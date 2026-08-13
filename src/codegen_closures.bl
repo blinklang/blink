@@ -9,6 +9,7 @@ import parser.{
     sublist_length, sublist_get,
 }
 import codegen_types.{
+    ann_mono_stem, ann_mono_c_type,
     Codegen, CT_INT, CT_FLOAT, CT_BOOL, CT_VOID, CT_STRUCT, CT_CLOSURE, CT_OPTION, CT_RESULT, CT_SET,
     CaptureEntry, ClosureCapInfo, VarEnumEntry,
     emit_line, c_safe_name, c_type_str, c_type_c_name, type_from_name,
@@ -32,7 +33,8 @@ import codegen_types.{
     cg_indent, cg_lines, cg_temp_counter,
 }
 import codegen_expr.{expr_closure_sig, expr_result_str, expr_result_type, recover_set_elem_from_tid}
-import codegen_stmt.{emit_fn_body, ret_needs_struct_body, cg_in_traced_fn, descriptor_from_capture}
+import codegen_stmt.{emit_fn_body, ret_needs_struct_body, cg_in_traced_fn, descriptor_from_capture, register_enum_instance_from_tid, register_struct_instance_from_tid}
+import typecheck.{tc_lookup_node_tid}
 import diagnostics.{Diag}
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -745,10 +747,10 @@ pub fn emit_fn_value_shim_if_needed(fn_node: Int, mangled: Str) -> Str ! Codegen
             params_c = params_c.concat(", ")
             if ptype == "Fn" {
                 params_c = params_c.concat("blink_closure* {pname}")
-            } else if is_enum_type(ptype) != 0 {
-                params_c = params_c.concat("{c_type_c_name(ptype)} {pname}")
-            } else if is_struct_type(ptype) != 0 {
-                params_c = params_c.concat("{c_type_c_name(ptype)} {pname}")
+            } else if is_enum_type(ptype) != 0 || is_struct_type(ptype) != 0 {
+                let mono = ann_mono_c_type(node_type_ann(p))
+                let pc = if mono != "" { mono } else { c_type_c_name(ptype) }
+                params_c = params_c.concat("{pc} {pname}")
             } else if ptype == "Tuple" {
                 params_c = params_c.concat("{tuple_c_name_from_ann(node_type_ann(p), \"void\")} {pname}")
             } else {
@@ -768,10 +770,9 @@ pub fn emit_fn_value_shim_if_needed(fn_node: Int, mangled: Str) -> Str ! Codegen
     let resolved_ret = resolve_ret_type_from_ann(fn_node)
     let mut ret_c_str = if resolved_ret != "" { resolved_ret } else { c_type_str(ret_type) }
     if ret_type == CT_VOID && ret_str != "Void" && ret_str != "" {
-        if is_struct_type(ret_str) != 0 {
-            ret_c_str = c_type_c_name(ret_str)
-        } else if is_enum_type(ret_str) != 0 {
-            ret_c_str = c_type_c_name(ret_str)
+        if is_struct_type(ret_str) != 0 || is_enum_type(ret_str) != 0 {
+            let ret_mono = ann_mono_c_type(node_type_ann(fn_node))
+            ret_c_str = if ret_mono != "" { ret_mono } else { c_type_c_name(ret_str) }
         }
     }
 
@@ -835,10 +836,10 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             } else if ptype == "" && cg_closure_param_type_hint >= 0 && cg_closure_param_type_hint != CT_VOID {
                 let ct = cg_closure_param_type_hint
                 params_c = params_c.concat("{c_type_str(ct)} {pname}")
-            } else if is_enum_type(ptype) != 0 {
-                params_c = params_c.concat("{c_type_c_name(ptype)} {pname}")
-            } else if is_struct_type(ptype) != 0 {
-                params_c = params_c.concat("{c_type_c_name(ptype)} {pname}")
+            } else if is_enum_type(ptype) != 0 || is_struct_type(ptype) != 0 {
+                let mono = ann_mono_c_type(node_type_ann(p))
+                let pc = if mono != "" { mono } else { c_type_c_name(ptype) }
+                params_c = params_c.concat("{pc} {pname}")
             } else if ptype == "Tuple" {
                 params_c = params_c.concat("{tuple_c_name_from_ann(node_type_ann(p), \"void\")} {pname}")
             } else if type_from_name(ptype) == CT_OPTION || type_from_name(ptype) == CT_RESULT {
@@ -920,11 +921,24 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             } else {
                 let param_ct = if is_enum_type(ptype) != 0 { CT_INT } else { type_from_name(ptype) }
                 set_var(pname, param_ct, 1)
+                let ptid = tc_lookup_node_tid(node_type_ann(p))
+                let inst_stem = ann_mono_stem(node_type_ann(p))
                 if is_struct_type(ptype) != 0 {
-                    set_var_struct(pname, ptype)
+                    // The instance, not the base: field reads against the base's declaration
+                    // resolve every generic field to its typevar.
+                    set_var_struct(pname, if inst_stem != "" { inst_stem } else { ptype })
+                    // Registered here, not in a prepass: register_struct_instance_params runs
+                    // before a named fn's body is emitted, but a closure body is emitted
+                    // mid-expression, so an instance whose only mention is this param would have
+                    // no field entries by the time the body needs them.
+                    register_struct_instance_from_tid(ptid)
                 }
                 if is_enum_type(ptype) != 0 {
                     var_enums.push(VarEnumEntry { name: pname, enum_type: ptype })
+                    if inst_stem != "" {
+                        register_enum_instance_from_tid(ptid)
+                        set_var_struct(pname, inst_stem)
+                    }
                 }
                 if ptype == "Tuple" {
                     let ta_t = node_type_ann(p)
@@ -965,7 +979,16 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             // temp names the typedef'd type.
             closure_ret_struct = stem
         } else if is_enum_type(ret_str) != 0 {
-            ret_c_str = c_type_c_name(ret_str)
+            // The enum arm of the same correction: a generic enum instance has no typedef under
+            // its base name, and nothing else in the program has to mention the instance, so the
+            // tagged union is registered here rather than assumed to exist.
+            let estem = closure_ret_mono_stem(node)
+            if estem != "" {
+                register_enum_instance_from_tid(tc_lookup_node_tid(node_type_ann(node)))
+                ret_c_str = c_type_c_name(estem)
+            } else {
+                ret_c_str = c_type_c_name(ret_str)
+            }
         }
     }
     emit_line("static {ret_c_str} {cname}({params_c}) \{")
@@ -1052,10 +1075,12 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                 sig_params = sig_params.concat("blink_closure*")
             } else if sptype == "" && saved_param_hint >= 0 && saved_param_hint != CT_VOID {
                 sig_params = sig_params.concat(c_type_str(saved_param_hint))
-            } else if is_enum_type(sptype) != 0 {
-                sig_params = sig_params.concat(c_type_c_name(sptype))
-            } else if is_struct_type(sptype) != 0 {
-                sig_params = sig_params.concat(c_type_c_name(sptype))
+            } else if is_enum_type(sptype) != 0 || is_struct_type(sptype) != 0 {
+                // Must agree with the definition line's params_c above: this string is the CAST
+                // the call is made through, so the two disagreeing is an ABI mismatch, not a
+                // cosmetic difference. Both read the one producer.
+                let smono = ann_mono_c_type(node_type_ann(sp))
+                sig_params = sig_params.concat(if smono != "" { smono } else { c_type_c_name(sptype) })
             } else if sptype == "Tuple" {
                 sig_params = sig_params.concat(tuple_c_name_from_ann(node_type_ann(sp), "void"))
             } else if type_from_name(sptype) == CT_OPTION || type_from_name(sptype) == CT_RESULT {

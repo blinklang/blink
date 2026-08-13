@@ -4641,15 +4641,40 @@ pub fn closure_lit_ret_c(node: Int) -> Str {
     c_type_from_tid(tc_tid_child(t, 0))
 }
 
-// The mono stem of a closure's declared generic-struct/enum return, read off the return
-// annotation's tid — the same route the plain-fn seam uses (src/codegen.bl). "" for a non-generic
-// return, a bare/typevar head, or an absent annotation.
-pub fn closure_ret_mono_stem(node: Int) -> Str {
-    tc_tid_struct_mono_name(tc_lookup_node_tid(node_type_ann(node)))
+// The mono stem of the struct/enum INSTANCE a type annotation names; "" when it names none.
+//
+// The sole producer for every position that spells a struct/enum annotation, this one or
+// ann_mono_c_type below. node_name / node_type_name on a `Box[Int]` annotation answer the generic
+// BASE, which has no typedef of its own, so a by-name spelling of an annotation names a C symbol
+// that was never emitted. resolve_type_parts memoizes the instance tid onto the annotation node,
+// and tc_tid_struct_mono_name is the stem producer byte-matched to the def side's
+// mangle_generic_name. Declines ("") for a bare generic base, an unsubstituted typevar slot or a
+// module-qualified head, leaving the caller on its by-name spelling.
+pub fn ann_mono_stem(ta: Int) -> Str {
+    tc_tid_struct_mono_name(tc_lookup_node_tid(ta))
 }
 
+// The same answer as a C type name rather than a stem, for the signature spellers.
+pub fn ann_mono_c_type(ta: Int) -> Str {
+    let stem = ann_mono_stem(ta)
+    if stem == "" { return "" }
+    c_type_c_name(stem)
+}
+
+// A fn-like node's own RETURN annotation carries the tid, so the return position reads the same
+// producer as the params.
+pub fn closure_ret_mono_stem(node: Int) -> Str {
+    ann_mono_stem(node_type_ann(node))
+}
+
+// The struct name field resolution should use for a C type name; "" when the name is not a
+// struct's. A generic struct INSTANCE's C name is in mono_instances, never in struct_reg_set —
+// that registry holds generic BASES — and the answer for an instance is the instance name itself,
+// not the base, whose declaration types every generic field as its typevar.
 pub fn resolve_struct_from_c_name(cname: Str) -> Str {
     if struct_reg_set.contains_key(cname) { return cname }
+    let mono = lookup_mono_base(cname)
+    if mono.base != "" && is_struct_type(mono.base) != 0 { return cname }
     let mut i = 0
     while i < cname.len() {
         if cname.byte_at(i) == 95 { // '_'
@@ -4980,10 +5005,9 @@ pub fn build_closure_sig_from_type_ann(ta: Int) -> Str {
             let elem = sublist_get(elems_sl, i)
             let ename = node_name(elem)
             sig_params = sig_params.concat(", ")
-            if is_enum_type(ename) != 0 {
-                sig_params = sig_params.concat(c_type_c_name(ename))
-            } else if is_struct_type(ename) != 0 {
-                sig_params = sig_params.concat(c_type_c_name(ename))
+            if is_enum_type(ename) != 0 || is_struct_type(ename) != 0 {
+                let mono = ann_mono_c_type(elem)
+                sig_params = sig_params.concat(if mono != "" { mono } else { c_type_c_name(ename) })
             } else if ename == "Tuple" {
                 sig_params = sig_params.concat(tuple_c_name_from_ann(elem, "void"))
             } else {
@@ -4995,10 +5019,9 @@ pub fn build_closure_sig_from_type_ann(ta: Int) -> Str {
     let mut ret_str = resolve_ret_type_from_ann(ta)
     if ret_str == "" {
         ret_str = c_type_str(ret_type)
-        if is_struct_type(ret_name) != 0 {
-            ret_str = c_type_c_name(ret_name)
-        } else if is_enum_type(ret_name) != 0 {
-            ret_str = c_type_c_name(ret_name)
+        if is_struct_type(ret_name) != 0 || is_enum_type(ret_name) != 0 {
+            let ret_mono = ann_mono_c_type(node_type_ann(ta))
+            ret_str = if ret_mono != "" { ret_mono } else { c_type_c_name(ret_name) }
         }
     }
     "{ret_str}(*)({sig_params})"

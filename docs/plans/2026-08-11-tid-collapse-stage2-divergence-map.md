@@ -9923,6 +9923,143 @@ ticket, because its stability guarantee, the absent comparator form, and the `.s
 `sections/06_tooling.md:1349` but defined nowhere are all unanswered. Implementing first would pick
 the stability guarantee by accident.
 
+## The fn type that named a struct C never declared (br `36vhhw`)
+
+A `fn(...)` type mentioning a generic struct or enum INSTANCE spelled that instance with its BASE
+name and no type args. `blink_Box` is never typedef'd, so this was not a miscompile — every
+occurrence escaped to `cc`:
+
+    let f: fn(Box[Int]) -> Int = fn(bx: Box[Int]) -> Int { bx.v + 1 }
+
+    build/g.c:196:57: error: unknown type name 'blink_Box'; did you mean 'blink_ev'?
+
+The instance spelling existed and was in use two lines away — `blink_Box_0Int` for the typedef and
+for the struct literal — so only the closure signature dropped the args. All three positions
+failed (param, return, let annotation) and a non-generic struct in the same branch was fine, which
+puts the axis on generic-instance-ness rather than on closures-with-structs.
+
+### The cause is a speller keyed on the annotation's NAME
+
+`node_name` / `node_type_name` on a `Box[Int]` annotation answer `Box`. The `[Int]` lives in the
+annotation's type-param children and was discarded before spelling, so `c_type_c_name(node_name(elem))`
+could only ever produce the base. `resolve_type_parts` already memoizes the struct/enum INSTANCE tid
+onto that same annotation node, and `tc_tid_struct_mono_name` is already byte-matched to the def
+side's `mangle_generic_name` — so the correction is to read the tid the node is carrying.
+
+Teaching `c_type_c_name` to re-parse a name into type args would have been the other option and it
+is the wrong one: it spells a segment with no tid behind it, which is the erasure the `arg_tids`
+seam exists to prevent.
+
+### Sixteen hand-copies, and the seams that mattered were in none of them
+
+`param_c_type` (src/codegen_stmt.bl) already had the correct pattern —
+`tc_tid_struct_mono_name(tc_lookup_node_tid(node_type_ann(p)))` — and so did 15 other places, each
+its own hand-copy of the same expression across four files. The six closure-signature builders were
+in none of them. That is the whole defect: not a missing idea, a missing paste.
+
+The fix is therefore one producer, `ann_mono_stem` (with `ann_mono_c_type` for the callers that
+want a C type rather than a stem), and all 16 sites now read it. A fix at one closure seam would
+have passed the MVCE above and left the other five, which is why the fixture asserts param, return
+and let-annotation position, both the struct and the enum arm, and two distinct instantiations in
+one program.
+
+### The definition line and the call-site cast are one decision
+
+`params_c` builds `static RET __closure_N(...)` and `sig_params` builds the
+`((RET(*)(...))cls->fn_ptr)` the call is made THROUGH. They are two strings in the same function.
+Fixing only the first would have replaced a `cc` error with an ABI mismatch — a silent one. Both
+now read the single producer, and that is the property to preserve, not the individual spellings.
+
+### Spelling the type was not enough: a closure body is emitted mid-expression
+
+With the signature correct, three rows still rendered the literal `<value>` placeholder for
+`"{h.v}"` while `h.v.len()` on the same receiver worked — different channels, and one of them was
+empty. The named-fn control passed, which located it:
+
+`register_struct_instance_params` (src/codegen.bl) is a PREPASS. A named fn's params are registered
+before any body is emitted, so their field entries always exist. A closure body is emitted in the
+middle of an expression, so a generic instance whose only mention in the program is a closure param
+had no field entries at the moment its body needed them, and field resolution fell through to the
+placeholder. `emit_closure`'s param seam now registers the instance itself.
+
+Note which way that failed: the interpolation compiled CLEANLY and printed `<value>`. The method
+call would have failed loudly. Same missing registration, one loud face and one silent one.
+
+### And the call RESULT needed the instance too
+
+The last red row was `f(Holder { v: 7 }).v` where `f: fn(Holder[Int]) -> Holder[Str]` — comparing
+two pointers as `Int`. The closure definition and the cast were both correct by then; the gap was
+that `resolve_struct_from_c_name` declined `Holder_0Str`. A generic struct INSTANCE's C name lives
+in `mono_instances`; `struct_reg_set` holds generic BASES only. So the closure-call reseat asked "is
+this ret tag a struct?", got "no", and left the result untyped.
+
+The answer for an instance is the instance name, not the base: resolving `Holder_0Str` to `Holder`
+would read `v` against the base's declaration, where it is a typevar, and land on the `Int` default.
+All three consumers of that resolver are the closure-return-tag path, so the arm is scoped to
+exactly this question.
+
+### Coverage
+
+`tests/test_36vhhw_fn_type_generic_struct.bl`, 14 rows, ordinary in-file rows — before the fix the
+whole FILE fails to build, which is the red state, so a subprocess harness would have added nothing.
+Param / return / let-annotation position, the struct and enum arms, a two-type-param instance
+(`Pair[Int, Str]`, so a fix that appends only one arg segment is caught), two distinct
+instantiations in one program (so a consistently-wrong mangling that collapses them is caught),
+field USE inside the body in both let and fn-param position, and four controls: a non-generic
+struct, scalar param and return, and a generic instance outside any fn type.
+
+Red: whole file fails to build → 11/14 → 13/14 → **14/14**.
+
+### Three enum defects behind this one, all filed, none of them this cell
+
+Enum RETURN position has its spelling fixed here alongside the param arm, but no program that
+returns a generic enum instance runs yet, so the fixture cannot assert it. Reducing that wall gave
+three independent bugs, each with a one-byte control that isolates it:
+
+* **`fzt37n`** — `Maybe.Just(v: "hi")` casts to `blink_Maybe`; `Maybe.Just("hi")` runs. Named-arg
+  construction does not consult the channel the positional form consults. No fn, no closure.
+* **`050868`** — `fn mk() -> Maybe[Int]` never emits the `blink_Maybe_0Int` typedef, while the
+  struct analogue does. The registration `emit_closure` now calls is the one the named-fn return
+  position is missing.
+* **`kdftak`** — with spelling and typedef both correct, a match arm binds the payload as
+  `void v = ...`. The scrutinee's own C type is right, so the instance is known; only the binder is
+  not substituted. A param-position binder on the same instance types correctly, which is what
+  makes this the call-result channel and not variant binding generally.
+
+Also `snbmkv` from the first pass of this cell: the payload-LESS variant cast, whose control is the
+payload-bearing form in the same position.
+
+### Census
+
+Both instruments are exactly neutral in both build modes, on the intersected file basis (1000 files
+monolithic, 931 archive-linked — not "the baseline minus the new test roots", which the `0e7dek` row
+already proved insufficient):
+
+| instrument | mode | diverge | missing | cells |
+|---|---|---|---|---|
+| ctypediv | monolithic | 37 → 37 | 109 → 109 | 16 → 16 |
+| ctypediv | archive-linked | 37 → 37 | 109 → 109 | 16 → 16 |
+| tydiv | monolithic | 30265 → 30265 | 80 → 80 | 753 → 753 |
+
+Neutral is the expected answer and worth stating rather than assuming: the fix changes which C type
+NAME is spelled, and both instruments compare a tid against a flat slot. What it does touch is
+`set_var_struct` at two seams, which writes a flat `sname` the tydiv tap reads — so a movement was
+possible and had to be measured, not argued away.
+
+**The whole apparent +34 is two new roots.** The unintersected count reads 30265 → 30299, and a
+per-file diff attributes every row: 52 rows from this cell's own fixture and 34 from
+`tests/test_s58gjs_list_append.bl`, the previous cell's fixture, added after the baseline sweep was
+taken. No pre-existing file moved by one row.
+
+Both sweeps carry an identical `error[` count (1215, of which 7 `ImportNotSelected`), which is the
+guard against the failure mode recorded on the `0e7dek` row: a sweep whose corpus stopped compiling
+reads as an improvement.
+
+Archive-linked tydiv is recorded here as a **first basis**, not a comparison —
+`agree=487866 diverge=7109 missing=80` over 1899 summary lines, 395 files reaching the instrument.
+No prior archive-linked tydiv sweep exists to diff against; the harness for it (`sweep_tydiv_arc.sh`)
+is new with this cell.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

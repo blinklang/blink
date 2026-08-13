@@ -1,0 +1,161 @@
+// A `fn(...)` type that names a generic struct or enum INSTANCE must spell that instance, not
+// its base name.
+//
+// The tid holds the instance and the flat side spells the base, so the emitted C names a
+// typedef that was never emitted:
+//
+//     [dbg:tydiv] bucket=diverge site=emit_let_binding.decl var=f
+//         tid=Fn(Holder[Str]) -> Int
+//         flat=Fn(int64_t(*)(const blink_closure*, blink_Holder))
+//
+// Nothing rejects it — no typecheck error and no I0001 — so it reaches cc, which is why these
+// rows are ordinary in-file rows rather than subprocess assertions: before the fix this whole
+// FILE fails to build, which is the red state.
+//
+// Six closure-signature builders share the by-name spelling, so a fix at one site passes the
+// param row and leaves the others. Param, return and let-annotation position are therefore all
+// asserted, and both the struct and enum arms.
+
+import std.io
+
+type Holder[T] { v: T }
+
+type Pair[A, B] { first: A, second: B }
+
+type Maybe[T] {
+    Nothing,
+    Just(v: T)
+}
+
+// A non-generic struct is the control: it takes the same `is_struct_type` branch and already
+// works, so a row that breaks it means the fix moved the wrong thing.
+type Plain { v: Str }
+
+fn call_par(f: fn(Holder[Int]) -> Int, h: Holder[Int]) -> Int {
+    f(h)
+}
+
+fn call_ret(f: fn(Int) -> Holder[Int], x: Int) -> Int {
+    let h = f(x)
+    h.v
+}
+
+fn call_enum(f: fn(Maybe[Int]) -> Int, m: Maybe[Int]) -> Int {
+    f(m)
+}
+
+fn call_plain(f: fn(Plain) -> Int, p: Plain) -> Int {
+    f(p)
+}
+
+test "generic struct instance as a closure param type in a let annotation" {
+    let f: fn(Holder[Int]) -> Int = fn(h: Holder[Int]) -> Int { h.v + 1 }
+    assert_eq(f(Holder { v: 41 }), 42)
+}
+
+test "generic struct instance as a closure param type in fn-param position" {
+    assert_eq(call_par(fn(h: Holder[Int]) -> Int { h.v + 1 }, Holder { v: 41 }), 42)
+}
+
+test "generic struct instance as a closure return type" {
+    assert_eq(call_ret(fn(k: Int) -> Holder[Int] { Holder { v: k + 1 } }, 41), 42)
+}
+
+test "generic struct instance as a closure return type in a let annotation" {
+    let f: fn(Int) -> Holder[Int] = fn(k: Int) -> Holder[Int] { Holder { v: k + 1 } }
+    assert_eq(f(41).v, 42)
+}
+
+// The enum arm sits directly above the struct arm in the same spellers and has the same
+// defect, so a struct-only fix leaves this red.
+//
+// `Maybe.Nothing` is deliberately absent from both enum rows: a PAYLOAD-LESS variant of a
+// generic enum casts to the bare base from a separate speller that no fn type is involved in
+// (a plain `fn take(m: Maybe[Int])` reproduces it), tracked as its own bug with its own
+// fixture. `Maybe.Just` positional is the arm this file owns — the named-arg form
+// `Maybe.Just(v: 42)` is a third, independent cast defect.
+//
+// Enum RETURN position is likewise absent, though its spelling is fixed here alongside the
+// param arm: no program that returns a generic enum instance runs yet, because the match arm
+// binds its payload as Void. Asserting the spelling needs that binder first.
+test "generic enum instance as a closure param type" {
+    let f: fn(Maybe[Int]) -> Int = fn(m: Maybe[Int]) -> Int {
+        match m {
+            Maybe.Just(v) => v
+            Maybe.Nothing => 0
+        }
+    }
+    assert_eq(f(Maybe.Just(42)), 42)
+}
+
+test "generic enum instance as a closure param type in fn-param position" {
+    assert_eq(call_enum(fn(m: Maybe[Int]) -> Int {
+        match m {
+            Maybe.Just(v) => v
+            Maybe.Nothing => 0
+        }
+    }, Maybe.Just(42)), 42)
+    assert_eq(call_enum(fn(m: Maybe[Int]) -> Int {
+        match m {
+            Maybe.Just(v) => v + 1
+            Maybe.Nothing => 0
+        }
+    }, Maybe.Just(41)), 42)
+}
+
+// Two DISTINCT instantiations in one program: both spell `blink_Holder` before the fix, so a
+// fix that mangles consistently but wrongly would collapse them onto one type and this row is
+// what catches it.
+test "two instantiations of the same generic struct stay distinct in fn types" {
+    let fi: fn(Holder[Int]) -> Int = fn(h: Holder[Int]) -> Int { h.v + 1 }
+    let fs: fn(Holder[Str]) -> Str = fn(h: Holder[Str]) -> Str { "{h.v}!" }
+    assert_eq(fi(Holder { v: 41 }), 42)
+    assert_eq(fs(Holder { v: "ok" }), "ok!")
+}
+
+test "a fn type carries a generic instance in both param and return position at once" {
+    let f: fn(Holder[Int]) -> Holder[Str] = fn(h: Holder[Int]) -> Holder[Str] { Holder { v: "n{h.v}" } }
+    assert_eq(f(Holder { v: 7 }).v, "n7")
+}
+
+// Two type params, so a fix that only ever appends one type-arg segment is caught.
+test "a two-parameter generic struct instance in a fn type" {
+    let f: fn(Pair[Int, Str]) -> Str = fn(p: Pair[Int, Str]) -> Str { "{p.first}{p.second}" }
+    assert_eq(f(Pair { first: 4, second: "2" }), "42")
+}
+
+// The closure BODY has to be able to use the param, not merely have it spelled. Before the fix
+// this reported `unresolved method '.len' on type Str` in let position and `on type Void` in
+// call-arg position — for a receiver whose own type is correct and whose method exists.
+test "the closure body can use a field of a generic struct param" {
+    let f: fn(Holder[Str]) -> Int = fn(h: Holder[Str]) -> Int { h.v.len() }
+    assert_eq(f(Holder { v: "abcd" }), 4)
+}
+
+test "the closure body can use a field of a generic struct param in fn-param position" {
+    let g = fn(h: Holder[Str]) -> Int { h.v.len() }
+    let f: fn(Holder[Str]) -> Int = g
+    assert_eq(f(Holder { v: "abcde" }), 5)
+}
+
+// ── Controls: the non-generic path already worked and must keep working ────────
+
+test "a non-generic struct as a closure param type still works" {
+    let f: fn(Plain) -> Int = fn(p: Plain) -> Int { p.v.len() }
+    assert_eq(f(Plain { v: "abcd" }), 4)
+    assert_eq(call_plain(fn(p: Plain) -> Int { p.v.len() }, Plain { v: "abc" }), 3)
+}
+
+test "scalar closure param and return types still work" {
+    let f: fn(Int) -> Int = fn(k: Int) -> Int { k + 1 }
+    let g: fn(Str) -> Int = fn(s: Str) -> Int { s.len() }
+    assert_eq(f(41), 42)
+    assert_eq(g("abcd"), 4)
+}
+
+test "a generic struct instance outside any fn type still works" {
+    let h = Holder { v: "abcd" }
+    assert_eq(h.v.len(), 4)
+    let p = Pair { first: 1, second: "x" }
+    assert_eq(p.second, "x")
+}
