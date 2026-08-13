@@ -34,7 +34,7 @@ import codegen_types.{
     get_impl_method_ret, get_impl_method_ret_q, has_derive_method, impl_method_reg_name, impl_trait_for_method, impl_type_implements_trait_method, lookup_impl_method, mangle_impl_method_q, get_list_elem_struct, get_list_elem_type,
     get_list_elem_option_inner, get_list_elem_option_inner_struct, get_list_elem_option_inner_tp,
     get_list_elem_result_ok, get_list_elem_result_err, get_list_elem_result_ok_struct, get_list_elem_result_err_struct,
-    get_list_elem_result_ok_tp, get_list_elem_result_err_tp, tp_carrier_tag, c_type_tag_for_struct,
+    get_list_elem_result_ok_tp, get_list_elem_result_err_tp, tp_carrier_tag, c_type_tag_for_struct, builtin_struct_name_for_ct,
     get_map_key_type, get_map_key_struct,
     get_map_value_list_elem, get_map_value_struct, get_map_value_type,
     get_struct_field_closure_sig,
@@ -4680,6 +4680,16 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                         inner_s = ve_name
                     }
                 }
+                if inner_s == "" {
+                    // br kxe0s2. Both channels above are keyed on the emitted C EXPRESSION
+                    // STRING, so they only answer for a named variable — `Some(Duration.ms(50))`
+                    // has no ScopeVar for its inner at all. The flat CT does answer, and for
+                    // these two types it names a declared struct, so this is the last resort
+                    // that keeps an Instant/Duration inner off the scalar branch below (where
+                    // c_type_tag has no arm and the carrier became the never-typedef'd
+                    // blink_Option_void). Ordered last so a real struct/enum name still wins.
+                    inner_s = builtin_struct_name_for_ct(inner_type)
+                }
                 if inner_s != "" {
                     if cg_in_handler_body != 0 && cg_handler_body_is_ue != 0 && cg_current_fn_option_inner == CT_PTR {
                         ensure_option_type(CT_PTR)
@@ -5857,8 +5867,16 @@ fn emit_list_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 let e_str = expr_result_str
                 let e_type = expr_result_type
                 if i == 0 {
-                    first_elem_type = e_type
-                    first_elem_struct = resolve_push_struct(e_str, tmp)
+                    let pushed_s = resolve_push_struct(e_str, tmp)
+                    // br kxe0s2: an Instant/Duration element presents as (CT_STRUCT, name)
+                    // here, which is the one element shape every downstream reader handles —
+                    // `.get()`'s first arm, `for-in`, pop. Its own flat CT would reach none of
+                    // them and the element would come back a bare int64_t. resolve_push_struct
+                    // cannot answer for it: all three of its channels are keyed on a ScopeVar
+                    // and the element is a call.
+                    let bs_s = if pushed_s == "" { builtin_struct_name_for_ct(e_type) } else { "" }
+                    first_elem_type = if bs_s != "" { CT_STRUCT } else { e_type }
+                    first_elem_struct = if bs_s != "" { bs_s } else { pushed_s }
                     first_elem_str = e_str
                 }
                 let e_struct = resolve_push_struct(e_str, tmp)

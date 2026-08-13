@@ -3,7 +3,7 @@ import codegen_types.{
     CT_CHAR, CT_FLOAT, CT_HANDLE, CT_HANDLER, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_INSTANT, CT_INT, CT_ITERATOR, CT_LIST, CT_MAP,
     CT_OPTION, CT_PTR, CT_RESULT, CT_SET, CT_STRING, CT_STRINGBUILDER,
     CT_ENUM, CT_STRUCT, CT_TEMPLATE, CT_VOID,
-    append_ev_arg, c_fn_name, c_type_c_name, c_type_c_name_in, c_type_from_tag, c_type_str, c_type_tag, c_type_tag_for_struct, canonical_struct_tag, derive_method_cname,
+    append_ev_arg, c_fn_name, c_type_c_name, c_type_c_name_in, c_type_from_tag, c_type_str, c_type_tag, c_type_tag_for_struct, canonical_struct_tag, builtin_struct_name_for_ct, builtin_struct_ct_for_name, derive_method_cname,
     cg_async_scope_stack, cg_async_wrapper_counter, cg_closure_defs,
     cg_closure_param_type_hint, cg_current_fn_name, cg_handler_body_idx,
     cg_handler_cleanup_fn, cg_handler_cleanup_var,
@@ -764,13 +764,23 @@ pub fn resolve_push_struct(val_str: Str, list_name: Str) -> Str {
 // (callers resolve it differently: resolve_push_struct for push/set/map, the
 // StructLit fallback for list literals), or "" if none applies.
 pub fn emit_boxed_container_store(emit_prefix: Str, val_str: Str, val_type: Int, val_struct: Str, elem_container: Str) ! Codegen.Emit, Codegen.Register {
-    if (val_type == CT_STRUCT || val_type == CT_VOID) && val_struct != "" {
+    // br kxe0s2: an Instant/Duration element is a by-value C struct with its own flat CT and
+    // no struct name on any channel, so it matched none of the branches below and fell to the
+    // final `else` — `blink_list_push(l, (void*)blink_std_time_Duration_ms(7))`, which cc
+    // rejects as "cannot convert to a pointer type". Naming it here is enough: the struct
+    // branch's heap-box IS the correct lowering for a by-value struct element, and it also
+    // records the element metadata that makes the later `.get(0).unwrap()` come back typed.
+    // This is the one place list.push / list.set / map.insert / list-literal all funnel
+    // through, so the four sites are covered by the one name.
+    let bs_name = builtin_struct_name_for_ct(val_type)
+    let box_name = if val_struct == "" { bs_name } else { val_struct }
+    if (val_type == CT_STRUCT || val_type == CT_VOID || bs_name != "") && box_name != "" {
         if elem_container != "" {
-            set_list_elem_struct(elem_container, val_struct)
+            set_list_elem_struct(elem_container, box_name)
             set_list_elem_type(elem_container, CT_VOID)
         }
         let box_tmp = fresh_temp("_box")
-        emit_line("{c_type_c_name(val_struct)}* {box_tmp} = ({c_type_c_name(val_struct)}*)blink_alloc(sizeof({c_type_c_name(val_struct)}));")
+        emit_line("{c_type_c_name(box_name)}* {box_tmp} = ({c_type_c_name(box_name)}*)blink_alloc(sizeof({c_type_c_name(box_name)}));")
         emit_line("*{box_tmp} = {val_str};")
         emit_line("{emit_prefix}(void*){box_tmp});")
     } else if val_type == CT_INT {
@@ -1806,13 +1816,19 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str, fb_key_c
         let val_str2 = expr_result_str
         let val_type2 = expr_result_type
         let val_list_elem = expr_list_elem_type
-        let val_struct = if val_type2 == CT_STRUCT { resolve_push_struct(val_str2, "") } else { "" }
-        emit_boxed_container_store("blink_map_set({obj_str}, {key_expr}, ", val_str2, val_type2, val_struct, "")
+        // br kxe0s2: an Instant/Duration VALUE presents as (CT_STRUCT, name), the same
+        // normalization the list-literal element does — the map records its value type here,
+        // and `.get()` picks the struct-carrier arm off the recorded pair. Its own flat CT
+        // reaches neither, so the value came back a bare int64_t.
+        let bs_val = builtin_struct_name_for_ct(val_type2)
+        let ins_val_type = if bs_val != "" { CT_STRUCT } else { val_type2 }
+        let val_struct = if bs_val != "" { bs_val } else if val_type2 == CT_STRUCT { resolve_push_struct(val_str2, "") } else { "" }
+        emit_boxed_container_store("blink_map_set({obj_str}, {key_expr}, ", val_str2, ins_val_type, val_struct, "")
         if set_var_name != "" {
-            emit_trace_state(set_var_name, "insert", val_str2, val_type2)
+            emit_trace_state(set_var_name, "insert", val_str2, ins_val_type)
         }
         let map_name_for_set = if set_var_name != "" { set_var_name } else { obj_str }
-        set_map_types(map_name_for_set, key_ct, val_type2, "")
+        set_map_types(map_name_for_set, key_ct, ins_val_type, "")
         if val_struct != "" {
             set_map_value_struct(map_name_for_set, val_struct)
         }
@@ -3846,7 +3862,25 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
 
     emit_expr(obj_node)
     let obj_str = expr_result_str
-    let obj_type = expr_result_type
+    // br kxe0s2: a container-retrieved Instant/Duration arrives here as CT_STRUCT plus the
+    // struct NAME the carrier boxed it under — which is what makes Option[Duration] spell a
+    // real typedef at all (builtin_struct_name_for_ct). The blocks that lower `.to_ms()` to
+    // Duration_to_ms are gated on the flat CT alone, so without this recovery
+    // `Some(d).unwrap().to_ms()` reached the UnresolvedMethod backstop while the byte-identical
+    // direct call resolved. Only these two names move; every other struct keeps its CT and
+    // falls through to the ordinary struct/trait dispatch below, which reads get_var_struct
+    // directly and is unaffected.
+    //
+    // CT_VOID is in the guard because that is the OTHER spelling of "a by-value struct whose
+    // identity lives in the name slot": the Result unwrap tail (:675) declares the real C
+    // struct and calls set_var_struct, then publishes CT_VOID. emit_boxed_container_store's
+    // own struct branch accepts the same two CTs for the same reason.
+    let obj_type = if expr_result_type == CT_STRUCT || expr_result_type == CT_VOID {
+        let bs_ct = builtin_struct_ct_for_name(get_var_struct(obj_str))
+        if bs_ct != -1 { bs_ct } else { expr_result_type }
+    } else {
+        expr_result_type
+    }
     // AL1: a chained-call receiver (`foo().get(k)`) is never a ScopeVar, so
     // emit_map_method's name-keyed lookups always miss. Capture the map carrier
     // metadata obj_node's own emit_expr just published (the same globals

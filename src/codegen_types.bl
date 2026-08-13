@@ -6554,6 +6554,37 @@ pub fn c_type_tag_for_struct(name: Str) -> Str {
     strip_blink_prefix(c_type_c_name(name))
 }
 
+// br kxe0s2: the two builtin types that are BOTH a declared struct and a flat CT.
+// `Instant` and `Duration` are ordinary `pub type` declarations (lib/std/time.bl:21,:25)
+// whose methods are ordinary value-receiver free functions, and codegen ALSO gives them
+// CT_INSTANT/CT_DURATION so `time.read().to_unix_ms()` lowers to a direct call.
+//
+// Every carrier and container-boxing site decides struct-vs-scalar by asking whether a
+// struct NAME is present, and these two never presented one — so they took the scalar side,
+// where the Option carrier is named from c_type_tag (which has no arm for either and
+// answers its `else { "void" }` default) and a list/map element is cast struct-to-pointer,
+// which cc rejects outright. Naming them here routes both through the struct machinery that
+// already works for `Some(some_point)` and `[some_point]`, instead of inventing a
+// by-value carrier with a struct-derived tag that no container path supports.
+//
+// This is the inverse of type_from_name's own "Instant"/"Duration" arms below, and the two
+// must stay in step: the carrier stores the name, and the method blocks recover the flat CT
+// from it.
+pub fn builtin_struct_name_for_ct(ct: Int) -> Str {
+    if ct == CT_INSTANT { return "Instant" }
+    if ct == CT_DURATION { return "Duration" }
+    ""
+}
+
+// br kxe0s2, the reverse direction: a retrieved Instant/Duration arrives as CT_STRUCT plus
+// the name the carrier boxed it under, and the method blocks are gated on the flat CT.
+// Answers -1 for every other struct so a genuine user struct is untouched.
+pub fn builtin_struct_ct_for_name(name: Str) -> Int {
+    if name == "Instant" { return CT_INSTANT }
+    if name == "Duration" { return CT_DURATION }
+    -1
+}
+
 pub fn type_from_name(name: Str) -> Int {
     let bracket_pos = name.index_of("[")
     let mut base = name
@@ -6993,8 +7024,16 @@ pub fn c_type_tag(ct: Int) -> Str {
     // so the name was REFERENCED and never TYPEDEF'D. That default is why this function is weaker
     // than its tid twin: tc_tid_tag_at fails CLOSED on an unhandled kind
     // (ICE_SEG_UNHANDLED_KIND) so a missing arm cannot be mistaken for a genuine Void. Here a
-    // missing arm silently BECOMES a Void. Instant, Duration and Closure are still in that hole
-    // (kxe0s2); do not read this arm as closing the class.
+    // missing arm silently BECOMES a Void. CT_CLOSURE is still in that hole (br 597kj0:
+    // `Some(fn(x: Int) -> Int { x * 2 })` emits the never-typedef'd blink_Option_void, and a
+    // closure has no struct name to recover, so it cannot take the fix below); do not read
+    // this arm as closing the class.
+    //
+    // Instant and Duration WERE in it too (br kxe0s2), and the fix deliberately did not add
+    // arms here: both are declared structs, so they now present as (CT_STRUCT, name) at every
+    // carrier and element boundary (builtin_struct_name_for_ct) and their carriers are named by
+    // canonical_struct_tag instead — which is also what the tid twin already answered for them,
+    // so the two spellers agree by construction rather than by a third hand-kept arm.
     else if ct == CT_HANDLER { "handler" }
     else if ct == CT_MAP { "map" }
     else if ct == CT_SET { "set" }

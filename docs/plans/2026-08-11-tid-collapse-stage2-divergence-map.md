@@ -8735,6 +8735,111 @@ Divergence-neutral once part 3 landed: `diverge=43 decline=109` in both build mo
 identical to the pre-ticket baseline, the two `ctype.handler` rows gone, and `agree` up 313 (mono) /
 232 (arc) — all of it the new test file's own sites.
 
+## The two types that were both a struct and a scalar (br `kxe0s2`)
+
+`Some(Duration.ms(50))` did not compile, and the error came out at the far end of the pipeline:
+
+```
+error[UnresolvedMethod]: unresolved method '.to_ms' on type Duration in 'main'
+```
+
+**That message is codegen, not typecheck.** It is `codegen_methods.bl:5737`, and the `in '<fn>'`
+suffix is the tell — typecheck's diagnostics carry no such suffix. The ticket had it filed against
+the typecheck gate, and the gate is incapable of producing it: `tc_method_resolvable_on_type`'s
+clause (e) fails open on `is_builtin_method`, which lists `to_ms` along with `to_seconds`, `to_nanos`,
+`sub`, `scale`, `is_zero`, `since`, `elapsed`, `to_rfc3339`, `to_unix_ms` and `to_unix_secs`
+(`typecheck.bl:6728-6746`). No typecheck change was made. Reading the source before naming the layer
+is the whole content of that paragraph.
+
+With the method call removed so codegen got further, cc gave the other half:
+
+```
+error: unknown type name 'blink_Option_void'
+  const blink_Option_void o = (blink_Option_void){.tag = 1, .value = d};
+```
+
+**One cause, two symptoms.** `Instant` and `Duration` are the only two types in the language that are
+simultaneously a declared struct — `pub type Duration { nanos: Int }` (`lib/std/time.bl:21,:25`), with
+methods as ordinary value-receiver free functions — and a flat CT, `CT_INSTANT`/`CT_DURATION`, which
+exists so `time.read().to_unix_ms()` lowers to a direct call. Every carrier and container-element site
+decides struct-vs-scalar by asking whether a struct **name** is present. These two never presented
+one, so they took the scalar side, where the carrier is named from `c_type_tag` — which had no arm for
+either and answered its `else { "void" }` default. `emit_option_typedef` returns early on exactly
+`tag == "void"`, so `blink_Option_void` was referenced and never typedef'd. In containers they fell
+through to `emit_boxed_container_store`'s final `else` and emitted `(void*)<struct value>`, which cc
+rejects outright. And the retrieved value came back a bare `int64_t`, so the method blocks that spell
+`Duration_to_ms` — gated on the flat CT — no longer matched. Hence the `UnresolvedMethod` at the end.
+
+**The fix routes them to the struct carrier instead of adding `c_type_tag` arms.** The invariant is
+*at every container-element and carrier boundary an Instant/Duration presents as
+`(CT_STRUCT, "Instant"/"Duration")`*. Two helpers in `codegen_types.bl`
+(`builtin_struct_name_for_ct`, and `builtin_struct_ct_for_name` for the reverse direction), then five
+fill-ins: the `Some()` inner name, ordered **last** so a real struct or enum name still wins;
+`emit_boxed_container_store`'s guard and box name, which is the documented single chokepoint for
+`list.push` / `list.set` / `map.insert` / list-literal (br `4yzsfc`) and therefore covers four store
+sites with one name; `map.insert`'s value CT, normalized before **both** the store and `set_map_types`
+because insert passes `elem_container: ""` and records its value type separately; the list literal's
+`i == 0` block, whose `first_elem_struct` is read from `resolve_push_struct` *before*
+`emit_boxed_container_store` has recorded anything; and the receiver CT recovery at
+`emit_method_call:3850`, which has to sit there and not lower because
+`let mut struct_type = get_var_struct(obj_str)` at `:5639` is bound long after the Instant/Duration
+method blocks.
+
+Three reasons for the routing choice rather than a by-value carrier with a struct-derived tag, all
+recorded in the comment on `c_type_tag`'s `CT_HANDLER` arm:
+
+1. List-of-struct, Map-value-struct, Result-of-struct and tuple-of-struct machinery is fully built
+   out, so **one** routing decision covers every container — instead of one hand-written arm per
+   container, which is the shape br `1mw2c3`'s `CT_HANDLER` arm had to take one section above.
+2. The tid twin `tc_tid_tag_at` (`typecheck.bl:12884`) already answers `c_type_tag_for_struct(t.name)`
+   for a `TyKind.Struct` inner. Routing to the struct carrier makes the two spellers agree **by
+   construction** rather than by a third hand-kept arm — br `bwyfy1`'s lesson, applied instead of
+   re-learned.
+3. A struct-derived tag on the scalar path would collide with `emit_struct_option_typedef`'s
+   pointer-boxed member under the same typedef name and one shared `option_typedef_emitted` dedup
+   guard — the exact hazard `ensure_carrier_from_tag`'s own comment warns about.
+
+**`CT_VOID` is the other spelling of "by-value struct whose identity lives in the name slot."** The
+Result unwrap tail (`codegen_methods.bl:673-677`) declares the real C struct, calls
+`set_var_struct(...)`, and then publishes `expr_result_type = CT_VOID` — not `CT_STRUCT`.
+`emit_boxed_container_store`'s struct branch already accepted both; my first pass accepted only
+`CT_STRUCT` at the method gate, which is precisely why the `Result[Duration, Str]` row still failed
+after the first regen. Worth carrying forward into Stage 4: any guard written as `== CT_STRUCT` is
+half a guard.
+
+**The `Type_method` free-function convention is not general** — falsified by probe before
+generalizing anything: `type P { x: Int }` plus `pub fn P_double(p: P) -> Int` plus `p.double()` gives
+`warning[UnknownMethod]` then `error[UnresolvedMethod]`. Duration and Instant dispatch is
+special-cased on the flat CT (`obj_type == CT_INSTANT` at `codegen_methods.bl:4954`, `CT_DURATION` at
+`:4994`), which is exactly why the receiver recovery is needed and why it cannot be replaced by a
+naming convention.
+
+**Why an entire carrier sat unexercised.** `rg '\[(Instant|Duration)\]' src/ lib/ tests/ examples/`
+finds nothing — not one `Instant` or `Duration` appears as a type argument anywhere in the repo. A
+zero-hit sweep is an unexercised tap, not coverage, so all 16 rows of the new test are constructed by
+hand. The second half of the camouflage is that both types are `{ nanos: Int }` and `int64_t`-shaped
+in C, so flooring one to `Int` *looks* like a legitimate scalar. It is wrong twice: once in the
+carrier name, once in what the retrieved value can still do. And field access degraded silently
+instead of failing — `d2.nanos` interpolated the literal string `"<value>"` — which is why every row
+asserts on a value and none end in `assert(true)`.
+
+**The bwyfy1 caution, discharged by measurement.** The ticket warned that `c_type_tag` is not
+Option-local and that br `bwyfy1` records collapsing it to one rule breaking 296 fixtures. Census
+re-run in both build modes over `tests` + `examples` + `src`: `diverge=43 decline=109` before,
+`diverge=43 decline=109` after, and a per-cell diff of the normalized `(site, tid, flat)` triples is
+**identical** in both modes. No churn, because no `c_type_tag` arm was added and every change is
+gated — `builtin_struct_name_for_ct` returns `""` and `builtin_struct_ct_for_name` returns `-1` for
+every other type. Better than neutral: the new test file's own rows read `ctype.flat agree=79`,
+`ctype.option agree=9`, `ctype.struct agree=4`, `ctype.result agree=2`, all with `diverge=0
+missing=0`. Reason 2 above, measured rather than asserted.
+
+**`CT_CLOSURE` is now the only kind left in the `else { "void" }` hole** — br `597kj0`, filed with an
+MVCE. `Some(fn(x: Int) -> Int { x * 2 })` produces the identical `blink_Option_void`. Same shape,
+different cause: a closure has no struct name to recover, so it cannot take this fix and needs either
+a real closure carrier or a fail-closed diagnostic. `List[closure]` already works, so the list element
+path has a channel the Option carrier lacks — that contrast is where whoever takes it should start,
+rather than inventing a third representation.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
