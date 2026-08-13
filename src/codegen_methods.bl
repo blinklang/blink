@@ -4937,10 +4937,32 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 emit_line("{elem_c}* {box_tmp} = ({elem_c}*)blink_alloc(sizeof({elem_c}));")
                 emit_line("*{box_tmp} = {val_str};")
                 emit_line("blink_channel_send({obj_str}, (void*){box_tmp});")
-            } else if val_type == CT_INT {
-                emit_line("blink_channel_send({obj_str}, (void*)(intptr_t){val_str});")
             } else {
-                emit_line("blink_channel_send({obj_str}, (void*){val_str});")
+                // br w3v2e6: the SAME 8-byte payload the fallback used to send inline, put in a
+                // box and sent as the box's address. The payload word is bit-for-bit what it
+                // was — `(void*)(intptr_t)x` for an Int, `(void*)x` for anything
+                // pointer-shaped — so every reinterpretation on the receive side is unchanged
+                // and this is not the element inference (that is w3v2e6's other half, and it is
+                // spec-blocked: bare `Channel(n)` is in no spec section, and 8vcj2c's E0301
+                // boundary may make an un-annotated element an error rather than something to
+                // infer from a later use).
+                //
+                // What changes is ONLY that the address is never NULL. Inline, `x == 0` sent
+                // NULL, which is blink_channel_recv's end-of-stream sentinel, so a sent 0 broke
+                // the for-in drain and took every value behind it — `send(5) send(0) send(7)`
+                // drained `5` and stopped. The drain's own comment claimed its NULL test was
+                // "only sound because send now boxes", which was true only on the elem_ct >= 0
+                // side above.
+                //
+                // The cast stays INSIDE the box assignment, and the box is `void*`, not
+                // `int64_t`, on purpose. A bare Float element is a loud `cc` error today
+                // ("cannot convert to a pointer type"); an int64_t box would have accepted the
+                // double and silently truncated it, trading a loud failure for a wrong value.
+                let payload = if val_type == CT_INT { "(void*)(intptr_t){val_str}" } else { "(void*){val_str}" }
+                let box_tmp = fresh_temp("__chbox_")
+                emit_line("void** {box_tmp} = (void**)blink_alloc(sizeof(void*));")
+                emit_line("*{box_tmp} = {payload};")
+                emit_line("blink_channel_send({obj_str}, (void*){box_tmp});")
             }
             expr_result_str = "0"
             expr_result_type = CT_INT
@@ -4966,12 +4988,19 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 expr_result_type = elem_ct
                 return
             }
+            // br w3v2e6: the box the send fallback now writes, unwrapped back to the payload
+            // word before the pre-existing reinterpretation below reads it. Guarded, because
+            // NULL here is a closed empty channel and dereferencing it would segfault where the
+            // old code answered the zero value — the same yzan52 answer the boxed branch above
+            // preserves, and not a codegen fix's decision to change.
+            let pay_tmp = fresh_temp("__chpay_")
+            emit_line("void* {pay_tmp} = ({recv_tmp} == NULL) ? NULL : *(void**){recv_tmp};")
             let ch_inner = get_var_channel_inner(obj_str)
             if ch_inner == CT_STRING {
-                expr_result_str = "(const char*){recv_tmp}"
+                expr_result_str = "(const char*){pay_tmp}"
                 expr_result_type = CT_STRING
             } else {
-                expr_result_str = "(int64_t)(intptr_t){recv_tmp}"
+                expr_result_str = "(int64_t)(intptr_t){pay_tmp}"
                 expr_result_type = CT_INT
             }
             return

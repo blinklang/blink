@@ -5038,9 +5038,11 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             let ch_inner = get_var_channel_inner(iter_str)
             // br hgd2az: the element type from the ITERABLE's tid, with the flat field kept
             // as the fallback for a channel whose element nothing knows (br w3v2e6). The
-            // NULL test above is the end-of-stream signal and is only sound because `send`
-            // now boxes — a raw `(void*)(intptr_t)0` element was indistinguishable from it,
-            // which dropped a sent 0 and every value behind it.
+            // NULL test below is the end-of-stream signal and is sound only because `send`
+            // boxes — a raw `(void*)(intptr_t)0` element is indistinguishable from it, which
+            // dropped a sent 0 and every value behind it. hgd2az made that true of the
+            // `elem_ct >= 0` arm only; br w3v2e6 boxed the fallback too, so it now holds for
+            // every channel, which is why both fallback arms below dereference.
             let ch_tid = tc_lookup_node_tid(iter_node)
             let elem_ct = tc_channel_elem_ct(ch_tid)
             let recv_tmp = fresh_temp("__chrecv_")
@@ -5058,11 +5060,16 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                     set_var_struct(var_name, elem_sname)
                 }
             } else if ch_inner == CT_STRING {
-                emit_line("const char* {c_var_name} = (const char*){recv_tmp};")
+                // br w3v2e6, both fallback arms: unwrap the box the send fallback now writes
+                // before reinterpreting. No NULL guard is needed here — unlike the `.recv()`
+                // twin, the `if (recv_tmp == NULL) break;` above has already left the loop, and
+                // THAT is the test this fix repaired: the box address is never NULL, so a sent 0
+                // no longer reads as end-of-stream and truncates the drain.
+                emit_line("const char* {c_var_name} = (const char*)*(void**){recv_tmp};")
                 push_scope()
                 set_var(var_name, CT_STRING, 0)
             } else {
-                emit_line("int64_t {c_var_name} = (int64_t)(intptr_t){recv_tmp};")
+                emit_line("int64_t {c_var_name} = (int64_t)(intptr_t)*(void**){recv_tmp};")
                 push_scope()
                 set_var(var_name, CT_INT, 0)
             }

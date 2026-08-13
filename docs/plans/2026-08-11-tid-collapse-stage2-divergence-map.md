@@ -9039,6 +9039,95 @@ as C plus a run; and three controls — `List[closure]` and `Map[Str, closure]`,
 because both pointer-box the element and never name a carrier, and a genuine `Result[Void, Str]`
 proving `hsgsbp`'s load-bearing `"void"` match still lowers to the `int64_t` placeholder.
 
+## The value that was indistinguishable from end-of-stream (br `w3v2e6`, the data-loss half)
+
+`w3v2e6` is titled as a *tid publication* ticket — a bare `let ch = Channel(4)` publishes no element
+type, so `infer_type` leaves it `Unknown` and all three channel seams fall back. Its own notes then
+name a second, separable defect and hand it to this ticket: *"on a bare channel, `ch.send(0)` still
+encodes as `(void*)(intptr_t)0`, which IS NULL, and NULL is `blink_channel_recv`'s end-of-stream
+sentinel."*
+
+**The measured loss is bigger than "a 0 goes missing."** The for-in drain is
+`while (1) { void* r = blink_channel_recv(ch); if (r == NULL) break; ... }`, so a payload of NULL does
+not drop one element — it ends the stream:
+
+```
+let ch = Channel(4); ch.send(5); ch.send(0); ch.send(7); ch.close()
+for v in ch { io.println("v={v}") }      // printed v=5 only: 0 AND 7 vanished
+```
+
+Silently, exit 0. Only the for-in path is affected — `.recv()` has no NULL-as-terminator, so it reads
+`0, 1` back correctly, which is why this survived every corpus run.
+
+**br `hgd2az` half-fixed it and its comment overstated the result.** hgd2az routed the three seams
+through the channel node's tid and boxes the element when `tc_channel_elem_ct` answers `>= 0`, and a
+box address is never NULL — so an annotated `Channel[Int]` was already correct. But its comment on the
+drain read *"the NULL test above is the end-of-stream signal and is only sound because `send` now
+boxes"*, which was true of the boxed arm and false of the fallback sitting three lines below it. The
+comment now says which arm hgd2az made true and which one this fix did.
+
+**The fix is decision-independent, and that is the point.** `w3v2e6`'s publication half is
+spec-blocked: bare `Channel(n)` appears in no spec section and no `blink llms` topic (the spec's
+spelling is `channel.new[T](buffer: n)`, `sections/04_effects.md:1751`, which hgd2az already handles);
+`make_channel_type(TYPE_UNKNOWN)` would launder an unknown into a structured type; and minting a
+metavar is the right HM answer but nothing binds it, so every corpus `let ch = Channel(4)` would
+become `error[CannotInferType]` E0301 under the gqg3rk boundary check (spec 8vcj2c). The ticket says
+that decision is not its to make unilaterally, and it is right.
+
+So the fallback now boxes **the same 8-byte payload it used to send inline**:
+
+```
+void** __chbox_0 = (void**)blink_alloc(sizeof(void*));
+*__chbox_0 = (void*)(intptr_t)x;              /* the exact word the old `send` passed */
+blink_channel_send(ch, (void*)__chbox_0);
+```
+
+The payload word is bit-for-bit unchanged, so every reinterpretation downstream is unchanged. What
+changes is **only** that the address is never NULL. No element type is invented, no tid is published,
+and 8vcj2c's answer is not needed.
+
+**Two details that are the whole fix, not decoration.** The box is `void*` and **not** `int64_t`: a
+bare `Float` element is a loud `cc` error today (*"cannot convert to a pointer type"*), and an
+`int64_t` box would have accepted the double and silently truncated it — trading a loud failure for a
+wrong value, the one way this change could have made things worse. And the `.recv()` twin gets a NULL
+guard the drain does not need (`void* p = (r == NULL) ? NULL : *(void**)r;`), because `.recv()` on a
+closed empty channel legitimately reaches the decode with NULL in hand and must keep answering the
+element's zero value (what it *should* answer is br `yzan52`); the drain has already `break`-ed by
+then, and that break is precisely the test this fix repaired.
+
+**The compiler's own code is an instance of the fixed shape, and it worked by accident.**
+`src/cli.bl:2169-2170` — `let dot_ch = Channel(1); dot_ch.send(0)` — is `blink test --parallel`'s
+dot-column counter. It was correct only because **two bugs cancelled**: the payload 0 became NULL, and
+`.recv()`'s NULL case answers the element's zero value. It is now correct by construction.
+(`src/cli.bl:2162` and `lib/std/http_server.bl:368` are the other two bare channels; both send 1 and
+never 0.)
+
+**Measured.** `task regen` exit 0; `task ci` exit 0 — 705 test files 705 passed / 0 failed (that run
+*is* the dot counter, through the rebuilt CLI), fmt 1628 passed / 0 failed.
+`tests/test_w3v2e6_bare_channel_zero_truncation.bl` 9/9, red on exactly 3 rows before the fix.
+
+The 9 rows: a leading zero drains; a **mid-stream** zero does not take the value behind it (the row
+that distinguishes truncation from a bad rendering of one element); the C-level mechanism, asserting
+the box is emitted and the inline `(void*)(intptr_t)` send is gone — a behavioural row alone would
+also pass if the drain simply stopped treating NULL as end-of-stream, which would break a genuinely
+closed channel instead. Then six controls: `.recv()` still reads `0, 1`; a closed empty channel still
+ends the drain *and* still reads back zero (the row that proves the sentinel survived the move from
+payload to box address); the compiler's own 1-slot zero-valued cell; an annotated `Channel[Int]`; and
+two rows that **pin still-wrong answers on purpose** — a bare `Str` channel still prints a pointer
+(`w3v2e6`'s inference half; asserted as the *absence* of `v=hello`, since the garbage value varies per
+run) and a bare `Float` channel still fails loudly in `cc`. When the inference lands, those two go
+red, which is the point: it must not slide in silently.
+
+**Census after — divergence-neutral in both build modes.** `diverge=43 missing=109` in monolithic
+(`lines=2015 agree=438334`) and archive-linked (`lines=1816 agree=362258`) alike, matching the baseline
+exactly; and a per-cell diff of the normalized `(site, tid, flat)` triples on a common-file basis (993-
+and 924-file intersections, 17 distinct cells in each mode) is identical. That is the expected reading:
+this change alters *emitted C*, not what either authority claims a type is, so the instrument that
+compares the two should not move. The 21 family-A `flat=Channel[Int]` rows are still there — they are
+the publication half, and they stay until it is decided.
+
+`w3v2e6` stays **open**. Its data-loss half is dead; its publication half is a spec question.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
