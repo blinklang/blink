@@ -1,0 +1,261 @@
+// br ees4yr — a mutating collection method requires a `let mut` binding.
+//
+// The spec states the rule and gives the counter-example as a COMPILE ERROR, so this is a
+// missing check and not an ambiguity. sections/03_types.md:302:
+//
+//   "Mutating methods (`push`, `pop`, `insert`, `remove`, `set`) require the binding to be
+//    `let mut`. Immutable bindings can only call non-mutating methods (`get`, `contains`,
+//    `len`, `keys`, `values`, etc.)"
+//
+// and the example at :316:
+//
+//   names.push("Dave")    // COMPILE ERROR — names is not mut
+//
+// Before this test, all nine implemented mutating methods were accepted on a non-mut binding
+// and ran: `let xs: List[Int] = [1]` + `xs.push(2)` printed len=2. The check was not weak, it
+// was absent — no site enforced it, so there was nothing to copy.
+//
+// WHERE THE AUTHORITATIVE METHOD SET COMES FROM. The per-type tables' `Mutates` column
+// (:369, :430, :485), NOT the trait blocks' `// Mutation (requires let mut)` comments — the
+// MapOps block files `contains_key` under that comment while its own table row says
+// `Mutates=no` (br psytmt). And NOT `pp_is_mutating_method` (typecheck.bl:4718), which is the
+// @pure walker's list and includes `append`, marked `Mutates=no`. The set is:
+//   List  push, pop, set, clear   (+ insert, remove once they exist — br 5ebq1h)
+//   Map   insert, remove, clear
+//   Set   insert, remove
+//
+// SCOPE. This file covers `let` bindings only, which is all the spec's text and its example
+// speak to. A function parameter is a separate and currently unrestricted mutation source
+// (`fn f(xs: List[Int]) { xs.push(9) }` mutates the caller's list), and whether the rule
+// extends there is a real spec question with three materially different answers — br 5ryk88,
+// for the panel. Assignment to a non-mut binding is a third axis, br gm879d. Neither is
+// asserted here in either direction.
+//
+// The compile-error rows shell out to `build/blinkc` and assert on the diagnostic, the same
+// mechanism as tests/test_mut_field_error.bl — an in-process test cannot contain a program
+// that must fail to compile. Every acceptance row instead RUNS and asserts on a value, so an
+// over-broad check that rejected a legal program would fail here rather than pass quietly.
+
+fn ees_diag(tag: Str, src: Str) -> Str {
+    let path = ".tmp/_ees4yr_{tag}.bl"
+    write_file(path, src)
+    let args = [path, "/dev/null", "--format", "json"]
+    let result = process_run("build/blinkc", args)
+    let output = "{result.out}{result.err_out}"
+    shell_exec("rm -f {path}")
+    output
+}
+
+fn ees_wrap(body: Str) -> Str {
+    "fn main() \{\n{body}\n\}\n"
+}
+
+test "ees4yr the spec's own counter-example is a compile error" {
+    // sections/03_types.md:316, verbatim.
+    let out = ees_diag("spec", ees_wrap("    let names = [\"Alice\", \"Bob\", \"Carol\"]\n    names.push(\"Dave\")"))
+    assert(out.contains("E0610"))
+    assert(out.contains("MutationRequiresMut"))
+}
+
+test "ees4yr list.push on a non-mut binding is E0610" {
+    let out = ees_diag("lpush", ees_wrap("    let xs: List[Int] = [1]\n    xs.push(2)"))
+    assert(out.contains("E0610"))
+}
+
+test "ees4yr list.pop on a non-mut binding is E0610" {
+    let out = ees_diag("lpop", ees_wrap("    let xs: List[Int] = [1, 2]\n    let p = xs.pop()"))
+    assert(out.contains("E0610"))
+}
+
+test "ees4yr list.set on a non-mut binding is E0610" {
+    let out = ees_diag("lset", ees_wrap("    let xs: List[Int] = [1, 2]\n    xs.set(0, 9)"))
+    assert(out.contains("E0610"))
+}
+
+test "ees4yr list.clear on a non-mut binding is E0610" {
+    let out = ees_diag("lclear", ees_wrap("    let xs: List[Int] = [1, 2]\n    xs.clear()"))
+    assert(out.contains("E0610"))
+}
+
+test "ees4yr map.insert on a non-mut binding is E0610" {
+    let out = ees_diag("mins", ees_wrap("    let m: Map[Str, Int] = Map()\n    m.insert(\"a\", 1)"))
+    assert(out.contains("E0610"))
+}
+
+test "ees4yr map.remove on a non-mut binding is E0610" {
+    let out = ees_diag("mrem", ees_wrap("    let m: Map[Str, Int] = Map()\n    let r = m.remove(\"a\")"))
+    assert(out.contains("E0610"))
+}
+
+test "ees4yr map.clear on a non-mut binding is E0610" {
+    let out = ees_diag("mclear", ees_wrap("    let m: Map[Str, Int] = Map()\n    m.clear()"))
+    assert(out.contains("E0610"))
+}
+
+test "ees4yr set.insert on a non-mut binding is E0610" {
+    let out = ees_diag("sins", ees_wrap("    let s: Set[Int] = Set()\n    let mut b = s.insert(1)"))
+    assert(out.contains("E0610"))
+}
+
+test "ees4yr set.remove on a non-mut binding is E0610" {
+    let out = ees_diag("srem", ees_wrap("    let s: Set[Int] = Set()\n    let mut b = s.remove(1)"))
+    assert(out.contains("E0610"))
+}
+
+test "ees4yr a let that ALIASES another collection is still a let" {
+    // The shape the check actually found in our own source: `let items =
+    // sl_data.get(sl).unwrap()` in src/parser.bl, then `items.push(node_id)`. The binding is
+    // never reassigned, so it reads as immutable, and the push mutates the aliased list all
+    // the same. This is exactly what the spec's rationale at :320 is for — `grep "let mut"`
+    // has to find this line — so an implementation that only looked at whether the BINDING
+    // was reassigned would miss the whole class.
+    let out = ees_diag("alias", ees_wrap("    let mut src: List[Int] = [1]\n    let alias = src\n    alias.push(2)"))
+    assert(out.contains("E0610"))
+    assert(out.contains("alias"))
+}
+
+test "ees4yr a parameter is NOT rejected — that axis is undecided" {
+    // `fn f(xs: List[Int]) { xs.push(9) }` mutates the caller's list and the spec's text does
+    // not reach it (br 5ryk88, for the panel). nr_is_mut answers 0 for a param exactly as it
+    // does for a plain `let`, so this row is what keeps the implementation from silently
+    // adopting one reading of an open spec question. It pins today's answer, not the right one.
+    let out = ees_diag("param", "fn ees_p(xs: List[Int]) -> Int \{\n    xs.push(9)\n    xs.len()\n\}\n\nfn main() \{\n    let mut ys: List[Int] = [1]\n    io.println(\"\{ees_p(ys)\}\")\n\}\n")
+    assert(out.contains("E0610") == false)
+}
+
+test "ees4yr a user method sharing a mutating name is untouched" {
+    // `insert`/`remove`/`set`/`clear` are ordinary method names. The check keys on the
+    // RECEIVER KIND, so a value-receiver method on a user struct must not be caught — a
+    // name-only key would reject this and there would be no way to write it.
+    let out = ees_diag("userm", "type EesBox \{ n: Int \}\n\nfn EesBox_set(b: EesBox, v: Int) -> Int \{ b.n + v \}\n\nfn main() \{\n    let b = EesBox \{ n: 1 \}\n    io.println(\"\{b.set(2)\}\")\n\}\n")
+    assert(out.contains("E0610") == false)
+}
+
+test "ees4yr the help points at the declaring line" {
+    // The span is on the CALL, which is what the reader is looking at, so the line of the
+    // `let` has to travel in the help text or a long function makes them hunt for it.
+    let out = ees_diag("declline", "fn main() \{\n    let xs: List[Int] = [1]\n    io.println(\"pad\")\n    io.println(\"pad\")\n    xs.push(2)\n\}\n")
+    assert(out.contains("E0610"))
+    assert(out.contains("at line 2"))
+}
+
+test "ees4yr the diagnostic names the binding and the method" {
+    // A message that says only "requires let mut" makes the reader hunt for which of several
+    // collections in scope is at fault. Both names must appear.
+    let out = ees_diag("msg", ees_wrap("    let scores: List[Int] = [1]\n    scores.push(2)"))
+    assert(out.contains("scores"))
+    assert(out.contains("push"))
+}
+
+test "ees4yr a let-mut binding accepts every mutating method it has" {
+    // The positive control, and it runs rather than merely compiling: an over-broad check
+    // would take this whole row down.
+    let mut xs: List[Int] = [1, 2]
+    xs.push(3)
+    xs.set(0, 9)
+    let p = xs.pop()
+    assert_eq(p.unwrap(), 3)
+    assert_eq(xs.get(0).unwrap(), 9)
+    assert_eq(xs.len(), 2)
+    xs.clear()
+    assert_eq(xs.len(), 0)
+
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    m.insert("b", 2)
+    // Map.remove returns Bool, not the spec's Option[V] — br ddapre. Asserted as it is, so
+    // this row pins today's contract instead of the one the spec wrote.
+    assert(m.remove("a"))
+    assert_eq(m.len(), 1)
+    m.clear()
+    assert_eq(m.len(), 0)
+
+    let mut s: Set[Int] = Set()
+    assert(s.insert(1))
+    assert(s.remove(1))
+    assert_eq(s.len(), 0)
+}
+
+test "ees4yr non-mutating methods on a non-mut List stay legal" {
+    // The spec's own list of what an immutable binding may still call, plus the transforming
+    // methods that return a new list. `concat`/`slice` and not `append`/`reverse`/`sort`:
+    // those three are in the spec table but do not exist (br s58gjs).
+    let xs: List[Int] = [3, 1, 2]
+    assert_eq(xs.len(), 3)
+    assert(xs.is_empty() == false)
+    assert(xs.contains(1))
+    assert_eq(xs.get(0).unwrap(), 3)
+    assert_eq(xs.concat([4]).len(), 4)
+    assert_eq(xs.slice(0, 2).len(), 2)
+    // .collect() is required: a let bound to a bare .map(f) is spelled List[T] and resolves no
+    // List method — br 58gbmc. Written with it so this row tests the mutability rule and not
+    // that bug.
+    assert_eq(xs.map(fn(v: Int) -> Int { v * 2 }).collect().get(0).unwrap(), 6)
+    assert_eq(xs.filter(fn(v: Int) -> Bool { v > 1 }).collect().len(), 2)
+    assert_eq(xs.fold(0, fn(a: Int, v: Int) -> Int { a + v }), 6)
+    // The receiver survives: none of the above mutated it.
+    assert_eq(xs.len(), 3)
+}
+
+test "ees4yr non-mutating methods on a non-mut Map and Set stay legal" {
+    let mut m0: Map[Str, Int] = Map()
+    m0.insert("a", 1)
+    let m = m0
+    assert_eq(m.len(), 1)
+    assert(m.contains_key("a"))
+    assert(m.contains("a"))
+    assert_eq(m.get("a").unwrap(), 1)
+    assert_eq(m.keys().len(), 1)
+    assert_eq(m.values().len(), 1)
+    // Not m.entries() or m.get_or_default(..) — both are in the spec table and neither exists
+    // (br ddapre).
+
+    let mut s0: Set[Int] = Set()
+    s0.insert(5)
+    let s = s0
+    assert_eq(s.len(), 1)
+    assert(s.contains(5))
+    assert(s.is_empty() == false)
+}
+
+test "ees4yr the check is scope-keyed, not name-keyed" {
+    // A shadowing `let mut` of the same name must be the one consulted. A check that keyed on
+    // the name alone, or on the first declaration it saw, would reject this.
+    let xs: List[Int] = [1]
+    assert_eq(xs.len(), 1)
+    let mut xs2: List[Int] = [1]
+    xs2.push(2)
+    assert_eq(xs2.len(), 2)
+    if true {
+        let mut inner: List[Int] = []
+        inner.push(7)
+        assert_eq(inner.get(0).unwrap(), 7)
+    }
+}
+
+test "ees4yr a mutating method on a let-mut binding inside a loop stays legal" {
+    // Guards the loop/scope-frame path: nr scope frames are pushed per block, and a check that
+    // lost the binding's is_mut across a frame boundary would fire here.
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < 3 {
+        out.push(i)
+        i = i + 1
+    }
+    assert_eq(out.len(), 3)
+    assert_eq(out.get(2).unwrap(), 2)
+}
+
+test "ees4yr StringBuilder and Bytes are deliberately out of scope" {
+    // The spec rule is §3.2.2 Collection Methods and names List/Map/Set. StringBuilder.write /
+    // .clear and Bytes.push are mutating in the ordinary sense but are not collection methods,
+    // and extending the rule to them would be a language change, not this fix. This row does
+    // not endorse the current behaviour — it pins it, so widening the check later is a
+    // deliberate act with a failing test rather than a silent side effect.
+    let sb = StringBuilder()
+    sb.write("x")
+    sb.write("y")
+    assert_eq(sb.to_str(), "xy")
+    sb.clear()
+    assert_eq(sb.len(), 0)
+}

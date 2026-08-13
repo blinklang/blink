@@ -8840,6 +8840,100 @@ a real closure carrier or a fail-closed diagnostic. `List[closure]` already work
 path has a channel the Option carrier lacks — that contrast is where whoever takes it should start,
 rather than inventing a third representation.
 
+## The rule the spec states, the example it marks COMPILE ERROR, and nine methods that ignored both (br `ees4yr`)
+
+`sections/03_types.md:302` states it plainly: "Mutating methods (`push`, `pop`, `insert`, `remove`,
+`set`) require the binding to be `let mut`. Immutable bindings can only call non-mutating methods."
+:316 gives the counter-example with the verdict written in: `names.push("Dave")  // COMPILE ERROR —
+names is not mut`. That program compiled, ran, and printed the mutated length.
+
+**The first deliverable was scope, and the answer is that the check did not exist.** Not one of the
+nine implemented mutating methods enforced it — `List.push/pop/set/clear`, `Map.insert/remove/clear`,
+`Set.insert/remove` all accepted a plain `let` receiver and mutated it. There was no correct site to
+copy from. `List.insert` and `List.remove` are in the spec's table but are not implemented at all (br
+`5ebq1h`); both are listed in the new method table so they arrive covered rather than needing a
+second edit.
+
+**The second deliverable was the ticket's own caution — do not assume the emitted C is
+const-correct.** It is not, and that is why the severity really is "missing diagnostic" and not
+"writing through a const object": collections are never const-qualified, so `let xs` and `let mut xs`
+both emit `blink_list* xs = _l0;`. Scalars and structs *do* get `const` today. So the spec's second
+rationale at :320 — that the C backend can emit `const` for immutable bindings — remains unrealised
+for exactly the types this rule is about. Checked before deciding, as the ticket asked.
+
+**The home is `tc_check_body`'s MethodCall arm, and `infer_type`'s arm is the wrong one.**
+`infer_type` is a memo *wrapper*: it always calls `infer_type_uncached` and only records the result,
+so it does not short-circuit and it runs several times per node — the nr pass, the inference pass,
+and mono re-inference. A diagnostic emitted there reports two or three times for one call.
+`tc_check_body` walks each node exactly once **with the nr scope frames live**, which is the pair of
+properties this check needs and the only place both hold. It is reached in statement position via the
+ExprStmt arm and in binding position via LetBinding.
+
+**Keyed on the receiver's kind, never on the method name.** `insert`, `remove`, `set` and `clear` are
+ordinary user method names; a name-only key rejects `my_widget.set(3)`.
+`tc_is_mutating_collection_method(k: TyKind, method: Str)` takes the kind, and `type_kind` resolves
+bound metavars internally while `resolve_alias_tid` handles `type Names = List[Str]`. Three candidate
+authorities for the method set, and only one is real:
+
+1. The per-type tables' `Mutates` column (`sections/03_types.md:369`, `:430`, `:485`) — **this one**.
+2. The trait blocks' `// Mutation (requires let mut)` comments — wrong: the MapOps block files
+   `contains_key` under that heading while its own table row says Mutates=no (br `psytmt`).
+3. `pp_is_mutating_method` (`typecheck.bl:4719`) — wrong, and the tempting one, because it already
+   exists and looks authoritative. It is the `@pure` walker's list and it includes `append`, which is
+   Mutates=no.
+
+**`nr_is_mut` cannot tell a parameter from a `let`** — both answer 0 — so `is_mut` alone cannot scope
+the rule. Binder identity has to come from the declaring node: parameters bind through the node-less
+`nr_define_typed` in `tc_check_fn`, lets through `nr_define_typed_at(..., node)`. Hence a new
+accessor `nr_binding_node(name)` plus a `node_kind(decl) == NodeKind.LetBinding` guard, which leaves
+parameters, match/for/with binders and closure params deliberately out. Parameters are the
+interesting exclusion: `fn f(xs: List[Int]) { xs.push(9) }` mutates the *caller's* list and the
+spec's sentence does not reach it — that is br `5ryk88`, spec-undecided, and not a question this
+ticket gets to answer unilaterally. Module-level globals are unaffected too, verified by the
+pre-existing `test_type_errors` row that still reports E0300 rather than E0610.
+
+**New code E0610 / `MutationRequiresMut`.** E0602 is spec-reserved
+(`sections/05_memory_compile_errors.md:346`) and unimplemented, so it was left alone rather than
+claimed. The help carries the *declaring* line, because the span points at the call:
+`declare it as 'let mut m' at line 3`. That is a usability decision that paid for itself immediately
+— it is what made the corpus migration mechanically drivable, since the compiler named every site
+together with the declaration to change.
+
+**Two real aliasing bugs in the compiler's own source**, which is the class the spec's `grep "let
+mut"` rationale exists to expose — a binding never reassigned whose aliased collection is mutated:
+
+```
+src/codegen_derive.bl:81  let eq_target = if is_generic { derive_eq_generic_bases } else { derive_eq_types }   ... eq_target.push(tname)
+src/parser.bl:92          let items = sl_data.get(sl).unwrap()                                                 ... items.push(node_id)
+```
+
+A test row mirrors that shape so it stays covered.
+
+**Blast radius, measured rather than estimated:** 10 sites in `src` + `lib` across 5 files, 278 in
+`tests` + `examples` across 54 files. The heuristic candidate list said 391; the inflation was
+StringBuilder and Bytes receivers, neither of which is in scope.
+
+**Two traps worth carrying forward.** A probe `blinkc` built into a scratchpad directory resolves
+stdlib modules from `argv[0]`, prints `ModuleNotFound` for all 11 prelude modules, degrades
+typechecking, and produced a **false zero-violation sweep** over `lib/std`. It must live in `build/`.
+And `bootstrap.sh` copies `lib/std/*.bl` into `build/lib/std` with the archive built from *those*, so
+an edit to `lib/std` has no effect until a regen — which is what made the migration script report
+repeated NOMATCH on `http_types.bl` / `http_client.bl` lines it had already fixed.
+
+**Census after — divergence-neutral, and confirmed per cell.** Both build modes over `tests` +
+`examples` + `src`: `diverge=43 missing=109` before and after, and a per-cell diff of the normalized
+`(site, tid, flat)` triples on a **common-file basis** — the 991-file / 922-file intersections, 17
+distinct cells in each mode — is identical. Excluding "the new test roots" is not a sound comparison
+basis and published a wrong figure once; intersect the file sets instead. Diagnostics do not move
+types, and this measurement says so rather than assuming it.
+
+`tests/test_ees4yr_mut_binding_required.bl`, 21 rows: ten E0610 expectations (the spec's own
+counter-example verbatim, then each of the nine implemented methods), the aliasing row, three
+negative controls pinning what is deliberately out of scope (a parameter is not rejected, a user
+method sharing a mutating name is untouched, StringBuilder and Bytes are untouched), a row asserting
+the help names the declaring line, and six acceptance rows that *run* and assert values. One of those
+pins `Map.remove` returning `Bool` rather than `Option[V]` (br `ddapre`).
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

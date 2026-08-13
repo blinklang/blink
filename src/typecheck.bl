@@ -23,6 +23,7 @@ import diagnostics.{
     NON_EXHAUSTIVE_MATCH,
     TYPE_ERROR, TEMPLATE_MISMATCH, CANNOT_INFER_TYPE, NOT_ITERABLE, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
+    MUTATION_REQUIRES_MUT,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -6460,6 +6461,18 @@ fn nr_mark_written(name: Str, _node: Int) ! Diag.Report {
     }
 }
 
+// The declaring node of `name`'s current top binding, or -1 when the binder recorded none.
+// br ees4yr reads it to tell a `let` apart from every other way a name enters scope: a
+// parameter, a match/for/with binder and a closure param all define through the node-less
+// nr_define_typed / nr_define_mut, so -1 there means "not a let" without a per-binder flag.
+fn nr_binding_node(name: Str) -> Int {
+    match nr_name_top.get(name) {
+        Some(i) => return nr_scope_nodes.get(i).unwrap()
+        None => {}
+    }
+    -1
+}
+
 fn nr_get_type(name: Str) -> Int {
     match nr_name_top.get(name) {
         Some(i) => return nr_scope_types.get(i).unwrap()
@@ -11564,6 +11577,59 @@ fn tc_bind_with_resource(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.
 // the recursive tc_check_body and other nr_* writes fall outside that pattern,
 // which the analyzer correctly flags.
 @allow(UnrestoredMutation, IncompleteStateRestore)
+// br ees4yr. Which collection methods the spec calls mutating, keyed by RECEIVER KIND and
+// not by bare method name: `insert`/`remove`/`set`/`clear` are all ordinary user method
+// names too, and a name-only key would reject `my_widget.set(3)`.
+//
+// The set comes from the per-type tables' `Mutates` column (sections/03_types.md:369, :430,
+// :485) and NOT from the trait blocks' "// Mutation (requires let mut)" comments — the
+// MapOps block files `contains_key` under that comment while its own table row says
+// Mutates=no (br psytmt). It is also NOT pp_is_mutating_method (:4718), which is the @pure
+// walker's list and includes `append`, marked Mutates=no. List.insert/List.remove are in the
+// spec table and do not exist yet (br 5ebq1h); they are listed here so they arrive covered.
+fn tc_is_mutating_collection_method(k: TyKind, method: Str) -> Int {
+    if k == TyKind.List {
+        return method == "push" || method == "pop" || method == "set" || method == "clear" || method == "insert" || method == "remove"
+    }
+    if k == TyKind.Map {
+        return method == "insert" || method == "remove" || method == "clear"
+    }
+    if k == TyKind.Set {
+        return method == "insert" || method == "remove"
+    }
+    0
+}
+
+// sections/03_types.md:302 — "Mutating methods require the binding to be `let mut`", with
+// `names.push("Dave")  // COMPILE ERROR` at :316. The rationale at :320 is that `grep "let
+// mut"` must find every mutation source, so the check has to key on the BINDING, which is
+// why only a bare-Ident receiver is in scope: `mk_list().push(1)` mutates a temporary that
+// no binding names.
+//
+// A parameter is a separate and currently unrestricted mutation source — `fn f(xs:
+// List[Int]) { xs.push(9) }` mutates the caller's list — and whether the rule reaches there
+// is a live spec question (br 5ryk88), so params are left alone. nr_is_mut answers 0 for a
+// param exactly as it does for a plain `let`, so is_mut alone cannot tell them apart: the
+// binder identity has to come from the decl node, which only the `let` binder records. That
+// same guard leaves match/for/with binders and closure params out, each of which is its own
+// question the spec's text does not reach.
+fn tc_check_mutating_method(node: Int, obj: Int, obj_t: Int) ! Diag.Report {
+    if obj == -1 { return }
+    if node_kind(obj) != NodeKind.Ident { return }
+    let name = node_name(obj)
+    if nr_has_binding(name) == 0 { return }
+    if nr_is_mut(name) != 0 { return }
+    let decl = nr_binding_node(name)
+    if decl == -1 || node_kind(decl) != NodeKind.LetBinding { return }
+    let method = node_method(node)
+    if tc_is_mutating_collection_method(type_kind(resolve_alias_tid(obj_t)), method) == 0 { return }
+    tc_errors.push("cannot call mutating method '{method}' on immutable binding '{name}'")
+    // The span points at the CALL, because that is what the reader is looking at, so the help
+    // has to carry the line of the `let` — otherwise a long function makes the reader hunt for
+    // which of several same-named bindings is in scope here.
+    diag_error_at("MutationRequiresMut", MUTATION_REQUIRES_MUT, "cannot call mutating method '.{method}' on immutable binding '{name}'", node, "declare it as 'let mut {name}' at line {node_line(decl)}")
+}
+
 fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return }
     let kind = node_kind(node)
@@ -12131,6 +12197,12 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // the Part B body walk: bind unannotated closure params to the elem/acc
         // type and type-check the body once.
         let obj_t = infer_type(node_obj(node))
+        // br ees4yr. This arm, and not infer_type's MethodCall arm: infer_type is called
+        // several times per node (the nr pass, then the inference pass, then re-inference for
+        // mono) and its memo wrapper does not short-circuit, so a diagnostic emitted there
+        // reports two or three times. tc_check_body walks each node once, with the nr scope
+        // frames live, which is the pair of facts the check needs.
+        tc_check_mutating_method(node, node_obj(node), obj_t)
         let args_sl = node_args(node)
         // The argument the List-HOF path walks itself, so the generic walk below does not
         // report its contents a second time.
