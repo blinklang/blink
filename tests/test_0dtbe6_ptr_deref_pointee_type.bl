@@ -1,0 +1,98 @@
+import compile_test_helpers.{compile_and_run}
+
+// br 0dtbe6 — a pointer's POINTEE travelled through one channel only: the `let` annotation.
+//
+// Two independent places read it, and BOTH are annotation-first:
+//
+//   1. the DECLARATION. `resolve_ptr_inner_c` (codegen_types.bl) reads `cg_let_target_ann`
+//      and nothing else, and maps the name through `ptr_inner_c_type`, whose fallback arm is
+//      `_ => "void"`. So a pointee the map does not list — `Bool` is one — declares as
+//      `void*`, and then even `p.write(true)` is *invalid use of void expression*.
+//   2. the DEREFERENCE. `Ptr.deref()` in codegen_methods hard-coded `expr_result_type =
+//      CT_INT`, so the RESULT of `*(p)` was an `int64_t` whatever the pointer pointed at.
+//
+// (2) is the one that is silent. `Ptr[Float]` reads a `double` through an `int64_t`
+// initializer, so 1.5 truncates to 1 with exit 0 and no diagnostic. A struct pointee is
+// louder — `int64_t v = (*(s))` does not compile — but it is the same single line.
+//
+// Sized ints looked correct before the fix and still are, for a reason that is worth writing
+// down: `*(int32_t*)` promotes to `int64_t` losslessly, so the VALUE survived; what CT_INT
+// lost was the width and signedness, which govern `/ < >`, overflow trapping and
+// `.wrapping_*` resolution (the same reason `sized_int_ct_from_tid` answers a CT and not a C
+// string). The guard rows below hold that.
+//
+// SCOPE. This publishes the pointee's C type and the pointee's CT. It does NOT decide whether
+// `.deref()` is spec'd as `T` or as `Option[T]` — sections/07_trust_modules_metadata.md:217
+// says `Option[T]`, codegen says bare `T`, and lib/std/libc.bl depends on the bare form. That
+// is br mwsy85, a spec question. Same separation hgd2az used: fix the element type without
+// settling the surface.
+
+// ── The silent one ───────────────────────────────────────────────────────────────────
+
+test "a Float pointee derefs as a Float, not as a truncated Int" {
+    with ffi.scope() as scope {
+        let p: Ptr[Float] = scope.alloc()
+        p.write(1.5)
+        assert_eq("{p.deref()}", "1.5")
+    }
+}
+
+test "a Float pointee survives an unannotated take, where only the tid names it" {
+    with ffi.scope() as scope {
+        let p: Ptr[Float] = scope.alloc()
+        p.write(2.25)
+        let taken = scope.take(p)
+        assert_eq("{taken.deref()}", "2.25")
+    }
+}
+
+// ── Widths and signedness must not regress ───────────────────────────────────────────
+
+test "an Int pointee still round-trips" {
+    with ffi.scope() as scope {
+        let p: Ptr[Int] = scope.alloc()
+        p.write(3)
+        assert_eq(p.deref(), 3)
+        let taken = scope.take(p)
+        assert_eq(taken.deref(), 3)
+    }
+}
+
+test "sized-int pointees still round-trip" {
+    with ffi.scope() as scope {
+        let q: Ptr[I32] = scope.alloc()
+        q.write(7)
+        assert_eq("{q.deref()}", "7")
+        let u: Ptr[U8] = scope.alloc()
+        u.write(200)
+        assert_eq("{u.deref()}", "200")
+    }
+}
+
+test "addr and is_null are unaffected" {
+    with ffi.scope() as scope {
+        let p: Ptr[Int] = scope.alloc()
+        p.write(11)
+        assert_eq(p.is_null(), false)
+        assert(p.addr() != 0)
+    }
+}
+
+// ── The two cc escapes ───────────────────────────────────────────────────────────────
+//
+// Written as sources rather than as corpus rows because a `void*` declaration makes the whole
+// FILE uncompilable, which would take the rows above down with it.
+
+test "a Bool pointee declares as a bool, not as void" {
+    let src = "@trusted(audit: \"0dtbe6-test\")\nfn go() ! FFI \{\n    with ffi.scope() as scope \{\n        let b: Ptr[Bool] = scope.alloc()\n        b.write(true)\n        io.println(\"bool=\{b.deref()}\")\n    }\n}\nfn main() \{ go() }\n"
+    let r = compile_and_run(src, "0dtbe6_bool_pointee")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("bool=true"))
+}
+
+test "a struct pointee derefs as the struct, not as an Int" {
+    let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\n@trusted(audit: \"0dtbe6-test\")\nfn go() ! FFI \{\n    with ffi.scope() as scope \{\n        let s: Ptr[Pollfd] = scope.alloc()\n        let v = s.deref()\n        io.println(\"fd=\{v.fd}\")\n    }\n}\nfn main() \{ go() }\n"
+    let r = compile_and_run(src, "0dtbe6_struct_pointee")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("fd=0"))
+}

@@ -13736,14 +13736,23 @@ fn tc_channel_elem_tid(chan_tid: Int) -> Int {
     tc_tid_resolved(tc_tid_child(t, 0))
 }
 
-// The element's CT when the element is representable BY VALUE in codegen's flat universe,
-// and -1 when it is not — in which case the caller must keep its existing flat behaviour
-// rather than trade one wrong answer for another. The gate and the answer are the same
-// function on purpose: a kind that this cannot spell cannot be claimed as supported
-// somewhere else. The match is exhaustive so a kind added later fails to compile here
-// instead of falling through to a plausible CT.
-pub fn tc_channel_elem_ct(chan_tid: Int) -> Int {
-    let e = tc_channel_elem_tid(chan_tid)
+// The CT of a tid when a bare CT is a COMPLETE answer for it, and -1 when it is not — in
+// which case the caller must keep its existing flat behaviour rather than trade one wrong
+// answer for another. The gate and the answer are the same function on purpose: a kind that
+// this cannot spell cannot be claimed as supported somewhere else. The match is exhaustive so
+// a kind added later fails to compile here instead of falling through to a plausible CT.
+//
+// The rule dividing the arms is one line: a bare CT is complete exactly when the type's C
+// spelling does not depend on children. Everything with children (List, Map, Set, Option,
+// Result, Tuple, Ptr, and a generic struct/enum instance) needs metadata that only the flat
+// side channels or the mono registry carry, so answering CT_LIST for a `List[Foo]` would move
+// the wrong element type one level DOWN rather than fix it. Those decline.
+//
+// Two callers, one for a Channel's element (br hgd2az) and one for a Ptr's pointee (br
+// 0dtbe6). They ask the same question about a different child, so they share the answer
+// rather than keeping two copies that can drift apart.
+fn tc_tid_byvalue_ct(tid: Int) -> Int {
+    let e = tc_tid_resolved(tid)
     if e < 0 { return -1 }
     let k = tc_tid_kind(e)
     // A struct or a data enum travels as its typedef, by value. A GENERIC instance is
@@ -13770,15 +13779,20 @@ pub fn tc_channel_elem_ct(chan_tid: Int) -> Int {
         TyKind.U32 => CT_U32
         TyKind.U64 => CT_U64
         // Two runtime handles with no element of their own, so nothing is lost by carrying
-        // them: the box holds the handle and the unboxed value is complete.
+        // them: the value IS the handle and a bare CT describes it completely.
         TyKind.Bytes => CT_BYTES
         TyKind.StringBuilder => CT_STRINGBUILDER
-        // A CONTAINER element round-trips through the box perfectly well; what does not
-        // round-trip is its own element/key/value metadata, which lives in flat side fields
-        // that a `recv()` result has no way to carry. Claiming these would turn a wrong
-        // element type into a wrong element type ONE LEVEL DOWN — the exact defect this
-        // ticket is fixing — so they stay with the fallback until c_type_from_tid makes the
-        // whole tree spellable.
+        // The children cases. The VALUE travels fine — a `blink_list*` is a `blink_list*`
+        // however it is reached; what does not travel is its own element/key/value metadata,
+        // which lives in flat side fields that neither a `recv()` result nor a `deref()`
+        // rvalue has any way to carry. Claiming these would move a wrong element type ONE
+        // LEVEL DOWN rather than fix it, so they stay with the fallback until c_type_from_tid
+        // makes the whole tree spellable at every consumer.
+        //
+        // TyKind.Ptr is in this list for that reason and not because a pointer is not a
+        // by-value thing: `Ptr[Ptr[Int]]` derefs to a perfectly good pointer, but the pointee
+        // of THAT pointer has nowhere to go, so the next `.deref()` would be back to
+        // guessing. What the declared shape of a nested pointer should be is br mwsy85.
         TyKind.List => -1
         TyKind.Map => -1
         TyKind.Set => -1
@@ -13792,10 +13806,11 @@ pub fn tc_channel_elem_ct(chan_tid: Int) -> Int {
         TyKind.Iterator => -1
         TyKind.Template => -1
         TyKind.FfiScope => -1
-        // No element type at all. `Channel[Void]` is not a thing, an unresolved metavar or a
-        // typevar means the element is not known YET, and a bare `Channel(n)` reaches here
-        // through TyKind.Unknown — that spelling names no element and is br w3v2e6's
-        // inference task, not a hole in this function.
+        // Nothing to carry. `Channel[Void]` is not a thing, an unresolved metavar or a typevar
+        // means the type is not known YET, and a bare `Channel(n)` reaches here through
+        // TyKind.Unknown — that spelling names no element and is br w3v2e6's inference task,
+        // not a hole in this function. Void as a POINTEE is the deliberate `Ptr[Void]` opaque
+        // handle, whose `void*` the flat path already prints.
         TyKind.Void => -1
         TyKind.Typevar => -1
         TyKind.Unknown => -1
@@ -13805,11 +13820,46 @@ pub fn tc_channel_elem_ct(chan_tid: Int) -> Int {
     }
 }
 
+pub fn tc_channel_elem_ct(chan_tid: Int) -> Int {
+    tc_tid_byvalue_ct(tc_channel_elem_tid(chan_tid))
+}
+
 // The bare struct/enum name behind a CT_STRUCT element; "" for every other element. Paired
 // with tc_channel_elem_ct — a caller that reads CT_STRUCT must read this too, or it has a
 // nameless struct.
 pub fn tc_channel_elem_struct(chan_tid: Int) -> Str {
     tc_tid_struct(tc_channel_elem_tid(chan_tid))
+}
+
+// ── Pointer pointee type, for `Ptr.deref()` (br 0dtbe6) ──────────────────────────────
+//
+// `deref` hard-coded `expr_result_type = CT_INT`, so `*(p)` was an int64_t whatever p pointed
+// at: `Ptr[Float]` truncated 1.5 to 1 with exit 0 and no diagnostic, and a struct pointee did
+// not compile (`int64_t v = (*(s));`). Same shape as the channel pair above — the type was in
+// the tid the whole time, and the pointee reached codegen only through the `let` annotation.
+//
+// Answers the pointee's CT, or -1 when a bare CT is not a complete answer for it, in which
+// case the caller keeps CT_INT. This does NOT decide whether `.deref()` is spec'd as `T` or as
+// `Option[T]` (sections/07_trust_modules_metadata.md:217 says the latter, codegen and
+// lib/std/libc.bl the former) — that is br mwsy85, a spec question, and publishing the pointee
+// is orthogonal to it.
+fn tc_ptr_pointee_tid(ptr_tid: Int) -> Int {
+    let t = tc_tid_resolved(ptr_tid)
+    if t < 0 { return -1 }
+    if tc_tid_kind(t) != TyKind.Ptr { return -1 }
+    if tc_tid_child_count(t) < 1 { return -1 }
+    tc_tid_resolved(tc_tid_child(t, 0))
+}
+
+pub fn tc_ptr_pointee_ct(ptr_tid: Int) -> Int {
+    tc_tid_byvalue_ct(tc_ptr_pointee_tid(ptr_tid))
+}
+
+// The bare struct/enum name behind a CT_STRUCT pointee; "" otherwise. Paired with
+// tc_ptr_pointee_ct exactly as tc_channel_elem_struct is with tc_channel_elem_ct: a caller
+// that reads CT_STRUCT must read this too, or it has a nameless struct.
+pub fn tc_ptr_pointee_struct(ptr_tid: Int) -> Str {
+    tc_tid_struct(tc_ptr_pointee_tid(ptr_tid))
 }
 
 // ── Stage 3: the C type of a tid, spelled recursively ────────────────────────────────

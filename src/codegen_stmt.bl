@@ -3439,6 +3439,21 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     if val_type == CT_INT && (ann_ct == CT_I8 || ann_ct == CT_I16 || ann_ct == CT_I32 || ann_ct == CT_U8 || ann_ct == CT_U16 || ann_ct == CT_U32 || ann_ct == CT_U64) {
         val_type = ann_ct
     }
+    // The other direction of the same rule — the ANNOTATION governs an integer local's
+    // declaration — which had nothing to reach until `deref()` started answering the pointee's
+    // own CT (br 0dtbe6). `let n: Int = p.deref()` on a `Ptr[U8]` otherwise declares `n` as
+    // `uint8_t` under an `Int` annotation, taking the local's arithmetic (signedness, the
+    // overflow trap, `.wrapping_*`) with it. typecheck records that local at the ANNOTATION's
+    // Int — the census row reads `ty=Int` — so the tid and the emitted C would disagree, which
+    // is the one thing this stage exists to remove.
+    //
+    // That the program typechecks AT ALL is a separate fail-open: written explicitly, `let u:
+    // U8 = 200` then `let n: Int = u` is a TypeError, because sized ints are nominally distinct
+    // from Int. `.deref()` is unsigned in typecheck (typecheck.bl:9986, pending br mwsy85), so
+    // the declared type is never compared against the RHS. br axpq22.
+    if ann_ct == CT_INT && (val_type == CT_I8 || val_type == CT_I16 || val_type == CT_I32 || val_type == CT_U8 || val_type == CT_U16 || val_type == CT_U32 || val_type == CT_U64) {
+        val_type = CT_INT
+    }
     // br tm1vbv — the tid twin of the annotation rule directly above, for the case that rule
     // cannot reach: a binding with NO annotation. `expr_result_type` is CT_INT whenever the value
     // arrives through an anonymous carrier temp (`l.get(0).unwrap()`, `m.get(k).unwrap()`,
@@ -4161,13 +4176,24 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             emit_line("const {c_type_c_name(struct_type)} {cname} = {val_str};")
         }
     } else if val_type == CT_PTR && type_ann != -1 {
-        let pelems = node_elements(type_ann)
-        let mut ptr_c_type = "void*"
-        if pelems != -1 && sublist_length(pelems) > 0 {
-            ptr_c_type = "{ptr_inner_c_type(node_name(sublist_get(pelems, 0)))}*"
+        // br 0dtbe6. The tid LEADS the annotation here, which reverses this branch's original
+        // order. Both channels describe the same binding, so they agree wherever the
+        // annotation's own mapping has an arm — but `ptr_inner_c_type` is a fixed name table
+        // whose fallback is `_ => "void"`, so a pointee it does not list (`Bool` is one)
+        // declared as `void*` and then even `p.write(true)` was *invalid use of void
+        // expression*. ptr_c_from_tid declines on `void*`, so the annotation keeps every
+        // binding the tid cannot improve on, including the deliberate `Ptr[Void]`.
+        let mut ptr_c_type = ptr_c_from_tid(decl_tid)
+        decl_branch = "ptr_ann_tid"
+        if ptr_c_type == "" {
+            let pelems = node_elements(type_ann)
+            ptr_c_type = "void*"
+            if pelems != -1 && sublist_length(pelems) > 0 {
+                ptr_c_type = "{ptr_inner_c_type(node_name(sublist_get(pelems, 0)))}*"
+            }
+            decl_branch = "ptr_ann"
         }
         decl_c = ptr_c_type
-        decl_branch = "ptr_ann"
         emit_line("{ptr_c_type} {cname} = {val_str};")
     } else if val_type == CT_PTR && ffi_offset_pending_struct != "" {
         decl_c = "{c_type_c_name(ffi_offset_pending_struct)}*"

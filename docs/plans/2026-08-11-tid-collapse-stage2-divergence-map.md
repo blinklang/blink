@@ -7629,6 +7629,118 @@ compound slot `IBox[Option[Int]]`, a generic-enum instance, the annotation-fixed
 (the binder consumer), a generic fn whose mono body must agree with its caller on the stem, and an
 unsubstituted-typevar row that must keep declining.
 
+## A pointer's pointee reached codegen through the annotation only (br `0dtbe6`)
+
+The ticket's title names one cell — `Ptr[Float].deref()` prints `1` — and the fix found three,
+in two different channels. That is the same lesson as `bn3e6j`: the ticket is a sighting, and
+reading the source before naming a cause is what turns a sighting into the population.
+
+### The three cells
+
+`Ptr.deref()` set `expr_result_type = CT_INT` unconditionally (`codegen_methods.bl:5005`), so
+`*(p)` was an `int64_t` whatever `p` pointed at:
+
+| pointee | emitted | what happened |
+| --- | --- | --- |
+| `Float` | `const int64_t f = (*(p));` over `double* p` | **silent.** `1.5` printed as `1`, exit 0, no diagnostic |
+| an `@ffi.struct` | `const int64_t v = (*(s));` | `cc`: *incompatible types … using type `blink_Pollfd`*, no Blink span |
+| `Bool` | `void* b` | `cc`: *invalid use of void expression* — on `b.write(true)`, before any deref |
+
+The third one is a different channel and is why the fix is not one line. The declaration branch
+read the pointee out of the binding's own annotation and mapped the name through
+`ptr_inner_c_type`, a fixed name table whose fallback arm is `_ => "void"` — and it has no
+`Bool` arm. So `let b: Ptr[Bool]` declared `void*` while the tid said `int*`.
+
+Sized-int pointees looked correct before the fix and still are, for a reason worth writing
+down rather than filing as luck: `*(int32_t*)` promotes to `int64_t` losslessly, so the VALUE
+survived. What `CT_INT` lost for them was the width and the signedness, which govern `/ < >`,
+the overflow trap the spec promises for sized ints, and whether `.wrapping_*` resolves at all —
+the same three consumers that made `tm1vbv`'s helper answer a CT instead of a C string.
+
+### One question about two children, answered once
+
+`tc_channel_elem_ct` (br `hgd2az`) already answered *"can a bare CT describe this child
+completely?"* for a Channel's element. A Ptr's pointee is the same question about a different
+child, so the body became `tc_tid_byvalue_ct` and both seams are now thin wrappers over it
+rather than two copies with a drift risk. The rule dividing its arms is one line:
+
+> A bare CT is a complete answer exactly when the type's C spelling does not depend on
+> children.
+
+Everything with children declines, and `-1` means *keep whatever you do today* — the same
+contract, for the same reason, as `c_type_from_tid`'s `""`. `TyKind.Ptr` is in the declining
+list, which reads oddly for a fix about pointers and is deliberate: `Ptr[Ptr[Int]]` derefs to a
+perfectly good pointer, but the pointee of THAT pointer has nowhere to travel, so the next
+`.deref()` would be back to guessing. What a nested pointer's declared shape should be is br
+`mwsy85`.
+
+### The tid leads, and this time it reverses an existing branch
+
+The `ptr_ann` branch now asks `ptr_c_from_tid(decl_tid)` FIRST and keeps the annotation as the
+fallback (`bef42x`'s ordering doctrine, `ptr_c_from_tid`'s `void*` decline as the gate). That is
+a reversal of the branch's original order, not an addition alongside it — justified because both
+channels describe the same binding, so they agree wherever the annotation's own table has an
+arm, and the table's `_ => "void"` fallback is exactly where it does not.
+
+### Measured
+
+```
+                     before (post-tk8s0y)          after
+ctype.ptr_ann        agree=96   missing=0          agree=1     missing=0
+ctype.ptr_ann_tid    —                             agree=101   missing=0
+ctype.flat  diverge  9                             9
+TOTAL missing        114                           114
+```
+
+Identical in both build modes. The flip changed **no emitted C in the corpus**: all 96
+pre-existing rows agreed already, and one row still falls through to the annotation and agrees
+there. That is not a null result — an all-agree flip is the proof that the flat arm contributes
+nothing recoverable at that site, which is precisely the precondition Stage 4 needs before
+deleting it. The `Bool` pointee is not a corpus shape at all, so the census could never have
+found it (`feedback_corpus_sweep_is_not_coverage`); the test constructs it by hand.
+
+`TOTAL missing` does not move, and the reason is worth stating plainly: the census cell for
+`let f = p.deref()` is a `ctype.flat` `ty=?` row, i.e. the local has **no tid**, because
+typecheck signs `is_null`, `offset` and `to_str` on a Ptr and deliberately omits `deref` and
+`addr` (`typecheck.bl:9986`, pending br `mwsy85`). Codegen now spells the pointee correctly at a
+site typecheck still has no type for. Closing that row means signing the method, which is the
+next paragraph.
+
+### The byproduct the census caught in the same hour
+
+With `deref` answering the pointee, four corpus rows started diverging:
+`ty=Int tidc=int64_t emitted=uint8_t`. All four are `let n: Int = <Ptr[U8]>.deref()` — a U8
+stored into an `Int` local, which is a hard `TypeError` when written explicitly:
+
+```blink
+let u: U8 = 200
+let n: Int = u          // error[TypeError] — sized ints are nominally distinct from Int
+```
+
+It is accepted through `deref` only because the method is unsigned, so the declared type is
+never compared against the RHS. Two consequences, kept separate on purpose:
+
+- **The emitted C** is now put back in agreement with the tid: `emit_let_binding` carries the
+  reverse direction of a rule it already had — the annotation governs an integer local's
+  declaration — which had nothing to reach until `deref` started answering a sized CT. Without
+  it the local's arithmetic silently becomes U8 arithmetic under an `Int` annotation.
+- **The missing compare** is br `axpq22`. Signing `deref` as the pointee type is not a decision
+  on `mwsy85` (it records what codegen emits and what `lib/std` already depends on), but it IS
+  stdlib-visible: `lib/std/libc.bl` reads `Errno(c_errno_location().deref())` off a `Ptr[I32]` in
+  five places and would need the explicit conversion, so it needs the two-regen dance.
+
+Verified that path end to end rather than assuming it: `libc.read_bytes(9999, 8)` still returns
+`Err(Errno(9))` — EBADF — with the pointee now typed `I32`.
+
+### Half (b) was already fixed
+
+The ticket's second MVCE — `let taken = scope.take(p)` then `taken.deref()`, a `cc` escape —
+printed `v=3` on the build that opened the ticket. Br `q3ssqw`'s `ptr_tid` declaration branch had
+already closed it, and `test_ps5br9_ffi_scope_receiver_type.bl`'s mode-10 row said otherwise in a
+comment. That row is now upgraded from asserting `is_null` to asserting the value. Verifying a
+ticket's own premise against the current build is the cheapest step in this whole loop and it has
+now paid twice in a row (`tk8s0y`'s module-qualified prediction was the other).
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

@@ -73,7 +73,7 @@ import diagnostics.{
     ICE_SEG_ERASED_SLOT,
 }
 import ast.{NodeKind, is_block_bearing, dbg_trace, dbg_channel_on}
-import typecheck.{sv_ty_or_flat, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_tuple_sname, tc_tid_list_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
+import typecheck.{sv_ty_or_flat, tc_channel_elem_ct, tc_channel_elem_struct, tc_ptr_pointee_ct, tc_ptr_pointee_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_tuple_sname, tc_tid_list_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
 let mut btc_arg_offset: Int = 0
@@ -5003,8 +5003,32 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     // Ptr methods
     if obj_type == CT_PTR {
         if method == "deref" {
+            // br 0dtbe6: the POINTEE's CT, from the receiver's tid. This was CT_INT
+            // unconditionally, which read a `double` through an `int64_t` (1.5 printed as 1,
+            // exit 0, no diagnostic) and made a struct pointee a `cc` error. A -1 means a bare
+            // CT is not a complete answer for the pointee (a container, a nested Ptr, an
+            // un-annotated allocation whose pointee nothing knows), and CT_INT stays in charge
+            // there — the same decline-keeps-the-old-behaviour contract as the channel element
+            // above. Sized ints looked right before because `*(int32_t*)` promotes losslessly;
+            // what CT_INT lost for them was the width and signedness that govern `/ < >`,
+            // overflow trapping and `.wrapping_*`.
+            let ptr_tid = tc_lookup_node_tid(obj_node)
+            let pointee_ct = tc_ptr_pointee_ct(ptr_tid)
+            let pointee_sname = tc_ptr_pointee_struct(ptr_tid)
+            if pointee_ct == CT_STRUCT && pointee_sname != "" {
+                // A struct rvalue needs a NAME to travel by, and expr_result_* carries no
+                // struct channel of its own, so it goes through a temp the way every other
+                // struct-valued result here does.
+                let d_tmp = fresh_temp("_pderef_")
+                emit_line("{c_type_c_name(pointee_sname)} {d_tmp} = (*({obj_str}));")
+                set_var(d_tmp, CT_STRUCT, 0)
+                set_var_struct(d_tmp, pointee_sname)
+                expr_result_str = d_tmp
+                expr_result_type = CT_STRUCT
+                return
+            }
             expr_result_str = "(*({obj_str}))"
-            expr_result_type = CT_INT
+            expr_result_type = if pointee_ct >= 0 { pointee_ct } else { CT_INT }
             return
         }
         if method == "write" {
