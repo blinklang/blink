@@ -8934,6 +8934,111 @@ method sharing a mutating name is untouched, StringBuilder and Bytes are untouch
 the help names the declaring line, and six acceptance rows that *run* and assert values. One of those
 pins `Map.remove` returning `Bool` rather than `Option[V]` (br `ddapre`).
 
+## The last kind in the hole, and why it got one arm and not two (br `597kj0`)
+
+`c_type_tag` (`src/codegen_types.bl:7002`) maps a `CT_*` to the lowercase segment that names an
+`Option` / `Result` carrier, and it ends in `else { "void" }`. That default is the whole defect class
+`rh7rhf` and `kxe0s2` came out of: a **missing arm silently becomes a genuine Void**, where the tid
+twin `tc_tid_tag_at` fails *closed* on an unhandled kind (`ICE_SEG_UNHANDLED_KIND`). `CT_CLOSURE` was
+the last kind left in it.
+
+**It failed two ways, not one, and the second is the worse one.** The ticket described the Option
+side: `Some(fn(x: Int) -> Int { x * 2 })` named `blink_Option_void`, and `emit_option_typedef`
+(`:7945`) returns early on exactly `tag == "void" || tag == ""`, so the name was **referenced and
+never typedef'd** — a `cc` error, loud. The Result side is not symmetric. `emit_result_typedef`
+(`:7960`) *matches* the literal `"void"` tag to lower a `Void` leaf to an `int64_t` placeholder field
+(br `hsgsbp`, load-bearing), so `blink_Result_void_str` really was **declared** and a
+`blink_closure*` was stored into an `int64_t` member. Nothing but a promoted `-Wint-conversion`
+stood between that and a silent miscompile on a compiler that does not warn.
+
+**The fix is one arm, because the source already said which one.** `unwrap_scalar_ct`'s comment read:
+*"CT_CLOSURE is floored too and that is a latent erasure of the same family, left alone deliberately —
+no `blink_Option_closure` carrier exists to spell it against… **Widen `c_type_tag` first if a closure
+inner ever needs it.**"* That instruction is exact, and it composes: `unwrap_scalar_ct` is *derived*
+from `c_type_tag` (`if c_type_tag(ct) != "void" { return ct }`) rather than enumerated, so the arm
+un-floored it with **no edit there at all** — which is the payoff of having derived it. And
+`emit_option_typedef` spells the member from `c_type_str(CT_CLOSURE)` = `"blink_closure*"`
+(`:6166`), a runtime type (`bootstrap/runtime_core.h:2308-2312`), so a single arm yields a *complete*
+carrier: `typedef struct { int tag; blink_closure* value; } blink_Option_closure;`. The ticket's
+suggested alternative — a bespoke "tag + function pointer + userdata" carrier — was unnecessary:
+`blink_closure` already **is** that struct, and it is heap-allocated, so a pointer suffices.
+
+**The `decide first` question was answered by citation, not by judgement.** The ticket asked whether
+`Option[fn(..) -> ..]` should be a supported type at all or a diagnostic. `sections/04_effects.md:454`
+declares `error_handler: Option[fn(Request, ServerError) -> Response] = None` inside the http_server
+`Route` type, and `:407` uses `List[fn(fn(Request) -> Response) -> fn(Request) -> Response]`. The
+spec's own design depends on the carrier existing, so it is a codegen gap and not a missing check.
+
+**One arm, deliberately, and the asymmetry is the interesting part.** `tc_tid_tag_at` takes a position
+(`TAGPOS_TOP` / `TAGPOS_INNER`). Grepping the callers separates them cleanly: `tc_tid_to_c_tag` (TOP)
+is the **mono-args CSV / mono-instance mangling** speller; `tc_tid_inner_tag` (INNER) is the
+**carrier** speller. `TyKind.Fn` had no arm at either. It now has one at INNER only.
+
+Dropping a closure's signature at INNER is *exact*, not merely conventional: every closure of every
+signature is one `blink_closure*`, so a per-signature carrier name would emit distinct typedefs with
+byte-identical bodies. At TOP the same drop would make `identity[fn(Int) -> Int]` and
+`identity[fn(Str) -> Str]` mangle to **one symbol and one body** — trading a loud floor measured at 0
+for a silent instance collision. So TOP keeps failing closed.
+
+That is a **knowing divergence from the Handle/Ptr/Handler precedent**, which took arms at both
+positions and accepted the drop at TOP — `rh7rhf`'s own words: *"Both DROP the pointee, which is what
+makes Ptr non-injective as a segment."* Non-injectivity is tolerable for a pointee the mono-args CSV
+recovers elsewhere. A whole function signature is not. The reasoning is recorded at both arms, because
+a future reader comparing the two kinds will otherwise read the asymmetry as an oversight.
+
+**An existing test had to move, and it now pins the asymmetry instead of hiding it.**
+`tests/test_vbcw1e_lowercase_void_twin.bl` R4 used `TK_FN` as its witness for "a kind with no arm
+spells the unhandled-kind sentinel" — its comment said *"the only constructible one"*, because every
+other armless kind lacks an exported `make_*` constructor. Arming Fn at INNER made that row red. The
+row's **guarantee** survives untouched (an armless position must fail closed and must not spell
+`"void"`); only its witness position moved, so the row now asserts both sides from the same
+`make_fn_type` tid: `ICE_SEG_UNHANDLED_KIND` at TOP, `"closure"` at INNER, and `diag_is_ice_seg`
+false for the latter. A red pre-existing test whose *witness* went stale is not a regression, and
+rewriting it to assert the new fact in the same breath as the old one is what keeps it honest.
+
+**One of my own new assertions was wrong, and the fix is worth recording.** The Result row first
+asserted `!c.contains("blink_Result_void_str")`. That name is emitted by **every** program — the
+prelude synthesizes `Result[Void, Str]`, and `fn main() { io.println("hi") }` contains it three times
+— so its presence never discriminated anything. The bug was that the closure Result was *declared as*
+it. The row now asserts the binding's own type (`blink_Result_closure_str r =`) and the member being a
+pointer, which is what actually distinguishes fixed from broken.
+
+**Two byproduct findings, both filed with MVCEs, both out of scope here.**
+
+- br `0ya6sk` (`type:spec`) — **the spec's own `Route` example does not parse.** `handler` is
+  `TokenKind.Handler` (`src/tokens.bl:72`), so `handler: fn(Request) -> Response` at
+  `sections/04_effects.md:454-455` is `error[KeywordAsIdentifier]`, and `handler` is not listed as
+  reserved anywhere in `sections/02_syntax*.md`. Two defensible resolutions (permit keywords in field
+  position vs. correct the spec and publish the reserved word); the ticket states both rather than
+  presuming one. The test row that reproduces the `Route` shape renames the field to `on_error` with
+  an inline comment pointing at the ticket.
+- br `ndgx84` (`type:bug`) — **a closure that came out of a container is not callable.**
+  `let h = fs.get(0).unwrap(); h(41)` is `error[UndefinedFunction]: undefined function 'h'`, while the
+  control `let g = f; g(41)` prints `42`. It reproduces from a **List**, whose element path never
+  names a carrier, so it is not Option-specific and it survives this fix: every construction form
+  compiles and runs now, and only *calling* the unwrapped value fails. The callee resolver keys on the
+  initializer's *shape* (a closure literal, or another closure binding) instead of the binding's type.
+
+**Verified in both build modes, by hand — the corpus does not contain this shape.** A sweep would read
+zero hits here, which is an unexercised tap and not coverage (`feedback_corpus_sweep_is_not_coverage`),
+so the shape was constructed directly: archive-linked (`build/blink`) and monolithic
+(`build/blinkc` + `cc -Ibuild`) both emit `blink_Option_closure` / `blink_Result_closure_str` with a
+`blink_closure*` member, and both binaries run and print. `task ci` exit 0 — 704/704 test files, fmt
+1626 passed / 0 failed.
+
+**Census after — divergence-neutral in both modes.** `diverge=43 missing=109` before and after, and a
+per-cell diff of the normalized `(site, tid, flat)` triples on a common-file basis (992-file and
+923-file intersections, 17 distinct cells in each mode) is identical. Widening a tag speller for a kind
+the corpus never instantiates should move nothing, and this says so instead of assuming it.
+
+`tests/test_597kj0_option_closure_carrier.bl`, 9 rows: the carrier declaration asserted on the
+*member type* and not just the name; `Some(closure)`; an explicit `Option[fn(..) -> ..]` annotation;
+`None` under that annotation (a separate emission path — `{.tag = 0}` with no value — that named the
+same undeclared carrier and so failed independently); the spec's `Route` field shape; the Result twin
+as C plus a run; and three controls — `List[closure]` and `Map[Str, closure]`, which already worked
+because both pointer-box the element and never name a carrier, and a genuine `Result[Void, Str]`
+proving `hsgsbp`'s load-bearing `"void"` match still lowers to the `int64_t` placeholder.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

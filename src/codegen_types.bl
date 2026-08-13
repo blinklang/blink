@@ -6471,10 +6471,10 @@ pub fn is_sized_int_ct(ct: Int) -> Int {
 //
 // The floor still stands for an inner c_type_tag does not name, which is what keeps
 // Instant/Duration/Enum correct: those are genuinely int64_t-shaped, have no c_type_tag arm,
-// and must KEEP being floored. CT_CLOSURE is floored too and that is a latent erasure of the
-// same family, left alone deliberately — no `blink_Option_closure` carrier exists to spell it
-// against, so passing it through would name a typedef that is never emitted, trading this
-// bug for br rh7rhf's. Widen c_type_tag first if a closure inner ever needs it.
+// and must KEEP being floored. CT_CLOSURE is NO LONGER floored: it was, and this comment said
+// to "widen c_type_tag first if a closure inner ever needs it" because no
+// `blink_Option_closure` carrier existed to spell it against. br 597kj0 widened it, so the
+// derived predicate picked this up with no edit here — which is the point of deriving it.
 pub fn unwrap_scalar_ct(ct: Int) -> Int {
     if c_type_tag(ct) != "void" { return ct }
     CT_INT
@@ -7024,10 +7024,10 @@ pub fn c_type_tag(ct: Int) -> Str {
     // so the name was REFERENCED and never TYPEDEF'D. That default is why this function is weaker
     // than its tid twin: tc_tid_tag_at fails CLOSED on an unhandled kind
     // (ICE_SEG_UNHANDLED_KIND) so a missing arm cannot be mistaken for a genuine Void. Here a
-    // missing arm silently BECOMES a Void. CT_CLOSURE is still in that hole (br 597kj0:
-    // `Some(fn(x: Int) -> Int { x * 2 })` emits the never-typedef'd blink_Option_void, and a
-    // closure has no struct name to recover, so it cannot take the fix below); do not read
-    // this arm as closing the class.
+    // missing arm silently BECOMES a Void. CT_CLOSURE was the last kind left in that hole and it
+    // took an arm of its own below (br 597kj0) rather than the struct routing described next —
+    // a closure has no struct name to recover. The hole is closed for every kind this function
+    // knows about; the asymmetry between failing closed and guessing Void is not.
     //
     // Instant and Duration WERE in it too (br kxe0s2), and the fix deliberately did not add
     // arms here: both are declared structs, so they now present as (CT_STRUCT, name) at every
@@ -7035,6 +7035,29 @@ pub fn c_type_tag(ct: Int) -> Str {
     // canonical_struct_tag instead — which is also what the tid twin already answered for them,
     // so the two spellers agree by construction rather than by a third hand-kept arm.
     else if ct == CT_HANDLER { "handler" }
+    // 597kj0: THE SIGNATURE IS DROPPED, on the same precedent as CT_HANDLER above — and here
+    // the drop is not merely conventional but exact. Every closure, whatever it takes and
+    // returns, is one `blink_closure*` (runtime_core.h:2309: fn_ptr + userdata + promoter), so
+    // `blink_Option_closure`'s member type is identical for every signature and a per-signature
+    // carrier name would name distinct typedefs with byte-identical bodies. The signature stays
+    // recoverable from the tid, and from the ScopeVar `sname` the closure paths already read.
+    //
+    // Its absence was the last kind in the `else { "void" }` default below (see the CT_HANDLER
+    // comment, which named it), and it failed two ways, not one. `Some(closure)` named the
+    // never-typedef'd `blink_Option_void` — a cc error. `Ok(closure)` in a Result was WORSE:
+    // emit_result_typedef lowers a `void` leaf to an `int64_t` placeholder field, so
+    // `blink_Result_void_str` really was declared and a closure pointer was narrowed into an
+    // int64_t member. Only -Wint-conversion stood between that and a silent miscompile.
+    //
+    // unwrap_scalar_ct (:6479) is derived from this function rather than enumerated, so this arm
+    // also stops it flooring a closure inner to CT_INT — which is what its own comment asked
+    // for ("Widen c_type_tag first if a closure inner ever needs it").
+    //
+    // Only the INNER tag position gets this. The tid twin's TOP position (tc_tid_to_c_tag) is the
+    // mono-instance mangling speller, where dropping the signature would make two instantiations
+    // over different closure types share one mangled name and one body — so TyKind.Fn keeps
+    // failing CLOSED there. See the note on tc_tid_tag_at's TyKind.Fn INNER arm.
+    else if ct == CT_CLOSURE { "closure" }
     else if ct == CT_MAP { "map" }
     else if ct == CT_SET { "set" }
     else if ct == CT_BYTES { "bytes" }
@@ -8215,6 +8238,11 @@ pub fn type_from_name_tag(tag: Str) -> Int {
     else if tag == "stringbuilder" { CT_STRINGBUILDER }
     else if tag == "ptr" { CT_PTR }
     else if tag == "char" { CT_CHAR }
+    // 597kj0: the inverse of c_type_tag's CT_CLOSURE arm, so an Option/Result carrier tag
+    // decoded back through c_type_from_tag spells `blink_closure*` and not CT_VOID's `void`.
+    // ("handler" has no arm here either and is the same latent gap one kind over — br pending,
+    // not widened here, because no measured site decodes a handler tag yet.)
+    else if tag == "closure" { CT_CLOSURE }
     else if tag == "i8" { CT_I8 }
     else if tag == "i16" { CT_I16 }
     else if tag == "i32" { CT_I32 }

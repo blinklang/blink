@@ -1,0 +1,134 @@
+// br 597kj0: a closure inside an Option or Result carrier.
+//
+// `Some(fn(x: Int) -> Int { x * 2 })` emitted `blink_Option_void` — a name that is
+// REFERENCED and never TYPEDEF'D, because emit_option_typedef declines on exactly
+// `c_type_tag(inner) == "void"` and CT_CLOSURE had no arm in c_type_tag, so it took that
+// function's `else { "void" }` default. CT_CLOSURE was the last kind left in that hole
+// (br kxe0s2 took Instant/Duration out of it by routing them to the struct carrier).
+//
+// The Result twin fails WORSE and is why this file asserts on emitted C as well as on
+// behavior: `blink_Result_void_str` IS declared, because emit_result_typedef lowers a
+// `void` leaf to an `int64_t` placeholder field. So a closure pointer was stored into an
+// int64_t member — a silent narrowing that only a -Wint-conversion diagnostic caught, and
+// nothing at all would have caught on a compiler that does not promote that warning.
+//
+// The type is NOT hypothetical: sections/04_effects.md:454 declares
+// `error_handler: Option[fn(Request, ServerError) -> Response] = None` in the `Route` type,
+// so the spec's own http_server design depends on this carrier existing.
+//
+// Rows 7-8 are controls, not coverage: List[closure] and Map[Str, closure] already worked
+// before the fix (both pointer-box the element and never name a carrier), so they pin that
+// widening c_type_tag did not move the paths that were already correct.
+
+import std.process.{ProcessResult}
+
+fn emit_c(tag: Str, src: Str) -> Str {
+    let bl_path = ".tmp/_597kj0_{tag}.bl"
+    write_file(bl_path, src)
+    let _ = process_run("build/blink", ["build", bl_path, "--emit", "c"])
+    let c_src = read_file("build/_597kj0_{tag}.c")
+    shell_exec("rm -f {bl_path} build/_597kj0_{tag}.c")
+    c_src
+}
+
+fn run_src(tag: Str, src: Str) -> ProcessResult {
+    let bl_path = ".tmp/_597kj0_{tag}.bl"
+    let bin = ".tmp/_597kj0_{tag}"
+    write_file(bl_path, src)
+    let build = process_run("build/blink", ["build", bl_path, "-o", bin])
+    if build.exit_code != 0 {
+        shell_exec("rm -f {bl_path}")
+        return build
+    }
+    let r = process_run(bin, [])
+    shell_exec("rm -f {bl_path} {bin}")
+    r
+}
+
+test "the Option-of-closure carrier is declared, not just referenced" {
+    let src = "fn main() \{\n    let o = Some(fn(x: Int) -> Int \{ x * 2 \})\n    io.println(\"some=\{o.is_some()\}\")\n\}\n"
+    let c = emit_c("decl", src)
+    // The bug: the carrier is named but no typedef for it is ever emitted.
+    assert(!c.contains("blink_Option_void"))
+    // The fix: a real carrier whose member is the closure's own C type. Asserting the
+    // member type and not just the name — `blink_closure*` is what makes the stored
+    // pointer round-trip, and an int64_t member would pass a name-only assertion.
+    assert(c.contains("int tag; blink_closure* value; } blink_Option_closure;"))
+}
+
+test "Some(closure) compiles and runs" {
+    let src = "fn main() \{\n    let o = Some(fn(x: Int) -> Int \{ x * 2 \})\n    io.println(\"some=\{o.is_some()\}\")\n\}\n"
+    let r = run_src("some", src)
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("some=true"))
+}
+
+test "an explicit Option[fn(..) -> ..] annotation carries a closure" {
+    let src = "fn main() \{\n    let o: Option[fn(Int) -> Int] = Some(fn(x: Int) -> Int \{ x * 2 \})\n    io.println(\"some=\{o.is_some()\}\")\n\}\n"
+    let r = run_src("ann", src)
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("some=true"))
+}
+
+// The None side is a separate emission path (`{.tag = 0}` with no value), and it named the
+// same undeclared carrier — so it fails independently of whether a closure is ever stored.
+test "a None under an Option[fn(..) -> ..] annotation compiles and runs" {
+    let src = "fn main() \{\n    let o: Option[fn(Int) -> Int] = None\n    io.println(\"none=\{o.is_none()\}\")\n\}\n"
+    let r = run_src("none", src)
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("none=true"))
+}
+
+// The spec's own shape (sections/04_effects.md:454), one rename away: `handler` is a
+// TokenKind in this implementation, so the spec's `handler:` field name does not parse
+// (br pending) and this row uses `on_error` to keep the carrier the subject under test.
+test "an Option[fn(..) -> ..] struct field with a None default compiles and runs" {
+    let src = "type Route \{\n    pattern: Str\n    on_error: Option[fn(Int) -> Int] = None\n\}\nfn main() \{\n    let a = Route \{ pattern: \"/a\", on_error: Some(fn(x: Int) -> Int \{ x + 1 \}) \}\n    let b = Route \{ pattern: \"/b\" \}\n    io.println(\"a=\{a.on_error.is_some()\} b=\{b.on_error.is_none()\}\")\n\}\n"
+    let r = run_src("field", src)
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("a=true b=true"))
+}
+
+// The Result twin, and the one row whose old failure was a NARROWING rather than an
+// undeclared name: `.ok` was an int64_t placeholder field holding a closure pointer.
+test "a Result-of-closure stores a pointer, not an int64_t placeholder" {
+    let src = "fn main() \{\n    let r: Result[fn(Int) -> Int, Str] = Ok(fn(x: Int) -> Int \{ x * 3 \})\n    io.println(\"ok=\{r.is_ok()\}\")\n\}\n"
+    let c = emit_c("resc", src)
+    // NOT `!c.contains("blink_Result_void_str")`: that name is emitted by EVERY program
+    // (the prelude synthesizes Result[Void, Str]), so its presence never discriminated. The
+    // bug was that the closure Result was DECLARED AS it — so assert on the binding's own
+    // type, and on the member being a pointer rather than the int64_t placeholder.
+    assert(c.contains("blink_Result_closure_str r ="))
+    assert(c.contains("union \{ blink_closure* ok; const char* err; \}; \} blink_Result_closure_str;"))
+    let r = run_src("res", src)
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("ok=true"))
+}
+
+test "List[closure] still works" {
+    let src = "fn main() \{\n    let fs = [fn(x: Int) -> Int \{ x + 1 \}, fn(x: Int) -> Int \{ x + 2 \}]\n    io.println(\"n=\{fs.len()\}\")\n\}\n"
+    let r = run_src("list", src)
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("n=2"))
+}
+
+test "Map[Str, closure] still works" {
+    let src = "fn main() \{\n    let mut m: Map[Str, fn(Int) -> Int] = Map()\n    m.insert(\"d\", fn(x: Int) -> Int \{ x * 2 \})\n    io.println(\"n=\{m.len()\}\")\n\}\n"
+    let r = run_src("mapv", src)
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("n=1"))
+}
+
+// A genuine Void inner must keep its own spelling: emit_option_typedef returns early on
+// `tag == "void"` and the Result emitter MATCHES the literal "void" tag to lower a Void leaf
+// to an int64_t placeholder (br hsgsbp — that match is load-bearing). Widening c_type_tag for
+// a closure must not disturb it, which a `Result[Void, Str]` — synthesized for every
+// `?`-bearing test block — exercises directly.
+test "a genuine Void leaf still lowers to the placeholder field" {
+    let src = "fn main() \{\n    let r: Result[Void, Str] = Ok(())\n    io.println(\"ok=\{r.is_ok()\}\")\n\}\n"
+    let c = emit_c("void", src)
+    assert(c.contains("blink_Result_void_str"))
+    let r = run_src("voidrun", src)
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("ok=true"))
+}
