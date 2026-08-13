@@ -6831,6 +6831,7 @@ fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "StringBuilder" { return type_stringbuilder() }
     if name == "Map" { return make_map_type(make_metavar(), make_metavar()) }
     if name == "Set" { return make_set_type(make_metavar()) }
+    if name == "Channel" { return make_channel_type(make_metavar()) }
     TYPE_UNKNOWN
 }
 
@@ -10093,6 +10094,35 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 check_builtin_arg(method, 0, obj_t, args_sl, "Set")
                 return obj_t
             }
+        }
+
+        // Channel had no arm at all, so `.recv()` answered Unknown even for an annotated
+        // `Channel[Str]` — nothing compared its result against a declared type, and nothing
+        // pinned the element of a bare `Channel(n)`. `send` is the constraining use, exactly
+        // as `insert` is for Map/Set, so the pin goes through the same check_builtin_arg.
+        if obj_k == TyKind.Channel {
+            let args_sl = node_args(node)
+            let elem = ty_pool.get(tc_resolve(obj_t)).unwrap().inner1
+            if method == "send" {
+                check_builtin_arg(method, 0, elem, args_sl, "Channel")
+                return TYPE_VOID
+            }
+            // Not an Option: the runtime end-of-stream sentinel is consumed by the for-in
+            // drain, so `let v = ch.recv()` binds the element itself.
+            //
+            // An element nothing has pinned answers Unknown rather than the bare α, so
+            // `let v = ch.recv()` keeps the codegen reinterpretation fallback instead of
+            // becoming E0301. A bare `Channel` param annotation carries no element at all
+            // (`fn relay(src: Channel, dst: Channel)`), so a send through one pins the
+            // callee's element and never the caller's — whether that annotation should be
+            // rejected outright is a spec question, and answering it here by erroring on the
+            // read instead would reject the program at the wrong place.
+            if method == "recv" {
+                let r = tc_resolve(elem)
+                if tc_tid_has_unbound_metavar(r) != 0 { return TYPE_UNKNOWN }
+                return r
+            }
+            if method == "close" { return TYPE_VOID }
         }
 
         if obj_k == TyKind.Bytes {

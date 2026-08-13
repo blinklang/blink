@@ -1,0 +1,122 @@
+// `Channel(n)` in call position must give the binding a Channel type with an inferable
+// element, the way `Map()` and `Set()` do.
+//
+// Typecheck's builtin-constructor return typer had arms for Map, Set, Bytes and
+// StringBuilder but none for Channel, so the call fell through to TYPE_UNKNOWN and the
+// element was never recovered: `for v in ch` bound `v` at type `?`.
+//
+// Only Int payloads worked, because int64_t is the erased default — and every channel test
+// in the corpus used Int, which is why this survived. Str payloads were REJECTED
+// (`unresolved method '.len' on type ?`) and struct payloads reached cc
+// (`request for member 'n' in something not a structure or union`).
+//
+// The annotated form `let ch: Channel[T] = Channel(n)` took a different route and already
+// worked, so each shape below is paired with its annotated control: a control that fails
+// means the annotation route regressed, not this one.
+//
+// CONTAINER elements (`Channel[List[Int]]`) are deliberately absent: they fail in the recv
+// and for-in positions whether annotated or not, so they are a depth-2 carrier defect with
+// its own fixture, not this hole.
+
+type Msg { n: Int }
+
+// ── recv position ─────────────────────────────────────────────────────────────
+
+test "unannotated Channel carries a Str element through recv" {
+    let ch = Channel(4)
+    ch.send("abcd")
+    assert_eq(ch.recv().len(), 4)
+}
+
+test "unannotated Channel carries a struct element through recv" {
+    let ch = Channel(4)
+    ch.send(Msg { n: 7 })
+    assert_eq(ch.recv().n, 7)
+}
+
+// ── for-in binder position ────────────────────────────────────────────────────
+//
+// The binder is a separate consumer of the element type from recv, so a fix that only
+// reaches one of them leaves the other red.
+
+test "for-in over an unannotated Channel binds a Str element" {
+    let ch = Channel(4)
+    ch.send("ab")
+    ch.send("cde")
+    ch.close()
+    let mut total = 0
+    for v in ch {
+        total = total + v.len()
+    }
+    assert_eq(total, 5)
+}
+
+test "for-in over an unannotated Channel binds a struct element" {
+    let ch = Channel(4)
+    ch.send(Msg { n: 7 })
+    ch.send(Msg { n: 35 })
+    ch.close()
+    let mut total = 0
+    for m in ch {
+        total = total + m.n
+    }
+    assert_eq(total, 42)
+}
+
+// The element is minted as a metavar and solved by unification, so a second send of the
+// same type must not conflict with the first, and the solution must survive being read
+// back in a position other than the one that pinned it.
+test "the element solved by the first send serves a later distinct read" {
+    let ch = Channel(4)
+    ch.send("first")
+    ch.send("second")
+    ch.close()
+    let a = ch.recv()
+    let mut rest = ""
+    for v in ch {
+        rest = "{rest}{v}"
+    }
+    assert_eq(a, "first")
+    assert_eq(rest, "second")
+}
+
+// ── controls: the annotated route already worked ──────────────────────────────
+
+test "annotated Channel[Str] still works" {
+    let ch: Channel[Str] = Channel(4)
+    ch.send("ab")
+    ch.close()
+    let mut total = 0
+    for v in ch {
+        total = total + v.len()
+    }
+    assert_eq(total, 2)
+}
+
+test "annotated Channel[Msg] still works" {
+    let ch: Channel[Msg] = Channel(4)
+    ch.send(Msg { n: 7 })
+    ch.close()
+    let mut total = 0
+    for m in ch {
+        total = total + m.n
+    }
+    assert_eq(total, 7)
+}
+
+// The Int shape is the one that already passed, on the erased default rather than on a real
+// element type. It has to keep passing for the right reason now.
+test "unannotated Channel with an Int element still works" {
+    let ch = Channel(4)
+    ch.send(10)
+    ch.send(32)
+    ch.close()
+    let mut total = 0
+    for v in ch {
+        total = total + v
+    }
+    assert_eq(total, 42)
+    let ch2 = Channel(2)
+    ch2.send(7)
+    assert_eq(ch2.recv(), 7)
+}

@@ -1,28 +1,18 @@
-// br w3v2e6, the data-loss half: a sent 0 truncates a bare channel's for-in drain.
+// A sent 0 truncated a bare channel's for-in drain.
 //
-// An un-annotated `Channel(n)` has no element type (that inference is w3v2e6's other half and
-// is spec-blocked — bare `Channel(n)` appears in no spec section, and 8vcj2c's E0301 boundary
-// may say an un-annotated element is an ERROR rather than something to infer). So codegen falls
-// back to reinterpreting the element as an 8-byte word: `send` emitted
-// `blink_channel_send(ch, (void*)(intptr_t)x)`.
-//
-// For x == 0 that payload IS NULL, and NULL is blink_channel_recv's end-of-stream sentinel. The
-// for-in drain breaks on it, so a sent 0 ended the stream — silently, and taking every value
-// behind it as well:
+// A channel whose element codegen cannot spell falls back to reinterpreting that element as an
+// 8-byte word, and `send` emitted `blink_channel_send(ch, (void*)(intptr_t)x)`. For x == 0 that
+// payload IS NULL, and NULL is blink_channel_recv's end-of-stream sentinel, so the drain broke
+// on it: a sent 0 ended the stream silently, taking every value behind it as well.
 //
 //     let ch = Channel(4); ch.send(5); ch.send(0); ch.send(7); ch.close()
 //     for v in ch { io.println("v={v}") }      // printed v=5 and stopped: 0 and 7 vanished
 //
-// br hgd2az fixed this for a channel whose element IS known (it boxes, and a box address is
-// never NULL) and left the fallback reinterpreting — its own comment on the drain claimed the
-// NULL test was "only sound because send now boxes", which is true only on the boxed side.
-//
-// THE FIX IS DECISION-INDEPENDENT and does not need w3v2e6's inference answer: the fallback now
-// boxes the SAME 8-byte payload it used to send inline, so the address is never NULL while the
-// payload word, and every reinterpretation of it, is unchanged. That is why rows 6 and 7 below
-// pin the still-wrong answers rather than asserting fixed ones — a bare Str channel prints a
-// pointer both before and after, and a bare Float channel must keep failing LOUDLY in the C
-// compiler rather than being silently truncated into an integer box.
+// The fallback now boxes the same 8-byte payload it used to send inline, so the address is
+// never NULL while the payload word, and every reinterpretation of it, is unchanged. The drain
+// rows below therefore hold whether or not the element is known — which matters because the
+// fallback still governs a channel that nothing pins (a bare `Channel` param annotation carries
+// no element, so a send through one pins the callee's and never the caller's).
 
 import std.process.{ProcessResult}
 
@@ -88,7 +78,7 @@ test "the .recv() path on a bare channel still reads zero back" {
 }
 
 // A closed, empty channel must still end the drain and still answer the element's zero value
-// through .recv() (what it SHOULD answer is br yzan52, a spec question). Boxing moves the NULL
+// through .recv() (what it SHOULD answer is an open spec question). Boxing moves the NULL
 // test from the payload to the box address, so this is the row that proves the sentinel survived.
 test "a closed empty bare channel still ends the drain and reads back zero" {
     let src = "fn main() \{\n    let ch = Channel(4)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n    io.println(\"drained\")\n    io.println(\"empty=\{ch.recv()\}\")\n\}\n"
@@ -119,25 +109,25 @@ test "an annotated Channel[Int] still drains a zero" {
     assert(r.out.contains("v=1"))
 }
 
-// R6 — PINS A STILL-WRONG ANSWER, deliberately. A bare channel carrying a Str reinterprets the
-// element as an integer and prints a pointer, before AND after this fix, because the fallback
-// has no element type to consult — that is w3v2e6's inference half. Asserting the ABSENCE of
-// "hello" rather than the garbage number, since the pointer value varies per run. When the
-// inference lands this row goes red, which is the point: it must not slide in silently.
-test "a bare Str channel still reinterprets its element (w3v2e6 inference half, not fixed here)" {
+// R6 — the element is now INFERRED from the send, so a bare Str channel carries a Str. These
+// two rows previously pinned the still-wrong answers (a reinterpreted pointer here, a hard cc
+// failure below) as tripwires against the inference landing silently; it has landed, so they
+// now pin the right answers. The reinterpretation fallback still governs a channel that
+// nothing pins, which the rows above cover.
+test "a bare Str channel carries its element" {
     let src = "fn main() \{\n    let ch = Channel(4)\n    ch.send(\"hello\")\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n\}\n"
     let r = run_src("bstr", src)
     assert_eq(r.exit_code, 0)
-    assert(r.out.contains("v="))
-    assert(!r.out.contains("v=hello"))
+    assert(r.out.contains("v=hello"))
 }
 
-// R7 — the loudness control. A bare Float element fails in the C compiler ("cannot convert to a
-// pointer type"). Boxing must keep the cast that produces that error INSIDE the box assignment:
-// a `int64_t` box would have accepted the double and silently truncated it, trading a loud
-// failure for a wrong value. That is the one way this fix could have made things worse.
-test "a bare Float channel still fails loudly rather than truncating into a box" {
+// R7 — a bare Float element used to fail in the C compiler ("cannot convert to a pointer
+// type"). The box is now the element's own C type, so the double neither fails nor truncates.
+// Asserting the VALUE is what separates the fix from the old failure mode: an `int64_t` box
+// would have accepted the double and printed 1.
+test "a bare Float channel carries its element without truncating" {
     let src = "fn main() \{\n    let ch = Channel(4)\n    ch.send(1.5)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n\}\n"
     let r = run_src("bfl", src)
-    assert(r.exit_code != 0)
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("v=1.5"))
 }
