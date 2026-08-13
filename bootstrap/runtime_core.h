@@ -2367,6 +2367,13 @@ typedef struct {
     void  (*log)(const char* msg);
     void  (*eprint)(const char* msg);
     void  (*eprint_no_nl)(const char* msg);
+    /* Handler captures. A handler expression allocates its own copy of this
+     * vtable and stores its captured bindings here — one value directly in the
+     * word, several boxed into an emitted caps struct. It is LAST so that the
+     * positional `_default` initializers below stay aligned and leave it NULL.
+     * The user-effect vtables codegen emits (`codegen.bl`) carry the same slot;
+     * a builtin effect without it is why br wxxg4f could not capture at all. */
+    void* __userdata;
 } blink_io_vtable;
 
 BLINK_RT_FN void blink_io_default_print(const char* msg);
@@ -2423,6 +2430,7 @@ typedef struct {
     int         (*write)(const char* path, const char* content);
     int         (*delete_file)(const char* path);
     int         (*watch)(const char* path, void (*callback)(const char*));
+    void* __userdata;  /* handler captures — see blink_io_vtable */
 } blink_fs_vtable;
 
 BLINK_RT_FN const char* blink_fs_default_read(const char* path);
@@ -2475,6 +2483,7 @@ typedef struct {
     int (*connect)(const char* url);
     int (*listen)(const char* addr, int port);
     const char* (*dns)(const char* hostname);
+    void* __userdata;  /* handler captures — see blink_io_vtable */
 } blink_net_vtable;
 
 BLINK_RT_FN int blink_net_default_connect(const char* url);
@@ -2516,6 +2525,7 @@ typedef struct {
     const char* (*sign)(const char* data, const char* key);
     const char* (*encrypt)(const char* data, const char* key);
     const char* (*decrypt)(const char* data, const char* key);
+    void* __userdata;  /* handler captures — see blink_io_vtable */
 } blink_crypto_vtable;
 
 BLINK_RT_FN const char* blink_crypto_default_hash(const char* data);
@@ -2566,6 +2576,7 @@ typedef struct {
     int64_t (*rand_int)(int64_t min, int64_t max);
     double  (*rand_float)(void);
     void    (*rand_bytes)(void* buf, int64_t len);
+    void* __userdata;  /* handler captures — see blink_io_vtable */
 } blink_rand_vtable;
 
 #ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
@@ -2657,6 +2668,7 @@ BLINK_RT_FN blink_duration_struct blink_Instant_elapsed(blink_instant_struct the
 typedef struct {
     blink_instant_struct (*read)(void);
     void                (*sleep)(blink_duration_struct d);
+    void* __userdata;  /* handler captures — see blink_io_vtable */
 } blink_time_vtable;
 
 BLINK_RT_FN blink_instant_struct blink_time_default_read(void);
@@ -2700,6 +2712,7 @@ typedef struct {
     int         (*remove)(const char* name);
     const char* (*cwd)(void);
     void        (*exit_fn)(int code);
+    void* __userdata;  /* handler captures — see blink_io_vtable */
 } blink_env_vtable;
 
 BLINK_RT_FN const char* blink_env_default_read(const char* name);
@@ -2753,6 +2766,7 @@ BLINK_UNUSED static blink_env_vtable blink_env_vtable_default = {
 typedef struct {
     int64_t (*spawn)(const char* command);
     int     (*signal)(int64_t pid, int sig);
+    void* __userdata;  /* handler captures — see blink_io_vtable */
 } blink_process_vtable;
 
 BLINK_RT_FN int64_t blink_process_default_spawn(const char* command);

@@ -8593,6 +8593,82 @@ not compile:
   the escape and two without, so the escape belongs in whatever compare they share rather than in
   `check_arg_value` alone.
 
+## The gate that was really a missing struct member (br `wxxg4f`)
+
+Also not a census cell, and for a different reason than br `f5k3jk` was not one. `f5k3jk` was a type
+typecheck never checked; this one is a type nobody spelled wrong anywhere. A `handler IO { ... }` op
+body that referenced any enclosing binding emitted a free reference to a C identifier that is not in
+scope, and cc rejected the program:
+
+```
+build/cap1.c:124:48: error: 'tag' undeclared (first use in this function)
+  124 |     printf("%s\n", blink_str_format("[%s] %s", tag, msg));
+```
+
+The same shape through a **user** effect compiled and ran. That asymmetry is what made it a ticket
+rather than a feature request, and the ticket's own advice — *"start by diffing the two emit paths at
+the `has_handler_caps` branch rather than adding a second capture mechanism"* — was right. The diff
+was one condition, repeated three times: `&& is_user_effect != 0` on the capture analysis
+(`codegen_expr.bl:1343`) and on both of its consumers, the read side that declares the capture inside
+the static op fn (:1513) and the write side that stores it at construction (:1591).
+
+**The gate was not an oversight.** Captures ride in the vtable's `__userdata` word, and only the
+user-effect vtable had that word: codegen emits it (`codegen.bl:991`), while the eight builtin
+vtables are hand-written in `bootstrap/runtime_core.h` and were function pointers and nothing else —
+`blink_io_vtable` was five of them. So the gate was the honest consequence of a missing struct
+member, and it is worth separating from the kind of gate this project usually finds. A conjunct that
+narrows a check because the general case was never thought through is a defect. A conjunct that
+narrows a mechanism because the other half of the representation does not exist is a *description* of
+the representation. Deleting the first is a fix; deleting the second without adding the member would
+just have moved the failure from cc to a wild pointer. The fix is therefore symmetric — `void*
+__userdata;` last in all eight builtin structs (so the positional `_default` initializers stay
+aligned and leave it NULL), the three conjuncts dropped, and the capture read choosing
+`ev_field(f)` for a builtin against `ev_field("ue_{f}")` for a user effect.
+
+**A module global is not a capture, and the stdlib is what said so.** Removing the gate broke two
+rows of `tests/test_std_testing.bl`, because `analyze_captures` reports every free name that
+`is_scope_var` accepts and module-level `let`s are scope vars. `lib/std/testing.bl`'s
+`capture_log`/`capture_print` handlers reference file-scope `_capture_log_target` /
+`_capture_print_target`, which had been left as free references — correctly, since a file-scope C
+static is visible from a static function. With the gate gone they became captures, and capturing a
+global is wrong twice: the capture is a snapshot taken at handler-construction time, and it consumes
+the single `__userdata` word that nested handlers share. Hence a filter, `is_module_global(cname) ==
+0`, backed by a `cg_module_global_set` that `emit_top_level_let` registers — globals are emitted at
+`codegen.bl:1292`/`:1315`, function bodies at `:1934`, so the registry is always populated first.
+
+The general shape is worth keeping: **a capture analysis that has only ever run on one path has never
+been tested against the corpus.** Removing the gate did not just enable a feature, it turned an
+analysis loose on every builtin handler in the stdlib, and the row that caught the over-capture was
+the *composed* one. A single `capture_log` works fine — one handler's `__userdata` is nobody else's.
+
+**Divergence-neutral, for the fourth unit in a row.** `diverge=43 missing=109`, per-cell identical,
+in both build modes; `agree` rose 436981 → 437188 (mono) and 361359 → 361485 (arc), which is only the
+new test file's sites. Capture plumbing spells no types, so it moves no cell — and saying so out loud
+matters in a project whose exit criterion is a counter reaching zero.
+
+**Two byproducts, both found by probing the fix rather than by the census, and both larger than it:**
+
+- **br `saf1hh` (P0)** — nested handlers share ONE `__userdata` word, so an op **inherited** from an
+  outer handler reads the **inner** handler's captures. With two capture types that disagree it is a
+  SIGSEGV from safe Blink, confirmed at exit 139 on the user-effect path too, so it predates this fix
+  rather than following from it. The cause is a straight identity error: the capture belongs to a
+  *handler*, `__userdata` belongs to the *effect's vtable slot*, and delegation shares the slot. Any
+  fix has to break that identification (per-op `{fn, userdata}` pairs, a chained userdata, or
+  per-handler storage), so it needs a decision rather than a patch. The nesting row in the new test
+  documents which direction works and why the other has no row: a failing row cannot be parked, and a
+  row asserting today's output would pin the defect.
+- **br `vapcpp` (P1)** — `fs.*` and `net.*` handler overrides are silently ignored. Those 16 ops are
+  hardcoded codegen intrinsics (`blink_read_file(...)` at `codegen_methods.bl:3072` and friends) that
+  never read `__blink_ev.fs`/`.net`; of the eight builtin effects only io, time and env dispatch
+  through the evidence struct at all. The runtime vtables exist and the `with` emitter installs them
+  — only the call sites never look. This is the fail-open direction: `sections/04_effects.md:14`
+  sells handler attenuation as the sandbox ("*The runtime enforces it*") and `:284-295` gives
+  `mock_net` as a worked example of the shape that does not work. `saf1hh` is marked as blocking it,
+  because fixing dispatch widens the P0's reach rather than narrowing it.
+
+That second one is the reason this test's "second builtin effect" row is `handler Env` and not
+`handler FS`: FS was the first draft, and FS cannot carry the row.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

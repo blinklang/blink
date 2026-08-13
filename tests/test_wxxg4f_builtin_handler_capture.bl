@@ -1,0 +1,168 @@
+import compile_test_helpers.{compile_and_run}
+
+// br wxxg4f — a `handler IO { ... }` op body that references any enclosing binding emitted a free
+// reference to a C identifier that is not in scope, so cc rejected the program:
+//
+//     build/cap1.c:124:48: error: 'tag' undeclared (first use in this function)
+//       124 |     printf("%s\n", blink_str_format("[%s] %s", tag, msg));
+//
+// The identical shape through a USER effect compiled and ran correctly, which is what made this a
+// divergence between two emit paths rather than a missing feature.
+//
+// THE GATE WAS ONE CONDITION, and it was there for a real reason. `emit_handler_expr` analyzed captures
+// under `... && is_user_effect != 0` (codegen_expr.bl:1343), so a builtin-effect handler never collected
+// any, `has_handler_caps` stayed false, and the body referenced the binding free. The two other capture
+// sites carried the same `&& is_user_effect != 0`. The reason: captures travel in the vtable's
+// `__userdata` slot, and only the user-effect vtable HAD that slot — codegen emits it
+// (`codegen.bl:991`), while the nine builtin vtables are hand-written in `bootstrap/runtime_core.h` and
+// had five function pointers and nothing else. So the gate was not an oversight guarding an unfinished
+// path; it was the honest consequence of a missing struct member. The fix adds the member to all nine
+// and drops the gate, rather than building a second capture mechanism for builtins.
+//
+// EVERY ROW ASSERTS ON OUTPUT. A capture that arrived as garbage would still compile and still exit 0
+// — the ticket's own sibling defect prints `[M] structlit=140092283357272` — so the captured VALUE has
+// to appear in the assertion, not just the fact that the handler ran.
+
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str, value: Int)
+    }
+}
+
+// ── The MVCE, and its user-effect control ────────────────────────────────────────────
+
+test "a builtin-effect handler captures an enclosing fn parameter" {
+    let src = "fn mk(tag: Str) -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[\{tag}] \{msg}\")\n        }\n    }\n}\nfn main() \{\n    with mk(\"A\") \{\n        io.println(\"x\")\n    }\n}\n"
+    let r = compile_and_run(src, "wxxg4f_param")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[A] x"))
+}
+
+// The control that made the ticket a divergence rather than a feature request. It passed before the fix
+// and has to keep passing: the same three sites now serve both paths, so a fix that broke the user
+// effect would be a regression of the working half.
+test "a user-effect handler still captures an enclosing fn parameter" {
+    let src = "effect Metrics \{\n    effect Emit \{\n        fn counter(name: Str, value: Int)\n    }\n}\nfn mk(tag: Str) -> Handler[Metrics] \{\n    handler Metrics \{\n        fn counter(name: Str, value: Int) \{\n            io.println(\"[\{tag}] \{name}=\{value}\")\n        }\n    }\n}\nfn main() \{\n    with mk(\"A\") \{\n        metrics.counter(\"x\", 1)\n    }\n}\n"
+    let r = compile_and_run(src, "wxxg4f_ue_param")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[A] x=1"))
+}
+
+// ── The four shapes the ticket proved fail identically ───────────────────────────────
+//
+// All four are here because the ticket established the defect is NOT about crossing a function
+// boundary: an inline handler in the same function as the local failed too. Each is a separate row so a
+// partial fix cannot hide behind the others.
+
+test "a builtin-effect handler captures an enclosing fn local" {
+    let src = "fn main() \{\n    let tag = \"L\"\n    with handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[\{tag}] \{msg}\")\n        }\n    } \{\n        io.println(\"local\")\n    }\n}\n"
+    let r = compile_and_run(src, "wxxg4f_local")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[L] local"))
+}
+
+// TWO captures, which is a different code path from one: a single capture is stored directly in the
+// `__userdata` word, two or more are boxed into an emitted `__handler_N_caps` struct.
+test "a builtin-effect handler captures two enclosing bindings" {
+    let src = "fn mk(tag: Str, n: Int) -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[\{tag}/\{n}] \{msg}\")\n        }\n    }\n}\nfn main() \{\n    with mk(\"B\", 7) \{\n        io.println(\"two\")\n    }\n}\n"
+    let r = compile_and_run(src, "wxxg4f_two")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[B/7] two"))
+}
+
+// A non-Str capture on its own, because the one-capture path branches on CT_STRING: a Str goes into the
+// word as a pointer, everything else round-trips through `(uintptr_t)`. An Int is the row that catches a
+// fix that only handled the pointer case.
+test "a builtin-effect handler captures a non-Str binding" {
+    let src = "fn mk(n: Int) -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[\{n}] \{msg}\")\n        }\n    }\n}\nfn main() \{\n    with mk(42) \{\n        io.println(\"int\")\n    }\n}\n"
+    let r = compile_and_run(src, "wxxg4f_int")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[42] int"))
+}
+
+// ── The capture has to be the right one ─────────────────────────────────────────────
+//
+// The rows above would all pass if every handler read the same capture slot. These distinguish.
+
+test "two handlers over one effect carry their own captures" {
+    let src = "fn mk(tag: Str) -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[\{tag}] \{msg}\")\n        }\n    }\n}\nfn main() \{\n    let a = mk(\"A\")\n    let b = mk(\"B\")\n    with a \{\n        io.println(\"first\")\n    }\n    with b \{\n        io.println(\"second\")\n    }\n}\n"
+    let r = compile_and_run(src, "wxxg4f_two_handlers")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[A] first"))
+    assert(r.out.contains("[B] second"))
+}
+
+// A capture used across the two handler methods of one handler, so the shared analysis (which unions
+// captures over every method before emitting) is exercised rather than a per-method one.
+test "one capture is visible in two ops of the same handler" {
+    let src = "fn mk(tag: Str) -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[\{tag}/p] \{msg}\")\n        }\n        fn eprint(msg: Str) \{\n            io.println(\"[\{tag}/e] \{msg}\")\n        }\n    }\n}\nfn main() \{\n    with mk(\"C\") \{\n        io.println(\"p\")\n        io.eprintln(\"e\")\n    }\n}\n"
+    let r = compile_and_run(src, "wxxg4f_two_ops")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[C/p] p"))
+    assert(r.out.contains("[C/e] e"))
+}
+
+// A second builtin effect, so the fix is not IO-shaped, and `Env.read` returns a Str rather than
+// void — the row where the captured value has to survive a non-void return.
+//
+// This row was written against `handler FS` first, and FS cannot carry it: `fs.read` is a hardcoded
+// codegen intrinsic (`blink_read_file(...)`, codegen_methods.bl:3072) that never reads
+// `__blink_ev.fs`, so the override is accepted, compiled, run — and silently ignored, real filesystem
+// and all. Of the eight builtin effects only io, time and env dispatch through the evidence struct at
+// all. That is br vapcpp, a separate and larger defect than this one: wxxg4f is about whether a
+// handler body can SEE an enclosing binding, vapcpp about whether the handler is CONSULTED. Env is
+// the row that can distinguish them today.
+test "a second builtin effect captures too" {
+    let src = "fn mk(tag: Str) -> Handler[Env] \{\n    handler Env \{\n        fn read(name: Str) -> Str \{\n            \"[\{tag}] \{name}\"\n        }\n    }\n}\nfn main() \{\n    with mk(\"E\") \{\n        io.println(env.var(\"HOME\").unwrap())\n    }\n}\n"
+    let r = compile_and_run(src, "wxxg4f_env")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[E] HOME"))
+}
+
+// ── The uncaptured path is untouched ────────────────────────────────────────────────
+//
+// The fix adds a struct member to nine hand-written runtime vtables whose initializers are positional,
+// and drops a gate that three sites shared. A handler with NO captures is the row that says the
+// ordinary case still dispatches — the majority of handlers in the corpus, and the one shape a
+// mis-added member would break silently rather than at cc.
+
+test "a handler with no captures still dispatches" {
+    let src = "fn mk() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn main() \{\n    with mk() \{\n        io.println(\"plain\")\n    }\n    io.println(\"after\")\n}\n"
+    let r = compile_and_run(src, "wxxg4f_nocap")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[H] plain"))
+    assert(r.out.contains("after"))
+}
+
+// Nesting, and the row that says the default-delegation copy still works: the inner handler overrides
+// `print` while `eprint` falls through to the outer vtable's slot.
+//
+// READ THE DIRECTION. Only the INNER handler captures here, and that is the direction that works. The
+// reverse — an outer handler that captures, with its op inherited by an inner handler that also
+// captures — reads the INNER handler's `__userdata` and is wrong, because captures belong to a handler
+// while `__userdata` belongs to the effect's vtable slot, which delegation shares. With two capture
+// types that disagree it is a SIGSEGV from safe Blink. That is br saf1hh (P0), it predates this fix on
+// the user-effect path, and it needs a design decision rather than a patch, so there is no row for it
+// here: a failing row cannot be parked in this file, and a row asserting today's wrong output would
+// pin the defect in place.
+test "a captured handler nested inside another still delegates" {
+    let src = "fn outer() -> Handler[IO] \{\n    handler IO \{\n        fn eprint(msg: Str) \{\n            io.println(\"[O/e] \{msg}\")\n        }\n    }\n}\nfn inner(tag: Str) -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[\{tag}] \{msg}\")\n        }\n    }\n}\nfn main() \{\n    with outer() \{\n        with inner(\"I\") \{\n            io.println(\"p\")\n            io.eprintln(\"e\")\n        }\n    }\n}\n"
+    let r = compile_and_run(src, "wxxg4f_nested")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[I] p"))
+    assert(r.out.contains("[O/e] e"))
+}
+
+// ── In-corpus ───────────────────────────────────────────────────────────────────────
+
+test "a captured builtin handler compiles in the corpus" {
+    let tag = "corpus"
+    with handler IO {
+        fn print(msg: Str) {
+            io.eprintln("[{tag}] {msg}")
+        }
+    } {
+        io.println("swallowed")
+    }
+    assert(true)
+}

@@ -47,7 +47,7 @@ import codegen_types.{
     get_var_option_inner2_struct, get_var_option_inner_struct,
     get_var_result_err, get_var_result_err_struct,
     get_var_result_ok, get_var_result_ok_struct,
-    get_var_struct, get_var_tp, get_var_type,
+    get_var_struct, get_var_tp, get_var_type, is_module_global,
     get_variant_field_count, get_variant_field_name,
     get_variant_field_type_str, get_variant_index, get_variant_tag,
     get_callee_params_sl,
@@ -1338,9 +1338,10 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
     cg_closure_defs.push("static {vtable_type}* {outer_ptr_name} = NULL;")
     cg_closure_defs.push("")
 
-    // Analyze captures across all handler methods
+    // Analyze captures across all handler methods.
+    // Builtin and user effects share this: both vtable shapes carry `__userdata`.
     let mut handler_caps: List[HandlerCapture] = []
-    if methods_sl != -1 && sublist_length(methods_sl) > 0 && is_user_effect != 0 {
+    if methods_sl != -1 && sublist_length(methods_sl) > 0 {
         let mut mci = 0
         while mci < sublist_length(methods_sl) {
             let mc = sublist_get(methods_sl, mci)
@@ -1359,7 +1360,16 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
                     }
                     aci = aci + 1
                 }
-                if already == 0 {
+                // A module-level `let` is NOT a capture. analyze_captures reports every free
+                // name that is a scope var, and module globals are scope vars, so without this
+                // filter `handler IO { fn log(m: Str) { _target.push(m) } }` over a file-scope
+                // `_target` would box the global into __userdata — unnecessary, since the static
+                // handler fn can see a file-scope C static directly, and wrong twice over: the
+                // capture is a snapshot taken at handler-construction time, and it consumes the
+                // single __userdata word that nested handlers share (br saf1hh). lib/std/testing.bl's
+                // capture_log/capture_print are exactly this shape, and composing two of them was
+                // the row that caught it.
+                if already == 0 && is_module_global(cname) == 0 {
                     handler_caps.push(HandlerCapture { name: cname, tp_id: get_var_type(cname) })
                 }
                 cci = cci + 1
@@ -1510,8 +1520,8 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
                     pi = pi + 1
                 }
             }
-            if has_handler_caps && is_user_effect != 0 {
-                let cap_ev_fld = ev_field("ue_{vtable_field}")
+            if has_handler_caps {
+                let cap_ev_fld = if is_user_effect != 0 { ev_field("ue_{vtable_field}") } else { ev_field(vtable_field) }
                 if handler_caps.len() == 1 {
                     let cap0 = handler_caps.get(0).unwrap()
                     let cn = cap0.name
@@ -1588,7 +1598,7 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
     let vt_ptr = "__handler_ptr_{handler_idx}"
     emit_line("{vtable_type}* {vt_ptr} = ({vtable_type}*)blink_alloc(sizeof({vtable_type}));")
     emit_line("*{vt_ptr} = {vt_name};")
-    if has_handler_caps && is_user_effect != 0 {
+    if has_handler_caps {
         if handler_caps.len() == 1 {
             let cap0 = handler_caps.get(0).unwrap()
             let cn = cap0.name
