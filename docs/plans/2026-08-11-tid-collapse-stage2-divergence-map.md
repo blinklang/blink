@@ -8300,6 +8300,73 @@ correctly; what was wrong was the *slot* the handler got installed into, which n
 observes. Worth stating plainly, because a Stage-3 unit that closes a P1 while leaving the counter
 untouched is otherwise easy to read as having done nothing.
 
+### 3nf9fr — `Option[T].unwrap()` floors every pointer-shaped inner to `CT_INT`
+
+**Found by splitting a bigger ticket, not by the census.** br rh7rhf claimed three defects; its third —
+"the unwrap temp is `blink_Option_int`, which does not match the value's own declared type" — reproduces
+with **no handler and no effect anywhere**, so it came out as its own unit and rh7rhf blocked on it.
+
+`unwrap_scalar_ct` (`codegen_types.bl:6437`) passed through only Float/Char/Bool/sized-int and floored
+everything else to `CT_INT`. The **construct** side was already correct — `Some(handle)` emits a
+properly typedef'd `blink_Option_handle` — so only the unwrap disagreed with it:
+
+```c
+blink_Option_int _ounw_2 = o;              // wrong carrier: cc `invalid initializer`
+const int64_t h2 = _ounw_2.value;          // wrong decl: int64_t, not blink_handle*
+```
+
+**This is the same defect the tail's own comment claims to have closed.** That comment describes
+widening the arm from Float/Char to the sized ints "an escape with no Blink span, for eight inner
+types" — the pointer-shaped kinds were never added. Worth naming, because the comment reads as if the
+class were finished, and that is exactly why nobody looked again.
+
+The fix is one line, and the shape of it is the point:
+
+```blink
+if c_type_tag(ct) != "void" { return ct }
+CT_INT
+```
+
+**Derived, not enumerated.** The obvious repair was to add `CT_HANDLE`, `CT_STRINGBUILDER`,
+`CT_CHANNEL`, `CT_ITERATOR`, `CT_PTR`, `CT_TEMPLATE` to the pass-through list — but an enumerated list
+is precisely what went stale the first time. Asking `c_type_tag` instead makes the predicate agree with
+`emit_option_typedef` **by construction**: an inner is passed through exactly when a carrier for it can
+exist, because both sites now consult the same speller. It also subsumes the old list rather than
+extending it.
+
+The two test rows fail in **different layers**, which is the useful part of having both: `Option[Handle]`
+fails in cc (a wrong C type against a right one), `Option[StringBuilder]` fails in *Blink* with
+`unresolved method '.write' on type StringBuilder` — once the inner is erased to Int the unwrapped value
+is not a StringBuilder at all. A fix that only silenced cc would leave the second row red.
+
+**The floor has no working witness, and that is the finding.** I tried twice to pin the `CT_INT` floor
+and was wrong twice. First with Duration/Instant, on the reasoning that their C representation is an
+integer — but they are *nominal types with methods* (flooring loses `.to_ms()`), and their construct
+side already emits the undeclared `blink_Option_void` before the unwrap is reached (→ br kxe0s2). Then
+with `Option[Void]`, the one inner whose `"void"` tag comes from a real arm rather than a fall-through
+— same failure, same line. So the floor is reached **only** by inners `c_type_tag` cannot name, and
+every such inner already dies at construction. It cannot be pinned by any compiling program and cannot
+be blamed for anything; passing those inners through would spell the same undeclared name in the temp.
+The guard becomes load-bearing only once rh7rhf gives `c_type_tag` its missing arms. *"Its C
+representation is an integer"* is not the same claim as *"it is an Int"*, and neither is the same claim
+as *"the carrier exists."*
+
+`task ci` green — 697 test files, 697 passed, 0 failed; `fmt` 1612 passed, 0 failed.
+`tests/test_3nf9fr_option_unwrap_pointer_inner.bl`, 6 rows. Red was maximal: the in-corpus row made the
+whole file fail to **build**.
+
+The census does not move, in either build mode: `diverge=42 missing=109`, per-cell identical to the
+resqj9 baseline. Correct by construction — **no `ctypediv` cell observes the unwrap temp's carrier.**
+The probe watches which channel spells a type at a *declaration* site; this disagreement is between two
+spellings of the *same variable's* carrier. Second unit in a row to close a real defect without moving
+the counter, so it is worth saying once more: the counter is a coverage instrument, not a scoreboard.
+
+**Two byproduct tickets, both with MVCEs.** br y50dak — `Handle[T].await()` loses `T`, emitting
+`const void _unused = (int64_t)(intptr_t)__await_3();` for a *discarded* await, with no Option in the
+reproduction; the Handle row omits `.await()` for that reason, so it does not go red for a defect this
+unit does not own. br kxe0s2 — `Some(Duration)` / `Some(Instant)` emit the undeclared
+`blink_Option_void`; same missing-arm mechanism as rh7rhf, no handler involved.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

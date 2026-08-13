@@ -1,0 +1,151 @@
+import compile_test_helpers.{compile_and_run}
+
+// br 3nf9fr — `Option[T].unwrap()`'s scalar tail floors every POINTER-SHAPED inner to CT_INT, so the
+// unwrap temp's carrier disagrees with the operand's own declared type and the unwrapped binding
+// declares `int64_t`. `unwrap_scalar_ct` (codegen_types.bl:6437) passes through only
+// Float/Char/Bool/sized-int; everything else becomes CT_INT.
+//
+// The CONSTRUCT side is already right, which is what makes this a pure spelling disagreement rather
+// than a lost value — for `Some(handle)` codegen emits a correct, typedef'd carrier:
+//
+//     typedef struct { int tag; blink_handle* value; } blink_Option_handle;
+//     const blink_Option_handle o = (blink_Option_handle){.tag = 1, .value = h};
+//
+// and only the unwrap disagrees with it:
+//
+//     blink_Option_int _ounw_2 = o;              // wrong carrier: cc `invalid initializer`
+//     const int64_t h2 = _ounw_2.value;          // wrong decl: int64_t, not blink_handle*
+//     void* __await_3 = blink_handle_await(h2);  // `pointer from integer without a cast`
+//
+// THIS IS THE SAME DEFECT THE TAIL'S OWN COMMENT CLAIMS TO HAVE FIXED. It reads: "this arm used to
+// name CT_FLOAT and CT_CHAR and default everything else to `blink_Option_int`, so unwrapping an
+// Option over any sized integer or Bool declared the temp `blink_Option_int` against a
+// `blink_Option_u64` operand and cc rejected the initializer — an escape with no Blink span, for
+// eight inner types." The sized ints were added; the POINTER-shaped kinds never were. That is worth
+// stating plainly, because the comment reads as if the class were closed.
+//
+// Str/List/Map/Option/Result/Bytes/Set/struct each have a dedicated `else if` arm ABOVE the tail in
+// emit_option_method's `unwrap` (codegen_methods.bl:5129) and so are unaffected — the pins at the
+// bottom hold that. The kinds with no arm above AND a pointer C representation are the erased set:
+// CT_HANDLE, CT_STRINGBUILDER, CT_CHANNEL, CT_ITERATOR, CT_PTR, CT_TEMPLATE, CT_CLOSURE, CT_HANDLER.
+// Instant, Duration and Enum LOOK like legitimate scalars because their C representation is an integer,
+// but Instant and Duration are NOMINAL types with methods and belong to the erased set too — flooring
+// them loses `.to_ms()`, and their construct side already emits the undeclared `blink_Option_void`.
+// They are br rh7rhf's cell, not this one, because passing an inner through cannot help until
+// `c_type_tag` names it. See the last pin below, which I first wrote for Duration and got wrong.
+//
+// NOT HANDLER-SPECIFIC, and that is why this is its own ticket rather than br rh7rhf's claim #3:
+// neither row below contains a handler or an effect. rh7rhf's Handler inner is one more member of
+// this set, and it also needs its own missing `c_type_tag` arm, so it blocks on this.
+//
+// The two rows fail in DIFFERENT LAYERS, which is the useful part of having both. Handle fails in cc
+// (a wrong C type against a right one). StringBuilder fails in Blink, with
+// `error[UnresolvedMethod]: unresolved method '.write' on type StringBuilder` — because once the
+// inner is erased to Int, the unwrapped value is not a StringBuilder at all and method resolution
+// has nothing to dispatch on. A fix that only silenced cc would leave the second row red.
+
+// ── The erased pointer-shaped inners ────────────────────────────────────────────────
+//
+// Both rows assert on OUTPUT, not just on exit code: an unwrap that yields the right C type but the
+// wrong VALUE would still compile and exit 0.
+
+// This row does NOT call `.await()` on the unwrapped handle, and the omission is forced rather than
+// chosen: `Handle[T].await()` loses T on its own (br y50dak), emitting `const void _unused =
+// (int64_t)(intptr_t)__await_3();` for a discarded await and rendering `<value>` for a kept one — with
+// no Option anywhere in the reproduction. Awaiting here would make the row red for a defect this
+// ticket does not own, and would hide this one.
+//
+// `exit_code == 0` is the real assertion, not a formality: before the fix cc REJECTED this program
+// (`blink_Option_int _ounw_2 = o;` against a `blink_Option_handle` operand → `invalid initializer`,
+// then `const int64_t h2 = _ounw_2.value`). A clean compile is exactly the thing that was impossible.
+// The spawned function's own side effect is asserted alongside it so the row also proves the handle
+// is a live one and the task really ran.
+test "Option[Handle].unwrap() declares a handle, not an int64_t" {
+    let src = "fn main() \{\n    async.scope \{\n        let h = async.spawn(fn() -> Int \{\n            io.println(\"ran in task\")\n            21\n        })\n        let o = Some(h)\n        let _h2 = o.unwrap()\n        io.println(\"unwrapped ok\")\n    }\n}\n"
+    let r = compile_and_run(src, "u3nf9fr_handle")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("unwrapped ok"))
+    assert(r.out.contains("ran in task"))
+}
+
+test "Option[StringBuilder].unwrap() yields a builder that still has its methods" {
+    let src = "fn main() \{\n    let sb = StringBuilder.new()\n    sb.write(\"hi\")\n    let o = Some(sb)\n    let s2 = o.unwrap()\n    s2.write(\"!\")\n    io.println(\"built=\{s2.to_str()}\")\n}\n"
+    let r = compile_and_run(src, "u3nf9fr_sb")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("built=hi!"))
+}
+
+// The unwrapped value must still be the SAME object, not a copy or a fresh one. Writing through the
+// original after unwrapping proves the pointer survived the carrier round-trip: if the temp had
+// silently truncated it, this would read back only the second write, or crash.
+test "the unwrapped builder is the same object as the one that went in" {
+    let src = "fn main() \{\n    let sb = StringBuilder.new()\n    sb.write(\"a\")\n    let o = Some(sb)\n    let s2 = o.unwrap()\n    s2.write(\"b\")\n    sb.write(\"c\")\n    io.println(\"same=\{s2.to_str()} orig=\{sb.to_str()}\")\n}\n"
+    let r = compile_and_run(src, "u3nf9fr_identity")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("same=abc"))
+    assert(r.out.contains("orig=abc"))
+}
+
+// In-corpus, so `task test` compiles the shape on every run rather than only inside a helper.
+test "pointer-inner Option unwraps compile in the corpus" {
+    let sb = StringBuilder.new()
+    sb.write("corpus")
+    let o = Some(sb)
+    let s2 = o.unwrap()
+    s2.write("!")
+    assert_eq(s2.to_str(), "corpus!")
+}
+
+// ── Regression pins ─────────────────────────────────────────────────────────────────
+//
+// The inner kinds that were already correct, split by WHY. The first group has a dedicated arm above
+// the tail. The second group the tail already named. The third is the floor itself — and the header
+// above records that my first attempt at that row picked the wrong types for it.
+
+test "inners with a dedicated arm above the tail still unwrap" {
+    let src = "type P \{ x: Int }\nfn main() \{\n    io.println(\"p=\{Some(P\{x: 7}).unwrap().x}\")\n    io.println(\"s=\{Some(\"str\").unwrap()}\")\n    io.println(\"l=\{Some([1, 2, 3]).unwrap().len()}\")\n    let m: Map[Str, Int] = Map()\n    m.insert(\"k\", 5)\n    io.println(\"m=\{Some(m).unwrap().get(\"k\").unwrap()}\")\n    io.println(\"b=\{Some(Bytes.new()).unwrap().len()}\")\n}\n"
+    let r = compile_and_run(src, "u3nf9fr_pin_arms")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("p=7"))
+    assert(r.out.contains("s=str"))
+    assert(r.out.contains("l=3"))
+    assert(r.out.contains("m=5"))
+    assert(r.out.contains("b=0"))
+}
+
+// The scalar pass-throughs the tail already named, plus a sized int and a Char — the eight types the
+// tail's comment says were fixed last time. These are the rows a careless widening would break.
+test "the scalar inners the tail already named still unwrap" {
+    let src = "fn main() \{\n    io.println(\"i=\{Some(42).unwrap()}\")\n    io.println(\"f=\{Some(1.5).unwrap()}\")\n    io.println(\"bo=\{Some(true).unwrap()}\")\n    let u: U64 = 9\n    io.println(\"u=\{Some(u).unwrap()}\")\n    let c: Char = 'z'\n    io.println(\"c=\{Some(c).unwrap()}\")\n}\n"
+    let r = compile_and_run(src, "u3nf9fr_pin_scalars")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("i=42"))
+    assert(r.out.contains("f=1.5"))
+    assert(r.out.contains("bo=true"))
+    assert(r.out.contains("u=9"))
+    assert(r.out.contains("c=z"))
+}
+
+// ── The floor has no working witness, and that is the finding ────────────────────────
+//
+// THERE IS NO PIN ROW FOR THE CT_INT FLOOR, because no program that reaches it compiles today — and I
+// found that out by writing the row twice and being wrong twice, which is worth recording rather than
+// quietly dropping.
+//
+// Attempt one asserted Duration and Instant were floored CORRECTLY, on the reasoning that their C
+// representation is an integer. Both halves were wrong. They are NOMINAL types with methods, so
+// flooring loses them (`error[UnresolvedMethod]: unresolved method '.to_ms' on type Duration`), and
+// their construct side was ALREADY emitting an undeclared carrier before the unwrap is even reached:
+//
+//     const blink_Option_void o = (blink_Option_void){.tag = 1, .value = d};
+//
+// Attempt two moved to `Option[Void]` — the one inner whose "void" tag comes from a real arm rather
+// than a fall-through — and it failed the same way, at the same line.
+//
+// So the floor is reached only by inners that `c_type_tag` does not name, and EVERY such inner already
+// produces the undeclared `blink_Option_void` at CONSTRUCTION. The floor is unreachable by any working
+// program: it cannot be pinned, and it also cannot be blamed for anything. Passing those inners
+// through instead would spell the same undeclared name in the temp, so it would not be an improvement
+// either — which is why the guard stays as a statement that becomes load-bearing only once br rh7rhf
+// gives `c_type_tag` its missing arms. "Its C representation is an integer" is not the same claim as
+// "it is an Int", and neither is the same claim as "the carrier exists".
