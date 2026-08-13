@@ -9094,6 +9094,58 @@ fn tc_check_spread_sources(elems_sl: Int, elem_t: Int) ! TypeCheck.Resolve, Type
     }
 }
 
+// br f5k3jk — `List[T]` has one element type, and until this ran nothing checked that the elements of
+// a literal agreed on it. `[1, "a"]` read the Str pointer back as an Int, `[2.5, 1]` SIGSEGV'd, and
+// `[mk_io(), mk_metrics()]` dispatched `io.println` by slot index through the Metrics vtable — the
+// same cross-effect laundering br 88sfaz was filed P0 for, in safe Blink, reached through a literal
+// instead of a typevar.
+//
+// THE RULE IS check_arg_value's, NOT A NEW ONE. Element 0 governs (sections/03_types.md:311,
+// `[100, 95, 87]  // List[Int]`) and every later element is checked against it exactly as `push`
+// checks its argument: the int-literal escape, then the metavar unify when either side carries an
+// unbound α, then types_compatible. `xs.push("a")` on a `List[Int]` was already an error; the literal
+// was the one position that skipped the check.
+//
+// WHY THIS IS NOT THE SPEC DECISION tc_check_spread_sources DEFERRED. That comment (br q1pxhm) reads
+// "§2.16 says nothing about plain elements, so `[1, "x"]` stays legal. General list homogeneity is a
+// separate decision." The deferral was right and the question has one sound answer, because there is
+// no implicit widening anywhere in the language to build an alternative rule from — `let f: Float = 1`
+// and `push(1)` onto a `List[Float]` are both rejected today. So `[2.5, 1]` cannot mean "List[Float]
+// with 1 promoted"; it means the segfault. No expressible program is removed.
+//
+// check_arg_value ITSELF CANNOT BE CALLED HERE, and the reason is the trap this file already
+// documents twice: it infers the value node, and infer_type has no memo short-circuit, so a second
+// call re-walks the element and double-reports every diagnostic inside it. The contribution computed
+// by the caller's loop is passed in instead.
+//
+// SPREAD ELEMENTS ARE SKIPPED. tc_check_spread_sources owns them and cites the spec sentence it
+// enforces; reporting both would be one defect explained two different ways.
+//
+// UNIFY, NOT JUST COMPARE, when either side has an unbound metavar. It is what lets an element pin
+// the type — `[None, Some(4)]` was E0301 before this, because element 0 contributed `Option[α]` and
+// the constraint in element 1 was computed and thrown away. Pinning α from a later element is
+// inference, not the Void-defaulting br 8vcj2c ruled out: the literal determines the type.
+fn tc_check_list_elem_compat(elem: Int, elem_t: Int, idx: Int, first_t: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if node_kind(elem) == NodeKind.SpreadExpr { return }
+    if first_t == TYPE_UNKNOWN || elem_t == TYPE_UNKNOWN { return }
+    // Both resolutions, because the two paths in check_arg_value spell this escape differently —
+    // resolve_alias_tid on the concrete side, tc_resolve on the metavar side — and a first element
+    // whose type is a metavar already BOUND to a sized int needs the second one.
+    if is_int_literal_node(elem) != 0 {
+        if is_integer_type(resolve_alias_tid(first_t)) != 0 { return }
+        if is_integer_type(tc_resolve(first_t)) != 0 { return }
+    }
+    if tc_tid_has_unbound_metavar(first_t) != 0 || tc_tid_has_unbound_metavar(elem_t) != 0 {
+        if tc_unify(first_t, elem_t) == 0 {
+            tc_error_at("list element {idx + 1} has type {tc_type_str(elem_t)} but the list is built from {tc_type_str(first_t)}", elem)
+        }
+        return
+    }
+    if types_compatible(elem_t, first_t) == 0 {
+        tc_error_at("list element {idx + 1} has type {tc_type_str(elem_t)} but the list is built from {tc_type_str(first_t)}", elem)
+    }
+}
+
 fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let tid = infer_type_uncached(node)
     if node != -1 && node < tc_node_tid.len() {
@@ -10754,7 +10806,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // matching pre-existing homogeneity assumptions and diagnostics.
             let mut ei = 1
             while ei < sublist_length(elems_sl) {
-                let _c = tc_list_elem_contribution(sublist_get(elems_sl, ei))
+                let elem = sublist_get(elems_sl, ei)
+                let c = tc_list_elem_contribution(elem)
+                tc_check_list_elem_compat(elem, c, ei, first_t)
                 ei = ei + 1
             }
             tc_check_spread_sources(elems_sl, first_t)

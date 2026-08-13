@@ -8476,6 +8476,123 @@ honestly is what produced them — every one came from a row that went red for t
   the control that makes the distinction checkable — it also goes through a `List[Handler[IO]]`, and it
   passes.
 
+## The literal that was not a type position (br `f5k3jk`)
+
+**Not a census cell, and it is in this log for a reason.** Every other unit here was found by the
+instrument. This one was found by *writing a test row honestly*: rh7rhf's in-corpus row built
+`[mk_io(), mk_metrics()]` to show its new carrier tag worked, and the row **compiled**. The census could
+never have found it, because the census measures how codegen spells types it was given — and here
+typecheck handed codegen a `List[Handler[IO]]` that contained a `Handler[Metrics]`. Both spellers agreed
+perfectly. They were spelling a lie.
+
+**Three symptoms, one missing check.**
+
+```blink
+let xs = [1, "a"]           // xs.get(1) prints 94055069447766 — the Str pointer read as an Int
+let xs = [2.5, 1]           // xs.get(0) SIGSEGVs
+let hs = [mk_io(), mk_metrics()]
+for h in hs { with h { io.println("loop") } }
+                            // prints "[M] loop=1" — io.println dispatched by SLOT INDEX through the
+                            // Metrics vtable, calling counter(Str, Int) with one argument
+```
+
+The third is the reason this is P0 and jumped the queue: it is br 88sfaz's cross-effect vtable
+laundering, in safe Blink with no `@trusted` and no `@ffi`, reached through a list literal instead of a
+typevar. 88sfaz's own fix is intact — `fn take(h: Handler[IO])` called with a `Handler[Metrics]` is
+correctly rejected — and so is `push`. The **literal** was the one position with no check.
+
+**The fix reuses `check_arg_value`'s rule and cannot reuse `check_arg_value`.** Element 0 governs
+(`sections/03_types.md:311`, `[100, 95, 87] // List[Int]`) and every later element is checked against it
+exactly as `push` checks its argument: the int-literal escape, then the metavar unify when either side
+carries an unbound α, then `types_compatible`. But `check_arg_value` *infers* its value node, and
+`infer_type` has no memo short-circuit — a second call re-walks the element and double-reports every
+diagnostic inside it, the trap this file already documents at br q1pxhm. The contribution the caller's
+loop already computed is passed in instead. `tc_check_list_elem_compat`, 12 lines, called from the loop
+at `typecheck.bl:10755` that until now discarded its own result into `let _c`.
+
+**A comment in this codebase called this a spec decision, and it was right to at the time.**
+`tc_check_spread_sources` (br q1pxhm) enforced §2.16 for spread elements only, and recorded: *"§2.16 says
+nothing about plain elements, so `[1, "x"]` stays legal. General list homogeneity is a separate
+decision."* The deferral was correct at the time. What settles it now is that the question has exactly
+one sound answer, because there is no implicit widening anywhere in the language to build an alternative
+rule out of:
+
+```blink
+let f: Float = 1        // error, today
+xs.push(1)              // error on a List[Float], today
+```
+
+So `[2.5, 1]` cannot mean "`List[Float]` with `1` promoted" in this language. It means the segfault above.
+A heterogeneous list literal has no meaning to preserve, so enforcing homogeneity removes no expressible
+program — which is what makes this a bug fix and not a `type:spec` question for the panel.
+
+**Spread elements are skipped, deliberately.** q1pxhm's diagnostic cites the spec sentence it enforces
+and must stay the one that fires; a second report would be one defect explained two different ways. The
+test asserts the count, not just the presence.
+
+**One row went the other way: a program that did not compile now does.** `[None, Some(4)]` was E0301
+under-determined, because element 0 contributed `Option[α]` and the constraint in element 1 was computed
+and thrown away. Checking the element *unifies*, so α is pinned from the constraining element. That is
+inference, not the Void-defaulting br 8vcj2c ruled out — the literal determines the type, nothing was
+ever reading it.
+
+`tests/test_f5k3jk_list_literal_elem_types.bl`, 15 rows, 15/15. Red was 6 negative rows; **8 of the 15
+are positive controls**, and that ratio is the point — a homogeneity check is exactly the kind of change
+that over-fires. The controls that mattered: `[Ok(1), Err("e")]` (the two elements constrain *opposite*
+sides of one Result and fail a plain structural compare), `[Color.Red, Color.Green]` (two variants are
+one type), `pair[T](a, b) -> [a, b]` (an unbound Typevar is neither concrete nor a metavar, and silence
+there is load-bearing), and `[a, 1]` with `a: I32` (the int-literal escape).
+
+**`task regen` green on the first attempt, which was the real risk.** A homogeneity check that the
+compiler's own 40k lines violated even once would have bricked the bootstrap. They do not — and neither
+does the stdlib, nor `examples/`. One corpus file did:
+`tests/test_t7xf9y_handler_from_container.bl:136` read `[mk_io(), mk_metrics()]` in a row titled *"a
+handler at a non-zero List index can be used"*, whose stated purpose was to make index 1 a different
+effect from index 0. **That row was itself the 88sfaz crash**, in a test file written to guard against
+it. Made homogeneous, with the loss recorded in the comment: the stronger proof it was reaching for is
+not available in the language, because it was never sound.
+
+**Census, both modes: unchanged, and that is the expected result.** `diverge=43 missing=109` per-cell
+identical to the rh7rhf baseline; only `agree` grew (mono 436725 → 436981, arc 361184 → 361359 — the new
+test file's own compilations). No `ctypediv` cell can observe this fix: it changes which programs reach
+codegen, not how codegen spells anything. **Third unit in a row to close a real defect without moving the
+counter** — worth stating plainly, because a project whose exit criterion is a counter reaching 0 will
+otherwise quietly stop valuing the fixes that do not move it.
+
+`task ci` green — 699 test files, 699 passed, 0 failed; `fmt` 1616 passed, 0 failed.
+
+**The class is now one route from closed, and the last route is a P0 nobody had priced as one.** Six ways
+to get a `Handler[Metrics]` into a `Handler[IO]` slot, measured:
+
+```
+hs.push(mk_m())                              REJECTED   argument 1 of 'List.push'
+m.insert("k", mk_m())                        REJECTED   argument 2 of 'Map.insert'
+let o: Option[Handler[IO]] = Some(mk_m())    REJECTED   declared type … but got …
+fn f() -> Handler[IO] { mk_m() }             REJECTED   return value type …
+let t: (Handler[IO], Int) = (mk_m(), 1)      REJECTED   declared type … but got …
+let hs = [mk_io(), mk_m()]                   REJECTED   ← this unit
+let e = Env{h: mk_m()}                       ACCEPTED   ← br x231pe, prints "[M] structlit=140092283357272"
+```
+
+br x231pe was filed P2 as a general soundness gap ("`P { n: "not an int" }` typechecks clean"). It is the
+same P0 memory-safety hole through the struct-literal field, and it is **raised to P0**. It stays blocked
+on br 0khtje — a strict per-field check bricks self-hosting until `AstNode.kind`/`Token.kind` are real
+enum types, since ~281 `kind: NodeKind.X` sites are enum-into-Int — so 0khtje is **raised to P1** as the
+gate on a P0, with a note that a narrower carve-out (fire only when neither side is an Int/enum pair)
+might close the exposure without waiting for the migration.
+
+**Two byproducts, one family, and neither is this cell.** Both came from positive-control rows that would
+not compile:
+
+- **br 3x4q41 (P2)** — `let xs: List[I32] = [1, 2, 3]` is *rejected*: `declared type List[I32] but got
+  List[Int]`. The int-literal escape reaches a scalar `let` (`let x: I32 = 1`, fine) and a builtin method
+  argument (`push(1)` onto a `List[I32]`, fine) and not the literal-vs-annotation compare — by then the
+  element nodes are gone and only two list tids are compared. The literal needs the declared element type
+  as a construction hint, the way `check_arg_value` sets one before inferring an argument.
+- the same ticket, second position: `fn i32v() -> I32 { 7 }` is rejected too. Four positions, two with
+  the escape and two without, so the escape belongs in whatever compare they share rather than in
+  `check_arg_value` alone.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

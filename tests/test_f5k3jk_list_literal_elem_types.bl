@@ -1,0 +1,232 @@
+import compile_test_helpers.{compile_and_capture, compile_and_run}
+
+// br f5k3jk — a list literal's elements are never checked against each other, so `List[T]` can be
+// built holding values of several different types. Every observable consequence is undefined
+// behaviour, not a lenient conversion:
+//
+//     let xs = [1, "a"]
+//     xs.get(1).unwrap()          // prints 94055069447766 — the Str pointer read as an Int
+//
+//     let xs = [2.5, 1]
+//     xs.get(0).unwrap()          // SIGSEGV
+//
+//     let hs = [mk_io(), mk_metrics()]
+//     for h in hs { with h { io.println("loop") } }
+//     // prints "[M] loop=1" — io.println dispatched by SLOT INDEX through the Metrics vtable,
+//     // calling counter(Str, Int) with one argument. The `1` is not a value the program produced.
+//
+// The handler row is the reason this is P0 rather than P2: it is the same cross-effect vtable
+// laundering br 88sfaz was filed P0 for, in safe Blink with no @trusted and no @ffi, reached by a
+// different route. 88sfaz's own fix is intact — `fn take(h: Handler[IO])` called with a
+// `Handler[Metrics]` is correctly rejected — and so is `xs.push("a")` on a `List[Int]`. The literal
+// was the one position with no check.
+//
+// THE CHECK IS THE ONE push ALREADY USES, applied where it was skipped. That framing is deliberate:
+// element 0 governs the list's element type (sections/03_types.md:311, `[100, 95, 87] // List[Int]`),
+// and every later element is checked against it exactly as `push` checks its argument. No new
+// compatibility relation, no new coercion.
+//
+// WHY THIS IS NOT A SPEC DECISION, which is worth stating because a comment on the sibling check
+// says it is. tc_check_spread_sources (typecheck.bl:9060, br q1pxhm) enforced §2.16 for spread
+// elements only and recorded: "§2.16 says nothing about plain elements, so `[1, "x"]` stays legal.
+// General list homogeneity is a separate decision." The deferral was right at the time and the
+// question has exactly one sound answer, because Blink has no implicit numeric widening anywhere to
+// build an alternative rule out of:
+//
+//     let f: Float = 1        // error — rejected today
+//     xs.push(1)              // error on a List[Float] — rejected today
+//
+// So `[2.5, 1]` cannot mean "List[Float] with 1 promoted" in this language; it means the segfault
+// above. A heterogeneous list literal has no meaning to preserve, so enforcing homogeneity removes
+// no expressible program.
+//
+// SPREAD ELEMENTS STAY WITH THE §2.16 CHECK. They are skipped here so a mismatched spread reports
+// once, in the wording that cites the spec sentence it enforces, rather than twice.
+
+type A {
+    x: Int
+}
+
+type B {
+    y: Str
+}
+
+type Color {
+    Red
+    Green
+}
+
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str, value: Int)
+    }
+}
+
+fn mk_io() -> Handler[IO] {
+    handler IO {
+        fn print(msg: Str) {
+            io.println("[H] {msg}")
+        }
+    }
+}
+
+// ── The safety row ──────────────────────────────────────────────────────────────────
+//
+// Asserting on the DIAGNOSTIC and not on the output, because the pre-fix program exits 0. There is
+// no runtime signal to test against — that is the whole problem with this cell.
+
+test "a list literal cannot launder a handler across effects" {
+    let src = "effect Metrics \{\n    effect Emit \{\n        fn counter(name: Str, value: Int)\n    }\n}\nfn mk_io() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn mk_m() -> Handler[Metrics] \{\n    handler Metrics \{\n        fn counter(name: Str, value: Int) \{\n            io.println(\"[M] \{name}=\{value}\")\n        }\n    }\n}\nfn main() \{\n    let hs = [mk_io(), mk_m()]\n    for h in hs \{\n        with h \{\n            io.println(\"loop\")\n        }\n    }\n}\n"
+    let out = compile_and_capture(src, "f5k3jk_handler")
+    assert(out.contains("TypeError"))
+    assert(out.contains("Handler[Metrics]"))
+}
+
+// ── Scalars ─────────────────────────────────────────────────────────────────────────
+
+test "a heterogeneous scalar list literal is rejected" {
+    let src = "fn main() \{\n    let xs = [1, \"a\"]\n    io.println(\"len=\{xs.len()}\")\n}\n"
+    let out = compile_and_capture(src, "f5k3jk_scalar")
+    assert(out.contains("TypeError"))
+    assert(out.contains("Str"))
+}
+
+// An explicit annotation did not help before the fix and must not be needed after it: the check is
+// intra-literal, so the diagnostic points at the element rather than at the binding.
+test "an explicit annotation does not launder a mistyped element" {
+    let src = "fn main() \{\n    let xs: List[Int] = [1, \"a\"]\n    io.println(\"len=\{xs.len()}\")\n}\n"
+    let out = compile_and_capture(src, "f5k3jk_annot")
+    assert(out.contains("TypeError"))
+}
+
+// The float row's pre-fix behaviour was a SIGSEGV, not a wrong value — the strongest single
+// argument that no implicit promotion rule is being taken away here.
+test "an int literal among floats is rejected, as push already rejects it" {
+    let src = "fn main() \{\n    let xs = [2.5, 1]\n    io.println(\"0=\{xs.get(0).unwrap()}\")\n}\n"
+    let out = compile_and_capture(src, "f5k3jk_float")
+    assert(out.contains("TypeError"))
+}
+
+// ── Aggregates ──────────────────────────────────────────────────────────────────────
+
+test "two different struct types in one list literal are rejected" {
+    let src = "type A \{ x: Int }\ntype B \{ y: Str }\nfn main() \{\n    let ys = [A\{x: 1}, B\{y: \"s\"}]\n    io.println(\"len=\{ys.len()}\")\n}\n"
+    let out = compile_and_capture(src, "f5k3jk_struct")
+    assert(out.contains("TypeError"))
+    assert(out.contains("B"))
+}
+
+// Nested, so the check is structural and not a comparison of head kinds: both elements are Lists.
+test "nested list literals with different element types are rejected" {
+    let src = "fn main() \{\n    let xs = [[1], [\"a\"]]\n    io.println(\"len=\{xs.len()}\")\n}\n"
+    let out = compile_and_capture(src, "f5k3jk_nested")
+    assert(out.contains("TypeError"))
+}
+
+// ── What must keep compiling ────────────────────────────────────────────────────────
+//
+// A homogeneity check is exactly the kind of change that over-fires, and every row below is a shape
+// the corpus or the stdlib depends on. They assert on OUTPUT, not on the absence of a diagnostic: a
+// list that compiles and then reads back the wrong element would satisfy a silence assertion.
+
+test "homogeneous literals still compile and read back" {
+    let src = "fn main() \{\n    let ns = [1, 2, 3]\n    let ss = [\"a\", \"b\"]\n    let fs = [1.5, 2.5]\n    io.println(\"\{ns.get(2).unwrap()} \{ss.get(1).unwrap()} \{fs.get(0).unwrap()}\")\n}\n"
+    let r = compile_and_run(src, "f5k3jk_homog")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("3 b 1.5"))
+}
+
+// An int literal alongside a SIZED-int element: the escape `check_arg_value` applies for `push` has
+// to apply here too, or `[some_i32(), 1]` becomes an error.
+//
+// NOT `let xs: List[I32] = [1, 2, 3]`, which was this row's first form and is rejected today —
+// br 3x4q41, a different cell. That one is the literal disagreeing with its ANNOTATION (the binding
+// compares List[Int] against List[I32] after the element nodes are gone), where this ticket is about
+// elements disagreeing with EACH OTHER. `let x: I32 = 1` and `push(1)` onto a `List[I32]` are both
+// accepted, so the coercion exists and only the annotated-literal path cannot reach it.
+//
+// The sized value comes from an annotated `let` and not from `fn i32v() -> I32 { 7 }`, which is
+// rejected for the same reason as 3x4q41 — the escape does not reach the RETURN position either.
+test "an int literal alongside a sized-int element is accepted" {
+    let src = "fn main() \{\n    let a: I32 = 7\n    let xs = [a, 1]\n    io.println(\"len=\{xs.len()}\")\n}\n"
+    let r = compile_and_run(src, "f5k3jk_sized")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("len=2"))
+}
+
+// Both orders of an Option carrier. `[Some(3), None]` compiled before the fix; `[None, Some(3)]` did
+// NOT — element 0 contributed `Option[α]`, later elements were discarded, so α was never pinned and
+// the region boundary reported E0301 (br gqg3rk). Checking the element PINS α from the constraining
+// element, so the literal now types itself. That is inference, not the Void-defaulting br 8vcj2c
+// ruled out: the type is determined by the literal, it was just never read.
+test "an Option element carrier types itself in either order" {
+    let src = "fn main() \{\n    let a = [Some(3), None]\n    let b = [None, Some(4)]\n    io.println(\"\{a.len()} \{b.len()} \{a.get(0).unwrap().unwrap()} \{b.get(1).unwrap().unwrap()}\")\n}\n"
+    let r = compile_and_run(src, "f5k3jk_option")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("2 2 3 4"))
+}
+
+// Ok and Err contribute to OPPOSITE sides of the same Result, so neither element is compatible with
+// the other by a plain structural compare — this row fails if the check skips unification.
+test "Ok and Err in one list literal still compile" {
+    let src = "fn main() \{\n    let xs = [Ok(1), Err(\"e\")]\n    io.println(\"len=\{xs.len()}\")\n}\n"
+    let r = compile_and_run(src, "f5k3jk_result")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("len=2"))
+}
+
+// Two variants of one enum are one type. A check that compared variant identity rather than the
+// enum tid would reject this.
+test "different variants of one enum in a list literal are accepted" {
+    let src = "type Color \{\n    Red\n    Green\n}\nfn main() \{\n    let cs = [Color.Red, Color.Green]\n    io.println(\"len=\{cs.len()}\")\n}\n"
+    let r = compile_and_run(src, "f5k3jk_enum")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("len=2"))
+}
+
+// Inside a generic function the element type is an unbound Typevar, which is neither concrete nor a
+// metavar. Silence there is load-bearing: reporting it would reject every generic helper that builds
+// a list from its own parameters.
+test "a list literal built from typevar parameters is accepted" {
+    let src = "fn pair[T](a: T, b: T) -> List[T] \{\n    [a, b]\n}\nfn main() \{\n    let xs = pair(7, 8)\n    let ss = pair(\"x\", \"y\")\n    io.println(\"\{xs.get(1).unwrap()} \{ss.get(0).unwrap()}\")\n}\n"
+    let r = compile_and_run(src, "f5k3jk_typevar")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("8 x"))
+}
+
+// ── The §2.16 spread check keeps its own wording ─────────────────────────────────────
+//
+// br q1pxhm's diagnostic must still be the one that fires for a mismatched spread, and must fire
+// only once. A second report from the homogeneity check would be the same defect twice with two
+// different explanations.
+
+test "a mismatched spread still reports the spec's own diagnostic" {
+    let src = "fn main() \{\n    let a = [\"p\", \"q\"]\n    let xs = [1, ..a]\n    io.println(\"len=\{xs.len()}\")\n}\n"
+    let out = compile_and_capture(src, "f5k3jk_spread_bad")
+    assert(out.contains("list spread source has element type"))
+    assert_eq(out.split("list spread source has element type").len(), 2)
+}
+
+test "a compatible spread still compiles in either position" {
+    let src = "fn main() \{\n    let a = [2, 3]\n    let xs = [1, ..a]\n    let ys = [..a, 4]\n    io.println(\"\{xs.len()} \{ys.len()}\")\n}\n"
+    let r = compile_and_run(src, "f5k3jk_spread_ok")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("3 3"))
+}
+
+// ── In-corpus ───────────────────────────────────────────────────────────────────────
+
+test "the accepted shapes compile in the corpus" {
+    let ns = [1, 2, 3]
+    assert_eq(ns.len(), 3)
+    let cs = [Color.Red, Color.Green]
+    assert_eq(cs.len(), 2)
+    let structs = [A{x: 1}, A{x: 2}]
+    assert_eq(structs.len(), 2)
+    let hs = [mk_io(), mk_io()]
+    assert_eq(hs.len(), 2)
+    let opts = [Some(1), None]
+    assert_eq(opts.len(), 2)
+    let bs = [B{y: "s"}]
+    assert_eq(bs.len(), 1)
+}
