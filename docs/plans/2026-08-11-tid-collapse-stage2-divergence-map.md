@@ -9192,8 +9192,14 @@ existed since closures landed and the flat side uses it. `tc_tid_ct` therefore a
 closure and the guard rejected the binder before the arm could see it. Filed as br `rndevw` rather
 than fixed here, because it has its own blast radius **and its own consequence for this plan**: while
 that arm stands, every closure binding is a permanent `diverge` row, so **Stage 3's `counter == 0`
-exit cannot be reached** until it is corrected. The `tydiv` `flat=Fn()` rows do not move on this
+exit cannot be reached** until it is corrected. The `tydiv` closure rows do not move on this
 ticket for that reason.
+
+> **Correction, made when `rndevw` landed.** Correcting the arm is necessary but **not sufficient**:
+> the closure rows stay `diverge` afterwards, because `ty_tp_same_shape` rejects a closure a second
+> time in its child loop, where the flat universe holds the whole signature as one C string with no
+> `tp` children to compare. Stage 3's exit needs the flat field *gone*, not the translation layer
+> repaired. The deviation described above was nevertheless real and is now undone.
 
 **Census after — divergence-neutral in both build modes, and the delta is fully attributed.**
 `diverge=43 missing=109` in monolithic (`lines=2015 agree=438685`) and archive-linked
@@ -9203,10 +9209,17 @@ the normalized `(site, tid, flat)` triples on a common-file basis (994- and 925-
 and all 351 are `ctype.flat` — every other site's `agree`/`diverge`/`missing` triple is unchanged to
 the row. Per-file, the increase appears **only** in files that link the compiler (`src/*.bl` and the
 compiler-importing tests), at `+10` or `+7` each: it is this fix's own new declarations being
-measured while the compiler compiles itself, not a corpus behaviour change. Which is the reading to
-expect — the fix adds `CT_CLOSURE` where the flat channel previously said `CT_INT`, but `tk_to_ct`
-answers `CT_VOID` for `TyKind.Fn`, so the instrument cannot yet see those cells agree. They move when
-`rndevw` lands.
+measured while the compiler compiles itself, not a corpus behaviour change.
+
+> **Correction, made when `rndevw` landed.** This paragraph originally closed by predicting that the
+> 351 were closure cells the instrument "cannot yet see agree" because `tk_to_ct` answers `CT_VOID`
+> for `TyKind.Fn`, and that they would move when `rndevw` landed. They did not move — `rndevw` is
+> census-neutral to the row — and the prediction confused two different instruments. `ctype_probe_at`
+> spells with `c_type_from_tid`, which has always spelled a `Fn` as `blink_closure*` and never
+> consulted `tk_to_ct`, so closure declarations were **already agreeing** here. `tk_to_ct` feeds
+> `ty_tp_same_shape`, i.e. the `tydiv` sites, which is where the closure rows actually live. The
+> per-file attribution above was right on its own terms; only the explanation of *why* was wrong.
+> See the `rndevw` section below.
 
 **Three byproducts filed, none of them regressions.** `311nk2`: calling a call-expression result
 inline (`mk()(41)`, `fs.get(0).unwrap()(41)`) emits no call at all and silently prints the literal
@@ -9220,6 +9233,127 @@ containers are wrong, and `.len()` on the result draws codegen's `UnresolvedMeth
 that backstop's message prints `List[Int]` **from the tid**. Pre-existing — it reproduces from a
 directly-annotated closure variable — but only reachable in its container-sourced spelling once this
 fix made the call happen at all.
+
+## The arm that was in the wrong group, and the cell it does not retire (br `rndevw`)
+
+`tk_to_ct` ended in a five-arm group under one comment:
+
+    // No CT exists for these. CT_VOID is the erasure, not a type.
+    TyKind.Void => CT_VOID
+    TyKind.Fn => CT_VOID
+    TyKind.Tuple => CT_VOID
+    TyKind.Typevar => CT_VOID
+    TyKind.Unknown => CT_VOID
+
+The comment is true for four of those five and **false for `Fn`**. `CT_CLOSURE = 6`
+(`codegen_types.bl:36`) has existed since closures landed, the flat side stamps it on every closure
+binding, and `c_type_from_tid` already spells a `Fn` as `blink_closure*`. So the arm is the same
+shape as the `TyKind.Handler` and `TyKind.Template` arms in the *same* match, whose comments both
+say they "make the two universes AGREE rather than adding knowledge" — and it is now the third.
+`Tuple` and `Typevar` stay, correctly: there is no `CT_TUPLE` at all (codegen models a tuple as a
+struct), and a typevar is not storage.
+
+**The cost of the lie was measured, not guessed.** `tc_tid_ct` turns `CT_VOID` into `-1`, so it
+answered `-1` for every closure and no helper asking it for a head CT could see one. Fixing
+br `ndgx84` ran straight into it: `stamp_binder_elems_from_tid_if_unset` opens with a head-CT
+agreement guard, which rejected every closure binder before any arm could run, and that fix had to
+ask `tc_tid_kind` directly from **above** the guard — a deviation from br `0rmamy`'s ordering rule
+that only existed to route around this arm. With the arm repaired the guard admits a closure like
+any other head, and the second sub-step put that arm back where `0rmamy` says it belongs: last,
+keyed on the CT, catching only what the flat answer left unset. `task ci` green across both
+sub-steps (707/707, fmt 1632); the ndgx84 test stayed 10/10 through the move, which is the point of
+having written it first.
+
+**The half of the ticket that turned out to be wrong, and it is the more interesting half.** The
+ticket also claimed the arm makes Stage 3's `counter == 0` exit unreachable, the implication being
+that fixing the arm retires the closure `diverge` rows. It does not, and the test pins that rather
+than leaving it to be re-litigated. `ty_tp_same_shape` rejects a closure **twice over**:
+
+1. `if ct == CT_VOID && k != TyKind.Void { return TyShape.Differ }` — the root kind. This arm fixes
+   that one, and only that one.
+2. the **child loop**. `tc_tid_child_count` on a `Fn` is `1 + params` (return first), and the flat
+   universe holds a closure's signature as a **C string**, not as `tp` children — `flat=Fn(int64_t
+   (*)(const blink_closure*, int64_t))` is one `sname`, not a tree. So `tp_cmp_child` answers `-1`
+   at every index, and "an absent flat slot against a tid that NAMED the type" is a cell by the
+   instrument's own rule.
+
+So the row stays `diverge`, one level deeper and honestly attributed. That is the correct score:
+the flat universe genuinely cannot hold a closure's parameter and return types, which is exactly
+the divergence the instrument exists to count. **Closure cells are not retired by any repair to the
+translation layer** — they are retired by Stage 3 flipping authority onto the tid and Stage 4
+deleting the flat fields. Calling them `Ignorance` instead would be worse than leaving them:
+`Ignorance` is keyed on the *tid* being unknown, and a `Fn` tid knows exactly what it is, so
+scoring it as ignorance would hide a real cell from the very counter Stage 3 exits on.
+
+Two stale comments came off with it. `ty_tp_same_shape`'s own note listed "Tuple, Fn, Closure and
+Typevar" as the kinds collapsing onto `CT_VOID` — after this change `Fn` is not one of them, and
+`TyKind.Closure` **does not exist**: a closure *is* `TyKind.Fn`. And `tc_tid_ct`'s TRAP note (do not
+key a struct-slot admission gate on a CT, because several kinds share `CT_VOID`) listed `Fn` among
+them; the trap is real and still stands for `Void`/`Typevar`/`Unknown`, so the fix there is to drop
+`Fn` from the list rather than to soften the warning.
+
+### The census moved by zero, and the ndgx84 note said why wrongly
+
+Both modes came back exactly on the baseline — mono `agree=438685 diverge=43 missing=109`
+(`lines=2015`), archive-linked `agree=362609 diverge=43 missing=109` (`lines=1816`), on identical
+exclusions. The ndgx84 note had predicted the opposite: that its own `+351 agree` was closure cells
+the instrument "cannot see agree until rndevw lands". **That prediction was wrong, and the reason
+matters more than the number: those are two different instruments.**
+
+- `ctype_probe_at` (the `ctype.*` sites, and the published 43/109) spells with
+  **`c_type_from_tid`** and compares against the string the emitter actually printed. It has never
+  consulted `tk_to_ct`, and `c_type_from_tid` has always spelled a `Fn` as `blink_closure*`. So
+  closure declarations were **already agreeing** on this instrument, before and after.
+- `sv_ty_or_flat` (the `tydiv` sites, and Stage 2's 428-cell map) goes through
+  **`ty_tp_same_shape`**, which is the only consumer `tk_to_ct` feeds. That is where the closure
+  rows live, and where the two-level rejection above applies.
+
+Verified rather than reasoned: a hand-built closure program contributes exactly one `ctype.flat`
+**agree** row per closure binding (0 → 1 → 2 as bindings are added), and rows are only *printed*
+for decline/diverge, which is why grepping the sweep for a closure row finds nothing and why the
+tap looked unexercised at first. On the `tydiv` side the same program prints
+`bucket=diverge site=emit_let_binding.decl var=f tid=Fn(Int) -> Int flat=Fn(int64_t(*)(const
+blink_closure*, int64_t))` — the row the test pins, unchanged by this fix by construction.
+
+So rndevw is census-neutral **by mechanism**, not coincidentally, and the `+351` from ndgx84 was
+what the per-file attribution said it was all along: that fix's own new compiler declarations being
+measured while the compiler compiles itself. Nothing there was a closure cell.
+
+### Sizing the closure family, which is a Stage 3 input
+
+There was no `tydiv` corpus script (only `ctypediv`), so one was written — and the two sweeps must
+stay in separate files, because the instruments are not comparable. Monolithic, `tests` + `examples`
++ `src`, new test roots excluded: **196 closure diverge rows, 61 distinct `(site, tid, flat)`
+cells**, at exactly two sites — 44 at `emit_fn_params.param` and 17 at `emit_let_binding.decl`.
+
+Not one of the 61 has an empty flat signature. Every one carries the full spelling as an opaque
+string, which is the cleanest statement of what this whole plan is about: the flat universe is not
+*missing* the closure's type here, it is holding it in a form nothing can walk. Those 61 go to zero
+when the flat field goes away in Stage 4, and not before.
+
+**One of the 61 sub-families turned out to be a live bug, filed as br `kvjfqt`.** 28 cells read
+`tid=Fn(K, V) -> Bool` against a fully concrete `flat=Fn(int(*)(const blink_closure*, int64_t,
+int64_t))` — the tid is *less* concrete than the flat spelling, which for a post-mono site should be
+impossible. `substitute_typevar_tid` ends with
+
+    // TyKind.Fn and every scalar/nominal kind: no embedded typevar to rewrite.
+
+and that is the same species of false comment as the one this ticket fixed: `Fn` embeds typevars in
+precisely the way `List[T]` does, and `List`/`Option`/`Set`/`Result`/`Map`/`Tuple`/`Struct`/`Enum`
+all have recursing arms directly above it. So `tc_tid_subst_mono` hands back `Fn(T) -> T`
+unsubstituted inside a mono'd body, `closure_sig_from_tid` declines on the typevar child, the sig
+stays empty — and the ndgx84 backstop fires one level up, on safe Blink:
+
+    fn apply_first[T](fs: List[fn(T) -> T], x: T) -> T {
+        let h = fs.get(0).unwrap()
+        h(x)
+    }
+    // error[UndefinedFunction]: undefined function 'h' called in 'apply_1first_0Int'
+
+The mangled name proves the mono itself worked with `T=Int`; only the `Fn` tid's children were left
+as `T`. A directly annotated param (`fn apply_it[T](f: fn(T) -> T, ..)`) works, because that path
+resolves typevars by name off the AST annotation and never asks the tid — so this is the tid path
+specifically, which is the path Stage 3 is making authoritative.
 
 ## Appendix — all 428 shape cells
 

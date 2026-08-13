@@ -1,0 +1,161 @@
+// br rndevw: `tk_to_ct` maps `TyKind.Fn` onto `CT_VOID` under the comment
+//
+//     // No CT exists for these. CT_VOID is the erasure, not a type.
+//     TyKind.Void => CT_VOID
+//     TyKind.Fn => CT_VOID
+//     TyKind.Tuple => CT_VOID
+//     TyKind.Typevar => CT_VOID
+//     TyKind.Unknown => CT_VOID
+//
+// The comment is true for four of those five arms and FALSE for `Fn`. `CT_CLOSURE = 6`
+// (src/codegen_types.bl:36) has existed since closures landed, the flat side stamps it on every
+// closure binding, and `c_type_from_tid` already spells a `Fn` as `blink_closure*`. So this is the
+// same "the two universes disagree for no reason" shape as the `TyKind.Handler` and
+// `TyKind.Template` arms in the SAME match, whose comments both say they "make the two universes
+// AGREE rather than adding knowledge".
+//
+// THE COST OF THE LIE. `tc_tid_ct` turns `CT_VOID` into `-1`, so it answers `-1` for every closure
+// and no codegen helper that asks it for a head CT can see a closure at all. Measured while fixing
+// br ndgx84: `stamp_binder_elems_from_tid_if_unset` opens with a head-CT agreement guard, which
+// rejected every closure binder before any arm could run, and the fix had to ask `tc_tid_kind`
+// directly from ABOVE that guard — a deviation from br 0rmamy's ordering rule that this ticket
+// exists to remove.
+//
+// WHAT THIS DOES NOT FIX, pinned below rather than claimed. The ticket also says the arm makes
+// Stage 3's `counter == 0` exit unreachable, because a closure binding is a permanent `diverge`
+// row. The first half is right and the second half is not the whole reason. `ty_tp_same_shape`
+// rejects a closure TWICE over:
+//
+//   1. `if ct == CT_VOID && k != TyKind.Void { return TyShape.Differ }` — the root kind. This arm
+//      fixes that one.
+//   2. the child loop. `tc_tid_child_count` on a `Fn` is `1 + params`, and the flat universe holds
+//      a closure's signature as a C STRING, not as tp children, so `tp_cmp_child` answers `-1` at
+//      every index and an absent flat slot against a tid that NAMED the type is a cell by the
+//      instrument's own rule.
+//
+// So the row stays `diverge` after this fix, and CORRECTLY: the flat universe cannot structurally
+// hold a closure's parameter and return types, which is exactly the divergence the instrument
+// exists to count. Closure cells are retired by Stage 3 flipping authority onto the tid and Stage 4
+// deleting the flat fields — not by any repair to the translation layer. The pin below is what
+// keeps that from being quietly re-litigated as a bug.
+
+import typecheck.{
+    check_types, tc_lookup_node_tid, tc_type_str, tc_tid_ct, tc_tid_kind, tc_tid_child,
+    tc_unknown_tid, make_fn_type, make_tuple_type, make_list_type, TyKind,
+    TyDiv, sv_ty_or_flat, reset_ty_divergence, ty_divergence_count, ty_divergence_rows,
+}
+import codegen_types.{
+    CT_CLOSURE, CT_INT, CT_LIST,
+    set_var, set_var_ty, reset_scope_state,
+}
+import parser.{nodes}
+import compiler.{compile_to_program}
+import std.io
+// Bare and LOAD-BEARING despite `warning[UnusedImport]` (br xrhq1c): codegen_types resolves
+// several globals it cannot import out of the MERGED program, and codegen_expr is the smallest
+// root whose transitive closure closes those back-references.
+import codegen_expr
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert_eq(got, want)
+}
+
+fn probe_src() -> Str {
+    "fn probe() -> Int \{\n    let a = 1\n    let b = \"s\"\n    a\n}\n"
+}
+
+// Harvest real interned tids by their rendered type string, the same way
+// tests/test_stage2_ty_divergence.bl does. Building the Fn type from a HARVESTED leaf rather
+// than from a hand-made one keeps the row honest: a pool entry minted only inside this test
+// could agree with itself while the compiler's own entries did not.
+fn harvest() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/rndevw_probe.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut i = 0
+    while i < nodes.len() {
+        let tid = tc_lookup_node_tid(i)
+        if tid >= 0 { m.insert(tc_type_str(tid), tid) }
+        i = i + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 { io.println("FAIL: no harvested tid for rendered type '{key}'") }
+    assert(tid != -1)
+    tid
+}
+
+fn int_tid() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    expect_tid(harvest(), "Int")
+}
+
+// ── The fix ─────────────────────────────────────────────────────────────────────
+
+test "tc_tid_ct answers CT_CLOSURE for a Fn tid" {
+    let i = int_tid()
+    let f = make_fn_type(i, [i])
+    assert_eq_int("kind is Fn", if tc_tid_kind(f) == TyKind.Fn { 1 } else { 0 }, 1)
+    assert_eq_int("tc_tid_ct(Fn(Int) -> Int)", tc_tid_ct(f), CT_CLOSURE)
+}
+
+// A nullary closure and a multi-parameter one go through the same arm, but they are the two
+// shapes whose child COUNT differs most, and a fix that keyed on the params slice instead of the
+// kind would answer differently for them.
+test "the answer does not depend on the closure's arity" {
+    let i = int_tid()
+    assert_eq_int("Fn() -> Int", tc_tid_ct(make_fn_type(i, [])), CT_CLOSURE)
+    assert_eq_int("Fn(Int, Int) -> Int", tc_tid_ct(make_fn_type(i, [i, i])), CT_CLOSURE)
+}
+
+// The head CT is the whole reason the ndgx84 workaround exists, and a nested Fn is the case that
+// proves the arm is on the KIND and not on a binding's position.
+test "a Fn nested as a container element also reports CT_CLOSURE" {
+    let i = int_tid()
+    let lf = make_list_type(make_fn_type(i, [i]))
+    assert_eq_int("List of closures is still a List", tc_tid_ct(lf), CT_LIST)
+    assert_eq_int("its element is a closure", tc_tid_ct(tc_tid_child(lf, 0)), CT_CLOSURE)
+}
+
+// ── Controls: the comment stays true for the other four arms ────────────────────
+
+test "control: Tuple, Typevar and Unknown still have no CT" {
+    let i = int_tid()
+    assert_eq_int("Tuple has no CT_TUPLE to map onto", tc_tid_ct(make_tuple_type([i, i])), -1)
+    assert_eq_int("Unknown is ignorance, not a type", tc_tid_ct(tc_unknown_tid()), -1)
+}
+
+// ── The pin: the divergence row is NOT retired by this fix, and that is correct ─
+
+test "pin: a closure binding still lands in DIVERGE, on the children not the root" {
+    let i = int_tid()
+    let f = make_fn_type(i, [i])
+    reset_scope_state()
+    reset_ty_divergence()
+    // The flat universe's honest best for a closure: the head CT is right and there is nowhere
+    // for the signature to live as tp children.
+    set_var("h", CT_CLOSURE, 0)
+    set_var_ty("h", f)
+    assert_eq_int("the tid still governs the answer", sv_ty_or_flat("h", "unit.closure"), f)
+    let dv = ty_divergence_count("unit.closure", TyDiv.Diverge)
+    if dv != 1 {
+        io.println("FAIL: closure cell bucket — got diverge={dv}, want 1")
+        let rows = ty_divergence_rows()
+        let mut i2 = 0
+        while i2 < rows.len() {
+            io.println("  row: {rows.get(i2).unwrap()}")
+            i2 = i2 + 1
+        }
+    }
+    assert_eq(dv, 1)
+    // Not Unknown. `Ignorance` is keyed on the TID being unknown, and a Fn tid knows exactly what
+    // it is — calling this ignorance would hide a real cell from the Stage 3 counter.
+    assert_eq_int("not scored as ignorance", ty_divergence_count("unit.closure", TyDiv.Unknown), 0)
+    assert_eq_int("not scored as agreement", ty_divergence_count("unit.closure", TyDiv.Agree), 0)
+}

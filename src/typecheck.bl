@@ -1,6 +1,6 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on}
 import std.str.{str_to_lower}
-import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, c_type_c_name, is_transparent_newtype, resolve_effect_vtable, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_HANDLER, CT_CHANNEL, CT_PTR, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_TEMPLATE, CT_FFI_SCOPE, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
+import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, c_type_c_name, is_transparent_newtype, resolve_effect_vtable, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_CLOSURE, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_HANDLER, CT_CHANNEL, CT_PTR, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_TEMPLATE, CT_FFI_SCOPE, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
 import parser.{
     get_annotation, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
@@ -13269,6 +13269,14 @@ fn tk_to_ct(kind: TyKind) -> Int {
         // maps the annotation NAME to it, and the 7 emitters key on it. Only the tid side was
         // missing, so this arm makes the two universes agree rather than adding knowledge.
         TyKind.Template => CT_TEMPLATE
+        // Third arm of the same kind as Handler and Template above: CT_CLOSURE has existed since
+        // closures landed (codegen_types.bl:36) and the flat side stamps it on every closure
+        // binding, so this makes the two universes agree at the ROOT rather than adding knowledge.
+        // It does NOT make a closure cell agree overall, and that is not a shortcoming of this arm:
+        // the flat universe holds a closure's signature as a C STRING, not as tp children, so
+        // ty_tp_same_shape's child loop still finds no slot for the return or the params. That cell
+        // is real and is retired by Stage 3 flipping authority onto the tid, not here (br rndevw).
+        TyKind.Fn => CT_CLOSURE
         TyKind.FfiScope => CT_FFI_SCOPE
         TyKind.I8 => CT_I8
         TyKind.I16 => CT_I16
@@ -13278,9 +13286,9 @@ fn tk_to_ct(kind: TyKind) -> Int {
         TyKind.U32 => CT_U32
         TyKind.U64 => CT_U64
         TyKind.Char => CT_CHAR
-        // No CT exists for these. CT_VOID is the erasure, not a type.
+        // No CT exists for these. CT_VOID is the erasure, not a type. (TyKind.Fn used to sit in
+        // this group and did not belong: CT_CLOSURE exists — br rndevw.)
         TyKind.Void => CT_VOID
-        TyKind.Fn => CT_VOID
         TyKind.Tuple => CT_VOID
         TyKind.Typevar => CT_VOID
         TyKind.Unknown => CT_VOID
@@ -13482,10 +13490,13 @@ fn ty_tp_same_shape(tid0: Int, tp: Int, depth: Int) -> TyShape {
     // NAMED the type stays a cell (mv45y5 made that erasure honest, not correct), while an absent flat
     // slot against a tid that is itself unknown is two representations saying the same thing.
     //
-    // Keyed on the KIND being Unknown, deliberately not on tk_to_ct answering CT_VOID. Tuple, Fn,
-    // Closure and Typevar collapse onto CT_VOID too, and none of them is ignorance: those types are
-    // determined and the flat universe simply cannot spell them, which is exactly the divergence this
-    // instrument exists to count.
+    // Keyed on the KIND being Unknown, deliberately not on tk_to_ct answering CT_VOID. Tuple and
+    // Typevar collapse onto CT_VOID too, and neither is ignorance: those types are determined and
+    // the flat universe simply cannot spell them, which is exactly the divergence this instrument
+    // exists to count. (Fn was in that list until br rndevw gave it CT_CLOSURE; it now clears the
+    // root guard below and diverges one level deeper instead, at the child loop, because the flat
+    // universe holds a closure's signature as a C string rather than as tp children. Same cell,
+    // honestly attributed. There is no TyKind.Closure — a closure IS TyKind.Fn.)
     if k == TyKind.Unknown {
         if tp < 0 { return TyShape.Ignorance }
         return TyShape.Differ
@@ -13846,8 +13857,8 @@ pub fn tc_tid_map_key_tid(tid: Int) -> Int {
 // re-adding one is fine, folding resolution INTO this function is not.
 //
 // TRAP, and the reason this warning lives here rather than only at the seam: do NOT
-// key a struct-slot admission gate on a CT at all. tk_to_ct maps TyKind.Void, TyKind.Typevar,
-// TyKind.Unknown and TyKind.Fn all onto CT_VOID, so a CT-keyed slot gate admits unsolved
+// key a struct-slot admission gate on a CT at all. tk_to_ct maps TyKind.Void, TyKind.Typevar
+// and TyKind.Unknown all onto CT_VOID, so a CT-keyed slot gate admits unsolved
 // metavars as if they were a genuine Void — the inversion br hsgsbp had to reverse
 // once already. Slot gates key on the KIND (tc_struct_slot_encodable); the same trap
 // is restated at the seam itself, src/codegen_expr.bl:5669-5672.
