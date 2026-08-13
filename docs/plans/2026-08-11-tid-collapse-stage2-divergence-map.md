@@ -8198,6 +8198,108 @@ Map, user-effect List, two effects in one program, non-zero index), four run-mod
 handler body actually ran, five regression pins. `task ci` green — 695 test files, 695 passed, 0
 failed; `fmt` 1608 passed, 0 failed.
 
+## The `with` operand that was never typed (br `resqj9`)
+
+One commit after br `t7xf9y`, probing the *next* container shape turned up a worse row than the one
+the ticket was about:
+
+```blink
+type Env { h: Handler[IO] }
+let e = Env{h: mk()}
+with e.h { io.println("via field") }
+```
+
+This compiled, ran, and exited 0, printing `via field` where a correct dispatch prints
+`[H] via field`. **Nothing was installed.** The emitted C says so:
+
+```c
+blink_Env _s0 = { .h = blink_u_mk() };
+const blink_Env e = _s0;
+{
+    e.h;                                 // the operand, emitted for effect and dropped
+    __blink_ev.io->print("via field");   // ambient default, not the handler
+}
+```
+
+A silent wrong answer, which is why this is P1 while `t7xf9y` — which failed loudly in the C
+compiler — was P2. The field storage is fine: the field really is `blink_io_vtable* h` holding a real
+GC-allocated vtable. Only the operand *form* was at fault, and one extra binding proved it —
+`let hl = e.h; with hl { … }` was already correct.
+
+### My first fix was wrong, and the probe said so in one line
+
+`t7xf9y`'s comment blames the missing operand tid on `Ident` specifically, so a field access looked
+like it should already work. I added the node-tid recovery in codegen, regenerated, and all four rows
+still failed. A `dbg_trace` on the with-operand loop:
+
+```
+[dbg:withop] str=e.h ct=21 node_tid=-1
+```
+
+Two facts in that row. **`ct=21` IS `CT_HANDLER`** — the flat channel knew perfectly well it was
+looking at a handler; what it could not do was *name the effect*, because the vtable field is keyed by
+variable name and `e.h` is not one. And **`node_tid=-1`** — `tc_check_body` has no `Ident` arm *and no
+`FieldAccess` arm*. It **walks** the operand and never **types** it, so every `with` operand in the
+corpus landed on a silent fallthrough. The narrowing to `Ident` was wrong, and this ticket inherited
+it from the previous one.
+
+### The fix is one line, in typecheck
+
+```blink
+tc_check_body(wh_item2)
+let _memoized = infer_type(wh_item2)
+```
+
+`tc_check_body` stays and runs first: for an inline handler operand it routes to the `HandlerExpr` arm
+that walks the method bodies (br `pgc3d9`), which `infer_type` does not do. They are complements.
+
+Reconstructing the field's type in codegen instead — walking to the base variable's struct tid and
+looking the field up — would have been codegen inferring a type again, which is the thing this
+collapse exists to stop. It also makes the spec's own rule (`sections/04_effects.md:1102`, *"the
+compiler checks `Handler[E]` first, then `BlockHandler`"*) something a later change can enforce
+against a **type** rather than against a C string.
+
+### It retires a channel instead of adding one
+
+With the operand typed, the **operand node's** tid subsumes the `get_var_ty(handler_str)` **binding**
+tid that `t7xf9y` had added one commit earlier. Measured with a `withop` probe over
+`tests` + `examples` + `src`, 27 operands reaching the recovery:
+
+```
+ZERO rows where the binding tid answers and the node tid does not
+every row get_var_ty resolved, the node resolves to the SAME effect
++3 rows only the node can reach   (e.h, b.io, b.metrics)
+```
+
+So the binding recovery is **deleted**, and codegen asks one question in one place. Keeping it "just
+in case" would leave a second authority for the same question with no row to justify it. `t7xf9y`'s 14
+rows pass unchanged — what changed is which single channel answers them.
+
+The three corpus operands that answer *neither* channel were checked rather than assumed:
+`tests/test_with_parse.bl` declares `fn make_handler() -> Int`, so they are not handlers at all and
+the discard arm is right for them. The `_s*` / `_sr*` temps are `BlockHandler` struct values, handled
+by the arm below.
+
+Deliberately **not** touched: the flat `handler_type == CT_HANDLER` → `get_var_handler_vtable_field`
+recovery still runs first. The probe suggests the tid would answer for its rows too, but taking rows
+away from an arm an earlier ticket wired correctly needs its own measurement and its own ticket, per
+br `0rmamy`.
+
+### Measured
+
+`task ci` green — 696 test files, 696 passed, 0 failed; `fmt` 1610 passed, 0 failed.
+`tests/test_resqj9_with_field_operand.bl`, 6 rows, red before / green after: four failing rows (field
+operand, user-effect field operand, two field operands of *different* effects, a field two struct
+levels deep) and two pins that passed both before and after. Every row asserts on **output**, since
+compilation was never the problem.
+
+The census does **not** move, in either build mode: `diverge=42 missing=109`, unchanged. That is the
+honest reading of this unit — it was a **dispatch** fix, not a spelling one. The `ctypediv` probe
+watches which channel spells a C *type*, and every row here already spelled `blink_io_vtable*`
+correctly; what was wrong was the *slot* the handler got installed into, which no `ctype.*` cell
+observes. Worth stating plainly, because a Stage-3 unit that closes a P1 while leaving the counter
+untouched is otherwise easy to read as having done nothing.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

@@ -1,0 +1,164 @@
+import compile_test_helpers.{compile_and_run}
+
+// br resqj9 — `with <field-access>` compiled, ran, exited 0, and installed NOTHING. Every operation
+// in the block dispatched to the ambient default vtable instead of the handler:
+//
+//     type Env { h: Handler[IO] }
+//     let e = Env{h: mk()}
+//     with e.h { io.println("via field") }   // printed `via field`, not `[H] via field`
+//
+// The emitted C says it plainly — the operand is dropped and the call goes to `__blink_ev`:
+//
+//     blink_Env _s0 = { .h = blink_u_mk() };
+//     const blink_Env e = _s0;
+//     {
+//         e.h;                                 // the operand, emitted for effect
+//         __blink_ev.io->print("via field");   // ambient default, not the handler
+//     }
+//
+// A SILENT WRONG ANSWER, which is the only reason this is P1 while its sibling br t7xf9y (which
+// failed in the C compiler) was P2. The field storage is fine: the field really is
+// `blink_io_vtable* h` holding a real GC-allocated vtable, and `blink_u_mk` is the user fn `mk`
+// (`blink_u_` is the reserved-name escape, codegen_types.bl:884) — nothing is lost at construction.
+// Only the OPERAND FORM was at fault, proved by one extra binding making it correct:
+//
+//     let hl = e.h
+//     with hl { … }        // already printed `[H] …` before this fix, via br t7xf9y's sv.ty channel
+//
+// THE CAUSE is the third channel in the t7xf9y family, one operand form over.
+// `cg_handler_vtable_field` is written by emit_expr only for a handler CONSTRUCTION
+// (codegen_expr.bl:1618) or a call whose return is registered (:5312) — never for a field access.
+// t7xf9y added a tid recovery for exactly that hole, but recovered through
+// `get_var_ty(handler_str)`, and for a field operand `handler_str` is the C expression `e.h`, which
+// is not a variable name: the lookup missed, the field stayed empty, and an empty field means no
+// slot to install into, so the operand fell to the `emit_line("{handler_str};")` discard arm.
+//
+// THE FIX IS IN TYPECHECK, AND MY FIRST GUESS AT IT WAS WRONG. I expected the node tid to answer
+// already for a FieldAccess — t7xf9y's comment blames the missing tid on `Ident` specifically, so a
+// field access looked like it should be different. It is not: I added the node-tid recovery in
+// codegen, regenerated, and the rows below still failed. A `withop` probe said why —
+// `str=e.h ct=21 node_tid=-1`. The CT is 21, which IS CT_HANDLER, so the flat channel knew perfectly
+// well it was looking at a handler; what it could not do was NAME THE EFFECT, because the vtable
+// field is keyed by variable name and `e.h` is not one.
+//
+// tc_check_body has no Ident arm AND no FieldAccess arm. It WALKS the operand and never TYPES it, so
+// every `with` operand in the corpus — not just the bare-Ident ones — landed on a silent fallthrough
+// with no tid memoized. The fix is one line in typecheck's WithBlock arm: infer the operand.
+// Recovering it in codegen instead would have been codegen inferring a type again, which is the
+// thing this collapse exists to stop.
+//
+// AND THAT RETIRES A CHANNEL RATHER THAN ADDING ONE. With the operand typed, the node tid subsumes
+// the `get_var_ty` binding tid that t7xf9y introduced — measured over tests+examples+src: 27
+// operands reach the recovery, ZERO rows where the binding answers and the node does not, plus the
+// three field-access rows only the node can reach. So codegen now asks one question in one place,
+// and t7xf9y's rows still pass unchanged.
+//
+// Spec: handlers in struct fields are explicitly first-class — sections/04_effects.md:1306
+// "#### First-class values", with `type TestEnv { db: Handler[DB]; io: Handler[IO] }` at :1313.
+
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str, value: Int)
+    }
+}
+
+fn mk_io() -> Handler[IO] {
+    handler IO {
+        fn print(msg: Str) {
+            io.println("[H] {msg}")
+        }
+    }
+}
+
+fn mk_metrics() -> Handler[Metrics] {
+    handler Metrics {
+        fn counter(name: Str, value: Int) {
+            io.println("[M] {name}={value}")
+        }
+    }
+}
+
+type Env {
+    h: Handler[IO]
+}
+
+type Both {
+    io: Handler[IO]
+    metrics: Handler[Metrics]
+}
+
+// ── The rows that dispatched to the ambient default ──────────────────────────────────
+//
+// Every row here asserts on OUTPUT rather than on compilation, because compilation was never the
+// problem: each of these built and exited 0 while doing the wrong thing. A user effect's default
+// stub returns without doing anything, so output is the only observable difference between a
+// correct dispatch and no dispatch at all.
+
+test "a handler in a struct field dispatches when used directly as the with-operand" {
+    let src = "type Env \{ h: Handler[IO] }\nfn mk() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn main() \{\n    let e = Env\{h: mk()}\n    with e.h \{\n        io.println(\"via field\")\n    }\n}\n"
+    let r = compile_and_run(src, "resqj9_field_dispatch")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[H] via field"))
+}
+
+test "a user-effect handler in a struct field dispatches from a field operand" {
+    let src = "effect Metrics \{\n    effect Emit \{\n        fn counter(name: Str, value: Int)\n    }\n}\ntype Env \{ m: Handler[Metrics] }\nfn mk() -> Handler[Metrics] \{\n    handler Metrics \{\n        fn counter(name: Str, value: Int) \{\n            io.println(\"[M] \{name}=\{value}\")\n        }\n    }\n}\nfn main() \{\n    let e = Env\{m: mk()}\n    with e.m \{\n        metrics.counter(\"ok\", 42)\n    }\n}\n"
+    let r = compile_and_run(src, "resqj9_ue_field_dispatch")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[M] ok=42"))
+}
+
+// Two field operands on one `with`, and two DIFFERENT effects — the shape that turned t7xf9y's
+// stale-global surface from an argument into a measurement. If the second operand were to inherit
+// the first operand's slot, the IO vtable would land in `ue_metrics` and `metrics.counter` would
+// dispatch by slot index through it. Both prefixes must appear, and from the right handlers.
+test "two field operands of different effects each install their own slot" {
+    let src = "effect Metrics \{\n    effect Emit \{\n        fn counter(name: Str, value: Int)\n    }\n}\ntype Both \{\n    io: Handler[IO]\n    metrics: Handler[Metrics]\n}\nfn mk_io() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn mk_m() -> Handler[Metrics] \{\n    handler Metrics \{\n        fn counter(name: Str, value: Int) \{\n            io.println(\"[M] \{name}=\{value}\")\n        }\n    }\n}\nfn main() \{\n    let b = Both\{io: mk_io(), metrics: mk_m()}\n    with b.io, b.metrics \{\n        io.println(\"both\")\n        metrics.counter(\"both\", 1)\n    }\n}\n"
+    let r = compile_and_run(src, "resqj9_two_field_operands")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[H] both"))
+    assert(r.out.contains("[M] both=1"))
+}
+
+// A field reached through a nested struct, so the operand is a field access whose own base is a
+// field access rather than a variable. `handler_str` here is `outer.inner.h`, which is no more a
+// variable name than `e.h` was — the point is that the recovery keys on the tid of the node, so
+// depth costs it nothing.
+test "a handler two struct levels deep dispatches from a nested field operand" {
+    let src = "type Inner \{ h: Handler[IO] }\ntype Outer \{ inner: Inner }\nfn mk() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn main() \{\n    let o = Outer\{inner: Inner\{h: mk()}}\n    with o.inner.h \{\n        io.println(\"nested\")\n    }\n}\n"
+    let r = compile_and_run(src, "resqj9_nested_field")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[H] nested"))
+}
+
+// In-corpus, so the shape is compiled by every `task test` run and not only inside a helper. The
+// `assert(true)` here is deliberate and load-bearing in a way the rows above are not: this test
+// body is what the corpus COMPILES, and the run-mode assertions above are what prove it dispatches.
+test "field-operand with blocks compile in the corpus" {
+    let e = Env{h: mk_io()}
+    with e.h {
+        io.println("[corpus] via field")
+    }
+    let b = Both{io: mk_io(), metrics: mk_metrics()}
+    with b.io, b.metrics {
+        io.println("[corpus] both")
+        metrics.counter("corpus", 7)
+    }
+    assert(true)
+}
+
+// ── Regression pins ─────────────────────────────────────────────────────────────────
+//
+// The operand forms that were already correct, each verified by RUNNING it before the fix and
+// reading the prefix. The copy row in br t7xf9y is why these are not `assert(true)`: "already
+// right" is exactly the kind of claim that turns out to be false when a default stub returns
+// silently.
+
+test "the already-correct operand forms still dispatch" {
+    let src = "type Env \{ h: Handler[IO] }\nfn mk() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn take(h: Handler[IO]) \{\n    with h \{\n        io.println(\"param\")\n    }\n}\nfn main() \{\n    with mk() \{\n        io.println(\"construction\")\n    }\n    let e = Env\{h: mk()}\n    let hl = e.h\n    with hl \{\n        io.println(\"let-from-field\")\n    }\n    take(e.h)\n}\n"
+    let r = compile_and_run(src, "resqj9_pins")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[H] construction"))
+    assert(r.out.contains("[H] let-from-field"))
+    assert(r.out.contains("[H] param"))
+}
