@@ -114,7 +114,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{sv_ty_or_flat_at, ctype_probe_at, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
+import typecheck.{sv_ty_or_flat_at, ctype_probe_at, enum_instance_c_from_tid, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -880,7 +880,23 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
             // (`match Branch(Leaf(1), Leaf(2))` inline) recovers the mono from the emitted
             // value string, which the ctor tagged via set_var_struct.
             let scrut_mono = if node_kind(scrut) == NodeKind.Ident { get_var_struct(node_name(scrut)) } else { get_var_struct(expr_result_str) }
-            let scrut_c = if scrut_mono != "" && is_mono_struct_instance(scrut_mono) != 0 { c_type_from_tag(scrut_mono) } else { c_type_from_tag(match_scrut_enum) }
+            // br tk8s0y: the tid LEADS over both recoveries above. Both read a NAME — the var's
+            // tracked struct, or the emitted value string's — and a scrutinee whose instance was
+            // fixed by an ANNOTATION rather than by its constructor arguments has the bare base
+            // recorded under that name, so `match t` where `t: ITree[Int] = INone` declared the
+            // temp `blink_ITree`: a typedef that is never emitted. The tid reads the NODE and is
+            // indifferent to how the scrutinee was spelled (br bef42x's ordering).
+            //
+            // match_scrut_enum still stays BARE — it is the variant tag/field lookup key, not a C
+            // type (br jjhnf3) — and so does the scrut_sname recorded below, for the same reason.
+            let scrut_tid_c = enum_instance_c_from_tid(tc_lookup_node_tid(scrut))
+            let scrut_c = if scrut_tid_c != "" {
+                scrut_tid_c
+            } else if scrut_mono != "" && is_mono_struct_instance(scrut_mono) != 0 {
+                c_type_from_tag(scrut_mono)
+            } else {
+                c_type_from_tag(match_scrut_enum)
+            }
             emit_line("{scrut_c} {scrut_tmp} = {expr_result_str};")
             set_var(scrut_tmp, CT_INT, 1)
             if scrut_mono != "" && is_mono_struct_instance(scrut_mono) != 0 { set_var_struct(scrut_tmp, scrut_mono) }
@@ -3285,11 +3301,15 @@ fn let_binding_tid(node: Int, type_ann: Int, val_node: Int) -> Int {
 // call or an anonymous C temporary — and the declaration then falls to `c_type_str(CT_ENUM)`,
 // which is `int64_t`. The tid knows the type in every one of those positions.
 //
-// Two declines, both load-bearing:
-//   - a GENERIC enum instance has children, so `c_type_from_tid` returns "" and the existing
-//     `enum_mono` arm above keeps ownership of the per-instantiation spelling (br jjhnf3);
-//   - a TRANSPARENT NEWTYPE spells `int64_t` (br ja9jev), which is what the flat path already
-//     prints, so declining on equality leaves that decision exactly where it is.
+// One decline, load-bearing: a TRANSPARENT NEWTYPE spells `int64_t` (br ja9jev), which is what
+// the flat path already prints, so declining on equality leaves that decision exactly where it is.
+//
+// A generic enum INSTANCE used to be the second decline — c_type_from_tid returned "" for
+// anything with children, which left the per-instantiation spelling to the `enum_mono` arm above
+// (br jjhnf3). br tk8s0y widened the speller, so this now answers `blink_Tree_0Int` for an
+// instance as well. That does not change which arm wins: this helper is only consulted from the
+// arm ORDERED AFTER the enum/enum_mono one (br 0rmamy), and that arm now leads with
+// enum_instance_c_from_tid, which is the same answer reached one branch earlier.
 fn enum_c_from_tid(tid: Int) -> Str {
     if tid < 0 { return "" }
     if tc_tid_kind(tc_tid_resolved(tid)) != TyKind.Enum { return "" }
@@ -3297,6 +3317,11 @@ fn enum_c_from_tid(tid: Int) -> Str {
     if c == "int64_t" { return "" }
     c
 }
+
+// The shape that needs enum_instance_c_from_tid (typecheck.bl, br tk8s0y) here is an
+// annotation-only instance whose RHS is a payload-LESS variant: `let t: ITree[Int] = INone`.
+// enum_mono is derived from the RHS value's ScopeVar, and a bare variant has no mono stem to read
+// there, so the args live only on the annotation's tid.
 
 // br q3ssqw. The pointee of a `Ptr` local, spelled from the tid — "" when the tid cannot
 // improve on what the flat path already prints.
@@ -4091,13 +4116,31 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     } else if enum_type != "" {
         // Declare with the mono instance C type (blink_Tree_Int) when the RHS was a
         // generic-enum construction; else the bare enum type (jjhnf3).
-        let enum_decl = if enum_mono != "" { enum_mono } else { enum_type }
-        decl_c = c_type_c_name(enum_decl)
-        decl_branch = if enum_mono != "" { "enum_mono" } else { "enum" }
-        if is_mut != 0 {
-            emit_line("{c_type_c_name(enum_decl)} {cname} = {val_str};")
+        //
+        // br tk8s0y: the tid LEADS over both (br bef42x), because the census found the flat pair
+        // answering the bare base for an annotation-only instance — `let t: ITree[Int] = INone`
+        // emitted `const blink_ITree t`, a typedef that is never registered, while
+        // `blink_ITree_0Int` sat emitted a few hundred lines above. The two agree wherever
+        // enum_mono is non-empty, so leading with the tid changes only the rows where the flat
+        // side had nothing; enum_instance_c_from_tid is gated on the tid carrying args so it cannot
+        // reach any other enum binding.
+        let tid_mono = enum_instance_c_from_tid(decl_tid)
+        let enum_decl_c = if tid_mono != "" {
+            tid_mono
+        } else if enum_mono != "" {
+            c_type_c_name(enum_mono)
         } else {
-            emit_line("const {c_type_c_name(enum_decl)} {cname} = {val_str};")
+            c_type_c_name(enum_type)
+        }
+        decl_c = enum_decl_c
+        // Three labels, not two, so the census still says which authority governed: a row that
+        // moves from `enum` to `enum_mono_tid` is a bare base corrected, and one that moves from
+        // `enum_mono` is the tid agreeing with a stem the flat path had already found.
+        decl_branch = if tid_mono != "" { "enum_mono_tid" } else if enum_mono != "" { "enum_mono" } else { "enum" }
+        if is_mut != 0 {
+            emit_line("{enum_decl_c} {cname} = {val_str};")
+        } else {
+            emit_line("const {enum_decl_c} {cname} = {val_str};")
         }
     } else if val_type == CT_HANDLER {
         let h_vtt = get_var_handler_vtable_type(name)

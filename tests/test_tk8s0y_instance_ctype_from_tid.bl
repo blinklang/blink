@@ -1,0 +1,142 @@
+// c_type_from_tid must spell a monomorphized struct/enum INSTANCE, not decline it.
+//
+// Its Struct/Enum arm opened with `if tc_tid_child_count(t) != 0 { return "" }`, so every
+// `Box[Int]` / `Tree[Int]` tid declined even though it carries the concrete args and
+// tc_tid_struct_mono_name already spells the exact stem the def side emits. The census read
+// `ctype.enum_mono agree=0 diverge=0 missing=16` (100% decline) and 141 declines under
+// ctype.struct, most of them this cell.
+//
+// Most sites declined TO the flat path, which spells these correctly, so most rows below passed
+// before the fix and are here to pin the spellings the tid must now match. One did not: an
+// annotation-fixed generic-enum local emitted the bare `blink_ITree`, a typedef that is never
+// registered, because the flat pair reads a NAME and the annotation's args live only on the tid.
+//
+// The emitters whose answer changes: the let declaration's enum/enum_mono arm and the match
+// scrutinee temp, both now leading with enum_instance_c_from_tid. A wrong stem in any of them is
+// a hard `cc` failure — a reference to a typedef that was never emitted — not a silently wrong
+// value, which is why compiling at all is most of the assertion.
+
+type IBox[T] {
+    value: T
+}
+
+type IPair[A, B] {
+    first: A,
+    second: B,
+}
+
+type ITree[T] {
+    INone
+    INode(value: T)
+}
+
+fn ibox_get[T](b: IBox[T]) -> T {
+    b.value
+}
+
+test "a generic-struct instance local round-trips" {
+    let b: IBox[Int] = IBox { value: 41 }
+    assert(b.value == 41)
+    assert(ibox_get(b) == 41)
+}
+
+test "two distinct instances of one base coexist" {
+    let bi: IBox[Int] = IBox { value: 7 }
+    let bs: IBox[Str] = IBox { value: "seven" }
+    assert(bi.value == 7)
+    assert(bs.value == "seven")
+}
+
+// The recursive slot: `Box_0Box_10Int`, where a name built from the inner HEAD alone would
+// collapse to `Box_Box` and drop the Int.
+test "a nested instance keeps its inner arg" {
+    let bb: IBox[IBox[Int]] = IBox { value: IBox { value: 12 } }
+    assert(bb.value.value == 12)
+}
+
+test "a two-arg instance spells both slots in order" {
+    let p: IPair[Int, Str] = IPair { first: 3, second: "three" }
+    assert(p.first == 3)
+    assert(p.second == "three")
+}
+
+// A compound in a slot: the arg is spelled by the carrier speller, not the struct one.
+test "an instance whose arg is a compound round-trips" {
+    let bo: IBox[Option[Int]] = IBox { value: Some(5) }
+    assert(bo.value.unwrap() == 5)
+}
+
+// The enum_mono cell — every one of the 16 declines was a generic-enum instance.
+test "a generic-enum instance local round-trips" {
+    let t = INode(9)
+    let mut got = 0
+    match t {
+        INode(v) => { got = v }
+        INone => { got = -1 }
+    }
+    assert(got == 9)
+}
+
+// An ANNOTATION-fixed instance: the args come from the annotation, not from the constructor
+// argument's type. The declaration, the compound-literal cast and the match scrutinee temp must
+// all reach the same stem, or the C does not compile.
+//
+// The payload-LESS spelling of this row — `let t: ITree[Int] = INone` — is a separate cell and
+// still fails; the annotation's args reach the local's declaration but not the variant
+// construction that initializes it, so the cast and the arm's payload binder stay erased. Filed
+// with its MVCE as br acrtns rather than fixed here, because its cause is upstream of this
+// ticket's speller: two emitters have no instance tid to read at all.
+test "an annotation-fixed generic-enum instance round-trips" {
+    let t: ITree[Int] = INode(4)
+    let mut hit = 0
+    let mut got = 0
+    match t {
+        INode(v) => {
+            hit = 1
+            got = v
+        }
+        INone => { hit = 2 }
+    }
+    assert(hit == 1)
+    assert(got == 4)
+}
+
+// Consumer 2 of the widened speller: the for-in binder, which reads the ELEMENT tid. A struct
+// element goes through the named-carrier arm, so this row exists to prove the instance element
+// keeps working whichever arm claims it.
+test "a for binder over a list of instances reads the field" {
+    let bs: List[IBox[Int]] = [IBox { value: 1 }, IBox { value: 2 }]
+    let mut sum = 0
+    for b in bs { sum = sum + b.value }
+    assert(sum == 3)
+}
+
+test "a for binder over a list of nested instances reads through both levels" {
+    let bs: List[IBox[IBox[Int]]] = [IBox { value: IBox { value: 4 } }]
+    let mut sum = 0
+    for b in bs { sum = sum + b.value.value }
+    assert(sum == 4)
+}
+
+// A generic FN over the instance: the mono body's param and return both spell the stem, and the
+// two must agree or the call does not link.
+test "a generic fn over an instance agrees with its caller on the stem" {
+    let b: IBox[IBox[Str]] = IBox { value: IBox { value: "deep" } }
+    let inner = ibox_get(b)
+    assert(inner.value == "deep")
+    assert(ibox_get(inner) == "deep")
+}
+
+// The BARE generic base must keep declining — it has no C typedef of its own, only its
+// instances do, so a speller that answered `blink_IBox` here would name a symbol that is never
+// emitted. Exercised through a generic fn body, where the param type is the unsubstituted `T`.
+fn ibox_pair_sum[T](a: IBox[Int], b: IBox[Int], _witness: T) -> Int {
+    a.value + b.value
+}
+
+test "an unsubstituted type param does not disturb instance spelling" {
+    let a: IBox[Int] = IBox { value: 10 }
+    let b: IBox[Int] = IBox { value: 20 }
+    assert(ibox_pair_sum(a, b, "witness") == 30)
+    assert(ibox_pair_sum(a, b, 0) == 30)
+}

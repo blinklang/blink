@@ -271,18 +271,46 @@ test "an unbound metavariable declines" {
     assert_eq_str("bare metavar", c_type_from_tid(make_metavar()), "")
 }
 
-// A GENERIC INSTANCE's C name is the monomorphised spelling only the mono registry can
-// produce. `blink_Box` would name a type that was never typedef'd — the exact failure the
-// carrier correction above caught by measurement.
-test "a generic struct instance declines" {
+// A GENERIC INSTANCE's C name is the monomorphised spelling. This test used to pin a DECLINE
+// here, on the reasoning that only the mono registry could produce it and that `blink_Box` would
+// name a type never typedef'd. The second half of that reasoning still holds and is pinned below;
+// the first half was wrong. tc_tid_struct_mono_name produces exactly the def side's stem and is
+// byte-matched to mangle_generic_name (br cr4gqk), so the tid can spell an instance without a
+// second, drift-prone namer — and while it declined, 157 corpus declaration sites had no choice
+// but to spell from the flat path (br tk8s0y).
+//
+// The `_0` join and the recursive nesting are not cosmetic. They are the def side's mangling, and
+// a stem that disagrees by one byte is a reference to a typedef that was never emitted.
+test "a generic struct instance spells its mono stem" {
     let m = harvest()
     let int_tid = expect_tid(m, "Int")
-    assert_eq_str("Box[Int]", c_type_from_tid(make_struct_instance_type("Box", [int_tid])), "")
+    let str_tid = expect_tid(m, "Str")
+    assert_eq_str("Box[Int]",
+        c_type_from_tid(make_struct_instance_type("Box", [int_tid])), "blink_Box_0Int")
     assert_eq_str("Pair[Int,Str]",
-        c_type_from_tid(make_struct_instance_type("Pair", [int_tid, expect_tid(m, "Str")])), "")
-    // The arity is the axis, not the name: the same base with no args is a bare struct and
-    // spells fine. This pins that the decline is structural rather than a name blacklist.
+        c_type_from_tid(make_struct_instance_type("Pair", [int_tid, str_tid])),
+        "blink_Pair_0Int_0Str")
+    // Nesting recurses through the slot rather than reading the inner HEAD, which would collapse
+    // `Box[Box[Int]]` to `Box_Box` and drop the Int.
+    let inner = make_struct_instance_type("Box", [int_tid])
+    assert_eq_str("Box[Box[Int]]",
+        c_type_from_tid(make_struct_instance_type("Box", [inner])), "blink_Box_0Box_10Int")
+    // The arity is still the axis: the same base with no args is a BARE generic base, which has
+    // no typedef of its own, and must keep going through codegen's namer rather than acquiring a
+    // stem. This is the half of the original reasoning that survived.
     assert(c_type_from_tid(make_struct_instance_type("Box", [])) != "")
+}
+
+// An instance slot that cannot be encoded takes the whole stem down with it, rather than being
+// spelled around. A typevar slot is the case that matters: inside a generic body `Box[T]` is
+// normal, not an error, and a stem built with the typevar dropped or interpolated would either
+// collide with a different instantiation or name a non-identifier.
+test "a generic instance with an unspellable slot declines" {
+    let m = harvest()
+    assert_eq_str("Box[T]",
+        c_type_from_tid(make_struct_instance_type("Box", [expect_tid(m, "T")])), "")
+    assert_eq_str("Box[metavar]",
+        c_type_from_tid(make_struct_instance_type("Box", [make_metavar()])), "")
 }
 
 // An unsubstituted `T` has no C type. The caller must run tc_tid_subst_mono first; if that

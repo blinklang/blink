@@ -7520,6 +7520,115 @@ event before this, so the test's `filter` row over a plain-enum list exists to p
 declaration is genuinely reached rather than assumed — it shows up as the second `adapter_binder`
 diverge row (`ty=KCol`).
 
+## The speller that declined every monomorphized instance (br `tk8s0y`)
+
+`bn3e6j` established that **`missing` is the number Stage 4 needs at zero**, so the next unit was
+chosen by decline count rather than by divergence count. The largest cell was also the simplest: a
+generic-struct or generic-enum *instance* declined unconditionally.
+
+### The census, and the one line behind it
+
+Both build modes, `tests/` + `examples/` + `src/`, identical:
+
+```
+ctype.enum_mono   agree=0     diverge=0 missing=16   <- 100% decline
+ctype.struct      agree=23058 diverge=9 missing=141
+```
+
+`c_type_from_tid`'s Struct/Enum arm opened with `if tc_tid_child_count(t) != 0 { return "" }`. Every
+`Box[Int]` / `Tree[Int]` tid has children — that is what makes it an instance — so the arm declined
+exactly the tids that carry the most information.
+
+### The ticket's own reasoning was half wrong, in the useful direction
+
+The ticket argued the tid would need "a second, drift-prone namer" for mono stems. It does not.
+`tc_tid_struct_mono_name` (`typecheck.bl:14027`) already produces the stem, already joins with `_0`
+after `escape_mono_seg`, and is already byte-matched to the def side's `mangle_generic_name`
+(br `cr4gqk`); it already recurses through struct-instance slots so `Box[Box[Int]]` keeps its `Int`,
+and already admits `TyKind.Enum` (br `jjhnf3` / `82ajft` / `dbzy4r`). The whole widening is: call it,
+prepend `blink_`, and decline on `""` or on an ICE seg (br `vbcw1e` — collapse, never interpolate).
+
+`tests/test_ctype_from_tid_spelling.bl` carried a pin asserting the old decline, so `task ci` caught
+this half of the argument as a hard failure rather than a review comment. That test now pins the three
+stems (`blink_Box_0Int`, `blink_Pair_0Int_0Str`, `blink_Box_0Box_10Int`) and a companion case pins the
+declines that must survive — a typevar slot and a metavar slot.
+
+The second wrong expectation was measured, not argued: the ticket predicted module-qualified instances
+would **keep** declining, citing br `q4etvt`. They do not. That caution applies to a struct-instance
+*slot*, which `tc_tid_to_c_tag` strips; the *head* goes through `c_type_tag_for_struct(t.name)`, which
+keeps the qualifier. `tests/test_q4etvt_cross_module_instance.bl` moved `missing=4 → agree=4` and
+`tests/multifile/src/main.bl` `missing=3 → agree=3`, with no diverge row appearing anywhere — so the
+tid spells `blink_test_1cross_1module_1generic_1fn_1helper_1CmgBox_0Int` byte-for-byte.
+
+### Two of four seams flipped; the other two have nothing to read
+
+`c_type_from_tid` has three non-probe consumers, and this widening put the tid **first** at two more
+declaration sites (`bn3e6j`'s binder was the first):
+
+- the `let` declaration's enum arm (`codegen_stmt.bl` ~`:4091`), now labelled three ways
+  (`enum_mono_tid` / `enum_mono` / `enum`) so the census still says which authority governed;
+- the match scrutinee temp (`codegen_stmt.bl` ~`:882`). Both flat recoveries there read a *name*; the
+  tid reads the *node* and is indifferent to how the scrutinee was spelled — br `bef42x`'s ordering.
+
+The shared gate `enum_instance_c_from_tid` lives in `typecheck.bl`, not in codegen, because three
+emitters need the same answer for one binding — the declaration, the variant construction's
+compound-literal cast, and the scrutinee temp — and a per-file copy is how a cell grows a fourth
+spelling that disagrees with the other three.
+
+The remaining two emitters were **not** flipped. `let t: ITree[Int] = INone` still emits
+`(blink_ITree){.tag = 0}` and `void _v = …`: a payload-less variant carries no argument to infer the
+instance from, and typecheck does not memoize the annotation-fixed instance tid on the value node, so
+`tc_lookup_node_tid` declines there. A speculative reader was written at `codegen_expr.bl:686`,
+measured to decline, and **removed** — dead code at a flipped site reads as coverage the census cannot
+contradict. Filed as br `acrtns` with its MVCE and the two candidate fixes; the test row was swapped
+for a passing annotation-plus-payload twin rather than left failing (xfail is spec-only, br `1c2zr6`).
+
+### Measured result
+
+`task regen` green, `task ci` green unpiped (`EXIT=0`, 691/691 test files, fmt 1600 passed / 88
+skipped). Sweeps re-run in **both** modes; 159 detail rows each, and the only difference between the
+two is one generated temp's counter (`_destr40` vs `_destr38`) on the same row.
+
+```
+                     before (post-bn3e6j)              after
+ctype.enum_mono      agree=0     missing=16      site gone
+ctype.enum_mono_tid  —                           agree=18    missing=0
+ctype.struct  (mono) agree=23058 missing=141     agree=23190 missing=19
+ctype.struct  (arc)  agree=22827 missing=141     agree=22959 missing=19
+TOTAL missing        252                         114
+```
+
+138 declines cleared, and `ctype.enum_mono` disappeared as a *label*: no enum `let` in the corpus
+falls back to the flat mono name any more. All 18 flipped rows are `agree`, so no emitted C changed —
+which is the point. The flip's value is not a diff; it is the proof that the flat arm contributed
+nothing recoverable at these sites, which is the precondition Stage 4 needs. The corpus contains no
+row of the `acrtns` shape (that is why `diverge=0` here), so its absence is a gap in the corpus, not
+evidence of correctness.
+
+### The residual 19, and the one that was not this ticket
+
+`ctype.struct missing=19` is unchanged in composition from the baseline — 18 `ty=?` rows and 1
+`ty=Self` row, neither touched by this fix:
+
+- **18 rows, `ty=?`** — tuple-typed `let`s in `test_44xww4` / `test_combining_iterators` where the
+  site has *no tid at all*. A Stage-2 stamping gap, not a speller gap.
+- **1 row, `ty=Self`** — `let cfg_err = ConfigError.from(io_err)` in `tests/test_from_trait.bl`. The
+  impl method's declared return type `Self` was interned as a `TyKind.Struct` named literally
+  `"Self"`, so `c_type_from_tid` declines (correctly — `blink_Self` is emitted by nobody) and the flat
+  pair recovers `ConfigError` from the receiver name. The program passes today and will become a hard
+  `cc` failure the moment the tid governs a plain-struct declaration. Filed as br `wc5q4g`; the fix
+  belongs at the `Self` → impl-target substitution, not at the reader.
+
+### Why the test is mostly "does it compile"
+
+A wrong stem is not a wrong value — it is a reference to a typedef that was never emitted, i.e. a
+`cc` failure. So `tests/test_tk8s0y_instance_ctype_from_tid.bl`'s 11 rows assert modestly and exist
+mainly to *be compiled*: instance local, two instances of one base, the nested
+`IBox[IBox[Int]]` that a head-only namer collapses to `Box_Box`, a two-arg `IPair[Int, Str]`, a
+compound slot `IBox[Option[Int]]`, a generic-enum instance, the annotation-fixed twin, two for-in rows
+(the binder consumer), a generic fn whose mono body must agree with its caller on the stem, and an
+unsubstituted-typevar row that must keep declining.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

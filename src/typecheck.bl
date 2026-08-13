@@ -13854,7 +13854,31 @@ pub fn c_type_from_tid(tid: Int) -> Str {
     if t < 0 { return "" }
     let k = tc_tid_kind(t)
     if k == TyKind.Struct || k == TyKind.Enum {
-        if tc_tid_child_count(t) != 0 { return "" }
+        // A monomorphized INSTANCE (`Box[Int]`, `Tree[Int]`) is spelled from its args, not
+        // declined. tc_tid_struct_mono_name is the stem producer that is already byte-matched
+        // to the def side's mangle_generic_name (br cr4gqk), so this position adds only the
+        // `blink_` prefix — the same division of labour as the Option/Result/Tuple arm below,
+        // and for the same reason: a second spelling here could drift from the typedef the
+        // emitters registered, and a stem that drifts is a reference to a C symbol that was
+        // never emitted rather than a wrong value.
+        //
+        // It declines on its own terms — a bare generic base (no args, which falls through to
+        // the by-name spelling below), an unsubstituted typevar in a slot, or a
+        // module-qualified head, which it defers on deliberately because tc_tid_to_c_tag
+        // strips the qualifier and would diverge from the string path's file-derived prefix
+        // (br q4etvt). An ICE seg is collapsed rather than interpolated, matching the
+        // Option/Result/Tuple arm: buried mid-identifier it would slip past diag_is_ice_seg
+        // at the downstream chokepoints (br vbcw1e).
+        //
+        // MEASURED (br tk8s0y): the census read `ctype.enum_mono agree=0 diverge=0
+        // missing=16` — a 100% decline rate at a site whose flat side was already printing
+        // `blink_Tree_0Int` — plus most of `ctype.struct`'s 141 declines.
+        if tc_tid_child_count(t) != 0 {
+            let stem = tc_tid_struct_mono_name(t)
+            if stem == "" { return "" }
+            if diag_is_ice_seg(stem) { return "" }
+            return "blink_{stem}"
+        }
         // Transparent-alias hop, mirroring tc_tid_tag_at's twin alias hop: `type Port = Int`
         // lowers to a bare int64_t (project_type_alias_param_lowering), so the alias name must
         // resolve to the underlying type's spelling and not to a `blink_Port` typedef that is
@@ -13952,6 +13976,27 @@ pub fn c_type_from_tid(tid: Int) -> Str {
         TyKind.Struct => ""
         TyKind.Enum => ""
     }
+}
+
+// br tk8s0y. The mono-INSTANCE spelling of a generic-ENUM tid, or "".
+//
+// Narrower than c_type_from_tid on purpose, and the narrowness is the safety property: it
+// answers only for an enum tid that carries type args, so a caller can let it lead without
+// taking any other enum binding away from the flat spelling that already owns it — the br 0rmamy
+// ordering constraint, restated as a gate instead of an arm order. The one thing it corrects is
+// the bare generic base, which has no typedef of its own and so is a reference to a C symbol
+// that was never emitted.
+//
+// Lives here rather than in codegen because three separate emitters need the same answer for one
+// binding — the local's declaration, the variant construction's compound-literal cast, and the
+// match scrutinee's temp — and a per-file copy of this gate is how a cell grows a fourth spelling
+// that disagrees with the other three.
+pub fn enum_instance_c_from_tid(tid: Int) -> Str {
+    if tid < 0 { return "" }
+    let r = tc_tid_resolved(tid)
+    if tc_tid_kind(r) != TyKind.Enum { return "" }
+    if tc_tid_struct_arg_count(r) == 0 { return "" }
+    c_type_from_tid(r)
 }
 
 // Monomorphized-struct-instance accessors (br kvn6w8 spike). Read the concrete
