@@ -7741,6 +7741,119 @@ comment. That row is now upgraded from asserting `is_null` to asserting the valu
 ticket's own premise against the current build is the cheapest step in this whole loop and it has
 now paid twice in a row (`tk8s0y`'s module-qualified prediction was the other).
 
+## The callback whose result had no type (br `msezvm`)
+
+Three of the residual diverge rows were filed as class-(v) — *"3 `Void`-vs-`int64_t` at with-ptr
+bindings, where typecheck and codegen disagree about the type"* — and parked as a known
+disagreement. They were not a disagreement. Codegen was right and the tid was wrong, which is the
+rarer direction and the reason this is a **typecheck** fix in the middle of a codegen collapse.
+
+### The cause is one channel, and it is the only channel
+
+`infer_type`'s `with_ptr` arm read the closure's RETURN ANNOTATION and nothing else:
+
+```blink
+let ret_str = node_return_type(cls_node)
+if ret_str == "" { return TYPE_VOID }
+```
+
+So `b.with_ptr(fn(p) -> Int { b.len() })` was typed and `b.with_ptr(fn(p) { b.len() })` was not —
+even though the body is walked either way, and a type error inside it is reported either way. The
+spec signs the method `-> R` where R is the closure's result
+(`sections/07_trust_modules_metadata.md:566`) and its own worked example at `:554` does **not**
+ascribe the closure, so the spelling the spec writes is the spelling that did not work.
+
+`Void` is not inert. Reproduced by running programs, not by reading code:
+
+| written | result |
+| --- | --- |
+| `io.println("{n}")` | `error[MissingDisplayImpl]` — `Void` has no `Display` |
+| `let t = n + 1` | `error[TypeError]`: binary `+`: `Void` and `Int` |
+| `let m: Int = n` | `error[TypeError]`: declared `Int`, got `Void` |
+| `assert_eq(n, 3)` | **accepted** |
+
+The last row is why this survived: `cmp_operands_ok` (`typecheck.bl:8781`) fails open on a `Void`
+operand, and its comment names this exact call — *"an un-annotated closure return flowing through
+Bytes.with_ptr types as Void"*. `tests/test_bytes_with_ptr.bl` rides entirely on that fail-open.
+It is left in place: `with_ptr` is not the only `Void` producer, so narrowing it is its own change
+with its own corpus.
+
+### Why the obvious fix is a no-op, and the less obvious one double-reports
+
+The first attempt — answer the arm from the closure body — changed nothing after a full regen, and
+the reason is pass ORDER. `tc_check_body`'s `LetBinding` arm calls `infer_type(val)` and **then**
+`tc_check_body(val)`. The body's tail is not walked, so not memoized, until one step after
+`infer_type` had to answer.
+
+The repair for that is not "infer the body here", and this is the fact that shaped the whole fix:
+
+> `infer_type` is a **write-through memo, not a read-through cache**. `infer_type` calls
+> `infer_type_uncached` unconditionally, and it **reports as a side effect**.
+
+A speculative re-inference of the closure body would therefore report every diagnostic inside it a
+second time. Br `bfq7nf` already built the mechanism for asking this class of question without
+adding diagnostics — `tc_scoped_value_memo`, which reads what the in-scope walk recorded *one step
+late*, and the `LetBinding` recovery that fires when the inferred tid is `TYPE_UNKNOWN`. So:
+
+- the `with_ptr` arm **DECLINES** to `TYPE_UNKNOWN` for an unascribed closure, instead of
+  answering `Void`;
+- `tc_scoped_value_memo` gains a `MethodCall` arm that reads the closure body's tail, gated on the
+  node having no answer of its own (so the ascribed spelling keeps its annotation verbatim) and on
+  the receiver actually being `Bytes` (so a user method of the same name is untouched);
+- the existing recovery fills it in once the walk has run.
+
+Two shapes come along for free, because `tc_scoped_value_memo` already handles them structurally:
+a body that is a bare `match` (br `3c4g71`'s arm) and one that is a bare `if` (br `wnbsen`'s).
+`r` in `tests/test_9tmsmt_with_ptr_match_body.bl` is the corpus row for the first, and both are
+pinned — a narrower recovery that only read a simple tail would still pass every other row.
+
+### Measured
+
+```
+                     before (post-0dtbe6)         after
+ctype.flat  agree    407754                       408050
+ctype.flat  diverge  9                            6
+ctype.flat  missing  84                           86
+TOTAL diverge        45                           42
+TOTAL missing        114                          116
+```
+
+Identical in both build modes, 158 rows each. The accounting is exact, row by row: the three
+removed diverge rows are `n` and `addr` (`tests/test_bytes_with_ptr.bl:6`/`:13`) and `r`
+(`tests/test_9tmsmt_with_ptr_match_body.bl:8`). `n` and `r` now **AGREE**. `addr` **DECLINES**,
+which is the `+2 missing` — `p.addr()` is deliberately unsigned in typecheck's `Ptr` arm
+(`typecheck.bl:9986`, pending br `mwsy85`/`axpq22`), so the body has no type to read and the
+helper returns `-1` rather than guessing. A decline is the honest cell: codegen keeps what it does
+today.
+
+That empties class-(v)'s three-row with-ptr entry. **All 6 remaining `ctype.flat` diverge rows in
+the corpus are now the one `Bool + Bool` sum** at `src/codegen.bl:452`
+(`let __emit_modes = (a != 0) + (b != 0) + (c != 0)`), filed as br `4vrmqe` — and reading that row
+by hand rather than trusting the census label was worth the ten minutes, because the census
+understated it. `ty=Int tidc=int64_t emitted=int` reads like a width divergence. It is not:
+
+```blink
+let s = (a != 0) + (b != 0)
+assert_eq(s, 2)             // PASSES
+io.println("s={s}")         // prints "true"
+```
+
+The value is genuinely 2 and the emitted C is `const int s = ((a != 0) + (b != 0));`, but the
+`Display` dispatch is chosen from codegen's **flat** type, which is `Bool` — so the same binding
+compares equal to `2` and prints `true`, in the same program. Nonzero prints `true`, zero prints
+`false`, so it is silent and value-dependent. That the census could only see the width is the
+point: a diverge row is a *sighting*, and the two answers behind it have to be read.
+
+The compiler's own use of the expression is `if __emit_modes > 1`, which sees the int and works, so
+this is not a self-host miscompile — another instance of `feedback_self_host_doesnt_catch_user_codegen_bugs`.
+
+### The byproduct
+
+Writing the `Void`-body row of the test produced a `cc` escape that has nothing to do with
+`with_ptr`: `let _ = <Void expression>` emits `const void _unusedN = 0;`. `let _ =
+io.println("x")` reproduces it with no `Bytes` in the program at all — filed as br `2q76x9`, and
+the test row is written in statement position with a comment saying why.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

@@ -1,0 +1,206 @@
+import compile_test_helpers.{expect_compile_error, compile_and_run, compile_and_capture}
+
+// br msezvm — `Bytes.with_ptr(fn(p) { ... })` with NO `-> T` on the closure typed the whole
+// call as Void, so the value the closure computed had no type at all.
+//
+// THE CAUSE, in one line: the with_ptr arm of infer_type's Bytes branch reads the closure's
+// RETURN ANNOTATION and only that (`let ret_str = node_return_type(cls_node)`; `if ret_str ==
+// "" { return TYPE_VOID }`, src/typecheck.bl:9944) — so the ascribed spelling was typed and
+// the unascribed one was not, even though the closure body is walked either way (a type error
+// inside it is reported today).
+//
+// THE SPEC SIGNS IT AS `T`. sections/07_trust_modules_metadata.md gives
+// `.with_ptr(fn(p) { ... }) -> T`, and `blink llms --topic "Bytes Methods"` repeats it: "Pin
+// buffer and call closure with `Ptr[U8]`". T is the closure's result, and a closure with no
+// `-> T` still HAS a result — `tc_closure_declared_ret` answering Void for an unannotated
+// closure is about the OBLIGATION a closure is checked against, not about what a callback in
+// HOF position hands back. `xs.map(fn(x) { x * 2 })` is the same shape and works.
+//
+// FAIL-OPEN MODES, every one reproduced by RUNNING a program. Void is not inert — it is
+// accepted wherever the checks fail open on it, and rejected where they do not:
+//
+//   1. `io.println("{n}")`      — error[MissingDisplayImpl]. Void has no Display.
+//   2. `let t = n + 1`          — error[TypeError]: binary '+': incompatible types Void and Int.
+//   3. `let m: Int = n`         — error[TypeError]: declared type Int but got Void.
+//   4. `assert_eq(n, 3)`        — ACCEPTED, and this is why the defect stayed invisible for as
+//      long as it did: `cmp_operands_ok` (typecheck.bl:8781) fails open on a Void operand, and
+//      its comment names this very call — "an un-annotated closure return flowing through
+//      Bytes.with_ptr types as Void". tests/test_bytes_with_ptr.bl rides entirely on that
+//      fail-open. It is left in place here: with_ptr is not the only Void producer, so
+//      narrowing it is its own change with its own corpus.
+//
+// The three census rows this closes are `ctype.flat` diverge rows from the Stage 3a ctypediv
+// sweep — `n` and `addr` in tests/test_bytes_with_ptr.bl and `r` in
+// tests/test_9tmsmt_with_ptr_match_body.bl — where codegen spelled the local `int64_t` from the
+// flat scope field and the tid said `void`. Codegen was RIGHT and the tid was wrong, which is
+// the rarer direction and the reason this is a typecheck fix and not a codegen one. After it,
+// `n` and `r` AGREE and `addr` DECLINES: diverge 9 -> 6, missing 84 -> 86, identical in both
+// build modes.
+
+// ── The rows that did not compile ────────────────────────────────────────────────────
+
+test "an unascribed with_ptr result is an Int where the body computes one" {
+    let b = Bytes.new()
+    b.push(10)
+    b.push(20)
+    b.push(30)
+    let n = b.with_ptr(fn(_p) { b.len() })
+    // Mode 2: arithmetic on the result. This is the row that says the type is Int and not
+    // merely "not Void".
+    assert_eq(n + 1, 4)
+    // Mode 3: read back through an explicit annotation, which is the declared-type compare.
+    let m: Int = n
+    assert_eq(m, 3)
+}
+
+// Mode 1. Interpolation needs Display, so it is the check that cannot be satisfied by a
+// fail-open — it either has a type or it does not compile.
+test "an unascribed with_ptr result interpolates" {
+    let b = Bytes.new()
+    b.push(7)
+    let n = b.with_ptr(fn(_p) { b.len() })
+    assert_eq("len={n}", "len=1")
+}
+
+// A non-Int body, so the fix cannot be "call it Int". Str also gives the result a METHOD, which
+// a Void could not have.
+test "an unascribed with_ptr result carries a Str body's type" {
+    let b = Bytes.new()
+    b.push(1)
+    let s = b.with_ptr(fn(_p) { "pinned" })
+    assert_eq(s, "pinned")
+    assert_eq(s.len(), 6)
+}
+
+// A compound body type, which is where a flat channel would have erased the element even if the
+// kind came through.
+test "an unascribed with_ptr result carries a List[Int] body's type" {
+    let b = Bytes.new()
+    b.push(1)
+    let xs = b.with_ptr(fn(_p) { [b.len(), 5] })
+    assert_eq(xs.len(), 2)
+    assert_eq(xs.get(0).unwrap(), 1)
+    assert_eq(xs.get(1).unwrap(), 5)
+}
+
+// A body whose single expression is itself a compound expression, so the answer comes from the
+// tail's own inference and not from a literal sitting alone in the block.
+test "the type comes from the tail expression, not from a literal" {
+    let b = Bytes.new()
+    b.push(4)
+    b.push(5)
+    let n = b.with_ptr(fn(_p) { b.len() * 10 + 1 })
+    assert_eq(n + 0, 21)
+}
+
+// The recovery reads the body's tail through tc_scoped_value_memo, so the tail kinds that
+// function handles structurally — `match` and `if`, whose ARM/BRANCH bodies hold the answer —
+// come along for free. `r` in tests/test_9tmsmt_with_ptr_match_body.bl is the corpus row for the
+// match half; both halves are pinned here because a narrower recovery would still pass every
+// row above.
+test "a match body's arms give the result type" {
+    let b = Bytes.new()
+    b.push(7)
+    let sel = 0
+    let n = b.with_ptr(fn(_p) {
+        match sel {
+            0 => b.len()
+            _ => 0
+        }
+    })
+    assert_eq(n + 1, 2)
+}
+
+test "an if body's branches give the result type" {
+    let b = Bytes.new()
+    b.push(7)
+    b.push(8)
+    let n = b.with_ptr(fn(_p) {
+        if b.len() > 1 { b.len() } else { 0 }
+    })
+    assert_eq(n + 1, 3)
+}
+
+// ── Regression pins ─────────────────────────────────────────────────────────────────
+
+// The ascribed control, which is the row that proves the axis: identical code, one `-> Int`,
+// and it worked before the fix. It must not change.
+test "an ASCRIBED with_ptr closure was never affected" {
+    let b = Bytes.new()
+    b.push(1)
+    b.push(2)
+    let n: Int = b.with_ptr(fn(_p) -> Int { b.len() })
+    assert_eq(n, 2)
+}
+
+// `p.addr()` is DELIBERATELY unsigned in typecheck's Ptr arm (typecheck.bl:9986 — the spec
+// spells `Ptr[Ptr[T]]` at §07:220 while codegen emits a bare Int, and which side moves is br
+// mwsy85). So the body here infers to no useful type, and the point of the row is that the
+// fix must fall back rather than break it: tests/test_bytes_with_ptr.bl:13 carries this exact
+// shape today. When br axpq22 signs the pointer methods, this row gains a value assertion.
+test "a body whose type typecheck cannot name still compiles" {
+    let b = Bytes.new()
+    b.push(99)
+    let addr = b.with_ptr(fn(p) { p.addr() })
+    assert(addr != 0)
+}
+
+// A genuinely Void body — the fix must not invent a type for a closure that computes nothing.
+// `io.println` returns Void, so this is the one row where Void is the RIGHT answer.
+//
+// Written in STATEMENT position rather than as `let _ = ...` on purpose: `let _ = <Void>` emits
+// `const void _unusedN = 0;` and is rejected by the C compiler (br 2q76x9), which is a defect of
+// the discard binder and not of with_ptr — `let _ = io.println("x")` reproduces it with no Bytes
+// in the program at all.
+test "a Void body is still Void" {
+    let b = Bytes.new()
+    b.push(1)
+    b.with_ptr(fn(_p) { io.println("pinned {b.len()}") })
+    assert_eq(b.len(), 1)
+}
+
+// Reading the tail must not turn the closure body into an unchecked region — this errored before
+// the fix (the body IS walked, by tc_check_callable_arg_bodies) and must error after it.
+//
+// The error COUNT is asserted, not just its presence, and that is the whole reason the recovery
+// reads a memo instead of re-inferring: `infer_type` is a write-through memo rather than a
+// read-through cache (infer_type_uncached always runs), so a second inference of the body would
+// report every diagnostic inside it twice. One error-severity diagnostic is that claim, checked.
+test "a type error inside an unascribed with_ptr body is reported exactly once" {
+    let src = "fn main() \{\n    let b = Bytes.new()\n    b.push(1)\n    let _n = b.with_ptr(fn(p) \{ b.get(\"x\") })\n}\n"
+    let out = compile_and_capture(src, "msezvm_body_error")
+    assert(out.contains("TypeError"))
+    // json diagnostics, one per line — n occurrences of the needle split into n+1 pieces.
+    assert_eq(out.split("\"severity\":\"error\"").len(), 2)
+}
+
+// The single-expression restriction on a with_ptr body (error[WithPtrBodyTooComplex]) is what
+// bounds the tail read to one expression, so it is pinned here: if it ever relaxes, the recovery
+// has to grow a story for a body whose tail names a body-local `let`.
+test "a multi-statement with_ptr body is still rejected" {
+    let src = "fn main() \{\n    let b = Bytes.new()\n    b.push(1)\n    let n = b.with_ptr(fn(p) \{ let half = b.len()\n        half + 1 })\n    io.println(\"\{n}\")\n}\n"
+    expect_compile_error(src, "msezvm_body_multi_stmt", "WithPtrBodyTooComplex")
+}
+
+// And the result is still a value, not a receiver for anything: an unknown method on the
+// now-typed result must be rejected rather than fall open.
+test "an unknown method on the now-typed result is rejected" {
+    let src = "fn main() \{\n    let b = Bytes.new()\n    b.push(1)\n    let s = b.with_ptr(fn(p) \{ \"pinned\" })\n    io.println(\"\{s.bogus()}\")\n}\n"
+    expect_compile_error(src, "msezvm_result_bogus", "UnresolvedMethod")
+}
+
+// The growth ban is enforced by nogrow_scan on the same closure body this fix now reads, so it
+// must survive a change to how the body's type is derived.
+test "growing the pinned Bytes inside the closure is still rejected" {
+    let src = "fn main() \{\n    let b = Bytes.new()\n    b.push(1)\n    b.with_ptr(fn(p) \{ b.push(2) })\n    io.println(\"\{b.len()}\")\n}\n"
+    expect_compile_error(src, "msezvm_grow_in_with_ptr", "BytesGrowInWithPtr")
+}
+
+// A run-mode row, so the value is checked in a compiled-and-executed program rather than only
+// inside the test harness.
+test "the typed result runs" {
+    let src = "fn main() \{\n    let b = Bytes.new()\n    b.push(10)\n    b.push(20)\n    let n = b.with_ptr(fn(p) \{ b.len() })\n    io.println(\"n=\{n + 1}\")\n}\n"
+    let r = compile_and_run(src, "msezvm_typed_result_runs")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("n=3"))
+}

@@ -2530,6 +2530,33 @@ fn tc_closure_declared_ret(cls: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     ret_tid
 }
 
+// br msezvm — the result type of a callback that carries no `-> T`, read from its BODY.
+//
+// tc_closure_declared_ret above answers Void for an unannotated closure on purpose: that is the
+// obligation the closure's own tail is CHECKED AGAINST (Principle 2 — a closure and a named fn
+// share one obligation). What a HOF hands BACK to its caller is a different question, and for
+// `Bytes.with_ptr` the spec answers it with `T` — whatever the body computed
+// (sections/07_trust_modules_metadata.md; `blink llms --topic "Bytes Methods"`).
+//
+// Reads the tid the walk already recorded for the body's tail rather than re-inferring it:
+// infer_type is a write-through memo, NOT a read-through cache (infer_type_uncached always
+// runs), and it REPORTS as a side effect — so a speculative re-infer here would report every
+// diagnostic inside the body a second time. That is the same reasoning br bfq7nf gives at
+// tc_scoped_value_memo, whose whole job is answering this class of question without adding
+// diagnostics, and this is called from there for exactly that reason.
+//
+// DECLINES to -1 rather than guessing, so the caller keeps its own default for a body whose
+// type typecheck cannot name. `fn(p) { p.addr() }` (tests/test_bytes_with_ptr.bl:13) is the
+// live corpus row: the pointer methods are deliberately unsigned pending br mwsy85/axpq22.
+fn tc_closure_body_result_tid(cls: Int, depth: Int) -> Int {
+    if cls == -1 { return -1 }
+    if node_kind(cls) != NodeKind.Closure { return -1 }
+    let t = tc_scoped_value_memo(node_body(cls), depth + 1)
+    if t < 0 { return -1 }
+    if t == TYPE_UNKNOWN { return -1 }
+    t
+}
+
 // List HOFs whose closure takes a single element-typed param. `fold` is handled
 // separately (its closure takes accumulator + element).
 fn is_elem_closure_hof(method: Str) -> Int {
@@ -9942,7 +9969,17 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 let cls_node = sublist_get(args_sl, 0)
                 if node_kind(cls_node) != NodeKind.Closure { return TYPE_VOID }
                 let ret_str = node_return_type(cls_node)
-                if ret_str == "" { return TYPE_VOID }
+                // br msezvm. `-> T` was the ONLY channel, so the unascribed spelling — which is
+                // the one the spec writes and the one the corpus uses — typed as Void, and Void
+                // is not inert: `n + 1` is E0301-class TypeError, `"{n}"` is MissingDisplayImpl.
+                //
+                // DECLINE, rather than answer. The body's own tail is what types this call, and
+                // it is not memoized until tc_check_body walks the closure one step later — so
+                // the honest answer here is "not yet known", and the LetBinding recovery (br
+                // bfq7nf) fills it in from the body once the walk has run. Answering Void was
+                // the bug; answering it by re-inferring the body HERE would double-report every
+                // diagnostic inside it.
+                if ret_str == "" { return TYPE_UNKNOWN }
                 let rt = resolve_type_name(ret_str)
                 if rt == -1 { return TYPE_VOID }
                 return rt
@@ -10984,6 +11021,26 @@ fn tc_scoped_value_memo(node: Int, depth: Int) -> Int {
             i = i + 1
         }
         return merged
+    }
+    // br msezvm — a CALLBACK'S BODY is a scope the speculative infer could not see either, and
+    // for the same reason as the two above: `Bytes.with_ptr(fn(p) { ... })` is typed by the
+    // closure's tail (spec §07 signs it `-> T`), and that tail is not walked — so not memoized —
+    // until tc_check_body reaches the call, one step after infer_type had to answer. The
+    // with_ptr arm of infer_type therefore declines to TYPE_UNKNOWN and the answer is read here.
+    //
+    // Gated on the node having NO answer of its own, so the ASCRIBED spelling (`fn(p) -> Int`)
+    // keeps the annotation's type verbatim, and gated on the receiver actually being Bytes, so a
+    // user type with a method of the same name is untouched.
+    if k == NodeKind.MethodCall {
+        let own = tc_lookup_node_tid(node)
+        if own >= 0 && own != TYPE_UNKNOWN { return own }
+        if node_method(node) == "with_ptr" {
+            let recv_t = tc_lookup_node_tid(node_obj(node))
+            if recv_t >= 0 && type_kind(recv_t) == TyKind.Bytes {
+                return tc_closure_body_result_tid(closure_arg_at(node_args(node), 0), depth)
+            }
+        }
+        return own
     }
     tc_lookup_node_tid(node)
 }
