@@ -9830,6 +9830,99 @@ are one row per corpus file that compiles `src/codegen.bl`; the sixth raw row be
 root. The compound-assignment step is separately census-neutral (byte-identical sweep totals before
 and after), as it adds a diagnostic and no type.
 
+## The method the spec voted and the compiler never had (br `s58gjs`)
+
+The spec's `ListOps` block declares `fn append(self, other: List[T]) -> List[T]`. The implementation
+shipped that operation as `concat`. So the spec named a method that did not resolve, and the ticket
+arrived framed as "the spec lists methods that don't exist" — i.e. as a documentation defect.
+
+### The vote is the artifact of record, and it says the impl drifted
+
+`DECISIONS.md:187` records 3-2 for the expanded 12-method List surface: push, pop, get, set,
+**append**, contains, reverse, sort, insert, remove, index_of, last. The spec table is that vote
+transcribed. So the drifted side is the implementation, and "fix the spec to say `concat`" would have
+been overturning a panel decision with an edit.
+
+**A ticket that says the spec is wrong is a claim to check against DECISIONS.md, not a work order.**
+The first pass of this analysis recommended deleting the spec rows; that recommendation was wrong for
+exactly this reason.
+
+The counter-argument is real and was put to the user: `concat` is the collection-family verb —
+`StrOps` and `BytesOps` both declare `fn concat`, and the spec documents both. Renaming List leaves
+List as the one collection with a different verb for the same shape of operation. The user ruled:
+the voted spelling wins.
+
+### Three regens, because a rename is a break
+
+Bootstrap protocol, one regen each: `append` added alongside `concat` -> in-tree callers migrated ->
+`concat` removed. Step 3's green regen is also the proof that no other compiler-source or stdlib
+caller existed.
+
+That proof does not extend to `tests/`. `task regen` compiles `src/` and `lib/`; it does not compile
+the test corpus, so two `List` receivers in `tests/test_trait_signatures.bl` (lines 57 and 143)
+survived three green regens and were caught only by `task ci`. **A rename's blast radius is
+`task ci`-wide, not regen-wide** — the same gap that
+`feedback_self_host_doesnt_catch_user_codegen_bugs` names for codegen bugs applies to surface
+renames.
+
+Both sites were in one file and one diagnostic set, and the first fix pass took the file's failures
+from the tail of the log and repaired only the last one — costing a whole `task ci` cycle to
+rediscover the first. **A compiler prints every error it found; fix from the whole set, not the
+tail.**
+
+### The migration hint fired from the wrong phase
+
+A rename that breaks working code has to say what to write instead. The hint was added at
+typecheck's E0505 site — and did not appear. The message said so: the `in 'main'` suffix is
+**codegen's** backstop, not typecheck's.
+
+`is_builtin_method` is keyed on the method NAME, not the receiver type. `concat` still answers 1
+there because `Str.concat` and `Bytes.concat` exist, so `tc_method_resolvable_on_type` called
+`.concat` resolvable on a `List` and typecheck's rejection never ran. Both sites now route through
+one exported helper rather than each carrying a copy of the string:
+
+    pub fn tc_list_rename_help(method: Str) -> Str {
+        if method == "concat" { return "list concatenation is `.append(other)`" }
+        ""
+    }
+
+That name-keyed gate is a general hole, not a detail of this rename: **every method name shared
+between a resolvable type and an unresolvable one is checked on the strength of the other type.**
+`index_of` (on `Str`, not `List`) is the next instance, and the `last`/`index_of` implementation
+ticket carries the warning.
+
+It is also the boundary of what `blink check` can see — `check` runs the front half, so a diagnostic
+living in codegen's backstop is invisible to it by construction. `blink check` certifies
+`xs.concat([2])` as `ok` (second confirmed instance of `e6zemp`), and `build/blinkc` prints the error
+and exits **0** (`8wetcp`, filed). `build/blink build` is the only front end whose exit code can gate
+a test row, which is why this ticket's rejection rows drive a subprocess through `build`.
+
+### No census is owed
+
+The rename changes no type, no `CT_*`, and no emitted C — the arm still emits `list_concat(...)`, the
+same C helper and the same `std.list` free function (`lib/std/list.bl:73`, unrenamed: the vote is
+about the method surface). The divergence counters cannot move, so a sweep would report the noise
+floor and nothing else. Stating that is the honest answer; running the sweep to produce two
+identical tables would not add evidence.
+
+### Byproducts
+
+Two spec defects, found by editing the doc rather than by reading it: `slice` and `join` were
+implemented and undocumented (the block claimed "13 methods from `ListOps`" while listing 11), and
+the example at `sections/03_types.md:222` passed a `Str` to `append`, which takes a `List[T]` — a
+documented example that does not compile.
+
+One P1 bug, found because a test row returned 139967378849728: a closure literal's return type is
+not inferred from its body, so `ys.fold(0, fn(acc, v) { acc + v })` types the callback as `Void` and
+yields garbage. Nothing checks a callback's return type against the HOF's declared signature.
+Declaring `-> Int` fixes it, and the test row says why it is mandatory.
+
+Four of the twelve voted methods are still unimplemented (`last`, `index_of`, `reverse`, `sort`).
+They are not needed by the collapse, so they are tickets, not work — with `sort` blocked on a spec
+ticket, because its stability guarantee, the absent comparator form, and the `.sorted()` used at
+`sections/06_tooling.md:1349` but defined nowhere are all unanswered. Implementing first would pick
+the stability guarantee by accident.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

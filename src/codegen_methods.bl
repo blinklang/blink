@@ -73,16 +73,16 @@ import diagnostics.{
     ICE_SEG_ERASED_SLOT,
 }
 import ast.{NodeKind, is_block_bearing, dbg_trace, dbg_channel_on}
-import typecheck.{sv_ty_or_flat, tc_channel_elem_ct, tc_channel_elem_struct, tc_ptr_pointee_ct, tc_ptr_pointee_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_tuple_sname, tc_tid_list_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
+import typecheck.{sv_ty_or_flat, tc_channel_elem_ct, tc_channel_elem_struct, tc_ptr_pointee_ct, tc_ptr_pointee_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_tuple_sname, tc_tid_list_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member, tc_list_rename_help}
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
 let mut btc_arg_offset: Int = 0
 
-// vbhc4x: recover a Set element / Map key CT from the method-argument node's
+// Recover a Set element / Map key CT from the method-argument node's
 // memoized tid, for the case where the container is a generic-struct field
 // (Box[T] { s: Set[T] }). typecheck does NOT monomorphize struct instances, so
 // the FieldAccess tid for `b.s` is Set[<typevar>] and get_set_elem_type/
-// get_map_key_type have nothing recorded (mv45y5: -1, not a fabricated
+// get_map_key_type have nothing recorded (-1, not a fabricated
 // default). The concrete element type lives only on the argument node
 // (`insert(3)` → 3 infers TYPE_INT). Fire ONLY when the caller's element is
 // still unrecorded (elem_ct < 0 || elem_ct == CT_VOID, with sname == "" — see
@@ -96,7 +96,7 @@ fn recover_elem_ct_from_arg(node: Int, arg_pos: Int, is_erased_default: Bool) ->
     let args_sl = node_args(node)
     if args_sl == -1 || arg_pos >= sublist_length(args_sl) { return ElemRecovery { ct: -1, sname: "" } }
     let atid = tc_lookup_node_tid(sublist_get(args_sl, arg_pos))
-    // mmegcb: a tuple element (Set[(Int,Str)] through a tuple boundary) has no
+    // A tuple element (Set[(Int,Str)] through a tuple boundary) has no
     // scalar CT — tc_tid_ct returns -1 for TyKind.Tuple. Recover its mangled carrier
     // and route through the kops-struct box path (CT_STRUCT + sname), the same
     // path the direct Set[(Int,Str)] uses. Guard on kops_is_struct_key so we
@@ -129,7 +129,7 @@ fn emit_panic_tag_check_render(tmp: Str, tag_val: Int, msg_prefix: Str, rendered
 }
 
 // The concrete element tid per binder, and the SOLE producer of the poly-impl mono
-// CSV (br 3fc3pn) — emit_poly_impl_call renders that CSV from this list via
+// CSV — emit_poly_impl_call renders that CSV from this list via
 // mono_csv_from_arg_tids, so the symbol and the def-side slot types come from one
 // value and cannot disagree. The canonical `impl[T] Trait[T] for List[T]` binds every
 // binder to the receiver list's element type, so each binder's tid is inner1 of the
@@ -139,8 +139,8 @@ fn emit_panic_tag_check_render(tmp: Str, tag_val: Int, msg_prefix: Str, rendered
 // store -1 otherwise, purely so the tid could not out-spell the string CSV twin
 // (poly_impl_concrete_args, deleted): that twin spelled a struct element via the raw
 // QUALIFIED get_list_elem_struct through c_type_tag_for_struct, which emits only the
-// struct HEAD. With the twin gone the gate protects nothing and actively caused br
-// gdq426 — a qualified GENERIC element (`multifile_helper.HelperBox[Int]`) was declined,
+// struct HEAD. With the twin gone the gate protects nothing and actively caused a
+// miscompile: a qualified GENERIC element (`multifile_helper.HelperBox[Int]`) was declined,
 // fell to the twin, and mangled to the type-argument-free `multifile_helper_HelperBox`,
 // colliding every instantiation onto one C symbol with an erased `void` param.
 //
@@ -158,16 +158,13 @@ fn emit_panic_tag_check_render(tmp: Str, tag_val: Int, msg_prefix: Str, rendered
 //
 // The one thing that still recovers a -1 slot is `mono_arg_tids_with_ann`
 // (src/codegen_stmt.bl), reached from the two mono TYPEDEF emitters. It does NOT read
-// the CSV — an earlier version of this comment named a `resolve_mono_field_type` that
-// NEVER EXISTED (br fes70z: `git log -S` finds it only as added comment text, never as a
-// definition), and the CSV mechanism it advertised is what
-// decisions/compiler-type-representation.md:104 forbids and br 0n07he deleted. What the
+// a CSV — decisions/compiler-type-representation.md:104 forbids that mechanism. What the
 // net actually does is recover the slot from a tid MEMOIZED ON THE SOURCE ANNOTATION
 // NODE (MonoInstance.ann), so no string is parsed for a type param.
 //
 // It BAILS, returning the list untouched, in four cases: `ann == -1`; no -1 hole to fill; an
-// EMPTY arg_tids (no hole to find — which is why merge_arg_tids treats arity as information,
-// br p7014w); and an arity mismatch against what the annotation tid recovers.
+// EMPTY arg_tids (no hole to find — which is why merge_arg_tids treats arity as information);
+// and an arity mismatch against what the annotation tid recovers.
 //
 // ON A BAIL THERE IS NO FALLBACK LEFT — the name passes through unchanged, which is an
 // ERASURE and not a downgrade. So a slot that is a BINDER must not reach a C symbol; the
@@ -184,14 +181,14 @@ fn poly_impl_concrete_arg_tids(im: Int, recv_node: Int) -> List[Int] {
     tids
 }
 
-// pktmea: the RETURN-path twin of poly_impl_concrete_arg_tids. The four RETURN-type
+// The RETURN-path twin of poly_impl_concrete_arg_tids. The four RETURN-type
 // substitution sites in emit_poly_impl_call recover the concrete element name for a
 // bare-T / compound-over-T return; this carries the concrete element tid per binder
 // so resolve_tparam_via_tid can lower that name from the interned type_id pool
 // (tc_seg_from_tid). This is the only path now — the dotted string CSV it replaced
 // (poly_impl_resolution_args) is deleted.
 //
-// This carries the raw element tid with no encodability gate — and since br 3fc3pn so does
+// This carries the raw element tid with no encodability gate — and so does
 // poly_impl_concrete_arg_tids, so the two paths now agree. They used to differ: the arg-tid
 // path applied a strict tc_poly_elem_slot_encodable gate whose only job was keeping the
 // MANGLING CSV byte-identical to the string twin's physical symbol. Both the twin and the
@@ -220,9 +217,9 @@ fn poly_impl_return_elem_tids(im: Int, recv_node: Int) -> List[Int] {
 // codegen_expr). A slot keeps its concrete tid when tc_seg_from_tid can spell it at all, and
 // stores -1 when it cannot — an unencodable tid, or a -1 from an unresolvable receiver.
 //
-// What this used to ALSO do, and no longer does (br fsa9gf): compare the spelled segment
+// What this used to ALSO do, and no longer does: compare the spelled segment
 // against the CSV segment mangling actually used, and veto the slot on any byte divergence.
-// That comparison guarded a hazard that br 3fc3pn then removed at its root. The hazard was
+// That comparison guarded a hazard whose root cause is gone. The hazard was
 // TWO WALKERS: `ta_str` came from tc_mono_csv (tid-derived, all-or-nothing) OR
 // infer_fn_type_args_from_types (string inference), so a 2-tparam call with one unspellable
 // slot routed the WHOLE CSV to the string walker while tc_mono_tids_core still held a good
@@ -230,7 +227,7 @@ fn poly_impl_return_elem_tids(im: Int, recv_node: Int) -> List[Int] {
 //
 // Both of those producers are gone. Every caller now renders `ta_str` from THIS list via
 // mono_csv_from_arg_tids, so the symbol and the per-slot tids are the same value in two
-// forms and cannot disagree. The br 6cvvh8 miscompile class the comparison was a tripwire
+// forms and cannot disagree. The miscompile class the comparison was a tripwire
 // for (clean `cc`, wrong at runtime) is therefore unreachable through this seam by
 // construction, not merely undetected.
 //
@@ -238,27 +235,24 @@ fn poly_impl_return_elem_tids(im: Int, recv_node: Int) -> List[Int] {
 // -1 and renders as ICE_SEG_ERASED_SLOT. It is caught at the I0001 chokepoints, and the
 // remaining soft detectors are the `monofield` channel (binder-survived + the three bails)
 // and emit_struct_lit's chokepoint; neither is sound, and NEITHER sees a slot whose
-// unspellable answer is a tuple stem (br 3aa3je).
+// unspellable answer is a tuple stem.
 //
 // The `is_some()` gate is NOT part of what was deleted, and must stay: tc_mono_tids_core
 // does not gate on encodability before returning (it pushes tc_resolve_tparam_tid's raw
 // result, so a TyKind.Typevar-bearing tid arrives non-negative). Storing those would flow `""`
 // segments out of segs_from_arg_tids into mono_name_from_ann / resolve_tuple_ann /
 // resolve_tparam_seg — i.e. into NAMES, mangling `blink_f_` — and the empty-segment
-// chokepoint is deliberately unarmed (codegen_expr.bl:5923-5927). Dropping it would be a
-// plain correctness regression, not a tripwire removal.
+// chokepoint is deliberately unarmed. Dropping it would be a
+// plain correctness regression, not a tripwire removal. The pair of functions involved
+// is tc_mono_tids_subst (public entry) and tc_mono_tids_core (the walker that builds
+// the list).
 //
-// NOTE on the name: several older comments here and in codegen_expr say "tc_mono_tids",
-// which is not a function — the pair is tc_mono_tids_subst (public entry) and
-// tc_mono_tids_core (the walker that actually builds the list). New text should spell the
-// real one.
-//
-// A -1 here is not a string fallback: the def-side resolver (resolve_tparam_via_tid,
-// :347-354) passes the binder name through UNCHANGED, which is I0001 on a return slot and
+// A -1 here is not a string fallback: the def-side resolver (resolve_tparam_via_tid)
+// passes the binder name through UNCHANGED, which is I0001 on a return slot and
 // erased C on a param slot. Do not restore the claim that it degrades gracefully.
 // Do not name the `_Void` grep as the guard either: CLAUDE.md documents it as a LOWER
 // BOUND, and the bare-binder spelling it would have to catch (`blink_List_T`) contains no
-// "Void" at all, so it reads 0 on exactly the shape in question (br pt4hsy, br w4c0py).
+// "Void" at all, so it reads 0 on exactly the shape in question.
 // Gen1==Gen2 proves byte-equality of the compiler's own output and nothing about user
 // programs (see project_self_host_doesnt_catch_user_codegen_bugs).
 pub fn listop_slot_tid(tid: Int) -> Int {
@@ -267,7 +261,7 @@ pub fn listop_slot_tid(tid: Int) -> Int {
 }
 
 // Render a mono CSV directly from an arg_tids list — the TOTAL replacement for
-// tc_mono_csv, and since br 3fc3pn the SOLE producer of a monomorphization CSV.
+// tc_mono_csv, and the SOLE producer of a monomorphization CSV.
 //
 // tc_mono_csv was all-or-nothing: one unresolvable slot returned None and the whole
 // call deferred to the string producer (infer_fn_type_args_from_types /
@@ -300,7 +294,7 @@ pub fn mono_csv_from_arg_tids(arg_tids: List[Int]) -> Str {
     csv
 }
 
-// 6mhzya: the canonical type-param resolver, home to all three codegen layers
+// The canonical type-param resolver, home to all three codegen layers
 // (stmt/expr/methods) after the three byte-identical twins collapsed here.
 // codegen_methods is the only safe home: it already imports typecheck for
 // tc_seg_from_tid, and it sits below both codegen_expr (imports methods) and
@@ -318,24 +312,21 @@ pub fn mono_csv_from_arg_tids(arg_tids: List[Int]) -> Str {
 // case: that one would spell a bare binder into a C symbol.
 //
 // That last case is NOT hypothetical and the `_Void` grep does NOT guard it — a bare
-// binder mangles to `blink_Box_T`, which contains no "Void" (br pt4hsy, br w4c0py).
+// binder mangles to `blink_Box_T`, which contains no "Void".
 // The real guards are, in order:
 //   - the callers: register_map_elem_struct_mono and the CT_VOID struct-return arm of
 //     emit_generic_call both refuse to register an instance whose args CSV still holds
 //     a binder (tparams_sl_contains);
 //   - `mono_arg_tids_with_ann` (src/codegen_stmt.bl), which recovers a def-side typedef
-//     field from a tid MEMOIZED ON THE SOURCE ANNOTATION NODE. This tier previously read
-//     "resolve_mono_field_type (codegen_stmt), which recovers ... from the concrete_args CSV",
-//     and BOTH HALVES OF THAT WERE WRONG (br fes70z): no such function has ever existed, and
-//     the CSV mechanism it named is the one br 0n07he deleted per
-//     decisions/compiler-type-representation.md:104. Treat this tier as PARTIAL, not a
+//     field from a tid MEMOIZED ON THE SOURCE ANNOTATION NODE — not from a CSV, which
+//     decisions/compiler-type-representation.md:104 forbids. Treat this tier as PARTIAL, not a
 //     backstop: it bails on `ann == -1`, on no -1 hole, on an EMPTY arg_tids (no hole to
 //     find), and on an arity mismatch — and a bail erases, because there is no CSV tail to
 //     fall back to;
 //   - emit_struct_lit's I0001 chokepoint, which now treats a binder segment as erased
 //     exactly like "Void".
 //
-// NOT COVERED BY ANY OF THE THREE, and not a binder at all — br 3aa3je: a struct instance
+// NOT COVERED BY ANY OF THE THREE, and not a binder at all: a struct instance
 // nested inside a TUPLE type arg (`Box[(Box[Int], Int)]`) reaches here with `resolved` a
 // TUPLE STEM, so every binder-keyed predicate above (including tparams_sl_contains and the
 // R3 guard) is BLIND to it. build/nest_tuple.c:123 still emits
@@ -355,7 +346,7 @@ pub fn resolve_tparam_via_tid(param_name: Str, tparams_sl: Int, arg_tids: List[I
 // the positional-binder rule. It hands back the interned tid instead of its spelled
 // segment, which is what a caller that must read the resolved type STRUCTURALLY — a
 // tuple's arity and element tids, to register its carrier from the tid
-// (ensure_tuple_carrier_from_tid, br fqthkv) — needs: the segment string is a name and
+// (ensure_tuple_carrier_from_tid) — needs: the segment string is a name and
 // not a type. Returns -1 when `param_name` is not a binder here, or when arg_tids
 // captured nothing for its position.
 //
@@ -395,7 +386,7 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
     // cross-module struct BARE (CmgPoint) — which type_from_name / is_struct_type
     // recover directly from struct_reg_set without a `.` to split — and a struct
     // instance as its physical mono stem. The dotted string CSV this replaced
-    // (poly_impl_resolution_args) is what the head relied on before pktmea (br dwhm4v);
+    // (poly_impl_resolution_args) is what the head relied on before this tid path;
     // it is now deleted. Bare is not just equivalent but MORE correct: the dotted
     // spelling flowed into descriptor_mangle and produced the invalid promote symbol
     // `blink_promote_helper.CmgPoint` for a with-arena tail (latent bug fixed here).
@@ -406,8 +397,8 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
     // (`Option_int` / `Result_int_str` / `Map_int_str`) via the tid RETURN path
     // (poly_impl_return_elem_tids -> tc_seg_from_tid). type_from_name of a carrier
     // tag is CT_VOID (a tag is not a head name), so the result temp would carry
-    // CT_VOID and any chained method (`.first().unwrap()`) would fail to resolve
-    // (br 4c3gts). Reroute the CT off the tag exactly as the free-fn twin
+    // CT_VOID and any chained method (`.first().unwrap()`) would fail to resolve.
+    // Reroute the CT off the tag exactly as the free-fn twin
     // mono_fn_signature does (is_compound_tag -> compound_tag_ct), so the
     // Option/Result carrier-threading branches below fire and the caller sees the
     // concrete compound type. `canon_ret` canonicalizes a module-qualified inner so
@@ -449,15 +440,15 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
     // A compound-over-binder return (`-> Option[T]` / `-> Result[T, E]`) needs
     // the concrete inner threaded into the caller's carrier globals, or the
     // enclosing `let` binds the default `blink_Option_int` while the def side
-    // monomorphized `blink_Option_LocalPoint` — an invalid-initializer mismatch
-    // (br wkwj7e). node_return_type gives only the HEAD ("Option"), so read the
+    // monomorphized `blink_Option_LocalPoint` — an invalid-initializer mismatch.
+    // node_return_type gives only the HEAD ("Option"), so read the
     // return annotation's inner child(ren) and substitute through the same
     // resolver the head used (resolve_tparam_via_tid over ret_tids, dotted-
     // string fallback). The tid path spells a bare cross-module inner BARE, which
     // is the carrier convention the free-fn emit_generic_fn_call_tail and the 7
     // other RETURN-path producers already store (strip_module_qualifier); the
     // caller-side unwrap_carrier strips internally anyway, so bare is safe. Recovers
-    // struct instances with is_mono_struct_instance (br bd4mg6). Runs AFTER the
+    // struct instances with is_mono_struct_instance. Runs AFTER the
     // arg-emission loop: emit_expr on the args clobbers these same expr_* carrier
     // globals, so setting them earlier would be overwritten (the free-fn path
     // receives args_str pre-emitted for the same reason).
@@ -469,7 +460,7 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
             // is the typevar node (no compound children), so recover the carrier +
             // inner from the canonicalized tag, mirroring mono_fn_signature's
             // rerouted branch. ensure_carrier_from_tag emits the typedef;
-            // option_inner_*_from_tag recover the inner CT / struct (br 4c3gts).
+            // option_inner_*_from_tag recover the inner CT / struct.
             ensure_carrier_from_tag(canon_ret)
             let inner_ct = option_inner_ct_from_tag(canon_ret)
             let inner_struct = option_inner_struct_from_tag(canon_ret)
@@ -494,7 +485,7 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
         let ann_elems = if ret_ann != -1 { node_elements(ret_ann) } else { -1 }
         if rerouted {
             // Bare-binder `-> T` bound to a Result element: derive both inners from
-            // the canonicalized tag (br 4c3gts), mirroring the Option branch above.
+            // the canonicalized tag, mirroring the Option branch above.
             // split_result_compound splits `Result_int_str` into ok/err segments;
             // a segment naming a struct/enum typedef tag (typedef_tag_or_empty)
             // threads through the mixed-struct carrier globals so the caller binds
@@ -559,12 +550,12 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_user_impl_call(node: Int, type_name: Str, method: Str, obj_str: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     // Resolve the owning trait so the symbol matches the trait-qualified
-    // definition (sb3125). Ambiguous calls are rejected at typecheck, so a
+    // definition. Ambiguous calls are rejected at typecheck, so a
     // resolved trait here is unique; "" (e.g. inherent/synthesized paths) keeps
     // the bare symbol.
     let call_trait = impl_trait_for_method(type_name, method)
     let mangled = if call_trait != "" { mangle_impl_method_q(type_name, call_trait, method) } else { "{type_name}_{method}" }
-    // ms4ctb: a polymorphic impl on a builtin generic receiver
+    // A polymorphic impl on a builtin generic receiver
     // (`impl[T] Trait[T] for List[T]`) is monomorphized per concrete T at the
     // use site — registered here, emitted by the deferred mono pass — exactly
     // like a generic free fn. Routed before the single-symbol path below.
@@ -629,7 +620,7 @@ fn emit_user_impl_call(node: Int, type_name: Str, method: Str, obj_str: Str) ! C
                     // never-typedef'd `blink_Box`. Read the instance tid off
                     // the return annotation and expand to the mono stem,
                     // mirroring the def-side seams. Empty stem (bare/typevar/
-                    // enum) falls back unchanged (br ns7qdm).
+                    // enum) falls back unchanged.
                     let ret_stem = tc_tid_struct_mono_name(tc_lookup_node_tid(node_type_ann(m_node)))
                     let ret_carrier = if ret_stem != "" { ret_stem } else { ret_str }
                     let s_tmp = fresh_temp("_sr")
@@ -679,11 +670,10 @@ fn emit_result_unwrap_inner(
         expr_result_str = "{tmp}.{field}"
         expr_result_type = CT_STRING
     } else if inner_t == CT_CLOSURE {
-        // br ndgx84, the Result half. The CARRIER was already right — `Ok(f)` builds
-        // `blink_Result_closure_str`, whose `.ok` member is a `blink_closure*` (br 597kj0 gave the
-        // `closure` tag its round-trip) — and only this decode was missing, so the value fell to
-        // the `else` below and came back CT_INT: `const int64_t h = _runw_0.ok;`. No temp and no
-        // cast, for the same reason as the CT_STRING arm above: the member already has the type.
+        // The Result half of the same CLOSURE handling as the Option arm below: `Ok(f)` builds
+        // `blink_Result_closure_str`, whose `.ok` member is already a `blink_closure*`. No temp
+        // and no cast, for the same reason as the CT_STRING arm above: the member already has
+        // the type.
         expr_result_str = "{tmp}.{field}"
         expr_result_type = CT_CLOSURE
     } else if inner_t == CT_LIST {
@@ -761,7 +751,7 @@ pub fn resolve_push_struct(val_str: Str, list_name: Str) -> Str {
 // (or the inline int form) and a trailing ");".
 //
 // Single source of truth for compound-element boxing across list.push,
-// list.set, map.insert, and list-literal (br 4yzsfc): compound values
+// list.set, map.insert, and list-literal: compound values
 // (struct/enum/Option/Result) must be heap-allocated and stored behind a void*,
 // never cast struct-to-pointer directly (cc rejects that). Mirrors the branch
 // structure of the list.push reference. `elem_container` is the list name to
@@ -772,7 +762,7 @@ pub fn resolve_push_struct(val_str: Str, list_name: Str) -> Str {
 // (callers resolve it differently: resolve_push_struct for push/set/map, the
 // StructLit fallback for list literals), or "" if none applies.
 pub fn emit_boxed_container_store(emit_prefix: Str, val_str: Str, val_type: Int, val_struct: Str, elem_container: Str) ! Codegen.Emit, Codegen.Register {
-    // br kxe0s2: an Instant/Duration element is a by-value C struct with its own flat CT and
+    // An Instant/Duration element is a by-value C struct with its own flat CT and
     // no struct name on any channel, so it matched none of the branches below and fell to the
     // final `else` — `blink_list_push(l, (void*)blink_std_time_Duration_ms(7))`, which cc
     // rejects as "cannot convert to a pointer type". Naming it here is enough: the struct
@@ -837,7 +827,7 @@ pub fn emit_boxed_container_store(emit_prefix: Str, val_str: Str, val_type: Int,
     }
 }
 
-// Sub-issue A (br 4yzsfc): a bare `None` written into List[Option[X]] via
+// A bare `None` written into List[Option[X]] via
 // push/set defaults its carrier to blink_Option_int (codegen_expr.bl None path)
 // because no expected annotation is threaded. When the receiver list already
 // records its element carrier as an `Option_X` tag, reseat the just-emitted
@@ -1030,7 +1020,7 @@ fn emit_str_method(node: Int, obj_str: Str, _obj_node: Int, method: Str) -> Int 
     0
 }
 
-// j0cdey: the C expression for a HOF iterator's current ELEMENT value. For a
+// The C expression for a HOF iterator's current ELEMENT value. For a
 // scalar element it's the carrier's `.value`; for a pointer-boxed COMPOUND
 // (ifs_carrier_tag set by iter_from_source) the `.value` is an intptr_t to the
 // boxed carrier, so deref it back to the carrier by value — the closures/adapters
@@ -1043,7 +1033,7 @@ fn hof_elem_value(next_var: Str) -> Str {
     "{next_var}.value"
 }
 
-// 44xww4: one slot of an enumerate/zip pair, described for the Tuple2 struct that
+// One slot of an enumerate/zip pair, described for the Tuple2 struct that
 // materializes the pair. `carrier` is the pointer-boxed compound tag (Option_int,
 // Result_int_str) or "" for a scalar; `next_var`.value holds the carrier's value.
 // tag: tuple-name / elem_structs token (Option_int, or "int" for a scalar).
@@ -1052,10 +1042,10 @@ fn hof_elem_value(next_var: Str) -> Str {
 // value: C expression for the slot value, BY VALUE.
 type EnumZipSlot { tag: Str, ct: Int, struct_tag: Str, value: Str }
 
-// 44xww4: describe an enumerate/zip pair slot fed by a `.value`-carrying iterator
+// Describe an enumerate/zip pair slot fed by a `.value`-carrying iterator
 // `next` result. A compound source (carrier != "") boxes the carrier behind an
 // intptr_t, so deref it back BY VALUE for a plain struct-field assignment — the
-// s663bm multi-eightbyte RETURN concern does NOT apply to a field store. A scalar
+// multi-eightbyte RETURN concern does NOT apply to a field store. A scalar
 // slot keys on its CT directly.
 fn enum_zip_slot(next_var: Str, elem_type: Int, carrier: Str) -> EnumZipSlot {
     if carrier != "" {
@@ -1071,7 +1061,7 @@ fn enum_zip_slot_struct_csv(slot: EnumZipSlot) -> Str {
     if slot.struct_tag != "" { slot.struct_tag } else { "-" }
 }
 
-// The slot's elem_names CSV token for ensure_tuple_type (br dq15j7). `slot.ct` is
+// The slot's elem_names CSV token for ensure_tuple_type. `slot.ct` is
 // the iterator's own concrete element type, not an erased mono-struct-field slot,
 // so CT_VOID here can only mean the iterator genuinely yields Void — always safe
 // to name it, same reasoning as emit_tuple_lit's per-element derivation.
@@ -1079,7 +1069,7 @@ fn enum_zip_slot_name_csv(slot: EnumZipSlot) -> Str {
     if slot.struct_tag == "" && slot.ct == CT_VOID { "Void" } else { "" }
 }
 
-// 44xww4: stamp `result_list` as a List of `tuple_tag` structs (mirrors
+// Stamp `result_list` as a List of `tuple_tag` structs (mirrors
 // emit_list_lit's struct-element path) and set the expr_* result channels so the
 // caller's `.get()` returns Option[tuple_tag] and `for (i,x)` destructures it.
 pub fn finish_enum_zip_result(result_list: Str, tuple_tag: Str) {
@@ -1091,7 +1081,7 @@ pub fn finish_enum_zip_result(result_list: Str, tuple_tag: Str) {
     expr_list_elem_struct = tuple_tag
 }
 
-// 1n9fhg: publish the expr_* element channels for a result whose element is the pointer-boxed
+// Publish the expr_* element channels for a result whose element is the pointer-boxed
 // carrier `carrier`. A COMPOUND carrier (Option_/Result_/Map_) is named by its CT alone, which is
 // why every adapter used to set only expr_list_elem_type; a NAMED BY-VALUE carrier (a struct, a
 // tuple, a data enum) has CT_VOID for a CT and carries its whole identity in the name, so the
@@ -1103,11 +1093,11 @@ pub fn publish_carrier_elem(carrier: Str) {
     }
 }
 
-// j0cdey: copy a source List's COMPOUND element type onto a destination list
+// Copy a source List's COMPOUND element type onto a destination list
 // (a HOF that produces a new List[Option[T]]/List[Result[T,E]], e.g. collect over
 // a compound source). Reuses the source's stored deep inner tp so a nested
 // container element — `List[Option[Map]]` — keeps its type params on the result.
-// jcr0zz: also the re-bind path for `let g = <list-expr>` (codegen_stmt.bl's
+// Also the re-bind path for `let g = <list-expr>` (codegen_stmt.bl's
 // unannotated CT_LIST branch) — a compound element recovered onto the RHS temp
 // var by recover_list_elem_from_tid must survive onto the LHS var by the same
 // route, or the deep tp_id dies with the temp and later readers (emit_list_method's
@@ -1122,16 +1112,16 @@ pub fn copy_list_compound_elem(src: Str, dst: Str) {
     let elem_ct = get_list_elem_type(src)
     // Stage 3 question, and the only one that decides whether the body can go: this copy is
     // load-bearing ONLY where it writes an element that stamp_list_elem_from_tid then declines to
-    // overwrite. ALL THREE callers now run the stamp immediately after (br zaq1np gave the collect
-    // site the one that was missing), and the stamp spells every element kind faithfully or not at
+    // overwrite. ALL THREE callers now run the stamp immediately after (the collect
+    // site was the one missing it), and the stamp spells every element kind faithfully or not at
     // all — so `arm=` here with no `stamp ... var={dst}` line after it is the whole load-bearing
     // set, and the corpus join reads 0 of those in both build modes. Keyed on dst so the two lines
     // join by name.
     //
     // What that does NOT license is deleting the body. Every corpus event is superseded, but a
     // shape whose inner the tid cannot spell still declines, and then these arms are the answer —
-    // the flat path stays as the decline fallback until the tid is complete (br bef42x's ordering,
-    // Stage 4's deletion).
+    // the flat path stays as the decline fallback until the tid is complete (an ordering
+    // constraint on Stage 4's deletion).
     let tracing = dbg_channel_on("listelem")
     if elem_ct == CT_OPTION {
         let oi_tp = get_list_elem_option_inner_tp(src)
@@ -1183,7 +1173,7 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
         reseat_bare_none_from_list_elem(obj_str)
         let val_str = expr_result_str
         let val_type = expr_result_type
-        // d7es5j: capture the list's recorded element-map K/V BEFORE
+        // Capture the list's recorded element-map K/V BEFORE
         // set_list_elem_type(CT_MAP) collapses them (the flat slot can't hold
         // list→map→{k,v}). Used below to preserve an annotated List[Map[K,V]]
         // value type when an untyped `Map()` is pushed.
@@ -1193,11 +1183,11 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
         if val_type != CT_INT {
             set_list_elem_type(obj_str, val_type)
         }
-        // wx184m: a plain set_list_elem_type(CT_MAP) collapses the element map's
+        // A plain set_list_elem_type(CT_MAP) collapses the element map's
         // value type to the default Int (the flat slot can't hold list→map→{k,v}).
         // Carry the pushed map's scalar key+value through so List[Map[K,V]].get()
         // keeps V instead of defaulting to Int.
-        // d7es5j: an empty `Map()` literal is genuinely untyped (raw k/v == -1),
+        // An empty `Map()` literal is genuinely untyped (raw k/v == -1),
         // so its default Int value must NOT clobber the list's annotated value
         // type. Prefer the pushed map's types only where it actually has them;
         // otherwise restore the list's pre-collapse element-map types.
@@ -1216,7 +1206,7 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
                 set_list_elem_map_types(obj_str, pre_list_map_k, pre_list_map_v, pre_list_map_vs)
             }
         }
-        // nprhy8: pushing a Set carries only its OWN kind (CT_SET) via the plain
+        // Pushing a Set carries only its OWN kind (CT_SET) via the plain
         // set_list_elem_type above — the pushed set's element (Int/struct) has
         // nowhere to land without this, so a later `d.get(0).unwrap()` for-in
         // has no nested element and either ICEs (Stage A.4) or misreads the
@@ -1311,7 +1301,7 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             let pop_map_v = get_list_elem_map_val_type(obj_str)
             let pop_map_vs = get_list_elem_map_val_struct(obj_str)
             let k_tag = if pop_map_k >= 0 { c_type_tag(pop_map_k) } else { "str" }
-            // mvfd3m: mirror the .get() path — a struct map value tags the carrier
+            // Mirror the .get() path — a struct map value tags the carrier
             // by struct name and forwards the value-struct through inner2_struct.
             let v_tag = if pop_map_vs != "" { c_type_tag_for_struct(pop_map_vs) } else if pop_map_v >= 0 { c_type_tag(pop_map_v) } else { "int" }
             let map_struct = "Map_{k_tag}_{v_tag}"
@@ -1331,9 +1321,9 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             expr_option_inner = CT_MAP
             expr_option_inner_struct = map_struct
         } else if elem_type == CT_OPTION {
-            // gemr3z: List[Option[T]].pop() -> Option[Option[T]] — mirror the .get()
+            // List[Option[T]].pop() -> Option[Option[T]] — mirror the .get()
             // CT_OPTION branch (the element Option is pointer-boxed on the list).
-            // whg65a: carrier tag + inner tp threading matches .get() so a nested
+            // Carrier tag + inner tp threading matches .get() so a nested
             // container inner survives pop() as well.
             let oi_ct = get_list_elem_option_inner(obj_str)
             let oi_struct = get_list_elem_option_inner_struct(obj_str)
@@ -1350,7 +1340,7 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             if oi_struct != "" {
                 set_var_option_inner2_struct(res, oi_struct)
             }
-            // whg65a: store res's full deep tp (`Option[Option[Map]]`) so a later
+            // Store res's full deep tp (`Option[Option[Map]]`) so a later
             // unwrap recovers the element Option[Map] with its nested type intact —
             // mirrors the .get() CT_OPTION branch.
             if oi_tp >= 0 && (tp_get_kind(oi_tp) == CT_LIST || tp_get_kind(oi_tp) == CT_MAP) {
@@ -1362,8 +1352,8 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             expr_option_inner_struct = opt_carrier
             expr_option_inner_tp = oi_tp
         } else if elem_type == CT_RESULT {
-            // gemr3z: List[Result[T,E]].pop() -> Option[Result[T,E]] — the Result twin.
-            // whg65a: ok/err tags from each side's full inner tp (nested-container safe).
+            // List[Result[T,E]].pop() -> Option[Result[T,E]] — the Result twin.
+            // Ok/err tags from each side's full inner tp (nested-container safe).
             let rok_ct = get_list_elem_result_ok(obj_str)
             let rerr_ct = get_list_elem_result_err(obj_str)
             let rok_struct = get_list_elem_result_ok_struct(obj_str)
@@ -1423,9 +1413,9 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
         // Element membership by linear scan. MVP covers primitive element
         // types (Int, Bool, Str, Float) — the equality types the language
         // already defines. Struct/enum/nested-collection elements fall
-        // through to UnresolvedMethod (kk0mv7: deep collection/struct
+        // through to UnresolvedMethod: deep collection/struct
         // equality is a separate concern; `==` on boxed structs is pointer
-        // identity today, so a field-wise `.contains` would diverge from it).
+        // identity today, so a field-wise `.contains` would diverge from it.
         let elem_type = get_list_elem_type(obj_str)
         if elem_type != CT_INT && elem_type != CT_BOOL && elem_type != CT_STRING && elem_type != CT_FLOAT {
             return 0
@@ -1527,7 +1517,7 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             let map_v = get_list_elem_map_val_type(obj_str)
             let map_vs = get_list_elem_map_val_struct(obj_str)
             let k_tag = if map_k >= 0 { c_type_tag(map_k) } else { "str" }
-            // mvfd3m: a struct map value names the carrier by its struct tag
+            // A struct map value names the carrier by its struct tag
             // (Map_{k}_{Point}) and forwards the value-struct name through the
             // option's inner2_struct channel so the later unwrap recovers it.
             let v_tag = if map_vs != "" { c_type_tag_for_struct(map_vs) } else if map_v >= 0 { c_type_tag(map_v) } else { "int" }
@@ -1548,7 +1538,7 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             expr_option_inner = CT_MAP
             expr_option_inner_struct = map_struct
         } else if elem_type == CT_OPTION {
-            // gemr3z: List[Option[T]].get() returns Option[Option[T]]. The element
+            // List[Option[T]].get() returns Option[Option[T]]. The element
             // Option is boxed by POINTER on the list (like a struct/map element), so
             // read it back as a `blink_<carrier>*` and carry it in a struct-option
             // whose inner IS the element's carrier tag. Mirrors the CT_MAP branch;
@@ -1556,7 +1546,7 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             // expr_option_inner + set_var_option_inner2 so the caller's match on the
             // unwrapped `Option[T]` decodes T instead of the flattened default.
             //
-            // whg65a: the carrier tag comes from the element Option's full inner tp
+            // The carrier tag comes from the element Option's full inner tp
             // (tp_carrier_tag), so a NESTED container inner — `Option[Map[Int,Str]]`
             // → `Option_Map_int_str`, not the lossy `Option_map` — keeps its K/V. The
             // inner tp is threaded via expr_option_inner_tp so the arm that unwraps
@@ -1577,7 +1567,7 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             if oi_struct != "" {
                 set_var_option_inner2_struct(res, oi_struct)
             }
-            // whg65a: for a nested-container inner, store res's full deep tp
+            // For a nested-container inner, store res's full deep tp
             // (`Option[Option[List[Int]]]`) so `.unwrap()` recovers the element
             // Option[List[Int]] with its List element type intact — the carrier tag
             // `Option_list` is element-agnostic and can't round-trip it.
@@ -1590,11 +1580,11 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             expr_option_inner_struct = opt_carrier
             expr_option_inner_tp = oi_tp
         } else if elem_type == CT_RESULT {
-            // gemr3z: List[Result[T,E]].get() returns Option[Result[T,E]] — the Result
+            // List[Result[T,E]].get() returns Option[Result[T,E]] — the Result
             // twin of the CT_OPTION branch. The element Result carrier is pointer-boxed
             // on the list; carry it in a struct-option keyed on the Result carrier tag.
             //
-            // whg65a: ok/err tags come from each side's full inner tp (tp_carrier_tag)
+            // Ok/err tags come from each side's full inner tp (tp_carrier_tag)
             // so a nested container — `Result[Map[Int,Str],Str]` →
             // `Result_Map_int_str_str` — keeps its K/V.
             let rok_ct = get_list_elem_result_ok(obj_str)
@@ -1638,14 +1628,12 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             expr_option_inner = CT_SET
             expr_option_inner_struct = ""
         } else if elem_type == CT_HANDLER {
-            // br 1mw2c3. Without this arm a handler element fell to the int carrier below and the
-            // `with` operand assigned an int64_t to a vtable pointer, which only cc reported. The
-            // carrier is the one `Some(mk())` already emits — `blink_Option_handler`, member
+            // The carrier is the one `Some(mk())` already emits — `blink_Option_handler`, member
             // `void*` — so it needs no per-effect variant and no cast at either end: the store
             // takes a `blink_io_vtable*` and the read yields one through C's implicit
-            // void*↔object-pointer conversion. That the effect is DROPPED here is deliberate and
-            // matches c_type_tag's Handler arm, which writes out why; the `with` operand recovers
-            // the effect from the tid (br t7xf9y) rather than from the carrier tag.
+            // void*↔object-pointer conversion. The effect is DROPPED here deliberately, matching
+            // c_type_tag's Handler arm; the `with` operand recovers the effect from the tid
+            // rather than from the carrier tag.
             //
             // A list stores a handler as the pointer itself, not boxed behind one — the same as
             // CT_STRING and CT_SET above — so there is no dereference here.
@@ -1661,11 +1649,8 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             expr_option_inner = CT_HANDLER
             expr_option_inner_struct = ""
         } else if elem_type == CT_CLOSURE {
-            // br ndgx84, the exact twin of the CT_HANDLER arm above and for the same reason:
-            // without it a closure element fell to the int carrier below, so the binding was
-            // DECLARED `const int64_t h = ..` and every later use of it was an integer. The
-            // `blink_Option_closure` carrier already exists (br 597kj0 gave the `closure` tag its
-            // round-trip), and a list stores a closure as the pointer itself — `push` emits
+            // The exact twin of the CT_HANDLER arm above: the `blink_Option_closure` carrier
+            // already exists, and a list stores a closure as the pointer itself — `push` emits
             // `blink_list_push(fs, (void*)f)` — so the read needs no dereference.
             //
             // The element's SIGNATURE is deliberately not carried here. It cannot be: the list's
@@ -1721,7 +1706,7 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
         expr_result_type = CT_STRING
         return 1
     }
-    if method == "concat" {
+    if method == "append" {
         let args_sl = node_args(node)
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let other_str = expr_result_str
@@ -1763,7 +1748,7 @@ fn is_set_builtin_intercept(ct: Int, method: Str) -> Bool {
 }
 
 fn map_key_expr_inner(key_str: Str, key_ct: Int, key_sname: Str, for_insert: Bool) -> Str ! Codegen.Emit, Codegen.Register {
-    // k4thkq: FIRST, because a payload-less enum is a registered kops key AND an inline one. The
+    // FIRST, because a payload-less enum is a registered kops key AND an inline one. The
     // runtime memcpy's key_size bytes out of the pointer we hand it (blink_map_set /
     // blink_set_insert), so a stack temp is enough for an insert too — no blink_alloc, and nothing
     // downstream ever sees a pointer to an ordinal.
@@ -1821,7 +1806,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str, fb_key_c
     let base_val_ct = if !is_named_map_var && fb_val_ct >= 0 { fb_val_ct } else { base_val_ct0 }
     let base_val_sname0 = get_map_value_struct(map_var_name)
     let base_val_sname = if !is_named_map_var && fb_val_struct != "" { fb_val_struct } else { base_val_sname0 }
-    // vbhc4x: a generic-struct field Map[K,V] erases its key. The erased key CT
+    // A generic-struct field Map[K,V] erases its key. The erased key CT
     // is CT_VOID when the field's key is a typevar (tp_child1_kind yields the
     // typevar's void kind) or CT_STRING when the key CT is entirely unset — both
     // are the "no concrete key" default. Recover the concrete key from the key
@@ -1848,7 +1833,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str, fb_key_c
         let val_str2 = expr_result_str
         let val_type2 = expr_result_type
         let val_list_elem = expr_list_elem_type
-        // br kxe0s2: an Instant/Duration VALUE presents as (CT_STRUCT, name), the same
+        // An Instant/Duration VALUE presents as (CT_STRUCT, name), the same
         // normalization the list-literal element does — the map records its value type here,
         // and `.get()` picks the struct-carrier arm off the recorded pair. Its own flat CT
         // reaches neither, so the value came back a bare int64_t.
@@ -1879,7 +1864,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str, fb_key_c
         let vtype = base_val_ct
         let vstruct = base_val_sname
         let res = fresh_temp("_mgetopt_")
-        // br dcjy17: FIRST, because the ladder below cannot answer for these value kinds at all
+        // FIRST, because the ladder below cannot answer for these value kinds at all
         // — a Map's flat value channels hold a scalar, a struct name or a List element, so an
         // Option, Result or Set value falls into the ladder's else and is read back as
         // `blink_Option_int`, and a nested Map reaches the CT_MAP arm whose `blink_Option_map`
@@ -1915,7 +1900,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str, fb_key_c
                 }
                 // The carrier tag for a container inner is element-agnostic (`Option_list`), so
                 // the value Option's own inner travels as a deep tp instead — the channel the
-                // `.unwrap()` arm reads for exactly this case (whg65a).
+                // `.unwrap()` arm reads for exactly this case.
                 let ik = tp_get_kind(mvc.inner_tp)
                 if ik == CT_LIST || ik == CT_MAP {
                     set_var_option_inner_tp(res, type_option(mvc.inner_tp))
@@ -2024,7 +2009,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str, fb_key_c
             expr_option_inner = CT_FLOAT
             expr_option_inner_struct = ""
         } else if vtype == CT_HANDLER {
-            // br 1mw2c3, the Map twin of emit_list_method's CT_HANDLER arm — same carrier, same
+            // The Map twin of emit_list_method's CT_HANDLER arm — same carrier, same
             // reason, and the map stores a handler as the pointer itself so there is no
             // dereference (contrast the CT_FLOAT arm above, which does box).
             ensure_option_type(CT_HANDLER)
@@ -2039,7 +2024,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str, fb_key_c
             expr_option_inner = CT_HANDLER
             expr_option_inner_struct = ""
         } else if vtype == CT_CLOSURE {
-            // br ndgx84, the Map twin of emit_list_method's CT_CLOSURE arm — same carrier, same
+            // The Map twin of emit_list_method's CT_CLOSURE arm — same carrier, same
             // reason, and a map stores a closure as the pointer itself so there is no dereference.
             ensure_option_type(CT_CLOSURE)
             let opt_type = option_c_type(CT_CLOSURE)
@@ -2130,8 +2115,8 @@ fn emit_set_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
     let elem_ct = get_set_elem_type(set_var_name)
     let elem_sname = if elem_ct == CT_VOID || elem_ct == CT_STRUCT || elem_ct < 0 { get_set_elem_struct(set_var_name) } else { "" }
 
-    // vbhc4x: a generic-struct field Set[T] erases its element. Like the Map key
-    // (emit_map_method), the erased element CT is -1 (mv45y5: get_set_elem_type's
+    // A generic-struct field Set[T] erases its element. Like the Map key
+    // (emit_map_method), the erased element CT is -1 (get_set_elem_type's
     // truthful "no element recorded" sentinel) or CT_VOID (typevar element kind)
     // — both mean "no concrete element". Recover from the insert/contains/remove
     // argument's memoized tid, ONLY at that erased default with no struct name
@@ -2139,14 +2124,12 @@ fn emit_set_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
     // these three element-taking methods — union/len/is_empty do not box an
     // element.
     //
-    // mv45y5 Stage A.5: NOT dead code. Stage A stamped every Set *binding* site
-    // (unannotated let, fn params) from typecheck's tid, but a generic-struct
-    // FIELD's Set[T] (this fn's own motivating case, `GT[T] { s: Set[T] }`) has
-    // no scope var of its own to stamp ahead of time — typecheck does not
-    // monomorphize struct instances, so `e.s`'s tid stays Set[<typevar>] no
-    // matter how many binding sites get fixed. Confirmed still live via
-    // tests/test_6cvvh8_struct_mono_target_seams.bl's tuple-key insert row,
-    // whose failure symptom changed shape under this very Stage A landing.
+    // This is NOT dead code: a Set *binding* site (unannotated let, fn params) can
+    // be stamped from typecheck's tid ahead of time, but a generic-struct FIELD's
+    // Set[T] (`GT[T] { s: Set[T] }`) has no scope var of its own to stamp ahead of
+    // time — typecheck does not monomorphize struct instances, so `e.s`'s tid stays
+    // Set[<typevar>] regardless of how many binding sites are covered. See
+    // tests/test_6cvvh8_struct_mono_target_seams.bl's tuple-key insert row.
     let set_erased_default = (elem_ct < 0 || elem_ct == CT_VOID) && elem_sname == ""
     if method == "insert" {
         let args_sl = node_args(node)
@@ -2198,7 +2181,7 @@ fn emit_set_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         let args_sl = node_args(node)
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let other_str = expr_result_str
-        // nprhy8: mint a real scope var for the union result (not a bare call
+        // Mint a real scope var for the union result (not a bare call
         // expression string) so `for x in a.union(b)` used inline, with no
         // intervening `let`, has something to read the element metadata off
         // of — a bare expr_result_str has no scope-var entry at all.
@@ -2273,7 +2256,7 @@ fn emit_sb_method(node: Int, obj_str: Str, _obj_node: Int, method: Str) -> Int !
         let ch_str = expr_result_str
         let ch_type = expr_result_type
         // blink_sb_write_char takes const char*. A Str arg passes straight
-        // through; a Char arg (br 78b3jr) lowers to int32_t, so render it
+        // through; a Char arg lowers to int32_t, so render it
         // via blink_char_to_str like the Char.fmt path does.
         if ch_type == CT_CHAR {
             emit_line("blink_sb_write_char({obj_str}, blink_char_to_str((int64_t){ch_str}));")
@@ -2501,36 +2484,26 @@ fn emit_builtin_trait_method(node: Int, obj_str: Str, obj_type: Int, obj_node: I
         if emit_str_method(node, obj_str, obj_node, method) != 0 { return 1 }
     }
     if lookup_builtin_trait_impl("ListOps", obj_type) != 0 {
-        // br 6g6g7t: every reader in emit_list_method derives the element with
+        // Every reader in emit_list_method derives the element with
         // get_list_elem_type(obj_str) / get_list_elem_struct(obj_str), which look obj_str up as
         // a variable NAME. When the list is an EXPRESSION -- `make_tups().get(0)` -- obj_str is
         // the C call text `blink_u_f_make_tups()`, no ScopeVar has ever carried that name, and
-        // every reader gets the not-found sentinel and falls back to boxed int64. Measured on
-        // the copy_list_compound_elem analogue of the same hole:
+        // every reader gets the not-found sentinel and falls back to boxed int64.
         //
-        //   bucket=missing site=copy_list_compound_elem.src var=blink_u_f_loptmap() tid=- flat=-
-        //
-        // `flat=-` is the whole point: the flat universe is keyed by variable name, so a list
-        // that never had one is unrepresentable in it. The tid is keyed by NODE, so it is
-        // present and exactly right at the same place. Stamping it registers a synthetic scope
-        // var under the expression string -- the same mechanism fresh_temp names already use,
-        // and set_list_elem_type pushes one when the name is absent -- so all ~20 readers below
-        // are served by this one write instead of each growing its own tid path.
+        // The flat universe is keyed by variable name, so a list that never had one is
+        // unrepresentable in it. The tid is keyed by NODE, so it is present and exactly right at
+        // the same place. Stamping it registers a synthetic scope var under the expression
+        // string -- the same mechanism fresh_temp names already use, and set_list_elem_type
+        // pushes one when the name is absent -- so all ~20 readers below are served by this one
+        // write instead of each growing its own tid path.
         //
         // Gated on the flat path holding NO element for this name at all -- not on the broader
-        // list_elem_unspellable, which is wrong here and cost a segfault to learn: it counts a
-        // nameless CT_VOID as an erasure, but (CT_VOID, "") is a REAL spelling -- it is how a
-        // by-value plain-enum element is recorded, and the declared path stamps exactly that for
-        // an annotated `let l: List[Col]`. Re-stamping it from the tid promoted the element to
-        // the (CT_VOID, sname) struct convention, so `.get()` emitted
-        // `(blink_Col*)blink_list_get(..)` and the reader dereferenced a by-value enum:
-        // test_0rmamy segfaulted with all its rows still passing, because the crash is in the
-        // probe program the rows compile rather than in an assertion.
-        //
-        // "No element recorded" is also exactly what was measured -- `flat=-`, no ScopeVar under
-        // this name -- so it cannot override any flat answer at all, correct or not. Stage 3's
-        // authority flip is what reverses the precedence; until then each cell stays one
-        // measurable shape.
+        // list_elem_unspellable: that check counts a nameless CT_VOID as an erasure, but
+        // (CT_VOID, "") is a REAL spelling -- it is how a by-value plain-enum element is
+        // recorded, matching what the declared path stamps for an annotated `let l: List[Col]`.
+        // Re-stamping it from the tid would promote the element to the (CT_VOID, sname) struct
+        // convention, so `.get()` would emit `(blink_Col*)blink_list_get(..)` and the reader
+        // would dereference a by-value enum that was never boxed.
         //
         // Map and Set receivers have the identical hole on their own key/value channels (a
         // chained `make_maps().get("k")`), which this does NOT fix -- their metadata lives in
@@ -2633,14 +2606,14 @@ fn emit_io_output(node: Int, trace_op: Str, direct_prefix: Str, newline: Int, vt
 // Receiver type as USER-FACING TEXT for the unresolved-method diagnostic. Read the
 // memoized tid first, not the CT: type_name_from_ct is a total function over the CTs it
 // enumerates and answers "Void" for the rest, so an Option or Result receiver — CTs it has
-// no arm for — was reported as `on type Void`. Void is a real surface type in Blink, so
-// that is a confident wrong claim about the receiver rather than a visible unknown, which
-// is what decisions/under-determined-types.md forbids (br 3dpshm). typecheck already
+// no arm for — would be reported as `on type Void`. Void is a real surface type in Blink,
+// so that would be a confident wrong claim about the receiver rather than a visible
+// unknown, which decisions/under-determined-types.md forbids. typecheck already
 // computed the receiver's real type; tc_type_str also renders instance type-args
 // (Option[Int], Result[Int, Str]) and distinguishes a genuine TyKind.Void from TyKind.Unknown.
 //
-// Same reroute-off-the-tid shape as the ma6n41/tr5gcn CT_VOID recovery at
-// codegen_expr.bl:3055, and the CT stays the FALLBACK for the same reason: it is what
+// Same reroute-off-the-tid shape as the CT_VOID recovery in codegen_expr.bl, and the CT
+// stays the FALLBACK for the same reason: it is what
 // every already-correct receiver (List, Str, a struct) reads today, and "<?>" means the
 // node carries no usable tid — not that the type is unknown. Diagnostic text only; do not
 // route dispatch decisions through this.
@@ -2703,7 +2676,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 expr_result_str = tmp
                 expr_result_type = CT_OPTION
                 expr_result_ok_type = CT_VOID
-                // br bf0jnj. The inner type goes on BOTH channels, exactly as the try_from /
+                // The inner type goes on BOTH channels, exactly as the try_from /
                 // from_json arm above writes expr_result_ok_struct. A consumer that binds this
                 // call to a name reads the scope var stamped two lines up; one that consumes it
                 // as an expression — a direct `match Status.from_str(..)` scrutinee, an
@@ -2728,8 +2701,8 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 // A generic-enum qualified ctor (`Either.Left(42)` → Either[Int,Str])
                 // mono's to blink_Either_Int_Str, mirroring the bare-Call path
                 // (emit_expr's data-enum branch). Without this the qualified path
-                // emitted the erased bare enum (blink_Either) — undeclared for a
-                // generic enum (br 7q3aj0). "" (non-generic enum) keeps the bare name.
+                // would emit the erased bare enum (blink_Either) — undeclared for a
+                // generic enum. "" (non-generic enum) keeps the bare name.
                 let mono_name = register_mono_enum_from_node(node, mc_obj_name)
                 let sname = if mono_name != "" { mono_name } else { mc_obj_name }
                 let enum_c_name = c_type_c_name(sname)
@@ -2750,7 +2723,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                         // field_type is "Tree[T]", the enum is "Tree". Matches the
                         // bare-Call reference (emit_expr) — without the strip the box
                         // branch is skipped and the recursive field emits inline into an
-                        // int64_t pointer slot (C type error) (br 7q3aj0).
+                        // int64_t pointer slot (C type error).
                         if strip_generic_args(field_type) == mc_obj_name {
                             let box_tmp = fresh_temp("_ebox")
                             emit_line("{enum_c_name}* {box_tmp} = ({enum_c_name}*)blink_alloc(sizeof({enum_c_name}));")
@@ -2768,8 +2741,8 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 // CT_STRUCT (not CT_VOID) so a `let a: Either[Int,Str] = Either.Left(42)`
                 // binding derives its LHS C type off the mono struct tag (emit_let_binding
                 // gates enum_mono pickup on val_type == CT_STRUCT) — matching the bare-Call
-                // path, which already returns CT_STRUCT. Otherwise the LHS erased to the
-                // bare blink_Either while the RHS was the mono instance (br 7q3aj0).
+                // path, which already returns CT_STRUCT. Otherwise the LHS would erase to
+                // the bare blink_Either while the RHS is the mono instance.
                 expr_result_type = CT_STRUCT
                 set_var_struct(init_str, sname)
                 return
@@ -3508,7 +3481,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 // Sealed builtin ops-traits (StrOps/ListOps/BytesOps/…) on a
                 // builtin receiver dispatch to codegen intrinsics, not to a user
                 // impl symbol — check this FIRST so the trait-qualified user path
-                // below never claims a builtin (sb3125 regression).
+                // below never claims a builtin.
                 if lookup_builtin_trait_impl(trait_name, first_type) != 0 {
                     btc_arg_offset = 1
                     let bt_handled = emit_builtin_trait_method(node, first_str, first_type, obj_node, method, -1, -1, "", "")
@@ -3535,7 +3508,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 }
                 // Genuine user impl: build the trait-qualified symbol — this is
                 // the escape hatch that selects between two traits sharing a
-                // method name (sb3125). The qualifier names the intended trait,
+                // method name. The qualifier names the intended trait,
                 // but only honor it when that trait actually defines the method;
                 // otherwise (e.g. ListOps.is_empty, where is_empty lives in
                 // Sized) resolve the real owner so the symbol matches the def.
@@ -3644,7 +3617,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
     }
 
-    // brvx89: qualified `testing.skip(reason)` is the test-skip intrinsic, not a
+    // Qualified `testing.skip(reason)` is the test-skip intrinsic, not a
     // plain call to the no-op stdlib `skip`. Intercept it before the
     // module-qualified path routes it through the stdlib fn. mc_obj_is_local == 0
     // so a local named `testing` is not hijacked (mirrors the net.* guards).
@@ -3699,7 +3672,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                         // not the caller's ambient cg_current_module: when two
                         // modules share the bare type name (`Ngx`), the caller's
                         // context would pick the wrong module's C symbol (last
-                        // writer of the bare mod_type_prefix key) — br eczcwr.
+                        // writer of the bare mod_type_prefix key).
                         let mq_callee_mod = tc_qualifier_to_module_or_self(mq_mod_name)
                         emit_line("{c_type_c_name_in(mq_sret, mq_callee_mod)} {mq_tmp} = {c_fn_name(mq_fn_name)}({mq_args_str});")
                         set_var_struct(mq_tmp, mq_sret)
@@ -3908,7 +3881,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
 
     emit_expr(obj_node)
     let obj_str = expr_result_str
-    // br kxe0s2: a container-retrieved Instant/Duration arrives here as CT_STRUCT plus the
+    // A container-retrieved Instant/Duration arrives here as CT_STRUCT plus the
     // struct NAME the carrier boxed it under — which is what makes Option[Duration] spell a
     // real typedef at all (builtin_struct_name_for_ct). The blocks that lower `.to_ms()` to
     // Duration_to_ms are gated on the flat CT alone, so without this recovery
@@ -4192,7 +4165,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
     }
 
-    // 4q2etk: replaced by mwxtyj — builtin scalar Display: display() -> Str
+    // Builtin scalar Display: display() -> Str
     // and fmt(sb) on Int/Float/Bool/Str/Char. Uses the same helpers as
     // string interpolation. A user trait impl on the builtin receiver wins
     // (it is intercepted earlier). Simple enums lower to CT_INT, so the
@@ -4236,8 +4209,8 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             } else if obj_type == CT_BOOL {
                 emit_line("blink_sb_write_bool({fmt_sb_str}, {obj_str});")
             } else if obj_type == CT_CHAR {
-                // blink_sb_write_char takes const char* (see br ticket for
-                // the Char-arg write_char bug); render via blink_char_to_str.
+                // blink_sb_write_char takes const char*, so render via
+                // blink_char_to_str.
                 emit_line("blink_sb_write({fmt_sb_str}, blink_char_to_str((int64_t){obj_str}));")
             } else {
                 emit_line("blink_sb_write({fmt_sb_str}, {obj_str});")
@@ -4271,21 +4244,21 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
 
         // --- Adapter methods: return CT_ITERATOR ---
 
-        // z9gkt3: the lazy ADAPTER HOFs .map/.filter/.take/.skip/.chain/.flat_map
+        // The lazy ADAPTER HOFs .map/.filter/.take/.skip/.chain/.flat_map
         // over a List[compound] route through per-carrier adapter iterators
         // (blink_MapIterator_Option_int, …) that deref the pointer-boxed carrier.
-        // 44xww4: .enumerate/.zip over a List[compound] now flow through the same
+        // .enumerate/.zip over a List[compound] now flow through the same
         // Tuple2-struct materialization as directly-constructed tuples — the pair's
         // compound slot rides the struct field's stype (Option_int), so .0/.1 access
         // and for (i,x) destructuring re-decode it with no extra plumbing.
 
-        // msm1k3: iter_from_source has NO struct/enum-name channel — it lowers a
+        // iter_from_source has NO struct/enum-name channel — it lowers a
         // struct-element list to blink_list_into_iter_void / blink_Option_void, so
         // c_type_tag(elem_type) spells the pair slot "void" and the Tuple2 field
         // erases (a silent cc miscompile). This is a pre-existing iter_from_source
         // limitation shared by EVERY HOF (map/collect/take/… over List[Struct] fail
-        // identically), not specific to enumerate/zip. Until msm1k3 gives
-        // iter_from_source a struct channel, fail LOUDLY here rather than emit a
+        // identically), not specific to enumerate/zip. Until iter_from_source gains
+        // a struct channel, fail LOUDLY here rather than emit a
         // confusing C error. Fires only for a DIRECT List whose element is a real
         // struct/enum (a compound carrier tag like Option_int is not a struct type,
         // so the compound path above is unaffected).
@@ -4310,23 +4283,23 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let elem_type = ifs_elem_type
             let carrier = ifs_carrier_tag
             if carrier != "" {
-                // z9gkt3: a compound source. The adapter derefs the boxed carrier
+                // A compound source. The adapter derefs the boxed carrier
                 // for the closure INPUT; its forward element keys on the closure
                 // RETURN (a scalar in the tested surface), carried as CT_INT in
                 // blink_Option_int exactly as the scalar map coerces every return
-                // to int64 (r1s7g2 re-derives the collect result type).
+                // to int64 (the collect path re-derives the same result type).
                 //
-                // s663bm: that int64 coercion is only sound for a single-register
+                // That int64 coercion is only sound for a single-register
                 // return (int64_t / double / const char* / int). A BY-VALUE
                 // multi-eightbyte return — a struct or a compound carrier
                 // (blink_Option_*, blink_Result_*) — is returned in RAX:RDX under
                 // SysV; the int64 cast captures only RAX and drops the payload
                 // eightbyte, so the collected element is garbage and the read-back
                 // deref segfaults. The SCALAR map path has the same latent bug
-                // (s663bm) but is shielded by a typecheck mismatch there; the
+                // but is shielded by a typecheck mismatch there; the
                 // compound path lost the old loud guard, so re-guard THIS case
-                // loudly rather than extend a silent miscompile. Remove once s663bm
-                // boxes the by-value return.
+                // loudly rather than extend a silent miscompile. Remove once the
+                // by-value return is boxed.
                 if map_ret_part.starts_with("blink_") {
                     diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "'.map' over a List of Option/Result elements with a by-value struct/compound closure return is not yet supported (br s663bm)", node, "return a scalar (Int/Bool/Str/Float) from the closure, or collect first then map")
                     expr_result_str = "0"
@@ -4364,7 +4337,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let elem_type = ifs_elem_type
             let carrier = ifs_carrier_tag
             if carrier != "" {
-                // z9gkt3: predicate takes the derefed carrier by value; the boxed
+                // The predicate takes the derefed carrier by value; the boxed
                 // carrier passes through unchanged, so the result element is still
                 // the compound. Store the carrier on the iterator var so a chained
                 // adapter or terminal collect/for-in re-decodes it.
@@ -4400,7 +4373,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let elem_type = ifs_elem_type
             let carrier = ifs_carrier_tag
             if carrier != "" {
-                // z9gkt3: no closure — forward the boxed carrier verbatim (only the
+                // No closure — forward the boxed carrier verbatim (only the
                 // typedef NAME differs from the scalar _int, so a same-TU scalar
                 // take can't collide). Carrier stored on the var for the downstream.
                 ensure_take_iter_c(carrier)
@@ -4473,7 +4446,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let src_b_var = ifs_iter_var
             let next_b = ifs_next_fn
             if carrier != "" {
-                // z9gkt3: both sources are the same List[compound] carrier and their
+                // Both sources are the same List[compound] carrier and their
                 // pointer iterators both yield blink_Option_int, so a single
                 // carrier-keyed chain iter forwards the boxed carrier verbatim. opt_t
                 // is blink_Option_int (from the compound iter_from_source) for both.
@@ -4508,7 +4481,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let elem_type = ifs_elem_type
             let carrier = ifs_carrier_tag
             if carrier != "" {
-                // z9gkt3: the callback takes the derefed carrier and returns a
+                // The callback takes the derefed carrier and returns a
                 // flattened List; the buffer elements are the flattened scalars
                 // (CT_INT slot in blink_Option_int), so the forward element is CT_INT
                 // — no compound carrier survives the flatten.
@@ -4539,7 +4512,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let src_next = ifs_next_fn
             let elem_type = ifs_elem_type
             let opt_t = ifs_opt_type
-            // 44xww4: enumerate() yields genuine (Int, T) tuples (spec §3.8/§3c).
+            // enumerate() yields genuine (Int, T) tuples (spec §3.8/§3c).
             // The pair materializes as a Tuple2_int_<T> struct so per-slot compound
             // metadata (.1 = Option/Result), .0/.1 field access, and for (i,x)
             // destructuring all flow through the tuple-struct infra — the compound
@@ -4585,7 +4558,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let elem_type_b = ifs_elem_type
             let opt_b = ifs_opt_type
             let carrier_b = ifs_carrier_tag
-            // 44xww4: zip() yields genuine (T, U) tuples (spec §3.8/§3c) — same
+            // zip() yields genuine (T, U) tuples (spec §3.8/§3c) — same
             // Tuple2 materialization as enumerate, one value slot per side.
             let result_list = fresh_temp("__zip_")
             let next_a_var = fresh_temp("__zip_na_")
@@ -4628,7 +4601,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             emit_line("{opt_t} {next_var} = (({opt_t} (*)(void*)){src_next})(&{src_var});")
             emit_line("if ({next_var}.tag == 0) break;")
             if elem_type == CT_INT {
-                // j0cdey: a compound element's `.value` is already the intptr_t to the
+                // A compound element's `.value` is already the intptr_t to the
                 // boxed carrier — push it through unchanged (keeps the pointer boxing);
                 // the result list's element type is re-stamped from the source below.
                 emit_line("blink_list_push({result_list}, (void*)(intptr_t){next_var}.value);")
@@ -4638,28 +4611,23 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             cg_indent = cg_indent - 1
             emit_line("}")
             if carrier != "" {
-                // z9gkt3: a direct List source has full element metadata to copy; a
+                // A direct List source has full element metadata to copy; a
                 // var-iterator source (a chained lazy adapter — filter().collect())
                 // carries only the carrier tag on its sname, so re-stamp from the tag.
-                // 1n9fhg: copy_list_compound_elem only has arms for the compound element kinds,
+                // copy_list_compound_elem only has arms for the compound element kinds,
                 // so a NAMED BY-VALUE element (struct/tuple/data enum) reaching it from a direct
-                // List source fell through its no_arm tail and left the result element erased.
+                // List source falls through its no_arm tail and leaves the result element erased.
                 // Its tag is the whole answer for those, so take the tag route regardless of the
                 // source shape.
                 if obj_type == CT_LIST && is_compound_tag(carrier) != 0 {
                     copy_list_compound_elem(obj_str, result_list)
-                    // br zaq1np: the copy reads its source by variable NAME, so a source that is
+                    // The copy reads its source by variable NAME, so a source that is
                     // not a variable — `b.items.collect()`, `make().collect()` — has no ScopeVar
                     // under that spelling and every arm reads a fabricated flat default instead
                     // (sv_tp turns a missing inner into type_int()), leaving this temp holding
                     // `Option[Int]`. The tid is indifferent to how the source is spelled, so it
                     // LEADS here and the copy's answer survives only where it declines — the same
-                    // ordering the codegen_stmt let-ladders use (br bef42x).
-                    //
-                    // This was the ONE copy_list_compound_elem call site with no stamp after it,
-                    // which is why an intervening `let` hid the bug: that ladder re-stamped the
-                    // element from the tid one statement later, and only a result consumed in the
-                    // same chain ever saw the erasure.
+                    // ordering the codegen_stmt let-ladders use.
                     stamp_list_elem_from_tid(obj_node, result_list)
                 } else {
                     set_list_elem_compound_from_tag(result_list, carrier)
@@ -4701,18 +4669,18 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 ensure_option_type(elem_ct)
                 let stdlib_name = "list_{method}"
                 let args_sl = node_args(node)
-                // 0n07he Step 2a: recover the element binder's concrete tid from the
+                // Recover the element binder's concrete tid from the
                 // receiver list (tc_tid_list_elem over the object node's memoized tid),
                 // carried through listop_slot_tid so an unencodable slot stores -1 rather
                 // than a tid nothing can spell. A -1 is NOT a string fallback — the
-                // def-side resolver passes the binder through unchanged (:347-354), which
+                // def-side resolver passes the binder through unchanged, which
                 // is I0001 on a return slot and erased C on a param slot. The reachable
                 // elements are scalars OR bare containers (List/Map/Set/Bytes) — the
                 // `elem_name != "Void"` guard above only excludes struct/enum
                 // (type_name_from_ct has no CT_STRUCT/CT_ENUM case → "Void"). Both
                 // admitted kinds are encodable, so the gate passes them; do NOT assume a
                 // scalar-only shape here (a List[List[Int]].fold carries elem_name
-                // "List"). Since br fsa9gf the gate no longer checks that the tid's
+                // "List"). The gate does not check that the tid's
                 // spelling MATCHES type_name_from_ct's, so nothing here reports a
                 // divergence between the two.
                 let elem_tid = tc_tid_list_elem(tc_lookup_node_tid(node_obj(node)))
@@ -4724,25 +4692,21 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                     emit_expr(sublist_get(args_sl, 1))
                     let fn_str = expr_result_str
                     let arg_tids = [listop_slot_tid(elem_tid), listop_slot_tid(init_tid)]
-                    // br e00ngd / br 3fc3pn: render from arg_tids, not from
-                    // "{elem_name},{init_name}". The init half was the live miscompile —
-                    // type_name_from_ct has no CT_STRUCT arm, so a struct accumulator
-                    // spelled "Void", and the seam's only erasure guard
+                    // Render from arg_tids, not from
+                    // "{elem_name},{init_name}". type_name_from_ct has no CT_STRUCT arm, so a
+                    // struct accumulator would spell "Void", and the seam's only erasure guard
                     // (`elem_name != "Void"` above) screens the ELEMENT and never the
-                    // INIT. Two folds with different struct accumulators therefore both
-                    // mangled blink_list_fold_Int_Void: `--emit c` exited 0 with no
-                    // diagnostic and the C compile then failed on the collapsed symbol.
-                    // init_tid was already in hand here and spells the accumulator
-                    // correctly.
+                    // INIT — two folds with different struct accumulators would both
+                    // mangle to blink_list_fold_Int_Void. init_tid is already in hand here and
+                    // spells the accumulator correctly.
                     let ta_str = mono_csv_from_arg_tids(arg_tids)
                     let mangled = mangle_generic_name(stdlib_name, ta_str)
                     register_mono_fn(stdlib_name, ta_str, arg_tids)
                     register_mono_instance(stdlib_name, ta_str, arg_tids)
-                    // br e00ngd, second defect at the same seam: the RESULT LOCAL's C type.
-                    // c_type_str has no CT_STRUCT arm (codegen_types.bl:5241-5270), so a
-                    // struct accumulator declared `void __fold_N` — a hard C error, and the
-                    // reason the fixture stayed red after the symbol was fixed. Spell it from
-                    // the SAME init segment the symbol was mangled from, so the local and the
+                    // The RESULT LOCAL's C type is the same seam's second defect.
+                    // c_type_str has no CT_STRUCT arm, so a
+                    // struct accumulator would declare `void __fold_N` — a hard C error. Spell
+                    // it from the SAME init segment the symbol was mangled from, so the local and the
                     // callee's return type cannot disagree by construction. `init_sname` is
                     // exactly `arg_tids`' slot-1 segment; a divergence here would be a
                     // divergence inside one expression.
@@ -4874,7 +4838,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let elem_type = ifs_elem_type
             let opt_t = ifs_opt_type
             let carrier = ifs_carrier_tag
-            // j0cdey: find over List[Option[T]] returns Option[Option[T]] — the found
+            // Find over List[Option[T]] returns Option[Option[T]] — the found
             // element (itself a compound) is pointer-boxed, so the result carries the
             // pointer in a struct-option keyed on the element carrier tag. The closure
             // predicate still receives the element by value (hof_elem_value derefs).
@@ -4956,11 +4920,11 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
 
     // Channel methods
     if obj_type == CT_CHANNEL {
-        // br hgd2az: the element type comes from the RECEIVER's tid, not from
+        // The element type comes from the RECEIVER's tid, not from
         // get_var_channel_inner — that flat field is stamped by looking an emitted C
         // expression up as a variable name and so reads CT_INT for every channel that was
         // constructed rather than passed in. A -1 here means the element is not spellable
-        // (an un-annotated `Channel(4)`, whose element nothing knows — br w3v2e6), and the
+        // (an un-annotated `Channel(4)`, whose element nothing knows), and the
         // pre-existing int64/pointer reinterpretation below stays in charge for those.
         let ch_tid = tc_lookup_node_tid(node_obj(node))
         let elem_ct = tc_channel_elem_ct(ch_tid)
@@ -4984,26 +4948,24 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 emit_line("*{box_tmp} = {val_str};")
                 emit_line("blink_channel_send({obj_str}, (void*){box_tmp});")
             } else {
-                // br w3v2e6: the SAME 8-byte payload the fallback used to send inline, put in a
+                // The SAME 8-byte payload the fallback sends, put in a
                 // box and sent as the box's address. The payload word is bit-for-bit what it
-                // was — `(void*)(intptr_t)x` for an Int, `(void*)x` for anything
-                // pointer-shaped — so every reinterpretation on the receive side is unchanged
-                // and this is not the element inference (that is w3v2e6's other half, and it is
-                // spec-blocked: bare `Channel(n)` is in no spec section, and 8vcj2c's E0301
-                // boundary may make an un-annotated element an error rather than something to
-                // infer from a later use).
+                // is — `(void*)(intptr_t)x` for an Int, `(void*)x` for anything
+                // pointer-shaped — so every reinterpretation on the receive side is unchanged.
+                // This is not the element-inference question — that is spec-blocked: bare
+                // `Channel(n)` is in no spec section, and the E0301 boundary may make an
+                // un-annotated element an error rather than something to infer from a later use.
                 //
-                // What changes is ONLY that the address is never NULL. Inline, `x == 0` sent
-                // NULL, which is blink_channel_recv's end-of-stream sentinel, so a sent 0 broke
-                // the for-in drain and took every value behind it — `send(5) send(0) send(7)`
-                // drained `5` and stopped. The drain's own comment claimed its NULL test was
-                // "only sound because send now boxes", which was true only on the elem_ct >= 0
-                // side above.
+                // What changes is ONLY that the address is never NULL. An unboxed `x == 0`
+                // would send NULL, which is blink_channel_recv's end-of-stream sentinel, so a
+                // sent 0 would break the for-in drain and take every value behind it —
+                // `send(5) send(0) send(7)` would drain `5` and stop. The drain's NULL test is
+                // sound only because send always boxes.
                 //
                 // The cast stays INSIDE the box assignment, and the box is `void*`, not
                 // `int64_t`, on purpose. A bare Float element is a loud `cc` error today
-                // ("cannot convert to a pointer type"); an int64_t box would have accepted the
-                // double and silently truncated it, trading a loud failure for a wrong value.
+                // ("cannot convert to a pointer type"); an int64_t box would accept the
+                // double and silently truncate it, trading a loud failure for a wrong value.
                 let payload = if val_type == CT_INT { "(void*)(intptr_t){val_str}" } else { "(void*){val_str}" }
                 let box_tmp = fresh_temp("__chbox_")
                 emit_line("void** {box_tmp} = (void**)blink_alloc(sizeof(void*));")
@@ -5020,7 +4982,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             if elem_ct >= 0 {
                 // The NULL case is a closed, empty channel, and it keeps today's answer —
                 // the element's zero value. What it SHOULD answer (an Option? a panic?) is
-                // br yzan52, a spec question about a documented concurrency primitive, and
+                // a spec question about a documented concurrency primitive, and
                 // not something a codegen fix gets to decide.
                 let val_tmp = fresh_temp("__recvv_")
                 let zero = if elem_ct == CT_STRUCT { "\{0}" } else { "0" }
@@ -5034,11 +4996,11 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 expr_result_type = elem_ct
                 return
             }
-            // br w3v2e6: the box the send fallback now writes, unwrapped back to the payload
-            // word before the pre-existing reinterpretation below reads it. Guarded, because
+            // The box the send fallback writes, unwrapped back to the payload
+            // word before the reinterpretation below reads it. Guarded, because
             // NULL here is a closed empty channel and dereferencing it would segfault where the
-            // old code answered the zero value — the same yzan52 answer the boxed branch above
-            // preserves, and not a codegen fix's decision to change.
+            // closed-channel case should instead answer the zero value — the same answer the
+            // boxed branch above preserves, and not a codegen fix's decision to change.
             let pay_tmp = fresh_temp("__chpay_")
             emit_line("void* {pay_tmp} = ({recv_tmp} == NULL) ? NULL : *(void**){recv_tmp};")
             let ch_inner = get_var_channel_inner(obj_str)
@@ -5150,8 +5112,8 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     // Ptr methods
     if obj_type == CT_PTR {
         if method == "deref" {
-            // br 0dtbe6: the POINTEE's CT, from the receiver's tid. This was CT_INT
-            // unconditionally, which read a `double` through an `int64_t` (1.5 printed as 1,
+            // The POINTEE's CT, from the receiver's tid. Reading it as CT_INT
+            // unconditionally read a `double` through an `int64_t` (1.5 printed as 1,
             // exit 0, no diagnostic) and made a struct pointee a `cc` error. A -1 means a bare
             // CT is not a complete answer for the pointee (a container, a nested Ptr, an
             // un-annotated allocation whose pointee nothing knows), and CT_INT stays in charge
@@ -5314,7 +5276,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                         set_list_elem_struct(val_tmp, nested_s)
                     }
                 } else {
-                    // whg65a: only when the flat channel is empty do we consult the
+                    // Only when the flat channel is empty do we consult the
                     // deep inner tp — this is the `List[Option[List[T]]]` element case
                     // where set_var_option_inner_tp stored the element and the flat
                     // inner2 slot was never populated.
@@ -5328,7 +5290,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                             set_list_elem_struct(val_tmp, les)
                         }
                     } else if stamp_binder_elems_from_node_if_unset(node, val_tmp) {
-                        // br fyat2w: the CT_INT floor below is sv_tp's fabrication written out
+                        // The CT_INT floor below is sv_tp's fabrication written out
                         // longhand, and it is reached exactly when both channels above are keyed on
                         // a receiver that has no ScopeVar — a call. `node` is the `.unwrap()`, whose
                         // tid IS the unwrapped List, so `Option[List[Pt]].unwrap()` stops handing
@@ -5360,14 +5322,14 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 if map_nested_s != "" {
                     set_map_value_struct(val_tmp, map_nested_s)
                 }
-                // wx184m: recover the scalar Map key+value types from the option's
+                // Recover the scalar Map key+value types from the option's
                 // struct tag (`Map_<ktag>_<vtag>`) so a later `.get(k)` returns the
                 // right Option[V]. Without this the value defaults to Int and the
                 // key to Str, breaking non-Int values (`?? "x"`) and non-Str keys.
                 // Scalar-only; list/struct value types stay on the paths above. The
                 // let-binding carries this onto the bound name via copy_map_value_meta.
                 //
-                // AL1's chained-call fallback (codegen_methods.bl:3630-3633) reads
+                // AL1's chained-call fallback reads
                 // expr_map_key_type/expr_map_val_type off THIS expression rather than
                 // re-deriving from val_tmp's scope var (a chained receiver like
                 // `lm.get(0).unwrap().get("x")` is never a ScopeVar Ident, so
@@ -5390,7 +5352,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                     expr_map_key_struct = ""
                     expr_map_val_struct = map_nested_s
                 }
-                // br m039bn: LAST, so the tid wins over all three recoveries above — every one
+                // LAST, so the tid wins over all three recoveries above — every one
                 // of them reaches back through the option carrier tag `Map_{ktag}_{vtag}`, whose
                 // value tag for a List value is the element-agnostic `list`, while `node` is the
                 // `.unwrap()` call whose tid IS the unwrapped Map with key and value whole.
@@ -5400,8 +5362,8 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 // and sv_tp floors the value to Int. That floor is indistinguishable from a
                 // genuine Map[Str, Int], which is why this is an authority flip and not a gated
                 // fill-in — the argument is written out on stamp_map_from_tid. It declines by
-                // itself for an Option/Map/Result value, whose flat channel does not exist yet
-                // (br dcjy17), leaving the recoveries above in charge of what it will not claim.
+                // itself for an Option/Map/Result value, whose flat channel does not exist yet,
+                // leaving the recoveries above in charge of what it will not claim.
                 //
                 // The expr_map_* globals are republished from what the stamp actually wrote
                 // because a chained receiver's fb_val_ct OVERRIDES the name-keyed lookup in
@@ -5427,7 +5389,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 } else {
                     set_var_option_struct(val_tmp, CT_INT, inner_s)
                 }
-                // whg65a: a `List` inner's element type can't ride the carrier tag
+                // A `List` inner's element type can't ride the carrier tag
                 // (`Option_list` is element-agnostic), so recover it from the source
                 // Option[Option[List]]'s stored deep tp (its child1 is the element
                 // Option[List], whose child1 is the List with its element). Only for
@@ -5442,18 +5404,18 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 }
                 expr_result_str = val_tmp
                 expr_result_type = CT_OPTION
-                // fcqfhf: refresh the option-inner ledger to describe the
+                // Refresh the option-inner ledger to describe the
                 // unwrapped result (one level shallower). Without this a chained
                 // `.unwrap().unwrap()` re-reads the stale outer-level struct tag
                 // and mis-emits the outer carrier for the second unwrap.
                 expr_option_inner = get_var_option_inner(val_tmp)
                 expr_option_inner_struct = get_var_option_inner_struct(val_tmp)
-                // whg65a: surface the unwrapped Option's deep inner tp (a nested
+                // Surface the unwrapped Option's deep inner tp (a nested
                 // Map/List) so the let-binding that captures `inner` re-stamps it —
                 // otherwise the flat set_var_option_struct rebind drops the element.
                 expr_option_inner_tp = get_var_option_inner_tp(val_tmp)
             } else if inner == CT_RESULT && inner_s != "" {
-                // gemr3z: Option[Result[T,E]].unwrap() -> Result[T,E]. The inner
+                // Option[Result[T,E]].unwrap() -> Result[T,E]. The inner
                 // Result carrier (inner_s = Result_<ok>_<err>) is pointer-boxed in the
                 // struct-option value; deref it and rebuild the Result ledger from the
                 // carrier tag so a downstream match/unwrap on the Result decodes ok/err.
@@ -5492,7 +5454,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 // Set carrier member is a bare blink_set* (c_type_str(CT_SET)), never
                 // boxed — mirror the CT_BYTES branch. Without this Option[Set].unwrap()
                 // falls to the scalar else and erases to CT_INT, so `.contains`/`.len`
-                // on the unwrapped set report unresolved-method (br 7s0vaj, mirror of
+                // on the unwrapped set report unresolved-method (mirror of
                 // the emit_result_unwrap_inner CT_SET seam).
                 ensure_option_type(CT_SET)
                 let opt_c = option_c_type(CT_SET)
@@ -5501,7 +5463,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 let val_tmp = fresh_temp("_ounv_")
                 emit_line("blink_set* {val_tmp} = {tmp}.value;")
                 set_var(val_tmp, CT_SET, 0)
-                // nprhy8: the flat inner2 / inner2_struct channels carry the Set's OWN
+                // The flat inner2 / inner2_struct channels carry the Set's OWN
                 // element (stamped by the CT_SET .get()/.pop() arms) — without threading
                 // them onto val_tmp here, a later for-in over the unwrapped set has no
                 // element recorded and either ICEs (Stage A.4) or, worse, misreads the
@@ -5514,7 +5476,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 if nested_s != "" {
                     set_set_elem_struct(val_tmp, nested_s)
                 }
-                // br fyat2w: both recoveries above are keyed on the RECEIVER's name, and a call
+                // Both recoveries above are keyed on the RECEIVER's name, and a call
                 // receiver is an expression with no ScopeVar — so an `oset().unwrap()` left the
                 // element unset, and a later for-in fell through to the stale expr_list_elem_*
                 // globals. That made the element depend on the last list-producing declaration
@@ -5618,12 +5580,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             expr_result_type = CT_STRING
             return
         }
-        // br pvhaew. @derive(Hash) registered, forward-declared and emitted
-        // {T}_hash but no arm ever called it, so `p.hash()` fell to the E0505
-        // backstop. kops calls the same symbol internally for struct-keyed
-        // Map/Set, which is why an emitted, load-bearing function was never
-        // callable by name. U64 per sections/03_types.md:2352 and the
-        // `uint64_t` the body actually returns.
+        // @derive(Hash) emits {T}_hash, the same symbol kops calls internally
+        // for struct-keyed Map/Set — an emitted, load-bearing function this arm
+        // makes callable by name too. U64 per sections/03_types.md:2352,
+        // matching the `uint64_t` the body returns.
         if method == "hash" {
             expr_result_str = "{derive_method_cname(derive_struct, "hash")}({obj_str})"
             expr_result_type = CT_U64
@@ -5639,7 +5599,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 return
             }
         }
-        // vfgp72: derived Ord.cmp -> Ordering. The result is a simple-enum value
+        // Derived Ord.cmp -> Ordering. The result is a simple-enum value
         // (int-repped); tag the temp as Ordering so a `let o = a.cmp(b)` binding
         // resolves variants in a following `match o`.
         if method == "cmp" {
@@ -5668,7 +5628,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     }
     let mut derive_enum = get_var_enum(obj_str)
     if derive_enum == "" {
-        // 1n9fhg: a plain (payload-less) enum value is an ordinal, so it can reach a method call
+        // A plain (payload-less) enum value is an ordinal, so it can reach a method call
         // with no name anywhere in the flat universe — `l.get(0).unwrap()` over a list of them is
         // VALUE-boxed on purpose (set_list_elem_struct), and the unwrap's temp is an int64_t. The
         // identity is still in typecheck's tid for the receiver, which is the one authority the
@@ -5691,7 +5651,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             expr_result_type = CT_STRING
             return
         }
-        // br pvhaew — see the struct branch.
+        // See the struct branch above.
         if method == "hash" {
             expr_result_str = "{derive_method_cname(derive_enum, "hash")}({obj_str})"
             expr_result_type = CT_U64
@@ -5712,7 +5672,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 return
             }
         }
-        // vfgp72: derived Ord.cmp on an enum -> Ordering (see struct branch).
+        // Derived Ord.cmp on an enum -> Ordering (see struct branch).
         if method == "cmp" {
             let args_sl = node_args(node)
             if args_sl != -1 && sublist_length(args_sl) > 0 {
@@ -5749,10 +5709,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     if struct_type == "" {
         struct_type = get_var_enum(obj_str)
     }
-    // 4q2etk: replaced by mwxtyj — synthesized sealed Display.display().
-    // Resolves before lookup_impl_method: E0731 guarantees the Display impl
-    // itself never defines display, and a display owned by a DIFFERENT impl
-    // block keeps the symbol (synthesis is skipped), so it falls through.
+    // Synthesized sealed Display.display(). Resolves before lookup_impl_method:
+    // E0731 guarantees the Display impl itself never defines display, and a
+    // display owned by a DIFFERENT impl block keeps the symbol (synthesis is
+    // skipped), so it falls through.
     if struct_type != "" && method == "display" {
         let disp_call = synthesized_display_call(struct_type, obj_str)
         if disp_call != "" {
@@ -5788,7 +5748,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                     }
                 }
                 expr_result_str = "(({cls_sig}){cls_ptr}->fn_ptr)({args_str})"
-                // br pdvrsj, the third copy of the string parse — closure-valued FIELD called in
+                // The third copy of the string parse — closure-valued FIELD called in
                 // method position (`h.f(4)`). Same tid lead as codegen_expr's two sites; a fix at
                 // one of the three leaves the other two, which is why all three shapes are pinned.
                 let ret_ct_tid = closure_ret_direct_ct(node)
@@ -5818,12 +5778,13 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
     }
 
-    // 66g7ep: a confirmed module-qualified call (`module.member`) that reached
+    // A confirmed module-qualified call (`module.member`) that reached
     // this backstop is a member that does not exist on the module — every real
     // member, intrinsic, and namespace handler above has already returned. Frame
     // it as a module-member error (not "method on type") and offer a did-you-mean.
-    // The scope-var / not-a-type guards mirror line 2320, so a local that shadows
-    // an import qualifier (e.g. `sb` vs `import std.sb`) keeps the generic message.
+    // The scope-var / not-a-type guards mirror the module-qualified call site above, so
+    // a local that shadows an import qualifier (e.g. `sb` vs `import std.sb`) keeps the
+    // generic message.
     if node_kind(obj_node) == NodeKind.Ident {
         let mm_name = node_name(obj_node)
         if is_scope_var(mm_name) == 0 && is_trait_type(mm_name) == 0 && is_struct_type(mm_name) == 0 && is_enum_type(mm_name) == 0 && is_import_module_name(mm_name) != 0 && is_intrinsic_method(mm_name, method) == 0 {
@@ -5843,11 +5804,13 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
 
     // Generic fallback — emit diagnostic and produce safe placeholder
     let recv_type_name = receiver_type_name_for_diag(obj_node, obj_type)
-    // br j2xxyd: `.display()` on a struct/enum with no `impl Display` lands
-    // here. Suggest the impl (per the 4q2etk Display design) instead of an
-    // empty help string; every other unresolved method keeps the bare help.
+    // `.display()` on a struct/enum with no `impl Display` lands here. Suggest
+    // the impl (per the synthesized Display design above) instead of an empty
+    // help string; every other unresolved method keeps the bare help.
     let fallback_help = if method == "display" && struct_type != "" {
         "add an `impl Display for {struct_type}` (with `fn fmt(self, sb: StringBuilder)`)"
+    } else if obj_type == CT_LIST {
+        tc_list_rename_help(method)
     } else {
         ""
     }

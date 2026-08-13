@@ -1,0 +1,140 @@
+// `List.append(other) -> List[T]` is the voted name for list concatenation.
+//
+// DECISIONS.md:187 fixes the 12-method List surface 3-2 and spells the operation `append`;
+// sections/03_types.md:361/:383 declares `fn append(self, other: List[T]) -> List[T]` with
+// `Mutates = no`. The implementation shipped the same operation under the name `concat`, so
+// the spec named a method that did not resolve. The name the spec voted wins.
+//
+// `Mutates = no` is load-bearing, not cosmetic: the receiver must be usable unchanged after
+// the call, and an immutable binding must be enough. `append` sits in two mutating-method
+// sets (src/mutation_analysis.bl, `pp_is_mutating_method`) that were dead while no `append`
+// existed — the immutable-receiver row is what keeps them from waking up wrong.
+
+import std.io
+import std.process.{ProcessResult}
+
+// The old name has to fail through a SUBPROCESS: a rejection row inside this file would stop
+// the whole file from compiling. `blink build` is the only front end that reports this
+// correctly — `blink check` certifies `xs.concat([2])` as ok, and `blinkc` prints the error
+// but exits 0 — so an exit-code assertion is only meaningful through `build`.
+fn s58_check(tag: Str, src: Str) -> ProcessResult {
+    let bl_path = ".tmp/_s58gjs_{tag}.bl"
+    write_file(bl_path, src)
+    let r = process_run("build/blink", ["build", bl_path, "--format", "json"])
+    shell_exec("rm -f {bl_path} build/_s58gjs_{tag}")
+    r
+}
+
+test "append returns a list holding both sides in order" {
+    let xs: List[Int] = [1, 2]
+    let ys = xs.append([3, 4])
+    if ys.len() != 4 { io.println("FAIL: len — got {ys.len()}, want 4") }
+    assert_eq(ys.len(), 4)
+    assert_eq(ys.get(0).unwrap(), 1)
+    assert_eq(ys.get(1).unwrap(), 2)
+    assert_eq(ys.get(2).unwrap(), 3)
+    assert_eq(ys.get(3).unwrap(), 4)
+}
+
+test "append leaves the receiver unchanged" {
+    let xs: List[Int] = [1, 2]
+    let ys = xs.append([3])
+    if xs.len() != 2 { io.println("FAIL: receiver mutated — len {xs.len()}, want 2") }
+    assert_eq(xs.len(), 2)
+    assert_eq(ys.len(), 3)
+}
+
+// Mutates = no, so no `mut` may be demanded of the receiver.
+test "append accepts an immutable receiver" {
+    let xs: List[Int] = [7]
+    let ys = xs.append([8])
+    assert_eq(ys.len(), 2)
+    assert_eq(ys.get(1).unwrap(), 8)
+}
+
+test "append onto an empty list yields the argument" {
+    let xs: List[Int] = []
+    let ys = xs.append([5, 6])
+    assert_eq(ys.len(), 2)
+    assert_eq(ys.get(0).unwrap(), 5)
+}
+
+test "appending an empty list yields a copy of the receiver" {
+    let xs: List[Int] = [9]
+    let empty: List[Int] = []
+    let ys = xs.append(empty)
+    assert_eq(ys.len(), 1)
+    assert_eq(ys.get(0).unwrap(), 9)
+}
+
+test "append chains" {
+    let xs: List[Int] = [1]
+    let ys = xs.append([2]).append([3])
+    assert_eq(ys.len(), 3)
+    assert_eq(ys.get(2).unwrap(), 3)
+}
+
+test "append carries Str elements" {
+    let xs: List[Str] = ["a"]
+    let ys = xs.append(["b", "c"])
+    assert_eq(ys.len(), 3)
+    assert_eq(ys.join(","), "a,b,c")
+}
+
+test "append result is a real list, not an iterator" {
+    let xs: List[Int] = [2, 1]
+    let ys = xs.append([3])
+    // The `-> Int` is mandatory: a closure literal with no declared return type is typed
+    // Void and yields garbage through a HOF (filed separately).
+    let sum = ys.fold(0, fn(acc, v) -> Int { acc + v })
+    assert_eq(sum, 6)
+}
+
+// ── The old name is gone, and says where it went ──────────────────────────────
+
+test "the old List concat spelling is rejected" {
+    let r = s58_check("oldname", #"fn main() {
+    let xs: List[Int] = [1]
+    let ys = xs.concat([2])
+    io.println("{ys.len()}")
+}
+"#)
+    let out = "{r.out}{r.err_out}"
+    if r.exit_code == 0 { io.println("FAIL: List.concat still accepted") }
+    assert(r.exit_code != 0)
+    if !out.contains("UnresolvedMethod") { io.println("FAIL: want UnresolvedMethod, got: {out}") }
+    assert(out.contains("UnresolvedMethod"))
+}
+
+// A rename that breaks working code has to say what to write instead, or the reader is left
+// guessing which of the transforming methods took over.
+test "the rejection names append as the replacement" {
+    let r = s58_check("oldhint", #"fn main() {
+    let xs: List[Int] = [1]
+    let ys = xs.concat([2])
+    io.println("{ys.len()}")
+}
+"#)
+    let out = "{r.out}{r.err_out}"
+    if !out.contains("append") { io.println("FAIL: diagnostic must point at append, got: {out}") }
+    assert(out.contains("append"))
+}
+
+// ── Controls: `concat` stays the verb for the scalar sequences ────────────────
+
+test "Str concat is unaffected by the List rename" {
+    let a = "ab"
+    let b = a.concat("cd")
+    assert_eq(b, "abcd")
+}
+
+test "Bytes concat is unaffected by the List rename" {
+    let mut x = Bytes.new()
+    x.push(65)
+    let mut y = Bytes.new()
+    y.push(66)
+    let z = x.concat(y)
+    assert_eq(z.len(), 2)
+    assert_eq(z.get(0).unwrap(), 65)
+    assert_eq(z.get(1).unwrap(), 66)
+}

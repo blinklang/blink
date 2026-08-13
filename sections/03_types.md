@@ -219,7 +219,7 @@ let path = segments.join("/")            // "usr/local/bin"
 // Building up dynamically
 let mut lines: List[Str] = []
 for user in users {
-    lines = lines.append("{user.name}: {user.email}")
+    lines.push("{user.name}: {user.email}")
 }
 let report = lines.join("\n")
 ```
@@ -359,12 +359,13 @@ trait ListOps[T] {
 
     // Transformation (returns new list)
     fn append(self, other: List[T]) -> List[T]
+    fn slice(self, start: Int, end: Int) -> List[T]
     fn reverse(self) -> List[T]
     fn sort(self) -> List[T]
 }
 ```
 
-The full `List[T]` method surface (13 methods from `ListOps` + 2 from `Sized` + 1 from `Contains`):
+The full `List[T]` method surface (13 methods from `ListOps` + 2 from `Sized` + 1 from `Contains`, plus `join` from `Joinable`):
 
 | Method | Signature | Mutates | Notes |
 |--------|-----------|---------|-------|
@@ -381,6 +382,8 @@ The full `List[T]` method surface (13 methods from `ListOps` + 2 from `Sized` + 
 | `remove` | `fn(self, Int) -> T` | yes | Remove at index, shift left |
 | `clear` | `fn(self)` | yes | Reset to empty, retains capacity |
 | `append` | `fn(self, List[T]) -> List[T]` | no | Concatenate, returns new list |
+| `slice` | `fn(self, Int, Int) -> List[T]` | no | Sub-list `[start, end)`, returns new list |
+| `join` | `fn(self, Str) -> Str` | no | Join with a separator — `List[Str]` only, via `Joinable` (§3.2.1) |
 | `reverse` | `fn(self) -> List[T]` | no | Reversed copy |
 | `sort` | `fn(self) -> List[T]` | no | Sorted copy (requires `T: Ord`) |
 
