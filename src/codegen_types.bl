@@ -4652,6 +4652,75 @@ pub fn closure_ret_ct(ret_part: Str) -> Int {
     CT_VOID
 }
 
+// br pdvrsj. A closure CALL's result type, read from the type typecheck memoized on the call
+// node instead of re-parsed out of the emitted C signature string.
+//
+// The string above recognizes four spellings and answers CT_VOID for everything else, with the
+// `Option_*`/`Result_*`/struct-name reseat paths in codegen_expr rescuing the compounds whose C
+// name happens to NAME their Blink type. Nothing recognizes `blink_list*`, `blink_map*`,
+// `blink_set*` or `blink_bytes*`, because those spellings are shared by every instantiation —
+// so a container-returning closure typed its call result Void, and the correctness of a return
+// type depended on a coincidence of C naming.
+//
+// -1 means "typecheck memoized nothing here", which is the only case the string parse still has
+// to cover. It is NOT the same as CT_VOID: tc_tid_ct answers -1 for a Void tid too, and a
+// void-returning closure must keep reaching the string path that spells it.
+pub fn closure_ret_tid(node: Int) -> Int {
+    let raw = tc_lookup_node_tid(node)
+    if raw == -1 { return -1 }
+    tc_tid_subst_mono(raw, cg_mono_tparams_sl, cg_mono_arg_tids)
+}
+
+// The tid-led head CT for a closure call result. Seating the head CT is the WHOLE job for every
+// kind except the four below: a scalar needs nothing else, and a container's value is one shared
+// runtime pointer whose element types are recovered downstream from this same tid (the let
+// ladder's stamp_*_from_tid last resorts, keyed on the RHS node).
+//
+// The three exclusions are the kinds that need more than a CT and therefore keep the existing
+// reseat paths: Option and Result must register a per-instantiation carrier typedef and emit a
+// temp to hold it, and Struct must attach a NAME to a temp (the CT alone does not say which
+// struct). Those paths are string-driven and stay so until Stage 4 retires them; this function is
+// deliberately not the place to reimplement them.
+//
+// CT_ENUM is NOT excluded, and that is measured rather than assumed. An enum's C spelling is its
+// typedef name, so seating the head CT is enough for both the declaration and the match — the
+// remaining half of the enum failure was the CALL's fn-ptr cast, which is closure_lit_ret_c's job
+// below, not this one.
+//
+// Not a list of the kinds that were REPORTED broken. The string parse spelled four C types and
+// erased everything else, so `Char` (int32_t), `I32`, `StringBuilder`, `Channel` and the four
+// containers all failed alike — a whitelist of the reported ones would have left the rest, which
+// is how this defect stayed alive through several closure fixes.
+pub fn closure_ret_direct_ct(node: Int) -> Int {
+    let tid = closure_ret_tid(node)
+    if tid == -1 { return -1 }
+    let ct = tc_tid_ct(tid)
+    if ct == CT_OPTION || ct == CT_RESULT || ct == CT_STRUCT { return -1 }
+    ct
+}
+
+// br pdvrsj, the other half of the same defect. The C return spelling of a closure LITERAL, read
+// off the Fn tid — "" when there is no tid or it does not name a Fn.
+//
+// A closure call is emitted as `((sig)cls->fn_ptr)(cls, args..)`, so a correct result type is only
+// half the job: the CAST has to name the same C type. codegen_closures builds that sig from the
+// literal's own annotation names, and its return spelling is a three-way string chain
+// (`closure_ret_struct`, `resolve_ret_type_from_ann`, `c_type_str(type_from_name(name))`) whose
+// last arm answers `void` for every kind c_type_str cannot spell. So an enum-returning closure
+// declared the result correctly (`const blink_E e = ..`) and then cast the call through
+// `void(*)(..)`, which gcc rejects outright — a wrong cast, not a wrong type.
+//
+// This spells the return the way c_type_from_tid spells every other position. It DECLINES rather
+// than half-spelling for closure_sig_from_tid's reason: the string it feeds is a cast, so a
+// half-answer either fails to compile or compiles against the wrong ABI.
+pub fn closure_lit_ret_c(node: Int) -> Str {
+    let raw = tc_lookup_node_tid(node)
+    if raw == -1 { return "" }
+    let t = tc_tid_resolved(tc_tid_subst_mono(raw, cg_mono_tparams_sl, cg_mono_arg_tids))
+    if tc_tid_ct(t) != CT_CLOSURE { return "" }
+    c_type_from_tid(tc_tid_child(t, 0))
+}
+
 pub fn resolve_struct_from_c_name(cname: Str) -> Str {
     if struct_reg_set.contains_key(cname) { return cname }
     let mut i = 0

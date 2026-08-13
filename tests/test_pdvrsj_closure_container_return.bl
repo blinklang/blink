@@ -1,0 +1,329 @@
+// br pdvrsj: a closure whose return type is a CONTAINER is callable, but the call RESULT is typed
+// Void by codegen, so every method on it draws UnresolvedMethod and a for-in over it reaches the
+// fail-closed iterable tripwire:
+//
+//     let l = fn(n: Int) -> List[Int] { [n, n + 1] }
+//     let lv = l(4)
+//     lv.len()          // error[UnresolvedMethod]: unresolved method '.len' on type List[Int]
+//     for e in lv {}    // internal compiler error[UnhandledIterableAtCodegen]: for-in over 'Void'
+//
+// The first message is the tell: it PRINTS `List[Int]`, because that backstop's receiver name is
+// TID-derived while the decision that got it there is flat-derived. The tid and the flat view
+// disagree in one breath — a Stage-3 divergence cell of the tid-collapse plan.
+//
+// ROOT CAUSE. The result type is not read from the callee's type at all. It is recovered by
+// RE-PARSING the emitted C signature string: closure_ret_ct (codegen_types.bl) recognizes exactly
+// four spellings — int64_t, double, const char*, int — and answers CT_VOID for everything else,
+// with reseat_from_closure_ret_tag (codegen_expr.bl) rescuing only the compound cases whose C name
+// is self-describing (`Option_*`, `Result_*`, a resolvable struct name). Nothing recognizes
+// blink_list*, blink_map*, blink_set* or blink_bytes*. So the correctness of a return type depended
+// on whether its C spelling happens to name its Blink type — which is why the scalar, struct,
+// Option, Result and tuple controls below all passed before the fix and the containers did not.
+//
+// Every row runs in a SUBPROCESS: the failure is a compile error, so an in-file row could not be
+// red — the whole test file would fail to compile.
+//
+// Three emitters consume the answer and all three were wrong, so the shapes are not
+// interchangeable: a closure called by name (codegen_expr, the `l(4)` rows), a closure-valued
+// EXPRESSION called (codegen_expr's second site, the `h.f(4)` row), and the method-position
+// backstop in codegen_methods. A fix at one site leaves the other two.
+//
+// TUPLE IS A CONTROL, NOT A CASE. The ticket listed Tuple among the broken kinds; it was already
+// correct, because a tuple's C spelling IS its typedef name and resolve_struct_from_c_name
+// therefore recognized it. Measured, both bare and with a container inside, and pinned here.
+
+import std.process.{ProcessResult}
+
+fn run_src(tag: Str, src: Str) -> ProcessResult {
+    let bl_path = ".tmp/_pdvrsj_{tag}.bl"
+    let bin = ".tmp/_pdvrsj_{tag}"
+    write_file(bl_path, src)
+    let build = process_run("build/blink", ["build", bl_path, "-o", bin])
+    if build.exit_code != 0 {
+        shell_exec("rm -f {bl_path}")
+        return build
+    }
+    let r = process_run(bin, [])
+    shell_exec("rm -f {bl_path} {bin}")
+    r
+}
+
+fn expect_out(tag: Str, src: Str, want: Str) {
+    let r = run_src(tag, src)
+    if r.exit_code != 0 { io.println("FAIL[{tag}] exit={r.exit_code}\n{r.err}{r.out}") }
+    assert_eq(r.exit_code, 0)
+    if !r.out.contains(want) { io.println("FAIL[{tag}] want '{want}' in output, got: {r.out}") }
+    assert(r.out.contains(want))
+}
+
+// ── The four container kinds the string parser could not spell ──────────────────
+
+test "a closure returning List is callable and its result is a List" {
+    expect_out("list", #"fn main() {
+    let l = fn(n: Int) -> List[Int] { [n, n + 1] }
+    let lv = l(4)
+    io.println("n={lv.len()}")
+}
+"#, "n=2")
+}
+
+// The element type, not just the head. A fix that recovered CT_LIST but erased the element to Int
+// (sv_tp's fabrication, the failure mode this whole plan exists to kill) prints garbage here.
+test "the returned List's element type survives" {
+    expect_out("listelem", #"fn main() {
+    let l = fn(n: Int) -> List[Str] { ["a", "b"] }
+    let lv = l(4)
+    io.println("s={lv.get(0).unwrap().concat("!")}")
+}
+"#, "s=a!")
+}
+
+test "a closure returning Map is callable and keeps key and value types" {
+    expect_out("map", #"fn main() {
+    let l = fn(n: Int) -> Map[Str, Int] {
+        let mut m: Map[Str, Int] = Map()
+        m.insert("a", n)
+        m
+    }
+    let mv = l(4)
+    io.println("n={mv.len()} v={mv.get("a").unwrap()}")
+}
+"#, "n=1 v=4")
+}
+
+test "a closure returning Set is callable and keeps its element type" {
+    expect_out("set", #"fn main() {
+    let l = fn(n: Int) -> Set[Int] {
+        let mut s: Set[Int] = Set()
+        s.insert(n)
+        s
+    }
+    let sv = l(4)
+    io.println("n={sv.len()} has={sv.contains(4)}")
+}
+"#, "n=1 has=true")
+}
+
+test "a closure returning Bytes is callable" {
+    expect_out("bytes", #"fn main() {
+    let l = fn(n: Int) -> Bytes { Bytes.from_str("abc") }
+    let bv = l(4)
+    io.println("n={bv.len()}")
+}
+"#, "n=3")
+}
+
+// Depth 2. The flat pair (CT, sname) cannot hold this at all, which is the plan's thesis; the row
+// is here so that a fix reading only one level off the tid does not pass.
+test "a closure returning a nested container keeps the inner element" {
+    expect_out("nested", #"fn main() {
+    let l = fn(n: Int) -> List[List[Int]] { [[n], [n + 1, n + 2]] }
+    let lv = l(4)
+    io.println("outer={lv.len()} inner={lv.get(1).unwrap().len()}")
+}
+"#, "outer=2 inner=2")
+}
+
+// ── The kinds the four-spelling parse erased that the ticket did not name ────────
+//
+// Found by probing the kinds ADJACENT to the reported ones rather than by reading the ticket. A
+// first fix keyed on CT_LIST/CT_MAP/CT_SET/CT_BYTES passed every row above and left all of these
+// broken — `Char` emitted `const void c = ((int32_t(*)(..))..)`, StringBuilder and Channel drew
+// UnresolvedMethod — because the defect was never about containers. It was about the parse
+// spelling four C types and erasing every other kind alike, which is how it survived several
+// closure fixes.
+
+test "a closure returning Char is callable" {
+    expect_out("char", #"fn main() {
+    let l = fn(n: Int) -> Char { 'x' }
+    io.println("c={l(4)}")
+}
+"#, "c=x")
+}
+
+test "a closure returning a sized int is callable" {
+    expect_out("i32", #"fn main() {
+    let l = fn(n: Int) -> I32 { n.to_i32() }
+    io.println("v={l(4)}")
+}
+"#, "v=4")
+}
+
+test "a closure returning StringBuilder is callable" {
+    expect_out("sb", #"fn main() {
+    let l = fn(n: Int) -> StringBuilder {
+        let sb = StringBuilder.new()
+        sb.write("x")
+        sb
+    }
+    io.println("s={l(4).to_str()}")
+}
+"#, "s=x")
+}
+
+test "a closure returning Channel is callable" {
+    expect_out("chan", #"fn main() {
+    let l = fn(n: Int) -> Channel[Int] {
+        let c: Channel[Int] = Channel(1)
+        c.send(n)
+        c
+    }
+    io.println("v={l(7).recv()}")
+}
+"#, "v=7")
+}
+
+// An enum needed BOTH halves. Seating the result type fixed the declaration and the match, and
+// the call still cast through `void(*)(..)` — the closure LITERAL's sig builder spells its return
+// from a three-way string chain whose last arm answers `void` for every kind c_type_str cannot
+// spell, so gcc rejected the cast on a declaration that was already correct.
+test "a closure returning an enum is callable and matchable" {
+    expect_out("enum", #"type E { A, B }
+fn main() {
+    let l = fn(n: Int) -> E { E.A }
+    let e = l(4)
+    match e { A => io.println("a") B => io.println("b") }
+}
+"#, "a")
+}
+
+test "a closure returning a payload-carrying enum keeps its payload" {
+    expect_out("denum", #"type E { A(x: Int), B }
+fn main() {
+    let l = fn(n: Int) -> E { E.A(x: n) }
+    let e = l(4)
+    match e { A(x) => io.println("a={x}") B => io.println("b") }
+}
+"#, "a=4")
+}
+
+test "a closure returning a List of enums is callable" {
+    expect_out("lenum", #"type E { A, B }
+fn main() {
+    let l = fn(n: Int) -> List[E] { [E.A, E.B] }
+    io.println("n={l(4).len()}")
+}
+"#, "n=2")
+}
+
+// ── The second symptom: the fail-closed for-in tripwire ─────────────────────────
+
+test "for-in over a closure's List result finds a loop emitter" {
+    expect_out("forin", #"fn main() {
+    let l = fn(n: Int) -> List[Int] { [n, n + 1] }
+    let lv = l(4)
+    let mut sum = 0
+    for e in lv { sum = sum + e }
+    io.println("sum={sum}")
+}
+"#, "sum=9")
+}
+
+// ── The three emitters ─────────────────────────────────────────────────────────
+
+// No intermediate let: the method call reads the expr globals the call site just seated, rather
+// than a ScopeVar the let path stamped.
+test "a method chained straight onto the call result works" {
+    expect_out("chain", #"fn main() {
+    let l = fn(n: Int) -> List[Int] { [n, n + 1] }
+    io.println("n={l(4).len()}")
+}
+"#, "n=2")
+}
+
+test "a closure PARAM called inside the callee returns a usable container" {
+    expect_out("param", #"fn apply(f: fn(Int) -> List[Int]) -> Int {
+    let r = f(4)
+    r.len()
+}
+fn main() {
+    io.println("n={apply(fn(n: Int) -> List[Int] { [n, n + 1] })}")
+}
+"#, "n=2")
+}
+
+test "a closure read out of a container returns a usable container" {
+    expect_out("fromlist", #"fn main() {
+    let fs: List[fn(Int) -> List[Int]] = [fn(n: Int) -> List[Int] { [n, n + 1] }]
+    let h = fs.get(0).unwrap()
+    let r = h(4)
+    io.println("n={r.len()}")
+}
+"#, "n=2")
+}
+
+// Method position: `h.f(4)` is not a bare-name call, so it lands in the codegen_methods emitter —
+// the third of the three sites, with its own copy of the string parse.
+test "a closure-valued struct field called in method position returns a usable container" {
+    expect_out("fieldcall", #"type H { f: fn(Int) -> List[Int] }
+fn main() {
+    let h = H { f: fn(n: Int) -> List[Int] { [n, n + 1] } }
+    let r = h.f(4)
+    io.println("n={r.len()}")
+}
+"#, "n=2")
+}
+
+// ── Controls: the kinds whose C spelling happened to name their Blink type ──────
+
+test "control: scalar returns still work" {
+    expect_out("scalars", #"fn main() {
+    let i = fn(n: Int) -> Int { n + 1 }
+    let f = fn(n: Int) -> Float { 1.5 }
+    let s = fn(n: Int) -> Str { "s{n}" }
+    let b = fn(n: Int) -> Bool { n > 0 }
+    io.println("i={i(4)} f={f(4)} s={s(4)} b={b(4)}")
+}
+"#, "i=5 f=1.5 s=s4 b=true")
+}
+
+test "control: Option and Result returns still work" {
+    expect_out("optres", #"fn main() {
+    let o = fn(n: Int) -> Option[Int] { Some(n) }
+    let r = fn(n: Int) -> Result[Int, Str] { Ok(n) }
+    io.println("o={o(4).unwrap()} r={r(4).unwrap()}")
+}
+"#, "o=4 r=4")
+}
+
+// An Option whose INNER is a container already worked, because the recovery keyed on `Option_*`
+// and the carrier tag carried the inner. Pinned so the tid path does not regress it.
+test "control: an Option-of-container return still works" {
+    expect_out("optlist", #"fn main() {
+    let l = fn(n: Int) -> Option[List[Int]] { Some([n, n + 1]) }
+    let ov = l(4)
+    io.println("n={ov.unwrap().len()}")
+}
+"#, "n=2")
+}
+
+test "control: a struct return still works" {
+    expect_out("struct", #"type W { v: Int }
+fn main() {
+    let l = fn(n: Int) -> W { W { v: n } }
+    let wv = l(4)
+    io.println("v={wv.v}")
+}
+"#, "v=4")
+}
+
+// The ticket's mistaken case. A tuple's C spelling IS its typedef name, so it was already
+// recognized — including with a container inside it.
+test "control: a tuple return already worked, bare and with a container inside" {
+    expect_out("tuple", #"fn main() {
+    let t = fn(n: Int) -> (Int, Str) { (n, "x") }
+    let u = fn(n: Int) -> (Int, List[Int]) { (n, [n, n + 1]) }
+    let tv = t(4)
+    let uv = u(4)
+    io.println("a={tv.0} b={tv.1} c={uv.0} d={uv.1.len()}")
+}
+"#, "a=4 b=x c=4 d=2")
+}
+
+test "control: a Void-returning closure is still a statement" {
+    expect_out("void", #"fn main() {
+    let p = fn(n: Int) { io.println("p={n}") }
+    p(4)
+}
+"#, "p=4")
+}

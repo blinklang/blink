@@ -9441,6 +9441,121 @@ cells identical on a common-file basis (996 mono / 927 archive-linked common fil
 `9` from the excluded `test_rndevw` root. Nine is the number of new `let` bindings the two arms
 introduce: this fix's own declarations, measured while the compiler compiles itself.
 
+## The return type that was recovered by re-reading the C (br `pdvrsj`)
+
+A closure whose return type is a container is callable, and the call RESULT is typed `Void`:
+
+    let l = fn(n: Int) -> List[Int] { [n, n + 1] }
+    let lv = l(4)
+    lv.len()          // error[UnresolvedMethod]: unresolved method '.len' on type List[Int]
+    for e in lv {}    // internal compiler error[UnhandledIterableAtCodegen]: for-in over 'Void'
+
+The first message is the whole plan in one line. It PRINTS `List[Int]`, because that backstop's
+receiver name is tid-derived while the decision that reached it is flat-derived: the two authorities
+disagree inside a single diagnostic.
+
+The result type was never read from the callee's type at all. It was recovered by RE-PARSING the
+emitted C signature string. `closure_ret_ct` (`src/codegen_types.bl:4647`) recognizes exactly four
+spellings — `int64_t`, `double`, `const char*`, `int` — and answers `CT_VOID` for everything else;
+`reseat_from_closure_ret_tag` (`src/codegen_expr.bl:339`) rescues only the compounds whose C name
+happens to NAME their Blink type (`Option_*`, `Result_*`, a `resolve_struct_from_c_name` hit).
+Nothing recognizes `blink_list*`, `blink_map*`, `blink_set*` or `blink_bytes*` — those spellings are
+shared by every instantiation, so they are unrecoverable from the string by construction. **The
+correctness of a return type depended on a coincidence of C naming.**
+
+Three emitters consume that answer, each with its own copy of the parse: a closure called by name
+(`codegen_expr.bl:~5155`), a closure-valued EXPRESSION called (`codegen_expr.bl:~5396`), and a
+closure-valued FIELD called in method position (`codegen_methods.bl:~5790`, `h.f(4)`). The second
+one was wrong in the opposite direction — an unrecognized `blink_*` return fell to a blanket
+`CT_STRUCT`, not to `CT_VOID` — so both arms of the same string chain were guessing. A fix at one
+site leaves the other two, which is why all three shapes are pinned as rows.
+
+`closure_ret_direct_ct` seats the head CT from the tid the type checker already memoized on the call
+node. Seating the HEAD is the whole job, and that is measured rather than assumed: the let ladder in
+`codegen_stmt` already carries tid last-resorts keyed on the RHS node (`stamp_list_elem_from_tid`,
+`recover_list_elem_from_tid`, the `mv45y5` `CT_SET` branch, `apply_map_binding_meta`), every one of
+them gated on the head `val_type` being right. Fixing the head let the existing machinery recover
+the elements — including at depth 2, `List[List[Int]]`, which the flat pair cannot hold at all.
+
+### Why the predicate is an exclusion and not a list
+
+The first version keyed on `CT_LIST`/`CT_MAP`/`CT_SET`/`CT_BYTES` — the kinds the ticket named. It
+passed every row written from the ticket. Probing the ADJACENT kinds is what found it too narrow:
+
+    -> Char           const void c = ((int32_t(*)(const blink_closure*, int64_t))l->fn_ptr)(l, 4);
+    -> StringBuilder  error[UnresolvedMethod]
+    -> Channel[Int]   error[UnresolvedMethod]
+
+The defect was never about containers. The parse spelled four C types and erased every other kind
+alike, so `Char`, `I32`, `StringBuilder`, `Channel`, the four containers and the enums all failed
+together — and a whitelist of the reported ones would have left the rest, which is how this survived
+several closure fixes. The predicate is now the complement: the tid answers for every kind EXCEPT
+`CT_OPTION`, `CT_RESULT` and `CT_STRUCT`, which need more than a CT (a per-instantiation carrier
+typedef and a temp, or a NAME attached to a temp) and keep the string-driven reseat until Stage 4
+retires it.
+
+### The half that a CT cannot fix
+
+An enum needed both halves, and the second one is not a type — it is a cast. With the result type
+seated, an enum return DECLARED correctly and still failed to compile:
+
+    const blink_E e = ((void(*)(const blink_closure*, int64_t))l->fn_ptr)(l, 4);
+    //                  ^ gcc: void value not ignored as it ought to be
+
+A closure call is emitted as `((sig)cls->fn_ptr)(cls, args..)`, so the cast has to name the same C
+type the declaration does. `codegen_closures` builds that sig from the literal's own annotation
+names, and its return spelling is a three-way string chain ending in
+`c_type_str(type_from_name(name))` — which answers `void` for every kind `c_type_str` cannot spell,
+not just for a genuine `Void`. `closure_lit_ret_c` spells it from the closure node's own `Fn` tid and
+is ordered LAST, for `0rmamy`'s reason: the three string arms keep every return they can spell, the
+tid fills in only where they said `void`, and a genuine `Void` return reaches it and gets `void`
+again, so the override is a no-op there.
+
+One arm was written, measured and REVERTED: the same tid lead on the enum branch of the closure
+DEFINITION's return spelling (`codegen_closures.bl:1000`). Every probe was byte-identical without
+it, because `resolve_ret_type_from_ann` already answers for the shape that arm would have corrected.
+An unexercised arm is a liability in a file this size, so it is not in the tree.
+
+### What is a control, and what is a separate ticket
+
+The ticket listed `Tuple` among the broken kinds. It was already correct — a tuple's C spelling IS
+its typedef name, so `resolve_struct_from_c_name` recognized it — measured both bare and with a
+container inside (`(Int, List[Int])`), and pinned as a control rather than silently dropped.
+
+Two shapes are still broken and are neither this cell's cause nor its fix:
+
+- **br `wj9bvn`** — a closure returning a generic-enum INSTANCE (`-> Tree[Int]`) emits no typedef for
+  it: `blink_Tree` (the def line and the variant literal, the bare base) and `blink_Tree_0Int` (the
+  declaration and the cast, the instance) are both undeclared. Measured RED on the pre-`pdvrsj`
+  compiler too, so it is pre-existing; the payload-less and payload-carrying non-generic enums both
+  work and are pinned.
+- **br `gp4s8a`** — `fn(n: Int) -> I32 { 7 }` draws `error[TypeError]: return value type Int does not
+  match function 'closure' return type I32`. An int-literal coercion gap; `n.to_i32()` compiles, and
+  that is the form the sized-int row uses.
+
+### Red, green, and why the corpus said nothing
+
+18 of the 24 rows are red on the pre-fix compiler (measured by stashing the change and rebuilding),
+and the 6 that pass are exactly the controls. All 24 pass after. Every row runs its program in a
+SUBPROCESS: the failures are compile errors, so an in-file row could not be red — the whole test
+file would fail to compile.
+
+The corpus never exercised the broken shape. `tests/test_fn_type_params.bl:12` has
+`fn apply_list(f: fn(Int) -> List[Int], x: Int) -> List[Int] { f(x) }` and passes today, because
+`f(x)` is in TAIL position and the caller's type comes from the enclosing fn's own return
+annotation, not from the closure call's result. That is why no instrument moved, and why the
+hand-built rows are the coverage rather than the sweep.
+
+### Census
+
+The ctype instrument is neutral in both build modes: `diverge=43 missing=109` unchanged, 17 distinct
+cells identical on a common-file basis (957 mono / 878 archive-linked common files). `agree` rose by
+`+108` in each mode, attributed to the row — 34 compiler-linking files at `+3` and 3 at `+2`, which
+is `closure_lit_ret_c` reaching `c_type_from_tid` at the closure literals in the compiler's own
+source. The tydiv instrument does not move at all (30223 diverge rows, 196 closure rows), correctly:
+every closure row still diverges on the signature-as-C-string cause, and this cell removes the
+string from the RESULT type, not from the signature. Stage 4 retires the rest.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
