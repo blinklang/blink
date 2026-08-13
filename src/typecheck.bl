@@ -1,6 +1,6 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on}
 import std.str.{str_to_lower}
-import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, c_type_c_name, is_transparent_newtype, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_CHANNEL, CT_PTR, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_TEMPLATE, CT_FFI_SCOPE, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
+import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, c_type_c_name, is_transparent_newtype, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_HANDLER, CT_CHANNEL, CT_PTR, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_TEMPLATE, CT_FFI_SCOPE, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
 import parser.{
     get_annotation, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
@@ -73,7 +73,7 @@ effect TypeCheck {
 pub type TyKind {
     Int, Float, Bool, Str, Void,
     List, Option, Result, Fn, Struct, Enum,
-    Typevar, Unknown, Iterator, Handle, Channel, Ptr,
+    Typevar, Unknown, Iterator, Handle, Channel, Ptr, Handler,
     Tuple, Map, Bytes, Set, StringBuilder, Template, FfiScope,
     I8, I16, I32, U8, U16, U32, U64, Char
 }
@@ -98,6 +98,7 @@ fn tk_name(k: TyKind) -> Str {
         TyKind.Unknown => "Unknown"
         TyKind.Iterator => "Iterator"
         TyKind.Handle => "Handle"
+        TyKind.Handler => "Handler"
         TyKind.Channel => "Channel"
         TyKind.Ptr => "Ptr"
         TyKind.Tuple => "Tuple"
@@ -847,12 +848,74 @@ pub fn tc_unknown_tid() -> Int { TYPE_UNKNOWN }
 // closure's declared type is spelled `Fn(..) -> T`), and tk_to_ct collapsed both to CT_VOID
 // anyway. TyKind.Iterator is DEFERRED to br qzdz2e on a spec question — see the note on its
 // tc_tid_child_count arm.
+//
+// THIS AUDIT WAS INCOMPLETE, and how it was incomplete is the useful part: it enumerated the
+// UNCONSTRUCTED MEMBERS of TyKind, and `Handler[E]` was not a member — see make_handler_type
+// below (br 88sfaz), which cost a segfault reachable from safe Blink. "Which enum members are
+// unconstructed" is a strictly weaker question than "which annotations reach the make_typevar
+// tail", and only the second one would have found it.
 pub fn make_handle_type(result_type: Int) -> Int {
     ty_intern_simple(TyKind.Handle, "Handle", result_type, -1)
 }
 
 pub fn make_channel_type(elem_type: Int) -> Int {
     ty_intern_simple(TyKind.Channel, "Channel", elem_type, -1)
+}
+
+// br 88sfaz — the case the vag3wc audit above missed, because `Handler` was not an unconstructed
+// TyKind: it was not a TyKind AT ALL. `Handler[E]` fell through resolve_type_parts to
+// `make_typevar("Handler")`, and the Fn arm three screens down names what that costs in one line
+// — "a bare typevar unifies with anything". So every handler type compared equal to every other
+// type in the language, `let laundered: Int = <Handler[IO]>` typechecked clean, and a handler
+// laundered through it into a parameter of a DIFFERENT effect SEGFAULTED: the callee dispatches
+// by slot index, so a one-function vtable receiving a four-function dispatch calls a function
+// pointer read past the end of the struct. `blink check` said ok.
+//
+// THE NAME SLOT HOLDS THE EFFECT, which departs from make_handle_type / make_channel_type above
+// (name = the type's OWN name) and is not a shortcut. Those two carry their parameter as a child
+// tid because a Channel's element IS a type; an effect is not, so there is no tid to put in
+// inner1 and the effect has to travel in the only other slot the entry has. It is what the intern
+// key discriminates on, which is precisely the identity this fixes, and it is what
+// tc_tid_handler_effect hands back to codegen so `resolve_effect_vtable` stays on the codegen side
+// where the ue_effects registry lives.
+//
+// Sub-effects are ROOT-COMPARED, not string-compared — see tc_handler_effect_root.
+pub fn make_handler_type(effect_name: Str) -> Int {
+    ty_intern_simple(TyKind.Handler, effect_name, -1, -1)
+}
+
+// The effect a handler type handles, raw as written (`IO`, `IO.Print`, `Metrics`). "" for any
+// other kind, so a caller can use it as its own gate.
+pub fn tc_tid_handler_effect(tid: Int) -> Str {
+    if tid < 0 || tid >= ty_pool.len() { return "" }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TyKind.Handler { return "" }
+    t.name
+}
+
+// Two handler types are interchangeable exactly when they install into the same effect slot, and
+// the slot is chosen by the ROOT effect: resolve_effect_vtable (codegen_types.bl:1455) maps `IO`,
+// `IO.Print`, `IO.Log` and `IO.Eprint` all onto `blink_io_vtable`, and groups every user effect by
+// `ue.name` with `starts_with("{ue.name}.")`. So comparing roots is not a loosening of the rule —
+// it IS the equivalence the C representation already uses, which is why this cannot reject a
+// program that works today (lib/std/testing.bl returns Handler[IO.Log] / [IO.Print] / [IO.Eprint]).
+//
+// It is also representationally EXACT rather than merely convenient, which was measured and not
+// assumed: a `handler Metrics.Emit` declaration emits the PARENT'S FULL-SIZE vtable and fills the
+// unlisted slots from `blink_ue_metrics_vtable_default` (`__handler_vt_0 = *__handler_0_outer`,
+// then override). Two handler types with the same root effect therefore have literally the same C
+// type, and slot-index dispatch cannot run off the end of one — which is exactly why the 88sfaz
+// crash needed two DIFFERENT effects.
+//
+// So the remaining sub-effect question is not about this function. Passing a `Handler[Metrics.Emit]`
+// to a `Handler[Metrics]` parameter runs clean and returns the default stub's 0 from an unfilled
+// slot: a silent wrong answer, not a safety hole, and an effect-semantics decision (should a
+// default stub return a zero value or panic as "unhandled operation"?) rather than a type-identity
+// one. Filed with the measurement as br eegt61.
+pub fn tc_handler_effect_root(effect_name: Str) -> Str {
+    let dot = effect_name.index_of(".")
+    if dot < 0 { return effect_name }
+    effect_name.slice(0, dot)
 }
 
 // br w13xgb. The fifth case of the vag3wc audit, and the worst of them: TyKind.Ptr did not
@@ -2972,6 +3035,24 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     // TYPE_VOID for that case, not TYPE_UNKNOWN: it matches tc_closure_declared_ret and the
     // named-fn default, and Void is an ordinary inhabited type, not an unsolved one
     // (decisions/under-determined-types.md).
+    // `Handler[E]` (br 88sfaz). Belongs beside Fn for the identical reason its comment gives: the
+    // name is reserved (is_primitive_type claims it, :7105), so no user type could have taken it,
+    // and falling through to `make_typevar("Handler")` made an ANNOTATED handler both
+    // structureless and unsound. The parser puts the effect in `elements` (parser.bl:1478) as a
+    // TypeAnn node whose NAME is the effect — the effect is not a type, so the name is read
+    // directly rather than resolved.
+    //
+    // A bare `Handler` with no `[E]` keeps the old typevar answer on purpose: it is not a type
+    // anyone can write (the parser only builds this node from `handler[...]`), so minting a
+    // handler-of-no-effect would invent an identity for a shape that cannot occur, and a typevar
+    // is the honest "no information" answer if some path reaches here anyway.
+    if name == "Handler" {
+        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+            let eff = node_name(sublist_get(elems_sl, 0))
+            if eff != "" { return make_handler_type(eff) }
+        }
+        return make_typevar(name)
+    }
     if name == "Fn" {
         let ret_ann = if ann_node == -1 { -1 } else { node_type_ann(ann_node) }
         let ret_t = if ret_ann == -1 { TYPE_VOID } else { resolve_type_ann(ret_ann) }
@@ -8587,6 +8668,26 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
         if ka == TyKind.Template {
             return types_compatible(ta.inner1, tb.inner1)
         }
+        // br 88sfaz. Two handler types are interchangeable exactly when they install into the
+        // same effect slot, and the slot is picked by the ROOT effect — resolve_effect_vtable
+        // (codegen_types.bl:1455) maps `IO`, `IO.Print`, `IO.Log` and `IO.Eprint` all onto
+        // `blink_io_vtable`, and groups every user effect by `ue.name` plus
+        // `starts_with("{ue.name}.")`. So this is not name equality and not a loosening of one:
+        // it IS the equivalence the C representation already uses, which is why it cannot reject
+        // a program that compiles today (lib/std/testing.bl returns Handler[IO.Log] /
+        // [IO.Print] / [IO.Eprint] and they flow into `Handler[IO]` positions).
+        //
+        // The effect lives in the NAME slot rather than in a child (make_handler_type), so this
+        // compares strings where the arms above recurse on tids. There is no child to recurse
+        // into — an effect is not a type.
+        //
+        // Whether the type system SHOULD go finer than the representation — a `Handler[IO]`
+        // parameter rejecting a `Handler[IO.Print]` argument as too narrow, or accepting it as a
+        // subtype — is a sub-effect variance question the spec does not answer, and it is not
+        // this arm's to decide. Filed as friction.
+        if ka == TyKind.Handler {
+            return if tc_handler_effect_root(ta.name) == tc_handler_effect_root(tb.name) { 1 } else { 0 }
+        }
         if ka == TyKind.Map {
             if types_compatible(ta.inner1, tb.inner1) == 0 { return 0 }
             return types_compatible(ta.inner2, tb.inner2)
@@ -9094,6 +9195,18 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             return make_channel_type(resolve_type_parts(node_name(cn_tp), -1, cn_tp))
         }
         return make_channel_type(TYPE_UNKNOWN)
+    }
+
+    // br 88sfaz, and the same shape as ChannelNew above: a construction site that writes its
+    // own type down. `handler IO { ... }` parses to a HandlerExpr whose NAME is the full dotted
+    // effect (parser.bl:2126), so the effect is already in hand and nothing needs resolving —
+    // an effect is not a type. Without this arm the node fell to the silent TYPE_UNKNOWN tail,
+    // which is what left every handler value untyped even after resolve_type_parts learned to
+    // lower the ANNOTATION.
+    if kind == NodeKind.HandlerExpr {
+        let he_eff = node_name(node)
+        if he_eff == "" { return TYPE_UNKNOWN }
+        return make_handler_type(he_eff)
     }
 
     if kind == NodeKind.Ident {
@@ -12604,6 +12717,10 @@ fn type_to_str(tid0: Int) -> Str {
         // the note on tc_tid_child_count below (br qzdz2e).
         TyKind.Iterator => return name
         TyKind.Handle => return "Handle[{type_to_str(t.inner1)}]"
+        // The effect lives in the name slot, not in a child (make_handler_type), so this renders
+        // it directly instead of recursing. `Handler[IO]`, `Handler[IO.Print]`, `Handler[Metrics]`
+        // — the spelling a user wrote, which is what a diagnostic has to say back to them.
+        TyKind.Handler => return "Handler[{name}]"
         TyKind.Channel => return "Channel[{type_to_str(t.inner1)}]"
         TyKind.Ptr => return "Ptr[{type_to_str(t.inner1)}]"
         TyKind.Template => return "Template[{type_to_str(t.inner1)}]"
@@ -12956,6 +13073,13 @@ fn tk_to_ct(kind: TyKind) -> Int {
         TyKind.Iterator => CT_ITERATOR
         TyKind.Handle => CT_HANDLE
         TyKind.Channel => CT_CHANNEL
+        // Codegen has carried CT_HANDLER since handlers landed (codegen_types.bl:51) and keys
+        // the vtable side-channel on it, so this arm makes the two universes AGREE rather than
+        // adding knowledge — the same relationship the Template arm below has. The flat entry
+        // also stores the vtable type name in `sname` and an is-user-effect flag in `inner1`
+        // (codegen_types.bl:4841); the CT alone carries neither, which is why the tid is the
+        // only side that can now say WHICH effect (br 88sfaz).
+        TyKind.Handler => CT_HANDLER
         TyKind.Ptr => CT_PTR
         TyKind.Map => CT_MAP
         TyKind.Bytes => CT_BYTES
@@ -13641,6 +13765,11 @@ pub fn tc_tid_child_count(tid: Int) -> Int {
         TyKind.Ptr => 1
         // The phantom context. Carried, not checked — see make_template_type (br nrrs28).
         TyKind.Template => 1
+        // A handler's EFFECT is not a type, so it is not a child: it lives in the entry's name
+        // slot (make_handler_type, br 88sfaz) and is read back with tc_tid_handler_effect. This
+        // is the one kind whose parameter is deliberately NOT a tid, which is exactly why the
+        // count is 0 and not "1 that is always -1" — there is no type down there to erase.
+        TyKind.Handler => 0
         TyKind.FfiScope => 0
         TyKind.I8 => 0
         TyKind.I16 => 0
@@ -13698,6 +13827,9 @@ pub fn tc_tid_child(tid: Int, i: Int) -> Int {
         TyKind.Channel => if i == 0 { t.inner1 } else { -1 }
         TyKind.Ptr => if i == 0 { t.inner1 } else { -1 }
         TyKind.Template => if i == 0 { t.inner1 } else { -1 }
+        // Unreachable, like the leaves above: child_count is 0 because the effect is a NAME,
+        // not a tid (br 88sfaz).
+        TyKind.Handler => -1
         TyKind.FfiScope => -1
         TyKind.I8 => -1
         TyKind.I16 => -1
@@ -13862,6 +13994,11 @@ fn tc_tid_byvalue_ct(tid: Int) -> Int {
         TyKind.Channel => -1
         TyKind.Iterator => -1
         TyKind.Template => -1
+        // The one kind in this list that declines for a reason of its own rather than for a
+        // child's sake: a handler's C spelling is `blink_io_vtable*` / `blink_ue_<h>_vtable*`,
+        // chosen from the EFFECT, and a bare CT_HANDLER names none of them (br 88sfaz). The flat
+        // path keeps this one because the vtable type name is what its `sname` slot holds.
+        TyKind.Handler => -1
         TyKind.FfiScope => -1
         // Nothing to carry. `Channel[Void]` is not a thing, an unresolved metavar or a typevar
         // means the type is not known YET, and a bare `Channel(n)` reaches here through
@@ -14075,6 +14212,16 @@ pub fn c_type_from_tid(tid: Int) -> Str {
         TyKind.Void => "void"
         TyKind.Typevar => ""
         TyKind.Unknown => ""
+        // DECLINES, and this is a boundary fact rather than a gap: a handler's C type is the
+        // VTABLE STRUCT of its effect (`blink_io_vtable*`, `blink_ue_metrics_vtable*`), and the
+        // effect→vtable map is resolve_effect_vtable (codegen_types.bl:1455), which reads
+        // codegen's `ue_effects` registry to get the handle segment. typecheck imports
+        // codegen_types, not the reverse, and that registry is populated during codegen — so this
+        // file can say WHICH effect (tc_tid_handler_effect) but not what C calls it. Spelling it
+        // here would mean duplicating the grouping rule, which is precisely how a cell grows a
+        // second speller that disagrees with the first. Making this an agree is its own step (br
+        // 88sfaz gives the type an identity; the census flip is downstream).
+        TyKind.Handler => ""
         // All four handled above, ahead of the match.
         TyKind.Ptr => ""
         TyKind.Option => ""
@@ -15439,6 +15586,12 @@ fn tc_ann_head_matches_tid(ann: Int, tid: Int) -> Bool {
         TyKind.Channel => false
         TyKind.Ptr => false
         TyKind.Template => false
+        // `false` for the SAME reason TyKind.Fn is: the alignment this function exists to
+        // authorize does not hold. A `Handler[E]` annotation puts the effect in `elements`, but
+        // the effect is not a type and the tid has no children at all, so element 0 would be
+        // aligned against child 0 = -1. A type parameter cannot appear in an effect position
+        // either, so there is nothing here for tc_tparam_tid_from_ann to find (br 88sfaz).
+        TyKind.Handler => false
         TyKind.FfiScope => false
         TyKind.I8 => false
         TyKind.I16 => false

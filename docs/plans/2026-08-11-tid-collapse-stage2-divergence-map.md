@@ -7854,6 +7854,185 @@ Writing the `Void`-body row of the test produced a `cc` escape that has nothing 
 io.println("x")` reproduces it with no `Bytes` in the program at all — filed as br `2q76x9`, and
 the test row is written in statement position with a comment saying why.
 
+## The type that was not in the enum, and segfaulted (br `88sfaz`)
+
+`ctype.handler` was picked next because it is the **only site in the whole census with `agree=0`** —
+7 rows, every one a decline. A site the tid has never answered for is the shortest route to whatever
+the tid cannot say. What it could not say turned out to be the type's own identity, and the cost was
+a memory-safety hole reachable from ordinary safe Blink: no `@trusted`, no `@ffi`, no unsafe
+construct, `blink check` reporting `ok`, and the binary dying with SIGSEGV.
+
+```blink
+effect Small { effect Only { fn one(a: Str) } }
+effect Big   { effect Many { fn first(a: Str)  fn second(a: Str)
+                             fn third(a: Str)  fn fourth(a: Str) } }
+
+fn make_small() -> Handler[Small] { handler Small { fn one(a: Str) { io.println(a) } } }
+fn take_big(b: Handler[Big]) { with b { big.fourth("hello") } }
+
+fn main() {
+    let s = make_small()
+    let laundered: Int = s      // accepted
+    take_big(laundered)         // exit 139
+}
+```
+
+### The cause is not a missing arm — it is a missing member
+
+Every earlier cell in this document was a channel that dropped information. This one had no channel
+because it had no **type**. `Handler` was not a `TyKind`. `resolve_type_parts` (`typecheck.bl:2857`)
+has arms for List / Option / Result / Map / Set / Handle / Channel / Template / Fn and then a tail:
+
+```blink
+make_typevar(name)
+```
+
+`Handler[E]` fell to that tail, and the `Fn` arm three screens up already names what that costs, in
+one line of its own comment: **"a bare typevar unifies with anything."** That is the same sentence
+that describes the unsoundness br `nz7drz` fixed for `Fn` (`let bad: fn(Int) -> Int = 5` typechecked
+clean). So every handler type compared equal to every other type in the language.
+
+`TyKind.Handle` is *not* this type. That is the async task `Handle[T]`. `handler[E]` is a parser
+pseudo-type named `"Handler"` (`parser.bl:1478`) carrying the effect in `node_elements`, and
+`infer_type_uncached` had no `HandlerExpr` arm either — so neither the **annotation** nor the
+**value** had a type.
+
+### Why the vag3wc audit could not have found it
+
+The comment above `make_handle_type` is an explicit audit of `TyKind` members that are never
+constructed: Closure (deleted), Iterator (deferred to `qzdz2e`), Ptr (`w13xgb`). It is a careful,
+complete list — and it missed this, unavoidably, because **`Handler` was not a member to be found**.
+
+That is the transferable lesson for the rest of Stage 3, and it is recorded in the audit comment and
+in the header of `tests/test_vag3wc_channel_handle_iterator_tids.bl` so the next reader hits it:
+
+> *"Which enum members are unconstructed" is a strictly weaker question than "which annotations
+> reach the typevar tail."*
+
+### Three fail-opens compose into the crash, and each is independently a bug
+
+1. `let laundered: Int = <Handler[E]>` is **accepted** — the declared type is never compared against
+   a handler-typed RHS. Codegen then emits `void* laundered = s;`, because the vtable side-channel is
+   keyed by **variable name** (`get_var_handler_vtable_type`, `codegen_stmt.bl:4161`) and has no
+   entry under the new name, so it takes its `void*` arm.
+2. **`void*` converts implicitly to any object pointer in C**, which defeats the `cc` backstop that
+   catches the same mistake without the `Int` hop.
+3. The callee installs the pointer into **its own** effect slot from its own annotation, and effect
+   dispatch is by **slot index** (`__ev->ue_big->fourth(...)`). A one-function vtable receiving a
+   four-function dispatch reads a function pointer past the end of the struct and calls it.
+
+Rung 2 is why this could not be left to the C compiler: it is exactly the `Int` hop that turns a
+`cc` type error into a segfault.
+
+Two quieter members of the same family, both reproduced by running them:
+
+- **Same-size launder** — with the two vtables the same width it does not crash. It ran, exited 0,
+  and printed `[H] boom`: `metrics.counter("boom", 12345)` dispatched through the IO handler's
+  `print(const char*)`, discarding the `Int` argument.
+- **A lying annotation** — `let bad: Handler[Metrics] = make_io_handler()` compiled, ran, exited 0
+  and **did nothing**. Codegen ignored the annotation, followed the RHS effect, installed into
+  `.io`, and `metrics.counter` inside the `with` went to the default metrics vtable. A program that
+  silently does not do what it says.
+
+### The effect travels in the *name* slot, and that is not a shortcut
+
+```blink
+pub fn make_handler_type(effect_name: Str) -> Int {
+    ty_intern_simple(TyKind.Handler, effect_name, -1, -1)
+}
+```
+
+This departs from `make_handle_type` / `make_channel_type`, where `name` is the type's **own** name
+and the parameter is a child tid. Those two can do that because a Channel's element **is a type**. An
+effect is not, so there is no tid for `inner1` and the effect has to travel in the only other slot
+the entry has. It is what the intern key discriminates on — precisely the identity this fixes — and
+`tc_tid_handler_effect` hands it back so `resolve_effect_vtable` stays on the codegen side where the
+`ue_effects` registry lives.
+
+The consequence is that `Handler` is the one kind whose parameter is deliberately **not** a tid, so
+`tc_tid_child_count` answers `0` rather than "1 that is always -1". There is no type down there to
+erase.
+
+### Sub-effects are root-compared, and that is representationally exact
+
+`types_compatible` compares `tc_handler_effect_root` and not the full name, so `Handler[IO.Print]`
+and `Handler[IO]` are interchangeable. This is not a loosening chosen for convenience — it is the
+equivalence the C representation **already** uses. `resolve_effect_vtable` (`codegen_types.bl:1455`)
+maps `IO`, `IO.Print`, `IO.Log` and `IO.Eprint` all onto `blink_io_vtable`, and groups every user
+effect by `ue.name` plus `starts_with("{ue.name}.")`. Which is why it cannot reject a program that
+compiles today — `lib/std/testing.bl` returns `Handler[IO.Log]` / `[IO.Print]` / `[IO.Eprint]` into
+`Handler[IO]` positions.
+
+Measuring *why* it is exact was worth the five minutes, because it settles a question that would
+otherwise read as unfinished. A sub-effect handler emits the **parent's full-size vtable**, copying
+the default and overriding only its own slots:
+
+```c
+static blink_ue_metrics_vtable blink_ue_metrics_vtable_default = {
+    ..., blink_ue_metrics_default_get_counter };
+...
+blink_ue_metrics_vtable __handler_vt_0 = *__handler_0_outer;   // copy, then override
+```
+
+So two handler types with the same root effect have literally the same C type, slot-index dispatch
+cannot run off the end of one, and **this is why the crashing MVCE needed two different effects.**
+Both variance directions run clean today (exit 0); a `Handler[Metrics.Emit]` in a `Handler[Metrics]`
+position returns the default stub's `0` from `get_counter` with no diagnostic. That is a silent
+wrong answer, not a safety hole, and it is an effect-semantics question rather than a type-identity
+one — filed as br `eegt61` with the measurement.
+
+### Stage 0's net earned its keep twice in one change
+
+Adding the enum member failed the compile at **exactly six sites** in `typecheck.bl`, and every one
+of those sites' own governing comment dictated its answer:
+
+| site | arm | why |
+| --- | --- | --- |
+| `tk_to_ct` | `CT_HANDLER` | codegen has carried it since handlers landed; the arm makes the two universes agree rather than adding knowledge |
+| `tc_tid_child_count` | `0` | the effect is a name, not a child |
+| `tc_tid_child` | `-1` | unreachable given the count, enumerated so a kind that *gains* children cannot slip through |
+| `tc_tid_byvalue_ct` | `-1` | "a bare CT is a complete answer exactly when the C spelling does not depend on children" — a handler's depends on the effect |
+| `c_type_from_tid` | `""` | the vtable name needs codegen's `ue_effects`; see below |
+| `tc_ann_head_matches_tid` | `false` | the identical reason `TyKind.Fn` is `false` — element-index-to-child-index alignment does not hold when the element is not a type |
+
+It then failed **four test files** that carry their own independent `TyKind` enumeration
+(`test_e0wmt6`, `test_nz7drz`, `test_tc_tid_structural_accessors`, `test_vag3wc`). That second net
+exists precisely so a variant cannot appear or disappear without a deliberate edit, and it worked.
+
+### The census did not move, on purpose — but the rows did
+
+Measured over `tests` + `examples` + `src`, **identical in both build modes**. On the same basis
+(excluding the new test root) the census is unchanged: `ctype.handler` agree=0 diverge=0 missing=7;
+TOTAL diverge=42, missing=116. The `+5` handler rows are entirely the new test file.
+
+That is the scope split stated up front, not a shortfall. `c_type_from_tid` still declines, because a
+handler's C type is the **vtable struct of its effect** and the effect→vtable map reads codegen's
+`ue_effects` registry — and `typecheck` imports `codegen_types`, not the reverse. Spelling it in
+`typecheck` would mean duplicating the grouping rule, which is how a cell grows a second speller that
+disagrees with the first.
+
+What *did* move is the evidence that the identity landed:
+
+```
+BEFORE: bucket=decline site=ctype.handler var=h  ty=Handler          emitted=blink_io_vtable*
+AFTER:  bucket=decline site=ctype.handler var=h  ty=Handler[IO]      emitted=blink_io_vtable*
+        bucket=decline site=ctype.handler var=h2 ty=Handler[Metrics] emitted=blink_ue_metrics_vtable*
+```
+
+All 12 rows: the tid's effect matches the emitted vtable **1:1**. The tid now carries exactly what
+the speller needs; only the speller's *reach* is missing. `codegen_stmt.bl` imports both modules and
+already owns the handler declaration branch, so `resolve_effect_vtable(tc_tid_handler_effect(tid))`
+is spellable there — filed as br `22zk5f`. That flip also retires a name-keyed registry, which is the
+same keying that produced rung 1 of this crash.
+
+### What is deliberately not pinned
+
+A `Handler[E]` through a generic fn (`fn ident[T](x: T) -> T`) trips the I0001 tripwire — *the
+def-side slot resolved to `T` at codegen site `mono_fn_signature_ret`*. That is the fail-closed
+backstop working, so a handler simply cannot travel through a generic yet. Pinning an ICE as an
+expected outcome would make it load-bearing, so the corpus says so in a comment and the ticket
+carries the detail.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

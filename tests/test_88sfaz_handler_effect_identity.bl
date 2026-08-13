@@ -1,0 +1,184 @@
+import compile_test_helpers.{expect_compile_error, compile_and_run}
+
+// br 88sfaz — a `Handler[E]`'s EFFECT is not part of its type, so no compare can tell two
+// handler types apart. `blink check` says ok and the program SEGFAULTS.
+//
+// THE CAUSE, in one line: there is no constructed handler type in typecheck. `handler[E]` is a
+// parser pseudo-type named "Handler" (parser.bl:1478) carrying the effect in `node_elements`,
+// there is no `TyKind.Handler`, and the tid renders as the BARE name — so `Handler[IO]` and
+// `Handler[Metrics]` are the same type to every compare in the compiler. The effect reaches
+// codegen only through annotation nodes and name-keyed side registries (`reg_fn_ret_handler`,
+// `set_var_handler`, `resolve_effect_vtable`).
+//
+// This is the shape br vag3wc already fixed for Channel and Handle. typecheck.bl:12606 renders
+// `Handle[T]` / `Channel[T]` from their children now, and the comment above it names the
+// bare-name rendering as the defect it was. `Handler` was left behind because an EFFECT is not a
+// type, so the constructed form carries the effect NAME on the entry rather than a child tid.
+//
+// THE CHAIN. Three fail-opens compose into the segfault, and each is independently a bug:
+//
+//   1. `let laundered: Int = <Handler[E]>` is ACCEPTED — the declared type is never compared
+//      against a handler-typed RHS. Codegen then emits `void* laundered = s;`, because the
+//      vtable side-channel is keyed by VARIABLE NAME (get_var_handler_vtable_type,
+//      codegen_stmt.bl:4161) and has no entry under the new name, so the branch takes its
+//      `void*` arm.
+//   2. `void*` converts implicitly to any object pointer in C, which defeats the cc backstop
+//      that catches the same mistake without the Int hop.
+//   3. The callee installs the pointer into ITS OWN effect slot from its own annotation and
+//      dispatches by SLOT INDEX. A one-function vtable receiving a four-function dispatch reads
+//      a function pointer past the end of the struct and calls it.
+//
+// Every row below was reproduced by RUNNING it, not by reading code.
+
+fn seg_src() -> Str {
+    "effect Small \{\n    effect Only \{\n        fn one(a: Str)\n    }\n}\neffect Big \{\n    effect Many \{\n        fn first(a: Str)\n        fn second(a: Str)\n        fn third(a: Str)\n        fn fourth(a: Str)\n    }\n}\nfn make_small() -> Handler[Small] \{\n    handler Small \{\n        fn one(a: Str) \{\n            io.println(\"[small.one] \{a}\")\n        }\n    }\n}\nfn take_big(b: Handler[Big]) \{\n    with b \{\n        big.fourth(\"hello\")\n    }\n}\nfn main() \{\n    let s = make_small()\n    let laundered: Int = s\n    take_big(laundered)\n    io.println(\"survived\")\n}\n"
+}
+
+fn metrics_src(body: Str) -> Str {
+    "effect Metrics \{\n    effect Emit \{\n        fn counter(name: Str, value: Int)\n    }\n}\nfn make_io_handler() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn take_metrics(m: Handler[Metrics]) \{\n    with m \{\n        metrics.counter(\"boom\", 12345)\n    }\n}\nfn main() \{\n{body}\n}\n"
+}
+
+// ── The segfault, and the rung of the ladder that must break ─────────────────────────
+
+// The whole MVCE. `blink check` accepted this and the binary died with SIGSEGV (exit 139): a
+// four-slot dispatch through a one-slot vtable reads a function pointer past the end of the
+// struct and calls it. There is no @trusted, no @ffi and no unsafe construct anywhere in it.
+test "laundering a handler between effects does not compile" {
+    expect_compile_error(seg_src(), "88sfaz_segfault_launder", "TypeError")
+}
+
+// Rung 1 alone, which is the rung the fix has to break. Without the `Int` hop the mistake is
+// still not diagnosed by Blink — it is caught by the C compiler, which is a cc escape with no
+// Blink span: "expected 'blink_ue_metrics_vtable *' but argument is of type 'blink_io_vtable *'".
+test "a handler stored into an Int-declared binding does not compile" {
+    expect_compile_error(metrics_src("    let h = make_io_handler()\n    let n: Int = h\n    io.println(\"n=\{n}\")"), "88sfaz_handler_into_int", "TypeError")
+}
+
+// The same launder with the two vtables the SAME size, which is the silent variant rather than
+// the crashing one: this ran, exited 0, and printed `[H] boom` — `metrics.counter("boom", 12345)`
+// dispatched through the IO handler's `print(const char*)`, discarding the Int argument entirely.
+test "a same-size cross-effect launder does not compile" {
+    expect_compile_error(metrics_src("    let h = make_io_handler()\n    let laundered: Int = h\n    take_metrics(laundered)"), "88sfaz_same_size_launder", "TypeError")
+}
+
+// ── The cross-effect compares, each on its own channel ───────────────────────────────
+
+// A PARAMETER of the wrong effect. This one cc happens to catch, so it is not a wrong-answer
+// today — but it is a cc escape, and the fix is what turns it into a Blink diagnostic.
+test "passing a handler to a parameter of a different effect does not compile" {
+    expect_compile_error(metrics_src("    take_metrics(make_io_handler())"), "88sfaz_param_wrong_effect", "TypeError")
+}
+
+// A declared type of the wrong effect. This one is the quietest of the family: it compiled, ran,
+// exited 0 and DID NOTHING — codegen ignored the annotation, followed the RHS effect, installed
+// the handler into `.io`, and `metrics.counter` inside the `with` went to the default metrics
+// vtable. A program that silently does not do what it says.
+test "declaring a handler at a different effect does not compile" {
+    expect_compile_error(metrics_src("    let bad: Handler[Metrics] = make_io_handler()\n    with bad \{\n        metrics.counter(\"x\", 1)\n    }"), "88sfaz_decl_wrong_effect", "TypeError")
+}
+
+// The RETURN position, which is the third channel a handler type travels on and the one the
+// `reg_fn_ret_handler` registry serves.
+test "returning a handler of a different effect does not compile" {
+    expect_compile_error("effect Metrics \{\n    effect Emit \{\n        fn counter(name: Str, value: Int)\n    }\n}\nfn make_io_handler() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn lie() -> Handler[Metrics] \{\n    make_io_handler()\n}\nfn main() \{\n    let m = lie()\n    with m \{\n        metrics.counter(\"x\", 1)\n    }\n}\n", "88sfaz_return_wrong_effect", "TypeError")
+}
+
+// ── Regression pins: every correct shape must keep working ───────────────────────────
+//
+// These are written DIRECTLY in the corpus rather than through the string helper, so the Stage 3
+// ctypediv sweep can see them: `ctype.handler` is the one site in the whole census where the tid
+// answers for ZERO rows (agree=0 missing=7), and these rows are what that count is measured on.
+
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str, value: Int)
+    }
+    effect Query {
+        fn get_counter(name: Str) -> Int
+    }
+}
+
+fn make_io_handler() -> Handler[IO] {
+    handler IO {
+        fn print(msg: Str) {
+            io.println("[IO] {msg}")
+        }
+    }
+}
+
+fn make_metrics_handler() -> Handler[Metrics] {
+    handler Metrics {
+        fn counter(name: Str, value: Int) {
+            io.println("[METRICS] {name}={value}")
+        }
+        fn get_counter(_name: Str) -> Int {
+            99
+        }
+    }
+}
+
+fn use_io(h: Handler[IO]) {
+    with h {
+        io.println("through a param")
+    }
+}
+
+test "a handler local at its own effect still works" {
+    let h = make_io_handler()
+    with h {
+        io.println("hello")
+    }
+    assert(true)
+}
+
+test "a handler passed to a parameter of its OWN effect still works" {
+    use_io(make_io_handler())
+    assert(true)
+}
+
+// The annotated form of the same binding — the control that proves the axis is the EFFECT and
+// not the annotation: this must stay legal while the mismatched annotation above becomes an
+// error.
+test "a handler declared at its own effect still works" {
+    let h: Handler[IO] = make_io_handler()
+    with h {
+        io.println("annotated")
+    }
+    assert(true)
+}
+
+test "two handlers for different effects still work together" {
+    let h1 = make_io_handler()
+    let h2 = make_metrics_handler()
+    with h1, h2 {
+        io.println("both")
+        metrics.counter("test", 7)
+    }
+    assert(true)
+}
+
+// A user effect's handler at its own effect, which is the `blink_ue_*_vtable` half of the census
+// rows rather than the builtin `blink_io_vtable` half.
+test "a user-effect handler at its own effect still works" {
+    let h = make_metrics_handler()
+    with h {
+        metrics.counter("solo", 3)
+        assert_eq(metrics.get_counter("solo"), 99)
+    }
+    assert(true)
+}
+
+// A run-mode row, so the correct dispatch is checked in a compiled-and-executed program and not
+// only inside the harness. The fix must not change what a well-typed handler does.
+test "a correctly typed handler still dispatches to the handler body" {
+    let src = "effect Metrics \{\n    effect Emit \{\n        fn counter(name: Str, value: Int)\n    }\n}\nfn make_metrics() -> Handler[Metrics] \{\n    handler Metrics \{\n        fn counter(name: Str, value: Int) \{\n            io.println(\"[M] \{name}=\{value}\")\n        }\n    }\n}\nfn main() \{\n    let h = make_metrics()\n    with h \{\n        metrics.counter(\"ok\", 42)\n    }\n}\n"
+    let r = compile_and_run(src, "88sfaz_correct_dispatch")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[M] ok=42"))
+}
+
+// NOT PINNED, and deliberately: a `Handler[E]` through a generic fn (`fn ident[T](x: T) -> T`)
+// trips the I0001 tripwire today — "the def-side slot resolved to 'T' (codegen site
+// 'mono_fn_signature_ret')". That is the fail-closed backstop working, so a handler simply cannot
+// travel through a generic yet, and pinning an ICE as an expected outcome would make it load
+// bearing. Recorded on the ticket instead.
