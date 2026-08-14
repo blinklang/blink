@@ -10271,6 +10271,48 @@ and `c_type_from_tid` and `ctype_probe_at` both resolve from this file today. Th
 time a layering claim in a comment near this code has been backwards (`88sfaz` recorded the
 first). The import line is the authority, not the prose.
 
+### What is left in `codegen_types`, and why most of it is not a routing target
+
+The sub-step was scoped as "route this file's `c_type_str` sites." Measured against the source,
+that scope is mostly empty, and the reason is worth recording because it moves work from Stage 3
+to Stage 4.
+
+**Thin `(ct, name)` wrappers — belong to the caller's sub-step.** `chan_elem_c_type` (2 callers)
+and `c_field_type_str` (7 callers) each decide a spelling from a pair they are handed. The tid has
+to arrive from the caller, and every caller lives in `codegen_stmt` / `codegen_methods`. Routing
+them here would mean editing those files, which is a later sub-step by the plan's own file
+division.
+
+**The carrier typedef emitters — a deletion target, not a routing target.** `emit_option_typedef`
+takes a **CT** and keys its dedup identity on the CT-derived name:
+
+```
+let tag = c_type_tag(inner)
+let tname = "blink_Option_{tag}"
+if option_typedef_emitted.contains_key(tname) != 0 { return }
+let c_inner = c_type_str(inner)
+```
+
+Routing only `c_type_str(inner)` would spell the **body** at full depth underneath a **name** still
+at depth 1 — an incoherent typedef. The name and body have to move together, which is a signature
+change plus a dedup-key change, and emit order here is a by-value dependency
+(`project_typedef_emit_order_is_dependency`).
+
+And it does not need to move, because a full-depth sibling already exists.
+`emit_carrier_typedef_for_tag(tag: Str)` / `ensure_carrier_from_tag` is keyed on a full-depth tag
+string, and it is what emits `typedef struct { int tag; blink_map* value; }
+blink_Option_Map_str_int;`. So the two coexist: a CT-keyed depth-1 emitter and a tag-keyed
+full-depth one. The CT-keyed one is legacy that Stage 4 deletes once the tag-keyed path is shown to
+cover every shape it serves — not something Stage 3 rewrites.
+
+**`build_closure_sig_from_type_ann`** (the remaining two sites) was probed directly and its `else`
+branch only ever sees scalars and type-erased pointers, where the CT is total. `is_enum_type`
+routes Option/Result to `ann_mono_c_type` before reaching it, and that path is already correct at
+depth 1 **and** depth 2 — verified by construction, not by reading.
+
+So this sub-step's routable surface was one site, and it is done. The next sub-step is
+`codegen_stmt`, which is also where the two thin wrappers' tids have to come from.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
