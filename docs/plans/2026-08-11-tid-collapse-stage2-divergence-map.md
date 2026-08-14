@@ -10733,6 +10733,83 @@ variant-field row (`E.Tag(s) => { s }`) is the same shape as every failing row a
 the fix, which is the evidence that the pre-pass types *some* binder kinds and that a fix aimed at the
 `as` binder alone would have been the symptom.
 
+## Flipping the four zero-divergence match-binder branches, and the third one nobody had measured
+
+With `2ew5dp` closed, four of the five `match_binder` cells read `diverge=0` in both build modes.
+That number is the whole licence for this unit: the probe's Agree bucket means `spelled == emitted`
+as strings, so at every reach where the tid answers, it answers the identical text. Declines still
+fall back to the flat spelling. Therefore no emitted declaration can change — the flip is provably
+inert on today's corpus, and what it buys is that the tid is now the branch's *first* authority
+rather than an unused second opinion.
+
+Flipped, all on the template `qdsy9n` established (probe, then `c_type_from_tid`, then a
+`!= "" && != "void"` guard falling back to flat):
+
+| branch | cell | before |
+| --- | --- | --- |
+| carrier payload sub-pattern | `carrier_payload` | 9688 / 0 / 12 |
+| struct-style variant field | `variant_field` | 376 / 0 / 44 |
+| ident binder with an `sname` | `ident_sname` | 12 / 0 / 2 |
+| ident binder, scalar | `ident_scalar` | 74 / 0 / 0 |
+
+The fifth cell, `as_scalar` (10 / 16 / 2), is **not** flipped. Its 16 diverges are the ones
+`2ew5dp`'s census already broke down, and its 2 declines are `5kerq0`'s argument-position reach.
+It stays measured-only until that ticket lands.
+
+### The branch that had never been measured at all
+
+`bind_pattern_vars` has three AsPattern branches, and the instrumentation pass only ever tapped two
+of them. The third — `match_scrut_enum != ""` — spells from a name (`c_type_c_name(match_scrut_enum)`)
+rather than from a bare `CT_*`, so it never had the `void` defect its two siblings did, which is
+presumably why it read as uninteresting. But "no defect" and "not the tid" are different claims, and
+only the first was ever checked. Tapped as `match_binder.as_enum` in the same unit: **4 / 0 / 0** in
+both build modes. So it was flipped in the same unit, and the enum arm is no longer the one place a
+binder's C type comes from somewhere else.
+
+### The residual declines, enumerated
+
+60 decline hits over 28 distinct source positions, identical in both build modes. Three causes, and
+the split is the useful part — it is not one backlog, it is one bug plus two known-open families:
+
+| cause | positions | hits | cells |
+| --- | --- | --- | --- |
+| no tid published for the binder (`ty=-`) | 7 | 18 | `carrier_payload` ×5, `variant_field` ×2, `as_scalar` ×1 |
+| binder tid is an unsubstituted typevar (`ty=T`/`L`/`R`) | 20 | 40 | `variant_field` |
+| binder tid is a carrier with a metavar hole (`ty=Result[Int, ?]`) | 1 | 2 | `ident_sname` |
+
+The 40-hit majority is **correct declining**, not a hole to close here: the tid says `T`, and a
+typevar has no C spelling, so `c_type_from_tid` returning `""` and deferring to the mono-substituted
+flat name is the right answer at this seam. Every one of those 20 positions is in a generic-enum
+mono test (`7q3aj0`, `jjhnf3`, `82ajft`, `36vhhw`, `tk8s0y`) — i.e. this cell's decline floor is
+bounded below by typevar substitution reaching the *pattern binder*, which is `3ejrqa`'s subject,
+not this stage's.
+
+The single `ident_sname` row is the mirror image and worth naming precisely: the tid is
+`Result[Int, ?]` — real, structured, and *less* informative than the flat spelling, which knows
+`blink_Result_int_str`. The flat authority is not uniformly weaker; it is weaker in depth and
+stronger where a metavar never got solved.
+
+Of the 7 `ty=-` positions, 1 is `5kerq0` (already filed) and the other 6 are in `j0cdey` /
+`yb3a4z` / `36vhhw` — compound-carrier and tuple-element shapes whose binders typecheck never
+publishes at all. Not filed separately: they are the same "no published type" surface that
+`bind_struct_style_variant_fields` sits on, which needs its own unit anyway (that function has no
+pattern node to read a tid *from* — it derives from a declared type-name string).
+
+### Verification
+
+`task regen` 0 (twice, one per step). `task ci` 0 — 717/717 test files, fmt 1648 passed / 0 failed /
+92 skipped. Census in both modes: every cell unchanged except the new `as_enum` row, plus
+`ctype.flat` agree rising 423219 → 423661 (mono) and 346475 → 346917 (arc), the same +442 in both,
+which is the compiler's own source growing by these edits and not a behavior change.
+
+The emitted-C check needs its own sentence, because the naive reading of it is wrong. 929 of 963
+corpus files are byte-identical. The 34 that changed are **exactly** the roots that compile
+`codegen_stmt.bl` into themselves — 9 `src/*.bl` files plus the compiler-internals tests that import
+src modules, plus `codegen_stmt.bl` itself — and every changed line is either this edit lowered to C
+or temp renumbering downstream of it (`_box20`→`_box21`, `_ounv_24`→`_ounv_25`, `_l69`→`_l73`).
+Byte-identity for a codegen edit has to be judged against the roots that do *not* recompile the
+edited module; judged there it holds, which is what `diverge=0` predicted.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
