@@ -959,6 +959,9 @@ pub type CaptureEntry {
     name: Str
     is_mut: Int
     tp_id: Int
+    // The rehydration seam inside the closure body is out of scope by the time it spells the
+    // capture's cell, so the tid travels with the entry rather than being looked up by name.
+    tid: Int
 }
 
 pub type ClosureCapInfo {
@@ -6189,7 +6192,29 @@ pub fn c_field_type_str(ct: Int, tname: Str) -> Str {
 // (codegen_stmt) and the rehydration at the top of the closure body (codegen_closures). They read
 // this rather than deriving it apiece, so they cannot disagree. `tname` carries c_field_type_str's
 // Void-position rule for the caller that has it.
-pub fn capture_cell_c_type(tp_id: Int, tname: Str) -> Str {
+//
+// The tid LEADS and the flat chain below survives only where it declines. The flat chain composes
+// a carrier's tag from the inner CT alone, which holds no arguments of its own — so a carrier over
+// another carrier came out at depth 1 (`blink_Option_map` for an `Option[Map[Str, Int]]`), naming a
+// C type no emitter typedef'd while the variable itself was declared at full depth.
+//
+// A cell is a STORAGE position, so a genuine `void` falls through: c_type_from_tid answers Void
+// deliberately and leaves the position rule to its caller, which here is the flat chain's
+// c_field_type_str tail.
+//
+// The flat answer is computed BEFORE the tid is consulted so the probe can report the line this
+// site would otherwise have printed. Computing it only in the fallback would leave a decline here
+// invisible, and a decline is the one case in which the flat spelling still governs the output —
+// the number that gates deleting the flat arm.
+pub fn capture_cell_c_type(tid: Int, tp_id: Int, tname: Str) -> Str {
+    let flat = capture_cell_c_type_flat(tp_id, tname)
+    ctype_probe_at(tid, "capture_cell", "", flat, -1)
+    let spelled = c_type_from_tid(tid)
+    if spelled != "" && spelled != "void" { return spelled }
+    flat
+}
+
+fn capture_cell_c_type_flat(tp_id: Int, tname: Str) -> Str {
     let k = tp_get_kind(tp_id)
     if k == CT_STRUCT {
         let sn = tp_get_sname(tp_id)

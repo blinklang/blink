@@ -1,0 +1,175 @@
+// A mut-captured local's heap cell must be spelled at the variable's FULL depth.
+//
+// capture_cell_c_type composed the cell tag from the inner CT alone, so a carrier over another
+// carrier lost the child's own arguments: an `Option[Map[Str, Int]]` variable declared
+// `blink_Option_Map_str_int` got a `blink_Option_map` cell — a C type no emitter ever typedef'd.
+// Both seams that spell the cell then failed at cc, the declaration and the rehydration:
+//
+//     unknown type name 'blink_Option_map'
+//     incompatible types when assigning to type 'int' from type 'blink_Option_Map_str_int'
+//     invalid initializer                                  (inside the closure body)
+//
+// The boundary was exact — correct whenever the inner was depth-1-spellable, wrong whenever the
+// inner was itself a carrier. `Option[List[Int]]` passed only by luck (List's tag is `list`
+// whatever the element is), which is why the controls at the bottom are not redundant: they are
+// the shapes whose depth-1 tag happens to equal the real one, and they must keep passing for
+// that reason rather than because nothing looks at them.
+//
+// A carrier inner is the axis. Two seams spell one object — the cell declaration in the
+// enclosing scope and the rehydration at the top of the closure body — so every row below reads
+// the captured value INSIDE the closure and asserts the value, which is what proves the two
+// spellings agree on a layout rather than merely both compiling.
+
+type Bx { v: Int }
+
+// ── the axis: a carrier whose inner is itself a carrier ───────────────────────
+
+test "a mut-captured Option[Map[K, V]] cell carries its map" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    m.insert("b", 2)
+    let mut cell: Option[Map[Str, Int]] = Some(m)
+    let peek = fn() -> Int {
+        match cell {
+            Some(mm) => { mm.len() }
+            None => { -1 }
+        }
+    }
+    assert_eq(peek(), 2)
+}
+
+test "a mut-captured Option[Option[T]] cell carries both levels" {
+    let mut cell: Option[Option[Int]] = Some(Some(7))
+    let peek = fn() -> Int {
+        match cell {
+            Some(inner) => {
+                match inner {
+                    Some(x) => { x }
+                    None => { -1 }
+                }
+            }
+            None => { -2 }
+        }
+    }
+    assert_eq(peek(), 7)
+}
+
+test "a mut-captured Result[Map[K, V], E] cell carries its map" {
+    let mut m: Map[Int, Str] = Map()
+    m.insert(1, "x")
+    let mut cell: Result[Map[Int, Str], Str] = Ok(m)
+    let peek = fn() -> Int {
+        match cell {
+            Ok(mm) => { mm.len() }
+            Err(_) => { -1 }
+        }
+    }
+    assert_eq(peek(), 1)
+}
+
+// The Err side is a separate leaf of the same tag, so an ok-side-only fix leaves it red.
+test "a mut-captured Result cell reaches its Err payload" {
+    let mut cell: Result[Map[Int, Str], Str] = Err("nope")
+    let peek = fn() -> Str {
+        match cell {
+            Ok(_) => { "ok" }
+            Err(e) => { e }
+        }
+    }
+    assert_eq(peek(), "nope")
+}
+
+test "a mut-captured Option[Set[T]] cell carries its set" {
+    let mut s: Set[Int] = Set()
+    s.insert(4)
+    s.insert(5)
+    let mut cell: Option[Set[Int]] = Some(s)
+    let peek = fn() -> Int {
+        match cell {
+            Some(ss) => { ss.len() }
+            None => { -1 }
+        }
+    }
+    assert_eq(peek(), 2)
+}
+
+// A struct INSIDE the carrier is the leaf that needs a name rather than a tag, so the cell tag
+// exercises a different arm of the speller than the container rows above.
+//
+// The row reads len() rather than get("k"): whether a match binder inside a closure body keeps
+// the inner container's arguments is a separate seam, and reaching through it here would make
+// this row red for a reason that has nothing to do with the cell. len() still requires the cell
+// to be spelled blink_Option_Map_str_Bx, which is what this row is for.
+test "a mut-captured Option[Map[K, Struct]] cell carries its struct-named tag" {
+    let mut m: Map[Str, Bx] = Map()
+    m.insert("k", Bx { v: 9 })
+    let mut cell: Option[Map[Str, Bx]] = Some(m)
+    let peek = fn() -> Int {
+        match cell {
+            Some(mm) => { mm.len() }
+            None => { -2 }
+        }
+    }
+    assert_eq(peek(), 1)
+}
+
+// The cell is a MUTABLE cell, and the rows above only read it. A write proves the two seams
+// agree on the LAYOUT and not merely on the spelling: the closure reaches the payload through
+// its rehydrated pointer, mutates it, and the enclosing scope reads the same object back.
+//
+// The write goes through the payload rather than reassigning the carrier, because constructing
+// a compound carrier inside a closure body erases its arguments on a different seam.
+test "a write through a mut-captured carrier cell is visible outside the closure" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    let mut cell: Option[Map[Str, Int]] = Some(m)
+    let fill = fn() {
+        match cell {
+            Some(mm) => { mm.insert("b", 2) }
+            None => {}
+        }
+    }
+    fill()
+    let n = match cell {
+        Some(mm) => { mm.len() }
+        None => { -1 }
+    }
+    assert_eq(n, 2)
+}
+
+// ── controls: the depth-1 tag already equalled the real one ───────────────────
+//
+// These passed before the fix. They are here because each is a shape whose correct tag is
+// reachable from the inner CT alone, so a fix that changed their spelling would be emitting a
+// different C type than the variable's own declaration — the same defect, mirrored.
+
+test "a mut-captured Option[List[T]] cell still carries its list" {
+    let mut cell: Option[List[Int]] = Some([1, 2, 3])
+    let peek = fn() -> Int {
+        match cell {
+            Some(l) => { l.len() }
+            None => { -1 }
+        }
+    }
+    assert_eq(peek(), 3)
+}
+
+test "a mut-captured Option[Struct] cell still carries its struct" {
+    let mut cell: Option[Bx] = Some(Bx { v: 5 })
+    let peek = fn() -> Int {
+        match cell {
+            Some(b) => { b.v }
+            None => { -1 }
+        }
+    }
+    assert_eq(peek(), 5)
+}
+
+test "a mut-captured scalar cell still round-trips" {
+    let mut n = 1
+    let bump = fn() {
+        n = n + 41
+    }
+    bump()
+    assert_eq(n, 42)
+}

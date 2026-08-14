@@ -10156,6 +10156,121 @@ Two attribution traps cost real time here, both the same mistake in different cl
 So the honest read of the gate: the counter **can** reach 0, and the critical path is four
 implementation projects rather than any further deliberation.
 
+## `4zjmpb` — the first Stage 3 routing, and what a flipped site's census looks like
+
+The first site routed under Stage 3 sub-step 1. It is also the cleanest demonstration of the
+census rule the `forin_binder_ctype` comment states, because this site's `missing` column is 0
+and its `diverge` column is 13, and both numbers are good news.
+
+### The defect
+
+`capture_cell_c_type` (`codegen_types.bl:6204`) spells the heap cell of a **mut-captured** local.
+Two seams declare that cell and they must agree, because they spell one object: the declaration
+in the enclosing scope (`codegen_stmt`) and the rehydration at the top of the closure body
+(`codegen_closures`). They already read one function rather than deriving apiece, so the two
+could not disagree with each other — they could only both be wrong together, which is what they
+were.
+
+The flat chain composed a carrier's tag from the inner **CT alone**. A CT carries no arguments of
+its own, so a carrier over another carrier came out at depth 1:
+
+| declared as | cell spelled | consequence |
+| --- | --- | --- |
+| `blink_Option_Map_str_int` | `blink_Option_map` | `unknown type name` — no emitter ever typedef'd it |
+| `blink_Result_Map_int_str_str` | `blink_Result_map_str` | same |
+| `blink_Option_Option_int` | `blink_Option_option` | same |
+
+The boundary was exact: correct whenever the inner was depth-1-spellable, wrong whenever the
+inner was itself a carrier. `Option[List[Int]]` passed **only by luck** — List's tag is `list`
+whatever the element is — which is why the fixture keeps it as a control rather than dropping it.
+
+### The routing
+
+The `forin_binder_ctype` template, with one addition. The flat answer is now computed **before**
+the tid is consulted, into `capture_cell_c_type_flat`, so the probe can report the line the site
+would otherwise have printed. Computing it lazily in the fallback would have left a decline here
+invisible — and a decline is the only case in which the flat spelling still governs the output,
+i.e. the number that gates deleting the flat arm.
+
+The tid had to travel to the closure seam to get there. `CaptureEntry` gained a `tid` field: the
+rehydration seam is out of scope by the time it spells the cell, so a by-name lookup was not
+available, and threading the tid onto the entry keeps both spelling seams reading one source.
+
+### The census after the flip
+
+Corpus sweep, `tests` + `examples` + `src`, **identical in both build modes** (monolithic
+`build/blinkc` and archive-linked `--link-archive`):
+
+| | before | after |
+| --- | --- | --- |
+| `decline` (the Stage 4 gate) | 74 | **74** |
+| `diverge` | 37 | **50** |
+| `ctype.capture_cell` `missing` | — | **0** |
+| `ctype.capture_cell` `agree` | — | 91 |
+| `ctype.capture_cell` `diverge` | — | 13 |
+
+**The gate did not move, and that is the correct outcome.** `decline` counts sites where the tid
+declines and the flat spelling still governs. This site never declines — `missing=0` across the
+whole corpus — so it contributed nothing to the gate before the flip and contributes nothing
+after. What it contributes is the right to delete its flat arm in Stage 4 without a fallback.
+
+`diverge` rose by exactly the 13 rows this site now reports, and at a flipped site `diverge`
+counts **corrections the tid applied**, not defects. All 12 non-Void rows are the defect above:
+
+| cell | rows |
+| --- | --- |
+| `Result[Map[Int, Str], Str]` → `blink_Result_map_str` corrected | 4 |
+| `Option[Map[Str, Int]]` → `blink_Option_map` corrected | 4 |
+| `Option[Option[Int]]` → `blink_Option_option` corrected | 2 |
+| `Option[Map[Str, Bx]]` → `blink_Option_map` corrected | 2 |
+| `ty=Void tidc=void emitted=int64_t` — the by-design placeholder family | 1 |
+
+Each fixture row appears **twice**, which is the two-seam claim measured rather than asserted:
+the declaration and the rehydration each ask this function once. And all 12 come from the new
+fixture — the corpus contained **no** other member exercising a carrier-inner mut capture, so
+before the fixture existed this tap was unexercised. A zero here would have meant "never ran".
+
+### Three other seams fell out, none of them this one
+
+The fixture's first draft asserted through the cell in ways that reached past it. Each failure
+isolated to a different seam, and all three are now filed with their own MVCEs and controls:
+
+| seam | shape | filed |
+| --- | --- | --- |
+| by-value (non-mut) capture emits an **empty** capture descriptor, degrading box, unbox and promoter together | `Option[Int]` — depth-**independent** | `w3c0wb` P1 |
+| compound carrier **constructed inside** a closure body erases its arguments to `void` | `cell = Some(m)` inside `fn()` | `6n7kv0` P1 |
+| match binder from a captured carrier loses the **inner** container's arguments | `mm.get("k")` inside `fn()` | `dyzt8n` P1 |
+
+The controls are what separate them, and they were worth the time:
+
+- `mm.len()` through the same mut cell passes, so the cell is proven correct and `dyzt8n` is not
+  a cell defect.
+- The same `match` on the same mut cell **outside** any closure passes, so `mut` is not the axis
+  for `dyzt8n` — the closure body is.
+- A **scalar** carrier written inside a closure passes, so `6n7kv0` needs a compound inner.
+- A plain struct captured by value takes the correct path — descriptor `"S:Wrap"`, heap-boxed,
+  cast on read, real promoter — which is what proves `w3c0wb` is a missing recognition rather
+  than missing machinery.
+
+`w3c0wb` is worth a second look because the first read was wrong: the shape that surfaced it was
+`Option[Map[Str, Bx]]`, so it looked like another depth-2 cell. It is not. `Option[Int]` fails
+identically. Reducing before filing changed it from a nesting bug into a "carriers are not on the
+by-value capture path at all" bug.
+
+The two out-of-axis rows were **reshaped, not dropped**: row 6 reads `len()` (still requiring the
+cell to be spelled `blink_Option_Map_str_Bx`, which is what the row is for) and the write-through
+row mutates the payload rather than reconstructing the carrier. Both still pin the cell. The
+shapes they gave up are preserved verbatim as the MVCEs on the three tickets, which is where a
+red shape belongs while `test.failing` remains unimplemented (`1c2zr6`).
+
+### Trap
+
+`codegen_types.bl:1265` says the file is "BELOW typecheck in the module DAG — and so cannot read"
+it. Read narrowly that is about one producer's ordering; read as a file-level claim it is wrong,
+and `c_type_from_tid` and `ctype_probe_at` both resolve from this file today. This is the second
+time a layering claim in a comment near this code has been backwards (`88sfaz` recorded the
+first). The import line is the authority, not the prose.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
