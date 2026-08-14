@@ -10925,12 +10925,61 @@ four producers:
 | temp | declared as | why |
 | --- | --- | --- |
 | `_if_0` | `blink_Col` | fixed here |
-| `_match_2` | `int64_t` | the match result temp spells from a flat pre-pass; uninstrumented, `codegen_stmt.bl:853`/`993` |
+| `_match_2` | `int64_t` | the match result temp spells from the arm harvest; instrumented but not flipped — `match.result_temp`, `codegen_stmt.bl:1261` |
 | `_ounw_6` | `blink_Option_int` | an `Option[Col]` erased one level down, in the CARRIER's mono name |
 | `__opt8` | `blink_Option_int` | same cause as `_ounw_6`, different producer (`??`) |
 
 The carrier rows are a different family from the other two: the erasure is in the mono name of the
 carrier, not in the spelling of the declaration, so flipping a declaration site cannot reach them.
+The match row is the next unit — `match.result_temp` reads 899/265/157 (mono) and 890/265/157 (arc),
+so unlike the four match-binder branches it has no diverge=0 licence and has to be argued case by
+case.
+
+## Flipping `match.result_flat`, and reading a flip's blast radius off the census
+
+Same seam one expression form over, and the interesting part is that the licence came from the
+divergence population rather than from its being zero.
+
+**The population, classified before anything was touched** — 265 diverges, identical in both build
+modes, grouping into four spelling pairs:
+
+| tid -> flat | count | verdict |
+| --- | --- | --- |
+| `void` -> `int64_t` | 223 | the storage position rule — flat is right and must stay |
+| `blink_tokens_TokenKind` -> `int64_t` (plus one unqualified `blink_TokenKind`) | 40 | the tid is right; same family as the if temp |
+| `blink_Col` -> `int64_t` | 1 | `0rmamy`'s own probe, the `from_match` row |
+| `blink_io_vtable*` -> `void*` | 1 | the tid is more informative; both convert implicitly |
+
+Every diverging `emitted` value is a scalar or a pointer — `int64_t`, `void*`. None is a
+`blink_Option_*`, a `blink_Result_*` or a struct name. Since the carrier and struct branches spell
+exactly those, the whole divergence had to be the flat arm, and the `void` guard in the standard flip
+template already declines the 223 that must not move. That is a blast radius read off the census
+before writing the edit, and splitting the probe then confirmed it exactly:
+
+| cell | mono | arc |
+| --- | --- | --- |
+| `match.result_temp` (before, one cell) | 899 / 265 / 157 | 890 / 265 / 157 |
+| `match.result_carrier` | 14 / 0 / 152 | 14 / 0 / 152 |
+| `match.result_flat` | 885 / 265 / 5 | 876 / 265 / 5 |
+
+Conservation is exact on all three columns, and the carrier arm diverges **zero**. So the prediction
+holds, and it also says something about the handler-ABI hazard recorded for `if.result_carrier`:
+flipping `match.result_carrier` today would be a no-op, because it never diverges and the flip cannot
+act where it declines. The hazard is latent, not current — it becomes live the first time a
+handler-context struct carrier diverges here, which is precisely the case that cannot be allowed to
+be discovered by a miscompile. It stays flat-authoritative.
+
+**What moved.** `blink_Col _match_2;` where the emitter previously wrote `int64_t _match_2;`, and the
+Int-valued `match` inside the same program's `score` correctly still writes `int64_t _match_0;` — the
+flip is keyed on what the tid says, not on the expression form. `tests/test_0rmamy_enum_local_decl_typedef.bl`
+pins it as row 14. One-step emit lag again, one line, at the predicted place
+(`int64_t _match_1;` -> `blink_tokens_TokenKind _match_1;`); `cp build/blinkc_gen1 build/blinkc` and
+regen reaches the new fixed point. `task ci` green: 717/717, fmt 1648 passed / 0 failed / 92 skipped.
+
+**Both `codegen_stmt` result-temp seams are now flat-flipped and carrier-measured.** The remaining
+`if`/`match` residual is `dec`, not `div`: 190 + 5 on the flat cells and 604 + 152 on the carrier
+cells, dominated by `ty=-` — no published tid for the expression node at all. That population, not
+the divergence counter, is what gates Stage 4's deletion of the flat arm.
 
 **Census.** Both build modes, `div`/`dec` unchanged (agree grows with source only):
 
