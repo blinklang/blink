@@ -115,7 +115,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{sv_ty_or_flat_at, ctype_probe_at, closure_sig_from_tid, enum_instance_c_from_tid, tc_tid_handler_effect, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
+import typecheck.{sv_ty_or_flat_at, tc_top_level_let_tid, ctype_probe_at, closure_sig_from_tid, enum_instance_c_from_tid, tc_tid_handler_effect, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -870,7 +870,9 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                         }
                         emit_line("int64_t {tmp} = 0;")
                     } else {
-                        emit_line("{c_type_str(expr_result_type)} {tmp} = {expr_result_str};")
+                        let tup_flat_c = c_type_str(expr_result_type)
+                        ctype_probe_at(cg_node_mono_tid(match_tuple_elem_node), "tuple_scrut_elem", tmp, tup_flat_c, match_tuple_elem_node)
+                        emit_line("{tup_flat_c} {tmp} = {expr_result_str};")
                     }
                     set_var(tmp, expr_result_type, 1)
                     match_scruts.push(MatchScrutEntry { str_val: tmp, scrut_type: expr_result_type })
@@ -1025,7 +1027,9 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
             // as defence-in-depth for any residual variant-pattern arm that
             // reads `.tag` on a scrutinee that still reports a scalar CT.
             let scrut_tmp = fresh_temp("_scrut_")
-            emit_line("{c_type_str(expr_result_type)} {scrut_tmp} = {expr_result_str};")
+            let scrut_flat_c = c_type_str(expr_result_type)
+            ctype_probe_at(cg_node_mono_tid(scrut), "match.scrut_scalar", scrut_tmp, scrut_flat_c, scrut)
+            emit_line("{scrut_flat_c} {scrut_tmp} = {expr_result_str};")
             set_var(scrut_tmp, expr_result_type, 1)
             match_scruts.push(MatchScrutEntry { str_val: scrut_tmp, scrut_type: expr_result_type })
         } else if expr_result_type == CT_STRUCT && tuple_struct_arity(get_var_struct(expr_result_str)) >= 0 {
@@ -1926,7 +1930,12 @@ fn bind_struct_style_variant_fields(vidx: Int, fcount: Int, resolved_enum: Str, 
                 set_var(field_name, field_ct, 0)
                 register_var_compound_inner_from_str(field_name, found_ft)
             } else {
-                emit_line("{c_type_str(field_ct)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
+                let sf_flat_c = c_type_str(field_ct)
+                // The struct-style sibling of match_binder.variant_field. It reaches here from a
+                // declared field type rather than from a sub-pattern, so the tid is measured off the
+                // field-pattern node itself.
+                ctype_probe_at(pat_binder_tid(sf_node), "variant_field_struct_style", field_name, sf_flat_c, sf_node)
+                emit_line("{sf_flat_c} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
                 set_var(field_name, field_ct, 0)
             }
         }
@@ -5399,6 +5408,7 @@ fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Code
             let res_struct = get_var_struct(res_str)
             let tmp = fresh_temp("_wr_")
             let c_decl = if res_struct != "" { c_type_c_name(res_struct) } else { c_type_str(res_type) }
+            ctype_probe_at(cg_node_mono_tid(res_expr), "with_resource_temp", tmp, c_decl, res_expr)
             if res_struct != "" && lookup_impl_type_for_trait("BlockHandler", res_struct) == 1 {
                 emit_bh_setup(res_struct, res_str, binding, bh_state_vars)
             } else if res_struct != "" && lookup_impl_type_for_trait("Closeable", res_struct) == 1 {
@@ -10187,6 +10197,14 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
         expr_list_elem_struct = ""
     }
     let ts = if tuple_struct != "" { c_type_c_name(tuple_struct) } else { c_type_str(val_type) }
+    // A module-level `let` is a separate declaration chain from emit_let_binding's, so it gets its
+    // own cell rather than riding the local one. Two channels, in this order: the top-level walk
+    // records an ANNOTATED binding's tid in a module-keyed map and never touches the value node,
+    // and it memoizes the value node only for a bare literal. Reading either alone reports the
+    // other's population as untyped.
+    let tll_map_tid = tc_top_level_let_tid(node_module(node), name)
+    let tll_tid = if tll_map_tid >= 0 { tll_map_tid } else { cg_node_mono_tid(node_value(node)) }
+    ctype_probe_at(tll_tid, "top_level_let", name, ts, node)
     let cname = c_safe_name(name)
     let needs_init = helper_lines.len() > 0 || val_type == CT_LIST || val_type == CT_MAP || val_type == CT_SET || val_type == CT_CHANNEL
     let is_const = is_mut == 0 && !needs_init && val_type != CT_STRING

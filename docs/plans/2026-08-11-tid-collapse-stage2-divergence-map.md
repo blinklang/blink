@@ -11000,6 +11000,78 @@ is the codegen emit-string lag, not a defect (`project_codegen_emit_string_boots
 `cp build/blinkc_gen1 build/blinkc` then `task regen` reaches the new fixed point. `task ci` green:
 717/717, fmt 1648 passed / 0 failed / 92 skipped.
 
+## Measuring the rest of the declaration surface, and two cells that were not what they looked like
+
+With the two result temps flipped, the remaining declaration positions in `codegen_stmt` had never
+been measured at all. Five inert taps went in — no flip, no behavior change, and (the tell) no
+one-step emit lag, since an inert tap cannot alter emitted C.
+
+| cell | mono | arc | reading |
+| --- | --- | --- | --- |
+| `tuple_scrut_elem` | 15 / 0 / 0 | 15 / 0 / 0 | flippable, provable no-op |
+| `with_resource_temp` | 153 / 0 / 0 | 153 / 0 / 0 | flippable, provable no-op |
+| `match.scrut_scalar` | 38 / 11 / 0 | 38 / 11 / 0 | flippable; all 11 diverges are enum recoveries |
+| `top_level_let` | 27231 / 0 / 3 | 26363 / 0 / 3 | flippable; 3 residual are a real gap |
+| `variant_field_struct_style` | 0 / 0 / 34 | 0 / 0 / 34 | 100% decline — blocked, not flippable |
+
+The 11 `match.scrut_scalar` diverges are the same family as the two temps already flipped:
+`blink_Color` x4, `blink_Direction` x3, `blink_Op` x2, a multifile `Color`, and a `KCol` — every one
+an enum name the flat path spelled `int64_t`. Nothing else diverges anywhere on this surface.
+
+### The wrong channel, and why the census caught it before the ticket did
+
+The first `top_level_let` measurement read `cg_node_mono_tid(node_value(node))` and came back
+**9199 / 0 / 18035**, with 917 distinct globals appearing untyped. That is a big enough number to
+look like a finding: "module-level lets carry no type." It was about to be filed as one.
+
+Checking the premise against the source first (`feedback_check_ticket_against_spec`) found
+`src/typecheck.bl:12721`. The top-level walk types an ANNOTATED binding through `resolve_type_ann`
+and stores the result in a module-keyed map; it calls `infer_type` on the value node only when the
+initializer is a bare `IntLit` / `FloatLit` / `BoolLit` / `InterpString`. So there are two channels,
+and each reports the other's population as untyped. Reading the map first and falling back to the
+node memo:
+
+```blink
+let tll_map_tid = tc_top_level_let_tid(node_module(node), name)
+let tll_tid = if tll_map_tid >= 0 { tll_map_tid } else { cg_node_mono_tid(node_value(node)) }
+```
+
+**27231 / 0 / 3.** The 18032-decline "finding" was an artifact of asking the wrong channel. The
+lesson generalizes past this cell: a decline column measures *the channel you read*, and a large
+decline count is first evidence about the probe, not about the compiler.
+
+The 3 real residuals are unannotated top-level bindings with a non-literal initializer —
+`pub let ch = Channel(10)`, `const TIMEOUT_MS = 30 * 1000`, `let ymw81c_top_alias = ymw81c_top_m` —
+filed as `n90j7j`. Widening the literal kind-list is NOT the fix: function names are registered
+*after* that loop (`typecheck.bl:12756`), which is precisely why the restriction exists. A correct
+fix is a second pass after registration.
+
+### A 100% decline cell that turned out to be a soundness hole
+
+`variant_field_struct_style` declines every row in both modes, all `ty=-`. No tid has ever been
+published for a struct-style variant field binder.
+
+The cause is `tc_check_pattern_types`'s StructPattern arm (`typecheck.bl:12367`), which binds each
+field with a bare `nr_define(name)`. Every other arm in that function — IdentPattern, AsPattern,
+EnumPattern, TuplePattern, ListPattern — decomposes the hint and calls `nr_define_typed` +
+`tc_publish_node_tid`. StructPattern alone binds untyped, and the field's declared type is sitting
+right there on the declaration.
+
+That is not a codegen gap. Two MVCEs, both checking clean:
+
+- field `w: Int`, then `let bad: Str = w` — `blink check` says `ok`, and the error escapes to `cc`
+  as `const const char* bad = w;` (which also shows a doubled `const`, a separate spelling defect).
+- field `w: Float`, then `let bad: Int = w` and `take_int(w)` — `blink check` says `ok`, the program
+  **links and runs**, and prints `4.94066e-324 2 3`. A wrong-answer miscompile from ordinary safe
+  Blink: no unsafe, no FFI, no generics.
+
+Filed `8vc88v` (P1). It blocks flipping this cell — a flip cannot act where the probe declines — so
+the cell stays measured-only until the binder publishes a tid.
+
+Both anomalies point the same way, which is worth stating plainly: a cell that declines is not
+automatically "codegen has no channel." Once it was read correctly, one of these was a probe bug and
+the other was a typechecker soundness bug. Neither was what the raw number suggested.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
