@@ -10810,6 +10810,84 @@ or temp renumbering downstream of it (`_box20`→`_box21`, `_ounv_24`→`_ounv_2
 Byte-identity for a codegen edit has to be judged against the roots that do *not* recompile the
 edited module; judged there it holds, which is what `diverge=0` predicted.
 
+## The if-expression result temp, and the third position rule
+
+`emit_if_expr` declares its result temp on one of two mutually exclusive paths — a structured one
+that reads a carrier's shape back from the buffered branch values, and a bare-CT fallback — and
+neither had ever been tapped. They are the direct sibling of `match.result_temp`: the header of that
+function already says its pre-pass (`infer_block_type`) leaves `CT_VOID` for builtin heap
+constructors and is blind to `?`. Tapped as two cells, deliberately not one, because averaging a
+path that can see a carrier's inner against one that only has a CT would hide both.
+
+| cell | mono | arc |
+| --- | --- | --- |
+| `if.result_carrier` | 17823 / 2 / 604 | 406 / 2 / 598 |
+| `if.result_flat` | 31289 / 48 / 190 | 27371 / 48 / 190 |
+
+Neither is flipped in this unit, and the reason the carrier path is not is the finding.
+
+### Flat is right inside a handler implementation
+
+Both of `if.result_carrier`'s diverges look like the plan's root cause caught in the act — the tid
+says `Option[Item]` and `Result[Option[Item], LookupError]` where the flat chain says
+`blink_Option_ptr` and `blink_Result_Option_ptr_LookupError`, i.e. a struct inner erased to `ptr`.
+Emitting the C says otherwise. Both typedefs exist and they are physically different types:
+
+```c
+typedef struct { int tag; void* value; } blink_Option_ptr;
+typedef struct { int tag; blink_Item* value; } blink_Option_Item;
+```
+
+and both reaches are inside `__handler_0_find`, a handler implementation whose C signature returns
+`blink_Option_ptr` because the effect's vtable slot is declared `blink_Option_ptr (*find)(const
+char*)`. The call site converts explicitly (`__ue_conv_1`). So the erasure is the ABI, not a loss:
+the tid's answer is logically correct and physically wrong for that position, and flipping would
+emit `return _if_3;` from a function whose return type is the other struct.
+
+That makes **three** positions where `c_type_from_tid`'s logical answer must not govern, and it is
+worth stating as a set because the remaining ~30 uninstrumented sites in this stage all have to
+respect it:
+
+1. **storage** — a genuine `void` local is illegal C, so a declaration takes the `int64_t`
+   placeholder (`void_placeholder`, 0 agree / 6 diverge, and that cell must *stay* fully diverging).
+2. **field** — a Void struct field / Result leaf, which `c_field_type_str` owns.
+3. **handler-vtable ABI** — inside a handler implementation the physical type is the effect slot's
+   erased spelling, not the handler's logical one.
+
+The first two were known and commented at their sites. The third was not, and no gate over the flat
+authority would have found it: flat and tid disagree there *because flat is enforcing a rule the tid
+does not know about*. This is also the counterexample to reading the census as "diverge = defect" —
+a claim already qualified for flipped cells, now qualified for an unflipped one too.
+
+### What `if.result_flat`'s 48 diverges are
+
+All 48 are precision improvements in ordinary functions, in two classes already settled in the tid's
+favour at other sites:
+
+- **46 an enum local** — `let want_kind = if container == "Map" { TyKind.Map } else { TyKind.Set }`
+  (`typecheck.bl:13795`, reached once per root), `let kw = if kind == SK_FN { TokenKind.Fn } …`
+  (`lsp.bl:285`), and one `Col` in `test_0rmamy_enum_local_decl_typedef`. Flat says `int64_t`, the
+  tid says `blink_typecheck_TyKind`. The same class the for-in binder and the let declaration both
+  already resolved toward the tid.
+- **2 a handler value** — `Handler[IO]`, `void*` vs `blink_io_vtable*`, which the let declaration's
+  `handler_tid` branch already flips.
+
+So this path is flippable, but unlike the match-binder unit it is *not* free: 48 emitted
+declarations change, which needs its own unit and its own test rather than riding on a
+`diverge=0` argument.
+
+### The declines say the if node has no tid
+
+Dominant and identical in shape across both cells: 598 of `if.result_carrier`'s 604 declines and
+184 of `if.result_flat`'s 190 are `ty=-` — no published tid for the if node at all, falling back to
+`const char*` (370) or `int64_t` (228). The remainder is the `?`-holed carrier population seen at
+`match_binder.ident_sname`: `Result[Option[Item], ?]`, `Option[?]`, `(M, Result[Int, ?])` — a tid
+that is structurally real but whose err slot never got solved, so flat knows the fuller name.
+
+Not filed as a ticket: `agree` is 49k across the two cells, so this is specific positions rather
+than "if-expressions are untyped", and which positions has not been established. It is the
+enumerated residual for whoever flips this path.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
