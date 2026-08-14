@@ -69,9 +69,9 @@ fn log_message(msg: Str) ! IO.Log {
 }
 
 // Single effect with return type
-fn read_config(path: Str) -> Result[Config, IOError] ! FS.Read {
+fn read_config(path: Str) -> Result[Config, FsError] ! FS.Read {
     let text = fs.read(path)?
-    parse_config(text)
+    Ok(parse_config(text))
 }
 
 // Multiple fine-grained effects
@@ -154,7 +154,7 @@ effect Process {
 
 | Declaration | What you can use |
 |---|---|
-| `! FS.Read` | `fs.read(...)`, `fs.list(...)` -- read-only FS operations |
+| `! FS.Read` | `fs.read(...)`, `fs.list_dir(...)` -- read-only FS operations |
 | `! FS.Read, FS.Write` | Read and write, but not delete or watch |
 | `! FS` | All FS operations: read, write, delete, watch |
 | `! DB.Read` | Read-only database queries: `db.query(...)`, `db.query_one(...)` |
@@ -177,7 +177,7 @@ Declaring an effect in a function signature brings a **handle** into scope. The 
 fn example() ! IO.Print, FS.Read, DB.Read, Net.Connect, Crypto.Hash {
     io.print("Starting...")          // IO.Print handle (no newline)
     io.println("Done!")              // IO.Print handle (with newline)
-    let data = fs.read("input.txt")  // FS.Read handle
+    let data = fs.read("input.txt")? // FS.Read handle
     let rows = db.query("SELECT *..")? // DB.Read handle — string literal auto-parameterized to Template[DB]
     let resp = net.get(url)?          // Net.Connect handle
     let hash = crypto.hash(data)     // Crypto.Hash handle
@@ -212,7 +212,7 @@ The `_raw` variants are escape hatches for cases where direct C output is needed
 | `Crypto` / `Crypto.*` | `crypto` | `crypto.hash(...)`, `crypto.sign(...)`, `crypto.encrypt(...)`, `crypto.decrypt(...)` |
 | `Process` / `Process.*` | `process` | `process.spawn(...)`, `process.signal(...)` |
 
-The handle is always the lowercase form of the top-level effect name. Sub-effects do not create separate handles -- they control which *methods* on the handle are available. Declaring `! FS.Read` gives you the `fs` handle, but only `fs.read(...)` and `fs.list(...)` compile. Calling `fs.write(...)` with only `FS.Read` declared is a compile error:
+The handle is always the lowercase form of the top-level effect name. Sub-effects do not create separate handles -- they control which *methods* on the handle are available. Declaring `! FS.Read` gives you the `fs` handle, but only `fs.read(...)` and `fs.list_dir(...)` compile. Calling `fs.write(...)` with only `FS.Read` declared is a compile error:
 
 ```blink
 fn read_only() ! FS.Read {
@@ -795,6 +795,79 @@ fn transfer(from_id: Int, to_id: Int, amount: Int) -> Result[Void, DBError] ! DB
 
 ---
 
+#### 4.4.5 Filesystem Operations
+
+The `fs` handle is in scope when a function declares `! FS` or one of its sub-effects (`FS.Read`, `FS.Write`, `FS.Delete`, `FS.Watch`). Every filesystem operation can fail — a path may not exist, permission may be denied, a disk may be full — so each returns `Result[T, FsError]`. A failure is never a silent sentinel value; it is a typed error the caller must handle or propagate with `?`.
+
+| Operation | Signature | Effect |
+|---|---|---|
+| `fs.read` | `fs.read(path: Str) -> Result[Str, FsError]` | `FS.Read` |
+| `fs.write` | `fs.write(path: Str, content: Str) -> Result[Void, FsError]` | `FS.Write` |
+| `fs.list_dir` | `fs.list_dir(path: Str) -> Result[List[Str], FsError]` | `FS.Read` |
+| `fs.delete` | `fs.delete(path: Str) -> Result[Void, FsError]` | `FS.Delete` |
+
+Directory listing is a read, so `fs.list_dir` needs only `FS.Read` — there is no `FS.List` sub-effect.
+
+```blink
+fn load(path: Str) -> Result[Config, FsError] ! FS.Read {
+    let text = fs.read(path)?
+    Ok(parse_config(text))
+}
+```
+
+**The error type: `FsError`.** A filesystem failure carries three fields — the operation that failed, the path it failed on, and the underlying OS error code:
+
+```blink
+pub type FsOp {
+    Read
+    Write
+    ListDir
+    Delete
+}
+
+pub type FsError {
+    op: FsOp
+    path: Str
+    code: Errno
+}
+```
+
+`code` is the `Errno` newtype from `std.errno` — the same zero-cost error code returned by `libc.*` and `io.*`. `fs` wraps it with the operation and the path so the message can name *what* was being done and *to what*. `Errno` on its own says `ENOENT`; `FsError` says that reading `/etc/app.toml` gave `ENOENT`.
+
+`FsError` implements `Display`. The rendered form follows the convention `op path: message`:
+
+```blink
+match fs.read("/etc/app.toml") {
+    Ok(text) => process(text)
+    Err(e)   => io.eprintln("{e}")   // read /etc/app.toml: No such file or directory
+}
+```
+
+For the common branch — "did this fail because the file was not there?" — `FsError` provides a predicate so callers do not compare error codes by hand:
+
+```blink
+fn read_cache(cache_path: Str) -> Result[Option[Str], FsError] ! FS.Read {
+    match fs.read(cache_path) {
+        Ok(text) => Ok(Some(text))
+        Err(e) => {
+            if e.not_found() {
+                Ok(None)          // an absent cache is not an error here
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+```
+
+**Propagation is exact.** `?` on an `fs` call propagates `FsError` unchanged; it does not convert to the enclosing function's error type. A function that reads a file and returns a different error type must adapt with `.map_err(...)` — there is no implicit `.into()` (see error propagation, §3c).
+
+`FsError` and `FsOp` are prelude types: they need no import.
+
+**No file handles in v1.** The `fs` surface is exactly the four path-taking operations above. There is no `fs.open`, no `fs.create`, and no handle-taking read — a read is `fs.read(path)`, never `fs.read(handle)`. Streaming and incremental access are a post-v1 addition and will arrive as *methods on a file handle* (`file.read_line()`, `file.write_line(...)`), not as overloads of `fs.read` — Blink has no function overloading. Examples in §4.7 (*Scoped resources: `with...as`*) that open a `Closeable` file handle with `with ... as` illustrate the scoped-resource mechanism against that planned handle API; they are marked there as post-v1.
+
+---
+
 ### 4.5 Effect Composition Rules
 
 Effects propagate upward through the call graph. If function A calls function B, A must declare at least all of B's effects. The compiler enforces this transitively across the entire program.
@@ -1045,13 +1118,15 @@ test "integration test with shared environment" {
 
 Effect handlers manage long-lived, framework-level resources — connection pools, capability providers, test doubles. But functions also acquire short-lived, individual resources: a file handle for one read, a lock held for one critical section, a temp file for one transformation.
 
-The `with...as` construct handles this second tier:
+The `with...as` construct handles this second tier. The file-handle examples below (`fs.open`, `fs.create`, and the handle methods `read_all` / `write` / `read_line`) are **planned post-v1 API**, shown to illustrate the scoped-resource mechanism — they are not part of the v1 `fs` surface, which is the four path operations in §4.4.5:
 
 ```blink
-fn copy_file(src_path: Str, dst_path: Str) -> Result[(), IOError] ! FS {
+// Planned (post-v1): the file-handle API. Shown here to illustrate `with ... as`
+// scoped resources; the v1 fs surface is the four path operations in §4.4.5.
+fn copy_file(src_path: Str, dst_path: Str) -> Result[Void, FsError] ! FS {
     with fs.open(src_path)? as src, fs.create(dst_path)? as dst {
-        let data = fs.read(src)?
-        fs.write(dst, data)?
+        let data = src.read_all()?
+        dst.write(data)?
     }
 }
 ```
@@ -1068,11 +1143,13 @@ Both `src` and `dst` implement the `Closeable` trait. When the block exits — n
 The tiers compose naturally:
 
 ```blink
-fn export_data(query: Str, path: Str) -> Result[(), AppError] ! DB.Read, FS {
+// The scoped-resource file handle (`fs.create ... as out`, `out.write`) is the
+// planned post-v1 handle API; the two-tier `with` composition it illustrates is v1.
+fn export_data(query: Str, path: Str) -> Result[Void, AppError] ! DB.Read, FS {
     with fs.create(path)? as out {
         let rows = db.query(query)?
         for row in rows {
-            fs.write(out, row.to_csv())?
+            out.write(row.to_csv())?
         }
     }
 }
@@ -1121,7 +1198,7 @@ Scoped resources respect structured concurrency boundaries. A `Closeable` bound 
 fn bad_example() ! FS, Async {
     with fs.open("data.txt")? as file {
         async.spawn(fn() {
-            fs.read(file)  // COMPILE ERROR E0601: closeable `file` escapes scope
+            file.read_all()  // COMPILE ERROR E0601: closeable `file` escapes scope
         })
     }
 }
@@ -1132,7 +1209,7 @@ If concurrent tasks need the resource, open it outside or pass the data:
 ```blink
 fn good_example() ! FS, Async {
     let data = with fs.open("data.txt")? as file {
-        fs.read(file)?
+        file.read_all()?
     }
     async.scope {
         async.spawn(fn() { process(data) })
@@ -2001,11 +2078,13 @@ fn for_each(self, f: fn(T) -> () ! _) ! _ {
 }
 ```
 
+> **v1 note.** The `Iterator` adapters above illustrate the *shape* of wildcard forwarding; they do not describe v1 `Iterator`. In v1 the built-in `Iterator[T]` carrier is **pure** — an adapter callback that performs effects is a compile error, and the effect row is reserved in the carrier's internal representation, never spelled on a v1 surface signature (§3c.1 *Effectful Iteration: Deferred to v2*). The `! _` forwarding shown here is the reserved v2 shape and the live mechanism for ordinary user higher-order functions. It is used here because it is the clearest worked example of the wildcard rule.
+
 The wildcard `_` means: "whatever effects the callback has, this function has too." At call sites, the compiler resolves `_` to the concrete effects of the callback passed:
 
 ```blink
 fn process_items(items: List[Item]) ! DB.Read, IO.Log {
-    items.iter()
+    items.into_iter()
         .filter(fn(item) { item.is_active() })          // pure callback: _ = (nothing)
         .map(fn(item) {
             let price = db.query_one("SELECT ...")?       // _ = DB.Read
@@ -2092,7 +2171,7 @@ fn zip_with[A, B, C, e1, e2](f: fn(A) -> B ! e1, g: fn(B) -> C ! e2) -> Iterator
 
 Named variables enable: distinguishing effect sets from different callbacks, constraining effects (e.g., "callback may do IO but not DB"), and composing effect sets algebraically. The `_` wildcard is forward-compatible — it can desugar to an anonymous effect variable when named variables are added.
 
-**Effectful iteration:** The 3-2 vote deferring effectful iteration to v2 remains in effect. However, with `! _` on Iterator adapter signatures, effectful callbacks in `map`, `filter`, `fold`, and `for_each` become expressible once the Iterator trait is updated to carry wildcards. This update is a v2 change gated on real-world feedback.
+**Effectful iteration:** The vote deferring effectful iteration to v2 remains in effect. In v1 the `Iterator[T]` carrier is pure and its reserved effect row is invisible on every surface signature (§3c.1). Surfacing that row so effectful callbacks in `map`, `filter`, `fold`, and `for_each` become expressible is a conservative v2 extension, gated on real-world feedback.
 
 ---
 
