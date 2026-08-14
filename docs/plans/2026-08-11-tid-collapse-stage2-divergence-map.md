@@ -10060,6 +10060,102 @@ Archive-linked tydiv is recorded here as a **first basis**, not a comparison —
 No prior archive-linked tydiv sweep exists to diff against; the harness for it (`sweep_tydiv_arc.sh`)
 is new with this cell.
 
+## `859wey` — the Channel constructor and method arms, and the decline floor
+
+The ticket named one hole. There were two, and the one it named was inert.
+
+`get_builtin_fn_ret` had arms for `Map`, `Set`, `Bytes` and `StringBuilder` and none for
+`Channel`, so `Channel(n)` in call position answered `TYPE_UNKNOWN`. Adding the arm — minting
+`make_channel_type(make_metavar())`, exactly as Map and Set mint theirs — changed **nothing
+observable**. The fixture produced the identical four errors after a full regen.
+
+The operative hole was that `infer_type_uncached` has **no `obj_k == TyKind.Channel` arm at all**.
+Map, Set, Bytes, StringBuilder, Option, Result, Ptr, Template, FfiScope, Char, Int, Float, Str,
+List, Struct and Enum each have one; Channel had none. So nothing pinned the freshly minted α, and
+nothing typed `.recv()` either. `send` is the constraining use — the same role `insert` plays for
+Map and Set — so the pin goes through the same `check_builtin_arg`.
+
+Four defects, of which the ticket named three:
+
+| element | before | cause |
+|---|---|---|
+| `Str` | `error[UnresolvedMethod]: unresolved method '.len' on type ?` | the **codegen** backstop (`codegen_methods.bl:5817`), not typecheck's |
+| struct | cc: `request for member 'n' in something not a structure or union` | reinterpreted as an 8-byte word |
+| `Float` | cc: `cannot convert to a pointer type` | same |
+| `Int` | **passed** | `int64_t` is the erased default — and every channel test in the corpus used `Int` |
+
+The fourth, unnamed by the ticket: `.recv()` answered `Unknown` even on a fully annotated
+`Channel[Str]`, so its result was never compared against a declared type. `let x: Int =
+ch.recv()` on a `Str` channel was silently accepted.
+
+That last one is the shape worth carrying forward — **an arm that exists but is missing a method
+reads exactly like an arm that does not exist**, and the tell is always the same: a declared type
+that nothing rejects. The same probe run against `TyKind.Ptr` immediately found `deref` missing
+from an otherwise-populated arm (`0x2fv5`).
+
+### The retreat, and why it is not a workaround
+
+`recv` returns `TYPE_UNKNOWN` when the resolved element still holds an unbound metavar. A bare
+`Channel` annotation carries no element at all, so a send through `fn relay(src: Channel, dst:
+Channel)` pins the *callee's* element and never the caller's — making `recv` authoritative there
+turned `tests/test_channel_param.bl` into `error[CannotInferType]`. Erroring on the *read* would
+reject the program at the wrong place; the annotation is what is ill-formed. Filed as `m6ptme`,
+since resolved 6-0 as `error[TypeArgArity]` (E0303) at the annotation — `DECISIONS.md:349`, §3.4 —
+which is the correct place and retires this retreat. Impl: `xr792e`.
+
+`tests/test_w3v2e6_bare_channel_zero_truncation.bl` rows 6 and 7 were **deliberate tripwires**
+whose own comments said they must go red when the inference landed ("*When the inference lands this
+row goes red, which is the point: it must not slide in silently*"). Both were flipped to pin the
+correct answers. Row 7 asserts the **value** (`v=1.5`), not just a zero exit: an `int64_t` box
+would have accepted the double and printed `1`.
+
+### Census
+
+| bucket | before | after |
+|---|---|---|
+| `decline` | 109 | **74** |
+| `diverge` | 37 | 37 |
+| channel rows | 21 | **0** |
+| shapes *added* | — | **0** |
+
+Identical in both build modes — 74 / 37 with a byte-for-byte matching per-file distribution, which
+is the reconciliation `feedback_corpus_sweep_is_not_coverage` asks for and not a restatement of the
+monolithic figure.
+
+The 14 declines removed beyond the 21 channel rows are all in-family: `recv()`-result bindings, and
+`var=col` at `cli:2199`/`cli:2217` — the compiler's own one-slot bare-channel counter, which the
+`w3v2e6` fixture notes "worked before only because TWO bugs cancelled." The residue is 2 rows, both
+`var=val` in `test_channel_param.bl`: the bare-`Channel` retreat above.
+
+### The remaining 74 are fully attributed, and none of them needs a panel
+
+Stage 4's gate is the decline counter at 0. All 74 rows resolve to four decisions **that have all
+already been taken**, plus six plain bugs:
+
+| rows | family | decision | impl |
+|---|---|---|---|
+| 39 | adapter carriers + the pair binders downstream of them | `qzdz2e` — `Iterator[T]` is a sealed opaque carrier; collection adapters eager, iterator adapters lazy; zip/enumerate answer tuples (`DECISIONS.md:87-94`, §3c.1) | `ncnz6f` |
+| 18 | `fs.read` / `fs.list_dir` | `jr4xf7` — `Result[T, FsError]`; `fs.list_dir` name kept 6-0 (`:348`, §4.4.5) | `7an9p3` |
+| 8 | `p.deref()` (5) + `p.addr()` (3) | `mwsy85` — `deref() -> T` **bare**, `addr() -> Int` **numeric** (`:202`, §9.1.1) | `5zz0nw`, `0x2fv5` |
+| 3 | bare `Channel` annotation | `m6ptme` — `error[TypeArgArity]` E0303 (`:349`, §3.4) | `xr792e` |
+| 6 | `Ok(100)` with the Err side unbound (4), `ty=Self` (1, `3xhh59`), closure body with no tid (1) | none — plain bugs | — |
+
+Two attribution traps cost real time here, both the same mistake in different clothes:
+
+- **A ticket's title is not its premise.** `44xww4` was cited for the 18 tuple-binder rows; it is
+  closed and was `type:bug`. Those rows are `let e = a.enumerate()` followed by `let p0 =
+  e.get(0).unwrap()` — the binder is `?` only because the **carrier** is. Confirmed by
+  construction: `for p in a.enumerate()` produces **zero** declines, because nothing binds the
+  carrier. There is no separate element question; they fold into `qzdz2e`.
+- **The site's own comment is the authority on why it was left alone.** `fs.*` reads as ordinary
+  plumbing from the emitted type, and `Ptr.deref` reads as a trivially missing arm. Both had their
+  reason recorded in a comment at the exact line — `register_ns_intrinsic_sigs`
+  (`typecheck.bl:2390`) lists the `fs` family as deliberately unsigned, and `mwsy85` had already
+  catalogued deref/addr. Checking `br` by title found neither.
+
+So the honest read of the gate: the counter **can** reach 0, and the critical path is four
+implementation projects rather than any further deliberation.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
