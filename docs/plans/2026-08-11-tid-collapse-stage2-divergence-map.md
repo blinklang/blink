@@ -11072,6 +11072,87 @@ Both anomalies point the same way, which is worth stating plainly: a cell that d
 automatically "codegen has no channel." Once it was read correctly, one of these was a probe bug and
 the other was a typechecker soundness bug. Neither was what the raw number suggested.
 
+## Flipping the four measured cells, and a global that is declared twice
+
+Four of the five Unit E cells were flippable. Only one of them changes emitted C.
+
+### `match.scrut_scalar` — the red test came back for the wrong reason first
+
+The scrutinee temp's own branch gate excludes `CT_ENUM` outright, so the natural probe —
+`match pick2() { Col.Red => 1 ... }` — emits no temp at all and the row failed with "found 0"
+rather than with the erasure it was meant to pin. Reading the emitted C showed why: with QUALIFIED
+variant arms the scrutinee takes a different branch, one that **re-embeds the scrutinee expression
+in every arm test**, so `blink_u_pick2()` is called once per arm. With BARE variant arms it reaches
+the scalar branch and lands in `int64_t _scrut_16 = blink_u_pick2();` — the erasure, as expected.
+
+So an enum only arrives at this cell ALREADY erased to a scalar CT, which is exactly why the flat
+path had no name left to spell. The test row now uses bare arms and says so, because the qualified
+form silently does not reach the position.
+
+The double evaluation on the qualified path is a separate defect, filed `nyzkzs` (P1). It is real
+and observable, not a reading of the C: a `match` on a counter-incrementing fn reports `calls=3`
+with qualified arms and `calls=1` with bare arms, same program. The scalar branch's own comment says
+the temp exists precisely to stop a side-effecting scrutinee running once per arm — so the bare form
+is correct **by accident**, via the very erasure this cell was flipped to undo. Worth noting for
+Stage 4: fixing the erasure without fixing `nyzkzs` first would not regress it (the enum branch never
+had the temp either way), but the accident is the kind of thing that looks like a regression later.
+
+Red -> green on `tests/test_0rmamy_enum_local_decl_typedef.bl`, 15/15.
+
+### The three no-ops, and why two of them still got split
+
+`tuple_scrut_elem` (15/0/0) flips as-is: its genuine-Void case is handled by the branch above, so a
+`"void"` from the tid is a decline rather than a real Void.
+
+`with_resource_temp` and `top_level_let` both spelled a STRUCT arm through the same variable as
+their flat arm. Flipping either blind would have substituted the tid's logical answer where the
+physical type is a struct — the third position rule. Both were split first, and the split conserves
+all three columns exactly:
+
+| | agree | diverge | missing |
+| --- | --- | --- | --- |
+| `with_resource_temp` (before) | 153 | 0 | 0 |
+| `with_resource_flat` | 104 | 0 | 0 |
+| `with_resource_struct` | 49 | 0 | 0 |
+
+### A global is declared twice, on two different runs
+
+`top_level_let` turned out not to be one declaration site but two: the archive-header `extern`
+(`codegen_stmt.bl:10039`) and the definition (`:10233`), spelling the same C object from two
+independently-computed local variables. They are emitted on different runs — the header when the
+stdlib archive is built, the definition when the TU is compiled — so a flip applied to one and not
+the other is a link-time type error that no single build would catch.
+
+Both now go through one `top_level_let_type_str` helper, so they cannot drift by construction. That
+is the real fix; the flip is incidental to it.
+
+The header cell does not appear in the corpus sweep at all, because the sweep never builds the
+archive header. Per `feedback_corpus_sweep_is_not_coverage` an absent cell is an unexercised tap,
+not a clean one, so it was fired directly:
+
+    BLINK_TRACE_CHANNELS=ctypediv BLINK_FORCE_STDLIB_REBUILD=1 build/blink __build-stdlib-archive
+
+    ctype.top_level_let          107 / 0 / 0
+    ctype.top_level_let_header    49 / 0 / 0
+
+### Post-flip census
+
+| cell | mono | arc |
+| --- | --- | --- |
+| `match.scrut_scalar` | 38 / 11 / 0 | 38 / 11 / 0 |
+| `tuple_scrut_elem` | 15 / 0 / 0 | 15 / 0 / 0 |
+| `with_resource_flat` | 104 / 0 / 0 | 104 / 0 / 0 |
+| `with_resource_struct` | 49 / 0 / 0 | 49 / 0 / 0 |
+| `top_level_let` | 27231 / 0 / 3 | 26363 / 0 / 3 |
+
+The 11 `match.scrut_scalar` diverges are now corrections the tid applied, per the post-flip
+convention — the `emitted` column at a flipped site is deliberately the flat candidate. The three
+`top_level_let` declines remain `n90j7j`.
+
+**No emit lag.** Unlike the two result-temp flips, `task regen` reached the fixed point in one pass:
+the compiler's own source has no bare-variant enum match reaching the scalar scrutinee branch, so
+none of its emitted C changed. `task ci` green.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

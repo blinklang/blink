@@ -88,6 +88,8 @@ fn probe_src() -> Str {
     s = s.concat("trait Pick \{\n    fn pick_it(self) -> Col\n}\n")
     s = s.concat("impl Pick for Bx \{\n    fn pick_it(self) -> Col \{ self.k }\n}\n")
     s = s.concat("fn pick() -> Col \{ Col.Red }\n")
+    // Reached only as a match scrutinee, so `= blink_u_pick2();` locates exactly one temp.
+    s = s.concat("fn pick2() -> Col \{ Col.Green }\n")
     s = s.concat("fn idc[T](x: T) -> T \{ x }\n")
     s = s.concat("fn score(c: Col) -> Int \{\n    match c \{\n        Col.Red => 1\n        Col.Green => 2\n    }\n}\n")
     s = s.concat("fn main() \{\n")
@@ -107,9 +109,12 @@ fn probe_src() -> Str {
     s = s.concat("    let mp: Map[Str, Col] = Map()\n")
     s = s.concat("    let from_map = mp.get(\"x\") ?? Col.Green\n")
     s = s.concat("    let from_if = if true \{ Col.Red } else \{ Col.Green }\n")
+    // BARE variant arms deliberately: qualified `Col.Red` arms take a different branch that emits
+    // no scrutinee temp at all, so they would not reach the position this row pins.
+    s = s.concat("    let from_scrut = match pick2() \{\n        Red => 1\n        Green => 2\n    }\n")
     s = s.concat("    let total = score(from_call) + score(from_variant) + score(from_unwrap) + score(from_field)\n")
     s = s.concat("    let more = score(from_method) + score(from_generic) + score(from_match) + score(from_mut)\n")
-    s = s.concat("    let rest = score(from_list) + score(from_map) + score(from_if)\n")
+    s = s.concat("    let rest = score(from_list) + score(from_map) + score(from_if) + from_scrut\n")
     s = s.concat("    io.println(\"\{total} \{more} \{rest}\")\n")
     s = s.concat("}\n")
     s
@@ -178,6 +183,32 @@ fn assert_temp_decl_enum(c: Str, name: Str) {
     assert(!c.contains(bad))
 }
 
+// The match SCRUTINEE temp, which the helper above cannot reach: it is declared and initialized on
+// one line and no named local ever reads it, so it has to be found by its initializer instead. The
+// count check is part of the assertion, not decoration — a row that silently matches nothing would
+// pass while the temp stayed erased.
+fn assert_scrut_temp_enum(c: Str, call: Str) {
+    let anchor = " = {call};"
+    let ls = c.lines()
+    let mut found = 0
+    let mut i = 0
+    while i < ls.len() {
+        let line = ls.get(i).unwrap().trim()
+        if line.contains(anchor) && line.contains("_scrut_") {
+            found = found + 1
+            if !line.starts_with("blink_Col ") {
+                io.println("FAIL: scrutinee temp declared `{line}` — want a blink_Col declaration")
+            }
+            assert(line.starts_with("blink_Col "))
+        }
+        i = i + 1
+    }
+    if found != 1 {
+        io.println("FAIL: found {found} `_scrut_` temps initialized from `{call}`, want exactly 1")
+    }
+    assert(found == 1)
+}
+
 // ════ The six positions that lost the enum name ═══════════════════════════════
 //
 // One test per position rather than one test with six rows: these are six independent cells of
@@ -209,6 +240,13 @@ test "the if expression's own result temp is declared with the enum typedef" {
 // the if-expression did.
 test "the match expression's own result temp is declared with the enum typedef" {
     assert_temp_decl_enum(emitted_c(), "from_match")
+}
+
+// The third anonymous temp, on the input side rather than the result side. Its branch gate
+// excludes CT_ENUM outright, so an enum only reaches it ALREADY erased to a scalar CT — which is
+// why the flat path had no name left to spell and declared int64_t.
+test "the match scrutinee's own temp is declared with the enum typedef" {
+    assert_scrut_temp_enum(emitted_c(), "blink_u_pick2()")
 }
 
 // The mut row is separate because it takes a different arm of the declaration chain (no

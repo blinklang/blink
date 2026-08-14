@@ -871,8 +871,13 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                         emit_line("int64_t {tmp} = 0;")
                     } else {
                         let tup_flat_c = c_type_str(expr_result_type)
-                        ctype_probe_at(cg_node_mono_tid(match_tuple_elem_node), "tuple_scrut_elem", tmp, tup_flat_c, match_tuple_elem_node)
-                        emit_line("{tup_flat_c} {tmp} = {expr_result_str};")
+                        let tup_tid = cg_node_mono_tid(match_tuple_elem_node)
+                        ctype_probe_at(tup_tid, "tuple_scrut_elem", tmp, tup_flat_c, match_tuple_elem_node)
+                        let tup_spelled = c_type_from_tid(tup_tid)
+                        // The genuine-Void case is handled by the branch above, so a "void" here is
+                        // the tid declining rather than a real Void, and the flat spelling stands.
+                        let tup_ts = if tup_spelled != "" && tup_spelled != "void" { tup_spelled } else { tup_flat_c }
+                        emit_line("{tup_ts} {tmp} = {expr_result_str};")
                     }
                     set_var(tmp, expr_result_type, 1)
                     match_scruts.push(MatchScrutEntry { str_val: tmp, scrut_type: expr_result_type })
@@ -1028,8 +1033,18 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
             // reads `.tag` on a scrutinee that still reports a scalar CT.
             let scrut_tmp = fresh_temp("_scrut_")
             let scrut_flat_c = c_type_str(expr_result_type)
-            ctype_probe_at(cg_node_mono_tid(scrut), "match.scrut_scalar", scrut_tmp, scrut_flat_c, scrut)
-            emit_line("{scrut_flat_c} {scrut_tmp} = {expr_result_str};")
+            let scrut_tid = cg_node_mono_tid(scrut)
+            ctype_probe_at(scrut_tid, "match.scrut_scalar", scrut_tmp, scrut_flat_c, scrut)
+            // The gate above excludes CT_ENUM, so an enum only arrives here already erased to a
+            // scalar CT and the flat spelling has no name left to give. The tid still has it.
+            //
+            // Safe for the same reason as the two result temps: every carrier kind is routed to an
+            // earlier branch, so what reaches this one is a scalar or a pointer, and those convert
+            // implicitly in C even where the position's physical type is an erased vtable slot.
+            let scrut_spelled = c_type_from_tid(scrut_tid)
+            // A temp is a STORAGE position, so a genuine Void keeps the flat placeholder.
+            let scrut_ts = if scrut_spelled != "" && scrut_spelled != "void" { scrut_spelled } else { scrut_flat_c }
+            emit_line("{scrut_ts} {scrut_tmp} = {expr_result_str};")
             set_var(scrut_tmp, expr_result_type, 1)
             match_scruts.push(MatchScrutEntry { str_val: scrut_tmp, scrut_type: expr_result_type })
         } else if expr_result_type == CT_STRUCT && tuple_struct_arity(get_var_struct(expr_result_str)) >= 0 {
@@ -5407,8 +5422,27 @@ fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Code
             let res_type = expr_result_type
             let res_struct = get_var_struct(res_str)
             let tmp = fresh_temp("_wr_")
-            let c_decl = if res_struct != "" { c_type_c_name(res_struct) } else { c_type_str(res_type) }
-            ctype_probe_at(cg_node_mono_tid(res_expr), "with_resource_temp", tmp, c_decl, res_expr)
+            let mut c_decl = ""
+            let mut wr_is_flat = 0
+            if res_struct != "" {
+                c_decl = c_type_c_name(res_struct)
+            } else {
+                c_decl = c_type_str(res_type)
+                wr_is_flat = 1
+            }
+            let wr_tid = cg_node_mono_tid(res_expr)
+            if wr_is_flat == 0 {
+                // A struct resource keeps its own spelling: inside a handler implementation that
+                // spelling is the effect slot's erased one, and the two are different structs, so
+                // the tid's logical answer cannot be substituted here.
+                ctype_probe_at(wr_tid, "with_resource_struct", tmp, c_decl, res_expr)
+            } else {
+                ctype_probe_at(wr_tid, "with_resource_flat", tmp, c_decl, res_expr)
+                let wr_spelled = c_type_from_tid(wr_tid)
+                // Both the temp and the binding below are STORAGE positions, so a genuine Void
+                // keeps the flat placeholder.
+                if wr_spelled != "" && wr_spelled != "void" { c_decl = wr_spelled }
+            }
             if res_struct != "" && lookup_impl_type_for_trait("BlockHandler", res_struct) == 1 {
                 emit_bh_setup(res_struct, res_str, binding, bh_state_vars)
             } else if res_struct != "" && lookup_impl_type_for_trait("Closeable", res_struct) == 1 {
@@ -9951,6 +9985,27 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
 // ── Top-level: generate ─────────────────────────────────────────────
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
+// The spelling of a module-level `let`, shared by the archive-header `extern` and the definition.
+// These are two declarations of ONE C object emitted on different runs, so they must not be able to
+// drift: a header that spells a global differently from its definition is a link-time type error.
+//
+// Two tid channels, in this order. The top-level walk records an ANNOTATED binding's tid in a
+// module-keyed map and never touches the value node; it memoizes the value node only for a bare
+// literal. Reading either alone reports the other's population as untyped.
+fn top_level_let_type_str(node: Int, name: Str, tuple_struct: Str, val_type: Int, cell: Str) -> Str {
+    let flat = if tuple_struct != "" { c_type_c_name(tuple_struct) } else { c_type_str(val_type) }
+    let map_tid = tc_top_level_let_tid(node_module(node), name)
+    let tid = if map_tid >= 0 { map_tid } else { cg_node_mono_tid(node_value(node)) }
+    ctype_probe_at(tid, cell, name, flat, node)
+    // A tuple-struct global keeps its own spelling for the same reason the match carrier does: two
+    // struct types do not convert implicitly, so the tid's logical answer cannot be substituted.
+    if tuple_struct != "" { return flat }
+    let spelled = c_type_from_tid(tid)
+    // A global is a STORAGE position, so a genuine Void keeps the flat placeholder.
+    if spelled != "" && spelled != "void" { return spelled }
+    flat
+}
+
 pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     if cg_archive_header_mode != 0 && skip_private_in_module_header(node) {
         return
@@ -10002,7 +10057,7 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
     // tracking side effects below — those are body-emission state, not
     // header concerns.
     if cg_archive_header_mode != 0 {
-        let ts_h = if tuple_struct != "" { c_type_c_name(tuple_struct) } else { c_type_str(val_type) }
+        let ts_h = top_level_let_type_str(node, name, tuple_struct, val_type, "top_level_let_header")
         let cname_h = c_safe_name(name)
         let needs_init_h = helper_lines.len() > 0 || val_type == CT_LIST || val_type == CT_MAP || val_type == CT_SET || val_type == CT_CHANNEL
         let const_q_h = if is_mut == 0 && !needs_init_h && val_type != CT_STRING { "const " } else { "" }
@@ -10196,15 +10251,9 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
         expr_list_elem_type = -1
         expr_list_elem_struct = ""
     }
-    let ts = if tuple_struct != "" { c_type_c_name(tuple_struct) } else { c_type_str(val_type) }
     // A module-level `let` is a separate declaration chain from emit_let_binding's, so it gets its
-    // own cell rather than riding the local one. Two channels, in this order: the top-level walk
-    // records an ANNOTATED binding's tid in a module-keyed map and never touches the value node,
-    // and it memoizes the value node only for a bare literal. Reading either alone reports the
-    // other's population as untyped.
-    let tll_map_tid = tc_top_level_let_tid(node_module(node), name)
-    let tll_tid = if tll_map_tid >= 0 { tll_map_tid } else { cg_node_mono_tid(node_value(node)) }
-    ctype_probe_at(tll_tid, "top_level_let", name, ts, node)
+    // own cell rather than riding the local one.
+    let ts = top_level_let_type_str(node, name, tuple_struct, val_type, "top_level_let")
     let cname = c_safe_name(name)
     let needs_init = helper_lines.len() > 0 || val_type == CT_LIST || val_type == CT_MAP || val_type == CT_SET || val_type == CT_CHANNEL
     let is_const = is_mut == 0 && !needs_init && val_type != CT_STRING
