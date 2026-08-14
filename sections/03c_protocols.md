@@ -4,162 +4,81 @@
 
 `for x in collection { }` is Blink's primary iteration construct. It requires a formal protocol: two compiler-known traits that define what "iterable" means and how iteration proceeds.
 
-#### The `Iterator` Trait
+#### Two Iteration Worlds: Eager Collections, Lazy Iterators
 
-```blink
-trait Iterator[T] {
-    fn next(self) -> Option[T]
-}
-```
+Blink has two distinct worlds, and one door between them.
 
-One required method. Call `next()` repeatedly; it returns `Some(value)` for each element and `None` when exhausted. An iterator is a stateful cursor — once `next()` returns `None`, subsequent calls continue to return `None`.
+- A **collection** (`List`, `Set`, `Map`, `Range`, `Str`) is a value you already hold. Its adapter methods are **eager**: `list.map(f)` walks the list now and returns a new `List`. A collection method takes a collection and answers a collection.
+- An **`Iterator[T]`** is a lazy, single-pass *recipe* for producing elements on demand. Its adapter methods are **lazy**: they build a pipeline description and touch no elements until something consumes them. An iterator method takes an iterator and answers an iterator.
 
-**Why single-method.** `has_next()` + `next()` (Java) requires callers to coordinate two calls and creates invalid states (calling `next()` without `has_next()`). A single `next() -> Option[T]` encodes both "is there more?" and "give me the value" in one atomic operation. No invalid states, no double calls, no off-by-one bugs. (Vote: 3-2, Systems and PLT dissented wanting `size_hint()`.)
+The one rule that governs both worlds:
 
-#### The `IntoIterator` Trait
+> **Collection method in, collection out. Iterator method in, iterator out. `.into_iter()` is the door.**
 
-```blink
-trait IntoIterator[T] {
-    fn into_iter(self) -> Iterator[T]
-}
-```
-
-`IntoIterator` converts a value into an `Iterator`. This separates "thing that can be iterated" (a collection) from "thing that tracks iteration state" (an iterator). Collections implement `IntoIterator`; the returned `Iterator` does the actual traversal.
-
-```blink
-impl IntoIterator[T] for List[T] {
-    fn into_iter(self) -> Iterator[T] {
-        ListIterator { items: self, index: 0 }
-    }
-}
-```
-
-Iterators themselves implement `IntoIterator` trivially (return `self`), so you can pass an iterator where an iterable is expected:
-
-```blink
-impl IntoIterator[T] for Iterator[T] {
-    fn into_iter(self) -> Iterator[T] { self }
-}
-```
-
-**Why the separation.** A `List[Str]` is not an iterator — it has no cursor position. If `List` implemented `Iterator` directly, iterating the same list twice would require resetting internal state, and two concurrent `for` loops over the same list would interfere. `IntoIterator` produces a fresh `Iterator` each time, so:
+`.into_iter()` crosses from a collection into the lazy world; `.collect()` crosses back. There is no implicit conversion in either direction (§3c.2 — Blink has no implicit conversions), so the boundary is always visible in source.
 
 ```blink
 let names = ["Alice", "Bob", "Carol"]
-for n in names { io.println(n) }   // first pass — fresh iterator
-for n in names { io.println(n) }   // second pass — new fresh iterator
+
+let shouted = names.map(fn(n) { n.to_upper() })   // eager — shouted : List[Str]
+
+let first_two = names
+    .into_iter()                       // cross into the lazy world
+    .filter(fn(n) { n.len() > 3 })
+    .take(2)
+    .collect()                    // cross back — first_two : List[Str]
 ```
 
-Both loops work correctly. Each `for` calls `names.into_iter()` independently.
+**Why eager collection adapters.** A `List` is data you already have in memory; mapping over it should give you data you already have. Every mainstream ecosystem that a working programmer knows — JavaScript `Array.map`, Python list comprehensions, Kotlin `List.map`, Java requiring an explicit `.stream()` first — landed on *eager on the collection, lazy opt-in on a separate carrier*. Making `list.map` lazy imports the single most-asked lazy-evaluation footgun: a side-effecting map that is never consumed silently does nothing, with no diagnostic — which contradicts Blink's stance that under-determined behavior is a hard error, not a silent guess (§3.4 *Under-Determined Types*, `E0301`). Eager keeps evaluation order equal to source order. (Vote: 5-0, Minimalism dissented — see below.)
 
-#### `for` Loop Desugaring
+**Why not one uniform rule.** Making *all* adapters lazy is one rule instead of two, and the Minimalism panelist held that line: `list.map(f).filter(g).sum()` under eager evaluation allocates intermediate lists that a uniform-lazy pipeline would not. The trade the majority accepted: the two-worlds cost is a *type mismatch on a named type* — `expected List[Int], found Iterator[Int]`, fixed by adding `.collect()` or dropping `.into_iter()` — which is loud, greppable, and self-correcting, whereas the uniform-lazy cost is a *silent no-op* that produces a wrong program with a green build. A benign, frequent, self-correcting error beats a fatal, frequent, silent one. Blink also has effect rows: an eager adapter chain whose closures are pure is provably deforestable, so the intermediate lists are a *permitted* optimization target, not a permanent tax. (Minimalism dissent recorded: [Iterator Protocol rationale](../decisions/iterator-protocol.md).)
 
-The compiler desugars `for x in expr { body }` into:
+#### `Iterator[T]` — a Sealed, Lazy Carrier
+
+`Iterator[T]` is a **built-in, sealed, opaque type**, not a user-implementable trait. Its representation is unspecified: it holds a source plus a chain of adapters, and the compiler chooses the layout. Users cannot write `impl Iterator[Int] for Foo` — the type is closed, exactly as `Str` and `List` are closed. Its adapter surface is a sealed set of built-in methods (dispatched like `StrOps`/`ListOps`, §3c.4), which no user program may extend or override.
+
+An iterator is a **restartable recipe, not a stateful cursor.** This is forced by Blink's value semantics: values are copied on bind (§3.6, there is no `&mut self`), and there is no linearity checker to forbid aliasing. If an iterator were a mutable cursor, `let b = a` would give two handles to one advancing position, and advancing `b` would observably advance `a` — mutable state aliased through a value type, which the language forbids everywhere else. Modeling the carrier as a persistent recipe — conceptually `Unit -> Option[(T, Iterator[T])]`, the same shape as OCaml's `Seq.t` — removes the hazard: each node is re-entered, never mutated in place, so copying is free and re-traversal recomputes rather than resumes.
 
 ```blink
-let mut __iter = expr.into_iter()
-loop {
-    match __iter.next() {
-        Some(x) => { body }
-        None => break
-    }
-}
+let evens = (0..10).into_iter().filter(fn(n) { n % 2 == 0 })
+let a = evens.collect()   // [0, 2, 4, 6, 8]
+let b = evens.collect()   // [0, 2, 4, 6, 8] — re-traversal recomputes; `a` is unaffected
 ```
 
-`break` exits the loop. `continue` skips to the next `__iter.next()` call. This desugaring is the *only* way `for` interacts with the iterator protocol — no special compiler magic beyond calling `into_iter()` and `next()`.
+The one exception is an iterator built from a mutable closure (`iter.from_fn`, below): its re-traversal behaviour is **unspecified** — it may resume rather than restart. Iterators derived from a collection via `.into_iter()` are always restartable.
 
 #### Lazy Adapter Methods
 
-Iterator adapters are default methods on `Iterator`. They return new lazy iterators that transform elements on demand — no intermediate collections are allocated.
+The adapter methods on `Iterator[T]` are lazy: each returns a new iterator and touches no elements until a consuming method or a `for` loop pulls from the end. They are compiler-provided; the bodies are internal (the carrier layout is unspecified), so only signatures are shown.
 
 ```blink
-trait Iterator[T] {
-    fn next(self) -> Option[T]
+// Transforming
+fn map[U](self, f: fn(T) -> U) -> Iterator[U]
+fn filter(self, predicate: fn(T) -> Bool) -> Iterator[T]
+fn flat_map[U](self, f: fn(T) -> Iterator[U]) -> Iterator[U]
 
-    // Transforming
-    fn map[U](self, f: fn(T) -> U) -> Iterator[U] {
-        MapIterator { source: self, f }
-    }
+// Slicing
+fn take(self, n: Int) -> Iterator[T]
+fn skip(self, n: Int) -> Iterator[T]
 
-    fn filter(self, predicate: fn(T) -> Bool) -> Iterator[T] {
-        FilterIterator { source: self, predicate }
-    }
+// Combining
+fn zip[U](self, other: Iterator[U]) -> Iterator[(T, U)]
+fn enumerate(self) -> Iterator[(Int, T)]
+fn chain(self, other: Iterator[T]) -> Iterator[T]
 
-    // Slicing
-    fn take(self, n: Int) -> Iterator[T] {
-        TakeIterator { source: self, remaining: n }
-    }
-
-    fn skip(self, n: Int) -> Iterator[T] {
-        SkipIterator { source: self, remaining: n }
-    }
-
-    // Combining
-    fn zip[U](self, other: Iterator[U]) -> Iterator[(T, U)] {
-        ZipIterator { a: self, b: other }
-    }
-
-    fn enumerate(self) -> Iterator[(Int, T)] {
-        EnumerateIterator { source: self, index: 0 }
-    }
-
-    fn chain(self, other: Iterator[T]) -> Iterator[T] {
-        ChainIterator { first: self, second: other }
-    }
-
-    // Consuming (these drain the iterator)
-    fn collect(self) -> List[T] {
-        let mut result = []
-        for item in self {
-            result.push(item)
-        }
-        result
-    }
-
-    fn fold[U](self, init: U, f: fn(U, T) -> U) -> U {
-        let mut acc = init
-        for item in self {
-            acc = f(acc, item)
-        }
-        acc
-    }
-
-    fn count(self) -> Int {
-        self.fold(0, fn(n, _) { n + 1 })
-    }
-
-    fn any(self, predicate: fn(T) -> Bool) -> Bool {
-        for item in self {
-            if predicate(item) { return true }
-        }
-        false
-    }
-
-    fn all(self, predicate: fn(T) -> Bool) -> Bool {
-        for item in self {
-            if !predicate(item) { return false }
-        }
-        true
-    }
-
-    fn find(self, predicate: fn(T) -> Bool) -> Option[T] {
-        for item in self {
-            if predicate(item) { return Some(item) }
-        }
-        None
-    }
-
-    fn flat_map[U](self, f: fn(T) -> Iterator[U]) -> Iterator[U] {
-        FlatMapIterator { source: self, f, current: None }
-    }
-
-    fn for_each(self, f: fn(T)) {
-        for item in self { f(item) }
-    }
-}
+// Consuming (these drain the iterator)
+fn collect(self) -> List[T]
+fn fold[U](self, init: U, f: fn(U, T) -> U) -> U
+fn count(self) -> Int
+fn any(self, predicate: fn(T) -> Bool) -> Bool
+fn all(self, predicate: fn(T) -> Bool) -> Bool
+fn find(self, predicate: fn(T) -> Bool) -> Option[T]
+fn for_each(self, f: fn(T))
 ```
 
-**Lazy means no work until consumed.** Calling `.map(f).filter(p)` builds a pipeline description — zero elements are processed. Elements flow through the pipeline one at a time when a consuming method (`collect`, `fold`, `count`, `for_each`, `any`, `all`, `find`) or a `for` loop pulls from the end.
+`zip` and `enumerate` answer **tuples** — `Iterator[(T, U)]` and `Iterator[(Int, T)]` — never `List[List[...]]`, which would erase the element types (there is no type that is "`Int` or `T`"). (Vote: 6-0.)
+
+**Lazy means no work until consumed.** `.map(f).filter(p)` builds a pipeline description — zero elements are processed. Elements flow through one at a time when a consuming method (`collect`, `fold`, `count`, `for_each`, `any`, `all`, `find`) or a `for` loop pulls from the end.
 
 ```blink
 // No intermediate List allocated — elements flow one at a time
@@ -171,11 +90,41 @@ let result = names
     .collect()   // materialization point
 ```
 
-**Why lazy by default.** Eager adapters (Python's `list.map()` style) allocate intermediate collections at every step. Chaining `.map().filter().take(5)` on a million-element list would allocate three intermediate lists, processing all million elements, only to discard all but 5. Lazy evaluation processes only what's needed — if `.take(5)` finds 5 matching elements after examining 20, the remaining 999,980 are never touched. (Vote: 5-0.)
+**Why lazy in the iterator world.** Chaining `.map().filter().take(5)` on a million-element source would, under eager evaluation, process all million elements only to discard all but 5. Lazy evaluation processes only what is needed — if `.take(5)` is satisfied after examining 20 elements, the remaining 999,980 are never touched. Laziness is the whole point of crossing into the iterator world with `.into_iter()`; the collection world stays eager. (Vote: 5-0.)
 
-**Why default methods.** Implement `next()` and get the entire adapter library for free. This minimizes what users (and AI) must write for custom iterators: one method, not twenty. Collections can override specific adapters for performance — `List.count()` can return the stored length rather than iterating. (Vote: 5-0.)
+#### `for` Loop Desugaring and `IntoIterator`
 
-#### Built-in IntoIterator Implementations
+`for` iterates anything that produces an `Iterator`. The bridge is the compiler-known `IntoIterator` trait, whose one method `into_iter` is the crossing door — **the same call `.into_iter()` you write by hand** to move from a collection into the lazy world. There is one name for the crossing:
+
+```blink
+trait IntoIterator[T] {
+    fn into_iter(self) -> Iterator[T]
+}
+```
+
+The compiler desugars `for x in expr { body }` into:
+
+```blink
+let mut __iter = expr.into_iter()
+loop {
+    match __iter.next() {   // next() is the carrier's internal pull; not a public method
+        Some(x) => { body }
+        None => break
+    }
+}
+```
+
+`break` exits the loop; `continue` skips to the next internal pull. `expr.into_iter()` produces a fresh iterator each time, so two `for` loops over the same collection do not interfere:
+
+```blink
+let names = ["Alice", "Bob", "Carol"]
+for n in names { io.println(n) }   // first pass — fresh iterator
+for n in names { io.println(n) }   // second pass — new fresh iterator
+```
+
+Writing `.into_iter()` explicitly (the door of §3c.1) and letting `for` desugar to it are the same operation — `for n in names` and `for n in names.into_iter()` are equivalent, because `names.into_iter()` already yields an `Iterator[T]` and `Iterator`'s own `into_iter()` is the identity.
+
+**`IntoIterator` is sealed in v1.** Only the built-in collections (and `Iterator` itself, reflexively) implement it. A user type cannot yet implement `IntoIterator` directly — that extension point is deferred to v2 (see below). The built-in implementations:
 
 | Type | `into_iter()` yields | Notes |
 |------|---------------------|-------|
@@ -186,28 +135,22 @@ let result = names
 | `Str` | `Char` | Unicode scalar values |
 | `Iterator[T]` | `T` | Identity (returns self) |
 
-#### Example: Custom Iterator
+#### Custom Iteration: `iter.from_fn`
+
+Because `Iterator` is sealed, a custom source does not implement a trait — it *constructs* an iterator with the free function `iter.from_fn`, which wraps a closure that yields `Some(value)` per element and `None` at the end. The closure holds its state in ordinary `mut` captures, the same way every other closure in the language does:
 
 ```blink
-type Fibonacci {
-    a: Int
-    b: Int
+fn fibonacci() -> Iterator[Int] {
+    let mut a = 0
+    let mut b = 1
+    iter.from_fn(fn() {
+        let v = a
+        a = b
+        b = v + b
+        Some(v)
+    })
 }
 
-fn fibonacci() -> Fibonacci {
-    Fibonacci { a: 0, b: 1 }
-}
-
-impl Iterator[Int] for Fibonacci {
-    fn next(self) -> Option[Int] {
-        let value = self.a
-        self.a = self.b
-        self.b = value + self.b
-        Some(value)
-    }
-}
-
-// Usage
 let fibs = fibonacci()
     .take(10)
     .collect()   // [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
@@ -218,9 +161,41 @@ let sum_of_even_fibs = fibonacci()
     .fold(0, fn(acc, n) { acc + n })
 ```
 
+`iter.unfold(init, step)` is the same idea with the state passed explicitly rather than captured: `step` takes the current state and returns `Some((element, next_state))` or `None`.
+
+An iterator built by `from_fn` is **one-shot**: its captured state advances as it is consumed, so re-traversing it is unspecified. This is the deliberate exception to the restartable-recipe rule above — collection-derived iterators restart, `from_fn` iterators may not.
+
+**To make your own type iterable in v1**, expose a method that returns an iterator, and iterate that:
+
+```blink
+trait Walkable {
+    fn walk(self) -> Iterator[Int]
+}
+
+impl Walkable for Tree {
+    fn walk(self) -> Iterator[Int] {
+        // ... build and return an iterator over the tree, e.g. via iter.from_fn
+    }
+}
+
+for x in my_tree.walk() { io.println("{x}") }
+```
+
+`walk` is a plain user method that returns an `Iterator[T]`; the `for` loop then drives that carrier directly. This is one visible method call, not a materializing `.to_list()`. Because `IntoIterator` is sealed in v1, `walk` cannot be named `into_iter` and made implicit — writing `for x in my_tree` directly is the v2 extension below.
+
+#### Sealed in v1, User `IntoIterator` Deferred to v2
+
+Both `Iterator` and `IntoIterator` are **sealed** in v1: users construct iterators with `iter.from_fn`, but cannot implement either trait for their own types. The panel chose to stage the open extension point rather than ship it now (Vote: Phase B 3-3 → Phase D **4-2** for staging; DevOps and Minimalism dissented, wanting `IntoIterator` opened in v1).
+
+The reasoning: unsealing is a *monotone*, non-breaking change — v2 can open `IntoIterator` to user types without invalidating a single v1 program — whereas shipping an open protocol whose central invariant (carrier persistence) cannot yet be stated in the type system is not reversible. v1's real `from_fn` usage becomes the evidence that shapes v2's open-world design, including the diagnostics and completion the open trait will need. In v2, `for x in my_tree` (no `.into_iter()`) becomes expressible by implementing `IntoIterator[T] for Tree` with `into_iter` returning the sealed carrier.
+
+Only `IntoIterator` is the extension point that opens. `Iterator[T]` itself — the carrier type and its adapter surface — stays **sealed permanently**: a user type becomes iterable by *producing* an `Iterator` (via `into_iter`), never by *being* one. This keeps the carrier's layout and its persistence invariant fully under compiler control for all versions.
+
 #### Effectful Iteration: Deferred to v2
 
-The v1 `Iterator` trait is pure — `next()` cannot perform effects. This means `for line in file.lines() ! IO` is not expressible through the iterator protocol in v1.
+The v1 iterator is **pure** — an adapter closure that performs effects is a v1 error, and `Iterator[T]` carries exactly one user-visible type parameter, now and permanently. This means `for line in file.lines() ! IO` is not expressible through the iterator protocol in v1.
+
+The effect row is **reserved** rather than surfaced: it lives only in the carrier's internal representation (the monomorphization key, §4.15.3), never in v1 surface syntax or diagnostics. Because `Iterator[T]` stays a one-parameter type and the row rides the internal mono key, v2 can widen the family to effectful iteration as a **conservative extension** — every v1 program keeps its exact typing — instead of a breaking change that would rewrite the effect signature of every function that touches an iterator. (The PLT panelist argued for threading a live effect-row variable through the v1 checker immediately; the panel reserved the design without building the checker plumbing yet.)
 
 **Workaround for v1:** Use explicit loops with effect-performing calls:
 
@@ -759,7 +734,7 @@ impl Parse for Str {
 
 #### Built-in Type Method Dispatch
 
-Built-in types (`Str`, `List[T]`, `Map[K,V]`, `Set[T]`, `Bytes`, `StringBuilder`, `Instant`, `Duration`) have their methods defined by compiler-known traits (`Sized`, `StrOps`, `ListOps`, `MapOps`, `SetOps`, `StringBuildOps`, etc.). The underlying FFI bridge functions in `lib/std/` are internal — not part of the public API. Users interact exclusively through method syntax (§3.2).
+Built-in types (`Str`, `List[T]`, `Map[K,V]`, `Set[T]`, `Bytes`, `StringBuilder`, `Instant`, `Duration`, `Iterator[T]`) have their methods defined by compiler-known traits (`Sized`, `StrOps`, `ListOps`, `MapOps`, `SetOps`, `StringBuildOps`, `IteratorOps`, etc.). These surfaces are **sealed** — a user program cannot implement or override them. The underlying FFI bridge functions in `lib/std/` are internal — not part of the public API. Users interact exclusively through method syntax (§3.2).
 
 **Implementation note:** The current compiler implements dispatch for these types via hardcoded pattern matching in `codegen_methods.bl` rather than real trait resolution. This is an implementation shortcut — the spec-level semantics are trait-based, and the compiler should migrate to real trait resolution as the trait system matures. The hardcoded dispatch produces identical codegen (direct C function calls) and is invisible to users.
 
@@ -775,7 +750,7 @@ Built-in types (`Str`, `List[T]`, `Map[K,V]`, `Set[T]`, `Bytes`, `StringBuilder`
 
 #### Interaction with Other Features
 
-**Iterator adapters** (§3c.1): `.map()`, `.filter()`, `.collect()` etc. are default methods on the `Iterator` trait. They resolve through normal trait method lookup.
+**Iterator adapters** (§3c.1): `.map()`, `.filter()`, `.collect()` etc. are the sealed built-in method surface of the opaque `Iterator[T]` carrier, dispatched like the other built-in types above (`StrOps`/`ListOps`), not user-overridable trait defaults. Collections carry their own **eager** adapter surface that answers a collection; `.into_iter()` crosses into the lazy `Iterator` surface and `.collect()` crosses back.
 
 **Operator desugaring** (§3.6): `a + b` desugars to `Add.add(a, b)` — a qualified trait call, not dot syntax. Operators bypass method resolution entirely.
 
