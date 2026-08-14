@@ -10506,6 +10506,83 @@ only because the wrong default happens to match.
 This is the third time the corpus-sweep rule has paid for itself, and the sharpest: two P1
 miscompiles in a documented, voted language feature, sitting behind a tap that read zero.
 
+## `qdsy9n` — publishing a tid where typecheck had never published one
+
+The `as`-pattern binder is the first cell in this stage that a routing could not fix. Every other
+flipped site had a tid to read and was choosing not to read it; here the probe reported `ty=-` on
+**every** row, so there was nothing to route to. The fix is two-sided.
+
+### Typecheck side — the binder reads the hint undecomposed
+
+`tc_check_pattern_types` threads a one-level-decomposed hint down the pattern tree in
+`tc_pattern_binding_type`: the Option/Result arms unwrap it, the tuple arm indexes it, the list arm
+takes the element type, and the `IdentPattern` leaf publishes whatever reached it. The AsPattern arm
+did neither — `tc_check_pattern_types(node_pattern(node)); nr_define(node_name(node))`, an untyped
+define and a straight descent.
+
+The spec fixes what the binder's type must be: *"the bound name gets the pre-destructured value
+(scrutinee type)"*. So the arm reads the hint **as it arrives** and leaves it alone — the binder takes
+the undecomposed value, and the inner pattern then decomposes that same hint rather than one the
+binder already consumed. It publishes both ways the rest of the function does: `nr_define_typed` into
+scope and `tc_publish_node_tid` onto the node.
+
+The arm reads `tc_pattern_binding_type` directly rather than binding it to a local first. That is not
+style preference. Binding a global into a local reads to the `IncompleteStateRestore` analyser as the
+opening half of a save/restore, and it then reports the recursive call below as restoring 1 of 11
+globals — a warning pointing straight at correct code. Three instances, gone once the arm was written
+the way the `IdentPattern` arm 160 lines above already writes it (`ci` warning total 192 → 189).
+
+### Codegen side — spelling and metadata are separate obligations
+
+Both AsPattern branches now spell from `c_type_from_tid` on the standard template, with the flat
+`c_type_str` surviving where the tid declines.
+
+The metadata needed a new function, `stamp_whole_binder_from_tid`. Every other binder in the file
+holds a **decomposed** value, and its carrier and struct cases are served by the enclosing arm's
+struct-name slot, which the decomposition filled. A whole-value binder's slot is empty because
+nothing decomposed anything to fill it — which is the same root fact that made the C spelling `void`.
+
+It is deliberately a *new* function rather than an extension of `stamp_binder_from_binder_tid`. That
+shared function covers CT_MAP/CT_LIST/CT_SET only, and its own comment states the rule "no measured
+shape, no arm"; it has five callers, four of them `if !stamp_binder_from_tid(...) { <fallback> }`.
+Adding Option/Result/struct arms to it would have changed behaviour at four live, unmeasured sites to
+fix one measured one.
+
+### Census
+
+`as_scalar`, which read zero rows before, in both build modes:
+
+| | agree | diverge | missing |
+| --- | --- | --- | --- |
+| `match_binder.as_scalar` | 4 | 10 | **0** |
+
+`missing=0` is the result that matters: the tid now answers at every reach of a site where it
+previously answered nowhere. Every one of the 10 diverges is `emitted=void` against a correct
+`tidc` — `blink_Option_int`, `blink_Result_int_str`, `blink_ServerConfig` — so the diverge count is
+the miscompile being corrected, one row per reach, and not a new disagreement.
+
+The census-wide decline count did not move (132), and the other four match-binder branches held at
+`carrier_payload` 12/0, `variant_field` 44/0, `ident_scalar` 0/0, `ident_sname` 2/0. Their `agree`
+counts rose by a handful only because the new test file is itself in the swept corpus.
+
+### Two things left standing, deliberately
+
+`as_sname` **still reads zero rows.** The `sn != ""` branch requires the scrutinee's struct-name slot
+to be populated, and no shape in the corpus — including all six of the new test's carrier and struct
+rows, which all land in `as_scalar` — populates it. It is now routed and stamped identically to its
+sibling, but it is routed *unmeasured*, and it stays on the dark-corner list.
+
+Inside that same unmeasured branch, the non-carrier fallback keys `set_var_struct(c_bind, sn)` on the
+**C-safe** name while its neighbouring `set_var(bind_name, ...)` keys on the source name — they
+disagree for any binder needing C escaping. It is not filed as a bug because it has no reproduction:
+the branch never runs, and the struct path that replaced it keys consistently on the source name.
+Constructed by hand, a C-keyword binder over a struct scrutinee now compiles and runs correctly
+(`blink_Cfg _blink_register = c;`).
+
+The third branch, `match_scrut_enum != ""`, is unprobed. It spells from a name rather than a CT, so
+it never had the `void` defect, and it is the reason the data-enum row was green before the fix. It
+gets its tap with the flip of the four measured branches.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
