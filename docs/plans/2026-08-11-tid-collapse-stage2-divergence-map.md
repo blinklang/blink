@@ -10313,6 +10313,115 @@ depth 1 **and** depth 2 — verified by construction, not by reading.
 So this sub-step's routable surface was one site, and it is done. The next sub-step is
 `codegen_stmt`, which is also where the two thin wrappers' tids have to come from.
 
+## The most-reached declaration in the compiler, flipped without moving the gate
+
+Stage 3 sub-step 2 opens on `codegen_stmt`, whose 37 `c_type_str` sites are the largest single
+block left. The site to take first was chosen by measurement rather than by reading order, and the
+measurement said one site carries most of the remaining gate.
+
+### Why this site, and not the other 36
+
+`ctype.flat` is `emit_let_binding`'s final `else` — the last branch of the declaration chain, taken
+by every `let` whose type is not an enum, a `Ptr`, or a handler. Its census before the flip:
+
+```
+ctype.flat   agree=422259   diverge=0   missing=51
+```
+
+Two facts in one line. It is reached **422,310 times**, more than every other probed site in the
+compiler combined, so it is where a wrong answer would show up first. And its 51 declines are
+**51 of the 74** declines in the whole census — 69% of the number that gates Stage 4. No other
+`codegen_stmt` site holds more than four.
+
+`diverge=0` across 422 thousand reaches is the other half of the case. Wherever the tid answered at
+all, it agreed with the flat spelling exactly. So the flip could not change a single emitted
+declaration, and the whole risk of the sub-step sat in the 51 places where the tid declines.
+
+### The flip
+
+The template is the one Stage 3b established: compute the flat candidate **first**, probe with it,
+and let the tid lead only where it answers.
+
+```blink
+let flat = c_type_str(val_type)
+let spelled = c_type_from_tid(decl_tid)
+let ts = if spelled != "" && spelled != "void" { spelled } else { flat }
+decl_c = flat
+decl_branch = "flat"
+```
+
+Two details in there are load-bearing and neither is obvious.
+
+`void` falls through to the flat spelling. A declaration is a **storage position**, and no storage
+position can hold a `void`. `c_type_from_tid` answers `Void` deliberately when the type really is
+Void — it does not treat that as a failure — and it leaves the position rule to its caller. This
+caller's position rule is "not here."
+
+`decl_c` is set to `flat`, not to `ts`. The probe's `emitted` argument must stay the **flat
+candidate** rather than the line about to be printed. Feeding the chosen spelling back in would
+compare the tid against itself, report agreement unconditionally, and destroy the one number that
+says whether the branch still needs its flat arm. This is the same rule the `forin_binder_ctype`
+comment states from the other direction: after a flip, `diverge` counts the corrections the tid
+applied, and only `missing` still counts places where the flat spelling governs the output.
+
+### The census after: unchanged, which is the correct result
+
+| | before | after |
+| --- | --- | --- |
+| declines, whole census | 74 | **74** |
+| `ctype.flat` | `agree=422259 diverge=0 missing=51` | `agree=422327 diverge=0 missing=51` |
+
+Row-for-row identical in **both** build modes — monolithic and archive-linked produce the same 124
+rows, the same 74 declines, the same 50 divergences. The small rise in `agree` is the sweep reading
+its own subject: `src/codegen_stmt.bl` is in the corpus, and the flip added twelve lines of `let`
+to it.
+
+A flip that moves no number is the expected outcome here, and it is worth being explicit about why
+that is progress rather than a no-op. The tid is now the authority at the compiler's most-reached
+declaration site. The flat spelling survives at exactly 51 reaches out of 422,327 — 0.012% — and
+those 51 are now a **list**, not a fallback of unknown extent.
+
+### Byte-identity, checked rather than assumed
+
+Emitting C for the whole corpus before and after gave `DIFF_COUNT=34`. That looked like a
+contradiction of `diverge=0` until the 34 were classified instead of theorised about: **all 34
+embed the compiler** (`blink_typecheck_c_type_from_tid` is present in each), and **zero**
+non-compiler-embedding files differ by one byte. The delta in the 34 is my own edited source
+compiled into them, and it is mechanical in two ways:
+
+```
+<         const char* _if_26;              >         const char* _if_27;
+<   ...codegen_stmt.bl:5413");             >   ...codegen_stmt.bl:5425");
+```
+
+`_if_NN` temp renumbering, because the flip adds an `if`; and panic-message line numbers shifting
+by the twelve lines added. No codegen decision changed anywhere. `diverge=0` predicted exactly
+this, and the check confirms the prediction rather than replacing it.
+
+### The 51 declines, named
+
+All 51 decline for the same reason and it is not this site's reason: 50 carry `ty=?`, meaning a tid
+exists but `tc_type_str` answers Unknown, and one carries `ty=-`, meaning no tid was recorded at
+all. So these are gaps in what **typecheck** knows, reached through a site that is now correct.
+Seven of the 51 rows are the same seven source lines counted twice, once per translation unit,
+because `src/cli.bl` and `src/build_stdlib.bl` each compile the other's module — 44 distinct source
+lines in total.
+
+| family | rows | emitted | already attributed to |
+| --- | --- | --- | --- |
+| lazy iterator adapters (`chain`, `zip`, `enumerate`, `flat_map`) | 23 | `blink_list*` | the lazy-adapter registry work |
+| `fs` directory entries in `cli.bl` + `build_stdlib.bl` | 14 | `blink_list*`, `const char*` | deliberately unsigned; the `fs` family |
+| iterator terminal ops (`sum`, `count`) | 4 | `int64_t` | same registry |
+| effect operation results | 4 | `const char*` | the effect-typing seam |
+| `Ptr` locals and `addr` | 5 | `int64_t` | `q3ssqw`, `0dtbe6`, `msezvm` |
+| `Channel` receives | 3 | `int64_t` | `859wey` |
+| `ffi` scope temporaries | 3 | `int64_t` | the ffi seam |
+| `doubled` (`test_pgc3d9`, the sole `ty=-` row) | 1 | `int64_t` | closure-arg body walk |
+
+Every family on that list already has a ticket or a closed cell behind it. That is the shape Stage
+4 needs: the flat arm at this site is dead the moment those tids answer, and no new investigation
+stands between here and there.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
