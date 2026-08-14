@@ -175,22 +175,22 @@ import blink.ffi.{Ptr, Void, alloc_ptr, null_ptr}
 
 This import is **optional** — a documentation marker, not a requirement. `Ptr[T]`, `Void`, and the pointer operations are compiler-known and available without it; the `ffi` namespace is a no-import intrinsic like `io`/`net`/`time`. See *FFI import resolution and the real gates* below.
 
-**Nullability:** `Ptr[T]` is **non-null by default**. A `Ptr[T]` value is guaranteed to point to valid memory. Nullable pointers use `Ptr[T]?` (sugar for `Option[Ptr[T]]`), consistent with Blink's existing `Option` semantics.
+**Nullability:** `Ptr[T]` is **non-null by convention, not by proof**. Nothing in the type system prevents a null value at type `Ptr[T]`: `null_ptr[T]()` constructs one, `scope.alloc` can fail, and any C function may return `NULL`. Inside the `@ffi`/`@trusted` region where a `Ptr[T]` may appear (E0811), non-nullness is an **audited premise** the author asserts — not a guarantee the compiler discharges. `.is_null()` re-validates that premise at runtime, and `.deref()`/`.write(v)` trust it (see *Pointer Operations*).
 
 ```blink
-// Non-null pointer — guaranteed to point to something
+// A raw C pointer — may be null; the @trusted audit owns the invariant
 fn raw_sqlite3_exec(db: Ptr[Void], sql: Ptr[U8]) -> Int
 
-// Nullable pointer — C function may return NULL
+// A C function that can return NULL — test the result with .is_null()
 @ffi("libc", "getenv")
 @effects(Env)
 @trusted(audit: "ENV-001")
-fn raw_getenv(name: Ptr[U8]) -> Ptr[U8]?
+fn raw_getenv(name: Ptr[U8]) -> Ptr[U8]
 ```
 
-At FFI return boundaries, the compiler inserts a null-check for functions declared as returning non-null `Ptr[T]`. If C returns `NULL` where the Blink signature promises `Ptr[T]`, the program panics with a diagnostic. FFI functions that may return `NULL` **must** declare `Ptr[T]?` as the return type.
+`Ptr[T]?` (sugar for `Option[Ptr[T]]`) is **reserved** for a future *enforced* nullability model in which the compiler inserts a null-check at FFI return boundaries and forbids `.deref()` until the `Option` is eliminated. That model — and the boundary check — are **not yet implemented**; until they are, a possibly-null C return is spelled `Ptr[T]` and validated with `.is_null()`. When `Ptr[T]?` lands it must be revisited together with `.to_str()`, whose `Option[Str]` result is earned only because `Ptr[U8]` admits null today.
 
-**Nesting:** `Ptr[Ptr[T]]` is allowed and maps to `T**`. This is required for C out-parameters (e.g., `sqlite3_open`'s `sqlite3**` parameter).
+**Nesting:** `Ptr[Ptr[T]]` is allowed and maps to `T**`. This is required for C out-parameters (e.g., `sqlite3_open`'s `sqlite3**` parameter): allocate the cell with `scope.alloc[Ptr[T]]()`, pass it directly to C, then read it back with `.deref()` (which yields `Ptr[T]`).
 
 **The `Void` type:** `Void` is a special opaque type valid **only** as a `Ptr` type parameter. It maps to C's `void` — `Ptr[Void]` is `void*`. `Void` cannot be used as a standalone type, function parameter, or return type outside of `Ptr`.
 
@@ -210,24 +210,43 @@ error[E0810]: invalid Ptr type parameter
 
 All pointer operations are methods on `Ptr[T]` and compiler-known functions in the `ffi` namespace. They are available **without any import** — `ffi` is a no-import intrinsic namespace like `io`/`net`/`time`, and `import blink.ffi[.{...}]` is an **optional documentation marker**, never a requirement. The capability gate is on *where* a `Ptr[T]` may appear — inside an `@ffi`/`@trusted` context (`PtrOutsideFFI`, E0811) — not on any import (see *FFI import resolution and the real gates* above).
 
+This is the **canonical** `Ptr[T]` operations table. §9.1.3 extends it with `@ffi.struct` field projection (`p.field.read()` / `p.field.write(v)`) and array regions (`scope.alloc_n`); no other section redefines these operations.
+
 | Operation | Signature | C Mapping | Description |
 |-----------|-----------|-----------|-------------|
-| `alloc_ptr[T]()` | `fn alloc_ptr[T]() -> Ptr[T]` | `calloc(1, sizeof(T))` | Allocate zero-initialized memory for one `T` |
-| `null_ptr[T]()` | `fn null_ptr[T]() -> Ptr[T]?` | `NULL` | Create a null pointer (returns `None`) |
-| `.deref()` | `fn deref(self) -> Option[T]` | null-check + `*ptr` | Read the value behind the pointer. Returns `None` if null |
-| `.write(value)` | `fn write(self, value: T)` | `*ptr = value` | Write a value through the pointer |
-| `.is_null()` | `fn is_null(self) -> Bool` | `ptr == NULL` | Check if pointer is null |
-| `.addr()` | `fn addr(self) -> Ptr[Ptr[T]]` | `&ptr` | Get pointer-to-pointer for C out-parameters |
-| `.as_cstr()` | `fn as_cstr(self: Str) -> Ptr[U8]` | `strdup(s)` | Convert Blink `Str` to null-terminated C string copy |
-| `.to_str()` | `fn to_str(self: Ptr[U8]) -> Option[Str]` | null-check + copy | Convert null-terminated C string to Blink `Str` |
+| `alloc_ptr[T]()` | `fn alloc_ptr[T]() -> Ptr[T]` | `calloc(1, sizeof(T))` | Allocate zero-initialized memory for one `T` (GC-registered fallback; prefer `scope.alloc`) |
+| `null_ptr[T]()` | `fn null_ptr[T]() -> Ptr[T]` | `NULL` | Construct a null pointer of type `Ptr[T]` — the only way to spell `NULL` in Blink |
+| `.deref()` | `fn deref(self) -> T` | `*ptr` | Read the value behind the pointer. **No null check** — the pointee is an audited premise (see *Nullability*). Rejected on `Ptr[Void]` (E0825) |
+| `.write(value)` | `fn write(self, value: T)` | `*ptr = value` | Write a value through the pointer. Rejected on `Ptr[Void]` (E0825) |
+| `.is_null()` | `fn is_null(self) -> Bool` | `ptr == NULL` | Test whether the pointer is null. Defined as shorthand for `p == null_ptr()` |
+| `.addr()` | `fn addr(self) -> Int` | `(intptr_t)ptr` | The pointer's numeric address as an `Int`. **NOT** `&ptr` — an observation, not an out-parameter |
+| `.offset(i)` | `fn offset(self, i: Int) -> Ptr[T]` | `ptr + i` | Pointer to element `i` of an `alloc_n` region (§9.1.3). Rejected on a singleton `alloc[T]()`/`alloc_ptr[T]()` result (E0813) |
+| `.as_cstr()` | `fn as_cstr(self: Str) -> Ptr[U8]` | `strdup(s)` | Convert a Blink `Str` to a null-terminated C string copy (method on `Str`) |
+| `.to_str()` | `fn to_str(self: Ptr[U8]) -> Option[Str]` | null-check + copy | Convert a null-terminated C string to a Blink `Str`. `None` if the pointer is null |
 
-**`.deref()` semantics:** Returns `Option[T]`. If the pointer is null, returns `None`. If non-null, reads the value and returns `Some(value)`. On a non-null `Ptr[T]`, the compiler may optimize away the null check — but the return type remains `Option[T]` for uniformity.
+`Ptr[T]` also supports `==` / `!=`; equality against `null_ptr()` is the primitive that `.is_null()` desugars to.
+
+**`.deref()` semantics — bare `T`, `Option` is not returned.** `deref` reads the pointee and returns it **unwrapped**. It performs no null check: dereferencing a null or dangling pointer is undefined behaviour, accounted for by the `@ffi`/`@trusted` audit gate (E0811), not by the type. The reason `Option` is *not* returned follows the **"Option must be earned"** principle: an operation returns `Option[T]` only when a failure is observable as a value the operation itself produces (as `.to_str()` observes a null terminator). A load's null-partiality is not recoverable as a value, so no `Option` can honestly model it — wrapping it would advertise a check `deref` does not perform. When you need the null test, spell it: `if p.is_null() { ... }` before the read.
+
+**`.deref()` / `.write()` on `Ptr[Void]` — rejected (E0825).** `Void` has no value representation, so there is no bare `T` for `deref` to return and no value for `write` to store (`*(void*)p` is a C constraint violation). Both ops are rejected at compile time; see *Diagnostic Integration*. Every other operation — `.addr()`, `.offset()`, `==`, `.is_null()`, `null_ptr[Void]()`, and passing the pointer to C — is unaffected, so `Ptr[Void]` remains fully usable as an opaque handle.
+
+**`.addr()` semantics — numeric address, not address-of.** `addr` returns the pointer's address as a plain `Int`, mapping to `(intptr_t)ptr` — an *observation* of the pointer's value. It is **not** `&ptr`: there is no `Ptr.from_int(Int)` and none is provided, so the integer is not a capability to reconstruct the pointer. For a C **out-parameter** (`T**`), do not take the address of a local — allocate the cell as a pointer-to-pointer and pass it directly:
+
+```blink
+with ffi.scope() as scope {
+    let cell = scope.alloc[Ptr[Void]]()   // a Ptr[Ptr[Void]] cell
+    let rc = raw_sqlite3_open(cstr, cell)  // pass the cell, not cell.addr()
+    let db = cell.deref()                  // read the T** back out — a Ptr[Void]
+}
+```
+
+**`null_ptr[T]()` semantics.** Constructs a null `Ptr[T]`. It is the sole way to spell `NULL` in Blink surface — required to pass `NULL` *into* C and to compare against a possibly-null C return (`p == null_ptr()`, or equivalently `p.is_null()`).
 
 **`.write()` restriction:** Writing a GC-managed reference through a pointer is a compile error. Only FFI-compatible values (integers, floats, other pointers) can be written.
 
 **`.as_cstr()` semantics:** Creates a `malloc`'d null-terminated copy of the Blink string's bytes. The copy is allocated outside the GC and must be freed via `ffi.scope()` or manual cleanup. This is a method on `Str`, not on `Ptr[T]`.
 
-**`.to_str()` semantics:** Reads bytes from a `Ptr[U8]` until a null terminator, creates a GC-managed Blink `Str`. Returns `None` if the pointer is null.
+**`.to_str()` semantics:** Reads bytes from a `Ptr[U8]` until a null terminator, creates a GC-managed Blink `Str`. Returns `None` if the pointer is null — an `Option` earned by the walk to the terminator, which observes nullness as a value.
 
 #### Example: Complete FFI Wrapper
 
@@ -246,15 +265,13 @@ fn raw_sqlite3_close(db: Ptr[Void]) -> Int
 
 pub fn open_database(path: Str) -> Result[Database, DbError] ! IO {
     with ffi.scope() as scope {
-        let db_ptr = scope.alloc[Void]()
+        let db_ptr = scope.alloc[Ptr[Void]]()   // a Ptr[Ptr[Void]] out-param cell
         let cstr = scope.cstr(path)
-        let rc = raw_sqlite3_open(cstr, db_ptr.addr())
+        let rc = raw_sqlite3_open(cstr, db_ptr)  // pass the cell directly
         match rc {
             0 => {
-                match db_ptr.deref() {
-                    Some(raw_db) => Ok(Database.from_ptr(scope.take(raw_db)))
-                    None => Err(DbError.NullResult)
-                }
+                let raw_db = db_ptr.deref()      // Ptr[Void] — bare, no Option
+                Ok(Database.from_ptr(scope.take(raw_db)))
             }
             _ => Err(DbError.from_code(rc))
         }
@@ -305,15 +322,13 @@ impl Closeable for Database {
 
 pub fn open_database(path: Str) -> Result[Database, DbError] ! IO {
     with ffi.scope() as scope {
-        let db_ptr = scope.alloc[Void]()
+        let db_ptr = scope.alloc[Ptr[Void]]()   // a Ptr[Ptr[Void]] out-param cell
         let cstr = scope.cstr(path)
-        let rc = raw_sqlite3_open(cstr, db_ptr.addr())
+        let rc = raw_sqlite3_open(cstr, db_ptr)  // pass the cell directly
         match rc {
             0 => {
-                match db_ptr.deref() {
-                    Some(raw_db) => Ok(Database { handle: scope.take(raw_db) })
-                    None => Err(DbError.NullResult)
-                }
+                let raw_db = db_ptr.deref()      // Ptr[Void]
+                Ok(Database { handle: scope.take(raw_db) })
             }
             _ => Err(DbError.from_code(rc))
         }
@@ -363,6 +378,17 @@ warning[W0810]: unscoped pointer allocation
   |
   = help: wrap in `with ffi.scope() as scope { scope.alloc[Void]() }`
   = note: unscoped pointers rely on GC finalization (non-deterministic)
+
+error[E0825]: cannot deref `Ptr[Void]` — the pointee type is unknown
+ --> db/sqlite.bl:22:13
+  |
+22|     let v = handle.deref()
+  |             ^^^^^^^^^^^^^^ `Void` names no value to read
+  |
+  = note: `Ptr[Void]` is an opaque handle: pass it to C and test it with
+          `.is_null()`, but there is no value behind it to read or write
+  = help: if you know the pointee type, declare it — `Ptr[Int]`, `Ptr[U8]`, …
+  = help: for a C struct, use `@ffi.struct` and read fields with `p.field.read()`
 ```
 
 `blink audit` includes pointer allocations alongside FFI call sites and `Raw()` query sites:
