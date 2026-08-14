@@ -10888,6 +10888,69 @@ Not filed as a ticket: `agree` is 49k across the two cells, so this is specific 
 than "if-expressions are untyped", and which positions has not been established. It is the
 enumerated residual for whoever flips this path.
 
+## Flipping `if.result_flat`, and the anonymous temp that 0rmamy did not reach
+
+The flat path of `emit_if_expr` now leads with the tid. Only that path — `if.result_carrier` stays
+flat-authoritative for the handler-vtable reason recorded in the section above, and this is the
+sharpest available illustration of why the two cells had to be measured apart before either moved.
+
+**What licenses this one and not the other.** Every carrier kind is routed to the carrier path at
+`src/codegen_stmt.bl:509`, so what reaches the flat path is a scalar or a pointer. Those convert
+implicitly in C even where the position's physical type is an erased vtable slot; two struct types
+do not. The flat path cannot reach the case that made the carrier path unflippable.
+
+**What it fixes.** `0rmamy` closed the six positions where a *local* lost its enum name, and its
+`if` row passed the whole time the emitter was still writing:
+
+```c
+int64_t _if_0;
+if (1) { _if_0 = blink_Col_Red; } else { _if_0 = blink_Col_Green; }
+const blink_Col from_if = _if_0;      // the name recovered one line later, never re-derived
+```
+
+The local was right because `emit_let_binding`'s declaration chain already reads the tid. The temp
+it reads *through* was still erased, so the name was lost and then found again rather than never
+lost. After the flip the declaration is `blink_Col _if_0;`.
+
+Nothing observable changed — int64_t <-> enum is a legal implicit conversion, and the program
+prints the same `1` before and after. That is exactly why the cell survived: the test that pins it
+has to assert on emitted C, and `tests/test_0rmamy_enum_local_decl_typedef.bl` now carries a row
+that does, naming the temp by reading it out of the initializer that consumes it (its index is not
+predictable, and a bare `_if_` shape check is unusable because stdlib code declares `int64_t _if_N`
+for if-expressions that really do yield ints).
+
+**The three temps this did not fix**, re-measured rather than assumed, from one probe reaching all
+four producers:
+
+| temp | declared as | why |
+| --- | --- | --- |
+| `_if_0` | `blink_Col` | fixed here |
+| `_match_2` | `int64_t` | the match result temp spells from a flat pre-pass; uninstrumented, `codegen_stmt.bl:853`/`993` |
+| `_ounw_6` | `blink_Option_int` | an `Option[Col]` erased one level down, in the CARRIER's mono name |
+| `__opt8` | `blink_Option_int` | same cause as `_ounw_6`, different producer (`??`) |
+
+The carrier rows are a different family from the other two: the erasure is in the mono name of the
+carrier, not in the spelling of the declaration, so flipping a declaration site cannot reach them.
+
+**Census.** Both build modes, `div`/`dec` unchanged (agree grows with source only):
+
+| cell | mono | arc |
+| --- | --- | --- |
+| `if.result_carrier` | 17823 / 2 / 604 | 406 / 2 / 598 |
+| `if.result_flat` | 31323 / 48 / 190 | 27405 / 48 / 190 |
+| `void_placeholder` | 0 / 6 / 0 | 0 / 6 / 0 |
+
+The 48 `if.result_flat` diverges are now CORRECTIONS the tid applied, not defects — the probe's
+`emitted` column is deliberately the flat candidate at a flipped site, so this number does not go
+to zero and was never going to. `dec` is the one that must reach zero before Stage 4 can delete the
+flat arm.
+
+**One-step emit lag.** `task regen` failed the gen1/gen2 invariant on exactly one line —
+`int64_t _if_4;` -> `blink_typecheck_TyKind _if_4;` at the predicted `src/typecheck.bl:13795` — which
+is the codegen emit-string lag, not a defect (`project_codegen_emit_string_bootstrap`).
+`cp build/blinkc_gen1 build/blinkc` then `task regen` reaches the new fixed point. `task ci` green:
+717/717, fmt 1648 passed / 0 failed / 92 skipped.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

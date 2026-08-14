@@ -26,7 +26,8 @@
 // ── THE MEASURED AXIS ────────────────────────────────────────────────────────────────
 //
 // Measured by emitting C for one probe per position (.tmp/0rmamy/enum_prod.bl), not by reading
-// the code and guessing. Six positions LOSE the enum name and five KEEP it:
+// the code and guessing. This is the state BEFORE the fix — six positions LOSE the enum name and
+// five KEEP it. Every row below is pinned green now; the table is what the defect looked like:
 //
 //   lost                                     kept
 //   ----                                     ----
@@ -52,11 +53,21 @@
 //
 // ── SCOPE ────────────────────────────────────────────────────────────────────────────
 //
-// The anonymous temporaries THEMSELVES are still declared `int64_t` after this fix. They are a
-// different emit seam (codegen_expr), they are not in the ctypediv census (which probes
-// `emit_let_binding`'s declaration chain), and int64_t -> enum assignment is a legal implicit
-// conversion, so the declarations this test pins are correct regardless. Not silently left out:
-// see the doc section for the seam and why it is not folded in here.
+// The anonymous temporaries are a SECOND seam, and they are no longer uniform. Re-measured by
+// emitting C for a probe that reaches all four:
+//
+//   blink_Col _if_0;                    the if-expression temp — now carries the typedef
+//   int64_t _match_2;                   the match-expression temp — still erased
+//   blink_Option_int _ounw_6 = ...;     a carrier temp for an Option[Col] — erased in the
+//   blink_Option_int __opt8 = ...;      CARRIER's mono name, which is a different family
+//
+// The if row is fixed by `emit_if_expr` (src/codegen_stmt.bl) reading the tid, and it is in the
+// ctypediv census as `if.result_flat`. The match temp and the two carrier temps are not, and
+// each has its own cause: the match temp spells from a flat pre-pass, the carrier temps lose the
+// enum one level down in `Option_int`. int64_t <-> enum is a legal implicit conversion in every
+// case, so the LOCAL declarations this test pins are correct whichever way the temp is spelled —
+// which is why the temp rows need their own assertions rather than riding on these. Not silently
+// left out: see the doc section for each seam.
 
 import compiler.{compile_to_program}
 import typecheck.{check_types}
@@ -145,6 +156,27 @@ fn assert_decl_enum(c: Str, name: Str) {
     assert(!c.contains(bad))
 }
 
+// The anonymous temp a position reads THROUGH, pinned the same way from both sides. Its index is
+// not predictable and a bare `_if_` shape check is unusable — stdlib code declares `int64_t _if_N`
+// for if-expressions that really do yield ints — so the temp has to be named by reading it out of
+// the initializer that consumes it.
+fn assert_temp_decl_enum(c: Str, name: Str) {
+    let anchor = "blink_Col {name} = "
+    let at = c.index_of(anchor)
+    if at < 0 { io.println("FAIL: no `{anchor}` in emitted C — the temp cannot be located") }
+    assert(at >= 0)
+    let rest = c.slice(at + anchor.len(), c.len())
+    let end = rest.index_of(";")
+    assert(end > 0)
+    let tmp = rest.slice(0, end)
+    let want = "blink_Col {tmp};"
+    let bad = "int64_t {tmp};"
+    if !c.contains(want) { io.println("FAIL: `{want}` not in emitted C (temp still erased?)") }
+    if c.contains(bad) { io.println("FAIL: `{bad}` still in emitted C") }
+    assert(c.contains(want))
+    assert(!c.contains(bad))
+}
+
 // ════ The six positions that lost the enum name ═══════════════════════════════
 //
 // One test per position rather than one test with six rows: these are six independent cells of
@@ -162,6 +194,13 @@ test "a local bound to a match expression is declared with the enum typedef" {
 
 test "a local bound to an if expression is declared with the enum typedef" {
     assert_decl_enum(emitted_c(), "from_if")
+}
+
+// The temp, not the local. The row above passes because emit_let_binding's declaration chain
+// reads the tid, and it passed while the if-expression still declared `int64_t _if_0;` and
+// assigned an enum into it — the name was recovered one line later rather than never lost.
+test "the if expression's own result temp is declared with the enum typedef" {
+    assert_temp_decl_enum(emitted_c(), "from_if")
 }
 
 // The mut row is separate because it takes a different arm of the declaration chain (no
