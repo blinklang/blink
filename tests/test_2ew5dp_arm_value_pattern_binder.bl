@@ -1,0 +1,135 @@
+// A match arm whose value IS a pattern-bound ident. The binder is declared correctly; the match's
+// RESULT type is not, because the codegen pre-pass evaluates each arm in a throwaway scope where the
+// binding carries no type, so the arm's value comes back CT_INT. That one wrong value spells the
+// result temp and also propagates out as the enclosing `let`'s type, so the defect has two faces:
+//
+//     int64_t _match_1;               // should be const char*
+//     const char* w = _scrut_0;       // the binder itself is right
+//     error: assignment to 'int64_t' from 'const char *' makes integer from pointer without a cast
+//
+//     error[UnresolvedMethod]: unresolved method '.unwrap' on type Option[Int] in 'main'
+//
+// The second face is codegen's own backstop, not typecheck's E0505 — it prints the tid-derived type
+// name (which is right) while dispatch uses the flat CT (which is CT_INT).
+//
+// The rows below hold the arm value shape fixed and vary only the binder KIND, because the reported
+// case was an `as` binder and the defect is not specific to one: a plain list-element binder fails
+// identically, while an enum variant-field binder already worked.
+//
+// A list-element binder is covered here only for a Str element. The other element kinds cross a
+// second, independent seam — the list-element binder's own declaration disagrees with its unbox
+// cast, which a statement-position match reproduces on its own — and those rows belong to it.
+
+type Cfg { port: Int, host: Str }
+
+type E {
+    Tag(s: Str)
+    Nil
+}
+
+// ── face 1: the result temp's C spelling ──────────────────────────────────────
+
+test "a Str-valued as-pattern binder is the match result" {
+    let s = "hi"
+    let r = match s {
+        w as "hi" => { w }
+        _ => { "no" }
+    }
+    assert_eq(r, "hi")
+}
+
+test "a Str-valued list-element binder is the match result" {
+    let ls: List[Str] = ["hi"]
+    let r = match ls {
+        [f, ..] => { f }
+        _ => { "no" }
+    }
+    assert_eq(r, "hi")
+}
+
+test "a struct-valued as-pattern binder is the match result" {
+    let c = Cfg { port: 5, host: "h" }
+    let r = match c {
+        w as Cfg { .. } => { w }
+    }
+    assert_eq(r.port, 5)
+}
+
+// ── face 2: the type the enclosing `let` registers, seen through a method call ──
+//
+// These fail at the Blink level rather than in cc, so they need a method call on the result to show
+// it: a carrier or container that reaches the `let` as CT_INT dispatches nothing.
+
+test "an Option-valued as-pattern binder is the match result" {
+    let o: Option[Int] = Some(3)
+    let none: Option[Int] = None
+    let r = match o {
+        w as Some(_) => { w }
+        None => { none }
+    }
+    assert_eq(r.unwrap(), 3)
+}
+
+// ── the same match outside a `let` ─────────────────────────────────────────────
+//
+// The recovery reads the arm bodies' types back after they are walked, and its reach is whatever
+// tc_check_body descends into: statement forms. A tail match is a statement of the fn body block, so
+// the first row pins a genuinely separate position from the `let` rows above.
+//
+// The second row does NOT. An argument-position match is reached by nothing, and this one only types
+// because its `_ => { "no" }` arm yields a literal that type_merge picks up. Written so that every arm
+// is a binder, argument position still fails — that is a live defect, not covered here. The row is
+// kept as the boundary: it must stay green when that defect is fixed.
+
+fn pick_whole(c: Cfg) -> Cfg {
+    match c {
+        w as Cfg { .. } => { w }
+    }
+}
+
+fn width_of(s: Str) -> Int { s.len() }
+
+test "a binder-valued match in return position keeps its type" {
+    let c = Cfg { port: 5, host: "h" }
+    assert_eq(pick_whole(c).port, 5)
+}
+
+test "a binder-valued match in argument position keeps its type" {
+    let s = "hi"
+    assert_eq(width_of(match s { w as "hi" => { w } _ => { "no" } }), 2)
+}
+
+// ── controls: shapes that already worked ──────────────────────────────────────
+//
+// The variant-field row is the informative one. It is the same shape as every row above — an arm
+// whose value is a pattern-bound ident — and it passed before the fix, so the pre-pass does type
+// SOME binder kinds. A fix that stopped here would be treating the symptom.
+
+test "a Str-valued variant-field binder is the match result" {
+    let e = E.Tag("hi")
+    let r = match e {
+        E.Tag(s) => { s }
+        E.Nil => { "no" }
+    }
+    assert_eq(r, "hi")
+}
+
+test "an Int-valued as-pattern binder is the match result" {
+    let n = 7
+    let r = match n {
+        w as 7 => { w }
+        _ => { 0 }
+    }
+    assert_eq(r, 7)
+}
+
+// An arm value that merely MENTIONS the binder is unaffected — the defect needs the arm value to BE
+// the ident. Kept as a boundary marker so a fix that widens further than the binder shows up here.
+test "a Str-valued arm that only mentions the binder is unaffected" {
+    let s = "hi"
+    let r = match s {
+        w as "hi" => { "{w}!" }
+        _ => { "no" }
+    }
+    assert_eq(r, "hi!")
+}

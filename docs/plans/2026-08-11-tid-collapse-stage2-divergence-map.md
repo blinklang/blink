@@ -10583,6 +10583,156 @@ The third branch, `match_scrut_enum != ""`, is unprobed. It spells from a name r
 it never had the `void` defect, and it is the reason the data-enum row was green before the fix. It
 gets its tap with the flip of the four measured branches.
 
+## `2ew5dp` — the match result temp, and why no gate over the old authorities could work
+
+`qdsy9n` deliberately made every arm in its test yield an `Int`, with a header note that an arm whose
+value **is** the binder mistypes the result temp on a separate seam. This is that seam. It is the
+first unit in the stage that needed a change in `typecheck.bl`, and the reason is worth stating
+plainly: the answer codegen needed did not exist yet at the moment codegen asked for it.
+
+### Three authorities, two of them derived from the arms
+
+`emit_match_expr` had three sources for the result temp's type:
+
+1. `infer_arm_type(first_arm)` — a static guess that answers `CT_INT` for any ident it cannot name.
+2. The buffer-emit pre-pass harvest (`pp_type` / `pp_carrier` / `pp_all_value`) — it re-emits each arm
+   in a throwaway scope, where a pattern binding carries no type, so a binder-valued arm comes back
+   `CT_INT`.
+3. The match node's own tid — the only one of the three not derived from the arms.
+
+`CT_INT = 0` is both a legitimate answer and the "I don't know" default. That single fact is why the
+existing workaround at `codegen_stmt.bl:1118` could only ever be a workaround: no gate placed over
+authorities 1 and 2 can distinguish *"this arm yields an Int"* from *"I could not type this arm"*,
+because both arrive as the same integer. The struct case was patched there by name
+(`infer_arm_struct_name`), which is the same defect handled one kind at a time.
+
+### The tid did not answer either, and why
+
+Routing to authority 3 found `ty=-`. `infer_type`'s MatchExpr arm merges `infer_arm_body(arm)` across
+arms, and `infer_arm_body` runs `infer_type` on the arm body **without the arm's pattern bindings in
+scope** — a fact the code already documents at `typecheck.bl:11163`. So a binder-valued arm
+contributes `TYPE_UNKNOWN`, and `type_merge` hides it whenever a sibling arm answers. Only a match
+where *no* arm dodges loses its type outright — which is exactly the reported shape.
+
+The answers do exist, just later: `tc_check_body`'s MatchExpr arm walks each arm body inside
+`nr_push_scope()` with `tc_pattern_binding_type` set, and those walks memoize. So the match re-reads
+its own arms after they are walked, via the existing `tc_scoped_value_memo`:
+
+```blink
+let own_tid = tc_lookup_node_tid(node)
+if own_tid < 0 || own_tid == TYPE_UNKNOWN {
+    tc_publish_node_tid(node, tc_scoped_value_memo(node, 0))
+}
+```
+
+**Published at the match, not at the consumer.** The first attempt put it in the `LetBinding`
+recovery, which is where `tc_scoped_value_memo`'s only two callers already lived. That fixed
+`let r = match ...` and left `fn pick(c: Cfg) -> Cfg { match c { w as Cfg { .. } => { w } } }` still
+emitting `return _match_0;` as `int64_t`. The defect is the match's, so the recovery belongs to the
+match — one publish instead of one per consumer.
+
+It is recovery only — gated on the node having no answer of its own, and `tc_publish_node_tid` drops
+a `TYPE_UNKNOWN` memo on its own, so the gate needs no second check.
+
+**Its reach is exactly `tc_check_body`'s reach, which is narrower than it first appeared.** That
+function dispatches on statement forms only — Block, LetBinding, Assignment/CompoundAssign, IfExpr,
+WhileLoop, ForIn, MatchExpr, LoopExpr, WithBlock, WithResource, HandlerExpr, AssertPanics. There is no
+Call, StructLit, Interp or MethodCall descent, so a match nested in one of those is never walked, the
+arm bodies are never memoized in scope, and the recovery has nothing to read.
+
+The tail-position row looked like evidence that return position was covered. It is not: a tail match is
+a **statement of the fn body Block**, reached through the Block arm. The genuinely nested positions —
+call argument, struct-literal field, interpolation, method receiver — are still broken, filed as
+`5kerq0`.
+
+The argument-position row in the test is green, and it took the census to notice that it is green for
+the wrong reason: its `_ => { "no" }` arm yields a literal, and `type_merge` fills the match type from
+that sibling. `match_binder.as_scalar` records the same reach as a **decline** with `ty=-`, which is the
+binder's missing tid showing through a row that otherwise reads as a pass. Constructed so that no arm
+dodges, argument position fails exactly like the other three. The row stays, relabelled for what it
+actually pins.
+
+### Codegen side — one override point, placed last
+
+The tid sets `result_type` / `match_struct_name` / `mcarrier` **after** the existing harvest gate, so
+it is the last word, and the declaration, the arm emission, the E0505 backstop and the outgoing
+`expr_result_*` registration then all follow one authority instead of three.
+
+Two deliberate asymmetries in that block:
+
+- **The struct branch is not gated on `pp_all_value`.** A struct value rides the carrier as `CT_VOID`,
+  so at the harvest an arm yielding a struct and an arm yielding *nothing* are the same signal. A
+  struct tid says outright that the match evaluates to a value; `pp_all_value` cannot say it. Gating
+  it was the first attempt, and it left the struct row red.
+- **Both carrier fallbacks are gated on `use_tid_carrier == 0`.** `carrier_result_concrete` requires a
+  non-empty `ok_struct`/`err_struct`, so a perfectly good `Result[Int, Str]` read off a tid counts as
+  non-concrete and would have been overwritten by `carrier_from_fn_ret_result()`. The gate also keeps
+  the pre-existing path bit-for-bit unchanged wherever the tid declines.
+
+`ct_names_kind_completely` names the exclusion rule once: Struct, Enum, Handler and Fn each keep the
+rest of their identity on a channel a bare CT cannot carry (a name, an effect, a signature), so only
+the kinds a CT spells completely are allowed to set `result_type`.
+
+### Census — the interesting number went the "wrong" way, correctly
+
+`match.result_temp`, both build modes (monolithic / archive-linked):
+
+| | agree | diverge | decline |
+| --- | --- | --- | --- |
+| before | 724 | 48 | 550 |
+| after | 899 / 890 | 265 | **157** |
+
+Declines fell 550 → 157: the publish gave a tid to 393 match nodes that had none. Of those, 175 the
+tid spells identically to the emitted C, and 218 it spells differently — which is why diverge *rose*.
+That rise is not a regression, and it is not an unknown. Every one of the 265 diverges is a kind the
+override declines by construction:
+
+| tid spelling → emitted | rows | why it is excluded |
+| --- | --- | --- |
+| `void` → `int64_t` | 223 | `tc_tid_ct` returns **-1** for `CT_VOID`, so a Void/Tuple tid fails the `m_ct >= 0` gate. These are statement-position matches whose temp is never read. |
+| `blink_tokens_TokenKind` / `blink_Col` → `int64_t` | 41 | Enum — excluded by `ct_names_kind_completely`. |
+| `blink_io_vtable*` → `void*` | 1 | Handler — same exclusion. |
+
+223 + 41 + 1 = 265, so the bucket is closed: no diverge row is unaccounted for, and none can reach an
+emitted declaration. The `_ct` sentinel convention — *"-1, not CT_VOID, when the kind has no concrete
+storage type"* — is doing the load-bearing work in the first row, exactly as its comment promises.
+
+Elsewhere in the census: `ctype.flat` diverge 7 → **0**, `match_binder.ident_scalar` diverge 4 → **0**
+(see below), `enum_tid` +34 agrees, and every other cell unchanged in both modes.
+
+The 157 remaining declines are **13 distinct code positions**, re-counted once per compilation unit
+that includes them. Each already emits a plausible spelling, so this is an enumerated residual rather
+than a suspected miscompile:
+
+| line | var | emitted |
+| --- | --- | --- |
+| 18 | `_match_3` | `blink_Tuple3_Model_Option_..._Cmd_int` |
+| 21 | `_match_3` | `blink_Tuple2_Z9Model_Option_Z9Cmd` |
+| 51 | `_match_2` | `blink_Result_int_IIFEErr` |
+| 74, 93, 99, 144 | `_match_1` | `int64_t` |
+| 92 | `_match_2` | `blink_Result_int_PgError` |
+| 123 | `_match_1` | `blink_list*` |
+| 172 | `_match_3` | `blink_ast_AstNode` |
+| 2397 | `_match_2` | `blink_codegen_types_RetType` |
+| 2411 | `_match_2` | `blink_codegen_types_FnRetHandlerEntry` |
+| 2785 | `_match_2` | `blink_codegen_types_FnRetStructInner` |
+
+### A byproduct, moved out rather than left red
+
+Three rows of the first test draft — a list-element binder over a struct, an Option and a List element
+— were failing on a different seam: the binder's own declaration and its unbox cast come from
+different authorities (struct element needs a deref, not a cast; an Option element declares `void`).
+A statement-position match reproduces it with no result temp involved, which proves independence.
+Filed as `t3hsad` and the rows moved there, with a header note in the test saying a list-element
+binder is covered here for a `Str` element only. Removing them took
+`match_binder.ident_scalar` from 76/4/0 to 74/**0**/0 — so that cell's 4 diverges were `t3hsad`'s tap
+firing, not this unit's, and `t3hsad` now has that recorded on it.
+
+The test's control rows carry the argument that this was not fixed one kind at a time: the
+variant-field row (`E.Tag(s) => { s }`) is the same shape as every failing row and passed **before**
+the fix, which is the evidence that the pre-pass types *some* binder kinds and that a fix aimed at the
+`as` binder alone would have been the symptom.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

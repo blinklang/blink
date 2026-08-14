@@ -115,7 +115,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{sv_ty_or_flat_at, ctype_probe_at, closure_sig_from_tid, enum_instance_c_from_tid, tc_tid_handler_effect, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
+import typecheck.{sv_ty_or_flat_at, ctype_probe_at, closure_sig_from_tid, enum_instance_c_from_tid, tc_tid_handler_effect, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -482,6 +482,24 @@ fn carrier_from_fn_ret_result() -> IfCarrier {
 // returning Option[Struct]): every Option is represented as blink_Option_ptr.
 fn carrier_ptr_option() -> IfCarrier {
     IfCarrier { ct: CT_OPTION, option_inner: CT_PTR, option_inner_struct: "", option_is_none: 0, ok_type: -1, ok_struct: "", err_type: -1, err_struct: "" }
+}
+
+// A carrier read off a tid instead of off emitted values. option_is_none is 0 because a tid states
+// the carrier's element type outright, so there is no bare-None placeholder to distinguish.
+fn carrier_from_tid(tid: Int) -> IfCarrier {
+    if tc_tid_kind(tid) == TyKind.Result {
+        return IfCarrier { ct: CT_RESULT, option_inner: -1, option_inner_struct: "", option_is_none: 0, ok_type: tc_tid_result_ok_ct(tid), ok_struct: tc_tid_result_ok_struct(tid), err_type: tc_tid_result_err_ct(tid), err_struct: tc_tid_result_err_struct(tid) }
+    }
+    IfCarrier { ct: CT_OPTION, option_inner: tc_tid_option_inner_ct(tid), option_inner_struct: tc_tid_option_inner_struct(tid), option_is_none: 0, ok_type: -1, ok_struct: "", err_type: -1, err_struct: "" }
+}
+
+// True when a bare CT spells this kind completely — i.e. a tid can hand its answer to a flat
+// `ctype` channel and lose nothing. The four excluded kinds each keep the rest of their identity in
+// a separate channel a CT cannot carry: struct and enum need a name, a handler needs its effect,
+// and a closure keeps its signature as a C string.
+fn ct_names_kind_completely(k: TyKind) -> Int {
+    if k == TyKind.Struct || k == TyKind.Enum || k == TyKind.Handler || k == TyKind.Fn { return 0 }
+    1
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -1155,35 +1173,73 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
     if match_struct_name == "" && pp_type != CT_VOID && pp_all_value != 0 && pp_type != CT_STRUCT && (result_type == CT_VOID || result_type == CT_RESULT || result_type == CT_OPTION) {
         result_type = pp_type
     }
-    // The carrier shaping the result temp: harvested from the arms when concrete,
-    // else the enclosing fn's return type (the bare Ok/Err/Some/None fallback).
-    // A ptr-erased Option context (UE handler returning Option[Struct]) keeps the
-    // physical blink_Option_ptr representation — same exception as emit_if_expr.
-    let mut mcarrier = pp_carrier
+
+    // Both authorities above read the arms' emitted values, and neither can type an arm whose value
+    // IS a pattern-bound ident: infer_arm_type answers its CT_INT default for an ident it cannot
+    // name, and the pre-pass re-emits the arm in a throwaway scope where the binding carries no
+    // type. Since CT_INT is also a legitimate answer, the harvest gate above cannot tell the two
+    // apart and keeps the default — so `Ok(b) => { b }` mistyped the result temp and the enclosing
+    // let together. The match's own tid is not derived from the arms, so it decides.
+    //
+    // Left alone where a struct name is already in hand: more specific than any CT, on a channel a
+    // CT cannot carry.
+    let m_tid = cg_node_mono_tid(node)
+    let mut use_tid_carrier = 0
+    if match_struct_name == "" {
+        let m_kind = tc_tid_kind(m_tid)
+        if m_kind == TyKind.Struct {
+            // Deliberately not gated on pp_all_value. A struct value rides the carrier as CT_VOID,
+            // so at the harvest an arm yielding a struct and an arm yielding nothing are the same
+            // signal; a struct tid says outright that the match evaluates to a value.
+            let m_stem = tc_tid_struct_mono_name(m_tid)
+            match_struct_name = if m_stem != "" { m_stem } else { tc_tid_struct(m_tid) }
+        } else if pp_all_value != 0 && ct_names_kind_completely(m_kind) != 0 {
+            let m_ct = tc_tid_ct(m_tid)
+            if m_ct >= 0 {
+                result_type = m_ct
+                if m_ct == CT_OPTION && tc_tid_option_inner_ct(m_tid) >= 0 { use_tid_carrier = 1 }
+                if m_ct == CT_RESULT && tc_tid_result_ok_ct(m_tid) >= 0 && tc_tid_result_err_ct(m_tid) >= 0 { use_tid_carrier = 1 }
+            }
+        }
+    }
+
+    // The carrier shaping the result temp: the tid when it states a resolvable element, else
+    // harvested from the arms when concrete, else the enclosing fn's return type (the bare
+    // Ok/Err/Some/None fallback). A ptr-erased Option context (UE handler returning Option[Struct])
+    // keeps the physical blink_Option_ptr representation — same exception as emit_if_expr.
+    let mut mcarrier = if use_tid_carrier != 0 { carrier_from_tid(m_tid) } else { pp_carrier }
     if result_type == CT_OPTION {
         if cg_current_fn_option_inner == CT_PTR {
             mcarrier = carrier_ptr_option()
-        } else if carrier_option_concrete(pp_carrier) == 0 {
+        } else if use_tid_carrier == 0 && carrier_option_concrete(pp_carrier) == 0 {
             mcarrier = carrier_from_fn_ret_option()
         }
     } else if result_type == CT_RESULT {
-        if carrier_result_concrete(pp_carrier) == 0 {
+        if use_tid_carrier == 0 && carrier_result_concrete(pp_carrier) == 0 {
             mcarrier = carrier_from_fn_ret_result()
         }
     }
 
+    // The result temp's spelling, assembled from the harvest before it is printed so the probe can
+    // measure the same string the emit uses. A CT_VOID result declares no temp at all, which is why
+    // the empty string gates both the probe and the emit rather than only the emit.
+    let mut result_decl_c = ""
     if match_struct_name != "" {
-        emit_line("{c_type_c_name(match_struct_name)} {result_var};")
+        result_decl_c = c_type_c_name(match_struct_name)
     } else if result_type == CT_RESULT {
-        emit_line("{result_c_type_mixed(mcarrier.ok_type, mcarrier.err_type, mcarrier.ok_struct, mcarrier.err_struct)} {result_var};")
+        result_decl_c = result_c_type_mixed(mcarrier.ok_type, mcarrier.err_type, mcarrier.ok_struct, mcarrier.err_struct)
     } else if result_type == CT_OPTION {
         if mcarrier.option_inner_struct != "" {
-            emit_line("{struct_option_c_type(mcarrier.option_inner_struct)} {result_var};")
+            result_decl_c = struct_option_c_type(mcarrier.option_inner_struct)
         } else {
-            emit_line("{option_c_type(mcarrier.option_inner)} {result_var};")
+            result_decl_c = option_c_type(mcarrier.option_inner)
         }
     } else if result_type != CT_VOID {
-        emit_line("{c_type_str(result_type)} {result_var};")
+        result_decl_c = c_type_str(result_type)
+    }
+    if result_decl_c != "" {
+        ctype_probe_at(cg_node_mono_tid(node), "match.result_temp", result_var, result_decl_c, node)
+        emit_line("{result_decl_c} {result_var};")
     }
 
     let mut has_guards = 0
@@ -1911,7 +1967,14 @@ fn pat_measure(bind_name: Str, pat: Int) {
 // says what `mm.get(k)` decodes to, the spelling says what C type holds `mm`. A binder can be right
 // on one and wrong on the other.
 fn pat_binder_tid(pat: Int) -> Int {
-    tc_tid_subst_mono(tc_tid_resolved(tc_lookup_node_tid(pat)), cg_mono_tparams_sl, cg_mono_arg_tids)
+    cg_node_mono_tid(pat)
+}
+
+// The tid any node's C spelling and metadata are read through: resolved past metavars, then
+// substituted for the enclosing mono instance. Kept as one definition so a second reader cannot
+// arrive at a differently-resolved tid for the same node.
+fn cg_node_mono_tid(n: Int) -> Int {
+    tc_tid_subst_mono(tc_tid_resolved(tc_lookup_node_tid(n)), cg_mono_tparams_sl, cg_mono_arg_tids)
 }
 
 // Emit C variable bindings for ident sub-patterns within a pattern.
