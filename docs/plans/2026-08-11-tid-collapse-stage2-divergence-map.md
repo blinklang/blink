@@ -10422,6 +10422,90 @@ Every family on that list already has a ticket or a closed cell behind it. That 
 4 needs: the flat arm at this site is dead the moment those tids answer, and no new investigation
 stands between here and there.
 
+## Instrumenting the match-binder spelling, and the feature it found broken
+
+The next site family in `codegen_stmt` is the match-arm binder, which the earlier work had already
+flipped on **one** axis and left flat on the other. The two axes are easy to conflate and are
+genuinely separate:
+
+- the binder's **metadata** — what `mm.get(k)` decodes to. `pat_measure_at` already stamps this from
+  the tid and measures it on the `sv_ty_or_flat` channel, where `match_pattern.bind` reads
+  `diverge=522 missing=16`.
+- the binder's **C spelling** — what C type holds `mm`. Still flat, and **unprobed on `ctypediv`**.
+
+A binder can be right on one and wrong on the other, so the spelling needed its own tap before it
+could be flipped. Six probes went in, keyed to the six places a binder's declaration is printed,
+all with the flat candidate as `emitted` and **no flip** — a measurement step on its own regen,
+following the Stage 3d precedent for entering an uncensused seam.
+
+### What the tap said
+
+| branch | agree | diverge | missing |
+| --- | --- | --- | --- |
+| `match_binder.carrier_payload` | 9676 | **0** | 12 |
+| `match_binder.variant_field` | 368 | **0** | 44 |
+| `match_binder.ident_scalar` | 68 | **0** | 0 |
+| `match_binder.ident_sname` | 12 | **0** | 2 |
+| `match_binder.as_sname` | — | — | — |
+| `match_binder.as_scalar` | — | — | — |
+
+Identical in both build modes. Two results worth stating plainly.
+
+`diverge=0` on every branch that fires. So all four can be flipped without changing one emitted
+declaration, exactly as the `ctype.flat` site was.
+
+The census's decline count rose **74 → 132**. That is the instrument getting more honest, not the
+compiler getting worse: the 58 new declines were always there, and were simply invisible while the
+site had no tap. A number that only ever falls is measuring its own coverage.
+
+`match_binder.ident_sname` reading `diverge=0` is a real finding in its own right. The comment above
+that site warns that `sn` is a dumping ground into which `emit_tuple_typedef` also writes compound
+tags, so a Map element arrives indistinguishable from a struct. That hazard is real for the
+**metadata** — which is why the tid stamp there was added — but it does not manifest as a wrong C
+spelling anywhere in the corpus.
+
+### The two taps that fired zero rows
+
+`as_sname` and `as_scalar` returned nothing at all, and nothing in `tests/`, `examples/` or `src/`
+uses an `as` pattern. A zero-row tap is an unexercised tap, so the shape was constructed by hand —
+and `name as pattern` turns out to be broken in a way no corpus sweep could have found.
+
+The binder is declared from `c_type_str(entry.scrut_type)`. For the three kinds a bare CT cannot
+name, that answers `void`:
+
+| scrutinee | emitted | |
+| --- | --- | --- |
+| `Int` | `int64_t w` | ok |
+| `Str` | `const char* w` | ok |
+| `List[Int]` | `blink_list* w` | ok |
+| data enum | `blink_Event w` | ok — `match_scrut_enum` is checked first |
+| `Option[Int]` | `void w` | **hard C error** |
+| `Result[Int, Str]` | `void w` | **hard C error** |
+| struct | `void w` | **hard C error** |
+
+`entry.scrut_sname` is empty for all three, so the `sn != ""` sibling branch does not catch them
+either. The spec's **own first example** for the feature (§3, *Pattern Binding (`as`)*, voted 4-1)
+does not compile:
+
+```
+error: variable or field 'config' declared void
+error: incompatible types when initializing type 'int' using type 'blink_ServerConfig'
+```
+
+Filed as `qdsy9n`. It cannot be closed by routing alone: the probe reports `ty=-` on **every** row
+at that site, meaning typecheck publishes no tid on an AsPattern node at all. The spec says what the
+tid should be — *"the bound name gets the pre-destructured value (scrutinee type)"* — so the fix is
+two-sided, publish then spell.
+
+A second, independent defect fell out of the same construction and is filed as `2ew5dp`: when an
+arm's value **is** an as-pattern binder, the match result temp is declared `int64_t` regardless of
+type, so a `Str`-valued as-pattern match emits `int64_t _match_1 = <const char*>`. The binder itself
+is spelled correctly there; this is the arm-value type, not the binder. An `Int`-valued one works
+only because the wrong default happens to match.
+
+This is the third time the corpus-sweep rule has paid for itself, and the sharpest: two P1
+miscompiles in a documented, voted language feature, sitting behind a tap that read zero.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
