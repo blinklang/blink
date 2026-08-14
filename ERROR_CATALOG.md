@@ -71,6 +71,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | NonExhaustiveMatch | E0004 | A `match` leaves an enum variant unhandled. Guarded arms do not contribute to coverage; a `_` or plain-binding arm makes the match exhaustive | Pattern matching | §3.9 |
 | TypeError | E0300 | Type mismatch detected during type checking | Type checking | §3 |
 | CannotInferType | E0301 | Inference left a type variable unbound — annotate the binding, or supply the type argument at the call when the callee's signature does not supply it. Reported where the repair attaches | Type checking | §3.4 |
+| TypeArgArity | E0303 | A type constructor in a type position was applied to the wrong number of type arguments — including none (a bare `Channel`/`List`). Under- and over-application are one code. Decided at name resolution, before inference | Name resolution | §3.4 |
 | TemplateMismatch | E0310 | String template parameter type does not match argument | Type checking | §3 |
 | UndeclaredEffect | E0500 | Callee requires effect not declared by caller | Effects | §4.5 |
 | CapabilityBudgetExceeded | E0501 | Function effect exceeds module `@capabilities` budget | Effects | §4.8 |

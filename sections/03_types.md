@@ -1223,6 +1223,55 @@ A **bound is an occurrence.** `T: Serialize` partitions the instantiations into 
 
 W0604 is a warning and not an error: a binder nothing supplies is still callable, because the brackets reach it. Nothing about such a declaration is unsound — it is merely a declaration whose every call must carry a type argument that changes nothing, and the lint is what keeps those out of a codebase.
 
+#### Kind-Correctness of Type Expressions
+
+Every type expression written in a **type position** — a parameter type, a return type, a field type, a binding annotation, a nested type argument, or a struct-literal head — must denote a complete type. A type constructor of arity *n* denotes a complete type only when it is applied to exactly *n* type arguments. Writing a constructor with the wrong number of arguments — including **none** — does not denote a type; it is `error[TypeArgArity]` (E0303).
+
+```blink
+fn relay(src: Channel, dst: Channel) { }   // error[TypeArgArity]: `Channel` takes 1 type argument, 0 were given
+```
+
+`Channel` is a type constructor of arity 1, so `Channel` standing alone is not a type — it is a constructor with its argument missing. The same rule rejects a partially applied constructor and an over-applied one:
+
+```blink
+fn f(m: Map[Str]) { }          // error[TypeArgArity]: `Map` takes 2 type arguments, 1 was given
+fn g(xs: List[Int, Str]) { }   // error[TypeArgArity]: `List` takes 1 type argument, 2 were given
+```
+
+This is one rule, not three cases. Under-application (too few arguments, of which the bare name is the *k* = 0 extreme) and over-application (too many) are the same failure — a type expression whose applied arity does not match the constructor's declared arity — and carry the same code in both directions.
+
+**The rule is uniform across builtins and user generics.** `Channel`, `List`, `Map`, `Set`, and `Option` are type constructors on exactly the terms a user's `type Registry[T]` is; none is a special case. A bare `Registry` in a type position is `error[TypeArgArity]` for the same reason a bare `Channel` is.
+
+```blink
+type Registry[T] {
+    entries: List[T]
+}
+
+fn lookup(r: Registry) { }      // error[TypeArgArity]: `Registry` takes 1 type argument, 0 were given
+```
+
+**E0303 is decided at name resolution, before inference runs.** A constructor's arity is a property of its declaration alone, so the mismatch is known the moment the annotation is read — no call site, and no inference, is consulted. This is what distinguishes E0303 from `error[CannotInferType]` (E0301, §3.4 *Under-Determined Types*): E0301 fires when inference *terminates* with a type variable no use ever fixed; E0303 fires when a type expression was never well-formed to begin with. A bare `Channel` annotation is not an unsolved variable that a later use might constrain — it names a slot the program neglected to fill, and no downstream use can fill an argument the annotation did not open. The two never co-fire on the same type expression: a well-formed constructor application may leave a variable under-determined (E0301), but an ill-formed one is rejected first (E0303).
+
+**The repair depends on the case, and the first `help:` offered is normative** (§3.4 *Explicit Type Application*):
+
+| Case | Example | Repair offered first |
+| --- | --- | --- |
+| Bare constructor, a type parameter is in scope | `fn relay[T](src: Channel)` | apply the parameter in scope — `Channel[T]` |
+| Bare constructor, no type parameter is in scope | `fn relay(src: Channel)` | declare a binder on the enclosing declaration and apply it — `fn relay[T](src: Channel[T], dst: Channel[T])` |
+| Under-applied (some, too few) | `Map[Str]` | supply the missing argument — `Map[Str, V]` |
+| Over-applied (too many) | `List[Int, Str]` | remove the extra argument — `List[Int]` |
+
+The binder-declaring repair is offered **only** when the constructor is bare *and* no type parameter already in scope can fill the slot. Where a parameter is in scope, applying it is the whole repair; suggesting a fresh binder there would shadow an available one.
+
+**Trait references are not type expressions and are outside this rule.** A trait name in a bound (`T: Ord`) or an impl header does not occupy a type position — it constrains a type parameter rather than denoting a type (§3.6). Its arguments are governed by `error[TraitArgArity]` (E0910), the impl-header specialization of the same arity principle. So a generic signature that mentions a trait only in a bound is well-formed under E0303:
+
+```blink
+fn sort[T: Ord](xs: List[T]) -> List[T] { xs }   // OK -- `Ord` is a bound, not a type expression;
+                                                  //       `List[T]` is a complete type
+```
+
+One principle — a constructor is applied to its exact arity — surfaces as E0303 in type positions and E0910 in trait positions, because the repair and the surrounding grammar differ between the two.
+
 #### Under-Determined Types
 
 Inference at a binding is a two-state judgment: either every type variable is resolved to a concrete type, or the ones that cannot be resolved are **reported**. There is no third state — Blink never *defaults* an unresolved type variable to a concrete type, and there is no user-facing "unknown" or "any" type that inference can fall into.
