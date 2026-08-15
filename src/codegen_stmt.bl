@@ -757,16 +757,32 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
 }
 
 // True when any arm's pattern reads the scrutinee as a struct (`.tag`/`.data`/
-// members) rather than as a scalar. A data-enum-returning call reports
-// expr_result_type == CT_INT (a known misreport), so the scalar-bind path in
-// emit_match_expr would otherwise materialize `int64_t _scrut = <struct-call>`
-// and then the arm's `_scrut.tag` access would not compile. Fieldless enums are
-// safe (they compare as ints), so only *data* enum variants and aggregate
-// patterns disqualify the scalar-bind.
+// members) rather than as a scalar. The scalar-bind path in emit_match_expr
+// materializes `<scalar> _scrut = <scrutinee>` and has each arm test the temp;
+// an arm that then reads `_scrut.tag`/`.data` would not compile against a scalar
+// temp. So only fieldless (plain, C-style) enum variants -- which compare as
+// ints -- are safe; data-enum variants and aggregate patterns disqualify the
+// scalar-bind.
 fn match_arm_pattern_needs_struct(pat: Int) -> Int {
     let pk = node_kind(pat)
-    if pk == NodeKind.StructPattern || pk == NodeKind.TuplePattern || pk == NodeKind.ListPattern || pk == NodeKind.EnumPattern {
+    if pk == NodeKind.StructPattern || pk == NodeKind.TuplePattern || pk == NodeKind.ListPattern {
         return 1
+    }
+    if pk == NodeKind.EnumPattern {
+        // A qualified variant pattern needs a struct scrutinee only when the enum
+        // carries payloads (a data enum) or the pattern destructures fields. A
+        // plain (C-style) enum variant (`Col.Red`) only compares a scalar tag, so
+        // it must not block the scalar-scrutinee temp -- otherwise a side-effecting
+        // scrutinee is re-embedded and re-evaluated once per arm tested. Mirrors
+        // the IdentPattern is_data_enum test below.
+        let ep_enum = node_name(pat)
+        if ep_enum != "" && is_data_enum(ep_enum) != 0 { return 1 }
+        // node_name is the enum only for the qualified form; a bare payload
+        // variant (`Branch(l, r)`) names the *variant*, which is_data_enum can't
+        // see -- the field check is what disqualifies those, so keep it.
+        let ep_flds = node_fields(pat)
+        if ep_flds != -1 && sublist_length(ep_flds) > 0 { return 1 }
+        return 0
     }
     if pk == NodeKind.AsPattern {
         return match_arm_pattern_needs_struct(node_pattern(pat))
