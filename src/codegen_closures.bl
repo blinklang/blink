@@ -835,15 +835,22 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             params_c = params_c.concat(", ")
             if ptype == "Fn" {
                 params_c = params_c.concat("blink_closure* {pname}")
-            } else if ptype == "" && (hint_tid_c != "" || (cg_closure_param_type_hint >= 0 && cg_closure_param_type_hint != CT_VOID)) {
-                // An unannotated param takes its type from the call-site element hint. The tid
-                // holds the struct identity the flat CT loses (c_type_str has no struct arm, so a
-                // struct hint spelled `void p` — illegal C) and leads; the flat CT is the fallback
-                // for a scalar element. The tid also carries element types the flat CT registry
-                // never knew (a receiver reached through a field spells CT_VOID there), so entry
-                // is gated on either channel. Paired with the cast below, which reads the same tid.
-                let hint_c = if hint_tid_c != "" { hint_tid_c } else { c_type_str(cg_closure_param_type_hint) }
-                params_c = params_c.concat("{hint_c} {pname}")
+            } else if ptype == "" {
+                // An unannotated param takes its per-position type from the closure's own Fn tid
+                // (fold's Int accumulator, distinct from the list element) — this leads, so a
+                // position-blind element hint no longer mistypes a param the HOF supplies
+                // differently. The call-site element hint is the fallback for a slot the tid
+                // cannot name; its own tid still leads its flat CT (c_type_str has no struct arm,
+                // so a struct hint spelled `void p` — illegal C). Paired with the cast below.
+                let lit_c = closure_lit_param_c(node, i)
+                if lit_c != "" {
+                    params_c = params_c.concat("{lit_c} {pname}")
+                } else if hint_tid_c != "" || (cg_closure_param_type_hint >= 0 && cg_closure_param_type_hint != CT_VOID) {
+                    let hint_c = if hint_tid_c != "" { hint_tid_c } else { c_type_str(cg_closure_param_type_hint) }
+                    params_c = params_c.concat("{hint_c} {pname}")
+                } else {
+                    params_c = params_c.concat("{c_type_str(type_from_name(ptype))} {pname}")
+                }
             } else if is_enum_type(ptype) != 0 || is_struct_type(ptype) != 0 {
                 let mono = ann_mono_c_type(node_type_ann(p))
                 let pc = if mono != "" { mono } else { c_type_c_name(ptype) }
@@ -1109,12 +1116,19 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             let sp_hint_tid_c = closure_hint_c(saved_param_hint_tid)
             if sptype == "Fn" {
                 sig_params = sig_params.concat("blink_closure*")
-            } else if sptype == "" && (sp_hint_tid_c != "" || (saved_param_hint >= 0 && saved_param_hint != CT_VOID)) {
-                // The cast half of the definition's hint arm above: both read the same element
-                // tid and gate on the same channels, so the fn-ptr cast and the closure body's
-                // param type stay in ABI sync. The tid leads and declines to the flat hint
-                // identically on both sides.
-                sig_params = sig_params.concat(if sp_hint_tid_c != "" { sp_hint_tid_c } else { c_type_str(saved_param_hint) })
+            } else if sptype == "" {
+                // The cast half of the definition's unannotated arm above: the per-position Fn-tid
+                // type leads and the element hint is the fallback, in the same order and gated on
+                // the same channels, so the fn-ptr cast and the closure body's param type stay in
+                // ABI sync.
+                let sp_lit_c = closure_lit_param_c(node, si)
+                if sp_lit_c != "" {
+                    sig_params = sig_params.concat(sp_lit_c)
+                } else if sp_hint_tid_c != "" || (saved_param_hint >= 0 && saved_param_hint != CT_VOID) {
+                    sig_params = sig_params.concat(if sp_hint_tid_c != "" { sp_hint_tid_c } else { c_type_str(saved_param_hint) })
+                } else {
+                    sig_params = sig_params.concat(c_type_str(type_from_name(sptype)))
+                }
             } else if is_enum_type(sptype) != 0 || is_struct_type(sptype) != 0 {
                 // Must agree with the definition line's params_c above: this string is the CAST
                 // the call is made through, so the two disagreeing is an ABI mismatch, not a
