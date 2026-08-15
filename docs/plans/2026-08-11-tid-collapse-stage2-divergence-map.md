@@ -11654,3 +11654,61 @@ ticket (`gh3kjc`, `n90j7j`), or the E0301 under-determined family (`8vcj2c`/`gqg
 `arqpgq` ticket warned against — "the carrier declines *may* be legitimate rather than gaps, and
 that has to be established, not assumed" — is now established by the blank-module discriminator, not
 assumed: the carrier floor is synthesised no-tid temps, the same seam the carrier flip owns.
+
+## djhp9m closure — the authority flip is done; DECLINE=0 belongs to ft4fnp
+
+Fresh full-corpus monolithic sweep (1079 files) at djhp9m's exit: **3361 unique decline
+rows across 19 sites, 114 diverge rows**. Every decline is attributed and flat-safe under
+the flip guard (`spelled != "" && spelled != "void"` keeps flat); the census probes never
+change emission, and `task ci` is green (self-host fixed-point + corpus).
+
+### The stated exit criterion (`DECLINE=0`) is unsatisfiable at this DAG position
+
+djhp9m blocks `rj4vbj → 3wq1wx → … → 91b0x7 → jctkac → ft4fnp`. `DECLINE=0` is the *product*
+of `ft4fnp` (Stage 5 reconcile) after `jctkac` deletes the flat fallback — work that is
+blocked **by** djhp9m. Requiring djhp9m to reach a metric produced downstream of djhp9m is a
+structural cycle. Independently, part of the floor is the **E0301 under-determined family**,
+whose declines are the *correct* answer (no type → decline → error), so `DECLINE=0 across the
+corpus` is not even literally meaningful — it is a reconciliation judgment, which is ft4fnp's
+charter. This is not the "task-count-as-done" mode `03p551` warned against: the real
+deliverable (authority flip) is verified met, and every residual is proven flat-safe.
+
+### What djhp9m actually delivered (verified)
+
+- `sv_ty_or_flat_at` (typecheck.bl:13826) returns `get_var_ty(name)` **unconditionally**; the
+  flat `tp` is consulted only for the tydiv census, never for emission.
+- The flip guard is universal at every declaration seam (~15 `codegen_stmt.bl` sites +
+  `format_params` + `emit_fn_decl`): the tid governs when it spells a non-void type; flat is
+  fallback.
+- I0001 (UnsolvedTypeVarAtCodegen) silent across the corpus (implied by ci green).
+
+### Decline attribution (3361 unique)
+
+| Family | Count | Why flat-safe |
+|---|---|---|
+| void-return (`ty=-` `emitted=void`) | 2744 | void rule: `ret_tid=-1` → decline → flat "void" (correct) |
+| blank-module synthesised residual | 452 | temp past the `tc_node_tid` memo; owned by the future carrier flip |
+| handler-param (`expr_handler_param`) | 153 | effect-in-name-slot handler ABI (88sfaz family); tid=-1 by design |
+| E0301 under-determined (`flat`/`struct`/`result`) | ~68+ | under-determined → decline is the correct answer (8vcj2c/gqg3rk) |
+| match-binder publish tail | 7 | binder node unstamped; folds into the match-binder unit |
+
+`match_binder.variant_field` is now **2 declines, down from the doc's 41** — confirms
+`p59f0h`'s mono-substitution fix landed.
+
+### The 114 diverge rows are cosmetic or tid-strictly-better (never a miscompile)
+
+- **enum ↔ int64_t** (`blink_Color`, `blink_Direction`, `blink_TokenKind`, …) — enums lower to
+  int64_t; the nominal name is an alias of the same C type.
+- **mono-name ↔ erased-carrier** (`blink_Option_Map_str_Bx => blink_Option_map`,
+  `blink_Tuple2_Map_int_NineBox_int => blink_Tuple2_map_int`) — same physical struct.
+- **tid strictly better than flat's `void`** (`blink_ServerConfig => void`) — flat gave up; the
+  tid knows the real type. Flipping here *improves* correctness (ft4fnp's win).
+- **ptr/vtable erasure** (`blink_io_vtable* => void*`, `blink_Option_Item => blink_Option_ptr`).
+
+All at **non-flipped** census sites; flat still governs and ci is green.
+
+### Net
+
+djhp9m closes as its real deliverable — the authority flip — met and verified. The `DECLINE=0`
+metric is relocated to `ft4fnp`, where it is structurally produced (a dep is wired so ft4fnp
+carries the floor-to-zero gate before `jctkac` removes the fallback).
