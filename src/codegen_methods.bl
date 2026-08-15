@@ -6,7 +6,7 @@ import codegen_types.{
     CT_ENUM, CT_STRUCT, CT_TEMPLATE, CT_VOID,
     append_ev_arg, c_fn_name, c_type_c_name, c_type_c_name_in, c_type_from_tag, c_type_str, c_type_tag, c_type_tag_for_struct, canonical_struct_tag, builtin_struct_name_for_ct, builtin_struct_ct_for_name, derive_method_cname,
     cg_async_scope_stack, cg_async_wrapper_counter, cg_closure_defs,
-    cg_closure_param_type_hint, cg_current_fn_name, cg_handler_body_idx,
+    cg_closure_param_type_hint, cg_closure_param_type_hint_tid, cg_current_fn_name, cg_handler_body_idx,
     cg_handler_cleanup_fn, cg_handler_cleanup_var,
     cg_handler_is_user_effect, cg_handler_vtable_field, cg_handler_vtable_type,
     cg_in_handler_body, cg_in_ffi_scope_resource, cg_indent, cg_let_target_name, cg_let_target_type,
@@ -75,7 +75,7 @@ import diagnostics.{
     ICE_SEG_ERASED_SLOT,
 }
 import ast.{NodeKind, is_block_bearing, dbg_trace, dbg_channel_on}
-import typecheck.{sv_ty_or_flat, tc_channel_elem_ct, tc_channel_elem_struct, tc_ptr_pointee_ct, tc_ptr_pointee_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_tuple_sname, tc_tid_list_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member, tc_list_rename_help, ctype_probe_at, c_type_from_tid, tc_tid_resolved, tc_tid_subst_mono}
+import typecheck.{sv_ty_or_flat, tc_channel_elem_ct, tc_channel_elem_struct, tc_ptr_pointee_ct, tc_ptr_pointee_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_tuple_sname, tc_tid_list_elem, tc_tid_iter_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member, tc_list_rename_help, ctype_probe_at, c_type_from_tid, tc_tid_resolved, tc_tid_subst_mono}
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
 let mut btc_arg_offset: Int = 0
@@ -4241,17 +4241,24 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     // Iterator adapter and consumer methods — work on both CT_LIST and CT_ITERATOR
     if (obj_type == CT_LIST || obj_type == CT_ITERATOR) && (method == "count" || method == "collect" || method == "for_each" || method == "any" || method == "all" || method == "find" || method == "fold" || method == "map" || method == "filter" || method == "take" || method == "skip" || method == "chain" || method == "flat_map" || method == "enumerate" || method == "zip") {
 
-        // Set element type hint for closure param type inference
+        // Set element type hint for closure param type inference. The bare CT loses struct
+        // identity (c_type_str has no struct arm), so also publish the element tid for the
+        // closure param speller; it declines to the CT where the tid is unspellable.
         if obj_type == CT_LIST {
             let hint_elem = get_list_elem_type(obj_str)
             if hint_elem != -1 {
                 cg_closure_param_type_hint = hint_elem
             }
+            cg_closure_param_type_hint_tid = tc_tid_list_elem(cm_node_mono_tid(obj_node))
         } else if obj_type == CT_ITERATOR {
             let hint_elem = get_var_iterator_inner(obj_str)
             if hint_elem > 0 {
                 cg_closure_param_type_hint = hint_elem
             }
+            // An iterator tid is not a List kind, so tc_tid_list_elem would always decline
+            // here; tc_tid_iter_elem reads the element of a List/Set/Map-backed iterator and
+            // returns Unknown (spells "") for a genuine iterator kind, declining to the CT.
+            cg_closure_param_type_hint_tid = tc_tid_iter_elem(cm_node_mono_tid(obj_node))
         }
 
         // --- Adapter methods: return CT_ITERATOR ---
@@ -4948,6 +4955,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             return
         }
         cg_closure_param_type_hint = -1
+        cg_closure_param_type_hint_tid = -1
     }
 
     // Channel methods

@@ -1,0 +1,69 @@
+// br tcpd75 — the emit_closure hint-param positions (the `ptype == ""` branch that fires for an
+// UNANNOTATED closure param whose type comes from the call-site hint) now spell their C type from
+// the closure node's tid, with the flat c_type_str(hint) kept only where the tid declines. The
+// definition line (params_c) and the call-site fn-ptr cast (sig_params) are an ABI pair, so both
+// move together through closure_lit_param_c(node, i).
+//
+// The flat hint is a bare CT, and c_type_str has no CT_STRUCT arm, so a struct-typed inferred
+// closure param spelled `void p` — a hard C error (`'void' must be the only parameter`). The tid
+// names it (`blink_Pt`), so an unannotated closure over a struct element now compiles. A scalar
+// element (List[Int]) has no CT_STRUCT problem, so the tid declines and the flat int64_t stands.
+
+import compile_test_helpers
+import std.io
+
+fn hint_src() -> Str {
+    #"import std.io
+
+type Pt { x: Int y: Int }
+
+fn main() {
+    let pts = [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }]
+    let xs = pts.map(fn(p) -> Int { p.x + p.y })
+    let total = xs.fold(0, fn(a: Int, v: Int) -> Int { a + v })
+    io.println("{total}")
+}
+"#
+}
+
+fn scalar_src() -> Str {
+    #"import std.io
+
+fn main() {
+    let xs = [1, 2, 3].map(fn(x) -> Int { x + 1 })
+    let total = xs.fold(0, fn(a: Int, v: Int) -> Int { a + v })
+    io.println("{total}")
+}
+"#
+}
+
+test "unannotated struct closure param spells its struct type, not void" {
+    let c = compile_test_helpers.compile_and_emit_c(hint_src(), "tcpd75_hint")
+    if c.contains("void p)") {
+        io.println("FAIL: struct hint param still spelled void")
+    }
+    assert(!c.contains("void p)"))
+    assert(c.contains("blink_Pt p)"))
+    // The definition line and the call-site fn-ptr cast are an ABI pair; the cast must
+    // spell the same struct type (no param name), not the flat `void`.
+    assert(c.contains(", blink_Pt))"))
+}
+
+test "unannotated scalar closure param declines the tid and stays int64_t" {
+    let c = compile_test_helpers.compile_and_emit_c(scalar_src(), "tcpd75_scalar")
+    if c.contains("void x)") {
+        io.println("FAIL: scalar hint param spelled void")
+    }
+    assert(!c.contains("void x)"))
+    assert(c.contains("int64_t x)"))
+}
+
+test "unannotated struct closure param compiles and runs" {
+    let r = compile_test_helpers.compile_and_run(hint_src(), "tcpd75_hint_run")
+    if r.exit_code != 0 {
+        io.println("FAIL: did not run cleanly (exit {r.exit_code})")
+        io.println(r.err_out)
+    }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("10"))
+}

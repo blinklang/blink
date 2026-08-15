@@ -22,10 +22,10 @@ import codegen_types.{
     is_emitted_fn, is_enum_type, is_struct_type, list_contains_str, resolve_variant,
     reg_fn_struct_ret, reg_fn_ret_from_ann,
     resolve_ret_type_from_ann, resolve_option_inner_from_ann, build_closure_sig_from_type_ann,
-    closure_lit_ret_c, closure_lit_ret_ct, closure_lit_param_c, closure_ret_mono_stem, capture_cell_c_type,
+    closure_lit_ret_c, closure_lit_ret_ct, closure_lit_param_c, closure_hint_c, closure_ret_mono_stem, capture_cell_c_type,
     resolve_tuple_ann, tuple_c_name_from_ann,
     append_ev_arg, fn_node_has_effects,
-    cg_closure_counter, cg_closure_defs, cg_closure_promoter_defs, cg_closure_param_type_hint,
+    cg_closure_counter, cg_closure_defs, cg_closure_promoter_defs, cg_closure_param_type_hint, cg_closure_param_type_hint_tid,
     cg_fn_shim_emitted,
     cg_closure_cap_start, cg_closure_cap_count,
     cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_ret, cg_current_fn_option_inner, cg_in_test_body,
@@ -823,6 +823,7 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
 
     // Build C parameter list: __self first if captures, then user params
     let saved_param_hint = cg_closure_param_type_hint
+    let saved_param_hint_tid = cg_closure_param_type_hint_tid
     let mut params_c = "const blink_closure* __self"
     if params_sl != -1 && sublist_length(params_sl) > 0 {
         let mut i = 0
@@ -834,8 +835,15 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             if ptype == "Fn" {
                 params_c = params_c.concat("blink_closure* {pname}")
             } else if ptype == "" && cg_closure_param_type_hint >= 0 && cg_closure_param_type_hint != CT_VOID {
+                // An unannotated param takes its type from the call-site hint, a bare CT.
+                // c_type_str has no struct arm, so a struct hint spelled `void p` — illegal C.
+                // The element tid the HOF published holds the struct identity and leads; it
+                // declines (empty) for an unspellable slot, keeping the flat hint. Paired
+                // with the cast below, which reads the same tid.
                 let ct = cg_closure_param_type_hint
-                params_c = params_c.concat("{c_type_str(ct)} {pname}")
+                let hint_tid_c = closure_hint_c(cg_closure_param_type_hint_tid)
+                let hint_c = if hint_tid_c != "" { hint_tid_c } else { c_type_str(ct) }
+                params_c = params_c.concat("{hint_c} {pname}")
             } else if is_enum_type(ptype) != 0 || is_struct_type(ptype) != 0 {
                 let mono = ann_mono_c_type(node_type_ann(p))
                 let pc = if mono != "" { mono } else { c_type_c_name(ptype) }
@@ -1101,7 +1109,11 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             if sptype == "Fn" {
                 sig_params = sig_params.concat("blink_closure*")
             } else if sptype == "" && saved_param_hint >= 0 && saved_param_hint != CT_VOID {
-                sig_params = sig_params.concat(c_type_str(saved_param_hint))
+                // The cast half of the definition's hint arm above: both read the same element
+                // tid, so the fn-ptr cast and the closure body's param type stay in ABI sync.
+                // The tid leads and declines to the flat hint identically on both sides.
+                let sp_hint_tid_c = closure_hint_c(saved_param_hint_tid)
+                sig_params = sig_params.concat(if sp_hint_tid_c != "" { sp_hint_tid_c } else { c_type_str(saved_param_hint) })
             } else if is_enum_type(sptype) != 0 || is_struct_type(sptype) != 0 {
                 // Must agree with the definition line's params_c above: this string is the CAST
                 // the call is made through, so the two disagreeing is an ABI mismatch, not a
@@ -1134,6 +1146,7 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     }
     expr_closure_sig = "{sig_ret_str}(*)({sig_params})"
     cg_closure_param_type_hint = -1
+    cg_closure_param_type_hint_tid = -1
 
     let mut slot_descs: List[Str] = []
     let mut di = 0
