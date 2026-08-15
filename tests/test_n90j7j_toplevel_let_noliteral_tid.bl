@@ -1,0 +1,85 @@
+// br n90j7j — an unannotated module-level `let`/`const` whose initializer is not a bare literal
+// registers no tid, so codegen has only its flat fields to spell the declaration. The top-level
+// walk in tc_infer_program infers a tid ONLY for an IntLit/FloatLit/BoolLit/InterpString RHS
+// (typecheck.bl), because function names register in a LATER loop — so a call/ident/binop/variant
+// initializer had nothing to resolve against at that point. A second pass after fn registration
+// re-infers them.
+//
+// THIS TEST ASSERTS ON EMITTED C, DELIBERATELY, the same honest shape test_0rmamy uses for its
+// sibling cell. The defect is not a miscompile: C converts enum <-> int implicitly, so
+// `int64_t g = blink_Col_Green;` runs identically to `blink_Col g = ...`. The observable is the
+// declaration itself — a global typed `int64_t` has thrown away that it holds a `Col`, which is
+// exactly the fact Stage 4 needs the tid to carry before it can delete that site's flat arm.
+//
+// Two positions, both unannotated and non-literal:
+//   let g_variant = Col.Green   — a variant construction, resolvable without fn names
+//   let g_alias   = g_variant   — an Ident reading the PRIOR global; pins that the second pass
+//                                 runs in source order, so the alias sees g_variant's fresh tid
+// Before the fix both declare `int64_t`; after, both declare `blink_Col`.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import codegen.{generate}
+import std.io
+// codegen_types resolves globals out of the MERGED program that it cannot import; a bare
+// `import codegen_expr` closes those back-references (see test_0rmamy). `blink check` reports it
+// UNUSED — it is not.
+import codegen_expr
+
+fn probe_src() -> Str {
+    let mut s = "import std.io\n"
+    s = s.concat("type Col \{ Red, Green }\n")
+    s = s.concat("fn score(c: Col) -> Int \{\n")
+    s = s.concat("    match c \{\n        Col.Red => 1\n        Col.Green => 2\n    }\n")
+    s = s.concat("}\n")
+    s = s.concat("let g_variant = Col.Green\n")
+    s = s.concat("let g_alias = g_variant\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    io.println(\"\{score(g_variant) + score(g_alias)}\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+// `generate` may be called only ONCE per process (it opens with a debug_assert that cg_lines is
+// empty and does not clear the buffer on exit), so the emitted C is cached — see test_0rmamy.
+let mut probe_c = ""
+
+fn emitted_c() -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+    if probe_c != "" { return probe_c }
+    let path = "build/toplevel_let_mono_probe.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let c = generate(program)
+    fs.remove(path)
+    probe_c = c
+    c
+}
+
+// The enum typedef must exist for any row below to mean anything.
+fn assert_typedef(c: Str) {
+    if !c.contains("} blink_Col;") {
+        io.println("FAIL: emitted C has no `blink_Col` typedef — the rows below cannot be read")
+    }
+    assert(c.contains("} blink_Col;"))
+}
+
+// Pinned from BOTH sides: the enum spelling must appear AND the erased spelling must not.
+fn assert_global_decl_enum(c: Str, name: Str) {
+    let want = "blink_Col {name} ="
+    let bad = "int64_t {name} ="
+    if !c.contains(want) { io.println("FAIL: `{want}` not in emitted C (global still erased?)") }
+    if c.contains(bad) { io.println("FAIL: `{bad}` still in emitted C") }
+    assert(c.contains(want))
+    assert(!c.contains(bad))
+}
+
+test "a top-level let bound to a variant is declared with the enum typedef" {
+    let c = emitted_c()
+    assert_typedef(c)
+    assert_global_decl_enum(c, "g_variant")
+}
+
+test "a top-level let aliasing an earlier enum global is declared with the enum typedef" {
+    assert_global_decl_enum(emitted_c(), "g_alias")
+}
