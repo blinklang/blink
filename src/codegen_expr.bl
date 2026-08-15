@@ -99,7 +99,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{tc_mono_tids_subst, tc_tid_subst_mono, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_list_elem_ct, tc_tid_list_elem_struct, tc_tid_list_elem, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_ct_resolved, tc_tid_map_val_struct_resolved, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_faithful, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved}
+import typecheck.{ctype_probe_at, c_type_from_tid, tc_mono_tids_subst, tc_tid_subst_mono, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_list_elem_ct, tc_tid_list_elem_struct, tc_tid_list_elem, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_ct_resolved, tc_tid_map_val_struct_resolved, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_faithful, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -464,6 +464,16 @@ pub fn recover_option_set_elem_from_tid(node: Int, var_name: Str) ! Codegen.Regi
 // FUNCTION body (e.g. `fn unbox[T](b: Box[T]) -> T { b.value }` at T=Map[K,V]),
 // the field access's own tid memo still reads back with T a bare typevar
 // unless rewritten through this call's binder.
+// Canonical tid read for a codegen_expr position, mirroring codegen_stmt's
+// cg_node_mono_tid: resolve, then substitute the active mono binders so a
+// typevar slot reads back concrete inside a generic body.
+fn cg_expr_mono_tid(raw: Int) -> Int {
+    tc_tid_subst_mono(tc_tid_resolved(raw), cg_mono_tparams_sl, cg_mono_arg_tids)
+}
+fn cg_expr_node_mono_tid(node: Int) -> Int {
+    cg_expr_mono_tid(tc_lookup_node_tid(node))
+}
+
 fn recover_map_kv_from_tid(node: Int, var_name: Str) ! Codegen.Register, Codegen.Scope {
     let mtid = tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids)
     let kct = tc_tid_map_key_ct_resolved(mtid)
@@ -1386,6 +1396,7 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
             let cap = handler_caps.get(csi).unwrap()
             let cn = cap.name
             let ct = cap.tp_id
+            ctype_probe_at(cg_expr_mono_tid(get_var_ty(cn)), "expr_handler_cap_field", cn, c_type_str(ct), -1)
             cg_closure_defs.push("    {c_type_str(ct)} {c_safe_name(cn)};")
             csi = csi + 1
         }
@@ -1411,6 +1422,7 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
                     let pname = node_name(p)
                     let ptype = node_type_name(p)
                     let ct = type_from_name(ptype)
+                    ctype_probe_at(cg_expr_node_mono_tid(p), "expr_handler_param", pname, c_type_str(ct), p)
                     param_str = param_str.concat("{c_type_str(ct)} {pname}")
                     pi = pi + 1
                 }
@@ -1421,7 +1433,9 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
             let ret_str = node_return_type(m)
             let ret_type = type_from_name(ret_str)
             let ann_ret_c = resolve_ret_type_from_ann(m)
-            let mut ret_c = if ann_ret_c != "" { ann_ret_c } else { c_type_str(ret_type) }
+            let ret_flat = if ann_ret_c != "" { ann_ret_c } else { c_type_str(ret_type) }
+            ctype_probe_at(cg_expr_node_mono_tid(node_type_ann(m)), "expr_handler_ret", node_name(m), ret_flat, node_type_ann(m))
+            let mut ret_c = ret_flat
             let ue_needs_ptr = is_user_effect != 0 && ret_type == CT_OPTION && resolve_option_inner_from_ann(m) == CT_VOID
             if ue_needs_ptr {
                 ret_c = option_c_type(CT_PTR)
@@ -1525,6 +1539,7 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
                     let cn = cap0.name
                     let ct = cap0.tp_id
                     let safe_cn = c_safe_name(cn)
+                    ctype_probe_at(cg_expr_mono_tid(get_var_ty(cn)), "expr_handler_unbox1", cn, c_type_str(ct), -1)
                     if ct == CT_STRING {
                         emit_line("{c_type_str(ct)} {safe_cn} = (const char*){cap_ev_fld}->__userdata;")
                     } else {
@@ -1539,6 +1554,7 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
                         let cn = cap.name
                         let ct = cap.tp_id
                         let safe_cn = c_safe_name(cn)
+                        ctype_probe_at(cg_expr_mono_tid(get_var_ty(cn)), "expr_handler_unboxN", cn, c_type_str(ct), -1)
                         emit_line("{c_type_str(ct)} {safe_cn} = __caps->{safe_cn};")
                         set_var(cn, ct, 0)
                         uci = uci + 1
@@ -1657,6 +1673,7 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
     let cl_body = node_body(closure_node)
     let cl_ret_str = node_return_type(closure_node)
     let cl_ret_type = type_from_name(cl_ret_str)
+    ctype_probe_at(cg_expr_node_mono_tid(node_type_ann(closure_node)), "expr_task_ret", cl_ret_str, c_type_str(cl_ret_type), node_type_ann(closure_node))
     let mut task_ret_c = c_type_str(cl_ret_type)
     let mut task_ret_struct = ""
     let mut body_ret = cl_ret_type
@@ -1761,6 +1778,7 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
     while mc_i < captures.len() {
         let mc_e = closure_captures.get(cap_start + mc_i).unwrap()
         if mc_e.is_mut != 0 {
+            ctype_probe_at(cg_expr_mono_tid(mc_e.tid), "expr_task_mutcap", mc_e.name, c_type_str(tp_get_kind(mc_e.tp_id)), -1)
             let mc_ts = c_type_str(tp_get_kind(mc_e.tp_id))
             emit_line("{mc_ts}* {mc_e.name}_cell = ({mc_ts}*)blink_closure_get_capture(__self, {mc_i});")
         }
@@ -2141,7 +2159,11 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
         return
     }
     if op == "<<" || op == ">>" {
-        let lc = c_type_str(left_type)
+        let sh_tid = cg_expr_node_mono_tid(node_left(node))
+        let sh_flat = c_type_str(left_type)
+        ctype_probe_at(sh_tid, "expr_shift_operand", "shift", sh_flat, node_left(node))
+        let sh_spelled = c_type_from_tid(sh_tid)
+        let lc = if sh_spelled != "" && sh_spelled != "void" { sh_spelled } else { sh_flat }
         let rhs_node = node_right(node)
         if rhs_node != -1 && node_kind(rhs_node) == NodeKind.IntLit {
             expr_result_str = "(({lc})({left_str}) {op} (uint32_t){right_str})"
@@ -2162,7 +2184,11 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
 
     // Sized-integer arithmetic: trap on overflow per spec §03_types.md:739-760.
     if is_sized_int_ct(left_type) && (op == "+" || op == "-" || op == "*" || op == "/" || op == "%") {
-        let lc = c_type_str(left_type)
+        let sov_tid = cg_expr_node_mono_tid(node_left(node))
+        let sov_flat = c_type_str(left_type)
+        ctype_probe_at(sov_tid, "expr_sized_arith", "sov", sov_flat, node_left(node))
+        let sov_spelled = c_type_from_tid(sov_tid)
+        let lc = if sov_spelled != "" && sov_spelled != "void" { sov_spelled } else { sov_flat }
         let tname = type_name_from_ct(left_type)
         let loc_line = panic_line_str(node)
         let file = panic_file_for_fmt(node)
@@ -2202,7 +2228,11 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
     // UB (SIGFPE) -- guard only those two like the sized ints. I64 is an
     // alias for CT_INT, so this covers both; the message reads "Int" for both.
     if left_type == CT_INT && (op == "/" || op == "%") {
-        let lc = c_type_str(left_type)
+        let iov_tid = cg_expr_node_mono_tid(node_left(node))
+        let iov_flat = c_type_str(left_type)
+        ctype_probe_at(iov_tid, "expr_int_divmod", "iov", iov_flat, node_left(node))
+        let iov_spelled = c_type_from_tid(iov_tid)
+        let lc = if iov_spelled != "" && iov_spelled != "void" { iov_spelled } else { iov_flat }
         let tname = type_name_from_ct(left_type)
         let loc_line = panic_line_str(node)
         let file = panic_file_for_fmt(node)
@@ -2384,7 +2414,11 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
     let op = node_op(node)
     if op == "-" {
         if is_sized_int_ct(operand_type) {
-            let lc = c_type_str(operand_type)
+            let sneg_tid = cg_expr_node_mono_tid(node_left(node))
+            let sneg_flat = c_type_str(operand_type)
+            ctype_probe_at(sneg_tid, "expr_unary_neg", "sneg", sneg_flat, node_left(node))
+            let sneg_spelled = c_type_from_tid(sneg_tid)
+            let lc = if sneg_spelled != "" && sneg_spelled != "void" { sneg_spelled } else { sneg_flat }
             let tname = type_name_from_ct(operand_type)
             let loc_line = panic_line_str(node)
             let file = panic_file_for_fmt(node)
@@ -4105,6 +4139,13 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     if renderable != 0 || logical != 0 {
                         let lhs_tmp = fresh_temp("_pa_l")
                         let rhs_tmp = fresh_temp("_pa_r")
+                        // The assert-operand decomposition stores the ALREADY-elaborated
+                        // value (e.g. `_ounw_N.value`, an unwrapped Option inner), whose C
+                        // type is the flat operand type — not the operand NODE's tid, which
+                        // can describe the pre-elaboration expression (Option-outer / stale)
+                        // and diverge. So this keeps the flat spelling.
+                        ctype_probe_at(cg_expr_node_mono_tid(lhs), "expr_pa_lhs", "pa_l", c_type_str(lhs_ct), lhs)
+                        ctype_probe_at(cg_expr_node_mono_tid(rhs), "expr_pa_rhs", "pa_r", c_type_str(rhs_ct), rhs)
                         emit_line("{c_type_str(lhs_ct)} {lhs_tmp} = ({lhs_c});")
                         emit_line("{c_type_str(rhs_ct)} {rhs_tmp} = ({rhs_c});")
 

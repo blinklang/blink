@@ -1,0 +1,71 @@
+// br nmzvy9 — the sized-int overflow / shift / unary-neg / Int-div-mod guard temps that emit_binop
+// and emit_unaryop synthesize (__sov / __sh_val / __iov / __sneg) now spell their C type from the
+// left-operand node's tid, not the flat expr_result_type. Each site gates on the operand's own
+// emitted scalar type (is_sized_int_ct / CT_INT), so the operand is physically a concrete scalar
+// whose tid matches — the census showed byte-identical agreement even for Option-unwrap operands.
+//
+// Each site is a STORAGE position (a temp declaration), so it keeps the flat spelling only where
+// the tid declines ("") or erases to "void"; otherwise the tid leads. (The assert-operand temps
+// _pa_l / _pa_r are NOT flipped: their stored value can be an erased generic slot — physically
+// int64_t while the tid spells the logical Str — so they stay on the flat spelling.)
+
+import compile_test_helpers
+import std.io
+
+fn ops_src() -> Str {
+    #"import std.io
+
+fn main() {
+    let a: I32 = 100
+    let b: I32 = 7
+    io.println("{a + b} {a - b} {a * b} {a / b} {a % b}")
+    io.println("{a << 2} {a >> 1}")
+    let c: I32 = 5
+    io.println("{-c}")
+    let u: U8 = 3
+    io.println("{u + u}")
+
+    let x = 40
+    let y = 2
+    assert(x > y)
+    assert(x / y == 20)
+    let s = "hi"
+    let t = "hi"
+    assert(s == t)
+    io.println("ok")
+}
+"#
+}
+
+test "sized-int arith overflow temps spell from the tid (I32 -> int32_t, U8 -> uint8_t)" {
+    let c = compile_test_helpers.compile_and_emit_c(ops_src(), "nmzvy9_sov")
+    if !c.contains("int32_t __sov") {
+        io.println("FAIL: I32 arith temp not spelled int32_t")
+    }
+    assert(c.contains("int32_t __sov"))
+    assert(c.contains("uint8_t __sov"))
+}
+
+test "shift and unary-neg operand temps spell from the tid" {
+    let c = compile_test_helpers.compile_and_emit_c(ops_src(), "nmzvy9_shneg")
+    assert(c.contains("(int32_t)(a) << (uint32_t)"))
+    assert(c.contains("int32_t __sneg"))
+}
+
+test "Int div/mod guard temp spells int64_t from the tid" {
+    let c = compile_test_helpers.compile_and_emit_c(ops_src(), "nmzvy9_iov")
+    assert(c.contains("int64_t __iov"))
+}
+
+test "operand-temp fn compiles and runs with every guard active" {
+    let r = compile_test_helpers.compile_and_run(ops_src(), "nmzvy9_run")
+    if r.exit_code != 0 {
+        io.println("FAIL: did not run cleanly (exit {r.exit_code})")
+        io.println(r.err_out)
+    }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("107 93 700 14 2"))
+    assert(r.out.contains("400 50"))
+    assert(r.out.contains("-5"))
+    assert(r.out.contains("ok"))
+}
