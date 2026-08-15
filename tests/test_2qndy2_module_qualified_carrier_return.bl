@@ -1,0 +1,121 @@
+// br 2qndy2 — after 5edyqa (01cec48) the free-fn resolved/scalar signature-return
+// positions spell their C type from the return-annotation node's tid
+// (tc_tid_inner_tag) instead of the flat resolve_ret_type_from_ann's
+// canonical_struct_tag. c_type_from_tid documents (typecheck.bl:~14577) that the
+// flat canonical_struct_tag DOUBLES the module prefix of a module-qualified carrier
+// inner into a never-typedef'd name — so for a return like
+// `Result[time.Instant, Str]` the flat speller would emit
+// `blink_Result_std_time_std_time_Instant_str` in the signature while the carrier
+// typedef the rest of the program emits is `blink_Result_std_time_Instant_str`,
+// and the two disagree.
+//
+// The tid path is the correct one, and 5edyqa moved the signature onto it. Nothing
+// pinned that for a CROSS-MODULE (module-qualified) carrier inner, so this fixture
+// locks it in two ways:
+//
+//   1. The emitted signature return type is byte-identical to the carrier typedef
+//      name (single `std_time_` prefix), and the doubled `std_time_std_time_`
+//      spelling appears NOWHERE — a regression to canonical_struct_tag would
+//      reintroduce it.
+//   2. The program actually links and runs. A doubled carrier name is undeclared C,
+//      so a doubling regression fails to compile rather than merely misspelling a
+//      string the emit-only rows could still pass on.
+//
+// The emit-pin rows compile monolithically (compile_and_emit_c), where the carrier
+// typedef is inline, so the signature==typedef equality is proven there; the run
+// rows link against the archive, where a doubling regression surfaces as an
+// undeclared-C link failure instead. Both slots of the carrier are covered — the OK
+// member (Result / Option) and the ERR member (Result[Str, time.Instant]) — since a
+// re-canonicalization regression could hit either union half independently.
+//
+// `time.Instant` is a module-qualified return annotation (the type carries the
+// `std_time_` physical prefix); the value is constructed through the prelude-bare
+// `Instant` static method, which is the only spelling the parser accepts for a type
+// member.
+
+import compile_test_helpers
+import std.io
+
+fn result_carrier_src() -> Str {
+    #"import std.io
+import std.time
+
+fn mk_inst() -> Result[time.Instant, Str] {
+    Ok(Instant.from_epoch_secs(100))
+}
+
+fn main() {
+    io.println("s={mk_inst().unwrap().to_unix_secs()}")
+}
+"#
+}
+
+fn option_carrier_src() -> Str {
+    #"import std.io
+import std.time
+
+fn mk_opt() -> Option[time.Instant] {
+    Some(Instant.from_epoch_secs(200))
+}
+
+fn main() {
+    io.println("o={mk_opt().unwrap().to_unix_secs()}")
+}
+"#
+}
+
+fn err_carrier_src() -> Str {
+    #"import std.io
+import std.time
+
+fn mk_err() -> Result[Str, time.Instant] {
+    Err(Instant.from_epoch_secs(300))
+}
+
+fn main() {
+    io.println("e={mk_err().unwrap_err().to_unix_secs()}")
+}
+"#
+}
+
+test "Result[time.Instant, Str] return spells the single-prefix carrier in its signature" {
+    let c = compile_test_helpers.compile_and_emit_c(result_carrier_src(), "2qndy2_result")
+    compile_test_helpers.expect_contains(c, "blink_Result_std_time_Instant_str blink_u_mk_inst(", "tid-led signature return")
+    compile_test_helpers.expect_contains(c, "} blink_Result_std_time_Instant_str;", "carrier typedef name")
+    if c.contains("std_time_std_time") { io.println("FAIL: doubled module prefix in carrier name") }
+    assert(!c.contains("std_time_std_time"))
+}
+
+test "Option[time.Instant] return spells the single-prefix carrier in its signature" {
+    let c = compile_test_helpers.compile_and_emit_c(option_carrier_src(), "2qndy2_option")
+    compile_test_helpers.expect_contains(c, "blink_Option_std_time_Instant blink_u_mk_opt(", "tid-led signature return")
+    compile_test_helpers.expect_contains(c, "} blink_Option_std_time_Instant;", "carrier typedef name")
+    if c.contains("std_time_std_time") { io.println("FAIL: doubled module prefix in carrier name") }
+    assert(!c.contains("std_time_std_time"))
+}
+
+test "Result[Str, time.Instant] err-slot carrier spells the single-prefix carrier" {
+    let c = compile_test_helpers.compile_and_emit_c(err_carrier_src(), "2qndy2_err")
+    compile_test_helpers.expect_contains(c, "blink_Result_str_std_time_Instant blink_u_mk_err(", "tid-led signature return")
+    compile_test_helpers.expect_contains(c, "} blink_Result_str_std_time_Instant;", "carrier typedef name")
+    if c.contains("std_time_std_time") { io.println("FAIL: doubled module prefix in carrier name") }
+    assert(!c.contains("std_time_std_time"))
+}
+
+test "a module-qualified Result carrier return links and runs" {
+    let r = compile_test_helpers.compile_and_run(result_carrier_src(), "2qndy2_result_run")
+    if !r.out.contains("s=100") { io.println("FAIL: Result carrier — got '{r.out}' / '{r.err_out}'") }
+    assert(r.out.contains("s=100"))
+}
+
+test "a module-qualified Option carrier return links and runs" {
+    let r = compile_test_helpers.compile_and_run(option_carrier_src(), "2qndy2_option_run")
+    if !r.out.contains("o=200") { io.println("FAIL: Option carrier — got '{r.out}' / '{r.err_out}'") }
+    assert(r.out.contains("o=200"))
+}
+
+test "a module-qualified err-slot carrier return links and runs" {
+    let r = compile_test_helpers.compile_and_run(err_carrier_src(), "2qndy2_err_run")
+    if !r.out.contains("e=300") { io.println("FAIL: err-slot carrier — got '{r.out}' / '{r.err_out}'") }
+    assert(r.out.contains("e=300"))
+}
