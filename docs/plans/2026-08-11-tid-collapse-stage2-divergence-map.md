@@ -11587,3 +11587,70 @@ F |      1 | V | Float
 F |      1 | (Z9Model, Option[Z9Cmd]) | Tuple2_Z9Model_Option_Z9Cmd
 M |     39 | - | -
 ```
+
+## Attributing the whole decline floor — a full-corpus sweep, per cell
+
+The instrumented cells above each argue their own diverge population. This section closes the other
+half: the **declines**. A single mono sweep over the whole corpus (899 `.bl` files, monolithic
+`build/blinkc` so stdlib nodes are in scope, `BLINK_TRACE_CHANNELS=ctypediv`) collected **837
+decline rows**, and every one is now attributed to a rule, an existing ticket, or a filed gap —
+none is left as "the tid is just untyped here."
+
+### The one discriminator that split it: source module
+
+The single most useful cut is the `at=<module>:<line>` field. A decline with a **blank** module is
+a node with no `node_source_module` — a temp synthesised after typecheck, past the end of the
+`tc_node_tid` memo, so `tc_lookup_node_tid` returns -1 and the tid is `-`. A decline stamped
+`__main__` (or any real module) is a genuine source node the typechecker did visit. The split is
+near-total and it is what separates "enumerated residual of a future flip" from "a real position":
+
+| ty class | blank module | `__main__` |
+| --- | --- | --- |
+| `ty=-` (no tid) | 690 | 32 |
+| `ty=?` (unsolved metavar) | 11 | 60 |
+| typevar (`T`/`L`/`R`/`Self`) | 1 | 41 |
+
+### The 704 blank-module declines are the carrier-flip residual, not gaps
+
+690 `ty=-` + 11 `?`-holed + 3 typevar/concrete stragglers, and they land almost entirely in
+`if.result_carrier` (444),
+`match.result_carrier` (111), and `if.result_flat` (143). These are the same synthesised if/match
+**result temps** the two "if-expression result temp" and "match result temp" sections above already
+named: the doc's own verdict was *"which positions has not been established … the enumerated
+residual for whoever flips this path,"* and this sweep is that enumeration. The diverge cousins of
+these cells are held flat by the **handler-vtable ABI position rule** (rule #3); the declines are
+the no-tid tail of the same seam and fold into the same future unit. **Not filed** — they are owned
+by the carrier-path flip, not by an independent gap.
+
+### The 133 real-`__main__` declines, each to a home
+
+- **60 `ty=?`** (`ctype.flat` 36, `ctype.struct` 18, and a few carrier siblings) — unsolved
+  metavars from iterator-adapter / effect / ffi / ptr code (`test_44xww4`, `test_combining_iterators`,
+  …). These are the **under-determined family (A)** the E0301 program already owns
+  (spec `8vcj2c` closed, impl `gqg3rk` done). They emit correct C via the flat fallback and are
+  **flat-safe under djhp9m's flip guard** (`spelled != "" && != "void"` keeps flat), so they block
+  only the Stage-4 *field deletion* (`jctkac`), not the authority flip. No new ticket — attributed
+  to the E0301 residual; `ft4fnp` (Stage 5 reconcile) is where the floor must read zero before
+  `jctkac` removes the fallback.
+- **41 typevar** at `match_binder.variant_field` (40) + one stray — a bare enum-def typevar tid on a
+  generic-enum-instance match binder, spelled `T`/`L`/`R`. Distinct mechanism from "publish a tid":
+  the tid **is** published, it just isn't mono-substituted. **Filed `p59f0h`** (blocks `djhp9m`),
+  root at `codegen_stmt.bl:2394` reading `pat_binder_tid` without `tc_tid_subst_mono`.
+- **12 `variant_field_struct_style`** `ty=-` — already tracked by **`gh3kjc`** (and recorded at the
+  "428 shape cells" appendix as 100%-decline, blocked-not-flippable).
+- **12 `match_binder.carrier_payload` + 4 `match_binder.variant_field`** `ty=-` — the publish-a-tid
+  tail the match-binder section already measured (`diverge=0`, flippable once typecheck stamps the
+  binder node); folds into that unit, no separate ticket.
+- **3 `top_level_let`** `ty=-` (`ch`, `TIMEOUT_MS`, `ymw81c_top_alias`) — already tracked by
+  **`n90j7j`** (unannotated top-level let with a non-literal initializer registers no tid).
+- **1 `ctype.flat`** `ty=-` (`doubled`, a closure-param local in `test_pgc3d9`) — the no-tid tail of
+  the same closure-body walk; folds into the E0301/publish residual, below the threshold of its own
+  ticket.
+
+### Net
+
+One new ticket (`p59f0h`). Everything else is a named rule (handler-ABI carrier residual), an open
+ticket (`gh3kjc`, `n90j7j`), or the E0301 under-determined family (`8vcj2c`/`gqg3rk`). The claim the
+`arqpgq` ticket warned against — "the carrier declines *may* be legitimate rather than gaps, and
+that has to be established, not assumed" — is now established by the blank-module discriminator, not
+assumed: the carrier floor is synthesised no-tid temps, the same seam the carrier flip owns.
