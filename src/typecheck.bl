@@ -12498,14 +12498,63 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         return
     }
     if kind == NodeKind.StructPattern {
+        // Resolve the carrier so each field binder is typed from its declared field type,
+        // the same treatment every sibling arm gives its binders. Two carriers reach here:
+        // a struct-style enum variant (resolved to a variant index, fields via evfield_pool)
+        // and a plain struct (resolved to a struct tid, fields via sfield_pool). Without this
+        // the binder is untyped by omission and a mistyped use escapes to the C compiler.
+        let tname = node_type_name(node)
+        let saved_binding = tc_pattern_binding_type
+        let mut var_idx = -1
+        let mut struct_tid = -1
+        // The scrutinee hint is authoritative: a struct hint types fields from the struct, an
+        // enum hint from the named variant. Only with no usable hint do we resolve the name
+        // globally, and there a top-level struct still wins over a same-named enum variant --
+        // otherwise a bare variant lookup would hijack an unrelated struct destructure.
+        if saved_binding >= 0 && type_kind(saved_binding) == TyKind.Struct {
+            struct_tid = saved_binding
+        } else if saved_binding >= 0 && type_kind(saved_binding) == TyKind.Enum {
+            var_idx = get_variant_by_name(saved_binding, tname)
+        }
+        if var_idx == -1 && struct_tid == -1 {
+            let rt = resolve_type_name(tname)
+            if rt != -1 && type_kind(rt) == TyKind.Struct {
+                struct_tid = rt
+            } else {
+                let fallback_tid = get_variant_enum_tid(tname)
+                if fallback_tid != TYPE_UNKNOWN {
+                    var_idx = get_variant_by_name(fallback_tid, tname)
+                }
+            }
+        }
         let flds_sl = node_fields(node)
         if flds_sl != -1 {
             let mut i = 0
             while i < sublist_length(flds_sl) {
-                nr_define(node_name(sublist_get(flds_sl, i)))
+                let f = sublist_get(flds_sl, i)
+                let fname = node_name(f)
+                let fpat = node_pattern(f)
+                let mut sub_t = -1
+                if var_idx >= 0 {
+                    sub_t = lookup_evfield_type_by_name(var_idx, fname)
+                } else if struct_tid >= 0 {
+                    sub_t = get_struct_field_tid(struct_tid, fname)
+                }
+                if fpat != -1 {
+                    tc_pattern_binding_type = sub_t
+                    tc_check_pattern_types(fpat)
+                } else {
+                    if sub_t >= 0 {
+                        nr_define_typed(fname, 0, sub_t)
+                        tc_publish_node_tid(f, sub_t)
+                    } else {
+                        nr_define(fname)
+                    }
+                }
                 i = i + 1
             }
         }
+        tc_pattern_binding_type = saved_binding
         return
     }
     if kind == NodeKind.TuplePattern {
