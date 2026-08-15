@@ -5423,7 +5423,7 @@ pub fn emit_block(block: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
 
 // __ With-block codegen __
 
-fn emit_bh_setup(struct_name: Str, handler_str: Str, binding: Str, bh_state_vars: List[Str]) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn emit_bh_setup(struct_name: Str, handler_str: Str, binding: Str, ctx_tid: Int, ctx_node: Int, bh_state_vars: List[Str]) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     emit_bh_cleanup_for_type(struct_name)
     let c_type = c_type_c_name(struct_name)
     let enter_fn = c_fn_name(mangle_impl_method_q(struct_name, "BlockHandler", "enter"))
@@ -5434,7 +5434,21 @@ fn emit_bh_setup(struct_name: Str, handler_str: Str, binding: Str, bh_state_vars
     if binding != "" {
         let ctx_type_name = lookup_assoc_type(struct_name, "Context")
         if ctx_type_name != "" {
-            let ctx_c_type = if is_struct_type(ctx_type_name) != 0 { c_type_c_name(ctx_type_name) } else { c_type_str(type_from_name(ctx_type_name)) }
+            let ctx_c_type = if is_struct_type(ctx_type_name) != 0 {
+                // A struct Context keeps its physical spelling — the tid's logical answer
+                // cannot be substituted where the storage type is a struct.
+                c_type_c_name(ctx_type_name)
+            } else {
+                let flat = c_type_str(type_from_name(ctx_type_name))
+                ctype_probe_at(ctx_tid, "bh_context_flat", binding, flat, ctx_node)
+                let spelled = c_type_from_tid(ctx_tid)
+                // The binder is a STORAGE position, so a genuine Void keeps the flat placeholder.
+                // The binder tid also FALLS BACK to the resource tid whenever the Context is Void
+                // or a carrier the name channel cannot reconstruct (Option/Result/Tuple) — see
+                // tc_with_binder_tid — so a tid that spells the resource's own type is that
+                // fallback, not a Context answer, and must keep the flat spelling.
+                if spelled != "" && spelled != "void" && spelled != c_type { spelled } else { flat }
+            }
             emitted_let_names.push(binding)
             emitted_let_set.insert(binding, 1)
             emit_line("{ctx_c_type} {binding} = {enter_fn}({bh_tmp});")
@@ -5545,7 +5559,7 @@ fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Code
                 if wr_spelled != "" && wr_spelled != "void" { c_decl = wr_spelled }
             }
             if res_struct != "" && lookup_impl_type_for_trait("BlockHandler", res_struct) == 1 {
-                emit_bh_setup(res_struct, res_str, binding, bh_state_vars)
+                emit_bh_setup(res_struct, res_str, binding, tc_lookup_node_tid(item), item, bh_state_vars)
             } else if res_struct != "" && lookup_impl_type_for_trait("Closeable", res_struct) == 1 {
                 emit_cl_cleanup_for_type(res_struct)
                 let cl_c_type = c_type_c_name(res_struct)
@@ -5683,7 +5697,7 @@ fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Code
             } else {
                 let h_struct = get_var_struct(handler_str)
                 if h_struct != "" && lookup_impl_type_for_trait("BlockHandler", h_struct) == 1 {
-                    emit_bh_setup(h_struct, handler_str, "", bh_state_vars)
+                    emit_bh_setup(h_struct, handler_str, "", -1, -1, bh_state_vars)
                 } else if handler_str != "" {
                     emit_line("{handler_str};")
                 }

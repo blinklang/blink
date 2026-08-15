@@ -1,0 +1,118 @@
+// br 6q3q7e — the `with <resource> as name` binder for a BlockHandler spells its C type from the
+// Context tid, not the flat CT. `emit_bh_setup` threads the binder tid published on the
+// WithResource node and lets `c_type_from_tid` lead, keeping the flat spelling where the tid
+// declines, is void, or falls back to the resource's own type (the Void/Option/Result/Tuple
+// Contexts, where tc_with_binder_tid cannot reconstruct a Context tid from the bare name).
+//
+// For a scalar Context the tid AGREES with the flat spelling, so the flip is byte-identical
+// there. For a plain-enum Context it CORRECTS a latent bug: the flat pool cannot spell an enum
+// tid and erases it to `void`, so the binder used to be declared `void m = enter(...)` — invalid
+// C that never reached a user because no Context in the tree was an enum. The tid spells the
+// enum's real C name, which matches the enter() return type.
+
+import compile_test_helpers
+import std.io
+
+// ── scalar + struct Contexts: byte-identical (tid agrees / struct arm kept flat) ──
+
+fn scalar_struct_src() -> Str {
+    #"import std.io
+
+type Timer { name: Str, id: Int }
+fn make_timer(name: Str, id: Int) -> Timer { Timer { name: name, id: id } }
+
+type Transaction { conn_id: Int }
+type Connection { id: Int }
+fn make_conn(id: Int) -> Connection { Connection { id: id } }
+
+impl BlockHandler for Timer {
+    type Context = Int
+    fn enter(self) -> Int { self.id }
+    fn exit(self, ok: Bool) { }
+}
+
+impl BlockHandler for Connection {
+    type Context = Transaction
+    fn enter(self) -> Transaction { Transaction { conn_id: self.id } }
+    fn exit(self, ok: Bool) { }
+}
+
+fn main() {
+    with make_timer("t", 7) as elapsed {
+        io.println("elapsed={elapsed}")
+    }
+    with make_conn(2) as tx {
+        io.println("tx={tx.conn_id}")
+    }
+}
+"#
+}
+
+test "a scalar-Context binder is declared int64_t and a struct-Context binder keeps its struct type" {
+    let c = compile_test_helpers.compile_and_emit_c(scalar_struct_src(), "6q3q7e_scalar")
+    if !c.contains("int64_t elapsed = blink_Timer_BlockHandler_enter") {
+        io.println("FAIL: scalar Context binder not spelled int64_t")
+    }
+    assert(c.contains("int64_t elapsed = blink_Timer_BlockHandler_enter"))
+    if !c.contains("blink_Transaction tx = blink_Connection_BlockHandler_enter") {
+        io.println("FAIL: struct Context binder lost its struct spelling")
+    }
+    assert(c.contains("blink_Transaction tx = blink_Connection_BlockHandler_enter"))
+}
+
+test "the scalar and struct BlockHandler contexts compile and run" {
+    let r = compile_test_helpers.compile_and_run(scalar_struct_src(), "6q3q7e_scalar_run")
+    if r.exit_code != 0 {
+        io.println("FAIL: did not run cleanly (exit {r.exit_code})")
+        io.println(r.err_out)
+    }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("elapsed=7"))
+    assert(r.out.contains("tx=2"))
+}
+
+// ── enum Context: the correction (flat erased to `void`; the tid spells the enum) ──
+
+fn enum_src() -> Str {
+    #"import std.io
+
+type Mode { Fast, Slow }
+type Runner { id: Int }
+fn make_runner(id: Int) -> Runner { Runner { id: id } }
+
+impl BlockHandler for Runner {
+    type Context = Mode
+    fn enter(self) -> Mode { Mode.Fast }
+    fn exit(self, ok: Bool) { }
+}
+
+fn main() {
+    with make_runner(1) as m {
+        let n = match m {
+            Mode.Fast => 1
+            Mode.Slow => 2
+        }
+        io.println("n={n}")
+    }
+}
+"#
+}
+
+test "an enum-Context binder is spelled from the tid, not erased to void" {
+    let c = compile_test_helpers.compile_and_emit_c(enum_src(), "6q3q7e_enum")
+    if c.contains("void m = blink_Runner_BlockHandler_enter") {
+        io.println("FAIL: enum Context binder erased to void (the pre-flip bug)")
+    }
+    assert(!c.contains("void m = blink_Runner_BlockHandler_enter"))
+    assert(c.contains("blink_Mode m = blink_Runner_BlockHandler_enter"))
+}
+
+test "the enum BlockHandler context compiles and runs" {
+    let r = compile_test_helpers.compile_and_run(enum_src(), "6q3q7e_enum_run")
+    if r.exit_code != 0 {
+        io.println("FAIL: enum Context did not run cleanly (exit {r.exit_code})")
+        io.println(r.err_out)
+    }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("n=1"))
+}
