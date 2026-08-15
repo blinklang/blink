@@ -2747,7 +2747,7 @@ fn emit_block_value(block: Int) -> Str ! Codegen.Emit, Codegen.Register, Codegen
     if last_kind == NodeKind.Return {
         if node_value(last) != -1 {
             emit_expr(node_value(last))
-            emit_return_with_trace(expr_result_str, cg_current_fn_ret)
+            emit_return_with_trace(expr_result_str, cg_current_fn_ret, node_value(last))
         } else {
             emit_trace_exit_void()
             emit_line("return;")
@@ -3190,7 +3190,7 @@ fn emit_stmt(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
     if kind == NodeKind.Return {
         if node_value(node) != -1 {
             emit_expr(node_value(node))
-            emit_return_with_trace(expr_result_str, cg_current_fn_ret)
+            emit_return_with_trace(expr_result_str, cg_current_fn_ret, node_value(node))
         } else {
             emit_trace_exit_void()
             emit_line("return;")
@@ -7289,7 +7289,7 @@ fn emit_trace_exit_with_val(val_expr: Str, ret_str: Str) ! Codegen.Emit {
 // check/build/LSP.
 
 @allow(UnrestoredMutation)
-pub fn emit_return_with_trace(val_str: Str, ret_type: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+pub fn emit_return_with_trace(val_str: Str, ret_type: Int, retval_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let mut actual_val = val_str
     if cg_in_handler_body != 0 && cg_handler_body_is_ue != 0 && ret_type == CT_RESULT && cg_current_fn_option_inner == CT_PTR {
         let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
@@ -7330,9 +7330,21 @@ pub fn emit_return_with_trace(val_str: Str, ret_type: Int) ! Codegen.Emit, Codeg
         if type_where_preds.contains_key(rname) { ret_alias = rname }
         has_ensures = fn_has_ensures(cg_current_fn_node)
     }
+    // The temp stores the return VALUE, so its type is the value expression's, read off the node
+    // the caller emitted — a resolved expression node, unlike the return annotation, which carries
+    // no published tid. A handler-body rewrite above reassigns actual_val to a different erased
+    // carrier type, so its tid no longer matches; that path only fires for CT_RESULT, which the
+    // flat arm spells "void" and the flip below leaves on the flat path anyway.
+    let rv_tid = if retval_node != -1 { cg_node_mono_tid(retval_node) } else { -1 }
     if cg_in_traced_fn != 0 && trace_ret_is_primitive(ret_name) != 0 {
         let ret_tmp = fresh_temp("__trace_rv_")
-        emit_line("{c_type_str(ret_type)} {ret_tmp} = {actual_val};")
+        let trv_flat_c = c_type_str(ret_type)
+        ctype_probe_at(rv_tid, "trace_rv_flat", ret_tmp, trv_flat_c, retval_node)
+        // Reached only for a primitive return type, so the flat arm is always a scalar and the tid
+        // agrees: the flip is byte-identical. A decline or void keeps the flat placeholder.
+        let trv_spelled = c_type_from_tid(rv_tid)
+        let trv_c = if trv_spelled != "" && trv_spelled != "void" { trv_spelled } else { trv_flat_c }
+        emit_line("{trv_c} {ret_tmp} = {actual_val};")
         if ret_alias != "" {
             emit_where_assert(ret_alias, ret_tmp)
         }
@@ -7345,7 +7357,16 @@ pub fn emit_return_with_trace(val_str: Str, ret_type: Int) ! Codegen.Emit, Codeg
         let mut rv_var = actual_val
         if has_ensures != 0 || ret_alias != "" {
             let ret_tmp2 = fresh_temp("__ens_rv_")
-            emit_line("{c_type_str(ret_type)} {ret_tmp2} = {actual_val};")
+            let ens_flat_c = c_type_str(ret_type)
+            ctype_probe_at(rv_tid, "ens_rv_flat", ret_tmp2, ens_flat_c, retval_node)
+            // Unlike __trace_rv_ this temp is reached for any return type, so a struct/enum/carrier
+            // arrives with a flat spelling of "void" (c_type_str has no name for it) and — inside a
+            // handler body — a physical type that is the effect slot's erased spelling the tid does
+            // not know. Per the flat-vs-carrier licence only a scalar/pointer flat arm flips; a
+            // "void" flat arm (every carrier kind) is left to the flat path.
+            let ens_spelled = c_type_from_tid(rv_tid)
+            let ens_c = if ens_spelled != "" && ens_spelled != "void" && ens_flat_c != "void" { ens_spelled } else { ens_flat_c }
+            emit_line("{ens_c} {ret_tmp2} = {actual_val};")
             if ret_alias != "" {
                 emit_where_assert(ret_alias, ret_tmp2)
             }
@@ -7883,16 +7904,16 @@ pub fn emit_fn_body(block: Int, ret_type: Int) ! Codegen.Emit, Codegen.Register,
     let last_kind = node_kind(last)
     if ret_type != CT_VOID && last_kind == NodeKind.ExprStmt {
         emit_expr(node_value(last))
-        emit_return_with_trace(expr_result_str, cg_current_fn_ret)
+        emit_return_with_trace(expr_result_str, cg_current_fn_ret, node_value(last))
     } else if ret_type != CT_VOID && last_kind == NodeKind.IfExpr {
         emit_if_expr(last)
-        emit_return_with_trace(expr_result_str, cg_current_fn_ret)
+        emit_return_with_trace(expr_result_str, cg_current_fn_ret, last)
     } else if ret_type != CT_VOID && last_kind == NodeKind.MatchExpr {
         emit_match_expr(last)
-        emit_return_with_trace(expr_result_str, cg_current_fn_ret)
+        emit_return_with_trace(expr_result_str, cg_current_fn_ret, last)
     } else if ret_type != CT_VOID && last_kind == NodeKind.WithBlock {
         emit_with_block_expr(last)
-        emit_return_with_trace(expr_result_str, cg_current_fn_ret)
+        emit_return_with_trace(expr_result_str, cg_current_fn_ret, last)
     } else {
         emit_stmt(last)
     }
