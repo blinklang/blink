@@ -64,7 +64,8 @@ import codegen_types.{
     tp_child1_kind, tp_child2_kind, tp_child1_sname, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname,
     type_from_name, type_from_name_tag, type_name_from_ct, is_compound_tag, is_intrinsic_method, ue_methods,
     compound_tag_ct, ensure_carrier_from_tag, split_result_compound, CompoundSplit, typedef_tag_or_empty,
-    var_enums, VarEnumEntry
+    var_enums, VarEnumEntry,
+    cg_mono_tparams_sl, cg_mono_arg_tids
 }
 import diagnostics.{
     diag_error_at,
@@ -74,7 +75,7 @@ import diagnostics.{
     ICE_SEG_ERASED_SLOT,
 }
 import ast.{NodeKind, is_block_bearing, dbg_trace, dbg_channel_on}
-import typecheck.{sv_ty_or_flat, tc_channel_elem_ct, tc_channel_elem_struct, tc_ptr_pointee_ct, tc_ptr_pointee_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_tuple_sname, tc_tid_list_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member, tc_list_rename_help}
+import typecheck.{sv_ty_or_flat, tc_channel_elem_ct, tc_channel_elem_struct, tc_ptr_pointee_ct, tc_ptr_pointee_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_tuple_sname, tc_tid_list_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member, tc_list_rename_help, ctype_probe_at, c_type_from_tid, tc_tid_resolved, tc_tid_subst_mono}
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
 let mut btc_arg_offset: Int = 0
@@ -1745,6 +1746,12 @@ fn is_map_builtin_intercept(ct: Int, method: Str) -> Bool {
 // impls. Single source of truth — both dispatch sites in emit_method_call use it.
 fn is_set_builtin_intercept(ct: Int, method: Str) -> Bool {
     ct == CT_SET && (method == "insert" || method == "contains" || method == "remove" || method == "len" || method == "is_empty" || method == "union")
+}
+
+// Mirrors codegen_expr.cg_expr_node_mono_tid; codegen_expr imports this module, so the
+// canonical reader cannot be imported back without a module cycle.
+fn cm_node_mono_tid(n: Int) -> Int {
+    tc_tid_subst_mono(tc_tid_resolved(tc_lookup_node_tid(n)), cg_mono_tparams_sl, cg_mono_arg_tids)
 }
 
 fn map_key_expr_inner(key_str: Str, key_ct: Int, key_sname: Str, for_insert: Bool) -> Str ! Codegen.Emit, Codegen.Register {
@@ -4097,13 +4104,16 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     // C's unsigned arithmetic already wraps; signed wrapping is achieved by
     // round-tripping through the unsigned type at the same bit width.
     if is_sized_type {
+        let sized_obj_tid = cm_node_mono_tid(obj_node)
+        let sized_tid_c = c_type_from_tid(sized_obj_tid)
         let args_sl = node_args(node)
         if method == "wrapping_add" || method == "wrapping_sub" || method == "wrapping_mul" {
             if args_sl != -1 && sublist_length(args_sl) > 0 {
                 emit_expr(sublist_get(args_sl, 0))
                 let rhs_str = expr_result_str
                 let c_op = if method == "wrapping_add" { "+" } else if method == "wrapping_sub" { "-" } else { "*" }
-                let target_c = c_type_str(obj_type)
+                ctype_probe_at(sized_obj_tid, "method_wrap_arith", "wrap", c_type_str(obj_type), obj_node)
+                let target_c = if sized_tid_c != "" && sized_tid_c != "void" { sized_tid_c } else { c_type_str(obj_type) }
                 let unsigned_c = wrapping_unsigned_c_type(obj_type)
                 expr_result_str = "({target_c})((({unsigned_c})({obj_str})) {c_op} (({unsigned_c})({rhs_str})))"
                 expr_result_type = obj_type
@@ -4115,7 +4125,8 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 emit_expr(sublist_get(args_sl, 0))
                 let rhs_str = expr_result_str
                 let c_op = if method == "wrapping_div" { "/" } else { "%" }
-                let target_c = c_type_str(obj_type)
+                ctype_probe_at(sized_obj_tid, "method_wrap_divrem", "wrap", c_type_str(obj_type), obj_node)
+                let target_c = if sized_tid_c != "" && sized_tid_c != "void" { sized_tid_c } else { c_type_str(obj_type) }
                 let tname = type_name_from_ct(obj_type)
                 let result_tmp = fresh_temp("__wdv")
                 let lhs_tmp = fresh_temp("__wdv_l")
@@ -4132,7 +4143,8 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             }
         }
         if method == "wrapping_neg" {
-            let target_c = c_type_str(obj_type)
+            ctype_probe_at(sized_obj_tid, "method_wrap_neg", "wrap", c_type_str(obj_type), obj_node)
+            let target_c = if sized_tid_c != "" && sized_tid_c != "void" { sized_tid_c } else { c_type_str(obj_type) }
             let unsigned_c = wrapping_unsigned_c_type(obj_type)
             expr_result_str = "({target_c})(-(({unsigned_c})({obj_str})))"
             expr_result_type = obj_type
@@ -4723,8 +4735,12 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                         expr_result_str = result_var
                         expr_result_type = CT_STRUCT
                     } else {
+                        let fold_res_tid = listop_slot_tid(init_tid)
+                        let fold_res_spelled = c_type_from_tid(fold_res_tid)
+                        let fold_res_c = if fold_res_spelled != "" && fold_res_spelled != "void" { fold_res_spelled } else { c_type_str(init_type) }
                         reg_fn(mangled, init_type)
-                        emit_line("{c_type_str(init_type)} {result_var} = {c_fn_name(mangled)}({obj_str}, {init_str}, {fn_str});")
+                        ctype_probe_at(fold_res_tid, "method_fold_result", result_var, c_type_str(init_type), sublist_get(args_sl, 0))
+                        emit_line("{fold_res_c} {result_var} = {c_fn_name(mangled)}({obj_str}, {init_str}, {fn_str});")
                         expr_result_str = result_var
                         expr_result_type = init_type
                     }
@@ -4903,7 +4919,23 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let opt_t = ifs_opt_type
             let acc_var = fresh_temp("__fold_acc_")
             let next_var = fresh_temp("__fold_next_")
-            emit_line("{c_type_str(init_type)} {acc_var} = {init_str};")
+            // The lazy fold has no struct-accumulator branch. c_type_str has no CT_STRUCT arm, so a
+            // by-value struct init spelled `void __fold_acc_` — a hard C error. Where the operand is
+            // physically a by-value struct the tid names it, so the declaration and the published
+            // slot both spell from that one name; every other operand keeps the flat spelling, so an
+            // erased slot (physically an int64_t) is never mis-declared as a struct.
+            let acc_tid = cm_node_mono_tid(sublist_get(args_sl, 0))
+            let acc_seg = tc_seg_from_tid(acc_tid)
+            let acc_sname = if acc_seg.is_some() { acc_seg.unwrap() } else { "" }
+            let acc_named = acc_sname != "" && (is_struct_type(acc_sname) != 0 || is_enum_type(acc_sname) != 0 || is_mono_struct_instance(acc_sname) != 0)
+            if init_type == CT_STRUCT && acc_named {
+                ctype_probe_at(acc_tid, "method_fold_acc", acc_var, c_type_str(init_type), sublist_get(args_sl, 0))
+                emit_line("{c_type_c_name(acc_sname)} {acc_var} = {init_str};")
+                set_var(acc_var, CT_STRUCT, 0)
+                set_var_struct(acc_var, acc_sname)
+            } else {
+                emit_line("{c_type_str(init_type)} {acc_var} = {init_str};")
+            }
             emit_line("while (1) \{")
             cg_indent = cg_indent + 1
             emit_line("{opt_t} {next_var} = (({opt_t} (*)(void*)){src_next})(&{src_var});")

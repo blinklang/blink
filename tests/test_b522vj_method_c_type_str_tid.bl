@@ -1,0 +1,96 @@
+// br b522vj — the c_type_str storage/cast positions in emit_method_call now spell their C type
+// from the receiver / accumulator node's tid, not the flat CT. Two families move:
+//
+//   * sized-int wrapping arithmetic (wrapping_add/sub/mul/div/rem/neg) casts and temp declarations
+//     — the census showed the receiver tid AGREES byte-identically with the flat sized-int CT for
+//     every width, so the flip is output-identical while making the tid authoritative.
+//
+//   * the fold result local (eager path) and accumulator (lazy path). The flat c_type_str has no
+//     CT_STRUCT arm, so a struct accumulator on the LAZY path spelled `void __fold_acc_` — a hard
+//     C error. The tid names it (`blink_Acc`), so the lazy struct fold now compiles; its result var
+//     also gets its struct name published so a downstream field access resolves.
+//
+// The map-key inline-scalar site (map_key_expr_inner) is NOT flipped: it is node-less (takes a raw
+// key CT, no AST node) and is reached only for concrete scalar keys where the flat spelling is exact.
+
+import compile_test_helpers
+import std.io
+
+fn wrap_src() -> Str {
+    #"import std.io
+
+fn main() {
+    let a: I8 = 100
+    let b: I8 = 50
+    io.println("{a.wrapping_add(b)} {a.wrapping_div(b)} {a.wrapping_neg()}")
+    let e: I32 = 2000000000
+    io.println("{e.wrapping_add(e)} {e.wrapping_mul(e)}")
+    let h: U8 = 200
+    io.println("{h.wrapping_add(h)} {h.wrapping_div(h)}")
+}
+"#
+}
+
+fn fold_src() -> Str {
+    #"import std.io
+
+type Acc { sum: Int count: Int }
+
+fn main() {
+    let nums = [1, 2, 3, 4, 5]
+    let s = nums.fold(0, fn(a: Int, x: Int) -> Int { a + x })
+    let fs = nums.fold(0.0, fn(a: Float, y: Int) -> Float { a + 1.0 })
+    io.println("{s} {fs}")
+    let lacc = nums.filter(fn(x: Int) -> Bool { x > 2 }).fold(Acc { sum: 0, count: 0 }, fn(a: Acc, x: Int) -> Acc { Acc { sum: a.sum + x, count: a.count + 1 } })
+    io.println("{lacc.sum} {lacc.count}")
+}
+"#
+}
+
+test "sized-int wrapping temps and casts spell from the tid" {
+    let c = compile_test_helpers.compile_and_emit_c(wrap_src(), "b522vj_wrap")
+    if !c.contains("int8_t __wdv") {
+        io.println("FAIL: I8 wrapping_div temp not spelled int8_t")
+    }
+    assert(c.contains("int8_t __wdv"))
+    assert(c.contains("(int32_t)(((uint32_t"))
+    assert(c.contains("(uint8_t)(((uint8_t"))
+}
+
+test "eager fold result local spells from the tid (int64_t / double)" {
+    let c = compile_test_helpers.compile_and_emit_c(fold_src(), "b522vj_foldres")
+    assert(c.contains("int64_t __fold"))
+    assert(c.contains("double __fold"))
+}
+
+test "lazy struct-accumulator fold spells its struct type, not void" {
+    let c = compile_test_helpers.compile_and_emit_c(fold_src(), "b522vj_lazyacc")
+    if c.contains("void __fold_acc_") {
+        io.println("FAIL: lazy fold struct accumulator still spelled void")
+    }
+    assert(!c.contains("void __fold_acc_"))
+    assert(c.contains("blink_Acc __fold_acc_"))
+}
+
+test "wrapping ops compile and run with the tid-spelled temps" {
+    let r = compile_test_helpers.compile_and_run(wrap_src(), "b522vj_wrap_run")
+    if r.exit_code != 0 {
+        io.println("FAIL: wrapping did not run cleanly (exit {r.exit_code})")
+        io.println(r.err_out)
+    }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("-106 2 -100"))
+    assert(r.out.contains("-294967296 -1651507200"))
+    assert(r.out.contains("144 1"))
+}
+
+test "lazy struct-accumulator fold compiles, runs, and its fields resolve" {
+    let r = compile_test_helpers.compile_and_run(fold_src(), "b522vj_fold_run")
+    if r.exit_code != 0 {
+        io.println("FAIL: fold did not run cleanly (exit {r.exit_code})")
+        io.println(r.err_out)
+    }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("15 5"))
+    assert(r.out.contains("12 3"))
+}
