@@ -1,0 +1,73 @@
+// A closure promoted out of `with arena` carries one DESCRIPTOR per capture, and
+// the arena runtime drives the deep copy from that string. For a container whose
+// value/element is a generic-struct INSTANCE, tid_to_descriptor's Struct arm must
+// spell the value's mono stem (S:Box_0Int) — the erased bare head (S:Box) mangles
+// to an undeclared blink_Box in the promoter body, so the whole TU fails to cc.
+//
+// Two things are pinned here. First the descriptor STRING, so a regression to the
+// bare head is caught at the spelling, not only at link time:
+//
+//     Map[Str, Box[Int]]   "M:P:Str|S:Box_0Int"   not  "M:P:Str|S:Box"
+//     List[Box[Int]]       "L:S:Box_0Int"         not  "L:S:Box"
+//
+// Then the promoted closure is RUN out of `with arena`, so the promoter is not
+// only declared but actually invoked — the deep copy executes and the boxed value
+// survives the inner arena's destruction. A descriptor naming a promoter that is
+// never emitted, or one the runtime cannot mangle, is a link/run failure rather
+// than a wrong string, which the emit-only rows cannot catch.
+
+import compile_test_helpers
+
+fn map_val_src() -> Str {
+    #"import std.io
+
+type Box[T] { value: T }
+
+fn main() {
+    let mut m: Map[Str, Box[Int]] = Map()
+    m.insert("k", Box { value: 55 })
+    let g = with arena {
+        fn(i: Int) -> Int { m.get("k").unwrap().value + i }
+    }
+    io.println("a={g(0)}")
+}
+"#
+}
+
+fn list_elem_src() -> Str {
+    #"import std.io
+
+type Box[T] { value: T }
+
+fn main() {
+    let mut xs: List[Box[Int]] = []
+    xs.push(Box { value: 7 })
+    let g = with arena {
+        fn(i: Int) -> Int { xs.get(0).unwrap().value + i }
+    }
+    io.println("a={g(0)}")
+}
+"#
+}
+
+test "a Map[K, Box[Int]] capture descriptor spells the value's mono stem" {
+    let c = compile_test_helpers.compile_and_emit_c(map_val_src(), "hs78tq_mapdesc")
+    compile_test_helpers.expect_contains(c, "\"M:P:Str|S:Box_0Int\"", "Map[Str, Box[Int]] capture descriptor")
+}
+
+test "a List[Box[Int]] capture descriptor spells the element's mono stem" {
+    let c = compile_test_helpers.compile_and_emit_c(list_elem_src(), "hs78tq_listdesc")
+    compile_test_helpers.expect_contains(c, "\"L:S:Box_0Int\"", "List[Box[Int]] capture descriptor")
+}
+
+test "the promoted closure over a map with a struct value still runs" {
+    let r = compile_test_helpers.compile_and_run(map_val_src(), "hs78tq_maprun")
+    if !r.out.contains("a=55") { compile_test_helpers.expect_contains(r.out, "a=55", "promoted map closure — got '{r.err_out}'") }
+    assert(r.out.contains("a=55"))
+}
+
+test "the promoted closure over a list with a struct value still runs" {
+    let r = compile_test_helpers.compile_and_run(list_elem_src(), "hs78tq_listrun")
+    if !r.out.contains("a=7") { compile_test_helpers.expect_contains(r.out, "a=7", "promoted list closure — got '{r.err_out}'") }
+    assert(r.out.contains("a=7"))
+}
