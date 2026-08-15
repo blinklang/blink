@@ -4298,6 +4298,19 @@ pub fn set_set_elem_type(name: Str, elem_type: Int) {
     push_scope_var(ScopeVar { name: name, ctype: CT_SET, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_SET, elem_type, -1, "") })
 }
 
+// A binding-site tid (ScopeVar.ty / CaptureEntry.tid) is the RAW declared tid: inside a
+// monomorphized generic-fn body its typevars are still bare, so a nested struct element/key
+// would read back as its bare base name (HBox, not HBox_0HBox_10Int) and miss the kops
+// struct-key registry. Substitute the active mono binders first so the tid spells its concrete
+// stem. Its free typevars are the ENCLOSING FN's tparams, so bind against cg_fn_mono_*, NOT
+// cg_mono_*: the latter is transiently swapped to the containing struct's tparams during a
+// struct-literal field loop, so a binding-site read reached there would bind against the wrong
+// (or empty) pair and silently drop back to the bare-name miss. A no-op outside a mono body or
+// on a typevar-free tid.
+fn cg_bind_mono_tid(ty: Int) -> Int {
+    tc_tid_subst_mono(ty, cg_fn_mono_tparams_sl, cg_fn_mono_arg_tids)
+}
+
 // -1 means "no element recorded" — callers must treat that as unknown (loud diagnostic
 // downstream), never assume CT_STRING. A struct/tuple element legitimately reads -1 here too, so
 // check get_set_elem_struct before concluding "truly unknown".
@@ -4307,7 +4320,7 @@ pub fn get_set_elem_type(name: Str) -> Int {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_SET {
             if sv.ty >= 0 {
-                let e = tc_tid_set_elem_ct_resolved(sv.ty)
+                let e = tc_tid_set_elem_ct_resolved(cg_bind_mono_tid(sv.ty))
                 // An enum element is name-carried: c_type_str spells CT_ENUM
                 // "void" and emit_set_method's CT guard omits CT_ENUM, so let it
                 // fall through to the flat CT (CT_VOID) and pick up the identity
@@ -4324,7 +4337,7 @@ pub fn get_set_elem_type(name: Str) -> Int {
             let cap = closure_captures.get(cg_closure_cap_start + ci).unwrap()
             if cap.name == name && tp_get_kind(cap.tp_id) == CT_SET {
                 if cap.tid >= 0 {
-                    let e = tc_tid_set_elem_ct_resolved(cap.tid)
+                    let e = tc_tid_set_elem_ct_resolved(cg_bind_mono_tid(cap.tid))
                     if e >= 0 && e != CT_ENUM { return e }
                 }
                 return tp_child1_kind(cap.tp_id)
@@ -4344,7 +4357,7 @@ pub fn get_set_elem_struct(name: Str) -> Str {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_SET {
             if sv.ty >= 0 {
-                let s = tc_tid_set_elem_struct_resolved(sv.ty)
+                let s = tc_tid_set_elem_struct_resolved(cg_bind_mono_tid(sv.ty))
                 if s != "" { return s }
             }
             return tp_child1_sname(sv.tp_id)
@@ -4357,7 +4370,7 @@ pub fn get_set_elem_struct(name: Str) -> Str {
             let cap = closure_captures.get(cg_closure_cap_start + ci).unwrap()
             if cap.name == name && tp_get_kind(cap.tp_id) == CT_SET {
                 if cap.tid >= 0 {
-                    let s = tc_tid_set_elem_struct_resolved(cap.tid)
+                    let s = tc_tid_set_elem_struct_resolved(cg_bind_mono_tid(cap.tid))
                     if s != "" { return s }
                 }
                 return tp_child1_sname(cap.tp_id)
@@ -4480,6 +4493,13 @@ pub fn get_map_key_type(name: Str) -> Int {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_MAP {
+            if sv.ty >= 0 {
+                let k = tc_tid_map_key_ct_resolved(cg_bind_mono_tid(sv.ty))
+                // An enum key is name-carried (see get_set_elem_type): map_key_expr_inner's
+                // CT branch spells CT_ENUM "void", so fall through to the flat CT and let
+                // the identity ride get_map_key_struct's tid-first sname instead.
+                if k >= 0 && k != CT_ENUM { return k }
+            }
             let c1k = tp_child1_kind(sv.tp_id)
             if c1k >= 0 { return c1k }
             return CT_STRING
@@ -4491,6 +4511,10 @@ pub fn get_map_key_type(name: Str) -> Int {
         while ci < cg_closure_cap_count {
             let cap = closure_captures.get(cg_closure_cap_start + ci).unwrap()
             if cap.name == name && tp_get_kind(cap.tp_id) == CT_MAP {
+                if cap.tid >= 0 {
+                    let k = tc_tid_map_key_ct_resolved(cg_bind_mono_tid(cap.tid))
+                    if k >= 0 && k != CT_ENUM { return k }
+                }
                 let c1k = tp_child1_kind(cap.tp_id)
                 if c1k >= 0 { return c1k }
                 return CT_STRING
@@ -4506,6 +4530,10 @@ pub fn get_map_key_struct(name: Str) -> Str {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_MAP {
+            if sv.ty >= 0 {
+                let s = tc_tid_map_key_struct_resolved(cg_bind_mono_tid(sv.ty))
+                if s != "" { return s }
+            }
             return tp_child1_sname(sv.tp_id)
         }
         i = i - 1
@@ -4515,6 +4543,10 @@ pub fn get_map_key_struct(name: Str) -> Str {
         while ci < cg_closure_cap_count {
             let cap = closure_captures.get(cg_closure_cap_start + ci).unwrap()
             if cap.name == name && tp_get_kind(cap.tp_id) == CT_MAP {
+                if cap.tid >= 0 {
+                    let s = tc_tid_map_key_struct_resolved(cg_bind_mono_tid(cap.tid))
+                    if s != "" { return s }
+                }
                 return tp_child1_sname(cap.tp_id)
             }
             ci = ci + 1
