@@ -1,0 +1,141 @@
+// A user-effect handler whose operation returns `Option[Struct]` has its C return type erased
+// to `blink_Option_ptr` — the handler-vtable ABI position rule, since every handler for one
+// effect must share a signature. The `Some(...)` emitter honors that: it heap-boxes the struct
+// and stamps the result CT_PTR.
+//
+// It stamped the result's inner STRUCT NAME unerased in the same breath, and the two cells are
+// read by different consumers. A `let` inside the handler body spells its declaration from the
+// struct-name cell and its initializer from the value:
+//
+//     const blink_Option_Item boxed = (blink_Option_ptr){.tag = 1, .value = (void*)__ue_heap_2};
+//
+// — invalid initializer, then "incompatible types when returning". Erasing a value and not its
+// declaration is the same pair-of-producers split every other cell in this family had.
+//
+// Tail position never showed it because the tail result flows straight into the handler's
+// `return`, where the erased spelling is the correct one; only an intermediate binding reads
+// the struct-name cell.
+
+import compile_test_helpers
+
+fn let_bound_src() -> Str {
+    #"import std.io
+
+type Item {
+    name: Str
+    count: Int
+}
+
+effect Store {
+    effect Lookup {
+        fn find(name: Str) -> Option[Item]
+    }
+}
+
+fn lookup(name: Str) -> Option[Item] ! Store.Lookup {
+    store.find(name)
+}
+
+fn main() {
+    with handler Store {
+        fn find(name: Str) -> Option[Item] {
+            let boxed = Some(Item { name: name, count: 5 })
+            boxed
+        }
+    } {
+        let r = lookup("apple")
+        io.println("n={r.unwrap().name} c={r.unwrap().count}")
+    }
+}
+"#
+}
+
+test "a let-bound Some(Struct) inside a user-effect handler body compiles and runs" {
+    let r = compile_test_helpers.compile_and_run(let_bound_src(), "m4vk9d_letbound")
+    if !r.out.contains("n=apple c=5") { compile_test_helpers.expect_contains(r.out, "n=apple c=5", "let-bound Some(Struct) in UE handler — got '{r.err_out}'") }
+    assert(r.out.contains("n=apple c=5"))
+}
+
+// The tail-position form, as the control: it is the shape that already worked, and it pins that
+// erasing the struct-name cell did not change the value the caller actually receives.
+fn tail_src() -> Str {
+    #"import std.io
+
+type Item {
+    name: Str
+    count: Int
+}
+
+effect Store {
+    effect Lookup {
+        fn find(name: Str) -> Option[Item]
+    }
+}
+
+fn lookup(name: Str) -> Option[Item] ! Store.Lookup {
+    store.find(name)
+}
+
+fn main() {
+    with handler Store {
+        fn find(name: Str) -> Option[Item] {
+            Some(Item { name: name, count: 9 })
+        }
+    } {
+        let r = lookup("pear")
+        io.println("n={r.unwrap().name} c={r.unwrap().count}")
+    }
+}
+"#
+}
+
+test "a tail-position Some(Struct) inside a user-effect handler body keeps working" {
+    let r = compile_test_helpers.compile_and_run(tail_src(), "m4vk9d_tail")
+    if !r.out.contains("n=pear c=9") { compile_test_helpers.expect_contains(r.out, "n=pear c=9", "tail Some(Struct) in UE handler — got '{r.err_out}'") }
+    assert(r.out.contains("n=pear c=9"))
+}
+
+// A `None` returned from the same handler, to prove the erasure did not break the empty case —
+// the None emitter reads the same fn-level option-inner channel the Some emitter erases against.
+fn none_src() -> Str {
+    #"import std.io
+
+type Item {
+    name: Str
+    count: Int
+}
+
+effect Store {
+    effect Lookup {
+        fn find(name: Str) -> Option[Item]
+    }
+}
+
+fn lookup(name: Str) -> Option[Item] ! Store.Lookup {
+    store.find(name)
+}
+
+fn main() {
+    with handler Store {
+        fn find(name: Str) -> Option[Item] {
+            if name == "hit" {
+                let boxed = Some(Item { name: name, count: 3 })
+                boxed
+            } else {
+                None
+            }
+        }
+    } {
+        let a = lookup("hit")
+        let b = lookup("miss")
+        io.println("a={a.is_some()} b={b.is_none()} c={a.unwrap().count}")
+    }
+}
+"#
+}
+
+test "None from the same handler still arrives empty" {
+    let r = compile_test_helpers.compile_and_run(none_src(), "m4vk9d_none")
+    if !r.out.contains("a=true b=true c=3") { compile_test_helpers.expect_contains(r.out, "a=true b=true c=3", "None alongside a let-bound Some — got '{r.err_out}'") }
+    assert(r.out.contains("a=true b=true c=3"))
+}

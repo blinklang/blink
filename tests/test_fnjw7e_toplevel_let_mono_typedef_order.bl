@@ -1,0 +1,76 @@
+// The global-let loop runs after the main typedef pass, so a module-level `let` whose C type
+// is a monomorphized instance declares a type that has not been emitted yet. The tuple arm of
+// emit_top_level_let already flushes eagerly for this reason; struct and enum instances need
+// the same flush.
+//
+// The name is right and only the position is wrong, so these rows assert ORDER — a `contains`
+// check would pass on the broken output.
+
+import compile_test_helpers
+import std.io
+
+fn assert_declared_after_typedef(c: Str, typedef_needle: Str, decl_needle: Str, label: Str) {
+    let td = c.index_of(typedef_needle)
+    let decl = c.index_of(decl_needle)
+    if td < 0 { io.println("FAIL: {label} — no typedef '{typedef_needle}'") }
+    assert(td >= 0)
+    if decl < 0 { io.println("FAIL: {label} — no declaration '{decl_needle}'") }
+    assert(decl >= 0)
+    if td > decl { io.println("FAIL: {label} — typedef at {td} follows the declaration at {decl}") }
+    assert(td < decl)
+}
+
+fn struct_global_src() -> Str {
+    #"import std.io
+
+type Box[T] {
+    v: T
+}
+
+let gbox: Box[Int] = Box { v: 7 }
+
+fn main() {
+    io.println("v={gbox.v}")
+}
+"#
+}
+
+test "a generic-struct global is declared after its mono typedef" {
+    let c = compile_test_helpers.compile_and_emit_c(struct_global_src(), "fnjw7e_struct")
+    assert_declared_after_typedef(c, "} blink_Box_0Int;", "blink_Box_0Int gbox;", "Box[Int] global")
+}
+
+test "a generic-struct global compiles and runs" {
+    let r = compile_test_helpers.compile_and_run(struct_global_src(), "fnjw7e_struct_run")
+    if !r.out.contains("v=7") { io.println("FAIL: Box[Int] global — got '{r.out}' / '{r.err_out}'") }
+    assert(r.out.contains("v=7"))
+}
+
+fn enum_global_src() -> Str {
+    #"import std.io
+
+type Holder[T] {
+    Empty
+    Full(v: T)
+}
+
+let ghold: Holder[Int] = Holder.Full(v: 9)
+
+fn main() {
+    let n = match ghold {
+        Holder.Empty => 0
+        Holder.Full(v) => v
+    }
+    io.println("n={n}")
+}
+"#
+}
+
+// The enum arm is asserted on the emitted C only. A generic enum bound to a `let` — local or
+// global — separately emits its constructor cast as the bare generic base and erases its
+// payload binder to `void`, so this program does not reach cc. The ordering this
+// file is about is still observable, and is what this row pins.
+test "a generic-enum global is declared after its mono typedef" {
+    let c = compile_test_helpers.compile_and_emit_c(enum_global_src(), "fnjw7e_enum")
+    assert_declared_after_typedef(c, "} blink_Holder_0Int;", "blink_Holder_0Int ghold", "Holder[Int] global")
+}

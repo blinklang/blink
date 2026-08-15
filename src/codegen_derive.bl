@@ -10,7 +10,7 @@ import codegen_types.{
     is_hash_scalar_ct,
     kops_table_name, kops_is_inline_enum_key, c_type_str,
     ensure_struct_result_type, ensure_struct_option_type, ensure_option_type, ensure_mixed_result_type,
-    is_struct_type, is_enum_type, is_data_enum,
+    is_struct_type, is_enum_type, is_data_enum, is_transparent_newtype,
     has_derive_method,
     get_struct_field_tp_id,
     tp_child1_kind, tp_child1_sname,
@@ -1858,8 +1858,22 @@ pub fn descriptor_typedef_tag(desc: Str) -> Str {
     // c_type_tag(CT_OPTION)="option" would name an undeclared type once a
     // nested Debug walker routes a nested Option/Result through
     // descriptor_c_type.
+    //
+    // tp_carrier_tag is the authority on which kinds recurse: Option, Result and Map do; List and
+    // Set stay flat, because their element travels via the variable's elem-metadata channel rather
+    // than the carrier tag. Diverge from it in either direction and descriptor_c_type names a type
+    // no typedef emitted.
     if desc.starts_with("O:") {
         return "Option_{descriptor_typedef_tag(inner_desc_of(desc))}"
+    }
+    if desc.starts_with("M:") {
+        let rest = desc.slice(2, desc.len())
+        let bar = rest.index_of("|")
+        if bar >= 0 {
+            let k = rest.slice(0, bar)
+            let v = rest.slice(bar + 1, rest.len())
+            return "Map_{descriptor_typedef_tag(k)}_{descriptor_typedef_tag(v)}"
+        }
     }
     if desc.starts_with("R:") {
         let rest = desc.slice(2, desc.len())
@@ -1996,6 +2010,19 @@ fn emit_promote_desc_copy(access: Str, desc: Str, dst: Str) ! Codegen.Emit {
     emit_line("{dst} = blink_promote_{mangle}(target, {access});")
 }
 
+// Whether the Option carrier for this payload stores it THROUGH a pointer. Mirrors the branch
+// emit_struct_option_typedef takes, and must keep mirroring it: a payload the typedef boxes but
+// the promoter copies by value passes a `T*` to a by-value `blink_promote_T`, which is a C type
+// error rather than a wrong answer. `P:` inners are spelled by emit_option_typedef instead and
+// are always inline.
+fn option_payload_is_boxed(inner: Str) -> Int {
+    if inner == "" { return 0 }
+    if inner.starts_with("P:") { return 0 }
+    if is_transparent_newtype(descriptor_typedef_tag(inner)) != 0 { return 0 }
+    if descriptor_c_type(inner).ends_with("*") { return 0 }
+    1
+}
+
 fn emit_promote_option(desc: Str) ! Codegen.Emit {
     let inner = inner_desc_of(desc)
     let mangle = descriptor_mangle(desc)
@@ -2005,7 +2032,15 @@ fn emit_promote_option(desc: Str) ! Codegen.Emit {
     emit_line("{cty} dst = src;")
     emit_line("if (src.tag == 1) \{")
     cg_indent = cg_indent + 1
-    emit_promote_desc_copy("src.value", inner, "dst.value")
+    if option_payload_is_boxed(inner) != 0 {
+        let inner_c = descriptor_c_type(inner)
+        let box = fresh_temp("_pobox_")
+        emit_line("{inner_c}* {box} = ({inner_c}*)blink_promote_alloc(target, sizeof({inner_c}));")
+        emit_line("*{box} = blink_promote_{descriptor_mangle(inner)}(target, *src.value);")
+        emit_line("dst.value = {box};")
+    } else {
+        emit_promote_desc_copy("src.value", inner, "dst.value")
+    }
     cg_indent = cg_indent - 1
     emit_line("}")
     emit_line("return dst;")

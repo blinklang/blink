@@ -1,0 +1,97 @@
+// A closure promoted out of `with arena` carries one DESCRIPTOR per capture, and the arena
+// runtime drives the deep copy from that string. `descriptor_from_capture` spelled it by hand
+// from the flat cells — `tp_child1_kind` / `tp_child1_sname` — which reach exactly one level, so
+// every capture at depth 2 lost its inner shape:
+//
+//     List[List[Int]]      "L:P:Int"        instead of  "L:L:P:Int"
+//     List[Option[Int]]    "L:P:Int"        instead of  "L:O:P:Int"
+//     Map[Str, List[Int]]  "M:P:Str|P:Int"  instead of  "M:P:Str|L:P:Int"
+//     List[CapPt]          "L:P:Int"        instead of  "L:S:CapPt"
+//
+// `tp_to_descriptor` already walks the same tp_id recursively and produces the identical leaves,
+// so this was a third hand-written speller beside one that was already correct — but routing
+// through it fixed only the first three rows. The struct element is depth ONE and still erased,
+// because a capture's flat cell carries no child struct name at all; only CaptureEntry.tid does,
+// which is why that field exists. So the descriptor is spelled from the tid, with the flat
+// speller kept as the fallback for a tid that declines.
+//
+// The wrong descriptor makes the promoter copy the element SLOT as an inline int64_t rather than
+// recursing. A list slot holds the inner container's pointer and a boxed Option's pointer, so the
+// bit-copy leaves the original pointee un-promoted. Nothing miscompiles today only because
+// E0700/ArenaValueEscapes fail-closed rejects nesting an arena-allocated value into a container
+// at all — every capture that reaches this path is GC-heap-backed, where an un-promoted pointee
+// stays alive. These rows pin the descriptor itself so the guard is not the only thing standing
+// between the flat speller and a dangling pointer.
+
+import compile_test_helpers
+
+fn capture_src(decl: Str, use_expr: Str) -> Str {
+    "import std.io\n\nfn main() \{\n{decl}\n    let g = with arena \{\n        fn(i: Int) -> Int \{ {use_expr} + i }\n    }\n    io.println(\"a=\{g(0)}\")\n}\n"
+}
+
+fn nested_list_decl() -> Str {
+    #"    let mut inner: List[Int] = []
+    inner.push(11)
+    let mut xs: List[List[Int]] = []
+    xs.push(inner)"#
+}
+
+test "a List[List[T]] capture descriptor keeps the inner list" {
+    let c = compile_test_helpers.compile_and_emit_c(capture_src(nested_list_decl(), "xs.len()"), "z6bhn4_nested")
+    compile_test_helpers.expect_contains(c, "\"L:L:P:Int\"", "List[List[Int]] capture descriptor")
+}
+
+fn option_elem_decl() -> Str {
+    #"    let mut xs: List[Option[Int]] = []
+    xs.push(Some(31))"#
+}
+
+test "a List[Option[T]] capture descriptor keeps the Option" {
+    let c = compile_test_helpers.compile_and_emit_c(capture_src(option_elem_decl(), "xs.len()"), "z6bhn4_option")
+    compile_test_helpers.expect_contains(c, "\"L:O:P:Int\"", "List[Option[Int]] capture descriptor")
+}
+
+fn map_val_decl() -> Str {
+    #"    let mut iv: List[Int] = []
+    iv.push(7)
+    let mut xs: Map[Str, List[Int]] = Map()
+    xs.insert("k", iv)"#
+}
+
+test "a Map[K, List[V]] capture descriptor keeps the value list" {
+    let c = compile_test_helpers.compile_and_emit_c(capture_src(map_val_decl(), "xs.len()"), "z6bhn4_mapval")
+    compile_test_helpers.expect_contains(c, "\"M:P:Str|L:P:Int\"", "Map[Str, List[Int]] capture descriptor")
+}
+
+// The one shape the flat speller already got right, as the control: it pins that the tid speller
+// did not change the leaf spellings, which is what the mangled promoter function names are keyed
+// on — the two spellers have to agree or one type gets two promoter functions.
+fn flat_list_decl() -> Str {
+    #"    let mut xs: List[Int] = []
+    xs.push(3)"#
+}
+
+test "a List[Int] capture descriptor is unchanged" {
+    let c = compile_test_helpers.compile_and_emit_c(capture_src(flat_list_decl(), "xs.len()"), "z6bhn4_flat")
+    compile_test_helpers.expect_contains(c, "\"L:P:Int\"", "List[Int] capture descriptor")
+}
+
+fn struct_elem_decl() -> Str {
+    #"    let mut xs: List[CapPt] = []
+    xs.push(CapPt { x: 4 })"#
+}
+
+test "a List[Struct] capture descriptor names the struct" {
+    let src = "import std.io\n\ntype CapPt \{ x: Int }\n\nfn main() \{\n{struct_elem_decl()}\n    let g = with arena \{\n        fn(i: Int) -> Int \{ xs.len() + i }\n    }\n    io.println(\"a=\{g(0)}\")\n}\n"
+    let c = compile_test_helpers.compile_and_emit_c(src, "z6bhn4_struct")
+    compile_test_helpers.expect_contains(c, "\"L:S:CapPt\"", "List[CapPt] capture descriptor")
+}
+
+// The promoted closure still has to RUN. A descriptor the runtime cannot mangle, or one naming a
+// promoter that is never emitted, is a link error rather than a wrong answer — this row is what
+// separates "the string changed" from "the string is usable".
+test "the promoted closure still runs with the deeper descriptors" {
+    let r = compile_test_helpers.compile_and_run(capture_src(nested_list_decl(), "xs.len()"), "z6bhn4_run")
+    if !r.out.contains("a=1") { compile_test_helpers.expect_contains(r.out, "a=1", "promoted closure over List[List[Int]] — got '{r.err_out}'") }
+    assert(r.out.contains("a=1"))
+}

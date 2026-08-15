@@ -857,15 +857,18 @@ pub fn c_fn_name(name: Str) -> Str {
     c_fn_name_in(name, cg_current_module)
 }
 
-fn c_fn_name_in(name: Str, caller_module: Str) -> Str {
+// Same definer-vs-caller contract as c_type_c_name_in, and the same limit: mod_fn_prefix's
+// composite entry is keyed by the DEFINER, so the sole caller — which passes cg_current_module —
+// can only hit it for a same-module function, where the bare key already agrees.
+fn c_fn_name_in(name: Str, definer_module: Str) -> Str {
     let resolved = resolve_import_alias(name)
     // FFI declarations bind directly to a runtime-provided C symbol; never
     // mangle them with a module prefix.
     if is_fn_ffi(resolved) != 0 {
         return "blink_{resolved}"
     }
-    if caller_module != "" {
-        let qualified = "{caller_module}:{resolved}"
+    if definer_module != "" {
+        let qualified = "{definer_module}:{resolved}"
         match mod_fn_prefix.get(qualified) {
             Some(prefix) => {
                 if prefix != "" {
@@ -898,20 +901,33 @@ pub fn c_type_c_name(name: Str) -> Str {
 // §03_types.md:1038 (the collision rule is struct-vs-variant only). Their C
 // symbols must stay DISTINCT (§07:1801-1816: `blink_<module_path>_<item>`).
 // mod_type_prefix keyed by bare name alone collapses them (last writer wins),
-// so consult the COMPOSITE key `"{caller_module}:{resolved}"` FIRST — populated
+// so consult the COMPOSITE key `"{definer_module}:{resolved}"` FIRST — populated
 // alongside the bare key at the type-registration sites — then fall back to the
 // bare key (same-module / single-definition callers unchanged).
-pub fn c_type_c_name_in(name: Str, caller_module: Str) -> Str {
+//
+// The parameter is the module that DEFINES the type, not the one asking: the registration sites
+// key the composite entry by the definer, so a caller passing its OWN module only ever hits for a
+// same-module type and every cross-module caller silently takes the ambiguous bare key. The two
+// callers that know the definer pass it (typedef_c_name via mangling_module, the module-qualified
+// call return via tc_qualifier_to_module_or_self); the bare c_type_c_name wrapper passes
+// cg_current_module and is therefore correct only for a type the current module defines.
+pub fn c_type_c_name_in(name: Str, definer_module: Str) -> Str {
     // A Map_K_V tag is an IDENTITY mangling only — every Map lowers to the single
     // runtime type blink_map* regardless of its key/value (no per-instantiation
     // carrier struct is emitted, unlike Option/Result). So a Map tag as a field type
     // must resolve to blink_map*, NOT blink_Map_K_V (which is never typedef'd).
-    if name.starts_with("Map_") {
+    //
+    // The three prefix tests below recognize a SYNTHESIZED carrier tag by its spelling, and a
+    // user type may legally be declared with the same leading text. A declared name is in the
+    // struct/enum registry and a synthesized tag never is, so registry membership — not the
+    // prefix — decides which of the two this is.
+    let user_declared = is_struct_type(name) != 0 || is_enum_type(name) != 0
+    if name.starts_with("Map_") && !user_declared {
         return "blink_map*"
     }
     // Compound carrier name (Option_X, Result_X_Y) — canonicalize the nested
     // struct/enum tags so the C type matches the actual emitted typedef.
-    if name.starts_with("Option_") || name.starts_with("Result_") {
+    if (name.starts_with("Option_") || name.starts_with("Result_")) && !user_declared {
         return "blink_{canonical_struct_tag(name)}"
     }
     let bare = strip_module_qualifier(name)
@@ -921,8 +937,8 @@ pub fn c_type_c_name_in(name: Str, caller_module: Str) -> Str {
     if builtin_type_set.contains_key(resolved) {
         return "blink_{resolved}"
     }
-    if caller_module != "" {
-        let qualified = "{caller_module}:{resolved}"
+    if definer_module != "" {
+        let qualified = "{definer_module}:{resolved}"
         match mod_type_prefix.get(qualified) {
             Some(prefix) => {
                 if prefix != "" {
@@ -4663,6 +4679,10 @@ pub fn closure_ret_tid(node: Int) -> Int {
 // and Struct must attach a NAME to a temp, so those three keep the existing string-driven reseat
 // paths. An exclusion rather than a whitelist because the string parse erased every kind it could
 // not spell alike — Char, I32, StringBuilder, Channel and the containers together.
+//
+// Takes a CALL node, whose tid IS the result. A closure LITERAL answers its own Closure tid
+// here, so every kind test below reads CT_CLOSURE and a genuine Void cannot report itself —
+// use closure_lit_ret_ct for that side.
 pub fn closure_ret_direct_ct(node: Int) -> Int {
     let tid = closure_ret_tid(node)
     if tid == -1 { return -1 }
@@ -4683,6 +4703,39 @@ pub fn closure_lit_ret_c(node: Int) -> Str {
     let t = tc_tid_resolved(tc_tid_subst_mono(raw, cg_mono_tparams_sl, cg_mono_arg_tids))
     if tc_tid_ct(t) != CT_CLOSURE { return "" }
     c_type_from_tid(tc_tid_child(t, 0))
+}
+
+// The C spelling of closure LITERAL parameter `i`, read off its Fn tid; "" when there is no
+// tid, it does not name a Fn, or the slot is out of range.
+//
+// The same pairing as the return above, for the other half of the signature: the definition's
+// parameter list and the call-site cast are one ABI. Declines on a `void` answer because that
+// is not a legal parameter — an unspellable slot has to leave both sides on the string chain
+// together rather than repair one of them.
+pub fn closure_lit_param_c(node: Int, i: Int) -> Str {
+    let raw = tc_lookup_node_tid(node)
+    if raw == -1 { return "" }
+    let t = tc_tid_resolved(tc_tid_subst_mono(raw, cg_mono_tparams_sl, cg_mono_arg_tids))
+    if tc_tid_ct(t) != CT_CLOSURE { return "" }
+    // Child 0 is the return and the params follow it (tc_tid_child's Fn arm).
+    if i + 1 >= tc_tid_child_count(t) { return "" }
+    let p_c = c_type_from_tid(tc_tid_child(t, i + 1))
+    if p_c == "void" { return "" }
+    p_c
+}
+
+// The head CT of that same return, for the body emitter that decides whether the tail is
+// returned or discarded. Paired with closure_lit_ret_c on purpose: the signature and the body
+// are two halves of one ABI, and a body repaired from a different producer can disagree with
+// the head it is emitted under. closure_ret_direct_ct is NOT that producer — it reads the tid
+// of the node it is given as the result, which is true of a CALL node but makes a closure
+// LITERAL answer CT_CLOSURE, so a genuine Void never reports itself.
+pub fn closure_lit_ret_ct(node: Int) -> Int {
+    let raw = tc_lookup_node_tid(node)
+    if raw == -1 { return -1 }
+    let t = tc_tid_resolved(tc_tid_subst_mono(raw, cg_mono_tparams_sl, cg_mono_arg_tids))
+    if tc_tid_ct(t) != CT_CLOSURE { return -1 }
+    tc_tid_ct(tc_tid_child(t, 0))
 }
 
 // The mono stem of the struct/enum INSTANCE a type annotation names; "" when it names none.

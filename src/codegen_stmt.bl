@@ -56,7 +56,7 @@ import codegen_types.{
     match_scruts, mono_fns, mono_instances, mono_name_from_ann, mono_phys_base, mut_captured_vars, nth_type_arg, option_c_type, register_mono_instance,
     arg_tids_differ, mono_fn_decl_tid_drift, mono_fn_decl_seg_drift,
     register_carrier_inner_mono_instance,
-    strip_generic_args, strip_module_qualifier,
+    strip_generic_args, strip_module_qualifier, CT_CHAR,
     poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
     compound_tag_ct, option_inner_ct_from_tag, option_inner_struct_from_tag,
     option_c_type_mixed, pop_scope, ptr_inner_c_type, push_scope,
@@ -105,7 +105,7 @@ import codegen_expr.{
     register_map_elem_struct_mono_from_tid
 }
 import codegen_methods.{resolve_tparam_via_tid, copy_list_compound_elem, emit_boxed_container_store, finish_enum_zip_result, mono_csv_from_arg_tids}
-import codegen_derive.{ct_to_descriptor, desc_primary_ct, descriptor_c_type, descriptor_mangle, emit_promote_elem_into, inner_desc_of, queue_promote_type, map_pair_key_read_expr}
+import codegen_derive.{ct_to_descriptor, desc_primary_ct, descriptor_c_type, descriptor_mangle, emit_promote_elem_into, inner_desc_of, queue_promote_type, map_pair_key_read_expr, tp_to_descriptor}
 import diagnostics.{
     Diag, diag_error_at, diag_ice_at, diag_warn_at, diag_file_for_node,
     ARENA_CLOSURE_TAIL_NONLITERAL, ARENA_CLOSURE_UNSUPPORTED_CAP,
@@ -115,7 +115,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{sv_ty_or_flat_at, tc_top_level_let_tid, ctype_probe_at, closure_sig_from_tid, enum_instance_c_from_tid, tc_tid_handler_effect, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
+import typecheck.{sv_ty_or_flat_at, tc_tid_child, tc_top_level_let_tid, ctype_probe_at, closure_sig_from_tid, enum_instance_c_from_tid, struct_instance_c_from_tid, tc_tid_handler_effect, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -1265,7 +1265,11 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
     let mut result_decl_c = ""
     let mut result_is_flat = 0
     if match_struct_name != "" {
-        result_decl_c = c_type_c_name(match_struct_name)
+        // c_type_c_name answers the bare generic base for an instance, and the base has no
+        // typedef. The if-expression sibling that builds the same temp already leads with the
+        // tid; without this the two result temps in one function spell one type two ways.
+        let m_struct_mono = struct_instance_c_from_tid(cg_node_mono_tid(node))
+        result_decl_c = if m_struct_mono != "" { m_struct_mono } else { c_type_c_name(match_struct_name) }
     } else if result_type == CT_RESULT {
         result_decl_c = result_c_type_mixed(mcarrier.ok_type, mcarrier.err_type, mcarrier.ok_struct, mcarrier.err_struct)
     } else if result_type == CT_OPTION {
@@ -1456,7 +1460,11 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
     cg_current_fn_option_inner_struct = saved_loop_option_inner_struct
     if match_struct_name != "" {
         set_var(result_var, CT_VOID, 1)
-        set_var_struct(result_var, match_struct_name)
+        // Registering the bare base leaves every field on this temp typed by a typevar, so a
+        // read of it interpolates as `<value>`. Read the stem from the tid the declaration
+        // above was spelled from, so the C type and the registered name cannot disagree.
+        let m_stem = tc_tid_struct_mono_name(cg_node_mono_tid(node))
+        set_var_struct(result_var, if m_stem != "" { m_stem } else { match_struct_name })
         expr_result_str = result_var
         expr_result_type = CT_VOID
     } else if result_type == CT_RESULT {
@@ -2038,6 +2046,42 @@ fn cg_node_mono_tid(n: Int) -> Int {
     tc_tid_subst_mono(tc_tid_resolved(tc_lookup_node_tid(n)), cg_mono_tparams_sl, cg_mono_arg_tids)
 }
 
+// Read element `i` out of a `blink_list*` as its declared C type.
+//
+// A list stores every element as `void*`, and how one is read back depends on the element's
+// PHYSICAL shape: a pointer type IS the slot, an int-like scalar is stuffed inline through
+// intptr_t, and everything else — a double, a struct, an Option/Result/Tuple carrier — is
+// boxed and read through a deref. That is the same rule emit_option_typedef applies to decide
+// `T value` vs `T* value`, so the two agree on what is boxed.
+//
+// A two-cell (elem_type, elem_struct) pair cannot express the distinction: it spelled every
+// non-scalar as `(T)(intptr_t)`, which is a cc error for an aggregate and a pointer-from-integer
+// warning for a pointer. Declines with "" on a tid c_type_from_tid cannot spell, so a caller
+// keeps whatever it does today rather than trading one wrong cast for another.
+//
+// codegen_methods' `.get` emitter answers the same question with a per-shape ladder of its own.
+fn list_elem_unbox_from_tid(elem_tid: Int, expr: Str) -> Str {
+    let c = c_type_from_tid(elem_tid)
+    if c == "" || c == "void" { return "" }
+    if c.ends_with("*") { return "({c}){expr}" }
+    match tc_tid_kind(tc_tid_resolved(elem_tid)) {
+        TyKind.Int => "(int64_t)(intptr_t){expr}"
+        TyKind.Bool => "(int64_t)(intptr_t){expr}"
+        TyKind.Char => "(int64_t)(intptr_t){expr}"
+        TyKind.I8 => "(int64_t)(intptr_t){expr}"
+        TyKind.I16 => "(int64_t)(intptr_t){expr}"
+        TyKind.I32 => "(int64_t)(intptr_t){expr}"
+        TyKind.U8 => "(int64_t)(intptr_t){expr}"
+        TyKind.U16 => "(int64_t)(intptr_t){expr}"
+        TyKind.U32 => "(int64_t)(intptr_t){expr}"
+        TyKind.U64 => "(int64_t)(intptr_t){expr}"
+        // A transparent newtype (`type Errno(Int)`) spells int64_t but reports TyKind.Enum, so
+        // the spelling — not the kind — has to decide it. Every other enum is either a plain
+        // int64_t or a boxed aggregate, and both are answered correctly by the same test.
+        _ => if c == "int64_t" { "(int64_t)(intptr_t){expr}" } else { "*({c}*){expr}" }
+    }
+}
+
 // Emit C variable bindings for ident sub-patterns within a pattern.
 // scrut_off/scrut_len index into match_scruts.
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -2578,7 +2622,22 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                 } else if elem_type >= 0 {
                     bind_ct = elem_type
                 }
-                match_scruts = [MatchScrutEntry { str_val: "{cast}blink_list_get({scrut}, {j})", scrut_type: bind_ct }]
+                // The IdentPattern arm below spells the binder's DECLARATION from this
+                // sub-pattern's own tid, so the initializer has to be read off the same tid or
+                // the two halves of one line disagree — `blink_list* b = (int64_t)(intptr_t)…`.
+                // The flat chain above stays as the fallback for a tid that cannot be spelled.
+                let sub_tid = pat_binder_tid(sub_pat)
+                let elem_read = list_elem_unbox_from_tid(sub_tid, "blink_list_get({scrut}, {j})")
+                let scrut_str = if elem_read != "" { elem_read } else { "{cast}blink_list_get({scrut}, {j})" }
+                // The sibling TuplePattern arm recurses on the ORIGINAL match_scruts, so its
+                // binders keep the scrutinee's struct name; this arm rebuilds the entry and
+                // dropped it, leaving a struct binder registered under no name at all — a field
+                // read on it rendered as the `<value>` placeholder. Struct/Enum only: the
+                // IdentPattern arm treats a non-empty sname as a compound TAG for every other
+                // kind, which is a different channel with a different grammar.
+                let sub_k = tc_tid_kind(tc_tid_resolved(sub_tid))
+                let sub_sname = if sub_k == TyKind.Struct || sub_k == TyKind.Enum { tc_tid_struct(sub_tid) } else { "" }
+                match_scruts = [MatchScrutEntry { str_val: scrut_str, scrut_type: bind_ct, scrut_sname: sub_sname }]
                 let saved_enum = match_scrut_enum
                 match_scrut_enum = if elem_struct != "" && is_enum_type(elem_struct) != 0 { elem_struct } else { "" }
                 bind_pattern_vars(sub_pat, 0, 1)
@@ -2882,6 +2941,19 @@ fn infer_expr_type(node: Int) -> Int {
                 return CT_STRUCT
             }
             return CT_INT
+        }
+        // This runs as a PRE-pass — emit_if_expr calls it to decide whether to open its
+        // buffered carrier-discovery path at all, before either branch has been emitted — so a
+        // block-local (`{ let boxed = Some(x)  boxed }`) is not in scope yet and get_var_type
+        // falls through to its CT_INT default. That is the same trap infer_arm_type names for a
+        // pattern binder, solved there by re-reading the arm pattern; here typecheck already
+        // holds the answer on the node. Only consulted when scope has none, so an in-scope
+        // variable keeps whatever the flat side says.
+        if is_scope_var(iname) == 0 {
+            let ident_ct = tc_tid_ct(tc_tid_resolved(tc_lookup_node_tid(node)))
+            if ident_ct >= 0 {
+                return ident_ct
+            }
         }
         return get_var_type(iname)
     }
@@ -4370,12 +4442,17 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             emit_line("void* {cname} = {val_str};")
         }
     } else if struct_type != "" {
-        decl_c = c_type_c_name(struct_type)
-        decl_branch = "struct"
+        // Same lead, same gate as the enum arm above: c_type_c_name answers the bare generic
+        // base for an instance, and the base has no typedef. Gated on the tid carrying args,
+        // so it reaches no other struct binding.
+        let s_tid_mono = struct_instance_c_from_tid(decl_tid)
+        let struct_decl_c = if s_tid_mono != "" { s_tid_mono } else { c_type_c_name(struct_type) }
+        decl_c = struct_decl_c
+        decl_branch = if s_tid_mono != "" { "struct_mono_tid" } else { "struct" }
         if is_mut != 0 {
-            emit_line("{c_type_c_name(struct_type)} {cname} = {val_str};")
+            emit_line("{struct_decl_c} {cname} = {val_str};")
         } else {
-            emit_line("const {c_type_c_name(struct_type)} {cname} = {val_str};")
+            emit_line("const {struct_decl_c} {cname} = {val_str};")
         }
     } else if val_type == CT_PTR && type_ann != -1 {
         // The tid LEADS the annotation here. Both channels describe the same binding, so
@@ -4891,6 +4968,14 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                     elem_type = CT_INT
                     elem_struct = ""
                     plain_enum_name = ne.name
+                } else if ne.name != "" {
+                    // The recovery answers {tag, name, plain_enum} and the plain-enum arm above
+                    // reads one field of it. A struct element answers a name here, and dropping
+                    // it leaves the gate's `elem_struct == ""` still true, so the iterator is
+                    // emitted over `void`. Only reachable where the flat channels held nothing,
+                    // so this adds an answer rather than overriding one.
+                    elem_type = CT_STRUCT
+                    elem_struct = ne.name
                 }
             }
             // A COMPOUND element (`for item in (List[Option[T]])`) is boxed by
@@ -5702,6 +5787,50 @@ fn payload_desc_for(ct: Int, sname: Str) -> Str {
     ct_to_descriptor(ct, "")
 }
 
+// Spell an arena promote descriptor from a TID rather than from the flat cells.
+//
+// Declines with "" for any kind the descriptor grammar has no form for, and propagates a child's
+// decline outward, so a caller falls back to the flat speller instead of trading one wrong
+// descriptor for another. Leaf spellings delegate to ct_to_descriptor so a mangled promoter name
+// stays byte-identical to the one tp_to_descriptor produces for the same type — the two have to
+// agree or the same type gets two promoter functions.
+//
+// TyKind.Enum is deliberately NOT spelled `S:`: a plain C-like enum is a bare int64_t, not a
+// boxed aggregate, and the descriptor grammar cannot tell the two apart. TyKind.Result is left
+// out for the same reason the flat speller leaves it out — no arm means "" means E0702, which
+// is fail-closed.
+fn tid_to_descriptor(tid: Int) -> Str {
+    let r = tc_tid_resolved(tid)
+    if r < 0 { return "" }
+    let k = tc_tid_kind(r)
+    if k == TyKind.Struct {
+        let sn = tc_tid_struct(r)
+        if sn == "" { return "" }
+        return "S:{strip_module_qualifier(sn)}"
+    }
+    if k == TyKind.List {
+        let e = tid_to_descriptor(tc_tid_child(r, 0))
+        if e == "" { return "" }
+        return "L:{e}"
+    }
+    if k == TyKind.Option {
+        let e = tid_to_descriptor(tc_tid_child(r, 0))
+        if e == "" { return "" }
+        return "O:{e}"
+    }
+    if k == TyKind.Map {
+        let kd = tid_to_descriptor(tc_tid_child(r, 0))
+        let vd = tid_to_descriptor(tc_tid_child(r, 1))
+        if kd == "" || vd == "" { return "" }
+        return "M:{kd}|{vd}"
+    }
+    let ct = tc_tid_ct(r)
+    if ct == CT_INT || ct == CT_FLOAT || ct == CT_BOOL || ct == CT_STRING { return ct_to_descriptor(ct, "") }
+    if ct == CT_CHAR || ct == CT_I8 || ct == CT_I16 || ct == CT_I32 { return ct_to_descriptor(ct, "") }
+    if ct == CT_U8 || ct == CT_U16 || ct == CT_U32 || ct == CT_U64 { return ct_to_descriptor(ct, "") }
+    ""
+}
+
 // Returns "" for unsupported kinds (caller maps to an E0702 variant).
 pub fn descriptor_from_capture(entry: CaptureEntry) -> Str {
     let k = tp_get_kind(entry.tp_id)
@@ -5714,17 +5843,20 @@ pub fn descriptor_from_capture(entry: CaptureEntry) -> Str {
         if sn != "" { return "S:{sn}" }
         return ""
     }
-    if k == CT_LIST {
-        let ek = tp_child1_kind(entry.tp_id)
-        let es = tp_child1_sname(entry.tp_id)
-        return "L:{ct_to_descriptor(ek, es)}"
-    }
-    if k == CT_MAP {
-        let kk = tp_child1_kind(entry.tp_id)
-        let ks = tp_child1_sname(entry.tp_id)
-        let vk = tp_child2_kind(entry.tp_id)
-        let vs = tp_child2_sname(entry.tp_id)
-        return "M:{ct_to_descriptor(kk, ks)}|{ct_to_descriptor(vk, vs)}"
+    // tp_to_descriptor walks this same tp_id recursively and produces identical leaves, so
+    // spelling the children by hand here bought nothing and reached exactly one level:
+    // ct_to_descriptor has no List/Map/Option arm, so an inner container fell through to
+    // "P:Int". The arena runtime drives its deep copy off this string, and a slot described as
+    // an inline int64_t is bit-copied instead of recursed into — which leaves a nested
+    // container, a boxed Option, and a boxed struct element pointing at the ORIGINAL, so far
+    // only harmless because E0700 rejects nesting an arena-allocated value into a container.
+    if k == CT_LIST || k == CT_MAP || k == CT_OPTION {
+        // The tid first: the flat child cell carries no struct name for a capture, so a
+        // `List[Point]` element — BOXED in the list, therefore a pointer that must be promoted
+        // rather than bit-copied — reached the runtime as "P:Int" through either flat speller.
+        let from_tid = tid_to_descriptor(entry.tid)
+        if from_tid != "" { return from_tid }
+        return tp_to_descriptor(entry.tp_id)
     }
     if k == CT_CLOSURE {
         let sig = tp_get_sname(entry.tp_id)
@@ -9992,10 +10124,15 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
 // Two tid channels, in this order. The top-level walk records an ANNOTATED binding's tid in a
 // module-keyed map and never touches the value node; it memoizes the value node only for a bare
 // literal. Reading either alone reports the other's population as untyped.
+fn top_level_let_tid(node: Int, name: Str) -> Int {
+    let map_tid = tc_top_level_let_tid(node_module(node), name)
+    if map_tid >= 0 { return map_tid }
+    cg_node_mono_tid(node_value(node))
+}
+
 fn top_level_let_type_str(node: Int, name: Str, tuple_struct: Str, val_type: Int, cell: Str) -> Str {
     let flat = if tuple_struct != "" { c_type_c_name(tuple_struct) } else { c_type_str(val_type) }
-    let map_tid = tc_top_level_let_tid(node_module(node), name)
-    let tid = if map_tid >= 0 { map_tid } else { cg_node_mono_tid(node_value(node)) }
+    let tid = top_level_let_tid(node, name)
     ctype_probe_at(tid, cell, name, flat, node)
     // A tuple-struct global keeps its own spelling for the same reason the match carrier does: two
     // struct types do not convert implicitly, so the tid's logical answer cannot be substituted.
@@ -10053,6 +10190,18 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
             emit_tuple_typedef_for_tag(tuple_struct)
         }
     }
+    // A generic struct/enum global has the same ordering problem the tuple arm above solves:
+    // top_level_let_type_str spells the decl from the tid, so it can name a mono typedef that
+    // the later pass has not emitted yet. Register from the same tid that speller reads, then
+    // flush; every emit dedups via its BLINK_TD_ guard.
+    let inst_tid = top_level_let_tid(node, name)
+    if inst_tid >= 0 && tuple_struct == "" {
+        if register_struct_instance_from_tid(inst_tid) != "" {
+            emit_mono_typedefs_from(0)
+        } else if register_enum_instance_from_tid(inst_tid) != "" {
+            emit_mono_typedefs_from(0)
+        }
+    }
     // Header mode: emit decl-only and bail before any of the var/type
     // tracking side effects below — those are body-emission state, not
     // header concerns.
@@ -10068,6 +10217,16 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
     reg_module_global(name)
     if tuple_struct != "" {
         set_var_struct(name, tuple_struct)
+    } else if inst_tid >= 0 {
+        // Without this a struct or enum global carries its CT with no name, so every field
+        // read on it resolves to nothing and falls back to the `<value>` placeholder — the
+        // local path registers it, which is why the same annotation works as a local. Read
+        // from the tid the decl was spelled from, so the two cannot disagree.
+        let g_stem = tc_tid_struct_mono_name(inst_tid)
+        let g_name = if g_stem != "" { g_stem } else { tc_tid_struct(inst_tid) }
+        if g_name != "" {
+            set_var_struct(name, g_name)
+        }
     }
     // Track list element type from annotation
     if val_type == CT_LIST && type_ann != -1 {

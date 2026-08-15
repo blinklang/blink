@@ -1601,6 +1601,30 @@ fn substitute_typevar_tid(t: Int, binds: Map[Str, Int]) -> Int {
         if inner == e.inner1 { return t }
         return make_set_type(inner)
     }
+    // The remaining one-child kinds, per tc_tid_child_count. The SUBSTITUTION half of the pair
+    // whose discovery half is unify_typevar_binds: leaving a bind discovered but unapplied
+    // spells the param with the typevar still in it, so the type reaches monomorphization
+    // unsolved either way. Both halves have to list the same kinds.
+    if k == TyKind.Handle {
+        let inner = substitute_typevar_tid(e.inner1, binds)
+        if inner == e.inner1 { return t }
+        return make_handle_type(inner)
+    }
+    if k == TyKind.Channel {
+        let inner = substitute_typevar_tid(e.inner1, binds)
+        if inner == e.inner1 { return t }
+        return make_channel_type(inner)
+    }
+    if k == TyKind.Ptr {
+        let inner = substitute_typevar_tid(e.inner1, binds)
+        if inner == e.inner1 { return t }
+        return make_ptr_type(inner)
+    }
+    if k == TyKind.Template {
+        let inner = substitute_typevar_tid(e.inner1, binds)
+        if inner == e.inner1 { return t }
+        return make_template_type(inner)
+    }
     if k == TyKind.Result {
         let ok = substitute_typevar_tid(e.inner1, binds)
         let er = substitute_typevar_tid(e.inner2, binds)
@@ -1794,7 +1818,16 @@ fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
     }
     let ae = ty_pool.get(atid).unwrap()
     if ae.kind != pk { return }
-    if pk == TyKind.List || pk == TyKind.Option || pk == TyKind.Set {
+    // Every one-child kind, per tc_tid_child_count — the layout authority. A kind left out
+    // here is not a missed optimization: a typevar reachable only through it has no other way
+    // to be inferred and reaches monomorphization unsolved (I0001 UnsolvedTypeVarAtCodegen),
+    // which is what the Fn arm below was added to stop one kind over. TyKind.Iterator is
+    // excluded because it reports 0 children there and is never constructed.
+    if pk == TyKind.List || pk == TyKind.Option || pk == TyKind.Set || pk == TyKind.Handle {
+        unify_typevar_binds(pe.inner1, ae.inner1, binds)
+        return
+    }
+    if pk == TyKind.Channel || pk == TyKind.Ptr || pk == TyKind.Template {
         unify_typevar_binds(pe.inner1, ae.inner1, binds)
         return
     }
@@ -2805,7 +2838,11 @@ fn tc_check_callable_arg_bodies(args_sl: Int, skip_idx: Int) ! TypeCheck.Resolve
 // `got` drives the argument loop, not `expected`, so a wrong arity still type-checks every
 // argument it was given instead of stopping at the first report.
 fn tc_check_call_against_fn_tid(fn_tid: Int, args_sl: Int, label: Str, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let fn_ty = ty_pool.get(fn_tid).unwrap()
+    // All three call sites guard with `type_kind(..) == TyKind.Fn`, which RESOLVES, so the
+    // entry read here has to be the entry the guard approved. Reading the raw tid instead
+    // sees a metavar's own entry: params_count 0, and inner1 the solution rather than the
+    // Fn's return.
+    let fn_ty = ty_pool.get(tc_tid_resolved(fn_tid)).unwrap()
     let expected = fn_ty.params_count
     let got = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
     if got != expected {
@@ -8834,13 +8871,35 @@ fn type_merge(a0: Int, b0: Int) -> Int {
 }
 
 // Short-form arm bodies parse as ExprStmt; unwrap so infer_type sees the expression.
-fn infer_arm_body(arm: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+// The arm body is inferred inside a scope where the arm's PATTERN bindings carry their
+// types — `w as "hi" => { w }` must see `w: Str`, not the out-of-scope UNKNOWN that a bare
+// infer_type would return. Without the scope, a match whose every arm's value is a binder
+// merged to TYPE_UNKNOWN. This scope makes the merged type correct wherever infer_type is
+// called on the match node — call arg, interp, method receiver, and the tail/let/return
+// positions the tc_check_body recovery reaches. It is NOT enough on its own for a match hidden
+// in a non-generic struct-lit field: infer_type never inters that field, so tc_check_body's
+// StructLit arm must descend into it (from binding, tail and return position) for the memo to
+// be written at all. Once written, codegen reads Str and `.len()` on the receiver resolves.
+//
+// tc_check_pattern_types emits no diagnostics (only defines names and publishes leaf tids),
+// so running it on every infer_type(match) — which happens many times per node — is
+// idempotent. The scope is pushed and popped here so the bindings never leak past the arm.
+fn infer_arm_body(arm: Int, scrut_tid: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let b = node_body(arm)
     if b == -1 { return TYPE_UNKNOWN }
+    nr_push_scope()
+    let saved_pat = tc_pattern_binding_type
+    tc_pattern_binding_type = scrut_tid
+    tc_check_pattern_types(node_pattern(arm))
+    tc_pattern_binding_type = saved_pat
+    let mut r = TYPE_UNKNOWN
     if node_kind(b) == NodeKind.ExprStmt {
-        return infer_type(node_value(b))
+        r = infer_type(node_value(b))
+    } else {
+        r = infer_type(b)
     }
-    infer_type(b)
+    nr_pop_scope()
+    r
 }
 
 fn type_kind(tid0: Int) -> TyKind {
@@ -10967,10 +11026,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     if kind == NodeKind.MatchExpr {
         let arms_sl = node_arms(node)
         if arms_sl != -1 && sublist_length(arms_sl) > 0 {
-            let mut merged = infer_arm_body(sublist_get(arms_sl, 0))
+            let scrut_tid = infer_type(node_scrutinee(node))
+            let mut merged = infer_arm_body(sublist_get(arms_sl, 0), scrut_tid)
             let mut i = 1
             while i < sublist_length(arms_sl) {
-                let arm_t = infer_arm_body(sublist_get(arms_sl, i))
+                let arm_t = infer_arm_body(sublist_get(arms_sl, i), scrut_tid)
                 if merged == TYPE_UNKNOWN {
                     merged = arm_t
                 } else {
@@ -11644,6 +11704,44 @@ fn tc_check_mutating_method(node: Int, obj: Int, obj_t: Int) ! Diag.Report {
     diag_error_at("MutationRequiresMut", MUTATION_REQUIRES_MUT, "cannot call mutating method '.{method}' on immutable binding '{name}'", node, "declare it as 'let mut {name}' at line {node_line(decl)}")
 }
 
+// The mutation check above runs from tc_check_body's MethodCall arm, which is reached only in
+// statement/initializer position, so a mutating call written as an ARGUMENT is never checked —
+// the same mutation on the same binding caught or allowed by syntactic position alone. The
+// generic walk deliberately does not recurse into argument expressions (infer_type has already
+// visited them and re-walking invents duplicate diagnostics), so this descends for the mutation
+// check ONLY.
+//
+// Closure arguments are skipped: tc_check_callable_arg_bodies routes those through tc_check_body,
+// which reaches their statements by the normal path.
+fn tc_check_mutating_in_args(args_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if args_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(args_sl) {
+        tc_check_mutating_nested(sublist_get(args_sl, i))
+        i = i + 1
+    }
+}
+
+fn tc_check_mutating_nested(n: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if n == -1 { return }
+    let k = node_kind(n)
+    if k == NodeKind.Closure { return }
+    if k == NodeKind.MethodCall {
+        let obj = node_obj(n)
+        // Gated on Ident before infer_type runs. tc_check_mutating_method rejects every other
+        // object kind anyway, and inferring here would re-report infer_type's own diagnostics.
+        if obj != -1 && node_kind(obj) == NodeKind.Ident {
+            tc_check_mutating_method(n, obj, infer_type(obj))
+        }
+        tc_check_mutating_nested(obj)
+        tc_check_mutating_in_args(node_args(n))
+        return
+    }
+    if k == NodeKind.Call {
+        tc_check_mutating_in_args(node_args(n))
+    }
+}
+
 fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return }
     let kind = node_kind(node)
@@ -12173,8 +12271,11 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // listed — a statement-position call can carry a closure argument whose body
             // needs walking (`take(fn() { ... })`). Both arms are narrow by construction:
             // they walk callable arguments only, never arbitrary statement values.
+            // NodeKind.StructLit joins them so a struct literal at the fn tail (`Box { v: match
+            // ... }`, the last statement of the body) reaches the StructLit arm's field walk;
+            // that arm only descends into is_block_bearing field values, so it is equally narrow.
             let vk = node_kind(val)
-            if is_block_bearing(vk) || vk == NodeKind.MethodCall || vk == NodeKind.Call {
+            if is_block_bearing(vk) || vk == NodeKind.MethodCall || vk == NodeKind.Call || vk == NodeKind.StructLit {
                 tc_check_body(val)
             }
         }
@@ -12193,6 +12294,11 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // EARLY return inside an `if` is not the block's last statement, so the tail
             // check never visits it.
             tc_check_returned_value(val_t, node)
+            // A returned struct literal is walked the same way the ExprStmt arm walks a
+            // tail struct literal: infer_type does not type a non-generic struct's field
+            // values, so a binder-valued match hidden in a field stays TYPE_UNKNOWN unless
+            // the StructLit arm's field walk reaches it here.
+            if node_kind(val) == NodeKind.StructLit { tc_check_body(val) }
         } else {
             if tc_current_fn_ret != TYPE_VOID && tc_current_fn_ret != TYPE_UNKNOWN {
                 tc_error_at("function '{tc_current_fn_name}' returns {type_to_str(tc_current_fn_ret)} but bare 'return' has no value", node)
@@ -12236,6 +12342,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // (the shape in our own src/cli.bl) is a MethodCall on a receiver that is not a
         // List, so its body still needs walking below.
         tc_check_callable_arg_bodies(args_sl, hof_arg)
+        tc_check_mutating_in_args(args_sl)
         return
     }
 
@@ -12253,6 +12360,32 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             tc_check_body(cb_callee)
         }
         tc_check_callable_arg_bodies(node_args(node), -1)
+        tc_check_mutating_in_args(node_args(node))
+        return
+    }
+
+    // A struct-literal field value in binding/statement position (`let b = Box { v: match
+    // ... }`). infer_type's StructLit arm inters field values only on the GENERIC
+    // reverse-inference path — a non-generic struct returns its bare tid without ever typing
+    // a field — so a block-bearing value there (a match whose every arm is a binder) never
+    // got walked in scope and its node kept TYPE_UNKNOWN. Codegen then spelled the result
+    // temp int64_t. Walk each block-bearing field value the same way the ExprStmt arm
+    // re-dispatches a statement-position match: only is_block_bearing values, because a plain
+    // field value infer_type has already visited (on the generic path) or does not need
+    // re-walking, and recursing unconditionally would surface the spurious errors the ExprStmt
+    // arm's comment describes.
+    if kind == NodeKind.StructLit {
+        let sl_flds = node_fields(node)
+        if sl_flds != -1 {
+            let mut sfi = 0
+            while sfi < sublist_length(sl_flds) {
+                let sfv = node_value(sublist_get(sl_flds, sfi))
+                if sfv != -1 && is_block_bearing(node_kind(sfv)) != 0 {
+                    tc_check_body(sfv)
+                }
+                sfi = sfi + 1
+            }
+        }
         return
     }
 
@@ -14489,6 +14622,17 @@ pub fn enum_instance_c_from_tid(tid: Int) -> Str {
     c_type_from_tid(r)
 }
 
+// The struct twin, same gate and same narrowness: it answers only for a struct tid carrying
+// type args, so it corrects the bare generic base — a C symbol that was never typedef'd — and
+// takes no other struct binding away from the by-name spelling that already owns it.
+pub fn struct_instance_c_from_tid(tid: Int) -> Str {
+    if tid < 0 { return "" }
+    let r = tc_tid_resolved(tid)
+    if tc_tid_kind(r) != TyKind.Struct { return "" }
+    if tc_tid_struct_arg_count(r) == 0 { return "" }
+    c_type_from_tid(r)
+}
+
 // Monomorphized-struct-instance accessors. Read the concrete
 // type-args of a struct-instance tid built by make_struct_instance_type — the
 // `Box[Int]` shape stored variadically in ty_param_list[params_start..]. These
@@ -15767,10 +15911,15 @@ fn tc_ann_head_matches_tid(ann: Int, tid: Int) -> Bool {
         TyKind.Typevar => false
         TyKind.Unknown => false
         TyKind.Iterator => false
-        TyKind.Handle => false
-        TyKind.Channel => false
-        TyKind.Ptr => false
-        TyKind.Template => false
+        // The four one-child carriers. Each spells its inner as `elements[0]`
+        // (resolve_type_parts' Handle/Channel/Ptr/Template arms) and stores it in inner1, which
+        // tc_tid_child answers at index 0 — so the index alignment this function authorizes does
+        // hold, and declining left `fn f[T](c: Channel[T])` with no argument position able to
+        // supply T at all: I0001 at monomorphization, the signature uncallable.
+        TyKind.Handle => nm == "Handle"
+        TyKind.Channel => nm == "Channel"
+        TyKind.Ptr => nm == "Ptr"
+        TyKind.Template => nm == "Template"
         // `false` for the SAME reason TyKind.Fn is: the alignment this function exists to
         // authorize does not hold. A `Handler[E]` annotation puts the effect in `elements`, but
         // the effect is not a type and the tid has no children at all, so element 0 would be

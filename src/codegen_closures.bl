@@ -22,7 +22,7 @@ import codegen_types.{
     is_emitted_fn, is_enum_type, is_struct_type, list_contains_str, resolve_variant,
     reg_fn_struct_ret, reg_fn_ret_from_ann,
     resolve_ret_type_from_ann, resolve_option_inner_from_ann, build_closure_sig_from_type_ann,
-    closure_lit_ret_c, closure_ret_mono_stem, capture_cell_c_type,
+    closure_lit_ret_c, closure_lit_ret_ct, closure_lit_param_c, closure_ret_mono_stem, capture_cell_c_type,
     resolve_tuple_ann, tuple_c_name_from_ann,
     append_ev_arg, fn_node_has_effects,
     cg_closure_counter, cg_closure_defs, cg_closure_promoter_defs, cg_closure_param_type_hint,
@@ -850,8 +850,15 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                 ensure_carrier_from_tag(carrier)
                 params_c = params_c.concat("{c_type_c_name(carrier)} {pname}")
             } else {
+                // type_from_name answers CT_VOID for every name it cannot map, a type
+                // parameter among them, and `void x` is not a legal C parameter. The tid
+                // holds the substituted answer; it declines rather than half-spelling, so an
+                // unspellable slot stays on the string below with the cast side, which reads
+                // the same producer.
+                let p_tid_c = closure_lit_param_c(node, i)
                 let ct = type_from_name(ptype)
-                params_c = params_c.concat("{c_type_str(ct)} {pname}")
+                let p_ts = if p_tid_c != "" { p_tid_c } else { c_type_str(ct) }
+                params_c = params_c.concat("{p_ts} {pname}")
             }
             i = i + 1
         }
@@ -991,6 +998,16 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             }
         }
     }
+    // Ordered last, matching the call-site cast below: the string arms own every return they
+    // can spell, and the tid fills in only where they answered `void` — which c_type_str gives
+    // for every kind it cannot spell, not just for a genuine Void. The cast is emitted from the
+    // same producer, and the two disagreeing is an ABI mismatch cc cannot see.
+    if ret_c_str == "void" {
+        let tid_ret = closure_lit_ret_c(node)
+        if tid_ret != "" {
+            ret_c_str = tid_ret
+        }
+    }
     emit_line("static {ret_c_str} {cname}({params_c}) \{")
     cg_indent = cg_indent + 1
     let mut mc_i = 0
@@ -1015,6 +1032,16 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     let mut body_ret = ret_type
     if closure_ret_struct != "" || (ret_type == CT_VOID && ret_str != "Void" && ret_str != "" && ret_needs_struct_body(ret_str) != 0) {
         body_ret = CT_INT
+    }
+    // A signature repaired from the tid without repairing the body leaves the tail lowered as
+    // a discard, so the caller reads an uninitialized register. Reads the ct twin of the
+    // producer the signature used, so the two cannot answer for different types; a genuine
+    // Void answers CT_VOID and this is a no-op.
+    if body_ret == CT_VOID {
+        let tid_body_ct = closure_lit_ret_ct(node)
+        if tid_body_ct != -1 {
+            body_ret = tid_body_ct
+        }
     }
     cg_current_fn_name = cname
     cg_current_fn_has_ev = 0
@@ -1088,7 +1115,9 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                 // carrier param, or the cast keeps `void` and gcc rejects the call.
                 sig_params = sig_params.concat(c_type_c_name(compound_name_from_ann(node_type_ann(sp))))
             } else {
-                sig_params = sig_params.concat(c_type_str(type_from_name(sptype)))
+                // The cast half of the definition's else arm above, reading the one producer.
+                let sp_tid_c = closure_lit_param_c(node, si)
+                sig_params = sig_params.concat(if sp_tid_c != "" { sp_tid_c } else { c_type_str(type_from_name(sptype)) })
             }
             si = si + 1
         }

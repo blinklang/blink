@@ -1,0 +1,86 @@
+// A closure call is emitted `((sig)cls->fn_ptr)(cls, args..)`, so the cast has to name the
+// same C return type the definition line does. The annotation-string chain answers "void"
+// for every kind it cannot spell, not just for a genuine Void, so both sides need the tid
+// fallback — and the body needs it too, or a `void` definition lowers its tail as a discard
+// and the caller reads an uninitialized register.
+//
+// The mismatch is invisible to cc: it is a cast through a function pointer, so the wrong
+// answer only appears once the optimizer stops spilling the value. That is why these rows
+// assert on the emitted C rather than only on the runtime answer.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+fn float_ret_src() -> Str {
+    #"import std.io
+
+fn apply[T](v: T) -> T {
+    let f = fn(x: Int) -> T { v }
+    f(3)
+}
+
+fn main() {
+    let got: Float = apply(1.5)
+    io.println("got={got}")
+}
+"#
+}
+
+test "a closure returning a type parameter defines and casts the same C type" {
+    let c = compile_test_helpers.compile_and_emit_c(float_ret_src(), "w60yrx_float")
+    // The cast side already reads the tid. The definition must agree, or the two spell one
+    // C object two ways and the call is undefined.
+    assert_has(c, "double(*)(const blink_closure*", "call-site cast names the substituted return")
+    assert_lacks(c, "static void __closure_0(", "closure definition must not keep the erased `void`")
+    assert_has(c, "static double __closure_0(", "closure definition names the substituted return")
+}
+
+test "a closure returning a type parameter returns its tail instead of discarding it" {
+    let c = compile_test_helpers.compile_and_emit_c(float_ret_src(), "w60yrx_tail")
+    // A `void` return type also makes the body lower its tail as a statement, so repairing
+    // only the signature would leave the caller reading an uninitialized register.
+    assert_lacks(c, "(void)*(double*)blink_closure_get_capture", "the tail must be returned, not discarded")
+}
+
+test "the substituted closure return survives to runtime" {
+    let r = compile_test_helpers.compile_and_run(float_ret_src(), "w60yrx_run")
+    assert_has(r.out, "got=1.5", "apply(1.5) through a type-parameter-returning closure")
+}
+
+// A genuine Void return must keep `void` on both sides: the tid answers "void" here too, so
+// the fallback must not mistake a real Void for a decline.
+fn void_ret_src() -> Str {
+    #"import std.io
+
+fn main() {
+    let mut hits = 0
+    let f = fn(x: Int) { hits = hits + x }
+    f(3)
+    io.println("hits={hits}")
+}
+"#
+}
+
+test "a genuinely Void closure keeps void on both sides" {
+    let c = compile_test_helpers.compile_and_emit_c(void_ret_src(), "w60yrx_void")
+    assert_has(c, "static void __closure_0(", "a real Void return stays void in the definition")
+    assert_lacks(c, "double(*)(const blink_closure*", "a real Void return is not cast to a value type")
+}
+
+// The signature and the body are repaired from two producers, so a control that reads only the
+// signature cannot see them disagree. `return` with a value under a `void` head is a cc error,
+// which is what makes running it — not spelling-matching it — the check that binds the pair.
+test "a genuinely Void closure body returns nothing" {
+    let r = compile_test_helpers.compile_and_run(void_ret_src(), "w60yrx_void_run")
+    assert_has(r.out, "hits=3", "a Void closure mutating a capture compiles and runs")
+}

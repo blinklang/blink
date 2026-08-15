@@ -1,0 +1,70 @@
+// A match nested inside an EXPRESSION loses its type when EVERY arm's value is a pattern-bound
+// ident. Statement, tail and let-initializer positions were fixed by 2ew5dp; these four
+// expression positions were not, because tc_check_body dispatches on statement forms only and
+// never descends into a Call/StructLit/InterpString/MethodCall operand — so infer_arm_body
+// evaluates each arm out of scope and the whole match comes back TYPE_UNKNOWN.
+//
+// The necessary condition is that every arm's value is a binder: a single non-binder arm supplies
+// the type via type_merge and hides the defect (see the 2ew5dp argument-position row, which stays
+// green because its `_ => { "no" }` arm yields a literal).
+//
+// Four positions, all the same match `match s { w as "hi" => { w } z => { z } }` — its result is
+// Str in every arm:
+//   1. call argument       — width_of(match ...)      (was: cc int/pointer mismatch)
+//   2. struct-literal field — Box { v: match ... }     (was: cc int/pointer mismatch)
+//   3. string interpolation — "{match ...}"            (was: cc int/pointer mismatch)
+//   4. method receiver      — (match ...).len()        (was: typecheck UnresolvedMethod on type ?)
+// plus the tail control, which already worked and must stay green.
+
+type Box { v: Str }
+
+fn width_of(s: Str) -> Int { s.len() }
+
+fn pick(s: Str) -> Str { match s { w as "hi" => { w } z => { z } } }
+
+// A struct literal is not itself block-bearing, so a binder-valued match hidden in one of its
+// fields is only reached when tc_check_body descends into the struct-lit. Binding position gets
+// that descent; the two spellings below are the other positions a struct literal reaches the
+// return-value check — the implicit fn tail, and an early `return` — where the field-match was
+// left TYPE_UNKNOWN and codegen spelled the result temp int64_t.
+fn box_tail(s: Str) -> Box { Box { v: match s { w as "hi" => { w } z => { z } } } }
+
+fn box_return(s: Str) -> Box {
+    if s == "" { return Box { v: match s { w as "hi" => { w } z => { z } } } }
+    Box { v: "other" }
+}
+
+test "binder-valued match in call-argument position keeps its Str type" {
+    let s = "hi"
+    assert_eq(width_of(match s { w as "hi" => { w } z => { z } }), 2)
+}
+
+test "binder-valued match in struct-literal field keeps its Str type" {
+    let s = "hey"
+    let b = Box { v: match s { w as "hi" => { w } z => { z } } }
+    assert_eq(b.v, "hey")
+}
+
+test "binder-valued match in string interpolation keeps its Str type" {
+    let s = "hey"
+    let out = "{match s { w as "hi" => { w } z => { z } }}"
+    assert_eq(out, "hey")
+}
+
+test "binder-valued match as a method receiver keeps its Str type" {
+    let s = "hey"
+    let n = (match s { w as "hi" => { w } z => { z } }).len()
+    assert_eq(n, 3)
+}
+
+test "binder-valued match in a struct-lit field at the fn tail keeps its Str type" {
+    assert_eq(box_tail("hey").v, "hey")
+}
+
+test "binder-valued match in a struct-lit field under an early return keeps its Str type" {
+    assert_eq(box_return("").v, "")
+}
+
+test "control: the same match in fn-tail position keeps its Str type" {
+    assert_eq(pick("hey"), "hey")
+}

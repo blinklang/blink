@@ -1,0 +1,127 @@
+// An `Option[T]` carrier stores its payload THROUGH a pointer whenever T is not already
+// pointer-shaped — `emit_struct_option_typedef` picks between
+//
+//     typedef struct { int tag; blink_list* value; } blink_Option_List_int;   // inline
+//     typedef struct { int tag; blink_W*     value; } blink_Option_W;          // BOXED
+//
+// on `inner_c.ends_with("*")`. The arena promoter for the same carrier did not mirror that rule:
+// it copied the payload by value in every case —
+//
+//     dst.value = blink_promote_W(target, src.value);
+//
+// — which hands a `blink_W*` to a function declared `blink_W blink_promote_W(blink_arena_t*,
+// blink_W)`. That is a C type error, so the whole program fails to build; there is no silently
+// wrong answer to observe.
+//
+// The boxed inners are struct, nested Option, and nested Result. List/Map/closure payloads are
+// pointer-shaped and were already correct, which is why this stayed hidden: nothing reached the
+// promoter with a boxed payload until `descriptor_from_capture` learned to spell `O:` captures at
+// full depth. Result carriers are a union of BY-VALUE members and need no boxing at all.
+
+import compile_test_helpers
+
+test "an Option[Struct] mut-captured into a closure promotes its boxed payload" {
+    let src = #"import std.io
+
+type W { n: Int }
+
+fn main() {
+    let mut o: Option[W] = None
+    let f = fn() { o = Some(W { n: 3 }) }
+    f()
+    io.println("n={o.unwrap().n}")
+}
+"#
+    let r = compile_test_helpers.compile_and_run(src, "x2rp7f_struct")
+    if !r.out.contains("n=3") { compile_test_helpers.expect_contains(r.out, "n=3", "Option[Struct] capture — got '{r.err_out}'") }
+    assert(r.out.contains("n=3"))
+}
+
+// The nested-carrier payload takes the same boxed branch of the typedef and so the same branch of
+// the promoter; it is a separate row because its promoter recurses into another carrier promoter
+// rather than a struct one.
+test "an Option[Option[Int]] mut-captured into a closure promotes its boxed payload" {
+    let src = #"import std.io
+
+fn main() {
+    let mut o: Option[Option[Int]] = None
+    let f = fn() { o = Some(Some(7)) }
+    f()
+    io.println("n={o.unwrap().unwrap()}")
+}
+"#
+    let r = compile_test_helpers.compile_and_run(src, "x2rp7f_nested")
+    if !r.out.contains("n=7") { compile_test_helpers.expect_contains(r.out, "n=7", "Option[Option[Int]] capture — got '{r.err_out}'") }
+    assert(r.out.contains("n=7"))
+}
+
+// The pointer-shaped payload, as the control: it pins that teaching the promoter to box did not
+// start boxing a payload the typedef stores inline — that would be the same mismatch mirrored.
+test "an Option[List[Int]] mut-captured into a closure keeps its inline payload" {
+    let src = #"import std.io
+
+fn main() {
+    let mut o: Option[List[Int]] = None
+    let f = fn() {
+        let mut xs: List[Int] = []
+        xs.push(5)
+        o = Some(xs)
+    }
+    f()
+    io.println("n={o.unwrap().len()}")
+}
+"#
+    let r = compile_test_helpers.compile_and_run(src, "x2rp7f_list")
+    if !r.out.contains("n=1") { compile_test_helpers.expect_contains(r.out, "n=1", "Option[List[Int]] capture — got '{r.err_out}'") }
+    assert(r.out.contains("n=1"))
+}
+
+// Naming the promoter is a second, independent obligation: `descriptor_c_type` spells the carrier
+// as `blink_Option_{descriptor_typedef_tag(inner)}`, and that tag has to be the one the carrier
+// machinery actually typedef'd. `tp_carrier_tag` recurses through Option / Result / Map and leaves
+// List and Set flat; `descriptor_typedef_tag` recursed through Option and Result only, so a Map
+// payload collapsed to the bare kind tag and the promoter was declared over a type that is never
+// emitted:
+//
+//     static blink_Option_map blink_promote_Option_Map_Str_Bx(...)   // blink_Option_map undeclared
+//
+// against the real `blink_Option_Map_str_Bx`. This row is a Map payload rather than a struct one
+// because it is the tag spelling under test, not the boxing — a Map is pointer-shaped and takes
+// the inline branch.
+test "an Option[Map[K, V]] mut-captured into a closure names the carrier the typedef used" {
+    let src = #"import std.io
+
+type Bx { v: Int }
+
+fn main() {
+    let mut o: Option[Map[Str, Bx]] = None
+    let f = fn() {
+        let mut m: Map[Str, Bx] = Map()
+        m.insert("k", Bx { v: 6 })
+        o = Some(m)
+    }
+    f()
+    io.println("n={o.unwrap().get("k").unwrap().v}")
+}
+"#
+    let r = compile_test_helpers.compile_and_run(src, "x2rp7f_mapval")
+    if !r.out.contains("n=6") { compile_test_helpers.expect_contains(r.out, "n=6", "Option[Map[Str, Bx]] capture — got '{r.err_out}'") }
+    assert(r.out.contains("n=6"))
+}
+
+// The scalar payload is spelled by emit_option_typedef, not the struct-tagged emitter, and is
+// always inline. It is the row that would catch a boxing predicate keyed on the wrong branch.
+test "an Option[Int] mut-captured into a closure keeps its inline payload" {
+    let src = #"import std.io
+
+fn main() {
+    let mut o: Option[Int] = None
+    let f = fn() { o = Some(9) }
+    f()
+    io.println("n={o.unwrap()}")
+}
+"#
+    let r = compile_test_helpers.compile_and_run(src, "x2rp7f_int")
+    if !r.out.contains("n=9") { compile_test_helpers.expect_contains(r.out, "n=9", "Option[Int] capture — got '{r.err_out}'") }
+    assert(r.out.contains("n=9"))
+}
