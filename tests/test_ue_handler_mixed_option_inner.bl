@@ -1,0 +1,53 @@
+// A user-effect handler whose operation returns `Option[Struct]` has that return position
+// erased to the `blink_Option_ptr` handler-vtable ABI. The erasure must stay a PER-VALUE
+// property of the box the `Some(Struct)` constructor actually heap-boxes — NOT a body-wide
+// fn-level condition. An ordinary intermediate Option binding in the same body (e.g.
+// `let y = Some(5)`, whose value is a concrete `blink_Option_int`, never ptr-boxed) must keep
+// its concrete carrier: its declaration, initializer, and every consumer (unwrap, match,
+// container store, `??`) spell `blink_Option_int`, not the erased `blink_Option_ptr`.
+//
+// This guards against re-deriving the erasure from the coarse `cg_current_fn_option_inner ==
+// CT_PTR` sentinel, which is set for the whole handler body and cannot tell which Option was
+// actually erased — that over-fires and spells every in-body Option `blink_Option_ptr`,
+// mismatching the concrete value.
+
+import compile_test_helpers
+
+fn mixed_inner_src() -> Str {
+    #"import std.io
+
+type Item {
+    name: Str
+    count: Int
+}
+
+effect Store {
+    effect Lookup {
+        fn find(name: Str) -> Option[Item]
+    }
+}
+
+fn lookup(name: Str) -> Option[Item] ! Store.Lookup {
+    store.find(name)
+}
+
+fn main() {
+    with handler Store {
+        fn find(name: Str) -> Option[Item] {
+            let y = Some(5)
+            let n = y.unwrap()
+            Some(Item { name: name, count: n })
+        }
+    } {
+        let r = lookup("apple")
+        io.println("n={r.unwrap().name} c={r.unwrap().count}")
+    }
+}
+"#
+}
+
+test "an intermediate scalar Some inside an Option[Struct]-returning UE handler keeps its concrete carrier" {
+    let r = compile_test_helpers.compile_and_run(mixed_inner_src(), "ue_mixed_inner")
+    if !r.out.contains("n=apple c=5") { compile_test_helpers.expect_contains(r.out, "n=apple c=5", "mixed-inner Option in UE handler — got '{r.err_out}'") }
+    assert(r.out.contains("n=apple c=5"))
+}
