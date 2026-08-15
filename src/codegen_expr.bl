@@ -99,7 +99,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{ctype_probe_at, c_type_from_tid, tc_mono_tids_subst, tc_tid_subst_mono, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_list_elem_ct, tc_tid_list_elem_struct, tc_tid_list_elem, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_ct_resolved, tc_tid_map_val_struct_resolved, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_faithful, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved}
+import typecheck.{ctype_probe_at, c_type_from_tid, tc_scalar_tid_for_ct, tc_mono_tids_subst, tc_tid_subst_mono, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_list_elem_ct, tc_tid_list_elem_struct, tc_tid_list_elem, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_ct_resolved, tc_tid_map_val_struct_resolved, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_faithful, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -109,6 +109,15 @@ import typecheck.{ctype_probe_at, c_type_from_tid, tc_mono_tids_subst, tc_tid_su
 
 pub let mut expr_result_str: Str = ""
 pub let mut expr_result_type: Int = 0
+// Physical result tid twin of expr_result_type. Published at every emit_expr result — each inline
+// producer arm and the boundary after each external delegate (emit_method_call/emit_if_expr/
+// emit_match_expr/emit_block_expr/emit_with_block_expr/emit_closure, which set the flat CT in
+// their own module but cannot publish here) — so any expression elaborated through emit_expr
+// carries a fresh twin, and a consumer can read the tid directly instead of recovering it from the
+// node's LOGICAL mono tid (which mis-spells erased storage slots). Scalar results carry the
+// canonical singleton (physically exact); aggregates carry the node's own tid, or -1 when no node
+// is in scope (the nodeless carrier helpers, whose aggregate results no tid consumer reads yet).
+pub let mut expr_result_tid: Int = -1
 pub let mut expr_closure_sig: Str = ""
 pub let mut expr_option_inner: Int = -1
 pub let mut expr_result_ok_type: Int = -1
@@ -264,6 +273,7 @@ fn emit_ok_result(ok_str: Str, ok_type: Int, err_type: Int, ok_s: Str, err_s: St
         let res_type = result_c_type_mixed(ok_type, err_type, ok_s, err_s)
         expr_result_str = "({res_type})\{.tag = 0, .ok = {ok_str}}"
         expr_result_type = CT_RESULT
+        publish_result_tid(-1)
         expr_result_ok_type = ok_type
         expr_result_err_type = err_type
         expr_result_ok_struct = ok_s
@@ -273,6 +283,7 @@ fn emit_ok_result(ok_str: Str, ok_type: Int, err_type: Int, ok_s: Str, err_s: St
         let res_type = result_c_type(ok_type, err_type)
         expr_result_str = "({res_type})\{.tag = 0, .ok = {ok_str}}"
         expr_result_type = CT_RESULT
+        publish_result_tid(-1)
         expr_result_ok_type = ok_type
         expr_result_err_type = err_type
         expr_result_ok_struct = ""
@@ -291,6 +302,7 @@ fn emit_err_result(err_str: Str, ok_type: Int, err_type: Int, ok_s: Str, err_s: 
         expr_result_str = "({res_type})\{.tag = 1, .err = {err_str}}"
     }
     expr_result_type = CT_RESULT
+    publish_result_tid(-1)
     expr_result_ok_type = ok_type
     expr_result_err_type = err_type
     expr_result_ok_struct = ok_s
@@ -323,6 +335,7 @@ fn set_bare_none_struct_result(inner_tag: Str) {
     let opt_type = struct_option_c_type(inner_tag)
     expr_result_str = "({opt_type})\{.tag = 0}"
     expr_result_type = CT_OPTION
+    publish_result_tid(-1)
     expr_option_inner = CT_INT
     expr_option_inner_struct = inner_tag
 }
@@ -343,6 +356,7 @@ fn reseat_from_closure_ret_tag(sname: Str, tmp: Str) -> Int ! Codegen.Scope {
         let inner_s = option_inner_struct_from_tag(sname)
         expr_result_str = tmp
         expr_result_type = CT_OPTION
+        publish_result_tid(-1)
         expr_option_inner = inner_ct
         expr_option_inner_struct = inner_s
         if inner_s != "" {
@@ -356,6 +370,7 @@ fn reseat_from_closure_ret_tag(sname: Str, tmp: Str) -> Int ! Codegen.Scope {
         let split = split_result_compound(sname)
         expr_result_str = tmp
         expr_result_type = CT_RESULT
+        publish_result_tid(-1)
         expr_result_ok_type = type_from_name_tag(split.first)
         expr_result_err_type = type_from_name_tag(split.second)
         expr_result_ok_struct = typedef_tag_or_empty(split.first)
@@ -368,6 +383,7 @@ fn reseat_from_closure_ret_tag(sname: Str, tmp: Str) -> Int ! Codegen.Scope {
         set_var_struct(tmp, resolved)
         expr_result_str = tmp
         expr_result_type = CT_STRUCT
+        publish_result_tid(-1)
         return 1
     }
     0
@@ -380,10 +396,12 @@ fn reseat_after_q_on_result(tmp: Str, rok: Int, rok_s: Str) {
     expr_result_str = "{tmp}.ok"
     if rok == CT_OPTION {
         expr_result_type = CT_OPTION
+        publish_result_tid(-1)
         expr_option_inner = option_inner_ct_from_tag(rok_s)
         expr_option_inner_struct = option_inner_struct_from_tag(rok_s)
     } else if rok == CT_RESULT {
         expr_result_type = CT_RESULT
+        publish_result_tid(-1)
         let split = split_result_compound(rok_s)
         expr_result_ok_type = type_from_name_tag(split.first)
         expr_result_err_type = type_from_name_tag(split.second)
@@ -392,9 +410,11 @@ fn reseat_after_q_on_result(tmp: Str, rok: Int, rok_s: Str) {
         return
     } else if rok_s != "" {
         expr_result_type = CT_INT
+        publish_result_tid(-1)
         set_var_struct(expr_result_str, rok_s)
     } else {
         expr_result_type = rok
+        publish_result_tid(-1)
     }
     expr_result_ok_struct = ""
     expr_result_err_struct = ""
@@ -474,6 +494,20 @@ fn cg_expr_node_mono_tid(node: Int) -> Int {
     cg_expr_mono_tid(tc_lookup_node_tid(node))
 }
 
+// Publish expr_result_tid to agree with the flat expr_result_type just assigned. A scalar CT maps
+// to its canonical singleton — physically exact even for an erased slot, and the branch a tid
+// consumer reads. Any other (aggregate) CT falls back to the node's own mono tid, whose spelling
+// for the container itself is physical; pass node = -1 from a nodeless carrier helper (its
+// aggregate result feeds no tid consumer) to record -1 rather than call the node accessor.
+fn publish_result_tid(node: Int) {
+    let s = tc_scalar_tid_for_ct(expr_result_type)
+    if s != -1 {
+        expr_result_tid = s
+    } else {
+        expr_result_tid = if node >= 0 { cg_expr_node_mono_tid(node) } else { -1 }
+    }
+}
+
 fn recover_map_kv_from_tid(node: Int, var_name: Str) ! Codegen.Register, Codegen.Scope {
     let mtid = tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids)
     let kct = tc_tid_map_key_ct_resolved(mtid)
@@ -546,12 +580,14 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             expr_result_str = s
         }
         expr_result_type = CT_INT
+        publish_result_tid(node)
         return
     }
 
     if kind == NodeKind.FloatLit {
         expr_result_str = node_str_val(node)
         expr_result_type = CT_FLOAT
+        publish_result_tid(node)
         return
     }
 
@@ -562,12 +598,14 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             expr_result_str = "0"
         }
         expr_result_type = CT_BOOL
+        publish_result_tid(node)
         return
     }
 
     if kind == NodeKind.CharLit {
         expr_result_str = "(int32_t){node_str_val(node)}"
         expr_result_type = CT_CHAR
+        publish_result_tid(node)
         return
     }
 
@@ -576,11 +614,13 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         if (name == "self" || name == "_self") && cg_where_self_var != "" {
             expr_result_str = cg_where_self_var
             expr_result_type = CT_INT
+            publish_result_tid(node)
             return
         }
         if name == "result" && cg_ensures_result_var != "" {
             expr_result_str = cg_ensures_result_var
             expr_result_type = CT_INT
+            publish_result_tid(node)
             return
         }
         if name == "None" {
@@ -608,6 +648,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 let opt_type = option_c_type(t_inner_ct)
                 expr_result_str = "({opt_type})\{.tag = 0}"
                 expr_result_type = CT_OPTION
+                publish_result_tid(node)
                 expr_option_inner = t_inner_ct
                 expr_option_inner_struct = ""
                 expr_option_is_none = 1
@@ -619,6 +660,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 let opt_type = option_c_type(expect_inner_ct)
                 expr_result_str = "({opt_type})\{.tag = 0}"
                 expr_result_type = CT_OPTION
+                publish_result_tid(node)
                 expr_option_inner = expect_inner_ct
                 expr_option_inner_struct = ""
                 expr_option_is_none = 1
@@ -631,6 +673,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 let opt_type = struct_option_c_type(fsi.ok_struct)
                 expr_result_str = "({opt_type})\{.tag = 0}"
                 expr_result_type = CT_OPTION
+                publish_result_tid(node)
                 if is_compound_tag(fsi.ok_struct) != 0 {
                     expr_option_inner = type_from_name(fsi.ok_struct.slice(0, fsi.ok_struct.index_of("_")))
                     expr_option_inner_struct = fsi.ok_struct
@@ -649,6 +692,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                     let opt_type = struct_option_c_type(inner_tag)
                     expr_result_str = "({opt_type})\{.tag = 0}"
                     expr_result_type = CT_OPTION
+                    publish_result_tid(node)
                     expr_option_inner = CT_INT
                     expr_option_inner_struct = inner_tag
                 } else {
@@ -656,6 +700,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                     let opt_type = option_c_type(inner_ct)
                     expr_result_str = "({opt_type})\{.tag = 0}"
                     expr_result_type = CT_OPTION
+                    publish_result_tid(node)
                     expr_option_inner = inner_ct
                     expr_option_inner_struct = ""
                 }
@@ -667,6 +712,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 let opt_type = option_c_type(none_inner)
                 expr_result_str = "({opt_type})\{.tag = 0}"
                 expr_result_type = CT_OPTION
+                publish_result_tid(node)
                 expr_option_inner = none_inner
                 expr_option_inner_struct = ""
             }
@@ -683,11 +729,13 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 // than an instance typedef that has nothing to derive it from.
                 expr_result_str = "({c_type_c_name(variant_enum2)})\{.tag = {tag}}"
                 expr_result_type = CT_STRUCT
+                publish_result_tid(node)
                 set_var_struct(expr_result_str, variant_enum2)
                 return
             }
             expr_result_str = "{c_type_c_name(variant_enum2)}_{name}"
             expr_result_type = CT_INT
+            publish_result_tid(node)
             var_enums.push(VarEnumEntry { name: expr_result_str, enum_type: variant_enum2 })
             return
         }
@@ -698,6 +746,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             if cap_entry.is_mut != 0 {
                 expr_result_str = "(*{safe}_cell)"
                 expr_result_type = tp_get_kind(cap_entry.tp_id)
+                publish_result_tid(node)
                 // A field access resolves its receiver's struct by the EMITTED string, and
                 // `(*x_cell)` is no scope var, so without this the field type is CT_VOID: the read
                 // declares `void v` and interpolation prints the `<value>` placeholder.
@@ -709,6 +758,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             }
             expr_result_str = capture_cast_expr(cap_idx)
             expr_result_type = tp_get_kind(cap_entry.tp_id)
+            publish_result_tid(node)
             return
         }
         if list_contains_str(mut_captured_vars, name) != 0 {
@@ -723,6 +773,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             if is_closure_param == 0 {
                 expr_result_str = "(*{safe}_cell)"
                 expr_result_type = get_var_type(name)
+                publish_result_tid(node)
                 // Same rewrite, enclosing scope: carry the struct identity onto the cell
                 // expression so a field read through it keeps its type.
                 if expr_result_type == CT_STRUCT {
@@ -749,6 +800,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 )
                 expr_result_str = "0"
                 expr_result_type = CT_INT
+                publish_result_tid(node)
                 return
             }
             let target_fn_node = get_fn_node(name)
@@ -756,6 +808,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 let shim_name = emit_fn_value_shim_if_needed(target_fn_node, c_fn_name(name))
                 expr_result_str = "blink_closure_new_typed((void*){shim_name}, NULL, NULL, 0, NULL)"
                 expr_result_type = CT_CLOSURE
+                publish_result_tid(node)
                 expr_closure_sig = cg_expect_fn_value_sig
                 return
             }
@@ -767,6 +820,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             expr_result_str = safe
         }
         expr_result_type = get_var_type(name)
+        publish_result_tid(node)
         if expr_result_type == CT_OPTION {
             expr_option_inner = get_var_option_inner(name)
             expr_option_inner_struct = get_var_option_inner_struct(name)
@@ -831,6 +885,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         if _callee != -1 && node_name(_callee) == "old" && cg_old_snapshot_vars.contains_key("{node}") {
             expr_result_str = cg_old_snapshot_vars.get("{node}").unwrap()
             expr_result_type = CT_INT
+            publish_result_tid(node)
             return
         }
         emit_call(node)
@@ -839,6 +894,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
 
     if kind == NodeKind.MethodCall {
         emit_method_call(node)
+        publish_result_tid(node)
         return
     }
 
@@ -849,6 +905,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
 
     if kind == NodeKind.IfExpr {
         emit_if_expr(node)
+        publish_result_tid(node)
         return
     }
 
@@ -864,6 +921,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                         let cname = c_safe_name(resolved_field)
                         expr_result_str = cname
                         expr_result_type = get_var_type(resolved_field)
+                        publish_result_tid(node)
                         if expr_result_type == CT_OPTION {
                             expr_option_inner = get_var_option_inner(resolved_field)
                             expr_option_inner_struct = get_var_option_inner_struct(resolved_field)
@@ -901,11 +959,13 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                     let tag = get_variant_tag(obj_name, fa_field)
                     expr_result_str = "({c_type_c_name(obj_name)})\{.tag = {tag}}"
                     expr_result_type = CT_STRUCT
+                    publish_result_tid(node)
                     set_var_struct(expr_result_str, obj_name)
                     return
                 }
                 expr_result_str = "{c_type_c_name(obj_name)}_{fa_field}"
                 expr_result_type = CT_INT
+                publish_result_tid(node)
                 var_enums.push(VarEnumEntry { name: expr_result_str, enum_type: obj_name })
                 return
             }
@@ -994,6 +1054,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 recover_list_elem_from_tid(node, expr_result_str)
             }
             expr_result_type = fa_type
+            publish_result_tid(node)
             return
         }
         if struct_type != "" {
@@ -1177,6 +1238,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             }
         }
         expr_result_type = fa_type
+        publish_result_tid(node)
         return
     }
 
@@ -1189,9 +1251,11 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         if obj_type == CT_STRING {
             expr_result_str = "blink_str_char_at({obj_str}, {idx_str})"
             expr_result_type = CT_INT
+            publish_result_tid(node)
         } else {
             expr_result_str = "{obj_str}[{idx_str}]"
             expr_result_type = CT_INT
+            publish_result_tid(node)
         }
         return
     }
@@ -1204,21 +1268,25 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
     if kind == NodeKind.RangeLit {
         expr_result_str = "0"
         expr_result_type = CT_VOID
+        publish_result_tid(node)
         return
     }
 
     if kind == NodeKind.MatchExpr {
         emit_match_expr(node)
+        publish_result_tid(node)
         return
     }
 
     if kind == NodeKind.Block {
         emit_block_expr(node)
+        publish_result_tid(node)
         return
     }
 
     if kind == NodeKind.WithBlock {
         emit_with_block_expr(node)
+        publish_result_tid(node)
         return
     }
 
@@ -1232,6 +1300,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         }
         expr_result_str = "0"
         expr_result_type = CT_VOID
+        publish_result_tid(node)
         return
     }
 
@@ -1247,6 +1316,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
 
     if kind == NodeKind.Closure {
         emit_closure(node)
+        publish_result_tid(node)
         return
     }
 
@@ -1275,6 +1345,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             expr_result_str = "blink_channel_new(16)"
         }
         expr_result_type = CT_CHANNEL
+        publish_result_tid(node)
         return
     }
 
@@ -1290,6 +1361,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             diag_error("FileNotFound", FILE_NOT_FOUND, "#embed file not found: {full_path}", node_line(node), node_col(node), "")
             expr_result_str = "\"\""
             expr_result_type = CT_STRING
+            publish_result_tid(node)
             return
         }
         let content = read_file(full_path)
@@ -1310,6 +1382,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         emit_line(sb.to_str())
         expr_result_str = var_name
         expr_result_type = CT_STRING
+        publish_result_tid(node)
         return
     }
 
@@ -1321,6 +1394,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
 
     expr_result_str = "0"
     expr_result_type = CT_VOID
+    publish_result_tid(node)
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -1338,6 +1412,7 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
         emit_line("/* handler for unknown effect: {effect_name} */")
         expr_result_str = "0"
         expr_result_type = CT_VOID
+        publish_result_tid(node)
         return
     }
 
@@ -1638,6 +1713,7 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
     }
     expr_result_str = vt_ptr
     expr_result_type = CT_HANDLER
+    publish_result_tid(node)
     cg_handler_vtable_type = vtable_type
     cg_handler_vtable_field = vtable_field
     cg_handler_is_user_effect = is_user_effect
@@ -1858,27 +1934,35 @@ fn emit_await_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     if inner_type == CT_INT {
         expr_result_str = "(int64_t)(intptr_t){tmp}"
         expr_result_type = CT_INT
+        publish_result_tid(node)
     } else if inner_type == CT_STRING {
         expr_result_str = "(const char*){tmp}"
         expr_result_type = CT_STRING
+        publish_result_tid(node)
     } else if inner_type == CT_FLOAT {
         expr_result_str = "*(double*){tmp}"
         expr_result_type = CT_FLOAT
+        publish_result_tid(node)
     } else if inner_type == CT_BOOL {
         expr_result_str = "(int)(intptr_t){tmp}"
         expr_result_type = CT_BOOL
+        publish_result_tid(node)
     } else if inner_type == CT_LIST {
         expr_result_str = "(blink_list*){tmp}"
         expr_result_type = CT_LIST
+        publish_result_tid(node)
     } else if inner_type == CT_MAP {
         expr_result_str = "(blink_map*){tmp}"
         expr_result_type = CT_MAP
+        publish_result_tid(node)
     } else if inner_type == CT_SET {
         expr_result_str = "(blink_set*){tmp}"
         expr_result_type = CT_SET
+        publish_result_tid(node)
     } else if inner_type == CT_BYTES {
         expr_result_str = "(blink_bytes*){tmp}"
         expr_result_type = CT_BYTES
+        publish_result_tid(node)
     } else if inner_type == CT_OPTION {
         let inner2 = get_var_handle_inner2(handle_str)
         let opt_c_type = if inner2 >= 0 {
@@ -1895,6 +1979,7 @@ fn emit_await_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         emit_line("{opt_c_type} {unboxed} = *({opt_c_type}*){tmp};")
         expr_result_str = unboxed
         expr_result_type = CT_OPTION
+        publish_result_tid(node)
         expr_option_inner = if get_var_handle_inner2(handle_str) >= 0 { get_var_handle_inner2(handle_str) } else { CT_INT }
     } else if inner_type == CT_RESULT {
         let inner2 = get_var_handle_inner2(handle_str)
@@ -1905,6 +1990,7 @@ fn emit_await_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         emit_line("{res_c_type} {unboxed} = *({res_c_type}*){tmp};")
         expr_result_str = unboxed
         expr_result_type = CT_RESULT
+        publish_result_tid(node)
         expr_result_ok_type = ok_ct
         expr_result_err_type = err_ct
     } else if inner_type == CT_STRUCT && handle_sname != "" && is_struct_type(handle_sname) != 0 {
@@ -1913,10 +1999,12 @@ fn emit_await_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         emit_line("{struct_c} {unboxed} = *({struct_c}*){tmp};")
         expr_result_str = unboxed
         expr_result_type = CT_STRUCT
+        publish_result_tid(node)
         set_var_struct(unboxed, handle_sname)
     } else {
         expr_result_str = "(int64_t)(intptr_t){tmp}"
         expr_result_type = CT_INT
+        publish_result_tid(node)
     }
 }
 
@@ -1947,6 +2035,7 @@ fn emit_async_scope(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     emit_line("blink_list_free({list_name});")
     expr_result_str = saved_str
     expr_result_type = saved_type
+    publish_result_tid(node)
 }
 
 // Mirrors codegen_stmt.bl:strip_outer_parens. Duplicated rather than
@@ -2003,10 +2092,12 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
                 emit_line("{inner_c} {val_tmp} = {tmp}.tag == 1 ? {tmp}.value : {right_str};")
                 set_var(val_tmp, opt_inner, 0)
                 expr_result_type = opt_inner
+                publish_result_tid(node)
             } else {
                 emit_line("{c_type_c_name(opt_inner_s)} {val_tmp} = {tmp}.tag == 1 ? *{tmp}.value : {right_str};")
                 set_var_struct(val_tmp, opt_inner_s)
                 expr_result_type = right_type
+                publish_result_tid(node)
             }
             expr_result_str = val_tmp
         } else if opt_inner == CT_LIST {
@@ -2026,6 +2117,7 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
             }
             expr_result_str = val_tmp
             expr_result_type = CT_LIST
+            publish_result_tid(node)
         } else if opt_inner == CT_SET {
             // The generic opt_inner>=0 fallback below mints no temp
             // var — it returns a bare ternary expression string — so there is
@@ -2057,15 +2149,18 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
             }
             expr_result_str = val_tmp
             expr_result_type = CT_SET
+            publish_result_tid(node)
         } else if opt_inner >= 0 {
             let opt_c = option_c_type(opt_inner)
             emit_line("{opt_c} {tmp} = {left_str};")
             expr_result_str = "({tmp}.tag == 1 ? {tmp}.value : {right_str})"
             expr_result_type = right_type
+            publish_result_tid(node)
         } else {
             emit_line("const int64_t {tmp} = (int64_t){left_str};")
             expr_result_str = "({tmp}.tag == 1 ? {tmp}.value : {right_str})"
             expr_result_type = right_type
+            publish_result_tid(node)
         }
         return
     }
@@ -2115,9 +2210,11 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
             }
             expr_result_str = sc_tmp
             expr_result_type = CT_BOOL
+            publish_result_tid(node)
         } else {
             expr_result_str = "({left_str} {op} {right_str})"
             expr_result_type = CT_BOOL
+            publish_result_tid(node)
         }
         return
     }
@@ -2138,6 +2235,7 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
             expr_result_str = "({ltmp}.tag != {rtmp}.tag || ({ltmp}.tag != 0 && {ltmp}.value != {rtmp}.value))"
         }
         expr_result_type = CT_BOOL
+        publish_result_tid(node)
         return
     }
 
@@ -2145,17 +2243,20 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
         let eq_fn = c_fn_name("str_eq")
         expr_result_str = "{eq_fn}({left_str}, {right_str})"
         expr_result_type = CT_BOOL
+        publish_result_tid(node)
         return
     }
     if op == "!=" && left_type == CT_STRING && right_type == CT_STRING {
         let eq_fn = c_fn_name("str_eq")
         expr_result_str = "(!{eq_fn}({left_str}, {right_str}))"
         expr_result_type = CT_BOOL
+        publish_result_tid(node)
         return
     }
     if (op == "<" || op == "<=" || op == ">" || op == ">=") && left_type == CT_STRING && right_type == CT_STRING {
         expr_result_str = "(blink_str_cmp({left_str}, {right_str}) {op} 0)"
         expr_result_type = CT_BOOL
+        publish_result_tid(node)
         return
     }
     if op == "<<" || op == ">>" {
@@ -2179,6 +2280,7 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
             expr_result_str = val
         }
         expr_result_type = left_type
+        publish_result_tid(node)
         return
     }
 
@@ -2220,6 +2322,7 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
         }
         expr_result_str = result_tmp
         expr_result_type = left_type
+        publish_result_tid(node)
         return
     }
 
@@ -2249,6 +2352,7 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
         emit_line("{lc} {result_tmp} = {lhs_tmp} {op} {rhs_tmp};")
         expr_result_str = result_tmp
         expr_result_type = left_type
+        publish_result_tid(node)
         return
     }
 
@@ -2263,6 +2367,7 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
         if left_type == CT_INSTANT || left_type == CT_DURATION {
             expr_result_str = "(({left_str}).nanos {op} ({right_str}).nanos)"
             expr_result_type = CT_BOOL
+            publish_result_tid(node)
             return
         }
         // Bytes: runtime structural comparison.
@@ -2275,6 +2380,7 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
                 expr_result_str = "(blink_bytes_cmp({left_str}, {right_str}) {op} 0)"
             }
             expr_result_type = CT_BOOL
+            publish_result_tid(node)
             return
         }
         // Struct, or data-enum carrying a custom Eq/Ord: route to the eq/cmp
@@ -2288,6 +2394,7 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
                 if eq_call != "" {
                     expr_result_str = if op == "==" { eq_call } else { "(!{eq_call})" }
                     expr_result_type = CT_BOOL
+                    publish_result_tid(node)
                     return
                 }
             } else {
@@ -2307,6 +2414,7 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
                         expr_result_str = "({ct} != {ord_t}_Less)"
                     }
                     expr_result_type = CT_BOOL
+                    publish_result_tid(node)
                     return
                 }
             }
@@ -2316,8 +2424,10 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
     expr_result_str = "({left_str} {op} {right_str})"
     if op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" {
         expr_result_type = CT_BOOL
+        publish_result_tid(node)
     } else {
         expr_result_type = left_type
+        publish_result_tid(node)
     }
 }
 
@@ -2404,6 +2514,7 @@ pub fn emit_skip_intrinsic(reason_arg: Int) ! Codegen.Emit, Codegen.Register, Co
     emit_line("return;")
     expr_result_str = ""
     expr_result_type = CT_VOID
+    publish_result_tid(-1)
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -2434,16 +2545,20 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
             }
             expr_result_str = result_tmp
             expr_result_type = operand_type
+            publish_result_tid(node)
             return
         }
         expr_result_str = "(-{operand_str})"
         expr_result_type = operand_type
+        publish_result_tid(node)
     } else if op == "!" {
         expr_result_str = "(!{operand_str})"
         expr_result_type = CT_BOOL
+        publish_result_tid(node)
     } else if op == "~" {
         expr_result_str = "(~({operand_str}))"
         expr_result_type = operand_type
+        publish_result_tid(node)
     } else if op == "?" {
         let tmp = fresh_temp("__res")
         if operand_type == CT_RESULT {
@@ -2493,6 +2608,7 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 diag_set_last_fix("replace", "-> Result[T, E]")
                 expr_result_str = "0"
                 expr_result_type = CT_INT
+                publish_result_tid(node)
             } else {
                 let rok = expr_result_ok_type
                 let rerr = expr_result_err_type
@@ -2578,15 +2694,18 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                     if inner_c.ends_with("*") {
                         expr_result_str = "{tmp}.value"
                         expr_result_type = opt_inner
+                        publish_result_tid(node)
                     } else {
                         expr_result_str = "(*{tmp}.value)"
                         expr_result_type = CT_INT
+                        publish_result_tid(node)
                         set_var_struct(expr_result_str, opt_inner_s)
                     }
                 } else {
                     let inner = if opt_inner >= 0 { opt_inner } else { CT_INT }
                     expr_result_str = "{tmp}.value"
                     expr_result_type = inner
+                    publish_result_tid(node)
                 }
                 expr_option_inner = -1
                 expr_option_inner_struct = ""
@@ -2595,6 +2714,7 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 diag_set_last_fix("replace", "-> Option[T]")
                 expr_result_str = "0"
                 expr_result_type = CT_INT
+                publish_result_tid(node)
             } else {
                 let opt_inner = expr_option_inner
                 let opt_inner_s = expr_option_inner_struct
@@ -2636,15 +2756,18 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                     if inner_c.ends_with("*") {
                         expr_result_str = "{tmp}.value"
                         expr_result_type = opt_inner
+                        publish_result_tid(node)
                     } else {
                         expr_result_str = "(*{tmp}.value)"
                         expr_result_type = CT_INT
+                        publish_result_tid(node)
                         set_var_struct(expr_result_str, opt_inner_s)
                     }
                 } else {
                     let inner = if opt_inner >= 0 { opt_inner } else { CT_INT }
                     expr_result_str = "{tmp}.value"
                     expr_result_type = inner
+                    publish_result_tid(node)
                 }
                 expr_option_inner = -1
                 expr_option_inner_struct = ""
@@ -2653,10 +2776,12 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
             diag_error_at("QuestionMarkInvalidOperand", QM_INVALID_OPERAND, "'?' requires a Result or Option value", node, "")
             expr_result_str = "0"
             expr_result_type = CT_INT
+            publish_result_tid(node)
         }
     } else {
         expr_result_str = "({op}{operand_str})"
         expr_result_type = operand_type
+        publish_result_tid(node)
     }
 }
 
@@ -3481,6 +3606,7 @@ fn emit_generic_struct_ret_temp(mangled: Str, struct_name: Str, temp_prefix: Str
     set_var_struct(g_tmp, struct_name)
     expr_result_str = g_tmp
     expr_result_type = CT_STRUCT
+    publish_result_tid(-1)
 }
 
 // Slot-aligned resolver for building a mono-args CSV element-by-element off a
@@ -4034,6 +4160,7 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str) -> Int 
     }
     expr_result_str = "{c_fn_name(mangled)}({call_args})"
     expr_result_type = ret_type
+    publish_result_tid(node)
     // Always publish the map value/key struct globals (empty for a non-map or a
     // scalar-valued map) so a struct-valued map call never leaks its stem into the
     // NEXT map binding — mirrors the plain-fn path's unconditional struct resets
@@ -4201,6 +4328,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             }
             expr_result_str = ""
             expr_result_type = CT_VOID
+            publish_result_tid(node)
             return
         }
 
@@ -4209,6 +4337,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             if cg_debug_mode == 0 {
                 expr_result_str = ""
                 expr_result_type = CT_VOID
+                publish_result_tid(node)
                 return
             }
             if args_sl != -1 && sublist_length(args_sl) > 0 {
@@ -4233,6 +4362,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             }
             expr_result_str = ""
             expr_result_type = CT_VOID
+            publish_result_tid(node)
             return
         }
 
@@ -4456,6 +4586,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             }
             expr_result_str = ""
             expr_result_type = CT_VOID
+            publish_result_tid(node)
             return
         }
 
@@ -4535,6 +4666,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             }
             expr_result_str = ""
             expr_result_type = CT_VOID
+            publish_result_tid(node)
             return
         }
 
@@ -4548,6 +4680,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             if t_args != -1 && sublist_length(t_args) > 0 {
                 emit_expr(sublist_get(t_args, 0))
                 expr_result_type = CT_INT
+                publish_result_tid(node)
                 return
             }
         }
@@ -4590,6 +4723,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             init_str = init_str.concat("}")
             expr_result_str = init_str
             expr_result_type = CT_STRUCT
+            publish_result_tid(node)
             set_var_struct(init_str, sname)
             return
         }
@@ -4656,6 +4790,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     let opt_type = struct_option_c_type(transparent_enum)
                     expr_result_str = "({opt_type})\{.tag = 1, .value = {inner_str}}"
                     expr_result_type = CT_OPTION
+                    publish_result_tid(node)
                     expr_option_inner = inner_type
                     expr_option_inner_struct = transparent_enum
                     return
@@ -4696,6 +4831,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                         emit_line("*{heap_tmp} = {inner_str};")
                         expr_result_str = "({opt_type})\{.tag = 1, .value = (void*){heap_tmp}}"
                         expr_result_type = CT_OPTION
+                        publish_result_tid(node)
                         expr_option_inner = CT_PTR
                         // Erased with the value, not left behind. The two cells are read by
                         // different consumers — a `let` inside the handler body spells its
@@ -4713,6 +4849,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                         emit_line("*{box_tmp} = {inner_str};")
                         expr_result_str = "({opt_type})\{.tag = 1, .value = {box_tmp}}"
                         expr_result_type = CT_OPTION
+                        publish_result_tid(node)
                         expr_option_inner = inner_type
                         expr_option_inner_struct = inner_s
                     }
@@ -4774,6 +4911,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                         expr_result_str = "({opt_type})\{.tag = 1, .value = {box_tmp}}"
                     }
                     expr_result_type = CT_OPTION
+                    publish_result_tid(node)
                     expr_option_inner = inner_type
                     expr_option_inner_struct = compound_name
                     if inner_type == CT_MAP {
@@ -4801,6 +4939,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     let opt_type = option_c_type(inner_type)
                     expr_result_str = "({opt_type})\{.tag = 1, .value = {inner_str}}"
                     expr_result_type = CT_OPTION
+                    publish_result_tid(node)
                     expr_option_inner = inner_type
                     expr_option_inner_struct = ""
                 }
@@ -5030,6 +5169,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     let res_type = result_c_type_mixed(ok_type, err_type, ok_s, err_s)
                     expr_result_str = "({res_type})\{.tag = 1, .err = {err_str}}"
                     expr_result_type = CT_RESULT
+                    publish_result_tid(node)
                     expr_result_ok_type = ok_type
                     expr_result_err_type = err_type
                     expr_result_ok_struct = ok_s
@@ -5039,6 +5179,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     let res_type = result_c_type(ok_type, err_type)
                     expr_result_str = "({res_type})\{.tag = 1, .err = {err_str}}"
                     expr_result_type = CT_RESULT
+                    publish_result_tid(node)
                     expr_result_ok_type = ok_type
                     expr_result_err_type = err_type
                     expr_result_ok_struct = ""
@@ -5052,6 +5193,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             let kops = kops_table_name(ec.type_const, ec.struct_name)
             expr_result_str = "blink_map_new(&{kops})"
             expr_result_type = CT_MAP
+            publish_result_tid(node)
             // A bare `Map()` literal carries no key/value type of its own -- the
             // binding's annotation branch (emit_let_binding's CT_MAP arm) derives
             // and stamps the real types separately. Without resetting these here,
@@ -5071,6 +5213,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             let kops = kops_table_name(ec.type_const, ec.struct_name)
             expr_result_str = "blink_set_new(&{kops})"
             expr_result_type = CT_SET
+            publish_result_tid(node)
             // A fresh set carries no element type via the global; the let-block
             // records it from the annotation. Clear so a stale value from a
             // prior expression can't leak into an unannotated `let s = Set()`.
@@ -5081,6 +5224,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         if fn_name == "Bytes" {
             expr_result_str = "blink_bytes_new()"
             expr_result_type = CT_BYTES
+            publish_result_tid(node)
             return
         }
         if fn_name == "StringBuilder" {
@@ -5093,6 +5237,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 expr_result_str = "blink_sb_new()"
             }
             expr_result_type = CT_STRINGBUILDER
+            publish_result_tid(node)
             return
         }
         if fn_name == "Channel" {
@@ -5105,18 +5250,21 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 expr_result_str = "blink_channel_new(16)"
             }
             expr_result_type = CT_CHANNEL
+            publish_result_tid(node)
             return
         }
         if fn_name == "alloc_ptr" {
             let inner_c = resolve_ptr_inner_c()
             expr_result_str = "({inner_c}*)malloc(sizeof({inner_c}))"
             expr_result_type = CT_PTR
+            publish_result_tid(node)
             return
         }
         if fn_name == "null_ptr" {
             let inner_c = resolve_ptr_inner_c()
             expr_result_str = "(({inner_c}*)NULL)"
             expr_result_type = CT_PTR
+            publish_result_tid(node)
             return
         }
         // Check if this is a closure-typed variable
@@ -5165,6 +5313,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             if ret_ct_tid >= 0 {
                 expr_result_str = "(({closure_sig}){cls_expr}->fn_ptr)({args_str})"
                 expr_result_type = ret_ct_tid
+                publish_result_tid(node)
                 return
             }
             if ret_part.starts_with("blink_") {
@@ -5181,6 +5330,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             }
             expr_result_str = "(({closure_sig}){cls_expr}->fn_ptr)({args_str})"
             expr_result_type = closure_ret_ct(ret_part)
+            publish_result_tid(node)
             return
         }
         let args_sl = node_args(node)
@@ -5239,9 +5389,11 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             emit_line("/* undefined: {fn_name} */")
             expr_result_str = "0"
             expr_result_type = CT_INT
+            publish_result_tid(node)
             return
         }
         expr_result_type = get_fn_ret(fn_name)
+        publish_result_tid(node)
         if expr_result_type == CT_VOID || expr_result_type == CT_STRUCT || expr_result_type == CT_ENUM {
             let fn_sret = get_fn_ret_struct(fn_name)
             if fn_sret != "" {
@@ -5251,6 +5403,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 set_var_struct(s_tmp, fn_sret)
                 expr_result_str = s_tmp
                 expr_result_type = CT_STRUCT
+                publish_result_tid(node)
             } else {
                 expr_result_str = "{c_fn_name(fn_name)}({args_str})"
             }
@@ -5383,6 +5536,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                         expr_list_elem_type = -1
                         expr_list_elem_struct = ""
                         expr_result_type = get_impl_method_ret_q(type_name, owner_trait, method)
+                        publish_result_tid(node)
                         return
                     }
                 }
@@ -5412,6 +5566,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         let ret_ct_tid = closure_ret_direct_ct(node)
         if ret_ct_tid >= 0 {
             expr_result_type = ret_ct_tid
+            publish_result_tid(node)
             return
         }
         let ret_part = closure_sig_ret_part(func_cls_sig)
@@ -5426,9 +5581,11 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 reseat_from_closure_ret_tag(sname, tmp)
             } else {
                 expr_result_type = CT_STRUCT
+                publish_result_tid(node)
             }
         } else {
             expr_result_type = closure_ret_ct(ret_part)
+            publish_result_tid(node)
         }
     } else {
         if args_sl != -1 {
@@ -5444,6 +5601,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         }
         expr_result_str = "{func_str}({args_str})"
         expr_result_type = CT_VOID
+        publish_result_tid(node)
     }
 }
 
@@ -5632,6 +5790,7 @@ fn emit_interp_string(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
     if parts_sl == -1 {
         expr_result_str = "\"\""
         expr_result_type = CT_STRING
+        publish_result_tid(node)
         return
     }
 
@@ -5656,6 +5815,7 @@ fn emit_interp_string(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
         }
         expr_result_str = "\"".concat(concat_str).concat("\"")
         expr_result_type = CT_STRING
+        publish_result_tid(node)
         return
     }
 
@@ -5695,6 +5855,7 @@ fn emit_interp_string(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
         expr_result_str = "blink_str_format(\"".concat(fmt).concat("\")")
     }
     expr_result_type = CT_STRING
+    publish_result_tid(node)
 }
 
 fn is_raw_call(node: Int) -> Int {
@@ -5774,6 +5935,7 @@ pub fn emit_template_construction(node: Int) ! Codegen.Emit, Codegen.Register, C
         emit_line("blink_list_push({tpl}->parts, (void*)\"\");")
         expr_result_str = tpl
         expr_result_type = CT_TEMPLATE
+        publish_result_tid(node)
         return
     }
 
@@ -5834,6 +5996,7 @@ pub fn emit_template_construction(node: Int) ! Codegen.Emit, Codegen.Register, C
 
     expr_result_str = tpl
     expr_result_type = CT_TEMPLATE
+    publish_result_tid(node)
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -5945,6 +6108,7 @@ fn emit_list_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
     }
     expr_result_str = tmp
     expr_result_type = CT_LIST
+    publish_result_tid(node)
 }
 
 fn infer_struct_type_args(type_name: Str, field_types: List[Int], field_structs: List[Str]) -> Option[Str] {
@@ -6685,6 +6849,7 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
             init_str = init_str.concat("}")
             expr_result_str = init_str
             expr_result_type = CT_STRUCT
+            publish_result_tid(node)
             set_var_struct(init_str, enum_type_name)
             return
         }
@@ -7113,6 +7278,7 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     }
     expr_result_str = tmp
     expr_result_type = CT_STRUCT
+    publish_result_tid(node)
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -7121,6 +7287,7 @@ fn emit_tuple_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
     if elems_sl == -1 {
         expr_result_str = "0"
         expr_result_type = CT_VOID
+        publish_result_tid(node)
         return
     }
     let arity = sublist_length(elems_sl)
@@ -7359,4 +7526,5 @@ fn emit_tuple_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
     set_var_struct(tmp, tup_name)
     expr_result_str = tmp
     expr_result_type = CT_STRUCT
+    publish_result_tid(node)
 }
