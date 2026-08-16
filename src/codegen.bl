@@ -93,7 +93,7 @@ import codegen_stmt.{
     reset_typedef_emitted_stmt,
     register_struct_instance_from_tid, register_enum_instance_from_tid, register_carrier_struct_instance_leaves,
 }
-import typecheck.{sanitize_test_name, tc_classify_mono_conflicts, ty_divergence_dump, tc_lookup_node_tid, c_type_from_tid, ctype_probe_at}
+import typecheck.{sanitize_test_name, tc_classify_mono_conflicts, ty_divergence_dump, tc_lookup_node_tid, c_type_from_tid, ctype_probe_at, tc_variant_field_is_selfrec_tuple}
 import codegen_derive.{
     deser_externs_emitted, emit_derive_fn_defs, emit_derive_fn_defs_from,
     derive_counts_now, emit_kops_adapters_late, emit_kops_adapters_from, emit_kops_forward_decls_from,
@@ -1261,17 +1261,31 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             }
             if is_enum != 0 {
                 // Flush each variant payload's carrier typedef before this enum.
+                // A tuple field whose elements reference THIS enum by value
+                // (`Pair(p: (Box, Box))`) forward-references the enum typedef, so
+                // its carrier must come AFTER emit_enum_typedef (which boxes the
+                // field to int64_t) — defer it, mirroring the mono path.
+                let e_nm = node_name(td)
                 let etparams = node_type_params(td)
                 let e_is_generic = etparams != -1 && sublist_length(etparams) > 0
+                let mut deferred_selfrec_tuples: List[Int] = []
                 if !e_is_generic && td_flds != -1 {
                     let mut vanns: List[Int] = []
                     let mut vi = 0
                     while vi < sublist_length(td_flds) {
-                        let vflds = node_fields(sublist_get(td_flds, vi))
+                        let vnode = sublist_get(td_flds, vi)
+                        let v_nm = node_name(vnode)
+                        let vflds = node_fields(vnode)
                         if vflds != -1 {
                             let mut vfi = 0
                             while vfi < sublist_length(vflds) {
-                                vanns.push(node_value(sublist_get(vflds, vfi)))
+                                let vf = sublist_get(vflds, vfi)
+                                let vf_ann = node_value(vf)
+                                if vf_ann != -1 && node_name(vf_ann) == "Tuple" && tc_variant_field_is_selfrec_tuple(e_nm, v_nm, node_name(vf)) != 0 {
+                                    deferred_selfrec_tuples.push(vf_ann)
+                                } else {
+                                    vanns.push(vf_ann)
+                                }
                                 vfi = vfi + 1
                             }
                         }
@@ -1280,6 +1294,14 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                     preflush_field_carrier_typedefs(vanns)
                 }
                 emit_enum_typedef(td)
+                let mut dt = 0
+                while dt < deferred_selfrec_tuples.len() {
+                    let dann = deferred_selfrec_tuples.get(dt).unwrap()
+                    let mark = emitted_tuple_entries.len()
+                    let _dtup = resolve_tuple_ann(dann, -1, [])
+                    emit_tuple_types_from(mark)
+                    dt = dt + 1
+                }
             } else {
                 // Flush each field's carrier typedef before this struct.
                 if td_flds != -1 {
