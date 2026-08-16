@@ -1,0 +1,118 @@
+// The Return arm of tc_check_body walked the returned value's body ONLY when it
+// was a StructLit, so `return handler E { ... }` and `return fn() { ... }` (a
+// closure) skipped their method/closure bodies and the type errors inside them
+// went unreported. This is the exact tail-vs-return asymmetry that produced the
+// bare-tail-handler bug: the ExprStmt (tail) gate already re-dispatches
+// is_block_bearing / MethodCall / Call / StructLit / Closure / HandlerExpr into
+// their body walk, but the Return gate only listed StructLit. A returned value
+// leaves the function exactly like a tail value, so the two gates must walk the
+// same kinds. The fix routes both through a shared predicate so they cannot
+// drift again. Sibling of the tail handler walk (fttkpk) and the tail closure
+// walk that added Closure to the ExprStmt gate.
+
+import compile_test_helpers
+
+fn src_return_handler_bad() -> Str {
+    #"effect E {
+    effect Op {
+        fn op() -> Int
+    }
+}
+
+fn make() -> Handler[E] {
+    return handler E {
+        fn op() -> Int { "notint" }
+    }
+}
+
+fn main() {
+    let _ = make()
+}
+"#
+}
+
+test "type error in a returned handler's method body is reported" {
+    compile_test_helpers.expect_compile_error(src_return_handler_bad(), "5tfn7m_ret_handler", "return value type Str does not match")
+}
+
+fn src_return_closure_bad() -> Str {
+    #"fn make() -> fn(Int) -> Int {
+    return fn(_x: Int) -> Int { "notint" }
+}
+
+fn main() {
+    let _ = make()
+}
+"#
+}
+
+test "type error in a returned closure's body is reported (sibling of the handler case)" {
+    compile_test_helpers.expect_compile_error(src_return_closure_bad(), "5tfn7m_ret_closure", "return value type Str does not match")
+}
+
+fn src_return_handler_once() -> Str {
+    #"effect E {
+    effect Op {
+        fn op() -> Int
+    }
+}
+
+fn make() -> Handler[E] {
+    return handler E {
+        fn op() -> Int { "notint" }
+    }
+}
+
+fn main() {
+    let _ = make()
+}
+"#
+}
+
+test "returned handler body error is reported exactly once (no double-walk)" {
+    let output = compile_test_helpers.compile_and_capture(src_return_handler_once(), "5tfn7m_ret_once")
+    compile_test_helpers.expect_contains(output, "return value type Str does not match", "returned handler body error")
+    // The Return arm walks the value once; infer_type does not walk handler/closure
+    // bodies, so exactly one diagnostic must surface.
+    assert_eq(count_occurrences(output, "return value type Str does not match"), 1)
+}
+
+fn src_return_struct_ok() -> Str {
+    #"import std.io
+
+type Box { v: Int }
+
+fn make(n: Int) -> Box {
+    return Box {
+        v: match n {
+            0 => 10
+            _ => 20
+        }
+    }
+}
+
+fn main() {
+    io.println("v {make(0).v}")
+}
+"#
+}
+
+test "returned struct-literal field still walks (no regression from the broadened gate)" {
+    let r = compile_test_helpers.compile_and_run(src_return_struct_ok(), "5tfn7m_ret_struct")
+    if !r.out.contains("v 10") {
+        compile_test_helpers.expect_contains(r.out, "v 10", "returned struct-lit field walk — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("v 10"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn count_occurrences(haystack: Str, needle: Str) -> Int {
+    let mut count = 0
+    let mut rest = haystack
+    while rest.contains(needle) {
+        let idx = rest.index_of(needle)
+        count = count + 1
+        rest = rest.slice(idx + needle.len(), rest.len())
+    }
+    count
+}

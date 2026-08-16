@@ -11937,6 +11937,19 @@ fn tc_check_mutating_nested(n: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     }
 }
 
+// A statement-position value (the tail of a block, or the operand of an explicit
+// `return`) leaves the function the same way whether it is a bare ExprStmt tail
+// or a `return`, so both sites re-dispatch the SAME node kinds into tc_check_body:
+// infer_type types only a value's signature/shape, never the bodies nested inside
+// a closure, a handler's methods, a call's closure arguments, or a struct
+// literal's block-valued fields. Each kind here carries such a body. Keeping the
+// two gates on one predicate stops them from drifting — the tail gate once carried
+// Closure/HandlerExpr while the return gate carried only StructLit, and returned
+// handler/closure bodies went unwalked as a result.
+fn tc_stmt_value_walks_body(vk: Int) -> Bool {
+    is_block_bearing(vk) || vk == NodeKind.MethodCall || vk == NodeKind.Call || vk == NodeKind.StructLit || vk == NodeKind.Closure || vk == NodeKind.HandlerExpr
+}
+
 fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return }
     let kind = node_kind(node)
@@ -12477,8 +12490,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // parse_primary expression whose method bodies infer_type does not walk, so its body
             // diagnostics are skipped and node tids unpublished unless it reaches the HandlerExpr
             // arm here. A handler consumed by `with` routes through the WithBlock arm instead.
-            let vk = node_kind(val)
-            if is_block_bearing(vk) || vk == NodeKind.MethodCall || vk == NodeKind.Call || vk == NodeKind.StructLit || vk == NodeKind.Closure || vk == NodeKind.HandlerExpr {
+            if tc_stmt_value_walks_body(node_kind(val)) {
                 tc_check_body(val)
             }
         }
@@ -12497,11 +12509,12 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // EARLY return inside an `if` is not the block's last statement, so the tail
             // check never visits it.
             tc_check_returned_value(val_t, node)
-            // A returned struct literal is walked the same way the ExprStmt arm walks a
-            // tail struct literal: infer_type does not type a non-generic struct's field
-            // values, so a binder-valued match hidden in a field stays TYPE_UNKNOWN unless
-            // the StructLit arm's field walk reaches it here.
-            if node_kind(val) == NodeKind.StructLit { tc_check_body(val) }
+            // A returned value is walked the same way the ExprStmt arm walks a tail value,
+            // through the shared tc_stmt_value_walks_body predicate: infer_type types only a
+            // value's shape, never the bodies nested inside it (a struct literal's block-valued
+            // fields, a returned closure's or handler's method bodies, a call's closure args),
+            // so those stay unwalked unless this walk reaches them.
+            if tc_stmt_value_walks_body(node_kind(val)) { tc_check_body(val) }
         } else {
             if tc_current_fn_ret != TYPE_VOID && tc_current_fn_ret != TYPE_UNKNOWN {
                 tc_error_at("function '{tc_current_fn_name}' returns {type_to_str(tc_current_fn_ret)} but bare 'return' has no value", node)
