@@ -3547,7 +3547,57 @@ fn struct_field_type_ann(td_flds: Int, fname: Str) -> Int {
 // binder here. That fallback can still SPELL a type-param binder, which is why the
 // cg_let_target_ann half of the retarget is gated on value_ctx_ann_spellable below.
 fn field_ann_at_instance(td_flds: Int, td_tparams: Int, sname: Str, fname: Str) -> Int {
-    let f_ann = struct_field_type_ann(td_flds, fname)
+    descend_field_ann(struct_field_type_ann(td_flds, fname), td_tparams, sname)
+}
+
+// Emit the fi-th positional argument of a data-enum variant constructor with the
+// value-context annotation retargeted to that variant field's declared type, so a
+// compound arg (`V(Result[P, Int])` → the `Ok(...)` value) adopts the declared
+// payload type instead of reverse-inferring its own slots (err defaulted to str,
+// ok to int) and minting a carrier that mismatches the declared field. Returns the
+// emitted C expression. Shared by the bare-Call (`V(..)`) and qualified (`E.V(..)`)
+// positional ctor paths; the struct-style path retargets via field_ann_at_instance
+// directly. Mirrors the field-annotation retarget's channel discipline exactly:
+// cg_expect_arg_ann unconditionally, cg_let_target_ann only when spellable.
+@allow(UnrestoredMutation, IncompleteStateRestore)
+pub fn emit_variant_positional_arg(arg_node: Int, enum_name: Str, variant_name: Str, fi: Int) -> Str ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    let enum_td = find_type_def_node(enum_name)
+    let enum_tparams = if enum_td != -1 { node_type_params(enum_td) } else { -1 }
+    let mut variant_flds = -1
+    if enum_td != -1 {
+        let variants_sl = node_fields(enum_td)
+        if variants_sl != -1 {
+            let mut vj = 0
+            while vj < sublist_length(variants_sl) {
+                let vnode = sublist_get(variants_sl, vj)
+                if node_name(vnode) == variant_name {
+                    variant_flds = node_fields(vnode)
+                    break
+                }
+                vj = vj + 1
+            }
+        }
+    }
+    let vf_node = if variant_flds != -1 && fi < sublist_length(variant_flds) { sublist_get(variant_flds, fi) } else { -1 }
+    let vf_ann = if vf_node != -1 { descend_field_ann(node_value(vf_node), enum_tparams, enum_name) } else { -1 }
+    let saved_arg_ann = cg_expect_arg_ann
+    let saved_let_ann = cg_let_target_ann
+    let saved_fa_ctx = cg_fa_receiver_ctx
+    cg_expect_arg_ann = vf_ann
+    if value_ctx_ann_spellable(vf_ann) != 0 { cg_let_target_ann = vf_ann }
+    cg_fa_receiver_ctx = false
+    emit_expr(arg_node)
+    cg_fa_receiver_ctx = saved_fa_ctx
+    cg_expect_arg_ann = saved_arg_ann
+    cg_let_target_ann = saved_let_ann
+    expr_result_str
+}
+
+// The instance-resolved annotation for a field whose declared annotation node is
+// `f_ann` — the descent half of field_ann_at_instance, factored out so the
+// positional variant-ctor path (whose fields are indexed, not named) can reuse it
+// with an annotation node it fetched by index.
+fn descend_field_ann(f_ann: Int, td_tparams: Int, sname: Str) -> Int {
     if f_ann == -1 { return -1 }
     if td_tparams == -1 { return f_ann }
     let nparams = sublist_length(td_tparams)
@@ -4826,8 +4876,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     }
                     let field_name = get_variant_field_name(vidx, fi).unwrap()
                     let field_type = get_variant_field_type_str(vidx, fi).unwrap()
-                    emit_expr(sublist_get(args_sl, fi))
-                    let arg_str = expr_result_str
+                    let arg_str = emit_variant_positional_arg(sublist_get(args_sl, fi), variant_enum, fn_name, fi)
                     if strip_generic_args(field_type) == variant_enum {
                         let box_tmp = fresh_temp("_ebox")
                         emit_line("{enum_c_name}* {box_tmp} = ({enum_c_name}*)blink_alloc(sizeof({enum_c_name}));")
