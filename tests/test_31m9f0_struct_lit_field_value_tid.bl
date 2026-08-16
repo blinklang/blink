@@ -1,0 +1,59 @@
+// A MONOMORPHIC struct literal's field VALUES must reach type inference so their node tids
+// publish — otherwise codegen mints temps from those values with no authoritative type. The
+// generic instance path infers field values in its typevar-binds loop, but a non-generic struct
+// returns before that loop, so its field values were previously never inferred.
+//
+// Each value is inferred under the DECLARED field type as construction hint, mirroring an
+// annotation (`let t: Tree = Leaf { .. }`): a bare variant-named value resolves to the field's
+// enum instead of tripping ambiguous-construction, and an as-yet-unpinned empty container adopts
+// the declared element type rather than staying an under-determined metavar.
+
+import compile_test_helpers
+
+// The original shape: a field value that mints an Option temp (`list.get(i).unwrap()`). The temp
+// now carries the call's tid; before, it was the sole tid-less structural-accessor reader class.
+test "a mono struct field value that unwraps an Option runs correctly" {
+    let mut s = "type Holder \{ n: Int, s: Str }\n\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let xs = [10, 20, 30]\n")
+    s = s.concat("    let names = [\"a\", \"b\", \"c\"]\n")
+    s = s.concat("    let h = Holder \{ n: xs.get(1).unwrap(), s: names.get(2).unwrap() }\n")
+    s = s.concat("    io.println(\"n=\{h.n} s=\{h.s}\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "31m9f0_option_field")
+    assert_eq(r.out.trim(), "n=20 s=c")
+    assert_eq(r.exit_code, 0)
+}
+
+// The declared field type disambiguates a bare variant name shared by two enums, exactly as an
+// annotation would. Without the field-type hint the value infers with no enum context and the
+// two `Leaf` declarations make it an ambiguous construction (E0519).
+test "a mono struct field's declared enum type disambiguates a bare shared variant" {
+    let mut s = "type Tree \{ Leaf \{ value: Int } }\n\n"
+    s = s.concat("type Other \{ Leaf \{ value: Int } }\n\n")
+    s = s.concat("type S \{ t: Tree }\n\n")
+    s = s.concat("fn describe(x: Tree) -> Str \{\n")
+    s = s.concat("    match x \{ Tree.Leaf \{ value } => \"leaf:\{value}\" }\n")
+    s = s.concat("}\n\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let v = S \{ t: Leaf \{ value: 7 } }\n")
+    s = s.concat("    io.println(describe(v.t))\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "31m9f0_field_hint")
+    assert_eq(r.out.trim(), "leaf:7")
+    assert_eq(r.exit_code, 0)
+}
+
+// An empty-collection field value adopts the declared element type: the field infers a metavar
+// list which is unified against `List[Int]`, so the value carries the concrete element type.
+test "a mono struct empty-list field adopts the declared element type" {
+    let mut s = "type Bag \{ xs: List[Int] }\n\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut b = Bag \{ xs: [] }\n")
+    s = s.concat("    b.xs.push(42)\n")
+    s = s.concat("    io.println(\"first=\{b.xs.get(0).unwrap()} len=\{b.xs.len()}\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "31m9f0_empty_list_field")
+    assert_eq(r.out.trim(), "first=42 len=1")
+    assert_eq(r.exit_code, 0)
+}

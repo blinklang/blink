@@ -214,22 +214,33 @@ test "a bare-ctor field under a Float-keyed annotation is untouched by the pin" 
     assert_lacks(out, "BLINK_COMPILER_BUG_", "tripwire / kops sentinel absent from the DIAGNOSTIC")
 }
 
-// ── pinned loud: the two boundaries this commit deliberately does NOT cross ──
+// ── pinned loud: the boundary this seam deliberately does NOT cross ──
 
-// Not a direct Call, so tc_call_mints_ret_only reads 0 and the value is never
-// inferred by the walk. Reaching it needs a transitive successor predicate that is
-// only half-solvable from one arm's type; half-solved is the "compiles under a
-// wrong-but-plausible mono name" failure a loud I0001 exists to prevent. Filed
-// separately.
-test "a return-only mint behind an if-arm field value is still loud" {
+// The if-arm field value is no longer loud: the monomorphic-struct field-value walk infers every
+// field value under the DECLARED field type as construction hint, so Set[Int] flows into BOTH
+// arms and each mkset()'s return-only T pins to Int through the element metavar. This is the same
+// declared-field-type authority the direct-call pin uses, now reaching through the if-expression —
+// not a half-solve from one arm's type — so it lands the correct i64 kops, not the erased string
+// default that would collide 256 and 512.
+test "a return-only mint behind an if-arm field value pins from the declared field type" {
     let mut src = "type W \{ s: Set[Int] }\n"
     src = src.concat("fn mkset[T]() -> Set[T] \{ Set() }\n")
     src = src.concat("fn main() \{\n")
     src = src.concat("    let w = W \{ s: if 1 == 1 \{ mkset() } else \{ mkset() } }\n")
-    src = src.concat("    assert_eq(w.s.len(), 0)\n")
+    src = src.concat("    w.s.insert(256)\n")
+    src = src.concat("    w.s.insert(512)\n")
+    src = src.concat("    assert_eq(w.s.len(), 2)\n")
+    src = src.concat("    assert(w.s.contains(256))\n")
+    src = src.concat("    assert(!w.s.contains(257))\n")
     src = src.concat("}\n")
-    let out = compile_test_helpers.compile_and_capture(src, "e2kjqy_ifarm_field_loud")
-    assert_has(out, "I0001", "if-arm field value stays a loud stop")
+    let out = compile_test_helpers.compile_and_capture(src, "e2kjqy_ifarm_field_pin")
+    assert_lacks(out, "I0001", "if-arm field / the declared field type pins the mint")
+    assert_lacks(out, "E0301", "if-arm field / the declared field type determines the slot")
+    let c = compile_test_helpers.compile_and_emit_c(src, "e2kjqy_ifarm_field_c")
+    assert_has(c, "blink_set_new(&blink_kops_i64)", "if-arm field / Int-element kops")
+    assert_lacks(c, "blink_kops_str", "if-arm field / must not hash an Int element as a string")
+    let r = compile_test_helpers.compile_and_run(src, "e2kjqy_ifarm_field_run")
+    assert_eq(r.exit_code, 0)
 }
 
 // tc_pin_admits_declared admits Map, Set, and generic struct/enum instances — not

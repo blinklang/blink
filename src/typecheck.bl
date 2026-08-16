@@ -3422,6 +3422,36 @@ fn tc_pin_struct_lit_field_ret_mints(stid: Int, node: Int) ! TypeCheck.Resolve, 
     }
 }
 
+// Publish a node tid for every field VALUE of a MONOMORPHIC struct literal. The generic path
+// below infers field values in its typevar-binds loop, but a non-generic struct returns before
+// that loop — so its field values would otherwise never reach infer_type and would carry no tid,
+// leaving codegen without the authoritative type for any temp it mints from them.
+//
+// Each value is inferred under the DECLARED field type as construction hint (so a bare
+// variant-named value like `Leaf {..}` resolves to the field's enum rather than tripping an
+// ambiguous-construction error) and, when the value is an as-yet-unpinned empty container
+// (`[]`/`Map()`/`None`), unified against the declared type so the node memo carries the concrete
+// element type rather than an under-determined metavar. Mirrors check_arg_value's hint+unify.
+// infer_type writes cumulative inference state that persists beyond the restored hint.
+@allow(UnrestoredMutation)
+fn tc_infer_struct_lit_field_values(stid: Int, node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let flds_sl = node_fields(node)
+    if flds_sl == -1 { return }
+    let mut fi = 0
+    while fi < sublist_length(flds_sl) {
+        let f = sublist_get(flds_sl, fi)
+        let declared = get_struct_field_tid(stid, node_name(f))
+        let saved_hint = tc_construct_hint
+        if declared != -1 && declared != TYPE_UNKNOWN { tc_construct_hint = resolve_alias_tid(declared) }
+        let vt = infer_type(node_value(f))
+        tc_construct_hint = saved_hint
+        if declared != -1 && declared != TYPE_UNKNOWN && tc_tid_has_unbound_metavar(vt) != 0 {
+            tc_unify(declared, vt)
+        }
+        fi = fi + 1
+    }
+}
+
 // LIVE reverse-inference of a struct literal's concrete instance tid. Given the bare generic tid
 // (`Box`) and the StructLit node, unify each declared generic field type (which
 // holds TyKind.Typevar for a generic field, e.g. Box.value: T) against the inferred
@@ -3444,9 +3474,15 @@ fn tc_struct_lit_instance_tid(stid: Int, sname: Str, node: Int) -> Int ! TypeChe
     tc_pin_struct_lit_field_ret_mints(stid, node)
     let bare = strip_module_qualifier(sname)
     let decl = tc_struct_decl_nodes.get(bare) ?? -1
-    if decl == -1 { return stid }
+    if decl == -1 {
+        tc_infer_struct_lit_field_values(stid, node)
+        return stid
+    }
     let tparams_sl = node_type_params(decl)
-    if tparams_sl == -1 || sublist_length(tparams_sl) == 0 { return stid }
+    if tparams_sl == -1 || sublist_length(tparams_sl) == 0 {
+        tc_infer_struct_lit_field_values(stid, node)
+        return stid
+    }
     let flds_sl = node_fields(node)
     if flds_sl == -1 { return stid }
     let mut binds: Map[Str, Int] = Map()
