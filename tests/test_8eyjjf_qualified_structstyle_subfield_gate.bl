@@ -1,0 +1,209 @@
+// A QUALIFIED struct-style enum variant pattern (E.V { x: 5 }) must gate the arm
+// on each refutable named sub-field, exactly like the BARE form (V { x: 5 }).
+// Spec §3.5: the bare and qualified struct-style spellings "emit identical code"
+// and are duals of construction. The parser emits a qualified Type.Variant { .. }
+// as an EnumPattern with int_val:1 + StructLitField children, so it hit
+// positional_payload_condition's `node_int_val(pat) != 0 -> return tag-only`
+// guard and dropped every sub-field gate; only the bare Variant { .. } reached
+// the StructPattern arm that recurses field conditions. The fix routes both
+// spellings through one struct-style field-gating loop.
+
+import compile_test_helpers
+
+fn src_scalar_gate() -> Str {
+    #"import std.io
+
+type E { V { x: Int } }
+
+fn main() {
+    let e = E.V { x: 3 }
+    match e {
+        E.V { x: 5 } => io.println("five")
+        E.V { x: y } => io.println("other={y}")
+    }
+}
+"#
+}
+
+test "qualified struct-style scalar sub-field literal gates the arm" {
+    let r = compile_test_helpers.compile_and_run(src_scalar_gate(), "8eyjjf_scalar")
+    if !r.out.contains("other=3") {
+        compile_test_helpers.expect_contains(r.out, "other=3", "qualified struct-style scalar gate — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("other=3"))
+    assert(!r.out.contains("five"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_string_gate() -> Str {
+    #"import std.io
+
+type Msg { M { tag: Str } }
+
+fn main() {
+    let m = Msg.M { tag: "no" }
+    match m {
+        Msg.M { tag: "yes" } => io.println("yes")
+        Msg.M { tag: s } => io.println("other={s}")
+    }
+}
+"#
+}
+
+test "qualified struct-style string sub-field literal gates the arm" {
+    let r = compile_test_helpers.compile_and_run(src_string_gate(), "8eyjjf_string")
+    if !r.out.contains("other=no") {
+        compile_test_helpers.expect_contains(r.out, "other=no", "qualified struct-style string gate — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("other=no"))
+    assert(!r.out.contains("yes"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_multi_field_gate() -> Str {
+    #"import std.io
+
+type Point { P { x: Int, y: Int } }
+
+fn main() {
+    let p = Point.P { x: 1, y: 9 }
+    match p {
+        Point.P { x: 1, y: 2 } => io.println("one-two")
+        Point.P { x: a, y: b } => io.println("other={a},{b}")
+    }
+}
+"#
+}
+
+test "qualified struct-style multi-field gates on any refutable field" {
+    let r = compile_test_helpers.compile_and_run(src_multi_field_gate(), "8eyjjf_multi")
+    if !r.out.contains("other=1,9") {
+        compile_test_helpers.expect_contains(r.out, "other=1,9", "qualified struct-style multi-field gate — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("other=1,9"))
+    assert(!r.out.contains("one-two"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_binder_shorthand() -> Str {
+    #"import std.io
+
+type E { V { x: Int } }
+
+fn main() {
+    let e = E.V { x: 42 }
+    match e {
+        E.V { x } => io.println("x={x}")
+    }
+}
+"#
+}
+
+test "qualified struct-style shorthand binder still binds the field" {
+    let r = compile_test_helpers.compile_and_run(src_binder_shorthand(), "8eyjjf_binder")
+    if !r.out.contains("x=42") {
+        compile_test_helpers.expect_contains(r.out, "x=42", "qualified struct-style binder — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("x=42"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_range_gate() -> Str {
+    #"import std.io
+
+type N { W { n: Int } }
+
+fn main() {
+    let n = N.W { n: 50 }
+    match n {
+        N.W { n: 0..10 } => io.println("low")
+        N.W { n: x } => io.println("high={x}")
+    }
+}
+"#
+}
+
+test "qualified struct-style range sub-field gates the arm" {
+    let r = compile_test_helpers.compile_and_run(src_range_gate(), "8eyjjf_range")
+    if !r.out.contains("high=50") {
+        compile_test_helpers.expect_contains(r.out, "high=50", "qualified struct-style range gate — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("high=50"))
+    assert(!r.out.contains("low"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_generic_instance_gate() -> Str {
+    #"import std.io
+
+type Box[T] { V { val: T } }
+
+fn main() {
+    let b: Box[Int] = Box.V { val: 3 }
+    match b {
+        Box.V { val: 5 } => io.println("five")
+        Box.V { val: _ } => io.println("other")
+    }
+}
+"#
+}
+
+test "qualified struct-style refutable sub-field gates on a generic instance" {
+    let r = compile_test_helpers.compile_and_run(src_generic_instance_gate(), "8eyjjf_generic")
+    if !r.out.contains("other") {
+        compile_test_helpers.expect_contains(r.out, "other", "qualified struct-style generic gate — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("other"))
+    assert(!r.out.contains("five"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_tuple_subfield_gate() -> Str {
+    #"import std.io
+
+type E { V { pair: (Int, Int) } }
+
+fn main() {
+    let e = E.V { pair: (3, 4) }
+    match e {
+        E.V { pair: (9, 9) } => io.println("match")
+        E.V { pair: (a, b) } => io.println("other={a},{b}")
+    }
+}
+"#
+}
+
+test "qualified struct-style tuple sub-field gates the arm without crashing codegen" {
+    let r = compile_test_helpers.compile_and_run(src_tuple_subfield_gate(), "8eyjjf_tuple")
+    if !r.out.contains("other=3,4") {
+        compile_test_helpers.expect_contains(r.out, "other=3,4", "qualified struct-style tuple gate — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("other=3,4"))
+    assert(!r.out.contains("match"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_carrier_subfield_gate() -> Str {
+    #"import std.io
+
+type E { V { r: Option[Int] } }
+
+fn main() {
+    let e = E.V { r: Some(5) }
+    match e {
+        E.V { r: None } => io.println("none")
+        E.V { r: Some(x) } => io.println("some={x}")
+    }
+}
+"#
+}
+
+test "qualified struct-style Option carrier sub-field gates the arm" {
+    let r = compile_test_helpers.compile_and_run(src_carrier_subfield_gate(), "8eyjjf_carrier")
+    if !r.out.contains("some=5") {
+        compile_test_helpers.expect_contains(r.out, "some=5", "qualified struct-style carrier gate — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("some=5"))
+    assert(!r.out.contains("none"))
+    assert_eq(r.exit_code, 0)
+}

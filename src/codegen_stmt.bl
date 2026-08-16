@@ -49,7 +49,7 @@ import codegen_types.{
     get_var_result_err, get_var_result_err_struct, get_var_result_ok,
     get_var_result_ok_struct, get_var_struct, get_var_type, has_derive_method, is_scope_var,
     get_variant_field_count, get_variant_field_name,
-    get_variant_field_type_str, get_variant_index, get_variant_tag,
+    get_variant_field_type_str, variant_field_type_by_name, get_variant_index, get_variant_tag,
     impl_method_self_name, builtin_receiver_type_name,
     is_compound_ct, is_data_enum, is_enum_type, is_mono_struct_instance, is_transparent_newtype,
     is_intrinsic_method, is_named_type, is_runtime_header_fn, is_stdlib_source_module, is_struct_or_enum_type, is_struct_type, is_trait_type, list_contains_str, list_iter_c_type, skip_private_in_module_header,
@@ -1682,17 +1682,78 @@ fn push_tuple_elem_scruts(tup_tag: Str, base_expr: Str) {
     }
 }
 
+// Shared named-sub-field gating loop for the two struct-style spellings — bare
+// `Variant { .. }` (StructPattern) and qualified `Type.Variant { .. }`
+// (EnumPattern int_val:1). Routing both through one loop keeps them emitting
+// identical code, the duality spec §3.5 requires. For an enum field the declared
+// type is looked up BY NAME (struct-style fields may be reordered) so each
+// sub-field carries the same context the positional loop threads: the CT (nested
+// Option/Result carriers gate), the field's own enum name for match_scrut_enum
+// (a nested bare variant resolves against it), and a tuple field's carrier tag
+// (the TuplePattern arm self-expands it instead of unwrapping a missing scrut).
+fn struct_style_subfield_conditions(flds_sl: Int, scrut: Str, is_enum: Bool, resolved_enum: Str, variant: Str, scrut_mono: Str) -> Str {
+    let vidx = if is_enum { get_variant_index(resolved_enum, variant) } else { -1 }
+    let mut parts = ""
+    let mut n = 0
+    let mut j = 0
+    while j < sublist_length(flds_sl) {
+        let sf = sublist_get(flds_sl, j)
+        let fname = node_name(sf)
+        let fpat = node_pattern(sf)
+        if fpat != -1 {
+            let field_scrut = if is_enum { "{scrut}.data.{variant}.{fname}" } else { "{scrut}.{fname}" }
+            let mut field_ct = CT_VOID
+            let mut field_enum = ""
+            let mut tup_tag = ""
+            if vidx >= 0 {
+                let ft = variant_field_type_by_name(vidx, fname)
+                let field_base = strip_generic_args(ft)
+                field_ct = type_from_name(ft)
+                field_enum = if is_enum_type(field_base) != 0 { field_base } else { "" }
+                if node_kind(fpat) == NodeKind.TuplePattern {
+                    tup_tag = tuple_field_carrier_tag_mono(resolved_enum, variant, fname, scrut_mono, "")
+                }
+            }
+            let saved_scruts = match_scruts
+            match_scruts = [MatchScrutEntry { str_val: field_scrut, scrut_type: field_ct, scrut_sname: tup_tag }]
+            let saved_enum = match_scrut_enum
+            match_scrut_enum = field_enum
+            let sub_cond = pattern_condition(fpat, 0, 1)
+            match_scrut_enum = saved_enum
+            match_scruts = saved_scruts
+            if sub_cond != "" {
+                if n > 0 {
+                    parts = parts.concat(" && ")
+                }
+                parts = parts.concat(sub_cond)
+                n = n + 1
+            }
+        }
+        j = j + 1
+    }
+    parts
+}
+
 // The C condition for a data-enum POSITIONAL constructor pattern: gate on the
 // variant tag AND every refutable payload sub-pattern read through
 // `{scrut}.data.{variant}.{field}`. Each field's declared type supplies the CT
 // (so nested Option/Result carriers gate) and the enum name for match_scrut_enum
 // (so a nested bare variant resolves against the field's own enum, not the
 // outer one); a tuple field carries its carrier tag so the TuplePattern arm
-// self-expands it. Struct-style enum patterns (node_int_val != 0, including a
-// qualified `Type.Variant { .. }`) keep tag-only gating here for now.
+// self-expands it. A qualified struct-style variant pattern (`E.V { x: 5 }`)
+// parses as an EnumPattern with int_val:1 + StructLitField children; it gates
+// each named sub-field through the shared struct-style loop.
 fn positional_payload_condition(pat: Int, resolved_enum: Str, resolved_variant: Str, scrut: Str, tag: Int, scrut_mono: Str) -> Str {
     let base = "({scrut}.tag == {tag})"
     if node_int_val(pat) != 0 {
+        let ss_flds = node_fields(pat)
+        if ss_flds == -1 {
+            return base
+        }
+        let ss_sub = struct_style_subfield_conditions(ss_flds, scrut, true, resolved_enum, resolved_variant, scrut_mono)
+        if ss_sub != "" {
+            return "{base} && {ss_sub}"
+        }
         return base
     }
     let flds_sl = node_fields(pat)
@@ -1877,29 +1938,13 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
             parts = "({scrut}.tag == {tag})"
             _parts_n = 1
         }
-        let mut j = 0
-        while j < sublist_length(flds_sl) {
-            let sf = sublist_get(flds_sl, j)
-            let fname = node_name(sf)
-            let fpat = node_pattern(sf)
-            if fpat != -1 {
-                let field_scrut = if sp_is_enum { "{scrut}.data.{sp_variant}.{fname}" } else { "{scrut}.{fname}" }
-                let saved_scruts = match_scruts
-                match_scruts = [MatchScrutEntry { str_val: field_scrut, scrut_type: CT_VOID }]
-                let saved_enum = match_scrut_enum
-                match_scrut_enum = ""
-                let sub_cond = pattern_condition(fpat, 0, 1)
-                match_scrut_enum = saved_enum
-                match_scruts = saved_scruts
-                if sub_cond != "" {
-                    if _parts_n > 0 {
-                        parts = parts.concat(" && ")
-                    }
-                    parts = parts.concat(sub_cond)
-                    _parts_n = _parts_n + 1
-                }
+        let sp_scrut_mono = match_scruts.get(scrut_off).unwrap().scrut_sname
+        let sp_sub = struct_style_subfield_conditions(flds_sl, scrut, sp_is_enum, sp_enum, sp_variant, sp_scrut_mono)
+        if sp_sub != "" {
+            if _parts_n > 0 {
+                parts = parts.concat(" && ")
             }
-            j = j + 1
+            parts = parts.concat(sp_sub)
         }
         return parts
     }
