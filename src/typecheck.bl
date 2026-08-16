@@ -2831,6 +2831,22 @@ fn check_closure_body(cls: Int, p0_t: Int, p1_t: Int) ! TypeCheck.Resolve, TypeC
     // tid minted during inference left unannotated params UNKNOWN; this overwrites it.
     tc_publish_node_tid(cls, make_fn_type(tc_closure_declared_ret(cls), param_types))
     tc_check_closure_body_against_own_ret(cls)
+    // An unannotated closure carries no `-> T`, so tc_closure_declared_ret answered Void
+    // above and the Fn tid returned Void — the HOF then reads an uninitialised
+    // accumulator/element slot. Now that the body has been walked (and therefore its tail
+    // is memoized), infer the return from that tail and re-stamp. This mirrors the
+    // Bytes.with_ptr / LetBinding recovery, which reads the same body-result tid one step
+    // after the walk; reading the memo does not re-report the body's diagnostics. The depth
+    // arg is the tail-value tree-recursion bound (tc_scoped_value_memo caps it at 8), a fresh
+    // walk from here, so seed it at 0 — NOT tc_in_closure_depth, an unrelated closure-nesting
+    // counter that would shrink the budget to 8 minus the nesting and skip the re-stamp for a
+    // HOF closure nested inside another closure body.
+    if node_type_ann(cls) == -1 {
+        let inferred_ret = tc_closure_body_result_tid(cls, 0)
+        if inferred_ret >= 0 {
+            tc_publish_node_tid(cls, make_fn_type(inferred_ret, param_types))
+        }
+    }
     nr_pop_scope()
 }
 
@@ -2911,10 +2927,82 @@ fn tc_check_callable_arg_bodies(args_sl: Int, skip_idx: Int) ! TypeCheck.Resolve
             if a != -1 && node_kind(a) == NodeKind.NamedArg { a = node_value(a) }
             if a != -1 {
                 let ak = node_kind(a)
-                if ak == NodeKind.Closure || ak == NodeKind.HandlerExpr { tc_check_body(a) }
+                if ak == NodeKind.Closure || ak == NodeKind.HandlerExpr {
+                    tc_check_body(a)
+                } else {
+                    // A non-callable argument can still nest a HOF whose unannotated closure
+                    // needs binding and walking — `foo(a.fold(0, fn(x,y){..}))`,
+                    // `io.println("{a.map(fn(x){..})}")`. Descend so that closure reaches
+                    // check_closure_body instead of keeping a Void return (garbage at codegen).
+                    tc_walk_nested_hof_bodies(a)
+                }
             }
         }
         i = i + 1
+    }
+}
+
+// A HOF whose closure must be bound and walked (check_closure_body) can hide anywhere a value
+// nests: the receiver of an outer method call (`a.map(f).collect()`), an interpolation part
+// (`"{a.fold(..)}"`), a binary operand, an argument. tc_check_body's arms walk only primary
+// statement positions, so a HOF in one of these positions never reached check_closure_body and
+// its unannotated closure kept a Void return — silent garbage at codegen. This descends the
+// value-carrying expression kinds and routes each nested MethodCall/Call to tc_check_body, which
+// runs that call's own HOF closure-body walk exactly once. It re-infers and re-reports nothing of
+// its own: it only reaches the same per-node walk the primary arms use, for nodes those arms miss.
+fn tc_walk_nested_hof_bodies(expr: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if expr == -1 { return }
+    let k = node_kind(expr)
+    if k == NodeKind.MethodCall || k == NodeKind.Call {
+        tc_check_body(expr)
+        return
+    }
+    if k == NodeKind.NamedArg {
+        tc_walk_nested_hof_bodies(node_value(expr))
+        return
+    }
+    if k == NodeKind.BinOp {
+        tc_walk_nested_hof_bodies(node_left(expr))
+        tc_walk_nested_hof_bodies(node_right(expr))
+        return
+    }
+    if k == NodeKind.UnaryOp {
+        tc_walk_nested_hof_bodies(node_left(expr))
+        return
+    }
+    if k == NodeKind.FieldAccess {
+        tc_walk_nested_hof_bodies(node_obj(expr))
+        return
+    }
+    if k == NodeKind.IndexExpr {
+        tc_walk_nested_hof_bodies(node_obj(expr))
+        tc_walk_nested_hof_bodies(node_index(expr))
+        return
+    }
+    if k == NodeKind.InterpString {
+        let parts = node_elements(expr)
+        if parts != -1 {
+            let mut i = 0
+            while i < sublist_length(parts) {
+                let p = sublist_get(parts, i)
+                if node_kind(p) != NodeKind.Ident || node_str_val(p) == "" {
+                    tc_walk_nested_hof_bodies(p)
+                }
+                i = i + 1
+            }
+        }
+        return
+    }
+    if k == NodeKind.TupleLit || k == NodeKind.ListLit {
+        let els = node_elements(expr)
+        if els != -1 {
+            let mut i = 0
+            while i < sublist_length(els) {
+                tc_walk_nested_hof_bodies(sublist_get(els, i))
+                i = i + 1
+            }
+        }
+        return
     }
 }
 
@@ -12559,6 +12647,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // List, so its body still needs walking below.
         tc_check_callable_arg_bodies(args_sl, hof_arg)
         tc_check_mutating_in_args(args_sl)
+        // The RECEIVER of this call is a value the arm above only inferred, never body-walked,
+        // so a HOF in the receiver chain (`a.map(f).collect()`) reaches check_closure_body only
+        // through this descent.
+        tc_walk_nested_hof_bodies(node_obj(node))
         return
     }
 

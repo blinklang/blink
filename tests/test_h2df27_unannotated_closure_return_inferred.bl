@@ -1,0 +1,79 @@
+// A closure literal with no `-> T` must infer its return type from its body, not
+// default to Void. When such a closure is a HOF argument (fold/map), the Void
+// return was never reconciled with the callback type the HOF expects, so codegen
+// read an uninitialised accumulator/element slot and the program printed garbage
+// with no diagnostic. The docs promise the bare spelling works
+// (`numbers.map(fn(x) { x * 2 })`, sections/03_types.md), so the fix infers the
+// return from the body's tail and re-stamps the closure's Fn tid after the body
+// walk. Same closure-typing family as the tail/return body-walk fixes (fttkpk,
+// the returned-closure walk).
+
+import compile_test_helpers
+
+fn src_fold_variants() -> Str {
+    #"import std.io
+
+fn main() {
+    let a: List[Int] = [2, 1, 3]
+    io.println("rt {a.fold(0, fn(acc: Int, v: Int) -> Int { acc + v })}")
+    io.println("ra {a.fold(0, fn(acc: Int, v: Int) { acc + v })}")
+    io.println("ba {a.fold(0, fn(acc, v) { acc + v })}")
+}
+"#
+}
+
+test "fold with an unannotated closure return infers Int and sums correctly" {
+    let r = compile_test_helpers.compile_and_run(src_fold_variants(), "h2df27_fold")
+    // All three rows must equal 6 — the absent `-> T` must not yield garbage.
+    if !r.out.contains("rt 6") || !r.out.contains("ra 6") || !r.out.contains("ba 6") {
+        compile_test_helpers.expect_contains(r.out, "ra 6", "fold unannotated-ret — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("rt 6"))
+    assert(r.out.contains("ra 6"))
+    assert(r.out.contains("ba 6"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_map_unannotated() -> Str {
+    #"import std.io
+
+fn main() {
+    let a: List[Int] = [1, 2, 3]
+    let doubled: List[Int] = a.map(fn(x) { x * 2 }).collect()
+    let mut total = 0
+    for v in doubled {
+        total = total + v
+    }
+    io.println("total {total}")
+}
+"#
+}
+
+test "map with an unannotated closure return produces real elements, not garbage" {
+    let r = compile_test_helpers.compile_and_run(src_map_unannotated(), "h2df27_map")
+    // 1*2 + 2*2 + 3*2 = 12
+    if !r.out.contains("total 12") {
+        compile_test_helpers.expect_contains(r.out, "total 12", "map unannotated-ret — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("total 12"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_annotated_still_ok() -> Str {
+    #"import std.io
+
+fn main() {
+    let a: List[Int] = [2, 1, 3]
+    io.println("sum {a.fold(0, fn(acc: Int, v: Int) -> Int { acc + v })}")
+}
+"#
+}
+
+test "explicitly annotated closure return still works (no regression)" {
+    let r = compile_test_helpers.compile_and_run(src_annotated_still_ok(), "h2df27_annotated")
+    if !r.out.contains("sum 6") {
+        compile_test_helpers.expect_contains(r.out, "sum 6", "annotated closure regression — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("sum 6"))
+    assert_eq(r.exit_code, 0)
+}
