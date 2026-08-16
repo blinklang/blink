@@ -76,7 +76,7 @@ import diagnostics.{
     ICE_SEG_ERASED_SLOT,
 }
 import ast.{NodeKind, is_block_bearing, dbg_trace, dbg_channel_on}
-import typecheck.{tc_channel_elem_ct, tc_channel_elem_struct, tc_ptr_pointee_ct, tc_ptr_pointee_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_tuple_sname, tc_tid_list_elem, tc_tid_iter_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member, tc_list_rename_help, ctype_probe_at, c_type_from_tid, tc_tid_resolved, tc_tid_subst_mono, tc_tid_option_inner_struct}
+import typecheck.{tc_channel_elem_ct, tc_channel_elem_struct, tc_ptr_pointee_ct, tc_ptr_pointee_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_tuple_sname, tc_tid_list_elem, tc_tid_iter_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member, tc_list_rename_help, ctype_probe_at, c_type_from_tid, tc_tid_resolved, tc_tid_subst_mono, tc_tid_option_inner_struct, tc_variant_field_is_selfrec_tuple}
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
 let mut btc_arg_offset: Int = 0
@@ -2744,7 +2744,13 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 // (emit_expr's data-enum branch). Without this the qualified path
                 // would emit the erased bare enum (blink_Either) — undeclared for a
                 // generic enum. "" (non-generic enum) keeps the bare name.
-                let mono_name = register_mono_enum_from_node(node, mc_obj_name)
+                // The node tid is bare for an annotation-only instance (`let r:
+                // Box[Int] = Box.Pair(..)` — the concrete args live on the let/arg
+                // annotation, not the ctor node). Fall back to that channel so the
+                // qualified ctor spells the mono instance (blink_Box_0Int) rather
+                // than the erased bare enum, mirroring the nullary FieldAccess path.
+                let node_mono = register_mono_enum_from_node(node, mc_obj_name)
+                let mono_name = if node_mono != "" { node_mono } else { register_mono_enum_from_ann(node, mc_obj_name) }
                 let sname = if mono_name != "" { mono_name } else { mc_obj_name }
                 let enum_c_name = c_type_c_name(sname)
                 let mut init_str = "({enum_c_name})\{.tag = {tag}"
@@ -2772,6 +2778,17 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                             let box_tmp = fresh_temp("_ebox")
                             emit_line("{enum_c_name}* {box_tmp} = ({enum_c_name}*)blink_alloc(sizeof({enum_c_name}));")
                             emit_line("*{box_tmp} = {arg_str};")
+                            init_str = init_str.concat(".{field_name} = (int64_t)(intptr_t){box_tmp}")
+                        } else if tc_variant_field_is_selfrec_tuple(mc_obj_name, method, field_name) != 0 {
+                            // Self-recursive tuple field: the union member is a boxed
+                            // int64_t (see emit_mono_enum_typedef). Heap-copy the tuple
+                            // value and store its pointer. __typeof__ spells the mono
+                            // tuple carrier without recomputing its name here.
+                            let val_tmp = fresh_temp("_tval")
+                            let box_tmp = fresh_temp("_tbox")
+                            emit_line("__typeof__({arg_str}) {val_tmp} = {arg_str};")
+                            emit_line("__typeof__({val_tmp})* {box_tmp} = blink_alloc(sizeof({val_tmp}));")
+                            emit_line("*{box_tmp} = {val_tmp};")
                             init_str = init_str.concat(".{field_name} = (int64_t)(intptr_t){box_tmp}")
                         } else {
                             init_str = init_str.concat(".{field_name} = {arg_str}")

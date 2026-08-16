@@ -99,7 +99,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{ctype_probe_at, c_type_from_tid, tc_scalar_tid_for_ct, tc_mono_tids_subst, tc_tid_subst_mono, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_list_elem_ct, tc_tid_list_elem_struct, tc_tid_list_elem, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_ct_resolved, tc_tid_map_val_struct_resolved, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_faithful, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved}
+import typecheck.{ctype_probe_at, c_type_from_tid, tc_scalar_tid_for_ct, tc_mono_tids_subst, tc_tid_subst_mono, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_list_elem_ct, tc_tid_list_elem_struct, tc_tid_list_elem, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_ct_resolved, tc_tid_map_val_struct_resolved, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_faithful, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved, tc_variant_field_is_selfrec_tuple}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -4862,8 +4862,11 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             // A generic-enum instance (`Leaf(1)` → Tree[Int]) mono's to blink_Tree_Int;
             // mono_name is the STEM (Tree_Int) or "" for a non-generic enum, which keeps
             // the bare variant_enum name. Variant metadata (tag/field types) stays keyed
-            // on the bare name.
-            let mono_name = register_mono_enum_from_node(node, variant_enum)
+            // on the bare name. The node tid is bare for an annotation-only instance
+            // (`let r: Box[Int] = Pair(..)`), so fall back to the let/arg annotation
+            // channel — mirroring the qualified ctor and nullary FieldAccess paths.
+            let node_mono = register_mono_enum_from_node(node, variant_enum)
+            let mono_name = if node_mono != "" { node_mono } else { register_mono_enum_from_ann(node, variant_enum) }
             let sname = if mono_name != "" { mono_name } else { variant_enum }
             let enum_c_name = c_type_c_name(sname)
             let mut init_str = "({enum_c_name})\{.tag = {tag}"
@@ -4881,6 +4884,17 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                         let box_tmp = fresh_temp("_ebox")
                         emit_line("{enum_c_name}* {box_tmp} = ({enum_c_name}*)blink_alloc(sizeof({enum_c_name}));")
                         emit_line("*{box_tmp} = {arg_str};")
+                        init_str = init_str.concat(".{field_name} = (int64_t)(intptr_t){box_tmp}")
+                    } else if tc_variant_field_is_selfrec_tuple(variant_enum, fn_name, field_name) != 0 {
+                        // Self-recursive tuple field: the union member is a boxed
+                        // int64_t (see emit_mono_enum_typedef). Heap-copy the tuple
+                        // value and store its pointer. __typeof__ spells the mono
+                        // tuple carrier without recomputing its name here.
+                        let val_tmp = fresh_temp("_tval")
+                        let box_tmp = fresh_temp("_tbox")
+                        emit_line("__typeof__({arg_str}) {val_tmp} = {arg_str};")
+                        emit_line("__typeof__({val_tmp})* {box_tmp} = blink_alloc(sizeof({val_tmp}));")
+                        emit_line("*{box_tmp} = {val_tmp};")
                         init_str = init_str.concat(".{field_name} = (int64_t)(intptr_t){box_tmp}")
                     } else {
                         init_str = init_str.concat(".{field_name} = {arg_str}")
@@ -6949,7 +6963,8 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
             // mono's to blink_Choice_Int_Str, mirroring the call-style paths. Without
             // this the struct-lit path emitted the erased bare enum (blink_Choice) —
             // undeclared for a generic enum. "" (non-generic) keeps bare.
-            let mono_name = register_mono_enum_from_node(node, variant_enum)
+            let node_mono = register_mono_enum_from_node(node, variant_enum)
+            let mono_name = if node_mono != "" { node_mono } else { register_mono_enum_from_ann(node, variant_enum) }
             let enum_type_name = if mono_name != "" { mono_name } else { variant_enum }
             let enum_c_name = c_type_c_name(enum_type_name)
             // Resolve this variant's field-def sublist so bare `None` fields
@@ -7017,6 +7032,16 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
                         let box_tmp = fresh_temp("_ebox")
                         emit_line("{enum_c_name}* {box_tmp} = ({enum_c_name}*)blink_alloc(sizeof({enum_c_name}));")
                         emit_line("*{box_tmp} = {arg_str};")
+                        init_str = init_str.concat(".{field_name} = (int64_t)(intptr_t){box_tmp}")
+                    } else if tc_variant_field_is_selfrec_tuple(variant_enum, sname, field_name) != 0 {
+                        // Self-recursive tuple field (`Pair { p: (Box[T], Box[T]) }`): the
+                        // union member is a boxed int64_t, so heap-copy the tuple and store
+                        // its pointer. Mirrors the positional qualified/bare ctor paths.
+                        let val_tmp = fresh_temp("_tval")
+                        let box_tmp = fresh_temp("_tbox")
+                        emit_line("__typeof__({arg_str}) {val_tmp} = {arg_str};")
+                        emit_line("__typeof__({val_tmp})* {box_tmp} = blink_alloc(sizeof({val_tmp}));")
+                        emit_line("*{box_tmp} = {val_tmp};")
                         init_str = init_str.concat(".{field_name} = (int64_t)(intptr_t){box_tmp}")
                     } else {
                         init_str = init_str.concat(".{field_name} = {arg_str}")

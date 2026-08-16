@@ -116,7 +116,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{sv_ty_or_flat_at, tc_tid_child, tc_top_level_let_tid, ctype_probe_at, closure_sig_from_tid, enum_instance_c_from_tid, struct_instance_c_from_tid, tc_tid_handler_effect, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_tuple_sname, tc_tid_to_c_tag, tc_variant_field_tid_by_name}
+import typecheck.{sv_ty_or_flat_at, tc_tid_child, tc_top_level_let_tid, ctype_probe_at, closure_sig_from_tid, enum_instance_c_from_tid, struct_instance_c_from_tid, tc_tid_handler_effect, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_tuple_sname, tc_tid_to_c_tag, tc_variant_field_tid_by_name, tc_variant_field_is_selfrec_tuple}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -852,6 +852,48 @@ fn tuple_field_carrier_tag_mono(enum_name: Str, variant_name: Str, field_name: S
         }
     }
     tuple_field_carrier_tag(enum_name, variant_name, field_name, fallback)
+}
+
+// The mono tuple carrier of a SELF-RECURSIVE tuple field, resolved from the
+// field's ANNOTATION exactly as emit_mono_enum_typedef spells its typedef. The
+// tid path cannot serve here: a self-referring tuple element is stored arg-less
+// (bare `Box`, not `Box[T]`), so tc_tid_tuple_sname yields the erased
+// `Tuple2_Box_Box` — never the registered `Tuple2_Box_0Int_Box_0Int`. Reads the
+// enum's tparams and the scrutinee-mono arg tids so `(Box[T], Box[T])` on a
+// Box[Int] resolves to the same carrier the typedef emitter registered.
+fn selfrec_tuple_field_carrier(enum_name: Str, variant_name: Str, field_name: Str, scrut_mono: Str) -> Str {
+    let td = find_type_def(enum_name)
+    if td == -1 { return "" }
+    let tparams_sl = node_type_params(td)
+    // A non-generic enum has no typevars to substitute; resolve the tuple carrier
+    // from the bare annotation with empty segs, exactly as emit_enum_typedef does.
+    let segs = if tparams_sl == -1 { [] } else { segs_from_arg_tids(lookup_mono_base(scrut_mono).arg_tids) }
+    let flds_sl = node_fields(td)
+    if flds_sl == -1 { return "" }
+    let mut i = 0
+    while i < sublist_length(flds_sl) {
+        let v = sublist_get(flds_sl, i)
+        if node_name(v) == variant_name {
+            let vflds = node_fields(v)
+            if vflds != -1 {
+                let mut fi = 0
+                while fi < sublist_length(vflds) {
+                    let vf = sublist_get(vflds, fi)
+                    if node_name(vf) == field_name {
+                        let ann = node_value(vf)
+                        if ann != -1 && node_name(ann) == "Tuple" {
+                            let tup = resolve_tuple_ann(ann, tparams_sl, segs)
+                            if tup.is_some() { return tup.unwrap() }
+                        }
+                        return ""
+                    }
+                    fi = fi + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    ""
 }
 
 // Materialize a tuple scrutinee into one temp and push one `._i` field-access
@@ -2216,6 +2258,22 @@ fn bind_struct_style_variant_fields(vidx: Int, fcount: Int, resolved_enum: Str, 
                 emit_line("__typeof__({scrut}.data.{resolved_variant}.{field_name}) {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
                 set_var(field_name, field_ct, 0)
                 register_var_compound_inner_from_str(field_name, res_ft)
+            } else if tc_variant_field_is_selfrec_tuple(resolved_enum, resolved_variant, field_name) != 0 {
+                // Self-recursive tuple field (`Pair { p }` shorthand): stored boxed as
+                // an int64_t pointer (see the ctor), so deref through the mono tuple
+                // carrier and publish its tag so `p.0` reads. Mirrors the positional path.
+                let tup_tag = selfrec_tuple_field_carrier(resolved_enum, resolved_variant, field_name, scrut_mono)
+                if tup_tag == "" {
+                    diag_ice_at("SelfrecTupleCarrierUnresolved", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                        "self-recursive tuple field '{field_name}' of '{resolved_enum}.{resolved_variant}' reached codegen without a resolvable tuple carrier",
+                        sf_node,
+                        "this is a compiler bug — the boxed tuple carrier should resolve from the field annotation")
+                } else {
+                    let tup_c = c_type_c_name(tup_tag)
+                    emit_line("{tup_c} {c_bind} = *({tup_c}*)(intptr_t){scrut}.data.{resolved_variant}.{field_name};")
+                    set_var(field_name, field_ct, 0)
+                    set_var_struct(field_name, tup_tag)
+                }
             } else {
                 let sf_flat_c = c_type_str(field_ct)
                 // The struct-style sibling of match_binder.variant_field: the binder reaches here
@@ -2666,6 +2724,22 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                                     emit_line("__typeof__({scrut}.data.{resolved_variant}.{field_name}) {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
                                     set_var(bind_name, field_ct, 0)
                                     register_var_compound_inner_from_str(bind_name, field_type_name)
+                                } else if tc_variant_field_is_selfrec_tuple(resolved_enum, resolved_variant, field_name) != 0 {
+                                    // Self-recursive tuple field: stored boxed as an
+                                    // int64_t pointer (see the ctor), so deref through the
+                                    // mono tuple carrier and publish its tag so `p.0` reads.
+                                    let tup_tag = selfrec_tuple_field_carrier(resolved_enum, resolved_variant, field_name, scrut_mono)
+                                    if tup_tag == "" {
+                                        diag_ice_at("SelfrecTupleCarrierUnresolved", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                                            "self-recursive tuple field '{field_name}' of '{resolved_enum}.{resolved_variant}' reached codegen without a resolvable tuple carrier",
+                                            sub_pat,
+                                            "this is a compiler bug — the boxed tuple carrier should resolve from the field annotation")
+                                    } else {
+                                        let tup_c = c_type_c_name(tup_tag)
+                                        emit_line("{tup_c} {c_bind} = *({tup_c}*)(intptr_t){scrut}.data.{resolved_variant}.{field_name};")
+                                        set_var(bind_name, field_ct, 0)
+                                        set_var_struct(bind_name, tup_tag)
+                                    }
                                 } else {
                                     let vfield_tid = subst_variant_field_binder_tid(pat_binder_tid(sub_pat), resolved_enum, scrut_mono)
                                     let vfield_c = c_type_str(field_ct)
@@ -8943,6 +9017,12 @@ fn emit_mono_enum_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[In
     // union would nest one typedef textually inside another (illegal C), and the
     // later top-level tuple flush lands AFTER this enum typedef that names it.
     // Mirrors emit_mono_struct_typedef's dependency pre-pass.
+    //
+    // EXCEPTION: a tuple whose elements reference THIS enum (`Pair(p: (Box[T],
+    // Box[T]))`) embeds the enum by value and so forward-references it — its
+    // typedef must come AFTER the enum, which boxes the field to int64_t below.
+    // Defer those tags to a post-pass emitted once the enum typedef is closed.
+    let mut deferred_selfrec_tuples: List[Str] = []
     let mut pv = 0
     while pv < sublist_length(flds_sl) {
         let pvnode = sublist_get(flds_sl, pv)
@@ -8956,7 +9036,11 @@ fn emit_mono_enum_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[In
                     if node_name(pvf_ann) == "Tuple" {
                         let ptup = resolve_tuple_ann(pvf_ann, tparams_sl, segs)
                         if ptup.is_some() {
-                            emit_tuple_typedef_for_tag(ptup.unwrap())
+                            if tc_variant_field_is_selfrec_tuple(base_name, node_name(pvnode), node_name(pvf)) != 0 {
+                                deferred_selfrec_tuples.push(ptup.unwrap())
+                            } else {
+                                emit_tuple_typedef_for_tag(ptup.unwrap())
+                            }
                         }
                     } else {
                         // A typevar field (`One(x: T)`) bound to a tuple type-arg
@@ -8996,14 +9080,21 @@ fn emit_mono_enum_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[In
                     let vf_type_name = node_name(vf_type_ann)
                     let resolved = resolve_mono_slot(vf_type_name, tparams_sl, arg_tids, "enum_typedef_payload", "{c_name}.{vname}.{vf_name}", vf_type_ann)
                     if vf_type_name == "Tuple" {
-                        // Tuple payload: spell the tuple carrier under typevar
-                        // substitution so `(T, T)` on an E[P] lowers to
-                        // blink_Tuple2_P_P, not the erased/void fall-through.
-                        let tup_opt = resolve_tuple_ann(vf_type_ann, tparams_sl, segs)
-                        if tup_opt.is_some() {
-                            vf_c_type = c_type_c_name(tup_opt.unwrap())
+                        if tc_variant_field_is_selfrec_tuple(base_name, vname, vf_name) != 0 {
+                            // Self-recursive tuple field (`Pair(p: (Box[T], Box[T]))`):
+                            // boxed as a heap pointer, so the union member is a bare
+                            // int64_t (mirrors the direct self-recursive field below).
+                            vf_c_type = "int64_t"
                         } else {
-                            vf_c_type = c_field_type_str(type_from_name(vf_type_name), vf_type_name)
+                            // Tuple payload: spell the tuple carrier under typevar
+                            // substitution so `(T, T)` on an E[P] lowers to
+                            // blink_Tuple2_P_P, not the erased/void fall-through.
+                            let tup_opt = resolve_tuple_ann(vf_type_ann, tparams_sl, segs)
+                            if tup_opt.is_some() {
+                                vf_c_type = c_type_c_name(tup_opt.unwrap())
+                            } else {
+                                vf_c_type = c_field_type_str(type_from_name(vf_type_name), vf_type_name)
+                            }
                         }
                     } else if resolved == base_name {
                         // Self-recursive field (`Branch(left: Tree[T], …)`): the ctor
@@ -9067,6 +9158,15 @@ fn emit_mono_enum_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[In
     emit_line("} {td_cname};")
     emit_td_guard_close()
     emit_line("")
+    // Now that the enum typedef is complete, emit the self-recursive tuple
+    // carriers it boxes (`Tuple2_Box_0Int_Box_0Int`), which embed this enum by
+    // value and therefore had to wait for it. The ctor/match-binder reference
+    // them from function bodies emitted far below, so this ordering suffices.
+    let mut dt = 0
+    while dt < deferred_selfrec_tuples.len() {
+        emit_tuple_typedef_for_tag(deferred_selfrec_tuples.get(dt).unwrap())
+        dt = dt + 1
+    }
     i = 0
     while i < sublist_length(flds_sl) {
         let v = sublist_get(flds_sl, i)
@@ -10515,11 +10615,19 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
                                 vf_c_type = "{c_type_c_name(vf_type_name)}"
                             }
                         } else if vf_type_name == "Tuple" {
-                            let tup_opt = resolve_tuple_ann(vf_type_ann, -1, [])
-                            if tup_opt.is_some() {
-                                vf_c_type = c_type_c_name(tup_opt.unwrap())
+                            if tc_variant_field_is_selfrec_tuple(name, vname, vf_name) != 0 {
+                                // Self-recursive tuple field (`Pair(p: (Box, Box))`):
+                                // boxed as a heap pointer, so the union member is a bare
+                                // int64_t (mirrors emit_mono_enum_typedef and the direct
+                                // self-recursive field above).
+                                vf_c_type = "int64_t"
                             } else {
-                                vf_c_type = c_field_type_str(type_from_name(vf_type_name), vf_type_name)
+                                let tup_opt = resolve_tuple_ann(vf_type_ann, -1, [])
+                                if tup_opt.is_some() {
+                                    vf_c_type = c_type_c_name(tup_opt.unwrap())
+                                } else {
+                                    vf_c_type = c_field_type_str(type_from_name(vf_type_name), vf_type_name)
+                                }
                             }
                         } else {
                             let vf_ct = type_from_name(vf_type_name)
