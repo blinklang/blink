@@ -1,0 +1,104 @@
+// A monomorphic enum whose variant payload is a by-value carrier of a struct (Option[P],
+// Result[P,_]) must emit that carrier typedef BEFORE the enum typedef that embeds it by value.
+// The enum-typedef emission had no per-type field-carrier pre-flush (structs do), so the carrier
+// was queued and flushed AFTER the enum -> cc failed with 'unknown type name blink_Option_P' /
+// 'incompatible types initializing int'. These shapes register the carrier from a Some/Ok literal,
+// so no payload-value inference is involved — they isolate the typedef ORDERING fix.
+
+import compile_test_helpers
+
+fn src_ctor_option() -> Str {
+    #"import std.io
+
+type P { x: Int, y: Int }
+
+type E { V(Option[P]) }
+
+fn main() {
+    let e = E.V(Some(P { x: 1, y: 2 }))
+    match e {
+        E.V(p) => {
+            match p {
+                Some(v) => io.println("x={v.x} y={v.y}")
+                None => io.println("none")
+            }
+        }
+    }
+}
+"#
+}
+
+fn src_structlit_option() -> Str {
+    #"import std.io
+
+type P { x: Int, y: Int }
+
+type E {
+    V { p: Option[P] }
+}
+
+fn main() {
+    let e = E.V { p: Some(P { x: 3, y: 4 }) }
+    match e {
+        E.V { p } => {
+            match p {
+                Some(v) => io.println("x={v.x} y={v.y}")
+                None => io.println("none")
+            }
+        }
+    }
+}
+"#
+}
+
+fn src_ctor_result() -> Str {
+    // The unmentioned err slot of `Ok(...)` defaults to str, so declaring the payload as
+    // Result[P, Str] makes that default match the declared type — isolating the typedef
+    // ordering fix from the separate err-default bug (vsw0s1), which bites only when the
+    // declared err differs from the str default (e.g. `V(Result[P, Int])`).
+    #"import std.io
+
+type P { x: Int, y: Int }
+
+type E { V(Result[P, Str]) }
+
+fn main() {
+    let e = E.V(Ok(P { x: 5, y: 6 }))
+    match e {
+        E.V(r) => {
+            match r {
+                Ok(v) => io.println("x={v.x} y={v.y}")
+                Err(_) => io.println("err")
+            }
+        }
+    }
+}
+"#
+}
+
+test "mono enum ctor payload Option[struct] carrier typedef precedes the enum" {
+    let r = compile_test_helpers.compile_and_run(src_ctor_option(), "44x9qw_ctor_option")
+    if !r.out.contains("x=1 y=2") {
+        compile_test_helpers.expect_contains(r.out, "x=1 y=2", "enum ctor Option[struct] payload — got '{r.err_out}'")
+    }
+    assert(r.out.contains("x=1 y=2"))
+    assert_eq(r.exit_code, 0)
+}
+
+test "mono enum struct-literal payload Option[struct] carrier typedef precedes the enum" {
+    let r = compile_test_helpers.compile_and_run(src_structlit_option(), "44x9qw_structlit_option")
+    if !r.out.contains("x=3 y=4") {
+        compile_test_helpers.expect_contains(r.out, "x=3 y=4", "enum structlit Option[struct] payload — got '{r.err_out}'")
+    }
+    assert(r.out.contains("x=3 y=4"))
+    assert_eq(r.exit_code, 0)
+}
+
+test "mono enum ctor payload Result[struct,_] carrier typedef precedes the enum" {
+    let r = compile_test_helpers.compile_and_run(src_ctor_result(), "44x9qw_ctor_result")
+    if !r.out.contains("x=5 y=6") {
+        compile_test_helpers.expect_contains(r.out, "x=5 y=6", "enum ctor Result[struct,_] payload — got '{r.err_out}'")
+    }
+    assert(r.out.contains("x=5 y=6"))
+    assert_eq(r.exit_code, 0)
+}
