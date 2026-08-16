@@ -1,0 +1,66 @@
+// A `handler E { ... }` literal written as a bare statement — the tail of a block
+// or fn body, not consumed by `with` — is a parse_primary expression that arrives
+// ExprStmt-wrapped, exactly like a tail closure. tc_check_body only re-dispatches a
+// known set of ExprStmt-wrapped kinds into their body walk; HandlerExpr was missing
+// from that gate, so a bare tail handler's method bodies went unwalked in statement
+// position and type errors inside them were never reported. tc_check_callable_arg_bodies
+// already pairs Closure+HandlerExpr as the body-carrying arg kinds, so gating Closure
+// (commit that added the closure walk) while omitting HandlerExpr was an asymmetry.
+// A handler consumed by `with` routes through the WithBlock arm and is unaffected.
+
+import compile_test_helpers
+
+fn src_bare_handler_bad_return() -> Str {
+    #"effect E {
+    effect Op {
+        fn op() -> Int
+    }
+}
+
+fn main() {
+    handler E {
+        fn op() -> Int { "notint" }
+    }
+}
+"#
+}
+
+test "type error in a bare tail handler's method body is reported" {
+    compile_test_helpers.expect_compile_error(src_bare_handler_bad_return(), "fttkpk_bare", "return value type Str does not match")
+}
+
+fn src_with_handler_bad_return() -> Str {
+    #"effect E {
+    effect Op {
+        fn op() -> Int
+    }
+}
+
+fn main() {
+    with handler E {
+        fn op() -> Int { "notint" }
+    } {
+        let x = e.op()
+        io.println("{x}")
+    }
+}
+"#
+}
+
+test "with-consumed handler still reports the same body type error (no regression, no double-walk)" {
+    let output = compile_test_helpers.compile_and_capture(src_with_handler_bad_return(), "fttkpk_with")
+    compile_test_helpers.expect_contains(output, "return value type Str does not match", "with-consumed handler body error")
+    // Exactly one diagnostic — the WithBlock arm must not double-walk the handler body.
+    assert_eq(count_occurrences(output, "return value type Str does not match"), 1)
+}
+
+fn count_occurrences(haystack: Str, needle: Str) -> Int {
+    let mut count = 0
+    let mut rest = haystack
+    while rest.contains(needle) {
+        let idx = rest.index_of(needle)
+        count = count + 1
+        rest = rest.slice(idx + needle.len(), rest.len())
+    }
+    count
+}
