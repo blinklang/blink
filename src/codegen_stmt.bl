@@ -2110,7 +2110,22 @@ fn bind_struct_style_variant_fields(vidx: Int, fcount: Int, resolved_enum: Str, 
         // the concrete C type instead of the erased `void`. Mirrors the positional path.
         let res_ft = resolve_variant_field_type_mono(found_ft, resolved_enum, scrut_mono)
         let field_ct = type_from_name(res_ft)
-        if fpat_node != -1 {
+        if fpat_node != -1 && strip_generic_args(res_ft) == resolved_enum && (node_kind(fpat_node) == NodeKind.IdentPattern || node_kind(fpat_node) == NodeKind.WildcardPattern) {
+            // A self-recursive field (`tail: LL[T]`) renamed to an ident is stored boxed as
+            // int64_t; the recursion path can only plain-assign, so deref here through the
+            // mono type. Mirrors the positional path: set_var_struct publishes the mono stem
+            // so a downstream fn call or nested match on the binder recovers the instance.
+            if node_kind(fpat_node) == NodeKind.IdentPattern && node_name(fpat_node) != "_" {
+                let bn = node_name(fpat_node)
+                let c_bind = c_safe_name(bn)
+                let fc_type = if scrut_mono != "" && is_mono_struct_instance(scrut_mono) != 0 { scrut_mono } else { resolved_enum }
+                let fc_name = c_type_c_name(fc_type)
+                emit_line("{fc_name} {c_bind} = *({fc_name}*)(intptr_t){scrut}.data.{resolved_variant}.{field_name};")
+                set_var(bn, CT_VOID, 0)
+                set_var_struct(bn, fc_type)
+                var_enums.push(VarEnumEntry { name: bn, enum_type: resolved_enum })
+            }
+        } else if fpat_node != -1 {
             let saved_scruts = match_scruts
             // A tuple payload has no struct/enum name; publish its carrier tag so the
             // TuplePattern arm can expand the single whole-tuple entry per element. A
@@ -2128,12 +2143,16 @@ fn bind_struct_style_variant_fields(vidx: Int, fcount: Int, resolved_enum: Str, 
             match_scruts = saved_scruts
         } else {
             let c_bind = c_safe_name(field_name)
-            if res_ft == resolved_enum {
-                let fc_name = c_type_c_name(res_ft)
+            if strip_generic_args(res_ft) == resolved_enum {
+                // A self-recursive field (`tail: LL[T]`) is stored boxed as int64_t, so the
+                // binder derefs through the mono C type. Mirrors the positional path:
+                // set_var_struct publishes the mono stem for downstream recovery.
+                let fc_type = if scrut_mono != "" && is_mono_struct_instance(scrut_mono) != 0 { scrut_mono } else { resolved_enum }
+                let fc_name = c_type_c_name(fc_type)
                 emit_line("{fc_name} {c_bind} = *({fc_name}*)(intptr_t){scrut}.data.{resolved_variant}.{field_name};")
                 set_var(field_name, CT_VOID, 0)
-                set_var_struct(field_name, res_ft)
-                var_enums.push(VarEnumEntry { name: field_name, enum_type: res_ft })
+                set_var_struct(field_name, fc_type)
+                var_enums.push(VarEnumEntry { name: field_name, enum_type: resolved_enum })
             } else if is_struct_type(res_ft) != 0 {
                 emit_line("{c_type_c_name(res_ft)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
                 set_var(field_name, CT_VOID, 0)

@@ -979,10 +979,18 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             if is_enum_type(obj_name) != 0 {
                 if is_data_enum(obj_name) != 0 {
                     let tag = get_variant_tag(obj_name, fa_field)
-                    expr_result_str = "({c_type_c_name(obj_name)})\{.tag = {tag}}"
+                    // A nullary variant of a generic enum (`LL.Nil` → LL[Int]) mono's to
+                    // blink_LL_0Int and must register the instance so its typedef is emitted;
+                    // mirrors the Call-form constructor. The instance args live on the let/arg
+                    // annotation, not the node, so fall back to that channel. A non-generic
+                    // enum keeps the bare name.
+                    let node_mono = register_mono_enum_from_node(node, obj_name)
+                    let mono_name = if node_mono != "" { node_mono } else { register_mono_enum_from_ann(node, obj_name) }
+                    let sname = if mono_name != "" { mono_name } else { obj_name }
+                    expr_result_str = "({c_type_c_name(sname)})\{.tag = {tag}}"
                     expr_result_type = CT_STRUCT
                     publish_result_tid(node)
-                    set_var_struct(expr_result_str, obj_name)
+                    set_var_struct(expr_result_str, sname)
                     return
                 }
                 expr_result_str = "{c_type_c_name(obj_name)}_{fa_field}"
@@ -6556,7 +6564,18 @@ pub fn mono_instance_arg_tids_from_tid(inst_tid: Int, expected_base: Str, expect
 // avoid a codegen_expr→codegen_stmt import cycle. `expected_base` guards against a
 // mismatched memoized tid — the registered instance must name this variant's enum.
 pub fn register_mono_enum_from_node(node: Int, expected_base: Str) -> Str ! Codegen.Register {
-    let inst_tid = tc_lookup_node_tid(node)
+    register_mono_enum_from_tid(tc_lookup_node_tid(node), expected_base)
+}
+
+// A nullary variant constructor (`LL.Nil`) carries only the bare enum on its own
+// node — infer_type returns the base enum, not the instance — so its concrete args
+// live on the let/arg annotation. Read that channel when the node tid is bare so the
+// mono instance registers and the cast spells the stem, matching the Call form.
+pub fn register_mono_enum_from_ann(node: Int, expected_base: Str) -> Str ! Codegen.Register {
+    register_mono_enum_from_tid(tid_native_struct_inst_tid(node, expected_base), expected_base)
+}
+
+fn register_mono_enum_from_tid(inst_tid: Int, expected_base: Str) -> Str ! Codegen.Register {
     if inst_tid < 0 { return "" }
     if tc_tid_is_enum(inst_tid) == 0 { return "" }
     if tc_tid_struct(inst_tid) != expected_base { return "" }
