@@ -1533,9 +1533,17 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
             let ret_flat = if ann_ret_c != "" { ann_ret_c } else { c_type_str(ret_type) }
             ctype_probe_at(cg_expr_node_mono_tid(node_type_ann(m)), "expr_handler_ret", node_name(m), ret_flat, node_type_ann(m))
             let mut ret_c = ret_flat
-            let ue_needs_ptr = is_user_effect != 0 && ret_type == CT_OPTION && resolve_option_inner_from_ann(m) == CT_VOID
+            let ue_opt_inner_struct = if is_user_effect != 0 && ret_type == CT_OPTION { ue_handler_option_inner_name(m) } else { "" }
+            let ue_opt_transparent = ue_opt_inner_struct != "" && is_transparent_newtype(ue_opt_inner_struct) != 0
+            let ue_needs_ptr = is_user_effect != 0 && ret_type == CT_OPTION && resolve_option_inner_from_ann(m) == CT_VOID && ue_opt_transparent == 0
             if ue_needs_ptr {
                 ret_c = option_c_type(CT_PTR)
+            } else if ue_opt_transparent {
+                // A transparent newtype has no heap pointer to erase: its Option carrier is a scalar
+                // struct, so the wrapper returns the concrete carrier by identity, exactly like a
+                // non-UE fn returning Option[Errno]. No boundary boxing.
+                ensure_struct_option_type(ue_opt_inner_struct)
+                ret_c = struct_option_c_type(ue_opt_inner_struct)
             }
             let mut ue_result_opt_ptr = 0
             if is_user_effect != 0 && ret_type == CT_RESULT {
@@ -1612,22 +1620,27 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
                 }
             }
             cg_handler_ret_option_erased = 0
-            if ue_needs_ptr {
+            if ue_opt_transparent {
+                // Mirror the non-UE Option[Errno] fn: inner CT_VOID + the newtype name so the
+                // Some(...) construction builds the scalar carrier; nothing is ptr-erased.
+                cg_current_fn_option_inner = resolve_option_inner_from_ann(m)
+                cg_current_fn_option_inner_struct = ue_opt_inner_struct
+            } else if ue_needs_ptr {
                 let _ue_inner_struct = ue_handler_option_inner_name(m)
-                if _ue_inner_struct != "" && is_transparent_newtype(_ue_inner_struct) == 0 {
+                if _ue_inner_struct != "" {
                     // Erase-only-at-boundary: the inner is a genuine heap-boxed struct/enum, so
                     // keep the in-body Option carrier CONCRETE (inner CT_VOID + the struct name)
                     // and every value — struct field, tuple element, if/match arm — is a
                     // well-typed blink_Option_<Struct>. The C return signature stays
                     // blink_Option_ptr (the shared vtable ABI); emit_return_with_trace boxes the
-                    // heap pointer concrete->ptr once at the boundary.
+                    // heap pointer concrete->ptr once at the boundary. A transparent newtype never
+                    // reaches here — ue_needs_ptr excludes it.
                     cg_current_fn_option_inner = CT_VOID
                     cg_current_fn_option_inner_struct = _ue_inner_struct
                     cg_handler_ret_option_erased = 1
                 } else {
-                    // Un-nameable inner (typevar/alias) or a transparent newtype (inline scalar
-                    // payload, no heap pointer to reinterpret): the concrete blink_Option_<Struct>
-                    // carrier does not apply, so fall back to the uniform in-body ptr erasure that
+                    // Un-nameable inner (typevar/alias): the concrete blink_Option_<Struct> carrier
+                    // does not apply, so fall back to the uniform in-body ptr erasure that
                     // heap-boxes each value per construction.
                     cg_current_fn_option_inner = CT_PTR
                 }

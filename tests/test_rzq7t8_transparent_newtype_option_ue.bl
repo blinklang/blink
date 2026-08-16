@@ -1,0 +1,75 @@
+// A transparent newtype (`std.errno.Errno` — a single-variant single-Int-payload enum that lowers
+// to a bare int64_t) inside an `Option` is a THREE-speller bug: the `Some(Errno(rc))` construction
+// and the `blink_Option_std_errno_Errno` carrier typedef are transparent (a bare `int64_t value`),
+// but the CONSUMERS diverge — `.unwrap()` dereferences `.value` as a heap pointer and types the
+// result as the boxed enum struct. Through a user-effect (UE) handler op the divergence compounds:
+// the op-return boundary erases the transparent Option to the uniform `blink_Option_ptr` vtable ABI,
+// and the perform site casts the (nonexistent) pointer payload back into the int64_t value field.
+//
+// A transparent newtype has NO heap pointer to erase or dereference — its Option carrier IS a scalar
+// carrier. Every site (construct, carrier typedef, unwrap/match consumer, UE op signature, UE perform
+// conversion) must read the value by identity, not through a pointer.
+
+import compile_test_helpers
+
+// Root case (no UE): the transparent Option consumer path must read the value by identity.
+fn nonue_src() -> Str {
+    #"import std.io
+import std.errno.{Errno}
+
+fn find(name: Str) -> Option[Errno] {
+    Some(Errno(13))
+}
+
+fn main() {
+    let e = find("x").unwrap()
+    let v = match e { Errno(rc) => rc }
+    io.println("v={v}")
+}
+"#
+}
+
+test "a transparent-newtype Option[Errno] round-trips through unwrap + match" {
+    let r = compile_test_helpers.compile_and_run(nonue_src(), "rzq7t8_nonue")
+    if !r.out.contains("v=13") { compile_test_helpers.expect_contains(r.out, "v=13", "non-UE transparent Option — got '{r.err_out}'") }
+    assert(r.out.contains("v=13"))
+    assert_eq(r.exit_code, 0)
+}
+
+// The ticket case: the same transparent Option[Errno] flowing through a UE handler op. The op
+// signature must NOT ptr-erase the transparent carrier, and the perform site must NOT cast a
+// pointer into the scalar value field.
+fn ue_src() -> Str {
+    #"import std.io
+import std.errno.{Errno}
+
+effect Store {
+    effect Lookup {
+        fn find(name: Str) -> Option[Errno]
+    }
+}
+
+fn lookup(name: Str) -> Option[Errno] ! Store.Lookup {
+    store.find(name)
+}
+
+fn main() {
+    with handler Store {
+        fn find(name: Str) -> Option[Errno] {
+            Some(Errno(13))
+        }
+    } {
+        let e = lookup("x").unwrap()
+        let v = match e { Errno(rc) => rc }
+        io.println("v={v}")
+    }
+}
+"#
+}
+
+test "a transparent-newtype Option[Errno] round-trips through a UE handler op" {
+    let r = compile_test_helpers.compile_and_run(ue_src(), "rzq7t8_ue")
+    if !r.out.contains("v=13") { compile_test_helpers.expect_contains(r.out, "v=13", "UE transparent Option — got '{r.err_out}'") }
+    assert(r.out.contains("v=13"))
+    assert_eq(r.exit_code, 0)
+}

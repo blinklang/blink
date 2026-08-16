@@ -79,7 +79,7 @@ import codegen_types.{
     reset_scope_state, resolve_ret_type_from_ann, resolve_self_type,
     scope_frame_starts, scope_vars,
     sf_closure_sigs, sf_entries, sf_entries_idx, struct_field_defaults, struct_invariants,
-    strip_module_qualifier,
+    strip_module_qualifier, struct_option_c_type,
     struct_reg_names, struct_reg_set, sv_tp,
     trait_entries, tryfrom_entries, type_alias_base, type_from_name,
     type_where_preds, ue_effects, ue_methods, var_enum_frame_starts, var_enums,
@@ -776,7 +776,16 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                                     }
                                 }
                                 if op_ret_ct == CT_OPTION {
-                                    if op_ret_inner_struct != "" {
+                                    if op_ret_inner_struct != "" && is_transparent_newtype(op_ret_inner_struct) != 0 {
+                                        // A transparent newtype lowers to a bare int64_t: its Option
+                                        // carrier is a scalar carrier with no heap pointer to erase to
+                                        // the uniform vtable ABI. Keep the transparent carrier on the
+                                        // op signature and mark the inner scalar so the perform site
+                                        // reads it by identity instead of casting a pointer.
+                                        ensure_struct_option_type(op_ret_inner_struct)
+                                        op_c_ret = struct_option_c_type(op_ret_inner_struct)
+                                        op_ret_inner_ct = CT_INT
+                                    } else if op_ret_inner_struct != "" {
                                         ensure_option_type(CT_PTR)
                                         op_c_ret = option_c_type(CT_PTR)
                                         op_ret_inner_ct = CT_PTR
@@ -939,7 +948,15 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     while ue_pre < ue_methods.len() {
         let ue_m = ue_methods.get(ue_pre).unwrap()
         if ue_m.ret_ct == CT_OPTION {
-            emit_option_typedef(ue_m.ret_inner_ct)
+            if ue_m.ret_inner_struct != "" && is_transparent_newtype(ue_m.ret_inner_struct) != 0 {
+                // Transparent newtype: the op signature keeps the scalar struct-option
+                // carrier (blink_Option_<NT>, a bare int64_t value). Emit it INLINE here
+                // (not via the deferred ensure_* list) so the typedef precedes the vtable
+                // struct that references it.
+                emit_struct_option_typedef(ue_m.ret_inner_struct)
+            } else {
+                emit_option_typedef(ue_m.ret_inner_ct)
+            }
         } else if ue_m.ret_ct == CT_RESULT {
             if ue_m.ret_inner_struct != "" && ue_m.ret_inner_ct == CT_VOID {
                 let td_ok = find_type_def_node(ue_m.ret_inner_struct)

@@ -1,6 +1,7 @@
 import parser.{
     node_effects, node_elements, node_fields, node_is_pub, node_module, node_name, node_params, node_return_type,
     node_source_module, node_trait_name, node_type_ann, node_type_name, node_type_params,
+    node_value,
     sublist_get, sublist_length
 }
 import ast.{dbg_channel_on, dbg_trace}
@@ -8327,7 +8328,12 @@ pub fn is_transparent_newtype(tag: Str) -> Int {
     // multi-field payload) must fall through to normal boxed enum codegen — name
     // alone would otherwise silently miscompile it.
     let vidx = get_variant_index("Errno", "Errno")
-    if vidx < 0 { return 0 }
+    if vidx < 0 {
+        // The UE-effect vtable-signature pass runs BEFORE any enum typedef is
+        // emitted, so enum_variants is still empty there. Read the shape straight
+        // from the declaration node so the vtable ABI and the later consumers agree.
+        return is_transparent_newtype_from_decl()
+    }
     let ev = enum_variants.get(vidx).unwrap()
     if ev.field_count != 1 { return 0 }
     // Exactly one variant in the enum (no sibling variants sharing its enum_idx).
@@ -8345,6 +8351,25 @@ pub fn is_transparent_newtype(tag: Str) -> Int {
         Some(ft) => if ft != "Int" { return 0 }
         None => return 0
     }
+    1
+}
+
+// The shape gate of is_transparent_newtype, read from the AST rather than the
+// enum_variants registry — for the early UE-effect signature pass that runs
+// before any enum typedef (and its variant registration) is emitted. Mirrors the
+// registry gate: the canonical `Errno` enum, single variant, single Int field.
+fn is_transparent_newtype_from_decl() -> Int {
+    let td = find_type_def_node("Errno")
+    if td == -1 { return 0 }
+    let vars = node_fields(td)
+    if vars == -1 || sublist_length(vars) != 1 { return 0 }
+    let v = sublist_get(vars, 0)
+    let vflds = node_fields(v)
+    if vflds == -1 || sublist_length(vflds) != 1 { return 0 }
+    let vf = sublist_get(vflds, 0)
+    let ann = node_value(vf)
+    if ann == -1 { return 0 }
+    if node_name(ann) != "Int" { return 0 }
     1
 }
 
