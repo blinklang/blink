@@ -116,7 +116,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{sv_ty_or_flat_at, tc_tid_child, tc_top_level_let_tid, ctype_probe_at, closure_sig_from_tid, enum_instance_c_from_tid, struct_instance_c_from_tid, tc_tid_handler_effect, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_tuple_sname, tc_tid_to_c_tag}
+import typecheck.{sv_ty_or_flat_at, tc_tid_child, tc_top_level_let_tid, ctype_probe_at, closure_sig_from_tid, enum_instance_c_from_tid, struct_instance_c_from_tid, tc_tid_handler_effect, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_tuple_sname, tc_tid_to_c_tag, tc_variant_field_tid_by_name}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -825,6 +825,45 @@ fn rhs_is_genuine_void(val_type: Int, val_node: Int) -> Int {
     0
 }
 
+// The tuple carrier tag of an enum variant's field, or `fallback` when the
+// field isn't a tuple or its carrier isn't registered (e.g. a generic-enum
+// instance whose payload tid still holds typevars). The tag drives the nested
+// TuplePattern expansion in the match-binder.
+fn tuple_field_carrier_tag(enum_name: Str, variant_name: Str, field_name: Str, fallback: Str) -> Str {
+    let ftid = tc_variant_field_tid_by_name(enum_name, variant_name, field_name)
+    if ftid < 0 { return fallback }
+    let rtid = tc_tid_resolved(ftid)
+    if tc_tid_kind(rtid) != TyKind.Tuple { return fallback }
+    let tag = tc_tid_tuple_sname(rtid)
+    if tag != "" && tuple_struct_arity(tag) >= 0 { tag } else { fallback }
+}
+
+// Materialize a tuple scrutinee into one temp and push one `._i` field-access
+// entry per element onto match_scruts, so a TuplePattern arm can index
+// scrut_off + j per element. Element types/carrier metadata come from the
+// tuple's registered fields. Shared by the top-level tuple-scrutinee fast path
+// and the nested tuple sub-pattern expansion (an enum variant Tuple payload).
+fn expand_tuple_scrut_entry(tup_tag: Str, base_expr: Str) ! Codegen.Emit, Codegen.Scope {
+    let scrut_tmp = fresh_temp("_scrut_")
+    emit_line("{c_type_c_name(tup_tag)} {scrut_tmp} = {base_expr};")
+    set_var(scrut_tmp, CT_STRUCT, 1)
+    set_var_struct(scrut_tmp, tup_tag)
+    let arity = tuple_struct_arity(tup_tag)
+    let mut ti = 0
+    while ti < arity {
+        let field_name = "_{ti}"
+        let ft = get_struct_field_type(tup_tag, field_name)
+        let fs = get_struct_field_stype(tup_tag, field_name)
+        let elem_expr = "{scrut_tmp}.{field_name}"
+        if fs != "" {
+            match_scruts.push(MatchScrutEntry { str_val: elem_expr, scrut_type: CT_STRUCT, scrut_sname: fs })
+        } else {
+            match_scruts.push(MatchScrutEntry { str_val: elem_expr, scrut_type: ft })
+        }
+        ti = ti + 1
+    }
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let scrut = node_scrutinee(node)
@@ -1087,25 +1126,7 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
             // field-access entry per element, mirroring the fast path. Element
             // types/carrier metadata come from the tuple's registered fields,
             // exactly as emit_tuple_destructure resolves them.
-            let tup_s = get_var_struct(expr_result_str)
-            let arity = tuple_struct_arity(tup_s)
-            let scrut_tmp = fresh_temp("_scrut_")
-            emit_line("{c_type_c_name(tup_s)} {scrut_tmp} = {expr_result_str};")
-            set_var(scrut_tmp, CT_STRUCT, 1)
-            set_var_struct(scrut_tmp, tup_s)
-            let mut ti = 0
-            while ti < arity {
-                let field_name = "_{ti}"
-                let ft = get_struct_field_type(tup_s, field_name)
-                let fs = get_struct_field_stype(tup_s, field_name)
-                let elem_expr = "{scrut_tmp}.{field_name}"
-                if fs != "" {
-                    match_scruts.push(MatchScrutEntry { str_val: elem_expr, scrut_type: CT_STRUCT, scrut_sname: fs })
-                } else {
-                    match_scruts.push(MatchScrutEntry { str_val: elem_expr, scrut_type: ft })
-                }
-                ti = ti + 1
-            }
+            expand_tuple_scrut_entry(get_var_struct(expr_result_str), expr_result_str)
         } else {
             match_scruts.push(MatchScrutEntry { str_val: expr_result_str, scrut_type: expr_result_type })
         }
@@ -1941,7 +1962,10 @@ fn bind_struct_style_variant_fields(vidx: Int, fcount: Int, resolved_enum: Str, 
         let field_ct = type_from_name(found_ft)
         if fpat_node != -1 {
             let saved_scruts = match_scruts
-            match_scruts = [MatchScrutEntry { str_val: "{scrut}.data.{resolved_variant}.{field_name}", scrut_type: field_ct }]
+            // A tuple payload has no struct/enum name; publish its carrier tag so the
+            // TuplePattern arm can expand the single whole-tuple entry per element.
+            let ss_entry_sname = if node_kind(fpat_node) == NodeKind.TuplePattern { tuple_field_carrier_tag(resolved_enum, resolved_variant, field_name, "") } else { "" }
+            match_scruts = [MatchScrutEntry { str_val: "{scrut}.data.{resolved_variant}.{field_name}", scrut_type: field_ct, scrut_sname: ss_entry_sname }]
             let saved_enum = match_scrut_enum
             match_scrut_enum = if found_ft != "" && is_enum_type(found_ft) != 0 { found_ft } else { "" }
             bind_pattern_vars(fpat_node, 0, 1)
@@ -2461,7 +2485,11 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                             // resolves to its instance stem when that names a mono. The
                             // bare enum name is used for match_scrut_enum's variant lookups.
                             let nested_mono = if is_mono_struct_instance(field_type_name) != 0 { field_type_name } else { "" }
-                            match_scruts = [MatchScrutEntry { str_val: "{scrut}.data.{resolved_variant}.{field_name}", scrut_type: field_ct, scrut_sname: nested_mono }]
+                            // A tuple payload has no struct/enum name; publish its carrier tag so
+                            // the TuplePattern arm can expand the single whole-tuple entry into
+                            // one per-element entry rather than indexing past the only entry.
+                            let pos_entry_sname = if sub_pk == NodeKind.TuplePattern { tuple_field_carrier_tag(resolved_enum, resolved_variant, field_name, nested_mono) } else { nested_mono }
+                            match_scruts = [MatchScrutEntry { str_val: "{scrut}.data.{resolved_variant}.{field_name}", scrut_type: field_ct, scrut_sname: pos_entry_sname }]
                             let saved_enum = match_scrut_enum
                             match_scrut_enum = if field_type_name != "" && is_enum_type(strip_generic_args(field_type_name)) != 0 { strip_generic_args(field_type_name) } else { "" }
                             bind_pattern_vars(sub_pat, 0, 1)
@@ -2657,8 +2685,30 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
     if pk == NodeKind.TuplePattern {
         let elems_sl = node_elements(pat)
         if elems_sl != -1 {
+            let n_elems = sublist_length(elems_sl)
+            // Two shapes reach here. The top-level tuple-scrutinee fast path
+            // pre-expands the tuple into one entry per element (scrut_len ==
+            // n_elems). A nested tuple sub-pattern (an enum variant Tuple
+            // payload) arrives as a SINGLE whole-tuple entry whose scrut_sname
+            // names the tuple carrier; expand it the same way before indexing
+            // per element, else scrut_off + j past element 0 unwraps a None.
+            if scrut_len == 1 && n_elems > 1 {
+                let whole = match_scruts.get(scrut_off).unwrap()
+                if whole.scrut_sname != "" && tuple_struct_arity(whole.scrut_sname) >= 0 {
+                    let saved_scruts = match_scruts
+                    match_scruts = []
+                    expand_tuple_scrut_entry(whole.scrut_sname, whole.str_val)
+                    let mut je = 0
+                    while je < n_elems {
+                        bind_pattern_vars(sublist_get(elems_sl, je), je, 1)
+                        je = je + 1
+                    }
+                    match_scruts = saved_scruts
+                    return
+                }
+            }
             let mut j = 0
-            while j < sublist_length(elems_sl) {
+            while j < n_elems {
                 let sub_pat = sublist_get(elems_sl, j)
                 bind_pattern_vars(sub_pat, scrut_off + j, 1)
                 j = j + 1
