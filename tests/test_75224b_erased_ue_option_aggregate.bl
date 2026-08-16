@@ -1,0 +1,234 @@
+// A user-effect handler whose op returns `Option[Struct]` erases that return to the shared
+// `blink_Option_ptr` handler-vtable ABI. The per-value erased marker fixes only SCALAR in-body
+// consumers (unwrap/match/??/?) — it structurally CANNOT fix an erased `Some(struct)` that flows
+// into a FIXED C aggregate typedef (struct field, tuple element, list element), because the
+// aggregate's C type is decided at its typedef, not per value: a `blink_Option_ptr` box would land
+// in a `blink_Option_Item` slot.
+//
+// The fix is erase-only-at-boundary: in-body `Some(struct)` stays a concrete `blink_Option_Item`
+// everywhere (so every aggregate slot is well typed); ONLY the handler op's return boundary boxes
+// the concrete option into the erased `blink_Option_ptr` vtable ABI.
+
+import compile_test_helpers
+
+fn struct_field_src() -> Str {
+    #"import std.io
+
+type Item {
+    name: Str
+    count: Int
+}
+
+type Box {
+    opt: Option[Item]
+    flag: Bool
+}
+
+effect Store {
+    effect Lookup {
+        fn find(name: Str) -> Option[Item]
+    }
+}
+
+fn lookup(name: Str) -> Option[Item] ! Store.Lookup {
+    store.find(name)
+}
+
+fn main() {
+    with handler Store {
+        fn find(name: Str) -> Option[Item] {
+            let b = Box { opt: Some(Item { name: name, count: 7 }), flag: true }
+            b.opt
+        }
+    } {
+        let r = lookup("apple")
+        io.println("n={r.unwrap().name} c={r.unwrap().count}")
+    }
+}
+"#
+}
+
+test "an erased UE-handler Option[Struct] stored into a struct field round-trips" {
+    let r = compile_test_helpers.compile_and_run(struct_field_src(), "75224b_struct_field")
+    if !r.out.contains("n=apple c=7") { compile_test_helpers.expect_contains(r.out, "n=apple c=7", "struct-field aggregate — got '{r.err_out}'") }
+    assert(r.out.contains("n=apple c=7"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn tuple_elem_src() -> Str {
+    #"import std.io
+
+type Item {
+    name: Str
+    count: Int
+}
+
+effect Store {
+    effect Lookup {
+        fn find(name: Str) -> Option[Item]
+    }
+}
+
+fn lookup(name: Str) -> Option[Item] ! Store.Lookup {
+    store.find(name)
+}
+
+fn main() {
+    with handler Store {
+        fn find(name: Str) -> Option[Item] {
+            let pair = (Some(Item { name: name, count: 5 }), true)
+            pair.0
+        }
+    } {
+        let r = lookup("pear")
+        io.println("n={r.unwrap().name} c={r.unwrap().count}")
+    }
+}
+"#
+}
+
+test "an erased UE-handler Option[Struct] stored into a tuple element round-trips" {
+    let r = compile_test_helpers.compile_and_run(tuple_elem_src(), "75224b_tuple_elem")
+    if !r.out.contains("n=pear c=5") { compile_test_helpers.expect_contains(r.out, "n=pear c=5", "tuple-element aggregate — got '{r.err_out}'") }
+    assert(r.out.contains("n=pear c=5"))
+    assert_eq(r.exit_code, 0)
+}
+
+// A bare `return None` fallback in the handler op must produce the concrete blink_Option_Item
+// (tag 0) that the boundary boxes, not a flat inner=CT_PTR that diverges from the tid. The Some
+// path and the None path must agree at the boundary.
+fn return_none_src() -> Str {
+    #"import std.io
+
+type Item {
+    name: Str
+    count: Int
+}
+
+effect Store {
+    effect Lookup {
+        fn find(name: Str) -> Option[Item]
+    }
+}
+
+fn lookup(name: Str) -> Option[Item] ! Store.Lookup {
+    store.find(name)
+}
+
+fn main() {
+    with handler Store {
+        fn find(name: Str) -> Option[Item] {
+            if name == "miss" { return None }
+            Some(Item { name: name, count: 8 })
+        }
+    } {
+        let a = lookup("hit")
+        let b = lookup("miss")
+        io.println("a={a.unwrap().name} b_none={b.is_none()}")
+    }
+}
+"#
+}
+
+test "an erased UE-handler Option[Struct] with a return-None fallback boxes both paths" {
+    let r = compile_test_helpers.compile_and_run(return_none_src(), "75224b_return_none")
+    if !r.out.contains("a=hit b_none=true") { compile_test_helpers.expect_contains(r.out, "a=hit b_none=true", "return-None fallback — got '{r.err_out}'") }
+    assert(r.out.contains("a=hit b_none=true"))
+    assert_eq(r.exit_code, 0)
+}
+
+// Reassigning `o = Some(struct)` into a concrete-sourced Option var must not erase the value
+// unconditionally (the old per-value path erased the assign but consulted the target bit on a
+// None-assign — an asymmetry). With erase-only-at-boundary both stay concrete in-body.
+fn reassign_src() -> Str {
+    #"import std.io
+
+type Item {
+    name: Str
+    count: Int
+}
+
+effect Store {
+    effect Lookup {
+        fn find(name: Str) -> Option[Item]
+    }
+}
+
+fn lookup(name: Str) -> Option[Item] ! Store.Lookup {
+    store.find(name)
+}
+
+fn main() {
+    with handler Store {
+        fn find(name: Str) -> Option[Item] {
+            let mut o = Some(Item { name: "init", count: 1 })
+            o = Some(Item { name: name, count: 2 })
+            o
+        }
+    } {
+        let r = lookup("apple")
+        io.println("n={r.unwrap().name} c={r.unwrap().count}")
+    }
+}
+"#
+}
+
+test "an erased UE-handler Option[Struct] reassigned in-body round-trips" {
+    let r = compile_test_helpers.compile_and_run(reassign_src(), "75224b_reassign")
+    if !r.out.contains("n=apple c=2") { compile_test_helpers.expect_contains(r.out, "n=apple c=2", "in-body reassign — got '{r.err_out}'") }
+    assert(r.out.contains("n=apple c=2"))
+    assert_eq(r.exit_code, 0)
+}
+
+// A data-enum inner (not a struct) exercises the enum arm of the boundary gate. It must be
+// heap-boxed and boxed to blink_Option_ptr exactly like a struct — but only a NON-transparent
+// enum: a transparent newtype (inline scalar payload, e.g. Errno) has no heap pointer to
+// reinterpret, so the gate excludes it and keeps the uniform in-body ptr erasure.
+fn enum_field_src() -> Str {
+    #"import std.io
+
+type Shape {
+    Circle(Int)
+    Square(Int)
+}
+
+type Holder {
+    shp: Option[Shape]
+    flag: Bool
+}
+
+effect Store {
+    effect Lookup {
+        fn find(name: Str) -> Option[Shape]
+    }
+}
+
+fn lookup(name: Str) -> Option[Shape] ! Store.Lookup {
+    store.find(name)
+}
+
+fn main() {
+    with handler Store {
+        fn find(name: Str) -> Option[Shape] {
+            let h = Holder { shp: Some(Circle(9)), flag: true }
+            h.shp
+        }
+    } {
+        let r = lookup("x")
+        let s = r.unwrap()
+        let out = match s {
+            Circle(n) => "circle {n}"
+            Square(n) => "square {n}"
+        }
+        io.println("shape={out}")
+    }
+}
+"#
+}
+
+test "an erased UE-handler Option[Enum] stored into a struct field round-trips" {
+    let r = compile_test_helpers.compile_and_run(enum_field_src(), "75224b_enum_field")
+    if !r.out.contains("shape=circle 9") { compile_test_helpers.expect_contains(r.out, "shape=circle 9", "enum-field aggregate — got '{r.err_out}'") }
+    assert(r.out.contains("shape=circle 9"))
+    assert_eq(r.exit_code, 0)
+}

@@ -13,7 +13,7 @@ import codegen_types.{
     cg_mono_tparams_sl, cg_mono_arg_tids, cg_fn_mono_tparams_sl, cg_fn_mono_arg_tids,
     cg_debug_mode, cg_handler_body_field, cg_handler_body_idx,
     cg_handler_body_is_ue, cg_handler_body_vtable_type,
-    cg_handler_caps, HandlerCapture,
+    cg_handler_caps, HandlerCapture, cg_handler_ret_option_erased,
     cg_handler_counter, cg_handler_is_user_effect,
     cg_handler_vtable_field, cg_handler_vtable_type,
     cg_in_handler_body, cg_indent, cg_lines, cg_program_node,
@@ -63,7 +63,7 @@ import codegen_types.{
     reg_fn, reg_fn_ret_from_ann, reg_fn_ret_struct_inner,
     reg_fn_ret_type, reg_fn_struct_ret, reg_fn_with_effects,
     register_mono_fn, register_mono_instance,
-    resolve_import_alias, resolve_option_inner_from_ann,
+    resolve_import_alias, resolve_option_inner_from_ann, ue_handler_option_inner_name,
     resolve_ptr_inner_c, resolve_result_inner_tag, resolve_ret_type_from_ann, resolve_struct_from_c_name,
     resolve_tparam_seg,
     nth_type_arg, resolve_variant, struct_concrete_args_from_target,
@@ -1577,6 +1577,8 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
             let saved_handler_hidx = cg_handler_body_idx
             let saved_fn_ret = cg_current_fn_ret
             let saved_fn_option_inner = cg_current_fn_option_inner
+            let saved_fn_option_inner_struct = cg_current_fn_option_inner_struct
+            let saved_handler_ret_opt_erased = cg_handler_ret_option_erased
             let saved_fn_name = cg_current_fn_name
             let saved_fn_has_ev_h = cg_current_fn_has_ev
             let saved_handler_caps = cg_handler_caps
@@ -1609,8 +1611,26 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
                     reg_fn_ret_struct_inner(static_name, "Option_ptr", _fsi_cur.err_struct)
                 }
             }
+            cg_handler_ret_option_erased = 0
             if ue_needs_ptr {
-                cg_current_fn_option_inner = CT_PTR
+                let _ue_inner_struct = ue_handler_option_inner_name(m)
+                if _ue_inner_struct != "" && is_transparent_newtype(_ue_inner_struct) == 0 {
+                    // Erase-only-at-boundary: the inner is a genuine heap-boxed struct/enum, so
+                    // keep the in-body Option carrier CONCRETE (inner CT_VOID + the struct name)
+                    // and every value — struct field, tuple element, if/match arm — is a
+                    // well-typed blink_Option_<Struct>. The C return signature stays
+                    // blink_Option_ptr (the shared vtable ABI); emit_return_with_trace boxes the
+                    // heap pointer concrete->ptr once at the boundary.
+                    cg_current_fn_option_inner = CT_VOID
+                    cg_current_fn_option_inner_struct = _ue_inner_struct
+                    cg_handler_ret_option_erased = 1
+                } else {
+                    // Un-nameable inner (typevar/alias) or a transparent newtype (inline scalar
+                    // payload, no heap pointer to reinterpret): the concrete blink_Option_<Struct>
+                    // carrier does not apply, so fall back to the uniform in-body ptr erasure that
+                    // heap-boxes each value per construction.
+                    cg_current_fn_option_inner = CT_PTR
+                }
             } else if ue_result_opt_ptr != 0 {
                 cg_current_fn_option_inner = CT_PTR
             } else if ret_type == CT_OPTION {
@@ -1677,6 +1697,8 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
             cg_handler_caps = saved_handler_caps
             cg_current_fn_ret = saved_fn_ret
             cg_current_fn_option_inner = saved_fn_option_inner
+            cg_current_fn_option_inner_struct = saved_fn_option_inner_struct
+            cg_handler_ret_option_erased = saved_handler_ret_opt_erased
             cg_current_fn_name = saved_fn_name
             cg_current_fn_has_ev = saved_fn_has_ev_h
             cg_in_traced_fn = saved_in_traced
@@ -1844,6 +1866,14 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
     let saved_fn_has_ev = cg_current_fn_has_ev
     let saved_fn_ret = cg_current_fn_ret
     let saved_fn_option_inner = cg_current_fn_option_inner
+    // The spawned task is its own static C function, never a UE handler-op return boundary, so it
+    // must not inherit the enclosing handler's erase-at-boundary state — otherwise a task body
+    // returning Option would trip emit_return_with_trace's concrete->ptr box with the outer
+    // handler's leaked struct name.
+    let saved_fn_option_inner_struct = cg_current_fn_option_inner_struct
+    let saved_handler_ret_opt_erased = cg_handler_ret_option_erased
+    cg_current_fn_option_inner_struct = ""
+    cg_handler_ret_option_erased = 0
     // The spawned task is its own static C function; it must not inherit the
     // enclosing test/assert_panics elaboration, or a `?` inside it would emit a
     // test-propagation `return` or `goto __ap_returned_<n>` into a frame/label
@@ -1910,6 +1940,8 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
     cg_current_fn_has_ev = saved_fn_has_ev
     cg_current_fn_ret = saved_fn_ret
     cg_current_fn_option_inner = saved_fn_option_inner
+    cg_current_fn_option_inner_struct = saved_fn_option_inner_struct
+    cg_handler_ret_option_erased = saved_handler_ret_opt_erased
     cg_in_test_body = saved_in_test
     cg_in_assert_panics = saved_in_ap
     cg_in_traced_fn = saved_in_traced
@@ -2767,7 +2799,13 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 let opt_inner = expr_option_inner
                 let opt_inner_s = expr_option_inner_struct
                 let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
-                let fn_opt_c = if fsi.ok_struct != "" {
+                // A `?`-propagated None emits its OWN inline `return`, bypassing the boundary box in
+                // emit_return_with_trace. In an erase-only-at-boundary handler op the C return type is
+                // the shared blink_Option_ptr ABI, so the None sentinel must spell that carrier.
+                let fn_opt_c = if cg_handler_ret_option_erased != 0 {
+                    ensure_option_type(CT_PTR)
+                    option_c_type(CT_PTR)
+                } else if fsi.ok_struct != "" {
                     struct_option_c_type(fsi.ok_struct)
                 } else {
                     let fn_inner = if cg_current_fn_option_inner != 0 { cg_current_fn_option_inner } else { CT_INT }
