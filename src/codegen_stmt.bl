@@ -2105,40 +2105,49 @@ fn bind_struct_style_variant_fields(vidx: Int, fcount: Int, resolved_enum: Str, 
             }
             vfi = vfi + 1
         }
-        let field_ct = type_from_name(found_ft)
+        // A generic-enum instance carries its mono stem on scrut_mono; a field whose
+        // declared type is a typevar (`val: T`) resolves against it so the binder gets
+        // the concrete C type instead of the erased `void`. Mirrors the positional path.
+        let res_ft = resolve_variant_field_type_mono(found_ft, resolved_enum, scrut_mono)
+        let field_ct = type_from_name(res_ft)
         if fpat_node != -1 {
             let saved_scruts = match_scruts
             // A tuple payload has no struct/enum name; publish its carrier tag so the
-            // TuplePattern arm can expand the single whole-tuple entry per element.
-            let ss_entry_sname = if node_kind(fpat_node) == NodeKind.TuplePattern { tuple_field_carrier_tag_mono(resolved_enum, resolved_variant, field_name, scrut_mono, "") } else { "" }
+            // TuplePattern arm can expand the single whole-tuple entry per element. A
+            // struct/enum field publishes its resolved name so the recursed IdentPattern
+            // binder spells the concrete type when its own typevar tid cannot.
+            let ss_entry_sname =
+                if node_kind(fpat_node) == NodeKind.TuplePattern { tuple_field_carrier_tag_mono(resolved_enum, resolved_variant, field_name, scrut_mono, "") }
+                else if res_ft != "" && (is_struct_type(res_ft) != 0 || is_enum_type(res_ft) != 0) { res_ft }
+                else { "" }
             match_scruts = [MatchScrutEntry { str_val: "{scrut}.data.{resolved_variant}.{field_name}", scrut_type: field_ct, scrut_sname: ss_entry_sname }]
             let saved_enum = match_scrut_enum
-            match_scrut_enum = if found_ft != "" && is_enum_type(found_ft) != 0 { found_ft } else { "" }
+            match_scrut_enum = if res_ft != "" && is_enum_type(res_ft) != 0 { res_ft } else { "" }
             bind_pattern_vars(fpat_node, 0, 1)
             match_scrut_enum = saved_enum
             match_scruts = saved_scruts
         } else {
             let c_bind = c_safe_name(field_name)
-            if found_ft == resolved_enum {
-                let fc_name = c_type_c_name(found_ft)
+            if res_ft == resolved_enum {
+                let fc_name = c_type_c_name(res_ft)
                 emit_line("{fc_name} {c_bind} = *({fc_name}*)(intptr_t){scrut}.data.{resolved_variant}.{field_name};")
                 set_var(field_name, CT_VOID, 0)
-                set_var_struct(field_name, found_ft)
-                var_enums.push(VarEnumEntry { name: field_name, enum_type: found_ft })
-            } else if is_struct_type(found_ft) != 0 {
-                emit_line("{c_type_c_name(found_ft)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
+                set_var_struct(field_name, res_ft)
+                var_enums.push(VarEnumEntry { name: field_name, enum_type: res_ft })
+            } else if is_struct_type(res_ft) != 0 {
+                emit_line("{c_type_c_name(res_ft)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
                 set_var(field_name, CT_VOID, 0)
-                set_var_struct(field_name, found_ft)
-            } else if is_enum_type(found_ft) != 0 {
-                emit_line("{c_type_c_name(found_ft)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
+                set_var_struct(field_name, res_ft)
+            } else if is_enum_type(res_ft) != 0 {
+                emit_line("{c_type_c_name(res_ft)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
                 set_var(field_name, CT_INT, 0)
-                var_enums.push(VarEnumEntry { name: field_name, enum_type: found_ft })
+                var_enums.push(VarEnumEntry { name: field_name, enum_type: res_ft })
             } else if field_ct == CT_LIST {
                 emit_line("blink_list* {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
                 set_var(field_name, CT_LIST, 0)
-                let bracket_pos = found_ft.index_of("[")
+                let bracket_pos = res_ft.index_of("[")
                 if bracket_pos > 0 {
-                    let inner_name = found_ft.substr(bracket_pos + 1, found_ft.len() - bracket_pos - 2)
+                    let inner_name = res_ft.substr(bracket_pos + 1, res_ft.len() - bracket_pos - 2)
                     let inner_ct = type_from_name(inner_name)
                     if inner_ct != CT_VOID {
                         set_list_elem_type(field_name, inner_ct)
@@ -2150,7 +2159,7 @@ fn bind_struct_style_variant_fields(vidx: Int, fcount: Int, resolved_enum: Str, 
             } else if field_ct == CT_OPTION || field_ct == CT_RESULT {
                 emit_line("__typeof__({scrut}.data.{resolved_variant}.{field_name}) {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
                 set_var(field_name, field_ct, 0)
-                register_var_compound_inner_from_str(field_name, found_ft)
+                register_var_compound_inner_from_str(field_name, res_ft)
             } else {
                 let sf_flat_c = c_type_str(field_ct)
                 // The struct-style sibling of match_binder.variant_field: the binder reaches here
