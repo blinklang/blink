@@ -1,0 +1,174 @@
+// A user-effect handler whose operation returns `Option[Struct]` erases that return to the
+// shared `blink_Option_ptr` handler-vtable ABI: the `Some(Struct)` constructor heap-boxes the
+// payload as `void*`. When the SAME handler body then consumes an erased Option in-body — unwrap,
+// a `match` arm, or `??` — the consumer must reassert the erased carrier AND cast the `void*`
+// payload back to the true struct pointer. Reading `.value` without the cast miscompiles (a
+// `void*` assigned straight into a `blink_Item`).
+//
+// The logical inner stays TRUE (the tid says Item); only the physical carrier is erased. Each
+// consumer recovers the struct from the per-value erased marker, not from a body-wide sentinel.
+
+import compile_test_helpers
+
+fn inbody_unwrap_src() -> Str {
+    #"import std.io
+
+type Item {
+    name: Str
+    count: Int
+}
+
+effect Store {
+    effect Lookup {
+        fn find(name: Str) -> Option[Item]
+    }
+}
+
+fn lookup(name: Str) -> Option[Item] ! Store.Lookup {
+    store.find(name)
+}
+
+fn main() {
+    with handler Store {
+        fn find(name: Str) -> Option[Item] {
+            let o = Some(Item { name: name, count: 7 })
+            let x = o.unwrap()
+            io.println("inbody n={x.name} c={x.count}")
+            Some(x)
+        }
+    } {
+        let r = lookup("apple")
+        io.println("n={r.unwrap().name} c={r.unwrap().count}")
+    }
+}
+"#
+}
+
+test "an erased Option[Struct] unwrapped in the same UE handler body casts the void* payload back" {
+    let r = compile_test_helpers.compile_and_run(inbody_unwrap_src(), "ue_inbody_unwrap")
+    if !r.out.contains("inbody n=apple c=7") { compile_test_helpers.expect_contains(r.out, "inbody n=apple c=7", "in-body unwrap of erased Some — got '{r.err_out}'") }
+    assert(r.out.contains("inbody n=apple c=7"))
+    assert(r.out.contains("n=apple c=7"))
+}
+
+fn inbody_match_src() -> Str {
+    #"import std.io
+
+type Item {
+    name: Str
+    count: Int
+}
+
+effect Store {
+    effect Lookup {
+        fn find(name: Str) -> Option[Item]
+    }
+}
+
+fn lookup(name: Str) -> Option[Item] ! Store.Lookup {
+    store.find(name)
+}
+
+fn main() {
+    with handler Store {
+        fn find(name: Str) -> Option[Item] {
+            let o = Some(Item { name: name, count: 9 })
+            let picked = match o {
+                Some(it) => Item { name: it.name, count: it.count + 1 }
+                None => Item { name: "none", count: 0 }
+            }
+            Some(picked)
+        }
+    } {
+        let r = lookup("pear")
+        io.println("n={r.unwrap().name} c={r.unwrap().count}")
+    }
+}
+"#
+}
+
+test "an erased Option[Struct] matched in the same UE handler body casts the void* payload back" {
+    let r = compile_test_helpers.compile_and_run(inbody_match_src(), "ue_inbody_match")
+    if !r.out.contains("n=pear c=10") { compile_test_helpers.expect_contains(r.out, "n=pear c=10", "in-body match of erased Some — got '{r.err_out}'") }
+    assert(r.out.contains("n=pear c=10"))
+}
+
+fn inbody_coalesce_src() -> Str {
+    #"import std.io
+
+type Item {
+    name: Str
+    count: Int
+}
+
+effect Store {
+    effect Lookup {
+        fn find(name: Str) -> Option[Item]
+    }
+}
+
+fn lookup(name: Str) -> Option[Item] ! Store.Lookup {
+    store.find(name)
+}
+
+fn main() {
+    with handler Store {
+        fn find(name: Str) -> Option[Item] {
+            let o = Some(Item { name: name, count: 3 })
+            let x = o ?? Item { name: "fallback", count: 0 }
+            Some(x)
+        }
+    } {
+        let r = lookup("plum")
+        io.println("n={r.unwrap().name} c={r.unwrap().count}")
+    }
+}
+"#
+}
+
+test "an erased Option[Struct] coalesced with ?? in the same UE handler body casts the void* payload back" {
+    let r = compile_test_helpers.compile_and_run(inbody_coalesce_src(), "ue_inbody_coalesce")
+    if !r.out.contains("n=plum c=3") { compile_test_helpers.expect_contains(r.out, "n=plum c=3", "in-body ?? of erased Some — got '{r.err_out}'") }
+    assert(r.out.contains("n=plum c=3"))
+}
+
+fn inbody_question_src() -> Str {
+    #"import std.io
+
+type Item {
+    name: Str
+    count: Int
+}
+
+effect Store {
+    effect Lookup {
+        fn find(name: Str) -> Option[Item]
+    }
+}
+
+fn lookup(name: Str) -> Option[Item] ! Store.Lookup {
+    store.find(name)
+}
+
+fn main() {
+    with handler Store {
+        fn find(name: Str) -> Option[Item] {
+            let o = Some(Item { name: name, count: 4 })
+            let x = o?
+            io.println("q n={x.name} c={x.count}")
+            Some(x)
+        }
+    } {
+        let r = lookup("apple")
+        io.println("n={r.unwrap().name} c={r.unwrap().count}")
+    }
+}
+"#
+}
+
+test "an erased Option[Struct] propagated with ? in the same UE handler body casts the void* payload back" {
+    let r = compile_test_helpers.compile_and_run(inbody_question_src(), "ue_inbody_question")
+    if !r.out.contains("q n=apple c=4") { compile_test_helpers.expect_contains(r.out, "q n=apple c=4", "in-body ? of erased Some — got '{r.err_out}'") }
+    assert(r.out.contains("q n=apple c=4"))
+    assert(r.out.contains("n=apple c=4"))
+}

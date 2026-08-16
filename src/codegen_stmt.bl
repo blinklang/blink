@@ -45,6 +45,7 @@ import codegen_types.{
     get_var_closure_sig, get_var_handler_vtable_type,
     get_var_handle_sname, get_var_handle_sname2, get_var_iter_next_fn,
     get_var_iterator_inner, get_var_option_inner, get_var_option_inner_struct,
+    get_var_option_erased, set_var_option_erased,
     get_var_result_err, get_var_result_err_struct, get_var_result_ok,
     get_var_result_ok_struct, get_var_struct, get_var_type, has_derive_method, is_scope_var,
     get_variant_field_count, get_variant_field_name,
@@ -96,7 +97,7 @@ import codegen_expr.{
     expr_map_key_type, expr_map_val_type, expr_map_val_struct, expr_map_key_struct, expr_option_inner,
     expr_option_inner_list_elem, expr_option_inner_list_struct,
     expr_option_inner_map_val_struct, expr_option_inner_map_val_list_elem, expr_option_inner_tp,
-    expr_option_inner_struct, expr_option_is_none, expr_result_err_struct, expr_result_err_type,
+    expr_option_inner_struct, expr_option_is_none, expr_option_erased, expr_result_err_struct, expr_result_err_type,
     expr_result_ok_struct, expr_result_ok_type, expr_result_str,
     expr_result_type, mono_instance_arg_tids_from_tid, panic_file_for, panic_file_for_fmt,
     panic_line_str, emit_panic_site, segs_from_arg_tids,
@@ -975,7 +976,19 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
             } else {
                 let oi = expr_option_inner
                 let oi_s = expr_option_inner_struct
-                if oi_s != "" {
+                let oi_erased = expr_option_erased
+                if oi_erased != 0 {
+                    // A ptr-erased scrutinee is a blink_Option_ptr box; the true struct
+                    // rides oi_s and the payload is recovered by the Some(x) arm. Record
+                    // the true struct + erased bit on scrut_tmp so bind_pattern_vars casts
+                    // the void* payload back — the transient expr_option_erased global is
+                    // clobbered by the intervening arm-condition emits.
+                    ensure_option_type(CT_PTR)
+                    let opt_c = option_c_type(CT_PTR)
+                    emit_line("{opt_c} {scrut_tmp} = {expr_result_str};")
+                    set_var_option_struct(scrut_tmp, oi, oi_s)
+                    set_var_option_erased(scrut_tmp, 1)
+                } else if oi_s != "" {
                     let opt_c = struct_option_c_type(oi_s)
                     emit_line("{opt_c} {scrut_tmp} = {expr_result_str};")
                 } else {
@@ -2136,6 +2149,7 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
             let sub_pk = node_kind(sub_pat)
             let scrut = match_scruts.get(scrut_off).unwrap().str_val
             let scrut_type = match_scruts.get(scrut_off).unwrap().scrut_type
+            let bind_erased = get_var_option_erased(scrut)
             if sub_pk == NodeKind.IdentPattern {
                 let bind_name = node_name(sub_pat)
                 if bind_name != "_" {
@@ -2222,7 +2236,10 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                             set_list_elem_struct(bind_name, expr_list_elem_struct)
                         }
                     } else if inner_struct != "" {
-                        if field == "value" {
+                        if field == "value" && bind_erased != 0 {
+                            // Erased box: .value is a void* to the true struct.
+                            emit_line("{c_type_c_name(inner_struct)} {c_bind} = *({c_type_c_name(inner_struct)}*){scrut}.{field};")
+                        } else if field == "value" {
                             emit_line("{c_type_c_name(inner_struct)} {c_bind} = *{scrut}.{field};")
                         } else {
                             emit_line("{c_type_c_name(inner_struct)} {c_bind} = {scrut}.{field};")
@@ -3913,6 +3930,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             set_var_option(name, opt_inner_ct)
             ensure_option_type(opt_inner_ct)
         }
+        set_var_option_erased(name, expr_option_erased)
         if expr_option_inner == CT_LIST && expr_option_inner_list_elem != -1 {
             set_var_option_inner2(name, expr_option_inner_list_elem)
             expr_option_inner_list_elem = -1
@@ -4414,7 +4432,15 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         let opt_inner = get_var_option_inner(name)
         let opt_inner_s = get_var_option_inner_struct(name)
         let opt_c_inner = opt_inner
-        let opt_c = option_c_type_mixed(opt_c_inner, opt_inner_s)
+        // A ptr-erased Option (UE-handler ABI) carries its TRUE logical inner in
+        // the flat channels, but its physical value is a blink_Option_ptr box — the
+        // declaration must spell the erased carrier to accept it.
+        let opt_c = if get_var_option_erased(name) != 0 {
+            ensure_option_type(CT_PTR)
+            option_c_type(CT_PTR)
+        } else {
+            option_c_type_mixed(opt_c_inner, opt_inner_s)
+        }
         decl_c = opt_c
         decl_branch = "option"
         if val_str.ends_with("\{.tag = 0}") {

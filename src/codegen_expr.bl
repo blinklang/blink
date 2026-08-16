@@ -44,7 +44,7 @@ import codegen_types.{
     get_var_handle_inner, get_var_handle_inner2, get_var_handle_sname,
     get_var_iter_next_fn, get_var_iterator_inner, get_var_iter_carrier,
     get_var_option_inner, get_var_option_inner2, get_var_option_inner_tp,
-    get_var_option_inner2_struct, get_var_option_inner_struct,
+    get_var_option_inner2_struct, get_var_option_inner_struct, get_var_option_erased,
     get_var_result_err, get_var_result_err_struct,
     get_var_result_ok, get_var_result_ok_struct,
     get_var_struct, get_var_tp, get_var_ty, get_var_type, is_module_global,
@@ -132,6 +132,10 @@ pub let mut expr_map_val_type: Int = -1
 pub let mut expr_map_val_struct: Str = ""
 pub let mut expr_map_key_struct: Str = ""
 pub let mut expr_option_is_none: Int = 0
+// 1 iff the just-emitted expr's Option value is physically ptr-erased to the shared
+// handler-vtable ABI (blink_Option_ptr box) while expr_option_inner/_struct carry the
+// TRUE logical inner. Consumers reassert the erased carrier and cast the void* payload.
+pub let mut expr_option_erased: Int = 0
 pub let mut expr_option_inner_list_elem: Int = -1
 pub let mut expr_option_inner_list_struct: Str = ""
 pub let mut expr_option_inner_map_val_struct: Str = ""
@@ -571,6 +575,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
     let kind = node_kind(node)
     expr_closure_sig = ""
     expr_option_is_none = 0
+    expr_option_erased = 0
 
     if kind == NodeKind.IntLit {
         let s = node_str_val(node)
@@ -637,6 +642,20 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             // struct/compound inner carries its tag in the var-struct slot; a scalar inner
             // routes through the ct branch. Mirrors the annotation path's carrier choice.
             if cg_assign_target_name != "" && get_var_type(cg_assign_target_name) == CT_OPTION {
+                if get_var_option_erased(cg_assign_target_name) != 0 {
+                    // The target's physical carrier is the erased blink_Option_ptr box;
+                    // a None must match it, not the true struct's carrier.
+                    ensure_option_type(CT_PTR)
+                    let opt_type = option_c_type(CT_PTR)
+                    expr_result_str = "({opt_type})\{.tag = 0}"
+                    expr_result_type = CT_OPTION
+                    publish_result_tid(node)
+                    expr_option_inner = get_var_option_inner(cg_assign_target_name)
+                    expr_option_inner_struct = get_var_option_inner_struct(cg_assign_target_name)
+                    expr_option_erased = 1
+                    expr_option_is_none = 1
+                    return
+                }
                 let t_inner_s = get_var_option_inner_struct(cg_assign_target_name)
                 if t_inner_s != "" {
                     set_bare_none_struct_result(t_inner_s)
@@ -824,6 +843,9 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         if expr_result_type == CT_OPTION {
             expr_option_inner = get_var_option_inner(name)
             expr_option_inner_struct = get_var_option_inner_struct(name)
+            // Propagate the var's ptr-erased carrier so a match / ?? / store on this
+            // Option var reasserts the blink_Option_ptr box and casts its void* payload.
+            expr_option_erased = get_var_option_erased(name)
             // Restore the deep inner tp so a match on this Option var (an
             // `Option[Map[K,V]]` / `Option[List[T]]` unwrapped from a
             // List[compound] element) recovers the nested container's own type
@@ -2076,6 +2098,7 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
         let left_type = expr_result_type
         let opt_inner = expr_option_inner
         let opt_inner_s = expr_option_inner_struct
+        let opt_erased = expr_option_erased
         if left_type == CT_BOOL || left_type == CT_FLOAT || left_type == CT_STRING || left_type == CT_LIST || left_type == CT_RESULT || left_type == CT_CLOSURE {
             diag_error_at("CoalesceRequiresOption", COALESCE_REQUIRES_OPT, "the ?? operator requires an Option value but got a non-Option type in function '{cg_current_fn_name}'", node, "")
         }
@@ -2084,7 +2107,14 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
         let right_type = expr_result_type
         let tmp = fresh_temp("__opt")
         if opt_inner_s != "" {
-            let opt_c = struct_option_c_type(opt_inner_s)
+            // A ptr-erased left carries a blink_Option_ptr box with a void* payload;
+            // spell the erased carrier and cast the payload back to the true struct.
+            let opt_c = if opt_erased != 0 {
+                ensure_option_type(CT_PTR)
+                option_c_type(CT_PTR)
+            } else {
+                struct_option_c_type(opt_inner_s)
+            }
             emit_line("{opt_c} {tmp} = {left_str};")
             let val_tmp = fresh_temp("__optv")
             let inner_c = c_type_from_tag(opt_inner_s)
@@ -2092,6 +2122,11 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
                 emit_line("{inner_c} {val_tmp} = {tmp}.tag == 1 ? {tmp}.value : {right_str};")
                 set_var(val_tmp, opt_inner, 0)
                 expr_result_type = opt_inner
+                publish_result_tid(node)
+            } else if opt_erased != 0 {
+                emit_line("{c_type_c_name(opt_inner_s)} {val_tmp} = {tmp}.tag == 1 ? *({c_type_c_name(opt_inner_s)}*){tmp}.value : {right_str};")
+                set_var_struct(val_tmp, opt_inner_s)
+                expr_result_type = right_type
                 publish_result_tid(node)
             } else {
                 emit_line("{c_type_c_name(opt_inner_s)} {val_tmp} = {tmp}.tag == 1 ? *{tmp}.value : {right_str};")
@@ -2522,6 +2557,9 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
     emit_expr(node_left(node))
     let operand_str = expr_result_str
     let operand_type = expr_result_type
+    // A ptr-erased Option operand carries a blink_Option_ptr box with a void*
+    // payload; `?` must spell the erased carrier and cast the payload back.
+    let operand_erased = expr_option_erased
     let op = node_op(node)
     if op == "-" {
         if is_sized_int_ct(operand_type) {
@@ -2661,7 +2699,12 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 let opt_inner = expr_option_inner
                 let opt_inner_s = expr_option_inner_struct
                 if opt_inner_s != "" {
-                    let opt_c = struct_option_c_type(opt_inner_s)
+                    let opt_c = if operand_erased != 0 {
+                        ensure_option_type(CT_PTR)
+                        option_c_type(CT_PTR)
+                    } else {
+                        struct_option_c_type(opt_inner_s)
+                    }
                     emit_line("{opt_c} {tmp} = {operand_str};")
                 } else {
                     let inner = if opt_inner >= 0 { opt_inner } else { CT_INT }
@@ -2695,6 +2738,11 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                         expr_result_str = "{tmp}.value"
                         expr_result_type = opt_inner
                         publish_result_tid(node)
+                    } else if operand_erased != 0 {
+                        expr_result_str = "(*({c_type_c_name(opt_inner_s)}*){tmp}.value)"
+                        expr_result_type = CT_INT
+                        publish_result_tid(node)
+                        set_var_struct(expr_result_str, opt_inner_s)
                     } else {
                         expr_result_str = "(*{tmp}.value)"
                         expr_result_type = CT_INT
@@ -2726,7 +2774,12 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                     option_c_type(fn_inner)
                 }
                 if opt_inner_s != "" {
-                    let opt_c = struct_option_c_type(opt_inner_s)
+                    let opt_c = if operand_erased != 0 {
+                        ensure_option_type(CT_PTR)
+                        option_c_type(CT_PTR)
+                    } else {
+                        struct_option_c_type(opt_inner_s)
+                    }
                     emit_line("{opt_c} {tmp} = {operand_str};")
                 } else {
                     let inner = if opt_inner >= 0 { opt_inner } else { CT_INT }
@@ -2757,6 +2810,11 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                         expr_result_str = "{tmp}.value"
                         expr_result_type = opt_inner
                         publish_result_tid(node)
+                    } else if operand_erased != 0 {
+                        expr_result_str = "(*({c_type_c_name(opt_inner_s)}*){tmp}.value)"
+                        expr_result_type = CT_INT
+                        publish_result_tid(node)
+                        set_var_struct(expr_result_str, opt_inner_s)
                     } else {
                         expr_result_str = "(*{tmp}.value)"
                         expr_result_type = CT_INT
@@ -4835,14 +4893,13 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                         expr_result_str = "({opt_type})\{.tag = 1, .value = (void*){heap_tmp}}"
                         expr_result_type = CT_OPTION
                         publish_result_tid(node)
-                        expr_option_inner = CT_PTR
-                        // Erased with the value, not left behind. The two cells are read by
-                        // different consumers — a `let` inside the handler body spells its
-                        // DECLARATION from the struct name and its initializer from the value —
-                        // so a struct name surviving an erasure produces
-                        // `blink_Option_Item x = (blink_Option_ptr){...}`. The struct identity is
-                        // recovered on the caller's side, where the fn's own signature is unerased.
-                        expr_option_inner_struct = ""
+                        // The logical inner stays TRUE (the tid says Item); only the physical
+                        // carrier is the blink_Option_ptr box. The erased bit — not an erased
+                        // inner — tells each consumer to reassert the ptr carrier and cast the
+                        // void* payload back to the true struct.
+                        expr_option_inner = inner_type
+                        expr_option_inner_struct = inner_s
+                        expr_option_erased = 1
                     } else {
                         ensure_struct_option_type(inner_s)
                         let opt_type = struct_option_c_type(inner_s)

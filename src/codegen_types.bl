@@ -1562,6 +1562,13 @@ type ScopeVar {
     // "refinement" of the flat fields that contradicts the stamped tid is exactly the divergence
     // the counter must report, so resetting to -1 there would blind the instrument.
     ty: Int
+    // 1 iff this Option value is physically ptr-erased to the shared handler-vtable
+    // ABI (blink_Option_ptr) even though inner1/sname carry the true
+    // logical struct. A UE handler op returning Option[Struct] boxes the payload as void*; the
+    // logical inner stays true (aligned with the tid), and THIS bit — not the inner type — is
+    // what every physical speller consults to reassert the erased carrier and to cast the
+    // void* payload back to the true struct pointer.
+    erased: Int
 }
 
 // Bridge: compute tp pool ID from CT_* flat fields
@@ -1712,7 +1719,7 @@ pub fn set_var_ffi_ptr_extra(name: Str, struct_name: Str, arr: Str, origin: Str)
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_PTR {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: encoded, ty: sv.ty, tp_id: sv.tp_id })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: encoded, ty: sv.ty, tp_id: sv.tp_id })
             return
         }
         i = i - 1
@@ -1726,7 +1733,7 @@ pub fn set_var_ffi_ptr_struct(name: Str, struct_name: Str) {
         if sv.name == name && sv.ctype == CT_PTR {
             let arr = ffi_ptr_field(sv.extra, 1)
             let origin = ffi_ptr_field(sv.extra, 2)
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: "{struct_name}|{arr}|{origin}", ty: sv.ty, tp_id: sv.tp_id })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: "{struct_name}|{arr}|{origin}", ty: sv.ty, tp_id: sv.tp_id })
             return
         }
         i = i - 1
@@ -1752,7 +1759,7 @@ pub fn set_var_ffi_ptr_array(name: Str) {
         if sv.name == name && sv.ctype == CT_PTR {
             let struct_name = ffi_ptr_field(sv.extra, 0)
             let origin = ffi_ptr_field(sv.extra, 2)
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: "{struct_name}|n|{origin}", ty: sv.ty, tp_id: sv.tp_id })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: "{struct_name}|n|{origin}", ty: sv.ty, tp_id: sv.tp_id })
             return
         }
         i = i - 1
@@ -1942,7 +1949,7 @@ pub fn pop_scope() ! Codegen.Scope {
 }
 
 pub fn set_var(name: Str, ctype: Int, is_mut: Int) ! Codegen.Scope {
-    push_scope_var(ScopeVar { name: name, ctype: ctype, is_mut: is_mut, inner1: -1, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(ctype, -1, -1, "") })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: ctype, is_mut: is_mut, inner1: -1, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(ctype, -1, -1, "") })
 }
 
 // ── The tid stamping seam ───────────────────────────────────────────────────
@@ -1955,7 +1962,7 @@ pub fn set_var_ty(name: Str, tid: Int) {
     let idx = find_scope_var(name)
     if idx < 0 { return }
     let sv = scope_vars.get(idx).unwrap()
-    scope_vars.set(idx, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: tid, tp_id: sv.tp_id })
+    scope_vars.set(idx, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: tid, tp_id: sv.tp_id })
 }
 
 // -1 when unstamped or unknown. Callers must treat -1 as "ask the flat fields", NOT as a
@@ -2114,7 +2121,7 @@ fn update_sv_sname(name: Str, ctype: Int, val: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == ctype {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: val, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, sv.inner1, sv.inner2, val) })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: val, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, sv.inner1, sv.inner2, val) })
             return
         }
         i = i - 1
@@ -2126,7 +2133,7 @@ fn update_sv_sname2(name: Str, ctype: Int, val: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == ctype {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: val, extra: sv.extra, ty: sv.ty, tp_id: sv.tp_id })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: val, extra: sv.extra, ty: sv.ty, tp_id: sv.tp_id })
             return
         }
         i = i - 1
@@ -2997,12 +3004,12 @@ pub fn set_list_elem_type(name: Str, elem_type: Int) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_LIST {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: elem_type, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, elem_type, sv.inner2, sv.sname) })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: elem_type, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, elem_type, sv.inner2, sv.sname) })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_LIST, elem_type, -1, "") })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_LIST, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_LIST, elem_type, -1, "") })
 }
 
 // the list element with NO Int default — -1 when nothing ever recorded one.
@@ -3079,7 +3086,7 @@ pub fn set_list_nested_elem_type(name: Str, nested_type: Int) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_LIST {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: nested_type, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, sv.inner1, nested_type, sv.sname) })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: nested_type, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, sv.inner1, nested_type, sv.sname) })
             return
         }
         i = i - 1
@@ -3107,12 +3114,12 @@ pub fn set_list_nested_elem_struct(name: Str, struct_name: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_LIST {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: struct_name, ty: sv.ty, tp_id: sv.tp_id })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: struct_name, ty: sv.ty, tp_id: sv.tp_id })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: -1, inner2: -1, sname: "", sname2: "", extra: struct_name, ty: -1, tp_id: sv_tp(CT_LIST, -1, -1, "") })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_LIST, is_mut: 0, inner1: -1, inner2: -1, sname: "", sname2: "", extra: struct_name, ty: -1, tp_id: sv_tp(CT_LIST, -1, -1, "") })
 }
 
 pub fn get_list_nested_elem_struct(name: Str) -> Str {
@@ -3195,12 +3202,12 @@ pub fn set_list_elem_map_types(name: Str, key_ct: Int, val_ct: Int, val_name: St
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_LIST {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: CT_MAP, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: list_tp })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: CT_MAP, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: list_tp })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: CT_MAP, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: list_tp })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_LIST, is_mut: 0, inner1: CT_MAP, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: list_tp })
 }
 
 // Record a List's element-OPTION inner as a full nested type
@@ -3220,12 +3227,12 @@ fn set_list_elem_compound_tp(name: Str, list_tp: Int, inner_marker: Int) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_LIST {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner_marker, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: list_tp })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner_marker, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: list_tp })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: inner_marker, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: list_tp })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_LIST, is_mut: 0, inner1: inner_marker, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: list_tp })
 }
 
 // Record a List's element-OPTION from a pre-built inner tp
@@ -4259,12 +4266,12 @@ fn set_list_elem_struct_raw(name: Str, struct_name: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_LIST {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: struct_name, extra: sv.extra, ty: sv.ty, tp_id: sv.tp_id })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: struct_name, extra: sv.extra, ty: sv.ty, tp_id: sv.tp_id })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: -1, inner2: -1, sname: "", sname2: struct_name, extra: "", ty: -1, tp_id: sv_tp(CT_LIST, -1, -1, "") })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_LIST, is_mut: 0, inner1: -1, inner2: -1, sname: "", sname2: struct_name, extra: "", ty: -1, tp_id: sv_tp(CT_LIST, -1, -1, "") })
 }
 
 pub fn get_list_elem_struct(name: Str) -> Str {
@@ -4323,12 +4330,12 @@ pub fn set_set_elem_type(name: Str, elem_type: Int) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_SET {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: elem_type, inner2: -1, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, elem_type, -1, sv.sname) })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: elem_type, inner2: -1, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, elem_type, -1, sv.sname) })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_SET, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_SET, elem_type, -1, "") })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_SET, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_SET, elem_type, -1, "") })
 }
 
 // A binding-site tid (ScopeVar.ty / CaptureEntry.tid) is the RAW declared tid: inside a
@@ -4422,7 +4429,7 @@ pub fn set_set_elem_struct(name: Str, struct_name: Str) {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_SET {
             let new_tp = type_set(type_struct(struct_name))
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: new_tp })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: new_tp })
             return
         }
         i = i - 1
@@ -4450,7 +4457,7 @@ pub fn set_map_types(name: Str, key_type: Int, value_type: Int, value_name: Str)
             } else {
                 sv_tp(sv.ctype, key_type, eff_value_type, sv.sname)
             }
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: key_type, inner2: eff_value_type, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: new_tp })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: key_type, inner2: eff_value_type, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: new_tp })
             if (value_type == CT_VOID || value_type == CT_STRUCT || value_type == CT_ENUM) && value_name != "" && is_named_type(value_name) != 0 {
                 set_map_value_struct(name, value_name)
             }
@@ -4458,7 +4465,7 @@ pub fn set_map_types(name: Str, key_type: Int, value_type: Int, value_name: Str)
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_MAP, is_mut: 0, inner1: key_type, inner2: value_type, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_MAP, key_type, value_type, "") })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_MAP, is_mut: 0, inner1: key_type, inner2: value_type, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_MAP, key_type, value_type, "") })
     if (value_type == CT_VOID || value_type == CT_STRUCT || value_type == CT_ENUM) && value_name != "" && is_named_type(value_name) != 0 {
         set_map_value_struct(name, value_name)
     }
@@ -4597,7 +4604,7 @@ pub fn set_map_key_struct(name: Str, struct_name: Str) {
             let new_k = type_struct(struct_name)
             let new_v = if v >= 0 { sv_tp(v, -1, -1, sv.sname2) } else { type_int() }
             let new_tp = type_map(new_k, new_v)
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: new_tp })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: new_tp })
             return
         }
         i = i - 1
@@ -4653,7 +4660,7 @@ pub fn set_map_value_struct(name: Str, struct_name: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_MAP {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: struct_name, extra: sv.extra, ty: sv.ty, tp_id: sv.tp_id })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: struct_name, extra: sv.extra, ty: sv.ty, tp_id: sv.tp_id })
             return
         }
         i = i - 1
@@ -4684,7 +4691,7 @@ pub fn set_map_value_list_elem(name: Str, elem_type: Int) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_MAP {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: "{elem_type}", ty: sv.ty, tp_id: sv.tp_id })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: "{elem_type}", ty: sv.ty, tp_id: sv.tp_id })
             return
         }
         i = i - 1
@@ -4717,7 +4724,7 @@ pub fn clear_map_value_meta(name: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_MAP {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: "", extra: "", ty: sv.ty, tp_id: sv.tp_id })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: "", extra: "", ty: sv.ty, tp_id: sv.tp_id })
             return
         }
         i = i - 1
@@ -5063,12 +5070,12 @@ pub fn set_var_struct(name: Str, type_name: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) != CT_CLOSURE {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: type_name, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, sv.inner1, sv.inner2, type_name) })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: type_name, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, sv.inner1, sv.inner2, type_name) })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_VOID, is_mut: 0, inner1: -1, inner2: -1, sname: type_name, sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_VOID, -1, -1, type_name) })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_VOID, is_mut: 0, inner1: -1, inner2: -1, sname: type_name, sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_VOID, -1, -1, type_name) })
 }
 
 pub fn get_var_struct(name: Str) -> Str {
@@ -5099,7 +5106,7 @@ pub fn set_var_handler(name: Str, vtable_type: Str, vtable_field: Str, is_ue: In
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_HANDLER {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: CT_HANDLER, is_mut: sv.is_mut, inner1: is_ue, inner2: sv.inner2, sname: vtable_type, sname2: vtable_field, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(CT_HANDLER, is_ue, -1, vtable_type) })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: CT_HANDLER, is_mut: sv.is_mut, inner1: is_ue, inner2: sv.inner2, sname: vtable_type, sname2: vtable_field, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(CT_HANDLER, is_ue, -1, vtable_type) })
             return
         }
         i = i - 1
@@ -5176,12 +5183,12 @@ pub fn set_var_closure(name: Str, sig: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_CLOSURE {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sig, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, sv.inner1, sv.inner2, sig) })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sig, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, sv.inner1, sv.inner2, sig) })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_CLOSURE, is_mut: 0, inner1: -1, inner2: -1, sname: sig, sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_CLOSURE, -1, -1, sig) })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_CLOSURE, is_mut: 0, inner1: -1, inner2: -1, sname: sig, sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_CLOSURE, -1, -1, sig) })
 }
 
 pub fn get_var_closure_sig(name: Str) -> Str {
@@ -7577,12 +7584,12 @@ pub fn set_var_option(name: Str, inner: Int) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_OPTION {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, inner, sv.inner2, sv.sname) })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, inner, sv.inner2, sv.sname) })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_OPTION, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_OPTION, inner, -1, "") })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_OPTION, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_OPTION, inner, -1, "") })
 }
 
 pub fn set_var_option_inner2(name: Str, val: Int) {
@@ -7590,7 +7597,7 @@ pub fn set_var_option_inner2(name: Str, val: Int) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_OPTION {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: val, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, sv.inner1, val, sv.sname) })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: val, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, sv.inner1, val, sv.sname) })
             return
         }
         i = i - 1
@@ -7625,7 +7632,7 @@ pub fn set_var_option_inner2_struct(name: Str, struct_name: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_OPTION {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: struct_name, ty: sv.ty, tp_id: sv.tp_id })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: struct_name, ty: sv.ty, tp_id: sv.tp_id })
             return
         }
         i = i - 1
@@ -7643,7 +7650,7 @@ pub fn set_var_option_inner_tp(name: Str, inner_tp: Int) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_OPTION {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: type_option(inner_tp) })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: type_option(inner_tp) })
             return
         }
         i = i - 1
@@ -7701,12 +7708,12 @@ pub fn set_var_option_struct(name: Str, inner: Int, struct_name: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_OPTION {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: struct_name, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, inner, sv.inner2, struct_name) })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: struct_name, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, inner, sv.inner2, struct_name) })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_OPTION, is_mut: 0, inner1: inner, inner2: -1, sname: struct_name, sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_OPTION, inner, -1, struct_name) })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_OPTION, is_mut: 0, inner1: inner, inner2: -1, sname: struct_name, sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_OPTION, inner, -1, struct_name) })
 }
 
 pub fn get_var_option_inner(name: Str) -> Int {
@@ -7717,17 +7724,56 @@ pub fn get_var_option_inner_struct(name: Str) -> Str {
     get_sv_sname(name, CT_OPTION)
 }
 
+// Mark an Option var as physically ptr-erased to the shared handler-vtable ABI.
+// The logical inner1/sname stay TRUE (aligned with the tid); this bit records that
+// the stored value is a blink_Option_ptr box, so every physical speller reasserts the
+// erased carrier and casts the void* payload back to the true struct.
+pub fn set_var_option_erased(name: Str, e: Int) {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_OPTION {
+            scope_vars.set(i, ScopeVar { erased: e, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv.tp_id })
+            return
+        }
+        i = i - 1
+    }
+}
+
+pub fn get_var_option_erased(name: Str) -> Int {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_OPTION {
+            return sv.erased
+        }
+        i = i - 1
+    }
+    let blink_name = c_blink_name(name)
+    if blink_name != name {
+        i = scope_vars.len() - 1
+        while i >= 0 {
+            let sv = scope_vars.get(i).unwrap()
+            if sv.name == blink_name && tp_get_kind(sv.tp_id) == CT_OPTION {
+                return sv.erased
+            }
+            i = i - 1
+        }
+    }
+    0
+}
+
 pub fn set_var_result(name: Str, ok_t: Int, err_t: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_RESULT {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: ok_t, inner2: err_t, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, ok_t, err_t, sv.sname) })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: ok_t, inner2: err_t, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, ok_t, err_t, sv.sname) })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_RESULT, is_mut: 0, inner1: ok_t, inner2: err_t, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_RESULT, ok_t, err_t, "") })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_RESULT, is_mut: 0, inner1: ok_t, inner2: err_t, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_RESULT, ok_t, err_t, "") })
 }
 
 pub fn set_var_result_struct(name: Str, ok_t: Int, err_t: Int, ok_s: Str, err_s: Str) {
@@ -7735,12 +7781,12 @@ pub fn set_var_result_struct(name: Str, ok_t: Int, err_t: Int, ok_s: Str, err_s:
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_RESULT {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: ok_t, inner2: err_t, sname: ok_s, sname2: err_s, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, ok_t, err_t, ok_s) })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: ok_t, inner2: err_t, sname: ok_s, sname2: err_s, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, ok_t, err_t, ok_s) })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_RESULT, is_mut: 0, inner1: ok_t, inner2: err_t, sname: ok_s, sname2: err_s, extra: "", ty: -1, tp_id: sv_tp(CT_RESULT, ok_t, err_t, ok_s) })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_RESULT, is_mut: 0, inner1: ok_t, inner2: err_t, sname: ok_s, sname2: err_s, extra: "", ty: -1, tp_id: sv_tp(CT_RESULT, ok_t, err_t, ok_s) })
 }
 
 // Precondition: fs.starts_with("Option_")
@@ -7908,7 +7954,7 @@ pub fn set_var_result_ok_elem(name: Str, elem_type: Int, elem_struct: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_RESULT {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: encoded, ty: sv.ty, tp_id: sv.tp_id })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: encoded, ty: sv.ty, tp_id: sv.tp_id })
             return
         }
         i = i - 1
@@ -7936,12 +7982,12 @@ pub fn set_var_iterator(name: Str, inner: Int, next_fn: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_ITERATOR {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: next_fn, ty: sv.ty, tp_id: sv_tp(sv.ctype, inner, sv.inner2, sv.sname) })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: next_fn, ty: sv.ty, tp_id: sv_tp(sv.ctype, inner, sv.inner2, sv.sname) })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_ITERATOR, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: next_fn, ty: -1, tp_id: sv_tp(CT_ITERATOR, inner, -1, "") })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_ITERATOR, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: next_fn, ty: -1, tp_id: sv_tp(CT_ITERATOR, inner, -1, "") })
 }
 
 pub fn get_var_iterator_inner(name: Str) -> Int {
@@ -7963,7 +8009,7 @@ pub fn set_var_iter_carrier(name: Str, carrier: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_ITERATOR {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: carrier, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv.tp_id })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: carrier, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv.tp_id })
             return
         }
         i = i - 1
@@ -7979,7 +8025,7 @@ pub fn set_var_alias(name: Str, target: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: target, extra: sv.extra, ty: sv.ty, tp_id: sv.tp_id })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: target, extra: sv.extra, ty: sv.ty, tp_id: sv.tp_id })
             return
         }
         i = i - 1
@@ -8004,12 +8050,12 @@ pub fn set_var_handle(name: Str, inner: Int) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_HANDLE {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, inner, sv.inner2, sv.sname) })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, inner, sv.inner2, sv.sname) })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_HANDLE, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_HANDLE, inner, -1, "") })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_HANDLE, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_HANDLE, inner, -1, "") })
 }
 
 pub fn get_var_handle_inner(name: Str) -> Int {
@@ -8022,12 +8068,12 @@ pub fn set_var_handle_full(name: Str, inner: Int, inner2: Int, extra1: Str, extr
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_HANDLE {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: inner2, sname: "", sname2: "", extra: encoded_extra, ty: sv.ty, tp_id: sv_tp(CT_HANDLE, inner, -1, "") })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: inner2, sname: "", sname2: "", extra: encoded_extra, ty: sv.ty, tp_id: sv_tp(CT_HANDLE, inner, -1, "") })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_HANDLE, is_mut: 0, inner1: inner, inner2: inner2, sname: "", sname2: "", extra: encoded_extra, ty: -1, tp_id: sv_tp(CT_HANDLE, inner, -1, "") })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_HANDLE, is_mut: 0, inner1: inner, inner2: inner2, sname: "", sname2: "", extra: encoded_extra, ty: -1, tp_id: sv_tp(CT_HANDLE, inner, -1, "") })
 }
 
 pub fn get_var_handle_inner2(name: Str) -> Int {
@@ -8063,12 +8109,12 @@ pub fn set_var_channel(name: Str, inner: Int) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_CHANNEL {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, inner, sv.inner2, sv.sname) })
+            scope_vars.set(i, ScopeVar { erased: sv.erased, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv_tp(sv.ctype, inner, sv.inner2, sv.sname) })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_CHANNEL, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_CHANNEL, inner, -1, "") })
+    push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_CHANNEL, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_CHANNEL, inner, -1, "") })
 }
 
 pub fn get_var_channel_inner(name: Str) -> Int {
