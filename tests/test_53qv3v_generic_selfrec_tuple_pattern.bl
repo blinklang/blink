@@ -1,0 +1,186 @@
+// A GENERIC self-recursive enum whose variant payload is a tuple of the enum
+// itself (`Pair(p: (Box[T], Box[T]))`), destructured through a NESTED tuple
+// PATTERN in the match arm (`Box.Pair((l, r)) => sum(l) + sum(r)`). The tuple
+// field is boxed to int64_t at the enum, and each pattern binder must deref
+// through the ARG-FULL mono carrier (`Tuple2_Box_0Int_Box_0Int` →
+// `blink_Box_0Int`), NOT the erased argless carrier. Two coupled failures were
+// possible: the codegen binder panicked on the unresolved carrier, and the
+// binder type erased to `blink_Box` because the self element was stored bare
+// `(Box, Box)` — `resolve_type_ann` drops all-typevar instances, so the typevar
+// slot has to be preserved structurally in the tuple field and re-substituted
+// against the scrutinee instance at the binder. This is the generic
+// tuple-pattern tail of the e1f78s self-recursive-enum family (gjsr9e covers the
+// non-generic case, bxva7r the nested-field case).
+
+import compile_test_helpers
+
+fn src_generic_walk() -> Str {
+    #"import std.io
+
+type Box[T] { Pair(p: (Box[T], Box[T])), Leaf(v: T) }
+
+fn sum(b: Box[Int]) -> Int {
+    match b {
+        Box.Leaf(v) => v
+        Box.Pair((l, r)) => sum(l) + sum(r)
+    }
+}
+
+fn main() {
+    let l: Box[Int] = Box.Leaf(3)
+    let r: Box[Int] = Box.Leaf(4)
+    let root: Box[Int] = Box.Pair((l, r))
+    io.println("sum {sum(root)}")
+}
+"#
+}
+
+test "generic self-recursive tuple-pattern destructure walks the boxed tuple" {
+    let r = compile_test_helpers.compile_and_run(src_generic_walk(), "53qv3v_walk")
+    if !r.out.contains("sum 7") {
+        compile_test_helpers.expect_contains(r.out, "sum 7", "generic selfrec tuple-pattern walk — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("sum 7"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_generic_leaf() -> Str {
+    #"import std.io
+
+type Box[T] { Pair(p: (Box[T], Box[T])), Leaf(v: T) }
+
+fn main() {
+    let b: Box[Int] = Box.Leaf(5)
+    match b {
+        Box.Leaf(v) => io.println("leaf {v}")
+        Box.Pair((l, r)) => io.println("pair")
+    }
+}
+"#
+}
+
+test "generic self-recursive tuple-pattern enum compiles and matches Leaf" {
+    let r = compile_test_helpers.compile_and_run(src_generic_leaf(), "53qv3v_leaf")
+    if !r.out.contains("leaf 5") {
+        compile_test_helpers.expect_contains(r.out, "leaf 5", "generic selfrec tuple-pattern Leaf — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("leaf 5"))
+    assert(!r.out.contains("pair"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_struct_style() -> Str {
+    #"import std.io
+
+type Box[T] { Pair(p: (Box[T], Box[T])), Leaf(v: T) }
+
+fn sum(b: Box[Int]) -> Int {
+    match b {
+        Box.Leaf(v) => v
+        Box.Pair { p: (l, r) } => sum(l) + sum(r)
+    }
+}
+
+fn main() {
+    let l: Box[Int] = Box.Leaf(3)
+    let r: Box[Int] = Box.Leaf(4)
+    let root: Box[Int] = Box.Pair((l, r))
+    io.println("sum {sum(root)}")
+}
+"#
+}
+
+test "generic self-recursive tuple field destructured struct-style walks the boxed tuple" {
+    let r = compile_test_helpers.compile_and_run(src_struct_style(), "53qv3v_structstyle")
+    if !r.out.contains("sum 7") {
+        compile_test_helpers.expect_contains(r.out, "sum 7", "generic selfrec struct-style tuple walk — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("sum 7"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_multi_tparam() -> Str {
+    #"import std.io
+
+type Pair[K, V] { Node(p: (Pair[K,V], Pair[K,V])), Leaf(k: K, v: V) }
+
+fn depth(b: Pair[Int,Int]) -> Int {
+    match b {
+        Pair.Leaf(k, v) => 1
+        Pair.Node((l, r)) => depth(l) + depth(r)
+    }
+}
+
+fn main() {
+    let l: Pair[Int,Int] = Pair.Leaf(1, 2)
+    let r: Pair[Int,Int] = Pair.Leaf(3, 4)
+    let root: Pair[Int,Int] = Pair.Node((l, r))
+    io.println("depth {depth(root)}")
+}
+"#
+}
+
+test "multi-typaram self-recursive tuple field substitutes both params" {
+    let r = compile_test_helpers.compile_and_run(src_multi_tparam(), "53qv3v_multi")
+    if !r.out.contains("depth 2") {
+        compile_test_helpers.expect_contains(r.out, "depth 2", "multi-typaram selfrec tuple walk — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("depth 2"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_nested_generic() -> Str {
+    #"import std.io
+
+type Box[T] { Node(p: (T, (Box[T], Box[T]))), Leaf(v: T) }
+
+fn sum(b: Box[Int]) -> Int {
+    match b {
+        Box.Leaf(v) => v
+        Box.Node((tag, (l, r))) => tag + sum(l) + sum(r)
+    }
+}
+
+fn main() {
+    let l: Box[Int] = Box.Leaf(3)
+    let r: Box[Int] = Box.Leaf(4)
+    let root: Box[Int] = Box.Node((100, (l, r)))
+    io.println("sum {sum(root)}")
+}
+"#
+}
+
+test "nested-tuple generic self-recursive field descends both wrapping levels" {
+    let r = compile_test_helpers.compile_and_run(src_nested_generic(), "53qv3v_nested")
+    if !r.out.contains("sum 107") {
+        compile_test_helpers.expect_contains(r.out, "sum 107", "nested-generic selfrec tuple walk — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("sum 107"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_nonself_neighbor() -> Str {
+    #"import std.io
+
+type Other[T] { Wrap(x: T) }
+type W[T] { V(p: (Other[T], Int)), E }
+
+fn main() {
+    let o: Other[Int] = Other.Wrap(5)
+    let w: W[Int] = W.V((o, 7))
+    io.println("built")
+}
+"#
+}
+
+test "non-self generic instance in a variant tuple field is not boxed and still constructs" {
+    // Guards against over-broadening the self-recursive tuple interning: a NON-self
+    // generic instance element (`(Other[T], Int)`) must stay erased so its ctor
+    // still emits — preserving its typevar slots miscompiles the tuple carrier.
+    let r = compile_test_helpers.compile_and_run(src_nonself_neighbor(), "53qv3v_nonself")
+    if !r.out.contains("built") {
+        compile_test_helpers.expect_contains(r.out, "built", "non-self generic tuple field construct — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("built"))
+    assert_eq(r.exit_code, 0)
+}

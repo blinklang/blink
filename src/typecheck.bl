@@ -1559,6 +1559,36 @@ fn lookup_evfield_type_by_name(var_idx: Int, name: Str) -> Int {
     -1
 }
 
+// Rewrite a variant field's DECLARED (generic) tid through the scrutinee's mono
+// instance args, so a match binder is typed at its concrete instance rather than
+// the enum's raw typevars. evfield_pool stores the generic field type (`(Box[T],
+// Box[T])`); the scrutinee hint carries the instance (`Box[Int]`). Zipping the
+// enum decl's tparams against the instance's arg tids and substituting turns the
+// binder's node tid concrete (`(Box[Int], Box[Int])`) — the sole authority the C
+// spelling reads. Without it a struct/enum tuple element erases to the bare base
+// (`blink_Box`), which the physical mono carrier (`blink_Box_0Int`) then rejects.
+// A no-op when the hint is not a generic instance (params_count 0) or carries no
+// matching typevar. `substitute_typevar_tid` appends to ty_param_list, so every
+// instance arg is read into `binds` BEFORE it runs.
+fn tc_subst_evfield_from_instance(field_tid: Int, inst_tid: Int) -> Int {
+    if field_tid < 0 || inst_tid < 0 || inst_tid >= ty_pool.len() { return field_tid }
+    let ie = ty_pool.get(inst_tid).unwrap()
+    if ie.params_count == 0 { return field_tid }
+    if ie.kind != TyKind.Enum && ie.kind != TyKind.Struct { return field_tid }
+    let decl = tc_type_decl_nodes.get(strip_module_qualifier(ie.name)) ?? -1
+    if decl == -1 { return field_tid }
+    let tparams_sl = node_type_params(decl)
+    if tparams_sl == -1 { return field_tid }
+    let mut binds: Map[Str, Int] = Map()
+    let mut i = 0
+    while i < sublist_length(tparams_sl) && i < ie.params_count {
+        let arg = ty_param_list.get(ie.params_start + i).unwrap()
+        binds.insert(node_name(sublist_get(tparams_sl, i)), arg)
+        i = i + 1
+    }
+    substitute_typevar_tid(field_tid, binds)
+}
+
 // The declared tid of a named field on an enum variant, for codegen match binding.
 // Returns -1 when the enum/variant/field can't be resolved.
 pub fn tc_variant_field_tid_by_name(enum_name: Str, variant_name: Str, field_name: Str) -> Int {
@@ -1594,11 +1624,17 @@ fn tc_tuple_tid_references_enum(tup_rtid: Int, enum_tid: Int) -> Int {
     let n = tc_tid_child_count(tup_rtid)
     let mut i = 0
     while i < n {
-        // Compare by type-def IDENTITY, not by stripped name: a same-named type
-        // from another module (`other.Box`) strips to the same base and would
-        // false-match, boxing a field that is not self-referential at all.
         let child = tc_tid_resolved(tc_tid_child(tup_rtid, i))
+        // A non-generic self element interns as the bare enum tid (exact identity);
+        // a generic one interns as an instance (`Box[T]`, a distinct tid) whose base
+        // name resolves back to the bare enum. The instance carries only its base
+        // name (module already stripped at interning), so the match is by that name —
+        // a foreign same-named generic enum would false-match here, but its identity
+        // was already collapsed upstream, so this does not widen the hazard.
         if child == enum_tid { return 1 }
+        if tc_tid_kind(child) == TyKind.Enum {
+            if lookup_named_type(strip_module_qualifier(ty_pool.get(child).unwrap().name)) == enum_tid { return 1 }
+        }
         if tc_tid_kind(child) == TyKind.Tuple {
             if tc_tuple_tid_references_enum(child, enum_tid) != 0 { return 1 }
         }
@@ -3383,6 +3419,49 @@ fn tc_evfield_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.Reso
     make_enum_instance_type(strip_module_qualifier(node_name(ann_node)), arg_tids)
 }
 
+// The tuple-aware extension of tc_evfield_instance_tid. A self-recursive tuple
+// field (`Pair(p: (Box[T], Box[T]))`) resolves through the bare-tuple path, whose
+// elements resolve_type_ann erases to the argless base (`(Box, Box)`) — the same
+// all-typevar skip tc_evfield_instance_tid exists to bypass for a DIRECT enum
+// field. Recurse the annotation: at a tuple, re-intern each element structurally
+// and rebuild the tuple so a SELF-type element keeps its `[T]` slots; otherwise
+// defer to tc_evfield_instance_tid. That preserved typevar is what lets a match
+// binder substitute T→Int from the scrutinee instance (tc_subst_evfield_from_instance)
+// and lets a ctor reverse-infer the instance from `(l, r)`. Returns -1 (caller
+// keeps the bare tid) when nothing structural needs interning. make_tuple_type
+// appends to ty_param_list, so every element tid is collected into `elems` first.
+//
+// The root field annotation keeps the original any-instance behavior (a direct
+// `left: Tree[T]` field preserves its typevars). Inside a tuple the preservation
+// is restricted to `self_enum`: a non-self generic instance element (`(Other[T],
+// Int)`) has no arg-full tuple-carrier emission, so constructing it miscompiles
+// if its slots are kept — it must stay erased, exactly as before this path existed.
+fn tc_evfield_structural_tid(ann_node: Int, bare_tid: Int, self_enum: Str, is_root: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    if node_name(ann_node) == "Tuple" {
+        let elems_sl = node_elements(ann_node)
+        if elems_sl == -1 || sublist_length(elems_sl) < 1 { return -1 }
+        let mut elems: List[Int] = []
+        let mut changed = 0
+        let mut i = 0
+        while i < sublist_length(elems_sl) {
+            let el_ann = sublist_get(elems_sl, i)
+            let el_bare = resolve_type_ann(el_ann)
+            let el_inst = tc_evfield_structural_tid(el_ann, el_bare, self_enum, 0)
+            if el_inst != -1 {
+                elems.push(el_inst)
+                changed = 1
+            } else {
+                elems.push(el_bare)
+            }
+            i = i + 1
+        }
+        if changed == 0 { return -1 }
+        return make_tuple_type(elems)
+    }
+    if is_root == 0 && strip_module_qualifier(node_name(ann_node)) != self_enum { return -1 }
+    tc_evfield_instance_tid(ann_node, bare_tid)
+}
+
 // Purely SYNTACTIC pre-check: is `v` a direct call to a bare Ident whose signature
 // declares at least one RETURN-ONLY type param — i.e. could this node have minted a
 // metavar that a declared type is entitled to pin?
@@ -3951,10 +4030,11 @@ fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Rep
                     let vf_name = node_name(vf)
                     let vf_type_ann = node_value(vf)
                     let mut vf_type_id = resolve_type_ann(vf_type_ann)
-                    // A generic-enum instance field (`Branch(left: Tree[T], …)`)
-                    // interns its typevar slots so reverse-inference can bind T from
-                    // a concrete `Tree[Int]` construction arg.
-                    let inst = tc_evfield_instance_tid(vf_type_ann, vf_type_id)
+                    // A generic-enum instance field (`Branch(left: Tree[T], …)`) or a
+                    // tuple wrapping one (`Pair(p: (Box[T], Box[T]))`) interns its
+                    // typevar slots so reverse-inference and pattern binders can bind T
+                    // from a concrete instance instead of erasing to the bare base.
+                    let inst = tc_evfield_structural_tid(vf_type_ann, vf_type_id, name, 1)
                     if inst != -1 { vf_type_id = inst }
                     evfield_pool.push(EnumVariantFieldEntry { var_idx: var_idx, name: vf_name, type_id: vf_type_id })
                     fi = fi + 1
@@ -12591,7 +12671,7 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
                     let fpat = node_pattern(f)
                     let fname = node_name(f)
                     let mut sub_t = -1
-                    if var_idx >= 0 { sub_t = lookup_evfield_type_by_name(var_idx, fname) }
+                    if var_idx >= 0 { sub_t = tc_subst_evfield_from_instance(lookup_evfield_type_by_name(var_idx, fname), saved_binding) }
                     if sub_t < 0 { sub_t = tc_pattern_binding_type }
                     if fpat != -1 {
                         tc_pattern_binding_type = sub_t
@@ -12606,7 +12686,7 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
                     }
                 } else {
                     let mut sub_t = -1
-                    if var_idx >= 0 { sub_t = lookup_evfield_type_by_index(var_idx, i) }
+                    if var_idx >= 0 { sub_t = tc_subst_evfield_from_instance(lookup_evfield_type_by_index(var_idx, i), saved_binding) }
                     if sub_t < 0 { sub_t = tc_pattern_binding_type }
                     tc_pattern_binding_type = sub_t
                     tc_check_pattern_types(f)

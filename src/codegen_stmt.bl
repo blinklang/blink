@@ -2209,16 +2209,34 @@ fn bind_struct_style_variant_fields(vidx: Int, fcount: Int, resolved_enum: Str, 
             // A self-recursive field is boxed; the nested sub-pattern must read
             // through the mono deref, and its stem is the scrutinee's own mono.
             let sr_mono = selfrec_field_mono(fld_base, resolved_enum, scrut_mono)
-            let ss_entry_sname =
-                if node_kind(fpat_node) == NodeKind.TuplePattern { tuple_field_carrier_tag_mono(resolved_enum, resolved_variant, field_name, scrut_mono, "") }
-                else if fld_is_selfrec { sr_mono }
-                else if res_ft != "" && (is_struct_type(res_ft) != 0 || is_enum_type(res_ft) != 0) { res_ft }
-                else { "" }
-            match_scruts = [MatchScrutEntry { str_val: variant_field_scrut_expr(scrut, resolved_variant, field_name, fld_base, resolved_enum, scrut_mono), scrut_type: field_ct, scrut_sname: ss_entry_sname }]
-            let saved_enum = match_scrut_enum
-            match_scrut_enum = if fld_is_selfrec { resolved_enum } else if res_ft != "" && is_enum_type(res_ft) != 0 { res_ft } else { "" }
-            bind_pattern_vars(fpat_node, 0, 1)
-            match_scrut_enum = saved_enum
+            // A self-recursive tuple field (`Pair { p: (l, r) }`) is boxed; deref
+            // through its arg-full carrier so the TuplePattern arm expands the real
+            // tuple, mirroring the positional path.
+            let ss_sr_tuple_tag = if node_kind(fpat_node) == NodeKind.TuplePattern && tc_variant_field_is_selfrec_tuple(resolved_enum, resolved_variant, field_name) != 0 { selfrec_tuple_field_carrier(resolved_enum, resolved_variant, field_name, scrut_mono) } else { "" }
+            if node_kind(fpat_node) == NodeKind.TuplePattern && tc_variant_field_is_selfrec_tuple(resolved_enum, resolved_variant, field_name) != 0 && ss_sr_tuple_tag == "" {
+                diag_ice_at("SelfrecTupleCarrierUnresolved", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                    "self-recursive tuple field '{field_name}' of '{resolved_enum}.{resolved_variant}' reached codegen without a resolvable tuple carrier",
+                    fpat_node,
+                    "this is a compiler bug — the boxed tuple carrier should resolve from the field annotation")
+            } else if ss_sr_tuple_tag != "" {
+                let ss_c = c_type_c_name(ss_sr_tuple_tag)
+                match_scruts = [MatchScrutEntry { str_val: "(*({ss_c}*)(intptr_t){scrut}.data.{resolved_variant}.{field_name})", scrut_type: field_ct, scrut_sname: ss_sr_tuple_tag }]
+                let saved_enum = match_scrut_enum
+                match_scrut_enum = ""
+                bind_pattern_vars(fpat_node, 0, 1)
+                match_scrut_enum = saved_enum
+            } else {
+                let ss_entry_sname =
+                    if node_kind(fpat_node) == NodeKind.TuplePattern { tuple_field_carrier_tag_mono(resolved_enum, resolved_variant, field_name, scrut_mono, "") }
+                    else if fld_is_selfrec { sr_mono }
+                    else if res_ft != "" && (is_struct_type(res_ft) != 0 || is_enum_type(res_ft) != 0) { res_ft }
+                    else { "" }
+                match_scruts = [MatchScrutEntry { str_val: variant_field_scrut_expr(scrut, resolved_variant, field_name, fld_base, resolved_enum, scrut_mono), scrut_type: field_ct, scrut_sname: ss_entry_sname }]
+                let saved_enum = match_scrut_enum
+                match_scrut_enum = if fld_is_selfrec { resolved_enum } else if res_ft != "" && is_enum_type(res_ft) != 0 { res_ft } else { "" }
+                bind_pattern_vars(fpat_node, 0, 1)
+                match_scrut_enum = saved_enum
+            }
             match_scruts = saved_scruts
         } else {
             let c_bind = c_safe_name(field_name)
@@ -2774,15 +2792,34 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                             // so it never names a mono directly).
                             let sr_mono = selfrec_field_mono(strip_generic_args(field_type_name), resolved_enum, scrut_mono)
                             let nested_mono = if sr_mono != "" { sr_mono } else if is_mono_struct_instance(field_type_name) != 0 { field_type_name } else { "" }
-                            // A tuple payload has no struct/enum name; publish its carrier tag so
-                            // the TuplePattern arm can expand the single whole-tuple entry into
-                            // one per-element entry rather than indexing past the only entry.
-                            let pos_entry_sname = if sub_pk == NodeKind.TuplePattern { tuple_field_carrier_tag_mono(resolved_enum, resolved_variant, field_name, scrut_mono, nested_mono) } else { nested_mono }
-                            match_scruts = [MatchScrutEntry { str_val: variant_field_scrut_expr(scrut, resolved_variant, field_name, strip_generic_args(field_type_name), resolved_enum, scrut_mono), scrut_type: field_ct, scrut_sname: pos_entry_sname }]
-                            let saved_enum = match_scrut_enum
-                            match_scrut_enum = if field_type_name != "" && is_enum_type(strip_generic_args(field_type_name)) != 0 { strip_generic_args(field_type_name) } else { "" }
-                            bind_pattern_vars(sub_pat, 0, 1)
-                            match_scrut_enum = saved_enum
+                            // A self-recursive tuple field (`Pair((l, r))`) is boxed; deref
+                            // through its arg-full carrier so the TuplePattern arm expands the
+                            // real tuple, not the raw pointer bits (else the erased carrier is
+                            // unregistered and the expander unwraps a missing scrut).
+                            let sr_tuple_tag = if sub_pk == NodeKind.TuplePattern && tc_variant_field_is_selfrec_tuple(resolved_enum, resolved_variant, field_name) != 0 { selfrec_tuple_field_carrier(resolved_enum, resolved_variant, field_name, scrut_mono) } else { "" }
+                            if sub_pk == NodeKind.TuplePattern && tc_variant_field_is_selfrec_tuple(resolved_enum, resolved_variant, field_name) != 0 && sr_tuple_tag == "" {
+                                diag_ice_at("SelfrecTupleCarrierUnresolved", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                                    "self-recursive tuple field '{field_name}' of '{resolved_enum}.{resolved_variant}' reached codegen without a resolvable tuple carrier",
+                                    sub_pat,
+                                    "this is a compiler bug — the boxed tuple carrier should resolve from the field annotation")
+                            } else if sr_tuple_tag != "" {
+                                let sr_c = c_type_c_name(sr_tuple_tag)
+                                match_scruts = [MatchScrutEntry { str_val: "(*({sr_c}*)(intptr_t){scrut}.data.{resolved_variant}.{field_name})", scrut_type: field_ct, scrut_sname: sr_tuple_tag }]
+                                let saved_enum = match_scrut_enum
+                                match_scrut_enum = ""
+                                bind_pattern_vars(sub_pat, 0, 1)
+                                match_scrut_enum = saved_enum
+                            } else {
+                                // A tuple payload has no struct/enum name; publish its carrier tag so
+                                // the TuplePattern arm can expand the single whole-tuple entry into
+                                // one per-element entry rather than indexing past the only entry.
+                                let pos_entry_sname = if sub_pk == NodeKind.TuplePattern { tuple_field_carrier_tag_mono(resolved_enum, resolved_variant, field_name, scrut_mono, nested_mono) } else { nested_mono }
+                                match_scruts = [MatchScrutEntry { str_val: variant_field_scrut_expr(scrut, resolved_variant, field_name, strip_generic_args(field_type_name), resolved_enum, scrut_mono), scrut_type: field_ct, scrut_sname: pos_entry_sname }]
+                                let saved_enum = match_scrut_enum
+                                match_scrut_enum = if field_type_name != "" && is_enum_type(strip_generic_args(field_type_name)) != 0 { strip_generic_args(field_type_name) } else { "" }
+                                bind_pattern_vars(sub_pat, 0, 1)
+                                match_scrut_enum = saved_enum
+                            }
                             match_scruts = saved_scruts
                         }
                         fi = fi + 1
