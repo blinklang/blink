@@ -838,6 +838,22 @@ fn tuple_field_carrier_tag(enum_name: Str, variant_name: Str, field_name: Str, f
     if tag != "" && tuple_struct_arity(tag) >= 0 { tag } else { fallback }
 }
 
+// Substituting twin of tuple_field_carrier_tag. On a generic-enum instance the
+// variant field tid still holds the enum's typevars (`(T,T)`), so its raw carrier
+// isn't registered; substitute against the scrutinee's mono args first so the tag
+// resolves to the concrete carrier (`Tuple2_P_P`). Falls back to the raw lookup.
+fn tuple_field_carrier_tag_mono(enum_name: Str, variant_name: Str, field_name: Str, scrut_mono: Str, fallback: Str) -> Str {
+    let ftid = tc_variant_field_tid_by_name(enum_name, variant_name, field_name)
+    if ftid >= 0 && scrut_mono != "" {
+        let rtid = tc_tid_resolved(subst_variant_field_binder_tid(ftid, enum_name, scrut_mono))
+        if tc_tid_kind(rtid) == TyKind.Tuple {
+            let tag = tc_tid_tuple_sname(rtid)
+            if tag != "" && tuple_struct_arity(tag) >= 0 { return tag }
+        }
+    }
+    tuple_field_carrier_tag(enum_name, variant_name, field_name, fallback)
+}
+
 // Materialize a tuple scrutinee into one temp and push one `._i` field-access
 // entry per element onto match_scruts, so a TuplePattern arm can index
 // scrut_off + j per element. Element types/carrier metadata come from the
@@ -1674,7 +1690,7 @@ fn push_tuple_elem_scruts(tup_tag: Str, base_expr: Str) {
 // outer one); a tuple field carries its carrier tag so the TuplePattern arm
 // self-expands it. Struct-style enum patterns (node_int_val != 0, including a
 // qualified `Type.Variant { .. }`) keep tag-only gating here for now.
-fn positional_payload_condition(pat: Int, resolved_enum: Str, resolved_variant: Str, scrut: Str, tag: Int) -> Str {
+fn positional_payload_condition(pat: Int, resolved_enum: Str, resolved_variant: Str, scrut: Str, tag: Int, scrut_mono: Str) -> Str {
     let base = "({scrut}.tag == {tag})"
     if node_int_val(pat) != 0 {
         return base
@@ -1697,7 +1713,7 @@ fn positional_payload_condition(pat: Int, resolved_enum: Str, resolved_variant: 
         let field_base = strip_generic_args(field_type_raw)
         let field_ct = type_from_name(field_type_raw)
         let field_expr = "{scrut}.data.{resolved_variant}.{field_name}"
-        let tup_tag = if node_kind(sub_pat) == NodeKind.TuplePattern { tuple_field_carrier_tag(resolved_enum, resolved_variant, field_name, "") } else { "" }
+        let tup_tag = if node_kind(sub_pat) == NodeKind.TuplePattern { tuple_field_carrier_tag_mono(resolved_enum, resolved_variant, field_name, scrut_mono, "") } else { "" }
         let saved_scruts = match_scruts
         let saved_enum = match_scrut_enum
         match_scruts = [MatchScrutEntry { str_val: field_expr, scrut_type: field_ct, scrut_sname: tup_tag }]
@@ -1827,7 +1843,7 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
             }
             if is_data_enum(enum_name) != 0 {
                 let tag = get_variant_tag(enum_name, variant_name)
-                return positional_payload_condition(pat, enum_name, variant_name, match_scruts.get(scrut_off).unwrap().str_val, tag)
+                return positional_payload_condition(pat, enum_name, variant_name, match_scruts.get(scrut_off).unwrap().str_val, tag, match_scruts.get(scrut_off).unwrap().scrut_sname)
             }
             return "({match_scruts.get(scrut_off).unwrap().str_val} == {c_type_c_name(enum_name)}_{variant_name})"
         }
@@ -1838,7 +1854,7 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
         }
         if resolved != "" && is_data_enum(resolved) != 0 {
             let tag = get_variant_tag(resolved, pat_name)
-            return positional_payload_condition(pat, resolved, pat_name, match_scruts.get(scrut_off).unwrap().str_val, tag)
+            return positional_payload_condition(pat, resolved, pat_name, match_scruts.get(scrut_off).unwrap().str_val, tag, match_scruts.get(scrut_off).unwrap().scrut_sname)
         }
         return ""
     }
@@ -2025,7 +2041,7 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
 // `Type.Variant { .. }` EnumPattern path and the bare `Variant { .. }`
 // StructPattern path so both lower identically.
 @allow(UnrestoredMutation, IncompleteStateRestore)
-fn bind_struct_style_variant_fields(vidx: Int, fcount: Int, resolved_enum: Str, resolved_variant: Str, scrut: Str, flds_sl: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn bind_struct_style_variant_fields(vidx: Int, fcount: Int, resolved_enum: Str, resolved_variant: Str, scrut: Str, flds_sl: Int, scrut_mono: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let mut sfi = 0
     while sfi < sublist_length(flds_sl) {
         let sf_node = sublist_get(flds_sl, sfi)
@@ -2049,7 +2065,7 @@ fn bind_struct_style_variant_fields(vidx: Int, fcount: Int, resolved_enum: Str, 
             let saved_scruts = match_scruts
             // A tuple payload has no struct/enum name; publish its carrier tag so the
             // TuplePattern arm can expand the single whole-tuple entry per element.
-            let ss_entry_sname = if node_kind(fpat_node) == NodeKind.TuplePattern { tuple_field_carrier_tag(resolved_enum, resolved_variant, field_name, "") } else { "" }
+            let ss_entry_sname = if node_kind(fpat_node) == NodeKind.TuplePattern { tuple_field_carrier_tag_mono(resolved_enum, resolved_variant, field_name, scrut_mono, "") } else { "" }
             match_scruts = [MatchScrutEntry { str_val: "{scrut}.data.{resolved_variant}.{field_name}", scrut_type: field_ct, scrut_sname: ss_entry_sname }]
             let saved_enum = match_scrut_enum
             match_scrut_enum = if found_ft != "" && is_enum_type(found_ft) != 0 { found_ft } else { "" }
@@ -2096,7 +2112,7 @@ fn bind_struct_style_variant_fields(vidx: Int, fcount: Int, resolved_enum: Str, 
                 // from a declared field type, so its tid is read off the field-pattern node itself
                 // (published by the EnumPattern/StructPattern typecheck arms). The tid leads; a
                 // genuine void or a decline keeps the flat placeholder, since this is a storage decl.
-                let sf_binder_tid = pat_binder_tid(sf_node)
+                let sf_binder_tid = subst_variant_field_binder_tid(pat_binder_tid(sf_node), resolved_enum, scrut_mono)
                 ctype_probe_at(sf_binder_tid, "variant_field_struct_style", field_name, sf_flat_c, sf_node)
                 let sf_spelled = c_type_from_tid(sf_binder_tid)
                 let sf_c = if sf_spelled != "" && sf_spelled != "void" { sf_spelled } else { sf_flat_c }
@@ -2480,7 +2496,7 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                     return
                 }
                 if is_struct_pat != 0 {
-                    bind_struct_style_variant_fields(vidx, fcount, resolved_enum, resolved_variant, scrut, ep_flds_sl)
+                    bind_struct_style_variant_fields(vidx, fcount, resolved_enum, resolved_variant, scrut, ep_flds_sl, match_scruts.get(scrut_off).unwrap().scrut_sname)
                 } else {
                     // A generic-enum scrutinee (Tree[Int]) carries its mono stem on the
                     // scrutinee entry; payload fields whose declared type is a typevar
@@ -2573,7 +2589,7 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                             // A tuple payload has no struct/enum name; publish its carrier tag so
                             // the TuplePattern arm can expand the single whole-tuple entry into
                             // one per-element entry rather than indexing past the only entry.
-                            let pos_entry_sname = if sub_pk == NodeKind.TuplePattern { tuple_field_carrier_tag(resolved_enum, resolved_variant, field_name, nested_mono) } else { nested_mono }
+                            let pos_entry_sname = if sub_pk == NodeKind.TuplePattern { tuple_field_carrier_tag_mono(resolved_enum, resolved_variant, field_name, scrut_mono, nested_mono) } else { nested_mono }
                             match_scruts = [MatchScrutEntry { str_val: "{scrut}.data.{resolved_variant}.{field_name}", scrut_type: field_ct, scrut_sname: pos_entry_sname }]
                             let saved_enum = match_scrut_enum
                             match_scrut_enum = if field_type_name != "" && is_enum_type(strip_generic_args(field_type_name)) != 0 { strip_generic_args(field_type_name) } else { "" }
@@ -2618,7 +2634,7 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
             let vidx = get_variant_index(sp_enum, stype_name)
             if vidx >= 0 {
                 let fcount = get_variant_field_count(vidx)
-                bind_struct_style_variant_fields(vidx, fcount, sp_enum, stype_name, scrut, flds_sl)
+                bind_struct_style_variant_fields(vidx, fcount, sp_enum, stype_name, scrut, flds_sl, match_scruts.get(scrut_off).unwrap().scrut_sname)
             }
             return
         }
@@ -8792,6 +8808,7 @@ fn emit_mono_enum_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[In
     let tparams_sl = node_type_params(td)
     if tparams_sl == -1 { return }
     let arg_tids = mono_arg_tids_with_ann(arg_tids0, ann, base_name, sublist_length(tparams_sl))
+    let segs = segs_from_arg_tids(arg_tids)
     let flds_sl = node_fields(td)
     if flds_sl == -1 { return }
     let c_name = mangle_generic_name(mono_phys_base(base_name), concrete_args)
@@ -8802,6 +8819,41 @@ fn emit_mono_enum_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[In
     // The variant metadata itself stays keyed on the BARE base (emit_enum_typedef
     // populated it), which ctor/match reach by recovering the base via lookup_mono_base.
     enum_reg_set.insert(c_name, 1)
+
+    // A Tuple variant-field carrier (e.g. `pair: (T,T)` -> Tuple2_P_P) must have
+    // its own typedef forced BEFORE this enum's `typedef struct {` opens below —
+    // emit_tuple_typedef_for_tag emits directly, so calling it inside the open
+    // union would nest one typedef textually inside another (illegal C), and the
+    // later top-level tuple flush lands AFTER this enum typedef that names it.
+    // Mirrors emit_mono_struct_typedef's dependency pre-pass.
+    let mut pv = 0
+    while pv < sublist_length(flds_sl) {
+        let pvnode = sublist_get(flds_sl, pv)
+        let pvflds = node_fields(pvnode)
+        if pvflds != -1 {
+            let mut pf = 0
+            while pf < sublist_length(pvflds) {
+                let pvf = sublist_get(pvflds, pf)
+                let pvf_ann = node_value(pvf)
+                if pvf_ann != -1 {
+                    if node_name(pvf_ann) == "Tuple" {
+                        let ptup = resolve_tuple_ann(pvf_ann, tparams_sl, segs)
+                        if ptup.is_some() {
+                            emit_tuple_typedef_for_tag(ptup.unwrap())
+                        }
+                    } else {
+                        // A typevar field (`One(x: T)`) bound to a tuple type-arg
+                        // resolves to a registered tuple carrier; force its typedef
+                        // too. A non-tuple resolution is a no-op in the emitter.
+                        let presolved = resolve_mono_slot(node_name(pvf_ann), tparams_sl, arg_tids, "enum_typedef_tuple_prepass", "{c_name}.{node_name(pvnode)}.{node_name(pvf)}", pvf_ann)
+                        emit_tuple_typedef_for_tag(presolved)
+                    }
+                }
+                pf = pf + 1
+            }
+        }
+        pv = pv + 1
+    }
 
     emit_td_guard_open(td_cname)
     emit_line("typedef struct \{")
@@ -8826,7 +8878,17 @@ fn emit_mono_enum_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[In
                 if vf_type_ann != -1 {
                     let vf_type_name = node_name(vf_type_ann)
                     let resolved = resolve_mono_slot(vf_type_name, tparams_sl, arg_tids, "enum_typedef_payload", "{c_name}.{vname}.{vf_name}", vf_type_ann)
-                    if resolved == base_name {
+                    if vf_type_name == "Tuple" {
+                        // Tuple payload: spell the tuple carrier under typevar
+                        // substitution so `(T, T)` on an E[P] lowers to
+                        // blink_Tuple2_P_P, not the erased/void fall-through.
+                        let tup_opt = resolve_tuple_ann(vf_type_ann, tparams_sl, segs)
+                        if tup_opt.is_some() {
+                            vf_c_type = c_type_c_name(tup_opt.unwrap())
+                        } else {
+                            vf_c_type = c_field_type_str(type_from_name(vf_type_name), vf_type_name)
+                        }
+                    } else if resolved == base_name {
                         // Self-recursive field (`Branch(left: Tree[T], …)`): the ctor
                         // boxes it as (int64_t)(intptr_t)ptr, so the union member is a
                         // bare int64_t (mirrors emit_enum_typedef's vf_type_name==name).
