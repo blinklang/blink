@@ -848,20 +848,7 @@ fn expand_tuple_scrut_entry(tup_tag: Str, base_expr: Str) ! Codegen.Emit, Codege
     emit_line("{c_type_c_name(tup_tag)} {scrut_tmp} = {base_expr};")
     set_var(scrut_tmp, CT_STRUCT, 1)
     set_var_struct(scrut_tmp, tup_tag)
-    let arity = tuple_struct_arity(tup_tag)
-    let mut ti = 0
-    while ti < arity {
-        let field_name = "_{ti}"
-        let ft = get_struct_field_type(tup_tag, field_name)
-        let fs = get_struct_field_stype(tup_tag, field_name)
-        let elem_expr = "{scrut_tmp}.{field_name}"
-        if fs != "" {
-            match_scruts.push(MatchScrutEntry { str_val: elem_expr, scrut_type: CT_STRUCT, scrut_sname: fs })
-        } else {
-            match_scruts.push(MatchScrutEntry { str_val: elem_expr, scrut_type: ft })
-        }
-        ti = ti + 1
-    }
+    push_tuple_elem_scruts(tup_tag, scrut_tmp)
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -1657,6 +1644,75 @@ fn transparent_payload_condition(pat: Int, scrut_off: Int) -> Str {
     cond
 }
 
+// Push one `._i` field-access entry per tuple element onto match_scruts, reading
+// each element's type/carrier metadata from the tuple's registered fields. A
+// nested tuple element carries its own carrier tag on scrut_sname, so a
+// TuplePattern arm can self-expand it again. base_expr is any lvalue naming the
+// tuple (a temp on the binder side, a direct field access on the condition side).
+fn push_tuple_elem_scruts(tup_tag: Str, base_expr: Str) {
+    let arity = tuple_struct_arity(tup_tag)
+    let mut ti = 0
+    while ti < arity {
+        let field_name = "_{ti}"
+        let ft = get_struct_field_type(tup_tag, field_name)
+        let fs = get_struct_field_stype(tup_tag, field_name)
+        let elem_expr = "{base_expr}.{field_name}"
+        if fs != "" {
+            match_scruts.push(MatchScrutEntry { str_val: elem_expr, scrut_type: CT_STRUCT, scrut_sname: fs })
+        } else {
+            match_scruts.push(MatchScrutEntry { str_val: elem_expr, scrut_type: ft })
+        }
+        ti = ti + 1
+    }
+}
+
+// The C condition for a data-enum POSITIONAL constructor pattern: gate on the
+// variant tag AND every refutable payload sub-pattern read through
+// `{scrut}.data.{variant}.{field}`. Each field's declared type supplies the CT
+// (so nested Option/Result carriers gate) and the enum name for match_scrut_enum
+// (so a nested bare variant resolves against the field's own enum, not the
+// outer one); a tuple field carries its carrier tag so the TuplePattern arm
+// self-expands it. Struct-style enum patterns (node_int_val != 0, including a
+// qualified `Type.Variant { .. }`) keep tag-only gating here for now.
+fn positional_payload_condition(pat: Int, resolved_enum: Str, resolved_variant: Str, scrut: Str, tag: Int) -> Str {
+    let base = "({scrut}.tag == {tag})"
+    if node_int_val(pat) != 0 {
+        return base
+    }
+    let flds_sl = node_fields(pat)
+    if flds_sl == -1 {
+        return base
+    }
+    let vidx = get_variant_index(resolved_enum, resolved_variant)
+    if vidx < 0 {
+        return base
+    }
+    let fcount = get_variant_field_count(vidx)
+    let mut parts = base
+    let mut fi = 0
+    while fi < sublist_length(flds_sl) && fi < fcount {
+        let sub_pat = sublist_get(flds_sl, fi)
+        let field_name = get_variant_field_name(vidx, fi).unwrap()
+        let field_type_raw = get_variant_field_type_str(vidx, fi).unwrap()
+        let field_base = strip_generic_args(field_type_raw)
+        let field_ct = type_from_name(field_type_raw)
+        let field_expr = "{scrut}.data.{resolved_variant}.{field_name}"
+        let tup_tag = if node_kind(sub_pat) == NodeKind.TuplePattern { tuple_field_carrier_tag(resolved_enum, resolved_variant, field_name, "") } else { "" }
+        let saved_scruts = match_scruts
+        let saved_enum = match_scrut_enum
+        match_scruts = [MatchScrutEntry { str_val: field_expr, scrut_type: field_ct, scrut_sname: tup_tag }]
+        match_scrut_enum = if is_enum_type(field_base) != 0 { field_base } else { "" }
+        let sub_cond = pattern_condition(sub_pat, 0, 1)
+        match_scrut_enum = saved_enum
+        match_scruts = saved_scruts
+        if sub_cond != "" {
+            parts = "({parts} && {sub_cond})"
+        }
+        fi = fi + 1
+    }
+    parts
+}
+
 // Build a C condition string for a pattern.
 // scrut_off/scrut_len index into match_scruts.
 // Returns "" when the pattern always matches (wildcard/ident).
@@ -1771,7 +1827,7 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
             }
             if is_data_enum(enum_name) != 0 {
                 let tag = get_variant_tag(enum_name, variant_name)
-                return "({match_scruts.get(scrut_off).unwrap().str_val}.tag == {tag})"
+                return positional_payload_condition(pat, enum_name, variant_name, match_scruts.get(scrut_off).unwrap().str_val, tag)
             }
             return "({match_scruts.get(scrut_off).unwrap().str_val} == {c_type_c_name(enum_name)}_{variant_name})"
         }
@@ -1782,7 +1838,7 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
         }
         if resolved != "" && is_data_enum(resolved) != 0 {
             let tag = get_variant_tag(resolved, pat_name)
-            return "({match_scruts.get(scrut_off).unwrap().str_val}.tag == {tag})"
+            return positional_payload_condition(pat, resolved, pat_name, match_scruts.get(scrut_off).unwrap().str_val, tag)
         }
         return ""
     }
@@ -1862,10 +1918,39 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
         if elems_sl == -1 {
             return ""
         }
+        let n_elems = sublist_length(elems_sl)
+        // One whole-tuple entry carrying a carrier tag (a tuple payload field, or
+        // a nested tuple element): expand into per-element entries and gate each,
+        // the same way bind_pattern_vars' TuplePattern arm does. Without this a
+        // nested tuple would index scrut_off + j past the single entry.
+        if scrut_len == 1 && n_elems > 1 {
+            let whole = match_scruts.get(scrut_off).unwrap()
+            if whole.scrut_sname != "" && tuple_struct_arity(whole.scrut_sname) >= 0 {
+                let saved = match_scruts
+                match_scruts = []
+                push_tuple_elem_scruts(whole.scrut_sname, whole.str_val)
+                let mut eparts = ""
+                let mut _eparts_n = 0
+                let mut ej = 0
+                while ej < n_elems {
+                    let ec = pattern_condition(sublist_get(elems_sl, ej), ej, 1)
+                    if ec != "" {
+                        if _eparts_n > 0 {
+                            eparts = eparts.concat(" && ")
+                        }
+                        eparts = eparts.concat(ec)
+                        _eparts_n = _eparts_n + 1
+                    }
+                    ej = ej + 1
+                }
+                match_scruts = saved
+                return eparts
+            }
+        }
         let mut parts = ""
         let mut _parts_n = 0
         let mut j = 0
-        while j < sublist_length(elems_sl) {
+        while j < n_elems {
             let sub_pat = sublist_get(elems_sl, j)
             let sub_cond = pattern_condition(sub_pat, scrut_off + j, 1)
             if sub_cond != "" {
