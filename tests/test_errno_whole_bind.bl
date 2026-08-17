@@ -1,0 +1,42 @@
+// br fsr5ew: binding the error value AS A WHOLE in a match arm on
+// Result[T, Errno] emitted invalid C. Errno is a transparent newtype, so the
+// Result carrier's err arm is a bare int64_t, but the match binder `Err(e)` was
+// declared with the BOXED typedef (blink_std_errno_Errno e = _scrut.err) — flat
+// source, boxed destination. Only the nested-destructure form Err(Errno(rc))
+// worked, which is why lib/std never hit it. `match r { Err(e) => ... }` is the
+// most idiomatic error shape and must compile for the stdlib's syscall error type.
+
+import compile_test_helpers
+import std.errno.{Errno}
+
+fn f() -> Result[Str, Errno] { return Err(Errno(2)) }
+
+test "a whole-value Errno binder on Result[_, Errno] compiles and round-trips" {
+    match f() {
+        Ok(_) => assert(false)
+        Err(e) => match e {
+            Errno(rc) => assert_eq(rc, 2)
+        }
+    }
+}
+
+fn g() -> Option[Errno] { return Some(Errno(7)) }
+
+test "a whole-value Errno binder on Option[Errno] compiles and round-trips" {
+    // Option carriers store the transparent inner flat in `.value`, so the
+    // whole-value `Some(e)` binder reads int64_t directly — no pointer deref.
+    match g() {
+        Some(e) => match e { Errno(rc) => assert_eq(rc, 7) }
+        None => assert(false)
+    }
+}
+
+test "the whole-value Errno binder is declared bare int64_t, not a boxed carrier" {
+    let src = "pub type Errno \{ Errno(Int) }\n"
+        .concat("fn f() -> Result[Str, Errno] \{ return Err(Errno(2)) }\n")
+        .concat("fn main() \{ match f() \{ Ok(_) => \{} Err(e) => \{ let _ = e } } }\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_errno_whole_bind")
+    // The binder is a bare int64_t, never the boxed blink_..._Errno carrier.
+    assert(c.contains("int64_t e ="))
+    assert(!c.contains("_Errno e ="))
+}
