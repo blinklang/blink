@@ -9504,7 +9504,48 @@ fn tc_check_list_elem_compat(elem: Int, elem_t: Int, idx: Int, first_t: Int) ! T
     }
 }
 
-fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+// True when `existing` is a Fn tid that REFINES the freshly-minted `fresh` Fn tid: same arity,
+// and at every position `existing` is at least as concrete as `fresh`. `fresh` comes from the
+// declaration alone (unannotated params UNKNOWN, an omitted arrow VOID), so a position where
+// `existing` fills in an UNKNOWN param or a concrete return over the VOID default is a refinement,
+// never a contradiction. A position where `fresh` already holds a concrete type that `existing`
+// disagrees with means these are DIFFERENT signatures (e.g. the same closure node re-minted under
+// another mono T) — not a refinement — so the answer is 0 and the fresh mint stands.
+//
+// `pub` FOR THE TEST ONLY — same precedent as make_fn_type: the sole live caller is infer_type's
+// Closure arm, and the test pins the positional refinement rule directly.
+pub fn tc_fn_tid_more_specific(existing0: Int, fresh0: Int) -> Int {
+    if existing0 < 0 || fresh0 < 0 { return 0 }
+    let existing = tc_resolve(existing0)
+    let fresh = tc_resolve(fresh0)
+    if existing < 0 || existing >= ty_pool.len() { return 0 }
+    if fresh < 0 || fresh >= ty_pool.len() { return 0 }
+    let ee = ty_pool.get(existing).unwrap()
+    let fe = ty_pool.get(fresh).unwrap()
+    if ee.kind != TyKind.Fn { return 0 }
+    if fe.kind != TyKind.Fn { return 0 }
+    if ee.params_count != fe.params_count { return 0 }
+    let fr = tc_resolve(fe.inner1)
+    let er = tc_resolve(ee.inner1)
+    // The return refines only when fresh defaulted to VOID (omitted arrow) AND existing supplies
+    // a real return. An existing UNKNOWN is LESS specific than a concrete VOID, so it must not win
+    // — that would keep a divergence-cell UNKNOWN where the honest VOID default was available.
+    if fr != er && (fr != TYPE_VOID || er == TYPE_UNKNOWN) { return 0 }
+    let mut i = 0
+    while i < fe.params_count {
+        let fp = tc_resolve(ty_param_list.get(fe.params_start + i).unwrap())
+        let ep = tc_resolve(ty_param_list.get(ee.params_start + i).unwrap())
+        if fp != ep && fp != TYPE_UNKNOWN { return 0 }
+        i = i + 1
+    }
+    1
+}
+
+// `pub` FOR THE TEST ONLY — same precedent as make_fn_type. Real code reaches inference through
+// tc_check_body, never this entry directly; the g19dpq test calls it by hand to install the
+// latent re-inference producer the Closure-arm guard defends against. It MUTATES the tc_node_tid
+// memo, so it must not be called from ordinary compiler code.
+pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let tid = infer_type_uncached(node)
     if node != -1 && node < tc_node_tid.len() {
         // Never downgrade a known memo to UNKNOWN. -1 is the unset sentinel (TYPE_INT
@@ -11395,7 +11436,21 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 i = i + 1
             }
         }
-        return make_fn_type(ret_t, param_types)
+        let fresh = make_fn_type(ret_t, param_types)
+        // check_closure_body may have already published a more-specific signature for this
+        // closure — an unannotated param bound from the HOF element type, the return inferred
+        // from the body. This arm re-mints from the declaration alone (UNKNOWN params, a VOID
+        // default return), and the infer_type memo only refuses a downgrade of the WHOLE tid to
+        // UNKNOWN, so without this the re-mint would clobber the concrete stamp. Keep whichever
+        // is strictly more specific; a differing concrete position (a re-mint under another mono
+        // T) is not a refinement, so the fresh mint still wins there. The cross-T safety rests on
+        // check_closure_body binding an unannotated param from a TYPEVAR elem in a generic
+        // context (not a concrete stamp that could go stale under a second T).
+        let existing = tc_lookup_node_tid(node)
+        if tc_fn_tid_more_specific(existing, fresh) != 0 {
+            return existing
+        }
+        return fresh
     }
 
     TYPE_UNKNOWN

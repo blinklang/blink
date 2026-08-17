@@ -1,0 +1,166 @@
+// br g19dpq: check_closure_body publishes a closure's Fn tid with the per-position
+// param types a HOF supplies (an unannotated param bound from the element type) and the
+// return inferred from the body — src/typecheck.bl:2832/2847. infer_type's Closure arm
+// re-mints Fn from the DECLARATION alone: an unannotated param is UNKNOWN, an omitted
+// arrow is VOID. The infer_type memo only refuses a downgrade of the WHOLE tid to
+// TYPE_UNKNOWN, so a known->known overwrite is allowed — a later infer_type(cls) would
+// clobber the concrete signature back to Fn(Void, [Unknown..]).
+//
+// LATENT today (no live producer re-runs inference on a closure after check_closure_body),
+// so this test installs that producer directly: check_types stamps the concrete tid, then
+// infer_type(cls) is called by hand. The guard in the Closure arm must keep the concrete
+// signature — the more-specific existing Fn tid wins over the under-specified re-mint.
+
+import compiler.{compile_to_program}
+import typecheck.{
+    check_types, tc_lookup_node_tid, infer_type, tc_fn_tid_more_specific,
+    TyKind, tc_tid_kind, tc_tid_child, tc_tid_child_count,
+}
+import parser.{nodes, node_kind}
+import ast.{NodeKind}
+import std.io
+// Bare and LOAD-BEARING despite `warning[UnusedImport]` (br xrhq1c): codegen_types resolves
+// several globals it cannot import out of the MERGED program, and codegen_expr is the smallest
+// root whose transitive closure closes those back-references. (Same as test_nz7drz.)
+import codegen_expr
+
+fn kind_str(k: TyKind) -> Str {
+    match k {
+        TyKind.Int => "Int"
+        TyKind.Str => "Str"
+        TyKind.Void => "Void"
+        TyKind.Unknown => "Unknown"
+        TyKind.Fn => "Fn"
+        _ => "OTHER"
+    }
+}
+
+fn assert_eq_str(got: Str, want: Str, label: Str) {
+    if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+fn assert_eq_int(got: Int, want: Int, label: Str) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert(got == want)
+}
+
+fn ret_kind(t: Int) -> Str {
+    if t < 0 { return "NONE" }
+    if tc_tid_child_count(t) < 1 { return "NO-CHILD" }
+    kind_str(tc_tid_kind(tc_tid_child(t, 0)))
+}
+
+fn param_kind(t: Int, i: Int) -> Str {
+    if t < 0 { return "NONE" }
+    if tc_tid_child_count(t) < i + 2 { return "NO-CHILD" }
+    kind_str(tc_tid_kind(tc_tid_child(t, i + 1)))
+}
+
+// The single HOF closure in the last-compiled program.
+fn first_closure_node() -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.Closure { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// ── The clobber, end to end ─────────────────────────────────────────────────────
+
+fn hof_src() -> Str {
+    #"fn main() {
+    let ys = [1, 2, 3].map(fn(x) { x * 2 })
+    io.println("{ys.len()}")
+}
+"#
+}
+
+fn tid_after_check(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, TypeCheck.Resolve, TypeCheck.Report, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let cn = first_closure_node()
+    let t = tc_lookup_node_tid(cn)
+    fs.remove(path)
+    t
+}
+
+fn tid_after_reinfer(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, TypeCheck.Resolve, TypeCheck.Report, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let cn = first_closure_node()
+    infer_type(cn)
+    let t = tc_lookup_node_tid(cn)
+    fs.remove(path)
+    t
+}
+
+test "check_closure_body stamps the concrete HOF closure signature (precondition)" {
+    let t = tid_after_check("build/g19dpq_pre.bl", hof_src())
+    assert_eq_str(kind_str(tc_tid_kind(t)), "Fn", "closure tid is Fn")
+    assert_eq_str(param_kind(t, 0), "Int", "unannotated param bound to Int from the element")
+    assert_eq_str(ret_kind(t), "Int", "return inferred as Int from the body")
+}
+
+test "a later infer_type(cls) does not clobber the concrete signature to Void/Unknown" {
+    let t = tid_after_reinfer("build/g19dpq_reinfer.bl", hof_src())
+    assert_eq_str(kind_str(tc_tid_kind(t)), "Fn", "closure tid is still Fn")
+    assert_eq_str(param_kind(t, 0), "Int", "param stays Int, not Unknown")
+    assert_eq_str(ret_kind(t), "Int", "return stays Int, not the Void default")
+}
+
+// ── Direct pins on the refinement predicate, over REAL harvested closure tids ────
+//
+// Three plain (non-HOF) closures give three real Fn tids: a concrete Int->Int, a
+// Void-return Int->() (omitted arrow), and a Str->Str. No hand-built pool entries — the
+// predicate is exercised on the exact tids inference produces.
+
+fn triad_src() -> Str {
+    #"fn main() {
+    let ci = fn(x: Int) -> Int { x }
+    let cv = fn(x: Int) { io.println("{x}") }
+    let cs = fn(s: Str) -> Str { s }
+    io.println("{ci(1)}{cs("a")}")
+    cv(2)
+}
+"#
+}
+
+fn find_closure(ret: Str, p0: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.Closure {
+            let t = tc_lookup_node_tid(i)
+            if t >= 0 && ret_kind(t) == ret && param_kind(t, 0) == p0 { return t }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn harvest_triad(path: Str) -> (Int, Int, Int) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, TypeCheck.Resolve, TypeCheck.Report, FS {
+    write_file(path, triad_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let concrete = find_closure("Int", "Int")
+    let void_int = find_closure("Void", "Int")
+    let str_str = find_closure("Str", "Str")
+    fs.remove(path)
+    (concrete, void_int, str_str)
+}
+
+test "the predicate rules on real closure tids" {
+    let (concrete, void_int, str_str) = harvest_triad("build/g19dpq_triad.bl")
+    assert(concrete >= 0 && void_int >= 0 && str_str >= 0)
+    // A concrete Int return refines a Void default of the same arity+param.
+    assert_eq_int(tc_fn_tid_more_specific(concrete, void_int), 1, "Int return refines Void default")
+    // Void does NOT refine a concrete Int return.
+    assert_eq_int(tc_fn_tid_more_specific(void_int, concrete), 0, "Void does not refine Int return")
+    // A different concrete param (the mono re-instantiation case) is not a refinement.
+    assert_eq_int(tc_fn_tid_more_specific(concrete, str_str), 0, "Int param does not refine a concrete Str param")
+    // Equal counts as at-least-as-specific (harmless no-op).
+    assert_eq_int(tc_fn_tid_more_specific(concrete, concrete), 1, "equal refines itself")
+}
