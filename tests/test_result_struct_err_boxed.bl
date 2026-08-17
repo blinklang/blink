@@ -1,0 +1,111 @@
+// br 8ncqe2 (C2, jr4xf7 spec): a struct-typed ERROR arm of Result is stored BY
+// POINTER in the C carrier, not inline. This keeps Result[T, FsError] at 16
+// bytes (register-pair return) instead of 32 (sret). Mirrors the existing
+// struct-Option boxing (blink_Option_<struct> stores `<struct>* value`).
+// The transparent-newtype path (Result[_, Errno]) stays a bare int64_t err arm
+// (pinned separately in test_errno_transparent_emit.bl and re-pinned below).
+
+import compile_test_helpers
+
+type BoxErr { code: Int, note: Str }
+
+fn mk_err() -> Result[Int, BoxErr] { return Err(BoxErr { code: 5, note: "boom" }) }
+fn mk_ok() -> Result[Int, BoxErr] { return Ok(42) }
+
+test "a struct-typed Result err arm round-trips through construct + match Err(e)" {
+    match mk_err() {
+        Ok(_) => assert(false)
+        Err(e) => {
+            assert_eq(e.code, 5)
+            assert_eq(e.note, "boom")
+        }
+    }
+}
+
+test "the Ok arm of a struct-err Result is unaffected" {
+    match mk_ok() {
+        Ok(n) => assert_eq(n, 42)
+        Err(_) => assert(false)
+    }
+}
+
+fn propagate() -> Result[Int, BoxErr] {
+    let x = mk_err()?
+    return Ok(x + 1)
+}
+
+test "? propagation carries the boxed struct err through the enclosing Result" {
+    match propagate() {
+        Ok(_) => assert(false)
+        Err(e) => assert_eq(e.code, 5)
+    }
+}
+
+test "unwrap_err reads the boxed struct err by value" {
+    let e = mk_err().unwrap_err()
+    assert_eq(e.code, 5)
+    assert_eq(e.note, "boom")
+}
+
+test "a struct-typed Result err arm is a POINTER member in the C carrier" {
+    let src = "pub type MyErr \{ code: Int }\n"
+        .concat("fn f() -> Result[Int, MyErr] \{ return Err(MyErr \{ code: 7 }) }\n")
+        .concat("fn main() \{ match f() \{ Ok(_) => \{} Err(e) => \{ let _ = e.code } } }\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_struct_err_boxed")
+    // The err member is a pointer to the struct, never inline.
+    assert(c.contains("blink_MyErr* err"))
+    assert(!c.contains("blink_MyErr err;"))
+}
+
+test "the transparent-newtype err arm stays a bare int64_t, never boxed" {
+    let src = "pub type Errno \{ Errno(Int) }\n"
+        .concat("fn f() -> Result[Str, Errno] \{ return Err(Errno(2)) }\n")
+        .concat("fn main() \{ match f() \{ Ok(_) => \{} Err(e) => \{ let _ = e } } }\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_struct_err_errno_pin")
+    // Errno is transparent: bare int64_t err arm, no pointer boxing.
+    assert(c.contains("int64_t err"))
+    assert(!c.contains("_Errno* err"))
+}
+
+// A monomorphized data-enum err instance must stay INLINE — is_mono_struct_instance
+// also admits enum bases, and the flush-ordering hazard lets one slip past the
+// enum exclusion; boxing it would disagree with the inline typedef. The spec boxes
+// STRUCT err arms only.
+test "a monomorphized enum err instance stays inline, never boxed" {
+    let src = "type Parsed[T] \{ Good(T), Bad }\n"
+        .concat("fn f() -> Result[Int, Parsed[Int]] \{ return Err(Parsed.Good(0)) }\n")
+        .concat("fn main() \{ match f() \{ Ok(_) => \{} Err(_) => \{} } }\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_mono_enum_err_inline")
+    assert(c.contains("blink_Parsed_0Int err;"))
+    assert(!c.contains("blink_Parsed_0Int* err"))
+}
+
+// C2 boxing allocates the err box with blink_alloc, which lands in the CURRENT
+// arena when one is active. A boxed struct err propagated by `?` out of a `with`
+// arena-expr block must be re-boxed in the surviving outer arena and deep-copied,
+// or the returned .err dangles (use-after-free). Reads the value on the outer side.
+type ArRes { h: Int }
+impl Closeable for ArRes { fn close(_self) {} }
+type ArErr { code: Int, note: Str }
+
+fn ar_open() -> Result[ArRes, ArErr] { Ok(ArRes { h: 1 }) }
+fn ar_fail() -> Result[Int, ArErr] { Err(ArErr { code: 91, note: "deep" }) }
+
+fn ar_propagate() -> Result[Int, ArErr] {
+    fn() -> Result[Int, ArErr] {
+        with ar_open()? as r {
+            let x = ar_fail()?
+            Ok(x + r.h)
+        }
+    }()
+}
+
+test "a boxed struct err survives arena-expr teardown via ? (no use-after-free)" {
+    match ar_propagate() {
+        Ok(_) => assert(false)
+        Err(e) => {
+            assert_eq(e.code, 91)
+            assert_eq(e.note, "deep")
+        }
+    }
+}

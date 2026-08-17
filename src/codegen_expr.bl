@@ -51,7 +51,7 @@ import codegen_types.{
     get_variant_field_count, get_variant_field_name,
     get_variant_field_type_str, get_variant_index, get_variant_tag,
     get_callee_params_sl,
-    is_compound_ct, is_compound_tag, is_data_enum, is_named_typedef_tag, is_mono_struct_instance, is_transparent_newtype, typedef_tag_or_empty,
+    is_compound_ct, is_compound_tag, is_data_enum, is_named_typedef_tag, is_mono_struct_instance, is_transparent_newtype, is_boxed_struct_err, typedef_tag_or_empty,
     list_named_elem_of, ListNamedElem,
     is_emitted_let, is_enum_type, is_fn_registered, is_generic_fn,
     is_scope_var,
@@ -295,15 +295,28 @@ fn emit_ok_result(ok_str: Str, ok_type: Int, err_type: Int, ok_s: Str, err_s: St
     }
 }
 
-fn emit_err_result(err_str: Str, ok_type: Int, err_type: Int, ok_s: Str, err_s: Str) {
+// C2: a struct-typed err value is GC-heap boxed and the Result carrier stores
+// the pointer (see is_boxed_struct_err). Returns the pointer temp to place in
+// `.err`; a non-boxed (scalar / transparent / enum) err passes straight through.
+fn box_struct_err(err_str: Str, err_s: Str) -> Str ! Codegen.Emit {
+    if is_boxed_struct_err(err_s) == 0 { return err_str }
+    let ec = c_type_c_name(err_s)
+    let box_tmp = fresh_temp("_errbox_")
+    emit_line("{ec}* {box_tmp} = ({ec}*)blink_alloc(sizeof({ec}));")
+    emit_line("*{box_tmp} = {err_str};")
+    box_tmp
+}
+
+fn emit_err_result(err_str: Str, ok_type: Int, err_type: Int, ok_s: Str, err_s: Str) ! Codegen.Emit {
+    let err_val = box_struct_err(err_str, err_s)
     if ok_s != "" || err_s != "" {
         ensure_mixed_result_type(ok_type, err_type, ok_s, err_s)
         let res_type = result_c_type_mixed(ok_type, err_type, ok_s, err_s)
-        expr_result_str = "({res_type})\{.tag = 1, .err = {err_str}}"
+        expr_result_str = "({res_type})\{.tag = 1, .err = {err_val}}"
     } else {
         ensure_result_type(ok_type, err_type)
         let res_type = result_c_type(ok_type, err_type)
-        expr_result_str = "({res_type})\{.tag = 1, .err = {err_str}}"
+        expr_result_str = "({res_type})\{.tag = 1, .err = {err_val}}"
     }
     expr_result_type = CT_RESULT
     publish_result_tid(-1)
@@ -2676,7 +2689,9 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 let qm_line = node_line(node)
                 let qm_col = node_col(node)
                 let qm_file = panic_file_for(node)
-                let err_msg_expr = test_render_err_message(rerr, rerr_s, "{tmp}.err")
+                // C2: a struct-typed err arm is boxed by pointer; deref to render.
+                let err_val_expr = if is_boxed_struct_err(rerr_s) != 0 { "*{tmp}.err" } else { "{tmp}.err" }
+                let err_msg_expr = test_render_err_message(rerr, rerr_s, err_val_expr)
                 let err_type_name = test_err_type_display_name(rerr, rerr_s)
                 emit_line("if ({tmp}.tag == 1) \{")
                 cg_indent = cg_indent + 1
@@ -2719,7 +2734,19 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                     emit_line("if ({tmp}.tag == 1) \{")
                     cg_indent = cg_indent + 1
                     let mut err_expr = "{tmp}.err"
-                    if err_desc == "P:Str" {
+                    if is_boxed_struct_err(rerr_s) != 0 {
+                        // C2: a boxed struct err is a heap pointer that blink_alloc
+                        // may have landed in an arena about to be torn down below.
+                        // Re-box in the surviving outer arena and deep-copy the
+                        // pointee, or the returned .err dangles.
+                        let box_mangle = descriptor_mangle(err_desc)
+                        queue_promote_type(err_desc)
+                        let ec = c_type_from_tag(rerr_s)
+                        let btmp = fresh_temp("__arena_errbox_")
+                        emit_line("{ec}* {btmp} = ({ec}*)blink_promote_alloc({outer_prev}, sizeof({ec}));")
+                        emit_line("*{btmp} = blink_promote_{box_mangle}({outer_prev}, *{tmp}.err);")
+                        err_expr = btmp
+                    } else if err_desc == "P:Str" {
                         let etmp = fresh_temp("__arena_err_")
                         emit_line("const char* {etmp} = blink_promote_str({outer_prev}, {tmp}.err);")
                         err_expr = etmp
@@ -4624,7 +4651,11 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                         cg_indent = cg_indent + 1
                         if left_err_s != "" {
                             let eq_err = fresh_temp("_eqerr")
-                            emit_struct_field_eq(eq_err, left_err_s, "_left.err", "_right.err", ".")
+                            // C2: a struct-typed err arm is boxed by pointer; reach
+                            // through it with `->`, mirroring the boxed-Option payload
+                            // compare, instead of an inline `.` field access.
+                            let err_op = if is_boxed_struct_err(left_err_s) != 0 { "->" } else { "." }
+                            emit_struct_field_eq(eq_err, left_err_s, "_left.err", "_right.err", err_op)
                             emit_line("if (!{eq_err}) {eq_v} = 0;")
                         } else if left_err == CT_STRING {
                             emit_line("if (!blink_str_eq(_left.err, _right.err)) {eq_v} = 0;")
@@ -5346,10 +5377,11 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                         }
                     }
                 }
+                let err_val = box_struct_err(err_str, err_s)
                 if ok_s != "" || err_s != "" {
                     ensure_mixed_result_type(ok_type, err_type, ok_s, err_s)
                     let res_type = result_c_type_mixed(ok_type, err_type, ok_s, err_s)
-                    expr_result_str = "({res_type})\{.tag = 1, .err = {err_str}}"
+                    expr_result_str = "({res_type})\{.tag = 1, .err = {err_val}}"
                     expr_result_type = CT_RESULT
                     publish_result_tid(node)
                     expr_result_ok_type = ok_type
@@ -5359,7 +5391,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 } else {
                     ensure_result_type(ok_type, err_type)
                     let res_type = result_c_type(ok_type, err_type)
-                    expr_result_str = "({res_type})\{.tag = 1, .err = {err_str}}"
+                    expr_result_str = "({res_type})\{.tag = 1, .err = {err_val}}"
                     expr_result_type = CT_RESULT
                     publish_result_tid(node)
                     expr_result_ok_type = ok_type

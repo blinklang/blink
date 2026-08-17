@@ -10,7 +10,7 @@ import codegen_types.{
     is_hash_scalar_ct,
     kops_table_name, kops_is_inline_enum_key, c_type_str,
     ensure_struct_result_type, ensure_struct_option_type, ensure_option_type, ensure_mixed_result_type,
-    is_struct_type, is_enum_type, is_data_enum, is_transparent_newtype,
+    is_struct_type, is_enum_type, is_data_enum, is_transparent_newtype, is_boxed_struct_err,
     has_derive_method,
     get_struct_field_tp_id,
     tp_child1_kind, tp_child1_sname,
@@ -2065,7 +2065,19 @@ fn emit_promote_result(desc: Str) ! Codegen.Emit {
     cg_indent = cg_indent - 1
     emit_line("} else \{")
     cg_indent = cg_indent + 1
-    emit_promote_desc_copy("src.err", err_d, "dst.err")
+    // C2: a boxed struct err is a heap pointer. blink_alloc lands the box in the
+    // CURRENT arena when one is active, so promotion must re-box in `target` and
+    // deep-copy the pointee — mirroring the boxed-Option branch above. A bare
+    // pointer copy would dangle once the source arena is torn down.
+    if is_boxed_struct_err(descriptor_typedef_tag(err_d)) != 0 {
+        let err_c = descriptor_c_type(err_d)
+        let box = fresh_temp("_prerr_")
+        emit_line("{err_c}* {box} = ({err_c}*)blink_promote_alloc(target, sizeof({err_c}));")
+        emit_line("*{box} = blink_promote_{descriptor_mangle(err_d)}(target, *src.err);")
+        emit_line("dst.err = {box};")
+    } else {
+        emit_promote_desc_copy("src.err", err_d, "dst.err")
+    }
     cg_indent = cg_indent - 1
     emit_line("}")
     emit_line("return dst;")

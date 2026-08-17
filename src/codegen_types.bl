@@ -8325,6 +8325,58 @@ pub fn is_named_typedef_tag(tag: Str) -> Int {
     0
 }
 
+// C2 boxing (jr4xf7 spec, 6-0): a STRUCT-typed error arm of a Result carrier is
+// stored BY POINTER, so `Result[T, FsError]` stays 16 bytes (register-pair
+// return) instead of 32 (sret). Mirrors the existing struct-Option boxing
+// (`blink_Option_<struct>` stores `<struct>* value`). Scoped to plain structs
+// (FsError, ConversionError): an ENUM error (NetError, DbError) stays inline —
+// the spec says "struct-typed error arm" — and the transparent `Errno` newtype
+// stays a bare int64_t. Every construct/read/typedef seam must consult THIS
+// predicate so they agree on box-vs-inline.
+pub fn is_boxed_struct_err(tag: Str) -> Int {
+    if tag == "" || tag == "void" || tag == "Void" { return 0 }
+    if is_compound_tag(tag) != 0 { return 0 }
+    if is_transparent_newtype(tag) != 0 { return 0 }
+    if is_enum_type(tag) != 0 { return 0 }
+    if is_struct_type(tag) != 0 { return 1 }
+    // A mono instance boxes only when its base is a STRUCT — is_mono_struct_instance
+    // also admits enum-based instances (Parsed[Int]), which the flush-ordering hazard
+    // (enum_reg_set populated only at typedef flush) lets slip past is_enum_type above.
+    // An enum err arm stays inline, so gate on the struct base directly.
+    let mono_base = lookup_mono_base(tag).base
+    if mono_base != "" && is_struct_type(mono_base) != 0 { return 1 }
+    // A module-prefixed canonical tag (`std_time_Instant`) is recognized by
+    // neither is_struct_type nor is_enum_type — both only strip a dot-qualifier,
+    // not the physical `std_time_` prefix. Discriminate struct-vs-enum on the bare
+    // trailing component so a module-qualified struct err boxes while a
+    // module-qualified enum err stays inline.
+    if is_canonical_struct_only_tag(tag) != 0 { return 1 }
+    0
+}
+
+// Like is_canonical_struct_tag but STRUCT-only: the trailing bare component must
+// be a registered STRUCT (not enum) whose module prefix matches.
+fn is_canonical_struct_only_tag(tag: Str) -> Int {
+    let mut i = tag.len() - 1
+    while i > 0 {
+        if tag.byte_at(i) == 95 { // '_'
+            let bare = tag.substring(i + 1, tag.len() - i - 1)
+            let prefix = tag.substring(0, i)
+            if struct_reg_set.contains_key(bare) != 0 {
+                if mod_type_prefix.contains_key("{prefix}:{bare}") != 0 { return 1 }
+                match mod_type_prefix.get(bare) {
+                    Some(p) => {
+                        if p == prefix { return 1 }
+                    }
+                    None => {}
+                }
+            }
+        }
+        i = i - 1
+    }
+    0
+}
+
 pub fn typedef_tag_or_empty(tag: Str) -> Str {
     if is_named_typedef_tag(tag) != 0 { tag } else { "" }
 }
@@ -8489,9 +8541,16 @@ pub fn emit_struct_result_typedef(ok_tag: Str, err_tag: Str) ! Codegen.Emit {
         emit_carrier_typedef_for_tag(err_tag)
     }
     let c_ok = if ok_tag == "void" || ok_tag == "Void" { "int64_t" } else { c_type_from_tag(ok_tag) }
-    let c_err = if err_tag == "void" || err_tag == "Void" { "int64_t" } else { c_type_from_tag(err_tag) }
+    // C2: a struct-typed err arm is stored by pointer (see is_boxed_struct_err).
+    let err_member = if err_tag == "void" || err_tag == "Void" {
+        "int64_t err"
+    } else if is_boxed_struct_err(err_tag) != 0 {
+        "{c_type_from_tag(err_tag)}* err"
+    } else {
+        "{c_type_from_tag(err_tag)} err"
+    }
     emit_td_guard_open(tname)
-    emit_line("typedef struct \{ int tag; union \{ {c_ok} ok; {c_err} err; }; } {tname};")
+    emit_line("typedef struct \{ int tag; union \{ {c_ok} ok; {err_member}; }; } {tname};")
     emit_td_guard_close()
     emit_line("")
 }

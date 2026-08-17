@@ -43,7 +43,7 @@ import codegen_types.{
     get_variant_field_count, get_variant_field_name,
     get_variant_field_type_str, get_variant_index, get_variant_tag,
     has_derive_method, is_compound_ct, is_data_enum, is_enum_type, is_fn_registered, is_scope_var, is_str_backed_enum, strip_generic_args,
-    is_generic_fn, is_mono_struct_instance, is_struct_type, is_struct_or_enum_type, is_trait_type, is_transparent_newtype, is_user_effect_handle,
+    is_generic_fn, is_mono_struct_instance, is_struct_type, is_struct_or_enum_type, is_trait_type, is_transparent_newtype, is_boxed_struct_err, is_user_effect_handle,
     cg_expect_fn_value_sig, cg_expect_arg_ann, arg_type_ann_at, get_callee_params_sl,
     builtin_receiver_type_name,
     is_sized_int_ct, unwrap_scalar_ct, lookup_builtin_trait_impl, lookup_impl_method, impl_method_reg_name, impl_trait_for_method, impl_type_implements_trait_method, mangle_generic_name, mangle_impl_method_q, mangle_from_method, synthesized_display_call, render_result_arm_value, wrapping_unsigned_c_type,
@@ -658,14 +658,27 @@ fn emit_result_unwrap_inner(
     // The panicked-on arm is the OTHER arm: `.unwrap()` panics on Err, so we
     // render `tmp.err`; `.unwrap_err()` panics on Ok, so we render `tmp.ok`.
     let panic_field = if is_ok { "err" } else { "ok" }
-    let rendered = render_result_arm_value(other_t, other_s, "{tmp}.{panic_field}")
+    // C2: a struct-typed err arm is boxed by pointer; deref before rendering it.
+    let panic_val_expr = if panic_field == "err" && is_boxed_struct_err(other_s) != 0 {
+        "*{tmp}.{panic_field}"
+    } else {
+        "{tmp}.{panic_field}"
+    }
+    let rendered = render_result_arm_value(other_t, other_s, panic_val_expr)
     // The guard is byte-identical across every inner-type branch and always
     // precedes the value binding, so emit it once here. Branches differ only in
     // how they bind and type the success value.
     emit_panic_tag_check_render(tmp, panic_tag, panic_msg, rendered, node)
     if inner_s != "" && is_compound_ct(inner_t) == 0 {
         let val_tmp = fresh_temp(if is_ok { "_runv_" } else { "_ruerr_" })
-        emit_line("{c_type_c_name(inner_s)} {val_tmp} = {tmp}.{field};")
+        // C2: a struct-typed err arm is boxed by pointer; `.unwrap_err()` copies
+        // the struct out of the box. The ok arm is never boxed.
+        let unwrap_val = if field == "err" && is_boxed_struct_err(inner_s) != 0 {
+            "*{tmp}.{field}"
+        } else {
+            "{tmp}.{field}"
+        }
+        emit_line("{c_type_c_name(inner_s)} {val_tmp} = {unwrap_val};")
         set_var_struct(val_tmp, inner_s)
         expr_result_str = val_tmp
         expr_result_type = CT_VOID
@@ -2869,7 +2882,11 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 let res_type = struct_result_c_type("char", "ConversionError")
                 emit_line("int64_t {tmp} = blink_char_validate_code_point({arg_str});")
                 emit_line("{res_type} {res_tmp};")
-                emit_line("if ({tmp} >= 0) \{ {res_tmp}.tag = 0; {res_tmp}.ok = (int32_t){tmp}; } else \{ {res_tmp}.tag = 1; {res_tmp}.err = ({c_type_c_name(\"ConversionError\")})\{.message = \"not a valid Unicode scalar value\", .source_type = \"Int\", .target_type = \"Char\"}; }")
+                // C2: the ConversionError err arm is boxed by pointer — GC-alloc
+                // the struct and store the pointer, matching the carrier typedef.
+                let cerr = c_type_c_name("ConversionError")
+                let ebox = fresh_temp("_cverr_")
+                emit_line("if ({tmp} >= 0) \{ {res_tmp}.tag = 0; {res_tmp}.ok = (int32_t){tmp}; } else \{ {res_tmp}.tag = 1; {cerr}* {ebox} = ({cerr}*)blink_alloc(sizeof({cerr})); *{ebox} = ({cerr})\{.message = \"not a valid Unicode scalar value\", .source_type = \"Int\", .target_type = \"Char\"}; {res_tmp}.err = {ebox}; }")
                 set_var_result_struct(res_tmp, CT_CHAR, CT_STRUCT, "", "ConversionError")
                 expr_result_str = res_tmp
                 expr_result_type = CT_RESULT
