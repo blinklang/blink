@@ -1,0 +1,71 @@
+// br cz10bb: an Errno-typed STRUCT FIELD must stay transparent (bare int64_t),
+// like every other Errno seam. The transparent-newtype carve-out was scoped to
+// Result-arm/let/match seams and skipped struct fields, so the field was
+// DECLARED boxed (blink_..._Errno code;) but CONSTRUCTED and READ flat:
+//   - construct: `.code = 2` brace-elides into the boxed struct's first member
+//     -> sets .tag = 2, silently loses the value. No diagnostic.
+//   - read back: `int64_t x = e.code;` is invalid C (int64_t <- boxed struct).
+// Blocks Errno as a field of a structured fs/net error (FsError, jr4xf7 spec).
+
+import compile_test_helpers
+import std.errno.{Errno}
+
+test "a transparent-newtype struct field emits a bare int64_t member, not a boxed carrier" {
+    let src = "pub type Errno \{ Errno(Int) }\n"
+        .concat("pub type FsError \{ path: Str, code: Errno }\n")
+        .concat("fn mk() -> FsError \{ return FsError \{ path: \"/x\", code: Errno(2) } }\n")
+        .concat("fn main() \{ let _ = mk() }\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_errno_field")
+    // The field is bare int64_t, never a boxed blink_Errno carrier.
+    assert(c.contains("int64_t code;"))
+    assert(!c.contains("blink_Errno code;"))
+}
+
+type FieldErr { path: Str, code: Errno }
+
+fn mk_err() -> Result[Str, FieldErr] {
+    return Err(FieldErr { path: "/tmp/a", code: Errno(2) })
+}
+
+test "an Errno struct field round-trips its value through construct and read-back" {
+    match mk_err() {
+        Ok(_) => assert(false)
+        Err(e) => {
+            assert_eq(e.path, "/tmp/a")
+            match e.code {
+                Errno(rc) => assert_eq(rc, 2)
+            }
+        }
+    }
+}
+
+type GBox[T] { val: T, code: Errno }
+
+fn mk_gbox() -> GBox[Str] { return GBox { val: "hi", code: Errno(7) } }
+
+test "an Errno field on a GENERIC struct stays transparent through the mono path" {
+    let b = mk_gbox()
+    assert_eq(b.val, "hi")
+    match b.code {
+        Errno(rc) => assert_eq(rc, 7)
+    }
+}
+
+test "a Result[_, Errno] carrier field keeps its carrier type, not a flattened int64_t" {
+    // A carrier that merely CONTAINS Errno (Result[Int, Errno]) is NOT a
+    // transparent leaf: the generic-struct field must keep its carrier struct,
+    // not collapse to a bare int64_t. Guards is_transparent_newtype's `_Errno`
+    // name-gate against over-matching compound tags when the leaf-transparency
+    // check runs before the carrier branch. Emit-only: the carrier-of-newtype
+    // field still has separate lowering bugs (double module-qualification and
+    // err-arm erasure) tracked apart from this transparent-leaf fix.
+    let src = "pub type Errno \{ Errno(Int) }\n"
+        .concat("pub type Carrier[T] \{ v: T }\n")
+        .concat("fn mk() -> Result[Int, Errno] \{ return Ok(9) }\n")
+        .concat("fn wrap() -> Carrier[Result[Int, Errno]] \{ return Carrier \{ v: mk() } }\n")
+        .concat("fn main() \{ let _ = wrap() }\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_errno_carrier_field")
+    // The field carries a Result carrier, never a flattened bare int.
+    assert(c.contains("blink_Result"))
+    assert(!c.contains("int64_t v;"))
+}

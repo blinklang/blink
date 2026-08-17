@@ -8505,7 +8505,12 @@ pub fn register_mono_field_types(base_name: Str, mono_name: Str, arg_tids0: List
             // mangled name as a struct type.
             let resolved_mono_base = lookup_mono_base(resolved).base
             let resolved_is_mono_struct = resolved_mono_base != "" && find_type_def(resolved_mono_base) != -1
-            if is_struct_type(resolved) != 0 || is_enum_type(resolved) != 0 || resolved_is_mono_struct {
+            if is_transparent_newtype(resolved) != 0 {
+                // Transparent newtype (Errno): bare int64_t field, honest CT_INT
+                // metadata. Mirrors emit_mono_struct_typedef; must precede the
+                // is_enum_type arm, which would record it as a boxed CT_STRUCT.
+                reg_sf_entry(mono_name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""))
+            } else if is_struct_type(resolved) != 0 || is_enum_type(resolved) != 0 || resolved_is_mono_struct {
                 reg_sf_entry(mono_name, fname, CT_STRUCT, resolved, sv_tp(CT_STRUCT, -1, -1, resolved))
             } else if is_compound_tag(resolved) != 0 {
                 // A bare-typevar field (`value: T`) whose concrete arg is a COMPOUND
@@ -8925,7 +8930,12 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[
             // through every branch below to the CT_VOID default and erases the
             // field to `void` while the field's VALUE still constructs the real
             // payload.
-            if is_struct_type(resolved) != 0 || is_enum_type(resolved) != 0 || is_mono_struct_instance(resolved) != 0 {
+            if is_transparent_newtype(resolved) != 0 {
+                // Transparent newtype (Errno): bare int64_t, honest CT_INT metadata.
+                // Must precede the is_enum_type arm, which would box it.
+                emit_line("int64_t {fname};")
+                reg_sf_entry(c_name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""))
+            } else if is_struct_type(resolved) != 0 || is_enum_type(resolved) != 0 || is_mono_struct_instance(resolved) != 0 {
                 emit_line("{c_type_c_name(resolved)} {fname};")
                 reg_sf_entry(c_name, fname, CT_VOID, resolved, sv_tp(CT_VOID, -1, -1, resolved))
             } else if resolved == "Option" {
@@ -10418,12 +10428,20 @@ pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit, Codegen.Register, Diag.
                 emit_line("{c_type_c_name(type_name)} {fname};")
                 reg_sf_entry(name, fname, CT_VOID, type_name, sv_tp(CT_VOID, -1, -1, type_name))
             } else if is_enum_type(type_name) != 0 {
-                if is_data_enum(type_name) != 0 {
-                    emit_line("{c_type_c_name(type_name)} {fname};")
-                } else {
+                if is_transparent_newtype(type_name) != 0 {
+                    // A transparent newtype (Errno) is a bare int64_t at every
+                    // seam. Boxing it in the field decl while construct/read stay
+                    // flat silently loses the value and emits invalid C on read-back.
                     emit_line("int64_t {fname};")
+                    reg_sf_entry(name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""))
+                } else {
+                    if is_data_enum(type_name) != 0 {
+                        emit_line("{c_type_c_name(type_name)} {fname};")
+                    } else {
+                        emit_line("int64_t {fname};")
+                    }
+                    reg_sf_entry(name, fname, CT_VOID, type_name, sv_tp(CT_VOID, -1, -1, type_name))
                 }
-                reg_sf_entry(name, fname, CT_VOID, type_name, sv_tp(CT_VOID, -1, -1, type_name))
             } else if type_name == "Tuple" {
                 let tup_opt = resolve_tuple_ann(type_ann_node, -1, [])
                 if tup_opt.is_some() {
