@@ -2157,14 +2157,35 @@ BLINK_RT_FN int64_t blink_str_index_of(const char* s, const char* needle) {
 
 /* ── File I/O ───────────────────────────────────────────────────────── */
 
+/* ── Filesystem error side-channel ──────────────────────────────────────
+   The raw fs syscalls record errno here (0 on success) instead of exiting,
+   so a Blink Result[T, FsError] wrapper can turn a failure into Err. */
+#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
+  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
+    __thread int64_t blink_fs_errno = 0;
+  #else
+    extern __thread int64_t blink_fs_errno;
+  #endif
+#else
+BLINK_UNUSED static __thread int64_t blink_fs_errno = 0;
+#endif
+
+BLINK_RT_FN int64_t blink_fs_errno_get(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_fs_errno_get(void) {
+    return blink_fs_errno;
+}
+#endif
+
 BLINK_RT_FN const char* blink_read_file(const char* path);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_read_file(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) {
-        fprintf(stderr, "blink: cannot open file: %s\n", path);
-        exit(1);
+        blink_fs_errno = (int64_t)errno;
+        return "";
     }
+    blink_fs_errno = 0;
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -2181,12 +2202,22 @@ BLINK_RT_FN void blink_write_file(const char* path, const char* content);
 BLINK_RT_FN void blink_write_file(const char* path, const char* content) {
     FILE* f = fopen(path, "wb");
     if (!f) {
-        fprintf(stderr, "blink: cannot open file for writing: %s\n", path);
-        exit(1);
+        blink_fs_errno = (int64_t)errno;
+        return;
     }
     size_t len = strlen(content);
-    fwrite(content, 1, len, f);
-    fclose(f);
+    size_t wrote = fwrite(content, 1, len, f);
+    if (wrote != len) {
+        int e = errno;
+        fclose(f);
+        blink_fs_errno = (int64_t)(e != 0 ? e : EIO);
+        return;
+    }
+    if (fclose(f) != 0) {
+        blink_fs_errno = (int64_t)errno;
+        return;
+    }
+    blink_fs_errno = 0;
 }
 #endif
 
@@ -2241,7 +2272,11 @@ BLINK_RT_FN blink_list* blink_list_dir(const char* path);
 BLINK_RT_FN blink_list* blink_list_dir(const char* path) {
     blink_list* result = blink_list_new();
     DIR* d = opendir(path);
-    if (!d) return result;
+    if (!d) {
+        blink_fs_errno = (int64_t)errno;
+        return result;
+    }
+    blink_fs_errno = 0;
     struct dirent* entry;
     while ((entry = readdir(d)) != NULL) {
         if (entry->d_name[0] == '.' && (entry->d_name[1] == '\0' ||
@@ -2458,7 +2493,11 @@ BLINK_RT_FN int blink_fs_default_delete(const char* path) {
 BLINK_RT_FN void blink_fs_remove(const char* path);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_fs_remove(const char* path) {
-    unlink(path);
+    if (unlink(path) != 0) {
+        blink_fs_errno = (int64_t)errno;
+    } else {
+        blink_fs_errno = 0;
+    }
 }
 #endif
 
