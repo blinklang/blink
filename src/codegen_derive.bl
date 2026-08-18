@@ -21,6 +21,7 @@ import codegen_types.{
     derive_eq_types, derive_ord_types, derive_clone_types, derive_hash_types, derive_debug_types,
     derive_hash_generic_bases, derive_eq_generic_bases,
     derive_method_entries, display_impl_types, lookup_impl_method, mangle_impl_method_q,
+    mod_fn_prefix, cg_skip_modules, cg_emit_only_module,
     DeriveMethodEntry,
     list_contains_str,
     sf_entries,
@@ -230,6 +231,22 @@ fn display_synthesis_skipped(tname: Str) -> Int {
     lookup_impl_method(tname, "display")
 }
 
+// The synthesized display() has a single home: the TU that owns the Display
+// impl. mod_fn_prefix records that module beside the impl; an unregistered
+// symbol is entry-module (__main__) owned, since only __main__/orphan impls are
+// left out of mod_fn_prefix. A consuming TU (a user TU using a stdlib type, or a
+// per-module .o that is not the owner) emits only the forward decl and links
+// against the owner's copy — the same skip_module gate the user-written fmt half
+// of the impl already uses, so display() and fmt stay co-located.
+fn display_def_owned_elsewhere(tname: Str) -> Bool {
+    let owner = match mod_fn_prefix.get(mangle_impl_method_q(tname, "Display", "display")) {
+        Some(m) => m
+        None => "__main__"
+    }
+    if cg_emit_only_module != "" && owner != cg_emit_only_module { return true }
+    cg_skip_modules.contains_key(owner)
+}
+
 pub fn emit_display_forward_decls() ! Codegen.Emit {
     let mut i = 0
     while i < display_impl_types.len() {
@@ -245,7 +262,7 @@ pub fn emit_display_fn_defs() ! Codegen.Emit {
     let mut i = 0
     while i < display_impl_types.len() {
         let tname = display_impl_types.get(i).unwrap()
-        if display_synthesis_skipped(tname) == 0 {
+        if display_synthesis_skipped(tname) == 0 && display_def_owned_elsewhere(tname) == false {
             emit_line("const char* {c_fn_name(mangle_impl_method_q(tname, "Display", "display"))}({c_type_c_name(tname)} self) \{")
             cg_indent = cg_indent + 1
             emit_line("blink_sb* sb = blink_sb_new();")

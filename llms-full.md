@@ -386,6 +386,9 @@ fs.read(path)                   // -> Result[Str, FsError]
 fs.write(path, content)         // -> Result[Void, FsError]
 fs.delete(path)                 // -> Result[Void, FsError] (delete file, backed by unlink(2))
 fs.list_dir(dir)                // -> Result[List[Str], FsError] (filenames)
+// FsError { op: FsOp, path: Str, code: Errno } — the error the fs.* surface returns.
+"{err}"                         // Display renders `op path: message`, e.g. `read /etc/app.toml: No such file or directory`
+err.not_found()                 // -> Bool: true only when the failure was ENOENT (file not there)
 
 // Environment (effect: Env)
 env.args()                      // -> List[Str] (all CLI args)

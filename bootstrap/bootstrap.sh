@@ -15,6 +15,7 @@ cp "$SCRIPT_DIR"/runtime_*.h "$BUILD_DIR/"
 # Build a flat runtime.h in build/ that user .c files #include directly.
 # (Flat so nested #includes inside the split headers are pre-resolved.)
 cat "$SCRIPT_DIR/runtime_core.h" \
+    "$SCRIPT_DIR/runtime_errno.h" \
     "$SCRIPT_DIR/runtime_tcp.h" \
     "$SCRIPT_DIR/runtime_unix_socket.h" \
     "$SCRIPT_DIR/runtime_thread.h" \

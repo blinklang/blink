@@ -18,3 +18,54 @@ pub type FsError {
     path: Str
     code: Errno
 }
+
+// ENOENT is 2 on Linux. Named ERR_NOENT (not ENOENT) because <errno.h> defines
+// ENOENT as a C macro, which would rewrite the emitted constant into invalid C —
+// the same reason libc.bl names its EINVAL constant ERR_INVAL.
+let ERR_NOENT: Int = 2
+
+// strerror(3) via the blink_strerror vendored shim (bootstrap/runtime_errno.h).
+// The raw @ffi binding is module-private and effect-declared; errno_message is the
+// safe effectless wrapper (strerror is a pure errno->message table lookup, so it
+// carries no observable effect once wrapped).
+@ffi("blink_strerror")
+@trusted(audit: "Wraps strerror_r(3) through the blink_strerror shim, which renders the message into a local buffer and returns an owned GC copy. Pure lookup, thread-safe, no side effects, no memory shared back to C.")
+fn c_strerror(code: Int) -> Str ! FFI {}
+
+fn errno_message(code: Int) -> Str {
+    c_strerror(code)
+}
+
+// `e.not_found()` — true exactly when the failure was ENOENT, so callers can ask
+// "did this fail because the file was not there?" without matching error codes by
+// hand (sections/04_effects.md:846-861). A method needs a trait (Blink has no
+// inherent methods, §3c); this trait carries that one predicate for FsError.
+pub trait FsErrorExt {
+    fn not_found(self) -> Bool
+}
+
+impl FsErrorExt for FsError {
+    fn not_found(self) -> Bool {
+        match self.code {
+            Errno(code) => code == ERR_NOENT
+        }
+    }
+}
+
+// FsError renders as `op path: message` (sections/04_effects.md:837), e.g.
+// `read /etc/app.toml: No such file or directory`. The op is the lowercase
+// operation name; the message is the OS text for the errno code.
+impl Display for FsError {
+    fn fmt(self, sb: StringBuilder) {
+        let op = match self.op {
+            FsOp.Read => "read"
+            FsOp.Write => "write"
+            FsOp.ListDir => "list_dir"
+            FsOp.Delete => "delete"
+        }
+        let code = match self.code {
+            Errno(c) => c
+        }
+        sb.write("{op} {self.path}: {errno_message(code)}")
+    }
+}
