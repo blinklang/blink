@@ -7385,17 +7385,49 @@ fn resolve_tuple_tag(ann: Int) -> Str {
 }
 
 fn resolve_ann_tag(ann: Int, name: Str) -> Str {
+    resolve_ann_tag_ctx(ann, name, -1, [], [])
+}
+
+// The tid a type-param binder is bound to in this mono, or -1. Inlines the positional
+// lookup (tparam_tid_via_mono in codegen_methods) so codegen_types keeps no upward
+// dependency — arg_tids is aligned to tparams_sl exactly as that helper reads it.
+fn tparam_bound_tid_local(name: Str, tparams_sl: Int, arg_tids: List[Int]) -> Int {
+    if tparams_sl == -1 { return -1 }
+    let mut pi = 0
+    while pi < sublist_length(tparams_sl) {
+        if node_name(sublist_get(tparams_sl, pi)) == name {
+            if pi < arg_tids.len() { return arg_tids.get(pi).unwrap() }
+            return -1
+        }
+        pi = pi + 1
+    }
+    -1
+}
+
+// Substituting twin of resolve_ann_tag. When a leaf name is a type-param binder, spell it
+// from its bound TID with tc_tid_inner_tag — the INNER-position speller the carrier path
+// uses (scalar → lowercase `int`, struct/enum → capital mono stem, nested compound
+// recursively). resolve_tparam_seg is NOT used for the leaf: it hands back the TOP-position
+// tag (`Int`), which the carrier typedef and caller never spell. `segs` still feeds the
+// struct-with-typevar-args branch (mono_name_from_ann needs the mangle segment there). With
+// tparams_sl=-1 / arg_tids=[] / segs=[] this is byte-identical to the pre-substitution path.
+fn resolve_ann_tag_ctx(ann: Int, name: Str, tparams_sl: Int, arg_tids: List[Int], segs: List[Str]) -> Str {
+    let bt = tparam_bound_tid_local(name, tparams_sl, arg_tids)
+    if bt >= 0 {
+        let t = tc_tid_inner_tag(bt)
+        if t != "" && !t.contains("<") { return t }
+    }
     let ct = type_from_name(name)
     if node_name(ann) == "Tuple" {
-        let t = resolve_tuple_tag(ann)
-        if t != "" { return t }
+        let t = resolve_tuple_ann(ann, tparams_sl, segs)
+        if t.is_some() { return t.unwrap() }
         return c_type_tag(ct)
     }
     if is_compound_ct(ct) != 0 {
-        return compound_name_from_ann(ann)
+        return compound_name_from_ann_ctx(ann, tparams_sl, arg_tids, segs)
     }
     if is_struct_type(name) != 0 || is_enum_type(name) != 0 {
-        let mono = mono_name_from_ann(strip_module_qualifier(name), ann, -1, [])
+        let mono = mono_name_from_ann(strip_module_qualifier(name), ann, tparams_sl, segs)
         if mono != "" { return mono }
         return strip_module_qualifier(name)
     }
@@ -7403,6 +7435,17 @@ fn resolve_ann_tag(ann: Int, name: Str) -> Str {
 }
 
 pub fn compound_name_from_ann(ann_node: Int) -> Str {
+    compound_name_from_ann_ctx(ann_node, -1, [], [])
+}
+
+// Substituting twin of compound_name_from_ann: threads (tparams_sl, arg_tids, segs) into
+// each inner so a type-param inner (`Option[Map[K,V]]`, `Option[Option[T]]`,
+// `Option[Result[T,E]]`) spells its concrete args instead of erasing them to `void`. A
+// generic fn's def-side mono has no call node to read a tid off, but its arg_tids ARE the
+// type-param bindings (aligned to tparams_sl), so resolve_ann_tag_ctx spells each leaf from
+// the bound tid. `segs` is the mangle-segment twin for the struct-with-typevar-args branch.
+// The wrapper above passes (-1, [], []) and is byte-identical to the pre-substitution path.
+pub fn compound_name_from_ann_ctx(ann_node: Int, tparams_sl: Int, arg_tids: List[Int], segs: List[Str]) -> Str {
     let name = node_name(ann_node)
     let ct = type_from_name(name)
     if ct == CT_RESULT {
@@ -7412,8 +7455,8 @@ pub fn compound_name_from_ann(ann_node: Int) -> Str {
             let err_ann = sublist_get(inner_elems, 1)
             let ok_name = node_name(ok_ann)
             let err_name = node_name(err_ann)
-            let ok_tag = resolve_ann_tag(ok_ann, ok_name)
-            let err_tag = resolve_ann_tag(err_ann, err_name)
+            let ok_tag = resolve_ann_tag_ctx(ok_ann, ok_name, tparams_sl, arg_tids, segs)
+            let err_tag = resolve_ann_tag_ctx(err_ann, err_name, tparams_sl, arg_tids, segs)
             return "Result_{ok_tag}_{err_tag}"
         }
         "Result_int_str"
@@ -7422,7 +7465,7 @@ pub fn compound_name_from_ann(ann_node: Int) -> Str {
         if inner_elems != -1 && sublist_length(inner_elems) >= 1 {
             let inner_ann2 = sublist_get(inner_elems, 0)
             let inner_name2 = node_name(inner_ann2)
-            let inner_tag = resolve_ann_tag(inner_ann2, inner_name2)
+            let inner_tag = resolve_ann_tag_ctx(inner_ann2, inner_name2, tparams_sl, arg_tids, segs)
             return "Option_{inner_tag}"
         }
         "Option_int"
@@ -7433,14 +7476,14 @@ pub fn compound_name_from_ann(ann_node: Int) -> Str {
             let val_ann = sublist_get(inner_elems, 1)
             let key_name = node_name(key_ann)
             let val_name = node_name(val_ann)
-            let key_tag = resolve_ann_tag(key_ann, key_name)
-            let val_tag = resolve_ann_tag(val_ann, val_name)
+            let key_tag = resolve_ann_tag_ctx(key_ann, key_name, tparams_sl, arg_tids, segs)
+            let val_tag = resolve_ann_tag_ctx(val_ann, val_name, tparams_sl, arg_tids, segs)
             return "Map_{key_tag}_{val_tag}"
         }
         "map"
     } else if name == "Tuple" {
-        let t = resolve_tuple_tag(ann_node)
-        if t != "" { return t }
+        let t = resolve_tuple_ann(ann_node, tparams_sl, segs)
+        if t.is_some() { return t.unwrap() }
         return c_type_tag(ct)
     } else {
         c_type_tag(ct)

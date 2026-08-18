@@ -22,7 +22,7 @@ import codegen_types.{
     cg_mono_tparams_sl, cg_mono_arg_tids, cg_fn_mono_tparams_sl, cg_fn_mono_arg_tids,
     cg_let_target_name, cg_let_target_type, cg_assign_target_name, cg_lines, cg_program_node,
     cg_temp_counter, cg_trace_codegen, cg_ensures_result_var, cg_old_snapshot_vars,
-    compound_name_from_ann, resolve_result_inner_tag,
+    compound_name_from_ann, compound_name_from_ann_ctx, resolve_result_inner_tag,
     emit_arena_restore_helper, emit_bh_cleanup_for_type, emit_cl_cleanup_for_type, emit_ev_restore_helper, emit_handle_cleanup, emit_line, ev_field, fn_node_has_effects,
     cg_archive_build_mode, cg_archive_header_mode, cg_user_tu_mode, in_per_module_object,
     emit_struct_option_typedef, emit_td_guard_open, emit_td_guard_close,
@@ -1072,6 +1072,14 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                     emit_line("{opt_c} {scrut_tmp} = {expr_result_str};")
                     set_var_option_struct(scrut_tmp, oi, oi_s)
                     set_var_option_erased(scrut_tmp, 1)
+                } else if is_compound_ct(tc_tid_option_inner_ct(tc_tid_resolved(cg_node_mono_tid(scrut)))) != 0 && c_type_from_tid(cg_node_mono_tid(scrut)).starts_with("blink_Option_") {
+                    // A compound inner (`Option[Map[K,V]]`, `Option[Option[T]]`,
+                    // `Option[Result[..]]`) erases through the flat oi/oi_s channels — they
+                    // carry only a one-level inner and spell blink_Option_option /
+                    // blink_Option_map. The scrutinee tid holds the full inner, so lead with
+                    // it for exactly that shape, mirroring the scalar branch below.
+                    let opt_c = c_type_from_tid(cg_node_mono_tid(scrut))
+                    emit_line("{opt_c} {scrut_tmp} = {expr_result_str};")
                 } else if oi_s != "" {
                     let opt_c = struct_option_c_type(oi_s)
                     emit_line("{opt_c} {scrut_tmp} = {expr_result_str};")
@@ -2594,7 +2602,17 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                         ctype_probe_at(payload_tid, "match_binder.carrier_payload", bind_name, payload_c, sub_pat)
                         let payload_spelled = c_type_from_tid(payload_tid)
                         let payload_ts = if payload_spelled != "" && payload_spelled != "void" { payload_spelled } else { payload_c }
-                        emit_line("{payload_ts} {c_bind} = {scrut}.{field};")
+                        // A compound inner (Option/Result) under an Option's `.value`
+                        // is boxed by pointer, so the whole-value binder derefs — same
+                        // rule the inner_struct != "" arms above use. Reached here when
+                        // the flat inner-struct channel was erased and the tid recovered
+                        // the payload type; without the deref the binder assigns a
+                        // pointer to a by-value struct.
+                        if field == "value" && (inner_ct == CT_OPTION || inner_ct == CT_RESULT) {
+                            emit_line("{payload_ts} {c_bind} = *{scrut}.{field};")
+                        } else {
+                            emit_line("{payload_ts} {c_bind} = {scrut}.{field};")
+                        }
                         set_var(bind_name, inner_ct, 0)
                         if inner_ct == CT_LIST {
                             // A plain `Option[List[T]]` (no struct name)
@@ -4847,17 +4865,29 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         let opt_inner = get_var_option_inner(name)
         let opt_inner_s = get_var_option_inner_struct(name)
         let opt_c_inner = opt_inner
+        // A compound inner (`Option[Map[K,V]]`, `Option[Option[T]]`, `Option[Result[..]]`)
+        // erases through the flat channels: option_c_type_mixed sees only a one-level inner
+        // and drops the args (`blink_Option_map`). The tid carries the full inner, so lead
+        // with it for exactly that shape — gated on the inner being compound and the tid
+        // spelling a well-formed Option carrier — while a scalar/struct inner keeps the flat
+        // spelling byte-for-byte. The typedef is registered by the producer's signature and
+        // return-expression, which the same TU always emits.
+        let opt_tid_c = c_type_from_tid(decl_tid)
+        let opt_inner_compound = is_compound_ct(tc_tid_option_inner_ct(tc_tid_resolved(decl_tid))) != 0
+        let opt_use_tid = opt_inner_compound && opt_tid_c.starts_with("blink_Option_")
         // A ptr-erased Option (UE-handler ABI) carries its TRUE logical inner in
         // the flat channels, but its physical value is a blink_Option_ptr box — the
         // declaration must spell the erased carrier to accept it.
         let opt_c = if get_var_option_erased(name) != 0 {
             ensure_option_type(CT_PTR)
             option_c_type(CT_PTR)
+        } else if opt_use_tid {
+            opt_tid_c
         } else {
             option_c_type_mixed(opt_c_inner, opt_inner_s)
         }
         decl_c = opt_c
-        decl_branch = "option"
+        decl_branch = if get_var_option_erased(name) == 0 && opt_use_tid { "option_tid" } else { "option" }
         if val_str.ends_with("\{.tag = 0}") {
             val_str = "({opt_c})\{.tag = 0}"
         }
@@ -9384,7 +9414,12 @@ fn mono_fn_signature(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) -> M
                 ret_c_str = struct_option_c_type(inner_name)
                 cg_current_fn_option_inner_struct = inner_name
             } else if is_compound_ct(inner_ct) != 0 {
-                let compound_name = compound_name_from_ann(inner_ann)
+                // A type-param inner (`-> Option[Map[K,V]]`) erases through the plain
+                // annotation decoder — compound_name_from_ann reads K,V as bare names and
+                // spells `Map_void_void`, so the signature named a carrier the body and
+                // caller never use. The def-side arg_tids ARE the type-param bindings, so
+                // segs spells the inner concretely (`Map_str_int`), matching both.
+                let compound_name = compound_name_from_ann_ctx(inner_ann, tparams_sl, arg_tids, segs)
                 ensure_struct_option_type(compound_name)
                 ret_c_str = struct_option_c_type(compound_name)
                 cg_current_fn_option_inner_struct = compound_name
