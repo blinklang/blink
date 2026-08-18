@@ -1050,7 +1050,16 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
             if expr_result_type == CT_RESULT {
                 let rok_s = expr_result_ok_struct
                 let rerr_s = expr_result_err_struct
-                if rok_s != "" || rerr_s != "" {
+                // A compound ok/err inner (`Result[Map[K,V], E]`) erases through the
+                // flat rok/rerr channels — they carry only a one-level inner and spell
+                // blink_Result_map_str. The scrutinee tid holds the full inner, so lead
+                // with it for exactly that shape, mirroring the CT_OPTION branch below.
+                let res_scrut_tid_r = tc_tid_resolved(cg_node_mono_tid(scrut))
+                let res_scrut_tid_c = c_type_from_tid(cg_node_mono_tid(scrut))
+                let res_scrut_compound = is_compound_ct(tc_tid_result_ok_ct(res_scrut_tid_r)) != 0 || is_compound_ct(tc_tid_result_err_ct(res_scrut_tid_r)) != 0
+                if res_scrut_compound && res_scrut_tid_c.starts_with("blink_Result_") {
+                    emit_line("{res_scrut_tid_c} {scrut_tmp} = {expr_result_str};")
+                } else if rok_s != "" || rerr_s != "" {
                     let res_c = result_c_type_mixed(rok, rerr, rok_s, rerr_s)
                     emit_line("{res_c} {scrut_tmp} = {expr_result_str};")
                 } else {
@@ -4901,9 +4910,20 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         let rerr = get_var_result_err(name)
         let rok_s = get_var_result_ok_struct(name)
         let rerr_s = get_var_result_err_struct(name)
-        let res_c = result_c_type_mixed(rok, rerr, rok_s, rerr_s)
+        // A compound ok/err inner whose carrier tag embeds args (`Result[Map[K,V], E]`,
+        // `Result[Option[T], E]`) erases through the flat channels: result_c_type_mixed
+        // sees only a one-level inner and drops the args (`blink_Result_map_str`). The
+        // tid carries the full inner, so lead with it for exactly that shape — gated on
+        // an inner being compound and the tid spelling a well-formed Result carrier —
+        // while a scalar/struct inner keeps the flat spelling byte-for-byte. Mirrors the
+        // CT_OPTION arm above.
+        let res_tid_r = tc_tid_resolved(decl_tid)
+        let res_tid_c = c_type_from_tid(decl_tid)
+        let res_inner_compound = is_compound_ct(tc_tid_result_ok_ct(res_tid_r)) != 0 || is_compound_ct(tc_tid_result_err_ct(res_tid_r)) != 0
+        let res_use_tid = res_inner_compound && res_tid_c.starts_with("blink_Result_")
+        let res_c = if res_use_tid { res_tid_c } else { result_c_type_mixed(rok, rerr, rok_s, rerr_s) }
         decl_c = res_c
-        decl_branch = "result"
+        decl_branch = if res_use_tid { "result_tid" } else { "result" }
         if is_mut != 0 {
             emit_line("{res_c} {cname} = {val_str};")
         } else {
@@ -9455,9 +9475,12 @@ fn mono_fn_signature(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) -> M
             // return type while the body + call site used the correctly-named
             // carrier — an invalid-initializer mismatch. Thread the struct
             // names through the mixed carrier, mirroring the CT_OPTION branch
-            // above (a generic fn returning Result[UserStruct, _]).
-            let ok_struct = if is_struct_or_enum_type(ok_name) != 0 { ok_name } else { "" }
-            let err_struct = if is_struct_or_enum_type(err_name) != 0 { err_name } else { "" }
+            // above (a generic fn returning Result[UserStruct, _]). A COMPOUND
+            // inner (`-> Result[Map[K,V], E]`) erases the same way — the flat
+            // channel spells `Result_map_str` — so recover the concrete inner
+            // stem from the annotation's mono, in the fn's segs context.
+            let ok_struct = if is_struct_or_enum_type(ok_name) != 0 { ok_name } else if is_compound_ct(ok_ct) != 0 { compound_name_from_ann_ctx(ok_ann, tparams_sl, arg_tids, segs) } else { "" }
+            let err_struct = if is_struct_or_enum_type(err_name) != 0 { err_name } else if is_compound_ct(err_ct) != 0 { compound_name_from_ann_ctx(err_ann, tparams_sl, arg_tids, segs) } else { "" }
             if ok_struct != "" || err_struct != "" {
                 ensure_mixed_result_type(ok_ct, err_ct, ok_struct, err_struct)
                 ret_c_str = result_c_type_mixed(ok_ct, err_ct, ok_struct, err_struct)
