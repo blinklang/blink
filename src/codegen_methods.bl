@@ -76,7 +76,7 @@ import diagnostics.{
     ICE_SEG_ERASED_SLOT,
 }
 import ast.{NodeKind, is_block_bearing, dbg_trace, dbg_channel_on}
-import typecheck.{tc_channel_elem_ct, tc_channel_elem_struct, tc_ptr_pointee_ct, tc_ptr_pointee_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_tuple_sname, tc_tid_list_elem, tc_tid_iter_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member, tc_list_rename_help, ctype_probe_at, c_type_from_tid, tc_tid_resolved, tc_tid_subst_mono, tc_tid_option_inner_struct, tc_variant_field_is_selfrec_tuple}
+import typecheck.{tc_channel_elem_ct, tc_channel_elem_struct, tc_ptr_pointee_ct, tc_ptr_pointee_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_tuple_sname, tc_tid_list_elem, tc_tid_list_elem_ct_resolved, tc_tid_list_elem_struct, tc_tid_iter_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member, tc_list_rename_help, ctype_probe_at, c_type_from_tid, tc_tid_resolved, tc_tid_subst_mono, tc_tid_option_inner_struct, tc_variant_field_is_selfrec_tuple}
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
 let mut btc_arg_offset: Int = 0
@@ -4479,15 +4479,48 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 expr_list_elem_type = CT_INT
                 return
             }
-            let tag = c_type_tag(elem_type)
-            ensure_map_iter(elem_type)
+            // The adapter's forward element is the closure RETURN, recovered from
+            // the authoritative node tid (List[out]) — NOT the source element. A
+            // cross-type map (source ≠ output) needs a two-type iterator: the
+            // source option feeds `source_next`, the output option is what `_next`
+            // returns and what collect/for-in read back.
+            let in_ct = elem_type
+            let node_tid = cm_node_mono_tid(node)
+            let mut out_ct = tc_tid_list_elem_ct_resolved(node_tid)
+            let out_struct = tc_tid_list_elem_struct(node_tid)
+            if out_ct < 0 { out_ct = in_ct }
+            // A by-value multi-eightbyte closure return — a struct, tuple, enum, or
+            // a compound Option/Result — is returned in RAX:RDX under SysV and rides
+            // a pointer-boxed carrier Option, a different convention than the
+            // single-register by-value path below. Carrying it correctly needs the
+            // pointer-boxed path; guard it loudly rather than truncate to int64. The
+            // tid catches an annotated compound return; an UNANNOTATED one flattens
+            // to the source element in the tid, so also guard on the closure's real C
+            // return spelling — a `blink_`-prefixed aggregate — exactly as the
+            // compound-source branch above.
+            if map_ret_part.starts_with("blink_") || out_struct != "" || out_ct == CT_OPTION || out_ct == CT_RESULT {
+                diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "'.map' with a by-value struct/tuple/Option/Result closure return is not yet supported (br s663bm)", node, "return a scalar (Int/Bool/Str/Float) from the closure, or collect first then map")
+                expr_result_str = "0"
+                expr_result_type = CT_VOID
+                return
+            }
+            let in_tag = c_type_tag(in_ct)
+            let in_c = c_type_str(in_ct)
+            let in_opt = ifs_opt_type
+            let out_tag = c_type_tag(out_ct)
+            let out_opt = option_c_type(out_ct)
+            let out_c = c_type_str(out_ct)
+            ensure_option_type(out_ct)
+            let iter_name = "blink_MapIterator_{in_tag}_{out_tag}"
+            ensure_map_iter("{in_tag}|{in_c}|{in_opt}|{out_tag}|{out_c}|{out_opt}")
             let adapter_var = fresh_temp("__map_")
-            emit_line("blink_MapIterator_{tag} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .fn = {fn_str} };")
-            set_var_iterator(adapter_var, elem_type, "blink_MapIterator_{tag}_next")
+            emit_line("{iter_name} {adapter_var} = \{ .source = &{src_var}, .source_next = ({in_opt} (*)(void*)){src_next}, .fn = {fn_str} };")
+            set_var_iterator(adapter_var, out_ct, "{iter_name}_next")
+            stamp_iter_adapter_tid(adapter_var, node)
             expr_result_str = adapter_var
             expr_result_type = CT_ITERATOR
-            expr_iter_next_fn = "blink_MapIterator_{tag}_next"
-            expr_list_elem_type = elem_type
+            expr_iter_next_fn = "{iter_name}_next"
+            expr_list_elem_type = out_ct
             return
         }
         if method == "filter" {
