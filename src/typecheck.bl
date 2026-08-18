@@ -1453,6 +1453,28 @@ fn runtime_process_result_tid() -> Int {
     ensure_runtime_struct_type("ProcessResult", ["out", "err_out", "exit_code"], [TYPE_STR, TYPE_STR, TYPE_INT])
 }
 
+// The err type of the public fs.* surface. When std.fs is imported its `struct FsError`
+// decl has already registered the name, so we return that tid and the caller's `FsError`
+// annotations share identity with this surface's err arm. When it is NOT imported we still
+// need a carrier tid for the fs.* signatures, but the name must stay unresolvable — FsError
+// is not prelude, so `fn take(e: FsError)` without `import std.fs` is an unknown type. So the
+// unimported carrier is minted WITHOUT touching the named-type tables; the op/code field tids
+// are then -1 (FsOp/Errno also absent), typing `e.op`/`e.code` as Unknown for a wildcard-only
+// caller while `e.path` stays Str. Actually consuming the fs.* surface unimported fails at
+// codegen (the carrier and FsError tag stay unqualified), which is the real enforcement.
+let mut fs_error_runtime_tid_cache: Int = -1
+fn fs_error_tid() -> Int {
+    let named = lookup_named_type("FsError")
+    if named != -1 { return named }
+    if fs_error_runtime_tid_cache != -1 { return fs_error_runtime_tid_cache }
+    let tid = new_type(TyKind.Struct, "FsError")
+    sfield_pool.push(TcStructField { struct_id: tid, name: "op", type_id: lookup_named_type("FsOp") })
+    sfield_pool.push(TcStructField { struct_id: tid, name: "path", type_id: TYPE_STR })
+    sfield_pool.push(TcStructField { struct_id: tid, name: "code", type_id: lookup_named_type("Errno") })
+    fs_error_runtime_tid_cache = tid
+    tid
+}
+
 // THE StringBuilder tid — one entry per program, so `sb_a` and `sb_b` compare
 // equal by integer comparison per decisions/compiler-type-representation.md Q3.
 //
@@ -2504,9 +2526,6 @@ fn register_intrinsic_fn_sig(key: Str, params: List[Int], ret: Int) {
 //
 // Deliberately absent, each because what its signature IS is an open question, not where it
 // lives:
-//   - `fs.read/write/list_dir/remove` — sections/04_effects.md:73,157 spells `fs.read(path)?`
-//     as a Result and names the lister `fs.list`, while codegen emits a bare `const char*`
-//     from `blink_read_file`. A spec answer has to come first.
 //   - `net.request` — its `Result[Response, NetError]` needs two stdlib struct types that a
 //     consuming module need not have imported.
 //   - `io.println/print/print_raw/eprintln/eprint/eprint_raw/log` — Void statements with a
@@ -2546,9 +2565,20 @@ fn register_ns_intrinsic_sigs() {
     register_intrinsic_fn_sig("io.write", [TYPE_STR], TYPE_VOID)
     register_intrinsic_fn_sig("io.write_bytes", [bytes_t], TYPE_VOID)
 
-    // fs.errno — the last fs op's errno side-channel (0 = success). Unlike fs.read/write/
-    // list_dir/remove above, its type is not an open question: it is plumbing the Result
-    // wrappers read, always an Int.
+    // fs.* — the public filesystem surface returns Result[T, FsError] per
+    // sections/04_effects.md:800-867; codegen redirects each to the fs_do_* wrapper. When the
+    // program never imported std.fs, fs_error_tid mints the carrier WITHOUT registering the
+    // name (so `FsError` stays an unknown type), yet the signature is still right — the same
+    // fail-closed shape as time.read minting Instant.
+    let fs_err_t = fs_error_tid()
+    register_intrinsic_fn_sig("fs.read", [TYPE_STR], make_result_type(TYPE_STR, fs_err_t))
+    register_intrinsic_fn_sig("fs.write", [TYPE_STR, TYPE_STR], make_result_type(TYPE_VOID, fs_err_t))
+    register_intrinsic_fn_sig("fs.list_dir", [TYPE_STR], make_result_type(make_list_type(TYPE_STR), fs_err_t))
+    register_intrinsic_fn_sig("fs.delete", [TYPE_STR], make_result_type(TYPE_VOID, fs_err_t))
+
+    // fs.errno — the last fs op's errno side-channel (0 = success). Unlike the signed
+    // surface above, its type is not an open question: it is plumbing the Result wrappers
+    // read, always an Int.
     register_intrinsic_fn_sig("fs.errno", [], TYPE_INT)
 
     register_intrinsic_fn_sig("term.isatty", [TYPE_INT], TYPE_INT)
@@ -5745,6 +5775,7 @@ fn init_types() ! TypeCheck.Register {
     named_type_names.clear()
     named_type_ids.clear()
     named_type_map.clear()
+    fs_error_runtime_tid_cache = -1
     tc_hashable_types.clear()
     tc_debug_types.clear()
     tc_type_decl_nodes.clear()
@@ -6831,6 +6862,8 @@ pub fn is_builtin_fn(name: Str) -> Int {
     if name == "get_arg" { return 1 }
     if name == "read_file" { return 1 }
     if name == "write_file" { return 1 }
+    if name == "list_dir" { return 1 }
+    if name == "fs_remove" { return 1 }
     if name == "file_exists" { return 1 }
     if name == "shell_exec" { return 1 }
     if name == "exit" { return 1 }
@@ -7101,6 +7134,8 @@ fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "get_arg" { return TYPE_STR }
     if name == "read_file" { return TYPE_STR }
     if name == "write_file" { return TYPE_VOID }
+    if name == "list_dir" { return make_list_type(TYPE_STR) }
+    if name == "fs_remove" { return TYPE_VOID }
     if name == "file_exists" { return TYPE_INT }
     if name == "shell_exec" { return TYPE_INT }
     if name == "exit" { return TYPE_VOID }

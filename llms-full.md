@@ -380,11 +380,12 @@ io.write_bytes(b)               // write Bytes to stdout
 io.print_raw("text")            // raw printf (bypasses vtable)
 io.eprint_raw("error")          // raw fprintf stderr (bypasses vtable)
 
-// Filesystem (effect: FS)
-fs.read(path)                   // -> Str
-fs.write(path, content)         // -> Void
-fs.remove(path)                 // -> Void (delete file, backed by unlink(2))
-fs.list_dir(dir)                // -> List[Str] (filenames)
+// Filesystem (effect: FS) — the signed surface returns Result[T, FsError];
+// `import std.fs` to name FsError/FsOp in a caller that handles the error.
+fs.read(path)                   // -> Result[Str, FsError]
+fs.write(path, content)         // -> Result[Void, FsError]
+fs.delete(path)                 // -> Result[Void, FsError] (delete file, backed by unlink(2))
+fs.list_dir(dir)                // -> Result[List[Str], FsError] (filenames)
 
 // Environment (effect: Env)
 env.args()                      // -> List[Str] (all CLI args)
