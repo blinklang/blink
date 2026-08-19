@@ -1204,41 +1204,6 @@ pub fn tc_tid_has_bare_typevar(tid0: Int) -> Int {
     0
 }
 
-// Does `tid` name a transparent `type Alias = X` anywhere in its structure? The tid tree
-// stores the alias's OWN name, and resolve_alias_tid only ever peels the outermost one, so
-// `Map[Port, Int]` keeps `Port` in its key slot while the parallel annotation-NODE path
-// (type_from_name) lowers it to Int. Two spellings of one type, and the pin caller below
-// refuses rather than committing the un-canonical one — a structural resolver for this
-// shape is its own prerequisite.
-pub fn tc_tid_has_alias(tid0: Int) -> Int {
-    if tc_alias_underlying.len() == 0 { return 0 }
-    let tid = tc_resolve(tid0)
-    if tid < 0 || tid >= ty_pool.len() { return 0 }
-    let e = ty_pool.get(tid).unwrap()
-    if e.name != "" {
-        let under = tc_alias_underlying.get(e.name) ?? -1
-        if under != -1 { return 1 }
-    }
-    let k = e.kind
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set {
-        return tc_tid_has_alias(e.inner1)
-    }
-    if k == TyKind.Result || k == TyKind.Map {
-        if tc_tid_has_alias(e.inner1) != 0 { return 1 }
-        return tc_tid_has_alias(e.inner2)
-    }
-    if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum {
-        let mut i = 0
-        while i < e.params_count {
-            let c = ty_param_list.get(e.params_start + i).unwrap()
-            if tc_tid_has_alias(c) != 0 { return 1 }
-            i = i + 1
-        }
-        return 0
-    }
-    0
-}
-
 // The machine-applicable annotation shape that would fix an under-determined
 // binding, chosen from the empty-ctor's known outer shape.
 // `: List[T]` / `: T?` / `: Map[K, V]` / `: Set[T]`; a
@@ -3327,6 +3292,15 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
         }
         return make_fn_type(ret_t, param_types)
     }
+
+    // A transparent `type Alias = X` peels to X's tid HERE, at the leaf the
+    // recursion reaches for every child position — so `Map[Port, Int]` gets Int
+    // in its key slot, not the alias's own name. Without this the tid kept `Port`
+    // while the annotation/param path lowered it to Int (two spellings of one
+    // type), and an alias-keyed map inside a compound carrier emitted a void key
+    // temp. The annotation node still names what the user wrote for diagnostics.
+    let alias_name_tid = tc_resolve_transparent_alias_name(name)
+    if alias_name_tid != -1 { return tc_resolve(alias_name_tid) }
 
     let resolved = resolve_type_name(name)
     if resolved != -1 {
@@ -12328,10 +12302,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 //     for one nothing can (tc_tid_has_bare_typevar), and it emitted
                 //     BLINK_COMPILER_BUG_kops_unsupported_K_ct23_ — the kops selector had been
                 //     recovering the concrete key from the instantiation.
-                //   • No alias. `let m: Map[Port, Int] = Map()` over `type Port = Int` keeps
-                //     `Port` in the tid's key slot while the annotation path lowers it to Int,
-                //     so pinning commits the un-canonical spelling and the i64 vtable is never
-                //     selected (tc_tid_has_alias).
+                //
+                // An alias key needs no gate: resolve_type_parts now peels a transparent
+                // `type Port = Int` at the tid leaf, so `Map[Port, Int]` already carries Int
+                // in its key slot and pinning commits the canonical spelling.
                 //
                 // Two gates then remain inside tc_pin_tail_ret_generic and they are the shared
                 // ones: an admitted declared head, and an actually-unbound metavar in the value.
@@ -12339,7 +12313,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 if pin_ok == false {
                     let dk = type_kind(resolve_alias_tid(declared_tid))
                     if dk == TyKind.Map || dk == TyKind.Set {
-                        if tc_tid_has_bare_typevar(declared_tid) == 0 && tc_tid_has_alias(declared_tid) == 0 {
+                        if tc_tid_has_bare_typevar(declared_tid) == 0 {
                             pin_ok = true
                         }
                     }
