@@ -105,7 +105,7 @@ import codegen_expr.{
     recover_list_elem_from_tid,
     register_map_elem_struct_mono_from_tid
 }
-import codegen_methods.{resolve_tparam_via_tid, copy_list_compound_elem, emit_boxed_container_store, finish_enum_zip_result, mono_csv_from_arg_tids}
+import codegen_methods.{resolve_tparam_via_tid, tparam_tid_via_mono, copy_list_compound_elem, emit_boxed_container_store, finish_enum_zip_result, mono_csv_from_arg_tids}
 import codegen_derive.{ct_to_descriptor, desc_primary_ct, descriptor_c_type, descriptor_mangle, emit_promote_elem_into, inner_desc_of, queue_promote_type, map_pair_key_read_expr, tp_to_descriptor}
 import diagnostics.{
     Diag, diag_error_at, diag_ice_at, diag_warn_at, diag_file_for_node,
@@ -8547,7 +8547,7 @@ pub fn find_type_def(name: Str) -> Int {
 // through register_mono_instance (emit_struct_lit passes no ann). A hole this
 // node's tid can fill but the registry's cannot still leaves a field type
 // here that the emitted typedef does not have.
-pub fn register_mono_field_types(base_name: Str, mono_name: Str, arg_tids0: List[Int], ann: Int) ! Diag.Report, Codegen.Emit {
+pub fn register_mono_field_types(base_name: Str, mono_name: Str, arg_tids0: List[Int], ann: Int) ! Diag.Report, Codegen.Emit, Codegen.Register {
     // A struct instance minted here may itself be a Hash/Eq-derived generic
     // struct's instance, embedded BY VALUE as another instance's field (e.g.
     // HBox_0Int nested inside HBox_0HBox_10Int's `value` field).
@@ -8630,9 +8630,11 @@ pub fn register_mono_field_types(base_name: Str, mono_name: Str, arg_tids0: List
                 let ct = type_from_name(resolved)
                 let inner_elems = node_elements(type_ann_node)
                 if (ct == CT_OPTION || ct == CT_LIST) && inner_elems != -1 && sublist_length(inner_elems) >= 1 {
-                    let inner_name = resolve_mono_slot(node_name(sublist_get(inner_elems, 0)), tparams_sl, arg_tids, "register_mono_field_types_inner", "{mono_name}.{fname}", type_ann_node)
+                    let inner_ann = sublist_get(inner_elems, 0)
+                    let inner_stem = carrier_inner_instance_stem(inner_ann, tparams_sl, arg_tids)
+                    let inner_name = if inner_stem != "" { inner_stem } else { resolve_mono_slot(node_name(inner_ann), tparams_sl, arg_tids, "register_mono_field_types_inner", "{mono_name}.{fname}", type_ann_node) }
                     let inner_ct = type_from_name(inner_name)
-                    let inner_sname = if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 { inner_name } else { "" }
+                    let inner_sname = if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 || is_mono_struct_instance(inner_name) != 0 { inner_name } else { "" }
                     reg_sf_entry(mono_name, fname, ct, "", sv_tp(ct, inner_ct, -1, inner_sname))
                 } else if ct == CT_MAP && inner_elems != -1 && sublist_length(inner_elems) >= 2 {
                     let key_name = resolve_mono_slot(node_name(sublist_get(inner_elems, 0)), tparams_sl, arg_tids, "register_mono_field_types_inner", "{mono_name}.{fname}", type_ann_node)
@@ -8933,7 +8935,62 @@ pub fn resolve_mono_slot(param_name: Str, tparams_sl: Int, arg_tids: List[Int], 
     resolved
 }
 
-fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[Int], ann: Int) ! Codegen.Emit, Diag.Report {
+// A carrier inner that is a generic-struct INSTANCE bound by the ENCLOSING mono struct
+// (`Inner[T]` field of `RB[T]`, emitted as RB[Int]): resolve_mono_slot substitutes only a
+// whole-name binder, so the bare head `Inner` erased the child and the carrier was spelled
+// three divergent ways (Inner_0T literal / Inner erased / Inner_0Int correct). Bind each of
+// the inner's type args through the enclosing arg_tids and register the instance from those
+// tids, so its mono stem (Inner_0Int) and typedef match the tid path. Returns "" when the
+// inner is not a fully-bound generic instance, and the caller keeps its prior spelling.
+fn carrier_inner_instance_stem(inner_ann: Int, tparams_sl: Int, arg_tids: List[Int]) -> Str ! Codegen.Register {
+    if inner_ann == -1 { return "" }
+    let base = strip_module_qualifier(node_name(inner_ann))
+    let td = find_type_def(base)
+    if td == -1 { return "" }
+    let tp = node_type_params(td)
+    if tp == -1 || sublist_length(tp) == 0 { return "" }
+    let elems = node_elements(inner_ann)
+    if elems == -1 || sublist_length(elems) != sublist_length(tp) { return "" }
+    let mut inner_tids: List[Int] = []
+    let mut i = 0
+    while i < sublist_length(elems) {
+        let t = tparam_tid_via_mono(node_name(sublist_get(elems, i)), tparams_sl, arg_tids)
+        if t < 0 { return "" }
+        inner_tids.push(t)
+        i = i + 1
+    }
+    register_mono_instance(base, mono_csv_from_arg_tids(inner_tids), inner_tids)
+}
+
+// Force the typedef of a carrier inner that is a mono generic INSTANCE (`Inner_0Int`),
+// before the enclosing struct's typedef opens. carrier_inner_instance_stem registers such an
+// inner LATE (appended after the outer struct in mono_instances), so its typedef would
+// otherwise flush AFTER the carrier that embeds it by value — a cc forward reference.
+// emit_tuple_typedef_for_tag is a no-op here (it only knows tuples), so emit the instance's
+// own typedef directly, dispatching struct vs enum on the base's first field exactly as
+// emit_all_mono_typedefs does: is_mono_struct_instance also admits enum-based instances
+// (Tree_0Int), and routing those to the struct emitter would emit an EMPTY struct that wins
+// the shared include guard and suppresses the real tagged-union typedef. The struct emitter's
+// struct_reg_set membership check (name inserted before its own field pre-emit loop) and the
+// enum emitter's own guard both dedup the later flush and break self-referential recursion.
+// A non-instance tag returns early.
+fn force_mono_instance_typedef(tag: Str) ! Codegen.Emit, Diag.Report, Codegen.Register {
+    if tag == "" || is_mono_struct_instance(tag) == 0 { return }
+    let ml = lookup_mono_base(tag)
+    if ml.base == "" { return }
+    let td = find_type_def(ml.base)
+    if td == -1 { return }
+    let flds_sl = node_fields(td)
+    if flds_sl == -1 || sublist_length(flds_sl) == 0 { return }
+    if node_kind(sublist_get(flds_sl, 0)) != NodeKind.TypeVariant {
+        if struct_reg_set.contains_key(tag) != 0 { return }
+        emit_mono_struct_typedef(ml.base, ml.args, ml.arg_tids, -1)
+    } else {
+        emit_mono_enum_typedef(ml.base, ml.args, ml.arg_tids, -1)
+    }
+}
+
+fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[Int], ann: Int) ! Codegen.Emit, Diag.Report, Codegen.Register {
     let td = find_type_def(base_name)
     if td == -1 {
         return
@@ -8979,9 +9036,11 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[
                 let inner_elems0 = node_elements(type_ann_node0)
                 if inner_elems0 != -1 && sublist_length(inner_elems0) >= 1 {
                     let inner_ann0 = sublist_get(inner_elems0, 0)
-                    let inner_resolved0 = resolve_mono_slot(node_name(inner_ann0), tparams_sl, arg_tids, "struct_typedef_field_inner", "{c_name}.{node_name(f0)}", inner_ann0)
+                    let inner_stem0 = carrier_inner_instance_stem(inner_ann0, tparams_sl, arg_tids)
+                    let inner_resolved0 = if inner_stem0 != "" { inner_stem0 } else { resolve_mono_slot(node_name(inner_ann0), tparams_sl, arg_tids, "struct_typedef_field_inner", "{c_name}.{node_name(f0)}", inner_ann0) }
                     if is_struct_type(inner_resolved0) != 0 || is_mono_struct_instance(inner_resolved0) != 0 {
                         emit_tuple_typedef_for_tag(inner_resolved0)
+                        force_mono_instance_typedef(inner_resolved0)
                     }
                 }
                 // The Option CARRIER itself (blink_Option_set, blink_Option_double) is
@@ -8989,22 +9048,26 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[
                 // later flush, so a carrier that isn't already pre-emitted lands after
                 // this struct's own typedef, which references it — a cc forward
                 // reference. Force it here, at the outer level, like the tuple dep above.
-                emit_carrier_typedef_for_tag(compound_name_from_ann_ctx(type_ann_node0, tparams_sl, arg_tids, []))
+                emit_carrier_typedef_for_tag(compound_name_from_ann_ctx(type_ann_node0, tparams_sl, arg_tids, segs_from_arg_tids(arg_tids)))
             } else if resolved0 == "Result" {
                 let inner_elems0 = node_elements(type_ann_node0)
                 if inner_elems0 != -1 && sublist_length(inner_elems0) >= 2 {
                     let ok_ann0 = sublist_get(inner_elems0, 0)
                     let err_ann0 = sublist_get(inner_elems0, 1)
-                    let ok_resolved0 = resolve_mono_slot(node_name(ok_ann0), tparams_sl, arg_tids, "struct_typedef_field_inner", "{c_name}.{node_name(f0)}", ok_ann0)
-                    let err_resolved0 = resolve_mono_slot(node_name(err_ann0), tparams_sl, arg_tids, "struct_typedef_field_inner", "{c_name}.{node_name(f0)}", err_ann0)
+                    let ok_stem0 = carrier_inner_instance_stem(ok_ann0, tparams_sl, arg_tids)
+                    let err_stem0 = carrier_inner_instance_stem(err_ann0, tparams_sl, arg_tids)
+                    let ok_resolved0 = if ok_stem0 != "" { ok_stem0 } else { resolve_mono_slot(node_name(ok_ann0), tparams_sl, arg_tids, "struct_typedef_field_inner", "{c_name}.{node_name(f0)}", ok_ann0) }
+                    let err_resolved0 = if err_stem0 != "" { err_stem0 } else { resolve_mono_slot(node_name(err_ann0), tparams_sl, arg_tids, "struct_typedef_field_inner", "{c_name}.{node_name(f0)}", err_ann0) }
                     if is_struct_type(ok_resolved0) != 0 || is_mono_struct_instance(ok_resolved0) != 0 {
                         emit_tuple_typedef_for_tag(ok_resolved0)
+                        force_mono_instance_typedef(ok_resolved0)
                     }
                     if is_struct_type(err_resolved0) != 0 || is_mono_struct_instance(err_resolved0) != 0 {
                         emit_tuple_typedef_for_tag(err_resolved0)
+                        force_mono_instance_typedef(err_resolved0)
                     }
                 }
-                emit_carrier_typedef_for_tag(compound_name_from_ann_ctx(type_ann_node0, tparams_sl, arg_tids, []))
+                emit_carrier_typedef_for_tag(compound_name_from_ann_ctx(type_ann_node0, tparams_sl, arg_tids, segs_from_arg_tids(arg_tids)))
             } else if is_compound_tag(resolved0) != 0 {
                 // A bare-typevar field (`v: T`) whose concrete arg is a compound
                 // carrier resolves to the carrier TAG ("Option_int", "Result_double_str")
@@ -9047,9 +9110,10 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[
                 if inner_elems != -1 && sublist_length(inner_elems) >= 1 {
                     let inner_ann = sublist_get(inner_elems, 0)
                     let inner_raw = node_name(inner_ann)
-                    let inner_resolved = resolve_mono_slot(inner_raw, tparams_sl, arg_tids, "struct_typedef_field_inner", "{c_name}.{fname}", inner_ann)
+                    let inner_stem = carrier_inner_instance_stem(inner_ann, tparams_sl, arg_tids)
+                    let inner_resolved = if inner_stem != "" { inner_stem } else { resolve_mono_slot(inner_raw, tparams_sl, arg_tids, "struct_typedef_field_inner", "{c_name}.{fname}", inner_ann) }
                     let inner_ct = type_from_name(inner_resolved)
-                    if is_struct_type(inner_resolved) != 0 || is_enum_type(inner_resolved) != 0 {
+                    if is_struct_type(inner_resolved) != 0 || is_enum_type(inner_resolved) != 0 || is_mono_struct_instance(inner_resolved) != 0 {
                         ensure_struct_option_type(inner_resolved)
                         let opt_c = struct_option_c_type(inner_resolved)
                         emit_line("{opt_c} {fname};")
@@ -9079,12 +9143,14 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[
                     let err_ann = sublist_get(inner_elems, 1)
                     let ok_raw = node_name(ok_ann)
                     let err_raw = node_name(err_ann)
-                    let ok_resolved = resolve_mono_slot(ok_raw, tparams_sl, arg_tids, "struct_typedef_field_inner", "{c_name}.{fname}", ok_ann)
-                    let err_resolved = resolve_mono_slot(err_raw, tparams_sl, arg_tids, "struct_typedef_field_inner", "{c_name}.{fname}", err_ann)
+                    let ok_stem = carrier_inner_instance_stem(ok_ann, tparams_sl, arg_tids)
+                    let err_stem = carrier_inner_instance_stem(err_ann, tparams_sl, arg_tids)
+                    let ok_resolved = if ok_stem != "" { ok_stem } else { resolve_mono_slot(ok_raw, tparams_sl, arg_tids, "struct_typedef_field_inner", "{c_name}.{fname}", ok_ann) }
+                    let err_resolved = if err_stem != "" { err_stem } else { resolve_mono_slot(err_raw, tparams_sl, arg_tids, "struct_typedef_field_inner", "{c_name}.{fname}", err_ann) }
                     let ok_ct = type_from_name(ok_resolved)
                     let err_ct = type_from_name(err_resolved)
-                    let ok_is_type = is_struct_type(ok_resolved) != 0 || is_enum_type(ok_resolved) != 0
-                    let err_is_type = is_struct_type(err_resolved) != 0 || is_enum_type(err_resolved) != 0
+                    let ok_is_type = is_struct_type(ok_resolved) != 0 || is_enum_type(ok_resolved) != 0 || is_mono_struct_instance(ok_resolved) != 0
+                    let err_is_type = is_struct_type(err_resolved) != 0 || is_enum_type(err_resolved) != 0 || is_mono_struct_instance(err_resolved) != 0
                     if ok_is_type || err_is_type {
                         let ok_tag = if ok_is_type { ok_resolved } else { c_type_tag(ok_ct) }
                         let err_tag = if err_is_type { err_resolved } else { c_type_tag(err_ct) }
@@ -9335,7 +9401,7 @@ fn emit_mono_enum_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[In
     emit_line("")
 }
 
-pub fn emit_all_mono_typedefs() ! Codegen.Emit, Diag.Report {
+pub fn emit_all_mono_typedefs() ! Codegen.Emit, Diag.Report, Codegen.Register {
     let mut i = 0
     while i < mono_instances.len() {
         let mi = mono_instances.get(i).unwrap()
@@ -10353,7 +10419,7 @@ pub fn emit_all_mono_fns() ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
     }
 }
 
-pub fn emit_mono_typedefs_from(start: Int) ! Codegen.Emit, Diag.Report {
+pub fn emit_mono_typedefs_from(start: Int) ! Codegen.Emit, Diag.Report, Codegen.Register {
     let mut i = start
     while i < mono_instances.len() {
         let mi = mono_instances.get(i).unwrap()
