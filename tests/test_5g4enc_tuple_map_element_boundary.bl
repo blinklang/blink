@@ -1,0 +1,59 @@
+// br 5g4enc — a tuple whose element is a Map was spelled two ways in C: some paths
+// spelled it structurally (blink_Tuple2_Map_str_int_int), others erased it to a bare
+// `map` (blink_Tuple2_map_int). The clash was a live cc escape at a C fn boundary
+// where the two spellers met — `incompatible type for argument` with no Blink span.
+// Resolution: ERASE EVERYWHERE — Map is an erased carrier exactly like List and Set
+// (one blink_map* for every K/V), so every speller drops K/V; the key/value are
+// recovered per-use from the authoritative tid, never spelled into the C type.
+//
+// These MVCEs cross a fn boundary on purpose: an annotated param receives a value
+// produced by another speller. Both must agree on the single erased tag.
+
+// ── Half A — a generic fn returning a tuple whose element is the Map ───────────
+// wrap[T]'s return `(T, Int)` and sum_it's annotated param `(Map[Str,Int], Int)` both
+// erase to blink_Tuple2_map_int. Passing one to the other must typecheck in C.
+
+fn wrap[T](x: T) -> (T, Int) { (x, 1) }
+
+fn sum_it(t: (Map[Str, Int], Int)) -> Int { t.0.get("a").unwrap() + t.1 }
+
+test "a generic-fn-returned tuple with a Map element passes to an annotated param" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 41)
+    let tw = wrap(m)
+    assert_eq(sum_it(tw), 42)
+}
+
+// ── Half B — a tuple literal whose Map element is itself nested (depth 2) ──────
+// A Map[Str, Map[Int, Bool]] element erases to the same bare `map` as any other Map,
+// so both the literal `(outer, 2)` and take_nested's annotated param lower to
+// blink_Tuple2_map_int; the nested K/V are never spelled into the C tag.
+
+fn take_nested(t: (Map[Str, Map[Int, Bool]], Int)) -> Int { t.0.len() + t.1 }
+
+test "a tuple literal with a depth-2 nested-Map element passes to an annotated param" {
+    let mut inner: Map[Int, Bool] = Map()
+    inner.insert(1, true)
+    let mut outer: Map[Str, Map[Int, Bool]] = Map()
+    outer.insert("k", inner)
+    let t = (outer, 2)
+    assert_eq(take_nested(t), 3)
+}
+
+// ── Control — two Map shapes share one erased mono instance and still round-trip ─
+// Under erasure both Map shapes go through the SAME wrap mono (blink_wrap_0Map) and
+// the SAME erased tuple struct (blink_Tuple2_map_int). The values survive because K/V
+// are recovered per-use from the tid, not from the shared C type.
+
+fn take_int_bool(t: (Map[Int, Bool], Int)) -> Int { t.0.len() + t.1 }
+
+test "two distinct Map shapes through the same generic fn keep distinct tuple tags" {
+    let mut ms: Map[Str, Int] = Map()
+    ms.insert("a", 1)
+    let mut mib: Map[Int, Bool] = Map()
+    mib.insert(9, true)
+    let ts = wrap(ms)
+    let tib = wrap(mib)
+    assert_eq(sum_it(ts), 2)
+    assert_eq(take_int_bool(tib), 2)
+}

@@ -7,15 +7,14 @@
 //   - tc_struct_slot_encodable deliberately does NOT tc_resolve (typecheck.bl:1387) while
 //     tc_tid_encodable does. Folding them changes behavior on a bound-but-unresolved
 //     metavar. R1 pins the asymmetry so a fold that resolves cannot land silently.
-//   - tc_tid_to_c_tag (top-level) and tc_tid_inner_tag (inner) spell the SAME tid two
-//     different ways on purpose (br bwyfy1: collapsing them to one rule broke 296
-//     fixtures and was reverted). R2 pins both positions on the same tids so the
-//     one-encoder-two-positions merge stays a refactor, not a behavior change.
-//   - tc_tid_tuple_elem_faithful's TK_MAP arm is a live behavioral guard, not an
-//     invariant: codegen_expr.bl:7196 selects between the tid speller and a still-live
-//     string speller on its `false`, exactly the br jefm9w shape ("do not arm a guard a
-//     working program depends on"). R3 pins the refusal so the predicate cannot be armed
-//     or dropped now that it has been renamed to tc_tid_tuple_elem_faithful.
+//   - tc_tid_to_c_tag (top-level) and tc_tid_inner_tag (inner) still spell the SAME tid
+//     two different ways for non-erased kinds on purpose (br bwyfy1: collapsing them to
+//     one rule broke 296 fixtures). R2 pins that Map is an erased carrier at BOTH
+//     positions ("Map" top, "map" inner) so the one-encoder-two-positions split stays
+//     intact while Map matches its List/Set siblings.
+//   - tc_tid_tuple_elem_faithful's TK_MAP arm returns true for every Map element: Map is
+//     erased inner, so the tid, value and annotation paths all spell the same bare "map"
+//     and can never diverge. R3 pins that every Map element rides the tid faithfully.
 //
 // SETUP HAZARDS, inherited from tests/test_hsgsbp_void_vs_erasure.bl (same pattern):
 //  1. Bare `import codegen_expr` closes the whole-program-merge back-references.
@@ -115,28 +114,28 @@ test "tc_struct_slot_encodable refuses a raw bound metavar but admits its resolu
         tc_struct_slot_encodable(resolved_key_tid))
 }
 
-// R2 — position-asymmetry pin (br bwyfy1). tc_tid_to_c_tag (top-level) erases a Map to
-// its bare Pascal carrier; tc_tid_inner_tag (inner) spells it structurally with lowercase
-// scalars. Collapsing the two into one RULE instead of one encoder with a position
-// parameter was tried once and broke 296 fixtures. These rows pin both spellings of the
-// SAME tid so the merge stays byte-identical by construction.
-test "tc_tid_to_c_tag and tc_tid_inner_tag spell the same Map tid two different ways" {
+// R2 — Map is an erased carrier at BOTH positions (like List/Set). tc_tid_to_c_tag
+// (top-level, mono-instance naming) erases Map to its bare Pascal carrier "Map";
+// tc_tid_inner_tag (inner, tuple/carrier element) erases it to lowercase "map". Neither
+// spells K/V — the single blink_map* representation backs every shape, so a distinct C
+// name per shape would name byte-identical layouts. K/V are recovered per-use from the tid.
+test "tc_tid_to_c_tag and tc_tid_inner_tag both erase the same Map tid" {
     let m = harvest_type_tids()
     let map_tid = expect_tid(m, "Map[Int, Str]")
 
     assert_eq_str("top-level position erases Map to its bare carrier",
         tc_tid_to_c_tag(map_tid), "Map")
-    assert_eq_str("inner position spells Map structurally, lowercase",
-        tc_tid_inner_tag(map_tid), "Map_int_str")
+    assert_eq_str("inner position erases Map to its lowercase carrier",
+        tc_tid_inner_tag(map_tid), "map")
 }
 
-// R3 — path-selector pin (br jefm9w shape). codegen_expr.bl:7196 reads
-// tc_tid_tuple_elem_faithful's `false` on a Map tuple element with a non-scalar
-// key/value to fall back onto a still-live string speller — a working program depends
-// on that fallback firing. This is a live behavioral guard, not an invariant assertion,
-// and must not be armed or silently dropped now that the predicate has been renamed
-// from tc_tid_tuple_elem_encodable.
-test "tc_tid_tuple_elem_faithful still refuses a Map tuple element with a non-scalar value" {
+// R3 — a Map tuple element ALWAYS rides the tid faithfully, whatever its K/V. Because
+// Map is erased at the inner position (tc_tid_inner_tag → "map") the tid path, the value
+// path (emit_tuple_lit) and the annotation path (resolve_tuple_ann) all spell the same
+// bare "map" regardless of key/value — so the element can never diverge and there is no
+// non-scalar shape to fall back to a string speller for. This pins the erasure: a
+// scalar-value Map AND a compound-value Map both ride faithfully.
+test "tc_tid_tuple_elem_faithful admits every Map tuple element under erasure" {
     let m = harvest_type_tids()
     // The harvested Map[Int, Str] carries its key/value slots as RAW bound metavars
     // (fill's K/V are bound in place by tc_pin_generic_args_from_binds, same shape as
@@ -146,18 +145,13 @@ test "tc_tid_tuple_elem_faithful still refuses a Map tuple element with a non-sc
     let scalar_key_tid = tc_tid_resolved(tc_tid_map_key_tid(map_tid))
     let scalar_val_tid = tc_tid_resolved(m.get("Str") ?? -1)
 
-    // A fresh Map built from two RESOLVED scalar tids — negative control so this row
-    // cannot pass by the gate being universally false.
     let scalar_map_tid = make_map_type(scalar_key_tid, scalar_val_tid)
-    assert_true("a scalar-key/scalar-value Map tuple element is still admitted",
+    assert_true("a scalar-key/scalar-value Map tuple element rides faithfully",
         tc_tid_tuple_elem_faithful(scalar_map_tid))
 
-    // A Map whose VALUE is itself compound (Map[Int, Map[Int,Str]]) is the shape the
-    // gate's own comment names as refused: "Scalar inners only — a struct/compound
-    // inner would spell via tc_tid_struct_mono_name here vs canonical_struct_tag on the
-    // value/annotation side and could diverge." codegen_expr.bl:7196 depends on this
-    // `false` to fall back to the string speller for exactly this shape.
+    // A Map whose VALUE is itself compound (Map[Int, Map[Int,Str]]) erases to the same
+    // bare "map" — the nested K/V never reach the C tag — so it rides faithfully too.
     let nested_map_tid = make_map_type(scalar_key_tid, scalar_map_tid)
-    assert_false("a Map tuple element with a compound value is still refused",
+    assert_true("a Map tuple element with a compound value also rides faithfully",
         tc_tid_tuple_elem_faithful(nested_map_tid))
 }

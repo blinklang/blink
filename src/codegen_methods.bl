@@ -1334,21 +1334,19 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             expr_option_inner_list_elem = pop_nested
             expr_option_inner_list_struct = pop_nested_s
         } else if elem_type == CT_MAP {
-            let pop_map_k = get_list_elem_map_key_type(obj_str)
-            let pop_map_v = get_list_elem_map_val_type(obj_str)
+            // Map is an erased carrier: the Option-of-Map is blink_Option_map, byte-matching
+            // every other Option[Map] producer (Some(m), the annotation path, tp_carrier_tag),
+            // so a popped map meets one built elsewhere without a C nominal clash. K/V are
+            // recovered per-use from the tid: the ladder-end stamp_container_option_temp backs
+            // res with the full Option[Map[K,V]] tid so a later `.unwrap().get(k)` decodes V.
             let pop_map_vs = get_list_elem_map_val_struct(obj_str)
-            let k_tag = if pop_map_k >= 0 { c_type_tag(pop_map_k) } else { "str" }
-            // Mirror the .get() path — a struct map value tags the carrier
-            // by struct name and forwards the value-struct through inner2_struct.
-            let v_tag = if pop_map_vs != "" { c_type_tag_for_struct(pop_map_vs) } else if pop_map_v >= 0 { c_type_tag(pop_map_v) } else { "int" }
-            let map_struct = "Map_{k_tag}_{v_tag}"
-            ensure_struct_option_type(map_struct)
-            let opt_type = struct_option_c_type(map_struct)
+            ensure_option_type(CT_MAP)
+            let opt_type = option_c_type(CT_MAP)
             emit_line("{opt_type} {res};")
             emit_line("if (blink_list_len({obj_str}) > 0) \{")
             emit_line("    {res}.tag = 1; {res}.value = (blink_map*)blink_list_pop({obj_str});")
             emit_line("} else \{ {res}.tag = 0; }")
-            set_var_option_struct(res, CT_MAP, map_struct)
+            set_var_option(res, CT_MAP)
             if pop_map_vs != "" {
                 set_var_option_inner2_struct(res, pop_map_vs)
                 expr_option_inner_map_val_struct = pop_map_vs
@@ -1356,7 +1354,7 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             expr_result_str = res
             expr_result_type = CT_OPTION
             expr_option_inner = CT_MAP
-            expr_option_inner_struct = map_struct
+            expr_option_inner_struct = ""
         } else if elem_type == CT_OPTION {
             // List[Option[T]].pop() -> Option[Option[T]] — mirror the .get()
             // CT_OPTION branch (the element Option is pointer-boxed on the list).
@@ -1551,22 +1549,19 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             expr_option_inner_list_elem = nested_et
             expr_option_inner_list_struct = nested_es
         } else if elem_type == CT_MAP {
-            let map_k = get_list_elem_map_key_type(obj_str)
-            let map_v = get_list_elem_map_val_type(obj_str)
+            // Map is an erased carrier: the Option-of-Map is blink_Option_map, byte-matching
+            // every other Option[Map] producer (Some(m), the annotation path, tp_carrier_tag),
+            // so a got map meets one built elsewhere without a C nominal clash. K/V are
+            // recovered per-use from the tid: the ladder-end stamp_container_option_temp backs
+            // res with the full Option[Map[K,V]] tid so a later `.unwrap().get(k)` decodes V.
             let map_vs = get_list_elem_map_val_struct(obj_str)
-            let k_tag = if map_k >= 0 { c_type_tag(map_k) } else { "str" }
-            // A struct map value names the carrier by its struct tag
-            // (Map_{k}_{Point}) and forwards the value-struct name through the
-            // option's inner2_struct channel so the later unwrap recovers it.
-            let v_tag = if map_vs != "" { c_type_tag_for_struct(map_vs) } else if map_v >= 0 { c_type_tag(map_v) } else { "int" }
-            let map_struct = "Map_{k_tag}_{v_tag}"
-            ensure_struct_option_type(map_struct)
-            let opt_type = struct_option_c_type(map_struct)
+            ensure_option_type(CT_MAP)
+            let opt_type = option_c_type(CT_MAP)
             emit_line("{opt_type} {res};")
             emit_line("if (blink_list_in_bounds({obj_str}, {idx_tmp})) \{")
             emit_line("    {res}.tag = 1; {res}.value = (blink_map*)blink_list_get({obj_str}, {idx_tmp});")
             emit_line("} else \{ {res}.tag = 0; }")
-            set_var_option_struct(res, CT_MAP, map_struct)
+            set_var_option(res, CT_MAP)
             if map_vs != "" {
                 set_var_option_inner2_struct(res, map_vs)
                 expr_option_inner_map_val_struct = map_vs
@@ -1574,7 +1569,7 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             expr_result_str = res
             expr_result_type = CT_OPTION
             expr_option_inner = CT_MAP
-            expr_option_inner_struct = map_struct
+            expr_option_inner_struct = ""
         } else if elem_type == CT_OPTION {
             // List[Option[T]].get() returns Option[Option[T]]. The element
             // Option is boxed by POINTER on the list (like a struct/map element), so
@@ -5561,8 +5556,14 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 }
                 expr_result_str = val_tmp
                 expr_result_type = CT_LIST
-            } else if inner == CT_MAP && inner_s != "" {
-                let opt_c = struct_option_c_type(inner_s)
+            } else if inner == CT_MAP {
+                // Map is an erased carrier: the option is blink_Option_map whether the
+                // producer left inner_s empty (set_var_option) or spelled a legacy Map_ tag.
+                // The tid-lead below (stamp_map_from_tid) is the authority for K/V; the flat
+                // recoveries only fill what the tid declines. An empty inner_s no longer skips
+                // this whole branch to the scalar tail -- that dropped the tid recovery and
+                // erased a List/struct map value out of a List element.
+                let opt_c = if inner_s != "" { struct_option_c_type(inner_s) } else { option_c_type(CT_MAP) }
                 emit_line("{opt_c} {tmp} = {obj_str};")
                 emit_panic_tag_check(tmp, 0, "unwrap called on None", node)
                 let val_tmp = fresh_temp("_ounv_")
@@ -5592,13 +5593,15 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 // `.get(k)` on this chain falls back to whatever a prior, unrelated
                 // CT_MAP-producing expression left behind.
                 if map_nested < 0 && map_nested_s == "" {
-                    let kv = map_struct_scalar_kv(inner_s)
-                    if kv.first >= 0 {
-                        set_map_types(val_tmp, kv.first, kv.second, "")
-                        expr_map_key_type = kv.first
-                        expr_map_val_type = kv.second
-                        expr_map_key_struct = ""
-                        expr_map_val_struct = ""
+                    if inner_s != "" {
+                        let kv = map_struct_scalar_kv(inner_s)
+                        if kv.first >= 0 {
+                            set_map_types(val_tmp, kv.first, kv.second, "")
+                            expr_map_key_type = kv.first
+                            expr_map_val_type = kv.second
+                            expr_map_key_struct = ""
+                            expr_map_val_struct = ""
+                        }
                     }
                 } else {
                     expr_map_key_type = -1
@@ -5648,9 +5651,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 // (`Option_list` is element-agnostic), so recover it from the source
                 // Option[Option[List]]'s stored deep tp (its child1 is the element
                 // Option[List], whose child1 is the List with its element). Only for
-                // the List case — a Map inner is already fully recovered from its tag
-                // (`Option_Map_int_str`) by set_var_option_from_struct_tag above, and
-                // overriding it here with the source's flat map would erase V.
+                // the List case — a Map inner is an erased carrier too, but the
+                // stamp_container_option_temp above already backed val_tmp with the
+                // node tid, from which a later get(k) recovers V; a flat overwrite here
+                // would erase it.
                 if inner_s == "Option_list" {
                     let src_inner_tp = get_var_option_inner_tp(obj_str)
                     if src_inner_tp >= 0 && tp_get_kind(src_inner_tp) == CT_OPTION {

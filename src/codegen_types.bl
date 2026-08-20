@@ -2685,20 +2685,21 @@ pub fn resolve_tuple_ann(ta: Int, tparams_sl: Int, segs: List[Str]) -> Option[St
             let struct_tag = if mono != "" { mono } else { c_type_tag_for_struct(elem_name) }
             tags = tags.concat(struct_tag)
             elem_structs_enc = elem_structs_enc.concat(struct_tag)
-        } else if is_compound_ct(elem_t) != 0 && elem_name == elem_name_raw {
-            // Annotation genuinely spells the compound (e.g. `Map[Str, Int]`):
-            // read its inner shape from the node's child anns.
+        } else if (elem_t == CT_OPTION || elem_t == CT_RESULT) && elem_name == elem_name_raw {
+            // Annotation genuinely spells a by-value carrier (e.g. `Option[Int]`):
+            // read its inner shape from the node's child anns and embed the carrier
+            // struct by value. Map is NOT here — it is a POINTER carrier (blink_map*),
+            // stored erased through the scalar branch below like List/Set.
             ensure_compound_type_from_ann(elem_ann)
             let compound_name = canonical_struct_tag(compound_name_from_ann(elem_ann))
             tags = tags.concat(compound_name)
             elem_structs_enc = elem_structs_enc.concat(compound_name)
         } else {
-            // Scalar, OR a typevar substituted to a bare compound (`T` → `Map`).
-            // In the latter case the raw ann is the bare typevar node with no
-            // inner anns, so compound_name_from_ann would decode "void"; and the
-            // inner types were erased to the bare name upstream anyway (same as
-            // the param, which emits `blink_map*`). Use the type-erased tag so
-            // the tuple field type matches the parameter.
+            // Scalar, a pointer carrier (Map/List/Set — genuine `Map[Str, Int]` or a
+            // typevar `T` → `Map`), or a typevar substituted to a bare compound. The
+            // inner types are erased to the bare pointer (blink_map*) regardless of K/V,
+            // matching the param and the tid path; the field lowers through
+            // c_field_type_str(elem_t) with an empty elem_struct. Use the type-erased tag.
             tags = tags.concat(c_type_tag(elem_t))
             elem_structs_enc = elem_structs_enc.concat("-")
         }
@@ -3981,10 +3982,9 @@ pub fn map_val_carrier_from_vtid(vtid: Int) -> MapValCarrier {
         return MapValCarrier { ct: CT_RESULT, tag: "Result_{tp_carrier_tag(ok_tp)}_{tp_carrier_tag(err_tp)}", inner_tp: -1, inner_ct: -1, inner_sname: "" }
     }
     if vct == CT_MAP {
-        let key_tp = deep_tp_from_tid(tc_tid_map_key_tid(vtid))
-        let val_tp = deep_tp_from_tid(tc_tid_map_val_tid(vtid))
-        if key_tp == -1 || val_tp == -1 { return no_map_val_carrier() }
-        return MapValCarrier { ct: CT_MAP, tag: "Map_{tp_carrier_tag(key_tp)}_{tp_carrier_tag(val_tp)}", inner_tp: -1, inner_ct: -1, inner_sname: "" }
+        // A Map-valued Map rides the erased carrier: one blink_map* backs every K/V, so
+        // the tag drops K/V (`map`, matching tp_carrier_tag). K/V come from the tid.
+        return MapValCarrier { ct: CT_MAP, tag: "map", inner_tp: -1, inner_ct: -1, inner_sname: "" }
     }
     // A Set value has no deep_tp_from_tid tree (that builder answers -1 for Set on purpose) and
     // needs none: E1400 forecloses a container element, so the element is a flat scalar/struct
@@ -7359,15 +7359,15 @@ pub fn is_compound_ct(ct: Int) -> Int {
     }
 }
 
-// The carrier tag for a tp node, recursing into nested containers so a
-// deep element type spells its full layout — `Option[Map[Int,Str]]` →
-// `Option_Map_int_str`, `Result[Map[Int,Str],Str]` → `Result_Map_int_str_str`,
-// `Option[List[Int]]` → `Option_list`. The tp_pool twin of typecheck's
-// tc_tid_inner_tag (which walks the ty_pool). This is the single source of the
-// carrier name for `List[compound]` get()/pop()/for-in and the HOF iterator path,
-// replacing the lossy one-level `c_type_tag(inner_ct)` spellings (which erase a
-// Map's K/V to the bare `map` tag). A struct/enum node uses its C struct tag; a
-// bare scalar its c_type_tag.
+// The carrier tag for a tp node, recursing into nested by-value carriers so a
+// deep element type spells its full layout — `Option[Option[Int]]` →
+// `Option_Option_int`, `Result[Option[Int],Str]` → `Result_Option_int_str`,
+// `Option[List[Int]]` → `Option_list`, `Option[Map[Int,Str]]` → `Option_map`.
+// The tp_pool twin of typecheck's tc_tid_inner_tag (which walks the ty_pool). This
+// is the single source of the carrier name for `List[compound]` get()/pop()/for-in
+// and the HOF iterator path. Map/List/Set are ERASED carriers (one blink_map*/
+// blink_list*/blink_set* per shape), so their K/V element(s) drop out of the tag; a
+// struct/enum node uses its C struct tag; a bare scalar its c_type_tag.
 pub fn tp_carrier_tag(id: Int) -> Str {
     if id < 0 { return "void" }
     let kind = tp_get_kind(id)
@@ -7382,13 +7382,11 @@ pub fn tp_carrier_tag(id: Int) -> Str {
     if kind == CT_RESULT {
         return "Result_{tp_carrier_tag(tp_get_child1(id))}_{tp_carrier_tag(tp_get_child2(id))}"
     }
-    if kind == CT_MAP {
-        return "Map_{tp_carrier_tag(tp_get_child1(id))}_{tp_carrier_tag(tp_get_child2(id))}"
-    }
-    // List/Set/Iterator and all scalars are pointer-boxed / by-value under a
+    // Map/List/Set/Iterator and all scalars are pointer-boxed / by-value under a
     // single flat tag — the inner element travels via the var's map/list-elem
-    // metadata channels, not the carrier tag (mirrors the existing `Option_list`
-    // spelling for List[Option[List[T]]]).
+    // metadata channels, not the carrier tag. Map erases its K/V here exactly like
+    // List/Set (`Map[Int,Str]` → `map`, `Option[Map[Int,Str]]` → `Option_map`): one
+    // blink_map* backs every shape, so K/V are recovered per-use from the tid.
     c_type_tag(kind)
 }
 
@@ -7498,16 +7496,10 @@ pub fn compound_name_from_ann_ctx(ann_node: Int, tparams_sl: Int, arg_tids: List
         }
         "Option_int"
     } else if ct == CT_MAP {
-        let inner_elems = node_elements(ann_node)
-        if inner_elems != -1 && sublist_length(inner_elems) >= 2 {
-            let key_ann = sublist_get(inner_elems, 0)
-            let val_ann = sublist_get(inner_elems, 1)
-            let key_name = node_name(key_ann)
-            let val_name = node_name(val_ann)
-            let key_tag = resolve_ann_tag_ctx(key_ann, key_name, tparams_sl, arg_tids, segs)
-            let val_tag = resolve_ann_tag_ctx(val_ann, val_name, tparams_sl, arg_tids, segs)
-            return "Map_{key_tag}_{val_tag}"
-        }
+        // Map is an erased carrier, exactly like List and Set (which have no arm here
+        // and fall to c_type_tag → "list"/"set"): one blink_map* serves every key/value
+        // pair, so the C tag drops K/V at every annotation position. K/V are recovered
+        // per-use from the authoritative tid, never spelled into the C type.
         "map"
     } else if name == "Tuple" {
         let t = resolve_tuple_ann(ann_node, tparams_sl, segs)
@@ -7988,8 +7980,10 @@ pub fn set_var_result_from_struct_tag(name: Str, fs: Str) {
 
 // Convert an annotation-form type string (`Option[Str]`, `Result[Int, Str]`,
 // `Map[Str, Str]`, `Foo`, `Int`) into its carrier/struct tag form
-// (`Option_str`, `Result_int_str`, `Map_str_str`, `Foo`, `int`). Recurses on
-// nested compound inners so the tag matches the emitted typedef.
+// (`Option_str`, `Result_int_str`, `map`, `Foo`, `int`). Recurses on nested
+// by-value compound inners (Option/Result) so the tag matches the emitted
+// typedef; Map is an erased carrier (one blink_map* per shape) so it drops K/V
+// and falls to the flat `map` tag like List/Set.
 fn compound_tag_from_type_str(s: Str) -> Str {
     let ct = type_from_name(s)
     let bracket_pos = s.index_of("[")
@@ -8000,8 +7994,6 @@ fn compound_tag_from_type_str(s: Str) -> Str {
             return "Option_{compound_tag_from_type_str(parts.get(0).unwrap())}"
         } else if ct == CT_RESULT && parts.len() >= 2 {
             return "Result_{compound_tag_from_type_str(parts.get(0).unwrap())}_{compound_tag_from_type_str(parts.get(1).unwrap())}"
-        } else if ct == CT_MAP && parts.len() >= 2 {
-            return "Map_{compound_tag_from_type_str(parts.get(0).unwrap())}_{compound_tag_from_type_str(parts.get(1).unwrap())}"
         }
     }
     let bare = strip_module_qualifier(s)
