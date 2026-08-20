@@ -1,0 +1,80 @@
+// get_map_key_type / get_map_value_type no longer fabricate a CT_STRING key or
+// CT_INT value default: an unset kind returns -1 so a consumer can tell a
+// genuinely-recovered type from "unknown" (the Map analogue of the Set fix).
+// The retirement reaches sv_tp's CT_MAP arm too — an unset key/value passes
+// through as -1 instead of a baked-in type_string()/type_int() — so the
+// erased-generic-struct-field cases below must recover K/V from the receiver's
+// tid rather than trusting the old fabricated (Str, Int) sentinel.
+// These cases exercise the LIVE recovery paths that must keep answering the
+// real key/value type through the tid + flat channels after the default retired.
+
+type Point {
+    x: Int
+    y: Int
+}
+
+type Holder[K, V] {
+    m: Map[K, V]
+}
+
+fn make_int_str() -> Holder[Int, Str] {
+    let mut m: Map[Int, Str] = Map()
+    Holder { m: m }
+}
+
+fn make_str_pt() -> Holder[Str, Point] {
+    let mut m: Map[Str, Point] = Map()
+    Holder { m: m }
+}
+
+test "Int-keyed map recovers the Int key (not a fabricated Str)" {
+    let mut m: Map[Int, Str] = Map()
+    m.insert(7, "seven")
+    assert_eq(m.get(7).unwrap(), "seven")
+    // A wrong (fabricated Str) key would hash 7 differently and miss.
+    assert_eq(m.contains_key(7), true)
+}
+
+test "Str-keyed map keeps its Str key through get/insert" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("k", 42)
+    assert_eq(m.get("k").unwrap(), 42)
+}
+
+test "struct-value map recovers the struct value" {
+    let mut m: Map[Str, Point] = Map()
+    m.insert("o", Point { x: 3, y: 4 })
+    let p = m.get("o").unwrap()
+    assert_eq(p.x, 3)
+    assert_eq(p.y, 4)
+}
+
+test "Int-keyed map with a List value recovers both key and element" {
+    let mut m: Map[Int, List[Int]] = Map()
+    m.insert(1, [10, 20, 30])
+    let xs = m.get(1).unwrap()
+    assert_eq(xs.get(1).unwrap(), 20)
+}
+
+// The erased-field cases: sv_tp gives Holder.m the (-1, -1) key/value shape, so
+// the real K/V must come from the returned instance's tid. A wrong value
+// recovery would lower `.get(k).unwrap() == "..."` as a scalar pointer compare
+// (Int value) instead of blink_str_eq, so the string equality is the assertion.
+
+test "erased generic-struct-field Map[Int,Str] recovers the Int key and Str value" {
+    let h = make_int_str()
+    h.m.insert(256, "lo")
+    h.m.insert(512, "hi")
+    assert_eq(h.m.len(), 2)
+    assert(h.m.get(256).unwrap() == "l".concat("o"))
+    assert_eq(h.m.contains_key(512), true)
+    assert_eq(h.m.contains_key(1), false)
+}
+
+test "erased generic-struct-field Map[Str,Point] recovers the struct value" {
+    let h = make_str_pt()
+    h.m.insert("o", Point { x: 3, y: 4 })
+    let p = h.m.get("o").unwrap()
+    assert_eq(p.x, 3)
+    assert_eq(p.y, 4)
+}

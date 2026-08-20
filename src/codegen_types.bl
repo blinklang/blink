@@ -1594,8 +1594,13 @@ pub fn sv_tp(ctype: Int, inner1: Int, inner2: Int, sname: Str) -> Int {
         return type_result(ok, err)
     }
     if ctype == CT_MAP {
-        let k = if inner1 >= 0 { sv_tp(inner1, -1, -1, "") } else { type_string() }
-        let v = if inner2 >= 0 { sv_tp(inner2, -1, -1, sname) } else { type_int() }
+        // Mirror the CT_SET arm below: an unknown key/value must NOT fabricate a
+        // concrete CT_STRING/CT_INT. typecheck resolves a Map's key and value by
+        // metavar inference (or errors E0301 when under-determined), so -1 passes
+        // through and get_map_key_type/get_map_value_type report "unknown" rather
+        // than a plausible-but-wrong default.
+        let k = if inner1 >= 0 { sv_tp(inner1, -1, -1, "") } else { -1 }
+        let v = if inner2 >= 0 { sv_tp(inner2, -1, -1, sname) } else { -1 }
         return type_map(k, v)
     }
     if ctype == CT_SET {
@@ -4019,8 +4024,8 @@ pub fn map_val_carrier_from_vtid(vtid: Int) -> MapValCarrier {
 // need it for opposite reasons:
 //
 //   1. A call/expression receiver (`for pair in mkm()`) has no ScopeVar to key the flat
-//      channels on, so get_map_key_type / get_map_value_type answer their FABRICATED defaults
-//      (CT_STRING / CT_INT — sv_tp's CT_MAP arm) instead of declining. The pair for a
+//      channels on, so get_map_key_type / get_map_value_type have nothing to answer from. They
+//      once fabricated (CT_STRING / CT_INT) here and now decline (-1) instead. The pair for a
 //      `Map[Str, List[Int]]` was therefore built as `Tuple2_str_int`, and `pair.1.get(0)` hit
 //      codegen's UnresolvedMethod backstop — whose message prints the TID-derived type name, so
 //      it read `'.get' on type List[Int]`, naming the type it was not using.
@@ -4587,9 +4592,10 @@ pub fn get_map_key_type(name: Str) -> Int {
                 // the identity ride get_map_key_struct's tid-first sname instead.
                 if k >= 0 && k != CT_ENUM { return k }
             }
-            let c1k = tp_child1_kind(sv.tp_id)
-            if c1k >= 0 { return c1k }
-            return CT_STRING
+            // No CT_STRING fabrication: an unset key kind returns -1 (mirrors
+            // get_set_elem_type) so a consumer can tell a genuinely-recovered
+            // Str key from "key unknown" instead of trusting a plausible default.
+            return tp_child1_kind(sv.tp_id)
         }
         i = i - 1
     }
@@ -4602,14 +4608,12 @@ pub fn get_map_key_type(name: Str) -> Int {
                     let k = tc_tid_map_key_ct_resolved(cg_bind_mono_tid(cap.tid))
                     if k >= 0 && k != CT_ENUM { return k }
                 }
-                let c1k = tp_child1_kind(cap.tp_id)
-                if c1k >= 0 { return c1k }
-                return CT_STRING
+                return tp_child1_kind(cap.tp_id)
             }
             ci = ci + 1
         }
     }
-    CT_STRING
+    -1
 }
 
 pub fn get_map_key_struct(name: Str) -> Str {
@@ -4679,6 +4683,9 @@ pub fn get_map_value_type(name: Str) -> Int {
             }
             let c2k = tp_child2_kind(sv.tp_id)
             if c2k >= 0 { return c2k }
+            // No CT_INT fabrication: an unset value kind returns the flat inner2
+            // (already -1 when genuinely unset), so consumers see "value unknown"
+            // rather than a plausible Int default.
             return sv.inner2
         }
         i = i - 1
@@ -4692,14 +4699,12 @@ pub fn get_map_value_type(name: Str) -> Int {
                     let c = tc_tid_map_val_ct_resolved(cg_bind_mono_tid(cap.tid))
                     if c >= 0 && c != CT_STRUCT && c != CT_ENUM { return c }
                 }
-                let c2k = tp_child2_kind(cap.tp_id)
-                if c2k >= 0 { return c2k }
-                return CT_INT
+                return tp_child2_kind(cap.tp_id)
             }
             ci = ci + 1
         }
     }
-    CT_INT
+    -1
 }
 
 pub fn set_map_value_struct(name: Str, struct_name: Str) {
