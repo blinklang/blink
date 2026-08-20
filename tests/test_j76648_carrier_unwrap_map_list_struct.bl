@@ -1,0 +1,67 @@
+// A `let` bound to a carrier-unwrap result — `let m2 = mk().unwrap()` where mk
+// returns Result[Map[Str, List[Point]], Str] — must mint an INFERRED node tid
+// that is faithful all the way down to the list-element struct slot. The codegen
+// consumer (get_map_value_list_elem_struct, keyed on sv.ty) recovers the element
+// struct from that tid; an unfaithful tid returns empty and the element reads back
+// as a scalar (`_ounw.value.y` on a non-struct → cc "request for member 'y' in
+// something not a structure or union").
+//
+// Annotating the intermediate (`let m2: Map[Str, List[Point]] = mk().unwrap()`)
+// already worked — the annotation supplied the faithful tid. This pins the
+// UNANNOTATED path: the tid inferred from the carrier-unwrap alone must be just as
+// faithful, so K/V (and the value's own list-element struct) come from the tid.
+
+type J6Point { x: Int, y: Int }
+
+fn mk_result() -> Result[Map[Str, List[J6Point]], Str] {
+    let mut m: Map[Str, List[J6Point]] = Map()
+    m.insert("k", [J6Point { x: 3, y: 9 }])
+    Ok(m)
+}
+
+fn mk_option() -> Option[Map[Str, List[J6Point]]] {
+    let mut m: Map[Str, List[J6Point]] = Map()
+    m.insert("k", [J6Point { x: 7, y: 11 }])
+    Some(m)
+}
+
+test "inferred tid from a Result.unwrap() carries the map value list-element struct" {
+    let m2 = mk_result().unwrap()
+    let got = m2.get("k").unwrap().get(0).unwrap().y
+    assert_eq(got, 9)
+}
+
+test "inferred tid from an Option.unwrap() carries the map value list-element struct" {
+    let m2 = mk_option().unwrap()
+    let got = m2.get("k").unwrap().get(0).unwrap().x
+    assert_eq(got, 7)
+}
+
+test "annotated intermediate control still reads the deep struct field" {
+    let m2: Map[Str, List[J6Point]] = mk_result().unwrap()
+    let got = m2.get("k").unwrap().get(0).unwrap().y
+    assert_eq(got, 9)
+}
+
+fn wrap_in_map[T](v: T) -> Map[Str, List[T]] {
+    let mut m: Map[Str, List[T]] = Map()
+    m.insert("k", [v])
+    m
+}
+
+// A `Map[Str, List[T]]` let-binding INSIDE a generic body: the binder tid reads
+// `List[T]` with T abstract, so the value-list stamp must mono-substitute (T -> J6Point)
+// before the tid resolves to CT_LIST — an unsubstituted tid declines and the `.get`
+// below mis-dispatches on the floored scalar arm.
+fn deep_first[T](v: T) -> Option[T] {
+    let m: Map[Str, List[T]] = wrap_in_map(v)
+    match m.get("k") {
+        Some(lst) => lst.get(0)
+        None => None
+    }
+}
+
+test "generic-body Map[Str,List[T]] let-binding dispatches .get on the list value" {
+    let got = deep_first(J6Point { x: 5, y: 8 })
+    assert_eq(got.unwrap().y, 8)
+}
