@@ -4019,6 +4019,52 @@ pub fn map_val_carrier_from_vtid(vtid: Int) -> MapValCarrier {
     no_map_val_carrier()
 }
 
+// The leaf-scalar value CT of a Map, read off the tid — the scalar twin of
+// map_val_carrier_from_tid, which covers only the container value kinds. The flat
+// get_map_value_type channel floors a mono struct-field Map's value to the erased
+// sv_tp default (CT_INT); the tid is authoritative, keeping producer and the tid-led
+// consumer on the same carrier. Declines (ct = -1) for a container value (those ride
+// map_val_carrier_from_tid), an abstract tid, or a non-Map/Option receiver, so the
+// flat ladder keeps its answer.
+pub type MapValScalar {
+    ct: Int,
+    sname: Str
+}
+
+pub fn map_val_scalar_from_tid(get_node: Int, obj_node: Int) -> MapValScalar {
+    let otid = tc_tid_subst_mono(tc_lookup_node_tid(obj_node), cg_mono_tparams_sl, cg_mono_arg_tids)
+    if tc_tid_ct(otid) == CT_MAP {
+        return map_val_scalar_of_ct(tc_tid_map_val_ct_resolved(otid))
+    }
+    // A chained receiver (foo().get(k)) has no Map tid to read; fall back to the
+    // `.get` call's own Option[V] result tid, mirroring map_val_carrier_from_tid.
+    let gtid = tc_tid_subst_mono(tc_lookup_node_tid(get_node), cg_mono_tparams_sl, cg_mono_arg_tids)
+    if tc_tid_ct(gtid) == CT_OPTION {
+        return map_val_scalar_of_ct(tc_tid_option_inner_ct(gtid))
+    }
+    MapValScalar { ct: -1, sname: "" }
+}
+
+// A leaf scalar carries as a single blink_Option_<tag>: any CT that is not a
+// struct/enum (those are name-carried through the flat sname channel — the tid's
+// plain resolved name is the bare head `Box`, not the mono stem `Box_0Int`) and not
+// a container (List/Set/Option/Result/Map, which ride the carrier ladders).
+pub fn is_leaf_scalar_ct(ct: Int) -> Int {
+    if ct < 0 || ct == CT_STRUCT || ct == CT_ENUM || ct == CT_LIST || ct == CT_SET || is_compound_ct(ct) != 0 {
+        return 0
+    }
+    1
+}
+
+// A pure scalar value CT leads (sname always ""); a struct/enum or container value
+// declines so the flat channel keeps its answer.
+fn map_val_scalar_of_ct(ct: Int) -> MapValScalar {
+    if is_leaf_scalar_ct(ct) == 0 {
+        return MapValScalar { ct: -1, sname: "" }
+    }
+    MapValScalar { ct: ct, sname: "" }
+}
+
 // both halves of a Map's (K, V) pair, read off the RECEIVER's tid, for map
 // iteration's pair-tuple materialization (emit_for_in). Two distinct holes need it, and they
 // need it for opposite reasons:
@@ -4109,6 +4155,30 @@ pub fn get_list_elem_option_inner(name: Str) -> Int {
             return -1
         }
         i = i - 1
+    }
+    -1
+}
+
+// The element Option's inner SCALAR CT of a List RECEIVER, read off the node tid
+// (List[Option[Str]] → CT_STRING). The flat get_list_elem_option_inner reads the
+// tp_pool's child-of-child, which a mono/field-bound List erases to the CT_INT
+// default; the tid is authoritative. Keying on the receiver NODE (not a name)
+// answers for field accesses (`h.xs`) and chained receivers, which no scope_vars
+// name-scan can reach. Declines (-1) for a non-Option element or a non-leaf inner
+// (struct/enum name-carried, container owned by the oi_tp path), so the flat
+// channel keeps its answer there.
+pub fn list_elem_option_inner_scalar_ct_from_tid(obj_node: Int) -> Int {
+    let ltid = tc_tid_subst_mono(tc_lookup_node_tid(obj_node), cg_mono_tparams_sl, cg_mono_arg_tids)
+    if tc_tid_ct(ltid) != CT_LIST {
+        return -1
+    }
+    let et = tc_tid_list_elem(ltid)
+    if tc_tid_ct(et) != CT_OPTION {
+        return -1
+    }
+    let c = tc_tid_option_inner_ct(et)
+    if is_leaf_scalar_ct(c) != 0 {
+        return c
     }
     -1
 }
@@ -6786,6 +6856,17 @@ pub fn unwrap_scalar_ct(ct: Int) -> Int {
     CT_INT
 }
 
+// The cast prefix for storing a container-slot value (returned as void* by
+// blink_list_get / blink_map_get / blink_list_pop) into a scalar Option carrier.
+// A pointer-backed scalar (Bytes, Ptr, …) casts straight to its pointer c_type,
+// mirroring the CT_STRING arm; an int-like scalar rides the intptr round-trip.
+pub fn scalar_carrier_cast(ct: Int) -> Str {
+    if c_type_str(ct).ends_with("*") {
+        return "({c_type_str(ct)})"
+    }
+    "(int64_t)(intptr_t)"
+}
+
 pub fn is_hash_scalar_ct(ct: Int) -> Int {
     if ct == CT_INT || ct == CT_BOOL || ct == CT_CHAR { return 1 }
     is_sized_int_ct(ct)
@@ -7877,7 +7958,37 @@ pub fn set_var_option_struct(name: Str, inner: Int, struct_name: Str) {
 }
 
 pub fn get_var_option_inner(name: Str) -> Int {
-    get_sv_inner1(name, CT_OPTION)
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_OPTION {
+            if sv.ty >= 0 {
+                let c = tc_tid_option_inner_ct(cg_bind_mono_tid(sv.ty))
+                // A struct/enum inner is name-carried through
+                // get_var_option_inner_struct; decline it so the flat sname channel
+                // keeps identity, mirroring get_list_elem_type's CT_ENUM decline.
+                if c >= 0 && c != CT_STRUCT && c != CT_ENUM { return c }
+            }
+            return sv.inner1
+        }
+        i = i - 1
+    }
+    let alt = c_blink_name(name)
+    if alt != name {
+        let mut j = scope_vars.len() - 1
+        while j >= 0 {
+            let sv = scope_vars.get(j).unwrap()
+            if sv.name == alt && tp_get_kind(sv.tp_id) == CT_OPTION {
+                if sv.ty >= 0 {
+                    let c = tc_tid_option_inner_ct(cg_bind_mono_tid(sv.ty))
+                    if c >= 0 && c != CT_STRUCT && c != CT_ENUM { return c }
+                }
+                return sv.inner1
+            }
+            j = j - 1
+        }
+    }
+    -1
 }
 
 pub fn get_var_option_inner_struct(name: Str) -> Str {

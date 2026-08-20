@@ -24,7 +24,7 @@ import codegen_types.{
     get_fn_ret, get_fn_ret_struct, get_fn_ret_struct_inner, get_fn_ret_type,
     get_impl_method_ret, get_impl_method_ret_q, get_list_elem_map_key_type, get_list_elem_map_val_type, get_list_elem_map_val_struct, set_list_elem_map_types, is_map_scalar_ct,
     get_list_elem_map_key_tp, get_list_elem_map_val_tp, set_list_elem_map_tp,
-    get_list_elem_option_inner, get_list_elem_option_inner_struct, get_list_elem_result_ok, get_list_elem_result_err, get_list_elem_result_ok_struct, get_list_elem_result_err_struct,
+    get_list_elem_option_inner, get_list_elem_option_inner_struct, list_elem_option_inner_scalar_ct_from_tid, get_list_elem_result_ok, get_list_elem_result_err, get_list_elem_result_ok_struct, get_list_elem_result_err_struct,
     get_list_elem_option_inner_tp, get_list_elem_result_ok_tp, get_list_elem_result_err_tp, tp_carrier_tag,
     type_option,
     get_list_elem_struct, get_list_elem_type,
@@ -46,7 +46,7 @@ import codegen_types.{
     is_generic_fn, is_mono_struct_instance, is_struct_type, is_struct_or_enum_type, is_trait_type, is_transparent_newtype, is_boxed_struct_err, is_user_effect_handle,
     cg_expect_fn_value_sig, cg_expect_arg_ann, arg_type_ann_at, get_callee_params_sl,
     builtin_receiver_type_name,
-    is_sized_int_ct, unwrap_scalar_ct, lookup_builtin_trait_impl, lookup_impl_method, impl_method_reg_name, impl_trait_for_method, impl_type_implements_trait_method, mangle_generic_name, mangle_impl_method_q, mangle_from_method, synthesized_display_call, render_result_arm_value, wrapping_unsigned_c_type,
+    is_sized_int_ct, unwrap_scalar_ct, scalar_carrier_cast, lookup_builtin_trait_impl, lookup_impl_method, impl_method_reg_name, impl_trait_for_method, impl_type_implements_trait_method, mangle_generic_name, mangle_impl_method_q, mangle_from_method, synthesized_display_call, render_result_arm_value, wrapping_unsigned_c_type,
     option_c_type, option_inner_ct_from_tag, option_inner_struct_from_tag, reg_fn, reg_fn_ret_type, reg_fn_ret_struct_inner, reg_fn_struct_ret, reg_fn_with_effects, register_mono_fn, register_mono_instance,
     poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
     resolve_import_alias, resolve_ptr_inner_c, resolve_struct_from_c_name, get_var_ffi_ptr_struct, is_ffi_ptr_array_var,
@@ -54,7 +54,7 @@ import codegen_types.{
     result_c_type, result_c_type_mixed,
     set_list_elem_struct, set_list_elem_type, set_list_nested_elem_type, set_list_nested_elem_struct,
     set_list_elem_option, set_list_elem_result, set_list_elem_option_tp, set_list_elem_result_tp,
-    stamp_list_elem_from_tid, stamp_map_from_tid, stamp_binder_elems_from_node_if_unset, map_val_carrier_from_tid, MapValCarrier,
+    stamp_list_elem_from_tid, stamp_map_from_tid, stamp_binder_elems_from_node_if_unset, map_val_carrier_from_tid, MapValCarrier, map_val_scalar_from_tid, MapValScalar,
     push_scope, pop_scope,
     set_map_types, set_map_value_list_elem, set_map_value_struct, map_struct_scalar_kv, set_var, set_var_handle,
     set_var_handle_full, set_var_iterator, set_var_option,
@@ -1360,10 +1360,18 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             // CT_OPTION branch (the element Option is pointer-boxed on the list).
             // Carrier tag + inner tp threading matches .get() so a nested
             // container inner survives pop() as well.
-            let oi_ct = get_list_elem_option_inner(obj_str)
+            // The tid is authoritative for a SCALAR element-Option inner
+            // (List[Option[Str]]): the flat channel erases a mono/field-bound List's
+            // deep inner to CT_INT. A struct/enum/container inner rides the flat
+            // oi_struct / oi_tp channels below (the tid declines those here).
+            let flat_oi_ct = get_list_elem_option_inner(obj_str)
+            let tid_oi_ct = list_elem_option_inner_scalar_ct_from_tid(obj_node)
+            let oi_ct = if tid_oi_ct >= 0 { tid_oi_ct } else { flat_oi_ct }
             let oi_struct = get_list_elem_option_inner_struct(obj_str)
             let oi_tp = get_list_elem_option_inner_tp(obj_str)
-            let opt_carrier = if oi_tp >= 0 { "Option_{tp_carrier_tag(oi_tp)}" } else if oi_struct != "" { "Option_{c_type_tag_for_struct(oi_struct)}" } else if oi_ct >= 0 { "Option_{c_type_tag(oi_ct)}" } else { "Option_int" }
+            // Tid-led scalar wins first (see the .get() CT_OPTION branch): it is set only
+            // for a genuine scalar inner and is precise where the flat oi_tp is erased.
+            let opt_carrier = if tid_oi_ct >= 0 { "Option_{c_type_tag(tid_oi_ct)}" } else if oi_tp >= 0 { "Option_{tp_carrier_tag(oi_tp)}" } else if oi_struct != "" { "Option_{c_type_tag_for_struct(oi_struct)}" } else if oi_ct >= 0 { "Option_{c_type_tag(oi_ct)}" } else { "Option_int" }
             ensure_struct_option_type(opt_carrier)
             let opt_type = struct_option_c_type(opt_carrier)
             emit_line("{opt_type} {res};")
@@ -1430,16 +1438,21 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             expr_option_inner = CT_SET
             expr_option_inner_struct = ""
         } else {
-            ensure_option_type(CT_INT)
-            let opt_type = option_c_type(CT_INT)
+            // Precise scalar carrier from the tid-led element type, twin of the .get()
+            // scalar else-branch: producer and the tid-led .unwrap() consumer must
+            // agree on the carrier, so a Bool/Char/pointer-backed element keeps its own
+            // blink_Option_<tag> rather than being coalesced to blink_Option_int.
+            let scalar_ct = unwrap_scalar_ct(elem_type)
+            ensure_option_type(scalar_ct)
+            let opt_type = option_c_type(scalar_ct)
             emit_line("{opt_type} {res};")
             emit_line("if (blink_list_len({obj_str}) > 0) \{")
-            emit_line("    {res}.tag = 1; {res}.value = (int64_t)(intptr_t)blink_list_pop({obj_str});")
+            emit_line("    {res}.tag = 1; {res}.value = {scalar_carrier_cast(scalar_ct)}blink_list_pop({obj_str});")
             emit_line("} else \{ {res}.tag = 0; }")
-            set_var_option(res, CT_INT)
+            set_var_option(res, scalar_ct)
             expr_result_str = res
             expr_result_type = CT_OPTION
-            expr_option_inner = CT_INT
+            expr_option_inner = scalar_ct
             expr_option_inner_struct = ""
         }
         stamp_container_option_temp(res, node)
@@ -1584,10 +1597,21 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             // → `Option_Map_int_str`, not the lossy `Option_map` — keeps its K/V. The
             // inner tp is threaded via expr_option_inner_tp so the arm that unwraps
             // to the Map stamps its value type.
-            let oi_ct = get_list_elem_option_inner(obj_str)
+            // The tid is authoritative for a SCALAR element-Option inner
+            // (List[Option[Str]]): the flat channel erases a mono/field-bound List's
+            // deep inner to CT_INT. A struct/enum/container inner rides the flat
+            // oi_struct / oi_tp channels below (the tid declines those here).
+            let flat_oi_ct = get_list_elem_option_inner(obj_str)
+            let tid_oi_ct = list_elem_option_inner_scalar_ct_from_tid(obj_node)
+            let oi_ct = if tid_oi_ct >= 0 { tid_oi_ct } else { flat_oi_ct }
             let oi_struct = get_list_elem_option_inner_struct(obj_str)
             let oi_tp = get_list_elem_option_inner_tp(obj_str)
-            let opt_carrier = if oi_tp >= 0 { "Option_{tp_carrier_tag(oi_tp)}" } else if oi_struct != "" { "Option_{c_type_tag_for_struct(oi_struct)}" } else if oi_ct >= 0 { "Option_{c_type_tag(oi_ct)}" } else { "Option_int" }
+            // The tid-led scalar wins first: it answers only for a genuine scalar inner
+            // (it declines struct/enum/container), and it is precise where the flat oi_tp
+            // is erased to a void sentinel (a field/mono-bound List's `Option[Str]` element
+            // reads oi_tp=0 → tp_carrier_tag "int"). A real container inner leaves
+            // tid_oi_ct=-1, so oi_tp still owns `Option[List[..]]` / `Option[Map[..]]`.
+            let opt_carrier = if tid_oi_ct >= 0 { "Option_{c_type_tag(tid_oi_ct)}" } else if oi_tp >= 0 { "Option_{tp_carrier_tag(oi_tp)}" } else if oi_struct != "" { "Option_{c_type_tag_for_struct(oi_struct)}" } else if oi_ct >= 0 { "Option_{c_type_tag(oi_ct)}" } else { "Option_int" }
             ensure_struct_option_type(opt_carrier)
             let opt_type = struct_option_c_type(opt_carrier)
             emit_line("{opt_type} {res};")
@@ -1703,16 +1727,22 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             expr_option_inner = CT_CLOSURE
             expr_option_inner_struct = ""
         } else {
-            ensure_option_type(CT_INT)
-            let opt_type = option_c_type(CT_INT)
+            // Precise scalar carrier from the tid-led element type: unwrap_scalar_ct
+            // floors only a genuinely-void element to Int (the SAME normalization the
+            // .unwrap() consumer applies), so a Bool/Char/sized-int element gets its
+            // own blink_Option_<tag> instead of being coalesced to blink_Option_int. A
+            // pointer-backed scalar (Bytes) needs a pointer cast, not the intptr cast.
+            let scalar_ct = unwrap_scalar_ct(elem_type)
+            ensure_option_type(scalar_ct)
+            let opt_type = option_c_type(scalar_ct)
             emit_line("{opt_type} {res};")
             emit_line("if (blink_list_in_bounds({obj_str}, {idx_tmp})) \{")
-            emit_line("    {res}.tag = 1; {res}.value = (int64_t)(intptr_t)blink_list_get({obj_str}, {idx_tmp});")
+            emit_line("    {res}.tag = 1; {res}.value = {scalar_carrier_cast(scalar_ct)}blink_list_get({obj_str}, {idx_tmp});")
             emit_line("} else \{ {res}.tag = 0; }")
-            set_var_option(res, CT_INT)
+            set_var_option(res, scalar_ct)
             expr_result_str = res
             expr_result_type = CT_OPTION
-            expr_option_inner = CT_INT
+            expr_option_inner = scalar_ct
             expr_option_inner_struct = ""
         }
         stamp_container_option_temp(res, node)
@@ -1940,8 +1970,13 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str, fb_key_c
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let key_str = expr_result_str
         let key_expr = map_key_expr_lookup(key_str, key_ct, key_sname)
-        let vtype = base_val_ct
-        let vstruct = base_val_sname
+        // The tid is authoritative for a NON-COMPOUND value type: the flat
+        // get_map_value_type channel floors a mono struct-field Map's value to the
+        // erased sv_tp default (CT_INT). Container values still ride the
+        // map_val_carrier_from_tid ladder below (mvs declines them).
+        let mvs = map_val_scalar_from_tid(node, obj_node)
+        let vtype = if mvs.ct >= 0 { mvs.ct } else { base_val_ct }
+        let vstruct = if mvs.ct >= 0 { mvs.sname } else { base_val_sname }
         let res = fresh_temp("_mgetopt_")
         // FIRST, because the ladder below cannot answer for these value kinds at all
         // — a Map's flat value channels hold a scalar, a struct name or a List element, so an
@@ -2147,16 +2182,23 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str, fb_key_c
             expr_option_inner = CT_CLOSURE
             expr_option_inner_struct = ""
         } else {
-            ensure_option_type(CT_INT)
-            let opt_type = option_c_type(CT_INT)
+            // Precise scalar carrier from the tid-led value type — the Map twin of
+            // emit_list_method's scalar else-branch. unwrap_scalar_ct floors only a
+            // genuinely-void value to Int (matching the .unwrap() consumer), so a
+            // Bool/Char/sized-int value gets its own blink_Option_<tag> rather than
+            // being coalesced to blink_Option_int. A pointer-backed value (Bytes) needs
+            // a pointer cast, not the intptr cast.
+            let scalar_ct = unwrap_scalar_ct(vtype)
+            ensure_option_type(scalar_ct)
+            let opt_type = option_c_type(scalar_ct)
             emit_line("{opt_type} {res};")
             emit_line("if (blink_map_has({obj_str}, {key_expr})) \{")
-            emit_line("    {res}.tag = 1; {res}.value = (int64_t)(intptr_t)blink_map_get({obj_str}, {key_expr});")
+            emit_line("    {res}.tag = 1; {res}.value = {scalar_carrier_cast(scalar_ct)}blink_map_get({obj_str}, {key_expr});")
             emit_line("} else \{ {res}.tag = 0; }")
-            set_var_option(res, CT_INT)
+            set_var_option(res, scalar_ct)
             expr_result_str = res
             expr_result_type = CT_OPTION
-            expr_option_inner = CT_INT
+            expr_option_inner = scalar_ct
             expr_option_inner_struct = ""
         }
         stamp_container_option_temp(res, node)
