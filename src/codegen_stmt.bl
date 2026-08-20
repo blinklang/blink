@@ -106,7 +106,7 @@ import codegen_expr.{
     register_map_elem_struct_mono_from_tid
 }
 import codegen_methods.{resolve_tparam_via_tid, tparam_tid_via_mono, copy_list_compound_elem, emit_boxed_container_store, finish_enum_zip_result, mono_csv_from_arg_tids}
-import codegen_derive.{ct_to_descriptor, desc_primary_ct, descriptor_c_type, descriptor_mangle, emit_promote_elem_into, inner_desc_of, queue_promote_type, map_pair_key_read_expr, tp_to_descriptor}
+import codegen_derive.{ct_to_descriptor, desc_primary_ct, descriptor_c_type, descriptor_mangle, emit_promote_elem_into, inner_desc_of, queue_promote_type, map_pair_key_read_expr, tp_to_descriptor, tid_to_descriptor}
 import diagnostics.{
     Diag, diag_error_at, diag_ice_at, diag_warn_at, diag_file_for_node,
     ARENA_CLOSURE_TAIL_NONLITERAL, ARENA_CLOSURE_UNSUPPORTED_CAP,
@@ -6360,61 +6360,6 @@ fn payload_desc_for(ct: Int, sname: Str) -> Str {
     ct_to_descriptor(ct, "")
 }
 
-// Spell an arena promote descriptor from a TID rather than from the flat cells.
-//
-// Declines with "" for any kind the descriptor grammar has no form for, and propagates a child's
-// decline outward, so a caller falls back to the flat speller instead of trading one wrong
-// descriptor for another. Leaf spellings delegate to ct_to_descriptor so a mangled promoter name
-// stays byte-identical to the one tp_to_descriptor produces for the same type — the two have to
-// agree or the same type gets two promoter functions.
-//
-// TyKind.Enum is deliberately NOT spelled `S:`: a plain C-like enum is a bare int64_t, not a
-// boxed aggregate, and the descriptor grammar cannot tell the two apart. TyKind.Result is left
-// out for the same reason the flat speller leaves it out — no arm means "" means E0702, which
-// is fail-closed.
-fn tid_to_descriptor(tid: Int) -> Str {
-    let r = tc_tid_resolved(tid)
-    if r < 0 { return "" }
-    let k = tc_tid_kind(r)
-    if k == TyKind.Struct {
-        // The mono stem first (Box_0Int): a generic-struct instance value must
-        // spell its mono name, not the erased bare head (Box) — the promote
-        // helper's C type and the typedef the rest of the program emits must name
-        // the same symbol, or the helper references an undeclared blink_Box.
-        // Collapse, never interpolate: tc_tid_struct_mono_name can answer a bare
-        // ICE_SEG_* sentinel for an unencodable slot; wrapping it in "S:{}" would
-        // bury the BLINK_I0001_ prefix past diag_is_ice_seg. Decline (fail-closed
-        // to the flat speller / E0702) rather than emit a buried-ICE C symbol.
-        let mono = tc_tid_struct_mono_name(r)
-        if diag_is_ice_seg(mono) { return "" }
-        if mono != "" { return "S:{mono}" }
-        let sn = tc_tid_struct(r)
-        if sn == "" { return "" }
-        return "S:{strip_module_qualifier(sn)}"
-    }
-    if k == TyKind.List {
-        let e = tid_to_descriptor(tc_tid_child(r, 0))
-        if e == "" { return "" }
-        return "L:{e}"
-    }
-    if k == TyKind.Option {
-        let e = tid_to_descriptor(tc_tid_child(r, 0))
-        if e == "" { return "" }
-        return "O:{e}"
-    }
-    if k == TyKind.Map {
-        let kd = tid_to_descriptor(tc_tid_child(r, 0))
-        let vd = tid_to_descriptor(tc_tid_child(r, 1))
-        if kd == "" || vd == "" { return "" }
-        return "M:{kd}|{vd}"
-    }
-    let ct = tc_tid_ct(r)
-    if ct == CT_INT || ct == CT_FLOAT || ct == CT_BOOL || ct == CT_STRING { return ct_to_descriptor(ct, "") }
-    if ct == CT_CHAR || ct == CT_I8 || ct == CT_I16 || ct == CT_I32 { return ct_to_descriptor(ct, "") }
-    if ct == CT_U8 || ct == CT_U16 || ct == CT_U32 || ct == CT_U64 { return ct_to_descriptor(ct, "") }
-    ""
-}
-
 // Returns "" for unsupported kinds (caller maps to an E0702 variant).
 pub fn descriptor_from_capture(entry: CaptureEntry) -> Str {
     let k = tp_get_kind(entry.tp_id)
@@ -8594,6 +8539,7 @@ pub fn register_mono_field_types(base_name: Str, mono_name: Str, arg_tids0: List
         let type_ann_node = node_value(f)
         if type_ann_node != -1 {
             let type_name = node_name(type_ann_node)
+            let field_tid = tc_tid_subst_mono(tc_tid_resolved(tc_lookup_node_tid(type_ann_node)), tparams_sl, arg_tids)
             let resolved = resolve_mono_slot(type_name, tparams_sl, arg_tids, "register_mono_field_types", "{mono_name}.{fname}", type_ann_node)
             // A struct-INSTANCE concrete arg (e.g. Box[Box[Int]] → field arg
             // "Box_Int") has not yet entered struct_reg_set at construction time
@@ -8610,9 +8556,9 @@ pub fn register_mono_field_types(base_name: Str, mono_name: Str, arg_tids0: List
                 // Transparent newtype (Errno): bare int64_t field, honest CT_INT
                 // metadata. Mirrors emit_mono_struct_typedef; must precede the
                 // is_enum_type arm, which would record it as a boxed CT_STRUCT.
-                reg_sf_entry(mono_name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""))
+                reg_sf_entry(mono_name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""), field_tid)
             } else if is_struct_type(resolved) != 0 || is_enum_type(resolved) != 0 || resolved_is_mono_struct {
-                reg_sf_entry(mono_name, fname, CT_STRUCT, resolved, sv_tp(CT_STRUCT, -1, -1, resolved))
+                reg_sf_entry(mono_name, fname, CT_STRUCT, resolved, sv_tp(CT_STRUCT, -1, -1, resolved), field_tid)
             } else if is_compound_tag(resolved) != 0 {
                 // A bare-typevar field (`value: T`) whose concrete arg is a COMPOUND
                 // carrier (`Box[Option[Int]]` → resolved "Option_int"): the field
@@ -8626,15 +8572,15 @@ pub fn register_mono_field_types(base_name: Str, mono_name: Str, arg_tids0: List
                 if cct == CT_OPTION {
                     let inner_ct = option_inner_ct_from_tag(resolved)
                     let inner_sname = option_inner_struct_from_tag(resolved)
-                    reg_sf_entry(mono_name, fname, cct, "", sv_tp(cct, inner_ct, -1, inner_sname))
+                    reg_sf_entry(mono_name, fname, cct, "", sv_tp(cct, inner_ct, -1, inner_sname), field_tid)
                 } else if cct == CT_RESULT {
                     let split = split_result_compound(resolved)
                     let ok_ct = type_from_name_tag(split.first)
                     let err_ct = type_from_name_tag(split.second)
-                    reg_sf_entry(mono_name, fname, cct, "", sv_tp(cct, ok_ct, err_ct, ""))
+                    reg_sf_entry(mono_name, fname, cct, "", sv_tp(cct, ok_ct, err_ct, ""), field_tid)
                 } else {
                     let kv = map_struct_scalar_kv(resolved)
-                    reg_sf_entry(mono_name, fname, cct, "", sv_tp(cct, kv.first, kv.second, ""))
+                    reg_sf_entry(mono_name, fname, cct, "", sv_tp(cct, kv.first, kv.second, ""), field_tid)
                 }
             } else {
                 let ct = type_from_name(resolved)
@@ -8645,26 +8591,26 @@ pub fn register_mono_field_types(base_name: Str, mono_name: Str, arg_tids0: List
                     let inner_name = if inner_stem != "" { inner_stem } else { resolve_mono_slot(node_name(inner_ann), tparams_sl, arg_tids, "register_mono_field_types_inner", "{mono_name}.{fname}", type_ann_node) }
                     let inner_ct = type_from_name(inner_name)
                     let inner_sname = if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 || is_mono_struct_instance(inner_name) != 0 { inner_name } else { "" }
-                    reg_sf_entry(mono_name, fname, ct, "", sv_tp(ct, inner_ct, -1, inner_sname))
+                    reg_sf_entry(mono_name, fname, ct, "", sv_tp(ct, inner_ct, -1, inner_sname), field_tid)
                 } else if ct == CT_MAP && inner_elems != -1 && sublist_length(inner_elems) >= 2 {
                     let key_name = resolve_mono_slot(node_name(sublist_get(inner_elems, 0)), tparams_sl, arg_tids, "register_mono_field_types_inner", "{mono_name}.{fname}", type_ann_node)
                     let val_name = resolve_mono_slot(node_name(sublist_get(inner_elems, 1)), tparams_sl, arg_tids, "register_mono_field_types_inner", "{mono_name}.{fname}", type_ann_node)
                     let key_ct = type_from_name(key_name)
                     let val_ct = type_from_name(val_name)
                     let val_sname = if is_struct_type(val_name) != 0 || is_enum_type(val_name) != 0 { val_name } else { "" }
-                    reg_sf_entry(mono_name, fname, ct, "", sv_tp(ct, key_ct, val_ct, val_sname))
+                    reg_sf_entry(mono_name, fname, ct, "", sv_tp(ct, key_ct, val_ct, val_sname), field_tid)
                 } else if ct == CT_RESULT && inner_elems != -1 && sublist_length(inner_elems) >= 2 {
                     let ok_name = resolve_mono_slot(node_name(sublist_get(inner_elems, 0)), tparams_sl, arg_tids, "register_mono_field_types_inner", "{mono_name}.{fname}", type_ann_node)
                     let err_name = resolve_mono_slot(node_name(sublist_get(inner_elems, 1)), tparams_sl, arg_tids, "register_mono_field_types_inner", "{mono_name}.{fname}", type_ann_node)
                     let ok_ct = type_from_name(ok_name)
                     let err_ct = type_from_name(err_name)
-                    reg_sf_entry(mono_name, fname, ct, "", sv_tp(ct, ok_ct, err_ct, ""))
+                    reg_sf_entry(mono_name, fname, ct, "", sv_tp(ct, ok_ct, err_ct, ""), field_tid)
                 } else {
-                    reg_sf_entry(mono_name, fname, ct, "", sv_tp(ct, -1, -1, ""))
+                    reg_sf_entry(mono_name, fname, ct, "", sv_tp(ct, -1, -1, ""), field_tid)
                 }
             }
         } else {
-            reg_sf_entry(mono_name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""))
+            reg_sf_entry(mono_name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""), -1)
         }
         i = i + 1
     }
@@ -9098,6 +9044,7 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[
         let type_ann_node = node_value(f)
         if type_ann_node != -1 {
             let type_name = node_name(type_ann_node)
+            let field_tid = tc_tid_subst_mono(tc_tid_resolved(tc_lookup_node_tid(type_ann_node)), tparams_sl, arg_tids)
             let resolved = resolve_mono_slot(type_name, tparams_sl, arg_tids, "struct_typedef_field", "{c_name}.{fname}", type_ann_node)
             // is_enum_type / is_mono_struct_instance widen the same admission
             // emit_mono_enum_typedef's payload loop already uses — a bare
@@ -9111,10 +9058,10 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[
                 // Transparent newtype (Errno): bare int64_t, honest CT_INT metadata.
                 // Must precede the is_enum_type arm, which would box it.
                 emit_line("int64_t {fname};")
-                reg_sf_entry(c_name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""))
+                reg_sf_entry(c_name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""), field_tid)
             } else if is_struct_type(resolved) != 0 || is_enum_type(resolved) != 0 || is_mono_struct_instance(resolved) != 0 {
                 emit_line("{c_type_c_name(resolved)} {fname};")
-                reg_sf_entry(c_name, fname, CT_VOID, resolved, sv_tp(CT_VOID, -1, -1, resolved))
+                reg_sf_entry(c_name, fname, CT_VOID, resolved, sv_tp(CT_VOID, -1, -1, resolved), field_tid)
             } else if resolved == "Option" {
                 let inner_elems = node_elements(type_ann_node)
                 if inner_elems != -1 && sublist_length(inner_elems) >= 1 {
@@ -9127,24 +9074,24 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[
                         ensure_struct_option_type(inner_resolved)
                         let opt_c = struct_option_c_type(inner_resolved)
                         emit_line("{opt_c} {fname};")
-                        reg_sf_entry(c_name, fname, CT_OPTION, opt_c, sv_tp(CT_OPTION, inner_ct, -1, inner_resolved))
+                        reg_sf_entry(c_name, fname, CT_OPTION, opt_c, sv_tp(CT_OPTION, inner_ct, -1, inner_resolved), field_tid)
                     } else if is_compound_ct(inner_ct) != 0 {
                         let compound_name = compound_name_from_ann(inner_ann)
                         ensure_struct_option_type(compound_name)
                         let opt_c = struct_option_c_type(compound_name)
                         emit_line("{opt_c} {fname};")
-                        reg_sf_entry(c_name, fname, CT_OPTION, opt_c, sv_tp(CT_OPTION, inner_ct, -1, compound_name))
+                        reg_sf_entry(c_name, fname, CT_OPTION, opt_c, sv_tp(CT_OPTION, inner_ct, -1, compound_name), field_tid)
                     } else {
                         ensure_option_type(inner_ct)
                         let opt_c = option_c_type(inner_ct)
                         emit_line("{opt_c} {fname};")
-                        reg_sf_entry(c_name, fname, CT_OPTION, "", sv_tp(CT_OPTION, inner_ct, -1, ""))
+                        reg_sf_entry(c_name, fname, CT_OPTION, "", sv_tp(CT_OPTION, inner_ct, -1, ""), field_tid)
                     }
                 } else {
                     ensure_option_type(CT_INT)
                     let opt_c = option_c_type(CT_INT)
                     emit_line("{opt_c} {fname};")
-                    reg_sf_entry(c_name, fname, CT_OPTION, "", sv_tp(CT_OPTION, CT_INT, -1, ""))
+                    reg_sf_entry(c_name, fname, CT_OPTION, "", sv_tp(CT_OPTION, CT_INT, -1, ""), field_tid)
                 }
             } else if resolved == "Result" {
                 let inner_elems = node_elements(type_ann_node)
@@ -9167,18 +9114,18 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[
                         ensure_struct_result_type(ok_tag, err_tag)
                         let res_c = struct_result_c_type(ok_tag, err_tag)
                         emit_line("{res_c} {fname};")
-                        reg_sf_entry(c_name, fname, CT_RESULT, res_c, sv_tp(CT_RESULT, ok_ct, err_ct, ""))
+                        reg_sf_entry(c_name, fname, CT_RESULT, res_c, sv_tp(CT_RESULT, ok_ct, err_ct, ""), field_tid)
                     } else {
                         ensure_result_type(ok_ct, err_ct)
                         let res_c = result_c_type(ok_ct, err_ct)
                         emit_line("{res_c} {fname};")
-                        reg_sf_entry(c_name, fname, CT_RESULT, "", sv_tp(CT_RESULT, ok_ct, err_ct, ""))
+                        reg_sf_entry(c_name, fname, CT_RESULT, "", sv_tp(CT_RESULT, ok_ct, err_ct, ""), field_tid)
                     }
                 } else {
                     ensure_result_type(CT_INT, CT_STRING)
                     let res_c = result_c_type(CT_INT, CT_STRING)
                     emit_line("{res_c} {fname};")
-                    reg_sf_entry(c_name, fname, CT_RESULT, "", sv_tp(CT_RESULT, CT_INT, CT_STRING, ""))
+                    reg_sf_entry(c_name, fname, CT_RESULT, "", sv_tp(CT_RESULT, CT_INT, CT_STRING, ""), field_tid)
                 }
             } else if is_compound_tag(resolved) != 0 {
                 // A bare-typevar field (`value: T`) whose concrete arg is a COMPOUND
@@ -9193,22 +9140,22 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[
                 let cct = compound_tag_ct(resolved)
                 emit_line("{c_type_c_name(resolved)} {fname};")
                 if cct == CT_OPTION {
-                    reg_sf_entry(c_name, fname, cct, "", sv_tp(cct, option_inner_ct_from_tag(resolved), -1, option_inner_struct_from_tag(resolved)))
+                    reg_sf_entry(c_name, fname, cct, "", sv_tp(cct, option_inner_ct_from_tag(resolved), -1, option_inner_struct_from_tag(resolved)), field_tid)
                 } else if cct == CT_RESULT {
                     let split = split_result_compound(resolved)
-                    reg_sf_entry(c_name, fname, cct, "", sv_tp(cct, type_from_name_tag(split.first), type_from_name_tag(split.second), ""))
+                    reg_sf_entry(c_name, fname, cct, "", sv_tp(cct, type_from_name_tag(split.first), type_from_name_tag(split.second), ""), field_tid)
                 } else {
                     let kv = map_struct_scalar_kv(resolved)
-                    reg_sf_entry(c_name, fname, cct, "", sv_tp(cct, kv.first, kv.second, ""))
+                    reg_sf_entry(c_name, fname, cct, "", sv_tp(cct, kv.first, kv.second, ""), field_tid)
                 }
             } else {
                 let ct = type_from_name(resolved)
                 emit_line("{c_field_type_str(ct, resolved)} {fname};")
-                reg_sf_entry(c_name, fname, ct, "", sv_tp(ct, -1, -1, ""))
+                reg_sf_entry(c_name, fname, ct, "", sv_tp(ct, -1, -1, ""), field_tid)
             }
         } else {
             emit_line("int64_t {fname};")
-            reg_sf_entry(c_name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""))
+            reg_sf_entry(c_name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""), -1)
         }
         i = i + 1
     }
@@ -10617,42 +10564,43 @@ pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit, Codegen.Register, Diag.
         let type_ann_node = node_value(f)
         if type_ann_node != -1 {
             let type_name = node_name(type_ann_node)
+            let field_tid = tc_tid_resolved(tc_lookup_node_tid(type_ann_node))
             if type_name == "Fn" {
                 emit_line("blink_closure* {fname};")
-                reg_sf_entry(name, fname, CT_CLOSURE, "", sv_tp(CT_CLOSURE, -1, -1, ""))
+                reg_sf_entry(name, fname, CT_CLOSURE, "", sv_tp(CT_CLOSURE, -1, -1, ""), field_tid)
                 let sig = build_closure_sig_from_type_ann(type_ann_node)
                 sf_closure_sigs.push(StructFieldClosureSig { struct_name: name, field_name: fname, sig: sig })
             } else if type_name == name {
                 emit_line("int64_t {fname};")
-                reg_sf_entry(name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""))
+                reg_sf_entry(name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""), field_tid)
             } else if is_struct_type(type_name) != 0 {
                 emit_line("{c_type_c_name(type_name)} {fname};")
-                reg_sf_entry(name, fname, CT_VOID, type_name, sv_tp(CT_VOID, -1, -1, type_name))
+                reg_sf_entry(name, fname, CT_VOID, type_name, sv_tp(CT_VOID, -1, -1, type_name), field_tid)
             } else if is_enum_type(type_name) != 0 {
                 if is_transparent_newtype(type_name) != 0 {
                     // A transparent newtype (Errno) is a bare int64_t at every
                     // seam. Boxing it in the field decl while construct/read stay
                     // flat silently loses the value and emits invalid C on read-back.
                     emit_line("int64_t {fname};")
-                    reg_sf_entry(name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""))
+                    reg_sf_entry(name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""), field_tid)
                 } else {
                     if is_data_enum(type_name) != 0 {
                         emit_line("{c_type_c_name(type_name)} {fname};")
                     } else {
                         emit_line("int64_t {fname};")
                     }
-                    reg_sf_entry(name, fname, CT_VOID, type_name, sv_tp(CT_VOID, -1, -1, type_name))
+                    reg_sf_entry(name, fname, CT_VOID, type_name, sv_tp(CT_VOID, -1, -1, type_name), field_tid)
                 }
             } else if type_name == "Tuple" {
                 let tup_opt = resolve_tuple_ann(type_ann_node, -1, [])
                 if tup_opt.is_some() {
                     let tup_tag = tup_opt.unwrap()
                     emit_line("{c_type_c_name(tup_tag)} {fname};")
-                    reg_sf_entry(name, fname, CT_VOID, tup_tag, sv_tp(CT_VOID, -1, -1, tup_tag))
+                    reg_sf_entry(name, fname, CT_VOID, tup_tag, sv_tp(CT_VOID, -1, -1, tup_tag), field_tid)
                 } else {
                     let ct = type_from_name(type_name)
                     emit_line("{c_field_type_str(ct, type_name)} {fname};")
-                    reg_sf_entry(name, fname, ct, "", tp_from_ann(type_ann_node))
+                    reg_sf_entry(name, fname, ct, "", tp_from_ann(type_ann_node), field_tid)
                 }
             } else {
                 let ct = type_from_name(type_name)
@@ -10663,11 +10611,11 @@ pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit, Codegen.Register, Diag.
                 } else {
                     emit_line("{c_field_type_str(ct, type_name)} {fname};")
                 }
-                reg_sf_entry(name, fname, ct, "", field_tp)
+                reg_sf_entry(name, fname, ct, "", field_tp, field_tid)
             }
         } else {
             emit_line("int64_t {fname};")
-            reg_sf_entry(name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""))
+            reg_sf_entry(name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""), -1)
         }
         let default_node = node_condition(f)
         if default_node != -1 {

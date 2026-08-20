@@ -12,7 +12,8 @@ import codegen_types.{
     ensure_struct_result_type, ensure_struct_option_type, ensure_option_type, ensure_mixed_result_type,
     is_struct_type, is_enum_type, is_data_enum, is_transparent_newtype, is_boxed_struct_err,
     has_derive_method,
-    get_struct_field_tp_id,
+    get_struct_field_tp_id, get_struct_field_type_tid,
+    carrier_slot_ct,
     tp_child1_kind, tp_child1_sname,
     tp_child2_kind, tp_child2_sname,
     tp_get_child1, tp_get_child2, tp_get_kind, tp_get_sname,
@@ -28,7 +29,14 @@ import codegen_types.{
     enum_regs, enum_variants,
 }
 import parser.{node_args, node_handlers, node_name, node_type_params, sublist_get, sublist_length}
-import diagnostics.{diag_error_at, UNKNOWN_DERIVE_NAME, Diag}
+import typecheck.{
+    TyKind,
+    tc_tid_resolved, tc_tid_kind, tc_tid_ct, tc_tid_child,
+    tc_tid_struct, tc_tid_struct_mono_name,
+    tc_tid_list_elem_ct, tc_tid_list_elem_struct,
+    tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_val_ct, tc_tid_map_val_struct,
+}
+import diagnostics.{diag_error_at, diag_is_ice_seg, UNKNOWN_DERIVE_NAME, Diag}
 
 fn is_known_derive(name: Str) -> Bool {
     name == "Serialize" || name == "Deserialize" || name == "Eq" || name == "Ord" || name == "Clone" || name == "Hash" || name == "Debug"
@@ -545,9 +553,10 @@ fn emit_field_serialize(access: Str, field_type: Int, stype: Str, struct_name: S
 }
 
 fn emit_list_serialize(access: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {
+    let ftid = get_struct_field_type_tid(struct_name, field_name)
     let fa_tp = get_struct_field_tp_id(struct_name, field_name)
-    let elem_struct = if fa_tp >= 0 { tp_child1_sname(fa_tp) } else { "" }
-    let elem_type = if fa_tp >= 0 { tp_child1_kind(fa_tp) } else { CT_INT }
+    let elem_struct = if ftid >= 0 { tc_tid_list_elem_struct(ftid) } else if fa_tp >= 0 { tp_child1_sname(fa_tp) } else { "" }
+    let elem_type = if ftid >= 0 { carrier_slot_ct(tc_tid_list_elem_ct(ftid)) } else if fa_tp >= 0 { tp_child1_kind(fa_tp) } else { CT_INT }
     emit_line("result = blink_str_concat(result, \"[\");")
     emit_line("\{")
     cg_indent = cg_indent + 1
@@ -727,6 +736,66 @@ pub fn tp_to_descriptor(tp_id: Int) -> Str {
     ct_to_descriptor(k, "")
 }
 
+// Walk a resolved TID into a descriptor, full-depth. The authoritative counterpart
+// to tp_to_descriptor: the flat tp tree captures only ~2 nesting levels (sv_tp
+// recursion) and collapses a lost inner to P:Int, so a `List[Option[Point]]` field
+// spelled from the tp cells mangles as L:O:P:Int and renders the struct as an int.
+// The TID carries the full type, so this recovers S:Point. Leaf spellings delegate
+// to ct_to_descriptor so a mangled name stays byte-identical to the string- and
+// tp-path spellers for the same scalar. Declines with "" for any kind the grammar
+// has no form for, and propagates a child decline outward, so a caller falls back
+// to the flat speller rather than trading one wrong descriptor for another.
+pub fn tid_to_descriptor(tid: Int) -> Str {
+    let r = tc_tid_resolved(tid)
+    if r < 0 { return "" }
+    let k = tc_tid_kind(r)
+    if k == TyKind.Struct {
+        // The mono stem first (Box_0Int): a generic-struct instance value must
+        // spell its mono name, not the erased bare head. Collapse, never
+        // interpolate: an unencodable slot answers a BLINK_I0001_ ICE sentinel;
+        // wrapping it in "S:{}" would bury the prefix past diag_is_ice_seg, so
+        // decline (fail-closed to the flat speller) instead.
+        let mono = tc_tid_struct_mono_name(r)
+        if diag_is_ice_seg(mono) { return "" }
+        if mono != "" { return "S:{mono}" }
+        let sn = tc_tid_struct(r)
+        if sn == "" { return "" }
+        return "S:{strip_module_qualifier(sn)}"
+    }
+    if k == TyKind.List {
+        let e = tid_to_descriptor(tc_tid_child(r, 0))
+        if e == "" { return "" }
+        return "L:{e}"
+    }
+    if k == TyKind.Option {
+        let e = tid_to_descriptor(tc_tid_child(r, 0))
+        if e == "" { return "" }
+        return "O:{e}"
+    }
+    if k == TyKind.Map {
+        let kd = tid_to_descriptor(tc_tid_child(r, 0))
+        let vd = tid_to_descriptor(tc_tid_child(r, 1))
+        if kd == "" || vd == "" { return "" }
+        return "M:{kd}|{vd}"
+    }
+    let ct = tc_tid_ct(r)
+    if ct == CT_INT || ct == CT_FLOAT || ct == CT_BOOL || ct == CT_STRING { return ct_to_descriptor(ct, "") }
+    if ct == CT_CHAR || ct == CT_I8 || ct == CT_I16 || ct == CT_I32 { return ct_to_descriptor(ct, "") }
+    if ct == CT_U8 || ct == CT_U16 || ct == CT_U32 || ct == CT_U64 { return ct_to_descriptor(ct, "") }
+    ""
+}
+
+// A struct field's descriptor, TID-first with a flat fallback. The TID is the
+// authoritative full-depth type; it declines to "" only for a kind outside the
+// descriptor grammar, in which case the flat tp speller stands in.
+pub fn field_desc(tid: Int, tp_id: Int) -> Str {
+    if tid >= 0 {
+        let d = tid_to_descriptor(tid)
+        if d != "" { return d }
+    }
+    tp_to_descriptor(tp_id)
+}
+
 // Index of the top-level comma in `s` (bracket-depth 0), or -1. Mirrors the
 // depth counter in get_variant_field_type_str (bytes: '[' 91, ']' 93, ',' 44).
 fn top_level_comma(s: Str) -> Int {
@@ -817,7 +886,7 @@ pub fn queue_debug_type(desc: Str) {
             let sf = sf_entries.get(i).unwrap()
             if sf.struct_name == sname {
                 if sf.field_type == CT_LIST || sf.field_type == CT_OPTION || sf.field_type == CT_MAP {
-                    queue_debug_type(tp_to_descriptor(sf.tp_id))
+                    queue_debug_type(field_desc(sf.tid, sf.tp_id))
                 }
             }
             i = i + 1
@@ -1111,14 +1180,12 @@ fn emit_field_debug(access: Str, field_type: Int, stype: Str) ! Codegen.Emit {
 // the same depth-agnostic generated fn. The field's tp_id gives the exact
 // descriptor (queued during the codegen pre-pass, so the walker exists).
 fn emit_list_debug(access: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {
-    let fa_tp = get_struct_field_tp_id(struct_name, field_name)
-    let desc = tp_to_descriptor(fa_tp)
+    let desc = field_desc(get_struct_field_type_tid(struct_name, field_name), get_struct_field_tp_id(struct_name, field_name))
     emit_line("result = blink_str_concat(result, blink_debug_{descriptor_mangle(desc)}({access}));")
 }
 
 fn emit_option_debug(access: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {
-    let fa_tp = get_struct_field_tp_id(struct_name, field_name)
-    let desc = tp_to_descriptor(fa_tp)
+    let desc = field_desc(get_struct_field_type_tid(struct_name, field_name), get_struct_field_tp_id(struct_name, field_name))
     emit_line("result = blink_str_concat(result, blink_debug_{descriptor_mangle(desc)}({access}));")
 }
 
@@ -1187,8 +1254,7 @@ pub fn map_pair_key_read_expr(slot: Str, key_ct: Int, key_struct: Str) -> Str {
 }
 
 fn emit_map_debug(access: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {
-    let fa_tp = get_struct_field_tp_id(struct_name, field_name)
-    let desc = tp_to_descriptor(fa_tp)
+    let desc = field_desc(get_struct_field_type_tid(struct_name, field_name), get_struct_field_tp_id(struct_name, field_name))
     emit_line("result = blink_str_concat(result, blink_debug_{descriptor_mangle(desc)}({access}));")
 }
 
@@ -1398,8 +1464,9 @@ fn emit_deser_field(target: Str, node_var: Str, field_type: Int, stype: Str, str
 }
 
 fn emit_list_deserialize(target: Str, node_var: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {
+    let ftid = get_struct_field_type_tid(struct_name, field_name)
     let fa_tp = get_struct_field_tp_id(struct_name, field_name)
-    let elem_type = if fa_tp >= 0 { tp_child1_kind(fa_tp) } else { CT_INT }
+    let elem_type = if ftid >= 0 { carrier_slot_ct(tc_tid_list_elem_ct(ftid)) } else if fa_tp >= 0 { tp_child1_kind(fa_tp) } else { CT_INT }
     emit_line("{target} = blink_list_new();")
     emit_line("\{")
     cg_indent = cg_indent + 1
@@ -1907,7 +1974,7 @@ pub fn queue_promote_type(desc: Str) {
         while i < sf_entries.len() {
             let sf = sf_entries.get(i).unwrap()
             if sf.struct_name == sname {
-                queue_field_type(sf.field_type, sf.stype, sf.tp_id)
+                queue_field_type(sf.field_type, sf.stype, sf.tp_id, sf.tid)
             }
             i = i + 1
         }
@@ -1947,23 +2014,23 @@ pub fn queue_promote_type(desc: Str) {
     // C:<sig_hash> — dispatched at runtime via src->promoter; no per-type walker.
 }
 
-fn queue_field_type(field_ct: Int, stype: Str, tp_id: Int) {
+fn queue_field_type(field_ct: Int, stype: Str, tp_id: Int, tid: Int) {
     if field_ct == CT_STRUCT || (field_ct == CT_VOID && stype != "") {
         if stype != "" { queue_promote_type("S:{stype}") }
         return
     }
     if field_ct == CT_LIST {
-        let ek = if tp_id >= 0 { tp_child1_kind(tp_id) } else { -1 }
-        let es = if tp_id >= 0 { tp_child1_sname(tp_id) } else { "" }
+        let ek = if tid >= 0 { carrier_slot_ct(tc_tid_list_elem_ct(tid)) } else if tp_id >= 0 { tp_child1_kind(tp_id) } else { -1 }
+        let es = if tid >= 0 { tc_tid_list_elem_struct(tid) } else if tp_id >= 0 { tp_child1_sname(tp_id) } else { "" }
         let inner = ct_to_descriptor(ek, es)
         queue_promote_type("L:{inner}")
         return
     }
     if field_ct == CT_MAP {
-        let kk = if tp_id >= 0 { tp_child1_kind(tp_id) } else { -1 }
-        let ks = if tp_id >= 0 { tp_child1_sname(tp_id) } else { "" }
-        let vk = if tp_id >= 0 { tp_child2_kind(tp_id) } else { -1 }
-        let vs = if tp_id >= 0 { tp_child2_sname(tp_id) } else { "" }
+        let kk = if tid >= 0 { carrier_slot_ct(tc_tid_map_key_ct(tid)) } else if tp_id >= 0 { tp_child1_kind(tp_id) } else { -1 }
+        let ks = if tid >= 0 { tc_tid_map_key_struct(tid) } else if tp_id >= 0 { tp_child1_sname(tp_id) } else { "" }
+        let vk = if tid >= 0 { carrier_slot_ct(tc_tid_map_val_ct(tid)) } else if tp_id >= 0 { tp_child2_kind(tp_id) } else { -1 }
+        let vs = if tid >= 0 { tc_tid_map_val_struct(tid) } else if tp_id >= 0 { tp_child2_sname(tp_id) } else { "" }
         let kd = ct_to_descriptor(kk, ks)
         let vd = ct_to_descriptor(vk, vs)
         queue_promote_type("M:{kd}|{vd}")
@@ -2094,7 +2161,7 @@ fn emit_promote_result(desc: Str) ! Codegen.Emit {
     emit_line("")
 }
 
-fn emit_promote_field_copy(access: Str, field_ct: Int, stype: Str, tp_id: Int, dst: Str) ! Codegen.Emit {
+fn emit_promote_field_copy(access: Str, field_ct: Int, stype: Str, tp_id: Int, tid: Int, dst: Str) ! Codegen.Emit {
     if field_ct == CT_STRING {
         emit_line("{dst} = blink_promote_str(target, {access});")
         return
@@ -2108,18 +2175,18 @@ fn emit_promote_field_copy(access: Str, field_ct: Int, stype: Str, tp_id: Int, d
         return
     }
     if field_ct == CT_LIST {
-        let ek = if tp_id >= 0 { tp_child1_kind(tp_id) } else { -1 }
-        let es = if tp_id >= 0 { tp_child1_sname(tp_id) } else { "" }
+        let ek = if tid >= 0 { carrier_slot_ct(tc_tid_list_elem_ct(tid)) } else if tp_id >= 0 { tp_child1_kind(tp_id) } else { -1 }
+        let es = if tid >= 0 { tc_tid_list_elem_struct(tid) } else if tp_id >= 0 { tp_child1_sname(tp_id) } else { "" }
         let inner = ct_to_descriptor(ek, es)
         let mangle = "List_{descriptor_mangle(inner)}"
         emit_line("{dst} = blink_promote_{mangle}(target, {access});")
         return
     }
     if field_ct == CT_MAP {
-        let kk = if tp_id >= 0 { tp_child1_kind(tp_id) } else { -1 }
-        let ks = if tp_id >= 0 { tp_child1_sname(tp_id) } else { "" }
-        let vk = if tp_id >= 0 { tp_child2_kind(tp_id) } else { -1 }
-        let vs = if tp_id >= 0 { tp_child2_sname(tp_id) } else { "" }
+        let kk = if tid >= 0 { carrier_slot_ct(tc_tid_map_key_ct(tid)) } else if tp_id >= 0 { tp_child1_kind(tp_id) } else { -1 }
+        let ks = if tid >= 0 { tc_tid_map_key_struct(tid) } else if tp_id >= 0 { tp_child1_sname(tp_id) } else { "" }
+        let vk = if tid >= 0 { carrier_slot_ct(tc_tid_map_val_ct(tid)) } else if tp_id >= 0 { tp_child2_kind(tp_id) } else { -1 }
+        let vs = if tid >= 0 { tc_tid_map_val_struct(tid) } else if tp_id >= 0 { tp_child2_sname(tp_id) } else { "" }
         let kd = ct_to_descriptor(kk, ks)
         let vd = ct_to_descriptor(vk, vs)
         let mangle = "Map_{descriptor_mangle(kd)}_{descriptor_mangle(vd)}"
@@ -2139,7 +2206,7 @@ fn emit_promote_struct(desc: Str) ! Codegen.Emit {
     while i < sf_entries.len() {
         let sf = sf_entries.get(i).unwrap()
         if sf.struct_name == sname {
-            emit_promote_field_copy("src.{sf.field_name}", sf.field_type, sf.stype, sf.tp_id, "dst.{sf.field_name}")
+            emit_promote_field_copy("src.{sf.field_name}", sf.field_type, sf.stype, sf.tp_id, sf.tid, "dst.{sf.field_name}")
         }
         i = i + 1
     }
