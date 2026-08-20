@@ -525,6 +525,16 @@ fn publish_result_tid(node: Int) {
     }
 }
 
+// A by-value carrier slot (Result ok/err, Option/List inner) reads its CT from
+// the tid vocabulary, where a Void, tuple, or otherwise unnameable leaf answers
+// -1. The flat carrier channel (sv_tp, c_type_tag) spells that leaf as CT_VOID;
+// a bare -1 there is fabricated to `int` by sv_tp's default arm. Convert at the
+// boundary so a `Result[Void, E]` ok slot or a `List[(A,B)]` element keeps its
+// void spelling instead of collapsing to int.
+fn carrier_slot_ct(ct: Int) -> Int {
+    if ct < 0 { CT_VOID } else { ct }
+}
+
 fn recover_map_kv_from_tid(node: Int, var_name: Str) ! Codegen.Register, Codegen.Scope {
     let mtid = tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids)
     let kct = tc_tid_map_key_ct_resolved(mtid)
@@ -5636,78 +5646,139 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         expr_list_elem_struct = ""
         expr_map_val_struct = ""
         expr_map_key_struct = ""
-        if expr_result_type == CT_RESULT {
-            expr_result_ok_type = tp_child1_kind(rt.tp_id)
-            expr_result_err_type = tp_child2_kind(rt.tp_id)
-            let fsi = get_fn_ret_struct_inner(fn_name)
-            expr_result_ok_struct = fsi.ok_struct
-            expr_result_err_struct = fsi.err_struct
-            let ok_child_id = tp_get_child1(rt.tp_id)
-            if expr_result_ok_type == CT_LIST && ok_child_id >= 0 {
-                expr_list_elem_type = tp_child1_kind(ok_child_id)
-                let elem_child_id = tp_get_child1(ok_child_id)
-                if elem_child_id >= 0 {
-                    expr_list_elem_struct = tp_get_sname(elem_child_id)
+        // The declared return type's tid (from the annotation node) is the authority
+        // for carrier args; the tp_* pool is the bootstrap fallback for entries that
+        // predate the tid channel (flat producers with rt.tid < 0).
+        if rt.tid >= 0 {
+            let ret_tid = rt.tid
+            if expr_result_type == CT_RESULT {
+                expr_result_ok_type = carrier_slot_ct(tc_tid_result_ok_ct(ret_tid))
+                expr_result_err_type = carrier_slot_ct(tc_tid_result_err_ct(ret_tid))
+                let fsi = get_fn_ret_struct_inner(fn_name)
+                expr_result_ok_struct = fsi.ok_struct
+                expr_result_err_struct = fsi.err_struct
+                let ok_tid = tc_tid_result_ok_tid(ret_tid)
+                if expr_result_ok_type == CT_LIST && ok_tid >= 0 {
+                    expr_list_elem_type = carrier_slot_ct(tc_tid_list_elem_ct(ok_tid))
+                    expr_list_elem_struct = tc_tid_list_elem_struct(ok_tid)
                 }
             }
-        }
-        if expr_result_type == CT_OPTION {
-            expr_option_inner = tp_child1_kind(rt.tp_id)
-            let fsi = get_fn_ret_struct_inner(fn_name)
-            expr_option_inner_struct = fsi.ok_struct
-            let opt_child1 = tp_get_child1(rt.tp_id)
-            if expr_option_inner == CT_LIST && opt_child1 >= 0 {
-                expr_option_inner_list_elem = tp_child1_kind(opt_child1)
-                let elem_child_id = tp_get_child1(opt_child1)
-                if elem_child_id >= 0 {
-                    let ls = tp_get_sname(elem_child_id)
+            if expr_result_type == CT_OPTION {
+                expr_option_inner = carrier_slot_ct(tc_tid_option_inner_ct(ret_tid))
+                let fsi = get_fn_ret_struct_inner(fn_name)
+                expr_option_inner_struct = fsi.ok_struct
+                let inner_tid = tc_tid_option_inner_tid(ret_tid)
+                if expr_option_inner == CT_LIST && inner_tid >= 0 {
+                    expr_option_inner_list_elem = carrier_slot_ct(tc_tid_list_elem_ct(inner_tid))
+                    let ls = tc_tid_list_elem_struct(inner_tid)
                     if ls != "" {
                         expr_option_inner_list_struct = ls
                     }
                 }
-            }
-            if expr_option_inner == CT_MAP && opt_child1 >= 0 {
-                let map_val_child = tp_get_child2(opt_child1)
-                if map_val_child >= 0 {
-                    let mvk = tp_get_kind(map_val_child)
-                    if mvk == CT_LIST {
-                        let list_child = tp_get_child1(map_val_child)
-                        if list_child >= 0 {
-                            expr_option_inner_map_val_list_elem = tp_get_kind(list_child)
+                if expr_option_inner == CT_MAP && inner_tid >= 0 {
+                    let val_tid = tc_tid_map_val_tid(inner_tid)
+                    if val_tid >= 0 {
+                        let mvk = tc_tid_ct(val_tid)
+                        if mvk == CT_LIST {
+                            expr_option_inner_map_val_list_elem = carrier_slot_ct(tc_tid_list_elem_ct(val_tid))
                         }
-                    }
-                    let mvs = tp_get_sname(map_val_child)
-                    if mvs != "" {
-                        expr_option_inner_map_val_struct = mvs
+                        let mvs = tc_tid_map_val_struct(inner_tid)
+                        if mvs != "" {
+                            expr_option_inner_map_val_struct = mvs
+                        }
                     }
                 }
             }
-        }
-        if expr_result_type == CT_LIST {
-            expr_list_elem_type = tp_child1_kind(rt.tp_id)
-            let fsi = get_fn_ret_struct_inner(fn_name)
-            expr_list_elem_struct = fsi.ok_struct
-        }
-        if expr_result_type == CT_MAP {
-            expr_map_key_type = tp_child1_kind(rt.tp_id)
-            expr_map_val_type = tp_child2_kind(rt.tp_id)
-            // A plain (non-generic) fn returning Map[K, Box[Int]] carries the value
-            // struct on the return tid's value-child sname; without this a struct-
-            // instance Map value erases to the bare generic head at the call site.
-            // Mirrors the CT_LIST/CT_OPTION struct recovery three lines above.
-            let map_val_child = tp_get_child2(rt.tp_id)
-            if map_val_child >= 0 {
-                let mvs = tp_get_sname(map_val_child)
-                if mvs != "" { expr_map_val_struct = mvs }
+            if expr_result_type == CT_LIST {
+                expr_list_elem_type = carrier_slot_ct(tc_tid_list_elem_ct(ret_tid))
+                let fsi = get_fn_ret_struct_inner(fn_name)
+                expr_list_elem_struct = fsi.ok_struct
             }
-            let map_key_child = tp_get_child1(rt.tp_id)
-            if map_key_child >= 0 {
-                let mks = tp_get_sname(map_key_child)
+            if expr_result_type == CT_MAP {
+                expr_map_key_type = tc_tid_map_key_ct(ret_tid)
+                expr_map_val_type = tc_tid_map_val_ct(ret_tid)
+                // A plain (non-generic) fn returning Map[K, Box[Int]] carries the value
+                // struct on the return tid's value child; without this a struct-instance
+                // Map value erases to the bare generic head at the call site. Mirrors the
+                // CT_LIST/CT_OPTION struct recovery three lines above.
+                let mvs = tc_tid_map_val_struct(ret_tid)
+                if mvs != "" { expr_map_val_struct = mvs }
+                let mks = tc_tid_map_key_struct(ret_tid)
                 if mks != "" { expr_map_key_struct = mks }
             }
-        }
-        if expr_result_type == CT_SET {
-            expr_list_elem_type = tp_child1_kind(rt.tp_id)
+            if expr_result_type == CT_SET {
+                expr_list_elem_type = tc_tid_set_elem_ct(ret_tid)
+            }
+        } else {
+            if expr_result_type == CT_RESULT {
+                expr_result_ok_type = tp_child1_kind(rt.tp_id)
+                expr_result_err_type = tp_child2_kind(rt.tp_id)
+                let fsi = get_fn_ret_struct_inner(fn_name)
+                expr_result_ok_struct = fsi.ok_struct
+                expr_result_err_struct = fsi.err_struct
+                let ok_child_id = tp_get_child1(rt.tp_id)
+                if expr_result_ok_type == CT_LIST && ok_child_id >= 0 {
+                    expr_list_elem_type = tp_child1_kind(ok_child_id)
+                    let elem_child_id = tp_get_child1(ok_child_id)
+                    if elem_child_id >= 0 {
+                        expr_list_elem_struct = tp_get_sname(elem_child_id)
+                    }
+                }
+            }
+            if expr_result_type == CT_OPTION {
+                expr_option_inner = tp_child1_kind(rt.tp_id)
+                let fsi = get_fn_ret_struct_inner(fn_name)
+                expr_option_inner_struct = fsi.ok_struct
+                let opt_child1 = tp_get_child1(rt.tp_id)
+                if expr_option_inner == CT_LIST && opt_child1 >= 0 {
+                    expr_option_inner_list_elem = tp_child1_kind(opt_child1)
+                    let elem_child_id = tp_get_child1(opt_child1)
+                    if elem_child_id >= 0 {
+                        let ls = tp_get_sname(elem_child_id)
+                        if ls != "" {
+                            expr_option_inner_list_struct = ls
+                        }
+                    }
+                }
+                if expr_option_inner == CT_MAP && opt_child1 >= 0 {
+                    let map_val_child = tp_get_child2(opt_child1)
+                    if map_val_child >= 0 {
+                        let mvk = tp_get_kind(map_val_child)
+                        if mvk == CT_LIST {
+                            let list_child = tp_get_child1(map_val_child)
+                            if list_child >= 0 {
+                                expr_option_inner_map_val_list_elem = tp_get_kind(list_child)
+                            }
+                        }
+                        let mvs = tp_get_sname(map_val_child)
+                        if mvs != "" {
+                            expr_option_inner_map_val_struct = mvs
+                        }
+                    }
+                }
+            }
+            if expr_result_type == CT_LIST {
+                expr_list_elem_type = tp_child1_kind(rt.tp_id)
+                let fsi = get_fn_ret_struct_inner(fn_name)
+                expr_list_elem_struct = fsi.ok_struct
+            }
+            if expr_result_type == CT_MAP {
+                expr_map_key_type = tp_child1_kind(rt.tp_id)
+                expr_map_val_type = tp_child2_kind(rt.tp_id)
+                let map_val_child = tp_get_child2(rt.tp_id)
+                if map_val_child >= 0 {
+                    let mvs = tp_get_sname(map_val_child)
+                    if mvs != "" { expr_map_val_struct = mvs }
+                }
+                let map_key_child = tp_get_child1(rt.tp_id)
+                if map_key_child >= 0 {
+                    let mks = tp_get_sname(map_key_child)
+                    if mks != "" { expr_map_key_struct = mks }
+                }
+            }
+            if expr_result_type == CT_SET {
+                expr_list_elem_type = tp_child1_kind(rt.tp_id)
+            }
         }
         if expr_result_type == CT_HANDLER {
             let h_info = get_fn_ret_handler(fn_name)
