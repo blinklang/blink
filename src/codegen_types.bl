@@ -2213,8 +2213,38 @@ pub fn get_capture_index(name: Str) -> Int {
     -1
 }
 
+// Capture boxing, rehydration, and promotion read a captured value's kind and struct name.
+// An as-pattern whole binder is stamped tid-only (stamp_whole_binder_from_tid), so its tp is the
+// CT_VOID placeholder and these flat reads answer nothing — the value falls to a void* passthrough
+// and the emitted C is wrong. These recover kind/name from the authoritative tid, but only when the
+// flat channel is the placeholder, so every already-populated capture keeps its flat answer verbatim.
+// Shares sv_struct_tid_first's tid→name contract: a mono instance spells its stem, a
+// non-generic struct/enum spells its bare name, and the two shapes the name cannot faithfully
+// carry — a transparent newtype (a bare scalar, no aggregate) and an under-populated generic base
+// (only the flat channel holds its mono suffix) — decline so the flat channel stands.
+pub fn capture_sname(tid: Int, tp_id: Int) -> Str {
+    let flat = tp_get_sname(tp_id)
+    if flat != "" { return flat }
+    let m = cg_bind_mono_tid(tid)
+    let mono = tc_tid_struct_mono_name(m)
+    if mono != "" { return mono }
+    let nm = tc_tid_struct(m)
+    if nm != "" && is_transparent_newtype(nm) == 0 && struct_def_is_generic(nm) == 0 { return nm }
+    ""
+}
+
+pub fn capture_ct(tid: Int, tp_id: Int) -> Int {
+    let flat = tp_get_kind(tp_id)
+    if flat != CT_VOID { return flat }
+    // A named struct or data enum binder boxes as a by-value aggregate (a data enum lowers to a C
+    // struct); a transparent newtype declines above and stays a scalar, never mis-boxed as CT_STRUCT.
+    if capture_sname(tid, tp_id) != "" { return CT_STRUCT }
+    flat
+}
+
 pub fn capture_cast_expr(idx: Int) -> Str {
-    let ct = tp_get_kind(closure_captures.get(cg_closure_cap_start + idx).unwrap().tp_id)
+    let cap_e0 = closure_captures.get(cg_closure_cap_start + idx).unwrap()
+    let ct = capture_ct(cap_e0.tid, cap_e0.tp_id)
     if ct == CT_INT {
         "(int64_t)(intptr_t)blink_closure_get_capture(__self, {idx})"
     } else if ct == CT_I8 {
@@ -2248,7 +2278,7 @@ pub fn capture_cast_expr(idx: Int) -> Str {
     } else if ct == CT_CLOSURE {
         "(blink_closure*)blink_closure_get_capture(__self, {idx})"
     } else if ct == CT_STRUCT {
-        let sname = tp_get_sname(closure_captures.get(cg_closure_cap_start + idx).unwrap().tp_id)
+        let sname = capture_sname(cap_e0.tid, cap_e0.tp_id)
         if sname != "" {
             "(*(({c_type_c_name(sname)}*)blink_closure_get_capture(__self, {idx})))"
         } else {
@@ -3933,7 +3963,9 @@ pub fn stamp_whole_binder_from_tid(mtid: Int, var_name: Str, is_mut: Int) -> Boo
     let sname = tc_tid_struct(mtid)
     if sname != "" {
         set_var(var_name, CT_VOID, is_mut)
-        set_var_struct(var_name, sname)
+        // The tid is the authoritative name channel: sv_struct_tid_first spells this binder's
+        // struct/enum name from it, so a whole-binder needs no flat sname write.
+        set_var_ty(var_name, mtid)
         // A data enum reaches here only when the scrutinee's enum name was not already in hand;
         // the binder still needs its variant registration to match on.
         if is_data_enum(sname) != 0 {
@@ -5424,19 +5456,20 @@ pub fn set_var_struct(name: Str, type_name: Str) {
     push_scope_var(ScopeVar { erased: 0, name: name, ctype: CT_VOID, is_mut: 0, inner1: -1, inner2: -1, sname: type_name, sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_VOID, -1, -1, type_name) })
 }
 
-// A scope var's struct name, read tid-first — the authoritative channel — but the tid is
-// trusted ONLY for a fully-instantiated generic mono instance (Inner_0Int, Tree_0Int). That
-// mono C name is the one spelling the flat sname cannot beat, and is byte-identical to what
-// the def side emits (tc_tid_struct_mono_name mirrors mangle_generic_name). Everything else
-// defers to the flat sname: a non-generic struct/enum (sname holds the same name), a
-// payloadless enum or the transparent Errno newtype (no C struct — both have params_count 0,
-// so mono_name is already ""), and a generic instance whose tid still lacks its args (the
-// population gap — sname holds the mono C name until tid population lands). Naming the bare
-// base here would spell that under-populated generic as `Inner`, dropping the `_0Int` the
-// field-type substitution needs.
+// A scope var's struct name, read tid-first — the authoritative channel. A fully-instantiated
+// generic mono instance (Inner_0Int, Tree_0Int) is spelled from tc_tid_struct_mono_name, which
+// is byte-matched to the def side's mangle_generic_name. A non-generic struct or data/payloadless
+// enum names itself from tc_tid_struct — the same name the C type carries. The transparent Errno
+// newtype is the one Struct/Enum tid that lowers to a bare scalar, so it must NOT name a struct
+// here. The flat sname remains the fallback for a var whose tid is still unpopulated (the
+// population gap) or names a shape the tid cannot yet spell (a generic instance without its args,
+// which mono_name declines and tc_tid_struct would wrongly spell as the bare base).
 fn sv_struct_tid_first(sv: ScopeVar) -> Str {
-    let from_tid = tc_tid_struct_mono_name(cg_bind_mono_tid(sv.ty))
-    if from_tid != "" { return from_tid }
+    let m = cg_bind_mono_tid(sv.ty)
+    let mono = tc_tid_struct_mono_name(m)
+    if mono != "" { return mono }
+    let nm = tc_tid_struct(m)
+    if nm != "" && is_transparent_newtype(nm) == 0 && struct_def_is_generic(nm) == 0 { return nm }
     sv.sname
 }
 
@@ -6147,6 +6180,19 @@ pub fn find_type_def_node(name: Str) -> Int {
         i = i + 1
     }
     -1
+}
+
+// Does the struct/enum DEFINITION declare type parameters? A generic base whose tid carries no
+// args (the population gap) is indistinguishable from a non-generic type by mono-name alone —
+// both decline — so a tid-first name reader must consult the def to know it may NOT spell the
+// bare base (Inner) where only the flat channel holds the mono name (Inner_0Int).
+pub fn struct_def_is_generic(name: Str) -> Int {
+    let td = find_type_def_node(name)
+    if td == -1 { return 0 }
+    let tp = node_type_params(td)
+    if tp == -1 { return 0 }
+    if sublist_length(tp) > 0 { return 1 }
+    0
 }
 
 // Build a mono struct name from a generic-struct type annotation.

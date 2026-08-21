@@ -108,3 +108,55 @@ test "a Result with a transparent-newtype error arm round-trips both sides" {
     assert_eq(a, 7)
     assert_eq(b, 13)
 }
+
+// ── as-pattern WHOLE binders → tid is the SOLE name channel ─────────────────────────────
+// stamp_whole_binder_from_tid's struct/enum branch stamps only the tid (no flat sname). The
+// binder's method dispatch (struct) and scrutinee resolution (enum) must therefore read the
+// name back from the tid — so these fail to compile if the tid-first reader ever regresses to
+// a flat-only channel for a non-generic struct/enum.
+type Wrap {
+    One(Point)
+    Two(Int)
+}
+
+type Nested {
+    Inner(Shape)
+    Other(Int)
+}
+
+test "an as-pattern struct binder dispatches its method through the tid" {
+    let w = Wrap.One(Point { x: 5, y: 6 })
+    let r = match w {
+        Wrap.One(p as Point) => p.sum()
+        Wrap.Two(n) => n
+    }
+    assert_eq(r, 11)
+}
+
+test "an as-pattern enum binder resolves its scrutinee through the tid" {
+    let n = Nested.Inner(Shape.Square(8))
+    let r = match n {
+        Nested.Inner(s as Shape) => match s {
+            Shape.Circle(x) => x
+            Shape.Square(y) => y
+        }
+        Nested.Other(k) => k
+    }
+    assert_eq(r, 8)
+}
+
+// ── an as-pattern struct binder CAPTURED in a closure → tid drives the capture boxing ─────
+// The tid-only binder (stamp_whole_binder writes no flat sname) is boxed by value into the
+// closure and rehydrated inside the body. That boxing/rehydration reads the value's kind and
+// struct name, which for this binder can only come from the tid (capture_ct/capture_sname) — a
+// flat-only read finds the CT_VOID placeholder and the capture falls to a void* passthrough:
+// broken C (a struct member on a non-struct). The closure is returned and called OUTSIDE the arm
+// to keep the test on the capture path, clear of an unrelated block-tail-closure-call defect.
+test "a captured as-pattern struct binder boxes and rehydrates through the tid" {
+    let w = Wrap.One(Point { x: 5, y: 6 })
+    let g = match w {
+        Wrap.One(p as Point) => fn() -> Int { p.x + p.y }
+        Wrap.Two(n) => fn() -> Int { n }
+    }
+    assert_eq(g(), 11)
+}
