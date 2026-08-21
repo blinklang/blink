@@ -12230,7 +12230,20 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             if tail != -1 && node_kind(tail) != NodeKind.Return {
                 let tail_val = tc_block_tail_value(tail)
                 if tail_val != -1 {
-                    tc_check_returned_value(infer_type(tail_val), tail_val)
+                    // The tail is walked (and memoized) above, in scope, before this runs. infer_type
+                    // re-types it out of scope, so a tail whose value names a block-local — an `if`
+                    // built from per-branch `let`s — reads UNKNOWN and the declared-return compare
+                    // goes silent. Recover the in-scope answer the same way the LetBinding arm does,
+                    // and for the same reason the IfExpr walk publishes it: an `if`/`match` in a
+                    // block-`let` was already covered, the fn tail was the one consumer that was not.
+                    let mut tail_t = infer_type(tail_val)
+                    if tail_t == TYPE_UNKNOWN || tc_tid_has_unknown(tail_t) != 0 {
+                        let memo = tc_scoped_value_memo(tail_val, 0)
+                        if memo >= 0 && memo != TYPE_UNKNOWN {
+                            tail_t = if tail_t == TYPE_UNKNOWN { memo } else { tc_tid_fill_unknowns(tail_t, memo) }
+                        }
+                    }
+                    tc_check_returned_value(tail_t, tail_val)
                 }
             }
         }
@@ -12475,6 +12488,21 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         }
         tc_check_body(node_then_body(node))
         tc_check_body(node_else_body(node))
+        // The branch bodies were walked — and memoized — inside their own block scopes, so an
+        // `if` whose branch tail names a block-local `let` memoized TYPE_UNKNOWN for the `if` as
+        // a whole. The answers exist now; read them back here at the `if`, exactly as the
+        // MatchExpr arm does for its arms. Recovery only — gated on the node having no answer of
+        // its own, and tc_publish_node_tid refuses an UNKNOWN, so a genuinely void `if` is a
+        // no-op. Two-branch forms ONLY: an else-less `if` whose value is discarded is a statement
+        // that codegen lowers without a result temp (emit_if_expr's else==-1 && tid<0 fast path);
+        // publishing a tid there would defeat that and resurrect a dead temp. A consumed else-less
+        // if-tail keeps its own publish path, unaffected here.
+        if node_else_body(node) != -1 {
+            let own_tid = tc_lookup_node_tid(node)
+            if own_tid < 0 || own_tid == TYPE_UNKNOWN {
+                tc_publish_node_tid(node, tc_scoped_value_memo(node, 0))
+            }
+        }
         return
     }
 

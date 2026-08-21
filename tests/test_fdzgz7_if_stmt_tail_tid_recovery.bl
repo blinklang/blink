@@ -1,0 +1,198 @@
+import compile_test_helpers
+
+// br fdzgz7 — a statement-position `if`-as-value whose branch tails name block-locals had no
+// recovered tid, in TWO consumer positions that the wnbsen/bfq7nf recovery never reached.
+//
+// tc_check_body's IfExpr arm (src/typecheck.bl:12471) walks both branch bodies but — unlike its
+// MatchExpr sibling (typecheck.bl:12559-12562) — never publishes the `if` node's own tid from
+// the memos the walk just wrote. And the fn-body tail-return check (typecheck.bl:12233) types the
+// tail with a FRESH `infer_type`, which runs after the branch scopes are popped, so a branch
+// value built from a block-local reads UNKNOWN. UNKNOWN unifies with anything, so both consumers
+// go silent.
+//
+// FACET A — fn-body tail-return compare, a SILENT fail-open reproduced by a program:
+//
+//     fn label(c: Bool) -> Int { if c { let p = "v"  p.concat("-a") } else { .. } }
+//
+//   `blink check` clean, then `C compilation failed` (a char* laundered into an Int return).
+//   The let-RHS form (wnbsen) IS caught; this fn-tail form was not, because the return check
+//   re-infers out of scope instead of reading the memo the walk wrote.
+//
+// FACET B — the codegen tid decline that blocks the tid-sole-authority gate: the INNER `if` of
+//
+//     let r = if c { x } else { let flat = "f"  let spelled = x  if spelled != "" { spelled } else { flat } }
+//
+//   never gets its tid published, so codegen's if.result reads `ty=?` and falls back to the flat
+//   channel. Runtime is correct today ONLY because that flat channel exists — the value the tid
+//   half must carry once the flat channel is deleted. Pinned here as a run row: the fix must add
+//   the missing tid without changing one runtime answer (bfq7nf's rule).
+//
+// The axis is the CONSUMER, not the tail kind: a `match` in either position was already covered.
+
+// ── FACET A: the declared-return compare (the RED rows) ──────────────────────────────
+
+test "a fn-tail if with a then-branch block-local declared Int is rejected" {
+    let mut s = "fn label(c: Bool) -> Int \{\n"
+    s = s.concat("    if c \{\n")
+    s = s.concat("        let p = \"v\"\n")
+    s = s.concat("        p.concat(\"-a\")\n")
+    s = s.concat("    } else \{\n")
+    s = s.concat("        \"b\"\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = label(true) }\n")
+    compile_test_helpers.expect_compile_error(s, "fdzgz7_then_local", "TypeError")
+}
+
+test "a fn-tail if with block-locals in BOTH branches declared Int is rejected" {
+    let mut s = "fn label(c: Bool) -> Int \{\n"
+    s = s.concat("    if c \{\n")
+    s = s.concat("        let p = \"v\"\n")
+    s = s.concat("        p.concat(\"-a\")\n")
+    s = s.concat("    } else \{\n")
+    s = s.concat("        let q = \"w\"\n")
+    s = s.concat("        q.concat(\"-b\")\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = label(true) }\n")
+    compile_test_helpers.expect_compile_error(s, "fdzgz7_both_local", "TypeError")
+}
+
+test "a fn-tail else-if chain built from block-locals declared Int is rejected" {
+    let mut s = "fn label(n: Int) -> Int \{\n"
+    s = s.concat("    if n == 0 \{\n")
+    s = s.concat("        let p = \"v\"\n")
+    s = s.concat("        p.concat(\"-a\")\n")
+    s = s.concat("    } else if n == 1 \{\n")
+    s = s.concat("        let q = \"w\"\n")
+    s = s.concat("        q.concat(\"-b\")\n")
+    s = s.concat("    } else \{\n")
+    s = s.concat("        let r = \"x\"\n")
+    s = s.concat("        r.concat(\"-c\")\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = label(2) }\n")
+    compile_test_helpers.expect_compile_error(s, "fdzgz7_elseif", "TypeError")
+}
+
+test "a fn-tail if with a block-local passed to an Int parameter is rejected" {
+    let mut s = "fn takes_int(n: Int) -> Int \{ n + 1 }\n"
+    s = s.concat("fn label(c: Bool) -> Int \{\n")
+    s = s.concat("    let s = if c \{\n")
+    s = s.concat("        let p = \"v\"\n")
+    s = s.concat("        p.concat(\"-a\")\n")
+    s = s.concat("    } else \{\n")
+    s = s.concat("        let q = \"w\"\n")
+    s = s.concat("        q.concat(\"-b\")\n")
+    s = s.concat("    }\n")
+    s = s.concat("    takes_int(s)\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = label(true) }\n")
+    compile_test_helpers.expect_compile_error(s, "fdzgz7_arg_int", "TypeError")
+}
+
+// ── Monotonicity: the fix must not go silent the other way ────────────────────────────
+
+test "a fn-tail if of Int built from a block-local declared Str is still rejected" {
+    let mut s = "fn label(c: Bool) -> Str \{\n"
+    s = s.concat("    if c \{\n")
+    s = s.concat("        let p = 5\n")
+    s = s.concat("        p + 1\n")
+    s = s.concat("    } else \{\n")
+    s = s.concat("        let q = 6\n")
+    s = s.concat("        q + 2\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = label(true) }\n")
+    compile_test_helpers.expect_compile_error(s, "fdzgz7_int_decl_str", "TypeError")
+}
+
+// ── Controls: the shapes that already resolved must keep resolving ────────────────────
+
+test "a fn-tail if whose value comes from an OUTER-scope local was always caught" {
+    let mut s = "fn label(c: Bool) -> Int \{\n"
+    s = s.concat("    let p = \"v\"\n")
+    s = s.concat("    if c \{ p.concat(\"-a\") } else \{ p.concat(\"-b\") }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = label(true) }\n")
+    compile_test_helpers.expect_compile_error(s, "fdzgz7_ctl_outer", "TypeError")
+}
+
+test "the let-RHS form was already caught by the wnbsen recovery" {
+    let mut s = "fn label(c: Bool) -> Int \{\n"
+    s = s.concat("    let bad = \{\n")
+    s = s.concat("        let p = \"v\"\n")
+    s = s.concat("        if c \{ p.concat(\"-a\") } else \{ p.concat(\"-b\") }\n")
+    s = s.concat("    }\n")
+    s = s.concat("    bad\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = label(true) }\n")
+    compile_test_helpers.expect_compile_error(s, "fdzgz7_ctl_letrhs", "TypeError")
+}
+
+// ── The runtime pins: the fix must not change one answer ──────────────────────────────
+//
+// Written directly into the corpus so the ctypediv/tydiv instrument sees them
+// (feedback_corpus_sweep_is_not_coverage), and asserted with Str-only methods so the tid the
+// recovery adds has to be right for these to hold.
+
+test "a correct fn-tail if built from per-branch block-locals still runs" {
+    let mut s = "fn pick(c: Bool) -> Str \{\n"
+    s = s.concat("    if c \{\n")
+    s = s.concat("        let p = \"v\"\n")
+    s = s.concat("        p.concat(\"-a\")\n")
+    s = s.concat("    } else \{\n")
+    s = s.concat("        let q = \"w\"\n")
+    s = s.concat("        q.concat(\"-b\")\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    io.println(pick(true))\n")
+    s = s.concat("    io.println(pick(false))\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "fdzgz7_run_fn_tail")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "v-a\nw-b")
+}
+
+// FACET B: the nested if — the inner `if` is a block tail naming block-locals `spelled`/`flat`,
+// nested in the else-branch of an outer `if` that is itself a let RHS. This is the compiler-source
+// shape (src/codegen_stmt.bl) whose inner if declined the ctypediv gate.
+test "a nested block-tail if built from block-locals still runs" {
+    let mut s = "fn pick(c: Bool, x: Str) -> Str \{\n"
+    s = s.concat("    let r = if c \{\n")
+    s = s.concat("        x.concat(\"!\")\n")
+    s = s.concat("    } else \{\n")
+    s = s.concat("        let flat = \"flatval\"\n")
+    s = s.concat("        let spelled = x\n")
+    s = s.concat("        if spelled != \"\" \{ spelled } else \{ flat }\n")
+    s = s.concat("    }\n")
+    s = s.concat("    r\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    io.println(pick(true, \"hi\"))\n")
+    s = s.concat("    io.println(pick(false, \"yo\"))\n")
+    s = s.concat("    io.println(pick(false, \"\"))\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "fdzgz7_run_nested")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "hi!\nyo\nflatval")
+}
+
+// A branch whose OWN block-local is Int-valued was never affected: `p + 1` on an unknown `p`
+// still infers Int, so this row pins that the family needs a value typed FROM the block-local.
+test "an Int-valued fn-tail if from a block-local still runs" {
+    let mut s = "fn pick(c: Bool) -> Int \{\n"
+    s = s.concat("    if c \{\n")
+    s = s.concat("        let p = 5\n")
+    s = s.concat("        p + 1\n")
+    s = s.concat("    } else \{\n")
+    s = s.concat("        let q = 6\n")
+    s = s.concat("        q + 2\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ io.println(\"\{pick(true)}\") }\n")
+    let r = compile_test_helpers.compile_and_run(s, "fdzgz7_run_int")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "6")
+}
