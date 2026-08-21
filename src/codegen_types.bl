@@ -1580,6 +1580,8 @@ type ScopeVar {
 // ScopeVar fields it replaces). Fields are added as each flat scratch channel is migrated here.
 type ScopeVarScratch {
     opt_erased: Int        // CT_OPTION: physical ptr-erasure bit (blink_Option_ptr carrier)
+    ptr_struct: Str        // CT_PTR: @ffi.struct typedef name the pointer points to (or "")
+    ptr_is_array: Int      // CT_PTR: 1 for scope.alloc_n[T](n), 0 for a singleton
 }
 
 // Bridge: compute tp pool ID from CT_* flat fields
@@ -1644,7 +1646,7 @@ pub let mut scope_frame_starts: List[Int] = []
 pub let mut scope_var_scratch: List[ScopeVarScratch] = []
 
 fn scratch_default() -> ScopeVarScratch {
-    ScopeVarScratch { opt_erased: 0 }
+    ScopeVarScratch { opt_erased: 0, ptr_struct: "", ptr_is_array: 0 }
 }
 // Per-ctype counts of entries currently in scope_vars. Lets the get_sv_*
 // helpers and get_var_alias short-circuit when zero (the common case for
@@ -1708,43 +1710,17 @@ fn find_scope_var(name: Str) -> Int {
     -1
 }
 
-// ScopeVar.extra encoding for CT_PTR vars: "struct|arr|origin"
-//   struct: @ffi.struct typedef name (or "")
-//   arr:    "n" for scope.alloc_n[T](n), "" for singleton
-//   origin: name of the `with ffi.scope() as <name>` binding the Ptr came from
-//           ("" when unknown -- e.g. parameter, scope.take(p), non-Ident receiver).
-// Backward-compatible: older two-field "struct|n" parses with origin "".
+// CT_PTR scratch (ptr_struct, ptr_is_array) lives in scope_var_scratch:
+//   ptr_struct: @ffi.struct typedef name the pointer points to (or "")
+//   ptr_is_array: 1 for scope.alloc_n[T](n), 0 for a singleton
 
-fn ffi_ptr_field(extra: Str, idx: Int) -> Str {
-    // Hand-rolled split-by-pipe: avoids List allocation in a hot codegen path.
-    // Returns "" for out-of-range index. Matches Str.split("|") semantics.
-    let mut start = 0
-    let mut field = 0
-    let len = extra.len()
-    let mut i = 0
-    while i < len {
-        if extra.byte_at(i) == 124 { // '|'
-            if field == idx {
-                return extra.substring(start, i - start)
-            }
-            field = field + 1
-            start = i + 1
-        }
-        i = i + 1
-    }
-    if field == idx {
-        return extra.substring(start, len - start)
-    }
-    ""
-}
-
-pub fn set_var_ffi_ptr_extra(name: Str, struct_name: Str, arr: Str, origin: Str) {
-    let encoded = "{struct_name}|{arr}|{origin}"
+pub fn set_var_ffi_ptr_extra(name: Str, struct_name: Str, is_array: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_PTR {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: encoded, ty: sv.ty, tp_id: sv.tp_id })
+            let s = scope_var_scratch.get(i).unwrap()
+            scope_var_scratch.set(i, ScopeVarScratch { opt_erased: s.opt_erased, ptr_struct: struct_name, ptr_is_array: is_array })
             return
         }
         i = i - 1
@@ -1756,9 +1732,8 @@ pub fn set_var_ffi_ptr_struct(name: Str, struct_name: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_PTR {
-            let arr = ffi_ptr_field(sv.extra, 1)
-            let origin = ffi_ptr_field(sv.extra, 2)
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: "{struct_name}|{arr}|{origin}", ty: sv.ty, tp_id: sv.tp_id })
+            let s = scope_var_scratch.get(i).unwrap()
+            scope_var_scratch.set(i, ScopeVarScratch { opt_erased: s.opt_erased, ptr_struct: struct_name, ptr_is_array: s.ptr_is_array })
             return
         }
         i = i - 1
@@ -1770,7 +1745,7 @@ pub fn get_var_ffi_ptr_struct(name: Str) -> Str {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_PTR {
-            return ffi_ptr_field(sv.extra, 0)
+            return scope_var_scratch.get(i).unwrap().ptr_struct
         }
         i = i - 1
     }
@@ -1782,9 +1757,8 @@ pub fn set_var_ffi_ptr_array(name: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_PTR {
-            let struct_name = ffi_ptr_field(sv.extra, 0)
-            let origin = ffi_ptr_field(sv.extra, 2)
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: "{struct_name}|n|{origin}", ty: sv.ty, tp_id: sv.tp_id })
+            let s = scope_var_scratch.get(i).unwrap()
+            scope_var_scratch.set(i, ScopeVarScratch { opt_erased: s.opt_erased, ptr_struct: s.ptr_struct, ptr_is_array: 1 })
             return
         }
         i = i - 1
@@ -1796,8 +1770,7 @@ pub fn is_ffi_ptr_array_var(name: Str) -> Int {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_PTR {
-            if ffi_ptr_field(sv.extra, 1) == "n" { return 1 }
-            return 0
+            return scope_var_scratch.get(i).unwrap().ptr_is_array
         }
         i = i - 1
     }
@@ -8276,7 +8249,8 @@ pub fn set_var_option_erased(name: Str, e: Int) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_OPTION {
-            scope_var_scratch.set(i, ScopeVarScratch { opt_erased: e })
+            let s = scope_var_scratch.get(i).unwrap()
+            scope_var_scratch.set(i, ScopeVarScratch { opt_erased: e, ptr_struct: s.ptr_struct, ptr_is_array: s.ptr_is_array })
             return
         }
         i = i - 1
