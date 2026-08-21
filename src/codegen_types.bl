@@ -1582,6 +1582,7 @@ type ScopeVarScratch {
     opt_erased: Int        // CT_OPTION: physical ptr-erasure bit (blink_Option_ptr carrier)
     ptr_struct: Str        // CT_PTR: @ffi.struct typedef name the pointer points to (or "")
     ptr_is_array: Int      // CT_PTR: 1 for scope.alloc_n[T](n), 0 for a singleton
+    iter_next_fn: Str      // CT_ITERATOR: emitted C name of the source's next() thunk
 }
 
 // Bridge: compute tp pool ID from CT_* flat fields
@@ -1646,7 +1647,7 @@ pub let mut scope_frame_starts: List[Int] = []
 pub let mut scope_var_scratch: List[ScopeVarScratch] = []
 
 fn scratch_default() -> ScopeVarScratch {
-    ScopeVarScratch { opt_erased: 0, ptr_struct: "", ptr_is_array: 0 }
+    ScopeVarScratch { opt_erased: 0, ptr_struct: "", ptr_is_array: 0, iter_next_fn: "" }
 }
 // Per-ctype counts of entries currently in scope_vars. Lets the get_sv_*
 // helpers and get_var_alias short-circuit when zero (the common case for
@@ -1720,7 +1721,7 @@ pub fn set_var_ffi_ptr_extra(name: Str, struct_name: Str, is_array: Int) {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_PTR {
             let s = scope_var_scratch.get(i).unwrap()
-            scope_var_scratch.set(i, ScopeVarScratch { opt_erased: s.opt_erased, ptr_struct: struct_name, ptr_is_array: is_array })
+            scope_var_scratch.set(i, ScopeVarScratch { opt_erased: s.opt_erased, ptr_struct: struct_name, ptr_is_array: is_array, iter_next_fn: s.iter_next_fn })
             return
         }
         i = i - 1
@@ -1733,7 +1734,7 @@ pub fn set_var_ffi_ptr_struct(name: Str, struct_name: Str) {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_PTR {
             let s = scope_var_scratch.get(i).unwrap()
-            scope_var_scratch.set(i, ScopeVarScratch { opt_erased: s.opt_erased, ptr_struct: struct_name, ptr_is_array: s.ptr_is_array })
+            scope_var_scratch.set(i, ScopeVarScratch { opt_erased: s.opt_erased, ptr_struct: struct_name, ptr_is_array: s.ptr_is_array, iter_next_fn: s.iter_next_fn })
             return
         }
         i = i - 1
@@ -1758,7 +1759,7 @@ pub fn set_var_ffi_ptr_array(name: Str) {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_PTR {
             let s = scope_var_scratch.get(i).unwrap()
-            scope_var_scratch.set(i, ScopeVarScratch { opt_erased: s.opt_erased, ptr_struct: s.ptr_struct, ptr_is_array: 1 })
+            scope_var_scratch.set(i, ScopeVarScratch { opt_erased: s.opt_erased, ptr_struct: s.ptr_struct, ptr_is_array: 1, iter_next_fn: s.iter_next_fn })
             return
         }
         i = i - 1
@@ -8250,7 +8251,7 @@ pub fn set_var_option_erased(name: Str, e: Int) {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_OPTION {
             let s = scope_var_scratch.get(i).unwrap()
-            scope_var_scratch.set(i, ScopeVarScratch { opt_erased: e, ptr_struct: s.ptr_struct, ptr_is_array: s.ptr_is_array })
+            scope_var_scratch.set(i, ScopeVarScratch { opt_erased: e, ptr_struct: s.ptr_struct, ptr_is_array: s.ptr_is_array, iter_next_fn: s.iter_next_fn })
             return
         }
         i = i - 1
@@ -8488,12 +8489,17 @@ pub fn set_var_iterator(name: Str, inner: Int, next_fn: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_ITERATOR {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: next_fn, ty: sv.ty, tp_id: sv_tp(sv.ctype, inner, sv.inner2, sv.sname) })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: "", ty: sv.ty, tp_id: sv_tp(sv.ctype, inner, sv.inner2, sv.sname) })
+            let s = scope_var_scratch.get(i).unwrap()
+            scope_var_scratch.set(i, ScopeVarScratch { opt_erased: s.opt_erased, ptr_struct: s.ptr_struct, ptr_is_array: s.ptr_is_array, iter_next_fn: next_fn })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_ITERATOR, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: next_fn, ty: -1, tp_id: sv_tp(CT_ITERATOR, inner, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_ITERATOR, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_ITERATOR, inner, -1, "") })
+    let ni = scope_vars.len() - 1
+    let ns = scope_var_scratch.get(ni).unwrap()
+    scope_var_scratch.set(ni, ScopeVarScratch { opt_erased: ns.opt_erased, ptr_struct: ns.ptr_struct, ptr_is_array: ns.ptr_is_array, iter_next_fn: next_fn })
 }
 
 pub fn get_var_iterator_inner(name: Str) -> Int {
@@ -8501,7 +8507,26 @@ pub fn get_var_iterator_inner(name: Str) -> Int {
 }
 
 pub fn get_var_iter_next_fn(name: Str) -> Str {
-    get_sv_extra(name, CT_ITERATOR)
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_ITERATOR {
+            return scope_var_scratch.get(i).unwrap().iter_next_fn
+        }
+        i = i - 1
+    }
+    let blink_name = c_blink_name(name)
+    if blink_name != name {
+        i = scope_vars.len() - 1
+        while i >= 0 {
+            let sv = scope_vars.get(i).unwrap()
+            if sv.name == blink_name && tp_get_kind(sv.tp_id) == CT_ITERATOR {
+                return scope_var_scratch.get(i).unwrap().iter_next_fn
+            }
+            i = i - 1
+        }
+    }
+    ""
 }
 
 // An adapter over a List[compound] source keys its typedef on the carrier
