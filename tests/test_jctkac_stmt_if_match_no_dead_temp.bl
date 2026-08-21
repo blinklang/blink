@@ -1,0 +1,140 @@
+// jctkac — a statement-position `if`/`match` (value discarded) must emit NO result temp.
+//
+// THIS TEST ASSERTS ON EMITTED C, DELIBERATELY. The defect is not a miscompile: a dead
+// result temp (`int64_t _if_0; if (c) { return 1; }` then a `(void)_if_0;`, or a
+// `blink_<ret> _match_0;` fabricated from the enclosing fn's return type) is harmless at
+// runtime — C leaves it unread and the program computes the right answer. So a test that
+// RUNS the program cannot fail either way; the emitted C is the only place the defect lives.
+// Same honest shape as tests/test_0rmamy_enum_local_decl_typedef.bl.
+//
+// WHY IT MATTERS. Per §2.9 an `if` without `else` never yields a value, and a `match` whose
+// value is discarded is a statement — both have type `()`. The node's ty_pool tid is
+// correctly left unpublished for these; the fabricated temp comes from the flat channel
+// (`c_type_str(then_type)` / `get_fn_ret_struct`) guessing a type the construct does not
+// have. Removing it is the tid-sole-authority thesis in miniature: no value → no temp.
+//
+// The VALUE-position rows are the regression guard: an `if/else` and a `match` whose value
+// IS used must keep declaring their result temp, or the fix would have thrown away a live
+// value. Those rows are green before and after; the statement rows go green only with the fix.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import codegen.{generate}
+import std.io
+import codegen_expr
+
+// One probe program so every row is a single compile and the rows cannot drift apart.
+// Each probe fn carries a distinctive name so its emitted C body can be located and read
+// in isolation — the temp indices are global and unpredictable, so a whole-C substring
+// check would collide with stdlib functions that legitimately declare `_if_`/`_match_`.
+fn probe_src() -> Str {
+    let mut s = ""
+    // Else-less `if` as the TAIL of a match arm, inside a statement-position match: the arm
+    // value is emitted via emit_if_expr. The then-branch diverges (`return`), so before the
+    // fix the pre-pass fabricated a result temp from the returned type and left a dead
+    // `_if_N = 0;` after the unreachable return.
+    s = s.concat("fn armtailif(o: Option[Str]) -> Str \{\n    match o \{\n        Some(p) => \{\n            if p != \"\" \{ return p }\n        }\n        None => \{}\n    }\n    \"default\"\n}\n")
+    // Statement `match` in a STRUCT-returning fn: value discarded, arms diverge or are empty.
+    // Before the fix get_fn_ret_struct leaked the enclosing fn's return struct as a dead temp.
+    s = s.concat("type Box \{ v: Int }\n")
+    s = s.concat("fn findbox(o: Option[Box]) -> Box \{\n    match o \{\n        Some(b) => return b\n        None => \{}\n    }\n    Box \{ v: 0 }\n}\n")
+    // Value `if/else`: the temp MUST survive (regression guard).
+    s = s.concat("fn valif(c: Bool) -> Int \{\n    let vv = if c \{ 10 } else \{ 20 }\n    vv\n}\n")
+    // Value `match`: the temp MUST survive (regression guard).
+    s = s.concat("fn valmatch(n: Int) -> Int \{\n    let vm = match n \{\n        0 => 100\n        _ => 200\n    }\n    vm\n}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    io.println(\"\{armtailif(Some(\\\"x\\\"))} \{findbox(Some(Box\{v:5})).v} \{valif(true)} \{valmatch(0)}\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+// `generate` may be called exactly once per process (it debug_asserts cg_lines is empty on
+// entry and never clears it on exit), so cache the emitted C across rows.
+let mut probe_c = ""
+
+fn emitted_c() -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, FS.Delete {
+    if probe_c != "" { return probe_c }
+    let path = "build/jctkac_stmt_if_match_probe.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let c = generate(program)
+    let _ = fs.delete(path)
+    probe_c = c
+    c
+}
+
+// Return the brace-matched C body of the function whose definition line contains `marker`.
+// The emitted C opens each function's brace on the signature line (`... name(...) {`), so the
+// definition is the line that contains the marker AND ends with `{`; from there we count
+// braces to the matching close. A call site never ends its line with `{`, so it is skipped.
+fn fn_c_body(c: Str, marker: Str) -> Str {
+    let ls = c.lines()
+    let mut i = 0
+    let mut start = 0 - 1
+    while i < ls.len() {
+        let line = ls.get(i).unwrap()
+        if line.contains(marker) && line.trim().ends_with("\{") {
+            start = i
+            i = ls.len()
+        } else {
+            i = i + 1
+        }
+    }
+    if start < 0 { return "" }
+    let mut depth = 0
+    let mut out = ""
+    let mut j = start
+    let mut done = 0
+    while j < ls.len() && done == 0 {
+        let line = ls.get(j).unwrap()
+        out = out.concat(line).concat("\n")
+        let mut k = 0
+        while k < line.len() {
+            let ch = line.slice(k, k + 1)
+            if ch == "\{" { depth = depth + 1 }
+            if ch == "\}" {
+                depth = depth - 1
+                if depth == 0 { done = 1 }
+            }
+            k = k + 1
+        }
+        j = j + 1
+    }
+    out
+}
+
+test "an else-less if at a match-arm tail emits no result temp" {
+    let c = emitted_c()
+    let body = fn_c_body(c, "_armtailif(")
+    if body == "" { io.println("FAIL: could not locate armtailif in emitted C") }
+    assert(body != "")
+    if body.contains("_if_") { io.println("FAIL: armtailif still declares an if result temp:\n{body}") }
+    assert(!body.contains("_if_"))
+}
+
+test "a statement match in a struct-returning fn emits no result temp" {
+    let c = emitted_c()
+    let body = fn_c_body(c, "_findbox(")
+    if body == "" { io.println("FAIL: could not locate findbox in emitted C") }
+    assert(body != "")
+    if body.contains("_match_") { io.println("FAIL: findbox still declares a match result temp:\n{body}") }
+    assert(!body.contains("_match_"))
+}
+
+test "a value-position if/else still declares its result temp" {
+    let c = emitted_c()
+    let body = fn_c_body(c, "_valif(")
+    assert(body != "")
+    if !body.contains("_if_") { io.println("FAIL: valif lost its if result temp:\n{body}") }
+    assert(body.contains("_if_"))
+}
+
+test "a value-position match still declares its result temp" {
+    let c = emitted_c()
+    let body = fn_c_body(c, "_valmatch(")
+    assert(body != "")
+    if !body.contains("_match_") { io.println("FAIL: valmatch lost its match result temp:\n{body}") }
+    assert(body.contains("_match_"))
+}

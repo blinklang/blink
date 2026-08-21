@@ -505,6 +505,18 @@ fn ct_names_kind_completely(k: TyKind) -> Int {
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
 pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    // An else-less `if` whose value is DISCARDED (unpublished node tid — no consumer memoized a
+    // type for it) is a statement of type (): emit it as one so a diverging then-branch
+    // (`if c { return X }`) can't fabricate a result temp from the returned type. An else-less `if`
+    // whose value is still consumed is left to the value path below, which preserves its type from
+    // the flat channel — rejecting that shape is §2.9's expression-context missing-else error, a
+    // typecheck concern, not codegen's to silently erase.
+    if node_else_body(node) == -1 && cg_node_mono_tid(node) < 0 {
+        emit_if_stmt(node)
+        expr_result_str = "0"
+        expr_result_type = CT_VOID
+        return
+    }
     let tmp = fresh_temp("_if_")
     let then_type = infer_block_type(node_then_body(node))
     if then_type == CT_VOID || then_type == CT_STRUCT || then_type == CT_RESULT || then_type == CT_OPTION {
@@ -1304,8 +1316,18 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
     // the pre-pass emits a struct arm whose tail is a pattern-bound ident (e.g.
     // `Ok(b) => { b }`) as CT_INT (the binding isn't typed in the throwaway
     // scope), which would otherwise mislead the harvest.
+    // A match whose value is USED has a published node tid — a consumer (let/return/arg) memoized
+    // it during typecheck. An unpublished tid means the value is discarded: a statement match. It
+    // yields no value, so it must declare no result temp; forcing the result to Void here stops the
+    // struct/flat fallbacks below from fabricating one (get_fn_ret_struct leaking the enclosing fn's
+    // return struct, or infer_arm_type's guess) from a type the match does not have.
+    let match_is_stmt = cg_node_mono_tid(node) < 0
+    if match_is_stmt {
+        result_type = CT_VOID
+    }
+
     let mut match_struct_name = ""
-    if result_type == CT_STRUCT || result_type == CT_VOID {
+    if (result_type == CT_STRUCT || result_type == CT_VOID) && match_is_stmt == 0 {
         match_struct_name = infer_arm_struct_name(first_arm)
         if match_struct_name == "" {
             match_struct_name = get_fn_ret_struct(cg_current_fn_name)
@@ -1350,7 +1372,7 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
     // CT cannot carry.
     let m_tid = cg_node_mono_tid(node)
     let mut use_tid_carrier = 0
-    if match_struct_name == "" {
+    if match_struct_name == "" && match_is_stmt == 0 {
         let m_kind = tc_tid_kind(m_tid)
         if m_kind == TyKind.Struct {
             // Deliberately not gated on pp_all_value. A struct value rides the carrier as CT_VOID,
