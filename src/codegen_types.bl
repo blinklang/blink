@@ -1579,6 +1579,16 @@ type ScopeVar {
     erased: Int
 }
 
+// Per-var codegen SCRATCH state, held in `scope_var_scratch` index-aligned with `scope_vars`
+// (row i belongs to scope_vars[i]). This is where NON-type per-var state lives so the tid
+// (`ScopeVar.ty`) can be the sole authority for a var's type: every field here is codegen state
+// that no type can spell — a physical-carrier flag, an emitted C symbol name, an adapter tag.
+// Each field names exactly one concern (no channel is reused across ctypes, unlike the flat
+// ScopeVar fields it replaces). Fields are added as each flat scratch channel is migrated here.
+type ScopeVarScratch {
+    opt_erased: Int        // CT_OPTION: physical ptr-erasure bit (blink_Option_ptr carrier)
+}
+
 // Bridge: compute tp pool ID from CT_* flat fields
 pub fn sv_tp(ctype: Int, inner1: Int, inner2: Int, sname: Str) -> Int {
     if ctype == CT_LIST {
@@ -1636,6 +1646,13 @@ pub fn sv_tp(ctype: Int, inner1: Int, inner2: Int, sname: Str) -> Int {
 }
 pub let mut scope_vars: List[ScopeVar] = []
 pub let mut scope_frame_starts: List[Int] = []
+// Index-aligned with scope_vars (same length, row i is scope_vars[i]'s scratch). Maintained
+// only in push_scope_var / pop_scope / reset_scope_state — the sole scope_vars length-mutators.
+pub let mut scope_var_scratch: List[ScopeVarScratch] = []
+
+fn scratch_default() -> ScopeVarScratch {
+    ScopeVarScratch { opt_erased: 0 }
+}
 // Per-ctype counts of entries currently in scope_vars. Lets the get_sv_*
 // helpers and get_var_alias short-circuit when zero (the common case for
 // rare ctypes like CT_CLOSURE / CT_ITERATOR / CT_HANDLE).
@@ -1666,6 +1683,7 @@ fn push_scope_var(sv: ScopeVar) {
     let idx = scope_vars.len()
     let name = sv.name
     scope_vars.push(sv)
+    scope_var_scratch.push(scratch_default())
     bump_scope_ct(sv.ctype, 1)
     match scope_name_idx.get(name) {
         Some(stack) => { stack.push(idx) }
@@ -1678,6 +1696,7 @@ fn push_scope_var(sv: ScopeVar) {
 
 pub fn reset_scope_state() {
     scope_vars.clear()
+    scope_var_scratch.clear()
     scope_frame_starts.clear()
     scope_ct_counts.clear()
     scope_name_idx.clear()
@@ -1961,6 +1980,7 @@ pub fn pop_scope() ! Codegen.Scope {
             None => {}
         }
         scope_vars.pop()
+        scope_var_scratch.pop()
     }
     let ve_start = var_enum_frame_starts.get(var_enum_frame_starts.len() - 1).unwrap()
     var_enum_frame_starts.pop()
@@ -8263,7 +8283,7 @@ pub fn set_var_option_erased(name: Str, e: Int) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_OPTION {
-            scope_vars.set(i, ScopeVar { erased: e, name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, ty: sv.ty, tp_id: sv.tp_id })
+            scope_var_scratch.set(i, ScopeVarScratch { opt_erased: e })
             return
         }
         i = i - 1
@@ -8275,7 +8295,7 @@ pub fn get_var_option_erased(name: Str) -> Int {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_OPTION {
-            return sv.erased
+            return scope_var_scratch.get(i).unwrap().opt_erased
         }
         i = i - 1
     }
@@ -8285,7 +8305,7 @@ pub fn get_var_option_erased(name: Str) -> Int {
         while i >= 0 {
             let sv = scope_vars.get(i).unwrap()
             if sv.name == blink_name && sv.ctype == CT_OPTION {
-                return sv.erased
+                return scope_var_scratch.get(i).unwrap().opt_erased
             }
             i = i - 1
         }
