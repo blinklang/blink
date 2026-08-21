@@ -1,0 +1,110 @@
+// jctkac (tid-sole-authority, stage-4 flat-field deletion). get_var_struct is the
+// highest-leverage flat-only reader of sv.sname (45 call sites). Migrating it tid-first
+// must not change one runtime answer (bfq7nf): these in-corpus fixtures exercise the
+// accessor at codegen time across the ctypes it serves, so a wrong name after the flip
+// fails to compile or prints the wrong value.
+//
+// The axis is get_var_struct's DISPATCH positions:
+//   - plain struct var + trait method        -> codegen_methods struct_type dispatch
+//   - generic struct INSTANCE + method       -> the mono-name (tc_tid_struct_mono_name) path
+//   - enum var as a match scrutinee          -> scrut_mono (codegen_stmt)
+//   - Option[Struct] / Result[Struct,_] var  -> the sname FALLBACK the tid must not disturb
+
+trait Summable {
+    fn sum(self) -> Int
+}
+
+type Point {
+    x: Int
+    y: Int
+}
+
+impl Summable for Point {
+    fn sum(self) -> Int {
+        self.x + self.y
+    }
+}
+
+type Box[T] {
+    value: T
+}
+
+fn unbox(b: Box[Int]) -> Int {
+    b.value
+}
+
+type Shape {
+    Circle(Int)
+    Square(Int)
+}
+
+// A transparent newtype: a single-Int-payload enum that lowers to a bare int64_t with NO C
+// struct. tc_tid_struct names it, but get_var_struct must return "" for a var of one — the
+// tid-first path has to defer to the flat channel here, same as the flat channel always did.
+pub type Errno {
+    Errno(Int)
+}
+
+// ── plain struct var → method dispatch reads get_var_struct(obj) ──────────────────────
+test "a plain struct var dispatches its trait method" {
+    let p = Point { x: 3, y: 4 }
+    assert_eq(p.sum(), 7)
+}
+
+test "a mutable struct var still dispatches its method" {
+    let mut p = Point { x: 10, y: 20 }
+    p = Point { x: 1, y: 2 }
+    assert_eq(p.sum(), 3)
+}
+
+// ── generic struct INSTANCE var → stamped and read through a fn boundary ───────────────
+test "a generic struct instance var round-trips its field" {
+    let b = Box { value: 21 }
+    assert_eq(unbox(b), 21)
+}
+
+// ── enum var as a match scrutinee → scrut_mono reads get_var_struct(name) ──────────────
+test "an enum var matches by variant through the scrutinee path" {
+    let s = Shape.Circle(5)
+    let area = match s {
+        Shape.Circle(r) => r * r * 3
+        Shape.Square(a) => a * a
+    }
+    assert_eq(area, 75)
+}
+
+// ── Option[Struct] var → sname FALLBACK: get_var_struct returns the INNER struct ───────
+test "an Option-of-struct var unwraps to the right struct" {
+    let o: Option[Point] = Some(Point { x: 6, y: 1 })
+    assert_eq(o.unwrap().sum(), 7)
+}
+
+// ── Result[Struct,_] var → sname FALLBACK on the ok side ───────────────────────────────
+test "a Result-of-struct var reads the ok struct" {
+    let r: Result[Point, Str] = Ok(Point { x: 2, y: 5 })
+    assert_eq(r.unwrap().sum(), 7)
+}
+
+// ── transparent newtype var → get_var_struct must NOT name it (bare int64_t, no struct) ──
+test "a transparent-newtype var round-trips as a bare scalar" {
+    let e = Errno(22)
+    let code = match e {
+        Errno(rc) => rc
+    }
+    assert_eq(code, 22)
+}
+
+test "a Result with a transparent-newtype error arm round-trips both sides" {
+    let ok: Result[Int, Errno] = Ok(7)
+    let err: Result[Int, Errno] = Err(Errno(13))
+    let a = match ok {
+        Ok(v) => v
+        Err(Errno(rc)) => rc
+    }
+    let b = match err {
+        Ok(v) => v
+        Err(Errno(rc)) => rc
+    }
+    assert_eq(a, 7)
+    assert_eq(b, 13)
+}
