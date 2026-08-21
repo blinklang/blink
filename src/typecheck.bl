@@ -2786,6 +2786,11 @@ fn tc_check_closure_body_against_own_ret(cls: Int) ! TypeCheck.Resolve, TypeChec
     let prev_fn_ret = tc_current_fn_ret
     tc_current_fn_name = "closure"
     tc_current_fn_ret = tc_closure_declared_ret(cls)
+    // codegen's expr_task_ret position reads the closure return-annotation node's tid. Publish
+    // the declared return so an annotated task closure resolves off the tid instead of the flat
+    // carrier; an unannotated closure has no annotation node and the emit site reads tc_void_tid().
+    let cls_ret_ann = node_type_ann(cls)
+    if cls_ret_ann != -1 { tc_publish_node_tid(cls_ret_ann, tc_current_fn_ret) }
     let body = node_body(cls)
     if node_kind(body) == NodeKind.Block { tc_fn_body_block = 1 }
     // Spec §3c.2: a closure body does not inherit the surrounding test-body
@@ -2893,10 +2898,29 @@ fn tc_check_handler_method(m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
         let mut i = 0
         while i < sublist_length(params_sl) {
             let p = sublist_get(params_sl, i)
-            nr_define_typed(node_name(p), 0, resolve_param_type(p))
+            let pname = node_name(p)
+            let ptid = resolve_param_type(p)
+            // Mirror tc_check_fn's param publish: lift a generic-struct/enum param to its
+            // structural instance, then publish the tid on the param node so codegen's
+            // expr_handler_param position reads it off the tid instead of the flat carrier.
+            let ann = node_type_ann(p)
+            let mut ptid_final = ptid
+            if ann != -1 {
+                let inst = tc_fnsig_param_instance_tid(ann, ptid)
+                if inst != -1 { ptid_final = inst }
+            }
+            nr_define_typed(pname, 0, ptid_final)
+            tc_publish_node_tid(p, ptid_final)
             i = i + 1
         }
     }
+    // The return twin: codegen's expr_handler_ret position reads the return-annotation node's
+    // tid. Publish the same tid the body was checked against (tc_current_fn_ret ==
+    // tc_closure_declared_ret(m), which keeps the generic-instance re-intern a hand-rolled
+    // resolve_type_ann would drop). An unannotated (void) method has no annotation node; the
+    // emit site reads tc_void_tid() for that case.
+    let ret_ann = node_type_ann(m)
+    if ret_ann != -1 { tc_publish_node_tid(ret_ann, tc_current_fn_ret) }
     if node_kind(body) == NodeKind.Block { tc_fn_body_block = 1 }
     // Same reason as the closure walker: a handler method body is its own fn context, so `?`
     // inside it gates against this method's return type and not an enclosing test block's
