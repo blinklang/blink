@@ -7,7 +7,11 @@
 //   - a for-loop over the outer list (the iteration read path)
 //   - a generic struct INSTANCE element (Box[Int]) — the mono-stem name path
 //   - a scalar inner (Int) — no nested struct, names ""
+// The recovery-path rows below (alias chain, Option.unwrap, Result.unwrap, .pop(), Set element)
+// reach the reader without relying on a prior `extra` stamp, so once the reader is tid-only the
+// nested struct name must still round-trip from the authoritative list tid alone.
 
+@derive(Hash, Eq)
 type Point {
     x: Int
     y: Int
@@ -16,6 +20,9 @@ type Point {
 type Box[T] {
     value: T
 }
+
+let GRID: List[List[Point]] = [[Point { x: 11, y: 22 }, Point { x: 33, y: 44 }]]
+let STACK: List[List[Point]] = [[Point { x: 1, y: 2 }], [Point { x: 3, y: 4 }, Point { x: 5, y: 6 }]]
 
 // ── List[List[Struct]] var → nested get + field ────────────────────────────────────────
 test "a list-of-list-of-struct var reads a nested struct field" {
@@ -46,4 +53,102 @@ test "a list-of-list-of-scalar var round-trips without a nested struct" {
     let ll: List[List[Int]] = [[11, 22], [33]]
     let row = ll.get(0).unwrap()
     assert_eq(row.get(1).unwrap(), 22)
+}
+
+// ══ recovery paths that reach the reader without a prior set ══════════════════════════════
+
+fn make_opt_nested() -> Option[List[List[Point]]] {
+    let mut ll: List[List[Point]] = [[Point { x: 1, y: 2 }, Point { x: 3, y: 4 }]]
+    Some(ll)
+}
+
+fn make_res_nested() -> Result[List[List[Point]], Str] {
+    let mut ll: List[List[Point]] = [[Point { x: 5, y: 6 }], [Point { x: 7, y: 8 }]]
+    Ok(ll)
+}
+
+// ── struct element through an unannotated alias chain, indexed .get().unwrap() ────────────
+test "List[List[Point]] keeps its nested struct element across an alias chain" {
+    let mut ll1: List[List[Point]] = [[Point { x: 10, y: 20 }, Point { x: 30, y: 40 }]]
+    let ll2 = ll1
+    let ll3 = ll2
+    let inner = ll3.get(0).unwrap()
+    let p = inner.get(1).unwrap()
+    assert_eq(p.x, 30)
+    assert_eq(p.y, 40)
+    assert_eq(inner.len(), 2)
+}
+
+// ── struct element recovered through Option.unwrap ───────────────────────────────────────
+test "List[List[Point]] recovered from Option.unwrap round-trips its nested struct" {
+    let ll = make_opt_nested().unwrap()
+    let inner = ll.get(0).unwrap()
+    let p = inner.get(0).unwrap()
+    assert_eq(p.x, 1)
+    assert_eq(p.y, 2)
+}
+
+// ── struct element recovered through Result.unwrap ───────────────────────────────────────
+test "List[List[Point]] recovered from Result.unwrap round-trips its nested struct" {
+    let ll = make_res_nested().unwrap()
+    let inner = ll.get(1).unwrap()
+    let p = inner.get(0).unwrap()
+    assert_eq(p.x, 7)
+    assert_eq(p.y, 8)
+}
+
+// ── nested struct element recovered through .pop() ───────────────────────────────────────
+test "List[List[Point]] pops its inner list keeping the struct element" {
+    let mut ll: List[List[Point]] = [[Point { x: 11, y: 22 }], [Point { x: 33, y: 44 }, Point { x: 55, y: 66 }]]
+    let popped = ll.pop().unwrap()
+    let p = popped.get(1).unwrap()
+    assert_eq(p.x, 55)
+    assert_eq(p.y, 66)
+    assert_eq(popped.len(), 2)
+}
+
+// ── Set-of-struct nested element through for-in iteration ─────────────────────────────────
+test "List[Set[Point]] iterates its nested set struct element" {
+    let mut inner_set: Set[Point] = Set()
+    inner_set.insert(Point { x: 7, y: 9 })
+    let mut ls: List[Set[Point]] = [inner_set]
+    let mut count = 0
+    for s in ls {
+        for p in s {
+            count = count + p.x + p.y
+        }
+    }
+    assert_eq(count, 16)
+}
+
+// ── Set-of-struct nested element through .get().unwrap() — load-bearing for the reader SET branch ──
+// The for-in row above is preempted by the binder-tid stamp, so .get() is the one that forces the
+// reader to name the Set's struct element from the list tid alone.
+test "List[Set[Point]] recovers its nested set struct element through .get" {
+    let mut inner_set: Set[Point] = Set()
+    inner_set.insert(Point { x: 7, y: 9 })
+    let ls: List[Set[Point]] = [inner_set]
+    let s = ls.get(0).unwrap()
+    let mut sum = 0
+    for p in s {
+        sum = sum + p.x + p.y
+    }
+    assert_eq(sum, 16)
+}
+
+// ── global List[List[Struct]] via .get() — pins the global-var read path (ty stamped for globals) ──
+test "a global list-of-list-of-struct reads its nested struct field through .get" {
+    let row = GRID.get(0).unwrap()
+    let p = row.get(1).unwrap()
+    assert_eq(p.x, 33)
+    assert_eq(p.y, 44)
+}
+
+// ── global List[List[Struct]] via .pop() — the mutable-global pop read path ───────────────
+test "a global list-of-list-of-struct pops its inner list keeping the struct element" {
+    let mut st = STACK
+    let popped = st.pop().unwrap()
+    let p = popped.get(1).unwrap()
+    assert_eq(p.x, 5)
+    assert_eq(p.y, 6)
 }
