@@ -3,7 +3,7 @@ import codegen_types.{
     CT_HANDLE, CT_HANDLER, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_INT, CT_ITERATOR, CT_LIST, CT_MAP, CT_OPTION, CT_PTR,
     CT_CHAR, CT_ENUM, CT_RESULT, CT_SET, CT_STRING, CT_STRINGBUILDER, CT_STRUCT, CT_TEMPLATE, CT_VOID,
     CarrierInfo, CaptureEntry, ClosureCapInfo, VarEnumEntry,
-    c_blink_name, c_fn_name, c_safe_name, c_type_c_name, c_type_str, c_type_tag, canonical_struct_tag, carrier_slot_ct, ct_bit_width, derive_method_cname,
+    c_blink_name, c_fn_name, c_safe_name, c_type_c_name, c_type_str, c_type_tag, canonical_struct_tag, carrier_slot_ct, cg_bind_mono_tid, ct_bit_width, derive_method_cname,
     append_ev_arg, capture_cast_expr,
     cg_arena_expr_prev_stack, cg_arena_expr_tmp_stack,
     cg_async_scope_counter, cg_async_scope_stack,
@@ -99,7 +99,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{ctype_probe_at, c_type_from_tid, tc_scalar_tid_for_ct, tc_mono_tids_subst, tc_tid_subst_mono, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_list_elem_ct, tc_tid_list_elem_struct, tc_tid_list_elem_struct_mono, tc_tid_list_elem, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_ct_resolved, tc_tid_map_val_struct_resolved, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_struct_slot_encodable, tc_tid_inner_tag, tc_resolve_transparent_alias_name, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_faithful, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved, tc_variant_field_is_selfrec_tuple}
+import typecheck.{ctype_probe_at, c_type_from_tid, tc_scalar_tid_for_ct, tc_mono_tids_subst, tc_tid_subst_mono, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_child, tc_tid_name, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_list_elem_ct, tc_tid_list_elem_struct, tc_tid_list_elem_struct_mono, tc_tid_list_elem, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_ct_resolved, tc_tid_map_val_struct_resolved, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_struct_slot_encodable, tc_tid_inner_tag, tc_resolve_transparent_alias_name, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_faithful, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved, tc_variant_field_is_selfrec_tuple, tc_tid_kind, TyKind}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -1798,7 +1798,7 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
-pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_name: Str, task_fn_name: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+pub fn emit_async_spawn_closure(closure_node: Int, spawn_node: Int, wrapper_idx: Int, wrapper_name: Str, task_fn_name: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let cl_params_sl = node_params(closure_node)
     let captures = analyze_captures(node_body(closure_node), cl_params_sl)
     let cap_start = closure_captures.len()
@@ -1826,10 +1826,20 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
 
     let cl_body = node_body(closure_node)
     let cl_ret_str = node_return_type(closure_node)
-    let cl_ret_type = type_from_name(cl_ret_str)
+    let mut cl_ret_type = type_from_name(cl_ret_str)
     let mut task_ret_c = c_type_str(cl_ret_type)
     let mut task_ret_struct = ""
     let mut body_ret = cl_ret_type
+    // The spawn's authoritative Handle tid: its child(0) is the task's return type. Pinned once at
+    // typecheck (the async.spawn memo), so it survives mono lowering — unlike a codegen-time re-walk
+    // of the body, which is unstable. Used to recover an un-annotated closure's compound return.
+    let mut spawn_inner_tid = -1
+    let sp_htid = tc_lookup_node_tid(spawn_node)
+    if sp_htid >= 0 && tc_tid_ct(sp_htid) == CT_HANDLE {
+        spawn_inner_tid = cg_bind_mono_tid(tc_tid_child(sp_htid, 0))
+    }
+    let mut recovered_opt_inner = -1
+    let mut recovered_opt_inner_struct = ""
 
     if cl_ret_type == CT_OPTION {
         let ret_ann = node_type_ann(closure_node)
@@ -1885,12 +1895,81 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
     // orthogonal representation rule (unit tasks carry an int64_t placeholder), not a type identity.
     ctype_probe_at(cg_fn_ret_tid(closure_node), "expr_task_ret", cl_ret_str, task_ret_c, node_type_ann(closure_node))
 
-    let is_void_ret = cl_ret_str == "Void" || (cl_ret_str == "" && infer_block_type(cl_body) == CT_VOID)
+    // A user struct/enum body surfaces as CT_VOID to infer_block_type (the codegen block-type
+    // re-walk), so trust the authoritative Handle tid for the void decision when it is populated —
+    // the same re-walk instability the recovery below is pinned against would otherwise skip the
+    // recovery and force an int64_t task fn that the await unbox disagrees with. The re-walk stays
+    // the fallback only when the tid is unavailable. Ask the tid's kind, not tc_tid_ct: the latter
+    // collapses TyKind.Void onto CT_VOID and then to -1, so a Void inner is indistinguishable from
+    // an unresolved/typevar tid there.
+    let is_void_ret = cl_ret_str == "Void" || (cl_ret_str == "" && (if spawn_inner_tid >= 0 { tc_tid_kind(spawn_inner_tid) == TyKind.Void } else { infer_block_type(cl_body) == CT_VOID }))
     if is_void_ret {
         task_ret_c = "int64_t"
     } else if cl_ret_str == "" {
-        task_ret_c = "int64_t"
-        body_ret = CT_INT
+        // Un-annotated non-void closure: the annotation-driven recovery above never fired
+        // (node_type_ann is -1). Take the task's return type from the authoritative Handle tid so
+        // a compound body (Result/Option) keeps its real C type instead of an int64_t placeholder
+        // that the wrapper's boxing and the await unbox would then disagree with. Recover each
+        // carrier arm by its NOMINAL name off the tid children — the same name-then-type_from_name
+        // logic the annotated path (above) runs on the annotation node — so a transparent-newtype
+        // arm (Errno) keeps its nominal carrier tag instead of peeling to its int base, which the
+        // await side does not do; peeling here would spell a carrier the consumer never declares.
+        let ict = if spawn_inner_tid >= 0 { tc_tid_ct(spawn_inner_tid) } else { -1 }
+        if ict == CT_RESULT {
+            let ok_name = tc_tid_name(tc_tid_child(spawn_inner_tid, 0))
+            let err_name = tc_tid_name(tc_tid_child(spawn_inner_tid, 1))
+            let ok_ct = type_from_name(ok_name)
+            let err_ct = type_from_name(err_name)
+            let ok_struct = if ok_ct == CT_VOID && is_struct_or_enum_type(ok_name) != 0 { ok_name } else { "" }
+            let err_struct = if err_ct == CT_VOID && is_struct_or_enum_type(err_name) != 0 { err_name } else { "" }
+            ensure_mixed_result_type(ok_ct, err_ct, ok_struct, err_struct)
+            task_ret_c = result_c_type_mixed(ok_ct, err_ct, ok_struct, err_struct)
+            cl_ret_type = CT_RESULT
+            body_ret = CT_RESULT
+        } else if ict == CT_OPTION {
+            let inner_name = tc_tid_name(tc_tid_child(spawn_inner_tid, 0))
+            let inner_ct = type_from_name(inner_name)
+            if inner_ct == CT_VOID && is_struct_or_enum_type(inner_name) != 0 {
+                ensure_struct_option_type(inner_name)
+                task_ret_c = struct_option_c_type(inner_name)
+                recovered_opt_inner_struct = inner_name
+            } else {
+                ensure_option_type(inner_ct)
+                task_ret_c = option_c_type(inner_ct)
+                recovered_opt_inner = inner_ct
+            }
+            cl_ret_type = CT_OPTION
+            body_ret = CT_OPTION
+        } else if ict == CT_STRUCT || ict == CT_ENUM {
+            let sname = tc_tid_name(spawn_inner_tid)
+            if is_transparent_newtype(sname) != 0 {
+                // A transparent newtype travels as its bare scalar (int64_t — the codegen
+                // convention for transparent newtypes), not the aggregate c_type_c_name spells:
+                // the task body returns the raw scalar, so a by-value struct return would mis-type
+                // the task fn. The await side erases the newtype the same way, so both land on
+                // int64_t.
+                task_ret_c = "int64_t"
+                body_ret = CT_INT
+            } else if ict == CT_STRUCT && is_struct_type(sname) != 0 {
+                task_ret_c = c_type_c_name(sname)
+                task_ret_struct = sname
+                cl_ret_type = CT_STRUCT
+                body_ret = CT_INT
+            } else {
+                // Bare data enum: the await side has no enum-by-value unbox, so it cannot
+                // round-trip through async.spawn (the annotated path fails identically). Fall back
+                // to the int64_t placeholder rather than an aggregate the wrapper cannot box.
+                task_ret_c = "int64_t"
+                body_ret = CT_INT
+            }
+        } else if ict >= 0 && ict != CT_VOID {
+            task_ret_c = c_type_str(ict)
+            cl_ret_type = ict
+            body_ret = ict
+        } else {
+            task_ret_c = "int64_t"
+            body_ret = CT_INT
+        }
     }
 
     if task_ret_struct != "" || (cl_ret_type == CT_VOID && cl_ret_str != "Void" && cl_ret_str != "" && (is_struct_type(cl_ret_str) != 0 || is_enum_type(cl_ret_str) != 0)) {
@@ -1933,7 +2012,12 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
     cg_current_fn_has_ev = 0
     cg_current_fn_ret = body_ret
     if cl_ret_type == CT_OPTION {
-        cg_current_fn_option_inner = resolve_option_inner_from_ann(closure_node)
+        cg_current_fn_option_inner = if recovered_opt_inner >= 0 { recovered_opt_inner } else { resolve_option_inner_from_ann(closure_node) }
+        // A recovered Option[Struct] task needs its inner struct name so a bare `None` in the body
+        // emits the struct-option carrier (matching task_ret_c), not the int-option fallback.
+        if recovered_opt_inner_struct != "" {
+            cg_current_fn_option_inner_struct = recovered_opt_inner_struct
+        }
     } else {
         cg_current_fn_option_inner = 0
     }

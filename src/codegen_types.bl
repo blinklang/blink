@@ -4624,7 +4624,7 @@ pub fn set_set_elem_type(name: Str, elem_type: Int) {
 // struct-literal field loop, so a binding-site read reached there would bind against the wrong
 // (or empty) pair and silently drop back to the bare-name miss. A no-op outside a mono body or
 // on a typevar-free tid.
-fn cg_bind_mono_tid(ty: Int) -> Int {
+pub fn cg_bind_mono_tid(ty: Int) -> Int {
     tc_tid_subst_mono(ty, cg_fn_mono_tparams_sl, cg_fn_mono_arg_tids)
 }
 
@@ -8619,8 +8619,49 @@ pub fn set_var_handle(name: Str, inner: Int) {
     push_scope_var(ScopeVar { name: name, ctype: CT_HANDLE, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_HANDLE, inner, -1, "") })
 }
 
+// The outer kind a Handle var carries (its inner1 channel), read tid-first. Reproduces the kind the
+// async.spawn site stamps: a Result/Option return names itself, a struct/enum/newtype return names
+// CT_STRUCT, a void return names CT_INT, and a scalar/container return names the leaf kind its
+// surface spelling would. Falls back to the stamped pool field when the Handle tid is unpopulated.
+fn sv_handle_inner_tid_first(sv: ScopeVar) -> Int {
+    let rt = sv_handle_result_tid(sv)
+    if rt >= 0 {
+        let c = tc_tid_ct(rt)
+        if c == CT_RESULT { return CT_RESULT }
+        if c == CT_OPTION { return CT_OPTION }
+        if c == CT_STRUCT { return CT_STRUCT }
+        if c == CT_ENUM { return CT_STRUCT }
+        // tc_tid_ct collapses Void onto CT_VOID and then to -1, so a void task never matches a
+        // CT_ constant here — detect it by kind (mirrors the async.spawn void gate) so the invariant
+        // "a void return names CT_INT" holds instead of leaking CT_VOID through type_from_name.
+        if tc_tid_kind(rt) == TyKind.Void { return CT_INT }
+        return type_from_name(tc_tid_name(rt))
+    }
+    tp_child1_kind(sv.tp_id)
+}
+
 pub fn get_var_handle_inner(name: Str) -> Int {
-    get_sv_inner1(name, CT_HANDLE)
+    if scope_ct_count(CT_HANDLE) <= 0 { return -1 }
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_HANDLE {
+            return sv_handle_inner_tid_first(sv)
+        }
+        i = i - 1
+    }
+    let blink_name = c_blink_name(name)
+    if blink_name != name {
+        i = scope_vars.len() - 1
+        while i >= 0 {
+            let sv = scope_vars.get(i).unwrap()
+            if sv.name == blink_name && tp_get_kind(sv.tp_id) == CT_HANDLE {
+                return sv_handle_inner_tid_first(sv)
+            }
+            i = i - 1
+        }
+    }
+    -1
 }
 
 pub fn set_var_handle_full(name: Str, inner: Int, inner2: Int, extra1: Str, extra2: Str) {
@@ -8637,12 +8678,35 @@ pub fn set_var_handle_full(name: Str, inner: Int, inner2: Int, extra1: Str, extr
     push_scope_var(ScopeVar { name: name, ctype: CT_HANDLE, is_mut: 0, inner1: inner, inner2: inner2, sname: "", sname2: "", extra: encoded_extra, ty: -1, tp_id: sv_tp(CT_HANDLE, inner, -1, "") })
 }
 
+// The Option-elem / Result-err kind a Handle var carries (its inner2 channel), read tid-first.
+// The spawn site stamps this as type_from_name of the elem/err surface name (so a struct/enum/newtype
+// elem lands as CT_VOID), and -1 for every non-Option/Result return. Reproduced here off the tid's
+// elem/err child, with the stamped flat field as fallback when the Handle tid is unpopulated.
+fn sv_handle_inner2_tid_first(sv: ScopeVar) -> Int {
+    let rt = sv_handle_result_tid(sv)
+    if rt >= 0 {
+        let c = tc_tid_ct(rt)
+        if c == CT_RESULT {
+            let et = tc_tid_result_err_tid(rt)
+            if et >= 0 { return type_from_name(tc_tid_name(et)) }
+            return -1
+        }
+        if c == CT_OPTION {
+            let it = tc_tid_option_inner_tid(rt)
+            if it >= 0 { return type_from_name(tc_tid_name(it)) }
+            return -1
+        }
+        return -1
+    }
+    sv.inner2
+}
+
 pub fn get_var_handle_inner2(name: Str) -> Int {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_HANDLE {
-            return sv.inner2
+            return sv_handle_inner2_tid_first(sv)
         }
         i = i - 1
     }
@@ -8669,9 +8733,35 @@ fn sv_handle_sname_tid_first(sv: ScopeVar) -> Str {
         if c == CT_RESULT {
             let s = tc_tid_result_ok_struct(rt)
             if s != "" && is_transparent_newtype(s) == 0 && struct_def_is_generic(s) == 0 { return s }
+            // Scalar ok (Int/Str/Bool/...): the ok channel carries the leaf's TYPE NAME so the
+            // await site can recover its ct via type_from_name. A struct/enum/newtype ok maps to
+            // CT_VOID here and is left to the struct arm above / flat fallback below.
+            let ot = tc_tid_result_ok_tid(rt)
+            if ot >= 0 {
+                let on = tc_tid_name(ot)
+                if on != "" && type_from_name(on) != CT_VOID { return on }
+            }
         } else if c == CT_OPTION {
             let s = tc_tid_option_inner_struct(rt)
-            if s != "" && is_transparent_newtype(s) == 0 && struct_def_is_generic(s) == 0 { return s }
+            if s != "" && struct_def_is_generic(s) == 0 {
+                if is_transparent_newtype(s) == 0 { return s }
+                // A transparent newtype inner, un-annotated (empty flat head): fall back to the
+                // tid's nominal name so the await carrier matches the emit side's
+                // blink_Option_<Newtype> instead of an unregistered blink_Option_void. The Option
+                // inner-value path handles the newtype's bare representation correctly (unlike a
+                // Result ok arm), so the nominal name is safe here.
+                let ex = sv.extra
+                let flat_head = if ex == "" { "" } else {
+                    let ci = ex.index_of(":")
+                    if ci < 0 { ex } else { ex.slice(0, ci) }
+                }
+                if flat_head == "" { return s }
+            }
+            let it = tc_tid_option_inner_tid(rt)
+            if it >= 0 {
+                let inm = tc_tid_name(it)
+                if inm != "" && type_from_name(inm) != CT_VOID { return inm }
+            }
         } else if c == CT_STRUCT || c == CT_ENUM {
             let s = tc_tid_struct(rt)
             if s != "" && is_transparent_newtype(s) == 0 && struct_def_is_generic(s) == 0 { return s }
@@ -8687,16 +8777,26 @@ fn sv_handle_sname_tid_first(sv: ScopeVar) -> Str {
 // The struct name on a Handle's err channel (Result only), read tid-first with the flat `extra`
 // tail as fallback.
 fn sv_handle_sname2_tid_first(sv: ScopeVar) -> Str {
+    let extra = sv.extra
+    let flat = if extra == "" { "" } else {
+        let idx = extra.index_of(":")
+        if idx < 0 { "" } else { extra.slice(idx + 1, extra.len()) }
+    }
     let rt = sv_handle_result_tid(sv)
     if rt >= 0 && tc_tid_ct(rt) == CT_RESULT {
         let s = tc_tid_result_err_struct(rt)
-        if s != "" && is_transparent_newtype(s) == 0 && struct_def_is_generic(s) == 0 { return s }
+        if s != "" && struct_def_is_generic(s) == 0 {
+            if is_transparent_newtype(s) == 0 { return s }
+            // A transparent newtype err arm (bare-scalar carrier) is normally left to the flat
+            // `extra` tail, which an annotated spawn stamps. For an un-annotated spawn `extra` is
+            // empty, so fall back to the tid's nominal name — otherwise the arm erases to `void`
+            // and the await carrier (blink_Result_int_void) is never registered, unlike the emit
+            // side's blink_Result_int_<Newtype>. The err arm is not unwrapped as a value here, so
+            // the nominal name does not reach the newtype-unwrap representation path.
+            if flat == "" { return s }
+        }
     }
-    let extra = sv.extra
-    if extra == "" { return "" }
-    let idx = extra.index_of(":")
-    if idx < 0 { return "" }
-    extra.slice(idx + 1, extra.len())
+    flat
 }
 
 pub fn get_var_handle_sname(name: Str) -> Str {

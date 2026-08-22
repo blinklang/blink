@@ -1,0 +1,129 @@
+// An un-annotated spawn closure — `async.spawn(fn() { ... })` with no `-> T` — must take its task
+// return type from the INFERRED body type, not a forced int64_t placeholder. When the body yields a
+// compound (Result/Option), the emitted task fn, its boxing, and the await unbox must all agree on
+// that compound. Forcing int64_t makes the task fn return a Result-typed value through an int64_t
+// signature, so the generated C fails to compile. These rows pin the inferred-compound spawn path
+// that the annotated rows (test_jctkac_handle_inner_tid) do not reach.
+
+type Coord {
+    x: Int
+    y: Int
+}
+
+fn parse_it() -> Result[Int, Str] {
+    Ok(1)
+}
+
+fn maybe_it() -> Option[Int] {
+    Some(9)
+}
+
+fn make_coord() -> Coord {
+    Coord { x: 7, y: 8 }
+}
+
+fn maybe_coord() -> Option[Coord] {
+    Some(Coord { x: 5, y: 6 })
+}
+
+type Errno {
+    Errno(Int)
+}
+
+fn parse_err() -> Result[Int, Errno] {
+    Ok(7)
+}
+
+fn parse_ok() -> Result[Errno, Str] {
+    Ok(Errno(9))
+}
+
+fn maybe_errno() -> Option[Errno] {
+    Some(Errno(4))
+}
+
+fn maybe_list() -> Option[List[Int]] {
+    Some([1, 2, 3])
+}
+
+// ── un-annotated closure whose body infers Result[Int, Str] ───────────────────────────────
+test "an un-annotated spawn inferring Result awaits and unwraps the ok" {
+    let h = async.spawn(fn() {
+        parse_it()
+    })
+    let r = h.await
+    assert_eq(r.unwrap(), 1)
+}
+
+// ── un-annotated closure whose body infers Option[Int] ────────────────────────────────────
+test "an un-annotated spawn inferring Option awaits and unwraps the some" {
+    let h = async.spawn(fn() {
+        maybe_it()
+    })
+    let o = h.await
+    assert_eq(o.unwrap(), 9)
+}
+
+// ── un-annotated closure whose body infers a bare struct ──────────────────────────────────
+// A user struct surfaces as CT_VOID to the codegen block-type re-walk, so the void gate must take
+// its "is this void?" answer from the authoritative Handle tid, not that re-walk, or the recovery
+// is skipped and the task fn returns int64_t while the await unboxes a blink_Coord.
+test "an un-annotated spawn inferring a struct awaits the struct" {
+    let h = async.spawn(fn() {
+        make_coord()
+    })
+    let c = h.await
+    assert_eq(c.x, 7)
+}
+
+// ── un-annotated closure whose body infers Option[Struct] ─────────────────────────────────
+test "an un-annotated spawn inferring Option[Struct] awaits and unwraps the some" {
+    let h = async.spawn(fn() {
+        maybe_coord()
+    })
+    let c = h.await
+    assert_eq(c.unwrap().y, 6)
+}
+
+// ── un-annotated closure whose body infers a Result with a transparent-newtype err arm ────────
+// A transparent newtype (Errno = bare int64_t) in the err slot must keep its NOMINAL carrier tag
+// (blink_Result_int_Errno) on the await side, not erase to an unregistered blink_Result_int_void.
+// The await reads the err-arm name from the Handle tid when the flat channel is empty (un-annotated).
+test "an un-annotated spawn inferring Result with a newtype err arm awaits and unwraps the ok" {
+    let h = async.spawn(fn() {
+        parse_err()
+    })
+    let r = h.await
+    assert_eq(r.unwrap(), 7)
+}
+
+// ── un-annotated closure whose body infers a Result with a transparent-newtype ok arm ─────────
+test "an un-annotated spawn inferring Result with a newtype ok arm awaits and unwraps the ok" {
+    let h = async.spawn(fn() {
+        parse_ok()
+    })
+    let r = h.await
+    let e = r.unwrap()
+    let n = match e { Errno(x) => x }
+    assert_eq(n, 9)
+}
+
+// ── un-annotated closure whose body infers Option of a transparent newtype ────────────────────
+test "an un-annotated spawn inferring Option[Newtype] awaits and unwraps the some" {
+    let h = async.spawn(fn() {
+        maybe_errno()
+    })
+    let o = h.await
+    let e = o.unwrap()
+    let n = match e { Errno(x) => x }
+    assert_eq(n, 4)
+}
+
+// ── un-annotated closure whose body infers Option[List] (compound-but-not-erased inner) ───────
+test "an un-annotated spawn inferring Option[List] awaits and unwraps the some" {
+    let h = async.spawn(fn() {
+        maybe_list()
+    })
+    let o = h.await
+    assert_eq(o.unwrap().len(), 3)
+}
