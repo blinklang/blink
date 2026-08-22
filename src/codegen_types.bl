@@ -8672,20 +8672,100 @@ pub fn get_var_handle_inner2(name: Str) -> Int {
     -1
 }
 
-pub fn get_var_handle_sname(name: Str) -> Str {
-    let extra = get_sv_extra(name, CT_HANDLE)
+// The result-type tid a Handle var carries in its ty slot (inner1 of the Handle tid, mono-bound),
+// or -1 when the var is unstamped or its ty is not a Handle. make_handle_type puts the spawned
+// task's return type there, so the ok/inner/struct names below read from the authoritative tid.
+fn sv_handle_result_tid(sv: ScopeVar) -> Int {
+    if sv.ty < 0 { return -1 }
+    if tc_tid_ct(sv.ty) != CT_HANDLE { return -1 }
+    cg_bind_mono_tid(tc_tid_child(sv.ty, 0))
+}
+
+// The struct name on a Handle's ok / inner / struct-return channel, read tid-first. A transparent
+// newtype (bare scalar, no C struct) or a bare-erased generic base is declined under the same guard
+// the other tid-first readers use, so the flat `extra` head stays authoritative there and for a var
+// whose Handle tid is still unpopulated.
+fn sv_handle_sname_tid_first(sv: ScopeVar) -> Str {
+    let rt = sv_handle_result_tid(sv)
+    if rt >= 0 {
+        let c = tc_tid_ct(rt)
+        if c == CT_RESULT {
+            let s = tc_tid_result_ok_struct(rt)
+            if s != "" && is_transparent_newtype(s) == 0 && struct_def_is_generic(s) == 0 { return s }
+        } else if c == CT_OPTION {
+            let s = tc_tid_option_inner_struct(rt)
+            if s != "" && is_transparent_newtype(s) == 0 && struct_def_is_generic(s) == 0 { return s }
+        } else if c == CT_STRUCT || c == CT_ENUM {
+            let s = tc_tid_struct(rt)
+            if s != "" && is_transparent_newtype(s) == 0 && struct_def_is_generic(s) == 0 { return s }
+        }
+    }
+    let extra = sv.extra
     if extra == "" { return "" }
     let idx = extra.index_of(":")
     if idx < 0 { return extra }
     extra.slice(0, idx)
 }
 
-pub fn get_var_handle_sname2(name: Str) -> Str {
-    let extra = get_sv_extra(name, CT_HANDLE)
+// The struct name on a Handle's err channel (Result only), read tid-first with the flat `extra`
+// tail as fallback.
+fn sv_handle_sname2_tid_first(sv: ScopeVar) -> Str {
+    let rt = sv_handle_result_tid(sv)
+    if rt >= 0 && tc_tid_ct(rt) == CT_RESULT {
+        let s = tc_tid_result_err_struct(rt)
+        if s != "" && is_transparent_newtype(s) == 0 && struct_def_is_generic(s) == 0 { return s }
+    }
+    let extra = sv.extra
     if extra == "" { return "" }
     let idx = extra.index_of(":")
     if idx < 0 { return "" }
     extra.slice(idx + 1, extra.len())
+}
+
+pub fn get_var_handle_sname(name: Str) -> Str {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_HANDLE {
+            return sv_handle_sname_tid_first(sv)
+        }
+        i = i - 1
+    }
+    let blink_name = c_blink_name(name)
+    if blink_name != name {
+        i = scope_vars.len() - 1
+        while i >= 0 {
+            let sv = scope_vars.get(i).unwrap()
+            if sv.name == blink_name && tp_get_kind(sv.tp_id) == CT_HANDLE {
+                return sv_handle_sname_tid_first(sv)
+            }
+            i = i - 1
+        }
+    }
+    ""
+}
+
+pub fn get_var_handle_sname2(name: Str) -> Str {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_HANDLE {
+            return sv_handle_sname2_tid_first(sv)
+        }
+        i = i - 1
+    }
+    let blink_name = c_blink_name(name)
+    if blink_name != name {
+        i = scope_vars.len() - 1
+        while i >= 0 {
+            let sv = scope_vars.get(i).unwrap()
+            if sv.name == blink_name && tp_get_kind(sv.tp_id) == CT_HANDLE {
+                return sv_handle_sname2_tid_first(sv)
+            }
+            i = i - 1
+        }
+    }
+    ""
 }
 
 pub fn set_var_channel(name: Str, inner: Int) {
