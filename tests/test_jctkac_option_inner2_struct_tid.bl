@@ -1,14 +1,12 @@
-// get_var_option_inner2_struct names the STRUCT held inside an Option var's List/Map inner, so
-// unwrapping the Option and then reading a field off a list element / map value emits the right
-// struct member access. Every row unwraps through the carrier and reads a struct field, so an
-// empty or wrong name fails to compile or reads the wrong field. The rows cover the accessor's
-// dispatch positions:
-//   - Ident-read of an Option[List[Struct]] / Option[Map[K,Struct]] var
-//   - a match scrutinee on such a var
-//   - a reassignment of a mutable such var
-//   - a generic struct INSTANCE inner (Box[Int]) — the mono-stem name path
-//   - a scalar inner (Int) — no nested struct, names ""
+// get_var_option_inner2_struct names the STRUCT held inside an Option var's inner List/Map, so
+// unwrapping/matching the Option and then indexing the inner container and reading a field off an
+// element emits the right struct member access. Every row descends Option -> container -> struct and
+// reads a field, so an empty or wrong name fails to compile or reads the wrong field. The rows reach
+// the reader through paths that do NOT set the `extra` channel first (fn return, match, alias chain,
+// struct field, generic instance), so once the reader is tid-only the nested struct name must still
+// round-trip from the authoritative option tid alone.
 
+@derive(Hash, Eq)
 type Point {
     x: Int
     y: Int
@@ -18,47 +16,120 @@ type Box[T] {
     value: T
 }
 
-// ── Option[List[Struct]] var → Ident-read + unwrap + index + field ─────────────────────
-test "an Option-of-list-of-struct var reads a nested struct field" {
-    let o: Option[List[Point]] = Some([Point { x: 1, y: 2 }, Point { x: 3, y: 4 }])
-    let lst = o.unwrap()
-    assert_eq(lst.get(1).unwrap().x, 3)
+fn make_opt_list() -> Option[List[Point]] {
+    Some([Point { x: 1, y: 2 }, Point { x: 3, y: 4 }])
 }
 
-// ── Option[Map[Str,Struct]] var → Ident-read + unwrap + get + field ────────────────────
-test "an Option-of-map-of-struct var reads a nested struct field" {
+fn make_opt_map() -> Option[Map[Str, Point]] {
     let mut m: Map[Str, Point] = Map()
     m.insert("a", Point { x: 5, y: 6 })
-    let o: Option[Map[Str, Point]] = Some(m)
-    let mm = o.unwrap()
-    assert_eq(mm.get("a").unwrap().y, 6)
+    Some(m)
 }
 
-// ── match scrutinee on the Option var → the inner list binder keeps its struct element ──
-test "a match on an Option-of-list-of-struct var binds the inner list" {
-    let o: Option[List[Point]] = Some([Point { x: 7, y: 8 }])
-    let r = match o {
-        Some(lst) => lst.get(0).unwrap().x
-        None => -1
+// ── Option[List[Struct]] recovered from a fn return, unwrapped + indexed ──────────────────
+test "Option[List[Point]] from a fn return names its inner list element struct" {
+    let inner = make_opt_list().unwrap()
+    let p = inner.get(1).unwrap()
+    assert_eq(p.x, 3)
+    assert_eq(p.y, 4)
+}
+
+// ── Option[List[Struct]] through a match binding ──────────────────────────────────────────
+test "Option[List[Point]] through match Some binds the inner list struct" {
+    let opt = make_opt_list()
+    match opt {
+        Some(inner) => {
+            let p = inner.get(0).unwrap()
+            assert_eq(p.x, 1)
+            assert_eq(p.y, 2)
+        }
+        None => { assert_eq(0, 1) }
     }
-    assert_eq(r, 7)
 }
 
-// ── reassignment of a mutable Option var → the set path re-stamps the nested struct ─────
-test "a reassigned Option-of-list-of-struct var reads the new struct field" {
-    let mut o: Option[List[Point]] = None
-    o = Some([Point { x: 9, y: 10 }])
-    assert_eq(o.unwrap().get(0).unwrap().y, 10)
+// ── Option[List[Struct]] through an alias chain ───────────────────────────────────────────
+test "Option[List[Point]] keeps its inner struct across an alias chain" {
+    let o1: Option[List[Point]] = Some([Point { x: 10, y: 20 }, Point { x: 30, y: 40 }])
+    let o2 = o1
+    let o3 = o2
+    let inner = o3.unwrap()
+    let p = inner.get(1).unwrap()
+    assert_eq(p.x, 30)
+    assert_eq(p.y, 40)
 }
 
-// ── generic struct INSTANCE inner → the mono-stem naming path (Box_0Int) ────────────────
-test "an Option-of-list-of-generic-instance var reads the boxed field" {
-    let o: Option[List[Box[Int]]] = Some([Box { value: 42 }])
-    assert_eq(o.unwrap().get(0).unwrap().value, 42)
+// ── Option[Map[K,Struct]] recovered from a fn return ──────────────────────────────────────
+test "Option[Map[Str,Point]] from a fn return names its inner map value struct" {
+    let inner = make_opt_map().unwrap()
+    let p = inner.get("a").unwrap()
+    assert_eq(p.x, 5)
+    assert_eq(p.y, 6)
 }
 
-// ── negative: a scalar inner has no nested struct, and must still round-trip ────────────
-test "an Option-of-list-of-scalar var round-trips without a nested struct" {
-    let o: Option[List[Int]] = Some([11, 22])
-    assert_eq(o.unwrap().get(1).unwrap(), 22)
+// ── Option[Map[K,Struct]] through a match binding ─────────────────────────────────────────
+test "Option[Map[Str,Point]] through match Some binds the inner map value struct" {
+    let opt = make_opt_map()
+    match opt {
+        Some(inner) => {
+            let p = inner.get("a").unwrap()
+            assert_eq(p.x, 5)
+        }
+        None => { assert_eq(0, 1) }
+    }
+}
+
+// ── Option[List[Struct]] as a struct field ────────────────────────────────────────────────
+type Wrap {
+    items: Option[List[Point]]
+}
+
+test "an Option[List[Point]] struct field names its inner list struct" {
+    let w = Wrap { items: Some([Point { x: 7, y: 8 }]) }
+    let inner = w.items.unwrap()
+    let p = inner.get(0).unwrap()
+    assert_eq(p.x, 7)
+    assert_eq(p.y, 8)
+}
+
+// ── generic struct INSTANCE inner element (Box_0Int mono stem) ─────────────────────────────
+test "Option[List[Box[Int]]] names its boxed inner element struct" {
+    let o: Option[List[Box[Int]]] = Some([Box { value: 99 }])
+    let inner = o.unwrap()
+    assert_eq(inner.get(0).unwrap().value, 99)
+}
+
+// ── negative: a scalar inner has no nested struct, and must still round-trip ───────────────
+test "Option[List[Int]] round-trips without a nested struct" {
+    let o: Option[List[Int]] = Some([11, 22, 33])
+    let inner = o.unwrap()
+    assert_eq(inner.get(2).unwrap(), 33)
+}
+
+// ── Option[Set[Struct]] ?? fallback ──────────────────────────────────────────────────────
+// The reader names no Set inner (it has no set arm and answers ""), so the coalesced set must
+// recover its element struct from the ?? node's own tid, not from the reader. The producer is a
+// List[Set].get()/Map[K,Set].get() call, which stamps the flat element channel on the Option var,
+// so the ?? site's tid net is exercised past its `flat channel present` short-circuit. Iterating
+// the result and reading a struct field off each element fails to compile if the struct is lost.
+test "Option[Set[Point]] ?? fallback from a List producer keeps its element struct" {
+    let mut inner: Set[Point] = Set()
+    inner.insert(Point { x: 7, y: 8 })
+    let lst: List[Set[Point]] = [inner]
+    let opt = lst.get(0)
+    let fallback: Set[Point] = Set()
+    let mut sum = 0
+    for p in (opt ?? fallback) { sum = sum + p.x }
+    assert_eq(sum, 7)
+}
+
+test "Option[Set[Point]] ?? fallback from a Map producer keeps its element struct" {
+    let mut inner: Set[Point] = Set()
+    inner.insert(Point { x: 3, y: 4 })
+    let mut m: Map[Str, Set[Point]] = Map()
+    m.insert("k", inner)
+    let opt = m.get("k")
+    let fallback: Set[Point] = Set()
+    let mut sum = 0
+    for p in (opt ?? fallback) { sum = sum + p.x }
+    assert_eq(sum, 3)
 }
