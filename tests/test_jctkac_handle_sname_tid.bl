@@ -18,6 +18,11 @@ type Oops {
     code: Int
 }
 
+// A transparent newtype (single Int variant named Errno) — lowers to a bare int64_t, no box.
+type Errno {
+    Errno(Int)
+}
+
 // ── Struct return → await → read a struct field ────────────────────────────────────────
 test "an async handle of a struct reads a field off the awaited result" {
     let h = async.spawn(fn() -> Point {
@@ -52,6 +57,33 @@ test "an async handle of a result with a struct err names both arms" {
     })
     let r = h.await
     assert_eq(r.unwrap().x, 11)
+}
+
+// ── ANNOTATED Result with a transparent-newtype OK arm → await → unwrap the ok ───────────
+// The ok arm DECLINES the newtype name (sname's is_transparent_newtype guard): the ok value is
+// unwrapped by the await, and naming it would type the carrier's `.ok` as a boxed struct instead of
+// the bare int64_t it lowers to. So sname answers "" and the await uses the void-ok carrier, which is
+// layout-identical. Since the flat channel is retired, this ANNOTATED spawn takes the same reader
+// path as the un-annotated one (test_3z72k1) — the annotation must not change the emitted carrier.
+test "an async handle of a result with a newtype ok arm unwraps the ok by identity" {
+    let h = async.spawn(fn() -> Result[Errno, Str] {
+        Ok(Errno(9))
+    })
+    let r = h.await
+    let n = match r.unwrap() { Errno(x) => x }
+    assert_eq(n, 9)
+}
+
+// ── ANNOTATED Result with a transparent-newtype ERR arm → await → unwrap the ok ──────────
+// The err arm KEEPS the nominal newtype name (sname2 has no transparent guard): the err arm is never
+// unwrapped as a value, so its nominal tag keeps the await carrier blink_Result_int_Errno registered
+// rather than erasing to an unregistered blink_Result_int_void.
+test "an async handle of a result with a newtype err arm names the err carrier" {
+    let h = async.spawn(fn() -> Result[Int, Errno] {
+        Ok(7)
+    })
+    let r = h.await
+    assert_eq(r.unwrap(), 7)
 }
 
 // ── negative: an Int return has no struct, names "" and still round-trips ────────────────

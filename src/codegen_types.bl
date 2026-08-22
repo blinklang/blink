@@ -8687,10 +8687,9 @@ fn sv_handle_result_tid(sv: ScopeVar) -> Int {
     cg_bind_mono_tid(tc_tid_child(sv.ty, 0))
 }
 
-// The struct name on a Handle's ok / inner / struct-return channel, read tid-first. A transparent
-// newtype (bare scalar, no C struct) or a bare-erased generic base is declined under the same guard
-// the other tid-first readers use, so the flat `extra` head stays authoritative there and for a var
-// whose Handle tid is still unpopulated.
+// The struct name on a Handle's ok / inner / struct-return channel, recovered from the authoritative
+// Handle tid. A bare-erased generic base is declined (the mono stem names it downstream); a var whose
+// Handle tid is unpopulated answers "".
 fn sv_handle_sname_tid_first(sv: ScopeVar) -> Str {
     let rt = sv_handle_result_tid(sv)
     if rt >= 0 {
@@ -8698,30 +8697,26 @@ fn sv_handle_sname_tid_first(sv: ScopeVar) -> Str {
         if c == CT_RESULT {
             let s = tc_tid_result_ok_struct(rt)
             if s != "" && is_transparent_newtype(s) == 0 && struct_def_is_generic(s) == 0 { return s }
-            // Scalar ok (Int/Str/Bool/...): the ok channel carries the leaf's TYPE NAME so the
-            // await site can recover its ct via type_from_name. A struct/enum/newtype ok maps to
-            // CT_VOID here and is left to the struct arm above / flat fallback below.
+            // A transparent newtype ok arm is declined on purpose: unlike the err arm, the ok value
+            // IS unwrapped by the await site, and naming it as the newtype would type the carrier's
+            // `.ok` member as the boxed struct instead of the bare int64_t it lowers to. Answering ""
+            // yields the void-ok carrier, which is layout-identical (transparent newtype => int64_t)
+            // and — unlike OLD's flat channel — no longer varies with whether the closure was
+            // annotated. Scalar ok (Int/Str/Bool/...) falls to the leaf TYPE NAME below so the await
+            // site can recover its ct via type_from_name.
             let ot = tc_tid_result_ok_tid(rt)
             if ot >= 0 {
                 let on = tc_tid_name(ot)
                 if on != "" && type_from_name(on) != CT_VOID { return on }
             }
         } else if c == CT_OPTION {
+            // The inner struct name round-trips from the option tid whether or not the inner is a
+            // transparent newtype: for a newtype the Option inner-value path handles its bare
+            // representation, so the nominal struct name is the right await-carrier name (it matches
+            // the emit side's blink_Option_<Newtype>). A scalar inner has no struct and falls to the
+            // tid below.
             let s = tc_tid_option_inner_struct(rt)
-            if s != "" && struct_def_is_generic(s) == 0 {
-                if is_transparent_newtype(s) == 0 { return s }
-                // A transparent newtype inner, un-annotated (empty flat head): fall back to the
-                // tid's nominal name so the await carrier matches the emit side's
-                // blink_Option_<Newtype> instead of an unregistered blink_Option_void. The Option
-                // inner-value path handles the newtype's bare representation correctly (unlike a
-                // Result ok arm), so the nominal name is safe here.
-                let ex = sv.extra
-                let flat_head = if ex == "" { "" } else {
-                    let ci = ex.index_of(":")
-                    if ci < 0 { ex } else { ex.slice(0, ci) }
-                }
-                if flat_head == "" { return s }
-            }
+            if s != "" && struct_def_is_generic(s) == 0 { return s }
             let it = tc_tid_option_inner_tid(rt)
             if it >= 0 {
                 let inm = tc_tid_name(it)
@@ -8732,36 +8727,20 @@ fn sv_handle_sname_tid_first(sv: ScopeVar) -> Str {
             if s != "" && is_transparent_newtype(s) == 0 && struct_def_is_generic(s) == 0 { return s }
         }
     }
-    let extra = sv.extra
-    if extra == "" { return "" }
-    let idx = extra.index_of(":")
-    if idx < 0 { return extra }
-    extra.slice(0, idx)
+    ""
 }
 
-// The struct name on a Handle's err channel (Result only), read tid-first with the flat `extra`
-// tail as fallback.
+// The struct name on a Handle's err channel (Result only), recovered from the authoritative result
+// tid. A transparent newtype err arm resolves to its nominal name too (the arm is never unwrapped as
+// a value here, so its bare representation is not reached) — that keeps the await carrier
+// blink_Result_<ok>_<Newtype> registered.
 fn sv_handle_sname2_tid_first(sv: ScopeVar) -> Str {
-    let extra = sv.extra
-    let flat = if extra == "" { "" } else {
-        let idx = extra.index_of(":")
-        if idx < 0 { "" } else { extra.slice(idx + 1, extra.len()) }
-    }
     let rt = sv_handle_result_tid(sv)
     if rt >= 0 && tc_tid_ct(rt) == CT_RESULT {
         let s = tc_tid_result_err_struct(rt)
-        if s != "" && struct_def_is_generic(s) == 0 {
-            if is_transparent_newtype(s) == 0 { return s }
-            // A transparent newtype err arm (bare-scalar carrier) is normally left to the flat
-            // `extra` tail, which an annotated spawn stamps. For an un-annotated spawn `extra` is
-            // empty, so fall back to the tid's nominal name — otherwise the arm erases to `void`
-            // and the await carrier (blink_Result_int_void) is never registered, unlike the emit
-            // side's blink_Result_int_<Newtype>. The err arm is not unwrapped as a value here, so
-            // the nominal name does not reach the newtype-unwrap representation path.
-            if flat == "" { return s }
-        }
+        if s != "" && struct_def_is_generic(s) == 0 { return s }
     }
-    flat
+    ""
 }
 
 pub fn get_var_handle_sname(name: Str) -> Str {
