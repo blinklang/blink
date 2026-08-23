@@ -94,6 +94,7 @@ import codegen_types.{
     closure_sig_hash
 }
 import codegen_expr.{
+    ensure_tuple_carrier_from_tid,
     emit_expr, expr_closure_sig, expr_list_elem_struct, expr_list_elem_type,
     expr_map_key_type, expr_map_val_type, expr_map_val_struct, expr_map_key_struct, expr_option_inner,
     expr_option_inner_list_elem, expr_option_inner_list_struct,
@@ -3140,6 +3141,36 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                 }
             }
             pat_measure(bind_name, pat)
+        }
+        if scrut_len > 1 {
+            // A whole-value ident binder over a tuple scrutinee. The top-level
+            // tuple-scrutinee fast path pre-expanded the tuple into one entry per
+            // element (scrut_len == n_elems), so no single whole-tuple entry
+            // survives -- reconstruct the tuple from the per-element scruts as a
+            // compound literal. The carrier name comes from the binder tid via
+            // ensure_tuple_carrier_from_tid, which also REGISTERS the typedef (a
+            // literal scrutinee never materializes the tuple value, so its typedef
+            // is otherwise never emitted) and returns "" for an ICE_SEG / unspellable
+            // element, ceding rather than naming an undeclared C type. set_var_ty
+            // stamps the binder onto the tid channel.
+            let whole_tid = pat_binder_tid(pat)
+            let whole_tag = ensure_tuple_carrier_from_tid(whole_tid)
+            if whole_tag != "" {
+                let c_bind = c_safe_name(bind_name)
+                let mut inits = ""
+                let mut j = 0
+                while j < scrut_len {
+                    if j > 0 { inits = inits.concat(", ") }
+                    let elem = match_scruts.get(scrut_off + j).unwrap()
+                    inits = inits.concat("._{j} = {elem.str_val}")
+                    j = j + 1
+                }
+                emit_line("{c_type_c_name(whole_tag)} {c_bind} = \{ {inits} };")
+                set_var(bind_name, CT_VOID, 1)
+                set_var_struct(c_bind, whole_tag)
+                set_var_ty(bind_name, whole_tid)
+                pat_measure(bind_name, pat)
+            }
         }
         return
     }
