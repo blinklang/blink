@@ -3498,6 +3498,52 @@ fn tc_produce_enum_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> Int 
 @allow(UnrestoredMutation)
 fn tc_fnsig_param_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     let bk = type_kind(bare_tid)
+    // A CONTAINER param/return (`Map[Str, Box[T]]`, `List[Box[T]]`, …) whose element
+    // is a generic user-struct: resolve_type_ann erased that element to its bare base
+    // on the value path (the all-typevar skip), so at the call site
+    // substitute_typevar_tid meets a params_count-0 base in the slot and has no `[T]`
+    // to rebind — the container comes back with the value erased (blink_Box, not
+    // blink_Box_0Int). Recurse into each element annotation, re-intern it structurally,
+    // and rebuild the container tid so the element keeps its slots. Mirrors
+    // substitute_typevar_tid's own container arms and tc_evfield_structural_tid's tuple
+    // recursion; returns -1 (caller keeps the bare tid) when no element needed interning.
+    //
+    // A generic-ENUM element (`Map[Str, Wrap[T]]`) rides the same recursion, but its
+    // all-typevar instance is still skipped by tc_produce_enum_instance_tid AND its
+    // mono ctor is not yet emitted inside a generic body, so it stays erased for now.
+    if bk == TyKind.Map || bk == TyKind.List || bk == TyKind.Option || bk == TyKind.Result || bk == TyKind.Set {
+        let need = if bk == TyKind.Map || bk == TyKind.Result { 2 } else { 1 }
+        let celems_sl = node_elements(ann_node)
+        if celems_sl == -1 || sublist_length(celems_sl) < need { return -1 }
+        // The already-erased element tids the value path stored on the container.
+        let ce = ty_pool.get(bare_tid).unwrap()
+        // Re-resolve each element with the nested-structural exception raised, exactly
+        // as tc_produce_struct_instance_tid's own nested-arg path does (the D2 fix):
+        // this mints a full `Box[T]` / `Box[Box[T]]` instance for a generic-struct
+        // element instead of the bare base, at any nesting depth.
+        let saved_suppress = tc_suppress_ann_validation
+        let saved_nested = tc_structural_nested_instances
+        tc_suppress_ann_validation = 1
+        tc_structural_nested_instances = 1
+        let mut parts: List[Int] = []
+        let mut ci = 0
+        while ci < need {
+            parts.push(resolve_type_ann(sublist_get(celems_sl, ci)))
+            ci = ci + 1
+        }
+        tc_suppress_ann_validation = saved_suppress
+        tc_structural_nested_instances = saved_nested
+        let structural_key_or_only = parts.get(0).unwrap()
+        // Nothing changed if every slot resolves to the tid already stored: keep the
+        // caller on its bare tid so an all-scalar container is untouched.
+        if bk == TyKind.List { if structural_key_or_only == ce.inner1 { return -1 } return make_list_type(structural_key_or_only) }
+        if bk == TyKind.Option { if structural_key_or_only == ce.inner1 { return -1 } return make_option_type(structural_key_or_only) }
+        if bk == TyKind.Set { if structural_key_or_only == ce.inner1 { return -1 } return make_set_type(structural_key_or_only) }
+        let structural_val = parts.get(1).unwrap()
+        if structural_key_or_only == ce.inner1 && structural_val == ce.inner2 { return -1 }
+        if bk == TyKind.Map { return make_map_type(structural_key_or_only, structural_val) }
+        return make_result_type(structural_key_or_only, structural_val)
+    }
     // A generic-ENUM param/return (`t: Tree[T]` / `-> Tree[Int]`)
     // must also re-intern as a structural instance carrying its type-arg slots — the
     // enum twin of the struct case — so the codegen return/param mono seams read the
