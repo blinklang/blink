@@ -2532,6 +2532,37 @@ fn list_elem_unbox_from_tid(elem_tid: Int, expr: Str) -> Str {
     }
 }
 
+// Bind a WHOLE-value binder over a pre-expanded tuple scrutinee: a bare whole-ident binder, or an
+// `as` pattern's name, which name the undecomposed tuple. The top-level tuple-scrutinee fast path
+// pre-expands the tuple into one match_scruts entry per element (scrut_len == n_elems), so no single
+// whole-tuple entry survives -- reconstruct it from the per-element scruts as a compound literal.
+// The carrier name comes from the binder tid via ensure_tuple_carrier_from_tid, which also REGISTERS
+// the typedef (a literal scrutinee never materializes the tuple value, so its typedef is otherwise
+// never emitted) and returns "" for an ICE_SEG / unspellable element, ceding rather than naming an
+// undeclared C type. stamp_whole_binder_from_tid's tuple arm stamps the tid channel that
+// sv_struct_tid_first reads to spell field access, so no flat sname write is needed. Returns whether
+// it bound the value.
+fn bind_whole_tuple_from_scruts(pat: Int, bind_name: Str, scrut_off: Int, scrut_len: Int) -> Bool ! Codegen.Emit, Codegen.Scope {
+    let whole_tid = pat_binder_tid(pat)
+    let whole_tag = ensure_tuple_carrier_from_tid(whole_tid)
+    if whole_tag == "" { return false }
+    let c_bind = c_safe_name(bind_name)
+    let mut inits = ""
+    let mut j = 0
+    while j < scrut_len {
+        if j > 0 { inits = inits.concat(", ") }
+        let elem = match_scruts.get(scrut_off + j).unwrap()
+        inits = inits.concat("._{j} = {elem.str_val}")
+        j = j + 1
+    }
+    emit_line("{c_type_c_name(whole_tag)} {c_bind} = \{ {inits} };")
+    // whole_tag != "" means ensure_tuple_carrier_from_tid registered the carrier, so the tuple arm
+    // of stamp_whole_binder_from_tid (same tid, same find_tuple_entry gate) always fires here.
+    let _ = stamp_whole_binder_from_tid(whole_tid, bind_name, 1)
+    pat_measure(bind_name, pat)
+    true
+}
+
 // Emit C variable bindings for ident sub-patterns within a pattern.
 // scrut_off/scrut_len index into match_scruts.
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -3028,6 +3059,14 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
     }
     if pk == NodeKind.AsPattern {
         let bind_name = node_name(pat)
+        if scrut_len > 1 {
+            // `x as y` over a pre-expanded tuple scrutinee binds BOTH names to the whole tuple.
+            // The as-name is reconstructed here; node_pattern(pat) (the inner binder) is bound by
+            // the recursion below. Element 0 alone would mis-declare a whole-tuple bind.
+            bind_whole_tuple_from_scruts(pat, bind_name, scrut_off, scrut_len)
+            bind_pattern_vars(node_pattern(pat), scrut_off, scrut_len)
+            return
+        }
         let c_bind = c_safe_name(bind_name)
         let entry = match_scruts.get(scrut_off).unwrap()
         let st = entry.scrut_type
@@ -3143,34 +3182,8 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
             pat_measure(bind_name, pat)
         }
         if scrut_len > 1 {
-            // A whole-value ident binder over a tuple scrutinee. The top-level
-            // tuple-scrutinee fast path pre-expanded the tuple into one entry per
-            // element (scrut_len == n_elems), so no single whole-tuple entry
-            // survives -- reconstruct the tuple from the per-element scruts as a
-            // compound literal. The carrier name comes from the binder tid via
-            // ensure_tuple_carrier_from_tid, which also REGISTERS the typedef (a
-            // literal scrutinee never materializes the tuple value, so its typedef
-            // is otherwise never emitted) and returns "" for an ICE_SEG / unspellable
-            // element, ceding rather than naming an undeclared C type. set_var_ty
-            // stamps the binder onto the tid channel.
-            let whole_tid = pat_binder_tid(pat)
-            let whole_tag = ensure_tuple_carrier_from_tid(whole_tid)
-            if whole_tag != "" {
-                let c_bind = c_safe_name(bind_name)
-                let mut inits = ""
-                let mut j = 0
-                while j < scrut_len {
-                    if j > 0 { inits = inits.concat(", ") }
-                    let elem = match_scruts.get(scrut_off + j).unwrap()
-                    inits = inits.concat("._{j} = {elem.str_val}")
-                    j = j + 1
-                }
-                emit_line("{c_type_c_name(whole_tag)} {c_bind} = \{ {inits} };")
-                set_var(bind_name, CT_VOID, 1)
-                set_var_struct(c_bind, whole_tag)
-                set_var_ty(bind_name, whole_tid)
-                pat_measure(bind_name, pat)
-            }
+            // A whole-value ident binder over a tuple scrutinee.
+            bind_whole_tuple_from_scruts(pat, bind_name, scrut_off, scrut_len)
         }
         return
     }
