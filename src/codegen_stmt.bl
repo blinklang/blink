@@ -45,13 +45,14 @@ import codegen_types.{
     get_var_closure_sig, get_var_handler_vtable_type,
     get_var_handle_sname, get_var_handle_sname2, get_var_iter_next_fn,
     get_var_iterator_inner, get_var_option_inner, get_var_option_inner_struct,
+    get_var_option_inner_tag, get_var_result_ok_tag, get_var_result_err_tag,
     get_var_option_erased, set_var_option_erased,
     get_var_result_err, get_var_result_err_struct, get_var_result_ok,
     get_var_result_ok_struct, get_var_struct, get_var_type, has_derive_method, is_scope_var,
     get_variant_field_count, get_variant_field_name,
     get_variant_field_type_str, variant_field_type_by_name, get_variant_index, get_variant_tag,
     impl_method_self_name, builtin_receiver_type_name,
-    is_compound_ct, is_data_enum, is_enum_type, is_mono_struct_instance, is_transparent_newtype, is_boxed_struct_err,
+    is_compound_ct, is_data_enum, is_enum_type, is_payloadless_enum, is_mono_struct_instance, is_transparent_newtype, is_boxed_struct_err,
     is_intrinsic_method, is_named_type, is_runtime_header_fn, is_stdlib_source_module, is_struct_or_enum_type, is_struct_type, is_trait_type, list_contains_str, list_iter_c_type, skip_private_in_module_header,
     lookup_assoc_type, lookup_impl_type_for_trait, lookup_mono_base, mangle_generic_name, mangle_impl_method, mangle_impl_method_q, match_scrut_enum,
     match_scruts, mono_fns, mono_instances, mono_name_from_ann, mono_phys_base, mut_captured_vars, nth_type_arg, option_c_type, register_mono_instance,
@@ -1080,6 +1081,10 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                 // flat rok/rerr channels — they carry only a one-level inner and spell
                 // blink_Result_map_str. The scrutinee tid holds the full inner, so lead
                 // with it for exactly that shape, mirroring the CT_OPTION branch below.
+                // For a NON-compound inner the split flips: a generic-struct instance
+                // (`Result[Inner[T], Str]`) erases through the tid to the bare head
+                // (blink_Result_Inner_str), while the flat channel keeps the mono stem
+                // (Inner_0Int) — so lead with the tid only when the inner is compound.
                 let res_scrut_tid_r = tc_tid_resolved(cg_node_mono_tid(scrut))
                 let res_scrut_tid_c = c_type_from_tid(cg_node_mono_tid(scrut))
                 let res_scrut_compound = is_compound_ct(tc_tid_result_ok_ct(res_scrut_tid_r)) != 0 || is_compound_ct(tc_tid_result_err_ct(res_scrut_tid_r)) != 0
@@ -1088,6 +1093,8 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                 } else if rok_s != "" || rerr_s != "" {
                     let res_c = result_c_type_mixed(rok, rerr, rok_s, rerr_s)
                     emit_line("{res_c} {scrut_tmp} = {expr_result_str};")
+                } else if res_scrut_tid_c.starts_with("blink_Result_") {
+                    emit_line("{res_scrut_tid_c} {scrut_tmp} = {expr_result_str};")
                 } else {
                     let res_c = result_c_type(rok, rerr)
                     emit_line("{res_c} {scrut_tmp} = {expr_result_str};")
@@ -1108,15 +1115,20 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                     set_var_option_struct(scrut_tmp, oi, oi_s)
                     set_var_option_erased(scrut_tmp, 1)
                 } else if is_compound_ct(tc_tid_option_inner_ct(tc_tid_resolved(cg_node_mono_tid(scrut)))) != 0 && c_type_from_tid(cg_node_mono_tid(scrut)).starts_with("blink_Option_") {
-                    // A compound inner (`Option[Map[K,V]]`, `Option[Option[T]]`,
-                    // `Option[Result[..]]`) erases through the flat oi/oi_s channels — they
-                    // carry only a one-level inner and spell blink_Option_option /
-                    // blink_Option_map. The scrutinee tid holds the full inner, so lead with
-                    // it for exactly that shape, mirroring the scalar branch below.
+                    // A compound inner (`Option[Map[K,V]]`, `Option[Option[T]]`) erases
+                    // through the flat oi/oi_s channels, which drop the nested args; the
+                    // tid carries the full inner, so lead with it for exactly that shape.
+                    // For a NON-compound inner the split flips (mirrors the CT_RESULT arm
+                    // above): a generic-struct instance erases through the tid to the bare
+                    // head (blink_Option_Inner), while the flat channel keeps the mono
+                    // stem (Inner_0Int) — so the flat branch below must win.
                     let opt_c = c_type_from_tid(cg_node_mono_tid(scrut))
                     emit_line("{opt_c} {scrut_tmp} = {expr_result_str};")
                 } else if oi_s != "" {
                     let opt_c = struct_option_c_type(oi_s)
+                    emit_line("{opt_c} {scrut_tmp} = {expr_result_str};")
+                } else if c_type_from_tid(cg_node_mono_tid(scrut)).starts_with("blink_Option_") {
+                    let opt_c = c_type_from_tid(cg_node_mono_tid(scrut))
                     emit_line("{opt_c} {scrut_tmp} = {expr_result_str};")
                 } else {
                     let opt_c = option_c_type(oi)
@@ -1652,8 +1664,9 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
 // `enum_name` must be one of "Some" / "Ok" / "Err"; `scrut_type` is the
 // scrutinee's compound carrier (CT_OPTION / CT_RESULT). Returns the field
 // name on the carrier ("value" / "ok" / "err"), the inner CT, the inner
-// struct name (or ""), and the payload expression — an enum-by-value box
-// is auto-dereferenced for "value" when the inner is an enum type.
+// struct name (or ""), and the payload expression — a heap-boxed data-enum
+// payload is auto-dereferenced for "value"; transparent newtypes and
+// payload-less enums are stored inline and read by value.
 type UnwrapCarrier {
     field: Str
     inner_ct: Int
@@ -1681,6 +1694,12 @@ fn unwrap_carrier(enum_name: Str, scrut: Str, scrut_type: Int) -> UnwrapCarrier 
         // Transparent newtype (e.g. Option[Errno]): the carrier's `.value` member
         // is a bare int64_t, not a boxed enum pointer — read it directly without
         // the *(blink_Errno*) deref the boxed path uses.
+        "{scrut}.value"
+    } else if field == "value" && inner_struct != "" && is_payloadless_enum(inner_struct) != 0 {
+        // Payload-less enum (e.g. Option[Cmd]): emit_struct_option_typedef stores
+        // the ordinal inline as a bare `{Cmd} value`, mirroring the transparent
+        // newtype above — read it directly. The boxed deref below would treat the
+        // inline ordinal as a pointer and fault.
         "{scrut}.value"
     } else if field == "value" && inner_is_enum {
         "(*({c_type_c_name(inner_struct)}*){scrut}.value)"
@@ -2639,6 +2658,11 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                             if field == "value" && bind_erased != 0 {
                                 // Erased box: .value is a void* to the true struct.
                                 emit_line("{c_type_c_name(inner_struct)} {c_bind} = *({c_type_c_name(inner_struct)}*){scrut}.{field};")
+                            } else if field == "value" && is_payloadless_enum(inner_struct) != 0 {
+                                // Payload-less enum Option carrier is by-value (mirrors
+                                // the err arm's is_boxed_struct_err): bind by identity,
+                                // no deref.
+                                emit_line("{c_type_c_name(inner_struct)} {c_bind} = {scrut}.{field};")
                             } else if field == "value" {
                                 emit_line("{c_type_c_name(inner_struct)} {c_bind} = *{scrut}.{field};")
                             } else if field == "err" && is_boxed_struct_err(inner_struct) != 0 {
@@ -4907,18 +4931,26 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         }
     } else if val_type == CT_OPTION {
         let opt_inner = get_var_option_inner(name)
-        let opt_inner_s = get_var_option_inner_struct(name)
+        let opt_inner_s = get_var_option_inner_tag(name)
         let opt_c_inner = opt_inner
         // A compound inner (`Option[Map[K,V]]`, `Option[Option[T]]`, `Option[Result[..]]`)
         // erases through the flat channels: option_c_type_mixed sees only a one-level inner
         // and drops the args (`blink_Option_map`). The tid carries the full inner, so lead
         // with it for exactly that shape — gated on the inner being compound and the tid
         // spelling a well-formed Option carrier — while a scalar/struct inner keeps the flat
-        // spelling byte-for-byte. The typedef is registered by the producer's signature and
+        // spelling byte-for-byte. Leading with the tid unconditionally would erase a
+        // non-compound generic-struct instance (`Option[Inner[Int]]`) to its bare head
+        // (blink_Option_Inner), dropping the mono stem (Inner_0Int) the flat channel still
+        // carries. The typedef is registered by the producer's signature and
         // return-expression, which the same TU always emits.
         let opt_tid_c = c_type_from_tid(decl_tid)
         let opt_inner_compound = is_compound_ct(tc_tid_option_inner_ct(tc_tid_resolved(decl_tid))) != 0
-        let opt_use_tid = opt_inner_compound && opt_tid_c.starts_with("blink_Option_")
+        // Mirrors the CT_RESULT arm: the flat sname leads only when it holds a mono stem
+        // the tid dropped (generic-struct instance). An empty flat sname means the tid is
+        // at least as specific, so it leads and recovers a payloadless-enum nominal
+        // (`Option[Errno]`) the CT-only mixed spelling would void out.
+        let opt_flat_has_sname = opt_inner_s != ""
+        let opt_use_tid = opt_tid_c.starts_with("blink_Option_") && (opt_inner_compound || opt_flat_has_sname == false)
         // A ptr-erased Option (UE-handler ABI) carries its TRUE logical inner in
         // the flat channels, but its physical value is a blink_Option_ptr box — the
         // declaration must spell the erased carrier to accept it.
@@ -4943,19 +4975,29 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     } else if val_type == CT_RESULT {
         let rok = get_var_result_ok(name)
         let rerr = get_var_result_err(name)
-        let rok_s = get_var_result_ok_struct(name)
-        let rerr_s = get_var_result_err_struct(name)
+        let rok_s = get_var_result_ok_tag(name)
+        let rerr_s = get_var_result_err_tag(name)
         // A compound ok/err inner whose carrier tag embeds args (`Result[Map[K,V], E]`,
         // `Result[Option[T], E]`) erases through the flat channels: result_c_type_mixed
         // sees only a one-level inner and drops the args (`blink_Result_map_str`). The
         // tid carries the full inner, so lead with it for exactly that shape — gated on
         // an inner being compound and the tid spelling a well-formed Result carrier —
-        // while a scalar/struct inner keeps the flat spelling byte-for-byte. Mirrors the
+        // while a scalar/struct inner keeps the flat spelling byte-for-byte. Leading with
+        // the tid unconditionally would erase a non-compound generic-struct instance
+        // (`Result[Inner[Int], Str]`) to its bare head (blink_Result_Inner_str), dropping
+        // the mono stem (Inner_0Int) the flat channel still carries. Mirrors the
         // CT_OPTION arm above.
         let res_tid_r = tc_tid_resolved(decl_tid)
         let res_tid_c = c_type_from_tid(decl_tid)
         let res_inner_compound = is_compound_ct(tc_tid_result_ok_ct(res_tid_r)) != 0 || is_compound_ct(tc_tid_result_err_ct(res_tid_r)) != 0
-        let res_use_tid = res_inner_compound && res_tid_c.starts_with("blink_Result_")
+        // The flat sname channel leads only when it carries a mono stem the tid dropped:
+        // a non-compound generic-struct instance (`Result[Inner[Int], Str]`) keeps
+        // `Inner_0Int` in the flat sname while the tid erases to the bare head
+        // `blink_Result_Inner_str`. When both flat snames are empty the flat channel has
+        // nothing more specific to add, so a well-formed tid leads and recovers a concrete
+        // nominal the CT-only mixed spelling would void out (`Result[Errno, Str]`).
+        let res_flat_has_sname = rok_s != "" || rerr_s != ""
+        let res_use_tid = res_tid_c.starts_with("blink_Result_") && (res_inner_compound || res_flat_has_sname == false)
         let res_c = if res_use_tid { res_tid_c } else { result_c_type_mixed(rok, rerr, rok_s, rerr_s) }
         decl_c = res_c
         decl_branch = if res_use_tid { "result_tid" } else { "result" }
@@ -10889,9 +10931,16 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
                     emit_line("} else if (blink_str_eq(s, \"{evar.str_value}\")) \{")
                 }
                 cg_indent = cg_indent + 1
-                let box_tmp = fresh_temp("_ebox_")
-                emit_line("{cn}* {box_tmp} = ({cn}*)blink_alloc(sizeof({cn})); *{box_tmp} = {cn}_{evar.name};")
-                emit_line("_r.tag = 1; _r.value = {box_tmp};")
+                if is_payloadless_enum(name) != 0 {
+                    // Payload-less enum: the carrier holds the ordinal by value
+                    // (emit_struct_option_typedef spells `{cn} value`), so store it
+                    // inline — the box path would assign a pointer to a value member.
+                    emit_line("_r.tag = 1; _r.value = {cn}_{evar.name};")
+                } else {
+                    let box_tmp = fresh_temp("_ebox_")
+                    emit_line("{cn}* {box_tmp} = ({cn}*)blink_alloc(sizeof({cn})); *{box_tmp} = {cn}_{evar.name};")
+                    emit_line("_r.tag = 1; _r.value = {box_tmp};")
+                }
                 cg_indent = cg_indent - 1
             }
             i = i + 1

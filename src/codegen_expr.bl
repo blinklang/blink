@@ -44,14 +44,15 @@ import codegen_types.{
     get_var_handle_inner, get_var_handle_inner2, get_var_handle_sname, get_var_handle_sname2,
     get_var_iter_next_fn, get_var_iterator_inner, get_var_iter_carrier,
     get_var_option_inner, get_var_option_inner2, get_var_option_inner_tp,
-    get_var_option_inner2_struct, get_var_option_inner_struct, get_var_option_erased,
-    get_var_result_err, get_var_result_err_struct,
-    get_var_result_ok, get_var_result_ok_struct,
+    get_var_option_inner2_struct, get_var_option_inner_struct, get_var_option_inner_nominal, get_var_option_erased,
+    get_var_option_inner_tag, get_var_result_ok_tag, get_var_result_err_tag,
+    get_var_result_err, get_var_result_err_struct, get_var_result_err_nominal,
+    get_var_result_ok, get_var_result_ok_struct, get_var_result_ok_nominal,
     get_var_struct, get_var_tp, get_var_ty, get_var_type, is_module_global,
     get_variant_field_count, get_variant_field_name,
     get_variant_field_type_str, get_variant_index, get_variant_tag,
     get_callee_params_sl,
-    is_compound_ct, is_compound_tag, is_data_enum, is_named_typedef_tag, is_mono_struct_instance, is_transparent_newtype, is_boxed_struct_err, typedef_tag_or_empty,
+    is_compound_ct, is_compound_tag, is_data_enum, is_payloadless_enum, is_named_typedef_tag, is_mono_struct_instance, is_transparent_newtype, is_boxed_struct_err, typedef_tag_or_empty,
     list_named_elem_of, ListNamedElem,
     is_emitted_let, is_enum_type, is_fn_registered, is_generic_fn,
     is_scope_var,
@@ -667,7 +668,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                     expr_option_is_none = 1
                     return
                 }
-                let t_inner_s = get_var_option_inner_struct(cg_assign_target_name)
+                let t_inner_s = get_var_option_inner_tag(cg_assign_target_name)
                 if t_inner_s != "" {
                     set_bare_none_struct_result(t_inner_s)
                     expr_option_is_none = 1
@@ -853,7 +854,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         publish_result_tid(node)
         if expr_result_type == CT_OPTION {
             expr_option_inner = get_var_option_inner(name)
-            expr_option_inner_struct = get_var_option_inner_struct(name)
+            expr_option_inner_struct = get_var_option_inner_nominal(name)
             // Propagate the var's ptr-erased carrier so a match / ?? / store on this
             // Option var reasserts the blink_Option_ptr box and casts its void* payload.
             expr_option_erased = get_var_option_erased(name)
@@ -874,8 +875,8 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         if expr_result_type == CT_RESULT {
             expr_result_ok_type = get_var_result_ok(name)
             expr_result_err_type = get_var_result_err(name)
-            expr_result_ok_struct = get_var_result_ok_struct(name)
-            expr_result_err_struct = get_var_result_err_struct(name)
+            expr_result_ok_struct = get_var_result_ok_nominal(name)
+            expr_result_err_struct = get_var_result_err_nominal(name)
         }
         if expr_result_type == CT_ITERATOR {
             expr_iter_next_fn = get_var_iter_next_fn(name)
@@ -2164,7 +2165,11 @@ fn emit_await_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         let err_ct = if inner2 >= 0 { inner2 } else { CT_STRING }
         let ok_struct = if (ok_ct == CT_VOID || ok_ct == CT_STRUCT || ok_ct == CT_ENUM) && is_struct_or_enum_type(handle_sname) != 0 { handle_sname } else { "" }
         let err_struct = if sname2 != "" && is_struct_or_enum_type(sname2) != 0 { sname2 } else { "" }
-        let res_c_type = result_c_type_mixed(ok_ct, err_ct, ok_struct, err_struct)
+        // The whole-carrier spelling is the authoritative tid's, so an await materializes the same
+        // struct type the awaited value was produced with; the flat reconstruction only fills scalar
+        // carriers whose tid does not spell a registered Result carrier.
+        let res_tid_c = c_type_from_tid(cg_node_mono_tid(node))
+        let res_c_type = if res_tid_c.starts_with("blink_Result_") { res_tid_c } else { result_c_type_mixed(ok_ct, err_ct, ok_struct, err_struct) }
         let unboxed = fresh_temp("__ures_")
         emit_line("{res_c_type} {unboxed} = *({res_c_type}*){tmp};")
         set_var_result_struct(unboxed, ok_ct, err_ct, ok_struct, err_struct)
@@ -2287,6 +2292,23 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
                 emit_line("{c_type_c_name(opt_inner_s)} {val_tmp} = {tmp}.tag == 1 ? *({c_type_c_name(opt_inner_s)}*){tmp}.value : {right_str};")
                 set_var_struct(val_tmp, opt_inner_s)
                 expr_result_type = right_type
+                publish_result_tid(node)
+            } else if is_payloadless_enum(opt_inner_s) != 0 {
+                // By-value nominal carrier (blink_Option_<enum>): the ordinal lives
+                // inline, so read {tmp}.value directly — the boxed deref below would
+                // treat the ordinal as a pointer.
+                emit_line("{c_type_c_name(opt_inner_s)} {val_tmp} = {tmp}.tag == 1 ? {tmp}.value : {right_str};")
+                set_var_struct(val_tmp, opt_inner_s)
+                expr_result_type = right_type
+                publish_result_tid(node)
+            } else if is_transparent_newtype(opt_inner_s) != 0 {
+                // Transparent newtype (Errno): the carrier holds a bare int64_t
+                // inline and the default operand also lowers to that scalar, so read
+                // {tmp}.value by identity — the boxed deref below would treat it as a
+                // pointer. The match resolves the variant from its arm (like unwrap).
+                emit_line("int64_t {val_tmp} = {tmp}.tag == 1 ? {tmp}.value : {right_str};")
+                set_var(val_tmp, CT_INT, 0)
+                expr_result_type = CT_INT
                 publish_result_tid(node)
             } else {
                 emit_line("{c_type_c_name(opt_inner_s)} {val_tmp} = {tmp}.tag == 1 ? *{tmp}.value : {right_str};")
@@ -2917,6 +2939,19 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                         expr_result_type = CT_INT
                         publish_result_tid(node)
                         set_var_struct(expr_result_str, opt_inner_s)
+                    } else if is_payloadless_enum(opt_inner_s) != 0 {
+                        // By-value ordinal carrier: read {tmp}.value directly. The
+                        // boxed deref below would treat the inline ordinal as a pointer.
+                        expr_result_str = "{tmp}.value"
+                        expr_result_type = CT_INT
+                        publish_result_tid(node)
+                        set_var_struct(expr_result_str, opt_inner_s)
+                    } else if is_transparent_newtype(opt_inner_s) != 0 {
+                        // Transparent newtype (Errno): the carrier holds a bare
+                        // int64_t inline — read {tmp}.value by identity, no deref.
+                        expr_result_str = "{tmp}.value"
+                        expr_result_type = CT_INT
+                        publish_result_tid(node)
                     } else {
                         expr_result_str = "(*{tmp}.value)"
                         expr_result_type = CT_INT
@@ -2995,6 +3030,19 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                         expr_result_type = CT_INT
                         publish_result_tid(node)
                         set_var_struct(expr_result_str, opt_inner_s)
+                    } else if is_payloadless_enum(opt_inner_s) != 0 {
+                        // By-value ordinal carrier: read {tmp}.value directly. The
+                        // boxed deref below would treat the inline ordinal as a pointer.
+                        expr_result_str = "{tmp}.value"
+                        expr_result_type = CT_INT
+                        publish_result_tid(node)
+                        set_var_struct(expr_result_str, opt_inner_s)
+                    } else if is_transparent_newtype(opt_inner_s) != 0 {
+                        // Transparent newtype (Errno): the carrier holds a bare
+                        // int64_t inline — read {tmp}.value by identity, no deref.
+                        expr_result_str = "{tmp}.value"
+                        expr_result_type = CT_INT
+                        publish_result_tid(node)
                     } else {
                         expr_result_str = "(*{tmp}.value)"
                         expr_result_type = CT_INT
@@ -5168,6 +5216,17 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                         expr_option_inner = inner_type
                         expr_option_inner_struct = inner_s
                         expr_option_erased = 1
+                    } else if is_payloadless_enum(inner_s) != 0 {
+                        // Payload-less enum: by-value nominal carrier, no heap box —
+                        // mirrors the transparent-newtype construct above and the
+                        // Result err-enum arm. The ordinal is stored inline in .value.
+                        ensure_struct_option_type(inner_s)
+                        let opt_type = struct_option_c_type(inner_s)
+                        expr_result_str = "({opt_type})\{.tag = 1, .value = {inner_str}}"
+                        expr_result_type = CT_OPTION
+                        publish_result_tid(node)
+                        expr_option_inner = inner_type
+                        expr_option_inner_struct = inner_s
                     } else {
                         ensure_struct_option_type(inner_s)
                         let opt_type = struct_option_c_type(inner_s)
@@ -5339,9 +5398,9 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 // (ok_type) still comes from the emitted arg; only the carrier NAME
                 // (ok_s/err_s) is taken from the target.
                 if cg_assign_target_name != "" && get_var_type(cg_assign_target_name) == CT_RESULT {
-                    let t_ok_s = get_var_result_ok_struct(cg_assign_target_name)
+                    let t_ok_s = get_var_result_ok_tag(cg_assign_target_name)
                     let t_err_t = get_var_result_err(cg_assign_target_name)
-                    let t_err_s = get_var_result_err_struct(cg_assign_target_name)
+                    let t_err_s = get_var_result_err_tag(cg_assign_target_name)
                     emit_ok_result(ok_str, ok_type, t_err_t, t_ok_s, t_err_s)
                     return
                 }
@@ -5448,8 +5507,8 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 if cg_assign_target_name != "" && get_var_type(cg_assign_target_name) == CT_RESULT {
                     let t_ok_t = get_var_result_ok(cg_assign_target_name)
                     let t_err_t = get_var_result_err(cg_assign_target_name)
-                    let t_ok_s = get_var_result_ok_struct(cg_assign_target_name)
-                    let t_err_s = get_var_result_err_struct(cg_assign_target_name)
+                    let t_ok_s = get_var_result_ok_tag(cg_assign_target_name)
+                    let t_err_s = get_var_result_err_tag(cg_assign_target_name)
                     emit_err_result(err_str, t_ok_t, t_err_t, t_ok_s, t_err_s)
                     return
                 }

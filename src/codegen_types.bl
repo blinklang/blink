@@ -5273,6 +5273,46 @@ pub fn is_str_backed_enum(name: Str) -> Int {
     0
 }
 
+// The logical enum name a type-spelling denotes, or "" when it is not an enum.
+// Accepts the bare name, a dot-qualified form, and the canonical underscore-joined
+// carrier tag (`test_mod_Cmd`) that emit_struct_option_typedef and the other
+// carrier-tag seams carry — enum_reg_set is keyed on the bare logical name, so a
+// C tag must be walked back to it (mirrors resolve_struct_from_c_name, longest
+// suffix first) or the two-namespace split makes the typedef and constructor
+// disagree on by-value vs boxed.
+pub fn enum_logical_name(name: Str) -> Str {
+    if enum_reg_set.contains_key(name) != 0 { return name }
+    let bare = strip_module_qualifier(name)
+    if bare != name && enum_reg_set.contains_key(bare) != 0 { return bare }
+    // A compound carrier tag (Result_/Option_/Map_) merely CONTAINS an enum
+    // component; it is not the enum itself. The suffix-walk below would
+    // false-match that component (mirrors is_transparent_newtype's guard).
+    if is_compound_tag(name) != 0 { return "" }
+    // A tag that resolves to a struct/mono-struct instance is not an enum; the
+    // suffix-walk would otherwise match a trailing enum-named component of a
+    // struct's C tag (e.g. `Foo_Bar` with a sibling enum `Bar`).
+    if resolve_struct_from_c_name(name) != "" { return "" }
+    let mut i = 0
+    while i < name.len() {
+        if name.byte_at(i) == 95 { // '_'
+            let suffix = name.substring(i + 1, name.len() - i - 1)
+            if enum_reg_set.contains_key(suffix) != 0 { return suffix }
+        }
+        i = i + 1
+    }
+    ""
+}
+
+// A payload-less enum (every variant nullary) lowers to a bare ordinal, so its
+// Option/List carrier holds the enum BY VALUE — the same treatment
+// is_boxed_struct_err gives a payload-less enum err arm, never a heap box.
+pub fn is_payloadless_enum(name: Str) -> Int {
+    let logical = enum_logical_name(name)
+    if logical == "" { return 0 }
+    if is_data_enum(logical) != 0 { return 0 }
+    1
+}
+
 pub fn get_variant_index(enum_name: Str, variant_name: Str) -> Int {
     let key = enum_name.concat("|").concat(variant_name)
     match enum_variant_full_idx.get(key) {
@@ -7817,14 +7857,14 @@ pub fn compound_option_inner_name(inner_type: Int, inner_str: Str) -> Str {
     if inner_type == CT_RESULT {
         let ok_t = get_var_result_ok(inner_str)
         let err_t = get_var_result_err(inner_str)
-        let ok_s = get_var_result_ok_struct(inner_str)
-        let err_s = get_var_result_err_struct(inner_str)
+        let ok_s = get_var_result_ok_tag(inner_str)
+        let err_s = get_var_result_err_tag(inner_str)
         let ok_tag = if ok_s != "" { ok_s } else { c_type_tag(ok_t) }
         let err_tag = if err_s != "" { err_s } else { c_type_tag(err_t) }
         "Result_{ok_tag}_{err_tag}"
     } else if inner_type == CT_OPTION {
         let opt_inner = get_var_option_inner(inner_str)
-        let opt_inner_s = get_var_option_inner_struct(inner_str)
+        let opt_inner_s = get_var_option_inner_tag(inner_str)
         let inner_tag = if opt_inner_s != "" { opt_inner_s } else { c_type_tag(opt_inner) }
         "Option_{inner_tag}"
     } else if inner_type == CT_MAP {
@@ -8225,6 +8265,18 @@ fn sev_plain_struct(s: Str) -> Str {
     if s != "" && struct_def_is_generic(s) == 0 && is_transparent_newtype(s) == 0 && (is_enum_type(s) == 0 || is_data_enum(s) != 0) { s } else { "" }
 }
 
+// A payloadless enum stores its ordinal in a bare int, so sev_plain_struct declines it (a
+// value-access reader keeps the value a scalar). Its CARRIER TAG still needs the nominal, because
+// a payloadless enum is a distinct C type (blink_Grade) and the carrier is blink_Result_int_Grade
+// with a `blink_Grade` field — so the carrier-tag accessors admit it here where the value readers
+// decline. A TRANSPARENT newtype is NOT admitted here: its carrier tag DOES keep the nominal
+// (blink_Result_Errno_str, over a bare int64_t field), but that nominal is recovered through the
+// tid/flat channel, so this scalar-nominal channel declines it to avoid double-sourcing the name. A
+// generic-def bare head also declines (its mono stem is the tag; a bare head erases the args).
+fn sev_scalar_nominal_name(s: Str) -> Str {
+    if s != "" && struct_def_is_generic(s) == 0 && is_transparent_newtype(s) == 0 && is_enum_type(s) != 0 && is_data_enum(s) == 0 { s } else { "" }
+}
+
 fn sev_option_inner_name(bt: Int) -> Str {
     let mono = tc_tid_option_inner_struct_mono(bt)
     if mono != "" { return mono }
@@ -8233,11 +8285,96 @@ fn sev_option_inner_name(bt: Int) -> Str {
     sev_nested_carrier_tag(tc_tid_option_inner_tid(bt))
 }
 
+// The flat-channel struct-name fallback for a carrier accessor whose tid answer is
+// unusable. A generic-instance inner (Box[Int]) reaches these accessors with a tid
+// that resolves only to the erased generic head (Box) — its mono args live on the
+// map/list value tid, which upstream erases — while set_var_*_struct stamped the
+// flat sname channel with the real mono stem (Box_0Int). The flat channel is
+// authoritative for that stem BY DESIGN (see sev_plain_struct). So prefer the tid
+// answer whenever it is a real resolved name, and fall back to the flat mono stem
+// only when the tid could spell nothing better than a generic head.
+fn carrier_sname_or_flat(tid_ans: Str, flat: Str) -> Str {
+    if tid_ans != "" && struct_def_is_generic(tid_ans) == 0 { return tid_ans }
+    if flat != "" && struct_def_is_generic(flat) == 0 { return flat }
+    tid_ans
+}
+
+// A `tid_ans == ""` is two-faced: the tid could not SPELL the inner (a
+// generic-instance erased to its bare head, whose mono stem lives only on the
+// flat channel) or the tid DECLINED it on purpose (a transparent newtype /
+// payloadless enum, stored scalar). The two flat variants below diverge on which
+// of those the flat fallback is allowed to speak for.
+//
+// VALUE access must keep a scalar-stored inner by-value, so its flat fallback is
+// filtered through sev_plain_struct — it resurrects only a real struct / data
+// enum / mono stem, never a transparent newtype or payloadless enum.
+fn carrier_sname_or_flat_value(tid_ans: Str, flat: Str) -> Str {
+    if tid_ans != "" && struct_def_is_generic(tid_ans) == 0 { return tid_ans }
+    let flat_ok = sev_plain_struct(flat)
+    if flat_ok != "" { return flat_ok }
+    tid_ans
+}
+
+// The carrier TAG names the C carrier type, which must match the nominal the
+// producer registered — a transparent newtype (blink_Result_Errno_str, over a
+// bare int64_t field) and a payloadless enum (blink_Option_Grade, with a
+// `blink_Grade` field) both keep their nominal there, exactly as the constructor emits it. So the tag reader
+// admits ANY non-generic flat nominal (the flat channel carries a generic
+// instance as its mono stem, never a bare head, so the generic guard only ever
+// rejects a raw generic-def name). Mirrors the unfiltered flat fallback the
+// pre-tid readers used, which an await-bound carrier still relies on for its
+// err arm.
+fn carrier_sname_or_flat_tag(tid_ans: Str, flat: Str) -> Str {
+    carrier_sname_or_flat(tid_ans, flat)
+}
+
 pub fn get_var_option_inner_struct(name: Str) -> Str {
     let t = get_sv_ty(name, CT_OPTION)
-    let sever = if t >= 0 { sev_option_inner_name(cg_bind_mono_tid(t)) } else { "" }
-    if sever != "" { return sever }
-    get_sv_sname(name, CT_OPTION)
+    let tid_ans = if t >= 0 { sev_option_inner_name(cg_bind_mono_tid(t)) } else { "" }
+    carrier_sname_or_flat_value(tid_ans, get_sv_sname(name, CT_OPTION))
+}
+
+// Carrier-tag twin of sev_option_inner_name: identical, except it admits a scalar-erased
+// nominal (transparent newtype / payloadless enum) that the value-access twin declines, so an
+// Option[Code] carrier is named blink_Option_std_x_Code rather than losing the tag.
+fn sev_option_inner_tag(bt: Int) -> Str {
+    let mono = tc_tid_option_inner_struct_mono(bt)
+    if mono != "" { return mono }
+    let s = tc_tid_option_inner_struct(bt)
+    let plain = sev_plain_struct(s)
+    if plain != "" { return plain }
+    let nominal = sev_scalar_nominal_name(s)
+    if nominal != "" { return nominal }
+    sev_nested_carrier_tag(tc_tid_option_inner_tid(bt))
+}
+
+// ROLE-1 carrier-tag accessor: the struct-name half that option_c_type_mixed expects, recovered
+// from the authoritative tid and admitting scalar-erased nominals. The value-access reader
+// (get_var_option_inner_struct) still declines those so a value stays by-value; these two roles
+// diverge only for a transparent newtype / payloadless enum inner.
+pub fn get_var_option_inner_tag(name: Str) -> Str {
+    let t = get_sv_ty(name, CT_OPTION)
+    let tid_ans = if t >= 0 { sev_option_inner_tag(cg_bind_mono_tid(t)) } else { "" }
+    carrier_sname_or_flat_tag(tid_ans, get_sv_sname(name, CT_OPTION))
+}
+
+// VALUE-ACCESS nominal: the raw inner nominal for EVERY nominal inner — struct, data enum,
+// payloadless enum AND transparent newtype (which the carrier-tag twin erases). An unwrap /
+// match-bind reads this to pick deref-vs-scalar handling and to name the bound value's type;
+// it must see the transparent newtype ("Errno") to take the scalar branch, and the payloadless
+// enum ("Cmd") to take the boxed branch. Answers "" only for a genuine primitive scalar.
+fn sev_option_inner_nominal(bt: Int) -> Str {
+    let mono = tc_tid_option_inner_struct_mono(bt)
+    if mono != "" { return mono }
+    let s = tc_tid_option_inner_struct(bt)
+    if s != "" { return s }
+    sev_nested_carrier_tag(tc_tid_option_inner_tid(bt))
+}
+
+pub fn get_var_option_inner_nominal(name: Str) -> Str {
+    let t = get_sv_ty(name, CT_OPTION)
+    let tid_ans = if t >= 0 { sev_option_inner_nominal(cg_bind_mono_tid(t)) } else { "" }
+    carrier_sname_or_flat(tid_ans, get_sv_sname(name, CT_OPTION))
 }
 
 // Mark an Option var as physically ptr-erased to the shared handler-vtable ABI.
@@ -8466,16 +8603,86 @@ fn sev_result_err_name(bt: Int) -> Str {
 
 pub fn get_var_result_ok_struct(name: Str) -> Str {
     let t = get_sv_ty(name, CT_RESULT)
-    let sever = if t >= 0 { sev_result_ok_name(cg_bind_mono_tid(t)) } else { "" }
-    if sever != "" { return sever }
-    get_sv_sname(name, CT_RESULT)
+    let tid_ans = if t >= 0 { sev_result_ok_name(cg_bind_mono_tid(t)) } else { "" }
+    carrier_sname_or_flat_value(tid_ans, get_sv_sname(name, CT_RESULT))
 }
 
 pub fn get_var_result_err_struct(name: Str) -> Str {
     let t = get_sv_ty(name, CT_RESULT)
-    let sever = if t >= 0 { sev_result_err_name(cg_bind_mono_tid(t)) } else { "" }
-    if sever != "" { return sever }
-    get_sv_sname2(name, CT_RESULT)
+    let tid_ans = if t >= 0 { sev_result_err_name(cg_bind_mono_tid(t)) } else { "" }
+    carrier_sname_or_flat_value(tid_ans, get_sv_sname2(name, CT_RESULT))
+}
+
+// Carrier-tag twins of sev_result_ok_name / sev_result_err_name: identical, except they admit a
+// scalar-erased nominal (transparent newtype / payloadless enum) that the value-access twins
+// decline, so a Result[Int, Code] err carrier is named blink_Result_int_std_x_Code, not _void.
+fn sev_result_ok_tag(bt: Int) -> Str {
+    let mono = tc_tid_result_ok_struct_mono(bt)
+    if mono != "" { return mono }
+    let s = tc_tid_result_ok_struct(bt)
+    let plain = sev_plain_struct(s)
+    if plain != "" { return plain }
+    let nominal = sev_scalar_nominal_name(s)
+    if nominal != "" { return nominal }
+    sev_nested_carrier_tag(tc_tid_result_ok_tid(bt))
+}
+
+fn sev_result_err_tag(bt: Int) -> Str {
+    let mono = tc_tid_result_err_struct_mono(bt)
+    if mono != "" { return mono }
+    let s = tc_tid_result_err_struct(bt)
+    let plain = sev_plain_struct(s)
+    if plain != "" { return plain }
+    let nominal = sev_scalar_nominal_name(s)
+    if nominal != "" { return nominal }
+    sev_nested_carrier_tag(tc_tid_result_err_tid(bt))
+}
+
+// ROLE-1 carrier-tag accessors: the struct-name halves that result_c_type_mixed expects,
+// recovered from the authoritative tid and admitting scalar-erased nominals. The value-access
+// readers (get_var_result_ok_struct / _err_struct) still decline those so an unwrapped value
+// stays by-value; the roles diverge only for a transparent newtype / payloadless enum inner.
+pub fn get_var_result_ok_tag(name: Str) -> Str {
+    let t = get_sv_ty(name, CT_RESULT)
+    let tid_ans = if t >= 0 { sev_result_ok_tag(cg_bind_mono_tid(t)) } else { "" }
+    carrier_sname_or_flat_tag(tid_ans, get_sv_sname(name, CT_RESULT))
+}
+
+pub fn get_var_result_err_tag(name: Str) -> Str {
+    let t = get_sv_ty(name, CT_RESULT)
+    let tid_ans = if t >= 0 { sev_result_err_tag(cg_bind_mono_tid(t)) } else { "" }
+    carrier_sname_or_flat_tag(tid_ans, get_sv_sname2(name, CT_RESULT))
+}
+
+// VALUE-ACCESS nominals: the raw ok/err nominal for EVERY nominal inner, transparent newtypes
+// included (which the carrier-tag twins erase). Value-access unwrap/match-bind reads these to
+// pick deref-vs-scalar handling and name the bound value; "" only for a primitive scalar.
+fn sev_result_ok_nominal(bt: Int) -> Str {
+    let mono = tc_tid_result_ok_struct_mono(bt)
+    if mono != "" { return mono }
+    let s = tc_tid_result_ok_struct(bt)
+    if s != "" { return s }
+    sev_nested_carrier_tag(tc_tid_result_ok_tid(bt))
+}
+
+fn sev_result_err_nominal(bt: Int) -> Str {
+    let mono = tc_tid_result_err_struct_mono(bt)
+    if mono != "" { return mono }
+    let s = tc_tid_result_err_struct(bt)
+    if s != "" { return s }
+    sev_nested_carrier_tag(tc_tid_result_err_tid(bt))
+}
+
+pub fn get_var_result_ok_nominal(name: Str) -> Str {
+    let t = get_sv_ty(name, CT_RESULT)
+    let tid_ans = if t >= 0 { sev_result_ok_nominal(cg_bind_mono_tid(t)) } else { "" }
+    carrier_sname_or_flat(tid_ans, get_sv_sname(name, CT_RESULT))
+}
+
+pub fn get_var_result_err_nominal(name: Str) -> Str {
+    let t = get_sv_ty(name, CT_RESULT)
+    let tid_ans = if t >= 0 { sev_result_err_nominal(cg_bind_mono_tid(t)) } else { "" }
+    carrier_sname_or_flat(tid_ans, get_sv_sname2(name, CT_RESULT))
 }
 
 pub fn get_var_result_ok_elem(name: Str) -> Int {
@@ -8948,6 +9155,12 @@ pub fn emit_struct_option_typedef(struct_name: Str) ! Codegen.Emit {
         // boxed — mirror the Result carrier which stores the scalar inline. The
         // else-branch's int64_t* boxing would force a heap pointer the construct
         // and match paths don't allocate.
+        emit_line("typedef struct \{ int tag; {inner_c} value; } {tname};")
+    } else if is_payloadless_enum(tag) != 0 {
+        // Payload-less enum: a bare ordinal, stored inline like the transparent
+        // newtype and the Result err-enum arm (is_boxed_struct_err). The
+        // else-branch's pointer boxing would heap-allocate an ordinal and force
+        // the consumer to deref it as a pointer.
         emit_line("typedef struct \{ int tag; {inner_c} value; } {tname};")
     } else if inner_c.ends_with("*") {
         emit_line("typedef struct \{ int tag; {inner_c} value; } {tname};")

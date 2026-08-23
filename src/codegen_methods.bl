@@ -36,13 +36,13 @@ import codegen_types.{
     get_struct_field_closure_sig, get_struct_field_type,
     get_var_channel_inner, get_var_enum, get_var_iterator_inner,
     get_var_option_inner, get_var_option_inner2, get_var_option_inner2_struct,
-    get_var_option_inner_struct, get_var_option_inner_tp, get_var_option_erased,
+    get_var_option_inner_struct, get_var_option_inner_tag, get_var_option_inner_nominal, get_var_option_inner_tp, get_var_option_erased,
     get_var_result_err, get_var_result_err_struct,
     get_var_result_ok, get_var_result_ok_elem, get_var_result_ok_elem_struct,
     get_var_result_ok_struct, get_var_struct,
     get_variant_field_count, get_variant_field_name,
     get_variant_field_type_str, get_variant_index, get_variant_tag,
-    has_derive_method, is_compound_ct, is_data_enum, is_enum_type, is_fn_registered, is_scope_var, is_str_backed_enum, strip_generic_args,
+    has_derive_method, is_compound_ct, is_data_enum, is_enum_type, is_payloadless_enum, is_fn_registered, is_scope_var, is_str_backed_enum, strip_generic_args,
     is_generic_fn, is_mono_struct_instance, is_struct_type, is_struct_or_enum_type, is_trait_type, is_transparent_newtype, is_boxed_struct_err, is_user_effect_handle,
     cg_expect_fn_value_sig, cg_expect_arg_ann, arg_type_ann_at, get_callee_params_sl,
     builtin_receiver_type_name,
@@ -670,7 +670,20 @@ fn emit_result_unwrap_inner(
     // precedes the value binding, so emit it once here. Branches differ only in
     // how they bind and type the success value.
     emit_panic_tag_check_render(tmp, panic_tag, panic_msg, rendered, node)
-    if inner_s != "" && is_compound_ct(inner_t) == 0 {
+    if inner_s != "" && is_transparent_newtype(inner_s) != 0 && is_compound_ct(inner_t) == 0 {
+        // A transparent newtype arm lowers to its underlying scalar: the carrier
+        // member is a bare int64_t, so the binder is int64_t and the value stays
+        // scalar (no struct-typing, or the intermediate `let e = r.unwrap()`
+        // would declare a `blink_Errno` from a bare int). The enum identity is
+        // recorded via var_enums so a downstream `match e { Errno(x) => x }`
+        // still resolves the variant. Mirrors unwrap_carrier's transparent arm.
+        let val_tmp = fresh_temp(if is_ok { "_runv_" } else { "_ruerr_" })
+        emit_line("int64_t {val_tmp} = {tmp}.{field};")
+        set_var(val_tmp, CT_INT, 0)
+        var_enums.push(VarEnumEntry { name: val_tmp, enum_type: inner_s })
+        expr_result_str = val_tmp
+        expr_result_type = CT_INT
+    } else if inner_s != "" && is_compound_ct(inner_t) == 0 {
         let val_tmp = fresh_temp(if is_ok { "_runv_" } else { "_ruerr_" })
         // C2: a struct-typed err arm is boxed by pointer; `.unwrap_err()` copies
         // the struct out of the box. The ok arm is never boxed.
@@ -1490,7 +1503,29 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
         let idx_tmp = fresh_temp("_lgi_")
         emit_line("int64_t {idx_tmp} = {idx_str};")
         let res = fresh_temp("_lget_")
-        if (elem_type == CT_VOID || elem_type == CT_STRUCT || elem_type == CT_ENUM) && elem_struct != "" {
+        // A plain-enum element is erased to its CT_INT ordinal in the flat list
+        // channel, so its identity survives only on the .get result tid — the same
+        // tid the consumer reads. Recover the enum from there and lift the ordinal
+        // into a by-VALUE nominal Option carrier the consumer's spelling agrees with.
+        let lget_inner = tc_tid_option_inner_struct(cm_node_mono_tid(node))
+        let plain_enum = if lget_inner != "" && is_payloadless_enum(lget_inner) != 0 { lget_inner } else { "" }
+        if plain_enum != "" {
+            // Payload-less enum element: stored as its ordinal, lifted here into a
+            // by-VALUE nominal Option carrier (blink_Option_<Enum>) — no pointer box,
+            // no deref, mirroring the Result err-enum. The tid names the enum, so the
+            // consumer spells the same carrier from that tid.
+            ensure_struct_option_type(plain_enum)
+            let opt_type = struct_option_c_type(plain_enum)
+            emit_line("{opt_type} {res};")
+            emit_line("if (blink_list_in_bounds({obj_str}, {idx_tmp})) \{")
+            emit_line("    {res}.tag = 1; {res}.value = ({c_type_c_name(plain_enum)})(intptr_t)blink_list_get({obj_str}, {idx_tmp});")
+            emit_line("} else \{ {res}.tag = 0; }")
+            set_var_option_struct(res, CT_VOID, plain_enum)
+            expr_result_str = res
+            expr_result_type = CT_OPTION
+            expr_option_inner = CT_VOID
+            expr_option_inner_struct = plain_enum
+        } else if (elem_type == CT_VOID || elem_type == CT_STRUCT || elem_type == CT_ENUM) && elem_struct != "" {
             ensure_struct_option_type(elem_struct)
             let opt_type = struct_option_c_type(elem_struct)
             emit_line("{opt_type} {res};")
@@ -2051,7 +2086,24 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str, fb_key_c
             stamp_container_option_temp(res, node)
             return 1
         }
-        if vstruct != "" {
+        // A payload-less enum value is erased to its CT_INT ordinal in the flat map
+        // channel, so its identity survives only on the .get result tid. Recover the
+        // enum from there and lift the ordinal into a by-VALUE nominal Option carrier
+        // the consumer's spelling agrees with — mirroring the list.get plain-enum arm.
+        let mget_enum = tc_tid_option_inner_struct(cm_node_mono_tid(node))
+        if mget_enum != "" && is_payloadless_enum(mget_enum) != 0 {
+            ensure_struct_option_type(mget_enum)
+            let opt_type = struct_option_c_type(mget_enum)
+            emit_line("{opt_type} {res};")
+            emit_line("if (blink_map_has({obj_str}, {key_expr})) \{")
+            emit_line("    {res}.tag = 1; {res}.value = ({c_type_c_name(mget_enum)})(intptr_t)blink_map_get({obj_str}, {key_expr});")
+            emit_line("} else \{ {res}.tag = 0; }")
+            set_var_option_struct(res, CT_VOID, mget_enum)
+            expr_result_str = res
+            expr_result_type = CT_OPTION
+            expr_option_inner = CT_VOID
+            expr_option_inner_struct = mget_enum
+        } else if vstruct != "" {
             ensure_struct_option_type(vstruct)
             let opt_type = struct_option_c_type(vstruct)
             emit_line("{opt_type} {res};")
@@ -5124,6 +5176,31 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 expr_option_inner_struct = carrier
                 return
             }
+            // The iterator erases a plain-enum element to its CT_INT ordinal (opt_t is
+            // blink_Option_int), so the found element's identity survives only on the
+            // .find result tid. Recover the enum from there and lift the ordinal into a
+            // by-VALUE nominal Option carrier — mirroring the list.get plain-enum arm.
+            let find_enum = tc_tid_option_inner_struct(cm_node_mono_tid(node))
+            if find_enum != "" && is_payloadless_enum(find_enum) != 0 {
+                ensure_struct_option_type(find_enum)
+                let res_opt_t = struct_option_c_type(find_enum)
+                let result_var = fresh_temp("__find_")
+                emit_line("{res_opt_t} {result_var} = ({res_opt_t})\{.tag = 0};")
+                emit_line("while (1) \{")
+                cg_indent = cg_indent + 1
+                emit_line("{opt_t} {next_var} = (({opt_t} (*)(void*)){src_next})(&{src_var});")
+                emit_line("if ({next_var}.tag == 0) break;")
+                emit_line("if ((({fn_sig}){fn_str}->fn_ptr)({fn_str}, {next_var}.value)) \{ {result_var} = ({res_opt_t})\{.tag = 1, .value = ({c_type_c_name(find_enum)})(intptr_t){next_var}.value}; break; }")
+                cg_indent = cg_indent - 1
+                emit_line("}")
+                set_var_option_struct(result_var, CT_VOID, find_enum)
+                stamp_container_option_temp(result_var, node)
+                expr_result_str = result_var
+                expr_result_type = CT_OPTION
+                expr_option_inner = CT_VOID
+                expr_option_inner_struct = find_enum
+                return
+            }
             ensure_option_type(elem_type)
             let result_var = fresh_temp("__find_")
             emit_line("{opt_t} {result_var} = ({opt_t})\{.tag = 0};")
@@ -5508,7 +5585,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         if method == "unwrap" {
             let sv_inner = get_var_option_inner(obj_str)
             let inner = if sv_inner != -1 { sv_inner } else { expr_option_inner }
-            let sv_inner_s = get_var_option_inner_struct(obj_str)
+            let sv_inner_s = get_var_option_inner_nominal(obj_str)
             let inner_s = if sv_inner_s != "" { sv_inner_s } else { expr_option_inner_struct }
             let erased = if sv_inner != -1 { get_var_option_erased(obj_str) } else { expr_option_erased }
             let tmp = fresh_temp("_ounw_")
@@ -5522,6 +5599,21 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 let val_tmp = fresh_temp("_ounv_")
                 emit_line("int64_t {val_tmp} = {tmp}.value;")
                 set_var(val_tmp, CT_INT, 0)
+                expr_result_str = val_tmp
+                expr_result_type = CT_INT
+            } else if inner_s != "" && is_payloadless_enum(inner_s) != 0 {
+                // Payload-less enum: the carrier holds the ordinal by value, so
+                // unwrap reads it by identity (no deref) — mirroring the
+                // transparent-newtype branch. The enum identity is registered so a
+                // downstream match on the result resolves its variants.
+                let opt_c = struct_option_c_type(inner_s)
+                emit_line("{opt_c} {tmp} = {obj_str};")
+                emit_panic_tag_check(tmp, 0, "unwrap called on None", node)
+                let val_tmp = fresh_temp("_ounv_")
+                emit_line("{c_type_c_name(inner_s)} {val_tmp} = {tmp}.value;")
+                set_var(val_tmp, CT_INT, 0)
+                set_var_struct(val_tmp, inner_s)
+                var_enums.push(VarEnumEntry { name: val_tmp, enum_type: inner_s })
                 expr_result_str = val_tmp
                 expr_result_type = CT_INT
             } else if inner_s != "" && is_compound_ct(inner) == 0 {
