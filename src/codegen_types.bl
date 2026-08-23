@@ -5427,6 +5427,19 @@ pub fn get_fn_enum_ret(name: Str) -> Str {
 }
 
 pub fn set_var_struct(name: Str, type_name: Str) {
+    // A declared, non-generic, non-transparent struct/enum name resolves to its
+    // canonical tid via the name->tid registry, so a plain struct/enum var can
+    // carry its type on sv.ty instead of only the flat sname channel. A generic
+    // base (Box), a transparent newtype, and a mangled instance name (Box_0Int,
+    // absent from the registry) resolve to -1 or are guarded out and keep riding
+    // sname. Only stamp a plain value var (Struct/Enum/Void); a compound carrier
+    // (Option/Result/Ptr) keeps sname as its INNER name and must not have its tid
+    // overwritten with the bare inner struct. Never overwrite an existing tid. The
+    // round-trip check adopts the tid only when it spells back the same bare name,
+    // so an alias or re-export whose tid names a different type stays on sname.
+    let resolved = lookup_named_type(type_name)
+    let bare = strip_module_qualifier(type_name)
+    let stamp = if resolved >= 0 && is_transparent_newtype(bare) == 0 && struct_def_is_generic(bare) == 0 && tc_tid_struct(resolved) == bare { resolved } else { -1 }
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -5438,12 +5451,14 @@ pub fn set_var_struct(name: Str, type_name: Str) {
             if sv.ctype == CT_MAP || sv.ctype == CT_SET || sv.ctype == CT_LIST {
                 return
             }
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: type_name, sname2: sv.sname2, ty: sv.ty, tp_id: sv_tp(sv.ctype, sv.inner1, sv.inner2, type_name) })
+            let is_plain_value = sv.ctype == CT_STRUCT || sv.ctype == CT_ENUM || sv.ctype == CT_VOID
+            let newty = if sv.ty >= 0 { sv.ty } else { if is_plain_value { stamp } else { -1 } }
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: type_name, sname2: sv.sname2, ty: newty, tp_id: sv_tp(sv.ctype, sv.inner1, sv.inner2, type_name) })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_VOID, is_mut: 0, inner1: -1, inner2: -1, sname: type_name, sname2: "", ty: -1, tp_id: sv_tp(CT_VOID, -1, -1, type_name) })
+    push_scope_var(ScopeVar { name: name, ctype: CT_VOID, is_mut: 0, inner1: -1, inner2: -1, sname: type_name, sname2: "", ty: stamp, tp_id: sv_tp(CT_VOID, -1, -1, type_name) })
 }
 
 // A scope var's struct name, read tid-first — the authoritative channel. A fully-instantiated
