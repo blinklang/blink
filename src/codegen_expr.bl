@@ -2270,8 +2270,24 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
         emit_expr(node_right(node))
         let right_str = expr_result_str
         let right_type = expr_result_type
+        // Gate on the STRUCTURAL shape of the operand, not expr_option_is_none: that
+        // global reflects the LAST nested None emitted, so a non-None operand whose
+        // subtree ends in a None (e.g. `x ?? g(None)`) would leave it spuriously set.
+        // A bare None is always an Ident named "None" (parens are transparent here).
+        let nr = node_right(node)
+        let right_is_none = if node_kind(nr) == NodeKind.Ident && node_name(nr) == "None" { 1 } else { 0 }
         let tmp = fresh_temp("__opt")
         if opt_inner_s != "" {
+            // A bare `None` default has no carrier context of its own, so it lowered to
+            // `(blink_Option_int){.tag=0}` — a hard cc mismatch against the left inner's
+            // structured carrier. The default's type is fixed by the left Option's inner,
+            // so spell it in that carrier (c_type_c_name(opt_inner_s)), the same type the
+            // struct arms below declare the result with.
+            let none_default = if right_is_none != 0 {
+                "({c_type_c_name(opt_inner_s)})\{.tag = 0}"
+            } else {
+                right_str
+            }
             // A ptr-erased left carries a blink_Option_ptr box with a void* payload;
             // spell the erased carrier and cast the payload back to the true struct.
             let opt_c = if opt_erased != 0 {
@@ -2289,14 +2305,16 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
                 expr_result_type = opt_inner
                 publish_result_tid(node)
             } else if opt_erased != 0 {
-                emit_line("{c_type_c_name(opt_inner_s)} {val_tmp} = {tmp}.tag == 1 ? *({c_type_c_name(opt_inner_s)}*){tmp}.value : {right_str};")
+                emit_line("{c_type_c_name(opt_inner_s)} {val_tmp} = {tmp}.tag == 1 ? *({c_type_c_name(opt_inner_s)}*){tmp}.value : {none_default};")
                 set_var_struct(val_tmp, opt_inner_s)
                 expr_result_type = right_type
                 publish_result_tid(node)
             } else if is_payloadless_enum(opt_inner_s) != 0 {
                 // By-value nominal carrier (blink_Option_<enum>): the ordinal lives
                 // inline, so read {tmp}.value directly — the boxed deref below would
-                // treat the ordinal as a pointer.
+                // treat the ordinal as a pointer. A bare-None default never reaches this
+                // arm (`?? None` only types when the inner is itself an Option), so this
+                // keeps the raw operand string.
                 emit_line("{c_type_c_name(opt_inner_s)} {val_tmp} = {tmp}.tag == 1 ? {tmp}.value : {right_str};")
                 set_var_struct(val_tmp, opt_inner_s)
                 expr_result_type = right_type
@@ -2311,7 +2329,7 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
                 expr_result_type = CT_INT
                 publish_result_tid(node)
             } else {
-                emit_line("{c_type_c_name(opt_inner_s)} {val_tmp} = {tmp}.tag == 1 ? *{tmp}.value : {right_str};")
+                emit_line("{c_type_c_name(opt_inner_s)} {val_tmp} = {tmp}.tag == 1 ? *{tmp}.value : {none_default};")
                 set_var_struct(val_tmp, opt_inner_s)
                 expr_result_type = right_type
                 publish_result_tid(node)

@@ -1,0 +1,85 @@
+// A List[Option[Compound]] element read through the `??` coalesce operator must
+// type its default operand with the true inner element, not an erased `int`. The
+// element Option's inner type is recovered from the flat tp pool, which erases a
+// compound inner (struct / list / set) to CT_INT -- so `.get()` published an
+// erased element type and the coalesce codegen spelled the None/[]/Set() default
+// as `(blink_Option_int){.tag=0}` where `(blink_Option_<compound>){...}` was
+// required, a hard cc failure. The option-inner accessors now lead with the
+// authoritative tid, which carries the real inner across the plain, mono, and
+// generic-fn-return cases alike. The leaf-scalar inner and the match consumer
+// were never erased (match reconstructs from the tid); they guard against
+// regression here.
+type P { x: Int }
+
+fn wrap[T](v: T) -> List[Option[T]] {
+    let xs: List[Option[T]] = [Some(v)]
+    xs
+}
+
+fn dflt(o: Option[Int]) -> Option[P] {
+    Some(P { x: 42 })
+}
+
+test "list-option-int coalesce (leaf scalar, never erased)" {
+    let xs: List[Option[Int]] = [Some(7)]
+    let e = xs.get(0) ?? None
+    assert_eq(e ?? 0, 7)
+}
+
+test "list-option-struct coalesce types the default from the tid" {
+    let xs: List[Option[P]] = [Some(P { x: 5 })]
+    let e = xs.get(0) ?? None
+    let p = e ?? P { x: 0 }
+    assert_eq(p.x, 5)
+}
+
+test "list-option-list coalesce types the default from the tid" {
+    let inner: List[Int] = [9]
+    let xs: List[Option[List[Int]]] = [Some(inner)]
+    let e = xs.get(0) ?? None
+    let lst = e ?? []
+    assert_eq(lst.get(0) ?? 0, 9)
+}
+
+test "list-option-set coalesce types the default from the tid" {
+    let mut s: Set[Int] = Set()
+    s.insert(1)
+    let xs: List[Option[Set[Int]]] = [Some(s)]
+    let e = xs.get(0) ?? None
+    let got = e ?? Set()
+    assert_eq(got.len(), 1)
+}
+
+test "generic-fn-return list-option-struct coalesce types the default from the tid" {
+    let xs = wrap(P { x: 5 })
+    let e = xs.get(0) ?? None
+    let p = e ?? P { x: 0 }
+    assert_eq(p.x, 5)
+}
+
+test "coalesce default that is a call ending in None keeps the call's value" {
+    // The None-default carrier must be gated on the STRUCTURAL shape of the right
+    // operand, not a residual global: `dflt(None)` is a call whose subtree ends in a
+    // None argument, so a flag-based gate would wrongly spell the default as a bare
+    // (blink_Option_P){.tag=0} and discard dflt's real Some(P{x:42}).
+    let xs: List[Option[P]] = []
+    let e = xs.get(0) ?? dflt(None)
+    match e {
+        Some(p) => { assert_eq(p.x, 42) }
+        None => { assert_eq(0, 1) }
+    }
+}
+
+test "list-option-struct via nested match still resolves the inner field" {
+    let xs: List[Option[P]] = [Some(P { x: 8 })]
+    let e = xs.get(0)
+    match e {
+        Some(inner) => {
+            match inner {
+                Some(p) => { assert_eq(p.x, 8) }
+                None => { assert_eq(1, 2) }
+            }
+        }
+        None => { assert_eq(1, 3) }
+    }
+}
