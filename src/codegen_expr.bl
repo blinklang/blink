@@ -3956,12 +3956,22 @@ fn expect_arg_result_elem(slot: Int) -> Int {
 // Bind a generic fn's struct/tuple return into a temp so the caller's
 // `let x = call()` sees a concrete struct type, and write the expr_result
 // globals. Shared by the tuple-return and plain struct/enum-return paths.
-fn emit_generic_struct_ret_temp(mangled: Str, struct_name: Str, temp_prefix: Str, call_args: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope {
+fn emit_generic_struct_ret_temp(mangled: Str, struct_name: Str, temp_prefix: Str, call_args: Str, node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope {
     reg_fn_struct_ret(mangled, struct_name)
     let g_tmp = fresh_temp(temp_prefix)
     emit_line("{c_type_c_name(struct_name)} {g_tmp} = {c_fn_name(mangled)}({call_args});")
     set_var(g_tmp, CT_STRUCT, 0)
     set_var_struct(g_tmp, struct_name)
+    // This temp has no typecheck node of its own, so let_binding_tid never stamps
+    // it — its struct/tuple name lived only on the flat sname channel. The call
+    // node's mono tid is the value's type; stamp it so the tid leads, gated on the
+    // reader's own round-trip (tid_struct_name == struct_name), so a tid that spells
+    // a different shape — or none (a generic-enum return, the nested-generic bug) —
+    // keeps the flat spelling.
+    if node >= 0 {
+        let g_tid = cg_expr_node_mono_tid(node)
+        if tid_spells_struct(g_tid, struct_name) != 0 { set_var_ty(g_tmp, g_tid) }
+    }
     expr_result_str = g_tmp
     expr_result_type = CT_STRUCT
     publish_result_tid(-1)
@@ -4465,7 +4475,7 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str) -> Int 
         // non-generic struct-value reference path — instead of falling through to a
         // `void` binding. Mirrors emit_generic_struct_ret_temp's use at
         // the annotated-tuple/plain-T sites below.
-        emit_generic_struct_ret_temp(mangled, resolved_ret, "_gsr", call_args)
+        emit_generic_struct_ret_temp(mangled, resolved_ret, "_gsr", call_args, node)
         return 1
     } else if ret_type == CT_VOID && resolved_ret != "Void" && resolved_ret != "" {
         let ret_ann = node_type_ann(gfn_node)
@@ -4475,7 +4485,7 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str) -> Int 
         if resolved_ret == "Tuple" && ret_ann != -1 {
             let tup_opt = resolve_tuple_ann(ret_ann, tparams_sl, segs)
             if tup_opt.is_some() {
-                emit_generic_struct_ret_temp(mangled, tup_opt.unwrap(), "_gtr", call_args)
+                emit_generic_struct_ret_temp(mangled, tup_opt.unwrap(), "_gtr", call_args, node)
                 return 1
             }
         }
@@ -4529,7 +4539,7 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str) -> Int 
         // Plain T → user struct/enum: emit a temp + struct binding so the
         // caller's `let x = call()` sees a concrete struct type.
         if ret_struct_name == "" && is_struct_or_enum_type(resolved_ret) != 0 {
-            emit_generic_struct_ret_temp(mangled, resolved_ret, "_gsr", call_args)
+            emit_generic_struct_ret_temp(mangled, resolved_ret, "_gsr", call_args, node)
             return 1
         }
     }
