@@ -2097,6 +2097,22 @@ fn tc_node_has_ret_mint(n: Int) -> Int {
     1
 }
 
+// The shared pin_ok gate for a declared-type pin, used by the LetBinding and
+// Assignment arms so both spell it once. The value minted a return-only group (the
+// generic-call path), OR the declared head is a container/carrier whose element
+// slots a concrete annotation determines: Map/Set/Option/Result carry their slots on
+// inner1/inner2, so a fully-concrete declared head (no bare typevar) can pin an
+// under-determined initializer without the struct-literal-field-metavar ambiguity
+// that keeps Struct/Enum heads on the mint path above.
+fn tc_pin_ok_for_declared(val: Int, declared_tid: Int) -> Int {
+    if tc_node_has_ret_mint(val) != 0 { return 1 }
+    let dk = type_kind(resolve_alias_tid(declared_tid))
+    if dk == TyKind.Map || dk == TyKind.Set || dk == TyKind.Option || dk == TyKind.Result {
+        if tc_tid_has_bare_typevar(declared_tid) == 0 { return 1 }
+    }
+    0
+}
+
 // A generic call's return type, with its type params substituted from the call's
 // arguments — and, for a RETURN-ONLY type param, from a freshly minted metavariable.
 //
@@ -2197,13 +2213,14 @@ fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, self_offset: Int) ! Ty
 // blink_kops_str for an Int key, trading a loud ICE for a silent hash collision.
 //
 // tc_pin_admits_declared is the gate; each branch is load-bearing:
-//   TyKind.Map/TyKind.Set      — the only kind whose params_count is never set
-//                        (make_map_type/make_set_type store inner1/inner2, not a
-//                        ty_param_list), so it must admit unconditionally rather
-//                        than fall into the params_count check below.
-//   TyKind.Struct/TyKind.Enum  — excludes Option/Result/List/tuple/Handler returns, which
-//                        is what keeps every existing tail-`None` / tail-`[]` /
-//                        tail-tuple return byte-identical.
+//   TyKind.Map/TyKind.Set/     — the kinds whose params_count is never set
+//   TyKind.Option/TyKind.Result   (make_*_type store inner1/inner2, not a
+//                        ty_param_list), so they must admit unconditionally rather
+//                        than fall into the params_count check below. Admitting the
+//                        two carriers back-pins a tail-`None` / tail-`Ok`/`Err` whose
+//                        other slot a declared return or annotation determines.
+//   TyKind.Struct/TyKind.Enum  — excludes List/tuple/Handler returns, which keeps
+//                        every existing tail-`[]` / tail-tuple return byte-identical.
 //   params_count > 0   — a monomorphic struct has nothing to pin.
 // The caller additionally requires an unbound metavar in the inferred value, which
 // excludes a bare TyKind.Typevar, so a generic fn's `-> Box[T]` keeps its existing
@@ -2228,6 +2245,11 @@ fn tc_pin_admits_declared(d: Int) -> Int {
     if d < 0 || d >= ty_pool.len() { return 0 }
     let dt = ty_pool.get(d).unwrap()
     if dt.kind == TyKind.Map || dt.kind == TyKind.Set { return 1 }
+    // Option/Result carry their element slots on inner1/inner2 (like Map/Set), not a
+    // ty_param_list, so a declared Result[Int,Str] / Option[Int] must pin an
+    // under-determined tail-bound carrier the same way — the Struct/Enum params_count
+    // path below never sees them.
+    if dt.kind == TyKind.Option || dt.kind == TyKind.Result { return 1 }
     if dt.kind != TyKind.Struct && dt.kind != TyKind.Enum { return 0 }
     if dt.params_count == 0 { return 0 }
     1
@@ -12456,16 +12478,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 //
                 // Two gates then remain inside tc_pin_tail_ret_generic and they are the shared
                 // ones: an admitted declared head, and an actually-unbound metavar in the value.
-                let mut pin_ok = tc_node_has_ret_mint(val) != 0
-                if pin_ok == false {
-                    let dk = type_kind(resolve_alias_tid(declared_tid))
-                    if dk == TyKind.Map || dk == TyKind.Set {
-                        if tc_tid_has_bare_typevar(declared_tid) == 0 {
-                            pin_ok = true
-                        }
-                    }
-                }
-                if pin_ok {
+                if tc_pin_ok_for_declared(val, declared_tid) != 0 {
                     tc_pin_tail_ret_generic(declared_tid, inferred_tid)
                 }
             }
@@ -12573,8 +12586,11 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // generic struct/enum), so the branch would be dead. Excluded on
                     // purpose rather than by accident.
                     //
-                    // Restricted to values that minted here — see tc_node_has_ret_mint.
-                    if kind == NodeKind.Assignment && tc_node_has_ret_mint(val) != 0 {
+                    // Same shared gate as the LetBinding arm: a value that minted here,
+                    // or a concrete container/carrier target that determines an
+                    // under-determined value's slots (`x = Err("boom")` pins the mut
+                    // carrier's other slot).
+                    if kind == NodeKind.Assignment && tc_pin_ok_for_declared(val, target_t) != 0 {
                         tc_pin_tail_ret_generic(target_t, val_t)
                     }
                 }
