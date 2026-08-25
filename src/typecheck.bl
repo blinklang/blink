@@ -4153,10 +4153,10 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
     named_type_map.insert(name, tid)
     tc_struct_decl_nodes.insert(name, td)
     tc_type_decl_nodes.insert(name, td)
-    let alias_ann = node_value(td)
-    if alias_ann != -1 {
-        tc_alias_underlying.insert(name, resolve_type_ann(alias_ann))
-    }
+    // The alias RHS is resolved in a second pass (see check_types), AFTER every
+    // type name is interned: resolving it here, in textual order, mints an orphan
+    // typevar for any target declared later — a forward reference is well-formed
+    // (spec §3, type info flows both ways) and must lower like a target-before one.
     if type_has_derive(td, "Hash") != 0 {
         tc_hashable_types.insert(name, 1)
     }
@@ -4164,8 +4164,7 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
         tc_debug_types.insert(name, 1)
     }
 
-    let is_ffi_struct = has_annotation(td, "ffi.struct")
-    if is_ffi_struct != 0 {
+    if has_annotation(td, "ffi.struct") != 0 {
         ffi_struct_type_set.insert(name, 1)
     }
 
@@ -4173,6 +4172,20 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
         ffi_opaque_type_set.insert(name, 1)
     }
 
+    if has_annotation(td, "deprecated") != 0 {
+        depr_type_nodes.insert(name, td)
+    }
+}
+
+// Resolve a struct's field type annotations. Split out of register_struct_type
+// so it runs AFTER every type name is interned and every alias underlying is
+// resolved: a field may reference an alias (`items: List[MB]`) whose target — or
+// whose own declaration — comes later in the file, and resolving it during the
+// name-registration pass would peel to an orphan typevar.
+fn resolve_struct_fields(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
+    let name = node_name(td)
+    let tid = named_type_map.get(name) ?? -1
+    let is_ffi_struct = has_annotation(td, "ffi.struct")
     let flds_sl = node_fields(td)
     if flds_sl != -1 {
         let mut i = 0
@@ -4184,7 +4197,7 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
             // `Option[Inner[T]]` or a direct `Inner[T]` field) so a later T->Int
             // substitution rebuilds the mono instance from the field tid alone. The
             // flag threads through the carrier branches of resolve_type_parts; the
-            // struct twin of the enum variant-field path at register_enum_type.
+            // struct twin of the enum variant-field path at resolve_enum_variants.
             let saved_nested = tc_structural_nested_instances
             tc_structural_nested_instances = 1
             let ftype_id = resolve_type_ann(ftype_ann)
@@ -4204,10 +4217,6 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
             i = i + 1
         }
     }
-
-    if has_annotation(td, "deprecated") != 0 {
-        depr_type_nodes.insert(name, td)
-    }
 }
 
 fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
@@ -4225,6 +4234,19 @@ fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Rep
         tc_debug_types.insert(name, 1)
     }
 
+    if has_annotation(td, "deprecated") != 0 {
+        depr_type_nodes.insert(name, td)
+    }
+}
+
+// Resolve an enum's variant payload annotations. Split out of register_enum_type
+// so it runs AFTER every type name is interned and every alias underlying is
+// resolved: a payload may reference an alias (`Wrap(o: MB)`) whose target — or
+// whose own declaration — comes later in the file, and resolving it during the
+// name-registration pass would peel to an orphan typevar.
+fn resolve_enum_variants(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
+    let name = node_name(td)
+    let tid = named_type_map.get(name) ?? -1
     let flds_sl = node_fields(td)
     if flds_sl != -1 {
         let mut _tag = 0
@@ -4262,10 +4284,6 @@ fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Rep
             _tag = _tag + 1
             i = i + 1
         }
-    }
-
-    if has_annotation(td, "deprecated") != 0 {
-        depr_type_nodes.insert(name, td)
     }
 }
 
@@ -5959,6 +5977,40 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
                 register_struct_type(td)
             }
             i = i + 1
+        }
+        // Second pass: resolve each alias's underlying type now that every type
+        // name is interned, so a target declared textually after the alias
+        // resolves to its real instance tid instead of an orphan typevar.
+        let mut j = 0
+        while j < sublist_length(types_sl) {
+            let atd = sublist_get(types_sl, j)
+            let alias_ann = node_value(atd)
+            if alias_ann != -1 {
+                tc_alias_underlying.insert(node_name(atd), resolve_type_ann(alias_ann))
+            }
+            j = j + 1
+        }
+        // Third pass: resolve enum variant payloads and struct field types.
+        // Deferred to here so a payload or field that names an alias
+        // (`Wrap(o: MB)`, `items: List[MB]`) peels through a fully-populated
+        // tc_alias_underlying regardless of declaration order. An alias node has
+        // no fields, so resolve_struct_fields is a no-op for it.
+        let mut k = 0
+        while k < sublist_length(types_sl) {
+            let etd = sublist_get(types_sl, k)
+            let etd_flds = node_fields(etd)
+            let mut is_enum = 0
+            if etd_flds != -1 && sublist_length(etd_flds) > 0 {
+                if node_kind(sublist_get(etd_flds, 0)) == NodeKind.TypeVariant {
+                    is_enum = 1
+                }
+            }
+            if is_enum != 0 {
+                resolve_enum_variants(etd)
+            } else {
+                resolve_struct_fields(etd)
+            }
+            k = k + 1
         }
     }
 
