@@ -1,0 +1,342 @@
+import compile_test_helpers
+
+// br espzac — a List[@ffi.opaque] / Map[@ffi.opaque] element is one inline machine word
+// (the bare handle), never a heap-boxed `<cname>**` cell. gn5yns NPO'd a DIRECT Option[opaque]
+// and 3hggdm the compound/ABI carrier seams; the container element-store and element-read sites
+// still assumed struct-inner => one extra level of indirection (box the handle, deref on get)
+// and leaked the `*` into the C carrier identifier (blink_List_FILE*). spec sections/
+// 07_trust_modules_metadata.md:877 (an opaque handle flows like any nominal type — a container
+// element is ordinary nominal-type usage), decisions/opaque-ffi-handles.md (6-0).
+
+// ── List[opaque] ─────────────────────────────────────────────────────────────────────────
+
+// The present handle must survive the list-store and come back out of .get().unwrap()
+// fclose-able (a boxed `FILE**` cell would deref to garbage / mis-shape the carrier).
+fn list_some_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi("c", "fopen")
+@trusted
+fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> CFile ! FFI { }
+
+@ffi("c", "fclose")
+@trusted
+fn c_fclose(f: CFile) -> Int ! FFI { }
+
+fn collect(a: CFile, b: CFile) -> List[CFile] { [a, b] }
+
+fn main() {
+    with ffi.scope() as scope {
+        let p = scope.cstr("/dev/null")
+        let m = scope.cstr("r")
+        let a = c_fopen(p, m)
+        let b = c_fopen(p, m)
+        let xs = collect(a, b)
+        io.println("len {xs.len()}")
+        let first = xs.get(0).unwrap()
+        io.println("rc {c_fclose(first)}")
+    }
+}
+"#
+}
+
+test "List[opaque] carries a present handle out fclose-able" {
+    let r = compile_test_helpers.compile_and_run(list_some_src(), "_espzac_list_some")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("len 2"))
+    assert(r.out.contains("rc 0"))
+}
+
+test "List[opaque] carrier leaks no * in the C identifier and spells the bare handle" {
+    let c = compile_test_helpers.compile_and_emit_c(list_some_src(), "_espzac_list_some_c")
+    assert(!c.contains("blink_List_FILE"))
+    assert(!c.contains("blink_Option_FILE"))
+    assert(c.contains("FILE*"))
+}
+
+// A get() past the end must round-trip a None through the null niche, not read a box.
+fn list_none_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi("c", "fopen")
+@trusted
+fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> CFile ! FFI { }
+
+fn main() {
+    with ffi.scope() as scope {
+        let p = scope.cstr("/dev/null")
+        let m = scope.cstr("r")
+        let a = c_fopen(p, m)
+        let xs = [a]
+        let miss = xs.get(5)
+        if miss.is_none() { io.println("list none") }
+    }
+}
+"#
+}
+
+test "List[opaque] out-of-bounds get round-trips a None through the null niche" {
+    let r = compile_test_helpers.compile_and_run(list_none_src(), "_espzac_list_none")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("list none"))
+}
+
+// ── Map[opaque] ──────────────────────────────────────────────────────────────────────────
+
+fn map_some_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi("c", "fopen")
+@trusted
+fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> CFile ! FFI { }
+
+@ffi("c", "fclose")
+@trusted
+fn c_fclose(f: CFile) -> Int ! FFI { }
+
+fn main() {
+    with ffi.scope() as scope {
+        let p = scope.cstr("/dev/null")
+        let m = scope.cstr("r")
+        let f = c_fopen(p, m)
+        let mut tbl: Map[Str, CFile] = Map()
+        tbl.insert("h", f)
+        match tbl.get("h") {
+            Some(g) => io.println("rc {c_fclose(g)}")
+            None => io.println("map none")
+        }
+    }
+}
+"#
+}
+
+test "Map[opaque] value carries a present handle out fclose-able" {
+    let r = compile_test_helpers.compile_and_run(map_some_src(), "_espzac_map_some")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("rc 0"))
+}
+
+test "Map[opaque] carrier leaks no * in the C identifier and spells the bare handle" {
+    let c = compile_test_helpers.compile_and_emit_c(map_some_src(), "_espzac_map_some_c")
+    assert(!c.contains("blink_Map_FILE"))
+    assert(!c.contains("blink_Option_FILE"))
+    assert(c.contains("FILE*"))
+}
+
+fn map_none_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi("c", "fopen")
+@trusted
+fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> CFile ! FFI { }
+
+fn main() {
+    with ffi.scope() as scope {
+        let p = scope.cstr("/dev/null")
+        let m = scope.cstr("r")
+        let f = c_fopen(p, m)
+        let mut tbl: Map[Str, CFile] = Map()
+        tbl.insert("h", f)
+        if tbl.get("nope").is_none() { io.println("map none") }
+    }
+}
+"#
+}
+
+test "Map[opaque] missing-key get round-trips a None through the null niche" {
+    let r = compile_test_helpers.compile_and_run(map_none_src(), "_espzac_map_none")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("map none"))
+}
+
+// ── Iteration + pop reader seams ─────────────────────────────────────────────────────────────
+
+// `for h in xs` over a List[opaque] recovers the inline handle with a single cast, not a
+// struct deref -- each iterate must be fclose-able.
+fn list_forin_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi("c", "fopen")
+@trusted
+fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> CFile ! FFI { }
+
+@ffi("c", "fclose")
+@trusted
+fn c_fclose(f: CFile) -> Int ! FFI { }
+
+fn collect(a: CFile, b: CFile) -> List[CFile] { [a, b] }
+
+fn main() {
+    with ffi.scope() as scope {
+        let p = scope.cstr("/dev/null")
+        let m = scope.cstr("r")
+        let a = c_fopen(p, m)
+        let b = c_fopen(p, m)
+        let xs = collect(a, b)
+        for h in xs {
+            io.println("rc {c_fclose(h)}")
+        }
+    }
+}
+"#
+}
+
+test "for-in over List[opaque] casts the inline handle without a deref" {
+    let r = compile_test_helpers.compile_and_run(list_forin_src(), "_espzac_list_forin")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("rc 0"))
+}
+
+// `for (k, v) in tbl` over a Map[Str, opaque] reads the value slot inline.
+fn map_forin_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi("c", "fopen")
+@trusted
+fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> CFile ! FFI { }
+
+@ffi("c", "fclose")
+@trusted
+fn c_fclose(f: CFile) -> Int ! FFI { }
+
+fn main() {
+    with ffi.scope() as scope {
+        let p = scope.cstr("/dev/null")
+        let m = scope.cstr("r")
+        let f = c_fopen(p, m)
+        let mut tbl: Map[Str, CFile] = Map()
+        tbl.insert("h", f)
+        for (k, v) in tbl {
+            io.println("rc {c_fclose(v)}")
+        }
+    }
+}
+"#
+}
+
+test "for-in over Map[Str, opaque] reads the value handle inline" {
+    let r = compile_test_helpers.compile_and_run(map_forin_src(), "_espzac_map_forin")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("rc 0"))
+}
+
+// list.pop() over a List[opaque] carries the handle out through the NPO'd Option carrier,
+// not a `.tag`/`.value` struct field access on a bare pointer.
+fn list_pop_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi("c", "fopen")
+@trusted
+fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> CFile ! FFI { }
+
+@ffi("c", "fclose")
+@trusted
+fn c_fclose(f: CFile) -> Int ! FFI { }
+
+fn main() {
+    with ffi.scope() as scope {
+        let p = scope.cstr("/dev/null")
+        let m = scope.cstr("r")
+        let a = c_fopen(p, m)
+        let mut xs = [a]
+        let popped = xs.pop().unwrap()
+        io.println("rc {c_fclose(popped)}")
+    }
+}
+"#
+}
+
+test "list.pop over List[opaque] carries the handle out through the NPO carrier" {
+    let r = compile_test_helpers.compile_and_run(list_pop_src(), "_espzac_list_pop")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("rc 0"))
+}
+
+// ── Arena-promote walker ─────────────────────────────────────────────────────────────────────
+
+// A List[opaque] built inside an ffi.scope arena and RETURNED escapes the arena, forcing
+// arena-promotion of each element. The promote walker must pass the inline handle straight
+// through -- an @ffi.opaque handle is a bare C pointer, not GC/arena memory, so it must not be
+// heap-reboxed, dereferenced, or run through a (never-emitted) blink_promote_<opaque> walker.
+fn promote_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi("c", "fopen")
+@trusted
+fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> CFile ! FFI { }
+
+@ffi("c", "fclose")
+@trusted
+fn c_fclose(f: CFile) -> Int ! FFI { }
+
+fn build() -> List[CFile] {
+    with ffi.scope() as scope {
+        let p = scope.cstr("/dev/null")
+        let m = scope.cstr("r")
+        let a = c_fopen(p, m)
+        [a]
+    }
+}
+
+fn main() {
+    let xs = build()
+    io.println("len {xs.len()}")
+    io.println("rc {c_fclose(xs.get(0).unwrap())}")
+}
+"#
+}
+
+test "arena-promote of a List[opaque] passes the inline handle through" {
+    let r = compile_test_helpers.compile_and_run(promote_src(), "_espzac_promote")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("len 1"))
+    assert(r.out.contains("rc 0"))
+}
+
+// Same escape path for a Map[Str, opaque] value: the map-promote walker reads src->values[i]
+// (the inline handle) and must pass it through, not deref/rebox it.
+fn promote_map_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi("c", "fopen")
+@trusted
+fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> CFile ! FFI { }
+
+@ffi("c", "fclose")
+@trusted
+fn c_fclose(f: CFile) -> Int ! FFI { }
+
+fn build() -> Map[Str, CFile] {
+    with ffi.scope() as scope {
+        let p = scope.cstr("/dev/null")
+        let m = scope.cstr("r")
+        let a = c_fopen(p, m)
+        let mut tbl: Map[Str, CFile] = Map()
+        tbl.insert("h", a)
+        tbl
+    }
+}
+
+fn main() {
+    let tbl = build()
+    io.println("len {tbl.len()}")
+    io.println("rc {c_fclose(tbl.get("h").unwrap())}")
+}
+"#
+}
+
+test "arena-promote of a Map[Str, opaque] passes the inline value handle through" {
+    let r = compile_test_helpers.compile_and_run(promote_map_src(), "_espzac_promote_map")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("len 1"))
+    assert(r.out.contains("rc 0"))
+}

@@ -61,7 +61,7 @@ import codegen_types.{
     set_var_option_inner2, set_var_option_inner_tp,
     set_var_option_struct, set_var_option_from_struct_tag, set_var_result, set_var_result_struct, set_var_struct,
     strip_blink_prefix,
-    struct_option_c_type, struct_result_c_type, is_opaque_type,
+    struct_option_c_type, struct_result_c_type, is_opaque_type, opaque_handle_c_name,
     tp_child1_kind, tp_child2_kind, tp_child1_sname, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname,
     carrier_slot_ct,
     type_from_name, type_from_name_tag, type_name_from_ct, is_compound_tag, is_intrinsic_method, ue_methods,
@@ -842,7 +842,16 @@ pub fn emit_boxed_container_store(emit_prefix: Str, val_str: Str, val_type: Int,
     // through, so the four sites are covered by the one name.
     let bs_name = builtin_struct_name_for_ct(val_type)
     let box_name = if val_struct == "" { bs_name } else { val_struct }
-    if (val_type == CT_STRUCT || val_type == CT_VOID || bs_name != "") && box_name != "" {
+    if box_name != "" && is_opaque_type(box_name) != 0 {
+        // An @ffi.opaque handle is one machine word (a bare pointer), so it rides the
+        // list's void* slot inline — never a `<cname>**` heap box. The element read
+        // recovers it with a single cast, no deref.
+        if elem_container != "" {
+            set_list_elem_struct(elem_container, box_name)
+            set_list_elem_type(elem_container, CT_VOID)
+        }
+        emit_line("{emit_prefix}(void*){val_str});")
+    } else if (val_type == CT_STRUCT || val_type == CT_VOID || bs_name != "") && box_name != "" {
         if elem_container != "" {
             set_list_elem_struct(elem_container, box_name)
             set_list_elem_type(elem_container, CT_VOID)
@@ -905,6 +914,21 @@ pub fn emit_boxed_container_store(emit_prefix: Str, val_str: Str, val_type: Int,
     } else {
         emit_line("{emit_prefix}(void*){val_str});")
     }
+}
+
+// Emit an @ffi.opaque container element read into `res`: the Option carrier is NPO'd to the
+// bare handle word, so a present value is the getter cast to the handle and absence is the null
+// niche — never a `.tag`/`.value` struct read (the carrier has no such fields), never a deref
+// (the handle rides the slot inline, see emit_boxed_container_store). `guard` is the presence
+// test (blink_list_in_bounds / blink_map_has) and `getter` the raw void* fetch. Caller has
+// already confirmed `struct_name` is @ffi.opaque. Records the NPO'd option on `res`.
+pub fn emit_opaque_container_get(res: Str, struct_name: Str, guard: Str, getter: Str) ! Codegen.Emit, Codegen.Register {
+    ensure_struct_option_type(struct_name)
+    let opt_type = struct_option_c_type(struct_name)
+    let handle = opaque_handle_c_name(struct_name)
+    emit_line("{opt_type} {res};")
+    emit_line("if ({guard}) \{ {res} = ({handle}){getter}; } else \{ {res} = ((void*)0); }")
+    set_var_option_struct(res, CT_VOID, struct_name)
 }
 
 // A bare `None` written into List[Option[X]] via
@@ -1340,7 +1364,13 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             elem_type = CT_VOID
         }
         let res = fresh_temp("_lpop_")
-        if (elem_type == CT_VOID || elem_type == CT_STRUCT || elem_type == CT_ENUM) && elem_struct != "" {
+        if (elem_type == CT_VOID || elem_type == CT_STRUCT || elem_type == CT_ENUM) && elem_struct != "" && is_opaque_type(elem_struct) != 0 {
+            emit_opaque_container_get(res, elem_struct, "blink_list_len({obj_str}) > 0", "blink_list_pop({obj_str})")
+            expr_result_str = res
+            expr_result_type = CT_OPTION
+            expr_option_inner = CT_VOID
+            expr_option_inner_struct = elem_struct
+        } else if (elem_type == CT_VOID || elem_type == CT_STRUCT || elem_type == CT_ENUM) && elem_struct != "" {
             ensure_struct_option_type(elem_struct)
             let opt_type = struct_option_c_type(elem_struct)
             emit_line("{opt_type} {res};")
@@ -1587,13 +1617,17 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             expr_option_inner = CT_VOID
             expr_option_inner_struct = plain_enum
         } else if (elem_type == CT_VOID || elem_type == CT_STRUCT || elem_type == CT_ENUM) && elem_struct != "" {
-            ensure_struct_option_type(elem_struct)
-            let opt_type = struct_option_c_type(elem_struct)
-            emit_line("{opt_type} {res};")
-            emit_line("if (blink_list_in_bounds({obj_str}, {idx_tmp})) \{")
-            emit_line("    {res}.tag = 1; {res}.value = ({c_type_c_name(elem_struct)}*)blink_list_get({obj_str}, {idx_tmp});")
-            emit_line("} else \{ {res}.tag = 0; }")
-            set_var_option_struct(res, CT_VOID, elem_struct)
+            if is_opaque_type(elem_struct) != 0 {
+                emit_opaque_container_get(res, elem_struct, "blink_list_in_bounds({obj_str}, {idx_tmp})", "blink_list_get({obj_str}, {idx_tmp})")
+            } else {
+                ensure_struct_option_type(elem_struct)
+                let opt_type = struct_option_c_type(elem_struct)
+                emit_line("{opt_type} {res};")
+                emit_line("if (blink_list_in_bounds({obj_str}, {idx_tmp})) \{")
+                emit_line("    {res}.tag = 1; {res}.value = ({c_type_c_name(elem_struct)}*)blink_list_get({obj_str}, {idx_tmp});")
+                emit_line("} else \{ {res}.tag = 0; }")
+                set_var_option_struct(res, CT_VOID, elem_struct)
+            }
             expr_result_str = res
             expr_result_type = CT_OPTION
             expr_option_inner = CT_VOID
@@ -2179,6 +2213,13 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str, fb_key_c
             expr_result_type = CT_OPTION
             expr_option_inner = CT_VOID
             expr_option_inner_struct = mget_enum
+        } else if vstruct != "" && is_opaque_type(vstruct) != 0 {
+            emit_opaque_container_get(res, vstruct, "blink_map_has({obj_str}, {key_expr})", "blink_map_get({obj_str}, {key_expr})")
+            stamp_container_option_temp(res, node)
+            expr_result_str = res
+            expr_result_type = CT_OPTION
+            expr_option_inner = CT_VOID
+            expr_option_inner_struct = vstruct
         } else if vstruct != "" {
             ensure_struct_option_type(vstruct)
             let opt_type = struct_option_c_type(vstruct)
