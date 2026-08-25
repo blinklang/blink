@@ -87,7 +87,7 @@ import codegen_types.{
     stamp_list_elem_from_tid, stamp_list_elem_from_list_tid, stamp_binder_from_tid, stamp_binder_from_binder_tid, stamp_whole_binder_from_tid, stamp_binder_elems_from_tid_if_unset, stamp_map_from_map_tid, map_val_carrier_from_recv, MapValCarrier,
     map_pair_from_recv, MapPairTid,
     split_result_compound, CompoundSplit, map_struct_scalar_kv, MapKvCt, typedef_tag_or_empty, carrier_slot_ct, tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname,
-    tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, get_var_tp, type_from_name, type_from_name_tag,
+    tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, get_var_tp, type_from_name, type_from_name_tag, type_alias_base,
     type_name_from_ct, type_where_preds, cg_where_self_var, is_compound_tag, var_enums,
     list_named_elem_of, named_elem_of_elem_tid, ListNamedElem,
     get_var_iter_carrier,
@@ -8743,6 +8743,25 @@ pub fn find_type_def(name: Str) -> Int {
     -1
 }
 
+// A type alias is transparent: follow the alias chain from a field/variant-payload
+// type annotation to its concrete target annotation, which carries the real mono
+// args the bare alias reference drops. Returns the original ann for a non-alias
+// (or an alias whose def can't be resolved), so annotation-driven consumers lower
+// `m: MB` exactly as if the user wrote the target type. The 64-step guard bounds a
+// malformed self-referential alias.
+pub fn resolve_alias_ann(ann: Int) -> Int {
+    let mut cur = ann
+    let mut guard = 0
+    while guard < 64 {
+        if type_alias_base.contains_key(node_name(cur)) == 0 { return cur }
+        let atd = find_type_def(node_name(cur))
+        if atd == -1 || node_fields(atd) != -1 || node_value(atd) == -1 { return cur }
+        cur = node_value(atd)
+        guard = guard + 1
+    }
+    cur
+}
+
 // `ann` is the source node whose memoized tid the recovery net may read — the
 // struct-literal construction node at the sole caller. This function and its
 // sibling emit_mono_struct_typedef both run mono_arg_tids_with_ann, but not
@@ -9226,8 +9245,9 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[
     let mut j = 0
     while j < sublist_length(flds_sl) {
         let f0 = sublist_get(flds_sl, j)
-        let type_ann_node0 = node_value(f0)
-        if type_ann_node0 != -1 {
+        let type_ann_orig0 = node_value(f0)
+        if type_ann_orig0 != -1 {
+            let type_ann_node0 = resolve_alias_ann(type_ann_orig0)
             let resolved0 = resolve_mono_slot(node_name(type_ann_node0), tparams_sl, arg_tids, "struct_typedef_field", "{c_name}.{node_name(f0)}", type_ann_node0)
             if is_struct_type(resolved0) != 0 || is_enum_type(resolved0) != 0 || is_mono_struct_instance(resolved0) != 0 {
                 emit_tuple_typedef_for_tag(resolved0)
@@ -9290,10 +9310,11 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[
     while i < sublist_length(flds_sl) {
         let f = sublist_get(flds_sl, i)
         let fname = node_name(f)
-        let type_ann_node = node_value(f)
-        if type_ann_node != -1 {
+        let type_ann_orig = node_value(f)
+        if type_ann_orig != -1 {
+            let field_tid = tc_tid_subst_mono(tc_tid_resolved(tc_lookup_node_tid(type_ann_orig)), tparams_sl, arg_tids)
+            let type_ann_node = resolve_alias_ann(type_ann_orig)
             let type_name = node_name(type_ann_node)
-            let field_tid = tc_tid_subst_mono(tc_tid_resolved(tc_lookup_node_tid(type_ann_node)), tparams_sl, arg_tids)
             let resolved = resolve_mono_slot(type_name, tparams_sl, arg_tids, "struct_typedef_field", "{c_name}.{fname}", type_ann_node)
             // is_enum_type / is_mono_struct_instance widen the same admission
             // emit_mono_enum_typedef's payload loop already uses — a bare
@@ -9459,8 +9480,9 @@ fn emit_mono_enum_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[In
             let mut pf = 0
             while pf < sublist_length(pvflds) {
                 let pvf = sublist_get(pvflds, pf)
-                let pvf_ann = node_value(pvf)
-                if pvf_ann != -1 {
+                let pvf_ann_orig = node_value(pvf)
+                if pvf_ann_orig != -1 {
+                    let pvf_ann = resolve_alias_ann(pvf_ann_orig)
                     if node_name(pvf_ann) == "Tuple" {
                         let ptup = resolve_tuple_ann(pvf_ann, tparams_sl, segs)
                         if ptup.is_some() {
@@ -9502,9 +9524,10 @@ fn emit_mono_enum_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[In
             while fi < sublist_length(vflds) {
                 let vf = sublist_get(vflds, fi)
                 let vf_name = node_name(vf)
-                let vf_type_ann = node_value(vf)
+                let vf_type_ann_orig = node_value(vf)
                 let mut vf_c_type = "int64_t"
-                if vf_type_ann != -1 {
+                if vf_type_ann_orig != -1 {
+                    let vf_type_ann = resolve_alias_ann(vf_type_ann_orig)
                     let vf_type_name = node_name(vf_type_ann)
                     let resolved = resolve_mono_slot(vf_type_name, tparams_sl, arg_tids, "enum_typedef_payload", "{c_name}.{vname}.{vf_name}", vf_type_ann)
                     if vf_type_name == "Tuple" {
@@ -10864,10 +10887,11 @@ pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit, Codegen.Register, Diag.
     while i < sublist_length(flds_sl) {
         let f = sublist_get(flds_sl, i)
         let fname = node_name(f)
-        let type_ann_node = node_value(f)
-        if type_ann_node != -1 {
+        let type_ann_orig = node_value(f)
+        if type_ann_orig != -1 {
+            let field_tid = tc_tid_resolved(tc_lookup_node_tid(type_ann_orig))
+            let type_ann_node = resolve_alias_ann(type_ann_orig)
             let type_name = node_name(type_ann_node)
-            let field_tid = tc_tid_resolved(tc_lookup_node_tid(type_ann_node))
             if type_name == "Fn" {
                 emit_line("blink_closure* {fname};")
                 reg_sf_entry(name, fname, CT_CLOSURE, "", sv_tp(CT_CLOSURE, -1, -1, ""), field_tid)
@@ -11124,9 +11148,10 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
                 while fi < sublist_length(vflds) {
                     let vf = sublist_get(vflds, fi)
                     let vf_name = node_name(vf)
-                    let vf_type_ann = node_value(vf)
+                    let vf_type_ann_orig = node_value(vf)
                     let mut vf_c_type = "int64_t"
-                    if vf_type_ann != -1 {
+                    if vf_type_ann_orig != -1 {
+                        let vf_type_ann = resolve_alias_ann(vf_type_ann_orig)
                         let vf_type_name = node_name(vf_type_ann)
                         if vf_type_name == name {
                             vf_c_type = "int64_t"

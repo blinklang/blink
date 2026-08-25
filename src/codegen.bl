@@ -57,7 +57,8 @@ import codegen_types.{
     emit_option_typedef, option_typedef_emitted, reset_result_typedef_emitted,
     push_td_guard_open, push_td_guard_close,
     c_type_tag, emit_struct_option_typedef, emit_struct_result_typedef,
-    compound_name_from_ann, ensure_compound_type_from_ann, register_field_ann_mono_instances, find_type_def_node,
+    compound_name_from_ann, ensure_compound_type_from_ann, register_field_ann_mono_instances,
+    register_carrier_inner_mono_instance, find_type_def_node,
     ensure_mixed_result_type, ensure_option_type, ensure_struct_option_type,
     ensure_struct_result_type, is_compound_ct, option_c_type,
     mono_name_from_ann, resolve_result_inner_tag, resolve_tuple_ann,
@@ -90,7 +91,7 @@ import codegen_stmt.{
     emit_enum_typedef, emit_fn_decl, emit_fn_def,
     emit_impl_method_def, emit_mono_fn_decls_range, emit_mono_fns_from, emit_mono_typedefs_from,
     emit_struct_typedef, emit_top_level_let, format_impl_params, cg_node_mono_tid, cg_fn_ret_tid,
-    reset_typedef_emitted_stmt,
+    reset_typedef_emitted_stmt, resolve_alias_ann,
     register_struct_instance_from_tid, register_enum_instance_from_tid, register_carrier_struct_instance_leaves,
 }
 import typecheck.{sanitize_test_name, tc_classify_mono_conflicts, ty_divergence_dump, tc_lookup_node_tid, c_type_from_tid, ctype_probe_at, tc_variant_field_is_selfrec_tuple}
@@ -159,7 +160,13 @@ fn collect_ann_type_names(ann: Int, out: List[Str]) {
 
 fn collect_type_deps(td: Int, out: List[Str]) {
     let flds_sl = node_fields(td)
-    if flds_sl == -1 { return }
+    if flds_sl == -1 {
+        // A type alias (no fields) depends on the type names in its target
+        // annotation, so the target typedef — and any mono/carrier instance the
+        // alias lowering emits from it — is ordered before the alias typedef.
+        if node_value(td) != -1 { collect_ann_type_names(node_value(td), out) }
+        return
+    }
     let mut i = 0
     while i < sublist_length(flds_sl) {
         let f = sublist_get(flds_sl, i)
@@ -414,8 +421,12 @@ fn preflush_field_carrier_typedefs(anns: List[Int]) ! Codegen.Emit, Codegen.Regi
     let pre_mono_td = mono_instances.len()
     let mut i = 0
     while i < anns.len() {
-        let fann = anns.get(i).unwrap()
-        if fann != -1 {
+        let fann0 = anns.get(i).unwrap()
+        if fann0 != -1 {
+            // A type alias is transparent: resolve to the target annotation so the
+            // instance/carrier the alias names is registered from its real mono args
+            // (the bare alias reference drops them), same as a direct field type.
+            let fann = resolve_alias_ann(fann0)
             // Register the generic-struct/enum instances the field's type names,
             // before its typedef emits below — otherwise a value member over a mono
             // instance erases (a carrier inner like List[Option[Box[Int]]] to `void`,
@@ -1269,8 +1280,32 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             if td_flds == -1 && node_value(td) != -1 {
                 if !td_foreign {
                     let alias_name = node_name(td)
-                    let base_name = type_alias_base.get(alias_name).unwrap()
-                    let c_base = c_type_for_alias(base_name)
+                    // A type alias is transparent, so its target's mono arguments
+                    // must survive into the alias typedef. Follow the alias chain to
+                    // the concrete target annotation (an alias-of-alias carries no
+                    // bracket args to re-derive from), so every consumer lowers the
+                    // alias exactly as the concrete type — the same resolution the
+                    // struct-field/variant-payload emitters apply.
+                    let base_ann = resolve_alias_ann(node_value(td))
+                    let base_name = node_name(base_ann)
+                    let base_ct = type_from_name(base_name)
+                    // The bare base (blink_Option, blink_Box) is either never
+                    // typedef'd or drops the args, so a carrier/instance/tuple target
+                    // must lower to the concrete C type and emit its dependent
+                    // typedefs first (as a struct field of the same type would, via
+                    // preflush_field_carrier_typedefs; a no-op for a scalar target).
+                    preflush_field_carrier_typedefs([base_ann])
+                    let c_base = if base_name == "Tuple" {
+                        let tup = resolve_tuple_ann(base_ann, -1, [])
+                        if tup.is_some() { c_type_c_name(tup.unwrap()) } else { c_type_for_alias(base_name) }
+                    } else if base_ct == CT_LIST || base_ct == CT_SET || is_compound_ct(base_ct) != 0 {
+                        c_type_from_tag(compound_name_from_ann(base_ann))
+                    } else if is_struct_type(base_name) != 0 || is_enum_type(base_name) != 0 {
+                        let stem = register_carrier_inner_mono_instance(base_name, base_ann)
+                        if stem != "" { c_type_c_name(stem) } else { c_type_for_alias(base_name) }
+                    } else {
+                        c_type_for_alias(base_name)
+                    }
                     emit_line("typedef {c_base} blink_{alias_name};")
                 }
                 cg_current_module = saved_type_emit_module
@@ -1308,7 +1343,13 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                             let mut vfi = 0
                             while vfi < sublist_length(vflds) {
                                 let vf = sublist_get(vflds, vfi)
-                                let vf_ann = node_value(vf)
+                                let vf_ann_orig = node_value(vf)
+                                // Resolve the alias before the Tuple/self-recursive
+                                // classification so it matches emit_enum_typedef, which
+                                // resolves too — otherwise an alias-to-tuple payload is
+                                // classified as an ordinary carrier here but boxed as a
+                                // tuple there, desyncing the typedef ordering.
+                                let vf_ann = if vf_ann_orig != -1 { resolve_alias_ann(vf_ann_orig) } else { vf_ann_orig }
                                 if vf_ann != -1 && node_name(vf_ann) == "Tuple" && tc_variant_field_is_selfrec_tuple(e_nm, v_nm, node_name(vf)) != 0 {
                                     deferred_selfrec_tuples.push(vf_ann)
                                 } else {
