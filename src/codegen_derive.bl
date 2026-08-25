@@ -6,6 +6,7 @@ import codegen_types.{
     emit_line,
     fresh_temp,
     c_fn_name, c_type_c_name, c_type_tag, canonical_struct_tag, strip_module_qualifier,
+    lookup_mono_base,
     type_from_name, type_from_name_tag,
     is_hash_scalar_ct,
     kops_table_name, kops_is_inline_enum_key, c_type_str,
@@ -21,6 +22,8 @@ import codegen_types.{
     derive_serialize_types, derive_deserialize_types,
     derive_eq_types, derive_ord_types, derive_clone_types, derive_hash_types, derive_debug_types,
     derive_hash_generic_bases, derive_eq_generic_bases,
+    derive_debug_generic_bases, derive_ord_generic_bases,
+    derive_clone_generic_bases, derive_serialize_generic_bases,
     derive_method_entries, display_impl_types, lookup_impl_method, mangle_impl_method_q,
     mod_fn_prefix, cg_skip_modules, cg_emit_only_module,
     DeriveMethodEntry,
@@ -62,8 +65,24 @@ pub fn register_derive_annotations(types_sl: Int) ! Diag.Report {
                             let darg = sublist_get(args_sl, di)
                             let dname = node_name(darg)
                             let tname = node_name(td)
+                            // A GENERIC type's bare declared name (e.g. "HBox") has no C
+                            // representation, so each derive below routes to a generic-bases
+                            // side list instead of the real emission list —
+                            // ensure_struct_derive_kops_key_for_base joins each mono instance
+                            // in on demand, at the ctor site that names it. Deserialize is
+                            // NOT routed here: its from_json call site does not yet
+                            // monomorphize, so generic Deserialize is unsupported end-to-end.
+                            // derive_method_entries still keys on the bare name regardless:
+                            // typecheck resolves `.eq()`/`.debug()`/... on the DECLARED type,
+                            // not a not-yet-existing instance.
+                            let mut eq_target = if is_generic { derive_eq_generic_bases } else { derive_eq_types }
+                            let mut hash_target = if is_generic { derive_hash_generic_bases } else { derive_hash_types }
+                            let mut debug_target = if is_generic { derive_debug_generic_bases } else { derive_debug_types }
+                            let mut ord_target = if is_generic { derive_ord_generic_bases } else { derive_ord_types }
+                            let mut clone_target = if is_generic { derive_clone_generic_bases } else { derive_clone_types }
+                            let mut serialize_target = if is_generic { derive_serialize_generic_bases } else { derive_serialize_types }
                             if dname == "Serialize" {
-                                derive_serialize_types.push(tname)
+                                serialize_target.push(tname)
                                 derive_method_entries.push(DeriveMethodEntry {
                                     type_name: tname,
                                     method_name: "to_json",
@@ -79,16 +98,6 @@ pub fn register_derive_annotations(types_sl: Int) ! Diag.Report {
                                 })
                                 ensure_struct_result_type(tname, "str")
                             }
-                            // A GENERIC type's bare declared name (e.g. "HBox") has no C
-                            // representation, so its Hash/Eq derive routes to the
-                            // generic-bases side lists instead of the real emission
-                            // lists — ensure_struct_derive_kops_key joins each mono
-                            // instance in on demand, at the ctor site that names it.
-                            // derive_method_entries still keys on the
-                            // bare name regardless: typecheck resolves `.eq()`/`.hash()`
-                            // on the DECLARED type, not a not-yet-existing instance.
-                            let mut eq_target = if is_generic { derive_eq_generic_bases } else { derive_eq_types }
-                            let mut hash_target = if is_generic { derive_hash_generic_bases } else { derive_hash_types }
                             if dname == "Eq" {
                                 if list_contains_str(eq_target, tname) == 0 {
                                     eq_target.push(tname)
@@ -105,8 +114,8 @@ pub fn register_derive_annotations(types_sl: Int) ! Diag.Report {
                             // Ordering; ret_type CT_VOID here, typecheck resolves the
                             // real Ordering tid (mirrors Deserialize's from_json).
                             if dname == "Ord" {
-                                if list_contains_str(derive_ord_types, tname) == 0 {
-                                    derive_ord_types.push(tname)
+                                if list_contains_str(ord_target, tname) == 0 {
+                                    ord_target.push(tname)
                                     derive_method_entries.push(DeriveMethodEntry {
                                         type_name: tname,
                                         method_name: "cmp",
@@ -123,7 +132,7 @@ pub fn register_derive_annotations(types_sl: Int) ! Diag.Report {
                                 }
                             }
                             if dname == "Clone" {
-                                derive_clone_types.push(tname)
+                                clone_target.push(tname)
                                 derive_method_entries.push(DeriveMethodEntry {
                                     type_name: tname,
                                     method_name: "clone",
@@ -145,7 +154,7 @@ pub fn register_derive_annotations(types_sl: Int) ! Diag.Report {
                                 })
                             }
                             if dname == "Debug" {
-                                derive_debug_types.push(tname)
+                                debug_target.push(tname)
                                 derive_method_entries.push(DeriveMethodEntry {
                                     type_name: tname,
                                     method_name: "debug",
@@ -222,6 +231,55 @@ pub fn emit_derive_forward_decls() ! Codegen.Emit {
         hi = hi + 1
     }
     let mut dbi = 0
+    while dbi < derive_debug_types.len() {
+        let tname = derive_debug_types.get(dbi).unwrap()
+        emit_line("const char* {c_type_c_name(tname)}_debug({c_type_c_name(tname)} self);")
+        dbi = dbi + 1
+    }
+}
+
+// Supplemental forward decls for derive fns whose type joined a real emission
+// list AFTER emit_derive_forward_decls already ran — i.e. a generic mono
+// instance (Box_0Int) discovered during fn-body emission via the generic-base
+// join in ensure_struct_derive_kops_key_for_base. These are called directly by
+// C name, so the prototype must precede both the call site and the definition;
+// emitted into the restored pre-fn buffer after bodies, exactly like
+// emit_kops_forward_decls_from. Hash is excluded: it dispatches through the kops
+// table, whose extern is the sole supplemental decl it needs (already emitted by
+// emit_kops_forward_decls_from), and re-emitting here would duplicate it.
+pub fn emit_derive_forward_decls_from(start: DeriveCounts) ! Codegen.Emit {
+    let mut i = start.serialize
+    while i < derive_serialize_types.len() {
+        let tname = derive_serialize_types.get(i).unwrap()
+        emit_line("const char* {c_type_c_name(tname)}_to_json({c_type_c_name(tname)} self);")
+        i = i + 1
+    }
+    let mut j = start.deserialize
+    while j < derive_deserialize_types.len() {
+        let tname = derive_deserialize_types.get(j).unwrap()
+        let cs_tag = canonical_struct_tag(tname)
+        emit_line("blink_Result_{cs_tag}_str {c_type_c_name(tname)}_from_json(const char* input);")
+        j = j + 1
+    }
+    let mut ei = start.eq
+    while ei < derive_eq_types.len() {
+        let tname = derive_eq_types.get(ei).unwrap()
+        emit_line("int {c_type_c_name(tname)}_eq({c_type_c_name(tname)} self, {c_type_c_name(tname)} other);")
+        ei = ei + 1
+    }
+    let mut oi = start.ord
+    while oi < derive_ord_types.len() {
+        let tname = derive_ord_types.get(oi).unwrap()
+        emit_line("{c_type_c_name("Ordering")} {c_type_c_name(tname)}_cmp({c_type_c_name(tname)} self, {c_type_c_name(tname)} other);")
+        oi = oi + 1
+    }
+    let mut ci = start.clone
+    while ci < derive_clone_types.len() {
+        let tname = derive_clone_types.get(ci).unwrap()
+        emit_line("{c_type_c_name(tname)} {c_type_c_name(tname)}_clone({c_type_c_name(tname)} self);")
+        ci = ci + 1
+    }
+    let mut dbi = start.debug
     while dbi < derive_debug_types.len() {
         let tname = derive_debug_types.get(dbi).unwrap()
         emit_line("const char* {c_type_c_name(tname)}_debug({c_type_c_name(tname)} self);")
@@ -1277,7 +1335,9 @@ fn emit_field_debug_struct(access: Str, field_type: Int, stype: Str, struct_name
 fn emit_struct_debug(type_name: Str) ! Codegen.Emit {
     emit_line("const char* {c_type_c_name(type_name)}_debug({c_type_c_name(type_name)} self) \{")
     cg_indent = cg_indent + 1
-    emit_line("const char* result = \"{type_name} \{ \";")
+    let mono_base = lookup_mono_base(type_name).base
+    let display_name = if mono_base != "" { mono_base } else { type_name }
+    emit_line("const char* result = \"{display_name} \{ \";")
     let mut _field_idx = 0
     let mut i = 0
     while i < sf_entries.len() {

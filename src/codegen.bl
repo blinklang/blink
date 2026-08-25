@@ -37,6 +37,8 @@ import codegen_types.{
     c_fn_name, c_safe_name, c_type_c_name, c_type_from_tag, c_type_for_alias, c_type_str, canonical_struct_tag,
     derive_deserialize_types, derive_eq_types, derive_ord_types, derive_clone_types, derive_hash_types,
     derive_hash_generic_bases, derive_eq_generic_bases,
+    derive_debug_generic_bases, derive_ord_generic_bases,
+    derive_clone_generic_bases, derive_serialize_generic_bases,
     derive_method_entries, derive_serialize_types, display_impl_types,
     effect_entries, emit_all_iter_types, emit_all_option_result_types,
     emit_all_tuple_types, emit_iter_types_from, emit_line,
@@ -98,7 +100,7 @@ import typecheck.{sanitize_test_name, tc_classify_mono_conflicts, ty_divergence_
 import codegen_derive.{
     deser_externs_emitted, emit_derive_fn_defs, emit_derive_fn_defs_from,
     derive_counts_now, emit_kops_adapters_late, emit_kops_adapters_from, emit_kops_forward_decls_from,
-    emit_derive_forward_decls, emit_display_forward_decls, emit_display_fn_defs,
+    emit_derive_forward_decls, emit_derive_forward_decls_from, emit_display_forward_decls, emit_display_fn_defs,
     register_derive_annotations,
     emit_promote_forward_decls, emit_promote_fn_defs,
     promote_types, promote_emitted, promote_fwd_emitted,
@@ -551,6 +553,10 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     derive_hash_types.clear()
     derive_hash_generic_bases.clear()
     derive_eq_generic_bases.clear()
+    derive_debug_generic_bases.clear()
+    derive_ord_generic_bases.clear()
+    derive_clone_generic_bases.clear()
+    derive_serialize_generic_bases.clear()
     derive_method_entries.clear()
     deser_externs_emitted = 0
     promote_types.clear()
@@ -1992,6 +1998,11 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     // fn body) references an undeclared symbol. A supplemental sweep after all
     // bodies (below, at the pre-fn buffer restore) covers the delta.
     let pre_body_hash_count = derive_counts_now().hash
+    // Full watermark: a generic type's derive fns join the real emission lists
+    // only when a mono instance is discovered during body emission (below), so
+    // their forward decls need a supplemental sweep over this delta — see
+    // emit_derive_forward_decls_from at the pre-fn buffer restore.
+    let pre_body_derive_counts = derive_counts_now()
     emit_derive_forward_decls()
     // Queue every nested-container Debug walker reachable from a @derive(Debug)
     // type (struct fields via tp_to_descriptor, enum-variant fields via the
@@ -2125,6 +2136,13 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
 
     // Derived function definitions
     emit_derive_fn_defs()
+    // A generic @derive(Debug) type joins the real debug list only when a mono
+    // instance is discovered during fn-body emission, so its container fields'
+    // nested walkers were not queued by the pre-body queue_all_debug_types. Re-queue
+    // now (idempotent — dedups on the descriptor) so emit_debug_fn_defs below
+    // defines the late walkers; their forward decls come from the supplemental
+    // emit_debug_forward_decls at the pre-fn buffer restore.
+    queue_all_debug_types()
     // Nested-container Debug walkers: emitted AFTER {T}_debug bodies (which they
     // may call for struct elements) and forward-declared above.
     emit_debug_fn_defs()
@@ -2155,6 +2173,19 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
 
     // Emit iterator type definitions discovered during codegen
     emit_all_iter_types()
+
+    // Supplemental nested-container Debug walker forward decls for the late
+    // walkers queued above (re-queue before emit_debug_fn_defs). Watermarked by
+    // debug_fwd_emitted so it emits only the delta, and positioned after the
+    // option/result carriers a walker may reference.
+    emit_debug_forward_decls()
+
+    // Supplemental derive forward decls for generic mono instances joined during
+    // fn-body emission (Box_0Int's _debug/_cmp/_clone/_to_json). Positioned after
+    // the mono/tuple/option-result typedefs so the referenced instance type is
+    // already declared, and before the mono fn flush + fn_def append so the
+    // prototype precedes every referencing body.
+    emit_derive_forward_decls_from(pre_body_derive_counts)
 
     // Closure defs registered during the mono flush are emitted inside it,
     // before the bodies that reference them; the loop below emits only the
