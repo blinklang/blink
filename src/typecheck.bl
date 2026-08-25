@@ -9442,13 +9442,32 @@ fn is_integer_type(tid: Int) -> Int {
     is_sized_int(k)
 }
 
-// The arithmetic traits are sealed to the built-in numeric types (spec
-// sections/03_types.md:1936) and the language has no truthiness (DECISIONS.md:106), so Bool is
-// not an operand of `+ - * / %` — a count must be spelled `if cond { 1 } else { 0 }`. Bitwise
-// rejects it the same way (03_types.md:801). Shared with the compound-assignment forms, which
-// carry the bare operator and must not be a way around the rule.
-fn reject_bool_arith_operand(op: Str, tid: Int, node: Int) ! TypeCheck.Report, Diag.Report {
-    if type_kind(resolve_alias_tid(tid)) == TyKind.Bool {
+// The arithmetic traits (Add/Sub/Mul/Div/Rem/Neg) are sealed to the built-in numeric types —
+// Int, the sized ints, and Float — and user types cannot implement them (spec
+// sections/03_types.md:1988, sections/02_syntax.md:1046). So `+ - * / %`, unary `-`, and the
+// compound forms accept only a numeric operand: a struct, an @ffi.opaque handle (whose pointer
+// would otherwise form a silent ptrdiff in C), an enum, Bool (no truthiness — DECISIONS.md:109),
+// Char, or Str is not one. Without this a same-typed non-numeric pair passes the
+// types_compatible mismatch check and reaches codegen. Resolves aliases so `type Port = Int`
+// still counts as numeric.
+fn is_arith_numeric_type(tid: Int) -> Int {
+    let k = type_kind(resolve_alias_tid(tid))
+    if k == TyKind.Int || k == TyKind.Float { return 1 }
+    if is_sized_int(k) != 0 { return 1 }
+    // Fail-open on types this check cannot model at the definition site, mirroring
+    // cmp_operands_ok's Typevar/Void set (plus Unknown):
+    //   - Typevar: a generic `T <op> T` body is not re-checked here for the concrete
+    //     substitution; a non-numeric instantiation is currently caught only downstream
+    //     (the C compiler rejects it). Closing that mono-side hole is a separate follow-up.
+    //   - Void: an under-inferred value (e.g. an un-annotated closure return) types
+    //     as Void; rejecting it would break programs that compiled before this check.
+    //   - Unknown: not yet resolved (includes TYPE_UNKNOWN, kind Unknown).
+    if k == TyKind.Typevar || k == TyKind.Void || k == TyKind.Unknown { return 1 }
+    0
+}
+
+fn reject_non_numeric_arith_operand(op: Str, tid: Int, node: Int) ! TypeCheck.Report, Diag.Report {
+    if is_arith_numeric_type(tid) == 0 {
         tc_error_at("arithmetic '{op}' requires numeric operand, got {type_to_str(tid)}", node)
     }
 }
@@ -9994,8 +10013,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             return TYPE_STR
         }
         if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
-            reject_bool_arith_operand(op, lt, node)
-            reject_bool_arith_operand(op, rt, node)
+            reject_non_numeric_arith_operand(op, lt, node)
+            reject_non_numeric_arith_operand(op, rt, node)
             // A bare int literal takes its type from the surrounding expression
             // (spec sections/03_types.md:874), so `a * 2` with `a: I32` treats
             // `2` as I32 and yields I32 — not a rejected `I32 * Int`. Coerce a
@@ -10070,7 +10089,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         let op = node_op(node)
         let operand = infer_type(node_left(node))
         if op == "!" { return TYPE_BOOL }
-        if op == "-" { return operand }
+        if op == "-" {
+            // Unary minus desugars to Neg.neg, a sealed arithmetic trait (spec
+            // sections/02_syntax.md:1046) — `-someStruct` / `-someOpaque` is not numeric.
+            reject_non_numeric_arith_operand(op, operand, node)
+            return operand
+        }
         if op == "~" {
             if operand != TYPE_UNKNOWN && is_integer_type(operand) == 0 {
                 tc_error_at("bitwise '~' requires integer operand, got {type_to_str(operand)}", node)
@@ -12785,8 +12809,8 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // else-less `if` (no value on the false path) is rejected.
             let val_t = tc_infer_value(val)
             if kind == NodeKind.CompoundAssign {
-                reject_bool_arith_operand(node_op(node), target_t, node)
-                reject_bool_arith_operand(node_op(node), val_t, node)
+                reject_non_numeric_arith_operand(node_op(node), target_t, node)
+                reject_non_numeric_arith_operand(node_op(node), val_t, node)
             }
             if target_t != TYPE_UNKNOWN && val_t != TYPE_UNKNOWN {
                 if assignment_types_compatible(target_t, val_t, val) == 0 {
