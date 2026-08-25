@@ -24,7 +24,7 @@ import codegen_types.{
     get_fn_ret, get_fn_ret_struct, get_fn_ret_struct_inner, get_fn_ret_type,
     get_impl_method_ret, get_impl_method_ret_q, get_list_elem_map_key_type, get_list_elem_map_val_type, get_list_elem_map_val_struct, set_list_elem_map_types, is_map_scalar_ct,
     get_list_elem_map_key_tp, get_list_elem_map_val_tp, set_list_elem_map_tp,
-    get_list_elem_option_inner, get_list_elem_option_inner_struct, list_elem_option_inner_scalar_ct_from_tid, get_list_elem_result_ok, get_list_elem_result_err, get_list_elem_result_ok_struct, get_list_elem_result_err_struct, capture_ct, capture_sname,
+    get_list_elem_option_inner, get_list_elem_option_inner_struct, list_elem_option_inner_scalar_ct_from_tid, list_elem_option_carrier_tag_from_tid, get_list_elem_result_ok, get_list_elem_result_err, get_list_elem_result_ok_struct, get_list_elem_result_err_struct, capture_ct, capture_sname,
     get_list_elem_option_inner_tp, get_list_elem_result_ok_tp, get_list_elem_result_err_tp, tp_carrier_tag,
     type_option,
     get_list_elem_struct, get_list_elem_type,
@@ -1665,10 +1665,11 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             // unwrapped `Option[T]` decodes T instead of the flattened default.
             //
             // The carrier tag comes from the element Option's full inner tp
-            // (tp_carrier_tag), so a NESTED container inner — `Option[Map[Int,Str]]`
-            // → `Option_Map_int_str`, not the lossy `Option_map` — keeps its K/V. The
-            // inner tp is threaded via expr_option_inner_tp so the arm that unwraps
-            // to the Map stamps its value type.
+            // (tp_carrier_tag), so a NESTED container inner spells the erased carrier
+            // head — `Option[Map[Int,Str]]` → `Option_map` (Map is an erased carrier;
+            // K/V drop from the tag). The inner tp is threaded via expr_option_inner_tp
+            // so the arm that unwraps to the Map recovers its K/V and stamps its value
+            // type.
             // The tid is authoritative for a SCALAR element-Option inner
             // (List[Option[Str]]): the flat channel erases a mono/field-bound List's
             // deep inner to CT_INT. A struct/enum/container inner rides the flat
@@ -1678,12 +1679,18 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             let oi_ct = if tid_oi_ct >= 0 { tid_oi_ct } else { flat_oi_ct }
             let oi_struct = get_list_elem_option_inner_struct(obj_str)
             let oi_tp = get_list_elem_option_inner_tp(obj_str)
+            // Last-resort tid carrier: when every flat channel is erased (a field/mono-bound
+            // List whose element is `Option[Map[..]]` reads tid_oi_ct=-1, oi_tp=-1,
+            // oi_struct=""), the node tid still spells the element-Option carrier
+            // (`Option_map`), which is exactly what the `.unwrap()` consumer reads back.
+            // Without it the chain defaults to `Option_int` and the deref hits a scalar.
+            let tid_carrier = list_elem_option_carrier_tag_from_tid(obj_node)
             // The tid-led scalar wins first: it answers only for a genuine scalar inner
             // (it declines struct/enum/container), and it is precise where the flat oi_tp
             // is erased to a void sentinel (a field/mono-bound List's `Option[Str]` element
             // reads oi_tp=0 → tp_carrier_tag "int"). A real container inner leaves
             // tid_oi_ct=-1, so oi_tp still owns `Option[List[..]]` / `Option[Map[..]]`.
-            let opt_carrier = if tid_oi_ct >= 0 { "Option_{c_type_tag(tid_oi_ct)}" } else if oi_tp >= 0 { "Option_{tp_carrier_tag(oi_tp)}" } else if oi_struct != "" { "Option_{c_type_tag_for_struct(oi_struct)}" } else if oi_ct >= 0 { "Option_{c_type_tag(oi_ct)}" } else { "Option_int" }
+            let opt_carrier = if tid_oi_ct >= 0 { "Option_{c_type_tag(tid_oi_ct)}" } else if oi_tp >= 0 { "Option_{tp_carrier_tag(oi_tp)}" } else if oi_struct != "" { "Option_{c_type_tag_for_struct(oi_struct)}" } else if oi_ct >= 0 { "Option_{c_type_tag(oi_ct)}" } else if tid_carrier != "" { tid_carrier } else { "Option_int" }
             ensure_struct_option_type(opt_carrier)
             let opt_type = struct_option_c_type(opt_carrier)
             emit_line("{opt_type} {res};")
@@ -1710,9 +1717,10 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             // twin of the CT_OPTION branch. The element Result carrier is pointer-boxed
             // on the list; carry it in a struct-option keyed on the Result carrier tag.
             //
-            // Ok/err tags come from each side's full inner tp (tp_carrier_tag)
-            // so a nested container — `Result[Map[Int,Str],Str]` →
-            // `Result_Map_int_str_str` — keeps its K/V.
+            // Ok/err tags come from each side's full inner tp (tp_carrier_tag), so a
+            // nested container spells the erased carrier head — `Result[Map[Int,Str],Str]`
+            // → `Result_map_str` (Map is an erased carrier; K/V drop from the tag and are
+            // recovered per-use from the tid).
             let rok_ct = get_list_elem_result_ok(obj_str)
             let rerr_ct = get_list_elem_result_err(obj_str)
             let rok_struct = get_list_elem_result_ok_struct(obj_str)
