@@ -854,6 +854,92 @@ For C surfaces β cannot reach (varargs, signal handlers, glibc-version-conditio
 
 Diagnostic codes `W0811` (init-flow analysis), `W0813` (zero-len Buf), and `E0818` (endian-tag tracking) considered during deliberation are **not** shipped — see decision rationale.
 
+### 9.1.4 Opaque FFI handle types (`@ffi.opaque`)
+
+Section 9.1.1 gives `Ptr[Void]` for opaque C pointers, and §9.1.3 gives `@ffi.struct` for C records whose layout is fully known. Neither models a handle whose C type is **incomplete on the Blink side** — `sqlite3*`, `sqlite3_stmt*`, a `FILE*`, an OpenSSL `SSL_CTX*` — that must also **flow through ordinary non-FFI Blink code** (struct fields, wrapper functions, bindings). `Ptr[Void]` cannot: it is E0811-gated so it may not leave an `@ffi`/`@trusted` context, and it is non-nominal — every opaque handle collapses to the one type `Ptr[Void]`, so `sqlite3*` and `sqlite3_stmt*` become interchangeable. `@ffi.struct` cannot: an incomplete C type has no layout to mirror. This subsection is the resolution of that gap, decided by panel deliberation [`opaque-ffi-handles`](../decisions/opaque-ffi-handles.md) (6-0).
+
+#### `@ffi.opaque` — declaring an opaque C handle
+
+```blink
+@ffi.opaque(header = "sqlite3.h", name = "sqlite3")
+type Sqlite3
+
+@ffi.opaque(header = "sqlite3.h", name = "sqlite3_stmt")
+type Sqlite3Stmt
+```
+
+`@ffi.opaque(header, name)` declares a **bare nominal, arity-0** handle type that mirrors a named, possibly-incomplete C type. The type has **no body** — no fields, no variants (a body is rejected). `header` is resolved against `[native-dependencies].headers` exactly as for `@ffi.struct` (§9.1.3). `name` is the C type the handle points at; the Blink type lowers to `name *` — one machine word. Because the pointee is incomplete, **no `sizeof`/`offsetof` `_Static_assert` is emitted** (the deliberate contrast with `@ffi.struct`, whose whole purpose is a known layout).
+
+Each `@ffi.opaque` declaration is its own **nominal type**. `Sqlite3` and `Sqlite3Stmt` are distinct and never interchangeable, even though both lower to a C pointer — the nominal distinctness `Ptr[Void]` could not provide.
+
+#### Flows freely in non-FFI code — containment stays syntactic
+
+An `@ffi.opaque` type **is not a `Ptr[T]`**, so E0811 (`PtrOutsideFFI`) never applies to it. It flows through ordinary Blink code like any nominal type — struct fields, function parameters and returns, `let` bindings — with no `@trusted` and no capability gate:
+
+```blink
+pub type Connection {
+    db: Sqlite3,
+}
+
+// ordinary Blink code — no @ffi, no @trusted: `Sqlite3` is not a `Ptr`
+pub fn table_count(conn: Connection) -> Int {
+    count_tables(conn.db)   // holds and passes the handle freely
+}
+```
+
+This does **not** relax E0811. The rule is unchanged — "a `Ptr[T]` may appear only inside an `@ffi`/`@trusted` context" — and remains statable purely syntactically. An opaque handle is simply not a `Ptr[T]`; its E0811-exemption is *by construction of a distinct declared type*, not a carve-out in the gate. (The rejected alternative — narrowing E0811 to exempt `Ptr[Void]` itself — would have kept the raw-pointer surface `.addr()`/`==` reachable from non-FFI code and left every handle collapsed to one type; see the decision rationale.)
+
+#### Inert — no operations
+
+An `@ffi.opaque` type has **no methods and no operations**. There is no `.deref()`, `.addr()`, `.offset()`, field access, arithmetic, or `==`. The only things you can do with a handle are hold it, pass it, return it, and store it in a field. It carries no readable value — its C type is incomplete. A member or method access is rejected by the ordinary "no method on `<Type>`" diagnostic (no dedicated error code). This inertness is **permanent and by construction**: the handle exposes zero raw-pointer surface to non-FFI code, which is exactly why it is safer than a `Ptr[Void]` in the wild.
+
+#### Nullability — `Option[T]`, with guaranteed null-pointer optimization
+
+An `@ffi.opaque` handle is **non-null by the FFI-boundary contract**. Absence is modeled **only** by `Option[Sqlite3]`, and only where a C API makes NULL an observed outcome (a constructor or lookup that can fail) — the "Option must be earned" principle (§9.1.1, *Nullability*). Unlike `Ptr[T]`, an opaque handle has **no `.is_null()`** and **no null sentinel** (`null_opaque` / `Opaque[T]?` were considered and rejected as a second null channel). `Option` is the sole absence channel.
+
+**Null-pointer optimization is guaranteed, not best-effort.** `Option[Sqlite3]` is represented as a single machine word: the C `NULL` pointer *is* the `None` niche, and a present handle is the non-null pointer. A nullable handle therefore costs exactly one word and one comparison — never a tagged struct. This guarantee holds for every `@ffi.opaque` type because the compiler knows the representation is a pointer whose null value is unused.
+
+#### Construction — sealed to the FFI boundary
+
+A handle value can be produced **only at the FFI boundary**: as the return value of an `@ffi` function, or by reading one out of a `Ptr` cell inside an `@ffi`/`@trusted` region. There is no literal and no user-callable constructor; constructing or coercing an `@ffi.opaque` value from ordinary Blink code is rejected by the existing construction / type-mismatch diagnostics (no new error code). `Ptr[Sqlite3]` is a legal FFI inner type (it lowers to `sqlite3 **`, the standard out-parameter shape), so a handle is minted by dereferencing the out-cell at the boundary:
+
+```blink
+// raw FFI binding — private, audited
+@ffi("sqlite3", "sqlite3_open")
+@effects(IO)
+@trusted(audit: "DB-003")
+fn raw_sqlite3_open(path: Ptr[U8], out: Ptr[Sqlite3]) -> Int
+
+// safe wrapper — mints the opaque handle at the boundary
+pub fn open(path: Str) -> Option[Connection] ! IO {
+    with ffi.scope() as scope {
+        let out = scope.alloc[Sqlite3]()          // Ptr[Sqlite3] out-cell — a sqlite3**
+        let cstr = scope.cstr(path)
+        let rc = raw_sqlite3_open(cstr, out)
+        if rc != 0 { return None }
+        Some(Connection { db: out.deref() })      // Ptr[Sqlite3].deref() -> Sqlite3, at the boundary
+    }
+}
+```
+
+`out.deref()` returns a bare `Sqlite3` (deref on a non-`Void` pointer is legal — E0825 rejects only `Ptr[Void]`, §9.1.1). Round-tripping a handle *back* to a raw pointer to hand to another C call is likewise confined to `@ffi`/`@trusted`; because the handle has no `.addr()` in ordinary code, it cannot be fabricated or re-crossed outside the boundary.
+
+Every boundary crossing that produces or consumes an opaque handle is tagged with the `blink audit` category **`opaque-ffi-handle`**, so the FFI inventory (§9.1, *`blink audit`*) lists them alongside pointer allocations and `Raw()` sites.
+
+#### Choosing among the three FFI type mechanisms
+
+| Mechanism | C shape | Flows in non-FFI code? | Nominal identity | Layout known |
+|-----------|---------|------------------------|------------------|--------------|
+| `Ptr[Void]` (§9.1.1) | `void *` | No — E0811-gated | No — all collapse to one type | n/a (opaque) |
+| `@ffi.struct` (§9.1.3) | complete `struct` | via `Ptr[T]`, E0811-gated | Yes | Yes (`sizeof`/`offsetof` asserted) |
+| `@ffi.opaque` (§9.1.4) | incomplete type, held as `T *` | **Yes** — not a `Ptr` | **Yes** — one per declaration | No — incomplete by design |
+
+Use `@ffi.opaque` for a named handle whose innards C hides from you and that your Blink code must carry around; use `@ffi.struct` when you own the layout and read fields; drop to `Ptr[Void]` only for a fully anonymous pointer that never leaves the `@ffi` region.
+
+#### Diagnostic codes added by §9.1.4
+
+**None.** This is a deliberate design point: an opaque handle reuses the ordinary nominal-type machinery end to end. A bad member access reuses the existing "no method on `<Type>`"; construction outside the boundary reuses the existing construction / type-mismatch diagnostics; a malformed `@ffi.opaque` declaration (a body, or a missing `header`/`name`) reuses the existing malformed-annotation diagnostics. The only new artifact is the `blink audit` category `opaque-ffi-handle`. A dedicated code (`E0826`, *opaque handle constructed outside FFI*) was considered for the boundary-construction violation and deferred — the existing diagnostics carry the message, and adding a code remains available to the implementation if the reused error proves unclear in practice.
+
 ### 9.2 System Boundary — Runtime Validation
 
 Inside Blink, contracts (`@requires`, `@ensures`) are verified statically by the SMT solver wherever possible. But at the edges of the system — HTTP handlers, CLI entry points, message consumers, gRPC endpoints — input arrives from the outside world. External input cannot satisfy `@requires` statically because the compiler has no control over what a client sends.
