@@ -1,0 +1,125 @@
+import compile_test_helpers
+
+// br vhcqnb — Option[Option[@ffi.opaque]] emits invalid C at two seams. The outer carrier stays a
+// tagged { int tag; FILE* value } (two None niches can't collapse into one pointer word), but the
+// inner Option[opaque] is NPO'd to the bare handle: inner None is the null handle ((FILE*)0), NOT a
+// tagged (blink_Option_CFile){.tag=0} over the suppressed/undeclared inner carrier, and the outer
+// Some match-binder reads .value directly (already FILE*), NOT *_scrut.value.
+// spec sections/07_trust_modules_metadata.md §9.1.4, decisions/opaque-ffi-handles.md (6-0).
+
+fn some_none_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+fn f() -> Option[Option[CFile]] { Some(None) }
+
+fn main() {
+    match f() {
+        Some(o) => match o {
+            Some(_) => io.println("some")
+            None => io.println("inner none")
+        }
+        None => io.println("outer none")
+    }
+}
+"#
+}
+
+test "Some(None) over Option[Option[opaque]] compiles and reads inner None as the null handle" {
+    let r = compile_test_helpers.compile_and_run(some_none_src(), "_vhcqnb_some_none")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("inner none"))
+}
+
+test "Option[Option[opaque]] outer carrier spells the bare handle, no suppressed inner carrier" {
+    let c = compile_test_helpers.compile_and_emit_c(some_none_src(), "_vhcqnb_some_none_c")
+    assert(!c.contains("blink_Option_CFile"))
+    assert(c.contains("FILE*"))
+}
+
+// A present inner handle must survive both carriers and come back fclose-able.
+fn some_some_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi("c", "fopen")
+@trusted
+fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> CFile ! FFI { }
+
+@ffi("c", "fclose")
+@trusted
+fn c_fclose(f: CFile) -> Int ! FFI { }
+
+fn wrap(h: CFile) -> Option[Option[CFile]] { Some(Some(h)) }
+
+fn main() {
+    with ffi.scope() as scope {
+        let a = c_fopen(scope.cstr("/dev/null"), scope.cstr("r"))
+        match wrap(a) {
+            Some(o) => match o {
+                Some(h) => io.println("rc {c_fclose(h)}")
+                None => io.println("inner none")
+            }
+            None => io.println("outer none")
+        }
+    }
+}
+"#
+}
+
+test "Some(Some(handle)) over Option[Option[opaque]] carries the handle out fclose-able" {
+    let r = compile_test_helpers.compile_and_run(some_some_src(), "_vhcqnb_some_some")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("rc 0"))
+}
+
+// Outer None must round-trip through the tagged carrier's tag, not touch the handle slot.
+fn outer_none_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+fn f() -> Option[Option[CFile]] { None }
+
+fn main() {
+    match f() {
+        Some(_) => io.println("some")
+        None => io.println("outer none")
+    }
+}
+"#
+}
+
+test "None over Option[Option[opaque]] round-trips the outer tag" {
+    let r = compile_test_helpers.compile_and_run(outer_none_src(), "_vhcqnb_outer_none")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("outer none"))
+}
+
+// The opaque fix generalized the outer-carrier name resolution in the Some() compound branch,
+// which also repaired a latent bug: a plain Some(Some(struct)) returned from a fn (no let-target
+// annotation to lean on) spelled the outer carrier one Option too shallow (blink_Option_Point
+// instead of blink_Option_Option_Point) and failed to compile. Guard the shared path.
+fn nested_struct_src() -> Str {
+    #"type Point { x: Int
+y: Int }
+
+fn wrap(p: Point) -> Option[Option[Point]] { Some(Some(p)) }
+
+fn main() {
+    let p = Point { x: 7, y: 2 }
+    match wrap(p) {
+        Some(o) => match o {
+            Some(q) => io.println("got {q.x}")
+            None => io.println("inner none")
+        }
+        None => io.println("outer none")
+    }
+}
+"#
+}
+
+test "Some(Some(struct)) returned from a fn spells the full nested outer carrier" {
+    let r = compile_test_helpers.compile_and_run(nested_struct_src(), "_vhcqnb_nested_struct")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("got 7"))
+}

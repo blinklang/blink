@@ -81,7 +81,7 @@ import codegen_types.{
     strip_blink_prefix, strip_generic_args, strip_module_qualifier,
     tid_spells_struct,
     sf_entries, struct_field_defaults, struct_invariants, struct_option_c_type, synthesized_display_call,
-    is_opaque_type, opaque_handle_c_name,
+    is_opaque_type, opaque_handle_c_name, opaque_option_carrier_cname,
     coerce_to_c_str, render_result_arm_value,
     tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname, tp_get_child1, tp_get_child2, tp_get_kind, tp_get_sname,
     resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
@@ -5308,19 +5308,25 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 // no heap box. Resolve the opaque inner name from the arg's own
                 // var-struct, the let-target annotation, or the enclosing fn return
                 // (the same three channels the transparent/scalar paths consult).
+                // Only a non-compound inner can be the bare handle: for Some(Some(h))
+                // the inner Some(h) already NPO'd to `h`, whose var-struct still reads
+                // CFile — but the OUTER inner_type is CT_OPTION and must stay a tagged
+                // carrier, so gate the whole NPO probe on a non-compound inner_type.
                 let mut opaque_inner = ""
-                let some_vs = get_var_struct(inner_str)
-                if some_vs != "" && is_opaque_type(some_vs) != 0 {
-                    opaque_inner = some_vs
+                if is_compound_ct(inner_type) == 0 {
+                    let some_vs = get_var_struct(inner_str)
+                    if some_vs != "" && is_opaque_type(some_vs) != 0 {
+                        opaque_inner = some_vs
+                    }
                 }
-                if opaque_inner == "" && cg_let_target_ann != -1 && node_name(cg_let_target_ann) == "Option" {
+                if opaque_inner == "" && is_compound_ct(inner_type) == 0 && cg_let_target_ann != -1 && node_name(cg_let_target_ann) == "Option" {
                     let oi_elems = node_elements(cg_let_target_ann)
                     if oi_elems != -1 && sublist_length(oi_elems) >= 1 {
                         let oi_name = node_name(sublist_get(oi_elems, 0))
                         if is_opaque_type(oi_name) != 0 { opaque_inner = oi_name }
                     }
                 }
-                if opaque_inner == "" && cg_current_fn_node != -1 {
+                if opaque_inner == "" && is_compound_ct(inner_type) == 0 && cg_current_fn_node != -1 {
                     let fr_inner = option_inner_struct_from_fn(cg_current_fn_node)
                     if fr_inner != "" && is_opaque_type(fr_inner) != 0 { opaque_inner = fr_inner }
                 }
@@ -5403,8 +5409,18 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 } else if is_compound_ct(inner_type) != 0 {
                     let compound_name = if ann_inner_name != "" {
                         ann_inner_name
-                    } else if inner_type == CT_OPTION && expr_option_inner_struct != "" {
+                    } else if inner_type == CT_OPTION && inner_is_none != 0 && expr_option_inner_struct != "" {
+                        // A bare inner `None` already publishes its OWN carrier tag
+                        // (Option_CFile) in expr_option_inner_struct — that IS the inner
+                        // value's type tag, so use it directly.
                         expr_option_inner_struct
+                    } else if inner_type == CT_OPTION && expr_option_inner_struct != "" {
+                        // A real inner `Some(..)`/Option var publishes its INNER struct
+                        // (Point, CFile), so THIS carrier is one Option deeper:
+                        // Option[Option[Point]] over an inner "Point" is "Option_Point".
+                        // canonical_struct_tag re-wraps an already-tagged inner
+                        // (Option[Option[Option[X]]]) and passes a bare opaque/struct name through.
+                        "Option_{canonical_struct_tag(expr_option_inner_struct)}"
                     } else if inner_type == CT_OPTION {
                         let opt_tag = c_type_tag(expr_option_inner)
                         "Option_{opt_tag}"
@@ -5426,7 +5442,15 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     let compound_c = c_type_from_tag(compound_name)
                     let mut actual_inner = inner_str
                     if inner_type == CT_OPTION && inner_is_none != 0 {
-                        actual_inner = "(blink_{compound_name})\{.tag = 0}"
+                        // A nested inner Option[@ffi.opaque] is NPO'd to the bare handle, so its
+                        // None is the null handle ((FILE*)0) — never a tagged carrier literal over
+                        // the suppressed, undeclared blink_Option_<opaque>.
+                        let inner_opaque = opaque_option_carrier_cname(compound_name)
+                        if inner_opaque != "" {
+                            actual_inner = "(({inner_opaque})0)"
+                        } else {
+                            actual_inner = "(blink_{compound_name})\{.tag = 0}"
+                        }
                     }
                     if compound_c.ends_with("*") {
                         expr_result_str = "({opt_type})\{.tag = 1, .value = {actual_inner}}"
