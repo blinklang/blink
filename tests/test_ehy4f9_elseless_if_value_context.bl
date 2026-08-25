@@ -1,0 +1,137 @@
+import compile_test_helpers
+
+// spec §2.9 (sections/02_syntax.md:486): in EXPRESSION context (let binding, return,
+// argument, any consumed sub-expression) an `if` REQUIRES an `else` — the false path
+// produces no value. Statement context (value discarded) allows else-less, type ().
+// error[E0304] MissingElse is raised at the value-context site.
+
+test "else-less if bound in a let is rejected (the MVCE)" {
+    let src = "fn f(c: Bool) -> Int \{\n let x = if c \{ 1 }\n x\n }\nfn main() \{ let _ = f(false) }\n"
+    compile_test_helpers.expect_compile_error(src, "ehy4f9_let", "E0304")
+}
+
+test "else-less if bound in an ANNOTATED let is rejected" {
+    let src = "fn main() \{ let c = true\n let x: Int = if c \{ 1 }\n io.println(\"\{x}\") }\n"
+    compile_test_helpers.expect_compile_error(src, "ehy4f9_let_ann", "E0304")
+}
+
+test "else-less if in an explicit return is rejected" {
+    let src = "fn f(c: Bool) -> Int \{ return if c \{ 1 } }\nfn main() \{ let _ = f(true) }\n"
+    compile_test_helpers.expect_compile_error(src, "ehy4f9_return", "E0304")
+}
+
+test "else-less if as an implicit fn tail is rejected" {
+    let src = "fn f(c: Bool) -> Int \{ if c \{ 1 } }\nfn main() \{ let _ = f(true) }\n"
+    compile_test_helpers.expect_compile_error(src, "ehy4f9_tail", "E0304")
+}
+
+test "else-less if passed as a call argument is rejected" {
+    let src = "fn g(n: Int) -> Int \{ n }\nfn main() \{ let c = true\n let _ = g(if c \{ 1 }) }\n"
+    compile_test_helpers.expect_compile_error(src, "ehy4f9_arg", "E0304")
+}
+
+test "else-less if tail of a block-let is rejected (the wnbsen shape)" {
+    let src = "fn main() \{ let c = true\n let s = \{ let p = 1\n if c \{ p } }\n io.println(\"\{s}\") }\n"
+    compile_test_helpers.expect_compile_error(src, "ehy4f9_block_let", "E0304")
+}
+
+// ── Flat value positions: an else-less `if` as a sub-expression ───────────────
+// infer_type returns the then-branch type for an else-less `if`, so any consumed
+// sub-expression position silently accepted it (a false-path uninitialized read).
+
+test "else-less if as a binary operand is rejected" {
+    let src = "fn main() \{ let c = true\n let y = 1 + if c \{ 2 }\n io.println(\"\{y}\") }\n"
+    compile_test_helpers.expect_compile_error(src, "ehy4f9_binop", "E0304")
+}
+
+test "else-less if as a struct-literal field is rejected" {
+    let src = "type Foo \{ a: Int }\nfn main() \{ let c = true\n let x = Foo \{ a: if c \{ 1 } }\n io.println(\"\{x.a}\") }\n"
+    compile_test_helpers.expect_compile_error(src, "ehy4f9_structfield", "E0304")
+}
+
+test "else-less if as a list element is rejected" {
+    let src = "fn main() \{ let c = true\n let xs = [if c \{ 1 }]\n io.println(\"\{xs.len()}\") }\n"
+    compile_test_helpers.expect_compile_error(src, "ehy4f9_listelem", "E0304")
+}
+
+test "else-less if as a tuple element is rejected" {
+    let src = "fn main() \{ let c = true\n let t = (if c \{ 1 }, 0)\n io.println(\"\{t.1}\") }\n"
+    compile_test_helpers.expect_compile_error(src, "ehy4f9_tupleelem", "E0304")
+}
+
+test "else-less if as an assignment RHS is rejected" {
+    let src = "fn main() \{ let c = true\n let mut x = 0\n x = if c \{ 1 }\n io.println(\"\{x}\") }\n"
+    compile_test_helpers.expect_compile_error(src, "ehy4f9_assign", "E0304")
+}
+
+test "else-less if as a match scrutinee is rejected" {
+    let src = "fn main() \{ let c = true\n let x = match (if c \{ 1 }) \{ 0 => 10\n _ => 20 }\n io.println(\"\{x}\") }\n"
+    compile_test_helpers.expect_compile_error(src, "ehy4f9_scrutinee", "E0304")
+}
+
+test "else-less if nested in a value-context branch is rejected" {
+    let src = "fn f(c: Bool, d: Bool) -> Int \{ if c \{ if d \{ 1 } } else \{ 2 } }\nfn main() \{ let _ = f(true, false) }\n"
+    compile_test_helpers.expect_compile_error(src, "ehy4f9_branch_nested", "E0304")
+}
+
+// ── Statement-context flat compounds: the compound is discarded but CONSUMES the `if` ──
+// A discarded statement protects only its outermost expression and its pass-through tail
+// chain. A flat compound (call arg, list/tuple element) always consumes its children, so
+// those child positions are value context even when the whole statement is discarded — the
+// leak that let `assert_eq(if c { 1 }, 1)` type-check and then read an uninitialized value.
+
+test "else-less if as a builtin-call arg in a discarded statement is rejected" {
+    let src = "fn main() \{ let c = true\n assert_eq(if c \{ 1 }, 1) }\n"
+    compile_test_helpers.expect_compile_error(src, "ehy4f9_stmt_builtin_arg", "E0304")
+}
+
+test "else-less if as a list element in a discarded statement is rejected" {
+    let src = "fn main() \{ let c = true\n [if c \{ 1 }] }\n"
+    compile_test_helpers.expect_compile_error(src, "ehy4f9_stmt_listelem", "E0304")
+}
+
+test "else-less if as a tuple element in a discarded statement is rejected" {
+    let src = "fn main() \{ let c = true\n (if c \{ 1 }, 0) }\n"
+    compile_test_helpers.expect_compile_error(src, "ehy4f9_stmt_tupleelem", "E0304")
+}
+
+// ── More value positions that produce the consumed value through a tail ────────
+
+test "else-less if as a match-arm value in a let is rejected" {
+    let src = "fn main() \{ let c = true\n let n = 0\n let x = match n \{ 0 => if c \{ 1 }\n _ => 2 }\n io.println(\"\{x}\") }\n"
+    compile_test_helpers.expect_compile_error(src, "ehy4f9_matcharm", "E0304")
+}
+
+// ── Legal cases the fix must NOT touch ────────────────────────────────────────
+// §2.9: an `if` whose value is DISCARDED (statement context) is legal without an
+// `else`. The value-context check must not fire on these.
+
+test "else-less if as a discarded statement is accepted (statement context)" {
+    let src = "fn main() \{ let c = true\n if c \{ io.println(\"hi\") } }\n"
+    compile_test_helpers.expect_no_error(src, "ehy4f9_stmt_ok", "E0304")
+}
+
+test "if with else bound in a let is accepted" {
+    let src = "fn main() \{ let c = true\n let x = if c \{ 1 } else \{ 2 }\n io.println(\"\{x}\") }\n"
+    compile_test_helpers.expect_no_error(src, "ehy4f9_else_ok", "E0304")
+}
+
+test "a bare block ending in an else-less if is a statement (accepted)" {
+    let src = "fn main() \{ let c = true\n \{\n io.println(\"start\")\n if c \{ io.println(\"hi\") } } }\n"
+    compile_test_helpers.expect_no_error(src, "ehy4f9_bareblock_ok", "E0304")
+}
+
+test "an async.scope ending in an else-less if is a statement (accepted)" {
+    let src = "fn main() \{ let c = true\n async.scope \{\n if c \{ io.println(\"hi\") } } }\n"
+    compile_test_helpers.expect_no_error(src, "ehy4f9_async_ok", "E0304")
+}
+
+test "an else-less if returned from a -> () fn is a statement (accepted)" {
+    let src = "fn f(c: Bool) \{ return if c \{ io.println(\"hi\") } }\nfn main() \{ f(true) }\n"
+    compile_test_helpers.expect_no_error(src, "ehy4f9_voidreturn_ok", "E0304")
+}
+
+test "a discarded nested block inside a value block is a statement (accepted)" {
+    let src = "fn main() \{ let c = true\n let x = \{\n \{ io.println(\"a\")\n if c \{ io.println(\"b\") } }\n 5 }\n io.println(\"\{x}\") }\n"
+    compile_test_helpers.expect_no_error(src, "ehy4f9_nested_stmt_ok", "E0304")
+}

@@ -21,7 +21,7 @@ import diagnostics.{
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
     NON_EXHAUSTIVE_MATCH,
-    TYPE_ERROR, TEMPLATE_MISMATCH, CANNOT_INFER_TYPE, NOT_ITERABLE, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
+    TYPE_ERROR, TEMPLATE_MISMATCH, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
     MUTATION_REQUIRES_MUT,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
@@ -3090,7 +3090,9 @@ fn tc_check_call_against_fn_tid(fn_tid: Int, args_sl: Int, label: Str, node: Int
     let pstart = fn_ty.params_start
     let mut li = 0
     while li < got {
-        let arg_tid = infer_type(sublist_get(args_sl, li))
+        // A call argument is expression context (§2.9): an else-less `if` passed as an
+        // argument has no value on the false path. Infer in value context.
+        let arg_tid = tc_infer_value(sublist_get(args_sl, li))
         if li < expected {
             let ptid = ty_param_list.get(pstart + li).unwrap()
             if arg_tid != TYPE_UNKNOWN && ptid != TYPE_UNKNOWN && types_compatible(ptid, arg_tid) == 0 {
@@ -9726,12 +9728,46 @@ pub fn tc_fn_tid_more_specific(existing0: Int, fresh0: Int) -> Int {
     1
 }
 
+// §2.9: report an else-less `if` used as a value. The single emit site for E0304; the IfExpr
+// arm calls it only when tc_if_value_ctx is set, so a statement-context else-less `if` (value
+// discarded) is never reported.
+fn tc_report_missing_else(node: Int) ! Diag.Report {
+    diag_error_at("MissingElse", MISSING_ELSE, "an `if` used as a value must have an `else` — the false path produces no value (§2.9)", node, "add an `else` branch, or make the `if` a statement if you only want its effect")
+}
+
+// Infer a value in EXPRESSION context (§2.9): set tc_if_value_ctx across the walk so the IfExpr
+// arm reports an else-less `if` anywhere the value is produced — flat sub-expressions and the
+// block/with/async/match TAILS infer_type descends alike. Saves/restores so a value nested in a
+// statement (an arg of a discarded call) is still value context, and vice versa.
+@allow(UnrestoredMutation)
+fn tc_infer_value(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let saved = tc_if_value_ctx
+    tc_if_value_ctx = 1
+    let t = infer_type(node)
+    tc_if_value_ctx = saved
+    t
+}
+
+// §2.9: the implicit tail and an explicit `return` are expression context only when the fn
+// actually returns a value. tc_current_fn_ret is -1 when lookup_fnsig missed (impl methods,
+// unresolved sigs); TYPE_VOID / TYPE_UNKNOWN are the non-value returns. One predicate so the
+// tail gate (which also drives the declared-return compare) and the Return gate cannot drift.
+fn tc_fn_returns_value() -> Bool {
+    tc_current_fn_ret >= 0 && tc_current_fn_ret != TYPE_VOID && tc_current_fn_ret != TYPE_UNKNOWN
+}
+
 // `pub` FOR THE TEST ONLY — same precedent as make_fn_type. Real code reaches inference through
 // tc_check_body, never this entry directly; the g19dpq test calls it by hand to install the
 // latent re-inference producer the Closure-arm guard defends against. It MUTATES the tc_node_tid
 // memo, so it must not be called from ordinary compiler code.
 pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    // §2.9: infer_type_uncached resets tc_if_value_ctx to 1 at entry (its consuming child
+    // descents are all value positions) and only its pass-through arms restore the incoming
+    // context. Save/restore here so a walk never clobbers the flag its caller set — the
+    // ambient a discarded statement relies on stays 0 across statements.
+    let saved_ctx = tc_if_value_ctx
     let tid = infer_type_uncached(node)
+    tc_if_value_ctx = saved_ctx
     if node != -1 && node < tc_node_tid.len() {
         // Never downgrade a known memo to UNKNOWN. -1 is the unset sentinel (TYPE_INT
         // is 0), so a never-inferred node still takes the write, and known->known
@@ -9772,9 +9808,19 @@ pub fn tc_publish_node_tid(node: Int, tid: Int) {
     tc_node_tid.set(node, tid)
 }
 
+@allow(UnrestoredMutation)
 fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return TYPE_UNKNOWN }
     let kind = node_kind(node)
+
+    // §2.9 value-context flag. `incoming` is whether THIS node is a consumed value (its else-less
+    // `if` needs an `else`). Reset to 1 so every consuming child descent below — operand, element,
+    // field, argument, index, scrutinee, condition — is value context by default. Only the
+    // pass-through arms (block/with/async tail, if branches, match-arm bodies) restore `incoming`,
+    // so a discarded statement's legal else-less `if` stays legal exactly at those tails. The
+    // infer_type wrapper restores the flag on return, so this write never escapes the walk.
+    let incoming = tc_if_value_ctx
+    tc_if_value_ctx = 1
 
     if kind == NodeKind.IntLit { return TYPE_INT }
     if kind == NodeKind.FloatLit { return TYPE_FLOAT }
@@ -11584,13 +11630,17 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     }
 
     if kind == NodeKind.IfExpr {
+        // The condition is always consumed (value context); leave the flag at 1. The branches
+        // inherit THIS if's own consumed-ness, so restore `incoming` before descending them.
         let cond_t = infer_type(node_condition(node))
         if is_bool_compat(cond_t) == 0 {
             tc_error_at("if condition must be Bool, got {type_to_str(cond_t)}", node)
         }
+        tc_if_value_ctx = incoming
         let then_t = infer_type(node_then_body(node))
         let else_node = node_else_body(node)
         if else_node != -1 {
+            tc_if_value_ctx = incoming
             let else_t = infer_type(else_node)
             if then_t != TYPE_UNKNOWN && else_t != TYPE_UNKNOWN {
                 if types_compatible(then_t, else_t) == 0 {
@@ -11601,16 +11651,29 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if else_t == TYPE_UNKNOWN { return then_t }
             return type_merge(then_t, else_t)
         }
+        // §2.9: an else-less `if` used as a value has no value on the false path. infer_type
+        // reaches this arm in BOTH contexts — value positions AND the tails of discarded
+        // statement blocks/asyncs (its Block/WithBlock/AsyncScope arms descend the tail) — so
+        // report only when `incoming` marks THIS `if` as a consumed value. One gated site covers
+        // every position infer_type walks: flat (operand, field, element, argument, scrutinee,
+        // RHS) and every value tail. A discarded statement `if` stays legal with type ().
+        if incoming != 0 {
+            tc_report_missing_else(node)
+        }
         return then_t
     }
 
     if kind == NodeKind.MatchExpr {
         let arms_sl = node_arms(node)
         if arms_sl != -1 && sublist_length(arms_sl) > 0 {
+            // The scrutinee is consumed by the match (value context); the arm bodies produce the
+            // match's value, so they inherit its own consumed-ness.
             let scrut_tid = infer_type(node_scrutinee(node))
+            tc_if_value_ctx = incoming
             let mut merged = infer_arm_body(sublist_get(arms_sl, 0), scrut_tid)
             let mut i = 1
             while i < sublist_length(arms_sl) {
+                tc_if_value_ctx = incoming
                 let arm_t = infer_arm_body(sublist_get(arms_sl, i), scrut_tid)
                 if merged == TYPE_UNKNOWN {
                     merged = arm_t
@@ -11627,6 +11690,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     if kind == NodeKind.Block {
         let tail = tc_block_tail_stmt(node)
         if tail == -1 { return TYPE_VOID }
+        // The tail produces the block's value, so it inherits the block's own consumed-ness.
+        tc_if_value_ctx = incoming
         return infer_type(tc_block_tail_value(tail))
     }
 
@@ -11636,6 +11701,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     }
 
     if kind == NodeKind.WithBlock {
+        tc_if_value_ctx = incoming
         return infer_type(node_body(node))
     }
 
@@ -11648,6 +11714,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     // statement-position scope returns Unknown here AND its body goes unwalked, because
     // tc_check_body's ExprStmt re-dispatch keys on is_block_bearing.
     if kind == NodeKind.AsyncScope {
+        tc_if_value_ctx = incoming
         return infer_type(node_body(node))
     }
 
@@ -12419,7 +12486,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // lookup_fnsig hits, and it is called from two non-reentrant top-level loops,
         // so a miss leaves the -1 that init_types/the prior restore put there. (Which
         // is why this check does not reach impl methods — see tc_check_returned_value.)
-        if is_fn_body != 0 && tc_current_fn_ret >= 0 && tc_current_fn_ret != TYPE_VOID && tc_current_fn_ret != TYPE_UNKNOWN {
+        if is_fn_body != 0 && tc_fn_returns_value() {
             let tail = tc_block_tail_stmt(node)
             if tail != -1 && node_kind(tail) != NodeKind.Return {
                 let tail_val = tc_block_tail_value(tail)
@@ -12430,7 +12497,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // goes silent. Recover the in-scope answer the same way the LetBinding arm does,
                     // and for the same reason the IfExpr walk publishes it: an `if`/`match` in a
                     // block-`let` was already covered, the fn tail was the one consumer that was not.
-                    let mut tail_t = infer_type(tail_val)
+                    // Implicit tail of a value-returning fn is expression context (§2.9):
+                    // infer in value context so an else-less `if` tail (no value on the false
+                    // path) is rejected.
+                    let mut tail_t = tc_infer_value(tail_val)
                     if tail_t == TYPE_UNKNOWN || tc_tid_has_unknown(tail_t) != 0 {
                         let memo = tc_scoped_value_memo(tail_val, 0)
                         if memo >= 0 && memo != TYPE_UNKNOWN {
@@ -12466,7 +12536,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if val != -1 {
             let saved_hint = tc_construct_hint
             if declared_tid != TYPE_UNKNOWN { tc_construct_hint = resolve_alias_tid(declared_tid) }
-            inferred_tid = infer_type(val)
+            // A let binding is expression context (§2.9): infer in value context so an else-less
+            // `if` as its value (no value on the false path) is rejected regardless of the
+            // declared/inferred type, so `let x = if c { 1 }` fails even when x is unused.
+            inferred_tid = tc_infer_value(val)
             tc_construct_hint = saved_hint
             tc_check_body(val)
             // `let x = { let h = 5  h }` and
@@ -12621,7 +12694,9 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let val = node_value(node)
         if target != -1 && val != -1 {
             let target_t = infer_type(target)
-            let val_t = infer_type(val)
+            // An assignment RHS is expression context (§2.9): infer in value context so an
+            // else-less `if` (no value on the false path) is rejected.
+            let val_t = tc_infer_value(val)
             if kind == NodeKind.CompoundAssign {
                 reject_bool_arith_operand(node_op(node), target_t, node)
                 reject_bool_arith_operand(node_op(node), val_t, node)
@@ -12945,8 +13020,13 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let val = node_value(node)
         if val != -1 {
             let saved_hint = tc_construct_hint
-            if tc_current_fn_ret != TYPE_VOID && tc_current_fn_ret != TYPE_UNKNOWN { tc_construct_hint = resolve_alias_tid(tc_current_fn_ret) }
-            let val_t = infer_type(val)
+            // An explicit `return` is expression context (§2.9) ONLY when the fn returns a
+            // value: infer in value context there so an else-less `if` (no value on the false
+            // path) is rejected. `return if c { .. }` in a `-> ()` fn is statement context —
+            // the returned value is discarded — so it stays legal (plain infer, flag off).
+            let returns_value = tc_fn_returns_value()
+            if returns_value { tc_construct_hint = resolve_alias_tid(tc_current_fn_ret) }
+            let val_t = if returns_value { tc_infer_value(val) } else { infer_type(val) }
             tc_construct_hint = saved_hint
             // Shared with the implicit tail — see tc_check_returned_value for why each
             // guard is load-bearing. This arm stays necessary alongside the tail site: an
@@ -13063,6 +13143,15 @@ let mut tc_pattern_binding_type: Int = -1
 // fn-arg param, Ok/Err/Some carrier) and consulted FIRST among the unqualified
 // resolution rules. -1 = no hint. Mirrors the tc_pattern_binding_type discipline.
 let mut tc_construct_hint: Int = -1
+
+// §2.9 value-context flag. infer_type walks ONLY value positions (flat sub-expressions and
+// block/with/async/match TAILS) — never a discarded statement, which tc_check_body walks
+// instead — so the flag rides infer_type's recursion: value sites set it before inferring
+// their value, and it reaches every consumed position beneath. 0 = discard/statement context
+// (an else-less `if` is legal, type ()); 1 = value context (the IfExpr arm reports E0304).
+// Default 0 is fail-safe: a missed value site leaks (spec-should-error but does not) rather
+// than rejecting legal code. Set by tc_infer_value at let/return/assignment/fn-tail/argument.
+let mut tc_if_value_ctx: Int = 0
 
 // Genuinely saves/restores tc_pattern_binding_type around recursive descent;
 // the nr_define/nr_define_typed/recursive calls also write scope-management
