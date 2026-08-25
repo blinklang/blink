@@ -1,0 +1,39 @@
+import compile_test_helpers
+
+// axpq22 — typecheck must sign `Ptr.deref()` as the pointee type T. Per
+// sections/07_trust_modules_metadata.md:219 the signature is `fn deref(self) -> T`,
+// so a `Ptr[U8]` deref yields U8 (sized ints are nominally distinct from Int).
+// Reading it into an `Int` binding must be a TypeError (E0300), exactly as the
+// explicit store `let u: U8 = 200; let n: Int = u` already is. Leaving `deref`
+// unsigned made the let's declared type never compare against the RHS, so a U8
+// pointee laundered straight into an Int local with no diagnostic. The honest
+// form is `p.deref().to_int()`.
+
+test "Ptr[U8] deref into an Int binding is rejected (no laundering)" {
+    let src = "fn main() \{ let s = \"hi\"\n let p: Ptr[U8] = s.as_cstr()\n let n: Int = p.deref()\n io.println(\"\{n}\") }\n"
+    compile_test_helpers.expect_compile_error(src, "axpq22_deref_launder", "E0300")
+}
+
+test "Ptr[U8] deref with explicit .to_int() is accepted" {
+    let src = "fn main() \{ let s = \"hi\"\n let p: Ptr[U8] = s.as_cstr()\n let n: Int = p.deref().to_int()\n io.println(\"\{n}\") }\n"
+    compile_test_helpers.expect_no_error(src, "axpq22_deref_to_int", "E0300")
+}
+
+test "Ptr[U8] deref into a U8 binding is accepted (pointee type matches)" {
+    let src = "fn main() \{ let s = \"hi\"\n let p: Ptr[U8] = s.as_cstr()\n let b: U8 = p.deref()\n io.println(\"\{b.to_int()}\") }\n"
+    compile_test_helpers.expect_no_error(src, "axpq22_deref_u8", "E0300")
+}
+
+// A second sized width proves the signing reads the pointee generically (inner1), not a
+// hardcoded U8: I32 is nominally distinct from Int too, so the bare store is still E0300.
+test "Ptr[I32] deref into an Int binding is rejected (width is not U8-specific)" {
+    let src = "import blink.ffi\nfn main() \{ with ffi.scope() as scope \{ let p: Ptr[I32] = scope.alloc()\n let n: Int = p.deref()\n io.println(\"\{n}\") } }\n"
+    compile_test_helpers.expect_compile_error(src, "axpq22_deref_i32_launder", "E0300")
+}
+
+// The direct positive: when the pointee genuinely IS Int, `p.deref()` types as Int and needs
+// no `.to_int()` bridge — the signing must not regress the common Ptr[Int] case.
+test "Ptr[Int] deref into an Int binding is accepted (pointee is Int)" {
+    let src = "import blink.ffi\nfn main() \{ with ffi.scope() as scope \{ let p: Ptr[Int] = scope.alloc()\n p.write(7)\n let n: Int = p.deref()\n io.println(\"\{n}\") } }\n"
+    compile_test_helpers.expect_no_error(src, "axpq22_deref_int_ok", "E0300")
+}

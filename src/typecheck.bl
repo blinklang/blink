@@ -10840,21 +10840,23 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if method == "is_empty" { return TYPE_BOOL }
         }
 
-        // Only the three methods where the spec and codegen already agree, or where
-        // codegen is the sole authority AND lib/std depends on it. `.deref()` and `.addr()` are
-        // deliberately absent: sections/07_trust_modules_metadata.md:217,:220 specifies
-        // `Option[T]` and `Ptr[Ptr[T]]` while codegen_methods.bl:4774-4835 implements a bare
-        // `Int` for both, and lib/std/libc.bl:146,164,177,189,210 depends on the bare form. An
-        // arm here would have to pick a side. `.read()` / `.write()` are likewise out until
-        // the miscompile that makes their return type meaningless is fixed.
+        // Ptr methods typed here per sections/07_trust_modules_metadata.md: `is_null` and
+        // `to_str` are codegen-authoritative; `addr` is the integer address (:220);
+        // `deref` (:219) is signed as the pointee T so a sized pointee cannot launder into
+        // an Int binding; `offset` preserves the pointee. `.write()` returns unit and is
+        // typed at its own dispatch; a first-class arm for it is out until its argument is
+        // type-checked against the pointee.
         if obj_k == TyKind.Ptr {
             let args_sl = node_args(node)
             if method == "is_null" { return TYPE_BOOL }
             // `addr` is always the integer address (codegen emits `(int64_t)(intptr_t)…`).
-            // `deref` stays deliberately unsigned here until br axpq22 lands: returning the
-            // pointee would make `let n: Int = <Ptr[U8]>.deref()` a TypeError, which is
-            // axpq22's pinned behavior, not this ticket's (see test_q3ssqw_ptr_call_return_pointee).
             if method == "addr" { return TYPE_INT }
+            // `deref` reads the pointee, so its result IS the pointee type T
+            // (sections/07_trust_modules_metadata.md:219, `fn deref(self) -> T`).
+            // Signing it closes the fail-open where an unsigned result skipped the
+            // let compare and laundered a sized-int pointee (Ptr[U8]) into an Int
+            // binding; the honest form is `p.deref().to_int()`.
+            if method == "deref" { return ty_pool.get(obj_t).unwrap().inner1 }
             // Pointer arithmetic, so the pointee is PRESERVED — `obj_t` itself, not its child.
             // Absent from the spec's operations table but defined by codegen
             // (codegen_methods.bl:4812), described by the E0813/E0822 diagnostics, and
