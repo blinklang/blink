@@ -13,7 +13,7 @@ import codegen_types.{
     cg_mono_tparams_sl, cg_mono_arg_tids, cg_fn_mono_tparams_sl, cg_fn_mono_arg_tids,
     cg_debug_mode, cg_handler_body_field, cg_handler_body_idx,
     cg_handler_body_is_ue, cg_handler_body_vtable_type,
-    cg_handler_caps, HandlerCapture, cg_handler_ret_option_erased,
+    cg_handler_caps, HandlerCapture, handler_cap_c_type, cg_handler_ret_option_erased,
     cg_handler_counter, cg_handler_is_user_effect,
     cg_handler_vtable_field, cg_handler_vtable_type,
     cg_in_handler_body, cg_indent, cg_lines, cg_program_node,
@@ -747,7 +747,16 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                     inner_tag = fsi.ok_struct.slice(7, fsi.ok_struct.len())
                 }
                 let inner_ct = type_from_name_tag(inner_tag)
-                if is_compound_tag(inner_tag) != 0 || is_struct_type(inner_tag) != 0 || is_enum_type(inner_tag) != 0 {
+                if is_opaque_type(inner_tag) != 0 {
+                    // Result[Option[@ffi.opaque], E]: the ok segment NPO's to the bare
+                    // handle word, so None is the null handle pointer, not a carrier.
+                    let handle = opaque_handle_c_name(inner_tag)
+                    expr_result_str = "(({handle})0)"
+                    expr_result_type = CT_OPTION
+                    publish_result_tid(node)
+                    expr_option_inner = CT_INT
+                    expr_option_inner_struct = inner_tag
+                } else if is_compound_tag(inner_tag) != 0 || is_struct_type(inner_tag) != 0 || is_enum_type(inner_tag) != 0 {
                     ensure_struct_option_type(inner_tag)
                     let opt_type = struct_option_c_type(inner_tag)
                     expr_result_str = "({opt_type})\{.tag = 0}"
@@ -1544,7 +1553,7 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
                 // capture_log/capture_print are exactly this shape: composing two of them
                 // would conflict over that shared word.
                 if already == 0 && is_module_global(cname) == 0 {
-                    handler_caps.push(HandlerCapture { name: cname, tp_id: get_var_type(cname) })
+                    handler_caps.push(HandlerCapture { name: cname, tp_id: get_var_type(cname), struct_name: get_var_struct(cname) })
                 }
                 cci = cci + 1
             }
@@ -1561,9 +1570,9 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
         while csi < handler_caps.len() {
             let cap = handler_caps.get(csi).unwrap()
             let cn = cap.name
-            let ct = cap.tp_id
-            ctype_probe_at(cg_expr_mono_tid(get_var_ty(cn)), "expr_handler_cap_field", cn, c_type_str(ct), -1)
-            cg_closure_defs.push("    {c_type_str(ct)} {c_safe_name(cn)};")
+            let cap_ct_s = handler_cap_c_type(cap)
+            ctype_probe_at(cg_expr_mono_tid(get_var_ty(cn)), "expr_handler_cap_field", cn, cap_ct_s, -1)
+            cg_closure_defs.push("    {cap_ct_s} {c_safe_name(cn)};")
             csi = csi + 1
         }
         cg_closure_defs.push("} {cap_struct_name};")
@@ -1738,13 +1747,15 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
                     let cn = cap0.name
                     let ct = cap0.tp_id
                     let safe_cn = c_safe_name(cn)
-                    ctype_probe_at(cg_expr_mono_tid(get_var_ty(cn)), "expr_handler_unbox1", cn, c_type_str(ct), -1)
+                    let cap_ct_s = handler_cap_c_type(cap0)
+                    ctype_probe_at(cg_expr_mono_tid(get_var_ty(cn)), "expr_handler_unbox1", cn, cap_ct_s, -1)
                     if ct == CT_STRING {
-                        emit_line("{c_type_str(ct)} {safe_cn} = (const char*){cap_ev_fld}->__userdata;")
+                        emit_line("{cap_ct_s} {safe_cn} = (const char*){cap_ev_fld}->__userdata;")
                     } else {
-                        emit_line("{c_type_str(ct)} {safe_cn} = ({c_type_str(ct)})(uintptr_t){cap_ev_fld}->__userdata;")
+                        emit_line("{cap_ct_s} {safe_cn} = ({cap_ct_s})(uintptr_t){cap_ev_fld}->__userdata;")
                     }
                     set_var(cn, ct, 0)
+                    if cap0.struct_name != "" { set_var_struct(cn, cap0.struct_name) }
                 } else {
                     emit_line("{cap_struct_name}* __caps = ({cap_struct_name}*){cap_ev_fld}->__userdata;")
                     let mut uci = 0
@@ -1753,9 +1764,11 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
                         let cn = cap.name
                         let ct = cap.tp_id
                         let safe_cn = c_safe_name(cn)
-                        ctype_probe_at(cg_expr_mono_tid(get_var_ty(cn)), "expr_handler_unboxN", cn, c_type_str(ct), -1)
-                        emit_line("{c_type_str(ct)} {safe_cn} = __caps->{safe_cn};")
+                        let cap_ct_s = handler_cap_c_type(cap)
+                        ctype_probe_at(cg_expr_mono_tid(get_var_ty(cn)), "expr_handler_unboxN", cn, cap_ct_s, -1)
+                        emit_line("{cap_ct_s} {safe_cn} = __caps->{safe_cn};")
                         set_var(cn, ct, 0)
+                        if cap.struct_name != "" { set_var_struct(cn, cap.struct_name) }
                         uci = uci + 1
                     }
                 }

@@ -1,0 +1,205 @@
+import compile_test_helpers
+
+// br 3hggdm — a NESTED / ABI-seam `Option[@ffi.opaque]` inner must be NPO'd to the bare
+// handle word (C NULL is the `None` niche), the same as a DIRECT `Option[opaque]` (gn5yns).
+// Before the fix these seams routed the opaque inner through the tagged-carrier grammar and
+// spelled invalid C — a `*` folded into a C identifier (`blink_Option_FILE*`) or a `.tag`
+// compound literal on a bare pointer (`(FILE*){.tag = 0}`). spec sections/07:896, decisions/
+// opaque-ffi-handles.md (6-0). The direct seams gn5yns fixed are pinned in
+// tests/test_gn5yns_option_opaque_npo.bl; these are the compound/ABI seams it did not reach.
+
+// ── Case 1: Result[Option[opaque], E] ────────────────────────────────────────────────────
+
+test "Result[Option[opaque], E] with a None Ok-payload compiles and round-trips" {
+    let src = "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("type MyErr \{ code: Int }\n")
+        .concat("fn f() -> Result[Option[CFile], MyErr] \{ Ok(None) }\n")
+        .concat("fn main() \{\n")
+        .concat("    match f() \{\n")
+        .concat("        Ok(o) => match o \{ Some(_) => io.println(\"some\") None => io.println(\"none\") }\n")
+        .concat("        Err(_) => io.println(\"err\")\n")
+        .concat("    }\n")
+        .concat("}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_3hggdm_result_opt")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("none"))
+}
+
+test "Result[Option[opaque], E] carrier leaks no tagged Option stem nor a * in the C identifier" {
+    let src = "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("type MyErr \{ code: Int }\n")
+        .concat("fn f() -> Result[Option[CFile], MyErr] \{ Ok(None) }\n")
+        .concat("fn main() \{ match f() \{ Ok(_) => io.println(\"ok\") Err(_) => io.println(\"e\") } }\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_3hggdm_result_opt_c")
+    assert(!c.contains("blink_Option_FILE"))
+    assert(c.contains("FILE*"))
+}
+
+// The Ok(Some(handle)) path: the present handle must survive the nested Result[Option[..]]
+// carrier and come back out fclose-able (the null niche is only half the round-trip).
+fn result_some_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi("c", "fopen")
+@trusted
+fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> CFile ! FFI { }
+
+@ffi("c", "fclose")
+@trusted
+fn c_fclose(f: CFile) -> Int ! FFI { }
+
+type MyErr { code: Int }
+
+fn open_it(f: CFile) -> Result[Option[CFile], MyErr] { Ok(Some(f)) }
+
+fn main() {
+    with ffi.scope() as scope {
+        let p = scope.cstr("/dev/null")
+        let m = scope.cstr("r")
+        let f = c_fopen(p, m)
+        match open_it(f) {
+            Ok(o) => match o {
+                Some(g) => io.println("some rc {c_fclose(g)}")
+                None => io.println("none")
+            }
+            Err(_) => io.println("err")
+        }
+    }
+}
+"#
+}
+
+test "Result[Option[opaque], E] carries a present handle out fclose-able" {
+    let r = compile_test_helpers.compile_and_run(result_some_src(), "_3hggdm_result_some")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("some rc 0"))
+}
+
+// ── Case 2: a user-effect operation returning Option[opaque] (None path) ──────────────────
+// Exercises the fn-signature spelling (codegen.bl), the operation dispatch wrapper's return
+// spelling (codegen_expr.bl), and the handler body's None return (codegen_stmt.bl).
+
+fn ue_none_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+effect Store {
+    effect Lookup {
+        fn find(k: Str) -> Option[CFile]
+    }
+}
+
+fn lookup(k: Str) -> Option[CFile] ! Store.Lookup {
+    store.find(k)
+}
+
+fn main() {
+    with handler Store {
+        fn find(k: Str) -> Option[CFile] {
+            None
+        }
+    } {
+        let r = lookup("x")
+        if r.is_none() { io.println("ue none") }
+    }
+}
+"#
+}
+
+test "a user-effect op returning Option[opaque] round-trips a None through the null niche" {
+    let r = compile_test_helpers.compile_and_run(ue_none_src(), "_3hggdm_ue_none")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("ue none"))
+}
+
+test "a user-effect op returning Option[opaque] leaks no tagged Option stem" {
+    let c = compile_test_helpers.compile_and_emit_c(ue_none_src(), "_3hggdm_ue_none_c")
+    assert(!c.contains("blink_Option_FILE"))
+    assert(c.contains("FILE*"))
+}
+
+// ── Case 3: a user-effect handler body returning Some(opaque handle) ──────────────────────
+// The handler body's Some emitter must box the bare handle as the null-niche word, not stamp
+// a `.tag`/`.value` compound literal on a `CN*`.
+
+fn ue_some_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi("c", "fopen")
+@trusted
+fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> CFile ! FFI { }
+
+@ffi("c", "fclose")
+@trusted
+fn c_fclose(f: CFile) -> Int ! FFI { }
+
+effect Store {
+    effect Lookup {
+        fn get(k: Str) -> Option[CFile]
+    }
+}
+
+fn lookup(k: Str) -> Option[CFile] ! Store.Lookup {
+    store.get(k)
+}
+
+fn main() {
+    with ffi.scope() as scope {
+        let p = scope.cstr("/dev/null")
+        let m = scope.cstr("r")
+        let f = c_fopen(p, m)
+        with handler Store {
+            fn get(k: Str) -> Option[CFile] {
+                Some(f)
+            }
+        } {
+            let r = lookup("x")
+            if r.is_some() {
+                let g = r.unwrap()
+                io.println("ue some rc {c_fclose(g)}")
+            }
+        }
+    }
+}
+"#
+}
+
+test "a user-effect handler returning Some(opaque) carries the handle out fclose-able" {
+    let r = compile_test_helpers.compile_and_run(ue_some_src(), "_3hggdm_ue_some")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("ue some rc 0"))
+}
+
+// ── Case 4: async spawn/await of Option[opaque] ──────────────────────────────────────────
+// The spawned task result and the `.await` unbox must carry the opaque inner as the bare
+// handle word, not route it through a `blink_Option_void`/`blink_Option_ptr` carrier.
+
+fn await_none_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+fn main() {
+    async.scope {
+        let h = async.spawn(fn() -> Option[CFile] {
+            None
+        })
+        let r = h.await
+        if r.is_none() { io.println("await none") }
+    }
+}
+"#
+}
+
+test "async spawn/await of Option[opaque] round-trips a None" {
+    let r = compile_test_helpers.compile_and_run(await_none_src(), "_3hggdm_await_none")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("await none"))
+}
+
+test "async spawn/await of Option[opaque] spells the bare handle, no tagged carrier" {
+    let c = compile_test_helpers.compile_and_emit_c(await_none_src(), "_3hggdm_await_none_c")
+    assert(c.contains("FILE*"))
+    assert(!c.contains("blink_Option_FILE"))
+}

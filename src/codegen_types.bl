@@ -1494,6 +1494,17 @@ pub let mut cg_handler_body_idx: Int = 0
 pub type HandlerCapture {
     name: Str
     tp_id: Int
+    struct_name: Str
+}
+
+// The C declaration type for a handler capture. An @ffi.opaque capture carries
+// its type only in `struct_name` (its CT erases to CT_VOID → `void`), so spell the
+// bare handle from the name; every other capture uses its CT.
+pub fn handler_cap_c_type(cap: HandlerCapture) -> Str {
+    if cap.struct_name != "" && is_opaque_type(cap.struct_name) != 0 {
+        return opaque_handle_c_name(cap.struct_name)
+    }
+    c_type_str(cap.tp_id)
 }
 pub let mut cg_handler_caps: List[HandlerCapture] = []
 
@@ -7393,6 +7404,11 @@ pub fn strip_blink_prefix(c_name: Str) -> Str {
 }
 
 pub fn c_type_tag_for_struct(name: Str) -> Str {
+    // An @ffi.opaque handle lowers to a bare `<cname>*` pointer with no carrier struct. Its
+    // C name carries a `*` that cannot appear inside a carrier identifier (folding it in
+    // spells `blink_Result_FILE*_MyErr` etc.), so the tag is the identifier-safe nominal
+    // name; c_type_from_tag maps it back to the pointer.
+    if is_opaque_type(name) != 0 { return strip_module_qualifier(name) }
     strip_blink_prefix(c_type_c_name(name))
 }
 
@@ -9596,6 +9612,16 @@ fn is_transparent_newtype_from_decl() -> Int {
 }
 
 pub fn c_type_from_tag(tag: Str) -> Str {
+    if is_opaque_type(tag) != 0 {
+        // @ffi.opaque: the carrier member IS the bare handle pointer (NPO), never a
+        // blink_<tag> struct and never a blink_Option_ wrapper. The inverse of
+        // c_type_tag_for_struct's opaque arm.
+        return opaque_handle_c_name(tag)
+    }
+    // Option[@ffi.opaque] has the SAME representation as the bare handle, so a
+    // Result/tuple ok/err segment over it spells the bare handle too.
+    let opaque_opt_c = opaque_option_carrier_cname(tag)
+    if opaque_opt_c != "" { return opaque_opt_c }
     if is_transparent_newtype(tag) != 0 {
         // Transparent: the carrier member is a bare int64_t, never blink_Errno.
         "int64_t"
@@ -9674,10 +9700,10 @@ pub fn emit_struct_result_typedef(ok_tag: Str, err_tag: Str) ! Codegen.Emit {
     // carrier (e.g. Result[Option[Box[Int]],Str] whose ok_tag is Option_Box_Int)
     // must have its own carrier typedef precede this one, or C reads the
     // undeclared member as `int *`. Idempotent via the emitted guards.
-    if is_compound_tag(ok_tag) != 0 {
+    if is_compound_tag(ok_tag) != 0 && opaque_option_carrier_cname(ok_tag) == "" {
         emit_carrier_typedef_for_tag(ok_tag)
     }
-    if is_compound_tag(err_tag) != 0 {
+    if is_compound_tag(err_tag) != 0 && opaque_option_carrier_cname(err_tag) == "" {
         emit_carrier_typedef_for_tag(err_tag)
     }
     let c_ok = if ok_tag == "void" || ok_tag == "Void" { "int64_t" } else { c_type_from_tag(ok_tag) }
