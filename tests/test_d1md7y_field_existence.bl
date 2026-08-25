@@ -1,0 +1,148 @@
+import compile_test_helpers
+
+// br d1md7y — reading a field a struct does not declare was silently accepted and interpolated as
+// the literal placeholder <value>; the infer path fell through to TYPE_UNKNOWN when
+// get_struct_field_tid returned -1. The spec makes nonexistent member access a COMPILE ERROR:
+// sections/03_types.md:3305 ("tuple (Int, Int) has no field 2"). Now E0525 NoSuchField.
+
+fn bad_struct_field_src() -> Str {
+    #"type P { a: Int }
+fn main() {
+    let p = P { a: 1 }
+    io.println("a={p.a} bogus={p.zzz}")
+}
+"#
+}
+
+test "reading a field a struct does not declare is E0525" {
+    compile_test_helpers.expect_compile_error(bad_struct_field_src(), "d1md7y_bad_field", "E0525")
+}
+
+fn empty_struct_field_src() -> Str {
+    #"type Empty {}
+fn main() {
+    let e = Empty {}
+    io.println("{e.x}")
+}
+"#
+}
+
+test "field access on an empty struct is E0525" {
+    compile_test_helpers.expect_compile_error(empty_struct_field_src(), "d1md7y_empty", "E0525")
+}
+
+fn opaque_field_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi("c", "fopen")
+@trusted
+fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> CFile ! FFI { }
+
+fn main() {
+    with ffi.scope() as scope {
+        let a = c_fopen(scope.cstr("/dev/null"), scope.cstr("r"))
+        io.println("{a.handle}")
+    }
+}
+"#
+}
+
+test "field access on an @ffi.opaque handle is E0525 (inertness falls out of the general check)" {
+    compile_test_helpers.expect_compile_error(opaque_field_src(), "d1md7y_opaque", "E0525")
+}
+
+fn tuple_oob_src() -> Str {
+    #"fn main() {
+    let pair = (1, 2)
+    io.println("{pair.2}")
+}
+"#
+}
+
+test "out-of-range tuple index is E0525 (spec 03_types.md:3305)" {
+    compile_test_helpers.expect_compile_error(tuple_oob_src(), "d1md7y_tuple_oob", "E0525")
+}
+
+// Guards: legitimate access must still typecheck cleanly.
+fn good_struct_field_src() -> Str {
+    #"type P { a: Int
+b: Str }
+fn main() {
+    let p = P { a: 1, b: "x" }
+    io.println("a={p.a} b={p.b}")
+}
+"#
+}
+
+test "a declared struct field still typechecks (no false E0525)" {
+    compile_test_helpers.expect_no_error(good_struct_field_src(), "d1md7y_good_field", "E0525")
+}
+
+fn good_tuple_index_src() -> Str {
+    #"fn main() {
+    let pair = (1, 2)
+    io.println("{pair.0} {pair.1}")
+}
+"#
+}
+
+test "an in-range tuple index still typechecks (no false E0525)" {
+    compile_test_helpers.expect_no_error(good_tuple_index_src(), "d1md7y_good_tuple", "E0525")
+}
+
+// Guard the design invariant: get_struct_field_tid answering -1 (or a substituted
+// generic-instance field) must never be read as absence. A declared field on a
+// generic struct INSTANCE resolves, and only a genuinely-undeclared field errors.
+fn generic_instance_good_src() -> Str {
+    #"type Box[T] { value: T }
+fn main() {
+    let b = Box { value: 5 }
+    io.println("v={b.value}")
+}
+"#
+}
+
+test "a declared field on a generic struct instance still typechecks (no false E0525)" {
+    compile_test_helpers.expect_no_error(generic_instance_good_src(), "d1md7y_generic_good", "E0525")
+}
+
+fn generic_instance_bad_src() -> Str {
+    #"type Box[T] { value: T }
+fn main() {
+    let b = Box { value: 5 }
+    io.println("v={b.nope}")
+}
+"#
+}
+
+test "an undeclared field on a generic struct instance is E0525" {
+    compile_test_helpers.expect_compile_error(generic_instance_bad_src(), "d1md7y_generic_bad", "E0525")
+}
+
+// Guard the `._N` underscore-prefixed tuple accessor: it names the same element
+// as `.N`, so an in-range access must resolve (no false E0525) and an
+// out-of-range one must error.
+fn underscore_tuple_good_src() -> Str {
+    #"fn main() {
+    let pair = (1, 2)
+    io.println("{pair._0} {pair._1}")
+}
+"#
+}
+
+test "an in-range underscore tuple index still typechecks (no false E0525)" {
+    compile_test_helpers.expect_no_error(underscore_tuple_good_src(), "d1md7y_us_tuple_good", "E0525")
+}
+
+fn underscore_tuple_oob_src() -> Str {
+    #"fn main() {
+    let pair = (1, 2)
+    io.println("{pair._5}")
+}
+"#
+}
+
+test "an out-of-range underscore tuple index is E0525" {
+    compile_test_helpers.expect_compile_error(underscore_tuple_oob_src(), "d1md7y_us_tuple_oob", "E0525")
+}

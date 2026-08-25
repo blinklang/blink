@@ -88,6 +88,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | CoalesceRequiresOption | E0513 | `??` operator used on non-Option value | Type checking | §3c.2 |
 | AmbiguousMethodCall | E0522 | Unqualified method call resolves to a method defined by two or more implemented traits | Name resolution | §3.6 |
 | MissingDisplayImpl | E0523 | Interpolated `{expr}` type does not implement `Display` | Type checking | §3.6 |
+| NoSuchField | E0525 | Field access names a field the struct, tuple, or opaque handle does not declare | Type checking | §3.2 |
 | CloseableEscapesScope | E0601 | `Closeable` value escapes `with...as` scope | Resources | §5.5 |
 | ArenaValueEscapes | E0700 | Arena-scoped value escapes arena scope | Arena | §5.2 |
 | ArenaTypeContainsCycle | E0701 | Type crossing `with arena { }` boundary contains a cycle | Arena | §5.2 |

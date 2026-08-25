@@ -48,6 +48,7 @@ import diagnostics.{
     UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE,
     BITWISE_PRECEDENCE, UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
     NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME,
+    NO_SUCH_FIELD,
 }
 
 effect TypeCheck {
@@ -1506,6 +1507,32 @@ fn get_struct_field_tid(struct_tid: Int, fname: Str) -> Int {
     -1
 }
 
+// Returns 1 only when obj_t's struct declaration is resolvable AND does not
+// declare `fname` — the field is PROVABLY absent from the declared shape. A
+// bodiless struct (an @ffi.opaque handle, §9.1.4, or an empty `type E {}`)
+// declares zero fields, so every field access on it is provably absent.
+//
+// Returns 0 when the field IS declared, or when the declaration cannot be
+// resolved from the tid. That second case is a real state, not a bug: an
+// inferred list element (jctkac) surfaces as a struct-kind handle tid whose
+// fields are not findable by tid even though the underlying struct declares
+// them. get_struct_field_tid answering -1 must therefore NOT be read as "no
+// such field"; only a resolvable declaration that omits the field proves
+// absence.
+fn tc_struct_field_provably_absent(obj_t: Int, fname: Str) -> Int {
+    let t = ty_pool.get(obj_t).unwrap()
+    let decl = tc_struct_decl_nodes.get(strip_module_qualifier(t.name)) ?? -1
+    if decl == -1 { return 0 }
+    let flds_sl = node_fields(decl)
+    if flds_sl == -1 { return 1 }
+    let mut i = 0
+    while i < sublist_length(flds_sl) {
+        if node_name(sublist_get(flds_sl, i)) == fname { return 0 }
+        i = i + 1
+    }
+    1
+}
+
 // Normalize a possibly-monomorphized struct instance tid (Box[Int]) to its base
 // declaration tid (Box), by name. Any consumer that maps a struct tid
 // back to declaration-level data keyed on the base tid (fields; anything using
@@ -2327,8 +2354,16 @@ fn tc_check_returned_value(val_t: Int, at_node: Int) ! TypeCheck.Report, Diag.Re
 // non-numeric name (so struct field accesses never match the tuple path).
 fn str_to_tuple_index(name: Str) -> Int {
     if name.len() == 0 { return -1 }
-    let mut acc = 0
+    // A tuple element is written `.0` (spec §3, sections/03_types.md:3292) or
+    // `._0` (the underscore-prefixed form the corpus and stdlib use). Both name
+    // the same zero-based index, so skip one optional leading underscore before
+    // reading the digits.
     let mut i = 0
+    if name.byte_at(0) == 95 {
+        if name.len() == 1 { return -1 }
+        i = 1
+    }
+    let mut acc = 0
     while i < name.len() {
         let ch = name.byte_at(i)
         if ch < 48 || ch > 57 { return -1 }
@@ -11487,6 +11522,17 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 }
                 return ft
             }
+            // ft == -1 does NOT prove the field is absent: an under-resolved
+            // handle tid (a jctkac inferred-list element) is struct-kind yet
+            // carries no findable fields. Error only when the declared shape is
+            // resolvable and genuinely omits the field (sections/03_types.md:3305);
+            // an @ffi.opaque handle is a bodiless struct, so its inertness against
+            // field access falls out of the same declared-shape rule (§9.1.4).
+            // Otherwise fall through to TYPE_UNKNOWN, the pre-existing behavior.
+            if tc_struct_field_provably_absent(obj_t, fname) != 0 {
+                diag_error_at("NoSuchField", NO_SUCH_FIELD, "type {type_to_str(obj_t)} has no field '{fname}'", node, "use a declared field, or add the field to the type")
+            }
+            return TYPE_UNKNOWN
         }
         // Tuple positional access `t.0`, `t.1`, ...: the field name is the
         // numeric index into the tuple's element tids. Without this, a tuple
@@ -11498,6 +11544,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if idx >= 0 && idx < te.params_count {
                 return ty_param_list.get(te.params_start + idx).unwrap()
             }
+            diag_error_at("NoSuchField", NO_SUCH_FIELD, "tuple {type_to_str(obj_t)} has no field '{fname}'", node, "a tuple field is a numeric index within its arity")
+            return TYPE_UNKNOWN
         }
         return TYPE_UNKNOWN
     }
