@@ -8211,6 +8211,45 @@ pub fn resolve_result_inner_tag(ann: Int, name: Str, ct: Int) -> Str {
     ""
 }
 
+// Register the generic-struct/enum INSTANCE leaves reachable through a compound
+// TYPE ANNOTATION — a struct/enum-variant field's `List[Option[Box[Int]]]`. This
+// is annotation-driven, not tid-driven: typecheck does not stamp a node tid onto a
+// field type annotation, so register_carrier_struct_instance_leaves' tid path
+// cannot reach here. A carrier over such an instance emits its value member in the
+// type-def prologue, BEFORE any construction site registers the instance, so
+// without this the member erases to `void` (see is_mono_struct_instance /
+// c_type_from_tag). ensure_compound_type_from_ann only NAMES the carrier via
+// mono_name_from_ann and cannot itself register (it is reached from pure
+// name-resolution contexts like resolve_tuple_ann that carry no Codegen effect).
+// Idempotent via the mono registry; a non-instance leaf registers nothing.
+pub fn register_carrier_mono_instances_from_ann(ann_node: Int) ! Codegen.Register {
+    if ann_node == -1 { return }
+    let ct = type_from_name(node_name(ann_node))
+    let elems = node_elements(ann_node)
+    if elems == -1 { return }
+    if ct == CT_OPTION || ct == CT_LIST || ct == CT_SET {
+        if sublist_length(elems) >= 1 {
+            register_carrier_inner_leaf_from_ann(sublist_get(elems, 0))
+        }
+    } else if ct == CT_RESULT || ct == CT_MAP {
+        if sublist_length(elems) >= 2 {
+            register_carrier_inner_leaf_from_ann(sublist_get(elems, 0))
+            register_carrier_inner_leaf_from_ann(sublist_get(elems, 1))
+        }
+    }
+}
+
+fn register_carrier_inner_leaf_from_ann(inner_ann: Int) ! Codegen.Register {
+    if inner_ann == -1 { return }
+    let inner_name = node_name(inner_ann)
+    if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
+        register_carrier_inner_mono_instance(inner_name, inner_ann)
+    } else {
+        // A nested compound leaf (Option[Result[Box[Int],Str]]) recurses one layer.
+        register_carrier_mono_instances_from_ann(inner_ann)
+    }
+}
+
 pub fn ensure_compound_type_from_ann(ann_node: Int) {
     let name = node_name(ann_node)
     let ct = type_from_name(name)

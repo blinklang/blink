@@ -57,7 +57,7 @@ import codegen_types.{
     emit_option_typedef, option_typedef_emitted, reset_result_typedef_emitted,
     push_td_guard_open, push_td_guard_close,
     c_type_tag, emit_struct_option_typedef, emit_struct_result_typedef,
-    compound_name_from_ann, ensure_compound_type_from_ann, find_type_def_node,
+    compound_name_from_ann, ensure_compound_type_from_ann, register_carrier_mono_instances_from_ann, find_type_def_node,
     ensure_mixed_result_type, ensure_option_type, ensure_struct_option_type,
     ensure_struct_result_type, is_compound_ct, option_c_type,
     mono_name_from_ann, resolve_result_inner_tag, resolve_tuple_ann,
@@ -405,16 +405,22 @@ fn flush_mono_fns_with_typedefs(start_idx: Int) ! Codegen.Emit, Codegen.Register
 // Register the carriers from the DECLARED annotations here and flush just the
 // newly-queued ones, before the owner is emitted (idempotent dedup makes the
 // later catch-all flush a no-op). Callers pass their own gathered annotations.
-fn preflush_field_carrier_typedefs(anns: List[Int]) ! Codegen.Emit {
+fn preflush_field_carrier_typedefs(anns: List[Int]) ! Codegen.Emit, Codegen.Register, Diag.Report {
     let pre_opt = emitted_option_types.len()
     let pre_res = emitted_result_types.len()
     let pre_struct_opt = emitted_struct_option_types.len()
     let pre_struct_res = emitted_struct_result_types.len()
     let pre_tuple = emitted_tuple_entries.len()
+    let pre_mono_td = mono_instances.len()
     let mut i = 0
     while i < anns.len() {
         let fann = anns.get(i).unwrap()
         if fann != -1 {
+            // Register generic-struct-instance leaves the field's carrier will name,
+            // before the carrier typedef emits below — otherwise a value member over
+            // a mono instance (List[Option[Box[Int]]]) erases to `void`, since no
+            // construction site has registered the instance yet at prologue time.
+            register_carrier_mono_instances_from_ann(fann)
             ensure_compound_type_from_ann(fann)
             if node_name(fann) == "Tuple" {
                 let _tup = resolve_tuple_ann(fann, -1, [])
@@ -422,6 +428,11 @@ fn preflush_field_carrier_typedefs(anns: List[Int]) ! Codegen.Emit {
         }
         i = i + 1
     }
+    // A field carrier over a mono instance (List[Option[Box[Int]]]) names that
+    // instance by value, so the instance's own typedef must be flushed before the
+    // Option/Result/tuple carrier flush below (as flush_mono_fns_with_typedefs
+    // also flushes mono typedefs ahead of its carriers).
+    emit_mono_typedefs_from(pre_mono_td)
     emit_option_result_types_from(pre_opt, pre_res, pre_struct_opt, pre_struct_res)
     emit_tuple_types_from(pre_tuple)
 }
