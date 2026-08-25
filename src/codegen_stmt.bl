@@ -34,7 +34,7 @@ import codegen_types.{
     enum_reg_set, enum_regs, enum_str_backed_set, enum_variants,
     enum_variant_name_idx, enum_variant_full_idx, fresh_temp, get_fn_enum_ret,
     get_fn_ret, get_fn_ret_struct, get_fn_ret_struct_inner, get_fn_ret_type,
-    get_generic_fn_node, get_list_elem_struct, get_list_elem_type,
+    get_generic_fn_node, get_list_elem_struct, get_list_elem_type, get_list_elem_tid,
     get_list_nested_elem_struct, get_list_nested_elem_type,
     get_map_key_type, get_map_key_type_raw, get_map_key_struct, get_map_value_struct, get_map_value_type, get_map_value_type_raw, get_map_value_list_elem, is_map_scalar_ct, get_set_elem_type, get_set_elem_struct,
     ensure_tuple_type, find_tuple_entry, cg_bind_mono_tid,
@@ -1179,6 +1179,14 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
             let scrut_tmp = fresh_temp("_scrut_")
             emit_line("blink_list* {scrut_tmp} = {expr_result_str};")
             set_var(scrut_tmp, CT_LIST, 1)
+            // Carry the scrutinee's list tid onto the temp so a list-pattern arm can
+            // read each element back off the authoritative element tid — a boxed
+            // carrier/struct element needs `*(T*)blink_list_get(...)`, which only the
+            // tid can spell; the flat elem channels below cannot.
+            let scrut_list_tid = cg_node_mono_tid(scrut)
+            if scrut_list_tid >= 0 {
+                set_var_ty(scrut_tmp, scrut_list_tid)
+            }
             let mut src_name = expr_result_str
             if node_kind(scrut) == NodeKind.Ident {
                 src_name = node_name(scrut)
@@ -2252,12 +2260,42 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
                 } else if elem_type >= 0 {
                     sub_scrut_type = elem_type
                 }
-                match_scruts = [MatchScrutEntry { str_val: "{cast}blink_list_get({scrut}, {j})", scrut_type: sub_scrut_type }]
+                // A boxed carrier element (List[Option[T]]/List[Result[T,E]]) has to be
+                // read as a struct VALUE off the list's element tid, or the Some/Ok/Err
+                // sub-match spells `.tag`/payload on a scalar. The carrier globals feed
+                // unwrap_carrier's inner-type resolution for a nested inner sub-pattern
+                // (`Some(7)`); save/restore around the recursion.
+                let mut carrier_read = ""
+                let cc_saved_oi = expr_option_inner
+                let cc_saved_ois = expr_option_inner_struct
+                let cc_saved_rok = expr_result_ok_type
+                let cc_saved_rerr = expr_result_err_type
+                let cc_saved_roks = expr_result_ok_struct
+                let cc_saved_rerrs = expr_result_err_struct
+                if elem_type == CT_OPTION || elem_type == CT_RESULT {
+                    let cc_elem_tid = get_list_elem_tid(scrut)
+                    let cread = list_elem_unbox_from_tid(cc_elem_tid, "blink_list_get({scrut}, {j})")
+                    if cread != "" {
+                        // Parenthesize: the carrier arm appends `.tag`/`.value`, which binds
+                        // tighter than the `*` deref in `*(T*)…`.
+                        carrier_read = "({cread})"
+                        sub_scrut_type = elem_type
+                        set_carrier_globals_from_inner(elem_type, tc_tid_to_c_tag(cg_bind_mono_tid(cc_elem_tid)))
+                    }
+                }
+                let cc_str = if carrier_read != "" { carrier_read } else { "{cast}blink_list_get({scrut}, {j})" }
+                match_scruts = [MatchScrutEntry { str_val: cc_str, scrut_type: sub_scrut_type }]
                 let saved_enum = match_scrut_enum
                 match_scrut_enum = if elem_struct != "" && is_enum_type(elem_struct) != 0 { elem_struct } else { "" }
                 let sub_cond = pattern_condition(sub_pat, 0, 1)
                 match_scrut_enum = saved_enum
                 match_scruts = saved_scruts
+                expr_option_inner = cc_saved_oi
+                expr_option_inner_struct = cc_saved_ois
+                expr_result_ok_type = cc_saved_rok
+                expr_result_err_type = cc_saved_rerr
+                expr_result_ok_struct = cc_saved_roks
+                expr_result_err_struct = cc_saved_rerrs
                 if sub_cond != "" {
                     if _parts_n > 0 {
                         parts = parts.concat(" && ")
@@ -3303,13 +3341,36 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                 } else if elem_type >= 0 {
                     bind_ct = elem_type
                 }
+                // A carrier sub-pattern (`Some(a)`/`Ok(a)`/`Err(m)`) has no spellable node
+                // tid, so the sub-pattern-tid read below declines and the flat cast reads a
+                // scalar — the carrier arm then binds `.value`/`.ok`/`.err` off it. For a
+                // carrier element, read the struct VALUE off the LIST's element tid instead
+                // and feed unwrap_carrier's inner-type globals from the element channels.
+                let mut carrier_read = ""
+                let bc_saved_oi = expr_option_inner
+                let bc_saved_ois = expr_option_inner_struct
+                let bc_saved_rok = expr_result_ok_type
+                let bc_saved_rerr = expr_result_err_type
+                let bc_saved_roks = expr_result_ok_struct
+                let bc_saved_rerrs = expr_result_err_struct
+                if elem_type == CT_OPTION || elem_type == CT_RESULT {
+                    let bc_elem_tid = get_list_elem_tid(scrut)
+                    let cread = list_elem_unbox_from_tid(bc_elem_tid, "blink_list_get({scrut}, {j})")
+                    if cread != "" {
+                        // Parenthesize: unwrap_carrier appends `.value`/`.ok`/`.err`, which
+                        // binds tighter than the `*` deref in `*(T*)…`.
+                        carrier_read = "({cread})"
+                        bind_ct = elem_type
+                        set_carrier_globals_from_inner(elem_type, tc_tid_to_c_tag(cg_bind_mono_tid(bc_elem_tid)))
+                    }
+                }
                 // The IdentPattern arm below spells the binder's DECLARATION from this
                 // sub-pattern's own tid, so the initializer has to be read off the same tid or
                 // the two halves of one line disagree — `blink_list* b = (int64_t)(intptr_t)…`.
                 // The flat chain above stays as the fallback for a tid that cannot be spelled.
                 let sub_tid = pat_binder_tid(sub_pat)
                 let elem_read = list_elem_unbox_from_tid(sub_tid, "blink_list_get({scrut}, {j})")
-                let scrut_str = if elem_read != "" { elem_read } else { "{cast}blink_list_get({scrut}, {j})" }
+                let scrut_str = if carrier_read != "" { carrier_read } else if elem_read != "" { elem_read } else { "{cast}blink_list_get({scrut}, {j})" }
                 // The sibling TuplePattern arm recurses on the ORIGINAL match_scruts, so its
                 // binders keep the scrutinee's struct name; this arm rebuilds the entry and
                 // dropped it, leaving a struct binder registered under no name at all — a field
@@ -3324,6 +3385,12 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                 bind_pattern_vars(sub_pat, 0, 1)
                 match_scrut_enum = saved_enum
                 match_scruts = saved_scruts
+                expr_option_inner = bc_saved_oi
+                expr_option_inner_struct = bc_saved_ois
+                expr_result_ok_type = bc_saved_rok
+                expr_result_err_type = bc_saved_rerr
+                expr_result_ok_struct = bc_saved_roks
+                expr_result_err_struct = bc_saved_rerrs
                 j = j + 1
             }
         }
