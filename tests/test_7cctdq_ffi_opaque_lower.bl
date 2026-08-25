@@ -1,0 +1,63 @@
+// An @ffi.opaque handle type lowers to a bare C pointer `cname *` (one machine
+// word), not a `blink_` struct. It flows through ordinary non-FFI code — struct
+// fields, parameters, returns — with no @trusted, because it is not a Ptr[T] and
+// so E0811 never applies. Ptr[opaque] lowers to `cname **` (the out-param shape).
+// No struct body and no sizeof/offsetof _Static_assert are emitted: the pointee
+// is incomplete by design, the deliberate contrast with @ffi.struct.
+import compile_test_helpers
+
+test "@ffi.opaque type lowers to a bare C pointer, not a blink_ struct" {
+    let src = "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("fn hold(f: CFile) -> CFile \{ f }\n")
+        .concat("fn main() \{ }\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_7cctdq_decl")
+    assert(c.contains("#include <stdio.h>"))
+    assert(c.contains("FILE*"))
+    assert(!c.contains("blink_CFile"))
+}
+
+test "Ptr to an @ffi.opaque type lowers to cname**" {
+    let src = "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("@ffi(\"c\", \"cfile_out\")\n@trusted\nfn c_out(out: Ptr[CFile]) -> Int ! FFI \{ \}\n")
+        .concat("fn main() \{ }\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_7cctdq_ptr")
+    assert(c.contains("FILE**"))
+}
+
+test "@ffi.opaque flows through a non-FFI struct field and fn without E0811" {
+    let src = "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("type Wrap \{ f: CFile }\n")
+        .concat("fn take(w: Wrap) -> CFile \{ w.f }\n")
+        .concat("fn main() \{ }\n")
+    compile_test_helpers.expect_no_error(src, "_7cctdq_flow", "E0811")
+}
+
+test "@ffi.opaque emits no incomplete-pointee sizeof/offsetof assert" {
+    let src = "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("fn hold(f: CFile) -> CFile \{ f }\n")
+        .concat("fn main() \{ }\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_7cctdq_noassert")
+    assert(!c.contains("sizeof(FILE)"))
+    assert(!c.contains("offsetof"))
+    assert(!c.contains("} blink_CFile;"))
+}
+
+test "@ffi.opaque round-trips a real C handle through non-FFI code" {
+    let src = "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("@ffi(\"c\", \"fopen\")\n@trusted\nfn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> CFile ! FFI \{ \}\n")
+        .concat("@ffi(\"c\", \"fclose\")\n@trusted\nfn c_fclose(f: CFile) -> Int ! FFI \{ \}\n")
+        .concat("fn relay(f: CFile) -> CFile \{ f }\n")
+        .concat("fn main() \{\n")
+        .concat("    with ffi.scope() as scope \{\n")
+        .concat("        let p = scope.cstr(\"/dev/null\")\n")
+        .concat("        let m = scope.cstr(\"r\")\n")
+        .concat("        let f = c_fopen(p, m)\n")
+        .concat("        let g = relay(f)\n")
+        .concat("        let rc = c_fclose(g)\n")
+        .concat("        io.println(\"rc \{rc}\")\n")
+        .concat("    }\n")
+        .concat("}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_7cctdq_run")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("rc 0"))
+}

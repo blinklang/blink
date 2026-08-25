@@ -5189,7 +5189,12 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         // that says whether this branch still needs the flat arm.
         decl_c = flat
         decl_branch = "flat"
-        if is_mut != 0 || val_type == CT_STRING || val_type == CT_LIST || val_type == CT_MAP || val_type == CT_SET || val_type == CT_BYTES || val_type == CT_CLOSURE || val_type == CT_ITERATOR || val_type == CT_HANDLE || val_type == CT_CHANNEL || val_type == CT_PTR || val_type == CT_STRINGBUILDER || val_type == CT_FFI_SCOPE {
+        // A leading `const` on a pointer spelling (e.g. an @ffi.opaque handle
+        // lowered to `FILE*`) qualifies the POINTEE, not the binding, so the
+        // value no longer matches a plain `T*` parameter. Every pointer-lowered
+        // CT_ type is already exempted for this reason; a `*`-tailed spelling
+        // that reaches this flat arm gets the same treatment.
+        if is_mut != 0 || ts.ends_with("*") || val_type == CT_STRING || val_type == CT_LIST || val_type == CT_MAP || val_type == CT_SET || val_type == CT_BYTES || val_type == CT_CLOSURE || val_type == CT_ITERATOR || val_type == CT_HANDLE || val_type == CT_CHANNEL || val_type == CT_PTR || val_type == CT_STRINGBUILDER || val_type == CT_FFI_SCOPE {
             emit_line("{ts} {cname} = {val_str};")
         } else {
             emit_line("const {ts} {cname} = {val_str};")
@@ -8161,7 +8166,11 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
             emit_line("extern {c_ret} {ffi_symbol}({params});")
         }
         if !(c_name == ffi_symbol && is_header_fn) {
-            if ret_type == CT_VOID {
+            // Gate on the resolved C return string, not `ret_type == CT_VOID`. A
+            // struct/enum/opaque return lowers to CT_VOID with a type name, so the
+            // old tag test wrongly emitted a `void` body and dropped `return`,
+            // discarding the FFI call's result. `c_ret` is the single authority.
+            if c_ret == "void" {
                 if params == "void" {
                     emit_line("void {c_name}(void) \{ {ffi_symbol}(); }")
                 } else {
@@ -10645,6 +10654,29 @@ pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit, Codegen.Register, Diag.
     if name == "ConversionError" { return }
     // ProcessResult's C typedef lives in runtime_process.h — skip emission to avoid duplication.
     if name == "ProcessResult" { return }
+    // An @ffi.opaque handle emits only the system header that declares its
+    // pointee. The type itself lowers to `<c_name>*` at every seam (see
+    // c_type_c_name_in), so there is no struct body and — because the pointee is
+    // incomplete by design — no sizeof/offsetof _Static_assert. This is the
+    // deliberate contrast with @ffi.struct, which does emit a body and asserts.
+    let opaque_ann = get_annotation(td_node, "ffi.opaque")
+    if opaque_ann != -1 {
+        let opaque_header = get_str_named_arg(opaque_ann, "header")
+        if opaque_header != "" && ffi_includes_emitted.contains_key(opaque_header) == 0 {
+            ffi_includes_emitted.insert(opaque_header, 1)
+            emit_line("#include <{opaque_header}>")
+            if manifest_name != "" && manifest_header_is_declared(opaque_header) == 0 {
+                diag_warn_at(
+                    "MissingCanonicalHeader",
+                    MISSING_CANONICAL_HEADER,
+                    "@ffi.opaque '{name}' declares header '{opaque_header}' but no [native-dependencies] entry in blink.toml lists it",
+                    td_node,
+                    "add the header to blink.toml: [native-dependencies] <dep>.headers = [\"{opaque_header}\"]"
+                )
+            }
+        }
+        return
+    }
     let flds_sl = node_fields(td_node)
     if flds_sl == -1 {
         return
