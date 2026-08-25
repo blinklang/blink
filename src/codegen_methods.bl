@@ -1420,23 +1420,21 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             // List[Option[T]].pop() -> Option[Option[T]] — mirror the .get()
             // CT_OPTION branch (the element Option is pointer-boxed on the list).
             // Carrier tag + inner tp threading matches .get() so a nested
-            // container inner survives pop() as well.
-            // The tid is authoritative for a SCALAR element-Option inner
-            // (List[Option[Str]]): the flat channel erases a mono/field-bound List's
-            // deep inner to CT_INT. A struct/enum/container inner rides the flat
-            // oi_struct / oi_tp channels below (the tid declines those here).
+            // container inner survives pop() as well. The flat channels are the fallback
+            // below the authoritative tid carrier (see the .get() CT_OPTION branch): a
+            // field/mono-bound List erases its deep inner, so they supply a carrier only
+            // when the tid declines.
             let flat_oi_ct = get_list_elem_option_inner(obj_str)
             let tid_oi_ct = list_elem_option_inner_scalar_ct_from_tid(obj_node)
             let oi_ct = if tid_oi_ct >= 0 { tid_oi_ct } else { flat_oi_ct }
             let oi_struct = get_list_elem_option_inner_struct(obj_str)
             let oi_tp = get_list_elem_option_inner_tp(obj_str)
-            // Last-resort tid carrier (see the .get() CT_OPTION branch): recovers a
-            // container inner (`Option[Map[..]]` → `Option_map`) the flat channels erase
-            // two carriers deep, so pop() spells the same carrier the consumer reads back.
+            // The tid carrier is authoritative (see the .get() CT_OPTION branch): it spells
+            // a scalar inner, hops transparent aliases, and keeps a nested container inner
+            // (`Option[Map[..]]` → `Option_map`) that the flat channels erase two carriers
+            // deep, so pop() spells the same carrier the consumer reads back.
             let tid_carrier = list_elem_option_carrier_tag_from_tid(obj_node)
-            // Tid-led scalar wins first (see the .get() CT_OPTION branch): it is set only
-            // for a genuine scalar inner and is precise where the flat oi_tp is erased.
-            let opt_carrier = if tid_oi_ct >= 0 { "Option_{c_type_tag(tid_oi_ct)}" } else if oi_tp >= 0 { "Option_{tp_carrier_tag(oi_tp)}" } else if oi_struct != "" { "Option_{c_type_tag_for_struct(oi_struct)}" } else if oi_ct >= 0 { "Option_{c_type_tag(oi_ct)}" } else if tid_carrier != "" { tid_carrier } else { "Option_int" }
+            let opt_carrier = if tid_carrier != "" { tid_carrier } else if tid_oi_ct >= 0 { "Option_{c_type_tag(tid_oi_ct)}" } else if oi_tp >= 0 { "Option_{tp_carrier_tag(oi_tp)}" } else if oi_struct != "" { "Option_{c_type_tag_for_struct(oi_struct)}" } else if oi_ct >= 0 { "Option_{c_type_tag(oi_ct)}" } else { "Option_int" }
             ensure_struct_option_type(opt_carrier)
             let opt_type = struct_option_c_type(opt_carrier)
             emit_line("{opt_type} {res};")
@@ -1679,27 +1677,22 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             // K/V drop from the tag). The inner tp is threaded via expr_option_inner_tp
             // so the arm that unwraps to the Map recovers its K/V and stamps its value
             // type.
-            // The tid is authoritative for a SCALAR element-Option inner
-            // (List[Option[Str]]): the flat channel erases a mono/field-bound List's
-            // deep inner to CT_INT. A struct/enum/container inner rides the flat
-            // oi_struct / oi_tp channels below (the tid declines those here).
+            // The flat channels are the fallback below the authoritative tid carrier: a
+            // field/mono-bound List erases its deep inner (`Option[Map[..]]` reads
+            // tid_oi_ct=-1, oi_tp=-1, oi_struct="", flat_oi_ct=CT_INT), so they can only
+            // supply a carrier when the tid declines.
             let flat_oi_ct = get_list_elem_option_inner(obj_str)
             let tid_oi_ct = list_elem_option_inner_scalar_ct_from_tid(obj_node)
             let oi_ct = if tid_oi_ct >= 0 { tid_oi_ct } else { flat_oi_ct }
             let oi_struct = get_list_elem_option_inner_struct(obj_str)
             let oi_tp = get_list_elem_option_inner_tp(obj_str)
-            // Last-resort tid carrier: when every flat channel is erased (a field/mono-bound
-            // List whose element is `Option[Map[..]]` reads tid_oi_ct=-1, oi_tp=-1,
-            // oi_struct=""), the node tid still spells the element-Option carrier
-            // (`Option_map`), which is exactly what the `.unwrap()` consumer reads back.
-            // Without it the chain defaults to `Option_int` and the deref hits a scalar.
             let tid_carrier = list_elem_option_carrier_tag_from_tid(obj_node)
-            // The tid-led scalar wins first: it answers only for a genuine scalar inner
-            // (it declines struct/enum/container), and it is precise where the flat oi_tp
-            // is erased to a void sentinel (a field/mono-bound List's `Option[Str]` element
-            // reads oi_tp=0 → tp_carrier_tag "int"). A real container inner leaves
-            // tid_oi_ct=-1, so oi_tp still owns `Option[List[..]]` / `Option[Map[..]]`.
-            let opt_carrier = if tid_oi_ct >= 0 { "Option_{c_type_tag(tid_oi_ct)}" } else if oi_tp >= 0 { "Option_{tp_carrier_tag(oi_tp)}" } else if oi_struct != "" { "Option_{c_type_tag_for_struct(oi_struct)}" } else if oi_ct >= 0 { "Option_{c_type_tag(oi_ct)}" } else if tid_carrier != "" { tid_carrier } else { "Option_int" }
+            // The tid carrier is authoritative — it spells a scalar inner (`Option_int`/
+            // `Option_str`), hops transparent aliases, and keeps a nested container inner
+            // (`Option_map`) — so it wins first, declining (to "") only when the element
+            // is not an Option in the tid or the tag is unresolved. The flat channels are
+            // the fallback: a field/mono-bound receiver erases them to a bare Option_int.
+            let opt_carrier = if tid_carrier != "" { tid_carrier } else if tid_oi_ct >= 0 { "Option_{c_type_tag(tid_oi_ct)}" } else if oi_tp >= 0 { "Option_{tp_carrier_tag(oi_tp)}" } else if oi_struct != "" { "Option_{c_type_tag_for_struct(oi_struct)}" } else if oi_ct >= 0 { "Option_{c_type_tag(oi_ct)}" } else { "Option_int" }
             ensure_struct_option_type(opt_carrier)
             let opt_type = struct_option_c_type(opt_carrier)
             emit_line("{opt_type} {res};")
@@ -4629,7 +4622,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             emit_expr(sublist_get(args_sl, 0))
             let fn_str = expr_result_str
             let map_ret_part = closure_sig_ret_part(expr_closure_sig)
-            iter_from_source(obj_str, obj_type)
+            iter_from_source(obj_str, obj_type, obj_node)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let elem_type = ifs_elem_type
@@ -4716,7 +4709,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let args_sl = node_args(node)
             emit_expr(sublist_get(args_sl, 0))
             let fn_str = expr_result_str
-            iter_from_source(obj_str, obj_type)
+            iter_from_source(obj_str, obj_type, obj_node)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let elem_type = ifs_elem_type
@@ -4753,7 +4746,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let args_sl = node_args(node)
             emit_expr(sublist_get(args_sl, 0))
             let n_str = expr_result_str
-            iter_from_source(obj_str, obj_type)
+            iter_from_source(obj_str, obj_type, obj_node)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let elem_type = ifs_elem_type
@@ -4789,7 +4782,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let args_sl = node_args(node)
             emit_expr(sublist_get(args_sl, 0))
             let n_str = expr_result_str
-            iter_from_source(obj_str, obj_type)
+            iter_from_source(obj_str, obj_type, obj_node)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let elem_type = ifs_elem_type
@@ -4820,17 +4813,18 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
         if method == "chain" {
             let args_sl = node_args(node)
-            emit_expr(sublist_get(args_sl, 0))
+            let other_node = sublist_get(args_sl, 0)
+            emit_expr(other_node)
             let other_str = expr_result_str
             let other_type = expr_result_type
-            iter_from_source(obj_str, obj_type)
+            iter_from_source(obj_str, obj_type, obj_node)
             let src_a_var = ifs_iter_var
             let next_a = ifs_next_fn
             let elem_type = ifs_elem_type
             let opt_t = ifs_opt_type
             let carrier = ifs_carrier_tag
             let tag = c_type_tag(elem_type)
-            iter_from_source(other_str, other_type)
+            iter_from_source(other_str, other_type, other_node)
             let src_b_var = ifs_iter_var
             let next_b = ifs_next_fn
             if carrier != "" {
@@ -4864,7 +4858,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let args_sl = node_args(node)
             emit_expr(sublist_get(args_sl, 0))
             let fn_str = expr_result_str
-            iter_from_source(obj_str, obj_type)
+            iter_from_source(obj_str, obj_type, obj_node)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let elem_type = ifs_elem_type
@@ -4896,7 +4890,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             return
         }
         if method == "enumerate" {
-            iter_from_source(obj_str, obj_type)
+            iter_from_source(obj_str, obj_type, obj_node)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let elem_type = ifs_elem_type
@@ -4931,10 +4925,11 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
         if method == "zip" {
             let args_sl = node_args(node)
-            emit_expr(sublist_get(args_sl, 0))
+            let other_node = sublist_get(args_sl, 0)
+            emit_expr(other_node)
             let other_str = expr_result_str
             let other_type = expr_result_type
-            iter_from_source(obj_str, obj_type)
+            iter_from_source(obj_str, obj_type, obj_node)
             let src_a_var = ifs_iter_var
             let next_a = ifs_next_fn
             let elem_type_a = ifs_elem_type
@@ -4942,7 +4937,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             // Capture side A's carrier before the second iter_from_source clobbers
             // ifs_carrier_tag (mirrors the next_a/opt_a capture above).
             let carrier_a = ifs_carrier_tag
-            iter_from_source(other_str, other_type)
+            iter_from_source(other_str, other_type, other_node)
             let src_b_var = ifs_iter_var
             let next_b = ifs_next_fn
             let elem_type_b = ifs_elem_type
@@ -4978,7 +4973,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         // --- Consumer methods: drive an iterator to completion ---
 
         if method == "collect" {
-            iter_from_source(obj_str, obj_type)
+            iter_from_source(obj_str, obj_type, obj_node)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let elem_type = ifs_elem_type
@@ -5035,7 +5030,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             return
         }
         if method == "count" {
-            iter_from_source(obj_str, obj_type)
+            iter_from_source(obj_str, obj_type, obj_node)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let opt_t = ifs_opt_type
@@ -5157,7 +5152,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             emit_expr(sublist_get(args_sl, 0))
             let fn_str = expr_result_str
             let fn_sig = expr_closure_sig
-            iter_from_source(obj_str, obj_type)
+            iter_from_source(obj_str, obj_type, obj_node)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let opt_t = ifs_opt_type
@@ -5179,7 +5174,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             emit_expr(sublist_get(args_sl, 0))
             let fn_str = expr_result_str
             let fn_sig = expr_closure_sig
-            iter_from_source(obj_str, obj_type)
+            iter_from_source(obj_str, obj_type, obj_node)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let opt_t = ifs_opt_type
@@ -5203,7 +5198,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             emit_expr(sublist_get(args_sl, 0))
             let fn_str = expr_result_str
             let fn_sig = expr_closure_sig
-            iter_from_source(obj_str, obj_type)
+            iter_from_source(obj_str, obj_type, obj_node)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let opt_t = ifs_opt_type
@@ -5227,7 +5222,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             emit_expr(sublist_get(args_sl, 0))
             let fn_str = expr_result_str
             let fn_sig = expr_closure_sig
-            iter_from_source(obj_str, obj_type)
+            iter_from_source(obj_str, obj_type, obj_node)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let elem_type = ifs_elem_type
@@ -5319,7 +5314,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             emit_expr(sublist_get(args_sl, 1))
             let fn_str = expr_result_str
             let fn_sig = expr_closure_sig
-            iter_from_source(obj_str, obj_type)
+            iter_from_source(obj_str, obj_type, obj_node)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let opt_t = ifs_opt_type

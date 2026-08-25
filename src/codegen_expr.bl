@@ -71,7 +71,7 @@ import codegen_types.{
     result_c_type, result_c_type_mixed,
     scope_vars, set_list_elem_struct, set_list_elem_type, set_list_nested_elem_type,
     set_list_elem_option_tp, set_list_elem_result_tp, set_list_elem_map_tp,
-    stamp_list_elem_from_tid,
+    stamp_list_elem_from_tid, list_elem_option_carrier_tag_from_tid, list_elem_result_carrier_tag_from_tid,
     type_option, type_result, type_map, type_list, type_struct, sv_tp,
     kops_table_name, kops_elem_is_concrete, kops_is_struct_key, key_struct_sname_from_ann, ensure_tuple_kops_key,
     ensure_struct_derive_kops_key, ensure_struct_derive_kops_key_for_base,
@@ -177,12 +177,18 @@ pub let mut ifs_carrier_tag: Str = ""
 
 // The carrier tag for a List's COMPOUND element (Option/Result), or "" if
 // the element isn't a compound. Mirrors the .get()/for-in carrier derivation:
-// the element's full inner tp drives the tag (tp_carrier_tag) so a nested
-// container inner — `List[Option[Map[Int,Str]]]` → `Option_Map_int_str` — keeps
-// its type params and composes with the compound-element tp NODE above
-// (expr_option_inner_tp).
-fn list_compound_carrier_tag(obj_str: Str, elem_type: Int) -> Str {
+// the receiver's node tid drives the tag first (it hops transparent aliases and
+// keeps a nested container inner — `List[Option[Map[Int,Str]]]` → `Option_map`),
+// and the flat inner-tp channel (tp_carrier_tag) is the fallback when the tid
+// declines. Composes with the compound-element tp NODE above (expr_option_inner_tp).
+fn list_compound_carrier_tag(obj_str: Str, elem_type: Int, obj_node: Int) -> Str {
     if elem_type == CT_OPTION {
+        // The tid carrier is authoritative — it hops transparent aliases and keeps a
+        // nested container inner — so prefer it, falling back to the flat channels only
+        // when it declines. The flat scalar channel erases a container inner to a bare
+        // Option_int for a field-bound/monomorphized receiver.
+        let tid_carrier = list_elem_option_carrier_tag_from_tid(obj_node)
+        if tid_carrier != "" { return tid_carrier }
         let oi_tp = get_list_elem_option_inner_tp(obj_str)
         let oi_struct = get_list_elem_option_inner_struct(obj_str)
         let oi_ct = get_list_elem_option_inner(obj_str)
@@ -192,6 +198,10 @@ fn list_compound_carrier_tag(obj_str: Str, elem_type: Int) -> Str {
         return "Option_int"
     }
     if elem_type == CT_RESULT {
+        // The tid carrier is authoritative and spells both Ok/Err sides at once;
+        // prefer it, falling back to the flat channels only when it declines.
+        let tid_res_carrier = list_elem_result_carrier_tag_from_tid(obj_node)
+        if tid_res_carrier != "" { return tid_res_carrier }
         let rok_tp = get_list_elem_result_ok_tp(obj_str)
         let rerr_tp = get_list_elem_result_err_tp(obj_str)
         let rok_struct = get_list_elem_result_ok_struct(obj_str)
@@ -210,12 +220,12 @@ fn list_compound_carrier_tag(obj_str: Str, elem_type: Int) -> Str {
 // ifs_next_fn (C function name to call next), ifs_elem_type, ifs_opt_type.
 // For a COMPOUND element, keys the iterator on CT_INT (the pointer
 // iterator) and sets ifs_carrier_tag so consumers deref the boxed carrier.
-pub fn iter_from_source(obj_str: Str, obj_type: Int) ! Codegen.Emit {
+pub fn iter_from_source(obj_str: Str, obj_type: Int, obj_node: Int) ! Codegen.Emit {
     ifs_carrier_tag = ""
     if obj_type == CT_LIST {
         let mut elem_type = get_list_elem_type(obj_str)
         if elem_type == -1 { elem_type = CT_INT }
-        let mut carrier = list_compound_carrier_tag(obj_str, elem_type)
+        let mut carrier = list_compound_carrier_tag(obj_str, elem_type, obj_node)
         // A NAMED BY-VALUE element — a struct, a tuple, or an enum — reaches here as
         // CT_VOID (or as a bare CT_STRUCT/CT_ENUM), and `c_type_tag(CT_VOID)` is "void", so the
         // whole iterator family below would key itself on the undefined
