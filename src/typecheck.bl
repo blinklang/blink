@@ -1533,6 +1533,25 @@ fn tc_struct_field_provably_absent(obj_t: Int, fname: Str) -> Int {
     1
 }
 
+// A struct-literal head `Name { ... }` may name only a constructible product type: a struct
+// declared with a body. A builtin scalar (Int), an enum head (only its variants construct, not
+// the enum type itself), and an @ffi.opaque handle (sealed to the FFI boundary, has no
+// user-callable constructor — sections/07_trust_modules_metadata.md section 9.1.4) are not
+// constructible. 03_types.md:1084 requires the head to denote a product type.
+fn tc_head_constructible_struct(stid: Int, sname: Str) -> Int {
+    if type_kind(stid) != TyKind.Struct { return 0 }
+    if ffi_opaque_type_set.contains_key(strip_module_qualifier(sname)) != 0 { return 0 }
+    1
+}
+
+fn tc_report_unconstructible_head(sname: Str, node: Int) ! Diag.Report {
+    if ffi_opaque_type_set.contains_key(strip_module_qualifier(sname)) != 0 {
+        diag_error_at("TypeError", TYPE_ERROR, "cannot construct @ffi.opaque handle '{sname}' outside the FFI boundary", node, "an opaque handle has no user-callable constructor; it is produced only at the FFI boundary (section 9.1.4)")
+        return
+    }
+    diag_error_at("TypeError", TYPE_ERROR, "'{sname}' is not a constructible struct type", node, "struct-literal syntax Name \{ ... } requires Name to name a struct type")
+}
+
 // Normalize a possibly-monomorphized struct instance tid (Box[Int]) to its base
 // declaration tid (Box), by name. Any consumer that maps a struct tid
 // back to declaration-level data keyed on the base tid (fields; anything using
@@ -11628,6 +11647,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 let etid = lookup_named_type(sname)
                 if etid != -1 {
                     check_deprecated_type(sname, node)
+                    if tc_head_constructible_struct(etid, sname) == 0 {
+                        tc_report_unconstructible_head(sname, node)
+                        return TYPE_UNKNOWN
+                    }
                     return etid
                 }
             } else {
@@ -11637,14 +11660,30 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     return tc_construct_hint
                 }
                 // 2) struct (Kind A guarantees a name is never both a struct AND a variant).
+                //    User-first: a user type shadowing a builtin name (`type Char { .. }`)
+                //    resolves here and stays constructible, matching how the annotation and
+                //    field-access paths resolve the same name.
                 let stid = lookup_named_type(sname)
                 if stid != -1 {
                     check_deprecated_type(sname, node)
+                    if tc_head_constructible_struct(stid, sname) == 0 {
+                        tc_report_unconstructible_head(sname, node)
+                        return TYPE_UNKNOWN
+                    }
                     // Reverse-infer the concrete instance tid (Box[Int]) from the
                     // field values so the literal carries its specialization, not the
                     // bare generic tid. Falls back to the bare stid when no concrete
                     // bind is discoverable (all-typevar / empty collection fields).
                     return tc_struct_lit_instance_tid(stid, sname, node)
+                }
+                // A builtin type used as a struct-literal head — scalar (`Int { }`) or
+                // structural (`List { }`, `Map { }`, `Option { }`) — is not a product struct
+                // and cannot be built with `{ ... }`. A user type of the same name was handled
+                // above (user-first), so this fires only for a genuine builtin, which
+                // lookup_named_type (name-map only) never finds.
+                if is_primitive_type(sname) != 0 {
+                    tc_report_unconstructible_head(sname, node)
+                    return TYPE_UNKNOWN
                 }
                 // 3) global-unique variant.
                 let n = count_enums_with_variant(sname)
