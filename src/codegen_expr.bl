@@ -22,7 +22,7 @@ import codegen_types.{
     cg_expect_fn_value_sig,
     build_closure_sig_from_type_ann, fn_node_has_effects, is_fn_ffi,
     closure_cap_infos, closure_captures, closure_param_names,
-    closure_ret_direct_ct, closure_ret_ct, closure_sig_ret_part,
+    closure_ret_direct_ct, closure_ret_opaque_option_inner, closure_ret_ct, closure_sig_ret_part,
     compound_name_from_ann, compound_option_inner_name,
     option_inner_ct_from_tag, option_inner_struct_from_tag,
     emit_line, ensure_carrier_from_tag, ensure_iter_type, ensure_mixed_result_type, ev_field,
@@ -76,11 +76,12 @@ import codegen_types.{
     kops_table_name, kops_elem_is_concrete, kops_is_struct_key, key_struct_sname_from_ann, ensure_tuple_kops_key,
     ensure_struct_derive_kops_key, ensure_struct_derive_kops_key_for_base,
     set_map_types, set_map_key_struct, set_set_elem_type, set_set_elem_struct, get_set_elem_type,
-    set_var, set_var_closure, set_var_option, set_var_struct, set_var_result_struct, set_var_ty,
+    set_var, set_var_closure, set_var_option, set_var_option_struct, set_var_struct, set_var_result_struct, set_var_ty,
     set_var_option_inner2,
     strip_blink_prefix, strip_generic_args, strip_module_qualifier,
     tid_spells_struct,
     sf_entries, struct_field_defaults, struct_invariants, struct_option_c_type, synthesized_display_call,
+    is_opaque_type, opaque_handle_c_name,
     coerce_to_c_str, render_result_arm_value,
     tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname, tp_get_child1, tp_get_child2, tp_get_kind, tp_get_sname,
     resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
@@ -350,6 +351,16 @@ fn test_err_type_display_name(err_ct: Int, err_struct: Str) -> Str {
 }
 
 fn set_bare_none_struct_result(inner_tag: Str) {
+    let opaque_c = opaque_handle_c_name(inner_tag)
+    if opaque_c != "" {
+        // @ffi.opaque inner: None is the null handle pointer, not a tagged carrier.
+        expr_result_str = "(({opaque_c})0)"
+        expr_result_type = CT_OPTION
+        publish_result_tid(-1)
+        expr_option_inner = CT_INT
+        expr_option_inner_struct = inner_tag
+        return
+    }
     ensure_struct_option_type(inner_tag)
     let opt_type = struct_option_c_type(inner_tag)
     expr_result_str = "({opt_type})\{.tag = 0}"
@@ -704,7 +715,10 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             }
             let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
             let fn_rt = get_fn_ret_type(cg_current_fn_name)
-            if fsi.ok_struct != "" && cg_current_fn_ret == CT_OPTION {
+            if fsi.ok_struct != "" && cg_current_fn_ret == CT_OPTION && is_opaque_type(fsi.ok_struct) != 0 {
+                // @ffi.opaque inner: null handle pointer, no tagged carrier.
+                set_bare_none_struct_result(fsi.ok_struct)
+            } else if fsi.ok_struct != "" && cg_current_fn_ret == CT_OPTION {
                 ensure_struct_option_type(fsi.ok_struct)
                 let opt_type = struct_option_c_type(fsi.ok_struct)
                 expr_result_str = "({opt_type})\{.tag = 0}"
@@ -2326,7 +2340,17 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
             emit_line("{opt_c} {tmp} = {left_str};")
             let val_tmp = fresh_temp("__optv")
             let inner_c = c_type_from_tag(opt_inner_s)
-            if inner_c.ends_with("*") {
+            if is_opaque_type(opt_inner_s) != 0 {
+                // NPO: the Option IS the handle pointer (NULL = None), so coalesce is a
+                // null test yielding the handle — no `.tag`/`.value` carrier read. Guard
+                // ahead of the pointer arm below, which the opaque cname also matches.
+                let handle_c = opaque_handle_c_name(opt_inner_s)
+                emit_line("{handle_c} {val_tmp} = ({tmp} != NULL) ? {tmp} : {right_str};")
+                set_var(val_tmp, CT_STRUCT, 0)
+                set_var_struct(val_tmp, opt_inner_s)
+                expr_result_type = CT_STRUCT
+                publish_result_tid(node)
+            } else if inner_c.ends_with("*") {
                 emit_line("{inner_c} {val_tmp} = {tmp}.tag == 1 ? {tmp}.value : {right_str};")
                 set_var(val_tmp, opt_inner, 0)
                 expr_result_type = opt_inner
@@ -2939,6 +2963,8 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 // via the Result-sentinel path so cleanup destructors run.
                 let opt_inner = expr_option_inner
                 let opt_inner_s = expr_option_inner_struct
+                // NPO: an Option[@ffi.opaque] operand is the bare handle (NULL = None).
+                let operand_is_opaque = opt_inner_s != "" && is_opaque_type(opt_inner_s) != 0
                 if opt_inner_s != "" {
                     let opt_c = if operand_erased != 0 {
                         ensure_option_type(CT_PTR)
@@ -2958,7 +2984,8 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 let qm_line = node_line(node)
                 let qm_col = node_col(node)
                 let qm_file = panic_file_for(node)
-                emit_line("if ({tmp}.tag == 0) \{")
+                let none_cond = if operand_is_opaque { "{tmp} == NULL" } else { "{tmp}.tag == 0" }
+                emit_line("if ({none_cond}) \{")
                 cg_indent = cg_indent + 1
                 if cg_in_assert_panics != 0 {
                     // §2.20: a `?`-propagated None exiting the body WITHOUT a
@@ -2975,7 +3002,15 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 emit_line("}")
                 if opt_inner_s != "" {
                     let inner_c = c_type_from_tag(opt_inner_s)
-                    if inner_c.ends_with("*") {
+                    if operand_is_opaque {
+                        // NPO: the Some value is the handle itself by identity — no
+                        // `.value` read. Guard ahead of the pointer arm, which the
+                        // opaque cname also matches.
+                        expr_result_str = tmp
+                        expr_result_type = CT_STRUCT
+                        publish_result_tid(node)
+                        set_var_struct(tmp, opt_inner_s)
+                    } else if inner_c.ends_with("*") {
                         expr_result_str = "{tmp}.value"
                         expr_result_type = opt_inner
                         publish_result_tid(node)
@@ -3033,6 +3068,13 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                     let fn_inner = if cg_current_fn_option_inner != 0 { cg_current_fn_option_inner } else { CT_INT }
                     option_c_type(fn_inner)
                 }
+                // The None value the enclosing fn returns. When the fn itself returns
+                // Option[@ffi.opaque], {fn_opt_c} is the bare handle (`FILE*`) and its
+                // None is the NULL niche — never a `{.tag = 0}` carrier initializer,
+                // which is invalid against a pointer type. Keyed on the ENCLOSING fn's
+                // return, independent of whether the `?` operand is opaque.
+                let fn_ret_opaque = cg_handler_ret_option_erased == 0 && fsi.ok_struct != "" && is_opaque_type(fsi.ok_struct) != 0
+                let fn_none_return = if fn_ret_opaque { "(({fn_opt_c})0)" } else { "({fn_opt_c})\{.tag = 0}" }
                 if opt_inner_s != "" {
                     let opt_c = if operand_erased != 0 {
                         ensure_option_type(CT_PTR)
@@ -3046,11 +3088,15 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                     let opt_c = option_c_type(inner)
                     emit_line("{opt_c} {tmp} = {operand_str};")
                 }
+                // NPO: an Option[@ffi.opaque] operand IS the handle pointer, so None is
+                // the NULL niche, not a `.tag` carrier.
+                let operand_is_opaque = opt_inner_s != "" && is_opaque_type(opt_inner_s) != 0
+                let none_cond = if operand_is_opaque { "{tmp} == NULL" } else { "{tmp}.tag == 0" }
                 let odepth = cg_arena_expr_tmp_stack.len()
                 if odepth == 0 {
-                    emit_line("if ({tmp}.tag == 0) return ({fn_opt_c})\{.tag = 0};")
+                    emit_line("if ({none_cond}) return {fn_none_return};")
                 } else {
-                    emit_line("if ({tmp}.tag == 0) \{")
+                    emit_line("if ({none_cond}) \{")
                     cg_indent = cg_indent + 1
                     let mut odi = odepth - 1
                     while odi >= 0 {
@@ -3060,13 +3106,21 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                         emit_line("blink_arena_destroy({inner_tmp});")
                         odi = odi - 1
                     }
-                    emit_line("return ({fn_opt_c})\{.tag = 0};")
+                    emit_line("return {fn_none_return};")
                     cg_indent = cg_indent - 1
                     emit_line("}")
                 }
                 if opt_inner_s != "" {
                     let inner_c = c_type_from_tag(opt_inner_s)
-                    if inner_c.ends_with("*") {
+                    if operand_is_opaque {
+                        // NPO: the Some value is the handle itself by identity — no
+                        // `.value` read. Guard ahead of the pointer arm, which the
+                        // opaque cname also matches.
+                        expr_result_str = tmp
+                        expr_result_type = CT_STRUCT
+                        publish_result_tid(node)
+                        set_var_struct(tmp, opt_inner_s)
+                    } else if inner_c.ends_with("*") {
                         expr_result_str = "{tmp}.value"
                         expr_result_type = opt_inner
                         publish_result_tid(node)
@@ -5226,6 +5280,35 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     expr_option_inner_struct = transparent_enum
                     return
                 }
+                // @ffi.opaque inner: the Option is niche-optimized to the bare
+                // handle pointer (NULL = None), so Some(h) IS the handle — no tag,
+                // no heap box. Resolve the opaque inner name from the arg's own
+                // var-struct, the let-target annotation, or the enclosing fn return
+                // (the same three channels the transparent/scalar paths consult).
+                let mut opaque_inner = ""
+                let some_vs = get_var_struct(inner_str)
+                if some_vs != "" && is_opaque_type(some_vs) != 0 {
+                    opaque_inner = some_vs
+                }
+                if opaque_inner == "" && cg_let_target_ann != -1 && node_name(cg_let_target_ann) == "Option" {
+                    let oi_elems = node_elements(cg_let_target_ann)
+                    if oi_elems != -1 && sublist_length(oi_elems) >= 1 {
+                        let oi_name = node_name(sublist_get(oi_elems, 0))
+                        if is_opaque_type(oi_name) != 0 { opaque_inner = oi_name }
+                    }
+                }
+                if opaque_inner == "" && cg_current_fn_node != -1 {
+                    let fr_inner = option_inner_struct_from_fn(cg_current_fn_node)
+                    if fr_inner != "" && is_opaque_type(fr_inner) != 0 { opaque_inner = fr_inner }
+                }
+                if opaque_inner != "" {
+                    expr_result_str = inner_str
+                    expr_result_type = CT_OPTION
+                    publish_result_tid(node)
+                    expr_option_inner = inner_type
+                    expr_option_inner_struct = opaque_inner
+                    return
+                }
                 // A CT_OPTION/CT_RESULT/CT_MAP inner must route to the compound
                 // branch below — its structured carrier (Option_Map_str_int) comes
                 // from the annotation-consult (ann_inner_name), NOT get_var_struct.
@@ -5739,6 +5822,23 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             if ret_ct_tid >= 0 {
                 expr_result_str = "(({closure_sig}){cls_expr}->fn_ptr)({args_str})"
                 expr_result_type = ret_ct_tid
+                publish_result_tid(node)
+                return
+            }
+            // Option[@ffi.opaque] is NPO'd to the bare handle (`FILE*`), a tag-less
+            // spelling closure_ret_tag_is_recognized cannot decode, so the tid restores
+            // the Option-ness here. The temp holds the handle; the reseat marks it an
+            // Option so downstream .is_none()/.unwrap()/match dispatch to the NULL niche.
+            let opaque_opt_inner = closure_ret_opaque_option_inner(node)
+            if opaque_opt_inner != "" {
+                let tmp = fresh_temp("_cls_ret_")
+                emit_line("{ret_part} {tmp} = (({closure_sig}){cls_expr}->fn_ptr)({args_str});")
+                set_var(tmp, CT_OPTION, 0)
+                set_var_option_struct(tmp, CT_STRUCT, opaque_opt_inner)
+                expr_result_str = tmp
+                expr_result_type = CT_OPTION
+                expr_option_inner = CT_STRUCT
+                expr_option_inner_struct = opaque_opt_inner
                 publish_result_tid(node)
                 return
             }

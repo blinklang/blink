@@ -1,0 +1,153 @@
+// Option[@ffi.opaque] has GUARANTEED null-pointer optimization: it is a single
+// machine word where the C NULL pointer IS the None niche and a present handle
+// is the non-null pointer — never a tagged struct. There is no `.is_null()` and
+// no null sentinel; Option is the sole absence channel. This holds for every
+// @ffi.opaque type because the compiler knows the representation is a pointer
+// whose null value is unused. (spec sections/07_trust_modules_metadata.md:896)
+import compile_test_helpers
+
+test "Option[opaque] carrier is a bare pointer, not a tagged struct" {
+    let src = "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("fn wrap(f: CFile) -> Option[CFile] \{ Some(f) }\n")
+        .concat("fn main() \{ }\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_gn5yns_carrier")
+    // No tagged carrier is emitted for the opaque inner: no `blink_Option_FILE`
+    // stem (which also guards against the `*` leaking into a C identifier).
+    assert(!c.contains("blink_Option_FILE"))
+    assert(c.contains("FILE*"))
+}
+
+test "Option[opaque] round-trips Some, None, is_some/is_none, unwrap, and match" {
+    let src = "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("@ffi(\"c\", \"fopen\")\n@trusted\nfn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> CFile ! FFI \{ \}\n")
+        .concat("@ffi(\"c\", \"fclose\")\n@trusted\nfn c_fclose(f: CFile) -> Int ! FFI \{ \}\n")
+        .concat("fn main() \{\n")
+        .concat("    with ffi.scope() as scope \{\n")
+        .concat("        let p = scope.cstr(\"/dev/null\")\n")
+        .concat("        let m = scope.cstr(\"r\")\n")
+        .concat("        let f = c_fopen(p, m)\n")
+        .concat("        let present: Option[CFile] = Some(f)\n")
+        .concat("        let absent: Option[CFile] = None\n")
+        .concat("        if present.is_some() \{ io.println(\"present is_some\") }\n")
+        .concat("        if absent.is_none() \{ io.println(\"absent is_none\") }\n")
+        .concat("        match present \{\n")
+        .concat("            Some(g) => \{\n")
+        .concat("                let rc = c_fclose(g)\n")
+        .concat("                io.println(\"match rc \{rc}\")\n")
+        .concat("            }\n")
+        .concat("            None => \{ io.println(\"match none\") }\n")
+        .concat("        }\n")
+        .concat("    }\n")
+        .concat("}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_gn5yns_roundtrip")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("present is_some"))
+    assert(r.out.contains("absent is_none"))
+    assert(r.out.contains("match rc 0"))
+}
+
+test "Option[opaque] unwrap returns the handle" {
+    let src = "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("@ffi(\"c\", \"fopen\")\n@trusted\nfn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> CFile ! FFI \{ \}\n")
+        .concat("@ffi(\"c\", \"fclose\")\n@trusted\nfn c_fclose(f: CFile) -> Int ! FFI \{ \}\n")
+        .concat("fn main() \{\n")
+        .concat("    with ffi.scope() as scope \{\n")
+        .concat("        let p = scope.cstr(\"/dev/null\")\n")
+        .concat("        let m = scope.cstr(\"r\")\n")
+        .concat("        let present: Option[CFile] = Some(c_fopen(p, m))\n")
+        .concat("        let g = present.unwrap()\n")
+        .concat("        let rc = c_fclose(g)\n")
+        .concat("        io.println(\"unwrap rc \{rc}\")\n")
+        .concat("    }\n")
+        .concat("}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_gn5yns_unwrap")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("unwrap rc 0"))
+}
+
+test "Option[opaque] `?` propagates None through the null niche" {
+    let src = "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("@ffi(\"c\", \"fclose\")\n@trusted\nfn c_fclose(f: CFile) -> Int ! FFI \{ \}\n")
+        .concat("fn maybe() -> Option[CFile] \{ None }\n")
+        .concat("fn use_q() -> Option[Int] \{\n")
+        .concat("    let h = maybe()?\n")
+        .concat("    Some(c_fclose(h))\n")
+        .concat("}\n")
+        .concat("fn main() \{\n")
+        .concat("    match use_q() \{\n")
+        .concat("        Some(n) => \{ io.println(\"some \{n}\") }\n")
+        .concat("        None => \{ io.println(\"propagated none\") }\n")
+        .concat("    }\n")
+        .concat("}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_gn5yns_question")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("propagated none"))
+}
+
+test "Option[opaque] `??` falls back to the default handle" {
+    let src = "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("@ffi(\"c\", \"fopen\")\n@trusted\nfn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> CFile ! FFI \{ \}\n")
+        .concat("@ffi(\"c\", \"fclose\")\n@trusted\nfn c_fclose(f: CFile) -> Int ! FFI \{ \}\n")
+        .concat("fn pick(a: Option[CFile], b: CFile) -> CFile \{ a ?? b }\n")
+        .concat("fn main() \{\n")
+        .concat("    with ffi.scope() as scope \{\n")
+        .concat("        let p = scope.cstr(\"/dev/null\")\n")
+        .concat("        let m = scope.cstr(\"r\")\n")
+        .concat("        let f = c_fopen(p, m)\n")
+        .concat("        let g = pick(None, f)\n")
+        .concat("        let rc = c_fclose(g)\n")
+        .concat("        io.println(\"pick rc \{rc}\")\n")
+        .concat("    }\n")
+        .concat("}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_gn5yns_coalesce")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("pick rc 0"))
+}
+
+test "FFI fn returning Option[opaque] spells the bare handle, no carrier" {
+    let src = "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("@ffi(\"c\", \"maybe_open\")\n@trusted\nfn c_maybe_open(p: Ptr[U8]) -> Option[CFile] ! FFI \{ \}\n")
+        .concat("fn main() \{ }\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_gn5yns_ffi_ret")
+    assert(!c.contains("blink_Option_FILE"))
+    assert(c.contains("FILE*"))
+}
+
+test "FFI fn taking Option[opaque] spells the bare handle, no carrier" {
+    let src = "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("@ffi(\"c\", \"take_opt\")\n@trusted\nfn c_take_opt(f: Option[CFile]) -> Int ! FFI \{ \}\n")
+        .concat("fn main() \{ }\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_gn5yns_ffi_param")
+    assert(!c.contains("blink_Option_FILE"))
+    assert(c.contains("FILE*"))
+}
+
+test "Closure returning Option[opaque] spells the bare handle, no carrier" {
+    let src = "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("fn main() \{\n")
+        .concat("    let f = fn () -> Option[CFile] \{ None }\n")
+        .concat("    let o = f()\n")
+        .concat("    if o.is_none() \{ io.println(\"none\") }\n")
+        .concat("}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_gn5yns_closure")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("none"))
+}
+
+test "Option[opaque] `?` in a fn returning Option[opaque] spells the null niche" {
+    let src = "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("fn maybe() -> Option[CFile] \{ None }\n")
+        .concat("fn chain() -> Option[CFile] \{\n")
+        .concat("    let h = maybe()?\n")
+        .concat("    Some(h)\n")
+        .concat("}\n")
+        .concat("fn main() \{\n")
+        .concat("    match chain() \{\n")
+        .concat("        Some(_g) => \{ io.println(\"some\") }\n")
+        .concat("        None => \{ io.println(\"propagated none\") }\n")
+        .concat("    }\n")
+        .concat("}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_gn5yns_q_ret_opaque")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("propagated none"))
+}

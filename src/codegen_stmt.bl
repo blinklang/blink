@@ -45,6 +45,7 @@ import codegen_types.{
     get_var_closure_sig, get_var_handler_vtable_type,
     get_var_handle_sname, get_var_handle_sname2, get_var_iter_next_fn,
     get_var_iterator_inner, get_var_option_inner, get_var_option_inner_struct,
+    get_var_option_inner_nominal,
     get_var_option_inner_tag, get_var_result_ok_tag, get_var_result_err_tag,
     get_var_option_erased, set_var_option_erased,
     get_var_result_err, get_var_result_err_struct, get_var_result_ok,
@@ -79,6 +80,7 @@ import codegen_types.{
     set_var_result_struct, set_var_result_from_struct_tag,
     set_var_struct, sf_closure_sigs, sf_entries,
     struct_field_defaults, struct_invariants, struct_option_c_type,
+    is_opaque_type, opaque_option_carrier_cname, opaque_handle_c_name,
     struct_reg_names, struct_reg_set, struct_result_c_type, sv_tp, tp_from_ann,
     type_int, type_string, type_struct, type_list, type_option, type_result, type_map, type_set, type_iterator,
     set_list_elem_option_tp, set_list_elem_result_tp, list_elem_unspellable,
@@ -1134,6 +1136,18 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                 } else if oi_s != "" {
                     let opt_c = struct_option_c_type(oi_s)
                     emit_line("{opt_c} {scrut_tmp} = {expr_result_str};")
+                    // An @ffi.opaque inner is niche-optimized to the bare handle
+                    // pointer; record it on the copy so the arm test and binder read
+                    // the NULL niche instead of a `.tag`/`.value` carrier.
+                    if is_opaque_type(oi_s) != 0 {
+                        set_var(scrut_tmp, CT_OPTION, 1)
+                        set_var_option(scrut_tmp, oi)
+                        set_var_option_struct(scrut_tmp, oi, oi_s)
+                        // The arm-condition and binder read the inner nominal through the
+                        // TID accessors (get_var_option_inner_nominal), not the flat sname,
+                        // so carry the scrutinee's Option[opaque] tid onto the copy.
+                        set_var_ty(scrut_tmp, cg_node_mono_tid(scrut))
+                    }
                 } else if c_type_from_tid(cg_node_mono_tid(scrut)).starts_with("blink_Option_") {
                     let opt_c = c_type_from_tid(cg_node_mono_tid(scrut))
                     emit_line("{opt_c} {scrut_tmp} = {expr_result_str};")
@@ -1697,7 +1711,12 @@ fn unwrap_carrier(enum_name: Str, scrut: Str, scrut_type: Int) -> UnwrapCarrier 
     }
     let inner_is_enum = inner_struct != "" && is_enum_type(inner_struct) != 0
     let inner_is_transparent = inner_struct != "" && is_transparent_newtype(inner_struct) != 0
-    let payload_expr = if field == "value" && inner_is_transparent {
+    let inner_is_opaque = inner_struct != "" && is_opaque_type(inner_struct) != 0
+    let payload_expr = if field == "value" && inner_is_opaque {
+        // NPO: the whole Option carrier is the bare handle pointer, so the Some
+        // payload is the scrutinee itself — no `.value` member exists.
+        "{scrut}"
+    } else if field == "value" && inner_is_transparent {
         // Transparent newtype (e.g. Option[Errno]): the carrier's `.value` member
         // is a bare int64_t, not a boxed enum pointer — read it directly without
         // the *(blink_Errno*) deref the boxed path uses.
@@ -1947,6 +1966,21 @@ fn positional_payload_condition(pat: Int, resolved_enum: Str, resolved_variant: 
 // The nested-carrier branch saves and restores the carrier-shape globals around
 // its recursion; the analyzer can't see the restore across the
 // set_carrier_globals_from_inner call, hence the allow.
+// The opaque inner name when the match scrutinee at `scrut_off` is a
+// null-pointer-optimized Option[@ffi.opaque] (its whole carrier is a bare handle
+// pointer, NULL = None), else "". Reads the carrier-tag channel (tuple-element
+// scrutinees) then the materialized copy's var metadata (single scrutinees).
+fn scrut_opaque_inner(scrut_off: Int) -> Str {
+    let e = match_scruts.get(scrut_off).unwrap()
+    if e.scrut_type != CT_OPTION { return "" }
+    if e.scrut_sname != "" && e.scrut_sname.starts_with("Option_") && opaque_option_carrier_cname(e.scrut_sname) != "" {
+        return e.scrut_sname.slice(7, e.scrut_sname.len())
+    }
+    let vs = get_var_option_inner_nominal(e.str_val)
+    if vs != "" && is_opaque_type(vs) != 0 { return vs }
+    ""
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
     let pk = node_kind(pat)
@@ -1958,6 +1992,9 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
         // Bare `None` is the Option carrier (tag 0) only for a real Option scrutinee;
         // a user enum reusing `None` resolves to its own variant tag below.
         if pat_name == "None" && match_scruts.get(scrut_off).unwrap().scrut_type == CT_OPTION {
+            if scrut_opaque_inner(scrut_off) != "" {
+                return "({match_scruts.get(scrut_off).unwrap().str_val} == NULL)"
+            }
             return "({match_scruts.get(scrut_off).unwrap().str_val}.tag == 0)"
         }
         let enum_name = resolve_arm_enum(pat_name)
@@ -1997,6 +2034,11 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
         let ep_scrut_type = match_scruts.get(scrut_off).unwrap().scrut_type
         let is_result_carrier = (enum_name == "Ok" || enum_name == "Err") && ep_scrut_type == CT_RESULT
         let is_option_carrier = enum_name == "Some" && ep_scrut_type == CT_OPTION
+        if is_option_carrier && scrut_opaque_inner(scrut_off) != "" {
+            // NPO: Some matches a non-null handle. The opaque handle is inert, so
+            // there is no nested sub-pattern to recurse into.
+            return "({match_scruts.get(scrut_off).unwrap().str_val} != NULL)"
+        }
         if is_result_carrier || is_option_carrier {
             let tag = if enum_name == "Err" { 1 } else if enum_name == "Some" { 1 } else { 0 }
             let scrut = match_scruts.get(scrut_off).unwrap().str_val
@@ -2597,7 +2639,20 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                     let field = uc.field
                     let inner_ct = uc.inner_ct
                     let inner_struct = uc.inner_struct
-                    if inner_struct != "" && inner_ct == CT_RESULT {
+                    let opaque_bind = if enum_name == "Some" && scrut_type == CT_OPTION {
+                        let obvs = get_var_option_inner_nominal(scrut)
+                        let cand = if obvs != "" { obvs } else { inner_struct }
+                        if cand != "" && is_opaque_type(cand) != 0 { cand } else { "" }
+                    } else {
+                        ""
+                    }
+                    if opaque_bind != "" {
+                        // NPO: the carrier IS the handle pointer, so Some(g) binds it
+                        // by identity — no `.value` deref.
+                        emit_line("{c_type_c_name(opaque_bind)} {c_bind} = {scrut};")
+                        set_var(bind_name, CT_STRUCT, 0)
+                        set_var_struct(bind_name, opaque_bind)
+                    } else if inner_struct != "" && inner_ct == CT_RESULT {
                         if field == "value" {
                             emit_line("{c_type_c_name(inner_struct)} {c_bind} = *{scrut}.{field};")
                         } else {
@@ -5015,7 +5070,13 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         decl_c = opt_c
         decl_branch = if get_var_option_erased(name) == 0 && opt_use_tid { "option_tid" } else { "option" }
         if val_str.ends_with("\{.tag = 0}") {
-            val_str = "({opt_c})\{.tag = 0}"
+            // Option[@ffi.opaque] is null-pointer-optimized: None is the NULL handle,
+            // never a `{.tag = 0}` struct initializer against the bare pointer type.
+            if opt_inner_s != "" && is_opaque_type(opt_inner_s) != 0 {
+                val_str = "(({opt_c})0)"
+            } else {
+                val_str = "({opt_c})\{.tag = 0}"
+            }
         }
         if is_mut != 0 {
             emit_line("{opt_c} {cname} = {val_str};")
@@ -7024,6 +7085,11 @@ pub fn param_c_type(p: Int, ptype: Str) -> Str {
                 let inner_ann = sublist_get(elems_sl, 0)
                 let inner_name = node_name(inner_ann)
                 let inner_t = type_from_name(inner_name)
+                if is_opaque_type(inner_name) != 0 {
+                    // Option[@ffi.opaque] is null-pointer-optimized to the bare handle
+                    // (NULL = None); it has no carrier struct (spec §9.1.4).
+                    return opaque_handle_c_name(inner_name)
+                }
                 if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
                     // A generic-struct INSTANCE param inner (Option[QBox[Int]])
                     // spells the mono stem (QBox_Int) so the carrier matches the tid path;

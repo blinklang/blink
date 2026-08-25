@@ -937,6 +937,10 @@ pub fn c_type_c_name_in(name: Str, definer_module: Str) -> Str {
     // Compound carrier name (Option_X, Result_X_Y) — canonicalize the nested
     // struct/enum tags so the C type matches the actual emitted typedef.
     if (name.starts_with("Option_") || name.starts_with("Result_")) && !user_declared {
+        let opaque_carrier = opaque_option_carrier_cname(name)
+        if opaque_carrier != "" {
+            return opaque_carrier
+        }
         return "blink_{canonical_struct_tag(name)}"
     }
     let bare = strip_module_qualifier(name)
@@ -2488,6 +2492,11 @@ pub fn resolve_ret_type_from_ann(fn_node: Int) -> Str {
                 let inner_ann = sublist_get(elems_sl, 0)
                 let inner_name = node_name(inner_ann)
                 let inner_t = type_from_name(inner_name)
+                if is_opaque_type(inner_name) != 0 {
+                    // Option[@ffi.opaque] is null-pointer-optimized to the bare handle
+                    // (NULL = None); it has no carrier struct (spec §9.1.4).
+                    return opaque_handle_c_name(inner_name)
+                }
                 if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
                     // a generic-struct INSTANCE inner spells the mono stem
                     // (QBox_Int), matching the tid path; the bare head is the fallback
@@ -5135,6 +5144,21 @@ pub fn closure_ret_direct_ct(node: Int) -> Int {
     ct
 }
 
+// The opaque inner struct name of a closure CALL whose result is Option[@ffi.opaque],
+// else "". NPO spells that return as the bare handle (`FILE*`), a tag-less C type the
+// string-driven reseat cannot recognize (closure_ret_tag_is_recognized only knows
+// `blink_`-prefixed carriers), so the tid is the sole authority for restoring the
+// Option-ness onto the call result.
+pub fn closure_ret_opaque_option_inner(node: Int) -> Str {
+    let raw = closure_ret_tid(node)
+    if raw == -1 { return "" }
+    let tid = tc_tid_resolved(raw)
+    if tc_tid_ct(tid) != CT_OPTION { return "" }
+    let inner_s = tc_tid_option_inner_struct(tid)
+    if inner_s != "" && is_opaque_type(inner_s) != 0 { return inner_s }
+    ""
+}
+
 // The C return spelling of a closure LITERAL, read off its Fn tid; "" when there is no tid or it
 // does not name a Fn. A closure call is emitted `((sig)cls->fn_ptr)(cls, args..)`, so the CAST has
 // to name the same C type the declaration does, and the annotation-string chain that builds the sig
@@ -7351,6 +7375,11 @@ pub fn option_c_type(inner: Int) -> Str {
 }
 
 pub fn struct_option_c_type(struct_name: Str) -> Str {
+    // An @ffi.opaque inner has no carrier struct: Option is the bare handle
+    // pointer with NULL as the None niche. Every declaration and temp spelled
+    // through this producer must agree, so intercept here.
+    let oc = opaque_handle_c_name(struct_name)
+    if oc != "" { return oc }
     "blink_Option_{canonical_struct_tag(struct_name)}"
 }
 
@@ -7370,6 +7399,8 @@ pub fn result_c_type_mixed(ok_t: Int, err_t: Int, ok_struct: Str, err_struct: St
 
 pub fn option_c_type_mixed(inner: Int, inner_struct: Str) -> Str {
     if inner_struct != "" {
+        let oc = opaque_handle_c_name(inner_struct)
+        if oc != "" { return oc }
         "blink_Option_{canonical_struct_tag(inner_struct)}"
     } else {
         "blink_Option_{c_type_tag(inner)}"
@@ -7389,6 +7420,33 @@ pub fn option_inner_ct_from_tag(tag: Str) -> Int {
     if inner.starts_with("Result_") { return CT_RESULT }
     if inner.starts_with("Map_") { return CT_MAP }
     type_from_name_tag(inner)
+}
+
+// The incomplete C pointer type an `Option_<opaque>` carrier lowers to under
+// guaranteed null-pointer optimization, or "" when the inner is not opaque.
+// The whole Option is one machine word (`FILE*`, `sqlite3*`): NULL is the None
+// niche and a present handle is the non-null pointer — never a tagged carrier.
+// Result carriers are excluded: they need both an ok and an err channel, so no
+// unused value is available for a niche.
+pub fn opaque_option_carrier_cname(tag: Str) -> Str {
+    if !tag.starts_with("Option_") { return "" }
+    opaque_handle_c_name(tag.slice(7, tag.len()))
+}
+
+// True when `name` is an @ffi.opaque handle type. Its bare handle and its
+// Option both lower to the incomplete C pointer, so the value seams read this
+// to take the null-pointer-optimized path instead of a `.tag`/`.value` carrier.
+pub fn is_opaque_type(name: Str) -> Int {
+    if opaque_handle_c_name(name) != "" { 1 } else { 0 }
+}
+
+// The bare incomplete C pointer an @ffi.opaque handle lowers to (`FILE*`), or ""
+// when `name` is not opaque.
+pub fn opaque_handle_c_name(name: Str) -> Str {
+    match ffi_opaque_c_name.get(resolve_import_alias(strip_module_qualifier(name))) {
+        Some(ocname) => "{ocname}*"
+        None => ""
+    }
 }
 
 pub fn canonical_struct_tag(tag: Str) -> Str {
@@ -8026,6 +8084,11 @@ pub fn ensure_carrier_from_tag(tag: Str) {
 }
 
 pub fn ensure_struct_option_type(struct_name: Str) {
+    // Option[@ffi.opaque] is null-pointer-optimized to a bare `<cname>*` word (NULL = None)
+    // and has NO carrier struct (spec §9.1.4). This is the one chokepoint that still sees the
+    // Blink name ("CFile"); canonical_struct_tag below would resolve it to the incomplete C
+    // name ("FILE*"), after which the emit-time guard can no longer recognize it as opaque.
+    if is_opaque_type(struct_name) != 0 { return }
     let tag = canonical_struct_tag(struct_name)
     let key = "s_{tag}"
     if emitted_option_set.contains_key(key) != 0 {
@@ -9177,6 +9240,9 @@ fn emit_result_typedef(ok_t: Int, err_t: Int) ! Codegen.Emit {
 
 pub fn emit_struct_option_typedef(struct_name: Str) ! Codegen.Emit {
     if struct_name == "void" || struct_name == "Void" || struct_name == "" { return }
+    // An Option over an @ffi.opaque handle is niche-optimized to the bare pointer
+    // (NULL = None); it has no carrier struct, so emit none.
+    if opaque_option_carrier_cname("Option_{struct_name}") != "" { return }
     let tag = canonical_struct_tag(struct_name)
     let tname = "blink_Option_{tag}"
     if option_typedef_emitted.contains_key(tname) != 0 { return }

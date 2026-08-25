@@ -61,7 +61,7 @@ import codegen_types.{
     set_var_option_inner2, set_var_option_inner_tp,
     set_var_option_struct, set_var_option_from_struct_tag, set_var_result, set_var_result_struct, set_var_struct,
     strip_blink_prefix,
-    struct_option_c_type, struct_result_c_type,
+    struct_option_c_type, struct_result_c_type, is_opaque_type,
     tp_child1_kind, tp_child2_kind, tp_child1_sname, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname,
     carrier_slot_ct,
     type_from_name, type_from_name_tag, type_name_from_ct, is_compound_tag, is_intrinsic_method, ue_methods,
@@ -119,6 +119,25 @@ fn emit_panic_tag_check(tmp: Str, tag_val: Int, msg: Str, node: Int) ! Codegen.E
     let file = panic_file_for_fmt(node)
     let loc = panic_line_str(node)
     emit_line("if ({tmp}.tag == {tag_val}) \{ {emit_panic_site(\"panic: {msg} at {file}:{loc}\", \"\")} }")
+}
+
+// The opaque inner name when the Option value at `obj_str` is null-pointer
+// optimized (its inner is an @ffi.opaque handle), else "". Resolves from the
+// var's recorded inner, then the live expr globals — the same two channels the
+// unwrap arm consults.
+fn option_obj_opaque_inner(obj_str: Str) -> Str {
+    let vs = get_var_option_inner_nominal(obj_str)
+    let inner_s = if vs != "" { vs } else { expr_option_inner_struct }
+    if inner_s != "" && is_opaque_type(inner_s) != 0 { inner_s } else { "" }
+}
+
+// The None check for a null-pointer-optimized Option[@ffi.opaque], where the
+// whole carrier is a bare handle pointer and NULL is the None niche — the
+// counterpart of emit_panic_tag_check for the tagged carrier.
+fn emit_panic_null_check(tmp: Str, msg: Str, node: Int) ! Codegen.Emit {
+    let file = panic_file_for_fmt(node)
+    let loc = panic_line_str(node)
+    emit_line("if ({tmp} == NULL) \{ {emit_panic_site(\"panic: {msg} at {file}:{loc}\", \"\")} }")
 }
 
 // Same guard as emit_panic_tag_check, but embeds the Display-rendered value of
@@ -5640,7 +5659,19 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let inner_s = if sv_inner_s != "" { sv_inner_s } else { expr_option_inner_struct }
             let erased = if sv_inner != -1 { get_var_option_erased(obj_str) } else { expr_option_erased }
             let tmp = fresh_temp("_ounw_")
-            if inner_s != "" && is_transparent_newtype(inner_s) != 0 {
+            if inner_s != "" && is_opaque_type(inner_s) != 0 {
+                // NPO: the Option IS the handle pointer. unwrap panics on NULL
+                // (the None niche) and yields the handle by identity — no deref.
+                let opt_c = struct_option_c_type(inner_s)
+                emit_line("{opt_c} {tmp} = {obj_str};")
+                emit_panic_null_check(tmp, "unwrap called on None", node)
+                let val_tmp = fresh_temp("_ounv_")
+                emit_line("{c_type_c_name(inner_s)} {val_tmp} = {tmp};")
+                set_var(val_tmp, CT_STRUCT, 0)
+                set_var_struct(val_tmp, inner_s)
+                expr_result_str = val_tmp
+                expr_result_type = CT_STRUCT
+            } else if inner_s != "" && is_transparent_newtype(inner_s) != 0 {
                 // A transparent newtype has no heap box: its Option carrier holds a bare
                 // int64_t value, so unwrap reads it by identity (no deref) and the result
                 // is the scalar the match/consumer treats it as.
@@ -5949,12 +5980,22 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             return
         }
         if method == "is_some" {
-            expr_result_str = "({obj_str}.tag == 1)"
+            let iss = option_obj_opaque_inner(obj_str)
+            if iss != "" {
+                expr_result_str = "({obj_str} != NULL)"
+            } else {
+                expr_result_str = "({obj_str}.tag == 1)"
+            }
             expr_result_type = CT_BOOL
             return
         }
         if method == "is_none" {
-            expr_result_str = "({obj_str}.tag == 0)"
+            let iss = option_obj_opaque_inner(obj_str)
+            if iss != "" {
+                expr_result_str = "({obj_str} == NULL)"
+            } else {
+                expr_result_str = "({obj_str}.tag == 0)"
+            }
             expr_result_type = CT_BOOL
             return
         }
