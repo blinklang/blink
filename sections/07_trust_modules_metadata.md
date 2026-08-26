@@ -192,7 +192,9 @@ fn raw_getenv(name: Ptr[U8]) -> Ptr[U8]
 
 **Nesting:** `Ptr[Ptr[T]]` is allowed and maps to `T**`. This is required for C out-parameters (e.g., `sqlite3_open`'s `sqlite3**` parameter): allocate the cell with `scope.alloc[Ptr[T]]()`, pass it directly to C, then read it back with `.deref()` (which yields `Ptr[T]`).
 
-**The `Void` type:** `Void` is a special opaque type valid **only** as a `Ptr` type parameter. It maps to C's `void` — `Ptr[Void]` is `void*`. `Void` cannot be used as a standalone type, function parameter, or return type outside of `Ptr`.
+**The `Void` type:** `Void` is the FFI-only marker for C's incomplete `void` pointee type. It is **well-formed only as the argument of `Ptr[_]`** — `Ptr[Void]` is `void*`. `Void` has no value representation (see *`.deref()` / `.write()` on `Ptr[Void]`* below): it is not a value type, and it may not appear as a standalone type, a function parameter or return type, a field type, or a generic argument anywhere except directly under `Ptr`. Every such non-`Ptr` use is a compile error (**E0828**) whose fix points at the unit type — the type that carries "no meaningful value" for a Blink value, parameter, or return is `()` (the unit type, §3.8), never `Void`.
+
+`()` and `Void` are two different kinds of thing, and the confinement of `Void` to `Ptr[Void]` is its definition, not a restriction bolted onto a general type. `()` is an *inhabited* value type: one value, a representation, usable as a return, a field, or a generic argument (`Result[(), E]`, `Map[Str, ()]`). `Void` mirrors C's incomplete `void` — no value representation, existing only as the thing a `void*` points at. This is exactly why `Ptr[Void].deref()` / `.write()` are rejected (E0825, below): there is no value of type `Void` to read or write.
 
 **Valid type parameters:** `Ptr[T]` accepts only FFI-compatible types: `Void`, `U8`, `U16`, `U32`, `U64`, `I8`, `I16`, `I32`, `Int` (maps to `int64_t`), `Float` (maps to `double`), and `Ptr[T]` itself (for pointer-to-pointer). Using a GC-managed type (e.g., `Ptr[Str]`, `Ptr[List[T]]`) is a compile error.
 
@@ -1723,7 +1725,7 @@ Inside `test` blocks, the following functions are auto-available without import:
 | `assert(cond)` | `fn assert(cond: Bool)` |
 | `assert_eq(a, b)` | `fn assert_eq[T: Eq + Display](left: T, right: T)` |
 | `assert_ne(a, b)` | `fn assert_ne[T: Eq + Display](left: T, right: T)` |
-| `prop_check(f)` | `fn prop_check[...](f: fn(...) -> ())` — the property closure given directly to the intrinsic may use `?`; it is elaborated to `fn(...) -> Result[Void, TestError]` like a test body (§2.20) |
+| `prop_check(f)` | `fn prop_check[...](f: fn(...) -> ())` — the property closure given directly to the intrinsic may use `?`; it is elaborated to `fn(...) -> Result[(), TestError]` like a test body (§2.20) |
 
 These are compiler intrinsics — not library functions. They capture source locations, generate diffs, and are stripped from release builds. They are scoped to `test` blocks; using them outside a test block is a compile error.
 

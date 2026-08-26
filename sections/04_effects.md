@@ -760,7 +760,7 @@ test "CLI exits with 1 on missing args" {
 `db.transaction` implements the `BlockHandler` trait (see §4.6.3), providing automatic `BEGIN`/`COMMIT`/`ROLLBACK` semantics via `with`. It requires the `DB.Write` effect.
 
 ```blink
-fn transfer(from_id: Int, to_id: Int, amount: Int) -> Result[Void, DBError] ! DB.Write {
+fn transfer(from_id: Int, to_id: Int, amount: Int) -> Result[(), DBError] ! DB.Write {
     with db.transaction() {
         let from = db.query_one("SELECT balance FROM accounts WHERE id = {from_id}")?
         let to_acct = db.query_one("SELECT balance FROM accounts WHERE id = {to_id}")?
@@ -802,9 +802,9 @@ The `fs` handle is in scope when a function declares `! FS` or one of its sub-ef
 | Operation | Signature | Effect |
 |---|---|---|
 | `fs.read` | `fs.read(path: Str) -> Result[Str, FsError]` | `FS.Read` |
-| `fs.write` | `fs.write(path: Str, content: Str) -> Result[Void, FsError]` | `FS.Write` |
+| `fs.write` | `fs.write(path: Str, content: Str) -> Result[(), FsError]` | `FS.Write` |
 | `fs.list_dir` | `fs.list_dir(path: Str) -> Result[List[Str], FsError]` | `FS.Read` |
-| `fs.delete` | `fs.delete(path: Str) -> Result[Void, FsError]` | `FS.Delete` |
+| `fs.delete` | `fs.delete(path: Str) -> Result[(), FsError]` | `FS.Delete` |
 
 Directory listing is a read, so `fs.list_dir` needs only `FS.Read` — there is no `FS.List` sub-effect.
 
@@ -1123,7 +1123,7 @@ The `with...as` construct handles this second tier. The file-handle examples bel
 ```blink
 // Planned (post-v1): the file-handle API. Shown here to illustrate `with ... as`
 // scoped resources; the v1 fs surface is the four path operations in §4.4.5.
-fn copy_file(src_path: Str, dst_path: Str) -> Result[Void, FsError] ! FS {
+fn copy_file(src_path: Str, dst_path: Str) -> Result[(), FsError] ! FS {
     with fs.open(src_path)? as src, fs.create(dst_path)? as dst {
         let data = src.read_all()?
         dst.write(data)?
@@ -1145,7 +1145,7 @@ The tiers compose naturally:
 ```blink
 // The scoped-resource file handle (`fs.create ... as out`, `out.write`) is the
 // planned post-v1 handle API; the two-tier `with` composition it illustrates is v1.
-fn export_data(query: Str, path: Str) -> Result[Void, AppError] ! DB.Read, FS {
+fn export_data(query: Str, path: Str) -> Result[(), AppError] ! DB.Read, FS {
     with fs.create(path)? as out {
         let rows = db.query(query)?
         for row in rows {
@@ -1510,11 +1510,11 @@ fn check_stock(item_id: Int) -> Result[Int, DBError] ! DB.Read {
     db.query_one("SELECT quantity FROM inventory WHERE id = {item_id}")?
 }
 
-fn update_stock(item_id: Int, delta: Int) -> Result[Void, DBError] ! DB.Write {
+fn update_stock(item_id: Int, delta: Int) -> Result[(), DBError] ! DB.Write {
     db.exec("UPDATE inventory SET quantity = quantity + {delta} WHERE id = {item_id}")?
 }
 
-fn drop_table() -> Result[Void, DBError] ! DB.Write {
+fn drop_table() -> Result[(), DBError] ! DB.Write {
     db.exec("DROP TABLE inventory")?
     // This works if the module's capability budget includes DB.Write
 }
@@ -1899,7 +1899,7 @@ fn check_inventory(order: Order) -> Result[(), OrderError] ! DB.Read {
     Ok(())
 }
 
-fn reserve_stock(order: Order) -> Result[Void, DBError] ! DB.Write {
+fn reserve_stock(order: Order) -> Result[(), DBError] ! DB.Write {
     for item in order.items {
         db.exec("UPDATE inventory SET quantity = quantity - {item.quantity} WHERE id = {item.id}")?
     }

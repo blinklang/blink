@@ -1189,7 +1189,7 @@ Pure-by-default enables the compiler to safely parallelize test execution — te
 
 #### Error Propagation: `?` in Test Bodies
 
-A test body may use the `?` operator on `Result[T, E]` or `Option[T]` without an explicit return-type annotation. When `?` appears anywhere in the body, the compiler implicitly elaborates the test body's return type to `Result[Void, TestError]`. The surface form (`test "name" { body }`) is unchanged — no annotation is written, none is permitted (see [DECISIONS.md](../DECISIONS.md)).
+A test body may use the `?` operator on `Result[T, E]` or `Option[T]` without an explicit return-type annotation. When `?` appears anywhere in the body, the compiler implicitly elaborates the test body's return type to `Result[(), TestError]`. The surface form (`test "name" { body }`) is unchanged — no annotation is written, none is permitted (see [DECISIONS.md](../DECISIONS.md)).
 
 ```blink
 test "connect and query" {
@@ -1229,7 +1229,7 @@ For `Option[T]` operands, the lowering is identical except the `None` arm produc
 
 **`Display` is required at each `?` site.** If `E` does not implement `Display`, the test fails to compile with E0514 pointing at the `?` site. This is the same rule the compiler uses for `?` outside tests under the exact-structural-match constraint (§3c.2 Rule 4): the test author must guarantee the error type can be rendered. The diagnostic suggests deriving or implementing `Display` for `E`.
 
-**Hygiene.** The elaborated return type is internal to the test grammar form. User code cannot name it, dot into it, or observe it from outside. The runner is the sole caller of a test body and consumes the elaborated `Result[Void, TestError]` directly.
+**Hygiene.** The elaborated return type is internal to the test grammar form. User code cannot name it, dot into it, or observe it from outside. The runner is the sole caller of a test body and consumes the elaborated `Result[(), TestError]` directly.
 
 **Composition with HOFs.** Ordinary higher-order functions are *not* a test grammar form. A closure passed to `for_each` or any user-callable HOF follows the normal `?` rules from §3c.2 — the closure's own return type governs whether `?` is valid inside it, **not** the enclosing test body. A closure that uses `?` must itself return `Result[T, E]` or `Option[T]`:
 
@@ -1237,7 +1237,7 @@ For `Option[T]` operands, the lowering is identical except the `None` arm produc
 test "all rows parse" {
     for_each([("a", "1"), ("b", "2")], fn(case) {
         let (label, raw) = case
-        // E0508: `?` inside a closure returning Void.
+        // E0508: `?` inside a closure returning `()`.
         // Fix: change closure return to Result, or call .unwrap() / match.
         let n = parse_int(raw)?
         assert_eq(n.to_str().len(), 1, label)
@@ -1247,7 +1247,7 @@ test "all rows parse" {
 
 The fix is to lift fallible work out of the closure or change the closure's return type. Test-body elaboration does **not** propagate inward into nested closures.
 
-**`?` inside a `prop_check` property closure.** The property closure passed as the **direct syntactic argument** of the `prop_check` intrinsic (§2.20 *Property-Based Testing*) is the one exception, and it is not a propagation of the enclosing test body's elaboration — it is the *same* closed-surface elaboration applied on its own account. `prop_check` is a compiler intrinsic, not an ordinary HOF: the runner is the sole caller of the property closure and the user can never name or invoke it. When that closure contains `?`, its body is implicitly elaborated to `Result[Void, TestError]` exactly as a test body is — no annotation, no trailing `Ok(())`:
+**`?` inside a `prop_check` property closure.** The property closure passed as the **direct syntactic argument** of the `prop_check` intrinsic (§2.20 *Property-Based Testing*) is the one exception, and it is not a propagation of the enclosing test body's elaboration — it is the *same* closed-surface elaboration applied on its own account. `prop_check` is a compiler intrinsic, not an ordinary HOF: the runner is the sole caller of the property closure and the user can never name or invoke it. When that closure contains `?`, its body is implicitly elaborated to `Result[(), TestError]` exactly as a test body is — no annotation, no trailing `Ok(())`:
 
 ```blink
 fn parse_port(s: Str) -> Result[Int, ParseError] { /* ... */ }
@@ -1265,7 +1265,7 @@ The trigger is **syntactic**: elaboration applies only when the closure literall
 
 ```blink
 test "let-bound property closure is not elaborated" {
-    // E0508: `?` inside a closure returning Void — `prop` is a value, not
+    // E0508: `?` inside a closure returning `()` — `prop` is a value, not
     // the direct argument of `prop_check`, so it is not elaborated.
     // Fix: inline the closure into the prop_check(...) call.
     let prop = fn(p: Int) {
@@ -1276,11 +1276,11 @@ test "let-bound property closure is not elaborated" {
 }
 ```
 
-Each `?` site inside an elaborated property closure renders via `Display[E]` and stamps `TestError.error_type` with the static name of `E` **at that site** — distinct `?` sites in one property may produce distinct `error_type` values (something a single declared error type could not express, since `?` performs no implicit conversion, §3c.2 Rule 4). `?` on an `Option[T]` operand is covered by the same elaboration: the `None` arm yields `TestError { message: "None", error_type: "Option", origin: <span> }`, identical to the test-body lowering. The runner ABI is unchanged — every property iteration returns `Result[Void, TestError]`, so the elaborated property closure and an assertion-only one share one monomorphic shape; the closure's `E` never reaches the runner. A returned `Err(TestError { ... })` is treated as "property failed for this input": the shrinker minimizes the generated input exactly as it does for an assertion failure, and the failure block prints the rendered error beneath the same `shrunk input:` line (see §8.10 Runner Output). This elaboration applies in both `blink check` and `blink test`.
+Each `?` site inside an elaborated property closure renders via `Display[E]` and stamps `TestError.error_type` with the static name of `E` **at that site** — distinct `?` sites in one property may produce distinct `error_type` values (something a single declared error type could not express, since `?` performs no implicit conversion, §3c.2 Rule 4). `?` on an `Option[T]` operand is covered by the same elaboration: the `None` arm yields `TestError { message: "None", error_type: "Option", origin: <span> }`, identical to the test-body lowering. The runner ABI is unchanged — every property iteration returns `Result[(), TestError]`, so the elaborated property closure and an assertion-only one share one monomorphic shape; the closure's `E` never reaches the runner. A returned `Err(TestError { ... })` is treated as "property failed for this input": the shrinker minimizes the generated input exactly as it does for an assertion failure, and the failure block prints the rendered error beneath the same `shrunk input:` line (see §8.10 Runner Output). This elaboration applies in both `blink check` and `blink test`.
 
 **Composition with `with`, `skip()`, panics, assertions.** `?` propagating an `Err` is one of the **catchable unwinds** of §4.6.3 — it runs `BlockHandler.exit(false)` and `Closeable.close()` on the way out, identical to assertion failure and `skip()`. Doc-tests are compiled as ordinary tests and obey the same rule.
 
-**Validation symmetry.** `blink check` and `blink test` apply the same elaboration rule — `?` is valid in a test body iff the body would type-check after the implicit `Result[Void, TestError]` elaboration. The two pipelines never disagree.
+**Validation symmetry.** `blink check` and `blink test` apply the same elaboration rule — `?` is valid in a test body iff the body would type-check after the implicit `Result[(), TestError]` elaboration. The two pipelines never disagree.
 
 **Failure rendering.** A test that returns `Err(TestError { ... })` produces NDJSON `status: "failed"` with a new `cause` discriminator field (see §8.10 Runner Output). The `cause` enum is closed: `"assertion" | "propagated_error"`. Power-assert introspection is not applied to `?`-propagated errors (there is no source `assert(...)` to decompose); the `TestError.message` field provides the rendered context.
 
@@ -1659,7 +1659,7 @@ Doc-tests verify that documentation stays in sync with implementation. They are 
 - `test` is a keyword — first-class syntax, not a macro or library
 - Test names are static `Str` literals (no interpolation)
 - Pure by default — no implicit effects. Use `with` handlers for effectful tests
-- `?` operator is valid inside a test body — the body is implicitly elaborated to `Result[Void, TestError]`. `TestError` is sealed; `Display[E]` is required at each `?` site. No annotation form (`test "name" -> Result[...] { }`) exists or will be added
+- `?` operator is valid inside a test body — the body is implicitly elaborated to `Result[(), TestError]`. `TestError` is sealed; `Display[E]` is required at each `?` site. No annotation form (`test "name" -> Result[...] { }`) exists or will be added
 - Four built-in assertions: `assert`, `assert_eq`, `assert_ne`, `assert_matches`
 - All assertions accept an optional trailing `Str` message for context
 - `assert_matches` takes a pattern (not an expression) as its second argument

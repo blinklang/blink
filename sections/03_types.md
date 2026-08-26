@@ -646,12 +646,12 @@ C representation: `typedef struct { uint8_t* data; int64_t len; int64_t cap; } b
 | `read_u32_le` / `read_u32_be` | `fn(self, Int) -> Result[Int, Str]` | Decode 4-byte little/big-endian unsigned at offset |
 | `read_i32_le` / `read_i32_be` | `fn(self, Int) -> Result[Int, Str]` | Decode 4-byte little/big-endian signed at offset |
 | `read_i64_le` / `read_i64_be` | `fn(self, Int) -> Result[Int, Str]` | Decode 8-byte little/big-endian signed at offset |
-| `set_i16_le` / `set_i16_be` | `fn(self, Int, Int) -> Result[Void, Str]` | Write 2-byte signed at offset (in-place, bounds vs `len`) |
-| `set_u16_le` / `set_u16_be` | `fn(self, Int, Int) -> Result[Void, Str]` | Write 2-byte unsigned at offset (in-place, bounds vs `len`) |
-| `set_i32_le` / `set_i32_be` | `fn(self, Int, Int) -> Result[Void, Str]` | Write 4-byte signed at offset (in-place, bounds vs `len`) |
-| `set_u32_le` / `set_u32_be` | `fn(self, Int, Int) -> Result[Void, Str]` | Write 4-byte unsigned at offset (in-place, bounds vs `len`) |
-| `set_i64_le` / `set_i64_be` | `fn(self, Int, Int) -> Result[Void, Str]` | Write 8-byte signed at offset (in-place, bounds vs `len`) |
-| `set_u64_le` / `set_u64_be` | `fn(self, Int, Int) -> Result[Void, Str]` | Write 8-byte unsigned at offset (in-place, bounds vs `len`) |
+| `set_i16_le` / `set_i16_be` | `fn(self, Int, Int) -> Result[(), Str]` | Write 2-byte signed at offset (in-place, bounds vs `len`) |
+| `set_u16_le` / `set_u16_be` | `fn(self, Int, Int) -> Result[(), Str]` | Write 2-byte unsigned at offset (in-place, bounds vs `len`) |
+| `set_i32_le` / `set_i32_be` | `fn(self, Int, Int) -> Result[(), Str]` | Write 4-byte signed at offset (in-place, bounds vs `len`) |
+| `set_u32_le` / `set_u32_be` | `fn(self, Int, Int) -> Result[(), Str]` | Write 4-byte unsigned at offset (in-place, bounds vs `len`) |
+| `set_i64_le` / `set_i64_be` | `fn(self, Int, Int) -> Result[(), Str]` | Write 8-byte signed at offset (in-place, bounds vs `len`) |
+| `set_u64_le` / `set_u64_be` | `fn(self, Int, Int) -> Result[(), Str]` | Write 8-byte unsigned at offset (in-place, bounds vs `len`) |
 | `with_ptr` | `fn[R](self, fn(Ptr[U8]) -> R ! FFI) -> R ! FFI` | Closure-scoped FFI pin (see §9.1.3) |
 
 The `set_*_le/be(off, v)` family is the symmetric counterpart of the existing `read_*_le/be(off)` family: it writes at a given offset, requires `off + width <= len` (returns `Err` otherwise — does not grow), and complements the append-only `write_*_le/be(v)` constructors. `set_*` and `write_*` are deliberately distinct verbs: `set` writes in-place at a known offset, `write` appends. (Panel decision: [`ffi-struct-construction`](../decisions/ffi-struct-construction.md), Q-α-bytes-offset-API.)
@@ -3242,7 +3242,7 @@ fn zip[T, U](a: Iterator[T], b: Iterator[U]) -> Iterator[(T, U)] {
 
 #### Unit Type
 
-The unit type `()` is the 0-tuple — a type with exactly one value, carrying no information. It is the implicit return type of functions and blocks that produce no value.
+The unit type `()` is the 0-tuple — the type with exactly one value, carrying no information. It is the canonical "no meaningful value" type: the implicit return type of functions and blocks that produce no value, and the success payload of a fallible operation that returns nothing (`Result[(), E]`). `()` is an ordinary inhabited, encodable type — it has a value and a representation, so it can be returned, stored in a field, and used as a generic argument.
 
 ```blink
 fn log(msg: Str) ! IO {
@@ -3250,6 +3250,8 @@ fn log(msg: Str) ! IO {
 }
 // return type is (), omitted by convention
 ```
+
+`()` is **not** `Void`. `Void` (§9.1.1) is the FFI-only marker for C's incomplete `void` pointee type; it has no value representation and is well-formed only as the argument of `Ptr[_]` (`Ptr[Void]` = `void*`). Wherever a value, parameter, or return type carries "no information," write `()`, never `Void` — using `Void` outside `Ptr` is a compile error (E0828).
 
 #### No 1-Tuples
 
