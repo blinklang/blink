@@ -45,7 +45,7 @@ import compiler.{
     set_strict_struct_layout,
 }
 import codegen.{Codegen, generate, generate_archive_header, generate_module_header, generate_module_object, enumerate_program_modules, cg_debug_mode, cg_trace_codegen, cg_deterministic}
-import codegen_types.{cg_emit_only_module, cg_skip_modules, cg_user_tu_mode, cg_blink_ev_extern_only, list_contains_str}
+import codegen_types.{cg_emit_only_module, cg_skip_modules, cg_user_tu_mode, cg_blink_ev_extern_only, list_contains_str, strip_module_qualifier}
 import build_stdlib.{build_stdlib_archive, list_stdlib_module_keys, resolve_blinkc_path, resolve_runtime_h}
 import stdlib_native_deps.{
     stdlib_native_dep_names, stdlib_native_dep_gate_macro, stdlib_native_dep_source_paths,
@@ -1391,6 +1391,21 @@ fn collect_opaque_type_names(program: Int) -> Map[Str, Int] {
     set
 }
 
+// The module-qualifier-stripped inner type name of a `Ptr[T]` param node,
+// or "" when the node carries no `Ptr` inner element. Used to detect a
+// `Ptr[opaque]` out-cell against the (bare-keyed) opaque set.
+fn opaque_ptr_inner(p: Int) -> Str {
+    let pta = node_type_ann(p)
+    if pta == -1 {
+        return ""
+    }
+    let pelems_sl = node_elements(pta)
+    if pelems_sl == -1 || sublist_length(pelems_sl) == 0 {
+        return ""
+    }
+    strip_module_qualifier(node_name(sublist_get(pelems_sl, 0)))
+}
+
 fn ffi_extract_trusted_info(fn_node: Int) -> Str {
     let ann = get_annotation(fn_node, "trusted")
     if ann == -1 {
@@ -1712,7 +1727,10 @@ fn do_ffi_audit(program: Int, json_output: Int) {
                 ptr_ret_count = ptr_ret_count + 1
             }
 
-            let oret = node_return_type(fn_node)
+            // Opaque lookups strip the module qualifier to match typecheck
+            // (ffi_opaque_type_set is keyed on the bare declared name; a
+            // cross-module reference arrives qualified as `mod.Handle`).
+            let oret = strip_module_qualifier(node_return_type(fn_node))
             if opaque_set.contains_key(oret) != 0 {
                 oc_fns.push(fn_name)
                 oc_lines.push(fn_line)
@@ -1726,7 +1744,7 @@ fn do_ffi_audit(program: Int, json_output: Int) {
                 let mut pj = 0
                 while pj < sublist_length(oparams_sl) {
                     let pp = sublist_get(oparams_sl, pj)
-                    let pt = node_type_name(pp)
+                    let pt = strip_module_qualifier(node_type_name(pp))
                     if opaque_set.contains_key(pt) != 0 {
                         oc_fns.push(fn_name)
                         oc_lines.push(fn_line)
@@ -1734,6 +1752,20 @@ fn do_ffi_audit(program: Int, json_output: Int) {
                         oc_params.push(node_name(pp))
                         oc_handles.push(pt)
                         oc_dirs.push("consume")
+                    } else if pt == "Ptr" {
+                        // A Ptr[opaque] out-cell (`sqlite3**`) mints a handle at
+                        // the boundary — read back via out.deref() — so it is a
+                        // PRODUCE crossing carrying the out-cell param name
+                        // (sections/07_trust_modules_metadata.md:904, :916).
+                        let inner = opaque_ptr_inner(pp)
+                        if inner != "" && opaque_set.contains_key(inner) != 0 {
+                            oc_fns.push(fn_name)
+                            oc_lines.push(fn_line)
+                            oc_files.push(fn_file)
+                            oc_params.push(node_name(pp))
+                            oc_handles.push(inner)
+                            oc_dirs.push("produce")
+                        }
                     }
                     pj = pj + 1
                 }

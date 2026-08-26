@@ -1,0 +1,80 @@
+import compile_test_helpers
+
+// Parts 1 + 3 — widen the `opaque-ffi-handle` blink audit beyond the
+// bare-slot MVP. sections/07_trust_modules_metadata.md:927 requires
+// EVERY boundary crossing that produces or consumes an @ffi.opaque handle to be
+// tagged, and :904/:916 name a second produce mechanism the MVP missed: a
+// `Ptr[opaque]` out-cell (`sqlite3**`) whose handle is minted at the boundary.
+//
+// Part 1 — a `Ptr[opaque]` parameter is a PRODUCE crossing. Direction convention:
+// the out-cell is where C mints the handle (read back via out.deref() at the
+// boundary, :916/:920), so it produces a handle into Blink. It is a named param,
+// so the crossing carries the param name AND direction "produce" — distinct from
+// a bare-opaque param (consume) and from a return-produce (no param).
+//
+// Part 3 — a module-qualified opaque reference must still match. The audit keyed
+// on the raw declared name while typecheck strips the module qualifier
+// (strip_module_qualifier, sections/07 & typecheck.bl), so `handle.Sqlite3` in a
+// merged multi-module program missed its crossing. The lookup now strips the
+// qualifier, matching typecheck, and records the bare handle name.
+
+fn out_cell_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\ntype Sqlite3\n"
+        .concat("@ffi(\"sqlite3\", \"sqlite3_open\")\n@trusted(audit: \"rev1\")\nfn raw_open(path: Ptr[U8], out: Ptr[Sqlite3]) -> Int ! FFI \{ \}\n")
+        .concat("fn main() \{ }\n")
+}
+
+test "a Ptr[opaque] out-cell param is a produce crossing" {
+    let out = compile_test_helpers.audit_ffi_via_cli(out_cell_src(), "khf7zs_outcell", 1)
+    assert(out.contains("\"fn\":\"raw_open\",\"param\":\"out\",\"handle\":\"Sqlite3\",\"direction\":\"produce\""))
+    assert(out.contains("\"opaque_handle\":1"))
+}
+
+// The Ptr[U8] param in the same signature must NOT be conflated with a handle —
+// only the Ptr[opaque] out-cell crosses.
+test "a Ptr over a non-opaque inner is not an opaque crossing" {
+    let out = compile_test_helpers.audit_ffi_via_cli(out_cell_src(), "khf7zs_notopaque", 1)
+    assert(!out.contains("\"handle\":\"U8\""))
+}
+
+// The human-readable report also surfaces the out-cell produce.
+test "the human-readable report lists a Ptr[opaque] out-cell produce" {
+    let out = compile_test_helpers.audit_ffi_via_cli(out_cell_src(), "khf7zs_outcell_human", 0)
+    assert(out.contains("produce"))
+    assert(out.contains("raw_open"))
+    assert(out.contains("Sqlite3"))
+}
+
+// Part 3 — a qualified opaque reference in an imported module resolves to a
+// crossing. The helper module declares the handle; main.bl consumes it via the
+// module-qualified name `handle.Sqlite3`.
+fn qualified_entry_src() -> Str {
+    "import db.handle\n"
+        .concat("@ffi(\"sqlite3\", \"sqlite3_close\")\n@trusted(audit: \"rev1\")\nfn c_close(db: handle.Sqlite3) -> Int ! FFI \{ \}\n")
+        .concat("fn main() \{ }\n")
+}
+
+fn qualified_helper_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\npub type Sqlite3\n"
+}
+
+test "a module-qualified opaque param is a consume crossing" {
+    let out = compile_test_helpers.audit_ffi_xmod(qualified_entry_src(), "db", "handle", qualified_helper_src(), "khf7zs_qual", 1)
+    assert(out.contains("\"fn\":\"c_close\",\"param\":\"db\",\"handle\":\"Sqlite3\",\"direction\":\"consume\""))
+    assert(out.contains("\"opaque_handle\":1"))
+}
+
+// Part 1 x Part 3 — a Ptr out-cell whose inner is module-qualified. The out-cell
+// unwrap must strip the qualifier before the opaque-set check, so a cross-module
+// `Ptr[handle.Sqlite3]` still resolves to a produce crossing of the bare handle.
+fn qualified_outcell_entry_src() -> Str {
+    "import db.handle\n"
+        .concat("@ffi(\"sqlite3\", \"sqlite3_open\")\n@trusted(audit: \"rev1\")\nfn c_open(path: Ptr[U8], out: Ptr[handle.Sqlite3]) -> Int ! FFI \{ \}\n")
+        .concat("fn main() \{ }\n")
+}
+
+test "a module-qualified Ptr[opaque] out-cell is a produce crossing" {
+    let out = compile_test_helpers.audit_ffi_xmod(qualified_outcell_entry_src(), "db", "handle", qualified_helper_src(), "khf7zs_qual_outcell", 1)
+    assert(out.contains("\"fn\":\"c_open\",\"param\":\"out\",\"handle\":\"Sqlite3\",\"direction\":\"produce\""))
+    assert(out.contains("\"opaque_handle\":1"))
+}
