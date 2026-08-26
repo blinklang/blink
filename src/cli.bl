@@ -1644,6 +1644,19 @@ fn collect_byte_pin_sites(node: Int, file: Str, out_lines: List[Int], out_files:
     }
 }
 
+// One opaque-ffi-handle boundary crossing: an @ffi signature slot that produces
+// (opaque return / Ptr out-cell) or consumes (opaque param) a handle. Held as a
+// record so the accumulate and both emit loops share one field order instead of
+// six index-locked parallel lists.
+type OpaqueCrossing {
+    fname: Str
+    line: Int
+    file: Str
+    param: Str
+    handle: Str
+    direction: Str
+}
+
 fn do_ffi_audit(program: Int, json_output: Int) {
     let fns_sl = node_params(program)
     if fns_sl == -1 {
@@ -1671,12 +1684,7 @@ fn do_ffi_audit(program: Int, json_output: Int) {
     // opaque-ffi-handle crossings (spec §9.1.4): one entry per @ffi signature slot
     // that produces (opaque return) or consumes (opaque param) a handle.
     let opaque_set = collect_opaque_type_names(program)
-    let mut oc_fns: List[Str] = []
-    let mut oc_lines: List[Int] = []
-    let mut oc_files: List[Str] = []
-    let mut oc_params: List[Str] = []
-    let mut oc_handles: List[Str] = []
-    let mut oc_dirs: List[Str] = []
+    let mut oc: List[OpaqueCrossing] = []
 
     // @ffi DISCOVERY is intentionally top-level-only: validate_ffi_fn (typecheck)
     // and codegen lower @ffi over top-level fns alone — no path lowers @ffi on an
@@ -1734,12 +1742,14 @@ fn do_ffi_audit(program: Int, json_output: Int) {
             // cross-module reference arrives qualified as `mod.Handle`).
             let oret = strip_module_qualifier(node_return_type(fn_node))
             if opaque_set.contains_key(oret) != 0 {
-                oc_fns.push(fn_name)
-                oc_lines.push(fn_line)
-                oc_files.push(fn_file)
-                oc_params.push("")
-                oc_handles.push(oret)
-                oc_dirs.push("produce")
+                oc.push(OpaqueCrossing {
+                    fname: fn_name,
+                    line: fn_line,
+                    file: fn_file,
+                    param: "",
+                    handle: oret,
+                    direction: "produce"
+                })
             } else if oret == "Option" {
                 // Option[opaque] return: an @ffi return is a produce mechanism and
                 // a nullable handle is the sole absence channel
@@ -1747,12 +1757,14 @@ fn do_ffi_audit(program: Int, json_output: Int) {
                 // direction as a bare opaque return.
                 let rinner = opaque_wrapper_inner(fn_node)
                 if rinner != "" && opaque_set.contains_key(rinner) != 0 {
-                    oc_fns.push(fn_name)
-                    oc_lines.push(fn_line)
-                    oc_files.push(fn_file)
-                    oc_params.push("")
-                    oc_handles.push(rinner)
-                    oc_dirs.push("produce")
+                    oc.push(OpaqueCrossing {
+                        fname: fn_name,
+                        line: fn_line,
+                        file: fn_file,
+                        param: "",
+                        handle: rinner,
+                        direction: "produce"
+                    })
                 }
             }
             let oparams_sl = node_params(fn_node)
@@ -1762,12 +1774,14 @@ fn do_ffi_audit(program: Int, json_output: Int) {
                     let pp = sublist_get(oparams_sl, pj)
                     let pt = strip_module_qualifier(node_type_name(pp))
                     if opaque_set.contains_key(pt) != 0 {
-                        oc_fns.push(fn_name)
-                        oc_lines.push(fn_line)
-                        oc_files.push(fn_file)
-                        oc_params.push(node_name(pp))
-                        oc_handles.push(pt)
-                        oc_dirs.push("consume")
+                        oc.push(OpaqueCrossing {
+                            fname: fn_name,
+                            line: fn_line,
+                            file: fn_file,
+                            param: node_name(pp),
+                            handle: pt,
+                            direction: "consume"
+                        })
                     } else if pt == "Ptr" {
                         // A Ptr[opaque] out-cell (`sqlite3**`) mints a handle at
                         // the boundary — read back via out.deref() — so it is a
@@ -1775,12 +1789,14 @@ fn do_ffi_audit(program: Int, json_output: Int) {
                         // (sections/07_trust_modules_metadata.md:904, :916).
                         let inner = opaque_wrapper_inner(pp)
                         if inner != "" && opaque_set.contains_key(inner) != 0 {
-                            oc_fns.push(fn_name)
-                            oc_lines.push(fn_line)
-                            oc_files.push(fn_file)
-                            oc_params.push(node_name(pp))
-                            oc_handles.push(inner)
-                            oc_dirs.push("produce")
+                            oc.push(OpaqueCrossing {
+                                fname: fn_name,
+                                line: fn_line,
+                                file: fn_file,
+                                param: node_name(pp),
+                                handle: inner,
+                                direction: "produce"
+                            })
                         }
                     } else if pt == "Option" {
                         // Option[opaque] param: a nullable handle handed to C
@@ -1788,12 +1804,14 @@ fn do_ffi_audit(program: Int, json_output: Int) {
                         // same direction as a bare opaque param, carrying the name.
                         let oinner = opaque_wrapper_inner(pp)
                         if oinner != "" && opaque_set.contains_key(oinner) != 0 {
-                            oc_fns.push(fn_name)
-                            oc_lines.push(fn_line)
-                            oc_files.push(fn_file)
-                            oc_params.push(node_name(pp))
-                            oc_handles.push(oinner)
-                            oc_dirs.push("consume")
+                            oc.push(OpaqueCrossing {
+                                fname: fn_name,
+                                line: fn_line,
+                                file: fn_file,
+                                param: node_name(pp),
+                                handle: oinner,
+                                direction: "consume"
+                            })
                         }
                     }
                     pj = pj + 1
@@ -1920,24 +1938,19 @@ fn do_ffi_audit(program: Int, json_output: Int) {
         }
         out = out.concat("]},\"opaque_ffi_handle\":\{\"crossing\":[")
         let mut ocj = 0
-        while ocj < oc_fns.len() {
+        while ocj < oc.len() {
             if ocj > 0 {
                 out = out.concat(",")
             }
-            let ocfile = oc_files.get(ocj).unwrap()
-            let ocline = oc_lines.get(ocj).unwrap()
-            let ocfn = oc_fns.get(ocj).unwrap()
-            let ochandle = oc_handles.get(ocj).unwrap()
-            let ocdir = oc_dirs.get(ocj).unwrap()
-            let ocparam = oc_params.get(ocj).unwrap()
-            out = out.concat("\{\"file\":\"{ocfile}\",\"line\":{ocline},\"fn\":\"{ocfn}\"")
-            if ocparam != "" {
-                out = out.concat(",\"param\":\"{ocparam}\"")
+            let occ = oc.get(ocj).unwrap()
+            out = out.concat("\{\"file\":\"{occ.file}\",\"line\":{occ.line},\"fn\":\"{occ.fname}\"")
+            if occ.param != "" {
+                out = out.concat(",\"param\":\"{occ.param}\"")
             }
-            out = out.concat(",\"handle\":\"{ochandle}\",\"direction\":\"{ocdir}\"}")
+            out = out.concat(",\"handle\":\"{occ.handle}\",\"direction\":\"{occ.direction}\"}")
             ocj = ocj + 1
         }
-        out = out.concat("]},\"summary\":\{\"total\":{total},\"audited\":{audited},\"unaudited\":{unaudited},\"ptr_params\":{ptr_param_count},\"ptr_returns\":{ptr_ret_count},\"byte_pin\":{byte_pin_lines.len()},\"opaque_handle\":{oc_fns.len()}}}")
+        out = out.concat("]},\"summary\":\{\"total\":{total},\"audited\":{audited},\"unaudited\":{unaudited},\"ptr_params\":{ptr_param_count},\"ptr_returns\":{ptr_ret_count},\"byte_pin\":{byte_pin_lines.len()},\"opaque_handle\":{oc.len()}}}")
         io.println(out)
     } else {
         if total == 0 {
@@ -1990,20 +2003,15 @@ fn do_ffi_audit(program: Int, json_output: Int) {
                 bph = bph + 1
             }
         }
-        if oc_fns.len() > 0 {
+        if oc.len() > 0 {
             io.println("")
             io.println("opaque-ffi-handle")
             io.println("=================")
             let mut och = 0
-            while och < oc_fns.len() {
-                let ocfile = oc_files.get(och).unwrap()
-                let ocline = oc_lines.get(och).unwrap()
-                let ocfn = oc_fns.get(och).unwrap()
-                let ochandle = oc_handles.get(och).unwrap()
-                let ocdir = oc_dirs.get(och).unwrap()
-                let ocparam = oc_params.get(och).unwrap()
-                let slot = if ocparam != "" { "param {ocparam}" } else { "return" }
-                io.println("  {ocdir}: {ocfn} ({slot}: {ochandle})  {ocfile}:{ocline}")
+            while och < oc.len() {
+                let occ = oc.get(och).unwrap()
+                let slot = if occ.param != "" { "param {occ.param}" } else { "return" }
+                io.println("  {occ.direction}: {occ.fname} ({slot}: {occ.handle})  {occ.file}:{occ.line}")
                 och = och + 1
             }
         }
