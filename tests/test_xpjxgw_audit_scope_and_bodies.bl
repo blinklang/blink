@@ -1,0 +1,86 @@
+import compile_test_helpers
+
+// The opaque-mint audit threads one binder env (name -> opaque pointee) through
+// the whole descent. Without lexical scoping the env leaks across sibling blocks:
+// a name bound to an opaque pointee in an `if` then-branch stays visible in the
+// else-branch, so a same-named non-opaque Ptr deref there is mis-tagged as a
+// mint. The env must be block-scoped so a then-branch binding never reaches the
+// else-branch. sections/07_trust_modules_metadata.md:211 fixes the mint region;
+// the binder env is an implementation detail that must not over-report.
+fn env_leak_src() -> Str {
+    #"@ffi.opaque(header: "sqlite3.h", name: "sqlite3")
+type Sqlite3
+
+@trusted(audit: "rev1")
+fn pick(flag: Bool) -> Int {
+    if flag {
+        let p = alloc_ptr[Sqlite3]()
+        0
+    } else {
+        let p = alloc_ptr[U8]()
+        let _ = p.deref()
+        0
+    }
+}
+
+fn main() { }
+"#
+}
+
+test "opaque-mint binder env does not leak from an if then-branch into the else" {
+    let out = compile_test_helpers.audit_ffi_via_cli(env_leak_src(), "xpjxgw_envleak", 1)
+    // The else-branch p is a Ptr[U8], not an opaque handle; its deref must not be
+    // tagged. Before block-scoping, the then-branch binding p->Sqlite3 leaked in
+    // and the else deref counted as a spurious mint (opaque_handle:1).
+    assert(out.contains("\"opaque_handle\":0"))
+}
+
+// A `with_ptr` byte-pin is region-independent and must be found wherever it sits
+// lexically, including inside a handler method body. The handler literal is a
+// nested body the unified walker did not descend, so a pin there was dropped.
+fn handler_body_pin_src() -> Str {
+    #"@ffi("c", "do_io")
+fn c_io(p: Ptr[U8], n: U64) -> I64
+
+fn run(data: Bytes) {
+    let _h = handler IO {
+        fn print(msg: Str) {
+            let _ = data.with_ptr(fn(p) -> Int { let _ = c_io(p, data.len().to_u64())
+                0 })
+        }
+    }
+}
+
+fn main() { }
+"#
+}
+
+test "audit --ffi descends a handler method body to find a with_ptr byte-pin" {
+    let out = compile_test_helpers.audit_ffi_via_cli(handler_body_pin_src(), "xpjxgw_handlerpin", 1)
+    assert(out.contains("byte-pin"))
+    assert(out.contains("\"byte_pin\":1"))
+}
+
+// A `channel.new[T](arg)` constructor is a ChannelNew node, not a Call; the
+// walker had no ChannelNew arm, so an expression in the buffer argument was
+// never descended and a byte-pin there was dropped. (A bare `Channel(arg)` is an
+// ordinary Call and was already covered.)
+fn channel_new_arg_pin_src() -> Str {
+    #"@ffi("c", "do_io")
+fn c_io(p: Ptr[U8], n: U64) -> I64
+
+fn run(data: Bytes) -> Int {
+    let ch = channel.new[Int](data.with_ptr(fn(p) -> Int { let _ = c_io(p, data.len().to_u64())
+        8 }))
+    0
+}
+
+fn main() { }
+"#
+}
+
+test "audit --ffi descends a channel.new argument to find a with_ptr byte-pin" {
+    let out = compile_test_helpers.audit_ffi_via_cli(channel_new_arg_pin_src(), "xpjxgw_channelpin", 1)
+    assert(out.contains("byte-pin"))
+    assert(out.contains("\"byte_pin\":1"))
+}

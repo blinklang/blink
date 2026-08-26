@@ -1542,6 +1542,20 @@ fn ptr_opaque_pointee(expr: Int, ptr_env: Map[Str, Str], opaque_set: Map[Str, In
     ""
 }
 
+// A shallow copy of a binder env, so a nested lexical scope can grow its own
+// bindings without leaking them back to the parent or across sibling blocks.
+fn copy_str_env(src: Map[Str, Str]) -> Map[Str, Str] {
+    let mut out: Map[Str, Str] = Map()
+    let ks = src.keys()
+    let mut i = 0
+    while i < ks.len() {
+        let k = ks.get(i).unwrap()
+        out.insert(k, src.get(k).unwrap())
+        i = i + 1
+    }
+    out
+}
+
 // Seed each Ptr[opaque] param name into the binder env. Shared by the fn-level
 // scan and the closure arm, which both bring params into scope for the body.
 fn seed_ptr_opaque_params(params_sl: Int, ptr_env: Map[Str, Str], opaque_set: Map[Str, Int]) {
@@ -1580,9 +1594,9 @@ fn scan_fn_ffi_audit(fn_node: Int, w: FfiAuditSink) {
 // each mint), and `ptr_env` (binder name -> opaque pointee, grown from params and
 // pointer-producing lets); the byte-pin side ignores all three. A closure literal
 // inherits the region (R-PROP-CLOSURE) after its own Ptr[opaque] params are
-// seeded. The decision-text rule R-NO-PROP-FNITEM (a named nested `fn` does not
-// inherit) has no witness: parse_stmt has no Fn arm, so a named nested fn is not
-// a body statement — the closure is the only nested-fn form. A plain Call routes
+// seeded. A handler method is the witness for R-NO-PROP-FNITEM (a named nested
+// `fn` does not inherit): its body is walked with region 0 and a fresh env. Each
+// block copies the binder env so a binding never leaks to a sibling. A plain Call routes
 // through node_left (the callee); node_obj is the MethodCall receiver, not a
 // Call's callee, so descending it would miss a call sitting in callee position.
 fn walk_ffi_audit(node: Int, file: Str, in_region: Int, fn_name: Str, ptr_env: Map[Str, Str], w: FfiAuditSink) {
@@ -1637,11 +1651,15 @@ fn walk_ffi_audit(node: Int, file: Str, in_region: Int, fn_name: Str, ptr_env: M
     }
 
     if kind == NodeKind.Block {
+        // A block is a lexical scope: bindings made here are visible to later
+        // statements in the same block but must not escape to a sibling block
+        // (an if then-branch must not leak a binding into the else-branch).
+        let benv = copy_str_env(ptr_env)
         let stmts_sl = node_stmts(node)
         if stmts_sl != -1 {
             let mut i = 0
             while i < sublist_length(stmts_sl) {
-                walk_ffi_audit(sublist_get(stmts_sl, i), file, in_region, fn_name, ptr_env, w)
+                walk_ffi_audit(sublist_get(stmts_sl, i), file, in_region, fn_name, benv, w)
                 i = i + 1
             }
         }
@@ -1805,8 +1823,43 @@ fn walk_ffi_audit(node: Int, file: Str, in_region: Int, fn_name: Str, ptr_env: M
     }
 
     if kind == NodeKind.Closure {
-        seed_ptr_opaque_params(node_params(node), ptr_env, w.opaque_set)
-        walk_ffi_audit(node_body(node), file, in_region, fn_name, ptr_env, w)
+        let cenv = copy_str_env(ptr_env)
+        seed_ptr_opaque_params(node_params(node), cenv, w.opaque_set)
+        walk_ffi_audit(node_body(node), file, in_region, fn_name, cenv, w)
+        return
+    }
+
+    if kind == NodeKind.HandlerExpr {
+        // A handler method is a named `fn` item, so by R-NO-PROP-FNITEM it does
+        // NOT inherit the enclosing FFI region: its body is walked with region 0
+        // and a fresh env seeded only from its own params. Byte-pins are still
+        // found (they are region-independent); a mint is tagged only if the
+        // method body opens its own region.
+        let methods_sl = node_methods(node)
+        if methods_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(methods_sl) {
+                let mth = sublist_get(methods_sl, i)
+                let mut menv: Map[Str, Str] = Map()
+                seed_ptr_opaque_params(node_params(mth), menv, w.opaque_set)
+                walk_ffi_audit(node_body(mth), file, 0, node_name(mth), menv, w)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.ChannelNew {
+        // `channel.new[T](arg)` is its own node, not a Call; its argument is an
+        // ordinary sub-expression evaluated in the enclosing region.
+        let args_sl = node_args(node)
+        if args_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(args_sl) {
+                walk_ffi_audit(sublist_get(args_sl, i), file, in_region, fn_name, ptr_env, w)
+                i = i + 1
+            }
+        }
         return
     }
 }
