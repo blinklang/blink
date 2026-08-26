@@ -52,7 +52,7 @@ BLINK_RT_FN int blink_sqlite3_query_cb(void* ud, int ncols, char** values, char*
     return 0;
 }
 
-BLINK_RT_FN void* blink_sqlite3_query(sqlite3* db, const char* sql) {
+BLINK_RT_FN blink_sqlite3_result* blink_sqlite3_query(sqlite3* db, const char* sql) {
     blink_sqlite3_result* res = (blink_sqlite3_result*)blink_alloc(sizeof(blink_sqlite3_result));
     res->rows = blink_list_new();
     res->columns = blink_list_new();
@@ -143,8 +143,7 @@ BLINK_RT_FN int64_t blink_sqlite3_rollback(sqlite3* db) {
     return (int64_t)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
 }
 
-BLINK_RT_FN int64_t blink_sqlite3_result_rc(blink_handle* r) {
-    blink_sqlite3_result* res = (blink_sqlite3_result*)r;
+BLINK_RT_FN int64_t blink_sqlite3_result_rc(blink_sqlite3_result* res) {
     return res->rc;
 }
 
@@ -161,32 +160,28 @@ BLINK_RT_FN int64_t blink_sqlite3_execute(sqlite3* db, const char* sql) {
     return (int64_t)sqlite3_last_insert_rowid(db);
 }
 
-BLINK_RT_FN int64_t blink_sqlite3_result_num_rows(void* r) {
-    blink_sqlite3_result* res = (blink_sqlite3_result*)r;
+BLINK_RT_FN int64_t blink_sqlite3_result_num_rows(blink_sqlite3_result* res) {
     return res->num_rows;
 }
 
-BLINK_RT_FN int64_t blink_sqlite3_result_num_cols(void* r) {
-    blink_sqlite3_result* res = (blink_sqlite3_result*)r;
+BLINK_RT_FN int64_t blink_sqlite3_result_num_cols(blink_sqlite3_result* res) {
     return res->num_cols;
 }
 
-BLINK_RT_FN const char* blink_sqlite3_result_column_name(void* r, int64_t idx) {
-    blink_sqlite3_result* res = (blink_sqlite3_result*)r;
+BLINK_RT_FN const char* blink_sqlite3_result_column_name(blink_sqlite3_result* res, int64_t idx) {
     if (idx < 0 || idx >= res->num_cols) return "";
     return (const char*)blink_list_get(res->columns, idx);
 }
 
-BLINK_RT_FN const char* blink_sqlite3_result_cell(void* r, int64_t row, int64_t col) {
-    blink_sqlite3_result* res = (blink_sqlite3_result*)r;
+BLINK_RT_FN const char* blink_sqlite3_result_cell(blink_sqlite3_result* res, int64_t row, int64_t col) {
     if (row < 0 || row >= res->num_rows) return "";
     blink_list* row_data = (blink_list*)blink_list_get(res->rows, row);
     if (col < 0 || col >= blink_list_len(row_data)) return "";
     return (const char*)blink_list_get(row_data, col);
 }
 
-BLINK_RT_FN void blink_sqlite3_result_free(void* r) {
-    (void)r; /* GC-managed — blink_alloc uses GC_MALLOC, no manual free needed */
+BLINK_RT_FN void blink_sqlite3_result_free(blink_sqlite3_result* res) {
+    (void)res; /* GC-managed — blink_alloc uses GC_MALLOC, no manual free needed */
 }
 
 #endif /* BLINK_USE_SQLITE */
