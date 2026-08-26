@@ -1,0 +1,83 @@
+import compile_test_helpers
+
+// br rs3aph — the `opaque-ffi-handle` blink audit category.
+// sections/07_trust_modules_metadata.md:927 requires every boundary crossing that
+// PRODUCES or CONSUMES an @ffi.opaque handle to be tagged with the `blink audit`
+// category `opaque-ffi-handle`, so the FFI inventory lists them alongside pointer
+// allocations and Raw() sites. §9.1.4 (:941) names this the ONLY new artifact of
+// the opaque-handle feature — no new error codes.
+//
+// A boundary crossing is an @ffi/@trusted function signature: an opaque-typed
+// return PRODUCES a handle (the C side mints it), an opaque-typed parameter
+// CONSUMES one (the C side takes it back). Ordinary Blink flow of a handle
+// (struct fields, non-FFI wrapper fns) is interior movement, not a crossing, and
+// is not listed. The audit walks top-level @ffi fn signatures only, mirroring the
+// existing bytes-bridge category.
+//
+// The JSON shape mirrors bytes_bridge: a top-level `opaque_ffi_handle` object
+// with a `crossing` list, plus an `opaque_handle` count in the summary. Each
+// crossing carries fn/handle/direction (and param for a consume) so assertions
+// pin a specific crossing rather than a bare line number (the audit dumps the
+// whole prelude, so a bare line substring is not collision-proof).
+
+fn produce_src() -> Str {
+    "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("@ffi(\"c\", \"tmpfile\")\n@trusted(audit: \"rev1\")\nfn c_tmpfile() -> CFile ! FFI \{ \}\n")
+        .concat("fn main() \{ }\n")
+}
+
+test "an @ffi fn returning an opaque handle is a produce crossing" {
+    let out = compile_test_helpers.audit_ffi_via_cli(produce_src(), "rs3aph_produce", 1)
+    assert(out.contains("\"fn\":\"c_tmpfile\",\"handle\":\"CFile\",\"direction\":\"produce\""))
+    assert(out.contains("\"opaque_handle\":1"))
+}
+
+fn consume_src() -> Str {
+    "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+        .concat("@ffi(\"c\", \"fclose\")\n@trusted(audit: \"rev1\")\nfn c_fclose(f: CFile) -> Int ! FFI \{ \}\n")
+        .concat("fn main() \{ }\n")
+}
+
+test "an @ffi fn taking an opaque handle is a consume crossing" {
+    let out = compile_test_helpers.audit_ffi_via_cli(consume_src(), "rs3aph_consume", 1)
+    assert(out.contains("\"fn\":\"c_fclose\",\"param\":\"f\",\"handle\":\"CFile\",\"direction\":\"consume\""))
+    assert(out.contains("\"opaque_handle\":1"))
+}
+
+// A fn that consumes one handle type and produces a distinct one yields TWO
+// crossings — nominally distinct handles are inventoried separately.
+fn both_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\ntype Sqlite3\n"
+        .concat("@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3_stmt\")\ntype Sqlite3Stmt\n")
+        .concat("@ffi(\"sqlite3\", \"sqlite3_next_stmt\")\n@trusted(audit: \"rev1\")\nfn c_next(db: Sqlite3) -> Sqlite3Stmt ! FFI \{ \}\n")
+        .concat("fn main() \{ }\n")
+}
+
+test "a fn consuming one handle and producing another yields two crossings" {
+    let out = compile_test_helpers.audit_ffi_via_cli(both_src(), "rs3aph_both", 1)
+    assert(out.contains("\"fn\":\"c_next\",\"param\":\"db\",\"handle\":\"Sqlite3\",\"direction\":\"consume\""))
+    assert(out.contains("\"fn\":\"c_next\",\"handle\":\"Sqlite3Stmt\",\"direction\":\"produce\""))
+    assert(out.contains("\"opaque_handle\":2"))
+}
+
+// An FFI fn with only ordinary (non-opaque) types is not a crossing — the
+// category must not conflate a Ptr[U8] param with an opaque handle.
+fn no_opaque_src() -> Str {
+    "@ffi(\"c\", \"do_io\")\nfn c_io(p: Ptr[U8], n: U64) -> I64\n"
+        .concat("fn main() \{ }\n")
+}
+
+test "an FFI fn with no opaque handle yields no crossing" {
+    let out = compile_test_helpers.audit_ffi_via_cli(no_opaque_src(), "rs3aph_none", 1)
+    assert(out.contains("\"opaque_ffi_handle\":\{\"crossing\":[]}"))
+    assert(out.contains("\"opaque_handle\":0"))
+}
+
+// The human-readable report also surfaces the crossing so a reviewer scanning the
+// plain output sees it, not only the JSON consumer.
+test "the human-readable audit report lists an opaque handle crossing" {
+    let out = compile_test_helpers.audit_ffi_via_cli(produce_src(), "rs3aph_human", 0)
+    assert(out.contains("c_tmpfile"))
+    assert(out.contains("CFile"))
+    assert(out.contains("produce"))
+}

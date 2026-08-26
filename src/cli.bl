@@ -1369,6 +1369,28 @@ fn ffi_ptr_return(fn_node: Int) -> Str {
     ""
 }
 
+// Collect the names of every top-level @ffi.opaque handle type in the program.
+// The audit runs after parse+merge only (compile_to_program stops before
+// typecheck), so the typecheck/codegen opaque registries are empty here; the
+// opaque set is rebuilt straight from the type-decl AST, keyed on the same
+// `ffi.opaque` annotation typecheck uses to populate ffi_opaque_type_set.
+fn collect_opaque_type_names(program: Int) -> Map[Str, Int] {
+    let mut set: Map[Str, Int] = Map()
+    let types_sl = node_fields(program)
+    if types_sl == -1 {
+        return set
+    }
+    let mut i = 0
+    while i < sublist_length(types_sl) {
+        let td = sublist_get(types_sl, i)
+        if get_annotation(td, "ffi.opaque") != -1 {
+            set.insert(node_name(td), 1)
+        }
+        i = i + 1
+    }
+    set
+}
+
 fn ffi_extract_trusted_info(fn_node: Int) -> Str {
     let ann = get_annotation(fn_node, "trusted")
     if ann == -1 {
@@ -1629,6 +1651,16 @@ fn do_ffi_audit(program: Int, json_output: Int) {
     let mut ptr_param_count = 0
     let mut ptr_ret_count = 0
 
+    // opaque-ffi-handle crossings (spec §9.1.4): one entry per @ffi signature slot
+    // that produces (opaque return) or consumes (opaque param) a handle.
+    let opaque_set = collect_opaque_type_names(program)
+    let mut oc_fns: List[Str] = []
+    let mut oc_lines: List[Int] = []
+    let mut oc_files: List[Str] = []
+    let mut oc_params: List[Str] = []
+    let mut oc_handles: List[Str] = []
+    let mut oc_dirs: List[Str] = []
+
     // @ffi DISCOVERY is intentionally top-level-only: validate_ffi_fn (typecheck)
     // and codegen lower @ffi over top-level fns alone — no path lowers @ffi on an
     // impl method — so widening discovery here would report fns that never
@@ -1639,9 +1671,11 @@ fn do_ffi_audit(program: Int, json_output: Int) {
         let ffi_ann = get_annotation(fn_node, "ffi")
         if ffi_ann != -1 {
             let fn_name = node_name(fn_node)
+            let fn_line = node_line(fn_node)
+            let fn_file = diag_file_for_node(fn_node)
             names.push(fn_name)
-            lines.push(node_line(fn_node))
-            files.push(diag_file_for_node(fn_node))
+            lines.push(fn_line)
+            files.push(fn_file)
 
             let ffi_args_sl = node_args(ffi_ann)
             let mut lib = ""
@@ -1676,6 +1710,33 @@ fn do_ffi_audit(program: Int, json_output: Int) {
             ptr_returns.push(ptr_ret)
             if ptr_ret != "" {
                 ptr_ret_count = ptr_ret_count + 1
+            }
+
+            let oret = node_return_type(fn_node)
+            if opaque_set.contains_key(oret) != 0 {
+                oc_fns.push(fn_name)
+                oc_lines.push(fn_line)
+                oc_files.push(fn_file)
+                oc_params.push("")
+                oc_handles.push(oret)
+                oc_dirs.push("produce")
+            }
+            let oparams_sl = node_params(fn_node)
+            if oparams_sl != -1 {
+                let mut pj = 0
+                while pj < sublist_length(oparams_sl) {
+                    let pp = sublist_get(oparams_sl, pj)
+                    let pt = node_type_name(pp)
+                    if opaque_set.contains_key(pt) != 0 {
+                        oc_fns.push(fn_name)
+                        oc_lines.push(fn_line)
+                        oc_files.push(fn_file)
+                        oc_params.push(node_name(pp))
+                        oc_handles.push(pt)
+                        oc_dirs.push("consume")
+                    }
+                    pj = pj + 1
+                }
             }
         }
         i = i + 1
@@ -1796,7 +1857,26 @@ fn do_ffi_audit(program: Int, json_output: Int) {
             out = out.concat("\{\"file\":\"{bfile}\",\"line\":{bline}}")
             bpj = bpj + 1
         }
-        out = out.concat("]},\"summary\":\{\"total\":{total},\"audited\":{audited},\"unaudited\":{unaudited},\"ptr_params\":{ptr_param_count},\"ptr_returns\":{ptr_ret_count},\"byte_pin\":{byte_pin_lines.len()}}}")
+        out = out.concat("]},\"opaque_ffi_handle\":\{\"crossing\":[")
+        let mut ocj = 0
+        while ocj < oc_fns.len() {
+            if ocj > 0 {
+                out = out.concat(",")
+            }
+            let ocfile = oc_files.get(ocj).unwrap()
+            let ocline = oc_lines.get(ocj).unwrap()
+            let ocfn = oc_fns.get(ocj).unwrap()
+            let ochandle = oc_handles.get(ocj).unwrap()
+            let ocdir = oc_dirs.get(ocj).unwrap()
+            let ocparam = oc_params.get(ocj).unwrap()
+            out = out.concat("\{\"file\":\"{ocfile}\",\"line\":{ocline},\"fn\":\"{ocfn}\"")
+            if ocparam != "" {
+                out = out.concat(",\"param\":\"{ocparam}\"")
+            }
+            out = out.concat(",\"handle\":\"{ochandle}\",\"direction\":\"{ocdir}\"}")
+            ocj = ocj + 1
+        }
+        out = out.concat("]},\"summary\":\{\"total\":{total},\"audited\":{audited},\"unaudited\":{unaudited},\"ptr_params\":{ptr_param_count},\"ptr_returns\":{ptr_ret_count},\"byte_pin\":{byte_pin_lines.len()},\"opaque_handle\":{oc_fns.len()}}}")
         io.println(out)
     } else {
         if total == 0 {
@@ -1847,6 +1927,23 @@ fn do_ffi_audit(program: Int, json_output: Int) {
                 let bfile = byte_pin_files.get(bph).unwrap()
                 io.println("  byte-pin: {bfile}:{bline}")
                 bph = bph + 1
+            }
+        }
+        if oc_fns.len() > 0 {
+            io.println("")
+            io.println("opaque-ffi-handle")
+            io.println("=================")
+            let mut och = 0
+            while och < oc_fns.len() {
+                let ocfile = oc_files.get(och).unwrap()
+                let ocline = oc_lines.get(och).unwrap()
+                let ocfn = oc_fns.get(och).unwrap()
+                let ochandle = oc_handles.get(och).unwrap()
+                let ocdir = oc_dirs.get(och).unwrap()
+                let ocparam = oc_params.get(och).unwrap()
+                let slot = if ocparam != "" { "param {ocparam}" } else { "return" }
+                io.println("  {ocdir}: {ocfn} ({slot}: {ochandle})  {ocfile}:{ocline}")
+                och = och + 1
             }
         }
     }
