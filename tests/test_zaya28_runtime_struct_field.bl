@@ -1,0 +1,45 @@
+import compile_test_helpers
+
+// br zaya28 — the E0525 NoSuchField absence prover (tc_struct_field_provably_absent) read the
+// declared shape only from tc_struct_decl_nodes, which is keyed on a parsed `type` AST node.
+// Runtime-minted structs (ProcessResult, Duration, Instant, FsError via ensure_runtime_struct_type)
+// have no AST decl node — they register their full shape in named_type_map and sfield_pool instead.
+// So field EXISTENCE (get_struct_field_tid, which reads sfield_pool) and field ABSENCE (which read
+// tc_struct_decl_nodes) consulted different sources: a bad field access on such a type found no decl
+// node, the prover returned 0 (cannot prove absent), and the access silently fell through to
+// TYPE_UNKNOWN instead of E0525 (sections/03_types.md:3305). ProcessResult is minted by the
+// process_pid_wait / process_spawn builtins, which type without importing std.process, so this is
+// reachable in ordinary code. The fix makes the absence prover fall back to the same shape source
+// existence uses (sfield_pool) when no AST decl node is present, so both channels agree.
+
+fn bad_field_src() -> Str {
+    #"fn main() {
+    let pid = process_spawn("echo", ["hi"])
+    let r = process_pid_wait(pid)
+    let bad = r.nonexistent_field
+    io.println("bad")
+}
+"#
+}
+
+test "reading a nonexistent field on a runtime-minted ProcessResult is E0525" {
+    compile_test_helpers.expect_compile_error(bad_field_src(), "zaya28_bad", "E0525")
+}
+
+// Guard: the real declared fields of the runtime-minted shape must still resolve — proving absence
+// from sfield_pool must not reject a field that IS in the shape.
+fn good_fields_src() -> Str {
+    #"fn main() {
+    let pid = process_spawn("echo", ["hi"])
+    let r = process_pid_wait(pid)
+    let out: Str = r.out
+    let err: Str = r.err_out
+    let code: Int = r.exit_code
+    io.println("{out} {err} {code}")
+}
+"#
+}
+
+test "reading real fields on a runtime-minted ProcessResult does not false-fire E0525" {
+    compile_test_helpers.expect_no_error(good_fields_src(), "zaya28_good", "E0525")
+}
