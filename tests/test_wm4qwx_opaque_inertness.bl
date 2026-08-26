@@ -1,0 +1,304 @@
+import compile_test_helpers
+
+// br wm4qwx — acceptance test for the @ffi.opaque inertness contract.
+// sections/07_trust_modules_metadata.md 9.1.4 seals an opaque handle as inert: it has no
+// user-callable methods, no fields, no ==, no Display, and no user-callable constructor; it is
+// nominally distinct from every other type and from other opaque handles. The spec mandates NO
+// new error codes for these — each property is enforced by the ordinary general diagnostic.
+//
+// This file does not add opaque-specific machinery; it proves the contract falls out for free
+// from the general typecheck rules landed by the blocker tickets: field access (E0525 NoSuchField),
+// construction head (E0300), arithmetic operands (E0300), and derive-Serialize field (E1401),
+// plus the already-present method (E0505), == (E0300), Display (E0523), and nominal-distinctness
+// (E0300) machinery. If any of these regresses, an opaque handle silently regains a capability the
+// spec forbids, so these assertions guard the whole inertness surface in one place.
+//
+// 9.1.4 enumerates the inert operations literally: deref / addr / offset, field access, arithmetic,
+// ==, and sealed construction. Two assertions here — Display (E0523) and derive-Serialize (E1401) —
+// are spec-DERIVED, not enumerated: they follow from an opaque handle carrying no readable value,
+// and are named explicitly by this ticket rather than by 9.1.4. The Map-key / Set-element cases go
+// through a distinct hashability path (E1400 MapKeyNotHashable), which follows from the no-==
+// property. A positive test pins the other half of the contract — an opaque handle flows freely
+// through ordinary code (held, passed, returned, stored in a field, read back) — so an over-eager
+// inertness guard cannot silently break legal FFI wrappers.
+
+fn opaque_decl() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+"#
+}
+
+// 9.1.4: no user-callable methods on an opaque handle.
+fn method_call_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn use(a: CFile) {
+    a.close()
+}
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "calling a method on an @ffi.opaque handle is E0505" {
+    compile_test_helpers.expect_compile_error(method_call_src(), "wm4qwx_method", "E0505")
+}
+
+// 9.1.4: an opaque handle has no value equality.
+fn equality_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn same(a: CFile, b: CFile) -> Bool {
+    a == b
+}
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "comparing two @ffi.opaque handles with == is E0300" {
+    compile_test_helpers.expect_compile_error(equality_src(), "wm4qwx_eq", "E0300")
+}
+
+// 9.1.4: an opaque handle does not implement Display.
+fn display_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn show(a: CFile) {
+    io.println("{a}")
+}
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "interpolating an @ffi.opaque handle is E0523" {
+    compile_test_helpers.expect_compile_error(display_src(), "wm4qwx_display", "E0523")
+}
+
+// 9.1.4: an opaque handle has no fields.
+fn field_access_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn peek(a: CFile) {
+    let x = a.handle
+    io.println("bad")
+}
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "reading a field on an @ffi.opaque handle is E0525" {
+    compile_test_helpers.expect_compile_error(field_access_src(), "wm4qwx_field", "E0525")
+}
+
+// 9.1.4: construction is sealed to the FFI boundary — no user-callable constructor.
+fn construct_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn main() {
+    let a: CFile = CFile {}
+    io.println("forged")
+}
+"#
+}
+
+test "constructing an @ffi.opaque handle via struct literal is E0300" {
+    compile_test_helpers.expect_compile_error(construct_src(), "wm4qwx_construct", "E0300")
+}
+
+// 9.1.4 + arithmetic sealed to built-in numerics: two opaque handles must not form pointer
+// arithmetic (a - b is a valid ptrdiff in C). The result is bound to a discard, not returned,
+// so the assertion cannot be satisfied by a return-type mismatch — if the arithmetic guard
+// regressed and a - b yielded an Int, this source would compile clean and the test would fail
+// loud rather than silently pass on the wrong E0300.
+fn arithmetic_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn diff(a: CFile, b: CFile) {
+    let _d = a - b
+}
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "arithmetic on two @ffi.opaque handles is E0300" {
+    compile_test_helpers.expect_compile_error(arithmetic_src(), "wm4qwx_arith", "E0300")
+}
+
+// An opaque handle is inert, so a struct deriving Serialize with an opaque field must be rejected
+// rather than silently serialize the handle to null.
+fn serialize_field_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+@derive(Serialize)
+type Wrap { f: CFile }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "deriving Serialize with an @ffi.opaque field is E1401" {
+    compile_test_helpers.expect_compile_error(serialize_field_src(), "wm4qwx_serialize", "E1401")
+}
+
+// p4fbst MVCE: a List of an opaque handle under derive(Serialize) is rejected too — the list
+// element predicate rejects the inert element type rather than emitting {"files":[null]}.
+fn serialize_list_field_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+@derive(Serialize)
+type Box { files: List[CFile] }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "deriving Serialize with a List of @ffi.opaque field is E1401" {
+    compile_test_helpers.expect_compile_error(serialize_list_field_src(), "wm4qwx_serialize_list", "E1401")
+}
+
+// 9.1.4: an opaque handle is nominally distinct from every other opaque handle.
+fn nominal_distinct_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+@ffi.opaque(header: "sqlite3.h", name: "sqlite3")
+type CDb
+fn takes_db(d: CDb) {
+    io.println("db")
+}
+fn cross(a: CFile) {
+    takes_db(a)
+}
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "passing one @ffi.opaque handle where another is expected is E0300" {
+    compile_test_helpers.expect_compile_error(nominal_distinct_src(), "wm4qwx_nominal", "E0300")
+}
+
+// 9.1.4: an opaque handle has no ==, so it cannot key a Map — the hashability path (E1400
+// MapKeyNotHashable) is a distinct guard from the general == rejection.
+fn map_key_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn store(a: CFile) {
+    let mut m: Map[CFile, Int] = Map()
+    m.set(a, 1)
+}
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "using an @ffi.opaque handle as a Map key is E1400" {
+    compile_test_helpers.expect_compile_error(map_key_src(), "wm4qwx_mapkey", "E1400")
+}
+
+// 9.1.4: the same hashability gate rejects an opaque handle as a Set element.
+fn set_elem_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn store(a: CFile) {
+    let mut s: Set[CFile] = Set()
+    s.add(a)
+}
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "using an @ffi.opaque handle as a Set element is E1400" {
+    compile_test_helpers.expect_compile_error(set_elem_src(), "wm4qwx_setelem", "E1400")
+}
+
+// 9.1.4: the raw-pointer surface is sealed — .addr() (like .deref()/.offset()) is not callable
+// on an opaque handle, so it takes the ordinary no-method path (E0505 UnresolvedMethod).
+fn addr_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn leak(a: CFile) {
+    let x = a.addr()
+    io.println("bad")
+}
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "calling .addr() on an @ffi.opaque handle is E0505" {
+    compile_test_helpers.expect_compile_error(addr_src(), "wm4qwx_addr", "E0505")
+}
+
+// The other half of the contract: an opaque handle flows freely through ordinary code — held in a
+// let, passed to a fn, returned, stored in a struct field, and read back — with no error. This
+// pins the four inertness guards above from over-reaching and breaking legal FFI wrappers: the
+// handle is inert, not untouchable.
+fn flows_freely_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+type Wrapper { handle: CFile }
+fn pass_through(a: CFile) -> CFile {
+    a
+}
+fn wrap(a: CFile) -> Wrapper {
+    Wrapper { handle: a }
+}
+fn unwrap(w: Wrapper) -> CFile {
+    w.handle
+}
+fn flow(a: CFile) -> CFile {
+    let held = a
+    let piped = pass_through(held)
+    let w = wrap(piped)
+    unwrap(w)
+}
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "an @ffi.opaque handle flows freely through hold/pass/return/store/read (no error)" {
+    let out = compile_test_helpers.compile_and_capture(flows_freely_src(), "wm4qwx_flows")
+    assert(!out.contains("\"severity\":\"error\""))
+}
+
+// 9.1.4: an opaque handle is not a Ptr — it exposes zero raw-pointer surface. Passing one where a
+// Ptr[U8] is expected is a nominal mismatch (E0300). The Ptr[U8] parameter declaration also emits
+// E0811 (PtrOutsideFFI), which is incidental noise here and cannot cause a false pass: if the
+// opaque/Ptr distinction regressed, the E0300 nominal mismatch would disappear and this assertion
+// would fail loud.
+fn not_ptr_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn takes_ptr(p: Ptr[U8]) {
+    io.println("ptr")
+}
+fn f(a: CFile) {
+    takes_ptr(a)
+}
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "passing an @ffi.opaque handle where a Ptr is expected is E0300" {
+    compile_test_helpers.expect_compile_error(not_ptr_src(), "wm4qwx_notptr", "E0300")
+}
