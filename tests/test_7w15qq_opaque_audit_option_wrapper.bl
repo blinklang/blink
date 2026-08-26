@@ -1,0 +1,64 @@
+import compile_test_helpers
+
+// The opaque-ffi-handle audit must tag Option-wrapped opaque crossings.
+// sections/07_trust_modules_metadata.md:895-899 makes Option[Sqlite3] the sole
+// nullable-handle shape, :911 lists an @ffi return as a produce mechanism, and
+// :927 requires EVERY produce/consume crossing to be tagged. Option follows the
+// slot direction: an Option[opaque] return produces a handle, an Option[opaque]
+// param consumes one — the same directions as the bare handle in that slot.
+
+fn opt_return_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\ntype Sqlite3\n"
+        .concat("@ffi(\"sqlite3\", \"sqlite3_lookup\")\n@trusted(audit: \"rev1\")\nfn raw_lookup(k: Ptr[U8]) -> Option[Sqlite3] ! FFI \{ \}\n")
+        .concat("fn main() \{ }\n")
+}
+
+test "an Option[opaque] return is a produce crossing" {
+    let out = compile_test_helpers.audit_ffi_via_cli(opt_return_src(), "7w15qq_optret", 1)
+    assert(out.contains("\"fn\":\"raw_lookup\",\"handle\":\"Sqlite3\",\"direction\":\"produce\""))
+    assert(out.contains("\"opaque_handle\":1"))
+}
+
+fn opt_param_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\ntype Sqlite3\n"
+        .concat("@ffi(\"sqlite3\", \"sqlite3_close\")\n@trusted(audit: \"rev1\")\nfn raw_close(db: Option[Sqlite3]) -> Int ! FFI \{ \}\n")
+        .concat("fn main() \{ }\n")
+}
+
+test "an Option[opaque] param is a consume crossing" {
+    let out = compile_test_helpers.audit_ffi_via_cli(opt_param_src(), "7w15qq_optparam", 1)
+    assert(out.contains("\"fn\":\"raw_close\",\"param\":\"db\",\"handle\":\"Sqlite3\",\"direction\":\"consume\""))
+    assert(out.contains("\"opaque_handle\":1"))
+}
+
+// An Option over a non-opaque inner must NOT be conflated with a handle.
+fn opt_nonopaque_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\ntype Sqlite3\n"
+        .concat("@ffi(\"c\", \"c_flag\")\n@trusted(audit: \"rev1\")\nfn c_flag(x: Option[U8]) -> Int ! FFI \{ \}\n")
+        .concat("fn main() \{ }\n")
+}
+
+test "an Option over a non-opaque inner is not an opaque crossing" {
+    let out = compile_test_helpers.audit_ffi_via_cli(opt_nonopaque_src(), "7w15qq_optnon", 1)
+    assert(!out.contains("\"handle\":\"U8\""))
+    assert(out.contains("\"opaque_handle\":0"))
+}
+
+// The wrapper unwrap strips the module qualifier off the inner name, so a
+// cross-module Option[handle.Sqlite3] param still resolves to a consume crossing
+// of the bare handle — the Option analogue of the khf7zs Ptr cross-module case.
+fn opt_qualified_entry_src() -> Str {
+    "import db.handle\n"
+        .concat("@ffi(\"sqlite3\", \"sqlite3_close\")\n@trusted(audit: \"rev1\")\nfn q_close(db: Option[handle.Sqlite3]) -> Int ! FFI \{ \}\n")
+        .concat("fn main() \{ }\n")
+}
+
+fn opt_qualified_helper_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\npub type Sqlite3\n"
+}
+
+test "a cross-module Option[opaque] param is a consume crossing" {
+    let out = compile_test_helpers.audit_ffi_xmod(opt_qualified_entry_src(), "db", "handle", opt_qualified_helper_src(), "7w15qq_optqual", 1)
+    assert(out.contains("\"fn\":\"q_close\",\"param\":\"db\",\"handle\":\"Sqlite3\",\"direction\":\"consume\""))
+    assert(out.contains("\"opaque_handle\":1"))
+}
