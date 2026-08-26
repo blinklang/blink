@@ -57,7 +57,7 @@ import codegen_stmt.{ann_str_val, positional_str_arg, positional_str_arg_count}
 import ast_dump.{ast_to_json}
 import formatter.{Format, format}
 import mutation_analysis.{analyze_mutations, analyze_save_restore}
-import escape.{analyze_escapes}
+import escape.{analyze_escapes, ffi_scope_resource_name}
 import symbol_index.{collect_effects, si_build, si_reset}
 import query.{query_filtered_layer}
 import diagnostics.{
@@ -1644,10 +1644,13 @@ fn collect_byte_pin_sites(node: Int, file: Str, out_lines: List[Int], out_files:
     }
 }
 
-// One opaque-ffi-handle boundary crossing: an @ffi signature slot that produces
-// (opaque return / Ptr out-cell) or consumes (opaque param) a handle. Held as a
-// record so the accumulate and both emit loops share one field order instead of
-// six index-locked parallel lists.
+// One opaque-ffi-handle boundary crossing. `site` says where it was found: a
+// "signature" crossing is an @ffi slot that produces (opaque return / Ptr
+// out-cell) or consumes (opaque param) a handle; a "mint" crossing is a body
+// `Ptr[opaque].deref()` that materialises a handle inside an FFI region
+// (sections/07_trust_modules_metadata.md:211, :895-935). Held as a record so
+// the accumulate and both emit loops share one field order instead of parallel
+// index-locked lists.
 type OpaqueCrossing {
     fname: Str
     line: Int
@@ -1655,13 +1658,336 @@ type OpaqueCrossing {
     param: Str
     handle: Str
     direction: Str
+    site: Str
+}
+
+// A function body is an FFI region when it carries @ffi or @trusted
+// (sections/07_trust_modules_metadata.md:211, region forms 1 and 2). The third
+// form — a `with ffi.scope() as _ { }` block — is a within-body sub-region the
+// walker detects via ffi_scope_resource_name, shared with escape.bl's E0601 pass
+// so the two cannot drift. This body-region predicate is intentionally broader
+// than E0811's signature gate (validate_ffi_fn, @ffi-only), which is left
+// unchanged: E0811 governs where a Ptr[T] may sit in a signature; this governs
+// where a body deref mints a handle.
+fn fn_is_ffi_region(fn_node: Int) -> Int {
+    if get_annotation(fn_node, "ffi") != -1 { return 1 }
+    if get_annotation(fn_node, "trusted") != -1 { return 1 }
+    0
+}
+
+// The opaque pointee produced by a pointer-minting intrinsic call
+// (`scope.alloc[T]()`, `scope.alloc_n[T](n)`, `alloc_ptr[T]()`, `null_ptr[T]()`),
+// or "" for any other call. The bracketed type argument does not attach to the
+// call as a type arg — it parses as an index expression (see typecheck.bl:11208)
+// — so the pointee `T` rides the IndexExpr index of the callee.
+fn intrinsic_ptr_opaque_pointee(call: Int, opaque_set: Map[Str, Int]) -> Str {
+    let callee = node_left(call)
+    if callee == -1 { return "" }
+    if node_kind(callee) != NodeKind.IndexExpr { return "" }
+    let base = node_obj(callee)
+    let idx = node_index(callee)
+    if base == -1 || idx == -1 { return "" }
+    if node_kind(idx) != NodeKind.Ident && node_kind(idx) != NodeKind.FieldAccess { return "" }
+    let mut ok = 0
+    if node_kind(base) == NodeKind.Ident {
+        let bn = node_name(base)
+        if bn == "alloc_ptr" || bn == "null_ptr" { ok = 1 }
+    }
+    if node_kind(base) == NodeKind.FieldAccess {
+        let fld = node_name(base)
+        if fld == "alloc" || fld == "alloc_n" { ok = 1 }
+    }
+    if ok == 0 { return "" }
+    let inner = strip_module_qualifier(node_name(idx))
+    if opaque_set.contains_key(inner) != 0 { return inner }
+    ""
+}
+
+// The opaque pointee an expression carries when it has Ptr[opaque] type,
+// recovered purely syntactically pre-typecheck: a bound var in `ptr_env`, or a
+// direct pointer-producing intrinsic call. "" when the expression is not a
+// Ptr[opaque]. A `.deref()` on such an expression inside a region is a mint.
+fn ptr_opaque_pointee(expr: Int, ptr_env: Map[Str, Str], opaque_set: Map[Str, Int]) -> Str {
+    if expr == -1 { return "" }
+    let k = node_kind(expr)
+    if k == NodeKind.Ident {
+        let nm = node_name(expr)
+        if ptr_env.contains_key(nm) != 0 { return ptr_env.get(nm).unwrap() }
+        return ""
+    }
+    if k == NodeKind.Call {
+        return intrinsic_ptr_opaque_pointee(expr, opaque_set)
+    }
+    ""
+}
+
+// Seed each Ptr[opaque] param name into the binder env. Shared by the fn-level
+// scan and the closure arm, which both bring params into scope for the body.
+fn seed_ptr_opaque_params(params_sl: Int, ptr_env: Map[Str, Str], opaque_set: Map[Str, Int]) {
+    if params_sl == -1 { return }
+    let mut pi = 0
+    while pi < sublist_length(params_sl) {
+        let pp = sublist_get(params_sl, pi)
+        let pt = strip_module_qualifier(node_type_name(pp))
+        if pt == "Ptr" {
+            let inner = opaque_wrapper_inner(pp)
+            if inner != "" && opaque_set.contains_key(inner) != 0 {
+                ptr_env.insert(node_name(pp), inner)
+            }
+        }
+        pi = pi + 1
+    }
+}
+
+fn scan_fn_for_mints(fn_node: Int, file: Str, opaque_set: Map[Str, Int], oc: List[OpaqueCrossing]) {
+    if fn_node == -1 { return }
+    let region = fn_is_ffi_region(fn_node)
+    let mut ptr_env: Map[Str, Str] = Map()
+    seed_ptr_opaque_params(node_params(fn_node), ptr_env, opaque_set)
+    collect_opaque_mint_sites(node_body(fn_node), file, region, node_name(fn_node), ptr_env, opaque_set, oc)
+}
+
+// Recursively walk a body subtree and record every opaque-handle MINT — a
+// `Ptr[opaque].deref()` lexically inside an FFI region (spec §9.1.4, :211). The
+// structure mirrors collect_byte_pin_sites (hand-rolled descent, no generic
+// visitor). Beyond that template it threads: `in_region` (1 inside an @ffi/
+// @trusted fn or an ffi.scope block), `fn_name` (the enclosing fn, attributed to
+// each mint), and `ptr_env` (binder name -> opaque pointee, grown from params and
+// pointer-producing lets). A closure literal inherits the region (R-PROP-CLOSURE).
+// The decision-text rule R-NO-PROP-FNITEM (a named nested `fn` does not inherit)
+// has no witness: parse_stmt has no Fn arm, so a named nested fn is not a body
+// statement in this language — the closure is the only nested-fn form.
+fn collect_opaque_mint_sites(node: Int, file: Str, in_region: Int, fn_name: Str, ptr_env: Map[Str, Str], opaque_set: Map[Str, Int], oc: List[OpaqueCrossing]) {
+    if node == -1 { return }
+    let kind = node_kind(node)
+
+    if kind == NodeKind.MethodCall {
+        if in_region != 0 && node_method(node) == "deref" {
+            let pointee = ptr_opaque_pointee(node_obj(node), ptr_env, opaque_set)
+            if pointee != "" {
+                oc.push(OpaqueCrossing {
+                    fname: fn_name,
+                    line: node_line(node),
+                    file: file,
+                    param: "",
+                    handle: pointee,
+                    direction: "produce",
+                    site: "mint"
+                })
+            }
+        }
+        let mc_obj = node_obj(node)
+        if mc_obj != -1 { collect_opaque_mint_sites(mc_obj, file, in_region, fn_name, ptr_env, opaque_set, oc) }
+        let args_sl = node_args(node)
+        if args_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(args_sl) {
+                collect_opaque_mint_sites(sublist_get(args_sl, i), file, in_region, fn_name, ptr_env, opaque_set, oc)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.Call {
+        let cleft = node_left(node)
+        if cleft != -1 { collect_opaque_mint_sites(cleft, file, in_region, fn_name, ptr_env, opaque_set, oc) }
+        let args_sl = node_args(node)
+        if args_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(args_sl) {
+                collect_opaque_mint_sites(sublist_get(args_sl, i), file, in_region, fn_name, ptr_env, opaque_set, oc)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.Block {
+        let stmts_sl = node_stmts(node)
+        if stmts_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(stmts_sl) {
+                collect_opaque_mint_sites(sublist_get(stmts_sl, i), file, in_region, fn_name, ptr_env, opaque_set, oc)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.LetBinding {
+        let v = node_value(node)
+        let mut inner = ""
+        let ta = node_target(node)
+        if ta != -1 {
+            let head = strip_module_qualifier(node_name(ta))
+            if head == "Ptr" {
+                let pelems_sl = node_elements(ta)
+                if pelems_sl != -1 && sublist_length(pelems_sl) > 0 {
+                    inner = strip_module_qualifier(node_name(sublist_get(pelems_sl, 0)))
+                }
+            }
+        }
+        if inner == "" && v != -1 {
+            inner = ptr_opaque_pointee(v, ptr_env, opaque_set)
+        }
+        if inner != "" && opaque_set.contains_key(inner) != 0 {
+            ptr_env.insert(node_name(node), inner)
+        }
+        collect_opaque_mint_sites(v, file, in_region, fn_name, ptr_env, opaque_set, oc)
+        return
+    }
+
+    if kind == NodeKind.ExprStmt {
+        collect_opaque_mint_sites(node_value(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        return
+    }
+
+    if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
+        collect_opaque_mint_sites(node_target(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        collect_opaque_mint_sites(node_value(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        return
+    }
+
+    if kind == NodeKind.Return {
+        collect_opaque_mint_sites(node_value(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        return
+    }
+
+    if kind == NodeKind.IfExpr {
+        collect_opaque_mint_sites(node_condition(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        collect_opaque_mint_sites(node_then_body(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        collect_opaque_mint_sites(node_else_body(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        return
+    }
+
+    if kind == NodeKind.MatchExpr {
+        collect_opaque_mint_sites(node_scrutinee(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        let arms_sl = node_arms(node)
+        if arms_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(arms_sl) {
+                let arm = sublist_get(arms_sl, i)
+                collect_opaque_mint_sites(node_guard(arm), file, in_region, fn_name, ptr_env, opaque_set, oc)
+                collect_opaque_mint_sites(node_body(arm), file, in_region, fn_name, ptr_env, opaque_set, oc)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.WhileLoop {
+        collect_opaque_mint_sites(node_condition(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        collect_opaque_mint_sites(node_body(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        return
+    }
+
+    if kind == NodeKind.LoopExpr || kind == NodeKind.AsyncScope || kind == NodeKind.AssertPanics {
+        collect_opaque_mint_sites(node_body(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        return
+    }
+
+    if kind == NodeKind.ForIn {
+        collect_opaque_mint_sites(node_iterable(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        collect_opaque_mint_sites(node_body(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        return
+    }
+
+    if kind == NodeKind.AwaitExpr {
+        collect_opaque_mint_sites(node_obj(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        return
+    }
+
+    if kind == NodeKind.NamedArg || kind == NodeKind.SpreadExpr {
+        collect_opaque_mint_sites(node_value(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        return
+    }
+
+    if kind == NodeKind.RangeLit {
+        collect_opaque_mint_sites(node_start(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        collect_opaque_mint_sites(node_end(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        return
+    }
+
+    if kind == NodeKind.WithBlock {
+        let mut region = in_region
+        let handlers_sl = node_handlers(node)
+        if handlers_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(handlers_sl) {
+                let h = sublist_get(handlers_sl, i)
+                collect_opaque_mint_sites(h, file, in_region, fn_name, ptr_env, opaque_set, oc)
+                if ffi_scope_resource_name(h) != "" { region = 1 }
+                i = i + 1
+            }
+        }
+        collect_opaque_mint_sites(node_body(node), file, region, fn_name, ptr_env, opaque_set, oc)
+        return
+    }
+
+    if kind == NodeKind.WithResource {
+        collect_opaque_mint_sites(node_value(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        return
+    }
+
+    if kind == NodeKind.BinOp {
+        collect_opaque_mint_sites(node_left(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        collect_opaque_mint_sites(node_right(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        return
+    }
+
+    if kind == NodeKind.UnaryOp {
+        collect_opaque_mint_sites(node_value(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        return
+    }
+
+    if kind == NodeKind.FieldAccess || kind == NodeKind.IndexExpr {
+        collect_opaque_mint_sites(node_obj(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        collect_opaque_mint_sites(node_index(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        return
+    }
+
+    if kind == NodeKind.TupleLit || kind == NodeKind.ListLit || kind == NodeKind.InterpString {
+        let elems_sl = node_elements(node)
+        if elems_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(elems_sl) {
+                collect_opaque_mint_sites(sublist_get(elems_sl, i), file, in_region, fn_name, ptr_env, opaque_set, oc)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.StructLit {
+        let fields_sl = node_fields(node)
+        if fields_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(fields_sl) {
+                collect_opaque_mint_sites(node_value(sublist_get(fields_sl, i)), file, in_region, fn_name, ptr_env, opaque_set, oc)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    // A closure literal inside the region inherits it (R-PROP-CLOSURE): recurse
+    // the body with in_region unchanged, after bringing its own Ptr[opaque] params
+    // into the binder env. This is the sole nested-fn form the language has — a
+    // named nested `fn` is not a statement (parse_stmt has no Fn arm), so the
+    // decision-text rule R-NO-PROP-FNITEM has no witness and needs no branch here.
+    if kind == NodeKind.Closure {
+        seed_ptr_opaque_params(node_params(node), ptr_env, opaque_set)
+        collect_opaque_mint_sites(node_body(node), file, in_region, fn_name, ptr_env, opaque_set, oc)
+        return
+    }
 }
 
 fn do_ffi_audit(program: Int, json_output: Int) {
     let fns_sl = node_params(program)
     if fns_sl == -1 {
         if json_output != 0 {
-            io.println("\{\"ffi_functions\":[],\"bytes_bridge\":\{\"byte-pin\":[]},\"summary\":\{\"total\":0,\"audited\":0,\"unaudited\":0,\"ptr_params\":0,\"ptr_returns\":0,\"byte_pin\":0}}")
+            io.println("\{\"ffi_functions\":[],\"bytes_bridge\":\{\"byte-pin\":[]},\"summary\":\{\"total\":0,\"audited\":0,\"unaudited\":0,\"ptr_params\":0,\"ptr_returns\":0,\"byte_pin\":0,\"opaque_handle\":0}}")
         } else {
             io.println("No FFI functions found.")
         }
@@ -1748,7 +2074,8 @@ fn do_ffi_audit(program: Int, json_output: Int) {
                     file: fn_file,
                     param: "",
                     handle: oret,
-                    direction: "produce"
+                    direction: "produce",
+                    site: "signature"
                 })
             } else if oret == "Option" {
                 // Option[opaque] return: an @ffi return is a produce mechanism and
@@ -1763,7 +2090,8 @@ fn do_ffi_audit(program: Int, json_output: Int) {
                         file: fn_file,
                         param: "",
                         handle: rinner,
-                        direction: "produce"
+                        direction: "produce",
+                        site: "signature"
                     })
                 }
             }
@@ -1780,7 +2108,8 @@ fn do_ffi_audit(program: Int, json_output: Int) {
                             file: fn_file,
                             param: node_name(pp),
                             handle: pt,
-                            direction: "consume"
+                            direction: "consume",
+                            site: "signature"
                         })
                     } else if pt == "Ptr" {
                         // A Ptr[opaque] out-cell (`sqlite3**`) mints a handle at
@@ -1795,7 +2124,8 @@ fn do_ffi_audit(program: Int, json_output: Int) {
                                 file: fn_file,
                                 param: node_name(pp),
                                 handle: inner,
-                                direction: "produce"
+                                direction: "produce",
+                                site: "signature"
                             })
                         }
                     } else if pt == "Option" {
@@ -1810,7 +2140,8 @@ fn do_ffi_audit(program: Int, json_output: Int) {
                                 file: fn_file,
                                 param: node_name(pp),
                                 handle: oinner,
-                                direction: "consume"
+                                direction: "consume",
+                                site: "signature"
                             })
                         }
                     }
@@ -1894,6 +2225,63 @@ fn do_ffi_audit(program: Int, json_output: Int) {
         }
     }
 
+    // opaque-handle MINT sites (spec §9.1.4): a Ptr[opaque].deref() lexically
+    // inside an FFI region. Walked over the same four Program sublists as the
+    // byte-pin driver so a mint is caught in any body. Top-level fns and impl
+    // methods enter through scan_fn_for_mints, which decides the fn-level region
+    // (@ffi / @trusted) and seeds the Ptr[opaque] binder env from params; test
+    // blocks and top-level lets have no fn-level region, so they start outside
+    // one (in_region 0) and a mint is tagged only under an inner ffi.scope block.
+    // Round-trips (a handle handed back to a raw pointer) are NOT yet tagged —
+    // deferred by decision opaque-handle-mint-boundary.md; see follow-up ticket.
+    let mut mp = 0
+    while mp < sublist_length(fns_sl) {
+        scan_fn_for_mints(sublist_get(fns_sl, mp), diag_file_for_node(sublist_get(fns_sl, mp)), opaque_set, oc)
+        mp = mp + 1
+    }
+
+    if impls_sl != -1 {
+        let mut imi = 0
+        while imi < sublist_length(impls_sl) {
+            let im = sublist_get(impls_sl, imi)
+            let methods_sl = node_methods(im)
+            if methods_sl != -1 {
+                let mut mmi = 0
+                while mmi < sublist_length(methods_sl) {
+                    let m = sublist_get(methods_sl, mmi)
+                    scan_fn_for_mints(m, diag_file_for_node(m), opaque_set, oc)
+                    mmi = mmi + 1
+                }
+            }
+            imi = imi + 1
+        }
+    }
+
+    if tests_sl != -1 {
+        let mut tmi = 0
+        while tmi < sublist_length(tests_sl) {
+            let tb = sublist_get(tests_sl, tmi)
+            let tbody = node_body(tb)
+            if tbody != -1 {
+                let mut tenv: Map[Str, Str] = Map()
+                collect_opaque_mint_sites(tbody, diag_file_for_node(tb), 0, node_name(tb), tenv, opaque_set, oc)
+            }
+            tmi = tmi + 1
+        }
+    }
+
+    if lets_sl != -1 {
+        let mut lmi = 0
+        while lmi < sublist_length(lets_sl) {
+            let ln = sublist_get(lets_sl, lmi)
+            if ln != -1 {
+                let mut lenv: Map[Str, Str] = Map()
+                collect_opaque_mint_sites(ln, diag_file_for_node(ln), 0, "", lenv, opaque_set, oc)
+            }
+            lmi = lmi + 1
+        }
+    }
+
     if json_output != 0 {
         let mut out = "\{\"ffi_functions\":["
         let mut k = 0
@@ -1947,7 +2335,7 @@ fn do_ffi_audit(program: Int, json_output: Int) {
             if occ.param != "" {
                 out = out.concat(",\"param\":\"{occ.param}\"")
             }
-            out = out.concat(",\"handle\":\"{occ.handle}\",\"direction\":\"{occ.direction}\"}")
+            out = out.concat(",\"handle\":\"{occ.handle}\",\"direction\":\"{occ.direction}\",\"site\":\"{occ.site}\"}")
             ocj = ocj + 1
         }
         out = out.concat("]},\"summary\":\{\"total\":{total},\"audited\":{audited},\"unaudited\":{unaudited},\"ptr_params\":{ptr_param_count},\"ptr_returns\":{ptr_ret_count},\"byte_pin\":{byte_pin_lines.len()},\"opaque_handle\":{oc.len()}}}")
@@ -2010,7 +2398,7 @@ fn do_ffi_audit(program: Int, json_output: Int) {
             let mut och = 0
             while och < oc.len() {
                 let occ = oc.get(och).unwrap()
-                let slot = if occ.param != "" { "param {occ.param}" } else { "return" }
+                let slot = if occ.site == "mint" { "mint" } else if occ.param != "" { "param {occ.param}" } else { "return" }
                 io.println("  {occ.direction}: {occ.fname} ({slot}: {occ.handle})  {occ.file}:{occ.line}")
                 och = och + 1
             }

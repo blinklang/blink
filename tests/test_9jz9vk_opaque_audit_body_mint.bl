@@ -1,0 +1,184 @@
+import compile_test_helpers
+
+// The opaque-ffi-handle audit must tag MINTS: a Ptr[opaque].deref() that
+// materialises a handle from raw memory, when it sits lexically inside an FFI
+// region. sections/07_trust_modules_metadata.md:211 fixes the region to three
+// forms (an @ffi fn body, an @trusted fn body, a `with ffi.scope() as _` block)
+// and :895-935 seal handle construction to that boundary; :927 requires every
+// produce/consume crossing there to be tagged. This body-region predicate is
+// deliberately broader than E0811's signature gate (@ffi-only) and independent
+// of it; the ffi.scope form reuses the same syntactic test as the E0601 escape
+// pass. A mint is a produce crossing with site "mint".
+
+fn scope_mint_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\ntype Sqlite3\n"
+        .concat("pub fn open() -> Int \{\n    with ffi.scope() as scope \{\n        let out = scope.alloc[Sqlite3]()\n        let db = out.deref()\n        0\n    \}\n\}\n")
+        .concat("fn main() \{ }\n")
+}
+
+// This exact source passes `blink check` (verified), so it is a real deref
+// inside an ffi.scope region — the audit MUST tag it. The region test here is the
+// same syntactic ffi.scope predicate the E0601 escape pass uses, so a deref the
+// compiler treats as inside the scope and this audit are anchored together.
+// (Tagging is region-gated, not compile-gated: test 3 shows a region-less deref
+// compiles yet is correctly not tagged.)
+test "a Ptr[opaque].deref() inside ffi.scope is a produce mint" {
+    let out = compile_test_helpers.audit_ffi_via_cli(scope_mint_src(), "9jz9vk_scopemint", 1)
+    assert(out.contains("\"fn\":\"open\",\"handle\":\"Sqlite3\",\"direction\":\"produce\",\"site\":\"mint\""))
+    assert(out.contains("\"opaque_handle\":1"))
+}
+
+fn trusted_mint_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\ntype Sqlite3\n"
+        .concat("@trusted(audit: \"rev1\")\nfn grab() -> Int \{\n    let out = alloc_ptr[Sqlite3]()\n    let db = out.deref()\n    0\n\}\n")
+        .concat("fn main() \{ }\n")
+}
+
+test "a Ptr[opaque].deref() inside an @trusted fn body is a produce mint" {
+    let out = compile_test_helpers.audit_ffi_via_cli(trusted_mint_src(), "9jz9vk_trustedmint", 1)
+    assert(out.contains("\"fn\":\"grab\",\"handle\":\"Sqlite3\",\"direction\":\"produce\",\"site\":\"mint\""))
+    assert(out.contains("\"opaque_handle\":1"))
+}
+
+// A deref outside any FFI region is not a boundary crossing, even though the
+// same code compiles (E0811 gates Ptr[T] in signatures, not deref sites). This
+// is the region gate working: a compiling region-less deref must NOT be tagged,
+// which is the panel's 6-0 rejection of "any fn that derefs Ptr[opaque]".
+fn plain_deref_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\ntype Sqlite3\n"
+        .concat("fn plain() -> Int \{\n    let out = alloc_ptr[Sqlite3]()\n    let db = out.deref()\n    0\n\}\n")
+        .concat("fn main() \{ }\n")
+}
+
+test "a Ptr[opaque].deref() outside any FFI region is not a mint" {
+    let out = compile_test_helpers.audit_ffi_via_cli(plain_deref_src(), "9jz9vk_plain", 1)
+    assert(!out.contains("\"site\":\"mint\""))
+    assert(out.contains("\"opaque_handle\":0"))
+}
+
+// A deref on a non-opaque Ptr inside a region is ordinary memory access, not a
+// handle mint — the pointee must be an @ffi.opaque type.
+fn nonopaque_deref_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\ntype Sqlite3\n"
+        .concat("@trusted(audit: \"rev1\")\nfn grab(p: Ptr[U8]) -> Int \{\n    let b = p.deref()\n    0\n\}\n")
+        .concat("fn main() \{ }\n")
+}
+
+test "a deref on a non-opaque Ptr inside a region is not a mint" {
+    let out = compile_test_helpers.audit_ffi_via_cli(nonopaque_deref_src(), "9jz9vk_nonopaque", 1)
+    assert(!out.contains("\"site\":\"mint\""))
+    assert(out.contains("\"opaque_handle\":0"))
+}
+
+// Propagation is normative (:211): a closure literal inside the region inherits
+// it, so a mint in the closure body is tagged under the enclosing fn.
+fn closure_mint_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\ntype Sqlite3\n"
+        .concat("pub fn open() -> Int \{\n    with ffi.scope() as scope \{\n        let out = scope.alloc[Sqlite3]()\n        let f = fn() -> Int \{\n            let db = out.deref()\n            0\n        \}\n        0\n    \}\n\}\n")
+        .concat("fn main() \{ }\n")
+}
+
+test "a mint inside a closure within ffi.scope inherits the region" {
+    let out = compile_test_helpers.audit_ffi_via_cli(closure_mint_src(), "9jz9vk_closure", 1)
+    assert(out.contains("\"fn\":\"open\",\"handle\":\"Sqlite3\",\"direction\":\"produce\",\"site\":\"mint\""))
+    assert(out.contains("\"opaque_handle\":1"))
+}
+
+// A Ptr[opaque] handle recovered through an ANNOTATED let binding is seeded from
+// the binding annotation, which parse_let_binding stores in the LetBinding
+// `target` field (not `type_ann`), so a later deref in the region is still a
+// mint. Here `out` is bound from a param by a plain assignment — not a
+// pointer-minting intrinsic — so only the annotation path can seed it, isolating
+// that path. (A named nested `fn` is not a Blink statement, so R-NO-PROP-FNITEM
+// from the decision has no witness — see the walker comment and the spec ticket.)
+fn annotated_let_mint_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\ntype Sqlite3\n"
+        .concat("@trusted(audit: \"rev1\")\nfn grab(p: Ptr[Sqlite3]) -> Int \{\n    let out: Ptr[Sqlite3] = p\n    let db = out.deref()\n    0\n\}\n")
+        .concat("fn main() \{ }\n")
+}
+
+test "a mint through an annotated Ptr[opaque] let binding is tagged" {
+    let out = compile_test_helpers.audit_ffi_via_cli(annotated_let_mint_src(), "9jz9vk_annlet", 1)
+    assert(out.contains("\"fn\":\"grab\",\"handle\":\"Sqlite3\",\"direction\":\"produce\",\"site\":\"mint\""))
+    assert(out.contains("\"opaque_handle\":1"))
+}
+
+// A mint nested inside an if-branch within ffi.scope is still tagged — the walker
+// descends if/match/loop bodies, not just a block's top-level statements.
+fn nested_if_mint_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\ntype Sqlite3\n"
+        .concat("pub fn open(flag: Int) -> Int \{\n    with ffi.scope() as scope \{\n        let out = scope.alloc[Sqlite3]()\n        if flag > 0 \{\n            let db = out.deref()\n            0\n        \} else \{\n            0\n        \}\n    \}\n\}\n")
+        .concat("fn main() \{ }\n")
+}
+
+test "a mint nested inside an if within ffi.scope is tagged" {
+    let out = compile_test_helpers.audit_ffi_via_cli(nested_if_mint_src(), "9jz9vk_nestedif", 1)
+    assert(out.contains("\"fn\":\"open\",\"handle\":\"Sqlite3\",\"direction\":\"produce\",\"site\":\"mint\""))
+    assert(out.contains("\"opaque_handle\":1"))
+}
+
+// The canonical open() from :895-935: an @ffi signature crossing (out-cell param,
+// produce) PLUS a body mint (out.deref(), produce) — both tagged, count two.
+fn canonical_open_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\ntype Sqlite3\n"
+        .concat("@ffi(\"sqlite3\", \"sqlite3_open\")\n@trusted(audit: \"DB-003\")\nfn raw_sqlite3_open(out: Ptr[Sqlite3]) -> Int ! FFI \{ \}\n")
+        .concat("pub fn open() -> Int \{\n    with ffi.scope() as scope \{\n        let out = scope.alloc[Sqlite3]()\n        let rc = raw_sqlite3_open(out)\n        let db = out.deref()\n        0\n    \}\n\}\n")
+        .concat("fn main() \{ }\n")
+}
+
+test "the canonical open tags both the signature crossing and the body mint" {
+    let out = compile_test_helpers.audit_ffi_via_cli(canonical_open_src(), "9jz9vk_canonical", 1)
+    assert(out.contains("\"fn\":\"raw_sqlite3_open\",\"param\":\"out\",\"handle\":\"Sqlite3\",\"direction\":\"produce\""))
+    assert(out.contains("\"fn\":\"open\",\"handle\":\"Sqlite3\",\"direction\":\"produce\",\"site\":\"mint\""))
+    assert(out.contains("\"opaque_handle\":2"))
+}
+
+// A plain (unannotated) let that aliases an already-tracked Ptr[opaque] binder
+// carries the same handle, so a deref of the alias in the region is still a mint.
+// The RHS is a bare Ident, so neither the annotation path nor the intrinsic-call
+// path fires — the binder env must be consulted for the alias.
+fn alias_let_mint_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\ntype Sqlite3\n"
+        .concat("@trusted(audit: \"rev1\")\nfn grab(p: Ptr[Sqlite3]) -> Int \{\n    let alias = p\n    let db = alias.deref()\n    0\n\}\n")
+        .concat("fn main() \{ }\n")
+}
+
+test "a mint through a plain let alias of a tracked handle is tagged" {
+    let out = compile_test_helpers.audit_ffi_via_cli(alias_let_mint_src(), "9jz9vk_aliaslet", 1)
+    assert(out.contains("\"fn\":\"grab\",\"handle\":\"Sqlite3\",\"direction\":\"produce\",\"site\":\"mint\""))
+    assert(out.contains("\"opaque_handle\":1"))
+}
+
+// A closure literal inherits the region (R-PROP-CLOSURE), and its own Ptr[opaque]
+// params seed the binder env for its body — so a deref of a closure param inside
+// the region is a mint attributed to the enclosing fn.
+fn closure_param_mint_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\ntype Sqlite3\n"
+        .concat("pub fn open() -> Int \{\n    with ffi.scope() as scope \{\n        let f = fn(p: Ptr[Sqlite3]) -> Int \{\n            let db = p.deref()\n            0\n        \}\n        0\n    \}\n\}\n")
+        .concat("fn main() \{ }\n")
+}
+
+test "a mint on a closure Ptr[opaque] param inside a region is tagged" {
+    let out = compile_test_helpers.audit_ffi_via_cli(closure_param_mint_src(), "9jz9vk_closureparam", 1)
+    assert(out.contains("\"fn\":\"open\",\"handle\":\"Sqlite3\",\"direction\":\"produce\",\"site\":\"mint\""))
+    assert(out.contains("\"opaque_handle\":1"))
+}
+
+// A cross-module opaque type in the alloc index (scope.alloc[handle.Sqlite3]())
+// parses the type argument as a qualified FieldAccess, not a bare Ident; the
+// intrinsic pointee reader must strip the qualifier and still seed the binder.
+fn qual_alloc_entry_src() -> Str {
+    "import db.handle\n"
+        .concat("pub fn open() -> Int \{\n    with ffi.scope() as scope \{\n        let out = scope.alloc[handle.Sqlite3]()\n        let db = out.deref()\n        0\n    \}\n\}\n")
+        .concat("fn main() \{ }\n")
+}
+
+fn qual_alloc_helper_src() -> Str {
+    "@ffi.opaque(header: \"sqlite3.h\", name: \"sqlite3\")\npub type Sqlite3\n"
+}
+
+test "a mint from a qualified opaque type in the alloc index is tagged" {
+    let out = compile_test_helpers.audit_ffi_xmod(qual_alloc_entry_src(), "db", "handle", qual_alloc_helper_src(), "9jz9vk_qualalloc", 1)
+    assert(out.contains("\"fn\":\"open\",\"handle\":\"Sqlite3\",\"direction\":\"produce\",\"site\":\"mint\""))
+    assert(out.contains("\"opaque_handle\":1"))
+}
