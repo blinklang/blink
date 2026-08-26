@@ -143,7 +143,7 @@ BLINK_RT_FN int64_t blink_sqlite3_rollback(sqlite3* db) {
     return (int64_t)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
 }
 
-int64_t blink_sqlite3_result_rc(blink_handle* r) {
+BLINK_RT_FN int64_t blink_sqlite3_result_rc(blink_handle* r) {
     blink_sqlite3_result* res = (blink_sqlite3_result*)r;
     return res->rc;
 }

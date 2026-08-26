@@ -1,0 +1,43 @@
+// Every runtime shim body in bootstrap/runtime_sqlite.h must carry the
+// BLINK_RT_FN linkage macro. In the plain single-TU build that macro expands to
+// `static`, giving each translation unit its own copy; in the archive monolith
+// it expands to a single external definition. A shim declared WITHOUT the macro
+// gets plain external linkage with an always-emitted body, so if the sqlite
+// runtime header reaches more than one TU under BLINK_USE_SQLITE the linker sees
+// two definitions of that symbol and fails with a duplicate-symbol error.
+//
+// This drives the real C toolchain over the actual bootstrap header (two TUs,
+// both under BLINK_USE_SQLITE) and asserts they link clean — the only faithful
+// way to observe a cross-TU linkage regression, since blinkc emits C and never
+// links, and self-host builds a single TU.
+//
+// sqlite is a peeled native dep: CI runs in a container with no system
+// libsqlite3, only the vendored lib/native/sqlite3 header/source. So the header
+// comes from -Ilib/native/sqlite3, and the link uses
+// --unresolved-symbols=ignore-all instead of -lsqlite3: the real sqlite3_*
+// bodies are irrelevant to a shim-linkage test, and a duplicate definition
+// still errors while the undefined sqlite3_* references are tolerated.
+
+fn tu_with_main() -> Str {
+    "#define BLINK_USE_SQLITE 1\n#include \"bootstrap/runtime.h\"\nint main(void) \{ return 0; \}\n"
+}
+
+fn tu_header_only() -> Str {
+    "#define BLINK_USE_SQLITE 1\n#include \"bootstrap/runtime.h\"\n"
+}
+
+test "two TUs including the sqlite runtime header link without a duplicate symbol" {
+    write_file("build/_ydetew_a.c", tu_with_main())
+    write_file("build/_ydetew_b.c", tu_header_only())
+    let script = "cc -c -I. -Ibootstrap -Ilib/native/sqlite3 build/_ydetew_a.c -o build/_ydetew_a.o 2>&1"
+        .concat(" && cc -c -I. -Ibootstrap -Ilib/native/sqlite3 build/_ydetew_b.c -o build/_ydetew_b.o 2>&1")
+        .concat(" && cc build/_ydetew_a.o build/_ydetew_b.o -o build/_ydetew_app -Wl,--unresolved-symbols=ignore-all 2>&1")
+    let r = process_run("sh", ["-c", script])
+    assert(r.exit_code == 0, "two sqlite-runtime TUs must compile and link cleanly (a duplicate shim symbol fails the link)")
+    assert(!r.out.contains("multiple definition"), "a sqlite shim collides across TUs — it is missing the BLINK_RT_FN linkage macro")
+    fs_remove("build/_ydetew_a.c")
+    fs_remove("build/_ydetew_b.c")
+    fs_remove("build/_ydetew_a.o")
+    fs_remove("build/_ydetew_b.o")
+    fs_remove("build/_ydetew_app")
+}
