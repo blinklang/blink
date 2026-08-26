@@ -1,0 +1,330 @@
+import compile_test_helpers
+
+// br tn8fdd — @derive(Serialize) never checked that a field type is actually serializable.
+// A field of a non-serializable type (a Ptr, an @ffi.opaque handle, a user type with no
+// Serialize impl, or a container the emitter cannot yet produce) passed typecheck and reached
+// codegen, where emit_field_serialize silently emitted the literal "null" for it — the banned
+// silent-fallback the derive-field checks exist to prevent (spec 03_types.md container-Debug
+// no-silent-stand-in rule). This mirrors the existing per-field derive checks: @derive(Debug)
+// fires E0520 and @derive(Hash/Eq/Ord) fires E1401 NonDerivableTrait (spec 03_types.md:2850,
+// section 3.6.6). @derive(Serialize) now uses the same E1401 NonDerivableTrait per-field check.
+// The serializable v1 set for a struct field = Int/Float/Bool/Str, a List of a serializable
+// element, or a struct/enum that itself derives Serialize. An enum-variant field is stricter:
+// no List (emit_enum_to_json has no list branch) and only a derived struct (not an enum) may
+// recurse (its nested arm gates on is_struct_type) — the enum emitter is weaker than the struct
+// emitter, and the check mirrors each emitter's faithful set exactly. Char, the sized ints, and
+// F32/F64 all serialize to "null" and are rejected even though they are scalars.
+
+fn ptr_field_src() -> Str {
+    #"@derive(Serialize)
+type Box { p: Ptr[U8] }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with a Ptr field is E1401" {
+    compile_test_helpers.expect_compile_error(ptr_field_src(), "tn8fdd_ptr", "E1401")
+}
+
+fn opaque_field_src() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+@derive(Serialize)
+type Wrap { f: CFile }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with an @ffi.opaque field is E1401" {
+    compile_test_helpers.expect_compile_error(opaque_field_src(), "tn8fdd_opaque", "E1401")
+}
+
+fn nonserialize_struct_field_src() -> Str {
+    #"type Plain { a: Int }
+@derive(Serialize)
+type Holder { inner: Plain }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with a non-Serialize user struct field is E1401" {
+    compile_test_helpers.expect_compile_error(nonserialize_struct_field_src(), "tn8fdd_userstruct", "E1401")
+}
+
+// A container the v1 emitter cannot faithfully produce (only List is emitted; Option/Map/Set/
+// Result fall through to the silent "null"). Rejected until codegen grows the support.
+fn option_field_src() -> Str {
+    #"@derive(Serialize)
+type Box { v: Option[Int] }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with an Option field is E1401" {
+    compile_test_helpers.expect_compile_error(option_field_src(), "tn8fdd_option", "E1401")
+}
+
+fn map_field_src() -> Str {
+    #"@derive(Serialize)
+type Box { m: Map[Str, Int] }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with a Map field is E1401" {
+    compile_test_helpers.expect_compile_error(map_field_src(), "tn8fdd_map", "E1401")
+}
+
+// Enum-variant fields take a stricter path than struct fields (emit_enum_to_json).
+fn enum_variant_ptr_src() -> Str {
+    #"@derive(Serialize)
+type E { V(p: Ptr[U8]) }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with a non-serializable enum-variant field is E1401" {
+    compile_test_helpers.expect_compile_error(enum_variant_ptr_src(), "tn8fdd_enumvariant", "E1401")
+}
+
+// A List whose element type is not serializable is rejected — the check recurses into the List.
+fn list_of_ptr_src() -> Str {
+    #"@derive(Serialize)
+type Box { xs: List[Ptr[U8]] }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with a List of non-serializable element is E1401" {
+    compile_test_helpers.expect_compile_error(list_of_ptr_src(), "tn8fdd_listptr", "E1401")
+}
+
+// Guards: legitimate serializable types must still derive cleanly (no false E1401).
+fn primitives_src() -> Str {
+    #"@derive(Serialize)
+type User { name: Str
+age: Int
+score: Float
+active: Bool }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize over scalar primitives still typechecks (no false E1401)" {
+    compile_test_helpers.expect_no_error(primitives_src(), "tn8fdd_primitives", "E1401")
+}
+
+fn nested_serialize_struct_src() -> Str {
+    #"@derive(Serialize)
+type Address { city: Str
+zip: Str }
+@derive(Serialize)
+type Person { name: Str
+address: Address }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with a nested Serialize struct field still typechecks (no false E1401)" {
+    compile_test_helpers.expect_no_error(nested_serialize_struct_src(), "tn8fdd_nested", "E1401")
+}
+
+fn list_of_str_src() -> Str {
+    #"@derive(Serialize)
+type Post { tags: List[Str] }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with a List[Str] field still typechecks (no false E1401)" {
+    compile_test_helpers.expect_no_error(list_of_str_src(), "tn8fdd_liststr", "E1401")
+}
+
+fn list_of_serialize_struct_src() -> Str {
+    #"@derive(Serialize)
+type Item { sku: Str }
+@derive(Serialize)
+type Cart { items: List[Item] }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with a List of Serialize struct still typechecks (no false E1401)" {
+    compile_test_helpers.expect_no_error(list_of_serialize_struct_src(), "tn8fdd_listitem", "E1401")
+}
+
+fn enum_primitive_src() -> Str {
+    #"@derive(Serialize)
+type Shape { Circle(radius: Float)
+Point }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize enum with primitive variant fields still typechecks (no false E1401)" {
+    compile_test_helpers.expect_no_error(enum_primitive_src(), "tn8fdd_enumprim", "E1401")
+}
+
+// A generic type parameter cannot be resolved at derive time — the check fails open, deferring
+// the serializability decision to instantiation (mirrors the Debug / Hash-Eq-Ord passes).
+fn generic_param_src() -> Str {
+    #"@derive(Serialize)
+type Box[T] { value: T }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize over a generic type param does not false-positive E1401" {
+    compile_test_helpers.expect_no_error(generic_param_src(), "tn8fdd_generic", "E1401")
+}
+
+// Char is a scalar but emit_field_serialize has no CT_CHAR branch — it serializes to "null".
+fn char_field_src() -> Str {
+    #"@derive(Serialize)
+type Box { c: Char }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with a Char field is E1401" {
+    compile_test_helpers.expect_compile_error(char_field_src(), "tn8fdd_char", "E1401")
+}
+
+// A sized int keeps a distinct CT (CT_U8 here) that falls through to "null" — only Int/I64 are
+// faithful.
+fn sized_int_field_src() -> Str {
+    #"@derive(Serialize)
+type Box { n: U8 }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with a sized-int field is E1401" {
+    compile_test_helpers.expect_compile_error(sized_int_field_src(), "tn8fdd_sized", "E1401")
+}
+
+// F32/F64 keep distinct CTs — only the plain Float is faithful (float_to_str).
+fn f32_field_src() -> Str {
+    #"@derive(Serialize)
+type Box { x: F32 }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with an F32 field is E1401" {
+    compile_test_helpers.expect_compile_error(f32_field_src(), "tn8fdd_f32", "E1401")
+}
+
+// A nested List: emit_list_serialize has no branch for a list-of-list element, so the inner list
+// serializes to "null". The element predicate is non-recursive.
+fn nested_list_field_src() -> Str {
+    #"@derive(Serialize)
+type Box { grid: List[List[Int]] }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with a List of List field is E1401" {
+    compile_test_helpers.expect_compile_error(nested_list_field_src(), "tn8fdd_nestedlist", "E1401")
+}
+
+// An enum-variant List field: emit_enum_to_json has NO list branch, so even a List of primitives
+// serializes to "null" — stricter than the struct path, which does render List[Int].
+fn enum_variant_list_src() -> Str {
+    #"@derive(Serialize)
+type E { V(xs: List[Int]) }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with an enum-variant List field is E1401" {
+    compile_test_helpers.expect_compile_error(enum_variant_list_src(), "tn8fdd_enumlist", "E1401")
+}
+
+// An enum-variant field whose type is itself a derived-Serialize enum: emit_enum_to_json gates
+// its nested recursion on is_struct_type, so an enum-typed variant field serializes to "null"
+// even though the same field in a struct would be faithful.
+fn enum_variant_enum_field_src() -> Str {
+    #"@derive(Serialize)
+type Inner { A, B }
+@derive(Serialize)
+type Outer { V(inner: Inner) }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with an enum-typed enum-variant field is E1401" {
+    compile_test_helpers.expect_compile_error(enum_variant_enum_field_src(), "tn8fdd_enumenum", "E1401")
+}
+
+// Guard: a struct field whose type is a derived-Serialize ENUM is faithful (the CT_VOID +
+// has_derive_method arm covers enums), so it must not false-positive.
+fn struct_enum_field_src() -> Str {
+    #"@derive(Serialize)
+type Status { Active, Idle }
+@derive(Serialize)
+type Rec { s: Status }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with a struct field of derived-enum type still typechecks (no false E1401)" {
+    compile_test_helpers.expect_no_error(struct_enum_field_src(), "tn8fdd_structenum", "E1401")
+}
+
+// Guard: a List whose element is a derived-Serialize enum is faithful (elem_struct +
+// has_derive_method resolves the enum), so it must not false-positive.
+fn list_of_enum_src() -> Str {
+    #"@derive(Serialize)
+type Status { Active, Idle }
+@derive(Serialize)
+type Log { entries: List[Status] }
+fn main() {
+    io.println("hi")
+}
+"#
+}
+
+test "derive Serialize with a List of derived-enum element still typechecks (no false E1401)" {
+    compile_test_helpers.expect_no_error(list_of_enum_src(), "tn8fdd_listenum", "E1401")
+}

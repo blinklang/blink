@@ -207,6 +207,11 @@ let mut tc_hashable_types: Map[Str, Int] = Map()
 // Set of struct/enum names that carry @derive(Debug). Used to reject
 // @derive(Debug) on a type whose field's user-type does not also derive Debug.
 let mut tc_debug_types: Map[Str, Int] = Map()
+// Set of struct/enum names that carry @derive(Serialize). Used to reject
+// @derive(Serialize) on a type whose field type is not itself serializable —
+// the emitter only faithfully serializes a user type when it carries the derive
+// (codegen has_derive_method is derive-only), so this mirrors that capability.
+let mut tc_serializable_types: Map[Str, Int] = Map()
 // type name -> its declaration node, for field-derive validation spans.
 let mut tc_type_decl_nodes: Map[Str, Int] = Map()
 
@@ -4219,6 +4224,9 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
     if type_has_derive(td, "Debug") != 0 {
         tc_debug_types.insert(name, 1)
     }
+    if type_has_derive(td, "Serialize") != 0 {
+        tc_serializable_types.insert(name, 1)
+    }
 
     if has_annotation(td, "ffi.struct") != 0 {
         ffi_struct_type_set.insert(name, 1)
@@ -4288,6 +4296,9 @@ fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Rep
     }
     if type_has_derive(td, "Debug") != 0 {
         tc_debug_types.insert(name, 1)
+    }
+    if type_has_derive(td, "Serialize") != 0 {
+        tc_serializable_types.insert(name, 1)
     }
 
     if has_annotation(td, "deprecated") != 0 {
@@ -4639,6 +4650,134 @@ fn tc_check_derive_hash_eq_ord() ! Diag.Report {
     tc_check_one_derive_trait("Hash")
     tc_check_one_derive_trait("Eq")
     tc_check_one_derive_trait("Ord")
+}
+
+// ---------------------------------------------------------------------------
+// E1401 NonDerivableTrait for @derive(Serialize) — spec §3.6.6, §3.6.2. Mirrors
+// tc_check_derive_debug: every field of a @derive(Serialize) type (and every
+// enum-variant field) must have a type the generated to_json can faithfully
+// serialize. The emitter (emit_field_serialize / emit_list_serialize in
+// codegen_derive.bl) produces a real value for exactly: the scalar primitives,
+// a List of a serializable element (recursively), and a struct/enum that itself
+// carries @derive(Serialize) (has_derive_method is derive-only). Any other type
+// — Ptr, an @ffi.opaque handle, a non-Serialize user type, or a container the
+// emitter does not yet walk (Option/Map/Set/Result) — falls through to the
+// literal "null", the banned silent fallback the per-field derive checks exist
+// to prevent. Reject those at derive time instead. Fails OPEN on a generic type
+// param (a name that is neither a builtin nor a registered user type), deferring
+// the decision to instantiation, exactly as the Debug and Hash/Eq/Ord passes do.
+
+// Is a bare scalar type name one the to_json emitter renders as a real JSON leaf
+// (not "null")? Only these four reach a faithful emitter branch: Int / I64 →
+// int_to_str (both lower to CT_INT), Float → float_to_str, Bool → true/false,
+// Str → escaped string. Char, the sized ints (I8/I16/I32, U8/U16/U32/U64) and
+// F32/F64 keep distinct CTs that fall through the emitter's else arm to the
+// literal "null", so they are NOT accepted here — this must not reuse the
+// Hash/Eq/Ord scalar helpers, whose set is wider than the emitter's.
+fn tc_serialize_scalar_ok(n: Str) -> Int {
+    if n == "Int" || n == "I64" || n == "Float" || n == "Bool" || n == "Str" { return 1 }
+    0
+}
+
+// A user type is faithfully serialized only when it itself derives Serialize
+// (mirrors the emitter's derive-only has_derive_method). An @ffi.opaque handle
+// is a registered struct with no derive, so it is rejected. A name that is
+// neither a builtin nor a registered user type is a generic type param — fail
+// open, deferring the decision to instantiation, as the Debug / Hash-Eq-Ord
+// passes do.
+fn tc_serialize_user_type_ok(name: Str) -> Int {
+    let bare = strip_module_qualifier(name)
+    if named_type_map.contains_key(name) || named_type_map.contains_key(bare) {
+        if tc_serializable_types.contains_key(name) || tc_serializable_types.contains_key(bare) { return 1 }
+        return 0
+    }
+    1
+}
+
+// A List element type emit_list_serialize renders faithfully: a scalar leaf, or
+// a user struct/enum that itself derives Serialize (the elem_struct +
+// has_derive_method arm covers both). A nested List, Char, a sized int, F32/F64,
+// Option, Map, etc. all fall through to "null", so is_primitive_type rejects
+// them (List included) before the user-type check.
+fn tc_serialize_list_elem_ok(ann: Int) -> Int {
+    let name = node_name(ann)
+    if tc_serialize_scalar_ok(name) != 0 { return 1 }
+    if is_primitive_type(name) != 0 { return 0 }
+    tc_serialize_user_type_ok(name)
+}
+
+// A struct-field type emit_field_serialize renders faithfully: a scalar leaf, a
+// List of a faithful element, or a user struct/enum that derives Serialize (its
+// CT_VOID + has_derive_method arm covers both struct and enum fields).
+fn tc_serialize_struct_field_ok(ann: Int) -> Int {
+    let name = node_name(ann)
+    if tc_serialize_scalar_ok(name) != 0 { return 1 }
+    if name == "List" {
+        let elems_sl = node_elements(ann)
+        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+            return tc_serialize_list_elem_ok(sublist_get(elems_sl, 0))
+        }
+        // A bare List with no element annotation cannot be proven serializable.
+        return 0
+    }
+    if is_primitive_type(name) != 0 { return 0 }
+    tc_serialize_user_type_ok(name)
+}
+
+// An enum-variant field type emit_enum_to_json renders faithfully — a strictly
+// weaker set than the struct path. It has NO List branch (even List[Int] emits
+// "null") and gates nested recursion on is_struct_type, so an enum-typed field
+// (even one deriving Serialize) also emits "null". Faithful set: a scalar leaf,
+// or a user STRUCT that derives Serialize. List and enum-typed fields are
+// rejected here until emit_enum_to_json grows the matching branches.
+fn tc_serialize_variant_field_ok(ann: Int) -> Int {
+    let name = node_name(ann)
+    if tc_serialize_scalar_ok(name) != 0 { return 1 }
+    if is_primitive_type(name) != 0 { return 0 }
+    let bare = strip_module_qualifier(name)
+    if named_type_map.contains_key(name) || named_type_map.contains_key(bare) {
+        if tc_serializable_types.contains_key(name) || tc_serializable_types.contains_key(bare) {
+            if tc_type_is_struct(name) != 0 || tc_type_is_struct(bare) != 0 { return 1 }
+            return 0
+        }
+        return 0
+    }
+    // Generic type param — fail open.
+    1
+}
+
+fn tc_check_one_serialize_field(f: Int, tname: Str, in_variant: Int) ! Diag.Report {
+    let ann = node_value(f)
+    let ok = if in_variant != 0 { tc_serialize_variant_field_ok(ann) } else { tc_serialize_struct_field_ok(ann) }
+    if ok == 0 {
+        diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive(Serialize) on '{tname}': field '{node_name(f)}' has type '{node_name(ann)}' which does not implement Serialize", f, "remove the field from the derive, give it a type that implements Serialize, or implement Serialize by hand")
+    }
+}
+
+fn tc_check_derive_serialize() ! Diag.Report {
+    let mut ti = 0
+    while ti < named_type_names.len() {
+        let tname = named_type_names.get(ti).unwrap()
+        if tc_serializable_types.contains_key(tname) != 0 {
+            let flds_sl = node_fields(tc_type_decl_nodes.get(tname).unwrap())
+            let mut i = 0
+            while flds_sl != -1 && i < sublist_length(flds_sl) {
+                let f = sublist_get(flds_sl, i)
+                if node_kind(f) == NodeKind.TypeVariant {
+                    let vflds_sl = node_fields(f)
+                    let mut vi = 0
+                    while vflds_sl != -1 && vi < sublist_length(vflds_sl) {
+                        tc_check_one_serialize_field(sublist_get(vflds_sl, vi), tname, 1)
+                        vi = vi + 1
+                    }
+                } else {
+                    tc_check_one_serialize_field(f, tname, 0)
+                }
+                i = i + 1
+            }
+        }
+        ti = ti + 1
+    }
 }
 
 // Kind A collision: a struct type whose name equals an enum variant name. This is the
@@ -5944,6 +6083,7 @@ fn init_types() ! TypeCheck.Register {
     fs_error_runtime_tid_cache = -1
     tc_hashable_types.clear()
     tc_debug_types.clear()
+    tc_serializable_types.clear()
     tc_type_decl_nodes.clear()
     tc_alias_underlying = Map()
     sfield_pool.clear()
@@ -6080,6 +6220,10 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     // @derive(Hash/Eq/Ord) requires every field's type to implement that trait
     // (spec §3.6.6 NonDerivableTrait, E1401).
     tc_check_derive_hash_eq_ord()
+
+    // @derive(Serialize) requires every field's type to be serializable by the
+    // generated to_json (spec §3.6.2/§3.6.6 NonDerivableTrait, E1401).
+    tc_check_derive_serialize()
 
     // Register all function signatures
     let fns_sl = node_params(program)
