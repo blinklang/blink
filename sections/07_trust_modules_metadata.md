@@ -160,7 +160,7 @@ The `ffi` namespace and the FFI pointer types are **compiler-known intrinsics**,
 
 **The two real gates.** The unsafe FFI surface is gated twice, and these are the *only* gates:
 
-1. **`PtrOutsideFFI` (E0811)** — a `Ptr[T]` may appear only inside an `@ffi`/`@trusted` context. This is a per-function capability gate on *where* pointer types are allowed, checked structurally regardless of imports.
+1. **`PtrOutsideFFI` (E0811)** — a `Ptr[T]` may appear only inside an **FFI region**: the body of an `@ffi`/`@trusted` function, or a `with ffi.scope() as _ { }` block (the canonical region list lives with *Pointer Operations*, E0811, below). This is a per-function capability gate on *where* pointer types are allowed, checked structurally regardless of imports.
 2. **`#275` native-dependency manifest** — an `@ffi` declaration without a matching `[native-dependencies]` entry in `blink.toml` is a compile error (§10.5.4).
 
 There is **no import gate** on FFI. A per-file `import blink.ffi` requirement would be strictly weaker than `rg '@ffi'` and would make `import` a capability boundary it is nowhere else in the language. See [FFI import namespace resolution](../decisions/ffi-import-namespace-resolution.md).
@@ -208,7 +208,15 @@ error[E0810]: invalid Ptr type parameter
 
 #### Pointer Operations
 
-All pointer operations are methods on `Ptr[T]` and compiler-known functions in the `ffi` namespace. They are available **without any import** — `ffi` is a no-import intrinsic namespace like `io`/`net`/`time`, and `import blink.ffi[.{...}]` is an **optional documentation marker**, never a requirement. The capability gate is on *where* a `Ptr[T]` may appear — inside an `@ffi`/`@trusted` context (`PtrOutsideFFI`, E0811) — not on any import (see *FFI import resolution and the real gates* above).
+All pointer operations are methods on `Ptr[T]` and compiler-known functions in the `ffi` namespace. They are available **without any import** — `ffi` is a no-import intrinsic namespace like `io`/`net`/`time`, and `import blink.ffi[.{...}]` is an **optional documentation marker**, never a requirement. The capability gate is on *where* a `Ptr[T]` may appear — inside an **FFI region** (`PtrOutsideFFI`, E0811) — not on any import (see *FFI import resolution and the real gates* above).
+
+**FFI regions.** A `Ptr[T]` — and every pointer operation in the table below — may appear only inside one of three lexical regions. This is the single, canonical statement of where E0811 permits a pointer; other sections point here rather than restate it:
+
+1. the body of an `@ffi` function;
+2. the body of an `@trusted` function;
+3. a `with ffi.scope() as _ { }` block (§9.1.1, *`ffi.scope`* — the block that owns the pointer's lifetime).
+
+The region is a **purely syntactic**, per-function structural property, decided without type resolution. A closure literal written inside a region **inherits** it — the pointer operations stay legal in the closure body. A **named** nested `fn` item does **not** inherit the enclosing region: it is its own function and needs its own `@ffi`/`@trusted` annotation or its own `ffi.scope` block. A pointer that *escapes* its region dynamically — stored past it, returned, or captured by an escaping closure — is not E0811's concern; that is the scope-escape diagnostic E0601 (§9.1.1).
 
 This is the **canonical** `Ptr[T]` operations table. §9.1.3 extends it with `@ffi.struct` field projection (`p.field.read()` / `p.field.write(v)`) and array regions (`scope.alloc_n`); no other section redefines these operations.
 
@@ -901,7 +909,7 @@ An `@ffi.opaque` handle is **non-null by the FFI-boundary contract**. Absence is
 
 #### Construction — sealed to the FFI boundary
 
-A handle value can be produced **only at the FFI boundary**: as the return value of an `@ffi` function, or by reading one out of a `Ptr` cell inside an `@ffi`/`@trusted` region. There is no literal and no user-callable constructor; constructing or coercing an `@ffi.opaque` value from ordinary Blink code is rejected by the existing construction / type-mismatch diagnostics (no new error code). `Ptr[Sqlite3]` is a legal FFI inner type (it lowers to `sqlite3 **`, the standard out-parameter shape), so a handle is minted by dereferencing the out-cell at the boundary:
+A handle value can be produced **only at the FFI boundary**: as the return value of an `@ffi` function, or by reading one out of a `Ptr` cell wherever a `Ptr[T]` may legally appear — an **FFI region** in the sense of E0811 (§9.1.1, *Pointer Operations* — an `@ffi`/`@trusted` body or a `with ffi.scope() as _ { }` block). The mint boundary is exactly that region set: it is not restated here, so the two cannot drift. There is no literal and no user-callable constructor; constructing or coercing an `@ffi.opaque` value from ordinary Blink code is rejected by the existing construction / type-mismatch diagnostics (no new error code). `Ptr[Sqlite3]` is a legal FFI inner type (it lowers to `sqlite3 **`, the standard out-parameter shape), so a handle is minted by dereferencing the out-cell at the boundary:
 
 ```blink
 // raw FFI binding — private, audited
@@ -922,9 +930,9 @@ pub fn open(path: Str) -> Option[Connection] ! IO {
 }
 ```
 
-`out.deref()` returns a bare `Sqlite3` (deref on a non-`Void` pointer is legal — E0825 rejects only `Ptr[Void]`, §9.1.1). Round-tripping a handle *back* to a raw pointer to hand to another C call is likewise confined to `@ffi`/`@trusted`; because the handle has no `.addr()` in ordinary code, it cannot be fabricated or re-crossed outside the boundary.
+`out.deref()` returns a bare `Sqlite3` (deref on a non-`Void` pointer is legal — E0825 rejects only `Ptr[Void]`, §9.1.1). Round-tripping a handle *back* to a raw pointer to hand to another C call is likewise confined to an FFI region (E0811, §9.1.1); because the handle has no `.addr()` in ordinary code, it cannot be fabricated or re-crossed outside the boundary.
 
-Every boundary crossing that produces or consumes an opaque handle is tagged with the `blink audit` category **`opaque-ffi-handle`**, so the FFI inventory (§9.1, *`blink audit`*) lists them alongside pointer allocations and `Raw()` sites.
+Every boundary crossing that produces or consumes an opaque handle is tagged with the `blink audit` category **`opaque-ffi-handle`**, so the FFI inventory (§9.1, *`blink audit`*) lists them alongside pointer allocations and `Raw()` sites. The crossings the audit tags are exactly those lexically inside an FFI region (E0811, above): a **mint** is a `Ptr[opaque].deref()` in such a region, a **round-trip** is a handle handed back to raw there. Because both the audit and E0811 read the same region set, a site cannot compile as legal yet slip the audit — the region predicate has one definition.
 
 #### Choosing among the three FFI type mechanisms
 
