@@ -1,0 +1,71 @@
+// Element-agnostic classification for poly impls over builtin containers decides
+// whether the impl lowers to one shared C symbol (elements opaque) or needs
+// per-element monomorphization. A binder that reaches a method through a
+// callback return type, or that carries a where-clause bound, makes the impl
+// element-dependent -- it must stay E0908 until per-element mono lands
+// (project b1bdnh), not be miscompiled as a single symbol. The inverse -- a
+// truly agnostic Set impl -- must still be accepted.
+import std.process { ProcessResult }
+
+fn run_check(blink_root: Str, base: Str, fname: Str, src: Str) -> ProcessResult {
+    write_file("{base}/{fname}", src)
+    let cmd = "cd {base} && {blink_root}/build/blink check --json {fname} 2>&1"
+    return process_run("sh", ["-c", cmd])
+}
+
+fn expect_e0908(r: ProcessResult, label: Str) -> Int {
+    if r.exit_code == 0 {
+        io.println("FAIL: {label} should be rejected (E0908), but check exited 0")
+        return 1
+    }
+    if !r.out.contains("\"code\":\"E0908\"") {
+        io.println("FAIL: {label} should report E0908 (element-dependent poly impl)")
+        io.println("got: {r.out}")
+        return 1
+    }
+    0
+}
+
+fn main() {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+    let base = ".tmp/_test_impl_poly_agnostic_binder_leak"
+    shell_exec("rm -rf {base}")
+    shell_exec("mkdir -p {base}")
+    write_file(
+        "{base}/blink.toml",
+        "[package]\nname = \"ipabl\"\nversion = \"0.1.0\"\n\n[dependencies]\n"
+    )
+
+    // Bug A: binder T appears only in a callback RETURN type. A fn-type
+    // annotation stores its return in `type_ann`, not `elements`, so a scan that
+    // walks only `elements` misses T and wrongly calls the impl agnostic.
+    let src_a = "pub trait Foo[T] \{\n    fn f(self, cb: fn() -> T) -> Int\n\}\n\nimpl[T] Foo[T] for Set[T] \{\n    fn f(self, _cb: fn() -> T) -> Int \{ 0 \}\n\}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n"
+    if expect_e0908(run_check(blink_root, base, "a.bl", src_a), "binder in callback return type") != 0 {
+        shell_exec("rm -rf {base}")
+        return
+    }
+
+    // Bug B: binder T is bounded through a where-clause. A bounded binder can
+    // materialize a T even when T is absent from every signature, so the impl is
+    // element-dependent. where-bounds live in a separate impl sublist, not on the
+    // binder node.
+    let src_b = "pub trait Bound \{\n    fn b(self) -> Int\n\}\n\npub trait Bar \{\n    fn g(self) -> Int\n\}\n\nimpl[T] Bar for Set[T] where T: Bound \{\n    fn g(self) -> Int \{ 0 \}\n\}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n"
+    if expect_e0908(run_check(blink_root, base, "b.bl", src_b), "where-bounded binder") != 0 {
+        shell_exec("rm -rf {base}")
+        return
+    }
+
+    // Inverse guard: a truly agnostic Set impl -- no binder in any signature, no
+    // bound -- must be ACCEPTED (single-symbol eager path), not over-rejected.
+    let src_ok = "pub trait Baz \{\n    fn h(self, key: Str) -> Int\n\}\n\nimpl[T] Baz for Set[T] \{\n    fn h(self, _key: Str) -> Int \{ 0 \}\n\}\n\nfn main() \{\n    io.println(\"ok\")\n\}\n"
+    let r_ok = run_check(blink_root, base, "ok.bl", src_ok)
+    if r_ok.exit_code != 0 {
+        io.println("FAIL: agnostic Set impl must be accepted, but check exited {r_ok.exit_code}")
+        io.println("got: {r_ok.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+
+    io.println("PASS: binder leaks (callback return, where-bound) stay E0908; agnostic Set impl accepted")
+    shell_exec("rm -rf {base}")
+}

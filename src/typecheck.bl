@@ -1,6 +1,6 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on}
 import std.str.{str_to_lower}
-import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, c_type_c_name, is_transparent_newtype, is_opaque_type, opaque_handle_c_name, resolve_effect_vtable, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_CLOSURE, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_HANDLER, CT_CHANNEL, CT_PTR, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_TEMPLATE, CT_FFI_SCOPE, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
+import codegen_types.{impl_is_element_agnostic, is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, c_type_c_name, is_transparent_newtype, is_opaque_type, opaque_handle_c_name, resolve_effect_vtable, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_CLOSURE, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_HANDLER, CT_CHANNEL, CT_PTR, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_TEMPLATE, CT_FFI_SCOPE, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
 import parser.{
     get_annotation, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
@@ -5915,22 +5915,44 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
         // E0908 gate is emitted after those checks (so a malformed poly impl reports
         // both its specific contract error and E0908) to block codegen.
         let is_poly = if binders_sl != -1 || recv_args_sl != -1 { 1 } else { 0 }
-        // ONLY the canonical builtin form `impl[T] Trait[T] for List[T]`
-        // — exactly one impl binder, a List receiver with exactly one type arg,
-        // and that type arg IS the binder — is monomorphized in codegen, so it
-        // must NOT trip E0908. Codegen assumes the single binder is the List's
-        // element type, so any other shape must still be rejected: multi-binder
-        // impls (`impl[T,U] Trait[T] for List[U]` would mis-map both binders to
-        // the element), binders without a receiver type-arg (Holder), receiver
-        // args without binders (Box[Int]), concrete `List[Int]`, user generic
-        // structs (Box[T]), and Map/Set receivers.
+        // Two supported canonical builtin forms:
+        //  1. `impl[T] Trait[T] for List[T]` — monomorphized per element T in
+        //     codegen (or, when element-agnostic, routed to the single-symbol
+        //     eager path). Codegen assumes the single binder is List's element.
+        //  2. Element-agnostic `impl[T] Trait[T] for Set[T]` and
+        //     `impl[K,V] Trait[K,V] for Map[K,V]` — these lower to ONE symbol
+        //     shared by every element type (byte-identical to a bare
+        //     `impl for Set`/`impl for Map`), so they route to the same eager
+        //     path. A TYPE-DEPENDENT Set/Map poly impl (a binder in a method
+        //     signature) would need per-element monomorphization that is not
+        //     built yet, so it must still trip E0908.
+        // Any other shape stays unsupported: multi-binder List impls (mis-map
+        // both binders to the element), binders without a receiver type-arg
+        // (Holder), receiver args without binders (Box[Int]), concrete
+        // `List[Int]`, and user generic structs (Box[T]).
         let mut poly_supported = 0
-        if binders_sl != -1 && recv_args_sl != -1 && impl_type == "List" {
-            if sublist_length(binders_sl) == 1 && sublist_length(recv_args_sl) == 1 {
+        if binders_sl != -1 && recv_args_sl != -1 {
+            let nb = sublist_length(binders_sl)
+            let nr = sublist_length(recv_args_sl)
+            if impl_type == "List" && nb == 1 && nr == 1 {
                 let binder_name = node_name(sublist_get(binders_sl, 0))
-                let recv_arg_name = node_name(sublist_get(recv_args_sl, 0))
-                if binder_name != "" && recv_arg_name == binder_name {
+                if binder_name != "" && node_name(sublist_get(recv_args_sl, 0)) == binder_name {
                     poly_supported = 1
+                }
+            }
+            if poly_supported == 0 && impl_is_element_agnostic(im) != 0 {
+                if impl_type == "Set" && nb == 1 && nr == 1 {
+                    let sb = node_name(sublist_get(binders_sl, 0))
+                    if sb != "" && node_name(sublist_get(recv_args_sl, 0)) == sb {
+                        poly_supported = 1
+                    }
+                }
+                if impl_type == "Map" && nb == 2 && nr == 2 {
+                    let k0 = node_name(sublist_get(binders_sl, 0))
+                    let v0 = node_name(sublist_get(binders_sl, 1))
+                    if k0 != "" && v0 != "" && node_name(sublist_get(recv_args_sl, 0)) == k0 && node_name(sublist_get(recv_args_sl, 1)) == v0 {
+                        poly_supported = 1
+                    }
                 }
             }
         }

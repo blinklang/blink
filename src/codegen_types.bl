@@ -1,5 +1,5 @@
 import parser.{
-    node_effects, node_elements, node_fields, node_is_pub, node_module, node_name, node_params, node_return_type,
+    node_effects, node_elements, node_fields, node_impl_binders, node_impl_where_bounds, node_is_pub, node_methods, node_module, node_name, node_params, node_return_type,
     node_source_module, node_trait_name, node_type_ann, node_type_name, node_type_params,
     node_value,
     sublist_get, sublist_length
@@ -14,6 +14,79 @@ effect Codegen {
     effect Emit
     effect Register
     effect Scope
+}
+
+fn collect_type_ann_names(ann: Int, out: List[Str]) {
+    if ann == -1 { return }
+    let n = node_name(ann)
+    if n != "" { out.push(n) }
+    let elems = node_elements(ann)
+    if elems != -1 {
+        let mut i = 0
+        while i < sublist_length(elems) {
+            collect_type_ann_names(sublist_get(elems, i), out)
+            i = i + 1
+        }
+    }
+    // A fn-type annotation stores its parameters in `elements` but its return
+    // type in `type_ann`, so the return binder is only reachable this way.
+    if n == "Fn" {
+        collect_type_ann_names(node_type_ann(ann), out)
+    }
+}
+
+// True when an impl over a builtin container lowers to identical C for every
+// concrete element type: no impl binder is bounded, and no binder name appears
+// in any method signature (parameter or return type). Such an impl treats
+// elements as opaque handles, so it routes through the single-symbol eager path
+// instead of per-element monomorphization. An unbounded, signature-agnostic
+// binder cannot cross a method boundary by value nor be operated on, so the
+// emitted C is provably element-independent.
+pub fn impl_is_element_agnostic(im: Int) -> Int {
+    let binders_sl = node_impl_binders(im)
+    if binders_sl == -1 { return 1 }
+    let nb = sublist_length(binders_sl)
+    if nb == 0 { return 1 }
+    // A where-clause bounds a binder just as an inline `[T: Bound]` does; a
+    // bounded binder can materialize an element value the C would branch on.
+    let where_sl = node_impl_where_bounds(im)
+    if where_sl != -1 && sublist_length(where_sl) != 0 { return 0 }
+    let mut bnames: List[Str] = []
+    let mut bi = 0
+    while bi < nb {
+        let b = sublist_get(binders_sl, bi)
+        if node_elements(b) != -1 { return 0 }
+        bnames.push(node_name(b))
+        bi = bi + 1
+    }
+    let methods_sl = node_methods(im)
+    if methods_sl == -1 { return 1 }
+    let mut j = 0
+    while j < sublist_length(methods_sl) {
+        let m = sublist_get(methods_sl, j)
+        let mut names: List[Str] = []
+        collect_type_ann_names(node_type_ann(m), names)
+        let params_sl = node_params(m)
+        if params_sl != -1 {
+            let mut pi = 0
+            while pi < sublist_length(params_sl) {
+                collect_type_ann_names(node_type_ann(sublist_get(params_sl, pi)), names)
+                pi = pi + 1
+            }
+        }
+        let mut ni = 0
+        while ni < names.len() {
+            let nm = names.get(ni).unwrap()
+            let mut bk = 0
+            while bk < bnames.len() {
+                if nm == bnames.get(bk).unwrap() { return 0 }
+                bk = bk + 1
+            }
+            ni = ni + 1
+        }
+        j = j + 1
+    }
+    1
 }
 
 // codegen_types.bl — Type constants, global state, scope/registry helpers
