@@ -1,0 +1,98 @@
+// A type alias is transparent: `type Outer = Inner` is the underlying type, so a
+// chain `Outer = Inner = Int` names `Int` for every purpose codegen resolves a type
+// name for. The name resolver followed only ONE alias hop, so a 2+-link chain
+// stalled on the intermediate alias: the return type of a fn declared `-> Outer`
+// resolved to a void carrier and its interpolation rendered `<value>` instead of the
+// value. The resolver now follows the chain to a fixpoint, shared by both the
+// CT-code mapping (type_from_name) and the struct-return decision
+// (ret_needs_struct_body), so the two agree on where a chain ends.
+
+type Inner = Int
+type Outer = Inner
+type A = Int
+type B = A
+type C = B
+
+fn get_two_hop() -> Outer { 42 }
+fn get_three_hop() -> C { 7 }
+
+// The core regression: a 2-hop scalar chain return must interpolate its value.
+test "a two-hop alias-chain return interpolates its value" {
+    assert_eq("v={get_two_hop()}", "v=42")
+}
+
+test "a three-hop alias-chain return interpolates its value" {
+    assert_eq("v={get_three_hop()}", "v=7")
+}
+
+// Control: the single-hop case the resolver already handled must keep working.
+type Solo = Int
+fn get_one_hop() -> Solo { 9 }
+
+test "a single-hop alias return still interpolates its value" {
+    assert_eq("v={get_one_hop()}", "v=9")
+}
+
+// ret_needs_struct_body shares the resolver now. A struct alias chain must still
+// select the struct-return convention, so the struct-literal tail is returned as a
+// value and its field reads back — one hop and two must both hold.
+
+type Point {
+    x: Int
+    y: Int
+}
+type PA = Point
+type PB = PA
+
+fn mk_one_hop() -> PA { Point { x: 7, y: 9 } }
+fn mk_two_hop() -> PB { Point { x: 3, y: 4 } }
+
+test "a single-hop struct alias return keeps the struct-return convention" {
+    assert_eq(mk_one_hop().x, 7)
+}
+
+test "a two-hop struct alias-chain return keeps the struct-return convention" {
+    assert_eq(mk_two_hop().x, 3)
+}
+
+// The shared resolver strips generic brackets before the struct-return test, so a
+// generic user struct returned as `-> Box[Int]` now takes the struct-return
+// convention and its value is returned, not dropped as a bare statement.
+type Box[T] {
+    val: T
+}
+fn wrap() -> Box[Int] { Box { val: 42 } }
+
+test "a generic user-struct return returns its value" {
+    assert_eq(wrap().val, 42)
+}
+
+// The reverse must hold: a builtin carrier (Option/Result/...) is never a registered
+// struct or enum, so stripping its bracket must NOT flip it onto the struct-return
+// path — it still carries its value through the carrier convention.
+fn maybe() -> Option[Point] { Some(Point { x: 5, y: 6 }) }
+fn nothing() -> Option[Point] { None }
+
+test "an Option-carrier return still carries its value, not struct-returned" {
+    assert_eq(maybe().unwrap().x, 5)
+    assert(nothing().is_none())
+}
+
+// The struct-return decision also keys on is_enum_type, so an enum alias chain must
+// resolve through the same fixpoint.
+type Color {
+    Red
+    Green
+    Blue
+}
+type C1 = Color
+type C2 = C1
+fn pick() -> C2 { Color.Green }
+
+test "an enum alias-chain return keeps the struct-return convention" {
+    let matched = match pick() {
+        Color.Green => true
+        _ => false
+    }
+    assert(matched)
+}
