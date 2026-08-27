@@ -1340,6 +1340,29 @@ The diagnostic points at the binding — where the annotation fix applies — an
 
 > There is no surface `unknown` / `any` / `?` type in Blink. The concept "a type not yet known" exists only inside the compiler as a transient inference state; it is never a type a program can name, hold, or produce. A value's type is always fully determined or the program does not type-check.
 
+**The judgment is a property of the type, not of the syntactic position.** An unsolved type variable is `error[CannotInferType]` wherever a value's type is finalized — a `let`, a tuple element, a match scrutinee, a struct field, a call argument, a return — never only at a `let`. The same value receives the same answer in every position: a position that silently completes an open variable is a bug, not a second rule.
+
+This governs a sum-type constructor that pins some of its type parameters and leaves the rest open. `Ok(3)` has type `Result[Int, E]` — the argument pins the `Ok` payload, but nothing constrains the error type `E`, so `E` is an unsolved variable exactly as the inner type of a bare `None` is. It is `error[CannotInferType]`, and it is that error in every position, including inside a tuple that is the scrutinee of a `match`:
+
+```blink
+fn f() -> Int {
+    match (Ok(3), 9) {            // error[CannotInferType]: the error type of `Ok(3)` is undetermined
+        (a, n) => {                //   — nothing pins the `Err` type of this `Result`
+            match a {
+                Ok(v) => v + n
+                Err(e) => n        // binds `e` but discards it — observes the container, not `E`
+            }
+        }
+    }
+}
+```
+
+The `Err(e) => n` arm does not rescue the scrutinee. It binds `e` but discards it without observing its type, so — like `.len()` on a list of undetermined element type — it constrains the container's shape, not the open parameter. A fully-determined variant is unaffected: `match (Some(5), 9)` compiles, because `Some(5)` pins `Option`'s only parameter and leaves nothing open.
+
+**What pins `E`.** The error type of a `Result` is determined by any one of four things: a type annotation on the binding (`let r: Result[Int, Str] = Ok(3)`), a `?` in a context whose error type it must match, a `match` arm that reads the `Err` payload's type, or an enclosing return type that names it. When none is present, `E` is under-determined and the constructor must state it. The repair is an explicit type-argument list on the constructor — `Ok[Int, Str](3)` (§3.4 *Explicit Type Application*) — placed where the open parameter lives. As with every under-determined binding, E0301 is reported where its repair attaches (§3.4, amended by `8w0yj9`): the `let` when a binding dominates the value, otherwise the constructor's type-argument position, with the dual-span blame at the open constructor.
+
+There is no "an Ok-only value proves the error type is uninhabited, so resolve it to a bottom type" rule. Inferring a type the program never wrote — whether the erased unit `Void` or a bottom `Never` — into an unconstrained slot is the same unlicensed substitution the two-state model forbids; a `Never` error type is reached only when a program *writes* `Result[Int, Never]`, never chosen by inference for an open slot. The I0001 backstop that catches a variable reaching monomorphization keys on the variable's *kind*, never on the concrete tag it would have been given, so a genuine `Result[Void, Str]` or an explicitly-written `Result[Int, Never]` is unaffected.
+
 #### Recursive Types
 
 Types can reference themselves. The compiler handles the indirection:
