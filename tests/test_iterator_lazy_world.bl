@@ -1,0 +1,78 @@
+// The lazy iteration world of §3c.1: `.into_iter()` is the door from a collection
+// into Iterator[T], iterator-receiver adapters stay lazy (iterator in, iterator out),
+// and `.collect()` crosses back to a List. This is the opt-in half of the two-worlds
+// model — the eager collection half is tested separately.
+//
+// Before this landed, `.into_iter()` was an unresolved method and TyKind.Iterator was
+// never constructed, so `let it: Iterator[Int] = ...` degraded to a bare typevar. These
+// tests pin the constructed carrier and the crossing contract.
+
+fn dbl(x: Int) -> Int { x * 2 }
+fn is_even(x: Int) -> Bool { x % 2 == 0 }
+fn tag(x: Int) -> Str { "n{x}" }
+
+test "into_iter then collect round-trips a list" {
+    let a: List[Int] = [1, 2, 3]
+    let it = a.into_iter()
+    let back = it.collect()
+    assert_eq(back.len(), 3)
+    assert_eq(back.get(0).unwrap(), 1)
+    assert_eq(back.get(2).unwrap(), 3)
+}
+
+test "documented Iterator[Int] annotation over into_iter().take(n)" {
+    let a: List[Int] = [10, 20, 30, 40]
+    let it: Iterator[Int] = a.into_iter().take(2)
+    let got = it.collect()
+    assert_eq(got.len(), 2)
+    assert_eq(got.get(0).unwrap(), 10)
+    assert_eq(got.get(1).unwrap(), 20)
+}
+
+test "lazy adapter chain map+filter then collect" {
+    let a: List[Int] = [1, 2, 3, 4, 5]
+    let out = a.into_iter().map(fn(x: Int) -> Int { dbl(x) }).filter(fn(x: Int) -> Bool { is_even(x) }).collect()
+    assert_eq(out.len(), 5)
+    assert_eq(out.get(0).unwrap(), 2)
+    assert_eq(out.get(4).unwrap(), 10)
+}
+
+test "iterator consumer count" {
+    let a: List[Int] = [1, 2, 3, 4]
+    let n = a.into_iter().filter(fn(x: Int) -> Bool { is_even(x) }).count()
+    assert_eq(n, 2)
+}
+
+test "iterator consumer fold" {
+    let a: List[Int] = [1, 2, 3, 4]
+    let s = a.into_iter().fold(0, fn(acc: Int, x: Int) -> Int { acc + x })
+    assert_eq(s, 10)
+}
+
+test "iterator consumer any and all" {
+    let a: List[Int] = [1, 2, 3, 4]
+    let has_even = a.into_iter().any(fn(x: Int) -> Bool { is_even(x) })
+    let all_pos = a.into_iter().all(fn(x: Int) -> Bool { x > 0 })
+    assert_eq(has_even, true)
+    assert_eq(all_pos, true)
+}
+
+// A lazy map whose closure CHANGES the element type (Int -> Str). The output element must come
+// from the closure return, not the source — the map arm reads it from the Iterator[out] node
+// tid via the sequence-aware helper. The List-only helper declines an Iterator tid and would
+// silently fall back to the source element (Int), mistyping the whole MapIterator.
+test "lazy map changes the element type" {
+    let a: List[Int] = [1, 2, 3]
+    let out = a.into_iter().map(fn(x: Int) -> Str { tag(x) }).collect()
+    assert_eq(out.len(), 3)
+    assert_eq(out.get(0).unwrap(), "n1")
+    assert_eq(out.get(2).unwrap(), "n3")
+}
+
+test "into_iter over a set collects its elements" {
+    let mut s: Set[Int] = Set()
+    s.insert(7)
+    s.insert(9)
+    let collected = s.into_iter().collect()
+    assert_eq(collected.len(), 2)
+}

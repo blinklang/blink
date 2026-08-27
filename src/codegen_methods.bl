@@ -77,7 +77,7 @@ import diagnostics.{
     ICE_SEG_ERASED_SLOT,
 }
 import ast.{NodeKind, is_block_bearing, dbg_trace, dbg_channel_on}
-import typecheck.{tc_channel_elem_ct, tc_channel_elem_struct, tc_ptr_pointee_ct, tc_ptr_pointee_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_tuple_sname, tc_tid_list_elem, tc_tid_list_elem_ct, tc_tid_list_elem_ct_resolved, tc_tid_list_elem_struct, tc_tid_iter_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member, tc_list_rename_help, ctype_probe_at, c_type_from_tid, tc_tid_resolved, tc_tid_subst_mono, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_err_ct, tc_tid_map_key_ct, tc_tid_map_val_ct, tc_tid_set_elem_ct, tc_variant_field_is_selfrec_tuple}
+import typecheck.{tc_channel_elem_ct, tc_channel_elem_struct, tc_ptr_pointee_ct, tc_ptr_pointee_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_tuple_sname, tc_tid_list_elem, tc_tid_list_elem_ct, tc_tid_list_elem_ct_resolved, tc_tid_list_elem_struct, tc_tid_seq_elem_ct_resolved, tc_tid_seq_elem_struct, tc_tid_iter_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member, tc_list_rename_help, ctype_probe_at, c_type_from_tid, tc_tid_resolved, tc_tid_subst_mono, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_err_ct, tc_tid_map_key_ct, tc_tid_map_val_ct, tc_tid_set_elem_ct, tc_variant_field_is_selfrec_tuple}
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
 let mut btc_arg_offset: Int = 0
@@ -4611,6 +4611,42 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         return
     }
 
+    // `.into_iter()` — the crossing door into the lazy world (§3c.1). A CT_ITERATOR is already
+    // in that world, so it is the identity. A CT_LIST builds its list-iterator directly; a CT_SET
+    // normalizes to a list first (the same blink_set_to_list bridge for-in uses), then iterates.
+    // The guard MUST match typecheck's into_iter arm (List/Set/Iterator only): Map->(K,V) and
+    // Str->Char are spec-legal but not yet wired here, so a `map.into_iter()` falls through to the
+    // unresolved-method backstop for a clean error instead of an unguarded miscompile.
+    if method == "into_iter" && (obj_type == CT_ITERATOR || obj_type == CT_LIST || obj_type == CT_SET) {
+        if obj_type == CT_ITERATOR {
+            expr_result_str = obj_str
+            expr_result_type = CT_ITERATOR
+            return
+        }
+        let mut src_str = obj_str
+        let mut src_type = obj_type
+        let mut src_node = obj_node
+        if obj_type == CT_SET {
+            let set_elem_ct = get_set_elem_type(obj_str)
+            let set_elem_struct = get_set_elem_struct(obj_str)
+            let lst = fresh_temp("_ii_setl_")
+            emit_line("blink_list* {lst} = blink_set_to_list({obj_str});")
+            set_var(lst, CT_LIST, 0)
+            if set_elem_ct >= 0 { set_list_elem_type(lst, set_elem_ct) }
+            if set_elem_struct != "" { set_list_elem_struct(lst, set_elem_struct) }
+            src_str = lst
+            src_type = CT_LIST
+            src_node = -1
+        }
+        iter_from_source(src_str, src_type, src_node)
+        let iter_var = ifs_iter_var
+        set_var_iterator(iter_var, ifs_elem_type, ifs_next_fn)
+        if ifs_carrier_tag != "" { set_var_iter_carrier(iter_var, ifs_carrier_tag) }
+        expr_result_str = iter_var
+        expr_result_type = CT_ITERATOR
+        return
+    }
+
     // Iterator adapter and consumer methods — work on both CT_LIST and CT_ITERATOR
     if (obj_type == CT_LIST || obj_type == CT_ITERATOR) && (method == "count" || method == "collect" || method == "for_each" || method == "any" || method == "all" || method == "find" || method == "fold" || method == "map" || method == "filter" || method == "take" || method == "skip" || method == "chain" || method == "flat_map" || method == "enumerate" || method == "zip") {
 
@@ -4709,14 +4745,17 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 return
             }
             // The adapter's forward element is the closure RETURN, recovered from
-            // the authoritative node tid (List[out]) — NOT the source element. A
-            // cross-type map (source ≠ output) needs a two-type iterator: the
-            // source option feeds `source_next`, the output option is what `_next`
-            // returns and what collect/for-in read back.
+            // the authoritative node tid — NOT the source element. A cross-type map
+            // (source ≠ output) needs a two-type iterator: the source option feeds
+            // `source_next`, the output option is what `_next` returns and what
+            // collect/for-in read back. The node tid is List[out] for an eager
+            // receiver and Iterator[out] for a lazy one, so read the element with the
+            // sequence-aware helper — the List-only one declines an Iterator tid and
+            // would silently fall back to the source element (a cross-type miscompile).
             let in_ct = elem_type
             let node_tid = cm_node_mono_tid(node)
-            let mut out_ct = tc_tid_list_elem_ct_resolved(node_tid)
-            let out_struct = tc_tid_list_elem_struct(node_tid)
+            let mut out_ct = tc_tid_seq_elem_ct_resolved(node_tid)
+            let out_struct = tc_tid_seq_elem_struct(node_tid)
             if out_ct < 0 { out_ct = in_ct }
             // A by-value multi-eightbyte closure return — a struct, tuple, enum, or
             // a compound Option/Result — is returned in RAX:RDX under SysV and rides

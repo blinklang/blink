@@ -204,7 +204,7 @@ fn three_annotations_src() -> Str {
     #"fn probe() -> Int {
     let mut a: List[Int] = []
     a.push(1)
-    let it: Iterator[Int] = a.take(1)
+    let it: Iterator[Int] = a.into_iter().take(1)
     let ch: Channel[Str] = Channel(2)
     let h: Handle[Bool] = async.spawn(fn() { true })
     0
@@ -233,29 +233,27 @@ test "Handle[Bool] annotation is TyKind.Handle" {
     assert_eq_str(tid_str_of(tc_tid_child(tid, 0)), "Bool", "Handle result type")
 }
 
-// PINS THE DEFERRAL, and is expected to be REWRITTEN by br qzdz2e rather than to keep
-// passing: `Iterator[Int]` still resolves to a bare typevar named "Iterator", carrying no
-// element. This is a live Stage 3 divergence site — `tid=? flat=Iterator[Int]` — recorded
-// here so it is a named debt with an owner instead of a silent hole. When qzdz2e decides
-// whether `Iterator[T]` is a trait or a concrete carrier and aligns the adapter return
-// types, these three assertions become Iterator / 1 / "Int", exactly like Channel above.
-test "Iterator[Int] annotation is NOT yet TyKind.Iterator (br qzdz2e)" {
+// br qzdz2e RESOLVED: `Iterator[T]` is a concrete sealed carrier (§3c.1:38), constructed by
+// `make_iterator_type` exactly like Channel/Handle above, and the initializer crosses into the
+// lazy world through `.into_iter()`. The three assertions the deferral predicted now hold:
+// Iterator / 1 / "Int".
+test "Iterator[Int] annotation is TyKind.Iterator carrying its element (br qzdz2e)" {
     typecheck_probe("build/vag3wc_repr_it.bl", three_annotations_src())
     let tid = let_tid("it")
     assert_true(tid >= 0, "the annotated let carries a tid at all")
-    assert_eq_str(kind_str(tc_tid_kind(tid)), "Typevar", "Iterator[Int] annotation kind")
-    assert_eq_int(tc_tid_child_count(tid), 0, "Iterator carries no element yet")
+    assert_eq_str(kind_str(tc_tid_kind(tid)), "Iterator", "Iterator[Int] annotation kind")
+    assert_eq_int(tc_tid_child_count(tid), 1, "Iterator child_count")
+    assert_eq_str(tid_str_of(tc_tid_child(tid, 0)), "Int", "Iterator element")
 }
 
 // The rendering is not decoration: the NotIterable diagnostic below contradicted itself
 // because `type_to_str` fell through to the typevar's bare name, so "Channel" was what the
 // user was told about a value the compiler was refusing to treat as a Channel.
-test "the constructed two render with their element, not as a bare name" {
+test "the constructed three render with their element, not as a bare name" {
     typecheck_probe("build/vag3wc_render.bl", three_annotations_src())
     assert_eq_str(tid_str_of(let_tid("ch")), "Channel[Str]", "Channel renders its element")
     assert_eq_str(tid_str_of(let_tid("h")), "Handle[Bool]", "Handle renders its result")
-    // Still the bare name, because still a typevar — see the pin above (br qzdz2e).
-    assert_eq_str(tid_str_of(let_tid("it")), "Iterator", "Iterator renders its bare name")
+    assert_eq_str(tid_str_of(let_tid("it")), "Iterator[Int]", "Iterator renders its element")
 }
 
 // ── Half B — the consequence: an annotated channel is iterable ─────────────────
@@ -329,18 +327,17 @@ test "runtime: an annotated handle awaits" {
     assert_eq_int(got, 42, "await on an annotated Handle[Int]")
 }
 
-// THE REGRESSION GUARD for br qzdz2e. This program follows the documented `List[T] Methods`
-// table (`.take(n) -> Iterator[T]`) and compiles and runs today — but only because the
-// annotation degrades to a typevar that unifies with the `List[Int]` typecheck actually
-// infers for `.take`. Constructing `TyKind.Iterator` breaks it. Whichever way qzdz2e lands,
-// this row makes that program's status a deliberate choice: either it keeps working, or the
-// decision is to reject it and this row changes with a recorded reason.
+// THE REGRESSION GUARD for br qzdz2e, now resolved. With `Iterator[T]` a concrete carrier and
+// eager collection adapters returning `List[T]`, the crossing into the lazy world is explicit:
+// `.into_iter()` opens the door, `.take(n)` stays lazy, and `.collect()` crosses back. The old
+// `a.take(2)` initializer is an eager `List[Int]` and no longer satisfies the annotation — that
+// rejection is the decision qzdz2e recorded (§3c.1:34 "found Iterator, add .collect()" cost).
 test "runtime: a documented Iterator[Int] annotation still compiles and runs" {
     let mut a: List[Int] = []
     a.push(1)
     a.push(2)
     a.push(3)
-    let it: Iterator[Int] = a.take(2)
+    let it: Iterator[Int] = a.into_iter().take(2)
     let got = it.collect()
     assert_eq_int(got.len(), 2, "collect length from an annotated Iterator[Int]")
     assert_eq_int(got.get(0).unwrap(), 1, "collect element from an annotated Iterator[Int]")

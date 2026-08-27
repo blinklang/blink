@@ -874,6 +874,14 @@ pub fn make_channel_type(elem_type: Int) -> Int {
     ty_intern_simple(TyKind.Channel, "Channel", elem_type, -1)
 }
 
+// The sealed, opaque one-inner iterator carrier (sections/03c_protocols.md:38 — "Iterator[T]
+// is a built-in, sealed, opaque type, not a user-implementable trait"). Shaped exactly like
+// make_channel_type: one inner = the element, name = the type's own name. `.into_iter()` is the
+// only door that produces one from a collection, and `.collect()` crosses back to a List.
+pub fn make_iterator_type(elem_type: Int) -> Int {
+    ty_intern_simple(TyKind.Iterator, "Iterator", elem_type, -1)
+}
+
 // The case the audit above missed, because `Handler` was not an unconstructed
 // TyKind: it was not a TyKind AT ALL. `Handler[E]` fell through resolve_type_parts to
 // `make_typevar("Handler")`, and the Fn arm three screens down names what that costs in one line
@@ -3560,6 +3568,15 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
             return make_channel_type(resolve_type_ann(sublist_get(elems_sl, 0)))
         }
         return make_channel_type(TYPE_UNKNOWN)
+    }
+    // The sealed iterator carrier (§3c.1:38). Ahead of resolve_type_name for the same reason
+    // Channel is: is_primitive_type claims the name, and falling through to make_typevar("Iterator")
+    // is what degraded `let it: Iterator[Int] = ...` to a bare typevar that unified with anything.
+    if name == "Iterator" {
+        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+            return make_iterator_type(resolve_type_ann(sublist_get(elems_sl, 0)))
+        }
+        return make_iterator_type(TYPE_UNKNOWN)
     }
     // The fourth carrier for the same reason. `Ptr` is claimed by
     // is_primitive_type (:6486) so no user type could have taken the name, and falling through
@@ -6624,7 +6641,9 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     tc_trait_names.push("From")
     tc_trait_names.push("TryFrom")
     tc_trait_names.push("Into")
-    tc_trait_names.push("Iterator")
+    // Iterator is NOT a trait: §3c.1:38 makes it a sealed, opaque, non-user-implementable
+    // built-in type (constructed by make_iterator_type). IntoIterator stays a trait name —
+    // it is the sealed protocol whose built-in impls `.into_iter()` dispatches through.
     tc_trait_names.push("IntoIterator")
     // These builtins are single-tparam (From[T], Into[T], ...); record
     // their arity so E0910 fires for impls that supply the wrong count. From/
@@ -6633,7 +6652,6 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     tc_trait_tparam_count_idx.insert("From", 1)
     tc_trait_tparam_count_idx.insert("TryFrom", 1)
     tc_trait_tparam_count_idx.insert("Into", 1)
-    tc_trait_tparam_count_idx.insert("Iterator", 1)
     tc_trait_tparam_count_idx.insert("IntoIterator", 1)
 
     // Register impl method signatures
@@ -7591,6 +7609,8 @@ fn is_builtin_method(name: Str) -> Int {
     if name == "flat_map" { return 1 }
     if name == "enumerate" { return 1 }
     if name == "zip" { return 1 }
+    // The crossing door into the lazy iterator world (§3c.1).
+    if name == "into_iter" { return 1 }
     // Map methods
     if name == "contains_key" { return 1 }
     if name == "remove" { return 1 }
@@ -10944,6 +10964,107 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if obj_k == TyKind.Int || obj_k == TyKind.Float || obj_k == TyKind.Bool || obj_k == TyKind.Str || obj_k == TyKind.Char {
             if method == "display" { return TYPE_STR }
             if method == "fmt" { return TYPE_VOID }
+        }
+
+        // `.into_iter()` is the crossing door into the lazy world (§3c.1:11-18, IntoIterator
+        // built-in impls at :127-136): List[T]/Set[T]/Iterator[T] yield T. It is the ONLY
+        // producer of a TyKind.Iterator carrier. Map[K,V]->(K,V) and Str->Char are legal per
+        // the spec table but not yet wired through codegen's into_iter door, so they are left to
+        // fall through to their own method arms rather than typed to an un-lowerable Iterator.
+        if method == "into_iter" {
+            if obj_k == TyKind.List || obj_k == TyKind.Set {
+                return make_iterator_type(ty_pool.get(obj_t).unwrap().inner1)
+            }
+            if obj_k == TyKind.Iterator { return obj_t }
+        }
+
+        // The lazy iterator-receiver world (§3c.1:56-77): adapters are "iterator method in,
+        // iterator out" and the consumers drain. Mirrors the eager List adapter table below but
+        // wraps each adapter result in a fresh Iterator carrier; `.collect()` is the door back to
+        // a List.
+        if obj_k == TyKind.Iterator {
+            let args_sl = node_args(node)
+            let elem = ty_pool.get(obj_t).unwrap().inner1
+            if method == "map" {
+                let cls = closure_arg_at(args_sl, 0)
+                check_closure_param(cls, 0, elem, method, "Iterator")
+                if cls == -1 { return obj_t }
+                let ret_ann = node_type_ann(cls)
+                if ret_ann != -1 {
+                    let u = resolve_type_ann(ret_ann)
+                    if u != -1 { return make_iterator_type(u) }
+                }
+                let ret_str = node_return_type(cls)
+                if ret_str == "" { return obj_t }
+                let u = resolve_type_name(ret_str)
+                if u != -1 { return make_iterator_type(u) }
+                return obj_t
+            }
+            if method == "flat_map" {
+                let cls = closure_arg_at(args_sl, 0)
+                check_closure_param(cls, 0, elem, method, "Iterator")
+                if cls == -1 { return obj_t }
+                let ret_ann = node_type_ann(cls)
+                if ret_ann != -1 {
+                    let u = resolve_type_ann(ret_ann)
+                    if u != -1 { return u }
+                }
+                let ret_str = node_return_type(cls)
+                if ret_str == "" { return obj_t }
+                let u = resolve_type_name(ret_str)
+                if u != -1 { return u }
+                return obj_t
+            }
+            if method == "filter" {
+                let cls = closure_arg_at(args_sl, 0)
+                check_closure_param(cls, 0, elem, method, "Iterator")
+                check_closure_ret(cls, TYPE_BOOL, method, "Iterator")
+                return obj_t
+            }
+            if method == "take" || method == "skip" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Iterator")
+                return obj_t
+            }
+            if method == "chain" {
+                check_builtin_arg(method, 0, obj_t, args_sl, "Iterator")
+                return obj_t
+            }
+            if method == "enumerate" {
+                return make_iterator_type(make_tuple_type([TYPE_INT, elem]))
+            }
+            if method == "zip" {
+                if args_sl == -1 || sublist_length(args_sl) < 1 { return TYPE_UNKNOWN }
+                let other_elem = tc_tid_iter_elem(tc_resolve(infer_type(sublist_get(args_sl, 0))))
+                if other_elem < 0 { return TYPE_UNKNOWN }
+                return make_iterator_type(make_tuple_type([elem, other_elem]))
+            }
+            // Consumers drain the iterator (§3c.1:69).
+            if method == "collect" { return make_list_type(elem) }
+            if method == "count" { return TYPE_INT }
+            if method == "for_each" {
+                check_closure_param(closure_arg_at(args_sl, 0), 0, elem, method, "Iterator")
+                return TYPE_VOID
+            }
+            if method == "any" || method == "all" {
+                let cls = closure_arg_at(args_sl, 0)
+                check_closure_param(cls, 0, elem, method, "Iterator")
+                check_closure_ret(cls, TYPE_BOOL, method, "Iterator")
+                return TYPE_BOOL
+            }
+            if method == "find" {
+                let cls = closure_arg_at(args_sl, 0)
+                check_closure_param(cls, 0, elem, method, "Iterator")
+                check_closure_ret(cls, TYPE_BOOL, method, "Iterator")
+                return make_option_type(elem)
+            }
+            if method == "fold" {
+                if args_sl == -1 || sublist_length(args_sl) < 2 { return TYPE_UNKNOWN }
+                let init_t = infer_type(sublist_get(args_sl, 0))
+                let cls = closure_arg_at(args_sl, 1)
+                check_closure_param(cls, 0, init_t, method, "Iterator")
+                check_closure_param(cls, 1, elem, method, "Iterator")
+                return init_t
+            }
         }
 
         if obj_k == TyKind.List {
@@ -14482,12 +14603,11 @@ fn type_to_str(tid0: Int) -> Str {
         TyKind.Unknown => return "?"
         TyKind.Typevar => return name
         TyKind.Enum => return name
-        // Channel/Handle are constructed, so they render their inner rather than the
+        // Channel/Handle/Iterator are constructed, so they render their inner rather than the
         // bare name. The bare name is what made NotIterable read "cannot iterate over
         // type 'Channel' -- only ... Channel ... implement iteration": one line contradicting
-        // itself. TyKind.Iterator stays UNCONSTRUCTED and keeps the bare-name rendering — see
-        // the note on tc_tid_child_count below.
-        TyKind.Iterator => return name
+        // itself.
+        TyKind.Iterator => return "Iterator[{type_to_str(t.inner1)}]"
         TyKind.Handle => return "Handle[{type_to_str(t.inner1)}]"
         // The effect lives in the name slot, not in a child (make_handler_type), so this renders
         // it directly instead of recursing. `Handler[IO]`, `Handler[IO.Print]`, `Handler[Metrics]`
@@ -15377,6 +15497,25 @@ pub fn tc_tid_list_elem_ct_resolved(tid: Int) -> Int {
     tid_inner_ct(tc_resolve(t.inner1))
 }
 
+// The element CT/struct of a SEQUENCE carrier — a List OR an Iterator, which both store their
+// element in inner1. The eager `list.map` returns List[out] and the lazy `iter.map` returns
+// Iterator[out] (§3c.1); the codegen map arm recovers its output element from that node tid, so
+// it must read either kind. Kept separate from tc_tid_list_elem_* so the many List-only callers
+// (derive, type-emit) keep declining an Iterator tid.
+pub fn tc_tid_seq_elem_ct_resolved(tid: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return -1 }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TyKind.List && t.kind != TyKind.Iterator { return -1 }
+    tid_inner_ct(tc_resolve(t.inner1))
+}
+
+pub fn tc_tid_seq_elem_struct(tid: Int) -> Str {
+    if tid < 0 || tid >= ty_pool.len() { return "" }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TyKind.List && t.kind != TyKind.Iterator { return "" }
+    tid_inner_struct(t.inner1)
+}
+
 // The List element slot's mono STEM only (Box_0Int) — never the bare-head
 // fallback tid_inner_struct would give. A list whose element arrives genuinely
 // erased (a bare-typevar generic-fn return whose inner1 reads back as the bare
@@ -15649,14 +15788,10 @@ pub fn tc_tid_child_count(tid: Int) -> Int {
         TyKind.StringBuilder => 0
         TyKind.Typevar => 0
         TyKind.Unknown => 0
-        // Channel/Handle carry one inner each (element / result). TyKind.Iterator is still
-        // never produced: `Iterator[T]` is a TRAIT in sections/03c_protocols.md as well as a
-        // concrete return type in the List-methods table, and typecheck's own adapter table
-        // answers List[T] for .take/.skip — so constructing it would reject the spec-legal
-        // `let it: Iterator[Int] = a.take(2)` that is accepted today. Deciding which reading
-        // wins, and aligning the adapter return types with it, is a deferred question; this
-        // arm stays 0 until then.
-        TyKind.Iterator => 0
+        // Channel/Handle/Iterator carry one inner each (element / result / element). Iterator is
+        // the sealed opaque carrier of §3c.1:38, produced only by `.into_iter()` and the lazy
+        // iterator-receiver adapters; its element is inner1, read below.
+        TyKind.Iterator => 1
         TyKind.Handle => 1
         TyKind.Channel => 1
         // The pointee. `Ptr[Void]` and `Ptr[Ptr[T]]` are both spec-legal pointees
@@ -15721,8 +15856,7 @@ pub fn tc_tid_child(tid: Int, i: Int) -> Int {
         TyKind.StringBuilder => -1
         TyKind.Typevar => -1
         TyKind.Unknown => -1
-        // Unconstructed — see tc_tid_child_count above.
-        TyKind.Iterator => -1
+        TyKind.Iterator => if i == 0 { t.inner1 } else { -1 }
         TyKind.Handle => if i == 0 { t.inner1 } else { -1 }
         TyKind.Channel => if i == 0 { t.inner1 } else { -1 }
         TyKind.Ptr => if i == 0 { t.inner1 } else { -1 }
@@ -15786,7 +15920,7 @@ pub fn tc_tid_struct(tid: Int) -> Str {
 // flat field is in fact right and only the tid is absent.
 pub fn tc_tid_iter_elem(iter_t: Int) -> Int {
     let tk = type_kind(iter_t)
-    if tk == TyKind.List || tk == TyKind.Set { return ty_pool.get(iter_t).unwrap().inner1 }
+    if tk == TyKind.List || tk == TyKind.Set || tk == TyKind.Iterator { return ty_pool.get(iter_t).unwrap().inner1 }
     if tk == TyKind.Map {
         // A Map's iteration element is the (K, V) pair. make_tuple_type interns, so this is the
         // same tid the pair tuple already has everywhere else — including at codegen, where the
@@ -17563,7 +17697,7 @@ fn tc_ann_head_matches_tid(ann: Int, tid: Int) -> Bool {
         TyKind.StringBuilder => false
         TyKind.Typevar => false
         TyKind.Unknown => false
-        TyKind.Iterator => false
+        TyKind.Iterator => nm == "Iterator"
         // The four one-child carriers. Each spells its inner as `elements[0]`
         // (resolve_type_parts' Handle/Channel/Ptr/Template arms) and stores it in inner1, which
         // tc_tid_child answers at index 0 — so the index alignment this function authorizes does
