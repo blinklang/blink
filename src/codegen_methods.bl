@@ -1218,6 +1218,79 @@ pub fn publish_carrier_elem(carrier: Str) {
     }
 }
 
+// Drive an iterator source to completion into a fresh, fully-typed List and
+// publish it on the expr_* channels. This is the crossing FROM the lazy world
+// back into the eager one — the body of `.collect()`, and also the
+// materialization an eager collection adapter runs on the adapter var it just
+// built (its receiver was a CT_LIST, so `list.map(f)` must answer a List, not an
+// iterator — §3c.1 / decision D2-A). Splitting it out keeps the two callers
+// element-for-element identical: an eager `list.ADAPTER(...)` is exactly
+// `list.into_iter().ADAPTER(...).collect()`.
+pub fn emit_iter_collect(src_str: Str, src_type: Int, src_node: Int) ! Codegen.Emit {
+    iter_from_source(src_str, src_type, src_node)
+    let src_var = ifs_iter_var
+    let src_next = ifs_next_fn
+    let elem_type = ifs_elem_type
+    let opt_t = ifs_opt_type
+    let carrier = ifs_carrier_tag
+    let result_list = fresh_temp("__collect_")
+    let next_var = fresh_temp("__collect_next_")
+    emit_line("blink_list* {result_list} = blink_list_new();")
+    emit_line("while (1) \{")
+    cg_indent = cg_indent + 1
+    emit_line("{opt_t} {next_var} = (({opt_t} (*)(void*)){src_next})(&{src_var});")
+    emit_line("if ({next_var}.tag == 0) break;")
+    if elem_type == CT_INT {
+        // A compound element's `.value` is already the intptr_t to the
+        // boxed carrier — push it through unchanged (keeps the pointer boxing);
+        // the result list's element type is re-stamped from the source below.
+        emit_line("blink_list_push({result_list}, (void*)(intptr_t){next_var}.value);")
+    } else if elem_type == CT_FLOAT {
+        // A by-value double cannot be cast to void* (cc rejects it), and the
+        // read-back is `*(double*)blink_list_get(...)` — heap-box the double so
+        // the slot holds a pointer, matching plain List[Float] construction.
+        let fbox = fresh_temp("_fbox")
+        emit_line("double* {fbox} = (double*)blink_alloc(sizeof(double));")
+        emit_line("*{fbox} = {next_var}.value;")
+        emit_line("blink_list_push({result_list}, (void*){fbox});")
+    } else {
+        emit_line("blink_list_push({result_list}, (void*){next_var}.value);")
+    }
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    if carrier != "" {
+        // A direct List source has full element metadata to copy; a
+        // var-iterator source (a chained lazy adapter — filter().collect())
+        // carries only the carrier tag on its sname, so re-stamp from the tag.
+        // copy_list_compound_elem only has arms for the compound element kinds,
+        // so a NAMED BY-VALUE element (struct/tuple/data enum) reaching it from a direct
+        // List source falls through its no_arm tail and leaves the result element erased.
+        // Its tag is the whole answer for those, so take the tag route regardless of the
+        // source shape.
+        if src_type == CT_LIST && is_compound_tag(carrier) != 0 {
+            copy_list_compound_elem(src_str, result_list)
+            // The copy reads its source by variable NAME, so a source that is
+            // not a variable — `b.items.collect()`, `make().collect()` — has no ScopeVar
+            // under that spelling and every arm reads a fabricated flat default instead
+            // (sv_tp turns a missing inner into type_int()), leaving this temp holding
+            // `Option[Int]`. The tid is indifferent to how the source is spelled, so it
+            // LEADS here and the copy's answer survives only where it declines — the same
+            // ordering the codegen_stmt let-ladders use.
+            stamp_list_elem_from_tid(src_node, result_list)
+        } else {
+            set_list_elem_compound_from_tag(result_list, carrier)
+        }
+        expr_result_str = result_list
+        expr_result_type = CT_LIST
+        publish_carrier_elem(carrier)
+        return
+    }
+    set_list_elem_type(result_list, elem_type)
+    expr_result_str = result_list
+    expr_result_type = CT_LIST
+    expr_list_elem_type = elem_type
+}
+
 // Copy a source List's COMPOUND element type onto a destination list
 // (a HOF that produces a new List[Option[T]]/List[Result[T,E]], e.g. collect over
 // a compound source). Reuses the source's stored deep inner tp so a nested
@@ -4738,6 +4811,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 let adapter_var = fresh_temp("__map_")
                 emit_line("blink_MapIterator_{carrier} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .fn = {fn_str} };")
                 set_var_iterator(adapter_var, CT_INT, "blink_MapIterator_{carrier}_next")
+                if obj_type == CT_LIST {
+                    emit_iter_collect(adapter_var, CT_ITERATOR, node)
+                    return
+                }
                 expr_result_str = adapter_var
                 expr_result_type = CT_ITERATOR
                 expr_iter_next_fn = "blink_MapIterator_{carrier}_next"
@@ -4785,6 +4862,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             emit_line("{iter_name} {adapter_var} = \{ .source = &{src_var}, .source_next = ({in_opt} (*)(void*)){src_next}, .fn = {fn_str} };")
             set_var_iterator(adapter_var, out_ct, "{iter_name}_next")
             stamp_iter_adapter_tid(adapter_var, node)
+            if obj_type == CT_LIST {
+                emit_iter_collect(adapter_var, CT_ITERATOR, node)
+                return
+            }
             expr_result_str = adapter_var
             expr_result_type = CT_ITERATOR
             expr_iter_next_fn = "{iter_name}_next"
@@ -4811,6 +4892,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 set_var_iterator(adapter_var, CT_INT, "blink_FilterIterator_{carrier}_next")
                 set_var_iter_carrier(adapter_var, carrier)
                 stamp_iter_adapter_tid(adapter_var, node)
+                if obj_type == CT_LIST {
+                    emit_iter_collect(adapter_var, CT_ITERATOR, node)
+                    return
+                }
                 expr_result_str = adapter_var
                 expr_result_type = CT_ITERATOR
                 expr_iter_next_fn = "blink_FilterIterator_{carrier}_next"
@@ -4822,6 +4907,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let adapter_var = fresh_temp("__filter_")
             emit_line("blink_FilterIterator_{tag} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .fn = {fn_str} };")
             set_var_iterator(adapter_var, elem_type, "blink_FilterIterator_{tag}_next")
+            if obj_type == CT_LIST {
+                emit_iter_collect(adapter_var, CT_ITERATOR, node)
+                return
+            }
             expr_result_str = adapter_var
             expr_result_type = CT_ITERATOR
             expr_iter_next_fn = "blink_FilterIterator_{tag}_next"
@@ -4847,6 +4936,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 set_var_iterator(adapter_var, CT_INT, "blink_TakeIterator_{carrier}_next")
                 set_var_iter_carrier(adapter_var, carrier)
                 stamp_iter_adapter_tid(adapter_var, node)
+                if obj_type == CT_LIST {
+                    emit_iter_collect(adapter_var, CT_ITERATOR, node)
+                    return
+                }
                 expr_result_str = adapter_var
                 expr_result_type = CT_ITERATOR
                 expr_iter_next_fn = "blink_TakeIterator_{carrier}_next"
@@ -4858,6 +4951,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let adapter_var = fresh_temp("__take_")
             emit_line("blink_TakeIterator_{tag} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .limit = {n_str}, .count = 0 };")
             set_var_iterator(adapter_var, elem_type, "blink_TakeIterator_{tag}_next")
+            if obj_type == CT_LIST {
+                emit_iter_collect(adapter_var, CT_ITERATOR, node)
+                return
+            }
             expr_result_str = adapter_var
             expr_result_type = CT_ITERATOR
             expr_iter_next_fn = "blink_TakeIterator_{tag}_next"
@@ -4880,6 +4977,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 set_var_iterator(adapter_var, CT_INT, "blink_SkipIterator_{carrier}_next")
                 set_var_iter_carrier(adapter_var, carrier)
                 stamp_iter_adapter_tid(adapter_var, node)
+                if obj_type == CT_LIST {
+                    emit_iter_collect(adapter_var, CT_ITERATOR, node)
+                    return
+                }
                 expr_result_str = adapter_var
                 expr_result_type = CT_ITERATOR
                 expr_iter_next_fn = "blink_SkipIterator_{carrier}_next"
@@ -4891,6 +4992,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let adapter_var = fresh_temp("__skip_")
             emit_line("blink_SkipIterator_{tag} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .skip_n = {n_str}, .skipped = 0 };")
             set_var_iterator(adapter_var, elem_type, "blink_SkipIterator_{tag}_next")
+            if obj_type == CT_LIST {
+                emit_iter_collect(adapter_var, CT_ITERATOR, node)
+                return
+            }
             expr_result_str = adapter_var
             expr_result_type = CT_ITERATOR
             expr_iter_next_fn = "blink_SkipIterator_{tag}_next"
@@ -4924,6 +5029,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 set_var_iterator(adapter_var, CT_INT, "blink_ChainIterator_{carrier}_next")
                 set_var_iter_carrier(adapter_var, carrier)
                 stamp_iter_adapter_tid(adapter_var, node)
+                if obj_type == CT_LIST {
+                    emit_iter_collect(adapter_var, CT_ITERATOR, node)
+                    return
+                }
                 expr_result_str = adapter_var
                 expr_result_type = CT_ITERATOR
                 expr_iter_next_fn = "blink_ChainIterator_{carrier}_next"
@@ -4934,6 +5043,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let adapter_var = fresh_temp("__chain_")
             emit_line("blink_ChainIterator_{tag} {adapter_var} = \{ .source_a = &{src_a_var}, .next_a = ({opt_t} (*)(void*)){next_a}, .source_b = &{src_b_var}, .next_b = ({opt_t} (*)(void*)){next_b}, .phase = 0 };")
             set_var_iterator(adapter_var, elem_type, "blink_ChainIterator_{tag}_next")
+            if obj_type == CT_LIST {
+                emit_iter_collect(adapter_var, CT_ITERATOR, node)
+                return
+            }
             expr_result_str = adapter_var
             expr_result_type = CT_ITERATOR
             expr_iter_next_fn = "blink_ChainIterator_{tag}_next"
@@ -4958,6 +5071,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 let adapter_var = fresh_temp("__flatmap_")
                 emit_line("blink_FlatMapIterator_{carrier} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .fn = {fn_str}, .buffer = NULL, .buf_idx = 0 };")
                 set_var_iterator(adapter_var, CT_INT, "blink_FlatMapIterator_{carrier}_next")
+                if obj_type == CT_LIST {
+                    emit_iter_collect(adapter_var, CT_ITERATOR, node)
+                    return
+                }
                 expr_result_str = adapter_var
                 expr_result_type = CT_ITERATOR
                 expr_iter_next_fn = "blink_FlatMapIterator_{carrier}_next"
@@ -4969,6 +5086,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let adapter_var = fresh_temp("__flatmap_")
             emit_line("blink_FlatMapIterator_{tag} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .fn = {fn_str}, .buffer = NULL, .buf_idx = 0 };")
             set_var_iterator(adapter_var, elem_type, "blink_FlatMapIterator_{tag}_next")
+            if obj_type == CT_LIST {
+                emit_iter_collect(adapter_var, CT_ITERATOR, node)
+                return
+            }
             expr_result_str = adapter_var
             expr_result_type = CT_ITERATOR
             expr_iter_next_fn = "blink_FlatMapIterator_{tag}_next"
@@ -5059,68 +5180,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         // --- Consumer methods: drive an iterator to completion ---
 
         if method == "collect" {
-            iter_from_source(obj_str, obj_type, obj_node)
-            let src_var = ifs_iter_var
-            let src_next = ifs_next_fn
-            let elem_type = ifs_elem_type
-            let opt_t = ifs_opt_type
-            let carrier = ifs_carrier_tag
-            let result_list = fresh_temp("__collect_")
-            let next_var = fresh_temp("__collect_next_")
-            emit_line("blink_list* {result_list} = blink_list_new();")
-            emit_line("while (1) \{")
-            cg_indent = cg_indent + 1
-            emit_line("{opt_t} {next_var} = (({opt_t} (*)(void*)){src_next})(&{src_var});")
-            emit_line("if ({next_var}.tag == 0) break;")
-            if elem_type == CT_INT {
-                // A compound element's `.value` is already the intptr_t to the
-                // boxed carrier — push it through unchanged (keeps the pointer boxing);
-                // the result list's element type is re-stamped from the source below.
-                emit_line("blink_list_push({result_list}, (void*)(intptr_t){next_var}.value);")
-            } else if elem_type == CT_FLOAT {
-                // A by-value double cannot be cast to void* (cc rejects it), and the
-                // read-back is `*(double*)blink_list_get(...)` — heap-box the double so
-                // the slot holds a pointer, matching plain List[Float] construction.
-                let fbox = fresh_temp("_fbox")
-                emit_line("double* {fbox} = (double*)blink_alloc(sizeof(double));")
-                emit_line("*{fbox} = {next_var}.value;")
-                emit_line("blink_list_push({result_list}, (void*){fbox});")
-            } else {
-                emit_line("blink_list_push({result_list}, (void*){next_var}.value);")
-            }
-            cg_indent = cg_indent - 1
-            emit_line("}")
-            if carrier != "" {
-                // A direct List source has full element metadata to copy; a
-                // var-iterator source (a chained lazy adapter — filter().collect())
-                // carries only the carrier tag on its sname, so re-stamp from the tag.
-                // copy_list_compound_elem only has arms for the compound element kinds,
-                // so a NAMED BY-VALUE element (struct/tuple/data enum) reaching it from a direct
-                // List source falls through its no_arm tail and leaves the result element erased.
-                // Its tag is the whole answer for those, so take the tag route regardless of the
-                // source shape.
-                if obj_type == CT_LIST && is_compound_tag(carrier) != 0 {
-                    copy_list_compound_elem(obj_str, result_list)
-                    // The copy reads its source by variable NAME, so a source that is
-                    // not a variable — `b.items.collect()`, `make().collect()` — has no ScopeVar
-                    // under that spelling and every arm reads a fabricated flat default instead
-                    // (sv_tp turns a missing inner into type_int()), leaving this temp holding
-                    // `Option[Int]`. The tid is indifferent to how the source is spelled, so it
-                    // LEADS here and the copy's answer survives only where it declines — the same
-                    // ordering the codegen_stmt let-ladders use.
-                    stamp_list_elem_from_tid(obj_node, result_list)
-                } else {
-                    set_list_elem_compound_from_tag(result_list, carrier)
-                }
-                expr_result_str = result_list
-                expr_result_type = CT_LIST
-                publish_carrier_elem(carrier)
-                return
-            }
-            set_list_elem_type(result_list, elem_type)
-            expr_result_str = result_list
-            expr_result_type = CT_LIST
-            expr_list_elem_type = elem_type
+            emit_iter_collect(obj_str, obj_type, obj_node)
             return
         }
         if method == "count" {
