@@ -2016,7 +2016,7 @@ fn with_logging(f: fn(Str) -> () ! IO.Log) ! IO.Log {
 // Function type with multiple effects
 fn transform(f: fn(Row) -> Row ! DB.Read, IO.Log) -> List[Row] ! DB.Read, IO.Log {
     let rows = db.query("SELECT * FROM data")?
-    rows.map(fn(r) { f(r) }).collect()
+    rows.map(fn(r) { f(r) })
 }
 ```
 

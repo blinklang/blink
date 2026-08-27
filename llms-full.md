@@ -538,16 +538,49 @@ let s = str_from_code_point(65)         // -> Str ("A"), from std.str
 | `.find(fn(T)->Bool)` | Option[T] | First match |
 | `.any(fn(T)->Bool)` | Bool | Any match? |
 | `.all(fn(T)->Bool)` | Bool | All match? |
-| `.count()` | Int | Count elements (drives iterator) |
+| `.count()` | Int | Count elements |
 | `.for_each(fn(T)->Void)` | Void | Apply to each element |
-| `.chain(other)` | Iterator[T] | Concatenate iterators |
-| `.flat_map(fn(T)->List[U])` | Iterator[U] | Map + flatten |
-| `.zip(other)` | List[List] | Pair elements (eager, returns list-of-pairs) |
-| `.enumerate()` | List[List] | With indices (eager, returns list-of-pairs) |
-| `.take(n)` | Iterator[T] | First n |
-| `.skip(n)` | Iterator[T] | Skip first n |
-| `.collect()` | List[T] | Iterator to list |
+| `.chain(other)` | List[T] | Concatenate, returns a new list (eager) |
+| `.flat_map(fn(T)->List[U])` | List[U] | Map then flatten (eager) |
+| `.zip(other)` | List[(T,U)] | Pair elements (eager, list of tuples) |
+| `.enumerate()` | List[(Int,T)] | Index each element (eager, list of tuples) |
+| `.take(n)` | List[T] | First n (eager) |
+| `.skip(n)` | List[T] | All but first n (eager) |
 | `.clear()` | Void | Remove all elements (mutates) |
+
+## Iterator[T] (Lazy)
+
+Blink has two iteration worlds. Collections (`List`, `Set`, `Map`, `Range`, `Str`) are **eager** — an adapter like `list.map(f)` runs now and returns a new collection. `Iterator[T]` is the **lazy** world — a single-pass recipe that touches no elements until a consuming method or a `for` loop pulls from it.
+
+`.into_iter()` is the one door into the lazy world; `.collect()` is the one door back to a `List`. There is no implicit conversion in either direction, so the boundary is always visible in source. `.collect()` is an iterator method only — a collection is already collected, so `list.collect()` is a compile error (`E0505`).
+
+```blink
+let first_two = names
+    .into_iter()                       // cross into the lazy world
+    .filter(fn(n) { n.len() > 3 })
+    .take(2)
+    .collect()                         // cross back — first_two : List[Str]
+```
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `.map(fn(T)->U)` | Iterator[U] | Transform each (lazy) |
+| `.filter(fn(T)->Bool)` | Iterator[T] | Keep matching (lazy) |
+| `.flat_map(fn(T)->Iterator[U])` | Iterator[U] | Map then flatten (lazy) |
+| `.take(n)` | Iterator[T] | First n (lazy) |
+| `.skip(n)` | Iterator[T] | Skip first n (lazy) |
+| `.zip(other)` | Iterator[(T,U)] | Pair with another iterator (lazy) |
+| `.enumerate()` | Iterator[(Int,T)] | Index each element (lazy) |
+| `.chain(other)` | Iterator[T] | Concatenate iterators (lazy) |
+| `.collect()` | List[T] | Drain into a List (door back) |
+| `.fold(init, fn(A,T)->A)` | A | Reduce (drains) |
+| `.count()` | Int | Count elements (drains) |
+| `.any(fn(T)->Bool)` | Bool | Any match? (drains) |
+| `.all(fn(T)->Bool)` | Bool | All match? (drains) |
+| `.find(fn(T)->Bool)` | Option[T] | First match (drains) |
+| `.for_each(fn(T))` | Void | Apply to each (drains) |
+
+`Iterator[T]` is a sealed, opaque built-in: it is not user-implementable, exactly as `Str` and `List` are closed. It is a restartable recipe, not a stateful cursor — collecting it twice recomputes from the source.
 
 ## Map[K, V] Methods
 
