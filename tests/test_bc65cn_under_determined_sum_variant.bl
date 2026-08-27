@@ -1,0 +1,66 @@
+// error[CannotInferType] (E0301) for an under-determined sum-variant type parameter,
+// UNIFORMLY across syntactic position.
+//
+// Spec: sections/03_types.md §3.4 "Under-Determined Types" — "The judgment is a
+// property of the type, not of the syntactic position." Rationale:
+// decisions/under-determined-sum-variant-parameter.md (bc65cn, 6-0). This instantiates
+// the governing 8vcj2c rule (decisions/under-determined-types.md): an unbound type
+// variable at a materialization boundary is E0301, never defaulted, in every position.
+//
+// An `Ok(3)` whose `Err` type nothing pins, or a `None` whose inner nothing pins, is
+// under-determined. As a direct `let` it was already E0301. As a TUPLE ELEMENT IN A
+// MATCH SCRUTINEE it was silently accepted and codegen fabricated an arbitrary carrier
+// (`blink_Result_int_str`, an invented `const char* err`) — a latent miscompile and an
+// ODR hazard under `--link-archive`. The scrutinee is a materialization boundary like
+// any other, so it must be E0301 too.
+//
+// An error-reading arm that USES the payload (`Err(e) => e.len()`), an annotation, a
+// `?`, or a constraining return would pin the open parameter; an arm that only binds and
+// discards it (`Err(e) => 0`) constrains nothing, so the type stays under-determined.
+
+import compile_test_helpers
+
+// ── the bug: an under-determined carrier in a tuple match-scrutinee must be E0301 ──
+
+test "an Ok-only Result in a tuple match-scrutinee is E0301" {
+    let src = "fn main() \{ let r = match (Ok(3), 9) \{ (a, n) => \{ let inner = match a \{ Ok(v) => v  Err(e) => 0 } inner + n } } io.println(\"r=\{r}\") }\n"
+    compile_test_helpers.expect_compile_error(src, "bc65cn_result_scrut", "E0301")
+}
+
+test "a None-only Option in a tuple match-scrutinee is E0301" {
+    let src = "fn main() \{ let r = match (None, 9) \{ (a, n) => \{ let inner = match a \{ Some(v) => 1  None => 0 } inner + n } } io.println(\"r=\{r}\") }\n"
+    compile_test_helpers.expect_compile_error(src, "bc65cn_option_scrut", "E0301")
+}
+
+// ── controls: a fully-determined carrier in the same position is NOT E0301 ──
+
+test "a Some(5) tuple scrutinee is fully determined and not E0301" {
+    let src = "fn main() \{ let r = match (Some(5), 9) \{ (a, n) => \{ let inner = match a \{ Some(v) => v  None => 0 } inner + n } } io.println(\"r=\{r}\") }\n"
+    compile_test_helpers.expect_no_error(src, "bc65cn_some_scrut", "E0301")
+}
+
+// An annotation on a dominating binding pins the open Err, so the same scrutinee shape
+// compiles — the repair the diagnostic points at (lift-to-annotated-let).
+test "an annotated Result binding pins the Err and is not E0301 as a scrutinee" {
+    let src = "fn main() \{ let ok: Result[Int, Str] = Ok(3) let r = match (ok, 9) \{ (a, n) => \{ let inner = match a \{ Ok(v) => v  Err(e) => 0 } inner + n } } io.println(\"r=\{r}\") }\n"
+    compile_test_helpers.expect_no_error(src, "bc65cn_annotated_scrut", "E0301")
+}
+
+// ── the eager boundary check must not pre-empt a LATER pin (timing) ──
+
+// A named-binding scrutinee whose metavar a later statement pins must NOT be E0301: the
+// boundary check runs mid-walk, so it must defer a bound reference to the scope-close
+// check (which runs after every constraining use). Checking it eagerly would false-reject
+// this valid program.
+test "a scrutinee binding pinned by a later annotated let is not E0301" {
+    let src = "fn main() \{ let x = None match x \{ Some(v) => 1  None => 0 } let y: Option[Int] = x io.println(\"ok\") }\n"
+    compile_test_helpers.expect_no_error(src, "bc65cn_later_pin_scrut", "E0301")
+}
+
+// Skipping a bound-reference scrutinee must not LOSE the error: an under-determined `let`
+// whose only use is a match scrutinee is still reported (by the scope-close check, on the
+// binding), so the value is rejected exactly once rather than not at all.
+test "an under-determined binding used only as a scrutinee is still E0301" {
+    let src = "fn main() \{ let x = Ok(3) match x \{ Ok(v) => v  Err(e) => 0 } io.println(\"done\") }\n"
+    compile_test_helpers.expect_compile_error(src, "bc65cn_binding_only_scrut", "E0301")
+}

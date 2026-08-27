@@ -1252,6 +1252,7 @@ fn tc_infer_annotation_hint(tid0: Int) -> Str {
     if k == TyKind.Set { return ": Set[T]" }
     if k == TyKind.Channel { return ": Channel[T]" }
     if k == TyKind.Map { return ": Map[K, V]" }
+    if k == TyKind.Result { return ": Result[T, E]" }
     if k == TyKind.Struct || k == TyKind.Enum {
         return ": {strip_module_qualifier(e.name)}[...]"
     }
@@ -1333,6 +1334,76 @@ fn tc_report_under_determined(vname: Str, tid: Int, decl_node: Int) ! Diag.Repor
         notes.push("the empty construction here has no element type to infer at line {node_line(val)}")
     }
     diag_error_at_notes("CannotInferType", CANNOT_INFER_TYPE, "cannot infer a type for '{vname}': it is never given one by an annotation or a later use", decl_node, "add a type annotation, e.g. `let {vname}{hint} = ...` (replace the placeholder with the intended element type)", notes)
+}
+
+// Point the caret at the specific open constructor inside a compound value: the first
+// tuple element whose type still carries an unbound metavar. A bare constructor
+// scrutinee (`match Ok(3) { .. }`) has no tuple wrapper, so the node itself is the
+// culprit — the fallthrough returns it unchanged.
+fn tc_locate_under_determined(node: Int) -> Int {
+    if node < 0 { return node }
+    if node_kind(node) == NodeKind.TupleLit {
+        let els = node_elements(node)
+        if els != -1 {
+            let mut i = 0
+            while i < sublist_length(els) {
+                let el = sublist_get(els, i)
+                let et = tc_lookup_node_tid(el)
+                if et >= 0 && et != TYPE_UNKNOWN && tc_tid_has_unbound_metavar(et) != 0 {
+                    return el
+                }
+                i = i + 1
+            }
+        }
+    }
+    node
+}
+
+// A match scrutinee that references an in-scope value binding — `match x`, or a
+// `match rec.field` / `match arr[i]` rooted at one — is already covered by the
+// scope-close under-determined check, which runs at nr_pop_scope after every later
+// constraining use has run. Re-checking such a scrutinee here, mid-walk, would both
+// false-reject a value a *later* statement pins (`match x` then `let y: Option[Int] = x`)
+// and double-report one the scope-close check already owns. Only an anonymous temporary
+// scrutinee — a constructor, a literal, a call, a tuple — escapes scope-close (it binds
+// no name), so the eager boundary check must fire there and only there. A nullary
+// constructor like `None` is an Ident with no binding (nr_has_binding == 0), so it stays
+// eagerly checked; a match-arm pattern binding is a mere alias of a value already caught
+// at its own materialization site, so skipping it drops the duplicate, not the error.
+fn tc_scrut_is_named_place(node: Int) -> Int {
+    let mut n = node
+    while n >= 0 {
+        let k = node_kind(n)
+        if k == NodeKind.Ident {
+            return nr_has_binding(node_name(n))
+        }
+        if k == NodeKind.FieldAccess || k == NodeKind.IndexExpr {
+            n = node_obj(n)
+        } else {
+            return 0
+        }
+    }
+    0
+}
+
+// The materialization-boundary twin of tc_report_under_determined for a value that is
+// NOT a `let` binding — a match scrutinee. Same error[CannotInferType] (E0301), applied
+// uniformly across syntactic position (decisions/under-determined-sum-variant-parameter.md,
+// sections/03_types.md §3.4: "The judgment is a property of the type, not of the syntactic
+// position."). There is no binding name to blame, so the caret lands on the open
+// constructor (tc_locate_under_determined). The note enumerates the four things that would
+// have pinned an open sum-variant parameter — an annotation, a `?`, an error-reading arm, or
+// a return type — since a `Err(e) => ...`/`None => ...` arm that discards its payload
+// constrains nothing.
+fn tc_report_under_determined_at(scrut: Int, scrut_tid: Int) ! Diag.Report {
+    if scrut == -1 { return }
+    let culprit = tc_locate_under_determined(scrut)
+    let culprit_tid = tc_lookup_node_tid(culprit)
+    let hint_tid = if culprit_tid >= 0 && culprit_tid != TYPE_UNKNOWN { culprit_tid } else { scrut_tid }
+    let hint = tc_infer_annotation_hint(hint_tid)
+    let mut notes: List[Str] = []
+    notes.push("its type is never constrained by an annotation, a `?`, an error-reading arm, or a return type")
+    diag_error_at_notes("CannotInferType", CANNOT_INFER_TYPE, "cannot infer a type for this value: it is left under-determined", culprit, "add a type annotation on a binding for this value, e.g. `let x{hint} = ...` (replace each placeholder with the intended type)", notes)
 }
 
 // Structural unification. On meeting an unbound α on either side, bind it to the
@@ -13297,6 +13368,26 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 tc_check_body(node_body(arm))
                 nr_pop_scope()
                 i = i + 1
+            }
+
+            // Materialization boundary: an anonymous temporary scrutinee is a value exactly
+            // like a `let` initializer, so a metavar still unbound after every arm's
+            // constraining uses have run is under-determined → error[CannotInferType] (E0301),
+            // uniformly with the `let` case (decisions/under-determined-sum-variant-parameter.md).
+            // Without this, an `Ok(3)` (Err never pinned) as a tuple element in the scrutinee
+            // slipped past the scope-close check — it binds no name whose type carries the
+            // metavar — and codegen fabricated an arbitrary carrier. A scrutinee that references
+            // an in-scope binding is skipped (tc_scrut_is_named_place): the scope-close check
+            // owns it with correct timing, so eager-checking it would false-reject a value a
+            // later statement pins and double-report one already covered. Gated on
+            // tc_boundary_check_active exactly as the scope-close check, so the annotation-blind
+            // name-resolution pass never fires it.
+            if tc_boundary_check_active != 0 {
+                if tc_tid_has_unbound_metavar(scrut_tid) != 0 {
+                    if tc_scrut_is_named_place(node_scrutinee(node)) == 0 {
+                        tc_report_under_determined_at(node_scrutinee(node), scrut_tid)
+                    }
+                }
             }
 
             // The arm bodies above were walked — and memoized — inside the scope where the arm's
