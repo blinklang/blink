@@ -1,0 +1,105 @@
+// br k7hrcy — `.collect()` is the ONE iterator-exclusive crossing, not a collection method.
+//
+// §3c.1:18  `.into_iter()` crosses a collection INTO the lazy world; `.collect()` crosses
+//           an iterator BACK to a List. There is no implicit conversion either way.
+// §3c.1:70  `fn collect(self) -> List[T]` lives under the Iterator[T] surface.
+// §3c.1:753 collect is a sealed Iterator[T] carrier method — collections carry their own
+//           eager surface and do NOT answer collect.
+//
+// So collect on a *collection* receiver (a List, an eager adapter result which is again a
+// List, a Set) must be rejected — a collection is already collected. The lazy round-trip
+// `x.into_iter()...collect()` stays valid and is the control that must NOT move.
+//
+// Before k7hrcy, the List method-dispatch had a `collect` arm that returned the receiver
+// unchanged, so `list.collect()` silently typechecked as a no-op. This pins the rejection
+// and its two-worlds help, and pins the Iterator crossing as still-valid.
+
+import compile_test_helpers
+
+fn src_expr(expr: Str) -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let a: List[Int] = [1, 2, 3]\n")
+    s = s.concat("    let _out = {expr}\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "E0505 is in the error catalog" {
+    compile_test_helpers.verify_catalog_entry("E0505", "UnresolvedMethod")
+}
+
+test "collect on a bare list receiver is rejected" {
+    let out = compile_test_helpers.compile_and_capture(src_expr("a.collect()"), "k7hrcy_list")
+    compile_test_helpers.expect_error(out, "E0505", "list.collect() / diagnostic fires")
+    compile_test_helpers.expect_contains(out, "into_iter", "list.collect() / help points at the lazy door")
+}
+
+test "collect after an eager adapter is rejected" {
+    let expr = "a.map(fn(x: Int) -> Int \{ x * 2 }).collect()"
+    let out = compile_test_helpers.compile_and_capture(src_expr(expr), "k7hrcy_adapter")
+    compile_test_helpers.expect_error(out, "E0505", "list.map(f).collect() / diagnostic fires")
+}
+
+test "collect on a set receiver is rejected" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let mut set: Set[Int] = Set()\n")
+    s = s.concat("    set.insert(1)\n")
+    s = s.concat("    let _out = set.collect()\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "k7hrcy_set")
+    compile_test_helpers.expect_error(out, "E0505", "set.collect() / diagnostic fires")
+}
+
+test "collect on a map receiver is rejected" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let mut m: Map[Str, Int] = Map()\n")
+    s = s.concat("    m.insert(\"a\", 1)\n")
+    s = s.concat("    let _out = m.collect()\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "k7hrcy_map")
+    compile_test_helpers.expect_error(out, "E0505", "map.collect() / diagnostic fires")
+    compile_test_helpers.expect_contains(out, "into_iter", "map.collect() / help is symmetric with list")
+}
+
+test "collect on a str receiver is rejected" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let text: Str = \"abc\"\n")
+    s = s.concat("    let _out = text.collect()\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "k7hrcy_str")
+    compile_test_helpers.expect_error(out, "E0505", "str.collect() / diagnostic fires")
+}
+
+test "collect on a bytes receiver is rejected" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let b: Bytes = Bytes()\n")
+    s = s.concat("    let _out = b.collect()\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "k7hrcy_bytes")
+    compile_test_helpers.expect_error(out, "E0505", "bytes.collect() / diagnostic fires")
+}
+
+// The rejection lives at TYPECHECK, not the codegen backstop, so the fast editor
+// path (`blink check`) must reject it identically to a full `blink build` — before
+// k7hrcy the collect no-op arm let both pass; a codegen-only fix would let check
+// silently accept what build rejects.
+test "collect on a collection is rejected by `blink check`, not just build" {
+    let out = compile_test_helpers.check_via_cli(src_expr("a.collect()"), "k7hrcy_check")
+    compile_test_helpers.expect_error(out, "E0505", "list.collect() / check path rejects too")
+}
+
+test "the lazy crossing is accepted by `blink check`" {
+    let out = compile_test_helpers.check_via_cli(src_expr("a.into_iter().collect()"), "k7hrcy_check_ok")
+    assert(!out.contains("E0505"))
+}
+
+// ── control: the lazy crossing must stay valid ────────────────────────────────
+test "collect after into_iter is still valid" {
+    compile_test_helpers.expect_no_error(src_expr("a.into_iter().collect()"), "k7hrcy_iter_ok", "E0505")
+}
+
+// ── control: an eager adapter without collect still answers a usable list ──────
+test "eager adapter without collect is still valid" {
+    let src = src_expr("a.map(fn(x: Int) -> Int \{ x * 2 })")
+    compile_test_helpers.expect_no_error(src, "k7hrcy_eager_ok", "E0505")
+}

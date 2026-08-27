@@ -401,6 +401,11 @@ fn tc_method_resolvable_on_type(obj_k: TyKind, tname: Str, method: Str) -> Int {
     //     the whole point: `.display()` on a type WITHOUT a Display impl must error
     //     here at typecheck, not fall open to the codegen backstop.
     if method != "display" && method != "to_str" && method != "from_str" {
+        // `collect` crosses iterator→List; it is the one iterator-exclusive method, not a
+        // collection method (§3c.1:18,70,753). On any non-Iterator receiver it must reach
+        // E0505 — do not let the name-only allowlist fail it open. An Iterator receiver
+        // never gets here: its collect returns in the Iterator dispatch block.
+        if method == "collect" && obj_k != TyKind.Iterator { return 0 }
         if is_builtin_method(method) != 0 { return 1 }
     }
     0
@@ -7548,6 +7553,7 @@ pub fn is_builtin_fn(name: Str) -> Int {
 // between the typecheck E0505 site and codegen's backstop so the two cannot drift.
 pub fn tc_list_rename_help(method: Str) -> Str {
     if method == "concat" { return "list concatenation is `.append(other)`" }
+    if method == "collect" { return "`.collect()` crosses an iterator back to a list; a collection is already collected — drop it, or call `.into_iter()` first to enter the lazy world" }
     ""
 }
 
@@ -10978,6 +10984,18 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if obj_k == TyKind.Iterator { return obj_t }
         }
 
+        // `.collect()` is the ONE iterator-exclusive method (§3c.1:18,70,753): it crosses an
+        // iterator BACK to a List. On a collection receiver it is not a method at all — a
+        // collection is already collected. Reject it HERE at typecheck, not at the codegen
+        // backstop, so `blink check` and `blink build` agree: name resolution belongs with
+        // E0504/E0506/E0507 (see the E0505 gate note at the Struct/Enum path below), and the
+        // backstop is unreachable once diag_count > 0 aborts before codegen. The Iterator
+        // receiver's collect is answered by the Iterator dispatch block immediately below.
+        if method == "collect" && (obj_k == TyKind.List || obj_k == TyKind.Map || obj_k == TyKind.Set || obj_k == TyKind.Str || obj_k == TyKind.Bytes) {
+            diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method '.collect' on type {type_to_str(obj_t)}", node, tc_list_rename_help("collect"))
+            return TYPE_UNKNOWN
+        }
+
         // The lazy iterator-receiver world (§3c.1:56-77): adapters are "iterator method in,
         // iterator out" and the consumers drain. Mirrors the eager List adapter table below but
         // wraps each adapter result in a fresh Iterator carrier; `.collect()` is the door back to
@@ -11207,10 +11225,6 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 let cls = closure_arg_at(args_sl, 0)
                 check_closure_param(cls, 0, elem, method, "List")
                 check_closure_ret(cls, TYPE_BOOL, method, "List")
-                return obj_t
-            }
-            if method == "collect" {
-                // No closure argument — nothing to validate.
                 return obj_t
             }
             if method == "contains" {
