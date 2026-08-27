@@ -1,25 +1,38 @@
-// br n90j7j — the second pass that types unannotated non-literal globals must NOT adopt an
-// under-determined tid. `infer_type` mints a fresh metavar for an open constructor (`[]` ->
-// List[α], `None` -> Option[α]), which is != TYPE_UNKNOWN and would pass a bare non-UNKNOWN
-// guard — but an unbound α has no C spelling, so codegen would name a garbage element type or
-// ICE. The pass gates adoption on `tc_tid_has_unbound_metavar == 0`, so an open global stays
-// UNKNOWN and codegen falls back exactly as before (a plain `blink_list*`).
+// br n90j7j — the second pass that types unannotated non-literal globals must NOT leak an
+// under-determined tid to codegen. `infer_type` mints a fresh metavar for an open constructor
+// (`[]` -> List[α], `None` -> Option[α]), which is != TYPE_UNKNOWN and would pass a bare
+// non-UNKNOWN guard — but an unbound α has no C spelling, so codegen would name a garbage
+// element type or ICE.
 //
-// This RUNS the program: the observable is that it compiles and prints the right length, which
-// only holds if the metavar tid never reached codegen.
+// n90j7j originally accommodated this by leaving an open global UNKNOWN and letting codegen fall
+// back to a flat `blink_list*`. That accommodation is exactly the "third default state" the
+// locked under-determined-types decision forbids (decisions/under-determined-types.md, 8vcj2c,
+// 6-0; §3.4): a top-level binding is judged at its own site by its RHS and annotation ALONE, and
+// a later cross-scope use (`g_empty.len()` in main) is action-at-a-distance that cannot pin it.
+// So the open global is now error[CannotInferType] (E0301) — rejected before codegen rather than
+// silently defaulted. The metavar still never reaches codegen; the outcome is an error, not a
+// garbage carrier. The annotation is the normative repair and restores a faithful tid.
 
 import compile_test_helpers
 import std.io
 
-test "an unannotated global with an open-list initializer compiles and runs" {
+// The bug the accommodation masked: a bare open-list global is under-determined → E0301.
+test "an unannotated global with an open-list initializer is E0301" {
+    let src = "let g_empty = []\nfn main() -> Int \{ g_empty.len() }\n"
+    compile_test_helpers.expect_compile_error(src, "n90j7j_open_list", "E0301")
+}
+
+// The repair: an annotated global pins the element type, so no metavar reaches codegen and the
+// program compiles and runs — the "no metavar leak" invariant n90j7j guarded, held the correct way.
+test "an annotated open-list global compiles and runs with no metavar leak" {
     let mut s = "import std.io\n"
-    s = s.concat("let g_empty = []\n")
+    s = s.concat("let g_empty: List[Int] = []\n")
     s = s.concat("fn main() \{\n")
     s = s.concat("    io.println(\"len=\{g_empty.len()}\")\n")
     s = s.concat("}\n")
-    let r = compile_test_helpers.compile_and_run(s, "n90j7j_open_list")
+    let r = compile_test_helpers.compile_and_run(s, "n90j7j_annotated_list")
     if r.exit_code != 0 {
-        io.println("FAIL: open-list global did not compile/run cleanly (exit {r.exit_code})")
+        io.println("FAIL: annotated open-list global did not compile/run cleanly (exit {r.exit_code})")
         io.println(r.err_out)
     }
     assert(r.exit_code == 0)
