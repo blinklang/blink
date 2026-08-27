@@ -34,7 +34,7 @@ import diagnostics.{
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905,
     TRAIT_CONTRACT_906, TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
-    POLY_IMPL_UNSUPPORTED, IMPL_BINDER_UNUSED, TRAIT_ARG_ARITY,
+    POLY_IMPL_UNSUPPORTED, IMPL_BINDER_UNUSED, TRAIT_ARG_ARITY, TYPE_ARG_ARITY,
     CONTRACT_PREDICATE_NOT_DECIDABLE, EFFECTFUL_CALL_IN_PREDICATE,
     IMPURE_CALL_IN_PREDICATE, LOOP_IN_PREDICATE,
     RESULT_OUTSIDE_ENSURES, OLD_OUTSIDE_ENSURES,
@@ -214,6 +214,13 @@ let mut tc_debug_types: Map[Str, Int] = Map()
 let mut tc_serializable_types: Map[Str, Int] = Map()
 // type name -> its declaration node, for field-derive validation spans.
 let mut tc_type_decl_nodes: Map[Str, Int] = Map()
+// Type-parameter names in scope at the current resolution point, each mapped to a
+// nesting count so an inner binder (a generic method of a generic type) can shadow
+// an outer one and restore it on exit. A name in this map is a type VARIABLE, not a
+// constructor — tc_ctor_arity reports no arity for it, so a binder that shadows a
+// type or builtin (`fn f[Channel](x: Channel)`) is not mis-read as that constructor
+// and E0303 does not fire on it (sections/03_types.md §3.4:1259).
+let mut tc_active_tparams: Map[Str, Int] = Map()
 
 type FnSigEntry {
     name: Str
@@ -3283,7 +3290,117 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
 // `ann_node` is the node to memoize onto and may be -1 when the caller has no node. Every
 // use of it below is either already -1-guarded (tc_memo_carrier_over_instance:2337) or
 // guarded here; nothing may pass -1 to a node accessor, which node_or_die crashes on.
+// The declared type-argument arity of a type constructor named in a type
+// position, or -1 when `name` is not an arity-bearing constructor (a primitive,
+// a type variable, a variadic form like Tuple/Fn, or an unknown name) and so is
+// not subject to error[TypeArgArity]. Builtin arities are fixed by the language;
+// a user generic's arity is the number of type parameters on its declaration
+// (a non-generic user type has arity 0). See sections/03_types.md §3.4.
+// Bring a declaration's type parameters into scope for the span of its signature
+// and body resolution, and take them back out. Counted, so nested binders that
+// reuse a name restore the outer one on exit. Both are no-ops for a -1 sublist.
+fn tc_push_tparam_scope(tparams_sl: Int) {
+    if tparams_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(tparams_sl) {
+        let nm = node_name(sublist_get(tparams_sl, i))
+        tc_active_tparams.insert(nm, (tc_active_tparams.get(nm) ?? 0) + 1)
+        i = i + 1
+    }
+}
+
+fn tc_pop_tparam_scope(tparams_sl: Int) {
+    if tparams_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(tparams_sl) {
+        let nm = node_name(sublist_get(tparams_sl, i))
+        let c = tc_active_tparams.get(nm) ?? 0
+        if c <= 1 {
+            let _ = tc_active_tparams.remove(nm)
+        } else {
+            tc_active_tparams.insert(nm, c - 1)
+        }
+        i = i + 1
+    }
+}
+
+fn tc_ctor_arity(name: Str) -> Int {
+    let n = strip_module_qualifier(name)
+    // A type parameter in scope is a type variable, not a constructor: a bare
+    // reference to it is well-formed and carries no arity to check (§3.4:1259).
+    if (tc_active_tparams.get(n) ?? 0) > 0 { return -1 }
+    if n == "List" || n == "Option" || n == "Set" || n == "Channel" || n == "Handle" || n == "Iterator" {
+        return 1
+    }
+    if n == "Map" || n == "Result" {
+        return 2
+    }
+    // The 0-arity scalars: a bare name is correct, any application over-applies.
+    // Ptr/Tuple/Fn/Self/Handler/Template are left to fall through (variadic,
+    // FFI-shaped, or resolved by another rule) so E0303 never fires on them here.
+    if n == "Int" || n == "Float" || n == "F32" || n == "F64" || n == "Bool" || n == "Str" {
+        return 0
+    }
+    if n == "Void" || n == "Bytes" || n == "Instant" || n == "Duration" || n == "Char" || n == "StringBuilder" {
+        return 0
+    }
+    if n == "U8" || n == "U16" || n == "U32" || n == "U64" || n == "I8" || n == "I16" || n == "I32" || n == "I64" {
+        return 0
+    }
+    let decl = tc_type_decl_nodes.get(n) ?? -1
+    if decl == -1 { return -1 }
+    let tps = node_type_params(decl)
+    if tps == -1 { return 0 }
+    sublist_length(tps)
+}
+
+// The case-specific repair, whose first `help:` line is normative
+// (sections/03_types.md §3.4:1255-1264). Four cases keyed on the mismatch shape:
+// over-application removes; a bare constructor with a type parameter already in
+// scope applies that parameter; a bare constructor with none declares one; a
+// partially-applied constructor supplies what is missing. The binder-declaring
+// repair is offered only when bare AND no in-scope parameter can fill the slot.
+fn tc_arity_help(n: Str, want: Int, got: Int) -> Str {
+    if got > want {
+        return "remove the extra type argument(s); '{n}' takes exactly {want}"
+    }
+    if got == 0 {
+        let ks = tc_active_tparams.keys()
+        if ks.len() > 0 {
+            return "apply the type parameter in scope, e.g. '{n}[{ks.get(0).unwrap()}]'"
+        }
+        return "declare a type parameter and apply it, e.g. '{n}[T]'"
+    }
+    "supply the missing type argument(s); '{n}' takes exactly {want}"
+}
+
+// error[TypeArgArity] (E0303): a type constructor in a type position must be
+// applied to exactly its declared arity. Under-application — of which a bare
+// name (0 args) is the extreme — and over-application are one failure. Decided
+// here at name resolution, from the declaration alone, before inference runs.
+fn tc_check_type_arg_arity(name: Str, elems_sl: Int, ann_node: Int) ! Diag.Report {
+    let want = tc_ctor_arity(name)
+    if want == -1 { return }
+    let got = if elems_sl == -1 { 0 } else { sublist_length(elems_sl) }
+    if got == want { return }
+    let n = strip_module_qualifier(name)
+    diag_error_at("TypeArgArity", TYPE_ARG_ARITY, "type constructor '{n}' takes {want} type argument(s) but {got} were given", ann_node, tc_arity_help(n, want, got))
+}
+
 fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    // Arity is a property of a WRITTEN type position, so it keys on ann_node
+    // alone — not on tc_suppress_ann_validation. That flag only silences
+    // hashability re-reports the live path already emitted; arity has no such
+    // live/producer duplication (and a nested arg reached only through a
+    // suppressed producer would otherwise escape the check — sections/03_types.md
+    // §3.4). Re-resolving the same arg node across producers re-runs the check on
+    // an identical span+message, which diag dedup collapses. The impl-self path
+    // passes ann_node = -1 for the receiver base — skipped here, checked in
+    // validate_trait_impls instead — so it neither double-reports nor emits a
+    // locationless diagnostic.
+    if ann_node != -1 {
+        tc_check_type_arg_arity(name, elems_sl, ann_node)
+    }
     if name == "List" {
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
             let inner = resolve_type_ann(sublist_get(elems_sl, 0))
@@ -4270,6 +4387,8 @@ fn resolve_struct_fields(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.
     let name = node_name(td)
     let tid = named_type_map.get(name) ?? -1
     let is_ffi_struct = has_annotation(td, "ffi.struct")
+    let decl_tparams = node_type_params(td)
+    tc_push_tparam_scope(decl_tparams)
     let flds_sl = node_fields(td)
     if flds_sl != -1 {
         let mut i = 0
@@ -4301,6 +4420,7 @@ fn resolve_struct_fields(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.
             i = i + 1
         }
     }
+    tc_pop_tparam_scope(decl_tparams)
 }
 
 fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
@@ -4334,6 +4454,8 @@ fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Rep
 fn resolve_enum_variants(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     let name = node_name(td)
     let tid = named_type_map.get(name) ?? -1
+    let decl_tparams = node_type_params(td)
+    tc_push_tparam_scope(decl_tparams)
     let flds_sl = node_fields(td)
     if flds_sl != -1 {
         let mut _tag = 0
@@ -4372,6 +4494,7 @@ fn resolve_enum_variants(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.
             i = i + 1
         }
     }
+    tc_pop_tparam_scope(decl_tparams)
 }
 
 // A field of a @derive(Debug) type whose own type is a user struct/enum must
@@ -4864,6 +4987,8 @@ fn tc_tparam_is_ret_only(tp_name: Str, ret_ann: Int, params_sl: Int) -> Int {
 
 fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     let name = node_name(fn_node)
+    let fn_tparams = node_type_params(fn_node)
+    tc_push_tparam_scope(fn_tparams)
     let ret_str = node_return_type(fn_node)
     let ret_ann = node_type_ann(fn_node)
     let mut ret_tid = TYPE_VOID
@@ -4955,6 +5080,7 @@ fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
     if has_annotation(fn_node, "deprecated") != 0 {
         depr_fn_nodes.insert(name, fn_node)
     }
+    tc_pop_tparam_scope(fn_tparams)
 }
 
 fn depr_ann_str_arg(ann_node: Int, key: Str) -> Str {
@@ -5907,6 +6033,20 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
         // and excluded.
         check_impl_type_arg_names(trait_args_sl, binders_sl, trait_name, "trait", im)
         check_impl_type_arg_names(recv_args_sl, binders_sl, trait_name, "receiver", im)
+        // The impl-header RECEIVER is a type position (spec §3.4): a bare
+        // `impl Show for Box` on a generic `Box[T]` is error[TypeArgArity] just
+        // as a bare `Box` param would be. The receiver is resolved through
+        // tc_impl_self_tid with annotation validation suppressed, so its arity
+        // is checked here rather than in resolve_type_parts.
+        tc_push_tparam_scope(binders_sl)
+        let recv_want = tc_ctor_arity(impl_type)
+        if recv_want != -1 {
+            let recv_got = if recv_args_sl == -1 { 0 } else { sublist_length(recv_args_sl) }
+            if recv_got != recv_want {
+                diag_error_at("TypeArgArity", TYPE_ARG_ARITY, "type constructor '{impl_type}' takes {recv_want} type argument(s) but {recv_got} were given in the impl receiver", im, tc_arity_help(impl_type, recv_want, recv_got))
+            }
+        }
+        tc_pop_tparam_scope(binders_sl)
         // Polymorphic impl headers parse (spec §3.6). The impl binders make `T`
         // a free type var that the contract check below resolves positionally
         // (Self == receiver base, trait tparam name == binder name), so the
@@ -6127,6 +6267,7 @@ fn init_types() ! TypeCheck.Register {
     tc_debug_types.clear()
     tc_serializable_types.clear()
     tc_type_decl_nodes.clear()
+    tc_active_tparams.clear()
     tc_alias_underlying = Map()
     sfield_pool.clear()
     nr_callable_field_names.clear()
@@ -6224,7 +6365,13 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             let atd = sublist_get(types_sl, j)
             let alias_ann = node_value(atd)
             if alias_ann != -1 {
+                // The alias's own binders are in scope inside its underlying type, so
+                // a binder that shadows a builtin (`type Wrap[List] = List`) is a type
+                // variable there, not the constructor (§3.4:1259).
+                let alias_tparams = node_type_params(atd)
+                tc_push_tparam_scope(alias_tparams)
                 tc_alias_underlying.insert(node_name(atd), resolve_type_ann(alias_ann))
+                tc_pop_tparam_scope(alias_tparams)
             }
             j = j + 1
         }
@@ -6452,6 +6599,8 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
                 // trait's `display` registers as a second owner.
                 tc_record_method_trait(impl_type, "display", "Display")
             }
+            let impl_binders_sl = node_impl_binders(im)
+            tc_push_tparam_scope(impl_binders_sl)
             let methods_sl = node_methods(im)
             if methods_sl != -1 {
                 let mut j = 0
@@ -6469,6 +6618,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
                     j = j + 1
                 }
             }
+            tc_pop_tparam_scope(impl_binders_sl)
             i = i + 1
         }
     }
@@ -12294,6 +12444,8 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
     let prev_boundary = tc_boundary_check_active
     tc_boundary_check_active = 1
     nr_push_scope()
+    let fn_tparams = node_type_params(fn_node)
+    tc_push_tparam_scope(fn_tparams)
     let fn_name = node_name(fn_node)
     let prev_fn_name = tc_current_fn_name
     let prev_fn_ret = tc_current_fn_ret
@@ -12401,6 +12553,7 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
         }
     }
     diag_clear_allows()
+    tc_pop_tparam_scope(fn_tparams)
     tc_current_fn_name = prev_fn_name
     tc_current_fn_ret = prev_fn_ret
     nr_pop_scope()
@@ -14059,7 +14212,12 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
             let impl_type = node_name(im)
             // What `self` is inside these bodies. Resolved once per impl block, not per
             // method: the receiver is a property of the header, and resolve_type_parts
-            // interns through the pool so a repeat would only churn it.
+            // interns through the pool so a repeat would only churn it. The binders are
+            // pushed first so a receiver arg that shadows a builtin (`impl[Map] Sz for
+            // List[Map]`) reads as the in-scope type variable, not the constructor
+            // (§3.4:1259).
+            let impl_binders_sl = node_impl_binders(im)
+            tc_push_tparam_scope(impl_binders_sl)
             tc_current_self_tid = tc_impl_self_tid(im)
             let methods_sl = node_methods(im)
             if methods_sl != -1 {
@@ -14080,6 +14238,7 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
                     j = j + 1
                 }
             }
+            tc_pop_tparam_scope(impl_binders_sl)
             tc_current_self_tid = -1
             i = i + 1
         }

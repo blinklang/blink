@@ -13,22 +13,26 @@
 // agree that the element is unknown, and there was nothing in either representation to repair.
 //
 // The corpus population was `tid=Set[?] flat=Set[?]` — the `self` param of an impl written on a bare,
-// un-parameterized container receiver. The stdlib once supplied these rows, but its container impls are
-// now arity-correct (`impl[T] SetPure for Set[T]`), so the probe below declares its own bare `impl Foo
-// for Set` to reproduce the equally-unknown `self` cell.
+// un-parameterized container receiver. error[TypeArgArity] (E0303, sections/03_types.md §3.4) has since
+// made every bare container in a type position illegal, so that equally-unknown cell is no longer
+// constructible from any valid source: a bare `impl Foo for Set` is rejected, and an arity-correct
+// `impl[T] Foo for Set[T]` yields `tid=Set[T] flat=Set[?]` (a divergence, not an equally-unknown pair).
+// No valid source can therefore spell the equally-unknown cell any more, from either direction: test 1
+// guards the rejected-source side (the old reproduction is now E0303 before it reaches the instrument),
+// and test 2 guards the accepted-source side (a valid program reaches the instrument and reports zero
+// unknowns).
 //
-// The fix must NOT be "treat CT_VOID as a wildcard". Two neighbouring classes have to keep diverging,
-// and both are asserted here:
-//   * tid=Set[Int] flat=Set[?] — the tid knows the element and the flat slot erased it. A real cell,
-//     and one of only 14 rows corpus-wide, which is exactly the kind of finding a wildcard would bury.
+// The instrument still must NOT "treat CT_VOID as a wildcard". Two neighbouring classes have to keep
+// diverging, and both are asserted here (tests 3 and 4):
+//   * tid=Set[Int] flat=Set[?] — the tid knows the element and the flat slot erased it. A real cell.
 //   * tid=Fn(Int) -> Int — Fn also collapses onto CT_VOID in tk_to_ct, but that is not ignorance: the
 //     type is fully known and the flat universe simply cannot spell it. Still a divergence.
 
 import std.fs
 import std.process.{ProcessResult}
 
-// A bare `impl Foo for Set` — the receiver has no element argument, so the `self` param is `Set[?]` on
-// both the tid and the flat side: the equally-unknown cell the ticket is about.
+// A bare `impl Foo for Set` — the receiver has no element argument. This is now error[TypeArgArity]
+// (E0303): a container named in a type position must carry its element. Test 1 asserts that rejection.
 let BARE_SRC: Str = #"trait Foo { fn foo(self) -> Int }
 impl Foo for Set { fn foo(self) -> Int { 0 } }
 fn main() { io.println("x") }
@@ -83,35 +87,31 @@ fn summary_field(out: Str, site: Str, field: Str) -> Int {
     -1
 }
 
-test "an equally-unknown child is not a divergence" {
+test "a bare container impl receiver is rejected as E0303" {
     if !have_blinkc() {
         skip("build/blinkc is not present in this working tree")
         return
     }
+    // The source that once produced an equally-unknown `self` cell now names an incomplete type, so it
+    // is error[TypeArgArity] before it can ever reach the instrument. blinkc reports to stderr.
     let r = run_tydiv(BARE_SRC)
-    assert_eq(r.exit_code, 0)
-    assert(!r.out.contains("error["))
-    // The ticket's row, verbatim. Both sides spell `?`; calling that a divergence is the defect.
-    assert(!r.out.contains("bucket=diverge site=emit_fn_params.param var=self tid=Set[?] flat=Set[?]"))
+    assert(r.out.contains("error[TypeArgArity]"))
+    assert(r.out.contains("'Set'"))
 }
 
-test "agreement about ignorance is reported, not folded into agree" {
+test "the equally-unknown population is eliminated (stage-3 clean)" {
     if !have_blinkc() {
         skip("build/blinkc is not present in this working tree")
         return
     }
-    let r = run_tydiv(BARE_SRC)
-    assert_eq(r.exit_code, 0)
-    // Counting these as `agree` would answer the exit criterion by hiding the population. They are a
-    // fourth bucket: the two representations agree, but they agree only about not knowing, and the
-    // gqg3rk metavar work is measured by watching this number shrink.
-    assert(r.out.contains("bucket=unknown site=emit_fn_params.param var=self tid=Set[?] flat=Set[?]"))
-    let unk = summary_field(r.out, "emit_fn_params.param", "unknown")
-    assert(unk > 0)
-    // And the rows must have moved rather than been duplicated: the same occurrences cannot be both.
-    let dv = summary_field(r.out, "emit_fn_params.param", "diverge")
-    assert(dv >= 0)
-    assert(!r.out.contains("bucket=diverge site=emit_fn_params.param var=self tid=Set[?] flat=Set[?]"))
+    // Test 1 covers the rejected-source direction (no valid source can spell the equally-unknown
+    // cell). This is the accepted-source direction: a valid program does reach the instrument, yet
+    // the census still reports zero unknowns. Reading the count, not merely the substring, is what
+    // makes this a real "clean" reading rather than a vacuous absence on unreached codegen.
+    let ok = run_tydiv(ASYMMETRIC_SRC)
+    assert_eq(ok.exit_code, 0)
+    assert(!ok.out.contains("error["))
+    assert_eq(summary_field(ok.out, "emit_fn_params.param", "unknown"), 0)
 }
 
 test "a flat slot that erased an element the tid knows still diverges" {
