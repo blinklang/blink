@@ -2941,8 +2941,9 @@ fn tc_closure_declared_ret(cls: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
 // and is the sole caller of this function.
 //
 // DECLINES to -1 rather than guessing, so the caller keeps its own default for a body whose
-// type typecheck cannot name — e.g. `fn(p) { p.addr() }` (tests/test_bytes_with_ptr.bl:13),
-// where the pointer methods are deliberately unsigned.
+// tail typecheck could not name (a memoized TYPE_UNKNOWN). The with_ptr caller binds the
+// closure param to Ptr[U8] before the walk (tc_check_body's MethodCall arm), so an
+// `fn(p) { p.addr() }` tail names its type and does NOT reach this decline.
 fn tc_closure_body_result_tid(cls: Int, depth: Int) -> Int {
     if cls == -1 { return -1 }
     if node_kind(cls) != NodeKind.Closure { return -1 }
@@ -13650,6 +13651,18 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     hof_arg = 1
                 }
             }
+        }
+        // Bytes.with_ptr hands its closure a `Ptr[U8]` (sections/07_trust_modules_metadata.md;
+        // the same pointer nogrow_scan names in its escape diagnostics). The generic walk below
+        // would bind the unannotated param to UNKNOWN, so `fn(p) { p.addr() }` would miss the
+        // Ptr method arm and the body tail would memoize as UNKNOWN — the with_ptr result tid
+        // then declines and codegen falls back to the flat carrier. Binding the param to Ptr[U8]
+        // here, exactly as the List-HOF path binds the element type, lets the body type and the
+        // closure's return tid publish faithfully. An annotated param keeps its own type
+        // (check_closure_body prefers the declared type over this hint).
+        if type_kind(obj_t) == TyKind.Bytes && node_method(node) == "with_ptr" {
+            check_closure_body(closure_arg_at(args_sl, 0), make_ptr_type(TYPE_U8), -1)
+            hof_arg = 0
         }
         // "Only List has closure-taking HOFs" is true of the STDLIB and false of the
         // LANGUAGE — any fn-typed param takes a closure, and `async.spawn(fn() { ... })`
