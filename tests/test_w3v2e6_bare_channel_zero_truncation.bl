@@ -9,10 +9,12 @@
 //     for v in ch { io.println("v={v}") }      // printed v=5 and stopped: 0 and 7 vanished
 //
 // The fallback now boxes the same 8-byte payload it used to send inline, so the address is
-// never NULL while the payload word, and every reinterpretation of it, is unchanged. The drain
-// rows below therefore hold whether or not the element is known — which matters because the
-// fallback still governs a channel that nothing pins (a bare `Channel` param annotation carries
-// no element, so a send through one pins the callee's and never the caller's).
+// never NULL while the payload word, and every reinterpretation of it, is unchanged. The
+// fallback governs any channel whose element codegen boxes (a sent 0 among them). Every such
+// channel now carries a KNOWN element: an unpinned local channel is error[CannotInferType]
+// (E0301, decisions/under-determined-types.md) and a bare `Channel` in a type position is
+// error[TypeArgArity] (E0303, sections/03_types.md §3.4), so no element-less channel reaches
+// codegen at all — the rows below pin the element through a send or an annotation.
 
 import std.process.{ProcessResult}
 
@@ -78,10 +80,11 @@ test "the .recv() path on a bare channel still reads zero back" {
 }
 
 // A closed, empty channel must still end the drain and still answer the element's zero value
-// through .recv() (what it SHOULD answer is an open spec question). Boxing moves the NULL
-// test from the payload to the box address, so this is the row that proves the sentinel survived.
-test "a closed empty bare channel still ends the drain and reads back zero" {
-    let src = "fn main() \{\n    let ch = Channel(4)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n    io.println(\"drained\")\n    io.println(\"empty=\{ch.recv()\}\")\n\}\n"
+// through .recv(). The channel is annotated because a channel nothing pins is now
+// error[CannotInferType] (E0301); the runtime property under test is unchanged. Boxing moves the
+// NULL test from the payload to the box address, so this is the row that proves the sentinel survived.
+test "a closed empty annotated channel still ends the drain and reads back zero" {
+    let src = "fn main() \{\n    let ch: Channel[Int] = Channel(4)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n    io.println(\"drained\")\n    io.println(\"empty=\{ch.recv()\}\")\n\}\n"
     let r = run_src("closed", src)
     assert_eq(r.exit_code, 0)
     assert(!r.out.contains("v="))
@@ -112,8 +115,9 @@ test "an annotated Channel[Int] still drains a zero" {
 // R6 — the element is now INFERRED from the send, so a bare Str channel carries a Str. These
 // two rows previously pinned the still-wrong answers (a reinterpreted pointer here, a hard cc
 // failure below) as tripwires against the inference landing silently; it has landed, so they
-// now pin the right answers. The reinterpretation fallback still governs a channel that
-// nothing pins, which the rows above cover.
+// now pin the right answers. The boxing fallback still governs any element codegen must box
+// (a sent 0 among them), but every channel it governs now carries a KNOWN element — a channel
+// nothing pins is error[CannotInferType] (E0301) and never reaches codegen.
 test "a bare Str channel carries its element" {
     let src = "fn main() \{\n    let ch = Channel(4)\n    ch.send(\"hello\")\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n\}\n"
     let r = run_src("bstr", src)

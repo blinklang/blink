@@ -1,0 +1,64 @@
+// error[CannotInferType] (E0301) for an unpinned bare Channel(n).
+//
+// Spec: decisions/under-determined-types.md (DECISIONS.md:346) — a type
+// left under-determined after inference is E0301, UNIFORMLY, with no unobserved-local
+// carve-out. `[]`, bare `None`, `Map()`, `Set()` already obey this. A bare `Channel(n)`
+// whose element type no use ever pins is the same class: it must be E0301, not the silent
+// int64 fallback the flat path kept.
+//
+// `Channel(n)` mints Channel[metavar]; a constraining use — a `.send(x)`, an explicit
+// `: Channel[T]` annotation, or passing it to a `Channel[T]` parameter — binds the element
+// and the value is well-formed. Only the never-pinned channel leaks. A `for v in ch` and a
+// discarded `.recv()` are CONSUMING uses, not constraining ones (they read at the element
+// type but determine nothing about what that type is), so a channel that only drains stays
+// under-determined and is E0301 too.
+//
+// A bare `Channel` in a TYPE position (`fn f(ch: Channel)`) is a different rule —
+// error[TypeArgArity] E0303 (sections/03_types.md §3.4; DECISIONS.md:349) — and must NOT be
+// conflated with this E0301 on the CONSTRUCTOR.
+
+import compile_test_helpers
+
+// ── the bug: an unpinned bare Channel(n) must be E0301 ───────────────────────
+
+test "an unused bare Channel(n) is E0301" {
+    let src = "fn main() \{ let ch = Channel(4) io.println(\"done\") }\n"
+    compile_test_helpers.expect_compile_error(src, "hpd94q_unused_channel", "E0301")
+}
+
+test "a for-in-only bare Channel(n) is still E0301 (for-in does not pin the element)" {
+    let src = "fn main() \{ let ch = Channel(4) for v in ch \{ io.println(\"x\") } }\n"
+    compile_test_helpers.expect_compile_error(src, "hpd94q_forin_channel", "E0301")
+}
+
+test "a recv-only bare Channel(n) is still E0301 (a discarded recv does not pin the element)" {
+    let src = "fn main() \{ let ch = Channel(4) let _ = ch.recv() }\n"
+    compile_test_helpers.expect_compile_error(src, "hpd94q_recv_channel", "E0301")
+}
+
+test "the E0301 hint for an unpinned channel names Channel[T]" {
+    let src = "fn main() \{ let ch = Channel(4) io.println(\"done\") }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "hpd94q_channel_hint")
+    assert(out.contains("E0301"))
+    assert(out.contains("Channel[T]"))
+}
+
+// ── controls: a constraining use pins the element, so NOT E0301 ──────────────
+
+test "a Channel(n) pinned by send is not E0301" {
+    let src = "fn main() \{ let ch = Channel(4) ch.send(\"x\") let _ = ch.recv() }\n"
+    compile_test_helpers.expect_no_error(src, "hpd94q_send_channel", "E0301")
+}
+
+test "an annotated Channel[T] binding is not E0301" {
+    let src = "fn main() \{ let ch: Channel[Int] = Channel(4) io.println(\"done\") }\n"
+    compile_test_helpers.expect_no_error(src, "hpd94q_annotated_channel", "E0301")
+}
+
+// A Channel(n) passed to a concrete Channel[T] parameter is pinned by that call, exactly as an
+// empty list passed to a List[T] parameter is. This is a constraining use through unification,
+// so it must NOT be E0301 — the regression guard for the tc_unify Channel descent.
+test "a Channel(n) pinned by a concrete Channel[T] parameter is not E0301" {
+    let src = "fn take(ch: Channel[Str]) \{ ch.send(\"x\") }\nfn main() \{ let ch = Channel(4) take(ch) io.println(\"done\") }\n"
+    compile_test_helpers.expect_no_error(src, "hpd94q_param_channel", "E0301")
+}
