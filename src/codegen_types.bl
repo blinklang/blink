@@ -5653,6 +5653,35 @@ pub fn get_fn_enum_ret(name: Str) -> Str {
     ""
 }
 
+// Reverse-resolve a mangled generic-mono INSTANCE name (Box_0Int, Tree_0Int) back to its
+// interned instance tid. lookup_named_type misses these — the mangled name is not in the
+// name->tid registry, so set_var_struct would leave such a var on ty=-1 and force every
+// reader onto the flat sname (the class-1 population gap). lookup_mono_base recovers the
+// LOGICAL base + concrete arg tids the def side registered the instance with, and
+// make_*_instance_type re-interns the SAME entry the def side minted (interning dedups).
+//
+// The struct/enum KIND comes from the base's def via is_enum_type: every top-level type is
+// registered before any function body runs (where every set_var_struct caller lives), so the
+// kind here matches the one the def side interned with. The round-trip is kind-AGNOSTIC —
+// tc_tid_struct_mono_name spells a Struct and an Enum instance identically — so it validates
+// only the NAME/args, not the kind: it spells the args recursively, so a stale or arg-less
+// MonoInstance row (arg_tids empty, or an unsubstituted typevar slot) spells a different name
+// and declines to -1, leaving the var on the flat sname. When it matches, tid_struct_name
+// spells this var byte-identically to the sname it replaces, and tc_tid_ct answers the same
+// CT_STRUCT/CT_ENUM the flat head already carries — so the stamp only ever confirms the name,
+// never retypes the var.
+fn mono_instance_tid(c_name: Str) -> Int {
+    let ml = lookup_mono_base(c_name)
+    if ml.base == "" { return -1 }
+    let inst = if is_enum_type(ml.base) != 0 {
+        make_enum_instance_type(ml.base, ml.arg_tids)
+    } else {
+        make_struct_instance_type(ml.base, ml.arg_tids)
+    }
+    if tc_tid_struct_mono_name(inst) == c_name { return inst }
+    -1
+}
+
 pub fn set_var_struct(name: Str, type_name: Str) {
     // A declared, non-generic, non-transparent struct/enum name resolves to its
     // canonical tid via the name->tid registry, so a plain struct/enum var can
@@ -5663,10 +5692,13 @@ pub fn set_var_struct(name: Str, type_name: Str) {
     // (Option/Result/Ptr) keeps sname as its INNER name and must not have its tid
     // overwritten with the bare inner struct. Never overwrite an existing tid. The
     // round-trip check adopts the tid only when it spells back the same bare name,
-    // so an alias or re-export whose tid names a different type stays on sname.
+    // so an alias or re-export whose tid names a different type stays on sname. A
+    // mangled mono-instance name that the plain lookup misses is recovered from the
+    // mono registry through the same round-trip guard.
     let resolved = lookup_named_type(type_name)
     let bare = strip_module_qualifier(type_name)
-    let stamp = if resolved >= 0 && is_transparent_newtype(bare) == 0 && struct_def_is_generic(bare) == 0 && tc_tid_struct(resolved) == bare { resolved } else { -1 }
+    let plain = if resolved >= 0 && is_transparent_newtype(bare) == 0 && struct_def_is_generic(bare) == 0 && tc_tid_struct(resolved) == bare { resolved } else { -1 }
+    let stamp = if plain >= 0 { plain } else { mono_instance_tid(type_name) }
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
