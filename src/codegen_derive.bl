@@ -11,7 +11,7 @@ import codegen_types.{
     is_hash_scalar_ct,
     kops_table_name, kops_is_inline_enum_key, c_type_str,
     ensure_struct_result_type, ensure_struct_option_type, ensure_option_type, ensure_mixed_result_type,
-    is_struct_type, is_enum_type, is_data_enum, is_transparent_newtype, is_boxed_struct_err, is_opaque_type,
+    is_struct_type, is_enum_type, is_data_enum, is_transparent_newtype, is_boxed_struct_err, is_opaque_type, is_payloadless_enum,
     has_derive_method,
     get_struct_field_tp_id, get_struct_field_type_tid,
     carrier_slot_ct,
@@ -992,6 +992,15 @@ fn emit_debug_slot(slot: Str, desc: Str) ! Codegen.Emit {
     let ct = desc_primary_ct(desc)
     if desc.starts_with("S:") {
         let sname = desc.slice(2, desc.len())
+        // A payload-less enum element is stored by VALUE as an intptr-packed
+        // ordinal in the void* slot, not boxed behind it — dereferencing the
+        // ordinal as a pointer segfaults. Cast the ordinal to the enum type by
+        // value, mirroring the .get/.pop element-erasure recovery. A struct or
+        // data-carrying enum stays boxed and keeps the deref.
+        if is_payloadless_enum(sname) != 0 {
+            emit_line("result = blink_str_concat(result, {c_type_c_name(sname)}_debug(({c_type_c_name(sname)})(intptr_t){slot}));")
+            return
+        }
         emit_line("result = blink_str_concat(result, {c_type_c_name(sname)}_debug(*({c_type_c_name(sname)}*){slot}));")
         return
     }
@@ -1075,7 +1084,13 @@ fn emit_debug_list_fn(desc: Str) ! Codegen.Emit {
 // `*`). So `v.value` for those inners is a `T*` and must be dereferenced before
 // handing it to the by-value {cn}_debug / blink_debug_ walker.
 fn option_inner_is_boxed(inner: Str) -> Int {
-    if inner.starts_with("S:") { return 1 }
+    if inner.starts_with("S:") {
+        // A payload-less enum inner is stored INLINE by emit_struct_option_typedef
+        // (a bare ordinal, like the transparent-newtype arm), not boxed behind a
+        // pointer — so v.value is the enum by value and must not be dereferenced.
+        if is_payloadless_enum(inner.slice(2, inner.len())) != 0 { return 0 }
+        return 1
+    }
     if inner.starts_with("O:") { return 1 }
     if inner.starts_with("R:") { return 1 }
     0
