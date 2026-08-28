@@ -1522,7 +1522,7 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
     cg_closure_defs.push("")
 
     // Analyze captures across all handler methods.
-    // Builtin and user effects share this: both vtable shapes carry `__userdata`.
+    // Builtin and user effects share this: both vtable shapes carry a per-op userdata slot.
     let mut handler_caps: List[HandlerCapture] = []
     if methods_sl != -1 && sublist_length(methods_sl) > 0 {
         let mut mci = 0
@@ -1546,12 +1546,10 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
                 // A module-level `let` is NOT a capture. analyze_captures reports every free
                 // name that is a scope var, and module globals are scope vars, so without this
                 // filter `handler IO { fn log(m: Str) { _target.push(m) } }` over a file-scope
-                // `_target` would box the global into __userdata — unnecessary, since the static
-                // handler fn can see a file-scope C static directly, and wrong twice over: the
-                // capture is a snapshot taken at handler-construction time, and it consumes the
-                // single __userdata word that nested handlers share. lib/std/testing.bl's
-                // capture_log/capture_print are exactly this shape: composing two of them
-                // would conflict over that shared word.
+                // `_target` would box the global into the per-op userdata slot — unnecessary,
+                // since the static handler fn can see a file-scope C static directly, and wrong:
+                // a captured value is a snapshot taken at handler-construction time, so a global
+                // mutated after install would read stale through the capture.
                 if already == 0 && is_module_global(cname) == 0 {
                     handler_caps.push(HandlerCapture { name: cname, tp_id: get_var_type(cname), struct_name: get_var_struct(cname) })
                 }
@@ -1750,14 +1748,14 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
                     let cap_ct_s = handler_cap_c_type(cap0)
                     ctype_probe_at(cg_expr_mono_tid(get_var_ty(cn)), "expr_handler_unbox1", cn, cap_ct_s, -1)
                     if ct == CT_STRING {
-                        emit_line("{cap_ct_s} {safe_cn} = (const char*){cap_ev_fld}->__userdata;")
+                        emit_line("{cap_ct_s} {safe_cn} = (const char*){cap_ev_fld}->__userdata_{mname};")
                     } else {
-                        emit_line("{cap_ct_s} {safe_cn} = ({cap_ct_s})(uintptr_t){cap_ev_fld}->__userdata;")
+                        emit_line("{cap_ct_s} {safe_cn} = ({cap_ct_s})(uintptr_t){cap_ev_fld}->__userdata_{mname};")
                     }
                     set_var(cn, ct, 0)
                     if cap0.struct_name != "" { set_var_struct(cn, cap0.struct_name) }
                 } else {
-                    emit_line("{cap_struct_name}* __caps = ({cap_struct_name}*){cap_ev_fld}->__userdata;")
+                    emit_line("{cap_struct_name}* __caps = ({cap_struct_name}*){cap_ev_fld}->__userdata_{mname};")
                     let mut uci = 0
                     while uci < handler_caps.len() {
                         let cap = handler_caps.get(uci).unwrap()
@@ -1827,27 +1825,40 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
     emit_line("{vtable_type}* {vt_ptr} = ({vtable_type}*)blink_alloc(sizeof({vtable_type}));")
     emit_line("*{vt_ptr} = {vt_name};")
     if has_handler_caps {
+        // This handler's captures back every op it defines. Store the same caps
+        // value into the per-op userdata slot of each overridden op, so each op's
+        // static fn reads it back from its own slot; ops NOT defined here keep the
+        // slot copied from the outer vtable and delegate to the outer captures
+        // (saf1hh). A single shared slot would give an inherited op this inner
+        // handler's captures — wrong data, or a wild deref on a type mismatch.
+        let mut caps_val = ""
         if handler_caps.len() == 1 {
             let cap0 = handler_caps.get(0).unwrap()
-            let cn = cap0.name
             let ct = cap0.tp_id
-            let safe_cn = c_safe_name(cn)
+            let safe_cn = c_safe_name(cap0.name)
             if ct == CT_STRING {
-                emit_line("{vt_ptr}->__userdata = (void*){safe_cn};")
+                caps_val = "(void*){safe_cn}"
             } else {
-                emit_line("{vt_ptr}->__userdata = (void*)(uintptr_t){safe_cn};")
+                caps_val = "(void*)(uintptr_t){safe_cn}"
             }
         } else {
             let cap_alloc = fresh_temp("__hcaps_")
             emit_line("{cap_struct_name}* {cap_alloc} = ({cap_struct_name}*)blink_alloc(sizeof({cap_struct_name}));")
             let mut sci = 0
             while sci < handler_caps.len() {
-                let cn = handler_caps.get(sci).unwrap().name
-                let safe_cn = c_safe_name(cn)
+                let safe_cn = c_safe_name(handler_caps.get(sci).unwrap().name)
                 emit_line("{cap_alloc}->{safe_cn} = {safe_cn};")
                 sci = sci + 1
             }
-            emit_line("{vt_ptr}->__userdata = (void*){cap_alloc};")
+            caps_val = "(void*){cap_alloc}"
+        }
+        if methods_sl != -1 {
+            let mut umi = 0
+            while umi < sublist_length(methods_sl) {
+                let mname_u = node_name(sublist_get(methods_sl, umi))
+                emit_line("{vt_ptr}->__userdata_{mname_u} = {caps_val};")
+                umi = umi + 1
+            }
         }
     }
     expr_result_str = vt_ptr

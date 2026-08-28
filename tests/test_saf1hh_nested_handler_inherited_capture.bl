@@ -1,0 +1,87 @@
+// saf1hh — a nested handler shares ONE `__userdata` word on the copied vtable,
+// so an op the inner handler does NOT override (still the OUTER handler's static
+// fn, inherited via the vtable copy) reads the INNER handler's captures. Per spec
+// §4.7:1457-1475 an omitted op auto-delegates to the enclosing handler and must
+// run with THAT handler's captures. Before the fix this returned the wrong
+// capture, and with a type mismatch (outer Str vs inner Int) it wild-derefs and
+// SIGSEGVs from safe Blink — hence P0.
+
+effect Store {
+    effect Ops {
+        fn get_a() -> Str
+        fn get_b() -> Str
+    }
+}
+
+// The core bug: two ops, inner overrides only get_a, so get_b is inherited from
+// the outer handler and must read the OUTER capture.
+test "inherited op reads outer handler capture, not inner" {
+    let outer_tag = "OUT"
+    let inner_tag = "IN"
+    with handler Store {
+        fn get_a() -> Str { "a:{outer_tag}" }
+        fn get_b() -> Str { "b:{outer_tag}" }
+    } {
+        assert_eq(store.get_a(), "a:OUT")
+        assert_eq(store.get_b(), "b:OUT")
+        with handler Store {
+            fn get_a() -> Str { "a:{inner_tag}" }
+        } {
+            assert_eq(store.get_a(), "a:IN")
+            assert_eq(store.get_b(), "b:OUT")
+        }
+        assert_eq(store.get_a(), "a:OUT")
+        assert_eq(store.get_b(), "b:OUT")
+    }
+}
+
+// Three levels: the middle handler captures and defines both ops; the inner
+// overrides only get_a, so get_b delegates through to the MIDDLE capture.
+test "three-level nesting inherits the nearest defining handler's capture" {
+    let l1 = "L1"
+    let l2 = "L2"
+    let l3 = "L3"
+    with handler Store {
+        fn get_a() -> Str { "a:{l1}" }
+        fn get_b() -> Str { "b:{l1}" }
+    } {
+        with handler Store {
+            fn get_a() -> Str { "a:{l2}" }
+            fn get_b() -> Str { "b:{l2}" }
+        } {
+            with handler Store {
+                fn get_a() -> Str { "a:{l3}" }
+            } {
+                assert_eq(store.get_a(), "a:L3")
+                assert_eq(store.get_b(), "b:L2")
+            }
+            assert_eq(store.get_a(), "a:L2")
+            assert_eq(store.get_b(), "b:L2")
+        }
+        assert_eq(store.get_a(), "a:L1")
+        assert_eq(store.get_b(), "b:L1")
+    }
+}
+
+// The builtin-effect path the ticket reports as a segfault: outer captures a Str
+// used by the inherited eprint, inner overrides only print. Reaching the
+// inherited eprint must not crash. (eprint writes to stderr; the assertion is
+// that the program runs to completion rather than SIGSEGV.)
+fn outer_io(tag: Str) -> Handler[IO] {
+    handler IO {
+        fn eprint(msg: Str) { io.eprintln("[{tag}] {msg}") }
+    }
+}
+
+test "builtin nested handler: inherited eprint does not crash" {
+    with outer_io("OUT") {
+        io.eprintln("before-inner")
+        with handler IO {
+            fn print(msg: Str) { io.println("[inner] {msg}") }
+        } {
+            io.eprintln("inside-inner")
+            io.println("printed")
+        }
+    }
+    assert(true)
+}
