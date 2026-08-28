@@ -5682,6 +5682,18 @@ fn mono_instance_tid(c_name: Str) -> Int {
     -1
 }
 
+// Reverse-resolve a nominal type name to its canonical tid: a declared, non-generic,
+// non-transparent struct/enum via the name->tid registry, else a mangled generic-mono
+// instance name (Box_0Int) via the mono registry. Returns -1 for a generic-def head, a
+// transparent newtype, an alias/re-export whose tid names a different type, or a name
+// absent from both registries — the caller then keeps the flat sname channel.
+fn nominal_struct_tid(type_name: Str) -> Int {
+    let resolved = lookup_named_type(type_name)
+    let bare = strip_module_qualifier(type_name)
+    let plain = if resolved >= 0 && is_transparent_newtype(bare) == 0 && struct_def_is_generic(bare) == 0 && tc_tid_struct(resolved) == bare { resolved } else { -1 }
+    if plain >= 0 { plain } else { mono_instance_tid(type_name) }
+}
+
 pub fn set_var_struct(name: Str, type_name: Str) {
     // A declared, non-generic, non-transparent struct/enum name resolves to its
     // canonical tid via the name->tid registry, so a plain struct/enum var can
@@ -5695,10 +5707,7 @@ pub fn set_var_struct(name: Str, type_name: Str) {
     // so an alias or re-export whose tid names a different type stays on sname. A
     // mangled mono-instance name that the plain lookup misses is recovered from the
     // mono registry through the same round-trip guard.
-    let resolved = lookup_named_type(type_name)
-    let bare = strip_module_qualifier(type_name)
-    let plain = if resolved >= 0 && is_transparent_newtype(bare) == 0 && struct_def_is_generic(bare) == 0 && tc_tid_struct(resolved) == bare { resolved } else { -1 }
-    let stamp = if plain >= 0 { plain } else { mono_instance_tid(type_name) }
+    let stamp = nominal_struct_tid(type_name)
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -8657,17 +8666,41 @@ pub fn get_var_option_inner2_struct(name: Str) -> Str {
     ""
 }
 
+// Reconstruct an Option carrier's tid from its flat inner-struct name, for the
+// population gap where set_var_option_struct is called on a fresh binder without a
+// preceding tid stamp — the common Option[Struct] local, whose inner CT is erased to
+// CT_VOID and whose struct name rides struct_name. Reverse-resolve that name to the
+// inner tid and wrap it in an Option so the carrier readers can spell the var from its
+// tid instead of only the flat channel. Restricted to a PLAIN, non-generic struct
+// inner: those are the shape where the value-access and carrier-tag inner-name readers
+// agree on the recovered name, so activating the tid path cannot diverge from the flat
+// name. A transparent newtype, an enum, a generic-def head, a compound inner
+// (Option/Result/Map), or a bare scalar has no plain struct name here and declines to
+// -1, leaving the binder on ty=-1. Guarded by a round-trip: adopt the carrier only when
+// its inner-name speller reproduces the exact flat struct_name, so a mis-resolved name
+// declines rather than retyping the carrier.
+fn option_carrier_tid_from_flat(struct_name: Str) -> Int {
+    if struct_name == "" { return -1 }
+    if is_struct_type(struct_name) == 0 { return -1 }
+    if struct_def_is_generic(struct_name) != 0 { return -1 }
+    let inner = nominal_struct_tid(struct_name)
+    if inner < 0 { return -1 }
+    let carrier = make_option_type(inner)
+    if sev_option_inner_name(cg_bind_mono_tid(carrier)) == struct_name { carrier } else { -1 }
+}
+
 pub fn set_var_option_struct(name: Str, inner: Int, struct_name: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_OPTION {
+            // Update keeps the prior tid; only a fresh push reconstructs from the flat name.
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: struct_name, sname2: sv.sname2, ty: sv.ty, tp_id: sv_tp(sv.ctype, inner, sv.inner2, struct_name) })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_OPTION, is_mut: 0, inner1: inner, inner2: -1, sname: struct_name, sname2: "", ty: -1, tp_id: sv_tp(CT_OPTION, inner, -1, struct_name) })
+    push_scope_var(ScopeVar { name: name, ctype: CT_OPTION, is_mut: 0, inner1: inner, inner2: -1, sname: struct_name, sname2: "", ty: option_carrier_tid_from_flat(struct_name), tp_id: sv_tp(CT_OPTION, inner, -1, struct_name) })
 }
 
 pub fn get_var_option_inner(name: Str) -> Int {
