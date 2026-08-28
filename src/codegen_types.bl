@@ -8877,17 +8877,64 @@ pub fn set_var_result(name: Str, ok_t: Int, err_t: Int) {
     push_scope_var(ScopeVar { name: name, ctype: CT_RESULT, is_mut: 0, inner1: ok_t, inner2: err_t, sname: "", sname2: "", ty: -1, tp_id: sv_tp(CT_RESULT, ok_t, err_t, "") })
 }
 
+// One slot of a Result carrier, reverse-resolved from its flat CT + struct name to a tid.
+// An empty sname is a bare scalar (its singleton tid); a non-empty sname is a PLAIN,
+// non-generic struct (its nominal tid). Anything else — an enum, a transparent newtype, a
+// generic head, a compound inner, or an unresolvable scalar — declines to -1. A CT_VOID
+// scalar slot declines too: a bare-Void slot is the erasure ambiguity, not a Result[Void, _].
+fn result_slot_tid_from_flat(ct: Int, sname: Str) -> Int {
+    if sname == "" {
+        if ct == CT_VOID { return -1 }
+        return tc_scalar_tid_for_ct(ct)
+    }
+    if is_struct_type(sname) == 0 { return -1 }
+    if struct_def_is_generic(sname) != 0 { return -1 }
+    nominal_struct_tid(sname)
+}
+
+// Per-slot round-trip on the reconstructed carrier. The guard is slot-shape-aware because the
+// value-access CT reader (get_var_result_*) declines CT_STRUCT/CT_ENUM and keeps flat inner1:
+// a struct slot only needs its name reproduced (the CT is preserved regardless), a scalar slot
+// needs its CT reproduced and its name to stay empty, so activating the tid path cannot diverge.
+fn result_slot_roundtrip_ok(sname: Str, ct: Int, back_name: Str, back_ct: Int) -> Int {
+    if sname != "" {
+        if back_name == sname { 1 } else { 0 }
+    } else {
+        if back_ct == ct && back_name == "" { 1 } else { 0 }
+    }
+}
+
+// Reconstruct a Result carrier's tid from its flat ok/err slots, the Result twin of
+// option_carrier_tid_from_flat, for the same fresh-push population gap where
+// set_var_result_struct lands on a binder with no preceding tid stamp. Unlike the Option
+// sibling — whose flat inner is only ever a struct — a Result slot is routinely a bare scalar
+// (Result[Int, Str]), so each slot reconstructs scalar and plain-struct shapes alike. Both
+// slots must reconstruct and both must round-trip, or the whole carrier declines to -1 and the
+// binder stays on ty=-1, leaving the flat channels authoritative.
+fn result_carrier_tid_from_flat(ok_t: Int, err_t: Int, ok_s: Str, err_s: Str) -> Int {
+    let ok_tid = result_slot_tid_from_flat(ok_t, ok_s)
+    if ok_tid < 0 { return -1 }
+    let err_tid = result_slot_tid_from_flat(err_t, err_s)
+    if err_tid < 0 { return -1 }
+    let carrier = make_result_type(ok_tid, err_tid)
+    let bound = cg_bind_mono_tid(carrier)
+    if result_slot_roundtrip_ok(ok_s, ok_t, sev_result_ok_name(bound), tc_tid_result_ok_ct(bound)) == 0 { return -1 }
+    if result_slot_roundtrip_ok(err_s, err_t, sev_result_err_name(bound), tc_tid_result_err_ct(bound)) == 0 { return -1 }
+    carrier
+}
+
 pub fn set_var_result_struct(name: Str, ok_t: Int, err_t: Int, ok_s: Str, err_s: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_RESULT {
+            // Update keeps the prior tid; only a fresh push reconstructs from the flat names.
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: ok_t, inner2: err_t, sname: ok_s, sname2: err_s, ty: sv.ty, tp_id: sv_tp(sv.ctype, ok_t, err_t, ok_s) })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_RESULT, is_mut: 0, inner1: ok_t, inner2: err_t, sname: ok_s, sname2: err_s, ty: -1, tp_id: sv_tp(CT_RESULT, ok_t, err_t, ok_s) })
+    push_scope_var(ScopeVar { name: name, ctype: CT_RESULT, is_mut: 0, inner1: ok_t, inner2: err_t, sname: ok_s, sname2: err_s, ty: result_carrier_tid_from_flat(ok_t, err_t, ok_s, err_s), tp_id: sv_tp(CT_RESULT, ok_t, err_t, ok_s) })
 }
 
 // Precondition: fs.starts_with("Option_")
