@@ -1,0 +1,148 @@
+// A push-built (unannotated) List[Option[scalar]] must read back correctly through
+// every element consumer: .get().unwrap(), .pop(), for-in, [..spread], and a match on
+// the reader. `let mut xs = []` gives the element an UNBOUND metavar; the first push pins
+// it. A pinned metavar has kind Unknown with inner1 pointing at its solution, so a method
+// arm that reads the receiver's structural child from `obj_t.inner1` without resolving the
+// metavar first reads the BINDING POINTER instead — typing `e.unwrap()` on such an element
+// one level too deep. Written directly in the corpus so the shapes are the real
+// self-hosted build, not a compile_and_run string (feedback_corpus_sweep_is_not_coverage).
+//
+// The exposing shape is an intermediate `let s = e.unwrap()` whose result is a scalar used
+// in a typed position (`s.len()`, `b == true`): a one-level-too-deep type declares `s` as
+// the carrier struct, and the scalar operation no longer compiles.
+
+fn build_opts() -> List[Option[Int]] {
+    let mut xs = []
+    xs.push(Some(7))
+    xs.push(None)
+    xs.push(Some(9))
+    xs
+}
+
+test "push-built List[Option[Int]] reads back through .get().unwrap()" {
+    let xs = build_opts()
+    assert_eq(xs.len(), 3)
+    assert_eq(xs.get(0).unwrap().unwrap(), 7)
+    assert(!xs.get(1).unwrap().is_some())
+    assert_eq(xs.get(2).unwrap().unwrap(), 9)
+}
+
+test "push-built List[Option[Int]] pops the last element as Option[Option[Int]]" {
+    let mut xs = build_opts()
+    let last = xs.pop()
+    assert(last.is_some())
+    assert_eq(last.unwrap().unwrap(), 9)
+    assert_eq(xs.len(), 2)
+}
+
+test "push-built List[Option[Int]] iterates with for-in" {
+    let xs = build_opts()
+    let mut sum = 0
+    let mut nones = 0
+    for o in xs {
+        if o.is_some() { sum = sum + o.unwrap() } else { nones = nones + 1 }
+    }
+    assert_eq(sum, 16)
+    assert_eq(nones, 1)
+}
+
+test "push-built List[Option[Int]] spreads into another list keeping the inner" {
+    let xs = build_opts()
+    let ys = [..xs]
+    assert_eq(ys.len(), 3)
+    assert_eq(ys.get(0).unwrap().unwrap(), 7)
+    assert(!ys.get(1).unwrap().is_some())
+    assert_eq(ys.get(2).unwrap().unwrap(), 9)
+}
+
+test "push-built List[Option[Int]] destructures through a nested match" {
+    let xs = build_opts()
+    let mut got = -100
+    match xs.get(0) {
+        Some(inner) => {
+            match inner {
+                Some(v) => { got = v }
+                None => { got = -1 }
+            }
+        }
+        None => { got = -2 }
+    }
+    assert_eq(got, 7)
+}
+
+test "a let rebind of a push-built List[Option[Int]] keeps the inner Option" {
+    let xs = build_opts()
+    let alias = xs
+    assert_eq(alias.get(2).unwrap().unwrap(), 9)
+    let outer = alias.get(1)
+    let inner = outer.unwrap()
+    assert(!inner.is_some())
+}
+
+// A bare `None` pushed AFTER a `Some(<non-int scalar>)` still leaves the element pinned to
+// the first Some's carrier. The exposing shape is an UNANNOTATED list (no return type, no
+// `: List[Option[Str]]`) with None as the LAST write and an intermediate `let s = e.unwrap()`:
+// if the receiver's pinned metavar is read one level too deep, `s` is typed as the carrier
+// struct and `s.len()` fails to compile (const char* vs struct mismatch).
+
+test "an unannotated None-last push keeps the element carrier as Option[Str]" {
+    let mut xs = []
+    xs.push(Some("hi"))
+    xs.push(None)
+    let e0 = xs.get(0).unwrap()
+    assert(e0.is_some())
+    // The intermediate `let s` binds the inner from the element carrier, so a downgrade
+    // to Option[Int] would type `s` as Int and `s.len()` would not compile.
+    let s = e0.unwrap()
+    assert_eq(s.len(), 2)
+    assert(!xs.get(1).unwrap().is_some())
+}
+
+test "an unannotated None between two Some(Str) reads back the surrounding strings" {
+    let mut xs = []
+    xs.push(Some("alpha"))
+    xs.push(None)
+    xs.push(Some("beta"))
+    let a = xs.get(0).unwrap()
+    let b = xs.get(2).unwrap()
+    let sa = a.unwrap()
+    let sb = b.unwrap()
+    assert_eq(sa.len(), 5)
+    assert(!xs.get(1).unwrap().is_some())
+    assert_eq(sb.len(), 4)
+}
+
+test "an unannotated None-last push keeps the element carrier as Option[Bool]" {
+    let mut xs = []
+    xs.push(Some(true))
+    xs.push(None)
+    let e0 = xs.get(0).unwrap()
+    assert(e0.is_some())
+    let b = e0.unwrap()
+    assert_eq(b, true)
+    assert(!xs.get(1).unwrap().is_some())
+}
+
+// `.pop()` is a distinct carrier-producing method arm from `.get()`. Guard the non-int
+// scalar shape through it: pop yields Option[Option[Str]], and a chained double-unwrap
+// reads the scalar back. A carrier read one level too deep would mis-spell the pop temp.
+test "a push-built List[Option[Str]] pops through a chained double-unwrap to a scalar" {
+    let mut xs = []
+    xs.push(Some("hi"))
+    xs.push(None)
+    xs.push(Some("world"))
+    assert_eq(xs.pop().unwrap().unwrap().len(), 5)
+}
+
+// The Result carrier has two structural children, so the same "resolve the receiver's
+// pinned metavar before reading its inner" path is exercised on a different carrier. A
+// push-built List[Result[Str,Int]] must read an Ok scalar back through an intermediate let.
+test "a push-built List[Result[Str,Int]] reads an Ok scalar through an intermediate let" {
+    let mut xs = []
+    xs.push(Ok("alpha"))
+    xs.push(Err(1))
+    let r0 = xs.get(0).unwrap()
+    let s = r0.unwrap()
+    assert_eq(s.len(), 5)
+    assert(xs.get(1).unwrap().is_err())
+}
