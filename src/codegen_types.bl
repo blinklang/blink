@@ -4164,15 +4164,24 @@ pub fn map_val_carrier_from_recv(obj_node: Int) -> MapValCarrier {
 }
 
 pub fn map_val_carrier_from_vtid(vtid: Int) -> MapValCarrier {
-    let vct = tc_tid_ct(vtid)
+    // Resolve before the non-resolving tc_tid_ct/tc_tid_*_tid reads: a push-built Map whose
+    // value is a carrier holds it as a bound metavar (kind Unknown, inner1 -> solution), so the
+    // raw value tid answers CT_VOID and declines the carrier, erasing Map[K,Option[V]] /
+    // Map[K,Result[..]] on get().unwrap(). Thread the resolved tid through every child read.
+    let rt = tc_tid_resolved(vtid)
+    let vct = tc_tid_ct(rt)
     if vct == CT_OPTION {
-        let inner_tp = deep_tp_from_tid(tc_tid_option_inner_tid(vtid))
+        // Resolve the child too: a Result carrier's ok/err (and, symmetrically, an Option's inner)
+        // is bound across separate insert sites, so a push-built value's child tid is itself a
+        // bound metavar. deep_tp_from_tid does not resolve, so a raw metavar reads -1 and declines
+        // the whole carrier, erasing it back to the ladder's `blink_Option_result`.
+        let inner_tp = deep_tp_from_tid(tc_tid_resolved(tc_tid_option_inner_tid(rt)))
         if inner_tp == -1 { return no_map_val_carrier() }
-        return MapValCarrier { ct: CT_OPTION, tag: "Option_{tp_carrier_tag(inner_tp)}", inner_tp: inner_tp, inner_ct: tc_tid_option_inner_ct(vtid), inner_sname: tc_tid_option_inner_struct(vtid) }
+        return MapValCarrier { ct: CT_OPTION, tag: "Option_{tp_carrier_tag(inner_tp)}", inner_tp: inner_tp, inner_ct: tc_tid_option_inner_ct(rt), inner_sname: tc_tid_option_inner_struct(rt) }
     }
     if vct == CT_RESULT {
-        let ok_tp = deep_tp_from_tid(tc_tid_result_ok_tid(vtid))
-        let err_tp = deep_tp_from_tid(tc_tid_result_err_tid(vtid))
+        let ok_tp = deep_tp_from_tid(tc_tid_resolved(tc_tid_result_ok_tid(rt)))
+        let err_tp = deep_tp_from_tid(tc_tid_resolved(tc_tid_result_err_tid(rt)))
         if ok_tp == -1 || err_tp == -1 { return no_map_val_carrier() }
         return MapValCarrier { ct: CT_RESULT, tag: "Result_{tp_carrier_tag(ok_tp)}_{tp_carrier_tag(err_tp)}", inner_tp: -1, inner_ct: -1, inner_sname: "" }
     }
@@ -4186,8 +4195,8 @@ pub fn map_val_carrier_from_vtid(vtid: Int) -> MapValCarrier {
     // and the Set rides the ordinary `blink_Option_set` carrier with its element on the option's
     // inner2 channels — the same shape emit_list_method's CT_SET element arm uses.
     if vct == CT_SET {
-        let ect = tc_tid_set_elem_ct(vtid)
-        let es = tc_tid_set_elem_struct(vtid)
+        let ect = tc_tid_set_elem_ct(rt)
+        let es = tc_tid_set_elem_struct(rt)
         if ect < 0 && es == "" { return no_map_val_carrier() }
         return MapValCarrier { ct: CT_SET, tag: "", inner_tp: -1, inner_ct: ect, inner_sname: es }
     }
@@ -4197,12 +4206,12 @@ pub fn map_val_carrier_from_vtid(vtid: Int) -> MapValCarrier {
     // inner2 channels, same as Set; the mono struct-name twin declines to "" on a genuinely erased
     // element and cedes to the flat sname channel there.
     if vct == CT_LIST {
-        let ect = tc_tid_list_elem_ct(vtid)
+        let ect = tc_tid_list_elem_ct(rt)
         // Prefer the mono STEM (a generic-instance element `Box[Int]` is `Box_0Int`, not the bare
         // `Box`), but a plain non-generic struct (params_count 0) has no stem, so the mono twin
         // declines to "" there — fall back to the bare head, which IS its C symbol.
-        let mut es = tc_tid_list_elem_struct_mono(vtid)
-        if es == "" { es = tc_tid_list_elem_struct(vtid) }
+        let mut es = tc_tid_list_elem_struct_mono(rt)
+        if es == "" { es = tc_tid_list_elem_struct(rt) }
         if ect < 0 && es == "" { return no_map_val_carrier() }
         return MapValCarrier { ct: CT_LIST, tag: "", inner_tp: -1, inner_ct: ect, inner_sname: es }
     }
