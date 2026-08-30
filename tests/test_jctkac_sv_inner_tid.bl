@@ -1,0 +1,196 @@
+// jctkac: the flat sv-inner helpers get_sv_inner1/get_sv_inner2 (codegen_types.bl)
+// back four accessors — get_var_result_ok (inner1), get_var_result_err (inner2),
+// get_var_iterator_inner (inner1), get_var_channel_inner (inner1). Each formerly
+// read the element CT off the derived tp_* pool via tp_child{1,2}_kind(sv.tp_id);
+// the pool child is built straight from inner1/inner2 at every setter, so the read
+// now moves to the flat field directly.
+//
+// Attribution (mutation-tested in archive build mode): only the iterator rows
+// (4, 5) actually DISCRIMINATE get_sv_inner1's flat read — swapping the field the
+// reader returns flips their runtime answer, because get_var_iterator_inner reads
+// a pure-flat var (ty<0) and is always reached. The Result rows (1-3) are
+// tid-shielded: get_var_result_ok/err answer scalar ok/err off the authoritative
+// tid channel before the flat fallback runs, so they exercise the whole
+// union-lowering path but do not independently pin the flat read. The Channel
+// rows (6, 7) reach the flat reader but carry the element as a void*-box, so a
+// mistyped element CT does not change their answer either. get_sv_inner2 has NO
+// user-constructible discriminating shape — its only observable exerciser is the
+// stdlib's own str_char_at_opt (Char.from_code_point -> Result[Char,_]), which is
+// guarded at the regen level (a wrong inner2 breaks the stdlib build). These rows
+// stay for their broad end-to-end value; the iterator rows are the load-bearing
+// pin for the flat migration.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+// Row 1: Result[Int, Str] Ok path — ok element is Int (inner1).
+fn src_row1() -> Str {
+    "fn make() -> Result[Int, Str] \{ Ok(42) }\n"
+        .concat("fn main() ! IO \{\n")
+        .concat("    let r = make()\n")
+        .concat("    match r \{\n")
+        .concat("        Ok(v) => io.println(\"ok=\{v}\")\n")
+        .concat("        Err(e) => io.println(\"err=\{e}\")\n")
+        .concat("    }\n")
+        .concat("}\n")
+}
+
+test "row 1: Result[Int,Str] Ok reads the Int ok element" {
+    let r = compile_test_helpers.compile_and_run(src_row1(), "jctkac_svinner_row1")
+    if r.exit_code != 0 { io.println("FAIL: row1 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("ok=42"))
+}
+
+// Row 2: Result[Int, Str] Err path — err element is Str. tid-shielded (the err
+// CT resolves off the tid channel), so this exercises the union err-member
+// lowering end-to-end rather than pinning the flat inner2 read.
+fn src_row2() -> Str {
+    "fn make() -> Result[Int, Str] \{ Err(\"boom\") }\n"
+        .concat("fn main() ! IO \{\n")
+        .concat("    let r = make()\n")
+        .concat("    match r \{\n")
+        .concat("        Ok(v) => io.println(\"ok=\{v}\")\n")
+        .concat("        Err(e) => io.println(\"err=\{e}\")\n")
+        .concat("    }\n")
+        .concat("}\n")
+}
+
+test "row 2: Result[Int,Str] Err reads the Str err element" {
+    let r = compile_test_helpers.compile_and_run(src_row2(), "jctkac_svinner_row2")
+    if r.exit_code != 0 { io.println("FAIL: row2 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("err=boom"))
+}
+
+// Row 3: Result[Str, Int] — ok/err scalars SWAPPED vs rows 1/2. Both payloads
+// resolve off the tid channel (tid-shielded), so this pins the full swapped-union
+// lowering end-to-end; it is not an independent probe of the flat inner1/inner2
+// read.
+fn src_row3() -> Str {
+    "fn make(b: Bool) -> Result[Str, Int] \{ if b \{ Ok(\"good\") } else \{ Err(7) } }\n"
+        .concat("fn main() ! IO \{\n")
+        .concat("    match make(true) \{\n")
+        .concat("        Ok(v) => io.println(\"ok=\{v}\")\n")
+        .concat("        Err(e) => io.println(\"err=\{e}\")\n")
+        .concat("    }\n")
+        .concat("    match make(false) \{\n")
+        .concat("        Ok(v) => io.println(\"ok=\{v}\")\n")
+        .concat("        Err(e) => io.println(\"err=\{e}\")\n")
+        .concat("    }\n")
+        .concat("}\n")
+}
+
+test "row 3: Result[Str,Int] keeps ok=Str and err=Int members distinct" {
+    let r = compile_test_helpers.compile_and_run(src_row3(), "jctkac_svinner_row3")
+    if r.exit_code != 0 { io.println("FAIL: row3 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("ok=good"))
+    assert(r.out.contains("err=7"))
+}
+
+// Row 4: iterator element (get_var_iterator_inner) over List[Int] via the lazy
+// crossing into_iter()...collect(). DISCRIMINATING: the iterator var is pure-flat
+// (ty<0), so the flat inner1 read is the sole element-CT source — swapping the
+// returned field flips this answer (mutation-attributed).
+fn src_row4() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let a: List[Int] = [1, 2, 3]\n")
+        .concat("    let b = a.into_iter().map(fn(x: Int) -> Int \{ x * 10 }).collect()\n")
+        .concat("    let mut total = 0\n")
+        .concat("    for x in b \{ total = total + x }\n")
+        .concat("    io.println(\"total=\{total}\")\n")
+        .concat("}\n")
+}
+
+test "row 4: List[Int] iterator element carries the Int through collect" {
+    let r = compile_test_helpers.compile_and_run(src_row4(), "jctkac_svinner_row4")
+    if r.exit_code != 0 { io.println("FAIL: row4 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("total=60"))
+}
+
+// Row 5: iterator element over List[Str] — a distinct scalar so an Int-fabricated
+// iterator element would mistype the collected list. DISCRIMINATING, same
+// pure-flat path as row 4.
+fn src_row5() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let a: List[Str] = [\"a\", \"b\", \"c\"]\n")
+        .concat("    let b = a.into_iter().map(fn(x: Str) -> Str \{ x.concat(\"!\") }).collect()\n")
+        .concat("    let mut out = \"\"\n")
+        .concat("    for x in b \{ out = out.concat(x) }\n")
+        .concat("    io.println(\"out=\{out}\")\n")
+        .concat("}\n")
+}
+
+test "row 5: List[Str] iterator element carries the Str through collect" {
+    let r = compile_test_helpers.compile_and_run(src_row5(), "jctkac_svinner_row5")
+    if r.exit_code != 0 { io.println("FAIL: row5 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("out=a!b!c!"))
+}
+
+// Row 6: channel element (get_var_channel_inner) — Channel[Int] send/recv. Reaches
+// the flat reader but carries the element as a void*-box, so the element CT does
+// not change the answer; kept for end-to-end send/recv coverage, not as a flat-read
+// probe.
+fn src_row6() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let ch: Channel[Int] = Channel(4)\n")
+        .concat("    ch.send(21)\n")
+        .concat("    ch.send(21)\n")
+        .concat("    let a = ch.recv()\n")
+        .concat("    let b = ch.recv()\n")
+        .concat("    io.println(\"sum=\{a + b}\")\n")
+        .concat("}\n")
+}
+
+test "row 6: Channel[Int] carries the Int element through send/recv" {
+    let r = compile_test_helpers.compile_and_run(src_row6(), "jctkac_svinner_row6")
+    if r.exit_code != 0 { io.println("FAIL: row6 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("sum=42"))
+}
+
+// Row 7: channel element over Channel[Str] — distinct scalar, same void*-boxed
+// path as row 6.
+fn src_row7() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let ch: Channel[Str] = Channel(4)\n")
+        .concat("    ch.send(\"ping\")\n")
+        .concat("    let m = ch.recv()\n")
+        .concat("    io.println(\"msg=\{m}\")\n")
+        .concat("}\n")
+}
+
+test "row 7: Channel[Str] carries the Str element through send/recv" {
+    let r = compile_test_helpers.compile_and_run(src_row7(), "jctkac_svinner_row7")
+    if r.exit_code != 0 { io.println("FAIL: row7 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("msg=ping"))
+}
+
+// C witness: Result[Str, Int] must lay the union with a const char* ok member and
+// an int64_t err member. This ordering is tid-resolved (the union type comes off
+// the tid channel, not the flat inner1/inner2 read), so the witness pins the
+// end-to-end union layout, not the flat migration specifically.
+fn src_c_witness() -> Str {
+    "fn make(b: Bool) -> Result[Str, Int] \{ if b \{ Ok(\"good\") } else \{ Err(7) } }\n"
+        .concat("fn main() ! IO \{\n")
+        .concat("    match make(true) \{\n")
+        .concat("        Ok(v) => io.println(\"ok=\{v}\")\n")
+        .concat("        Err(e) => io.println(\"err=\{e}\")\n")
+        .concat("    }\n")
+        .concat("}\n")
+}
+
+test "C witness: Result[Str,Int] union spells ok=const char*, err=int64_t" {
+    let c = compile_test_helpers.compile_and_emit_c(src_c_witness(), "jctkac_svinner_c_witness")
+    assert_has(c, "const char* ok", "witness / ok member is a string")
+    assert_has(c, "int64_t err", "witness / err member is an int")
+}
