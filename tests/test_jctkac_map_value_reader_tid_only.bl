@@ -1,0 +1,83 @@
+// The map value-kind readers (get_map_value_type / get_map_value_type_raw) recover
+// a name-carried value (struct, enum, tuple) from the map tid alone — the flat
+// sname2 CT_VOID-signal fallback they once carried is gone. Two shape families
+// exercise the readers where that fallback used to answer:
+//
+//   * ty>=0 erased value: a generic-struct or nested-generic value whose tid head
+//     reads back erased. The tid struct/enum/tuple checks answer CT_VOID and
+//     get_map_value_struct spells the name from the tid head, so the reader never
+//     needs the flat channel.
+//   * ty<0 projection temp: a map read out of another map, a struct field, a
+//     function return, or a tuple element leaves the temp on ty=-1 with no map
+//     tid. The reader honestly reports the flat inner2 kind (-1 when unset)
+//     instead of the fallback's CT_VOID lie — get_map_value_struct returns ""
+//     for ty<0, so there was never a name to carry, and the value type is
+//     recovered downstream from the projection expression.
+//
+// Each row reads the value back out (through .get()/.unwrap() and field access),
+// driving both readers. They must spell the value's C type correctly with no flat
+// sname2 fallback in the readers.
+
+type Point { x: Int, y: Int }
+type Box[T] { value: T }
+
+test "a map projected out of a nested map keeps its struct value" {
+    let mut outer: Map[Str, Map[Str, Point]] = Map()
+    let mut inner: Map[Str, Point] = Map()
+    inner.insert("p", Point { x: 1, y: 2 })
+    outer.insert("k", inner)
+    assert_eq(outer.get("k").unwrap().get("p").unwrap().x, 1)
+}
+
+test "a map read from a struct field keeps its struct value" {
+    let mut m: Map[Str, Point] = Map()
+    m.insert("p", Point { x: 3, y: 4 })
+    let h = (m, 0)
+    assert_eq(h.0.get("p").unwrap().x, 3)
+}
+
+fn make_point_map() -> Map[Str, Point] {
+    let mut m: Map[Str, Point] = Map()
+    m.insert("p", Point { x: 5, y: 6 })
+    m
+}
+
+test "a map returned from a function keeps its struct value" {
+    assert_eq(make_point_map().get("p").unwrap().x, 5)
+}
+
+test "a nested map projection keeps its tuple value" {
+    let mut outer: Map[Str, Map[Str, (Int, Int)]] = Map()
+    let mut inner: Map[Str, (Int, Int)] = Map()
+    inner.insert("p", (9, 10))
+    outer.insert("k", inner)
+    assert_eq(outer.get("k").unwrap().get("p").unwrap().0, 9)
+}
+
+fn make_generic_map[T](v: T) -> Map[Str, T] {
+    let mut m: Map[Str, T] = Map()
+    m.insert("k", v)
+    m
+}
+
+test "a generic function returns a Map with a struct value" {
+    let m = make_generic_map(Point { x: 1, y: 2 })
+    assert_eq(m.get("k").unwrap().x, 1)
+}
+
+test "a generic function returns a Map with a generic-struct value" {
+    let m = make_generic_map(Box { value: 42 })
+    assert_eq(m.get("k").unwrap().value, 42)
+}
+
+test "a nested generic Map[Str, Box[Point]] keeps its value" {
+    let mut m: Map[Str, Box[Point]] = Map()
+    m.insert("p", Box { value: Point { x: 5, y: 6 } })
+    assert_eq(m.get("p").unwrap().value.x, 5)
+}
+
+test "a generic map value survives an intermediate let" {
+    let m = make_generic_map(Box { value: 99 })
+    let got = m.get("k").unwrap()
+    assert_eq(got.value, 99)
+}
