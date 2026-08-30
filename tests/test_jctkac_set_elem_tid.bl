@@ -1,0 +1,199 @@
+// jctkac: the Set-element accessor family must read its element off the
+// authoritative tid channel, not the flat tp_* pool. get_set_elem_struct is
+// already tid-only; this test pins get_set_elem_type across every element shape
+// and every reader path so the pool read can be retired without a silent
+// miscompile.
+//
+// The element-CT reader feeds map_key_expr's boxing (insert/contains/remove),
+// the for-in iterator element type, and the union-temp/copy seams. A wrong
+// element CT boxes the key at the wrong width or picks the wrong iterator, so
+// every row reads back a concrete value through the seam under test — a
+// fabricated default would show as the wrong answer, not an accidental match.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+// Row 1: scalar Set[Int] — insert/contains/len off an inferred receiver.
+fn src_row1() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut a = Set()\n")
+        .concat("    a.insert(3)\n")
+        .concat("    a.insert(4)\n")
+        .concat("    a.insert(3)\n")
+        .concat("    io.println(\"has3=\{a.contains(3)} has9=\{a.contains(9)} len=\{a.len()}\")\n")
+        .concat("}\n")
+}
+
+test "row 1: Set[Int] insert/contains/len reads the Int element" {
+    let r = compile_test_helpers.compile_and_run(src_row1(), "jctkac_set_row1")
+    if r.exit_code != 0 { io.println("FAIL: row1 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("has3=true has9=false len=2"))
+}
+
+// Row 2: scalar Set[Str] — a distinct scalar so an Int-fabricated default would
+// mistype the key.
+fn src_row2() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut b: Set[Str] = Set()\n")
+        .concat("    b.insert(\"x\")\n")
+        .concat("    b.insert(\"y\")\n")
+        .concat("    io.println(\"hasx=\{b.contains(\"x\")} hasz=\{b.contains(\"z\")}\")\n")
+        .concat("}\n")
+}
+
+test "row 2: Set[Str] boxes the Str element" {
+    let r = compile_test_helpers.compile_and_run(src_row2(), "jctkac_set_row2")
+    if r.exit_code != 0 { io.println("FAIL: row2 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("hasx=true hasz=false"))
+}
+
+// Row 3: for-in over a scalar Set[Int] — the iterator-element reader path.
+fn src_row3() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut a = Set()\n")
+        .concat("    a.insert(3)\n")
+        .concat("    a.insert(4)\n")
+        .concat("    a.insert(5)\n")
+        .concat("    let mut total = 0\n")
+        .concat("    for x in a \{ total = total + x }\n")
+        .concat("    io.println(\"total=\{total}\")\n")
+        .concat("}\n")
+}
+
+test "row 3: for x in a (Set[Int]) iterates the Int element" {
+    let r = compile_test_helpers.compile_and_run(src_row3(), "jctkac_set_row3")
+    if r.exit_code != 0 { io.println("FAIL: row3 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("total=12"))
+}
+
+// Row 4: @derive(Hash,Eq) struct element — the get_set_elem_struct channel.
+fn src_row4() -> Str {
+    "@derive(Hash, Eq)\n"
+        .concat("type Pt \{ x: Int, y: Int }\n")
+        .concat("fn main() ! IO \{\n")
+        .concat("    let mut c: Set[Pt] = Set()\n")
+        .concat("    c.insert(Pt \{ x: 1, y: 2 })\n")
+        .concat("    io.println(\"has=\{c.contains(Pt \{ x: 1, y: 2 })} no=\{c.contains(Pt \{ x: 9, y: 9 })}\")\n")
+        .concat("}\n")
+}
+
+test "row 4: Set[Pt] struct element boxes via the struct-key path" {
+    let r = compile_test_helpers.compile_and_run(src_row4(), "jctkac_set_row4")
+    if r.exit_code != 0 { io.println("FAIL: row4 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("has=true no=false"))
+}
+
+// Row 5: enum element — the name-carried path. get_set_elem_type reports the
+// element as non-scalar so emit_set_method fetches the enum name from
+// get_set_elem_struct's tid sname (mirrors the Map enum-key path).
+fn src_row5() -> Str {
+    "@derive(Hash, Eq)\n"
+        .concat("type Color \{ Red, Green, Blue }\n")
+        .concat("fn main() ! IO \{\n")
+        .concat("    let mut cc: Set[Color] = Set()\n")
+        .concat("    cc.insert(Color.Green)\n")
+        .concat("    cc.insert(Color.Blue)\n")
+        .concat("    io.println(\"g=\{cc.contains(Color.Green)} r=\{cc.contains(Color.Red)}\")\n")
+        .concat("}\n")
+}
+
+test "row 5: Set[Color] enum element boxes by name" {
+    let r = compile_test_helpers.compile_and_run(src_row5(), "jctkac_set_row5")
+    if r.exit_code != 0 { io.println("FAIL: row5 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("g=true r=false"))
+}
+
+// Row 6: captured scalar Set in a closure — the CAPTURE reader path. The
+// closure body's `for x in g` lowers through blink_set_to_list +
+// blink_ListIterator_int, whose element type comes from get_set_elem_type's
+// capture branch. A capture-path regression picks the wrong iterator.
+fn src_row6() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut g = Set()\n")
+        .concat("    g.insert(7)\n")
+        .concat("    g.insert(8)\n")
+        .concat("    let f = fn() -> Int \{\n")
+        .concat("        let mut t = 0\n")
+        .concat("        for x in g \{ t = t + x }\n")
+        .concat("        t\n")
+        .concat("    }\n")
+        .concat("    io.println(\"cap=\{f()}\")\n")
+        .concat("}\n")
+}
+
+test "row 6: a captured Set[Int]'s for-in carries the Int element" {
+    let r = compile_test_helpers.compile_and_run(src_row6(), "jctkac_set_row6")
+    if r.exit_code != 0 { io.println("FAIL: row6 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("cap=15"))
+}
+
+// Row 7: captured Set[Int] .contains inside a closure — the capture reader
+// feeding map_key_expr_lookup (not the iterator).
+fn src_row7() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut g = Set()\n")
+        .concat("    g.insert(11)\n")
+        .concat("    g.insert(12)\n")
+        .concat("    let f = fn() -> Bool \{ g.contains(11) }\n")
+        .concat("    let h = fn() -> Bool \{ g.contains(99) }\n")
+        .concat("    io.println(\"a=\{f()} b=\{h()}\")\n")
+        .concat("}\n")
+}
+
+test "row 7: a captured Set[Int]'s .contains reads the Int element" {
+    let r = compile_test_helpers.compile_and_run(src_row7(), "jctkac_set_row7")
+    if r.exit_code != 0 { io.println("FAIL: row7 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("a=true b=false"))
+}
+
+// Row 8: union temp (synthesized receiver) — set_set_elem_type stamps the
+// element on a fresh temp with ty<0, then for-in reads it back.
+fn src_row8() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut d = Set()\n")
+        .concat("    d.insert(1)\n")
+        .concat("    d.insert(2)\n")
+        .concat("    let mut e = Set()\n")
+        .concat("    e.insert(2)\n")
+        .concat("    e.insert(3)\n")
+        .concat("    let mut total = 0\n")
+        .concat("    for x in d.union(e) \{ total = total + x }\n")
+        .concat("    io.println(\"total=\{total}\")\n")
+        .concat("}\n")
+}
+
+test "row 8: union temp carries the Set's Int element into for-in" {
+    let r = compile_test_helpers.compile_and_run(src_row8(), "jctkac_set_row8")
+    if r.exit_code != 0 { io.println("FAIL: row8 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("total=6"))
+}
+
+// C witness: the enum-element insert must box a typed enum local through the
+// enum's kops, not an int64 by value.
+fn src_c_witness() -> Str {
+    "@derive(Hash, Eq)\n"
+        .concat("type Color \{ Red, Green, Blue }\n")
+        .concat("fn main() ! IO \{\n")
+        .concat("    let mut cc: Set[Color] = Set()\n")
+        .concat("    cc.insert(Color.Green)\n")
+        .concat("}\n")
+}
+
+test "C witness: Set[Color] insert boxes a blink_Color local via kops_blink_Color" {
+    let c = compile_test_helpers.compile_and_emit_c(src_c_witness(), "jctkac_set_c_witness")
+    assert_has(c, "kops_blink_Color", "witness / enum kops present")
+    assert_has(c, "blink_Color _mkey", "witness / typed enum local boxed by address")
+}
