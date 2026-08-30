@@ -9,7 +9,7 @@ import codegen_types.{
     cg_async_scope_counter, cg_async_scope_stack,
     cg_closure_cap_count, cg_closure_cap_start, cg_closure_defs,
     cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_node, cg_current_fn_option_inner, cg_current_fn_option_inner_struct, cg_current_fn_ret, cg_in_test_body, cg_test_mode, cg_in_assert_panics,
-    cg_let_target_ann, cg_expect_arg_ann, cg_assign_target_name, cg_fa_receiver_ctx,
+    cg_let_target_ann, cg_expect_arg_ann, cg_expect_arg_tid, cg_assign_target_name, cg_fa_receiver_ctx,
     cg_mono_tparams_sl, cg_mono_arg_tids, cg_fn_mono_tparams_sl, cg_fn_mono_arg_tids,
     cg_debug_mode, cg_handler_body_field, cg_handler_body_idx,
     cg_handler_body_is_ue, cg_handler_body_vtable_type,
@@ -282,6 +282,24 @@ fn propagate_enum_struct(name: Str, result_str: Str) {
             set_var_struct(result_str, ve)
         }
     }
+}
+
+// One side of a pushed Result carrier is namable from the element tid when it is a
+// leaf scalar or a struct/enum/tuple. A compound inner (Option/Result/Map/List/Set)
+// needs the annotation path's upgrade_compound_carrier to embed the structured tag,
+// so the tid push path declines and the ctor falls through to its existing handling.
+fn result_push_side_namable(ct: Int, s: Str) -> Bool {
+    if s != "" { return true }
+    if ct == CT_OPTION || ct == CT_RESULT || ct == CT_MAP || ct == CT_LIST || ct == CT_SET { return false }
+    ct >= 0
+}
+
+// Normalize a Result side to the carrier convention carrier_from_elem_name uses: a
+// struct/enum/tuple side rides CT_INT (its name carries the tag; the emit helpers
+// box the err value and embed the ok value), while a scalar side keeps its own ct.
+fn result_push_side_ct(ct: Int, s: Str) -> Int {
+    if s != "" { return CT_INT }
+    ct
 }
 
 fn emit_ok_result(ok_str: Str, ok_type: Int, err_type: Int, ok_s: Str, err_s: Str) {
@@ -4704,6 +4722,11 @@ fn emit_struct_field_eq(eq_var: Str, struct_name: Str, lhs: Str, rhs: Str, acces
 fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let func_node = node_left(node)
     let func_kind = node_kind(func_node)
+    // A live push tid (List[Result[..]].push) is consumed only by the Ok/Err
+    // branches below. Capture it and clear the global so it cannot leak through
+    // any arg loop in this function into a nested call's own Ok/Err arguments.
+    let entry_expect_tid = cg_expect_arg_tid
+    cg_expect_arg_tid = -1
     if func_kind == NodeKind.Ident {
         let fn_name = resolve_import_alias(node_name(func_node))
         let call_line = node_line(func_node)
@@ -5513,6 +5536,28 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             let args_sl = node_args(node)
             let arity = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
             let exp_ok_ann = expect_arg_result_elem(0)
+            let ok_exp_res_tid = tc_tid_resolved(entry_expect_tid)
+            if exp_ok_ann == -1 && arity > 0 && tc_tid_ct(ok_exp_res_tid) == CT_RESULT {
+                let ok_s = tc_tid_result_ok_struct(ok_exp_res_tid)
+                let err_s = tc_tid_result_err_struct(ok_exp_res_tid)
+                let ok_ct = tc_tid_result_ok_ct(ok_exp_res_tid)
+                let err_ct = tc_tid_result_err_ct(ok_exp_res_tid)
+                if result_push_side_namable(ok_ct, ok_s) && result_push_side_namable(err_ct, err_s) {
+                    let saved_tid = cg_expect_arg_tid
+                    let saved_arg_ann = cg_expect_arg_ann
+                    let saved_let_ann = cg_let_target_ann
+                    cg_expect_arg_ann = -1
+                    cg_let_target_ann = -1
+                    cg_expect_arg_tid = tc_tid_result_ok_tid(ok_exp_res_tid)
+                    emit_expr(sublist_get(args_sl, 0))
+                    cg_expect_arg_tid = saved_tid
+                    cg_expect_arg_ann = saved_arg_ann
+                    cg_let_target_ann = saved_let_ann
+                    let ok_str = expr_result_str
+                    emit_ok_result(ok_str, result_push_side_ct(ok_ct, ok_s), result_push_side_ct(err_ct, err_s), ok_s, err_s)
+                    return
+                }
+            }
             if exp_ok_ann != -1 && arity > 0 {
                 let exp_err_ann = expect_arg_result_elem(1)
                 let ok_name = node_name(exp_ok_ann)
@@ -5662,6 +5707,28 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         if fn_name == "Err" {
             let args_sl = node_args(node)
             let exp_err_result_ann = expect_arg_result_elem(0)
+            let err_exp_res_tid = tc_tid_resolved(entry_expect_tid)
+            if exp_err_result_ann == -1 && args_sl != -1 && sublist_length(args_sl) > 0 && tc_tid_ct(err_exp_res_tid) == CT_RESULT {
+                let ok_s = tc_tid_result_ok_struct(err_exp_res_tid)
+                let err_s = tc_tid_result_err_struct(err_exp_res_tid)
+                let ok_ct = tc_tid_result_ok_ct(err_exp_res_tid)
+                let err_ct = tc_tid_result_err_ct(err_exp_res_tid)
+                if result_push_side_namable(ok_ct, ok_s) && result_push_side_namable(err_ct, err_s) {
+                    let saved_tid = cg_expect_arg_tid
+                    let saved_arg_ann = cg_expect_arg_ann
+                    let saved_let_ann = cg_let_target_ann
+                    cg_expect_arg_ann = -1
+                    cg_let_target_ann = -1
+                    cg_expect_arg_tid = tc_tid_result_err_tid(err_exp_res_tid)
+                    emit_expr(sublist_get(args_sl, 0))
+                    cg_expect_arg_tid = saved_tid
+                    cg_expect_arg_ann = saved_arg_ann
+                    cg_let_target_ann = saved_let_ann
+                    let err_str = expr_result_str
+                    emit_err_result(err_str, result_push_side_ct(ok_ct, ok_s), result_push_side_ct(err_ct, err_s), ok_s, err_s)
+                    return
+                }
+            }
             if exp_err_result_ann != -1 && args_sl != -1 && sublist_length(args_sl) > 0 {
                 let exp_err_ann = expect_arg_result_elem(1)
                 let ok_name = node_name(exp_err_result_ann)

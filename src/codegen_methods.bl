@@ -44,7 +44,7 @@ import codegen_types.{
     get_variant_field_type_str, get_variant_index, get_variant_tag,
     has_derive_method, is_compound_ct, is_data_enum, is_enum_type, is_payloadless_enum, is_fn_registered, is_scope_var, is_str_backed_enum, strip_generic_args,
     is_generic_fn, is_mono_struct_instance, is_struct_type, is_struct_or_enum_type, is_trait_type, is_transparent_newtype, is_boxed_struct_err, is_user_effect_handle,
-    cg_expect_fn_value_sig, cg_expect_arg_ann, arg_type_ann_at, get_callee_params_sl,
+    cg_expect_fn_value_sig, cg_expect_arg_ann, cg_expect_arg_tid, cg_bind_mono_tid, arg_type_ann_at, get_callee_params_sl,
     builtin_receiver_type_name,
     is_sized_int_ct, unwrap_scalar_ct, scalar_carrier_cast, lookup_builtin_trait_impl, lookup_impl_method, impl_method_reg_name, impl_trait_for_method, impl_type_implements_trait_method, mangle_generic_name, mangle_impl_method_q, mangle_from_method, synthesized_display_call, render_result_arm_value, wrapping_unsigned_c_type,
     option_c_type, option_inner_ct_from_tag, option_inner_struct_from_tag, reg_fn, reg_fn_ret_type, reg_fn_ret_type_tp, sv_tp, reg_fn_ret_struct_inner, reg_fn_struct_ret, reg_fn_with_effects, register_mono_fn, register_mono_instance,
@@ -1354,7 +1354,16 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
         }
         let args_sl = node_args(node)
         let push_arg_node = sublist_get(args_sl, btc_arg_offset)
+        // The list element type is the pushed value's expected type. A bare Err/Ok
+        // arg (`push(Err(s))`) has no annotation node to adopt — the generic
+        // `push(self, elem: T)` param spells the typevar `T`, not the concrete
+        // `Result[Int, Point]` — so hand the element tid down through
+        // cg_expect_arg_tid, which the Ok/Err ctors read to spell the pushed carrier
+        // instead of erasing the struct side to `void`.
+        let saved_expect_tid = cg_expect_arg_tid
+        cg_expect_arg_tid = tc_tid_list_elem(cg_bind_mono_tid(get_var_ty(obj_str)))
         emit_expr(push_arg_node)
+        cg_expect_arg_tid = saved_expect_tid
         reseat_bare_none_from_list_elem(obj_str)
         let val_str = expr_result_str
         let val_type = expr_result_type
@@ -3041,6 +3050,10 @@ fn receiver_type_name_for_diag(obj_node: Int, obj_type: Int) -> Str {
 pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let obj_node = node_obj(node)
     let method = node_method(node)
+    // Clear any live push tid so it cannot leak through this dispatch's arg loops
+    // into a nested Ok/Err. A List push below re-establishes it for its own arg,
+    // and only emit_call's Ok/Err branches ever read it.
+    cg_expect_arg_tid = -1
     let mut mc_obj_is_local = 0
     if node_kind(obj_node) == NodeKind.Ident {
         if is_scope_var(node_name(obj_node)) != 0 {
