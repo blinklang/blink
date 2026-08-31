@@ -2285,21 +2285,35 @@ pub fn get_capture_index(name: Str) -> Int {
 
 // Capture boxing, rehydration, and promotion read a captured value's kind and struct name.
 // An as-pattern whole binder is stamped tid-only (stamp_whole_binder_from_tid), so its tp is the
-// CT_VOID placeholder and these flat reads answer nothing — the value falls to a void* passthrough
-// and the emitted C is wrong. These recover kind/name from the authoritative tid, but only when the
-// flat channel is the placeholder, so every already-populated capture keeps its flat answer verbatim.
-// Shares sv_struct_tid_first's tid→name contract: a mono instance spells its stem, a
-// non-generic struct/enum spells its bare name, and the two shapes the name cannot faithfully
-// carry — a transparent newtype (a bare scalar, no aggregate) and an under-populated generic base
-// (only the flat channel holds its mono suffix) — decline so the flat channel stands.
+// CT_VOID placeholder and the flat reads answer nothing — the value would fall to a void*
+// passthrough and the emitted C be wrong. These readers recover kind/name from the authoritative
+// tid so such a capture spells correctly.
+// A capture cell's struct name, read tid-first — the authoritative channel, mirroring
+// sv_struct_tid_first (the carrier-context twin). The flat sname is consulted ONLY when
+// the tid cannot answer: an unpopulated tid (tid < 0), or one naming an unspellable
+// generic instance whose mono suffix lives only on the flat channel. When a populated
+// tid CAN answer, its answer is authoritative even when "" — a carrier over a
+// container/scalar inner has no nominal name, so "" is the correct spelling.
 pub fn capture_sname(tid: Int, tp_id: Int) -> Str {
-    let flat = tp_get_sname(tp_id)
-    if flat != "" { return flat }
+    let nm = capture_sname_tid_cell(tid)
+    if nm != "" { return nm }
+    if tid >= 0 && tid_names_unspellable_generic(tid) == 0 { return "" }
+    tp_get_sname(tp_id)
+}
+
+// tid->name recovery for a capture, sharing tid_struct_name's contract: a transparent
+// newtype has no aggregate C struct, so it declines and stays a bare scalar (capture_ct
+// then keeps it CT_INT), and an under-populated generic base declines so the flat mono
+// spelling stands. The arm set is narrower than tid_struct_name's: a capture never
+// surfaces the Option/Result-inner nominal a scope var can, so those arms are omitted.
+fn capture_sname_tid_cell(tid: Int) -> Str {
     let m = cg_bind_mono_tid(tid)
     let mono = tc_tid_struct_mono_name(m)
     if mono != "" { return mono }
     let nm = tc_tid_struct(m)
     if nm != "" && is_transparent_newtype(nm) == 0 && struct_def_is_generic(nm) == 0 { return nm }
+    let tup = tc_tid_tuple_sname(m)
+    if find_tuple_entry(tup) >= 0 { return tup }
     ""
 }
 
