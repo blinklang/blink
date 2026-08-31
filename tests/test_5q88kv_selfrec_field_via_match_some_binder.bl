@@ -1,0 +1,178 @@
+// A self-recursive generic-enum instance (`Tree[Int]`) bound through a
+// `match Some(t)` Option-carrier binder over a list element must deref its
+// self-recursive field through the instance's mono stem (`blink_Tree_0Int`),
+// not the bare head (`blink_Tree`, a C symbol that is never typedef'd). The
+// scrutinee temp's declaration already leads from the binder's tid; the
+// self-recursive field-deref stem, however, read only the flat get_var_struct
+// channel, which is unset for a Some(t) binder, so the field spelled the bare
+// head and cc failed with `unknown type name 'blink_Tree'`.
+//
+// The distinguishing axis (a bare local `let t: Tree[Int]` or `.get(0).unwrap()`
+// both work) is the match-Some(t) Option-carrier binder: t declares with the
+// correct mono stem but its flat struct channel is empty, so the deref stem must
+// recover the mono from the tid.
+
+import compile_test_helpers
+
+fn src_match_some_selfrec() -> Str {
+    #"import std.io
+
+type Tree[T] {
+    Leaf(value: T)
+    Branch(left: Tree[T], right: Tree[T])
+}
+
+fn main() {
+    let a: List[Tree[Int]] = [Tree.Branch(Tree.Leaf(1), Tree.Leaf(2))]
+    match a.get(0) {
+        Some(t) => match t {
+            Leaf(_v) => io.println("leaf")
+            Branch(_l, _r) => io.println("branch")
+        }
+        None => io.println("none")
+    }
+}
+"#
+}
+
+test "selfrec generic-enum field via match Some(t) list-element binder derefs the mono stem" {
+    let r = compile_test_helpers.compile_and_run(src_match_some_selfrec(), "5q88kv_branch")
+    if !r.out.contains("branch") {
+        compile_test_helpers.expect_contains(r.out, "branch", "selfrec via match Some — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("branch"))
+    assert(!r.out.contains("leaf"))
+    assert(!r.out.contains("none"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_match_some_selfrec_read_inner() -> Str {
+    #"import std.io
+
+type Tree[T] {
+    Leaf(value: T)
+    Branch(left: Tree[T], right: Tree[T])
+}
+
+fn main() {
+    let a: List[Tree[Int]] = [Tree.Branch(Tree.Leaf(7), Tree.Leaf(9))]
+    match a.get(0) {
+        Some(t) => match t {
+            Leaf(_v) => io.println("leaf")
+            Branch(l, _r) => match l {
+                Leaf(v) => io.println("v={v}")
+                Branch(_a, _b) => io.println("nested")
+            }
+        }
+        None => io.println("none")
+    }
+}
+"#
+}
+
+test "unboxed self-recursive field read through a match Some(t) binder carries its value" {
+    let r = compile_test_helpers.compile_and_run(src_match_some_selfrec_read_inner(), "5q88kv_inner")
+    if !r.out.contains("v=7") {
+        compile_test_helpers.expect_contains(r.out, "v=7", "selfrec inner read via match Some — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("v=7"))
+    assert_eq(r.exit_code, 0)
+}
+
+// The carrier that binds `t` decides which sub-branch of the widened gate runs:
+// a plain Option local, a Result Ok(t), and a map.get() carrier each populate the
+// binder's channels differently, so each is a distinct regression pin.
+
+fn src_match_some_selfrec_opt_local() -> Str {
+    #"import std.io
+
+type Tree[T] {
+    Leaf(value: T)
+    Branch(left: Tree[T], right: Tree[T])
+}
+
+fn main() {
+    let o: Option[Tree[Int]] = Some(Tree.Branch(Tree.Leaf(1), Tree.Leaf(2)))
+    match o {
+        Some(t) => match t {
+            Leaf(_v) => io.println("leaf")
+            Branch(_l, _r) => io.println("branch")
+        }
+        None => io.println("none")
+    }
+}
+"#
+}
+
+test "selfrec generic-enum field via a plain Option local match Some(t) binder" {
+    let r = compile_test_helpers.compile_and_run(src_match_some_selfrec_opt_local(), "5q88kv_optloc")
+    if !r.out.contains("branch") {
+        compile_test_helpers.expect_contains(r.out, "branch", "selfrec via Option-local match Some — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("branch"))
+    assert(!r.out.contains("leaf"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_match_some_selfrec_result_ok() -> Str {
+    #"import std.io
+
+type Tree[T] {
+    Leaf(value: T)
+    Branch(left: Tree[T], right: Tree[T])
+}
+
+fn main() {
+    let r: Result[Tree[Int], Str] = Ok(Tree.Branch(Tree.Leaf(3), Tree.Leaf(4)))
+    match r {
+        Ok(t) => match t {
+            Leaf(_v) => io.println("leaf")
+            Branch(_l, _r) => io.println("branch")
+        }
+        Err(_e) => io.println("err")
+    }
+}
+"#
+}
+
+test "selfrec generic-enum field via a Result Ok(t) binder" {
+    let r = compile_test_helpers.compile_and_run(src_match_some_selfrec_result_ok(), "5q88kv_resok")
+    if !r.out.contains("branch") {
+        compile_test_helpers.expect_contains(r.out, "branch", "selfrec via Result Ok — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("branch"))
+    assert(!r.out.contains("leaf"))
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_match_some_selfrec_map_get() -> Str {
+    #"import std.io
+
+type Tree[T] {
+    Leaf(value: T)
+    Branch(left: Tree[T], right: Tree[T])
+}
+
+fn main() {
+    let mut m: Map[Str, Tree[Int]] = Map()
+    m.insert("k", Tree.Branch(Tree.Leaf(5), Tree.Leaf(6)))
+    match m.get("k") {
+        Some(t) => match t {
+            Leaf(_v) => io.println("leaf")
+            Branch(_l, _r) => io.println("branch")
+        }
+        None => io.println("none")
+    }
+}
+"#
+}
+
+test "selfrec generic-enum field via a map.get() Some(t) binder" {
+    let r = compile_test_helpers.compile_and_run(src_match_some_selfrec_map_get(), "5q88kv_mapget")
+    if !r.out.contains("branch") {
+        compile_test_helpers.expect_contains(r.out, "branch", "selfrec via map.get match Some — got '{r.out}' / '{r.err_out}'")
+    }
+    assert(r.out.contains("branch"))
+    assert(!r.out.contains("leaf"))
+    assert_eq(r.exit_code, 0)
+}
