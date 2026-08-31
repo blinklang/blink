@@ -302,6 +302,45 @@ fn result_push_side_ct(ct: Int, s: Str) -> Int {
     ct
 }
 
+// The struct/enum/tuple NAME of a Result side spelled from its RESOLVED leaf tid —
+// the mono stem for a generic instance (Box_Int), the module-stripped head for a
+// bare struct/enum, the generated tag for a tuple (Tuple2_int_int), "" otherwise.
+// Matches the flat channel's tid_inner_struct convention, so a side spelled here
+// agrees with the annotation path.
+fn result_side_struct_from_leaf(leaf: Int) -> Str {
+    let mono = tc_tid_struct_mono_name(leaf)
+    if mono != "" { return mono }
+    let s = tc_tid_struct(leaf)
+    if s != "" { return s }
+    // A tuple side names its generated tag (Tuple2_int_int) on the same footing as
+    // a struct, matching the flat channel's tid_inner_struct Tuple arm, so a tuple
+    // Result side rides the tid push path instead of erasing to a void carrier.
+    tc_tid_tuple_sname(leaf)
+}
+
+// The carrier tag for a Result side spelled from its RESOLVED leaf tid: a named
+// struct/enum side rides its own name; a nested Option/Result side rides its
+// structured inner tag (Result_Point_str), so a Result whose side is itself a
+// carrier keeps the full shape instead of erasing one level; a scalar side stays
+// "" and rides its ct through the emit helpers.
+fn result_side_carrier_tag(side_ct: Int, side_struct: Str, side_leaf: Int) -> Str {
+    if side_struct != "" { return side_struct }
+    if side_ct == CT_OPTION || side_ct == CT_RESULT { return tc_tid_inner_tag(side_leaf) }
+    ""
+}
+
+// Whether a Result side can be spelled for emit_ok_result/emit_err_result straight
+// from its RESOLVED leaf tid: a named struct/enum, a scalar, or a nested
+// Option/Result whose inner tag encodes faithfully. A Map/List/Set side declines
+// (it is an erased by-pointer carrier the flat channel still owns), as does an
+// unencodable inner, so the caller falls back to the flat fn-return channel.
+fn result_side_tid_namable(side_ct: Int, side_struct: Str, side_leaf: Int) -> Bool {
+    if side_struct != "" { return !diag_is_ice_seg(side_struct) }
+    if side_ct == CT_OPTION || side_ct == CT_RESULT { return !diag_is_ice_seg(tc_tid_inner_tag(side_leaf)) }
+    if side_ct == CT_MAP || side_ct == CT_LIST || side_ct == CT_SET { return false }
+    side_ct >= 0
+}
+
 fn emit_ok_result(ok_str: Str, ok_type: Int, err_type: Int, ok_s: Str, err_s: Str) {
     if ok_s != "" || err_s != "" {
         ensure_mixed_result_type(ok_type, err_type, ok_s, err_s)
@@ -5297,7 +5336,22 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 // carrier stays Option_Errno with a bare int64_t value member (no
                 // box), mirroring the transparent Result treatment.
                 let mut transparent_enum = transparent_newtype_arg_enum(sublist_get(args_sl, 0))
+                // Propagate the payload's authoritative tid so a nested carrier
+                // (Some(Ok(..)), Some(Some(..))) resolves each level from the tid
+                // rather than the flat fn-return channel, which carries only one
+                // level of ok/err structure: for an Option[Result[..]] return that
+                // channel holds the whole Result carrier as the "ok struct", so a
+                // nested Result-of-Result Ok double-counts it. Mirrors the Ok/Err
+                // payload tid propagation. Restored after the emit so a non-call
+                // payload can't leak the tid to a later emit in this handler.
+                let saved_some_arg_tid = cg_expect_arg_tid
+                let some_node_tid = tc_tid_resolved(cg_expr_node_mono_tid(node))
+                if tc_tid_ct(some_node_tid) == CT_OPTION {
+                    let some_inner_tid = tc_tid_option_inner_tid(some_node_tid)
+                    if some_inner_tid >= 0 { cg_expect_arg_tid = some_inner_tid }
+                }
                 emit_expr(sublist_get(args_sl, 0))
+                cg_expect_arg_tid = saved_some_arg_tid
                 let inner_str = expr_result_str
                 let inner_type = expr_result_type
                 let inner_is_none = expr_option_is_none
@@ -5556,23 +5610,31 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             let exp_ok_ann = expect_arg_result_elem(0)
             let ok_exp_res_tid = tc_tid_resolved(entry_expect_tid)
             if exp_ok_ann == -1 && arity > 0 && tc_tid_ct(ok_exp_res_tid) == CT_RESULT {
-                let ok_s = tc_tid_result_ok_struct(ok_exp_res_tid)
-                let err_s = tc_tid_result_err_struct(ok_exp_res_tid)
-                let ok_ct = tc_tid_result_ok_ct(ok_exp_res_tid)
-                let err_ct = tc_tid_result_err_ct(ok_exp_res_tid)
-                if result_push_side_namable(ok_ct, ok_s) && result_push_side_namable(err_ct, err_s) {
+                // Resolve each side's leaf tid so a bound-metavar side (a never-
+                // constructed Err over an Ok, left as α := Str by unification) reads
+                // its solution, and a nested Option/Result side spells its full inner
+                // tag. The flat fn-return channel holds only one level of ok/err
+                // structure, so a Result whose Ok is itself a Result (Some(Ok(Ok(x))))
+                // double-counts there; the resolved leaves carry the true shape.
+                let ok_leaf = tc_tid_resolved(tc_tid_result_ok_tid(ok_exp_res_tid))
+                let err_leaf = tc_tid_resolved(tc_tid_result_err_tid(ok_exp_res_tid))
+                let ok_ct = tc_tid_ct(ok_leaf)
+                let err_ct = tc_tid_ct(err_leaf)
+                let ok_s = result_side_struct_from_leaf(ok_leaf)
+                let err_s = result_side_struct_from_leaf(err_leaf)
+                if result_side_tid_namable(ok_ct, ok_s, ok_leaf) && result_side_tid_namable(err_ct, err_s, err_leaf) {
                     let saved_tid = cg_expect_arg_tid
                     let saved_arg_ann = cg_expect_arg_ann
                     let saved_let_ann = cg_let_target_ann
                     cg_expect_arg_ann = -1
                     cg_let_target_ann = -1
-                    cg_expect_arg_tid = tc_tid_result_ok_tid(ok_exp_res_tid)
+                    cg_expect_arg_tid = ok_leaf
                     emit_expr(sublist_get(args_sl, 0))
                     cg_expect_arg_tid = saved_tid
                     cg_expect_arg_ann = saved_arg_ann
                     cg_let_target_ann = saved_let_ann
                     let ok_str = expr_result_str
-                    emit_ok_result(ok_str, result_push_side_ct(ok_ct, ok_s), result_push_side_ct(err_ct, err_s), ok_s, err_s)
+                    emit_ok_result(ok_str, result_push_side_ct(ok_ct, ok_s), result_push_side_ct(err_ct, err_s), result_side_carrier_tag(ok_ct, ok_s, ok_leaf), result_side_carrier_tag(err_ct, err_s, err_leaf))
                     return
                 }
             }
@@ -5744,23 +5806,29 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             let exp_err_result_ann = expect_arg_result_elem(0)
             let err_exp_res_tid = tc_tid_resolved(entry_expect_tid)
             if exp_err_result_ann == -1 && args_sl != -1 && sublist_length(args_sl) > 0 && tc_tid_ct(err_exp_res_tid) == CT_RESULT {
-                let ok_s = tc_tid_result_ok_struct(err_exp_res_tid)
-                let err_s = tc_tid_result_err_struct(err_exp_res_tid)
-                let ok_ct = tc_tid_result_ok_ct(err_exp_res_tid)
-                let err_ct = tc_tid_result_err_ct(err_exp_res_tid)
-                if result_push_side_namable(ok_ct, ok_s) && result_push_side_namable(err_ct, err_s) {
+                // Resolve each side's leaf tid so a bound-metavar side (an ok side
+                // never constructed in the Err branch, left as α := struct by
+                // unification) reads its solution, and a nested Option/Result side
+                // spells its full inner tag rather than the flat single-level channel.
+                let ok_leaf = tc_tid_resolved(tc_tid_result_ok_tid(err_exp_res_tid))
+                let err_leaf = tc_tid_resolved(tc_tid_result_err_tid(err_exp_res_tid))
+                let ok_ct = tc_tid_ct(ok_leaf)
+                let err_ct = tc_tid_ct(err_leaf)
+                let ok_s = result_side_struct_from_leaf(ok_leaf)
+                let err_s = result_side_struct_from_leaf(err_leaf)
+                if result_side_tid_namable(ok_ct, ok_s, ok_leaf) && result_side_tid_namable(err_ct, err_s, err_leaf) {
                     let saved_tid = cg_expect_arg_tid
                     let saved_arg_ann = cg_expect_arg_ann
                     let saved_let_ann = cg_let_target_ann
                     cg_expect_arg_ann = -1
                     cg_let_target_ann = -1
-                    cg_expect_arg_tid = tc_tid_result_err_tid(err_exp_res_tid)
+                    cg_expect_arg_tid = err_leaf
                     emit_expr(sublist_get(args_sl, 0))
                     cg_expect_arg_tid = saved_tid
                     cg_expect_arg_ann = saved_arg_ann
                     cg_let_target_ann = saved_let_ann
                     let err_str = expr_result_str
-                    emit_err_result(err_str, result_push_side_ct(ok_ct, ok_s), result_push_side_ct(err_ct, err_s), ok_s, err_s)
+                    emit_err_result(err_str, result_push_side_ct(ok_ct, ok_s), result_push_side_ct(err_ct, err_s), result_side_carrier_tag(ok_ct, ok_s, ok_leaf), result_side_carrier_tag(err_ct, err_s, err_leaf))
                     return
                 }
             }
