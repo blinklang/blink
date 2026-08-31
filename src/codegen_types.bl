@@ -4929,7 +4929,12 @@ pub fn set_map_types(name: Str, key_type: Int, value_type: Int, value_name: Str)
             } else {
                 sv_tp(sv.ctype, key_type, eff_value_type, sv.sname)
             }
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: key_type, inner2: eff_value_type, sname: sv.sname, sname2: sv.sname2, ty: sv.ty, tp_id: new_tp })
+            // Keep the flat key kind in step with the pool key child so the two
+            // channels agree for a struct key: the prior_k_sname branch forces the
+            // pool child to CT_STRUCT (type_struct), so the flat field must read
+            // CT_STRUCT too, not the erased incoming key_type (CT_VOID for a struct).
+            let eff_key_type = if prior_k_sname != "" { CT_STRUCT } else { key_type }
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: eff_key_type, inner2: eff_value_type, sname: sv.sname, sname2: sv.sname2, ty: sv.ty, tp_id: new_tp })
             if (value_type == CT_VOID || value_type == CT_STRUCT || value_type == CT_ENUM) && value_name != "" && is_named_type(value_name) != 0 {
                 set_map_value_struct(name, value_name)
             }
@@ -4943,15 +4948,17 @@ pub fn set_map_types(name: Str, key_type: Int, value_type: Int, value_name: Str)
     }
 }
 
-// Raw map key type: the tp child1 kind, or -1 when the key type was never set.
-// Unlike get_map_key_type this does NOT mask an unset key as CT_STRING, so callers
-// can tell a genuinely-recovered key apart from the default.
+// Raw map key kind, or -1 when the key type was never set. Unlike get_map_key_type
+// this returns -1 for an unset key rather than a plausible default, so callers can
+// tell a genuinely-recovered key apart from "unknown". Mirrors get_map_value_type_raw.
 pub fn get_map_key_type_raw(name: Str) -> Int {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_MAP {
-            return tp_child1_kind(sv.tp_id)
+            // Flat key kind; set_map_types/set_map_key_struct keep inner1 in step
+            // with the pool key child (CT_STRUCT for a struct key, -1 when unset).
+            return sv.inner1
         }
         i = i - 1
     }
@@ -5040,7 +5047,9 @@ pub fn get_map_key_type(name: Str) -> Int {
             // No CT_STRING fabrication: an unset key kind returns -1 (mirrors
             // get_set_elem_type) so a consumer can tell a genuinely-recovered
             // Str key from "key unknown" instead of trusting a plausible default.
-            return tp_child1_kind(sv.tp_id)
+            // Read the flat key kind; set_map_types/set_map_key_struct keep inner1
+            // in step with the pool key child, so this equals the old pool read.
+            return sv.inner1
         }
         i = i - 1
     }
@@ -5100,7 +5109,9 @@ pub fn set_map_key_struct(name: Str, struct_name: Str) {
             let new_k = type_struct(struct_name)
             let new_v = if v >= 0 { sv_tp(v, -1, -1, sv.sname2) } else { type_int() }
             let new_tp = type_map(new_k, new_v)
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, ty: sv.ty, tp_id: new_tp })
+            // The pool key child becomes CT_STRUCT (type_struct); sync the flat key
+            // kind to match so get_map_key_type can read inner1 in place of the pool.
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: CT_STRUCT, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, ty: sv.ty, tp_id: new_tp })
             return
         }
         i = i - 1
