@@ -4877,19 +4877,33 @@ pub fn get_list_elem_struct(name: Str) -> Str {
 // annotate an already-live Set var still get a write; callers relying on this
 // push as their FIRST registration of `name` must not assume any other kind
 // (e.g. CT_OPTION) also gets stamped by the same call.
+// A Set tid over a concrete scalar element, so a codegen-synthesized set (a union
+// temp, a copy sink) that reaches set_set_elem_type without a typecheck tid still
+// answers its element off the authoritative tid channel. -1 for a struct/enum/void
+// element: those carry no scalar tid here — a struct's identity arrives later through
+// set_set_elem_struct, and an unresolved element stays genuinely unknown.
+fn set_scalar_ty(elem_type: Int) -> Int {
+    if elem_type == CT_VOID { return -1 }
+    let etid = tc_scalar_tid_for_ct(elem_type)
+    if etid >= 0 { make_set_type(etid) } else { -1 }
+}
+
 pub fn set_set_elem_type(name: Str, elem_type: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_SET {
             // A set var is always (CT_SET, sname=""); the pool key needs no flat-field read here,
-            // so the fresh element alone reconstructs the same entry.
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: elem_type, inner2: -1, sname: sv.sname, ty: sv.ty, tp_id: sv_tp(CT_SET, elem_type, -1, "") })
+            // so the fresh element alone reconstructs the same entry. Stamp a scalar Set tid when
+            // the var carries none, so get_set_elem_type reads the element off the tid, not the flat
+            // field; a richer existing tid stands.
+            let new_ty = if sv.ty >= 0 { sv.ty } else { set_scalar_ty(elem_type) }
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: elem_type, inner2: -1, sname: sv.sname, ty: new_ty, tp_id: sv_tp(CT_SET, elem_type, -1, "") })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_SET, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", ty: -1, tp_id: sv_tp(CT_SET, elem_type, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_SET, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", ty: set_scalar_ty(elem_type), tp_id: sv_tp(CT_SET, elem_type, -1, "") })
 }
 
 // A binding-site tid (ScopeVar.ty / CaptureEntry.tid) is the RAW declared tid: inside a
@@ -4920,17 +4934,16 @@ pub fn get_set_elem_type(name: Str) -> Int {
         if sv.name == name && sv.ctype == CT_SET {
             if sv.ty >= 0 {
                 let e = tc_tid_set_elem_ct_resolved(cg_bind_mono_tid(sv.ty))
-                // An enum element is name-carried: c_type_str spells CT_ENUM
-                // "void" and emit_set_method's CT guard omits CT_ENUM, so let it
-                // fall through to the flat CT (CT_VOID) and pick up the identity
-                // from get_set_elem_struct's tid-first sname instead.
-                if e >= 0 && e != CT_ENUM { return e }
+                // An enum element is name-carried: c_type_str spells CT_ENUM "void"
+                // and emit_set_method's CT guard omits CT_ENUM, so report the void CT
+                // and let the identity ride get_set_elem_struct's tid-first sname.
+                if e == CT_ENUM { return CT_VOID }
+                if e >= 0 { return e }
             }
-            // No tid (a set var registered only via set_set_elem_type, ty<0): read
-            // the element off the flat field, not the derived tp_* pool — sv_tp
-            // built that pool child straight from inner1 at the same setter, so the
-            // two agree, and an erased-typevar element reads CT_VOID either way.
-            return sv.inner1
+            // No tid, or a tid whose element declines a CT (an erased typevar): the
+            // element is genuinely unknown here, so -1 — a caller checks
+            // get_set_elem_struct for a name before concluding "truly unknown".
+            return -1
         }
         i = i - 1
     }
