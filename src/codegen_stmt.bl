@@ -39,7 +39,7 @@ import codegen_types.{
     get_map_key_type, get_map_key_type_raw, get_map_key_struct, get_map_value_struct, get_map_value_type, get_map_value_type_raw, get_map_value_list_elem, is_map_scalar_ct, get_set_elem_type, get_set_elem_struct,
     ensure_tuple_type, find_tuple_entry, cg_bind_mono_tid,
     chan_elem_c_type, get_var_ty,
-    get_struct_field_stype, get_struct_field_type, get_var_channel_inner,
+    get_struct_field_stype, get_struct_field_type,
     get_var_enum, get_var_handle_inner, get_var_handle_inner2,
     get_var_handler_is_ue, get_var_handler_vtable_field,
     get_var_closure_sig, get_var_handler_vtable_type,
@@ -70,7 +70,7 @@ import codegen_types.{
     set_list_nested_elem_type, set_list_elem_map_types, set_list_elem_option, set_list_elem_result, get_list_elem_option_inner, get_list_elem_option_inner_struct, get_list_elem_result_ok, get_list_elem_result_err, get_list_elem_result_ok_struct, get_list_elem_result_err_struct, get_list_elem_option_inner_tp, get_list_elem_result_ok_tp, get_list_elem_result_err_tp, tp_carrier_tag, set_var_option_inner_tp, set_map_types, set_map_key_struct, key_struct_sname_from_ann, set_map_value_list_elem, copy_map_value_meta, set_set_elem_type, set_set_elem_struct,
     find_type_def_node, set_var_ffi_ptr_struct, set_var_ffi_ptr_array, set_var_ffi_ptr_extra,
     ffi_alloc_n_pending, ffi_offset_pending_struct,
-    set_var, set_var_ty, set_var_alias, set_var_channel, set_var_closure, set_var_handle,
+    set_var, set_var_ty, set_var_alias, set_var_closure, set_var_handle,
     set_var_handler, tid_spells_struct,
     set_var_handle_full, set_var_iterator, set_var_option,
     set_var_option_inner2, get_var_option_inner_tp,
@@ -4771,22 +4771,6 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             set_var_handle(name, CT_INT)
         }
     }
-    if val_type == CT_CHANNEL {
-        // `val_str` is the emitted C expression for the initializer
-        // (`blink_channel_new(4)`), NOT a variable name, so for every CONSTRUCTED channel
-        // this lookup misses and the CT_INT default below became the element type of every
-        // channel in every program. The binding's own tid knows the element, so ask it
-        // first; the flat lookup and its default stay for a channel with no tid to read.
-        let ch_inner = get_var_channel_inner(val_str)
-        let tid_inner = tc_channel_elem_ct(get_var_ty(name))
-        if tid_inner >= 0 {
-            set_var_channel(name, tid_inner)
-        } else if ch_inner >= 0 {
-            set_var_channel(name, ch_inner)
-        } else {
-            set_var_channel(name, CT_INT)
-        }
-    }
     // The generic struct-fallback propagates the RHS var's `sname` onto a
     // struct-typed binding via get_var_struct -> set_var_struct, which rebuilds
     // tp_id through the lossy 2-level sv_tp bridge. For an Option whose inner is
@@ -6141,13 +6125,11 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             cg_indent = cg_indent - 1
             emit_line("}")
         } else if iter_type == CT_CHANNEL {
-            let ch_inner = get_var_channel_inner(iter_str)
-            // The element type comes from the ITERABLE's tid, with the flat field kept
-            // as the fallback for a channel whose element nothing knows. The
-            // NULL test below is the end-of-stream signal and is sound only because `send`
-            // boxes — a raw `(void*)(intptr_t)0` element is indistinguishable from it, which
-            // would drop a sent 0 and every value behind it. Both fallback arms below dereference
-            // the box for the same reason, so every channel keeps that invariant.
+            // The element type comes from the ITERABLE's tid. The NULL test below is the
+            // end-of-stream signal and is sound only because `send` boxes — a raw
+            // `(void*)(intptr_t)0` element is indistinguishable from it, which would drop a
+            // sent 0 and every value behind it. The last-resort arm dereferences the box for
+            // the same reason, so every channel keeps that invariant.
             let ch_tid = tc_lookup_node_tid(iter_node)
             let elem_ct = tc_channel_elem_ct(ch_tid)
             let recv_tmp = fresh_temp("__chrecv_")
@@ -6164,14 +6146,6 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                 if elem_ct == CT_STRUCT {
                     set_var_struct(var_name, elem_sname)
                 }
-            } else if ch_inner == CT_STRING {
-                // Unwrap the box the send fallback writes before reinterpreting. No NULL guard
-                // is needed here — unlike the `.recv()` twin, the `if (recv_tmp == NULL) break;`
-                // above has already left the loop, and the box address is never NULL, so a sent 0
-                // does not read as end-of-stream and truncate the drain.
-                emit_line("const char* {c_var_name} = (const char*)*(void**){recv_tmp};")
-                push_scope()
-                set_var(var_name, CT_STRING, 0)
             } else {
                 emit_line("int64_t {c_var_name} = (int64_t)(intptr_t)*(void**){recv_tmp};")
                 push_scope()
