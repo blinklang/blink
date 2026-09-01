@@ -3191,12 +3191,25 @@ fn tc_check_callable_arg_bodies(args_sl: Int, skip_idx: Int) ! TypeCheck.Resolve
 // statement positions, so a HOF in one of these positions never reached check_closure_body and
 // its unannotated closure kept a Void return — silent garbage at codegen. This descends the
 // value-carrying expression kinds and routes each nested MethodCall/Call to tc_check_body, which
-// runs that call's own HOF closure-body walk exactly once. It re-infers and re-reports nothing of
-// its own: it only reaches the same per-node walk the primary arms use, for nodes those arms miss.
+// runs that call's own HOF closure-body walk exactly once. The MethodCall/Call arms re-infer
+// nothing of their own — they reach the same per-node walk the primary arms use, for nodes those
+// arms miss. The Block arm does walk the block through tc_check_body, whose tail ExprStmt re-infers
+// a value the enclosing call already inferred; that is harmless, since diagnostics dedup on
+// (code, span, message) and the raw error count is discarded at every caller.
 fn tc_walk_nested_hof_bodies(expr: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if expr == -1 { return }
     let k = node_kind(expr)
     if k == NodeKind.MethodCall || k == NodeKind.Call {
+        tc_check_body(expr)
+        return
+    }
+    // A block-expr in a value-nested position (`take_int({ let mut s: Set[Int] = Set()  ...  s.len() })`).
+    // tc_infer_value types only the block's TAIL, so the non-tail statements inside — the `let`
+    // above all — never reach the LetBinding arm and their node tids stay unpublished. Codegen then
+    // has no declared type to read for the block-local, so a `Set[Int]` local boxes its key at the
+    // wrong width. tc_check_body walks every statement in its own scope, which is the same full walk
+    // a fn-body block gets; routing here closes the one nesting position it was never reached from.
+    if k == NodeKind.Block {
         tc_check_body(expr)
         return
     }
