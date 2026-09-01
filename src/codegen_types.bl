@@ -3232,30 +3232,46 @@ pub fn get_fn_ret(name: Str) -> Int {
     CT_VOID
 }
 
+// A List tid over a concrete scalar element, mirroring set_scalar_ty for the SET
+// family. -1 for a struct/enum element (no scalar tid — a named element's identity
+// arrives through set_list_elem_struct or a compound tid stamp) and -1 for a void
+// element via the explicit guard below (a by-value marker, never a real element),
+// so an unresolved element stays genuinely unknown.
+fn list_scalar_ty(elem_type: Int) -> Int {
+    if elem_type == CT_VOID { return -1 }
+    let etid = tc_scalar_tid_for_ct(elem_type)
+    if etid >= 0 { make_list_type(etid) } else { -1 }
+}
+
 pub fn set_list_elem_type(name: Str, elem_type: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_LIST {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: elem_type, inner2: sv.inner2, sname: sv.sname, ty: sv.ty, tp_id: sv_tp(sv.ctype, elem_type, sv.inner2, sv.sname) })
+            // Stamp a scalar List tid when the var carries none, so get_list_elem_type
+            // reads a scalar element off the tid rather than the retired flat field; a
+            // richer existing tid (an annotated or compound-stamped list) stands.
+            let new_ty = if sv.ty >= 0 { sv.ty } else { list_scalar_ty(elem_type) }
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: elem_type, inner2: sv.inner2, sname: sv.sname, ty: new_ty, tp_id: sv_tp(sv.ctype, elem_type, sv.inner2, sv.sname) })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", ty: -1, tp_id: sv_tp(CT_LIST, elem_type, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", ty: list_scalar_ty(elem_type), tp_id: sv_tp(CT_LIST, elem_type, -1, "") })
 }
 
-// the list element with NO Int default — -1 when nothing ever recorded one.
+// the raw flat `inner1` element — a "was an element ever recorded?" signal, distinct
+// from `get_list_elem_type`'s flattened CT.
 //
-// `get_list_elem_type` below cannot report that, and not by oversight: it reads
-// `tp_child1_kind`, and `sv_tp(CT_LIST, -1, ..)` answers `type_list(type_int())`. A list whose
-// element was lost and a genuine `List[Int]` are the same pool entry, bit for bit, so every
-// question asked through the pool comes back "Int" and a fill-only stamp would decline forever.
-// The raw flat `inner1` field is kept alongside `tp_id` by every setter and still says -1, which
-// makes it the only place the distinction survives. Mirrors get_map_key_type_raw.
+// The sole caller (stamp_binder_elems_from_tid_if_unset) guards on `>= 0` to skip a var
+// whose flat channel is already populated. A by-value element (struct/tuple/data enum)
+// records `inner1 == CT_VOID` (5, so `>= 0`) even when no tid was stamped, so raw reports
+// "recorded" and the guard declines to re-stamp. `get_list_elem_type` now reads the tid and
+// answers -1 when the tid is absent, so it would miss that flat-only record and re-stamp over
+// it — which is why this guard must stay on the raw flat field. Mirrors get_map_key_type_raw.
 //
-// Falls back to the pool answer for a name that is not a scope var (a closure capture carries a
-// tp_id and no flat fields), because a missing answer must read as SET there: declining is a
+// Falls back to get_list_elem_type for a name that is not a scope var (a closure capture carries
+// a tid and no flat fields), because a missing answer must read as SET there: declining is a
 // no-op, while writing over a capture's real element would be a new silent-wrong.
 pub fn get_list_elem_type_raw(name: Str) -> Int {
     let mut i = scope_vars.len() - 1
@@ -3280,21 +3296,34 @@ pub fn get_list_elem_type_raw(name: Str) -> Int {
     get_list_elem_type(name)
 }
 
+// The list element flattened to a single CT, read from the authoritative tid. A
+// plain (payload-less) enum element is stored by ordinal, so it flattens to CT_INT
+// the way the push side stamps it; a data enum and a tuple are by-value, so they
+// flatten to CT_VOID (their identity comes from get_list_elem_struct). A
+// genuinely-erased element stays -1.
+fn list_elem_ct_from_tid(sv_ty: Int) -> Int {
+    if sv_ty < 0 { return -1 }
+    let bt = cg_bind_mono_tid(sv_ty)
+    let e = tc_tid_list_elem_ct_resolved(bt)
+    if e == CT_ENUM {
+        let es = tc_tid_list_elem_struct_head(bt)
+        if es != "" && is_data_enum(es) == 0 { return CT_INT }
+        return CT_VOID
+    }
+    if e >= 0 { return e }
+    // e < 0: tid_inner_ct erases Tuple/Typevar/Unknown alike; a tuple element is
+    // still by-value and names a tag here (tid_inner_struct spells it), so flatten
+    // it to CT_VOID while a nameless typevar/unknown stays erased.
+    if tc_tid_list_elem_struct(bt) != "" { return CT_VOID }
+    -1
+}
+
 pub fn get_list_elem_type(name: Str) -> Int {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_LIST {
-            if sv.ty >= 0 {
-                let e = tc_tid_list_elem_ct_resolved(cg_bind_mono_tid(sv.ty))
-                // An enum element is name-carried and stored by ordinal; the flat
-                // CT drives the plain-enum ordinal arm, so decline CT_ENUM and let
-                // the flat answer stand (identity comes from get_list_elem_struct).
-                if e >= 0 && e != CT_ENUM { return e }
-            }
-            // Container-sname invariant: no list setter bakes a struct into the
-            // element child, so the pool child1 kind equals the flat inner1.
-            return sv.inner1
+            return list_elem_ct_from_tid(sv.ty)
         }
         i = i - 1
     }
@@ -3304,11 +3333,7 @@ pub fn get_list_elem_type(name: Str) -> Int {
         while j >= 0 {
             let sv = scope_vars.get(j).unwrap()
             if sv.name == alt && sv.ctype == CT_LIST {
-                if sv.ty >= 0 {
-                    let e = tc_tid_list_elem_ct_resolved(cg_bind_mono_tid(sv.ty))
-                    if e >= 0 && e != CT_ENUM { return e }
-                }
-                return sv.inner1
+                return list_elem_ct_from_tid(sv.ty)
             }
             j = j - 1
         }
@@ -3821,6 +3846,7 @@ pub fn stamp_list_elem_from_list_tid(etid: Int, var_name: Str) -> ListElemStamp 
         }
         if tracing != 0 { dbg_trace("listelem", "stamp ect={ect} var={var_name} arm=option inner_tp={inner_tp}") }
         set_list_elem_type(var_name, ect)
+        if get_var_ty(var_name) < 0 { set_var_ty(var_name, etid) }
         set_list_elem_option_tp(var_name, inner_tp)
         return ListElemStamp { ct: ect, sname: "" }
     }
@@ -3834,6 +3860,7 @@ pub fn stamp_list_elem_from_list_tid(etid: Int, var_name: Str) -> ListElemStamp 
         }
         if tracing != 0 { dbg_trace("listelem", "stamp ect={ect} var={var_name} arm=result inner_tp={ok_tp}") }
         set_list_elem_type(var_name, ect)
+        if get_var_ty(var_name) < 0 { set_var_ty(var_name, etid) }
         set_list_elem_result_tp(var_name, ok_tp, err_tp)
         return ListElemStamp { ct: ect, sname: "" }
     }
@@ -3847,6 +3874,7 @@ pub fn stamp_list_elem_from_list_tid(etid: Int, var_name: Str) -> ListElemStamp 
         }
         if tracing != 0 { dbg_trace("listelem", "stamp ect={ect} var={var_name} arm=map inner_tp={val_tp}") }
         set_list_elem_type(var_name, ect)
+        if get_var_ty(var_name) < 0 { set_var_ty(var_name, etid) }
         set_list_elem_map_tp(var_name, key_tp, val_tp)
         return ListElemStamp { ct: ect, sname: "" }
     }
@@ -3864,6 +3892,7 @@ pub fn stamp_list_elem_from_list_tid(etid: Int, var_name: Str) -> ListElemStamp 
         }
         if tracing != 0 { dbg_trace("listelem", "stamp ect={ect} var={var_name} arm=set set_ct={set_ct} set_struct={set_struct}") }
         set_list_elem_type(var_name, ect)
+        if get_var_ty(var_name) < 0 { set_var_ty(var_name, etid) }
         if set_ct >= 0 {
             set_list_nested_elem_type(var_name, set_ct)
         }
@@ -3903,6 +3932,7 @@ pub fn stamp_list_elem_from_list_tid(etid: Int, var_name: Str) -> ListElemStamp 
     }
     if tracing != 0 { dbg_trace("listelem", "stamp ect={ect} var={var_name} arm=tail") }
     set_list_elem_type(var_name, ect)
+    if get_var_ty(var_name) < 0 { set_var_ty(var_name, etid) }
     if ect != CT_LIST { return ListElemStamp { ct: ect, sname: "" } }
     let inner_tid = tc_tid_list_elem(etid)
     let nect = tc_tid_list_elem_ct(inner_tid)
