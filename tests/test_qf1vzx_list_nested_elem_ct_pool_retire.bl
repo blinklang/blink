@@ -1,0 +1,150 @@
+// qf1vzx tp_id retirement: get_list_nested_elem_type must spell a List's doubly-nested
+// element CT for NON-scalar inners (List/Set/Struct), the shapes that reach its pool
+// branch. Scalar inners already ride the tid; these rows pin the struct/container inners
+// so the tid path (ungated) proves total before the pool child is deleted. pop(), for-in,
+// and get() each consume the nested CT to type the popped/looped inner container's own
+// elements, so an erased CT flips the deep read.
+
+@derive(Hash, Eq)
+type Pt { x: Int, y: Int }
+
+type Color {
+    Red
+    Green
+    Blue
+}
+
+type Shape {
+    Circle(Int)
+    Square
+}
+
+test "pop over List[List[List[Int]]] keeps the doubly-nested list element typed" {
+    let mut a: List[List[List[Int]]] = [[[1, 2], [3]], [[4, 5, 6]]]
+    let popped = a.pop()
+    match popped {
+        Some(inner) => {
+            assert_eq(inner.len(), 1)
+            let row = inner.get(0).unwrap()
+            assert_eq(row.len(), 3)
+            assert_eq(row.get(2).unwrap(), 6)
+        }
+        None => assert_eq(1, 0)
+    }
+}
+
+test "pop over List[List[Pt]] keeps the nested struct element typed" {
+    let mut a: List[List[Pt]] = [[Pt { x: 1, y: 2 }], [Pt { x: 3, y: 4 }, Pt { x: 5, y: 6 }]]
+    let popped = a.pop()
+    match popped {
+        Some(inner) => {
+            assert_eq(inner.len(), 2)
+            let p = inner.get(1).unwrap()
+            assert_eq(p.x, 5)
+            assert_eq(p.y, 6)
+        }
+        None => assert_eq(1, 0)
+    }
+}
+
+test "for-in over List[List[List[Int]]] sums the doubly-nested ints" {
+    let a: List[List[List[Int]]] = [[[1], [2, 3]], [[4]]]
+    let mut total = 0
+    for inner in a {
+        for row in inner {
+            for v in row {
+                total = total + v
+            }
+        }
+    }
+    assert_eq(total, 10)
+}
+
+test "for-in over List[Set[Pt]] reaches the nested-set struct element" {
+    let mut s1: Set[Pt] = Set()
+    s1.insert(Pt { x: 1, y: 1 })
+    let mut s2: Set[Pt] = Set()
+    s2.insert(Pt { x: 2, y: 2 })
+    s2.insert(Pt { x: 3, y: 3 })
+    let a: List[Set[Pt]] = [s1, s2]
+    let mut count = 0
+    for inner in a {
+        count = count + inner.len()
+    }
+    assert_eq(count, 3)
+}
+
+test "pop over List[List[Option[Int]]] keeps the doubly-nested Option element typed" {
+    let mut a: List[List[Option[Int]]] = [[Some(1), None], [Some(2)]]
+    let popped = a.pop()
+    match popped {
+        Some(inner) => {
+            assert_eq(inner.len(), 1)
+            let cell = inner.get(0).unwrap()
+            match cell {
+                Some(v) => assert_eq(v, 2)
+                None => assert_eq(1, 0)
+            }
+        }
+        None => assert_eq(1, 0)
+    }
+}
+
+test "for-in over List[Set[Int]] reaches the nested-set scalar element" {
+    let mut s1: Set[Int] = Set()
+    s1.insert(10)
+    s1.insert(20)
+    let mut s2: Set[Int] = Set()
+    s2.insert(30)
+    let a: List[Set[Int]] = [s1, s2]
+    let mut total = 0
+    for inner in a {
+        for v in inner {
+            total = total + v
+        }
+    }
+    assert_eq(total, 60)
+}
+
+// A PLAIN (payload-less) enum inner-list element rides its CT_INT ordinal, NOT a (CT_VOID, name)
+// by-value box — the pool child answered CT_INT for it, and stamp_list_elem_from_tid stamps
+// CT_INT. The reader must keep that distinction so the ordinal is not dereferenced as a pointer.
+test "for-in over List[List[Color]] reaches the plain-enum element" {
+    let outer: List[List[Color]] = [[Color.Red], [Color.Green, Color.Blue]]
+    let mut count = 0
+    for inner in outer {
+        for c in inner {
+            match c {
+                Color.Red => count = count + 1
+                Color.Green => count = count + 10
+                Color.Blue => count = count + 100
+            }
+        }
+    }
+    assert_eq(count, 111)
+}
+
+test "chained get-unwrap over List[List[Color]] keeps the plain-enum ordinal" {
+    let outer: List[List[Color]] = [[Color.Red, Color.Blue]]
+    let c = outer.get(0).unwrap().get(1).unwrap()
+    match c {
+        Color.Blue => assert_eq(1, 1)
+        _ => assert_eq(1, 0)
+    }
+}
+
+// A DATA enum inner-list element IS a (CT_VOID, name) by-value box, the other side of the
+// plain/data split the reader now makes.
+test "for-in over List[List[Shape]] reaches the data-enum element" {
+    let outer: List[List[Shape]] = [[Shape.Circle(3), Shape.Square]]
+    let mut total = 0
+    for inner in outer {
+        for s in inner {
+            match s {
+                Shape.Circle(r) => total = total + r
+                Shape.Square => total = total + 100
+            }
+        }
+    }
+    assert_eq(total, 103)
+}
