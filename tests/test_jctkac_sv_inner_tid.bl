@@ -1,24 +1,10 @@
-// jctkac: the flat sv-inner helpers get_sv_inner1/get_sv_inner2 (codegen_types.bl)
-// back four accessors — get_var_result_ok (inner1), get_var_result_err (inner2),
-// get_var_iterator_inner (inner1), get_var_channel_inner (inner1). Each formerly
-// read the element CT off the derived tp_* pool via tp_child{1,2}_kind(sv.tp_id);
-// the pool child is built straight from inner1/inner2 at every setter, so the read
-// now moves to the flat field directly.
-//
-// Attribution (mutation-tested in archive build mode): only the iterator rows
-// (4, 5) actually DISCRIMINATE get_sv_inner1's flat read — swapping the field the
-// reader returns flips their runtime answer, because get_var_iterator_inner reads
-// a pure-flat var (ty<0) and is always reached. The Result rows (1-3) are
-// tid-shielded: get_var_result_ok/err answer scalar ok/err off the authoritative
-// tid channel before the flat fallback runs, so they exercise the whole
-// union-lowering path but do not independently pin the flat read. The Channel
-// rows (6, 7) reach the flat reader but carry the element as a void*-box, so a
-// mistyped element CT does not change their answer either. get_sv_inner2 has NO
-// user-constructible discriminating shape — its only observable exerciser is the
-// stdlib's own str_char_at_opt (Char.from_code_point -> Result[Char,_]), which is
-// guarded at the regen level (a wrong inner2 breaks the stdlib build). These rows
-// stay for their broad end-to-end value; the iterator rows are the load-bearing
-// pin for the flat migration.
+// jctkac: end-to-end coverage for the element-CT readers behind Result, iterator,
+// and channel scope vars. Rows 1-3 drive get_var_result_ok/err through Result union
+// lowering; rows 4-5 drive get_var_iterator_inner, which reads the element off the
+// tid (the dedicated reader pin lives in test_jctkac_iterator_var_reader_tid.bl);
+// rows 6-7 drive get_var_channel_inner over a void*-boxed element, where the element
+// CT never changes the runtime answer. The C witness pins the Result[Str,Int] union
+// member layout. These rows guard the whole lowering path, not any single field.
 
 import compile_test_helpers
 import std.io
@@ -95,9 +81,8 @@ test "row 3: Result[Str,Int] keeps ok=Str and err=Int members distinct" {
 }
 
 // Row 4: iterator element (get_var_iterator_inner) over List[Int] via the lazy
-// crossing into_iter()...collect(). DISCRIMINATING: the iterator var is pure-flat
-// (ty<0), so the flat inner1 read is the sole element-CT source — swapping the
-// returned field flips this answer (mutation-attributed).
+// crossing into_iter()...collect(). The element CT is read off the tid; a mistyped
+// element would flip the collected Int.
 fn src_row4() -> Str {
     "fn main() ! IO \{\n"
         .concat("    let a: List[Int] = [1, 2, 3]\n")
@@ -116,8 +101,7 @@ test "row 4: List[Int] iterator element carries the Int through collect" {
 }
 
 // Row 5: iterator element over List[Str] — a distinct scalar so an Int-fabricated
-// iterator element would mistype the collected list. DISCRIMINATING, same
-// pure-flat path as row 4.
+// iterator element would mistype the collected list. Same tid-read path as row 4.
 fn src_row5() -> Str {
     "fn main() ! IO \{\n"
         .concat("    let a: List[Str] = [\"a\", \"b\", \"c\"]\n")
@@ -135,10 +119,9 @@ test "row 5: List[Str] iterator element carries the Str through collect" {
     assert(r.out.contains("out=a!b!c!"))
 }
 
-// Row 6: channel element (get_var_channel_inner) — Channel[Int] send/recv. Reaches
-// the flat reader but carries the element as a void*-box, so the element CT does
-// not change the answer; kept for end-to-end send/recv coverage, not as a flat-read
-// probe.
+// Row 6: channel element (get_var_channel_inner) — Channel[Int] send/recv. The
+// element rides a void*-box, so the element CT does not change the answer; kept for
+// end-to-end send/recv coverage.
 fn src_row6() -> Str {
     "fn main() ! IO \{\n"
         .concat("    let ch: Channel[Int] = Channel(4)\n")
