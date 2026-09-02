@@ -34,7 +34,7 @@ import codegen_types.{
     set_set_elem_type, set_set_elem_struct,
     kops_is_inline_key, kops_is_struct_key, kops_is_inline_enum_key,
     get_struct_field_closure_sig, get_struct_field_type,
-    get_var_enum, get_var_iterator_inner,
+    get_var_enum, get_var_iterator_inner, get_var_list_elem_tid, get_var_iter_elem_tid,
     get_var_option_inner, get_var_option_inner2, get_var_option_inner2_struct,
     get_var_option_inner_struct, get_var_option_inner_tag, get_var_option_inner_nominal, get_var_option_inner_tp, get_var_option_erased,
     get_var_result_err, get_var_result_err_struct,
@@ -77,7 +77,7 @@ import diagnostics.{
     ICE_SEG_ERASED_SLOT,
 }
 import ast.{NodeKind, is_block_bearing, dbg_trace, dbg_channel_on}
-import typecheck.{tc_channel_elem_ct, tc_channel_elem_struct, tc_ptr_pointee_ct, tc_ptr_pointee_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_tuple_sname, tc_tid_list_elem, tc_tid_list_elem_ct, tc_tid_list_elem_ct_resolved, tc_tid_list_elem_struct, tc_tid_seq_elem_ct_resolved, tc_tid_seq_elem_struct, tc_tid_iter_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member, tc_list_rename_help, ctype_probe_at, c_type_from_tid, tc_tid_resolved, tc_tid_subst_mono, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_err_ct, tc_tid_map_key_ct, tc_tid_map_val_ct, tc_tid_set_elem_ct, tc_variant_field_is_selfrec_tuple}
+import typecheck.{make_iterator_type, tc_channel_elem_ct, tc_channel_elem_struct, tc_ptr_pointee_ct, tc_ptr_pointee_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_tuple_sname, tc_tid_list_elem, tc_tid_list_elem_ct, tc_tid_list_elem_ct_resolved, tc_tid_list_elem_struct, tc_tid_seq_elem_ct_resolved, tc_tid_seq_elem_struct, tc_tid_iter_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member, tc_list_rename_help, ctype_probe_at, c_type_from_tid, tc_tid_resolved, tc_tid_subst_mono, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_err_ct, tc_tid_map_key_ct, tc_tid_map_val_ct, tc_tid_set_elem_ct, tc_variant_field_is_selfrec_tuple}
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
 let mut btc_arg_offset: Int = 0
@@ -2112,6 +2112,29 @@ fn stamp_container_struct_temp(res: Str, node: Int, flat: Str) {
 fn stamp_iter_adapter_tid(adapter_var: Str, node: Int) {
     let t = cm_node_mono_tid(node)
     if t >= 0 && tc_tid_ct(t) == CT_LIST { set_var_ty(adapter_var, t) }
+}
+
+// A CONTAINER element (Set/List/Map) stores as a bare pointer, so its physical CT
+// equals its logical CT — the reader can take it off the iterator tid. Stamp the
+// var's tid from the SOURCE element tid: an into_iter and an element-preserving
+// adapter (filter/take/skip/chain) both keep the source element, and the source tid
+// spans an eager List source (its node tid, or the source var's list tid) and a lazy
+// Iterator source (the source var's iterator tid) alike. A named/enum element is NOT
+// stamped here — it is storage-normalized (a plain enum value-boxes as CT_INT), a
+// fact the logical tid does not carry, so it stays on set_var_iterator's element CT.
+fn stamp_iter_container_elem(var: Str, elem_ct: Int, obj_str: Str, obj_type: Int, obj_node: Int) {
+    if elem_ct != CT_SET && elem_ct != CT_LIST && elem_ct != CT_MAP { return }
+    let mut et = -1
+    if obj_type == CT_LIST {
+        if obj_node >= 0 {
+            let lt = cm_node_mono_tid(obj_node)
+            if lt >= 0 { et = tc_tid_list_elem(lt) }
+        }
+        if et < 0 { et = get_var_list_elem_tid(obj_str) }
+    } else if obj_type == CT_ITERATOR {
+        et = get_var_iter_elem_tid(obj_str)
+    }
+    if et >= 0 { set_var_ty(var, make_iterator_type(et)) }
 }
 
 fn map_key_expr_inner(key_str: Str, key_ct: Int, key_sname: Str, for_insert: Bool) -> Str ! Codegen.Emit, Codegen.Register {
@@ -4777,6 +4800,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         iter_from_source(src_str, src_type, src_node)
         let iter_var = ifs_iter_var
         set_var_iterator(iter_var, ifs_elem_type, ifs_next_fn)
+        stamp_iter_container_elem(iter_var, ifs_elem_type, src_str, src_type, src_node)
         if ifs_carrier_tag != "" { set_var_iter_carrier(iter_var, ifs_carrier_tag) }
         expr_result_str = iter_var
         expr_result_type = CT_ITERATOR
@@ -4974,6 +4998,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let adapter_var = fresh_temp("__filter_")
             emit_line("blink_FilterIterator_{tag} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .fn = {fn_str} };")
             set_var_iterator(adapter_var, elem_type, "blink_FilterIterator_{tag}_next")
+            stamp_iter_container_elem(adapter_var, elem_type, obj_str, obj_type, obj_node)
             if obj_type == CT_LIST {
                 emit_iter_collect(adapter_var, CT_ITERATOR, node)
                 return
@@ -5018,6 +5043,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let adapter_var = fresh_temp("__take_")
             emit_line("blink_TakeIterator_{tag} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .limit = {n_str}, .count = 0 };")
             set_var_iterator(adapter_var, elem_type, "blink_TakeIterator_{tag}_next")
+            stamp_iter_container_elem(adapter_var, elem_type, obj_str, obj_type, obj_node)
             if obj_type == CT_LIST {
                 emit_iter_collect(adapter_var, CT_ITERATOR, node)
                 return
@@ -5059,6 +5085,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let adapter_var = fresh_temp("__skip_")
             emit_line("blink_SkipIterator_{tag} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .skip_n = {n_str}, .skipped = 0 };")
             set_var_iterator(adapter_var, elem_type, "blink_SkipIterator_{tag}_next")
+            stamp_iter_container_elem(adapter_var, elem_type, obj_str, obj_type, obj_node)
             if obj_type == CT_LIST {
                 emit_iter_collect(adapter_var, CT_ITERATOR, node)
                 return
@@ -5110,6 +5137,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let adapter_var = fresh_temp("__chain_")
             emit_line("blink_ChainIterator_{tag} {adapter_var} = \{ .source_a = &{src_a_var}, .next_a = ({opt_t} (*)(void*)){next_a}, .source_b = &{src_b_var}, .next_b = ({opt_t} (*)(void*)){next_b}, .phase = 0 };")
             set_var_iterator(adapter_var, elem_type, "blink_ChainIterator_{tag}_next")
+            stamp_iter_container_elem(adapter_var, elem_type, obj_str, obj_type, obj_node)
             if obj_type == CT_LIST {
                 emit_iter_collect(adapter_var, CT_ITERATOR, node)
                 return

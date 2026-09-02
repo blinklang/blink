@@ -9438,32 +9438,74 @@ pub fn get_var_result_ok_elem_struct(name: Str) -> Str {
 
 
 pub fn set_var_iterator(name: Str, inner: Int, next_fn: Str) {
+    // Stamp the var's tid from the element CT. A scalar element determines its tid
+    // exactly (tc_scalar_tid_for_ct is total on the primitives), so the iterator tid
+    // carries the element faithfully; a compound/carrier element reaches here as
+    // CT_INT (pointer-boxed, its identity on the carrier tag) and takes the same
+    // Int tid, which the reader never consults for a carrier.
+    let et = tc_scalar_tid_for_ct(inner)
+    let iter_ty = if et >= 0 { make_iterator_type(et) } else { -1 }
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_ITERATOR {
             // An iterator var is always (CT_ITERATOR, inner2=-1, sname=""); the pool key needs no
             // flat-field read here, so the fresh element alone reconstructs the same entry.
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, ty: sv.ty, tp_id: sv_tp(CT_ITERATOR, inner, -1, "") })
+            let keep_ty = if iter_ty >= 0 { iter_ty } else { sv.ty }
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, ty: keep_ty, tp_id: sv_tp(CT_ITERATOR, inner, -1, "") })
             let s = scope_var_scratch.get(i).unwrap()
             scope_var_scratch.set(i, ScopeVarScratch { opt_erased: s.opt_erased, ptr_struct: s.ptr_struct, ptr_is_array: s.ptr_is_array, iter_next_fn: next_fn, iter_carrier: s.iter_carrier, iter_alias: s.iter_alias, handler_vtable_type: s.handler_vtable_type, handler_vtable_field: s.handler_vtable_field, handler_is_ue: s.handler_is_ue })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_ITERATOR, is_mut: 0, inner1: inner, inner2: -1, sname: "", ty: -1, tp_id: sv_tp(CT_ITERATOR, inner, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_ITERATOR, is_mut: 0, inner1: inner, inner2: -1, sname: "", ty: iter_ty, tp_id: sv_tp(CT_ITERATOR, inner, -1, "") })
     let ni = scope_vars.len() - 1
     let ns = scope_var_scratch.get(ni).unwrap()
     scope_var_scratch.set(ni, ScopeVarScratch { opt_erased: ns.opt_erased, ptr_struct: ns.ptr_struct, ptr_is_array: ns.ptr_is_array, iter_next_fn: next_fn, iter_carrier: ns.iter_carrier, iter_alias: ns.iter_alias, handler_vtable_type: ns.handler_vtable_type, handler_vtable_field: ns.handler_vtable_field, handler_is_ue: ns.handler_is_ue })
 }
 
-// The iterator var's element CT, read from the flat inner1 field. The iterator tid
-// cannot yet spell a non-scalar element (the producer, set_var_iterator, holds only
-// the element CT — not a full element tid), so a tid-led read erases a compound
-// container / carrier element to a bare default; the flat field carries every kind
-// faithfully until that element tid is threaded through the iterator source.
+// The iterator var's physical element CT. A boxed carrier element is pointer-boxed
+// as CT_INT, its true identity on the carrier tag, so a carrier var answers CT_INT
+// directly. Otherwise read the element off the iterator tid (tc_tid_iter_elem spans
+// the List tid an adapter stamps and the Iterator tid into_iter stamps alike). Every
+// set_var_iterator stamps the tid from the element CT, so the tid is the sole channel.
 pub fn get_var_iterator_inner(name: Str) -> Int {
-    get_sv_inner1(name, CT_ITERATOR)
+    if get_var_iter_carrier(name) != "" { return CT_INT }
+    let t = get_sv_ty(name, CT_ITERATOR)
+    if t >= 0 {
+        let et = tc_tid_iter_elem(t)
+        if et >= 0 {
+            let c = tc_tid_ct(et)
+            if c >= 0 { return c }
+        }
+    }
+    -1
+}
+
+// A list var's element tid off its own tid, or -1 when the var carries no list tid
+// (a call source has no ScopeVar; its element tid comes from the node instead).
+pub fn get_var_list_elem_tid(name: Str) -> Int {
+    let t = get_sv_ty(name, CT_LIST)
+    if t >= 0 { return tc_tid_list_elem(t) }
+    -1
+}
+
+// An iterator var's element tid off its own tid — the alias site copies it so a
+// container-element iterator's tid survives the rebind.
+pub fn get_var_iter_elem_tid(name: Str) -> Int {
+    let t = get_sv_ty(name, CT_ITERATOR)
+    if t >= 0 { return tc_tid_iter_elem(t) }
+    -1
+}
+
+// Copy a container-element iterator's tid across an alias rebind. set_var_iterator
+// self-stamps the tid only from a scalar element CT; a container element (CT_SET/
+// CT_LIST/CT_MAP) leaves it unstamped, so carry the source iterator's tid verbatim.
+pub fn copy_var_iter_container_tid(dst: Str, src: Str, elem_ct: Int) {
+    if elem_ct != CT_SET && elem_ct != CT_LIST && elem_ct != CT_MAP { return }
+    let t = get_sv_ty(src, CT_ITERATOR)
+    if t >= 0 { set_var_ty(dst, t) }
 }
 
 pub fn get_var_iter_next_fn(name: Str) -> Str {
