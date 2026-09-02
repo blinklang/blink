@@ -69,7 +69,7 @@ import codegen_types.{
     resolve_tparam_seg,
     nth_type_arg, resolve_variant, struct_concrete_args_from_target,
     result_c_type, result_c_type_mixed,
-    scope_vars, set_list_elem_struct, set_list_elem_type, set_list_nested_elem_type,
+    scope_vars, set_list_elem_struct, set_list_elem_type,
     set_list_elem_option_tp, set_list_elem_result_tp, set_list_elem_map_tp,
     stamp_list_elem_from_tid, list_elem_option_carrier_tag_from_tid, list_elem_result_carrier_tag_from_tid,
     type_option, type_result, type_map, type_list, type_struct, sv_tp,
@@ -623,22 +623,11 @@ fn recover_map_kv_from_tid(node: Int, var_name: Str) ! Codegen.Register, Codegen
 //     tail; the declared-List[T] LetBinding path in codegen_stmt.bl
 //     uses the identical (CT_VOID, sname) shape for a struct elem, and for
 //     a nested one).
-//   - CT_OPTION/CT_RESULT/CT_MAP elements recover their own inner
-//     via deep_tp_from_tid instead of re-erasing to Int — a flat
-//     set_list_elem_type(CT_OPTION) would lose that inner, which is exactly
-//     what deep_tp_from_tid's tp_id tree exists to preserve. CT_SET has a
-//     parity target too (emit_list_method's `get`/`pop` CT_SET arms) — its
-//     element is flat (E1400 forbids a container Set element), so it
-//     recovers via tc_tid_set_elem_ct/_struct straight onto
-//     set_list_nested_elem_type/_struct, no deep_tp_from_tid needed.
-//     CT_ITERATOR/CT_HANDLE/CT_CHANNEL/CT_BYTES still have no parity target
-//     and stay erased on purpose; a flat write there would trade a loud
-//     `.get()` error for a link error in for-in instead. Staying erased is
-//     the honest answer, not a wrong-but-quiet one.
-// A nested List[List[T]] recurses exactly one level into
-// set_list_nested_elem_type/_struct, mirroring the declared-path shape in
-// codegen_stmt.bl; a second nested List level, or a typevar or fn
-// element, is a safe no-op (the -1/"" sentinel already stands).
+//   - CT_OPTION/CT_RESULT/CT_MAP/CT_SET and a nested List element carry
+//     their own inner through the full list tid stamped at set_var_ty, not
+//     through a flat nested channel. The bare set_list_elem_type write only
+//     records the OUTER kind; the inner tree lives in the tid, so no
+//     re-erasure to Int and no separate nested write are needed.
 //
 // A DECLINED stamp (ct == -1) must leave the globals alone rather than clear
 // them: the caller's existing channel may hold a correct answer from another
@@ -1352,11 +1341,11 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 // A List[Set[T]] field's own element (Set) is knowable straight off
                 // reg_sf_entry's shallow one-level tp (sv_tp has no slot for a 2nd
                 // level), but the Set's OWN nested element never is -- recover_list_
-                // elem_from_tid's CT_SET arm is the only path that stamps
-                // set_list_nested_elem_type/_struct, so it must still run even when
-                // the outer "List's element is a Set" fact is already correctly
-                // known, or a generic fn body's `for s in b.xs { for x in s {...} }`
-                // hits the SetElementTypeUnknownAtCodegen ICE on `s`.
+                // elem_from_tid's CT_SET arm is the only path that stamps the full
+                // list tid, so it must still run even when the outer "List's element
+                // is a Set" fact is already correctly known, or a generic fn body's
+                // `for s in b.xs { for x in s {...} }` hits the
+                // SetElementTypeUnknownAtCodegen ICE on `s`.
                 if le_tp < 0 || (tp_child1_sname(le_tp) == "" && tp_child1_kind(le_tp) == CT_INT) || tp_child1_kind(le_tp) == CT_SET {
                     recover_list_elem_from_tid(node, expr_result_str)
                 }
@@ -6851,20 +6840,12 @@ fn emit_list_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
     } else {
         expr_list_elem_struct = ""
     }
-    // A Set first element carries only its own kind (CT_SET) via the
-    // expr_list_elem_type global above — the LET-BINDING consumer
-    // (codegen_stmt.bl) recovers the Set's OWN element by reading
-    // get_list_nested_elem_type(tmp), which requires tmp to already be a
-    // registered CT_LIST scope var (set_list_nested_elem_type has no push
-    // fallback, unlike set_list_elem_type). Register tmp and carry the
-    // element off the first element's own var, mirroring the push() fix in
-    // emit_list_method.
+    // Register tmp as a CT_LIST scope var so the full List[Set[T]] tid stamp
+    // below has a var to land on; the LET-BINDING consumer (codegen_stmt.bl)
+    // then recovers the Set's OWN element by reading get_list_nested_elem_type(tmp)
+    // off that tid.
     if first_elem_type == CT_SET {
         set_list_elem_type(tmp, CT_SET)
-        let nested = get_set_elem_type(first_elem_str)
-        if nested >= 0 {
-            set_list_nested_elem_type(tmp, nested)
-        }
     }
     // A list-of-sets literal ([s1, s2, ..]) is registered by the CT_SET branch above but left
     // tid-less (a Set element has no scalar tid to seed set_var_ty), so its nested set element
