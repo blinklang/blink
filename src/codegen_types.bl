@@ -1687,15 +1687,10 @@ type ScopeVar {
     inner1: Int
     inner2: Int
     sname: Str
-    tp_id: Int
-    // typecheck's tid for this binding, or -1 if nothing stamped one. NOT a tp_id: this
-    // is an index into typecheck's ty_pool, the authoritative recursive tree, whereas
-    // tp_id indexes codegen's second pool which sv_tp derives FROM the lossy flat fields
-    // above; where the two disagree is what the divergence counter measures.
-    //
-    // Preserved (never invalidated) across the 34 mutation sites on purpose: a codegen
-    // "refinement" of the flat fields that contradicts the stamped tid is exactly the divergence
-    // the counter must report, so resetting to -1 there would blind the instrument.
+    // typecheck's tid for this binding, or -1 if nothing stamped one. An index into
+    // typecheck's ty_pool, the authoritative recursive tree the tid-based element
+    // readers (get_list_elem_*, get_map_*, get_var_option_*) consult. The flat fields
+    // above are the legacy channel, still read where the tid can't yet spell a shape.
     ty: Int
 }
 
@@ -2089,7 +2084,7 @@ pub fn pop_scope() ! Codegen.Scope {
 }
 
 pub fn set_var(name: Str, ctype: Int, is_mut: Int) ! Codegen.Scope {
-    push_scope_var(ScopeVar { name: name, ctype: ctype, is_mut: is_mut, inner1: -1, inner2: -1, sname: "", ty: -1, tp_id: sv_tp(ctype, -1, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: ctype, is_mut: is_mut, inner1: -1, inner2: -1, sname: "", ty: -1 })
 }
 
 // ── The tid stamping seam ───────────────────────────────────────────────────
@@ -2102,7 +2097,7 @@ pub fn set_var_ty(name: Str, tid: Int) {
     let idx = find_scope_var(name)
     if idx < 0 { return }
     let sv = scope_vars.get(idx).unwrap()
-    scope_vars.set(idx, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, ty: tid, tp_id: sv.tp_id })
+    scope_vars.set(idx, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, ty: tid })
 }
 
 // -1 when unstamped or unknown. Callers must treat -1 as "ask the flat fields", NOT as a
@@ -2113,10 +2108,14 @@ pub fn get_var_ty(name: Str) -> Int {
     scope_vars.get(idx).unwrap().ty
 }
 
+// The flat-fields view of a var, rebuilt on demand now that the tp_id cache is gone.
+// A pure sv_tp read: this is the flat channel, kept so the divergence tap can compare
+// it against the authoritative tid until the flat channels themselves are retired.
 pub fn get_var_tp(name: Str) -> Int {
     let idx = find_scope_var(name)
     if idx >= 0 {
-        return scope_vars.get(idx).unwrap().tp_id
+        let sv = scope_vars.get(idx).unwrap()
+        return sv_tp(sv.ctype, sv.inner1, sv.inner2, sv.sname)
     }
     type_int()
 }
@@ -3200,12 +3199,12 @@ pub fn set_list_elem_type(name: Str, elem_type: Int) {
             // reads a scalar element off the tid rather than the retired flat field; a
             // richer existing tid (an annotated or compound-stamped list) stands.
             let new_ty = if sv.ty >= 0 { sv.ty } else { list_scalar_ty(elem_type) }
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: elem_type, inner2: sv.inner2, sname: sv.sname, ty: new_ty, tp_id: sv_tp(sv.ctype, elem_type, sv.inner2, sv.sname) })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: elem_type, inner2: sv.inner2, sname: sv.sname, ty: new_ty })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", ty: list_scalar_ty(elem_type), tp_id: sv_tp(CT_LIST, elem_type, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", ty: list_scalar_ty(elem_type) })
 }
 
 // the raw flat `inner1` element — a "was an element ever recorded?" signal, distinct
@@ -3307,7 +3306,7 @@ pub fn set_list_nested_elem_type(name: Str, nested_type: Int) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_LIST {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: nested_type, sname: sv.sname, ty: sv.ty, tp_id: sv_tp(sv.ctype, sv.inner1, nested_type, sv.sname) })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: nested_type, sname: sv.sname, ty: sv.ty })
             return
         }
         i = i - 1
@@ -3408,29 +3407,20 @@ pub fn get_list_elem_map_val_struct(name: Str) -> Str {
     ""
 }
 
-// Record a List's element-map key+value types as a full nested type
-// (`type_list(type_map(k, v))`). The flat inner1/inner2 ScopeVar slots can't
-// hold three type params (list→map→{k,v}); set_list_elem_type(CT_MAP) lowers
-// the map value to the default Int. Building the tp_id directly preserves V so
-// List[Map[K,V]].get()/pop() carry the right value type.
-//
-// A struct map value (val_ct == CT_STRUCT, val_name non-empty) flows
-// through sv_tp's CT_STRUCT case as type_struct(val_name), so the struct name
-// survives on the map node's child2 sname — recovered by
-// get_list_elem_map_val_struct. Scalar values (val_name == "") are unchanged.
+// Flag a List's element as a Map by parking CT_MAP in the flat inner1 slot for the
+// legacy flat readers. The deep list→map→{k,v} shape (which inner1/inner2 can't hold)
+// rides the stamped tid on sv.ty and is rebuilt on demand by deep_tp_from_tid.
 pub fn set_list_elem_map_types(name: Str, key_ct: Int, val_ct: Int, val_name: Str) {
-    let map_tp = sv_tp(CT_MAP, key_ct, val_ct, val_name)
-    let list_tp = type_list(map_tp)
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_LIST {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: CT_MAP, inner2: sv.inner2, sname: sv.sname, ty: sv.ty, tp_id: list_tp })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: CT_MAP, inner2: sv.inner2, sname: sv.sname, ty: sv.ty })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: CT_MAP, inner2: -1, sname: "", ty: -1, tp_id: list_tp })
+    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: CT_MAP, inner2: -1, sname: "", ty: -1 })
 }
 
 // Record a List's element-OPTION inner as a full nested type
@@ -3450,12 +3440,12 @@ fn set_list_elem_compound_tp(name: Str, list_tp: Int, inner_marker: Int) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_LIST {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner_marker, inner2: sv.inner2, sname: sv.sname, ty: sv.ty, tp_id: list_tp })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner_marker, inner2: sv.inner2, sname: sv.sname, ty: sv.ty })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: inner_marker, inner2: -1, sname: "", ty: -1, tp_id: list_tp })
+    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: inner_marker, inner2: -1, sname: "", ty: -1 })
 }
 
 // Record a List's element-OPTION from a pre-built inner tp
@@ -4712,12 +4702,12 @@ fn set_list_elem_struct_raw(name: Str, struct_name: Str) {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_LIST {
             let newty = if sv.ty >= 0 { sv.ty } else { list_tid }
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, ty: newty, tp_id: sv.tp_id })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, ty: newty })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: -1, inner2: -1, sname: "", ty: list_tid, tp_id: sv_tp(CT_LIST, -1, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: -1, inner2: -1, sname: "", ty: list_tid })
 }
 
 pub fn get_list_elem_struct(name: Str) -> Str {
@@ -4839,12 +4829,12 @@ pub fn set_set_elem_type(name: Str, elem_type: Int) {
             // the var carries none, so get_set_elem_type reads the element off the tid, not the flat
             // field; a richer existing tid stands.
             let new_ty = if sv.ty >= 0 { sv.ty } else { set_scalar_ty(elem_type) }
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: elem_type, inner2: -1, sname: sv.sname, ty: new_ty, tp_id: sv_tp(CT_SET, elem_type, -1, "") })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: elem_type, inner2: -1, sname: sv.sname, ty: new_ty })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_SET, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", ty: set_scalar_ty(elem_type), tp_id: sv_tp(CT_SET, elem_type, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_SET, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", ty: set_scalar_ty(elem_type) })
 }
 
 // A binding-site tid (ScopeVar.ty / CaptureEntry.tid) is the RAW declared tid: inside a
@@ -4952,14 +4942,13 @@ pub fn set_set_elem_struct(name: Str, struct_name: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_SET {
-            let new_tp = type_set(type_struct(struct_name))
             // A synthesized receiver (a union temp, a generic-struct field, a
             // tuple element) reaches here on ty<0, its concrete element known
             // only now as `struct_name`. Intern it as a real Set tid so the
             // element reads back off the authoritative tid channel, not the flat
             // pool. A var that already carries a tid keeps it — the tid is richer.
             let new_ty = if sv.ty < 0 { make_set_type(make_struct_instance_type(struct_name, [])) } else { sv.ty }
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, ty: new_ty, tp_id: new_tp })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, ty: new_ty })
             return
         }
         i = i - 1
@@ -4999,15 +4988,6 @@ pub fn set_map_types(name: Str, key_type: Int, value_type: Int, value_name: Str)
             let prior_v = sv.inner2
             let val_erased = value_type == CT_VOID && value_name == ""
             let eff_value_type = if val_erased && prior_v >= 0 && prior_v != CT_VOID { prior_v } else { value_type }
-            let new_tp = if prior_k_sname != "" {
-                // The pool value-child struct name is never read: the map value
-                // struct rides the authoritative tid, and get_map_value_struct is
-                // tid-first, so leave the pool child nameless.
-                let new_v = if eff_value_type >= 0 { sv_tp(eff_value_type, -1, -1, "") } else { type_int() }
-                type_map(type_struct(prior_k_sname), new_v)
-            } else {
-                sv_tp(sv.ctype, key_type, eff_value_type, sv.sname)
-            }
             // Keep the flat key kind in step with the pool key child so the two
             // channels agree for a struct key: the prior_k_sname branch forces the
             // pool child to CT_STRUCT (type_struct), so the flat field must read
@@ -5018,12 +4998,12 @@ pub fn set_map_types(name: Str, key_type: Int, value_type: Int, value_name: Str)
             // pool; a richer existing tid (an annotated or struct-keyed map) stands.
             // Mirrors set_set_elem_type.
             let new_ty = if sv.ty < 0 { map_scalar_ty(eff_key_type, eff_value_type) } else { sv.ty }
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: eff_key_type, inner2: eff_value_type, sname: sv.sname, ty: new_ty, tp_id: new_tp })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: eff_key_type, inner2: eff_value_type, sname: sv.sname, ty: new_ty })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_MAP, is_mut: 0, inner1: key_type, inner2: value_type, sname: "", ty: map_scalar_ty(key_type, value_type), tp_id: sv_tp(CT_MAP, key_type, value_type, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_MAP, is_mut: 0, inner1: key_type, inner2: value_type, sname: "", ty: map_scalar_ty(key_type, value_type) })
 }
 
 // Raw map key kind, or -1 when the key type was never set. Unlike get_map_key_type
@@ -5195,15 +5175,9 @@ pub fn set_map_key_struct(name: Str, struct_name: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_MAP {
-            let v = if sv.inner2 >= 0 { sv.inner2 } else { CT_INT }
-            let new_k = type_struct(struct_name)
-            // The pool value-child struct name is never read (get_map_value_struct
-            // is tid-first); leave it nameless.
-            let new_v = if v >= 0 { sv_tp(v, -1, -1, "") } else { type_int() }
-            let new_tp = type_map(new_k, new_v)
-            // The pool key child becomes CT_STRUCT (type_struct); sync the flat key
-            // kind to match so get_map_key_type can read inner1 in place of the pool.
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: CT_STRUCT, inner2: sv.inner2, sname: sv.sname, ty: sv.ty, tp_id: new_tp })
+            // Sync the flat key kind to CT_STRUCT so get_map_key_type can read inner1
+            // in place of the pool; the struct key rides the authoritative tid on sv.ty.
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: CT_STRUCT, inner2: sv.inner2, sname: sv.sname, ty: sv.ty })
             return
         }
         i = i - 1
@@ -5309,7 +5283,7 @@ pub fn set_map_value_list_elem(name: Str, _elem_type: Int) {
             // reads. Recovery paths (copy_map_value_meta, Option/Result unwrap) reach here
             // without a prior set_map_types. The element kind itself now rides the map tid,
             // recovered by get_map_value_list_elem, so it no longer writes the `extra` channel.
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: CT_LIST, sname: sv.sname, ty: sv.ty, tp_id: sv.tp_id })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: CT_LIST, sname: sv.sname, ty: sv.ty })
             return
         }
         i = i - 1
@@ -5839,12 +5813,12 @@ pub fn set_var_struct(name: Str, type_name: Str) {
             }
             let is_plain_value = sv.ctype == CT_STRUCT || sv.ctype == CT_ENUM || sv.ctype == CT_VOID
             let newty = if sv.ty >= 0 { sv.ty } else { if is_plain_value { stamp } else { -1 } }
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: type_name, ty: newty, tp_id: sv_tp(sv.ctype, sv.inner1, sv.inner2, type_name) })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: type_name, ty: newty })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_VOID, is_mut: 0, inner1: -1, inner2: -1, sname: type_name, ty: stamp, tp_id: sv_tp(CT_VOID, -1, -1, type_name) })
+    push_scope_var(ScopeVar { name: name, ctype: CT_VOID, is_mut: 0, inner1: -1, inner2: -1, sname: type_name, ty: stamp })
 }
 
 // A tid's struct name — the authoritative channel — or "" when the tid names no
@@ -6044,12 +6018,12 @@ pub fn set_var_closure(name: Str, sig: Str, tid: Int) {
             let keep_ty = if tid >= 0 { tid } else { sv.ty }
             // A closure var is always (CT_CLOSURE, inner1=-1, inner2=-1); the pool key needs no
             // flat-field read here, so the sig alone reconstructs the same entry.
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sig, ty: keep_ty, tp_id: sv_tp(CT_CLOSURE, -1, -1, sig) })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sig, ty: keep_ty })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_CLOSURE, is_mut: 0, inner1: -1, inner2: -1, sname: sig, ty: tid, tp_id: sv_tp(CT_CLOSURE, -1, -1, sig) })
+    push_scope_var(ScopeVar { name: name, ctype: CT_CLOSURE, is_mut: 0, inner1: -1, inner2: -1, sname: sig, ty: tid })
 }
 
 pub fn get_var_closure_sig(name: Str) -> Str {
@@ -8699,12 +8673,12 @@ pub fn set_var_option(name: Str, inner: Int) {
             // the exact scalar carrier now that its inner CT is known, mirroring the
             // struct-inner reconstruct on set_var_option_struct.
             let recovered = if sv.ty >= 0 { sv.ty } else { option_scalar_carrier_tid(inner) }
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, ty: recovered, tp_id: sv_tp(sv.ctype, inner, sv.inner2, sv.sname) })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, ty: recovered })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_OPTION, is_mut: 0, inner1: inner, inner2: -1, sname: "", ty: option_scalar_carrier_tid(inner), tp_id: sv_tp(CT_OPTION, inner, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_OPTION, is_mut: 0, inner1: inner, inner2: -1, sname: "", ty: option_scalar_carrier_tid(inner) })
 }
 
 pub fn set_var_option_inner2(name: Str, val: Int) {
@@ -8712,7 +8686,7 @@ pub fn set_var_option_inner2(name: Str, val: Int) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_OPTION {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: val, sname: sv.sname, ty: sv.ty, tp_id: sv_tp(sv.ctype, sv.inner1, val, sv.sname) })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: val, sname: sv.sname, ty: sv.ty })
             return
         }
         i = i - 1
@@ -8753,7 +8727,7 @@ pub fn set_var_option_inner_tp(name: Str, inner_tp: Int) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_OPTION {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, ty: sv.ty, tp_id: type_option(inner_tp) })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, ty: sv.ty })
             return
         }
         i = i - 1
@@ -8870,12 +8844,12 @@ pub fn set_var_option_struct(name: Str, inner: Int, struct_name: Str) {
             // the same way the fresh push does, guarded by the round-trip so flat
             // stays authoritative when the name cannot be spelled exactly.
             let recovered = if sv.ty >= 0 { sv.ty } else { option_carrier_tid_from_flat(struct_name) }
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: struct_name, ty: recovered, tp_id: sv_tp(sv.ctype, inner, sv.inner2, struct_name) })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: struct_name, ty: recovered })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_OPTION, is_mut: 0, inner1: inner, inner2: -1, sname: struct_name, ty: option_carrier_tid_from_flat(struct_name), tp_id: sv_tp(CT_OPTION, inner, -1, struct_name) })
+    push_scope_var(ScopeVar { name: name, ctype: CT_OPTION, is_mut: 0, inner1: inner, inner2: -1, sname: struct_name, ty: option_carrier_tid_from_flat(struct_name) })
 }
 
 // The tid is the sole authority for the Option value CT, struct/enum included: a
@@ -9036,7 +9010,7 @@ pub fn set_var_result(name: Str, ok_t: Int, err_t: Int) {
             // tid), so the err slot reconstructs as a scalar; a carrier that cannot
             // reconstruct declines to ty=-1, where the ok/err readers answer -1.
             let recovered = if sv.ty >= 0 { sv.ty } else { result_carrier_tid_from_flat(ok_t, err_t, sv.sname, "") }
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: ok_t, inner2: err_t, sname: sv.sname, ty: recovered, tp_id: sv_tp(sv.ctype, ok_t, err_t, sv.sname) })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: ok_t, inner2: err_t, sname: sv.sname, ty: recovered })
             return
         }
         i = i - 1
@@ -9045,7 +9019,7 @@ pub fn set_var_result(name: Str, ok_t: Int, err_t: Int) {
     // its exact carrier tid now, the fresh-push twin of the update path above and of the
     // scalar-Option carrier reconstruct; a Void or struct slot declines to -1 inside the
     // helper and the binder stays on ty=-1, where the ok/err readers answer -1.
-    push_scope_var(ScopeVar { name: name, ctype: CT_RESULT, is_mut: 0, inner1: ok_t, inner2: err_t, sname: "", ty: result_carrier_tid_from_flat(ok_t, err_t, "", ""), tp_id: sv_tp(CT_RESULT, ok_t, err_t, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_RESULT, is_mut: 0, inner1: ok_t, inner2: err_t, sname: "", ty: result_carrier_tid_from_flat(ok_t, err_t, "", "") })
 }
 
 // One slot of a Result carrier, reverse-resolved from its flat CT + struct name to a tid.
@@ -9109,12 +9083,12 @@ pub fn set_var_result_struct(name: Str, ok_t: Int, err_t: Int, ok_s: Str, err_s:
             // (get_var_result_err_struct reads it there); sname keeps ok_s only because it
             // feeds the pool key below.
             let recovered = if sv.ty >= 0 { sv.ty } else { result_carrier_tid_from_flat(ok_t, err_t, ok_s, err_s) }
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: ok_t, inner2: err_t, sname: ok_s, ty: recovered, tp_id: sv_tp(CT_RESULT, ok_t, err_t, ok_s) })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: ok_t, inner2: err_t, sname: ok_s, ty: recovered })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_RESULT, is_mut: 0, inner1: ok_t, inner2: err_t, sname: ok_s, ty: result_carrier_tid_from_flat(ok_t, err_t, ok_s, err_s), tp_id: sv_tp(CT_RESULT, ok_t, err_t, ok_s) })
+    push_scope_var(ScopeVar { name: name, ctype: CT_RESULT, is_mut: 0, inner1: ok_t, inner2: err_t, sname: ok_s, ty: result_carrier_tid_from_flat(ok_t, err_t, ok_s, err_s) })
 }
 
 // Precondition: fs.starts_with("Option_")
@@ -9385,14 +9359,14 @@ pub fn set_var_iterator(name: Str, inner: Int, next_fn: Str) {
             // An iterator var is always (CT_ITERATOR, inner2=-1, sname=""); the pool key needs no
             // flat-field read here, so the fresh element alone reconstructs the same entry.
             let keep_ty = if iter_ty >= 0 { iter_ty } else { sv.ty }
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, ty: keep_ty, tp_id: sv_tp(CT_ITERATOR, inner, -1, "") })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, ty: keep_ty })
             let s = scope_var_scratch.get(i).unwrap()
             scope_var_scratch.set(i, ScopeVarScratch { opt_erased: s.opt_erased, ptr_struct: s.ptr_struct, ptr_is_array: s.ptr_is_array, iter_next_fn: next_fn, iter_carrier: s.iter_carrier, iter_alias: s.iter_alias, handler_vtable_type: s.handler_vtable_type, handler_vtable_field: s.handler_vtable_field, handler_is_ue: s.handler_is_ue })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_ITERATOR, is_mut: 0, inner1: inner, inner2: -1, sname: "", ty: iter_ty, tp_id: sv_tp(CT_ITERATOR, inner, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_ITERATOR, is_mut: 0, inner1: inner, inner2: -1, sname: "", ty: iter_ty })
     let ni = scope_vars.len() - 1
     let ns = scope_var_scratch.get(ni).unwrap()
     scope_var_scratch.set(ni, ScopeVarScratch { opt_erased: ns.opt_erased, ptr_struct: ns.ptr_struct, ptr_is_array: ns.ptr_is_array, iter_next_fn: next_fn, iter_carrier: ns.iter_carrier, iter_alias: ns.iter_alias, handler_vtable_type: ns.handler_vtable_type, handler_vtable_field: ns.handler_vtable_field, handler_is_ue: ns.handler_is_ue })
@@ -9539,12 +9513,12 @@ pub fn set_var_handle(name: Str, inner: Int) {
         if sv.name == name && sv.ctype == CT_HANDLE {
             // A handle var always has sname=""; inner2 stays a field read because set_var_handle_full
             // carries the async ok/err refinement there.
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, ty: sv.ty, tp_id: sv_tp(CT_HANDLE, inner, sv.inner2, "") })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, ty: sv.ty })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_HANDLE, is_mut: 0, inner1: inner, inner2: -1, sname: "", ty: -1, tp_id: sv_tp(CT_HANDLE, inner, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_HANDLE, is_mut: 0, inner1: inner, inner2: -1, sname: "", ty: -1 })
 }
 
 // The outer kind a Handle var carries, read off the authoritative Handle tid: a Result/Option
@@ -9601,12 +9575,12 @@ pub fn set_var_handle_full(name: Str, inner: Int, inner2: Int) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_HANDLE {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: inner2, sname: "", ty: sv.ty, tp_id: sv_tp(CT_HANDLE, inner, -1, "") })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: inner2, sname: "", ty: sv.ty })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_HANDLE, is_mut: 0, inner1: inner, inner2: inner2, sname: "", ty: -1, tp_id: sv_tp(CT_HANDLE, inner, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_HANDLE, is_mut: 0, inner1: inner, inner2: inner2, sname: "", ty: -1 })
 }
 
 // The Option-elem / Result-err kind a Handle var carries, read off the tid's elem/err child: a
