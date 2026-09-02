@@ -97,4 +97,13 @@ For blocking issues, use `type:bug` or `type:spec` directly instead of friction.
 You can log bugs you find using `br add "<description>" -t repo:blink -t type:bug`.
 Make sure you always provide a MVCE in the description for reproduction steps.
 If you "work-around" the bug, you also need to add a task to `br` for cleaning up the workaround
-once the bug is fixed, by making it depending on the bug ticket. 
+once the bug is fixed, by making it depending on the bug ticket.
+
+## Tests
+Name a test for what it proves, not for a `br` ticket ID. `br` is local-only, so a ticket ID
+(e.g. `7xgbh6`) means nothing to another reader or to this repo as training data — the same
+reason `br` IDs stay out of commit messages and source comments. Use `test_<what_it_proves>.bl`
+(e.g. `test_closure_capture_struct_cell.bl`). Keep the test-to-ticket link in a `br note`, not in
+the file name or the test body.
+Keep every test file name unique. `blink test` writes a fixture to `build/<basename>`, so two
+files with the same base name collide. 
