@@ -73,7 +73,7 @@ import codegen_types.{
     set_var, set_var_ty, set_var_alias, set_var_closure, set_var_handle,
     set_var_handler, tid_spells_struct,
     set_var_handle_full, set_var_iterator, set_var_option,
-    set_var_option_inner2, get_var_option_inner_tp,
+    get_var_option_inner_tp,
     get_var_option_inner2, get_var_option_inner2_struct,
     set_var_option_struct, set_var_option_from_struct_tag,
     set_var_result,
@@ -105,7 +105,7 @@ import codegen_expr.{
     expr_result_ok_struct, expr_result_ok_type, expr_result_str,
     expr_result_type, mono_instance_arg_tids_from_tid, panic_file_for, panic_file_for_fmt,
     panic_line_str, emit_panic_site, segs_from_arg_tids,
-    tparams_sl_contains, recover_set_elem_from_tid, recover_option_set_elem_from_tid,
+    tparams_sl_contains, recover_set_elem_from_tid,
     recover_list_elem_from_tid,
     register_map_elem_struct_mono_from_tid
 }
@@ -1172,22 +1172,10 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                     emit_line("{opt_c} {scrut_tmp} = {expr_result_str};")
                 }
                 // The materialized scrut_tmp is a bare C copy with no scope-var
-                // metadata of its own — unwrap_carrier reads the still-live transient
-                // globals for inner_ct/inner_struct, but a CT_SET inner's OWN element
-                // rides the source var's flat inner2 channel, which the copy above
-                // does not carry. Copy it explicitly (mirrors the CT_LIST branch's
-                // get_list_elem_type(src_name) carry) before expr_result_str moves on,
-                // so bind_pattern_vars's Some(x) arm can read it off scrut_tmp.
+                // metadata of its own. Register it as a CT_OPTION var so
+                // bind_pattern_vars's Some(x) arm reads a CT_SET inner off it.
                 if oi == CT_SET {
-                    // set_var_option_inner2 only mutates an EXISTING CT_OPTION
-                    // scope_vars entry (no push fallback, unlike set_var_option) —
-                    // scrut_tmp has no entry at all on this branch, so register it
-                    // first or the inner2 write below is a silent no-op.
                     set_var_option(scrut_tmp, oi)
-                    let set_nested = get_var_option_inner2(expr_result_str)
-                    if set_nested != -1 {
-                        set_var_option_inner2(scrut_tmp, set_nested)
-                    }
                 }
             }
             match_scruts.push(MatchScrutEntry { str_val: scrut_tmp, scrut_type: expr_result_type })
@@ -4668,27 +4656,14 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         }
         set_var_option_erased(name, expr_option_erased)
         if expr_option_inner == CT_LIST && expr_option_inner_list_elem != -1 {
-            set_var_option_inner2(name, expr_option_inner_list_elem)
             expr_option_inner_list_elem = -1
             expr_option_inner_list_struct = ""
         }
         if expr_option_inner == CT_MAP {
             if expr_option_inner_map_val_list_elem >= 0 {
-                set_var_option_inner2(name, expr_option_inner_map_val_list_elem)
                 expr_option_inner_map_val_list_elem = -1
             }
             expr_option_inner_map_val_struct = ""
-        }
-        // A CT_SET inner carries its own element on the RHS temp's flat
-        // inner2 channel (stamped directly by the .get()/.pop() CT_SET arms, never
-        // through the CT_LIST-only expr_option_inner_list_elem global). Copy it
-        // straight off val_str rather than adding a parallel global, so
-        // `let o = d.get(0)` doesn't lose the element.
-        if expr_option_inner == CT_SET {
-            let set_nested = get_var_option_inner2(val_str)
-            if set_nested != -1 {
-                set_var_option_inner2(name, set_nested)
-            }
         }
     }
     if val_type == CT_RESULT {
@@ -8649,23 +8624,9 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                                 set_var_option_struct(pname, inner_t, inner_s)
                             } else if is_compound_ct(inner_t) != 0 || inner_name == "Tuple" {
                                 set_var_option_struct(pname, inner_t, compound_name_from_ann(inner_ann))
-                            } else if inner_name == "Set" {
-                                // CT_SET is deliberately not in is_compound_ct, so the
-                                // arm above never fires -- the Set's OWN element rides
-                                // the option's flat inner2 slot instead (get_var_option_inner2),
-                                // mirroring the bare `Set[T]` param arm below.
-                                set_var_option(pname, inner_t)
-                                let set_elems_sl = node_elements(inner_ann)
-                                if set_elems_sl != -1 && sublist_length(set_elems_sl) > 0 {
-                                    let set_elem_ann = sublist_get(set_elems_sl, 0)
-                                    let set_elem_ct = type_from_name(node_name(set_elem_ann))
-                                    if set_elem_ct >= 0 && set_elem_ct != CT_VOID {
-                                        set_var_option_inner2(pname, set_elem_ct)
-                                    } else {
-                                        recover_option_set_elem_from_tid(inner_ann, pname)
-                                    }
-                                }
                             } else {
+                                // A CT_SET inner reads its own element off the
+                                // option tid, so it needs no flat inner2 stamp.
                                 set_var_option(pname, inner_t)
                             }
                         }
@@ -10191,23 +10152,9 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) ! Cod
                             let inner_ct = type_from_name(inner_name)
                             if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
                                 set_var_option_struct(pname, CT_INT, inner_name)
-                            } else if inner_name == "Set" {
-                                // See the twin block in emit_fn_def -- the Set's own
-                                // element rides the option's inner2 slot, not
-                                // is_compound_ct (CT_SET is deliberately excluded there).
-                                set_var_option(pname, inner_ct)
-                                let set_elems_sl = node_elements(inner_ann)
-                                if set_elems_sl != -1 && sublist_length(set_elems_sl) > 0 {
-                                    let set_elem_ann = sublist_get(set_elems_sl, 0)
-                                    let set_elem_name = resolve_tparam_via_tid(node_name(set_elem_ann), tparams_sl, arg_tids)
-                                    let set_elem_ct = type_from_name(set_elem_name)
-                                    if set_elem_ct >= 0 && set_elem_ct != CT_VOID {
-                                        set_var_option_inner2(pname, set_elem_ct)
-                                    } else {
-                                        recover_option_set_elem_from_tid(inner_ann, pname)
-                                    }
-                                }
                             } else {
+                                // A CT_SET inner reads its own element off the
+                                // option tid, so it needs no flat inner2 stamp.
                                 set_var_option(pname, inner_ct)
                             }
                         }
@@ -10604,23 +10551,9 @@ fn emit_poly_impl_method_def(im: Int, method_node: Int, concrete_args: Str, arg_
                             let inner_ct = type_from_name(inner_name)
                             if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
                                 set_var_option_struct(pname, CT_INT, inner_name)
-                            } else if inner_name == "Set" {
-                                // See the twin block in emit_fn_def -- the Set's own
-                                // element rides the option's inner2 slot, not
-                                // is_compound_ct (CT_SET is deliberately excluded there).
-                                set_var_option(pname, inner_ct)
-                                let set_elems_sl = node_elements(inner_ann)
-                                if set_elems_sl != -1 && sublist_length(set_elems_sl) > 0 {
-                                    let set_elem_ann = sublist_get(set_elems_sl, 0)
-                                    let set_elem_name = resolve_tparam_via_tid(node_name(set_elem_ann), tparams_sl, arg_tids)
-                                    let set_elem_ct = type_from_name(set_elem_name)
-                                    if set_elem_ct >= 0 && set_elem_ct != CT_VOID {
-                                        set_var_option_inner2(pname, set_elem_ct)
-                                    } else {
-                                        recover_option_set_elem_from_tid(inner_ann, pname)
-                                    }
-                                }
                             } else {
+                                // A CT_SET inner reads its own element off the
+                                // option tid, so it needs no flat inner2 stamp.
                                 set_var_option(pname, inner_ct)
                             }
                         }
