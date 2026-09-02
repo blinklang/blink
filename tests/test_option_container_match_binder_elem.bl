@@ -1,0 +1,77 @@
+// A match in value position (let got = match ...) must not discard an arm whose
+// body is a BLOCK whose tail is a value-producing expression the static pre-pass
+// cannot type -- a method-call chain like inner.get(0).unwrap(), or that chain
+// followed by a field access. The match-lowering pre-pass classified such an arm
+// as valueless (it relied on infer_block_type, which returns CT_VOID both for a
+// genuinely void block and for a value block whose tail type it cannot infer),
+// so the whole match result was discarded and read back as 0. The classification
+// is now structural. The defect discards the ENTIRE arm value, so a scalar Int
+// element guards it exactly as well as a struct element.
+
+type McPt { x: Int, y: Int }
+
+test "match Option[List[Int]] local binder reads the scalar element" {
+    let o: Option[List[Int]] = Some([10, 20])
+    let got = match o {
+        Some(inner) => { inner.get(0).unwrap() }
+        None => { -1 }
+    }
+    assert_eq(got, 10)
+}
+
+test "match Option[List[Struct]] local binder reads the struct element" {
+    let o: Option[List[McPt]] = Some([McPt { x: 7, y: 8 }])
+    let got = match o {
+        Some(inner) => { inner.get(0).unwrap().x }
+        None => { -1 }
+    }
+    assert_eq(got, 7)
+}
+
+fn first_list_x(p: Option[List[McPt]]) -> Int {
+    match p {
+        Some(xs) => { xs.get(0).unwrap().x }
+        None => { -1 }
+    }
+}
+
+test "match Option[List[Struct]] fn param reads the struct element" {
+    let xs: List[McPt] = [McPt { x: 11, y: 22 }]
+    assert_eq(first_list_x(Some(xs)), 11)
+}
+
+fn val_map_y(p: Option[Map[Str, McPt]]) -> Int {
+    match p {
+        Some(m) => { m.get("k").unwrap().y }
+        None => { -1 }
+    }
+}
+
+test "match Option[Map[Str,Struct]] fn param reads the struct value" {
+    let mut m: Map[Str, McPt] = Map()
+    m.insert("k", McPt { x: 33, y: 44 })
+    assert_eq(val_map_y(Some(m)), 44)
+}
+
+// The block-tail value-producing kinds the classifier now recognises beyond a
+// plain ExprStmt: an if-expression tail whose BOTH branches are un-inferrable
+// (so the old infer_block_type could not rescue it through the else branch), and
+// an arena with-block tail (which infer_block_type never had a case for at all).
+
+test "match block arm with an un-inferrable if-tail keeps the value" {
+    let o: Option[List[Int]] = Some([10, 20])
+    let got = match o {
+        Some(inner) => { if inner.len() > 1 { inner.get(1).unwrap() } else { inner.get(0).unwrap() } }
+        None => { -1 }
+    }
+    assert_eq(got, 20)
+}
+
+test "match block arm with an arena with-block tail keeps the value" {
+    let o: Option[List[Int]] = Some([10, 20])
+    let got = match o {
+        Some(inner) => { with arena { inner.get(1).unwrap() } }
+        None => { -1 }
+    }
+    assert_eq(got, 20)
+}
