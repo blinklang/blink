@@ -830,6 +830,12 @@ pub fn tid_to_descriptor(tid: Int) -> Str {
         if e == "" { return "" }
         return "O:{e}"
     }
+    if k == TyKind.Result {
+        let ok = tid_to_descriptor(tc_tid_child(r, 0))
+        let err = tid_to_descriptor(tc_tid_child(r, 1))
+        if ok == "" || err == "" { return "" }
+        return "R:{ok}|{err}"
+    }
     if k == TyKind.Map {
         let kd = tid_to_descriptor(tc_tid_child(r, 0))
         let vd = tid_to_descriptor(tc_tid_child(r, 1))
@@ -867,6 +873,39 @@ fn top_level_comma(s: Str) -> Int {
         i = i + 1
     }
     -1
+}
+
+// Index just past the first complete descriptor starting at `start`. The
+// descriptor grammar is prefix-coded: P:/S:/C: are leaves that run to the next
+// "|" (byte 124) at this level, L:/O: prepend one sub-descriptor, and M:/R:
+// prepend two joined by "|". Walking one whole descriptor tells a two-operand
+// carrier which "|" is its OWN separator rather than one buried in its first
+// operand.
+fn desc_span(s: Str, start: Int) -> Int {
+    let n = s.len()
+    if start + 2 > n { return n }
+    let p = s.slice(start, start + 2)
+    if p == "L:" || p == "O:" { return desc_span(s, start + 2) }
+    if p == "M:" || p == "R:" {
+        let e1 = desc_span(s, start + 2)
+        return desc_span(s, e1 + 1)
+    }
+    let mut i = start + 2
+    while i < n {
+        if s.byte_at(i) == 124 { return i }
+        i = i + 1
+    }
+    n
+}
+
+// Index of the "|" that separates the two operands of a Map or Result body (the
+// text after "M:" / "R:"), or -1. A Map key is always scalar or a struct, so its
+// first "|" is the separator; a Result ok operand can be a Map, Option[Map], or
+// nested Result carrying its own "|", so the split must skip past it.
+fn desc_operand_bar(body: Str) -> Int {
+    let e = desc_span(body, 0)
+    if e >= body.len() { return -1 }
+    e
 }
 
 // Parse an enum-variant field type STRING into a descriptor (enum-variant
@@ -1958,7 +1997,7 @@ pub fn descriptor_mangle(desc: Str) -> Str {
     }
     if desc.starts_with("R:") {
         let rest = desc.slice(2, desc.len())
-        let bar = rest.index_of("|")
+        let bar = desc_operand_bar(rest)
         if bar >= 0 {
             let ok = rest.slice(0, bar)
             let err = rest.slice(bar + 1, rest.len())
@@ -1999,7 +2038,7 @@ pub fn descriptor_c_type(desc: Str) -> Str {
     }
     if desc.starts_with("R:") {
         let rest = desc.slice(2, desc.len())
-        let bar = rest.index_of("|")
+        let bar = desc_operand_bar(rest)
         if bar >= 0 {
             let ok = rest.slice(0, bar)
             let err = rest.slice(bar + 1, rest.len())
@@ -2027,7 +2066,7 @@ pub fn descriptor_typedef_tag(desc: Str) -> Str {
     }
     if desc.starts_with("R:") {
         let rest = desc.slice(2, desc.len())
-        let bar = rest.index_of("|")
+        let bar = desc_operand_bar(rest)
         if bar >= 0 {
             let ok = rest.slice(0, bar)
             let err = rest.slice(bar + 1, rest.len())
@@ -2077,7 +2116,7 @@ pub fn queue_promote_type(desc: Str) {
     }
     if desc.starts_with("R:") {
         let rest = desc.slice(2, desc.len())
-        let bar = rest.index_of("|")
+        let bar = desc_operand_bar(rest)
         if bar >= 0 {
             let ok = rest.slice(0, bar)
             let err = rest.slice(bar + 1, rest.len())
@@ -2201,7 +2240,8 @@ fn emit_promote_option(desc: Str) ! Codegen.Emit {
 
 fn emit_promote_result(desc: Str) ! Codegen.Emit {
     let rest = desc.slice(2, desc.len())
-    let bar = rest.index_of("|")
+    let bar = desc_operand_bar(rest)
+    if bar < 0 { return }
     let ok_d = rest.slice(0, bar)
     let err_d = rest.slice(bar + 1, rest.len())
     let mangle = descriptor_mangle(desc)
@@ -2336,6 +2376,15 @@ pub fn emit_promote_elem_into(src_expr: Str, ct: Int, desc: Str) -> Str ! Codege
         emit_line("blink_closure* {cl_tmp} = (blink_closure*){src_expr};")
         emit_line("if ({cl_tmp} && {cl_tmp}->promoter) {cl_tmp} = {cl_tmp}->promoter(target, {cl_tmp});")
         return "(void*){cl_tmp}"
+    }
+    if desc.starts_with("O:") || desc.starts_with("R:") {
+        // A carrier is a by-value struct boxed in the capture slot, so it promotes
+        // like S:: deref the stored pointer, deep-copy the value, re-box into target.
+        let cty = descriptor_c_type(desc)
+        let tmp = fresh_temp("_pc_")
+        emit_line("{cty}* {tmp} = ({cty}*)blink_promote_alloc(target, sizeof({cty}));")
+        emit_line("*{tmp} = blink_promote_{mangle}(target, *({cty}*){src_expr});")
+        return "(void*){tmp}"
     }
     // Nested collection: pointer stored directly
     return "(void*)blink_promote_{mangle}(target, (void*){src_expr})"

@@ -1,0 +1,203 @@
+// A by-value (non-mut) capture of a carrier-typed local must be BOXED, the same
+// way a by-value struct capture is.
+//
+// Option and Result lower to by-value C structs (blink_Option_int, blink_Result_*),
+// not to pointers. The by-value capture path spelled three seams for such a value —
+// the store into the capture array, the rehydration read inside the closure body,
+// and the arena promoter — and all three fell through to the scalar/pointer
+// catch-all, which cast the struct straight to void*:
+//
+//     __caps_0[0] = (void*)c;                                 // cannot convert to a pointer
+//     blink_Option_int _scrut_0 = blink_closure_get_capture(__self, 0);  // invalid initializer
+//     new_caps[0] = (void*)blink_promote_Option_Int(target, (void*)src->captures[0]);  // wrong arg
+//
+// Safe Blink code failed to compile. A carrier must take the boxed struct path:
+// alloc the carrier, store the value, keep a pointer; read by dereferencing it.
+// Every row reads the captured value INSIDE the closure and asserts it, so a passing
+// row proves the store and the read agree on one boxed layout rather than merely
+// both compiling.
+
+type Bx { v: Int }
+type Color { Red, Green, Blue }
+
+// ── the axis: a by-value carrier captured by a closure ────────────────────────
+
+test "a by-value Option[Int] capture carries its value" {
+    let c: Option[Int] = Some(7)
+    let peek = fn() -> Int {
+        match c {
+            Some(x) => { x }
+            None => { -1 }
+        }
+    }
+    assert_eq(peek(), 7)
+}
+
+test "a by-value Option[Int] None capture round-trips" {
+    let c: Option[Int] = None
+    let peek = fn() -> Int {
+        match c {
+            Some(x) => { x }
+            None => { -1 }
+        }
+    }
+    assert_eq(peek(), -1)
+}
+
+test "a by-value Result[Int, Str] Ok capture carries its value" {
+    let c: Result[Int, Str] = Ok(42)
+    let peek = fn() -> Int {
+        match c {
+            Ok(x) => { x }
+            Err(_) => { -1 }
+        }
+    }
+    assert_eq(peek(), 42)
+}
+
+test "a by-value Result[Int, Str] Err capture carries its error" {
+    let c: Result[Int, Str] = Err("boom")
+    let peek = fn() -> Int {
+        match c {
+            Ok(x) => { x }
+            Err(e) => { e.len() }
+        }
+    }
+    assert_eq(peek(), 4)
+}
+
+test "a by-value Option[struct] capture carries its struct" {
+    let c: Option[Bx] = Some(Bx { v: 9 })
+    let peek = fn() -> Int {
+        match c {
+            Some(b) => { b.v }
+            None => { -1 }
+        }
+    }
+    assert_eq(peek(), 9)
+}
+
+test "a by-value Option[Option[Int]] capture carries both levels" {
+    let c: Option[Option[Int]] = Some(Some(5))
+    let peek = fn() -> Int {
+        match c {
+            Some(inner) => {
+                match inner {
+                    Some(x) => { x }
+                    None => { -1 }
+                }
+            }
+            None => { -2 }
+        }
+    }
+    assert_eq(peek(), 5)
+}
+
+test "a by-value Result[struct] Ok capture carries its struct" {
+    let c: Result[Bx, Str] = Ok(Bx { v: 5 })
+    let peek = fn() -> Int {
+        match c {
+            Ok(b) => { b.v }
+            Err(_) => { -1 }
+        }
+    }
+    assert_eq(peek(), 5)
+}
+
+test "a by-value Result[struct] Err capture carries its error" {
+    let c: Result[Bx, Str] = Err("boom")
+    let peek = fn() -> Int {
+        match c {
+            Ok(b) => { b.v }
+            Err(e) => { e.len() }
+        }
+    }
+    assert_eq(peek(), 4)
+}
+
+test "a by-value Result[Map, Str] capture carries its map" {
+    let mut mm: Map[Int, Str] = Map()
+    mm.insert(1, "a")
+    mm.insert(2, "b")
+    let c: Result[Map[Int, Str], Str] = Ok(mm)
+    let peek = fn() -> Int {
+        match c {
+            Ok(m) => { m.len() }
+            Err(_) => { -1 }
+        }
+    }
+    assert_eq(peek(), 2)
+}
+
+test "a by-value Option[Map] capture carries its map" {
+    let mut mm: Map[Int, Str] = Map()
+    mm.insert(7, "x")
+    let c: Option[Map[Int, Str]] = Some(mm)
+    let peek = fn() -> Int {
+        match c {
+            Some(m) => { m.len() }
+            None => { -1 }
+        }
+    }
+    assert_eq(peek(), 1)
+}
+
+// A carrier whose inner kind the promote-descriptor grammar cannot spell (here
+// an enum err operand) has no faithful arena walker, so a promoted capture is
+// rejected (see test_arena_promote_offgrammar_carrier_rejected). Captured in
+// scope — never promoted — the store and read seams still box it faithfully.
+test "a by-value off-grammar Result[Int, enum] capture round-trips in scope" {
+    let c: Result[Int, Color] = Ok(42)
+    let peek = fn() -> Int {
+        match c {
+            Ok(x) => { x }
+            Err(_) => { -1 }
+        }
+    }
+    assert_eq(peek(), 42)
+}
+
+// ── the promoter seam: a carrier-capturing closure escapes an arena ───────────
+// The closure is the tail value of `with arena`, so it is deep-copied out via
+// __promote_closure. The captured carrier is arena-local, so reading it after the
+// block closes proves the promoter copied the boxed value rather than aliasing it.
+
+test "a promoted closure carries its by-value Option capture" {
+    let f: fn() -> Int = with arena {
+        let c: Option[Int] = Some(7)
+        fn() -> Int {
+            match c {
+                Some(x) => { x }
+                None => { -1 }
+            }
+        }
+    }
+    assert_eq(f(), 7)
+}
+
+test "a promoted closure carries its by-value Result capture" {
+    let f: fn() -> Int = with arena {
+        let c: Result[Int, Str] = Ok(42)
+        fn() -> Int {
+            match c {
+                Ok(x) => { x }
+                Err(_) => { -1 }
+            }
+        }
+    }
+    assert_eq(f(), 42)
+}
+
+// ── controls: shapes the by-value path already handled ────────────────────────
+
+test "a by-value Int capture still carries its value" {
+    let n = 11
+    let peek = fn() -> Int { n }
+    assert_eq(peek(), 11)
+}
+
+test "a by-value struct capture still carries its value" {
+    let b = Bx { v: 13 }
+    let peek = fn() -> Int { b.v }
+    assert_eq(peek(), 13)
+}

@@ -1,0 +1,38 @@
+// A by-value Result capture whose ok/err operand the descriptor grammar cannot
+// spell (an enum, Bytes, Set, closure, ...) has no faithful promote walker: the
+// descriptor collapses to a bare "P:Int", so the arena tail promoter bit-copies
+// the boxed carrier's heap pointer as an integer instead of deep-copying it —
+// a use-after-free once the inner arena is torn down.
+//
+// The store and read seams box such a capture correctly (they spell the C type
+// from the tid), so the non-promoted case runs fine; only the arena-tail
+// promoter lacks the walker. Rather than emit the silent int-copy, the tail
+// promoter rejects the capture the same way it rejects any other kind it cannot
+// promote — a loud E0702d — until the descriptor grammar covers the inner kind.
+// An in-grammar carrier (Result[Int, Str]) must still promote.
+
+import compile_test_helpers
+
+test "a promoted closure capturing an off-grammar Result[Int, enum] is rejected, not miscompiled" {
+    let src = "type Color \{ Red, Green, Blue }\nfn main() \{ let f: fn() -> Int = with arena \{ let c: Result[Int, Color] = Ok(42)\n fn() -> Int \{ match c \{ Ok(x) => \{ x } Err(_) => \{ -1 } } } }\n let _ = f() }\n"
+    compile_test_helpers.expect_compile_error(src, "arena_promote_result_enum", "E0702d")
+}
+
+test "a promoted closure capturing Option[List[enum-of-unspellable]] is rejected, not miscompiled" {
+    // The carrier's C type (blink_Option_list) is element-erased, so a top-level
+    // name check cannot see that the Bytes element collapsed. The descriptor must
+    // be spelled from the tid alone, which declines the whole tree, so the capture
+    // is rejected rather than promoted with a bit-copied arena element pointer.
+    let src = "fn mk() -> List[Bytes] \{ [Bytes.from_str(\"hi\")] }\nfn main() \{ let f: fn() -> Int = with arena \{ let c: Option[List[Bytes]] = Some(mk())\n fn() -> Int \{ match c \{ Some(l) => \{ l.len() } None => \{ -1 } } } }\n let _ = f() }\n"
+    compile_test_helpers.expect_compile_error(src, "arena_promote_option_list_bytes", "E0702d")
+}
+
+test "a promoted closure capturing an in-grammar Option[List[Int]] still compiles" {
+    let src = "fn main() \{ let f: fn() -> Int = with arena \{ let c: Option[List[Int]] = Some([1, 2, 3])\n fn() -> Int \{ match c \{ Some(l) => \{ l.len() } None => \{ -1 } } } }\n let _ = f() }\n"
+    compile_test_helpers.expect_no_error(src, "arena_promote_option_list_int", "E0702d")
+}
+
+test "a promoted closure capturing an in-grammar Result[Int, Str] still compiles" {
+    let src = "fn main() \{ let f: fn() -> Int = with arena \{ let c: Result[Int, Str] = Ok(42)\n fn() -> Int \{ match c \{ Ok(x) => \{ x } Err(_) => \{ -1 } } } }\n let _ = f() }\n"
+    compile_test_helpers.expect_no_error(src, "arena_promote_result_str", "E0702d")
+}
