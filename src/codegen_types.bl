@@ -2177,39 +2177,6 @@ fn get_var_mut(name: Str) -> Int {
     0
 }
 
-// Read the element off the flat field, not the derived tp_* pool. sv_tp builds
-// the pool child straight from inner1 at every setter, so tp_child1_kind(sv.tp_id)
-// and sv.inner1 agree for every inner1 >= 0. They diverge at exactly one value:
-// for CT_RESULT/CT_ITERATOR/CT_CHANNEL sv_tp fabricates a concrete default
-// (type_int/type_string) when inner1 < 0, so the old pool read returned CT_INT
-// where the flat field holds -1. No writer of these ctypes ever stores a literal
-// -1 inner (callers floor to CT_VOID/CT_INT, and E0301 rejects under-determined
-// carriers before codegen), so that divergent state is unreachable and the flat
-// field is the truthful channel.
-fn get_sv_inner1(name: Str, ctype: Int) -> Int {
-    if scope_ct_count(ctype) <= 0 { return -1 }
-    let mut i = scope_vars.len() - 1
-    while i >= 0 {
-        let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == ctype {
-            return sv.inner1
-        }
-        i = i - 1
-    }
-    let blink_name = c_blink_name(name)
-    if blink_name != name {
-        i = scope_vars.len() - 1
-        while i >= 0 {
-            let sv = scope_vars.get(i).unwrap()
-            if sv.name == blink_name && sv.ctype == ctype {
-                return sv.inner1
-            }
-            i = i - 1
-        }
-    }
-    -1
-}
-
 // The authoritative tid of the ctype-matched var, matched exactly as the flat
 // get_sv_* readers do (kind + c_blink_name fallback) so a tid-first accessor and
 // its flat fallback always resolve the same ScopeVar. -1 when unstamped/absent.
@@ -2230,33 +2197,6 @@ fn get_sv_ty(name: Str, ctype: Int) -> Int {
             let sv = scope_vars.get(i).unwrap()
             if sv.name == blink_name && sv.ctype == ctype {
                 return sv.ty
-            }
-            i = i - 1
-        }
-    }
-    -1
-}
-
-// The inner2 twin of get_sv_inner1 (CT_RESULT's err element). Same invariant:
-// sv.inner2 equals tp_child2_kind(sv.tp_id) at every reachable state, and the flat
-// field is truthful where the pool would fabricate type_string() for a -1 err.
-fn get_sv_inner2(name: Str, ctype: Int) -> Int {
-    if scope_ct_count(ctype) <= 0 { return -1 }
-    let mut i = scope_vars.len() - 1
-    while i >= 0 {
-        let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == ctype {
-            return sv.inner2
-        }
-        i = i - 1
-    }
-    let blink_name = c_blink_name(name)
-    if blink_name != name {
-        i = scope_vars.len() - 1
-        while i >= 0 {
-            let sv = scope_vars.get(i).unwrap()
-            if sv.name == blink_name && sv.ctype == ctype {
-                return sv.inner2
             }
             i = i - 1
         }
@@ -4000,14 +3940,13 @@ pub fn stamp_map_from_map_tid(mtid: Int, var_name: Str) -> Bool {
     true
 }
 
-// Stamp a Result binder/temp with its authoritative carrier tid so the ok/err
-// readers resolve through the tid rather than the flat inner1/inner2 channel. The
-// value readers (get_var_result_ok/err) still fall back to that flat channel for a
-// Void or unresolvable slot, and the struct-name twins (get_var_result_ok_struct/
-// err_struct) are tid-only. So this only fills a ty slot a binder push left at -1;
-// it never contradicts a flat channel a reader still consults. Declines when the tid
-// is not a Result, leaving the var flat-authoritative. The Result twin of
-// stamp_map_from_map_tid.
+// Stamp a Result binder/temp with its authoritative carrier tid. The tid is the
+// sole authority for the ok/err element CT: get_var_result_ok/err read it through
+// the tid (via the _resolved readers) with no flat inner1/inner2 fallback, and the
+// struct-name twins (get_var_result_ok_struct/err_struct) are tid-only too. A binder
+// left without a stamped tid yields -1 from those readers (which collapses to a
+// "void" tag downstream), so this stamp is what makes the ok/err CT channel present.
+// Declines when the tid is not a Result. The Result twin of stamp_map_from_map_tid.
 pub fn stamp_result_from_tid(rtid: Int, var_name: Str) -> Bool {
     if tc_tid_ct(rtid) != CT_RESULT { return false }
     set_var_ty(var_name, rtid)
@@ -9097,12 +9036,11 @@ pub fn set_var_result(name: Str, ok_t: Int, err_t: Int) {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_RESULT {
             // An earlier fresh push may have landed this binder on ty=-1 (e.g. an
-            // if-expr temp), leaving the flat slots sole authority. Now that the
-            // ok/err slots are known, reverse-resolve the carrier tid the same way
-            // the fresh-push path does. This entry point carries no err struct name;
-            // a Result var never stores one on a flat channel (only set_var_result_struct
-            // knows it, and it rides the tid), so the err slot reconstructs as a scalar
-            // and a struct err stays flat-authoritative on the declined carrier.
+            // if-expr temp). Now that the ok/err slots are known, reverse-resolve the
+            // carrier tid the same way the fresh-push path does. This entry point carries
+            // no err struct name (only set_var_result_struct knows it, and it rides the
+            // tid), so the err slot reconstructs as a scalar; a carrier that cannot
+            // reconstruct declines to ty=-1, where the ok/err readers answer -1.
             let recovered = if sv.ty >= 0 { sv.ty } else { result_carrier_tid_from_flat(ok_t, err_t, sv.sname, "") }
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: ok_t, inner2: err_t, sname: sv.sname, ty: recovered, tp_id: sv_tp(sv.ctype, ok_t, err_t, sv.sname) })
             return
@@ -9112,7 +9050,7 @@ pub fn set_var_result(name: Str, ok_t: Int, err_t: Int) {
     // A fresh scalar-slotted Result (both slots bare scalars, no struct name) reconstructs
     // its exact carrier tid now, the fresh-push twin of the update path above and of the
     // scalar-Option carrier reconstruct; a Void or struct slot declines to -1 inside the
-    // helper and the binder stays flat-authoritative there.
+    // helper and the binder stays on ty=-1, where the ok/err readers answer -1.
     push_scope_var(ScopeVar { name: name, ctype: CT_RESULT, is_mut: 0, inner1: ok_t, inner2: err_t, sname: "", ty: result_carrier_tid_from_flat(ok_t, err_t, "", ""), tp_id: sv_tp(CT_RESULT, ok_t, err_t, "") })
 }
 
@@ -9131,10 +9069,12 @@ fn result_slot_tid_from_flat(ct: Int, sname: Str) -> Int {
     nominal_struct_tid(sname)
 }
 
-// Per-slot round-trip on the reconstructed carrier. The guard is slot-shape-aware because the
-// value-access CT reader (get_var_result_*) declines CT_STRUCT/CT_ENUM and keeps flat inner1:
-// a struct slot only needs its name reproduced (the CT is preserved regardless), a scalar slot
-// needs its CT reproduced and its name to stay empty, so activating the tid path cannot diverge.
+// Per-slot round-trip on the reconstructed carrier: the gate that decides whether the tid is a
+// faithful enough encoding of the flat slots to become their sole authority. The guard is
+// slot-shape-aware: a struct slot carries its identity in the name (get_var_result_*_struct reads
+// it off the tid), so only the name must reproduce; a scalar slot carries it in the CT, so the CT
+// must reproduce and the name stay empty. A slot that cannot round-trip declines the whole carrier
+// to -1 rather than stamp a lossy tid.
 fn result_slot_roundtrip_ok(sname: Str, ct: Int, back_name: Str, back_ct: Int) -> Int {
     if sname != "" {
         if back_name == sname { 1 } else { 0 }
@@ -9149,7 +9089,8 @@ fn result_slot_roundtrip_ok(sname: Str, ct: Int, back_name: Str, back_ct: Int) -
 // sibling — whose flat inner is only ever a struct — a Result slot is routinely a bare scalar
 // (Result[Int, Str]), so each slot reconstructs scalar and plain-struct shapes alike. Both
 // slots must reconstruct and both must round-trip, or the whole carrier declines to -1 and the
-// binder stays on ty=-1, where the ok/err struct-name readers answer "" (no flat-name fallback).
+// binder stays on ty=-1, where the ok/err CT readers answer -1 and the struct-name readers "" —
+// the flat channel is no longer consulted.
 fn result_carrier_tid_from_flat(ok_t: Int, err_t: Int, ok_s: Str, err_s: Str) -> Int {
     let ok_tid = result_slot_tid_from_flat(ok_t, ok_s)
     if ok_tid < 0 { return -1 }
@@ -9169,9 +9110,9 @@ pub fn set_var_result_struct(name: Str, ok_t: Int, err_t: Int, ok_s: Str, err_s:
         if sv.name == name && sv.ctype == CT_RESULT {
             // Update keeps a populated tid; a binder an earlier push left on ty=-1 (e.g. an
             // if-expr temp) reconstructs from the now-known flat names the same way the fresh
-            // push does, guarded by the round-trip so flat stays authoritative when the names
-            // cannot be spelled exactly. The err name rides the tid (get_var_result_err_struct
-            // reads it there); sname keeps ok_s only because it
+            // push does, guarded by the round-trip so the carrier declines to ty=-1 (readers
+            // answer -1/"") when the names cannot be spelled exactly. The err name rides the tid
+            // (get_var_result_err_struct reads it there); sname keeps ok_s only because it
             // feeds the pool key below.
             let recovered = if sv.ty >= 0 { sv.ty } else { result_carrier_tid_from_flat(ok_t, err_t, ok_s, err_s) }
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: ok_t, inner2: err_t, sname: ok_s, ty: recovered, tp_id: sv_tp(CT_RESULT, ok_t, err_t, ok_s) })
@@ -9304,26 +9245,24 @@ pub fn register_var_compound_from_tag(name: Str, tag: Str, is_mut: Int) ! Codege
     }
 }
 
+// The tid is the sole authority for the Ok CT, struct/enum included: a name-carried
+// struct/enum Ok reproduces the same CT the retired flat inner1 held, and the separate
+// sname reader (get_var_result_ok_struct) still supplies the identity. The _resolved
+// reader peels a back-pinned bound metavar the bare tc_tid_result_ok_ct would decline.
 pub fn get_var_result_ok(name: Str) -> Int {
     let t = get_sv_ty(name, CT_RESULT)
     if t >= 0 {
-        let c = tc_tid_result_ok_ct(cg_bind_mono_tid(t))
-        // The tid is the authority for the Ok CT, struct/enum included: a name-carried
-        // struct/enum Ok reproduces the same CT the flat inner1 held, and the separate
-        // sname reader (get_var_result_ok_struct) still supplies the identity. The flat
-        // inner1 remains only for a dormant carrier whose slots declined tid reconstruction.
-        if c >= 0 { return c }
+        return tc_tid_result_ok_ct_resolved(cg_bind_mono_tid(t))
     }
-    get_sv_inner1(name, CT_RESULT)
+    -1
 }
 
 pub fn get_var_result_err(name: Str) -> Int {
     let t = get_sv_ty(name, CT_RESULT)
     if t >= 0 {
-        let c = tc_tid_result_err_ct(cg_bind_mono_tid(t))
-        if c >= 0 { return c }
+        return tc_tid_result_err_ct_resolved(cg_bind_mono_tid(t))
     }
-    get_sv_inner2(name, CT_RESULT)
+    -1
 }
 
 fn sev_result_ok_name(bt: Int) -> Str {
