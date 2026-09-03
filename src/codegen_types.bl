@@ -2099,18 +2099,13 @@ pub fn get_var_ty(name: Str) -> Int {
     scope_vars.get(idx).unwrap().ty
 }
 
-// The flat-fields view of a var, rebuilt on demand now that the tp_id cache is gone.
-// A pure sv_tp read: this is the flat channel, kept so the divergence tap can compare
-// it against the authoritative tid until the flat channels themselves are retired.
-// The second-child slot is erased here: the flat channel has a single sname, so it
-// could never carry a Result's struct err or a Map's struct value faithfully (a
-// captured Result[Int, Oops] spelled blink_Result_int_int) — the tid leads and spells
-// those, so this view no longer reads the retired inner2.
+// A live scope var's type pool entry, lowered from the authoritative tid. The tid is the
+// sole source now; the flat ctype/inner1/sname channels no longer feed this. An unstamped
+// var lowers to a bare int, the same C placeholder the retired flat view produced for it.
 pub fn get_var_tp(name: Str) -> Int {
     let idx = find_scope_var(name)
     if idx >= 0 {
-        let sv = scope_vars.get(idx).unwrap()
-        return sv_tp(sv.ctype, sv.inner1, -1, sv.sname)
+        return c_repr_tp_from_tid(scope_vars.get(idx).unwrap().ty)
     }
     type_int()
 }
@@ -3673,6 +3668,49 @@ fn deep_tp_from_tid(tid: Int) -> Int {
         return type_struct(name)
     }
     if ct < 0 { return -1 }
+    sv_tp(ct, -1, -1, "")
+}
+
+// The C-representation tp of a tid: the top kind the C backend lowers the type to, which is
+// the tid twin of the flat sv_tp view get_var_tp read off the retired ctype channel. It
+// differs from the nominal deep_tp_from_tid only where the C lowering collapses the nominal
+// kind: a plain enum is an int64_t ordinal (CT_INT, not its nominal enum), and a container
+// whose inner the tid cannot spell still lowers to its own pointer kind rather than to a
+// fabricated scalar -- so it never returns -1, giving a coarse-but-correct fallback kind for
+// the capture cast path when the tid names no aggregate.
+fn c_repr_tp_from_tid(tid: Int) -> Int {
+    if tid < 0 { return type_int() }
+    let ct = tc_tid_ct(tid)
+    if ct == CT_OPTION { return type_option(c_repr_tp_from_tid(tc_tid_option_inner_tid(tid))) }
+    if ct == CT_RESULT {
+        return type_result(c_repr_tp_from_tid(tc_tid_result_ok_tid(tid)), c_repr_tp_from_tid(tc_tid_result_err_tid(tid)))
+    }
+    if ct == CT_MAP {
+        return type_map(c_repr_tp_from_tid(tc_tid_map_key_tid(tid)), c_repr_tp_from_tid(tc_tid_map_val_tid(tid)))
+    }
+    if ct == CT_LIST { return type_list(c_repr_tp_from_tid(tc_tid_list_elem(tid))) }
+    if ct == CT_SET { return type_set(c_repr_tp_from_tid(tc_tid_set_elem_tid(tid))) }
+    if ct == CT_ITERATOR { return type_iterator(c_repr_tp_from_tid(tc_tid_iter_elem_tid(tid))) }
+    if ct == CT_HANDLE || ct == CT_CHANNEL || ct == CT_PTR { return sv_tp(ct, -1, -1, "") }
+    if ct == CT_STRUCT {
+        let stem = tc_tid_struct_mono_name(tid)
+        let name = if stem != "" { stem } else { tc_tid_struct(tid) }
+        // A transparent newtype (Errno) has no aggregate C struct: it lowers to its bare
+        // Int payload, so it boxes as a scalar, never as a struct.
+        if name != "" && is_transparent_newtype(name) != 0 { return type_int() }
+        if name == "" { return sv_tp(CT_STRUCT, -1, -1, "") }
+        return type_struct(name)
+    }
+    if ct == CT_ENUM {
+        let stem = tc_tid_struct_mono_name(tid)
+        let name = if stem != "" { stem } else { tc_tid_struct(tid) }
+        if name != "" && is_transparent_newtype(name) != 0 { return type_int() }
+        // A data enum carries a payload, so it boxes by value under its struct name; a plain
+        // enum has none and falls through to the bare int of its ordinal.
+        if name != "" && is_data_enum(name) != 0 { return type_struct(name) }
+        return type_int()
+    }
+    if ct < 0 { return type_int() }
     sv_tp(ct, -1, -1, "")
 }
 
