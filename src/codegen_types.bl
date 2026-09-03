@@ -1072,12 +1072,6 @@ pub type CaptureEntry {
     // The rehydration seam inside the closure body is out of scope by the time it spells the
     // capture's cell, so the tid travels with the entry rather than being looked up by name.
     tid: Int
-    // The captured var's flat key-kind channel, snapshot at capture time. The
-    // captured scope var is out of scope inside the closure body, so its map key
-    // kind travels with the entry — the last flat child the capture branches still
-    // read (the map key readers), the value kind and every other child now riding
-    // the tid above.
-    inner1: Int
     // The captured var's top-level container kind (CT_MAP/CT_SET/...), snapshot
     // straight off the scope var's ctype at capture time. The capture-branch
     // container guards read this rather than tp_get_kind(tp_id): ctype is the same
@@ -2123,17 +2117,6 @@ pub fn get_var_tp(name: Str) -> Int {
 
 pub fn is_scope_var(name: Str) -> Int {
     if find_scope_var(name) >= 0 { 1 } else { 0 }
-}
-
-// The captured var's flat container channel, read straight off the scope var so a
-// capture entry can snapshot it. Return -1 (the flat channel's "unset" value) when
-// the name is not a live scope var, matching what an unset inner1/inner2 holds.
-pub fn get_var_inner1(name: Str) -> Int {
-    let idx = find_scope_var(name)
-    if idx >= 0 {
-        return scope_vars.get(idx).unwrap().inner1
-    }
-    -1
 }
 
 pub fn get_var_type(name: Str) -> Int {
@@ -5011,11 +4994,17 @@ pub fn get_map_key_type_raw(name: Str) -> Int {
         while ci < cg_closure_cap_count {
             let cap = closure_captures.get(cg_closure_cap_start + ci).unwrap()
             if cap.name == name && cap.ctype == CT_MAP {
-                // Flat key kind, mirroring the scope-var branch's inner1 read. The
-                // captured scope var's inner1 rides the entry as a snapshot; a CT_MAP
-                // key child is never fabricated, so the flat field carries the key kind
-                // faithfully.
-                return cap.inner1
+                // The key kind rides the capture tid alone, mirroring the scope-var
+                // branch above and get_map_value_type_raw's capture branch: a struct or
+                // enum key is name-carried and answers CT_STRUCT; a scalar key answers
+                // its own resolved kind; an untyped Map() leaves the key metavar unbound
+                // and reads back -1 (unknown), no fabrication.
+                if cap.tid >= 0 {
+                    let kt = cg_bind_mono_tid(cap.tid)
+                    if tc_tid_map_key_struct_resolved(kt) != "" { return CT_STRUCT }
+                    return tc_tid_map_key_ct_resolved(kt)
+                }
+                return -1
             }
             ci = ci + 1
         }
@@ -5103,14 +5092,16 @@ pub fn get_map_key_type(name: Str) -> Int {
         while ci < cg_closure_cap_count {
             let cap = closure_captures.get(cg_closure_cap_start + ci).unwrap()
             if cap.name == name && cap.ctype == CT_MAP {
+                // The key kind rides the capture tid alone, mirroring the scope-var
+                // branch above: a struct or enum key is name-carried and answers
+                // CT_STRUCT; a scalar key answers its own resolved kind; an unset key
+                // reads back -1 (no fabrication).
                 if cap.tid >= 0 {
-                    let k = tc_tid_map_key_ct_resolved(cg_bind_mono_tid(cap.tid))
-                    if k >= 0 && k != CT_ENUM { return k }
+                    let kt = cg_bind_mono_tid(cap.tid)
+                    if tc_tid_map_key_struct_resolved(kt) != "" { return CT_STRUCT }
+                    return tc_tid_map_key_ct_resolved(kt)
                 }
-                // Flat key kind, mirroring the scope-var branch's inner1 read (an enum
-                // key already rides the tid sname above). A CT_MAP key child is never
-                // fabricated, so the flat field carries the key kind faithfully.
-                return cap.inner1
+                return -1
             }
             ci = ci + 1
         }
