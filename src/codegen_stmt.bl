@@ -120,7 +120,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{sv_ty_or_flat_at, tc_void_tid, tc_tid_child, tc_top_level_let_tid, ctype_probe_at, closure_sig_from_tid, enum_instance_c_from_tid, struct_instance_c_from_tid, tc_tid_handler_effect, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, make_list_type, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_tuple_sname, tc_tid_to_c_tag, tc_variant_field_tid_by_name, tc_variant_field_is_selfrec_tuple}
+import typecheck.{tc_void_tid, tc_tid_child, tc_top_level_let_tid, ctype_probe_at, closure_sig_from_tid, enum_instance_c_from_tid, struct_instance_c_from_tid, tc_tid_handler_effect, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, make_list_type, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_tuple_sname, tc_tid_to_c_tag, tc_variant_field_tid_by_name, tc_variant_field_is_selfrec_tuple}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -2514,31 +2514,23 @@ fn subst_variant_field_binder_tid(tid: Int, bare_enum: Str, scrut_mono: Str) -> 
     tc_tid_subst_mono(tid, tparams_sl, ml.arg_tids)
 }
 
-// The divergence tap for a match-arm pattern binder.
+// Stamps a match-arm pattern binder's authoritative tid onto its ScopeVar.
 //
 // `bind_pattern_vars` stamps through ~28 `set_var` calls spread over its arms, but a binder's NAME
 // is decided in only four places: the generic `NodeKind.IdentPattern` arm that every recursed
 // sub-pattern re-enters the function to reach, and the three carrier fast paths that handle an
-// IdentPattern inline without recursing. Tapping those four covers the family. A tap per arm would
-// cover it today and rot tomorrow, because an arm added later would be silently unmeasured — the
-// same reason `params_measure` sits after the whole param loop instead of inside its branches.
+// IdentPattern inline without recursing. Stamping at those four covers the family. A stamp per arm
+// would cover it today and rot tomorrow, because an arm added later would be silently unstamped.
 //
 // The tid is typecheck's, not a second derivation: `tc_check_pattern_types` already decomposes the
 // binding hint one level per arm (Option/Result unwrap, tuple element, list element, variant field)
-// and now publishes each leaf's answer on the leaf node. Substituted through the instance's binds
-// for the same reason the for-in and param taps are — inside a monomorphized body a binder over a
-// `List[T]` element publishes `T`, and comparing a typevar against a concrete flat spelling reports
-// a divergence that is only the tap failing to look up what T is bound to.
+// and publishes each leaf's answer on the leaf node. Substituted through the instance's binds so a
+// binder over a `List[T]` element inside a monomorphized body resolves `T` to its concrete arg.
 //
-// A struct-style shorthand field (`match p { Pt { x, y } => ... }`) is NOT measured here: it has no
-// IdentPattern node, so it never reaches this tap. It is bound and measured by
-// `bind_struct_style_variant_fields` instead, under its own `variant_field_struct_style` tap.
-// Typecheck's StructPattern and EnumPattern struct-style arms publish each field's declared type on
-// the field node, so that tap has a real tid to read.
-// `site` is a parameter and not a constant because the two callers are different declaration
-// families that happen to share a mechanism: a match arm and a tuple destructure. Collapsing them
-// under one key would lose the attribution the cell map is read through.
-fn pat_measure_at(bind_name: Str, pat: Int, site: Str) {
+// A struct-style shorthand field (`match p { Pt { x, y } => ... }`) is NOT stamped here: it has no
+// IdentPattern node, so it never reaches this path. `bind_struct_style_variant_fields` stamps it
+// instead, from the field type typecheck publishes on the StructPattern / EnumPattern field node.
+fn pat_measure(bind_name: Str, pat: Int) {
     if bind_name == "" { return }
     if bind_name == "_" { return }
     let tid = tc_tid_subst_mono(tc_tid_resolved(tc_lookup_node_tid(pat)), cg_mono_tparams_sl, cg_mono_arg_tids)
@@ -2553,14 +2545,9 @@ fn pat_measure_at(bind_name: Str, pat: Int, site: Str) {
         // already had an answer keeps it.
         let _filled = stamp_binder_elems_from_tid_if_unset(tid, bind_name)
     }
-    let _measured = sv_ty_or_flat_at(bind_name, site, pat)
 }
 
-fn pat_measure(bind_name: Str, pat: Int) {
-    pat_measure_at(bind_name, pat, "match_pattern.bind")
-}
-
-// The tid a binder's C DECLARATION is spelled from — the same expression `pat_measure_at` measures
+// The tid a binder's C DECLARATION is spelled from — the same expression `pat_measure` stamps
 // the binder's metadata through, so the two cannot drift onto different tids for one binder.
 //
 // The metadata channel and the spelling channel are separate axes and both are needed: the metadata
@@ -4218,15 +4205,12 @@ fn emit_tuple_destructure(pat_node: Int, source_var: Str, struct_name: Str, is_m
                 set_var(elem_name, ft, is_mut)
             }
         }
-        // This one function is the whole family: both `let (a, b) = t` and
-        // `for (k, v) in <iterable>` route here, so a tap here is not a copy
-        // of the match-arm tap even though both measure a pattern binder. The
-        // two paths differ in what they can report — typecheck decomposes a
-        // for-in tuple pattern and publishes each leaf's type, but does NOT
-        // decompose a LetBinding one, so a `let` destructure lands in the
-        // `missing` bucket. The tap must not paper over that asymmetry by
-        // re-deriving the element from `struct_name`.
-        pat_measure_at(elem_name, sub_pat, "tuple_destructure.elem")
+        // Both `let (a, b) = t` and `for (k, v) in <iterable>` route here. The two paths
+        // differ in what they can stamp: typecheck decomposes a for-in tuple pattern and
+        // publishes each leaf's type, but does NOT decompose a LetBinding one, so a `let`
+        // destructure has no leaf tid and stamps nothing rather than re-deriving the element
+        // from `struct_name` — a fabricated element would read the wrong slot at runtime.
+        pat_measure(elem_name, sub_pat)
         di = di + 1
     }
 }
@@ -4960,15 +4944,10 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     }
     let struct_type = get_var_struct(name)
     let cname = c_safe_name(name)
-    // Stage 2 measurement, immediately ahead of the declaration chain below — the single
-    // decision that turns a variable's type into C. The answer is DISCARDED: the flat
-    // `val_type` still governs every branch, which is what keeps the emitted C byte-identical
-    // while the counter enumerates the cells Stage 3 has to lower from the tid instead.
-    // `node` is threaded so the sweep row can name the declaration (`at=module:line`).
-    // Without it a row identifies only the variable and the ENTRY file, and neither locates the
-    // `let`: every test compile re-emits the whole stdlib, so one stdlib binding is blamed on
-    // ~90 entry files at once.
-    let decl_tid = tc_tid_subst_mono(sv_ty_or_flat_at(name, "emit_let_binding.decl", node), cg_mono_tparams_sl, cg_mono_arg_tids)
+    // The variable's authoritative tid, substituted through the current mono binder so a
+    // typevar in a generic body resolves to its instantiated arg. The declaration chain below
+    // spells the C type from this tid (enum_c_from_tid, ptr_c_from_tid, c_type_from_tid …).
+    let decl_tid = tc_tid_subst_mono(get_var_ty(name), cg_mono_tparams_sl, cg_mono_arg_tids)
     // Stage 3 measurement, the string twin of the line above. Each arm of the chain below
     // records the C TYPE it printed and which arm printed it; the ctypediv probe after the
     // chain compares that against c_type_from_tid's answer for the same variable. The flat
@@ -5349,30 +5328,22 @@ fn map_keys_boxed_elem(n: Int) -> Str {
     elem.name
 }
 
-// Stage 2's dual-write for a for-in loop variable, and the tap that measures it.
+// Stamps a for-in loop variable's element tid onto its ScopeVar.
 // Called from every arm of emit_for_in once the loop variable's ScopeVar exists and before the
 // body is emitted, i.e. with exactly the type the body will read.
 //
-// Advisory, like every other Stage 2 dual-write: the answer is DISCARDED and the flat fields
-// still govern every branch, so the emitted C does not change. What changes is that the counter
-// can see the site.
-//
 // The stamp is gated on a KNOWN element: tc_tid_iter_elem answers TYPE_UNKNOWN for the iterables
-// whose element typecheck does not publish yet (Str, Bytes, Iterator, Channel, Range), and
-// stamping that would report a divergence against a flat field that is in fact correct. Left
-// unstamped, the tap answers `missing` instead — a bucket that says "no tid here", which is the
-// honest reading and also the inventory of the iterables still to be typed.
-fn forin_measure_var(var_name: Str, iter_node: Int, node: Int) {
+// whose element typecheck does not publish yet (Str, Bytes, Iterator, Channel, Range). Stamping
+// that would overwrite a correct flat field with an under-determined tid, so those are left
+// unstamped for the flat channel to spell.
+fn forin_measure_var(var_name: Str, iter_node: Int) {
     if var_name == "" { return }
-    // Substituted through the instance's binds for the same reason emit_let_binding.decl does it:
-    // inside a monomorphized body `for x in xs` over a `List[T]` publishes `T`, and
-    // comparing a typevar against the concrete flat spelling reports a divergence that is only
-    // the tap failing to look up what T is bound to.
+    // Substituted through the instance's binds: inside a monomorphized body `for x in xs` over a
+    // `List[T]` publishes `T`, which must resolve to its concrete arg before it is stamped.
     let elem_tid = tc_tid_subst_mono(tc_tid_resolved(tc_tid_iter_elem(tc_tid_resolved(tc_lookup_node_tid(iter_node)))), cg_mono_tparams_sl, cg_mono_arg_tids)
     if elem_tid >= 0 && tc_tid_kind(elem_tid) != TyKind.Unknown {
         set_var_ty(var_name, elem_tid)
     }
-    let _measured = sv_ty_or_flat_at(var_name, "emit_for_in.var", node)
 }
 
 // The ctype half of the same measurement, and the DECIDER for the two for-in
@@ -5408,20 +5379,19 @@ fn forin_binder_ctype(var_name: Str, iter_node: Int, node: Int, site: Str, flat:
     spelled
 }
 
-// The same dual-write for a function parameter, which is the larger population: four
-// registration loops — plain fn, prototype, monomorphized fn, poly impl — build a param's ScopeVar
-// from `node_type_name(p)`, a NAME put through type_from_name, while the annotation node carries
-// the whole tree.
+// The same stamping for a function parameter, which is the larger population: four registration
+// loops — plain fn, prototype, monomorphized fn, poly impl — build a param's ScopeVar from
+// `node_type_name(p)`, a NAME put through type_from_name, while the annotation node carries the
+// whole tree. This stamps the param's resolved tid so the body reads the full type.
 //
 // Called once per loop, AFTER the loop, rather than inside its arms. Each loop stamps through
-// several branches with an early `continue`, and what the counter has to compare is the type the
-// BODY will read — i.e. the state after every arm has run. Re-walking the sublist costs one pass
-// and cannot miss an arm that was added without a tap.
+// several branches with an early `continue`, and what the body reads is the state after every arm
+// has run. Re-walking the sublist costs one pass and cannot miss an arm added without a stamp.
 //
 // tparams_sl/arg_tids are the mono binds (cg_fn_mono_*, the stable twins — params are registered
-// at fn entry, before any struct-literal swap), so a generic param is compared as the concrete
-// type this instance was emitted for instead of as a bare typevar against a concrete flat
-// spelling. -1/[] outside a mono body makes tc_tid_subst_mono a no-op.
+// at fn entry, before any struct-literal swap), so a generic param resolves to the concrete type
+// this instance was emitted for instead of a bare typevar. -1/[] outside a mono body makes
+// tc_tid_subst_mono a no-op.
 fn params_measure(params_sl: Int, tparams_sl: Int, arg_tids: List[Int]) {
     if params_sl == -1 { return }
     let mut i = 0
@@ -5438,7 +5408,6 @@ fn params_measure(params_sl: Int, tparams_sl: Int, arg_tids: List[Int]) {
             if ptid >= 0 && tc_tid_kind(ptid) != TyKind.Unknown {
                 set_var_ty(pname, ptid)
             }
-            let _measured = sv_ty_or_flat_at(pname, "emit_fn_params.param", p)
         }
         i = i + 1
     }
@@ -5472,7 +5441,7 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
         emit_line("int64_t {c_var_name} = {next_var}.value;")
         push_scope()
         set_var(var_name, CT_INT, 1)
-        forin_measure_var(var_name, iter_node, node)
+        forin_measure_var(var_name, iter_node)
         emit_block(node_body(node))
         pop_scope()
         cg_indent = cg_indent - 1
@@ -5826,7 +5795,7 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                         set_var_result(var_name, if rok_ct >= 0 { rok_ct } else { CT_INT }, if rerr_ct >= 0 { rerr_ct } else { CT_STRING })
                     }
                 }
-                forin_measure_var(var_name, iter_node, node)
+                forin_measure_var(var_name, iter_node)
                 emit_block(node_body(node))
                 pop_scope()
                 cg_indent = cg_indent - 1
@@ -5890,7 +5859,7 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                         set_var(var_name, CT_VOID, 0)
                         set_var_struct(c_var_name, elem_struct)
                     }
-                    forin_measure_var(var_name, iter_node, node)
+                    forin_measure_var(var_name, iter_node)
                     emit_block(node_body(node))
                     pop_scope()
                     cg_indent = cg_indent - 1
@@ -5937,7 +5906,7 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                         }
                     }
                 }
-                forin_measure_var(var_name, iter_node, node)
+                forin_measure_var(var_name, iter_node)
                 emit_block(node_body(node))
                 pop_scope()
                 cg_indent = cg_indent - 1
@@ -6000,7 +5969,7 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                         set_set_elem_struct(var_name, nested_es)
                     }
                 }
-                forin_measure_var(var_name, iter_node, node)
+                forin_measure_var(var_name, iter_node)
                 emit_block(node_body(node))
                 pop_scope()
                 cg_indent = cg_indent - 1
@@ -6046,7 +6015,7 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                     var_enums.push(VarEnumEntry { name: var_name, enum_type: adapter_elem.name })
                 }
             }
-            forin_measure_var(var_name, iter_node, node)
+            forin_measure_var(var_name, iter_node)
             emit_block(node_body(node))
             pop_scope()
             cg_indent = cg_indent - 1
@@ -6078,7 +6047,7 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                 push_scope()
                 set_var(var_name, CT_INT, 0)
             }
-            forin_measure_var(var_name, iter_node, node)
+            forin_measure_var(var_name, iter_node)
             emit_block(node_body(node))
             pop_scope()
             cg_indent = cg_indent - 1
@@ -6096,7 +6065,7 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             emit_line("const char* {c_var_name} = {next_var}.value;")
             push_scope()
             set_var(var_name, CT_STRING, 0)
-            forin_measure_var(var_name, iter_node, node)
+            forin_measure_var(var_name, iter_node)
             emit_block(node_body(node))
             pop_scope()
             cg_indent = cg_indent - 1
@@ -6355,14 +6324,10 @@ fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Code
                     set_var_struct(binding, res_struct)
                 }
             }
-            // Stage 2 dual-write for the resource binder. Typecheck publishes the
-            // BINDER's tid on the WithResource node, so the ScopeVar the four paths above just
-            // built can READ its type instead of leaving `ty` unstamped. Advisory only while the
-            // flat fields still govern every emit decision.
+            // Stamps the resource binder's tid. Typecheck publishes the BINDER's tid on the
+            // WithResource node, so the ScopeVar the four paths above just built reads its full
+            // type instead of leaving `ty` unstamped.
             set_var_ty(binding, tc_lookup_node_tid(item))
-            // The tap that makes the stamp above countable. There is no `catch` binder to
-            // tap alongside it: Blink has no catch clause, effects and Result carry failure.
-            let _measured = sv_ty_or_flat_at(binding, "with_resource.bind", item)
         } else {
             // This clear is a BUG FIX rather than tidying. cg_handler_vtable_field is
             // set by emit_expr when the operand is a handler CONSTRUCTION, and it was read below

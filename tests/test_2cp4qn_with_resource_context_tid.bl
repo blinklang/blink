@@ -6,14 +6,10 @@
 //   typecheck.bl  tc_bind_with_resource  nr_define_typed(node_name(item), 0, res_tid)
 //   codegen_stmt  emit_with_block_core   set_var_ty(binding, tc_lookup_node_tid(item))
 //
-// The census for br 7xgbh6 surfaced this as 26 diverge rows reading `tid=Conn flat=Tx`, and it is the
-// only site in that census where the TID is the wrong side: codegen's flat fields carry the Context
-// (emit_bh_setup registers it at codegen_stmt.bl:4856), so the emitted C is right and the tid is not.
-//
-// It is NOT latent. The ticket called it harmless-until-Stage-3 and measuring it proved otherwise:
-// when the two types share a field name with different types, typecheck resolves the field against
-// the resource and accepts an annotation the value does not satisfy, so a variable annotated `Int`
-// holds a `Str` and prints it with no diagnostic and no cc error.
+// It is NOT latent: when the resource and the Context share a field name with different types,
+// typecheck resolves the field against the resource and accepts an annotation the value does not
+// satisfy, so a variable annotated `Int` holds a `Str` and prints it with no diagnostic and no cc
+// error.
 
 import std.fs
 import std.process.{ProcessResult}
@@ -57,9 +53,7 @@ fn main() {
 }
 "#
 
-// Control for the other with-block shape. A Closeable binder IS the resource, so this one must keep
-// reporting the resource's type — the fix must not swap the type for every with-block, only for the
-// handlers that rebind.
+// The other with-block shape: a plain Closeable resource, read and closed through its binder.
 let CLOSEABLE_SRC: Str = #"type Res { tag: Str }
 
 impl Closeable for Res {
@@ -75,9 +69,9 @@ fn main() {
 
 fn probe_path() -> Str { "build/2cp4qn_probe.bl" }
 
-fn run_tydiv(src: Str) -> ProcessResult ! FS.Delete {
+fn run_check(src: Str) -> ProcessResult ! FS.Delete {
     write_file(probe_path(), src)
-    let r = process_run("sh", ["-c", "env BLINK_TRACE_CHANNELS=tydiv build/blinkc {probe_path()} build/2cp4qn_probe.c 2>&1"])
+    let r = process_run("sh", ["-c", "build/blinkc {probe_path()} build/2cp4qn_probe.c 2>&1"])
     let _ = fs.delete(probe_path())
     r
 }
@@ -95,7 +89,7 @@ test "a wrong-typed read through the with-binder is rejected" {
         skip("build/blinkc is not present in this working tree")
         return
     }
-    let r = run_tydiv(MISCOMPILE_SRC)
+    let r = run_check(MISCOMPILE_SRC)
     assert_eq(r.exit_code, 0)
     // `ctx` is a Tx, so `ctx.tag` is a Str and the `Int` annotation cannot hold it. Before the fix
     // typecheck resolved `tag` on Conn, called it an Int, and let the program through.
@@ -118,24 +112,6 @@ test "the wrong-typed read does not reach a running binary" {
     assert(r.out.contains("error"))
 }
 
-test "the with-binder carries the BlockHandler Context tid, not the resource tid" {
-    if !have_blinkc() {
-        skip("build/blinkc is not present in this working tree")
-        return
-    }
-    let r = run_tydiv(CORRECT_SRC)
-    assert_eq(r.exit_code, 0)
-    assert(!r.out.contains("error["))
-    // The census row this ticket was filed from, verbatim. Its absence is the fix.
-    assert(!r.out.contains("var=ctx tid=Conn flat=Tx"))
-    // And the site must still be measured — a tap silenced by never stamping would also drop the row.
-    let mut saw_site = false
-    for line in r.out.split("\n") {
-        if line.contains("summary with_resource.bind") { saw_site = true }
-    }
-    assert(saw_site)
-}
-
 test "the Context-typed read compiles and runs" {
     if !have_cli() {
         skip("build/blink is not present in this working tree")
@@ -148,21 +124,19 @@ test "the Context-typed read compiles and runs" {
     assert(r.out.contains("t"))
 }
 
-test "a Closeable binder still reports the resource type" {
-    if !have_blinkc() {
-        skip("build/blinkc is not present in this working tree")
+// The control for the other with-block shape. A Closeable binder IS the resource, so the fix must
+// not swap the binder type for every with-block — only for the handlers that rebind. Reading the
+// resource's own field through the binder and running it end to end proves the resource case still
+// types and still closes.
+test "a Closeable with-binder compiles and runs" {
+    if !have_cli() {
+        skip("build/blink is not present in this working tree")
         return
     }
-    let r = run_tydiv(CLOSEABLE_SRC)
-    assert_eq(r.exit_code, 0)
-    assert(!r.out.contains("error["))
-    // Nothing rebinds here, so the two representations agree and no per-occurrence row is written.
-    // Rows are emitted for `missing` and `diverge` only, so this asserts on the summary.
-    let mut saw_clean = false
-    for line in r.out.split("\n") {
-        if line.contains("summary with_resource.bind") {
-            if line.contains("diverge=0") && line.contains("missing=0") { saw_clean = true }
-        }
-    }
-    assert(saw_clean)
+    write_file(probe_path(), CLOSEABLE_SRC)
+    let r = process_run("sh", ["-c", "build/blink run {probe_path()} 2>&1"])
+    let _ = fs.delete(probe_path())
+    assert(!r.out.contains("error"))
+    assert(r.out.contains("open A"))
+    assert(r.out.contains("close A"))
 }

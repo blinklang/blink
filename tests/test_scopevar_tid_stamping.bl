@@ -1,0 +1,153 @@
+// The ScopeVar tid-stamping seam (decisions/compiler-type-representation.md Q2, 5-0).
+// ScopeVar carries typecheck's authoritative tid alongside the legacy flat fields, and
+// these rows pin the tid channel's own behavior: a var starts unstamped, set_var_ty stamps
+// a tid get_var_ty reads back, an unknown name never fabricates a tid, and a stamped tid
+// SURVIVES later flat-field refinement and scope shadowing.
+//
+// WHY THE TID CANNOT COPY THE FLAT DEFAULT. get_var_ty answers -1 on a miss. Its retired
+// sibling get_var_tp answered a FABRICATED Int for a variable that does not exist; copying
+// that default into the tid seam would reintroduce, at the very first accessor, the lie the
+// tid channel exists to remove. -1 is "no tid here", a different claim from "this is an Int".
+//
+// WHY THE STAMP SURVIVES REFINEMENT. All flat-field mutation sites rebuild the ScopeVar and
+// carry `ty` across unchanged. Invalidating it on refinement ("the flat fields were just
+// refined, so the tid is stale") would blind the authoritative channel — the stamped tid is
+// the answer, not the flat fields it rode past.
+//
+// SETUP HAZARDS (inherited from tests/test_tc_tid_structural_accessors.bl):
+//  1. Base scalar tids (TYPE_INT et al) are private globals seeded during check_types, so
+//     they are harvested from a probe program keyed by rendered type string.
+//  2. Bare `import codegen_expr` is load-bearing even though `blink check` reports it
+//     UNUSED: codegen_types resolves several globals out of the MERGED program rather than
+//     importing them. Dropping it on the warning's advice fails at C compile, not at check.
+//  3. Scope state is process-global, so every row calls reset_scope_state() first rather
+//     than trusting test ordering.
+import std.fs
+import typecheck.{
+    check_types, tc_lookup_node_tid, tc_type_str,
+    make_list_type, make_map_type,
+}
+import codegen_types.{
+    CT_INT, CT_STRING, CT_LIST, CT_MAP,
+    set_var, set_var_ty, get_var_ty,
+    set_list_elem_type, set_map_types, push_scope, pop_scope, reset_scope_state,
+}
+import parser.{nodes}
+import compiler.{compile_to_program}
+import std.io
+import codegen_expr
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert_eq(got, want)
+}
+
+fn probe_src() -> Str {
+    "fn probe() -> Int \{\n    let a = 1\n    let b = \"s\"\n    let c = true\n    a\n}\n"
+}
+
+fn harvest_scalars() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/scopevar_tid_stamping_probe.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 {
+            m.insert(tc_type_str(tid), tid)
+        }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 {
+        io.println("FAIL: harvested map has no tid for rendered type string '{key}'")
+    }
+    assert(tid != -1)
+    tid
+}
+
+fn fresh() {
+    reset_scope_state()
+}
+
+test "a variable created through set_var starts unstamped" {
+    fresh()
+    set_var("x", CT_INT, 0)
+    assert_eq_int("unstamped ty", get_var_ty("x"), -1)
+}
+
+test "set_var_ty stamps a tid that get_var_ty reads back" {
+    fresh()
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    reset_scope_state()
+    set_var("x", CT_INT, 0)
+    set_var_ty("x", int_tid)
+    assert_eq_int("stamped ty", get_var_ty("x"), int_tid)
+}
+
+// get_var_ty answers -1 for a name that does not exist — "no tid here", NOT a fabricated
+// type. The whole tid channel depends on being able to tell "codegen has no tid" apart from
+// "this variable is an Int".
+test "get_var_ty answers -1 for an unknown name" {
+    fresh()
+    assert_eq_int("unknown name has no tid", get_var_ty("nope"), -1)
+}
+
+test "set_var_ty on an unknown name is a no-op, not a creation" {
+    fresh()
+    set_var_ty("ghost", 7)
+    assert_eq_int("ghost was not created", get_var_ty("ghost"), -1)
+}
+
+// The preservation invariant. set_list_elem_type rebuilds the ScopeVar to refine inner1;
+// the stamped tid must ride through. If it were invalidated here, every variable codegen
+// refines — most of them — would lose its authoritative tid.
+test "a stamped tid survives a later flat-field refinement" {
+    fresh()
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let list_int = make_list_type(int_tid)
+    reset_scope_state()
+    set_var("xs", CT_LIST, 0)
+    set_var_ty("xs", list_int)
+    set_list_elem_type("xs", CT_INT)
+    assert_eq_int("ty survived set_list_elem_type", get_var_ty("xs"), list_int)
+}
+
+test "a stamped tid survives set_map_types" {
+    fresh()
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    let map_tid = make_map_type(str_tid, int_tid)
+    reset_scope_state()
+    set_var("mm", CT_MAP, 0)
+    set_var_ty("mm", map_tid)
+    set_map_types("mm", CT_STRING, CT_INT, "")
+    assert_eq_int("ty survived set_map_types", get_var_ty("mm"), map_tid)
+}
+
+test "shadowed bindings carry independent tids" {
+    fresh()
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    reset_scope_state()
+    set_var("v", CT_INT, 0)
+    set_var_ty("v", int_tid)
+    push_scope()
+    set_var("v", CT_STRING, 0)
+    set_var_ty("v", str_tid)
+    assert_eq_int("inner binding's tid", get_var_ty("v"), str_tid)
+    pop_scope()
+    assert_eq_int("outer binding's tid restored", get_var_ty("v"), int_tid)
+}

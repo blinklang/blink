@@ -1,6 +1,6 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on}
 import std.str.{str_to_lower}
-import codegen_types.{impl_is_element_agnostic, is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, c_type_c_name, is_transparent_newtype, is_opaque_type, opaque_handle_c_name, resolve_effect_vtable, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_CLOSURE, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_HANDLER, CT_CHANNEL, CT_PTR, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_TEMPLATE, CT_FFI_SCOPE, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
+import codegen_types.{impl_is_element_agnostic, is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, c_type_c_name, is_transparent_newtype, is_opaque_type, opaque_handle_c_name, resolve_effect_vtable, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_CLOSURE, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_HANDLER, CT_CHANNEL, CT_PTR, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_TEMPLATE, CT_FFI_SCOPE, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
 import parser.{
     get_annotation, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
@@ -845,10 +845,9 @@ pub fn make_set_type(elem_type: Int) -> Int {
     ty_intern_simple(TyKind.Set, "Set", elem_type, -1)
 }
 
-// Read-only, and exported for one reason: the divergence instrument's unit tests have to be able to
-// BUILD an under-determined type to assert the Unknown bucket, and its three neighbouring
-// classes — erased-flat, known-tid, kind-mismatch — are already pinned by unit tests right beside it.
-// The global itself stays private; a test that could assign it could invalidate the pool.
+// Read-only, and exported so a unit test can BUILD an under-determined type — e.g. to assert
+// tc_tid_ct answers -1 for the Unknown kind. The global itself stays private; a test that could
+// assign it could invalidate the pool.
 pub fn tc_unknown_tid() -> Int { TYPE_UNKNOWN }
 
 // The two one-inner runtime carriers. Until these existed, `new_type` was never
@@ -15089,9 +15088,8 @@ fn tk_to_ct(kind: TyKind) -> Int {
         // closures landed (codegen_types.bl:36) and the flat side stamps it on every closure
         // binding, so this makes the two universes agree at the ROOT rather than adding knowledge.
         // It does NOT make a closure cell agree overall, and that is not a shortcoming of this arm:
-        // the flat universe holds a closure's signature as a C STRING, not as tp children, so
-        // ty_tp_same_shape's child loop still finds no slot for the return or the params. That cell
-        // is real and is retired by Stage 3 flipping authority onto the tid, not here.
+        // the flat universe holds a closure's signature as a C STRING, not as tp children, so the
+        // return and the params have no flat slot. The tid is the authority for those.
         TyKind.Fn => CT_CLOSURE
         TyKind.FfiScope => CT_FFI_SCOPE
         TyKind.I8 => CT_I8
@@ -15110,38 +15108,26 @@ fn tk_to_ct(kind: TyKind) -> Int {
     }
 }
 
-// ── Stage 2 divergence instrument ───────────────────────────────────
+// ── C-spelling divergence counter (ctypediv) ───────────────────────────
 //
-// WHY THIS LIVES IN typecheck.bl. The measurement needs to read BOTH type universes at
-// once: ty_pool (this file) and codegen's flat-derived tp_pool. typecheck imports
-// codegen_types, not the reverse, so this file is the only one below codegen_expr /
-// codegen_stmt / codegen_methods that can see both — and it already owns tk_to_ct, the
-// translation layer the comparison runs through. All three codegen modules import
-// typecheck, so a call site anywhere in codegen can reach sv_ty_or_flat. It leaves with
-// tk_to_ct in Stage 4.
+// A shared per-site counter of how a tid's C SPELLING compares to the C codegen actually
+// emitted at a site. ctype_probe_at feeds it; the ctypediv sweep (ty_divergence_dump) reads it.
 //
-// WHAT IT MEASURES. Per call site: how often codegen has no stamped tid at all (Missing),
-// how often it has one that the flat fields contradict (Diverge), and how often the two
-// agree. Missing is remaining Stage 2 instrumentation; Diverge is remaining Stage 3
-// lowering work. Pooling them into one number would conflate the two, so they are separate
-// buckets, and both are keyed by site because Stage 3's exit criterion — the counter at 0 —
-// has to be worked through site by site.
+// WHY IT LIVES IN typecheck.bl. It keys on c_type_from_tid, the tid speller this file owns, and
+// every codegen module (codegen_expr / codegen_stmt / codegen_methods) imports typecheck, so a
+// probe call anywhere in codegen can reach it.
 //
-// Unknown is the fourth answer, and it exists because the counter is an exit criterion.
-// Both representations can agree that a type is under-determined — a tid whose child is an unbound
-// metavar against a flat slot that was never filled — and there is nothing in either one to repair.
-// Counting that as Diverge made every site holding an under-determined type unable to read 0 no matter
-// how correct codegen was; counting it as Agree would answer the criterion by hiding the population.
-// It is agreement about ignorance, so it is its own bucket: visible, shrinkable by the metavar work,
-// and not confused with a representation defect.
-pub type TyDiv { Agree, Diverge, Missing, Unknown }
+// THREE BUCKETS, kept separate because they mean different things: Missing (the tid declines to
+// spell the type at all), Diverge (the tid spells a different C string than codegen emitted), and
+// Agree. A per-site zero is the exit criterion, so a QUERY must never create a row — an unreached
+// site reads 0 as "never measured", which a sweep must not confuse with "clean".
+pub type TyDiv { Agree, Diverge, Missing }
 
 type TyDivRow {
     site: Str
     agree: Int
     diverge: Int
     missing: Int
-    unknown: Int
 }
 // Deliberately NOT reset by reset_scope_state: that runs per function, and a per-function
 // counter cannot answer a whole-corpus sweep. Reset is explicit only.
@@ -15163,7 +15149,7 @@ fn ty_div_find(site: Str) -> Int {
 fn ty_div_bump(site: Str, b: TyDiv) {
     let idx = ty_div_find(site)
     if idx < 0 {
-        ty_div_rows.push(TyDivRow { site: site, agree: 0, diverge: 0, missing: 0, unknown: 0 })
+        ty_div_rows.push(TyDivRow { site: site, agree: 0, diverge: 0, missing: 0 })
         ty_div_bump(site, b)
         return
     }
@@ -15172,7 +15158,6 @@ fn ty_div_bump(site: Str, b: TyDiv) {
         TyDiv.Agree => { ty_div_rows.set(idx, TyDivRow { agree: r.agree + 1, ..r }) }
         TyDiv.Diverge => { ty_div_rows.set(idx, TyDivRow { diverge: r.diverge + 1, ..r }) }
         TyDiv.Missing => { ty_div_rows.set(idx, TyDivRow { missing: r.missing + 1, ..r }) }
-        TyDiv.Unknown => { ty_div_rows.set(idx, TyDivRow { unknown: r.unknown + 1, ..r }) }
     }
 }
 
@@ -15186,7 +15171,6 @@ pub fn ty_divergence_count(site: Str, b: TyDiv) -> Int {
         TyDiv.Agree => return r.agree
         TyDiv.Diverge => return r.diverge
         TyDiv.Missing => return r.missing
-        TyDiv.Unknown => return r.unknown
     }
 }
 
@@ -15205,30 +15189,23 @@ pub fn ty_divergence_rows() -> List[Str] {
     let mut i = 0
     while i < ty_div_rows.len() {
         let r = ty_div_rows.get(i).unwrap()
-        // `unknown=` is appended LAST so an older sweep stays diffable against a newer one:
-        // every script that reads this line keys on `<field>=` and ignores fields it does not know.
-        out.push("{r.site} agree={r.agree} diverge={r.diverge} missing={r.missing} unknown={r.unknown}")
+        out.push("{r.site} agree={r.agree} diverge={r.diverge} missing={r.missing}")
         i = i + 1
     }
     out
 }
 
-// ── Stage 3 instrument: the C SPELLING a tid answers vs the one codegen emitted ──────
+// ── ctypediv instrument: the C SPELLING a tid answers vs the one codegen emitted ──────
 //
-// The Stage 2 tydiv counter compares two type REPRESENTATIONS structurally. This compares
-// the two C STRINGS an emit site could print, which is the thing Stage 3 actually flips, and
-// it is a different measurement: a cell can agree structurally and still disagree on the
-// spelling (a mono stem, a Void placeholder, a Ptr pointee), and it can diverge structurally
-// while both paths happen to spell the same C (every container is one runtime pointer type).
-// Only the string comparison says whether flipping authority at a site changes the output.
+// This compares the two C STRINGS an emit site could print: what c_type_from_tid answers for
+// the authoritative tid, and what codegen actually emitted. Only the string comparison says
+// whether reading the type off the tid at a site changes the output — a cell can spell the
+// same C from either path (every container is one runtime pointer type) or disagree on the
+// spelling (a mono stem, a Void placeholder, a Ptr pointee).
 //
-// Rows land in the SAME table as tydiv, keyed by a `ctype.` site prefix, so the summary and
-// dump machinery is not duplicated. The bump is gated on the channel — unlike tydiv's, which
-// is unconditional — for one specific reason: a tydiv sweep's summary lines are the published
-// Stage 2 basis, and an unconditional bump here would add rows to it and make the two sweeps
-// no longer diffable. Gating keeps a `ctype.` row impossible unless someone is measuring
-// ctypediv, and a row still cannot exist without having been reached, which is the property
-// that lets a zero mean "clean" instead of "never ran".
+// Rows key on a `ctype.` site prefix. The bump is gated on the `ctypediv` channel, so a row
+// cannot exist unless someone is measuring, and a row still cannot exist without having been
+// reached — the property that lets a zero mean "clean" instead of "never ran".
 //
 // `emitted` is what the caller is ABOUT to print (or just printed) for this variable, and
 // `branch` names which arm of the caller's chain produced it — the cell map is only actionable
@@ -15251,118 +15228,17 @@ pub fn ctype_probe_at(tid: Int, branch: Str, name: Str, emitted: Str, node: Int)
     ctype_div_trace(site, "diverge", name, tid, spelled, emitted, node)
 }
 
-// Same field discipline as ty_div_trace: `at=` LAST, because both spellings can contain a
-// space (`const char*`, `const blink_Box*`) and every sweep script gets at the cell by
-// stripping the fixed trailing tokens (` at=…` and the harness's own ` file=…`).
+// `at=` LAST, because both spellings can contain a space (`const char*`, `const blink_Box*`)
+// and every sweep script gets at the cell by stripping the fixed trailing tokens (` at=…` and
+// the harness's own ` file=…`).
 fn ctype_div_trace(site: Str, bucket: Str, name: Str, tid: Int, spelled: Str, emitted: Str, node: Int) {
     let ty = if tid >= 0 { tc_type_str(tid) } else { "-" }
-    // `at_str` not `at` — same shadowing workaround ty_div_trace documents.
+    // `at_str`, not `at`, as a WORKAROUND: a local `let at` resolves to parser.bl's PRIVATE
+    // `fn at` and reports error[ImportNotSelected]. Rename back to `at` once that shadowing is fixed.
     let at_str = if node >= 0 { "{node_source_module(node)}:{node_line(node)}" } else { "-" }
     dbg_trace("ctypediv", "bucket={bucket} site={site} var={name} ty={ty} tidc={spelled} emitted={emitted} at={at_str}")
 }
 
-fn tp_cmp_child(tp: Int, i: Int) -> Int {
-    if i == 0 { return tp_get_child1(tp) }
-    if i == 1 { return tp_get_child2(tp) }
-    -1
-}
-
-// Structural, NOT string equality. The two universes render types with different
-// vocabularies (tp_display spells a closure `Fn(sig)`, tc_type_str spells a struct instance
-// with its mono stem), so comparing renderings would manufacture cells for pure spelling
-// differences and bury the real ones. Kinds are compared through tk_to_ct, the translation
-// that already exists.
-//
-// Returns 1 for "same shape". Every 0 is a real cell, by construction of three rules:
-//   * tp < 0 is an ERASED flat slot. Against a tid that named the type, that is a
-//     divergence, not a match — an honest -1 rather than a fabricated one does not
-//     make the erasure correct.
-//   * a kind with no CT at all (Tuple / Fn / Closure / Typevar / Unknown) collapses onto
-//     CT_VOID in tk_to_ct. Accepting that as equal to a CT_VOID tp would report AGREE for
-//     a tuple-typed variable the flat universe provably cannot describe, so the six are
-//     rejected up front and only a genuine Void matches CT_VOID.
-//   * Struct / Enum do not recurse. The flat universe has no slot for type arguments; what
-//     it has is the mono STEM baked into sname (`Box_Int`), so the args are compared there
-//     or nowhere. Recursing would report a cell for every non-generic struct.
-// The comparison's three answers. Differ is a cell to fix; Ignorance is the two
-// representations agreeing that a type is under-determined, which is not a cell and not a match.
-//
-// Ignorance propagates UPWARD but loses to Differ: `Set[?]` against `Set[?]` is Ignorance, `Map[Str, ?]`
-// against `Map[Int, ?]` is Differ. A parent cannot be cleaner than its worst child, and one honest
-// unknown child does not excuse a sibling that disagrees.
-type TyShape { Same, Differ, Ignorance }
-
-fn ty_tp_same_shape(tid0: Int, tp: Int, depth: Int) -> TyShape {
-    // A cycle cannot occur in an interned acyclic pool; the cap is against a corrupted
-    // slot, and it answers "same" so a defensive stop can never invent a cell.
-    if depth > 12 { return TyShape.Same }
-    let tid = tc_resolve(tid0)
-    if tid < 0 || tid >= ty_pool.len() { return TyShape.Differ }
-    let t = ty_pool.get(tid).unwrap()
-    let k = t.kind
-    // Ignorance is tested BEFORE the erased-slot guard below, and it is the only case in which a
-    // `tp < 0` is not a divergence. The order is the whole fix: an absent flat slot against a tid that
-    // NAMED the type stays a cell (an honest erasure, not a correct one), while an absent flat
-    // slot against a tid that is itself unknown is two representations saying the same thing.
-    //
-    // Keyed on the KIND being Unknown, deliberately not on tk_to_ct answering CT_VOID. Tuple and
-    // Typevar collapse onto CT_VOID too, and neither is ignorance: those types are determined and
-    // the flat universe simply cannot spell them, which is exactly the divergence this instrument
-    // exists to count. Fn clears the root guard below and diverges one level deeper instead, at
-    // the child loop, because the flat universe holds a closure's signature as a C string rather
-    // than as tp children. Same cell, honestly attributed. There is no TyKind.Closure — a closure
-    // IS TyKind.Fn.
-    if k == TyKind.Unknown {
-        if tp < 0 { return TyShape.Ignorance }
-        return TyShape.Differ
-    }
-    if tp < 0 { return TyShape.Differ }
-    let ct = tk_to_ct(k)
-    if ct == CT_VOID && k != TyKind.Void { return TyShape.Differ }
-    if ct != tp_get_kind(tp) { return TyShape.Differ }
-    if k == TyKind.Struct || k == TyKind.Enum {
-        let sn = tp_get_sname(tp)
-        if sn == t.name { return TyShape.Same }
-        let stem = tc_tid_struct_mono_name(tid)
-        if stem != "" && sn == stem { return TyShape.Same }
-        return TyShape.Differ
-    }
-    let n = tc_tid_child_count(tid)
-    let mut i = 0
-    let mut worst = TyShape.Same
-    while i < n {
-        let c = ty_tp_same_shape(tc_tid_child(tid, i), tp_cmp_child(tp, i), depth + 1)
-        match c {
-            TyShape.Differ => { return TyShape.Differ }
-            TyShape.Ignorance => { worst = TyShape.Ignorance }
-            TyShape.Same => { }
-        }
-        i = i + 1
-    }
-    worst
-}
-
-// The Stage 2 seam, and the one Stage 3 flips. Answers the authoritative tid for `name`, or
-// -1 when codegen never stamped one; a caller keeps its legacy flat path for -1 and reads
-// the tid otherwise. In Stage 2 no emit decision calls it, so the flat fields still govern
-// everything and the emitted C is unchanged — the instrument observes without perturbing.
-//
-// `site` is a stable label for the call site, not a message. It is the key the whole cell
-// map is grouped by.
-pub fn sv_ty_or_flat(name: Str, site: Str) -> Int {
-    sv_ty_or_flat_at(name, site, -1)
-}
-
-// Same seam, plus the AST node whose type is being decided, so the trace can name the
-// declaration instead of only the variable.
-//
-// Attribution, not decoration. A sweep row carries `var=` and the ENTRY file it was compiled
-// from, and neither identifies the `let`: every test compile re-emits the whole stdlib, so one
-// stdlib `let buf = ...` is blamed on ~90 different entry files, and short names (`r`, `p`,
-// `v`, `inner`) collide across modules besides. Ranking cells by grepping `let <var> =` out of
-// the entry file therefore mis-attributes most of the corpus — 501 of 767 (var, flat, file)
-// triples had no such line at all, and the ones that did were frequently a same-named variable
-// in an unrelated module. `at=` makes every remaining cell attributable from the sweep alone.
 // A module-level `let`'s tid, which does NOT live on its value node. The top-level walk types an
 // annotated binding through `resolve_type_ann` and only calls `infer_type` on a bare numeric or
 // interpolated-string initializer, so the node memo answers for the literal case alone. This map is
@@ -15375,32 +15251,6 @@ pub fn tc_top_level_let_tid(module_name: Str, name: Str) -> Int {
     }
 }
 
-pub fn sv_ty_or_flat_at(name: Str, site: Str, node: Int) -> Int {
-    let tid = get_var_ty(name)
-    if tid < 0 {
-        ty_div_bump(site, TyDiv.Missing)
-        ty_div_trace(site, "missing", name, -1, -1, node)
-        return -1
-    }
-    let tp = get_var_tp(name)
-    let shape = ty_tp_same_shape(tid, tp, 0)
-    match shape {
-        TyShape.Same => { ty_div_bump(site, TyDiv.Agree) }
-        // Traced as well as counted. The population is meant to be attributable — which declaration is
-        // under-determined, at which site — because that is how it gets shrunk. Silence would make it
-        // an unfalsifiable claim that the remaining rows are harmless.
-        TyShape.Ignorance => {
-            ty_div_bump(site, TyDiv.Unknown)
-            ty_div_trace(site, "unknown", name, tid, tp, node)
-        }
-        TyShape.Differ => {
-            ty_div_bump(site, TyDiv.Diverge)
-            ty_div_trace(site, "diverge", name, tid, tp, node)
-        }
-    }
-    tid
-}
-
 // The sweep's readout: one NDJSON-ish line per occurrence, carrying both renderings so the
 // cell map says WHAT diverged and not merely where. Off by default, so the instrument costs
 // a channel check per call when nobody is measuring.
@@ -15409,40 +15259,14 @@ pub fn sv_ty_or_flat_at(name: Str, site: Str, node: Int) -> Int {
 // instrument was not exercised", which is a different claim from "zero divergences", and
 // keeping the two distinguishable is the whole reason a sweep can be trusted.
 pub fn ty_divergence_dump() {
-    if dbg_channel_on("tydiv") == 0 && dbg_channel_on("ctypediv") == 0 { return }
+    if dbg_channel_on("ctypediv") == 0 { return }
     let rows = ty_divergence_rows()
     let mut i = 0
     while i < rows.len() {
         let row = rows.get(i).unwrap()
-        // A row goes out on the channel that produced it. dbg_trace gates on its own channel
-        // argument, so a `ctype.` row emitted as "tydiv" would be dropped by a ctypediv-only
-        // sweep — and a tydiv row emitted as "ctypediv" would silently join the other sweep's
-        // basis. The site prefix is the discriminator because the two instruments share one
-        // counter table (see ctype_probe_at).
-        if row.starts_with("ctype.") {
-            dbg_trace("ctypediv", "summary {row}")
-        } else {
-            dbg_trace("tydiv", "summary {row}")
-        }
+        dbg_trace("ctypediv", "summary {row}")
         i = i + 1
     }
-}
-
-// `at=` is LAST on the line on purpose: a flat spelling can contain spaces
-// (`Fn(int64_t(*)(const blink_closure*, int64_t))`), so every sweep script strips a fixed
-// trailing token to get at the cell. Two trailing tokens now — the harness appends ` file=`
-// after this — and both are suffixes, which keeps `sed 's| at=[^ ]* file=[^ ]*$||'` sufficient.
-// `-` when no node was threaded, so the field is always present and never has to be optional.
-fn ty_div_trace(site: Str, bucket: Str, name: Str, tid: Int, tp: Int, node: Int) {
-    if dbg_channel_on("tydiv") == 0 { return }
-    let spelled_tid = if tid >= 0 { tc_type_str(tid) } else { "-" }
-    let spelled_tp = if tp >= 0 { tp_display(tp) } else { "-" }
-    // Named `at_str`, not `at`, as a WORKAROUND: a local `let at` is not found at all —
-    // resolution reaches parser.bl:585's PRIVATE `fn at` and reports error[ImportNotSelected],
-    // suggesting you import a private item. Shadowing runs the wrong way. Rename this back to
-    // `at` once that shadowing bug is fixed.
-    let at_str = if node >= 0 { "{node_source_module(node)}:{node_line(node)}" } else { "-" }
-    dbg_trace("tydiv", "bucket={bucket} site={site} var={name} tid={spelled_tid} flat={spelled_tp} at={at_str}")
 }
 
 // Inner-type accessors over a tid. A Set[T]/Map[K,V] element reached through a
