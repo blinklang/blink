@@ -1,0 +1,88 @@
+// Phase 1.1 (tid-sole-authority): the MatchExpr arm loop stamps each arm's PATTERN binders,
+// but the MatchArm NODE itself carried no tid — so codegen had no node channel for an arm's
+// body-value type. Each arm node must be stamped with its body-value tid, reusing the
+// arm-body-value source the match's own type inference already computes (no re-inference).
+//
+// RED: before the fix every MatchArm node reads -1. The probe imports nothing, so `nodes`
+// holds only this program's arms — no stdlib matches inflate the count.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid}
+import parser.{nodes, node_kind}
+import ast.{NodeKind}
+import std.io
+import codegen_expr
+
+// use_prelude=0: no prelude modules are merged, so `nodes` holds ONLY this probe's arms.
+// A prelude-merged program mixes in library arms whose bodies diverge (return/break — no
+// body-value tid) and are therefore legitimately unstamped, which would defeat the
+// stamped-vs-total invariant. The probe uses only Int/Str/match, so it needs no prelude.
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 0)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn stamped_arm_count() -> Int {
+    let mut n = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.MatchArm {
+            if tc_lookup_node_tid(i) >= 0 { n = n + 1 }
+        }
+        i = i + 1
+    }
+    n
+}
+
+fn total_arm_count() -> Int {
+    let mut n = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.MatchArm { n = n + 1 }
+        i = i + 1
+    }
+    n
+}
+
+fn probe_src() -> Str {
+    let mut s = "fn label(n: Int) -> Str \{\n"
+    s = s.concat("    match n \{\n        0 => \"zero\"\n        other => \"other\"\n    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = label(1) }\n")
+    s
+}
+
+// A BRACED arm body (`Pat => { ... }`) makes the arm's body node a Block, not a bare value.
+// tc_arm_body_value hands back the Block; its own tid is never written for a nested arm block
+// in statement/tail position, so a naive tc_lookup_node_tid on it reads -1 and the stamp
+// silently no-ops. The stamp must resolve the Block's tail value instead.
+fn braced_probe_src() -> Str {
+    let mut s = "fn label(n: Int) -> Str \{\n"
+    s = s.concat("    match n \{\n        0 => \{ \"zero\" }\n        other => \{ \"other\" }\n    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = label(1) }\n")
+    s
+}
+
+test "every match arm node carries its body-value tid" {
+    typecheck_probe("build/match_arm_node_stamped.bl", probe_src())
+    let total = total_arm_count()
+    let stamped = stamped_arm_count()
+    if total < 2 { io.println("FAIL: probe produced {total} arms, expected 2 — test is not exercising the loop") }
+    assert(total >= 2)
+    if stamped < total { io.println("FAIL: {stamped}/{total} match arms stamped with a tid") }
+    assert(stamped == total)
+}
+
+test "match arms with braced block bodies also carry their body-value tid" {
+    typecheck_probe("build/match_arm_node_braced.bl", braced_probe_src())
+    let total = total_arm_count()
+    let stamped = stamped_arm_count()
+    if total < 2 { io.println("FAIL: braced probe produced {total} arms, expected 2") }
+    assert(total >= 2)
+    if stamped < total { io.println("FAIL: {stamped}/{total} braced match arms stamped with a tid") }
+    assert(stamped == total)
+}

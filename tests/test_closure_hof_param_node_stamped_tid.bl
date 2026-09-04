@@ -1,0 +1,61 @@
+// Phase 1.1 (tid-sole-authority): check_closure_body (the HOF path that binds a closure's
+// params to the element/accumulator type the HOF supplies) hard-coded only params 0 and 1,
+// and never stamped the param NODES. So a HOF closure's param node read -1, and a closure with
+// a param at index >= 2 lost that param entirely — it was never bound into scope and its type
+// never reached the closure's Fn tid. The fix loops over ALL params and stamps each node.
+//
+// RED: before the fix, a map/fold closure's param nodes read -1 (check_closure_body binds them
+// into scope by name but publishes nothing on the node; infer_type's Closure arm mints the Fn
+// tid but stamps no param node either).
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import std.io
+import codegen_expr
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn param_tid(pname: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.Param && node_name(i) == pname {
+            return tc_lookup_node_tid(i)
+        }
+        i = i + 1
+    }
+    -1
+}
+
+// map supplies one param (the element); fold supplies two (accumulator, element). Both reach
+// check_closure_body, so both param positions are the ones this fix binds and stamps.
+fn hof_src() -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let xs = [1, 2, 3]\n")
+    s = s.concat("    let ys = xs.map(fn(zzp: Int) -> Int \{ zzp + 1 })\n")
+    s = s.concat("    let sm = xs.fold(0, fn(zzacc: Int, zzelem: Int) -> Int \{ zzacc + zzelem })\n")
+    s = s.concat("    let _ = ys.len() + sm\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a map HOF closure's element param node carries a tid" {
+    typecheck_probe("build/closure_hof_map_param.bl", hof_src())
+    if param_tid("zzp") < 0 { io.println("FAIL: map closure param 'zzp' node tid is unset (-1)") }
+    assert(param_tid("zzp") >= 0)
+}
+
+test "a fold HOF closure's accumulator and element param nodes both carry a tid" {
+    typecheck_probe("build/closure_hof_fold_params.bl", hof_src())
+    if param_tid("zzacc") < 0 { io.println("FAIL: fold closure param 'zzacc' (index 0) node tid is unset (-1)") }
+    if param_tid("zzelem") < 0 { io.println("FAIL: fold closure param 'zzelem' (index 1) node tid is unset (-1)") }
+    assert(param_tid("zzacc") >= 0)
+    assert(param_tid("zzelem") >= 0)
+}

@@ -1,0 +1,69 @@
+// Phase 1.1 (tid-sole-authority): a simple `for x in xs` stored its loop variable as a bare
+// var_name string with NO binder node, so tc_lookup_node_tid had nothing to read for the
+// binder. The parser now builds an IdentPattern node for the simple binder and hangs it off a
+// dedicated `for_binder` field (NOT `elements`, which codegen keys on to mean "destructure a
+// tuple"), and typecheck stamps it with the element type.
+//
+// RED: before the fix, a simple ForIn node has for_binder == -1 (no node to stamp).
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid}
+import parser.{nodes, node_kind, node_var_name, node_for_binder}
+import ast.{NodeKind}
+import compile_test_helpers
+import std.io
+import codegen_expr
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn for_binder_tid(loop_var: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.ForIn && node_var_name(i) == loop_var {
+            let binder = node_for_binder(i)
+            if binder == -1 { return -2 }
+            return tc_lookup_node_tid(binder)
+        }
+        i = i + 1
+    }
+    -3
+}
+
+fn probe_src() -> Str {
+    #"import std.io
+fn main() {
+    let xs: List[Option[Int]] = [Some(1), None, Some(3)]
+    let mut sum = 0
+    for zzitem in xs {
+        match zzitem {
+            Some(v) => { sum = sum + v }
+            None => {}
+        }
+    }
+    io.println("sum={sum}")
+}
+"#
+}
+
+test "a simple for-in binder has a dedicated node that carries the element tid" {
+    typecheck_probe("build/for_in_binder_node.bl", probe_src())
+    let t = for_binder_tid("zzitem")
+    if t == -3 { io.println("FAIL: no ForIn node for 'zzitem' found") }
+    if t == -2 { io.println("FAIL: ForIn 'zzitem' has no for_binder node (still -1)") }
+    if t < 0 { io.println("FAIL: for_binder tid is {t}") }
+    assert(t >= 0)
+}
+
+// The destructuring `for (k, v)` path must keep using `elements`, untouched: its binder is the
+// tuple pattern there, so for_binder stays -1 and this simple-binder field never collides.
+test "iterating a list of Option elements still compiles and runs" {
+    let r = compile_test_helpers.compile_and_run(probe_src(), "for_in_binder_run")
+    if !r.out.contains("sum=4") { io.println("FAIL: got '{r.out}' / '{r.err_out}'") }
+    assert(r.out.contains("sum=4"))
+}

@@ -1,0 +1,67 @@
+// Phase 1.1 (tid-sole-authority): a module-level `let` binds its tid into the
+// tc_module_let_tid map but NOT onto the let NODE, so tc_lookup_node_tid(<module let>)
+// answered -1 and codegen had no node channel to read the declared type from. Local lets
+// stamp their node; module lets must too, from the same site that fills the map.
+//
+// The RED shape is a NON-literal initializer, which the top-level walk resolves only in its
+// second pass (after fn-name registration) through tc_register_module_let_tid. A bare literal
+// is already stamped by infer_type in the first pass, so `Col.Green` (a variant construction)
+// is the position that exposed the gap.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import std.io
+// codegen_types resolves globals out of the MERGED program it cannot import; a bare
+// `import codegen_expr` closes those back-references (see test_0rmamy / test_n90j7j).
+import codegen_expr
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn let_tid(vname: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.LetBinding && node_name(i) == vname {
+            return tc_lookup_node_tid(i)
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn probe_src() -> Str {
+    let mut s = "type Col \{ Red, Green }\n"
+    s = s.concat("fn score(c: Col) -> Int \{\n")
+    s = s.concat("    match c \{\n        Col.Red => 1\n        Col.Green => 2\n    }\n")
+    s = s.concat("}\n")
+    s = s.concat("let gzz_variant = Col.Green\n")
+    s = s.concat("let gzz_alias = gzz_variant\n")
+    s = s.concat("let gzz_lit = 7\n")
+    s = s.concat("fn main() \{ let _ = score(gzz_variant) + score(gzz_alias) + gzz_lit }\n")
+    s
+}
+
+test "a module-level let bound to a variant carries a tid on its node" {
+    typecheck_probe("build/toplevel_let_node_variant.bl", probe_src())
+    if let_tid("gzz_variant") < 0 { io.println("FAIL: gzz_variant node tid is unset (-1)") }
+    assert(let_tid("gzz_variant") >= 0)
+}
+
+test "a module-level let aliasing an earlier global carries a tid on its node" {
+    typecheck_probe("build/toplevel_let_node_alias.bl", probe_src())
+    if let_tid("gzz_alias") < 0 { io.println("FAIL: gzz_alias node tid is unset (-1)") }
+    assert(let_tid("gzz_alias") >= 0)
+}
+
+test "a module-level let bound to a literal carries a tid on its node" {
+    typecheck_probe("build/toplevel_let_node_lit.bl", probe_src())
+    if let_tid("gzz_lit") < 0 { io.println("FAIL: gzz_lit node tid is unset (-1)") }
+    assert(let_tid("gzz_lit") >= 0)
+}
