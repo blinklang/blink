@@ -3189,42 +3189,6 @@ pub fn set_list_elem_type(name: Str, elem_type: Int) {
     push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: elem_type, sname: "", ty: list_scalar_ty(elem_type) })
 }
 
-// the raw flat `inner1` element — a "was an element ever recorded?" signal, distinct
-// from `get_list_elem_type`'s flattened CT.
-//
-// The sole caller (stamp_binder_elems_from_tid_if_unset) guards on `>= 0` to skip a var
-// whose flat channel is already populated. A by-value element (struct/tuple/data enum)
-// records `inner1 == CT_VOID` (5, so `>= 0`) even when no tid was stamped, so raw reports
-// "recorded" and the guard declines to re-stamp. `get_list_elem_type` now reads the tid and
-// answers -1 when the tid is absent, so it would miss that flat-only record and re-stamp over
-// it — which is why this guard must stay on the raw flat field. Mirrors get_map_key_type_raw.
-//
-// Falls back to get_list_elem_type for a name that is not a scope var (a closure capture carries
-// a tid and no flat fields), because a missing answer must read as SET there: declining is a
-// no-op, while writing over a capture's real element would be a new silent-wrong.
-pub fn get_list_elem_type_raw(name: Str) -> Int {
-    let mut i = scope_vars.len() - 1
-    while i >= 0 {
-        let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_LIST {
-            return sv.inner1
-        }
-        i = i - 1
-    }
-    let alt = c_blink_name(name)
-    if alt != name {
-        let mut j = scope_vars.len() - 1
-        while j >= 0 {
-            let sv = scope_vars.get(j).unwrap()
-            if sv.name == alt && sv.ctype == CT_LIST {
-                return sv.inner1
-            }
-            j = j - 1
-        }
-    }
-    get_list_elem_type(name)
-}
-
 // The list element flattened to a single CT, read from the authoritative tid. A
 // plain (payload-less) enum element is stored by ordinal, so it flattens to CT_INT
 // the way the push side stamps it; a data enum and a tuple are by-value, so they
@@ -4098,7 +4062,10 @@ pub fn stamp_binder_elems_from_tid_if_unset(mtid: Int, var_name: Str) -> Bool {
         return true
     }
     if ct == CT_LIST {
-        if get_list_elem_type_raw(var_name) >= 0 { return false }
+        // "Already recorded" reads off the binder's own list tid, which pat_measure stamps
+        // one line before this runs, so the element (a scalar CT, or CT_VOID for a by-value
+        // tuple/enum) is already present; a struct/enum element rides the sname channel below.
+        if get_list_elem_type(var_name) >= 0 { return false }
         if get_list_elem_struct(var_name) != "" { return false }
         let st = stamp_list_elem_from_list_tid(mtid, var_name)
         return st.ct >= 0 || st.sname != ""
