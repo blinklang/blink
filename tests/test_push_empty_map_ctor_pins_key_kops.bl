@@ -1,0 +1,51 @@
+// A fresh empty-container ctor passed as an ARGUMENT to a concretely-typed param
+// carries its unbound α on the ARG side, not on the param. `check_arg_value` gated
+// its back-pin on a metavar in the EXPECTED type, so `l.push(Map())` into a
+// `List[Map[Int, Str]]` never unified the concrete `Map[Int, Str]` INTO the fresh
+// `Map()` — the ctor reached codegen with an unsolved key α and defaulted to
+// blink_kops_str for an Int key. 256 and 512 both carry a 0x00 low byte, so under
+// the string hasher they collide (the memory-corruption class this repo forbids).
+// The fix mirrors check_arg_shapes: when the ARGUMENT carries an unbound metavar and
+// the param is concrete, unify the param INTO the arg so the concrete param pins α.
+//
+// The kops assertion is the load-bearing one: a fix that gets the map's value type
+// right while leaving the key α unbound still falls to the string default. Asserting
+// blink_kops_i64 present AND blink_kops_str absent separates a correct fix from that
+// one; the runtime round-trip through the pushed map is the independent witness.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+fn src_mvce() -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let mut l: List[Map[Int, Str]] = []\n")
+    s = s.concat("    l.push(Map())\n")
+    s = s.concat("    l.get(0).unwrap().insert(256, \"lo\")\n")
+    s = s.concat("    l.get(0).unwrap().insert(512, \"hi\")\n")
+    s = s.concat("    assert_eq(l.get(0).unwrap().get(256).unwrap(), \"lo\")\n")
+    s = s.concat("    assert_eq(l.get(0).unwrap().get(512).unwrap(), \"hi\")\n")
+    s = s.concat("    assert_eq(l.get(0).unwrap().len(), 2)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "push(Map()) into List[Map[Int,Str]] pins the Int-key kops" {
+    let c = compile_test_helpers.compile_and_emit_c(src_mvce(), "push_empty_map_c")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "push arg / Int-key kops")
+    assert_lacks(c, "blink_kops_str", "push arg / must not hash an Int key as a string")
+}
+
+test "the pushed map round-trips 256 and 512 without collision" {
+    let r = compile_test_helpers.compile_and_run(src_mvce(), "push_empty_map_run")
+    assert_eq(r.exit_code, 0)
+}

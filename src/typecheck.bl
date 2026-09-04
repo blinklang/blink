@@ -2458,6 +2458,104 @@ fn tc_pin_tail_ret_generic(declared_ret: Int, inferred_ret: Int) {
     let _ = tc_unify(d, inferred_ret)
 }
 
+// The value node an if/match ARM BODY reduces to: a Block yields its tail value, a
+// short-form arm's ExprStmt unwraps to its value, anything else IS its own value.
+// -1 when the body bears no tail value. This is the node the return-only mint is keyed
+// on — instantiate_return_type records the mint on the arm-tail CALL, never on the
+// enclosing if/match — so the pin gate must reach it to see the mint at all.
+fn tc_arm_tail_value_node(body: Int) -> Int {
+    if body < 0 { return -1 }
+    let k = node_kind(body)
+    if k == NodeKind.Block {
+        let tail = tc_block_tail_stmt(body)
+        if tail == -1 { return -1 }
+        // A `return X` arm DIVERGES: its operand flows to the enclosing fn's return,
+        // not to this if/match's declared let/assign target, so it must not be pinned
+        // from that target. tc_block_tail_value would unwrap it to X; contribute no
+        // value instead, exactly as a bare `return` (value -1) already does.
+        if node_kind(tail) == NodeKind.Return { return -1 }
+        return tc_block_tail_value(tail)
+    }
+    if k == NodeKind.ExprStmt { return node_value(body) }
+    body
+}
+
+// Does EVERY arm tail of this if/match directly mint a return-only group (a bare
+// generic call like `mk()`), so a declared type can pin THROUGH the if/match by
+// pinning each arm the way it pins a single tail call? An arm tail that is itself an
+// if/match recurses. Any other tail — a concrete value, a non-minting generic call —
+// answers 0, which leaves the value on its existing merged/loud path. This is the gate
+// that keeps the adjacent shapes LOUD: a mono-calls-mono direct tail is not an
+// if/match and never reaches here, and a mixed if (one minting arm, one concrete)
+// answers 0 so no arm is silently half-pinned.
+fn tc_ifmatch_arms_all_ret_mint(val: Int) -> Int {
+    let k = node_kind(val)
+    if k == NodeKind.IfExpr {
+        let en = node_else_body(val)
+        if en == -1 { return 0 }
+        if tc_arm_body_ret_mint(node_then_body(val)) == 0 { return 0 }
+        if tc_arm_body_ret_mint(en) == 0 { return 0 }
+        return 1
+    }
+    if k == NodeKind.MatchExpr {
+        let arms = node_arms(val)
+        if arms == -1 { return 0 }
+        if sublist_length(arms) == 0 { return 0 }
+        let mut i = 0
+        while i < sublist_length(arms) {
+            if tc_arm_body_ret_mint(node_body(sublist_get(arms, i))) == 0 { return 0 }
+            i = i + 1
+        }
+        return 1
+    }
+    0
+}
+
+fn tc_arm_body_ret_mint(body: Int) -> Int {
+    let v = tc_arm_tail_value_node(body)
+    if v < 0 { return 0 }
+    let k = node_kind(v)
+    if k == NodeKind.IfExpr || k == NodeKind.MatchExpr { return tc_ifmatch_arms_all_ret_mint(v) }
+    tc_node_has_ret_mint(v)
+}
+
+// Pin `declared_tid` into EACH arm tail of an if/match whose arms all mint a
+// return-only group (gated by tc_ifmatch_arms_all_ret_mint at the call site). The
+// merged inferred type of an if/match over a generic STRUCT carries only ONE arm's
+// metavar (type_merge returns the first side for a struct), so pinning the merged type
+// would leave the other arms' ctors unbound. Pinning each arm tail directly binds
+// every arm's α from the one declared type, exactly as a single tail call would.
+fn tc_pin_declared_through_ifmatch(declared_tid: Int, val: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let k = node_kind(val)
+    if k == NodeKind.IfExpr {
+        tc_pin_declared_into_arm(declared_tid, node_then_body(val))
+        let en = node_else_body(val)
+        if en != -1 { tc_pin_declared_into_arm(declared_tid, en) }
+        return
+    }
+    if k == NodeKind.MatchExpr {
+        let arms = node_arms(val)
+        if arms == -1 { return }
+        let mut i = 0
+        while i < sublist_length(arms) {
+            tc_pin_declared_into_arm(declared_tid, node_body(sublist_get(arms, i)))
+            i = i + 1
+        }
+        return
+    }
+}
+
+fn tc_pin_declared_into_arm(declared_tid: Int, body: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let v = tc_arm_tail_value_node(body)
+    if v < 0 { return }
+    let k = node_kind(v)
+    if k == NodeKind.IfExpr || k == NodeKind.MatchExpr {
+        tc_pin_declared_through_ifmatch(declared_tid, v)
+        return
+    }
+    tc_pin_tail_ret_generic(declared_tid, infer_type(v))
+}
+
 // The declared-return check for one returned value, shared by NodeKind.Return and by
 // the implicit tail of a fn body. Two spellings of one program must give
 // one answer, and the only way to guarantee that is one implementation.
@@ -2493,14 +2591,23 @@ fn tc_pin_tail_ret_generic(declared_ret: Int, inferred_ret: Int) {
 //     stop, never a silent miscompile — and doing so would newly touch live rows
 //     in tests/test_y1n3ck_generic_return_tail_infer.bl and
 //     tests/test_e00ngd_fold_struct_accumulator.bl that no test asks for.
-fn tc_check_returned_value(val_t: Int, at_node: Int) ! TypeCheck.Report, Diag.Report {
+fn tc_check_returned_value(val_t: Int, at_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if tc_current_fn_ret == TYPE_VOID || tc_current_fn_ret == TYPE_UNKNOWN { return }
     if val_t == TYPE_UNKNOWN { return }
     if types_compatible(tc_current_fn_ret, val_t) == 0 {
         tc_error_at("return value type {type_to_str(val_t)} does not match function '{tc_current_fn_name}' return type {type_to_str(tc_current_fn_ret)}", at_node)
     } else {
         if tc_in_closure_depth == 0 {
-            tc_pin_tail_ret_generic(tc_current_fn_ret, val_t)
+            // A `return`-wrapped value carries the returned node one level down; an
+            // implicit tail passes the value node itself. When that value is an if/match
+            // whose every arm tail minted a return-only group, the declared return can
+            // only pin ONE arm through the merged type — see through and pin each arm.
+            let vnode = if node_kind(at_node) == NodeKind.Return { node_value(at_node) } else { at_node }
+            if vnode >= 0 && tc_ifmatch_arms_all_ret_mint(vnode) != 0 {
+                tc_pin_declared_through_ifmatch(tc_current_fn_ret, vnode)
+            } else {
+                tc_pin_tail_ret_generic(tc_current_fn_ret, val_t)
+            }
         }
     }
 }
@@ -2664,6 +2771,19 @@ fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) !
     let mut lit_to_int = 0
     if is_int_literal_node(value_node) != 0 && is_integer_type(resolve_alias_tid(expected_t)) != 0 {
         lit_to_int = 1
+    }
+    // Mirror of check_arg_shapes (the fnsig-backed sibling): the metavar can sit on
+    // the ARGUMENT side, not the expected side, when a fresh empty-container ctor is
+    // passed to a concrete param — `l.push(Map())` with `l: List[Map[Int, Str]]` has a
+    // concrete `Map[Int, Str]` expected and a `Map[α_k, α_v]` arg. Unify the concrete
+    // expected type INTO the fresh ctor so it PINS α (and its kops vtable) instead of
+    // discarding the constraint. Only when a metavar is actually present, so the
+    // fully-concrete path keeps its existing types_compatible semantics.
+    if lit_to_int == 0 && tc_tid_has_unbound_metavar(arg_t) != 0 {
+        if tc_unify(expected_t, arg_t) == 0 {
+            tc_error_at("argument {arg_idx + 1} of '{label}' expects {type_to_str(expected_t)}, got {type_to_str(arg_t)}", value_node)
+        }
+        return
     }
     if lit_to_int == 0 && types_compatible(arg_t, expected_t) == 0 {
         tc_error_at("argument {arg_idx + 1} of '{label}' expects {type_to_str(expected_t)}, got {type_to_str(arg_t)}", value_node)
@@ -13439,6 +13559,12 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 // ones: an admitted declared head, and an actually-unbound metavar in the value.
                 if tc_pin_ok_for_declared(val, declared_tid) != 0 {
                     tc_pin_tail_ret_generic(declared_tid, inferred_tid)
+                } else if tc_ifmatch_arms_all_ret_mint(val) != 0 {
+                    // The value is an if/match whose every arm tail minted a return-only
+                    // group. tc_pin_ok_for_declared reads the mint memo on the if/match
+                    // VALUE node, where nothing was minted, so it declines — see through
+                    // and pin the declared type into each arm tail instead.
+                    tc_pin_declared_through_ifmatch(declared_tid, val)
                 }
             }
         }
@@ -13553,6 +13679,11 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // carrier's other slot).
                     if kind == NodeKind.Assignment && tc_pin_ok_for_declared(val, target_t) != 0 {
                         tc_pin_tail_ret_generic(target_t, val_t)
+                    } else if kind == NodeKind.Assignment && tc_ifmatch_arms_all_ret_mint(val) != 0 {
+                        // Same see-through as the LetBinding arm: an if/match RHS whose
+                        // every arm tail minted a return-only group pins each arm tail
+                        // from the target type, not the (single-arm) merged value type.
+                        tc_pin_declared_through_ifmatch(target_t, val)
                     }
                 }
             }
@@ -17543,47 +17674,6 @@ fn tc_type_is_enum(tname: Str) -> Int {
     0
 }
 
-// For a `List[( .., <param_name>, .. )]` param, the 0-based slot of the list's
-// tuple ELEMENT that names `param_name` (`List[(Str, T)]` → T is slot 1), or -1
-// when the list element is not a tuple / does not name the param. Reads the
-// element annotation's Tuple children; the tuple annotation node's name is "Tuple".
-fn tc_list_tuple_elem_slot(p: Int, param_name: Str) -> Int {
-    let ta = node_type_ann(p)
-    if ta == -1 { return -1 }
-    let elems_sl = node_elements(ta)
-    if elems_sl == -1 || sublist_length(elems_sl) < 1 { return -1 }
-    let elem_ann = sublist_get(elems_sl, 0)
-    if node_name(elem_ann) != "Tuple" { return -1 }
-    let tup_sl = node_elements(elem_ann)
-    if tup_sl == -1 { return -1 }
-    let mut i = 0
-    while i < sublist_length(tup_sl) {
-        if node_name(sublist_get(tup_sl, i)) == param_name { return i }
-        i = i + 1
-    }
-    -1
-}
-
-// True when param `p`'s annotation is List[<param_name>].
-fn tc_list_param_elem_is(p: Int, param_name: Str) -> Bool {
-    let ta = node_type_ann(p)
-    if ta == -1 { return false }
-    let elems_sl = node_elements(ta)
-    if elems_sl == -1 || sublist_length(elems_sl) < 1 { return false }
-    node_name(sublist_get(elems_sl, 0)) == param_name
-}
-
-// 1 if param `p` is Map[<param_name>, _], 2 if Map[_, <param_name>], else 0.
-fn tc_map_param_binds(p: Int, param_name: Str) -> Int {
-    let ta = node_type_ann(p)
-    if ta == -1 { return 0 }
-    let elems_sl = node_elements(ta)
-    if elems_sl == -1 || sublist_length(elems_sl) < 2 { return 0 }
-    if node_name(sublist_get(elems_sl, 0)) == param_name { return 1 }
-    if node_name(sublist_get(elems_sl, 1)) == param_name { return 2 }
-    0
-}
-
 // The 0-based type-arg slot in generic-struct param `p`'s annotation
 // (`Box[T]` → 0, `Pair[A, B]` → A=0 / B=1) that names `param_name`, or -1.
 // A struct can mention the param in any slot; when several do, return the LAST
@@ -17600,18 +17690,6 @@ fn tc_struct_param_binds(p: Int, param_name: Str) -> Int {
         i = i + 1
     }
     which
-}
-
-// 1 if param `p` is Result[<param_name>, _] / Option[<param_name>], 2 if
-// Result[_, <param_name>], else 0.
-fn tc_compound_param_binds(p: Int, param_name: Str) -> Int {
-    let ta = node_type_ann(p)
-    if ta == -1 { return 0 }
-    let elems_sl = node_elements(ta)
-    if elems_sl == -1 || sublist_length(elems_sl) < 1 { return 0 }
-    if node_name(sublist_get(elems_sl, 0)) == param_name { return 1 }
-    if sublist_length(elems_sl) >= 2 && node_name(sublist_get(elems_sl, 1)) == param_name { return 2 }
-    0
 }
 
 // For a `Fn(...) -> R` param annotation: -2 if the return slot names the param,
@@ -17866,57 +17944,14 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int, binds
         }
         if ptype == param_name {
             return arg_tid
-        } else if ptype == "List" {
-            if arg_tid >= 0 && arg_tid < ty_pool.len() {
-                let arg_ty = ty_pool.get(arg_tid).unwrap()
-                if arg_ty.kind == TyKind.List && tc_list_param_elem_is(p, param_name) {
-                    return arg_ty.inner1
-                }
-                // `List[(.., T, ..)]` — the element is a TUPLE naming the param at a
-                // fixed slot (std.testing.for_each's `cases: List[(Str, T)]`). The arg's
-                // element tuple tid (arg_ty.inner1) carries the concrete slot type, so
-                // read the slot the annotation names. Mirrors infer_fn_type_args_from_
-                // types' List→Tuple arm (codegen_types.bl:3992), which extracts the same
-                // slot from the registered tuple entry. Only fires when the element tid
-                // is actually a tuple of the annotation's arity; anything else falls
-                // through to keep scanning (the closure param, etc.).
-                let lslot = tc_list_tuple_elem_slot(p, param_name)
-                if lslot >= 0 && arg_ty.kind == TyKind.List && arg_ty.inner1 >= 0 && arg_ty.inner1 < ty_pool.len() {
-                    let elem_ty = ty_pool.get(arg_ty.inner1).unwrap()
-                    if elem_ty.kind == TyKind.Tuple && lslot < elem_ty.params_count {
-                        let slot_tid = ty_param_list.get(elem_ty.params_start + lslot).unwrap()
-                        if tc_struct_slot_encodable(slot_tid) { return slot_tid }
-                    }
-                }
-                // A `List[<nested>]` whose element mentions the param but is not the
-                // bare element (`List[(Str, T)]`, `List[Box[T]]`) can't be read from
-                // the flat inner1 slot. The deleted seg twin returned None here, which
-                // was correct THERE only because a None aborted the all-or-nothing
-                // tc_mono_csv and handed the whole call to the string walker. No such
-                // walker exists now. This resolver is PER-SLOT, so a hard -1 would
-                // freeze the binding at this param
-                // even though a LATER param (`body: fn(T) -> Void`, the std.testing
-                // for_each shape) can bind it. Fall through instead — keep scanning; if
-                // no later param binds it the loop still returns -1 at the tail.
-            }
-        } else if ptype == "Map" {
-            if arg_tid >= 0 && arg_tid < ty_pool.len() {
-                let arg_ty = ty_pool.get(arg_tid).unwrap()
-                if arg_ty.kind == TyKind.Map {
-                    let which = tc_map_param_binds(p, param_name)
-                    if which == 1 { return arg_ty.inner1 }
-                    if which == 2 { return arg_ty.inner2 }
-                }
-            }
-        } else if ptype == "Result" || ptype == "Option" {
-            if arg_tid >= 0 && arg_tid < ty_pool.len() {
-                let arg_ty = ty_pool.get(arg_tid).unwrap()
-                if arg_ty.kind == TyKind.Result || arg_ty.kind == TyKind.Option {
-                    let which = tc_compound_param_binds(p, param_name)
-                    if which == 1 { return arg_ty.inner1 }
-                    if which == 2 { return arg_ty.inner2 }
-                }
-            }
+        // The container heads (List/Map/Result/Option, and the List[(.., T, ..)] tuple
+        // slot that std.testing.for_each is built on) carry no non-structural rule: each
+        // just reads the child the annotation names off the arg tid. tc_tparam_tid_from_ann
+        // at the tail does exactly that, walking the annotation tree against the tid's
+        // children in lockstep, so a per-head arm here would only duplicate it. The two
+        // arms that remain are the ones the tail walker CANNOT stand in for: Fn (a closure
+        // signature it deliberately declines) and struct/enum (whose hard -1 must stop a
+        // later param from adopting a slot the named one could not encode).
         } else if ptype == "Fn" {
             // `f: Fn(T) -> U` names a type-param in a closure position. The binding is
             // read off the literal's own annotations: the return_type string when the

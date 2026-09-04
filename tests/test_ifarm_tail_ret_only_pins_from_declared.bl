@@ -1,0 +1,166 @@
+// A return-only tparam minted in an if/match ARM TAIL was never pinned from the
+// declared type. Every pin site (annotated let, assignment target, fn return)
+// compared against the if/match VALUE node, but the return-only mint is keyed on the
+// inner arm-tail CALL node — so the pin gate read 0 and the α reached codegen unbound
+// (I0001, or a str-defaulted kops for an Int element). type_merge over a generic
+// STRUCT returns one arm's side, so pinning the merged type alone would still leave
+// the other arm's ctor unbound; the fix pins the declared type THROUGH the if/match
+// into EACH arm tail, exactly as a single tail call is pinned.
+//
+// The kops assertion is the load-bearing one: a fix that gets the mono NAME right
+// while leaving the Set's element α unbound falls to the str default. 256 and 512 both
+// carry a 0x00 low byte, so under the string hasher they collide. Asserting
+// blink_kops_i64 present AND blink_kops_str absent separates a correct fix from that
+// one; the runtime round-trip is the independent witness.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+fn rgt_decls() -> Str {
+    let mut s = "type RGT[T] \{ s: Set[T] }\n"
+    s = s.concat("fn mk[T]() -> RGT[T] \{ RGT \{ s: Set() } }\n")
+    s
+}
+
+fn round_trip(recv: Str) -> Str {
+    let mut s = "    {recv}.s.insert(256)\n"
+    s = s.concat("    {recv}.s.insert(512)\n")
+    s = s.concat("    assert_eq({recv}.s.len(), 2)\n")
+    s = s.concat("    assert({recv}.s.contains(256))\n")
+    s = s.concat("    assert({recv}.s.contains(512))\n")
+    s = s.concat("    assert(!{recv}.s.contains(257))\n")
+    s
+}
+
+// The ticket's own MVCE: the annotation is on the let, the under-determined value
+// arrives through an if whose BOTH arm tails mint a return-only tparam.
+fn src_let() -> Str {
+    let mut s = rgt_decls()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let c = true\n")
+    s = s.concat("    let e: RGT[Int] = if c \{ mk() } else \{ mk() }\n")
+    s = s.concat(round_trip("e"))
+    s = s.concat("}\n")
+    s
+}
+
+// An assignment target is the declared-type source for the same shape.
+fn src_assign() -> Str {
+    let mut s = rgt_decls()
+    s = s.concat("fn mkint() -> RGT[Int] \{ RGT \{ s: Set() } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut e = mkint()\n")
+    s = s.concat("    e = if 1 == 1 \{ mk() } else \{ mk() }\n")
+    s = s.concat(round_trip("e"))
+    s = s.concat("}\n")
+    s
+}
+
+// A function's declared return type pins the same way through an if-arm tail.
+fn src_return() -> Str {
+    let mut s = rgt_decls()
+    s = s.concat("fn pick(c: Bool) -> RGT[Int] \{ if c \{ mk() } else \{ mk() } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let e = pick(true)\n")
+    s = s.concat(round_trip("e"))
+    s = s.concat("}\n")
+    s
+}
+
+// A DIVERGING `return` arm must NOT be pinned from the enclosing let/assign target:
+// its operand flows to the FUNCTION return, not to `e`. The see-through unwraps a
+// block tail through Return (tc_block_tail_value), so without a diverging-arm guard
+// the assignment target's type arg is pinned into the return operand, minting the
+// wrong instance (RGT[Int] returned where the fn declares RGT[Str]) — C that gcc
+// rejects. mkret is only ever called where RGT[Str] is expected, so a correct
+// compile NEVER instantiates blink_mkret_0Int; its presence is the exact miscompile.
+fn src_assign_diverging_return_arm() -> Str {
+    let mut s = rgt_decls()
+    s = s.concat("fn mkret[T]() -> RGT[T] \{ RGT \{ s: Set() } }\n")
+    s = s.concat("fn mkint() -> RGT[Int] \{ RGT \{ s: Set() } }\n")
+    s = s.concat("fn f(c: Bool) -> RGT[Str] \{\n")
+    s = s.concat("    let mut e = mkint()\n")
+    s = s.concat("    e = if c \{ mk() } else \{ return mkret() }\n")
+    s = s.concat("    e.s.insert(7)\n")
+    s = s.concat("    mkret()\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let r = f(true) assert_eq(r.s.len(), 0) }\n")
+    s
+}
+
+// A match arm tail is the same seam as an if arm tail.
+fn src_match() -> Str {
+    let mut s = rgt_decls()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let n = 1\n")
+    s = s.concat("    let e: RGT[Int] = match n \{\n")
+    s = s.concat("        0 => mk()\n")
+    s = s.concat("        _ => mk()\n")
+    s = s.concat("    }\n")
+    s = s.concat(round_trip("e"))
+    s = s.concat("}\n")
+    s
+}
+
+test "an annotated let pins a return-only tparam through both if-arm tails" {
+    let c = compile_test_helpers.compile_and_emit_c(src_let(), "ifarm_let_c")
+    assert_lacks(c, "I0001", "let / no unsolved-typevar ICE")
+    assert_has(c, "blink_kops_i64", "let / Int-element kops")
+    assert_lacks(c, "blink_kops_str", "let / must not hash an Int element as a string")
+}
+
+test "the let-form if-arm round-trips 256 and 512 at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_let(), "ifarm_let_run")
+    assert_eq(r.exit_code, 0)
+}
+
+test "an assignment target pins a return-only tparam through both if-arm tails" {
+    let c = compile_test_helpers.compile_and_emit_c(src_assign(), "ifarm_assign_c")
+    assert_lacks(c, "I0001", "assign / no unsolved-typevar ICE")
+    assert_has(c, "blink_kops_i64", "assign / Int-element kops")
+    assert_lacks(c, "blink_kops_str", "assign / must not hash an Int element as a string")
+}
+
+test "the assign-form if-arm round-trips 256 and 512 at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_assign(), "ifarm_assign_run")
+    assert_eq(r.exit_code, 0)
+}
+
+test "a fn return type pins a return-only tparam through both if-arm tails" {
+    let c = compile_test_helpers.compile_and_emit_c(src_return(), "ifarm_return_c")
+    assert_lacks(c, "I0001", "return / no unsolved-typevar ICE")
+    assert_has(c, "blink_kops_i64", "return / Int-element kops")
+    assert_lacks(c, "blink_kops_str", "return / must not hash an Int element as a string")
+}
+
+test "the return-form if-arm round-trips 256 and 512 at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_return(), "ifarm_return_run")
+    assert_eq(r.exit_code, 0)
+}
+
+test "a diverging return arm is not pinned from the assignment target" {
+    let c = compile_test_helpers.compile_and_emit_c(src_assign_diverging_return_arm(), "ifarm_divret_c")
+    assert_lacks(c, "blink_mkret_0Int", "divret / return arm must not mint the target's instance")
+}
+
+test "an annotated let pins a return-only tparam through both match arm tails" {
+    let c = compile_test_helpers.compile_and_emit_c(src_match(), "ifarm_match_c")
+    assert_lacks(c, "I0001", "match / no unsolved-typevar ICE")
+    assert_has(c, "blink_kops_i64", "match / Int-element kops")
+    assert_lacks(c, "blink_kops_str", "match / must not hash an Int element as a string")
+}
+
+test "the match-form arm round-trips 256 and 512 at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_match(), "ifarm_match_run")
+    assert_eq(r.exit_code, 0)
+}

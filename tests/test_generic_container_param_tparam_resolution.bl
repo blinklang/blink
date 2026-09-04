@@ -1,0 +1,126 @@
+// Locks the type-param resolution of every GENERIC CONTAINER PARAMETER shape that the
+// mono lowering derives through tc_resolve_tparam_tid: a bare element (`List[T]`), the
+// two-slot carriers (`Map[K, V]`, `Result[T, E]`, `Option[T]`), and the tuple-slot form
+// (`List[(Str, T)]`) that std.testing.for_each is built on. Each generic fn is called
+// with a concrete argument, so the mono instance must carry the concrete inner type —
+// not an erased slot. The runtime round-trips are the independent witnesses.
+//
+// The tuple-slot row over a STRUCT element is the load-bearing one: for a non-scalar T
+// the closure-signature path cannot recover the element type, so only the tuple-slot
+// resolution can supply it. A regression there erases the slot and the program either
+// fails to compile or mis-monomorphizes — which the struct round-trip catches.
+
+import compile_test_helpers
+import std.io
+
+fn assert_ok(label: Str, src: Str) {
+    let r = compile_test_helpers.compile_and_run(src, label)
+    if r.exit_code != 0 {
+        io.println("FAIL: {label} — exit {r.exit_code}")
+        io.println(r.err_out)
+    }
+    assert_eq(r.exit_code, 0)
+}
+
+fn assert_c_lacks_erasure(label: Str, tag: Str, src: Str) {
+    let c = compile_test_helpers.compile_and_emit_c(src, tag)
+    if c.contains("_Void") { io.println("FAIL: {label} — erased slot (_Void) in emitted C") }
+    assert(!c.contains("_Void"))
+}
+
+// List[T] bare element.
+fn src_list_elem() -> Str {
+    let mut s = "fn count[T](l: List[T]) -> Int \{ l.len() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let xs: List[Int] = [1, 2, 3]\n")
+    s = s.concat("    assert_eq(count(xs), 3)\n")
+    s = s.concat("}\n")
+    s
+}
+
+// Map[K, V] both slots — K into a kops position witnesses the key type.
+fn src_map_slots() -> Str {
+    let mut s = "fn size[K, V](m: Map[K, V]) -> Int \{ m.len() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut m: Map[Int, Str] = Map()\n")
+    s = s.concat("    m.insert(256, \"lo\")\n")
+    s = s.concat("    m.insert(512, \"hi\")\n")
+    s = s.concat("    assert_eq(size(m), 2)\n")
+    s = s.concat("}\n")
+    s
+}
+
+// Result[T, E] two-slot carrier.
+fn src_result_slots() -> Str {
+    let mut s = "fn ok_of[T, E](r: Result[T, E]) -> Bool \{ r.is_ok() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let r: Result[Int, Str] = Ok(7)\n")
+    s = s.concat("    assert(ok_of(r))\n")
+    s = s.concat("}\n")
+    s
+}
+
+// Option[T] single-slot carrier.
+fn src_option_slot() -> Str {
+    let mut s = "fn some_of[T](x: Option[T]) -> Bool \{ x.is_some() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let x: Option[Int] = Some(9)\n")
+    s = s.concat("    assert(some_of(x))\n")
+    s = s.concat("}\n")
+    s
+}
+
+// List[(Str, T)] tuple-slot, SCALAR T — the for_each shape with an Int element.
+fn src_tuple_slot_scalar() -> Str {
+    let mut s = "fn labels_len[T](cases: List[(Str, T)]) -> Int \{ cases.len() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let cs: List[(Str, Int)] = [(\"a\", 1), (\"b\", 2)]\n")
+    s = s.concat("    assert_eq(labels_len(cs), 2)\n")
+    s = s.concat("}\n")
+    s
+}
+
+// List[(Str, T)] tuple-slot, STRUCT T — only the tuple-slot resolution can supply the
+// element type here; the closure-signature path is scalar-only.
+fn src_tuple_slot_struct() -> Str {
+    let mut s = "type Pt \{ x: Int, y: Int }\n"
+    s = s.concat("fn first_y[T](cases: List[(Str, T)], pick: fn(T) -> Int) -> Int \{\n")
+    s = s.concat("    pick(cases.get(0).unwrap().1)\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let cs: List[(Str, Pt)] = [(\"p\", Pt \{ x: 3, y: 512 })]\n")
+    s = s.concat("    let v = first_y(cs, fn(p: Pt) -> Int \{ p.y })\n")
+    s = s.concat("    assert_eq(v, 512)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "List[T] parameter resolves its element type through monomorphization" {
+    assert_ok("list_elem", src_list_elem())
+    assert_c_lacks_erasure("list_elem", "gcp_list_c", src_list_elem())
+}
+
+test "Map[K,V] parameter resolves both slots through monomorphization" {
+    assert_ok("map_slots", src_map_slots())
+    assert_c_lacks_erasure("map_slots", "gcp_map_c", src_map_slots())
+}
+
+test "Result[T,E] parameter resolves both slots through monomorphization" {
+    assert_ok("result_slots", src_result_slots())
+    assert_c_lacks_erasure("result_slots", "gcp_result_c", src_result_slots())
+}
+
+test "Option[T] parameter resolves its slot through monomorphization" {
+    assert_ok("option_slot", src_option_slot())
+    assert_c_lacks_erasure("option_slot", "gcp_option_c", src_option_slot())
+}
+
+test "List[(Str,T)] tuple-slot parameter resolves a scalar element" {
+    assert_ok("tuple_scalar", src_tuple_slot_scalar())
+    assert_c_lacks_erasure("tuple_scalar", "gcp_tscalar_c", src_tuple_slot_scalar())
+}
+
+test "List[(Str,T)] tuple-slot parameter resolves a struct element" {
+    assert_ok("tuple_struct", src_tuple_slot_struct())
+    assert_c_lacks_erasure("tuple_struct", "gcp_tstruct_c", src_tuple_slot_struct())
+}
