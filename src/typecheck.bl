@@ -1555,9 +1555,15 @@ fn fs_error_tid() -> Int {
     if named != -1 { return named }
     if fs_error_runtime_tid_cache != -1 { return fs_error_runtime_tid_cache }
     let tid = new_type(TyKind.Struct, "FsError")
-    sfield_pool.push(TcStructField { struct_id: tid, name: "op", type_id: lookup_named_type("FsOp") })
+    // op/code stay Unknown for a wildcard-only caller when std.fs is unimported (FsOp/Errno
+    // absent) — the deliberate fs.* surface behavior, with codegen the real enforcement (the
+    // carrier and FsError tag stay unqualified). Store the TYPE_UNKNOWN singleton, not the raw
+    // -1 that lookup_named_type returns on a miss, so no -1 escapes as a field-type answer.
+    let fsop_tid = lookup_named_type("FsOp")
+    let errno_tid = lookup_named_type("Errno")
+    sfield_pool.push(TcStructField { struct_id: tid, name: "op", type_id: if fsop_tid != -1 { fsop_tid } else { TYPE_UNKNOWN } })
     sfield_pool.push(TcStructField { struct_id: tid, name: "path", type_id: TYPE_STR })
-    sfield_pool.push(TcStructField { struct_id: tid, name: "code", type_id: lookup_named_type("Errno") })
+    sfield_pool.push(TcStructField { struct_id: tid, name: "code", type_id: if errno_tid != -1 { errno_tid } else { TYPE_UNKNOWN } })
     fs_error_runtime_tid_cache = tid
     tid
 }
@@ -3039,7 +3045,7 @@ fn check_closure_body(cls: Int, p0_t: Int, p1_t: Int) ! TypeCheck.Resolve, TypeC
             let decl = resolve_param_type(pi)
             let hint = if i == 0 { p0_t } else { if i == 1 { p1_t } else { TYPE_UNKNOWN } }
             let bind = if decl != TYPE_UNKNOWN { decl } else { hint }
-            nr_define_typed(node_name(pi), 0, bind)
+            nr_define_typed(node_name(pi), 0, bind, -1)
             tc_publish_node_tid(pi, bind)
             param_types.push(if bind >= 0 { bind } else { TYPE_UNKNOWN })
             i = i + 1
@@ -3116,7 +3122,7 @@ fn tc_check_handler_method(m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
                 let inst = tc_fnsig_param_instance_tid(ann, ptid)
                 if inst != -1 { ptid_final = inst }
             }
-            nr_define_typed(pname, 0, ptid_final)
+            nr_define_typed(pname, 0, ptid_final, -1)
             tc_publish_node_tid(p, ptid_final)
             i = i + 1
         }
@@ -3709,6 +3715,15 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
         return resolved
     }
 
+    // An unresolved name here is NOT necessarily an unknown type: resolve_type_parts is
+    // the shared low-level type-lowering path, reached for the trait `Self` (no concrete
+    // receiver yet), the primitive sentinels, and effect names used as phantom
+    // `Template[Effect]` arguments (types_compatible:9738 is normative that effects are
+    // not in the type namespace) — local AND imported. All of those legitimately lower to
+    // a typevar. Reporting UnknownType here would false-positive on every one of them, so
+    // the genuine "unknown type in a struct field / enum-variant payload / alias
+    // underlying" leak (the positions name-resolution does not walk) must be closed in the
+    // name-resolution walker with its full acceptance set, not in this fallback.
     make_typevar(name)
 }
 
@@ -7380,14 +7395,15 @@ fn nr_define_mut_at(name: Str, is_mut: Int, node: Int) ! Diag.Report {
     nr_scope_push_entry(name, is_mut, TYPE_UNKNOWN, node)
 }
 
-fn nr_define_typed(name: Str, is_mut: Int, tid: Int) {
-    nr_scope_push_entry(name, is_mut, tid, -1)
-}
-
-// Like nr_define_typed but records the binding's decl node: the E0301
-// region-boundary check needs a span to point the diagnostic at. Used by the
-// inference-pass LetBinding, whose `node` is the `let` itself.
-fn nr_define_typed_at(name: Str, is_mut: Int, tid: Int, node: Int) {
+// Records the binding's decl node so the E0301 region-boundary check has a span
+// to point the diagnostic at. Only a binder that is the SOLE materialization site
+// of a possibly-under-determined value passes a real node: a `let`, and a `for`
+// binder over an anonymous iterable. Every alias binder — a match-arm / struct /
+// as-pattern payload, a `for` over a named place — passes -1 to DEFER to the
+// binding that owns the value, because the region check runs mid-walk and would
+// otherwise false-reject a value a later statement pins. tc_report_under_determined
+// skips a -1.
+fn nr_define_typed(name: Str, is_mut: Int, tid: Int, node: Int) {
     nr_scope_push_entry(name, is_mut, tid, node)
 }
 
@@ -9670,8 +9686,14 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
     let b = tc_resolve(resolve_alias_tid(b0))
     if a == b { return 1 }
     if a == TYPE_UNKNOWN || b == TYPE_UNKNOWN { return 1 }
-    if a < 0 || b < 0 { return 1 }
-    if a >= ty_pool.len() || b >= ty_pool.len() { return 1 }
+    // A negative or out-of-range tid is never a legitimate "pending unification"
+    // state — unlike an unbound metavar (handled permissively below, and reported
+    // once at the region boundary as E0301), a -1 is an ABSENCE: a lookup that found
+    // nothing. Phase 1.2 closes the sources that minted it as an answer (Char.from_code_point
+    // err arm, qualified-ctor evfield miss). Failing closed here turns any that survive
+    // into an honest incompatibility instead of a silent accept.
+    if a < 0 || b < 0 { return 0 }
+    if a >= ty_pool.len() || b >= ty_pool.len() { return 0 }
     let ta = ty_pool.get(a).unwrap()
     let tb = ty_pool.get(b).unwrap()
     let ka = ta.kind
@@ -10964,10 +10986,23 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                                 if node_kind(carg) == NodeKind.NamedArg {
                                     cval = node_value(carg)
                                     cftid = lookup_evfield_type_by_name(cvar_idx, node_name(carg))
+                                    // A named arg that names no declared field of the variant
+                                    // looks up as -1. Report the miss as E0525 here; the value
+                                    // check below is skipped for -1 so a generic argument-mismatch
+                                    // is not piled on top of this field error.
+                                    if cftid == -1 {
+                                        diag_error_at("NoSuchField", NO_SUCH_FIELD, "variant '{method}' has no field '{node_name(carg)}'", carg, "use a declared field, or add the field to the variant")
+                                    }
                                 } else {
                                     cftid = lookup_evfield_type_by_index(cvar_idx, i)
                                 }
-                                check_arg_value("{cname}.{method}", i, cftid, cval)
+                                // Skip the value check when the field tid is unresolved (-1):
+                                // a named miss already reported E0525 above, and a positional
+                                // index past the variant's arity already reported the arity
+                                // error. Passing -1 down would add a redundant type mismatch.
+                                if cftid != -1 {
+                                    check_arg_value("{cname}.{method}", i, cftid, cval)
+                                }
                                 i = i + 1
                             }
                         }
@@ -11860,7 +11895,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
             if obj_name == "Char" {
                 if method == "from_code_point" {
-                    return make_result_type(TYPE_CHAR, lookup_named_type("ConversionError"))
+                    // ConversionError is a runtime/prelude builtin, normally already
+                    // registered — but lookup_named_type returns -1 if it is not, which
+                    // would intern Result[Char, -1], a -1 escaping as the carrier's err
+                    // arm. Mint-or-return through ensure_runtime_struct_type so the err
+                    // arm is a concrete Struct tid by construction.
+                    return make_result_type(TYPE_CHAR, ensure_runtime_struct_type("ConversionError", ["message", "source_type", "target_type"], [TYPE_STR, TYPE_STR, TYPE_STR]))
                 }
             }
             // A user-effect operation call — `db.query(..)`, `storage.get_names()`. The
@@ -12527,6 +12567,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         return fresh
     }
 
+    // Reached only by NodeKind.Unknown placeholder nodes — the value slot of a
+    // diverging match/if arm (`None => return 0`). TYPE_UNKNOWN is the sentinel the
+    // MatchExpr/IfExpr merge reads as "this arm contributes no value type, skip it",
+    // so it must stay TYPE_UNKNOWN here — a metavar would be merged in wrongly, and an
+    // ICE would fire on the many valid diverging-arm matches the compiler itself has.
     TYPE_UNKNOWN
 }
 
@@ -12820,7 +12865,7 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
             // identically; the format_params gate keeps a divergent raw-pointer lowering
             // (Bytes uint8_t*, Ptr inner) on the flat, so emitted C is unchanged.
             if is_ffi == 0 {
-                nr_define_typed(pname, 0, ptid_final)
+                nr_define_typed(pname, 0, ptid_final, -1)
             }
             // The same type, on the node, for codegen's dual-write. `ptid_final` is the
             // answer every check below uses; publishing it here is what lets the param's
@@ -13099,7 +13144,7 @@ fn tc_bind_with_resource(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     if item < tc_node_tid.len() && bind_tid != TYPE_UNKNOWN {
         tc_node_tid.set(item, bind_tid)
     }
-    nr_define_typed(node_name(item), 0, bind_tid)
+    nr_define_typed(node_name(item), 0, bind_tid, -1)
 }
 
 // Block branch genuinely save/restores scope via nr_push_scope/nr_pop_scope;
@@ -13419,7 +13464,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // Record the decl node so the E0301 region-boundary check has a span. Node is
         // used only for that diagnostic in this pass — unused-var warnings are off
         // during inference (nr_warn_unused == 0).
-        nr_define_typed_at(vname, is_mut, final_tid, node)
+        nr_define_typed(vname, is_mut, final_tid, node)
         if type_ann == -1 && type_str == "" && final_tid != TYPE_UNKNOWN {
             tc_hints.push(HintEntry { line: node_line(node), col: node_col(node), name: vname, type_str: type_to_str(final_tid), module: nr_current_module })
         }
@@ -13451,7 +13496,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                         tc_let_elem_tid = tc_tid_child(tc_let_tup, tpi)
                         if tc_let_elem_tid < 0 { tc_let_elem_tid = TYPE_UNKNOWN }
                     }
-                    nr_define_typed(node_name(tsp), is_mut, tc_let_elem_tid)
+                    nr_define_typed(node_name(tsp), is_mut, tc_let_elem_tid, -1)
                     tc_publish_node_tid(tsp, tc_let_elem_tid)
                     tpi = tpi + 1
                 }
@@ -13577,7 +13622,16 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 diag_error_at("NotIterable", NOT_ITERABLE, "cannot iterate over type '{type_to_str(iter_t)}' with a `for` loop -- only List, Set, Map, Range, Str, Bytes, Channel, and Iterator implement iteration", node_iterable(node), "iterate a List, Set, Map, Range, Str, Bytes, Channel, or Iterator instead")
             }
         }
-        nr_define_typed(node_var_name(node), 0, elem_t)
+        // Record the binder's decl node for the E0301 region-boundary check ONLY when the
+        // iterable is an anonymous value (`for x in []`): there the binder is the sole
+        // materialization site of an under-determined element, so it must be reported. When
+        // the iterable roots at a named binding, that binding owns the under-determination and
+        // is reported at ITS own scope-close — stamping the loop-body binder too would both
+        // duplicate that and, because the loop scope closes mid-walk, false-reject a value a
+        // LATER statement pins (`for x in xs { } xs.push(1)`). Same defer-to-the-named-place
+        // rule the match scrutinee check uses (tc_scrut_is_named_place).
+        let for_binder_decl = if tc_scrut_is_named_place(node_iterable(node)) != 0 { -1 } else { node_for_binder(node) }
+        nr_define_typed(node_var_name(node), 0, elem_t, for_binder_decl)
         // Stamp the simple `for x in xs` binder's dedicated IdentPattern node with the element
         // type. The destructuring path carries for_binder == -1 and is stamped through its tuple
         // pattern below instead.
@@ -13764,7 +13818,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 let p = sublist_get(params_sl, i)
                 let pname = node_name(p)
                 let ptid = resolve_param_type(p)
-                nr_define_typed(pname, 0, ptid)
+                nr_define_typed(pname, 0, ptid, -1)
                 i = i + 1
             }
         }
@@ -13977,7 +14031,7 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         let name = node_name(node)
         if name != "_" && is_variant_name(name) == 0 {
             if tc_pattern_binding_type >= 0 {
-                nr_define_typed(name, 0, tc_pattern_binding_type)
+                nr_define_typed(name, 0, tc_pattern_binding_type, -1)
                 // Publish on the LEAF node as well as into scope. Every arm above decomposes
                 // the binding hint one level — Option/Result unwrap, tuple element, list
                 // element, enum variant field — so by the time control reaches here the
@@ -14051,7 +14105,7 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
                         tc_check_pattern_types(fpat)
                     } else {
                         if sub_t >= 0 {
-                            nr_define_typed(fname, 0, sub_t)
+                            nr_define_typed(fname, 0, sub_t, -1)
                             tc_publish_node_tid(f, sub_t)
                         } else {
                             nr_define(fname)
@@ -14118,7 +14172,7 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
                     tc_check_pattern_types(fpat)
                 } else {
                     if sub_t >= 0 {
-                        nr_define_typed(fname, 0, sub_t)
+                        nr_define_typed(fname, 0, sub_t, -1)
                         tc_publish_node_tid(f, sub_t)
                     } else {
                         nr_define(fname)
@@ -14192,7 +14246,7 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         // alone, and the inner pattern then decomposes that same hint rather than one the binder
         // already consumed.
         if tc_pattern_binding_type >= 0 {
-            nr_define_typed(node_name(node), 0, tc_pattern_binding_type)
+            nr_define_typed(node_name(node), 0, tc_pattern_binding_type, -1)
             tc_publish_node_tid(node, tc_pattern_binding_type)
         } else {
             nr_define(node_name(node))
@@ -14456,7 +14510,7 @@ fn tc_check_test_block(tb: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
 // (`m.x`). The qualified key is kept only for a known tid; an UNKNOWN binding
 // still needs its bare name in scope so a body that reads it resolves.
 fn tc_register_module_let_tid(l: Int, l_tid: Int) {
-    nr_define_typed(node_name(l), node_is_mut(l), l_tid)
+    nr_define_typed(node_name(l), node_is_mut(l), l_tid, -1)
     tc_publish_node_tid(l, l_tid)
     let l_mod_key = node_module(l)
     if l_mod_key != "" && l_tid != TYPE_UNKNOWN {

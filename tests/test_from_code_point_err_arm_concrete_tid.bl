@@ -1,0 +1,58 @@
+// Phase 1.2 (tid-sole-authority): Char.from_code_point is answered inline
+// as Result[Char, ConversionError] by interning make_result_type(TYPE_CHAR,
+// lookup_named_type("ConversionError")). lookup_named_type returns -1 when the
+// name is not registered, which would intern Result[Char, -1] — a -1 escaping
+// typecheck as an ANSWER (an err arm that reads as a real type downstream).
+//
+// The guard mints the err arm through ensure_runtime_struct_type, so the carrier's
+// err arm is a concrete Struct tid by construction, never -1 / TYPE_UNKNOWN.
+// This probe reads the interned tid off the let node and asserts the err arm is a
+// concrete Struct. ConversionError is prelude-registered, so concreteness held even
+// before the guard; the probe pins the invariant unconditionally, not a bare -1 RED.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_tid_kind, tc_tid_child, TyKind}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import std.io
+// codegen_types resolves globals out of the MERGED program it cannot import; a bare
+// `import codegen_expr` closes those back-references, the shim the other in-process
+// typecheck-probe tests use.
+import codegen_expr
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn let_tid(vname: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.LetBinding && node_name(i) == vname {
+            return tc_lookup_node_tid(i)
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn probe_src() -> Str {
+    "fn main() \{ let cfc = Char.from_code_point(65) }\n"
+}
+
+test "Char.from_code_point interns a Result whose err arm is a concrete Struct tid" {
+    typecheck_probe("build/from_code_point_err_arm.bl", probe_src())
+    let carrier = let_tid("cfc")
+    if carrier < 0 { io.println("FAIL: cfc carrier tid is unset (-1)") }
+    assert(carrier >= 0)
+    if tc_tid_kind(carrier) != TyKind.Result { io.println("FAIL: cfc is not a Result carrier") }
+    assert(tc_tid_kind(carrier) == TyKind.Result)
+    let err_arm = tc_tid_child(carrier, 1)
+    if err_arm < 0 { io.println("FAIL: err arm tid is -1 (a -1 escaped as an answer)") }
+    assert(err_arm >= 0)
+    if tc_tid_kind(err_arm) != TyKind.Struct { io.println("FAIL: err arm is not a concrete Struct") }
+    assert(tc_tid_kind(err_arm) == TyKind.Struct)
+}

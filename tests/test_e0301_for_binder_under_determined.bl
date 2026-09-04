@@ -1,0 +1,54 @@
+// Phase 1.3 (tid-sole-authority): error[CannotInferType] (E0301) must fire for
+// EVERY binder class, not just the local `let`. The region-boundary check
+// (nr_pop_scope) only reported a binding that carried a decl node; all binder
+// classes but `let` registered their scope entry with node -1, so the report
+// early-out silently dropped them. A `for` binder over an empty inline list is
+// the clean exhibit: its element type is an unbound metavar the loop never pins,
+// and nothing downstream consumes it, so before the fix the program was accepted
+// with the binder left under-determined — the forbidden "silently complete an
+// open variable" the spec names a bug (sections/03_types.md §3.4, decision 8vcj2c).
+//
+// RED before the fix: each `for ... in []` program below produced no diagnostic.
+
+import compile_test_helpers
+
+// ── simple `for x in []` binder is under-determined → E0301 ──────────────────
+
+test "for binder over an empty inline list errors E0301" {
+    let src = "fn main() ! IO \{\n    for x in [] \{\n        skip\n    }\n}\n"
+    compile_test_helpers.expect_compile_error(src, "e0301_for_simple", "E0301")
+}
+
+// ── KNOWN GAP: destructuring `for (a, b) in []` still escapes E0301 ──────────
+// The tuple pattern cannot decompose a bare-metavar element, so the leaf binders
+// fall back to the TYPE_UNKNOWN singleton (excluded from the metavar check)
+// instead of inheriting a metavar. Closing it belongs to the metavar-vs-unknown
+// work, not to the node-stamping of Phase 1.3 F. This test pins the current
+// (accepting) behavior so the fix flips it deliberately, red→green.
+
+test "destructuring for binders over an empty inline list is not yet E0301 (known gap)" {
+    let src = "fn main() ! IO \{\n    for (a, b) in [] \{\n        skip\n    }\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0301_for_destr_gap", "E0301")
+}
+
+// ── controls: a determined iterable pins the binder (must NOT error) ─────────
+
+test "for binder over a determined list literal does not error" {
+    let src = "fn main() ! IO \{\n    for x in [1, 2, 3] \{\n        assert_eq(x, x)\n    }\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0301_for_lit_ok", "E0301")
+}
+
+test "for binder over an annotated empty list does not error" {
+    let src = "fn main() ! IO \{\n    let xs: List[Int] = []\n    for x in xs \{\n        assert_eq(x, x)\n    }\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0301_for_ann_ok", "E0301")
+}
+
+// ── timing: a NAMED iterable pinned by a LATER use must not false-error ──────
+// The loop scope closes mid-walk, so an eager check on the binder would reject a
+// value a later statement pins. The named-place guard defers to xs's own binding,
+// which `push` pins — so no E0301, mirroring the match-scrutinee later-pin rule.
+
+test "for binder over a named list pinned by a later push does not error" {
+    let src = "fn main() ! IO \{\n    let mut xs = []\n    for x in xs \{\n        assert_eq(x, x)\n    }\n    xs.push(1)\n    assert_eq(xs.len(), 1)\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0301_for_later_pin_ok", "E0301")
+}
