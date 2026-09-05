@@ -1,0 +1,393 @@
+import ast.{NodeKind, dbg_trace}
+import parser.{
+    node_kind, node_name, node_left, node_right, node_body, node_condition,
+    node_then_body, node_else_body, node_scrutinee, node_guard, node_value,
+    node_obj, node_iterable, node_params, node_args, node_stmts, node_arms,
+    node_fields, node_elements, node_handlers, node_type_params, node_target,
+    sublist_get, sublist_length, has_annotation,
+}
+import typecheck.{
+    make_tuple_type, tc_lookup_node_tid, tc_mono_binds_map, substitute_typevar_tid,
+    tc_tid_struct, tc_tid_struct_arg_count, tc_tid_struct_arg_tid,
+}
+import lowering.{tc_mono_tids_subst, tc_seg_from_tid}
+import codegen_types.{mono_phys_base, mangle_generic_name, cg_program_node}
+import codegen_methods.{mono_csv_from_arg_tids}
+
+// Phase 2.1 shadow monomorphization worklist (br g3sba0 / project qf1vzx).
+//
+// A tid-keyed monomorphization pass that runs AFTER typecheck and BEFORE codegen.
+// It reproduces the *worklist* half of codegen's emit-time instantiation (solve
+// generic-fn-call args, extract struct-literal instances, dedup, go transitive)
+// with NO emission, keyed on the interned tuple tid of an instance's arg tids
+// rather than the CSV string.
+//
+// SHADOW ONLY: nothing reads `mono_worklist` yet and codegen keeps its emit-time
+// instantiation unchanged. The authority does not switch until the 2.3 diff
+// harness (0kpmac) is empty. The pass runs zero times unless BLINK_MONO_SHADOW is
+// set, so normal and regen builds cannot be perturbed by it.
+
+pub type MonoShadowInstance {
+    base_decl_node: Int
+    arg_tids: List[Int]
+    inst_tid: Int
+    c_name: Str
+}
+
+pub let mut mono_worklist: List[MonoShadowInstance] = []
+
+// Composite dedup key "{base_decl_node}\t{inst_tid}". Keyed on the base too,
+// since two different bases can legitimately share an interned arg-tuple tid.
+let mut mono_seen: Map[Str, Int] = Map()
+
+// Per-instance mono context for the transitive drain, mirroring codegen's
+// cg_mono_tparams_sl / cg_mono_arg_tids globals. Set before each body walk;
+// the seed walks under the empty context (-1 / []).
+let mut mono_ctx_tparams_sl: Int = -1
+let mut mono_ctx_arg_tids: List[Int] = []
+
+// Base-decl lookups built from the program node directly, so the pass does not
+// depend on codegen's registries (empty at this point in the pipeline).
+let mut mono_generic_fn_by_name: Map[Str, Int] = Map()
+let mut mono_type_def_by_name: Map[Str, Int] = Map()
+
+pub fn run_mono_shadow(program: Int) {
+    // Gate: off unless BLINK_MONO_SHADOW is set. Read once, like BLINK_TRACE_CHANNELS.
+    let gate = env.var("BLINK_MONO_SHADOW") ?? ""
+    if gate == "" { return }
+
+    mono_worklist = []
+    mono_seen = Map()
+    mono_ctx_tparams_sl = -1
+    mono_ctx_arg_tids = []
+    mono_generic_fn_by_name = Map()
+    mono_type_def_by_name = Map()
+
+    // mono_phys_base -> find_type_def_node reads cg_program_node. Codegen sets it
+    // to the same node later; setting it here is idempotent and lets struct c_names
+    // resolve their type-def base.
+    cg_program_node = program
+
+    build_decl_maps(program)
+    seed(program)
+    drain()
+}
+
+fn build_decl_maps(program: Int) {
+    let fns_sl = node_params(program)
+    if fns_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl) {
+            let fn_node = sublist_get(fns_sl, i)
+            let tparams = node_type_params(fn_node)
+            // FFI-bridged generics share one type-erased symbol; codegen does not
+            // monomorphize them, so the shadow must not either.
+            if tparams != -1 && sublist_length(tparams) > 0 && has_annotation(fn_node, "ffi") == 0 {
+                mono_generic_fn_by_name.insert(node_name(fn_node), fn_node)
+            }
+            i = i + 1
+        }
+    }
+    let types_sl = node_fields(program)
+    if types_sl != -1 {
+        let mut ti = 0
+        while ti < sublist_length(types_sl) {
+            let td = sublist_get(types_sl, ti)
+            if node_kind(td) == NodeKind.TypeDef {
+                mono_type_def_by_name.insert(node_name(td), td)
+            }
+            ti = ti + 1
+        }
+    }
+}
+
+// Seed the worklist from every NON-generic top-level fn body plus every
+// module-level let, under the empty mono context. A generic template body is
+// walked only once it is instantiated (in the drain), exactly as codegen only
+// emits a generic body per instance.
+fn seed(program: Int) {
+    mono_ctx_tparams_sl = -1
+    mono_ctx_arg_tids = []
+
+    let fns_sl = node_params(program)
+    if fns_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl) {
+            let fn_node = sublist_get(fns_sl, i)
+            let tparams = node_type_params(fn_node)
+            let is_generic = if tparams != -1 && sublist_length(tparams) > 0 { 1 } else { 0 }
+            if is_generic == 0 {
+                walk(node_body(fn_node))
+            }
+            i = i + 1
+        }
+    }
+    let lets_sl = node_stmts(program)
+    if lets_sl != -1 {
+        let mut li = 0
+        while li < sublist_length(lets_sl) {
+            walk(sublist_get(lets_sl, li))
+            li = li + 1
+        }
+    }
+}
+
+// FIFO drain. Re-reads `.len()` each step so instances discovered while walking a
+// body are processed in the same pass (mirrors emit_mono_fns_from). Each instance
+// is walked once, under its own mono context.
+fn drain() {
+    let mut di = 0
+    while di < mono_worklist.len() {
+        let inst = mono_worklist.get(di).unwrap()
+        let base = inst.base_decl_node
+        if base != -1 {
+            mono_ctx_tparams_sl = node_type_params(base)
+            mono_ctx_arg_tids = inst.arg_tids
+            walk(node_body(base))
+        }
+        di = di + 1
+    }
+}
+
+fn handle_call(node: Int) {
+    let callee = node_left(node)
+    if callee == -1 { return }
+    if node_kind(callee) != NodeKind.Ident { return }
+    let name = node_name(callee)
+    match mono_generic_fn_by_name.get(name) {
+        Some(gfn_node) => {
+            let raw = tc_mono_tids_subst(node, gfn_node, mono_ctx_tparams_sl, mono_ctx_arg_tids)
+            if raw.len() == 0 { return }
+            enqueue(gfn_node, raw)
+        }
+        None => {}
+    }
+}
+
+fn handle_struct_lit(node: Int) {
+    let raw_tid = tc_lookup_node_tid(node)
+    if raw_tid < 0 { return }
+    // Substitute the enclosing generic's binders (empty at the seed level, so a
+    // no-op there) so a `Box { .. }` literal inside `mk[T]` resolves to Box[Int].
+    let binds = tc_mono_binds_map(mono_ctx_tparams_sl, mono_ctx_arg_tids)
+    let inst_tid = substitute_typevar_tid(raw_tid, binds)
+    let base = tc_tid_struct(inst_tid)
+    if base == "" { return }
+    let n = tc_tid_struct_arg_count(inst_tid)
+    if n == 0 { return }
+    let mut base_node = -1
+    match mono_type_def_by_name.get(base) {
+        Some(v) => { base_node = v }
+        None => {}
+    }
+    let mut arg_tids: List[Int] = []
+    let mut i = 0
+    while i < n {
+        arg_tids.push(tc_tid_struct_arg_tid(inst_tid, i))
+        i = i + 1
+    }
+    enqueue(base_node, arg_tids)
+}
+
+// Intern the arg tuple, skip un-encodable/unsolved instances and dedup hits, then
+// push the shadow instance and trace it.
+fn enqueue(base_decl_node: Int, arg_tids: List[Int]) {
+    // Bail on any unsolved (-1) or un-encodable slot, the way codegen's I0001
+    // chokepoint refuses to mint a phantom instance. tc_seg_from_tid is None
+    // exactly where a slot has no C spelling.
+    let mut i = 0
+    while i < arg_tids.len() {
+        let t = arg_tids.get(i).unwrap()
+        if t < 0 { return }
+        if tc_seg_from_tid(t).is_none() { return }
+        i = i + 1
+    }
+    let inst_tid = make_tuple_type(arg_tids)
+    let key = "{base_decl_node}\t{inst_tid}"
+    if mono_seen.contains_key(key) != 0 { return }
+
+    let base_name = if base_decl_node != -1 { node_name(base_decl_node) } else { "" }
+    let csv = mono_csv_from_arg_tids(arg_tids)
+    let c_name = mangle_generic_name(mono_phys_base(base_name), csv)
+
+    mono_worklist.push(MonoShadowInstance {
+        base_decl_node: base_decl_node,
+        arg_tids: arg_tids,
+        inst_tid: inst_tid,
+        c_name: c_name,
+    })
+    mono_seen.insert(key, 1)
+    dbg_trace("mono", "{base_name} {c_name} {csv} inst_tid={inst_tid}")
+}
+
+// Structural walk over an expression/statement tree, discovering generic-fn calls
+// and struct literals. Mirrors escape.bl's walk_expr dispatch. Does not descend
+// into callee bodies (those are enqueued and drained separately).
+fn walk(node: Int) {
+    if node == -1 { return }
+    let kind = node_kind(node)
+
+    if kind == NodeKind.Call {
+        handle_call(node)
+        walk(node_left(node))
+        walk_list(node_args(node))
+        return
+    }
+    if kind == NodeKind.StructLit {
+        handle_struct_lit(node)
+        walk_fields(node_fields(node))
+        return
+    }
+    if kind == NodeKind.MethodCall {
+        walk(node_obj(node))
+        walk_list(node_args(node))
+        return
+    }
+    if kind == NodeKind.Assignment {
+        walk(node_value(node))
+        walk_assign_target(node)
+        return
+    }
+    if kind == NodeKind.CompoundAssign {
+        walk(node_value(node))
+        walk_assign_target(node)
+        return
+    }
+    if kind == NodeKind.Closure {
+        walk(node_body(node))
+        return
+    }
+    if kind == NodeKind.BinOp {
+        walk(node_left(node))
+        walk(node_right(node))
+        return
+    }
+    if kind == NodeKind.UnaryOp {
+        walk(node_left(node))
+        return
+    }
+    if kind == NodeKind.IfExpr {
+        walk(node_condition(node))
+        walk(node_then_body(node))
+        walk(node_else_body(node))
+        return
+    }
+    if kind == NodeKind.MatchExpr {
+        walk(node_scrutinee(node))
+        let arms_sl = node_arms(node)
+        if arms_sl != -1 {
+            let mut ai = 0
+            while ai < sublist_length(arms_sl) {
+                let arm = sublist_get(arms_sl, ai)
+                walk(node_guard(arm))
+                walk(node_body(arm))
+                ai = ai + 1
+            }
+        }
+        return
+    }
+    if kind == NodeKind.Block {
+        walk_list(node_stmts(node))
+        return
+    }
+    if kind == NodeKind.LetBinding {
+        walk(node_value(node))
+        return
+    }
+    if kind == NodeKind.ExprStmt {
+        walk(node_value(node))
+        return
+    }
+    if kind == NodeKind.Return {
+        walk(node_value(node))
+        return
+    }
+    if kind == NodeKind.ForIn {
+        walk(node_iterable(node))
+        walk(node_body(node))
+        return
+    }
+    if kind == NodeKind.WhileLoop {
+        walk(node_condition(node))
+        walk(node_body(node))
+        return
+    }
+    if kind == NodeKind.LoopExpr {
+        walk(node_body(node))
+        return
+    }
+    if kind == NodeKind.FieldAccess {
+        walk(node_obj(node))
+        return
+    }
+    if kind == NodeKind.IndexExpr {
+        walk(node_obj(node))
+        walk(node_right(node))
+        return
+    }
+    if kind == NodeKind.TupleLit {
+        walk_list(node_elements(node))
+        return
+    }
+    if kind == NodeKind.ListLit {
+        walk_list(node_elements(node))
+        return
+    }
+    if kind == NodeKind.InterpString {
+        walk_list(node_elements(node))
+        return
+    }
+    if kind == NodeKind.RangeLit {
+        walk(node_left(node))
+        walk(node_right(node))
+        return
+    }
+    if kind == NodeKind.WithBlock {
+        let handlers_sl = node_handlers(node)
+        if handlers_sl != -1 {
+            let mut hi = 0
+            while hi < sublist_length(handlers_sl) {
+                walk(sublist_get(handlers_sl, hi))
+                hi = hi + 1
+            }
+        }
+        walk(node_body(node))
+        return
+    }
+    if kind == NodeKind.WithResource {
+        // `with EXPR as name`: the resource initializer lives on node_value and
+        // may itself be a generic call or a struct literal.
+        walk(node_value(node))
+        return
+    }
+}
+
+fn walk_assign_target(node: Int) {
+    // An lvalue like `make_box[Int]().field = x` or `container[i].field = x`
+    // carries a generic call/struct-lit in the target's object subtree; the RHS
+    // walk alone misses it (mirrors escape.bl walk_assignment).
+    let target = node_target(node)
+    if target == -1 { return }
+    let tk = node_kind(target)
+    if tk == NodeKind.FieldAccess || tk == NodeKind.IndexExpr {
+        walk(node_obj(target))
+    }
+}
+
+fn walk_list(sl: Int) {
+    if sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        walk(sublist_get(sl, i))
+        i = i + 1
+    }
+}
+
+fn walk_fields(sl: Int) {
+    if sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        walk(node_value(sublist_get(sl, i)))
+        i = i + 1
+    }
+}
