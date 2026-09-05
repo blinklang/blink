@@ -1,6 +1,6 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on}
 import std.str.{str_to_lower}
-import codegen_types.{impl_is_element_agnostic, is_intrinsic_method, strip_module_qualifier, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_CLOSURE, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_HANDLER, CT_CHANNEL, CT_PTR, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_TEMPLATE, CT_FFI_SCOPE, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
+import codegen_types.{impl_is_element_agnostic, is_intrinsic_method, strip_module_qualifier}
 import parser.{
     get_annotation, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
@@ -429,7 +429,7 @@ fn tc_type_id_has_display(tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     if k == TyKind.Unknown || k == TyKind.Typevar { return 0 }
     if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Char || k == TyKind.Str { return 1 }
     // Sized integers are Display-able scalars — interpolation lowers them to
-    // %lld/%llu just like Int (codegen_expr emit_interp_string CT_I8..CT_U64).
+    // %lld/%llu just like Int (codegen_expr emit_interp_string, the i8..u64 integer widths).
     if is_sized_int(k) != 0 { return 1 }
     // Tuples derive Display structurally when every element is Display (spec
     // §3.6); codegen renders them "(e0, e1, ...)". An empty tuple has nothing
@@ -1015,7 +1015,7 @@ pub fn tc_unknown_tid() -> Int { TYPE_UNKNOWN }
 // The two one-inner runtime carriers. Until these existed, `new_type` was never
 // called with TyKind.Handle or TyKind.Channel, so an annotation naming one fell through
 // resolve_type_ann to `make_typevar(name)` — a bare typevar wearing the type's name. Codegen
-// meanwhile had CT_HANDLE / CT_CHANNEL and carried the element in its flat fields, which made
+// meanwhile had the Handle/Channel C type and carried the element in its flat fields, which made
 // the flat universe STRICTLY more informative than the tid for these and would have left the
 // Stage 3 divergence counter permanently nonzero at those sites with nothing to read. It also
 // broke a real program: `iter_tk == TyKind.Channel` is how tc_check_body recognises a channel
@@ -1027,7 +1027,7 @@ pub fn tc_unknown_tid() -> Int { TYPE_UNKNOWN }
 //
 // The other two unconstructible kinds resolve differently. TyKind.Closure is DELETED, not
 // constructed: TyKind.Fn is already constructed (make_fn_type), covers the same surface (a
-// closure's declared type is spelled `Fn(..) -> T`), and tk_to_ct collapsed both to CT_VOID
+// closure's declared type is spelled `Fn(..) -> T`), and tk_to_ct collapsed both to void
 // anyway. TyKind.Iterator is DEFERRED on a spec question — see the note on its
 // tc_tid_child_count arm.
 //
@@ -1140,7 +1140,7 @@ pub fn make_template_type(context: Int) -> Int {
     ty_intern_simple(TyKind.Template, "Template", context, -1)
 }
 
-// The value `ffi.scope()` produces. Codegen has carried CT_FFI_SCOPE
+// The value `ffi.scope()` produces. Codegen has carried the ffi-scope C type
 // (codegen_types.bl:48) and a four-method emitter block (codegen_methods.bl:4886) since the
 // FFI surface landed; typecheck had no kind for the scope object at all, so `with ffi.scope()
 // as scope` bound the binder at TYPE_UNKNOWN and the RECEIVER was permissive before any
@@ -1758,7 +1758,7 @@ fn resolve_type_name(name: Str) -> Int ! TypeCheck.Resolve {
     if name == "U64" { return TYPE_U64 }
     if name == "Char" { return TYPE_CHAR }
     // A builtin with no Blink declaration anywhere: `StringBuilder` names codegen's
-    // CT_STRINGBUILDER / `blink_sb*` and is listed by is_primitive_type, but lib/std/sb.bl
+    // StringBuilder C type / `blink_sb*` and is listed by is_primitive_type, but lib/std/sb.bl
     // only declares FUNCTIONS over it. Without this arm every `sb: StringBuilder` param
     // and `-> StringBuilder` return resolved to -1 and inference fell back to Unknown.
     if name == "StringBuilder" { return type_stringbuilder() }
@@ -2552,13 +2552,13 @@ fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, self_offset: Int) ! Ty
 // `fn mkmap() -> Map[Int, Str] { Map() }` has the identical shape one
 // level up: the bare `Map()` ctor mints `Map[?a, ?b]` and nothing pins it either —
 // but there is no struct-lit mono chokepoint to catch it, so it silently reaches
-// codegen's CT_STRING kops default instead of an ICE.
+// codegen's string kops default instead of an ICE.
 //
 // The pin is an IN-PLACE tc_unify, not a hint seed. That distinction is the whole
 // fix: the metavar integers in the instance's arg list are the SAME integers the
 // field's `Map[?a, ?b]` holds, so binding a:=Int solves the mono NAME and the
 // ctor's kops vtable from one constraint. Seeding tc_construct_hint instead would
-// fix only the name and leave resolve_ctor_kops_elem on its CT_STRING default —
+// fix only the name and leave resolve_ctor_kops_elem on its string default —
 // blink_kops_str for an Int key, trading a loud ICE for a silent hash collision.
 //
 // tc_pin_admits_declared is the gate; each branch is load-bearing:
@@ -4443,7 +4443,7 @@ fn tc_struct_lit_instance_tid(stid: Int, sname: Str, node: Int) -> Int ! TypeChe
     // its param to TYPE_UNKNOWN (make_map_type(TYPE_UNKNOWN,..)), and an instance
     // whose args are all unknown carries no more information than the bare tid.
     // Minting it would produce a `GKV[?,?]` whose field access substitutes to a
-    // CT_VOID inner and defeats codegen's erased-default recovery. A
+    // void inner and defeats codegen's erased-default recovery. A
     // MIXED instance (one arg concrete, one unknown) still mints — the arg-list
     // builder keeps the unknown arg, and the field-access consumer skips it.
     let mut has_concrete = 0
@@ -5225,7 +5225,7 @@ fn tc_check_derive_hash_eq_ord() ! Diag.Report {
 
 // Is a bare scalar type name one the to_json emitter renders as a real JSON leaf
 // (not "null")? Only these four reach a faithful emitter branch: Int / I64 →
-// int_to_str (both lower to CT_INT), Float → float_to_str, Bool → true/false,
+// int_to_str (both lower to int), Float → float_to_str, Bool → true/false,
 // Str → escaped string. Char, the sized ints (I8/I16/I32, U8/U16/U32/U64) and
 // F32/F64 keep distinct CTs that fall through the emitter's else arm to the
 // literal "null", so they are NOT accepted here — this must not reuse the
@@ -5264,7 +5264,7 @@ fn tc_serialize_list_elem_ok(ann: Int) -> Int {
 
 // A struct-field type emit_field_serialize renders faithfully: a scalar leaf, a
 // List of a faithful element, or a user struct/enum that derives Serialize (its
-// CT_VOID + has_derive_method arm covers both struct and enum fields).
+// void + has_derive_method arm covers both struct and enum fields).
 fn tc_serialize_struct_field_ok(ann: Int) -> Int {
     let name = node_name(ann)
     if tc_serialize_scalar_ok(name) != 0 { return 1 }
@@ -10829,7 +10829,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     // (sections/04_effects.md:1751) and it writes the element type down at the construction
     // site; the parser already keeps it (parser.bl:2885 stores `type_params`). Without this arm
     // the explicitly spelled type would be discarded and consumption seams would fall back to
-    // a fabricated CT_INT element.
+    // a fabricated int element.
     //
     // The type argument is read by NAME, not through resolve_type_ann: parse_type_params
     // builds a NodeKind.TypeParam whose `elements` are trait BOUNDS (parser.bl:1104-1113),
@@ -11598,7 +11598,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // `join` must resolve to a real type, not TYPE_UNKNOWN: it is in
             // is_builtin_method (:6299) — which is what lets it past the E0505
             // and W0501 gates — and codegen has always emitted
-            // `str_join(obj, delim) -> CT_STRING` (codegen_methods.bl:1620), so an
+            // `str_join(obj, delim) -> string` (codegen_methods.bl:1620), so an
             // unresolved type here unifies with anything, lets a mistyped result
             // through, and leaves a non-Str element receiver unchecked (`[1, 2].join(",")`
             // reads int64 as `const char*` in str_join).
@@ -11743,7 +11743,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if method == "len" { return TYPE_INT }
             // The one Ptr-producing method the spec states outright AND codegen agrees with:
             // `fn as_cstr(self: Str) -> Ptr[U8]` (sections/07_trust_modules_metadata.md:221)
-            // against `blink_strdup(s)` with expr_result_type = CT_PTR (codegen_methods.bl:857).
+            // against `blink_strdup(s)` with expr_result_type = pointer (codegen_methods.bl:857).
             // Its partner `.to_str(self: Ptr[U8]) -> Option[Str]` (:222) is in the TyKind.Ptr
             // block below, so the documented round trip now types end to end.
             if method == "as_cstr" { return make_ptr_type(TYPE_U8) }
@@ -11797,8 +11797,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if obj_k == TyKind.Int {
             if method == "to_str" { return TYPE_STR }
             // The two conversions codegen implements for an Int receiver:
-            // `to_string` (codegen_methods.bl:3879, the CT_INT branch) and `to_float`
-            // (`:3777`, gated on `obj_type == CT_INT`). Note `to_string` is NOT answered for a
+            // `to_string` (codegen_methods.bl:3879, the int branch) and `to_float`
+            // (`:3777`, gated on the Int type). Note `to_string` is NOT answered for a
             // sized-int or Bool receiver, and `to_float` is NOT answered for a Str one — codegen
             // implements none of those three, so answering them here would invent surface.
             if method == "to_string" { return TYPE_STR }
@@ -11814,7 +11814,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         }
 
         // A Float receiver's `to_int` is answered here rather than in the Str block above;
-        // codegen implements it at codegen_methods.bl:3782, gated on `obj_type == CT_FLOAT`.
+        // codegen implements it at codegen_methods.bl:3782, gated on the Float type.
         if obj_k == TyKind.Float {
             if method == "to_string" { return TYPE_STR }
             if method == "to_int" { return TYPE_INT }
@@ -12078,7 +12078,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
 
         // The four ffi.scope() allocators, against the operation table at
         // sections/07_trust_modules_metadata.md:280-286 and codegen's own emitter block
-        // (codegen_methods.bl:4886), which sets expr_result_type = CT_PTR for all four.
+        // (codegen_methods.bl:4886), which sets expr_result_type = pointer for all four.
         //
         // Two of the four are fully signable: `cstr` is monomorphic
         // (`fn cstr(self, s: Str) -> Ptr[U8]`, :285) and matches the
@@ -12576,7 +12576,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // `Map()`/`Set()` literal (`let b = GKV { m: Map() }` mints a
                 // GKV[?,?] instance, tc_struct_lit_instance_tid) — must leave the
                 // field's typevar UNBOUND. Substituting `Map[K,V]` with `K→?` yields
-                // `Map[?,?]` whose key CT is CT_VOID, which defeats the codegen
+                // `Map[?,?]` whose key C type is void, which defeats the codegen
                 // erased-default guard (recover_set_elem_from_tid keys on a -1 no-op
                 // for an unresolved inner) and regresses the arg-node element
                 // recovery. Skipping the bind keeps the field typevar, so
@@ -15213,7 +15213,7 @@ pub fn tc_tid_resolved(tid: Int) -> Int {
 // ({list_elem, set_elem, map_key, map_val, option_inner, result_ok, result_err,
 // struct_arg, tuple_elem} x {_ct, _struct, _tid} x {plain, _resolved}). That product
 // exists for ONE reason: codegen could not hold a tid, so each child had to be
-// pre-flattened into a (CT_* code, struct name) pair at this boundary. A pair spans
+// pre-flattened into a (C-type code, struct name) pair at this boundary. A pair spans
 // depth 1, which is why every nesting deeper than that needed its own bespoke channel.
 // tc_tid_child answers a *tid*, so it composes with itself and depth stops mattering.
 //
@@ -15302,7 +15302,7 @@ pub fn tc_tid_child_count(tid: Int) -> Int {
 // Answering -1 rather than a plausible default is the entire point. sv_tp
 // (codegen_types.bl) responds to a missing slot by INVENTING one —
 // `return type_list(type_int())` — and every "erases the element to Int" / "fabricated as
-// CT_STRING default" ticket in the backlog is that invention observed downstream. Do not
+// string default" ticket in the backlog is that invention observed downstream. Do not
 // add a fallback here, and do not clamp `i` to the last real child: a clamp duplicates a
 // type into a slot that has none and reads as success.
 pub fn tc_tid_child(tid: Int, i: Int) -> Int {
