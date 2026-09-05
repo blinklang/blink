@@ -1,0 +1,64 @@
+// type_merge is a branch-unification backstop: its docstring requires the caller
+// to have already validated types_compatible(a, b). types_compatible now fails
+// CLOSED on a -1 / out-of-range tid (an unknown encoding is treated as
+// incompatible, never adopted). type_merge must be symmetric: on a negative or
+// out-of-range tid it must return the shared TYPE_UNKNOWN singleton, NOT hand the
+// raw (possibly -1) side back as if it were a real merged answer — a -1 escaping
+// as a type is the forbidden "third default state" (decisions/under-determined-types.md).
+//
+// This is a backstop with no surface MVCE (a well-behaved caller pre-checks
+// types_compatible and so never reaches the guard), so the guard is exercised
+// directly, the way test_v76b0b_ty_pool_interns_compounds.bl drives the ty_pool
+// interning invariant through the pub make_*_type helpers.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, type_merge, tc_unknown_tid, make_option_type, make_metavar}
+// Bare, load-bearing: codegen_types back-references globals (e.g. tc_tid_ct) it cannot
+// import out of the MERGED program; codegen_expr is the smallest root whose transitive
+// closure closes them. Same incantation as test_tc_tid_structural_accessors.bl.
+import codegen_expr
+
+// Run a trivial compile so init_types() populates TYPE_UNKNOWN and the ty_pool
+// before the direct-call assertions below. Mirrors the probe-compile the ty_pool
+// interning test uses to harvest a live Int tid.
+fn tm_init_types_pool() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/type_merge_probe.bl"
+    write_file(path, #"fn main() {
+    assert(1 == 1)
+}
+"#)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+test "type_merge returns TYPE_UNKNOWN on a negative tid, not the raw side" {
+    tm_init_types_pool()
+    let valid = make_option_type(make_metavar())
+    let unk = tc_unknown_tid()
+    assert(type_merge(-1, valid) == unk)
+    assert(type_merge(valid, -1) == unk)
+}
+
+test "type_merge returns TYPE_UNKNOWN on an out-of-range tid, not the raw side" {
+    tm_init_types_pool()
+    let valid = make_option_type(make_metavar())
+    let unk = tc_unknown_tid()
+    let out_of_range = 999999999
+    assert(type_merge(out_of_range, valid) == unk)
+    assert(type_merge(valid, out_of_range) == unk)
+}
+
+// A valid same-kind merge is unaffected by the fail-closed guards: merging a
+// carrier holding an open metavar with a concrete-inner sibling still pins and
+// returns a real (non-UNKNOWN) tid.
+test "type_merge still merges two valid compatible types" {
+    tm_init_types_pool()
+    let unk = tc_unknown_tid()
+    let open_opt = make_option_type(make_metavar())
+    let other_opt = make_option_type(make_metavar())
+    let merged = type_merge(open_opt, other_opt)
+    assert(merged != unk)
+    assert(merged != -1)
+}

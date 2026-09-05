@@ -1,0 +1,42 @@
+// error[CannotInferType] (E0301): the region-boundary check (nr_pop_scope) is
+// active for the WHOLE inference pass, including the module-scope pop — not only
+// inside a fn/test body. tc_boundary_check_active is turned on at the top of
+// tc_infer_program, so a top-level binder that still holds a metavar at the
+// module-scope close is reported exactly like a local one, and no future
+// module-scope binder class can silently escape the check.
+//
+// Spec: sections/03_types.md §3.4 "Under-Determined Types" (decisions/under-determined-types.md,
+// 8vcj2c). A binding is judged at its own site; a later cross-scope use is
+// action-at-a-distance the panel rejected, so it cannot rescue a top-level binding.
+//
+// The widening must NOT false-reject a fn-body binding whose metavar a LATER
+// statement pins: the boundary check runs mid-walk, so a later pin (an annotated
+// let that references the binding) must still be seen before the fn body's own
+// pop. The two facts are exercised together below, in one program each.
+
+import compile_test_helpers
+
+// ── module-scope pop runs the boundary check: a top-level open binding is E0301 ──
+
+test "a top-level empty list is E0301 at the module-scope boundary" {
+    let src = "let g = []\nfn use_it() -> Int \{ g.len() }\n"
+    compile_test_helpers.expect_compile_error(src, "boundary_toplevel_open", "E0301")
+}
+
+// ── the widened region must not break a fn-body LATER pin ──
+// x is left open at its `let`, used as a match scrutinee, then pinned by a later
+// annotated let. The scope-close check runs after that pin, so x is bound by then.
+
+test "a fn-body binding pinned by a later annotated let is not E0301 under the widened region" {
+    let src = "fn main() ! IO \{ let x = None match x \{ Some(v) => io.println(\"s\")  None => io.println(\"n\") } let y: Option[Int] = x io.println(\"ok\") }\n"
+    compile_test_helpers.expect_no_error(src, "boundary_fnbody_later_pin", "E0301")
+}
+
+// ── both together: a top-level open binding errors while a fn-body later-pin in
+// the SAME program does not false-error — the module-scope check and the fn-body
+// check coexist without cross-contamination.
+
+test "a top-level open binding is E0301 while a fn-body later-pin in the same program is clean" {
+    let src = "let g = []\nfn main() ! IO \{ let x = None match x \{ Some(v) => io.println(\"s\")  None => io.println(\"n\") } let y: Option[Int] = x io.println(\"ok\") }\n"
+    compile_test_helpers.expect_compile_error(src, "boundary_mixed", "E0301")
+}

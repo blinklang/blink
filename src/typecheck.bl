@@ -6796,6 +6796,7 @@ fn init_types() ! TypeCheck.Register {
     tc_suppress_ann_validation = 0
     tc_structural_nested_instances = 0
     tc_boundary_check_active = 0
+    tc_pattern_report_open_leaf = 0
     tc_errors.clear()
     depr_fn_nodes.clear()
     depr_type_nodes.clear()
@@ -10187,7 +10188,7 @@ fn assignment_types_compatible(target_t: Int, val_t: Int, val_node: Int) -> Int 
 // Result[?, Bool] yields Result[Int, Bool] instead of dropping the
 // concrete payload from one side. Caller must have already validated
 // `types_compatible(a, b)`.
-fn type_merge(a0: Int, b0: Int) -> Int {
+pub fn type_merge(a0: Int, b0: Int) -> Int {
     // Branch unification is a constraining use: `if c { None } else {
     // Some(x) }` must PIN the None's element α from the Some branch, so the merged
     // binding is Option[T] and never trips E0301. Resolve bound metavars first,
@@ -10201,8 +10202,15 @@ fn type_merge(a0: Int, b0: Int) -> Int {
     if a == TYPE_UNKNOWN { return b }
     if b == TYPE_UNKNOWN { return a }
     if a == b { return a }
-    if a < 0 || b < 0 { return a }
-    if a >= ty_pool.len() || b >= ty_pool.len() { return a }
+    // Fail CLOSED, symmetric with types_compatible: a negative or out-of-range tid is
+    // an unknown/error encoding, so return the shared TYPE_UNKNOWN singleton rather than
+    // hand the raw (possibly -1) side back as a real merged answer — a -1 escaping as a
+    // type is the forbidden "third default state" (decisions/under-determined-types.md).
+    // This also re-gates the recursive inner merges below: any inner tid that is negative
+    // or out of range reaches this guard on re-entry and yields TYPE_UNKNOWN, so a
+    // malformed carrier can never produce a bogus container over a -1 element.
+    if a < 0 || b < 0 { return TYPE_UNKNOWN }
+    if a >= ty_pool.len() || b >= ty_pool.len() { return TYPE_UNKNOWN }
     if tc_is_unbound_metavar(a) != 0 {
         let _ = tc_unify(a, b)
         let ra = tc_resolve(a)
@@ -14011,7 +14019,15 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // arm takes its `tup_start == -1` path and types both leaves as untyped.
             let tc_saved_pat_hint = tc_pattern_binding_type
             tc_pattern_binding_type = elem_t
+            // Report an open leaf only when the iterable is an anonymous value: there the
+            // destructure leaves are the sole materialization site of an under-determined
+            // element, exactly as for_binder_decl reports the simple `for x in []` binder.
+            // A named iterable defers to its own binding's site (mid-walk pops would else
+            // false-reject a later pin), so leave the flag off.
+            let tc_saved_report_leaf = tc_pattern_report_open_leaf
+            tc_pattern_report_open_leaf = if tc_scrut_is_named_place(node_iterable(node)) == 0 { 1 } else { 0 }
             tc_check_pattern_types(tc_for_pat_node)
+            tc_pattern_report_open_leaf = tc_saved_report_leaf
             tc_pattern_binding_type = tc_saved_pat_hint
         }
         tc_check_body(node_body(node))
@@ -14370,6 +14386,13 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 }
 
 let mut tc_pattern_binding_type: Int = -1
+// When 1, an open (unbound-metavar) IdentPattern leaf is stamped with its OWN node
+// as the E0301 decl node, so the region-boundary check reports it. Set only around
+// the `for (a, b) in <anonymous>` pattern check, where each leaf is the sole
+// materialization site of an under-determined element (the destructure twin of the
+// simple `for x in []` binder). Stays 0 for match arms and named-iterable loops,
+// which defer to the scrutinee/named binding's own site (tc_scrut_is_named_place).
+let mut tc_pattern_report_open_leaf: Int = 0
 
 // Expected enum tid for a bare struct-style construction site (`Name { ... }`).
 // Set before infer_type at the four hint sources (binding annotation, return type,
@@ -14398,7 +14421,11 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         let name = node_name(node)
         if name != "_" && is_variant_name(name) == 0 {
             if tc_pattern_binding_type >= 0 {
-                nr_define_typed(name, 0, tc_pattern_binding_type, -1)
+                // decl -1 defers (match arm, named-iterable loop); the leaf's own node
+                // makes an open leaf reportable at E0301's region boundary. A concrete
+                // leaf type never trips that check, so stamping the node is harmless there.
+                let leaf_decl = if tc_pattern_report_open_leaf != 0 { node } else { -1 }
+                nr_define_typed(name, 0, tc_pattern_binding_type, leaf_decl)
                 // Publish on the LEAF node as well as into scope. Every arm above decomposes
                 // the binding hint one level — Option/Result unwrap, tuple element, list
                 // element, enum variant field — so by the time control reaches here the
@@ -14566,10 +14593,17 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
                 tup_start = te.params_start
                 tup_count = te.params_count
             }
+            // The hint is a bare unbound metavar (`for (a, b) in []`), so it cannot
+            // decompose into element types. Each leaf INHERITS a fresh metavar — not
+            // the shared TYPE_UNKNOWN singleton, which the boundary check excludes — so
+            // an unpinned leaf is seen as under-determined → error[CannotInferType].
+            let hint_is_open = tup_start < 0 && saved_binding >= 0 && tc_is_unbound_metavar(tc_resolve(saved_binding)) != 0
             let mut i = 0
             while i < sublist_length(elems_sl) {
                 if tup_start >= 0 && i < tup_count {
                     tc_pattern_binding_type = ty_param_list.get(tup_start + i).unwrap()
+                } else if hint_is_open {
+                    tc_pattern_binding_type = make_metavar()
                 } else {
                     tc_pattern_binding_type = -1
                 }
@@ -14899,6 +14933,19 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
     nr_scope_depth = 0
     nr_loop_depth = 0
     nr_push_scope()
+    // The E0301 region-boundary check is on for the WHOLE inference pass, not just
+    // inside tc_check_fn/tc_check_test_block. Turning it on here makes the check
+    // unconditional at module scope: the module-scope nr_pop_scope below runs it for
+    // every top-level binder that still holds a metavar in scope, so no future
+    // module-scope binder class can silently escape it the way the inline top-level
+    // report (the second-pass under-determined check) covers only unannotated lets.
+    // tc_check_fn/tc_check_test_block still save/restore around their own regions, so
+    // this only widens the region — it does not change their behaviour, and the
+    // module-scope pop is independent of the --incremental fn filter (fn bodies it
+    // skips report at their own site, not here). Reset to 0 by init_types before every
+    // run; restored at the end for symmetry.
+    let prev_boundary = tc_boundary_check_active
+    tc_boundary_check_active = 1
 
     // Register top-level let bindings WITH their declared types so fn bodies that
     // reference a module-global see its real type. Annotated type is resolved
@@ -15060,6 +15107,7 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
     }
 
     nr_pop_scope()
+    tc_boundary_check_active = prev_boundary
 }
 
 // ── Debug / introspection ───────────────────────────────────────────
