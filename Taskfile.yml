@@ -772,6 +772,47 @@ tasks:
         fi
         echo "ci-per-module-checks: ok (gen1 vs gen2 per-module byte-equal)"
 
+  # Phase 2.3 authority-switch gate: diff the shadow mono worklist
+  # (mono.bl, BLINK_MONO_SHADOW) against the live emit-time registry
+  # (mono_instances) over every tests/test_*.bl, keyed on the emitted C symbol.
+  # Standalone REPORTING target — NOT wired into `task ci`, because the diff is
+  # guaranteed non-empty until the shadow source-walk is extended (Phase 2.5
+  # wires it in as the gate once it reaches empty). Exits nonzero while any
+  # divergence remains. Modeled on the ci-per-module-checks diff idiom.
+  mono-diff:
+    desc: "Phase 2.3: diff shadow mono worklist vs live registry over tests/test_*.bl"
+    silent: true
+    deps: [build-cli]
+    cmds:
+      - |
+        set -u
+        OUT=$(mktemp -d)
+        trap "rm -rf $OUT" EXIT
+        CENSUS="$OUT/census.txt"
+        : > "$CENSUS"
+        total=0
+        files=0
+        for f in tests/test_*.bl; do
+          [ -e "$f" ] || continue
+          files=$((files+1))
+          BLINK_MONO_SHADOW=1 BLINK_MONO_DIFF=1 {{.BUILD_DIR}}/blink build --emit c "$f" -o "$OUT/out" 2> "$OUT/err.txt" > /dev/null || true
+          # Tag each divergence with its source file for triage.
+          /usr/bin/grep -E '^MONO-DIFF (SHADOW-ONLY|LIVE-ONLY)' "$OUT/err.txt" | sed "s#^#$f: #" >> "$CENSUS" || true
+          n=$(/usr/bin/grep -E '^MONO-DIFF TOTAL' "$OUT/err.txt" | tail -1 | awk '{print $3}')
+          [ -n "$n" ] && total=$((total+n)) || true
+        done
+        shadow_only=$(/usr/bin/grep -c 'MONO-DIFF SHADOW-ONLY' "$CENSUS" 2>/dev/null || true)
+        live_only=$(/usr/bin/grep -c 'MONO-DIFF LIVE-ONLY' "$CENSUS" 2>/dev/null || true)
+        echo "mono-diff: scanned $files test files"
+        echo "mono-diff: SHADOW-ONLY=$shadow_only  LIVE-ONLY=$live_only  TOTAL=$total"
+        echo "--- census (per-file) ---"
+        sort "$CENSUS"
+        if [ "$total" -gt 0 ]; then
+          echo "mono-diff: DIVERGENT ($total) — expected RED until the shadow source-walk is extended (Phase 2.5)"
+          exit 1
+        fi
+        echo "mono-diff: empty — shadow == live (authority-switch gate GREEN)"
+
   gen-stdlib-registry:
     desc: Regenerate src/embedded_stdlib_registry.bl from lib/std and lib/pkg
     sources:

@@ -1411,6 +1411,14 @@ pub fn mono_phys_base(base: Str) -> Str {
 }
 pub let mut mono_instances: List[MonoInstance] = []
 pub let mut mono_idx: Map[Str, Int] = Map()
+
+// Read-only live-registry accessors for the shadow-vs-live mono diff harness
+// (mono.bl run_mono_diff). MonoInstance stays private; the harness reads the
+// c_name join key plus base/args for triage annotation through these.
+pub fn mono_instances_count() -> Int { mono_instances.len() }
+pub fn mono_instance_c_name_at(i: Int) -> Str { mono_instances.get(i).unwrap().c_name }
+pub fn mono_instance_base_at(i: Int) -> Str { mono_instances.get(i).unwrap().base }
+pub fn mono_instance_args_at(i: Int) -> Str { mono_instances.get(i).unwrap().args }
 // count of newly minted c_names that collided with an EXISTING different
 // (base, args) entry's c_name — a mangle_generic_name collision slipping past the escape
 // fix. Must be 0 corpus-wide; see register_mono_instance_ann and dbg_trace channel
@@ -3194,10 +3202,19 @@ pub fn set_list_elem_type(name: Str, elem_type: Int) {
 // genuinely-erased element stays -1.
 fn list_elem_ct_from_tid(sv_ty: Int) -> Int {
     if sv_ty < 0 { return -1 }
-    let bt = cg_bind_mono_tid(sv_ty)
-    let e = tc_tid_list_elem_ct_resolved(bt)
+    listop_elem_flat_ct(cg_bind_mono_tid(sv_ty))
+}
+
+// The flattened element CT of an ALREADY-bound list tid: a plain (payload-less)
+// enum rides the CT_INT ordinal, a data enum / tuple / struct inner flattens to
+// CT_VOID, and every other element keeps its own CT. Split out of
+// list_elem_ct_from_tid (which prepends the cg_bind_mono_tid step) so the mono
+// shadow, whose list tid is already mono-substituted, can classify a list-HOF
+// element with the identical logic the live list-HOF guard uses.
+pub fn listop_elem_flat_ct(list_tid: Int) -> Int {
+    let e = tc_tid_list_elem_ct_resolved(list_tid)
     if e == CT_ENUM {
-        let es = tc_tid_list_elem_struct_head(bt)
+        let es = tc_tid_list_elem_struct_head(list_tid)
         if es != "" && is_data_enum(es) == 0 { return CT_INT }
         return CT_VOID
     }
@@ -3205,8 +3222,17 @@ fn list_elem_ct_from_tid(sv_ty: Int) -> Int {
     // e < 0: tid_inner_ct erases Tuple/Typevar/Unknown alike; a tuple element is
     // still by-value and names a tag here (tid_inner_struct spells it), so flatten
     // it to CT_VOID while a nameless typevar/unknown stays erased.
-    if tc_tid_list_elem_struct(bt) != "" { return CT_VOID }
+    if tc_tid_list_elem_struct(list_tid) != "" { return CT_VOID }
     -1
+}
+
+// Whether codegen's stdlib list-HOF path (list_fold/for_each/any/all) admits this
+// list's element, matching emit list-HOF `elem_name != "Void"` guard exactly: the
+// element flattens to a CT that type_name_from_ct spells non-Void (scalars, bare
+// containers, plain enums), excluding struct / data-enum / Option / Result inners,
+// which route to the fallback iterator path and mint no list_* instance.
+pub fn listop_hof_admits_elem(list_tid: Int) -> Bool {
+    type_name_from_ct(listop_elem_flat_ct(list_tid)) != "Void"
 }
 
 pub fn get_list_elem_type(name: Str) -> Int {

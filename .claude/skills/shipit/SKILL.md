@@ -18,6 +18,7 @@ Create a git commit with the following workflow:
    - Body: More detailed explanation of why things changed, with a balance between useful context and brevity
    - No need to mention added or updated tests, that goes without saying
    - DO NOT mention `br` issues. (br is local only and wouldnt make sense)
+   - `br` ticket ids shouldnt be ANYWHERE in the commit. Not the code, not the comments, nothing. `br` is a local only tool. If you see anything about br, clean it up. 
 7. Show me the commit message and wait for my approval
 8. After approval, create the commit
 9. do a git pull to make sure current branch is up to date
