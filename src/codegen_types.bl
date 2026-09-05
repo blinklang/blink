@@ -3317,49 +3317,6 @@ pub fn get_list_elem_map_val_struct(name: Str) -> Str {
     ""
 }
 
-// Record a List's element-OPTION inner as a full nested type
-// (`type_list(type_option(inner))`). The plain
-// set_list_elem_type(CT_OPTION) chain lowers the Option inner to the default Int.
-// Building the tp_id directly preserves the concrete inner (Str / a struct) so
-// List[Option[T]].get()/for-in carry the right inner type. `inner_struct` names a
-// struct/enum inner (routed through sv_tp's CT_STRUCT case); scalars pass "".
-// Core write-side that stamps a pre-built list tp (`type_list(<inner>)`)
-// onto the var. `inner_marker` is the element's own CT (CT_OPTION/CT_RESULT) kept
-// in the flat inner1 slot for the legacy callers that still read it. The inner tp
-// is arbitrarily deep — this is how `List[Option[Map[Int,Str]]]` stores its full
-// list→option→map→{k,v} shape (the flat sv_tp path collapses the Map's K/V).
-fn set_list_elem_compound_tp(name: Str, list_tp: Int, inner_marker: Int) {
-    let mut i = scope_vars.len() - 1
-    while i >= 0 {
-        let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_LIST {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, sname: sv.sname, ty: sv.ty })
-            return
-        }
-        i = i - 1
-    }
-    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, sname: "", ty: -1 })
-}
-
-// Record a List's element-OPTION from a pre-built inner tp
-// (`type_option(<deep inner tp>)`). The deep-tp caller
-// (set_list_elem_compound_ann) passes the fully-recursive inner so a nested
-// container inside the Option — `List[Option[Map[K,V]]]`,
-// `List[Option[List[T]]]` — keeps its own type params.
-pub fn set_list_elem_option_tp(name: Str, inner_tp: Int) {
-    set_list_elem_compound_tp(name, type_list(type_option(inner_tp)), CT_OPTION)
-}
-
-// Record a List's element-OPTION inner as a full nested type
-// (`type_list(type_option(inner))`). The scalar/bare-struct convenience twin of
-// set_list_elem_option_tp — `inner_struct` names a struct/enum inner ("" for
-// scalars), routed through sv_tp's CT_STRUCT case. Passes the Option's INNER tp
-// (`sv_tp(inner_ct, …)`) — set_list_elem_option_tp adds the single Option wrap; a
-// double sv_tp(CT_OPTION, …) here would nest the element as Option[Option[T]].
-pub fn set_list_elem_option(name: Str, inner_ct: Int, inner_struct: Str) {
-    set_list_elem_option_tp(name, sv_tp(inner_ct, -1, -1, inner_struct))
-}
-
 // What a List's element is, when that element is a NAMED BY-VALUE type — a struct, a
 // tuple, or an enum. `iter_from_source` needs this because the flat element pair cannot answer
 // it: a struct/tuple element reads `(CT_VOID, sname)` and a PLAIN (payload-less) enum element
@@ -3444,13 +3401,6 @@ pub fn set_list_elem_compound_from_tag(name: Str, carrier: Str) {
     }
 }
 
-// The Result twin of set_list_elem_option_tp — record
-// `type_list(type_result(ok_tp, err_tp))` from pre-built ok/err inner tps so a
-// nested container inside either side (`List[Result[Map[K,V], E]]`) survives.
-pub fn set_list_elem_result_tp(name: Str, ok_tp: Int, err_tp: Int) {
-    set_list_elem_compound_tp(name, type_list(type_result(ok_tp, err_tp)), CT_RESULT)
-}
-
 // What a List element's flat (CT, sname) pair is, according to typecheck's tid for the node
 // that produced the list — and the scope-var writes that record it. Moved here from
 // codegen_expr (where it was recover_list_elem_from_tid's body) because it is a ScopeVar
@@ -3500,13 +3450,10 @@ pub fn list_elem_unspellable(name: Str) -> Bool {
     false
 }
 
-// Build a fully-recursive tp node from a tid (typecheck's ty_pool tree), the
-// tid-side twin of deep_tp_from_ann. That one walks an annotation AST and
-// resolves mono typevars via cg_mono_*; this one walks a tid already
-// substituted by typecheck (tc_lookup_node_tid at a concrete use site), so
-// it does NOT call tc_tid_resolved at entry or in any recursive step —
-// composing a resolver into a non-resolving reader is a standing trap here,
-// as it is in codegen_stmt.bl's analogous walker.
+// Build a fully-recursive tp node from a tid (typecheck's ty_pool tree). Walks a
+// tid already substituted by typecheck (tc_lookup_node_tid at a concrete use
+// site), so it does NOT call tc_tid_resolved at entry or in any recursive step —
+// composing a resolver into a non-resolving reader is a standing trap here.
 //
 // Sentinel contract (load-bearing): returns -1 — NOT a tp id — for any tid naming
 // no faithfully representable type (an unencodable struct/enum slot, or a
@@ -3539,10 +3486,9 @@ fn deep_tp_from_tid(tid: Int) -> Int {
         if inner == -1 { return -1 }
         return type_list(inner)
     }
-    // Set and Iterator carry a resolvable element tid, so descend into it — the tid twin of
-    // deep_tp_from_ann's type_set/type_iterator arms, which the flat pool already spells for
-    // annotated shapes. Reaching the same node here lets the tid path type a Set inside a
-    // List's compound carrier (List[Option[Set]] and friends) instead of the pool.
+    // Set and Iterator carry a resolvable element tid, so descend into it. Reaching
+    // these arms lets the tid path type a Set inside a List's compound carrier
+    // (List[Option[Set]] and friends) instead of the pool.
     if ct == CT_SET {
         let inner = deep_tp_from_tid(tc_tid_set_elem_tid(tid))
         if inner == -1 { return -1 }
@@ -3554,7 +3500,7 @@ fn deep_tp_from_tid(tid: Int) -> Int {
         return type_iterator(inner)
     }
     // Handle/Channel/Ptr have no raw-tid element accessor to recurse into, so spell them
-    // kind-only — the same erased-inner tp deep_tp_from_ann writes for them (sv_tp at its tail).
+    // kind-only via sv_tp (erased inner).
     if ct == CT_HANDLE || ct == CT_CHANNEL || ct == CT_PTR {
         return sv_tp(ct, -1, -1, "")
     }
@@ -4246,13 +4192,6 @@ pub fn map_pair_from_recv(obj_node: Int) -> MapPairTid {
     }
     dbg_trace("mappair", "recv ok kct={kct} ks={ks} vct={vct} vs={vs} ect={ect} es={es}")
     MapPairTid { ok: 1, key_ct: kct, key_struct: ks, val_ct: vct, val_struct: vs, val_elem_ct: ect, val_elem_struct: es }
-}
-
-// The Result twin of set_list_elem_option — record
-// `type_list(type_result(ok, err))` so List[Result[T,E]].get()/for-in carry both
-// concrete inners. ok_struct/err_struct name a struct/enum inner ("" for scalars).
-pub fn set_list_elem_result(name: Str, ok_ct: Int, ok_struct: Str, err_ct: Int, err_struct: Str) {
-    set_list_elem_result_tp(name, sv_tp(ok_ct, -1, -1, ok_struct), sv_tp(err_ct, -1, -1, err_struct))
 }
 
 // The element Option's inner CT (List[Option[Int]] → CT_INT). -1 when the list is

@@ -82,8 +82,8 @@ import codegen_types.{
     struct_field_defaults, struct_invariants, struct_option_c_type,
     is_opaque_type, opaque_option_carrier_cname, opaque_handle_c_name,
     struct_reg_names, struct_reg_set, struct_result_c_type, sv_tp, tp_from_ann,
-    type_int, type_string, type_struct, type_list, type_option, type_result, type_map, type_set, type_iterator,
-    set_list_elem_option_tp, set_list_elem_result_tp, list_elem_unspellable,
+    type_int, type_string, type_struct, type_list, type_option, type_result, type_map,
+    list_elem_unspellable,
     stamp_list_elem_from_tid, stamp_list_elem_from_list_tid, stamp_binder_from_tid, stamp_binder_from_binder_tid, stamp_whole_binder_from_tid, stamp_binder_elems_from_tid_if_unset, stamp_map_from_map_tid, stamp_result_from_tid, map_val_carrier_from_recv, MapValCarrier,
     map_pair_from_recv, MapPairTid,
     split_result_compound, CompoundSplit, map_struct_scalar_kv, MapKvCt, typedef_tag_or_empty, carrier_slot_ct, tp_child1_kind, tp_child1_sname,
@@ -146,80 +146,6 @@ fn strip_outer_parens(s: Str) -> Str {
         }
     }
     s
-}
-
-// Build a fully-recursive tp node from a type annotation, substituting
-// mono typevars via the current cg_mono_* context. The tparam-resolving twin of
-// tp_from_ann (codegen_types.bl) — that one runs BELOW the mono resolver in the
-// module DAG so it can't call resolve_tparam_via_tid; this one lives alongside
-// the resolver and is the deep builder for a List's compound element inner, so
-// `List[Option[Map[K,V]]]` records list→option→map→{k,v} instead of collapsing
-// the Map's K/V to the sv_tp default (Str/Int). Handles the container ctypes it
-// can descend into; anything else lowers to the resolved scalar/struct.
-fn deep_tp_from_ann(ann: Int) -> Int ! Codegen.Register {
-    let resolved = resolve_tparam_via_tid(node_name(ann), cg_mono_tparams_sl, cg_mono_arg_tids)
-    let ct = type_from_name(resolved)
-    let elems = node_elements(ann)
-    let n = if elems != -1 { sublist_length(elems) } else { 0 }
-    if ct == CT_OPTION && n >= 1 {
-        return type_option(deep_tp_from_ann(sublist_get(elems, 0)))
-    }
-    if ct == CT_RESULT && n >= 2 {
-        return type_result(deep_tp_from_ann(sublist_get(elems, 0)), deep_tp_from_ann(sublist_get(elems, 1)))
-    }
-    if ct == CT_MAP && n >= 2 {
-        return type_map(deep_tp_from_ann(sublist_get(elems, 0)), deep_tp_from_ann(sublist_get(elems, 1)))
-    }
-    if ct == CT_LIST && n >= 1 {
-        return type_list(deep_tp_from_ann(sublist_get(elems, 0)))
-    }
-    if ct == CT_SET && n >= 1 {
-        return type_set(deep_tp_from_ann(sublist_get(elems, 0)))
-    }
-    if ct == CT_ITERATOR && n >= 1 {
-        return type_iterator(deep_tp_from_ann(sublist_get(elems, 0)))
-    }
-    if is_struct_or_enum_type(resolved) != 0 {
-        // A bare generic head (`resolved` alone, e.g. `QBox`) is never typedef'd
-        // on its own; only mono instances are. A nested struct/enum leaf must
-        // spell the mono STEM (`QBox_Int`), mirroring the declared List[T]
-        // element branch below. register_carrier_inner_mono_instance emits
-        // that instance's typedef so the stem this returns actually exists in C.
-        let stem = mono_name_from_ann(strip_module_qualifier(resolved), ann, -1, [])
-        let _reg = register_carrier_inner_mono_instance(resolved, ann)
-        return type_struct(if stem != "" { stem } else { resolved })
-    }
-    sv_tp(ct, -1, -1, "")
-}
-
-// Stamp a List[Option[T]] / List[Result[T,E]] element's INNER
-// type(s) from the element annotation onto the list var. Without this, the plain
-// set_list_elem_type(CT_OPTION) at each annotation site defaults the Option inner
-// to Int and get()/for-in emit the undefined `blink_Option_option`. Builds the
-// element's inner as a FULLY-RECURSIVE tp (deep_tp_from_ann) so a container
-// nested inside the compound — `List[Option[Map[K,V]]]`, `List[Result[Map,..]]`,
-// `List[Option[List[T]]]` — keeps its own type params. Records via the
-// deep set_list_elem_option_tp / set_list_elem_result_tp.
-// Returns 1 when it handled the element (Option/Result), 0 otherwise so the caller
-// keeps its existing dispatch for non-compound elements.
-fn set_list_elem_compound_ann(var_name: Str, elem_ann: Int, elem_ct: Int) -> Int ! Codegen.Register {
-    if elem_ct == CT_OPTION {
-        let inner_sl = node_elements(elem_ann)
-        if inner_sl != -1 && sublist_length(inner_sl) >= 1 {
-            set_list_elem_option_tp(var_name, deep_tp_from_ann(sublist_get(inner_sl, 0)))
-        }
-        return 1
-    }
-    if elem_ct == CT_RESULT {
-        let inner_sl = node_elements(elem_ann)
-        if inner_sl != -1 && sublist_length(inner_sl) >= 2 {
-            let ok_tp = deep_tp_from_ann(sublist_get(inner_sl, 0))
-            let err_tp = deep_tp_from_ann(sublist_get(inner_sl, 1))
-            set_list_elem_result_tp(var_name, ok_tp, err_tp)
-        }
-        return 1
-    }
-    0
 }
 
 fn infer_node_struct_name(node: Int) -> Str {
@@ -4744,7 +4670,6 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                         set_list_elem_struct(name, tup_opt.unwrap())
                     }
                 }
-                let _ = set_list_elem_compound_ann(name, elem_ann, elem_ct)
             }
         }
     }
@@ -7598,7 +7523,6 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str, im_node: Int) ! Codege
                                         set_list_elem_struct(pname, tup_opt.unwrap())
                                     }
                                 }
-                                let _ = set_list_elem_compound_ann(pname, elem_ann, elem_ct)
                             }
                         }
                     }
@@ -8341,7 +8265,6 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                                     set_list_elem_struct(pname, tup_opt.unwrap())
                                 }
                             }
-                            let _ = set_list_elem_compound_ann(pname, elem_ann, elem_ct)
                         }
                     }
                 }
@@ -9891,11 +9814,10 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) ! Cod
                                     set_list_elem_struct(pname, tup_opt.unwrap())
                                 }
                             }
-                            let _ = set_list_elem_compound_ann(pname, elem_ann, elem_ct)
                             // Every branch above spells the element from the ANNOTATION, and
                             // only its OUTER name goes through resolve_tparam_via_tid — a
-                            // COMPOUND element's inner is read raw (set_list_elem_compound_ann
-                            // → deep_tp_from_ann on the `T` node). Left alone, a mono instance
+                            // COMPOUND element's inner is left to the tid ladder below.
+                            // Left alone, a mono instance
                             // of `xs: List[Option[T]]` would bind its element as an Option
                             // over nothing (`blink_Option_void`), and `List[Result[T, Str]]`
                             // would return a `blink_Result_void_str` where a `Result_int_str`
@@ -11241,7 +11163,6 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
                         set_list_elem_struct(name, tup_opt.unwrap())
                     }
                 }
-                let _ = set_list_elem_compound_ann(name, elem_ann, elem_ct)
             }
         }
     }
