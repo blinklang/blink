@@ -10,7 +10,7 @@ import parser.{
     node_op, node_params, node_pattern, node_return_type, node_right, node_scrutinee,
     node_start, node_stmts, node_str_val, node_target, node_then_body, node_trait_name,
     node_type_ann, node_type_name, node_type_params, node_value, node_var_name,
-    node_impl_binders, node_recv_type_args, node_source_module,
+    node_impl_binders, node_recv_type_args, node_impl_where_bounds, node_source_module,
     node_set_module, node_set_name,
     node_xfail_reason, node_xfail_ticket,
     sublist_get, sublist_length,
@@ -252,8 +252,17 @@ let mut tc_trait_method_names: List[Str] = []
 let mut tc_trait_assoc_names: List[Str] = []
 
 // Types with an `impl Display`, for which the compiler synthesizes a sealed
-// `display() -> Str`.
+// `display() -> Str`. Keyed on the receiver BASE name and still the sole driver
+// of `.display()` resolvability (a name-level "is there any Display impl").
 let mut tc_display_impl_types: List[Str] = []
+
+// Parallel to tc_display_impl_types: base name -> the Display impl's node id
+// (exact; <=1 per (Trait, base) by §3.6:2370). The node carries the impl's
+// binders, receiver type-args and where-bounds, which is everything the
+// per-instantiation resolver needs to decide whether a SPECIFIC generic instance
+// (`Box[Int]` vs `Box[NoDisplay]`) actually satisfies Display — the base-name set
+// above cannot tell those apart.
+let mut tc_display_impl_nodes: Map[Str, List[Int]] = Map()
 
 // Typecheck-phase index of which traits define a given method for a
 // given type. Built while walking impls (the codegen impl_entries registry is
@@ -415,7 +424,7 @@ fn tc_method_resolvable_on_type(obj_k: TyKind, tname: Str, method: Str) -> Int {
 // Returns 1 for builtin-scalar Display (Int/Float/Bool/Char/Str) or a user
 // type with `impl Display`. Returns 0 for TyKind.Unknown / TyKind.Typevar so callers
 // SKIP the check (Display is unknowable for unresolved/generic types).
-fn tc_type_id_has_display(tid: Int) -> Int {
+fn tc_type_id_has_display(tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     let k = type_kind(tid)
     if k == TyKind.Unknown || k == TyKind.Typevar { return 0 }
     if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Char || k == TyKind.Str { return 1 }
@@ -447,23 +456,176 @@ fn tc_type_id_has_display(tid: Int) -> Int {
     // non-struct/enum kinds type_to_str already returns the plain scalar name, so
     // fall back to it.
     if k == TyKind.Struct || k == TyKind.Enum {
-        return tc_type_has_display_impl(strip_module_qualifier(ty_pool.get(tid).unwrap().name))
+        let base = strip_module_qualifier(ty_pool.get(tid).unwrap().name)
+        // Gate on the name-level fact first: no Display impl for this base at all
+        // is the existing E0523 (unchanged). This preserves the non-generic path
+        // exactly — the base-name answer IS the whole answer for a 0-arg type.
+        if tc_type_has_display_impl(base) == 0 { return 0 }
+        if tc_tid_struct_arg_count(tid) == 0 { return 1 }
+        // Generic INSTANCE (`Box[Int]`): the base-name fact is too coarse — resolve
+        // against the impl nodes so `Box[Int]` and `Box[NoDisplay]` can differ. A
+        // base may carry several disjoint Display impls (§3.6 coherence is per
+        // (Trait, TYPE): `impl Display for Box[Int]` and `... for Box[Str]` are both
+        // legal), so THIS instance has Display iff ANY of them applies to it.
+        let cands = match tc_display_impl_nodes.get(base) {
+            Some(c) => c
+            None => { return 1 }
+        }
+        let mut ci = 0
+        while ci < cands.len() {
+            let im = cands.get(ci).unwrap()
+            // A concrete-receiver impl (`impl Display for Box[Int]`) does not answer
+            // for `Box[Str]`; a poly impl answers only when its `where`-bounds are not
+            // definitely-unmet (`where T: Display` with T := NoDisplay). Unknown/typevar
+            // bounds fail open (regen safety).
+            if tc_impl_matches_instance(im, tid) != 0 {
+                let binds = tc_impl_binds_for_instance(im, tid)
+                if tc_impl_where_bounds_hold(im, binds) != -1 { return 1 }
+            }
+            ci = ci + 1
+        }
+        return 0
     }
     tc_type_has_display_impl(type_to_str(tid))
+}
+
+// Tri-state: does the concrete type `concrete_tid` satisfy trait `trait_name`?
+//   1 = satisfies, 0 = unknown/skip (Typevar/Unknown or a trait we cannot model
+//   → NEVER reject), -1 = definitely does not. Used to enforce impl `where`-bounds
+//   per instantiation. A -1 is the only value that turns into E0523.
+fn tc_type_satisfies_bound(concrete_tid: Int, trait_name: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let k = type_kind(concrete_tid)
+    // Unknowable for an unresolved/generic type — fail open, never reject.
+    if k == TyKind.Unknown || k == TyKind.Typevar { return 0 }
+    let scalar = if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Char || k == TyKind.Str { 1 } else { is_sized_int(k) }
+    if trait_name == "Display" {
+        if tc_type_id_has_display(concrete_tid) != 0 { return 1 }
+        return -1
+    }
+    // The @derive/impl-backed traits key on the struct/enum BASE name (tid is the
+    // source of truth for the base). Scalars satisfy these structurally.
+    let base = tc_tid_struct(concrete_tid)
+    if trait_name == "Debug" {
+        if scalar != 0 { return 1 }
+        if base != "" && tc_debug_types.contains_key(base) != 0 { return 1 }
+        if base != "" { return -1 }
+        return 0
+    }
+    if trait_name == "Hash" {
+        if scalar != 0 { return 1 }
+        if base != "" && tc_hashable_types.contains_key(base) != 0 { return 1 }
+        if base != "" { return -1 }
+        return 0
+    }
+    if trait_name == "Serialize" {
+        if scalar != 0 { return 1 }
+        if base != "" && tc_serializable_types.contains_key(base) != 0 { return 1 }
+        if base != "" { return -1 }
+        return 0
+    }
+    if trait_name == "Eq" {
+        if scalar != 0 { return 1 }
+        if base != "" && tc_type_has_eq_impl(base) != 0 { return 1 }
+        if base != "" { return -1 }
+        return 0
+    }
+    if trait_name == "Ord" {
+        if scalar != 0 { return 1 }
+        if base != "" && tc_type_has_ord_impl(base) != 0 { return 1 }
+        if base != "" { return -1 }
+        return 0
+    }
+    // A user trait we do not model here — fail open. A full impl-registry recursion
+    // is not needed: the compiler declares no such where-bound (audited), and
+    // an unmodeled bound must never manufacture a false E0523.
+    0
+}
+
+// Does the single Display impl `im` apply to the generic instance `tid`?
+//   Concrete receiver (`impl Display for Box[Int]`) → exact structural identity,
+//   so it does NOT answer for `Box[Str]`. Poly receiver (`impl[T] .. for Box[T]`)
+//   → same base + arity (binding + where-bounds decide the rest).
+fn tc_impl_matches_instance(im: Int, tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let binders = node_impl_binders(im)
+    let has_binders = if binders != -1 && sublist_length(binders) > 0 { 1 } else { 0 }
+    if has_binders == 0 {
+        let recv_tid = tc_impl_self_tid(im)
+        return if tc_tid_same_type(recv_tid, tid) { 1 } else { 0 }
+    }
+    let recv_args = node_recv_type_args(im)
+    let nr = if recv_args == -1 { 0 } else { sublist_length(recv_args) }
+    if nr != tc_tid_struct_arg_count(tid) { return 0 }
+    1
+}
+
+// Discover the impl's binder := concrete-arg map by unifying each receiver
+// type-arg annotation (`Box[T]` → `T`) against the instance's per-slot tid
+// (`Box[Int]` → Int). Read-only: validation suppressed, binders scoped so a bare
+// `T` lowers to a typevar the unifier can bind.
+fn tc_impl_binds_for_instance(im: Int, tid: Int) -> Map[Str, Int] ! TypeCheck.Resolve, Diag.Report {
+    let mut binds: Map[Str, Int] = Map()
+    let recv_args = node_recv_type_args(im)
+    if recv_args == -1 { return binds }
+    let binders = node_impl_binders(im)
+    let saved = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    tc_push_tparam_scope(binders)
+    let n = sublist_length(recv_args)
+    let mut i = 0
+    while i < n {
+        let ptid = resolve_type_ann(sublist_get(recv_args, i))
+        let atid = tc_tid_struct_arg_tid(tid, i)
+        if atid != -1 {
+            unify_typevar_binds(ptid, atid, binds)
+        }
+        i = i + 1
+    }
+    tc_pop_tparam_scope(binders)
+    tc_suppress_ann_validation = saved
+    binds
+}
+
+// Evaluate the impl's `where`-bounds against the discovered binds. Tri-state
+// combine: any definitely-unmet bound (-1) rejects the whole impl; an unbound
+// param or an unmodeled bound is skipped (fail open). Returns -1 (reject) or 1.
+fn tc_impl_where_bounds_hold(im: Int, binds: Map[Str, Int]) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let wb = node_impl_where_bounds(im)
+    if wb == -1 { return 1 }
+    let mut i = 0
+    while i < sublist_length(wb) {
+        let cons = sublist_get(wb, i)
+        let pname = node_name(cons)
+        let concrete = binds.get(pname) ?? -1
+        if concrete != -1 {
+            let bounds = node_elements(cons)
+            if bounds != -1 {
+                let mut j = 0
+                while j < sublist_length(bounds) {
+                    let trait_name = strip_module_qualifier(node_name(sublist_get(bounds, j)))
+                    if tc_type_satisfies_bound(concrete, trait_name) == -1 { return -1 }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    1
 }
 
 // Trait method signature registry (for contract validation)
 type TraitMethodSigEntry {
     trait_name: Str
     method: Str
-    ret: Str
+    ret_tid: Int
     tparams_start: Int
     tparams_count: Int
     params_start: Int
     params_count: Int
 }
 let mut tc_tmsig_pool: List[TraitMethodSigEntry] = []
-let mut tc_tmsig_param_names: List[Str] = []
+// Each trait method param's resolved tid, with Self/trait-tparams/Self.assoc
+// left as typevars for per-impl binding by subst_trait_type_tid.
+let mut tc_tmsig_param_tids: List[Int] = []
 let mut tc_trait_tparam_names: List[Str] = []
 
 let mut tc_current_fn_ret: Int = -1
@@ -6099,7 +6261,7 @@ fn is_user_sourced(node: Int) -> Int {
     0
 }
 
-fn register_trait(tr_node: Int) ! TypeCheck.Register {
+fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     let name = node_name(tr_node)
     tc_trait_names.push(name)
     // Collect trait-level type params (e.g., T in trait From[T])
@@ -6120,27 +6282,37 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register {
     tc_trait_tparam_count_idx.insert(name, tp_count)
     let methods_sl = node_methods(tr_node)
     if methods_sl != -1 {
+        // The trait's own tparams are in scope inside its method signatures;
+        // resolve each signature type to a tid once here (register precedes every
+        // impl check), leaving Self / trait-tparams / Self.assoc as typevars that
+        // the per-impl substitution binds. Validation is suppressed: a signature
+        // type is re-resolved here, not a freshly written position.
+        tc_push_tparam_scope(tparams_sl)
+        let saved_suppress = tc_suppress_ann_validation
+        tc_suppress_ann_validation = 1
         let mut i = 0
         while i < sublist_length(methods_sl) {
             let m = sublist_get(methods_sl, i)
             let mname = node_name(m)
             tc_trait_method_names.push("{name}.{mname}")
             // Store method signature for contract validation
-            let p_start = tc_tmsig_param_names.len()
+            let p_start = tc_tmsig_param_tids.len()
             let params_sl = node_params(m)
             let mut p_count = 0
             if params_sl != -1 {
                 let mut j = 0
                 while j < sublist_length(params_sl) {
                     let p = sublist_get(params_sl, j)
-                    tc_tmsig_param_names.push(node_type_name(p))
+                    tc_tmsig_param_tids.push(resolve_type_ann(node_type_ann(p)))
                     p_count = p_count + 1
                     j = j + 1
                 }
             }
-            tc_tmsig_pool.push(TraitMethodSigEntry { trait_name: name, method: mname, ret: node_return_type(m), tparams_start: tp_start, tparams_count: tp_count, params_start: p_start, params_count: p_count })
+            tc_tmsig_pool.push(TraitMethodSigEntry { trait_name: name, method: mname, ret_tid: resolve_type_ann(node_type_ann(m)), tparams_start: tp_start, tparams_count: tp_count, params_start: p_start, params_count: p_count })
             i = i + 1
         }
+        tc_suppress_ann_validation = saved_suppress
+        tc_pop_tparam_scope(tparams_sl)
     }
     let assoc_sl = node_assoc_types(tr_node)
     if assoc_sl != -1 {
@@ -6154,23 +6326,16 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register {
     }
 }
 
-fn subst_trait_type(type_str: Str, impl_type: Str, tmsig_idx: Int, impl_node: Int) -> Str {
-    if type_str == "Self" { return impl_type }
-    if type_str.starts_with("Self.") {
-        let assoc_name = type_str.substring(5, type_str.len() - 5)
-        let assoc_sl = node_assoc_types(impl_node)
-        if assoc_sl != -1 {
-            let mut ai = 0
-            while ai < sublist_length(assoc_sl) {
-                let at_node = sublist_get(assoc_sl, ai)
-                if node_name(at_node) == assoc_name {
-                    return node_type_name(at_node)
-                }
-                ai = ai + 1
-            }
-        }
-        return type_str
-    }
+// Substitute the trait method's Self /
+// trait-tparams / associated types by the concrete tids this impl binds them
+// to, then return the resulting tid. `Self` → the impl receiver; each trait
+// tparam name → the impl's positional trait-arg; each `Self.<assoc>` typevar
+// → the impl's `type <assoc> = ...` binding. Caller must have the impl binder
+// scope pushed and ann-validation suppressed.
+fn subst_trait_type_tid(type_tid: Int, impl_recv_tid: Int, tmsig_idx: Int, impl_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    if type_tid == TYPE_UNKNOWN { return type_tid }
+    let mut binds: Map[Str, Int] = Map()
+    binds.insert("Self", impl_recv_tid)
     let _tmsig = tc_tmsig_pool.get(tmsig_idx).unwrap()
     let tp_start = _tmsig.tparams_start
     let tp_count = _tmsig.tparams_count
@@ -6179,15 +6344,64 @@ fn subst_trait_type(type_str: Str, impl_type: Str, tmsig_idx: Int, impl_node: In
         let mut k = 0
         while k < tp_count {
             let tp_name = tc_trait_tparam_names.get(tp_start + k).unwrap()
-            if type_str == tp_name {
-                if impl_targs_sl != -1 && k < sublist_length(impl_targs_sl) {
-                    return node_name(sublist_get(impl_targs_sl, k))
-                }
+            if impl_targs_sl != -1 && k < sublist_length(impl_targs_sl) {
+                binds.insert(tp_name, resolve_type_ann(sublist_get(impl_targs_sl, k)))
             }
             k = k + 1
         }
     }
-    type_str
+    let assoc_sl = node_assoc_types(impl_node)
+    if assoc_sl != -1 {
+        let mut ai = 0
+        while ai < sublist_length(assoc_sl) {
+            let at_node = sublist_get(assoc_sl, ai)
+            binds.insert("Self.{node_name(at_node)}", resolve_type_ann(node_type_ann(at_node)))
+            ai = ai + 1
+        }
+    }
+    substitute_typevar_tid(type_tid, binds)
+}
+
+// One deep trait-contract compare: `verdict` is -1 when a side is unknown
+// (can't judge — fail-open), 0 when the deep tids agree, 1 when they differ.
+// `actual`/`expected` carry the tids so the caller can render them.
+type TraitContractTidResult {
+    verdict: Int
+    actual: Int
+    expected: Int
+}
+
+// Deep contract check: does the impl's method signature type at `impl_ann`
+// match what the trait requires (`trait_tid`, after binding Self / trait-tparams
+// / associated types to this impl), compared by interned tid? Caller must have
+// the impl binder scope pushed. Suppression of re-validation is saved/restored
+// here so the caller keeps no save/restore idiom of its own.
+fn tc_trait_contract_tid_check(trait_tid: Int, impl_ann: Int, impl_recv_tid: Int, tmsig_idx: Int, im: Int) -> TraitContractTidResult ! TypeCheck.Resolve, Diag.Report {
+    if trait_tid == TYPE_UNKNOWN { return TraitContractTidResult { verdict: -1, actual: TYPE_UNKNOWN, expected: TYPE_UNKNOWN } }
+    let saved_suppress = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    let mut self_binds: Map[Str, Int] = Map()
+    self_binds.insert("Self", impl_recv_tid)
+    let actual = substitute_typevar_tid(resolve_type_ann(impl_ann), self_binds)
+    tc_suppress_ann_validation = saved_suppress
+    tc_trait_contract_tid_check_actual(trait_tid, actual, impl_recv_tid, tmsig_idx, im)
+}
+
+// Same contract compare, but the impl-side tid is supplied already resolved. The
+// return check uses this to spell an OMITTED return arrow as Void (the ret_ann == -1
+// => TYPE_VOID rule): resolving the -1 node would yield UNKNOWN and skip the check,
+// silently satisfying a trait that requires a real return.
+fn tc_trait_contract_tid_check_actual(trait_tid: Int, actual: Int, impl_recv_tid: Int, tmsig_idx: Int, im: Int) -> TraitContractTidResult ! TypeCheck.Resolve, Diag.Report {
+    if trait_tid == TYPE_UNKNOWN { return TraitContractTidResult { verdict: -1, actual: actual, expected: TYPE_UNKNOWN } }
+    let saved_suppress = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    let expected = subst_trait_type_tid(trait_tid, impl_recv_tid, tmsig_idx, im)
+    tc_suppress_ann_validation = saved_suppress
+    if expected == TYPE_UNKNOWN || actual == TYPE_UNKNOWN {
+        return TraitContractTidResult { verdict: -1, actual: actual, expected: expected }
+    }
+    let v = if tc_tid_same_type(actual, expected) { 0 } else { 1 }
+    TraitContractTidResult { verdict: v, actual: actual, expected: expected }
 }
 
 // True when `name` is declared as a binder in the impl's `impl[T, ...]` list.
@@ -6257,7 +6471,7 @@ fn check_impl_type_arg_names(args_sl: Int, binders_sl: Int, trait_name: Str, whe
     }
 }
 
-fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
+fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     let impls_sl = node_methods(program)
     if impls_sl == -1 { return }
     let mut ii = 0
@@ -6368,10 +6582,10 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
             }
         }
         // A wrong trait-arg count would leave a trait tparam unbound, so
-        // subst_trait_type below returns its raw name and the per-param check
-        // prints a bogus `expected 'U'`. Report a dedicated arity error instead
-        // and skip the per-param comparison (trait_arg_arity_ok) so no unbound
-        // name leaks.
+        // subst_trait_type_tid below leaves it a bare typevar and the per-param
+        // check compares against an unresolved type. Report a dedicated arity
+        // error instead and skip the per-param comparison (trait_arg_arity_ok)
+        // so no unbound tparam leaks.
         // The count comes from the trait DECLARATION (register_trait records
         // node_type_params by name), not from tc_tmsig_pool, because a
         // methodless trait has no sig entry to scan.
@@ -6403,6 +6617,13 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
         }
         // Check each trait method signature against this impl
         let impl_methods_sl = node_methods(im)
+        // Deep (tid) contract audit runs alongside the string compare below: the
+        // impl's own binders are in scope for its receiver + method signatures.
+        // Validation suppression for the re-resolutions lives inside
+        // tc_impl_self_tid and tc_trait_contract_tid_check, so this function
+        // keeps no save/restore idiom of its own.
+        tc_push_tparam_scope(binders_sl)
+        let impl_recv_tid = tc_impl_self_tid(im)
         let mut si = 0
         while si < tc_tmsig_pool.len() {
             let tmsig = tc_tmsig_pool.get(si).unwrap()
@@ -6426,33 +6647,36 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
                                 diag_error_at("TraitContract", TRAIT_CONTRACT_901, "method '{expected_method}' in impl {trait_name} for {impl_type} has {impl_pcount} params, expected {trait_pcount}", impl_m, "trait requires {trait_pcount} parameters (including self)")
                             } else if trait_arg_arity_ok != 0 {
                                 // Skipped when the impl's trait-arg arity is
-                                // wrong (E0910 already reported): subst_trait_type
-                                // would otherwise leak an unbound trait tparam
-                                // name into the expected type.
+                                // wrong (E0910 already reported): subst_trait_type_tid
+                                // would otherwise leave an unbound trait tparam
+                                // typevar in the expected type.
                                 // Check param types
                                 let tp_start = tmsig.params_start
                                 let mut pi = 0
                                 while pi < trait_pcount {
-                                    let trait_ptype = tc_tmsig_param_names.get(tp_start + pi).unwrap()
-                                    if trait_ptype != "" {
+                                    let trait_ptid = tc_tmsig_param_tids.get(tp_start + pi).unwrap()
+                                    if trait_ptid != TYPE_UNKNOWN {
                                         let impl_p = sublist_get(impl_params_sl, pi)
-                                        let raw_impl_ptype = node_type_name(impl_p)
-                                        let impl_ptype = if raw_impl_ptype == "Self" { impl_type } else { raw_impl_ptype }
-                                        let expected_type = subst_trait_type(trait_ptype, impl_type, si, im)
-                                        if impl_ptype != expected_type {
-                                            diag_error_at("TraitContract", TRAIT_CONTRACT_902, "method '{expected_method}' param has type '{impl_ptype}', expected '{expected_type}'", impl_p, "change type to '{expected_type}' to match trait {trait_name}")
+                                        let r = tc_trait_contract_tid_check(trait_ptid, node_type_ann(impl_p), impl_recv_tid, si, im)
+                                        if r.verdict == 1 {
+                                            diag_error_at("TraitContract", TRAIT_CONTRACT_902, "method '{expected_method}' param has type '{type_to_str(r.actual)}', expected '{type_to_str(r.expected)}'", impl_p, "change type to '{type_to_str(r.expected)}' to match trait {trait_name}")
                                         }
                                     }
                                     pi = pi + 1
                                 }
-                                // Check return type
-                                let trait_ret = tmsig.ret
-                                if trait_ret != "" {
-                                    let raw_impl_ret = node_return_type(impl_m)
-                                    let impl_ret = if raw_impl_ret == "Self" { impl_type } else { raw_impl_ret }
-                                    let expected_ret = subst_trait_type(trait_ret, impl_type, si, im)
-                                    if impl_ret != expected_ret {
-                                        diag_error_at("TraitContract", TRAIT_CONTRACT_903, "method '{expected_method}' returns '{impl_ret}', expected '{expected_ret}'", impl_m, "change return type to '{expected_ret}' to match trait {trait_name}")
+                                // Check return type. An omitted arrow means the method
+                                // returns Void (ret_ann == -1 => TYPE_VOID), which must
+                                // still be compared: dropping to UNKNOWN would let a
+                                // Void impl silently satisfy a non-Void trait return.
+                                if tmsig.ret_tid != TYPE_UNKNOWN {
+                                    let impl_ret_ann = node_type_ann(impl_m)
+                                    let r = if impl_ret_ann == -1 {
+                                        tc_trait_contract_tid_check_actual(tmsig.ret_tid, TYPE_VOID, impl_recv_tid, si, im)
+                                    } else {
+                                        tc_trait_contract_tid_check(tmsig.ret_tid, impl_ret_ann, impl_recv_tid, si, im)
+                                    }
+                                    if r.verdict == 1 {
+                                        diag_error_at("TraitContract", TRAIT_CONTRACT_903, "method '{expected_method}' returns '{type_to_str(r.actual)}', expected '{type_to_str(r.expected)}'", impl_m, "change return type to '{type_to_str(r.expected)}' to match trait {trait_name}")
                                     }
                                 }
                             }
@@ -6467,6 +6691,7 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
             }
             si = si + 1
         }
+        tc_pop_tparam_scope(binders_sl)
         let impl_assoc_sl = node_assoc_types(im)
         let mut ati = 0
         while ati < tc_trait_assoc_names.len() {
@@ -6554,11 +6779,12 @@ fn init_types() ! TypeCheck.Register {
     tc_trait_method_names.clear()
     tc_trait_assoc_names.clear()
     tc_display_impl_types.clear()
+    tc_display_impl_nodes.clear()
     tc_method_trait_count_idx.clear()
     tc_method_trait_names_idx.clear()
     tc_poly_list_impl_node.clear()
     tc_tmsig_pool.clear()
-    tc_tmsig_param_names.clear()
+    tc_tmsig_param_tids.clear()
     tc_trait_tparam_names.clear()
     tc_trait_tparam_count_idx.clear()
     tc_current_fn_ret = -1
@@ -6866,6 +7092,16 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             // display() to Str.
             if trait_name == "Display" {
                 tc_display_impl_types.push(impl_type)
+                // Record every impl NODE for per-instantiation resolution. A base may
+                // carry several disjoint Display impls (§3.6 coherence is per (Trait,
+                // TYPE)), so accumulate them all — the resolver tries each in turn.
+                match tc_display_impl_nodes.get(impl_type) {
+                    Some(lst) => { lst.push(im) }
+                    None => {
+                        let l: List[Int] = [im]
+                        tc_display_impl_nodes.insert(impl_type, l)
+                    }
+                }
                 // The synthesized sealed `display()` makes `display` resolvable
                 // on this type; record it as a Display-owned method so a foreign
                 // trait's `display` registers as a second owner.

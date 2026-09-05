@@ -1,0 +1,75 @@
+import compile_test_helpers
+
+// Trait facts (Display) resolved per-INSTANTIATION, not off the base declared
+// type-name string. The compiler used to store one Display fact under "Box", so
+// `Box[Int]` and `Box[NoDisplay]` collapsed to the same answer — a §3.6
+// (sections/03_types.md:2287-2370) violation. E0523 is "does not implement
+// Display" (sections/03_types.md:2583). These assert on the DIAGNOSTIC CODE only
+// and never run the binary: a poly-impl program co-emits E0908 (poly-impl codegen
+// is unimplemented), which is irrelevant to the correctness of this typecheck fact.
+
+// --- Concrete-instance impl (the real bug): `impl Display for Box[Int]` answers
+// ONLY for Box[Int], not for Box[NoDisplay]. ---
+
+test "concrete Box[Int] Display impl does not answer for Box[NoDisplay]" {
+    let src = "type NoDisplay \{ x: Int }\ntype Box[T] \{ v: T }\nimpl Display for Box[Int] \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"box\") } }\nfn main() \{\n  let nd = NoDisplay \{ x: 1 }\n  let b: Box[NoDisplay] = Box \{ v: nd }\n  let s = \"b=\{b\}\"\n  io.println(s)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "concrete_box_int_display_not_nodisplay", "E0523")
+}
+
+test "concrete Box[Int] Display impl answers for Box[Int] (control)" {
+    let src = "type Box[T] \{ v: T }\nimpl Display for Box[Int] \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"box\") } }\nfn main() \{\n  let b: Box[Int] = Box \{ v: 5 }\n  let s = \"b=\{b\}\"\n  io.println(s)\n}\n"
+    compile_test_helpers.expect_no_error(src, "concrete_box_int_display_ok", "E0523")
+}
+
+// --- Two DISJOINT concrete Display impls on one base are both legal (§3.6
+// coherence is per (Trait, TYPE), and Box[Int] / Box[Str] cannot both match one
+// type). Each must answer for its OWN instance — a single per-base slot would let
+// the second registration shadow the first and spuriously reject it. ---
+
+test "two disjoint concrete Display impls: Box[Int] instance is not rejected" {
+    let src = "type Box[T] \{ v: T }\nimpl Display for Box[Int] \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"i\") } }\nimpl Display for Box[Str] \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"s\") } }\nfn main() \{\n  let b: Box[Int] = Box \{ v: 5 }\n  let s = \"b=\{b\}\"\n  io.println(s)\n}\n"
+    compile_test_helpers.expect_no_error(src, "disjoint_concrete_display_box_int", "E0523")
+}
+
+test "two disjoint concrete Display impls: Box[Str] instance is not rejected" {
+    let src = "type Box[T] \{ v: T }\nimpl Display for Box[Int] \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"i\") } }\nimpl Display for Box[Str] \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"s\") } }\nfn main() \{\n  let b: Box[Str] = Box \{ v: \"hi\" }\n  let s = \"b=\{b\}\"\n  io.println(s)\n}\n"
+    compile_test_helpers.expect_no_error(src, "disjoint_concrete_display_box_str", "E0523")
+}
+
+test "disjoint concrete impls still reject an uncovered instance" {
+    let src = "type NoDisplay \{ x: Int }\ntype Box[T] \{ v: T }\nimpl Display for Box[Int] \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"i\") } }\nimpl Display for Box[Str] \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"s\") } }\nfn main() \{\n  let nd = NoDisplay \{ x: 1 }\n  let b: Box[NoDisplay] = Box \{ v: nd }\n  let s = \"b=\{b\}\"\n  io.println(s)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "disjoint_concrete_display_box_uncovered", "E0523")
+}
+
+// --- Poly-impl `where`-bound: `impl[T] Display for Box[T] where T: Display`
+// admits Box[Int] but not Box[NoDisplay]. Code-only assertion (E0908 co-emits). ---
+
+test "poly Box[T] where T: Display rejects Box[NoDisplay]" {
+    let src = "type NoDisplay \{ x: Int }\ntype Box[T] \{ v: T }\nimpl[T] Display for Box[T] where T: Display \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"box\") } }\nfn main() \{\n  let nd = NoDisplay \{ x: 1 }\n  let b: Box[NoDisplay] = Box \{ v: nd }\n  let s = \"b=\{b\}\"\n  io.println(s)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "poly_box_where_display_rejects_nodisplay", "E0523")
+}
+
+test "poly Box[T] where T: Display admits Box[Int]" {
+    let src = "type Box[T] \{ v: T }\nimpl[T] Display for Box[T] where T: Display \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"box\") } }\nfn main() \{\n  let b: Box[Int] = Box \{ v: 5 }\n  let s = \"b=\{b\}\"\n  io.println(s)\n}\n"
+    compile_test_helpers.expect_no_error(src, "poly_box_where_display_admits_int", "E0523")
+}
+
+// --- Nested generics: the -1 (definitely-not) verdict propagates through recursion. ---
+
+test "nested Box[Box[NoDisplay]] is E0523" {
+    let src = "type NoDisplay \{ x: Int }\ntype Box[T] \{ v: T }\nimpl[T] Display for Box[T] where T: Display \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"box\") } }\nfn main() \{\n  let nd = NoDisplay \{ x: 1 }\n  let inner: Box[NoDisplay] = Box \{ v: nd }\n  let b: Box[Box[NoDisplay]] = Box \{ v: inner }\n  let s = \"b=\{b\}\"\n  io.println(s)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "nested_box_box_nodisplay", "E0523")
+}
+
+test "nested Box[Box[Int]] is clean" {
+    let src = "type Box[T] \{ v: T }\nimpl[T] Display for Box[T] where T: Display \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"box\") } }\nfn main() \{\n  let inner: Box[Int] = Box \{ v: 5 }\n  let b: Box[Box[Int]] = Box \{ v: inner }\n  let s = \"b=\{b\}\"\n  io.println(s)\n}\n"
+    compile_test_helpers.expect_no_error(src, "nested_box_box_int_clean", "E0523")
+}
+
+// --- Fail-open (regen safety): interpolating `Box[T]` inside a GENERIC fn leaves
+// the element type a bare typevar; the resolver must not reject an unknown. ---
+
+test "interp of Box[T] inside a generic fn does not fire E0523" {
+    let src = "type Box[T] \{ v: T }\nimpl[T] Display for Box[T] where T: Display \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"box\") } }\nfn show[T](b: Box[T]) \{\n  let s = \"b=\{b\}\"\n  io.println(s)\n}\nfn main() \{\n  let b: Box[Int] = Box \{ v: 5 }\n  show(b)\n}\n"
+    compile_test_helpers.expect_no_error(src, "generic_fn_box_t_fail_open", "E0523")
+}

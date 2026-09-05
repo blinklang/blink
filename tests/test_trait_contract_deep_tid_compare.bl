@@ -1,0 +1,67 @@
+import compile_test_helpers
+
+// The trait-contract checker compares method param/return types by interned tid,
+// DEEPLY, not by the base constructor-name string. Before the migration
+// node_type_name/node_return_type yielded only the base name, so `Result[Str, ErrA]`
+// and `Result[Str, ErrB]` both collapsed to "Result" and a genuine mismatch went
+// unreported (§3.6, sections/03_types.md:2287-2370). TRAIT_CONTRACT_902 =
+// param-type mismatch (E0902); 903 = return-type mismatch.
+
+// --- (a) Deep return mismatch: trait Result[Str,ErrA] vs impl Result[Str,ErrB]
+// differ only in the SECOND type argument. The shallow string compare missed it;
+// the deep tid compare fires E0903. ---
+
+test "deep return type arg mismatch reports E0903" {
+    let src = "type ErrA \{ code: Int }\ntype ErrB \{ code: Int }\ntrait Producer \{\n    fn make(self) -> Result[Str, ErrA]\n}\ntype Maker \{ x: Int }\nimpl Producer for Maker \{\n    fn make(self) -> Result[Str, ErrB] \{ Ok(\"x\") }\n}\nfn main() \{\n  io.println(\"unreachable\")\n}\n"
+    compile_test_helpers.expect_compile_error(src, "deep_ret_arg_mismatch_e0903", "E0903")
+}
+
+// --- (b) Deep param mismatch: trait Box[Int] vs impl Box[Str] differ in the
+// type argument only. Deep compare fires E0902. ---
+
+test "deep param type arg mismatch reports E0902" {
+    let src = "type Box[T] \{ v: T }\ntrait Consumer \{\n    fn take(self, x: Box[Int])\n}\ntype Taker \{ y: Int }\nimpl Consumer for Taker \{\n    fn take(self, x: Box[Str]) \{ }\n}\nfn main() \{\n  io.println(\"unreachable\")\n}\n"
+    compile_test_helpers.expect_compile_error(src, "deep_param_arg_mismatch_e0902", "E0902")
+}
+
+// --- (c) Correct impl exercising all three substitution paths at once: a
+// trait type parameter (U := Int), Self (:= Wrapper), and an associated type
+// (Self.Out := Str). Must stay clean under the deep compare (regression guard). ---
+
+test "self plus trait-tparam plus assoc impl does not fire E0902" {
+    let src = "trait Convert[U] \{\n    type Out\n    fn go(self, x: U) -> Self.Out\n    fn me(self) -> Self\n}\ntype Wrapper \{ v: Int }\nimpl Convert[Int] for Wrapper \{\n    type Out = Str\n    fn go(self, x: Int) -> Str \{ \"hi\" }\n    fn me(self) -> Wrapper \{ self }\n}\nfn main() \{\n  io.println(\"ok\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "self_tparam_assoc_ok_e0902", "E0902")
+}
+
+test "self plus trait-tparam plus assoc impl does not fire E0903" {
+    let src = "trait Convert[U] \{\n    type Out\n    fn go(self, x: U) -> Self.Out\n    fn me(self) -> Self\n}\ntype Wrapper \{ v: Int }\nimpl Convert[Int] for Wrapper \{\n    type Out = Str\n    fn go(self, x: Int) -> Str \{ \"hi\" }\n    fn me(self) -> Wrapper \{ self }\n}\nfn main() \{\n  io.println(\"ok\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "self_tparam_assoc_ok_e0903", "E0903")
+}
+
+// --- (d) Transparent alias on the impl side: `type Port = Int` peels to Int, so
+// an impl param `p: Port` satisfies a trait param `p: Int`. The deep tid compare
+// resolves the alias; a surface-name string compare would reject it. ---
+
+test "transparent alias param satisfies the trait and does not fire E0902" {
+    let src = "type Port = Int\ntrait Take \{\n    fn take(self, p: Int)\n}\ntype Server \{ z: Int }\nimpl Take for Server \{\n    fn take(self, p: Port) \{ }\n}\nfn main() \{\n  io.println(\"ok\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "transparent_alias_param_ok_e0902", "E0902")
+}
+
+// --- (e) An omitted return arrow means the method returns Void. When the trait
+// requires a non-Void return, the impl breaks the contract and must fire E0903 —
+// resolving the missing annotation as Unknown would silently satisfy the trait. ---
+
+test "omitted impl return arrow against a non-Void trait return reports E0903" {
+    let src = "trait Producer \{\n    fn make(self) -> Str\n}\ntype Maker \{ x: Int }\nimpl Producer for Maker \{\n    fn make(self) \{ }\n}\nfn main() \{\n  io.println(\"unreachable\")\n}\n"
+    compile_test_helpers.expect_compile_error(src, "omitted_return_arrow_nonvoid_e0903", "E0903")
+}
+
+test "explicit matching return arrow does not fire E0903 (control)" {
+    let src = "trait Producer \{\n    fn make(self) -> Str\n}\ntype Maker \{ x: Int }\nimpl Producer for Maker \{\n    fn make(self) -> Str \{ \"x\" }\n}\nfn main() \{\n  io.println(\"ok\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "explicit_matching_return_ok_e0903", "E0903")
+}
+
+test "omitted arrow against a Void trait return stays clean (control)" {
+    let src = "trait Sink \{\n    fn put(self)\n}\ntype Bin \{ x: Int }\nimpl Sink for Bin \{\n    fn put(self) \{ }\n}\nfn main() \{\n  io.println(\"ok\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "omitted_arrow_void_trait_ok_e0903", "E0903")
+}
