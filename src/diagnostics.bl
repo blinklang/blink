@@ -25,6 +25,7 @@ pub const CANNOT_INFER_TYPE       = "E0301"
 pub const NOT_ITERABLE            = "E0302"
 pub const TYPE_ARG_ARITY          = "E0303"
 pub const MISSING_ELSE            = "E0304"
+pub const UNLICENSED_SELF_OP      = "E0305"
 pub const TEMPLATE_MISMATCH       = "E0310"
 
 // E0500+ — effects, capabilities, ?-propagation
@@ -127,6 +128,7 @@ pub const TRAIT_CONTRACT_907 = "E0907"
 pub const POLY_IMPL_UNSUPPORTED = "E0908"
 pub const IMPL_BINDER_UNUSED = "E0909"
 pub const TRAIT_ARG_ARITY = "E0910"
+pub const MISSING_SUPERTRAIT_IMPL = "E0911"
 
 // E1300–E1308 — refinement contracts (predicate sublanguage + @pure + @modifies)
 // Predicates in @requires/@ensures/@where must lie in an SMT-decidable
@@ -778,6 +780,9 @@ pub fn diag_explain(code: Str) -> Str {
     if code == MISSING_ELSE {
         return "E0304 -- MissingElse\n\nAn `if` used as a VALUE must have an `else`. In expression context --\na let binding, a return, or an argument -- the `if` has to produce a\nvalue on every path, so both branches are required and must unify to\nthe same type. A missing `else` has no value when the condition is\nfalse, so the compiler rejects it rather than reading an\nuninitialized slot.\n\n  let x = if c \{ 1 }            // E0304 -- no value when c is false\n  let x = if c \{ 1 } else \{ 0 } // OK\n\nIn STATEMENT context the value is discarded, so `else` is optional and\nthe `if` has type ():\n\n  if c \{ log(\"hi\") }            // OK -- value discarded\n\nFix: add an `else` branch, or -- if you meant to run the branch for its\neffect only -- make the `if` a statement rather than binding its value."
     }
+    if code == UNLICENSED_SELF_OP {
+        return "E0305 -- UnlicensedSelfOperation\n\nInside a trait's default method body, `self` has the abstract type\n`Self`. `Self` is an implicit type parameter bounded by the trait's\nGUARANTEE SET: the methods the trait declares, plus every method of\neach trait named in its supertrait clause, transitively. An operator\n(which desugars to a trait method -- see Operator Desugaring) or a\nplain method call on a value of type `Self` is well-formed only when\nits backing trait is in the guarantee set. Any other operation is\nrejected at the trait DEFINITION, before any implementor exists.\n\n  trait Ranked: Ord \{                       // OK -- `<` -> Ord.cmp,\n      fn before(self, o: Self) -> Bool \{      //      Ord is a supertrait\n          self < o\n      \}\n  \}\n\n  trait Ranked \{                            // E0305 -- `<` needs Ord,\n      fn before(self, o: Self) -> Bool \{      //          not declared\n          self < o\n      \}\n  \}\n\nFix (open trait): declare the backing trait as a supertrait so every\nimplementor provides the operation -- `trait Ranked: Ord \{ ... \}`.\n\nThe arithmetic traits (Add, Sub, Mul, Div, Rem, Neg) are SEALED to the\nbuilt-in numeric types. A trait may still name one as a supertrait\n(`trait Doubler: Add`), but that restricts its implementors to the\nnumerics -- no user type can satisfy it -- so the diagnostic for a\nsealed backing trait does NOT suggest adding it. Make the method\nrequired instead, or use a concrete numeric type.\n\nA call to one of the trait's OWN methods is always licensed: that is\nwhat lets an `ne` default call `self.eq()`."
+    }
     if code == UNSOLVED_TYPEVAR_AT_CODEGEN {
         return "I0001 -- UnsolvedTypeVarAtCodegen\n\nAn INTERNAL COMPILER ERROR. A generic type's parameter was still\nunsolved when code generation tried to monomorphize it, so the\ncompiler had no concrete type to emit for that slot.\n\nThis is a bug in the compiler, not in your program. One of two\nthings should have happened first and did not:\n\n  - the type should have been inferred from a use, or\n  - the front end should have reported error[CannotInferType]\n    (E0301) for a genuinely under-determined binding.\n\nThe compiler stops here rather than emitting a type-erased name,\nwhich would silently collapse distinct instantiations onto one C\ntype and miscompile.\n\nFix: please report this, ideally with the smallest program that\nreproduces it. As a workaround, adding an explicit type annotation\nat the reported location usually avoids the unsolved slot.\n\n  let b: GKV[Int, Str] = GKV \{ m: Map() \}   // annotated -- avoids it"
     }
@@ -1119,6 +1124,9 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == TRAIT_ARG_ARITY {
         return "E0910 -- TraitContractArgArity\n\nAn `impl` supplies the wrong number of type arguments for the\ntrait it implements. A trait declared `trait T[A, B]` has two type\nparameters, so an impl must write `impl T[X, Y] for Recv` -- one\nargument per parameter. Supplying too few leaves a trait type\nparameter unbound: the compiler has no type to check the method\nsignatures against, and cannot report a meaningful contract error.\n\nFix: supply one type argument per trait type parameter.\n\n  trait From2[T, U] \{ fn op(self, x: T, y: U) -> T }\n  impl[T] From2[T] for Box[T] \{ ... }        // E0910 -- 1 arg for 2 params\n  impl[T] From2[T, Int] for Box[T] \{ ... }   // OK -- both params bound"
+    }
+    if code == MISSING_SUPERTRAIT_IMPL {
+        return "E0911 -- MissingSupertraitImpl\n\nA trait may declare supertraits: `trait Ranked: Ord` says every\ntype that implements Ranked must also implement Ord. This is the\nsoundness foundation of the licensing rule for `Self` in a default\nbody (E0305) -- a default body may call a supertrait's method on\n`Self` only because every implementor is guaranteed to provide it.\n\nSo an `impl` of a subtrait must satisfy each of the trait's\nsupertraits (transitively) for the receiver type. `@derive` counts\n(it auto-derives supertraits), as does an explicit `impl`. A\nbuilt-in receiver (Int, Str, ...) provides the built-in comparison\nand arithmetic traits intrinsically.\n\nFix: derive or implement the missing supertrait for the receiver.\n\n  trait Ranked: Ord \{ fn rank(self) -> Int }\n  type Foo \{ x: Int }\n  impl Ranked for Foo \{ ... }          // E0911 -- Foo does not implement Ord\n\n  @derive(Ord) type Foo \{ x: Int }     // OK -- derive provides Ord (and Eq)\n  impl Ranked for Int \{ ... }          // OK -- Int is Ord intrinsically"
     }
     if code == CIRCULAR_DEPENDENCY {
         return "E1002 -- CircularPackageDep\n\nThe lockfile contains a circular dependency between packages.\nPackage A depends on B, and B depends (transitively) on A.\n\nFix: break the cycle by extracting shared code into a third\npackage that both depend on, or remove the back-edge dependency.\n\n  // libs/A/blink.toml depends on B\n  // libs/B/blink.toml depends on A   // E1002 -- cycle"

@@ -11,7 +11,7 @@ import parser.{
     node_start, node_stmts, node_str_val, node_target, node_then_body, node_trait_name,
     node_type_ann, node_type_name, node_type_params, node_value, node_var_name,
     node_impl_binders, node_recv_type_args, node_impl_where_bounds, node_source_module,
-    node_set_module, node_set_name,
+    node_set_module, node_set_name, node_supertraits,
     node_xfail_reason, node_xfail_ticket,
     sublist_get, sublist_length,
 }
@@ -21,7 +21,7 @@ import diagnostics.{
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
     NON_EXHAUSTIVE_MATCH,
-    TYPE_ERROR, TEMPLATE_MISMATCH, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
+    TYPE_ERROR, TEMPLATE_MISMATCH, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
     MUTATION_REQUIRES_MUT,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
@@ -34,7 +34,7 @@ import diagnostics.{
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905,
     TRAIT_CONTRACT_906, TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
-    POLY_IMPL_UNSUPPORTED, IMPL_BINDER_UNUSED, TRAIT_ARG_ARITY, TYPE_ARG_ARITY,
+    POLY_IMPL_UNSUPPORTED, IMPL_BINDER_UNUSED, TRAIT_ARG_ARITY, MISSING_SUPERTRAIT_IMPL, TYPE_ARG_ARITY,
     CONTRACT_PREDICATE_NOT_DECIDABLE, EFFECTFUL_CALL_IN_PREDICATE,
     IMPURE_CALL_IN_PREDICATE, LOOP_IN_PREDICATE,
     RESULT_OUTSIDE_ENSURES, OLD_OUTSIDE_ENSURES,
@@ -232,6 +232,23 @@ let mut tc_active_tparams: Map[Str, Int] = Map()
 // parameter (e.g. Self, or an unmodeled builtin that lowers to a typevar).
 let mut tc_tp_arith_names: List[Str] = []
 let mut tc_tp_arith_bits: List[Int] = []
+// Parallel to tc_tp_arith_names, one entry per frame: the full trait-bound set
+// (pipe-framed, e.g. "|Add|Ord|Eq|") and — for the implicit `Self` frame of a trait
+// default body — the guarantee-set METHOD names ("|eq|ne|"). Type-parameter frames
+// carry an empty method set. Read by the E0305 licensing check for operators and
+// method calls on `Self` in a default body (sections/03_types.md "Operations on
+// `Self` in a Default Body").
+let mut tc_tp_bound_traits: List[Str] = []
+let mut tc_tp_bound_methods: List[Str] = []
+// The trait whose default body is being checked, for the E0305 diagnostic; "" when no
+// `Self` frame is active. tc_trait_node_idx maps a trait name to its AST node so the
+// guarantee-set closure can traverse user supertraits transitively.
+let mut tc_current_self_trait: Str = ""
+let mut tc_trait_node_idx: Map[Str, Int] = Map()
+// Each trait name → the pipe-framed set of its DIRECT declared supertraits, built in
+// register_trait (which precedes validate_trait_impls). The E0911 supertrait-obligation
+// check reads it to compute the transitive closure a subtrait impl must satisfy.
+let mut tc_trait_supers_idx: Map[Str, Str] = Map()
 
 type FnSigEntry {
     name: Str
@@ -370,6 +387,64 @@ fn tc_type_has_display_impl(tname: Str) -> Int {
         if tc_display_impl_types.get(i).unwrap() == tname { return 1 }
         i = i + 1
     }
+    0
+}
+
+// The DIRECT supertraits `trait_name` obliges an impl to satisfy: its declared
+// user supers (tc_trait_supers_idx) plus its own built-in super (builtin_trait_supers,
+// e.g. Ord → Eq). Pipe-framed. Transitive supers are covered without re-listing them:
+// each supertrait's own impl is independently subject to this same check, so the deeper
+// obligation is reported against that impl, not stacked onto this one.
+fn tc_trait_direct_supers(trait_name: Str) -> Str {
+    let mut acc = "|"
+    acc = tc_pipe_merge(acc, tc_trait_supers_idx.get(trait_name) ?? "|")
+    acc = tc_pipe_add(acc, builtin_trait_supers(trait_name))
+    acc
+}
+
+// Is there an explicit `impl {sname} for {tname}` among the program's impls?
+fn tc_impl_exists(impls_sl: Int, sname: Str, tname: Str) -> Int {
+    if impls_sl == -1 { return 0 }
+    let mut i = 0
+    while i < sublist_length(impls_sl) {
+        let other = sublist_get(impls_sl, i)
+        if node_trait_name(other) == sname {
+            if node_name(other) == tname { return 1 }
+        }
+        i = i + 1
+    }
+    0
+}
+
+// Does the receiver type `tname` satisfy supertrait `sname`? For E0911. @derive
+// and explicit impls both count. A built-in receiver (not a user-declared type)
+// provides the built-in comparison/arithmetic traits intrinsically, so it fails
+// open — it is never rejected here.
+fn tc_type_satisfies_trait(tname: Str, sname: Str, impls_sl: Int) -> Int {
+    if (tc_type_decl_nodes.get(tname) ?? -1) == -1 { return 1 }
+    if sname == "Eq" { return tc_type_has_eq_impl(tname) }
+    if sname == "Ord" { return tc_type_has_ord_impl(tname) }
+    if sname == "Display" { return tc_type_has_display_impl(tname) }
+    if sname == "Hash" {
+        let td = tc_type_decl_nodes.get(tname) ?? -1
+        if td != -1 && type_has_derive(td, "Hash") != 0 { return 1 }
+        if tc_method_trait_names(tname, "hash").contains("Hash") != 0 { return 1 }
+        return 0
+    }
+    if sname == "Clone" {
+        let td = tc_type_decl_nodes.get(tname) ?? -1
+        if td != -1 && type_has_derive(td, "Clone") != 0 { return 1 }
+        if tc_method_trait_names(tname, "clone").contains("Clone") != 0 { return 1 }
+        return 0
+    }
+    // Arithmetic traits are sealed to numerics; a user type can never satisfy one.
+    if is_arith_trait_name(sname) != 0 { return 0 }
+    tc_impl_exists(impls_sl, sname, tname)
+}
+
+// Is `sname` a trait the compiler can auto-derive? Steers the E0911 fix hint.
+fn tc_is_derivable_trait(sname: Str) -> Int {
+    if sname == "Eq" || sname == "Ord" || sname == "Hash" || sname == "Clone" { return 1 }
     0
 }
 
@@ -3740,6 +3815,8 @@ fn tc_push_arith_frames(sl: Int) {
         let tp = sublist_get(sl, i)
         tc_tp_arith_names.push(node_name(tp))
         tc_tp_arith_bits.push(tparam_node_has_arith_bound(tp))
+        tc_tp_bound_traits.push(tparam_node_bound_traits(tp))
+        tc_tp_bound_methods.push("|")
         i = i + 1
     }
 }
@@ -3751,6 +3828,8 @@ fn tc_pop_arith_frames(sl: Int) {
     while i < sublist_length(sl) {
         let _ = tc_tp_arith_names.pop()
         let _ = tc_tp_arith_bits.pop()
+        let _ = tc_tp_bound_traits.pop()
+        let _ = tc_tp_bound_methods.pop()
         i = i + 1
     }
 }
@@ -3767,6 +3846,224 @@ fn tc_tparam_arith_state(name: Str) -> Int {
         i = i - 1
     }
     -1
+}
+
+// ── E0305: operations on `Self` in a trait default body ──────────────────────
+// The guarantee-set bookkeeping. A pipe-framed string is a small set of names:
+// "|" is empty, "|Add|Ord|" holds two. Membership is a substring test on "|name|".
+fn tc_pipe_has(set: Str, name: Str) -> Int {
+    if name == "" { return 0 }
+    if set.contains("|{name}|") { return 1 }
+    0
+}
+
+fn tc_pipe_add(set: Str, name: Str) -> Str {
+    if name == "" { return set }
+    if tc_pipe_has(set, name) != 0 { return set }
+    if set == "" { return "|{name}|" }
+    "{set}{name}|"
+}
+
+// Merge every member of pipe-framed `b` into `a`.
+fn tc_pipe_merge(a: Str, b: Str) -> Str {
+    if b == "" { return a }
+    let mut acc = a
+    let mut seg_start = 0
+    let mut i = 0
+    while i <= b.len() {
+        if i == b.len() || b.byte_at(i) == 124 {
+            if i > seg_start {
+                acc = tc_pipe_add(acc, b.substring(seg_start, i - seg_start))
+            }
+            seg_start = i + 1
+        }
+        i = i + 1
+    }
+    acc
+}
+
+// The built-in traits the guarantee-set closure must know without an AST node: their
+// direct supertraits and the methods they provide.
+fn builtin_trait_supers(name: Str) -> Str {
+    if name == "Ord" { return "Eq" }
+    if name == "Hash" { return "Eq" }
+    ""
+}
+
+fn builtin_trait_methods(name: Str) -> Str {
+    if name == "Eq" { return "|eq|ne|" }
+    if name == "Ord" { return "|cmp|" }
+    if name == "Hash" { return "|hash|" }
+    if name == "Add" { return "|add|" }
+    if name == "Sub" { return "|sub|" }
+    if name == "Mul" { return "|mul|" }
+    if name == "Div" { return "|div|" }
+    if name == "Rem" { return "|rem|" }
+    if name == "Neg" { return "|neg|" }
+    if name == "Display" { return "|fmt|display|" }
+    if name == "Clone" { return "|clone|" }
+    ""
+}
+
+// The trait-bound set of one TypeParam / where-constraint node — its declared bounds,
+// plus each bound's built-in supertrait (so `T: Ord` also licenses `==`).
+fn tparam_node_bound_traits(tp: Int) -> Str {
+    let mut set = "|"
+    let bounds = node_elements(tp)
+    if bounds == -1 { return set }
+    let mut i = 0
+    while i < sublist_length(bounds) {
+        let bn = strip_module_qualifier(node_name(sublist_get(bounds, i)))
+        set = tc_pipe_add(set, bn)
+        set = tc_pipe_add(set, builtin_trait_supers(bn))
+        i = i + 1
+    }
+    set
+}
+
+fn tc_add_node_methods(set: Str, tr_node: Int) -> Str {
+    let ms = node_methods(tr_node)
+    if ms == -1 { return set }
+    let mut acc = set
+    let mut i = 0
+    while i < sublist_length(ms) {
+        acc = tc_pipe_add(acc, node_name(sublist_get(ms, i)))
+        i = i + 1
+    }
+    acc
+}
+
+// Push the implicit `Self` frame for a trait's default bodies: `Self` bounded by the
+// trait's guarantee set (own methods + the transitive supertrait closure's methods),
+// with an arithmetic bit set when any arithmetic trait is in the closure.
+fn tc_push_self_frame(tr_node: Int) {
+    let mut traits = tc_pipe_add("|", node_name(tr_node))
+    let mut methods = tc_add_node_methods("|", tr_node)
+    let mut work: List[Str] = []
+    let seed = node_supertraits(tr_node)
+    if seed != -1 {
+        let mut si = 0
+        while si < sublist_length(seed) {
+            work.push(strip_module_qualifier(node_name(sublist_get(seed, si))))
+            si = si + 1
+        }
+    }
+    while work.len() > 0 {
+        let s = work.pop().unwrap()
+        if tc_pipe_has(traits, s) == 0 {
+            traits = tc_pipe_add(traits, s)
+            // A builtin trait's sealed/synthesized methods (Display's `display`, Eq's `ne`)
+            // and intrinsic supertraits (Ord: Eq) live in the compiler, not the AST — merge
+            // them even when the trait ALSO has a user node (Display/Eq/Ord are in the
+            // stdlib). Both are "" for a pure user trait, so this is a no-op there.
+            methods = tc_pipe_merge(methods, builtin_trait_methods(s))
+            let bs = builtin_trait_supers(s)
+            if bs != "" { work.push(bs) }
+            let snode = tc_trait_node_idx.get(s) ?? -1
+            if snode != -1 {
+                methods = tc_add_node_methods(methods, snode)
+                let sup = node_supertraits(snode)
+                if sup != -1 {
+                    let mut ui = 0
+                    while ui < sublist_length(sup) {
+                        work.push(strip_module_qualifier(node_name(sublist_get(sup, ui))))
+                        ui = ui + 1
+                    }
+                }
+            }
+        }
+    }
+    let has_arith = tc_pipe_has(traits, "Add") != 0 || tc_pipe_has(traits, "Sub") != 0 || tc_pipe_has(traits, "Mul") != 0 || tc_pipe_has(traits, "Div") != 0 || tc_pipe_has(traits, "Rem") != 0 || tc_pipe_has(traits, "Neg") != 0
+    let arith = if has_arith { 1 } else { 0 }
+    tc_tp_arith_names.push("Self")
+    tc_tp_arith_bits.push(arith)
+    tc_tp_bound_traits.push(traits)
+    tc_tp_bound_methods.push(methods)
+}
+
+fn tc_pop_self_frame() {
+    let _ = tc_tp_arith_names.pop()
+    let _ = tc_tp_arith_bits.pop()
+    let _ = tc_tp_bound_traits.pop()
+    let _ = tc_tp_bound_methods.pop()
+}
+
+// The innermost active binding of `name`: its pipe-framed trait set / method set, or
+// "" if `name` is not an active type parameter (mirrors tc_tparam_arith_state).
+fn tc_tparam_bound_traits(name: Str) -> Str {
+    let mut i = tc_tp_arith_names.len() - 1
+    while i >= 0 {
+        if tc_tp_arith_names.get(i).unwrap() == name {
+            return tc_tp_bound_traits.get(i).unwrap()
+        }
+        i = i - 1
+    }
+    ""
+}
+
+fn tc_tparam_bound_methods(name: Str) -> Str {
+    let mut i = tc_tp_arith_names.len() - 1
+    while i >= 0 {
+        if tc_tp_arith_names.get(i).unwrap() == name {
+            return tc_tp_bound_methods.get(i).unwrap()
+        }
+        i = i - 1
+    }
+    ""
+}
+
+// The arithmetic trait an operator desugars to (§3.6). Binary `-` maps to Sub, but
+// unary `-` maps to Neg — they share the `-` spelling, so the caller says which.
+fn arith_backing_trait(op: Str, is_unary: Int) -> Str {
+    if op == "+" { return "Add" }
+    if op == "*" { return "Mul" }
+    if op == "/" { return "Div" }
+    if op == "%" { return "Rem" }
+    if is_unary != 0 { return "Neg" }
+    "Sub"
+}
+
+fn arith_backing_method(op: Str, is_unary: Int) -> Str {
+    if op == "+" { return "add" }
+    if op == "*" { return "mul" }
+    if op == "/" { return "div" }
+    if op == "%" { return "rem" }
+    if is_unary != 0 { return "neg" }
+    "sub"
+}
+
+// The comparison licensing check for an operand of a type-parameter type:
+// relational ops (`<` `>` `<=` `>=`) desugar to Ord.cmp, equality (`==` `!=`) to Eq.eq.
+// Licensed only when the backing trait is in the parameter's declared bound set; Ord
+// licenses equality too (Ord's Eq supertrait). `Self` in a trait default body reports
+// against the trait definition with the supertrait fix (E0305); any other type
+// parameter reports the missing bound (E0300). Fails open only when the name is not an
+// active type parameter (unmodeled builtin lowered to a typevar) — matching the
+// arithmetic check (reject_non_numeric_arith_operand).
+fn reject_unlicensed_comparison(op: Str, tid: Int, node: Int) ! TypeCheck.Report, Diag.Report {
+    if type_kind(resolve_alias_tid(tid)) != TyKind.Typevar { return }
+    let name = type_to_str(tid)
+    let traits = tc_tparam_bound_traits(name)
+    if traits == "" { return }
+    let relational = if op == "==" || op == "!=" { 0 } else { 1 }
+    if relational != 0 {
+        if tc_pipe_has(traits, "Ord") != 0 { return }
+    } else {
+        if tc_pipe_has(traits, "Eq") != 0 || tc_pipe_has(traits, "Ord") != 0 { return }
+    }
+    if name == "Self" {
+        let bt = if relational != 0 { "Ord" } else { "Eq" }
+        let bm = if relational != 0 { "Ord.cmp" } else { "Eq.eq" }
+        diag_error_at("UnlicensedSelfOperation", UNLICENSED_SELF_OP,
+            "'{op}' on `Self` is not licensed by `{tc_current_self_trait}` ('{op}' desugars to {bm}, but `{tc_current_self_trait}` does not require {bt})", node,
+            "declare the supertrait so every implementor provides '{op}': trait {tc_current_self_trait}: {bt} \{ ... \}")
+        return
+    }
+    let bt = if relational != 0 { "Ord" } else { "Eq" }
+    let bm = if relational != 0 { "Ord.cmp" } else { "Eq.eq" }
+    diag_error_at("TypeError", TYPE_ERROR,
+        "comparison '{op}' requires a trait bound on type parameter {name} ('{op}' desugars to {bm})", node,
+        "add a comparison bound so the operation is licensed, e.g. `[{name}: {bt}]`")
 }
 
 fn tc_push_tparam_scope(tparams_sl: Int) {
@@ -6357,6 +6654,17 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
     // Record the declared tparam count by trait name for the E0910
     // arity check, independent of whether the trait has any methods.
     tc_trait_tparam_count_idx.insert(name, tp_count)
+    // Record direct supertraits for the E0911 obligation check.
+    let mut supers = "|"
+    let sup_sl = node_supertraits(tr_node)
+    if sup_sl != -1 {
+        let mut spi = 0
+        while spi < sublist_length(sup_sl) {
+            supers = tc_pipe_add(supers, strip_module_qualifier(node_name(sublist_get(sup_sl, spi))))
+            spi = spi + 1
+        }
+    }
+    tc_trait_supers_idx.insert(name, supers)
     let methods_sl = node_methods(tr_node)
     if methods_sl != -1 {
         // The trait's own tparams are in scope inside its method signatures;
@@ -6769,6 +7077,35 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
             si = si + 1
         }
         tc_pop_tparam_scope(binders_sl)
+        // E0911: an impl of a subtrait must satisfy every supertrait (transitively)
+        // for the receiver. This is the soundness basis of the E0305 Self-licensing
+        // rule — a default body may call a supertrait method on `Self` only because
+        // every implementor is guaranteed to provide it. Only user-sourced impls are
+        // checked; the stdlib is trusted.
+        if is_user_sourced(im) != 0 {
+            let supers = tc_trait_direct_supers(trait_name)
+            let mut seg_start = 0
+            let mut ci = 0
+            while ci <= supers.len() {
+                if ci == supers.len() || supers.byte_at(ci) == 124 {
+                    if ci > seg_start {
+                        let sname = supers.substring(seg_start, ci - seg_start)
+                        if tc_type_satisfies_trait(impl_type, sname, impls_sl) == 0 {
+                            let fix = if is_arith_trait_name(sname) != 0 {
+                                "{sname} is a sealed arithmetic trait — only built-in numeric types implement it, so no user type can satisfy `{trait_name}: {sname}`; implement `{trait_name}` only for a numeric type, or drop the `: {sname}` supertrait if `{trait_name}` does not need it"
+                            } else if tc_is_derivable_trait(sname) != 0 {
+                                "derive it: `@derive({sname})` on `{impl_type}`, or write `impl {sname} for {impl_type}`"
+                            } else {
+                                "add `impl {sname} for {impl_type}`"
+                            }
+                            diag_error_at("MissingSupertraitImpl", MISSING_SUPERTRAIT_IMPL, "impl {trait_name} for {impl_type} requires {impl_type} to also implement supertrait '{sname}' (trait {trait_name}: {sname})", im, fix)
+                        }
+                    }
+                    seg_start = ci + 1
+                }
+                ci = ci + 1
+            }
+        }
         let impl_assoc_sl = node_assoc_types(im)
         let mut ati = 0
         while ati < tc_trait_assoc_names.len() {
@@ -6843,6 +7180,8 @@ fn init_types() ! TypeCheck.Register {
     tc_active_tparams.clear()
     tc_tp_arith_names.clear()
     tc_tp_arith_bits.clear()
+    tc_tp_bound_traits.clear()
+    tc_tp_bound_methods.clear()
     tc_alias_underlying = Map()
     sfield_pool.clear()
     nr_callable_field_names.clear()
@@ -6866,6 +7205,7 @@ fn init_types() ! TypeCheck.Register {
     tc_tmsig_param_tids.clear()
     tc_trait_tparam_names.clear()
     tc_trait_tparam_count_idx.clear()
+    tc_trait_supers_idx.clear()
     tc_current_fn_ret = -1
     tc_current_fn_name = ""
     tc_current_self_tid = -1
@@ -10451,7 +10791,7 @@ fn is_arith_numeric_type(tid: Int) -> Int {
     0
 }
 
-fn reject_non_numeric_arith_operand(op: Str, tid: Int, node: Int) ! TypeCheck.Report, Diag.Report {
+fn reject_non_numeric_arith_operand(op: Str, tid: Int, node: Int, is_unary: Int) ! TypeCheck.Report, Diag.Report {
     if is_arith_numeric_type(tid) == 0 {
         if type_kind(resolve_alias_tid(tid)) == TyKind.Typevar {
             let tpname = type_to_str(tid)
@@ -10465,6 +10805,17 @@ fn reject_non_numeric_arith_operand(op: Str, tid: Int, node: Int) ! TypeCheck.Re
             //     unmodeled builtin lowered to a typevar) — leave it as before this
             //     check; this check targets real type parameters only.
             if st != 0 {
+                return
+            }
+            // `Self` in a trait default body: report against the trait definition with
+            // the sealed-arithmetic diagnostic. Because the arithmetic traits are sealed
+            // to the numerics, naming one as a supertrait is not an actionable repair, so
+            // the help does NOT suggest it (Q5=B) — it names the seal and the real options.
+            if tpname == "Self" {
+                let bt = arith_backing_trait(op, is_unary)
+                diag_error_at("UnlicensedSelfOperation", UNLICENSED_SELF_OP,
+                    "'{op}' on `Self` is not licensed by `{tc_current_self_trait}` ('{op}' desugars to {bt}.{arith_backing_method(op, is_unary)}, but `{tc_current_self_trait}` does not require {bt})", node,
+                    "{bt} is a sealed arithmetic trait — only built-in numeric types implement it, so no user type could satisfy it; make this a required method (drop the default body) so each implementor defines it, or use a concrete numeric type instead of `Self`")
                 return
             }
             diag_error_at("TypeError", TYPE_ERROR,
@@ -10527,8 +10878,10 @@ fn cmp_operands_ok(lt: Int, rt: Int, relational: Int) -> Int {
     let kb = type_kind(b)
 
     // Fail-open on types we cannot model here, mirroring types_compatible:
-    //   - TyKind.Typevar: generic `T <op> T` resolves at monomorphization (the
-    //     concrete type's Eq/Ord is checked there).
+    //   - TyKind.Typevar: a type-parameter operand's Ord/Eq licensing is decided at
+    //     the definition by reject_unlicensed_comparison (the caller runs it first),
+    //     so returning 1 here avoids a redundant "incompatible types" report on top of
+    //     the missing-bound diagnostic; a licensed `[T: Ord]` compare is genuinely ok.
     //   - TyKind.Void: an under-inferred value (e.g. an un-annotated closure return
     //     flowing through Bytes.with_ptr) types as Void; rejecting it would
     //     break programs that compiled before operand checking landed.
@@ -10981,6 +11334,15 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         let rt = infer_type(node_right(node))
 
         if is_comparison_op(op) {
+            // A comparison on a type-parameter operand is licensed only by that
+            // parameter's declared bounds (Ord/Eq): `Self` in a trait default body by
+            // the guarantee set (E0305), any other type parameter by its `[T: Ord]` /
+            // `[T: Eq]` bound (E0300). Report on the left operand; on the right only
+            // when the left is not itself the same `Self`, so `self < other` reports once.
+            reject_unlicensed_comparison(op, lt, node)
+            if type_kind(resolve_alias_tid(lt)) != TyKind.Typevar || type_to_str(lt) != "Self" {
+                reject_unlicensed_comparison(op, rt, node)
+            }
             // Comparison operators desugar to Eq.eq / Ord.cmp and require
             // same-type operands (spec 03_types.md:1809). Validate when both sides
             // are known, preserving the enum-vs-Int representation exception
@@ -11017,8 +11379,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             return TYPE_STR
         }
         if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
-            reject_non_numeric_arith_operand(op, lt, node)
-            reject_non_numeric_arith_operand(op, rt, node)
+            reject_non_numeric_arith_operand(op, lt, node, 0)
+            // Skip the right operand only when the left is `Self` and already reported
+            // it — `self + self` must not raise two identical E0305. A non-`Self` left
+            // still lets the right be checked independently.
+            if type_kind(resolve_alias_tid(lt)) != TyKind.Typevar || type_to_str(lt) != "Self" {
+                reject_non_numeric_arith_operand(op, rt, node, 0)
+            }
             // A bare int literal takes its type from the surrounding expression
             // (spec sections/03_types.md:874), so `a * 2` with `a: I32` treats
             // `2` as I32 and yields I32 — not a rejected `I32 * Int`. Coerce a
@@ -11096,7 +11463,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if op == "-" {
             // Unary minus desugars to Neg.neg, a sealed arithmetic trait (spec
             // sections/02_syntax.md:1046) — `-someStruct` / `-someOpaque` is not numeric.
-            reject_non_numeric_arith_operand(op, operand, node)
+            reject_non_numeric_arith_operand(op, operand, node, 1)
             return operand
         }
         if op == "~" {
@@ -11514,6 +11881,20 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // child, which typed `e.unwrap()` on an `Option[T]` α one level too deep.
         let obj_t = tc_resolve(infer_type(obj_node))
         let obj_k = type_kind(obj_t)
+
+        // A plain method call on `Self` in a trait default body is licensed only when the
+        // method is in the trait's guarantee set (its own methods + the supertrait
+        // closure's). Reported at the trait definition (E0305). Fires only for a `Self`
+        // receiver with an active `Self` frame, so ordinary calls are untouched.
+        if obj_k == TyKind.Typevar && type_to_str(obj_t) == "Self" {
+            let gm = tc_tparam_bound_methods("Self")
+            if gm != "" && tc_pipe_has(gm, method) == 0 {
+                diag_error_at("UnlicensedSelfOperation", UNLICENSED_SELF_OP,
+                    "method '.{method}' on `Self` is not licensed by `{tc_current_self_trait}`", node,
+                    "`{tc_current_self_trait}` does not declare '{method}', and no supertrait it names provides it; declare the method on `{tc_current_self_trait}` (or a supertrait that has it) so every implementor supplies it")
+                return TYPE_UNKNOWN
+            }
+        }
 
         // Builtin scalar Display: display() -> Str and fmt(sb) on Int/Float/Bool/Str/Char.
         if obj_k == TyKind.Int || obj_k == TyKind.Float || obj_k == TyKind.Bool || obj_k == TyKind.Str || obj_k == TyKind.Char {
@@ -13983,8 +14364,8 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // else-less `if` (no value on the false path) is rejected.
             let val_t = tc_infer_value(val)
             if kind == NodeKind.CompoundAssign {
-                reject_non_numeric_arith_operand(node_op(node), target_t, node)
-                reject_non_numeric_arith_operand(node_op(node), val_t, node)
+                reject_non_numeric_arith_operand(node_op(node), target_t, node, 0)
+                reject_non_numeric_arith_operand(node_op(node), val_t, node, 0)
             }
             if target_t != TYPE_UNKNOWN && val_t != TYPE_UNKNOWN {
                 if assignment_types_compatible(target_t, val_t, val) == 0 {
@@ -15198,6 +15579,62 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
             tc_pop_tparam_scope(impl_binders_sl)
             tc_current_self_tid = -1
             i = i + 1
+        }
+    }
+
+    // Type check trait DEFAULT method bodies against an abstract, guarantee-set-bounded
+    // `Self` (E0305). A default body belongs to no impl, so the impl loop above never
+    // reaches it — this is the only place `self + self` / `self < other` / `self.foo()`
+    // on the abstract `Self` is checked, closing the hole where such a body slipped past
+    // the typechecker and died at the C compiler.
+    let traits_walk_sl = node_arms(program)
+    if traits_walk_sl != -1 {
+        // Index every trait by name so the guarantee-set closure can traverse user
+        // supertraits transitively.
+        tc_trait_node_idx.clear()
+        let mut ti = 0
+        while ti < sublist_length(traits_walk_sl) {
+            let trn0 = sublist_get(traits_walk_sl, ti)
+            tc_trait_node_idx.insert(node_name(trn0), trn0)
+            ti = ti + 1
+        }
+        let self_tv = make_typevar("Self")
+        let mut wi = 0
+        while wi < sublist_length(traits_walk_sl) {
+            let trn = sublist_get(traits_walk_sl, wi)
+            let tmethods_sl = node_methods(trn)
+            if tmethods_sl != -1 {
+                nr_current_module = node_module(trn)
+                tc_current_self_trait = node_name(trn)
+                tc_push_self_frame(trn)
+                tc_push_tparam_scope(node_type_params(trn))
+                tc_current_self_tid = self_tv
+                // A default body's signature is in tc_tmsig_pool, not fnsig_pool: a
+                // sentinel key that misses leaves sig == -1 in tc_check_fn, so the
+                // missing-tail check (gated on sig != -1) does not run against the abstract
+                // `Self`. Only the operator / method licensing is wanted here.
+                tc_current_method_sig_key = "__trait_default_no_sig__"
+                let prev_walk_ret = tc_current_fn_ret
+                let mut mj = 0
+                while mj < sublist_length(tmethods_sl) {
+                    let dm = sublist_get(tmethods_sl, mj)
+                    if node_body(dm) != -1 {
+                        // sig == -1 leaves tc_check_fn's declared-return install un-run, so
+                        // set it here (Self resolves to the abstract self typevar) — an
+                        // explicit `return expr` in the body is checked against it.
+                        tc_current_fn_ret = resolve_type_ann(node_type_ann(dm))
+                        tc_check_fn(dm)
+                    }
+                    mj = mj + 1
+                }
+                tc_current_fn_ret = prev_walk_ret
+                tc_current_method_sig_key = ""
+                tc_current_self_tid = -1
+                tc_pop_tparam_scope(node_type_params(trn))
+                tc_pop_self_frame()
+                tc_current_self_trait = ""
+            }
+            wi = wi + 1
         }
     }
 

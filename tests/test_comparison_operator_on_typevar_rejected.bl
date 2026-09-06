@@ -1,0 +1,114 @@
+// Comparison on a type parameter is checked at the DEFINITION site, against the
+// parameter's declared trait bounds (bounded parametric polymorphism, §3 spec).
+// This is the comparison-operator half of the same rule the arithmetic operators
+// already follow (see test_arith_operator_on_typevar_rejected.bl).
+//
+//   - UNBOUNDED `T`: `fn lt[T](a: T, b: T) -> Bool { a < b }` is ill-typed where it
+//     is written. A relational `<` desugars to Ord.cmp; with no `T: Ord` bound the
+//     operation is not licensed, so it is rejected at the definition, whether or not
+//     it is ever instantiated. Equality `==`/`!=` desugars to Eq.eq and needs `T: Eq`.
+//   - BOUNDED `T`: a matching bound (`[T: Ord]` for relational, `[T: Eq]` or `[T: Ord]`
+//     for equality — Ord's Eq supertrait licenses `==` too) makes the definition
+//     type-check. This closes the fail-open-on-Typevar hole in cmp_operands_ok.
+//
+// Call-site enforcement (rejecting `lt([1], [2])` because List has no Ord) is a
+// separate, larger piece and is not covered here.
+
+fn main() {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+
+    let base = ".tmp/_test_comparison_operator_on_typevar_rejected"
+    shell_exec("rm -rf {base}")
+    shell_exec("mkdir -p {base}")
+    write_file("{base}/blink.toml", "[package]\nname = \"cotr\"\nversion = \"0.1.0\"\n\n[dependencies]\n")
+
+    // Each REJECT case is a full program that must be rejected at the definition
+    // site: a comparison operator on an UNBOUNDED type parameter.
+    let reject_cases = [
+        // Relational operators need Ord.
+        "fn lt[T](a: T, b: T) -> Bool \{ a < b \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        "fn gt[T](a: T, b: T) -> Bool \{ a > b \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        "fn le[T](a: T, b: T) -> Bool \{ a <= b \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        "fn ge[T](a: T, b: T) -> Bool \{ a >= b \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        // Equality operators need Eq.
+        "fn eq[T](a: T, b: T) -> Bool \{ a == b \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        "fn ne[T](a: T, b: T) -> Bool \{ a != b \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        // Instantiated at a type with no Ord: still the same definition-site defect.
+        "fn lt[T](a: T, b: T) -> Bool \{ a < b \}\n\nfn main() \{\n    let _x = lt([1], [2])\n    io.println(\"unreachable\")\n\}\n",
+    ]
+    let mut ci = 0
+    while ci < reject_cases.len() {
+        let src = reject_cases.get(ci).unwrap()
+        write_file("{base}/case_{ci}.bl", src)
+
+        let cmd = "cd {base} && {blink_root}/build/blink check case_{ci}.bl 2>&1"
+        let result = process_run("sh", ["-c", cmd])
+
+        if result.exit_code == 0 {
+            io.println("FAIL: reject case {ci} should be rejected, but check exited 0")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        if !result.out.contains("E0300") && !result.out.contains("TypeError") {
+            io.println("FAIL: reject case {ci} did not emit E0300 / TypeError")
+            io.println("got: {result.out}")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        ci = ci + 1
+    }
+
+    // ACCEPT cases: a matching bound licenses the operation, so the definition
+    // type-checks and a numeric instantiation runs.
+    let accept_cases = [
+        // Inline `[T: Ord]` licenses relational.
+        "fn lt[T: Ord](a: T, b: T) -> Bool \{ a < b \}\n\nfn main() \{\n    io.println(\"\{lt(1, 2)\}\")\n\}\n",
+        // Inline `[T: Eq]` licenses equality.
+        "fn eq[T: Eq](a: T, b: T) -> Bool \{ a == b \}\n\nfn main() \{\n    io.println(\"\{eq(1, 1)\}\")\n\}\n",
+        // Ord licenses equality too (Ord's Eq supertrait).
+        "fn eqo[T: Ord](a: T, b: T) -> Bool \{ a == b \}\n\nfn main() \{\n    io.println(\"\{eqo(1, 1)\}\")\n\}\n",
+        // `where T: Ord` on a polymorphic impl method.
+        "trait Cmper[T] \{ fn less(self, a: T, b: T) -> Bool \}\n\nimpl[T] Cmper[T] for List[T] where T: Ord \{\n    fn less(self, a: T, b: T) -> Bool \{ a < b \}\n\}\n\nfn main() \{\n    let xs: List[Int] = [1]\n    io.println(\"\{xs.less(2, 3)\}\")\n\}\n",
+    ]
+    let mut ai = 0
+    while ai < accept_cases.len() {
+        let src = accept_cases.get(ai).unwrap()
+        write_file("{base}/accept_{ai}.bl", src)
+        let cmd = "cd {base} && {blink_root}/build/blink run accept_{ai}.bl 2>&1"
+        let result = process_run("sh", ["-c", cmd])
+        if result.exit_code != 0 {
+            io.println("FAIL: accept case {ai} (bounded comparison) should compile + run, exited {result.exit_code}")
+            io.println("got: {result.out}")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        if !result.out.contains("true") {
+            io.println("FAIL: accept case {ai} should print 'true'")
+            io.println("got: {result.out}")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        ai = ai + 1
+    }
+
+    // Positive guard: comparison on a concrete monomorphic body still works.
+    let ok_src = "fn less(a: Int, b: Int) -> Bool \{ a < b \}\n\nfn main() \{\n    io.println(\"\{less(1, 2)\}\")\n\}\n"
+    write_file("{base}/ok.bl", ok_src)
+    let ok_cmd = "cd {base} && {blink_root}/build/blink run ok.bl 2>&1"
+    let ok_result = process_run("sh", ["-c", ok_cmd])
+    if ok_result.exit_code != 0 {
+        io.println("FAIL: concrete comparison should compile + run, exited {ok_result.exit_code}")
+        io.println("got: {ok_result.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if !ok_result.out.contains("true") {
+        io.println("FAIL: less(1, 2) should print 'true'")
+        io.println("got: {ok_result.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+
+    io.println("PASS: unbounded comparison on a type parameter is rejected; a bound licenses it; concrete comparison still works")
+    shell_exec("rm -rf {base}")
+}

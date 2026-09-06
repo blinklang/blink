@@ -1,0 +1,196 @@
+// Operators and method calls on `Self` in a trait DEFAULT method body are checked
+// at the trait DEFINITION site (§3 spec, "Operations on `Self` in a Default Body").
+//
+// In a default body `self` has the abstract type `Self`, treated as an implicit type
+// parameter bounded by the trait's GUARANTEE SET: the methods the trait declares,
+// plus every method of each trait in its supertrait clause, transitively. An operator
+// (which desugars to a trait method, §3.6) or a plain method call on `Self` is
+// well-formed ONLY when its backing trait is in the guarantee set. A violation is
+// reported at the trait definition with error[UnlicensedSelfOperation] (E0305) — before
+// any implementor exists, closing the hole where `self + self` on a user type slipped
+// past the typechecker and died at the C compiler.
+//
+// Two-branch diagnostic:
+//   - SEALED backing trait (Add/Sub/Mul/Div/Rem/Neg): must NOT suggest `: Add`
+//     (unsatisfiable by any user type); names the seal instead.
+//   - OPEN backing trait (`<` -> Ord, `==` -> Eq): offers the one-click supertrait fix.
+//
+// Rejection rows run the compiler in a SUBPROCESS: they are compile errors, so an
+// in-file row could not be red without failing to compile the whole test file.
+
+import std.process.{ProcessResult}
+
+fn check_src(tag: Str, src: Str) -> ProcessResult {
+    let bl_path = ".tmp/_self_op_{tag}.bl"
+    write_file(bl_path, src)
+    let r = process_run("build/blink", ["check", bl_path, "--format", "json"])
+    shell_exec("rm -f {bl_path}")
+    r
+}
+
+fn expect_rejected(tag: Str, needle: Str, src: Str) {
+    let r = check_src(tag, src)
+    let out = "{r.out}{r.err_out}"
+    if r.exit_code == 0 { io.println("FAIL[{tag}] accepted, expected rejection") }
+    assert(r.exit_code != 0)
+    if !out.contains("E0305") { io.println("FAIL[{tag}] want E0305, got: {out}") }
+    assert(out.contains("E0305"))
+    if !out.contains(needle) { io.println("FAIL[{tag}] want '{needle}', got: {out}") }
+    assert(out.contains(needle))
+}
+
+fn expect_accepted(tag: Str, src: Str) {
+    let r = check_src(tag, src)
+    let out = "{r.out}{r.err_out}"
+    if r.exit_code != 0 { io.println("FAIL[{tag}] rejected, expected acceptance: {out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// ── REJECT: sealed arithmetic on Self, no supertrait ─────────────────────────
+
+test "self + self with no Add supertrait is rejected, sealed diagnostic" {
+    let r = check_src("add_sealed", #"trait Doubler {
+    fn double(self) -> Self { self + self }
+}
+
+fn main() {}
+"#)
+    let out = "{r.out}{r.err_out}"
+    assert(r.exit_code != 0)
+    assert(out.contains("E0305"))
+    // Sealed-case: must name the seal and must NOT suggest adding `: Add`.
+    if out.contains(": Add") { io.println("FAIL sealed case must not suggest ': Add': {out}") }
+    assert(!out.contains(": Add"))
+    if !out.contains("sealed") { io.println("FAIL want 'sealed' in: {out}") }
+    assert(out.contains("sealed"))
+}
+
+// ── REJECT: comparison / equality on Self, open backing trait ────────────────
+
+test "self < other with no Ord supertrait is rejected, offers : Ord" {
+    expect_rejected("lt_open", "Ord", #"trait Ranked {
+    fn rank(self) -> Int
+    fn before(self, other: Self) -> Bool { self < other }
+}
+
+fn main() {}
+"#)
+}
+
+test "self == other with no Eq supertrait is rejected, offers : Eq" {
+    expect_rejected("eq_open", "Eq", #"trait Keyed {
+    fn key(self) -> Int
+    fn same(self, other: Self) -> Bool { self == other }
+}
+
+fn main() {}
+"#)
+}
+
+// ── REJECT: plain method call on Self not in the guarantee set ────────────────
+
+test "self.method() not in the guarantee set is rejected" {
+    expect_rejected("method_unlicensed", "shout", #"trait Speaker {
+    fn say(self) { self.shout() }
+}
+
+fn main() {}
+"#)
+}
+
+// ── ACCEPT: the supertrait licenses the operation at the definition ───────────
+
+test "self < other with : Ord supertrait is accepted" {
+    expect_accepted("lt_licensed", #"trait Ranked: Ord {
+    fn rank(self) -> Int
+    fn before(self, other: Self) -> Bool { self < other }
+}
+
+fn main() {}
+"#)
+}
+
+test "self == other with : Eq supertrait is accepted" {
+    expect_accepted("eq_licensed", #"trait Keyed: Eq {
+    fn key(self) -> Int
+    fn same(self, other: Self) -> Bool { self == other }
+}
+
+fn main() {}
+"#)
+}
+
+test "self + self with : Add supertrait is accepted at the definition" {
+    expect_accepted("add_licensed", #"trait Doubler: Add {
+    fn double(self) -> Self { self + self }
+}
+
+fn main() {}
+"#)
+}
+
+// ── ACCEPT: a call to one of the trait's OWN methods is always licensed ───────
+
+test "self.own_method() in a default body is accepted (regression guard)" {
+    expect_accepted("own_method", #"trait Equatable {
+    fn eq(self, other: Self) -> Bool
+    fn ne(self, other: Self) -> Bool { !self.eq(other) }
+}
+
+fn main() {}
+"#)
+}
+
+// ── REJECT: unary minus on Self names Neg (not Sub) ──────────────────────────
+
+test "unary minus on Self is rejected and names Neg, not Sub" {
+    let r = check_src("neg_sealed", #"trait Negatable {
+    fn flip(self) -> Self { -self }
+}
+
+fn main() {}
+"#)
+    let out = "{r.out}{r.err_out}"
+    assert(r.exit_code != 0)
+    assert(out.contains("E0305"))
+    // Unary `-` desugars to Neg.neg, not Sub.sub.
+    if !out.contains("Neg") { io.println("FAIL unary minus must name Neg: {out}") }
+    assert(out.contains("Neg"))
+    if out.contains("Sub") { io.println("FAIL unary minus must not name Sub: {out}") }
+    assert(!out.contains("Sub"))
+}
+
+// ── ACCEPT: the sealed Display.display() is in the guarantee set of `: Display` ─
+
+test "self.display() is licensed by a : Display supertrait" {
+    expect_accepted("display_via_super", #"trait Show: Display {
+    fn present(self) -> Str { self.display() }
+}
+
+fn main() {}
+"#)
+}
+
+// ── ACCEPT: an explicit `return` in a default body checks against the declared ─
+
+test "explicit return in a default body checks against the declared return type" {
+    expect_accepted("explicit_return", #"trait Ranked: Ord {
+    fn rank(self) -> Int
+    fn top(self, other: Self) -> Bool { return self < other }
+}
+
+fn main() {}
+"#)
+}
+
+// ── ACCEPT: a relational op licensed transitively through Ord's Eq supertrait ─
+
+test "self == other is licensed by : Ord (Ord's Eq supertrait), transitively" {
+    expect_accepted("eq_via_ord", #"trait Ranked: Ord {
+    fn rank(self) -> Int
+    fn same(self, other: Self) -> Bool { self == other }
+}
+
+fn main() {}
+"#)
+}

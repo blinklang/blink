@@ -1,0 +1,85 @@
+// An impl of a trait that declares supertraits must also satisfy each supertrait
+// for the receiver type (spec 03_types.md:2156 — "Hash: Eq means implementing Hash
+// requires implementing Eq"). This is the soundness foundation of the E0305
+// UnlicensedSelfOperation rule: a trait default body may call a supertrait's method
+// on Self only because every implementor is guaranteed to provide that supertrait.
+//
+// The obligation is checked at the impl site. `@derive` already auto-derives
+// supertraits (spec 03_types.md:2935), so only EXPLICIT impls need this check.
+// A builtin receiver (Int, Str, ...) satisfies the builtin comparison traits
+// intrinsically, so it is never rejected here.
+
+fn main() {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+
+    let base = ".tmp/_test_supertrait_impl_obligation"
+    shell_exec("rm -rf {base}")
+    shell_exec("mkdir -p {base}")
+    write_file("{base}/blink.toml", "[package]\nname = \"stio\"\nversion = \"0.1.0\"\n\n[dependencies]\n")
+
+    // REJECT: `Ranked: Ord`, but the receiver has neither an Ord impl nor a derive.
+    let reject_src = "trait Ranked: Ord \{ fn rank(self) -> Int \}\n\ntype Foo \{ x: Int \}\n\nimpl Ranked for Foo \{\n    fn rank(self) -> Int \{ self.x \}\n\}\n\nfn main() \{\n    io.println(\"\{Foo \{ x: 1 \}.rank()\}\")\n\}\n"
+    write_file("{base}/reject.bl", reject_src)
+    let rres = process_run("sh", ["-c", "cd {base} && {blink_root}/build/blink check reject.bl 2>&1"])
+    if rres.exit_code == 0 {
+        io.println("FAIL: impl Ranked for Foo without Ord should be rejected, but check exited 0")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if !rres.out.contains("E0911") && !rres.out.contains("supertrait") {
+        io.println("FAIL: reject case did not name the missing supertrait (E0911)")
+        io.println("got: {rres.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+
+    // REJECT: a sealed arithmetic supertrait can never be satisfied by a user type,
+    // so the hint must NOT suggest `impl Add for Foo` (an unactionable loop). It names
+    // the seal and the real options instead.
+    let sealed_src = "trait Doubler: Add \{ fn double(self) -> Self \}\n\ntype Baz \{ x: Int \}\n\nimpl Doubler for Baz \{\n    fn double(self) -> Self \{ self \}\n\}\n\nfn main() \{}\n"
+    write_file("{base}/sealed.bl", sealed_src)
+    let sres = process_run("sh", ["-c", "cd {base} && {blink_root}/build/blink check sealed.bl 2>&1"])
+    if sres.exit_code == 0 {
+        io.println("FAIL: impl Doubler for Baz (Doubler: Add) should be rejected")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if sres.out.contains("impl Add for Baz") {
+        io.println("FAIL: sealed-arith supertrait must not suggest `impl Add for Baz`")
+        io.println("got: {sres.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if !sres.out.contains("sealed") {
+        io.println("FAIL: sealed-arith supertrait hint should name the seal")
+        io.println("got: {sres.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+
+    // ACCEPT cases: the supertrait is satisfied one way or another.
+    let accept_cases = [
+        // @derive(Ord) on the receiver auto-derives Eq too, satisfying Ord.
+        "trait Ranked: Ord \{ fn rank(self) -> Int \}\n\n@derive(Ord)\ntype Foo \{ x: Int \}\n\nimpl Ranked for Foo \{\n    fn rank(self) -> Int \{ self.x \}\n\}\n\nfn main() \{\n    io.println(\"\{Foo \{ x: 1 \}.rank()\}\")\n\}\n",
+        // A trait with NO supertrait imposes no obligation.
+        "trait Named \{ fn name(self) -> Str \}\n\ntype Bar \{ y: Int \}\n\nimpl Named for Bar \{\n    fn name(self) -> Str \{ \"bar\" \}\n\}\n\nfn main() \{\n    io.println(Bar \{ y: 1 \}.name())\n\}\n",
+        // A builtin receiver satisfies the comparison supertrait intrinsically.
+        "trait Ranked: Ord \{ fn rank(self) -> Int \}\n\nimpl Ranked for Int \{\n    fn rank(self) -> Int \{ self \}\n\}\n\nfn main() \{\n    io.println(\"\{(7).rank()\}\")\n\}\n",
+    ]
+    let mut ai = 0
+    while ai < accept_cases.len() {
+        let src = accept_cases.get(ai).unwrap()
+        write_file("{base}/accept_{ai}.bl", src)
+        let ares = process_run("sh", ["-c", "cd {base} && {blink_root}/build/blink check accept_{ai}.bl 2>&1"])
+        if ares.exit_code != 0 {
+            io.println("FAIL: accept case {ai} should pass the supertrait check, exited {ares.exit_code}")
+            io.println("got: {ares.out}")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        ai = ai + 1
+    }
+
+    io.println("PASS: an explicit subtrait impl requires the supertrait; derive/no-supertrait/builtin-receiver all accepted")
+    shell_exec("rm -rf {base}")
+}

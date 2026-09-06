@@ -1980,6 +1980,80 @@ error[SelfNotConstructor]: `Self` is not a constructor
 
 **`self` is always passed by value.** Blink is garbage-collected — there is no by-reference vs by-move distinction. The `self` parameter is a value like any other parameter. No `&self`, `&mut self`, or `self: Box[Self]` forms exist.
 
+#### Operations on `Self` in a Default Body
+
+Inside a trait's default method body, `self` has the abstract type `Self`. `Self`
+is treated as an implicit type parameter of the trait, bounded by the trait's
+**guarantee set**: the methods the trait itself declares, plus every method of each
+trait named in its supertrait clause, transitively. An operator (which desugars to
+a trait method — see *Operator Desugaring*) or a plain method call on a value of
+type `Self` is well-formed **only when its backing trait is in the guarantee set**.
+Any other operation on `Self` is rejected at the **trait definition**, before any
+implementor exists.
+
+This is the parametricity rule of *Polymorphic Trait Implementations* applied to
+`Self`: a default body may vary behavior only through bounds the trait declares.
+Because every `impl` must satisfy the trait's supertraits, a default body that
+type-checks under the guarantee set is valid for every implementor — the check is
+complete at the definition and is never re-run per implementor or per
+monomorphization.
+
+```blink
+trait Eq {
+    fn eq(self, other: Self) -> Bool
+    fn ne(self, other: Self) -> Bool { !self.eq(other) }   // OK: eq is Eq's own method
+}
+
+trait Ranked: Ord {
+    fn rank(self) -> Int
+    fn before(self, other: Self) -> Bool { self < other }  // OK: `<` -> Ord.cmp, Ord is a declared supertrait
+}
+```
+
+A body that uses an operator or method `Self` is not guaranteed to have is rejected
+where it is written:
+
+```
+error[UnlicensedSelfOperation]: `<` on `Self` is not licensed by `Ranked`
+ --> rank.bl:3:44
+  |
+3 |     fn before(self, other: Self) -> Bool { self < other }
+  |                                            ^^^^^^^^^^^ `<` desugars to `Ord.cmp`, but `Ranked` does not require `Ord`
+  |
+  = note: in a default body `self` has the abstract type `Self`; an operator or method
+          on `Self` is licensed only when the trait declares the backing trait as a supertrait
+  = help: declare the supertrait so every implementor provides `<`:
+              trait Ranked: Ord { ... }
+```
+
+**Arithmetic on `Self`.** The arithmetic traits (`Add`, `Sub`, `Mul`, `Div`, `Rem`,
+`Neg`) are sealed to built-in numeric types (see *Arithmetic Traits*). A trait may
+still name one as a supertrait — `trait Doubler: Add` is legal — but that restricts
+its implementors to the built-in numerics, the only types that satisfy `Add`. So
+`self + self` in a default body is licensed only for numeric-restricted traits and
+can never be satisfied by a user-defined type. The diagnostic for a sealed backing
+trait does **not** suggest adding the supertrait (an unsatisfiable repair); it states
+the seal and offers the real alternatives:
+
+```
+error[UnlicensedSelfOperation]: `+` on `Self` is not licensed by `Doubler`
+ --> num.bl:1:41
+  |
+1 | trait Doubler { fn double(self) -> Self { self + self } }
+  |                                           ^^^^^^^^^^^ `+` desugars to `Add.add`, but `Doubler` does not require `Add`
+  |
+  = note: `Add` is a sealed arithmetic trait — only built-in numeric types implement it,
+          so `trait Doubler: Add` would be satisfiable by no user type
+  = help: make `double` a required method and let each implementor define it:
+              fn double(self) -> Self
+  = help: if the operation is numeric, use a concrete numeric type instead of `Self`
+```
+
+The rule is uniform across every operator family (`Add`–`Neg`, `Eq`, `Ord`) and
+every plain method call on `self`. A call to one of the trait's own methods is always
+licensed — that is what lets `Eq.ne` call `self.eq()` and `Display.display` call
+`self.fmt()`.
+
 #### Arithmetic Traits
 
 ```blink
