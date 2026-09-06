@@ -21,7 +21,7 @@ import diagnostics.{
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
     NON_EXHAUSTIVE_MATCH,
-    TYPE_ERROR, TEMPLATE_MISMATCH, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
+    TYPE_ERROR, TEMPLATE_MISMATCH, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
     MUTATION_REQUIRES_MUT,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
@@ -270,6 +270,11 @@ let mut fnsig_type_param_names: List[Str] = []
 // list needs no new bookkeeping and no struct-shape change to a type the whole file
 // destructures.
 let mut fnsig_tparam_ret_only: List[Int] = []
+// Flat side-table PARALLEL to fnsig_type_param_names (same index, same length): the
+// pipe-framed declared-bound set for that type param (e.g. `|Add|`, `|Ord|Eq|`), as
+// produced by tparam_node_bound_traits. register_fn_sig discards the bound annotations
+// otherwise, so this is the only channel the call-site bound check (E0306) can read.
+let mut fnsig_tparam_bounds: List[Str] = []
 let mut fnsig_effect_names: List[Str] = []
 
 let mut tc_trait_names: List[Str] = []
@@ -617,6 +622,15 @@ fn tc_type_satisfies_bound(concrete_tid: Int, trait_name: Str) -> Int ! TypeChec
         if base != "" && tc_type_has_ord_impl(base) != 0 { return 1 }
         if base != "" { return -1 }
         return 0
+    }
+    // The arithmetic traits are sealed to the built-in numeric types (03_types.md:2011),
+    // so a concrete type satisfies one iff it is numeric. The top guard already returned
+    // 0 for an unresolved/typevar concrete, so a -1 here means a genuinely non-numeric
+    // argument (Str/Bool/Char/user) was bound to an arithmetic-bounded param — the ugly
+    // `cc` error today, a clean E0306 with this branch.
+    if trait_name == "Add" || trait_name == "Sub" || trait_name == "Mul" || trait_name == "Div" || trait_name == "Rem" || trait_name == "Neg" {
+        if is_arith_numeric_type(concrete_tid) != 0 { return 1 }
+        return -1
     }
     // A user trait we do not model here — fail open. A full impl-registry recursion
     // is not needed: the compiler declares no such where-bound (audited), and
@@ -2405,21 +2419,73 @@ fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
 // whole-bare-typevar rule (`x: T`) and typevars nested inside a compound param
 // (`x: List[T]`, `x: (T, Int)`, `x: Map[K, V]`, …) via unify_typevar_binds.
 fn build_typevar_binds(sig: Int, args_sl: Int) -> Map[Str, Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    build_typevar_binds_off(sig, args_sl, 0)
+}
+
+// `self_offset` shifts which fnsig param each call argument aligns with. Free-fn calls
+// pass 0 (arg `pi` ↔ param `pi`). A method call passes 1: the receiver supplies param 0
+// (self), so call argument `pi` ↔ fnsig param `1 + pi`. This binds only the callee's own
+// declared params, never self — matching check_arg_shapes' own self_offset discipline.
+fn build_typevar_binds_off(sig: Int, args_sl: Int, self_offset: Int) -> Map[Str, Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let fs = fnsig_pool.get(sig).unwrap()
     let param_start = fs.params_start
     let param_count = fs.params_count
     let mut binds: Map[Str, Int] = Map()
     if args_sl == -1 { return binds }
     let n = sublist_length(args_sl)
-    let mut pi = 0
-    while pi < param_count {
-        if pi < n {
-            let ptid = fnsig_param_list.get(param_start + pi).unwrap()
-            unify_typevar_binds(ptid, infer_type(sublist_get(args_sl, pi)), binds)
+    let mut i = 0
+    while i < n {
+        let pidx = i + self_offset
+        if pidx < param_count {
+            let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
+            unify_typevar_binds(ptid, infer_type(sublist_get(args_sl, i)), binds)
         }
-        pi = pi + 1
+        i = i + 1
     }
     binds
+}
+
+// Enforce a call's type-param bounds against the concrete types discovered for it
+// (E0306 TraitBoundNotSatisfied, spec 03_types.md:1193). Reads the sig's parallel
+// name+bound side-tables. Emits ONLY on a provably-unmet bound (tc_type_satisfies_bound
+// == -1); an unbound param, an unresolved concrete, or an unmodeled trait is skipped, so
+// this never rejects a program that compiles today (those already die at `cc`).
+fn tc_check_bounds_for_binds(sig: Int, binds: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
+    let fs = fnsig_pool.get(sig).unwrap()
+    let start = fs.type_params_start
+    let count = fs.type_params_count
+    let mut ti = 0
+    while ti < count {
+        let idx = start + ti
+        if idx < fnsig_type_param_names.len() && idx < fnsig_tparam_bounds.len() {
+            let name = fnsig_type_param_names.get(idx).unwrap()
+            let bounds = fnsig_tparam_bounds.get(idx).unwrap()
+            if bounds != "" && binds.contains_key(name) != 0 {
+                tc_check_one_bound(name, bounds, binds.get(name).unwrap(), node)
+            }
+        }
+        ti = ti + 1
+    }
+}
+
+// One type param's declared-bound set vs. its concrete type. Iterating the known modeled
+// traits (mirroring tc_type_satisfies_bound's coverage) avoids a pipe-string splitter and
+// matches the existing tc_pipe_has idiom. Reports at most one bound per param: the first
+// provably-unmet trait (`T: Ord` frames `|Ord|Eq|`, both -1 for a non-Ord type — one
+// error, not two).
+fn tc_check_one_bound(name: Str, bounds: Str, concrete: Int, node: Int) ! TypeCheck.Resolve, Diag.Report {
+    let traits = ["Add", "Sub", "Mul", "Div", "Rem", "Neg", "Ord", "Eq", "Display", "Debug", "Hash", "Serialize"]
+    let mut i = 0
+    while i < traits.len() {
+        let tr = traits.get(i).unwrap()
+        if tc_pipe_has(bounds, tr) != 0 && tc_type_satisfies_bound(concrete, tr) == -1 {
+            diag_error_at("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
+                "'{type_to_str(concrete)}' does not satisfy the {tr} bound on type parameter {name}", node,
+                "pass an argument whose type implements {tr}, or derive/implement {tr} for it; the arithmetic traits (Add/Sub/Mul/Div/Rem/Neg) are sealed to the built-in numeric types")
+            return
+        }
+        i = i + 1
+    }
 }
 
 // The metavars minted for `call_node`'s return-only type params, as a full-arity
@@ -5810,6 +5876,7 @@ fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
             let tp_name = node_name(tp)
             fnsig_type_param_names.push(tp_name)
             fnsig_tparam_ret_only.push(tc_tparam_is_ret_only(tp_name, ret_ann, params_sl))
+            fnsig_tparam_bounds.push(tparam_node_bound_traits(tp))
             tp_count = tp_count + 1
             ti = ti + 1
         }
@@ -7155,6 +7222,7 @@ fn init_types() ! TypeCheck.Register {
     fnsig_param_list.clear()
     fnsig_type_param_names.clear()
     fnsig_tparam_ret_only.clear()
+    fnsig_tparam_bounds.clear()
     fnsig_effect_names.clear()
     tc_trait_names.clear()
     tc_trait_method_names.clear()
@@ -11626,6 +11694,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     }
                     check_arg_shapes(fn_name, sig, args_sl, 0)
                     if fs.type_params_count > 0 {
+                        // Enforce each type param's declared bound against the concrete
+                        // type inferred for it (E0306). Read-only — bind the args, check,
+                        // diagnose — so it runs BEFORE the return/pin memo dance below and
+                        // preserves its "compute return FIRST, pin LAST" discipline.
+                        tc_check_bounds_for_binds(sig, build_typevar_binds(sig, args_sl), node)
                         // Pin any metavar-carrying arg from the call's resolved
                         // typevar binds, so `fill(Map(), 256, "x")` (K→Int, V→Str from
                         // the sibling args) codegens the Map() with the right kops
@@ -12589,6 +12662,16 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             let sig = lookup_fnsig(sig_name)
             if sig != -1 {
                 check_arg_shapes("{tname}.{method}", sig, node_args(node), 1)
+                // A method's OWN bounded type param (`fn combine[U: Add](self, ...)`)
+                // registers into the same fnsig with the same parallel name+bound side-
+                // tables, so enforce it at the call the same way (E0306). self_offset=1:
+                // self is param 0 (from the receiver), call arg `pi` ↔ fnsig param `1+pi`,
+                // so only the method's own params bind — impl-level `where`-bounds stay
+                // with tc_impl_where_bounds_hold. Additive: the return path is untouched.
+                let mfs = fnsig_pool.get(sig).unwrap()
+                if mfs.type_params_count > 0 {
+                    tc_check_bounds_for_binds(sig, build_typevar_binds_off(sig, node_args(node), 1), node)
+                }
                 return fnsig_pool.get(sig).unwrap().ret
             }
             // Instant's two CODEGEN-ONLY methods. Four of its six are declared in

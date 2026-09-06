@@ -72,6 +72,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | TypeError | E0300 | Type mismatch detected during type checking | Type checking | §3 |
 | CannotInferType | E0301 | Inference left a type variable unbound — annotate the binding, or supply the type argument at the call when the callee's signature does not supply it. Reported where the repair attaches | Type checking | §3.4 |
 | TypeArgArity | E0303 | A type constructor in a type position was applied to the wrong number of type arguments — including none (a bare `Channel`/`List`). Under- and over-application are one code. Decided at name resolution, before inference | Name resolution | §3.4 |
+| TraitBoundNotSatisfied | E0306 | A call's type argument (inferred or explicit) does not satisfy the type parameter's declared bound — checked against the arguments as written, before code generation | Type checking | §3.6 |
 | TemplateMismatch | E0310 | String template parameter type does not match argument | Type checking | §3 |
 | UndeclaredEffect | E0500 | Callee requires effect not declared by caller | Effects | §4.5 |
 | CapabilityBudgetExceeded | E0501 | Function effect exceeds module `@capabilities` budget | Effects | §4.8 |

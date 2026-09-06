@@ -1,0 +1,86 @@
+// A generic call whose inferred (or written) type argument violates a declared bound
+// is rejected at the CALL site with E0306 TraitBoundNotSatisfied — not left to die at
+// `cc` with an ugly backend error (spec sections/03_types.md:1193, :3476). This is the
+// call-site half of the bounded-parametric-polymorphism rule; the definition-site half
+// (an operator matching its own backing trait inside the body) is covered by
+// test_per_operator_arith_bound_matches_trait.bl.
+//
+// The arithmetic traits are sealed to the numerics, so a bounded `T` can only ever
+// monomorphize at a numeric type. Enforcing the bound at the call site turns the
+// backend crash into a clean front-end diagnostic. Scope: free functions AND a method's
+// own bounded type parameter. (Closures carry no bound slot on a Fn tid, so there is no
+// enforceable seam there — a fn-value cannot represent an unresolved bounded type param.)
+
+fn main() {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+
+    let base = ".tmp/_test_call_site_trait_bound_enforced"
+    shell_exec("rm -rf {base}")
+    shell_exec("mkdir -p {base}")
+    write_file("{base}/blink.toml", "[package]\nname = \"cstb\"\nversion = \"0.1.0\"\n\n[dependencies]\n")
+
+    // REJECT: the concrete type argument does not satisfy the param's declared bound.
+    let reject_cases = [
+        // Str is not Add — `sum("a", "b")` binds T := Str, which fails the Add bound.
+        "fn sum[T: Add](a: T, b: T) -> T \{ a + b \}\n\nfn main() \{\n    io.println(\"\{sum(\"a\", \"b\")\}\")\n\}\n",
+        // A user struct with no Ord impl fails an Ord bound at the call.
+        "type Widget \{ x: Int \}\n\nfn top[T: Ord](a: T, b: T) -> Bool \{ a < b \}\n\nfn main() \{\n    let p = Widget \{ x: 1 \}\n    let q = Widget \{ x: 2 \}\n    io.println(\"\{top(p, q)\}\")\n\}\n",
+        // METHOD REJECT: a trait method's OWN bounded type parameter, called with Str
+        // args. This is the first coverage of a method's own bounded type param. (The
+        // accept counterpart is deferred: monomorphizing a method's own type param is a
+        // separate, pre-existing codegen gap — a bound-satisfying numeric call erases `U`
+        // to `void` at codegen — so it is not exercised here. E0306 fires before codegen.)
+        "trait Combiner \{ fn combine[U: Add](self, a: U, b: U) -> U \}\n\ntype Calc \{ base: Int \}\n\nimpl Combiner for Calc \{\n    fn combine[U: Add](self, a: U, b: U) -> U \{ a + b \}\n\}\n\nfn main() \{\n    let c = Calc \{ base: 0 \}\n    io.println(\"\{c.combine(\"a\", \"b\")\}\")\n\}\n",
+    ]
+    let mut ci = 0
+    while ci < reject_cases.len() {
+        let src = reject_cases.get(ci).unwrap()
+        write_file("{base}/case_{ci}.bl", src)
+
+        let cmd = "cd {base} && {blink_root}/build/blink check case_{ci}.bl 2>&1"
+        let result = process_run("sh", ["-c", cmd])
+
+        if result.exit_code == 0 {
+            io.println("FAIL: reject case {ci} should be rejected, but check exited 0")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        if !result.out.contains("E0306") && !result.out.contains("TraitBoundNotSatisfied") {
+            io.println("FAIL: reject case {ci} did not emit E0306 / TraitBoundNotSatisfied")
+            io.println("got: {result.out}")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        ci = ci + 1
+    }
+
+    // ACCEPT: a numeric type argument satisfies the arithmetic bound; the body runs.
+    let accept_cases = [
+        // Free fn: sum(1, 2) binds T := Int, which is Add. Prints 3.
+        "fn sum[T: Add](a: T, b: T) -> T \{ a + b \}\n\nfn main() \{\n    io.println(\"\{sum(1, 2)\}\")\n\}\n",
+    ]
+    let expected = ["3"]
+    let mut ai = 0
+    while ai < accept_cases.len() {
+        let src = accept_cases.get(ai).unwrap()
+        write_file("{base}/accept_{ai}.bl", src)
+        let cmd = "cd {base} && {blink_root}/build/blink run accept_{ai}.bl 2>&1"
+        let result = process_run("sh", ["-c", cmd])
+        if result.exit_code != 0 {
+            io.println("FAIL: accept case {ai} (satisfied bound) should compile + run, exited {result.exit_code}")
+            io.println("got: {result.out}")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        if !result.out.contains(expected.get(ai).unwrap()) {
+            io.println("FAIL: accept case {ai} should print '{expected.get(ai).unwrap()}'")
+            io.println("got: {result.out}")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        ai = ai + 1
+    }
+
+    io.println("PASS: a type argument that violates a declared bound is rejected at the call site with E0306; a satisfying argument compiles and runs")
+    shell_exec("rm -rf {base}")
+}
