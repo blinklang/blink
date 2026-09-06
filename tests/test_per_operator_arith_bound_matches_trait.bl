@@ -1,0 +1,102 @@
+// A single arithmetic operator is licensed only by its OWN backing trait, not by
+// any arithmetic-family bound (§3.6 Operator Desugaring; bounded parametric
+// polymorphism, §3). This is the per-operator half of the same definition-site rule
+// the comparison operators follow (see test_comparison_operator_on_typevar_rejected.bl).
+//
+//   `a + b` -> Add.add,  `a - b` -> Sub.sub,  `a * b` -> Mul.mul,
+//   `a / b` -> Div.div,  `a % b` -> Rem.rem,  `-a` -> Neg.neg.
+//
+// So `fn f[T: Add](a: T, b: T) -> T { a * b }` is ill-typed where it is written:
+// `[T: Add]` licenses `+`, not `*` (which desugars to Mul). Before this fix any
+// arithmetic-family bound licensed EVERY arithmetic operator, so the mismatch slipped
+// through to codegen. A matching bound (or a multi-bound set covering the operator)
+// still type-checks and runs at a numeric instantiation.
+//
+// Call-site enforcement (rejecting a non-numeric argument to a bounded `T`) is a
+// separate, larger piece and is not covered here.
+
+fn main() {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+
+    let base = ".tmp/_test_per_operator_arith_bound_matches_trait"
+    shell_exec("rm -rf {base}")
+    shell_exec("mkdir -p {base}")
+    write_file("{base}/blink.toml", "[package]\nname = \"poab\"\nversion = \"0.1.0\"\n\n[dependencies]\n")
+
+    // REJECT: the declared bound does not include the operator's backing trait.
+    let reject_cases = [
+        // [T: Add] licenses only `+` — every other binary arithmetic operator is unlicensed.
+        "fn f[T: Add](a: T, b: T) -> T \{ a * b \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        "fn f[T: Add](a: T, b: T) -> T \{ a - b \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        "fn f[T: Add](a: T, b: T) -> T \{ a / b \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        "fn f[T: Add](a: T, b: T) -> T \{ a % b \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        // A different single bound: [T: Mul] does not license `+`.
+        "fn f[T: Mul](a: T, b: T) -> T \{ a + b \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        // Unary minus desugars to Neg, which [T: Add] does not provide.
+        "fn f[T: Add](a: T) -> T \{ -a \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        // Compound assignment: `x *= b` is Mul, unlicensed under [T: Add].
+        "fn f[T: Add](a: T, b: T) -> T \{\n    let mut x = a\n    x *= b\n    x\n\}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        // The same rule holds for a `where`-bounded polymorphic impl method: `where T: Add`
+        // does not license `*` in the body.
+        "trait Prod[T] \{ fn combine(self, a: T, b: T) -> T \}\n\nimpl[T] Prod[T] for List[T] where T: Add \{\n    fn combine(self, a: T, b: T) -> T \{ a * b \}\n\}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+    ]
+    let mut ci = 0
+    while ci < reject_cases.len() {
+        let src = reject_cases.get(ci).unwrap()
+        write_file("{base}/case_{ci}.bl", src)
+
+        let cmd = "cd {base} && {blink_root}/build/blink check case_{ci}.bl 2>&1"
+        let result = process_run("sh", ["-c", cmd])
+
+        if result.exit_code == 0 {
+            io.println("FAIL: reject case {ci} should be rejected, but check exited 0")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        if !result.out.contains("E0300") && !result.out.contains("TypeError") {
+            io.println("FAIL: reject case {ci} did not emit E0300 / TypeError")
+            io.println("got: {result.out}")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        ci = ci + 1
+    }
+
+    // ACCEPT: the operator matches its backing trait (or a multi-bound set covering it).
+    // Each prints its numeric result so we also prove the body actually runs.
+    let accept_cases = [
+        // Each single arithmetic operator, licensed by its own trait.
+        "fn m[T: Mul](a: T, b: T) -> T \{ a * b \}\n\nfn main() \{\n    io.println(\"\{m(2, 3)\}\")\n\}\n",  // 6
+        "fn s[T: Sub](a: T, b: T) -> T \{ a - b \}\n\nfn main() \{\n    io.println(\"\{s(9, 3)\}\")\n\}\n",  // 6
+        "fn d[T: Div](a: T, b: T) -> T \{ a / b \}\n\nfn main() \{\n    io.println(\"\{d(12, 2)\}\")\n\}\n", // 6
+        "fn r[T: Rem](a: T, b: T) -> T \{ a % b \}\n\nfn main() \{\n    io.println(\"\{r(20, 7)\}\")\n\}\n", // 6
+        "fn ng[T: Neg](a: T) -> T \{ -a \}\n\nfn main() \{\n    io.println(\"\{ng(-6)\}\")\n\}\n",           // 6
+        // A multi-bound set licenses every operator it names: 2 * 3 + 0 = 6.
+        "fn fma[T: Add + Mul](a: T, b: T) -> T \{ a * b \}\n\nfn main() \{\n    io.println(\"\{fma(2, 3)\}\")\n\}\n", // 6
+        // `where T: Mul` on a polymorphic impl method licenses `*`.
+        "trait Prod[T] \{ fn combine(self, a: T, b: T) -> T \}\n\nimpl[T] Prod[T] for List[T] where T: Mul \{\n    fn combine(self, a: T, b: T) -> T \{ a * b \}\n\}\n\nfn main() \{\n    let xs: List[Int] = [1]\n    io.println(\"\{xs.combine(2, 3)\}\")\n\}\n", // 6
+    ]
+    let mut ai = 0
+    while ai < accept_cases.len() {
+        let src = accept_cases.get(ai).unwrap()
+        write_file("{base}/accept_{ai}.bl", src)
+        let cmd = "cd {base} && {blink_root}/build/blink run accept_{ai}.bl 2>&1"
+        let result = process_run("sh", ["-c", cmd])
+        if result.exit_code != 0 {
+            io.println("FAIL: accept case {ai} (matching arithmetic bound) should compile + run, exited {result.exit_code}")
+            io.println("got: {result.out}")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        if !result.out.contains("6") {
+            io.println("FAIL: accept case {ai} should print '6'")
+            io.println("got: {result.out}")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        ai = ai + 1
+    }
+
+    io.println("PASS: each arithmetic operator is licensed only by its own backing trait; a matching or multi-bound set licenses it")
+    shell_exec("rm -rf {base}")
+}
