@@ -1,0 +1,118 @@
+// Arithmetic on a type parameter is checked at the DEFINITION site, against the
+// parameter's declared trait bounds (bounded parametric polymorphism, §3 spec).
+//
+//   - UNBOUNDED `T`: `fn add[T](a: T, b: T) { a + b }` is ill-typed where it is
+//     written. `a + b` desugars to Add.add(a, b); with no `T: Add` bound the
+//     operation is not licensed, so it is rejected at the definition (E0300),
+//     whether or not it is ever instantiated. This closes the fail-open-on-Typevar
+//     hole that previously let such a body reach codegen and die at `cc`
+//     (spec §3.1: no rule enforced only at codegen).
+//   - BOUNDED `T`: `fn sum[T: Add](a: T, b: T) -> T { a + b }` names an arithmetic
+//     bound, so the operation IS licensed and the definition type-checks. The
+//     arithmetic traits are sealed to the built-in numerics (03_types.md:2011), so
+//     such a body can only be soundly instantiated at a numeric type.
+//
+// Call-site enforcement (rejecting `sum("a", "b")` because Str is not Add) is a
+// separate, larger piece and is not covered here.
+
+fn main() {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+
+    let base = ".tmp/_test_arith_operator_on_typevar_rejected"
+    shell_exec("rm -rf {base}")
+    shell_exec("mkdir -p {base}")
+    write_file("{base}/blink.toml", "[package]\nname = \"aotr\"\nversion = \"0.1.0\"\n\n[dependencies]\n")
+
+    // Each REJECT case is a full program that must be rejected at the definition
+    // site: an arithmetic operator applied to an UNBOUNDED type parameter.
+    let reject_cases = [
+        // Unused generic body: still ill-typed where written.
+        "fn add[T](a: T, b: T) -> T \{ a + b \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        // Instantiated at Str: still the same definition-site defect.
+        "fn add[T](a: T, b: T) -> T \{ a + b \}\n\nfn main() \{\n    let _x = add(\"a\", \"b\")\n    io.println(\"unreachable\")\n\}\n",
+        // Every binary arithmetic operator, not just '+'.
+        "fn mul[T](a: T, b: T) -> T \{ a * b \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        "fn sub[T](a: T, b: T) -> T \{ a - b \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        "fn dvd[T](a: T, b: T) -> T \{ a / b \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        "fn rem[T](a: T, b: T) -> T \{ a % b \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        // Unary minus (desugars to Neg) on an unbounded parameter.
+        "fn neg[T](a: T) -> T \{ -a \}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        // Compound assignment on an unbounded parameter.
+        "fn bump[T](a: T, b: T) -> T \{\n    let mut x = a\n    x += b\n    x\n\}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+        // Shadowing: the impl's `where T: Add` must NOT license arithmetic on a
+        // method's OWN unbounded `[T]`, which shadows the impl binder. Accepting
+        // this reopened the codegen hole (the method's abstract T reaches cc).
+        "trait Foo[T] \{ fn bad[T](self, a: T, b: T) -> T \}\n\nimpl[T] Foo[T] for List[T] where T: Add \{\n    fn bad[T](self, a: T, b: T) -> T \{ a + b \}\n\}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n",
+    ]
+    let mut ci = 0
+    while ci < reject_cases.len() {
+        let src = reject_cases.get(ci).unwrap()
+        write_file("{base}/case_{ci}.bl", src)
+
+        let cmd = "cd {base} && {blink_root}/build/blink check case_{ci}.bl 2>&1"
+        let result = process_run("sh", ["-c", cmd])
+
+        if result.exit_code == 0 {
+            io.println("FAIL: reject case {ci} should be rejected, but check exited 0")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        if !result.out.contains("E0300") && !result.out.contains("TypeError") {
+            io.println("FAIL: reject case {ci} did not emit E0300 / TypeError")
+            io.println("got: {result.out}")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        ci = ci + 1
+    }
+
+    // ACCEPT cases: an arithmetic bound on the type parameter licenses the
+    // operation, so the definition type-checks and a numeric instantiation runs.
+    let accept_cases = [
+        // Inline `[T: Add]` bound on a free function.
+        "fn sum[T: Add](a: T, b: T) -> T \{ a + b \}\n\nfn main() \{\n    io.println(\"\{sum(2, 3)\}\")\n\}\n",
+        // `where T: Add` on a polymorphic impl method (the spec's canonical shape).
+        "trait Summer[T] \{ fn combine(self, a: T, b: T) -> T \}\n\nimpl[T] Summer[T] for List[T] where T: Add \{\n    fn combine(self, a: T, b: T) -> T \{ a + b \}\n\}\n\nfn main() \{\n    let xs: List[Int] = [1]\n    io.println(\"\{xs.combine(2, 3)\}\")\n\}\n",
+    ]
+    let mut ai = 0
+    while ai < accept_cases.len() {
+        let src = accept_cases.get(ai).unwrap()
+        write_file("{base}/accept_{ai}.bl", src)
+        let cmd = "cd {base} && {blink_root}/build/blink run accept_{ai}.bl 2>&1"
+        let result = process_run("sh", ["-c", cmd])
+        if result.exit_code != 0 {
+            io.println("FAIL: accept case {ai} (bounded arithmetic) should compile + run, exited {result.exit_code}")
+            io.println("got: {result.out}")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        if !result.out.contains("5") {
+            io.println("FAIL: accept case {ai} should print '5'")
+            io.println("got: {result.out}")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        ai = ai + 1
+    }
+
+    // Positive guard: arithmetic on a concrete numeric monomorphic body still works.
+    let ok_src = "fn twice(a: Int) -> Int \{ a + a \}\n\nfn main() \{\n    io.println(\"\{twice(21)\}\")\n\}\n"
+    write_file("{base}/ok.bl", ok_src)
+    let ok_cmd = "cd {base} && {blink_root}/build/blink run ok.bl 2>&1"
+    let ok_result = process_run("sh", ["-c", ok_cmd])
+    if ok_result.exit_code != 0 {
+        io.println("FAIL: numeric arithmetic should compile + run, exited {ok_result.exit_code}")
+        io.println("got: {ok_result.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if !ok_result.out.contains("42") {
+        io.println("FAIL: twice(21) should print '42'")
+        io.println("got: {ok_result.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+
+    io.println("PASS: unbounded arithmetic on a type parameter is rejected; a bound licenses it; numeric arithmetic still works")
+    shell_exec("rm -rf {base}")
+}

@@ -221,6 +221,17 @@ pub let mut tc_type_decl_nodes: Map[Str, Int] = Map()
 // type or builtin (`fn f[Channel](x: Channel)`) is not mis-read as that constructor
 // and E0303 does not fire on it (sections/03_types.md §3.4:1259).
 let mut tc_active_tparams: Map[Str, Int] = Map()
+// A stack of active type-parameter bindings, one frame per binder brought into
+// scope, recording the parameter name (tc_tp_arith_names) and whether it carries
+// an arithmetic-family bound — Add/Sub/Mul/Div/Rem/Neg — (tc_tp_arith_bits, 1/0),
+// declared inline (`[T: Add]`) or in an impl `where` clause (`where T: Add`). A
+// frame per binder — not a per-name count — so an inner binder that reuses an
+// outer name shadows it: the innermost frame for a name wins. Read by
+// reject_non_numeric_arith_operand to decide whether arithmetic is licensed on a
+// type parameter. A frame for a name absent from this stack is not a type
+// parameter (e.g. Self, or an unmodeled builtin that lowers to a typevar).
+let mut tc_tp_arith_names: List[Str] = []
+let mut tc_tp_arith_bits: List[Int] = []
 
 type FnSigEntry {
     name: Str
@@ -3694,6 +3705,70 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
 // Bring a declaration's type parameters into scope for the span of its signature
 // and body resolution, and take them back out. Counted, so nested binders that
 // reuse a name restore the outer one on exit. Both are no-ops for a -1 sublist.
+// An arithmetic-family trait: one whose method is what an arithmetic operator
+// desugars to (Add=+, Sub=-, Mul=*, Div=/, Rem=%, Neg=unary -). Naming any of
+// these in a type parameter's bound licenses arithmetic on that parameter.
+fn is_arith_trait_name(n: Str) -> Int {
+    if n == "Add" || n == "Sub" || n == "Mul" || n == "Div" || n == "Rem" || n == "Neg" {
+        return 1
+    }
+    0
+}
+
+// A TypeParam / where-constraint node carries an arithmetic-family bound when any
+// of its bounds (stored in `elements`) names an arithmetic trait.
+fn tparam_node_has_arith_bound(tp: Int) -> Int {
+    let bounds = node_elements(tp)
+    if bounds == -1 { return 0 }
+    let mut i = 0
+    while i < sublist_length(bounds) {
+        if is_arith_trait_name(strip_module_qualifier(node_name(sublist_get(bounds, i)))) != 0 {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+// Push one arith-bound frame per TypeParam / where-constraint node in `sl` — a
+// frame for every binder (bounded or not) so an inner binder masks an outer one
+// that reuses the same name (shadowing).
+fn tc_push_arith_frames(sl: Int) {
+    if sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        let tp = sublist_get(sl, i)
+        tc_tp_arith_names.push(node_name(tp))
+        tc_tp_arith_bits.push(tparam_node_has_arith_bound(tp))
+        i = i + 1
+    }
+}
+
+// Remove the frames a matching tc_push_arith_frames(sl) added.
+fn tc_pop_arith_frames(sl: Int) {
+    if sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        let _ = tc_tp_arith_names.pop()
+        let _ = tc_tp_arith_bits.pop()
+        i = i + 1
+    }
+}
+
+// The innermost active binding of `name`: 1 if it carries an arithmetic bound, 0
+// if it is an unbounded type parameter, -1 if `name` is not an active type
+// parameter at all (Self, or an unmodeled builtin lowered to a typevar).
+fn tc_tparam_arith_state(name: Str) -> Int {
+    let mut i = tc_tp_arith_names.len() - 1
+    while i >= 0 {
+        if tc_tp_arith_names.get(i).unwrap() == name {
+            return tc_tp_arith_bits.get(i).unwrap()
+        }
+        i = i - 1
+    }
+    -1
+}
+
 fn tc_push_tparam_scope(tparams_sl: Int) {
     if tparams_sl == -1 { return }
     let mut i = 0
@@ -3702,10 +3777,12 @@ fn tc_push_tparam_scope(tparams_sl: Int) {
         tc_active_tparams.insert(nm, (tc_active_tparams.get(nm) ?? 0) + 1)
         i = i + 1
     }
+    tc_push_arith_frames(tparams_sl)
 }
 
 fn tc_pop_tparam_scope(tparams_sl: Int) {
     if tparams_sl == -1 { return }
+    tc_pop_arith_frames(tparams_sl)
     let mut i = 0
     while i < sublist_length(tparams_sl) {
         let nm = node_name(sublist_get(tparams_sl, i))
@@ -6764,6 +6841,8 @@ fn init_types() ! TypeCheck.Register {
     tc_serializable_types.clear()
     tc_type_decl_nodes.clear()
     tc_active_tparams.clear()
+    tc_tp_arith_names.clear()
+    tc_tp_arith_bits.clear()
     tc_alias_underlying = Map()
     sfield_pool.clear()
     nr_callable_field_names.clear()
@@ -10359,20 +10438,40 @@ fn is_arith_numeric_type(tid: Int) -> Int {
     let k = type_kind(resolve_alias_tid(tid))
     if k == TyKind.Int || k == TyKind.Float { return 1 }
     if is_sized_int(k) != 0 { return 1 }
-    // Fail-open on types this check cannot model at the definition site, mirroring
-    // cmp_operands_ok's Typevar/Void set (plus Unknown):
-    //   - Typevar: a generic `T <op> T` body is not re-checked here for the concrete
-    //     substitution; a non-numeric instantiation is currently caught only downstream
-    //     (the C compiler rejects it). Closing that mono-side hole is a separate follow-up.
+    // Fail-open only on types this check genuinely cannot model at the definition site:
     //   - Void: an under-inferred value (e.g. an un-annotated closure return) types
     //     as Void; rejecting it would break programs that compiled before this check.
     //   - Unknown: not yet resolved (includes TYPE_UNKNOWN, kind Unknown).
-    if k == TyKind.Typevar || k == TyKind.Void || k == TyKind.Unknown { return 1 }
+    // Typevar is NOT fail-open here: an abstract type parameter is numeric only when
+    // an arithmetic bound licenses it. This function answers "is the type itself a
+    // built-in numeric" (no, for a Typevar); reject_non_numeric_arith_operand layers
+    // the bound check on top, accepting a bounded `T` and rejecting an unbounded one
+    // at its definition (§3.1: no rule enforced only at codegen).
+    if k == TyKind.Void || k == TyKind.Unknown { return 1 }
     0
 }
 
 fn reject_non_numeric_arith_operand(op: Str, tid: Int, node: Int) ! TypeCheck.Report, Diag.Report {
     if is_arith_numeric_type(tid) == 0 {
+        if type_kind(resolve_alias_tid(tid)) == TyKind.Typevar {
+            let tpname = type_to_str(tid)
+            let st = tc_tparam_arith_state(tpname)
+            // st != 0 means "not an unbounded type parameter":
+            //   st == 1: an arithmetic bound (`[T: Add]` / `where T: Add`) licenses
+            //     the operator — the body checks under it and monomorphizes at a
+            //     numeric type (arithmetic traits are sealed to the numerics,
+            //     03_types.md:2011).
+            //   st == -1: the name is not an active type parameter (Self, or an
+            //     unmodeled builtin lowered to a typevar) — leave it as before this
+            //     check; this check targets real type parameters only.
+            if st != 0 {
+                return
+            }
+            diag_error_at("TypeError", TYPE_ERROR,
+                "arithmetic '{op}' requires a trait bound on type parameter {tpname}", node,
+                "add an arithmetic bound so the operation is licensed, e.g. `[{tpname}: Add]`; the arithmetic traits (Add/Sub/Mul/Div/Rem/Neg) are sealed to the built-in numeric types")
+            return
+        }
         tc_error_at("arithmetic '{op}' requires numeric operand, got {type_to_str(tid)}", node)
     }
 }
@@ -15069,6 +15168,12 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
             // (§3.4:1259).
             let impl_binders_sl = node_impl_binders(im)
             tc_push_tparam_scope(impl_binders_sl)
+            // The binders (`[T]`) carry no bounds; an impl's arithmetic bounds live
+            // in its `where` clause (`impl[T] .. where T: Add`), so license those
+            // for the span of the method bodies. Pushed after the binder frames so
+            // the bounded `where T` frame shadows the unbounded binder `T` frame.
+            let impl_where_sl = node_impl_where_bounds(im)
+            tc_push_arith_frames(impl_where_sl)
             tc_current_self_tid = tc_impl_self_tid(im)
             let methods_sl = node_methods(im)
             if methods_sl != -1 {
@@ -15089,6 +15194,7 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
                     j = j + 1
                 }
             }
+            tc_pop_arith_frames(impl_where_sl)
             tc_pop_tparam_scope(impl_binders_sl)
             tc_current_self_tid = -1
             i = i + 1
