@@ -448,18 +448,26 @@ tasks:
   # monolith path stays reachable via `task ci-monolith` so a codegen
   # regression can be bisected against the single-TU output.
   ratchet:
-    desc: Fail if any flat type-channel count in src/codegen*.bl rose above scripts/ratchet_baseline.txt
+    desc: Fail if any tracked compiler-debt count rose above the baseline or the previous commit
     silent: true
     cmds:
       - ./scripts/ratchet.sh
+
+  test-ratchet:
+    desc: Self-test scripts/ratchet.sh's failure detection
+    silent: true
+    cmds:
+      - ./scripts/test_ratchet.sh
 
   ci:
     desc: Full CI — monolith verification + per-module emit invariants
     silent: true
     cmds:
       - task: ratchet
+      - task: test-ratchet
       - task: ci-monolith
       - task: ci-per-module-checks
+      - task: mono-diff
 
   # Legacy monolith-only verification: regen bootstrap + run all tests on
   # the single-TU (monolith) codegen path. Kept green as a fallback so users
@@ -772,15 +780,12 @@ tasks:
         fi
         echo "ci-per-module-checks: ok (gen1 vs gen2 per-module byte-equal)"
 
-  # Phase 2.3 authority-switch gate: diff the shadow mono worklist
-  # (mono.bl, BLINK_MONO_SHADOW) against the live emit-time registry
-  # (mono_instances) over every tests/test_*.bl, keyed on the emitted C symbol.
-  # Standalone REPORTING target — NOT wired into `task ci`, because the diff is
-  # guaranteed non-empty until the shadow source-walk is extended (Phase 2.5
-  # wires it in as the gate once it reaches empty). Exits nonzero while any
-  # divergence remains. Modeled on the ci-per-module-checks diff idiom.
+  # Authority-switch gate: diff the mono pass's worklist (mono.bl) against the
+  # live emit-time registry (mono_instances) over every tests/test_*.bl, keyed
+  # on the emitted C symbol. Wired into `task ci` below. Exits nonzero on any
+  # divergence. Modeled on the ci-per-module-checks diff idiom.
   mono-diff:
-    desc: "Phase 2.3: diff shadow mono worklist vs live registry over tests/test_*.bl"
+    desc: "Diff mono-pass worklist vs live registry over tests/test_*.bl"
     silent: true
     deps: [build-cli]
     cmds:
@@ -795,7 +800,7 @@ tasks:
         for f in tests/test_*.bl; do
           [ -e "$f" ] || continue
           files=$((files+1))
-          BLINK_MONO_SHADOW=1 BLINK_MONO_DIFF=1 {{.BUILD_DIR}}/blink build --emit c "$f" -o "$OUT/out" 2> "$OUT/err.txt" > /dev/null || true
+          BLINK_MONO_DIFF=1 {{.BUILD_DIR}}/blink build --emit c "$f" -o "$OUT/out" 2> "$OUT/err.txt" > /dev/null || true
           # Tag each divergence with its source file for triage.
           /usr/bin/grep -E '^MONO-DIFF (SHADOW-ONLY|LIVE-ONLY)' "$OUT/err.txt" | sed "s#^#$f: #" >> "$CENSUS" || true
           n=$(/usr/bin/grep -E '^MONO-DIFF TOTAL' "$OUT/err.txt" | tail -1 | awk '{print $3}')
@@ -808,7 +813,7 @@ tasks:
         echo "--- census (per-file) ---"
         sort "$CENSUS"
         if [ "$total" -gt 0 ]; then
-          echo "mono-diff: DIVERGENT ($total) — expected RED until the shadow source-walk is extended (Phase 2.5)"
+          echo "mono-diff: DIVERGENT ($total)"
           exit 1
         fi
         echo "mono-diff: empty — shadow == live (authority-switch gate GREEN)"
