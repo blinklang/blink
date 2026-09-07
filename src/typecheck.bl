@@ -1602,10 +1602,11 @@ fn tc_tid_fill_unknowns(base0: Int, src0: Int) -> Int {
     let base = tc_resolve(base0)
     let src = tc_resolve(src0)
     if base == src { return base }
-    if src == TYPE_UNKNOWN { return base }
-    if base == TYPE_UNKNOWN { return src }
-    if base < 0 || base >= ty_pool.len() { return base }
-    if src < 0 || src >= ty_pool.len() { return base }
+    // Absence is a hole here exactly like the give-up singleton. A position the recovery
+    // could not type at all is the position that most needs the memo, so a range guard that
+    // returned `base` untouched would decline the one case it exists to repair.
+    if tc_tid_is_no_info(src) != 0 { return base }
+    if tc_tid_is_no_info(base) != 0 { return src }
     if tc_tid_has_unknown(base) == 0 { return base }
     let eb = ty_pool.get(base).unwrap()
     let es = ty_pool.get(src).unwrap()
@@ -3439,6 +3440,23 @@ fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int) ! Ty
                 tc_construct_hint = resolve_alias_tid(ptid)
                 let arg_t = infer_type(arg_node)
                 tc_construct_hint = saved_hint
+                // An argument whose own type nothing has determined cannot be judged against
+                // the parameter. Skipping keeps the mistake that made it undetermined as the
+                // single report, instead of adding a mismatch against a type nobody claimed.
+                // "Carries a hole" and not "is a hole": the name-resolution pass walks a body
+                // before the typecheck pass has settled its locals, so `[a]` reads there as
+                // `List[<hole>]` — a real List tid with an undetermined element. Comparing it
+                // reports against a type nobody claimed; the compare that matters runs again on
+                // the typecheck pass, with the element settled.
+                //
+                // Skips THIS argument, not the rest of the call. Every argument is seeded
+                // above, and a keyword-argument closure gets its parameter types from that
+                // seed, so abandoning the loop leaves the later closures unseeded and they
+                // report E0301 for a program that infers fine.
+                if tc_tid_is_no_info(arg_t) != 0 || tc_tid_has_unknown(arg_t) != 0 {
+                    i = i + 1
+                    continue
+                }
                 // Metavar path: passing an as-yet-unpinned empty container
                 // to a concretely-typed param is a constraining use — UNIFY so the
                 // param type PINS the argument's α (`let xs = []; takes_ints(xs)`
@@ -3494,6 +3512,12 @@ fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) !
     tc_construct_hint = resolve_alias_tid(expected_t)
     let arg_t = infer_type(value_node)
     tc_construct_hint = saved_hint
+    // An argument whose own type nothing has determined cannot be judged against
+    // the parameter. Skipping keeps the mistake that made it undetermined as the
+    // single report, instead of adding a mismatch against a type nobody claimed.
+    // "Carries a hole" and not "is a hole" — see check_arg_shapes for why the
+    // name-resolution pass sees `List[<hole>]` for a well-typed list of locals.
+    if tc_tid_is_no_info(arg_t) != 0 || tc_tid_has_unknown(arg_t) != 0 { return }
     // Metavariable path: when the expected type carries an unbound α
     // (e.g. `elem` of an as-yet-unpinned List/Set/Map — an unannotated `[]`),
     // UNIFY it with the argument type so the constraining use PINS α, instead of
@@ -5242,7 +5266,7 @@ fn tc_call_mints_ret_only(v: Int) -> Int {
     if node_kind(callee) != NodeKind.Ident { return 0 }
     let mut fn_name = node_name(callee)
     fn_name = tc_alias_to_original.get(fn_name) ?? fn_name
-    if nr_get_type(fn_name) != TYPE_UNKNOWN { return 0 }
+    if tc_tid_is_no_info(nr_get_type(fn_name)) == 0 { return 0 }
     let sig = lookup_fnsig(fn_name)
     if sig == -1 { return 0 }
     let fs = fnsig_pool.get(sig).unwrap()
@@ -8823,12 +8847,14 @@ fn nr_binding_node(name: Str) -> Int {
     -1
 }
 
+// -1 for a name the scope does not carry. The give-up singleton would be a TYPE here, and a
+// caller cannot tell "this name has no recorded type" from "this name is typed as unknown".
 fn nr_get_type(name: Str) -> Int {
     match nr_name_top.get(name) {
         Some(i) => return nr_scope_types.get(i).unwrap()
         None => {}
     }
-    TYPE_UNKNOWN
+    -1
 }
 
 fn nr_set_last_type(tid: Int) {
@@ -11808,7 +11834,8 @@ pub fn tc_publish_node_tid(node: Int, tid: Int) {
 
 @allow(UnrestoredMutation)
 fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if node == -1 { return TYPE_UNKNOWN }
+    // No node is an absence, not a type. Every caller reads it through tc_tid_is_no_info.
+    if node == -1 { return -1 }
     let kind = node_kind(node)
 
     // §2.9 value-context flag. `incoming` is whether THIS node is a consumed value (its else-less
@@ -11882,7 +11909,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     // leaving the handler value untyped even though resolve_type_parts lowers the ANNOTATION.
     if kind == NodeKind.HandlerExpr {
         let he_eff = node_name(node)
-        if he_eff == "" { return TYPE_UNKNOWN }
+        if he_eff == "" { return -1 }
         return make_handler_type(he_eff)
     }
 
@@ -11891,11 +11918,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if name == "true" || name == "false" { return TYPE_BOOL }
         if name == "None" { return make_option_type(make_metavar()) }
         let vt = nr_get_type(name)
-        if vt != TYPE_UNKNOWN { return vt }
+        if tc_tid_is_no_info(vt) == 0 { return vt }
         if is_variant_name(name) != 0 {
             return get_variant_enum_tid(name)
         }
-        return TYPE_UNKNOWN
+        // An undeclared name is reported as E0506 by the name-resolution pass, so reaching here
+        // means the name IS in scope with no type recorded against it — an absence.
+        return -1
     }
 
     if kind == NodeKind.BinOp {
@@ -12216,7 +12245,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                             li = li + 1
                         }
                     }
-                    return TYPE_UNKNOWN
+                    // The name is in scope and carries a type, and that type is not a function.
+                    // A local whose own type is still open is not yet known to be uncallable, so
+                    // only a settled non-Fn type is reported.
+                    let lk = type_kind(local_tid)
+                    if lk == TyKind.Unknown || lk == TyKind.Typevar { return -1 }
+                    tc_error_at("cannot call '{fn_name}': it has type {type_to_str(local_tid)}, which is not a function", node)
+                    return tc_error_recovery_tid()
                 }
                 let sig = lookup_fnsig(fn_name)
                 if sig != -1 {
@@ -12299,7 +12334,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 }
             }
         }
-        return TYPE_UNKNOWN
+        // Nothing above claimed this node, so nothing has typed it — an absence.
+        return -1
     }
 
     if kind == NodeKind.MethodCall {
@@ -12321,7 +12357,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // than in an AsyncSpawn arm. The nr_get_type guard mirrors codegen's mc_obj_is_local
         // check: a local named `async` must not be mistaken for the module.
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident && node_name(obj_node) == "async" && method == "spawn" {
-            if nr_get_type("async") == TYPE_UNKNOWN {
+            if tc_tid_is_no_info(nr_get_type("async")) != 0 {
                 let sp_args = node_args(node)
                 if sp_args != -1 && sublist_length(sp_args) >= 1 {
                     let sp_cls = sublist_get(sp_args, 0)
@@ -12377,7 +12413,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // the shadowing variant's enum and `.Variant` fails to resolve.
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident {
             let cname = node_name(obj_node)
-            if nr_get_type(cname) == TYPE_UNKNOWN {
+            if tc_tid_is_no_info(nr_get_type(cname)) != 0 {
                 let ctor_tid = lookup_named_type(cname)
                 if ctor_tid != -1 && type_kind(ctor_tid) == TyKind.Enum {
                     let cvar_idx = get_variant_by_name(ctor_tid, method)
@@ -13022,7 +13058,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // read instead would reject the program at the wrong place.
             if method == "recv" {
                 let r = tc_resolve(elem)
-                if tc_tid_has_unbound_metavar(r) != 0 { return TYPE_UNKNOWN }
+                if tc_tid_has_unbound_metavar(r) != 0 { return -1 }
                 return r
             }
             if method == "close" { return TYPE_VOID }
@@ -13086,7 +13122,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // the honest answer here is "not yet known", and the LetBinding recovery
                 // fills it in from the body once the walk has run. Re-inferring the body HERE
                 // instead would double-report every diagnostic inside it.
-                if ret_str == "" { return TYPE_UNKNOWN }
+                if ret_str == "" { return -1 }
                 let rt = resolve_type_name(ret_str)
                 if rt == -1 { return TYPE_VOID }
                 return rt
@@ -13213,21 +13249,21 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 return make_ptr_type(TYPE_U8)
             }
             if method == "take" {
-                if args_sl == -1 || sublist_length(args_sl) < 1 { return TYPE_UNKNOWN }
+                if check_builtin_arity("scope", method, 1, args_sl, node) == 0 { return tc_error_recovery_tid() }
                 let taken_t = infer_type(sublist_get(args_sl, 0))
                 let taken_k = type_kind(resolve_alias_tid(taken_t))
                 if taken_k == TyKind.Ptr { return taken_t }
                 // An unresolved argument keeps the unresolved answer — `scope.take(scope.alloc())`
                 // is the corpus's own spelling and its argument has no tid by design (above).
-                if taken_k == TyKind.Unknown || taken_k == TyKind.Typevar { return TYPE_UNKNOWN }
+                if taken_k == TyKind.Unknown || taken_k == TyKind.Typevar { return -1 }
                 tc_error_at("argument 1 of 'scope.take' expects Ptr[T], got {type_to_str(taken_t)}", sublist_get(args_sl, 0))
                 return tc_error_recovery_tid()
             }
             if method == "alloc_n" {
                 check_builtin_arg(method, 0, TYPE_INT, args_sl, "scope")
-                return TYPE_UNKNOWN
+                return -1
             }
-            if method == "alloc" { return TYPE_UNKNOWN }
+            if method == "alloc" { return -1 }
         }
 
         if obj_k == TyKind.Struct || obj_k == TyKind.Enum {
@@ -13308,7 +13344,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if method == "cmp" && tc_type_has_ord_impl(tname) != 0 {
                 let ot = lookup_named_type("Ordering")
                 if ot != -1 { return ot }
-                return TYPE_UNKNOWN
+                return -1
             }
             // A closure-typed struct field invoked like a method —
             // `route.callback(req)`, `srv.error_handler.on_error(req, msg)`, the
@@ -13657,7 +13693,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                             }
                             return ff_ret
                         }
-                        return TYPE_UNKNOWN
+                        return -1
                     }
                 }
             }
@@ -13676,13 +13712,14 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 mci = mci + 1
             }
         }
-        return TYPE_UNKNOWN
+        // Nothing above claimed this node, so nothing has typed it — an absence.
+        return -1
     }
 
     if kind == NodeKind.FieldAccess {
         let obj_node = node_obj(node)
         let fname = node_name(node)
-        if obj_node == -1 { return TYPE_UNKNOWN }
+        if obj_node == -1 { return -1 }
 
         if node_kind(obj_node) == NodeKind.Ident {
             let obj_name = node_name(obj_node)
@@ -13772,11 +13809,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // resolvable and genuinely omits the field (sections/03_types.md:3305);
             // an @ffi.opaque handle is a bodiless struct, so its inertness against
             // field access falls out of the same declared-shape rule (§9.1.4).
-            // Otherwise fall through to TYPE_UNKNOWN, the pre-existing behavior.
+            // Otherwise the field's type is an absence, not an answer.
             if tc_struct_field_provably_absent(obj_t, fname) != 0 {
                 diag_error_at("NoSuchField", NO_SUCH_FIELD, "type {type_to_str(obj_t)} has no field '{fname}'", node, "use a declared field, or add the field to the type")
+                return tc_error_recovery_tid()
             }
-            return TYPE_UNKNOWN
+            return -1
         }
         // Tuple positional access `t.0`, `t.1`, ...: the field name is the
         // numeric index into the tuple's element tids. Without this, a tuple
@@ -13791,7 +13829,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             diag_error_at("NoSuchField", NO_SUCH_FIELD, "tuple {type_to_str(obj_t)} has no field '{fname}'", node, "a tuple field is a numeric index within its arity")
             return tc_error_recovery_tid()
         }
-        return TYPE_UNKNOWN
+        // Nothing above claimed this node, so nothing has typed it — an absence.
+        return -1
     }
 
     if kind == NodeKind.IndexExpr {
@@ -13936,7 +13975,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 }
             }
         }
-        return TYPE_UNKNOWN
+        // Nothing above claimed this node, so nothing has typed it — an absence.
+        return -1
     }
 
     if kind == NodeKind.TupleLit {
@@ -13965,13 +14005,24 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if else_node != -1 {
             tc_if_value_ctx = incoming
             let else_t = infer_type(else_node)
+            // Both sides must carry information all the way down before they can be
+            // compared. A branch typed `Option[<hole>]` on the name-resolution pass — the
+            // walk that runs before the typecheck pass settles the block's locals — is not a
+            // mismatch with `Option[?]`, it is the same branch not yet typed. The compare
+            // runs again on the typecheck pass, where both sides are settled.
             if tc_tid_is_no_info(then_t) == 0 && tc_tid_is_no_info(else_t) == 0 {
-                if types_compatible(then_t, else_t) == 0 {
-                    tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
+                if tc_tid_has_unknown(then_t) == 0 && tc_tid_has_unknown(else_t) == 0 {
+                    if types_compatible(then_t, else_t) == 0 {
+                        tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
+                    }
                 }
             }
             if tc_tid_is_no_info(then_t) != 0 { return else_t }
             if tc_tid_is_no_info(else_t) != 0 { return then_t }
+            // A hole takes the other branch's answer for that position, so the `if`'s own
+            // type never carries an absence into a container the callers then read.
+            if tc_tid_has_unknown(then_t) != 0 { return tc_tid_fill_unknowns(then_t, else_t) }
+            if tc_tid_has_unknown(else_t) != 0 { return tc_tid_fill_unknowns(else_t, then_t) }
             return type_merge(then_t, else_t)
         }
         // §2.9: an else-less `if` used as a value has no value on the false path. infer_type
@@ -14015,7 +14066,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if completes != 0 && tc_tid_is_no_info(merged) == 0 { return TYPE_VOID }
             return merged
         }
-        return TYPE_UNKNOWN
+        return -1
     }
 
     if kind == NodeKind.Block {
@@ -14069,7 +14120,14 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if tc_tid_kind(awaited) == TyKind.Handle && tc_tid_child_count(awaited) >= 1 {
             return tc_tid_child(awaited, 0)
         }
-        return TYPE_UNKNOWN
+        // A Handle with no element is a malformed carrier rather than a user mistake, and an
+        // operand whose own type is still open is not yet known to be un-awaitable. Report only
+        // a settled non-Handle: `.await` on it can never produce a value.
+        let ak = tc_tid_kind(awaited)
+        if ak == TyKind.Handle || ak == TyKind.Unknown || ak == TyKind.Typevar { return -1 }
+        if tc_tid_is_no_info(awaited) != 0 { return -1 }
+        tc_error_at("cannot await a value of type {type_to_str(awaited)}: '.await' expects a Handle[T]", node)
+        return tc_error_recovery_tid()
     }
 
     // A closure literal's type is its signature, computed from the declaration rather
@@ -14944,9 +15002,15 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // Implicit tail of a value-returning fn is expression context (§2.9):
                     // infer in value context so an else-less `if` tail (no value on the false
                     // path) is rejected.
+                    // Read the memo BEFORE the re-inference, not after. infer_type publishes
+                    // every node it walks, so the out-of-scope pass overwrites the in-scope
+                    // answer this recovery exists to read, and reading afterwards returns its
+                    // own damage. `Ok(out)` as a `with` tail is the shape that shows it: in
+                    // scope it is Result[List[Int], ?], re-typed out of scope the carried type
+                    // is gone, and the recovery used to "recover" the erased tid onto itself.
+                    let memo = tc_scoped_value_memo(tail_val, 0)
                     let mut tail_t = tc_infer_value(tail_val)
                     if tc_tid_is_no_info(tail_t) != 0 || tc_tid_has_unknown(tail_t) != 0 {
-                        let memo = tc_scoped_value_memo(tail_val, 0)
                         if tc_tid_is_no_info(memo) == 0 {
                             tail_t = if tc_tid_is_no_info(tail_t) != 0 { memo } else { tc_tid_fill_unknowns(tail_t, memo) }
                         }
