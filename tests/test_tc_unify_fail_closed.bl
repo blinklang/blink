@@ -1,0 +1,70 @@
+// tc_unify answers "these two types are the same, or I made them the same by pinning a
+// metavar". A tid of -1 or one past the end of ty_pool is not a type at all — it is the
+// absence of one — so there is nothing to answer about and the only sound reply is 0.
+//
+// It used to reply 1 for both, which is the same fail-open shape types_compatible and
+// type_merge already closed (tests/test_type_merge_fail_closed.bl). A vacuous 1 there
+// reads to every caller as "unified", so a caller that gates on the result treats an
+// absent type as a successful match and moves on with nothing pinned.
+//
+// The four callers that gate on the result all pre-gate on tc_tid_has_unbound_metavar,
+// which itself returns 0 for a negative or out-of-range tid, so no surface program can
+// reach these guards. Like the type_merge backstop, they are exercised directly.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_unify, tc_unknown_tid, make_option_type, make_metavar}
+// Bare, load-bearing: codegen_types back-references globals it cannot import out of the
+// MERGED program; codegen_expr is the smallest root that closes them.
+import codegen_expr
+
+fn unify_init_types_pool() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/tc_unify_probe.bl"
+    write_file(path, #"fn main() {
+    assert(1 == 1)
+}
+"#)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+test "tc_unify fails closed on a negative tid" {
+    unify_init_types_pool()
+    let valid = make_option_type(make_metavar())
+    assert(tc_unify(-1, valid) == 0)
+    assert(tc_unify(valid, -1) == 0)
+    // Two absences are still two absences: equal spellings of "no type" must not
+    // shortcut to success ahead of the range guard.
+    assert(tc_unify(-1, -1) == 0)
+}
+
+test "tc_unify fails closed on an out-of-range tid" {
+    unify_init_types_pool()
+    let valid = make_option_type(make_metavar())
+    let out_of_range = 999999999
+    assert(tc_unify(out_of_range, valid) == 0)
+    assert(tc_unify(valid, out_of_range) == 0)
+}
+
+// The guards must not cost a real unification: an open metavar still pins to a
+// concrete sibling, and a genuine mismatch still reports 0.
+test "tc_unify still pins an open metavar and still rejects a mismatch" {
+    unify_init_types_pool()
+    let mv = make_metavar()
+    let opt = make_option_type(make_metavar())
+    assert(tc_unify(mv, opt) == 1)
+    let a = make_option_type(make_metavar())
+    assert(tc_unify(a, a) == 1)
+}
+
+// The TYPE_UNKNOWN singleton keeps unifying vacuously. It is the `?` hole, a spelling a
+// surface program can still produce, so closing it here would turn every remaining
+// give-up exit into a hard type error rather than the E0301 the boundary check owns.
+test "the TYPE_UNKNOWN singleton still unifies vacuously" {
+    unify_init_types_pool()
+    let unk = tc_unknown_tid()
+    let valid = make_option_type(make_metavar())
+    assert(tc_unify(unk, valid) == 1)
+    assert(tc_unify(valid, unk) == 1)
+}

@@ -1704,13 +1704,21 @@ fn tc_report_under_determined_at(scrut: Int, scrut_tid: Int) ! Diag.Report {
 // permissive toward the legacy TYPE_UNKNOWN singleton and bare TyKind.Typevar (both
 // treated as "unifies with anything, no bind") so Stage 1 is behavior-neutral —
 // only fresh per-binding metavars from make_metavar ever get pinned.
-fn tc_unify(a0: Int, b0: Int) -> Int {
+// pub so the fail-closed range guards below can be driven directly; no surface program
+// reaches them, the same reason type_merge is pub.
+pub fn tc_unify(a0: Int, b0: Int) -> Int {
     let a = tc_resolve(a0)
     let b = tc_resolve(b0)
+    // Fail CLOSED on a tid that is not a type, ahead of the a == b shortcut so that two
+    // equal spellings of "no type" cannot answer "unified". A vacuous 1 reads to every
+    // caller as a successful match with nothing pinned, which is the fail-open shape
+    // types_compatible and type_merge already closed.
+    if a < 0 || b < 0 { return 0 }
+    if a >= ty_pool.len() || b >= ty_pool.len() { return 0 }
     if a == b { return 1 }
-    if a < 0 || b < 0 { return 1 }
-    if a >= ty_pool.len() || b >= ty_pool.len() { return 1 }
-    // Legacy singleton / bare typevar: unify vacuously, never bind (Stage-1 neutral).
+    // The `?` hole and a bare typevar unify vacuously, never bind. Unlike an absent tid
+    // these are spellings a surface program produces, and the E0301 boundary check —
+    // not this function — owns reporting one that never got pinned.
     if a == TYPE_UNKNOWN || b == TYPE_UNKNOWN { return 1 }
     let ka0 = ty_pool.get(a).unwrap().kind
     let kb0 = ty_pool.get(b).unwrap().kind
@@ -11247,16 +11255,17 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     let tid = infer_type_uncached(node)
     tc_if_value_ctx = saved_ctx
     if node != -1 && node < tc_node_tid.len() {
-        // Never downgrade a known memo to UNKNOWN. -1 is the unset sentinel (TYPE_INT
-        // is 0), so a never-inferred node still takes the write, and known->known
-        // overwrites are preserved: mono-calls-mono re-instantiates one AST node under
-        // several T.
+        // The memo answers a TYPE or nothing, and -1 is the "nobody has typed this"
+        // sentinel (TYPE_INT is 0, so -1 cannot collide with a real tid). TYPE_UNKNOWN
+        // is a real, in-range pool index, so writing it would read as an ANSWER to
+        // every `tid >= 0` gate downstream while meaning "inference gave up" — the one
+        // state the memo must not be able to represent. Refusing the write leaves the
+        // slot at -1, which is the same contract tc_publish_node_tid states for the
+        // memo's other writer. A negative tid is likewise an absence, never a type.
         //
-        // There is no known live producer of an out-of-scope re-infer today: tc_check_fn's
-        // declared-return compare runs inside the Block arm, in scope, and never re-infers.
-        // The guard is kept anyway because that is not proven to be the only such path.
-        // Do not treat this comment as evidence that a live producer remains.
-        if tid != TYPE_UNKNOWN || tc_node_tid.get(node).unwrap() == -1 {
+        // Known->known overwrites are still allowed: mono-calls-mono re-instantiates
+        // one AST node under several T.
+        if tid >= 0 && tid != TYPE_UNKNOWN {
             tc_node_tid.set(node, tid)
         }
     }
