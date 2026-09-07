@@ -207,20 +207,22 @@ let mut evfield_pool: List[EnumVariantFieldEntry] = []
 
 let mut named_type_map: Map[Str, Int] = Map()
 let mut fnsig_map: Map[Str, Int] = Map()
-// Set of struct/enum names that carry @derive(Hash). Used to reject
-// Map[K, V] at typecheck when K is a user type without the derive.
-let mut tc_hashable_types: Map[Str, Int] = Map()
-
-// Set of struct/enum names that carry @derive(Debug). Used to reject
-// @derive(Debug) on a type whose field's user-type does not also derive Debug.
-let mut tc_debug_types: Map[Str, Int] = Map()
-// Set of struct/enum names that carry @derive(Serialize). Used to reject
-// @derive(Serialize) on a type whose field type is not itself serializable —
-// the emitter only faithfully serializes a user type when it carries the derive
-// (codegen has_derive_method is derive-only), so this mirrors that capability.
-let mut tc_serializable_types: Map[Str, Int] = Map()
-// type name -> its declaration node, for field-derive validation spans.
+// type name -> its declaration node, which is also the sole store of the @derive facts:
+// a parallel table of derive bits would be a second authority to keep in sync, and it
+// could not answer for a generic INSTANCE, where `Box[Int]` and `Box[NoHash]` share the
+// base name and must not share a verdict. Read it through tc_type_name_derives
+// (declaration-level) or tc_tid_derive_fact (per instance).
 pub let mut tc_type_decl_nodes: Map[Str, Int] = Map()
+// The same declarations keyed by their own tid, for a value whose type was inferred and
+// carries no spelling to look up. Two modules may declare one bare name (spec
+// sections/03_types.md:1038), which the map above cannot hold both of.
+let mut tc_type_decl_node_by_tid: Map[Int, Int] = Map()
+// Stored under a tid whose bare name is declared by more than one module. Type
+// resolution is still module-blind — it mints ONE tid for every declaration of a bare
+// name — so such a tid does not identify the declaration the user wrote and must not
+// answer a question about it. Delete this the day resolution mints a tid per
+// declaration; the tid then names its own node and there is nothing to be unsure of.
+let DECL_NODE_AMBIGUOUS: Int = -2
 // Type-parameter names in scope at the current resolution point, each mapped to a
 // nesting count so an inner binder (a generic method of a generic type) can shadow
 // an outer one and restore it on exit. A name in this map is a type VARIABLE, not a
@@ -377,6 +379,46 @@ fn tc_mangle_impl_fnsig(impl_type: Str, trait_name: Str, mname: Str, im: Int) ->
         }
     }
     "{impl_type}_{trait_name}_{mname}"
+}
+
+// Index a declaration under its bare name, under `<module>.<bare>`, and under its tid.
+// The bare key is what an unqualified annotation looks up, but it holds only ONE
+// declaration, so a second module declaring the same bare name would otherwise answer
+// for the first. The qualified key resolves a written `m.Point`; the tid key resolves a
+// value whose type was inferred, where no spelling survives to look up.
+fn tc_register_type_decl_node(name: Str, tid: Int, td: Int) {
+    // Read the previous declaration of this bare name BEFORE overwriting either key.
+    let prev = tc_type_decl_nodes.get(name) ?? -1
+    let prev_tid = named_type_map.get(name) ?? -1
+    if prev != -1 && prev != td {
+        tc_type_decl_node_by_tid.insert(tid, DECL_NODE_AMBIGUOUS)
+        if prev_tid != -1 { tc_type_decl_node_by_tid.insert(prev_tid, DECL_NODE_AMBIGUOUS) }
+    } else {
+        tc_type_decl_node_by_tid.insert(tid, td)
+    }
+    tc_type_decl_nodes.insert(name, td)
+    let m = node_source_module(td)
+    if m != "" { tc_type_decl_nodes.insert("{m}.{name}", td) }
+}
+
+// The declaration node for the type `tname`, or -1. The qualified spelling is tried
+// FIRST and the bare name only as a fallback: two modules may each declare a type with
+// the same bare name (spec sections/03_types.md:1038), and the bare key holds whichever
+// registered last, so `m.Point` must resolve through its own module's key or it reads a
+// namesake's declaration. The fallback serves an unqualified annotation and a tid base.
+fn tc_decl_node_for_type(tname: Str) -> Int {
+    let td = tc_type_decl_nodes.get(tname) ?? -1
+    if td != -1 { return td }
+    tc_type_decl_nodes.get(strip_module_qualifier(tname)) ?? -1
+}
+
+// Does the DECLARED type `tname` carry `@derive(tr)`? This is a DECLARATION-level fact:
+// for a generic base it says only that the derive is written, which is the whole answer
+// for a 0-arg type and merely a precondition for an instance (tc_tid_derive_fact).
+fn tc_type_name_derives(tname: Str, tr: Str) -> Int {
+    let td = tc_decl_node_for_type(tname)
+    if td == -1 { return 0 }
+    type_has_derive(td, tr)
 }
 
 // Does `tname` carry an Eq impl usable by the `==`/`!=` operators?
@@ -611,26 +653,12 @@ fn tc_type_satisfies_bound(concrete_tid: Int, trait_name: Str) -> Int ! TypeChec
         if tc_type_id_has_display(concrete_tid) != 0 { return 1 }
         return -1
     }
-    // The @derive/impl-backed traits key on the struct/enum BASE name (tid is the
-    // source of truth for the base). Scalars satisfy these structurally.
+    // The @derive-backed traits resolve per INSTANCE off the tid; the impl-backed ones
+    // still key on the struct/enum BASE name. Scalars satisfy all of them structurally.
     let base = tc_tid_struct(concrete_tid)
-    if trait_name == "Debug" {
+    if trait_name == "Debug" || trait_name == "Hash" || trait_name == "Serialize" {
         if scalar != 0 { return 1 }
-        if base != "" && tc_debug_types.contains_key(base) != 0 { return 1 }
-        if base != "" { return -1 }
-        return 0
-    }
-    if trait_name == "Hash" {
-        if scalar != 0 { return 1 }
-        if base != "" && tc_hashable_types.contains_key(base) != 0 { return 1 }
-        if base != "" { return -1 }
-        return 0
-    }
-    if trait_name == "Serialize" {
-        if scalar != 0 { return 1 }
-        if base != "" && tc_serializable_types.contains_key(base) != 0 { return 1 }
-        if base != "" { return -1 }
-        return 0
+        return tc_tid_derive_fact(concrete_tid, trait_name)
     }
     if trait_name == "Eq" {
         if scalar != 0 { return 1 }
@@ -656,6 +684,83 @@ fn tc_type_satisfies_bound(concrete_tid: Int, trait_name: Str) -> Int ! TypeChec
     // A user trait we do not model here — fail open. A full impl-registry recursion
     // is not needed: the compiler declares no such where-bound (audited), and
     // an unmodeled bound must never manufacture a false E0523.
+    0
+}
+
+// Tri-state per-INSTANCE answer for the three @derive-backed traits (Hash / Debug /
+// Serialize): 1 satisfies, -1 definitely does not, 0 unknown (never rejects). The base's
+// derive is necessary but not sufficient for a generic instance — `@derive(Hash) type
+// Box[T] { v: T }` synthesizes a hash that hashes `v`, so `Box[NoHash]` has no usable
+// Hash even though `Box` carries the derive. This is the per-instantiation resolution
+// tc_type_id_has_display already does for Display; the structural rule replaces Display's
+// impl-node walk because these three traits are reachable ONLY through @derive (spec
+// §3.4:1908 for Hash; the Debug and Serialize emitters are derive-only), so there are no
+// impl nodes to consult.
+//
+// A field annotated with one of the declaration's type parameters takes that slot's
+// concrete argument and must satisfy the trait itself. Every other field was already
+// judged against the declaration by the derive-field passes (E0520 / E1401), so it is
+// skipped here rather than decided twice. Recursion runs on the instance's arguments,
+// which are strictly less nested than the instance, so it terminates.
+fn tc_tid_derive_fact(tid: Int, tr: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let base = tc_tid_struct(tid)
+    if base == "" { return 0 }
+    let mut td = tc_type_decl_node_by_tid.get(tid) ?? -1
+    if td == DECL_NODE_AMBIGUOUS { return 0 }
+    if td == -1 { td = tc_decl_node_for_type(tc_tid_name(tid)) }
+    if td == -1 { return -1 }
+    if type_has_derive(td, tr) == 0 { return -1 }
+    if tc_tid_struct_arg_count(tid) == 0 { return 1 }
+    let tps = node_type_params(td)
+    let flds = node_fields(td)
+    if tps == -1 || flds == -1 { return 1 }
+    let mut i = 0
+    while i < sublist_length(flds) {
+        let f = sublist_get(flds, i)
+        if node_kind(f) == NodeKind.TypeVariant {
+            let vflds = node_fields(f)
+            let mut vi = 0
+            while vflds != -1 && vi < sublist_length(vflds) {
+                if tc_tparam_field_fact(sublist_get(vflds, vi), tps, tid, tr) == -1 { return -1 }
+                vi = vi + 1
+            }
+        } else {
+            if tc_tparam_field_fact(f, tps, tid, tr) == -1 { return -1 }
+        }
+        i = i + 1
+    }
+    1
+}
+
+// One field of a generic declaration, judged against the instance `tid`. Answers -1 only
+// when a type parameter occurring in the field's annotation is bound to an argument that
+// definitely lacks the trait; every other shape answers 0 (skip).
+fn tc_tparam_field_fact(f: Int, tps: Int, tid: Int, tr: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
+    tc_ann_tparam_fact(node_value(f), tps, tid, tr)
+}
+
+// A type parameter binds its slot's argument to the trait wherever it occurs in `ann`,
+// not only when it IS the whole annotation: a derived impl must traverse every field, and
+// every container it can traverse imposes the same trait on its own element. So
+// `inner: Box[T]` is judged exactly like `v: T`, one level deeper.
+fn tc_ann_tparam_fact(ann: Int, tps: Int, tid: Int, tr: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
+    if ann == -1 { return 0 }
+    let aname = node_name(ann)
+    let mut i = 0
+    while i < sublist_length(tps) {
+        if node_name(sublist_get(tps, i)) == aname {
+            let arg = tc_tid_struct_arg_tid(tid, i)
+            if arg == -1 { return 0 }
+            return tc_type_satisfies_bound(arg, tr)
+        }
+        i = i + 1
+    }
+    let elems = node_elements(ann)
+    let mut j = 0
+    while elems != -1 && j < sublist_length(elems) {
+        if tc_ann_tparam_fact(sublist_get(elems, j), tps, tid, tr) == -1 { return -1 }
+        j = j + 1
+    }
     0
 }
 
@@ -5311,7 +5416,7 @@ fn validate_map_key(key_ann: Int) ! Diag.Report {
     }
     if is_builtin_hashable(key_name) != 0 { return }
     let bare = strip_module_qualifier(key_name)
-    if tc_hashable_types.contains_key(key_name) || tc_hashable_types.contains_key(bare) {
+    if tc_type_name_derives(key_name, "Hash") != 0 {
         return
     }
     // Generic type params and unknown names — let later phases handle them.
@@ -5363,7 +5468,7 @@ fn validate_set_elem(elem_ann: Int) ! Diag.Report {
     }
     if is_builtin_hashable(elem_name) != 0 { return }
     let bare = strip_module_qualifier(elem_name)
-    if tc_hashable_types.contains_key(elem_name) || tc_hashable_types.contains_key(bare) {
+    if tc_type_name_derives(elem_name, "Hash") != 0 {
         return
     }
     if named_type_map.contains_key(elem_name) || named_type_map.contains_key(bare) {
@@ -5482,23 +5587,9 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
     let tid = new_type(TyKind.Struct, name)
     named_type_names.push(name)
     named_type_ids.push(tid)
+    tc_register_type_decl_node(name, tid, td)
     named_type_map.insert(name, tid)
     tc_struct_decl_nodes.insert(name, td)
-    tc_type_decl_nodes.insert(name, td)
-    // The alias RHS is resolved in a second pass (see check_types), AFTER every
-    // type name is interned: resolving it here, in textual order, mints an orphan
-    // typevar for any target declared later — a forward reference is well-formed
-    // (spec §3, type info flows both ways) and must lower like a target-before one.
-    if type_has_derive(td, "Hash") != 0 {
-        tc_hashable_types.insert(name, 1)
-    }
-    if type_has_derive(td, "Debug") != 0 {
-        tc_debug_types.insert(name, 1)
-    }
-    if type_has_derive(td, "Serialize") != 0 {
-        tc_serializable_types.insert(name, 1)
-    }
-
     if has_annotation(td, "ffi.struct") != 0 {
         ffi_struct_type_set.insert(name, 1)
     }
@@ -5563,18 +5654,8 @@ fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Rep
     let tid = new_type(TyKind.Enum, name)
     named_type_names.push(name)
     named_type_ids.push(tid)
+    tc_register_type_decl_node(name, tid, td)
     named_type_map.insert(name, tid)
-    tc_type_decl_nodes.insert(name, td)
-    if type_has_derive(td, "Hash") != 0 {
-        tc_hashable_types.insert(name, 1)
-    }
-    if type_has_derive(td, "Debug") != 0 {
-        tc_debug_types.insert(name, 1)
-    }
-    if type_has_derive(td, "Serialize") != 0 {
-        tc_serializable_types.insert(name, 1)
-    }
-
     if has_annotation(td, "deprecated") != 0 {
         depr_type_nodes.insert(name, td)
     }
@@ -5637,7 +5718,7 @@ fn resolve_enum_variants(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.
 // itself carries @derive(Debug).
 fn tc_debug_field_ok(ftype_name: Str) -> Int {
     if named_type_map.contains_key(ftype_name) == 0 { return 1 }
-    if tc_debug_types.contains_key(ftype_name) != 0 { return 1 }
+    if tc_type_name_derives(ftype_name, "Debug") != 0 { return 1 }
     0
 }
 
@@ -5693,7 +5774,7 @@ fn tc_debug_map_key_ok(key_name: Str) -> Int {
     if key_name == "Str" || key_name == "Char" || key_name == "Int" || key_name == "Bool" { return 1 }
     if key_name == "I8" || key_name == "I16" || key_name == "I32" || key_name == "I64" { return 1 }
     if key_name == "U8" || key_name == "U16" || key_name == "U32" || key_name == "U64" { return 1 }
-    if tc_type_is_struct(key_name) != 0 && tc_debug_types.contains_key(key_name) != 0 { return 1 }
+    if tc_type_is_struct(key_name) != 0 && tc_type_name_derives(key_name, "Debug") != 0 { return 1 }
     0
 }
 
@@ -5791,8 +5872,9 @@ fn tc_check_derive_debug() ! Diag.Report {
     let mut ti = 0
     while ti < named_type_names.len() {
         let tname = named_type_names.get(ti).unwrap()
-        if tc_debug_types.contains_key(tname) != 0 {
-            let flds_sl = node_fields(tc_type_decl_nodes.get(tname).unwrap())
+        let td = tc_decl_node_for_type(tname)
+        if td != -1 && type_has_derive(td, "Debug") != 0 {
+            let flds_sl = node_fields(td)
             let mut i = 0
             while flds_sl != -1 && i < sublist_length(flds_sl) {
                 let f = sublist_get(flds_sl, i)
@@ -5872,7 +5954,7 @@ fn tc_field_type_derivable(ftype_name: Str, tr: Str) -> Int {
     let bare = strip_module_qualifier(ftype_name)
     if named_type_map.contains_key(ftype_name) || named_type_map.contains_key(bare) {
         if tr == "Hash" {
-            if tc_hashable_types.contains_key(ftype_name) || tc_hashable_types.contains_key(bare) { return 1 }
+            if tc_type_name_derives(ftype_name, "Hash") != 0 { return 1 }
             return 0
         }
         if tr == "Eq" {
@@ -5965,7 +6047,7 @@ fn tc_serialize_scalar_ok(n: Str) -> Int {
 fn tc_serialize_user_type_ok(name: Str) -> Int {
     let bare = strip_module_qualifier(name)
     if named_type_map.contains_key(name) || named_type_map.contains_key(bare) {
-        if tc_serializable_types.contains_key(name) || tc_serializable_types.contains_key(bare) { return 1 }
+        if tc_type_name_derives(name, "Serialize") != 0 { return 1 }
         return 0
     }
     1
@@ -6013,7 +6095,7 @@ fn tc_serialize_variant_field_ok(ann: Int) -> Int {
     if is_primitive_type(name) != 0 { return 0 }
     let bare = strip_module_qualifier(name)
     if named_type_map.contains_key(name) || named_type_map.contains_key(bare) {
-        if tc_serializable_types.contains_key(name) || tc_serializable_types.contains_key(bare) {
+        if tc_type_name_derives(name, "Serialize") != 0 {
             if tc_type_is_struct(name) != 0 || tc_type_is_struct(bare) != 0 { return 1 }
             return 0
         }
@@ -6035,8 +6117,9 @@ fn tc_check_derive_serialize() ! Diag.Report {
     let mut ti = 0
     while ti < named_type_names.len() {
         let tname = named_type_names.get(ti).unwrap()
-        if tc_serializable_types.contains_key(tname) != 0 {
-            let flds_sl = node_fields(tc_type_decl_nodes.get(tname).unwrap())
+        let td = tc_decl_node_for_type(tname)
+        if td != -1 && type_has_derive(td, "Serialize") != 0 {
+            let flds_sl = node_fields(td)
             let mut i = 0
             while flds_sl != -1 && i < sublist_length(flds_sl) {
                 let f = sublist_get(flds_sl, i)
@@ -7524,10 +7607,8 @@ fn init_types() ! TypeCheck.Register {
     named_type_ids.clear()
     named_type_map.clear()
     fs_error_runtime_tid_cache = -1
-    tc_hashable_types.clear()
-    tc_debug_types.clear()
-    tc_serializable_types.clear()
     tc_type_decl_nodes.clear()
+    tc_type_decl_node_by_tid.clear()
     tc_active_tparams.clear()
     tc_tp_arith_names.clear()
     tc_tp_bound_traits.clear()

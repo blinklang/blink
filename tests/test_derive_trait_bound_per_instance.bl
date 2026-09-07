@@ -1,0 +1,103 @@
+// A @derive-backed trait bound (Hash / Debug / Serialize) is decided PER GENERIC
+// INSTANCE, not per base name. `@derive(Hash) type Box[T] { v: T }` synthesizes a hash
+// that hashes `v`, so `Box[Int]` is Hash and `Box[NoHash]` is not, and the derive on the
+// base cannot answer for both. A type parameter binds its argument to the trait wherever
+// it occurs in a field type, so `W[T] { inner: Box[T] }` is judged the same way.
+//
+// The bound is enforced at the call site as E0306 TraitBoundNotSatisfied (spec
+// sections/03_types.md:1193), the same seam test_call_site_trait_bound_enforced.bl
+// covers for the arithmetic traits. For a 0-arg type the declaration's derive IS the
+// whole answer, which the non-generic rows hold in place.
+//
+// The accept rows assert on a RUN, not on a clean check: a green row must prove the
+// accepted program still builds, so it cannot come from a diagnostic that never fired.
+
+import compile_test_helpers
+
+test "generic instance with a non-Hash field fails a Hash bound" {
+    let out = compile_test_helpers.compile_and_capture(
+        "type NoHash \{ v: Int }\n\n@derive(Hash, Eq)\ntype Box[T] \{ v: T }\n\nfn need_hash[T: Hash](_x: T) -> Int \{ 1 }\n\nfn main() \{\n    io.println(\"\{need_hash(Box \{ v: NoHash \{ v: 1 } })}\")\n}\n",
+        "_dtbpi_hash")
+    compile_test_helpers.expect_error(out, "E0306", "Box[NoHash] fails T: Hash")
+}
+
+test "generic instance with a non-Debug field fails a Debug bound" {
+    let out = compile_test_helpers.compile_and_capture(
+        "type NoDebug \{ v: Int }\n\n@derive(Debug)\ntype Box[T] \{ v: T }\n\nfn need_debug[T: Debug](_x: T) -> Int \{ 1 }\n\nfn main() \{\n    io.println(\"\{need_debug(Box \{ v: NoDebug \{ v: 1 } })}\")\n}\n",
+        "_dtbpi_debug")
+    compile_test_helpers.expect_error(out, "E0306", "Box[NoDebug] fails T: Debug")
+}
+
+test "generic instance with a non-Serialize field fails a Serialize bound" {
+    let out = compile_test_helpers.compile_and_capture(
+        "type NoSer \{ v: Int }\n\n@derive(Serialize)\ntype Box[T] \{ v: T }\n\nfn need_ser[T: Serialize](_x: T) -> Int \{ 1 }\n\nfn main() \{\n    io.println(\"\{need_ser(Box \{ v: NoSer \{ v: 1 } })}\")\n}\n",
+        "_dtbpi_ser")
+    compile_test_helpers.expect_error(out, "E0306", "Box[NoSer] fails T: Serialize")
+}
+
+test "generic enum instance with a non-Hash payload fails a Hash bound" {
+    let out = compile_test_helpers.compile_and_capture(
+        "type NoHash \{ v: Int }\n\n@derive(Hash, Eq)\ntype Opt[T] \{\n    Wrap(v: T)\n    Empty\n}\n\nfn need_hash[T: Hash](_x: T) -> Int \{ 1 }\n\nfn main() \{\n    io.println(\"\{need_hash(Opt.Wrap(NoHash \{ v: 1 }))}\")\n}\n",
+        "_dtbpi_enum")
+    compile_test_helpers.expect_error(out, "E0306", "Opt[NoHash] fails T: Hash")
+}
+
+test "nested generic instance inherits its inner instance's verdict" {
+    let out = compile_test_helpers.compile_and_capture(
+        "type NoHash \{ v: Int }\n\n@derive(Hash, Eq)\ntype Box[T] \{ v: T }\n\nfn need_hash[T: Hash](_x: T) -> Int \{ 1 }\n\nfn main() \{\n    io.println(\"\{need_hash(Box \{ v: Box \{ v: NoHash \{ v: 1 } } })}\")\n}\n",
+        "_dtbpi_nested")
+    compile_test_helpers.expect_error(out, "E0306", "Box[Box[NoHash]] fails T: Hash")
+}
+
+test "a type parameter nested in a generic field type still binds the trait" {
+    let out = compile_test_helpers.compile_and_capture(
+        "type NoHash \{ v: Int }\n\n@derive(Hash, Eq)\ntype Box[T] \{ v: T }\n\n@derive(Hash, Eq)\ntype W[T] \{ inner: Box[T] }\n\nfn need_hash[T: Hash](_x: T) -> Int \{ 1 }\n\nfn main() \{\n    io.println(\"\{need_hash(W \{ inner: Box \{ v: NoHash \{ v: 1 } } })}\")\n}\n",
+        "_dtbpi_deep")
+    compile_test_helpers.expect_error(out, "E0306", "W[NoHash] fails T: Hash through Box[T]")
+}
+
+test "a type parameter nested in a container field type still binds the trait" {
+    let out = compile_test_helpers.compile_and_capture(
+        "type NoDbg \{ v: Int }\n\n@derive(Debug)\ntype W[T] \{ v: Option[T] }\n\nfn need_debug[T: Debug](_x: T) -> Int \{ 1 }\n\nfn main() \{\n    io.println(\"\{need_debug(W \{ v: Some(NoDbg \{ v: 1 }) })}\")\n}\n",
+        "_dtbpi_cont")
+    compile_test_helpers.expect_error(out, "E0306", "W[NoDbg] fails T: Debug through Option[T]")
+}
+
+test "non-generic type without the derive still fails the bound" {
+    let out = compile_test_helpers.compile_and_capture(
+        "type Bare \{ v: Int }\n\nfn need_hash[T: Hash](_x: T) -> Int \{ 1 }\n\nfn main() \{\n    io.println(\"\{need_hash(Bare \{ v: 1 })}\")\n}\n",
+        "_dtbpi_bare")
+    compile_test_helpers.expect_error(out, "E0306", "Bare fails T: Hash")
+}
+
+test "Box[Int] satisfies a Hash bound and runs" {
+    let r = compile_test_helpers.compile_and_run(
+        "@derive(Hash, Eq)\ntype Box[T] \{ v: T }\n\nfn need_hash[T: Hash](_x: T) -> Int \{ 1 }\n\nfn main() \{\n    io.println(\"\{need_hash(Box \{ v: 1 })}\")\n}\n",
+        "_dtbpi_hash_ok")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "1")
+}
+
+test "Box[Int] satisfies a Debug bound and runs" {
+    let r = compile_test_helpers.compile_and_run(
+        "@derive(Debug)\ntype Box[T] \{ v: T }\n\nfn need_debug[T: Debug](_x: T) -> Int \{ 1 }\n\nfn main() \{\n    io.println(\"\{need_debug(Box \{ v: 1 })}\")\n}\n",
+        "_dtbpi_debug_ok")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "1")
+}
+
+test "Box[Int] satisfies a Serialize bound and runs" {
+    let r = compile_test_helpers.compile_and_run(
+        "@derive(Serialize)\ntype Box[T] \{ v: T }\n\nfn need_ser[T: Serialize](_x: T) -> Int \{ 1 }\n\nfn main() \{\n    io.println(\"\{need_ser(Box \{ v: 1 })}\")\n}\n",
+        "_dtbpi_ser_ok")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "1")
+}
+
+test "non-generic type with the derive satisfies the bound and runs" {
+    let r = compile_test_helpers.compile_and_run(
+        "@derive(Hash, Eq)\ntype Pt \{ x: Int }\n\nfn need_hash[T: Hash](_x: T) -> Int \{ 1 }\n\nfn main() \{\n    io.println(\"\{need_hash(Pt \{ x: 1 })}\")\n}\n",
+        "_dtbpi_pt_ok")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "1")
+}
