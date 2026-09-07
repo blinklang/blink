@@ -74,6 +74,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | TypeArgArity | E0303 | A type constructor in a type position was applied to the wrong number of type arguments — including none (a bare `Channel`/`List`). Under- and over-application are one code. Decided at name resolution, before inference | Name resolution | §3.4 |
 | TraitBoundNotSatisfied | E0306 | A call's type argument (inferred or explicit) does not satisfy the type parameter's declared bound — checked against the arguments as written, before code generation | Type checking | §3.6 |
 | TemplateMismatch | E0310 | String template parameter type does not match argument | Type checking | §3 |
+| MissingReturn | E0311 | Control can reach the end of a block that must produce a value of type `R` along a path that yields `()` — a value-returning function whose tail can complete normally (a `while`/`for` tail, an `if` without `else`). The tail kind is carried as diagnostic data, not a separate code. Repair: add a trailing `return <value>`, or change the return type to `Option[R]`. A diverging tail (`panic`, or a `loop` no `break` targets) is accepted | Type checking | §3.3 |
 | UndeclaredEffect | E0500 | Callee requires effect not declared by caller | Effects | §4.5 |
 | CapabilityBudgetExceeded | E0501 | Function effect exceeds module `@capabilities` budget | Effects | §4.8 |
 | QuestionMarkInvalidOperand | E0502 | `?` operator used on non-Result, non-Option type | Type checking | §3c.2 |

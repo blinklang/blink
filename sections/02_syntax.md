@@ -602,6 +602,41 @@ for item in items {
 
 **Panel vote:** Both constructs 3-2. Plain break/continue 3-2. No labels 4-1. No while-let 5-0. See [DECISIONS.md](../DECISIONS.md).
 
+#### Loop typing and divergence
+
+Both `while` and `loop` are statements that evaluate to `()` (above). One refinement
+makes value-returning functions sound: a `loop { }` that **no `break` targets** never
+exits, so it has type `Never` (§2.20) rather than `()`, and may stand as the tail of a
+function returning any type.
+
+```blink
+// `loop` with no reachable break diverges — a valid tail for -> Int
+fn run() -> Int {
+    loop {
+        let ev = poll()
+        if ev.is_quit() { return ev.code() }
+    }
+}
+```
+
+- **Only `loop` diverges.** A `while` or `for` can always finish — the condition may be
+  false on entry, the iterable may be empty — so both are always `()`, never `Never`,
+  even as the tail of a value-returning function. A `while`/`for` tail in a non-`()`
+  function is `error[MissingReturn]` (E0311, §3.3).
+- **`while true` is not special.** The type checker does not fold the condition;
+  `while true { }` has type `()` like any other `while`. Write `loop { }` for an
+  intentional infinite loop — the linter warns and auto-fixes `while true` → `loop`
+  (above), which is also the form that type-checks as a diverging tail. Blessing
+  `while true` as `Never` would force the checker to answer how far condition-folding
+  extends (`while 1 < 2`? a `const`?) — a fuzzy boundary the single `loop` form avoids.
+- **`break` targeting.** A `loop` diverges only when no `break` names it. The search does
+  not cross into a nested loop (whose `break` targets that inner loop) or a closure body;
+  `continue` does not stop divergence.
+
+**Panel vote:** Reject-unless-diverges 6-0. One general body-completeness rule (not a
+loop-only carve-out) 6-0. `while true` not special (loop-only divergence) 5-1. See
+[loop-tail-fallthrough](../decisions/loop-tail-fallthrough.md).
+
 ### 2.12 Visibility
 
 All items (functions, types, constants, modules) are **private by default**. The `pub` keyword makes an item visible outside its module.

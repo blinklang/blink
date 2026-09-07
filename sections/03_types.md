@@ -973,6 +973,102 @@ let port: U16 = 8080        // OK: 8080 fits in U16
 let bad: U8 = 300           // COMPILE ERROR: 300 exceeds U8 range (0..255)
 ```
 
+#### Divergence and Body Completeness
+
+A block that stands in a **value position** — a function body, an `if`/`match` arm
+whose result is used, the tail of a `with`-block, or a block bound by `let` — has a
+*tail type*: the type of the value control produces when it reaches the end of the
+block. A value-returning `fn(...) -> R` type-checks only when its body's tail type is a
+subtype of `R`. This is the ordinary subtyping check; there is no loop-specific rule.
+
+Two facts about the type lattice decide every case:
+
+- **`Never` is a subtype of every type.** `Never` (§2.20) is the bottom type — it has no
+  values, so a construct of type `Never` never produces one and vacuously satisfies any
+  expected type.
+- **`()` is a subtype only of `()`.** The unit type is ordinary; a block whose tail type
+  is `()` satisfies `-> ()` (equivalently `-> Void`) and nothing else.
+
+A construct has type `Never` when it **provably diverges** — control cannot leave it
+normally:
+
+- `panic(msg)` and `env.exit(code)` (§2.20, §4.6) — untracked divergence.
+- A bare `return`, `?`-propagation on the error path, `break`, or `continue` in tail
+  position — control leaves the block by another edge.
+- A `loop { }` that **no `break` targets** — it runs forever. The search for a targeting
+  `break` does not descend into a nested loop (whose `break` targets the inner loop) or
+  into a closure body. See §2.11.
+- An `if`/`match` all of whose reachable arms diverge.
+
+Every other construct can complete normally and carries its ordinary type. In particular
+a `while` or `for` loop always has type `()` — the condition may be false on entry, or
+the iterable may be empty or exhaust — and an `if` with no `else` has type `()`. When `R`
+is not `()`, such a tail fails the subtype check.
+
+```blink
+// Rejected: the loop can finish (n may be <= 0 on entry, or fall through),
+// so the body's tail type is (), which is not a subtype of Int.
+fn first_hit(n: Int) -> Int {
+    while n > 0 {
+        if lucky(n) { return 7 }
+    }
+}   // error[MissingReturn] (E0311)
+
+// Accepted: the tail diverges, so its type is Never <: Int.
+fn serve() -> Int {
+    loop {
+        let req = next_request()
+        if req.is_stop() { return req.code() }
+    }
+}
+
+// Accepted: a trailing value makes the tail an Int.
+fn scan(n: Int) -> Int {
+    let mut i = n
+    while i > 0 {
+        if lucky(i) { return i }
+        i = i - 1
+    }
+    0
+}
+
+// Accepted: the honest type when "not found" is a real outcome.
+fn find(n: Int) -> Option[Int] {
+    let mut i = n
+    while i > 0 {
+        if lucky(i) { return Some(i) }
+        i = i - 1
+    }
+    None
+}
+```
+
+**Why reject rather than complete the value for you.** The alternatives — accept the
+program and return a zero value, or accept it and panic at run time — both make the
+program *do something* the author never wrote. That is the pattern already forbidden for
+inference (§3.4, *Under-Determined Types*): the compiler does not fabricate a value for a
+slot the program left open. Falling off the end of a value-returning function is the same
+open slot, reached along a control path instead of through an inference variable, and it
+gets the same answer — a compile-time error, not a fabricated value. See
+[DECISIONS.md](../DECISIONS.md).
+
+`Never` here is not inference choosing the bottom type for an open slot — which §3.4
+forbids. A loop's type is fixed by its own structure (whether a `break` targets it),
+decided before it is compared against `R`; the check never *picks* `Never` to make a
+program type-check.
+
+**error[MissingReturn] (E0311).** Fires when control can reach the end of a block that
+must produce a value of type `R` along a path that yields `()` — a fall-through function
+body, a value-position `if` without `else`, an arm that completes where a value was
+required. The primary line names the cause ("this function can finish without returning a
+value of type `R`"); the tail kind (loop, `if`-without-`else`, …) is carried as
+diagnostic data, not as a separate error code, so an editor or agent can offer the right
+repair from one stable key. The repair named first is the one that always compiles: add a
+trailing `return <value>` (or a tail value expression), or — when "no value" is a real
+outcome — change the return type to `Option[R]` (§3.7) and yield `None`. A diverging tail
+(`panic(...)`, or a `loop` no `break` targets) is accepted and needs no repair. This
+satisfies the Diagnostic Discipline of §3.1: every rejection names a repair that exists.
+
 ---
 
 ### 3.4 Algebraic Data Types
