@@ -1,0 +1,85 @@
+// Inference must never answer "unknown". Every arm of infer_type that once fell through to
+// the give-up singleton for a malformed call or a non-indexable receiver now reports, because
+// the fall-through type unified with everything and let the program reach `cc`.
+//
+// Two shapes are covered here.
+//
+// ARITY on a built-in method. check_builtin_arg validates argument i only when argument i is
+// PRESENT (it returns early on a short list), so `xs.zip()` and `xs.fold()` passed the front
+// end with no argument at all and no complaint. `xs.zip()` then reached codegen, which builds
+// the pair type out of an argument that is not there.
+//
+// INDEXING a value that is not a List. sections/03_types.md:1250 states the language has no
+// index operator and that element access is `.get()`, yet the parser accepts `x[0]` and
+// codegen lowers it to a raw C subscript. On an Int that is a `cc` error the user reads as
+// "subscripted value is neither array nor pointer nor vector", naming C rather than Blink; on
+// a Map it is "array subscript is not an integer"; on a Str it silently returns a byte while
+// inference typed the whole expression as unknown, so `let v: Str = s[0]` type-checked.
+// A leak of the C compiler's vocabulary into a Blink program's diagnostics is the bug.
+import compile_test_helpers
+
+// ── built-in method arity ───────────────────────────────────────────────────
+test "List.zip with no argument is reported" {
+    let src = "fn main() ! IO \{\n    let xs = [1, 2, 3]\n    let z = xs.zip()\n    io.println(\"\{z.len()\}\")\n\}\n"
+    compile_test_helpers.expect_compile_error(src, "uninfer_list_zip_arity", "E0300")
+}
+
+test "List.fold with no argument is reported" {
+    let src = "fn main() ! IO \{\n    let xs = [1, 2, 3]\n    let a = xs.fold()\n    io.println(\"\{a\}\")\n\}\n"
+    compile_test_helpers.expect_compile_error(src, "uninfer_list_fold_arity", "E0300")
+}
+
+test "List.zip over a non-List argument is reported" {
+    let src = "fn main() ! IO \{\n    let xs = [1, 2, 3]\n    let z = xs.zip(7)\n    io.println(\"\{z.len()\}\")\n\}\n"
+    compile_test_helpers.expect_compile_error(src, "uninfer_list_zip_argtype", "E0300")
+}
+
+// The well-formed spellings must keep working — an arity gate that also rejects the
+// correct call would pass the rows above for the wrong reason.
+test "List.zip over two lists still type-checks" {
+    let src = "fn main() ! IO \{\n    let xs = [1, 2, 3]\n    let ys = [\"a\", \"b\", \"c\"]\n    let z = xs.zip(ys)\n    io.println(\"\{z.len()\}\")\n\}\n"
+    compile_test_helpers.expect_no_error(src, "uninfer_list_zip_ok", "E0300")
+}
+
+test "List.fold with an accumulator and a closure still type-checks" {
+    let src = "fn main() ! IO \{\n    let xs = [1, 2, 3]\n    let a = xs.fold(0, fn(acc: Int, x: Int) -> Int \{ acc + x \})\n    io.println(\"\{a\}\")\n\}\n"
+    compile_test_helpers.expect_no_error(src, "uninfer_list_fold_ok", "E0300")
+}
+
+// ── indexing a value that is not a List ─────────────────────────────────────
+test "indexing an Int is reported by the front end" {
+    let src = "fn main() ! IO \{\n    let x = 1\n    let y = x[0]\n    io.println(\"\{y\}\")\n\}\n"
+    compile_test_helpers.expect_compile_error(src, "uninfer_index_int", "E0300")
+}
+
+test "indexing a Str is reported by the front end" {
+    let src = "fn main() ! IO \{\n    let s = \"hi\"\n    let v = s[0]\n    io.println(\"\{v\}\")\n\}\n"
+    compile_test_helpers.expect_compile_error(src, "uninfer_index_str", "E0300")
+}
+
+test "indexing a Map is reported by the front end" {
+    let src = "fn main() ! IO \{\n    let mut m = Map()\n    m.insert(\"a\", 1)\n    let v = m[\"a\"]\n    io.println(\"\{v\}\")\n\}\n"
+    compile_test_helpers.expect_compile_error(src, "uninfer_index_map", "E0300")
+}
+
+test "indexing a List still type-checks" {
+    let src = "fn main() ! IO \{\n    let xs = [1, 2, 3]\n    let y = xs[0]\n    io.println(\"\{y\}\")\n\}\n"
+    compile_test_helpers.expect_no_error(src, "uninfer_index_list_ok", "E0300")
+}
+
+// Iterator carries its own copies of the two shapes above — `.into_iter()` leaves the List arm and
+// lands in the Iterator arm, whose `zip` reads argument 0 without checking that one was passed.
+test "Iterator.zip with no argument is reported" {
+    let src = "fn main() ! IO \{\n    let xs = [1, 2, 3]\n    let z = xs.into_iter().zip()\n    io.println(\"\{z.count()\}\")\n\}\n"
+    compile_test_helpers.expect_compile_error(src, "uninfer_iter_zip_arity", "E0300")
+}
+
+test "Iterator.zip over a non-iterable argument is reported" {
+    let src = "fn main() ! IO \{\n    let xs = [1, 2, 3]\n    let z = xs.into_iter().zip(7)\n    io.println(\"\{z.count()\}\")\n\}\n"
+    compile_test_helpers.expect_compile_error(src, "uninfer_iter_zip_argtype", "E0300")
+}
+
+test "Iterator.zip over two iterators still type-checks" {
+    let src = "fn main() ! IO \{\n    let xs = [1, 2, 3]\n    let ys = [4, 5, 6]\n    let z = xs.into_iter().zip(ys.into_iter())\n    io.println(\"\{z.count()\}\")\n\}\n"
+    compile_test_helpers.expect_no_error(src, "uninfer_iter_zip_ok", "E0300")
+}

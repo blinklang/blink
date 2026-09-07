@@ -3531,6 +3531,19 @@ fn check_builtin_arg(method: Str, arg_idx: Int, expected_t: Int, args_sl: Int, c
     check_arg_value("{container_label}.{method}", arg_idx, expected_t, sublist_get(args_sl, arg_idx))
 }
 
+// Arity for a built-in intrinsic method. check_builtin_arg above validates argument i only
+// when argument i is PRESENT, so a call with too few arguments passed the front end with no
+// complaint and reached codegen, which then reads an argument that is not there. Answers 1
+// when the call is well-formed, 0 after reporting — the caller stops rather than indexing an
+// empty list, which panics.
+fn check_builtin_arity(container_label: Str, method: Str, want: Int, args_sl: Int, node: Int) -> Int ! TypeCheck.Report, Diag.Report {
+    let mut got = 0
+    if args_sl != -1 { got = sublist_length(args_sl) }
+    if got == want { return 1 }
+    tc_error_at("method '{container_label}.{method}' expects {want} argument(s), got {got}", node)
+    0
+}
+
 // A signature typecheck holds for a namespace intrinsic — a method codegen emits directly
 // rather than resolving to a Blink function. Registered into fnsig_pool under the qualified
 // key `{namespace}.{method}`, which no user function can spell (register_fn_sig separates a
@@ -12534,9 +12547,19 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 return make_iterator_type(make_tuple_type([TYPE_INT, elem]))
             }
             if method == "zip" {
-                if args_sl == -1 || sublist_length(args_sl) < 1 { return TYPE_UNKNOWN }
-                let other_elem = tc_tid_iter_elem(tc_resolve(infer_type(sublist_get(args_sl, 0))))
-                if other_elem < 0 { return TYPE_UNKNOWN }
+                if check_builtin_arity("Iterator", method, 1, args_sl, node) == 0 { return tc_error_recovery_tid() }
+                let other_t = tc_resolve(infer_type(sublist_get(args_sl, 0)))
+                // tc_tid_iter_elem answers the give-up singleton, not -1, for a receiver that is
+                // not iterable, so the singleton is the predicate for "not an iterable" here.
+                // An argument whose own type is not yet determined is not yet known to be wrong.
+                let other_k = tc_tid_kind(other_t)
+                if other_k == TyKind.Unknown || other_k == TyKind.Typevar { return tc_error_recovery_tid() }
+                let other_elem = tc_tid_iter_elem(other_t)
+                if other_elem < 0 { return tc_error_recovery_tid() }
+                if other_elem == TYPE_UNKNOWN {
+                    tc_error_at("argument 1 of 'Iterator.zip' expects an iterable, got {type_to_str(other_t)}", sublist_get(args_sl, 0))
+                    return tc_error_recovery_tid()
+                }
                 return make_iterator_type(make_tuple_type([elem, other_elem]))
             }
             // Consumers drain the iterator (§3c.1:69).
@@ -12559,7 +12582,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 return make_option_type(elem)
             }
             if method == "fold" {
-                if args_sl == -1 || sublist_length(args_sl) < 2 { return TYPE_UNKNOWN }
+                if check_builtin_arity("Iterator", method, 2, args_sl, node) == 0 { return tc_error_recovery_tid() }
                 let init_t = infer_type(sublist_get(args_sl, 0))
                 let cls = closure_arg_at(args_sl, 1)
                 check_closure_param(cls, 0, init_t, method, "Iterator")
@@ -12641,11 +12664,15 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
             if method == "zip" {
                 // A malformed `a.zip()` (no arg) must not index an empty sublist —
-                // sublist_get panics out of bounds. Fall back to the prior TYPE_UNKNOWN
-                // and let arity/codegen report it, exactly as before an arm existed.
-                if args_sl == -1 || sublist_length(args_sl) < 1 { return TYPE_UNKNOWN }
-                let other_elem = tc_tid_list_elem(tc_resolve(infer_type(sublist_get(args_sl, 0))))
-                if other_elem < 0 { return TYPE_UNKNOWN }
+                // sublist_get panics out of bounds — so the arity is reported first and
+                // the arm stops.
+                if check_builtin_arity("List", method, 1, args_sl, node) == 0 { return tc_error_recovery_tid() }
+                let other_t = tc_resolve(infer_type(sublist_get(args_sl, 0)))
+                let other_elem = tc_tid_list_elem(other_t)
+                if other_elem < 0 {
+                    tc_error_at("argument 1 of 'List.zip' expects a List, got {type_to_str(other_t)}", sublist_get(args_sl, 0))
+                    return tc_error_recovery_tid()
+                }
                 return make_list_type(make_tuple_type([elem, other_elem]))
             }
             if method == "slice" {
@@ -12749,17 +12776,20 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 return make_option_type(elem)
             }
             if method == "fold" {
-                if args_sl != -1 && sublist_length(args_sl) >= 2 {
-                    let acc_t = infer_type(sublist_get(args_sl, 0))
-                    let cls = sublist_get(args_sl, 1)
-                    check_closure_param(cls, 0, acc_t, method, "List")
-                    check_closure_param(cls, 1, elem, method, "List")
-                    check_closure_ret(cls, acc_t, method, "List")
-                    return acc_t
-                } else if args_sl != -1 && sublist_length(args_sl) >= 1 {
-                    return infer_type(sublist_get(args_sl, 0))
+                if check_builtin_arity("List", method, 2, args_sl, node) == 0 {
+                    // Still infer whatever WAS written, so a mistake inside the accumulator
+                    // is reported on its own terms rather than swallowed by the arity report.
+                    if args_sl != -1 && sublist_length(args_sl) >= 1 {
+                        let _ = infer_type(sublist_get(args_sl, 0))
+                    }
+                    return tc_error_recovery_tid()
                 }
-                return TYPE_UNKNOWN
+                let acc_t = infer_type(sublist_get(args_sl, 0))
+                let cls = sublist_get(args_sl, 1)
+                check_closure_param(cls, 0, acc_t, method, "List")
+                check_closure_param(cls, 1, elem, method, "List")
+                check_closure_ret(cls, acc_t, method, "List")
+                return acc_t
             }
         }
 
@@ -13747,11 +13777,22 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     }
 
     if kind == NodeKind.IndexExpr {
-        let obj_t = infer_type(node_obj(node))
+        let obj_t = tc_resolve(infer_type(node_obj(node)))
         if type_kind(obj_t) == TyKind.List {
             return ty_pool.get(obj_t).unwrap().inner1
         }
-        return TYPE_UNKNOWN
+        // sections/03_types.md:1250 states the language has no index operator and that element
+        // access is `.get()`. The parser accepts `x[0]` anyway and codegen lowers it to a raw C
+        // subscript, so every non-List receiver reached `cc` and was reported in C's vocabulary
+        // ("subscripted value is neither array nor pointer nor vector") — or, on a Str, silently
+        // produced a byte while the expression typed as unknown, so `let v: Str = s[0]` passed.
+        // A receiver whose own type is not yet determined is not yet known to be wrong.
+        let obj_k = type_kind(obj_t)
+        if obj_k == TyKind.Unknown || obj_k == TyKind.Typevar {
+            return tc_error_recovery_tid()
+        }
+        diag_error_at("TypeError", TYPE_ERROR, "cannot index a value of type {type_to_str(obj_t)}", node, "element access is '.get(i)'; '[i]' resolves only on a List")
+        return tc_error_recovery_tid()
     }
 
     if kind == NodeKind.ListLit {
