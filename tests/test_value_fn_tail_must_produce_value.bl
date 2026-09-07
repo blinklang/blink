@@ -1,0 +1,115 @@
+import compile_test_helpers
+
+// sections/03_types.md §3.3 "Divergence and Body Completeness": a value-returning
+// `fn -> R` type-checks only when its body's tail type is a subtype of R. `()` is a
+// subtype only of `()`, so a tail that can complete normally is error[MissingReturn]
+// (E0311). sections/02_syntax.md §2.11: `while`/`for` are always `()`; a `loop` is
+// `Never` only when no `break` targets it.
+
+// compile_and_capture answers JSON diagnostics, so a clean compile is the ABSENCE of an
+// error-severity record. Matching on "error[" would pass on any output shape at all.
+fn assert_compiles(src: Str, tag: Str, label: Str) {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    let failed = out.contains("\"severity\":\"error\"")
+    if failed { io.println("FAIL: {label} — the named repair does not compile: {out}") }
+    assert(!failed)
+}
+
+test "a while tail in a value-returning fn is rejected" {
+    let src = "fn h(n: Int) -> Int \{\n    while n > 0 \{\n        if n > 0 \{ return 7 }\n    }\n}\nfn main() \{ let _ = h(0) }\n"
+    compile_test_helpers.expect_compile_error(src, "tailval_while", "E0311")
+}
+
+test "a for tail in a value-returning fn is rejected because the iterable can exhaust" {
+    let src = "fn h(xs: List[Int]) -> Int \{\n    for x in xs \{\n        if x == 42 \{ return x }\n    }\n}\nfn main() \{ let _ = h([1]) }\n"
+    compile_test_helpers.expect_compile_error(src, "tailval_for", "E0311")
+}
+
+test "a loop tail a break targets is rejected" {
+    let src = "fn h(n: Int) -> Int \{\n    loop \{\n        if n > 0 \{ return 7 }\n        break\n    }\n}\nfn main() \{ let _ = h(1) }\n"
+    compile_test_helpers.expect_compile_error(src, "tailval_loop_break", "E0311")
+}
+
+// §2.11: the checker does not fold the condition, so `while true` is `()` like any
+// other `while`. The linter bridges `while true` to `loop`, which is the form that
+// type-checks as a diverging tail.
+test "a while true tail with no break is still rejected" {
+    let src = "fn h(n: Int) -> Int \{\n    while true \{\n        if n > 0 \{ return 7 }\n    }\n}\nfn main() \{ let _ = h(1) }\n"
+    compile_test_helpers.expect_compile_error(src, "tailval_while_true", "E0311")
+}
+
+test "a match tail with an arm that completes is rejected" {
+    let src = "fn h(n: Int) -> Int \{\n    match n \{\n        0 => \{ return 1 }\n        _ => \{ io.println(\"x\") }\n    }\n}\nfn main() \{ let _ = h(5) }\n"
+    compile_test_helpers.expect_compile_error(src, "tailval_match_arm", "E0311")
+}
+
+// The tail kind travels as structured diagnostic data on the one code, so an editor
+// or agent can pick the repair without re-parsing the prose (§3.3, Min's constraint
+// in decisions/loop-tail-fallthrough.md: one code, never a per-tail-kind family).
+test "the tail kind travels as structured data on the one code" {
+    let src = "fn h(n: Int) -> Int \{\n    while n > 0 \{\n        if n > 0 \{ return 7 }\n    }\n}\nfn main() \{ let _ = h(0) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "tailval_kind_while")
+    compile_test_helpers.expect_error(out, "E0311", "while tail reports E0311")
+    compile_test_helpers.expect_contains(out, "tail-kind: while", "while tail carries its kind")
+}
+
+test "a for tail carries its own tail kind" {
+    let src = "fn h(xs: List[Int]) -> Int \{\n    for x in xs \{\n        if x == 42 \{ return x }\n    }\n}\nfn main() \{ let _ = h([1]) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "tailval_kind_for")
+    compile_test_helpers.expect_contains(out, "tail-kind: for", "for tail carries its kind")
+}
+
+test "a loop tail carries its own tail kind" {
+    let src = "fn h(n: Int) -> Int \{\n    loop \{\n        if n > 0 \{ return 7 }\n        break\n    }\n}\nfn main() \{ let _ = h(1) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "tailval_kind_loop")
+    compile_test_helpers.expect_contains(out, "tail-kind: loop", "loop tail carries its kind")
+}
+
+test "a completing match arm carries its own tail kind" {
+    let src = "fn h(n: Int) -> Int \{\n    match n \{\n        0 => \{ return 1 }\n        _ => \{ io.println(\"x\") }\n    }\n}\nfn main() \{ let _ = h(5) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "tailval_kind_arm")
+    compile_test_helpers.expect_contains(out, "tail-kind: arm", "completing arm carries its kind")
+}
+
+// §3.1 Diagnostic Discipline rule 1: the repair named first must always compile.
+// Both named repairs are spelled out so the help text cannot drift away from the rule.
+test "the diagnostic names a repair that compiles" {
+    let src = "fn h(n: Int) -> Int \{\n    while n > 0 \{\n        if n > 0 \{ return 7 }\n    }\n}\nfn main() \{ let _ = h(0) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "tailval_help")
+    compile_test_helpers.expect_contains(out, "add a trailing `return <value>`", "help names the trailing return repair")
+    compile_test_helpers.expect_contains(out, "Option[Int]", "help names the Option return type")
+    // Assert the repairs by APPLYING them: the help text is only worth printing if the
+    // program it describes compiles.
+    let fixed_return = "fn h(n: Int) -> Int \{\n    while n > 0 \{\n        if n > 0 \{ return 7 }\n    }\n    return 0\n}\nfn main() \{ let _ = h(0) }\n"
+    assert_compiles(fixed_return, "tailval_help_fix1", "the trailing-return repair compiles")
+    let fixed_option = "fn h(n: Int) -> Option[Int] \{\n    while n > 0 \{\n        if n > 0 \{ return Some(7) }\n    }\n    None\n}\nfn main() \{ let _ = h(0) }\n"
+    assert_compiles(fixed_option, "tailval_help_fix2", "the Option repair compiles")
+}
+
+// A fn that already returns an Option must not be told to wrap it again: Option[Option[T]]
+// compiles but is never the repair the user wants.
+test "the Option repair is not named for a fn already returning Option" {
+    let src = "fn h(n: Int) -> Option[Int] \{\n    while n > 0 \{\n        if n > 0 \{ return Some(7) }\n    }\n}\nfn main() \{ let _ = h(0) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "tailval_help_opt")
+    compile_test_helpers.expect_error(out, "E0311", "an Option-returning fn still reports E0311")
+    let doubled = out.contains("Option[Option[Int]]")
+    if doubled { io.println("FAIL: the help told an Option-returning fn to wrap in Option again") }
+    assert(!doubled)
+}
+
+test "E0311 has a catalog entry and an explain body" {
+    compile_test_helpers.verify_catalog_entry("E0311", "MissingReturn")
+}
+
+// The BOUNDARY between this rule and the pre-existing else-less-if rule. An `if`
+// without `else` in a fn tail is a value-position `if` first, so E0304 MissingElse
+// still owns it and names the better repair ("add an else"). The body-completeness
+// rule is satisfied either way — the program is rejected — and pinning the code here
+// stops a later change from silently double-reporting both codes on one program.
+test "an else-less if tail keeps its own more specific code" {
+    let src = "fn h(n: Int) -> Int \{\n    if n > 0 \{ return 7 }\n}\nfn main() \{ let _ = h(0) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "tailval_elseless_if")
+    compile_test_helpers.expect_error(out, "E0304", "else-less if tail is rejected as MissingElse")
+    let has_both = out.contains("E0311")
+    assert_eq(has_both, false)
+}

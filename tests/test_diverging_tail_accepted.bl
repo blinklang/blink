@@ -1,0 +1,174 @@
+import compile_test_helpers
+
+// sections/03_types.md §3.3: a construct that provably diverges has type `Never`, and
+// `Never` is a subtype of every type, so it may stand as the tail of a fn returning
+// anything. sections/02_syntax.md §2.11: a `loop` diverges when no `break` targets it,
+// and the search for a targeting `break` does not descend into a nested loop or a
+// closure body. These functions are compiled by this very file — a rejection here is
+// a build failure, which is the assertion.
+
+fn serve(stop_at: Int) -> Int {
+    let mut n = 0
+    loop {
+        n = n + 1
+        if n == stop_at { return n }
+    }
+}
+
+// The inner `while`'s `break` targets the `while`, not the `loop`, so the `loop` still
+// diverges and the tail is Never.
+fn break_in_nested_loop(stop_at: Int) -> Int {
+    let mut n = 0
+    loop {
+        let mut i = 0
+        while i < 3 {
+            i = i + 1
+            if i == 2 { break }
+        }
+        n = n + 1
+        if n == stop_at { return n }
+    }
+}
+
+// A `break` inside a closure body belongs to a loop inside that closure; it cannot
+// target the enclosing `loop`, so the enclosing `loop` still diverges.
+fn break_in_closure(stop_at: Int) -> Int {
+    let mut n = 0
+    loop {
+        let count_to_three = fn() -> Int {
+            let mut i = 0
+            loop {
+                i = i + 1
+                if i > 2 { break }
+            }
+            i
+        }
+        n = n + count_to_three()
+        if n >= stop_at { return n }
+    }
+}
+
+// §2.11: `continue` does not stop divergence — it re-enters the same loop.
+fn continue_does_not_escape(stop_at: Int) -> Int {
+    let mut n = 0
+    loop {
+        n = n + 1
+        if n < stop_at { continue }
+        return n
+    }
+}
+
+// The repairs §3.3 names first, both of which must compile.
+fn trailing_value_tail(n: Int) -> Int {
+    let mut i = n
+    while i > 0 {
+        if i == 3 { return i }
+        i = i - 1
+    }
+    0
+}
+
+fn option_none_tail(n: Int) -> Option[Int] {
+    let mut i = n
+    while i > 0 {
+        if i == 3 { return Some(i) }
+        i = i - 1
+    }
+    None
+}
+
+// An `if`/`match` all of whose reachable arms diverge is itself Never.
+fn every_if_arm_returns(n: Int) -> Int {
+    if n > 0 { return 1 } else { return 2 }
+}
+
+fn every_match_arm_returns(n: Int) -> Int {
+    match n {
+        0 => { return 10 }
+        _ => { return 20 }
+    }
+}
+
+// A loop tail in a `-> Void` fn is unaffected: `()` is a subtype of `()`. Both loop
+// forms are spelled out because they reach the rule through different node kinds.
+fn void_while_tail(n: Int) -> Void {
+    let mut i = n
+    while i > 0 {
+        io.println("{i}")
+        i = i - 1
+    }
+}
+
+fn void_for_tail(xs: List[Int]) -> Void {
+    for x in xs {
+        io.println("{x}")
+    }
+}
+
+test "a loop no break targets is a valid tail for a value-returning fn" {
+    assert_eq(serve(4), 4)
+}
+
+test "a break inside a nested loop does not stop the outer loop diverging" {
+    assert_eq(break_in_nested_loop(3), 3)
+}
+
+test "a break inside a closure does not stop the enclosing loop diverging" {
+    assert_eq(break_in_closure(6), 6)
+}
+
+test "continue does not stop a loop diverging" {
+    assert_eq(continue_does_not_escape(5), 5)
+}
+
+test "a trailing value tail is accepted" {
+    assert_eq(trailing_value_tail(5), 3)
+    assert_eq(trailing_value_tail(2), 0)
+}
+
+test "an Option return with a None tail is accepted" {
+    assert_eq(option_none_tail(5) ?? 0, 3)
+    assert_eq(option_none_tail(2) ?? 0, 0)
+}
+
+test "an if whose arms all return is accepted" {
+    assert_eq(every_if_arm_returns(1), 1)
+    assert_eq(every_if_arm_returns(0), 2)
+}
+
+test "a match whose arms all return is accepted" {
+    assert_eq(every_match_arm_returns(0), 10)
+    assert_eq(every_match_arm_returns(7), 20)
+}
+
+test "a while tail in a Void fn is still accepted" {
+    void_while_tail(2)
+}
+
+test "a for tail in a Void fn is still accepted" {
+    void_for_tail([1, 2])
+}
+
+// §3.3 names env.exit as untracked divergence alongside panic, so an env.exit tail
+// satisfies a non-Void declared return. The call below never reaches the tail, so the
+// row can assert both that the program compiles and that it still runs.
+test "an env exit tail satisfies a value-returning fn" {
+    let src = "fn h(n: Int) -> Int \{\n    if n > 0 \{ return 1 }\n    env.exit(2)\n}\nfn main() \{ io.println(\"\{h(1)}\") }\n"
+    // compile_and_capture answers JSON diagnostics, so a clean compile is the ABSENCE of an
+    // error-severity record. Matching on "error[" would pass on any output shape at all.
+    let out = compile_test_helpers.compile_and_capture(src, "divtail_env_exit")
+    let rejected = out.contains("\"severity\":\"error\"")
+    assert_eq(rejected, false)
+    let r = compile_test_helpers.compile_and_run(src, "divtail_env_exit_run")
+    assert_eq(r.exit_code, 0)
+    compile_test_helpers.expect_contains(r.out, "1", "the value path still returns")
+}
+
+// A `Never`-typed value can stand in any value position, including the RHS of a `let`.
+// Nothing consumes it, but the emitted C still has to be well-formed — a bottom type
+// that reaches codegen as the literal C keyword `void` breaks the build.
+test "a Never typed let binding still emits buildable C" {
+    let src = "fn main() \{\n    let _x = env.exit(0)\n    io.println(\"unreachable\")\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "divtail_never_let")
+    assert_eq(r.exit_code, 0)
+}

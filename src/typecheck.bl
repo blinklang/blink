@@ -21,7 +21,7 @@ import diagnostics.{
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
     NON_EXHAUSTIVE_MATCH,
-    TYPE_ERROR, TEMPLATE_MISMATCH, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
+    TYPE_ERROR, TEMPLATE_MISMATCH, MISSING_RETURN, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
     MUTATION_REQUIRES_MUT,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
@@ -77,7 +77,8 @@ pub type TyKind {
     List, Option, Result, Fn, Struct, Enum,
     Typevar, Unknown, Iterator, Handle, Channel, Ptr, Handler,
     Tuple, Map, Bytes, Set, StringBuilder, Template, FfiScope,
-    I8, I16, I32, U8, U16, U32, U64, Char
+    I8, I16, I32, U8, U16, U32, U64, Char,
+    Never
 }
 
 // Stable spelling of a kind, for the ty_intern key. A match, not Display: it is
@@ -118,6 +119,7 @@ pub fn tk_name(k: TyKind) -> Str {
         TyKind.U32 => "U32"
         TyKind.U64 => "U64"
         TyKind.Char => "Char"
+        TyKind.Never => "Never"
     }
 }
 
@@ -178,6 +180,10 @@ pub let mut TYPE_U16: Int = -1
 pub let mut TYPE_U32: Int = -1
 pub let mut TYPE_U64: Int = -1
 pub let mut TYPE_CHAR: Int = -1
+// The bottom type (sections/03_types.md §3.3). Produced only by a construct that
+// PROVABLY diverges, so it is never the type of a value: it is a subtype of every
+// type and satisfies any declared return.
+pub let mut TYPE_NEVER: Int = -1
 
 // ── Type registries ─────────────────────────────────────────────────
 let mut named_type_names: List[Str] = []
@@ -3222,11 +3228,86 @@ fn tc_pin_declared_into_arm(declared_tid: Int, body: Int) ! TypeCheck.Resolve, T
 //     stop, never a silent miscompile — and doing so would newly touch live rows
 //     in tests/test_y1n3ck_generic_return_tail_infer.bl and
 //     tests/test_e00ngd_fold_struct_accumulator.bl that no test asks for.
+// Does this block end by transferring control out of itself? §3.3 calls such a block
+// diverging, which is what makes its type the bottom type rather than the type of the
+// operand its `return` carries away.
+fn tc_block_exits(block: Int) -> Int {
+    let stmts_sl = node_stmts(block)
+    if stmts_sl == -1 { return 0 }
+    if sublist_length(stmts_sl) == 0 { return 0 }
+    let k = node_kind(sublist_get(stmts_sl, sublist_length(stmts_sl) - 1))
+    if k == NodeKind.Return || k == NodeKind.Break || k == NodeKind.Continue { return 1 }
+    0
+}
+
+// The error[MissingReturn] tail kind for a fn tail that yields `()`, or "" when the
+// tail is not one of the shapes the body-completeness rule owns (§3.3). The kind is
+// DATA on one code, never a per-kind family of codes — Minimalism's binding constraint
+// in decisions/loop-tail-fallthrough.md.
+//
+// An else-less `if` never reaches here: it is a value-position `if` first, so
+// error[MissingElse] (E0304) reports it during inference and names the better repair.
+fn tc_missing_return_tail_kind(tail_val: Int, tail_t: Int) -> Str {
+    if tail_t != TYPE_VOID { return "" }
+    if tail_val < 0 { return "" }
+    let k = node_kind(tail_val)
+    // A `with` block or a bare block is a wrapper, not a tail shape of its own: the arm
+    // or loop that yielded `()` is the one inside, and it names the repair.
+    if k == NodeKind.WithBlock { return tc_missing_return_tail_kind(node_body(tail_val), tail_t) }
+    if k == NodeKind.Block {
+        let inner = tc_block_tail_stmt(tail_val)
+        if inner == -1 { return "" }
+        return tc_missing_return_tail_kind(tc_block_tail_value(inner), tail_t)
+    }
+    if k == NodeKind.ExprStmt { return tc_missing_return_tail_kind(node_value(tail_val), tail_t) }
+    // An explicit `return <form>` names the same repair as the same form standing as the
+    // tail. The kind is a property of the form that yielded `()`, not of the keyword.
+    if k == NodeKind.Return { return tc_missing_return_tail_kind(node_value(tail_val), tail_t) }
+    if k == NodeKind.WhileLoop { return "while" }
+    if k == NodeKind.ForIn { return "for" }
+    if k == NodeKind.LoopExpr { return "loop" }
+    if k == NodeKind.MatchExpr { return "arm" }
+    if k == NodeKind.IfExpr { return "arm" }
+    ""
+}
+
+// Why this tail can complete, in the words of the construct the user wrote. The
+// headline has to name the cause, not just the types (§3.3) — "expected Int, found ()"
+// points at a `()` the user never wrote.
+fn tc_missing_return_cause(kind: Str) -> Str {
+    if kind == "while" { return "its tail `while` loop can finish, because the condition may be false on entry" }
+    if kind == "for" { return "its tail `for` loop can finish, because the iterable may be empty or exhaust" }
+    if kind == "loop" { return "a `break` targets its tail `loop`, so the loop can finish" }
+    "an arm of its tail completes without producing a value"
+}
+
+fn tc_report_missing_return(kind: Str, at_node: Int) ! Diag.Report {
+    let r = type_to_str(tc_current_fn_ret)
+    // Both repairs must compile as written (§3.1). Naming the Option wrap for a fn that
+    // ALREADY returns an Option would spell Option[Option[T]], which compiles but is not
+    // the repair anyone wants — such a fn only needs the trailing None.
+    let mut fix = "add a trailing `return <value>` (or a tail value expression), or change the return type to Option[{r}] and yield None"
+    if type_kind(tc_current_fn_ret) == TyKind.Option {
+        fix = "add a trailing `return <value>` (or a tail value expression), or yield None"
+    }
+    diag_error_at_notes("MissingReturn", MISSING_RETURN, "function '{tc_current_fn_name}' can finish without returning a value of type {r}: {tc_missing_return_cause(kind)}", at_node, fix, ["tail-kind: {kind}"])
+}
+
 fn tc_check_returned_value(val_t: Int, at_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if tc_current_fn_ret == TYPE_VOID || tc_current_fn_ret == TYPE_UNKNOWN { return }
     if val_t == TYPE_UNKNOWN { return }
     if types_compatible(tc_current_fn_ret, val_t) == 0 {
-        tc_error_at("return value type {type_to_str(val_t)} does not match function '{tc_current_fn_name}' return type {type_to_str(tc_current_fn_ret)}", at_node)
+        // §3.3 body completeness: the tail type must be a subtype of R, and `()` is a
+        // subtype only of `()`. When the tail is a loop or an arm-bearing form that can
+        // complete, the SHAPE is what names the repair, so it reports as
+        // error[MissingReturn] instead of as a bare type mismatch. An explicit `return x`
+        // arrives with a Return node here and keeps the mismatch wording.
+        let mr_kind = tc_missing_return_tail_kind(at_node, val_t)
+        if mr_kind != "" {
+            tc_report_missing_return(mr_kind, at_node)
+        } else {
+            tc_error_at("return value type {type_to_str(val_t)} does not match function '{tc_current_fn_name}' return type {type_to_str(tc_current_fn_ret)}", at_node)
+        }
     } else {
         if tc_in_closure_depth == 0 {
             // A `return`-wrapped value carries the returned node one level down; an
@@ -3552,7 +3633,7 @@ fn register_ns_intrinsic_sigs() {
     register_intrinsic_fn_sig("env.cwd", [], TYPE_STR)
     register_intrinsic_fn_sig("env.set_var", [TYPE_STR, TYPE_STR], TYPE_VOID)
     register_intrinsic_fn_sig("env.remove_var", [TYPE_STR], TYPE_VOID)
-    register_intrinsic_fn_sig("env.exit", [TYPE_INT], TYPE_VOID)
+    register_intrinsic_fn_sig("env.exit", [TYPE_INT], TYPE_NEVER)
 
     // ffi.scope() — the arena constructor. This table entry is what makes the
     // `with ffi.scope() as scope` binder typed: tc_bind_with_resource binds the binder to the
@@ -7684,6 +7765,7 @@ fn init_types() ! TypeCheck.Register {
     TYPE_U32 = new_type(TyKind.U32, "U32")
     TYPE_U64 = new_type(TyKind.U64, "U64")
     TYPE_CHAR = new_type(TyKind.Char, "Char")
+    TYPE_NEVER = new_type(TyKind.Never, "Never")
 }
 
 pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
@@ -10897,6 +10979,10 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
     let b = tc_resolve(resolve_alias_tid(b0))
     if a == b { return 1 }
     if a == TYPE_UNKNOWN || b == TYPE_UNKNOWN { return 1 }
+    // §3.3: `Never` has no values, so a construct of that type never produces one and
+    // vacuously satisfies any expected type. Symmetric because this predicate is asked
+    // in both directions across the checker.
+    if a == TYPE_NEVER || b == TYPE_NEVER { return 1 }
     // A negative or out-of-range tid is never a legitimate "pending unification"
     // state — unlike an unbound metavar (handled permissively below, and reported
     // once at the region boundary as E0301), a -1 is an ABSENCE: a lookup that found
@@ -11055,6 +11141,9 @@ pub fn type_merge(a0: Int, b0: Int) -> Int {
     let b = tc_resolve(b0)
     if a == TYPE_UNKNOWN { return b }
     if b == TYPE_UNKNOWN { return a }
+    // A diverging branch contributes no value, so the other branch decides the merge.
+    if a == TYPE_NEVER { return b }
+    if b == TYPE_NEVER { return a }
     if a == b { return a }
     // Fail CLOSED, symmetric with types_compatible: a negative or out-of-range tid is
     // an unknown/error encoding, so return the shared TYPE_UNKNOWN singleton rather than
@@ -11222,7 +11311,9 @@ fn is_arith_numeric_type(tid: Int) -> Int {
     // built-in numeric" (no, for a Typevar); reject_non_numeric_arith_operand layers
     // the bound check on top, accepting a bounded `T` and rejecting an unbounded one
     // at its definition (§3.1: no rule enforced only at codegen).
-    if k == TyKind.Void || k == TyKind.Unknown { return 1 }
+    //   - Never: §3.3 makes it a subtype of every type, and it has no values, so the
+    //     numeric requirement holds vacuously and the operand is unreachable anyway.
+    if k == TyKind.Void || k == TyKind.Unknown || k == TyKind.Never { return 1 }
     0
 }
 
@@ -11719,7 +11810,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // Display is unknowable — erroring would false-reject and
                     // brick `task regen`).
                     let pk = type_kind(ptid)
-                    if pk != TyKind.Unknown && pk != TyKind.Typevar && tc_type_id_has_display(ptid) == 0 {
+                    // Never joins them for a stronger reason: §3.3 makes it a subtype of
+                    // every type and it has no values, so Display holds vacuously.
+                    if pk != TyKind.Unknown && pk != TyKind.Typevar && pk != TyKind.Never && tc_type_id_has_display(ptid) == 0 {
                         tc_errors.push("interpolated value of type '{type_to_str(ptid)}' does not implement Display")
                         diag_error_at("MissingDisplayImpl", MISSING_DISPLAY_IMPL, "type '{type_to_str(ptid)}' does not implement Display", part, "add '@derive(Display)' or implement Display manually; use '.debug()' for structural form")
                     }
@@ -13841,11 +13934,18 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // match's value, so they inherit its own consumed-ness.
             let scrut_tid = infer_type(node_scrutinee(node))
             tc_if_value_ctx = incoming
+            // §3.3: `()` is contagious across an arm-bearing form. One arm that falls out
+            // with no value makes the WHOLE match `()`, whatever its siblings produce.
+            // type_merge cannot say this — it keeps the first side when the kinds differ —
+            // so the completing arm is tracked alongside the merge.
             let mut merged = infer_arm_body(sublist_get(arms_sl, 0), scrut_tid)
+            let mut completes = 0
+            if tc_resolve(merged) == TYPE_VOID { completes = 1 }
             let mut i = 1
             while i < sublist_length(arms_sl) {
                 tc_if_value_ctx = incoming
                 let arm_t = infer_arm_body(sublist_get(arms_sl, i), scrut_tid)
+                if tc_resolve(arm_t) == TYPE_VOID { completes = 1 }
                 if merged == TYPE_UNKNOWN {
                     merged = arm_t
                 } else {
@@ -13853,12 +13953,18 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 }
                 i = i + 1
             }
+            if completes != 0 && merged != TYPE_UNKNOWN { return TYPE_VOID }
             return merged
         }
         return TYPE_UNKNOWN
     }
 
     if kind == NodeKind.Block {
+        // §3.3: a block whose last statement transfers control out of it produces no value
+        // and nothing follows it, so the block IS the bottom type. Typing it by the operand
+        // of its `return` instead makes a diverging arm look like an ordinary value-producing
+        // one, and the completeness rule then stops composing through an enclosing form.
+        if tc_block_exits(node) != 0 { return TYPE_NEVER }
         let tail = tc_block_tail_stmt(node)
         if tail == -1 { return TYPE_VOID }
         // The tail produces the block's value, so it inherits the block's own consumed-ness.
@@ -13867,18 +13973,15 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     }
 
     if kind == NodeKind.WhileLoop || kind == NodeKind.ForIn || kind == NodeKind.LoopExpr {
-        let scanned = infer_loop_return_type(node_body(node))
-        // sections/02_syntax.md:597 — a `while`/`loop`/`for` evaluates to `()`. The scan
-        // answers anything else only for the fn-TAIL case, where the loop's `return`s are
-        // what the declared-return compare has to read. -1 is the scan's "no return in
-        // here" answer and is NOT a type, so it becomes the statement type here.
-        //
-        // A loop that can FINISH is conceded the same way, so a value-returning fn whose
-        // tail is such a loop passes the compare and then falls off its end. The spec has
-        // no rule for that fall-through and a test has asserted the acceptance since
-        // 2026-03-27, so rejecting it is a spec decision, not a bug fix.
-        if scanned < 0 { return TYPE_VOID }
-        return scanned
+        // sections/02_syntax.md §2.11: a loop is a statement evaluating to `()`, with one
+        // refinement — a `loop` no `break` targets never exits, so it is `Never` and may
+        // stand as the tail of a fn returning any type. A `while`/`for` can always finish
+        // (the condition may be false on entry, the iterable may be empty), so both stay
+        // `()`; `while true` is not folded. The loop's type is fixed by its own structure
+        // here, BEFORE any compare against a declared return, which is why answering
+        // `Never` is not inference picking the bottom type for an open slot (§3.4).
+        if kind == NodeKind.LoopExpr && tc_loop_diverges(node) != 0 { return TYPE_NEVER }
+        return TYPE_VOID
     }
 
     if kind == NodeKind.WithBlock {
@@ -13978,51 +14081,48 @@ fn tc_io_is_print_method(ns: Str, method: Str) -> Int {
     0
 }
 
-// Answer the type the `return`s inside a loop body produce, or -1 when there is no
-// `return` in there at all.
+// Whether this `loop` provably diverges: no `break` anywhere in its body targets it.
 //
-// The two answers are different claims and must not share a spelling: a tail loop with
-// no return evaluates to `()` (sections/02_syntax.md:597), while a tail loop whose
-// return produces `()` is answering for the enclosing fn. TYPE_VOID served as both,
-// so a Void-typed return was skipped as "keep looking" and — worse — every nesting
-// form with no arm here read as an answer instead of as "not found", which rejected a
-// tail loop whose only return sat inside a nested while as returning `()`.
-fn infer_loop_return_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if node == -1 { return -1 }
+// §2.11 fixes the search: it does NOT cross into a nested loop, whose `break` targets
+// that inner loop, nor into a closure body, whose `break` belongs to a loop inside the
+// closure. `continue` re-enters the same loop and so does not stop divergence.
+//
+// Only `loop` can answer yes. A `while`/`for` can finish without any `break` at all, and
+// the checker does not fold the condition, so `while true` is not special.
+fn tc_loop_diverges(node: Int) -> Int {
+    if node_kind(node) != NodeKind.LoopExpr { return 0 }
+    if tc_body_breaks_here(node_body(node)) != 0 { return 0 }
+    1
+}
+
+// Whether a `break` in this subtree targets the loop that owns it — the recursive half
+// of tc_loop_diverges, stopping at each boundary that re-targets a `break`.
+fn tc_body_breaks_here(node: Int) -> Int {
+    if node == -1 { return 0 }
     let kind = node_kind(node)
-
-    if kind == NodeKind.Return {
-        let rv = infer_type(node_value(node))
-        if rv >= 0 && rv != TYPE_UNKNOWN { return rv }
-        // The returned value has no nameable type of its own. The declared return is the
-        // only other statement of what this `return` produces; when that is missing too,
-        // the scan has nothing to report and says so rather than inventing a type.
-        if tc_current_fn_ret >= 0 && tc_current_fn_ret != TYPE_UNKNOWN { return tc_current_fn_ret }
-        return -1
-    }
-
-    // A closure body's `return` returns from the CLOSURE, so counting it would type
-    // the loop from an unrelated signature. Stop rather than descend.
-    if kind == NodeKind.Closure { return -1 }
+    if kind == NodeKind.Break { return 1 }
+    // Boundaries. A nested loop owns every `break` under it; a closure body's `break`
+    // can only bind to a loop inside that closure.
+    if kind == NodeKind.WhileLoop || kind == NodeKind.ForIn || kind == NodeKind.LoopExpr { return 0 }
+    if kind == NodeKind.Closure { return 0 }
 
     let kids = tc_loop_scan_children(node)
     let mut i = 0
     while i < kids.len() {
-        let t = infer_loop_return_type(kids.get(i).unwrap())
-        if t != -1 { return t }
+        if tc_body_breaks_here(kids.get(i).unwrap()) != 0 { return 1 }
         i = i + 1
     }
-    -1
+    0
 }
 
 // The child nodes a loop-body scan descends into, for one statement or expression.
 //
 // Kept apart from the scan above because it is a list of AST shapes, not type logic: a
 // kind missing from it is a silently wrong answer rather than a crash, so it has to be
-// readable on its own. The caller keeps its own policy on the closure kind.
+// readable on its own. The caller keeps its own policy on the loop and closure kinds,
+// which are the boundaries that re-target a `break`.
 //
-// Conditions and scrutinees are deliberately absent: a `return` in one is not what the
-// loop produces.
+// Conditions and scrutinees are deliberately absent: a `break` cannot sit in one.
 //
 // ast.bl's is_block_bearing names the same block-bearing kinds for a different
 // consumer. It cannot drive this list — a boolean predicate says nothing about which
@@ -14077,8 +14177,8 @@ fn tc_loop_scan_children(node: Int) -> List[Int] {
         out.push(node_value(node))
         return out
     }
-    // A `return` also hides in the VALUE of a binding: `let x = if c { return 3 } else
-    // { return 4 }` diverges, and walking past it read as "no return in here".
+    // A `break` also hides in the VALUE of a binding: `let x = if c { break } else { 4 }`
+    // targets the enclosing loop, so walking past the binding would miss it.
     if kind == NodeKind.LetBinding {
         out.push(node_value(node))
         return out
@@ -16315,6 +16415,7 @@ fn type_to_str(tid0: Int) -> Str {
         TyKind.Bool => return "Bool"
         TyKind.Str => return "Str"
         TyKind.Void => return "Void"
+        TyKind.Never => return "Never"
         TyKind.Char => return name
         TyKind.I8 => return "I8"
         TyKind.I16 => return "I16"
@@ -16511,6 +16612,8 @@ pub fn tc_tid_child_count(tid: Int) -> Int {
         TyKind.U32 => 0
         TyKind.U64 => 0
         TyKind.Char => 0
+        // The bottom type has no values, so it has nothing under it either.
+        TyKind.Never => 0
     }
 }
 
@@ -16570,6 +16673,7 @@ pub fn tc_tid_child(tid: Int, i: Int) -> Int {
         TyKind.U32 => -1
         TyKind.U64 => -1
         TyKind.Char => -1
+        TyKind.Never => -1
     }
 }
 

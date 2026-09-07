@@ -1,0 +1,50 @@
+import compile_test_helpers
+
+// sections/03_types.md §3.3: the body-completeness rule is a property of a VALUE POSITION,
+// not of one syntactic slot. A `match`/`if` one of whose arms falls out with no value
+// yields `()` wherever it stands — bound by `let`, nested inside another arm, behind an
+// explicit `return`, or as the tail of a `with` block. A rule that only fires on the
+// outermost fn-tail node lets one level of nesting fabricate a value again, which is
+// disposition (c) that decisions/loop-tail-fallthrough.md rejects 6-0.
+
+test "a let-bound match with a completing arm is rejected" {
+    let src = "fn h(n: Int) -> Int \{\n    let y: Int = match n \{\n        0 => 1\n        _ => \{}\n    }\n    y\n}\nfn main() \{ let _ = h(5) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "vcomp_let_match")
+    // The declared type owns this position, so the annotation mismatch is the report —
+    // what matters here is that the match yields `()` rather than the first arm's Int.
+    compile_test_helpers.expect_error(out, "E0300", "a let-bound incomplete match is rejected")
+    compile_test_helpers.expect_contains(out, "declared type Int but got Void", "the match yields () not Int")
+}
+
+test "a match arm whose own body is an incomplete match is rejected" {
+    let src = "fn h(a: Int, b: Int) -> Int \{\n    match a \{\n        0 => match b \{\n            0 => 1\n            _ => \{}\n        }\n        _ => 2\n    }\n}\nfn main() \{ let _ = h(0, 5) }\n"
+    compile_test_helpers.expect_compile_error(src, "vcomp_nested_arm", "E0311")
+}
+
+test "an explicit return of an incomplete match is rejected" {
+    let src = "fn h(n: Int) -> Int \{\n    return match n \{\n        0 => 1\n        _ => \{}\n    }\n}\nfn main() \{ let _ = h(5) }\n"
+    compile_test_helpers.expect_compile_error(src, "vcomp_return_match", "E0311")
+}
+
+test "a with block tail holding an incomplete match is rejected" {
+    let src = "fn h(n: Int) -> Int \{\n    with ffi.scope() as _s \{\n        match n \{\n            0 => 1\n            _ => \{}\n        }\n    }\n}\nfn main() \{ let _ = h(5) }\n"
+    compile_test_helpers.expect_compile_error(src, "vcomp_with_match", "E0311")
+}
+
+// The positive direction has to keep composing too: a form all of whose arms diverge is
+// `Never` at every depth, so wrapping it must not turn it back into a rejection.
+fn nested_all_arms_return(a: Int, b: Int) -> Int {
+    match a {
+        0 => match b {
+            0 => { return 1 }
+            _ => { return 2 }
+        }
+        _ => { return 3 }
+    }
+}
+
+test "a nested form whose arms all diverge is still accepted" {
+    assert_eq(nested_all_arms_return(0, 0), 1)
+    assert_eq(nested_all_arms_return(0, 9), 2)
+    assert_eq(nested_all_arms_return(9, 9), 3)
+}

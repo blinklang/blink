@@ -18,6 +18,7 @@ import codegen_types.{
     cg_handler_body_is_ue, cg_handler_cleanup_fn, cg_handler_cleanup_var,
     cg_handler_is_user_effect, cg_handler_ret_option_erased,
     cg_handler_vtable_field, cg_handler_vtable_type,
+    cg_debug_mode,
     cg_in_handler_body, cg_in_ffi_scope_resource, cg_indent, cg_test_mode, cg_in_assert_panics, cg_assert_panics_counter, cg_let_target_ann, cg_expect_arg_ann,
     cg_mono_tparams_sl, cg_mono_arg_tids, cg_fn_mono_tparams_sl, cg_fn_mono_arg_tids,
     cg_cur_mono_base, cg_cur_mono_inst_tid, cg_cur_fn_mono_tparams_sl, cg_cur_fn_mono_arg_tids,
@@ -336,6 +337,24 @@ type IfCarrier {
     err_struct: Str
 }
 
+// The container-shape channels a branch's emitted value leaves behind. Snapshotted alongside the
+// carrier so which branch decides the result can be settled after both branches are emitted.
+type IfElems {
+    elem_type: Int
+    elem_struct: Str
+    map_key_type: Int
+    map_val_type: Int
+}
+
+fn snapshot_elems() -> IfElems {
+    IfElems {
+        elem_type: expr_list_elem_type,
+        elem_struct: expr_list_elem_struct,
+        map_key_type: expr_map_key_type,
+        map_val_type: expr_map_val_type,
+    }
+}
+
 fn snapshot_carrier() -> IfCarrier {
     IfCarrier {
         ct: expr_result_type,
@@ -409,6 +428,42 @@ fn ct_names_kind_completely(k: TyKind) -> Int {
     1
 }
 
+// §3.3: a branch that diverges reaches its closing brace on no path, so it produces no value
+// and its sibling alone decides what the arm-bearing form holds. Divergence is read from the
+// tid typecheck published for the branch, not re-derived here: infer_block_type is a flat
+// pre-pass that cannot tell a block with no value from one with no exit, and answering CT_VOID
+// for both is what lets a diverging branch erase the value its sibling did produce.
+fn cg_block_diverges(block: Int) -> Int {
+    if block == -1 { return 0 }
+    if tc_tid_kind(cg_node_mono_tid(block)) == TyKind.Never { return 1 }
+    0
+}
+
+// Index of the first arm that can say what the match holds. A diverging arm cannot: it has no
+// value, so reading the static arm type from it declares the result temp from a type the match
+// does not have. Falls back to 0 when every arm diverges — the match is then Never and nothing
+// consumes it.
+// Write one arm's value into the match's result temp. §3.3: a diverging arm reaches the write on
+// no path and has no value to write, so naming one emits an assignment whose right-hand side does
+// not exist — against a carrier-typed temp that does not even compile.
+fn emit_match_arm_result(arm: Int, arm_val: Str, result_type: Int, match_struct_name: Str, result_var: Str) ! Codegen.Emit {
+    if cg_block_diverges(node_body(arm)) != 0 { return }
+    if (result_type != CT_VOID || match_struct_name != "") && !(match_struct_name != "" && arm_val == "0") {
+        emit_line("{result_var} = {arm_val};")
+    } else if arm_val != "0" && arm_val != "" {
+        emit_line("(void){arm_val};")
+    }
+}
+
+fn cg_first_valued_arm(arms_sl: Int) -> Int {
+    let mut i = 0
+    while i < sublist_length(arms_sl) {
+        if cg_block_diverges(node_body(sublist_get(arms_sl, i))) == 0 { return i }
+        i = i + 1
+    }
+    0
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     // An else-less `if` whose value is DISCARDED (unpublished node tid — no consumer memoized a
@@ -424,7 +479,12 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         return
     }
     let tmp = fresh_temp("_if_")
-    let then_type = infer_block_type(node_then_body(node))
+    let then_div = cg_block_diverges(node_then_body(node))
+    let else_div = cg_block_diverges(node_else_body(node))
+    // The branch that decides the result type. A diverging branch has none, so ask its sibling.
+    // When both diverge the whole `if` is Never and nothing consumes it, so either answer serves.
+    let lead_body = if then_div != 0 && else_div == 0 { node_else_body(node) } else { node_then_body(node) }
+    let then_type = infer_block_type(lead_body)
     if then_type == CT_VOID || then_type == CT_STRUCT || then_type == CT_RESULT || then_type == CT_OPTION {
         // The pre-pass (infer_block_type) leaves CT_VOID for builtin heap
         // constructors (Bytes.new(), Map(), StringBuilder.new(), ...) and for
@@ -440,13 +500,8 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         cg_indent = cg_indent + 1
         let mut then_val = emit_block_value(node_then_body(node))
         cg_indent = cg_indent - 1
-        let real_type = expr_result_type
-        let then_carrier = snapshot_carrier()
-        let needs_struct = real_type == CT_VOID || real_type == CT_STRUCT
-        let elem_type = expr_list_elem_type
-        let elem_struct = expr_list_elem_struct
-        let map_key_type = expr_map_key_type
-        let map_val_type = expr_map_val_type
+        let mut lead_carrier = snapshot_carrier()
+        let mut lead_elems = snapshot_elems()
         let mut then_lines = cg_lines
 
         // Buffer-emit the else branch too so its carrier shape is observable
@@ -455,7 +510,7 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         // wins. Both buffers are replayed below so values emit exactly once.
         let mut else_val = ""
         let mut else_lines: List[Str] = []
-        let mut else_carrier = then_carrier
+        let mut else_carrier = lead_carrier
         let has_else = node_else_body(node) != -1
         if has_else {
             cg_lines = []
@@ -464,14 +519,29 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             cg_indent = cg_indent - 1
             else_carrier = snapshot_carrier()
             else_lines = cg_lines
+            // §3.3: a diverging then branch left no value behind, so every shape captured
+            // above describes a branch that has none. Take them from the sibling instead,
+            // which is the only branch that reaches the temp.
+            if then_div != 0 && else_div == 0 {
+                lead_carrier = else_carrier
+                lead_elems = snapshot_elems()
+            }
         }
         cg_lines = saved_lines
+        let then_carrier = lead_carrier
+        let real_type = then_carrier.ct
+        let elem_type = lead_elems.elem_type
+        let elem_struct = lead_elems.elem_struct
+        let map_key_type = lead_elems.map_key_type
+        let map_val_type = lead_elems.map_val_type
+        let needs_struct = real_type == CT_VOID || real_type == CT_STRUCT
+        let lead_val = if then_div != 0 && else_div == 0 { else_val } else { then_val }
 
         // Determine the temp's C type from the emitted value. A struct value is
         // CT_VOID with a non-empty struct name (set_var convention); the fn's
         // return struct is a last-resort fallback only when the branch itself
         // produced no struct, never before it.
-        let mut struct_name = if needs_struct { get_var_struct(then_val) } else { "" }
+        let mut struct_name = if needs_struct { get_var_struct(lead_val) } else { "" }
         if needs_struct && struct_name == "" {
             struct_name = infer_block_struct_name(node_then_body(node))
             if struct_name == "" && node_else_body(node) != -1 {
@@ -576,7 +646,10 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             cg_lines.push(then_lines.get(li).unwrap())
             li = li + 1
         }
-        emit_line("{tmp} = {then_val};")
+        // A diverging branch never reaches this point at run time, and the value it would
+        // assign does not exist — spelling one anyway is what emitted `_if_0 = 0;` against a
+        // carrier-typed temp and failed to compile.
+        if then_div == 0 { emit_line("{tmp} = {then_val};") }
         cg_indent = cg_indent - 1
         if has_else {
             emit_line("} else \{")
@@ -586,7 +659,7 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                 cg_lines.push(else_lines.get(ei).unwrap())
                 ei = ei + 1
             }
-            emit_line("{tmp} = {else_val};")
+            if else_div == 0 { emit_line("{tmp} = {else_val};") }
             cg_indent = cg_indent - 1
         }
         emit_line("}")
@@ -660,13 +733,13 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     emit_line("if ({cond_str}) \{")
     cg_indent = cg_indent + 1
     let then_val = emit_block_value(node_then_body(node))
-    emit_line("{tmp} = {then_val};")
+    if then_div == 0 { emit_line("{tmp} = {then_val};") }
     cg_indent = cg_indent - 1
     if node_else_body(node) != -1 {
         emit_line("} else \{")
         cg_indent = cg_indent + 1
         let else_val = emit_block_value(node_else_body(node))
-        emit_line("{tmp} = {else_val};")
+        if else_div == 0 { emit_line("{tmp} = {else_val};") }
         cg_indent = cg_indent - 1
     }
     emit_line("}")
@@ -739,7 +812,12 @@ fn match_arms_need_struct(arms_sl: Int) -> Int {
 // Void-RHS handling for the full rationale.
 fn rhs_is_genuine_void(val_type: Int, val_node: Int) -> Int {
     if val_type != CT_VOID { return 0 }
-    if tc_tid_to_c_tag(tc_lookup_node_tid(val_node)) == "Void" { return 1 }
+    let rhs_tid = tc_lookup_node_tid(val_node)
+    // §3.3: `Never` has no values at all, so a binding of one holds nothing, exactly as a
+    // Void binding holds nothing. It needs the same treatment for the same reason — a C
+    // declaration spelled from it comes out as the keyword `void` and will not compile.
+    if tc_tid_kind(rhs_tid) == TyKind.Never { return 1 }
+    if tc_tid_to_c_tag(rhs_tid) == "Void" { return 1 }
     0
 }
 
@@ -1186,7 +1264,7 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
         return
     }
 
-    let first_arm = sublist_get(arms_sl, 0)
+    let first_arm = sublist_get(arms_sl, cg_first_valued_arm(arms_sl))
     let mut result_type = infer_arm_type(first_arm)
     let result_var = fresh_temp("_match_")
 
@@ -1234,17 +1312,22 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
         // (arm_body_is_valueless) rather than a `pp_arm_val == "0"` string compare:
         // a literal `0` in value position (`None => 0`) also emits "0" but is a
         // genuine value.
-        if arm_carrier.ct == CT_VOID || pp_arm_val == "" || arm_body_is_valueless(node_body(pp_arm)) != 0 {
-            pp_all_value = 0
-        }
-        if pp_type == CT_VOID && arm_carrier.ct != CT_VOID {
-            pp_type = arm_carrier.ct
-            pp_carrier = arm_carrier
-        } else if pp_type != CT_VOID {
-            if pp_type == CT_OPTION && carrier_option_concrete(pp_carrier) == 0 && carrier_option_concrete(arm_carrier) != 0 {
+        // §3.3: a diverging arm reaches no value, so it is not evidence that the match has
+        // none. Harvesting it would mark the whole match valueless and throw away the shape
+        // the live arms did produce.
+        if cg_block_diverges(node_body(pp_arm)) == 0 {
+            if arm_carrier.ct == CT_VOID || pp_arm_val == "" || arm_body_is_valueless(node_body(pp_arm)) != 0 {
+                pp_all_value = 0
+            }
+            if pp_type == CT_VOID && arm_carrier.ct != CT_VOID {
+                pp_type = arm_carrier.ct
                 pp_carrier = arm_carrier
-            } else if pp_type == CT_RESULT && carrier_result_concrete(pp_carrier) == 0 && carrier_result_concrete(arm_carrier) != 0 {
-                pp_carrier = arm_carrier
+            } else if pp_type != CT_VOID {
+                if pp_type == CT_OPTION && carrier_option_concrete(pp_carrier) == 0 && carrier_option_concrete(arm_carrier) != 0 {
+                    pp_carrier = arm_carrier
+                } else if pp_type == CT_RESULT && carrier_result_concrete(pp_carrier) == 0 && carrier_result_concrete(arm_carrier) != 0 {
+                    pp_carrier = arm_carrier
+                }
             }
         }
         ppi = ppi + 1
@@ -1463,21 +1546,13 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                 emit_line("if ({guard_str}) \{")
                 cg_indent = cg_indent + 1
                 let arm_val = emit_arm_value(node_body(arm))
-                if (result_type != CT_VOID || match_struct_name != "") && !(match_struct_name != "" && arm_val == "0") {
-                    emit_line("{result_var} = {arm_val};")
-                } else if arm_val != "0" && arm_val != "" {
-                    emit_line("(void){arm_val};")
-                }
+                emit_match_arm_result(arm, arm_val, result_type, match_struct_name, result_var)
                 emit_line("_mg_ = 1;")
                 cg_indent = cg_indent - 1
                 emit_line("}")
             } else {
                 let arm_val = emit_arm_value(node_body(arm))
-                if (result_type != CT_VOID || match_struct_name != "") && !(match_struct_name != "" && arm_val == "0") {
-                    emit_line("{result_var} = {arm_val};")
-                } else if arm_val != "0" && arm_val != "" {
-                    emit_line("(void){arm_val};")
-                }
+                emit_match_arm_result(arm, arm_val, result_type, match_struct_name, result_var)
                 emit_line("_mg_ = 1;")
             }
             cg_indent = cg_indent - 1
@@ -1501,11 +1576,7 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
             let arm_val = emit_arm_value(node_body(arm))
             match_scruts = saved_match_scruts
             match_scrut_enum = saved_match_scrut_enum
-            if (result_type != CT_VOID || match_struct_name != "") && !(match_struct_name != "" && arm_val == "0") {
-                emit_line("{result_var} = {arm_val};")
-            } else if arm_val != "0" && arm_val != "" {
-                emit_line("(void){arm_val};")
-            }
+            emit_match_arm_result(arm, arm_val, result_type, match_struct_name, result_var)
             cg_indent = cg_indent - 1
             if is_wildcard {
                 break
@@ -6642,7 +6713,7 @@ fn emit_block_then_capture(block: Int, result_sink: Str, arena_prev: Str) -> Str
     }
     let last = sublist_get(stmts_sl, count - 1)
     let last_kind = node_kind(last)
-    let tail_node = if last_kind == NodeKind.ExprStmt { node_value(last) } else { last }
+    let tail_node = tail_value_node(last)
     emit_expr(tail_node)
     let tail_str = expr_result_str
     if expr_result_type == CT_CLOSURE {
@@ -8491,6 +8562,13 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
     pop_scope()
 }
 
+// The node whose type decides how a fn body's last statement closes. An ExprStmt is a
+// wrapper the checker never types, so the value inside it is what carries the tid.
+fn tail_value_node(last: Int) -> Int {
+    if last == -1 { return -1 }
+    if node_kind(last) == NodeKind.ExprStmt { node_value(last) } else { last }
+}
+
 // A fn whose return type is a struct, enum, or tuple uses the struct-return
 // calling convention: emit_fn_body must return the tail expression as a value,
 // so body_ret is forced to a non-void carrier (CT_INT). Shared by the generic
@@ -8502,6 +8580,27 @@ pub fn ret_needs_struct_body(ret_str: Str) -> Int {
     // tuple tail is emitted as a bare statement with no return.
     let base = resolve_alias_chain_name(ret_str)
     if is_struct_type(base) != 0 || is_enum_type(base) != 0 || base == "Tuple" { 1 } else { 0 }
+}
+
+// Whether the typecheck pass proved this tail diverges. Read off the recorded tid, not
+// re-derived from the AST here: the checker is the only place the divergence rule lives,
+// so codegen cannot disagree with what was accepted.
+fn cg_tail_diverges(node: Int) -> Int {
+    if node == -1 { return 0 }
+    if tc_tid_kind(cg_node_mono_tid(node)) == TyKind.Never { 1 } else { 0 }
+}
+
+// Close a value-returning fn whose tail diverges. Control provably never arrives, so
+// release emits the fact for the C optimizer instead of a return of nothing. A debug
+// build keeps a backstop that aborts loudly, so a divergence rule that is ever wrong
+// shows up as an ICE and not as a silent read of a garbage return slot.
+fn emit_diverging_tail_backstop() ! Codegen.Emit {
+    if cg_debug_mode == 0 {
+        emit_line("__builtin_unreachable();")
+        return
+    }
+    emit_line("fprintf(stderr, \"BLINK_ICE_DIVERGING_TAIL: %s returned past a diverging tail\\n\", \"{cg_current_fn_name}\");")
+    emit_line("abort();")
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -8524,16 +8623,20 @@ pub fn emit_fn_body(block: Int, ret_type: Int) ! Codegen.Emit, Codegen.Register,
     }
     let last = sublist_get(stmts_sl, count - 1)
     let last_kind = node_kind(last)
-    if ret_type != CT_VOID && last_kind == NodeKind.ExprStmt {
+    let wants_value = ret_type != CT_VOID
+    if wants_value && cg_tail_diverges(tail_value_node(last)) != 0 {
+        emit_stmt(last)
+        emit_diverging_tail_backstop()
+    } else if wants_value && last_kind == NodeKind.ExprStmt {
         emit_expr(node_value(last))
         emit_return_with_trace(expr_result_str, cg_current_fn_ret, node_value(last))
-    } else if ret_type != CT_VOID && last_kind == NodeKind.IfExpr {
+    } else if wants_value && last_kind == NodeKind.IfExpr {
         emit_if_expr(last)
         emit_return_with_trace(expr_result_str, cg_current_fn_ret, last)
-    } else if ret_type != CT_VOID && last_kind == NodeKind.MatchExpr {
+    } else if wants_value && last_kind == NodeKind.MatchExpr {
         emit_match_expr(last)
         emit_return_with_trace(expr_result_str, cg_current_fn_ret, last)
-    } else if ret_type != CT_VOID && last_kind == NodeKind.WithBlock {
+    } else if wants_value && last_kind == NodeKind.WithBlock {
         emit_with_block_expr(last)
         emit_return_with_trace(expr_result_str, cg_current_fn_ret, last)
     } else {
