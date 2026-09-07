@@ -1,0 +1,175 @@
+// Ten exits in infer_type_uncached report a real diagnostic and then have to answer
+// SOMETHING for the rest of the pass. They all answered TYPE_UNKNOWN, which is a real
+// in-range ty_pool index meaning "inference gave up" — so every `tid >= 0` gate
+// downstream reads it as an answer and codegen falls back to its flat channel on a
+// value that has no type. The recovery answer is now a fresh metavar: it unifies with
+// anything, so no second, bogus error cascades from it, and it cannot be mistaken for a
+// settled type.
+//
+// This pins the observable half of that change: the primary diagnostic each site
+// reports must be unchanged, and no site may start crashing or reporting an internal
+// compiler error in place of its diagnostic. One row per converted exit.
+
+fn recov_diag(tag: Str, src: Str) -> Str {
+    let path = ".tmp/_recov_{tag}.bl"
+    write_file(path, src)
+    let args = [path, "/dev/null", "--format", "json"]
+    let result = process_run("build/blinkc", args)
+    let output = "{result.out}{result.err_out}"
+    shell_exec("rm -f {path}")
+    output
+}
+
+// Every row asserts the diagnostic AND the absence of an ICE, because the recovery
+// value now flows on where TYPE_UNKNOWN used to stop things.
+fn assert_reports(tag: Str, src: Str, code: Str) {
+    let out = recov_diag(tag, src)
+    assert(out.contains(code))
+    assert(out.contains("I0001") == false)
+    assert(out.contains("internal compiler error") == false)
+}
+
+test "an unlicensed Self operation still reports and recovers" {
+    assert_reports("selfop", #"trait Greet {
+    fn hi(self) -> Str
+    fn shout(self) -> Str {
+        self.nope()
+    }
+}
+fn main() {
+    io.println("done")
+}
+"#, "UnlicensedSelfOperation")
+}
+
+test "collect on a non-iterator receiver still reports and recovers" {
+    assert_reports("collect", #"fn main() {
+    let xs = [1, 2, 3]
+    let c = xs.collect()
+    io.println("{c}")
+}
+"#, "UnresolvedMethod")
+}
+
+test "an unknown method on a named type still reports and recovers" {
+    assert_reports("nomethod", #"type S {
+    a: Int
+}
+fn main() {
+    let s = S { a: 1 }
+    let v = s.nope()
+    io.println("{v}")
+}
+"#, "UnresolvedMethod")
+}
+
+test "an ambiguous method on a named type still reports and recovers" {
+    assert_reports("ambigtype", #"type P {
+    n: Int
+}
+trait One {
+    fn go(self) -> Int
+}
+trait Two {
+    fn go(self) -> Int
+}
+impl One for P {
+    fn go(self) -> Int { 1 }
+}
+impl Two for P {
+    fn go(self) -> Int { 2 }
+}
+fn main() {
+    let p = P { n: 1 }
+    io.println("{p.go()}")
+}
+"#, "AmbiguousMethodCall")
+}
+
+test "an ambiguous method on List still reports and recovers" {
+    assert_reports("ambiglist", #"trait One {
+    fn go(self) -> Int
+}
+trait Two {
+    fn go(self) -> Int
+}
+impl One for List[Int] {
+    fn go(self) -> Int { 1 }
+}
+impl Two for List[Int] {
+    fn go(self) -> Int { 2 }
+}
+fn main() {
+    let xs = [1, 2]
+    io.println("{xs.go()}")
+}
+"#, "AmbiguousMethodCall")
+}
+
+test "a qualified trait call with no receiver still reports and recovers" {
+    assert_reports("qtnoargs", #"type P {
+    n: Int
+}
+trait Greet {
+    fn hi(self) -> Str
+}
+impl Greet for P {
+    fn hi(self) -> Str { "hi" }
+}
+fn main() {
+    let v = Greet.hi()
+    io.println("{v}")
+}
+"#, "E0300")
+}
+
+test "a qualified call to a method the trait lacks still reports and recovers" {
+    assert_reports("qtnomethod", #"type P {
+    n: Int
+}
+trait Greet {
+    fn hi(self) -> Str
+}
+impl Greet for P {
+    fn hi(self) -> Str { "hi" }
+}
+fn main() {
+    let p = P { n: 1 }
+    let v = Greet.nope(p)
+    io.println("{v}")
+}
+"#, "UnresolvedMethod")
+}
+
+test "an out-of-range tuple field still reports and recovers" {
+    assert_reports("tuplefield", #"fn main() {
+    let t = (1, "two")
+    let v = t.9
+    io.println("{v}")
+}
+"#, "NoSuchField")
+}
+
+test "an ambiguous bare variant construction still reports and recovers" {
+    assert_reports("ambigctor", #"type A {
+    Thing { x: Int }
+}
+type B {
+    Thing { x: Int }
+}
+fn main() {
+    let v = Thing { x: 1 }
+    io.println("done")
+}
+"#, "AmbiguousConstruction")
+}
+
+test "a mistyped scope.take argument still reports and recovers" {
+    assert_reports("scopetake", #"fn main() {
+    with ffi.scope() as scope {
+        let bad = scope.take(42)
+        io.println("{bad}")
+    }
+}
+"#, "E0300")
+}
