@@ -11258,10 +11258,14 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
         // The memo answers a TYPE or nothing, and -1 is the "nobody has typed this"
         // sentinel (TYPE_INT is 0, so -1 cannot collide with a real tid). TYPE_UNKNOWN
         // is a real, in-range pool index, so writing it would read as an ANSWER to
-        // every `tid >= 0` gate downstream while meaning "inference gave up" — the one
-        // state the memo must not be able to represent. Refusing the write leaves the
-        // slot at -1, which is the same contract tc_publish_node_tid states for the
-        // memo's other writer. A negative tid is likewise an absence, never a type.
+        // every `tid >= 0` gate downstream while meaning "inference gave up". Refusing
+        // the write leaves the slot at -1, which is the same contract
+        // tc_publish_node_tid states for the memo's other writer. A negative tid is
+        // likewise an absence, never a type.
+        //
+        // An UNBOUND METAVAR is a different thing and is still stored: it is a hole a
+        // later unification can pin, and the boundary check reports one that never was.
+        // Only the shared give-up singleton is refused here.
         //
         // Known->known overwrites are still allowed: mono-calls-mono re-instantiates
         // one AST node under several T.
@@ -12921,12 +12925,21 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // Still infer the arguments: a mistake inside the call is reported
                     // by the arg's own inference, which the fall-through used to do.
                     let pf_args = node_args(node)
+                    let mut pf_got = 0
                     if pf_args != -1 {
+                        pf_got = sublist_length(pf_args)
                         let mut pf_i = 0
                         while pf_i < sublist_length(pf_args) {
                             infer_type(sublist_get(pf_args, pf_i))
                             pf_i = pf_i + 1
                         }
+                    }
+                    // Arity is checked here for the same reason the fnsig arm above
+                    // checks it: each of these emits ONE C statement from argument 0,
+                    // so a second argument is dropped along with its side effects and a
+                    // missing one prints nothing. Only the PARAMETER TYPE is open.
+                    if pf_got != 1 {
+                        tc_error_at("function '{obj_name}.{method}' expects 1 argument(s), got {pf_got}", node)
                     }
                     return TYPE_VOID
                 }
@@ -13340,7 +13353,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     check_deprecated_type(sname, node)
                     if tc_head_constructible_struct(etid, sname) == 0 {
                         tc_report_unconstructible_head(sname, node)
-                        return TYPE_UNKNOWN
+                        return tc_error_recovery_tid()
                     }
                     return etid
                 }
@@ -13359,7 +13372,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     check_deprecated_type(sname, node)
                     if tc_head_constructible_struct(stid, sname) == 0 {
                         tc_report_unconstructible_head(sname, node)
-                        return TYPE_UNKNOWN
+                        return tc_error_recovery_tid()
                     }
                     // Reverse-infer the concrete instance tid (Box[Int]) from the
                     // field values so the literal carries its specialization, not the
@@ -13374,7 +13387,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // lookup_named_type (name-map only) never finds.
                 if is_primitive_type(sname) != 0 {
                     tc_report_unconstructible_head(sname, node)
-                    return TYPE_UNKNOWN
+                    return tc_error_recovery_tid()
                 }
                 // 3) global-unique variant.
                 let n = count_enums_with_variant(sname)
@@ -13479,6 +13492,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // answers anything else only for the fn-TAIL case, where the loop's `return`s are
         // what the declared-return compare has to read. -1 is the scan's "no return in
         // here" answer and is NOT a type, so it becomes the statement type here.
+        //
+        // A loop that can FINISH is conceded the same way, so a value-returning fn whose
+        // tail is such a loop passes the compare and then falls off its end. The spec has
+        // no rule for that fall-through and a test has asserted the acceptance since
+        // 2026-03-27, so rejecting it is a spec decision, not a bug fix.
         if scanned < 0 { return TYPE_VOID }
         return scanned
     }
@@ -13553,23 +13571,19 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     TYPE_UNKNOWN
 }
 
-// Answer the type the `return`s inside a loop body produce, or -1 when there is no
-// `return` in there at all.
+// The value an inference exit answers AFTER it has reported a diagnostic. The exit's
+// own diagnostic is the answer the user reads; this is only what the rest of the pass
+// carries in the value's place, and it exists so that every such exit names the
+// decision in one place instead of spelling the give-up singleton inline.
 //
-// The two answers are different claims and must not share a spelling: a tail loop with
-// no return evaluates to `()` (sections/02_syntax.md:597), while a tail loop whose
-// return produces `()` is answering for the enclosing fn. TYPE_VOID served as both,
-// so a Void-typed return was skipped as "keep looking" and — worse — every nesting
-// form with no arm here read as an answer instead of as "not found", which rejected a
-// tail loop whose only return sat inside a nested while as returning `()`.
-// The value an inference exit answers AFTER it has reported a diagnostic. A fresh
-// metavar unifies with anything, so no second, bogus error cascades out of an
-// expression whose real error is already on the report. TYPE_UNKNOWN cannot serve
-// here: it is a real in-range pool index, so every `tid >= 0` gate downstream reads
-// it as a settled type and codegen falls back to its flat channel on a value that
-// has none.
+// A fresh metavar is the type the placeholder WANTS to be — it cannot be mistaken for
+// a settled type. It cannot serve yet: the under-determined boundary check sees an
+// unbound metavar and reports CannotInferType on it, so each of these exits emitted a
+// second diagnostic whose note described a construction that is not in the program.
+// Suppressing that needs a placeholder the boundary check can tell apart from a
+// solvable metavar — a dedicated error type, not this one-line helper.
 fn tc_error_recovery_tid() -> Int {
-    make_metavar()
+    TYPE_UNKNOWN
 }
 
 // The io.* methods that print and answer `()`. Kept separate from the
@@ -13584,6 +13598,15 @@ fn tc_io_is_print_method(ns: Str, method: Str) -> Int {
     0
 }
 
+// Answer the type the `return`s inside a loop body produce, or -1 when there is no
+// `return` in there at all.
+//
+// The two answers are different claims and must not share a spelling: a tail loop with
+// no return evaluates to `()` (sections/02_syntax.md:597), while a tail loop whose
+// return produces `()` is answering for the enclosing fn. TYPE_VOID served as both,
+// so a Void-typed return was skipped as "keep looking" and — worse — every nesting
+// form with no arm here read as an answer instead of as "not found", which rejected a
+// tail loop whose only return sat inside a nested while as returning `()`.
 fn infer_loop_return_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return -1 }
     let kind = node_kind(node)
@@ -13598,23 +13621,52 @@ fn infer_loop_return_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Repor
         return -1
     }
 
+    // A closure body's `return` returns from the CLOSURE, so counting it would type
+    // the loop from an unrelated signature. Stop rather than descend.
+    if kind == NodeKind.Closure { return -1 }
+
+    let kids = tc_loop_scan_children(node)
+    let mut i = 0
+    while i < kids.len() {
+        let t = infer_loop_return_type(kids.get(i).unwrap())
+        if t != -1 { return t }
+        i = i + 1
+    }
+    -1
+}
+
+// The child nodes a loop-body scan descends into, for one statement or expression.
+//
+// Kept apart from the scan above because it is a list of AST shapes, not type logic: a
+// kind missing from it is a silently wrong answer rather than a crash, so it has to be
+// readable on its own. The caller keeps its own policy on the closure kind.
+//
+// Conditions and scrutinees are deliberately absent: a `return` in one is not what the
+// loop produces.
+//
+// ast.bl's is_block_bearing names the same block-bearing kinds for a different
+// consumer. It cannot drive this list — a boolean predicate says nothing about which
+// accessor reaches the block — so a new block-bearing kind has to be added in both.
+fn tc_loop_scan_children(node: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    let kind = node_kind(node)
+
     if kind == NodeKind.Block {
         let stmts_sl = node_stmts(node)
         if stmts_sl != -1 {
             let mut i = 0
             while i < sublist_length(stmts_sl) {
-                let t = infer_loop_return_type(sublist_get(stmts_sl, i))
-                if t != -1 { return t }
+                out.push(sublist_get(stmts_sl, i))
                 i = i + 1
             }
         }
-        return -1
+        return out
     }
 
     if kind == NodeKind.IfExpr {
-        let then_t = infer_loop_return_type(node_then_body(node))
-        if then_t != -1 { return then_t }
-        return infer_loop_return_type(node_else_body(node))
+        out.push(node_then_body(node))
+        out.push(node_else_body(node))
+        return out
     }
 
     if kind == NodeKind.MatchExpr {
@@ -13622,31 +13674,41 @@ fn infer_loop_return_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Repor
         if arms_sl != -1 {
             let mut i = 0
             while i < sublist_length(arms_sl) {
-                let t = infer_loop_return_type(node_body(sublist_get(arms_sl, i)))
-                if t != -1 { return t }
+                out.push(node_body(sublist_get(arms_sl, i)))
                 i = i + 1
             }
         }
-        return -1
+        return out
     }
 
-    // A nested loop, a `with` block and an `async.scope` are all bodies the ENCLOSING
-    // fn's `return`s can sit in, so the scan has to descend them. A closure literal is
-    // deliberately absent: a `return` in a closure body returns from the closure, and
-    // counting it would type the loop from an unrelated signature.
+    // A nested loop, a `with` block and an `async.scope` are all bodies the enclosing
+    // fn's `return`s can sit in.
     if kind == NodeKind.WhileLoop || kind == NodeKind.ForIn || kind == NodeKind.LoopExpr {
-        return infer_loop_return_type(node_body(node))
+        out.push(node_body(node))
+        return out
     }
     if kind == NodeKind.WithBlock || kind == NodeKind.AsyncScope {
-        return infer_loop_return_type(node_body(node))
+        out.push(node_body(node))
+        return out
     }
     // A block-bearing expression in statement position parses as ExprStmt, so unwrap it
-    // and re-enter, or the arms above never see the form inside.
+    // and re-enter, or the scans never see the form inside.
     if kind == NodeKind.ExprStmt {
-        return infer_loop_return_type(node_value(node))
+        out.push(node_value(node))
+        return out
+    }
+    // A `return` also hides in the VALUE of a binding: `let x = if c { return 3 } else
+    // { return 4 }` diverges, and walking past it read as "no return in here".
+    if kind == NodeKind.LetBinding {
+        out.push(node_value(node))
+        return out
+    }
+    if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
+        out.push(node_value(node))
+        return out
     }
 
-    -1
+    out
 }
 
 // ── Phase 2: Type check function bodies ─────────────────────────────
