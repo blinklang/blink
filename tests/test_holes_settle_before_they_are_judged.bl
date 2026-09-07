@@ -1,0 +1,101 @@
+// The name-resolution pass walks a function body before the typecheck pass has settled
+// the body's locals. A well-typed expression therefore reads, on that first walk, as a
+// real type carrying an undetermined position: `[a]` is a List whose element nothing has
+// named yet. Judging or discarding such a type on the first walk reports against a type
+// nobody claimed, or throws away the answer the second walk would have given.
+//
+// Each shape below must compile with no error at all — not merely without one chosen code,
+// which is why these rows assert on severity rather than on a single needle. They are the
+// shapes that broke when inference stopped answering "unknown" and the permissive
+// fall-through that had been hiding them went away.
+import compile_test_helpers
+
+// A carrier built in a `with` block and returned as the block's tail. The recovery that
+// repairs an under-determined tail re-infers it OUTSIDE the block, and inference publishes
+// every node it walks, so the re-inference overwrote the in-scope answer the recovery then
+// read. The tail's carried type came back erased and the recovery "repaired" the damage
+// onto itself. `out` is block-local, which is what makes the out-of-scope walk lose it.
+test "a carrier as a with-block tail keeps its carried type" {
+    let src = #"fn collect(n: Int) -> Result[List[Int], Str] ! IO {
+    with ffi.scope() as _scope {
+        let mut out: List[Int] = []
+        let mut j = 0
+        while j < n {
+            out.push(j)
+            j = j + 1
+        }
+        Ok(out)
+    }
+}
+
+fn main() ! IO {
+    match collect(3) {
+        Ok(xs) => io.println("{xs.len()}")
+        Err(e) => io.println("{e}")
+    }
+}
+"#
+    // Run it, do not merely compile it. The failure this row guards erased the tail's
+    // CARRIED type, and an erased carrier can still compile clean — only the emitted C and
+    // the value that comes out of it show the damage.
+    let r = compile_test_helpers.compile_and_run(src, "hole_with_tail_carrier")
+    compile_test_helpers.expect_contains(r.out, "3", "hole_with_tail_carrier prints its length")
+    assert(r.exit_code == 0)
+}
+
+// A list of locals passed as an argument. On the first walk the argument reads as a List
+// over an undetermined element, and comparing it against the parameter reported a mismatch
+// for a program that infers fine. The compare that matters runs again once the element is
+// settled.
+test "a list built from locals is a valid argument" {
+    let src = #"fn total(xs: List[Int]) -> Int {
+    let mut s = 0
+    for x in xs {
+        s = s + x
+    }
+    s
+}
+
+fn main() ! IO {
+    let a = 1
+    let b = 2
+    io.println("{total([a, b])}")
+}
+"#
+    compile_test_helpers.expect_compiles_clean(compile_test_helpers.compile_and_capture(src, "hole_list_arg"), "hole_list_arg")
+}
+
+// Skipping such an argument must skip THAT argument and not abandon the rest of the call.
+// Every argument is seeded before the per-argument check runs, and a closure argument takes
+// its parameter types from that seed, so leaving the loop early left the closure unseeded
+// and it was reported as impossible to infer.
+test "a closure after a hole-carrying argument still gets its parameter types" {
+    let src = #"fn main() ! IO {
+    let a = 1
+    let b = 2
+    let xs = [a, b]
+    let doubled = xs.map(fn(v: Int) -> Int { v * 2 })
+    let kept = doubled.filter(fn(v) { v > 2 })
+    io.println("{kept.len()}")
+}
+"#
+    compile_test_helpers.expect_compiles_clean(compile_test_helpers.compile_and_capture(src, "hole_arg_then_closure"), "hole_arg_then_closure")
+}
+
+// Both branches of an `if` carry a hole on the first walk. They are not a mismatch with each
+// other, they are the same branch not yet typed, and the join must take the settled side for
+// the position the other has not named rather than seat the hole in the result.
+test "if branches over locals join without a mismatch" {
+    let src = #"fn pick(flag: Int, a: Int, b: Int) -> Option[Int] {
+    if flag == 1 { Some(a) } else { Some(b) }
+}
+
+fn main() ! IO {
+    match pick(1, 7, 9) {
+        Some(v) => io.println("{v}")
+        None => io.println("none")
+    }
+}
+"#
+    compile_test_helpers.expect_compiles_clean(compile_test_helpers.compile_and_capture(src, "hole_if_join"), "hole_if_join")
+}

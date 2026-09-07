@@ -4372,7 +4372,15 @@ fn tc_leaf_is_instance_or_carrier(tid: Int) -> Int {
 
 fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     if ann_node == -1 {
-        return TYPE_UNKNOWN
+        // No annotation node to read. A fresh, independently-bindable alpha, not the shared
+        // give-up singleton, so an unwritten position a later use pins is not fixed as
+        // "nothing is known" here.
+        //
+        // A metavar is NOT no-info: tc_tid_is_no_info answers 0 for it. A caller that means
+        // ABSENCE — nothing has a type at this position — must therefore answer -1 itself
+        // before calling, the way register_trait and tc_trait_contract_tid_check do, rather
+        // than hand -1 in and expect a no-info tid back.
+        return make_metavar()
     }
     resolve_type_parts(node_name(ann_node), node_elements(ann_node), ann_node)
 }
@@ -7256,12 +7264,20 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
                 let mut j = 0
                 while j < sublist_length(params_sl) {
                     let p = sublist_get(params_sl, j)
-                    tc_tmsig_param_tids.push(resolve_type_ann(node_type_ann(p)))
+                    // `self` carries no annotation. That is an absence, not a type the
+                    // impl must match, and the contract check skips it on that basis.
+                    let p_ann = node_type_ann(p)
+                    tc_tmsig_param_tids.push(if p_ann == -1 { -1 } else { resolve_type_ann(p_ann) })
                     p_count = p_count + 1
                     j = j + 1
                 }
             }
-            tc_tmsig_pool.push(TraitMethodSigEntry { trait_name: name, method: mname, ret_tid: resolve_type_ann(node_type_ann(m)), tparams_start: tp_start, tparams_count: tp_count, params_start: p_start, params_count: p_count })
+            // An omitted arrow on the TRAIT side means Void, the same reading the impl
+            // side already takes below. Left as a no-info value it skipped the return
+            // contract check entirely, so an impl could return anything at all.
+            let m_ann = node_type_ann(m)
+            let m_ret = if m_ann == -1 { TYPE_VOID } else { resolve_type_ann(m_ann) }
+            tc_tmsig_pool.push(TraitMethodSigEntry { trait_name: name, method: mname, ret_tid: m_ret, tparams_start: tp_start, tparams_count: tp_count, params_start: p_start, params_count: p_count })
             i = i + 1
         }
         tc_suppress_ann_validation = saved_suppress
@@ -7331,6 +7347,10 @@ type TraitContractTidResult {
 // here so the caller keeps no save/restore idiom of its own.
 fn tc_trait_contract_tid_check(trait_tid: Int, impl_ann: Int, impl_recv_tid: Int, tmsig_idx: Int, im: Int) -> TraitContractTidResult ! TypeCheck.Resolve, Diag.Report {
     if tc_tid_is_no_info(trait_tid) != 0 { return TraitContractTidResult { verdict: -1, actual: TYPE_UNKNOWN, expected: TYPE_UNKNOWN } }
+    // A param the impl leaves unannotated — `self`, or any param written bare — has no
+    // written type to compare. Reporting it against the trait's type names `?`, which is
+    // not a type anyone can write, and asks the author to repair a correct impl.
+    if impl_ann == -1 { return TraitContractTidResult { verdict: -1, actual: TYPE_UNKNOWN, expected: TYPE_UNKNOWN } }
     let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
     let mut self_binds: Map[Str, Int] = Map()
@@ -7629,7 +7649,16 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
                                         tc_trait_contract_tid_check(tmsig.ret_tid, impl_ret_ann, impl_recv_tid, si, im)
                                     }
                                     if r.verdict == 1 {
-                                        diag_error_at("TraitContract", TRAIT_CONTRACT_903, "method '{expected_method}' returns '{type_to_str(r.actual)}', expected '{type_to_str(r.expected)}'", impl_m, "change return type to '{type_to_str(r.expected)}' to match trait {trait_name}")
+                                        // Void is not a return type a user may write, so the
+                                        // repair for a trait method declared without an arrow
+                                        // is to drop the impl's arrow, not to spell Void out.
+                                        let want = if r.expected == TYPE_VOID { "no return value" } else { "'{type_to_str(r.expected)}'" }
+                                        let fix = if r.expected == TYPE_VOID {
+                                            "remove the return type — trait {trait_name} declares '{expected_method}' with no return"
+                                        } else {
+                                            "change return type to '{type_to_str(r.expected)}' to match trait {trait_name}"
+                                        }
+                                        diag_error_at("TraitContract", TRAIT_CONTRACT_903, "method '{expected_method}' returns '{type_to_str(r.actual)}', expected {want}", impl_m, fix)
                                     }
                                 }
                             }
@@ -11909,6 +11938,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     // leaving the handler value untyped even though resolve_type_parts lowers the ANNOTATION.
     if kind == NodeKind.HandlerExpr {
         let he_eff = node_name(node)
+        // Empty only when the source ran out of tokens after `handler` — expect_value hands
+        // back the offending token's value otherwise, so a wrong token lands in he_eff and
+        // types as that handler. Either way the parser has reported; an absence here, not a
+        // second diagnostic and not a crash.
         if he_eff == "" { return -1 }
         return make_handler_type(he_eff)
     }
@@ -13344,6 +13377,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if method == "cmp" && tc_type_has_ord_impl(tname) != 0 {
                 let ot = lookup_named_type("Ordering")
                 if ot != -1 { return ot }
+                // Ordering is declared in lib/std/traits.bl, so a program that never pulls
+                // it in has no tid for it — the same reading register_derive_method_sigs
+                // takes when it leaves `cmp` unregistered. An absence: the method's return
+                // type is a type this program does not have.
                 return -1
             }
             // A closure-typed struct field invoked like a method —
@@ -16470,7 +16507,8 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
                         // sig == -1 leaves tc_check_fn's declared-return install un-run, so
                         // set it here (Self resolves to the abstract self typevar) — an
                         // explicit `return expr` in the body is checked against it.
-                        tc_current_fn_ret = resolve_type_ann(node_type_ann(dm))
+                        let dm_ann = node_type_ann(dm)
+                        tc_current_fn_ret = if dm_ann == -1 { TYPE_VOID } else { resolve_type_ann(dm_ann) }
                         tc_check_fn(dm)
                     }
                     mj = mj + 1

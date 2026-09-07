@@ -1,0 +1,139 @@
+// A trait method written without an arrow returns Void, and an impl must match it.
+//
+// The trait side resolved that missing annotation through the same path a missing node
+// took anywhere else, and got the give-up type back. The contract check skips a no-info
+// expected type by design, so the return comparison was skipped for EVERY trait method
+// declared without an arrow — the impl could return anything at all and nothing said so.
+// The check's own comment already claimed the opposite reading, that an omitted arrow
+// means Void and must still be compared.
+//
+// The mirror of that reading is the impl side: a param the impl leaves unannotated has no
+// written type, so it must NOT be compared. Reporting it names `?`, which is not a type
+// anyone can write, and tells the author to repair an impl that is already correct.
+import compile_test_helpers
+
+test "an impl returning a value where the trait returns Void is reported" {
+    let src = #"trait Sink {
+    fn drain(self)
+}
+
+type Bucket {
+    n: Int
+}
+
+impl Sink for Bucket {
+    fn drain(self) -> Int { self.n }
+}
+
+fn main() ! IO {
+    let b = Bucket { n: 1 }
+    b.drain()
+    io.println("done")
+}
+"#
+    compile_test_helpers.expect_compile_error(src, "trait_void_ret_mismatch", "E0903")
+}
+
+// The control proves the comparison admits the matching spelling. A check that rejected
+// the correct impl too would pass the row above for the wrong reason.
+test "an impl returning Void where the trait returns Void still type-checks" {
+    let src = #"trait Sink {
+    fn drain(self)
+}
+
+type Bucket {
+    n: Int
+}
+
+impl Sink for Bucket {
+    fn drain(self) { io.println("{self.n}") }
+}
+
+fn main() ! IO {
+    let b = Bucket { n: 1 }
+    b.drain()
+    io.println("done")
+}
+"#
+    compile_test_helpers.expect_compiles_clean(compile_test_helpers.compile_and_capture(src, "trait_void_ret_ok"), "trait_void_ret_ok")
+}
+
+// `self` carries no annotation on either side. That is an absence, not a type the impl
+// must match, so the param comparison must keep skipping it rather than reporting the
+// receiver against a type nobody wrote.
+test "an unannotated self param is not a contract mismatch" {
+    let src = #"trait Named {
+    fn label(self) -> Str
+}
+
+type Tag {
+    s: Str
+}
+
+impl Named for Tag {
+    fn label(self) -> Str { self.s }
+}
+
+fn main() ! IO {
+    let t = Tag { s: "x" }
+    io.println(t.label())
+}
+"#
+    compile_test_helpers.expect_compiles_clean(compile_test_helpers.compile_and_capture(src, "trait_self_param_absent"), "trait_self_param_absent")
+}
+
+// The trait annotates slot 0 as `self: Self` while the impl writes a bare `self`. The impl
+// is correct: `self` needs no annotation. Comparing the absence against the trait's Self
+// reported the receiver of every such impl.
+test "a bare self against an annotated trait self is not a contract mismatch" {
+    let src = #"trait Eqish {
+    fn same(self: Self, other: Self) -> Bool
+}
+
+type Box {
+    v: Int
+}
+
+impl Eqish for Box {
+    fn same(self, other: Box) -> Bool { self.v == other.v }
+}
+
+fn main() ! IO {
+    let a = Box { v: 1 }
+    let b = Box { v: 2 }
+    io.println("{a.same(b)}")
+}
+"#
+    compile_test_helpers.expect_compiles_clean(compile_test_helpers.compile_and_capture(src, "trait_bare_self_vs_annotated"), "trait_bare_self_vs_annotated")
+}
+
+// The same Void reading governs a trait's DEFAULT method body. A default written with no
+// arrow returns nothing, so `?` — which needs a Result or Option return to propagate into —
+// has nowhere to go. Left as the give-up type the body's return was no type at all and the
+// operator passed unexamined.
+test "the question mark operator in an arrowless trait default body is reported" {
+    let src = #"fn risky(n: Int) -> Result[Int, Str] {
+    if n < 0 { return Err("negative") }
+    Ok(n)
+}
+
+trait Runner {
+    fn go(self) {
+        let v = risky(1)?
+        io.println("{v}")
+    }
+}
+
+type Job {
+    id: Int
+}
+
+impl Runner for Job {}
+
+fn main() ! IO {
+    let j = Job { id: 1 }
+    j.go()
+}
+"#
+    compile_test_helpers.expect_compile_error(src, "trait_default_qm_void", "E0508")
+}
