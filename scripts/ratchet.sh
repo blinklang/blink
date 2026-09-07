@@ -151,6 +151,9 @@ printf '%s\n' "$rows_now" | while read -r name now; do
   mark=""
   [ "$now" -gt "$base" ] && mark="$mark UP(baseline)"
   [ "$now" -gt "$h1" ] && mark="$mark UP(head~1)"
+  # br_ids_in_source is an absolute zero gate (br is local-only; an id means
+  # nothing to another reader or to training data), not merely non-increasing.
+  [ "$name" = "br_ids_in_source" ] && [ "$now" -gt 0 ] && mark="$mark NONZERO(must-be-zero)"
   printf '%-26s %8s %8s %8s%s\n' "$name" "$base" "$h1" "$now" "$mark"
   [ -n "$mark" ] && printf x >> "$failmark"
 done

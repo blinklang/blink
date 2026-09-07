@@ -29,7 +29,6 @@ pub let mut other_global: Int = 0
 set_var(1, 2)
 if foo >= 0 { foo } else { bar }
 let h = tc_tid_list_elem_ct(1)
-// see br abc123
 EOF
   cat > "$dir/src/codegen_expr.bl" <<'EOF'
 pub let mut expr_foo: Int = 0
@@ -85,6 +84,22 @@ check_row return_type_unknown      typecheck.bl 'return TYPE_UNKNOWN'
 check_row str_keyed_type_facts     typecheck.bl 'let mut bar_map: Map[Str, Str] = Map()'
 check_row downgrade_calls          codegen.bl   'let h2 = tc_tid_option_inner_struct(1)'
 check_row br_ids_in_source         codegen.bl   '// also see br xyz987'
+
+# br_ids_in_source is an absolute zero gate: it must fail even when the
+# baseline and HEAD~1 both already read 1, where the plain non-increasing
+# rule alone would pass.
+STALE_ID_DIR="$WORK/stale_id"
+rm -rf "$STALE_ID_DIR"
+cp -r "$BASE" "$STALE_ID_DIR"
+printf '%s\n' '// see br abc123' >> "$STALE_ID_DIR/src/codegen.bl"
+STALE_ID_BASELINE="$WORK/stale_id_baseline.txt"
+RATCHET_SRC_DIR="$STALE_ID_DIR" RATCHET_BASELINE="$STALE_ID_BASELINE" ./scripts/ratchet.sh --update > /dev/null
+if RATCHET_SRC_DIR="$STALE_ID_DIR" RATCHET_BASELINE="$STALE_ID_BASELINE" RATCHET_HEAD1_DIR="$STALE_ID_DIR" ./scripts/ratchet.sh > /dev/null 2>&1; then
+  echo "FAIL br_ids_in_source-absolute-zero: baseline=1, head~1=1, now=1 should still fail (must-be-zero, not merely non-increasing)"
+  fail=1
+else
+  echo "PASS br_ids_in_source-absolute-zero: a steady nonzero count fails even though it does not increase"
+fi
 
 # The HEAD~1 check must catch a regression independently of the baseline,
 # even when the baseline has generous headroom banked from elsewhere.
