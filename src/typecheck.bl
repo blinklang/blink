@@ -1252,6 +1252,18 @@ pub fn make_set_type(elem_type: Int) -> Int {
 // assign it could invalidate the pool.
 pub fn tc_unknown_tid() -> Int { TYPE_UNKNOWN }
 
+// True when a tid carries no information about a type. Two spellings reach the same state and
+// both must be skipped wherever a type is merged or compared: ABSENCE — -1, or a tid outside
+// the pool, meaning nothing has a type here — and the give-up singleton, meaning inference had
+// nothing to say. A caller that tests only one of the two treats the other as a real type,
+// which is how a -1 element ends up inside a container tid.
+pub fn tc_tid_is_no_info(tid: Int) -> Int {
+    if tid < 0 { return 1 }
+    if tid >= ty_pool.len() { return 1 }
+    if tid == TYPE_UNKNOWN { return 1 }
+    0
+}
+
 // The two one-inner runtime carriers. Until these existed, `new_type` was never
 // called with TyKind.Handle or TyKind.Channel, so an annotation naming one fell through
 // resolve_type_ann to `make_typevar(name)` — a bare typevar wearing the type's name. Codegen
@@ -1543,8 +1555,10 @@ fn tc_tid_has_unbound_metavar(tid0: Int) -> Int {
 // predicates partition the two kinds of emptiness rather than overlapping.
 pub fn tc_tid_has_unknown(tid0: Int) -> Int {
     let tid = tc_resolve(tid0)
-    if tid == TYPE_UNKNOWN { return 1 }
-    if tid < 0 || tid >= ty_pool.len() { return 0 }
+    // Absence counts as a hole for the same reason the give-up singleton does: a memo pinned
+    // from a tid that names no type would pin the wrong thing. tc_tid_is_no_info already
+    // covers the out-of-range case, so ty_pool.get below is safe.
+    if tc_tid_is_no_info(tid) != 0 { return 1 }
     let e = ty_pool.get(tid).unwrap()
     let k = e.kind
     if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel {
@@ -1938,7 +1952,7 @@ fn tc_locate_under_determined(node: Int) -> Int {
             while i < sublist_length(els) {
                 let el = sublist_get(els, i)
                 let et = tc_lookup_node_tid(el)
-                if et >= 0 && et != TYPE_UNKNOWN && tc_tid_has_unbound_metavar(et) != 0 {
+                if tc_tid_is_no_info(et) == 0 && tc_tid_has_unbound_metavar(et) != 0 {
                     return el
                 }
                 i = i + 1
@@ -1988,7 +2002,7 @@ fn tc_report_under_determined_at(scrut: Int, scrut_tid: Int) ! Diag.Report {
     if scrut == -1 { return }
     let culprit = tc_locate_under_determined(scrut)
     let culprit_tid = tc_lookup_node_tid(culprit)
-    let hint_tid = if culprit_tid >= 0 && culprit_tid != TYPE_UNKNOWN { culprit_tid } else { scrut_tid }
+    let hint_tid = if tc_tid_is_no_info(culprit_tid) == 0 { culprit_tid } else { scrut_tid }
     let hint = tc_infer_annotation_hint(hint_tid)
     let mut notes: List[Str] = []
     notes.push("its type is never constrained by an annotation, a `?`, an error-reading arm, or a return type")
@@ -3294,8 +3308,8 @@ fn tc_report_missing_return(kind: Str, at_node: Int) ! Diag.Report {
 }
 
 fn tc_check_returned_value(val_t: Int, at_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if tc_current_fn_ret == TYPE_VOID || tc_current_fn_ret == TYPE_UNKNOWN { return }
-    if val_t == TYPE_UNKNOWN { return }
+    if tc_current_fn_ret == TYPE_VOID || tc_tid_is_no_info(tc_current_fn_ret) != 0 { return }
+    if tc_tid_is_no_info(val_t) != 0 { return }
     if types_compatible(tc_current_fn_ret, val_t) == 0 {
         // §3.3 body completeness: the tail type must be a subtype of R, and `()` is a
         // subtype only of `()`. When the tail is a loop or an arm-bearing form that can
@@ -3419,7 +3433,7 @@ fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int) ! Ty
         }
         if pidx >= 0 && pidx < param_count {
             let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
-            if ptid != TYPE_UNKNOWN {
+            if tc_tid_is_no_info(ptid) == 0 {
                 tc_seed_closure_expected_fn(arg_node, ptid)
                 let saved_hint = tc_construct_hint
                 tc_construct_hint = resolve_alias_tid(ptid)
@@ -3475,7 +3489,7 @@ fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int) ! Ty
 // writes cumulative inference state that is intended to persist, not roll back.
 @allow(UnrestoredMutation)
 fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if expected_t == TYPE_UNKNOWN { return }
+    if tc_tid_is_no_info(expected_t) != 0 { return }
     let saved_hint = tc_construct_hint
     tc_construct_hint = resolve_alias_tid(expected_t)
     let arg_t = infer_type(value_node)
@@ -3767,13 +3781,13 @@ fn closure_arg_at(args_sl: Int, idx: Int) -> Int {
 // (TYPE_UNKNOWN) and unknown expected types are skipped — annotation validation
 // only; check_closure_body handles inference for the unannotated case.
 fn check_closure_param(closure_node: Int, param_idx: Int, expected_t: Int, method: Str, container_label: Str) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if expected_t == TYPE_UNKNOWN { return }
+    if tc_tid_is_no_info(expected_t) != 0 { return }
     if closure_node == -1 || node_kind(closure_node) != NodeKind.Closure { return }
     let params_sl = node_params(closure_node)
     if params_sl == -1 || param_idx >= sublist_length(params_sl) { return }
     let p = sublist_get(params_sl, param_idx)
     let ptid = resolve_param_type(p)
-    if ptid == TYPE_UNKNOWN { return }
+    if tc_tid_is_no_info(ptid) != 0 { return }
     if types_compatible(ptid, expected_t) == 0 {
         tc_error_at("closure parameter {param_idx + 1} of '{container_label}.{method}' expects {type_to_str(expected_t)}, got {type_to_str(ptid)}", p)
     }
@@ -3783,7 +3797,7 @@ fn check_closure_param(closure_node: Int, param_idx: Int, expected_t: Int, metho
 // requires (e.g. Bool for filter/any/all). Skipped when the closure has no
 // declared return or the expected type is unknown.
 fn check_closure_ret(closure_node: Int, expected_ret: Int, method: Str, container_label: Str) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if expected_ret == TYPE_UNKNOWN { return }
+    if tc_tid_is_no_info(expected_ret) != 0 { return }
     if closure_node == -1 || node_kind(closure_node) != NodeKind.Closure { return }
     let ret_str = node_return_type(closure_node)
     if ret_str == "" { return }
@@ -3835,7 +3849,7 @@ fn tc_closure_body_result_tid(cls: Int, depth: Int) -> Int {
     if node_kind(cls) != NodeKind.Closure { return -1 }
     let t = tc_scoped_value_memo(node_body(cls), depth + 1)
     if t < 0 { return -1 }
-    if t == TYPE_UNKNOWN { return -1 }
+    if tc_tid_is_no_info(t) != 0 { return -1 }
     t
 }
 
@@ -3975,13 +3989,13 @@ fn check_closure_body(cls: Int, exp_fn: Int) ! TypeCheck.Resolve, TypeCheck.Repo
             let pi = sublist_get(params_sl, i)
             let decl = resolve_param_type(pi)
             let hint = hints.get(i) ?? TYPE_UNKNOWN
-            let mut bind = if decl != TYPE_UNKNOWN { decl } else { hint }
+            let mut bind = if tc_tid_is_no_info(decl) == 0 { decl } else { hint }
             // Neither an annotation nor the context chose this param's type. TYPE_UNKNOWN
             // unifies with anything and codegen erases it to `void`, so bind a fresh
             // metavar: a use in the body can still pin it, and one that stays open is
             // reported as error[CannotInferType] at the param's own span when this scope's
             // deferred blame is flushed (decisions/under-determined-types.md).
-            if bind < 0 || bind == TYPE_UNKNOWN { bind = make_metavar() }
+            if tc_tid_is_no_info(bind) != 0 { bind = make_metavar() }
             nr_define_typed(node_name(pi), 0, bind, pi)
             tc_publish_node_tid(pi, bind)
             param_types.push(bind)
@@ -3999,7 +4013,7 @@ fn check_closure_body(cls: Int, exp_fn: Int) ! TypeCheck.Resolve, TypeCheck.Repo
     let cls_ret_ann = node_type_ann(cls)
     let exp_ret = tc_fn_tid_ret(exp_fn)
     let mut seed_ret = tc_closure_declared_ret(cls)
-    if cls_ret_ann == -1 && exp_ret >= 0 && exp_ret != TYPE_UNKNOWN { seed_ret = exp_ret }
+    if cls_ret_ann == -1 && tc_tid_is_no_info(exp_ret) == 0 { seed_ret = exp_ret }
     tc_publish_node_tid(cls, make_fn_type(seed_ret, param_types))
     tc_check_closure_body_against_own_ret(cls)
     // An unannotated closure carries no `-> T`, so tc_closure_declared_ret answered Void
@@ -4241,7 +4255,7 @@ fn tc_check_call_against_fn_tid(fn_tid: Int, args_sl: Int, label: Str, node: Int
         let arg_tid = tc_infer_value(sublist_get(args_sl, li))
         if li < expected {
             let ptid = ty_param_list.get(pstart + li).unwrap()
-            if arg_tid != TYPE_UNKNOWN && ptid != TYPE_UNKNOWN && types_compatible(ptid, arg_tid) == 0 {
+            if tc_tid_is_no_info(arg_tid) == 0 && tc_tid_is_no_info(ptid) == 0 && types_compatible(ptid, arg_tid) == 0 {
                 tc_error_at("{label} argument {li} expects {type_to_str(ptid)}, got {type_to_str(arg_tid)}", node)
             }
         }
@@ -4949,11 +4963,15 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
 // check_impl_type_arg_names (:4643) has already reported against the same header.
 @allow(UnrestoredMutation)
 pub fn tc_impl_self_tid(im: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
-    if im == -1 { return TYPE_UNKNOWN }
+    // -1, not the give-up singleton: there is no receiver here, which is not the same claim as
+    // "the receiver has a type nobody could work out". tc_current_self_tid gates on -1, so the
+    // singleton made a trait default-method body type its own `self` as unknown — and unknown
+    // unifies with everything, which is the vacuous check this function exists to prevent.
+    if im == -1 { return -1 }
     let name = node_name(im)
     // A trait's own default-method bodies have no receiver type to speak of, and the parser
     // leaves `name` empty for a header with no `for` clause.
-    if name == "" { return TYPE_UNKNOWN }
+    if name == "" { return -1 }
     let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
     let t = resolve_type_parts(name, node_recv_type_args(im), -1)
@@ -5302,10 +5320,10 @@ fn tc_infer_struct_lit_field_values(stid: Int, node: Int) ! TypeCheck.Resolve, T
         let f = sublist_get(flds_sl, fi)
         let declared = get_struct_field_tid(stid, node_name(f))
         let saved_hint = tc_construct_hint
-        if declared != -1 && declared != TYPE_UNKNOWN { tc_construct_hint = resolve_alias_tid(declared) }
+        if tc_tid_is_no_info(declared) == 0 { tc_construct_hint = resolve_alias_tid(declared) }
         let vt = infer_type(node_value(f))
         tc_construct_hint = saved_hint
-        if declared != -1 && declared != TYPE_UNKNOWN && tc_tid_has_unbound_metavar(vt) != 0 {
+        if tc_tid_is_no_info(declared) == 0 && tc_tid_has_unbound_metavar(vt) != 0 {
             tc_unify(declared, vt)
         }
         fi = fi + 1
@@ -7244,7 +7262,7 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
 // → the impl's `type <assoc> = ...` binding. Caller must have the impl binder
 // scope pushed and ann-validation suppressed.
 fn subst_trait_type_tid(type_tid: Int, impl_recv_tid: Int, tmsig_idx: Int, impl_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
-    if type_tid == TYPE_UNKNOWN { return type_tid }
+    if tc_tid_is_no_info(type_tid) != 0 { return type_tid }
     let mut binds: Map[Str, Int] = Map()
     binds.insert("Self", impl_recv_tid)
     let _tmsig = tc_tmsig_pool.get(tmsig_idx).unwrap()
@@ -7288,7 +7306,7 @@ type TraitContractTidResult {
 // the impl binder scope pushed. Suppression of re-validation is saved/restored
 // here so the caller keeps no save/restore idiom of its own.
 fn tc_trait_contract_tid_check(trait_tid: Int, impl_ann: Int, impl_recv_tid: Int, tmsig_idx: Int, im: Int) -> TraitContractTidResult ! TypeCheck.Resolve, Diag.Report {
-    if trait_tid == TYPE_UNKNOWN { return TraitContractTidResult { verdict: -1, actual: TYPE_UNKNOWN, expected: TYPE_UNKNOWN } }
+    if tc_tid_is_no_info(trait_tid) != 0 { return TraitContractTidResult { verdict: -1, actual: TYPE_UNKNOWN, expected: TYPE_UNKNOWN } }
     let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
     let mut self_binds: Map[Str, Int] = Map()
@@ -7303,12 +7321,12 @@ fn tc_trait_contract_tid_check(trait_tid: Int, impl_ann: Int, impl_recv_tid: Int
 // => TYPE_VOID rule): resolving the -1 node would yield UNKNOWN and skip the check,
 // silently satisfying a trait that requires a real return.
 fn tc_trait_contract_tid_check_actual(trait_tid: Int, actual: Int, impl_recv_tid: Int, tmsig_idx: Int, im: Int) -> TraitContractTidResult ! TypeCheck.Resolve, Diag.Report {
-    if trait_tid == TYPE_UNKNOWN { return TraitContractTidResult { verdict: -1, actual: actual, expected: TYPE_UNKNOWN } }
+    if tc_tid_is_no_info(trait_tid) != 0 { return TraitContractTidResult { verdict: -1, actual: actual, expected: TYPE_UNKNOWN } }
     let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
     let expected = subst_trait_type_tid(trait_tid, impl_recv_tid, tmsig_idx, im)
     tc_suppress_ann_validation = saved_suppress
-    if expected == TYPE_UNKNOWN || actual == TYPE_UNKNOWN {
+    if tc_tid_is_no_info(expected) != 0 || tc_tid_is_no_info(actual) != 0 {
         return TraitContractTidResult { verdict: -1, actual: actual, expected: expected }
     }
     let v = if tc_tid_same_type(actual, expected) { 0 } else { 1 }
@@ -7566,7 +7584,7 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
                                 let mut pi = 0
                                 while pi < trait_pcount {
                                     let trait_ptid = tc_tmsig_param_tids.get(tp_start + pi).unwrap()
-                                    if trait_ptid != TYPE_UNKNOWN {
+                                    if tc_tid_is_no_info(trait_ptid) == 0 {
                                         let impl_p = sublist_get(impl_params_sl, pi)
                                         let r = tc_trait_contract_tid_check(trait_ptid, node_type_ann(impl_p), impl_recv_tid, si, im)
                                         if r.verdict == 1 {
@@ -7579,7 +7597,7 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
                                 // returns Void (ret_ann == -1 => TYPE_VOID), which must
                                 // still be compared: dropping to UNKNOWN would let a
                                 // Void impl silently satisfy a non-Void trait return.
-                                if tmsig.ret_tid != TYPE_UNKNOWN {
+                                if tc_tid_is_no_info(tmsig.ret_tid) == 0 {
                                     let impl_ret_ann = node_type_ann(impl_m)
                                     let r = if impl_ret_ann == -1 {
                                         tc_trait_contract_tid_check_actual(tmsig.ret_tid, TYPE_VOID, impl_recv_tid, si, im)
@@ -9188,19 +9206,19 @@ fn get_builtin_fn_ret(name: Str) -> Int {
 //     BEFORE the receiver is inferred so a same-spelled enum variant cannot shadow it into
 //     E0505. Keeping it there is why StringBuilder is named below only as a comment.
 //
-// Returns TYPE_UNKNOWN for anything it does not own, and the caller falls through to the
-// fnsig lookups rather than treating that as the final answer.
+// Returns -1 for anything it does not own — absence, so the caller falls through to the fnsig
+// lookups. The give-up singleton would have been a type here, and a type ends resolution.
 fn tc_builtin_static_ret(tname: Str, method: Str) -> Int {
     if tname == "Bytes" {
         if method == "new" || method == "from_str" || method == "zeroed" {
             return get_builtin_fn_ret("Bytes")
         }
-        return TYPE_UNKNOWN
+        return -1
     }
     // Map.new() / Set.new(): the element types are metavars, minted per call by
     // get_builtin_fn_ret. No other static constructor exists on either.
     if method == "new" { return get_builtin_fn_ret(tname) }
-    TYPE_UNKNOWN
+    -1
 }
 
 fn is_builtin_variant_name(name: Str) -> Int {
@@ -10256,7 +10274,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             let vk = node_kind(val)
             if vk == NodeKind.Call || vk == NodeKind.Ident || vk == NodeKind.MethodCall {
                 let inferred = infer_type(val)
-                if inferred != TYPE_UNKNOWN {
+                if tc_tid_is_no_info(inferred) == 0 {
                     nr_set_last_type(inferred)
                 }
             }
@@ -11152,21 +11170,18 @@ pub fn type_merge(a0: Int, b0: Int) -> Int {
     // otherwise merging Some's Option[T] with None's Option[α] would erase T.
     let a = tc_resolve(a0)
     let b = tc_resolve(b0)
-    if a == TYPE_UNKNOWN { return b }
-    if b == TYPE_UNKNOWN { return a }
+    // Fail CLOSED on a side that carries no information. Adopting the other side would let a
+    // caller that never checked types_compatible launder an absence into a real merged answer,
+    // and a raw -1 escaping as a type is the forbidden third default state
+    // (decisions/under-determined-types.md). The callers that legitimately have one empty side —
+    // a match arm that diverges, an if with no else — test tc_tid_is_no_info themselves and pick
+    // the other side without entering this function. The singleton is the answer here because
+    // there is no report to make: the argument is malformed, not the program.
+    if tc_tid_is_no_info(a) != 0 || tc_tid_is_no_info(b) != 0 { return tc_unknown_tid() }
     // A diverging branch contributes no value, so the other branch decides the merge.
     if a == TYPE_NEVER { return b }
     if b == TYPE_NEVER { return a }
     if a == b { return a }
-    // Fail CLOSED, symmetric with types_compatible: a negative or out-of-range tid is
-    // an unknown/error encoding, so return the shared TYPE_UNKNOWN singleton rather than
-    // hand the raw (possibly -1) side back as a real merged answer — a -1 escaping as a
-    // type is the forbidden "third default state" (decisions/under-determined-types.md).
-    // This also re-gates the recursive inner merges below: any inner tid that is negative
-    // or out of range reaches this guard on re-entry and yields TYPE_UNKNOWN, so a
-    // malformed carrier can never produce a bogus container over a -1 element.
-    if a < 0 || b < 0 { return TYPE_UNKNOWN }
-    if a >= ty_pool.len() || b >= ty_pool.len() { return TYPE_UNKNOWN }
     if tc_is_unbound_metavar(a) != 0 {
         let _ = tc_unify(a, b)
         let ra = tc_resolve(a)
@@ -11257,7 +11272,10 @@ pub fn type_merge(a0: Int, b0: Int) -> Int {
 // idempotent. The scope is pushed and popped here so the bindings never leak past the arm.
 fn infer_arm_body(arm: Int, scrut_tid: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let b = node_body(arm)
-    if b == -1 { return TYPE_UNKNOWN }
+    // No body is an ABSENCE — this arm contributes nothing to the merge. The merge below reads
+    // that through tc_tid_is_no_info, which is the same test it applies to the diverging-arm
+    // placeholder, so the two need not be the same value.
+    if b == -1 { return -1 }
     nr_push_scope()
     let saved_pat = tc_pattern_binding_type
     tc_pattern_binding_type = scrut_tid
@@ -11282,7 +11300,7 @@ pub fn type_kind(tid0: Int) -> TyKind {
 
 // Blink treats Int as truthy — Int is valid in Bool contexts
 fn is_bool_compat(tid: Int) -> Int {
-    if tid == TYPE_UNKNOWN { return 1 }
+    if tc_tid_is_no_info(tid) != 0 { return 1 }
     if tid == TYPE_BOOL { return 1 }
     if tid == TYPE_INT { return 1 }
     let k = type_kind(tid)
@@ -11297,7 +11315,7 @@ pub fn is_sized_int(k: TyKind) -> Int {
 }
 
 fn is_integer_type(tid: Int) -> Int {
-    if tid == TYPE_UNKNOWN { return 0 }
+    if tc_tid_is_no_info(tid) != 0 { return 0 }
     let k = type_kind(tid)
     if k == TyKind.Int { return 1 }
     is_sized_int(k)
@@ -11367,7 +11385,7 @@ fn reject_non_numeric_arith_operand(op: Str, tid: Int, node: Int, is_unary: Int)
 }
 
 fn is_shift_amount_type(tid: Int, rhs_node: Int) -> Int {
-    if tid == TYPE_UNKNOWN { return 1 }
+    if tc_tid_is_no_info(tid) != 0 { return 1 }
     let k = type_kind(tid)
     if k == TyKind.U32 { return 1 }
     if k == TyKind.Int && rhs_node != -1 && node_kind(rhs_node) == NodeKind.IntLit { return 1 }
@@ -11641,7 +11659,7 @@ fn tc_check_spread_sources(elems_sl: Int, elem_t: Int) ! TypeCheck.Resolve, Type
 // later element is inference, not Void-defaulting: the literal determines the type.
 fn tc_check_list_elem_compat(elem: Int, elem_t: Int, idx: Int, first_t: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node_kind(elem) == NodeKind.SpreadExpr { return }
-    if first_t == TYPE_UNKNOWN || elem_t == TYPE_UNKNOWN { return }
+    if tc_tid_is_no_info(first_t) != 0 || tc_tid_is_no_info(elem_t) != 0 { return }
     // Both resolutions, because the two paths in check_arg_value spell this escape differently —
     // resolve_alias_tid on the concrete side, tc_resolve on the metavar side — and a first element
     // whose type is a metavar already BOUND to a sized int needs the second one.
@@ -11686,12 +11704,12 @@ pub fn tc_fn_tid_more_specific(existing0: Int, fresh0: Int) -> Int {
     // The return refines only when fresh defaulted to VOID (omitted arrow) AND existing supplies
     // a real return. An existing UNKNOWN is LESS specific than a concrete VOID, so it must not win
     // — that would keep a divergence-cell UNKNOWN where the honest VOID default was available.
-    if fr != er && (fr != TYPE_VOID || er == TYPE_UNKNOWN) { return 0 }
+    if fr != er && (fr != TYPE_VOID || tc_tid_is_no_info(er) != 0) { return 0 }
     let mut i = 0
     while i < fe.params_count {
         let fp = tc_resolve(ty_param_list.get(fe.params_start + i).unwrap())
         let ep = tc_resolve(ty_param_list.get(ee.params_start + i).unwrap())
-        if fp != ep && fp != TYPE_UNKNOWN { return 0 }
+        if fp != ep && tc_tid_is_no_info(fp) == 0 { return 0 }
         i = i + 1
     }
     1
@@ -11722,7 +11740,7 @@ fn tc_infer_value(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
 // unresolved sigs); TYPE_VOID / TYPE_UNKNOWN are the non-value returns. One predicate so the
 // tail gate (which also drives the declared-return compare) and the Return gate cannot drift.
 fn tc_fn_returns_value() -> Bool {
-    tc_current_fn_ret >= 0 && tc_current_fn_ret != TYPE_VOID && tc_current_fn_ret != TYPE_UNKNOWN
+    tc_current_fn_ret != TYPE_VOID && tc_tid_is_no_info(tc_current_fn_ret) == 0
 }
 
 // `pub` FOR THE TEST ONLY — same precedent as make_fn_type. Real code reaches inference through
@@ -11752,7 +11770,7 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
         //
         // Known->known overwrites are still allowed: mono-calls-mono re-instantiates
         // one AST node under several T.
-        if tid >= 0 && tid != TYPE_UNKNOWN {
+        if tc_tid_is_no_info(tid) == 0 {
             tc_node_tid.set(node, tid)
         }
     }
@@ -11784,7 +11802,7 @@ pub fn tc_mc_obj_is_value(node: Int) -> Int {
 pub fn tc_publish_node_tid(node: Int, tid: Int) {
     if node == -1 { return }
     if node >= tc_node_tid.len() { return }
-    if tid < 0 || tid == TYPE_UNKNOWN { return }
+    if tc_tid_is_no_info(tid) != 0 { return }
     tc_node_tid.set(node, tid)
 }
 
@@ -11899,7 +11917,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // same-type operands (spec 03_types.md:1809). Validate when both sides
             // are known, preserving the enum-vs-Int representation exception
             // (03_types.md:1093) and untyped-int-literal coercion to a sized int.
-            if lt != TYPE_UNKNOWN && rt != TYPE_UNKNOWN {
+            if tc_tid_is_no_info(lt) == 0 && tc_tid_is_no_info(rt) == 0 {
                 if cmp_is_enum_int_pair(lt, rt) == 0 {
                     let lit_r = is_sized_int(type_kind(lt)) != 0 && rt == TYPE_INT && is_int_literal_node(node_right(node)) != 0
                     let lit_l = is_sized_int(type_kind(rt)) != 0 && lt == TYPE_INT && is_int_literal_node(node_left(node)) != 0
@@ -11923,7 +11941,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             return TYPE_BOOL
         }
         if op == "+" && (type_kind(lt) == TyKind.Str || type_kind(rt) == TyKind.Str) {
-            if lt != TYPE_UNKNOWN && rt != TYPE_UNKNOWN {
+            if tc_tid_is_no_info(lt) == 0 && tc_tid_is_no_info(rt) == 0 {
                 diag_error_at("StrPlusUnsupported", STR_PLUS_UNSUPPORTED,
                     "'+' does not work on Str", node,
                     "use .concat() to join two strings, or string interpolation to embed a value")
@@ -11947,45 +11965,45 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             let lit_to_sized_l = is_sized_int(type_kind(rt)) && lt == TYPE_INT && is_int_literal_node(node_left(node))
             if lit_to_sized_r { return lt }
             if lit_to_sized_l { return rt }
-            if lt != TYPE_UNKNOWN && rt != TYPE_UNKNOWN {
+            if tc_tid_is_no_info(lt) == 0 && tc_tid_is_no_info(rt) == 0 {
                 if types_compatible(lt, rt) == 0 {
                     tc_error_at("binary '{op}': incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
                 }
             }
-            if lt != TYPE_UNKNOWN { return lt }
+            if tc_tid_is_no_info(lt) == 0 { return lt }
             return rt
         }
         if op == "&" || op == "|" || op == "^" {
             check_bitwise_precedence(node, op)
-            if lt != TYPE_UNKNOWN && is_integer_type(lt) == 0 {
+            if tc_tid_is_no_info(lt) == 0 && is_integer_type(lt) == 0 {
                 tc_error_at("bitwise '{op}' requires integer operand, got {type_to_str(lt)}", node)
             }
-            if rt != TYPE_UNKNOWN && is_integer_type(rt) == 0 {
+            if tc_tid_is_no_info(rt) == 0 && is_integer_type(rt) == 0 {
                 tc_error_at("bitwise '{op}' requires integer operand, got {type_to_str(rt)}", node)
             }
-            if lt != TYPE_UNKNOWN && rt != TYPE_UNKNOWN && types_compatible(lt, rt) == 0 {
+            if tc_tid_is_no_info(lt) == 0 && tc_tid_is_no_info(rt) == 0 && types_compatible(lt, rt) == 0 {
                 tc_error_at("bitwise '{op}': incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
             }
-            if lt != TYPE_UNKNOWN { return lt }
+            if tc_tid_is_no_info(lt) == 0 { return lt }
             return rt
         }
         if op == "<<" || op == ">>" {
             check_bitwise_precedence(node, op)
-            if lt != TYPE_UNKNOWN && is_integer_type(lt) == 0 {
+            if tc_tid_is_no_info(lt) == 0 && is_integer_type(lt) == 0 {
                 tc_error_at("shift '{op}' requires integer left operand, got {type_to_str(lt)}", node)
             }
             let rhs = node_right(node)
-            if rt != TYPE_UNKNOWN && is_shift_amount_type(rt, rhs) == 0 {
+            if tc_tid_is_no_info(rt) == 0 && is_shift_amount_type(rt, rhs) == 0 {
                 tc_error_at("shift '{op}' amount must be U32, got {type_to_str(rt)}", node)
             }
-            if lt != TYPE_UNKNOWN && rhs != -1 && node_kind(rhs) == NodeKind.IntLit {
+            if tc_tid_is_no_info(lt) == 0 && rhs != -1 && node_kind(rhs) == NodeKind.IntLit {
                 let amt = node_str_val(rhs).to_int()
                 let bw = type_bit_width(lt)
                 if amt < 0 || amt >= bw {
                     tc_error_at("shift '{op}' amount {amt} out of range for {type_to_str(lt)} (must be 0..{bw})", node)
                 }
             }
-            if lt != TYPE_UNKNOWN { return lt }
+            if tc_tid_is_no_info(lt) == 0 { return lt }
             return TYPE_INT
         }
         if op == "??" {
@@ -12004,7 +12022,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
             return rt
         }
-        if lt != TYPE_UNKNOWN { return lt }
+        if tc_tid_is_no_info(lt) == 0 { return lt }
         return rt
     }
 
@@ -12019,7 +12037,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             return operand
         }
         if op == "~" {
-            if operand != TYPE_UNKNOWN && is_integer_type(operand) == 0 {
+            if tc_tid_is_no_info(operand) == 0 && is_integer_type(operand) == 0 {
                 tc_error_at("bitwise '~' requires integer operand, got {type_to_str(operand)}", node)
             }
             return operand
@@ -12127,7 +12145,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         tc_error_at("skip() expects 1 argument (reason: Str), got {arg_count}", node)
                     } else {
                         let arg_t = infer_type(sublist_get(args_sl, 0))
-                        if arg_t != TYPE_UNKNOWN && arg_t != TYPE_STR {
+                        if tc_tid_is_no_info(arg_t) == 0 && arg_t != TYPE_STR {
                             tc_error_at("skip() reason must be Str, got {type_to_str(arg_t)}", node)
                         }
                     }
@@ -12186,7 +12204,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // callable has a structured tid to check against, which is
                 // what makes `let g = c` followed by `g(21)` arity-checked.
                 let local_tid = nr_get_type(fn_name)
-                if local_tid != TYPE_UNKNOWN {
+                if tc_tid_is_no_info(local_tid) == 0 {
                     let call_args_sl = node_args(node)
                     if type_kind(local_tid) == TyKind.Fn {
                         return tc_check_call_against_fn_tid(local_tid, call_args_sl, "function '{fn_name}'", node)
@@ -13582,7 +13600,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // Unknown, ending resolution there.
             if is_builtin_fn(obj_name) != 0 && obj_is_value == 0 {
                 let bs_ret = tc_builtin_static_ret(obj_name, method)
-                if bs_ret != TYPE_UNKNOWN { return bs_ret }
+                if bs_ret >= 0 { return bs_ret }
             }
             // Static method on a builtin/named type: Type.from(x), Type.try_from(x), etc.
             // Trait-impl methods register under `{Type}_{trait}_{method}`; an
@@ -13947,13 +13965,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if else_node != -1 {
             tc_if_value_ctx = incoming
             let else_t = infer_type(else_node)
-            if then_t != TYPE_UNKNOWN && else_t != TYPE_UNKNOWN {
+            if tc_tid_is_no_info(then_t) == 0 && tc_tid_is_no_info(else_t) == 0 {
                 if types_compatible(then_t, else_t) == 0 {
                     tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
                 }
             }
-            if then_t == TYPE_UNKNOWN { return else_t }
-            if else_t == TYPE_UNKNOWN { return then_t }
+            if tc_tid_is_no_info(then_t) != 0 { return else_t }
+            if tc_tid_is_no_info(else_t) != 0 { return then_t }
             return type_merge(then_t, else_t)
         }
         // §2.9: an else-less `if` used as a value has no value on the false path. infer_type
@@ -13987,14 +14005,14 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 tc_if_value_ctx = incoming
                 let arm_t = infer_arm_body(sublist_get(arms_sl, i), scrut_tid)
                 if tc_resolve(arm_t) == TYPE_VOID { completes = 1 }
-                if merged == TYPE_UNKNOWN {
+                if tc_tid_is_no_info(merged) != 0 {
                     merged = arm_t
                 } else {
-                    if arm_t != TYPE_UNKNOWN { merged = type_merge(merged, arm_t) }
+                    if tc_tid_is_no_info(arm_t) == 0 { merged = type_merge(merged, arm_t) }
                 }
                 i = i + 1
             }
-            if completes != 0 && merged != TYPE_UNKNOWN { return TYPE_VOID }
+            if completes != 0 && tc_tid_is_no_info(merged) == 0 { return TYPE_VOID }
             return merged
         }
         return TYPE_UNKNOWN
@@ -14330,8 +14348,8 @@ fn tc_scoped_value_memo(node: Int, depth: Int) -> Int {
         let else_node = node_else_body(node)
         if else_node == -1 { return then_t }
         let else_t = tc_scoped_value_memo(else_node, depth + 1)
-        if then_t < 0 || then_t == TYPE_UNKNOWN { return else_t }
-        if else_t < 0 || else_t == TYPE_UNKNOWN { return then_t }
+        if tc_tid_is_no_info(then_t) != 0 { return else_t }
+        if tc_tid_is_no_info(else_t) != 0 { return then_t }
         if types_compatible(then_t, else_t) == 0 { return -1 }
         return type_merge(then_t, else_t)
     }
@@ -14342,7 +14360,7 @@ fn tc_scoped_value_memo(node: Int, depth: Int) -> Int {
         let mut i = 0
         while i < sublist_length(arms_sl) {
             let arm_t = tc_scoped_value_memo(tc_arm_body_value(sublist_get(arms_sl, i)), depth + 1)
-            if arm_t >= 0 && arm_t != TYPE_UNKNOWN {
+            if tc_tid_is_no_info(arm_t) == 0 {
                 if merged < 0 { merged = arm_t } else { merged = type_merge(merged, arm_t) }
             }
             i = i + 1
@@ -14360,7 +14378,7 @@ fn tc_scoped_value_memo(node: Int, depth: Int) -> Int {
     // user type with a method of the same name is untouched.
     if k == NodeKind.MethodCall {
         let own = tc_lookup_node_tid(node)
-        if own >= 0 && own != TYPE_UNKNOWN { return own }
+        if tc_tid_is_no_info(own) == 0 { return own }
         if node_method(node) == "with_ptr" {
             let recv_t = tc_lookup_node_tid(node_obj(node))
             if recv_t >= 0 && type_kind(recv_t) == TyKind.Bytes {
@@ -14394,7 +14412,7 @@ fn tc_arm_body_value(arm: Int) -> Int {
 // way to guarantee that is one implementation" (tc_check_returned_value).
 fn tc_check_missing_tail_value(body: Int, declared_ret: Int, owner_name: Str, at_node: Int) ! TypeCheck.Report, Diag.Report {
     if node_kind(body) != NodeKind.Block { return }
-    if declared_ret == TYPE_VOID || declared_ret == TYPE_UNKNOWN { return }
+    if declared_ret == TYPE_VOID || tc_tid_is_no_info(declared_ret) != 0 { return }
     if tc_block_tail_stmt(body) == -1 {
         tc_error_at("function '{owner_name}' declared return type {type_to_str(declared_ret)} but body returns {type_to_str(TYPE_VOID)}", at_node)
     }
@@ -14456,7 +14474,7 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
             // Guarded on the resolved type still being UNKNOWN so an explicitly annotated `self`
             // (and any future typed receiver form) keeps its own annotation: the annotation is
             // more specific than the header, and this must not overwrite it.
-            if pname == "self" && ptid_final == TYPE_UNKNOWN && tc_current_self_tid != -1 {
+            if pname == "self" && tc_tid_is_no_info(ptid_final) != 0 && tc_current_self_tid != -1 {
                 ptid_final = tc_current_self_tid
             }
             // An FFI extern fn has an empty body, so it needs no scope binding or argument
@@ -14742,7 +14760,7 @@ fn tc_bind_with_resource(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     // The node's tid is the BINDER's type, not the resource expression's: codegen's only consumer
     // reads it to stamp the binder's ScopeVar, so keeping the resource type here would just move
     // the same wrong answer one phase later.
-    if item < tc_node_tid.len() && bind_tid != TYPE_UNKNOWN {
+    if item < tc_node_tid.len() && tc_tid_is_no_info(bind_tid) == 0 {
         tc_node_tid.set(item, bind_tid)
     }
     nr_define_typed(node_name(item), 0, bind_tid, item)
@@ -14927,10 +14945,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // infer in value context so an else-less `if` tail (no value on the false
                     // path) is rejected.
                     let mut tail_t = tc_infer_value(tail_val)
-                    if tail_t == TYPE_UNKNOWN || tc_tid_has_unknown(tail_t) != 0 {
+                    if tc_tid_is_no_info(tail_t) != 0 || tc_tid_has_unknown(tail_t) != 0 {
                         let memo = tc_scoped_value_memo(tail_val, 0)
-                        if memo >= 0 && memo != TYPE_UNKNOWN {
-                            tail_t = if tail_t == TYPE_UNKNOWN { memo } else { tc_tid_fill_unknowns(tail_t, memo) }
+                        if tc_tid_is_no_info(memo) == 0 {
+                            tail_t = if tc_tid_is_no_info(tail_t) != 0 { memo } else { tc_tid_fill_unknowns(tail_t, memo) }
                         }
                     }
                     tc_check_returned_value(tail_t, tail_val)
@@ -14962,7 +14980,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if val != -1 {
             tc_seed_closure_expected_fn(val, declared_tid)
             let saved_hint = tc_construct_hint
-            if declared_tid != TYPE_UNKNOWN { tc_construct_hint = resolve_alias_tid(declared_tid) }
+            if tc_tid_is_no_info(declared_tid) == 0 { tc_construct_hint = resolve_alias_tid(declared_tid) }
             // A let binding is expression context (§2.9): infer in value context so an else-less
             // `if` as its value (no value on the false path) is rejected regardless of the
             // declared/inferred type, so `let x = if c { 1 }` fails even when x is unused.
@@ -14989,10 +15007,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // Str). The take stays monotone in both cases: a bare UNKNOWN accepts the memo
             // whole, exactly as before, and a partially erased answer takes only the memo's
             // answers for the positions it has no answer of its own for.
-            if inferred_tid == TYPE_UNKNOWN || tc_tid_has_unknown(inferred_tid) != 0 {
+            if tc_tid_is_no_info(inferred_tid) != 0 || tc_tid_has_unknown(inferred_tid) != 0 {
                 let memo = tc_scoped_value_memo(val, 0)
-                if memo >= 0 && memo != TYPE_UNKNOWN {
-                    if inferred_tid == TYPE_UNKNOWN {
+                if tc_tid_is_no_info(memo) == 0 {
+                    if tc_tid_is_no_info(inferred_tid) != 0 {
                         inferred_tid = memo
                     } else {
                         inferred_tid = tc_tid_fill_unknowns(inferred_tid, memo)
@@ -15001,7 +15019,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             }
         }
 
-        if declared_tid != TYPE_UNKNOWN && inferred_tid != TYPE_UNKNOWN {
+        if tc_tid_is_no_info(declared_tid) == 0 && tc_tid_is_no_info(inferred_tid) == 0 {
             if assignment_types_compatible(declared_tid, inferred_tid, val) == 0 {
                 tc_error_at("variable '{vname}': declared type {type_to_str(declared_tid)} but got {type_to_str(inferred_tid)}", node)
             } else {
@@ -15061,7 +15079,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         }
 
         let mut final_tid = declared_tid
-        if final_tid == TYPE_UNKNOWN {
+        if tc_tid_is_no_info(final_tid) != 0 {
             final_tid = inferred_tid
         }
         // Publish the BINDING's type on the let node itself. infer_type memoizes expression
@@ -15075,14 +15093,14 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // collapse, decisions/compiler-type-representation.md Q2).
         //
         // Additive: this slot was the -1 unset sentinel for every let node before now.
-        if node < tc_node_tid.len() && final_tid != TYPE_UNKNOWN {
+        if node < tc_node_tid.len() && tc_tid_is_no_info(final_tid) == 0 {
             tc_node_tid.set(node, final_tid)
         }
         // Record the decl node so the E0301 region-boundary check has a span. Node is
         // used only for that diagnostic in this pass — unused-var warnings are off
         // during inference (nr_warn_unused == 0).
         nr_define_typed(vname, is_mut, final_tid, node)
-        if type_ann == -1 && type_str == "" && final_tid != TYPE_UNKNOWN {
+        if type_ann == -1 && type_str == "" && tc_tid_is_no_info(final_tid) == 0 {
             tc_hints.push(HintEntry { line: node_line(node), col: node_col(node), name: vname, type_str: type_to_str(final_tid), module: nr_current_module })
         }
         let tc_let_pat_sl = node_elements(node)
@@ -15134,7 +15152,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 reject_non_numeric_arith_operand(node_op(node), target_t, node, 0)
                 reject_non_numeric_arith_operand(node_op(node), val_t, node, 0)
             }
-            if target_t != TYPE_UNKNOWN && val_t != TYPE_UNKNOWN {
+            if tc_tid_is_no_info(target_t) == 0 && tc_tid_is_no_info(val_t) == 0 {
                 if assignment_types_compatible(target_t, val_t, val) == 0 {
                     tc_error_at("assignment: cannot assign {type_to_str(val_t)} to {type_to_str(target_t)}", node)
                 } else {
@@ -15200,7 +15218,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // if-tail keeps its own publish path, unaffected here.
         if node_else_body(node) != -1 {
             let own_tid = tc_lookup_node_tid(node)
-            if own_tid < 0 || own_tid == TYPE_UNKNOWN {
+            if tc_tid_is_no_info(own_tid) != 0 {
                 tc_publish_node_tid(node, tc_scoped_value_memo(node, 0))
             }
         }
@@ -15320,7 +15338,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // reaches. That reach is statement forms only, so a match nested in an expression is not
             // covered. Recovery only — gated on the node having no answer of its own.
             let own_tid = tc_lookup_node_tid(node)
-            if own_tid < 0 || own_tid == TYPE_UNKNOWN {
+            if tc_tid_is_no_info(own_tid) != 0 {
                 tc_publish_node_tid(node, tc_scoped_value_memo(node, 0))
             }
 
@@ -15404,7 +15422,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if ap_match != -1 {
             tc_check_body(ap_match)
             let mt = infer_type(ap_match)
-            if mt != TYPE_UNKNOWN && mt != TYPE_STR {
+            if tc_tid_is_no_info(mt) == 0 && mt != TYPE_STR {
                 tc_error_at("assert_panics matching: must be Str, got {type_to_str(mt)}", node)
             }
         }
@@ -15512,7 +15530,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // so those stay unwalked unless this walk reaches them.
             if tc_stmt_value_walks_body(node_kind(val)) { tc_check_body(val) }
         } else {
-            if tc_current_fn_ret != TYPE_VOID && tc_current_fn_ret != TYPE_UNKNOWN {
+            if tc_current_fn_ret != TYPE_VOID && tc_tid_is_no_info(tc_current_fn_ret) == 0 {
                 tc_error_at("function '{tc_current_fn_name}' returns {type_to_str(tc_current_fn_ret)} but bare 'return' has no value", node)
             }
         }
@@ -16272,7 +16290,7 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
                         // blames it queued are discarded with them. The binding is judged
                         // below by its RHS and annotation alone.
                         tc_ud_truncate_pending(saved_blames)
-                        if clean && l_tid != TYPE_UNKNOWN {
+                        if clean && tc_tid_is_no_info(l_tid) == 0 {
                             if tc_tid_has_unbound_metavar(l_tid) != 0 {
                                 tc_ud_judge_binder(node_name(l), l_tid, l)
                             } else {
