@@ -1,0 +1,191 @@
+// error[CannotInferType] (E0301) must be REACHABLE from every binder class, not
+// only from a `let`. The region-boundary check (nr_pop_scope) reported a binding
+// only when its scope entry carried a decl node, and most binder classes — fn
+// param, handler-method param, both closure-param paths, `with` binder,
+// tuple-destructure leaf, struct-pattern field, as-pattern, module `let` —
+// registered with node -1, so the report's early-out dropped them unconditionally.
+//
+// Two distinct facts follow, and this file locks both:
+//
+//   1. A binder that is the SOLE holder of an under-determined type must be
+//      reported. The live exhibit is a higher-order-function closure param: the
+//      element type of an anonymous `[]` receiver reaches only the closure's
+//      param, and no `let` owns it, so before the fix the program compiled with
+//      the element type left open — the forbidden "silently complete an open
+//      variable" (sections/03_types.md §3.4, decisions/under-determined-types.md).
+//
+//   2. An ALIAS binder — a pattern leaf, a struct-pattern field, an as-pattern,
+//      a tuple-destructure leaf — must NOT add a second report when the value's
+//      owning binding is already blamed. E0301 is reported where its repair
+//      attaches (decisions/under-determined-types.md, amended 2026-07-29), and a
+//      pattern binder cannot carry an annotation. So the count is exactly one,
+//      and the blamed name is the owner's.
+
+import compile_test_helpers
+
+// Occurrences of `needle` in `s`. The rows below assert on the COUNT, not just
+// presence: "at least one E0301" is satisfied by a duplicate report as well as
+// by the single correct one, so it cannot distinguish the two.
+fn count_of(s: Str, needle: Str) -> Int {
+    let nlen = needle.len()
+    if nlen == 0 { return 0 }
+    let mut n = 0
+    let mut i = 0
+    while i + nlen <= s.len() {
+        if s.substring(i, nlen) == needle {
+            n = n + 1
+            i = i + nlen
+        } else {
+            i = i + 1
+        }
+    }
+    n
+}
+
+// ── 1. a HOF closure param is the sole holder of an open element type ────────
+// `[]` is anonymous, so no binding owns its element type; `.len()` pins the
+// RESULT to Int, so the outer `let` is fully ground and reports nothing. The
+// closure's own param is the only binder left holding the metavar.
+
+test "a map closure param over an anonymous empty list errors E0301" {
+    let src = "fn main() ! IO \{\n    let n = [].map(fn(x) \{ 1 }).len()\n    io.println(\"\{n}\")\n}\n"
+    compile_test_helpers.expect_compile_error(src, "e0301_hof_map_param", "E0301")
+}
+
+test "a filter closure param over an anonymous empty list errors E0301" {
+    let src = "fn main() ! IO \{\n    let n = [].filter(fn(x) \{ true }).len()\n    io.println(\"\{n}\")\n}\n"
+    compile_test_helpers.expect_compile_error(src, "e0301_hof_filter_param", "E0301")
+}
+
+// fold puts the element at param INDEX 1 (the accumulator is index 0), so this
+// row proves the report is not tied to the first param position.
+
+test "a fold closure element param over an anonymous empty list errors E0301" {
+    let src = "fn main() ! IO \{\n    let n = [].fold(0, fn(acc, x) \{ acc })\n    io.println(\"\{n}\")\n}\n"
+    compile_test_helpers.expect_compile_error(src, "e0301_hof_fold_param", "E0301")
+}
+
+// The blame must name the closure param, and its repair exemplar must be the
+// param's own annotation form — a `let` exemplar would name a repair that does
+// not exist at a closure param.
+
+test "the HOF closure param report names the param and its own repair form" {
+    let src = "fn main() ! IO \{\n    let n = [].map(fn(x) \{ 1 }).len()\n    io.println(\"\{n}\")\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "e0301_hof_param_msg")
+    compile_test_helpers.expect_error(out, "E0301", "hof param reports E0301")
+    compile_test_helpers.expect_contains(out, "cannot infer a type for 'x'", "hof param blames x")
+    compile_test_helpers.expect_contains(out, "fn(x", "hof param help shows the param annotation form")
+}
+
+// ── controls: a pinned HOF receiver must not error ───────────────────────────
+
+test "a map closure param over a determined list does not error" {
+    let src = "fn main() ! IO \{\n    let n = [1, 2].map(fn(x) \{ x + 1 }).len()\n    io.println(\"\{n}\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0301_hof_ok", "E0301")
+}
+
+test "a map closure param over an annotated empty list does not error" {
+    let src = "fn main() ! IO \{\n    let xs: List[Int] = []\n    let n = xs.map(fn(x) \{ x + 1 }).len()\n    io.println(\"\{n}\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0301_hof_ann_ok", "E0301")
+}
+
+// ── 2. alias binders report exactly once, at the owner ──────────────────────
+
+test "a tuple-destructure leaf adds no second report over its owning let" {
+    let src = "fn main() ! IO \{\n    let (a, b) = ([], [])\n    io.println(\"ok\")\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "e0301_tuple_leaf_once")
+    compile_test_helpers.expect_error(out, "E0301", "tuple destructure reports E0301")
+    assert_eq(count_of(out, "E0301"), 1)
+}
+
+test "a struct-pattern field adds no second report over its owning let" {
+    let src = "type Box[T] \{ items: List[T] }\nfn main() ! IO \{\n    let b = Box \{ items: [] }\n    match b \{\n        Box \{ items } => io.println(\"\{items.len()}\")\n    }\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "e0301_struct_field_once")
+    compile_test_helpers.expect_contains(out, "cannot infer a type for 'b'", "struct-pattern field blames the owning let")
+    assert_eq(count_of(out, "E0301"), 1)
+}
+
+test "an as-pattern binder adds no second report over its anonymous scrutinee" {
+    let src = "fn main() ! IO \{\n    match [] \{\n        whole as [] => io.println(\"e\")\n        other => io.println(\"o\")\n    }\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "e0301_as_pattern_once")
+    compile_test_helpers.expect_error(out, "E0301", "as-pattern scrutinee reports E0301")
+    assert_eq(count_of(out, "E0301"), 1)
+}
+
+test "a module let reports exactly once at its own site" {
+    let src = "let g = Map()\nfn main() ! IO \{\n    io.println(\"ok\")\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "e0301_module_let_once")
+    compile_test_helpers.expect_contains(out, "cannot infer a type for 'g'", "module let blames g")
+    assert_eq(count_of(out, "E0301"), 1)
+}
+
+// ── 3. an alias binder must not false-report a value a LATER statement pins ──
+// The arm/loop scope closes mid-walk, so the pattern leaf's own openness is not
+// yet decidable there. Deferring the judgment to the end of the inference pass
+// is what makes the leaf reportable at all without rejecting a pinned value.
+
+test "a match-arm leaf over a named place pinned by a later push does not error" {
+    let src = "fn main() ! IO \{\n    let mut xs = []\n    match xs \{\n        rest => io.println(\"\{rest.len()}\")\n    }\n    xs.push(1)\n    assert_eq(xs.len(), 1)\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0301_arm_leaf_later_pin", "E0301")
+}
+
+// ── 4. classes with no reachable metavar today must stay clean ───────────────
+// A fn param, a handler-method param and a `with` binder are all typed from a
+// declaration (an annotation, or a BlockHandler's `type Context`), so no
+// metavar reaches them. Passing their real node makes them REPORTABLE; it must
+// not make them report.
+
+test "an annotated fn param does not error" {
+    let src = "fn take(xs: List[Int]) -> Int \{ xs.len() }\nfn main() ! IO \{\n    io.println(\"\{take([])}\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0301_fn_param_ok", "E0301")
+}
+
+test "a with binder over a concrete handler context does not error" {
+    let src = "fn main() ! IO \{\n    with ffi.scope() as _s \{\n        io.println(\"ok\")\n    }\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0301_with_binder_ok", "E0301")
+}
+
+// ── 5. a destructuring binder must not false-report either ──────────────────
+// A `for (a, b)` binder over an element type that is still open cannot decompose
+// at the pattern, so the leaves take metavars INSIDE the scrutinee's own type. A
+// later statement that pins the iterable then pins the leaves with it. Handing each
+// leaf a disconnected metavar instead made the leaf unpinnable by construction and
+// rejected a program whose element type is determined.
+
+test "a for-destructure leaf pinned by a later push does not error" {
+    let src = "fn main() ! IO \{\n    let mut xs = []\n    for (a, b) in xs \{ io.println(\"\{a}-\{b}\") }\n    xs.push((1, \"s\"))\n    assert_eq(xs.len(), 1)\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0301_for_destructure_later_pin", "E0301")
+}
+
+// With no later pin there is nothing to solve the leaves, so both report — one per
+// leaf, because each element of the tuple is a separate under-determination.
+
+test "a for-destructure over an anonymous empty list errors per leaf" {
+    let src = "fn main() ! IO \{\n    for (a, b) in [] \{ io.println(\"\{a}-\{b}\") }\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "e0301_for_destructure_anon")
+    compile_test_helpers.expect_error(out, "E0301", "for-destructure over [] reports E0301")
+    assert_eq(count_of(out, "E0301"), 2)
+}
+
+// ── 6. the help must name a repair that attaches at the blamed span ─────────
+// A pattern binder carries no annotation of its own, so quoting `let a: T = ...`
+// at a tuple leaf would prescribe a repair the user cannot write there.
+
+test "a pattern binder help does not quote a let annotation" {
+    let src = "fn main() ! IO \{\n    for x in [] \{ io.println(\"\{x}\") }\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "e0301_pattern_help_form")
+    compile_test_helpers.expect_error(out, "E0301", "for binder over [] reports E0301")
+    compile_test_helpers.expect_contains(out, "a pattern binder takes no annotation of its own", "pattern binder help names the value, not a let")
+}
+
+// ── 7. a discarded speculative read queues no blame ─────────────────────────
+// The module-global pass infers an initializer only to learn whether the read is
+// clean, and throws that read's diagnostics away. A deferred blame minted inside
+// such a read must be thrown away with them, or a discarded read reports an error
+// the pass decided not to trust. The binding itself is still judged by its own
+// tid, which is what the `let g = Map()` row above locks.
+
+test "a discarded speculative module-initializer read reports no E0301" {
+    let src = "fn helper(x: Int) -> Int \{ x }\nlet g = helper(1, 2) + (match [].get(0) \{ Some(v) => 1  None => 0 })\nfn main() ! IO \{\n    io.println(\"\{g}\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0301_speculative_read_no_blame", "E0301")
+}
