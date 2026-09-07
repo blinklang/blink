@@ -17,6 +17,7 @@ import codegen_types.{
     tp_get_kind, tp_get_sname,
     scope_vars, push_scope, pop_scope, set_var, set_var_closure, set_var_struct, set_var_ty, get_var_tp, get_var_ty, get_var_ctype, is_scope_var,
     set_var_option_from_struct_tag, set_var_result_from_struct_tag, set_set_elem_type, stamp_list_elem_from_list_tid, closure_lit_param_tid,
+    stamp_binder_or_scalar_from_tid,
     tid_spells_struct,
     fn_regs, fn_regs_idx, var_enums, mut_captured_vars,
     closure_captures, closure_cap_infos, closure_lit_cap_idx, closure_param_names,
@@ -26,7 +27,7 @@ import codegen_types.{
     closure_lit_ret_c, closure_lit_ret_ct, closure_lit_param_c, closure_hint_c, closure_ret_mono_stem, capture_cell_c_type, capture_ct, capture_sname,
     resolve_tuple_ann, tuple_c_name_from_ann,
     append_ev_arg, fn_node_has_effects,
-    cg_closure_counter, cg_closure_defs, cg_closure_promoter_defs, cg_closure_param_type_hint, cg_closure_param_type_hint_tid,
+    cg_closure_counter, cg_closure_defs, cg_closure_promoter_defs, cg_closure_param_type_hint_tid,
     cg_fn_shim_emitted,
     cg_closure_cap_start, cg_closure_cap_count,
     cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_ret, cg_current_fn_option_inner, cg_in_test_body,
@@ -823,7 +824,6 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     closure_lit_cap_idx.insert(node, closure_cap_infos.len() - 1)
 
     // Build C parameter list: __self first if captures, then user params
-    let saved_param_hint = cg_closure_param_type_hint
     let saved_param_hint_tid = cg_closure_param_type_hint_tid
     let mut params_c = "const blink_closure* __self"
     if params_sl != -1 && sublist_length(params_sl) > 0 {
@@ -840,15 +840,13 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                 // An unannotated param takes its per-position type from the closure's own Fn tid
                 // (fold's Int accumulator, distinct from the list element) — this leads, so a
                 // position-blind element hint no longer mistypes a param the HOF supplies
-                // differently. The call-site element hint is the fallback for a slot the tid
-                // cannot name; its own tid still leads its flat CT (c_type_str has no struct arm,
-                // so a struct hint spelled `void p` — illegal C). Paired with the cast below.
+                // differently. The call-site element tid is the fallback for a slot the closure's
+                // own tid cannot name. Paired with the cast below.
                 let lit_c = closure_lit_param_c(node, i)
                 if lit_c != "" {
                     params_c = params_c.concat("{lit_c} {pname}")
-                } else if hint_tid_c != "" || (cg_closure_param_type_hint >= 0 && cg_closure_param_type_hint != CT_VOID) {
-                    let hint_c = if hint_tid_c != "" { hint_tid_c } else { c_type_str(cg_closure_param_type_hint) }
-                    params_c = params_c.concat("{hint_c} {pname}")
+                } else if hint_tid_c != "" {
+                    params_c = params_c.concat("{hint_tid_c} {pname}")
                 } else {
                     params_c = params_c.concat("{c_type_str(type_from_name(ptype))} {pname}")
                 }
@@ -915,8 +913,19 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                     let sig_str = build_closure_sig_from_type_ann(ta)
                     set_var_closure(pname, sig_str, tc_lookup_node_tid(p))
                 }
-            } else if ptype == "" && saved_param_hint >= 0 && saved_param_hint != CT_VOID {
-                set_var(pname, saved_param_hint, 1)
+            } else if ptype == "" {
+                // An unannotated param's ScopeVar takes its per-position type from the closure's
+                // own Fn tid, the same producer the signature line and the fn-ptr cast spell
+                // from, so the declaration and the body agree. It is the ONLY channel here: a
+                // param the context typed (a call argument against an fn-typed formal, an
+                // fn-typed `let`) has no annotation to fall back on, and an untyped var makes its
+                // body read the receiver back as void.
+                if !stamp_binder_or_scalar_from_tid(closure_lit_param_tid(node, i), pname, 1) {
+                    // The receiver's element tid, for the slot the closure's own Fn tid cannot
+                    // name. The signature line and the fn-ptr cast fall back to the same hint,
+                    // so all three stay spelled by one producer.
+                    let _ = stamp_binder_or_scalar_from_tid(saved_param_hint_tid, pname, 1)
+                }
             } else if type_from_name(ptype) == CT_OPTION {
                 // The param binds as an Option carrying its inner from the annotation, so
                 // a body `match x { Some(v) => ... }` decodes v.
@@ -1162,8 +1171,8 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                 let sp_lit_c = closure_lit_param_c(node, si)
                 if sp_lit_c != "" {
                     sig_params = sig_params.concat(sp_lit_c)
-                } else if sp_hint_tid_c != "" || (saved_param_hint >= 0 && saved_param_hint != CT_VOID) {
-                    sig_params = sig_params.concat(if sp_hint_tid_c != "" { sp_hint_tid_c } else { c_type_str(saved_param_hint) })
+                } else if sp_hint_tid_c != "" {
+                    sig_params = sig_params.concat(sp_hint_tid_c)
                 } else {
                     sig_params = sig_params.concat(c_type_str(type_from_name(sptype)))
                 }
@@ -1198,7 +1207,6 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         }
     }
     expr_closure_sig = "{sig_ret_str}(*)({sig_params})"
-    cg_closure_param_type_hint = -1
     cg_closure_param_type_hint_tid = -1
 
     let mut slot_descs: List[Str] = []

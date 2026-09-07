@@ -266,6 +266,12 @@ type FnSigEntry {
 }
 let mut fnsig_pool: List[FnSigEntry] = []
 let mut fnsig_param_list: List[Int] = []
+// Flat side-table PARALLEL to fnsig_param_list (same index, same length): each parameter's
+// declared NAME, or "" for an intrinsic. A keyword argument names its parameter, so without
+// this the only pairing available here is positional — and codegen reorders by name
+// (reorder_named_args), so a reordered call was checked against one signature and emitted
+// against another.
+let mut fnsig_param_names: List[Str] = []
 let mut fnsig_type_param_names: List[Str] = []
 // Flat side-table PARALLEL to fnsig_type_param_names (same index, same length):
 // 1 iff that type param is RETURN-ONLY — named by the fn's return annotation and by
@@ -821,7 +827,7 @@ pub let mut tc_hints: List[HintEntry] = []
 let mut tc_symbol_module: Map[Str, Str] = Map()
 let mut tc_used_modules: Map[Str, Int] = Map()
 
-// The type of every top-level `let`, keyed "{module}.{name}", so a
+// The DECLARATION NODE of every top-level `let`, keyed "{module}.{name}", so a
 // module-QUALIFIED access can be resolved. Top-level lets are also defined by
 // bare name (nr_define_typed, below), which is why the bare form inside the
 // declaring module was always typed; the qualified form had nothing to read.
@@ -832,7 +838,18 @@ let mut tc_used_modules: Map[Str, Int] = Map()
 // module makes the lookup immune to that, and the key is the module the QUALIFIER
 // resolves to (tc_qualifier_to_module_or_self), not the bare qualifier, so an
 // aliased or dotted import resolves the same way.
-pub let mut tc_module_let_tid: Map[Str, Int] = Map()
+//
+// It maps to the NODE, not to a type: the binding's type lives on the `let` node
+// like every other node's does, so this table cannot hold a second, drifting copy
+// of it. Both readers — the qualified-access arm below and codegen's
+// tc_top_level_let_tid — go from the node to tc_lookup_node_tid.
+let mut tc_module_let_decl: Map[Str, Int] = Map()
+
+// The `let` node a module-qualified name declares, or -1 when no module registered it.
+// Callers read the binding's type off that node.
+pub fn tc_module_let_decl_node(module_name: Str, name: Str) -> Int {
+    tc_module_let_decl.get("{module_name}.{name}") ?? -1
+}
 
 // Prelude modules (underscore form, e.g. "std_num") and the set of *free
 // function* names they export. The prelude provides compiler-known
@@ -3180,6 +3197,17 @@ fn is_int_literal_node(node: Int) -> Int {
     0
 }
 
+// The parameter index a keyword argument names, or -1. Starts at self_offset so a method's
+// implicit receiver slot cannot be named.
+fn tc_fnsig_param_index_by_name(param_start: Int, param_count: Int, self_offset: Int, label: Str) -> Int {
+    let mut k = self_offset
+    while k < param_count {
+        if (fnsig_param_names.get(param_start + k) ?? "") == label { return k }
+        k = k + 1
+    }
+    -1
+}
+
 // Validate call args against a fnsig's param types (type only, no arity).
 // `self_offset` skips leading implicit params: 0 for free functions, 1 for
 // methods whose fnsig carries `self` as param 0 (so explicit arg `i` aligns to
@@ -3195,11 +3223,18 @@ fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int) ! Ty
     let n = sublist_length(args_sl)
     let mut i = 0
     while i < n {
-        let pidx = i + self_offset
-        if pidx < param_count {
+        let arg_node = sublist_get(args_sl, i)
+        let mut pidx = i + self_offset
+        if node_kind(arg_node) == NodeKind.NamedArg {
+            // A keyword argument names its parameter, and codegen reorders by that name, so
+            // this check has to follow the name too. -1 means no such parameter, which
+            // codegen reports as InvalidKeywordArg; skipping leaves that one error standing.
+            pidx = tc_fnsig_param_index_by_name(param_start, param_count, self_offset, node_name(arg_node))
+        }
+        if pidx >= 0 && pidx < param_count {
             let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
             if ptid != TYPE_UNKNOWN {
-                let arg_node = sublist_get(args_sl, i)
+                tc_seed_closure_expected_fn(arg_node, ptid)
                 let saved_hint = tc_construct_hint
                 tc_construct_hint = resolve_alias_tid(ptid)
                 let arg_t = infer_type(arg_node)
@@ -3321,6 +3356,7 @@ fn register_intrinsic_fn_sig(key: Str, params: List[Int], ret: Int) {
     let mut i = 0
     while i < params.len() {
         fnsig_param_list.push(params.get(i).unwrap())
+        fnsig_param_names.push("")
         i = i + 1
     }
     fnsig_map.insert(key, fnsig_pool.len())
@@ -3653,17 +3689,84 @@ fn tc_check_closure_body_against_own_ret(cls: Int) ! TypeCheck.Resolve, TypeChec
     tc_current_fn_ret = prev_fn_ret
 }
 
-// Type-check the BODY of a closure with params bound to the types the HOF supplies
-// (`p0_t`/`p1_t`, -1 = absent). Unannotated params would otherwise bind to TYPE_UNKNOWN, so a
-// wrong body (e.g. `Str` param used as `Int`) leaks past typecheck to the C compiler. When a
-// param IS explicitly annotated we bind the declared type instead — this preserves Part A's
-// annotation validation and never contradicts it. The body walk itself — including installing
-// the closure's own declared return and the tc_in_closure_depth bump — is shared with
-// tc_check_body's Closure arm via tc_check_closure_body_against_own_ret: this is the second of
-// the two entry points into a closure body (the HOF path).
-fn check_closure_body(cls: Int, p0_t: Int, p1_t: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+// The per-position param types of a structured TyKind.Fn tid, in declaration order.
+// Empty when the tid is absent or is not a Fn, which is how "the context supplies no
+// signature" is spelled — a caller then hints nothing rather than hinting a wrong type.
+fn tc_fn_tid_param_hints(fn_tid: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    if fn_tid < 0 { return out }
+    let r = tc_tid_resolved(fn_tid)
+    if tc_tid_kind(r) != TyKind.Fn { return out }
+    // Child 0 of a Fn is its RETURN; the params start at 1 (tc_tid_child).
+    let nparams = tc_tid_child_count(r) - 1
+    let mut i = 0
+    while i < nparams {
+        let p = tc_tid_child(r, i + 1)
+        out.push(if p >= 0 { p } else { TYPE_UNKNOWN })
+        i = i + 1
+    }
+    out
+}
+
+// The RETURN of a structured TyKind.Fn tid, or -1 when the tid is absent or not a Fn.
+fn tc_fn_tid_ret(fn_tid: Int) -> Int {
+    if fn_tid < 0 { return -1 }
+    let r = tc_tid_resolved(fn_tid)
+    if tc_tid_kind(r) != TyKind.Fn { return -1 }
+    tc_tid_child(r, 0)
+}
+
+// A closure literal in a position whose type the context DECLARES — a call argument against
+// an fn-typed param, a `let` with an `fn(A, B) -> R` annotation — is where the expected
+// signature enters. The closure node is the only place both the inference walk and the body
+// walk can read it from, so the declared type is published there: infer_type's Closure arm
+// re-mints from the declaration alone (UNKNOWN params, a Void default return) and keeps
+// whichever of the two is more specific, so this seed survives that re-mint.
+fn tc_seed_closure_expected_fn(arg0: Int, expected: Int) {
+    if arg0 == -1 || expected < 0 { return }
+    if tc_tid_kind(tc_tid_resolved(expected)) != TyKind.Fn { return }
+    // A keyword argument wraps its value; the caller has already paired it with the
+    // parameter it NAMES, so the tid here is the right one to publish.
+    let mut a = arg0
+    if node_kind(a) == NodeKind.NamedArg { a = node_value(a) }
+    if a == -1 { return }
+    if node_kind(a) != NodeKind.Closure { return }
+    // A generic formal (`f: fn(T) -> U`) names type parameters this call has not
+    // substituted. Binding a param to a bare typevar cannot be solved later — a typevar is
+    // invisible to the metavar machinery — so it would reach monomorphization unsolved.
+    if tc_fn_tid_is_concrete(expected) == 0 { return }
+    tc_publish_node_tid(a, expected)
+}
+
+// Does every part of this Fn tid name a real type? A bare typevar anywhere means the
+// signature belongs to a generic that this call site has not substituted yet.
+fn tc_fn_tid_is_concrete(fn_tid: Int) -> Int {
+    let r = tc_tid_resolved(fn_tid)
+    let n = tc_tid_child_count(r)
+    let mut i = 0
+    while i < n {
+        if tc_tid_has_bare_typevar(tc_tid_child(r, i)) != 0 { return 0 }
+        i = i + 1
+    }
+    1
+}
+
+// Type-check the BODY of a closure with its params bound to the signature the CONTEXT
+// expects (`exp_fn`, a TyKind.Fn tid, or -1 when no context supplies one). Unannotated
+// params would otherwise bind to TYPE_UNKNOWN, so a wrong body (e.g. `Str` param used as
+// `Int`) leaks past typecheck to the C compiler. When a param IS explicitly annotated we
+// bind the declared type instead — this preserves Part A's annotation validation and never
+// contradicts it. The body walk itself — including installing the closure's own declared
+// return and the tc_in_closure_depth bump — is shared with tc_check_body's Closure arm via
+// tc_check_closure_body_against_own_ret.
+//
+// Hints are read off `exp_fn` per POSITION with no special-casing of index 0 and 1: the
+// ladder that hard-coded those two positions dropped every param from index 2 on, which
+// bound it to Void and emitted `void a` as a C parameter.
+fn check_closure_body(cls: Int, exp_fn: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if cls == -1 || node_kind(cls) != NodeKind.Closure { return }
     nr_push_scope()
+    let hints = tc_fn_tid_param_hints(exp_fn)
     let params_sl = node_params(cls)
     let mut param_types: List[Int] = []
     if params_sl != -1 {
@@ -3672,19 +3775,33 @@ fn check_closure_body(cls: Int, p0_t: Int, p1_t: Int) ! TypeCheck.Resolve, TypeC
         while i < nparams {
             let pi = sublist_get(params_sl, i)
             let decl = resolve_param_type(pi)
-            let hint = if i == 0 { p0_t } else { if i == 1 { p1_t } else { TYPE_UNKNOWN } }
-            let bind = if decl != TYPE_UNKNOWN { decl } else { hint }
+            let hint = hints.get(i) ?? TYPE_UNKNOWN
+            let mut bind = if decl != TYPE_UNKNOWN { decl } else { hint }
+            // Neither an annotation nor the context chose this param's type. TYPE_UNKNOWN
+            // unifies with anything and codegen erases it to `void`, so bind a fresh
+            // metavar: a use in the body can still pin it, and one that stays open is
+            // reported as error[CannotInferType] at the param's own span when this scope's
+            // deferred blame is flushed (decisions/under-determined-types.md).
+            if bind < 0 || bind == TYPE_UNKNOWN { bind = make_metavar() }
             nr_define_typed(node_name(pi), 0, bind, pi)
             tc_publish_node_tid(pi, bind)
-            param_types.push(if bind >= 0 { bind } else { TYPE_UNKNOWN })
+            param_types.push(bind)
             i = i + 1
         }
     }
-    // Stamp the closure's Fn tid with the per-position param types the HOF supplies, so
-    // codegen's closure_lit_param_c reads each param off the tid (fold's Int accumulator,
-    // distinct from the element type) instead of the position-blind element hint. The Fn
-    // tid minted during inference left unannotated params UNKNOWN; this overwrites it.
-    tc_publish_node_tid(cls, make_fn_type(tc_closure_declared_ret(cls), param_types))
+    // Stamp the closure's Fn tid with the per-position param types, so codegen's
+    // closure_lit_param_c reads each param off the tid (fold's Int accumulator, distinct
+    // from the element type) instead of the position-blind element hint. The Fn tid minted
+    // during inference left unannotated params UNKNOWN; this overwrites it.
+    //
+    // An omitted `-> R` makes tc_closure_declared_ret answer Void, which is worse than what
+    // the context already knows, so the expected return seeds the stamp there; the
+    // re-stamp below then covers the case where neither said anything.
+    let cls_ret_ann = node_type_ann(cls)
+    let exp_ret = tc_fn_tid_ret(exp_fn)
+    let mut seed_ret = tc_closure_declared_ret(cls)
+    if cls_ret_ann == -1 && exp_ret >= 0 && exp_ret != TYPE_UNKNOWN { seed_ret = exp_ret }
+    tc_publish_node_tid(cls, make_fn_type(seed_ret, param_types))
     tc_check_closure_body_against_own_ret(cls)
     // An unannotated closure carries no `-> T`, so tc_closure_declared_ret answered Void
     // above and the Fn tid returned Void — the HOF then reads an uninitialised
@@ -3696,7 +3813,9 @@ fn check_closure_body(cls: Int, p0_t: Int, p1_t: Int) ! TypeCheck.Resolve, TypeC
     // walk from here, so seed it at 0 — NOT tc_in_closure_depth, an unrelated closure-nesting
     // counter that would shrink the budget to 8 minus the nesting and skip the re-stamp for a
     // HOF closure nested inside another closure body.
-    if node_type_ann(cls) == -1 {
+    // A context that already stated the return (an fn-typed annotation) is authoritative,
+    // so the re-stamp is limited to the case where the seed is still the Void default.
+    if cls_ret_ann == -1 && seed_ret == TYPE_VOID {
         let inferred_ret = tc_closure_body_result_tid(cls, 0)
         if inferred_ret >= 0 {
             tc_publish_node_tid(cls, make_fn_type(inferred_ret, param_types))
@@ -6059,6 +6178,7 @@ fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
                 }
             }
             fnsig_param_list.push(ptid)
+            fnsig_param_names.push(node_name(p))
             count = count + 1
             i = i + 1
         }
@@ -7420,6 +7540,7 @@ fn init_types() ! TypeCheck.Register {
     fnsig_pool.clear()
     fnsig_map.clear()
     fnsig_param_list.clear()
+    fnsig_param_names.clear()
     fnsig_type_param_names.clear()
     fnsig_tparam_ret_only.clear()
     fnsig_tparam_bounds.clear()
@@ -7459,7 +7580,7 @@ fn init_types() ! TypeCheck.Register {
     ffi_struct_type_set.clear()
     ffi_opaque_type_set.clear()
     tc_symbol_module.clear()
-    tc_module_let_tid.clear()
+    tc_module_let_decl.clear()
     tc_prelude_free_fn.clear()
     tc_used_modules.clear()
     tc_hints.clear()
@@ -13360,9 +13481,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // than guessing a type.
             if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 {
                 let qual_mod = tc_qualifier_to_module_or_self(obj_name)
-                match tc_module_let_tid.get("{qual_mod}.{fname}") {
-                    Some(let_tid) => return let_tid
-                    None => {}
+                let qual_decl = tc_module_let_decl_node(qual_mod, fname)
+                if qual_decl != -1 {
+                    let let_tid = tc_lookup_node_tid(qual_decl)
+                    if let_tid >= 0 { return let_tid }
                 }
             }
         }
@@ -14522,6 +14644,15 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         tc_fn_body_block = 0
         nr_push_scope()
         let stmts_sl = node_stmts(node)
+        // The implicit tail of a value-returning fn is a return position, so a closure there
+        // takes its signature from the declared return. The tail compare below runs AFTER the
+        // walk; the seed has to be in hand BEFORE it, because the walk is what checks the body.
+        if is_fn_body != 0 && tc_fn_returns_value() {
+            let seed_tail = tc_block_tail_stmt(node)
+            if seed_tail != -1 {
+                tc_seed_closure_expected_fn(tc_block_tail_value(seed_tail), tc_current_fn_ret)
+            }
+        }
         if stmts_sl != -1 {
             let mut i = 0
             let mut _found_terminal = 0
@@ -14607,6 +14738,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 
         let mut inferred_tid = TYPE_UNKNOWN
         if val != -1 {
+            tc_seed_closure_expected_fn(val, declared_tid)
             let saved_hint = tc_construct_hint
             if declared_tid != TYPE_UNKNOWN { tc_construct_hint = resolve_alias_tid(declared_tid) }
             // A let binding is expression context (§2.9): infer in value context so an else-less
@@ -15073,21 +15205,15 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         return
     }
 
+    // The second of the two entry points into a closure body: a closure the HOF path did not
+    // claim (a call argument to a user function, an fn-typed `let`, a struct-literal field,
+    // an immediately-invoked literal). It used to bind params from their annotations alone
+    // and publish nothing at all on the param nodes, so an unannotated param here was Void.
+    // Both entry points are now the same function, so a param's type and its node stamp
+    // cannot differ by which path reached it. The expected signature is whatever the context
+    // published on this closure node — the empty answer when nothing did.
     if kind == NodeKind.Closure {
-        nr_push_scope()
-        let params_sl = node_params(node)
-        if params_sl != -1 {
-            let mut i = 0
-            while i < sublist_length(params_sl) {
-                let p = sublist_get(params_sl, i)
-                let pname = node_name(p)
-                let ptid = resolve_param_type(p)
-                nr_define_typed(pname, 0, ptid, p)
-                i = i + 1
-            }
-        }
-        tc_check_closure_body_against_own_ret(node)
-        nr_pop_scope()
+        check_closure_body(node, tc_lookup_node_tid(node))
         return
     }
 
@@ -15144,6 +15270,12 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // the returned value is discarded — so it stays legal (plain infer, flag off).
             let returns_value = tc_fn_returns_value()
             if returns_value { tc_construct_hint = resolve_alias_tid(tc_current_fn_ret) }
+            // A closure in return position takes its signature from the declared return, the
+            // same way a call argument takes it from the formal. Seeded before the value is
+            // inferred and walked, which is where the closure body reads it. Inside a closure
+            // body tc_current_fn_ret still names the ENCLOSING fn, so seeding there would
+            // publish another function's signature on this closure.
+            if returns_value && tc_in_closure_depth == 0 { tc_seed_closure_expected_fn(val, tc_current_fn_ret) }
             let val_t = if returns_value { tc_infer_value(val) } else { infer_type(val) }
             tc_construct_hint = saved_hint
             // Shared with the implicit tail — see tc_check_returned_value for why each
@@ -15181,16 +15313,19 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // The argument the List-HOF path walks itself, so the generic walk below does not
         // report its contents a second time.
         let mut hof_arg = -1
-        if type_kind(obj_t) == TyKind.List {
+        // The eager (List) and lazy (Iterator) worlds share these HOFs, so both must hand the
+        // closure its element type. Only the eager half did, so a lazy `xs.into_iter().map(fn(x)
+        // { .. })` left its param with no type at all — now an error, not a silent Void.
+        if type_kind(obj_t) == TyKind.List || type_kind(obj_t) == TyKind.Iterator {
             let method = node_method(node)
-            let elem = ty_pool.get(obj_t).unwrap().inner1
+            let elem = tc_tid_iter_elem(obj_t)
             if is_elem_closure_hof(method) != 0 {
-                check_closure_body(closure_arg_at(args_sl, 0), elem, -1)
+                check_closure_body(closure_arg_at(args_sl, 0), make_fn_type(TYPE_UNKNOWN, [elem]))
                 hof_arg = 0
             } else if method == "fold" {
                 if args_sl != -1 && sublist_length(args_sl) >= 2 {
                     let acc_t = infer_type(sublist_get(args_sl, 0))
-                    check_closure_body(sublist_get(args_sl, 1), acc_t, elem)
+                    check_closure_body(sublist_get(args_sl, 1), make_fn_type(TYPE_UNKNOWN, [acc_t, elem]))
                     hof_arg = 1
                 }
             }
@@ -15204,7 +15339,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // closure's return tid publish faithfully. An annotated param keeps its own type
         // (check_closure_body prefers the declared type over this hint).
         if type_kind(obj_t) == TyKind.Bytes && node_method(node) == "with_ptr" {
-            check_closure_body(closure_arg_at(args_sl, 0), make_ptr_type(TYPE_U8), -1)
+            check_closure_body(closure_arg_at(args_sl, 0), make_fn_type(TYPE_UNKNOWN, [make_ptr_type(TYPE_U8)]))
             hof_arg = 0
         }
         // "Only List has closure-taking HOFs" is true of the STDLIB and false of the
@@ -15788,16 +15923,18 @@ fn tc_check_test_block(tb: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
 
 // ── Phase 2: Top-level driver ───────────────────────────────────────
 
-// Record a module-level let's tid on both spellings from one site so they
-// cannot drift: the bare name in the nr scope, and the module-qualified key
-// (`m.x`). The qualified key is kept only for a known tid; an UNKNOWN binding
-// still needs its bare name in scope so a body that reads it resolves.
+// Record a module-level let from one site: its tid on the `let` node, its bare name
+// in the nr scope, and the module-qualified key (`m.x`) pointing back at that same
+// node. One tid, one place — a qualified read resolves the node here and then reads
+// the node's tid, so the two spellings cannot name different types. An UNKNOWN
+// binding publishes no tid (tc_publish_node_tid declines it) but still needs both
+// spellings registered so a body that reads it resolves.
 fn tc_register_module_let_tid(l: Int, l_tid: Int) {
     nr_define_typed(node_name(l), node_is_mut(l), l_tid, l)
     tc_publish_node_tid(l, l_tid)
     let l_mod_key = node_module(l)
-    if l_mod_key != "" && l_tid != TYPE_UNKNOWN {
-        tc_module_let_tid.insert("{l_mod_key}.{node_name(l)}", l_tid)
+    if l_mod_key != "" {
+        tc_module_let_decl.insert("{l_mod_key}.{node_name(l)}", l)
     }
 }
 

@@ -1,0 +1,69 @@
+// An unannotated closure parameter takes its type from the signature the CONTEXT
+// expects, at every position — not just positions 0 and 1. The hint ladder covered
+// index 0 and 1 only, and the only other closure-body path supplied no hint at all,
+// so `hof(fn(a, b, c) { ... })` bound all three params to Void and emitted
+// `static void __closure_0(..., void a, void b, void c)`.
+//
+// RED before the fix: every program below either reported `.len` on type Void or
+// failed C compilation with "'void' must be the only parameter and unnamed".
+
+import compile_test_helpers
+
+fn cpi_apply3(f: fn(Int, Str, Bool) -> Int) -> Int {
+    f(7, "abcd", true)
+}
+
+fn cpi_apply4(f: fn(Int, Str, Bool, Float) -> Int) -> Int {
+    f(2, "xy", false, 3.5)
+}
+
+// The expected signature reaches the closure through a call ARGUMENT position.
+test "a closure argument infers its params at index 0, 1 and 2" {
+    let n = cpi_apply3(fn(a, b, c) { if c { a + b.len() } else { a } })
+    assert_eq(n, 11)
+}
+
+test "a closure argument infers a param at index 3" {
+    let n = cpi_apply4(fn(a, b, c, d) { if c { 0 } else { a + b.len() + (if d > 1.0 { 100 } else { 0 }) } })
+    assert_eq(n, 104)
+}
+
+// The expected signature reaches the closure through the fn-typed ANNOTATION on a
+// `let` — the second closure-body path, which published nothing on its param nodes.
+test "a closure bound to an fn-typed let infers all of its params" {
+    let f: fn(Int, Str, Bool) -> Int = fn(a, b, c) { if c { a + b.len() } else { a } }
+    assert_eq(f(3, "zz", true), 5)
+}
+
+// A method's declared param carries the expected signature the same way a free
+// function's does.
+trait CpiRun {
+    fn run(self, f: fn(Int, Str, Bool) -> Int) -> Int
+}
+
+type CpiRunner { base: Int }
+
+impl CpiRun for CpiRunner {
+    fn run(self, f: fn(Int, Str, Bool) -> Int) -> Int {
+        f(self.base, "qq", true)
+    }
+}
+
+test "a closure passed to a method infers all of its params" {
+    let r = CpiRunner { base: 10 }
+    assert_eq(r.run(fn(a, b, c) { if c { a + b.len() } else { a } }), 12)
+}
+
+// An explicit annotation still wins over the context's hint, so a partially
+// annotated parameter list keeps its own types.
+test "an annotated param keeps its declared type beside inferred neighbours" {
+    let n = cpi_apply3(fn(a, b: Str, c) { if c { a + b.len() } else { a } })
+    assert_eq(n, 11)
+}
+
+// No context supplies a signature, so nothing can choose these param types. That is
+// error[CannotInferType] (E0301), never a silent Void.
+test "an unannotated closure param with no expected signature errors E0301" {
+    let src = "fn main() ! IO \{\n    let g = fn(zq) \{ 1 }\n    assert_eq(g(1), 1)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "cpi_no_hint_e0301", "E0301")
+}
