@@ -122,11 +122,23 @@ let mut ntd_table_only: Int = 0
 let mut ntd_untided: Int = 0
 let mut ntd_details: Int = 0
 
+// Exact per-kind census of the two buckets Stage 2 has to act on (UNTIDED and
+// MISS-IN-CTX), keyed by the already-rendered row text so the report needs no
+// key parsing. The detail lines below sample at most diff_detail_cap rows per
+// compile, which cannot say how a bucket splits across node kinds; this can.
+// The site names WHICH chokepoint read the node, so a kind that only ever
+// arrives at one of them names the codegen caller to delete.
+let mut ntd_bucket: Map[Str, Int] = Map()
+
 // Per-compile cap on the detail lines of the two soft categories, so one file
 // cannot crowd out the rest of the census. Both totals lines stay exact.
 // MISMATCH and TABLE-ONLY are never capped: they must be 0, and a capped line is
 // a divergence with no address to act on.
 let diff_detail_cap: Int = 20
+
+// UNTIDED details are capped per census ROW, not per compile: at most this many
+// line:col samples for each (kind, chokepoint) pair.
+let untided_detail_cap: Int = 2
 
 fn mono_diff_gate() -> Int {
     let g = env.var("BLINK_MONO_DIFF") ?? ""
@@ -142,26 +154,36 @@ pub fn mono_node_tid_diff_on() -> Int {
 
 // Tally one chokepoint read. `table` is node_tid_for_key's answer (-1 = no entry),
 // `formula` the pre-table recompute; `base` is the instance context codegen read
-// under (-1 = outside any mono instance).
-pub fn node_tid_diff_record(base: Int, node: Int, table: Int, formula: Int) {
+// under (-1 = outside any mono instance); `site` names the chokepoint that asked.
+pub fn node_tid_diff_record(site: Str, base: Int, node: Int, table: Int, formula: Int) {
     if table < 0 {
         if formula < 0 {
             ntd_untided = ntd_untided + 1
+            // Per-ROW cap rather than a per-compile one: UNTIDED is dominated by a
+            // few huge rows, and a shared cap would spend every line on those and
+            // leave the small rows with no address at all.
+            if ntd_bucket_add("UNTIDED", site, node) <= untided_detail_cap {
+                ntd_detail("UNTIDED", site, node, table, formula)
+            }
             return
         }
         ntd_miss = ntd_miss + 1
         if base >= 0 {
             ntd_miss_in_ctx = ntd_miss_in_ctx + 1
+            // Row counted, but the per-compile cap is kept here rather than the
+            // per-row one UNTIDED uses: this bucket is small enough that 20 lines
+            // already address every row, and Stage 2 reads those existing lines.
+            let _row = ntd_bucket_add("MISS-IN-CTX", site, node)
             if ntd_details < diff_detail_cap {
                 ntd_details = ntd_details + 1
-                ntd_detail("MISS-IN-CTX", node, table, formula)
+                ntd_detail("MISS-IN-CTX", site, node, table, formula)
             }
         }
         return
     }
     if formula < 0 {
         ntd_table_only = ntd_table_only + 1
-        ntd_detail("TABLE-ONLY", node, table, formula)
+        ntd_detail("TABLE-ONLY", site, node, table, formula)
         return
     }
     if table == formula {
@@ -169,18 +191,39 @@ pub fn node_tid_diff_record(base: Int, node: Int, table: Int, formula: Int) {
         return
     }
     ntd_mismatch = ntd_mismatch + 1
-    ntd_detail("MISMATCH", node, table, formula)
+    ntd_detail("MISMATCH", site, node, table, formula)
+}
+
+// One census row per (bucket, node kind, chokepoint). Returns the row's new
+// count, which is also how the UNTIDED detail lines ration themselves: the first
+// few reads of each row carry a line:col, the rest are counted only.
+fn ntd_bucket_add(tag: Str, site: Str, node: Int) -> Int {
+    let key = "tag={tag} kind={node_kind_name(node_kind(node))} site={site}"
+    let n = (ntd_bucket.get(key) ?? 0) + 1
+    ntd_bucket.insert(key, n)
+    n
+}
+
+fn ntd_report_buckets() {
+    let ks = ntd_bucket.keys()
+    let mut i = 0
+    while i < ks.len() {
+        let k = ks.get(i).unwrap()
+        let n = ntd_bucket.get(k) ?? 0
+        io.eprintln("NODE-TID-DIFF BUCKET {k} count={n}")
+        i = i + 1
+    }
 }
 
 // The module goes on the line: a monolith compile walks stdlib and user nodes
 // together, so line:col alone does not name a file.
-fn ntd_detail(tag: Str, node: Int, table: Int, formula: Int) {
+fn ntd_detail(tag: Str, site: Str, node: Int, table: Int, formula: Int) {
     let kind = node_kind_name(node_kind(node))
     let m = node_source_module(node)
     let src_mod = if m == "" { "<unknown>" } else { m }
     let line = node_line(node)
     let col = node_col(node)
-    io.eprintln("NODE-TID-DIFF {tag} kind={kind} at {src_mod}:{line}:{col} node={node} table={table} ({tc_type_str(table)}) formula={formula} ({tc_type_str(formula)})")
+    io.eprintln("NODE-TID-DIFF {tag} kind={kind} site={site} at {src_mod}:{line}:{col} node={node} table={table} ({tc_type_str(table)}) formula={formula} ({tc_type_str(formula)})")
 }
 
 pub fn run_mono_shadow(program: Int) {
@@ -209,6 +252,7 @@ pub fn run_mono_shadow(program: Int) {
     ntd_table_only = 0
     ntd_untided = 0
     ntd_details = 0
+    ntd_bucket = Map()
 
     // mono_phys_base -> find_type_def_node reads cg_program_node. Codegen sets it
     // to the same node later; setting it here is idempotent and lets struct c_names
@@ -309,6 +353,7 @@ pub fn run_mono_diff() -> Int {
     io.eprintln("MONO-DIFF LABEL-DIVERGENT {label_div}")
     io.eprintln("MONO-DIFF TOTAL {total}")
     io.eprintln("NODE-TID-DIFF TOTALS HIT={ntd_hit} MISS={ntd_miss} MISS-IN-CTX={ntd_miss_in_ctx} MISMATCH={ntd_mismatch} TABLE-ONLY={ntd_table_only} UNTIDED={ntd_untided}")
+    ntd_report_buckets()
     total
 }
 
