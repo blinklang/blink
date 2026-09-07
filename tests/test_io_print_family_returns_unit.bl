@@ -1,0 +1,81 @@
+// The io.* print family evaluates to `()`, and typecheck says so.
+//
+// register_ns_intrinsic_sigs deliberately leaves println/print/print_raw/eprintln/
+// eprint/eprint_raw/log UNSIGNED, because their PARAMETER is genuinely open — any
+// Display value — and a parameter claim in that table could only be wrong. That
+// reasoning covers the parameter and not the return: every one of them emits a C
+// statement and yields no value (src/codegen_methods.bl:3231-3259), so the return is
+// settled even though the parameter is not.
+//
+// While the return went unclaimed the whole call fell through to TYPE_UNKNOWN, which is
+// compatible with everything. So `let bad: Int = io.println("a")` passed `blink check`,
+// and `let s: Str = io.eprintln("a")` passed it too and then failed in codegen with
+// "unresolved method '.len' on type Str" — a message about a type the value does not
+// have. `blink check` and `blink build` have to agree, and the phase that knows the
+// call produces nothing is this one.
+
+fn print_diag(tag: Str, src: Str) -> Str {
+    let path = ".tmp/_ioprint_{tag}.bl"
+    write_file(path, src)
+    let args = [path, "/dev/null", "--format", "json"]
+    let result = process_run("build/blinkc", args)
+    let output = "{result.out}{result.err_out}"
+    shell_exec("rm -f {path}")
+    output
+}
+
+fn wrap(body: Str) -> Str {
+    "fn main() \{\n{body}\n\}\n"
+}
+
+test "an Int annotation on io.println is a type error" {
+    let out = print_diag("int", wrap("    let bad: Int = io.println(\"a\")\n    io.println(\"\{bad\}\")"))
+    assert(out.contains("E0300"))
+}
+
+test "a Str annotation on io.eprintln is a type error, not a codegen surprise" {
+    let out = print_diag("str", wrap("    let s: Str = io.eprintln(\"a\")\n    io.println(\"\{s.len()\}\")"))
+    assert(out.contains("E0300"))
+    // The old failure came out of codegen as a claim about Str, which the value is not.
+    assert(out.contains("unresolved method") == false)
+}
+
+test "interpolating the result of io.print reaches the Display gate" {
+    let out = print_diag("disp", wrap("    let x = io.print(\"a\")\n    io.println(\"\{x\}\")"))
+    assert(out.contains("E0523"))
+    assert(out.contains("Void"))
+}
+
+test "the whole family answers unit, not just println" {
+    let out = print_diag("fam", wrap("    let a: Int = io.print(\"a\")\n    io.println(\"\{a\}\")"))
+    assert(out.contains("E0300"))
+    let out2 = print_diag("fam2", wrap("    let b: Int = io.eprint(\"a\")\n    io.println(\"\{b\}\")"))
+    assert(out2.contains("E0300"))
+    let out3 = print_diag("fam3", wrap("    let c: Int = io.log(\"a\")\n    io.println(\"\{c\}\")"))
+    assert(out3.contains("E0300"))
+    let out4 = print_diag("fam4", wrap("    let d: Int = io.print_raw(\"a\")\n    io.println(\"\{d\}\")"))
+    assert(out4.contains("E0300"))
+    let out5 = print_diag("fam5", wrap("    let e: Int = io.eprint_raw(\"a\")\n    io.println(\"\{e\}\")"))
+    assert(out5.contains("E0300"))
+}
+
+// io.debug is LISTED by is_intrinsic_method and emitted by no codegen arm, so it must
+// keep reaching the loud backstop. Answering a type for it would claim a method that
+// cannot be called works.
+test "io.debug still reaches the loud backstop rather than gaining a type" {
+    let out = print_diag("dbg", wrap("    io.debug(\"a\")"))
+    assert(out.contains("E0300") == false)
+}
+
+// The args are still inferred, so a mistake INSIDE a print call is still reported.
+test "an argument error inside a print call is still reported" {
+    let out = print_diag("arg", wrap("    let n = 1\n    io.println(\"\{n.no_such_method()\}\")"))
+    assert(out.contains("E05"))
+}
+
+// Acceptance: ordinary printing works and stays a statement.
+test "ordinary printing still works" {
+    io.println("print family acceptance")
+    io.eprintln("print family acceptance (stderr)")
+    assert(1 == 1)
+}
