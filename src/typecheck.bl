@@ -13444,8 +13444,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     }
 
     if kind == NodeKind.WhileLoop || kind == NodeKind.ForIn || kind == NodeKind.LoopExpr {
-        let body = node_body(node)
-        return infer_loop_return_type(body)
+        let scanned = infer_loop_return_type(node_body(node))
+        // sections/02_syntax.md:597 — a `while`/`loop`/`for` evaluates to `()`. The scan
+        // answers anything else only for the fn-TAIL case, where the loop's `return`s are
+        // what the declared-return compare has to read. -1 is the scan's "no return in
+        // here" answer and is NOT a type, so it becomes the statement type here.
+        if scanned < 0 { return TYPE_VOID }
+        return scanned
     }
 
     if kind == NodeKind.WithBlock {
@@ -13518,14 +13523,27 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     TYPE_UNKNOWN
 }
 
+// Answer the type the `return`s inside a loop body produce, or -1 when there is no
+// `return` in there at all.
+//
+// The two answers are different claims and must not share a spelling: a tail loop with
+// no return evaluates to `()` (sections/02_syntax.md:597), while a tail loop whose
+// return produces `()` is answering for the enclosing fn. TYPE_VOID served as both,
+// so a Void-typed return was skipped as "keep looking" and — worse — every nesting
+// form with no arm here read as an answer instead of as "not found", which rejected a
+// tail loop whose only return sat inside a nested while as returning `()`.
 fn infer_loop_return_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if node == -1 { return TYPE_VOID }
+    if node == -1 { return -1 }
     let kind = node_kind(node)
 
     if kind == NodeKind.Return {
         let rv = infer_type(node_value(node))
-        if rv != TYPE_UNKNOWN { return rv }
-        return tc_current_fn_ret
+        if rv >= 0 && rv != TYPE_UNKNOWN { return rv }
+        // The returned value has no nameable type of its own. The declared return is the
+        // only other statement of what this `return` produces; when that is missing too,
+        // the scan has nothing to report and says so rather than inventing a type.
+        if tc_current_fn_ret >= 0 && tc_current_fn_ret != TYPE_UNKNOWN { return tc_current_fn_ret }
+        return -1
     }
 
     if kind == NodeKind.Block {
@@ -13534,25 +13552,17 @@ fn infer_loop_return_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Repor
             let mut i = 0
             while i < sublist_length(stmts_sl) {
                 let t = infer_loop_return_type(sublist_get(stmts_sl, i))
-                if t != TYPE_VOID {
-                    return t
-                }
+                if t != -1 { return t }
                 i = i + 1
             }
         }
-        return TYPE_VOID
+        return -1
     }
 
     if kind == NodeKind.IfExpr {
         let then_t = infer_loop_return_type(node_then_body(node))
-        if then_t != TYPE_VOID {
-            return then_t
-        }
-        let else_t = infer_loop_return_type(node_else_body(node))
-        if else_t != TYPE_VOID {
-            return else_t
-        }
-        return TYPE_VOID
+        if then_t != -1 { return then_t }
+        return infer_loop_return_type(node_else_body(node))
     }
 
     if kind == NodeKind.MatchExpr {
@@ -13560,18 +13570,31 @@ fn infer_loop_return_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Repor
         if arms_sl != -1 {
             let mut i = 0
             while i < sublist_length(arms_sl) {
-                let arm = sublist_get(arms_sl, i)
-                let t = infer_loop_return_type(node_body(arm))
-                if t != TYPE_VOID {
-                    return t
-                }
+                let t = infer_loop_return_type(node_body(sublist_get(arms_sl, i)))
+                if t != -1 { return t }
                 i = i + 1
             }
         }
-        return TYPE_VOID
+        return -1
     }
 
-    TYPE_VOID
+    // A nested loop, a `with` block and an `async.scope` are all bodies the ENCLOSING
+    // fn's `return`s can sit in, so the scan has to descend them. A closure literal is
+    // deliberately absent: a `return` in a closure body returns from the closure, and
+    // counting it would type the loop from an unrelated signature.
+    if kind == NodeKind.WhileLoop || kind == NodeKind.ForIn || kind == NodeKind.LoopExpr {
+        return infer_loop_return_type(node_body(node))
+    }
+    if kind == NodeKind.WithBlock || kind == NodeKind.AsyncScope {
+        return infer_loop_return_type(node_body(node))
+    }
+    // A block-bearing expression in statement position parses as ExprStmt, so unwrap it
+    // and re-enter, or the arms above never see the form inside.
+    if kind == NodeKind.ExprStmt {
+        return infer_loop_return_type(node_value(node))
+    }
+
+    -1
 }
 
 // ── Phase 2: Type check function bodies ─────────────────────────────

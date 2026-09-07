@@ -1,0 +1,132 @@
+// A `loop`/`while`/`for` in a fn's TAIL position contributes the type of the
+// `return`s inside it, and the scan that finds them must see through every
+// block-bearing form a return can hide in.
+//
+// `while` and `loop` evaluate to `()` and are statements, not expressions
+// (sections/02_syntax.md:597). So the only reason a loop's type is ever
+// anything but `()` is the fn-tail case: `fn f() -> Int { loop { return 3 } }`
+// has the loop as its tail, and the declared-return compare reads the tail's
+// type. The scan therefore has to answer "the type these returns produce",
+// with a separate answer for "there are no returns in here at all" — the two
+// are different claims, and collapsing them onto TYPE_VOID made "found a
+// return of type ()" indistinguishable from "found nothing, keep looking".
+//
+// The rows below are all VALID programs. Each one was rejected with
+// "return value type Void does not match function ... return type Int"
+// because the scan had no arm for the nesting form and read its
+// "found nothing" sentinel as the answer.
+
+fn nested_while() -> Int {
+    loop {
+        while true {
+            return 7
+        }
+    }
+}
+
+fn nested_for() -> Int {
+    loop {
+        for i in [11] {
+            return i
+        }
+    }
+}
+
+fn nested_loop() -> Int {
+    while true {
+        loop {
+            return 13
+        }
+    }
+}
+
+fn nested_with() -> Int {
+    loop {
+        with arena {
+            return 4
+        }
+    }
+}
+
+fn nested_deep(flag: Bool) -> Str {
+    loop {
+        while true {
+            if flag {
+                return "yes"
+            }
+            return "no"
+        }
+    }
+}
+
+test "a return inside a while nested in a tail loop types the loop" {
+    assert(nested_while() == 7)
+}
+
+test "a return inside a for nested in a tail loop types the loop" {
+    assert(nested_for() == 11)
+}
+
+test "a return inside a loop nested in a tail while types the while" {
+    assert(nested_loop() == 13)
+}
+
+test "a return inside a with-block nested in a tail loop types the loop" {
+    assert(nested_with() == 4)
+}
+
+test "the scan reaches a return under loop + while + if" {
+    assert(nested_deep(true) == "yes")
+    assert(nested_deep(false) == "no")
+}
+
+// A closure body's `return` belongs to the CLOSURE, not to the enclosing fn, so
+// the scan must NOT count it. Here the only return that types the loop is the
+// outer one; if the closure's `return 9` were counted the answer would still be
+// Int by luck, so the closure returns a Str to make a wrong count observable as
+// a compile error rather than a silent pass.
+fn closure_return_not_counted() -> Int {
+    loop {
+        let label = fn() -> Str { return "ignored" }
+        if label().len() > 0 {
+            return 21
+        }
+    }
+}
+
+test "a closure's own return does not type the enclosing tail loop" {
+    assert(closure_return_not_counted() == 21)
+}
+
+// A loop with no `return` at all still evaluates to `()`, so a tail loop in a
+// Void fn stays legal and a tail loop in a value-returning fn stays an error.
+// This is the "found nothing" answer, and it must not silently become a type.
+fn void_tail_loop(n: Int) -> Int {
+    let mut total = 0
+    let mut i = 0
+    while i < n {
+        total = total + i
+        i = i + 1
+    }
+    total
+}
+
+test "a returnless while stays a statement evaluating to unit" {
+    assert(void_tail_loop(4) == 6)
+}
+
+fn scan_diag(tag: Str, src: Str) -> Str {
+    let path = ".tmp/_loopscan_{tag}.bl"
+    write_file(path, src)
+    let args = [path, "/dev/null", "--format", "json"]
+    let result = process_run("build/blinkc", args)
+    let output = "{result.out}{result.err_out}"
+    shell_exec("rm -f {path}")
+    output
+}
+
+test "a returnless tail loop in a value fn is still rejected" {
+    let out = scan_diag("noret", "fn f() -> Int \{\n    loop \{\n        break\n    \}\n\}\nfn main() \{ io.println(\"\{f()\}\") \}\n")
+    assert(out.contains("E0300"))
+    assert(out.contains("does not match function 'f' return type Int"))
+}
