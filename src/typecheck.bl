@@ -11550,12 +11550,11 @@ fn infer_arm_body(arm: Int, scrut_tid: Int) -> Int ! TypeCheck.Resolve, TypeChec
     tc_pattern_binding_type = scrut_tid
     tc_check_pattern_types(node_pattern(arm))
     tc_pattern_binding_type = saved_pat
-    let mut r = TYPE_UNKNOWN
-    if node_kind(b) == NodeKind.ExprStmt {
-        r = infer_type(node_value(b))
-    } else {
-        r = infer_type(b)
-    }
+    // Infer the BODY NODE whatever its shape. infer_type answers for the statement kinds a
+    // braceless arm produces (ExprStmt passes through to its value, a control transfer is
+    // Never), so the body node itself is stamped and codegen's divergence read is one path
+    // for the braced and the braceless spelling alike.
+    let r = infer_type(b)
     nr_pop_scope()
     r
 }
@@ -14341,6 +14340,21 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         return -1
     }
 
+    // §3.3: `return`/`break`/`continue` transfers control out of the form that holds it and
+    // reaches nothing after it, so it produces no value and its type is the bottom type. The
+    // rule belongs on the STATEMENT node, not only on a Block that happens to wrap it: a
+    // braceless arm body (`0 => return 100`) IS that statement node, and two spellings of one
+    // program must give one answer.
+    if kind == NodeKind.Return || kind == NodeKind.Break || kind == NodeKind.Continue { return TYPE_NEVER }
+
+    // An expression statement holds exactly the type of the expression it wraps, divergence
+    // included — `0 => env.exit(1)` diverges the same way `{ env.exit(1) }` does. Pass-through
+    // on the value context (§2.9) so the wrapped value keeps this node's consumed-ness.
+    if kind == NodeKind.ExprStmt {
+        tc_if_value_ctx = incoming
+        return infer_type(node_value(node))
+    }
+
     if kind == NodeKind.Block {
         // §3.3: a block whose last statement transfers control out of it produces no value
         // and nothing follows it, so the block IS the bottom type. Typing it by the operand
@@ -14435,11 +14449,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         return fresh
     }
 
-    // Reached only by NodeKind.Unknown placeholder nodes — the value slot of a
-    // diverging match/if arm (`None => return 0`). TYPE_UNKNOWN is the sentinel the
-    // MatchExpr/IfExpr merge reads as "this arm contributes no value type, skip it",
-    // so it must stay TYPE_UNKNOWN here — a metavar would be merged in wrongly, and an
-    // ICE would fire on the many valid diverging-arm matches the compiler itself has.
+    // Reached by the statement kinds with no value of their own — NodeKind.Unknown
+    // placeholders, `let`/`const` bindings, `assert_panics`, `with`-resources. TYPE_UNKNOWN
+    // is the sentinel the MatchExpr/IfExpr merge reads as "this arm contributes no value
+    // type, skip it", so it must stay TYPE_UNKNOWN here — a metavar would be merged in
+    // wrongly, and an ICE would fire on the many valid diverging-arm matches the compiler
+    // itself has.
     TYPE_UNKNOWN
 }
 
@@ -14721,7 +14736,8 @@ fn tc_scoped_value_memo(node: Int, depth: Int) -> Int {
 }
 
 // The value node of a match arm body, or -1 when the body diverges and therefore contributes
-// no type. Mirrors infer_arm_body's ExprStmt unwrap — that is the node the walk memoizes.
+// no type. The by-kind -1 is load-bearing: it keeps tc_check_body's publish off a braceless
+// diverging body, whose own node already carries Never from infer_arm_body.
 fn tc_arm_body_value(arm: Int) -> Int {
     let b = node_body(arm)
     if b == -1 { return -1 }
