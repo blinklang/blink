@@ -2,6 +2,11 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## What's New (v0.53.1)
+
+- **A method that resolves to nothing on a known receiver type is now an error, not a warning.** `xs.iter()` on a `List[Int]`, `"hi".charAt(0)`, or `b.bogus()` on a `Bytes` used to emit `warning[UnknownMethod]: unknown method '...' -- may fail at compile time` and then fail later in the C compiler or at a codegen backstop. Any receiver whose type the front end knows -- the builtin scalars and containers, plus structs and enums, which already errored -- now reports **E0505 UnresolvedMethod** naming both the receiver type and the method, with a "did you mean" suggestion where one is close. The call's type is poisoned, so a declared type over the call does not draw a second, derived error. **W0501 UnknownMethod** survives for the one case that has no type to name: a receiver whose type is still a bare type parameter or an unresolved metavariable at the call.
+- **The `Bytes.set_*_le/be(offset, value)` family type-checks.** All twelve (`set_u16_be` through `set_i64_le`) are pinned by the spec and have been emitted by codegen since the family landed, but the front end did not know the names, so it reported them as unknown methods. They now check their two `Int` arguments and are typed `Result[(), Str]`.
+
 ## Fixes (v0.53.1)
 
 - **`--test-json` per-test status is now `"passed"`, not `"pass"`.** The per-test record's `status` value disagreed with both the summary object's `passed` count key and §8.10's documented wire format. Any external consumer matching the literal string `"pass"` needs updating to `"passed"`; the in-repo test suite has been updated to match.

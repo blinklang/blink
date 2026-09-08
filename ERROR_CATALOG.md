@@ -176,7 +176,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | Name | Code | One-line | Category | Spec ref |
 |------|------|----------|----------|----------|
 | RawBypassesParam | W0310 | `Raw()` bypasses query parameterization | Contracts | §3b.5 |
-| UnknownMethod | W0501 | Method call could not be verified during type checking | Method resolution | §3c.4 |
+| UnknownMethod | W0501 | Method name resolves to nothing and the receiver's type is not known at the call | Method resolution | §3c.4 |
 | IncompleteStateRestore | W0550 | Speculative lookahead saves some but not all written bindings | Mutation analysis | §4.16 |
 | UnrestoredMutation | W0551 | Function writes module-level state without restoring it in a speculative context | Mutation analysis | §4.16 |
 | UnusedVariable | W0600 | Variable declared but never read | Linting | §6 |
@@ -211,10 +211,10 @@ The self-hosting compiler (`src/codegen_types.bl`, `src/codegen_expr.bl`) curren
 | E0509 | QuestionMarkOptionInNonOption | `codegen_expr.bl` — `?` on Option in non-Option function |
 | E0512 | QuestionMarkErrorMismatch | Not yet implemented — requires type checker |
 | E0504 | UndefinedFunction | `typecheck.bl` — name resolution + `codegen_expr.bl` — codegen |
-| E0505 | UnresolvedMethod | `typecheck.bl` — unresolved method on a known struct/enum (primary) + `codegen_methods.bl` — method dispatch (fail-open backstop) |
+| E0505 | UnresolvedMethod | `typecheck.bl` — unresolved method on any receiver whose type is known: struct/enum, and the builtin scalars/containers (primary) + `codegen_methods.bl` — method dispatch (fail-open backstop) |
 | E0506 | UndefinedVariable | `typecheck.bl` — name resolution |
 | E0507 | UnknownType | `typecheck.bl` — name resolution |
-| W0501 | UnknownMethod | `typecheck.bl` — name resolution (warning, may be false positive for struct field closures) |
+| W0501 | UnknownMethod | `typecheck.bl` — name resolution records the call, inference reports it (soft class only: the receiver's type is a bare typevar or unresolved at the call; a KNOWN receiver type is E0505 instead) |
 | E1004 | VersionConflict | `compiler.bl` — lockfile version conflict validation in `ensure_lockfile_loaded()` |
 | E1008 | InvalidModuleAnnotation | `compiler.bl` — @module annotation validation in `load_module()` |
 | E1052 | PackageNotDeclared | `compiler.bl` — Tier 2 stdlib import without blink.toml dependency |

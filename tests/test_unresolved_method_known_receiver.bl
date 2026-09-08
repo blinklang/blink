@@ -1,0 +1,193 @@
+// A method call whose RECEIVER TYPE IS KNOWN and that resolves to nothing is a name
+// error, not a caution. Before this, only a struct/enum receiver reached E0505; a
+// builtin receiver (List, Map, Set, Str, Bytes, scalars) fell through the per-kind
+// dispatch, drew the name-only warning, and travelled to codegen with no type.
+//
+// The soft class the spec still allows is a receiver whose type is NOT known at the
+// call — a bare typevar or an unresolved metavar. Those keep the warning: no type is
+// known there, so no type can be named as lacking the method.
+
+// Every row drives `blink check` (the front end) rather than a full compile: codegen has
+// always carried a fail-open E0505 backstop, so a row asserting on a full compile would go
+// green whether or not the front end reports anything.
+
+import compile_test_helpers
+
+test "an unresolvable method on a List receiver is an error" {
+    let mut s = "fn main() ! IO \{\n"
+    s = s.concat("    let xs = [1, 2, 3]\n")
+    s = s.concat("    let it = xs.iter()\n")
+    s = s.concat("    io.println(\"\{it}\")\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.check_via_cli(s, "unresmeth_list_iter")
+    compile_test_helpers.expect_error(out, "E0505", "List receiver, unresolvable method")
+    compile_test_helpers.expect_contains(out, "unresolved method '.iter' on type List[Int]", "the error names the receiver type and the method")
+}
+
+test "an unresolvable method on a Str receiver is an error" {
+    let mut s = "fn main() ! IO \{\n"
+    s = s.concat("    let x = \"hi\".charAt(0)\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.check_via_cli(s, "unresmeth_str_charat")
+    compile_test_helpers.expect_error(out, "E0505", "Str receiver, unresolvable method")
+    compile_test_helpers.expect_contains(out, "on type Str", "the error names Str as the receiver type")
+}
+
+test "an unresolvable method on a Map receiver is an error" {
+    let mut s = "fn main() ! IO \{\n"
+    s = s.concat("    let mut m = Map()\n")
+    s = s.concat("    m.insert(\"a\", 1)\n")
+    s = s.concat("    let z = m.frobnicate()\n")
+    s = s.concat("    io.println(\"\{z}\")\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.check_via_cli(s, "unresmeth_map")
+    compile_test_helpers.expect_error(out, "E0505", "Map receiver, unresolvable method")
+}
+
+test "a near-miss method name is offered as a suggestion" {
+    let mut s = "fn main() ! IO \{\n"
+    s = s.concat("    let mut xs = [1, 2, 3]\n")
+    s = s.concat("    xs.appned(4)\n")
+    s = s.concat("    io.println(\"\{xs.len()}\")\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.check_via_cli(s, "unresmeth_nearmiss")
+    compile_test_helpers.expect_error(out, "E0505", "near-miss method name is an error")
+    compile_test_helpers.expect_contains(out, "did you mean '.append'", "the near-miss suggestion names the real method")
+}
+
+// The call's type is poisoned after the error, so a declared type over the call does not
+// draw a second, derived error naming a type the program never really had.
+test "the error does not cascade into a second diagnostic" {
+    let mut s = "fn main() ! IO \{\n"
+    s = s.concat("    let xs = [1, 2, 3]\n")
+    s = s.concat("    let it: Str = xs.iter()\n")
+    s = s.concat("    io.println(\"\{it}\")\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.check_via_cli(s, "unresmeth_no_cascade")
+    compile_test_helpers.expect_error(out, "E0505", "declared type over an unresolvable call still errors once")
+    let cascaded = out.contains("TypeError")
+    if cascaded {
+        io.println("FAIL: a second, derived error followed the unresolved method")
+    } else {
+        io.println("PASS: no second error followed the unresolved method")
+    }
+    assert(!cascaded)
+}
+
+// A bare typevar receiver has no known type at the call. Naming it as lacking the method
+// would be a claim the compiler cannot make, so this stays out of E0505.
+test "a bare typevar receiver draws no unresolved-method error" {
+    let mut s = "fn f[T](x: T) ! IO \{\n"
+    s = s.concat("    x.frobnicate()\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() ! IO \{ f(1) }\n")
+    let out = compile_test_helpers.check_via_cli(s, "unresmeth_typevar")
+    let hard = out.contains("E0505")
+    if hard {
+        io.println("FAIL: a bare typevar receiver drew E0505")
+    } else {
+        io.println("PASS: a bare typevar receiver drew no E0505")
+    }
+    assert(!hard)
+}
+
+// A struct receiver already reached E0505; it must keep doing so, and it must now draw
+// exactly one diagnostic rather than a warning followed by the error.
+test "a struct receiver still errors and no longer double-reports" {
+    let mut s = "type Foo \{ a: Int }\n"
+    s = s.concat("fn main() ! IO \{\n")
+    s = s.concat("    let f = Foo \{ a: 1 }\n")
+    s = s.concat("    let x = f.iter()\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.check_via_cli(s, "unresmeth_struct")
+    compile_test_helpers.expect_error(out, "E0505", "struct receiver still errors")
+    let warned = out.contains("W0501")
+    if warned {
+        io.println("FAIL: the struct receiver drew W0501 alongside E0505")
+    } else {
+        io.println("PASS: the struct receiver drew E0505 alone")
+    }
+    assert(!warned)
+}
+
+// Inference visits a call node more than once, and the receiver's type is spelled
+// differently on each visit while its metavars are still being pinned. Reporting on the
+// early visit named `Map[?, ?]` — a type the program never had — and then reported a second
+// time under the pinned spelling, because the duplicate filter keys on the message text.
+// A receiver only counts as known once its type is determined all the way down.
+test "an unresolvable method on a Map receiver is reported exactly once" {
+    let mut s = "fn main() ! IO \{\n"
+    s = s.concat("    let mut m = Map()\n")
+    s = s.concat("    m.insert(\"a\", 1)\n")
+    s = s.concat("    let z = m.frobnicate()\n")
+    s = s.concat("    io.println(\"\{z}\")\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.check_via_cli(s, "unresmeth_map_once")
+    // One JSON record per diagnostic, so the split counts the reports.
+    let reports = out.split("\"code\":\"E0505\"").len() - 1
+    if reports == 1 {
+        io.println("PASS: one call draws one error")
+    } else {
+        io.println("FAIL: one call drew \{reports} errors")
+    }
+    assert(reports == 1)
+    let unpinned = out.contains("Map[?")
+    if unpinned {
+        io.println("FAIL: the error named the receiver's unpinned type")
+    } else {
+        io.println("PASS: the error named the receiver's pinned type")
+    }
+    assert(!unpinned)
+}
+
+// A qualified trait call that the trait does not declare is its own hard report. It must
+// not also collect the soft warning, which would contradict it on the same line.
+test "a qualified trait call missing from the trait draws one report" {
+    let mut s = "type P \{ a: Int }\n"
+    s = s.concat("impl Display for P \{\n")
+    s = s.concat("    fn fmt(self, sb: StringBuilder) \{ sb.write(\"P\") }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() ! IO \{\n")
+    s = s.concat("    let p = P \{ a: 1 }\n")
+    s = s.concat("    io.println(\"\{Display.frobnicate(p)}\")\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.check_via_cli(s, "unresmeth_qualified_trait")
+    compile_test_helpers.expect_error(out, "E0505", "a trait that does not declare the method errors")
+    let warned = out.contains("W0501")
+    if warned {
+        io.println("FAIL: the qualified trait call drew W0501 alongside its error")
+    } else {
+        io.println("PASS: the qualified trait call drew its error alone")
+    }
+    assert(!warned)
+}
+
+// The twelve `Bytes.set_*_le/be` names joined the resolvable set so the spec's in-place
+// writes stop reading as unknown methods. Registering a name without its arity is how the
+// previous hole was made: codegen reads argument 1 unconditionally, so a short call has to
+// be rejected here rather than panicking the compiler later.
+test "Bytes.set_* is resolvable and its arity is checked" {
+    let mut ok_src = "fn main() ! IO \{\n"
+    ok_src = ok_src.concat("    let mut b = Bytes.zeroed(8)\n")
+    ok_src = ok_src.concat("    let r = b.set_u32_le(0, 7)\n")
+    ok_src = ok_src.concat("    io.println(\"\{r.is_ok()}\")\n")
+    ok_src = ok_src.concat("}\n")
+    let ok_out = compile_test_helpers.check_via_cli(ok_src, "unresmeth_bytes_set_ok")
+    let rejected = ok_out.contains("E0505")
+    if rejected {
+        io.println("FAIL: a well-formed Bytes.set_u32_le was reported as unresolvable")
+    } else {
+        io.println("PASS: a well-formed Bytes.set_u32_le resolves")
+    }
+    assert(!rejected)
+
+    let mut bad = "fn main() ! IO \{\n"
+    bad = bad.concat("    let mut b = Bytes.zeroed(8)\n")
+    bad = bad.concat("    let r = b.set_u32_le(0)\n")
+    bad = bad.concat("    io.println(\"\{r.is_ok()}\")\n")
+    bad = bad.concat("}\n")
+    let bad_out = compile_test_helpers.check_via_cli(bad, "unresmeth_bytes_set_arity")
+    compile_test_helpers.expect_contains(bad_out, "expects 2 argument(s), got 1", "a short Bytes.set_* call is rejected at check time")
+}

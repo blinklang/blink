@@ -7751,6 +7751,10 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
 fn init_types() ! TypeCheck.Register {
     ty_pool.clear()
     ty_param_list.clear()
+    // The unresolved-method handoff spans all three phases of one check_types, so it is
+    // cleared here rather than in resolve_names with the registries that feed it.
+    nr_unresolved_method_nodes = []
+    tc_unresolved_method_hard = Map()
     // Load-bearing for the daemon/LSP (long-lived processes, daemon.bl / lsp.bl): a
     // surviving intern map would hand out tids keyed against the PREVIOUS, since-cleared
     // pool on the next check_types() call — out-of-bounds unwrap panic or a silently
@@ -8238,8 +8242,28 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     // Phase 2: Expression type inference
     tc_infer_program(program)
 
+    // Phase 3: whatever Phase 1 found unresolvable and Phase 2 did not report on. The
+    // receiver's type was never known at the call, so no type can be named as lacking the
+    // method — the honest report is the soft one.
+    tc_flush_unresolved_method_warnings()
+
     if trace_mode != "" { trace("typecheck", "done ({tc_errors.len()} errors)") }
     tc_errors.len()
+}
+
+// Report the Phase-1 unresolvable method names that Phase 2 left alone. A receiver whose
+// type is a bare typevar or an unresolved metavar at the call has no type to name, so this
+// stays a warning; every receiver whose type IS known was already reported as E0505.
+fn tc_flush_unresolved_method_warnings() ! Diag.Report {
+    let mut i = 0
+    while i < nr_unresolved_method_nodes.len() {
+        let n = nr_unresolved_method_nodes.get(i).unwrap()
+        if tc_unresolved_method_hard.contains_key(n) == 0 {
+            let m = node_method(n)
+            diag_warn_at("UnknownMethod", UNKNOWN_METHOD, "method '{m}' resolves to nothing, and the receiver's type is not known here", n, "annotate the receiver so the method can be resolved, or correct the method name")
+        }
+        i = i + 1
+    }
 }
 
 // ── User-effect handle name tracking ────────────────────────────────
@@ -9086,6 +9110,22 @@ fn is_builtin_method(name: Str) -> Int {
     if name == "write_u32_le" { return 1 }
     if name == "write_i32_le" { return 1 }
     if name == "write_i64_le" { return 1 }
+    // The `set_*_le/be(off, v)` family — sections/03_types.md:649-655. Codegen has
+    // dispatched all twelve since the family landed (codegen_methods.bl:2784); they were
+    // never added here, so the name-only gate answered "no such method" for a method the
+    // spec pins and the runtime implements.
+    if name == "set_u16_be" { return 1 }
+    if name == "set_u32_be" { return 1 }
+    if name == "set_u64_be" { return 1 }
+    if name == "set_i16_be" { return 1 }
+    if name == "set_i32_be" { return 1 }
+    if name == "set_i64_be" { return 1 }
+    if name == "set_u16_le" { return 1 }
+    if name == "set_u32_le" { return 1 }
+    if name == "set_u64_le" { return 1 }
+    if name == "set_i16_le" { return 1 }
+    if name == "set_i32_le" { return 1 }
+    if name == "set_i64_le" { return 1 }
     // Effect handle methods (io, fs, net, time, async, env)
     if name == "println" { return 1 }
     if name == "print" { return 1 }
@@ -9631,6 +9671,14 @@ let mut nr_impl_type_names: List[Str] = []
 let mut nr_impl_method_names: List[Str] = []
 let mut nr_callable_field_names: List[Str] = []
 
+// Method calls whose NAME resolves nowhere, found in Phase 1. Phase 1 cannot decide the
+// severity: it has no receiver type, and W0501-vs-E0505 turns on exactly that. So it
+// records the node and Phase 2 decides — the nodes it reports as E0505 land in
+// tc_unresolved_method_hard, and whatever is left over is flushed as W0501 once inference
+// is done, which is where the receiver types stop changing.
+let mut nr_unresolved_method_nodes: List[Int] = []
+let mut tc_unresolved_method_hard: Map[Int, Int] = Map()
+
 // `with X as ctx` does not always bind X: for a BlockHandler the binder is what
 // `enter()` returns, i.e. the impl's `type Context`. Resource type name -> Context type name,
 // filled from the same impl walk that fills the method registry below, since that loop already
@@ -9648,6 +9696,14 @@ fn is_callable_field_name(name: Str) -> Int {
     0
 }
 
+// The two registry lists are index-parallel: entry i is the pair (type, method). Every
+// push must go through here, or a reader that walks one list and indexes the other reads
+// past the end.
+fn nr_register_impl_method(type_name: Str, method: Str) {
+    nr_impl_type_names.push(type_name)
+    nr_impl_method_names.push(method)
+}
+
 fn nr_has_impl_method(type_name: Str, method: Str) -> Int {
     let mut i = 0
     while i < nr_impl_type_names.len() {
@@ -9657,6 +9713,162 @@ fn nr_has_impl_method(type_name: Str, method: Str) -> Int {
         i = i + 1
     }
     0
+}
+
+// Does this method NAME resolve to nothing anywhere in the program? A name-level fact,
+// so it holds for every receiver: a name no builtin, no impl, no derive and no callable
+// field supplies cannot be supplied by any type either. Phase 1 records the nodes that
+// answer yes; Phase 2 turns the ones with a KNOWN receiver type into E0505 and leaves the
+// rest as the soft W0501.
+fn nr_method_name_unresolvable(method: Str) -> Int {
+    if is_builtin_method(method) != 0 { return 0 }
+    if is_variant_name(method) != 0 { return 0 }
+    if is_callable_field_name(method) != 0 { return 0 }
+    let mut i = 0
+    while i < nr_impl_method_names.len() {
+        if nr_impl_method_names.get(i).unwrap() == method { return 0 }
+        i = i + 1
+    }
+    1
+}
+
+// The identifier alphabet a near-miss neighbour is drawn from. Method names are
+// lowercase with underscores and the occasional digit.
+fn tc_ident_alphabet() -> Str {
+    "abcdefghijklmnopqrstuvwxyz_0123456789"
+}
+
+// The closest BUILTIN method name one edit away from `method`, or "" when there is none.
+//
+// Generated-and-probed rather than scanned, because is_builtin_method is a name chain, not
+// a list, and cannot be enumerated. Probing it keeps ONE authority for "this builtin method
+// exists"; a second copy of the 170-odd names to scan would drift from it, which is the
+// failure this compiler has already paid for twice. The four edits are tried in order of how
+// likely each is to be the typo the user made: transposition, deletion, substitution,
+// insertion.
+fn tc_builtin_method_edit1(method: Str) -> Str {
+    let n = method.len()
+    // Two characters give too many neighbours for the match to mean anything.
+    if n < 3 { return "" }
+    let mut i = 0
+    while i + 1 < n {
+        let c = method.slice(0, i).concat(method.slice(i + 1, i + 2)).concat(method.slice(i, i + 1)).concat(method.slice(i + 2, n))
+        if is_builtin_method(c) != 0 { return c }
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        let c = method.slice(0, i).concat(method.slice(i + 1, n))
+        if is_builtin_method(c) != 0 { return c }
+        i = i + 1
+    }
+    let alpha = tc_ident_alphabet()
+    let alen = alpha.len()
+    i = 0
+    while i < n {
+        let mut a = 0
+        while a < alen {
+            let c = method.slice(0, i).concat(alpha.slice(a, a + 1)).concat(method.slice(i + 1, n))
+            if is_builtin_method(c) != 0 { return c }
+            a = a + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i <= n {
+        let mut a = 0
+        while a < alen {
+            let c = method.slice(0, i).concat(alpha.slice(a, a + 1)).concat(method.slice(i, n))
+            if is_builtin_method(c) != 0 { return c }
+            a = a + 1
+        }
+        i = i + 1
+    }
+    ""
+}
+
+// Near-miss suggestion for a method the receiver does not have. Candidates come only from
+// the registries that ANSWER method resolution, so a suggestion always names something the
+// compiler would accept on some receiver. Returns "" when nothing is close enough — a
+// far-off name is a missing feature, not a misspelling.
+//
+// A declared type is asked about ITS OWN methods first: `f.dispaly()` on a type with an
+// `impl Display` must suggest that impl's method, not a same-named builtin. The builtin
+// surface is offered only for a builtin receiver, where no impl registry applies.
+fn tc_suggest_method(obj_k: TyKind, tname: Str, method: Str) -> Str {
+    // The registry stores the impl head (`List` for `impl Trait for List[Int]`), while a
+    // builtin receiver reaches here spelled with its arguments, so match on the head.
+    let mut head = tname
+    let br = tname.index_of("[")
+    if br > 0 { head = tname.slice(0, br) }
+    let mut best_dist = -1
+    let mut best_name = ""
+    let mut i = 0
+    while i < nr_impl_type_names.len() {
+        if nr_impl_type_names.get(i).unwrap() == head {
+            let cand = nr_impl_method_names.get(i).unwrap()
+            let d = str_levenshtein(method, cand)
+            if best_dist == -1 || d < best_dist {
+                best_dist = d
+                best_name = cand
+            }
+        }
+        i = i + 1
+    }
+    if best_dist != -1 {
+        let mut threshold = method.len() / 3
+        if threshold < 1 { threshold = 1 }
+        if best_dist <= threshold {
+            if threshold <= 1 || best_dist < threshold { return best_name }
+        }
+    }
+    if obj_k == TyKind.Struct || obj_k == TyKind.Enum { return "" }
+    tc_builtin_method_edit1(method)
+}
+
+// The help line for an unresolved method: the rename note the resolver already carries for
+// a renamed List operation, else the near-miss suggestion, else nothing.
+fn tc_unresolved_method_help(obj_k: TyKind, tname: Str, method: Str) -> Str {
+    if method == "display" {
+        return "add an `impl Display for {tname}` (with `fn fmt(self, sb: StringBuilder)`)"
+    }
+    if obj_k == TyKind.List {
+        let rename = tc_list_rename_help(method)
+        if rename != "" { return rename }
+    }
+    let near = tc_suggest_method(obj_k, tname, method)
+    if near != "" { return "did you mean '.{near}'?" }
+    ""
+}
+
+// A receiver whose type the front end KNOWS. Struct and Enum are absent because their own
+// gate answers them earlier, with the impl registries in hand. Unknown and Typevar are
+// absent because there is no type to name as lacking the method. The rest are absent
+// because their method surface is not modelled here at all (Fn, Handle, Handler, Channel,
+// Ptr, Template, FFIScope), so silence there is honest rather than fail-open.
+fn tc_recv_type_is_known(obj_k: TyKind) -> Int {
+    if obj_k == TyKind.Int || obj_k == TyKind.Float || obj_k == TyKind.Bool { return 1 }
+    if obj_k == TyKind.Str || obj_k == TyKind.Char { return 1 }
+    if obj_k == TyKind.I8 || obj_k == TyKind.I16 || obj_k == TyKind.I32 { return 1 }
+    if obj_k == TyKind.U8 || obj_k == TyKind.U16 || obj_k == TyKind.U32 || obj_k == TyKind.U64 { return 1 }
+    if obj_k == TyKind.List || obj_k == TyKind.Map || obj_k == TyKind.Set { return 1 }
+    if obj_k == TyKind.Bytes || obj_k == TyKind.StringBuilder { return 1 }
+    if obj_k == TyKind.Option || obj_k == TyKind.Result { return 1 }
+    if obj_k == TyKind.Tuple || obj_k == TyKind.Iterator { return 1 }
+    0
+}
+
+// Known KIND is not enough: `Map[?, ?]` before its first insert is a Map, but naming it in a
+// diagnostic names a type the program never had, and inference visits the same node again
+// once the holes are filled — two errors for one call. A receiver counts as known only when
+// its type is determined all the way down, which is also the reading §3c.4 forces: a hole
+// is a type the compiler does not know, so the honest report there is the soft warning.
+fn tc_recv_type_is_determined(obj_k: TyKind, obj_t: Int) -> Int {
+    if tc_recv_type_is_known(obj_k) == 0 { return 0 }
+    if tc_tid_has_unbound_metavar(obj_t) != 0 { return 0 }
+    if tc_tid_has_unknown(obj_t) != 0 { return 0 }
+    if tc_tid_has_bare_typevar(obj_t) != 0 { return 0 }
+    1
 }
 
 // ── Name resolution walker ──────────────────────────────────────────
@@ -9910,16 +10122,14 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
                 let mut j = 0
                 while j < sublist_length(methods_sl) {
                     let m = sublist_get(methods_sl, j)
-                    nr_impl_type_names.push(impl_type)
-                    nr_impl_method_names.push(node_name(m))
+                    nr_register_impl_method(impl_type, node_name(m))
                     j = j + 1
                 }
             }
             // The compiler synthesizes a sealed display() for every Display
             // impl; register it so calls resolve.
             if node_trait_name(im) == "Display" {
-                nr_impl_type_names.push(impl_type)
-                nr_impl_method_names.push("display")
+                nr_register_impl_method(impl_type, "display")
             }
             if node_trait_name(im) == "BlockHandler" {
                 let ctx_sl = node_assoc_types(im)
@@ -9945,16 +10155,17 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
         let mut i = 0
         while i < sublist_length(derive_types_sl) {
             let td = sublist_get(derive_types_sl, i)
-            if type_has_derive(td, "Clone") != 0 { nr_impl_method_names.push("clone") }
-            if type_has_derive(td, "Eq") != 0 { nr_impl_method_names.push("eq") }
+            let dtname = node_name(td)
+            if type_has_derive(td, "Clone") != 0 { nr_register_impl_method(dtname, "clone") }
+            if type_has_derive(td, "Eq") != 0 { nr_register_impl_method(dtname, "eq") }
             if type_has_derive(td, "Ord") != 0 {
-                nr_impl_method_names.push("cmp")
-                nr_impl_method_names.push("eq")
+                nr_register_impl_method(dtname, "cmp")
+                nr_register_impl_method(dtname, "eq")
             }
-            if type_has_derive(td, "Hash") != 0 { nr_impl_method_names.push("hash") }
-            if type_has_derive(td, "Debug") != 0 { nr_impl_method_names.push("debug") }
-            if type_has_derive(td, "Serialize") != 0 { nr_impl_method_names.push("to_json") }
-            if type_has_derive(td, "Deserialize") != 0 { nr_impl_method_names.push("from_json") }
+            if type_has_derive(td, "Hash") != 0 { nr_register_impl_method(dtname, "hash") }
+            if type_has_derive(td, "Debug") != 0 { nr_register_impl_method(dtname, "debug") }
+            if type_has_derive(td, "Serialize") != 0 { nr_register_impl_method(dtname, "to_json") }
+            if type_has_derive(td, "Deserialize") != 0 { nr_register_impl_method(dtname, "from_json") }
             i = i + 1
         }
     }
@@ -10553,7 +10764,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     }
                 }
                 if is_ue_call == 0 {
-                    diag_warn_at("UnknownMethod", UNKNOWN_METHOD, "unknown method '{method_name}' — may fail at compile time", node, "")
+                    // Recorded, not reported. Phase 2 knows the receiver type and turns
+                    // this into E0505 wherever the type is known; the leftovers are
+                    // flushed as W0501 after inference.
+                    nr_unresolved_method_nodes.push(node)
                 }
             }
         }
@@ -13141,6 +13355,16 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 check_builtin_arg(method, 0, TYPE_INT, args_sl, "Bytes")
                 return TYPE_VOID
             }
+            // set_*(off, v) writes IN PLACE at a bounds-checked offset and reports the
+            // bound as an Err, unlike the appending write_* family above.
+            if method == "set_u16_be" || method == "set_u32_be" || method == "set_u64_be" || method == "set_i16_be" || method == "set_i32_be" || method == "set_i64_be" || method == "set_u16_le" || method == "set_u32_le" || method == "set_u64_le" || method == "set_i16_le" || method == "set_i32_le" || method == "set_i64_le" {
+                // Arity before the per-argument types: codegen reads argument 1 unconditionally,
+                // so a short call panics the compiler rather than erroring.
+                check_builtin_arity("Bytes", method, 2, args_sl, node)
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Bytes")
+                check_builtin_arg(method, 1, TYPE_INT, args_sl, "Bytes")
+                return make_result_type(TYPE_VOID, TYPE_STR)
+            }
             if method == "with_ptr" {
                 if args_sl == -1 || sublist_length(args_sl) < 1 { return TYPE_VOID }
                 let cls_node = sublist_get(args_sl, 0)
@@ -13420,13 +13644,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // actionable help; blinkc_main aborts on diag_count > 0 before codegen, so
             // the backstop never re-fires.
             if tc_method_resolvable_on_type(obj_k, tname, method) == 0 {
-                let help = if method == "display" {
-                    "add an `impl Display for {tname}` (with `fn fmt(self, sb: StringBuilder)`)"
-                } else if obj_k == TyKind.List {
-                    tc_list_rename_help(method)
-                } else {
-                    ""
-                }
+                let help = tc_unresolved_method_help(obj_k, tname, method)
+                tc_unresolved_method_hard.insert(node, 1)
                 diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method '.{method}' on type {tname}", node, help)
                 return tc_error_recovery_tid()
             }
@@ -13659,6 +13878,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     if tc_trait_declares_method(obj_name, method) == 0 {
                         let qt_owner = tc_method_trait_names(qt_tname, method)
                         let qt_help = if qt_owner != "" { "'{method}' on {qt_tname} is defined by {qt_owner}" } else { "" }
+                        tc_unresolved_method_hard.insert(node, 1)
                         diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "trait '{obj_name}' does not define method '{method}'", node, qt_help)
                         return tc_error_recovery_tid()
                     }
@@ -13748,6 +13968,21 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 infer_type(sublist_get(mc_args, mci))
                 mci = mci + 1
             }
+        }
+        // The receiver is a BUILTIN type the front end knows, the per-kind dispatch above
+        // did not claim the call, and the method name resolves nowhere in the program. That
+        // is a name error, the same one a struct receiver already draws, and nothing later
+        // can supply the method. Struct and enum receivers never reach here — their own gate
+        // above answers them with the impl registries in hand.
+        //
+        // The poison return is what keeps this to ONE diagnostic: a declared type over the
+        // call unifies with the recovery tid instead of drawing a second, derived error
+        // about a type the program never had.
+        if tc_recv_type_is_determined(obj_k, obj_t) != 0 && nr_method_name_unresolvable(method) != 0 {
+            let mc_tname = type_to_str(obj_t)
+            tc_unresolved_method_hard.insert(node, 1)
+            diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method '.{method}' on type {mc_tname}", node, tc_unresolved_method_help(obj_k, mc_tname, method))
+            return tc_error_recovery_tid()
         }
         // Nothing above claimed this node, so nothing has typed it — an absence.
         return -1
