@@ -4300,6 +4300,15 @@ fn tc_error_at(msg: Str, node_id: Int) ! TypeCheck.Report, Diag.Report {
     diag_error_at("TypeError", TYPE_ERROR, msg, node_id, "")
 }
 
+// Drops every type error recorded after the first `n`. tc_error writes TWO channels, and
+// diag_truncate empties only one of them, so a speculative read that rolls back its diagnostics
+// must roll back this list with them. Otherwise check_types counts errors that nothing printed.
+fn tc_errors_truncate(n: Int) {
+    while tc_errors.len() > n {
+        tc_errors.pop()
+    }
+}
+
 
 // ── Incremental filter API ──────────────────────────────────────────
 
@@ -16530,6 +16539,118 @@ fn tc_register_module_let_tid(l: Int, l_tid: Int) {
     }
 }
 
+// Types an ANNOTATED module-level global's initializer for its node tids alone.
+//
+// The first pass already registered the declared type on the binding, so this walk decides
+// nothing about the binding. It runs so every expression node INSIDE the initializer gets a
+// tid, as an unannotated global's initializer does and as any `let` in a fn body does. Without
+// it, an annotation removed the initializer's types and codegen had nothing to read for
+// `[1, 2]` in `let xs: List[Int] = [1, 2]`.
+//
+// The read is speculative on the same terms as the unannotated pass below: codegen validates a
+// global initializer, not this site (and blinkc stops on diag_count > 0), so this pass rolls
+// back every diagnostic and every under-determined blame the read records.
+//
+// The declared type drives the walk — construct hint, closure expected fn type, and the metavar
+// pin — so `let m: Map[Str, Int] = Map()` records `Map[Str, Int]` on the ctor and not `Map[?, ?]`.
+//
+// @allow: the read is speculative by design and restores the two things it must — the construct
+// hint and the diagnostic channels. What it keeps is the point of the pass: node tids and metavar
+// bindings.
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn tc_stamp_annotated_global_init(l: Int, l_val: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let declared = tc_lookup_node_tid(l)
+    let saved = diag_entry_count()
+    let saved_errors = tc_errors.len()
+    let saved_blames = tc_ud_pending_count()
+    tc_seed_closure_expected_fn(l_val, declared)
+    let saved_hint = tc_construct_hint
+    if tc_tid_is_no_info(declared) == 0 { tc_construct_hint = resolve_alias_tid(declared) }
+    let v_tid = tc_infer_value(l_val)
+    tc_construct_hint = saved_hint
+    // infer_type types a value's shape only, never a body nested in a closure, in a call's
+    // closure argument or in a struct literal's block-valued field — tc_stmt_value_walks_body.
+    tc_check_body(l_val)
+    if tc_tid_is_no_info(declared) == 0 && tc_tid_is_no_info(v_tid) == 0 {
+        // Behind the compare, for the reason the LetBinding arm gives at its own pin: a pin
+        // ahead of the compare can turn a mismatch into a silent success. The compare only
+        // reports through the diagnostics this pass discards, so it gates and nothing more.
+        if assignment_types_compatible(declared, v_tid, l_val) != 0 {
+            if tc_pin_ok_for_declared(l_val, declared) != 0 {
+                tc_pin_tail_ret_generic(declared, v_tid)
+            } else if tc_ifmatch_arms_all_ret_mint(l_val) != 0 {
+                tc_pin_declared_through_ifmatch(declared, l_val)
+            }
+        }
+    }
+    diag_truncate(saved)
+    tc_errors_truncate(saved_errors)
+    tc_ud_truncate_pending(saved_blames)
+}
+
+// Second pass over every global's initializer, in source order. The first pass registered the
+// BINDINGS and typed only an unannotated bare-scalar-literal initializer, so every other global
+// arrives here with its initializer expressions unvisited.
+//
+// An ANNOTATED global keeps the declared type it already carries; the walk serves only the node
+// tids inside the initializer — tc_stamp_annotated_global_init.
+//
+// An UNANNOTATED non-literal global stayed UNKNOWN because a call/ident/variant initializer can
+// name a function or an earlier global, and the first pass had registered neither. Both are
+// registered now, so infer again: a later global that reads an earlier one (`let b = a`) sees a's
+// fresh tid, and codegen spells the declaration from it and not from its flat arm.
+//
+// infer_type both REPORTS and mints metavars, so the read stays contained: this pass rolls back
+// every diagnostic it raises (codegen validates a global initializer, not this site — and blinkc
+// stops on diag_count > 0), and adopts the tid only when the read was clean AND fully ground. An
+// open tid (`[]` -> List[α]) or a read that errored leaves the binding UNKNOWN, as before — this
+// pass only turns UNKNOWN into a concrete tid.
+//
+// A clean but still-open tid is the module-scope form of the region-boundary under-determined
+// case (nr_pop_scope): a top-level binding takes its type at its own site from its RHS and
+// annotation ALONE, so an empty `[]`/`None`/`Channel(n)`/`Map()` that nothing here pins is
+// under-determined -> error[CannotInferType] (E0301). A later cross-scope use (`ch.send(1)` in a
+// fn or test body) is the remote effect the panel rejected, so it cannot supply the type; leaving
+// the binding UNKNOWN would let codegen invent an arbitrary flat carrier — the forbidden "third
+// default state" (decisions/under-determined-types.md; §3.4).
+fn tc_infer_global_initializers(lets_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let mut i = 0
+    while i < sublist_length(lets_sl) {
+        let l = sublist_get(lets_sl, i)
+        let l_val = node_value(l)
+        if l_val != -1 {
+            if node_target(l) != -1 || node_type_name(l) != "" {
+                nr_current_module = node_module(l)
+                tc_stamp_annotated_global_init(l, l_val)
+            } else {
+                let vk = node_kind(l_val)
+                if vk != NodeKind.IntLit && vk != NodeKind.FloatLit && vk != NodeKind.BoolLit && vk != NodeKind.InterpString {
+                    nr_current_module = node_module(l)
+                    let saved = diag_entry_count()
+                    let saved_errors = tc_errors.len()
+                    let saved_blames = tc_ud_pending_count()
+                    let l_tid = infer_type(l_val)
+                    let clean = diag_entry_count() == saved
+                    diag_truncate(saved)
+                    tc_errors_truncate(saved_errors)
+                    // This read is speculative and its diagnostics go away, so the blames it
+                    // recorded go with them. The binding takes its type below from its RHS and
+                    // annotation alone.
+                    tc_ud_truncate_pending(saved_blames)
+                    if clean && tc_tid_is_no_info(l_tid) == 0 {
+                        if tc_tid_has_unbound_metavar(l_tid) != 0 {
+                            tc_ud_judge_binder(node_name(l), l_tid, l)
+                        } else {
+                            tc_register_module_let_tid(l, l_tid)
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
 fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     nr_scope_names = []
     nr_scope_muts = []
@@ -16602,58 +16723,10 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
         }
     }
 
-    // Second pass over unannotated non-literal globals. The first pass left them
-    // UNKNOWN because a call/ident/variant initializer can reference a function or
-    // an earlier global, and neither was registered yet. Both are now, so re-infer
-    // in source order: a later global that reads an earlier one (`let b = a`) sees
-    // a's fresh tid, so codegen spells the declaration from it, not its flat arm.
-    //
-    // infer_type both REPORTS and mints metavars, so the read is contained: any
-    // diagnostic it raises here is rolled back (a global initializer is validated
-    // in codegen, not at this site — and blinkc aborts on diag_count > 0), and the
-    // tid is adopted only when the read was clean AND fully ground. An open tid
-    // (`[]` -> List[α]) or a read that errored leaves the binding UNKNOWN, exactly
-    // as before — this pass only ever turns UNKNOWN into a concrete tid.
-    //
-    // A clean but still-open tid is the module-scope twin of the region-boundary
-    // under-determined case (nr_pop_scope): a top-level binding is judged at its own
-    // site by its RHS and annotation ALONE, so an empty `[]`/`None`/`Channel(n)`/`Map()`
-    // that nothing here pins is genuinely under-determined → error[CannotInferType]
-    // (E0301). A later cross-scope use (`ch.send(1)` in a fn or test body) is the
-    // action-at-a-distance the panel rejected, so it cannot rescue the binding; leaving
-    // it UNKNOWN would let codegen fabricate an arbitrary flat carrier — the forbidden
-    // "third default state" (decisions/under-determined-types.md, 8vcj2c; §3.4).
+    // This pass walks every module-global initializer, once the globals and the function
+    // names are both registered — see tc_infer_global_initializers.
     if lets_sl != -1 {
-        let mut i = 0
-        while i < sublist_length(lets_sl) {
-            let l = sublist_get(lets_sl, i)
-            if node_target(l) == -1 && node_type_name(l) == "" {
-                let l_val = node_value(l)
-                if l_val != -1 {
-                    let vk = node_kind(l_val)
-                    if vk != NodeKind.IntLit && vk != NodeKind.FloatLit && vk != NodeKind.BoolLit && vk != NodeKind.InterpString {
-                        nr_current_module = node_module(l)
-                        let saved = diag_entry_count()
-                        let saved_blames = tc_ud_pending_count()
-                        let l_tid = infer_type(l_val)
-                        let clean = diag_entry_count() == saved
-                        diag_truncate(saved)
-                        // This read is speculative and its diagnostics are discarded, so the
-                        // blames it queued are discarded with them. The binding is judged
-                        // below by its RHS and annotation alone.
-                        tc_ud_truncate_pending(saved_blames)
-                        if clean && tc_tid_is_no_info(l_tid) == 0 {
-                            if tc_tid_has_unbound_metavar(l_tid) != 0 {
-                                tc_ud_judge_binder(node_name(l), l_tid, l)
-                            } else {
-                                tc_register_module_let_tid(l, l_tid)
-                            }
-                        }
-                    }
-                }
-            }
-            i = i + 1
-        }
+        tc_infer_global_initializers(lets_sl)
     }
 
     // Type check each function body (skip unaffected when incremental filter active)

@@ -8,6 +8,11 @@
 #                every read falls back: HIT = 0 and MISS > 0. This is the
 #                negative check — it pins the documented gap Stage 2 must close
 #                rather than a hook that fakes a failure.
+#   globals.bl   one ANNOTATED module-level global per initializer shape. An
+#                annotation must not remove the initializer's type: typecheck
+#                walks it either way, so no node in this file may reach codegen
+#                without a tid. The fixture must also build clean, or the census
+#                measures a run that stopped early.
 set -u
 cd "$(dirname "$0")/.."
 BLINK=${BLINK:-build/blink}
@@ -41,6 +46,44 @@ fn add(a: Int, b: Int) -> Int { a + b }
 fn main() {
     let s = add(1, 2)
     io.println("{s}")
+}
+EOF
+
+cat > "$WORK/globals.bl" <<'EOF'
+type Pt { x: Int, y: Int }
+type GBox[T] { v: T }
+type GWrap[T] { One(T)  Two }
+
+let g_list: List[Int] = [1, 2, 3]
+let g_empty: List[Int] = []
+let g_map: Map[Str, Int] = Map()
+let g_set: Set[Int] = Set()
+let g_struct: Pt = Pt { x: 1, y: 2 }
+let g_tuple: (Int, Str) = (7, "hi")
+let g_closure: fn(Int) -> Int = fn(n: Int) -> Int { n + 1 }
+let g_alias: List[Int] = g_list
+let g_none: Option[Int] = None
+let g_some: Option[Int] = Some(3)
+let g_res: Result[Int, Str] = Ok(1)
+let g_nested: List[Map[Str, Int]] = [Map()]
+let g_deep: Map[Str, List[Int]] = Map()
+let g_box: GBox[Int] = GBox { v: 1 }
+let g_wrap: GWrap[Int] = GWrap.One(2)
+pub let g_pub: List[Str] = ["a"]
+let mut g_mut: List[Int] = [9]
+const g_const: List[Int] = [4, 5]
+pub const g_const_pub: Str = "k"
+
+fn main() {
+    let a = g_list.len() + g_empty.len() + g_map.len() + g_set.len()
+    let b = a + g_struct.x + g_alias.len() + g_pub.len() + g_mut.len() + g_nested.len() + g_deep.len() + g_box.v
+    let f = g_closure
+    let c = f(b) + g_tuple.0
+    let d = match g_none { Some(v) => v  None => c }
+    let e = match g_some { Some(v) => v + d  None => d }
+    let h = match g_res { Ok(v) => v + e  Err(_) => e }
+    let k = match g_wrap { One(v) => v + h  Two => h }
+    let m = g_const.len() + k + g_const_pub.len()
 }
 EOF
 
@@ -88,6 +131,34 @@ fi
 echo "plain:   $plain"
 check "plain HIT == 0"    "$(field "$plain" HIT)"  eq 0
 check "plain MISS > 0"    "$(field "$plain" MISS)" gt 0
+
+# Run this fixture directly rather than through totals_line, which drops the exit
+# status. A build that stops early still prints a TOTALS line, so the census would
+# read clean for a file the compiler never finished.
+BLINK_MONO_DIFF=1 "$BLINK" build --emit c "$WORK/globals.bl" -o "$WORK/out.c" \
+  > "$WORK/stdout.txt" 2> "$WORK/err.txt"
+globals_status=$?
+check "globals fixture builds clean" "$globals_status" eq 0
+if [ "$globals_status" != "0" ]; then
+  /usr/bin/grep -E '^(error|warning)' "$WORK/err.txt" | head -5
+fi
+globals=$(/usr/bin/grep -E '^NODE-TID-DIFF TOTALS' "$WORK/err.txt" | tail -1)
+if [ -z "$globals" ]; then
+  echo "FAIL globals fixture: no 'NODE-TID-DIFF TOTALS' line under BLINK_MONO_DIFF=1"
+  tail -5 "$WORK/err.txt"
+  exit 1
+fi
+echo "globals: $globals"
+check "globals MISMATCH == 0"   "$(field "$globals" MISMATCH)"   eq 0
+check "globals TABLE-ONLY == 0" "$(field "$globals" TABLE-ONLY)" eq 0
+# UNTIDED counts the nodes for which neither channel holds a tid. The whole point of
+# the fixture is that an annotated global leaves none, so assert the TOTALS figure and
+# not a per-bucket slice: `site` names the codegen chokepoint that asked, not the node
+# class, so filtering on it hides whole node kinds.
+check "globals UNTIDED == 0" "$(field "$globals" UNTIDED)" eq 0
+if [ "$(field "$globals" UNTIDED)" != "0" ]; then
+  /usr/bin/grep -E '^NODE-TID-DIFF (BUCKET tag=UNTIDED|UNTIDED)' "$WORK/err.txt" | head -20
+fi
 
 # The gate must be off by default. Cleared explicitly, so an exported
 # BLINK_MONO_DIFF in the caller's environment cannot fail this check.
