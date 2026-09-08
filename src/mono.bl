@@ -5,6 +5,7 @@ import parser.{
     node_obj, node_iterable, node_params, node_args, node_stmts, node_arms,
     node_fields, node_elements, node_handlers, node_type_params, node_target,
     node_captures, node_method, sublist_get, sublist_length, has_annotation,
+    node_value_child_ids,
     node_methods, node_trait_name, node_impl_binders, node_recv_type_args,
     node_line, node_col, node_source_module,
 }
@@ -756,8 +757,9 @@ fn record_node_tid(node: Int) {
 }
 
 // Structural walk over an expression/statement tree, discovering generic-fn calls
-// and struct literals. Mirrors escape.bl's walk_expr dispatch. Does not descend
-// into callee bodies (those are enqueued and drained separately).
+// and struct literals. Child descent comes from ast.node_value_child_ids, so a new
+// NodeKind cannot be silently unreachable here. Does not descend into callee bodies
+// (those are enqueued and drained separately under their own mono context).
 fn walk(node: Int) {
     if node == -1 { return }
     record_node_tid(node)
@@ -766,173 +768,21 @@ fn walk(node: Int) {
 
     if kind == NodeKind.Call {
         handle_call(node)
-        walk(node_left(node))
-        walk_list(node_args(node))
-        return
-    }
-    if kind == NodeKind.StructLit {
-        // The instance this literal constructs is enqueued by handle_node_instance
-        // above (off the node's own tid); here we only descend into field values.
-        walk_fields(node_fields(node))
-        return
     }
     if kind == NodeKind.MethodCall {
         handle_method_call(node)
         handle_poly_impl_call(node)
         handle_list_hof_call(node)
-        walk(node_obj(node))
-        walk_list(node_args(node))
-        return
     }
-    if kind == NodeKind.Assignment {
-        walk(node_value(node))
-        walk_assign_target(node)
-        return
-    }
-    if kind == NodeKind.CompoundAssign {
-        walk(node_value(node))
-        walk_assign_target(node)
-        return
-    }
-    if kind == NodeKind.Closure {
-        walk(node_body(node))
-        return
-    }
-    if kind == NodeKind.BinOp {
-        walk(node_left(node))
-        walk(node_right(node))
-        return
-    }
-    if kind == NodeKind.UnaryOp {
-        walk(node_left(node))
-        return
-    }
-    if kind == NodeKind.IfExpr {
-        walk(node_condition(node))
-        walk(node_then_body(node))
-        walk(node_else_body(node))
-        return
-    }
-    if kind == NodeKind.MatchExpr {
-        walk(node_scrutinee(node))
-        let arms_sl = node_arms(node)
-        if arms_sl != -1 {
-            let mut ai = 0
-            while ai < sublist_length(arms_sl) {
-                let arm = sublist_get(arms_sl, ai)
-                walk(node_guard(arm))
-                walk(node_body(arm))
-                ai = ai + 1
-            }
-        }
-        return
-    }
-    if kind == NodeKind.Block {
-        walk_list(node_stmts(node))
-        return
-    }
-    if kind == NodeKind.LetBinding {
-        walk(node_value(node))
-        return
-    }
-    if kind == NodeKind.ExprStmt {
-        walk(node_value(node))
-        return
-    }
-    if kind == NodeKind.Return {
-        walk(node_value(node))
-        return
-    }
-    if kind == NodeKind.ForIn {
-        walk(node_iterable(node))
-        walk(node_body(node))
-        return
-    }
-    if kind == NodeKind.WhileLoop {
-        walk(node_condition(node))
-        walk(node_body(node))
-        return
-    }
-    if kind == NodeKind.LoopExpr {
-        walk(node_body(node))
-        return
-    }
-    if kind == NodeKind.FieldAccess {
-        walk(node_obj(node))
-        return
-    }
-    if kind == NodeKind.IndexExpr {
-        walk(node_obj(node))
-        walk(node_right(node))
-        return
-    }
-    if kind == NodeKind.TupleLit {
-        walk_list(node_elements(node))
-        return
-    }
-    if kind == NodeKind.ListLit {
-        walk_list(node_elements(node))
-        return
-    }
-    if kind == NodeKind.SpreadExpr {
-        walk(node_value(node))
-        return
-    }
-    if kind == NodeKind.InterpString {
-        walk_list(node_elements(node))
-        return
-    }
-    if kind == NodeKind.RangeLit {
-        walk(node_left(node))
-        walk(node_right(node))
-        return
-    }
-    if kind == NodeKind.WithBlock {
-        let handlers_sl = node_handlers(node)
-        if handlers_sl != -1 {
-            let mut hi = 0
-            while hi < sublist_length(handlers_sl) {
-                walk(sublist_get(handlers_sl, hi))
-                hi = hi + 1
-            }
-        }
-        walk(node_body(node))
-        return
-    }
-    if kind == NodeKind.WithResource {
-        // `with EXPR as name`: the resource initializer lives on node_value and
-        // may itself be a generic call or a struct literal.
-        walk(node_value(node))
-        return
-    }
-}
 
-fn walk_assign_target(node: Int) {
-    // An lvalue like `make_box[Int]().field = x` or `container[i].field = x`
-    // carries a generic call/struct-lit in the target's object subtree; the RHS
-    // walk alone misses it (mirrors escape.bl walk_assignment).
-    let target = node_target(node)
-    if target == -1 { return }
-    let tk = node_kind(target)
-    if tk == NodeKind.FieldAccess || tk == NodeKind.IndexExpr {
-        walk(node_obj(target))
-    }
-}
-
-fn walk_list(sl: Int) {
-    if sl == -1 { return }
+    let kids = node_value_child_ids(node)
     let mut i = 0
-    while i < sublist_length(sl) {
-        walk(sublist_get(sl, i))
-        i = i + 1
-    }
-}
-
-fn walk_fields(sl: Int) {
-    if sl == -1 { return }
-    let mut i = 0
-    while i < sublist_length(sl) {
-        walk(node_value(sublist_get(sl, i)))
+    while i < kids.len() {
+        let kid = kids.get(i).unwrap()
+        // A declaration body belongs to its own instance context, not to this one.
+        if kid != -1 && node_kind(kid) != NodeKind.FnDef {
+            walk(kid)
+        }
         i = i + 1
     }
 }

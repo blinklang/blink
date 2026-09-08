@@ -73,6 +73,11 @@ compute_rows() {
   eg=$(rg -o '^pub let mut (expr_[a-z_0-9]+)' -r '$1' "$root/src/codegen_expr.bl" 2>/dev/null | paste -sd'|')
   if [ -n "$eg" ]; then eg_count=$(cnt "\\b(${eg})\\b" "$cg"); else eg_count=0; fi
 
+  # The exemption list is counted INSIDE its own function, so the row cannot be zeroed by
+  # rewriting the ifs as a match, nor inflated by the same idiom appearing elsewhere.
+  exempt_count=$(awk '/^(pub )?fn tc_kind_unstamped_allowed\(/{f=1} f{print} f&&/^\}/{exit}' $tc 2>/dev/null |
+    rg -o '\bNodeKind\.[A-Za-z]+\b' | wc -l | tr -d ' ')
+
   cat <<ROWS
 ct_refs $(cnt '\bCT_[A-Z_]+\b' "$cg")
 type_from_name $(cnt '\btype_from_name(_tag)?\(' "$cg")
@@ -89,6 +94,7 @@ return_type_unknown $(cnt 'return TYPE_UNKNOWN' "$tc")
 str_keyed_type_facts $(( $(cnt '^let mut [a-z_]+: Map\[Str' "$tc") + $(cnt '^pub let mut [a-z_]+: Map\[Str' "$tc") ))
 downgrade_calls $(cnt '\btc_tid_[a-z_]*_(ct|ct_resolved|struct|struct_head|struct_mono|tuple)\(' "$cg")
 br_ids_in_source $(( $(cnt '\bbr [0-9a-z]{6}\b' "$allbl $tf") + $(cnt '\b(g3sba0|qf1vzx|0kpmac)\b' "$allbl $tf") ))
+stamp_exempt_kinds $exempt_count
 ROWS
 }
 
@@ -122,6 +128,7 @@ fi
 
 [ -f "$baseline" ] || { echo "ratchet: no baseline; run scripts/ratchet.sh --update"; exit 1; }
 
+head1_tracked=""
 if [ -n "${RATCHET_HEAD1_DIR:-}" ]; then
   head1_root="$RATCHET_HEAD1_DIR"
   check_root "$head1_root"
@@ -130,6 +137,13 @@ elif git rev-parse --verify --quiet "${head1_ref}^{commit}" >/dev/null 2>&1; the
   head1_root=.tmp/ratchet_head1
   materialize_ref "$head1_ref" "$head1_root"
   rows_head1=$(compute_rows "$head1_root")
+  # Which rows that commit defined at all. A row added by the commit under
+  # test has no previous-commit count: computing it over the older files
+  # answers 0 for a metric nobody tracked, which would fail the new row for
+  # the fact of existing. Its baseline, written in the same commit, is its
+  # first reference.
+  head1_tracked=$(git show "${head1_ref}:scripts/ratchet.sh" 2>/dev/null |
+    sed -n 's/^\([a-z_][a-z_0-9]*\) \$.*/\1/p' | tr '\n' ' ')
 else
   # $head1_ref does not resolve (shallow clone, or a repo with too few
   # commits for HEAD~1 to exist). Skip the previous-commit comparison for
@@ -148,6 +162,12 @@ printf '%s\n' "$rows_now" | while read -r name now; do
   [ -z "$base" ] && base=0
   h1=$(printf '%s\n' "$rows_head1" | awk -v n="$name" '$1==n{print $2}')
   [ -z "$h1" ] && h1=0
+  if [ -n "$head1_tracked" ]; then
+    case " $head1_tracked " in
+      *" $name "*) ;;
+      *) h1="$now" ;;
+    esac
+  fi
   mark=""
   [ "$now" -gt "$base" ] && mark="$mark UP(baseline)"
   [ "$now" -gt "$h1" ] && mark="$mark UP(head~1)"

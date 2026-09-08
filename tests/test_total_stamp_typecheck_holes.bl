@@ -1,0 +1,652 @@
+// The post-inference total-stamp pass asserts that every node whose kind DENOTES a value
+// carries a concrete tid. Each shape below reached the end of type checking with nodes that
+// carried nothing, for a different reason, and each is asserted here at the tid channel
+// rather than through emitted C so the claim is about the channel and not about codegen's
+// syntactic fallbacks.
+//
+// `diag_count == 0` after check_types is the whole claim for a clean source: no ordinary
+// error, and no NodeCarriesNoType internal error either.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_tid_is_concrete, tc_stamp_program, tc_kind_unstamped_allowed}
+import parser.{nodes, node_kind, node_name, node_value, node_body, node_condition, node_unclaimed_child_field, node_value_child_ids}
+import ast.{NodeKind, AstNode, nk_bridge_gap, nk_of, nk_is_typed}
+import diagnostics.{diag_count, diag_ice_count, diag_reset}
+import std.io
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import codegen_expr
+
+fn stamp_probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    // The prelude imports std modules, and this binary is not the CLI: nothing has told the
+    // resolver where lib/std lives. Register the embedded copies, the same source the CLI
+    // compiles against, so the probe does not depend on where the test binary was built.
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    // The stamp claim rests on the enumerator seeing every child, so every probe below also
+    // asserts that no node in the program it compiled holds a child field the table omits.
+    assert(unclaimed_child_fields() == 0)
+    diag_count + diag_ice_count
+}
+
+fn unclaimed_child_fields() -> Int {
+    let mut bad = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if node_unclaimed_child_field(i) != "" { bad = bad + 1 }
+        i = i + 1
+    }
+    bad
+}
+
+fn node_tid_by(kind: NodeKind, nm: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == kind && node_name(i) == nm { return tc_lookup_node_tid(i) }
+        i = i + 1
+    }
+    -1
+}
+
+// The value expression of the `let` binding named `nm`, or -1 when there is no such binding.
+fn let_value_of(nm: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.LetBinding && node_name(i) == nm { return node_value(i) }
+        i = i + 1
+    }
+    -1
+}
+
+// The id of the first node of `kind`, or -1 when the program holds none.
+fn first_node_of(kind: NodeKind) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == kind { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// The default expression of the struct field named `fname`, or -1 when it has none.
+fn field_default_of(fname: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.TypeField && node_name(i) == fname { return node_condition(i) }
+        i = i + 1
+    }
+    -1
+}
+
+// Phase 5's own predicate over one subtree: a node that denotes a value, is not on the
+// exemption list, and carries no concrete type. Counted here without the cascade filter, so a
+// hole below the root is reported by the count even when the pass reports only the frontier.
+fn untyped_value_nodes_in(root: Int) -> Int {
+    if root == -1 { return -1 }
+    let mut bad = 0
+    let mut stack: List[Int] = [root]
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap()
+        let k = nk_of(node_kind(n))
+        if nk_is_typed(k) != 0 && tc_kind_unstamped_allowed(k) == 0 {
+            if tc_tid_is_concrete(tc_lookup_node_tid(n)) == 0 { bad = bad + 1 }
+        }
+        let kids = node_value_child_ids(n)
+        let mut i = 0
+        while i < kids.len() {
+            stack.push(kids.get(i).unwrap())
+            i = i + 1
+        }
+    }
+    bad
+}
+
+// A call through a struct FIELD holding a function value. The Call arm answered nothing for a
+// FieldAccess callee, so the call was both untyped and unchecked in its arguments.
+fn field_call_src() -> Str {
+    let mut s = "type ErrorHandler \{\n"
+    s = s.concat("    on_error: fn(Int, Str) -> Str\n")
+    s = s.concat("}\n")
+    s = s.concat("fn run(h: ErrorHandler) -> Str \{ (h.on_error)(1, \"zzmsg\") }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let h = ErrorHandler \{ on_error: fn(zzc: Int, zzm: Str) -> Str \{ zzm } }\n")
+    s = s.concat("    let _ = run(h).len()\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a call through a fn-typed field is typed and its arguments checked" {
+    assert(stamp_probe("build/stamp_field_call.bl", field_call_src()) == 0)
+    // The call answers the callee's return type, and the closure it is handed binds its params.
+    assert(tc_tid_is_concrete(node_tid_by(NodeKind.Param, "zzm")) != 0)
+}
+
+// A closure written directly as a struct-literal field value. Nothing routed it to
+// check_closure_body, so its params bound nothing and its body carried no types.
+fn struct_lit_closure_src() -> Str {
+    let mut s = "type ErrorHandler \{\n"
+    s = s.concat("    on_error: fn(Int, Str) -> Str\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let h = ErrorHandler \{ on_error: fn(zzcode, zzmsg) \{ \"e: \{zzmsg}\" } }\n")
+    s = s.concat("    let _ = (h.on_error)(1, \"x\").len()\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a closure in a struct-literal field position has its params bound and body typed" {
+    assert(stamp_probe("build/stamp_struct_lit_closure.bl", struct_lit_closure_src()) == 0)
+    assert(tc_tid_is_concrete(node_tid_by(NodeKind.Param, "zzmsg")) != 0)
+}
+
+// A higher-order call in an `if` or `while` CONDITION. The condition was inferred but never
+// body-walked, so a closure there was never reached by check_closure_body.
+fn cond_hof_src() -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let xs = [\"a\", \"bb\"]\n")
+    s = s.concat("    if xs.any(fn(zzs) \{ zzs.len() > 1 }) \{ io.println(\"y\") }\n")
+    s = s.concat("    let mut i = 0\n")
+    s = s.concat("    while xs.all(fn(zzt) \{ zzt.len() > 0 }) \{ i = i + 1\n        break }\n")
+    s = s.concat("    let _ = i\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a higher-order closure in an if or while condition has its body typed" {
+    assert(stamp_probe("build/stamp_cond_hof.bl", cond_hof_src()) == 0)
+    assert(tc_tid_is_concrete(node_tid_by(NodeKind.Param, "zzs")) != 0)
+    assert(tc_tid_is_concrete(node_tid_by(NodeKind.Param, "zzt")) != 0)
+}
+
+// An impl method's receiver spelled with a leading underscore. The receiver type came from the
+// impl header keyed on the literal name `self`, so `_self` and every field read through it
+// carried nothing.
+fn underscore_self_src() -> Str {
+    let mut s = "type Counter \{\n    value: Int\n}\n"
+    s = s.concat("trait Readable \{ fn get_value(self) -> Int }\n")
+    s = s.concat("impl Readable for Counter \{\n")
+    s = s.concat("    fn get_value(_self) -> Int \{ _self.value }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let c = Counter \{ value: 1 }\n")
+    s = s.concat("    let _ = c.get_value()\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "an impl method receiver spelled with a leading underscore carries the impl's self type" {
+    assert(stamp_probe("build/stamp_underscore_self.bl", underscore_self_src()) == 0)
+    assert(tc_tid_is_concrete(node_tid_by(NodeKind.Param, "_self")) != 0)
+}
+
+// A `with` block in EXPRESSION position. The recovery publish lived in the statement arm of
+// tc_check_body, which never reaches an argument, so neither the block nor any statement
+// inside it was typed.
+fn with_expr_src() -> Str {
+    let mut s = "fn take_list(l: List[Int]) -> Int \{ l.len() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let n = take_list(with arena \{\n")
+    s = s.concat("        let mut zzm: List[Int] = []\n")
+    s = s.concat("        zzm.push(2)\n")
+    s = s.concat("        zzm\n")
+    s = s.concat("    })\n")
+    s = s.concat("    let _ = n\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a with block in argument position has its body typed" {
+    assert(stamp_probe("build/stamp_with_expr.bl", with_expr_src()) == 0)
+    assert(tc_tid_is_concrete(node_tid_by(NodeKind.LetBinding, "zzm")) != 0)
+}
+
+// A higher-order call as a `for` loop's ITERABLE. Same shape as the condition above: the
+// iterable was inferred but never body-walked.
+fn forin_hof_src() -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let xs = [1, 2, 9]\n")
+    s = s.concat("    for zzv in xs.filter(fn(zzn) \{ zzn > 5 }) \{ io.println(\"\{zzv}\") }\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a higher-order closure in a for-loop iterable has its body typed" {
+    assert(stamp_probe("build/stamp_forin_hof.bl", forin_hof_src()) == 0)
+    assert(tc_tid_is_concrete(node_tid_by(NodeKind.Param, "zzn")) != 0)
+}
+
+// A higher-order call on an ASSIGNMENT right-hand side. The arm inferred the value in value
+// context but never body-walked it, so a closure argument there was never bound.
+fn assign_hof_src() -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let xs = [1, 2, 9]\n")
+    s = s.concat("    let mut ys: List[Int] = []\n")
+    s = s.concat("    ys = xs.filter(fn(zzp) \{ zzp > 5 })\n")
+    s = s.concat("    let _ = ys.len()\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a higher-order closure on an assignment right-hand side has its body typed" {
+    assert(stamp_probe("build/stamp_assign_hof.bl", assign_hof_src()) == 0)
+    assert(tc_tid_is_concrete(node_tid_by(NodeKind.Param, "zzp")) != 0)
+}
+
+// An enum STRUCT-variant construction with named fields. The arm answered the enum type from
+// the variant name and returned, so the field values carried nothing.
+fn enum_struct_variant_src() -> Str {
+    let mut s = "type Shape \{\n    Rect \{ width: Float, height: Float }\n    Dot\n}\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let r = Shape.Rect \{ width: 3.0, height: 4.0 }\n")
+    s = s.concat("    match r \{\n")
+    s = s.concat("        Shape.Rect \{ width, height } => io.println(\"\{width}\{height}\")\n")
+    s = s.concat("        Shape.Dot => io.println(\"d\")\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "an enum struct-variant construction types its field values" {
+    assert(stamp_probe("build/stamp_enum_struct_variant.bl", enum_struct_variant_src()) == 0)
+}
+
+// A match arm GUARD. The guard expression was never inferred.
+fn match_guard_src() -> Str {
+    let mut s = "fn classify(v: Int) -> Int \{\n"
+    s = s.concat("    match v \{\n")
+    s = s.concat("        zzg if zzg < 0 => 2\n")
+    s = s.concat("        _ => 1\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = classify(3) }\n")
+    s
+}
+
+test "a match arm guard expression is typed" {
+    assert(stamp_probe("build/stamp_match_guard.bl", match_guard_src()) == 0)
+}
+
+// Keyword arguments. The NamedArg wrapper node and the value inside it carried nothing.
+fn named_arg_src() -> Str {
+    let mut s = "fn serve(port: Int, host: Str) -> Int \{ port + host.len() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let _ = serve(port: 8080, host: \"0.0.0.0\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a keyword argument and its value are typed" {
+    assert(stamp_probe("build/stamp_named_arg.bl", named_arg_src()) == 0)
+}
+
+// A struct literal with a SPREAD base. The spread node and the call inside it carried nothing.
+fn struct_spread_src() -> Str {
+    let mut s = "type Box \{\n    tag: Int\n    size: Int\n}\n"
+    s = s.concat("fn base() -> Box \{ Box \{ tag: 1, size: 7 } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b: Box = Box \{ tag: 2, ..base() }\n")
+    s = s.concat("    let _ = b.size\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a struct literal spread base is typed" {
+    assert(stamp_probe("build/stamp_struct_spread.bl", struct_spread_src()) == 0)
+}
+
+// A variant struct-literal claimed by the enclosing annotation's HINT rather than by its own
+// name. The hint answered the literal's type without looking inside it.
+fn hinted_variant_src() -> Str {
+    let mut s = "type QeErr \{\n    NotFound \{ zzmsg: Str }\n    Other\n}\n"
+    s = s.concat("type QeHolder \{\n    err: QeErr\n}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let h = QeHolder \{ err: NotFound \{ zzmsg: \"field\" } }\n")
+    s = s.concat("    match h.err \{\n")
+    s = s.concat("        QeErr.NotFound \{ zzmsg } => io.println(zzmsg)\n")
+    s = s.concat("        QeErr.Other => io.println(\"o\")\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a variant struct literal typed from the enclosing hint still types its field values" {
+    assert(stamp_probe("build/stamp_hinted_variant.bl", hinted_variant_src()) == 0)
+}
+
+// A channel's CAPACITY argument. The construction answers from its type argument alone.
+fn channel_cap_src() -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let ch = channel.new[Int](10)\n")
+    s = s.concat("    ch.send(1)\n")
+    s = s.concat("    io.println(\"\{ch.recv()}\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a channel construction types its capacity argument" {
+    assert(stamp_probe("build/stamp_channel_cap.bl", channel_cap_src()) == 0)
+}
+
+// A diverging `if` on an ASSIGNMENT right-hand side. The arm inferred only the block tails, so
+// the operand of each `return` inside the branches was never typed.
+fn assign_diverging_if_src() -> Str {
+    let mut s = "fn f(c: Bool) -> Int \{\n"
+    s = s.concat("    let mut y = 0\n")
+    s = s.concat("    y += if c \{ return 7 } else \{ return 8 }\n")
+    s = s.concat("    y\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ io.println(\"\{f(true)}\") }\n")
+    s
+}
+
+test "a diverging if on an assignment right-hand side types both return operands" {
+    assert(stamp_probe("build/stamp_assign_diverging_if.bl", assign_diverging_if_src()) == 0)
+}
+
+// A struct SPREAD base over a generic struct. The reverse-inference path unified the named
+// fields and never looked at the spread entry, which carries no field name.
+fn generic_spread_src() -> Str {
+    let mut s = "type Box[T] \{\n    value: T\n    tag: Int\n}\n"
+    s = s.concat("fn base() -> Box[Int] \{ Box \{ value: 7, tag: 1 } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b: Box[Int] = Box \{ tag: 2, ..base() }\n")
+    s = s.concat("    io.println(\"\{b.value}\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a generic struct literal types its spread base" {
+    assert(stamp_probe("build/stamp_generic_spread.bl", generic_spread_src()) == 0)
+}
+
+// The two Ptr constructors are codegen intrinsics that had no declared return type, so the
+// call itself carried nothing and the annotation was never checked against it.
+fn ptr_ctor_src() -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let n: Ptr[Int] = null_ptr()\n")
+    s = s.concat("    io.println(\"\{n.is_null()}\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a null pointer construction carries a Ptr type" {
+    assert(stamp_probe("build/stamp_ptr_ctor.bl", ptr_ctor_src()) == 0)
+    assert(tc_tid_is_concrete(tc_lookup_node_tid(let_value_of("n"))) != 0)
+}
+
+// A field read through a value whose type was INFERRED rather than annotated. The value's tid
+// is a bound metavar, and the field lookup read it without resolving, so it answered nothing.
+fn inferred_elem_field_src() -> Str {
+    let mut s = "type IPoint \{\n    x: Int\n    y: Int\n}\n"
+    s = s.concat("fn g() -> Int \{\n")
+    s = s.concat("    let mut xs = []\n")
+    s = s.concat("    xs.push(IPoint \{ x: 3, y: 4 })\n")
+    s = s.concat("    let zzp = xs.get(0).unwrap()\n")
+    s = s.concat("    zzp.x + zzp.y\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ io.println(\"\{g()}\") }\n")
+    s
+}
+
+test "a field read through an inferred list element is typed" {
+    assert(stamp_probe("build/stamp_inferred_elem_field.bl", inferred_elem_field_src()) == 0)
+    assert(tc_tid_is_concrete(node_tid_by(NodeKind.LetBinding, "zzp")) != 0)
+}
+
+// A closure written as an element of a CONTAINER LITERAL, under an annotation that gives it
+// its signature. Neither walk reached it: the let arm descends a call or a struct literal, and
+// inference types a closure's signature without its body, so the params bound nothing and the
+// body carried no types.
+fn list_lit_closure_src() -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let zzfs: List[fn(Int) -> Int] = [fn(zzx: Int) -> Int \{ zzx + 1 }]\n")
+    s = s.concat("    io.println(\"\{zzfs.get(0).unwrap()(1)}\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a closure in a container literal element has its params bound and body typed" {
+    assert(stamp_probe("build/stamp_list_lit_closure.bl", list_lit_closure_src()) == 0)
+    assert(tc_tid_is_concrete(node_tid_by(NodeKind.Param, "zzx")) != 0)
+}
+
+// A closure READ OUT of a container and applied in place. The Call arm answered nothing for a
+// callee that was neither a name, a field, nor a literal closure, so the call was untyped, its
+// arguments unchecked, and nothing inside the callee typed either.
+fn container_call_src() -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let zzgs: List[fn(Int) -> Int] = [fn(zzy: Int) -> Int \{ zzy * 2 }]\n")
+    s = s.concat("    let zzn = zzgs.get(0).unwrap()(2)\n")
+    s = s.concat("    io.println(\"\{zzn}\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a call through a closure read out of a container is typed and its arguments checked" {
+    assert(stamp_probe("build/stamp_container_call.bl", container_call_src()) == 0)
+    assert(tc_tid_is_concrete(node_tid_by(NodeKind.LetBinding, "zzn")) != 0)
+}
+
+// The enumerator's two matches are indexed by NodeKind and have no catch-all arm, so a new
+// kind cannot compile until both arms exist. The bridge between the tag order and the kind
+// list is the one part of that a match cannot check, so it is checked here.
+test "the child enumerator table covers every NodeKind" {
+    assert(nk_bridge_gap() == -1)
+}
+
+// The pass itself, on a node that denotes a value and carries nothing. The node is appended
+// with no type and handed to the pass as its own root, which is what a stamping hole looks
+// like from the pass's side: one internal error, and no ordinary error.
+test "a value node with no type is an internal compiler error" {
+    diag_reset()
+    let orphan = nodes.len()
+    nodes.push(AstNode { kind: NodeKind.IntLit, line: 1, col: 1 })
+    tc_stamp_program(orphan)
+    assert(diag_ice_count == 1)
+    assert(diag_count == 0)
+}
+
+// A closure buried in a CALL ARGUMENT of a struct-literal FIELD VALUE — the carrier
+// constructor `Some(...)` around a callback. The field-value walk descended only block-bearing
+// values, so the closure's params bound nothing and its body carried no types.
+fn struct_field_call_closure_src() -> Str {
+    let mut s = "type ZzRoute \{\n"
+    s = s.concat("    zzcb: Option[fn(Int) -> Int]\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let zzr = ZzRoute \{ zzcb: Some(fn(zzq: Int) -> Int \{ zzq + 1 }) }\n")
+    s = s.concat("    io.println(\"\{zzr.zzcb.is_some()}\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a closure inside a call argument of a struct-literal field is typed" {
+    assert(stamp_probe("build/stamp_struct_field_call_closure.bl", struct_field_call_closure_src()) == 0)
+    assert(tc_tid_is_concrete(node_tid_by(NodeKind.Param, "zzq")) != 0)
+}
+
+// A closure argument under an `.await`. The nested walk descended a call, a field read and an
+// operator but not an await, so `spawn(fn() { .. }).await` in statement position left every
+// statement of the spawned body untyped.
+fn await_closure_src() -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let _ = async.spawn(fn() \{\n")
+    s = s.concat("        let zzws: [Int] = []\n")
+    s = s.concat("        0\n")
+    s = s.concat("    }).await\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a closure argument of an awaited call has its body typed" {
+    assert(stamp_probe("build/stamp_await_closure.bl", await_closure_src()) == 0)
+    assert(tc_tid_is_concrete(node_tid_by(NodeKind.LetBinding, "zzws")) != 0)
+}
+
+// A with-block whose TAIL is a read the checker leaves untyped. The recovery published `()` for
+// the block, which claimed a value the block does not have and made the binding above it look
+// like the hole; the tail is the hole, and it is one the exemption list still allows.
+fn with_tail_untyped_src() -> Str {
+    let mut s = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\n"
+    s = s.concat("pub type ZzPollfd \{ fd: I32, events: I16, revents: I16 }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let _zzv = with ffi.scope() as zzs \{\n")
+    s = s.concat("        let zzp: Ptr[ZzPollfd] = zzs.alloc()\n")
+    s = s.concat("        zzp.fd.read()\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a with-block whose tail read is untyped is not reported above the tail" {
+    assert(stamp_probe("build/stamp_with_tail_untyped.bl", with_tail_untyped_src()) == 0)
+    // The block above the exempt tail carries nothing: what the test pins is that the pass
+    // stays quiet about the PARENT of an unanswered child, not that everything got a type.
+    assert(tc_tid_is_concrete(tc_lookup_node_tid(first_node_of(NodeKind.WithBlock))) == 0)
+}
+
+// A struct-field DEFAULT whose value is compound. Nothing calls a default and codegen only
+// emits it, so the whole subtree is typed where the field type is in hand — stamping the top
+// node alone left every element of `[1, 2]` carrying nothing.
+fn compound_field_default_src() -> Str {
+    let mut s = "type ZzConfig \{\n"
+    s = s.concat("    zzlimits: [Int] = [1, 2]\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let zzc = ZzConfig \{}\n")
+    s = s.concat("    io.println(\"\{zzc.zzlimits.len()}\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a compound struct-field default types every node of its value" {
+    assert(stamp_probe("build/stamp_compound_field_default.bl", compound_field_default_src()) == 0)
+    assert(untyped_value_nodes_in(field_default_of("zzlimits")) == 0)
+}
+
+// A struct-field default on a GENERIC declaration. The default is checked under the
+// declaration's type parameters: resolving it anywhere else leaves T undeclared, and typing it
+// nowhere leaves the closure's params bound to nothing.
+fn generic_field_default_src() -> Str {
+    let mut s = "type ZzBox[T] \{\n"
+    s = s.concat("    zzf: fn(T) -> T = fn(zzt: T) -> T \{ zzt }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let zzb: ZzBox[Int] = ZzBox \{}\n")
+    s = s.concat("    io.println(\"\{(zzb.zzf)(3)}\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a struct-field default closure is typed under the declaration's type parameters" {
+    assert(stamp_probe("build/stamp_generic_field_default.bl", generic_field_default_src()) == 0)
+    assert(tc_tid_is_concrete(node_tid_by(NodeKind.Param, "zzt")) != 0)
+}
+
+// What the exemption list still owes, stated as an invariant rather than as a number. A node
+// left without a type is either one of the exempt kinds itself, or a block that reads its type
+// from a tail which is one of them — a block ending in a method call has nothing to read. The
+// count of everything else has to stay 0: that is what makes the pass total up to the list.
+fn unexcused_untyped_nodes_in(root: Int) -> Int {
+    if root == -1 { return -1 }
+    let mut bad = 0
+    let mut stack: List[Int] = [root]
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap()
+        let k = nk_of(node_kind(n))
+        let kids = node_value_child_ids(n)
+        if nk_is_typed(k) != 0 && tc_kind_unstamped_allowed(k) == 0 {
+            if tc_tid_is_concrete(tc_lookup_node_tid(n)) == 0 {
+                if block_tail_is_exempt_and_untyped(n, kids) == 0 { bad = bad + 1 }
+            }
+        }
+        let mut i = 0
+        while i < kids.len() {
+            stack.push(kids.get(i).unwrap())
+            i = i + 1
+        }
+    }
+    bad
+}
+
+// The same walk, counting the excused blocks instead. Without it the assertion above holds
+// trivially on a program that contains no such block and proves nothing.
+fn excused_untyped_blocks_in(root: Int) -> Int {
+    if root == -1 { return -1 }
+    let mut found = 0
+    let mut stack: List[Int] = [root]
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap()
+        let kids = node_value_child_ids(n)
+        if node_kind(n) == NodeKind.Block {
+            if tc_tid_is_concrete(tc_lookup_node_tid(n)) == 0 {
+                if block_tail_is_exempt_and_untyped(n, kids) != 0 { found = found + 1 }
+            }
+        }
+        let mut i = 0
+        while i < kids.len() {
+            stack.push(kids.get(i).unwrap())
+            i = i + 1
+        }
+    }
+    found
+}
+
+// A block's tail is its last child, read off the enumerator so the excuse cannot rest on a
+// second private notion of what a tail is. An expression statement is transparent: it is the
+// statement wrapper the parser puts around the value the block answers with. Only a Block gets
+// the excuse — no other form reads its type from its last child alone.
+fn block_tail_is_exempt_and_untyped(n: Int, kids: List[Int]) -> Int {
+    if node_kind(n) != NodeKind.Block { return 0 }
+    if kids.len() == 0 { return 0 }
+    let mut tail = kids.get(kids.len() - 1).unwrap()
+    if tail == -1 { return 0 }
+    if node_kind(tail) == NodeKind.ExprStmt { tail = node_value(tail) }
+    if tail == -1 { return 0 }
+    if tc_kind_unstamped_allowed(nk_of(node_kind(tail))) == 0 { return 0 }
+    if tc_tid_is_concrete(tc_lookup_node_tid(tail)) != 0 { return 0 }
+    1
+}
+
+// The body of the fn named `nm`, so a probe counts nodes in its own source and not in the
+// prelude or in an earlier probe's leftovers, which share this arena.
+fn fn_body_of(nm: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == nm { return node_body(i) }
+        i = i + 1
+    }
+    -1
+}
+
+// The shape the corpus census of untyped blocks is dominated by: a match-arm block whose last
+// statement writes through a pointer field. The write is a method call, an exempt kind, so the
+// tail carries nothing and the block has nothing to read.
+fn arm_block_method_tail_src() -> Str {
+    let mut s = "type ZzP \{ zzf: Int }\n"
+    s = s.concat("fn zzrun(o: Option[Int]) \{\n")
+    s = s.concat("    with ffi.scope() as scope \{\n")
+    s = s.concat("        let buf: Ptr[ZzP] = scope.alloc_n(1)\n")
+    s = s.concat("        match o \{\n")
+    s = s.concat("            Some(v) => \{\n")
+    s = s.concat("                let cell = buf.offset(0)\n")
+    s = s.concat("                cell.zzf.write(v)\n")
+    s = s.concat("            }\n")
+    s = s.concat("            None => \{}\n")
+    s = s.concat("        }\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ zzrun(Some(3)) }\n")
+    s
+}
+
+test "every node the pass leaves untyped is exempt or a block with an exempt tail" {
+    assert(stamp_probe("build/stamp_arm_block_method_tail.bl", arm_block_method_tail_src()) == 0)
+    let body = fn_body_of("zzrun")
+    assert(excused_untyped_blocks_in(body) > 0)
+    assert(unexcused_untyped_nodes_in(body) == 0)
+}

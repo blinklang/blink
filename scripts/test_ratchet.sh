@@ -39,6 +39,8 @@ EOF
   cat > "$dir/src/typecheck.bl" <<'EOF'
 return TYPE_UNKNOWN
 let mut foo_map: Map[Str, Int] = Map()
+pub fn tc_kind_unstamped_allowed(k: NodeKind) -> Int {
+    if k == NodeKind.Ident { return 1 }
 EOF
   : > "$dir/Taskfile.yml"
 }
@@ -84,6 +86,7 @@ check_row return_type_unknown      typecheck.bl 'return TYPE_UNKNOWN'
 check_row str_keyed_type_facts     typecheck.bl 'let mut bar_map: Map[Str, Str] = Map()'
 check_row downgrade_calls          codegen.bl   'let h2 = tc_tid_option_inner_struct(1)'
 check_row br_ids_in_source         codegen.bl   '// also see br xyz987'
+check_row stamp_exempt_kinds       typecheck.bl 'if k == NodeKind.Break { return 1 }'
 
 # br_ids_in_source is an absolute zero gate: it must fail even when the
 # baseline and HEAD~1 both already read 1, where the plain non-increasing
@@ -182,6 +185,49 @@ echo 'let a = CT_INT' > "$GITWORK/src/codegen.bl"
     exit 1
   fi
   echo "PASS git-dirty-picks-head: dirty tree compared against HEAD rather than HEAD~1"
+
+  # A row the commit under test ADDS has no previous-commit count: computing
+  # it over the reference commit's files answers 0 for a metric nobody was
+  # tracking, which must not fail the row for the fact of existing.
+  # The marker the new row counts is introduced by this same uncommitted edit, so the
+  # reference commit counts 0 of it and the row would be failed for rising 0 -> 1 if a row
+  # this commit adds were compared at all.
+  printf '%s\n' '// newrow_marker' >> src/codegen.bl
+  awk '/^ROWS$/ { print "newrow $(cnt \047newrow_marker\047 \"$cg\")" } { print }' scripts/ratchet.sh > new.sh
+  cat new.sh > scripts/ratchet.sh
+  rm -f new.sh
+  ./scripts/ratchet.sh --update > /dev/null
+  newrow_out=$(./scripts/ratchet.sh 2>&1)
+  if [ $? != 0 ]; then
+    echo "FAIL git-new-row: a row absent from the reference commit should have no previous-commit reference"
+    printf '%s\n' "$newrow_out"
+    exit 1
+  fi
+  if ! printf '%s\n' "$newrow_out" | rg -q '^newrow +1 +1 +1$'; then
+    echo "FAIL git-new-row: the new row did not count the marker this edit added, so the check was vacuous"
+    printf '%s\n' "$newrow_out"
+    exit 1
+  fi
+  echo "PASS git-new-row: a row this commit adds is not failed against a commit that never tracked it"
+
+  # The converse: once the reference commit defines the row, it is checked
+  # like any other, so a real rise still fails.
+  git add -A
+  git commit -q -m three
+  printf '%s\n' '// newrow_marker' >> src/codegen.bl
+  ./scripts/ratchet.sh --update > /dev/null
+  conv_out=$(./scripts/ratchet.sh 2>&1)
+  if [ $? = 0 ]; then
+    echo "FAIL git-new-row-then-checked: a row the reference commit defines must be compared against it"
+    printf '%s\n' "$conv_out"
+    exit 1
+  fi
+  if ! printf '%s\n' "$conv_out" | rg -q '^newrow .*UP\(head~1\)'; then
+    echo "FAIL git-new-row-then-checked: the run failed, but not on the row under test"
+    printf '%s\n' "$conv_out"
+    exit 1
+  fi
+  echo "PASS git-new-row-then-checked: once the reference commit tracks the row, a rise fails"
 )
 if [ $? != 0 ]; then fail=1; fi
 

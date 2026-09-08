@@ -428,14 +428,27 @@ fn ct_names_kind_completely(k: TyKind) -> Int {
     1
 }
 
+// The node a tid question about `n` should be asked of. ast.nk_is_typed is the spec for which
+// kinds carry a tid at all; an Untyped wrapper carries none, so the question goes to the single
+// value child it wraps. A wrapper with several children (an assignment, a loop) holds no value
+// and answers for nothing, so there is no node to ask.
+fn cg_tid_bearer(n: Int) -> Int {
+    if n == -1 { return -1 }
+    if nk_is_typed(nk_of(node_kind(n))) != 0 { return n }
+    let kids = node_value_child_ids(n)
+    if kids.len() != 1 { return -1 }
+    cg_tid_bearer(kids.get(0).unwrap())
+}
+
 // §3.3: a branch that diverges reaches its closing brace on no path, so it produces no value
 // and its sibling alone decides what the arm-bearing form holds. Divergence is read from the
 // tid typecheck published for the branch, not re-derived here: infer_block_type is a flat
 // pre-pass that cannot tell a block with no value from one with no exit, and answering CT_VOID
 // for both is what lets a diverging branch erase the value its sibling did produce.
 fn cg_block_diverges(block: Int) -> Int {
-    if block == -1 { return 0 }
-    if tc_tid_kind(cg_node_mono_tid(block)) == TyKind.Never { return 1 }
+    let bearer = cg_tid_bearer(block)
+    if bearer == -1 { return 0 }
+    if tc_tid_kind(cg_node_mono_tid(bearer)) == TyKind.Never { return 1 }
     0
 }
 
@@ -472,7 +485,7 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     // whose value is still consumed is left to the value path below, which preserves its type from
     // the flat channel — rejecting that shape is §2.9's expression-context missing-else error, a
     // typecheck concern, not codegen's to silently erase.
-    if node_else_body(node) == -1 && cg_node_mono_tid(node) < 0 {
+    if node_else_body(node) == -1 && cg_tid_is_value(cg_node_mono_tid(node)) == 0 {
         emit_if_stmt(node)
         expr_result_str = "0"
         expr_result_type = CT_VOID
@@ -1342,12 +1355,12 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
     // the pre-pass emits a struct arm whose tail is a pattern-bound ident (e.g.
     // `Ok(b) => { b }`) as CT_INT (the binding isn't typed in the throwaway
     // scope), which would otherwise mislead the harvest.
-    // A match whose value is USED has a published node tid — a consumer (let/return/arg) memoized
-    // it during typecheck. An unpublished tid means the value is discarded: a statement match. It
-    // yields no value, so it must declare no result temp; forcing the result to Void here stops the
-    // struct/flat fallbacks below from fabricating one (get_fn_ret_struct leaking the enclosing fn's
-    // return struct, or infer_arm_type's guess) from a type the match does not have.
-    let match_is_stmt = cg_node_mono_tid(node) < 0
+    // A match whose value is USED has a tid that denotes a value. A tid that denotes none —
+    // absent, Void, or Never — means the match is a statement. It yields no value, so it must
+    // declare no result temp; forcing the result to Void here stops the struct/flat fallbacks
+    // below from fabricating one (get_fn_ret_struct leaking the enclosing fn's return struct,
+    // or infer_arm_type's guess) from a type the match does not have.
+    let match_is_stmt = cg_tid_is_value(cg_node_mono_tid(node)) == 0
     if match_is_stmt {
         result_type = CT_VOID
     }
@@ -2527,7 +2540,18 @@ fn pat_measure(bind_name: Str, pat: Int) {
 // says what `mm.get(k)` decodes to, the spelling says what C type holds `mm`. A binder can be right
 // on one and wrong on the other.
 fn pat_binder_tid(pat: Int) -> Int {
+    if pat == -1 { return -1 }
     cg_node_mono_tid(pat)
+}
+
+// Whether a tid says "this form produces a value". Absence is one way to say no; Void is the
+// other, and it is the one that matters now that every value node carries a type — a form in
+// statement position is typed Void, and reading tid PRESENCE as value-ness would fabricate a
+// result temp for every statement `if` and lower every statement `match` as a value match.
+pub fn cg_tid_is_value(tid: Int) -> Int {
+    if tid < 0 { return 0 }
+    if tc_tid_kind(tid) == TyKind.Void { return 0 }
+    1
 }
 
 // The tid any node's C spelling and metadata are read through: resolved past metavars, then
@@ -6727,6 +6751,12 @@ fn emit_block_then_capture(block: Int, result_sink: Str, arena_prev: Str) -> Str
         i = i + 1
     }
     let last = sublist_get(stmts_sl, count - 1)
+    // A tail that holds no value — an assignment, a loop — leaves the block with nothing to
+    // capture. It still has to RUN, so emit it as the statement it is and promote nothing.
+    if cg_tid_bearer(last) == -1 {
+        emit_stmt(last)
+        return ""
+    }
     let last_kind = node_kind(last)
     let tail_node = tail_value_node(last)
     emit_expr(tail_node)
@@ -8577,11 +8607,14 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
     pop_scope()
 }
 
-// The node whose type decides how a fn body's last statement closes. An ExprStmt is a
-// wrapper the checker never types, so the value inside it is what carries the tid.
+// The node whose type decides how a fn body's last statement closes: the tid bearer of the
+// last statement. A tail that holds no value at all — an assignment, a loop — has no bearer,
+// and the statement itself is still the node the block closes on.
 fn tail_value_node(last: Int) -> Int {
     if last == -1 { return -1 }
-    if node_kind(last) == NodeKind.ExprStmt { node_value(last) } else { last }
+    let bearer = cg_tid_bearer(last)
+    if bearer == -1 { return last }
+    bearer
 }
 
 // A fn whose return type is a struct, enum, or tuple uses the struct-return
@@ -8601,8 +8634,9 @@ pub fn ret_needs_struct_body(ret_str: Str) -> Int {
 // re-derived from the AST here: the checker is the only place the divergence rule lives,
 // so codegen cannot disagree with what was accepted.
 fn cg_tail_diverges(node: Int) -> Int {
-    if node == -1 { return 0 }
-    if tc_tid_kind(cg_node_mono_tid(node)) == TyKind.Never { 1 } else { 0 }
+    let bearer = cg_tid_bearer(node)
+    if bearer == -1 { return 0 }
+    if tc_tid_kind(cg_node_mono_tid(bearer)) == TyKind.Never { 1 } else { 0 }
 }
 
 // Close a value-returning fn whose tail diverges. Control provably never arrives, so

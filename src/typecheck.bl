@@ -1,4 +1,4 @@
-import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on}
+import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on, nk_of, nk_is_typed}
 import std.str.{str_to_lower}
 import codegen_types.{impl_is_element_agnostic, is_intrinsic_method, strip_module_qualifier}
 import parser.{
@@ -12,15 +12,16 @@ import parser.{
     node_type_ann, node_type_name, node_type_params, node_value, node_var_name,
     node_impl_binders, node_recv_type_args, node_impl_where_bounds, node_source_module,
     node_set_module, node_set_name, node_supertraits,
-    node_xfail_reason, node_xfail_ticket,
+    node_xfail_reason, node_xfail_ticket, node_value_child_ids,
     sublist_get, sublist_length,
 }
 import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_no_loc,
-    diag_push_allows, diag_warn_at, diag_truncate, diag_entry_count,
+    diag_push_allows, diag_warn_at, diag_truncate, diag_entry_count, diag_ice_at, diag_count,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
     NON_EXHAUSTIVE_MATCH,
+    UNSOLVED_TYPEVAR_AT_CODEGEN,
     TYPE_ERROR, TEMPLATE_MISMATCH, MISSING_RETURN, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
     MUTATION_REQUIRES_MUT,
@@ -2291,12 +2292,19 @@ fn tc_report_unconstructible_head(sname: Str, node: Int) ! Diag.Report {
 // Normalize a possibly-monomorphized struct instance tid (Box[Int]) to its base
 // declaration tid (Box), by name. Any consumer that maps a struct tid
 // back to declaration-level data keyed on the base tid (fields; anything using
-// sf.struct_id) must normalize first. A bare tid, a non-struct tid, or an
-// unresolvable name returns the input unchanged.
-fn tc_struct_base_tid(tid: Int) -> Int {
-    if tid < 0 || tid >= ty_pool.len() { return tid }
+// sf.struct_id) must normalize first. The input is resolved first, so a solved metavar
+// standing for a struct normalizes too; a bare tid, a non-struct tid, or an unresolvable
+// name returns the input unchanged.
+fn tc_struct_base_tid(tid0: Int) -> Int {
+    // Resolve first: a value whose type was INFERRED rather than annotated carries a bound
+    // metavar, not the struct itself (`let mut xs = []` then `xs.push(p)` pins the element, so
+    // `xs.get(0).unwrap()` is an α that solves to the struct). The pool entry for an α is kind
+    // Unknown, so without resolving, every field lookup through such a value answered "no
+    // field" and the field access carried no type at all.
+    let tid = tc_resolve(tid0)
+    if tid < 0 || tid >= ty_pool.len() { return tid0 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TyKind.Struct { return tid }
+    if t.kind != TyKind.Struct { return tid0 }
     if t.params_count == 0 { return tid }
     let base = lookup_named_type(strip_module_qualifier(t.name))
     if base == -1 { return tid }
@@ -4172,6 +4180,17 @@ fn tc_check_callable_arg_bodies(args_sl: Int, skip_idx: Int) ! TypeCheck.Resolve
     }
 }
 
+// A statement-position SUBEXPRESSION that its arm only inferred and never body-walked: an
+// `if`/`while` condition, a `for` iterable, an assignment right-hand side. A HOF there
+// (`if list_any(xs, fn(s) { ... })`, `for v in xs.filter(fn(n) { ... })`) reached
+// check_closure_body from nowhere, so its closure bound no params and its body carried no
+// types. Every such arm wants the same two steps in the same order, so they share one name.
+fn tc_check_nested_value(expr: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let t = infer_type(expr)
+    tc_walk_nested_hof_bodies(expr)
+    t
+}
+
 // A HOF whose closure must be bound and walked (check_closure_body) can hide anywhere a value
 // nests: the receiver of an outer method call (`a.map(f).collect()`), an interpolation part
 // (`"{a.fold(..)}"`), a binary operand, an argument. tc_check_body's arms walk only primary
@@ -4200,6 +4219,15 @@ fn tc_walk_nested_hof_bodies(expr: Int) ! TypeCheck.Resolve, TypeCheck.Report, D
         tc_check_body(expr)
         return
     }
+    // A closure, a handler, or a struct literal written DIRECTLY in a nested value position —
+    // `inner = fn(x: Int) -> Int { x + 100 }`. These are the same three kinds the ExprStmt arm
+    // walks through tc_stmt_value_walks_body, and for the same reason: infer_type types a
+    // closure's signature and a struct literal's head without descending, so nothing in the
+    // body or the fields was ever typed.
+    if k == NodeKind.Closure || k == NodeKind.HandlerExpr || k == NodeKind.StructLit {
+        tc_check_body(expr)
+        return
+    }
     if k == NodeKind.NamedArg {
         tc_walk_nested_hof_bodies(node_value(expr))
         return
@@ -4214,6 +4242,12 @@ fn tc_walk_nested_hof_bodies(expr: Int) ! TypeCheck.Resolve, TypeCheck.Report, D
         return
     }
     if k == NodeKind.FieldAccess {
+        tc_walk_nested_hof_bodies(node_obj(expr))
+        return
+    }
+    // `spawn(fn() { .. }).await` — the awaited expression holds the closure, and the operand
+    // of an await lives in `obj`.
+    if k == NodeKind.AwaitExpr {
         tc_walk_nested_hof_bodies(node_obj(expr))
         return
     }
@@ -5389,7 +5423,34 @@ fn tc_infer_struct_lit_field_values(stid: Int, node: Int) ! TypeCheck.Resolve, T
 // A missing decl node (should not happen for a resolved struct) or a non-generic
 // struct (no type params) short-circuits to bare — no instance is minted for a
 // monomorphic struct, keeping the pool free of redundant entries.
+// Walk the body of a closure written directly as a struct-literal field value
+// (`ErrorHandler { on_error: fn(req, msg) -> Response { .. } }`). Nothing else reaches it:
+// infer_type answers the closure's own Fn tid without descending, and there is no call site
+// to route it through tc_check_callable_arg_bodies — so its params never bound and its body
+// never typed. The declared FIELD type supplies the param hints, which is exactly what a
+// closure argument gets from the parameter it is passed to.
+fn tc_check_struct_lit_field_closures(stid: Int, node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let flds_sl = node_fields(node)
+    if flds_sl == -1 { return }
+    let mut fi = 0
+    while fi < sublist_length(flds_sl) {
+        let f = sublist_get(flds_sl, fi)
+        let v = node_value(f)
+        if v != -1 {
+            let vk = node_kind(v)
+            if vk == NodeKind.Closure {
+                let declared = resolve_alias_tid(get_struct_field_tid(stid, node_name(f)))
+                if type_kind(declared) == TyKind.Fn { check_closure_body(v, declared) }
+            } else if vk == NodeKind.HandlerExpr {
+                tc_check_body(v)
+            }
+        }
+        fi = fi + 1
+    }
+}
+
 fn tc_struct_lit_instance_tid(stid: Int, sname: Str, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    tc_check_struct_lit_field_closures(stid, node)
     tc_pin_struct_lit_field_ret_mints(stid, node)
     let bare = strip_module_qualifier(sname)
     let decl = tc_struct_decl_nodes.get(bare) ?? -1
@@ -5412,6 +5473,11 @@ fn tc_struct_lit_instance_tid(stid: Int, sname: Str, node: Int) -> Int ! TypeChe
         let declared = get_struct_field_tid(stid, fname)
         if declared != -1 {
             unify_typevar_binds(declared, infer_type(node_value(f)), binds)
+        } else {
+            // A spread entry (`..base()`) has no field name, and so no declared type to unify
+            // against, but the value it spreads is an ordinary expression that must carry a
+            // type — nothing else in this path looked at it.
+            infer_type(node_value(f))
         }
         fi = fi + 1
     }
@@ -8256,6 +8322,10 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     // method — the honest report is the soft one.
     tc_flush_unresolved_method_warnings()
 
+    // Phases 4 and 5: recover the types inference determined but never wrote down, then hold
+    // every value node to carrying one.
+    tc_stamp_program(program)
+
     if trace_mode != "" { trace("typecheck", "done ({tc_errors.len()} errors)") }
     tc_errors.len()
 }
@@ -9285,6 +9355,11 @@ fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "process_pid_kill" { return TYPE_INT }
     if name == "process_pid_send_signal" { return TYPE_INT }
     if name == "process_install_signal_forwarding" { return TYPE_VOID }
+    // Both Ptr constructors are codegen intrinsics whose element comes from the context — the
+    // annotation on the binding. A metavar is that context's slot; leaving them absent left the
+    // call itself with no type at all.
+    if name == "alloc_ptr" { return make_ptr_type(make_metavar()) }
+    if name == "null_ptr" { return make_ptr_type(make_metavar()) }
     if name == "Bytes" { return new_type(TyKind.Bytes, "Bytes") }
     if name == "StringBuilder" { return type_stringbuilder() }
     if name == "Map" { return make_map_type(make_metavar(), make_metavar()) }
@@ -9418,13 +9493,58 @@ fn tc_enum_ctor_instance_tid(enum_tid: Int, decl: Int, vname: Str, args_sl: Int)
 // construction (a StructLit node). Unifies each declared payload field tid against
 // the inferred value by FIELD NAME (lookup_evfield_type_by_name) rather than by
 // position. Same bare-fallback / has_concrete contract.
+// The enum-variant twin of tc_infer_struct_lit_field_values: `E.V { a: 1 }` answered its type
+// from the variant name alone, so on every path that needs no reverse-inference the field
+// VALUES were never inferred and carried no type. The declared field type is the value's hint,
+// and a closure field value needs the same body walk a struct field's does — nothing else
+// reaches it.
+// @allow: publishing the field values' types IS this function's effect.
+@allow(UnrestoredMutation)
+fn tc_infer_enum_structlit_field_values(vname: Str, flds_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if flds_sl == -1 { return }
+    let var_idx = get_variant_var_idx(vname)
+    let mut fi = 0
+    while fi < sublist_length(flds_sl) {
+        let f = sublist_get(flds_sl, fi)
+        let v = node_value(f)
+        if v != -1 {
+            let mut declared = -1
+            if var_idx != -1 { declared = lookup_evfield_type_by_name(var_idx, node_name(f)) }
+            if declared != -1 { declared = resolve_alias_tid(declared) }
+            if node_kind(v) == NodeKind.Closure && type_kind(declared) == TyKind.Fn {
+                check_closure_body(v, declared)
+            } else if node_kind(v) == NodeKind.HandlerExpr {
+                tc_check_body(v)
+            } else {
+                let saved_hint = tc_construct_hint
+                if declared != -1 && tc_tid_is_no_info(declared) == 0 { tc_construct_hint = declared }
+                let vt = infer_type(v)
+                tc_construct_hint = saved_hint
+                if declared != -1 && tc_tid_is_no_info(declared) == 0 && tc_tid_has_unbound_metavar(vt) != 0 {
+                    tc_unify(declared, vt)
+                }
+            }
+        }
+        fi = fi + 1
+    }
+}
+
 fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if decl == -1 { return enum_tid }
+    if decl == -1 {
+        tc_infer_enum_structlit_field_values(vname, flds_sl)
+        return enum_tid
+    }
     let tparams_sl = node_type_params(decl)
-    if tparams_sl == -1 || sublist_length(tparams_sl) == 0 { return enum_tid }
+    if tparams_sl == -1 || sublist_length(tparams_sl) == 0 {
+        tc_infer_enum_structlit_field_values(vname, flds_sl)
+        return enum_tid
+    }
     if flds_sl == -1 { return enum_tid }
     let var_idx = get_variant_var_idx(vname)
-    if var_idx == -1 { return enum_tid }
+    if var_idx == -1 {
+        tc_infer_enum_structlit_field_values(vname, flds_sl)
+        return enum_tid
+    }
     let mut binds: Map[Str, Int] = Map()
     let mut fi = 0
     while fi < sublist_length(flds_sl) {
@@ -9432,6 +9552,10 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl:
         let declared = lookup_evfield_type_by_name(var_idx, node_name(f))
         if declared != -1 {
             unify_typevar_binds(declared, infer_type(node_value(f)), binds)
+        } else {
+            // A field name the variant does not declare is still an expression that must carry
+            // a type; the mismatch itself is reported elsewhere.
+            infer_type(node_value(f))
         }
         fi = fi + 1
     }
@@ -11548,6 +11672,19 @@ pub fn type_merge(a0: Int, b0: Int) -> Int {
 // tc_check_pattern_types emits no diagnostics (only defines names and publishes leaf tids),
 // so running it on every infer_type(match) — which happens many times per node — is
 // idempotent. The scope is pushed and popped here so the bindings never leak past the arm.
+// A match arm GUARD. Both match walks bound the arm's pattern and then went straight to the
+// body, so `v if v < 0 => ..` left the guard and everything under it with no type — and with no
+// Bool check either. It must be typed inside the arm's own scope, where the pattern bindings the
+// guard names exist.
+fn tc_check_arm_guard(arm: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let g = node_guard(arm)
+    if g == -1 { return }
+    let gt = tc_check_nested_value(g)
+    if is_bool_compat(gt) == 0 {
+        tc_error_at("match guard must be Bool, got {type_to_str(gt)}", g)
+    }
+}
+
 fn infer_arm_body(arm: Int, scrut_tid: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let b = node_body(arm)
     // No body is an ABSENCE — this arm contributes nothing to the merge. The merge below reads
@@ -11559,6 +11696,7 @@ fn infer_arm_body(arm: Int, scrut_tid: Int) -> Int ! TypeCheck.Resolve, TypeChec
     tc_pattern_binding_type = scrut_tid
     tc_check_pattern_types(node_pattern(arm))
     tc_pattern_binding_type = saved_pat
+    tc_check_arm_guard(arm)
     // Infer the BODY NODE whatever its shape. infer_type answers for the statement kinds a
     // braceless arm produces (ExprStmt passes through to its value, a control transfer is
     // Never), so the body node itself is stamped and codegen's divergence read is one path
@@ -12024,6 +12162,27 @@ fn tc_fn_returns_value() -> Bool {
 // tc_check_body, never this entry directly; the g19dpq test calls it by hand to install the
 // latent re-inference producer the Closure-arm guard defends against. It MUTATES the tc_node_tid
 // memo, so it must not be called from ordinary compiler code.
+// Every ARGUMENT of a call must carry a type. Several arms answer a call's own type from the
+// method name alone — `Char.from_code_point(-1)`, `Bytes.zeroed(4)` — and return without
+// descending, which leaves the arguments both untyped and unchecked. Inferring them AFTER the
+// answer keeps every hinted arm's own argument typing intact: an arm that pins a metavar from
+// a hint has already written the node, and only an argument nobody claimed is inferred here.
+fn tc_infer_unclaimed_args(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if node == -1 { return }
+    let k = node_kind(node)
+    // ChannelNew joins the two call kinds: `channel.new[Int](10)` answers from its type argument
+    // and never looked at the capacity.
+    if k != NodeKind.MethodCall && k != NodeKind.Call && k != NodeKind.ChannelNew { return }
+    let a_sl = node_args(node)
+    if a_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(a_sl) {
+        let a = sublist_get(a_sl, i)
+        if a != -1 && tc_tid_is_no_info(tc_lookup_node_tid(a)) != 0 { infer_type(a) }
+        i = i + 1
+    }
+}
+
 pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // §2.9: infer_type_uncached resets tc_if_value_ctx to 1 at entry (its consuming child
     // descents are all value positions) and only its pass-through arms restore the incoming
@@ -12032,6 +12191,7 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     let saved_ctx = tc_if_value_ctx
     let tid = infer_type_uncached(node)
     tc_if_value_ctx = saved_ctx
+    tc_infer_unclaimed_args(node)
     if node != -1 && node < tc_node_tid.len() {
         // The memo answers a TYPE or nothing, and -1 is the "nobody has typed this"
         // sentinel (TYPE_INT is 0, so -1 cannot collide with a real tid). TYPE_UNKNOWN
@@ -12562,6 +12722,15 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     return fs.ret
                 }
             } else if callee_kind == NodeKind.FieldAccess {
+                // A FIELD holding a function value — `(self.action)()`, `(h.on_error)(1, m)`.
+                // The field's own type is the only thing that says what the call answers and
+                // the only thing that can check the arguments; without it the call is both
+                // untyped and unchecked. Same treatment as a closure variable, since the
+                // callee is a closure value either way.
+                let fa_fn_t = infer_type(callee)
+                if type_kind(fa_fn_t) == TyKind.Fn {
+                    return tc_check_call_against_fn_tid(fa_fn_t, node_args(node), "field", node)
+                }
                 // Infer args so nested expressions in a module-qualified call
                 // (e.g. io.println(x.m())) are type-checked — otherwise this
                 // branch returns without descending, hiding E0522.
@@ -12599,6 +12768,24 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     while cai < sublist_length(cls_args) {
                         infer_type(sublist_get(cls_args, cai))
                         cai = cai + 1
+                    }
+                }
+            } else {
+                // A call through any OTHER value expression — `xs.get(0).unwrap()(1)`, an
+                // element read out of a container and applied in place. The callee is a
+                // closure value like the two arms above, so it gets their treatment: its own
+                // type says what the call answers and checks the arguments. Without this the
+                // call returned unclaimed and nothing inside the callee was typed either.
+                let val_fn_t = infer_type(callee)
+                if type_kind(val_fn_t) == TyKind.Fn {
+                    return tc_check_call_against_fn_tid(val_fn_t, node_args(node), "closure", node)
+                }
+                let val_args = node_args(node)
+                if val_args != -1 {
+                    let mut vai = 0
+                    while vai < sublist_length(val_args) {
+                        infer_type(sublist_get(val_args, vai))
+                        vai = vai + 1
                     }
                 }
             }
@@ -14045,7 +14232,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
         }
 
-        let obj_t = infer_type(obj_node)
+        // tc_resolve, so the arms below read the struct itself and not the bound metavar an
+        // inferred value carries — type_kind resolves, but the pool reads here do not.
+        let obj_t = tc_resolve(infer_type(obj_node))
         if type_kind(obj_t) == TyKind.Struct {
             let ft = get_struct_field_tid(obj_t, fname)
             if ft != -1 {
@@ -14223,12 +14412,20 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         tc_report_unconstructible_head(sname, node)
                         return tc_error_recovery_tid()
                     }
-                    return etid
+                    // `mod.Type { .. }` is the same construction as `Type { .. }` and must
+                    // answer the same way — the bare spelling reverse-infers its instance and
+                    // types its field values, this one returned the head and looked at nothing,
+                    // so every field value under a qualified literal carried no type.
+                    return tc_struct_lit_instance_tid(etid, sname, node)
                 }
             } else {
                 // 1) hint FIRST (monotonicity: a distant enum decl must never retroactively
                 //    rebind a locally-determined site).
                 if tc_construct_hint >= 0 && type_kind(tc_construct_hint) == TyKind.Enum && get_variant_by_name(tc_construct_hint, sname) != -1 {
+                    // The hint answers the literal's own type without looking inside it, so the
+                    // field VALUES still need typing — `QeHolder { err: NotFound { msg: "x" } }`
+                    // left the inner literal's fields with nothing.
+                    tc_infer_enum_structlit_field_values(sname, node_fields(node))
                     return tc_construct_hint
                 }
                 // 2) struct (Kind A guarantees a name is never both a struct AND a variant).
@@ -14408,10 +14605,34 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
 
     if kind == NodeKind.WithBlock {
         tc_if_value_ctx = incoming
+        // A `with` in EXPRESSION position — an argument, a `let` value. tc_check_body reaches
+        // statement forms only, so in this position nothing walked the body and nothing bound
+        // the resource names its tail reads: inferring the body alone answers from an empty
+        // scope and leaves every statement inside untyped. Route through the statement arm,
+        // which binds the resources, walks the body and recovers the block's own type, then
+        // answer that. Gated on the node having no type yet, so the statement position (where
+        // that arm has already run and published) keeps its single walk.
+        if tc_tid_is_no_info(tc_lookup_node_tid(node)) != 0 {
+            tc_check_body(node)
+            let w_expr_tid = tc_lookup_node_tid(node)
+            if tc_tid_is_no_info(w_expr_tid) == 0 { return w_expr_tid }
+        }
         return infer_type(node_body(node))
     }
 
+    if kind == NodeKind.NamedArg {
+        // A keyword argument is a LABEL on a value, and its type is that value's type. There was
+        // no arm at all, so `serve(port: 8080)` left both the label node and the literal inside
+        // it with nothing — check_arg_shapes infers the NamedArg node, not the value, so the
+        // argument was never checked against the parameter either.
+        return infer_type(node_value(node))
+    }
+
     if kind == NodeKind.RangeLit {
+        // The bounds are ordinary expressions and the only things that can be wrong here, but
+        // the answer (a list of Int) never depended on them, so nothing used to look.
+        infer_type(node_start(node))
+        infer_type(node_end(node))
         return make_list_type(TYPE_INT)
     }
 
@@ -14846,7 +15067,14 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
             // Guarded on the resolved type still being UNKNOWN so an explicitly annotated `self`
             // (and any future typed receiver form) keeps its own annotation: the annotation is
             // more specific than the header, and this must not overwrite it.
-            if pname == "self" && tc_tid_is_no_info(ptid_final) != 0 && tc_current_self_tid != -1 {
+            //
+            // Keyed on the receiver POSITION, not on the spelling: an impl method may write
+            // the receiver `_self` to mark it unused, and the receiver is still the receiver.
+            // Keying on the name `self` left `_self` bound to TYPE_UNKNOWN and every field
+            // read through it untyped. Only param 0 of an impl method can be the receiver,
+            // and tc_current_self_tid is -1 outside an impl, so a free function's
+            // un-annotated first param is untouched.
+            if i == 0 && ann == -1 && tc_tid_is_no_info(ptid_final) != 0 && tc_current_self_tid != -1 {
                 ptid_final = tc_current_self_tid
             }
             // An FFI extern fn has an empty body, so it needs no scope binding or argument
@@ -15246,6 +15474,41 @@ fn tc_stmt_value_walks_body(vk: Int) -> Bool {
     is_block_bearing(vk) || vk == NodeKind.MethodCall || vk == NodeKind.Call || vk == NodeKind.StructLit || vk == NodeKind.Closure || vk == NodeKind.HandlerExpr
 }
 
+// A statement's VALUE, after it has been inferred: the walk inference itself does not do.
+// A block-bearing value needs its non-tail statements walked (`y = if c { return 7 } else
+// { return 8 }` typed neither return operand); every other shape can still HIDE one
+// (`rows.find(fn(e) { .. }).unwrap().val` is a FieldAccess, so the first test says no and
+// nothing walked the closure). The nested walk descends the value-carrying shapes only and
+// routes each call it finds to tc_check_body, so both branches stay as narrow as each other.
+// @allow: publishing types IS this function's effect, so there is nothing to restore.
+@allow(UnrestoredMutation)
+fn tc_walk_stmt_value(val: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if val == -1 { return }
+    if tc_stmt_value_walks_body(node_kind(val)) {
+        tc_check_body(val)
+    } else {
+        tc_walk_nested_hof_bodies(val)
+    }
+}
+
+// An assignment right-hand side: expression context (§2.9), so an else-less `if` (no value on
+// the false path) is rejected, then walked like any other statement value.
+// @allow: as tc_walk_stmt_value.
+@allow(UnrestoredMutation)
+fn tc_infer_assigned_value(val: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let t = tc_infer_value(val)
+    tc_walk_stmt_value(val)
+    t
+}
+
+// One arm of a statement-position match: its guard, then its body.
+// @allow: as tc_walk_stmt_value.
+@allow(UnrestoredMutation)
+fn tc_check_stmt_match_arm(arm: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    tc_check_arm_guard(arm)
+    tc_check_body(node_body(arm))
+}
+
 fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return }
     let kind = node_kind(node)
@@ -15364,7 +15627,11 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // declared/inferred type, so `let x = if c { 1 }` fails even when x is unused.
             inferred_tid = tc_infer_value(val)
             tc_construct_hint = saved_hint
-            tc_check_body(val)
+            // A closure written inside a container literal — `let fs: List[fn(Int) -> Int] =
+            // [fn(x: Int) -> Int { x + 1 }]` — is reached by neither walk on its own: tc_check_body
+            // descends a call or a struct literal, not a list, and infer_type types the closure's
+            // signature without its body. tc_walk_stmt_value picks the walk the value's kind needs.
+            tc_walk_stmt_value(val)
             // `let x = { let h = 5  h }` and
             // `let x = match sh { Circle(a) => a  Square(a) => a }` — the value names a binding
             // the construct itself introduces, which the infer_type above could not see because
@@ -15523,9 +15790,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let val = node_value(node)
         if target != -1 && val != -1 {
             let target_t = infer_type(target)
-            // An assignment RHS is expression context (§2.9): infer in value context so an
-            // else-less `if` (no value on the false path) is rejected.
-            let val_t = tc_infer_value(val)
+            let val_t = tc_infer_assigned_value(val)
             if kind == NodeKind.CompoundAssign {
                 reject_non_numeric_arith_operand(node_op(node), target_t, node, 0)
                 reject_non_numeric_arith_operand(node_op(node), val_t, node, 0)
@@ -15579,7 +15844,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     }
 
     if kind == NodeKind.IfExpr {
-        let cond_t = infer_type(node_condition(node))
+        let cond_t = tc_check_nested_value(node_condition(node))
         if is_bool_compat(cond_t) == 0 {
             tc_error_at("if condition must be Bool, got {type_to_str(cond_t)}", node)
         }
@@ -15604,7 +15869,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     }
 
     if kind == NodeKind.WhileLoop {
-        let cond_t = infer_type(node_condition(node))
+        let cond_t = tc_check_nested_value(node_condition(node))
         if is_bool_compat(cond_t) == 0 {
             tc_error_at("while condition must be Bool, got {type_to_str(cond_t)}", node)
         }
@@ -15614,7 +15879,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 
     if kind == NodeKind.ForIn {
         nr_push_scope()
-        let iter_t = tc_resolve(infer_type(node_iterable(node)))
+        let iter_t = tc_resolve(tc_check_nested_value(node_iterable(node)))
         let iter_tk = type_kind(iter_t)
         let elem_t = tc_tid_iter_elem(iter_t)
         // Gated on the KIND, not on `elem_t == TYPE_UNKNOWN`. A List/Set/Map is iterable whatever
@@ -15678,7 +15943,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 tc_pattern_binding_type = scrut_tid
                 tc_check_pattern_types(node_pattern(arm))
                 tc_pattern_binding_type = -1
-                tc_check_body(node_body(arm))
+                tc_check_stmt_match_arm(arm)
                 // Resolve the arm's body-value tid through the scoped-value memo, NOT a bare
                 // tc_lookup_node_tid: a braced arm body (`Pat => { ... }`) makes tc_arm_body_value
                 // return the Block node, whose own tid is unwritten in statement position — the
@@ -15860,10 +16125,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             infer_type(val)
             // Statement-position HOFs (l.for_each(fn(x){...})) need the MethodCall
             // branch to walk the closure body. Binding-position calls already
-            // get this via tc_check_body(val) in the LetBinding handler. Scoped to
-            // MethodCall rather than recursing unconditionally: the Assignment handler
+            // get this via tc_check_body(val) in the LetBinding handler. Scoped to the
+            // call kinds below rather than recursing unconditionally: the Assignment handler
             // lacks LetBinding's literal-to-sized-int coercion, so walking arbitrary
-            // statement values would surface spurious errors (br: separate ticket).
+            // statement values would surface spurious errors.
             //
             // Block-bearing control-flow in statement position must also be walked:
             // infer_type only visits a block's tail, so non-tail statements inside
@@ -15890,9 +16155,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // parse_primary expression whose method bodies infer_type does not walk, so its body
             // diagnostics are skipped and node tids unpublished unless it reaches the HandlerExpr
             // arm here. A handler consumed by `with` routes through the WithBlock arm instead.
-            if tc_stmt_value_walks_body(node_kind(val)) {
-                tc_check_body(val)
-            }
+            tc_walk_stmt_value(val)
         }
         return
     }
@@ -15925,7 +16188,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // value's shape, never the bodies nested inside it (a struct literal's block-valued
             // fields, a returned closure's or handler's method bodies, a call's closure args),
             // so those stay unwalked unless this walk reaches them.
-            if tc_stmt_value_walks_body(node_kind(val)) { tc_check_body(val) }
+            tc_walk_stmt_value(val)
         } else {
             if tc_current_fn_ret != TYPE_VOID && tc_tid_is_no_info(tc_current_fn_ret) == 0 {
                 tc_error_at("function '{tc_current_fn_name}' returns {type_to_str(tc_current_fn_ret)} but bare 'return' has no value", node)
@@ -16011,24 +16274,18 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     }
 
     // A struct-literal field value in binding/statement position (`let b = Box { v: match
-    // ... }`). infer_type's StructLit arm inters field values only on the GENERIC
-    // reverse-inference path — a non-generic struct returns its bare tid without ever typing
-    // a field — so a block-bearing value there (a match whose every arm is a binder) never
-    // got walked in scope and its node kept TYPE_UNKNOWN. Codegen then spelled the result
-    // temp int64_t. Walk each block-bearing field value the same way the ExprStmt arm
-    // re-dispatches a statement-position match: only is_block_bearing values, because a plain
-    // field value infer_type has already visited (on the generic path) or does not need
-    // re-walking, and recursing unconditionally would surface the spurious errors the ExprStmt
-    // arm's comment describes.
+    // ... }`, `Route { cb: Some(fn(x: Int) -> Int { x }) }`). infer_type's StructLit arm
+    // inters field values only on the GENERIC reverse-inference path — a non-generic struct
+    // returns its bare tid without ever typing a field — so nothing there walked a
+    // block-bearing value's non-tail statements, nor a closure buried in a call argument.
+    // A field value is a value in statement position like any other, so it takes the same
+    // walk chooser a `let` value takes.
     if kind == NodeKind.StructLit {
         let sl_flds = node_fields(node)
         if sl_flds != -1 {
             let mut sfi = 0
             while sfi < sublist_length(sl_flds) {
-                let sfv = node_value(sublist_get(sl_flds, sfi))
-                if sfv != -1 && is_block_bearing(node_kind(sfv)) != 0 {
-                    tc_check_body(sfv)
-                }
+                tc_walk_stmt_value(node_value(sublist_get(sl_flds, sfi)))
                 sfi = sfi + 1
             }
         }
@@ -17399,3 +17656,300 @@ fn tc_ann_names_tparam(ann: Int, param_name: Str) -> Bool {
 // behind it. Widening the admitted set means re-establishing alignment here, not
 // relying on a later screen. The capture cost of staying narrow is
 // still nil (a closure typed over a sized int / Char binds no target-corpus tparam).
+
+// ── Phase 4/5: total stamping ───────────────────────────────────────
+//
+// Inference stamps a node's type as a SIDE EFFECT of being asked for it, and the walk that
+// asks is driven by tc_check_body, which reaches statement forms only. So a value that no
+// statement arm happens to ask about carries nothing, and every later reader — the mono
+// pass, codegen's two tid chokepoints — is left guessing from syntax instead of reading an
+// answer. These two phases turn that from a silent gap into a reported one.
+//
+// Phase 4 RECOVERS, bottom-up, the types that are already determined but never written down:
+// a scope- or branch-bearing form in a position tc_check_body does not walk (an argument, an
+// initializer) is typed by its tail, which the walk DID memoize. It publishes only what it
+// can read back; it never infers, because infer_type reports as it goes and inferring a form
+// the checker skipped would invent diagnostics the program does not deserve.
+//
+// Phase 5 ASSERTS: every node whose kind denotes or binds a value must now carry a concrete
+// type, or the compiler raises I0001 against that node. TC_UNSTAMPED_KINDS holds the kinds
+// still known to break that rule; it is temporary, it is measured by the ratchet, and it
+// must reach 0.
+
+// Kinds whose nodes are still allowed to carry no type. TEMPORARY: each entry is a hole with
+// a ticket, not a design decision, and the ratchet row that counts this list must reach 0.
+//
+//   Ident        - a module qualifier in receiver position (`io` in `io.println`) names a
+//                  namespace, not a value, and nothing types it. Needs the qualifier to stop
+//                  being an Ident node, or a namespace type.
+//   IdentPattern - a match-arm binder is typed by the scrutinee, but only the arms the
+//                  checker walked record it.
+//   MethodCall   - two unattributed populations, one per position.
+//   FieldAccess  - a field reached through a type-parameter binder has no type at the
+//                  definition site by construction; only the mono pass can answer.
+pub fn tc_kind_unstamped_allowed(k: NodeKind) -> Int {
+    if k == NodeKind.Ident { return 1 }
+    if k == NodeKind.IdentPattern { return 1 }
+    if k == NodeKind.MethodCall { return 1 }
+    if k == NodeKind.FieldAccess { return 1 }
+    0
+}
+
+// Whether `tid` answers the question "what type is this" — a tid that resolves to a real
+// pool entry and not to an unsolved metavariable.
+pub fn tc_tid_is_concrete(tid: Int) -> Int {
+    if tc_tid_is_no_info(tid) != 0 { return 0 }
+    let r = tc_tid_resolved(tid)
+    if tc_tid_is_no_info(r) != 0 { return 0 }
+    if tc_is_unbound_metavar(r) != 0 { return 0 }
+    1
+}
+
+// The type a scope- or branch-bearing form has by virtue of its tail, or -1 when nothing can
+// be read back. Void is the answer for a form in statement position: it completes, and the
+// value it does not produce is `()`. Never comes first, because a form every path leaves
+// produces no value at all and codegen reads that distinction to decide reachability.
+fn tc_recovered_scope_tid(node: Int) -> Int {
+    let k = node_kind(node)
+    if k == NodeKind.Block {
+        if tc_block_exits(node) != 0 { return TYPE_NEVER }
+    }
+    // §2.9: an `if` with no else produces nothing on the path that skips the branch, so it holds
+    // `()` whatever the branch evaluates to. Reached only when no consumer typed the form, which
+    // is the statement position the rule is about.
+    if k == NodeKind.IfExpr {
+        if node_else_body(node) == -1 { return TYPE_VOID }
+    }
+    let memo = tc_scoped_value_memo(node, 0)
+    if tc_tid_is_concrete(memo) != 0 { return memo }
+    // A tail that produces a value of its own but carries no type leaves the whole form
+    // unknown. `()` would claim a value the form does not have, and would hide the tail as the
+    // real hole, so nothing is published and the consumer above reads as a cascade instead.
+    let tail = tc_scoped_tail_node(node, 0)
+    if tail != -1 {
+        if tc_tid_is_concrete(tc_lookup_node_tid(tail)) == 0 { return -1 }
+    }
+    if k == NodeKind.Block { return TYPE_VOID }
+    if k == NodeKind.IfExpr { return TYPE_VOID }
+    if k == NodeKind.MatchExpr { return TYPE_VOID }
+    if k == NodeKind.WithBlock { return TYPE_VOID }
+    if k == NodeKind.AsyncScope { return TYPE_VOID }
+    -1
+}
+
+// The node whose value a block-bearing form evaluates to, or -1 when its last statement
+// produces none. Mirrors tc_scoped_value_memo's descent, which reads the TYPE at this same
+// node; a branching form has no single tail and answers -1.
+fn tc_scoped_tail_node(node: Int, depth: Int) -> Int {
+    if node == -1 { return -1 }
+    if depth >= 8 { return -1 }
+    let k = node_kind(node)
+    if k == NodeKind.WithBlock || k == NodeKind.AsyncScope {
+        return tc_scoped_tail_node(node_body(node), depth + 1)
+    }
+    if k == NodeKind.Block {
+        let tail = tc_block_tail_stmt(node)
+        if tail == -1 { return -1 }
+        return tc_block_tail_value(tail)
+    }
+    -1
+}
+
+// One node, after its children. Publishing nothing is always allowed here; Phase 5 is what
+// decides whether the absence is tolerable.
+fn tc_stamp_recover_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let k = node_kind(node)
+    if k == NodeKind.TypeDef {
+        tc_stamp_type_field_defaults(node)
+        return
+    }
+    // §3.3: control transfer produces no value, and the rule belongs on the statement node
+    // itself — the checker only ever asks about the Block that wraps it.
+    if k == NodeKind.Return || k == NodeKind.Break || k == NodeKind.Continue {
+        tc_publish_node_tid(node, TYPE_NEVER)
+        return
+    }
+    // A literal chunk of an interpolated string IS a string literal; only the interpolated
+    // expressions between the chunks are inferred.
+    if k == NodeKind.Ident {
+        if is_literal_string_part(node) != 0 { tc_publish_node_tid(node, TYPE_STR) }
+        return
+    }
+    if tc_tid_is_concrete(tc_lookup_node_tid(node)) != 0 { return }
+    if k == NodeKind.Block || k == NodeKind.IfExpr || k == NodeKind.MatchExpr {
+        tc_publish_node_tid(node, tc_recovered_scope_tid(node))
+        return
+    }
+    if k == NodeKind.WithBlock || k == NodeKind.AsyncScope {
+        tc_publish_node_tid(node, tc_recovered_scope_tid(node))
+        return
+    }
+    // A call through a value — `(self.action)()`, a closure held in a field or a local — has
+    // no name for the Call arm to look up, so nothing types it. The callee's own type says
+    // what the call answers: child 0 of a Fn tid is its return type.
+    if k == NodeKind.Call {
+        if tc_tid_is_concrete(tc_lookup_node_tid(node)) != 0 { return }
+        if node_left(node) == -1 { return }
+        let callee_t = tc_tid_resolved(tc_lookup_node_tid(node_left(node)))
+        if type_kind(callee_t) == TyKind.Fn { tc_publish_node_tid(node, tc_tid_child(callee_t, 0)) }
+        return
+    }
+    // `..base` in a struct literal contributes the fields of the value it spreads, so it has
+    // exactly that value's type.
+    if k == NodeKind.SpreadExpr {
+        tc_publish_node_tid(node, tc_lookup_node_tid(node_value(node)))
+        return
+    }
+    // §2.11: a loop evaluates to `()`, except a `loop` no `break` targets, which never exits.
+    if k == NodeKind.LoopExpr {
+        if tc_loop_diverges(node) != 0 {
+            tc_publish_node_tid(node, TYPE_NEVER)
+        } else {
+            tc_publish_node_tid(node, TYPE_VOID)
+        }
+    }
+}
+
+// A field DEFAULT is the one value expression no ordinary walk reaches: nothing calls it and
+// codegen only ever emits it. Checked at the declaration, where the field's resolved type is in
+// hand and the declaration's type parameters can be put back in scope for it.
+fn tc_stamp_type_field_defaults(td: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let flds_sl = node_fields(td)
+    if flds_sl == -1 { return }
+    let struct_tid = named_type_map.get(node_name(td)) ?? -1
+    let tparams = node_type_params(td)
+    tc_push_tparam_scope(tparams)
+    let mut i = 0
+    while i < sublist_length(flds_sl) {
+        let f = sublist_get(flds_sl, i)
+        if node_kind(f) == NodeKind.TypeField {
+            let dflt = node_condition(f)
+            if dflt != -1 {
+                tc_stamp_field_default(dflt, get_struct_field_tid(struct_tid, node_name(f)))
+                // The surrounding walk recovers the default's nodes BEFORE it reaches this
+                // declaration, so a node that reads its type from a child — a closure body's
+                // block from its tail — had nothing to read then. Recover the subtree again now
+                // that the check above has typed it.
+                let _ = tc_stamp_walk(dflt)
+            }
+        }
+        i = i + 1
+    }
+    tc_pop_tparam_scope(tparams)
+}
+
+// The default's value against the field's declared type: the same pair of walks a let
+// binding's value gets, so a container default types its elements and a closure default binds
+// its params and types its body.
+// @allow: publishing types IS this function's effect, as in tc_walk_stmt_value; the one global
+// it must not leak, the construct hint, is saved and restored.
+@allow(UnrestoredMutation)
+fn tc_stamp_field_default(dflt: Int, ftid: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    tc_seed_closure_expected_fn(dflt, ftid)
+    let saved_hint = tc_construct_hint
+    if tc_tid_is_no_info(ftid) == 0 { tc_construct_hint = resolve_alias_tid(ftid) }
+    let inferred = tc_infer_value(dflt)
+    tc_construct_hint = saved_hint
+    if tc_tid_is_concrete(tc_lookup_node_tid(dflt)) == 0 { tc_publish_node_tid(dflt, inferred) }
+    tc_walk_stmt_value(dflt)
+}
+
+// Post-order over the value children of `node`. Explicitly iterative: the AST is as deep as
+// the source nests, and a recursive walk over the compiler's own longest functions is a
+// stack the recovery pass has no reason to spend.
+fn tc_stamp_walk(root: Int) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let mut order: List[Int] = []
+    if root == -1 { return order }
+    let mut seen: Map[Int, Int] = Map()
+    let mut stack: List[Int] = [root]
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap()
+        if seen.contains_key(n) { continue }
+        seen.insert(n, 1)
+        order.push(n)
+        let kids = node_value_child_ids(n)
+        let mut i = 0
+        while i < kids.len() {
+            stack.push(kids.get(i).unwrap())
+            i = i + 1
+        }
+    }
+    let mut j = order.len() - 1
+    while j >= 0 {
+        tc_stamp_recover_node(order.get(j).unwrap())
+        j = j - 1
+    }
+    order
+}
+
+// Whether `n` has no type only because a node it is built out of has none. A parent reads its
+// type from its children, so the parent of an unanswered child cannot answer either: the hole
+// is the child's. Reporting only the frontier names the one node to fix instead of the whole
+// chain above it.
+fn tc_stamp_is_cascade(n: Int) -> Int {
+    // `.await` answers with the PAYLOAD of its operand's handle, so a handle whose payload is
+    // still open leaves it nothing to read even though the operand itself has a type. The hole
+    // is in whatever failed to pin the payload — the spawned closure's return.
+    if node_kind(n) == NodeKind.AwaitExpr {
+        let awaited = tc_tid_resolved(tc_lookup_node_tid(node_obj(n)))
+        if tc_tid_kind(awaited) != TyKind.Handle { return 1 }
+        if tc_tid_child_count(awaited) < 1 { return 1 }
+        if tc_tid_is_concrete(tc_tid_child(awaited, 0)) == 0 { return 1 }
+        return 0
+    }
+    // A block-bearing form reads its type from its TAIL and from nothing else, so the tail is
+    // the only child that can be its hole — its other statements are typed on their own.
+    let tail = tc_scoped_tail_node(n, 0)
+    if tail != -1 {
+        if tc_tid_is_concrete(tc_lookup_node_tid(tail)) == 0 { return 1 }
+        return 0
+    }
+    let kids = node_value_child_ids(n)
+    let mut i = 0
+    while i < kids.len() {
+        let kid = kids.get(i).unwrap()
+        if kid != -1 {
+            if nk_is_typed(nk_of(node_kind(kid))) != 0 {
+                if tc_tid_is_concrete(tc_lookup_node_tid(kid)) == 0 { return 1 }
+            }
+        }
+        i = i + 1
+    }
+    0
+}
+
+// Phase 5. Reports against the first offending node per kind, so a systemic hole reads as one
+// error naming its kind and not as thousands.
+fn tc_stamp_assert(order: List[Int]) ! Diag.Report {
+    let mut reported: Map[Str, Int] = Map()
+    let mut i = 0
+    while i < order.len() {
+        let n = order.get(i).unwrap()
+        let k = nk_of(node_kind(n))
+        if nk_is_typed(k) != 0 && tc_kind_unstamped_allowed(k) == 0 {
+            if tc_tid_is_concrete(tc_lookup_node_tid(n)) == 0 && tc_stamp_is_cascade(n) == 0 {
+                let kn = node_kind_name(node_kind(n))
+                if reported.contains_key(kn) == false {
+                    reported.insert(kn, 1)
+                    diag_ice_at("NodeCarriesNoType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                        "a {kn} node reached the end of type checking with no type",
+                        n,
+                        "every node whose kind denotes or binds a value must carry a type by the end of inference; this is a compiler defect, not a program error")
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Phases 4 and 5 over one program. Separate from check_types so `blink check` and the test
+// harness reach the same pass by the same name.
+pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let order = tc_stamp_walk(program)
+    // A program that already has an error has nodes inference deliberately never typed: the
+    // arm that would have typed them reported instead and returned. Asserting there turns
+    // every ordinary type error into an internal-compiler-error cascade, so the total-stamp
+    // claim only holds for a program that type checks.
+    if diag_count > 0 { return }
+    tc_stamp_assert(order)
+}
