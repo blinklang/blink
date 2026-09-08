@@ -12083,6 +12083,20 @@ pub fn tc_publish_node_tid(node: Int, tid: Int) {
     tc_node_tid.set(node, tid)
 }
 
+// `scope.alloc()` / `scope.alloc_n(n)` cannot spell their own pointee (see the FFIScope
+// arm below), so the only thing that says what they allocate is the type expected of the
+// call — a let annotation, a parameter, or a return type. Hand that back when it really is
+// a pointer, so the node carries a type instead of nothing. Anything else, an absent
+// expectation included, stays untyped: an invented pointee would be a guess, not an answer.
+// Resolved, because the carrier-argument set site (infer_carrier_arg) stores a raw pool
+// inner and every other reader of this channel resolves before it tests the kind.
+fn tc_ffi_alloc_hint_tid() -> Int {
+    if tc_construct_hint < 0 { return -1 }
+    let hint_tid = resolve_alias_tid(tc_construct_hint)
+    if type_kind(hint_tid) != TyKind.Ptr { return -1 }
+    hint_tid
+}
+
 @allow(UnrestoredMutation)
 fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // No node is an absence, not a type. Every caller reads it through tc_tid_is_no_info.
@@ -13488,24 +13502,26 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         }
 
         // The four ffi.scope() allocators, against the operation table at
-        // sections/07_trust_modules_metadata.md:280-286 and codegen's own emitter block
+        // sections/07_trust_modules_metadata.md:309-313 and codegen's own emitter block
         // (codegen_methods.bl:4886), which sets expr_result_type = pointer for all four.
         //
         // Two of the four are fully signable: `cstr` is monomorphic
-        // (`fn cstr(self, s: Str) -> Ptr[U8]`, :285) and matches the
+        // (`fn cstr(self, s: Str) -> Ptr[U8]`, :312) and matches the
         // `Str.as_cstr()` signature above; `take` is the IDENTITY on its argument's type
-        // (`fn take[T](self, ptr: Ptr[T]) -> Ptr[T]`, :286), so it needs the argument's tid
+        // (`fn take[T](self, ptr: Ptr[T]) -> Ptr[T]`, :313), so it needs the argument's tid
         // and no inference at all.
         //
-        // `alloc` / `alloc_n` are deliberately UNSIGNED. The spec writes the pointee at the
-        // call site — `scope.alloc[T]()`, `scope.alloc_n[T](n)` — but that spelling does not
-        // parse as a method call: parser.bl:2887 accepts a `[` after a member name for the one
-        // hard-coded `channel.new[T]` form and nothing else, so the type argument never
-        // reaches the AST. The only channel that carries the pointee today is the
-        // let annotation, which codegen reads directly (resolve_ptr_inner_c). TYPE_UNKNOWN is
-        // the honest answer and leaves that path byte-identical; minting `Ptr[metavar]` would
-        // make every unannotated `let p = scope.alloc()` in the corpus E0301 with nothing to
-        // bind it. Their argument IS checked: alloc_n takes a count, and
+        // `alloc` / `alloc_n` cannot infer a pointee of their own. The spec writes it at the
+        // call site — `scope.alloc[T]()` (sections/07_trust_modules_metadata.md:311),
+        // `scope.alloc_n[T](n)` (:564) — but that spelling does not parse as a method call:
+        // parser.bl:2896 accepts a `[` after a member name for the one hard-coded
+        // `channel.new[T]` form and nothing else, so the type argument never reaches the AST.
+        // What is left is the type expected of the call, which tc_ffi_alloc_hint_tid reads;
+        // without one they stay untyped. Minting `Ptr[metavar]` instead would make every
+        // unannotated `let p = scope.alloc()` in the corpus E0301 with nothing to bind it.
+        // Codegen sizes the allocation from its own let annotation (resolve_ptr_inner_c), a
+        // narrower channel than this one, so the two agree on a let and only this one answers
+        // for an argument or a return. Their argument IS checked: alloc_n takes a count, and
         // passing a Str for it silently calloc'd a garbage size and returned NULL.
         if obj_k == TyKind.FfiScope {
             let args_sl = node_args(node)
@@ -13518,17 +13534,18 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 let taken_t = infer_type(sublist_get(args_sl, 0))
                 let taken_k = type_kind(resolve_alias_tid(taken_t))
                 if taken_k == TyKind.Ptr { return taken_t }
-                // An unresolved argument keeps the unresolved answer — `scope.take(scope.alloc())`
-                // is the corpus's own spelling and its argument has no tid by design (above).
+                // An unresolved argument keeps the unresolved answer. `scope.take(scope.alloc())`
+                // is the corpus's own spelling, and with nothing expecting a pointer around it
+                // the inner allocator has no type to give (above).
                 if taken_k == TyKind.Unknown || taken_k == TyKind.Typevar { return -1 }
                 tc_error_at("argument 1 of 'scope.take' expects Ptr[T], got {type_to_str(taken_t)}", sublist_get(args_sl, 0))
                 return tc_error_recovery_tid()
             }
             if method == "alloc_n" {
                 check_builtin_arg(method, 0, TYPE_INT, args_sl, "scope")
-                return -1
+                return tc_ffi_alloc_hint_tid()
             }
-            if method == "alloc" { return -1 }
+            if method == "alloc" { return tc_ffi_alloc_hint_tid() }
         }
 
         if obj_k == TyKind.Struct || obj_k == TyKind.Enum {

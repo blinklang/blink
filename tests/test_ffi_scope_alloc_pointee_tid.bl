@@ -1,0 +1,161 @@
+// `scope.alloc()` and `scope.alloc_n(n)` cannot name their own pointee: the spec writes it
+// at the call site (`scope.alloc[T]()`, sections/07_trust_modules_metadata.md:311;
+// `scope.alloc_n[T](n)`, :564), and the parser does not accept that spelling on a method
+// call. What is left is the type expected of the call, so that is what the node must carry.
+//
+// Without an expectation there is no pointee to give, and the call stays untyped rather than
+// guessing one. That case is pinned below, because a guess here would be a wrong allocation
+// size, not a missing one.
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
+import parser.{nodes, node_kind, node_method}
+import ast.{NodeKind}
+import std.io
+import codegen_expr
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 0)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn method_call_count(name: Str) -> Int {
+    let mut n = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.MethodCall {
+            if node_method(i) == name { n = n + 1 }
+        }
+        i = i + 1
+    }
+    n
+}
+
+fn stamped_method_call_count(name: Str) -> Int {
+    let mut n = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.MethodCall {
+            if node_method(i) == name {
+                if tc_lookup_node_tid(i) >= 0 { n = n + 1 }
+            }
+        }
+        i = i + 1
+    }
+    n
+}
+
+fn first_method_call_type_str(name: Str) -> Str {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.MethodCall {
+            if node_method(i) == name {
+                return tc_type_str(tc_lookup_node_tid(i))
+            }
+        }
+        i = i + 1
+    }
+    ""
+}
+
+fn check_all_stamped(name: Str, expect_total: Int) {
+    let total = method_call_count(name)
+    let stamped = stamped_method_call_count(name)
+    if total != expect_total { io.println("FAIL {name}: probe produced {total} calls, expected {expect_total}") }
+    assert(total == expect_total)
+    if stamped < total { io.println("FAIL {name}: {stamped}/{total} '.{name}' calls stamped with a tid") }
+    assert(stamped == total)
+}
+
+let ALLOC_SRC: Str = #"fn main() {
+    with ffi.scope() as scope {
+        let p: Ptr[Float] = scope.alloc()
+        p.write(1.5)
+        let _v: Float = p.deref()
+    }
+}
+"#
+
+let ALLOC_N_SRC: Str = #"type Pollfd {
+    fd: I32
+    events: I16
+    revents: I16
+}
+
+fn main() {
+    with ffi.scope() as scope {
+        let p: Ptr[Pollfd] = scope.alloc_n(3)
+        let cell = p.offset(0)
+        cell.fd.write(7)
+    }
+}
+"#
+
+// Several calls on one binder in one block, which is the shape the census row came from.
+let MANY_SRC: Str = #"fn main() {
+    with ffi.scope() as scope {
+        let a: Ptr[Int] = scope.alloc()
+        let b: Ptr[Int] = scope.alloc()
+        let c: Ptr[U8] = scope.cstr("hi")
+        a.write(1)
+        b.write(2)
+        let _n = c.addr()
+    }
+}
+"#
+
+// No annotation, so nothing anywhere carries the pointee. TYPE_UNKNOWN stays the honest
+// answer — the stamp must come from the declared type and must not be invented.
+let UNANNOTATED_SRC: Str = #"fn main() {
+    with ffi.scope() as scope {
+        let p = scope.alloc()
+        let _q = p
+    }
+}
+"#
+
+// The allocator nested inside `scope.take`, whose own result is the identity on its argument.
+// Stamping the inner call makes the outer one resolvable too.
+let TAKE_SRC: Str = #"fn main() {
+    with ffi.scope() as scope {
+        let p: Ptr[Int] = scope.take(scope.alloc())
+        p.write(3)
+    }
+}
+"#
+
+test "an annotated scope.alloc carries the annotation's pointer type" {
+    typecheck_probe("build/ffi_alloc_tid_alloc.bl", ALLOC_SRC)
+    check_all_stamped("alloc", 1)
+    assert_eq(first_method_call_type_str("alloc"), "Ptr[Float]")
+}
+
+test "an annotated scope.alloc_n carries the annotation's pointer type" {
+    typecheck_probe("build/ffi_alloc_tid_allocn.bl", ALLOC_N_SRC)
+    check_all_stamped("alloc_n", 1)
+    assert_eq(first_method_call_type_str("alloc_n"), "Ptr[Pollfd]")
+}
+
+test "every allocator call on one with-binder is stamped" {
+    typecheck_probe("build/ffi_alloc_tid_many.bl", MANY_SRC)
+    check_all_stamped("alloc", 2)
+    check_all_stamped("cstr", 1)
+    assert_eq(first_method_call_type_str("alloc"), "Ptr[Int]")
+    assert_eq(first_method_call_type_str("cstr"), "Ptr[U8]")
+}
+
+test "an unannotated scope.alloc stays untyped rather than guessing" {
+    typecheck_probe("build/ffi_alloc_tid_bare.bl", UNANNOTATED_SRC)
+    assert_eq(method_call_count("alloc"), 1)
+    assert_eq(stamped_method_call_count("alloc"), 0)
+}
+
+test "scope.take over an annotated scope.alloc stamps both calls" {
+    typecheck_probe("build/ffi_alloc_tid_take.bl", TAKE_SRC)
+    check_all_stamped("alloc", 1)
+    check_all_stamped("take", 1)
+    assert_eq(first_method_call_type_str("alloc"), "Ptr[Int]")
+    assert_eq(first_method_call_type_str("take"), "Ptr[Int]")
+}
