@@ -1,0 +1,231 @@
+// A `with` block is an expression, so its node must carry the type of its own tail.
+// sections/02_syntax.md:1017 — "`with...as` is an expression. The block's value is its last
+// expression, same as any other block." sections/05_memory_compile_errors.md:171 — a
+// `with arena` block "evaluates to the value of `body`'s tail expression"; a tail that is
+// only a statement gives `()`.
+//
+// The tail usually names a binding the block itself introduces, which the speculative
+// infer_type cannot see, so the type has to be read back after the body is walked.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
+import parser.{nodes, node_kind}
+import ast.{NodeKind}
+import std.io
+import codegen_expr
+
+// use_prelude=0: `nodes` then holds ONLY this probe's blocks, so a stamped-vs-total
+// invariant cannot be diluted by library `with` blocks.
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 0)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn total_with_count() -> Int {
+    let mut n = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.WithBlock { n = n + 1 }
+        i = i + 1
+    }
+    n
+}
+
+fn stamped_with_count() -> Int {
+    let mut n = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.WithBlock {
+            if tc_lookup_node_tid(i) >= 0 { n = n + 1 }
+        }
+        i = i + 1
+    }
+    n
+}
+
+// The spelling of the FIRST with-block's tid, so a test can prove the stamp is the tail's
+// type and not merely a non-negative number.
+fn first_with_type_str() -> Str {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.WithBlock {
+            return tc_type_str(tc_lookup_node_tid(i))
+        }
+        i = i + 1
+    }
+    ""
+}
+
+fn check_all_stamped(label: Str, expect_total: Int) {
+    let total = total_with_count()
+    let stamped = stamped_with_count()
+    if total != expect_total { io.println("FAIL {label}: probe produced {total} with-blocks, expected {expect_total}") }
+    assert(total == expect_total)
+    if stamped < total { io.println("FAIL {label}: {stamped}/{total} with-blocks stamped with a tid") }
+    assert(stamped == total)
+}
+
+let LIST_TAIL_SRC: Str = #"fn main() {
+    let xs = with arena {
+        let mut l: List[Int] = []
+        l.push(1)
+        l
+    }
+    let _n = xs.len()
+}
+"#
+
+let MAP_TAIL_SRC: Str = #"fn main() {
+    let m = with arena {
+        let mut d: Map[Str, Int] = Map()
+        d.insert("a", 1)
+        d
+    }
+    let _n = m.len()
+}
+"#
+
+let SCALAR_TAIL_SRC: Str = #"fn main() {
+    let n = with arena {
+        let k = 41
+        k + 1
+    }
+    let _m = n + 0
+}
+"#
+
+let CARRIER_TAIL_SRC: Str = #"fn main() {
+    let o = with arena {
+        let c: Option[Int] = Some(3)
+        c
+    }
+    let _u = o.unwrap()
+}
+"#
+
+let NESTED_SRC: Str = #"fn main() {
+    let xs = with arena {
+        let inner = with arena {
+            let mut l: List[Int] = []
+            l.push(1)
+            l
+        }
+        inner
+    }
+    let _n = xs.len()
+}
+"#
+
+// The resource form of `with`, in value position: the block's value is its tail, exactly as
+// for the handler form (sections/02_syntax.md:1020).
+let RESOURCE_TAIL_SRC: Str = #"type Res { tag: Str }
+
+impl Closeable for Res {
+    fn close(_self) { }
+}
+
+fn main() {
+    let s = with Res { tag: "A" } as r {
+        r.tag
+    }
+    let _n = s.len()
+}
+"#
+
+// A with-block whose RESOURCE expression is itself a method call, so the stamp cannot depend
+// on the resource being a bare literal.
+let RESOURCE_FROM_CALL_SRC: Str = #"type Res { tag: Str }
+
+trait Dup { fn dup(self) -> Res }
+
+impl Dup for Res {
+    fn dup(self) -> Res { Res { tag: self.tag } }
+}
+
+impl Closeable for Res {
+    fn close(_self) { }
+}
+
+fn main() {
+    let base = Res { tag: "A" }
+    let s = with base.dup() as r {
+        r.tag
+    }
+    let _n = s.len()
+}
+"#
+
+// Statement position. The block's tail is a statement, so the block is `()` — and `()` is a
+// type, so the node must carry it rather than nothing.
+// No value-bearing last statement at all: the spec gives this block `()`.
+let STATEMENT_ONLY_TAIL_SRC: Str = #"fn main() {
+    with arena {
+        let mut l: List[Int] = []
+        let _n = l.len()
+    }
+}
+"#
+
+let STATEMENT_SRC: Str = #"fn main() {
+    with arena {
+        let mut l: List[Int] = []
+        l.push(1)
+    }
+}
+"#
+
+test "a with-block whose tail is a List carries the tail's tid" {
+    typecheck_probe("build/with_value_tid_list.bl", LIST_TAIL_SRC)
+    check_all_stamped("list tail", 1)
+    assert_eq(first_with_type_str(), "List[Int]")
+}
+
+test "a with-block whose tail is a Map carries the tail's tid" {
+    typecheck_probe("build/with_value_tid_map.bl", MAP_TAIL_SRC)
+    check_all_stamped("map tail", 1)
+    assert_eq(first_with_type_str(), "Map[Str, Int]")
+}
+
+test "a with-block whose tail is a scalar carries the tail's tid" {
+    typecheck_probe("build/with_value_tid_scalar.bl", SCALAR_TAIL_SRC)
+    check_all_stamped("scalar tail", 1)
+    assert_eq(first_with_type_str(), "Int")
+}
+
+test "a with-block whose tail is a carrier carries the carrier tid" {
+    typecheck_probe("build/with_value_tid_carrier.bl", CARRIER_TAIL_SRC)
+    check_all_stamped("carrier tail", 1)
+    assert_eq(first_with_type_str(), "Option[Int]")
+}
+
+test "nested with-blocks are each stamped" {
+    typecheck_probe("build/with_value_tid_nested.bl", NESTED_SRC)
+    check_all_stamped("nested", 2)
+}
+
+test "a with-resource block in value position is stamped" {
+    typecheck_probe("build/with_value_tid_resource.bl", RESOURCE_TAIL_SRC)
+    check_all_stamped("resource tail", 1)
+    assert_eq(first_with_type_str(), "Str")
+}
+
+test "a with-block whose resource expression is a method call is stamped" {
+    typecheck_probe("build/with_value_tid_resource_call.bl", RESOURCE_FROM_CALL_SRC)
+    check_all_stamped("resource from call", 1)
+    assert_eq(first_with_type_str(), "Str")
+}
+
+test "a with-block whose tail returns nothing carries the unit type" {
+    typecheck_probe("build/with_value_tid_stmt.bl", STATEMENT_SRC)
+    check_all_stamped("statement position", 1)
+    assert_eq(first_with_type_str(), "Void")
+}
+
+test "a with-block with no value-bearing tail carries the unit type" {
+    typecheck_probe("build/with_value_tid_stmt_only.bl", STATEMENT_ONLY_TAIL_SRC)
+    check_all_stamped("statement-only tail", 1)
+    assert_eq(first_with_type_str(), "Void")
+}
