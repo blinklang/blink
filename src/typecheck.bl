@@ -14319,10 +14319,46 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 }
                 let qt_recv = infer_type(sublist_get(qt_args, 0))
                 let qt_k = type_kind(qt_recv)
-                // A typevar or unknown receiver keeps today's answer: that is the spec's
-                // `fn show[T: Describe](v: T) { Describe.describe(v) }` form (:706), where
-                // the bound guarantees the method exists, the impl is chosen per
-                // instantiation, and there is no single fnsig to read.
+                // A receiver that is a BOUNDED type parameter — the spec's own
+                // `fn show[T: Describe](v: T) { Describe.describe(v) }` form (:706). No impl
+                // fnsig can answer, because the impl is chosen per instantiation, but the bound
+                // that LICENSES the call declares the signature, and that declared signature is
+                // already the answer the unqualified `v.describe()` takes on the same receiver
+                // (the bounded-typevar arm of the instance path). Both spellings of one call
+                // read one signature. A bound naming some other trait licenses nothing here and
+                // falls through unanswered, as an unbounded parameter does.
+                if qt_k == TyKind.Typevar {
+                    if tc_pipe_has(tc_tparam_bound_traits(type_to_str(qt_recv)), obj_name) != 0 {
+                        // The sealed synthesized `display()`, which has no declared signature
+                        // anywhere — the same arm the instance path carries. Its arity is spelled
+                        // here for the same reason: with no declaration to count, nothing else
+                        // can, and the extra arguments were accepted and then dropped.
+                        if obj_name == "Display" && method == "display" {
+                            if qt_n != 1 {
+                                tc_error_at("qualified trait call 'Display.display' expects 1 argument(s) including the receiver, got {qt_n}", node)
+                            }
+                            return TYPE_STR
+                        }
+                        let mut qv = 0
+                        while qv < tc_tmsig_pool.len() {
+                            let qtm = tc_tmsig_pool.get(qv).unwrap()
+                            if qtm.trait_name == obj_name && qtm.method == method {
+                                // The receiver IS param 0 (`self`), so the declared param count
+                                // is the qualified form's arity exactly, as it is on the concrete
+                                // path below. The per-argument type compare is NOT made here: a
+                                // trait param declared `Self` or over a trait type parameter is
+                                // bound per instantiation, and comparing an unbound one rejects
+                                // correct code.
+                                if qt_n != qtm.params_count {
+                                    tc_error_at("qualified trait call '{obj_name}.{method}' expects {qtm.params_count} argument(s) including the receiver, got {qt_n}", node)
+                                }
+                                return qtm.ret_tid
+                            }
+                            qv = qv + 1
+                        }
+                    }
+                }
+                // An unknown receiver keeps today's answer: there is no fnsig to read.
                 // The receiver's name in the impl registry: a struct or an enum answers with
                 // its own name, a builtin container with its kind name. `impl[T] Sizer[T] for
                 // List[T]` registers under `List_Sizer_tag`, the same key shape a struct impl
@@ -18115,7 +18151,14 @@ fn tc_scoped_tail_node(node: Int, depth: Int) -> Int {
     if k == NodeKind.Block {
         let tail = tc_block_tail_stmt(node)
         if tail == -1 { return -1 }
-        return tc_block_tail_value(tail)
+        let v = tc_block_tail_value(tail)
+        if v == -1 { return -1 }
+        // A tail statement whose KIND carries no type produces no value: §2.11 signs `for` and
+        // `while` as `()`, and the block-tail rule accepts both. Asking one for a type answers
+        // "unknown", which reads as an unanswered tail and leaves the block — and every form
+        // above it — with nothing to publish.
+        if nk_is_typed(nk_of(node_kind(v))) == 0 { return -1 }
+        return v
     }
     -1
 }
@@ -18178,12 +18221,21 @@ fn tc_stamp_recover_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.
 // A field DEFAULT is the one value expression no ordinary walk reaches: nothing calls it and
 // codegen only ever emits it. Checked at the declaration, where the field's resolved type is in
 // hand and the declaration's type parameters can be put back in scope for it.
+// @allow: the module below is saved and restored, which opts this function into the check and so
+// names the two mutations no save/restore can cover — the matched tparam push/pop pair, and the
+// type publishing that IS the point of the field-default check.
+@allow(UnrestoredMutation)
 fn tc_stamp_type_field_defaults(td: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let flds_sl = node_fields(td)
     if flds_sl == -1 { return }
     let struct_tid = named_type_map.get(node_name(td)) ?? -1
     let tparams = node_type_params(td)
     tc_push_tparam_scope(tparams)
+    // A bare name in a default resolves through the module the DECLARATION came from: the local
+    // scopes are gone by now, so a module-level binding is reached by its module key alone. The
+    // global-initializer walk sets the same global for the same reason.
+    let saved_module = nr_current_module
+    nr_current_module = node_module(td)
     let mut i = 0
     while i < sublist_length(flds_sl) {
         let f = sublist_get(flds_sl, i)
@@ -18200,6 +18252,7 @@ fn tc_stamp_type_field_defaults(td: Int) ! TypeCheck.Resolve, TypeCheck.Report, 
         }
         i = i + 1
     }
+    nr_current_module = saved_module
     tc_pop_tparam_scope(tparams)
 }
 
@@ -18308,9 +18361,57 @@ fn tc_stamp_is_cascade(n: Int) -> Int {
     0
 }
 
+// The body each node sits in: the nearest enclosing function or test block, or -1 for a node at
+// module level. Iterative, and over the WHOLE tree including the bodies the recovery walk
+// skips, so every node an unclaimed call can be recorded at has an answer here.
+fn tc_stamp_owner_map(root: Int) -> Map[Int, Int] {
+    let mut owner: Map[Int, Int] = Map()
+    if root == -1 { return owner }
+    let mut stack: List[Int] = [root]
+    let mut owners: List[Int] = [-1]
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap()
+        let o = owners.pop().unwrap()
+        if owner.contains_key(n) { continue }
+        owner.insert(n, o)
+        let k = node_kind(n)
+        let inner = if k == NodeKind.FnDef || k == NodeKind.TestBlock { n } else { o }
+        let kids = node_value_child_ids(n)
+        let mut i = 0
+        while i < kids.len() {
+            stack.push(kids.get(i).unwrap())
+            owners.push(inner)
+            i = i + 1
+        }
+    }
+    owner
+}
+
+// The bodies the stand-down covers: one entry per body that still holds an unclaimed call, and
+// -1 when a call sits at module level.
+//
+// A call no arm claimed carries nothing, and the absence spreads by DATA FLOW: the `let` it
+// initializes, then every read of that binding. A local binding lives no wider than the body
+// that declares it, and a body's result type is declared — an un-annotated signature returns
+// `()` — so the absence cannot cross the function or test block that holds the call. Standing
+// down for that body alone leaves every other body asserted. A closure is not a fence: its
+// result type may be inferred from its tail, so the absence flows out of it into the enclosing
+// body, which is why the owner is the nearest FnDef and not the nearest callable. A call at
+// module level has no fence at all — it types a global whose readers are the whole program.
+fn tc_stamp_standdown_bodies(owner: Map[Int, Int]) -> Map[Int, Int] {
+    let mut bodies: Map[Int, Int] = Map()
+    for uc in tc_unresolved_calls.keys() {
+        if tc_tid_is_no_info(tc_lookup_node_tid(uc)) != 0 {
+            bodies.insert(owner.get(uc) ?? -1, 1)
+        }
+    }
+    bodies
+}
+
 // Phase 5. Reports against the first offending node per kind, so a systemic hole reads as one
-// error naming its kind and not as thousands.
-fn tc_stamp_assert(order: List[Int]) ! Diag.Report {
+// error naming its kind and not as thousands. Nodes inside a body `stood` names are passed
+// over: an unclaimed call there leaves holes the report coming from codegen already owns.
+fn tc_stamp_assert(order: List[Int], owner: Map[Int, Int], stood: Map[Int, Int]) ! Diag.Report {
     // The name positions first, read off the PARENT, so the loop below can ask about a node
     // without having to find its parent again.
     let mut names: Map[Int, Int] = Map()
@@ -18325,6 +18426,10 @@ fn tc_stamp_assert(order: List[Int]) ! Diag.Report {
     while i < order.len() {
         let n = order.get(i).unwrap()
         let k = nk_of(node_kind(n))
+        if stood.contains_key(owner.get(n) ?? -1) {
+            i = i + 1
+            continue
+        }
         if nk_is_typed(k) != 0 && names.contains_key(n) == false {
             if tc_tid_is_concrete(tc_lookup_node_tid(n)) == 0 && tc_stamp_is_cascade(n) == 0 {
                 let kn = node_kind_name(node_kind(n))
@@ -18353,19 +18458,38 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     // The same precondition, for an error typecheck cannot report YET. A call no arm claimed
     // is codegen's to report, and until it does the absence spreads: the let it initializes
     // carries nothing, and so does every read of that binding. Nothing here can tell those
-    // apart from a real hole, so the claim waits for the program to type check completely.
+    // apart from a real hole — inside the BODY that holds the call. Every other body keeps its
+    // claim, so one unclaimed call buys silence for itself and not for the program.
     // Traced rather than silent, so "the pass stood down" is a thing a build can be asked.
+    let mut owner: Map[Int, Int] = Map()
+    let mut stood: Map[Int, Int] = Map()
     let live_unclaimed = tc_unresolved_call_count()
     if live_unclaimed > 0 {
+        owner = tc_stamp_owner_map(program)
+        stood = tc_stamp_standdown_bodies(owner)
         if dbg_channel_on("stamp") != 0 {
-            dbg_trace("stamp", "stood down: {live_unclaimed} call(s) left to the codegen backstop")
+            // The module-level pseudo-body is a key in `stood` but is not a body, so it is not
+            // counted as one.
+            let bodies = stood.len() - (if stood.contains_key(-1) { 1 } else { 0 })
+            dbg_trace("stamp", "stood down: {live_unclaimed} call(s) left to the codegen backstop, in {bodies} body(ies)")
             for uc in tc_unresolved_calls.keys() {
                 if tc_tid_is_no_info(tc_lookup_node_tid(uc)) != 0 {
-                    dbg_trace("stamp", "  .{node_method(uc)}() at {node_line(uc)}:{node_col(uc)}")
+                    // A call the owner walk never reached is fenced by nothing, which stands the
+                    // pass down everywhere — the same effect as a module-level call and a
+                    // different cause, so the trace names them apart.
+                    let where_ = if owner.contains_key(uc) == false {
+                        "<unowned: the whole program stands down>"
+                    } else {
+                        let ob = owner.get(uc) ?? -1
+                        if ob == -1 { "<module level>" } else { node_name(ob) }
+                    }
+                    dbg_trace("stamp", "  .{node_method(uc)}() at {node_line(uc)}:{node_col(uc)} in {where_}")
                 }
             }
         }
-        return
+        // A module-level call has no body to be fenced by: it types a global, and a global's
+        // readers are the whole program. That one case still stands the pass down everywhere.
+        if stood.contains_key(-1) { return }
     }
-    tc_stamp_assert(order)
+    tc_stamp_assert(order, owner, stood)
 }

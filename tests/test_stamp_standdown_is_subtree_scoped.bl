@@ -1,0 +1,167 @@
+// A call no arm of inference claimed carries nothing, and the total-stamp pass has to keep
+// quiet about it: codegen's backstop is what names it. The question these rows pin is HOW WIDE
+// that silence is. An unclaimed call in one function body must not buy silence for a hole in
+// another body — the absence spreads by data flow through local bindings, and a function body
+// is where those bindings end.
+//
+// A hole is grafted rather than written, because a hole in clean source is exactly what the
+// pass exists to make impossible. The graft appends a value node with no type to a body's
+// statement list, which is what a stamping hole looks like from the pass's side.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_unresolved_call_count, tc_stamp_program, tc_lookup_node_tid, tc_tid_is_concrete}
+import parser.{nodes, node_kind, node_name, node_body, node_stmts, sublist_push, new_sublist, finalize_sublist, node_value_child_ids}
+import ast.{NodeKind, AstNode}
+import diagnostics.{diag_count, diag_ice_count, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import codegen_expr
+
+fn compile_probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn fn_body_of(nm: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == nm { return node_body(i) }
+        i = i + 1
+    }
+    -1
+}
+
+// Blocks under `root`, and the subset of them carrying no concrete type. The second count is
+// the claim; the first is its non-vacuity guard.
+fn blocks_in(root: Int) -> Int {
+    if root == -1 { return -1 }
+    let mut found = 0
+    let mut stack: List[Int] = [root]
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap()
+        if node_kind(n) == NodeKind.Block { found = found + 1 }
+        let kids = node_value_child_ids(n)
+        let mut i = 0
+        while i < kids.len() {
+            stack.push(kids.get(i).unwrap())
+            i = i + 1
+        }
+    }
+    found
+}
+
+fn untyped_blocks_in(root: Int) -> Int {
+    if root == -1 { return -1 }
+    let mut bad = 0
+    let mut stack: List[Int] = [root]
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap()
+        if node_kind(n) == NodeKind.Block {
+            if tc_tid_is_concrete(tc_lookup_node_tid(n)) == 0 { bad = bad + 1 }
+        }
+        let kids = node_value_child_ids(n)
+        let mut i = 0
+        while i < kids.len() {
+            stack.push(kids.get(i).unwrap())
+            i = i + 1
+        }
+    }
+    bad
+}
+
+// Append a value node with no type as the last statement of `body`, and answer the count of
+// internal errors the pass then raises over the whole program.
+fn ice_count_with_hole_in(program: Int, body: Int) -> Int ! Parse.Build, TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let orphan = nodes.len()
+    nodes.push(AstNode { kind: NodeKind.IntLit, line: 1, col: 1 })
+    // sublist_push guards on an open sublist, which only the parser normally holds. Open a
+    // throwaway one so the graft goes through the parser's own writer and not a second path
+    // into the arena.
+    let scratch = new_sublist()
+    sublist_push(node_stmts(body), orphan)
+    finalize_sublist(scratch)
+    diag_reset()
+    tc_stamp_program(program)
+    diag_ice_count
+}
+
+// `zzxs.concat([2])` is a List method no arm of inference claims, so the record of unclaimed
+// calls is non-empty for the whole compile. `zzother` shares nothing with it.
+fn two_bodies_src() -> Str {
+    let mut s = "fn zzunres() -> Int \{\n"
+    s = s.concat("    let zzxs: List[Int] = [1]\n")
+    s = s.concat("    let zzys = zzxs.concat([2])\n")
+    s = s.concat("    zzys.len()\n")
+    s = s.concat("}\n")
+    s = s.concat("fn zzother(zzn: Int) -> Int \{\n")
+    s = s.concat("    let zzm = zzn + 1\n")
+    s = s.concat("    zzm * 2\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = zzunres() + zzother(1) }\n")
+    s
+}
+
+test "an unclaimed call leaves the rest of the program asserted" {
+    let program = compile_probe("build/stamp_scope_other_body.bl", two_bodies_src())
+    assert(diag_count == 0)
+    assert(diag_ice_count == 0)
+    assert(tc_unresolved_call_count() > 0)
+    assert(ice_count_with_hole_in(program, fn_body_of("zzother")) == 1)
+}
+
+test "an unclaimed call silences its own body" {
+    let program = compile_probe("build/stamp_scope_own_body.bl", two_bodies_src())
+    assert(diag_count == 0)
+    assert(tc_unresolved_call_count() > 0)
+    assert(ice_count_with_hole_in(program, fn_body_of("zzunres")) == 0)
+}
+
+// A test block is a body like any other: its bindings are local to it, so an unclaimed call in
+// one test cannot excuse a hole in the next.
+fn two_tests_src() -> Str {
+    let mut s = "test \"zzfirst\" \{\n"
+    s = s.concat("    let zzxs: List[Int] = [1]\n")
+    s = s.concat("    let zzys = zzxs.concat([2])\n")
+    s = s.concat("    assert(zzys.len() == 2)\n")
+    s = s.concat("}\n")
+    s = s.concat("fn zzclean(zzn: Int) -> Int \{ zzn + 1 }\n")
+    s = s.concat("fn main() \{ let _ = zzclean(1) }\n")
+    s
+}
+
+test "an unclaimed call in a test block leaves other bodies asserted" {
+    let program = compile_probe("build/stamp_scope_test_block.bl", two_tests_src())
+    assert(diag_count == 0)
+    assert(tc_unresolved_call_count() > 0)
+    assert(ice_count_with_hole_in(program, fn_body_of("zzclean")) == 1)
+}
+
+// A block whose last statement is a loop produces no value, so the block holds `()`. §2.11: a
+// `for` and a `while` each evaluate to `()`. The tail is accepted as a value-bearing statement
+// by the block-tail rule, and its kind carries no type, so reading a type off it answered
+// "unknown" and left every enclosing block untyped.
+fn loop_tail_src() -> Str {
+    let mut s = "fn zzloopy(zzn: Int) -> Int \{\n"
+    s = s.concat("    let mut zzacc = 0\n")
+    s = s.concat("    match zzn \{\n")
+    s = s.concat("        0 => \{ while zzacc < 3 \{ zzacc = zzacc + 1 } }\n")
+    s = s.concat("        _ => \{ for zzi in [1, 2] \{ zzacc = zzacc + zzi } }\n")
+    s = s.concat("    }\n")
+    s = s.concat("    zzacc\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = zzloopy(0) }\n")
+    s
+}
+
+test "a block whose tail is a loop carries the unit type" {
+    let _program = compile_probe("build/stamp_loop_tail.bl", loop_tail_src())
+    assert(diag_count == 0)
+    assert(diag_ice_count == 0)
+    assert(untyped_blocks_in(fn_body_of("zzloopy")) == 0)
+    assert(blocks_in(fn_body_of("zzloopy")) > 2)
+}

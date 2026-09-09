@@ -1,0 +1,62 @@
+import compile_test_helpers.{expect_compile_error, compile_and_run}
+
+// The qualified call `Trait.method(receiver)` where the receiver is a type parameter bounded by
+// that same trait. §3c:706 writes this exact shape —
+// `fn show[T: Display](val: T) -> Str { Display.display(val) }` — and the resolution table at
+// §3c:773 resolves it by "Explicit trait + method".
+//
+// The bound is what licenses the call, so the bound is what answers it: the trait's own declared
+// signature. The UNQUALIFIED form on the same receiver already reads that signature, so the two
+// spellings of one call had different answers — the qualified one had none at all. With no type,
+// the declared type of the result was never compared, and the node reached codegen carrying
+// nothing.
+
+fn bounded_src(decl: Str, tail: Str) -> Str {
+    let mut s = "type Pt \{ x: Int }\n"
+    s = s.concat("trait Describe \{\n    fn describe(self) -> Str\n}\n")
+    s = s.concat("trait Sizer \{\n    fn size(self) -> Int\n}\n")
+    s = s.concat("impl Describe for Pt \{\n    fn describe(self) -> Str \{ \"pt\" }\n}\n")
+    s = s.concat("impl Sizer for Pt \{\n    fn size(self) -> Int \{ self.x }\n}\n")
+    s = s.concat("impl Display for Pt \{\n    fn fmt(self, sb: StringBuilder) \{ sb.write(\"pt\") }\n}\n")
+    s = s.concat("fn probe[T: Describe + Sizer + Display](v: T) -> Str \{\n")
+    s = s.concat("    {decl}\n")
+    s = s.concat("    {tail}\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ io.println(probe(Pt \{ x: 7 })) }\n")
+    s
+}
+
+test "qualified trait call on a bounded type parameter compares its declared type" {
+    expect_compile_error(bounded_src("let bad: Int = Describe.describe(v)", "\"x\""), "qtc_bounded_ret_mismatch", "E0300")
+}
+
+// The two traits differ in return type on purpose: an answer taken from the wrong trait would
+// still type-check against the other one.
+test "each trait answers with its own return type through a bound" {
+    expect_compile_error(bounded_src("let bad: Str = Sizer.size(v)", "\"x\""), "qtc_bounded_sizer_mismatch", "E0300")
+}
+
+test "a well-typed qualified call through a bound still runs" {
+    let r = compile_and_run(bounded_src("let ok: Str = Describe.describe(v)", "\"\{ok}/\{Sizer.size(v)}\""), "qtc_bounded_ok")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("pt/7"))
+}
+
+// The receiver is param 0, so the declared param count IS the qualified form's arity. The
+// concrete-receiver path already reports this; the bounded receiver reached no check at all and
+// an extra argument escaped to cc as "too many arguments to a C function".
+test "a qualified call through a bound is arity-checked against the trait declaration" {
+    expect_compile_error(bounded_src("let bad: Str = Describe.describe(v, 1, 2)", "\"x\""), "qtc_bounded_arity_over", "E0300")
+}
+
+// `display()` is synthesized and declared nowhere, so its arity is not read off a declaration
+// and had to be spelled. Without it the extra arguments were accepted and silently dropped.
+test "the synthesized display through a bound is arity-checked too" {
+    expect_compile_error(bounded_src("let bad: Str = Display.display(v, 1)", "\"x\""), "qtc_bounded_display_arity", "E0300")
+}
+
+test "the one-argument display through a bound still runs" {
+    let r = compile_and_run(bounded_src("let ok: Str = Display.display(v)", "ok"), "qtc_bounded_display_ok")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("pt"))
+}
