@@ -9,7 +9,7 @@ import codegen_types.{
     cg_closure_param_type_hint_tid, cg_current_fn_name, cg_handler_body_idx,
     cg_handler_cleanup_fn, cg_handler_cleanup_var,
     cg_handler_is_user_effect, cg_handler_vtable_field, cg_handler_vtable_type,
-    cg_in_handler_body, cg_in_ffi_scope_resource, cg_indent, cg_let_target_name, cg_let_target_type,
+    cg_in_handler_body, cg_in_ffi_scope_resource, cg_indent,
     cg_uses_async,
     closure_cap_infos, closure_captures, closure_ret_direct_ct, closure_ret_ct, closure_sig_ret_part,
     emit_line, ensure_chain_iter, ensure_filter_iter, ensure_flat_map_iter,
@@ -4384,9 +4384,13 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         return
     }
 
-    // .into() dispatch — infer target type from assignment context
+    // .into()'s target is the CALL NODE's own type. The enclosing `let` annotation answers
+    // the wrong question at every position that is not the whole RHS: a carrier payload
+    // (`Some(i.into())` under `-> Option[Float]`) would read the carrier, and a fn-return
+    // position nothing at all, leaving the payload spelled from the ARGUMENT's type.
     if method == "into" {
-        let target = cg_let_target_type
+        let into_tid = tc_tid_resolved(cm_node_mono_tid(node))
+        let target = tc_tid_ct(into_tid)
         if target == CT_FLOAT && obj_type == CT_INT {
             expr_result_str = "(double){obj_str}"
             expr_result_type = CT_FLOAT
@@ -4412,17 +4416,25 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         if src_struct != "" {
             src_name = src_struct
         }
-        let mut tgt_name = type_name_from_ct(target)
-        if target == CT_VOID && cg_let_target_name != "" {
-            tgt_name = cg_let_target_name
-        }
+        // A nominal target (struct, enum, transparent newtype) is named by the tid; a
+        // builtin target has no nominal name and is named by its kind. The two are
+        // disjoint, and find_from_impl matches a `from` impl against either.
+        let tid_tgt_name = tc_tid_struct(into_tid)
+        let tgt_name = if tid_tgt_name != "" { tid_tgt_name } else { type_name_from_ct(target) }
         let from_methods = find_from_impl(src_name, tgt_name)
         if from_methods != -1 && sublist_length(from_methods) > 0 {
             let from_fn = sublist_get(from_methods, 0)
             let from_name = node_name(from_fn)
             let mangled = mangle_from_method(src_name, tgt_name, from_name)
             expr_result_str = "{c_fn_name(mangled)}({obj_str})"
-            expr_result_type = target
+            // A nominal head erases to CT_VOID, so a carrier or container built from this
+            // value needs the name on a second channel to spell its member -- the same
+            // publish the `Type.from(x)` spelling of this conversion makes.
+            let ret_ct = get_fn_ret(mangled)
+            if ret_ct == CT_VOID {
+                set_var_struct(expr_result_str, tgt_name)
+            }
+            expr_result_type = ret_ct
             return
         }
         emit_line("/* into() conversion not found */")

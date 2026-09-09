@@ -22,7 +22,7 @@ import codegen_types.{
     cg_in_handler_body, cg_in_ffi_scope_resource, cg_indent, cg_test_mode, cg_in_assert_panics, cg_assert_panics_counter, cg_let_target_ann, cg_expect_arg_ann,
     cg_mono_tparams_sl, cg_mono_arg_tids, cg_fn_mono_tparams_sl, cg_fn_mono_arg_tids,
     cg_cur_mono_base, cg_cur_mono_inst_tid, cg_cur_fn_mono_tparams_sl, cg_cur_fn_mono_arg_tids,
-    cg_let_target_name, cg_let_target_type, cg_assign_target_name, cg_lines, cg_program_node,
+    cg_assign_target_name, cg_lines, cg_program_node,
     cg_temp_counter, cg_trace_codegen, cg_ensures_result_var, cg_old_snapshot_vars,
     compound_name_from_ann, compound_name_from_ann_ctx, resolve_result_inner_tag,
     emit_arena_restore_helper, emit_bh_cleanup_for_type, emit_cl_cleanup_for_type, emit_ev_restore_helper, emit_handle_cleanup, emit_line, ev_field, fn_node_has_effects,
@@ -75,7 +75,6 @@ import codegen_types.{
     set_var, set_var_tid, set_var_ty, set_var_alias, set_var_closure, set_var_handle,
     set_var_handler, tid_spells_struct,
     set_var_iterator, set_var_option,
-    get_var_option_inner_tp,
     set_var_option_struct, set_var_option_from_struct_tag,
     set_var_result,
     set_var_result_struct, set_var_result_from_struct_tag,
@@ -4193,8 +4192,6 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             enum_type = ann_name
         }
     }
-    let saved_let_target = cg_let_target_type
-    let saved_let_target_name = cg_let_target_name
     let saved_let_target_ann = cg_let_target_ann
     // A let-RHS is a fresh value context described by cg_let_target_ann; an
     // outer call's cg_expect_arg_ann must not leak in (a block-expr let-RHS
@@ -4205,8 +4202,6 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     let mut ann_ct = 0
     if type_ann != -1 {
         ann_ct = type_from_name(node_name(type_ann))
-        cg_let_target_type = ann_ct
-        cg_let_target_name = node_name(type_ann)
         cg_let_target_ann = type_ann
         // A body-local carrier over struct instances (`let r: Result[RBox[Int],
         // RBox[Str]] = Ok(..)`) is named in no signature, so the pre-fn pass never
@@ -4217,8 +4212,6 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         // carrier or a non-carrier annotation (tid -1 / kind mismatch).
         register_carrier_struct_instance_leaves(tc_lookup_node_tid(type_ann))
     } else {
-        cg_let_target_type = 0
-        cg_let_target_name = ""
         cg_let_target_ann = -1
     }
     // This clear is a BUG FIX rather than tidying — the same fix made on
@@ -4231,8 +4224,6 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     cg_handler_vtable_field = ""
     cg_handler_is_user_effect = 0
     emit_expr(val_node)
-    cg_let_target_type = saved_let_target
-    cg_let_target_name = saved_let_target_name
     cg_let_target_ann = saved_let_target_ann
     cg_expect_arg_ann = saved_expect_arg_ann
     let val_str = expr_result_str
@@ -4304,13 +4295,11 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         name = fresh_temp("_unused")
     }
     let is_mut = node_is_mut(node)
-    set_var(name, val_type, is_mut)
-    // Stage 2: stamp typecheck's tid at the earliest possible point, immediately after the
-    // binding exists and BEFORE the ~40 set_var_* refinements below. Any later and the
-    // refinements would be measured against an unstamped var, so every read would report
-    // Missing and the instrument would measure its own late arrival. The refinements carry
-    // `ty` across untouched by design (src/codegen_types.bl ScopeVar.ty).
-    set_var_ty(name, binding_tid)
+    // Registered from the tid alone, the way a parameter position is: every reader below
+    // projects the shape it needs out of the tid. Resolved first, since a metavar pinned by
+    // the initializer stores its solution indirectly and substitution reads the slot raw.
+    let bind_tid = tc_tid_subst_mono(tc_tid_resolved(binding_tid), cg_mono_tparams_sl, cg_mono_arg_tids)
+    set_var_tid(name, bind_tid, is_mut)
     if enum_type != "" {
         var_enums.push(VarEnumEntry { name: name, enum_type: enum_type })
     }
@@ -4385,163 +4374,48 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         }
         set_var_closure(name, cls_sig, cls_tid)
     }
+    // The Option carrier typedef and every mono instance its inner names, asked for from the
+    // tid alone -- the same registration a parameter position runs. A Result carrier is named
+    // by its producer's signature instead, so this half registers nothing for it.
     if val_type == CT_OPTION {
-        let mut opt_inner_ct = expr_option_inner
-        let mut opt_inner_s = expr_option_inner_struct
-        if type_ann != -1 {
-            let ann_name = node_name(type_ann)
-            if ann_name == "Option" {
-                let ann_elems = node_elements(type_ann)
-                if ann_elems != -1 && sublist_length(ann_elems) >= 1 {
-                    let inner_ann = sublist_get(ann_elems, 0)
-                    let inner_name = node_name(inner_ann)
-                    let inner_ct = type_from_name(inner_name)
-                    if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
-                        // A generic struct INSTANCE inner (Option[Box[Int]]) must
-                        // carry its recursive mono stem (Box_Int), not the erased
-                        // bare head (Box) — otherwise the option carrier embeds a
-                        // never-typedef'd blink_Box*. Prefer the RHS-provided
-                        // struct (expr_option_inner_struct, already the fully-recursive
-                        // Box_Box_Int from the emitted Some payload) exactly as the
-                        // Result path prefers expr_result_ok_struct; only fall to the
-                        // annotation's one-level mono_name_from_ann when the RHS gave
-                        // nothing. Mirror resolve_ann_tag's fallback for the bare case.
-                        if opt_inner_s == "" {
-                            let mono = mono_name_from_ann(strip_module_qualifier(inner_name), inner_ann, -1, [])
-                            opt_inner_s = if mono != "" { mono } else { inner_name }
-                        }
-                        // Register the mono INSTANCE (QBox_Int) so the Option
-                        // carrier typedef's value member resolves to blink_QBox_Int (not
-                        // void*) when the carrier flush runs. Registration is idempotent
-                        // (dedups on phys_base+args); a bare struct / typevar is a no-op.
-                        let _reg = register_carrier_inner_mono_instance(inner_name, inner_ann)
-                        opt_inner_ct = inner_ct
-                    } else if is_compound_ct(inner_ct) != 0 || inner_name == "Tuple" {
-                        opt_inner_s = compound_name_from_ann(inner_ann)
-                        opt_inner_ct = inner_ct
-                    } else {
-                        opt_inner_ct = inner_ct
-                        opt_inner_s = ""
-                    }
-                }
-            }
-        }
-        if opt_inner_s != "" {
-            set_var_option_struct(name, opt_inner_ct, opt_inner_s)
-            ensure_struct_option_type(opt_inner_s)
-        } else {
-            set_var_option(name, opt_inner_ct)
-            ensure_option_type(opt_inner_ct)
-        }
+        register_param_instances(bind_tid)
         set_var_option_erased(name, expr_option_erased)
-        if expr_option_inner == CT_LIST && expr_option_inner_list_elem != -1 {
-            expr_option_inner_list_elem = -1
-            expr_option_inner_list_struct = ""
-        }
-        if expr_option_inner == CT_MAP {
-            if expr_option_inner_map_val_list_elem >= 0 {
-                expr_option_inner_map_val_list_elem = -1
-            }
-            expr_option_inner_map_val_struct = ""
-        }
-    }
-    if val_type == CT_RESULT {
-        let mut rok_t = expr_result_ok_type
-        let mut rerr_t = expr_result_err_type
-        let mut rok_s = expr_result_ok_struct
-        let mut rerr_s = expr_result_err_struct
-        if type_ann != -1 && node_name(type_ann) == "Result" {
-            let ann_elems = node_elements(type_ann)
-            if ann_elems != -1 && sublist_length(ann_elems) >= 2 {
-                if rok_s == "" {
-                    let ok_ann = sublist_get(ann_elems, 0)
-                    let ok_name = node_name(ok_ann)
-                    // A struct/enum or a Tuple ok side is carried by its tag as a
-                    // by-value member (rok_t=CT_INT). Map/Option/List inners keep
-                    // their own CT/struct from expr_result_ok_* — do NOT override
-                    // them to CT_INT (that erases the Map/List element type).
-                    if is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0 {
-                        let ok_mono = mono_name_from_ann(strip_module_qualifier(ok_name), ok_ann, -1, [])
-                        rok_s = if ok_mono != "" { ok_mono } else { ok_name }
-                        rok_t = CT_INT
-                    } else if ok_name == "Tuple" {
-                        let ok_tag = resolve_result_inner_tag(ok_ann, ok_name, type_from_name(ok_name))
-                        if ok_tag != "" {
-                            rok_s = ok_tag
-                            rok_t = CT_INT
-                        }
-                    }
-                }
-                if rerr_s == "" {
-                    let err_ann = sublist_get(ann_elems, 1)
-                    let err_name = node_name(err_ann)
-                    if is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0 {
-                        let err_mono = mono_name_from_ann(strip_module_qualifier(err_name), err_ann, -1, [])
-                        rerr_s = if err_mono != "" { err_mono } else { err_name }
-                        rerr_t = CT_INT
-                    } else if err_name == "Tuple" {
-                        let err_tag = resolve_result_inner_tag(err_ann, err_name, type_from_name(err_name))
-                        if err_tag != "" {
-                            rerr_s = err_tag
-                            rerr_t = CT_INT
-                        }
-                    }
-                }
-            }
-        }
-        if rok_s != "" || rerr_s != "" {
-            set_var_result_struct(name, rok_t, rerr_t, rok_s, rerr_s)
-        } else {
-            set_var_result(name, rok_t, rerr_t)
-        }
     }
     if val_type == CT_HANDLE {
         let inner = get_var_handle_inner(val_str)
         set_var_handle(name, if inner >= 0 { inner } else { CT_INT })
     }
-    // The generic struct-fallback propagates the RHS var's `sname` onto a
-    // struct-typed binding via get_var_struct -> set_var_struct, which rebuilds
-    // tp_id through the lossy 2-level sv_tp bridge. For an Option whose inner is
-    // itself a CONTAINER, that RHS sname is a CARRIER TAG (`Option_list`) and the
-    // rebuild re-collapses the deep tp (`Option[Option[List[Int]]]` ->
-    // `Option[Option[Int]]`) that the CT_OPTION block above just restored, losing
-    // the inner List's element. Skip the fallback ONLY in that narrow case
-    // (get_var_option_inner_tp(name) >= 0 iff the restored inner is a container);
-    // a compound over a real struct/enum inner (`Option[Status]`) has no deep
-    // container tp, so the fallback still runs and legitimately stamps the inner's
-    // struct name — no regression.
-    let skip_struct_fallback = (val_type == CT_OPTION && get_var_option_inner_tp(name) >= 0)
-    if skip_struct_fallback == 0 {
-        if node_kind(val_node) == NodeKind.StructLit {
-            let expr_struct = get_var_struct(val_str)
-            if expr_struct != "" {
-                set_var_struct(name, expr_struct)
-            } else {
-                let sname = node_type_name(val_node)
-                if is_struct_type(sname) != 0 {
-                    set_var_struct(name, sname)
-                }
+    // Stamps the RHS var's `sname` onto a struct-typed binding. Safe for every inner shape,
+    // since set_var_struct never overwrites a row that already carries a tid.
+    if node_kind(val_node) == NodeKind.StructLit {
+        let expr_struct = get_var_struct(val_str)
+        if expr_struct != "" {
+            set_var_struct(name, expr_struct)
+        } else {
+            let sname = node_type_name(val_node)
+            if is_struct_type(sname) != 0 {
+                set_var_struct(name, sname)
             }
-        } else if type_ann != -1 {
-            let ann_name = node_name(type_ann)
-            if is_struct_type(ann_name) != 0 {
-                let ann_mono = mono_name_from_ann(strip_module_qualifier(ann_name), type_ann, -1, [])
-                let _reg = register_carrier_inner_mono_instance(ann_name, type_ann)
-                set_var_struct(name, if ann_mono != "" { ann_mono } else { ann_name })
-            } else if ann_name == "Tuple" {
-                let tup_name = resolve_tuple_ann(type_ann, -1, []).unwrap()
-                set_var_struct(name, tup_name)
-            } else {
-                let expr_struct = get_var_struct(val_str)
-                if expr_struct != "" {
-                    set_var_struct(name, expr_struct)
-                }
-            }
+        }
+    } else if type_ann != -1 {
+        let ann_name = node_name(type_ann)
+        if is_struct_type(ann_name) != 0 {
+            let ann_mono = mono_name_from_ann(strip_module_qualifier(ann_name), type_ann, -1, [])
+            let _reg = register_carrier_inner_mono_instance(ann_name, type_ann)
+            set_var_struct(name, if ann_mono != "" { ann_mono } else { ann_name })
+        } else if ann_name == "Tuple" {
+            let tup_name = resolve_tuple_ann(type_ann, -1, []).unwrap()
+            set_var_struct(name, tup_name)
         } else {
             let expr_struct = get_var_struct(val_str)
             if expr_struct != "" {
                 set_var_struct(name, expr_struct)
             }
+        }
+    } else {
+        let expr_struct = get_var_struct(val_str)
+        if expr_struct != "" {
+            set_var_struct(name, expr_struct)
         }
     }
     if val_type == CT_LIST && type_ann != -1 {
@@ -8365,6 +8239,10 @@ pub fn register_struct_instance_from_tid(tid: Int) -> Str ! Codegen.Register {
             seg = register_struct_instance_from_tid(slot)
         } else {
             seg = tc_tid_struct_slot_seg(slot)
+            // A tuple argument is embedded by value, so its carrier typedef must be
+            // registered before the instance that names it. Without it the field's type
+            // is not a known struct, so the member erases to `void`.
+            if tc_tid_tuple_arity(slot) > 0 { let _ = ensure_tuple_typedef_from_tid(slot) }
         }
         if seg == "" { return "" }
         if i > 0 { args = args.concat(",") }
@@ -8415,6 +8293,7 @@ pub fn register_enum_instance_from_tid(tid: Int) -> Str ! Codegen.Register {
             }
         } else {
             seg = tc_tid_struct_slot_seg(slot)
+            if tc_tid_tuple_arity(slot) > 0 { let _ = ensure_tuple_typedef_from_tid(slot) }
         }
         if seg == "" { return "" }
         if i > 0 { args = args.concat(",") }

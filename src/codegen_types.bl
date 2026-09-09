@@ -1502,9 +1502,7 @@ type TupleEntry {
 pub let mut emitted_tuple_set: Map[Str, Int] = Map()
 pub let mut emitted_tuple_entries: List[TupleEntry] = []
 
-// Assignment context for .into() type inference
-pub let mut cg_let_target_type: Int = 0
-pub let mut cg_let_target_name: Str = ""
+// The enclosing let's type annotation node, for value-context selection in the RHS
 pub let mut cg_let_target_ann: Int = -1
 
 // true only while resolving a struct literal's OWN identity (name/mono args)
@@ -3599,7 +3597,13 @@ fn deep_tp_from_tid(tid: Int) -> Int {
 // whose inner the tid cannot spell still lowers to its own pointer kind rather than to a
 // fabricated scalar -- so it never returns -1, giving a coarse-but-correct fallback kind for
 // the capture cast path when the tid names no aggregate.
-fn c_repr_tp_from_tid(tid: Int) -> Int {
+fn c_repr_tp_from_tid(tid0: Int) -> Int {
+    // A metavar pinned to a solution has that solution's C representation, and nothing else:
+    // the structural accessors read their slot RAW by design, so a push-built container's
+    // element (`let mut m = Map()`, pinned by the first insert) reads back kind Unknown and
+    // would answer the scalar default for a carrier the backend spells by value. The
+    // recursions below pass a raw child tid on purpose -- each one resolves at its own entry.
+    let tid = tc_tid_resolved(tid0)
     if tid < 0 { return type_int() }
     // A tuple has no CT of its own -- tc_tid_ct erases it to -1 -- but it does lower to a C
     // aggregate, the registered carrier struct. Spelling it here is what lets the head kind of
@@ -3627,6 +3631,12 @@ fn c_repr_tp_from_tid(tid: Int) -> Int {
         // Int payload, so it boxes as a scalar, never as a struct.
         if name != "" && is_transparent_newtype(name) != 0 { return type_int() }
         if name == "" { return sv_tp(CT_STRUCT, -1, -1, "") }
+        // Instant and Duration are declared structs that the C backend ALSO gives a flat kind
+        // of their own, and that kind is what every operator and method block is gated on --
+        // a plain struct head selects a raw `==`, which is not valid C on either. See
+        // builtin_struct_ct_for_name for the two-directional contract.
+        let bct = builtin_struct_ct_for_name(name)
+        if bct >= 0 { return sv_tp(bct, -1, -1, "") }
         return type_struct(name)
     }
     if ct == CT_ENUM {
@@ -4183,8 +4193,9 @@ pub fn map_pair_from_recv(obj_node: Int) -> MapPairTid {
     // the flat spelling in charge rather than half-overriding it.
     let raw_tid = tc_lookup_node_tid(obj_node)
     let otid = tc_tid_subst_mono(raw_tid, cg_mono_tparams_sl, cg_mono_arg_tids)
-    if tc_tid_ct(otid) != CT_MAP {
-        dbg_trace("mappair", "recv bail=not_map raw_tid={raw_tid} otid={otid} ct={tc_tid_ct(otid)}")
+    let oct = tc_tid_ct(otid)
+    if oct != CT_MAP {
+        dbg_trace("mappair", "recv bail=not_map raw_tid={raw_tid} otid={otid} ct={oct}")
         return no_map_pair_tid()
     }
     let kct = tc_tid_map_key_ct_resolved(otid)

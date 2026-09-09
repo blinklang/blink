@@ -1,0 +1,504 @@
+// Every `let` row — annotated and not, over every shape the flat refinement
+// ladder had an arm for — must get its type from the tid typecheck stamped on
+// the LetBinding node, with no second flat channel behind it.
+//
+// Each assertion is on a VALUE, never on a type. A let row registered from the
+// wrong channel raises no diagnostic: it declares the local with the wrong C
+// type, or refines the row's element/inner slot to a shape the later reads
+// decode wrongly, so the program prints a different number or names a typedef
+// that was never declared. A wrong answer here is a wrong answer in the
+// program, which is the only failure worth locking.
+
+type LBox[T] { v: T }
+type LPair[A, B] { a: A, b: B }
+type LTree[T] { Leaf, Node(T) }
+type LPlain { n: Int, s: Str }
+type LColor { Red, Green, Blue }
+type LShape { Circle(Int), Square(Int) }
+type LCode { LCode(Int) }
+type LAlias = LPlain
+
+effect Tally {
+    effect Add {
+        fn bump(by: Int) -> Int
+    }
+}
+
+fn mk_opt_int() -> Option[Int] { Some(41) }
+fn mk_opt_list() -> Option[List[Int]] { Some([7, 8]) }
+fn mk_opt_map() -> Option[Map[Str, Int]] {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("k", 9)
+    Some(m)
+}
+fn mk_opt_opt() -> Option[Option[Int]] { Some(Some(5)) }
+fn mk_opt_box() -> Option[LBox[Int]] { Some(LBox { v: 12 }) }
+fn mk_opt_enum() -> Option[LColor] { Some(LColor.Green) }
+fn mk_res_int() -> Result[Int, Str] { Ok(3) }
+fn mk_res_map() -> Result[Map[Str, Int], Str] {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("z", 4)
+    Ok(m)
+}
+fn mk_res_box() -> Result[LBox[Str], Str] { Ok(LBox { v: "hi" }) }
+fn mk_res_err_box() -> Result[Int, LBox[Str]] { Err(LBox { v: "bad" }) }
+fn mk_list_of_opt() -> List[Option[Int]] { [Some(1), None, Some(3)] }
+fn mk_list_of_res() -> List[Result[Int, Str]] { [Ok(2), Ok(5)] }
+fn mk_list_of_list() -> List[List[Int]] { [[1, 2], [3]] }
+fn mk_list_of_set() -> List[Set[Int]] {
+    let mut s: Set[Int] = Set()
+    s.insert(6)
+    [s]
+}
+fn mk_list_of_map() -> List[Map[Str, Int]] {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 11)
+    [m]
+}
+fn mk_list_of_box() -> List[LBox[Int]] { [LBox { v: 21 }] }
+fn mk_list_of_tuple() -> List[(Int, Str)] { [(3, "ab")] }
+fn mk_map_of_list() -> Map[Str, List[Int]] {
+    let mut m: Map[Str, List[Int]] = Map()
+    m.insert("k", [4, 5])
+    m
+}
+fn mk_map_of_opt() -> Map[Str, Option[Int]] {
+    let mut m: Map[Str, Option[Int]] = Map()
+    m.insert("k", Some(13))
+    m
+}
+fn mk_set_str() -> Set[Str] {
+    let mut s: Set[Str] = Set()
+    s.insert("qq")
+    s
+}
+fn mk_tuple() -> (Int, Str) { (5, "xyz") }
+fn mk_nested_tuple() -> ((Int, Int), Str) { ((3, 4), "ab") }
+fn mk_u8() -> U8 { 250.to_u8() }
+fn mk_code() -> LCode { LCode(19) }
+fn mk_closure() -> fn(Int) -> Int { fn(x: Int) -> Int { x * 3 } }
+
+// ── Option rows ─────────────────────────────────────────────────────────────
+
+test "an unannotated let over a call-returned Option scalar reads its payload" {
+    let a = mk_opt_int()
+    assert_eq(a.unwrap(), 41)
+    assert_eq(a.is_some(), true)
+}
+
+test "an annotated let over an Option scalar reads its payload" {
+    let a: Option[Int] = mk_opt_int()
+    assert_eq(a ?? 0, 41)
+}
+
+test "a let over Option of List keeps the element through the row" {
+    let a = mk_opt_list()
+    let xs = a.unwrap()
+    assert_eq(xs.get(0) ?? 0, 7)
+    assert_eq(xs.get(1) ?? 0, 8)
+    assert_eq(xs.len(), 2)
+}
+
+test "an annotated let over Option of List keeps the element" {
+    let a: Option[List[Int]] = mk_opt_list()
+    assert_eq(a.unwrap().get(1) ?? 0, 8)
+}
+
+test "a let over Option of Map keeps key and value through the row" {
+    let a = mk_opt_map()
+    let m = a.unwrap()
+    assert_eq(m.get("k") ?? 0, 9)
+    assert_eq(m.len(), 1)
+}
+
+test "an annotated let over Option of Map keeps key and value" {
+    let a: Option[Map[Str, Int]] = mk_opt_map()
+    assert_eq(a.unwrap().get("k") ?? 0, 9)
+}
+
+test "a let over Option of Option unwraps twice" {
+    let a = mk_opt_opt()
+    assert_eq(a.unwrap().unwrap(), 5)
+}
+
+test "an annotated let over Option of Option unwraps twice" {
+    let a: Option[Option[Int]] = mk_opt_opt()
+    assert_eq(a.unwrap() ?? 0, 5)
+}
+
+test "a let over Option of a generic struct instance reads its field" {
+    let a = mk_opt_box()
+    assert_eq(a.unwrap().v, 12)
+}
+
+test "an annotated let over Option of a generic struct instance reads its field" {
+    let a: Option[LBox[Int]] = mk_opt_box()
+    assert_eq(a.unwrap().v, 12)
+}
+
+test "a let over Option of a payloadless enum matches its variant" {
+    let a = mk_opt_enum()
+    match a.unwrap() {
+        LColor.Green => { assert_eq(1, 1) }
+        LColor.Red => { assert_eq(1, 0) }
+        LColor.Blue => { assert_eq(1, 0) }
+    }
+}
+
+test "a let over a bare None annotated with a compound inner stays None" {
+    let a: Option[List[Int]] = None
+    assert_eq(a.is_none(), true)
+    // Hoisted, not inlined: the formatter drops the parens a `(x ?? y).m()` receiver needs.
+    let fallback = a ?? [9]
+    assert_eq(fallback.get(0) ?? 0, 9)
+}
+
+// ── Result rows ─────────────────────────────────────────────────────────────
+
+test "a let over a Result scalar reads its ok side" {
+    let r = mk_res_int()
+    assert_eq(r.unwrap(), 3)
+    assert_eq(r.is_ok(), true)
+}
+
+test "an annotated let over a Result scalar reads its ok side" {
+    let r: Result[Int, Str] = mk_res_int()
+    assert_eq(r.unwrap(), 3)
+}
+
+test "a let over Result of Map keeps the map value" {
+    let r = mk_res_map()
+    assert_eq(r.unwrap().get("z") ?? 0, 4)
+}
+
+test "an annotated let over Result of Map keeps the map value" {
+    let r: Result[Map[Str, Int], Str] = mk_res_map()
+    assert_eq(r.unwrap().get("z") ?? 0, 4)
+}
+
+test "a let over Result of a generic struct instance reads its field" {
+    let r = mk_res_box()
+    assert_eq(r.unwrap().v, "hi")
+}
+
+test "an annotated let over Result with a struct err side reads the err" {
+    let r: Result[Int, LBox[Str]] = mk_res_err_box()
+    match r {
+        Ok(_) => { assert_eq(1, 0) }
+        Err(b) => { assert_eq(b.v, "bad") }
+    }
+}
+
+// ── List rows ───────────────────────────────────────────────────────────────
+
+test "a let over List of Option keeps the element carrier" {
+    let xs = mk_list_of_opt()
+    assert_eq(xs.get(0).unwrap() ?? 0, 1)
+    assert_eq(xs.get(1).unwrap().is_none(), true)
+    assert_eq(xs.get(2).unwrap() ?? 0, 3)
+}
+
+test "an annotated let over List of Option keeps the element carrier" {
+    let xs: List[Option[Int]] = mk_list_of_opt()
+    assert_eq(xs.get(2).unwrap() ?? 0, 3)
+}
+
+test "a let over List of Result keeps the element carrier" {
+    let xs = mk_list_of_res()
+    assert_eq(xs.get(0).unwrap().unwrap(), 2)
+    assert_eq(xs.get(1).unwrap().unwrap(), 5)
+}
+
+test "a let over List of List keeps the inner element" {
+    let xs = mk_list_of_list()
+    assert_eq(xs.get(0).unwrap().get(1) ?? 0, 2)
+    assert_eq(xs.get(1).unwrap().len(), 1)
+}
+
+test "a let over List of Set keeps the inner element" {
+    let xs = mk_list_of_set()
+    assert_eq(xs.get(0).unwrap().contains(6), true)
+    assert_eq(xs.get(0).unwrap().contains(7), false)
+}
+
+test "a let over List of Map keeps the map value" {
+    let xs = mk_list_of_map()
+    assert_eq(xs.get(0).unwrap().get("a") ?? 0, 11)
+}
+
+test "a let over List of a generic struct instance reads its field" {
+    let xs = mk_list_of_box()
+    assert_eq(xs.get(0).unwrap().v, 21)
+}
+
+test "a let over List of a tuple reads both elements" {
+    let xs = mk_list_of_tuple()
+    let t = xs.get(0).unwrap()
+    assert_eq(t.0, 3)
+    assert_eq(t.1, "ab")
+}
+
+test "an annotated let over List of a generic struct instance reads its field" {
+    let xs: List[LBox[Int]] = mk_list_of_box()
+    assert_eq(xs.get(0).unwrap().v, 21)
+}
+
+test "an annotated empty List of struct instance accepts a push" {
+    let mut xs: List[LBox[Int]] = []
+    xs.push(LBox { v: 31 })
+    assert_eq(xs.get(0).unwrap().v, 31)
+}
+
+// ── Map and Set rows ────────────────────────────────────────────────────────
+
+test "a let over Map of List keeps the value element" {
+    let m = mk_map_of_list()
+    assert_eq(m.get("k").unwrap().get(1) ?? 0, 5)
+}
+
+test "an annotated let over Map of List keeps the value element" {
+    let m: Map[Str, List[Int]] = mk_map_of_list()
+    assert_eq(m.get("k").unwrap().len(), 2)
+}
+
+test "a let over Map of Option keeps the value carrier" {
+    let m = mk_map_of_opt()
+    assert_eq(m.get("k").unwrap() ?? 0, 13)
+}
+
+test "a let over a Set of Str keeps the element" {
+    let s = mk_set_str()
+    assert_eq(s.contains("qq"), true)
+    assert_eq(s.contains("rr"), false)
+    assert_eq(s.len(), 1)
+}
+
+test "an annotated let over a Set of Str keeps the element" {
+    let s: Set[Str] = mk_set_str()
+    assert_eq(s.contains("qq"), true)
+}
+
+test "a let over a set union keeps the element" {
+    let mut a: Set[Int] = Set()
+    a.insert(1)
+    let mut b: Set[Int] = Set()
+    b.insert(2)
+    let u = a.union(b)
+    assert_eq(u.len(), 2)
+    assert_eq(u.contains(2), true)
+}
+
+test "a let aliasing another set keeps the element" {
+    let s = mk_set_str()
+    let t = s
+    assert_eq(t.contains("qq"), true)
+}
+
+// ── Struct, enum, newtype and alias rows ────────────────────────────────────
+
+test "a let over a struct literal reads its fields" {
+    let p = LPlain { n: 4, s: "ab" }
+    assert_eq(p.n + p.s.len(), 6)
+}
+
+test "an annotated let over a type alias to a struct reads its fields" {
+    let p: LAlias = LPlain { n: 4, s: "abc" }
+    assert_eq(p.n + p.s.len(), 7)
+}
+
+test "a let over a generic enum instance matches its payload" {
+    let t = LTree.Node(17)
+    match t {
+        LTree.Node(n) => { assert_eq(n, 17) }
+        LTree.Leaf => { assert_eq(1, 0) }
+    }
+}
+
+test "an annotated let over a generic enum instance with a bare variant" {
+    let t: LTree[Int] = LTree.Leaf
+    match t {
+        LTree.Node(_) => { assert_eq(1, 0) }
+        LTree.Leaf => { assert_eq(1, 1) }
+    }
+}
+
+test "a let over a payloadless enum variant matches" {
+    let c = LColor.Blue
+    match c {
+        LColor.Blue => { assert_eq(1, 1) }
+        LColor.Red => { assert_eq(1, 0) }
+        LColor.Green => { assert_eq(1, 0) }
+    }
+}
+
+test "a let over a data enum variant reads its payload" {
+    let s = LShape.Circle(9)
+    match s {
+        LShape.Circle(r) => { assert_eq(r, 9) }
+        LShape.Square(_) => { assert_eq(1, 0) }
+    }
+}
+
+test "a let over a transparent newtype is its bare payload" {
+    let c = mk_code()
+    match c {
+        LCode(n) => { assert_eq(n, 19) }
+    }
+}
+
+test "an annotated let over a transparent newtype is its bare payload" {
+    let c: LCode = LCode(23)
+    match c {
+        LCode(n) => { assert_eq(n, 23) }
+    }
+}
+
+// ── Tuple rows ──────────────────────────────────────────────────────────────
+
+test "a let over a tuple reads both elements" {
+    let t = mk_tuple()
+    assert_eq(t.0, 5)
+    assert_eq(t.1, "xyz")
+}
+
+test "an annotated let over a tuple reads both elements" {
+    let t: (Int, Str) = mk_tuple()
+    assert_eq(t.0 + t.1.len(), 8)
+}
+
+test "a let destructuring a tuple binds both halves" {
+    let (n, s) = mk_tuple()
+    assert_eq(n, 5)
+    assert_eq(s, "xyz")
+}
+
+test "a let over a nested tuple reads through both levels" {
+    let t = mk_nested_tuple()
+    let inner = t.0
+    assert_eq(inner.0 + inner.1 + t.1.len(), 9)
+}
+
+// ── Sized integer rows ──────────────────────────────────────────────────────
+
+test "a let over a sized int keeps its width through arithmetic" {
+    let b = mk_u8()
+    assert_eq(b.wrapping_add(10).to_int(), 4)
+}
+
+test "an unannotated let over an unwrapped sized int keeps its width" {
+    let xs: List[U8] = [250.to_u8()]
+    let b = xs.get(0).unwrap()
+    assert_eq(b.wrapping_add(10).to_int(), 4)
+}
+
+test "an annotated let over a converted sized int keeps its width" {
+    let b: U8 = 200.to_u8()
+    assert_eq(b.wrapping_add(100).to_int(), 44)
+}
+
+// ── Closure, handler and iterator rows ──────────────────────────────────────
+
+test "a let over a call-returned closure is callable" {
+    let f = mk_closure()
+    assert_eq(f(4), 12)
+}
+
+test "a let over a closure literal is callable" {
+    let g = fn(x: Int) -> Int { x + 8 }
+    assert_eq(g(4), 12)
+}
+
+test "a let over an unwrapped closure is callable" {
+    let fs: List[fn(Int) -> Int] = [fn(x: Int) -> Int { x - 2 }]
+    let f = fs.get(0).unwrap()
+    assert_eq(f(9), 7)
+}
+
+test "a let over a handler value dispatches its effect" {
+    let h = handler Tally {
+        fn bump(by: Int) -> Int { by * 5 }
+    }
+    let got = with h { tally.bump(3) }
+    assert_eq(got, 15)
+}
+
+// ── Void and discard rows ───────────────────────────────────────────────────
+
+fn does_nothing() {}
+
+test "a let over a Void-returning call is a placeholder, not a void local" {
+    let mut ran = 0
+    let _u = does_nothing()
+    ran = 1
+    assert_eq(ran, 1)
+}
+
+test "a wildcard let still evaluates its right-hand side" {
+    let mut seen = 0
+    let _ = {
+        seen = 7
+        1
+    }
+    assert_eq(seen, 7)
+}
+
+// ── Mutable capture of a let row ────────────────────────────────────────────
+
+test "a mut-captured let row's cell agrees with its declaration" {
+    let mut total = 0
+    let bump = fn(n: Int) { total = total + n }
+    bump(3)
+    bump(4)
+    assert_eq(total, 7)
+}
+
+test "a mut-captured compound let row's cell agrees with its declaration" {
+    let mut acc: List[Int] = []
+    let push2 = fn(n: Int) { acc.push(n) }
+    push2(5)
+    push2(6)
+    assert_eq(acc.get(1) ?? 0, 6)
+}
+
+// ── Generic-body let rows (the tid must be substituted through the instance) ─
+
+fn generic_let_roundtrip[T](x: T) -> T {
+    let inner = x
+    inner
+}
+
+fn generic_let_in_box[T](b: LBox[T]) -> T {
+    let v = b.v
+    v
+}
+
+fn generic_let_opt[T](x: T) -> Option[T] {
+    let o = Some(x)
+    o
+}
+
+test "a let inside a generic body binds the instantiated type" {
+    assert_eq(generic_let_roundtrip(6), 6)
+    assert_eq(generic_let_roundtrip("mn"), "mn")
+    assert_eq(generic_let_roundtrip(2.5), 2.5)
+}
+
+test "a let over a generic struct field binds the instantiated type" {
+    assert_eq(generic_let_in_box(LBox { v: 8 }), 8)
+    assert_eq(generic_let_in_box(LBox { v: "pq" }), "pq")
+}
+
+test "a let over a carrier inside a generic body binds the instance" {
+    assert_eq(generic_let_opt(4).unwrap(), 4)
+    assert_eq(generic_let_opt("rs").unwrap(), "rs")
+}
+
+fn generic_let_list[T](x: T) -> Int {
+    let xs: List[T] = [x]
+    xs.len()
+}
+
+test "a let over List of a type parameter binds per instance" {
+    assert_eq(generic_let_list(1), 1)
+    assert_eq(generic_let_list("t"), 1)
+}
