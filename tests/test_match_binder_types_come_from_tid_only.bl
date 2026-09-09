@@ -1,0 +1,302 @@
+// A match-arm binder's ScopeVar carries the typecheck tid and nothing else — no flat ctype, no
+// struct-name slot. Every downstream reader (method dispatch, field access, container element
+// decode, nested match) has to answer from that tid alone.
+//
+// Each test binds a value whose type the flat channel used to carry in a separate slot, then does
+// something with the binder that only works if the type survived: call a method that lives on the
+// element type, read a field, match again on the binder. A binder that reaches codegen untyped
+// decodes its slot as int64_t, so a Str element prints as a pointer and a struct field reads the
+// wrong offset — a wrong ANSWER, not a diagnostic. That is why every assertion is on a value.
+
+type Pt { x: Int, y: Int }
+
+type Shape {
+    Circle(r: Int)
+    Rect(w: Int, h: Int)
+}
+
+type Holder {
+    WithStruct(p: Pt)
+    WithList(xs: List[Str])
+    WithMap(m: Map[Str, Int])
+    WithOpt(o: Option[Str])
+    WithEnum(s: Shape)
+    WithTuple(t: (Int, Str))
+}
+
+type Tree {
+    Leaf(v: Int)
+    Node(left: Tree, right: Tree)
+}
+
+fn opt_pt() -> Option[Pt] { Some(Pt { x: 3, y: 4 }) }
+fn res_list() -> Result[List[Str], Str] { Ok(["aa", "bbb"]) }
+fn opt_map() -> Option[Map[Str, Str]] {
+    let mut m: Map[Str, Str] = Map()
+    m.insert("k", "vvvv")
+    Some(m)
+}
+fn opt_nested() -> Option[Option[Str]] { Some(Some("inner")) }
+
+// ── Carrier payload binders ──────────────────────────────────────────────────────
+
+test "a struct payload binder reads its fields" {
+    let mut n = 0
+    match opt_pt() {
+        Some(p) => { n = p.x * 10 + p.y }
+        None => { n = -1 }
+    }
+    assert_eq(n, 34)
+}
+
+test "a List payload binder decodes Str elements" {
+    let mut n = 0
+    match res_list() {
+        Ok(xs) => { for s in xs { n = n + s.len() } }
+        Err(_) => { n = -1 }
+    }
+    assert_eq(n, 5)
+}
+
+test "a Map payload binder keeps its value type" {
+    let mut acc = ""
+    match opt_map() {
+        Some(m) => {
+            match m.get("k") {
+                Some(v) => { acc = v }
+                None => { acc = "MISS" }
+            }
+        }
+        None => { acc = "NONE" }
+    }
+    assert_eq(acc, "vvvv")
+}
+
+test "a nested Option payload binder matches again" {
+    let mut acc = ""
+    match opt_nested() {
+        Some(inner) => {
+            match inner {
+                Some(s) => { acc = s }
+                None => { acc = "INNER-NONE" }
+            }
+        }
+        None => { acc = "NONE" }
+    }
+    assert_eq(acc, "inner")
+}
+
+// ── Positional variant field binders ─────────────────────────────────────────────
+
+test "a struct-typed variant field binder reads its fields" {
+    let h = Holder.WithStruct(Pt { x: 7, y: 9 })
+    let mut n = 0
+    match h {
+        Holder.WithStruct(p) => { n = p.x * 10 + p.y }
+        _ => { n = -1 }
+    }
+    assert_eq(n, 79)
+}
+
+test "a List variant field binder decodes Str elements" {
+    let h = Holder.WithList(["a", "bb", "ccc"])
+    let mut n = 0
+    match h {
+        Holder.WithList(xs) => { for s in xs { n = n + s.len() } }
+        _ => { n = -1 }
+    }
+    assert_eq(n, 6)
+}
+
+test "a Map variant field binder keeps its value type" {
+    let mut mm: Map[Str, Int] = Map()
+    mm.insert("q", 41)
+    let h = Holder.WithMap(mm)
+    let mut n = 0
+    match h {
+        Holder.WithMap(inner) => {
+            match inner.get("q") {
+                Some(v) => { n = v + 1 }
+                None => { n = -1 }
+            }
+        }
+        _ => { n = -2 }
+    }
+    assert_eq(n, 42)
+}
+
+test "an Option variant field binder matches again" {
+    let h = Holder.WithOpt(Some("yes"))
+    let mut acc = ""
+    match h {
+        Holder.WithOpt(o) => {
+            match o {
+                Some(s) => { acc = s }
+                None => { acc = "NONE" }
+            }
+        }
+        _ => { acc = "OTHER" }
+    }
+    assert_eq(acc, "yes")
+}
+
+test "an enum-typed variant field binder matches on its own variants" {
+    let h = Holder.WithEnum(Shape.Rect(3, 5))
+    let mut n = 0
+    match h {
+        Holder.WithEnum(s) => {
+            match s {
+                Shape.Circle(r) => { n = r }
+                Shape.Rect(w, ht) => { n = w * ht }
+            }
+        }
+        _ => { n = -1 }
+    }
+    assert_eq(n, 15)
+}
+
+test "a tuple variant field binder reads by position" {
+    let h = Holder.WithTuple((6, "six"))
+    let mut n = 0
+    let mut acc = ""
+    match h {
+        Holder.WithTuple(t) => {
+            n = t.0
+            acc = t.1
+        }
+        _ => { n = -1 }
+    }
+    assert_eq(n, 6)
+    assert_eq(acc, "six")
+}
+
+// ── Struct-style variant field binders (shorthand) ───────────────────────────────
+
+test "a struct-style struct field binder reads its fields" {
+    let h = Holder.WithStruct(Pt { x: 1, y: 5 })
+    let mut n = 0
+    match h {
+        Holder.WithStruct { p } => { n = p.x * 10 + p.y }
+        _ => { n = -1 }
+    }
+    assert_eq(n, 15)
+}
+
+test "a struct-style List field binder decodes Str elements" {
+    let h = Holder.WithList(["dddd", "e"])
+    let mut n = 0
+    match h {
+        Holder.WithList { xs } => { for s in xs { n = n + s.len() } }
+        _ => { n = -1 }
+    }
+    assert_eq(n, 5)
+}
+
+test "a struct-style Option field binder matches again" {
+    let h = Holder.WithOpt(Some("shorthand"))
+    let mut acc = ""
+    match h {
+        Holder.WithOpt { o } => {
+            match o {
+                Some(s) => { acc = s }
+                None => { acc = "NONE" }
+            }
+        }
+        _ => { acc = "OTHER" }
+    }
+    assert_eq(acc, "shorthand")
+}
+
+test "a struct-style tuple field binder reads by position" {
+    let h = Holder.WithTuple((8, "eight"))
+    let mut n = 0
+    let mut acc = ""
+    match h {
+        Holder.WithTuple { t } => {
+            n = t.0
+            acc = t.1
+        }
+        _ => { n = -1 }
+    }
+    assert_eq(n, 8)
+    assert_eq(acc, "eight")
+}
+
+// ── Self-recursive variant field binders ─────────────────────────────────────────
+
+fn tree_sum(t: Tree) -> Int {
+    match t {
+        Tree.Leaf(v) => v
+        Tree.Node(left, right) => tree_sum(left) + tree_sum(right)
+    }
+}
+
+fn tree_sum_shorthand(t: Tree) -> Int {
+    match t {
+        Tree.Leaf { v } => v
+        Tree.Node { left, right } => tree_sum_shorthand(left) + tree_sum_shorthand(right)
+    }
+}
+
+test "a self-recursive variant field binder keeps the enum type" {
+    let t = Tree.Node(Tree.Leaf(11), Tree.Node(Tree.Leaf(20), Tree.Leaf(2)))
+    assert_eq(tree_sum(t), 33)
+}
+
+test "a struct-style self-recursive field binder keeps the enum type" {
+    let t = Tree.Node(Tree.Leaf(4), Tree.Node(Tree.Leaf(6), Tree.Leaf(1)))
+    assert_eq(tree_sum_shorthand(t), 11)
+}
+
+// ── Plain struct pattern shorthand ───────────────────────────────────────────────
+
+test "a struct pattern shorthand binder keeps its field type" {
+    let p = Pt { x: 2, y: 8 }
+    let mut n = 0
+    match p {
+        Pt { x, y } => { n = x * 100 + y }
+    }
+    assert_eq(n, 208)
+}
+
+// ── As-pattern whole binders ─────────────────────────────────────────────────────
+
+test "an as-pattern binder over a struct keeps the whole value" {
+    let mut n = 0
+    match opt_pt() {
+        Some(p) => {
+            match p {
+                q as whole => { n = q.x + whole.y }
+            }
+        }
+        None => { n = -1 }
+    }
+    assert_eq(n, 7)
+}
+
+test "an as-pattern binder over a tuple keeps both elements" {
+    let t = (5, "five")
+    let mut n = 0
+    let mut acc = ""
+    match t {
+        pair as whole => {
+            n = pair.0
+            acc = whole.1
+        }
+    }
+    assert_eq(n, 5)
+    assert_eq(acc, "five")
+}
+
+// An `as` pattern nested inside a carrier pattern (`Ok(xs as all)`) is not covered here: it is
+// rejected by typecheck before codegen sees it, which is a separate defect on the pattern-checking
+// side. The equivalent whole-value shape below binds through the same codegen arm.
+
+test "an as-pattern binder over an unwrapped List keeps its element type" {
+    let xs0 = res_list().unwrap()
+    let mut n = 0
+    match xs0 {
+        xs as all => { n = xs.len() * 10 + all.len() }
+    }
+    assert_eq(n, 22)
+}

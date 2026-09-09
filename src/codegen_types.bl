@@ -1805,6 +1805,11 @@ let mut scope_ct_counts: List[Int] = []
 // that name (shadowing semantics). Maintained by push_scope_var/pop_scope/
 // reset_scope_state.
 let mut scope_name_idx: Map[Str, List[Int]] = Map()
+// How many rows currently in scope carry no flat ctype (ctype < 0) and answer their head
+// kind from the tid. The per-ctype counters above cannot see such a row -- bump_scope_ct
+// ignores a negative key -- so the ctype-keyed readers that short-circuit on a zero count
+// must also ask this before concluding the scope holds nothing of that kind.
+let mut scope_tid_only_count: Int = 0
 
 fn scope_ct_count(ctype: Int) -> Int {
     if ctype < 0 || ctype >= scope_ct_counts.len() { return 0 }
@@ -1827,6 +1832,7 @@ fn push_scope_var(sv: ScopeVar) {
     scope_vars.push(sv)
     scope_var_scratch.push(scratch_default())
     bump_scope_ct(sv.ctype, 1)
+    if sv.ctype < 0 { scope_tid_only_count = scope_tid_only_count + 1 }
     match scope_name_idx.get(name) {
         Some(stack) => { stack.push(idx) }
         None => {
@@ -1842,6 +1848,7 @@ pub fn reset_scope_state() {
     scope_frame_starts.clear()
     scope_ct_counts.clear()
     scope_name_idx.clear()
+    scope_tid_only_count = 0
 }
 
 // Topmost scope_vars index bound to `name`, or -1 if none. O(1) via scope_name_idx.
@@ -1855,6 +1862,17 @@ fn find_scope_var(name: Str) -> Int {
         None => {}
     }
     -1
+}
+
+// A row's top-level C-representation kind, the key every ctype-matched reader and refiner
+// selects a row on. A row registered from a tid alone carries no flat ctype; its head kind is the
+// one the C backend lowers its tid to, which is exactly what the flat ctype recorded. Reading
+// the head through here lets one matcher serve both row shapes, so a tid-only row is found
+// and refined in place instead of being shadowed by a duplicate push.
+fn sv_head_ct(sv: ScopeVar) -> Int {
+    if sv.ctype >= 0 { return sv.ctype }
+    if sv.ty < 0 { return -1 }
+    tp_get_kind(c_repr_tp_from_tid(sv.ty))
 }
 
 // CT_PTR scratch (ptr_struct, ptr_is_array) lives in scope_var_scratch:
@@ -2088,6 +2106,7 @@ pub fn pop_scope() ! Codegen.Scope {
     while scope_vars.len() > start {
         let sv = scope_vars.get(scope_vars.len() - 1).unwrap()
         bump_scope_ct(sv.ctype, -1)
+        if sv.ctype < 0 { scope_tid_only_count = scope_tid_only_count - 1 }
         match scope_name_idx.get(sv.name) {
             Some(stack) => { stack.pop() }
             None => {}
@@ -2112,6 +2131,13 @@ pub fn set_var(name: Str, ctype: Int, is_mut: Int) ! Codegen.Scope {
     // sname fallback and drop that identity.
     let scalar_ty = if ctype == CT_VOID { -1 } else { tc_scalar_tid_for_ct(ctype) }
     push_scope_var(ScopeVar { name: name, ctype: ctype, is_mut: is_mut, sname: "", ty: scalar_ty })
+}
+
+// A binding whose type is carried by the tid alone: no flat ctype, no sname. Every reader
+// projects the shape it needs out of sv.ty, so there is no second channel to keep in step
+// and none to go stale. This is the binder form; set_var below is the flat one it replaces.
+pub fn set_var_tid(name: Str, tid: Int, is_mut: Int) ! Codegen.Scope {
+    push_scope_var(ScopeVar { name: name, ctype: -1, is_mut: is_mut, sname: "", ty: tid })
 }
 
 // ── The tid stamping seam ───────────────────────────────────────────────────
@@ -2159,6 +2185,7 @@ pub fn get_var_type(name: Str) -> Int {
     // it an enum. sv_tp's top kind is inner-independent, so the flat ctype plus the
     // name reproduces the old pool kind, keeping the nominal enum/void+name -> struct
     // collapse in sv_tp alone rather than a second copy here.
+    if sv.ctype < 0 { return sv_head_ct(sv) }
     tp_get_kind(sv_tp(sv.ctype, -1, -1, sv.sname))
 }
 
@@ -2169,7 +2196,11 @@ pub fn get_var_type(name: Str) -> Int {
 pub fn get_var_ctype(name: Str) -> Int {
     let idx = find_scope_var(name)
     if idx >= 0 {
-        return tp_get_kind(c_repr_tp_from_tid(scope_vars.get(idx).unwrap().ty))
+        let sv = scope_vars.get(idx).unwrap()
+        // An unstamped row has no kind to lower. Saying so beats letting the tid lowering
+        // report its own integer default, which a capture reader cannot tell from a real Int.
+        if sv.ty < 0 { return -1 }
+        return tp_get_kind(c_repr_tp_from_tid(sv.ty))
     }
     -1
 }
@@ -2186,11 +2217,11 @@ fn get_var_mut(name: Str) -> Int {
 // get_sv_* readers do (kind + c_blink_name fallback) so a tid-first accessor and
 // its flat fallback always resolve the same ScopeVar. -1 when unstamped/absent.
 fn get_sv_ty(name: Str, ctype: Int) -> Int {
-    if scope_ct_count(ctype) <= 0 { return -1 }
+    if scope_ct_count(ctype) <= 0 && scope_tid_only_count <= 0 { return -1 }
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == ctype {
+        if sv.name == name && sv_head_ct(sv) == ctype {
             return sv.ty
         }
         i = i - 1
@@ -2200,7 +2231,7 @@ fn get_sv_ty(name: Str, ctype: Int) -> Int {
         i = scope_vars.len() - 1
         while i >= 0 {
             let sv = scope_vars.get(i).unwrap()
-            if sv.name == blink_name && sv.ctype == ctype {
+            if sv.name == blink_name && sv_head_ct(sv) == ctype {
                 return sv.ty
             }
             i = i - 1
@@ -2235,10 +2266,9 @@ pub fn get_capture_index(name: Str) -> Int {
 }
 
 // Capture boxing, rehydration, and promotion read a captured value's kind and struct name.
-// An as-pattern whole binder is stamped tid-only (stamp_whole_binder_from_tid), so its tp is the
-// CT_VOID placeholder and the flat reads answer nothing — the value would fall to a void*
-// passthrough and the emitted C be wrong. These readers recover kind/name from the authoritative
-// tid so such a capture spells correctly.
+// A match-arm binder carries no flat ctype at all, so the flat reads answer nothing — the value
+// would fall to a void* passthrough and the emitted C be wrong. These readers recover kind/name
+// from the authoritative tid so such a capture spells correctly.
 // A capture cell's struct name, read tid-first — the authoritative channel, mirroring
 // sv_struct_tid_first (the carrier-context twin). The flat sname is consulted ONLY when
 // the tid cannot answer: an unpopulated tid (tid < 0), or one naming an unspellable
@@ -3204,7 +3234,7 @@ pub fn set_list_elem_type(name: Str, elem_type: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_LIST {
+        if sv.name == name && sv_head_ct(sv) == CT_LIST {
             // Stamp a scalar List tid when the var carries none, so get_list_elem_type
             // reads a scalar element off the tid rather than the retired flat field; a
             // richer existing tid (an annotated or compound-stamped list) stands.
@@ -3571,6 +3601,13 @@ fn deep_tp_from_tid(tid: Int) -> Int {
 // the capture cast path when the tid names no aggregate.
 fn c_repr_tp_from_tid(tid: Int) -> Int {
     if tid < 0 { return type_int() }
+    // A tuple has no CT of its own -- tc_tid_ct erases it to -1 -- but it does lower to a C
+    // aggregate, the registered carrier struct. Spelling it here is what lets the head kind of
+    // a tuple-typed binding come off the tid at all; without it the tid would answer "int" for
+    // a value the backend passes as a struct. Gated on the carrier being registered, the same
+    // gate sv_struct_tid_first uses before it spells a tuple name from the tid.
+    let tup = tc_tid_tuple_sname(tid)
+    if tup != "" && find_tuple_entry(tup) >= 0 { return type_struct(tup) }
     let ct = tc_tid_ct(tid)
     if ct == CT_OPTION { return type_option(c_repr_tp_from_tid(tc_tid_option_inner_tid(tid))) }
     if ct == CT_RESULT {
@@ -3801,19 +3838,6 @@ pub fn stamp_map_from_map_tid(mtid: Int, var_name: Str) -> Bool {
     true
 }
 
-// Stamp a Result binder/temp with its authoritative carrier tid. The tid is the
-// sole authority for the ok/err element CT: get_var_result_ok/err read it through
-// the tid (via the _resolved readers) with no flat inner1/inner2 fallback, and the
-// struct-name twins (get_var_result_ok_struct/err_struct) are tid-only too. A binder
-// left without a stamped tid yields -1 from those readers (which collapses to a
-// "void" tag downstream), so this stamp is what makes the ok/err CT channel present.
-// Declines when the tid is not a Result. The Result twin of stamp_map_from_map_tid.
-pub fn stamp_result_from_tid(rtid: Int, var_name: Str) -> Bool {
-    if tc_tid_ct(rtid) != CT_RESULT { return false }
-    set_var_ty(var_name, rtid)
-    true
-}
-
 // Register a tuple-pattern binder from the element's own tid, one arm per kind. Both binder sites
 // (bind_pattern_vars' IdentPattern arm and emit_tuple_destructure) call this ahead of their flat
 // ladders, in both branches, because TWO different erasures live between a tuple element and its
@@ -3894,29 +3918,10 @@ pub fn stamp_binder_from_binder_tid(mtid: Int, var_name: Str, is_mut: Int) -> Bo
     false
 }
 
-// Register a WHOLE-value binder — an `as` pattern's name, which binds the scrutinee undecomposed.
-//
-// Every other binder holds a DECOMPOSED value, and its carrier and struct cases are served by the
-// enclosing arm's struct-name slot, which the decomposition filled. A whole-value binder's slot is
-// empty because nothing decomposed anything to fill it, so the three kinds a bare CT cannot name —
-// a carrier, which is only nameable WITH its inner, and a struct, which needs its name — have
-// nothing to fall back on and must come from the tid.
-//
-// Containers first, through the shared writer form: that is the same answer for a whole binder as
-// for a decomposed one.
-pub fn stamp_whole_binder_from_tid(mtid: Int, var_name: Str, is_mut: Int) -> Bool ! Codegen.Scope {
-    stamp_binder_from_tid_inner(mtid, var_name, is_mut, 0)
-}
-
-// Same, plus the scalar kinds. A caller that HAS a flat answer of its own wants the form above,
-// which declines a scalar and leaves the flat answer standing. A caller with no flat answer at
-// all — an unannotated closure param, whose only type channel is the closure's Fn tid — would be
-// left with an untyped var, so it takes the tid's scalar CT as well.
+// The container kinds above, plus the scalar kinds. The caller — an unannotated closure param,
+// whose only type channel is the closure's Fn tid — has no flat answer of its own, so a scalar
+// CT off the tid is better than leaving the var untyped.
 pub fn stamp_binder_or_scalar_from_tid(mtid: Int, var_name: Str, is_mut: Int) -> Bool ! Codegen.Scope {
-    stamp_binder_from_tid_inner(mtid, var_name, is_mut, 1)
-}
-
-fn stamp_binder_from_tid_inner(mtid: Int, var_name: Str, is_mut: Int, stamp_scalar: Int) -> Bool ! Codegen.Scope {
     if stamp_binder_from_binder_tid(mtid, var_name, is_mut) { return true }
     let ct = tc_tid_ct(mtid)
     if ct == CT_OPTION {
@@ -3956,7 +3961,7 @@ fn stamp_binder_from_tid_inner(mtid: Int, var_name: Str, is_mut: Int, stamp_scal
         set_var_ty(var_name, mtid)
         return true
     }
-    if stamp_scalar == 1 && ct >= 0 {
+    if ct >= 0 {
         set_var(var_name, ct, is_mut)
         set_var_ty(var_name, mtid)
         return true
@@ -3968,10 +3973,10 @@ fn stamp_binder_from_tid_inner(mtid: Int, var_name: Str, is_mut: Int, stamp_scal
 // side has no answer of its own.
 //
 // stamp_binder_from_binder_tid above is the WRITER form: it calls set_var, which rebuilds the
-// var's tp from scratch, so it has to run before whatever flat copies follow it. A match-arm
-// binder cannot be served that way — `bind_pattern_vars` emits its declaration inside one of ~28
-// arms, each doing its own element copy afterwards, and the single place that sees every binder
-// runs LAST, where writing would overrule arms that were already right.
+// var's tp from scratch, so it has to run before whatever flat copies follow it. A tuple-destructure
+// binder cannot be served that way — `emit_tuple_destructure` emits its declaration per element,
+// each doing its own element copy afterwards, and the single place that sees every binder runs
+// LAST, where writing would overrule elements that were already right.
 //
 // So this form asks first. An unset element channel reads -1 / "" (get_map_*_type_raw exists for
 // exactly this reason), which is the only honest signal available: a SET channel holding the
@@ -4541,7 +4546,7 @@ fn set_list_elem_struct_raw(name: Str, struct_name: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_LIST {
+        if sv.name == name && sv_head_ct(sv) == CT_LIST {
             let newty = if sv.ty >= 0 { sv.ty } else { list_tid }
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, sname: sv.sname, ty: newty })
             return
@@ -4664,7 +4669,7 @@ pub fn set_set_elem_type(name: Str, elem_type: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_SET {
+        if sv.name == name && sv_head_ct(sv) == CT_SET {
             // A set var is always (CT_SET, sname=""); the pool key needs no flat-field read here,
             // so the fresh element alone reconstructs the same entry. Stamp a scalar Set tid when
             // the var carries none, so get_set_elem_type reads the element off the tid, not the flat
@@ -4785,7 +4790,7 @@ pub fn set_set_elem_struct(name: Str, struct_name: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_SET {
+        if sv.name == name && sv_head_ct(sv) == CT_SET {
             // A synthesized receiver (a union temp, a generic-struct field, a
             // tuple element) reaches here on ty<0, its concrete element known
             // only now as `struct_name`. Intern it as a real Set tid so the
@@ -4814,7 +4819,7 @@ pub fn set_map_types(name: Str, key_type: Int, value_type: Int, value_name: Str)
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_MAP {
+        if sv.name == name && sv_head_ct(sv) == CT_MAP {
             // The struct KEY name rides the authoritative tid — both re-registration
             // callers stamp set_var_ty before calling here — so read it from the tid,
             // matching get_map_key_struct, not the flat pool key child.
@@ -5036,7 +5041,7 @@ pub fn set_map_key_struct(name: Str, struct_name: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_MAP {
+        if sv.name == name && sv_head_ct(sv) == CT_MAP {
             // Sync the flat key kind to CT_STRUCT so get_map_key_type can read inner1
             // in place of the pool; the struct key rides the authoritative tid on sv.ty.
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, sname: sv.sname, ty: sv.ty })
@@ -5644,18 +5649,21 @@ pub fn set_var_struct(name: Str, type_name: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype != CT_CLOSURE {
-            // A container never carries a struct name in the field-1 `sname` slot:
-            // its element/key/value identities live in inner1 and the tid.
-            // Writing one here would jam the name into sv_tp's element slot and
-            // collapse the child kind to a bogus CT_STRUCT. Leave containers untouched.
-            if sv.ctype == CT_MAP || sv.ctype == CT_SET || sv.ctype == CT_LIST {
+        if sv.name == name {
+            let head = sv_head_ct(sv)
+            if head != CT_CLOSURE {
+                // A container never carries a struct name in the field-1 `sname` slot:
+                // its element/key/value identities live in inner1 and the tid.
+                // Writing one here would jam the name into sv_tp's element slot and
+                // collapse the child kind to a bogus CT_STRUCT. Leave containers untouched.
+                if head == CT_MAP || head == CT_SET || head == CT_LIST {
+                    return
+                }
+                let is_plain_value = head == CT_STRUCT || head == CT_ENUM || head == CT_VOID
+                let newty = if sv.ty >= 0 { sv.ty } else { if is_plain_value { stamp } else { -1 } }
+                scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, sname: type_name, ty: newty })
                 return
             }
-            let is_plain_value = sv.ctype == CT_STRUCT || sv.ctype == CT_ENUM || sv.ctype == CT_VOID
-            let newty = if sv.ty >= 0 { sv.ty } else { if is_plain_value { stamp } else { -1 } }
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, sname: type_name, ty: newty })
-            return
         }
         i = i - 1
     }
@@ -5742,8 +5750,11 @@ pub fn get_var_struct(name: Str) -> Str {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype != CT_CLOSURE && sv.ctype != CT_HANDLER {
-            return sv_struct_tid_first(sv)
+        if sv.name == name {
+            let head = sv_head_ct(sv)
+            if head != CT_CLOSURE && head != CT_HANDLER {
+                return sv_struct_tid_first(sv)
+            }
         }
         i = i - 1
     }
@@ -5752,8 +5763,11 @@ pub fn get_var_struct(name: Str) -> Str {
         i = scope_vars.len() - 1
         while i >= 0 {
             let sv = scope_vars.get(i).unwrap()
-            if sv.name == blink_name && sv.ctype != CT_CLOSURE && sv.ctype != CT_HANDLER {
-                return sv_struct_tid_first(sv)
+            if sv.name == blink_name {
+                let head = sv_head_ct(sv)
+                if head != CT_CLOSURE && head != CT_HANDLER {
+                    return sv_struct_tid_first(sv)
+                }
             }
             i = i - 1
         }
@@ -5855,7 +5869,7 @@ pub fn set_var_closure(name: Str, sig: Str, tid: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_CLOSURE {
+        if sv.name == name && sv_head_ct(sv) == CT_CLOSURE {
             let keep_ty = if tid >= 0 { tid } else { sv.ty }
             // A closure var is always (CT_CLOSURE, inner1=-1); the pool key needs no
             // flat-field read here, so the sig alone reconstructs the same entry.
@@ -5868,11 +5882,11 @@ pub fn set_var_closure(name: Str, sig: Str, tid: Int) {
 }
 
 pub fn get_var_closure_sig(name: Str) -> Str {
-    if scope_ct_count(CT_CLOSURE) <= 0 { return "" }
+    if scope_ct_count(CT_CLOSURE) <= 0 && scope_tid_only_count <= 0 { return "" }
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_CLOSURE {
+        if sv.name == name && sv_head_ct(sv) == CT_CLOSURE {
             // The Fn tid is the only source of a closure's signature; when it cannot spell one
             // the signature is genuinely unknown, so "" is the honest answer.
             return closure_sig_from_tid(sv.ty)
@@ -8511,7 +8525,7 @@ pub fn set_var_option(name: Str, inner: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_OPTION {
+        if sv.name == name && sv_head_ct(sv) == CT_OPTION {
             // Keep a populated tid; a binder an earlier scalar push left on ty=-1 stamps
             // the exact scalar carrier now that its inner CT is known, mirroring the
             // struct-inner reconstruct on set_var_option_struct.
@@ -8671,7 +8685,7 @@ pub fn set_var_option_struct(name: Str, inner: Int, struct_name: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_OPTION {
+        if sv.name == name && sv_head_ct(sv) == CT_OPTION {
             // Update keeps a populated tid; a binder an earlier scalar push left on
             // ty=-1 (e.g. an if-expr temp) reconstructs from the now-known flat name
             // the same way the fresh push does, guarded by the round-trip so flat
@@ -8799,7 +8813,7 @@ pub fn set_var_option_erased(name: Str, e: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_OPTION {
+        if sv.name == name && sv_head_ct(sv) == CT_OPTION {
             let s = scope_var_scratch.get(i).unwrap()
             scope_var_scratch.set(i, ScopeVarScratch { opt_erased: e, ptr_struct: s.ptr_struct, ptr_is_array: s.ptr_is_array, iter_next_fn: s.iter_next_fn, iter_carrier: s.iter_carrier, iter_alias: s.iter_alias, handler_vtable_type: s.handler_vtable_type, handler_vtable_field: s.handler_vtable_field, handler_is_ue: s.handler_is_ue })
             return
@@ -8812,7 +8826,7 @@ pub fn get_var_option_erased(name: Str) -> Int {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_OPTION {
+        if sv.name == name && sv_head_ct(sv) == CT_OPTION {
             return scope_var_scratch.get(i).unwrap().opt_erased
         }
         i = i - 1
@@ -8822,7 +8836,7 @@ pub fn get_var_option_erased(name: Str) -> Int {
         i = scope_vars.len() - 1
         while i >= 0 {
             let sv = scope_vars.get(i).unwrap()
-            if sv.name == blink_name && sv.ctype == CT_OPTION {
+            if sv.name == blink_name && sv_head_ct(sv) == CT_OPTION {
                 return scope_var_scratch.get(i).unwrap().opt_erased
             }
             i = i - 1
@@ -8835,7 +8849,7 @@ pub fn set_var_result(name: Str, ok_t: Int, err_t: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_RESULT {
+        if sv.name == name && sv_head_ct(sv) == CT_RESULT {
             // An earlier fresh push may have landed this binder on ty=-1 (e.g. an
             // if-expr temp). Now that the ok/err slots are known, reverse-resolve the
             // carrier tid the same way the fresh-push path does. This plain entry is
@@ -8911,7 +8925,7 @@ pub fn set_var_result_struct(name: Str, ok_t: Int, err_t: Int, ok_s: Str, err_s:
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_RESULT {
+        if sv.name == name && sv_head_ct(sv) == CT_RESULT {
             // Update keeps a populated tid; a binder an earlier push left on ty=-1 (e.g. an
             // if-expr temp) reconstructs from the now-known flat names the same way the fresh
             // push does, guarded by the round-trip so the carrier declines to ty=-1 (readers
@@ -9001,20 +9015,8 @@ fn split_top_level_commas(s: Str) -> List[Str] {
     out
 }
 
-// Register compound-carrier inner-type metadata on a bound variable from its
-// annotation-form field type string (`Option[Str]`, `Result[Int, Str]`).
-pub fn register_var_compound_inner_from_str(name: Str, type_str: Str) {
-    let ct = type_from_name(type_str)
-    let tag = compound_tag_from_type_str(type_str)
-    if ct == CT_OPTION && tag.starts_with("Option_") {
-        set_var_option_from_struct_tag(name, tag)
-    } else if ct == CT_RESULT && tag.starts_with("Result_") {
-        set_var_result_from_struct_tag(name, tag)
-    }
-}
-
 // Register a variable bound to a whole compound CARRIER TAG (`Option_int`, `Result_int_str`) — the
-// tag-form twin of register_var_compound_inner_from_str above, which takes an annotation STRING. A
+// tag form: takes a carrier TAG rather than an annotation string. A
 // bare-typevar param `x: T` bound to a compound resolves to the carrier tag rather than a head
 // name, so type_from_name alone answers CT_VOID.
 //
@@ -9191,7 +9193,7 @@ pub fn set_var_iterator(name: Str, inner: Int, next_fn: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_ITERATOR {
+        if sv.name == name && sv_head_ct(sv) == CT_ITERATOR {
             // An iterator var is always (CT_ITERATOR, sname=""); the pool key needs no
             // flat-field read here, so the fresh element alone reconstructs the same entry.
             let keep_ty = if iter_ty >= 0 { iter_ty } else { sv.ty }
@@ -9255,7 +9257,7 @@ pub fn get_var_iter_next_fn(name: Str) -> Str {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_ITERATOR {
+        if sv.name == name && sv_head_ct(sv) == CT_ITERATOR {
             return scope_var_scratch.get(i).unwrap().iter_next_fn
         }
         i = i - 1
@@ -9265,7 +9267,7 @@ pub fn get_var_iter_next_fn(name: Str) -> Str {
         i = scope_vars.len() - 1
         while i >= 0 {
             let sv = scope_vars.get(i).unwrap()
-            if sv.name == blink_name && sv.ctype == CT_ITERATOR {
+            if sv.name == blink_name && sv_head_ct(sv) == CT_ITERATOR {
                 return scope_var_scratch.get(i).unwrap().iter_next_fn
             }
             i = i - 1
@@ -9283,7 +9285,7 @@ pub fn set_var_iter_carrier(name: Str, carrier: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_ITERATOR {
+        if sv.name == name && sv_head_ct(sv) == CT_ITERATOR {
             let s = scope_var_scratch.get(i).unwrap()
             scope_var_scratch.set(i, ScopeVarScratch { opt_erased: s.opt_erased, ptr_struct: s.ptr_struct, ptr_is_array: s.ptr_is_array, iter_next_fn: s.iter_next_fn, iter_carrier: carrier, iter_alias: s.iter_alias, handler_vtable_type: s.handler_vtable_type, handler_vtable_field: s.handler_vtable_field, handler_is_ue: s.handler_is_ue })
             return
@@ -9293,11 +9295,11 @@ pub fn set_var_iter_carrier(name: Str, carrier: Str) {
 }
 
 pub fn get_var_iter_carrier(name: Str) -> Str {
-    if scope_ct_count(CT_ITERATOR) <= 0 { return "" }
+    if scope_ct_count(CT_ITERATOR) <= 0 && scope_tid_only_count <= 0 { return "" }
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_ITERATOR {
+        if sv.name == name && sv_head_ct(sv) == CT_ITERATOR {
             return scope_var_scratch.get(i).unwrap().iter_carrier
         }
         i = i - 1
@@ -9307,7 +9309,7 @@ pub fn get_var_iter_carrier(name: Str) -> Str {
         i = scope_vars.len() - 1
         while i >= 0 {
             let sv = scope_vars.get(i).unwrap()
-            if sv.name == blink_name && sv.ctype == CT_ITERATOR {
+            if sv.name == blink_name && sv_head_ct(sv) == CT_ITERATOR {
                 return scope_var_scratch.get(i).unwrap().iter_carrier
             }
             i = i - 1
@@ -9320,7 +9322,7 @@ pub fn set_var_alias(name: Str, target: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_ITERATOR {
+        if sv.name == name && sv_head_ct(sv) == CT_ITERATOR {
             let s = scope_var_scratch.get(i).unwrap()
             scope_var_scratch.set(i, ScopeVarScratch { opt_erased: s.opt_erased, ptr_struct: s.ptr_struct, ptr_is_array: s.ptr_is_array, iter_next_fn: s.iter_next_fn, iter_carrier: s.iter_carrier, iter_alias: target, handler_vtable_type: s.handler_vtable_type, handler_vtable_field: s.handler_vtable_field, handler_is_ue: s.handler_is_ue })
             return
@@ -9330,11 +9332,11 @@ pub fn set_var_alias(name: Str, target: Str) {
 }
 
 pub fn get_var_alias(name: Str) -> Str {
-    if scope_ct_count(CT_ITERATOR) <= 0 { return "" }
+    if scope_ct_count(CT_ITERATOR) <= 0 && scope_tid_only_count <= 0 { return "" }
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_ITERATOR {
+        if sv.name == name && sv_head_ct(sv) == CT_ITERATOR {
             return scope_var_scratch.get(i).unwrap().iter_alias
         }
         i = i - 1
@@ -9346,7 +9348,7 @@ pub fn set_var_handle(name: Str, inner: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_HANDLE {
+        if sv.name == name && sv_head_ct(sv) == CT_HANDLE {
             // A handle var always has sname=""; the async ok/err refinement rides the
             // Handle tid (stamped at set_var_ty on spawn), read by the inner/inner2 twins.
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, sname: sv.sname, ty: sv.ty })
@@ -9383,7 +9385,7 @@ fn sv_handle_inner_tid_first(sv: ScopeVar) -> Int {
 }
 
 pub fn get_var_handle_inner(name: Str) -> Int {
-    if scope_ct_count(CT_HANDLE) <= 0 { return -1 }
+    if scope_ct_count(CT_HANDLE) <= 0 && scope_tid_only_count <= 0 { return -1 }
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()

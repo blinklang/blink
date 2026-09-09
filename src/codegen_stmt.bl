@@ -65,18 +65,17 @@ import codegen_types.{
     poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
     compound_tag_ct, option_inner_ct_from_tag, option_inner_struct_from_tag,
     option_c_type_mixed, pop_scope, ptr_inner_c_type, push_scope,
-    reg_sf_entry, ensure_struct_derive_kops_key, register_var_compound_from_tag, register_var_compound_inner_from_str, resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
+    reg_sf_entry, ensure_struct_derive_kops_key, register_var_compound_from_tag, resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
     resolve_import_alias, resolve_option_inner_from_ann, resolve_ret_type_from_ann,
     resolve_self_type, resolve_tuple_ann, resolve_variant, result_c_type,
     result_c_type_mixed, tuple_struct_arity, tuple_elem_name, set_list_elem_struct, set_list_elem_named_boxed, set_list_elem_type,
     get_list_elem_option_inner, get_list_elem_option_inner_struct, get_list_elem_result_ok, get_list_elem_result_err, get_list_elem_result_ok_struct, get_list_elem_result_err_struct, get_list_elem_option_inner_tp, get_list_elem_result_ok_tp, get_list_elem_result_err_tp, tp_carrier_tag, set_map_types, set_map_key_struct, key_struct_sname_from_ann, set_set_elem_type, set_set_elem_struct,
     find_type_def_node, set_var_ffi_ptr_struct, set_var_ffi_ptr_array, set_var_ffi_ptr_extra,
     ffi_alloc_n_pending, ffi_offset_pending_struct,
-    set_var, set_var_ty, set_var_alias, set_var_closure, set_var_handle,
+    set_var, set_var_tid, set_var_ty, set_var_alias, set_var_closure, set_var_handle,
     set_var_handler, tid_spells_struct,
     set_var_iterator, set_var_option,
     get_var_option_inner_tp,
-    get_var_option_inner2, get_var_option_inner2_struct,
     set_var_option_struct, set_var_option_from_struct_tag,
     set_var_result,
     set_var_result_struct, set_var_result_from_struct_tag,
@@ -86,9 +85,9 @@ import codegen_types.{
     struct_reg_names, struct_reg_set, struct_result_c_type, sv_tp, tp_from_ann,
     type_int, type_string, type_struct, type_list, type_option, type_result, type_map,
     list_elem_unspellable,
-    stamp_list_elem_from_tid, stamp_list_elem_from_list_tid, stamp_binder_from_tid, stamp_binder_from_binder_tid, stamp_whole_binder_from_tid, stamp_binder_elems_from_tid_if_unset, stamp_map_from_map_tid, stamp_result_from_tid, map_val_carrier_from_recv, MapValCarrier,
+    stamp_list_elem_from_tid, stamp_list_elem_from_list_tid, stamp_binder_from_tid, stamp_binder_from_binder_tid, stamp_binder_elems_from_tid_if_unset, map_val_carrier_from_recv, MapValCarrier,
     map_pair_from_recv, MapPairTid,
-    split_result_compound, CompoundSplit, map_struct_scalar_kv, MapKvCt, typedef_tag_or_empty, carrier_slot_ct, tp_child1_kind, tp_child1_sname,
+    split_result_compound, CompoundSplit, map_struct_scalar_kv, MapKvCt, typedef_tag_or_empty, carrier_slot_ct,
     tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, get_var_tp, type_from_name, type_from_name_tag, type_alias_base, resolve_alias_chain_name,
     type_name_from_ct, type_where_preds, cg_where_self_var, is_compound_tag, var_enums,
     list_named_elem_of, named_elem_of_elem_tid, ListNamedElem,
@@ -2334,16 +2333,15 @@ fn bind_struct_style_variant_fields(vidx: Int, fcount: Int, resolved_enum: Str, 
         if fpat_node != -1 && strip_generic_args(res_ft) == resolved_enum && (node_kind(fpat_node) == NodeKind.IdentPattern || node_kind(fpat_node) == NodeKind.WildcardPattern) {
             // A self-recursive field (`tail: LL[T]`) renamed to an ident is stored boxed as
             // int64_t; the recursion path can only plain-assign, so deref here through the
-            // mono type. Mirrors the positional path: set_var_struct publishes the mono stem
-            // so a downstream fn call or nested match on the binder recovers the instance.
+            // mono type. Mirrors the positional path: the binder tid names the mono instance,
+            // so a downstream fn call or nested match on the binder recovers it.
             if node_kind(fpat_node) == NodeKind.IdentPattern && node_name(fpat_node) != "_" {
                 let bn = node_name(fpat_node)
                 let c_bind = c_safe_name(bn)
                 let fc_type = if scrut_mono != "" && is_mono_struct_instance(scrut_mono) != 0 { scrut_mono } else { resolved_enum }
                 let fc_name = c_type_c_name(fc_type)
                 emit_line("{fc_name} {c_bind} = *({fc_name}*)(intptr_t){scrut}.data.{resolved_variant}.{field_name};")
-                set_var(bn, CT_VOID, 0)
-                set_var_struct(bn, fc_type)
+                set_var_tid(bn, subst_variant_field_binder_tid(pat_binder_tid(fpat_node), resolved_enum, scrut_mono), 0)
                 var_enums.push(VarEnumEntry { name: bn, enum_type: resolved_enum })
             }
         } else if fpat_node != -1 {
@@ -2388,47 +2386,26 @@ fn bind_struct_style_variant_fields(vidx: Int, fcount: Int, resolved_enum: Str, 
             match_scruts = saved_scruts
         } else {
             let c_bind = c_safe_name(field_name)
+            // The shorthand binder has no IdentPattern node of its own, so its tid rides on the
+            // field-pattern node typecheck publishes. Substituted through the scrutinee's mono
+            // binds; the branches below choose only how the field is read out of the payload.
+            let sf_binder_tid = subst_variant_field_binder_tid(pat_binder_tid(sf_node), resolved_enum, scrut_mono)
             if strip_generic_args(res_ft) == resolved_enum {
                 // A self-recursive field (`tail: LL[T]`) is stored boxed as int64_t, so the
-                // binder derefs through the mono C type. Mirrors the positional path:
-                // set_var_struct publishes the mono stem for downstream recovery.
+                // binder derefs through the mono C type. Mirrors the positional path.
                 let fc_type = if scrut_mono != "" && is_mono_struct_instance(scrut_mono) != 0 { scrut_mono } else { resolved_enum }
                 let fc_name = c_type_c_name(fc_type)
                 emit_line("{fc_name} {c_bind} = *({fc_name}*)(intptr_t){scrut}.data.{resolved_variant}.{field_name};")
-                set_var(field_name, CT_VOID, 0)
-                set_var_struct(field_name, fc_type)
                 var_enums.push(VarEnumEntry { name: field_name, enum_type: resolved_enum })
             } else if is_struct_type(res_ft) != 0 {
                 emit_line("{c_type_c_name(res_ft)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                set_var(field_name, CT_VOID, 0)
-                set_var_struct(field_name, res_ft)
             } else if is_enum_type(res_ft) != 0 {
                 emit_line("{c_type_c_name(res_ft)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                set_var(field_name, CT_INT, 0)
                 var_enums.push(VarEnumEntry { name: field_name, enum_type: res_ft })
             } else if field_ct == CT_LIST {
                 emit_line("blink_list* {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                set_var(field_name, CT_LIST, 0)
-                let bracket_pos = res_ft.index_of("[")
-                if bracket_pos > 0 {
-                    let inner_name = res_ft.substr(bracket_pos + 1, res_ft.len() - bracket_pos - 2)
-                    let inner_ct = type_from_name(inner_name)
-                    if inner_ct != CT_VOID {
-                        set_list_elem_type(field_name, inner_ct)
-                    } else if is_enum_type(inner_name) != 0 || is_struct_type(inner_name) != 0 {
-                        set_list_elem_struct(field_name, inner_name)
-                        set_list_elem_type(field_name, CT_VOID)
-                    }
-                }
             } else if field_ct == CT_OPTION || field_ct == CT_RESULT {
                 emit_line("__typeof__({scrut}.data.{resolved_variant}.{field_name}) {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                set_var(field_name, field_ct, 0)
-                register_var_compound_inner_from_str(field_name, res_ft)
-                // Stamp the Option/Result binder tid so its inner (`p.x` after `Some(v)`)
-                // reads through the tid rather than the flat sname fallback. Same field-pattern
-                // tid the else-branch uses; a decline or a mismatched carrier keeps the flat path.
-                let opt_binder_tid = subst_variant_field_binder_tid(pat_binder_tid(sf_node), resolved_enum, scrut_mono)
-                if tc_tid_ct(opt_binder_tid) == field_ct { set_var_ty(field_name, opt_binder_tid) }
             } else if tc_variant_field_is_selfrec_tuple(resolved_enum, resolved_variant, field_name) != 0 {
                 // Self-recursive tuple field (`Pair { p }` shorthand): stored boxed as
                 // an int64_t pointer (see the ctor), so deref through the mono tuple
@@ -2442,27 +2419,15 @@ fn bind_struct_style_variant_fields(vidx: Int, fcount: Int, resolved_enum: Str, 
                 } else {
                     let tup_c = c_type_c_name(tup_tag)
                     emit_line("{tup_c} {c_bind} = *({tup_c}*)(intptr_t){scrut}.data.{resolved_variant}.{field_name};")
-                    set_var(field_name, field_ct, 0)
-                    set_var_struct(field_name, tup_tag)
                 }
             } else {
                 let sf_flat_c = c_type_str(field_ct)
-                // The struct-style sibling of match_binder.variant_field: the binder reaches here
-                // from a declared field type, so its tid is read off the field-pattern node itself
-                // (published by the EnumPattern/StructPattern typecheck arms). The tid leads; a
-                // genuine void or a decline keeps the flat placeholder, since this is a storage decl.
-                let sf_binder_tid = subst_variant_field_binder_tid(pat_binder_tid(sf_node), resolved_enum, scrut_mono)
                 ctype_probe_at(sf_binder_tid, "variant_field_struct_style", field_name, sf_flat_c, sf_node)
                 let sf_spelled = c_type_from_tid(sf_binder_tid)
                 let sf_c = if sf_spelled != "" && sf_spelled != "void" { sf_spelled } else { sf_flat_c }
                 emit_line("{sf_c} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                set_var(field_name, field_ct, 0)
-                let sf_res_tid = tc_tid_resolved(sf_binder_tid)
-                if tc_tid_kind(sf_res_tid) == TyKind.Tuple {
-                    let tup_tag = tc_tid_tuple_sname(sf_res_tid)
-                    if tup_tag != "" { set_var_struct(field_name, tup_tag) }
-                }
             }
+            set_var_tid(field_name, sf_binder_tid, 0)
         }
         sfi = sfi + 1
     }
@@ -2500,22 +2465,17 @@ fn subst_variant_field_binder_tid(tid: Int, bare_enum: Str, scrut_mono: Str) -> 
     tc_tid_subst_mono(tid, tparams_sl, ml.arg_tids)
 }
 
-// Stamps a match-arm pattern binder's authoritative tid onto its ScopeVar.
+// Stamps a TUPLE-DESTRUCTURE binder's authoritative tid onto a ScopeVar the flat writers already
+// pushed. `let (a, b) = t` and `for (k, v) in xs` both land in emit_tuple_destructure, which still
+// registers its binders through the flat channel; this refines the row afterwards.
 //
-// `bind_pattern_vars` stamps through ~28 `set_var` calls spread over its arms, but a binder's NAME
-// is decided in only four places: the generic `NodeKind.IdentPattern` arm that every recursed
-// sub-pattern re-enters the function to reach, and the three carrier fast paths that handle an
-// IdentPattern inline without recursing. Stamping at those four covers the family. A stamp per arm
-// would cover it today and rot tomorrow, because an arm added later would be silently unstamped.
+// Match-arm binders do NOT come through here. They are registered by set_var_tid from the tid
+// alone, so there is no second channel to refine and nothing that can go stale between the two.
 //
 // The tid is typecheck's, not a second derivation: `tc_check_pattern_types` already decomposes the
-// binding hint one level per arm (Option/Result unwrap, tuple element, list element, variant field)
-// and publishes each leaf's answer on the leaf node. Substituted through the instance's binds so a
-// binder over a `List[T]` element inside a monomorphized body resolves `T` to its concrete arg.
-//
-// A struct-style shorthand field (`match p { Pt { x, y } => ... }`) is NOT stamped here: it has no
-// IdentPattern node, so it never reaches this path. `bind_struct_style_variant_fields` stamps it
-// instead, from the field type typecheck publishes on the StructPattern / EnumPattern field node.
+// binding hint one level per arm (tuple element, list element) and publishes each leaf's answer on
+// the leaf node. Substituted through the instance's binds so a binder over a `List[T]` element
+// inside a monomorphized body resolves `T` to its concrete arg.
 fn pat_measure(bind_name: Str, pat: Int) {
     if bind_name == "" { return }
     if bind_name == "_" { return }
@@ -2533,12 +2493,9 @@ fn pat_measure(bind_name: Str, pat: Int) {
     }
 }
 
-// The tid a binder's C DECLARATION is spelled from — the same expression `pat_measure` stamps
-// the binder's metadata through, so the two cannot drift onto different tids for one binder.
-//
-// The metadata channel and the spelling channel are separate axes and both are needed: the metadata
-// says what `mm.get(k)` decodes to, the spelling says what C type holds `mm`. A binder can be right
-// on one and wrong on the other.
+// The tid a match-arm binder is BOTH declared and registered from. One expression, read once per
+// binder, so the C type that holds the value and the type every reader answers from cannot drift
+// apart: what `mm.get(k)` decodes to and what C type holds `mm` are two projections of this tid.
 fn pat_binder_tid(pat: Int) -> Int {
     if pat == -1 { return -1 }
     cg_node_mono_tid(pat)
@@ -2628,7 +2585,7 @@ fn list_elem_unbox_from_tid(elem_tid: Int, expr: Str) -> Str {
 // The carrier name comes from the binder tid via ensure_tuple_carrier_from_tid, which also REGISTERS
 // the typedef (a literal scrutinee never materializes the tuple value, so its typedef is otherwise
 // never emitted) and returns "" for an ICE_SEG / unspellable element, ceding rather than naming an
-// undeclared C type. stamp_whole_binder_from_tid's tuple arm stamps the tid channel that
+// undeclared C type. The whole-binder tid stamp below fills the tid channel that
 // sv_struct_tid_first reads to spell field access, so no flat sname write is needed. Returns whether
 // it bound the value.
 fn bind_whole_tuple_from_scruts(pat: Int, bind_name: Str, scrut_off: Int, scrut_len: Int) -> Bool ! Codegen.Emit, Codegen.Scope {
@@ -2645,10 +2602,7 @@ fn bind_whole_tuple_from_scruts(pat: Int, bind_name: Str, scrut_off: Int, scrut_
         j = j + 1
     }
     emit_line("{c_type_c_name(whole_tag)} {c_bind} = \{ {inits} };")
-    // whole_tag != "" means ensure_tuple_carrier_from_tid registered the carrier, so the tuple arm
-    // of stamp_whole_binder_from_tid (same tid, same find_tuple_entry gate) always fires here.
-    let _ = stamp_whole_binder_from_tid(whole_tid, bind_name, 1)
-    pat_measure(bind_name, pat)
+    set_var_tid(bind_name, whole_tid, 1)
     true
 }
 
@@ -2676,6 +2630,11 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                 let bind_name = node_name(sub_pat)
                 if bind_name != "_" {
                     let c_bind = c_safe_name(bind_name)
+                    // One binder, one type channel. The branches below decide only how the value
+                    // is READ out of the carrier -- by identity, through a deref, out of a box --
+                    // which is a physical question the tid does not answer. What the binder IS
+                    // comes off this tid alone, once, after the chain.
+                    let bind_tid = pat_binder_tid(sub_pat)
                     let uc = unwrap_carrier(enum_name, scrut, scrut_type)
                     let field = uc.field
                     let inner_ct = uc.inner_ct
@@ -2691,29 +2650,11 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                         // NPO: the carrier IS the handle pointer, so Some(g) binds it
                         // by identity — no `.value` deref.
                         emit_line("{c_type_c_name(opaque_bind)} {c_bind} = {scrut};")
-                        set_var(bind_name, CT_STRUCT, 0)
-                        set_var_struct(bind_name, opaque_bind)
                     } else if inner_struct != "" && inner_ct == CT_RESULT {
                         if field == "value" {
                             emit_line("{c_type_c_name(inner_struct)} {c_bind} = *{scrut}.{field};")
                         } else {
                             emit_line("{c_type_c_name(inner_struct)} {c_bind} = {scrut}.{field};")
-                        }
-                        set_var(bind_name, CT_RESULT, 0)
-                        let _ = stamp_result_from_tid(pat_binder_tid(sub_pat), bind_name)
-                        if inner_struct.starts_with("Result_") {
-                            set_var_result_from_struct_tag(bind_name, inner_struct)
-                            let split = split_result_compound(inner_struct)
-                            if split.second != "" {
-                                expr_result_ok_type = get_var_result_ok(bind_name)
-                                expr_result_err_type = get_var_result_err(bind_name)
-                                expr_result_ok_struct = get_var_result_ok_struct(bind_name)
-                                expr_result_err_struct = get_var_result_err_struct(bind_name)
-                            } else {
-                                set_var_result(bind_name, expr_result_ok_type, expr_result_err_type)
-                            }
-                        } else {
-                            set_var_result(bind_name, expr_result_ok_type, expr_result_err_type)
                         }
                     } else if inner_struct != "" && inner_ct == CT_OPTION {
                         let inner_opaque_handle = opaque_option_carrier_cname(inner_struct)
@@ -2727,58 +2668,10 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                         } else {
                             emit_line("{c_type_c_name(inner_struct)} {c_bind} = {scrut}.{field};")
                         }
-                        set_var(bind_name, CT_OPTION, 0)
-                        if inner_struct.starts_with("Option_") {
-                            set_var_option_from_struct_tag(bind_name, inner_struct)
-                        } else {
-                            set_var_option_struct(bind_name, CT_INT, inner_struct)
-                        }
                     } else if inner_struct != "" && inner_ct == CT_MAP {
                         emit_line("blink_map* {c_bind} = {scrut}.{field};")
-                        set_var(bind_name, CT_MAP, 0)
-                        // A Map unwrapped from a `List[Option[Map[K,V]]]`
-                        // element (`match item { Some(mm) => mm.get(k) }`) needs its
-                        // scalar K/V so `mm.get(k)` decodes V — the single-slot
-                        // expr_option_inner_map_val_* channels only carry a struct/list
-                        // value, never a scalar V (Str), which is what erased to Int.
-                        // The carrier tag (`Map_int_str`) encodes both scalar sides;
-                        // recover them from the tag itself (stateless — unlike the
-                        // transient expr_option_inner_tp, which a nested scope can
-                        // revert). Fire only when a scalar V hasn't already been set.
-                        let mkv = map_struct_scalar_kv(inner_struct)
-                        if mkv.first >= 0 && expr_option_inner_map_val_struct == "" && expr_option_inner_map_val_list_elem < 0 {
-                            set_map_types(bind_name, mkv.first, mkv.second, "")
-                        }
-                        // The flat recovery above reaches back through the transient
-                        // expr_option_inner_map_val_* globals, which a prior unrelated Option[Map]
-                        // emission in the same function leaves holding its value struct/element --
-                        // an erased carrier tag (`map`) cannot displace them the way a structured
-                        // `Map_k_v` tag once did. The binder's own tid is the authority: it clears
-                        // the stale value meta and writes K/V whole, so a scalar Map value out of a
-                        // List element stops reading back a foreign struct.
-                        stamp_map_from_map_tid(pat_binder_tid(sub_pat), bind_name)
                     } else if inner_struct != "" && inner_ct == CT_LIST {
                         emit_line("blink_list* {c_bind} = {scrut}.{field};")
-                        set_var(bind_name, CT_LIST, 0)
-                        // A List unwrapped from a `List[Option[List[T]]]`
-                        // element carries its element type in expr_option_inner_tp
-                        // (the inner List tp node). Prefer it so `li.get(i)` decodes T.
-                        if expr_option_inner_tp >= 0 && tp_get_kind(expr_option_inner_tp) == CT_LIST {
-                            set_list_elem_type(bind_name, tp_child1_kind(expr_option_inner_tp))
-                            let les = tp_child1_sname(expr_option_inner_tp)
-                            if les != "" {
-                                set_list_elem_struct(bind_name, les)
-                            }
-                        } else if expr_option_inner_list_elem >= 0 {
-                            set_list_elem_type(bind_name, expr_option_inner_list_elem)
-                        } else if expr_list_elem_type >= 0 {
-                            set_list_elem_type(bind_name, expr_list_elem_type)
-                        }
-                        if expr_option_inner_list_struct != "" {
-                            set_list_elem_struct(bind_name, expr_option_inner_list_struct)
-                        } else if expr_list_elem_struct != "" {
-                            set_list_elem_struct(bind_name, expr_list_elem_struct)
-                        }
                     } else if inner_struct != "" {
                         if is_transparent_newtype(inner_struct) != 0 {
                             // Transparent newtype (Errno): the carrier arm is a bare
@@ -2787,7 +2680,6 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                             // type — no struct box — so a nested `match e { Errno(rc) }`
                             // binds rc by identity.
                             emit_line("int64_t {c_bind} = {scrut}.{field};")
-                            set_var(bind_name, CT_INT, 0)
                             var_enums.push(VarEnumEntry { name: bind_name, enum_type: inner_struct })
                         } else {
                             if field == "value" && bind_erased != 0 {
@@ -2807,17 +2699,14 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                             } else {
                                 emit_line("{c_type_c_name(inner_struct)} {c_bind} = {scrut}.{field};")
                             }
-                            set_var(bind_name, CT_INT, 0)
-                            set_var_struct(bind_name, inner_struct)
                             if is_enum_type(inner_struct) != 0 {
                                 var_enums.push(VarEnumEntry { name: bind_name, enum_type: inner_struct })
                             }
                         }
                     } else {
-                        let payload_tid = pat_binder_tid(sub_pat)
                         let payload_c = c_type_str(inner_ct)
-                        ctype_probe_at(payload_tid, "match_binder.carrier_payload", bind_name, payload_c, sub_pat)
-                        let payload_spelled = c_type_from_tid(payload_tid)
+                        ctype_probe_at(bind_tid, "match_binder.carrier_payload", bind_name, payload_c, sub_pat)
+                        let payload_spelled = c_type_from_tid(bind_tid)
                         let payload_ts = if payload_spelled != "" && payload_spelled != "void" { payload_spelled } else { payload_c }
                         // A compound inner (Option/Result) under an Option's `.value`
                         // is boxed by pointer, so the whole-value binder derefs — same
@@ -2830,54 +2719,8 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                         } else {
                             emit_line("{payload_ts} {c_bind} = {scrut}.{field};")
                         }
-                        set_var(bind_name, inner_ct, 0)
-                        if inner_ct == CT_LIST {
-                            // A plain `Option[List[T]]` (no struct name)
-                            // unwrapped from a List[compound] element carries T on
-                            // expr_option_inner_tp (the inner List tp). Prefer it so
-                            // `li.get(i)` decodes T — the list-elem globals below are
-                            // stale here (they described the outer list).
-                            if expr_option_inner_tp >= 0 && tp_get_kind(expr_option_inner_tp) == CT_LIST {
-                                set_list_elem_type(bind_name, tp_child1_kind(expr_option_inner_tp))
-                                let les = tp_child1_sname(expr_option_inner_tp)
-                                if les != "" {
-                                    set_list_elem_struct(bind_name, les)
-                                }
-                            } else if expr_option_inner_list_elem >= 0 {
-                                set_list_elem_type(bind_name, expr_option_inner_list_elem)
-                            } else if expr_list_elem_type >= 0 {
-                                set_list_elem_type(bind_name, expr_list_elem_type)
-                            }
-                            if expr_option_inner_list_struct != "" {
-                                set_list_elem_struct(bind_name, expr_option_inner_list_struct)
-                            } else if expr_list_elem_struct != "" {
-                                set_list_elem_struct(bind_name, expr_list_elem_struct)
-                            }
-                        } else if inner_ct == CT_SET {
-                            // match d.get(0) { Some(inner) => ... } — mirror the
-                            // CT_LIST branch above. The Set's own element rides the
-                            // scrutinee's flat inner2 channel (stamped by the .get()/.pop()
-                            // CT_SET arms), never a transient global.
-                            let set_nested = get_var_option_inner2(scrut)
-                            if set_nested != -1 {
-                                set_set_elem_type(bind_name, set_nested)
-                            }
-                            let set_nested_s = get_var_option_inner2_struct(scrut)
-                            if set_nested_s != "" {
-                                set_set_elem_struct(bind_name, set_nested_s)
-                            }
-                        } else if inner_ct == CT_MAP {
-                            // The carrier's ok/value struct slot was erased (a compound
-                            // Map inner sets no rok_s), so unwrap_carrier reported no
-                            // inner_struct and the Map reached this branch with only its
-                            // head CT. The Map C type is pointer-erased anyway, so only
-                            // the key/value metadata is at stake — and the binder's own
-                            // tid is the authority for it. Without this, `Map[Str, Point]`
-                            // read its value back as Int (`inner.get(k).value.<field>`).
-                            stamp_map_from_map_tid(pat_binder_tid(sub_pat), bind_name)
-                        }
                     }
-                    pat_measure(bind_name, sub_pat)
+                    set_var_tid(bind_name, bind_tid, 0)
                 }
             } else if sub_pk == NodeKind.WildcardPattern {
                 let _skip = 0
@@ -2941,8 +2784,7 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                             let bn = node_name(sub_pat0)
                             if bn != "_" {
                                 emit_line("int64_t {c_safe_name(bn)} = {scrut};")
-                                set_var(bn, CT_INT, 0)
-                                pat_measure(bn, sub_pat0)
+                                set_var_tid(bn, pat_binder_tid(sub_pat0), 0)
                             }
                         }
                     }
@@ -2971,44 +2813,28 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                             let bind_name = node_name(sub_pat)
                             if bind_name != "_" {
                                 let c_bind = c_safe_name(bind_name)
+                                // Substituted through the scrutinee's mono binds, so a field
+                                // declared `T` or `Tree[T]` names its concrete instance. The
+                                // branches below choose only how the field is read out of the
+                                // variant payload -- unboxed, deref'd, copied.
+                                let vfield_tid = subst_variant_field_binder_tid(pat_binder_tid(sub_pat), resolved_enum, scrut_mono)
                                 if field_type_name == resolved_enum {
                                     // Recursive-enum field: unbox with the scrutinee's
                                     // mono C type (blink_Tree_Int) so `l`/`r` are typed
-                                    // Tree[Int], not the erased bare Tree. set_var_struct
-                                    // publishes the mono stem so a downstream fn call
-                                    // (leaf_value(l)) resolves the arg C type.
+                                    // Tree[Int], not the erased bare Tree.
                                     let fc_type = if scrut_mono != "" && is_mono_struct_instance(scrut_mono) != 0 { scrut_mono } else { field_type_name }
                                     let fc_name = c_type_c_name(fc_type)
                                     emit_line("{fc_name} {c_bind} = *({fc_name}*)(intptr_t){scrut}.data.{resolved_variant}.{field_name};")
-                                    set_var(bind_name, CT_VOID, 0)
-                                    set_var_struct(bind_name, fc_type)
                                     var_enums.push(VarEnumEntry { name: bind_name, enum_type: resolved_enum })
                                 } else if is_struct_type(field_type_name) != 0 {
                                     emit_line("{c_type_c_name(field_type_name)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                                    set_var(bind_name, CT_VOID, 0)
-                                    set_var_struct(bind_name, field_type_name)
                                 } else if is_enum_type(field_type_name) != 0 {
                                     emit_line("{c_type_c_name(field_type_name)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                                    set_var(bind_name, CT_INT, 0)
                                     var_enums.push(VarEnumEntry { name: bind_name, enum_type: field_type_name })
                                 } else if field_ct == CT_LIST {
                                     emit_line("blink_list* {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                                    set_var(bind_name, CT_LIST, 0)
-                                    let bracket_pos = field_type_name.index_of("[")
-                                    if bracket_pos > 0 {
-                                        let inner_name = field_type_name.substr(bracket_pos + 1, field_type_name.len() - bracket_pos - 2)
-                                        let inner_ct = type_from_name(inner_name)
-                                        if inner_ct != CT_VOID {
-                                            set_list_elem_type(bind_name, inner_ct)
-                                        } else if is_enum_type(inner_name) != 0 || is_struct_type(inner_name) != 0 {
-                                            set_list_elem_struct(bind_name, inner_name)
-                                            set_list_elem_type(bind_name, CT_VOID)
-                                        }
-                                    }
                                 } else if field_ct == CT_OPTION || field_ct == CT_RESULT {
                                     emit_line("__typeof__({scrut}.data.{resolved_variant}.{field_name}) {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                                    set_var(bind_name, field_ct, 0)
-                                    register_var_compound_inner_from_str(bind_name, field_type_name)
                                 } else if tc_variant_field_is_selfrec_tuple(resolved_enum, resolved_variant, field_name) != 0 {
                                     // Self-recursive tuple field: stored boxed as an
                                     // int64_t pointer (see the ctor), so deref through the
@@ -3022,27 +2848,15 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                                     } else {
                                         let tup_c = c_type_c_name(tup_tag)
                                         emit_line("{tup_c} {c_bind} = *({tup_c}*)(intptr_t){scrut}.data.{resolved_variant}.{field_name};")
-                                        set_var(bind_name, field_ct, 0)
-                                        set_var_struct(bind_name, tup_tag)
                                     }
                                 } else {
-                                    let vfield_tid = subst_variant_field_binder_tid(pat_binder_tid(sub_pat), resolved_enum, scrut_mono)
                                     let vfield_c = c_type_str(field_ct)
                                     ctype_probe_at(vfield_tid, "match_binder.variant_field", bind_name, vfield_c, sub_pat)
                                     let vfield_spelled = c_type_from_tid(vfield_tid)
                                     let vfield_ts = if vfield_spelled != "" && vfield_spelled != "void" { vfield_spelled } else { vfield_c }
                                     emit_line("{vfield_ts} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                                    set_var(bind_name, field_ct, 0)
-                                    // A tuple payload has no struct/enum name, so publish its
-                                    // carrier tag on the binding; without it a positional read
-                                    // (`t.0`) can't find the tuple entry and renders <value>.
-                                    let vfield_res_tid = tc_tid_resolved(vfield_tid)
-                                    if tc_tid_kind(vfield_res_tid) == TyKind.Tuple {
-                                        let tup_tag = tc_tid_tuple_sname(vfield_res_tid)
-                                        if tup_tag != "" { set_var_struct(bind_name, tup_tag) }
-                                    }
                                 }
-                                pat_measure(bind_name, sub_pat)
+                                set_var_tid(bind_name, vfield_tid, 0)
                             }
                         } else if sub_pk == NodeKind.WildcardPattern {
                             let _skip = 0
@@ -3151,10 +2965,7 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                 match_scruts = saved_scruts
             } else {
                 emit_line("__typeof__({scrut}.{fname}) {c_fname} = {scrut}.{fname};")
-                set_var(fname, ftype, 0)
-                if fstype != "" {
-                    set_var_struct(fname, fstype)
-                }
+                set_var_tid(fname, pat_binder_tid(sf), 0)
             }
             j = j + 1
         }
@@ -3185,7 +2996,7 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
             let as_enum_spelled = c_type_from_tid(as_enum_tid)
             let as_enum_ts = if as_enum_spelled != "" && as_enum_spelled != "void" { as_enum_spelled } else { as_enum_c }
             emit_line("{as_enum_ts} {c_bind} = {scrut_str};")
-            set_var(bind_name, CT_INT, 1)
+            set_var_tid(bind_name, as_enum_tid, 1)
             var_enums.push(VarEnumEntry { name: bind_name, enum_type: match_scrut_enum })
         } else if sn != "" {
             let as_tid = pat_binder_tid(pat)
@@ -3194,21 +3005,7 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
             let as_sn_spelled = c_type_from_tid(as_tid)
             let as_sn_ts = if as_sn_spelled != "" && as_sn_spelled != "void" { as_sn_spelled } else { as_sn_c }
             emit_line("{as_sn_ts} {c_bind} = {scrut_str};")
-            if !stamp_whole_binder_from_tid(as_tid, bind_name, 1) {
-                if sn.starts_with("Option_") {
-                    set_var(bind_name, CT_OPTION, 1)
-                    set_var_option_from_struct_tag(bind_name, sn)
-                } else if sn.starts_with("Result_") {
-                    set_var(bind_name, CT_RESULT, 1)
-                    set_var_result_from_struct_tag(bind_name, sn)
-                } else {
-                    set_var(bind_name, CT_VOID, 1)
-                    set_var_struct(c_bind, sn)
-                    if is_data_enum(sn) != 0 {
-                        var_enums.push(VarEnumEntry { name: bind_name, enum_type: sn })
-                    }
-                }
-            }
+            set_var_tid(bind_name, as_tid, 1)
         } else {
             // The `sn == ""` branch is where an `as` binder over a carrier or a struct lands, and
             // `c_type_str` of a bare CT answers `void` for both: a carrier is only nameable WITH its
@@ -3220,9 +3017,7 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
             let as_spelled = c_type_from_tid(as_tid)
             let as_ts = if as_spelled != "" && as_spelled != "void" { as_spelled } else { as_c }
             emit_line("{as_ts} {c_bind} = {scrut_str};")
-            if !stamp_whole_binder_from_tid(as_tid, bind_name, 1) {
-                set_var(bind_name, st, 1)
-            }
+            set_var_tid(bind_name, as_tid, 1)
         }
         bind_pattern_vars(node_pattern(pat), scrut_off, scrut_len)
         return
@@ -3248,26 +3043,7 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                 let ident_sn_spelled = c_type_from_tid(ident_sn_tid)
                 let ident_sn_ts = if ident_sn_spelled != "" && ident_sn_spelled != "void" { ident_sn_spelled } else { ident_sn_c }
                 emit_line("{ident_sn_ts} {c_bind} = {entry.str_val};")
-                // Tid first, tag second. `sn` is the tuple field's struct-name slot, which
-                // emit_tuple_typedef also uses as a dumping ground for compound tags, so a
-                // Map element arrives here indistinguishable from a struct. The
-                // chain below decodes only `Option_`/`Result_` and would file it as a struct
-                // named `Map_str_int`.
-                if !stamp_binder_from_tid(pat, bind_name, 1) {
-                    if sn.starts_with("Option_") {
-                        set_var(bind_name, CT_OPTION, 1)
-                        set_var_option_from_struct_tag(bind_name, sn)
-                    } else if sn.starts_with("Result_") {
-                        set_var(bind_name, CT_RESULT, 1)
-                        set_var_result_from_struct_tag(bind_name, sn)
-                    } else {
-                        set_var(bind_name, CT_VOID, 1)
-                        set_var_struct(c_bind, sn)
-                        if is_data_enum(sn) != 0 {
-                            var_enums.push(VarEnumEntry { name: bind_name, enum_type: sn })
-                        }
-                    }
-                }
+                set_var_tid(bind_name, ident_sn_tid, 1)
             } else {
                 let ident_tid = pat_binder_tid(pat)
                 let ident_c = c_type_str(st)
@@ -3275,14 +3051,8 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                 let ident_spelled = c_type_from_tid(ident_tid)
                 let ident_ts = if ident_spelled != "" && ident_spelled != "void" { ident_spelled } else { ident_c }
                 emit_line("{ident_ts} {c_bind} = {entry.str_val};")
-                // The scalar branch needs the tid too, and for a different erasure: a container
-                // element keeps its own CT here and loses its ELEMENT, which is a silent wrong
-                // answer rather than a missing method.
-                if !stamp_binder_from_tid(pat, bind_name, 1) {
-                    set_var(bind_name, st, 1)
-                }
+                set_var_tid(bind_name, ident_tid, 1)
             }
-            pat_measure(bind_name, pat)
         }
         if scrut_len > 1 {
             // A whole-value ident binder over a tuple scrutinee.
