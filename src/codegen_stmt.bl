@@ -65,7 +65,7 @@ import codegen_types.{
     poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
     compound_tag_ct, option_inner_ct_from_tag, option_inner_struct_from_tag,
     option_c_type_mixed, pop_scope, ptr_inner_c_type, push_scope,
-    reg_sf_entry, ensure_struct_derive_kops_key, register_var_compound_from_tag, resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
+    reg_sf_entry, ensure_struct_derive_kops_key, resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
     resolve_import_alias, resolve_option_inner_from_ann, resolve_ret_type_from_ann,
     resolve_self_type, resolve_tuple_ann, resolve_variant, result_c_type,
     result_c_type_mixed, tuple_struct_arity, tuple_elem_name, set_list_elem_struct, set_list_elem_named_boxed, set_list_elem_type,
@@ -88,7 +88,7 @@ import codegen_types.{
     stamp_list_elem_from_tid, stamp_list_elem_from_list_tid, stamp_binder_from_tid, stamp_binder_from_binder_tid, stamp_binder_elems_from_tid_if_unset, map_val_carrier_from_recv, MapValCarrier,
     map_pair_from_recv, MapPairTid,
     split_result_compound, CompoundSplit, map_struct_scalar_kv, MapKvCt, typedef_tag_or_empty, carrier_slot_ct,
-    tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, get_var_tp, type_from_name, type_from_name_tag, type_alias_base, resolve_alias_chain_name,
+    tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, get_var_tp, type_from_name, type_from_name_tag, type_alias_base, resolve_alias_chain_name,
     type_name_from_ct, type_where_preds, cg_where_self_var, is_compound_tag, var_enums,
     list_named_elem_of, named_elem_of_elem_tid, ListNamedElem,
     get_var_iter_carrier,
@@ -97,7 +97,7 @@ import codegen_types.{
     closure_sig_hash
 }
 import codegen_expr.{
-    ensure_tuple_carrier_from_tid,
+    ensure_tuple_carrier_from_tid, ensure_tuple_typedef_from_tid,
     emit_expr, expr_closure_sig, expr_list_elem_struct, expr_list_elem_type,
     expr_map_key_type, expr_map_val_type, expr_map_val_struct, expr_map_key_struct, expr_option_inner,
     expr_option_inner_list_elem, expr_option_inner_list_struct,
@@ -122,8 +122,8 @@ import mono.{node_tid_for_key, mono_node_tid_diff_on, node_tid_diff_record}
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{tc_void_tid, tc_tid_child, tc_tid_handler_effect, tc_tid_subst_mono, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, make_list_type, make_tuple_type, TyKind, is_builtin_fn, is_import_module_name, tc_lookup_node_tid, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_variant_field_tid_by_name, tc_variant_field_is_selfrec_tuple}
-import lowering.{tc_top_level_let_tid, ctype_probe_at, closure_sig_from_tid, enum_instance_c_from_tid, struct_instance_c_from_tid, c_type_from_tid, tc_channel_elem_ct, tc_channel_elem_struct, tc_tid_struct_mono_name, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_tuple_sname, tc_tid_to_c_tag}
+import typecheck.{tc_void_tid, tc_tid_child, tc_tid_child_count, tc_tid_list_elem, tc_tid_handler_effect, tc_tid_subst_mono, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, make_list_type, make_tuple_type, TyKind, is_builtin_fn, is_import_module_name, tc_lookup_node_tid, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_variant_field_tid_by_name, tc_variant_field_is_selfrec_tuple, tc_tid_has_bare_typevar}
+import lowering.{tc_top_level_let_tid, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_set_elem_tid, ctype_probe_at, closure_sig_from_tid, enum_instance_c_from_tid, struct_instance_c_from_tid, c_type_from_tid, tc_channel_elem_ct, tc_channel_elem_struct, tc_tid_struct_mono_name, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_tuple_sname, tc_tid_to_c_tag}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -5169,36 +5169,97 @@ fn forin_binder_ctype(var_name: Str, iter_node: Int, node: Int, site: Str, flat:
     spelled
 }
 
-// The same stamping for a function parameter, which is the larger population: four registration
-// loops — plain fn, prototype, monomorphized fn, poly impl — build a param's ScopeVar from
-// `node_type_name(p)`, a NAME put through type_from_name, while the annotation node carries the
-// whole tree. This stamps the param's resolved tid so the body reads the full type.
+// ── Parameter binding ───────────────────────────────────────────────────────
 //
-// Called once per loop, AFTER the loop, rather than inside its arms. Each loop stamps through
-// several branches with an early `continue`, and what the body reads is the state after every arm
-// has run. Re-walking the sublist costs one pass and cannot miss an arm added without a stamp.
+// The tid a param row is typed by. The PARAM node, not its annotation: typecheck
+// publishes the param's resolved type there (tc_publish_node_tid in tc_check_fn,
+// the `self` receiver included via tc_current_self_tid), and the post-inference
+// total-stamp pass leaves none unstamped. The annotation node carries a tid only
+// for the struct-instance shapes that walk it, so it is the fallback, not the
+// source. tc_tid_subst_mono rewrites a generic body's typevar slots through the
+// instance binders; the mono and poly-impl callers pass their own binders because
+// cg_mono_* is not switched until body emit.
+pub fn param_bind_tid(p: Int, tparams_sl: Int, arg_tids: List[Int]) -> Int {
+    let mut praw = tc_lookup_node_tid(p)
+    if praw < 0 { praw = tc_lookup_node_tid(node_type_ann(p)) }
+    tc_tid_subst_mono(tc_tid_resolved(praw), tparams_sl, arg_tids)
+}
+
+// Every mono instance and carrier typedef a param's TYPE names, asked for from the
+// param's tid alone. A param is frequently the only site naming its instance, and
+// the caller's own construction registers the same typedef too late for a forward
+// decl already emitted above it, so this pass is what makes them exist.
+pub fn register_param_instances(tid0: Int) ! Codegen.Register {
+    // Resolve once at entry: the kind reads below (tc_tid_is_enum, tc_tid_struct) are
+    // non-resolving, and the Fn arm recurses on RAW children, so a bound metavar child
+    // would read TyKind.Unknown and fall past every arm.
+    let tid = tc_tid_resolved(tid0)
+    if tid < 0 { return }
+    if tc_tid_is_enum(tid) != 0 {
+        register_enum_instance_from_tid(tid)
+        return
+    }
+    if tc_tid_struct(tid) != "" {
+        register_struct_instance_from_tid(tid)
+        return
+    }
+    // A closure-typed param is spelled from its Fn tid's own children (child 0 the
+    // return, the params after it), and the param is usually the only site naming
+    // them: nothing here constructs the closure's return value. So walk them.
+    if tc_tid_kind(tid) == TyKind.Fn {
+        let n = tc_tid_child_count(tid)
+        let mut ci = 0
+        while ci < n {
+            register_param_instances(tc_tid_child(tid, ci))
+            ci = ci + 1
+        }
+        return
+    }
+    register_carrier_struct_instance_leaves(tid)
+    // A carrier over a still-generic inner (`Option[T]` in a poly-impl body) has no C
+    // name to register: every spelling of it puts the typevar placeholder in the
+    // symbol. The deferred mono pass registers the real carrier per concrete T.
+    if tc_tid_has_bare_typevar(tid) != 0 { return }
+    let tag = tc_tid_to_c_tag(tid)
+    // Decline a bare ICE_SEG_* sentinel rather than registering a typedef under it,
+    // as every other tag consumer here does.
+    if tag == "" || diag_is_ice_seg(tag) { return }
+    ensure_carrier_from_tag(tag)
+}
+
+// Bind one param row from its tid, and nothing else: no ctype, no sname, no
+// per-type-name arm. Every reader projects the shape it needs out of the one
+// channel, so there is no second channel to keep in step and none to go stale.
 //
-// tparams_sl/arg_tids are the mono binds (cg_fn_mono_*, the stable twins — params are registered
-// at fn entry, before any struct-literal swap), so a generic param resolves to the concrete type
-// this instance was emitted for instead of a bare typevar. -1/[] outside a mono body makes
-// tc_tid_subst_mono a no-op.
-fn params_measure(params_sl: Int, tparams_sl: Int, arg_tids: List[Int]) {
+// Two things a row still needs beyond its type ride the same tid. var_enums is the
+// last side table with no tid reader (get_var_enum answers the variant tag/field
+// lookups from it). The handler vtable scratch is what `with h` dispatches through.
+pub fn param_bind_row(pname: Str, ptid: Int, is_mut: Int) ! Codegen.Scope, Codegen.Register {
+    if pname == "" { return }
+    set_var_tid(pname, ptid, is_mut)
+    register_param_instances(ptid)
+    if tc_tid_is_enum(ptid) != 0 {
+        var_enums.push(VarEnumEntry { name: pname, enum_type: tc_tid_struct(ptid) })
+    }
+    let eff = tc_tid_handler_effect(ptid)
+    if eff != "" {
+        set_var_handler(pname, resolve_effect_vtable(eff), resolve_effect_field(eff), resolve_effect_is_ue(eff))
+    }
+}
+
+// The declared-param positions: plain fn, impl method (the `self` receiver
+// included), mono instance, poly-impl method, handler method. A closure literal
+// binds through param_bind_row directly because its params are typed positionally
+// off the closure's own Fn tid, not off the param node.
+pub fn params_bind(params_sl: Int, tparams_sl: Int, arg_tids: List[Int], param_mut: Int) ! Codegen.Scope, Codegen.Register {
     if params_sl == -1 { return }
     let mut i = 0
     while i < sublist_length(params_sl) {
         let p = sublist_get(params_sl, i)
         let pname = node_name(p)
-        // The PARAM node, not its annotation: typecheck publishes the param's resolved type
-        // there (tc_publish_node_tid), and the annotation node carries a tid only for the
-        // struct-instance shapes that walk it. The annotation is the fallback, not the source.
-        let mut praw = tc_lookup_node_tid(p)
-        if praw < 0 { praw = tc_lookup_node_tid(node_type_ann(p)) }
-        if pname != "" {
-            let ptid = tc_tid_subst_mono(tc_tid_resolved(praw), tparams_sl, arg_tids)
-            if ptid >= 0 && tc_tid_kind(ptid) != TyKind.Unknown {
-                set_var_ty(pname, ptid)
-            }
-        }
+        let mut is_mut = param_mut
+        if pname == "self" || pname == "_self" { is_mut = 0 }
+        param_bind_row(pname, param_bind_tid(p, tparams_sl, arg_tids), is_mut)
         i = i + 1
     }
 }
@@ -7358,134 +7419,8 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str, im_node: Int) ! Codege
         }
     }
 
-    let self_name = impl_method_self_name(fn_node)
-    if self_name != "" {
-        let impl_ct = type_from_name(impl_type)
-        if builtin_receiver_type_name(impl_ct) != "" {
-            set_var(self_name, impl_ct, 0)
-        } else {
-            set_var(self_name, CT_VOID, 0)
-            set_var_struct(self_name, impl_type)
-        }
-    }
-
     let params_sl = node_params(fn_node)
-    if params_sl != -1 {
-        let mut i = 0
-        while i < sublist_length(params_sl) {
-            let p = sublist_get(params_sl, i)
-            let pname = node_name(p)
-            if pname != "self" && pname != "_self" {
-                let ptype_raw = node_type_name(p)
-                let ptype = resolve_self_type(ptype_raw, impl_type)
-                if ptype == "Fn" {
-                    set_var(pname, CT_CLOSURE, 1)
-                    let ta = node_type_ann(p)
-                    if ta != -1 {
-                        let sig_str = build_closure_sig_from_type_ann(ta)
-                        set_var_closure(pname, sig_str, tc_lookup_node_tid(p))
-                    }
-                } else {
-                    let param_ct = if is_enum_type(ptype) != 0 { CT_INT } else { type_from_name(ptype) }
-                    set_var(pname, param_ct, 1)
-                    if is_struct_type(ptype) != 0 {
-                        // Mirror emit_fn_def / param_c_type: a struct-instance param
-                        // binds to its mono struct name so field reads resolve the
-                        // concrete inner, not the bare generic base.
-                        let inst_stem = ann_mono_stem(node_type_ann(p))
-                        let struct_name = if inst_stem != "" { inst_stem } else { ptype }
-                        set_var_struct(pname, struct_name)
-                        let param_tid = tc_lookup_node_tid(node_type_ann(p))
-                        if param_tid >= 0 && tc_tid_struct_mono_name(cg_bind_mono_tid(param_tid)) == struct_name {
-                            set_var_ty(pname, param_tid)
-                        }
-                    }
-                    if is_enum_type(ptype) != 0 {
-                        var_enums.push(VarEnumEntry { name: pname, enum_type: ptype })
-                        // Mirror emit_fn_def: a generic-enum instance param registers
-                        // its mono instance and tracks the mono stem.
-                        let einst = tc_lookup_node_tid(node_type_ann(p))
-                        let einst_stem = tc_tid_struct_mono_name(einst)
-                        if einst_stem != "" {
-                            register_enum_instance_from_tid(einst)
-                            set_var_struct(pname, einst_stem)
-                        }
-                    }
-                    if ptype == "List" {
-                        let ta = node_type_ann(p)
-                        if ta != -1 {
-                            let elems_sl = node_elements(ta)
-                            if elems_sl != -1 && sublist_length(elems_sl) > 0 {
-                                let elem_ann = sublist_get(elems_sl, 0)
-                                let elem_name = node_name(elem_ann)
-                                let elem_ct = type_from_name(elem_name)
-                                set_list_elem_type(pname, elem_ct)
-                                if elem_ct == CT_VOID && (is_named_type(elem_name) != 0) {
-                                    set_list_elem_struct(pname, elem_name)
-                                } else if elem_ct == CT_VOID && elem_name == "Tuple" {
-                                    let tup_opt = resolve_tuple_ann(elem_ann, -1, [])
-                                    if tup_opt.is_some() {
-                                        set_list_elem_struct(pname, tup_opt.unwrap())
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if ptype == "Map" {
-                        let ta = node_type_ann(p)
-                        if ta != -1 {
-                            let elems_sl = node_elements(ta)
-                            if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-                                let key_ann = sublist_get(elems_sl, 0)
-                                let val_ann = sublist_get(elems_sl, 1)
-                                let val_head = node_name(val_ann)
-                                let val_ct = type_from_name(val_head)
-                                // Mirror emit_fn_def's Map param fix: a
-                                // generic-struct-INSTANCE value ("Box[Int]") must
-                                // resolve to its mono stem, not the bare head.
-                                let val_inst_stem = ann_mono_stem(val_ann)
-                                let val_name = if val_inst_stem != "" { val_inst_stem } else { val_head }
-                                set_map_types(pname, type_from_name(node_name(key_ann)), val_ct, val_name)
-                                if val_inst_stem != "" {
-                                    register_map_elem_struct_mono_from_tid(tc_lookup_node_tid(val_ann))
-                                }
-                            }
-                        }
-                    }
-                    if ptype == "Set" {
-                        let ta = node_type_ann(p)
-                        if ta != -1 {
-                            let elems_sl = node_elements(ta)
-                            if elems_sl != -1 && sublist_length(elems_sl) > 0 {
-                                let elem_ann = sublist_get(elems_sl, 0)
-                                let elem_name = node_name(elem_ann)
-                                let elem_ct = type_from_name(elem_name)
-                                if elem_ct >= 0 && elem_ct != CT_VOID {
-                                    set_set_elem_type(pname, elem_ct)
-                                } else {
-                                    // A raw type-parameter letter (e.g. "T") or a
-                                    // struct-element name both read CT_VOID from
-                                    // type_from_name -- recover the mono-substituted
-                                    // element (scalar or struct) from the annotation's
-                                    // own tid instead of leaving it unstamped.
-                                    recover_set_elem_from_tid(ta, pname)
-                                }
-                            }
-                        }
-                    }
-                    if ptype == "Tuple" {
-                        let ta = node_type_ann(p)
-                        if ta != -1 {
-                            let tup_name = resolve_tuple_ann(ta, -1, []).unwrap()
-                            set_var_struct(pname, tup_name)
-                        }
-                    }
-                }
-            }
-            i = i + 1
-        }
-    }
-    params_measure(params_sl, -1, [])
+    params_bind(params_sl, -1, [], 1)
 
     let mut body_ret = ret_type
     if ret_needs_struct_body(ret_str) != 0 {
@@ -8109,233 +8044,8 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
         }
     }
 
-    // Register params in scope
     let params_sl = node_params(fn_node)
-    if params_sl != -1 {
-        let mut i = 0
-        while i < sublist_length(params_sl) {
-            let p = sublist_get(params_sl, i)
-            let pname = node_name(p)
-            let ptype = node_type_name(p)
-            if ptype == "Fn" {
-                set_var(pname, CT_CLOSURE, 1)
-                let ta = node_type_ann(p)
-                if ta != -1 {
-                    let sig_str = build_closure_sig_from_type_ann(ta)
-                    set_var_closure(pname, sig_str, tc_lookup_node_tid(p))
-                }
-            } else {
-                let param_ct = if is_enum_type(ptype) != 0 { CT_INT } else { type_from_name(ptype) }
-                set_var(pname, param_ct, 1)
-                if is_struct_type(ptype) != 0 {
-                    // Match the monomorphized carrier the signature emits (above):
-                    // a struct-instance param binds its var to the mono struct name
-                    // (Box_Str / Box_Box_Int) so field reads resolve the concrete
-                    // inner, not the bare generic `Box`.
-                    let inst_stem = ann_mono_stem(node_type_ann(p))
-                    let struct_name = if inst_stem != "" { inst_stem } else { ptype }
-                    set_var_struct(pname, struct_name)
-                    let param_tid = tc_lookup_node_tid(node_type_ann(p))
-                    if param_tid >= 0 && tc_tid_struct_mono_name(cg_bind_mono_tid(param_tid)) == struct_name {
-                        set_var_ty(pname, param_tid)
-                    }
-                }
-                if is_enum_type(ptype) != 0 {
-                    var_enums.push(VarEnumEntry { name: pname, enum_type: ptype })
-                    // A generic-enum INSTANCE param (`t: Tree[Int]`) registers its mono
-                    // instance (so the blink_Tree_Int typedef is emitted even when this
-                    // fn is the only site naming it) and tracks the mono stem so a
-                    // `match t {…}` body reads the mono type via get_var_struct.
-                    let einst = tc_lookup_node_tid(node_type_ann(p))
-                    let einst_stem = tc_tid_struct_mono_name(einst)
-                    if einst_stem != "" {
-                        register_enum_instance_from_tid(einst)
-                        set_var_struct(pname, einst_stem)
-                    }
-                }
-                if ptype == "List" {
-                    let ta = node_type_ann(p)
-                    if ta != -1 {
-                        let elems_sl = node_elements(ta)
-                        if elems_sl != -1 && sublist_length(elems_sl) > 0 {
-                            let elem_ann = sublist_get(elems_sl, 0)
-                            let elem_name = node_name(elem_ann)
-                            let elem_ct = type_from_name(elem_name)
-                            set_list_elem_type(pname, elem_ct)
-                            if elem_ct == CT_VOID && (is_named_type(elem_name) != 0) {
-                                set_list_elem_struct(pname, elem_name)
-                            } else if elem_ct == CT_VOID && elem_name == "Tuple" {
-                                let tup_opt = resolve_tuple_ann(elem_ann, -1, [])
-                                if tup_opt.is_some() {
-                                    set_list_elem_struct(pname, tup_opt.unwrap())
-                                }
-                            }
-                        }
-                    }
-                }
-                if ptype == "Map" {
-                    let ta = node_type_ann(p)
-                    if ta != -1 {
-                        let elems_sl = node_elements(ta)
-                        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-                            let key_ann = sublist_get(elems_sl, 0)
-                            let val_ann = sublist_get(elems_sl, 1)
-                            let val_head = node_name(val_ann)
-                            let val_ct = type_from_name(val_head)
-                            // Match the struct-param handling three branches up: the
-                            // bare head ("Box") is never declared in C when the value
-                            // is a generic-struct INSTANCE ("Box[Int]" -> "Box_Int").
-                            let val_inst_stem = ann_mono_stem(val_ann)
-                            let val_name = if val_inst_stem != "" { val_inst_stem } else { val_head }
-                            set_map_types(pname, type_from_name(node_name(key_ann)), val_ct, val_name)
-                            if val_inst_stem != "" {
-                                // Nothing else in this fn necessarily constructs/consumes
-                                // a Box_Int directly, so without registering the mono
-                                // instance here its typedef never gets emitted even
-                                // though every read site now correctly names it.
-                                register_map_elem_struct_mono_from_tid(tc_lookup_node_tid(val_ann))
-                            }
-                        }
-                    }
-                }
-                if ptype == "Set" {
-                    let ta = node_type_ann(p)
-                    if ta != -1 {
-                        let elems_sl = node_elements(ta)
-                        if elems_sl != -1 && sublist_length(elems_sl) > 0 {
-                            let elem_ann = sublist_get(elems_sl, 0)
-                            let elem_name = node_name(elem_ann)
-                            let elem_ct = type_from_name(elem_name)
-                            if elem_ct >= 0 && elem_ct != CT_VOID {
-                                set_set_elem_type(pname, elem_ct)
-                            } else {
-                                // See the twin block in emit_impl_method_def: recover
-                                // the mono-substituted element from the annotation's
-                                // tid rather than leaving it unstamped.
-                                recover_set_elem_from_tid(ta, pname)
-                            }
-                        }
-                    }
-                }
-                if ptype == "Tuple" {
-                    let ta = node_type_ann(p)
-                    if ta != -1 {
-                        let tup_name = resolve_tuple_ann(ta, -1, []).unwrap()
-                        set_var_struct(pname, tup_name)
-                    }
-                }
-                if ptype == "Result" {
-                    let ta = node_type_ann(p)
-                    if ta != -1 {
-                        let elems_sl = node_elements(ta)
-                        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-                            let ok_ann = sublist_get(elems_sl, 0)
-                            let err_ann = sublist_get(elems_sl, 1)
-                            let ok_name = node_name(ok_ann)
-                            let err_name = node_name(err_ann)
-                            let mut ok_t = type_from_name(ok_name)
-                            let mut err_t = type_from_name(err_name)
-                            let mut ok_s = ""
-                            let mut err_s = ""
-                            // A Tuple ok/err side is carried by its tag as a by-value
-                            // member (ct=CT_INT); mirrors emit_let_binding's Tuple path.
-                            // A compound (Map/Option/Result) side records its STRUCTURED
-                            // tag while keeping its CT so the scope-var speller
-                            // (result_c_type_mixed, the match scrutinee) matches the
-                            // structured carrier construction and the annotation param
-                            // type param_c_type declares — otherwise a Result[Map,_]
-                            // param's scrutinee erases to blink_Result_map_int while
-                            // the value is blink_Result_Map_str_int_int.
-                            if is_struct_or_enum_type(ok_name) != 0 {
-                                // Bind the mono stem (QBox_Int) so the body binding
-                                // matches param_c_type's signature spelling; register
-                                // the instance.
-                                let ok_mono = register_carrier_inner_mono_instance(ok_name, ok_ann)
-                                ok_s = if ok_mono != "" { ok_mono } else { ok_name }
-                            } else if ok_name == "Tuple" {
-                                let ok_tag = resolve_result_inner_tag(ok_ann, ok_name, ok_t)
-                                if ok_tag != "" {
-                                    ok_s = ok_tag
-                                    ok_t = CT_INT
-                                }
-                            } else if is_compound_ct(ok_t) != 0 {
-                                ok_s = compound_name_from_ann(ok_ann)
-                            }
-                            if is_struct_or_enum_type(err_name) != 0 {
-                                let err_mono = register_carrier_inner_mono_instance(err_name, err_ann)
-                                err_s = if err_mono != "" { err_mono } else { err_name }
-                            } else if err_name == "Tuple" {
-                                let err_tag = resolve_result_inner_tag(err_ann, err_name, err_t)
-                                if err_tag != "" {
-                                    err_s = err_tag
-                                    err_t = CT_INT
-                                }
-                            } else if is_compound_ct(err_t) != 0 {
-                                err_s = compound_name_from_ann(err_ann)
-                            }
-                            if ok_s != "" || err_s != "" {
-                                set_var_result_struct(pname, ok_t, err_t, ok_s, err_s)
-                            } else {
-                                set_var_result(pname, ok_t, err_t)
-                            }
-                        }
-                    }
-                }
-                if ptype == "Option" {
-                    let ta = node_type_ann(p)
-                    if ta != -1 {
-                        let elems_sl = node_elements(ta)
-                        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-                            let inner_ann = sublist_get(elems_sl, 0)
-                            let inner_name = node_name(inner_ann)
-                            let inner_t = type_from_name(inner_name)
-                            if is_struct_or_enum_type(inner_name) != 0 {
-                                // Bind the mono stem (QBox_Int) so the param body's
-                                // scrutinee C type matches param_c_type's signature
-                                // (blink_Option_QBox_Int), not the bare blink_Option_QBox.
-                                // register_carrier_inner_mono_instance also registers the
-                                // instance so the member lowers to blink_QBox_Int. "" (bare
-                                // struct/enum / typevar) keeps the bare head.
-                                let mono = register_carrier_inner_mono_instance(inner_name, inner_ann)
-                                let inner_s = if mono != "" { mono } else { inner_name }
-                                set_var_option_struct(pname, inner_t, inner_s)
-                            } else if is_compound_ct(inner_t) != 0 || inner_name == "Tuple" {
-                                set_var_option_struct(pname, inner_t, compound_name_from_ann(inner_ann))
-                            } else {
-                                // A CT_SET inner reads its own element off the
-                                // option tid, so it needs no flat inner2 stamp.
-                                set_var_option(pname, inner_t)
-                            }
-                        }
-                    }
-                }
-                if ptype == "Handler" {
-                    let ta = node_type_ann(p)
-                    if ta != -1 {
-                        let elems_sl = node_elements(ta)
-                        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-                            let effect_ann = sublist_get(elems_sl, 0)
-                            let effect_name = node_name(effect_ann)
-                            let h_vtt = resolve_effect_vtable(effect_name)
-                            let h_vtf = resolve_effect_field(effect_name)
-                            let h_is_ue = resolve_effect_is_ue(effect_name)
-                            // The handler-family scratch readers locate the var by its tid kind,
-                            // so a handler param needs its Handler tid stamped like the let path
-                            // does. The Handler[E] annotation node carries no tid; the param node
-                            // itself does.
-                            let hp_tid = tc_lookup_node_tid(p)
-                            if hp_tid >= 0 && tc_tid_ct(cg_bind_mono_tid(hp_tid)) == CT_HANDLER {
-                                set_var_ty(pname, hp_tid)
-                            }
-                            set_var_handler(pname, h_vtt, h_vtf, h_is_ue)
-                        }
-                    }
-                }
-            }
-            i = i + 1
-        }
-    }
-    params_measure(params_sl, -1, [])
+    params_bind(params_sl, -1, [], 1)
 
     mut_captured_vars = []
     prescan_mut_captures(node_body(fn_node))
@@ -8742,14 +8452,39 @@ pub fn register_carrier_struct_instance_leaves(tid: Int) ! Codegen.Register {
         register_carrier_leaf_or_instance(opt_tid)
         return
     }
+    // A Map/List/Set over struct instances is the container twin: the element is a
+    // leaf position that names blink_PBox_Int, and a param or return is often the
+    // only site naming it. A Map goes through the mono walk rather than the plain
+    // registrar because a nested instance value has to register inner-first.
+    let map_val = tc_tid_map_val_tid(tid)
+    if map_val >= 0 {
+        register_map_elem_struct_mono_from_tid(map_val)
+        register_map_elem_struct_mono_from_tid(tc_tid_map_key_tid(tid))
+        return
+    }
+    let list_elem = tc_tid_list_elem(tid)
+    if list_elem >= 0 {
+        register_carrier_leaf_or_instance(list_elem)
+        return
+    }
+    let set_elem = tc_tid_set_elem_tid(tid)
+    if set_elem >= 0 {
+        register_carrier_leaf_or_instance(set_elem)
+        return
+    }
     // A TUPLE over struct instances (`(PBox[Int], Int)`) embeds blink_PBox_Int by
     // value; register each element leaf so its typedef precedes the tuple typedef,
     // covering the param/return-only case that no construction registers.
     let arity = tc_tid_tuple_arity(tid)
-    let mut i = 0
-    while i < arity {
-        register_carrier_leaf_or_instance(tc_tid_tuple_elem_tid(tid, i))
-        i = i + 1
+    if arity > 0 {
+        let mut i = 0
+        while i < arity {
+            register_carrier_leaf_or_instance(tc_tid_tuple_elem_tid(tid, i))
+            i = i + 1
+        }
+        // The tuple's OWN typedef, after its leaves: a carrier over a tuple embeds it
+        // by value, so without this the carrier typedef degrades its payload to void*.
+        let _ = ensure_tuple_typedef_from_tid(tid)
     }
 }
 
@@ -9387,54 +9122,6 @@ pub fn emit_all_mono_typedefs() ! Codegen.Emit, Diag.Report, Codegen.Register {
     }
 }
 
-fn build_closure_sig_resolved_mono(ta: Int, tparams_sl: Int, arg_tids: List[Int]) -> Str {
-    let segs = segs_from_arg_tids(arg_tids)
-    let ret_raw = node_return_type(ta)
-    let ret_name = resolve_tparam_via_tid(ret_raw, tparams_sl, arg_tids)
-    let ret_type = type_from_name(ret_name)
-    let elems_sl = node_elements(ta)
-    let mut sig_params = "const blink_closure*"
-    if elems_sl != -1 && sublist_length(elems_sl) > 0 {
-        let mut i = 0
-        while i < sublist_length(elems_sl) {
-            let elem = sublist_get(elems_sl, i)
-            let ename_raw = node_name(elem)
-            let ename = resolve_tparam_via_tid(ename_raw, tparams_sl, arg_tids)
-            sig_params = sig_params.concat(", ")
-            if is_enum_type(ename) != 0 {
-                sig_params = sig_params.concat(c_type_c_name(ename))
-            } else if is_struct_type(ename) != 0 {
-                sig_params = sig_params.concat(c_type_c_name(ename))
-            } else if ename == "Tuple" {
-                let tup_opt = resolve_tuple_ann(elem, tparams_sl, segs)
-                if tup_opt.is_some() {
-                    sig_params = sig_params.concat(c_type_c_name(tup_opt.unwrap()))
-                } else {
-                    sig_params = sig_params.concat("void")
-                }
-            } else {
-                sig_params = sig_params.concat(c_type_str(type_from_name(ename)))
-            }
-            i = i + 1
-        }
-    }
-    let mut ret_str = c_type_str(ret_type)
-    if is_struct_type(ret_name) != 0 {
-        ret_str = c_type_c_name(ret_name)
-    } else if is_enum_type(ret_name) != 0 {
-        ret_str = c_type_c_name(ret_name)
-    } else if ret_name == "Tuple" {
-        let ret_ann = node_type_ann(ta)
-        if ret_ann != -1 {
-            let tup_opt = resolve_tuple_ann(ret_ann, tparams_sl, segs)
-            if tup_opt.is_some() {
-                ret_str = c_type_c_name(tup_opt.unwrap())
-            }
-        }
-    }
-    "{ret_str}(*)({sig_params})"
-}
-
 type MonoSig {
     sig: Str
     storage: Str
@@ -9659,240 +9346,15 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) ! Cod
     let ret_type = sig.ret_type
     let resolved_ret = sig.resolved_ret
     let tparams_sl = node_type_params(fn_node)
-    let segs = segs_from_arg_tids(arg_tids)
     let params_sl = node_params(fn_node)
 
     // Forward decl carries the same storage class as the def below;
     // otherwise C rejects `static inline` following a non-static proto.
     emit_line("{sig.sig};")
 
-    // Register params in scope
     push_scope()
     cg_temp_counter = 0
-    if params_sl != -1 {
-        let mut i = 0
-        while i < sublist_length(params_sl) {
-            let p = sublist_get(params_sl, i)
-            let pname = node_name(p)
-            let ptype = node_type_name(p)
-            let resolved_ptype = resolve_tparam_via_tid(ptype, tparams_sl, arg_tids)
-            if resolved_ptype == "Fn" {
-                set_var(pname, CT_CLOSURE, 1)
-                let ta = node_type_ann(p)
-                if ta != -1 {
-                    let sig_str = build_closure_sig_resolved_mono(ta, tparams_sl, arg_tids)
-                    set_var_closure(pname, sig_str, tc_tid_subst_mono(tc_lookup_node_tid(p), tparams_sl, arg_tids))
-                }
-            } else if type_from_name(resolved_ptype) == CT_VOID && is_compound_tag(resolved_ptype) != 0 && is_struct_type(resolved_ptype) == 0 && is_enum_type(resolved_ptype) == 0 {
-                // A bare-typevar param (`x: T`) bound to a whole Option/Result
-                // resolves to the carrier tag (Option_int, ...), reaching the
-                // same outcome as mono_fn_signature's own compound-param arm
-                // above so the local's scope CT agrees with the signature's C
-                // type by construction — though that arm excludes struct/enum
-                // by ARM ORDERING, not by an explicit clause the way this one
-                // does. The `type_from_name(...) == CT_VOID` guard (absent
-                // from that arm, a pre-existing gap shared with it) keeps a
-                // type ALIAS literally spelled like a carrier tag (`type
-                // Result_x = Int`) on its normal scalar/struct path instead of
-                // being misrouted into the carrier decoder.
-                //
-                // RAW, not canonicalized -- mirrors mono_fn_signature exactly,
-                // which also calls ensure_carrier_from_tag on the raw tag. The
-                // poly-impl twin below canonicalizes first because its own
-                // signature builder does; see the comment there.
-                register_var_compound_from_tag(pname, resolved_ptype, 1)
-            } else {
-                let param_ct = if is_enum_type(resolved_ptype) != 0 { CT_INT } else { type_from_name(resolved_ptype) }
-                set_var(pname, param_ct, 1)
-                if is_struct_type(resolved_ptype) != 0 {
-                    let p_mono_name = mono_name_from_ann(resolved_ptype, node_type_ann(p), tparams_sl, segs)
-                    let mono_struct_name = if p_mono_name != "" { p_mono_name } else { resolved_ptype }
-                    set_var_struct(pname, mono_struct_name)
-                    // Carry the tid, pre-substituted through this mono's own tparams so
-                    // it is already concrete (cg_fn_mono_* is not set until body emit).
-                    // A concrete tid round-trips as identity at read time and is also
-                    // right for non-rebinding readers. Gate on the reader's mono
-                    // round-trip; enums keep the flat channel (own increment).
-                    let raw_ptid = tc_lookup_node_tid(node_type_ann(p))
-                    let mono_ptid = tc_tid_subst_mono(tc_tid_resolved(raw_ptid), tparams_sl, arg_tids)
-                    if mono_ptid >= 0 && tc_tid_is_enum(mono_ptid) == 0 && tc_tid_struct_mono_name(mono_ptid) == mono_struct_name {
-                        set_var_ty(pname, mono_ptid)
-                    }
-                }
-                if is_enum_type(resolved_ptype) != 0 {
-                    // A generic-enum INSTANCE param (`t: Tree[T]`, T=Int). Two
-                    // bindings, exactly as the match-materialization path reads
-                    // them: var_enums carries the BARE base (Tree) so variant
-                    // tag/field lookups (get_var_enum → match_scrut_enum, kept bare)
-                    // work, and set_var_struct carries the MONO stem (Tree_Int) so the
-                    // scrutinee temp and recursive-field bindings get the concrete C
-                    // type (blink_Tree_Int) instead of the erased bare blink_Tree. ""
-                    // (non-generic enum) keeps the bare head on both.
-                    var_enums.push(VarEnumEntry { name: pname, enum_type: resolved_ptype })
-                    let p_mono_name = mono_name_from_ann(resolved_ptype, node_type_ann(p), tparams_sl, segs)
-                    if p_mono_name != "" {
-                        set_var_struct(pname, p_mono_name)
-                    }
-                }
-                if resolved_ptype == "List" {
-                    let ta = node_type_ann(p)
-                    if ta != -1 {
-                        let elems_sl = node_elements(ta)
-                        if elems_sl != -1 && sublist_length(elems_sl) > 0 {
-                            let elem_ann = sublist_get(elems_sl, 0)
-                            let elem_name_raw = node_name(elem_ann)
-                            let elem_name = resolve_tparam_via_tid(elem_name_raw, tparams_sl, arg_tids)
-                            let elem_ct = type_from_name(elem_name)
-                            set_list_elem_type(pname, elem_ct)
-                            if elem_ct != CT_VOID {
-                                ensure_option_type(elem_ct)
-                            }
-                            if elem_ct == CT_VOID && (is_named_type(elem_name) != 0) {
-                                set_list_elem_struct(pname, elem_name)
-                            } else if elem_ct == CT_VOID && elem_name == "Tuple" {
-                                let tup_opt = resolve_tuple_ann(elem_ann, tparams_sl, segs)
-                                if tup_opt.is_some() {
-                                    set_list_elem_struct(pname, tup_opt.unwrap())
-                                }
-                            }
-                            // Every branch above spells the element from the ANNOTATION, and
-                            // only its OUTER name goes through resolve_tparam_via_tid — a
-                            // COMPOUND element's inner is left to the tid ladder below.
-                            // Left alone, a mono instance
-                            // of `xs: List[Option[T]]` would bind its element as an Option
-                            // over nothing (`blink_Option_void`), and `List[Result[T, Str]]`
-                            // would return a `blink_Result_void_str` where a `Result_int_str`
-                            // was expected. The tid does carry T substituted once it is
-                            // rewritten through THIS instance's binder, so the ladder below
-                            // spells every element kind faithfully or declines whole, and the
-                            // annotation's answer survives only where it declines — the same
-                            // ordering the let-binding ladders use. tparams_sl/arg_tids are
-                            // passed explicitly because cg_mono_* is not switched to this
-                            // instance until emit_fn_body, further down.
-                            //
-                            // The PARAM node, not its annotation, is where typecheck publishes the
-                            // resolved type; the annotation carries a tid only for the shapes that
-                            // walk it, so it is the fallback. Same rule params_measure states.
-                            let mut praw = tc_lookup_node_tid(p)
-                            if praw < 0 { praw = tc_lookup_node_tid(ta) }
-                            // Records what the annotation had already written, so a corpus sweep can
-                            // tell the three outcomes apart: the stamp declined (the annotation still
-                            // governs), it agreed, or it OVERRODE. Only the third is a behavior
-                            // change, and it is the one that has to be attributed shape by shape.
-                            //
-                            // tp_display of the WHOLE var type, not the (ct, sname) pair the stamp
-                            // returns: a compound element's inner lives in tp_id, so `List[Option[T]]`
-                            // and `List[Option[Int]]` both read back as ct=CT_OPTION with an empty
-                            // sname and the pair cannot tell them apart — which is the exact defect
-                            // being measured.
-                            let mono_tracing = dbg_channel_on("monoparam")
-                            let pre_tp = if mono_tracing != 0 { tp_display(get_var_tp(pname)) } else { "" }
-                            let st = stamp_list_elem_from_list_tid(tc_tid_subst_mono(tc_tid_resolved(praw), tparams_sl, arg_tids), pname)
-                            if mono_tracing != 0 {
-                                dbg_trace("monoparam", "fn={mangled} param={pname} declined={st.ct} pre={pre_tp} post={tp_display(get_var_tp(pname))}")
-                            }
-                        }
-                    }
-                }
-                if resolved_ptype == "Map" {
-                    let ta = node_type_ann(p)
-                    if ta != -1 {
-                        let elems_sl = node_elements(ta)
-                        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-                            let key_ann = sublist_get(elems_sl, 0)
-                            let val_ann = sublist_get(elems_sl, 1)
-                            let key_name_raw = node_name(key_ann)
-                            let key_name = resolve_tparam_via_tid(key_name_raw, tparams_sl, arg_tids)
-                            let key_ct = type_from_name(key_name)
-                            let val_name_raw = node_name(val_ann)
-                            // resolve_tparam_via_tid only substitutes a BARE binder
-                            // ("V" -> "Box"); a nested generic-struct instance written
-                            // literally in the annotation ("Box[T]") still needs its
-                            // own type-arg substituted via the annotation's own tid
-                            // before falling back to the bare-binder path.
-                            let val_inst_stem = ann_mono_stem(val_ann)
-                            let val_name = if val_inst_stem != "" { val_inst_stem } else { resolve_tparam_via_tid(val_name_raw, tparams_sl, arg_tids) }
-                            let val_ct = type_from_name(val_name)
-                            set_map_types(pname, key_ct, val_ct, val_name)
-                            if val_inst_stem != "" {
-                                // See emit_fn_def's Map param handling for why this
-                                register_map_elem_struct_mono_from_tid(tc_lookup_node_tid(val_ann))
-                            }
-                            if key_ct == CT_VOID && is_named_type(key_name) != 0 {
-                                set_map_key_struct(pname, key_name)
-                            }
-                        }
-                    }
-                }
-                if resolved_ptype == "Tuple" {
-                    let ta = node_type_ann(p)
-                    if ta != -1 {
-                        let tup_name = resolve_tuple_ann(ta, tparams_sl, segs).unwrap()
-                        set_var_struct(pname, tup_name)
-                    }
-                }
-                if resolved_ptype == "Option" {
-                    let ta = node_type_ann(p)
-                    if ta != -1 {
-                        let elems_sl = node_elements(ta)
-                        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-                            let inner_ann = sublist_get(elems_sl, 0)
-                            let inner_name = resolve_tparam_via_tid(node_name(inner_ann), tparams_sl, arg_tids)
-                            let inner_ct = type_from_name(inner_name)
-                            if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
-                                set_var_option_struct(pname, CT_INT, inner_name)
-                            } else {
-                                // A CT_SET inner reads its own element off the
-                                // option tid, so it needs no flat inner2 stamp.
-                                set_var_option(pname, inner_ct)
-                            }
-                        }
-                    }
-                }
-                if resolved_ptype == "Result" {
-                    let ta = node_type_ann(p)
-                    if ta != -1 {
-                        let elems_sl = node_elements(ta)
-                        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-                            let ok_name = resolve_tparam_via_tid(node_name(sublist_get(elems_sl, 0)), tparams_sl, arg_tids)
-                            let err_name = resolve_tparam_via_tid(node_name(sublist_get(elems_sl, 1)), tparams_sl, arg_tids)
-                            let ok_ct = type_from_name(ok_name)
-                            let err_ct = type_from_name(err_name)
-                            let ok_s = if is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0 { ok_name } else { "" }
-                            let err_s = if is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0 { err_name } else { "" }
-                            if ok_s != "" || err_s != "" {
-                                set_var_result_struct(pname, ok_ct, err_ct, ok_s, err_s)
-                            } else {
-                                set_var_result(pname, ok_ct, err_ct)
-                            }
-                        }
-                    }
-                }
-                if resolved_ptype == "Set" {
-                    let ta = node_type_ann(p)
-                    if ta != -1 {
-                        let elems_sl = node_elements(ta)
-                        if elems_sl != -1 && sublist_length(elems_sl) > 0 {
-                            let elem_ann = sublist_get(elems_sl, 0)
-                            let elem_name_raw = node_name(elem_ann)
-                            let elem_name = resolve_tparam_via_tid(elem_name_raw, tparams_sl, arg_tids)
-                            let elem_ct = type_from_name(elem_name)
-                            if elem_ct >= 0 && elem_ct != CT_VOID {
-                                set_set_elem_type(pname, elem_ct)
-                            } else {
-                                // See the twin block in emit_impl_method_def: recover
-                                // the mono-substituted element from the annotation's
-                                // tid rather than leaving it unstamped.
-                                recover_set_elem_from_tid(ta, pname)
-                            }
-                        }
-                    }
-                }
-            }
-            i = i + 1
-        }
-    }
-    params_measure(params_sl, tparams_sl, arg_tids)
+    params_bind(params_sl, tparams_sl, arg_tids, 1)
 
     let saved_trace_fn = cg_trace_fn_qualified
     let saved_trace_mod = cg_trace_module
@@ -9960,36 +9422,6 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) ! Cod
     cg_trace_module = saved_trace_mod
     cg_in_traced_fn = saved_in_traced
     pop_scope()
-}
-
-// Register the element type of a poly-impl `self`/List[T] param from
-// the resolved element NAME (a resolve_tparam_via_tid result). A scalar or a
-// struct/enum element registers exactly as before (byte-identical). A COMPOUND
-// element resolves to a carrier tag (Option_int / Result_int_str / Map_int_str)
-// whose type_from_name is CT_VOID; recover the real CT via compound_tag_ct and
-// stamp the list element as that compound so body method calls on the receiver
-// see the concrete element rather than a Void.
-fn register_poly_list_elem(pname: Str, elem_name: Str) ! Codegen.Register {
-    let name_ct = type_from_name(elem_name)
-    if name_ct == CT_VOID && is_compound_tag(elem_name) != 0 {
-        // A COMPOUND element (carrier tag Option_str / Result_int_str / Map_int_str):
-        // ensure the carrier typedef exists. An Option/Result element then rides the
-        // param tid — the flat re-spell that once decoded its inner from the tag was a
-        // no-op — so only a Map keeps its bare CT_MAP registration.
-        let canon = canonical_struct_tag(elem_name)
-        ensure_carrier_from_tag(canon)
-        if compound_tag_ct(elem_name) == CT_MAP {
-            set_list_elem_type(pname, CT_MAP)
-        }
-        return
-    }
-    set_list_elem_type(pname, name_ct)
-    if name_ct != CT_VOID {
-        ensure_option_type(name_ct)
-    }
-    if name_ct == CT_VOID && is_named_type(elem_name) != 0 {
-        set_list_elem_struct(pname, elem_name)
-    }
 }
 
 // Build the C signature for a monomorphized poly-impl method
@@ -10125,148 +9557,12 @@ fn emit_poly_impl_method_def(im: Int, method_node: Int, concrete_args: Str, arg_
     let resolved_ret = sig.resolved_ret
     let tparams_sl = node_impl_binders(im)
     let params_sl = node_params(method_node)
-    let segs = segs_from_arg_tids(arg_tids)
 
     emit_line("{sig.sig};")
 
     push_scope()
     cg_temp_counter = 0
-    // The receiver's concrete element type (the impl binder's concrete arg),
-    // used to register both `self` and any List[T] param.
-    let recv_elem_name = if sublist_length(tparams_sl) > 0 { resolve_tparam_via_tid(node_name(sublist_get(tparams_sl, 0)), tparams_sl, arg_tids) } else { "" }
-    if params_sl != -1 {
-        let mut i = 0
-        while i < sublist_length(params_sl) {
-            let p = sublist_get(params_sl, i)
-            let pname = node_name(p)
-            if pname == "self" || pname == "_self" {
-                // `self: List[T]` — register as a List with the resolved element
-                // type so body method calls on self see the concrete element.
-                set_var(pname, CT_LIST, 0)
-                register_poly_list_elem(pname, recv_elem_name)
-                i = i + 1
-                continue
-            }
-            let ptype = resolve_tparam_via_tid(node_type_name(p), tparams_sl, arg_tids)
-            if ptype == "Fn" {
-                set_var(pname, CT_CLOSURE, 1)
-                let ta = node_type_ann(p)
-                if ta != -1 {
-                    let sig_str = build_closure_sig_resolved_mono(ta, tparams_sl, arg_tids)
-                    set_var_closure(pname, sig_str, tc_tid_subst_mono(tc_lookup_node_tid(p), tparams_sl, arg_tids))
-                }
-            } else if ptype == "List" {
-                // The `self: List[T]` receiver (and any other List[T] param):
-                // register the resolved element type so body method calls on it
-                // see the concrete element, not a bare tparam.
-                set_var(pname, CT_LIST, 1)
-                let ta = node_type_ann(p)
-                if ta != -1 {
-                    let elems_sl = node_elements(ta)
-                    if elems_sl != -1 && sublist_length(elems_sl) > 0 {
-                        let elem_name = resolve_tparam_via_tid(node_name(sublist_get(elems_sl, 0)), tparams_sl, arg_tids)
-                        register_poly_list_elem(pname, elem_name)
-                    }
-                }
-            } else if type_from_name(ptype) == CT_VOID && is_compound_tag(ptype) != 0 && is_struct_type(ptype) == 0 && is_enum_type(ptype) == 0 {
-                // Poly-impl twin of the emit_mono_fn_def arm above -- a non-self
-                // bare-binder param (`x: T`) bound to a whole Option/Result
-                // resolves to the carrier tag, reaching the same outcome as
-                // poly_impl_method_signature's own compound-param arm so the
-                // local's scope CT agrees with the signature's C type by
-                // construction — though that arm excludes struct/enum by ARM
-                // ORDERING, not by an explicit clause the way this one does.
-                // The `type_from_name(...) == CT_VOID` guard (absent from that
-                // arm, a pre-existing gap shared with it) keeps a type ALIAS
-                // literally spelled like a carrier tag (`type Result_x = Int`)
-                // on its normal scalar/struct path instead of being misrouted
-                // into the carrier decoder.
-                //
-                // Canonicalize BEFORE handing off, unlike the mono call site
-                // below: the two signature builders disagree with each other on
-                // this axis -- mono_fn_signature calls ensure_carrier_from_tag
-                // on the RAW tag, but poly_impl_method_signature canonicalizes
-                // first. register_var_compound_from_tag's own
-                // `ensure_carrier_from_tag` call must receive the SAME string
-                // its paired signature builder fed it, or the two can
-                // independently split a Result tag's ok/err segment differently
-                // (canonical_struct_tag's backward scan vs
-                // ensure_carrier_from_tag's internal forward splitter are not
-                // the same algorithm) and register a scope decode for a typedef
-                // the signature never emitted.
-                register_var_compound_from_tag(pname, canonical_struct_tag(ptype), 1)
-            } else {
-                let param_ct = if is_enum_type(ptype) != 0 { CT_INT } else { type_from_name(ptype) }
-                set_var(pname, param_ct, 1)
-                if is_struct_type(ptype) != 0 {
-                    // Register the mono instance name (Box_Int), not the bare head,
-                    // so field access on the param resolves; mirrors the flat side
-                    // of emit_mono_fn_def's struct arm and the signature above.
-                    let p_mono_name = mono_name_from_ann(ptype, node_type_ann(p), tparams_sl, segs)
-                    let mono_struct_name = if p_mono_name != "" { p_mono_name } else { ptype }
-                    set_var_struct(pname, mono_struct_name)
-                    // Carry the tid, pre-substituted through the impl binders so it
-                    // is already concrete (cg_fn_mono_* is not set until body emit).
-                    // A concrete tid round-trips as identity at read time. Gate on
-                    // the reader's mono round-trip; enums keep the flat channel.
-                    let raw_ptid = tc_lookup_node_tid(node_type_ann(p))
-                    let mono_ptid = tc_tid_subst_mono(tc_tid_resolved(raw_ptid), tparams_sl, arg_tids)
-                    if mono_ptid >= 0 && tc_tid_is_enum(mono_ptid) == 0 && tc_tid_struct_mono_name(mono_ptid) == mono_struct_name {
-                        set_var_ty(pname, mono_ptid)
-                    }
-                }
-                if is_enum_type(ptype) != 0 {
-                    // Bind the bare base in var_enums (for variant tag/field
-                    // lookup) plus the mono stem via set_var_struct (concrete C
-                    // type for the scrutinee temp). Mirrors emit_mono_fn_def.
-                    var_enums.push(VarEnumEntry { name: pname, enum_type: ptype })
-                    let p_mono_name = mono_name_from_ann(ptype, node_type_ann(p), tparams_sl, segs)
-                    if p_mono_name != "" {
-                        set_var_struct(pname, p_mono_name)
-                    }
-                }
-                if ptype == "Option" {
-                    let ta = node_type_ann(p)
-                    if ta != -1 {
-                        let elems_sl = node_elements(ta)
-                        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-                            let inner_ann = sublist_get(elems_sl, 0)
-                            let inner_name = resolve_tparam_via_tid(node_name(inner_ann), tparams_sl, arg_tids)
-                            let inner_ct = type_from_name(inner_name)
-                            if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
-                                set_var_option_struct(pname, CT_INT, inner_name)
-                            } else {
-                                // A CT_SET inner reads its own element off the
-                                // option tid, so it needs no flat inner2 stamp.
-                                set_var_option(pname, inner_ct)
-                            }
-                        }
-                    }
-                }
-                if ptype == "Result" {
-                    let ta = node_type_ann(p)
-                    if ta != -1 {
-                        let elems_sl = node_elements(ta)
-                        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-                            let ok_name = resolve_tparam_via_tid(node_name(sublist_get(elems_sl, 0)), tparams_sl, arg_tids)
-                            let err_name = resolve_tparam_via_tid(node_name(sublist_get(elems_sl, 1)), tparams_sl, arg_tids)
-                            let ok_ct = type_from_name(ok_name)
-                            let err_ct = type_from_name(err_name)
-                            let ok_s = if is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0 { ok_name } else { "" }
-                            let err_s = if is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0 { err_name } else { "" }
-                            if ok_s != "" || err_s != "" {
-                                set_var_result_struct(pname, ok_ct, err_ct, ok_s, err_s)
-                            } else {
-                                set_var_result(pname, ok_ct, err_ct)
-                            }
-                        }
-                    }
-                }
-            }
-            i = i + 1
-        }
-    }
-    params_measure(params_sl, tparams_sl, arg_tids)
+    params_bind(params_sl, tparams_sl, arg_tids, 1)
 
     let saved_trace_fn = cg_trace_fn_qualified
     let saved_trace_mod = cg_trace_module

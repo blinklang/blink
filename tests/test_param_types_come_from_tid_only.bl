@@ -1,0 +1,296 @@
+// Every parameter row — a free-fn param, an impl-method param, the `self`
+// receiver, a monomorphized generic param, a poly-impl param, a handler-method
+// param, a closure param — must get its type from the tid typecheck stamped on
+// the Param node, with no per-type-name ladder behind it.
+//
+// Each assertion is on a VALUE, never on a type. A param row bound from the
+// wrong channel does not raise a diagnostic: it decodes the incoming slot with
+// the wrong layout and the body reads a different number, or the emitted C
+// names a typedef that was never declared. So a wrong answer here is a wrong
+// answer in the program, which is the only failure worth locking.
+
+type PBox[T] { v: T }
+type PPair[A, B] { a: A, b: B }
+type PTree[T] { Leaf, Node(T) }
+type PPlain { n: Int, s: Str }
+
+effect Ledger {
+    effect Post {
+        fn entry(label: Str, amount: Int) -> Int
+    }
+}
+
+// ── free-fn params, one per shape the old ladder had an arm for ──────────────
+
+fn p_bare[T](x: T) -> T { x }
+
+fn p_struct_inst(b: PBox[Str]) -> Int { b.v.len() }
+
+fn p_struct_inst_nested(b: PBox[PBox[Int]]) -> Int { b.v.v }
+
+fn p_two_arg(p: PPair[Str, Int]) -> Int { p.a.len() + p.b }
+
+fn p_enum_inst(t: PTree[Int]) -> Int {
+    match t {
+        PTree.Node(n) => { return n }
+        PTree.Leaf => { return -1 }
+    }
+}
+
+fn p_list_of_opt(xs: List[Option[Int]]) -> Int {
+    let mut n = 0
+    for e in xs { n = n + (e ?? 0) }
+    n
+}
+
+fn p_map_of_list(m: Map[Str, List[Str]]) -> Int {
+    m.get("k").unwrap().get(0).unwrap().len()
+}
+
+fn p_map_of_struct_inst(m: Map[Str, PBox[Int]]) -> Int {
+    m.get("k").unwrap().v
+}
+
+fn p_set(s: Set[Str]) -> Int {
+    let mut n = 0
+    for e in s { n = n + e.len() }
+    n
+}
+
+fn p_tuple(t: (Int, Str)) -> Int { t.0 + t.1.len() }
+
+fn p_opt_scalar(o: Option[Int]) -> Int { o ?? -1 }
+
+// The carrier typedef this param's C signature names (blink_Option_PBox_0Str)
+// has to be registered from the param's own tid, before the fn forward decl:
+// nothing else in the program necessarily names it, and the call site that does
+// registers it too late for the decl that already referenced it.
+fn p_opt_struct_inst(o: Option[PBox[Str]]) -> Int {
+    match o {
+        Some(b) => { return b.v.len() }
+        None => { return 0 }
+    }
+}
+
+fn p_opt_result_struct_inst(o: Option[Result[PBox[Int], Str]]) -> Int {
+    match o {
+        Some(r) => {
+            match r {
+                Ok(b) => { return b.v }
+                Err(e) => { return -e.len() }
+            }
+        }
+        None => { return 0 }
+    }
+}
+
+fn p_opt_tuple(o: Option[(Int, Int)]) -> Int {
+    match o {
+        Some(t) => { return t.0 * t.1 }
+        None => { return 0 }
+    }
+}
+
+fn p_result_struct_inst(r: Result[PBox[Int], Str]) -> Int {
+    match r {
+        Ok(b) => { return b.v }
+        Err(e) => { return -e.len() }
+    }
+}
+
+fn p_result_scalar(r: Result[Int, Str]) -> Int {
+    match r {
+        Ok(v) => { return v }
+        Err(e) => { return -e.len() }
+    }
+}
+
+fn p_closure(f: fn(Int) -> Int, n: Int) -> Int { f(n) }
+
+fn p_plain_struct(s: PPlain) -> Int { s.n + s.s.len() }
+
+// ── generic fns whose params are the type parameter itself ───────────────────
+
+fn m_bare_struct[T](b: PBox[T]) -> T { b.v }
+
+fn m_bare_opt[T](o: Option[T], d: T) -> T { o ?? d }
+
+fn m_bare_list[T](xs: List[T], d: T) -> T { xs.get(0) ?? d }
+
+fn m_two[T](a: T, b: T, pick: Int) -> T { if pick == 0 { a } else { b } }
+
+// ── impl methods: `self` plus every param arm ────────────────────────────────
+
+trait PSummable {
+    fn total(self) -> Int
+    fn with_box(self, b: PBox[Int]) -> Int
+    fn with_opt(self, o: Option[Str]) -> Int
+    fn with_closure(self, f: fn(Int) -> Int) -> Int
+    fn with_tuple(self, t: (Int, Int)) -> Int
+}
+
+impl PSummable for PPlain {
+    fn total(self) -> Int { self.n + self.s.len() }
+    fn with_box(self, b: PBox[Int]) -> Int { self.n + b.v }
+    fn with_opt(self, o: Option[Str]) -> Int {
+        let s = o ?? ""
+        self.n + s.len()
+    }
+    fn with_closure(self, f: fn(Int) -> Int) -> Int { f(self.n) }
+    fn with_tuple(self, t: (Int, Int)) -> Int { self.n + t.0 + t.1 }
+}
+
+// ── poly impl: `self: List[T]` plus a bare-binder param ──────────────────────
+
+trait PSwap[T] {
+    fn swap_first(self, x: T) -> T
+    fn count_with(self, extra: Int) -> Int
+}
+
+impl[T] PSwap[T] for List[T] {
+    fn swap_first(self, x: T) -> T {
+        match self.get(0) {
+            Some(_v) => { return x }
+            None => { return x }
+        }
+    }
+    fn count_with(self, extra: Int) -> Int { self.len() + extra }
+}
+
+// ── handler-method params ────────────────────────────────────────────────────
+
+fn ledger_via(label: Str, amount: Int) -> Int ! Ledger.Post {
+    ledger.entry(label, amount)
+}
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+test "a bare type-parameter param carries the caller's type" {
+    assert_eq(p_bare(7), 7)
+    assert_eq(p_bare("abcd").len(), 4)
+    assert_eq(p_bare(true), true)
+}
+
+test "a generic-struct-instance param reads its concrete field" {
+    assert_eq(p_struct_inst(PBox { v: "abc" }), 3)
+    assert_eq(p_struct_inst_nested(PBox { v: PBox { v: 41 } }), 41)
+    assert_eq(p_two_arg(PPair { a: "xy", b: 5 }), 7)
+}
+
+test "a generic-enum-instance param matches its payload" {
+    assert_eq(p_enum_inst(PTree.Node(12)), 12)
+    assert_eq(p_enum_inst(PTree.Leaf), -1)
+}
+
+test "container params read their element type" {
+    assert_eq(p_list_of_opt([Some(1), None, Some(2)]), 3)
+    let mut ml: Map[Str, List[Str]] = Map()
+    ml.insert("k", ["hello"])
+    assert_eq(p_map_of_list(ml), 5)
+    let mut ms: Map[Str, PBox[Int]] = Map()
+    ms.insert("k", PBox { v: 31 })
+    assert_eq(p_map_of_struct_inst(ms), 31)
+    let mut st: Set[Str] = Set()
+    st.insert("ab")
+    assert_eq(p_set(st), 2)
+    assert_eq(p_tuple((3, "xy")), 5)
+}
+
+test "carrier params read their inner type" {
+    assert_eq(p_opt_scalar(Some(8)), 8)
+    assert_eq(p_opt_scalar(None), -1)
+    assert_eq(p_opt_struct_inst(Some(PBox { v: "abc" })), 3)
+    assert_eq(p_opt_struct_inst(None), 0)
+    assert_eq(p_opt_result_struct_inst(Some(Ok(PBox { v: 7 }))), 7)
+    assert_eq(p_opt_result_struct_inst(Some(Err("ab"))), -2)
+    assert_eq(p_opt_result_struct_inst(None), 0)
+    assert_eq(p_opt_tuple(Some((3, 4))), 12)
+    assert_eq(p_opt_tuple(None), 0)
+    assert_eq(p_result_struct_inst(Ok(PBox { v: 21 })), 21)
+    assert_eq(p_result_struct_inst(Err("ab")), -2)
+    assert_eq(p_result_scalar(Ok(5)), 5)
+    assert_eq(p_result_scalar(Err("abc")), -3)
+}
+
+test "a closure param calls through its signature" {
+    assert_eq(p_closure(fn(x: Int) -> Int { x * 3 }, 4), 12)
+    let bump = fn(x: Int) -> Int { x + 100 }
+    assert_eq(p_closure(bump, 1), 101)
+}
+
+test "a plain-struct param reads its fields" {
+    assert_eq(p_plain_struct(PPlain { n: 4, s: "xyz" }), 7)
+}
+
+test "a monomorphized param is bound per instantiation" {
+    assert_eq(m_bare_struct(PBox { v: 5 }), 5)
+    assert_eq(m_bare_struct(PBox { v: "wxyz" }).len(), 4)
+    assert_eq(m_bare_opt(Some(3), 0), 3)
+    assert_eq(m_bare_opt(None, 9), 9)
+    assert_eq(m_bare_opt(Some("ab"), "z").len(), 2)
+    assert_eq(m_bare_list([4, 5], 0), 4)
+    assert_eq(m_bare_list(["p", "q"], "z"), "p")
+    assert_eq(m_two(1, 2, 0), 1)
+    assert_eq(m_two("a", "bb", 1).len(), 2)
+}
+
+test "an impl method reads self and every param arm" {
+    let p = PPlain { n: 10, s: "abc" }
+    assert_eq(p.total(), 13)
+    assert_eq(p.with_box(PBox { v: 5 }), 15)
+    assert_eq(p.with_opt(Some("xy")), 12)
+    assert_eq(p.with_opt(None), 10)
+    assert_eq(p.with_closure(fn(x: Int) -> Int { x * 2 }), 20)
+    assert_eq(p.with_tuple((1, 2)), 13)
+}
+
+test "a poly-impl method reads self and its bare-binder param" {
+    let xs: List[Int] = [1, 2, 3]
+    assert_eq(xs.swap_first(9), 9)
+    assert_eq(xs.count_with(2), 5)
+    let ss: List[Str] = ["a", "b"]
+    assert_eq(ss.swap_first("z"), "z")
+    assert_eq(ss.count_with(1), 3)
+}
+
+test "handler-method params carry their declared types" {
+    // The op's answer mixes BOTH params, so a Str param decoded as an Int (or
+    // the reverse) changes the number rather than only the printed text.
+    with handler Ledger {
+        fn entry(label: Str, amount: Int) -> Int {
+            amount * 2 + label.len()
+        }
+    } {
+        assert_eq(ledger_via("abc", 5), 13)
+        assert_eq(ledger_via("", 0), 0)
+        assert_eq(ledger_via("wxyz", 1), 6)
+    }
+}
+
+fn sum_nested_tuple_param(t: ((Int, Int), Str)) -> Int {
+    let inner = t.0
+    inner.0 + inner.1 + t.1.len()
+}
+
+test "a nested tuple param is spelled from its tid" {
+    assert_eq(sum_nested_tuple_param(((3, 4), "ab")), 9)
+}
+
+test "an unannotated closure param binds from the closure Fn tid" {
+    let xs: List[Int] = [1, 2, 3]
+    let doubled = xs.map(fn(x) { x * 2 })
+    assert_eq(doubled.get(0) ?? 0, 2)
+    assert_eq(doubled.get(2) ?? 0, 6)
+}
+
+test "a closure param over a container binds from the closure Fn tid" {
+    let rows: List[List[Int]] = [[1, 2], [3]]
+    let sizes = rows.map(fn(r: List[Int]) -> Int { r.len() })
+    assert_eq(sizes.get(0) ?? 0, 2)
+    assert_eq(sizes.get(1) ?? 0, 1)
+}
+
+test "a two-param closure literal binds both rows from the Fn tid" {
+    let join = fn(a: Str, b: Int) -> Str { "{a}:{b}" }
+    assert_eq(join("k", 7), "k:7")
+}

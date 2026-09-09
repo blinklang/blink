@@ -89,6 +89,12 @@ import codegen_types.{
 }
 import codegen_derive.{ct_to_descriptor, descriptor_mangle, queue_promote_type}
 import codegen_methods.{emit_boxed_container_store, emit_method_call, listop_slot_tid, mono_csv_from_arg_tids, resolve_push_struct, resolve_tparam_via_tid, tparam_tid_via_mono}
+import codegen_stmt.{
+    params_bind, cg_fn_ret_tid, cg_in_traced_fn, cg_node_mono_tid,
+    emit_block_expr, emit_fn_body, emit_if_expr, emit_match_expr,
+    emit_return_with_trace, emit_trace_exit_void, emit_with_block_expr,
+    infer_block_type, register_mono_field_types
+}
 import codegen_closures.{analyze_captures, emit_closure, emit_fn_value_shim_if_needed}
 import diagnostics.{
     diag_error, diag_error_at, diag_warn_at, diag_set_last_fix, diag_ice_at,
@@ -1779,16 +1785,7 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
                 cg_current_fn_option_inner = 0
             }
             push_scope()
-            if params_sl != -1 {
-                let mut pi = 0
-                while pi < sublist_length(params_sl) {
-                    let p = sublist_get(params_sl, pi)
-                    let pname = node_name(p)
-                    let ptype = node_type_name(p)
-                    set_var(pname, type_from_name(ptype), 0)
-                    pi = pi + 1
-                }
-            }
+            params_bind(params_sl, -1, [], 0)
             if has_handler_caps {
                 let cap_ev_fld = if is_user_effect != 0 { ev_field("ue_{vtable_field}") } else { ev_field(vtable_field) }
                 if handler_caps.len() == 1 {
@@ -2356,10 +2353,8 @@ fn emit_async_scope(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     publish_result_tid(node)
 }
 
-// Mirrors codegen_stmt.bl:strip_outer_parens. Duplicated rather than
-// shared because the import direction is codegen_stmt -> codegen_expr;
-// keep the body byte-identical so a fix in one stays trivially
-// portable to the other.
+// Mirrors codegen_stmt.bl:strip_outer_parens. Keep the body byte-identical so a
+// fix in one stays trivially portable to the other.
 fn strip_outer_parens_expr(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
         let inner = s.substring(1, s.len() - 2)
@@ -3528,15 +3523,19 @@ type TidTupleElem { ct: Int, struct_tag: Str, ok: Bool, name: Str }
 // undeclared identifier with no source span. Keep the admission set here in step with
 // tc_tid_tuple_elem_faithful, the gate that decides which slots get here at all.
 pub fn ensure_tuple_carrier_from_tid(tid: Int) -> Str {
+    let c_name = ensure_tuple_typedef_from_tid(tid)
+    if c_name == "" { return "" }
+    ensure_tuple_kops_key(c_name)
+    c_name
+}
+
+// The typedef alone. A tuple named only by a param or a return type is never a
+// Map/Set key on that account, so arming key-ops there would emit an eq/hash pair
+// and a kops table that nothing calls.
+pub fn ensure_tuple_typedef_from_tid(tid: Int) -> Str {
     let c_name = tc_tid_tuple_sname(tid)
-    // "" and a bare ICE_SEG_* sentinel (tc_tid_tuple_sname can answer one for a tuple
-    // with a non-genuine element) both mean "cannot register a
-    // real carrier under this name" — decline rather than typedef'ing the sentinel.
     if c_name == "" || diag_is_ice_seg(c_name) { return "" }
-    if find_tuple_entry(c_name) >= 0 {
-        ensure_tuple_kops_key(c_name)
-        return c_name
-    }
+    if find_tuple_entry(c_name) >= 0 { return c_name }
     let arity = tc_tid_tuple_arity(tid)
     let mut elem_types = ""
     let mut elem_structs = ""
@@ -3556,7 +3555,6 @@ pub fn ensure_tuple_carrier_from_tid(tid: Int) -> Str {
         i = i + 1
     }
     ensure_tuple_type(c_name, arity, elem_types, elem_structs, elem_names)
-    ensure_tuple_kops_key(c_name)
     c_name
 }
 
@@ -3575,7 +3573,11 @@ fn tid_tuple_elem_enc(tid0: Int) -> TidTupleElem {
     // ICE_SEG_* sentinel for a non-genuine element — decline rather than register a
     // typedef under that name.
     if tuple_sname != "" && !diag_is_ice_seg(tuple_sname) {
-        let inner = ensure_tuple_carrier_from_tid(tid)
+        // The typedef only. Today's derive emitter drops a nested-tuple field from the
+        // outer eq/hash instead of recursing into it, so arming the inner here buys
+        // nothing and emits an unreferenced eq/hash pair plus an unguarded external
+        // kops table. Whoever teaches that emitter to recurse must arm the inner too.
+        let inner = ensure_tuple_typedef_from_tid(tid)
         if inner == "" || diag_is_ice_seg(inner) { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false, name: "" } }
         return TidTupleElem { ct: CT_VOID, struct_tag: inner, ok: true, name: "" }
     }
@@ -7204,9 +7206,9 @@ pub fn mono_instance_arg_tids_from_tid(inst_tid: Int, expected_base: Str, expect
 // typedef name (blink_Tree_Int) instead of the erased bare `Tree`. Reads the
 // enum-instance tid typecheck memoized onto the construction node (tc_lookup_node_tid);
 // returns "" (defer to the bare path) when the node carries no concretely-encodable
-// generic-enum instance. Mirrors register_enum_instance_from_tid but lives here to
-// avoid a codegen_expr→codegen_stmt import cycle. `expected_base` guards against a
-// mismatched memoized tid — the registered instance must name this variant's enum.
+// generic-enum instance. Mirrors register_enum_instance_from_tid. `expected_base`
+// guards against a mismatched memoized tid — the registered instance must name this
+// variant's enum.
 pub fn register_mono_enum_from_node(node: Int, expected_base: Str) -> Str ! Codegen.Register {
     register_mono_enum_from_tid(tc_lookup_node_tid(node), expected_base)
 }

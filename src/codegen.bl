@@ -61,8 +61,7 @@ import codegen_types.{
     push_td_guard_open, push_td_guard_close,
     c_type_tag, emit_struct_option_typedef, emit_struct_result_typedef,
     compound_name_from_ann, ensure_compound_type_from_ann, register_field_ann_mono_instances,
-    register_carrier_inner_mono_instance, find_type_def_node,
-    ensure_mixed_result_type, ensure_option_type, ensure_struct_option_type,
+    register_carrier_inner_mono_instance, find_type_def_node, ensure_option_type, ensure_struct_option_type,
     ensure_struct_result_type, is_compound_ct, option_c_type,
     mono_name_from_ann, resolve_result_inner_tag, resolve_tuple_ann,
     enum_reg_set, enum_regs, enum_str_backed_set, enum_variants,
@@ -72,7 +71,7 @@ import codegen_types.{
     fn_ret_structs, fn_ret_structs_idx, fn_ret_types, fn_ret_types_idx,
     from_entries, generic_fns, generic_fns_by_name, get_fn_enum_ret,
     impl_entries, impl_method_idx, init_builtin_effects,
-    is_data_enum, is_emitted_fn, is_emitted_let, is_enum_type, is_generic_fn, is_struct_or_enum_type, is_struct_type, is_transparent_newtype,
+    is_data_enum, is_emitted_fn, is_emitted_let, is_enum_type, is_generic_fn, is_struct_type, is_transparent_newtype,
     in_per_module_header, in_per_module_object,
     is_stdlib_source_module, join_lines, make_emit_key, mangle_impl_method, mangle_impl_method_q, mangling_module, mod_fn_prefix, mod_type_prefix, builtin_type_set, mono_arg_tid_arity_conflicts, mono_arg_tid_conflicts, mono_cname_collisions, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, mono_fn_decl_tid_drift, mono_fn_decl_seg_drift, mono_fns, mono_idx, mono_instances, skip_private_in_module_header,
     poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
@@ -95,7 +94,8 @@ import codegen_stmt.{
     emit_impl_method_def, emit_mono_fn_decls_range, emit_mono_fns_from, emit_mono_typedefs_from,
     emit_struct_typedef, emit_top_level_let, format_impl_params, cg_node_mono_tid, cg_fn_ret_tid,
     reset_typedef_emitted_stmt, resolve_alias_ann,
-    register_struct_instance_from_tid, register_enum_instance_from_tid, register_carrier_struct_instance_leaves,
+    register_struct_instance_from_tid, register_carrier_struct_instance_leaves,
+    register_param_instances, param_bind_tid,
 }
 import typecheck.{sanitize_test_name, tc_lookup_node_tid, tc_variant_field_is_selfrec_tuple, make_list_type}
 import lowering.{tc_classify_mono_conflicts, ty_divergence_dump, c_type_from_tid, ctype_probe_at, tc_scalar_tid_for_ct}
@@ -291,30 +291,15 @@ fn prepend_extern_one(idx: Int) {
     }
 }
 
-// Register the struct-instance carrier typedef for every struct-typed param in a
-// param list (free fn or impl method) so it precedes the fn/method forward decl.
-// A non-struct param, or a param whose annotation has no memoized instance tid
-// (bare/typevar), registers nothing (register_struct_instance_from_tid → "").
-// Both registrars live in codegen_stmt so the body-local let path can share them.
+// Register every type a param names — mono instance, enum instance, carrier
+// typedef — so all of them precede the fn/method forward decl that spells them.
+// A param is often the only site naming its instance, and the caller's own
+// construction registers it too late for a decl already emitted above.
 fn register_struct_instance_params(params_sl: Int) ! Codegen.Register {
     if params_sl == -1 { return }
     let mut i = 0
     while i < sublist_length(params_sl) {
-        let p = sublist_get(params_sl, i)
-        let ptid = tc_lookup_node_tid(node_type_ann(p))
-        if is_struct_type(node_type_name(p)) != 0 {
-            register_struct_instance_from_tid(ptid)
-        } else if is_enum_type(node_type_name(p)) != 0 {
-            // A generic-enum INSTANCE param (`t: Tree[Int]`) registers its mono
-            // instance here so the blink_Tree_Int typedef precedes the fn forward
-            // decl that names it — the enum twin of the struct branch.
-            register_enum_instance_from_tid(ptid)
-        } else {
-            // A carrier PARAM over struct instances (`x: Result[RBox[Int],..]`)
-            // names blink_RBox_Int by value in its typedef; register that leaf
-            // here too, symmetric to the return path.
-            register_carrier_struct_instance_leaves(ptid)
-        }
+        register_param_instances(param_bind_tid(sublist_get(params_sl, i), -1, []))
         i = i + 1
     }
 }
@@ -1781,8 +1766,9 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     // format_impl_params, so their struct-instance carriers must register here
     // too — otherwise the method's forward decl names blink_Box_Str before its
     // typedef. Poly-impl (generic) methods are NOT filtered out here; they no-op
-    // safely because register_struct_instance_from_tid returns "" for a
-    // typevar-slot instance (`Box[T]`) or bare `T` — the deferred mono pass
+    // safely because every slot a typevar reaches declines — the struct/enum
+    // registrars answer "" for a typevar-slot instance (`Box[T]`) or bare `T`, and
+    // the carrier tail declines on tc_tid_has_bare_typevar. The deferred mono pass
     // lowers those per concrete T instead.
     if impls_sl != -1 {
         let mut ii = 0
@@ -1809,63 +1795,6 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             ii = ii + 1
         }
     }
-    if fns_sl != -1 {
-        let mut pi = 0
-        while pi < sublist_length(fns_sl) {
-            let fn_node2 = sublist_get(fns_sl, pi)
-            let params_sl2 = node_params(fn_node2)
-            if params_sl2 != -1 {
-                let mut pj = 0
-                while pj < sublist_length(params_sl2) {
-                    let p2 = sublist_get(params_sl2, pj)
-                    let pt2 = node_type_name(p2)
-                    if pt2 == "Result" {
-                        let ta2 = node_type_ann(p2)
-                        if ta2 != -1 {
-                            let es2 = node_elements(ta2)
-                            if es2 != -1 && sublist_length(es2) >= 2 {
-                                let oa2 = sublist_get(es2, 0)
-                                let ea2 = sublist_get(es2, 1)
-                                let on2 = node_name(oa2)
-                                let en2 = node_name(ea2)
-                                let ot2 = type_from_name(on2)
-                                let et2 = type_from_name(en2)
-                                let ok_tag2 = resolve_result_inner_tag(oa2, on2, ot2)
-                                let err_tag2 = resolve_result_inner_tag(ea2, en2, et2)
-                                if ok_tag2 != "" || err_tag2 != "" {
-                                    let ok_t_tag2 = if ok_tag2 != "" { canonical_struct_tag(ok_tag2) } else { c_type_tag(ot2) }
-                                    let err_t_tag2 = if err_tag2 != "" { canonical_struct_tag(err_tag2) } else { c_type_tag(et2) }
-                                    ensure_struct_result_type(ok_t_tag2, err_t_tag2)
-                                } else {
-                                    ensure_mixed_result_type(ot2, et2, "", "")
-                                }
-                            }
-                        }
-                    } else if pt2 == "Option" {
-                        let ta2 = node_type_ann(p2)
-                        if ta2 != -1 {
-                            let es2 = node_elements(ta2)
-                            if es2 != -1 && sublist_length(es2) >= 1 {
-                                let ia2 = sublist_get(es2, 0)
-                                let in2 = node_name(ia2)
-                                let ict2 = type_from_name(in2)
-                                if is_struct_or_enum_type(in2) != 0 {
-                                    ensure_struct_option_type(in2)
-                                } else if is_compound_ct(ict2) != 0 || in2 == "Tuple" {
-                                    ensure_struct_option_type(compound_name_from_ann(ia2))
-                                } else {
-                                    ensure_option_type(ict2)
-                                }
-                            }
-                        }
-                    }
-                    pj = pj + 1
-                }
-            }
-            pi = pi + 1
-        }
-    }
-
     // Flush the mono struct-INSTANCE typedefs (registered from param/return carriers
     // over instances) BEFORE the option/result carrier flush, so a carrier like
     // blink_Result_RBox_Int_RBox_Str sees blink_RBox_Int/blink_RBox_Str already

@@ -6,8 +6,8 @@ import parser.{
 }
 import ast.{dbg_channel_on, dbg_trace}
 import diagnostics.{
-    Diag, diag_error_no_loc, diag_ice_no_loc, diag_set_last_fix, diag_is_ice_seg,
-    UNDECLARED_EFFECT, ICE_SEG_ERASED_SLOT, MAP_TAG_REACHED_CARRIER_SCOPE,
+    Diag, diag_error_no_loc, diag_set_last_fix, diag_is_ice_seg,
+    UNDECLARED_EFFECT, ICE_SEG_ERASED_SLOT,
 }
 
 effect Codegen {
@@ -3915,57 +3915,6 @@ pub fn stamp_binder_from_binder_tid(mtid: Int, var_name: Str, is_mut: Int) -> Bo
     // NO arm for the remaining kinds: a StringBuilder / Bytes / Channel binder reaches here through
     // the scalar branch already carrying the CT the tid names, so an arm for them would be dead
     // weight. No measured shape, no arm.
-    false
-}
-
-// The container kinds above, plus the scalar kinds. The caller — an unannotated closure param,
-// whose only type channel is the closure's Fn tid — has no flat answer of its own, so a scalar
-// CT off the tid is better than leaving the var untyped.
-pub fn stamp_binder_or_scalar_from_tid(mtid: Int, var_name: Str, is_mut: Int) -> Bool ! Codegen.Scope {
-    if stamp_binder_from_binder_tid(mtid, var_name, is_mut) { return true }
-    let ct = tc_tid_ct(mtid)
-    if ct == CT_OPTION {
-        set_var(var_name, CT_OPTION, is_mut)
-        set_var_ty(var_name, mtid)
-        set_var_option_struct(var_name, tc_tid_option_inner_ct(mtid), tc_tid_option_inner_struct(mtid))
-        return true
-    }
-    if ct == CT_RESULT {
-        set_var(var_name, CT_RESULT, is_mut)
-        set_var_ty(var_name, mtid)
-        set_var_result_struct(var_name, tc_tid_result_ok_ct(mtid), tc_tid_result_err_ct(mtid), tc_tid_result_ok_struct(mtid), tc_tid_result_err_struct(mtid))
-        return true
-    }
-    let sname = tc_tid_struct(mtid)
-    if sname != "" {
-        set_var(var_name, CT_VOID, is_mut)
-        // The tid is the authoritative name channel: sv_struct_tid_first spells this binder's
-        // struct/enum name from it, so a whole-binder needs no flat sname write.
-        set_var_ty(var_name, mtid)
-        // A data enum reaches here only when the scrutinee's enum name was not already in hand;
-        // the binder still needs its variant registration to match on.
-        if is_data_enum(sname) != 0 {
-            var_enums.push(VarEnumEntry { name: var_name, enum_type: sname })
-        }
-        return true
-    }
-    // A tuple binds undecomposed too, but tc_tid_struct declines tuples, so it needs its own arm.
-    // The carrier name comes from the dedicated tuple speller and must already be registered — the
-    // caller reconstructs the value (which registers the typedef via ensure_tuple_type) before
-    // stamping — so gate on find_tuple_entry, the same gate sv_struct_tid_first uses to decide it
-    // may spell the field from the tid; an unregistered name cedes to the flat channel. Like the
-    // struct arm, the tid is the authoritative name channel, so no flat sname write.
-    let tup = tc_tid_tuple_sname(mtid)
-    if tup != "" && find_tuple_entry(tup) >= 0 {
-        set_var(var_name, CT_VOID, is_mut)
-        set_var_ty(var_name, mtid)
-        return true
-    }
-    if ct >= 0 {
-        set_var(var_name, ct, is_mut)
-        set_var_ty(var_name, mtid)
-        return true
-    }
     false
 }
 
@@ -9013,42 +8962,6 @@ fn split_top_level_commas(s: Str) -> List[Str] {
     }
     out.push(s.substr(seg_start, s.len() - seg_start).trim())
     out
-}
-
-// Register a variable bound to a whole compound CARRIER TAG (`Option_int`, `Result_int_str`) — the
-// tag form: takes a carrier TAG rather than an annotation string. A
-// bare-typevar param `x: T` bound to a compound resolves to the carrier tag rather than a head
-// name, so type_from_name alone answers CT_VOID.
-//
-// set_var must run BEFORE the set_var_*_from_struct_tag decoders: both decoders PUSH their own
-// fully-populated ScopeVar when they find none to attach to, and find_scope_var returns the topmost
-// push, so decoding first would shadow the decoders' correctly-typed var under a bare
-// CT_OPTION/CT_RESULT one with no inner metadata.
-//
-// ensure_carrier_from_tag runs on the RAW tag, not `canon`: its Result branch re-canonicalizes
-// internally with a different splitter, so feeding it an already-canonical tag double-applies a
-// non-idempotent transform and can register a different typedef than the signature side emitted for
-// the identical source tag.
-//
-// No Map arm. It is unreachable — tc_tid_to_c_tag spells a Map as the bare "Map", never "Map_k_v" —
-// and unsafe to add speculatively: every Map lowers to one `blink_map*`, and set_map_types would
-// need K/V the tag cannot always supply, so calling it with the -1 sentinel swaps a loud `void` for
-// a silently wrong `.get()`/`.insert()`. The CT_MAP arm below is a backstop for that invariant, not
-// a Map implementation: if it fires, the tc_tid_to_c_tag invariant has broken elsewhere.
-pub fn register_var_compound_from_tag(name: Str, tag: Str, is_mut: Int) ! Codegen.Scope, Diag.Report {
-    ensure_carrier_from_tag(tag)
-    let canon = canonical_struct_tag(tag)
-    let ct = compound_tag_ct(canon)
-    set_var(name, ct, is_mut)
-    if ct == CT_OPTION {
-        set_var_option_from_struct_tag(name, canon)
-    } else if ct == CT_RESULT {
-        set_var_result_from_struct_tag(name, canon)
-    } else if ct == CT_MAP {
-        diag_ice_no_loc("MapTagReachedCarrierScope", MAP_TAG_REACHED_CARRIER_SCOPE,
-            "Map-shaped compound tag '{tag}' reached register_var_compound_from_tag's scope registration",
-            "tc_tid_to_c_tag should never spell TyKind.Map structurally — this invariant broke")
-    }
 }
 
 // The tid is the sole authority for the Ok CT, struct/enum included: a name-carried
