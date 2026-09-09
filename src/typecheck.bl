@@ -361,6 +361,20 @@ fn tc_method_trait_count(tname: Str, method: Str) -> Int {
     tc_method_trait_count_idx.get(tc_method_traits_key(tname, method)) ?? 0
 }
 
+// The name a user `impl Trait for <builtin>` header writes for a builtin receiver — "Str",
+// "List", "Float" — or "" for a receiver no impl header can name. Keyed on the KIND so the
+// answer is the spelling the impl registered under, not a rendering of the whole type.
+//
+// The set is codegen's, one for one (builtin_receiver_type_name, codegen_types.bl). Answering
+// for a kind codegen cannot dispatch — Int, Bool, Ptr, a carrier — would type a call here that
+// falls through to the backstop there, moving the error out of typecheck instead of into it.
+fn tc_builtin_receiver_name(tid: Int) -> Str {
+    let k = type_kind(tid)
+    if k == TyKind.Str || k == TyKind.List || k == TyKind.Map || k == TyKind.Set { return tk_name(k) }
+    if k == TyKind.Bytes || k == TyKind.StringBuilder || k == TyKind.Template || k == TyKind.Float { return tk_name(k) }
+    ""
+}
+
 fn tc_method_trait_names(tname: Str, method: Str) -> Str {
     tc_method_trait_names_idx.get(tc_method_traits_key(tname, method)) ?? ""
 }
@@ -5449,6 +5463,33 @@ fn tc_check_struct_lit_field_closures(stid: Int, node: Int) ! TypeCheck.Resolve,
     }
 }
 
+// A field value inferred under the field's OWN type rather than under the whole literal's.
+// @allow: infer_type writes cumulative inference state that outlives the restored hint, as in
+// tc_infer_struct_lit_field_values.
+@allow(UnrestoredMutation)
+fn tc_infer_field_value_under(hint: Int, value_node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let saved_hint = tc_construct_hint
+    if tc_tid_is_no_info(hint) == 0 { tc_construct_hint = resolve_alias_tid(hint) }
+    let vt = infer_type(value_node)
+    tc_construct_hint = saved_hint
+    vt
+}
+
+// The field's own declared type, with the type's own parameters filled in from the target
+// annotation when the target names that same type: `let w: GW[Pollfd] = GW { p: ... }` says
+// the field `p: Ptr[T]` is a `Ptr[Pollfd]` here. Without it a field value is inferred under the
+// WHOLE literal's type as its hint, which says nothing about any one field. A target naming a
+// DIFFERENT type is not this literal's instance and substitutes nothing.
+fn tc_field_target_hint(bare: Str, declared: Int) -> Int {
+    if tc_construct_hint < 0 { return declared }
+    let h = resolve_alias_tid(tc_construct_hint)
+    if h < 0 || h >= ty_pool.len() { return declared }
+    let he = ty_pool.get(h).unwrap()
+    if he.kind != TyKind.Struct && he.kind != TyKind.Enum { return declared }
+    if strip_module_qualifier(he.name) != bare { return declared }
+    tc_subst_evfield_from_instance(declared, h)
+}
+
 fn tc_struct_lit_instance_tid(stid: Int, sname: Str, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     tc_check_struct_lit_field_closures(stid, node)
     tc_pin_struct_lit_field_ret_mints(stid, node)
@@ -5472,7 +5513,8 @@ fn tc_struct_lit_instance_tid(stid: Int, sname: Str, node: Int) -> Int ! TypeChe
         let fname = node_name(f)
         let declared = get_struct_field_tid(stid, fname)
         if declared != -1 {
-            unify_typevar_binds(declared, infer_type(node_value(f)), binds)
+            let ftid = tc_infer_field_value_under(tc_field_target_hint(bare, declared), node_value(f))
+            unify_typevar_binds(declared, ftid, binds)
         } else {
             // A spread entry (`..base()`) has no field name, and so no declared type to unify
             // against, but the value it spreads is an ordinary expression that must carry a
@@ -6574,6 +6616,23 @@ fn check_deprecated_type(type_name: Str, usage_node: Int) ! Diag.Report {
         help = "use '{replacement}' instead"
     }
     diag_warn_at("DeprecatedUsage", DEPRECATED_USAGE, msg, usage_node, help)
+}
+
+// A `Ptr[S]` whose pointee is an `@ffi.struct`. The typed field access `p.f.read()/.write(v)`
+// is lowered only for those (codegen_methods.bl's get_var_ffi_ptr_struct gate), so resolving the
+// pair on any pointer would type a call codegen cannot emit and would shadow a user `.read()`
+// on the field's own type.
+fn tc_ptr_ffi_struct_pointee(ptr_tid: Int) -> Int {
+    let pt = tc_resolve(ptr_tid)
+    if pt < 0 || pt >= ty_pool.len() { return 0 }
+    if type_kind(pt) != TyKind.Ptr { return 0 }
+    // Resolved, like the FieldAccess arm that types `p.f`: an alias or a metavar-backed
+    // binding stores a raw pool inner, and the two halves of the pair must answer alike or
+    // `p.f` types while `p.f.read()` rejects on the field's own type.
+    let pointee = tc_resolve(ty_pool.get(pt).unwrap().inner1)
+    if pointee < 0 { return 0 }
+    if ffi_struct_type_set.contains_key(strip_module_qualifier(type_to_str(pointee))) != 0 { return 1 }
+    0
 }
 
 fn is_valid_ptr_inner(name: Str) -> Int {
@@ -7830,6 +7889,7 @@ fn init_types() ! TypeCheck.Register {
     // cleared here rather than in resolve_names with the registries that feed it.
     nr_unresolved_method_nodes = []
     tc_unresolved_method_hard = Map()
+    tc_unresolved_calls = Map()
     // Load-bearing for the daemon/LSP (long-lived processes, daemon.bl / lsp.bl): a
     // surviving intern map would hand out tids keyed against the PREVIOUS, since-cleared
     // pool on the next check_types() call — out-of-bounds unwrap panic or a silently
@@ -8518,6 +8578,23 @@ fn is_selected_import(name: Str, imp_node: Int) -> Int {
 pub fn is_import_module_name(name: Str) -> Int {
     if tc_import_modules_idx.contains_key(name) { return 1 }
     if tc_import_qualifiers_set.contains_key(name) { return 1 }
+    0
+}
+
+// The namespaces the compiler provides itself. No import declares them, so
+// is_import_module_name does not know them, yet `io` in `io.println(..)` names a namespace
+// exactly as an imported qualifier does.
+pub fn is_builtin_namespace(name: Str) -> Int {
+    if name == "io" { return 1 }
+    if name == "fs" { return 1 }
+    if name == "net" { return 1 }
+    if name == "env" { return 1 }
+    if name == "time" { return 1 }
+    if name == "async" { return 1 }
+    if name == "channel" { return 1 }
+    if name == "default" { return 1 }
+    if name == "term" { return 1 }
+    if name == "ffi" { return 1 }
     0
 }
 
@@ -9551,7 +9628,9 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl:
         let f = sublist_get(flds_sl, fi)
         let declared = lookup_evfield_type_by_name(var_idx, node_name(f))
         if declared != -1 {
-            unify_typevar_binds(declared, infer_type(node_value(f)), binds)
+            let ebare = strip_module_qualifier(type_to_str(enum_tid))
+            let ftid = tc_infer_field_value_under(tc_field_target_hint(ebare, declared), node_value(f))
+            unify_typevar_binds(declared, ftid, binds)
         } else {
             // A field name the variant does not declare is still an expression that must carry
             // a type; the mismatch itself is reported elsewhere.
@@ -9811,6 +9890,27 @@ let mut nr_callable_field_names: List[Str] = []
 // is done, which is where the receiver types stop changing.
 let mut nr_unresolved_method_nodes: List[Int] = []
 let mut tc_unresolved_method_hard: Map[Int, Int] = Map()
+
+// Method calls the inference pass could not type and did not report on: the name resolves
+// somewhere in the program, so name resolution let it pass, but no arm here claims this
+// receiver-and-method pair. Codegen's backstop is what names them, and it needs the program to
+// reach it, so the total-stamp pass excuses these NODES rather than reporting a hole over the
+// top of the report that is coming. Only the inference pass records: name resolution walks
+// before anything is typed, so a receiver that is merely not typed YET is not one of these.
+let mut tc_unresolved_calls: Map[Int, Int] = Map()
+
+// How many recorded calls are STILL unclaimed. A branch of an if-expression is inferred once
+// for the `if`'s own type, before tc_check_body walks that branch and binds the block's lets,
+// so a tail whose receiver is one of those lets reads as untyped there and falls through; the
+// second walk types it. The record therefore says "absent" only while the node it names still
+// carries nothing, and the count has to be taken at the point it is read.
+pub fn tc_unresolved_call_count() -> Int {
+    let mut live = 0
+    for uc in tc_unresolved_calls.keys() {
+        if tc_tid_is_no_info(tc_lookup_node_tid(uc)) != 0 { live = live + 1 }
+    }
+    live
+}
 
 // `with X as ctx` does not always bind X: for a BlockHandler the binder is what
 // `enter()` returns, i.e. the impl's `type Context`. Resource type name -> Context type name,
@@ -10733,7 +10833,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             tc_mark_symbol_used(name)
             return
         }
-        if name == "io" || name == "fs" || name == "net" || name == "env" || name == "time" || name == "async" || name == "channel" || name == "default" || name == "term" || name == "ffi" { return }
+        if is_builtin_namespace(name) != 0 { return }
         if is_user_effect_handle_name(name) != 0 { return }
         if is_variant_name(name) != 0 {
             if nr_check_selective_access(name, node) != 0 { return }
@@ -11981,8 +12081,28 @@ fn infer_carrier_arg(arg_node: Int, carrier: Str) -> Int ! TypeCheck.Resolve, Ty
 // A non-List operand contributes TYPE_UNKNOWN rather than a guess: `[..7]` is a spec violation
 // (§2.16), not a shape to invent an element for, and reporting it belongs with the rest of the
 // spread-source check below, where the diagnostic can name the real rule.
+// @allow: the construct hint is saved and restored around the single descent below, and the
+// types the descent publishes ARE this function's effect.
+@allow(UnrestoredMutation)
 fn tc_list_elem_contribution(elem: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if node_kind(elem) != NodeKind.SpreadExpr { return infer_type(elem) }
+    if node_kind(elem) != NodeKind.SpreadExpr {
+        // The hint names the slot the value flows into, and an ELEMENT's slot is the element
+        // type. Narrowed here rather than at the literal because a target-directed form reads
+        // the hint as its own target: unnarrowed, `[x.into()]` under `List[Float]` converts to
+        // List[Float] and an arena allocation sizes itself against the list. A spread is the
+        // exception below — its source really is a whole list, so its slot is the hint as given.
+        let saved_hint = tc_construct_hint
+        if tc_construct_hint >= 0 {
+            let h = resolve_alias_tid(tc_construct_hint)
+            if type_kind(h) == TyKind.List {
+                let e = tc_tid_child(h, 0)
+                if e >= 0 { tc_construct_hint = e }
+            }
+        }
+        let t = infer_type(elem)
+        tc_construct_hint = saved_hint
+        return t
+    }
     let src_t = tc_resolve(infer_type(node_value(elem)))
     // `tc_resolve` above is required, not defensive: tc_tid_child indexes ty_pool directly
     // and answers -1 for an unresolved metavar. A -1 child is still folded back to
@@ -12246,15 +12366,32 @@ pub fn tc_publish_node_tid(node: Int, tid: Int) {
 // `scope.alloc()` / `scope.alloc_n(n)` cannot spell their own pointee (see the FFIScope
 // arm below), so the only thing that says what they allocate is the type expected of the
 // call — a let annotation, a parameter, or a return type. Hand that back when it really is
-// a pointer, so the node carries a type instead of nothing. Anything else, an absent
-// expectation included, stays untyped: an invented pointee would be a guess, not an answer.
+// a pointer.
+//
 // Resolved, because the carrier-argument set site (infer_carrier_arg) stores a raw pool
 // inner and every other reader of this channel resolves before it tests the kind.
-fn tc_ffi_alloc_hint_tid() -> Int {
-    if tc_construct_hint < 0 { return -1 }
+//
+// With no such expectation there is nothing to name, and DECISIONS.md 8vcj2c (6-0) says an
+// under-determined type is reported and never defaulted. Void would not be a missing pointee
+// here, it would be a `sizeof(void)` allocation the checker had signed off on, so the repair
+// the report asks for — annotate the slot — is the only way the size can be right.
+//
+// The report waits for the inference pass. The name-resolution walk runs before any
+// annotation is honoured, so every allocator reads as unhinted there.
+fn tc_ffi_alloc_hint_tid(node: Int) -> Int ! Diag.Report {
+    if tc_construct_hint < 0 { return tc_ffi_alloc_unhinted_tid(node) }
     let hint_tid = resolve_alias_tid(tc_construct_hint)
-    if type_kind(hint_tid) != TyKind.Ptr { return -1 }
+    if type_kind(hint_tid) != TyKind.Ptr { return tc_ffi_alloc_unhinted_tid(node) }
     hint_tid
+}
+
+fn tc_ffi_alloc_unhinted_tid(node: Int) -> Int ! Diag.Report {
+    if tc_boundary_check_active == 0 { return -1 }
+    diag_error_at("CannotInferType", CANNOT_INFER_TYPE,
+        "cannot infer what this allocation points at: nothing names its pointee",
+        node,
+        "annotate the slot it flows into, e.g. `let p: Ptr[Int] = scope.alloc()`")
+    -1
 }
 
 @allow(UnrestoredMutation)
@@ -12351,6 +12488,44 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if is_variant_name(name) != 0 {
             return get_variant_enum_tid(name)
         }
+        // A named function used as a VALUE (`take_fn(m, bump)`) denotes its own signature. No
+        // binding carries it — the name lives in the function table, not in a scope — so the
+        // type is built from the signature here. A callee name reaches this arm too and gets
+        // the same answer, which is the same type the call is checked against.
+        //
+        // A module-level binding of the same name wins: registering the function names defines
+        // them in the same scope the globals live in, which leaves an untyped entry over a
+        // global that a function shadows, and the global is the value the name reads. Its own
+        // declaration is what says which value, so the answer comes from there rather than from
+        // the function table — without it the name, and every method called on it, carries
+        // nothing at all.
+        let g_decl = tc_module_let_decl_node(nr_current_module, name)
+        if g_decl != -1 {
+            let g_tid = tc_lookup_node_tid(g_decl)
+            if tc_tid_is_no_info(g_tid) == 0 { return g_tid }
+            return -1
+        }
+        // A binding in an inner frame IS what the name reads, even while it carries no type yet:
+        // the name-resolution walk registers a local before anything types it, and reads types as
+        // it goes. Answering from the function table there types a shadowing local as the
+        // function it shadows.
+        if nr_has_binding(name) != 0 && nr_top_binding_is_global(name) == 0 { return -1 }
+        let fn_sig = lookup_fnsig(name)
+        if fn_sig != -1 {
+            let fs = fnsig_pool.get(fn_sig).unwrap()
+            let mut fn_param_types: List[Int] = []
+            let mut fpi = 0
+            while fpi < fs.params_count {
+                fn_param_types.push(fnsig_param_list.get(fs.params_start + fpi).unwrap())
+                fpi = fpi + 1
+            }
+            return make_fn_type(fs.ret, fn_param_types)
+        }
+        // `with arena` names the built-in Arena effect where every other with-item names a
+        // handler VALUE. It denotes a handler all the same, so it answers the type its siblings
+        // answer. LAST, under every binding and every signature: the effect has no declaration
+        // to lose to, so anything a program does declare under the name is the thing it means.
+        if name == "arena" { return make_handler_type("Arena") }
         // An undeclared name is reported as E0506 by the name-resolution pass, so reaching here
         // means the name IS in scope with no type recorded against it — an absence.
         return -1
@@ -12663,6 +12838,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // what makes `let g = c` followed by `g(21)` arity-checked.
                 let local_tid = nr_get_type(fn_name)
                 if tc_tid_is_no_info(local_tid) == 0 {
+                    // The callee names a VALUE — a closure in a local or a parameter — not an
+                    // item, so it is a value child like any other and carries its own type.
+                    tc_publish_node_tid(callee, local_tid)
                     let call_args_sl = node_args(node)
                     if type_kind(local_tid) == TyKind.Fn {
                         return tc_check_call_against_fn_tid(local_tid, call_args_sl, "function '{fn_name}'", node)
@@ -12805,6 +12983,29 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // never un-marks it.
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident && nr_has_binding(node_name(obj_node)) != 0 {
             tc_mc_obj_is_value.set(node, 1)
+        }
+
+        // `p.zzf.read()` and `p.zzf.write(v)` — the typed field access the spec documents for a
+        // `Ptr[@ffi.struct S]` (§9.1). The receiver is a PLACE reached through the pointer, not
+        // an ordinary value of the field's type, so the pair is resolved on the SHAPE of the
+        // receiver — a field access whose own object is a pointer — which is the same shape
+        // codegen lowers it on. Resolving on the receiver's TYPE would instead put `read` and
+        // `write` on every value of that field's type.
+        if method == "read" || method == "write" {
+            if obj_node != -1 && node_kind(obj_node) == NodeKind.FieldAccess {
+                if tc_ptr_ffi_struct_pointee(infer_type(node_obj(obj_node))) != 0 {
+                    let place_t = infer_type(obj_node)
+                    if method == "read" { return place_t }
+                    // Inferred, not checked against the field: a stored value that does not fit
+                    // is C's to reject until the pointee-vs-argument check the Ptr arm below
+                    // still owes exists for `.write` in both its spellings.
+                    let pw_args = node_args(node)
+                    if pw_args != -1 && sublist_length(pw_args) >= 1 {
+                        infer_type(sublist_get(pw_args, 0))
+                    }
+                    return TYPE_VOID
+                }
+            }
         }
 
         // `async.spawn(f)` is Handle[T] for f's return type T. It parses as an
@@ -13468,6 +13669,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 return TYPE_VOID
             }
             if method == "clear" { return TYPE_VOID }
+            // Codegen emits it for a Map exactly as it does for the other four containers
+            // (src/codegen_methods.bl), and List/Str/Set/Bytes/StringBuilder all answer it here.
+            if method == "is_empty" { return TYPE_BOOL }
             if method == "get" {
                 check_builtin_arg(method, 0, key_t, args_sl, "Map")
                 return make_option_type(val_t)
@@ -13624,12 +13828,20 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // Ptr methods typed here per sections/07_trust_modules_metadata.md: `is_null` and
         // `to_str` are codegen-authoritative; `addr` is the integer address (:220);
         // `deref` (:219) is signed as the pointee T so a sized pointee cannot launder into
-        // an Int binding; `offset` preserves the pointee. `.write()` returns unit and is
-        // typed at its own dispatch; a first-class arm for it is out until its argument is
-        // type-checked against the pointee.
+        // an Int binding; `offset` preserves the pointee.
         if obj_k == TyKind.Ptr {
             let args_sl = node_args(node)
             if method == "is_null" { return TYPE_BOOL }
+            // `.write(v)` stores through the pointer and answers unit. The stored value is
+            // inferred but NOT checked against the pointee — that check still does not exist —
+            // and an unchecked argument is a smaller gap than a call that carries no type at
+            // all, which is what leaving this arm out meant.
+            if method == "write" {
+                if args_sl != -1 && sublist_length(args_sl) >= 1 {
+                    infer_type(sublist_get(args_sl, 0))
+                }
+                return TYPE_VOID
+            }
             // `addr` is always the integer address (codegen emits `(int64_t)(intptr_t)…`).
             if method == "addr" { return TYPE_INT }
             // `deref` reads the pointee, so its result IS the pointee type T
@@ -13704,8 +13916,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // parser.bl:2896 accepts a `[` after a member name for the one hard-coded
         // `channel.new[T]` form and nothing else, so the type argument never reaches the AST.
         // What is left is the type expected of the call, which tc_ffi_alloc_hint_tid reads;
-        // without one they stay untyped. Minting `Ptr[metavar]` instead would make every
-        // unannotated `let p = scope.alloc()` in the corpus E0301 with nothing to bind it.
+        // without one the pointee is Void, which is what codegen allocates for.
         // Codegen sizes the allocation from its own let annotation (resolve_ptr_inner_c), a
         // narrower channel than this one, so the two agree on a let and only this one answers
         // for an argument or a return. Their argument IS checked: alloc_n takes a count, and
@@ -13730,9 +13941,50 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
             if method == "alloc_n" {
                 check_builtin_arg(method, 0, TYPE_INT, args_sl, "scope")
-                return tc_ffi_alloc_hint_tid()
+                return tc_ffi_alloc_hint_tid(node)
             }
-            if method == "alloc" { return tc_ffi_alloc_hint_tid() }
+            if method == "alloc" { return tc_ffi_alloc_hint_tid(node) }
+        }
+
+        // A method call on a BOUNDED type parameter (`fn show[T: Display](x: T) { x.fmt(sb) }`).
+        // The bound is what licenses the call, so it is also what answers it: the trait's own
+        // declared signature. An unbounded parameter licenses nothing and reaches no arm.
+        if obj_k == TyKind.Typevar {
+            let tv_traits = tc_tparam_bound_traits(type_to_str(obj_t))
+            if tv_traits != "" {
+                // The sealed synthesized `display()`, which has no declared signature anywhere
+                // — the same arm the struct path carries below.
+                if method == "display" && tc_pipe_has(tv_traits, "Display") != 0 { return TYPE_STR }
+                let mut tvi = 0
+                while tvi < tc_tmsig_pool.len() {
+                    let tm = tc_tmsig_pool.get(tvi).unwrap()
+                    if tm.method == method && tc_pipe_has(tv_traits, tm.trait_name) != 0 {
+                        return tm.ret_tid
+                    }
+                    tvi = tvi + 1
+                }
+            }
+        }
+
+        // A user `impl Trait for Str` / `for Float` / `for Int` puts a method on a BUILTIN
+        // receiver. The trait-qualified fnsig below the struct gate answers those for a struct
+        // and an enum only, so the same lookup runs here for every other receiver kind — which
+        // is what codegen already does (src/codegen_methods.bl builtin_receiver_type_name +
+        // lookup_impl_method), and it does it before its own `.into()` arm, so this sits above
+        // the one below for the same reason. Under the builtin arms above, so a declared builtin
+        // method still wins over a same-named user impl.
+        if obj_k != TyKind.Struct && obj_k != TyKind.Enum {
+            let bname = tc_builtin_receiver_name(obj_t)
+            if bname != "" {
+                let btrait = tc_method_trait_names(bname, method)
+                if btrait != "" {
+                    let bsig = lookup_fnsig("{bname}_{btrait}_{method}")
+                    if bsig != -1 {
+                        check_arg_shapes("{bname}.{method}", bsig, node_args(node), 1)
+                        return fnsig_pool.get(bsig).unwrap().ret
+                    }
+                }
+            }
         }
 
         if obj_k == TyKind.Struct || obj_k == TyKind.Enum {
@@ -13861,6 +14113,21 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method '.{method}' on type {tname}", node, help)
                 return tc_error_recovery_tid()
             }
+        }
+
+        // `.into()` is TARGET-directed: the conversion is chosen by the type the result flows
+        // into, never by the receiver (sections/03_types.md From/Into). Codegen reads the
+        // assignment target for it; the same answer is available here as the construction hint
+        // the annotated binding installs. With no hint there is nothing to name, so decline.
+        //
+        // BELOW every impl lookup, because a declared `into` is an ordinary method: a receiver
+        // that has one answers with the method's own return type, and only a receiver with none
+        // is target-directed. The hint is the whole ENCLOSING target, so it is right only where
+        // the target is the value's own slot; a list element or a carrier argument narrows it
+        // elsewhere and is not this arm's to widen.
+        if method == "into" {
+            if tc_construct_hint >= 0 { return tc_construct_hint }
+            return -1
         }
 
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident {
@@ -14056,8 +14323,16 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // `fn show[T: Describe](v: T) { Describe.describe(v) }` form (:706), where
                 // the bound guarantees the method exists, the impl is chosen per
                 // instantiation, and there is no single fnsig to read.
-                if qt_k == TyKind.Struct || qt_k == TyKind.Enum {
-                    let qt_tname = ty_pool.get(qt_recv).unwrap().name
+                // The receiver's name in the impl registry: a struct or an enum answers with
+                // its own name, a builtin container with its kind name. `impl[T] Sizer[T] for
+                // List[T]` registers under `List_Sizer_tag`, the same key shape a struct impl
+                // takes, so the same lookup answers both.
+                let qt_tname = if qt_k == TyKind.Struct || qt_k == TyKind.Enum {
+                    ty_pool.get(qt_recv).unwrap().name
+                } else {
+                    tc_builtin_receiver_name(qt_recv)
+                }
+                if qt_tname != "" {
                     let qt_sig = lookup_fnsig("{qt_tname}_{obj_name}_{method}")
                     if qt_sig != -1 {
                         let qt_fs = fnsig_pool.get(qt_sig).unwrap()
@@ -14196,7 +14471,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method '.{method}' on type {mc_tname}", node, tc_unresolved_method_help(obj_k, mc_tname, method))
             return tc_error_recovery_tid()
         }
-        // Nothing above claimed this node, so nothing has typed it — an absence.
+        // Nothing above claimed this node, so nothing has typed it — an absence. Codegen's
+        // backstop is what names the receiver and the method, so record the absence and let
+        // the stamp pass leave that report standing.
+        if tc_boundary_check_active != 0 { tc_unresolved_calls.insert(node, 1) }
         return -1
     }
 
@@ -14314,6 +14592,17 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
             diag_error_at("NoSuchField", NO_SUCH_FIELD, "tuple {type_to_str(obj_t)} has no field '{fname}'", node, "a tuple field is a numeric index within its arity")
             return tc_error_recovery_tid()
+        }
+        // `p.zzf` where `p: Ptr[S]` names the field's STORAGE through the pointer — the
+        // receiver half of the documented `.read()` / `.write(v)` pair for a
+        // `Ptr[@ffi.struct S]` (§9.1). It lowers to `p->zzf`, so it answers the FIELD's type,
+        // which is exactly what codegen emits for it and what `.read()` hands back.
+        if type_kind(obj_t) == TyKind.Ptr {
+            let pointee = tc_resolve(ty_pool.get(obj_t).unwrap().inner1)
+            if type_kind(pointee) == TyKind.Struct {
+                let pf = get_struct_field_tid(pointee, fname)
+                if pf != -1 { return pf }
+            }
         }
         // Nothing above claimed this node, so nothing has typed it — an absence.
         return -1
@@ -15522,9 +15811,11 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // The implicit tail of a value-returning fn is a return position, so a closure there
         // takes its signature from the declared return. The tail compare below runs AFTER the
         // walk; the seed has to be in hand BEFORE it, because the walk is what checks the body.
+        let mut hint_tail = -1
         if is_fn_body != 0 && tc_fn_returns_value() {
             let seed_tail = tc_block_tail_stmt(node)
             if seed_tail != -1 {
+                if tc_block_tail_value(seed_tail) != -1 { hint_tail = seed_tail }
                 tc_seed_closure_expected_fn(tc_block_tail_value(seed_tail), tc_current_fn_ret)
             }
         }
@@ -15536,7 +15827,16 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 if _found_terminal != 0 {
                     diag_warn_at("UnreachableCode", UNREACHABLE_CODE, "unreachable code after return/break/continue", stmt, "remove this code or move it before the control flow statement")
                 }
+                // The implicit tail names the same slot an explicit `return` does, so it takes the
+                // same construction hint. Without it a target-directed tail — `x.into()`, a carrier
+                // literal, an arena allocation — has nothing to name its type and reaches the end
+                // of inference with none. Installed around the WALK, not around the tail compare
+                // further down: the walk is what publishes the node tids, and the compare re-reads
+                // what the walk already decided.
+                let saved_tail_hint = tc_construct_hint
+                if stmt == hint_tail { tc_construct_hint = resolve_alias_tid(tc_current_fn_ret) }
                 tc_check_body(stmt)
+                tc_construct_hint = saved_tail_hint
                 let sk = node_kind(stmt)
                 if sk == NodeKind.Return || sk == NodeKind.Break || sk == NodeKind.Continue {
                     _found_terminal = 1
@@ -15586,7 +15886,12 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // scope it is Result[List[Int], ?], re-typed out of scope the carried type
                     // is gone, and the recovery used to "recover" the erased tid onto itself.
                     let memo = tc_scoped_value_memo(tail_val, 0)
+                    // Same hint the walk used above. This re-inference republishes every node it
+                    // touches, so without it a target-directed tail loses the type the walk gave it.
+                    let saved_cmp_hint = tc_construct_hint
+                    tc_construct_hint = resolve_alias_tid(tc_current_fn_ret)
                     let mut tail_t = tc_infer_value(tail_val)
+                    tc_construct_hint = saved_cmp_hint
                     if tc_tid_is_no_info(tail_t) != 0 || tc_tid_has_unknown(tail_t) != 0 {
                         if tc_tid_is_no_info(memo) == 0 {
                             tail_t = if tc_tid_is_no_info(tail_t) != 0 { memo } else { tc_tid_fill_unknowns(tail_t, memo) }
@@ -16005,7 +16310,6 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 let wh_kind2 = node_kind(wh_item2)
                 if wh_kind2 == NodeKind.WithResource {
                     tc_bind_with_resource(wh_item2)
-                } else if wh_kind2 == NodeKind.Ident && node_name(wh_item2) == "arena" {
                 } else {
                     tc_check_body(wh_item2)
                     // tc_check_body WALKS the operand but never types it (no Ident arm, no
@@ -16239,8 +16543,16 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // closure's return tid publish faithfully. An annotated param keeps its own type
         // (check_closure_body prefers the declared type over this hint).
         if type_kind(obj_t) == TyKind.Bytes && node_method(node) == "with_ptr" {
-            check_closure_body(closure_arg_at(args_sl, 0), make_fn_type(TYPE_UNKNOWN, [make_ptr_type(TYPE_U8)]))
+            let wp_cls = closure_arg_at(args_sl, 0)
+            check_closure_body(wp_cls, make_fn_type(TYPE_UNKNOWN, [make_ptr_type(TYPE_U8)]))
             hof_arg = 0
+            // The call answers whatever its callback answers. infer_type's arm declines an
+            // unascribed callback because the body is not walked when it runs; once the walk has
+            // happened the closure's own tid carries the answer and the call takes it.
+            if wp_cls != -1 {
+                let wp_ret = tc_fn_tid_ret(tc_lookup_node_tid(wp_cls))
+                if wp_ret >= 0 { tc_publish_node_tid(node, wp_ret) }
+            }
         }
         // "Only List has closure-taking HOFs" is true of the STDLIB and false of the
         // LANGUAGE — any fn-typed param takes a closure, and `async.spawn(fn() { ... })`
@@ -16321,6 +16633,14 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
     let kind = node_kind(node)
     if kind == NodeKind.IdentPattern {
         let name = node_name(node)
+        // A nullary variant (`None`) and `_` bind nothing, but they still MATCH a value, and
+        // the value they match is the one the enclosing pattern decomposed to — the same type
+        // a binder in their place would take. So the tid goes on every IdentPattern; only the
+        // scope entry is conditional.
+        if name == "_" || is_variant_name(name) != 0 {
+            if tc_pattern_binding_type >= 0 { tc_publish_node_tid(node, tc_pattern_binding_type) }
+            return
+        }
         if name != "_" && is_variant_name(name) == 0 {
             if tc_pattern_binding_type >= 0 {
                 nr_define_typed(name, 0, tc_pattern_binding_type, node)
@@ -16548,8 +16868,18 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         return
     }
     if kind == NodeKind.OrPattern {
-        tc_check_pattern_types(node_left(node))
-        tc_check_pattern_types(node_right(node))
+        // The alternatives are an `elements` LIST, not a left/right pair — the parser builds one
+        // node for `a | b | c`. Reading left/right walked neither of them, so no alternative was
+        // pattern-typed. Each alternative matches the same scrutinee, so each takes the hint
+        // unchanged.
+        let alts = node_elements(node)
+        if alts != -1 {
+            let mut i = 0
+            while i < sublist_length(alts) {
+                tc_check_pattern_types(sublist_get(alts, i))
+                i = i + 1
+            }
+        }
         return
     }
     if kind == NodeKind.AsPattern {
@@ -17491,9 +17821,9 @@ pub fn tc_tid_struct(tid: Int) -> Str {
 // only List and Set, so a Map's element had to be reconstructed per codegen route.
 //
 // TYPE_UNKNOWN means "no element is published for this kind yet", which is a different claim
-// from "not iterable" — Str, Bytes, Iterator, Channel and Range are all spec-legal iterables
-// (sections/03c_protocols.md's IntoIterator table) whose element this does not yet answer, and
-// the ForIn arm's deferred-iterable list is what keeps them from being diagnosed. A caller that
+// from "not iterable" — Range is a spec-legal iterable (sections/03c_protocols.md's
+// IntoIterator table) whose element this does not answer, and the ForIn arm's
+// deferred-iterable list is what keeps it from being diagnosed. A caller that
 // stamps a ScopeVar must therefore gate on a KNOWN element and leave the slot unstamped
 // otherwise: stamping TYPE_UNKNOWN would make the divergence counter report a cell where the
 // flat field is in fact right and only the tid is absent.
@@ -17507,6 +17837,12 @@ pub fn tc_tid_iter_elem(iter_t: Int) -> Int {
         let mt = ty_pool.get(iter_t).unwrap()
         return make_tuple_type([mt.inner1, mt.inner2])
     }
+    // The three remaining iterables the front end admits. A Channel drains its own element;
+    // Bytes yields U8 (sections/03_types.md). A Str yields one-character Strs: that is what
+    // codegen binds, and the tid has to say what the body will actually read.
+    if tk == TyKind.Channel { return ty_pool.get(iter_t).unwrap().inner1 }
+    if tk == TyKind.Str { return TYPE_STR }
+    if tk == TyKind.Bytes { return TYPE_U8 }
     TYPE_UNKNOWN
 }
 
@@ -17672,27 +18008,56 @@ fn tc_ann_names_tparam(ann: Int, param_name: Str) -> Bool {
 // the checker skipped would invent diagnostics the program does not deserve.
 //
 // Phase 5 ASSERTS: every node whose kind denotes or binds a value must now carry a concrete
-// type, or the compiler raises I0001 against that node. TC_UNSTAMPED_KINDS holds the kinds
-// still known to break that rule; it is temporary, it is measured by the ratchet, and it
-// must reach 0.
+// type, or the compiler raises I0001 against that node. No kind is exempt. The three excuses
+// are positional or structural and each is measured by the ratchet: a name position
+// (tc_stamp_name_child), a cascade from a hole one level down (tc_stamp_is_cascade), and a
+// body inference never checked (the @ffi skip in tc_stamp_walk).
 
-// Kinds whose nodes are still allowed to carry no type. TEMPORARY: each entry is a hole with
-// a ticket, not a design decision, and the ratchet row that counts this list must reach 0.
-//
-//   Ident        - a module qualifier in receiver position (`io` in `io.println`) names a
-//                  namespace, not a value, and nothing types it. Needs the qualifier to stop
-//                  being an Ident node, or a namespace type.
-//   IdentPattern - a match-arm binder is typed by the scrutinee, but only the arms the
-//                  checker walked record it.
-//   MethodCall   - two unattributed populations, one per position.
-//   FieldAccess  - a field reached through a type-parameter binder has no type at the
-//                  definition site by construction; only the mono pass can answer.
-pub fn tc_kind_unstamped_allowed(k: NodeKind) -> Int {
-    if k == NodeKind.Ident { return 1 }
-    if k == NodeKind.IdentPattern { return 1 }
-    if k == NodeKind.MethodCall { return 1 }
-    if k == NodeKind.FieldAccess { return 1 }
+// Whether `name` denotes an ITEM — a namespace, an imported module, a type, a trait, a
+// variant, a function — rather than a value. The ladder is name resolution's own, from the
+// Ident arm of nr_check_node: what that pass accepts with no value binding behind it is
+// exactly what has no value behind it.
+pub fn tc_name_is_item(name: Str) -> Int {
+    // `import m.{add as plus}` registers `add` in the item tables and nothing under `plus`,
+    // so the ladder has to ask about the original name — the same resolution the Call arm
+    // applies before it reads the signature.
+    let item = tc_alias_to_original.get(name) ?? name
+    if is_builtin_namespace(item) != 0 { return 1 }
+    if is_import_module_name(item) != 0 { return 1 }
+    if is_variant_name(item) != 0 { return 1 }
+    if is_builtin_fn(item) != 0 { return 1 }
+    if is_known_type(item) != 0 { return 1 }
+    if is_trait_name(item) != 0 { return 1 }
+    if is_user_effect_handle_name(item) != 0 { return 1 }
+    if lookup_fnsig(item) != -1 { return 1 }
     0
+}
+
+// The one child of `n` that stands in a NAME position instead of a value position, or -1 when
+// every value child of `n` really is a value.
+//
+// Exactly three positions can hold a name: a call's callee, and the qualifier of a method call
+// or of a field access. Each is written as a bare Ident whether it names a value or an item —
+// `f(x)` and `emit_line(x)`, `xs.len()` and `io.println(x)`, `p.zzf` and `NodeKind.Ident` — and
+// only name resolution can tell the two apart, because a local BINDING shadows an item of the
+// same name. node_children sees the syntax and nothing else, so it cannot file these as
+// spellings the way it files a type annotation; the rule is applied here instead, against the
+// item tables name resolution itself uses. A name is a spelling: there is no value under it
+// for a type to describe. Everything else in those three positions is a value and must carry
+// a type like any other.
+pub fn tc_stamp_name_child(n: Int) -> Int {
+    let k = node_kind(n)
+    let c = if k == NodeKind.Call {
+        node_left(n)
+    } else if k == NodeKind.MethodCall || k == NodeKind.FieldAccess {
+        node_obj(n)
+    } else {
+        -1
+    }
+    if c == -1 { return -1 }
+    if node_kind(c) != NodeKind.Ident { return -1 }
+    if tc_name_is_item(node_name(c)) == 0 { return -1 }
+    c
 }
 
 // Whether `tid` answers the question "what type is this" — a tid that resolves to a real
@@ -17867,10 +18232,21 @@ fn tc_stamp_walk(root: Int) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, 
         if seen.contains_key(n) { continue }
         seen.insert(n, 1)
         order.push(n)
+        // An `@ffi` declaration's body is never checked — tc_check_fn skips it, and name
+        // resolution does not even bind its params — so nothing in it was ever given a type.
+        // Walking it would assert against a hole inference was told not to fill. The body is
+        // the only child that goes unchecked: the params and the return annotation are
+        // published either way.
+        let skip_body = if node_kind(n) == NodeKind.FnDef && has_annotation(n, "ffi") != 0 {
+            node_body(n)
+        } else {
+            -1
+        }
         let kids = node_value_child_ids(n)
         let mut i = 0
         while i < kids.len() {
-            stack.push(kids.get(i).unwrap())
+            let kid = kids.get(i).unwrap()
+            if kid != skip_body { stack.push(kid) }
             i = i + 1
         }
     }
@@ -17882,10 +18258,6 @@ fn tc_stamp_walk(root: Int) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, 
     order
 }
 
-// Whether `n` has no type only because a node it is built out of has none. A parent reads its
-// type from its children, so the parent of an unanswered child cannot answer either: the hole
-// is the child's. Reporting only the frontier names the one node to fix instead of the whole
-// chain above it.
 fn tc_stamp_is_cascade(n: Int) -> Int {
     // `.await` answers with the PAYLOAD of its operand's handle, so a handle whose payload is
     // still open leaves it nothing to read even though the operand itself has a type. The hole
@@ -17896,6 +18268,24 @@ fn tc_stamp_is_cascade(n: Int) -> Int {
         if tc_tid_child_count(awaited) < 1 { return 1 }
         if tc_tid_is_concrete(tc_tid_child(awaited, 0)) == 0 { return 1 }
         return 0
+    }
+    // A member reached THROUGH a type parameter — `v.x` where `v: T`, `x.m()` where `x: T` —
+    // names no type at this site. The field or method belongs to whatever T stands for, so the
+    // answer exists only once T is bound, which is monomorphization: the mono pass records this
+    // node's tid per instance. The receiver is typed (it is T), so the hole is not the
+    // receiver's own — it is the parameter's, one level up at the call that binds it. A BOUNDED
+    // parameter does not reach here: the bound licenses the member and the trait's own
+    // signature answers it, so a hole under a bound is a real hole and still reports.
+    let member_recv = if node_kind(n) == NodeKind.FieldAccess || node_kind(n) == NodeKind.MethodCall {
+        node_obj(n)
+    } else {
+        -1
+    }
+    if member_recv != -1 {
+        let recv_t = tc_tid_resolved(tc_lookup_node_tid(member_recv))
+        if tc_tid_kind(recv_t) == TyKind.Typevar {
+            if tc_tparam_bound_traits(tc_tid_name(recv_t)) == "" { return 1 }
+        }
     }
     // A block-bearing form reads its type from its TAIL and from nothing else, so the tail is
     // the only child that can be its hole — its other statements are typed on their own.
@@ -17921,12 +18311,21 @@ fn tc_stamp_is_cascade(n: Int) -> Int {
 // Phase 5. Reports against the first offending node per kind, so a systemic hole reads as one
 // error naming its kind and not as thousands.
 fn tc_stamp_assert(order: List[Int]) ! Diag.Report {
+    // The name positions first, read off the PARENT, so the loop below can ask about a node
+    // without having to find its parent again.
+    let mut names: Map[Int, Int] = Map()
+    let mut ni = 0
+    while ni < order.len() {
+        let nc = tc_stamp_name_child(order.get(ni).unwrap())
+        if nc != -1 { names.insert(nc, 1) }
+        ni = ni + 1
+    }
     let mut reported: Map[Str, Int] = Map()
     let mut i = 0
     while i < order.len() {
         let n = order.get(i).unwrap()
         let k = nk_of(node_kind(n))
-        if nk_is_typed(k) != 0 && tc_kind_unstamped_allowed(k) == 0 {
+        if nk_is_typed(k) != 0 && names.contains_key(n) == false {
             if tc_tid_is_concrete(tc_lookup_node_tid(n)) == 0 && tc_stamp_is_cascade(n) == 0 {
                 let kn = node_kind_name(node_kind(n))
                 if reported.contains_key(kn) == false {
@@ -17951,5 +18350,22 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     // every ordinary type error into an internal-compiler-error cascade, so the total-stamp
     // claim only holds for a program that type checks.
     if diag_count > 0 { return }
+    // The same precondition, for an error typecheck cannot report YET. A call no arm claimed
+    // is codegen's to report, and until it does the absence spreads: the let it initializes
+    // carries nothing, and so does every read of that binding. Nothing here can tell those
+    // apart from a real hole, so the claim waits for the program to type check completely.
+    // Traced rather than silent, so "the pass stood down" is a thing a build can be asked.
+    let live_unclaimed = tc_unresolved_call_count()
+    if live_unclaimed > 0 {
+        if dbg_channel_on("stamp") != 0 {
+            dbg_trace("stamp", "stood down: {live_unclaimed} call(s) left to the codegen backstop")
+            for uc in tc_unresolved_calls.keys() {
+                if tc_tid_is_no_info(tc_lookup_node_tid(uc)) != 0 {
+                    dbg_trace("stamp", "  .{node_method(uc)}() at {node_line(uc)}:{node_col(uc)}")
+                }
+            }
+        }
+        return
+    }
     tc_stamp_assert(order)
 }

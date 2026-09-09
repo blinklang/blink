@@ -9,8 +9,8 @@
 
 import std.fs
 import compiler.{compile_to_program}
-import typecheck.{check_types, tc_lookup_node_tid, tc_tid_is_concrete, tc_stamp_program, tc_kind_unstamped_allowed}
-import parser.{nodes, node_kind, node_name, node_value, node_body, node_condition, node_unclaimed_child_field, node_value_child_ids}
+import typecheck.{check_types, tc_unresolved_call_count, tc_alias_to_original, tc_lookup_node_tid, tc_tid_is_concrete, tc_tid_resolved, tc_stamp_program, tc_stamp_name_child, tc_name_is_item, TYPE_INT, TYPE_STR, TYPE_U8, TYPE_BOOL, TYPE_FLOAT}
+import parser.{nodes, node_kind, node_name, node_method, node_value, node_body, node_condition, node_unclaimed_child_field, node_value_child_ids}
 import ast.{NodeKind, AstNode, nk_bridge_gap, nk_of, nk_is_typed}
 import diagnostics.{diag_count, diag_ice_count, diag_reset}
 import std.io
@@ -82,19 +82,20 @@ fn field_default_of(fname: Str) -> Int {
     -1
 }
 
-// Phase 5's own predicate over one subtree: a node that denotes a value, is not on the
-// exemption list, and carries no concrete type. Counted here without the cascade filter, so a
+// Phase 5's own predicate over one subtree: a node that denotes a value, does not stand in a
+// name position, and carries no concrete type. Counted here without the cascade filter, so a
 // hole below the root is reported by the count even when the pass reports only the frontier.
 fn untyped_value_nodes_in(root: Int) -> Int {
     if root == -1 { return -1 }
     let mut bad = 0
+    let mut names: Map[Int, Int] = Map()
     let mut stack: List[Int] = [root]
+    let mut order: List[Int] = []
     while stack.len() > 0 {
         let n = stack.pop().unwrap()
-        let k = nk_of(node_kind(n))
-        if nk_is_typed(k) != 0 && tc_kind_unstamped_allowed(k) == 0 {
-            if tc_tid_is_concrete(tc_lookup_node_tid(n)) == 0 { bad = bad + 1 }
-        }
+        order.push(n)
+        let nc = tc_stamp_name_child(n)
+        if nc != -1 { names.insert(nc, 1) }
         let kids = node_value_child_ids(n)
         let mut i = 0
         while i < kids.len() {
@@ -102,7 +103,34 @@ fn untyped_value_nodes_in(root: Int) -> Int {
             i = i + 1
         }
     }
+    let mut j = 0
+    while j < order.len() {
+        let n = order.get(j).unwrap()
+        if nk_is_typed(nk_of(node_kind(n))) != 0 && names.contains_key(n) == false {
+            if tc_tid_is_concrete(tc_lookup_node_tid(n)) == 0 { bad = bad + 1 }
+        }
+        j = j + 1
+    }
     bad
+}
+
+// The names the walk excused, so an assertion that nothing else was excused cannot pass by
+// excusing nothing at all.
+fn spelled_names_in(root: Int) -> Int {
+    if root == -1 { return -1 }
+    let mut found = 0
+    let mut stack: List[Int] = [root]
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap()
+        if tc_stamp_name_child(n) != -1 { found = found + 1 }
+        let kids = node_value_child_ids(n)
+        let mut i = 0
+        while i < kids.len() {
+            stack.push(kids.get(i).unwrap())
+            i = i + 1
+        }
+    }
+    found
 }
 
 // A call through a struct FIELD holding a function value. The Call arm answered nothing for a
@@ -448,6 +476,8 @@ test "a value node with no type is an internal compiler error" {
     tc_stamp_program(orphan)
     assert(diag_ice_count == 1)
     assert(diag_count == 0)
+    // The arena is shared with every other row in this file, so the orphan comes back off it.
+    let _ = nodes.pop()
 }
 
 // A closure buried in a CALL ARGUMENT of a struct-literal FIELD VALUE — the carrier
@@ -489,22 +519,22 @@ test "a closure argument of an awaited call has its body typed" {
 
 // A with-block whose TAIL is a read the checker leaves untyped. The recovery published `()` for
 // the block, which claimed a value the block does not have and made the binding above it look
-// like the hole; the tail is the hole, and it is one the exemption list still allows.
+// like the hole; the tail is the hole, and a projection through a type parameter is one the
+// cascade rule allows to stay open until monomorphization.
 fn with_tail_untyped_src() -> Str {
-    let mut s = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\n"
-    s = s.concat("pub type ZzPollfd \{ fd: I32, events: I16, revents: I16 }\n")
-    s = s.concat("fn main() \{\n")
-    s = s.concat("    let _zzv = with ffi.scope() as zzs \{\n")
-    s = s.concat("        let zzp: Ptr[ZzPollfd] = zzs.alloc()\n")
-    s = s.concat("        zzp.fd.read()\n")
+    let mut s = "type ZzHold \{ zzn: Int }\n"
+    s = s.concat("fn zzwt[T](zzx: T) \{\n")
+    s = s.concat("    let _zzv = with arena \{\n")
+    s = s.concat("        zzx.zzn\n")
     s = s.concat("    }\n")
     s = s.concat("}\n")
+    s = s.concat("fn main() \{ zzwt(ZzHold \{ zzn: 1 }) }\n")
     s
 }
 
 test "a with-block whose tail read is untyped is not reported above the tail" {
     assert(stamp_probe("build/stamp_with_tail_untyped.bl", with_tail_untyped_src()) == 0)
-    // The block above the exempt tail carries nothing: what the test pins is that the pass
+    // The block above the unanswered tail carries nothing: what the test pins is that the pass
     // stays quiet about the PARENT of an unanswered child, not that everything got a type.
     assert(tc_tid_is_concrete(tc_lookup_node_tid(first_node_of(NodeKind.WithBlock))) == 0)
 }
@@ -547,71 +577,6 @@ test "a struct-field default closure is typed under the declaration's type param
     assert(tc_tid_is_concrete(node_tid_by(NodeKind.Param, "zzt")) != 0)
 }
 
-// What the exemption list still owes, stated as an invariant rather than as a number. A node
-// left without a type is either one of the exempt kinds itself, or a block that reads its type
-// from a tail which is one of them — a block ending in a method call has nothing to read. The
-// count of everything else has to stay 0: that is what makes the pass total up to the list.
-fn unexcused_untyped_nodes_in(root: Int) -> Int {
-    if root == -1 { return -1 }
-    let mut bad = 0
-    let mut stack: List[Int] = [root]
-    while stack.len() > 0 {
-        let n = stack.pop().unwrap()
-        let k = nk_of(node_kind(n))
-        let kids = node_value_child_ids(n)
-        if nk_is_typed(k) != 0 && tc_kind_unstamped_allowed(k) == 0 {
-            if tc_tid_is_concrete(tc_lookup_node_tid(n)) == 0 {
-                if block_tail_is_exempt_and_untyped(n, kids) == 0 { bad = bad + 1 }
-            }
-        }
-        let mut i = 0
-        while i < kids.len() {
-            stack.push(kids.get(i).unwrap())
-            i = i + 1
-        }
-    }
-    bad
-}
-
-// The same walk, counting the excused blocks instead. Without it the assertion above holds
-// trivially on a program that contains no such block and proves nothing.
-fn excused_untyped_blocks_in(root: Int) -> Int {
-    if root == -1 { return -1 }
-    let mut found = 0
-    let mut stack: List[Int] = [root]
-    while stack.len() > 0 {
-        let n = stack.pop().unwrap()
-        let kids = node_value_child_ids(n)
-        if node_kind(n) == NodeKind.Block {
-            if tc_tid_is_concrete(tc_lookup_node_tid(n)) == 0 {
-                if block_tail_is_exempt_and_untyped(n, kids) != 0 { found = found + 1 }
-            }
-        }
-        let mut i = 0
-        while i < kids.len() {
-            stack.push(kids.get(i).unwrap())
-            i = i + 1
-        }
-    }
-    found
-}
-
-// A block's tail is its last child, read off the enumerator so the excuse cannot rest on a
-// second private notion of what a tail is. An expression statement is transparent: it is the
-// statement wrapper the parser puts around the value the block answers with. Only a Block gets
-// the excuse — no other form reads its type from its last child alone.
-fn block_tail_is_exempt_and_untyped(n: Int, kids: List[Int]) -> Int {
-    if node_kind(n) != NodeKind.Block { return 0 }
-    if kids.len() == 0 { return 0 }
-    let mut tail = kids.get(kids.len() - 1).unwrap()
-    if tail == -1 { return 0 }
-    if node_kind(tail) == NodeKind.ExprStmt { tail = node_value(tail) }
-    if tail == -1 { return 0 }
-    if tc_kind_unstamped_allowed(nk_of(node_kind(tail))) == 0 { return 0 }
-    if tc_tid_is_concrete(tc_lookup_node_tid(tail)) != 0 { return 0 }
-    1
-}
-
 // The body of the fn named `nm`, so a probe counts nodes in its own source and not in the
 // prelude or in an earlier probe's leftovers, which share this arena.
 fn fn_body_of(nm: Str) -> Int {
@@ -624,10 +589,11 @@ fn fn_body_of(nm: Str) -> Int {
 }
 
 // The shape the corpus census of untyped blocks is dominated by: a match-arm block whose last
-// statement writes through a pointer field. The write is a method call, an exempt kind, so the
-// tail carries nothing and the block has nothing to read.
+// statement writes through a pointer field. The write is a method call, and while method calls
+// were exempt as a kind the tail carried nothing and the block had nothing to read.
 fn arm_block_method_tail_src() -> Str {
-    let mut s = "type ZzP \{ zzf: Int }\n"
+    let mut s = "@ffi.struct(header: \"zzp.h\", name: \"zzp\")\n"
+    s = s.concat("type ZzP \{ zzf: Int }\n")
     s = s.concat("fn zzrun(o: Option[Int]) \{\n")
     s = s.concat("    with ffi.scope() as scope \{\n")
     s = s.concat("        let buf: Ptr[ZzP] = scope.alloc_n(1)\n")
@@ -644,9 +610,566 @@ fn arm_block_method_tail_src() -> Str {
     s
 }
 
-test "every node the pass leaves untyped is exempt or a block with an exempt tail" {
+test "the only node the pass leaves untyped is a name it spells" {
     assert(stamp_probe("build/stamp_arm_block_method_tail.bl", arm_block_method_tail_src()) == 0)
     let body = fn_body_of("zzrun")
-    assert(excused_untyped_blocks_in(body) > 0)
-    assert(unexcused_untyped_nodes_in(body) == 0)
+    // `ffi` in `ffi.scope()` is one, so the excuse is exercised and the count below is not 0
+    // for want of anything to excuse.
+    assert(spelled_names_in(body) > 0)
+    assert(untyped_value_nodes_in(body) == 0)
+}
+
+// The tid of the first node of `kind` named `nm` WITHIN `root`, so a probe reads its own
+// source and not an earlier probe's leftovers in the shared arena.
+fn tid_in(root: Int, kind: NodeKind, nm: Str) -> Int {
+    if root == -1 { return -1 }
+    let mut stack: List[Int] = [root]
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap()
+        if node_kind(n) == kind && node_name(n) == nm { return tc_lookup_node_tid(n) }
+        let kids = node_value_child_ids(n)
+        let mut i = 0
+        while i < kids.len() {
+            stack.push(kids.get(i).unwrap())
+            i = i + 1
+        }
+    }
+    -1
+}
+
+// The tid of the first method call of `nm` within `root`. A method call is named by its
+// METHOD, which is not the field node_name reads.
+fn method_tid_in(root: Int, nm: Str) -> Int {
+    if root == -1 { return -1 }
+    let mut stack: List[Int] = [root]
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap()
+        if node_kind(n) == NodeKind.MethodCall && node_method(n) == nm { return tc_lookup_node_tid(n) }
+        let kids = node_value_child_ids(n)
+        let mut i = 0
+        while i < kids.len() {
+            stack.push(kids.get(i).unwrap())
+            i = i + 1
+        }
+    }
+    -1
+}
+
+// A call through a local holding a closure. The callee is an Ident like a named call's, but it
+// names a VALUE, so it carries the type it was bound with; the Call arm read that type to check
+// the arguments and never wrote it down.
+fn value_callee_src() -> Str {
+    let mut s = "fn zzcallee() -> Int \{\n"
+    s = s.concat("    let zzg = fn(zzx: Int) -> Int \{ zzx + 1 }\n")
+    s = s.concat("    zzg(41)\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = zzcallee() }\n")
+    s
+}
+
+test "a callee that names a value carries the value's type" {
+    assert(stamp_probe("build/stamp_value_callee.bl", value_callee_src()) == 0)
+    let body = fn_body_of("zzcallee")
+    assert(tc_tid_is_concrete(tid_in(body, NodeKind.Ident, "zzg")) != 0)
+    assert(untyped_value_nodes_in(body) == 0)
+}
+
+// A name in each of the three positions that can hold one: a module qualifier before a method
+// call, an enum type before a field access, and a function before a call. None of the three is
+// a value, so none carries a type, and the pass must not read that absence as a hole.
+fn item_name_src() -> Str {
+    let mut s = "type ZzColor \{ ZzRed, ZzBlue }\n"
+    s = s.concat("fn zzhelp(zzn: Int) -> Int \{ zzn * 2 }\n")
+    s = s.concat("fn zznames() \{\n")
+    s = s.concat("    let zzc = ZzColor.ZzRed\n")
+    s = s.concat("    let zzd = zzhelp(3)\n")
+    s = s.concat("    io.println(\"\{zzd}\")\n")
+    s = s.concat("    match zzc \{ ZzColor.ZzRed => \{} ZzColor.ZzBlue => \{} }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ zznames() }\n")
+    s
+}
+
+test "a name in a qualifier or callee position is a spelling and carries no type" {
+    assert(stamp_probe("build/stamp_item_name.bl", item_name_src()) == 0)
+    let body = fn_body_of("zznames")
+    assert(tc_name_is_item("io") != 0)
+    assert(tc_name_is_item("ZzColor") != 0)
+    assert(tc_name_is_item("zzhelp") != 0)
+    // A name that IS bound to a value is not an item, whatever position it stands in.
+    assert(tc_name_is_item("zzd") == 0)
+    assert(tc_tid_is_concrete(tid_in(body, NodeKind.Ident, "io")) == 0)
+    assert(tc_tid_is_concrete(tid_in(body, NodeKind.Ident, "zzhelp")) == 0)
+    assert(spelled_names_in(body) > 0)
+    assert(untyped_value_nodes_in(body) == 0)
+}
+
+// A match arm that binds nothing: a nullary variant and a wildcard. The variant MATCHES a value
+// of the scrutinee's type, which is the type a binder in its place would take, so it carries
+// that type. `_` is a WildcardPattern, a kind that denotes no value at all and carries none.
+fn nullary_pattern_src() -> Str {
+    let mut s = "fn zzpat(zzo: Option[Int]) -> Int \{\n"
+    s = s.concat("    match zzo \{\n")
+    s = s.concat("        None => 0\n")
+    s = s.concat("        _ => 1\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = zzpat(Some(3)) }\n")
+    s
+}
+
+test "a nullary variant pattern carries the matched type and a wildcard denotes no value" {
+    assert(stamp_probe("build/stamp_nullary_pattern.bl", nullary_pattern_src()) == 0)
+    let body = fn_body_of("zzpat")
+    assert(tc_tid_is_concrete(tid_in(body, NodeKind.IdentPattern, "None")) != 0)
+    assert(tc_tid_is_concrete(tid_in(body, NodeKind.WildcardPattern, "")) == 0)
+    assert(untyped_value_nodes_in(body) == 0)
+}
+
+// The documented typed field access for a pointer to an FFI struct: `p.zzf` names the field's
+// storage through the pointer and answers the FIELD's type, `.read()` hands that value back and
+// `.write(v)` stores into it. All three are values and all three carry types.
+//
+// The pointee is an `@ffi.struct` because that is the only pointee codegen lowers the pair for
+// (its get_var_ffi_ptr_struct gate). Typing it for any pointer would type a call that cannot be
+// emitted, and would put `read` and `write` on every value of the field's own type.
+fn ptr_field_src() -> Str {
+    let mut s = "@ffi.struct(header: \"zzq.h\", name: \"zzq\")\n"
+    s = s.concat("type ZzQ \{ zzf: Int }\n")
+    s = s.concat("fn zzptr() -> Int \{\n"                )
+    s = s.concat("    let mut zzout = 0\n")
+    s = s.concat("    with ffi.scope() as zzscope \{\n")
+    s = s.concat("        let zzbuf: Ptr[ZzQ] = zzscope.alloc_n(1)\n")
+    s = s.concat("        let zzcell = zzbuf.offset(0)\n")
+    s = s.concat("        zzcell.zzf.write(7)\n")
+    s = s.concat("        zzout = zzcell.zzf.read()\n")
+    s = s.concat("    }\n")
+    s = s.concat("    zzout\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = zzptr() }\n")
+    s
+}
+
+test "a field reached through a pointer carries the field's type, and so do its read and write" {
+    assert(stamp_probe("build/stamp_ptr_field.bl", ptr_field_src()) == 0)
+    let body = fn_body_of("zzptr")
+    assert(tc_tid_is_concrete(tid_in(body, NodeKind.FieldAccess, "zzf")) != 0)
+    assert(tc_tid_is_concrete(method_tid_in(body, "read")) != 0)
+    assert(tc_tid_is_concrete(method_tid_in(body, "write")) != 0)
+    assert(untyped_value_nodes_in(body) == 0)
+}
+
+// The three iterables whose element rule lived only in codegen. A `for` binder is a value like
+// any other binder, so it carries the element type of whatever it walks: a Str yields the
+// one-character Strs codegen binds, a Bytes yields U8, a Channel yields what it carries.
+fn iter_elem_src() -> Str {
+    let mut s = "fn zziter(zzc: Channel[Int]) -> Int \{\n"
+    s = s.concat("    let mut zzn = 0\n")
+    s = s.concat("    for zzs in \"ab\" \{ zzn = zzn + zzs.len() }\n")
+    s = s.concat("    for zzu in Bytes.from_str(\"ab\") \{ zzn = zzn + zzu.to_int() }\n")
+    s = s.concat("    for zzi in zzc \{ zzn = zzn + zzi }\n")
+    s = s.concat("    zzn\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = zziter(Channel(1)) }\n")
+    s
+}
+
+test "a for binder over a string, a byte buffer or a channel carries the element type" {
+    assert(stamp_probe("build/stamp_iter_elem.bl", iter_elem_src()) == 0)
+    let body = fn_body_of("zziter")
+    assert(tc_tid_resolved(tid_in(body, NodeKind.IdentPattern, "zzs")) == TYPE_STR)
+    assert(tc_tid_resolved(tid_in(body, NodeKind.IdentPattern, "zzu")) == TYPE_U8)
+    assert(tc_tid_resolved(tid_in(body, NodeKind.IdentPattern, "zzi")) == TYPE_INT)
+    assert(untyped_value_nodes_in(body) == 0)
+}
+
+// An or-pattern holds its alternatives in an `elements` list, not in a left/right pair. Each
+// alternative matches the same scrutinee, so each carries the scrutinee's type.
+fn or_pattern_src() -> Str {
+    let mut s = "type ZzE \{ ZzA, ZzB, ZzC }\n"
+    s = s.concat("fn zzor(zze: ZzE) -> Int \{\n")
+    s = s.concat("    match zze \{\n")
+    s = s.concat("        ZzA | ZzB => 1\n")
+    s = s.concat("        ZzC => 2\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = zzor(ZzE.ZzA) }\n")
+    s
+}
+
+test "every alternative of an or-pattern carries the matched type" {
+    assert(stamp_probe("build/stamp_or_pattern.bl", or_pattern_src()) == 0)
+    let body = fn_body_of("zzor")
+    let zza = tc_tid_resolved(tid_in(body, NodeKind.IdentPattern, "ZzA"))
+    let zzb = tc_tid_resolved(tid_in(body, NodeKind.IdentPattern, "ZzB"))
+    assert(tc_tid_is_concrete(zza) != 0)
+    // Both alternatives match the same scrutinee, so both answer the same type.
+    assert(zzb == zza)
+    assert(untyped_value_nodes_in(body) == 0)
+}
+
+// `with arena` names the built-in Arena effect where every other with-item names a handler
+// VALUE. It denotes a handler all the same, so it carries a type like its siblings do.
+fn arena_handler_src() -> Str {
+    let mut s = "fn zzarena() -> Int \{\n"
+    s = s.concat("    let zzv = with arena \{ 1 + 2 }\n")
+    s = s.concat("    zzv\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = zzarena() }\n")
+    s
+}
+
+test "the arena item of a with-block carries a handler type" {
+    assert(stamp_probe("build/stamp_arena_handler.bl", arena_handler_src()) == 0)
+    let body = fn_body_of("zzarena")
+    assert(tc_tid_is_concrete(tid_in(body, NodeKind.Ident, "arena")) != 0)
+    assert(untyped_value_nodes_in(body) == 0)
+}
+
+// A named function used as a VALUE rather than as a callee. No binding carries its type — the
+// name lives in the function table — so the type is built from the signature.
+fn fn_name_value_src() -> Str {
+    let mut s = "fn zzdouble(zzx: Int) -> Int \{ zzx * 2 }\n"
+    s = s.concat("fn zzapply(zzf: fn(Int) -> Int, zzn: Int) -> Int \{ zzf(zzn) }\n")
+    s = s.concat("fn zzuse() -> Int \{ zzapply(zzdouble, 4) }\n")
+    s = s.concat("fn main() \{ let _ = zzuse() }\n")
+    s
+}
+
+test "a function name passed as an argument carries its signature type" {
+    assert(stamp_probe("build/stamp_fn_name_value.bl", fn_name_value_src()) == 0)
+    let body = fn_body_of("zzuse")
+    // The same name in a CALLEE position is a spelling and carries nothing; here it is the
+    // argument, so it is a value and carries the function's type.
+    assert(tc_tid_is_concrete(tid_in(body, NodeKind.Ident, "zzdouble")) != 0)
+    assert(untyped_value_nodes_in(body) == 0)
+}
+
+// `is_empty` is emitted for a Map exactly as it is for the other containers, and every other
+// container answers it in the checker. The Map arm did not.
+fn map_is_empty_src() -> Str {
+    let mut s = "fn zzmap() -> Bool \{\n"
+    s = s.concat("    let zzm: Map[Str, Int] = Map()\n")
+    s = s.concat("    zzm.is_empty()\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = zzmap() }\n")
+    s
+}
+
+test "a map answers is_empty like every other container" {
+    assert(stamp_probe("build/stamp_map_is_empty.bl", map_is_empty_src()) == 0)
+    let body = fn_body_of("zzmap")
+    assert(tc_tid_resolved(method_tid_in(body, "is_empty")) == TYPE_BOOL)
+    assert(untyped_value_nodes_in(body) == 0)
+}
+
+// A user `impl Trait for Str` puts a method on a BUILTIN receiver. Codegen resolves it through
+// the impl table; the checker resolved it for a struct and an enum only.
+fn builtin_impl_src() -> Str {
+    let mut s = "trait ZzShout \{ fn zzshout(self) -> Str }\n"
+    s = s.concat("impl ZzShout for Str \{ fn zzshout(self) -> Str \{ self.concat(\"!\") } }\n")
+    s = s.concat("fn zzcall() -> Str \{ \"hi\".zzshout() }\n")
+    s = s.concat("fn main() \{ let _ = zzcall() }\n")
+    s
+}
+
+test "a trait method implemented for a builtin receiver answers the impl's return type" {
+    assert(stamp_probe("build/stamp_builtin_impl.bl", builtin_impl_src()) == 0)
+    let body = fn_body_of("zzcall")
+    assert(tc_tid_resolved(method_tid_in(body, "zzshout")) == TYPE_STR)
+    assert(untyped_value_nodes_in(body) == 0)
+}
+
+// `.into()` is target-directed: the conversion is chosen by the type the result flows into,
+// never by the receiver. The annotation on the binding is what names it.
+fn into_target_src() -> Str {
+    let mut s = "fn zzinto() -> Float \{\n"
+    s = s.concat("    let zzi: Int = 42\n")
+    s = s.concat("    let zzf: Float = zzi.into()\n")
+    s = s.concat("    zzf\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = zzinto() }\n")
+    s
+}
+
+test "an into conversion takes its type from the target annotation" {
+    assert(stamp_probe("build/stamp_into_target.bl", into_target_src()) == 0)
+    let body = fn_body_of("zzinto")
+    assert(tc_tid_resolved(method_tid_in(body, "into")) == TYPE_FLOAT)
+    assert(untyped_value_nodes_in(body) == 0)
+}
+
+// `with_ptr` answers whatever its callback answers. The checker's own arm runs before the
+// callback body is walked, so an unascribed callback left the call carrying nothing.
+fn with_ptr_src() -> Str {
+    let mut s = "fn zzwp() -> Int ! FFI \{\n"
+    s = s.concat("    let zzb = Bytes.from_str(\"ab\")\n")
+    s = s.concat("    zzb.with_ptr(fn(zzp) \{ zzp.addr() })\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ with ffi.scope() as zzs \{ let _ = zzwp() } }\n")
+    s
+}
+
+test "a with_ptr call with an unascribed callback carries the callback's return type" {
+    assert(stamp_probe("build/stamp_with_ptr.bl", with_ptr_src()) == 0)
+    let body = fn_body_of("zzwp")
+    assert(tc_tid_resolved(method_tid_in(body, "with_ptr")) == TYPE_INT)
+    assert(untyped_value_nodes_in(body) == 0)
+}
+
+// A method call on a BOUNDED type parameter. The bound is what licenses the call, so the
+// trait's own declared signature is what answers it.
+fn bounded_tparam_src() -> Str {
+    let mut s = "trait ZzNamed \{ fn zzname(self) -> Str }\n"
+    s = s.concat("type ZzT \{ zzv: Int }\n")
+    s = s.concat("impl ZzNamed for ZzT \{ fn zzname(self) -> Str \{ \"t\" } }\n")
+    s = s.concat("fn zzshow[T: ZzNamed](zzx: T) -> Str \{ zzx.zzname() }\n")
+    s = s.concat("fn main() \{ let _ = zzshow(ZzT \{ zzv: 1 }) }\n")
+    s
+}
+
+test "a method call on a bounded type parameter answers the bound trait's signature" {
+    assert(stamp_probe("build/stamp_bounded_tparam.bl", bounded_tparam_src()) == 0)
+    let body = fn_body_of("zzshow")
+    assert(tc_tid_resolved(method_tid_in(body, "zzname")) == TYPE_STR)
+    assert(untyped_value_nodes_in(body) == 0)
+}
+
+// A member reached through an UNBOUNDED type parameter names no type at this site: the field
+// belongs to whatever T stands for, so the answer exists only once T is bound. The pass must
+// treat that as a cascade and stay quiet, not report it as a hole.
+fn tparam_projection_src() -> Str {
+    let mut s = "type ZzC \{ zzcount: Int }\n"
+    s = s.concat("fn zzproj[T](zzr: Result[T, Str]) -> Int \{\n")
+    s = s.concat("    match zzr \{\n")
+    s = s.concat("        Ok(zzv) => \{ return zzv.zzcount }\n")
+    s = s.concat("        Err(_zze) => \{ return 0 }\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = zzproj(Ok(ZzC \{ zzcount: 3 })) }\n")
+    s
+}
+
+test "a member reached through a type parameter is a cascade, not a hole" {
+    assert(stamp_probe("build/stamp_tparam_projection.bl", tparam_projection_src()) == 0)
+    let body = fn_body_of("zzproj")
+    // The binder is typed — it is T. The projection off it is not, and that is the point:
+    // the mono pass records this node's tid once per instantiation.
+    assert(tc_tid_is_concrete(tid_in(body, NodeKind.IdentPattern, "zzv")) != 0)
+    assert(tc_tid_is_concrete(tid_in(body, NodeKind.FieldAccess, "zzcount")) == 0)
+}
+
+// A local binding whose name is also a function name. The binding is the value the name reads,
+// so the signature fallback must not answer over it. The name-resolution walk registers a local
+// before anything types it, and it reads types as it goes: at that point the binding carries no
+// type, which is exactly when the function table looks like an answer and is not one.
+fn shadowed_fn_name_src() -> Str {
+    let mut s = "fn zzwhere(zzk: Int) -> Int \{ zzk + 1 }\n"
+    s = s.concat("fn zzslice(zzc: Str) -> Str \{\n")
+    s = s.concat("    let zzwhere = zzc.index_of(\"a\")\n")
+    s = s.concat("    let zzrest = zzc.slice(zzwhere + 1, zzc.len())\n")
+    s = s.concat("    zzrest\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = zzslice(\"ab\") }\n")
+    s
+}
+
+test "a local binding shadowing a function name keeps the binding's type" {
+    assert(stamp_probe("build/stamp_shadowed_fn_name.bl", shadowed_fn_name_src()) == 0)
+    let body = fn_body_of("zzslice")
+    assert(tc_tid_resolved(tid_in(body, NodeKind.Ident, "zzwhere")) == TYPE_INT)
+    assert(untyped_value_nodes_in(body) == 0)
+}
+
+// A qualified trait call whose receiver is a BUILTIN container. The struct/enum arm reads the
+// impl's registered signature; a `impl[T] Trait[T] for List[T]` registers under the same key,
+// so the receiver's builtin name answers it the same way.
+fn qualified_builtin_impl_src() -> Str {
+    let mut s = "trait ZzSizer[T] \{ fn zztag(self, zzx: T) -> Int }\n"
+    s = s.concat("impl[T] ZzSizer[T] for List[T] \{ fn zztag(_self, _zzx: T) -> Int \{ 111 } }\n")
+    s = s.concat("fn zzq() -> Int \{\n")
+    s = s.concat("    let zzxs: List[Int] = [1, 2]\n")
+    s = s.concat("    let zzn = ZzSizer.zztag(zzxs, 0)\n")
+    s = s.concat("    zzn\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = zzq() }\n")
+    s
+}
+
+test "a qualified trait call on a builtin receiver answers the impl's return type" {
+    assert(stamp_probe("build/stamp_qualified_builtin_impl.bl", qualified_builtin_impl_src()) == 0)
+    let body = fn_body_of("zzq")
+    assert(tc_tid_resolved(tc_lookup_node_tid(let_value_of("zzn"))) == TYPE_INT)
+    assert(untyped_value_nodes_in(body) == 0)
+}
+
+// An arena allocation with nothing to say what it points at. Codegen emits `void*` and sizes the
+// allocation at one byte, so the pointer IS one to Void and the tid says so. An annotation still
+// wins: the hint is read first.
+fn scope_alloc_unhinted_src() -> Str {
+    let mut s = "@trusted(audit: \"stamp-probe\")\n"
+    s = s.concat("fn zzalloc() ! FFI \{\n")
+    s = s.concat("    with ffi.scope() as zzs \{\n")
+    s = s.concat("        let zzp = zzs.alloc()\n")
+    s = s.concat("        let _zzn = zzp.is_null()\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ zzalloc() }\n")
+    s
+}
+
+// DECISIONS.md 8vcj2c, 6-0: an under-determined type is reported, never defaulted. An arena
+// allocation names its pointee through the slot it flows into and nowhere else, so with no
+// such slot there is no size to allocate. Answering Void here would not be a missing type,
+// it would be a one-byte allocation the checker had blessed.
+test "an arena allocation with no target type is reported, not defaulted" {
+    assert(stamp_probe("build/stamp_scope_alloc_unhinted.bl", scope_alloc_unhinted_src()) > 0)
+    assert(diag_ice_count == 0)
+}
+
+// A method that resolves nowhere on its receiver. Typecheck does not model every builtin method,
+// so it neither answers the call nor rejects it — the codegen backstop names the type and the
+// method. The pass stands down for the whole program rather than pre-empting that report with an
+// internal error, the same way it stands down once a diagnostic has been raised.
+fn unresolved_method_src() -> Str {
+    let mut s = "fn zzunres() -> Int \{\n"
+    s = s.concat("    let zzxs: List[Int] = [1]\n")
+    s = s.concat("    let zzys = zzxs.concat([2])\n")
+    s = s.concat("    zzys.len()\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = zzunres() }\n")
+    s
+}
+
+test "a call typecheck cannot resolve is left to the backstop, not reported as a hole" {
+    assert(stamp_probe("build/stamp_unresolved_method.bl", unresolved_method_src()) == 0)
+    let body = fn_body_of("zzunres")
+    assert(tc_tid_is_concrete(tc_lookup_node_tid(let_value_of("zzys"))) == 0)
+}
+
+// A branch of an if-EXPRESSION is inferred once for the `if`'s own type, before tc_check_body
+// walks that branch and binds the block's lets. A tail whose receiver is one of those lets
+// reads as untyped on the first walk and falls through unclaimed; the second walk types it.
+// So the record of an unclaimed call says "absent" only while the node it names is still
+// untyped, and a count taken once over-reports.
+fn branch_tail_local_src() -> Str {
+    let mut s = "fn zzpick(sp: Str) -> Str \{\n"
+    s = s.concat("    if sp != \"\" \{\n")
+    s = s.concat("        sp\n")
+    s = s.concat("    } else \{\n")
+    s = s.concat("        let zzs = \"x \"\n")
+    s = s.concat("        zzs.trim()\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ io.println(zzpick(\"\")) }\n")
+    s
+}
+
+test "an if-branch tail method call on a block-local is typed, not left to the backstop" {
+    assert(stamp_probe("build/stamp_branch_tail_local.bl", branch_tail_local_src()) == 0)
+    let body = fn_body_of("zzpick")
+    assert(tc_tid_is_concrete(method_tid_in(body, "trim")) != 0)
+    assert(untyped_value_nodes_in(body) == 0)
+    assert(tc_unresolved_call_count() == 0)
+}
+
+fn alias_item_src() -> Str {
+    let mut s = "fn zzadd(a: Int, b: Int) -> Int \{ a + b }\n"
+    s = s.concat("fn main() \{ io.println(\"\{zzadd(2, 3)}\") }\n")
+    s
+}
+
+// `import m.{add as plus}` registers the ORIGINAL name in the item tables and nothing under
+// the alias, so a callee spelled with the alias is an item the ladder can only see by
+// resolving the alias first — the same resolution the Call arm already does for the type.
+test "an aliased import name is an item, so a call through it spells a name" {
+    assert(stamp_probe("build/stamp_alias_item.bl", alias_item_src()) == 0)
+    assert(tc_name_is_item("zzadd") != 0)
+    assert(tc_name_is_item("zzplus") == 0)
+    tc_alias_to_original.insert("zzplus", "zzadd")
+    assert(tc_name_is_item("zzplus") != 0)
+}
+
+// An `@ffi` function's body is never type checked: tc_check_fn skips it, so nothing in it is
+// ever given a type. The stamp walk must skip it for the same reason. Descending into a body
+// inference deliberately never visited turns every FFI helper with a real body into an
+// internal error about a hole the checker was told not to fill.
+fn ffi_body_src() -> Str {
+    let mut s = "@trusted(audit: \"stamp-probe\")\n"
+    s = s.concat("@ffi\n")
+    s = s.concat("fn zzbump(zzn: Int) -> Int ! FFI \{ zzn + 1 }\n")
+    s = s.concat("fn main() \{ io.println(\"ok\") }\n")
+    s
+}
+
+test "the body of an ffi function is not walked, because it is never checked" {
+    assert(stamp_probe("build/stamp_ffi_body.bl", ffi_body_src()) == 0)
+}
+
+fn tail_into_src() -> Str {
+    let mut s = "fn zzta(zzi: Int) -> Float \{\n"
+    s = s.concat("    zzi.into()\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ io.println(\"\{zzta(3)}\") }\n")
+    s
+}
+
+// An implicit tail is a return position, so it names the declared return type the same way an
+// explicit `return` does. A target-directed form there has no other slot to read.
+test "the implicit tail of a value-returning function takes the declared return as its type" {
+    assert(stamp_probe("build/stamp_tail_into.bl", tail_into_src()) == 0)
+    let body = fn_body_of("zzta")
+    assert(tc_tid_resolved(method_tid_in(body, "into")) == TYPE_FLOAT)
+}
+
+// The construction hint names the slot the value flows into. A list element's slot is the
+// ELEMENT type, not the list's, so the hint has to narrow on the way in — otherwise every
+// target-directed form reads the whole container as its own target.
+fn into_elem_src() -> Str {
+    let mut s = "fn zzmk(zzi: Int) -> List[Float] \{\n"
+    s = s.concat("    [zzi.into()]\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ io.println(\"\{zzmk(3).len()}\") }\n")
+    s
+}
+
+test "an into conversion in a list element takes the element type, not the list type" {
+    assert(stamp_probe("build/stamp_into_elem.bl", into_elem_src()) == 0)
+    let body = fn_body_of("zzmk")
+    assert(tc_tid_resolved(method_tid_in(body, "into")) == TYPE_FLOAT)
+}
+
+fn tail_carrier_into_src() -> Str {
+    let mut s = "fn zzoc(zzi: Int) -> Option[Float] \{\n"
+    s = s.concat("    Some(zzi.into())\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ io.println(\"\{zzoc(3).is_some()}\") }\n")
+    s
+}
+
+// A carrier payload narrows the tail's hint the same way a list element does: the slot is the
+// payload type, not the carrier's. Typecheck only — codegen still emits the source carrier for
+// this shape, which the C compiler rejects, so a running probe would pin the wrong answer.
+test "an into conversion in a tail carrier payload takes the payload type" {
+    assert(stamp_probe("build/stamp_tail_carrier_into.bl", tail_carrier_into_src()) == 0)
+    let body = fn_body_of("zzoc")
+    assert(tc_tid_resolved(method_tid_in(body, "into")) == TYPE_FLOAT)
+}
+
+fn alloc_elem_src() -> Str {
+    let mut s = "@ffi.struct(header: \"zzp.h\", name: \"zzp\")\n"
+    s = s.concat("type ZzPt \{ zzf: Int }\n")
+    s = s.concat("@trusted(audit: \"stamp-probe\")\n")
+    s = s.concat("fn zzmk() ! FFI \{\n")
+    s = s.concat("    with ffi.scope() as zzs \{\n")
+    s = s.concat("        let zzps: List[Ptr[ZzPt]] = [zzs.alloc()]\n")
+    s = s.concat("        let _zzn = zzps.len()\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ zzmk() }\n")
+    s
+}
+
+test "an arena allocation in a list element points at the element's own pointee" {
+    assert(stamp_probe("build/stamp_alloc_elem.bl", alloc_elem_src()) == 0)
 }

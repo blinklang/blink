@@ -36,10 +36,17 @@ EOF
   cat > "$dir/src/mono.bl" <<'EOF'
 // mono placeholder fixture, deliberately no pub let mut here
 EOF
+  # tc_stamp_name_child is a real excuse helper, so the row's reach beyond the assert itself
+  # is exercised. Left unterminated on purpose: check_row appends its probe line at EOF, and
+  # the stamp_excuse_kind_refs row counts each named function to the next `fn` line.
   cat > "$dir/src/typecheck.bl" <<'EOF'
 return TYPE_UNKNOWN
 let mut foo_map: Map[Str, Int] = Map()
-pub fn tc_kind_unstamped_allowed(k: NodeKind) -> Int {
+pub fn tc_stamp_name_child(n: Int) -> Int {
+    if k == NodeKind.Call { return node_left(n) }
+}
+pub fn tc_stamp_assert(order: List[Int]) {
+    diag_ice_at("NodeCarriesNoType", UNSOLVED_TYPEVAR_AT_CODEGEN, "no type", n)
     if k == NodeKind.Ident { return 1 }
 EOF
   : > "$dir/Taskfile.yml"
@@ -86,7 +93,7 @@ check_row return_type_unknown      typecheck.bl 'return TYPE_UNKNOWN'
 check_row str_keyed_type_facts     typecheck.bl 'let mut bar_map: Map[Str, Str] = Map()'
 check_row downgrade_calls          codegen.bl   'let h2 = tc_tid_option_inner_struct(1)'
 check_row br_ids_in_source         codegen.bl   '// also see br xyz987'
-check_row stamp_exempt_kinds       typecheck.bl 'if k == NodeKind.Break { return 1 }'
+check_row stamp_excuse_kind_refs   typecheck.bl 'if k == NodeKind.Break { return 1 }'
 
 # br_ids_in_source is an absolute zero gate: it must fail even when the
 # baseline and HEAD~1 both already read 1, where the plain non-increasing
@@ -119,6 +126,36 @@ else
   echo "PASS head1-independent: HEAD~1 check caught a regression the loose baseline alone would have missed"
 fi
 
+# Deleting the total-stamp assert must error, not read the excuse row as 0: the row counts a
+# surface the assert anchors, so a missing assert means the row is unmeasured, which is exactly
+# the regression it is there to catch. The message is asserted, not just the exit status, so an
+# unrelated early exit cannot read as a pass.
+NOSTAMP="$WORK/no_stamp"
+rm -rf "$NOSTAMP"
+cp -r "$BASE" "$NOSTAMP"
+grep -v 'NodeCarriesNoType' "$BASE/src/typecheck.bl" > "$NOSTAMP/src/typecheck.bl"
+nostamp_out=$(RATCHET_SRC_DIR="$NOSTAMP" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh 2>&1)
+if [ $? -eq 0 ] || ! printf '%s' "$nostamp_out" | rg -q 'no total-stamp assert'; then
+  echo "FAIL stamp-anchor-required: a typecheck.bl with no total-stamp assert should error by name, not pass with the row at 0"
+  fail=1
+else
+  echo "PASS stamp-anchor-required: a missing total-stamp assert errors instead of zeroing the row"
+fi
+
+# The regression that made the old row worthless: an exemption written into an excuse HELPER
+# rather than into the assert. Counting only the assert read that as 0 and passed.
+HELPEX="$WORK/helper_exempt"
+rm -rf "$HELPEX"
+cp -r "$BASE" "$HELPEX"
+sed 's|if k == NodeKind.Call { return node_left(n) }|if k == NodeKind.Call { return node_left(n) }\n    if k == NodeKind.TryExpr { return -1 }|' \
+  "$BASE/src/typecheck.bl" > "$HELPEX/src/typecheck.bl"
+if RATCHET_SRC_DIR="$HELPEX" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > /dev/null 2>&1; then
+  echo "FAIL stamp-excuse-helper-counted: a kind exemption added to an excuse helper must raise the row"
+  fail=1
+else
+  echo "PASS stamp-excuse-helper-counted: an exemption in an excuse helper raises the row"
+fi
+
 # A root path with a space must error loudly, not silently undercount (cnt()
 # passes its file-list argument to rg unquoted).
 SPACEY="$WORK/spa ced"
@@ -142,7 +179,9 @@ chmod +x "$GITWORK/scripts/ratchet.sh"
 echo 'let a = CT_INT' > "$GITWORK/src/codegen.bl"
 : > "$GITWORK/src/codegen_expr.bl"
 : > "$GITWORK/src/mono.bl"
-: > "$GITWORK/src/typecheck.bl"
+# ratchet requires the tree it gates to carry the total-stamp assert, so even this
+# throwaway repo names it; the rows under test here all live in codegen.bl.
+printf '%s\n' 'fn tc_stamp_assert(order: List[Int]) {' 'diag_ice_at("NodeCarriesNoType", X, "no type", n)' '}' > "$GITWORK/src/typecheck.bl"
 : > "$GITWORK/Taskfile.yml"
 (
   cd "$GITWORK" || exit 1

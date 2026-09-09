@@ -59,6 +59,38 @@ check_root() {
   esac
 }
 
+# First line of the function that raises the total-stamp hole, or empty when this
+# root has no such function. Keyed on the diagnostic rather than the function name
+# so a rename cannot silently move the count.
+stamp_anchor_line() {
+  awk '/^(pub )?fn /{s=NR} /NodeCarriesNoType/{print s; exit}' "$1" 2>/dev/null
+}
+
+# The functions the total-stamp assert consults to decide it may SKIP a node. Every excuse the
+# pass has lives in one of these, so this list is the surface a kind exemption can be written
+# on. Adding an excuse elsewhere means adding it here too, which is the point: the row below
+# counts kind references across exactly these, and an unlisted excuse function is an
+# unmeasured one.
+STAMP_EXCUSE_FNS="tc_stamp_assert tc_stamp_name_child tc_stamp_is_cascade tc_stamp_walk"
+
+# NodeKind references inside one named function, or 0 when the file has no such function.
+fn_kind_refs() {
+  awk -v want="$2" '
+    /^(pub )?fn /{ inside = ($0 ~ ("fn " want "\\(")) }
+    inside { print }
+  ' "$1" 2>/dev/null | rg -o '\bNodeKind\.[A-Za-z]+\b' | wc -l | tr -d ' '
+}
+
+# Like check_root, this must run OUTSIDE any $(...). The row it guards is the one
+# a change could zero by deleting the assert it counts inside, so no anchor in the
+# tree being gated is a failure, not a zero.
+check_stamp_anchor() {
+  if [ -z "$(stamp_anchor_line "$1/src/typecheck.bl")" ]; then
+    echo "ratchet: error: no total-stamp assert in '$1/src/typecheck.bl' (no NodeCarriesNoType diagnostic), so stamp_excuse_kind_refs cannot be measured" >&2
+    exit 2
+  fi
+}
+
 # Takes a root dir instead of reading the repo directly, so the same row
 # definitions run against the real tree, a materialized historical ref, or a
 # synthetic test fixture without duplicating the row list three times.
@@ -73,10 +105,22 @@ compute_rows() {
   eg=$(rg -o '^pub let mut (expr_[a-z_0-9]+)' -r '$1' "$root/src/codegen_expr.bl" 2>/dev/null | paste -sd'|')
   if [ -n "$eg" ]; then eg_count=$(cnt "\\b(${eg})\\b" "$cg"); else eg_count=0; fi
 
-  # The exemption list is counted INSIDE its own function, so the row cannot be zeroed by
-  # rewriting the ifs as a match, nor inflated by the same idiom appearing elsewhere.
-  exempt_count=$(awk '/^(pub )?fn tc_kind_unstamped_allowed\(/{f=1} f{print} f&&/^\}/{exit}' $tc 2>/dev/null |
-    rg -o '\bNodeKind\.[A-Za-z]+\b' | wc -l | tr -d ' ')
+  # Every kind reference across the whole excuse surface, not just inside the function that
+  # raises the hole. Counting only the raiser is what let the original four-kind list reach zero
+  # by moving one function over: the assert itself names no kind under any design, so a count
+  # taken there measures an empty set by construction and a reintroduced exemption in a helper
+  # is invisible. This is a ratchet, not a zero target — a kind named to LOCATE a position
+  # (which parent shapes have a name child) is legitimate, so the number is held down rather
+  # than driven out, and any new excuse raises it. A ref or fixture with no anchor contributes
+  # 0; the tree being gated must have one, which check_stamp_anchor enforces.
+  if [ -n "$(stamp_anchor_line "$tc")" ]; then
+    excuse_count=0
+    for f in $STAMP_EXCUSE_FNS; do
+      excuse_count=$((excuse_count + $(fn_kind_refs "$tc" "$f")))
+    done
+  else
+    excuse_count=0
+  fi
 
   cat <<ROWS
 ct_refs $(cnt '\bCT_[A-Z_]+\b' "$cg")
@@ -94,7 +138,7 @@ return_type_unknown $(cnt 'return TYPE_UNKNOWN' "$tc")
 str_keyed_type_facts $(( $(cnt '^let mut [a-z_]+: Map\[Str' "$tc") + $(cnt '^pub let mut [a-z_]+: Map\[Str' "$tc") ))
 downgrade_calls $(cnt '\btc_tid_[a-z_]*_(ct|ct_resolved|struct|struct_head|struct_mono|tuple)\(' "$cg")
 br_ids_in_source $(( $(cnt '\bbr [0-9a-z]{6}\b' "$allbl $tf") + $(cnt '\b(g3sba0|qf1vzx|0kpmac)\b' "$allbl $tf") ))
-stamp_exempt_kinds $exempt_count
+stamp_excuse_kind_refs $excuse_count
 ROWS
 }
 
@@ -117,6 +161,7 @@ materialize_ref() {
 }
 
 check_root "$now_root"
+check_stamp_anchor "$now_root"
 rows_now=$(compute_rows "$now_root")
 
 if [ "$update_flag" = "--update" ]; then
