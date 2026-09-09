@@ -121,7 +121,7 @@ import mono.{node_tid_for_key, mono_node_tid_diff_on, node_tid_diff_record}
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{tc_void_tid, tc_tid_child, tc_tid_child_count, tc_tid_list_elem, tc_tid_handler_effect, tc_tid_subst_mono, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, make_list_type, make_tuple_type, TyKind, is_builtin_fn, is_import_module_name, tc_lookup_node_tid, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_variant_field_tid_by_name, tc_variant_field_is_selfrec_tuple, tc_tid_has_bare_typevar}
+import typecheck.{tc_void_tid, tc_tid_child, tc_tid_child_count, tc_tid_list_elem, tc_tid_handler_effect, tc_tid_subst_mono, tc_tid_kind, tk_name, tc_tid_resolved, tc_tid_iter_elem, make_list_type, make_tuple_type, TyKind, is_builtin_fn, is_import_module_name, tc_lookup_node_tid, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_variant_field_tid_by_name, tc_variant_field_is_selfrec_tuple, tc_tid_has_bare_typevar}
 import lowering.{tc_top_level_let_tid, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_set_elem_tid, ctype_probe_at, closure_sig_from_tid, enum_instance_c_from_tid, struct_instance_c_from_tid, c_type_from_tid, tc_channel_elem_ct, tc_channel_elem_struct, tc_tid_struct_mono_name, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_tuple_sname, tc_tid_to_c_tag}
 
 fn strip_outer_parens(s: Str) -> Str {
@@ -4092,22 +4092,17 @@ fn let_binding_tid(node: Int, type_ann: Int, val_node: Int) -> Int {
     -1
 }
 
-// The C typedef of a unit-only enum local, spelled from the tid — "" when the tid
-// cannot improve on what the flat path already prints.
+// The C typedef of a nominal enum local, spelled from the tid — "" when the binding is not
+// one, which is how a let binding decides whether its `enum_type` NAME channel is telling the
+// truth about the shape.
 //
-// `infer_enum_from_node` recognises an enum by looking at the RHS *syntax* (a variant
-// construction, a field read), so it goes blank the moment the value arrives through a plain
-// call or an anonymous C temporary — and the declaration then falls to `c_type_str(CT_ENUM)`,
-// which is `int64_t`. The tid knows the type in every one of those positions.
-//
-// One decline, load-bearing: a TRANSPARENT NEWTYPE spells `int64_t`, which is what
-// the flat path already prints, so declining on equality leaves that decision exactly where it is.
+// One decline, load-bearing: a TRANSPARENT NEWTYPE spells `int64_t`, not a `blink_<Enum>`
+// typedef, and declining on it is what keeps `let e = Errno(5)` declared as a bare int64_t and
+// out of var_enums, matching its construction and its identity match-binding.
 //
 // A generic enum INSTANCE also answers here — c_type_from_tid spells `blink_Tree_0Int` for an
-// instance, not just a bare enum, mirroring the per-instantiation spelling the `enum_mono` arm
-// above uses. That does not change which arm wins: this helper is only consulted from the arm
-// ORDERED AFTER the enum/enum_mono one, and that arm leads with enum_instance_c_from_tid, which
-// is the same answer reached one branch earlier.
+// instance, not just a bare enum. The declaration arm asks enum_instance_c_from_tid first for
+// exactly that reason, so the two agree on which typedef an instance names.
 fn enum_c_from_tid(tid: Int) -> Str {
     if tid < 0 { return "" }
     if tc_tid_kind(tc_tid_resolved(tid)) != TyKind.Enum { return "" }
@@ -4117,9 +4112,8 @@ fn enum_c_from_tid(tid: Int) -> Str {
 }
 
 // The shape that needs enum_instance_c_from_tid (typecheck.bl) here is an
-// annotation-only instance whose RHS is a payload-LESS variant: `let t: ITree[Int] = INone`.
-// enum_mono is derived from the RHS value's ScopeVar, and a bare variant has no mono stem to read
-// there, so the args live only on the annotation's tid.
+// annotation-only instance whose RHS is a payload-LESS variant: `let t: ITree[Int] = INone`,
+// where the args live only on the annotation's tid.
 
 // The pointee of a `Ptr` local, spelled from the tid — "" when the tid cannot
 // improve on what the flat path already prints.
@@ -4137,48 +4131,32 @@ fn ptr_c_from_tid(tid: Int) -> Str {
     c
 }
 
-// The vtable type of a handler binding, spelled from the tid — "" when the tid does not
-// name a handler, or names an effect that resolves to no vtable.
+// A DECLARATION is a STORAGE position, and `void x;` is illegal C even though `()` is an
+// ordinary inhabited, encodable type -- so a Void binding stores a constant int64_t
+// placeholder and its RHS is discarded for effect, mirroring the lowering c_field_type_str
+// already applies to a Void struct field / Result leaf. A Never binding joins it: a value that
+// cannot exist has no C spelling at all, and the declaration is unreachable by construction.
 //
-// There is no equality decline here, unlike ptr_c_from_tid's `void*` and enum_c_from_tid's
-// `int64_t`, and the difference is what this helper is for: those two guard against a tid that
-// knows no more than the flat fields, but the flat path cannot spell a vtable type AT ALL unless it
-// already took the CT_HANDLER arm — and that arm is ordered before this one, so a binding reaching
-// here has no flat answer to protect. Every non-"" answer is a binding that would otherwise have
-// been declared from an ERASED CT (`int64_t`, from a container element).
-fn handler_c_from_tid(tid: Int) -> Str {
-    if tid < 0 { return "" }
-    let r = tc_tid_resolved(tid)
-    if tc_tid_kind(r) != TyKind.Handler { return "" }
-    c_type_from_tid(r)
+// ONE signal, where the flat pair needed two. The second signal used to be codegen's own CT
+// disagreeing with the tid, because `.pop()` was typecheck-side special-cased to Void while
+// codegen computed the Option it really returns. typecheck signs `.pop()` as `Option[T]` now
+// (src/typecheck.bl, the List method table), so the tid answers Void only where the value
+// genuinely is Void. An ERASED carrier slot is not swallowed by this: it resolves to its true
+// carrier tag (`Option_int`), never to Void, so it still falls through to the loud failure in
+// the declaration chain instead of becoming a well-typed int64_t.
+fn let_binding_is_valueless(tid: Int) -> Int {
+    let k = tc_tid_kind(tc_tid_resolved(tid))
+    if k == TyKind.Void { return 1 }
+    if k == TyKind.Never { return 1 }
+    0
 }
 
-// The CT of a sized-integer local, read from the tid — `-1` when the tid does not name
-// one of the seven.
-//
-// This one returns a CT and not a C string, and that difference is the whole point. The other two
-// helpers here correct a DECLARATION; a sized integer's type governs three more things that read
-// the recorded CT instead of the emitted spelling:
-//
-//   - whether `/`, `<` and `>` are the signed or the unsigned operator;
-//   - whether `+` emits the overflow TRAP the spec promises for sized ints
-//     ("Arithmetic on sized ints traps on overflow") or plain 64-bit arithmetic;
-//   - whether `.wrapping_add` and the other modular escape hatches resolve at all.
-//
-// So the answer is fed back into `val_type` before `set_var`, upstream of every one of them,
-// rather than into the declaration chain below.
-fn sized_int_ct_from_tid(tid: Int) -> Int {
-    if tid < 0 { return -1 }
-    match tc_tid_kind(tc_tid_resolved(tid)) {
-        TyKind.I8 => CT_I8
-        TyKind.I16 => CT_I16
-        TyKind.I32 => CT_I32
-        TyKind.U8 => CT_U8
-        TyKind.U16 => CT_U16
-        TyKind.U32 => CT_U32
-        TyKind.U64 => CT_U64
-        _ => -1
-    }
+// A declining speller means typecheck stamped no usable type for this binding.
+fn let_binding_unspellable(name: Str, node: Int) ! Diag.Report {
+    diag_ice_at("LetBindingTypeUnspellable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "let binding '{name}' has no C type at codegen",
+        node,
+        "this is a compiler bug — please report it with the smallest reproducing program")
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -4199,9 +4177,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     // mis-select e.g. a Set()/Map() kops table).
     let saved_expect_arg_ann = cg_expect_arg_ann
     cg_expect_arg_ann = -1
-    let mut ann_ct = 0
     if type_ann != -1 {
-        ann_ct = type_from_name(node_name(type_ann))
         cg_let_target_ann = type_ann
         // A body-local carrier over struct instances (`let r: Result[RBox[Int],
         // RBox[Str]] = Ok(..)`) is named in no signature, so the pre-fn pass never
@@ -4227,65 +4203,21 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     cg_let_target_ann = saved_let_target_ann
     cg_expect_arg_ann = saved_expect_arg_ann
     let val_str = expr_result_str
-    let mut val_type = expr_result_type
-    if val_type == CT_RESULT {
-        enum_type = ""
-    }
-    // A generic-enum construction (`let t = Branch(…)` → Tree[Int]) mono's the RHS to
-    // blink_Tree_Int and tracks that mono STEM on the value string. enum_type stays the
-    // BARE base (`Tree`) so var_enums / match variant lookups keep working; enum_mono is
-    // the mono name (or "") used only for the LHS C declaration type, so the var is
-    // declared blink_Tree_Int instead of the erased bare blink_Tree.
-    let mut enum_mono = ""
-    if enum_type != "" && val_type == CT_STRUCT {
-        let mono_s = get_var_struct(val_str)
-        if mono_s != "" && strip_module_qualifier(mono_s) != strip_module_qualifier(enum_type) && is_mono_struct_instance(mono_s) != 0 {
-            enum_mono = mono_s
-        }
-    }
-    // A transparent newtype lowers to a bare int64_t even as a
-    // standalone binding — `let e = Errno(5)` is `int64_t e = 5`, not the boxed
-    // struct. Clear the inferred enum_type so the var is declared as Int,
-    // matching the construction (CT_INT) and the identity match-binding.
-    if enum_type != "" && is_transparent_newtype(enum_type) != 0 {
-        enum_type = ""
-        val_type = CT_INT
-    }
-    if val_type == CT_INT && (ann_ct == CT_I8 || ann_ct == CT_I16 || ann_ct == CT_I32 || ann_ct == CT_U8 || ann_ct == CT_U16 || ann_ct == CT_U32 || ann_ct == CT_U64) {
-        val_type = ann_ct
-    }
-    // The other direction of the same rule — the ANNOTATION governs an integer local's
-    // declaration — which had nothing to reach until `deref()` started answering the pointee's
-    // own CT. `let n: Int = p.deref()` on a `Ptr[U8]` otherwise declares `n` as
-    // `uint8_t` under an `Int` annotation, taking the local's arithmetic (signedness, the
-    // overflow trap, `.wrapping_*`) with it. typecheck records that local at the ANNOTATION's
-    // Int, so the tid and the emitted C would disagree without this fix.
-    //
-    // typecheck signs `.deref()` as the pointee T, so `let n: Int = p.deref()` on a `Ptr[U8]`
-    // is already a TypeError there (like the explicit `let u: U8 = 200` then `let n: Int = u`,
-    // since sized ints are nominally distinct from Int). This rule handles only the honest
-    // widening path — `let n: Int = p.deref().to_int()` — where the annotation legitimately
-    // governs an Int local carrying a value that arrived through a sized CT.
-    if ann_ct == CT_INT && (val_type == CT_I8 || val_type == CT_I16 || val_type == CT_I32 || val_type == CT_U8 || val_type == CT_U16 || val_type == CT_U32 || val_type == CT_U64) {
-        val_type = CT_INT
-    }
-    // The tid twin of the annotation rule directly above, for the case that rule
-    // cannot reach: a binding with NO annotation. `expr_result_type` is CT_INT whenever the value
-    // arrives through an anonymous carrier temp (`l.get(0).unwrap()`, `m.get(k).unwrap()`,
-    // `r.unwrap()`), because those carriers are spelled with the Int member and nothing stamps the
-    // sized type back onto the temp. The local then loses signedness, the overflow trap and its
-    // modular methods all at once — `255 + 1` on an erased U8 answers 256 where the annotated
-    // form panics, which is a promise of the spec silently withdrawn.
-    //
-    // Substituted through the enclosing monomorphisation first, like every other tid consumer in
-    // codegen: a `U64` bound to a typevar `K` inside a mono'd generic fn would otherwise have an
-    // unsubstituted read see `K` and decline exactly there.
+    // The binding's authoritative type, asked for ONCE and projected by every reader below.
+    // Resolved first, since a metavar pinned by the initializer stores its solution
+    // indirectly and substitution reads the slot raw; substituted through the enclosing
+    // monomorphisation, so a typevar in a generic body reads as its instantiated arg.
     let binding_tid = let_binding_tid(node, type_ann, val_node)
-    if val_type == CT_INT && type_ann == -1 {
-        let sized_ct = sized_int_ct_from_tid(tc_tid_subst_mono(binding_tid, cg_mono_tparams_sl, cg_mono_arg_tids))
-        if sized_ct != -1 {
-            val_type = sized_ct
-        }
+    let bind_tid = tc_tid_subst_mono(tc_tid_resolved(binding_tid), cg_mono_tparams_sl, cg_mono_arg_tids)
+    let head = tc_tid_kind(tc_tid_resolved(bind_tid))
+    // `enum_type` is a NAME channel only — var_enums, and the match-variant lookup that reads
+    // it. infer_enum_from_node recognises an enum from the RHS *syntax*, so it names one for
+    // `Ok(..)` and for a transparent newtype's constructor alike; the tid decides whether the
+    // binding really is a nominal enum with a typedef of its own. enum_c_from_tid answers only
+    // for TyKind.Enum and declines on the bare `int64_t` a transparent newtype lowers to, which
+    // is what keeps a newtype binding out of var_enums and off the enum declaration arm.
+    if enum_type != "" && enum_c_from_tid(bind_tid) == "" {
+        enum_type = ""
     }
     let mut name = node_name(node)
     if name == "_destructure" {
@@ -4296,14 +4228,12 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     }
     let is_mut = node_is_mut(node)
     // Registered from the tid alone, the way a parameter position is: every reader below
-    // projects the shape it needs out of the tid. Resolved first, since a metavar pinned by
-    // the initializer stores its solution indirectly and substitution reads the slot raw.
-    let bind_tid = tc_tid_subst_mono(tc_tid_resolved(binding_tid), cg_mono_tparams_sl, cg_mono_arg_tids)
+    // projects the shape it needs out of the tid.
     set_var_tid(name, bind_tid, is_mut)
     if enum_type != "" {
         var_enums.push(VarEnumEntry { name: name, enum_type: enum_type })
     }
-    if val_type == CT_PTR && type_ann != -1 {
+    if head == TyKind.Ptr && type_ann != -1 {
         let pelems_ann = node_elements(type_ann)
         if pelems_ann != -1 && sublist_length(pelems_ann) > 0 {
             let inner_ann_name = node_name(sublist_get(pelems_ann, 0))
@@ -4314,11 +4244,11 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             }
         }
     }
-    if val_type == CT_PTR && ffi_offset_pending_struct != "" {
+    if head == TyKind.Ptr && ffi_offset_pending_struct != "" {
         set_var_ffi_ptr_extra(name, ffi_offset_pending_struct, 1)
     }
     ffi_alloc_n_pending = 0
-    if val_type == CT_HANDLER {
+    if head == TyKind.Handler {
         let mut h_vtt = cg_handler_vtable_type
         let mut h_vtf = cg_handler_vtable_field
         let mut h_is_ue = cg_handler_is_user_effect
@@ -4357,7 +4287,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         cg_handler_vtable_field = ""
         cg_handler_is_user_effect = 0
     }
-    if val_type == CT_CLOSURE {
+    if head == TyKind.Fn {
         // Ordered the same way as the handler arm above: `expr_closure_sig` owns
         // every binding whose RHS or annotation spelled a `fn(..) -> ..` node, and the tid only
         // fills in where both left it blank — a closure read out of a container
@@ -4377,11 +4307,11 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     // The Option carrier typedef and every mono instance its inner names, asked for from the
     // tid alone -- the same registration a parameter position runs. A Result carrier is named
     // by its producer's signature instead, so this half registers nothing for it.
-    if val_type == CT_OPTION {
+    if head == TyKind.Option {
         register_param_instances(bind_tid)
         set_var_option_erased(name, expr_option_erased)
     }
-    if val_type == CT_HANDLE {
+    if head == TyKind.Handle {
         let inner = get_var_handle_inner(val_str)
         set_var_handle(name, if inner >= 0 { inner } else { CT_INT })
     }
@@ -4418,7 +4348,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             set_var_struct(name, expr_struct)
         }
     }
-    if val_type == CT_LIST && type_ann != -1 {
+    if head == TyKind.List && type_ann != -1 {
         let ann_name = node_name(type_ann)
         if ann_name == "List" {
             let elems_sl = node_elements(type_ann)
@@ -4446,7 +4376,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             }
         }
     }
-    if val_type == CT_MAP && type_ann != -1 {
+    if head == TyKind.Map && type_ann != -1 {
         let ann_name = node_name(type_ann)
         if ann_name == "Map" {
             let elems_sl = node_elements(type_ann)
@@ -4467,7 +4397,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             }
         }
     }
-    if val_type == CT_SET && type_ann != -1 {
+    if head == TyKind.Set && type_ann != -1 {
         let ann_name = node_name(type_ann)
         if ann_name == "Set" {
             let elems_sl = node_elements(type_ann)
@@ -4484,7 +4414,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                 }
             }
         }
-    } else if val_type == CT_SET {
+    } else if head == TyKind.Set {
         // No annotation: carry the RHS set's element type across. Prefer copying
         // from the source var (`let alias = some_set`); fall back to a freshly
         // set expr_list_elem_type (union results). Always clear the global so a
@@ -4512,10 +4442,10 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         expr_list_elem_type = -1
         expr_list_elem_struct = ""
     }
-    if val_type == CT_MAP && expr_map_key_type >= 0 {
+    if head == TyKind.Map && expr_map_key_type >= 0 {
         apply_map_binding_meta(name)
     }
-    if val_type == CT_MAP {
+    if head == TyKind.Map {
         let val_orig_name = if node_kind(val_node) == NodeKind.Ident { node_name(val_node) } else { "" }
         carry_map_binding_meta(val_str, val_orig_name, name, type_ann)
     }
@@ -4523,9 +4453,9 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     // looks identical whether the RHS carried no element (expr_elem=-1) or carried a nameless
     // one (expr_elem=23, CT_STRUCT, with no sname); only tracing the three together tells them apart.
     if dbg_channel_on("listelem") != 0 {
-        dbg_trace("listelem", "letladder var={name} val_type={val_type} ann={type_ann} expr_elem={expr_list_elem_type} sv_elem={get_list_elem_type(name)}")
+        dbg_trace("listelem", "letladder var={name} head={tk_name(head)} ann={type_ann} expr_elem={expr_list_elem_type} sv_elem={get_list_elem_type(name)}")
     }
-    if val_type == CT_LIST && expr_list_elem_type >= 0 && type_ann == -1 {
+    if head == TyKind.List && expr_list_elem_type >= 0 && type_ann == -1 {
         set_list_elem_type(name, expr_list_elem_type)
         // A compound element (Option/Result/Map) recovered onto val_str by
         // recover_list_elem_from_tid (a field-access temp) carries its deep tp_id —
@@ -4567,7 +4497,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         if entry_elem_ct == CT_SET || entry_elem_ct == CT_LIST {
             stamp_list_elem_from_tid(val_node, name)
         }
-    } else if val_type == CT_LIST && expr_list_elem_type >= 0 {
+    } else if head == TyKind.List && expr_list_elem_type >= 0 {
         expr_list_elem_type = -1
         expr_list_elem_struct = ""
     }
@@ -4582,7 +4512,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     // already does for a set element. Guarded on the element being unspellable, so this
     // fires only where the code above left nothing usable; recover_list_elem_from_tid itself
     // declines when the tid has no nameable element either.
-    if val_type == CT_LIST && type_ann == -1 && list_elem_unspellable(name) {
+    if head == TyKind.List && type_ann == -1 && list_elem_unspellable(name) {
         recover_list_elem_from_tid(val_node, name)
         expr_list_elem_type = -1
         expr_list_elem_struct = ""
@@ -4590,13 +4520,13 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     // Last, because it has to win over the ladder above: a STRUCT key list's element is
     // pointer-boxed, and the ladder above can leave it named but scalar-tagged. See
     // map_keys_boxed_elem, which declines every inline key including a payload-less enum.
-    if val_type == CT_LIST {
+    if head == TyKind.List {
         let keys_elem = map_keys_boxed_elem(val_node)
         if keys_elem != "" {
             set_list_elem_named_boxed(name, keys_elem)
         }
     }
-    if val_type == CT_ITERATOR {
+    if head == TyKind.Iterator {
         set_var_alias(name, val_str)
         let iter_inner = get_var_iterator_inner(val_str)
         let iter_next = get_var_iter_next_fn(val_str)
@@ -4619,44 +4549,18 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     // map that comes out is the enumerated list of what the authority flip would change.
     let mut decl_c = ""
     let mut decl_branch = ""
-    // A genuine Void RHS (`let x = nothing()`, a Void-typed field
-    // read, a generic fn returning its Void type argument) must not decay to
-    // `const void x = ...;` -- illegal C, since `()` is an
-    // ordinary inhabited, encodable type, not a construct ban like `while`/
-    // `loop`. Checked FIRST, ahead of every
-    // other branch below (including struct_type != "", which a pre-existing
-    // sname-tagging quirk in tp_from_ann/get_struct_field_stype can leave set
-    // to the literal string "Void" for a genuinely Void field -- see
-    // tp_from_ann's `ct == CT_VOID -> sv_tp(CT_VOID, -1, -1, name)` catch-all,
-    // which stamps sname=name even when name IS "Void", not just when it's an
-    // unrecognized/erased name; that sname then rides get_var_struct into this
-    // function's own `struct_type` local via the no-annotation fallback.
+    // A genuine Void RHS (`let x = nothing()`, a Void-typed field read, a generic fn returning
+    // its Void type argument) must not decay to `const void x = ...;` -- illegal C, since `()`
+    // is an ordinary inhabited, encodable type, not a construct ban like `while`/`loop`.
     //
-    // TWO independent signals must both agree, not one:
-    //  - tc_tid_to_c_tag(tid) == "Void" recovers the literal name from the RHS
-    //    node's typecheck-side tid. This alone is not enough: `.pop()`/
-    //    `.clear()` on a List are typecheck-side special-cased to TYPE_VOID
-    //    even though codegen's OWN method-call handler computes their
-    //    real type as CT_OPTION (the Option[T] pop() actually returns) --
-    //    typecheck and codegen disagree about this one node's type, and
-    //    trusting the tid alone would silently discard a real `.pop()` result.
-    //  - val_type == CT_VOID is codegen's OWN computed type for this RHS
-    //    (expr_result_type), already correct for `.pop()` (CT_OPTION, so this
-    //    guard alone already excludes it) but NOT enough on its own either:
-    //    an ERASED carrier slot also collapses to CT_VOID at codegen
-    //    (type_from_name collapses "" and every unknown name onto it too), so
-    //    a CT-only check would silently swallow an erased carrier into a
-    //    well-typed int64_t and disarm the loud `void x;` tripwire R9 depends
-    //    on -- an erased slot's tid still resolves to its true carrier tag
-    //    (e.g. "Option_int"), never to "Void", so requiring the tid to ALSO
-    //    say "Void" keeps that case falling through to the loud failure below.
-    //
-    // Only where BOTH agree is the RHS discarded for effect (its C type is
-    // genuinely `void` for a Void-returning call -- there is no value to read
-    // it into) and the local a constant int64_t placeholder, mirroring the
-    // field lowering c_field_type_str already applies to a Void struct field
-    // / Result leaf.
-    if rhs_is_genuine_void(val_type, val_node) != 0 {
+    // Checked FIRST, ahead of every other branch below (including struct_type != "", which a
+    // pre-existing sname-tagging quirk in tp_from_ann/get_struct_field_stype can leave set to
+    // the literal string "Void" for a genuinely Void field -- see tp_from_ann's `ct == CT_VOID
+    // -> sv_tp(CT_VOID, -1, -1, name)` catch-all, which stamps sname=name even when name IS
+    // "Void", not just when it's an unrecognized/erased name; that sname then rides
+    // get_var_struct into this function's own `struct_type` local via the no-annotation
+    // fallback).
+    if let_binding_is_valueless(bind_tid) != 0 {
         // A Void-returning builtin (assert/debug_assert/skip) already emitted
         // its own full C statement(s) as a side effect inside emit_expr and
         // signals "nothing left to emit" via val_str=="", mirroring
@@ -4676,7 +4580,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         } else {
             emit_line("const int64_t {cname} = 0;")
         }
-    } else if val_type == CT_OPTION {
+    } else if head == TyKind.Option {
         let opt_inner = get_var_option_inner(name)
         let opt_inner_s = get_var_option_inner_tag(name)
         let opt_c_inner = opt_inner
@@ -4728,7 +4632,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         } else {
             emit_line("const {opt_c} {cname} = {val_str};")
         }
-    } else if val_type == CT_RESULT {
+    } else if head == TyKind.Result {
         let rok = get_var_result_ok(name)
         let rerr = get_var_result_err(name)
         let rok_s = get_var_result_ok_tag(name)
@@ -4763,43 +4667,32 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             emit_line("const {res_c} {cname} = {val_str};")
         }
     } else if enum_type != "" {
-        // Declare with the mono instance C type (blink_Tree_Int) when the RHS was a
-        // generic-enum construction; else the bare enum type.
-        //
-        // The tid LEADS over both, because the flat pair answers the bare base for an
-        // annotation-only instance — `let t: ITree[Int] = INone` emitted `const blink_ITree t`,
-        // a typedef that is never registered, while `blink_ITree_0Int` sat emitted a few hundred
-        // lines above. The two agree wherever enum_mono is non-empty, so leading with the tid
-        // changes only the rows where the flat side had nothing; enum_instance_c_from_tid is
-        // gated on the tid carrying args so it cannot reach any other enum binding.
+        // The tid spells the declaration; `enum_type` only says a nominal enum is what this
+        // binding IS. enum_instance_c_from_tid answers the per-instantiation typedef
+        // (blink_Tree_0Int) whenever the tid carries args, which is the shape the flat sname
+        // could not reach at all: `let t: ITree[Int] = INone` emitted `const blink_ITree t`, a
+        // typedef that is never registered, while `blink_ITree_0Int` sat emitted a few hundred
+        // lines above. A bare enum falls to enum_c_from_tid; the gate at the top of this
+        // function proved that non-empty for `bind_tid`, but this is the declaration's own tid.
         let tid_mono = enum_instance_c_from_tid(decl_tid)
-        let enum_tid_bare = enum_c_from_tid(decl_tid)
-        let enum_decl_c = if tid_mono != "" {
-            tid_mono
-        } else if enum_mono != "" {
-            c_type_c_name(enum_mono)
-        } else if enum_tid_bare != "" {
-            // Reader migration: a bare (non-mono) enum binding leads with the tid instead of
-            // the flat sname. enum_c_from_tid answers the same nominal typedef the flat sname
-            // did (blink_<Enum>), so this is byte-identical wherever the flat path already
-            // named the enum — it only removes a flat-sname reader. The flat name survives as
-            // the fallback for any binding whose tid declined.
-            enum_tid_bare
-        } else {
-            c_type_c_name(enum_type)
+        let enum_decl_c = if tid_mono != "" { tid_mono } else { enum_c_from_tid(decl_tid) }
+        if enum_decl_c == "" {
+            let_binding_unspellable(name, node)
+            ffi_offset_pending_struct = ""
+            return
         }
         decl_c = enum_decl_c
-        // Four labels now, so the census still says which authority governed: a row that
-        // moves from `enum` to `enum_mono_tid` is a bare base corrected, one that moves from
-        // `enum_mono` is the tid agreeing with a stem the flat path had already found, and
-        // `enum_bare_tid` is the tid taking over a bare enum the flat sname used to spell.
-        decl_branch = if tid_mono != "" { "enum_mono_tid" } else if enum_mono != "" { "enum_mono" } else if enum_tid_bare != "" { "enum_bare_tid" } else { "enum" }
+        decl_branch = if tid_mono != "" { "enum_mono_tid" } else { "enum_bare_tid" }
         if is_mut != 0 {
             emit_line("{enum_decl_c} {cname} = {val_str};")
         } else {
             emit_line("const {enum_decl_c} {cname} = {val_str};")
         }
-    } else if val_type == CT_HANDLER {
+    } else if head == TyKind.Handler {
+        // The CAST is not optional and not cosmetic: a handler read out of a container
+        // (`hs.get(0).unwrap()`) is stored through an `(int64_t)(intptr_t)` slot, so the
+        // initializer really is an integer expression at this point and the declaration is
+        // where it comes back to a vtable pointer.
         let h_vtt = get_var_handler_vtable_type(name)
         decl_branch = "handler"
         if h_vtt != "" {
@@ -4807,7 +4700,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             emit_line("{h_vtt}* {cname} = ({h_vtt}*){val_str};")
         } else {
             decl_c = "void*"
-            emit_line("void* {cname} = {val_str};")
+            emit_line("void* {cname} = (void*){val_str};")
         }
     } else if struct_type != "" {
         // Same lead, same gate as the enum arm above: c_type_c_name answers the bare generic
@@ -4826,7 +4719,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         } else {
             emit_line("const {struct_decl_c} {cname} = {val_str};")
         }
-    } else if val_type == CT_PTR && type_ann != -1 {
+    } else if head == TyKind.Ptr && type_ann != -1 {
         // The tid LEADS the annotation here. Both channels describe the same binding, so
         // they agree wherever the annotation's own mapping has an arm — but `ptr_inner_c_type`
         // is a fixed name table whose fallback is `_ => "void"`, so a pointee it does not list (`Bool` is one)
@@ -4845,13 +4738,14 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         }
         decl_c = ptr_c_type
         emit_line("{ptr_c_type} {cname} = {val_str};")
-    } else if val_type == CT_PTR && ffi_offset_pending_struct != "" {
+    } else if head == TyKind.Ptr && ffi_offset_pending_struct != "" {
         decl_c = "{c_type_c_name(ffi_offset_pending_struct)}*"
         decl_branch = "ptr_ffi"
         emit_line("{c_type_c_name(ffi_offset_pending_struct)}* {cname} = {val_str};")
     } else if enum_c_from_tid(decl_tid) != "" {
         // Deliberately placed AFTER every branch that already spells an enum — the
-        // `enum`/`enum_mono` arm above owns the bindings whose flat `enum_type` survived, and
+        // `enum_bare_tid`/`enum_mono_tid` arm above owns the bindings whose `enum_type` name
+        // channel survived, and
         // this arm only catches the ones where it went blank. Ordering it earlier would take
         // those bindings away from arms already wired correctly, which is a regression no
         // failing row would reveal.
@@ -4863,7 +4757,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         } else {
             emit_line("const {enum_c} {cname} = {val_str};")
         }
-    } else if val_type == CT_PTR && ptr_c_from_tid(decl_tid) != "" {
+    } else if head == TyKind.Ptr && ptr_c_from_tid(decl_tid) != "" {
         // The first site where the tid GOVERNS rather than being measured.
         // The two branches above read a pointee out of the binding's own annotation and out of
         // `ffi_offset_pending_struct`; neither can see the pointee of an UNANNOTATED binding
@@ -4875,45 +4769,30 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         decl_c = ptr_c
         decl_branch = "ptr_tid"
         emit_line("{ptr_c} {cname} = {val_str};")
-    } else if handler_c_from_tid(decl_tid) != "" {
-        // The CT_HANDLER arm far above owns every binding whose flat `val_type` survived, and
-        // this arm only catches the ones where it was ERASED — a handler read out of a container
-        // (`hs.get(0).unwrap()`, `m.get(k).unwrap()`) arrives as CT_INT, skips that arm, and
-        // fell through to the `flat` else below, which
-        // printed `int64_t`. The `with` that then used the binding failed in the C compiler
-        // ("assignment to 'blink_io_vtable *' from 'int64_t' … makes pointer from integer without a
-        // cast") with no Blink span to report it against.
-        //
-        // The CAST is not optional and not cosmetic: a container stores the handler pointer through
-        // an `(int64_t)(intptr_t)` slot, so the initializer really is an integer expression at this
-        // point and the declaration is where it comes back to a vtable pointer. This mirrors the
-        // CT_HANDLER arm, which casts for the same reason.
-        let h_tid_c = handler_c_from_tid(decl_tid)
-        decl_c = h_tid_c
-        decl_branch = "handler_tid"
-        emit_line("{h_tid_c} {cname} = ({h_tid_c}){val_str};")
     } else {
-        // The last branch of the chain, and the most-reached declaration site in the compiler. The
-        // tid LEADS here and the flat spelling survives only where it declines.
-        //
-        // A declaration is a STORAGE position, so a genuine `void` falls through to the flat
-        // spelling: c_type_from_tid answers Void deliberately and leaves the position rule to its
-        // caller.
-        let flat = c_type_str(val_type)
-        let spelled = c_type_from_tid(decl_tid)
-        let ts = if spelled != "" && spelled != "void" { spelled } else { flat }
-        // `decl_c` is the probe's `emitted` argument and is deliberately the FLAT CANDIDATE rather
-        // than the line about to be printed. Feeding the chosen spelling back in would compare the
-        // tid against itself and report agreement unconditionally, which destroys the one number
-        // that says whether this branch still needs the flat arm.
-        decl_c = flat
+        // The last branch of the chain, and the most-reached declaration site in the compiler.
+        // The tid is the ONLY authority: every kind the flat CT could spell the tid spells too
+        // (the whole test corpus and the compiler's own build agree in every reached cell), and
+        // the kinds it declines for -- a typevar that survived monomorphisation, an erased slot
+        // -- had no honest flat answer either. The flat spelling for those was `void`, which is
+        // not a legal declaration, so it was never a fallback worth keeping: it turned a
+        // stamping bug in typecheck into a C-compiler error with no Blink span on it.
+        let ts = c_type_from_tid(decl_tid)
+        if ts == "" || ts == "void" {
+            // diag_ice_at records without aborting, so bail rather than printing an empty
+            // type. The reset below is the one the skipped tail would have done.
+            let_binding_unspellable(name, node)
+            ffi_offset_pending_struct = ""
+            return
+        }
+        decl_c = ts
         decl_branch = "flat"
-        // A leading `const` on a pointer spelling (e.g. an @ffi.opaque handle
-        // lowered to `FILE*`) qualifies the POINTEE, not the binding, so the
-        // value no longer matches a plain `T*` parameter. Every pointer-lowered
-        // CT_ type is already exempted for this reason; a `*`-tailed spelling
-        // that reaches this flat arm gets the same treatment.
-        if is_mut != 0 || ts.ends_with("*") || val_type == CT_STRING || val_type == CT_LIST || val_type == CT_MAP || val_type == CT_SET || val_type == CT_BYTES || val_type == CT_CLOSURE || val_type == CT_ITERATOR || val_type == CT_HANDLE || val_type == CT_CHANNEL || val_type == CT_PTR || val_type == CT_STRINGBUILDER || val_type == CT_FFI_SCOPE {
+        // A leading `const` on a pointer spelling (e.g. an @ffi.opaque handle lowered to
+        // `FILE*`) qualifies the POINTEE, not the binding, so the value no longer matches a
+        // plain `T*` parameter. Keyed on the spelling that is about to be PRINTED, which
+        // subsumes the pointer-lowered kinds one by one: every one of them spells a
+        // `*`-tailed type.
+        if is_mut != 0 || ts.ends_with("*") {
             emit_line("{ts} {cname} = {val_str};")
         } else {
             emit_line("const {ts} {cname} = {val_str};")
@@ -4933,7 +4812,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         // `void* x_cell = (void*)blink_alloc(sizeof(void));` — a zero-sized alloc followed by an
         // illegal void-lvalue assignment. capture_cell_c_type is shared with the rehydration inside
         // the closure body, which declares the same cell, and carries the Void-position rule.
-        let cell_type = capture_cell_c_type(get_var_ty(name), get_var_tp(name), if rhs_is_genuine_void(val_type, val_node) != 0 { "Void" } else { "" })
+        let cell_type = capture_cell_c_type(get_var_ty(name), get_var_tp(name), if let_binding_is_valueless(bind_tid) != 0 { "Void" } else { "" })
         emit_line("{cell_type}* {cname}_cell = ({cell_type}*)blink_alloc(sizeof({cell_type}));")
         emit_line("*{cname}_cell = {cname};")
     }
