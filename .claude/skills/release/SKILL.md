@@ -113,7 +113,7 @@ Stage all changes and commit with: `Prepare vX.Y.Z release`
 Run `task release -- vX.Y.Z`
 
 This will:
-- Run full CI (`task ci`)
+- Run full CI (`task ci-release`)
 - Cross-compile binaries (`task build-binaries`)
 - Create git tag
 - Push tag
@@ -135,7 +135,7 @@ Run `gh release view vX.Y.Z` and show the user the release URL.
 - [ ] `llms-full.md` method tables match `src/codegen_methods.bl`
 - [ ] `llms-full.md` stdlib docs match `lib/std/*.bl` pub functions
 - [ ] CLAUDE.md [Docs Index] current
-- [ ] `task ci` passes
+- [ ] `task ci-release` passes
 - [ ] Release created on GitHub with binaries
 
 ### Anti-pattern check (reject the draft if any hit)
