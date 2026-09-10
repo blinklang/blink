@@ -1,0 +1,241 @@
+import std.fs
+import std.io
+import typecheck.{tc_type_str, tc_lookup_node_tid, check_types, lookup_named_type, make_metavar, tc_unknown_tid, make_struct_instance_type, make_map_type, make_ptr_type, make_option_type, make_list_type}
+import layout.{layout_of, layout_reset, Position, SlotForm}
+import parser.{nodes}
+import compiler.{compile_to_program}
+import codegen_expr
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.println("FAIL: {label}: got '{got}' want '{want}'")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+// The probe covers every TyKind a user program can name, so each row below reads a tid
+// that real inference produced and not a hand-built pool entry.
+fn probe_src() -> Str {
+    #"@derive(Hash, Eq)
+type Key { id: Int }
+type Point { x: Int, y: Int }
+type Color { Red, Green }
+type Shape { Circle { r: Int }, Square { w: Int, h: Int } }
+type Box[T] { val: T }
+type Errno { Errno(Int) }
+type Port = Int
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str)
+    }
+}
+fn ident[T](x: T) -> T { x }
+fn use_t(t: Template[Point]) -> Int { 1 }
+fn use_h(h: Handle[Int]) -> Int { 1 }
+fn use_cf(c: Option[CFile]) -> Int { 1 }
+fn main() {
+    let i: Int = 7
+    let f: Float = 1.5
+    let b: Bool = true
+    let s: Str = "s"
+    let c: Char = 'c'
+    let a1: I8 = 1
+    let a2: I16 = 1
+    let a3: I32 = 1
+    let a4: U8 = 1
+    let a5: U16 = 1
+    let a6: U32 = 1
+    let a7: U64 = 1
+    let u: Void = ()
+    let l: List[Int] = []
+    let lp: List[Point] = []
+    let o: Option[Int] = None
+    let op: Option[Point] = None
+    let oc: Option[Color] = None
+    let osh: Option[Shape] = None
+    let oe: Option[Errno] = None
+    let ob: Option[Box[Int]] = None
+    let ol: Option[List[Int]] = None
+    let oo: Option[Option[Int]] = None
+    let ot: Option[(Int, Str)] = None
+    let r: Result[Int, Str] = Ok(1)
+    let rss: Result[Str, Str] = Ok("a")
+    let rp: Result[Point, Color] = Ok(Point { x: 1, y: 2 })
+    let rcp: Result[Color, Point] = Ok(Color.Red)
+    let rv: Result[Void, Str] = Ok(())
+    let re: Result[Int, Errno] = Ok(1)
+    let ro: Result[Option[Point], Str] = Ok(None)
+    let m: Map[Str, Int] = Map()
+    let mk: Map[Key, Int] = Map()
+    let st: Set[Int] = Set()
+    let by: Bytes = Bytes()
+    let sb: StringBuilder = StringBuilder()
+    let t: (Int, Str) = (1, "a")
+    let tp: (Point, Option[Int]) = (Point { x: 1, y: 2 }, None)
+    let tt: (Int, (Int, Str)) = (1, (1, "a"))
+    let tv: (Void, Int) = ((), 1)
+    let bx: Box[Int] = Box { val: 1 }
+    let bxo: Box[Option[Int]] = Box { val: None }
+    let p: Point = Point { x: 1, y: 2 }
+    let k: Key = Key { id: 1 }
+    let col: Color = Color.Red
+    let sh: Shape = Shape.Circle { r: 1 }
+    let h: Handler[IO] = handler IO { fn print(_m: Str) {} }
+    let hm: Handler[Metrics] = handler Metrics {
+        fn counter(_n: Str) {}
+    }
+    let it: Iterator[Int] = l.into_iter()
+    let ch: Channel[Int] = Channel(1)
+    let e: Errno = Errno(3)
+    let port: Port = 3
+    let te: (Errno, Int) = (Errno(1), 2)
+    let optr: Option[Ptr[Int]] = None
+    let oh: Option[Handler[IO]] = None
+    let ohm: Option[Handler[Metrics]] = None
+    let fnv: fn(Int) -> Int = fn(x: Int) -> Int { x }
+    with ffi.scope() as scope {
+        let pt: Ptr[Int] = scope.alloc()
+        assert(l.len() == 0)
+    }
+    assert(i == 7)
+}
+"#
+}
+
+// The probe is deleted BEFORE any assertion so a red row never leaks the file.
+// check_types resets the type pool, so the layout memo must be reset with it.
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/layout_slot_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 {
+            m.insert(tc_type_str(tid), tid)
+        }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 {
+        io.println("FAIL: harvested map has no tid for rendered type string '{key}'")
+    }
+    assert(tid != -1)
+    tid
+}
+
+fn slot_form_name(f: SlotForm) -> Str {
+    match f {
+        SlotForm.Inline => "Inline"
+        SlotForm.PointerBoxed => "PointerBoxed"
+        SlotForm.InlineWord => "InlineWord"
+    }
+}
+
+fn assert_form(label: Str, tid: Int, slot_pos: Position, want: SlotForm, want_c: Str) {
+    let rec = layout_of(tid, slot_pos)
+    assert_eq_str("{label} decline", rec.decline_reason, "")
+    assert_eq_str("{label} form", slot_form_name(rec.slot_form), slot_form_name(want))
+    assert_eq_str("{label} spelling", rec.c_spelling, want_c)
+}
+
+// A container slot holds one machine word. Anything wider is boxed and the slot holds a
+// pointer to it; the spelling is the pointee type so a reader can cast the slot back.
+test "ContainerSlot boxes aggregates and keeps words inline" {
+    let m = harvest_type_tids()
+    assert_form("slot Point", expect_tid(m, "Point"), Position.ContainerSlot, SlotForm.PointerBoxed, "blink_Point")
+    assert_form("slot Shape", expect_tid(m, "Shape"), Position.ContainerSlot, SlotForm.PointerBoxed, "blink_Shape")
+    assert_form("slot Box[Int]", expect_tid(m, "Box[Int]"), Position.ContainerSlot, SlotForm.PointerBoxed, "blink_Box_0Int")
+    assert_form("slot Option[Int]", expect_tid(m, "Option[Int]"), Position.ContainerSlot, SlotForm.PointerBoxed, "blink_Option_int")
+    assert_form("slot Result[Int, Str]", expect_tid(m, "Result[Int, Str]"), Position.ContainerSlot, SlotForm.PointerBoxed, "blink_Result_int_str")
+    assert_form("slot (Int, Str)", expect_tid(m, "(Int, Str)"), Position.ContainerSlot, SlotForm.PointerBoxed, "blink_Tuple2_int_str")
+    assert_form("slot Int", expect_tid(m, "Int"), Position.ContainerSlot, SlotForm.InlineWord, "int64_t")
+    assert_form("slot Str", expect_tid(m, "Str"), Position.ContainerSlot, SlotForm.InlineWord, "const char*")
+    assert_form("slot Float", expect_tid(m, "Float"), Position.ContainerSlot, SlotForm.InlineWord, "double")
+    assert_form("slot Color", expect_tid(m, "Color"), Position.ContainerSlot, SlotForm.InlineWord, "blink_Color")
+    assert_form("slot Errno", expect_tid(m, "Errno"), Position.ContainerSlot, SlotForm.InlineWord, "int64_t")
+    assert_form("slot List[Int]", expect_tid(m, "List[Int]"), Position.ContainerSlot, SlotForm.InlineWord, "blink_list*")
+    assert_form("slot Handler[IO]", expect_tid(m, "Handler[IO]"), Position.ContainerSlot, SlotForm.InlineWord, "blink_io_vtable*")
+    assert_form("slot Option[CFile]", expect_tid(m, "Option[CFile]"), Position.ContainerSlot, SlotForm.InlineWord, "FILE*")
+    assert_form("slot Fn", expect_tid(m, "Fn(Int) -> Int"), Position.ContainerSlot, SlotForm.InlineWord, "blink_closure*")
+}
+
+// By-value positions never box: an aggregate is Inline, a word-sized value is InlineWord.
+test "Local, Param, Field and TupleElem hold aggregates by value" {
+    let m = harvest_type_tids()
+    assert_form("local Point", expect_tid(m, "Point"), Position.Local, SlotForm.Inline, "blink_Point")
+    assert_form("param Option[Point]", expect_tid(m, "Option[Point]"), Position.Param, SlotForm.Inline, "blink_Option_Point")
+    assert_form("field (Int, Str)", expect_tid(m, "(Int, Str)"), Position.Field, SlotForm.Inline, "blink_Tuple2_int_str")
+    assert_form("tuple elem Result", expect_tid(m, "Result[Point, Color]"), Position.TupleElem, SlotForm.Inline, "blink_Result_Point_Color")
+    assert_form("local Shape", expect_tid(m, "Shape"), Position.Local, SlotForm.Inline, "blink_Shape")
+    assert_form("local Int", expect_tid(m, "Int"), Position.Local, SlotForm.InlineWord, "int64_t")
+    assert_form("field Str", expect_tid(m, "Str"), Position.Field, SlotForm.InlineWord, "const char*")
+    assert_form("param List", expect_tid(m, "List[Point]"), Position.Param, SlotForm.InlineWord, "blink_list*")
+    assert_form("local Color", expect_tid(m, "Color"), Position.Local, SlotForm.InlineWord, "blink_Color")
+    assert_form("local Errno", expect_tid(m, "Errno"), Position.Local, SlotForm.InlineWord, "int64_t")
+    assert_form("local Void", expect_tid(m, "Void"), Position.Local, SlotForm.InlineWord, "int64_t")
+    assert_form("field Void", expect_tid(m, "Void"), Position.Field, SlotForm.InlineWord, "int64_t")
+}
+
+// Return is the one position where Void is genuinely void.
+test "Return spells Void as void and everything else as Local" {
+    let m = harvest_type_tids()
+    assert_form("return Void", expect_tid(m, "Void"), Position.Return, SlotForm.Inline, "void")
+    assert_form("return Point", expect_tid(m, "Point"), Position.Return, SlotForm.Inline, "blink_Point")
+    assert_form("return Option[Int]", expect_tid(m, "Option[Int]"), Position.Return, SlotForm.Inline, "blink_Option_int")
+    assert_form("return Int", expect_tid(m, "Int"), Position.Return, SlotForm.InlineWord, "int64_t")
+}
+
+// An effect vtable slot erases an Option over a nominal to the shared pointer carrier so
+// every handler of that effect has one C signature.
+test "VtableSlot erases Option over a nominal to blink_Option_ptr" {
+    let m = harvest_type_tids()
+    assert_form("vtable Option[Point]", expect_tid(m, "Option[Point]"), Position.VtableSlot, SlotForm.Inline, "blink_Option_ptr")
+    assert_form("vtable Option[Int]", expect_tid(m, "Option[Int]"), Position.VtableSlot, SlotForm.Inline, "blink_Option_int")
+    assert_form("vtable Int", expect_tid(m, "Int"), Position.VtableSlot, SlotForm.InlineWord, "int64_t")
+    assert_form("vtable Point", expect_tid(m, "Point"), Position.VtableSlot, SlotForm.Inline, "blink_Point")
+}
+
+// The record carries the transparent flag, the carrier tag and no decline for concrete tids.
+test "layout_of record fields agree with the single-question functions" {
+    let m = harvest_type_tids()
+    let errno = layout_of(expect_tid(m, "Errno"), Position.Local)
+    assert_eq_int("Errno transparent", errno.is_transparent, 1)
+    assert_eq_str("Errno tag", errno.carrier_tag, "Errno")
+    let point = layout_of(expect_tid(m, "Point"), Position.Local)
+    assert_eq_int("Point not transparent", point.is_transparent, 0)
+    assert_eq_str("Point tag", point.carrier_tag, "Point")
+    assert_eq_int("Point boxed_selfrec", point.boxed_selfrec, 0)
+    let opt = layout_of(expect_tid(m, "Option[Point]"), Position.Local)
+    assert_eq_str("Option tag", opt.carrier_tag, "Option_Point")
+    assert_eq_str("Option no decline", opt.decline_reason, "")
+}
+
+// The memo answers the same record twice; the second read must not change the answer.
+test "layout_of is stable across repeated reads" {
+    let m = harvest_type_tids()
+    let tid = expect_tid(m, "(Point, Option[Int])")
+    let first = layout_of(tid, Position.ContainerSlot)
+    let second = layout_of(tid, Position.ContainerSlot)
+    assert_eq_str("stable spelling", first.c_spelling, second.c_spelling)
+    assert_eq_str("stable form", slot_form_name(first.slot_form), slot_form_name(second.slot_form))
+    assert_eq_str("stable tag", first.carrier_tag, second.carrier_tag)
+}

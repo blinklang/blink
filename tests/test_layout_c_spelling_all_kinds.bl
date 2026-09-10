@@ -1,0 +1,287 @@
+import std.fs
+import std.io
+import typecheck.{tc_type_str, tc_lookup_node_tid, check_types, lookup_named_type, make_metavar, tc_unknown_tid, make_struct_instance_type, make_map_type, make_ptr_type, make_option_type, make_list_type}
+import layout.{c_type_of, carrier_tag_of, nominal_name_of, layout_of, layout_reset, Position}
+import parser.{nodes}
+import compiler.{compile_to_program}
+import codegen_expr
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.println("FAIL: {label}: got '{got}' want '{want}'")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+// The probe covers every TyKind a user program can name, so each row below reads a tid
+// that real inference produced and not a hand-built pool entry.
+fn probe_src() -> Str {
+    #"@derive(Hash, Eq)
+type Key { id: Int }
+type Point { x: Int, y: Int }
+type Color { Red, Green }
+type Shape { Circle { r: Int }, Square { w: Int, h: Int } }
+type Box[T] { val: T }
+type Errno { Errno(Int) }
+type Port = Int
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str)
+    }
+}
+fn ident[T](x: T) -> T { x }
+fn use_t(t: Template[Point]) -> Int { 1 }
+fn use_h(h: Handle[Int]) -> Int { 1 }
+fn use_cf(c: Option[CFile]) -> Int { 1 }
+fn main() {
+    let i: Int = 7
+    let f: Float = 1.5
+    let b: Bool = true
+    let s: Str = "s"
+    let c: Char = 'c'
+    let a1: I8 = 1
+    let a2: I16 = 1
+    let a3: I32 = 1
+    let a4: U8 = 1
+    let a5: U16 = 1
+    let a6: U32 = 1
+    let a7: U64 = 1
+    let u: Void = ()
+    let l: List[Int] = []
+    let lp: List[Point] = []
+    let o: Option[Int] = None
+    let op: Option[Point] = None
+    let oc: Option[Color] = None
+    let osh: Option[Shape] = None
+    let oe: Option[Errno] = None
+    let ob: Option[Box[Int]] = None
+    let ol: Option[List[Int]] = None
+    let oo: Option[Option[Int]] = None
+    let ot: Option[(Int, Str)] = None
+    let r: Result[Int, Str] = Ok(1)
+    let rss: Result[Str, Str] = Ok("a")
+    let rp: Result[Point, Color] = Ok(Point { x: 1, y: 2 })
+    let rcp: Result[Color, Point] = Ok(Color.Red)
+    let rv: Result[Void, Str] = Ok(())
+    let re: Result[Int, Errno] = Ok(1)
+    let ro: Result[Option[Point], Str] = Ok(None)
+    let m: Map[Str, Int] = Map()
+    let mk: Map[Key, Int] = Map()
+    let st: Set[Int] = Set()
+    let by: Bytes = Bytes()
+    let sb: StringBuilder = StringBuilder()
+    let t: (Int, Str) = (1, "a")
+    let tp: (Point, Option[Int]) = (Point { x: 1, y: 2 }, None)
+    let tt: (Int, (Int, Str)) = (1, (1, "a"))
+    let tv: (Void, Int) = ((), 1)
+    let bx: Box[Int] = Box { val: 1 }
+    let bxo: Box[Option[Int]] = Box { val: None }
+    let p: Point = Point { x: 1, y: 2 }
+    let k: Key = Key { id: 1 }
+    let col: Color = Color.Red
+    let sh: Shape = Shape.Circle { r: 1 }
+    let h: Handler[IO] = handler IO { fn print(_m: Str) {} }
+    let hm: Handler[Metrics] = handler Metrics {
+        fn counter(_n: Str) {}
+    }
+    let it: Iterator[Int] = l.into_iter()
+    let ch: Channel[Int] = Channel(1)
+    let e: Errno = Errno(3)
+    let port: Port = 3
+    let te: (Errno, Int) = (Errno(1), 2)
+    let optr: Option[Ptr[Int]] = None
+    let oh: Option[Handler[IO]] = None
+    let ohm: Option[Handler[Metrics]] = None
+    let fnv: fn(Int) -> Int = fn(x: Int) -> Int { x }
+    with ffi.scope() as scope {
+        let pt: Ptr[Int] = scope.alloc()
+        assert(l.len() == 0)
+    }
+    assert(i == 7)
+}
+"#
+}
+
+// The probe is deleted BEFORE any assertion so a red row never leaks the file.
+// check_types resets the type pool, so the layout memo must be reset with it.
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/layout_spell_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 {
+            m.insert(tc_type_str(tid), tid)
+        }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 {
+        io.println("FAIL: harvested map has no tid for rendered type string '{key}'")
+    }
+    assert(tid != -1)
+    tid
+}
+
+// Every kind at Position.Local spells the exact C type the runtime headers and the
+// current codegen agree on. Void at Local is the int64_t storage placeholder.
+test "c_type_of spells every concrete kind at Local" {
+    let m = harvest_type_tids()
+    assert_eq_str("local Int", c_type_of(expect_tid(m, "Int"), Position.Local), "int64_t")
+    assert_eq_str("local Float", c_type_of(expect_tid(m, "Float"), Position.Local), "double")
+    assert_eq_str("local Bool", c_type_of(expect_tid(m, "Bool"), Position.Local), "int")
+    assert_eq_str("local Str", c_type_of(expect_tid(m, "Str"), Position.Local), "const char*")
+    assert_eq_str("local Char", c_type_of(expect_tid(m, "Char"), Position.Local), "int32_t")
+    assert_eq_str("local I8", c_type_of(expect_tid(m, "I8"), Position.Local), "int8_t")
+    assert_eq_str("local I16", c_type_of(expect_tid(m, "I16"), Position.Local), "int16_t")
+    assert_eq_str("local I32", c_type_of(expect_tid(m, "I32"), Position.Local), "int32_t")
+    assert_eq_str("local U8", c_type_of(expect_tid(m, "U8"), Position.Local), "uint8_t")
+    assert_eq_str("local U16", c_type_of(expect_tid(m, "U16"), Position.Local), "uint16_t")
+    assert_eq_str("local U32", c_type_of(expect_tid(m, "U32"), Position.Local), "uint32_t")
+    assert_eq_str("local U64", c_type_of(expect_tid(m, "U64"), Position.Local), "uint64_t")
+    assert_eq_str("local List[Int]", c_type_of(expect_tid(m, "List[Int]"), Position.Local), "blink_list*")
+    assert_eq_str("local Map[Str, Int]", c_type_of(expect_tid(m, "Map[Str, Int]"), Position.Local), "blink_map*")
+    assert_eq_str("local Set[Int]", c_type_of(expect_tid(m, "Set[Int]"), Position.Local), "blink_set*")
+    assert_eq_str("local Bytes", c_type_of(expect_tid(m, "Bytes"), Position.Local), "blink_bytes*")
+    assert_eq_str("local StringBuilder", c_type_of(expect_tid(m, "StringBuilder"), Position.Local), "blink_sb*")
+    assert_eq_str("local Channel[Int]", c_type_of(expect_tid(m, "Channel[Int]"), Position.Local), "blink_channel*")
+    assert_eq_str("local Handle[Int]", c_type_of(expect_tid(m, "Handle[Int]"), Position.Local), "blink_handle*")
+    assert_eq_str("local Iterator[Int]", c_type_of(expect_tid(m, "Iterator[Int]"), Position.Local), "void*")
+    assert_eq_str("local ffi.scope()", c_type_of(expect_tid(m, "ffi.scope()"), Position.Local), "blink_list*")
+    assert_eq_str("local Fn(Int) -> Int", c_type_of(expect_tid(m, "Fn(Int) -> Int"), Position.Local), "blink_closure*")
+    assert_eq_str("local Template[Point]", c_type_of(expect_tid(m, "Template[Point]"), Position.Local), "blink_template*")
+    assert_eq_str("local Ptr[Int]", c_type_of(expect_tid(m, "Ptr[Int]"), Position.Local), "int64_t*")
+    assert_eq_str("local Handler[IO]", c_type_of(expect_tid(m, "Handler[IO]"), Position.Local), "blink_io_vtable*")
+    assert_eq_str("local Handler[Metrics]", c_type_of(expect_tid(m, "Handler[Metrics]"), Position.Local), "blink_ue_metrics_vtable*")
+    assert_eq_str("local Point", c_type_of(expect_tid(m, "Point"), Position.Local), "blink_Point")
+    assert_eq_str("local Color", c_type_of(expect_tid(m, "Color"), Position.Local), "blink_Color")
+    assert_eq_str("local Shape", c_type_of(expect_tid(m, "Shape"), Position.Local), "blink_Shape")
+    assert_eq_str("local Box[Int]", c_type_of(expect_tid(m, "Box[Int]"), Position.Local), "blink_Box_0Int")
+    assert_eq_str("local Box[Option[Int]]", c_type_of(expect_tid(m, "Box[Option[Int]]"), Position.Local), "blink_Box_0Option_1int")
+    assert_eq_str("local Errno", c_type_of(expect_tid(m, "Errno"), Position.Local), "int64_t")
+    assert_eq_str("local Option[Int]", c_type_of(expect_tid(m, "Option[Int]"), Position.Local), "blink_Option_int")
+    assert_eq_str("local Option[Point]", c_type_of(expect_tid(m, "Option[Point]"), Position.Local), "blink_Option_Point")
+    assert_eq_str("local Option[Errno]", c_type_of(expect_tid(m, "Option[Errno]"), Position.Local), "blink_Option_Errno")
+    assert_eq_str("local Option[CFile]", c_type_of(expect_tid(m, "Option[CFile]"), Position.Local), "FILE*")
+    assert_eq_str("local Result[Int, Str]", c_type_of(expect_tid(m, "Result[Int, Str]"), Position.Local), "blink_Result_int_str")
+    assert_eq_str("local Result[Void, Str]", c_type_of(expect_tid(m, "Result[Void, Str]"), Position.Local), "blink_Result_void_str")
+    assert_eq_str("local Result[Option[Point], Str]", c_type_of(expect_tid(m, "Result[Option[Point], Str]"), Position.Local), "blink_Result_Option_Point_str")
+    assert_eq_str("local (Int, Str)", c_type_of(expect_tid(m, "(Int, Str)"), Position.Local), "blink_Tuple2_int_str")
+    assert_eq_str("local (Point, Option[Int])", c_type_of(expect_tid(m, "(Point, Option[Int])"), Position.Local), "blink_Tuple2_Point_Option_int")
+    assert_eq_str("local (Int, (Int, Str))", c_type_of(expect_tid(m, "(Int, (Int, Str))"), Position.Local), "blink_Tuple2_int_Tuple2_int_str")
+    assert_eq_str("local (Void, Int)", c_type_of(expect_tid(m, "(Void, Int)"), Position.Local), "blink_Tuple2_void_int")
+    assert_eq_str("local (Errno, Int)", c_type_of(expect_tid(m, "(Errno, Int)"), Position.Local), "blink_Tuple2_int_int")
+    assert_eq_str("local Option[Ptr[Int]]", c_type_of(expect_tid(m, "Option[Ptr[Int]]"), Position.Local), "blink_Option_ptr")
+    assert_eq_str("local Option[Handler[IO]]", c_type_of(expect_tid(m, "Option[Handler[IO]]"), Position.Local), "blink_Option_handler")
+    assert_eq_str("local Void", c_type_of(expect_tid(m, "Void"), Position.Local), "int64_t")
+}
+
+// Param and Field follow Local for every concrete kind; Return is where Void becomes void.
+test "Param, Field and Return agree with Local except Void at Return" {
+    let m = harvest_type_tids()
+    assert_eq_str("param Point", c_type_of(expect_tid(m, "Point"), Position.Param), "blink_Point")
+    assert_eq_str("field Option[Int]", c_type_of(expect_tid(m, "Option[Int]"), Position.Field), "blink_Option_int")
+    assert_eq_str("return Int", c_type_of(expect_tid(m, "Int"), Position.Return), "int64_t")
+    assert_eq_str("return Void", c_type_of(expect_tid(m, "Void"), Position.Return), "void")
+    assert_eq_str("param Void", c_type_of(expect_tid(m, "Void"), Position.Param), "int64_t")
+    assert_eq_str("field Void", c_type_of(expect_tid(m, "Void"), Position.Field), "int64_t")
+    assert_eq_str("tuple elem Void", c_type_of(expect_tid(m, "Void"), Position.TupleElem), "int64_t")
+}
+
+// The carrier tag is the segment a carrier name is built from: lowercase for builtin
+// kinds, the nominal C name without blink_ for a struct or enum, the mono stem for an instance.
+test "carrier_tag_of spells the inner segment grammar" {
+    let m = harvest_type_tids()
+    assert_eq_str("tag Int", carrier_tag_of(expect_tid(m, "Int")), "int")
+    assert_eq_str("tag Float", carrier_tag_of(expect_tid(m, "Float")), "double")
+    assert_eq_str("tag Bool", carrier_tag_of(expect_tid(m, "Bool")), "bool")
+    assert_eq_str("tag Str", carrier_tag_of(expect_tid(m, "Str")), "str")
+    assert_eq_str("tag Char", carrier_tag_of(expect_tid(m, "Char")), "char")
+    assert_eq_str("tag I8", carrier_tag_of(expect_tid(m, "I8")), "i8")
+    assert_eq_str("tag U64", carrier_tag_of(expect_tid(m, "U64")), "u64")
+    assert_eq_str("tag Void", carrier_tag_of(expect_tid(m, "Void")), "void")
+    assert_eq_str("tag List[Int]", carrier_tag_of(expect_tid(m, "List[Int]")), "list")
+    assert_eq_str("tag Map[Str, Int]", carrier_tag_of(expect_tid(m, "Map[Str, Int]")), "map")
+    assert_eq_str("tag Set[Int]", carrier_tag_of(expect_tid(m, "Set[Int]")), "set")
+    assert_eq_str("tag Bytes", carrier_tag_of(expect_tid(m, "Bytes")), "bytes")
+    assert_eq_str("tag StringBuilder", carrier_tag_of(expect_tid(m, "StringBuilder")), "stringbuilder")
+    assert_eq_str("tag Channel[Int]", carrier_tag_of(expect_tid(m, "Channel[Int]")), "channel")
+    assert_eq_str("tag Handle[Int]", carrier_tag_of(expect_tid(m, "Handle[Int]")), "handle")
+    assert_eq_str("tag Iterator[Int]", carrier_tag_of(expect_tid(m, "Iterator[Int]")), "iter")
+    assert_eq_str("tag Fn(Int) -> Int", carrier_tag_of(expect_tid(m, "Fn(Int) -> Int")), "closure")
+    assert_eq_str("tag Template[Point]", carrier_tag_of(expect_tid(m, "Template[Point]")), "template")
+    assert_eq_str("tag Ptr[Int]", carrier_tag_of(expect_tid(m, "Ptr[Int]")), "ptr")
+    assert_eq_str("tag Handler[IO]", carrier_tag_of(expect_tid(m, "Handler[IO]")), "handler")
+    assert_eq_str("tag Point", carrier_tag_of(expect_tid(m, "Point")), "Point")
+    assert_eq_str("tag Color", carrier_tag_of(expect_tid(m, "Color")), "Color")
+    assert_eq_str("tag Errno", carrier_tag_of(expect_tid(m, "Errno")), "Errno")
+    assert_eq_str("tag Box[Int]", carrier_tag_of(expect_tid(m, "Box[Int]")), "Box_0Int")
+    assert_eq_str("tag Option[Int]", carrier_tag_of(expect_tid(m, "Option[Int]")), "Option_int")
+    assert_eq_str("tag Option[Point]", carrier_tag_of(expect_tid(m, "Option[Point]")), "Option_Point")
+    assert_eq_str("tag Result[Int, Str]", carrier_tag_of(expect_tid(m, "Result[Int, Str]")), "Result_int_str")
+    assert_eq_str("tag Result[Void, Str]", carrier_tag_of(expect_tid(m, "Result[Void, Str]")), "Result_void_str")
+    assert_eq_str("tag (Int, Str)", carrier_tag_of(expect_tid(m, "(Int, Str)")), "Tuple2_int_str")
+    assert_eq_str("tag (Point, Option[Int])", carrier_tag_of(expect_tid(m, "(Point, Option[Int])")), "Tuple2_Point_Option_int")
+    assert_eq_str("tag Option[Option[Int]]", carrier_tag_of(expect_tid(m, "Option[Option[Int]]")), "Option_Option_int")
+    assert_eq_str("tag (Errno, Int)", carrier_tag_of(expect_tid(m, "(Errno, Int)")), "Tuple2_int_int")
+}
+
+// A struct or enum answers its declared name; an instance answers its base; everything
+// structural answers the empty string.
+test "nominal_name_of names only structs and enums" {
+    let m = harvest_type_tids()
+    assert_eq_str("nominal Point", nominal_name_of(expect_tid(m, "Point")), "Point")
+    assert_eq_str("nominal Color", nominal_name_of(expect_tid(m, "Color")), "Color")
+    assert_eq_str("nominal Shape", nominal_name_of(expect_tid(m, "Shape")), "Shape")
+    assert_eq_str("nominal Box[Int]", nominal_name_of(expect_tid(m, "Box[Int]")), "Box")
+    assert_eq_str("nominal Errno", nominal_name_of(expect_tid(m, "Errno")), "Errno")
+    assert_eq_str("nominal Int", nominal_name_of(expect_tid(m, "Int")), "")
+    assert_eq_str("nominal Option[Point]", nominal_name_of(expect_tid(m, "Option[Point]")), "")
+    assert_eq_str("nominal (Int, Str)", nominal_name_of(expect_tid(m, "(Int, Str)")), "")
+    assert_eq_str("nominal List[Point]", nominal_name_of(expect_tid(m, "List[Point]")), "")
+    assert_eq_str("nominal Handler[IO]", nominal_name_of(expect_tid(m, "Handler[IO]")), "")
+    assert_eq_str("nominal Fn(Int) -> Int", nominal_name_of(expect_tid(m, "Fn(Int) -> Int")), "")
+    assert_eq_str("nominal CFile", nominal_name_of(lookup_named_type("CFile")), "CFile")
+    assert_eq_str("alias Port", nominal_name_of(lookup_named_type("Port")), "")
+    assert_eq_str("alias Port local", c_type_of(lookup_named_type("Port"), Position.Local), "int64_t")
+    assert_eq_str("alias Port tag", carrier_tag_of(lookup_named_type("Port")), "int")
+}
+
+// The kops table is chosen by kind for builtins and by @derive(Hash) for user types.
+test "layout_of kops_table follows kind and @derive(Hash)" {
+    let m = harvest_type_tids()
+    assert_eq_str("kops Int", layout_of(expect_tid(m, "Int"), Position.ContainerSlot).kops_table, "blink_kops_i64")
+    assert_eq_str("kops Str", layout_of(expect_tid(m, "Str"), Position.ContainerSlot).kops_table, "blink_kops_str")
+    assert_eq_str("kops Bool", layout_of(expect_tid(m, "Bool"), Position.ContainerSlot).kops_table, "blink_kops_bool")
+    assert_eq_str("kops Char", layout_of(expect_tid(m, "Char"), Position.ContainerSlot).kops_table, "blink_kops_char")
+    assert_eq_str("kops I8", layout_of(expect_tid(m, "I8"), Position.ContainerSlot).kops_table, "blink_kops_i8")
+    assert_eq_str("kops I16", layout_of(expect_tid(m, "I16"), Position.ContainerSlot).kops_table, "blink_kops_i16")
+    assert_eq_str("kops I32", layout_of(expect_tid(m, "I32"), Position.ContainerSlot).kops_table, "blink_kops_i32")
+    assert_eq_str("kops U8", layout_of(expect_tid(m, "U8"), Position.ContainerSlot).kops_table, "blink_kops_u8")
+    assert_eq_str("kops U16", layout_of(expect_tid(m, "U16"), Position.ContainerSlot).kops_table, "blink_kops_u16")
+    assert_eq_str("kops U32", layout_of(expect_tid(m, "U32"), Position.ContainerSlot).kops_table, "blink_kops_u32")
+    assert_eq_str("kops U64", layout_of(expect_tid(m, "U64"), Position.ContainerSlot).kops_table, "blink_kops_u64")
+    assert_eq_str("kops Key", layout_of(expect_tid(m, "Key"), Position.ContainerSlot).kops_table, "kops_blink_Key")
+    assert_eq_str("kops Point", layout_of(expect_tid(m, "Point"), Position.ContainerSlot).kops_table, "")
+    assert_eq_str("kops Float", layout_of(expect_tid(m, "Float"), Position.ContainerSlot).kops_table, "")
+    assert_eq_str("kops List[Int]", layout_of(expect_tid(m, "List[Int]"), Position.ContainerSlot).kops_table, "")
+}

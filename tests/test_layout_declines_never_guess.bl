@@ -1,0 +1,238 @@
+import std.fs
+import std.io
+import typecheck.{tc_type_str, tc_lookup_node_tid, check_types, lookup_named_type, make_metavar, tc_unknown_tid, make_struct_instance_type, make_map_type, make_ptr_type, make_option_type, make_list_type}
+import layout.{layout_of, c_type_of, carrier_tag_of, ensure_typedef_for, nominal_name_of, tid_of_node, layout_reset, layout_take_typedefs, Position}
+import diagnostics.{diag_ice_count}
+import parser.{nodes}
+import compiler.{compile_to_program}
+import codegen_expr
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.println("FAIL: {label}: got '{got}' want '{want}'")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+// The probe covers every TyKind a user program can name, so each row below reads a tid
+// that real inference produced and not a hand-built pool entry.
+fn probe_src() -> Str {
+    #"@derive(Hash, Eq)
+type Key { id: Int }
+type Point { x: Int, y: Int }
+type Color { Red, Green }
+type Shape { Circle { r: Int }, Square { w: Int, h: Int } }
+type Box[T] { val: T }
+type Errno { Errno(Int) }
+type Port = Int
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str)
+    }
+}
+fn ident[T](x: T) -> T { x }
+fn use_t(t: Template[Point]) -> Int { 1 }
+fn use_h(h: Handle[Int]) -> Int { 1 }
+fn use_cf(c: Option[CFile]) -> Int { 1 }
+fn main() {
+    let i: Int = 7
+    let f: Float = 1.5
+    let b: Bool = true
+    let s: Str = "s"
+    let c: Char = 'c'
+    let a1: I8 = 1
+    let a2: I16 = 1
+    let a3: I32 = 1
+    let a4: U8 = 1
+    let a5: U16 = 1
+    let a6: U32 = 1
+    let a7: U64 = 1
+    let u: Void = ()
+    let l: List[Int] = []
+    let lp: List[Point] = []
+    let o: Option[Int] = None
+    let op: Option[Point] = None
+    let oc: Option[Color] = None
+    let osh: Option[Shape] = None
+    let oe: Option[Errno] = None
+    let ob: Option[Box[Int]] = None
+    let ol: Option[List[Int]] = None
+    let oo: Option[Option[Int]] = None
+    let ot: Option[(Int, Str)] = None
+    let r: Result[Int, Str] = Ok(1)
+    let rss: Result[Str, Str] = Ok("a")
+    let rp: Result[Point, Color] = Ok(Point { x: 1, y: 2 })
+    let rcp: Result[Color, Point] = Ok(Color.Red)
+    let rv: Result[Void, Str] = Ok(())
+    let re: Result[Int, Errno] = Ok(1)
+    let ro: Result[Option[Point], Str] = Ok(None)
+    let m: Map[Str, Int] = Map()
+    let mk: Map[Key, Int] = Map()
+    let st: Set[Int] = Set()
+    let by: Bytes = Bytes()
+    let sb: StringBuilder = StringBuilder()
+    let t: (Int, Str) = (1, "a")
+    let tp: (Point, Option[Int]) = (Point { x: 1, y: 2 }, None)
+    let tt: (Int, (Int, Str)) = (1, (1, "a"))
+    let tv: (Void, Int) = ((), 1)
+    let bx: Box[Int] = Box { val: 1 }
+    let bxo: Box[Option[Int]] = Box { val: None }
+    let p: Point = Point { x: 1, y: 2 }
+    let k: Key = Key { id: 1 }
+    let col: Color = Color.Red
+    let sh: Shape = Shape.Circle { r: 1 }
+    let h: Handler[IO] = handler IO { fn print(_m: Str) {} }
+    let hm: Handler[Metrics] = handler Metrics {
+        fn counter(_n: Str) {}
+    }
+    let it: Iterator[Int] = l.into_iter()
+    let ch: Channel[Int] = Channel(1)
+    let e: Errno = Errno(3)
+    let port: Port = 3
+    let te: (Errno, Int) = (Errno(1), 2)
+    let optr: Option[Ptr[Int]] = None
+    let oh: Option[Handler[IO]] = None
+    let ohm: Option[Handler[Metrics]] = None
+    let fnv: fn(Int) -> Int = fn(x: Int) -> Int { x }
+    with ffi.scope() as scope {
+        let pt: Ptr[Int] = scope.alloc()
+        assert(l.len() == 0)
+    }
+    assert(i == 7)
+}
+"#
+}
+
+// The probe is deleted BEFORE any assertion so a red row never leaks the file.
+// check_types resets the type pool, so the layout memo must be reset with it.
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/layout_decline_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 {
+            m.insert(tc_type_str(tid), tid)
+        }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 {
+        io.println("FAIL: harvested map has no tid for rendered type string '{key}'")
+    }
+    assert(tid != -1)
+    tid
+}
+
+fn assert_declines(label: Str, tid: Int) {
+    let rec = layout_of(tid, Position.Local)
+    if rec.decline_reason == "" {
+        io.println("FAIL: {label}: expected a decline, got spelling '{rec.c_spelling}'")
+    }
+    assert(rec.decline_reason != "")
+    assert_eq_str("{label} c_spelling empty", rec.c_spelling, "")
+    assert_eq_str("{label} c_type_of empty", c_type_of(tid, Position.Local), "")
+    assert_eq_str("{label} carrier_tag empty", carrier_tag_of(tid), "")
+    assert_eq_str("{label} typedef empty", ensure_typedef_for(tid), "")
+    assert_eq_int("{label} emits nothing", layout_take_typedefs().len(), 0)
+}
+
+// A type that is not yet known has no C answer. Declining is the answer; a guess would be
+// a wrong C type that the C compiler may accept.
+test "a free typevar, an unbound metavar and Unknown decline" {
+    let m = harvest_type_tids()
+    assert_declines("typevar T", expect_tid(m, "T"))
+    assert_declines("fresh metavar", make_metavar())
+    assert_declines("Unknown", tc_unknown_tid())
+}
+
+// A carrier over an undetermined child cannot be spelled either: its name embeds the child.
+test "a carrier or instance over an undetermined child declines" {
+    let m = harvest_type_tids()
+    assert_declines("Option[?]", expect_tid(m, "Option[?]"))
+    assert_declines("Option[metavar]", make_option_type(make_metavar()))
+    assert_declines("(Point, Option[?])", expect_tid(m, "(Point, Option[?])"))
+    assert_declines("Option[T]", make_option_type(expect_tid(m, "T")))
+}
+
+// A generic base that was never monomorphised names no C type.
+test "an un-monomorphised generic base declines" {
+    let m = harvest_type_tids()
+    let _ = expect_tid(m, "Box[Int]")
+    let base = lookup_named_type("Box")
+    assert(base >= 0)
+    assert_declines("generic base Box", base)
+    assert_eq_str("base still nominal", nominal_name_of(base), "Box")
+}
+
+// A container is one runtime type whatever its element, so its spelling does not depend
+// on the element being known. The element itself still declines when asked directly.
+test "a pointer container over an undetermined element does not decline" {
+    let m = harvest_type_tids()
+    assert_eq_str("List[?]", c_type_of(expect_tid(m, "List[?]"), Position.Local), "blink_list*")
+    assert_eq_str("List[T]", c_type_of(make_list_type(expect_tid(m, "T")), Position.Local), "blink_list*")
+    assert_eq_str("Ptr[?]", c_type_of(make_ptr_type(make_metavar()), Position.Local), "void*")
+    assert_declines("elem of List[?]", make_metavar())
+}
+
+// An instance argument is part of a mono stem, so a metavar buried under a pointer
+// container inside it still has no stem segment.
+test "an instance argument with a buried unbound metavar declines" {
+    let m = harvest_type_tids()
+    let deep = make_struct_instance_type("Box", [make_map_type(make_metavar(), expect_tid(m, "Int"))])
+    assert_declines("Box[Map[?, Int]]", deep)
+    let sound = make_struct_instance_type("Box", [make_map_type(expect_tid(m, "Str"), expect_tid(m, "Int"))])
+    assert_eq_str("Box[Map[Str, Int]]", c_type_of(sound, Position.Local), "blink_Box_0Map")
+}
+
+// A node with no recorded type is a compiler bug, reported as I0001, never as a default.
+test "tid_of_node raises I0001 on a node with no type" {
+    let m = harvest_type_tids()
+    let _ = expect_tid(m, "Int")
+    let mut bare = -1
+    let mut idx = 0
+    while idx < nodes.len() && bare == -1 {
+        if tc_lookup_node_tid(idx) == -1 { bare = idx }
+        idx = idx + 1
+    }
+    assert(bare != -1)
+    let before = diag_ice_count
+    let got = tid_of_node(bare)
+    assert_eq_int("miss answers -1", got, -1)
+    assert_eq_int("miss counts one ICE", diag_ice_count - before, 1)
+}
+
+// A stamped node answers its stamp and raises nothing.
+test "tid_of_node answers a stamped node without a diagnostic" {
+    let m = harvest_type_tids()
+    let want = expect_tid(m, "Point")
+    let mut node = -1
+    let mut idx = 0
+    while idx < nodes.len() && node == -1 {
+        if tc_lookup_node_tid(idx) == want { node = idx }
+        idx = idx + 1
+    }
+    assert(node != -1)
+    let before = diag_ice_count
+    assert_eq_int("hit answers stamp", tid_of_node(node), want)
+    assert_eq_int("hit raises nothing", diag_ice_count - before, 0)
+}

@@ -1,0 +1,776 @@
+// layout.bl: the one place a type id becomes a physical C answer.
+//
+// Every question here is asked of a tid and a Position and answered from the
+// interned type tree plus the type declaration nodes. Nothing here reads a
+// codegen table or a flat CT code. A tid this module cannot
+// spell gets a decline (non-empty decline_reason, empty spelling), never a guess:
+// the caller that needs a spelling turns a decline into I0001.
+
+import typecheck.{
+    TyKind, tk_name, tc_tid_kind, tc_tid_child, tc_tid_child_count, tc_tid_name, tc_resolve,
+    tc_is_unbound_metavar, tc_tid_handler_effect, tc_handler_effect_root,
+    tc_lookup_node_tid, tc_type_decl_nodes, tc_resolve_transparent_alias_name,
+}
+import parser.{
+    node_source_module, node_fields, node_name, node_value, node_kind, node_handlers,
+    node_args, node_type_params, get_annotation, get_str_named_arg, sublist_get, sublist_length,
+}
+import ast.{NodeKind}
+import diagnostics.{diag_ice_at, UNSOLVED_TYPEVAR_AT_CODEGEN}
+
+pub type Position { Local, Field, Param, Return, ContainerSlot, VtableSlot, TupleElem }
+
+// Inline: an aggregate held by value. InlineWord: a value that fits one machine word
+// (scalar, pointer, ordinal). PointerBoxed: the slot holds a pointer to a heap copy.
+pub type SlotForm { Inline, PointerBoxed, InlineWord }
+
+pub type Slot { Inner1, Inner2, Param(Int), Elem(Int) }
+
+pub type LayoutRecord {
+    c_spelling: Str
+    slot_form: SlotForm
+    carrier_tag: Str
+    is_transparent: Int
+    boxed_selfrec: Int
+    kops_table: Str
+    decline_reason: Str
+}
+
+// The memo is a pure cache over (tid, position). The typedef buffer and guard set are
+// the only side effects this module owns; the binder frames are the only scope state.
+let mut layout_memo: Map[Str, LayoutRecord] = Map()
+let mut typedef_buffer: List[Str] = []
+let mut typedef_guard: Map[Str, Int] = Map()
+let mut binder_frame_parent: List[Int] = []
+let mut binder_frame_alive: List[Int] = []
+let mut binder_frame_start: List[Int] = []
+let mut binder_frame_stack: List[Int] = []
+let mut binder_entry_frame: List[Int] = []
+let mut binder_entry_name: List[Str] = []
+let mut binder_entry_tid: List[Int] = []
+
+// check_types rebuilds the type pool, so every cached answer is stale after it.
+pub fn layout_reset() {
+    layout_memo = Map()
+    typedef_buffer = []
+    typedef_guard = Map()
+    binder_frame_parent = []
+    binder_frame_alive = []
+    binder_frame_start = []
+    binder_frame_stack = []
+    binder_entry_frame = []
+    binder_entry_name = []
+    binder_entry_tid = []
+}
+
+// ── The eight questions ───────────────────────────────────────────────────
+
+pub fn c_type_of(tid: Int, position: Position) -> Str {
+    layout_of(tid, position).c_spelling
+}
+
+pub fn carrier_tag_of(tid: Int) -> Str {
+    layout_of(tid, Position.Local).carrier_tag
+}
+
+pub fn nominal_name_of(tid: Int) -> Str {
+    let r = lo_res(tid)
+    let k = tc_tid_kind(r)
+    if k != TyKind.Struct && k != TyKind.Enum { return "" }
+    lo_bare_name(tc_tid_name(r))
+}
+
+pub fn child_tid(tid: Int, slot: Slot) -> Int {
+    let r = lo_res(tid)
+    let k = tc_tid_kind(r)
+    match slot {
+        Slot.Inner1 => {
+            if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum { return -1 }
+            tc_tid_child(r, 0)
+        }
+        Slot.Inner2 => {
+            if k != TyKind.Result && k != TyKind.Map { return -1 }
+            tc_tid_child(r, 1)
+        }
+        Slot.Param(i) => {
+            if k == TyKind.Fn { return tc_tid_child(r, i + 1) }
+            if k != TyKind.Struct && k != TyKind.Enum { return -1 }
+            tc_tid_child(r, i)
+        }
+        Slot.Elem(i) => {
+            if k != TyKind.Tuple { return -1 }
+            tc_tid_child(r, i)
+        }
+    }
+}
+
+// A node with no recorded type is a compiler bug; report it and answer -1 so the caller
+// can stop. Nothing here ever substitutes a default type.
+pub fn tid_of_node(node: Int) -> Int ! Diag.Report {
+    let tid = tc_lookup_node_tid(node)
+    if tid >= 0 { return tid }
+    diag_ice_at("NoTypeForNode", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "node {node} reached layout with no recorded type", node,
+        "typecheck must stamp every node codegen reads; this is a compiler bug")
+    -1
+}
+
+pub fn tid_of_binder(scope: Int, name: Str) -> Int {
+    let mut frame = scope
+    while frame >= 0 && frame < binder_frame_parent.len() {
+        if binder_frame_alive.get(frame).unwrap() == 0 { return -1 }
+        let hit = lo_binder_lookup_in_frame(frame, name)
+        if hit >= 0 { return hit }
+        frame = binder_frame_parent.get(frame).unwrap()
+    }
+    -1
+}
+
+pub fn layout_of(tid: Int, position: Position) -> LayoutRecord {
+    let key = "{tid}:{lo_position_index(position)}"
+    match layout_memo.get(key) {
+        Some(rec) => return rec
+        None => {}
+    }
+    let rec = lo_compute_layout(tid, position)
+    layout_memo.insert(key, rec)
+    rec
+}
+
+// Emits the carrier typedef for an Option, Result or Tuple (inner carriers first) and
+// answers its C name. Every other kind answers its spelling and emits nothing.
+pub fn ensure_typedef_for(tid: Int) -> Str {
+    let rec = layout_of(tid, Position.Local)
+    if rec.decline_reason != "" { return "" }
+    let r = lo_res(tid)
+    let k = tc_tid_kind(r)
+    if k == TyKind.Option {
+        lo_emit_option_typedef(r, rec.c_spelling)
+    } else if k == TyKind.Result {
+        lo_emit_result_typedef(r, rec.c_spelling)
+    } else if k == TyKind.Tuple {
+        lo_emit_tuple_typedef(r, rec.c_spelling)
+    }
+    rec.c_spelling
+}
+
+// Drains the typedef buffer in emit order. Each entry is one guarded block.
+pub fn layout_take_typedefs() -> List[Str] {
+    let out = typedef_buffer
+    typedef_buffer = []
+    out
+}
+
+// ── Binder scopes ─────────────────────────────────────────────────────────
+
+pub fn binder_scope_push() -> Int {
+    let id = binder_frame_parent.len()
+    let parent = if binder_frame_stack.len() > 0 { binder_frame_stack.get(binder_frame_stack.len() - 1).unwrap() } else { -1 }
+    binder_frame_parent.push(parent)
+    binder_frame_start.push(binder_entry_frame.len())
+    binder_frame_alive.push(1)
+    binder_frame_stack.push(id)
+    id
+}
+
+// Frames are LIFO, so every entry bound since the frame opened is dead with it.
+pub fn binder_scope_pop() {
+    if binder_frame_stack.len() == 0 { return }
+    let top = binder_frame_stack.get(binder_frame_stack.len() - 1).unwrap()
+    binder_frame_alive.set(top, 0)
+    binder_frame_stack.pop()
+    let start = binder_frame_start.get(top).unwrap()
+    while binder_entry_frame.len() > start {
+        binder_entry_frame.pop()
+        binder_entry_name.pop()
+        binder_entry_tid.pop()
+    }
+}
+
+pub fn bind_binder(scope: Int, name: Str, tid: Int) {
+    if scope < 0 || scope >= binder_frame_alive.len() { return }
+    if binder_frame_alive.get(scope).unwrap() == 0 { return }
+    binder_entry_frame.push(scope)
+    binder_entry_name.push(name)
+    binder_entry_tid.push(tid)
+}
+
+fn lo_binder_lookup_in_frame(frame: Int, name: Str) -> Int {
+    let mut i = binder_entry_frame.len() - 1
+    while i >= 0 {
+        if binder_entry_frame.get(i).unwrap() == frame && binder_entry_name.get(i).unwrap() == name {
+            return binder_entry_tid.get(i).unwrap()
+        }
+        i = i - 1
+    }
+    -1
+}
+
+// ── Layout computation ────────────────────────────────────────────────────
+
+// Follows bound metavars, then a transparent `type A = X` alias to the type that owns
+// the C spelling. An alias has no C identity of its own.
+fn lo_res(tid: Int) -> Int {
+    let r = tc_resolve(tid)
+    if r < 0 { return r }
+    let k = tc_tid_kind(r)
+    if (k == TyKind.Struct || k == TyKind.Enum) && tc_tid_child_count(r) == 0 {
+        let underlying = tc_resolve_transparent_alias_name(tc_tid_name(r))
+        if underlying != -1 && underlying != r { return lo_res(underlying) }
+    }
+    r
+}
+
+fn lo_position_index(position: Position) -> Int {
+    match position {
+        Position.Local => 0
+        Position.Field => 1
+        Position.Param => 2
+        Position.Return => 3
+        Position.ContainerSlot => 4
+        Position.VtableSlot => 5
+        Position.TupleElem => 6
+    }
+}
+
+fn lo_declined(reason: Str) -> LayoutRecord {
+    LayoutRecord {
+        c_spelling: "", slot_form: SlotForm.InlineWord, carrier_tag: "",
+        is_transparent: 0, boxed_selfrec: 0, kops_table: "", decline_reason: reason,
+    }
+}
+
+fn lo_compute_layout(tid: Int, position: Position) -> LayoutRecord {
+    let reason = lo_decline_reason_of(tid)
+    if reason != "" { return lo_declined(reason) }
+    let r = lo_res(tid)
+    let k = tc_tid_kind(r)
+    let transparent = if lo_is_transparent_newtype(r) { 1 } else { 0 }
+    let word = lo_fits_word(r)
+    let mut spelling = lo_spell(r)
+    let mut form = if word { SlotForm.InlineWord } else { SlotForm.Inline }
+    if position == Position.Return && lo_is_void_like(k) {
+        spelling = "void"
+        form = SlotForm.Inline
+    } else if position == Position.ContainerSlot && !word {
+        form = SlotForm.PointerBoxed
+    } else if position == Position.VtableSlot && k == TyKind.Option && lo_is_boxed_nominal(lo_res(tc_tid_child(r, 0))) {
+        // Every handler of one effect shares one C signature, so an Option over a
+        // nominal payload is erased to the pointer carrier in the vtable slot.
+        spelling = "blink_Option_ptr"
+    }
+    LayoutRecord {
+        c_spelling: spelling, slot_form: form, carrier_tag: lo_tag_of(r),
+        is_transparent: transparent, boxed_selfrec: 0, kops_table: lo_kops_of(r),
+        decline_reason: "",
+    }
+}
+
+// The reasons a tid has no C answer. A pointer container (List, Map, Set, Channel,
+// Handle, Ptr, Fn) is one runtime type whatever its child, so it never declines here;
+// its child declines on its own when asked.
+fn lo_decline_reason_of(tid: Int) -> Str {
+    if tid < 0 { return "negative type id" }
+    let r = lo_res(tid)
+    let k = tc_tid_kind(r)
+    if k == TyKind.Unknown {
+        if tc_is_unbound_metavar(r) != 0 { return "unbound metavariable" }
+        return "unknown type"
+    }
+    if k == TyKind.Typevar { return "free type variable {tc_tid_name(r)}" }
+    if k == TyKind.Struct || k == TyKind.Enum {
+        if tc_tid_child_count(r) == 0 && lo_decl_is_generic(lo_decl_node_of(r)) { return "un-monomorphised generic {lo_bare_name(tc_tid_name(r))}" }
+        let child = lo_instance_arg_decline(r)
+        if child != "" { return child }
+        return lo_first_child_decline(r, 0)
+    }
+    if k == TyKind.Option || k == TyKind.Result || k == TyKind.Tuple { return lo_first_child_decline(r, 0) }
+    ""
+}
+
+// A mono stem has no segment grammar for a closure, template or ffi scope argument,
+// and an undetermined type anywhere under an argument leaves the stem unspellable,
+// even under a pointer container that would erase it in a plain slot.
+fn lo_instance_arg_decline(r: Int) -> Str {
+    let n = tc_tid_child_count(r)
+    let mut i = 0
+    while i < n {
+        let reason = lo_arg_decline_deep(tc_tid_child(r, i))
+        if reason != "" { return reason }
+        i = i + 1
+    }
+    ""
+}
+
+fn lo_arg_decline_deep(tid: Int) -> Str {
+    let reason = lo_decline_reason_of(tid)
+    if reason != "" { return reason }
+    let a = lo_res(tid)
+    let k = tc_tid_kind(a)
+    if k == TyKind.Fn || k == TyKind.Template || k == TyKind.FfiScope { return "instance argument of kind {tk_name(k)} has no mono segment" }
+    let n = tc_tid_child_count(a)
+    let mut i = 0
+    while i < n {
+        let child = lo_arg_decline_deep(tc_tid_child(a, i))
+        if child != "" { return child }
+        i = i + 1
+    }
+    ""
+}
+
+fn lo_first_child_decline(r: Int, from: Int) -> Str {
+    let n = tc_tid_child_count(r)
+    let mut i = from
+    while i < n {
+        let reason = lo_decline_reason_of(tc_tid_child(r, i))
+        if reason != "" { return reason }
+        i = i + 1
+    }
+    ""
+}
+
+fn lo_is_void_like(k: TyKind) -> Bool {
+    k == TyKind.Void || k == TyKind.Never
+}
+
+// True when the value is one machine word: a scalar, a runtime pointer, an ordinal enum,
+// a transparent newtype, an opaque handle or an Option over an opaque handle.
+fn lo_fits_word(r: Int) -> Bool {
+    let k = tc_tid_kind(r)
+    if k == TyKind.Struct || k == TyKind.Enum {
+        if lo_is_transparent_newtype(r) { return true }
+        if lo_opaque_c_name(r) != "" { return true }
+        if k == TyKind.Enum && tc_tid_child_count(r) == 0 { return !lo_decl_is_data_enum(lo_decl_node_of(r)) }
+        return false
+    }
+    if k == TyKind.Option { return lo_opaque_c_name(lo_res(tc_tid_child(r, 0))) != "" }
+    if k == TyKind.Result || k == TyKind.Tuple { return false }
+    true
+}
+
+// A struct, data enum, instance, carrier or tuple: what an Option payload stores by
+// pointer and what a vtable slot erases.
+fn lo_is_boxed_nominal(r: Int) -> Bool {
+    let k = tc_tid_kind(r)
+    if k != TyKind.Struct && k != TyKind.Enum { return false }
+    !lo_fits_word(r)
+}
+
+// ── Spelling ──────────────────────────────────────────────────────────────
+
+fn lo_spell(r: Int) -> Str {
+    let k = tc_tid_kind(r)
+    let scalar = lo_spell_scalar(k)
+    if scalar != "" { return scalar }
+    match k {
+        TyKind.Struct => lo_spell_nominal(r)
+        TyKind.Enum => lo_spell_nominal(r)
+        TyKind.Option => lo_spell_option(r)
+        TyKind.Result => "blink_{lo_tag_of(r)}"
+        TyKind.Tuple => "blink_{lo_tag_of(r)}"
+        TyKind.Ptr => lo_spell_ptr(r)
+        TyKind.Handler => "{lo_vtable_of(tc_tid_handler_effect(r))}*"
+        _ => ""
+    }
+}
+
+// Kinds whose spelling does not depend on a child. Void here is the storage
+// placeholder; Return replaces it with void in lo_compute_layout.
+fn lo_spell_scalar(k: TyKind) -> Str {
+    match k {
+        TyKind.Int => "int64_t"
+        TyKind.Float => "double"
+        TyKind.Bool => "int"
+        TyKind.Str => "const char*"
+        TyKind.Char => "int32_t"
+        TyKind.I8 => "int8_t"
+        TyKind.I16 => "int16_t"
+        TyKind.I32 => "int32_t"
+        TyKind.U8 => "uint8_t"
+        TyKind.U16 => "uint16_t"
+        TyKind.U32 => "uint32_t"
+        TyKind.U64 => "uint64_t"
+        TyKind.Void => "int64_t"
+        TyKind.Never => "int64_t"
+        TyKind.List => "blink_list*"
+        TyKind.FfiScope => "blink_list*"
+        TyKind.Map => "blink_map*"
+        TyKind.Set => "blink_set*"
+        TyKind.Bytes => "blink_bytes*"
+        TyKind.StringBuilder => "blink_sb*"
+        TyKind.Channel => "blink_channel*"
+        TyKind.Handle => "blink_handle*"
+        TyKind.Iterator => "void*"
+        TyKind.Fn => "blink_closure*"
+        TyKind.Template => "blink_template*"
+        _ => ""
+    }
+}
+
+fn lo_spell_nominal(r: Int) -> Str {
+    if lo_is_transparent_newtype(r) { return "int64_t" }
+    let opaque = lo_opaque_c_name(r)
+    if opaque != "" { return "{opaque}*" }
+    "blink_{lo_tag_of(r)}"
+}
+
+// An Option over an opaque handle is the bare handle pointer: NULL is None.
+fn lo_spell_option(r: Int) -> Str {
+    let inner = lo_res(tc_tid_child(r, 0))
+    let opaque = lo_opaque_c_name(inner)
+    if opaque != "" { return "{opaque}*" }
+    "blink_{lo_tag_of(r)}"
+}
+
+// A pointee that cannot be spelled drops to void*; a Ptr never declines.
+fn lo_spell_ptr(r: Int) -> Str {
+    let pointee = lo_res(tc_tid_child(r, 0))
+    if lo_decline_reason_of(pointee) != "" { return "void*" }
+    let k = tc_tid_kind(pointee)
+    if lo_is_void_like(k) { return "void*" }
+    "{lo_spell(pointee)}*"
+}
+
+fn lo_vtable_of(effect_name: Str) -> Str {
+    let root = tc_handler_effect_root(effect_name)
+    if root == "IO" { return "blink_io_vtable" }
+    if root == "FS" { return "blink_fs_vtable" }
+    if root == "Net" { return "blink_net_vtable" }
+    if root == "Crypto" { return "blink_crypto_vtable" }
+    if root == "Rand" { return "blink_rand_vtable" }
+    if root == "Time" { return "blink_time_vtable" }
+    if root == "Env" { return "blink_env_vtable" }
+    if root == "Process" { return "blink_process_vtable" }
+    "blink_ue_{root.to_lower()}_vtable"
+}
+
+// ── Carrier tags ──────────────────────────────────────────────────────────
+
+// The segment a carrier name is built from. Builtin kinds are lowercase words; a
+// struct or enum is its C name without blink_; an instance is its mono stem.
+fn lo_tag_of(r: Int) -> Str {
+    let k = tc_tid_kind(r)
+    let simple = lo_tag_scalar(k)
+    if simple != "" { return simple }
+    match k {
+        TyKind.Struct => lo_tag_nominal(r)
+        TyKind.Enum => lo_tag_nominal(r)
+        TyKind.Option => "Option_{lo_tag_of(lo_res(tc_tid_child(r, 0)))}"
+        TyKind.Result => "Result_{lo_tag_of(lo_res(tc_tid_child(r, 0)))}_{lo_tag_of(lo_res(tc_tid_child(r, 1)))}"
+        TyKind.Tuple => lo_tag_tuple(r)
+        _ => ""
+    }
+}
+
+fn lo_tag_scalar(k: TyKind) -> Str {
+    match k {
+        TyKind.Int => "int"
+        TyKind.Float => "double"
+        TyKind.Bool => "bool"
+        TyKind.Str => "str"
+        TyKind.Char => "char"
+        TyKind.I8 => "i8"
+        TyKind.I16 => "i16"
+        TyKind.I32 => "i32"
+        TyKind.U8 => "u8"
+        TyKind.U16 => "u16"
+        TyKind.U32 => "u32"
+        TyKind.U64 => "u64"
+        TyKind.Void => "void"
+        TyKind.Never => "void"
+        TyKind.List => "list"
+        TyKind.FfiScope => "list"
+        TyKind.Map => "map"
+        TyKind.Set => "set"
+        TyKind.Bytes => "bytes"
+        TyKind.StringBuilder => "stringbuilder"
+        TyKind.Channel => "channel"
+        TyKind.Handle => "handle"
+        TyKind.Iterator => "iter"
+        TyKind.Fn => "closure"
+        TyKind.Template => "template"
+        TyKind.Ptr => "ptr"
+        TyKind.Handler => "handler"
+        _ => ""
+    }
+}
+
+fn lo_tag_tuple(r: Int) -> Str {
+    let n = tc_tid_child_count(r)
+    let mut out = "Tuple{n}"
+    let mut i = 0
+    while i < n {
+        let elem = lo_res(tc_tid_child(r, i))
+        // A transparent newtype element lowers to a bare int64_t, so the tuple names it int.
+        let seg = if lo_is_transparent_newtype(elem) { "int" } else { lo_tag_of(elem) }
+        out = "{out}_{seg}"
+        i = i + 1
+    }
+    out
+}
+
+// The segment grammar at the head of a mono stem argument: a Pascal-case kind name for
+// a builtin, the bare name or nested stem for a nominal, the inner grammar for a carrier.
+fn lo_tag_top(r: Int) -> Str {
+    let k = tc_tid_kind(r)
+    if k == TyKind.Struct || k == TyKind.Enum {
+        if tc_tid_child_count(r) > 0 { return lo_tag_nominal(r) }
+        return lo_bare_name(tc_tid_name(r))
+    }
+    if k == TyKind.Option || k == TyKind.Result || k == TyKind.Tuple { return lo_tag_of(r) }
+    if k == TyKind.Void || k == TyKind.Never { return "Void" }
+    if k == TyKind.FfiScope || k == TyKind.Fn || k == TyKind.Template { return "" }
+    tk_name(k)
+}
+
+// An opaque handle keeps its bare declared name. An instance joins the escaped base
+// and every escaped argument tag with "_0" so a literal underscore in any segment
+// cannot collide with the separator.
+fn lo_tag_nominal(r: Int) -> Str {
+    let decl = lo_decl_node_of(r)
+    let name = lo_bare_name(tc_tid_name(r))
+    if lo_opaque_c_name(r) != "" { return name }
+    let base = lo_nominal_c_tag(name, decl)
+    let n = tc_tid_child_count(r)
+    if n == 0 { return base }
+    let mut out = lo_escape_mono_seg(base)
+    let mut i = 0
+    while i < n {
+        out = "{out}_0{lo_escape_mono_seg(lo_tag_top(lo_res(tc_tid_child(r, i))))}"
+        i = i + 1
+    }
+    out
+}
+
+// The C name without blink_: the declaring module (dots as underscores) then the
+// name. The main module and the compiler-provided types carry no prefix.
+fn lo_nominal_c_tag(name: Str, decl: Int) -> Str {
+    if decl < 0 { return name }
+    if name == "ConversionError" || name == "ProcessResult" { return name }
+    let m = node_source_module(decl)
+    if m == "" || m == "__main__" { return name }
+    "{lo_dots_to_underscores(m)}_{name}"
+}
+
+fn lo_escape_mono_seg(s: Str) -> Str {
+    if s.index_of("_") < 0 { return s }
+    let mut out = ""
+    let mut i = 0
+    while i < s.len() {
+        if s.byte_at(i) == 95 { out = out.concat("_1") } else { out = out.concat(s.substr(i, 1)) }
+        i = i + 1
+    }
+    out
+}
+
+fn lo_dots_to_underscores(s: Str) -> Str {
+    let mut out = ""
+    let mut i = 0
+    while i < s.len() {
+        if s.byte_at(i) == 46 { out = out.concat("_") } else { out = out.concat(s.substr(i, 1)) }
+        i = i + 1
+    }
+    out
+}
+
+fn lo_bare_name(name: Str) -> Str {
+    let mut dot = -1
+    let mut i = 0
+    while i < name.len() {
+        if name.byte_at(i) == 46 { dot = i }
+        i = i + 1
+    }
+    if dot < 0 { return name }
+    name.substr(dot + 1, name.len() - dot - 1)
+}
+
+// ── Key operations ────────────────────────────────────────────────────────
+
+fn lo_kops_of(r: Int) -> Str {
+    let k = tc_tid_kind(r)
+    let builtin = lo_kops_scalar(k)
+    if builtin != "" { return builtin }
+    if k != TyKind.Struct && k != TyKind.Enum { return "" }
+    let decl = lo_decl_node_of(r)
+    if !lo_decl_has_derive(decl, "Hash") { return "" }
+    "kops_blink_{lo_tag_nominal(r)}"
+}
+
+fn lo_kops_scalar(k: TyKind) -> Str {
+    match k {
+        TyKind.Int => "blink_kops_i64"
+        TyKind.Str => "blink_kops_str"
+        TyKind.Bool => "blink_kops_bool"
+        TyKind.Char => "blink_kops_char"
+        TyKind.I8 => "blink_kops_i8"
+        TyKind.I16 => "blink_kops_i16"
+        TyKind.I32 => "blink_kops_i32"
+        TyKind.U8 => "blink_kops_u8"
+        TyKind.U16 => "blink_kops_u16"
+        TyKind.U32 => "blink_kops_u32"
+        TyKind.U64 => "blink_kops_u64"
+        _ => ""
+    }
+}
+
+// ── Declaration node facts ────────────────────────────────────────────────
+
+fn lo_decl_node_of(r: Int) -> Int {
+    let name = tc_tid_name(r)
+    let direct = tc_type_decl_nodes.get(name) ?? -1
+    if direct >= 0 { return direct }
+    tc_type_decl_nodes.get(lo_bare_name(name)) ?? -1
+}
+
+fn lo_decl_is_generic(decl: Int) -> Bool {
+    if decl < 0 { return false }
+    let tps = node_type_params(decl)
+    tps != -1 && sublist_length(tps) > 0
+}
+
+fn lo_decl_is_enum(decl: Int) -> Bool {
+    if decl < 0 { return false }
+    let flds = node_fields(decl)
+    if flds == -1 || sublist_length(flds) == 0 { return false }
+    node_kind(sublist_get(flds, 0)) == NodeKind.TypeVariant
+}
+
+fn lo_decl_is_data_enum(decl: Int) -> Bool {
+    if !lo_decl_is_enum(decl) { return false }
+    let vars = node_fields(decl)
+    let mut i = 0
+    while i < sublist_length(vars) {
+        let vflds = node_fields(sublist_get(vars, i))
+        if vflds != -1 && sublist_length(vflds) > 0 { return true }
+        i = i + 1
+    }
+    false
+}
+
+// The transparent newtype contract is scoped to the name Errno with exactly one
+// variant that carries exactly one Int. Any other shape lowers as a normal enum.
+fn lo_is_transparent_newtype(r: Int) -> Bool {
+    if tc_tid_kind(r) != TyKind.Enum { return false }
+    if lo_bare_name(tc_tid_name(r)) != "Errno" { return false }
+    let decl = lo_decl_node_of(r)
+    if !lo_decl_is_enum(decl) { return false }
+    let vars = node_fields(decl)
+    if sublist_length(vars) != 1 { return false }
+    let vflds = node_fields(sublist_get(vars, 0))
+    if vflds == -1 || sublist_length(vflds) != 1 { return false }
+    let ann = node_value(sublist_get(vflds, 0))
+    ann != -1 && node_name(ann) == "Int"
+}
+
+fn lo_opaque_c_name(r: Int) -> Str {
+    let k = tc_tid_kind(r)
+    if k != TyKind.Struct && k != TyKind.Enum { return "" }
+    let decl = lo_decl_node_of(r)
+    if decl < 0 { return "" }
+    let ann = get_annotation(decl, "ffi.opaque")
+    if ann == -1 { return "" }
+    get_str_named_arg(ann, "name")
+}
+
+fn lo_decl_has_derive(decl: Int, derive_name: Str) -> Bool {
+    if decl < 0 { return false }
+    let anns = node_handlers(decl)
+    if anns == -1 { return false }
+    let mut i = 0
+    while i < sublist_length(anns) {
+        let ann = sublist_get(anns, i)
+        if node_name(ann) == "derive" && lo_args_name(node_args(ann), derive_name) { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn lo_args_name(args_sl: Int, want: Str) -> Bool {
+    if args_sl == -1 { return false }
+    let mut j = 0
+    while j < sublist_length(args_sl) {
+        if node_name(sublist_get(args_sl, j)) == want { return true }
+        j = j + 1
+    }
+    false
+}
+
+// ── Typedef emission ──────────────────────────────────────────────────────
+
+fn lo_guard_and_push(name: Str, body: Str) {
+    typedef_guard.insert(name, 1)
+    typedef_buffer.push("#ifndef BLINK_TD_{name}\n#define BLINK_TD_{name}\n{body}\n#endif")
+}
+
+fn lo_is_carrier_kind(k: TyKind) -> Bool {
+    k == TyKind.Option || k == TyKind.Result || k == TyKind.Tuple
+}
+
+// The C compiler must have seen a member's type before the struct that embeds it.
+fn lo_ensure_child_typedef(child: Int) {
+    let c = lo_res(child)
+    if lo_is_carrier_kind(tc_tid_kind(c)) { let _ = ensure_typedef_for(c) }
+}
+
+// The Option payload: word-sized values and plain enums sit inline; a struct, data
+// enum, instance, carrier or tuple sits behind a pointer.
+fn lo_emit_option_typedef(r: Int, name: Str) {
+    let inner = lo_res(tc_tid_child(r, 0))
+    if lo_opaque_c_name(inner) != "" { return }
+    if typedef_guard.contains_key(name) != 0 { return }
+    lo_ensure_child_typedef(inner)
+    let member = if lo_fits_word(inner) { lo_member_spelling(inner) } else { "{lo_spell(inner)}*" }
+    lo_guard_and_push(name, "typedef struct \{ int tag; {member} value; } {name};")
+}
+
+// The ok arm is by value; a struct-typed err arm is by pointer; a Void arm is an
+// int64_t placeholder. blink_Result_str_str is declared by the runtime header.
+fn lo_emit_result_typedef(r: Int, name: Str) {
+    if typedef_guard.contains_key(name) != 0 { return }
+    if name == "blink_Result_str_str" {
+        typedef_guard.insert(name, 1)
+        return
+    }
+    let ok = lo_res(tc_tid_child(r, 0))
+    let err = lo_res(tc_tid_child(r, 1))
+    lo_ensure_child_typedef(ok)
+    lo_ensure_child_typedef(err)
+    let ok_member = lo_member_spelling(ok)
+    let mut err_member = lo_member_spelling(err)
+    if lo_is_struct_by_pointer_err(err) { err_member = "{err_member}*" }
+    lo_guard_and_push(name, "typedef struct \{ int tag; union \{ {ok_member} ok; {err_member} err; }; } {name};")
+}
+
+fn lo_is_struct_by_pointer_err(err: Int) -> Bool {
+    let k = tc_tid_kind(err)
+    if k != TyKind.Struct { return false }
+    !lo_fits_word(err)
+}
+
+// Every tuple element is by value.
+fn lo_emit_tuple_typedef(r: Int, name: Str) {
+    if typedef_guard.contains_key(name) != 0 { return }
+    let n = tc_tid_child_count(r)
+    let mut i = 0
+    while i < n {
+        lo_ensure_child_typedef(tc_tid_child(r, i))
+        i = i + 1
+    }
+    let mut body = "typedef struct \{\n"
+    i = 0
+    while i < n {
+        body = "{body}    {lo_member_spelling(lo_res(tc_tid_child(r, i)))} _{i};\n"
+        i = i + 1
+    }
+    lo_guard_and_push(name, "{body}} {name};")
+}
+
+// A carrier member drops the pointee or effect: one blink_Option_ptr must serve every
+// Ptr[T] and one blink_Option_handler every effect, or two payload types would fight
+// over one guarded typedef name.
+fn lo_member_spelling(r: Int) -> Str {
+    let k = tc_tid_kind(r)
+    if lo_is_void_like(k) { return "int64_t" }
+    if k == TyKind.Ptr || k == TyKind.Handler { return "void*" }
+    lo_spell(r)
+}
