@@ -1,0 +1,103 @@
+import std.fs
+import std.io
+import typecheck.{tc_type_str, tc_lookup_node_tid, check_types, make_enum_instance_type, make_tuple_type, tc_type_decl_nodes}
+import layout.{field_layout_of, layout_of, layout_reset, Position, SlotForm}
+import parser.{nodes}
+import compiler.{compile_to_program}
+import codegen_expr
+import cname_test_helpers.{assert_eq_str}
+
+fn slot_form_name(f: SlotForm) -> Str {
+    match f {
+        SlotForm.Inline => "Inline"
+        SlotForm.PointerBoxed => "PointerBoxed"
+        SlotForm.InlineWord => "InlineWord"
+    }
+}
+
+// Tree and Pair reach themselves (directly and through a tuple); LL is the non-generic
+// shape; Holder embeds the same instances without being recursive itself.
+fn probe_src() -> Str {
+    #"type Tree[T] { Leaf(v: T), Node(l: Tree[T], r: Tree[T]) }
+type Pair[T] { One(v: T), Two(p: (Pair[T], Pair[T])) }
+type LL { Nil, Cons(h: Int, t: LL) }
+type Holder { t: Tree[Int], p: Pair[Int], l: LL }
+fn main() {
+    let i: Int = 1
+    let ll: LL = LL.Nil
+    let t: Tree[Int] = Tree.Leaf(1)
+    let p: Pair[Int] = Pair.One(2)
+    let h = Holder { t: t, p: p, l: ll }
+    io.println("{i} {h.t.is_leaf()}")
+}
+"#
+}
+
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/layout_selfrec_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    while idx < nodes.len() {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 { m.insert(tc_type_str(tid), tid) }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 {
+        io.println("FAIL: harvested map has no tid for rendered type string '{key}'")
+    }
+    assert(tid != -1)
+    tid
+}
+
+fn decl_of(name: Str) -> Int {
+    let d = tc_type_decl_nodes.get(name) ?? -1
+    assert(d >= 0)
+    d
+}
+
+fn assert_field(label: Str, owner: Str, field_tid: Int, want_form: SlotForm, want_spelling: Str) {
+    let rec = field_layout_of(decl_of(owner), field_tid)
+    assert_eq_str("{label} decline", rec.decline_reason, "")
+    assert_eq_str("{label} form", slot_form_name(rec.slot_form), slot_form_name(want_form))
+    assert_eq_str("{label} spelling", rec.c_spelling, want_spelling)
+}
+
+// The same instance tid is boxed in its own enum and held by value anywhere else.
+test "a self-recursive generic enum field is boxed only inside its own enum" {
+    let m = harvest_type_tids()
+    let tree_int = make_enum_instance_type("Tree", [expect_tid(m, "Int")])
+    assert_field("Tree.Node.l in Tree", "Tree", tree_int, SlotForm.PointerBoxed, "int64_t")
+    assert_field("Holder.t", "Holder", tree_int, SlotForm.Inline, "blink_Tree_0Int")
+    assert_eq_str("plain Field position is by value", layout_of(tree_int, Position.Field).c_spelling, "blink_Tree_0Int")
+}
+
+// A non-generic enum follows the same rule on its bare tid.
+test "a self-recursive non-generic enum field is boxed only inside its own enum" {
+    let m = harvest_type_tids()
+    let ll = expect_tid(m, "LL")
+    assert_field("LL.Cons.t in LL", "LL", ll, SlotForm.PointerBoxed, "int64_t")
+    assert_field("LL.Cons.h in LL", "LL", expect_tid(m, "Int"), SlotForm.InlineWord, "int64_t")
+    assert_field("Holder.l", "Holder", ll, SlotForm.Inline, "blink_LL")
+}
+
+// A tuple that reaches the owner at any depth embeds it by value, so it is boxed too.
+test "a tuple field that reaches its own enum is boxed only inside that enum" {
+    let m = harvest_type_tids()
+    let pair_int = make_enum_instance_type("Pair", [expect_tid(m, "Int")])
+    let tup = make_tuple_type([pair_int, pair_int])
+    let nested = make_tuple_type([expect_tid(m, "Int"), tup])
+    assert_field("Pair.Two.p in Pair", "Pair", tup, SlotForm.PointerBoxed, "int64_t")
+    assert_field("nested tuple in Pair", "Pair", nested, SlotForm.PointerBoxed, "int64_t")
+    assert_field("same tuple in Holder", "Holder", tup, SlotForm.Inline, "blink_Tuple2_Pair_0Int_Pair_0Int")
+    assert_field("Pair.One.v in Pair", "Pair", expect_tid(m, "Int"), SlotForm.InlineWord, "int64_t")
+}
