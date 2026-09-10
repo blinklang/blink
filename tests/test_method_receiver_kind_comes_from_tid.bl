@@ -1,0 +1,530 @@
+// Method dispatch decides WHICH emitter runs from the receiver's type. When that
+// decision reads a flat C-type code published beside the value instead of the
+// receiver's own type id, three things go wrong and none of them is a diagnostic:
+//
+//   - a receiver that arrives boxed out of a container carries the box's code,
+//     not its own, so `Some(d).unwrap().to_ms()` misses the Duration emitter
+//     that the byte-identical direct call reaches;
+//   - a chained receiver (`f().get(k)`) is no named variable, so a lookup keyed
+//     on the emitted C text finds nothing and the container's key/value shape
+//     falls back to a default;
+//   - a receiver bound to a type parameter inside a monomorphized instance
+//     reads the pre-substitution shape.
+//
+// Every assertion below is on a VALUE. These shapes miscompile quietly or emit C
+// the C compiler rejects; none of them raises an error.
+
+type MPoint { x: Int, y: Int }
+type MPair { a: Int, b: Str }
+type MColor { Red, Green, Blue }
+type MHolder { items: List[Int], lookup: Map[Str, Int] }
+
+@derive(Hash, Eq)
+type MKey { id: Int, tag: Str }
+
+type MBox[T] { v: T }
+
+// ── chained-call receivers of every head kind ───────────────────────────────
+// The receiver is the RESULT of a call, so it is never a scope variable and the
+// name-keyed recovery path has nothing to find. Only the receiver node's own
+// type answers.
+
+fn m_list() -> List[Int] { [3, 1, 2] }
+fn m_str() -> Str { "chain" }
+fn m_map() -> Map[Str, Int] {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 11)
+    m.insert("b", 22)
+    m
+}
+fn m_set() -> Set[Int] {
+    let mut s: Set[Int] = Set()
+    s.insert(4)
+    s.insert(5)
+    s
+}
+fn m_bytes() -> Bytes { Bytes.from_str("hello") }
+fn m_int() -> Int { 7 }
+fn m_float() -> Float { 2.5 }
+fn m_bool() -> Bool { true }
+fn m_char() -> Char { 'q' }
+fn m_opt() -> Option[Int] { Some(31) }
+fn m_res() -> Result[Int, Str] { Ok(41) }
+fn m_sb() -> StringBuilder {
+    let mut b = StringBuilder.new()
+    b.write("sb")
+    b
+}
+
+test "a chained List receiver dispatches as a list" {
+    assert_eq(m_list().len(), 3)
+    assert_eq(m_list().get(0).unwrap(), 3)
+}
+
+test "a chained Str receiver dispatches as a string" {
+    assert_eq(m_str().len(), 5)
+    assert_eq(m_str().to_upper(), "CHAIN")
+}
+
+test "a chained Map receiver dispatches as a map" {
+    assert_eq(m_map().get("a").unwrap(), 11)
+    assert_eq(m_map().len(), 2)
+    assert_eq(m_map().contains_key("b"), true)
+}
+
+test "a chained Set receiver dispatches as a set" {
+    assert_eq(m_set().len(), 2)
+    assert_eq(m_set().contains(4), true)
+}
+
+test "a chained Bytes receiver dispatches as bytes" {
+    assert_eq(m_bytes().len(), 5)
+    assert_eq(m_bytes().to_str().unwrap(), "hello")
+}
+
+test "a chained Int receiver dispatches as an int" {
+    assert_eq(m_int().to_float(), 7.0)
+    assert_eq(m_int().display(), "7")
+}
+
+test "a chained Float receiver dispatches as a float" {
+    assert_eq(m_float().to_int(), 2)
+    assert_eq(m_float().display(), "2.5")
+}
+
+test "a chained Bool receiver dispatches as a bool" {
+    assert_eq(m_bool().display(), "true")
+}
+
+test "a chained Char receiver dispatches as a char" {
+    assert_eq(m_char().display(), "q")
+    assert_eq(m_char().to_int(), 113)
+}
+
+test "a chained Option receiver dispatches as an option" {
+    assert_eq(m_opt().unwrap(), 31)
+    assert_eq(m_opt().is_some(), true)
+    assert_eq(m_opt().is_none(), false)
+}
+
+test "a chained Result receiver dispatches as a result" {
+    assert_eq(m_res().unwrap(), 41)
+    assert_eq(m_res().is_ok(), true)
+}
+
+test "a chained StringBuilder receiver dispatches as a builder" {
+    assert_eq(m_sb().to_str(), "sb")
+}
+
+// ── a receiver two calls deep ───────────────────────────────────────────────
+
+test "an iterator receiver produced by an adapter chain counts" {
+    assert_eq(m_list().into_iter().map(fn(x: Int) -> Int { x * 2 }).count(), 3)
+}
+
+test "an iterator receiver produced by an adapter chain collects" {
+    let got = m_list().into_iter().filter(fn(x: Int) -> Bool { x > 1 }).collect()
+    assert_eq(got.len(), 2)
+    assert_eq(got.get(0).unwrap(), 3)
+}
+
+test "a map value reached through two chained calls is an int" {
+    assert_eq(m_map().get("b").unwrap().to_float(), 22.0)
+}
+
+// ── Duration and Instant out of carriers ────────────────────────────────────
+// A Duration retrieved from an Option, a Result or a List arrives boxed. The
+// box's code says "some struct"; only the type id says "Duration", and the
+// method emitter is chosen by that.
+
+fn m_opt_dur() -> Option[Duration] { Some(Duration.ms(1500)) }
+fn m_res_dur() -> Result[Duration, Str] { Ok(Duration.seconds(3)) }
+fn m_list_dur() -> List[Duration] { [Duration.ms(250), Duration.ms(750)] }
+fn m_opt_inst() -> Option[Instant] { Some(Instant.from_epoch_secs(1000)) }
+fn m_list_inst() -> List[Instant] { [Instant.from_epoch_secs(2000)] }
+
+test "a Duration unwrapped out of an Option answers to_ms" {
+    assert_eq(m_opt_dur().unwrap().to_ms(), 1500)
+}
+
+test "a Duration unwrapped out of an Option answers to_seconds" {
+    assert_eq(m_opt_dur().unwrap().to_seconds(), 1)
+}
+
+test "a Duration unwrapped out of a Result answers to_ms" {
+    assert_eq(m_res_dur().unwrap().to_ms(), 3000)
+}
+
+test "a Duration read out of a List answers to_ms" {
+    assert_eq(m_list_dur().get(1).unwrap().to_ms(), 750)
+}
+
+test "a Duration out of a carrier still adds and scales" {
+    let d = m_opt_dur().unwrap()
+    assert_eq(d.add(Duration.ms(500)).to_ms(), 2000)
+    assert_eq(d.scale(2).to_ms(), 3000)
+    assert_eq(d.is_zero(), false)
+}
+
+test "an Instant unwrapped out of an Option answers to_unix_secs" {
+    assert_eq(m_opt_inst().unwrap().to_unix_secs(), 1000)
+}
+
+test "an Instant read out of a List answers to_unix_ms" {
+    assert_eq(m_list_inst().get(0).unwrap().to_unix_ms(), 2000000)
+}
+
+test "an Instant out of a carrier still measures a difference" {
+    let later = Instant.from_epoch_secs(1005)
+    assert_eq(later.since(m_opt_inst().unwrap()).to_seconds(), 5)
+}
+
+// ── Map receivers with struct keys and struct values ────────────────────────
+
+fn m_struct_key_map() -> Map[MKey, Int] {
+    let mut m: Map[MKey, Int] = Map()
+    m.insert(MKey { id: 1, tag: "one" }, 100)
+    m.insert(MKey { id: 2, tag: "two" }, 200)
+    m
+}
+
+fn m_struct_val_map() -> Map[Str, MPoint] {
+    let mut m: Map[Str, MPoint] = Map()
+    m.insert("p", MPoint { x: 3, y: 4 })
+    m
+}
+
+test "a chained Map with a struct key looks up by value" {
+    assert_eq(m_struct_key_map().get(MKey { id: 2, tag: "two" }).unwrap(), 200)
+}
+
+test "a chained Map with a struct key reports its size" {
+    assert_eq(m_struct_key_map().len(), 2)
+}
+
+test "a chained Map with a struct value returns the struct fields" {
+    let p = m_struct_val_map().get("p").unwrap()
+    assert_eq(p.x, 3)
+    assert_eq(p.y, 4)
+}
+
+test "a chained Map with a struct value answers contains_key" {
+    assert_eq(m_struct_val_map().contains_key("p"), true)
+    assert_eq(m_struct_val_map().contains_key("q"), false)
+}
+
+// ── receivers through a generic binder inside a mono instance ───────────────
+// Inside `fn f[T](x: T)` the binder's type is a type parameter until the
+// instance substitutes it. A dispatch that reads the pre-substitution shape
+// picks the wrong emitter for every instance.
+
+fn m_len_of[T](xs: List[T]) -> Int { xs.len() }
+
+fn m_first_or[T](xs: List[T], d: T) -> T {
+    match xs.get(0) {
+        Some(v) => v
+        None => d
+    }
+}
+
+fn m_unbox[T](b: MBox[T]) -> T { b.v }
+
+fn m_box_len(b: MBox[List[Int]]) -> Int { b.v.len() }
+
+fn m_box_map_get(b: MBox[Map[Str, Int]], k: Str) -> Int { b.v.get(k) ?? -1 }
+
+test "a generic list binder answers len at two instances" {
+    assert_eq(m_len_of([1, 2, 3]), 3)
+    assert_eq(m_len_of(["a", "b"]), 2)
+}
+
+test "a generic list binder answers get at two instances" {
+    assert_eq(m_first_or([9, 8], 0), 9)
+    assert_eq(m_first_or(["z"], "?"), "z")
+}
+
+test "a generic struct field receiver dispatches per instance" {
+    assert_eq(m_box_len(MBox { v: [4, 5, 6] }), 3)
+}
+
+test "a generic struct field map receiver dispatches per instance" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("k", 77)
+    assert_eq(m_box_map_get(MBox { v: m }, "k"), 77)
+    assert_eq(m_box_map_get(MBox { v: Map() }, "k"), -1)
+}
+
+test "a value unboxed from a generic struct answers its own methods" {
+    assert_eq(m_unbox(MBox { v: 12 }).to_float(), 12.0)
+    assert_eq(m_unbox(MBox { v: "hi" }).len(), 2)
+    assert_eq(m_unbox(MBox { v: [1, 2] }).len(), 2)
+}
+
+test "a Duration unboxed from a generic struct answers to_ms" {
+    assert_eq(m_unbox(MBox { v: Duration.ms(400) }).to_ms(), 400)
+}
+
+// ── receivers bound by a for-in loop ────────────────────────────────────────
+
+test "a for-in binder over a list of strings dispatches as a string" {
+    let mut total = 0
+    for s in ["aa", "bbb", "c"] {
+        total = total + s.len()
+    }
+    assert_eq(total, 6)
+}
+
+test "a for-in binder over a list of lists dispatches as a list" {
+    let mut total = 0
+    for inner in [[1, 2], [3], []] {
+        total = total + inner.len()
+    }
+    assert_eq(total, 3)
+}
+
+test "a for-in binder over a list of durations dispatches as a duration" {
+    let mut total = 0
+    for d in m_list_dur() {
+        total = total + d.to_ms()
+    }
+    assert_eq(total, 1000)
+}
+
+test "a for-in binder over a list of maps dispatches as a map" {
+    let mut a: Map[Str, Int] = Map()
+    a.insert("x", 1)
+    let mut b: Map[Str, Int] = Map()
+    b.insert("x", 2)
+    b.insert("y", 3)
+    let mut total = 0
+    for m in [a, b] {
+        total = total + m.len()
+    }
+    assert_eq(total, 3)
+}
+
+// ── receivers bound by a with block ─────────────────────────────────────────
+
+type MRes { name: Str, tally: List[Int] }
+
+impl Closeable for MRes {
+    fn close(self) {}
+}
+
+fn m_open(name: Str) -> MRes { MRes { name: name, tally: [1, 2, 3] } }
+
+test "a with-block binder answers its own struct field methods" {
+    let mut n = 0
+    with m_open("r") as r {
+        n = r.name.len() + r.tally.len()
+    }
+    assert_eq(n, 4)
+}
+
+test "a with-block binder field is a real list receiver" {
+    let mut got = 0
+    with m_open("r2") as r {
+        got = r.tally.get(2).unwrap()
+    }
+    assert_eq(got, 3)
+}
+
+// ── receivers reached through a field access ────────────────────────────────
+
+test "a struct field of list type dispatches as a list" {
+    let h = MHolder { items: [5, 6, 7], lookup: Map() }
+    assert_eq(h.items.len(), 3)
+    assert_eq(h.items.get(1).unwrap(), 6)
+}
+
+test "a struct field of map type dispatches as a map" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("f", 9)
+    let h = MHolder { items: [], lookup: m }
+    assert_eq(h.lookup.get("f").unwrap(), 9)
+    assert_eq(h.lookup.len(), 1)
+}
+
+test "a struct field of str type dispatches as a string" {
+    let p = MPair { a: 1, b: "field" }
+    assert_eq(p.b.len(), 5)
+    assert_eq(p.b.to_upper(), "FIELD")
+}
+
+// ── receivers reached through a tuple element ───────────────────────────────
+
+fn m_tuple() -> (List[Int], Str) { ([1, 2, 3, 4], "tup") }
+
+fn m_tuple_map() -> (Map[Str, Int], Int) {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("t", 8)
+    (m, 1)
+}
+
+test "a tuple element of list type dispatches as a list" {
+    let t = m_tuple()
+    assert_eq(t.0.len(), 4)
+    assert_eq(t.0.get(3).unwrap(), 4)
+}
+
+test "a tuple element of str type dispatches as a string" {
+    let t = m_tuple()
+    assert_eq(t.1.len(), 3)
+}
+
+test "a tuple element of map type dispatches as a map" {
+    let t = m_tuple_map()
+    assert_eq(t.0.get("t").unwrap(), 8)
+}
+
+// ── receivers of Ptr and channel kinds keep their own dispatch ──────────────
+
+test "a channel receiver still sends and receives" {
+    let ch: Channel[Int] = Channel(4)
+    ch.send(5)
+    ch.send(6)
+    assert_eq(ch.recv(), 5)
+    assert_eq(ch.recv(), 6)
+}
+
+// ── an enum receiver keeps user dispatch, not a builtin one ─────────────────
+
+trait MLabelled {
+    fn label(self) -> Str
+}
+
+impl MLabelled for MColor {
+    fn label(self) -> Str {
+        match self {
+            MColor.Red => "red"
+            MColor.Green => "green"
+            MColor.Blue => "blue"
+        }
+    }
+}
+
+test "an enum receiver out of a list reaches its user method" {
+    let cs = [MColor.Red, MColor.Blue]
+    assert_eq(cs.get(1).unwrap().label(), "blue")
+}
+
+test "an enum receiver out of an option reaches its user method" {
+    let c: Option[MColor] = Some(MColor.Green)
+    assert_eq(c.unwrap().label(), "green")
+}
+
+// ── a struct receiver out of a carrier reaches its user method ──────────────
+
+trait MNormed {
+    fn norm(self) -> Int
+}
+
+impl MNormed for MPoint {
+    fn norm(self) -> Int { self.x * self.x + self.y * self.y }
+}
+
+test "a struct receiver unwrapped from an Option reaches its user method" {
+    let p: Option[MPoint] = Some(MPoint { x: 3, y: 4 })
+    assert_eq(p.unwrap().norm(), 25)
+}
+
+test "a struct receiver read from a list reaches its user method" {
+    let ps = [MPoint { x: 1, y: 2 }, MPoint { x: 5, y: 0 }]
+    assert_eq(ps.get(1).unwrap().norm(), 25)
+}
+
+test "a struct receiver out of a map reaches its user method" {
+    assert_eq(m_struct_val_map().get("p").unwrap().norm(), 25)
+}
+
+// ── a user trait impl on a builtin receiver still wins ──────────────────────
+
+trait Doubled {
+    fn doubled(self) -> Int
+}
+
+impl Doubled for Str {
+    fn doubled(self) -> Int { self.len() * 2 }
+}
+
+test "a user trait impl on Str wins over the builtin dispatch" {
+    assert_eq(m_str().doubled(), 10)
+    assert_eq(m_tuple().1.doubled(), 6)
+}
+
+// ── into() conversions read the receiver kind too ───────────────────────────
+
+type MCelsius { deg: Int }
+
+impl From[Int] for MCelsius {
+    fn from(v: Int) -> MCelsius { MCelsius { deg: v } }
+}
+
+test "into on a chained int receiver converts through the from impl" {
+    let c: MCelsius = m_int().into()
+    assert_eq(c.deg, 7)
+}
+
+test "into on a chained int receiver converts to a float" {
+    let f: Float = m_int().into()
+    assert_eq(f, 7.0)
+}
+
+test "into on a chained int receiver converts to a string" {
+    let s: Str = m_int().into()
+    assert_eq(s, "7")
+}
+
+// ── sized-int receivers keep their width ────────────────────────────────────
+
+fn m_u8() -> U8 { 200.to_u8() }
+fn m_i32() -> I32 { (0 - 5).to_i32() }
+
+test "a chained U8 receiver wraps at its own width" {
+    assert_eq(m_u8().wrapping_add(100).to_int(), 44)
+}
+
+test "a chained I32 receiver converts to Int" {
+    assert_eq(m_i32().to_int(), -5)
+}
+
+// ── a sealed ops-trait qualified call as a receiver ─────────────────────────
+
+test "a qualified sealed ops call is a typed receiver for a chained method" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("key", 42)
+    assert_eq(MapOps.get(m, "key").unwrap(), 42)
+}
+
+test "a qualified sealed ops call on a list is a typed receiver" {
+    let mut ls: List[Int] = []
+    ls.push(11)
+    assert_eq(ListOps.get(ls, 0).unwrap(), 11)
+}
+
+test "a qualified sealed ops call on a str is a typed receiver" {
+    assert_eq(StrOps.to_upper("hi").len(), 2)
+}
+
+// The receiver of `Trait.method(x, ..)` is argument 0. The trait name sits where an
+// instance call keeps its receiver, so an emitter that reads the receiver's slots off
+// that node reads them off the trait instead and lands on erased defaults.
+
+test "a qualified map call recovers a struct value from the receiver" {
+    let mut m: Map[Str, MPoint] = Map()
+    m.insert("a", MPoint { x: 3, y: 4 })
+    let p = MapOps.get(m, "a").unwrap()
+    assert_eq(p.y, 4)
+}
+
+test "a qualified map call recovers a struct key from the receiver" {
+    let mut m: Map[MKey, Int] = Map()
+    m.insert(MKey { id: 1, tag: "a" }, 9)
+    assert_eq(MapOps.get(m, MKey { id: 1, tag: "a" }).unwrap(), 9)
+}
+
+test "a qualified set call reads the receiver, not the trait name" {
+    let mut s: Set[Int] = Set()
+    s.insert(4)
+    assert_eq(SetOps.contains(s, 4), true)
+}

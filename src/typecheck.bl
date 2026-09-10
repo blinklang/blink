@@ -1765,6 +1765,111 @@ fn tc_pin_ops_trait_receiver(trait_name: Str, method: Str, args_sl: Int) ! TypeC
     }
 }
 
+// The RETURN TYPE of a sealed Ops-trait call spelled statically —
+// `MapOps.get(m, k)`, the spec's disambiguating form (§03c:697). The qualified
+// resolution arm excludes the sealed traits (no impl fnsig exists for them), so the
+// call answered Unknown and NOTHING stamped the node: a chained receiver
+// (`MapOps.get(m, k).unwrap()`) then reached codegen with no type to dispatch on.
+//
+// The qualified spelling denotes the same call as `m.get(k)`, so it answers with the
+// same type, read off the receiver at args[0]. Only the ANSWER is given here — the
+// checks the instance arms make are not repeated, so this adds a type where there was
+// none and rejects nothing that compiles today. It therefore does not close the gaps
+// the qualified spelling already had: the trait qualifier goes unverified, arity goes
+// unchecked, and a receiver the instance arm would refuse still passes. Declines with
+// -1 for anything outside the sealed method surface.
+fn tc_ops_trait_qualified_ret(method: Str, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if args_sl == -1 || sublist_length(args_sl) < 1 { return -1 }
+    // Only the receiver is inferred here. infer_type sweeps this call's still-untyped
+    // arguments itself once this answer returns, and inference is uncached — a second
+    // walk of an already-typed argument re-runs its reports and re-mints the metavars
+    // an empty literal binds.
+    let recv = tc_resolve(infer_type(sublist_get(args_sl, 0)))
+    let k = type_kind(recv)
+    // `len` and `is_empty` are the two every sized receiver answers; `count` is List's
+    // alone and `capacity` StringBuilder's, exactly as the instance arms below have them.
+    // Answering either for the other receivers would invent surface codegen cannot emit.
+    if method == "len" || method == "is_empty" || (method == "count" && k == TyKind.List) || (method == "capacity" && k == TyKind.StringBuilder) {
+        if tc_ops_trait_sized_kind(k) != 0 {
+            if method == "is_empty" { return TYPE_BOOL }
+            return TYPE_INT
+        }
+    }
+    if k == TyKind.Str {
+        if method == "contains" || method == "starts_with" || method == "ends_with" { return TYPE_BOOL }
+        if method == "index_of" || method == "byte_at" || method == "to_int" || method == "parse_int" { return TYPE_INT }
+        if method == "parse_float" { return TYPE_FLOAT }
+        if method == "concat" || method == "replace" || method == "trim" || method == "trim_left" || method == "trim_right" { return TYPE_STR }
+        if method == "to_upper" || method == "to_lower" || method == "substring" || method == "substr" || method == "slice" { return TYPE_STR }
+        if method == "char_at" { return make_option_type(TYPE_CHAR) }
+        if method == "split" || method == "lines" { return make_list_type(TYPE_STR) }
+    }
+    if k == TyKind.List {
+        let elem = ty_pool.get(recv).unwrap().inner1
+        if method == "get" || method == "pop" { return make_option_type(elem) }
+        if method == "push" || method == "set" || method == "clear" { return TYPE_VOID }
+        if method == "append" || method == "slice" || method == "take" || method == "skip" { return recv }
+        if method == "contains" { return TYPE_BOOL }
+        if method == "join" { return TYPE_STR }
+    }
+    if k == TyKind.Map {
+        let key_t = ty_pool.get(recv).unwrap().inner1
+        let val_t = ty_pool.get(recv).unwrap().inner2
+        if method == "get" { return make_option_type(val_t) }
+        if method == "insert" || method == "clear" { return TYPE_VOID }
+        if method == "contains_key" || method == "contains" || method == "remove" { return TYPE_BOOL }
+        if method == "keys" { return make_list_type(key_t) }
+        if method == "values" { return make_list_type(val_t) }
+    }
+    if k == TyKind.Set {
+        if method == "insert" || method == "contains" || method == "remove" { return TYPE_BOOL }
+        if method == "union" { return recv }
+    }
+    if k == TyKind.Bytes {
+        if method == "get" { return make_option_type(TYPE_INT) }
+        if method == "push" || method == "set" { return TYPE_VOID }
+        if method == "slice" || method == "concat" { return recv }
+        if method == "to_str" { return make_result_type(TYPE_STR, TYPE_STR) }
+        if method == "to_hex" { return TYPE_STR }
+        if tc_bytes_read_be_le(method) != 0 { return make_result_type(TYPE_INT, TYPE_STR) }
+        if tc_bytes_write_be_le(method) != 0 { return TYPE_VOID }
+        if tc_bytes_set_be_le(method) != 0 { return make_result_type(TYPE_VOID, TYPE_STR) }
+    }
+    if k == TyKind.StringBuilder {
+        if method == "write" || method == "write_char" || method == "clear" { return TYPE_VOID }
+        if method == "to_str" { return TYPE_STR }
+    }
+    -1
+}
+
+// The receivers that answer `Sized`. Anything else declines, so a sized method on a
+// receiver the instance arms never answer for stays untyped rather than inventing one.
+fn tc_ops_trait_sized_kind(k: TyKind) -> Int {
+    if k == TyKind.Str || k == TyKind.List || k == TyKind.Map || k == TyKind.Set { return 1 }
+    if k == TyKind.Bytes || k == TyKind.StringBuilder { return 1 }
+    0
+}
+
+// The three Bytes offset families, spelled once each. They differ only in what they
+// answer with, so listing the names inline at each use would hide that.
+fn tc_bytes_read_be_le(method: Str) -> Int {
+    if method == "read_u16_be" || method == "read_u32_be" || method == "read_i32_be" || method == "read_i64_be" { return 1 }
+    if method == "read_u16_le" || method == "read_u32_le" || method == "read_i32_le" || method == "read_i64_le" { return 1 }
+    0
+}
+
+fn tc_bytes_write_be_le(method: Str) -> Int {
+    if method == "write_u16_be" || method == "write_u32_be" || method == "write_i32_be" || method == "write_i64_be" { return 1 }
+    if method == "write_u16_le" || method == "write_u32_le" || method == "write_i32_le" || method == "write_i64_le" { return 1 }
+    0
+}
+
+fn tc_bytes_set_be_le(method: Str) -> Int {
+    if method == "set_u16_be" || method == "set_u32_be" || method == "set_u64_be" || method == "set_i16_be" || method == "set_i32_be" || method == "set_i64_be" { return 1 }
+    if method == "set_u16_le" || method == "set_u32_le" || method == "set_u64_le" || method == "set_i16_le" || method == "set_i32_le" || method == "set_i64_le" { return 1 }
+    0
+}
+
 // ── Deferred E0301 blame ────────────────────────────────────────────
 //
 // E0301 is reported where its repair attaches (decisions/under-determined-types.md,
@@ -14139,6 +14244,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // MapOps.insert(m,"k",42)` infers Map[Str,Int] rather than E0301.
             if is_sealed_builtin_trait(obj_name) != 0 {
                 tc_pin_ops_trait_receiver(obj_name, method, node_args(node))
+                let ops_ret = tc_ops_trait_qualified_ret(method, node_args(node))
+                if ops_ret != -1 { return ops_ret }
             }
             if obj_name == "Char" {
                 if method == "from_code_point" {
