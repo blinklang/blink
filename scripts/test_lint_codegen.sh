@@ -74,6 +74,16 @@ else
     echo "ok   single_producer goes red (twin)"
 fi
 expect_red import_dag          cg_b.bl 'import codegen'
+# import_dag also carries scripts/lint_import_dag.sh: layout.bl must import cname.
+dir="$WORK/case_import_dag_shared"
+write_clean "$dir"
+printf 'import typecheck.{tc_x}\npub fn layout_of() -> Int { 1 }\n' > "$dir/src/layout.bl"
+printf 'pub fn c_fn_name() -> Str { "" }\n' > "$dir/src/cname.bl"
+if run_lint "$dir" > "$dir.out" 2>&1 || ! grep -qE '^L8 +import_dag .*OVER' "$dir.out" || ! grep -q 'must import cname' "$dir.out"; then
+    echo "FAIL import_dag: missing layout -> cname edge not caught:"; cat "$dir.out"; fail=1
+else
+    echo "ok   import_dag goes red through lint_import_dag.sh"
+fi
 long_fn=$(printf 'fn long() -> Int {\n'; for i in $(seq 1 80); do printf '    let v%d = %d\n' "$i" "$i"; done; printf '    1\n}')
 expect_red fn_length           cg_b.bl "$long_fn"
 expect_red br_ids_in_source    cg_b.bl '// tracked as br abc123'

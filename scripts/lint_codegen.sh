@@ -133,11 +133,12 @@ compute_rows() {
     # L5: a second inference engine.
     scan '\binfer_[a-z_0-9]+\(' "$@" > "$det/no_infer.txt"
 
-    # L6: a C type spelling decided outside layout.bl (the record) and
-    # cg_print.bl (the printer), or a TyKind test inside the printer.
+    # L6: a C type spelling decided outside layout.bl (the record), cname.bl
+    # (the C-symbol producer layout asks for every name) and cg_print.bl
+    # (the printer), or a TyKind test inside the printer.
     : > "$det/layout_outside_layer.txt"
     for f in "$@"; do
-        case "$f" in */layout.bl|*/cg_print.bl) continue ;; esac
+        case "$f" in */layout.bl|*/cname.bl|*/cg_print.bl) continue ;; esac
         scan '"(int64_t|int32_t|uint8_t|uint64_t|double|float|void|char|bool|_Bool|blink_(str|list|map|set|bytes|closure|option|result|tuple|ev|kops|Option|Result|Tuple)[A-Za-z_0-9]*)\**"' "$f" >> "$det/layout_outside_layer.txt"
     done
     for f in "$@"; do
@@ -165,17 +166,22 @@ compute_rows() {
         done
     done
 
-    # L8: import DAG. Forbidden edges by importing file.
+    # L8: import DAG. The layout/cname edges belong to scripts/lint_import_dag.sh
+    # (and the printer's to scripts/lint_print_imports.sh once it exists);
+    # their violation lines count here. Both need the modules present.
     : > "$det/import_dag.txt"
+    for dag in scripts/lint_import_dag.sh scripts/lint_print_imports.sh; do
+        [ -x "$dag" ] || continue
+        [ -f "$root/src/layout.bl" ] && [ -f "$root/src/cname.bl" ] || continue
+        LINT_SRC_DIR="$root/src" "./$dag" 2>/dev/null | grep -E 'must (not )?import' >> "$det/import_dag.txt" || true
+    done
     for f in "$@"; do
         fb=$(basename "$f" .bl)
         imports=$(grep -oP '^import \K[a-z_][a-z_0-9]*' "$f" 2>/dev/null)
         for m in $imports; do
             bad=""
-            case "$m" in codegen*|lowering) bad="old codegen module" ;; esac
+            case "$fb" in layout|cname) ;; *) case "$m" in codegen*|lowering) bad="old codegen module" ;; esac ;; esac
             case "$fb" in
-                layout) case "$m" in cg_*|mono|cname|ir|cg) bad="layout.bl imports nothing above it" ;; esac ;;
-                cname)  case "$m" in cg_*|mono|ir|cg) bad="cname.bl imports only layout and below" ;; esac ;;
                 ir)     case "$m" in cg_*|mono|cg) bad="ir.bl imports only layout and below" ;; esac ;;
                 mono)   case "$m" in cg_*|cg) bad="mono never imports an emitter" ;; esac ;;
                 cg_print) case "$m" in typecheck|layout|mono|ast|parser|cname) bad="the printer may not reason about types" ;; esac ;;
