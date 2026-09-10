@@ -1,0 +1,41 @@
+// Sibling to the cross-module type-collision test. That test deliberately
+// avoids let-binding the cross-module struct and reads fields off the
+// constructor return directly, because a `let` re-resolves the C type through
+// the module-blind get_var_struct/descriptor path and picks the LAST-WRITER
+// module's C symbol instead of the actual definer's — a distinct, deferred gap
+// in the same module-blindness family (§03_types.md:1038 makes two modules
+// each declaring `Ngx` legal; §07:1801-1816 requires distinct C symbols).
+//
+// This test performs the `let`-binding the sibling test avoids, staged as its
+// own two-helper-module package, since the defect is inherently cross-module and cannot
+// be expressed as a single embedded program.
+
+import std.path.{path_join}
+
+fn blink_bin_path() -> Str {
+    let root = env.var("BLINK_ROOT") ?? ""
+    if root != "" {
+        let p = path_join(root, "build/blink")
+        if file_exists(p) == 1 {
+            return p
+        }
+    }
+    "build/blink"
+}
+
+test.failing(
+    "let-binding a cross-module struct keeps the definer's own C symbol",
+    reason: "the let-binding re-resolves the struct's C type via the module-blind get_var_struct/descriptor path (keyed on the bare struct name), which picks whichever module last wrote that bare-name prefix instead of the actual definer module",
+    ticket: "838bkv",
+) {
+    let root = ".tmp/_let_binding_cross_module_struct_symbol"
+    let src_dir = "{root}/src"
+    let _mk = process_run("mkdir", ["-p", src_dir])
+    write_file("{root}/blink.toml", "[package]\nname = \"letxmod\"\nversion = \"0.1.0\"\n")
+    write_file("{src_dir}/letxmod_a.bl", "pub type Ngx \{ a: Int \}\npub fn make_a() -> Ngx \{ Ngx \{ a: 1 \} \}\n")
+    write_file("{src_dir}/letxmod_b.bl", "pub type Ngx \{ b: Int \}\npub fn make_b() -> Ngx \{ Ngx \{ b: 2 \} \}\n")
+    let entry_path = "{src_dir}/main.bl"
+    write_file(entry_path, "import letxmod_a\nimport letxmod_b\nfn main() \{\n    let x = letxmod_a.make_a()\n    let y = letxmod_b.make_b()\n    assert_eq(x.a, 1)\n    assert_eq(y.b, 2)\n\}\n")
+    let r = process_run(blink_bin_path(), ["run", entry_path])
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+}

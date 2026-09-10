@@ -1,0 +1,46 @@
+import compile_test_helpers.{compile_and_run}
+
+// A call that mints a return-only type param inside an if/match ARM must still be pinned
+// from the declared type at the use site, the same way a direct tail-position call is.
+
+type RGT[T] { s: Set[T] }
+fn mk[T]() -> RGT[T] { RGT { s: Set() } }
+
+test "a return-only type param pins through an if-expr's arms into a let declaration" {
+    let c = true
+    let mut e: RGT[Int] = if c { mk() } else { mk() }
+    e.s.insert(256)
+    e.s.insert(512)
+    assert_eq(e.s.len(), 2)
+    assert(e.s.contains(256))
+}
+
+test "a return-only type param pins through an if-expr's arms into an assignment RHS" {
+    let c = true
+    let mut e: RGT[Int] = RGT { s: Set() }
+    e = if c { mk() } else { mk() }
+    e.s.insert(256)
+    assert_eq(e.s.len(), 1)
+    assert(e.s.contains(256))
+}
+
+test.failing(
+    "a return-only type param pins through an if-expr's arms into a struct-literal field value",
+    reason: "the struct-literal-field pin site reads the field's declared type directly against the field VALUE's inferred type, but an if-expr value is not itself a Call to a return-only-tparam fn, so the mint inside each arm is never pinned and reaches monomorphization unsolved (ICE UnsolvedTypeVarAtCodegen)",
+    ticket: "2k26qf",
+) {
+    let src = #"
+type RGT[T] { s: Set[T] }
+type H { g: RGT[Int] }
+fn mk[T]() -> RGT[T] { RGT { s: Set() } }
+fn main() ! IO {
+    let c = true
+    let mut h = H { g: if c { mk() } else { mk() } }
+    h.g.s.insert(256)
+    io.println("{h.g.s.len()} {h.g.s.contains(256)}")
+}
+"#
+    let r = compile_and_run(src, "_return_only_tparam_pin_if_arm_struct_field")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "1 true\n")
+}
