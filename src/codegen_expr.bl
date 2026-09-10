@@ -108,7 +108,7 @@ import diagnostics.{
 import std.path.{path_dirname}
 import formatter.{format_expr}
 import mono.{node_tid_for_key, mono_node_tid_diff_on, node_tid_diff_record}
-import typecheck.{tc_tid_subst_mono, is_import_module_name, tc_lookup_node_tid, tc_tid_child, tc_tid_name, tc_tid_list_elem, tc_tid_resolved, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_resolve_transparent_alias_name, tc_variant_field_is_selfrec_tuple, tc_tid_kind, TyKind}
+import typecheck.{type_kind, tc_tid_subst_mono, is_import_module_name, tc_lookup_node_tid, tc_tid_child, tc_tid_name, tc_tid_list_elem, tc_tid_resolved, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_resolve_transparent_alias_name, tc_variant_field_is_selfrec_tuple, tc_tid_kind, TyKind}
 import lowering.{ctype_probe_at, c_type_from_tid, tc_scalar_tid_for_ct, tc_mono_tids_subst, tc_seg_from_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_list_elem_ct, tc_tid_list_elem_struct, tc_tid_list_elem_struct_mono, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_ct_resolved, tc_tid_map_val_struct_resolved, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct_mono_name, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_faithful, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
@@ -496,16 +496,16 @@ fn reseat_from_closure_ret_tag(sname: Str, tmp: Str) -> Int ! Codegen.Scope {
 // Reseat compound-inner expr globals after `?` on `Result[T, E]`.
 // `tmp` is the C tmp holding the result; `rok`/`rok_s` describe the Ok payload.
 // Downstream let/match needs to know T when it's Option/Result/struct.
-fn reseat_after_q_on_result(tmp: Str, rok: Int, rok_s: Str) {
+fn reseat_after_q_on_result(node: Int, tmp: Str, rok: Int, rok_s: Str) {
     expr_result_str = "{tmp}.ok"
     if rok == CT_OPTION {
         expr_result_type = CT_OPTION
-        publish_result_tid(-1)
+        publish_result_tid(node)
         expr_option_inner = option_inner_ct_from_tag(rok_s)
         expr_option_inner_struct = option_inner_struct_from_tag(rok_s)
     } else if rok == CT_RESULT {
         expr_result_type = CT_RESULT
-        publish_result_tid(-1)
+        publish_result_tid(node)
         let split = split_result_compound(rok_s)
         expr_result_ok_type = type_from_name_tag(split.first)
         expr_result_err_type = type_from_name_tag(split.second)
@@ -513,12 +513,14 @@ fn reseat_after_q_on_result(tmp: Str, rok: Int, rok_s: Str) {
         expr_result_err_struct = typedef_tag_or_empty(split.second)
         return
     } else if rok_s != "" {
+        // A boxed-struct payload rides an integer handle. That is a
+        // representation, not the value's type, so no tid is claimed for it.
         expr_result_type = CT_INT
         publish_result_tid(-1)
         set_var_struct(expr_result_str, rok_s)
     } else {
         expr_result_type = rok
-        publish_result_tid(-1)
+        publish_result_tid(node)
     }
     expr_result_ok_struct = ""
     expr_result_err_struct = ""
@@ -872,10 +874,8 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 // A field access resolves its receiver's struct by the EMITTED string, and
                 // `(*x_cell)` is no scope var, so without this the field type is CT_VOID: the read
                 // declares `void v` and interpolation prints the `<value>` placeholder.
-                if expr_result_type == CT_STRUCT {
-                    let cap_sname = capture_sname(cap_entry.tid, cap_entry.tp_id)
-                    if cap_sname != "" { set_var_struct(expr_result_str, cap_sname) }
-                }
+                let cap_sname = capture_sname(cap_entry.tid, cap_entry.tp_id)
+                if cap_sname != "" { set_var_struct(expr_result_str, cap_sname) }
                 return
             }
             expr_result_str = capture_cast_expr(cap_idx)
@@ -889,10 +889,8 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             // element boxing via resolve_push_struct) finds nothing and stores the aggregate as
             // a bare void* — invalid C. Record the tid-first name onto the string, mirroring the
             // mut-capture arm above.
-            if expr_result_type == CT_STRUCT {
-                let cap_sname = capture_sname(cap_entry.tid, cap_entry.tp_id)
-                if cap_sname != "" { set_var_struct(expr_result_str, cap_sname) }
-            }
+            let cap_sname = capture_sname(cap_entry.tid, cap_entry.tp_id)
+            if cap_sname != "" { set_var_struct(expr_result_str, cap_sname) }
             publish_result_tid(node)
             return
         }
@@ -956,7 +954,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         }
         expr_result_type = get_var_type(name)
         publish_result_tid(node)
-        if expr_result_type == CT_OPTION {
+        if type_kind(expr_result_tid) == TyKind.Option {
             expr_option_inner = get_var_option_inner(name)
             expr_option_inner_struct = get_var_option_inner_nominal(name)
             // Propagate the var's ptr-erased carrier so a match / ?? / store on this
@@ -976,13 +974,13 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 expr_option_inner_map_val_struct = get_var_option_inner2_struct(name)
             }
         }
-        if expr_result_type == CT_RESULT {
+        if type_kind(expr_result_tid) == TyKind.Result {
             expr_result_ok_type = get_var_result_ok(name)
             expr_result_err_type = get_var_result_err(name)
             expr_result_ok_struct = get_var_result_ok_nominal(name)
             expr_result_err_struct = get_var_result_err_nominal(name)
         }
-        if expr_result_type == CT_ITERATOR {
+        if type_kind(expr_result_tid) == TyKind.Iterator {
             expr_iter_next_fn = get_var_iter_next_fn(name)
         }
         // Same restore-on-read need as CT_ITERATOR above: emit_expr clears
@@ -992,10 +990,10 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         // later `g(21)` falls through the closure-variable call path into the
         // UndefinedFunction backstop, even though typecheck binds closures to
         // lets fine.
-        if expr_result_type == CT_CLOSURE {
+        if type_kind(expr_result_tid) == TyKind.Fn {
             expr_closure_sig = get_var_closure_sig(name)
         }
-        if expr_result_type == CT_LIST {
+        if type_kind(expr_result_tid) == TyKind.List {
             expr_list_elem_type = get_list_elem_type(name)
             expr_list_elem_struct = get_list_elem_struct(name)
         }
@@ -1060,7 +1058,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                         expr_result_str = cname
                         expr_result_type = get_var_type(resolved_field)
                         publish_result_tid(node)
-                        if expr_result_type == CT_OPTION {
+                        if type_kind(expr_result_tid) == TyKind.Option {
                             expr_option_inner = get_var_option_inner(resolved_field)
                             expr_option_inner_struct = get_var_option_inner_struct(resolved_field)
                             if expr_option_inner == CT_LIST {
@@ -1072,16 +1070,16 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                                 expr_option_inner_map_val_struct = get_var_option_inner2_struct(resolved_field)
                             }
                         }
-                        if expr_result_type == CT_RESULT {
+                        if type_kind(expr_result_tid) == TyKind.Result {
                             expr_result_ok_type = get_var_result_ok(resolved_field)
                             expr_result_err_type = get_var_result_err(resolved_field)
                             expr_result_ok_struct = get_var_result_ok_struct(resolved_field)
                             expr_result_err_struct = get_var_result_err_struct(resolved_field)
                         }
-                        if expr_result_type == CT_ITERATOR {
+                        if type_kind(expr_result_tid) == TyKind.Iterator {
                             expr_iter_next_fn = get_var_iter_next_fn(resolved_field)
                         }
-                        if expr_result_type == CT_LIST {
+                        if type_kind(expr_result_tid) == TyKind.List {
                             expr_list_elem_type = get_list_elem_type(resolved_field)
                             expr_list_elem_struct = get_list_elem_struct(resolved_field)
                         }
@@ -1133,7 +1131,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         emit_expr(fa_obj)
         cg_fa_receiver_ctx = saved_fa_receiver_ctx
         let obj_str = expr_result_str
-        let obj_type_for_fa = expr_result_type
+        let obj_tid_for_fa = expr_result_tid
         let mut c_field = fa_field
         if fa_field.len() > 0 {
             let fa_first = fa_field.char_at(0).unwrap()
@@ -1141,7 +1139,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 c_field = "_{fa_field}"
             }
         }
-        let fa_accessor = if obj_type_for_fa == CT_PTR { "->" } else { "." }
+        let fa_accessor = if type_kind(obj_tid_for_fa) == TyKind.Ptr { "->" } else { "." }
         expr_result_str = "{obj_str}{fa_accessor}{c_field}"
         let mut fa_type = CT_VOID
         let struct_type = get_var_struct(obj_str)
@@ -1402,10 +1400,10 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
     if kind == NodeKind.IndexExpr {
         emit_expr(node_obj(node))
         let obj_str = expr_result_str
-        let obj_type = expr_result_type
+        let obj_tid = expr_result_tid
         emit_expr(node_index(node))
         let idx_str = expr_result_str
-        if obj_type == CT_STRING {
+        if type_kind(obj_tid) == TyKind.Str {
             expr_result_str = "blink_str_char_at({obj_str}, {idx_str})"
             expr_result_type = CT_INT
             publish_result_tid(node)
@@ -2386,11 +2384,11 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
     if op == "??" {
         emit_expr(node_left(node))
         let left_str = expr_result_str
-        let left_type = expr_result_type
+        let left_kind = type_kind(expr_result_tid)
         let opt_inner = expr_option_inner
         let opt_inner_s = expr_option_inner_struct
         let opt_erased = expr_option_erased
-        if left_type == CT_BOOL || left_type == CT_FLOAT || left_type == CT_STRING || left_type == CT_LIST || left_type == CT_RESULT || left_type == CT_CLOSURE {
+        if left_kind == TyKind.Bool || left_kind == TyKind.Float || left_kind == TyKind.Str || left_kind == TyKind.List || left_kind == TyKind.Result || left_kind == TyKind.Fn {
             diag_error_at("CoalesceRequiresOption", COALESCE_REQUIRES_OPT, "the ?? operator requires an Option value but got a non-Option type in function '{cg_current_fn_name}'", node, "")
         }
         emit_expr(node_right(node))
@@ -2965,7 +2963,7 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 }
                 cg_indent = cg_indent - 1
                 emit_line("}")
-                reseat_after_q_on_result(tmp, rok, rok_s)
+                reseat_after_q_on_result(node, tmp, rok, rok_s)
             } else if cg_current_fn_ret != CT_RESULT {
                 diag_error_at("QuestionMarkResultInNonResult", QM_RESULT_IN_NON_RESULT, "'?' on Result in function '{cg_current_fn_name}' which does not return Result", node, "change the return type to Result")
                 diag_set_last_fix("replace", "-> Result[T, E]")
@@ -3040,7 +3038,7 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                     cg_indent = cg_indent - 1
                     emit_line("}")
                 }
-                reseat_after_q_on_result(tmp, rok, rok_s)
+                reseat_after_q_on_result(node, tmp, rok, rok_s)
             }
         } else if operand_type == CT_OPTION {
             if cg_in_test_body != 0 {
@@ -4938,7 +4936,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             if args_sl != -1 && sublist_length(args_sl) >= 2 {
                 emit_expr(sublist_get(args_sl, 0))
                 let left_str = expr_result_str
-                let left_type = expr_result_type
+                let left_kind = type_kind(expr_result_tid)
                 let left_ok = expr_result_ok_type
                 let left_err = expr_result_err_type
                 let left_ok_s = expr_result_ok_struct
@@ -4950,7 +4948,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 let right_str = expr_result_str
                 emit_line("\{")
                 cg_indent = cg_indent + 1
-                if left_type == CT_STRING {
+                if left_kind == TyKind.Str {
                     emit_line("const char* _left = {left_str};")
                     emit_line("const char* _right = {right_str};")
                     emit_line("if (!blink_str_eq(_left, _right)) \{")
@@ -4966,7 +4964,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     emit_line("__blink_assert_fail_eq({msg_tmp1}, {exp_tmp1}, {act_tmp1}, {call_line});")
                     cg_indent = cg_indent - 1
                     emit_line("}")
-                } else if left_type == CT_FLOAT {
+                } else if left_kind == TyKind.Float {
                     emit_line("double _left = (double)({left_str});")
                     emit_line("double _right = (double)({right_str});")
                     emit_line("if (_left != _right) \{")
@@ -4982,7 +4980,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     emit_line("__blink_assert_fail_eq({msg_tmp3}, {exp_tmp3}, {act_tmp3}, {call_line});")
                     cg_indent = cg_indent - 1
                     emit_line("}")
-                } else if left_type == CT_RESULT {
+                } else if left_kind == TyKind.Result {
                     let res_c = if left_ok_s != "" || left_err_s != "" {
                         result_c_type_mixed(left_ok, left_err, left_ok_s, left_err_s)
                     } else {
@@ -5060,7 +5058,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     emit_line("__blink_assert_fail_eq({msg_tmp4}, {exp_tmp4}, {act_tmp4}, {call_line});")
                     cg_indent = cg_indent - 1
                     emit_line("}")
-                } else if left_type == CT_OPTION {
+                } else if left_kind == TyKind.Option {
                     let opt_c = if left_opt_inner_s != "" {
                         struct_option_c_type(left_opt_inner_s)
                     } else {
@@ -5166,13 +5164,13 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             if args_sl != -1 && sublist_length(args_sl) >= 2 {
                 emit_expr(sublist_get(args_sl, 0))
                 let left_str = expr_result_str
-                let left_type = expr_result_type
+                let left_kind = type_kind(expr_result_tid)
                 let left_ne_struct = get_var_struct(left_str)
                 emit_expr(sublist_get(args_sl, 1))
                 let right_str = expr_result_str
                 emit_line("\{")
                 cg_indent = cg_indent + 1
-                if left_type == CT_STRING {
+                if left_kind == TyKind.Str {
                     emit_line("const char* _left = {left_str};")
                     emit_line("const char* _right = {right_str};")
                     emit_line("if (blink_str_eq(_left, _right)) \{")
@@ -5183,7 +5181,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     emit_line("__blink_assert_fail({msg_tmp1}, {call_line});")
                     cg_indent = cg_indent - 1
                     emit_line("}")
-                } else if left_type == CT_FLOAT {
+                } else if left_kind == TyKind.Float {
                     emit_line("double _left = (double)({left_str});")
                     emit_line("double _right = (double)({right_str});")
                     emit_line("if (_left == _right) \{")
@@ -6188,7 +6186,8 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         // to fill and skips every branch below regardless of its tid.
         if rt.tid >= 0 {
             let ret_tid = rt.tid
-            if expr_result_type == CT_RESULT {
+            let ret_kind = type_kind(ret_tid)
+            if ret_kind == TyKind.Result {
                 expr_result_ok_type = carrier_slot_ct(tc_tid_result_ok_ct(ret_tid))
                 expr_result_err_type = carrier_slot_ct(tc_tid_result_err_ct(ret_tid))
                 let fsi = get_fn_ret_struct_inner(fn_name)
@@ -6200,7 +6199,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     expr_list_elem_struct = tc_tid_list_elem_struct(ok_tid)
                 }
             }
-            if expr_result_type == CT_OPTION {
+            if ret_kind == TyKind.Option {
                 expr_option_inner = carrier_slot_ct(tc_tid_option_inner_ct(ret_tid))
                 let fsi = get_fn_ret_struct_inner(fn_name)
                 expr_option_inner_struct = fsi.ok_struct
@@ -6226,12 +6225,12 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     }
                 }
             }
-            if expr_result_type == CT_LIST {
+            if ret_kind == TyKind.List {
                 expr_list_elem_type = carrier_slot_ct(tc_tid_list_elem_ct(ret_tid))
                 let fsi = get_fn_ret_struct_inner(fn_name)
                 expr_list_elem_struct = fsi.ok_struct
             }
-            if expr_result_type == CT_MAP {
+            if ret_kind == TyKind.Map {
                 expr_map_key_type = tc_tid_map_key_ct(ret_tid)
                 expr_map_val_type = tc_tid_map_val_ct(ret_tid)
                 // A plain (non-generic) fn returning Map[K, Box[Int]] carries the value
@@ -6243,7 +6242,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 let mks = tc_tid_map_key_struct(ret_tid)
                 if mks != "" { expr_map_key_struct = mks }
             }
-            if expr_result_type == CT_SET {
+            if ret_kind == TyKind.Set {
                 expr_list_elem_type = tc_tid_set_elem_ct(ret_tid)
             }
         }

@@ -1,0 +1,446 @@
+// A consumer that asks what kind an expression produced must read the physical
+// type id, not a flat C-type code carried beside it. The two channels agree on
+// most shapes. The shapes below are the ones where a reader keyed on the wrong
+// channel gives a wrong ANSWER: a carrier that loses its tag, a container whose
+// element decodes at the wrong width, a captured aggregate stored as a bare
+// pointer, a scrutinee spilled at the wrong C type.
+//
+// Every assertion is on a VALUE. None of these shapes raises a diagnostic when
+// the kind comes from the wrong place. They miscompile quietly, or emit C that
+// the C compiler rejects.
+
+type EBox[T] { v: T }
+type EPlain { n: Int, s: Str }
+type EColor { Red, Green, Blue }
+type EShape { Circle(Int), Square(Int) }
+type EVoidField { tag: Int, v: Void }
+type EDefaulted { n: Int = 5, s: Str = "d" }
+
+fn e_nothing() -> Void {}
+
+fn e_ret_opt() -> Option[Int] { Some(41) }
+fn e_ret_res() -> Result[Int, Str] { Ok(7) }
+fn e_ret_list() -> List[Int] { [1, 2, 3] }
+fn e_ret_set() -> Set[Int] {
+    let mut s: Set[Int] = Set()
+    s.insert(9)
+    s
+}
+fn e_ret_map() -> Map[Str, Int] {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("k", 12)
+    m
+}
+fn e_ret_str() -> Str { "rs" }
+fn e_ret_float() -> Float { 2.5 }
+fn e_ret_bool() -> Bool { true }
+fn e_ret_bytes() -> Bytes { Bytes.from_str("ab") }
+fn e_ret_struct() -> EPlain { EPlain { n: 3, s: "p" } }
+fn e_ret_enum() -> EColor { EColor.Green }
+fn e_ret_data_enum() -> EShape { EShape.Circle(4) }
+fn e_ret_opt_list() -> Option[List[Int]] { Some([4, 5]) }
+fn e_ret_res_map() -> Result[Map[Str, Int], Str] {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("q", 6)
+    Ok(m)
+}
+
+// ── the free-fn call result publishes its own carrier channels ──────────────
+// The call arm reads the just-published kind to decide which inner channel to
+// refill (ok/err, option inner, list element, map key+value, set element,
+// handler vtable). Reading it from the wrong channel leaves the inner slot
+// stale, so the value below decodes through the previous expression's shape.
+
+test "a free fn returning a Result publishes its ok inner" {
+    assert_eq(e_ret_res().unwrap(), 7)
+}
+
+test "a free fn returning an Option publishes its inner" {
+    assert_eq(e_ret_opt().unwrap(), 41)
+}
+
+test "a free fn returning a List publishes its element" {
+    let xs = e_ret_list()
+    assert_eq(xs.len(), 3)
+    assert_eq(xs.get(2).unwrap(), 3)
+}
+
+test "a free fn returning a Map publishes key and value" {
+    let m = e_ret_map()
+    assert_eq(m.get("k").unwrap(), 12)
+}
+
+test "a free fn returning a Set publishes its element" {
+    let s = e_ret_set()
+    assert_eq(s.contains(9), true)
+}
+
+test "a free fn returning an Option of List keeps the nested element" {
+    let o = e_ret_opt_list()
+    let xs = o.unwrap()
+    assert_eq(xs.len(), 2)
+    assert_eq(xs.get(1).unwrap(), 5)
+}
+
+test "a free fn returning a Result of Map keeps the nested value" {
+    let r = e_ret_res_map()
+    let m = r.unwrap()
+    assert_eq(m.get("q").unwrap(), 6)
+}
+
+// ── the coalesce operand check ──────────────────────────────────────────────
+// `??` rejects a non-Option left operand by kind. A right answer here is that
+// the legal shapes still compile and produce the default.
+
+test "coalesce on an Option variable yields the value" {
+    let a: Option[Int] = Some(3)
+    assert_eq(a ?? 99, 3)
+}
+
+test "coalesce on a None variable yields the default" {
+    let b: Option[Int] = None
+    assert_eq(b ?? 99, 99)
+}
+
+test "coalesce over an Option of Str yields the default string" {
+    let c: Option[Str] = None
+    assert_eq(c ?? "fallback", "fallback")
+}
+
+// ── binary operators dispatch on the operand kind ───────────────────────────
+
+test "string equality and ordering dispatch on the operand kind" {
+    let x = e_ret_str()
+    assert_eq(x == "rs", true)
+    assert_eq(x != "zz", true)
+    assert_eq("a" < "b", true)
+    assert_eq("b" >= "a", true)
+}
+
+test "float arithmetic and comparison dispatch on the operand kind" {
+    let f = e_ret_float()
+    assert_eq(f + 0.5, 3.0)
+    assert_eq(f > 2.0, true)
+}
+
+test "boolean operators dispatch on the operand kind" {
+    let b = e_ret_bool()
+    assert_eq(b && true, true)
+    assert_eq(b || false, true)
+}
+
+// ── struct literals: a Void field and a defaulted field ─────────────────────
+// A genuinely Void field value is not a legal C initializer, so the literal
+// arm must recognise the kind and substitute a placeholder. A default value
+// goes through the same rule on the other loop.
+
+test "a struct literal with a Void field builds and reads its other field" {
+    let v = EVoidField { tag: 6, v: e_nothing() }
+    assert_eq(v.tag, 6)
+}
+
+test "a struct literal taking its defaults reads them back" {
+    let d = EDefaulted {}
+    assert_eq(d.n, 5)
+    assert_eq(d.s, "d")
+}
+
+test "a struct literal overriding one default keeps the other" {
+    let d2 = EDefaulted { n: 11 }
+    assert_eq(d2.n, 11)
+    assert_eq(d2.s, "d")
+}
+
+// ── tuple literals over carrier elements ────────────────────────────────────
+// A tuple element that is an Option or a Result must keep its carrier tag; the
+// element speller reads the just-emitted kind to decide whether to spell the
+// carrier structurally or ride the flat one-level tag.
+
+test "a tuple with an Option element keeps the carrier" {
+    let t = (e_ret_opt(), 2)
+    assert_eq(t.0.unwrap(), 41)
+    assert_eq(t.1, 2)
+}
+
+test "a tuple with a Result element keeps the carrier" {
+    let t2 = (e_ret_res(), "x")
+    assert_eq(t2.0.unwrap(), 7)
+    assert_eq(t2.1, "x")
+}
+
+test "a tuple with a List element keeps the element type" {
+    let t3 = (e_ret_list(), 1)
+    assert_eq(t3.0.len(), 3)
+    assert_eq(t3.1, 1)
+}
+
+test "a tuple with a struct element keeps the field" {
+    let t4 = (e_ret_struct(), 8)
+    assert_eq(t4.0.n, 3)
+    assert_eq(t4.1, 8)
+}
+
+// ── captured values inside a closure ────────────────────────────────────────
+// A by-value aggregate capture emits as an inline rvalue with no scope row, so
+// the capture arm records the aggregate's name against the emitted string. Read
+// from the wrong channel, a captured data enum stores as a bare integer and the
+// payload read below returns garbage or fails to compile.
+
+test "a closure capturing a struct reads its field" {
+    let p = e_ret_struct()
+    let f = fn() -> Int { p.n }
+    assert_eq(f(), 3)
+}
+
+test "a closure capturing a data enum matches its payload" {
+    let sh = e_ret_data_enum()
+    let g = fn() -> Int {
+        match sh {
+            EShape.Circle(r) => r
+            EShape.Square(w) => w * 2
+        }
+    }
+    assert_eq(g(), 4)
+}
+
+test "a closure capturing a payloadless enum compares it" {
+    let col = e_ret_enum()
+    let h = fn() -> Int { if col == EColor.Green { 1 } else { 0 } }
+    assert_eq(h(), 1)
+}
+
+test "a closure mutating a captured struct sees the write" {
+    let mut mp = EPlain { n: 1, s: "m" }
+    let bump = fn() -> Void { mp = EPlain { n: mp.n + 4, s: mp.s } }
+    bump()
+    assert_eq(mp.n, 5)
+}
+
+test "a closure capturing a list reads its element" {
+    let xs2 = e_ret_list()
+    let k = fn() -> Int { xs2.get(0).unwrap() }
+    assert_eq(k(), 1)
+}
+
+// ── match scrutinee spelling ────────────────────────────────────────────────
+// The scrutinee is spilled into a temp declared at the emitted kind. A wrong
+// kind declares the temp at the wrong C type and the arms decode the wrong
+// bytes.
+
+test "a match on an Option call result binds the payload" {
+    let r = match e_ret_opt() {
+        Some(v) => v
+        None => 0
+    }
+    assert_eq(r, 41)
+}
+
+test "a match on a Result call result binds the ok payload" {
+    let r2 = match e_ret_res() {
+        Ok(v) => v
+        Err(_) => 0
+    }
+    assert_eq(r2, 7)
+}
+
+test "a match on a Str call result compares the arms" {
+    let r3 = match e_ret_str() {
+        "rs" => 1
+        _ => 0
+    }
+    assert_eq(r3, 1)
+}
+
+test "a match on a data enum call result binds the payload" {
+    let r4 = match e_ret_data_enum() {
+        EShape.Circle(a) => a
+        EShape.Square(b) => b
+    }
+    assert_eq(r4, 4)
+}
+
+test "a match on a payloadless enum call result picks the arm" {
+    let r5 = match e_ret_enum() {
+        EColor.Red => 1
+        EColor.Green => 2
+        EColor.Blue => 3
+    }
+    assert_eq(r5, 2)
+}
+
+test "a match on a struct call result reads a field" {
+    let r6 = match e_ret_struct() {
+        EPlain { n, s: _ } => n
+    }
+    assert_eq(r6, 3)
+}
+
+// ── method-call arguments and receivers ─────────────────────────────────────
+// The argument loop reads the emitted kind of each argument to decide how to
+// box it into the container.
+
+test "pushing carrier arguments into a list keeps each carrier" {
+    let mut opts: List[Option[Int]] = []
+    opts.push(e_ret_opt())
+    opts.push(None)
+    assert_eq(opts.len(), 2)
+    assert_eq(opts.get(0).unwrap().unwrap(), 41)
+    assert_eq(opts.get(1).unwrap().is_none(), true)
+}
+
+test "inserting a container argument into a map keeps its element" {
+    let mut mm: Map[Str, List[Int]] = Map()
+    mm.insert("a", e_ret_list())
+    assert_eq(mm.get("a").unwrap().len(), 3)
+}
+
+test "pushing a struct argument into a list keeps its field" {
+    let mut ps: List[EPlain] = []
+    ps.push(e_ret_struct())
+    assert_eq(ps.get(0).unwrap().n, 3)
+}
+
+test "pushing a set argument into a list keeps its membership" {
+    let mut ss: List[Set[Int]] = []
+    ss.push(e_ret_set())
+    assert_eq(ss.get(0).unwrap().contains(9), true)
+}
+
+test "a Void-returning call used as a statement argument still runs" {
+    let mut counted = 0
+    let mut ns: List[Int] = []
+    ns.push(1)
+    counted = counted + ns.len()
+    e_nothing()
+    assert_eq(counted, 1)
+}
+
+// ── closure-typed variables ─────────────────────────────────────────────────
+// A closure bound to a let must keep its signature on the row, or the later
+// call falls through the closure-variable path.
+
+test "a closure bound to a let is callable through the binding" {
+    let add = fn(x: Int) -> Int { x + 1 }
+    let alias = add
+    assert_eq(alias(41), 42)
+}
+
+// ── interpolation renders by kind ───────────────────────────────────────────
+
+test "interpolation renders each builtin kind" {
+    let i = 5
+    let fl = 1.5
+    let bo = true
+    let st = "s"
+    assert_eq("{i}", "5")
+    assert_eq("{fl}", "1.5")
+    assert_eq("{bo}", "true")
+    assert_eq("{st}", "s")
+}
+
+// ── generic struct fields ───────────────────────────────────────────────────
+
+test "a generic struct field over a carrier keeps the carrier" {
+    let bo2 = EBox { v: e_ret_opt() }
+    assert_eq(bo2.v.unwrap(), 41)
+}
+
+test "a generic struct field over a list keeps the element" {
+    let bo3 = EBox { v: e_ret_list() }
+    assert_eq(bo3.v.get(1).unwrap(), 2)
+}
+
+test "a bytes call result keeps its length through a list element" {
+    let mut bs: List[Bytes] = []
+    bs.push(e_ret_bytes())
+    assert_eq(bs.get(0).unwrap().len(), 2)
+}
+
+// ── a `?` payload is a scrutinee like any other ─────────────────────────────
+// `?` reseats the result channels to the Ok payload. The payload's kind must
+// come with it, or a match on `f()?` loses the spill temp and the carrier
+// registration that every other scrutinee gets.
+
+fn e_q_opt() -> Result[Option[Int], Str] { Ok(Some(7)) }
+fn e_q_opt_str() -> Result[Option[Str], Str] { Ok(Some("qs")) }
+fn e_q_opt_list() -> Result[Option[List[Int]], Str] { Ok(Some([1, 2, 3])) }
+fn e_q_opt_struct() -> Result[Option[EPlain], Str] { Ok(Some(EPlain { n: 9, s: "q" })) }
+fn e_q_list() -> Result[List[Int], Str] { Ok([7, 8]) }
+fn e_q_res() -> Result[Result[Int, Str], Str] { Ok(Ok(5)) }
+
+fn e_q_match_opt() -> Result[Int, Str] {
+    match e_q_opt()? {
+        Some(v) => Ok(v)
+        None => Ok(0)
+    }
+}
+
+fn e_q_match_opt_str() -> Result[Str, Str] {
+    match e_q_opt_str()? {
+        Some(v) => Ok(v)
+        None => Ok("none")
+    }
+}
+
+fn e_q_match_opt_list() -> Result[Int, Str] {
+    match e_q_opt_list()? {
+        Some(v) => Ok(v.len())
+        None => Ok(0)
+    }
+}
+
+fn e_q_match_opt_struct() -> Result[Int, Str] {
+    match e_q_opt_struct()? {
+        Some(v) => Ok(v.n)
+        None => Ok(0)
+    }
+}
+
+fn e_q_match_list() -> Result[Int, Str] {
+    match e_q_list()? {
+        [] => Ok(0)
+        [x] => Ok(x)
+        [x, y] => Ok(x + y)
+        _ => Ok(-1)
+    }
+}
+
+fn e_q_match_res() -> Result[Int, Str] {
+    match e_q_res()? {
+        Ok(v) => Ok(v)
+        Err(_) => Ok(0)
+    }
+}
+
+fn e_q_let_opt() -> Result[Int, Str] {
+    let o = e_q_opt()?
+    Ok(o.unwrap())
+}
+
+test "a match on a question-mark Option payload binds the payload" {
+    assert_eq(e_q_match_opt().unwrap(), 7)
+}
+
+test "a match on a question-mark Option of Str payload binds the string" {
+    assert_eq(e_q_match_opt_str().unwrap(), "qs")
+}
+
+test "a match on a question-mark Option of List payload keeps the element" {
+    assert_eq(e_q_match_opt_list().unwrap(), 3)
+}
+
+test "a match on a question-mark Option of struct payload reads the field" {
+    assert_eq(e_q_match_opt_struct().unwrap(), 9)
+}
+
+test "a list pattern match on a question-mark List payload binds both elements" {
+    assert_eq(e_q_match_list().unwrap(), 15)
+}
+
+test "a match on a question-mark Result payload binds the inner ok" {
+    assert_eq(e_q_match_res().unwrap(), 5)
+}
+
+test "a let bound to a question-mark Option payload keeps the carrier" {
+    assert_eq(e_q_let_opt().unwrap(), 7)
+}
