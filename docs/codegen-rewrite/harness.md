@@ -24,7 +24,7 @@ finds its stdlib and archive from its own path.
 | `task ci` | The rewrite gate: `gen1`, `ratchet`, `test-ratchet`, `test-lint`, `corpus`, `corpus-check`, formatter goldens and idempotency with gen1, `typecheck-suite`. | Any step fails. |
 | `task gen1` | gen0 compiles `src/blinkc_main.bl` and `src/cli.bl`, then links `build/gen1/blinkc`. | Nonzero exit, an `error[` line, or a link error. |
 | `task corpus` | Compiles and runs every `tests/test_*.bl` on its own under gen0. Writes `build/corpus.json`. Then runs the lint. | Never for a test result. Only when the lint fails. |
-| `task corpus-check` | Compares `build/corpus.json` with `scripts/corpus_baseline.json` and with the baseline in the previous commit. | The pass count drops, or a file that passed no longer passes. |
+| `task corpus-check` | Compares `build/corpus.json` with `scripts/corpus_baseline.json` and with the baseline in the previous commit. A test that now lives in `tests/pinned/` is dropped from both references first. | The pass count drops, or a file that passed no longer passes. |
 | `task corpus-baseline` | Rewrites `scripts/corpus_baseline.json` from `build/corpus.json`. Run it only after a real gain. | Never. |
 | `task lint` | Runs `scripts/lint_codegen.sh`, the eleven rows below. | A row rises above its limit, or a row in debt rises above the previous commit. |
 | `task test-lint` | Runs `scripts/test_lint_codegen.sh`: each row goes red on a fixture. | A row does not catch its construct. |

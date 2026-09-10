@@ -1,0 +1,86 @@
+import std.fs
+import std.io
+import typecheck.{check_types, tc_type_str}
+import mono2.{run_mono, instances, MonoInst}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+// typecheck still reaches its CT bridge in codegen_types; linking needs it until that bridge goes.
+import codegen_expr
+
+fn probe_src() -> Str {
+    #"type Point { x: Int, y: Int }
+fn f[T](s: Set[T]) -> Int { s.len() }
+fn main() {
+    let a: Set[Int] = Set()
+    let b: Set[Point] = Set()
+    assert(f(a) == 0)
+    assert(f(b) == 0)
+}
+"#
+}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn instances_of(decl: Int) -> List[MonoInst] {
+    let mut out: List[MonoInst] = []
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(inst) }
+    }
+    out
+}
+
+test "f[Set[Int]] and f[Set[Point]] yield two distinct instances" {
+    let path = "build/mono_set_distinct_probe.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+    let f = find_fn("f")
+    assert(f >= 0)
+    let insts = instances_of(f)
+    if insts.len() != 2 {
+        io.println("FAIL: expected 2 instances of f, got {insts.len()}")
+    }
+    assert_eq(insts.len(), 2)
+    let a = insts.get(0).unwrap()
+    let b = insts.get(1).unwrap()
+    assert(a.arg_tids != b.arg_tids)
+    assert(a.inst_tid != b.inst_tid)
+    assert(a.c_name != b.c_name)
+    let mut seen_int = 0
+    let mut seen_point = 0
+    for inst in insts {
+        let s = tc_type_str(inst.arg_tids)
+        if s == "(Int)" || s == "(Int,)" { seen_int = 1 }
+        if s == "(Point)" || s == "(Point,)" { seen_point = 1 }
+    }
+    assert_eq(seen_int, 1)
+    assert_eq(seen_point, 1)
+}
+
+test "dedup: the same argument tuple registers once" {
+    let path = "build/mono_set_dedup_probe.bl"
+    write_file(path, #"fn g[T](x: T) -> T { x }
+fn main() {
+    assert(g(1) == 1)
+    assert(g(2) == 2)
+    assert(g("a") == "a")
+}
+"#)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+    let g = find_fn("g")
+    assert(g >= 0)
+    assert_eq(instances_of(g).len(), 2)
+}

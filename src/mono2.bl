@@ -1,0 +1,795 @@
+// The total monomorphization pass.
+//
+// Runs once after typecheck over the whole program. Every non-generic body is a root.
+// A root's walk finds each call to a generic function and each generic struct or enum
+// type it touches, and registers one instance per distinct (declaration, argument
+// tuple). Each instance body is then walked once under its own substitution, so the
+// closure is transitive. The result is the instance table and, per instance, the
+// substituted type of every typed node in its body.
+//
+// Identity is by ints only: the dedup key is (base_decl_node, arg_tids) where arg_tids
+// is the interned tuple of concrete type arguments, deep-canonicalized so a type built
+// over a since-bound metavar keys the same as its solved spelling. Typecheck interns a
+// type parameter by its spelling, so an instance's binds map that spelling to the
+// argument; the map is built from the declaration's own binder nodes and lives only
+// for that instance, so a same-spelled parameter on another declaration never leaks in.
+//
+// The instance table is the only state a consumer reads. Nothing here falls back: a
+// node a consumer asks about that the walk never reached is an internal error.
+
+import ast.{NodeKind, dbg_channel_on, dbg_trace, node_kind_name, nk_of, nk_tag}
+import parser.{
+    node_args, node_body, node_condition, node_else_body, node_elements, node_end, node_fields,
+    node_for_binder, node_guard, node_handlers, node_impl_binders, node_impl_where_bounds,
+    node_index, node_iterable, node_kind, node_left, node_method, node_methods, node_name,
+    node_obj, node_params, node_pattern, node_recv_type_args, node_right, node_scrutinee,
+    node_start, node_stmts, node_target, node_then_body, node_trait_name, node_type_ann,
+    node_type_params, node_value, node_captures, node_arms, node_assoc_types, get_annotation,
+    sublist_get, sublist_length,
+}
+import typecheck.{
+    TyKind, DECL_NODE_AMBIGUOUS, is_import_module_name, make_channel_type, make_enum_instance_type,
+    make_fn_type, make_handle_type, make_iterator_type, make_list_type, make_map_type, make_option_type,
+    make_ptr_type, make_result_type, make_set_type, make_struct_instance_type, make_template_type,
+    make_tuple_type,
+    substitute_typevar_tid, tc_alias_to_original, tc_lookup_node_tid, tc_mc_obj_is_value,
+    tc_resolve, tc_ret_mint_at, tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind,
+    tc_tid_is_no_info, tc_tid_list_elem, tc_tid_name, tc_tid_resolved, tc_tid_struct, tc_type_str,
+    tc_void_tid,
+}
+import cname.{c_mono_fn_name, c_mono_type_c_name, c_poly_method_name}
+import diagnostics.{diag_ice_at, UNSOLVED_TYPEVAR_AT_CODEGEN}
+
+pub type MonoInst {
+    base_decl_node: Int,
+    arg_tids: Int,
+    inst_tid: Int,
+    c_name: Str,
+}
+
+// The instance table and its per-instance side tables, all indexed by instance number.
+let mut mono_table: List[MonoInst] = []
+let mut mono_seen_keys: Map[Int, Int] = Map()
+let mut mono_node_tids: List[Map[Int, Int]] = []
+let mut mono_binds: List[Map[Str, Int]] = []
+// Raw tids whose type instances are already registered; the same tid is recorded on
+// every node that carries it.
+let mut type_insts_done: Map[Int, Int] = Map()
+
+// Declaration lookups the walk resolves a call through. Names here are how source
+// spells a callee; instance identity never depends on them.
+let mut generic_fn_by_name: Map[Str, Int] = Map()
+let mut poly_method_by_name: Map[Str, Int] = Map()
+let mut poly_method_by_qualified: Map[Str, Int] = Map()
+let mut poly_block_of_method: Map[Int, Int] = Map()
+
+// A root walk has no instance; it reads types straight from typecheck.
+let ROOT_BINDS: Map[Str, Int] = Map()
+let ROOT_CTX: Int = -1
+
+// An absent sublist is -1 in the AST; treat it as empty everywhere.
+fn sl_len(sl: Int) -> Int {
+    if sl == -1 { return 0 }
+    sublist_length(sl)
+}
+
+// Node ids and tids both stay far below 2^32, so one Int holds the pair exactly.
+fn seen_key(base_decl_node: Int, arg_tids: Int) -> Int {
+    base_decl_node * 4294967296 + arg_tids
+}
+
+// ── Public surface ─────────────────────────────────────────────────────────────
+
+pub fn instances() -> List[MonoInst] {
+    mono_table
+}
+
+// The substituted tid of `node` inside `inst`. A node the instance's walk never
+// recorded is a compiler bug: either the walk missed a child or the caller asked
+// about a node that belongs to another body.
+pub fn node_tid_for_inst(inst: MonoInst, node: Int) -> Int ! Diag.Report {
+    let idx = mono_seen_keys.get(seen_key(inst.base_decl_node, inst.arg_tids)) ?? -1
+    if idx >= 0 {
+        match mono_node_tids.get(idx).unwrap().get(node) {
+            Some(tid) => return tid
+            None => {}
+        }
+    }
+    diag_ice_at("MonoNodeNotInInstance", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "node {node} has no recorded type in mono instance {inst.c_name}", node,
+        "the walk records every typed node of an instance body; this is a compiler bug")
+    -1
+}
+
+// Run the pass over `program`. Every emit path calls this once after typecheck.
+pub fn run_mono(program: Int) ! Diag.Report {
+    mono_reset()
+    mono_build_decl_maps(program)
+    walk_roots(program)
+    mono_drain()
+    dbg_trace("mono", "instances={mono_table.len()}")
+}
+
+fn mono_reset() {
+    mono_table = []
+    mono_seen_keys = Map()
+    mono_node_tids = []
+    mono_binds = []
+    type_insts_done = Map()
+    generic_fn_by_name = Map()
+    poly_method_by_name = Map()
+    poly_method_by_qualified = Map()
+    poly_block_of_method = Map()
+}
+
+// ── Declaration maps ───────────────────────────────────────────────────────────
+
+fn has_type_params(fn_node: Int) -> Bool {
+    let tparams = node_type_params(fn_node)
+    tparams != -1 && sl_len(tparams) > 0
+}
+
+fn mono_build_decl_maps(program: Int) {
+    let fns_sl = node_params(program)
+    let mut i = 0
+    while i < sl_len(fns_sl) {
+        let fn_node = sublist_get(fns_sl, i)
+        // An FFI-bridged generic is one type-erased C symbol, never an instance.
+        if has_type_params(fn_node) && get_annotation(fn_node, "ffi") == -1 {
+            generic_fn_by_name.insert(node_name(fn_node), fn_node)
+        }
+        i = i + 1
+    }
+    let impls_sl = node_methods(program)
+    let mut ii = 0
+    while ii < sl_len(impls_sl) {
+        register_poly_impl(sublist_get(impls_sl, ii))
+        ii = ii + 1
+    }
+}
+
+// `impl[T] Trait[T] for List[T]` is the one impl shape that is per-element: exactly one
+// binder, a List receiver whose single type argument is that binder, and a body that
+// can see the element. An element-agnostic impl is one shared symbol instead.
+fn is_poly_impl(im: Int) -> Bool {
+    if node_name(im) != "List" { return false }
+    let binders_sl = node_impl_binders(im)
+    let recv_args_sl = node_recv_type_args(im)
+    if binders_sl == -1 || recv_args_sl == -1 { return false }
+    if sl_len(binders_sl) != 1 || sl_len(recv_args_sl) != 1 { return false }
+    let binder_name = node_name(sublist_get(binders_sl, 0))
+    if binder_name == "" || node_name(sublist_get(recv_args_sl, 0)) != binder_name { return false }
+    !poly_impl_is_element_agnostic(im)
+}
+
+// True when no method signature mentions a binder and no binder carries a bound. Such
+// an impl cannot move or inspect an element by value, so its C is element-independent.
+fn poly_impl_is_element_agnostic(im: Int) -> Bool {
+    let binders_sl = node_impl_binders(im)
+    let where_sl = node_impl_where_bounds(im)
+    if where_sl != -1 && sl_len(where_sl) != 0 { return false }
+    let mut bi = 0
+    while bi < sl_len(binders_sl) {
+        if node_elements(sublist_get(binders_sl, bi)) != -1 { return false }
+        bi = bi + 1
+    }
+    let methods_sl = node_methods(im)
+    let mut j = 0
+    while j < sl_len(methods_sl) {
+        let m = sublist_get(methods_sl, j)
+        if ann_mentions_binder(node_type_ann(m), binders_sl) { return false }
+        let params_sl = node_params(m)
+        let mut pi = 0
+        while pi < sl_len(params_sl) {
+            if ann_mentions_binder(node_type_ann(sublist_get(params_sl, pi)), binders_sl) { return false }
+            pi = pi + 1
+        }
+        j = j + 1
+    }
+    true
+}
+
+fn ann_mentions_binder(ann: Int, binders_sl: Int) -> Bool {
+    if ann == -1 { return false }
+    let mut bi = 0
+    while bi < sl_len(binders_sl) {
+        if node_name(ann) == node_name(sublist_get(binders_sl, bi)) { return true }
+        bi = bi + 1
+    }
+    let inner = node_type_ann(ann)
+    if inner != -1 && ann_mentions_binder(inner, binders_sl) { return true }
+    let elems = node_elements(ann)
+    let mut ei = 0
+    while ei < sl_len(elems) {
+        if ann_mentions_binder(sublist_get(elems, ei), binders_sl) { return true }
+        ei = ei + 1
+    }
+    false
+}
+
+fn register_poly_impl(im: Int) {
+    if !is_poly_impl(im) { return }
+    let methods_sl = node_methods(im)
+    let mut j = 0
+    while j < sl_len(methods_sl) {
+        let m = sublist_get(methods_sl, j)
+        poly_method_by_name.insert(node_name(m), m)
+        poly_method_by_qualified.insert("{node_trait_name(im)}.{node_name(m)}", m)
+        poly_block_of_method.insert(m, im)
+        j = j + 1
+    }
+}
+
+// ── Roots ──────────────────────────────────────────────────────────────────────
+
+// Every body that is emitted exactly once: non-generic functions and type
+// declarations (field defaults are expressions), non-poly impl and trait-default
+// methods, module lets, and test blocks. A generic body is walked only per instance,
+// in the drain.
+fn walk_roots(program: Int) ! Diag.Report {
+    let fns_sl = node_params(program)
+    let mut i = 0
+    while i < sl_len(fns_sl) {
+        let fn_node = sublist_get(fns_sl, i)
+        if !has_type_params(fn_node) { walk_fn_parts(ROOT_CTX, fn_node) }
+        i = i + 1
+    }
+    let types_sl = node_fields(program)
+    let mut tdi = 0
+    while tdi < sl_len(types_sl) {
+        let td = sublist_get(types_sl, tdi)
+        if !has_type_params(td) { mono_walk(ROOT_CTX, td) }
+        tdi = tdi + 1
+    }
+    let impls_sl = node_methods(program)
+    let mut ii = 0
+    while ii < sl_len(impls_sl) {
+        let im = sublist_get(impls_sl, ii)
+        if !is_poly_impl(im) { walk_sl(ROOT_CTX, node_methods(im)) }
+        ii = ii + 1
+    }
+    walk_sl(ROOT_CTX, node_arms(program))
+    walk_sl(ROOT_CTX, node_stmts(program))
+    let tests_sl = node_captures(program)
+    let mut ti = 0
+    while ti < sl_len(tests_sl) {
+        mono_walk(ROOT_CTX, node_body(sublist_get(tests_sl, ti)))
+        ti = ti + 1
+    }
+}
+
+// Instances found while draining are appended and reached by the same loop. A type
+// instance's walk reaches the generic types its fields name, so `Outer[Int]` brings
+// in `Inner[Int]` without any root spelling it.
+fn mono_drain() ! Diag.Report {
+    let mut di = 0
+    while di < mono_table.len() {
+        mono_walk(di, mono_table.get(di).unwrap().base_decl_node)
+        di = di + 1
+    }
+}
+
+// ── Substitution ───────────────────────────────────────────────────────────────
+
+fn ctx_binds(ctx: Int) -> Map[Str, Int] {
+    if ctx < 0 { return ROOT_BINDS }
+    mono_binds.get(ctx).unwrap()
+}
+
+// The type of `node` as seen from inside `ctx`: typecheck's stamp, resolved past
+// metavars, with the instance's type arguments put in for its binders. -1 when
+// typecheck stamped nothing.
+fn ctx_node_tid(ctx: Int, node: Int) -> Int {
+    let raw = tc_lookup_node_tid(node)
+    if raw < 0 { return -1 }
+    substitute_typevar_tid(tc_tid_resolved(raw), ctx_binds(ctx))
+}
+
+// A tid with every inference metavar replaced by its solution, at every depth. Typecheck
+// interns a compound over a metavar BEFORE the metavar binds, so `Map[?1, ?2]` and
+// `Map[Str, Int]` are two pool entries that print the same. Keying on the raw tid would
+// mint one instance per spelling; rebuilding through the constructors re-interns to one.
+fn canon_tid(tid0: Int) -> Int {
+    if tid0 < 0 { return tid0 }
+    let tid = tc_resolve(tid0)
+    let k = tc_tid_kind(tid)
+    let n = tc_tid_child_count(tid)
+    if n == 0 { return tid }
+    let mut kids: List[Int] = []
+    let mut i = 0
+    while i < n {
+        kids.push(canon_tid(tc_tid_child(tid, i)))
+        i = i + 1
+    }
+    canon_rebuild(tid, k, kids)
+}
+
+fn canon_rebuild(tid: Int, k: TyKind, kids: List[Int]) -> Int {
+    let a = kids.get(0).unwrap()
+    if k == TyKind.List { return make_list_type(a) }
+    if k == TyKind.Option { return make_option_type(a) }
+    if k == TyKind.Set { return make_set_type(a) }
+    if k == TyKind.Handle { return make_handle_type(a) }
+    if k == TyKind.Channel { return make_channel_type(a) }
+    if k == TyKind.Ptr { return make_ptr_type(a) }
+    if k == TyKind.Template { return make_template_type(a) }
+    if k == TyKind.Iterator { return make_iterator_type(a) }
+    if k == TyKind.Result { return make_result_type(a, kids.get(1).unwrap()) }
+    if k == TyKind.Map { return make_map_type(a, kids.get(1).unwrap()) }
+    if k == TyKind.Tuple { return make_tuple_type(kids) }
+    if k == TyKind.Fn { return make_fn_type(a, kids.slice(1, kids.len())) }
+    if k == TyKind.Struct { return make_struct_instance_type(tc_tid_name(tid), kids) }
+    if k == TyKind.Enum { return make_enum_instance_type(tc_tid_name(tid), kids) }
+    tid
+}
+
+fn canon_tids(tids: List[Int]) -> List[Int] {
+    let mut out: List[Int] = []
+    for t in tids { out.push(canon_tid(t)) }
+    out
+}
+
+// True when `tid` still carries an unsolved type: a binder's typevar or an inference
+// metavar that typecheck never bound. Neither can name an instance.
+fn tid_is_open(tid0: Int) -> Bool {
+    if tid0 < 0 { return false }
+    let tid = tc_resolve(tid0)
+    let k = tc_tid_kind(tid)
+    if k == TyKind.Typevar || k == TyKind.Unknown { return true }
+    let n = tc_tid_child_count(tid)
+    let mut i = 0
+    while i < n {
+        if tid_is_open(tc_tid_child(tid, i)) { return true }
+        i = i + 1
+    }
+    false
+}
+
+// Structural unification of a declared parameter type against a concrete argument
+// type, collecting typevar binds. The first concrete bind wins; a bind that still
+// carries a typevar yields to a later concrete one.
+fn unify(ptid: Int, atid0: Int, binds: Map[Str, Int]) {
+    if ptid < 0 || atid0 < 0 { return }
+    let atid = tc_resolve(atid0)
+    let pk = tc_tid_kind(ptid)
+    if pk == TyKind.Typevar {
+        let name = tc_tid_name(ptid)
+        match binds.get(name) {
+            Some(prev) => {
+                if tid_is_open(prev) && !tid_is_open(atid) { binds.insert(name, atid) }
+            }
+            None => { binds.insert(name, atid) }
+        }
+        return
+    }
+    if tc_tid_kind(atid) != pk { return }
+    if pk == TyKind.Struct || pk == TyKind.Enum {
+        if tc_tid_struct(ptid) != tc_tid_struct(atid) { return }
+    }
+    let n = tc_tid_child_count(ptid)
+    if n != tc_tid_child_count(atid) { return }
+    let mut i = 0
+    while i < n {
+        unify(tc_tid_child(ptid, i), tc_tid_child(atid, i), binds)
+        i = i + 1
+    }
+}
+
+fn param_index_by_name(params_sl: Int, name: Str) -> Int {
+    let mut i = 0
+    while i < sl_len(params_sl) {
+        if node_name(sublist_get(params_sl, i)) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// Binds for a call of generic `gfn` whose arguments are `args_sl` (positional, or
+// keyword through NamedArg) plus any leading receiver in `lead`. The declared return
+// unifies against the call's own type so a return-only parameter is solved too.
+fn solve_call_binds(ctx: Int, gfn: Int, call_node: Int, lead: List[Int], args_sl: Int) -> Map[Str, Int] {
+    let mut binds: Map[Str, Int] = Map()
+    let params_sl = node_params(gfn)
+    let mut li = 0
+    while li < lead.len() {
+        if li < sl_len(params_sl) {
+            unify(tc_lookup_node_tid(sublist_get(params_sl, li)), lead.get(li).unwrap(), binds)
+        }
+        li = li + 1
+    }
+    let mut i = 0
+    while i < sl_len(args_sl) {
+        let mut arg = sublist_get(args_sl, i)
+        let mut pidx = i + lead.len()
+        if nk_of(node_kind(arg)) == NodeKind.NamedArg {
+            pidx = param_index_by_name(params_sl, node_name(arg))
+            arg = node_value(arg)
+        }
+        if pidx >= 0 && pidx < sl_len(params_sl) {
+            unify(tc_lookup_node_tid(sublist_get(params_sl, pidx)), ctx_node_tid(ctx, arg), binds)
+        }
+        i = i + 1
+    }
+    let ret_ann = node_type_ann(gfn)
+    if ret_ann != -1 { unify(tc_lookup_node_tid(ret_ann), ctx_node_tid(ctx, call_node), binds) }
+    binds
+}
+
+// One concrete tid per binder of `gfn`, in binder order. A binder the arguments do not
+// reach may still have been minted by typecheck at the call; that is the last source.
+// An unsolved binder is an ICE: the instance cannot be named, so nothing is registered.
+fn binder_args(ctx: Int, gfn: Int, call_node: Int, binds: Map[Str, Int]) -> List[Int] ! Diag.Report {
+    let tparams = node_type_params(gfn)
+    let n = sl_len(tparams)
+    let mut out: List[Int] = []
+    let mut pi = 0
+    while pi < n {
+        let b = sublist_get(tparams, pi)
+        let mut t = binds.get(node_name(b)) ?? -1
+        if t < 0 || tid_is_open(t) {
+            let minted = tc_ret_mint_at(call_node, n, pi)
+            if minted >= 0 { t = substitute_typevar_tid(minted, ctx_binds(ctx)) }
+        }
+        if t < 0 || tid_is_open(t) {
+            diag_ice_at("MonoUnsolvedTypeParam", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "type parameter '{node_name(b)}' of '{node_name(gfn)}' is unsolved at this call", call_node,
+                "typecheck must reject a call it cannot fully type; this is a compiler bug")
+            return []
+        }
+        out.push(t)
+        pi = pi + 1
+    }
+    out
+}
+
+// ── Registration ───────────────────────────────────────────────────────────────
+
+fn binds_from_binders(binders_sl: Int, arg_tids: List[Int]) -> Map[Str, Int] {
+    let mut binds: Map[Str, Int] = Map()
+    let mut i = 0
+    while i < sl_len(binders_sl) && i < arg_tids.len() {
+        binds.insert(node_name(sublist_get(binders_sl, i)), arg_tids.get(i).unwrap())
+        i = i + 1
+    }
+    binds
+}
+
+// The instance's own signature type: declared params and return with the binds applied.
+fn fn_signature_tid(fn_node: Int, binds: Map[Str, Int]) -> Int {
+    let params_sl = node_params(fn_node)
+    let mut ptids: List[Int] = []
+    let mut i = 0
+    while i < sl_len(params_sl) {
+        ptids.push(substitute_typevar_tid(tc_lookup_node_tid(sublist_get(params_sl, i)), binds))
+        i = i + 1
+    }
+    let ret_ann = node_type_ann(fn_node)
+    let ret = if ret_ann != -1 { substitute_typevar_tid(tc_lookup_node_tid(ret_ann), binds) } else { tc_void_tid() }
+    make_fn_type(ret, ptids)
+}
+
+// `arg_tids` are canonical (see canon_tid); the caller made them so to spell c_name.
+fn register(base_decl_node: Int, binders_sl: Int, arg_tids: List[Int], inst_tid: Int, c_name: Str) {
+    let tuple = make_tuple_type(arg_tids)
+    let key = seen_key(base_decl_node, tuple)
+    match mono_seen_keys.get(key) {
+        Some(_) => return
+        None => {}
+    }
+    mono_seen_keys.insert(key, mono_table.len())
+    mono_table.push(MonoInst { base_decl_node: base_decl_node, arg_tids: tuple, inst_tid: inst_tid, c_name: c_name })
+    mono_node_tids.push(Map())
+    mono_binds.push(binds_from_binders(binders_sl, arg_tids))
+    if dbg_channel_on("mono") != 0 {
+        dbg_trace("mono", "instance {c_name} args={tc_type_str(tuple)} inst={tc_type_str(inst_tid)}")
+    }
+}
+
+fn register_fn(gfn: Int, arg_tids0: List[Int]) {
+    if arg_tids0.len() == 0 { return }
+    let arg_tids = canon_tids(arg_tids0)
+    let binders_sl = node_type_params(gfn)
+    let inst_tid = canon_tid(fn_signature_tid(gfn, binds_from_binders(binders_sl, arg_tids)))
+    register(gfn, binders_sl, arg_tids, inst_tid, c_mono_fn_name(gfn, make_tuple_type(arg_tids)))
+}
+
+fn register_poly_method(m: Int, elem_tid0: Int) {
+    let elem_tid = canon_tid(elem_tid0)
+    let im = poly_block_of_method.get(m).unwrap()
+    let binders_sl = node_impl_binders(im)
+    let inst_tid = canon_tid(fn_signature_tid(m, binds_from_binders(binders_sl, [elem_tid])))
+    let c_name = c_poly_method_name(im, node_name(m), make_tuple_type([elem_tid]))
+    register(m, binders_sl, [elem_tid], inst_tid, c_name)
+}
+
+// A generic struct or enum instance reached through a type. The declaration comes from
+// the tid's own decl link, so two same-named types in different modules stay apart.
+fn register_type_instance(tid: Int) ! Diag.Report {
+    let k = tc_tid_kind(tid)
+    if k != TyKind.Struct && k != TyKind.Enum { return }
+    let n = tc_tid_child_count(tid)
+    if n == 0 { return }
+    if tid_is_open(tid) { return }
+    let td = tc_tid_decl_node(tid)
+    if td == DECL_NODE_AMBIGUOUS {
+        diag_ice_at("MonoAmbiguousTypeDecl", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "generic type '{tc_tid_name(tid)}' resolves to more than one declaration", -1,
+            "the type pool must link an instance to its declaring module; this is a compiler bug")
+        return
+    }
+    if td < 0 { return }
+    let ct = canon_tid(tid)
+    let mut args: List[Int] = []
+    let mut i = 0
+    while i < n {
+        args.push(tc_tid_child(ct, i))
+        i = i + 1
+    }
+    register(td, node_type_params(td), args, ct, c_mono_type_c_name(ct))
+}
+
+// Every generic type instance inside `tid`: the tid itself, then its children. A type is
+// never its own argument, so the recursion ends even for a self-recursive enum.
+fn register_type_instances_in(tid: Int) ! Diag.Report {
+    if tid < 0 { return }
+    if type_insts_done.contains_key(tid) { return }
+    type_insts_done.insert(tid, 1)
+    register_type_instance(tid)
+    let n = tc_tid_child_count(tid)
+    let mut i = 0
+    while i < n {
+        register_type_instances_in(tc_tid_child(tid, i))
+        i = i + 1
+    }
+}
+
+// ── Call discovery ─────────────────────────────────────────────────────────────
+
+fn discover_generic_call(ctx: Int, gfn: Int, call_node: Int, lead: List[Int], args_sl: Int) ! Diag.Report {
+    let binds = solve_call_binds(ctx, gfn, call_node, lead, args_sl)
+    register_fn(gfn, binder_args(ctx, gfn, call_node, binds))
+}
+
+// A callee Ident that typecheck stamped with a type names a local value (a closure or
+// parameter) that shadows any item of that name; an item callee carries no stamp.
+fn discover_call(ctx: Int, node: Int) ! Diag.Report {
+    let callee = node_left(node)
+    if callee == -1 || nk_of(node_kind(callee)) != NodeKind.Ident { return }
+    if tc_tid_is_no_info(tc_lookup_node_tid(callee)) == 0 { return }
+    let fn_name = tc_alias_to_original.get(node_name(callee)) ?? node_name(callee)
+    match generic_fn_by_name.get(fn_name) {
+        Some(gfn) => discover_generic_call(ctx, gfn, node, [], node_args(node))
+        None => {}
+    }
+}
+
+// `mod.f(args)` parses as a MethodCall on a module Ident; it is a free-fn call.
+fn discover_module_call(ctx: Int, node: Int) ! Diag.Report {
+    let fn_name = tc_alias_to_original.get(node_method(node)) ?? node_method(node)
+    match generic_fn_by_name.get(fn_name) {
+        Some(gfn) => discover_generic_call(ctx, gfn, node, [], node_args(node))
+        None => {}
+    }
+}
+
+// `recv.m(..)` or `Trait.m(recv, ..)` on a List whose impl is per-element. The
+// qualified form names the trait, so the receiver is the first argument.
+fn discover_poly_impl_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
+    let method = node_method(node)
+    if nk_of(node_kind(obj)) == NodeKind.Ident && tc_mc_obj_is_value(node) == 0 {
+        match poly_method_by_qualified.get("{node_name(obj)}.{method}") {
+            Some(m) => {
+                let args_sl = node_args(node)
+                if sl_len(args_sl) >= 1 { register_poly_recv(ctx, m, sublist_get(args_sl, 0)) }
+            }
+            None => {}
+        }
+        return
+    }
+    match poly_method_by_name.get(method) {
+        Some(m) => register_poly_recv(ctx, m, obj)
+        None => {}
+    }
+}
+
+fn register_poly_recv(ctx: Int, m: Int, recv_node: Int) {
+    let recv_tid = ctx_node_tid(ctx, recv_node)
+    if recv_tid < 0 { return }
+    let elem_tid = tc_tid_list_elem(recv_tid)
+    if elem_tid < 0 || tid_is_open(elem_tid) { return }
+    register_poly_method(m, elem_tid)
+}
+
+// `.fold/.for_each/.any/.all` on a List call the stdlib generic `list_<m>`; the
+// receiver is its first parameter and the call's arguments follow.
+fn discover_list_hof_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
+    let method = node_method(node)
+    if method != "fold" && method != "for_each" && method != "any" && method != "all" { return }
+    let recv_tid = ctx_node_tid(ctx, obj)
+    if recv_tid < 0 || tc_tid_kind(recv_tid) != TyKind.List { return }
+    match generic_fn_by_name.get("list_{method}") {
+        Some(gfn) => discover_generic_call(ctx, gfn, node, [recv_tid], node_args(node))
+        None => {}
+    }
+}
+
+fn discover_method_call(ctx: Int, node: Int) ! Diag.Report {
+    let obj = node_obj(node)
+    if obj == -1 { return }
+    if nk_of(node_kind(obj)) == NodeKind.Ident && tc_mc_obj_is_value(node) == 0 && is_import_module_name(node_name(obj)) != 0 {
+        discover_module_call(ctx, node)
+        return
+    }
+    discover_poly_impl_call(ctx, node, obj)
+    discover_list_hof_call(ctx, node, obj)
+}
+
+// ── The walk ───────────────────────────────────────────────────────────────────
+
+// Record the node's substituted type for the instance and register any generic type
+// instance that type reaches. Roots record nothing: typecheck's stamp is their truth.
+fn mono_record(ctx: Int, node: Int) ! Diag.Report {
+    let tid = ctx_node_tid(ctx, node)
+    if tid < 0 { return }
+    if ctx >= 0 { mono_node_tids.get(ctx).unwrap().insert(node, tid) }
+    register_type_instances_in(tid)
+}
+
+fn walk_sl(ctx: Int, sl: Int) ! Diag.Report {
+    if sl == -1 { return }
+    let mut i = 0
+    while i < sl_len(sl) {
+        mono_walk(ctx, sublist_get(sl, i))
+        i = i + 1
+    }
+}
+
+fn walk2(ctx: Int, a: Int, b: Int) ! Diag.Report {
+    mono_walk(ctx, a)
+    mono_walk(ctx, b)
+}
+
+fn walk3(ctx: Int, a: Int, b: Int, c: Int) ! Diag.Report {
+    mono_walk(ctx, a)
+    mono_walk(ctx, b)
+    mono_walk(ctx, c)
+}
+
+fn walk_ref_and_list(ctx: Int, a: Int, sl: Int) ! Diag.Report {
+    mono_walk(ctx, a)
+    walk_sl(ctx, sl)
+}
+
+// Params and the return annotation carry the tids a consumer reads for a signature.
+fn walk_fn_parts(ctx: Int, fn_node: Int) ! Diag.Report {
+    walk_sl(ctx, node_params(fn_node))
+    mono_walk(ctx, node_type_ann(fn_node))
+    mono_walk(ctx, node_body(fn_node))
+}
+
+fn mono_walk_call(ctx: Int, node: Int) ! Diag.Report {
+    discover_call(ctx, node)
+    walk_ref_and_list(ctx, node_left(node), node_args(node))
+}
+
+fn mono_walk_method_call(ctx: Int, node: Int) ! Diag.Report {
+    discover_method_call(ctx, node)
+    walk_ref_and_list(ctx, node_obj(node), node_args(node))
+}
+
+fn walk_closure(ctx: Int, node: Int) ! Diag.Report {
+    walk_sl(ctx, node_params(node))
+    walk2(ctx, node_type_ann(node), node_body(node))
+}
+
+fn walk_let(ctx: Int, node: Int) ! Diag.Report {
+    walk3(ctx, node_target(node), node_value(node), node_elements(node))
+    walk_sl(ctx, node_handlers(node))
+}
+
+fn walk_for_in(ctx: Int, node: Int) ! Diag.Report {
+    walk2(ctx, node_for_binder(node), node_iterable(node))
+    walk2(ctx, node_elements(node), node_body(node))
+}
+
+fn walk_type_def(ctx: Int, node: Int) ! Diag.Report {
+    walk_sl(ctx, node_fields(node))
+    walk_sl(ctx, node_handlers(node))
+    walk2(ctx, node_condition(node), node_value(node))
+}
+
+fn walk_type_ann(ctx: Int, node: Int) ! Diag.Report {
+    walk_ref_and_list(ctx, node_type_ann(node), node_elements(node))
+}
+
+fn walk_trait_or_impl(ctx: Int, node: Int) ! Diag.Report {
+    walk_sl(ctx, node_assoc_types(node))
+    walk_sl(ctx, node_methods(node))
+}
+
+fn ice_unwalkable(node: Int, kind: NodeKind) ! Diag.Report {
+    diag_ice_at("MonoUnwalkableNode", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "the mono walk reached a {node_kind_name(nk_tag(kind))} node, which never sits inside a body", node,
+        "walk_roots owns the program node; this is a compiler bug")
+}
+
+// One arm per NodeKind. A kind added to the enum fails to compile here until it is
+// placed, and the two kinds that never sit inside a body are an ICE at runtime.
+fn mono_walk(ctx: Int, node: Int) ! Diag.Report {
+    if node == -1 { return }
+    mono_record(ctx, node)
+    let kind = nk_of(node_kind(node))
+    match kind {
+        NodeKind.IntLit => {}
+        NodeKind.FloatLit => {}
+        NodeKind.Ident => {}
+        NodeKind.Call => mono_walk_call(ctx, node)
+        NodeKind.MethodCall => mono_walk_method_call(ctx, node)
+        NodeKind.BinOp => walk2(ctx, node_left(node), node_right(node))
+        NodeKind.UnaryOp => mono_walk(ctx, node_left(node))
+        NodeKind.InterpString => walk_sl(ctx, node_elements(node))
+        NodeKind.BoolLit => {}
+        NodeKind.TupleLit => walk_sl(ctx, node_elements(node))
+        NodeKind.ListLit => walk_sl(ctx, node_elements(node))
+        NodeKind.StructLit => walk_sl(ctx, node_fields(node))
+        NodeKind.FieldAccess => mono_walk(ctx, node_obj(node))
+        NodeKind.IndexExpr => walk2(ctx, node_obj(node), node_index(node))
+        NodeKind.RangeLit => walk2(ctx, node_start(node), node_end(node))
+        NodeKind.IfExpr => walk3(ctx, node_condition(node), node_then_body(node), node_else_body(node))
+        NodeKind.MatchExpr => walk_ref_and_list(ctx, node_scrutinee(node), node_arms(node))
+        NodeKind.Closure => walk_closure(ctx, node)
+        NodeKind.LetBinding => walk_let(ctx, node)
+        NodeKind.ExprStmt => mono_walk(ctx, node_value(node))
+        NodeKind.Assignment => walk2(ctx, node_target(node), node_value(node))
+        NodeKind.CompoundAssign => walk2(ctx, node_target(node), node_value(node))
+        NodeKind.Return => mono_walk(ctx, node_value(node))
+        NodeKind.ForIn => walk_for_in(ctx, node)
+        NodeKind.WhileLoop => walk2(ctx, node_condition(node), node_body(node))
+        NodeKind.LoopExpr => mono_walk(ctx, node_body(node))
+        NodeKind.Break => {}
+        NodeKind.Continue => {}
+        NodeKind.Block => walk_sl(ctx, node_stmts(node))
+        NodeKind.FnDef => walk_fn_parts(ctx, node)
+        NodeKind.Param => mono_walk(ctx, node_type_ann(node))
+        NodeKind.Program => ice_unwalkable(node, kind)
+        NodeKind.TypeDef => walk_type_def(ctx, node)
+        NodeKind.TypeField => walk2(ctx, node_condition(node), node_value(node))
+        NodeKind.TypeVariant => walk_sl(ctx, node_fields(node))
+        NodeKind.TraitDef => walk_trait_or_impl(ctx, node)
+        NodeKind.ImplBlock => walk_trait_or_impl(ctx, node)
+        NodeKind.TestBlock => walk_ref_and_list(ctx, node_body(node), node_handlers(node))
+        NodeKind.IntPattern => {}
+        NodeKind.WildcardPattern => {}
+        NodeKind.IdentPattern => {}
+        NodeKind.TuplePattern => walk_sl(ctx, node_elements(node))
+        NodeKind.StringPattern => {}
+        NodeKind.OrPattern => walk_sl(ctx, node_elements(node))
+        NodeKind.RangePattern => {}
+        NodeKind.StructPattern => walk_sl(ctx, node_fields(node))
+        NodeKind.EnumPattern => walk_sl(ctx, node_fields(node))
+        NodeKind.AsPattern => mono_walk(ctx, node_pattern(node))
+        NodeKind.ListPattern => walk_sl(ctx, node_elements(node))
+        NodeKind.MatchArm => walk3(ctx, node_pattern(node), node_guard(node), node_body(node))
+        NodeKind.StructLitField => walk2(ctx, node_pattern(node), node_value(node))
+        NodeKind.WithBlock => walk_ref_and_list(ctx, node_body(node), node_handlers(node))
+        NodeKind.WithResource => mono_walk(ctx, node_value(node))
+        NodeKind.HandlerExpr => walk_sl(ctx, node_methods(node))
+        NodeKind.Annotation => {}
+        NodeKind.ModBlock => {}
+        NodeKind.ImportStmt => {}
+        NodeKind.TypeAnn => walk_type_ann(ctx, node)
+        NodeKind.TypeParam => {}
+        NodeKind.EffectDecl => walk_sl(ctx, node_methods(node))
+        NodeKind.AsyncScope => mono_walk(ctx, node_body(node))
+        NodeKind.AsyncSpawn => mono_walk(ctx, node_body(node))
+        NodeKind.AwaitExpr => mono_walk(ctx, node_obj(node))
+        NodeKind.ChannelNew => walk_sl(ctx, node_args(node))
+        NodeKind.EmbedExpr => {}
+        NodeKind.NamedArg => mono_walk(ctx, node_value(node))
+        NodeKind.AssocType => mono_walk(ctx, node_type_ann(node))
+        NodeKind.SpreadExpr => mono_walk(ctx, node_value(node))
+        NodeKind.CharLit => {}
+        NodeKind.AssertPanics => walk2(ctx, node_value(node), node_body(node))
+        NodeKind.KindCount => ice_unwalkable(node, kind)
+    }
+}
