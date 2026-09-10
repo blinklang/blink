@@ -1,0 +1,325 @@
+import std.fs
+import std.io
+import typecheck.{tc_type_str, tc_lookup_node_tid, check_types, lookup_named_type, make_metavar, tc_unknown_tid, make_struct_instance_type, make_map_type, make_ptr_type, make_option_type, make_list_type}
+import layout.{child_tid, ensure_typedef_for, layout_take_typedefs, tid_of_binder, binder_scope_push, binder_scope_pop, bind_binder, layout_reset, Slot}
+import parser.{nodes}
+import compiler.{compile_to_program}
+import codegen_expr
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.println("FAIL: {label}: got '{got}' want '{want}'")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+// The probe covers every TyKind a user program can name, so each row below reads a tid
+// that real inference produced and not a hand-built pool entry.
+fn probe_src() -> Str {
+    #"@derive(Hash, Eq)
+type Key { id: Int }
+type Point { x: Int, y: Int }
+type Color { Red, Green }
+type Shape { Circle { r: Int }, Square { w: Int, h: Int } }
+type Box[T] { val: T }
+type Errno { Errno(Int) }
+type Port = Int
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str)
+    }
+}
+fn ident[T](x: T) -> T { x }
+fn use_t(t: Template[Point]) -> Int { 1 }
+fn use_h(h: Handle[Int]) -> Int { 1 }
+fn use_cf(c: Option[CFile]) -> Int { 1 }
+fn main() {
+    let i: Int = 7
+    let f: Float = 1.5
+    let b: Bool = true
+    let s: Str = "s"
+    let c: Char = 'c'
+    let a1: I8 = 1
+    let a2: I16 = 1
+    let a3: I32 = 1
+    let a4: U8 = 1
+    let a5: U16 = 1
+    let a6: U32 = 1
+    let a7: U64 = 1
+    let u: Void = ()
+    let l: List[Int] = []
+    let lp: List[Point] = []
+    let o: Option[Int] = None
+    let op: Option[Point] = None
+    let oc: Option[Color] = None
+    let osh: Option[Shape] = None
+    let oe: Option[Errno] = None
+    let ob: Option[Box[Int]] = None
+    let ol: Option[List[Int]] = None
+    let oo: Option[Option[Int]] = None
+    let ot: Option[(Int, Str)] = None
+    let r: Result[Int, Str] = Ok(1)
+    let rss: Result[Str, Str] = Ok("a")
+    let rp: Result[Point, Color] = Ok(Point { x: 1, y: 2 })
+    let rcp: Result[Color, Point] = Ok(Color.Red)
+    let rv: Result[Void, Str] = Ok(())
+    let re: Result[Int, Errno] = Ok(1)
+    let ro: Result[Option[Point], Str] = Ok(None)
+    let m: Map[Str, Int] = Map()
+    let mk: Map[Key, Int] = Map()
+    let st: Set[Int] = Set()
+    let by: Bytes = Bytes()
+    let sb: StringBuilder = StringBuilder()
+    let t: (Int, Str) = (1, "a")
+    let tp: (Point, Option[Int]) = (Point { x: 1, y: 2 }, None)
+    let tt: (Int, (Int, Str)) = (1, (1, "a"))
+    let tv: (Void, Int) = ((), 1)
+    let bx: Box[Int] = Box { val: 1 }
+    let bxo: Box[Option[Int]] = Box { val: None }
+    let p: Point = Point { x: 1, y: 2 }
+    let k: Key = Key { id: 1 }
+    let col: Color = Color.Red
+    let sh: Shape = Shape.Circle { r: 1 }
+    let h: Handler[IO] = handler IO { fn print(_m: Str) {} }
+    let hm: Handler[Metrics] = handler Metrics {
+        fn counter(_n: Str) {}
+    }
+    let it: Iterator[Int] = l.into_iter()
+    let ch: Channel[Int] = Channel(1)
+    let e: Errno = Errno(3)
+    let port: Port = 3
+    let te: (Errno, Int) = (Errno(1), 2)
+    let optr: Option[Ptr[Int]] = None
+    let oh: Option[Handler[IO]] = None
+    let ohm: Option[Handler[Metrics]] = None
+    let fnv: fn(Int) -> Int = fn(x: Int) -> Int { x }
+    with ffi.scope() as scope {
+        let pt: Ptr[Int] = scope.alloc()
+        assert(l.len() == 0)
+    }
+    assert(i == 7)
+}
+"#
+}
+
+// The probe is deleted BEFORE any assertion so a red row never leaks the file.
+// check_types resets the type pool, so the layout memo must be reset with it.
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/layout_child_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 {
+            m.insert(tc_type_str(tid), tid)
+        }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 {
+        io.println("FAIL: harvested map has no tid for rendered type string '{key}'")
+    }
+    assert(tid != -1)
+    tid
+}
+
+fn type_of_child(tid: Int, slot: Slot) -> Str {
+    let c = child_tid(tid, slot)
+    if c < 0 { return "<none>" }
+    tc_type_str(c)
+}
+
+// Each slot reads one child by role, so a caller never counts positions by hand.
+test "child_tid reads Inner1, Inner2, Param and Elem by role" {
+    let m = harvest_type_tids()
+    assert_eq_str("Option inner", type_of_child(expect_tid(m, "Option[Point]"), Slot.Inner1), "Point")
+    assert_eq_str("List inner", type_of_child(expect_tid(m, "List[Point]"), Slot.Inner1), "Point")
+    assert_eq_str("Result ok", type_of_child(expect_tid(m, "Result[Int, Str]"), Slot.Inner1), "Int")
+    assert_eq_str("Result err", type_of_child(expect_tid(m, "Result[Int, Str]"), Slot.Inner2), "Str")
+    assert_eq_str("Map key", type_of_child(expect_tid(m, "Map[Str, Int]"), Slot.Inner1), "Str")
+    assert_eq_str("Map value", type_of_child(expect_tid(m, "Map[Str, Int]"), Slot.Inner2), "Int")
+    assert_eq_str("Channel inner", type_of_child(expect_tid(m, "Channel[Int]"), Slot.Inner1), "Int")
+    assert_eq_str("Ptr pointee", type_of_child(expect_tid(m, "Ptr[Int]"), Slot.Inner1), "Int")
+    assert_eq_str("instance arg 0", type_of_child(expect_tid(m, "Box[Option[Int]]"), Slot.Param(0)), "Option[Int]")
+    assert_eq_str("tuple elem 1", type_of_child(expect_tid(m, "(Point, Option[Int])"), Slot.Elem(1)), "Option[Int]")
+    assert_eq_str("nested tuple elem", type_of_child(expect_tid(m, "(Int, (Int, Str))"), Slot.Elem(1)), "(Int, Str)")
+    assert_eq_str("fn return", type_of_child(expect_tid(m, "Fn(Int) -> Int"), Slot.Inner1), "Int")
+    assert_eq_str("fn param 0", type_of_child(expect_tid(m, "Fn(Int) -> Int"), Slot.Param(0)), "Int")
+}
+
+// A slot a kind does not have answers -1, never a neighbour's child.
+test "child_tid answers -1 for a slot the kind does not have" {
+    let m = harvest_type_tids()
+    assert_eq_str("List Inner2", type_of_child(expect_tid(m, "List[Int]"), Slot.Inner2), "<none>")
+    assert_eq_str("Option Param", type_of_child(expect_tid(m, "Option[Int]"), Slot.Param(0)), "<none>")
+    assert_eq_str("tuple out of range", type_of_child(expect_tid(m, "(Int, Str)"), Slot.Elem(2)), "<none>")
+    assert_eq_str("tuple Inner1", type_of_child(expect_tid(m, "(Int, Str)"), Slot.Inner1), "<none>")
+    assert_eq_str("Int Inner1", type_of_child(expect_tid(m, "Int"), Slot.Inner1), "<none>")
+    assert_eq_str("struct Param", type_of_child(expect_tid(m, "Point"), Slot.Param(0)), "<none>")
+    assert_eq_str("fn param out of range", type_of_child(expect_tid(m, "Fn(Int) -> Int"), Slot.Param(1)), "<none>")
+}
+
+fn joined(parts: List[Str]) -> Str {
+    let mut out = ""
+    let mut i = 0
+    while i < parts.len() {
+        out = out.concat(parts.get(i).unwrap()).concat("\n")
+        i = i + 1
+    }
+    out
+}
+
+// A carrier typedef is emitted once, under its guard, with the member shape the current
+// runtime expects. A second request emits nothing and answers the same name.
+test "ensure_typedef_for emits an Option typedef once" {
+    let m = harvest_type_tids()
+    let tid = expect_tid(m, "Option[Int]")
+    assert_eq_str("name", ensure_typedef_for(tid), "blink_Option_int")
+    let out = layout_take_typedefs()
+    assert_eq_int("one block", out.len(), 1)
+    let text = joined(out)
+    assert(text.contains("#ifndef BLINK_TD_blink_Option_int"))
+    assert(text.contains("#define BLINK_TD_blink_Option_int"))
+    assert(text.contains("typedef struct \{ int tag; int64_t value; } blink_Option_int;"))
+    assert(text.contains("#endif"))
+    assert_eq_str("second name", ensure_typedef_for(tid), "blink_Option_int")
+    assert_eq_int("second emits nothing", layout_take_typedefs().len(), 0)
+}
+
+// An Option stores a struct, a data enum, an instance, a tuple or a carrier through a
+// pointer; a plain enum, a transparent newtype and a pointer-typed inner stay by value.
+test "Option payload boxing follows the inner kind" {
+    let m = harvest_type_tids()
+    let _ = ensure_typedef_for(expect_tid(m, "Option[Point]"))
+    let _ = ensure_typedef_for(expect_tid(m, "Option[Shape]"))
+    let _ = ensure_typedef_for(expect_tid(m, "Option[Box[Int]]"))
+    let _ = ensure_typedef_for(expect_tid(m, "Option[Color]"))
+    let _ = ensure_typedef_for(expect_tid(m, "Option[Errno]"))
+    let _ = ensure_typedef_for(expect_tid(m, "Option[List[Int]]"))
+    let _ = ensure_typedef_for(expect_tid(m, "Option[Option[Int]]"))
+    let _ = ensure_typedef_for(expect_tid(m, "Option[(Int, Str)]"))
+    let text = joined(layout_take_typedefs())
+    assert(text.contains("typedef struct \{ int tag; blink_Point* value; } blink_Option_Point;"))
+    assert(text.contains("typedef struct \{ int tag; blink_Shape* value; } blink_Option_Shape;"))
+    assert(text.contains("typedef struct \{ int tag; blink_Box_0Int* value; } blink_Option_Box_0Int;"))
+    assert(text.contains("typedef struct \{ int tag; blink_Color value; } blink_Option_Color;"))
+    assert(text.contains("typedef struct \{ int tag; int64_t value; } blink_Option_Errno;"))
+    assert(text.contains("typedef struct \{ int tag; blink_list* value; } blink_Option_list;"))
+    assert(text.contains("typedef struct \{ int tag; blink_Option_int* value; } blink_Option_Option_int;"))
+    assert(text.contains("typedef struct \{ int tag; blink_Tuple2_int_str* value; } blink_Option_Tuple2_int_str;"))
+}
+
+// A Result stores its ok arm by value and boxes only a struct-typed err arm; Void arms
+// become an int64_t placeholder. blink_Result_str_str comes from the runtime header.
+test "Result arm shapes follow the current runtime contract" {
+    let m = harvest_type_tids()
+    let _ = ensure_typedef_for(expect_tid(m, "Result[Int, Str]"))
+    let _ = ensure_typedef_for(expect_tid(m, "Result[Point, Color]"))
+    let _ = ensure_typedef_for(expect_tid(m, "Result[Color, Point]"))
+    let _ = ensure_typedef_for(expect_tid(m, "Result[Void, Str]"))
+    let _ = ensure_typedef_for(expect_tid(m, "Result[Int, Errno]"))
+    assert_eq_str("str_str name", ensure_typedef_for(expect_tid(m, "Result[Str, Str]")), "blink_Result_str_str")
+    let text = joined(layout_take_typedefs())
+    assert(text.contains("typedef struct \{ int tag; union \{ int64_t ok; const char* err; }; } blink_Result_int_str;"))
+    assert(text.contains("typedef struct \{ int tag; union \{ blink_Point ok; blink_Color err; }; } blink_Result_Point_Color;"))
+    assert(text.contains("typedef struct \{ int tag; union \{ blink_Color ok; blink_Point* err; }; } blink_Result_Color_Point;"))
+    assert(text.contains("typedef struct \{ int tag; union \{ int64_t ok; const char* err; }; } blink_Result_void_str;"))
+    assert(text.contains("typedef struct \{ int tag; union \{ int64_t ok; int64_t err; }; } blink_Result_int_Errno;"))
+    assert_eq_int("str_str never emitted", if text.contains("blink_Result_str_str;") { 1 } else { 0 }, 0)
+}
+
+// A tuple holds every element by value; an inner carrier or tuple is emitted first so the
+// C compiler has seen the member type.
+test "tuple typedefs hold elements by value and emit inner types first" {
+    let m = harvest_type_tids()
+    assert_eq_str("name", ensure_typedef_for(expect_tid(m, "(Point, Option[Int])")), "blink_Tuple2_Point_Option_int")
+    let _ = ensure_typedef_for(expect_tid(m, "(Int, (Int, Str))"))
+    let _ = ensure_typedef_for(expect_tid(m, "(Void, Int)"))
+    let out = layout_take_typedefs()
+    let text = joined(out)
+    assert(text.contains("typedef struct \{\n    blink_Point _0;\n    blink_Option_int _1;\n} blink_Tuple2_Point_Option_int;"))
+    assert(text.contains("typedef struct \{\n    int64_t _0;\n    blink_Tuple2_int_str _1;\n} blink_Tuple2_int_Tuple2_int_str;"))
+    assert(text.contains("typedef struct \{\n    int64_t _0;\n    int64_t _1;\n} blink_Tuple2_void_int;"))
+    let opt_at = text.index_of("} blink_Option_int;")
+    let outer_at = text.index_of("} blink_Tuple2_Point_Option_int;")
+    assert(opt_at >= 0 && outer_at > opt_at)
+    let inner_at = text.index_of("} blink_Tuple2_int_str;")
+    let nested_at = text.index_of("} blink_Tuple2_int_Tuple2_int_str;")
+    assert(inner_at >= 0 && nested_at > inner_at)
+}
+
+// A Ptr or Handler payload is one void* in the carrier, whatever it points to, so every
+// Option over a pointer shares one typedef under one name.
+test "Option over a Ptr or Handler payload stores void*" {
+    let m = harvest_type_tids()
+    assert_eq_str("ptr", ensure_typedef_for(expect_tid(m, "Option[Ptr[Int]]")), "blink_Option_ptr")
+    assert_eq_str("handler io", ensure_typedef_for(expect_tid(m, "Option[Handler[IO]]")), "blink_Option_handler")
+    assert_eq_str("handler metrics", ensure_typedef_for(expect_tid(m, "Option[Handler[Metrics]]")), "blink_Option_handler")
+    let out = layout_take_typedefs()
+    assert_eq_int("two typedefs", out.len(), 2)
+    let text = joined(out)
+    assert(text.contains("typedef struct \{ int tag; void* value; } blink_Option_ptr;"))
+    assert(text.contains("typedef struct \{ int tag; void* value; } blink_Option_handler;"))
+}
+
+// A nested carrier is emitted before the carrier that embeds it.
+test "a Result over an Option emits the Option first" {
+    let m = harvest_type_tids()
+    assert_eq_str("name", ensure_typedef_for(expect_tid(m, "Result[Option[Point], Str]")), "blink_Result_Option_Point_str")
+    let text = joined(layout_take_typedefs())
+    let inner_at = text.index_of("} blink_Option_Point;")
+    let outer_at = text.index_of("} blink_Result_Option_Point_str;")
+    assert(inner_at >= 0 && outer_at > inner_at)
+    assert(text.contains("union \{ blink_Option_Point ok; const char* err; }"))
+}
+
+// Types with no carrier typedef of their own answer their spelling and emit nothing.
+test "ensure_typedef_for emits nothing for scalars, nominals and niche Options" {
+    let m = harvest_type_tids()
+    assert_eq_str("Int", ensure_typedef_for(expect_tid(m, "Int")), "int64_t")
+    assert_eq_str("Point", ensure_typedef_for(expect_tid(m, "Point")), "blink_Point")
+    assert_eq_str("Box[Int]", ensure_typedef_for(expect_tid(m, "Box[Int]")), "blink_Box_0Int")
+    assert_eq_str("List", ensure_typedef_for(expect_tid(m, "List[Int]")), "blink_list*")
+    assert_eq_str("Option[CFile]", ensure_typedef_for(expect_tid(m, "Option[CFile]")), "FILE*")
+    assert_eq_str("Errno", ensure_typedef_for(expect_tid(m, "Errno")), "int64_t")
+    assert_eq_int("nothing emitted", layout_take_typedefs().len(), 0)
+}
+
+// Binder scopes nest: an inner frame shadows, a miss walks outward, a pop forgets.
+test "tid_of_binder walks nested binder scopes" {
+    let m = harvest_type_tids()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    let outer = binder_scope_push()
+    bind_binder(outer, "x", int_tid)
+    bind_binder(outer, "y", str_tid)
+    assert_eq_int("outer x", tid_of_binder(outer, "x"), int_tid)
+    let inner = binder_scope_push()
+    bind_binder(inner, "x", str_tid)
+    assert_eq_int("inner shadows x", tid_of_binder(inner, "x"), str_tid)
+    assert_eq_int("inner sees outer y", tid_of_binder(inner, "y"), str_tid)
+    assert_eq_int("inner miss", tid_of_binder(inner, "z"), -1)
+    binder_scope_pop()
+    assert_eq_int("outer x after pop", tid_of_binder(outer, "x"), int_tid)
+    binder_scope_pop()
+    assert_eq_int("popped scope misses", tid_of_binder(outer, "x"), -1)
+}
