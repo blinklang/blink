@@ -5,18 +5,27 @@
 // codegen table or a flat CT code. A tid this module cannot
 // spell gets a decline (non-empty decline_reason, empty spelling), never a guess:
 // the caller that needs a spelling turns a decline into I0001.
+//
+// This module decides storage. It spells no C symbol name of its own: every nominal
+// name, carrier tag and runtime symbol comes from cname.bl, and a name cname refuses
+// (an ICE_SEG_* sentinel) is a decline here.
 
 import typecheck.{
     TyKind, tk_name, tc_tid_kind, tc_tid_child, tc_tid_child_count, tc_tid_name, tc_resolve,
-    tc_is_unbound_metavar, tc_tid_handler_effect, tc_handler_effect_root,
-    tc_lookup_node_tid, tc_type_decl_nodes, tc_resolve_transparent_alias_name,
+    tc_is_unbound_metavar, tc_lookup_node_tid, tc_type_decl_nodes, tc_tid_decl_node,
+    DECL_NODE_AMBIGUOUS, tc_resolve_transparent_alias_name,
 }
 import parser.{
-    node_source_module, node_fields, node_name, node_value, node_kind, node_handlers,
-    node_args, node_type_params, get_annotation, get_str_named_arg, sublist_get, sublist_length,
+    node_fields, node_name, node_value, node_kind, node_handlers, node_args, node_type_params,
+    get_annotation, sublist_get, sublist_length,
 }
 import ast.{NodeKind}
-import diagnostics.{diag_ice_at, UNSOLVED_TYPEVAR_AT_CODEGEN}
+import diagnostics.{diag_ice_at, diag_is_ice_seg, UNSOLVED_TYPEVAR_AT_CODEGEN}
+import cname.{
+    c_typedef_name, c_type_decl_name, c_seg_inner, c_vtable_type_name, c_kops_table_name,
+    td_guard_open_lines, td_guard_close_line, cname_reset, cname_mark_transparent_newtype,
+    cname_mark_runtime_owned, cname_is_transparent_newtype,
+}
 
 pub type Position { Local, Field, Param, Return, ContainerSlot, VtableSlot, TupleElem }
 
@@ -26,12 +35,14 @@ pub type SlotForm { Inline, PointerBoxed, InlineWord }
 
 pub type Slot { Inner1, Inner2, Param(Int), Elem(Int) }
 
+// A record answers a tid in a position. Whether a variant field is boxed because it
+// reaches its own enum is a relation between the owner and the field, so it is not
+// a record field; field_layout_of answers it.
 pub type LayoutRecord {
     c_spelling: Str
     slot_form: SlotForm
     carrier_tag: Str
     is_transparent: Int
-    boxed_selfrec: Int
     kops_table: Str
     decline_reason: Str
 }
@@ -49,8 +60,12 @@ let mut binder_entry_frame: List[Int] = []
 let mut binder_entry_name: List[Str] = []
 let mut binder_entry_tid: List[Int] = []
 
-// check_types rebuilds the type pool, so every cached answer is stale after it.
+// check_types rebuilds the type pool, so every cached answer is stale after it. The
+// cname marks are keyed on declaration nodes from the same build, so they are reset
+// and re-marked with it.
 pub fn layout_reset() {
+    cname_reset()
+    lo_mark_decl_facts()
     layout_memo = Map()
     typedef_buffer = []
     typedef_guard = Map()
@@ -73,11 +88,15 @@ pub fn carrier_tag_of(tid: Int) -> Str {
     layout_of(tid, Position.Local).carrier_tag
 }
 
+// The declared Blink name, read from the declaration. A tid whose declaration cannot be
+// found or is ambiguous has no nominal name to give.
 pub fn nominal_name_of(tid: Int) -> Str {
     let r = lo_res(tid)
     let k = tc_tid_kind(r)
     if k != TyKind.Struct && k != TyKind.Enum { return "" }
-    lo_bare_name(tc_tid_name(r))
+    let decl = tc_tid_decl_node(r)
+    if decl < 0 { return "" }
+    node_name(decl)
 }
 
 pub fn child_tid(tid: Int, slot: Slot) -> Int {
@@ -135,6 +154,20 @@ pub fn layout_of(tid: Int, position: Position) -> LayoutRecord {
     let rec = lo_compute_layout(tid, position)
     layout_memo.insert(key, rec)
     rec
+}
+
+// A variant or struct field in its owner. A field that reaches its own enum by value
+// (directly, or through a tuple at any depth) is stored boxed: the owner's C typedef is
+// incomplete while its members are declared, so the member is an opaque int64_t word
+// that holds the heap pointer. Any other field is its Field-position layout.
+pub fn field_layout_of(owner_decl: Int, field_tid: Int) -> LayoutRecord {
+    let selfrec = lo_reaches_owner(field_tid, owner_decl)
+    if selfrec < 0 { return lo_declined("field type has an ambiguous declaration; cannot decide self-recursion") }
+    if selfrec == 0 { return layout_of(field_tid, Position.Field) }
+    LayoutRecord {
+        c_spelling: "int64_t", slot_form: SlotForm.PointerBoxed, carrier_tag: "",
+        is_transparent: 0, kops_table: "", decline_reason: "",
+    }
 }
 
 // Emits the carrier typedef for an Option, Result or Tuple (inner carriers first) and
@@ -236,7 +269,7 @@ fn lo_position_index(position: Position) -> Int {
 fn lo_declined(reason: Str) -> LayoutRecord {
     LayoutRecord {
         c_spelling: "", slot_form: SlotForm.InlineWord, carrier_tag: "",
-        is_transparent: 0, boxed_selfrec: 0, kops_table: "", decline_reason: reason,
+        is_transparent: 0, kops_table: "", decline_reason: reason,
     }
 }
 
@@ -248,6 +281,7 @@ fn lo_compute_layout(tid: Int, position: Position) -> LayoutRecord {
     let transparent = if lo_is_transparent_newtype(r) { 1 } else { 0 }
     let word = lo_fits_word(r)
     let mut spelling = lo_spell(r)
+    if diag_is_ice_seg(spelling) { return lo_declined("cname refused the name: {spelling}") }
     let mut form = if word { SlotForm.InlineWord } else { SlotForm.Inline }
     if position == Position.Return && lo_is_void_like(k) {
         spelling = "void"
@@ -261,9 +295,31 @@ fn lo_compute_layout(tid: Int, position: Position) -> LayoutRecord {
     }
     LayoutRecord {
         c_spelling: spelling, slot_form: form, carrier_tag: lo_tag_of(r),
-        is_transparent: transparent, boxed_selfrec: 0, kops_table: lo_kops_of(r),
+        is_transparent: transparent, kops_table: lo_kops_of(r),
         decline_reason: "",
     }
+}
+
+// Does a field of this type embed its owner by value? 1 when the field is the owner
+// itself (bare or any instance of it) or a tuple that reaches the owner at any depth;
+// -1 when the field's declaration is ambiguous, so no answer is safe.
+fn lo_reaches_owner(field_tid: Int, owner_decl: Int) -> Int {
+    let r = lo_res(field_tid)
+    let k = tc_tid_kind(r)
+    if k == TyKind.Struct || k == TyKind.Enum {
+        let decl = tc_tid_decl_node(r)
+        if decl == DECL_NODE_AMBIGUOUS { return -1 }
+        return if decl >= 0 && decl == owner_decl { 1 } else { 0 }
+    }
+    if k != TyKind.Tuple { return 0 }
+    let n = tc_tid_child_count(r)
+    let mut i = 0
+    while i < n {
+        let hit = lo_reaches_owner(tc_tid_child(r, i), owner_decl)
+        if hit != 0 { return hit }
+        i = i + 1
+    }
+    0
 }
 
 // The reasons a tid has no C answer. A pointer container (List, Map, Set, Channel,
@@ -279,7 +335,9 @@ fn lo_decline_reason_of(tid: Int) -> Str {
     }
     if k == TyKind.Typevar { return "free type variable {tc_tid_name(r)}" }
     if k == TyKind.Struct || k == TyKind.Enum {
-        if tc_tid_child_count(r) == 0 && lo_decl_is_generic(lo_decl_node_of(r)) { return "un-monomorphised generic {lo_bare_name(tc_tid_name(r))}" }
+        let decl = tc_tid_decl_node(r)
+        if decl == DECL_NODE_AMBIGUOUS { return "ambiguous declaration for {tc_tid_name(r)}" }
+        if tc_tid_child_count(r) == 0 && lo_decl_is_generic(decl) { return "un-monomorphised generic {tc_tid_name(r)}" }
         let child = lo_instance_arg_decline(r)
         if child != "" { return child }
         return lo_first_child_decline(r, 0)
@@ -339,11 +397,11 @@ fn lo_fits_word(r: Int) -> Bool {
     let k = tc_tid_kind(r)
     if k == TyKind.Struct || k == TyKind.Enum {
         if lo_is_transparent_newtype(r) { return true }
-        if lo_opaque_c_name(r) != "" { return true }
-        if k == TyKind.Enum && tc_tid_child_count(r) == 0 { return !lo_decl_is_data_enum(lo_decl_node_of(r)) }
+        if lo_is_opaque(r) { return true }
+        if k == TyKind.Enum && tc_tid_child_count(r) == 0 { return !lo_decl_is_data_enum(tc_tid_decl_node(r)) }
         return false
     }
-    if k == TyKind.Option { return lo_opaque_c_name(lo_res(tc_tid_child(r, 0))) != "" }
+    if k == TyKind.Option { return lo_is_opaque(lo_res(tc_tid_child(r, 0))) }
     if k == TyKind.Result || k == TyKind.Tuple { return false }
     true
 }
@@ -358,6 +416,8 @@ fn lo_is_boxed_nominal(r: Int) -> Bool {
 
 // ── Spelling ──────────────────────────────────────────────────────────────
 
+// The C spelling of a resolved tid. Scalars and runtime containers are fixed runtime
+// types; every nominal or carrier name is asked of cname.
 fn lo_spell(r: Int) -> Str {
     let k = tc_tid_kind(r)
     let scalar = lo_spell_scalar(k)
@@ -366,10 +426,10 @@ fn lo_spell(r: Int) -> Str {
         TyKind.Struct => lo_spell_nominal(r)
         TyKind.Enum => lo_spell_nominal(r)
         TyKind.Option => lo_spell_option(r)
-        TyKind.Result => "blink_{lo_tag_of(r)}"
-        TyKind.Tuple => "blink_{lo_tag_of(r)}"
+        TyKind.Result => c_typedef_name(r)
+        TyKind.Tuple => c_typedef_name(r)
         TyKind.Ptr => lo_spell_ptr(r)
-        TyKind.Handler => "{lo_vtable_of(tc_tid_handler_effect(r))}*"
+        TyKind.Handler => lo_spell_handler(r)
         _ => ""
     }
 }
@@ -407,19 +467,19 @@ fn lo_spell_scalar(k: TyKind) -> Str {
     }
 }
 
+// A transparent newtype is its bare payload word. Everything else, an opaque handle
+// included, is the typedef name cname spells for the tid.
 fn lo_spell_nominal(r: Int) -> Str {
     if lo_is_transparent_newtype(r) { return "int64_t" }
-    let opaque = lo_opaque_c_name(r)
-    if opaque != "" { return "{opaque}*" }
-    "blink_{lo_tag_of(r)}"
+    c_typedef_name(r)
 }
 
 // An Option over an opaque handle is the bare handle pointer: NULL is None.
 fn lo_spell_option(r: Int) -> Str {
     let inner = lo_res(tc_tid_child(r, 0))
-    let opaque = lo_opaque_c_name(inner)
-    if opaque != "" { return "{opaque}*" }
-    "blink_{lo_tag_of(r)}"
+    let opaque = lo_opaque_decl(inner)
+    if opaque >= 0 { return c_type_decl_name(opaque) }
+    c_typedef_name(r)
 }
 
 // A pointee that cannot be spelled drops to void*; a Ptr never declines.
@@ -428,199 +488,42 @@ fn lo_spell_ptr(r: Int) -> Str {
     if lo_decline_reason_of(pointee) != "" { return "void*" }
     let k = tc_tid_kind(pointee)
     if lo_is_void_like(k) { return "void*" }
-    "{lo_spell(pointee)}*"
+    let inner = lo_spell(pointee)
+    if diag_is_ice_seg(inner) { return inner }
+    "{inner}*"
 }
 
-fn lo_vtable_of(effect_name: Str) -> Str {
-    let root = tc_handler_effect_root(effect_name)
-    if root == "IO" { return "blink_io_vtable" }
-    if root == "FS" { return "blink_fs_vtable" }
-    if root == "Net" { return "blink_net_vtable" }
-    if root == "Crypto" { return "blink_crypto_vtable" }
-    if root == "Rand" { return "blink_rand_vtable" }
-    if root == "Time" { return "blink_time_vtable" }
-    if root == "Env" { return "blink_env_vtable" }
-    if root == "Process" { return "blink_process_vtable" }
-    "blink_ue_{root.to_lower()}_vtable"
+fn lo_spell_handler(r: Int) -> Str {
+    let vt = c_vtable_type_name(r)
+    if diag_is_ice_seg(vt) { return vt }
+    "{vt}*"
 }
 
 // ── Carrier tags ──────────────────────────────────────────────────────────
 
-// The segment a carrier name is built from. Builtin kinds are lowercase words; a
-// struct or enum is its C name without blink_; an instance is its mono stem.
+// The segment a carrier name is built from, spelled by cname at INNER position. A kind
+// that has no carrier segment (cname refuses it) has no tag.
 fn lo_tag_of(r: Int) -> Str {
-    let k = tc_tid_kind(r)
-    let simple = lo_tag_scalar(k)
-    if simple != "" { return simple }
-    match k {
-        TyKind.Struct => lo_tag_nominal(r)
-        TyKind.Enum => lo_tag_nominal(r)
-        TyKind.Option => "Option_{lo_tag_of(lo_res(tc_tid_child(r, 0)))}"
-        TyKind.Result => "Result_{lo_tag_of(lo_res(tc_tid_child(r, 0)))}_{lo_tag_of(lo_res(tc_tid_child(r, 1)))}"
-        TyKind.Tuple => lo_tag_tuple(r)
-        _ => ""
-    }
-}
-
-fn lo_tag_scalar(k: TyKind) -> Str {
-    match k {
-        TyKind.Int => "int"
-        TyKind.Float => "double"
-        TyKind.Bool => "bool"
-        TyKind.Str => "str"
-        TyKind.Char => "char"
-        TyKind.I8 => "i8"
-        TyKind.I16 => "i16"
-        TyKind.I32 => "i32"
-        TyKind.U8 => "u8"
-        TyKind.U16 => "u16"
-        TyKind.U32 => "u32"
-        TyKind.U64 => "u64"
-        TyKind.Void => "void"
-        TyKind.Never => "void"
-        TyKind.List => "list"
-        TyKind.FfiScope => "list"
-        TyKind.Map => "map"
-        TyKind.Set => "set"
-        TyKind.Bytes => "bytes"
-        TyKind.StringBuilder => "stringbuilder"
-        TyKind.Channel => "channel"
-        TyKind.Handle => "handle"
-        TyKind.Iterator => "iter"
-        TyKind.Fn => "closure"
-        TyKind.Template => "template"
-        TyKind.Ptr => "ptr"
-        TyKind.Handler => "handler"
-        _ => ""
-    }
-}
-
-fn lo_tag_tuple(r: Int) -> Str {
-    let n = tc_tid_child_count(r)
-    let mut out = "Tuple{n}"
-    let mut i = 0
-    while i < n {
-        let elem = lo_res(tc_tid_child(r, i))
-        // A transparent newtype element lowers to a bare int64_t, so the tuple names it int.
-        let seg = if lo_is_transparent_newtype(elem) { "int" } else { lo_tag_of(elem) }
-        out = "{out}_{seg}"
-        i = i + 1
-    }
-    out
-}
-
-// The segment grammar at the head of a mono stem argument: a Pascal-case kind name for
-// a builtin, the bare name or nested stem for a nominal, the inner grammar for a carrier.
-fn lo_tag_top(r: Int) -> Str {
-    let k = tc_tid_kind(r)
-    if k == TyKind.Struct || k == TyKind.Enum {
-        if tc_tid_child_count(r) > 0 { return lo_tag_nominal(r) }
-        return lo_bare_name(tc_tid_name(r))
-    }
-    if k == TyKind.Option || k == TyKind.Result || k == TyKind.Tuple { return lo_tag_of(r) }
-    if k == TyKind.Void || k == TyKind.Never { return "Void" }
-    if k == TyKind.FfiScope || k == TyKind.Fn || k == TyKind.Template { return "" }
-    tk_name(k)
-}
-
-// An opaque handle keeps its bare declared name. An instance joins the escaped base
-// and every escaped argument tag with "_0" so a literal underscore in any segment
-// cannot collide with the separator.
-fn lo_tag_nominal(r: Int) -> Str {
-    let decl = lo_decl_node_of(r)
-    let name = lo_bare_name(tc_tid_name(r))
-    if lo_opaque_c_name(r) != "" { return name }
-    let base = lo_nominal_c_tag(name, decl)
-    let n = tc_tid_child_count(r)
-    if n == 0 { return base }
-    let mut out = lo_escape_mono_seg(base)
-    let mut i = 0
-    while i < n {
-        out = "{out}_0{lo_escape_mono_seg(lo_tag_top(lo_res(tc_tid_child(r, i))))}"
-        i = i + 1
-    }
-    out
-}
-
-// The C name without blink_: the declaring module (dots as underscores) then the
-// name. The main module and the compiler-provided types carry no prefix.
-fn lo_nominal_c_tag(name: Str, decl: Int) -> Str {
-    if decl < 0 { return name }
-    if name == "ConversionError" || name == "ProcessResult" { return name }
-    let m = node_source_module(decl)
-    if m == "" || m == "__main__" { return name }
-    "{lo_dots_to_underscores(m)}_{name}"
-}
-
-fn lo_escape_mono_seg(s: Str) -> Str {
-    if s.index_of("_") < 0 { return s }
-    let mut out = ""
-    let mut i = 0
-    while i < s.len() {
-        if s.byte_at(i) == 95 { out = out.concat("_1") } else { out = out.concat(s.substr(i, 1)) }
-        i = i + 1
-    }
-    out
-}
-
-fn lo_dots_to_underscores(s: Str) -> Str {
-    let mut out = ""
-    let mut i = 0
-    while i < s.len() {
-        if s.byte_at(i) == 46 { out = out.concat("_") } else { out = out.concat(s.substr(i, 1)) }
-        i = i + 1
-    }
-    out
-}
-
-fn lo_bare_name(name: Str) -> Str {
-    let mut dot = -1
-    let mut i = 0
-    while i < name.len() {
-        if name.byte_at(i) == 46 { dot = i }
-        i = i + 1
-    }
-    if dot < 0 { return name }
-    name.substr(dot + 1, name.len() - dot - 1)
+    let seg = c_seg_inner(r)
+    if diag_is_ice_seg(seg) { return "" }
+    seg
 }
 
 // ── Key operations ────────────────────────────────────────────────────────
 
+// A builtin scalar key has a runtime table. A struct or enum key has a table only when
+// it derives Hash; cname spells the symbol codegen_derive emits for it.
 fn lo_kops_of(r: Int) -> Str {
     let k = tc_tid_kind(r)
-    let builtin = lo_kops_scalar(k)
-    if builtin != "" { return builtin }
-    if k != TyKind.Struct && k != TyKind.Enum { return "" }
-    let decl = lo_decl_node_of(r)
-    if !lo_decl_has_derive(decl, "Hash") { return "" }
-    "kops_blink_{lo_tag_nominal(r)}"
-}
-
-fn lo_kops_scalar(k: TyKind) -> Str {
-    match k {
-        TyKind.Int => "blink_kops_i64"
-        TyKind.Str => "blink_kops_str"
-        TyKind.Bool => "blink_kops_bool"
-        TyKind.Char => "blink_kops_char"
-        TyKind.I8 => "blink_kops_i8"
-        TyKind.I16 => "blink_kops_i16"
-        TyKind.I32 => "blink_kops_i32"
-        TyKind.U8 => "blink_kops_u8"
-        TyKind.U16 => "blink_kops_u16"
-        TyKind.U32 => "blink_kops_u32"
-        TyKind.U64 => "blink_kops_u64"
-        _ => ""
+    if k == TyKind.Struct || k == TyKind.Enum {
+        if !lo_decl_has_derive(tc_tid_decl_node(r), "Hash") { return "" }
     }
+    let table = c_kops_table_name(r)
+    if diag_is_ice_seg(table) { return "" }
+    table
 }
 
 // ── Declaration node facts ────────────────────────────────────────────────
-
-fn lo_decl_node_of(r: Int) -> Int {
-    let name = tc_tid_name(r)
-    let direct = tc_type_decl_nodes.get(name) ?? -1
-    if direct >= 0 { return direct }
-    tc_type_decl_nodes.get(lo_bare_name(name)) ?? -1
-}
 
 fn lo_decl_is_generic(decl: Int) -> Bool {
     if decl < 0 { return false }
@@ -647,12 +550,45 @@ fn lo_decl_is_data_enum(decl: Int) -> Bool {
     false
 }
 
-// The transparent newtype contract is scoped to the name Errno with exactly one
-// variant that carries exactly one Int. Any other shape lowers as a normal enum.
 fn lo_is_transparent_newtype(r: Int) -> Bool {
     if tc_tid_kind(r) != TyKind.Enum { return false }
-    if lo_bare_name(tc_tid_name(r)) != "Errno" { return false }
-    let decl = lo_decl_node_of(r)
+    let decl = tc_tid_decl_node(r)
+    decl >= 0 && cname_is_transparent_newtype(decl)
+}
+
+fn lo_is_opaque(r: Int) -> Bool { lo_opaque_decl(r) >= 0 }
+
+// The declaration node of an @ffi.opaque struct or enum, else -1.
+fn lo_opaque_decl(r: Int) -> Int {
+    let k = tc_tid_kind(r)
+    if k != TyKind.Struct && k != TyKind.Enum { return -1 }
+    let decl = tc_tid_decl_node(r)
+    if decl >= 0 && get_annotation(decl, "ffi.opaque") != -1 { return decl }
+    -1
+}
+
+// Two facts about a declaration that neither its node nor its tid carries are marked
+// on cname once per build. Until an annotation or typecheck owns them, this pass is
+// the interim owner, and it is the ONLY place a type is known by its name:
+//  - Errno with exactly one variant carrying exactly one Int is the transparent
+//    newtype that lowers to a bare int64_t;
+//  - ConversionError and ProcessResult are declared in lib/std but defined by
+//    runtime.h, so they keep the bare blink_<Name> the runtime declares.
+fn lo_mark_decl_facts() {
+    let names = tc_type_decl_nodes.keys()
+    let mut i = 0
+    while i < names.len() {
+        let name = names.get(i).unwrap()
+        let decl = tc_type_decl_nodes.get(name) ?? -1
+        if decl >= 0 && name == node_name(decl) {
+            if name == "Errno" && lo_decl_is_int_newtype_shape(decl) { cname_mark_transparent_newtype(decl) }
+            if name == "ConversionError" || name == "ProcessResult" { cname_mark_runtime_owned(decl) }
+        }
+        i = i + 1
+    }
+}
+
+fn lo_decl_is_int_newtype_shape(decl: Int) -> Bool {
     if !lo_decl_is_enum(decl) { return false }
     let vars = node_fields(decl)
     if sublist_length(vars) != 1 { return false }
@@ -660,16 +596,6 @@ fn lo_is_transparent_newtype(r: Int) -> Bool {
     if vflds == -1 || sublist_length(vflds) != 1 { return false }
     let ann = node_value(sublist_get(vflds, 0))
     ann != -1 && node_name(ann) == "Int"
-}
-
-fn lo_opaque_c_name(r: Int) -> Str {
-    let k = tc_tid_kind(r)
-    if k != TyKind.Struct && k != TyKind.Enum { return "" }
-    let decl = lo_decl_node_of(r)
-    if decl < 0 { return "" }
-    let ann = get_annotation(decl, "ffi.opaque")
-    if ann == -1 { return "" }
-    get_str_named_arg(ann, "name")
 }
 
 fn lo_decl_has_derive(decl: Int, derive_name: Str) -> Bool {
@@ -699,7 +625,8 @@ fn lo_args_name(args_sl: Int, want: Str) -> Bool {
 
 fn lo_guard_and_push(name: Str, body: Str) {
     typedef_guard.insert(name, 1)
-    typedef_buffer.push("#ifndef BLINK_TD_{name}\n#define BLINK_TD_{name}\n{body}\n#endif")
+    let open = td_guard_open_lines(name)
+    typedef_buffer.push("{open.get(0).unwrap()}\n{open.get(1).unwrap()}\n{body}\n{td_guard_close_line()}")
 }
 
 fn lo_is_carrier_kind(k: TyKind) -> Bool {
@@ -716,7 +643,7 @@ fn lo_ensure_child_typedef(child: Int) {
 // enum, instance, carrier or tuple sits behind a pointer.
 fn lo_emit_option_typedef(r: Int, name: Str) {
     let inner = lo_res(tc_tid_child(r, 0))
-    if lo_opaque_c_name(inner) != "" { return }
+    if lo_is_opaque(inner) { return }
     if typedef_guard.contains_key(name) != 0 { return }
     lo_ensure_child_typedef(inner)
     let member = if lo_fits_word(inner) { lo_member_spelling(inner) } else { "{lo_spell(inner)}*" }
