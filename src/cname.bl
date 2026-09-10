@@ -1,0 +1,461 @@
+// The one producer of every C symbol name the compiler emits.
+//
+// Every name is read from a declaration node or from a type id. No function here
+// branches on a type name string or on a CT_ constant: a struct or enum is known by
+// its type id, and the module that owns it is read from its declaration node.
+//
+// Two forms need facts that neither the tid nor the node carries:
+//  - a runtime-owned type (declared in lib/std but defined by runtime.h) drops its
+//    module prefix;
+//  - a transparent newtype spells `int` as a tuple element.
+// The owner of that fact marks the declaration through cname_mark_*; this module only
+// reads the mark.
+//
+// A speller that cannot name a type answers an ICE_SEG_* sentinel (diagnostics.bl).
+// A sentinel is never interpolated into a longer name: the caller sees it whole, so
+// diag_is_ice_seg can still detect it.
+
+import typecheck.{
+    TAGPOS_INNER, TAGPOS_TOP, TyKind, TypePoolEntry, tc_resolve,
+    tc_resolve_transparent_alias_name, tc_tid_decl_node, DECL_NODE_AMBIGUOUS, ty_param_list, ty_pool,
+}
+import parser.{
+    get_annotation, get_str_named_arg, node_name, node_source_module, node_trait_name,
+    node_type_params, sublist_get, sublist_length,
+}
+import diagnostics.{
+    ICE_SEG_AMBIGUOUS_DECL, ICE_SEG_NO_DECL, ICE_SEG_TID_OUT_OF_RANGE, ICE_SEG_UNHANDLED_KIND,
+    ICE_SEG_UNSOLVED_TYPEVAR, diag_is_ice_seg,
+}
+
+let mut runtime_owned_decls: Map[Int, Int] = Map()
+let mut transparent_decls: Map[Int, Int] = Map()
+
+// Runtime C symbols that a user function must not shadow.
+let blink_reserved: List[Str] = [
+    "list", "map", "set", "bytes", "sb", "closure", "ctx", "task", "threadpool",
+    "handle", "channel", "alloc", "strdup", "ProcessResult", "duration_struct",
+    "instant_struct",
+]
+
+pub fn cname_reset() {
+    runtime_owned_decls.clear()
+    transparent_decls.clear()
+}
+
+// A type declared in lib/std whose C typedef lives in runtime.h keeps the bare
+// `blink_<Name>` the runtime declares.
+pub fn cname_mark_runtime_owned(td: Int) {
+    runtime_owned_decls.insert(td, 1)
+}
+
+// The marker asserts the shape (one variant, one Int payload); this module only
+// spells the consequence.
+pub fn cname_mark_transparent_newtype(td: Int) {
+    transparent_decls.insert(td, 1)
+}
+
+fn is_reserved(name: Str) -> Bool {
+    let mut i = 0
+    while i < blink_reserved.len() {
+        if blink_reserved.get(i).unwrap() == name { return true }
+        i = i + 1
+    }
+    false
+}
+
+// The module segment of a symbol, or "" for the program's own module.
+fn named_module(node: Int) -> Str {
+    let m = node_source_module(node)
+    if m == "__main__" { return "" }
+    m
+}
+
+fn bare_name(name: Str) -> Str {
+    let dot = name.index_of(".")
+    if dot < 0 { return name }
+    name.substr(dot + 1, name.len() - dot - 1)
+}
+
+fn strip_blink(c_name: Str) -> Str {
+    if c_name.starts_with("blink_") { return c_name.slice(6, c_name.len()) }
+    c_name
+}
+
+// `_` inside a segment becomes `_1` so that `_0` stays the only argument separator.
+fn mono_escape(s: Str) -> Str {
+    if s.index_of("_") < 0 { return s }
+    let mut result = ""
+    let mut i = 0
+    while i < s.len() {
+        if s.byte_at(i) == 95 {
+            result = result.concat("_1")
+        } else {
+            result = result.concat(s.substr(i, 1))
+        }
+        i = i + 1
+    }
+    result
+}
+
+// ── Functions and globals ────────────────────────────────────────────────────────
+
+// A user function in the program's own module takes `u_` so it cannot collide with a
+// runtime export; `main` is the C entry point and stays `blink_main`.
+pub fn c_fn_decl_name(fn_node: Int) -> Str {
+    let name = node_name(fn_node)
+    if get_annotation(fn_node, "ffi") != -1 { return "blink_{name}" }
+    let m = named_module(fn_node)
+    if m != "" { return "blink_{m}_{name}" }
+    if name != "main" { return "blink_u_{name}" }
+    "blink_{name}"
+}
+
+// A top-level `let` is a C global under its own name in every module.
+pub fn c_global_name(let_node: Int) -> Str {
+    node_name(let_node)
+}
+
+// A mono instance of a generic function. `args_tid` is the interned tuple of the
+// concrete type arguments; its slots are spelled at TOP position. The base carries
+// no module prefix.
+pub fn c_mono_fn_name(fn_node: Int, args_tid: Int) -> Str {
+    let tid = tc_resolve(args_tid)
+    if tid < 0 || tid >= ty_pool.len() { return ICE_SEG_TID_OUT_OF_RANGE }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TyKind.Tuple { return ICE_SEG_UNHANDLED_KIND }
+    let stem = mono_stem(node_name(fn_node), t.params_start, t.params_count)
+    if diag_is_ice_seg(stem) { return stem }
+    "blink_{stem}"
+}
+
+// ── Types ────────────────────────────────────────────────────────────────────────
+
+fn opaque_c_name(td: Int) -> Str {
+    let ann = get_annotation(td, "ffi.opaque")
+    if ann == -1 { return "" }
+    get_str_named_arg(ann, "name")
+}
+
+// An @ffi.opaque type is the foreign incomplete type itself, as a pointer.
+pub fn c_type_decl_name(td: Int) -> Str {
+    let name = node_name(td)
+    let oc = opaque_c_name(td)
+    if oc != "" { return "{oc}*" }
+    if runtime_owned_decls.contains_key(td) != 0 { return "blink_{name}" }
+    let m = named_module(td)
+    if m != "" { return "blink_{m}_{name}" }
+    "blink_{name}"
+}
+
+// The identifier-safe stem of a type: what a carrier or a mono name embeds. An opaque
+// type's C name holds `*`, so its stem is the Blink name.
+pub fn c_type_decl_tag(td: Int) -> Str {
+    if opaque_c_name(td) != "" { return node_name(td) }
+    strip_blink(c_type_decl_name(td))
+}
+
+pub fn c_derive_method_name(td: Int, method: Str) -> Str {
+    "{c_type_decl_name(td)}_{method}"
+}
+
+pub fn c_variant_tag_macro(td: Int, variant: Int) -> Str {
+    "{c_type_decl_name(td)}_{node_name(variant)}_TAG"
+}
+
+pub fn c_mono_variant_tag_macro(inst_tid: Int, variant: Int) -> Str {
+    let owner = c_mono_type_c_name(inst_tid)
+    if diag_is_ice_seg(owner) { return owner }
+    "{owner}_{node_name(variant)}_TAG"
+}
+
+// The declaration node behind a struct or enum tid; -1 for any other kind.
+pub fn c_decl_for_tid(tid: Int) -> Int {
+    tc_tid_decl_node(tid)
+}
+
+// ── Impl methods ─────────────────────────────────────────────────────────────────
+
+// From/TryFrom are one trait with many source-typed impls, so the source type, not
+// the trait, keeps their symbols apart.
+fn impl_stem(im: Int, trait_name: Str, mname: Str) -> Str {
+    let impl_type = node_name(im)
+    if trait_name == "From" || trait_name == "TryFrom" {
+        let tps = node_type_params(im)
+        if tps != -1 && sublist_length(tps) > 0 {
+            return "{impl_type}_{mname}_{node_name(sublist_get(tps, 0))}"
+        }
+    }
+    "{impl_type}_{trait_name}_{mname}"
+}
+
+// An impl method takes the module of the impl block, not of the type it extends.
+fn impl_symbol(im: Int, stem: Str) -> Str {
+    let m = named_module(im)
+    if m != "" { return "blink_{m}_{stem}" }
+    if is_reserved(stem) { return "blink_u_{stem}" }
+    "blink_{stem}"
+}
+
+pub fn c_impl_method_name(im: Int, mname: Str) -> Str {
+    impl_symbol(im, impl_stem(im, node_trait_name(im), mname))
+}
+
+// The trait-qualified form for a caller that already resolved the trait.
+pub fn c_impl_method_name_q(im: Int, trait_name: Str, mname: Str) -> Str {
+    impl_symbol(im, "{node_name(im)}_{trait_name}_{mname}")
+}
+
+// The sealed dispatcher the compiler synthesizes next to a user `Display.fmt`.
+pub fn c_display_dispatch_name(im: Int) -> Str {
+    c_impl_method_name_q(im, "Display", "display")
+}
+
+// ── Mono instances and carriers ──────────────────────────────────────────────────
+
+// THE mono-name producer: escaped base, then `_0` + escaped TOP segment per slot.
+// Both a fn instance (slots in a tuple tid) and a struct/enum instance (slots in the
+// instance tid) read their arguments from ty_param_list, so both come here.
+fn mono_stem(base: Str, args_start: Int, args_count: Int) -> Str {
+    let mut result = mono_escape(base)
+    let mut i = 0
+    while i < args_count {
+        let seg = spellable(seg_at(ty_param_list.get(args_start + i).unwrap(), TAGPOS_TOP))
+        if diag_is_ice_seg(seg) { return seg }
+        result = result.concat("_0").concat(mono_escape(seg))
+        i = i + 1
+    }
+    result
+}
+
+// The mono stem of a struct/enum INSTANCE tid, or "" for a bare (non-instance) type.
+fn struct_instance_stem(t: TypePoolEntry, tid: Int) -> Str {
+    if t.params_count == 0 { return "" }
+    let td = tc_tid_decl_node(tid)
+    if td == DECL_NODE_AMBIGUOUS { return ICE_SEG_AMBIGUOUS_DECL }
+    if td < 0 { return ICE_SEG_NO_DECL }
+    mono_stem(c_type_decl_tag(td), t.params_start, t.params_count)
+}
+
+fn struct_c_name(t: TypePoolEntry, tid: Int) -> Str {
+    let stem = struct_instance_stem(t, tid)
+    if diag_is_ice_seg(stem) { return stem }
+    if stem != "" { return "blink_{stem}" }
+    let td = tc_tid_decl_node(tid)
+    if td < 0 { return ICE_SEG_NO_DECL }
+    c_type_decl_name(td)
+}
+
+// The C name of a struct or enum instance tid (`blink_Box_0Int`).
+pub fn c_mono_type_c_name(inst_tid: Int) -> Str {
+    let tid = tc_resolve(inst_tid)
+    if tid < 0 || tid >= ty_pool.len() { return ICE_SEG_TID_OUT_OF_RANGE }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TyKind.Struct && t.kind != TyKind.Enum { return ICE_SEG_UNHANDLED_KIND }
+    struct_c_name(t, tid)
+}
+
+// The typedef name of any type that gets its own C struct: a struct or enum (bare or
+// instance), an Option or Result carrier, or a tuple.
+pub fn c_typedef_name(tid0: Int) -> Str {
+    let tid = tc_resolve(tid0)
+    if tid < 0 || tid >= ty_pool.len() { return ICE_SEG_TID_OUT_OF_RANGE }
+    let t = ty_pool.get(tid).unwrap()
+    let k = t.kind
+    if k == TyKind.Struct || k == TyKind.Enum { return struct_c_name(t, tid) }
+    if k == TyKind.Option || k == TyKind.Result || k == TyKind.Tuple {
+        let tag = spellable(seg_at(tid, TAGPOS_TOP))
+        if diag_is_ice_seg(tag) { return tag }
+        return "blink_{tag}"
+    }
+    ICE_SEG_UNHANDLED_KIND
+}
+
+// A segment may carry `<tv>` for an unsubstituted type parameter: a fine answer for a
+// diagnostic, never a C identifier. A name producer refuses it as an ICE segment
+// instead of interpolating it.
+fn spellable(seg: Str) -> Str {
+    if seg.contains("<") { return ICE_SEG_UNSOLVED_TYPEVAR }
+    seg
+}
+
+// A type spelled as a mono argument (`Int`, `Box_0Int`, `Option_int`).
+pub fn c_seg_top(tid: Int) -> Str {
+    seg_at(tid, TAGPOS_TOP)
+}
+
+// A type spelled inside a carrier (`int`, `mymod_Ngx`, `Option_int`).
+pub fn c_seg_inner(tid: Int) -> Str {
+    seg_at(tid, TAGPOS_INNER)
+}
+
+fn seg_at(tid0: Int, tagpos: Int) -> Str {
+    let tid = tc_resolve(tid0)
+    if tid < 0 || tid >= ty_pool.len() { return ICE_SEG_TID_OUT_OF_RANGE }
+    let t = ty_pool.get(tid).unwrap()
+    let k = t.kind
+    if k == TyKind.Struct || k == TyKind.Enum { return struct_seg(t, tid, tagpos) }
+    if k == TyKind.Option {
+        let inner = seg_at(t.inner1, TAGPOS_INNER)
+        if diag_is_ice_seg(inner) { return inner }
+        return "Option_{inner}"
+    }
+    if k == TyKind.Result {
+        let ok = seg_at(t.inner1, TAGPOS_INNER)
+        if diag_is_ice_seg(ok) { return ok }
+        let err = seg_at(t.inner2, TAGPOS_INNER)
+        if diag_is_ice_seg(err) { return err }
+        return "Result_{ok}_{err}"
+    }
+    if k == TyKind.Tuple { return tuple_tag(t) }
+    if k == TyKind.Typevar { return "<tv>" }
+    // One blink_map* serves every key/value pair, so K and V do not ride the name. They
+    // are still walked so an unsolved slot fails closed instead of spelling "map".
+    if k == TyKind.Map {
+        if tagpos == TAGPOS_TOP { return "Map" }
+        let key = seg_at(t.inner1, TAGPOS_INNER)
+        if diag_is_ice_seg(key) { return key }
+        let val = seg_at(t.inner2, TAGPOS_INNER)
+        if diag_is_ice_seg(val) { return val }
+        return "map"
+    }
+    if tagpos == TAGPOS_TOP { return scalar_top(k) }
+    scalar_inner(k)
+}
+
+// A bare struct at TOP spells its bare name; inside a carrier it spells its full tag.
+// An instance spells its mono stem at both positions.
+fn struct_seg(t: TypePoolEntry, tid: Int, tagpos: Int) -> Str {
+    let stem = struct_instance_stem(t, tid)
+    if stem != "" { return stem }
+    let underlying = tc_resolve_transparent_alias_name(t.name)
+    if underlying != -1 { return seg_at(underlying, tagpos) }
+    if tagpos == TAGPOS_TOP { return bare_name(t.name) }
+    let td = tc_tid_decl_node(tid)
+    if td == DECL_NODE_AMBIGUOUS { return ICE_SEG_AMBIGUOUS_DECL }
+    if td < 0 { return ICE_SEG_NO_DECL }
+    c_type_decl_tag(td)
+}
+
+// A transparent newtype element lowers to a bare int64_t, so the tuple names it
+// `int`. Result and Option keep its nominal tag, so this stays tuple-only.
+fn tuple_tag(t: TypePoolEntry) -> Str {
+    let mut tag = "Tuple{t.params_count}"
+    let mut i = 0
+    while i < t.params_count {
+        let elem_tid = ty_param_list.get(t.params_start + i).unwrap()
+        let raw = seg_at(elem_tid, TAGPOS_INNER)
+        if diag_is_ice_seg(raw) { return raw }
+        let elem = if elem_is_transparent(elem_tid) { "int" } else { raw }
+        tag = tag.concat("_").concat(elem)
+        i = i + 1
+    }
+    tag
+}
+
+fn elem_is_transparent(tid: Int) -> Bool {
+    let td = tc_tid_decl_node(tid)
+    if td < 0 { return false }
+    transparent_decls.contains_key(td) != 0
+}
+
+// Exhaustive matches: a TyKind added without a spelling fails to compile here
+// instead of falling through to a sentinel at run time. The structural kinds
+// (Struct, Enum, Option, Result, Tuple, Map, Typevar) never reach these two
+// functions because seg_at answers them first.
+fn scalar_top(k: TyKind) -> Str {
+    match k {
+        TyKind.Int => "Int"
+        TyKind.Float => "Float"
+        TyKind.Bool => "Bool"
+        TyKind.Str => "Str"
+        TyKind.List => "List"
+        TyKind.Iterator => "Iterator"
+        TyKind.Handle => "Handle"
+        TyKind.Channel => "Channel"
+        TyKind.Ptr => "Ptr"
+        TyKind.Handler => "Handler"
+        TyKind.Set => "Set"
+        TyKind.Bytes => "Bytes"
+        TyKind.StringBuilder => "StringBuilder"
+        TyKind.I8 => "I8"
+        TyKind.I16 => "I16"
+        TyKind.I32 => "I32"
+        TyKind.U8 => "U8"
+        TyKind.U16 => "U16"
+        TyKind.U32 => "U32"
+        TyKind.U64 => "U64"
+        TyKind.Char => "Char"
+        TyKind.Void => "Void"
+        TyKind.Unknown => ICE_SEG_UNSOLVED_TYPEVAR
+        // A fn type at TOP would drop its signature and merge two instances into
+        // one symbol, so it is refused here and accepted only inside a carrier.
+        TyKind.Fn => ICE_SEG_UNHANDLED_KIND
+        TyKind.Never => ICE_SEG_UNHANDLED_KIND
+        TyKind.Template => ICE_SEG_UNHANDLED_KIND
+        TyKind.FfiScope => ICE_SEG_UNHANDLED_KIND
+        TyKind.Struct => ICE_SEG_UNHANDLED_KIND
+        TyKind.Enum => ICE_SEG_UNHANDLED_KIND
+        TyKind.Option => ICE_SEG_UNHANDLED_KIND
+        TyKind.Result => ICE_SEG_UNHANDLED_KIND
+        TyKind.Tuple => ICE_SEG_UNHANDLED_KIND
+        TyKind.Map => ICE_SEG_UNHANDLED_KIND
+        TyKind.Typevar => ICE_SEG_UNHANDLED_KIND
+    }
+}
+
+fn scalar_inner(k: TyKind) -> Str {
+    match k {
+        TyKind.Int => "int"
+        TyKind.Float => "double"
+        TyKind.Bool => "bool"
+        TyKind.Str => "str"
+        TyKind.List => "list"
+        TyKind.Iterator => "iter"
+        TyKind.Handle => "handle"
+        TyKind.Channel => "channel"
+        TyKind.Ptr => "ptr"
+        TyKind.Handler => "handler"
+        // Every closure is one blink_closure* member, so the signature does not
+        // ride the name.
+        TyKind.Fn => "closure"
+        TyKind.Set => "set"
+        TyKind.Bytes => "bytes"
+        TyKind.StringBuilder => "stringbuilder"
+        TyKind.I8 => "i8"
+        TyKind.I16 => "i16"
+        TyKind.I32 => "i32"
+        TyKind.U8 => "u8"
+        TyKind.U16 => "u16"
+        TyKind.U32 => "u32"
+        TyKind.U64 => "u64"
+        TyKind.Char => "char"
+        TyKind.Void => "void"
+        TyKind.Unknown => ICE_SEG_UNSOLVED_TYPEVAR
+        TyKind.Never => ICE_SEG_UNHANDLED_KIND
+        TyKind.Template => ICE_SEG_UNHANDLED_KIND
+        TyKind.FfiScope => ICE_SEG_UNHANDLED_KIND
+        TyKind.Struct => ICE_SEG_UNHANDLED_KIND
+        TyKind.Enum => ICE_SEG_UNHANDLED_KIND
+        TyKind.Option => ICE_SEG_UNHANDLED_KIND
+        TyKind.Result => ICE_SEG_UNHANDLED_KIND
+        TyKind.Tuple => ICE_SEG_UNHANDLED_KIND
+        TyKind.Map => ICE_SEG_UNHANDLED_KIND
+        TyKind.Typevar => ICE_SEG_UNHANDLED_KIND
+    }
+}
+
+// ── Typedef guards ───────────────────────────────────────────────────────────────
+
+pub fn td_guard_name(c_name: Str) -> Str {
+    "BLINK_TD_{c_name}"
+}
+
+pub fn td_guard_open_lines(c_name: Str) -> List[Str] {
+    let guard = td_guard_name(c_name)
+    ["#ifndef {guard}", "#define {guard}"]
+}
+
+pub fn td_guard_close_line() -> Str {
+    "#endif"
+}

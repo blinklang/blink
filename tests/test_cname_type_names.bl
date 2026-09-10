@@ -1,0 +1,131 @@
+// Golden names for the type-owned forms cname.bl produces: the struct/enum C
+// name, its carrier tag, the derive method symbol, the variant tag macro and
+// the typedef guard lines. Expected bytes come from the pinned compiler's C.
+
+import typecheck.{tc_type_decl_nodes}
+import parser.{node_fields, sublist_get}
+import compiler.{compile_to_program}
+import ast.{NodeKind}
+import cname.{c_type_decl_name, c_type_decl_tag, c_derive_method_name, c_variant_tag_macro, c_mono_variant_tag_macro, td_guard_name, td_guard_open_lines, td_guard_close_line, cname_mark_runtime_owned}
+import cname_test_helpers.{assert_eq_str, find_decl, tid_of, compile_probe, compile_pkg_probe}
+import std.io
+// Pulls the lowering layer into the program; compile_to_program needs it linked.
+import codegen_expr
+
+fn single_probe_src() -> Str {
+    #"@derive(Eq)
+type Point { x: Int, y: Int }
+type Shape {
+    Circle(r: Int)
+    Rect(w: Int, h: Int)
+}
+type Tree[T] {
+    Leaf
+    Node(v: T)
+}
+fn tree_len(t: Tree[Int]) -> Int { 0 }
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn main() {
+    let t: Tree[Int] = Tree.Node(1)
+    let _tl = tree_len(t)
+    let oc: Option[CFile] = None
+    let r: Result[I8, ConversionError] = Ok(1)
+    let p = Point { x: 1, y: 2 }
+    io.println("{p == p}")
+}
+"#
+}
+
+fn mymod_src() -> Str {
+    #"pub type Ngx { n: Int }
+pub type Kind {
+    Aa
+    Bb(v: Int)
+}
+"#
+}
+
+fn pkg_main_src() -> Str {
+    #"import mymod.{Ngx, Kind}
+type Ngx2 { n: Int }
+fn main() {
+    let n = Ngx { n: 1 }
+    let k = Kind.Bb(1)
+    let n2 = Ngx2 { n: 2 }
+    io.println("{n.n} {n2.n}")
+}
+"#
+}
+
+test "main-module struct and enum are blink_<name>; tag is the bare name" {
+    let _m = compile_probe("cname_type_names", single_probe_src())
+    let point = find_decl(NodeKind.TypeDef, "Point", "")
+    let shape = find_decl(NodeKind.TypeDef, "Shape", "")
+    assert_eq_str("Point", c_type_decl_name(point), "blink_Point")
+    assert_eq_str("Shape", c_type_decl_name(shape), "blink_Shape")
+    assert_eq_str("Point tag", c_type_decl_tag(point), "Point")
+}
+
+test "module type is blink_<module>_<name>; tag keeps the module" {
+    let _m = compile_pkg_probe("cname_type_names", "cnametype", mymod_src(), pkg_main_src())
+    let ngx = find_decl(NodeKind.TypeDef, "Ngx", "mymod")
+    let kind = find_decl(NodeKind.TypeDef, "Kind", "mymod")
+    let ngx2 = find_decl(NodeKind.TypeDef, "Ngx2", "")
+    assert_eq_str("Ngx", c_type_decl_name(ngx), "blink_mymod_Ngx")
+    assert_eq_str("Kind", c_type_decl_name(kind), "blink_mymod_Kind")
+    assert_eq_str("Ngx2", c_type_decl_name(ngx2), "blink_Ngx2")
+    assert_eq_str("Ngx tag", c_type_decl_tag(ngx), "mymod_Ngx")
+}
+
+test "@ffi.opaque type is the bare C pointer; its tag is the Blink name" {
+    let _m = compile_probe("cname_type_names", single_probe_src())
+    let cfile = find_decl(NodeKind.TypeDef, "CFile", "")
+    assert_eq_str("CFile", c_type_decl_name(cfile), "FILE*")
+    assert_eq_str("CFile tag", c_type_decl_tag(cfile), "CFile")
+}
+
+test "a runtime-owned stdlib type drops its module prefix once marked" {
+    let _m = compile_probe("cname_type_names", single_probe_src())
+    let ce = tc_type_decl_nodes.get("ConversionError") ?? -1
+    assert(ce >= 0)
+    // Not a golden byte: the pinned compiler never emits the unmarked spelling.
+    assert_eq_str("unmarked", c_type_decl_name(ce), "blink_std_traits_ConversionError")
+    cname_mark_runtime_owned(ce)
+    assert_eq_str("marked", c_type_decl_name(ce), "blink_ConversionError")
+    assert_eq_str("marked tag", c_type_decl_tag(ce), "ConversionError")
+}
+
+test "derived method symbol hangs off the type C name" {
+    let _m = compile_probe("cname_type_names", single_probe_src())
+    let point = find_decl(NodeKind.TypeDef, "Point", "")
+    assert_eq_str("Point eq", c_derive_method_name(point, "eq"), "blink_Point_eq")
+    let _p = compile_pkg_probe("cname_type_names", "cnametype", mymod_src(), pkg_main_src())
+    let ngx = find_decl(NodeKind.TypeDef, "Ngx", "mymod")
+    assert_eq_str("Ngx eq", c_derive_method_name(ngx, "eq"), "blink_mymod_Ngx_eq")
+}
+
+test "variant tag macro: <type C name>_<Variant>_TAG, for bare and mono enums" {
+    let m = compile_probe("cname_type_names", single_probe_src())
+    let shape = find_decl(NodeKind.TypeDef, "Shape", "")
+    let circle = sublist_get(node_fields(shape), 0)
+    let rect = sublist_get(node_fields(shape), 1)
+    assert_eq_str("Circle", c_variant_tag_macro(shape, circle), "blink_Shape_Circle_TAG")
+    assert_eq_str("Rect", c_variant_tag_macro(shape, rect), "blink_Shape_Rect_TAG")
+    let tree = find_decl(NodeKind.TypeDef, "Tree", "")
+    let leaf = sublist_get(node_fields(tree), 0)
+    assert_eq_str("Tree[Int].Leaf", c_mono_variant_tag_macro(tid_of(m, "Tree[Int]"), leaf), "blink_Tree_0Int_Leaf_TAG")
+    let _p = compile_pkg_probe("cname_type_names", "cnametype", mymod_src(), pkg_main_src())
+    let kind = find_decl(NodeKind.TypeDef, "Kind", "mymod")
+    let bb = sublist_get(node_fields(kind), 1)
+    assert_eq_str("Kind.Bb", c_variant_tag_macro(kind, bb), "blink_mymod_Kind_Bb_TAG")
+}
+
+test "typedef guard lines" {
+    assert_eq_str("guard", td_guard_name("blink_Point"), "BLINK_TD_blink_Point")
+    let open = td_guard_open_lines("blink_Point")
+    assert_eq(open.len(), 2)
+    assert_eq_str("ifndef", open.get(0).unwrap(), "#ifndef BLINK_TD_blink_Point")
+    assert_eq_str("define", open.get(1).unwrap(), "#define BLINK_TD_blink_Point")
+    assert_eq_str("endif", td_guard_close_line(), "#endif")
+}

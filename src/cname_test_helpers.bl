@@ -1,0 +1,129 @@
+// Shared harness for tests/test_cname_*.bl: compile a probe source in-process,
+// then look up declaration nodes and type ids by their source spelling.
+
+import typecheck.{TyKind, check_types, tc_lookup_node_tid, tc_resolve, tc_type_str, ty_param_list, ty_pool}
+import parser.{node_kind, node_name, node_source_module, node_trait_name, nodes}
+import compiler.{compile_to_program}
+import ast.{NodeKind, nk_of}
+import cname.{cname_reset}
+import std.io
+
+// A single-file build tags main-module nodes "" and a package build tags them
+// "__main__"; both mean the program's own module.
+pub fn module_matches(have: Str, want: Str) -> Bool {
+    if want == "" { return have == "" || have == "__main__" }
+    have == want
+}
+
+pub fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.println("FAIL: {label}: got '{got}' want '{want}'")
+    }
+    assert_eq(got, want)
+}
+
+pub fn find_decl(kind: NodeKind, name: Str, module: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == kind && node_name(i) == name && module_matches(node_source_module(i), module) {
+            return i
+        }
+        i = i + 1
+    }
+    io.println("FAIL: no decl '{name}' in module '{module}'")
+    -1
+}
+
+pub fn find_impl(type_name: Str, trait_name: Str, module: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.ImplBlock && node_name(i) == type_name && node_trait_name(i) == trait_name && module_matches(node_source_module(i), module) {
+            return i
+        }
+        i = i + 1
+    }
+    io.println("FAIL: no impl {trait_name} for '{type_name}' in module '{module}'")
+    -1
+}
+
+// tc_type_str prints a generic-enum instance bare (`Tree`) at any depth, so this
+// spells carriers and tuples itself and only leaves leaves to tc_type_str.
+pub fn type_key(tid: Int) -> Str {
+    let r = tc_resolve(tid)
+    let t = ty_pool.get(r).unwrap()
+    if t.kind == TyKind.Option { return "Option[{type_key(t.inner1)}]" }
+    if t.kind == TyKind.Result { return "Result[{type_key(t.inner1)}, {type_key(t.inner2)}]" }
+    if t.kind == TyKind.Tuple { return "(".concat(type_key_args(t.params_start, t.params_count)).concat(")") }
+    if t.kind != TyKind.Enum || t.params_count == 0 { return tc_type_str(r) }
+    "{tc_type_str(r)}[{type_key_args(t.params_start, t.params_count)}]"
+}
+
+fn type_key_args(start: Int, count: Int) -> Str {
+    let mut out = ""
+    let mut i = 0
+    while i < count {
+        if i > 0 { out = out.concat(", ") }
+        out = out.concat(type_key(ty_param_list.get(start + i).unwrap()))
+        i = i + 1
+    }
+    out
+}
+
+// Every typed node's tid, keyed by its source spelling; the last node wins.
+pub fn harvest_tids() -> Map[Str, Int] {
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    while idx < nodes.len() {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 {
+            m.insert(type_key(tid), tid)
+        }
+        idx = idx + 1
+    }
+    m
+}
+
+pub fn tid_of(m: Map[Str, Int], key: Str) -> Int {
+    let t = m.get(key) ?? -1
+    if t < 0 {
+        io.println("FAIL: probe has no type '{key}'; known: {m.keys().join(", ")}")
+    }
+    assert(t >= 0)
+    t
+}
+
+// The test binary has no lib/std beside it, so std imports inside a probe
+// resolve through BLINK_ROOT.
+fn point_blink_root_at_cwd() {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+}
+
+fn check_and_harvest(program: Int) -> Map[Str, Int] ! Diag.Report, TypeCheck {
+    check_types(program)
+    cname_reset()
+    harvest_tids()
+}
+
+// Compile one main-module source written to build/<stem>_probe.bl.
+pub fn compile_probe(stem: Str, src: Str) -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    point_blink_root_at_cwd()
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    let _rm = process_run("rm", ["-f", path])
+    check_and_harvest(program)
+}
+
+// Compile a two-file package under build/<stem>_pkg: src/mymod.bl plus a main.
+pub fn compile_pkg_probe(stem: Str, pkg_name: Str, mymod_src: Str, main_src: Str) -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    point_blink_root_at_cwd()
+    let root = "build/{stem}_pkg"
+    let _mk = process_run("mkdir", ["-p", "{root}/src"])
+    write_file("{root}/blink.toml", "[package]\nname = \"{pkg_name}\"\nversion = \"0.1.0\"\n")
+    write_file("{root}/src/mymod.bl", mymod_src)
+    let path = "{root}/src/probe.bl"
+    write_file(path, main_src)
+    let program = compile_to_program(path, 1)
+    let _rm = process_run("rm", ["-rf", root])
+    check_and_harvest(program)
+}

@@ -1,0 +1,165 @@
+// Golden names for the Option/Result/Tuple carrier typedefs and the segment
+// spellers behind them. A segment at TOP position (a mono argument) spells
+// Pascal case; at INNER position (inside a carrier) it spells the lowercase C
+// tag. Expected bytes come from the pinned compiler's C, except the rows labelled
+// "unmarked": those pin cname's default before the owner sets a mark, a state the
+// pinned compiler never emits because it decides by type name.
+
+import typecheck.{tc_type_decl_nodes, make_fn_type}
+
+import compiler.{compile_to_program}
+import ast.{NodeKind}
+import diagnostics.{diag_is_ice_seg}
+import cname.{c_typedef_name, c_seg_top, c_seg_inner, cname_mark_runtime_owned, cname_mark_transparent_newtype}
+import cname_test_helpers.{assert_eq_str, find_decl, tid_of, compile_probe, compile_pkg_probe}
+import std.io
+// Pulls the lowering layer into the program; compile_to_program needs it linked.
+import codegen_expr
+
+fn single_probe_src() -> Str {
+    #"import std.traits.{ConversionError}
+type Point { x: Int, y: Int }
+type Box[T] { v: T }
+type Shape {
+    Circle(r: Int)
+    Rect(w: Int, h: Int)
+}
+type Tree[T] {
+    Leaf
+    Node(v: T)
+}
+fn tree_len(t: Tree[Int]) -> Int { 0 }
+fn map_len(mp: Map[Str, Int]) -> Int { 0 }
+type Errno {
+    Errno(code: Int)
+}
+type Pid {
+    Pid(v: Int)
+}
+fn main() {
+    let b: Box[Int] = Box { v: 1 }
+    let t: Tree[Int] = Tree.Node(1)
+    let _tl = tree_len(t)
+    let o: Option[Int] = Some(1)
+    let os: Option[Str] = Some("s")
+    let oc: Option[Char] = Some('a')
+    let r: Result[Int, Str] = Ok(1)
+    let rv: Result[Void, Str] = Ok(())
+    let rc: Result[I8, ConversionError] = Ok(1)
+    let op: Option[Point] = Some(Point { x: 1, y: 2 })
+    let oo: Option[Option[Int]] = Some(Some(1))
+    let ob: Option[Box[Int]] = Some(b)
+    let ol: Option[List[Int]] = Some([1])
+    let om: Option[Map[Str, Int]] = None
+    let _ml = map_len(Map())
+    let ot: Option[Tree[Int]] = Some(t)
+    let rs: Result[Shape, Point] = Ok(Shape.Circle(1))
+    let tu: (Int, Str) = (1, "a")
+    let tu2: (Point, Bool, Float) = (Point { x: 1, y: 2 }, true, 1.0)
+    let tu3: ((Int, Int), Char) = ((1, 2), 'a')
+    let tuo: (Option[Int], Result[Int, Str]) = (Some(1), Ok(1))
+    let te: (Errno, Int) = (Errno.Errno(1), 2)
+    let tpid: (Pid, Int) = (Pid.Pid(1), 2)
+    let oe: Option[Errno] = Some(Errno.Errno(1))
+    let re: Result[Int, Errno] = Err(Errno.Errno(1))
+    io.println("{tu.0} {te.1} {tpid.1}")
+}
+"#
+}
+
+fn mymod_src() -> Str {
+    #"pub type Ngx { n: Int }
+pub type Box2[T] { v: T }
+pub type Kind {
+    Aa
+    Bb(v: Int)
+}
+"#
+}
+
+fn pkg_main_src() -> Str {
+    #"import mymod.{Ngx, Box2, Kind}
+fn main() {
+    let n = Ngx { n: 1 }
+    let b: Box2[Int] = Box2 { v: 1 }
+    let on: Option[Ngx] = Some(n)
+    let ok: Option[Kind] = Some(Kind.Bb(1))
+    let ob: Option[Box2[Int]] = Some(b)
+    let rn: Result[Ngx, Str] = Ok(n)
+    let tn: (Ngx, Int) = (n, 1)
+    io.println("{tn.1}")
+}
+"#
+}
+
+test "Option carrier over scalars, containers and structs" {
+    let m = compile_probe("cname_carrier_tags", single_probe_src())
+    assert_eq_str("Option[Int]", c_typedef_name(tid_of(m, "Option[Int]")), "blink_Option_int")
+    assert_eq_str("Option[Str]", c_typedef_name(tid_of(m, "Option[Str]")), "blink_Option_str")
+    assert_eq_str("Option[Char]", c_typedef_name(tid_of(m, "Option[Char]")), "blink_Option_char")
+    assert_eq_str("Option[List[Int]]", c_typedef_name(tid_of(m, "Option[List[Int]]")), "blink_Option_list")
+    assert_eq_str("Option[Map[Str, Int]]", c_typedef_name(tid_of(m, "Option[Map[Str, Int]]")), "blink_Option_map")
+    assert_eq_str("Option[Point]", c_typedef_name(tid_of(m, "Option[Point]")), "blink_Option_Point")
+    assert_eq_str("Option[Option[Int]]", c_typedef_name(tid_of(m, "Option[Option[Int]]")), "blink_Option_Option_int")
+    assert_eq_str("Option[Box[Int]]", c_typedef_name(tid_of(m, "Option[Box[Int]]")), "blink_Option_Box_0Int")
+    assert_eq_str("Option[Tree[Int]]", c_typedef_name(tid_of(m, "Option[Tree[Int]]")), "blink_Option_Tree_0Int")
+}
+
+test "Result carrier: Result_<ok>_<err>, Void spells void" {
+    let m = compile_probe("cname_carrier_tags", single_probe_src())
+    assert_eq_str("Result[Int, Str]", c_typedef_name(tid_of(m, "Result[Int, Str]")), "blink_Result_int_str")
+    assert_eq_str("Result[Void, Str]", c_typedef_name(tid_of(m, "Result[Void, Str]")), "blink_Result_void_str")
+    assert_eq_str("Result[Shape, Point]", c_typedef_name(tid_of(m, "Result[Shape, Point]")), "blink_Result_Shape_Point")
+    let ce = tc_type_decl_nodes.get("ConversionError") ?? -1
+    cname_mark_runtime_owned(ce)
+    assert_eq_str("Result[I8, ConversionError]", c_typedef_name(tid_of(m, "Result[I8, ConversionError]")), "blink_Result_i8_ConversionError")
+}
+
+test "tuple carrier: Tuple<n>_<inner tags>" {
+    let m = compile_probe("cname_carrier_tags", single_probe_src())
+    assert_eq_str("(Int, Str)", c_typedef_name(tid_of(m, "(Int, Str)")), "blink_Tuple2_int_str")
+    assert_eq_str("(Point, Bool, Float)", c_typedef_name(tid_of(m, "(Point, Bool, Float)")), "blink_Tuple3_Point_bool_double")
+    assert_eq_str("((Int, Int), Char)", c_typedef_name(tid_of(m, "((Int, Int), Char)")), "blink_Tuple2_Tuple2_int_int_char")
+    assert_eq_str("(Option[Int], Result[Int, Str])", c_typedef_name(tid_of(m, "(Option[Int], Result[Int, Str])")), "blink_Tuple2_Option_int_Result_int_str")
+}
+
+test "a marked transparent newtype spells int inside a tuple only" {
+    let m = compile_probe("cname_carrier_tags", single_probe_src())
+    assert_eq_str("(Pid, Int) unmarked", c_typedef_name(tid_of(m, "(Pid, Int)")), "blink_Tuple2_Pid_int")
+    assert_eq_str("(Errno, Int) unmarked", c_typedef_name(tid_of(m, "(Errno, Int)")), "blink_Tuple2_Errno_int")
+    cname_mark_transparent_newtype(find_decl(NodeKind.TypeDef, "Errno", ""))
+    assert_eq_str("(Errno, Int) marked", c_typedef_name(tid_of(m, "(Errno, Int)")), "blink_Tuple2_int_int")
+    assert_eq_str("Option[Errno]", c_typedef_name(tid_of(m, "Option[Errno]")), "blink_Option_Errno")
+    assert_eq_str("Result[Int, Errno]", c_typedef_name(tid_of(m, "Result[Int, Errno]")), "blink_Result_int_Errno")
+}
+
+test "module structs keep their module inside a carrier" {
+    let m = compile_pkg_probe("cname_carrier_tags", "cnamecarrier", mymod_src(), pkg_main_src())
+    assert_eq_str("Option[Ngx]", c_typedef_name(tid_of(m, "Option[Ngx]")), "blink_Option_mymod_Ngx")
+    assert_eq_str("Option[Kind]", c_typedef_name(tid_of(m, "Option[Kind]")), "blink_Option_mymod_Kind")
+    assert_eq_str("Option[Box2[Int]]", c_typedef_name(tid_of(m, "Option[Box2[Int]]")), "blink_Option_mymod_1Box2_0Int")
+    assert_eq_str("Result[Ngx, Str]", c_typedef_name(tid_of(m, "Result[Ngx, Str]")), "blink_Result_mymod_Ngx_str")
+    assert_eq_str("(Ngx, Int)", c_typedef_name(tid_of(m, "(Ngx, Int)")), "blink_Tuple2_mymod_Ngx_int")
+    assert_eq_str("bare Ngx", c_typedef_name(tid_of(m, "Ngx")), "blink_mymod_Ngx")
+}
+
+test "segment position: TOP is Pascal, INNER is the lowercase C tag" {
+    let m = compile_probe("cname_carrier_tags", single_probe_src())
+    assert_eq_str("Int top", c_seg_top(tid_of(m, "Int")), "Int")
+    assert_eq_str("Int inner", c_seg_inner(tid_of(m, "Int")), "int")
+    assert_eq_str("Float inner", c_seg_inner(tid_of(m, "Float")), "double")
+    assert_eq_str("Str inner", c_seg_inner(tid_of(m, "Str")), "str")
+    assert_eq_str("Map top", c_seg_top(tid_of(m, "Map[Str, Int]")), "Map")
+    assert_eq_str("Map inner", c_seg_inner(tid_of(m, "Map[Str, Int]")), "map")
+    assert_eq_str("Option top", c_seg_top(tid_of(m, "Option[Int]")), "Option_int")
+    assert_eq_str("Option inner", c_seg_inner(tid_of(m, "Option[Int]")), "Option_int")
+    assert_eq_str("Point top", c_seg_top(tid_of(m, "Point")), "Point")
+    assert_eq_str("Box[Int] top", c_seg_top(tid_of(m, "Box[Int]")), "Box_0Int")
+}
+
+test "a fn type is a closure inside a carrier and refused as a mono argument" {
+    let m = compile_probe("cname_carrier_tags", single_probe_src())
+    let f = make_fn_type(tid_of(m, "Int"), [tid_of(m, "Int")])
+    assert_eq_str("fn inner", c_seg_inner(f), "closure")
+    assert(diag_is_ice_seg(c_seg_top(f)))
+}

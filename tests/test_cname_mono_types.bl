@@ -1,0 +1,135 @@
+// Golden names for monomorphized struct and enum instances. The instance's
+// type id is the sole input: the base declaration comes from the tid and the
+// arguments from its slots. Expected bytes come from the pinned compiler's C.
+
+import compiler.{compile_to_program}
+import ast.{NodeKind}
+import typecheck.{make_struct_instance_type, make_option_type}
+import diagnostics.{diag_is_ice_seg}
+import cname.{c_mono_type_c_name, c_decl_for_tid, c_typedef_name}
+import cname_test_helpers.{assert_eq_str, find_decl, tid_of, compile_probe, compile_pkg_probe}
+import std.io
+// Pulls the lowering layer into the program; compile_to_program needs it linked.
+import codegen_expr
+
+fn single_probe_src() -> Str {
+    #"type Point { x: Int, y: Int }
+type Box[T] { v: T }
+type My_Box[T] { v: T }
+type Tree[T] {
+    Leaf
+    Node(v: T)
+}
+fn tree_len(t: Tree[Int]) -> Int { 0 }
+type Errno {
+    Errno(code: Int)
+}
+type Wrap[T] { v: T }
+fn ident[T](x: T) -> T { x }
+fn main() {
+    let b: Box[Int] = Box { v: 1 }
+    let bs: Box[Str] = Box { v: "s" }
+    let mb: My_Box[Int] = My_Box { v: 1 }
+    let bb: Box[Box[Int]] = Box { v: b }
+    let bo: Box[Option[Int]] = Box { v: Some(1) }
+    let bt: Box[(Int, Str)] = Box { v: (1, "a") }
+    let t: Tree[Int] = Tree.Node(1)
+    let _tl = tree_len(t)
+    let tp: Tree[Point] = Tree.Node(Point { x: 1, y: 2 })
+    let we: Wrap[Errno] = Wrap { v: Errno.Errno(1) }
+    io.println("{b.v} {bs.v} {mb.v}")
+}
+"#
+}
+
+// Both modules declare a generic `Box`; an instance tid carries only the bare
+// base name, so nothing in it says which declaration it came from.
+fn twin_mymod_src() -> Str {
+    #"pub type Box[T] { v: T }
+pub fn mk(x: Int) -> Box[Int] { Box { v: x } }
+"#
+}
+
+fn twin_main_src() -> Str {
+    #"import mymod.{mk}
+type Box[T] { v: T }
+fn main() {
+    let b: Box[Str] = Box { v: "s" }
+    let _a = mk(1)
+    io.println("{b.v}")
+}
+"#
+}
+
+fn mymod_src() -> Str {
+    #"pub type Ngx { n: Int }
+pub type Box2[T] { v: T }
+pub type My_Box2[T] { v: T }
+"#
+}
+
+fn pkg_main_src() -> Str {
+    #"import mymod.{Ngx, Box2, My_Box2}
+fn main() {
+    let n = Ngx { n: 1 }
+    let b: Box2[Int] = Box2 { v: 1 }
+    let mb: My_Box2[Str] = My_Box2 { v: "s" }
+    let bn: Box2[Ngx] = Box2 { v: n }
+    io.println("{b.v} {mb.v}")
+}
+"#
+}
+
+test "struct instance: blink_<escaped base>_0<escaped TOP arg> per slot" {
+    let m = compile_probe("cname_mono_types", single_probe_src())
+    assert_eq_str("Box[Int]", c_mono_type_c_name(tid_of(m, "Box[Int]")), "blink_Box_0Int")
+    assert_eq_str("Box[Str]", c_mono_type_c_name(tid_of(m, "Box[Str]")), "blink_Box_0Str")
+    assert_eq_str("My_Box[Int]", c_mono_type_c_name(tid_of(m, "My_Box[Int]")), "blink_My_1Box_0Int")
+    assert_eq_str("Box[Box[Int]]", c_mono_type_c_name(tid_of(m, "Box[Box[Int]]")), "blink_Box_0Box_10Int")
+    assert_eq_str("Box[Option[Int]]", c_mono_type_c_name(tid_of(m, "Box[Option[Int]]")), "blink_Box_0Option_1int")
+    assert_eq_str("Box[(Int, Str)]", c_mono_type_c_name(tid_of(m, "Box[(Int, Str)]")), "blink_Box_0Tuple2_1int_1str")
+    assert_eq_str("Wrap[Errno]", c_mono_type_c_name(tid_of(m, "Wrap[Errno]")), "blink_Wrap_0Errno")
+}
+
+test "enum instance spells like a struct instance" {
+    let m = compile_probe("cname_mono_types", single_probe_src())
+    assert_eq_str("Tree[Int]", c_mono_type_c_name(tid_of(m, "Tree[Int]")), "blink_Tree_0Int")
+    assert_eq_str("Tree[Point]", c_mono_type_c_name(tid_of(m, "Tree[Point]")), "blink_Tree_0Point")
+}
+
+test "module instance: the base carries the module, a bare struct arg does not" {
+    let m = compile_pkg_probe("cname_mono_types", "cnamemono", mymod_src(), pkg_main_src())
+    assert_eq_str("Box2[Int]", c_mono_type_c_name(tid_of(m, "Box2[Int]")), "blink_mymod_1Box2_0Int")
+    assert_eq_str("My_Box2[Str]", c_mono_type_c_name(tid_of(m, "My_Box2[Str]")), "blink_mymod_1My_1Box2_0Str")
+    assert_eq_str("Box2[Ngx]", c_mono_type_c_name(tid_of(m, "Box2[Ngx]")), "blink_mymod_1Box2_0Ngx")
+}
+
+test "the declaration behind a struct tid, bare or instance" {
+    let m = compile_probe("cname_mono_types", single_probe_src())
+    let box_decl = find_decl(NodeKind.TypeDef, "Box", "")
+    let point_decl = find_decl(NodeKind.TypeDef, "Point", "")
+    assert_eq(c_decl_for_tid(tid_of(m, "Box[Int]")), box_decl)
+    assert_eq(c_decl_for_tid(tid_of(m, "Point")), point_decl)
+    assert_eq(c_decl_for_tid(tid_of(m, "Int")), -1)
+}
+
+test "an unsolved type parameter never rides a mono or carrier name" {
+    let m = compile_probe("cname_mono_types", single_probe_src())
+    let tv = tid_of(m, "T")
+    let boxed_tv = make_struct_instance_type("Box", [tv])
+    let name = c_mono_type_c_name(boxed_tv)
+    if !diag_is_ice_seg(name) { io.println("FAIL: Box[T] spelled '{name}'") }
+    assert(diag_is_ice_seg(name))
+    let opt = c_typedef_name(make_option_type(tv))
+    if !diag_is_ice_seg(opt) { io.println("FAIL: Option[T] spelled '{opt}'") }
+    assert(diag_is_ice_seg(opt))
+}
+
+test "an instance of a bare name two modules declare fails closed" {
+    let m = compile_pkg_probe("cname_mono_types", "cnametwin", twin_mymod_src(), twin_main_src())
+    let tid = tid_of(m, "Box[Str]")
+    assert(c_decl_for_tid(tid) < 0)
+    let name = c_mono_type_c_name(tid)
+    if !diag_is_ice_seg(name) { io.println("FAIL: ambiguous Box[Str] spelled '{name}'") }
+    assert(diag_is_ice_seg(name))
+}
