@@ -1,0 +1,61 @@
+// Two modules that each declare a struct with the same BARE name (both named
+// `Ngx`, with different fields) collapse to a single entry in the typecheck
+// named-type map, which is keyed by bare name only. A cross-module call
+// returning one module's struct then declares its result var using the OTHER
+// module's C struct type, producing invalid/wrong-member-access C.
+//
+// This needs three real source files (two struct-declaring modules plus an
+// entry that imports both) to reproduce the cross-module bare-name collision,
+// so it stages its own package under .tmp/ rather than using compile_test_helpers'
+// single-helper xmod functions (which only stage one helper module).
+
+fn blink_bin() -> Str {
+    let root = env.var("BLINK_ROOT") ?? ""
+    if root != "" {
+        return "{root}/build/blink"
+    }
+    "build/blink"
+}
+
+test.failing(
+    "cross-module same-bare-name structs do not collide",
+    reason: "named_type_map is keyed by bare struct name only, so two modules each declaring `Ngx` collapse to one entry; a cross-module return-var decl then picks the wrong module's C struct type and member access fails to compile",
+    ticket: "0gv20f",
+) {
+    let root = ".tmp/_cross_module_bare_struct_name_collision"
+    let src_dir = "{root}/src"
+    let _mk = process_run("mkdir", ["-p", src_dir])
+    let toml = #"[package]
+name = "xmodngx"
+version = "0.1.0"
+"#
+    write_file("{root}/blink.toml", toml)
+    let mod_a = #"
+pub type Ngx { a: Int, b: Int }
+pub fn ngx_make() -> Ngx { Ngx { a: 11, b: 22 } }
+"#
+    write_file("{src_dir}/mvce_a.bl", mod_a)
+    let mod_b = #"
+pub type Ngx { p: Int, q: Int, r: Int }
+pub fn ngx_b_sum() -> Int {
+    let n = Ngx { p: 100, q: 200, r: 300 }
+    n.p + n.q + n.r
+}
+"#
+    write_file("{src_dir}/mvce_b.bl", mod_b)
+    let entry_path = "{src_dir}/main.bl"
+    let entry_src = #"
+import mvce_a
+import mvce_b
+import std.io
+
+fn main() ! IO {
+    let x = mvce_a.ngx_make()
+    io.println("a={x.a} b={x.b} sum={mvce_b.ngx_b_sum()}")
+}
+"#
+    write_file(entry_path, entry_src)
+    let r = process_run(blink_bin(), ["run", entry_path])
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "a=11 b=22 sum=600\n")
+}

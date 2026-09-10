@@ -1,0 +1,66 @@
+// tc_resolve_tparam_tid's Fn-argument resolver binds a generic function's type
+// parameter from a closure-literal argument by reading the closure's return
+// annotation as a plain name string, which only recognizes the four scalar
+// types (Int/Float/Bool/Str). A closure returning a generic struct instance,
+// or a List of closures whose element type carries the type parameter, should
+// resolve just as well — the type information is present on the tid, only the
+// resolver's name-based lookup cannot reach it.
+
+import compile_test_helpers.{compile_and_run}
+
+test.failing(
+    "generic fn's type parameter binds from a closure argument returning a generic struct instance",
+    reason: "tc_resolve_tparam_tid's Fn arm reads the closure literal's return annotation as a name string via tc_scalar_tid_from_name, which only admits Int/Float/Bool/Str; Box[Int] is not a scalar name so T reaches monomorphization unsolved",
+    ticket: "3ejrqa",
+) {
+    let src = #"
+import std.io
+
+type Box[T] { v: T }
+
+fn apply_ret[T](f: fn(Int) -> Box[T], x: Int) -> Box[T] {
+    f(x)
+}
+
+fn main() {
+    let b = apply_ret(fn(n: Int) -> Box[Int] { Box { v: n * 2 } }, 21)
+    io.println("{b.v}")
+}
+"#
+    let r = compile_and_run(src, "_closure_arg_typevar_struct_return")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "42\n")
+}
+
+test.failing(
+    "generic fn's type parameter binds from a List of closures whose element mentions it",
+    reason: "the resolver's List arm only handles a bare element or a tuple slot naming the type param directly; a List[fn(Int) -> T] element falls through with T unbound and reaches monomorphization unsolved",
+    ticket: "3ejrqa",
+) {
+    let src = #"
+import std.io
+
+fn make_it[T](fs: List[fn(Int) -> T], n: Int) -> T {
+    let h = fs.get(0).unwrap()
+    h(n)
+}
+
+fn main() {
+    let fs: List[fn(Int) -> Str] = [fn(n: Int) -> Str { "v{n}" }]
+    io.println("s={make_it(fs, 7)}")
+}
+"#
+    let r = compile_and_run(src, "_closure_arg_typevar_list_of_fn")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "s=v7\n")
+}
+
+// Control: the scalar case the resolver already handles must keep working.
+fn apply_ret_scalar[T](f: fn(Int) -> T, x: Int) -> T {
+    f(x)
+}
+
+test "generic fn's type parameter binds from a closure argument returning a scalar (control)" {
+    let b = apply_ret_scalar(fn(n: Int) -> Int { n * 2 }, 21)
+    assert_eq(b, 42)
+}
