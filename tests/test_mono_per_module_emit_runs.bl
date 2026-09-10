@@ -1,0 +1,59 @@
+import std.fs
+import std.io
+
+// The per-module driver path must run the pass before it emits. A trace line on
+// the `mono` channel is the only observable the driver gives a black-box test.
+fn probe_src() -> Str {
+    #"fn id[T](x: T) -> T { x }
+fn main() {
+    assert(id(1) == 1)
+    assert(id("s") == "s")
+}
+"#
+}
+
+fn instance_count_from(err_out: Str) -> Int {
+    let needle = "[dbg:mono] instances="
+    let lines = err_out.split("\n")
+    for line in lines {
+        if line.starts_with(needle) {
+            let rest = line.substring(needle.len(), line.len() - needle.len())
+            return rest.trim().parse_int()
+        }
+    }
+    -1
+}
+
+test "per-module emit path runs the mono pass" {
+    let path = "build/mono_per_module_probe.bl"
+    write_file(path, probe_src())
+    env.set_var("BLINK_TRACE_CHANNELS", "mono")
+    let result = process_run("build/blink", ["__emit-per-module", path, "build/mono_per_module_out"])
+    env.remove_var("BLINK_TRACE_CHANNELS")
+    let _ = fs.delete(path)
+    shell_exec("rm -rf build/mono_per_module_out")
+    if result.exit_code != 0 {
+        io.println("FAIL: per-module emit exited {result.exit_code}\n{result.err_out}")
+    }
+    assert_eq(result.exit_code, 0)
+    let n = instance_count_from(result.err_out)
+    if n < 2 {
+        io.println("FAIL: expected >= 2 instances traced, got {n}\n{result.err_out}")
+    }
+    assert(n >= 2)
+}
+
+test "monolith build path runs the mono pass" {
+    let path = "build/mono_monolith_probe.bl"
+    write_file(path, probe_src())
+    env.set_var("BLINK_TRACE_CHANNELS", "mono")
+    let result = process_run("build/blink", ["build", "--emit", "c", "--no-cache", path])
+    env.remove_var("BLINK_TRACE_CHANNELS")
+    let _ = fs.delete(path)
+    assert_eq(result.exit_code, 0)
+    let n = instance_count_from(result.err_out)
+    if n < 2 {
+        io.println("FAIL: expected >= 2 instances traced, got {n}\n{result.err_out}")
+    }
+    assert(n >= 2)
+}

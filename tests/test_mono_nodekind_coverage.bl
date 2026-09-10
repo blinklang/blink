@@ -1,0 +1,170 @@
+import std.fs
+import std.io
+import typecheck.{check_types}
+import mono2.{run_mono, instances}
+import diagnostics.{diag_ice_count}
+import parser.{nodes, node_kind}
+import ast.{NodeKind, nk_tag, nk_of, node_kind_name}
+import compiler.{compile_to_program}
+// typecheck still reaches its CT bridge in codegen_types; linking needs it until that bridge goes.
+import codegen_expr
+
+// One program that produces every NodeKind the parser can build. The pass walks it
+// with no ICE, which is what proves the walk's match has no unhandled arm.
+fn probe_src() -> Str {
+    #"import std.list
+@derive(Eq)
+type Point { x: Int, y: Int }
+type Shape { Circle { r: Int }, Dot }
+type Errno { Errno(Int) }
+trait Show {
+    type Out
+    fn show(self) -> Str
+}
+impl Show for Point {
+    type Out = Str
+    fn show(self) -> Str { "p" }
+}
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str)
+    }
+}
+const banner: Str = #embed("mono_nodekind_embed.txt")
+fn id[T](x: T) -> T { x }
+fn named(a: Int, b: Int) -> Int { a + b }
+fn ret_early(x: Int) -> Int {
+    if x > 0 { return 1 }
+    0
+}
+fn main() {
+    let i = 1
+    let f = 1.5
+    let b = true
+    let c = 'c'
+    let s = "s {i}"
+    let t = (1, "a")
+    let l: List[Int] = [1, 2, 3]
+    let p = Point { x: 1, y: 2 }
+    let p2 = Point { x: 3, ..p }
+    let fx = p2.x
+    let ix = l[0]
+    let r = 0..3
+    let neg = -i
+    let nb = !b
+    let v = if b { 1 } else { 2 }
+    let m = match ix {
+        0 => 0
+        1 | 2 => 1
+        3..5 => 2
+        _ => 3
+    }
+    let ms = match s {
+        "s" => 1
+        _ => 0
+    }
+    match t {
+        (a, _) => { assert(a == 1) }
+    }
+    match p {
+        Point { x, y: _ } => { assert(x == 1) }
+    }
+    match Shape.Dot {
+        Shape.Circle { r } => { assert(r == 0) }
+        Shape.Dot => {}
+    }
+    match l {
+        [first, ...] => { assert(first == 1) }
+        _ => {}
+    }
+    let whole = match i {
+        w as 1 => w
+        _ => 0
+    }
+    let add = fn(a: Int) -> Int { a + 1 }
+    let mut acc = 0
+    acc = acc + 1
+    acc += 1
+    for x in l {
+        if x == 2 { continue }
+        acc = acc + x
+    }
+    while acc > 100 { acc = 0 }
+    loop { break }
+    let blk = { let z = 1
+        z }
+    let n = named(a: 1, b: 2)
+    let e = Errno(3)
+    let ch = channel.new[Int](1)
+    async.scope {
+        let hd = async.spawn(fn() -> Int { 1 })
+        let got = hd.await
+        assert(got == 1)
+    }
+    with ffi.scope() as scope {
+        let pt: Ptr[Int] = scope.alloc()
+    }
+    with handler Metrics {
+        fn counter(_n: Str) {}
+    } {
+        metrics.counter("x")
+    }
+    assert(id(1) == 1)
+    assert(id("s") == "s")
+    assert(add(1) == 2)
+    assert(ret_early(1) == 1)
+    assert(p.show() == "p")
+    assert(f > 1.0 && c == 'c' && nb == false && v == 1 && m == 1 && ms == 1 && whole == 1 && blk == 1 && n == 3 && fx == 3 && neg == -1 && r.len() == 3 && banner.len() > 0)
+}
+test "panics" {
+    assert_panics { let zero = 0
+        assert(1 / zero == 1) }
+}
+"#
+}
+
+// The parser has no production for the first two, and KindCount is the enum
+// sentinel, so no program can put them in a tree.
+fn unproducible(k: NodeKind) -> Bool {
+    if k == NodeKind.ModBlock { return true }
+    if k == NodeKind.AsyncSpawn { return true }
+    if k == NodeKind.KindCount { return true }
+    false
+}
+
+test "probe covers every producible NodeKind and the pass walks it without an ICE" {
+    let path = "build/mono_nodekind_probe.bl"
+    write_file("build/mono_nodekind_embed.txt", "banner\n")
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let before = diag_ice_count
+    run_mono(program)
+    let _ = fs.delete(path)
+    let _ = fs.delete("build/mono_nodekind_embed.txt")
+    assert_eq(diag_ice_count, before)
+    assert(instances().len() >= 2)
+
+    let total = nk_tag(NodeKind.KindCount)
+    let mut seen: List[Int] = []
+    let mut k = 0
+    while k < total {
+        seen.push(0)
+        k = k + 1
+    }
+    let mut i = 0
+    while i < nodes.len() {
+        seen.set(node_kind(i), 1)
+        i = i + 1
+    }
+    let mut missing = 0
+    k = 0
+    while k < total {
+        if seen.get(k).unwrap() == 0 && !unproducible(nk_of(k)) {
+            io.println("FAIL: probe never produced NodeKind {node_kind_name(k)}")
+            missing = missing + 1
+        }
+        k = k + 1
+    }
+    assert_eq(missing, 0)
+}
