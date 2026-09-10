@@ -1,0 +1,90 @@
+import std.io
+import ir.{
+    ir_reset, ir_verify, ir_mark_materialize, ir_must_materialize,
+    ir_const, ir_var_ref, ir_binary, ir_call_direct, ir_let, ir_assign, ir_expr_stmt, ir_return, ir_if, ir_block,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+import codegen_expr
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn assert_rejects(label: Str, root: Int, needle: Str) {
+    let errs = ir_verify(root)
+    let mut hit = 0
+    for e in errs { if e.contains(needle) { hit += 1 } }
+    if hit == 0 { io.println("FAIL: {label}: no error contains '{needle}'; got: {errs.join(" | ")}") }
+    assert_eq_int("{label} reports '{needle}'", if hit > 0 { 1 } else { 0 }, 1)
+}
+
+fn assert_valid(label: Str, root: Int) {
+    let errs = ir_verify(root)
+    if errs.len() > 0 { io.println("FAIL: {label}: {errs.join(" | ")}") }
+    assert_eq_int("{label} verifies", errs.len(), 0)
+}
+
+fn int_const(text: Str) -> Int { ir_const(1, 0, "int64_t", text) }
+fn int_var(name: Str) -> Int { ir_var_ref(1, 0, "int64_t", name, SlotForm.InlineWord) }
+fn call_f() -> Int { ir_call_direct(1, 0, "int64_t", "main_f", SlotForm.InlineWord, []) }
+
+
+// The printer prints a value node inline into its parent unless must_materialize is set, so a
+// node the tree reaches twice would be evaluated twice. Lowering must flag it, and the verifier
+// holds lowering to that.
+test "a value node reached twice without the flag is rejected" {
+    ir_reset()
+    let shared = call_f()
+    let e = ir_expr_stmt(0, ir_binary(1, 0, "int64_t", "+", shared, shared))
+    assert_rejects("shared call", e, "reached twice")
+}
+
+test "a value node reached twice with the flag is accepted" {
+    ir_reset()
+    let shared = call_f()
+    ir_mark_materialize(shared)
+    let e = ir_expr_stmt(0, ir_binary(1, 0, "int64_t", "+", shared, shared))
+    assert_valid("materialised shared call", e)
+}
+
+test "a fresh node is inline by default and a mark is idempotent" {
+    ir_reset()
+    let c = int_const("1")
+    assert_eq_int("default", ir_must_materialize(c), 0)
+    ir_mark_materialize(c)
+    ir_mark_materialize(c)
+    assert_eq_int("marked once", ir_must_materialize(c), 1)
+}
+
+test "sharing across two statements is the same defect as sharing inside one expression" {
+    ir_reset()
+    let shared = int_var("x")
+    let l = ir_let(1, 0, "int64_t", "y", SlotForm.InlineWord, shared)
+    let r = ir_return(0, shared)
+    assert_rejects("shared across statements", ir_block(0, [l, r]), "reached twice")
+    ir_mark_materialize(shared)
+    assert_valid("flagged across statements", ir_block(0, [l, r]))
+}
+
+test "a statement node reached twice is rejected even when flagged" {
+    ir_reset()
+    let stmt = ir_expr_stmt(0, call_f())
+    let cond = ir_var_ref(3, 0, "int", "ok", SlotForm.InlineWord)
+    let blk = ir_block(0, [stmt])
+    let i = ir_if(0, cond, blk, blk)
+    assert_rejects("shared branch block", i, "reached twice")
+    ir_mark_materialize(blk)
+    assert_rejects("flag does not rescue a statement", i, "reached twice")
+}
+
+test "a tree with one use per node needs no flags" {
+    ir_reset()
+    let x = ir_let(1, 0, "int64_t", "x", SlotForm.InlineWord, call_f())
+    let y = ir_let(1, 0, "int64_t", "y", SlotForm.InlineWord, ir_binary(1, 0, "int64_t", "*", int_var("x"), int_var("x")))
+    let a = ir_assign(0, int_var("y"), ir_binary(1, 0, "int64_t", "-", int_var("y"), int_const("1")))
+    assert_valid("separate VarRef nodes per use", ir_block(0, [x, y, a, ir_return(0, int_var("y"))]))
+}

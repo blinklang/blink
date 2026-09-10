@@ -1,0 +1,204 @@
+import std.io
+import ir.{
+    IrKind, ir_reset, ir_node_count, ir_node, ir_kind, ir_tid, ir_span, ir_c_spelling, ir_c_name,
+    ir_kid_count, ir_kid, ir_kids, ir_must_materialize, ir_mark_materialize, ir_slot_form,
+    ir_kind_name, ir_kind_from_name, ir_kind_is_value, ir_all_kinds, ir_verify,
+    ir_const, ir_var_ref, ir_global_ref, ir_unary, ir_binary, ir_cast, ir_field_get, ir_field_set,
+    ir_struct_new, ir_tuple_new, ir_container_new, ir_box, ir_unbox, ir_carrier_wrap, ir_slot_form_name,
+    ir_carrier_unwrap, ir_carrier_tag, ir_call_direct, ir_call_indirect, ir_call_closure,
+    ir_call_virtual, ir_call_runtime, ir_closure_new, ir_effect_perform, ir_handler_install,
+    ir_let, ir_assign, ir_expr_stmt, ir_return, ir_if, ir_loop, ir_break, ir_continue, ir_block,
+    ir_switch, ir_with_scope, ir_panic, ir_unreachable,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+import codegen_expr
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn assert_kind(id: Int, want: IrKind, kids: Int) {
+    assert_eq_str("kind", ir_kind_name(ir_kind(id)), ir_kind_name(want))
+    assert_eq_int("{ir_kind_name(want)} kids", ir_kid_count(id), kids)
+}
+
+fn assert_valid(label: Str, root: Int) {
+    let errs = ir_verify(root)
+    if errs.len() > 0 { io.println("FAIL: {label}: {errs.join(" | ")}") }
+    assert_eq_int("{label} verifies", errs.len(), 0)
+}
+
+fn int_const(text: Str) -> Int { ir_const(1, 0, "int64_t", text) }
+fn int_var(name: Str) -> Int { ir_var_ref(1, 0, "int64_t", name, SlotForm.InlineWord) }
+
+
+test "the kind set is exactly the 37 kinds of the schema, each with a unique name" {
+    let kinds = ir_all_kinds()
+    assert_eq_int("kind count", kinds.len(), 37)
+    let mut seen: Map[Str, Int] = Map()
+    for k in kinds {
+        let name = ir_kind_name(k)
+        assert_eq_int("{name} unique", if seen.contains_key(name) { 1 } else { 0 }, 0)
+        seen.insert(name, 1)
+        match ir_kind_from_name(name) {
+            Some(back) => assert_eq_str("{name} round-trips", ir_kind_name(back), name)
+            None => assert_eq_str("{name} resolves", "missing", name)
+        }
+    }
+    assert_eq_int("unknown name", match ir_kind_from_name("Nope") { Some(_k) => 1 None => 0 }, 0)
+}
+
+test "values and statements partition the kinds 22 to 15" {
+    let mut values = 0
+    let mut stmts = 0
+    for k in ir_all_kinds() {
+        if ir_kind_is_value(k) { values += 1 } else { stmts += 1 }
+    }
+    assert_eq_int("values", values, 22)
+    assert_eq_int("statements", stmts, 15)
+    assert_eq_int("Const is a value", if ir_kind_is_value(IrKind.Const) { 1 } else { 0 }, 1)
+    assert_eq_int("Block is a statement", if ir_kind_is_value(IrKind.Block) { 1 } else { 0 }, 0)
+    assert_eq_int("Switch is a statement", if ir_kind_is_value(IrKind.Switch) { 1 } else { 0 }, 0)
+}
+
+test "every value kind is constructible with the documented kids and verifies" {
+    ir_reset()
+    let c = int_const("1")
+    assert_kind(c, IrKind.Const, 0)
+    assert_eq_str("Const literal", ir_c_name(c), "1")
+    assert_eq_int("Const tid", ir_tid(c), 1)
+    let v = int_var("x")
+    assert_kind(v, IrKind.VarRef, 0)
+    let g = ir_global_ref(1, 0, "int64_t", "counter", SlotForm.InlineWord)
+    assert_kind(g, IrKind.GlobalRef, 0)
+    let u = ir_unary(1, 0, "int64_t", "-", int_const("2"))
+    assert_kind(u, IrKind.Unary, 1)
+    let b = ir_binary(1, 0, "int64_t", "+", int_const("1"), int_var("y"))
+    assert_kind(b, IrKind.Binary, 2)
+    assert_eq_str("Binary op", ir_c_name(b), "+")
+    let cast = ir_cast(2, 0, "double", int_var("z"))
+    assert_kind(cast, IrKind.Cast, 1)
+    let obj = ir_var_ref(5, 0, "blink_Point*", "p", SlotForm.PointerBoxed)
+    let fg = ir_field_get(1, 0, "int64_t", "x", SlotForm.InlineWord, obj)
+    assert_kind(fg, IrKind.FieldGet, 1)
+    let sn = ir_struct_new(5, 0, "blink_Point", [int_const("1"), int_const("2")])
+    assert_kind(sn, IrKind.StructNew, 2)
+    let tn = ir_tuple_new(6, 0, "blink_Tuple_int_int", [int_const("1"), int_const("2")])
+    assert_kind(tn, IrKind.TupleNew, 2)
+    let cn = ir_container_new(7, 0, "blink_list*", "blink_list_new", [int_const("1")])
+    assert_kind(cn, IrKind.ContainerNew, 1)
+    let bx = ir_box(6, 0, "blink_Point*", "blink_Point", sn)
+    assert_kind(bx, IrKind.Box, 1)
+    assert_eq_str("Box slot", ir_slot_form_name(ir_slot_form(bx)), "PointerBoxed")
+    assert_eq_str("Box pointee", ir_c_name(bx), "blink_Point")
+    let ub = ir_unbox(5, 0, "blink_Point", SlotForm.Inline, obj)
+    assert_kind(ub, IrKind.Unbox, 1)
+    let some = ir_carrier_wrap(8, 0, "blink_Option_int", "value", int_const("1"), int_const("9"))
+    assert_kind(some, IrKind.CarrierWrap, 2)
+    let none = ir_carrier_wrap(8, 0, "blink_Option_int", "", int_const("0"), -1)
+    assert_kind(none, IrKind.CarrierWrap, 1)
+    let cu = ir_carrier_unwrap(1, 0, "int64_t", "value", SlotForm.InlineWord, some)
+    assert_kind(cu, IrKind.CarrierUnwrap, 1)
+    let ct = ir_carrier_tag(1, 0, "int", none)
+    assert_kind(ct, IrKind.CarrierTag, 1)
+    let cd = ir_call_direct(1, 0, "int64_t", "main_add", SlotForm.InlineWord, [int_const("1"), int_const("2")])
+    assert_kind(cd, IrKind.CallDirect, 2)
+    let fp = ir_var_ref(9, 0, "int64_t (*)(int64_t)", "f", SlotForm.InlineWord)
+    let ci = ir_call_indirect(1, 0, "int64_t", SlotForm.InlineWord, fp, [int_const("3")])
+    assert_kind(ci, IrKind.CallIndirect, 2)
+    let clo = ir_var_ref(10, 0, "blink_closure*", "cl", SlotForm.InlineWord)
+    let cc = ir_call_closure(1, 0, "int64_t", "int64_t (*)(blink_closure*, int64_t)", SlotForm.InlineWord, clo, [int_const("4")])
+    assert_kind(cc, IrKind.CallClosure, 2)
+    let cv = ir_call_virtual(1, 0, "int64_t", "counter", SlotForm.InlineWord, obj, [])
+    assert_kind(cv, IrKind.CallVirtual, 1)
+    let cr = ir_call_runtime(1, 0, "int64_t", "blink_list_len", SlotForm.InlineWord, [cn])
+    assert_kind(cr, IrKind.CallRuntime, 1)
+    assert_eq_str("CallRuntime symbol", ir_c_name(cr), "blink_list_len")
+    let nc = ir_closure_new(10, 0, "blink_closure*", "main_lambda_0", [int_var("cap")])
+    assert_kind(nc, IrKind.ClosureNew, 1)
+    let ep = ir_effect_perform(1, 0, "int64_t", "io_println", SlotForm.InlineWord, [int_const("5")])
+    assert_kind(ep, IrKind.EffectPerform, 1)
+    assert_valid("value tree", ir_expr_stmt(0, ir_binary(1, 0, "int64_t", "*", b, cd)))
+}
+
+test "every statement kind is constructible with the documented kids and verifies" {
+    ir_reset()
+    let l = ir_let(1, 0, "int64_t", "x", SlotForm.InlineWord, int_const("1"))
+    assert_kind(l, IrKind.Let, 1)
+    let l0 = ir_let(1, 0, "int64_t", "y", SlotForm.InlineWord, -1)
+    assert_kind(l0, IrKind.Let, 0)
+    let a = ir_assign(0, int_var("x"), int_const("2"))
+    assert_kind(a, IrKind.Assign, 2)
+    let obj = ir_var_ref(5, 0, "blink_Point*", "p", SlotForm.PointerBoxed)
+    let fs = ir_field_set(0, "x", obj, int_const("3"))
+    assert_kind(fs, IrKind.FieldSet, 2)
+    let es = ir_expr_stmt(0, ir_call_runtime(9, 0, "void", "blink_gc_collect", SlotForm.InlineWord, []))
+    assert_kind(es, IrKind.ExprStmt, 1)
+    let r = ir_return(0, int_var("x"))
+    assert_kind(r, IrKind.Return, 1)
+    let r0 = ir_return(0, -1)
+    assert_kind(r0, IrKind.Return, 0)
+    let brk = ir_break(0)
+    assert_kind(brk, IrKind.Break, 0)
+    let cont = ir_continue(0)
+    assert_kind(cont, IrKind.Continue, 0)
+    let cond = ir_binary(3, 0, "int", "<", int_var("x"), int_const("10"))
+    let i2 = ir_if(0, cond, ir_block(0, [brk]), -1)
+    assert_kind(i2, IrKind.If, 2)
+    let i3 = ir_if(0, ir_var_ref(3, 0, "int", "ok", SlotForm.InlineWord), ir_block(0, [a]), ir_block(0, [cont]))
+    assert_kind(i3, IrKind.If, 3)
+    let lp = ir_loop(0, ir_block(0, [i2, i3]))
+    assert_kind(lp, IrKind.Loop, 1)
+    let sw = ir_switch(0, ir_var_ref(1, 0, "int64_t", "tag", SlotForm.InlineWord),
+        [int_const("0"), ir_block(0, [fs]), int_const("1"), ir_block(0, [es])], ir_block(0, [ir_unreachable(0)]))
+    assert_kind(sw, IrKind.Switch, 6)
+    let sw0 = ir_switch(0, int_var("tag"), [int_const("0"), ir_block(0, [])], -1)
+    assert_kind(sw0, IrKind.Switch, 3)
+    let ws = ir_with_scope(0, "blink_arena_pop", -1, ir_block(0, []))
+    assert_kind(ws, IrKind.WithScope, 1)
+    let ws2 = ir_with_scope(0, "main_File_close", int_var("f"), ir_block(0, []))
+    assert_kind(ws2, IrKind.WithScope, 2)
+    let pn = ir_panic(0, ir_const(2, 0, "blink_str*", "\"boom\""))
+    assert_kind(pn, IrKind.Panic, 1)
+    let un = ir_unreachable(0)
+    assert_kind(un, IrKind.Unreachable, 0)
+    let hi = ir_handler_install(0, "metrics", ir_var_ref(11, 0, "blink_Metrics_vtable*", "h", SlotForm.InlineWord), ir_block(0, [r0]))
+    assert_kind(hi, IrKind.HandlerInstall, 2)
+    let body = ir_block(0, [l, l0, lp, sw, sw0, ws, ws2, hi, pn, un, r])
+    assert_kind(body, IrKind.Block, 11)
+    assert_valid("statement tree", body)
+}
+
+test "the arena hands out dense ids, and the record view agrees with the accessors" {
+    ir_reset()
+    assert_eq_int("empty arena", ir_node_count(), 0)
+    let c = ir_const(4, 17, "double", "1.5")
+    let v = ir_var_ref(4, 18, "double", "d", SlotForm.InlineWord)
+    let b = ir_binary(4, 19, "double", "*", c, v)
+    assert_eq_int("ids are dense", b, 2)
+    assert_eq_int("count", ir_node_count(), 3)
+    let n = ir_node(b)
+    assert_eq_str("record kind", ir_kind_name(n.kind), "Binary")
+    assert_eq_int("record tid", n.tid, 4)
+    assert_eq_int("record span", n.span, 19)
+    assert_eq_str("record spelling", n.c_spelling, "double")
+    assert_eq_str("record name", n.c_name, "*")
+    assert_eq_int("record kids", n.kids.len(), 2)
+    assert_eq_int("kid 0", ir_kid(b, 0), c)
+    assert_eq_int("kid 1", ir_kids(b).get(1).unwrap(), v)
+    assert_eq_int("span accessor", ir_span(c), 17)
+    assert_eq_str("spelling accessor", ir_c_spelling(v), "double")
+    assert_eq_int("fresh node is inline", ir_must_materialize(b), 0)
+    ir_mark_materialize(b)
+    assert_eq_int("marked node", ir_must_materialize(b), 1)
+    assert_eq_int("mark is visible through the record", ir_node(b).must_materialize, 1)
+}
