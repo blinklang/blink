@@ -1,0 +1,842 @@
+// ir.bl: the typed lowered IR between monomorphisation and the C printer.
+//
+// The IR is a tree, not SSA. Every value node carries the tid of the value it produces and
+// the C spelling that layout_of gave that tid, so the printer never asks a type question.
+// Lowering owns every representation decision (box, unbox, carrier wrap, tag read, mono
+// instance, vtable slot) and writes each as an explicit node. The printer owns C syntax only.
+//
+// Printer contract. src/cg_print.bl imports cg_emit and cname and nothing else. It may
+// decide C syntax, parenthesisation, statement order inside a block, temporary names, and
+// whether a value node prints inline into its parent or binds to a temporary first. It may
+// never import typecheck, layout, mono or ast; branch on a TyKind; compute or alter a C type
+// spelling; or read ty_pool. Its only type-shaped input is SlotForm, which says how a value
+// is held, not what it is.
+//
+// Inline rule. A value node prints inline unless must_materialize is set. Lowering sets the
+// flag for an effectful node and for a node the tree reaches twice, and for nothing else,
+// so the C keeps today's nested expression shape that gcc -O2 already optimises well.
+//
+// The kids of a node are node ids into one arena. Ids are dense and stable for the life of
+// the arena; ir_reset() empties it. A node is created after its kids, so a well-formed tree
+// is one where every kid id is smaller than its parent id. The verifier does not rely on
+// that ordering: it walks the tree and reports a cycle.
+
+import layout.{SlotForm}
+
+@derive(Eq)
+pub type IrKind {
+    Const, VarRef, GlobalRef,
+    Unary, Binary, Cast,
+    FieldGet, FieldSet, StructNew, TupleNew, ContainerNew,
+    Box, Unbox, CarrierWrap, CarrierUnwrap, CarrierTag,
+    CallDirect, CallIndirect, CallClosure, CallVirtual, CallRuntime,
+    ClosureNew, EffectPerform, HandlerInstall,
+    Let, Assign, ExprStmt, Return, If, Loop, Break, Continue, Block, Switch, WithScope,
+    Panic, Unreachable,
+}
+
+pub type IrNode {
+    kind: IrKind
+    tid: Int
+    span: Int
+    c_spelling: Str
+    c_name: Str
+    slot_form: SlotForm
+    must_materialize: Int
+    kids: List[Int]
+}
+
+// The arena. A node id is an index into this list, the same shape parser.bl uses for AST
+// nodes. Statements carry tid -1: tid 0 is a real type (the first interned one), so 0 can
+// not mean "unset".
+let mut ir_nodes: List[IrNode] = []
+
+pub fn ir_reset() { ir_nodes = [] }
+
+pub fn ir_node_count() -> Int { ir_nodes.len() }
+
+// The raw constructor. Every per-kind constructor goes through it; tests use it directly to
+// build trees the per-kind constructors refuse to shape, so the verifier can be exercised.
+// The kid list is copied: Blink lists are references, and a caller that reuses one scratch
+// list across call sites must not rewrite an earlier node.
+pub fn ir_new(kind: IrKind, tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm, kids: List[Int]) -> Int {
+    ir_nodes.push(IrNode {
+        kind: kind, tid: tid, span: span, c_spelling: c_spelling, c_name: c_name,
+        slot_form: slot_form, must_materialize: 0, kids: copy_ids(kids),
+    })
+    ir_nodes.len() - 1
+}
+
+fn copy_ids(xs: List[Int]) -> List[Int] {
+    let mut out: List[Int] = []
+    for x in xs { out.push(x) }
+    out
+}
+
+// ── Accessors ─────────────────────────────────────────────────────────────
+
+pub fn ir_node(id: Int) -> IrNode { ir_nodes.get(id).unwrap() }
+pub fn ir_kind(id: Int) -> IrKind { ir_node(id).kind }
+pub fn ir_tid(id: Int) -> Int { ir_node(id).tid }
+pub fn ir_span(id: Int) -> Int { ir_node(id).span }
+pub fn ir_c_spelling(id: Int) -> Str { ir_node(id).c_spelling }
+pub fn ir_c_name(id: Int) -> Str { ir_node(id).c_name }
+pub fn ir_slot_form(id: Int) -> SlotForm { ir_node(id).slot_form }
+pub fn ir_must_materialize(id: Int) -> Int { ir_node(id).must_materialize }
+pub fn ir_kid_count(id: Int) -> Int { ir_node(id).kids.len() }
+pub fn ir_kid(id: Int, i: Int) -> Int { ir_node(id).kids.get(i).unwrap() }
+
+// A copy, so a caller can not grow a node's kid list behind the verifier's back.
+pub fn ir_kids(id: Int) -> List[Int] { copy_ids(ir_node(id).kids) }
+
+pub fn ir_mark_materialize(id: Int) {
+    let n = ir_node(id)
+    ir_nodes.set(id, IrNode { must_materialize: 1, ..n })
+}
+
+// ── Kind tables ───────────────────────────────────────────────────────────
+
+pub fn ir_all_kinds() -> List[IrKind] {
+    [
+        IrKind.Const, IrKind.VarRef, IrKind.GlobalRef,
+        IrKind.Unary, IrKind.Binary, IrKind.Cast,
+        IrKind.FieldGet, IrKind.FieldSet, IrKind.StructNew, IrKind.TupleNew, IrKind.ContainerNew,
+        IrKind.Box, IrKind.Unbox, IrKind.CarrierWrap, IrKind.CarrierUnwrap, IrKind.CarrierTag,
+        IrKind.CallDirect, IrKind.CallIndirect, IrKind.CallClosure, IrKind.CallVirtual, IrKind.CallRuntime,
+        IrKind.ClosureNew, IrKind.EffectPerform, IrKind.HandlerInstall,
+        IrKind.Let, IrKind.Assign, IrKind.ExprStmt, IrKind.Return, IrKind.If, IrKind.Loop,
+        IrKind.Break, IrKind.Continue, IrKind.Block, IrKind.Switch, IrKind.WithScope,
+        IrKind.Panic, IrKind.Unreachable,
+    ]
+}
+
+pub fn ir_kind_name(kind: IrKind) -> Str {
+    match kind {
+        IrKind.Const => "Const"
+        IrKind.VarRef => "VarRef"
+        IrKind.GlobalRef => "GlobalRef"
+        IrKind.Unary => "Unary"
+        IrKind.Binary => "Binary"
+        IrKind.Cast => "Cast"
+        IrKind.FieldGet => "FieldGet"
+        IrKind.FieldSet => "FieldSet"
+        IrKind.StructNew => "StructNew"
+        IrKind.TupleNew => "TupleNew"
+        IrKind.ContainerNew => "ContainerNew"
+        IrKind.Box => "Box"
+        IrKind.Unbox => "Unbox"
+        IrKind.CarrierWrap => "CarrierWrap"
+        IrKind.CarrierUnwrap => "CarrierUnwrap"
+        IrKind.CarrierTag => "CarrierTag"
+        IrKind.CallDirect => "CallDirect"
+        IrKind.CallIndirect => "CallIndirect"
+        IrKind.CallClosure => "CallClosure"
+        IrKind.CallVirtual => "CallVirtual"
+        IrKind.CallRuntime => "CallRuntime"
+        IrKind.ClosureNew => "ClosureNew"
+        IrKind.EffectPerform => "EffectPerform"
+        IrKind.HandlerInstall => "HandlerInstall"
+        IrKind.Let => "Let"
+        IrKind.Assign => "Assign"
+        IrKind.ExprStmt => "ExprStmt"
+        IrKind.Return => "Return"
+        IrKind.If => "If"
+        IrKind.Loop => "Loop"
+        IrKind.Break => "Break"
+        IrKind.Continue => "Continue"
+        IrKind.Block => "Block"
+        IrKind.Switch => "Switch"
+        IrKind.WithScope => "WithScope"
+        IrKind.Panic => "Panic"
+        IrKind.Unreachable => "Unreachable"
+    }
+}
+
+pub fn ir_kind_from_name(name: Str) -> Option[IrKind] {
+    for k in ir_all_kinds() {
+        if ir_kind_name(k) == name { return Some(k) }
+    }
+    None
+}
+
+// A value kind produces a C expression; a statement kind produces a C statement.
+pub fn ir_kind_is_value(kind: IrKind) -> Bool {
+    match kind {
+        IrKind.FieldSet => false
+        IrKind.HandlerInstall => false
+        IrKind.Let => false
+        IrKind.Assign => false
+        IrKind.ExprStmt => false
+        IrKind.Return => false
+        IrKind.If => false
+        IrKind.Loop => false
+        IrKind.Break => false
+        IrKind.Continue => false
+        IrKind.Block => false
+        IrKind.Switch => false
+        IrKind.WithScope => false
+        IrKind.Panic => false
+        IrKind.Unreachable => false
+        _ => true
+    }
+}
+
+// c_name is the C token the kind prints verbatim: a literal, an identifier, an operator, a
+// field or union member, a symbol, a vtable slot, a cast type or a sizeof operand. These
+// kinds print nothing without it. CarrierWrap is checked by shape instead: only the
+// payload-carrying form needs a member name.
+fn kind_needs_c_name(kind: IrKind) -> Bool {
+    match kind {
+        IrKind.Const => true
+        IrKind.VarRef => true
+        IrKind.GlobalRef => true
+        IrKind.Unary => true
+        IrKind.Binary => true
+        IrKind.FieldGet => true
+        IrKind.FieldSet => true
+        IrKind.ContainerNew => true
+        IrKind.Box => true
+        IrKind.CarrierUnwrap => true
+        IrKind.CallDirect => true
+        IrKind.CallClosure => true
+        IrKind.CallVirtual => true
+        IrKind.CallRuntime => true
+        IrKind.ClosureNew => true
+        IrKind.EffectPerform => true
+        IrKind.HandlerInstall => true
+        IrKind.Let => true
+        _ => false
+    }
+}
+
+// Kid arity per kind: (min, max), max -1 for unbounded.
+fn kind_min_kids(kind: IrKind) -> Int {
+    match kind {
+        IrKind.Unary => 1
+        IrKind.Binary => 2
+        IrKind.Cast => 1
+        IrKind.FieldGet => 1
+        IrKind.FieldSet => 2
+        IrKind.Box => 1
+        IrKind.Unbox => 1
+        IrKind.CarrierWrap => 1
+        IrKind.CarrierUnwrap => 1
+        IrKind.CarrierTag => 1
+        IrKind.CallIndirect => 1
+        IrKind.CallClosure => 1
+        IrKind.CallVirtual => 1
+        IrKind.HandlerInstall => 2
+        IrKind.Assign => 2
+        IrKind.ExprStmt => 1
+        IrKind.If => 2
+        IrKind.Loop => 1
+        IrKind.Switch => 1
+        IrKind.WithScope => 1
+        IrKind.Panic => 1
+        _ => 0
+    }
+}
+
+fn kind_max_kids(kind: IrKind) -> Int {
+    match kind {
+        IrKind.Const => 0
+        IrKind.VarRef => 0
+        IrKind.GlobalRef => 0
+        IrKind.Unary => 1
+        IrKind.Binary => 2
+        IrKind.Cast => 1
+        IrKind.FieldGet => 1
+        IrKind.FieldSet => 2
+        IrKind.Box => 1
+        IrKind.Unbox => 1
+        IrKind.CarrierWrap => 2
+        IrKind.CarrierUnwrap => 1
+        IrKind.CarrierTag => 1
+        IrKind.HandlerInstall => 2
+        IrKind.Let => 1
+        IrKind.Assign => 2
+        IrKind.ExprStmt => 1
+        IrKind.Return => 1
+        IrKind.If => 3
+        IrKind.Loop => 1
+        IrKind.Break => 0
+        IrKind.Continue => 0
+        IrKind.WithScope => 2
+        IrKind.Panic => 1
+        IrKind.Unreachable => 0
+        _ => -1
+    }
+}
+
+
+// ── Constructors: values ──────────────────────────────────────────────────
+
+pub fn ir_const(tid: Int, span: Int, c_spelling: Str, literal: Str) -> Int {
+    ir_new(IrKind.Const, tid, span, c_spelling, literal, SlotForm.InlineWord, [])
+}
+
+pub fn ir_var_ref(tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm) -> Int {
+    ir_new(IrKind.VarRef, tid, span, c_spelling, c_name, slot_form, [])
+}
+
+pub fn ir_global_ref(tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm) -> Int {
+    ir_new(IrKind.GlobalRef, tid, span, c_spelling, c_name, slot_form, [])
+}
+
+pub fn ir_unary(tid: Int, span: Int, c_spelling: Str, op: Str, operand: Int) -> Int {
+    ir_new(IrKind.Unary, tid, span, c_spelling, op, SlotForm.InlineWord, [operand])
+}
+
+pub fn ir_binary(tid: Int, span: Int, c_spelling: Str, op: Str, lhs: Int, rhs: Int) -> Int {
+    ir_new(IrKind.Binary, tid, span, c_spelling, op, SlotForm.InlineWord, [lhs, rhs])
+}
+
+pub fn ir_cast(tid: Int, span: Int, c_spelling: Str, expr: Int) -> Int {
+    ir_new(IrKind.Cast, tid, span, c_spelling, "", SlotForm.InlineWord, [expr])
+}
+
+pub fn ir_field_get(tid: Int, span: Int, c_spelling: Str, field: Str, slot_form: SlotForm, obj: Int) -> Int {
+    ir_new(IrKind.FieldGet, tid, span, c_spelling, field, slot_form, [obj])
+}
+
+pub fn ir_struct_new(tid: Int, span: Int, c_spelling: Str, fields: List[Int]) -> Int {
+    ir_new(IrKind.StructNew, tid, span, c_spelling, "", SlotForm.Inline, fields)
+}
+
+pub fn ir_tuple_new(tid: Int, span: Int, c_spelling: Str, elems: List[Int]) -> Int {
+    ir_new(IrKind.TupleNew, tid, span, c_spelling, "", SlotForm.Inline, elems)
+}
+
+pub fn ir_container_new(tid: Int, span: Int, c_spelling: Str, ctor_symbol: Str, elems: List[Int]) -> Int {
+    ir_new(IrKind.ContainerNew, tid, span, c_spelling, ctor_symbol, SlotForm.InlineWord, elems)
+}
+
+// c_spelling is the box's own pointer type like every other value node. The pointee type
+// goes in c_name: it is the token the printer writes inside sizeof for the heap copy.
+pub fn ir_box(tid: Int, span: Int, c_spelling: Str, pointee_spelling: Str, value: Int) -> Int {
+    ir_new(IrKind.Box, tid, span, c_spelling, pointee_spelling, SlotForm.PointerBoxed, [value])
+}
+
+pub fn ir_unbox(tid: Int, span: Int, c_spelling: Str, slot_form: SlotForm, ptr: Int) -> Int {
+    ir_new(IrKind.Unbox, tid, span, c_spelling, "", slot_form, [ptr])
+}
+
+// member is the carrier field the payload lands in ("value", "ok", "err"); "" for None.
+// The tag kid is a Const so the printer writes both designators without knowing the carrier.
+pub fn ir_carrier_wrap(tid: Int, span: Int, c_spelling: Str, member: Str, tag: Int, payload: Int) -> Int {
+    let kids = if payload < 0 { [tag] } else { [tag, payload] }
+    ir_new(IrKind.CarrierWrap, tid, span, c_spelling, member, SlotForm.Inline, kids)
+}
+
+pub fn ir_carrier_unwrap(tid: Int, span: Int, c_spelling: Str, member: Str, slot_form: SlotForm, carrier: Int) -> Int {
+    ir_new(IrKind.CarrierUnwrap, tid, span, c_spelling, member, slot_form, [carrier])
+}
+
+pub fn ir_carrier_tag(tid: Int, span: Int, c_spelling: Str, carrier: Int) -> Int {
+    ir_new(IrKind.CarrierTag, tid, span, c_spelling, "", SlotForm.InlineWord, [carrier])
+}
+
+pub fn ir_call_direct(tid: Int, span: Int, c_spelling: Str, symbol: Str, slot_form: SlotForm, args: List[Int]) -> Int {
+    ir_new(IrKind.CallDirect, tid, span, c_spelling, symbol, slot_form, args)
+}
+
+pub fn ir_call_indirect(tid: Int, span: Int, c_spelling: Str, slot_form: SlotForm, callee: Int, args: List[Int]) -> Int {
+    ir_new(IrKind.CallIndirect, tid, span, c_spelling, "", slot_form, prepend(callee, args))
+}
+
+// fn_type is the C function-pointer type the closure's fn_ptr is cast to before the call.
+pub fn ir_call_closure(tid: Int, span: Int, c_spelling: Str, fn_type: Str, slot_form: SlotForm, closure: Int, args: List[Int]) -> Int {
+    ir_new(IrKind.CallClosure, tid, span, c_spelling, fn_type, slot_form, prepend(closure, args))
+}
+
+pub fn ir_call_virtual(tid: Int, span: Int, c_spelling: Str, slot: Str, slot_form: SlotForm, receiver: Int, args: List[Int]) -> Int {
+    ir_new(IrKind.CallVirtual, tid, span, c_spelling, slot, slot_form, prepend(receiver, args))
+}
+
+pub fn ir_call_runtime(tid: Int, span: Int, c_spelling: Str, symbol: Str, slot_form: SlotForm, args: List[Int]) -> Int {
+    ir_new(IrKind.CallRuntime, tid, span, c_spelling, symbol, slot_form, args)
+}
+
+pub fn ir_closure_new(tid: Int, span: Int, c_spelling: Str, fn_symbol: Str, captures: List[Int]) -> Int {
+    ir_new(IrKind.ClosureNew, tid, span, c_spelling, fn_symbol, SlotForm.InlineWord, captures)
+}
+
+pub fn ir_effect_perform(tid: Int, span: Int, c_spelling: Str, slot: Str, slot_form: SlotForm, args: List[Int]) -> Int {
+    ir_new(IrKind.EffectPerform, tid, span, c_spelling, slot, slot_form, args)
+}
+
+fn prepend(head: Int, rest: List[Int]) -> List[Int] { [head].append(rest) }
+
+// ── Constructors: statements ──────────────────────────────────────────────
+
+pub fn ir_field_set(span: Int, field: Str, obj: Int, value: Int) -> Int {
+    ir_new(IrKind.FieldSet, -1, span, "", field, SlotForm.Inline, [obj, value])
+}
+
+pub fn ir_handler_install(span: Int, ev_field: Str, handler_value: Int, body: Int) -> Int {
+    ir_new(IrKind.HandlerInstall, -1, span, "", ev_field, SlotForm.Inline, [handler_value, body])
+}
+
+// init < 0 declares without initialising; lowering uses that to materialise an if or match value.
+pub fn ir_let(tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm, init: Int) -> Int {
+    let kids: List[Int] = if init < 0 { [] } else { [init] }
+    ir_new(IrKind.Let, tid, span, c_spelling, c_name, slot_form, kids)
+}
+
+pub fn ir_assign(span: Int, target: Int, value: Int) -> Int {
+    ir_new(IrKind.Assign, -1, span, "", "", SlotForm.Inline, [target, value])
+}
+
+pub fn ir_expr_stmt(span: Int, expr: Int) -> Int {
+    ir_new(IrKind.ExprStmt, -1, span, "", "", SlotForm.Inline, [expr])
+}
+
+pub fn ir_return(span: Int, value: Int) -> Int {
+    let kids: List[Int] = if value < 0 { [] } else { [value] }
+    ir_new(IrKind.Return, -1, span, "", "", SlotForm.Inline, kids)
+}
+
+pub fn ir_if(span: Int, cond: Int, then_block: Int, else_block: Int) -> Int {
+    let kids: List[Int] = if else_block < 0 { [cond, then_block] } else { [cond, then_block, else_block] }
+    ir_new(IrKind.If, -1, span, "", "", SlotForm.Inline, kids)
+}
+
+pub fn ir_loop(span: Int, body: Int) -> Int {
+    ir_new(IrKind.Loop, -1, span, "", "", SlotForm.Inline, [body])
+}
+
+pub fn ir_break(span: Int) -> Int { ir_new(IrKind.Break, -1, span, "", "", SlotForm.Inline, []) }
+
+pub fn ir_continue(span: Int) -> Int { ir_new(IrKind.Continue, -1, span, "", "", SlotForm.Inline, []) }
+
+pub fn ir_block(span: Int, stmts: List[Int]) -> Int {
+    ir_new(IrKind.Block, -1, span, "", "", SlotForm.Inline, stmts)
+}
+
+// cases alternates (Const label, Block body). default_block < 0 means no default arm.
+pub fn ir_switch(span: Int, scrutinee: Int, cases: List[Int], default_block: Int) -> Int {
+    let mut kids: List[Int] = [scrutinee]
+    for k in cases { kids.push(k) }
+    if default_block >= 0 { kids.push(default_block) }
+    ir_new(IrKind.Switch, -1, span, "", "", SlotForm.Inline, kids)
+}
+
+// resource < 0 is a scope with no resource value (an arena block).
+pub fn ir_with_scope(span: Int, cleanup_symbol: Str, resource: Int, body: Int) -> Int {
+    let kids: List[Int] = if resource < 0 { [body] } else { [resource, body] }
+    ir_new(IrKind.WithScope, -1, span, "", cleanup_symbol, SlotForm.Inline, kids)
+}
+
+pub fn ir_panic(span: Int, message: Int) -> Int {
+    ir_new(IrKind.Panic, -1, span, "", "", SlotForm.Inline, [message])
+}
+
+pub fn ir_unreachable(span: Int) -> Int { ir_new(IrKind.Unreachable, -1, span, "", "", SlotForm.Inline, []) }
+
+// ── Verifier ──────────────────────────────────────────────────────────────
+
+// Empty means valid. Each string names the node, its kind and one defect.
+pub fn ir_verify(root: Int) -> List[Str] {
+    let mut errs: List[Str] = []
+    if root < 0 || root >= ir_node_count() {
+        errs.push("root {root}: node id out of range (arena holds {ir_node_count()})")
+        return errs
+    }
+    let mut seen: List[Int] = []
+    let mut on_stack: List[Int] = []
+    let mut i = 0
+    while i < ir_node_count() {
+        seen.push(0)
+        on_stack.push(0)
+        i += 1
+    }
+    verify_node(root, seen, on_stack, errs)
+    errs
+}
+
+fn verify_node(id: Int, seen: List[Int], on_stack: List[Int], errs: List[Str]) {
+    let kind = ir_kind(id)
+    let label = "node {id} ({ir_kind_name(kind)})"
+    if on_stack.get(id).unwrap() == 1 {
+        errs.push("{label}: cycle, the node contains itself")
+        return
+    }
+    if seen.get(id).unwrap() == 1 {
+        if !ir_kind_is_value(kind) {
+            errs.push("{label}: statement reached twice, a statement has one owner")
+        } else if ir_must_materialize(id) == 0 {
+            errs.push("{label}: value reached twice without must_materialize")
+        }
+        return
+    }
+    seen.set(id, 1)
+    on_stack.set(id, 1)
+    verify_fields(id, kind, label, errs)
+    let kids = ir_kids(id)
+    if verify_arity(kind, label, kids.len(), errs) {
+        let mut i = 0
+        while i < kids.len() {
+            let kid = kids.get(i).unwrap()
+            if kid < 0 || kid >= ir_node_count() {
+                errs.push("{label}: kid {i} id {kid} out of range (arena holds {ir_node_count()})")
+            } else {
+                verify_kid_shape(kind, label, i, kids.len(), kid, errs)
+                verify_node(kid, seen, on_stack, errs)
+            }
+            i += 1
+        }
+    }
+    on_stack.set(id, 0)
+}
+
+fn verify_fields(id: Int, kind: IrKind, label: Str, errs: List[Str]) {
+    if ir_kind_is_value(kind) && ir_tid(id) < 0 {
+        errs.push("{label}: value node without a tid")
+    }
+    if (ir_kind_is_value(kind) || kind == IrKind.Let) && ir_c_spelling(id) == "" {
+        errs.push("{label}: empty c_spelling")
+    }
+    let wrap_with_payload = kind == IrKind.CarrierWrap && ir_kid_count(id) == 2
+    if (kind_needs_c_name(kind) || wrap_with_payload) && ir_c_name(id) == "" {
+        errs.push("{label}: empty c_name")
+    }
+}
+
+fn verify_arity(kind: IrKind, label: Str, n: Int, errs: List[Str]) -> Bool {
+    let lo = kind_min_kids(kind)
+    let hi = kind_max_kids(kind)
+    if n < lo || (hi >= 0 && n > hi) {
+        if hi < 0 {
+            errs.push("{label}: expects at least {lo} kid{plural(lo)}, has {n}")
+        } else if lo == hi {
+            errs.push("{label}: expects {lo} kids, has {n}")
+        } else {
+            errs.push("{label}: expects {lo} or {hi} kids, has {n}")
+        }
+        return false
+    }
+    true
+}
+
+fn plural(n: Int) -> Str { if n == 1 { "" } else { "s" } }
+
+// Which category each kid position takes: a value, any statement, or a Block.
+fn verify_kid_shape(kind: IrKind, label: Str, i: Int, n: Int, kid: Int, errs: List[Str]) {
+    let kid_kind = ir_kind(kid)
+    let kid_is_value = ir_kind_is_value(kid_kind)
+    match kid_slot(kind, i, n) {
+        KidSlot.Value => {
+            if !kid_is_value { errs.push("{label}: kid {i} is a statement where a value is required") }
+        }
+        KidSlot.Stmt => {
+            if kid_is_value { errs.push("{label}: kid {i} is a value where a statement is required") }
+        }
+        KidSlot.BlockOnly => {
+            if kid_kind != IrKind.Block { errs.push("{label}: kid {i} must be a Block") }
+        }
+        KidSlot.ConstLabel => {
+            if kid_kind != IrKind.Const { errs.push("{label}: kid {i} case label must be a Const") }
+        }
+        KidSlot.ConstTag => {
+            if kid_kind != IrKind.Const { errs.push("{label}: kid {i} tag must be a Const") }
+        }
+        KidSlot.Lvalue => {
+            if !is_lvalue_kind(kid_kind) { errs.push("{label}: kid {i} target must be an lvalue") }
+        }
+    }
+}
+
+type KidSlot { Value, Stmt, BlockOnly, ConstLabel, ConstTag, Lvalue }
+
+fn kid_slot(kind: IrKind, i: Int, n: Int) -> KidSlot {
+    match kind {
+        IrKind.Block => KidSlot.Stmt
+        IrKind.If => if i == 0 { KidSlot.Value } else { KidSlot.BlockOnly }
+        IrKind.Loop => KidSlot.BlockOnly
+        IrKind.HandlerInstall => if i == 0 { KidSlot.Value } else { KidSlot.BlockOnly }
+        IrKind.WithScope => if i == n - 1 { KidSlot.BlockOnly } else { KidSlot.Value }
+        IrKind.Switch => switch_kid_slot(i, n)
+        IrKind.CarrierWrap => if i == 0 { KidSlot.ConstTag } else { KidSlot.Value }
+        IrKind.Assign => if i == 0 { KidSlot.Lvalue } else { KidSlot.Value }
+        _ => KidSlot.Value
+    }
+}
+
+// kids: [scrutinee, (label, body)*, default?]. An even count after the scrutinee is all
+// pairs; an odd count ends with the default Block.
+fn switch_kid_slot(i: Int, n: Int) -> KidSlot {
+    if i == 0 { return KidSlot.Value }
+    let has_default = (n - 1) % 2 == 1
+    if has_default && i == n - 1 { return KidSlot.BlockOnly }
+    if i % 2 == 1 { KidSlot.ConstLabel } else { KidSlot.BlockOnly }
+}
+
+fn is_lvalue_kind(kind: IrKind) -> Bool {
+    match kind {
+        IrKind.VarRef => true
+        IrKind.GlobalRef => true
+        IrKind.FieldGet => true
+        IrKind.Unbox => true
+        IrKind.CarrierUnwrap => true
+        _ => false
+    }
+}
+
+// ── Dump ──────────────────────────────────────────────────────────────────
+
+// (Kind tid span SlotForm must_materialize "c_spelling" "c_name" kids...), one kid per
+// line, two spaces per depth. Node ids do not appear, so two arenas holding the same tree
+// dump the same text. A node the tree reaches twice is written in full once, with a label
+// #k after its c_name; every later reach is the bare #k. Labels count from 0 in dump order,
+// so sharing survives a parse and the text stays arena-independent. The label also ends the
+// walk on a cyclic tree, so a dump of a malformed tree still terminates.
+pub fn ir_dump(root: Int) -> Str {
+    if root < 0 || root >= ir_node_count() { return "(out-of-range {root})" }
+    let refs = int_list(ir_node_count(), 0)
+    count_refs(root, refs)
+    let labels = int_list(ir_node_count(), -1)
+    let sb = StringBuilder.new()
+    dump_node(sb, root, 0, refs, labels, [0])
+    sb.to_str()
+}
+
+fn int_list(n: Int, fill: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < n {
+        out.push(fill)
+        i += 1
+    }
+    out
+}
+
+fn count_refs(id: Int, refs: List[Int]) {
+    let seen = refs.get(id).unwrap()
+    refs.set(id, seen + 1)
+    if seen > 0 { return }
+    for kid in ir_node(id).kids {
+        if kid >= 0 && kid < ir_node_count() { count_refs(kid, refs) }
+    }
+}
+
+// next_label is a one-element list: the counter must survive the recursion.
+fn dump_node(sb: StringBuilder, id: Int, depth: Int, refs: List[Int], labels: List[Int], next_label: List[Int]) {
+    let mut d = 0
+    while d < depth {
+        sb.write("  ")
+        d += 1
+    }
+    if id < 0 || id >= ir_node_count() {
+        sb.write("(out-of-range {id})")
+        return
+    }
+    let label = labels.get(id).unwrap()
+    if label >= 0 {
+        sb.write("#{label}")
+        return
+    }
+    let n = ir_node(id)
+    sb.write("(")
+    sb.write(ir_kind_name(n.kind))
+    // The label sits before the fields so a parser never confuses it with a `#k` kid.
+    if refs.get(id).unwrap() > 1 {
+        let k = next_label.get(0).unwrap()
+        next_label.set(0, k + 1)
+        labels.set(id, k)
+        sb.write(" #{k}")
+    }
+    sb.write(" {n.tid} {n.span} {ir_slot_form_name(n.slot_form)} {n.must_materialize} ")
+    sb.write(quote(n.c_spelling))
+    sb.write(" ")
+    sb.write(quote(n.c_name))
+    for kid in n.kids {
+        sb.write("\n")
+        dump_node(sb, kid, depth + 1, refs, labels, next_label)
+    }
+    sb.write(")")
+}
+
+pub fn ir_slot_form_name(f: SlotForm) -> Str {
+    match f {
+        SlotForm.Inline => "Inline"
+        SlotForm.PointerBoxed => "PointerBoxed"
+        SlotForm.InlineWord => "InlineWord"
+    }
+}
+
+fn slot_form_from_name(name: Str) -> Option[SlotForm] {
+    if name == "Inline" { return Some(SlotForm.Inline) }
+    if name == "PointerBoxed" { return Some(SlotForm.PointerBoxed) }
+    if name == "InlineWord" { return Some(SlotForm.InlineWord) }
+    None
+}
+
+fn quote(s: Str) -> Str {
+    let sb = StringBuilder.new()
+    sb.write("\"")
+    let mut run = 0
+    let mut i = 0
+    while i < s.len() {
+        let b = s.byte_at(i)
+        if b == 34 || b == 92 || b == 10 {
+            sb.write(s.slice(run, i))
+            if b == 34 { sb.write("\\\"") } else if b == 92 { sb.write("\\\\") } else { sb.write("\\n") }
+            run = i + 1
+        }
+        i += 1
+    }
+    sb.write(s.slice(run, s.len()))
+    sb.write("\"")
+    sb.to_str()
+}
+
+// ── Parse (the inverse of dump) ───────────────────────────────────────────
+
+// The cursor is module state so the recursive reader needs no tuple returns. A malformed
+// text answers -1 and leaves whatever nodes it had already built in the arena.
+// pr_labels maps a dump label #k to the node id its full occurrence built.
+let mut pr_text: Str = ""
+let mut pr_pos: Int = 0
+let mut pr_failed: Bool = false
+let mut pr_labels: List[Int] = []
+
+pub fn ir_parse(text: Str) -> Int {
+    pr_text = text
+    pr_pos = 0
+    pr_failed = false
+    pr_labels = []
+    let id = parse_node()
+    skip_ws()
+    if pr_failed || pr_pos != pr_text.len() { return -1 }
+    id
+}
+
+fn parse_node() -> Int {
+    skip_ws()
+    if eat("#") { return parse_label_ref() }
+    if !eat("(") { return fail() }
+    let kind_name = read_ident()
+    skip_ws()
+    let label = if eat("#") { read_int() } else { -1 }
+    let tid = read_int()
+    let span = read_int()
+    let slot_name = read_ident()
+    let mat = read_int()
+    let spelling = read_string()
+    let name = read_string()
+    if pr_failed { return -1 }
+    let mut kids: List[Int] = []
+    skip_ws()
+    while !peek_is(")") {
+        if pr_pos >= pr_text.len() { return fail() }
+        let kid = parse_node()
+        if pr_failed { return -1 }
+        kids.push(kid)
+        skip_ws()
+    }
+    eat(")")
+    let kind = match ir_kind_from_name(kind_name) {
+        Some(k) => k
+        None => return fail()
+    }
+    let slot = match slot_form_from_name(slot_name) {
+        Some(f) => f
+        None => return fail()
+    }
+    let id = ir_new(kind, tid, span, spelling, name, slot, kids)
+    if mat == 1 { ir_mark_materialize(id) }
+    if label >= 0 { bind_label(label, id) }
+    id
+}
+
+// A reference must follow the labelled node's full occurrence; a forward reference (which
+// only a cyclic tree can dump) is malformed.
+fn parse_label_ref() -> Int {
+    let label = read_int()
+    if pr_failed { return -1 }
+    if label < 0 || label >= pr_labels.len() { return fail() }
+    let id = pr_labels.get(label).unwrap()
+    if id < 0 { return fail() }
+    id
+}
+
+fn bind_label(label: Int, id: Int) {
+    while pr_labels.len() <= label { pr_labels.push(-1) }
+    pr_labels.set(label, id)
+}
+
+fn fail() -> Int {
+    pr_failed = true
+    -1
+}
+
+fn skip_ws() {
+    while pr_pos < pr_text.len() {
+        let b = pr_text.byte_at(pr_pos)
+        if b == 32 || b == 10 || b == 9 || b == 13 { pr_pos += 1 } else { return }
+    }
+}
+
+fn peek_is(s: Str) -> Bool {
+    pr_pos < pr_text.len() && pr_text.slice(pr_pos, pr_pos + 1) == s
+}
+
+fn eat(s: Str) -> Bool {
+    if peek_is(s) {
+        pr_pos += 1
+        return true
+    }
+    false
+}
+
+fn is_ident_byte(b: Int) -> Bool {
+    (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95
+}
+
+fn read_ident() -> Str {
+    skip_ws()
+    let start = pr_pos
+    while pr_pos < pr_text.len() && is_ident_byte(pr_text.byte_at(pr_pos)) { pr_pos += 1 }
+    if pr_pos == start {
+        fail()
+        return ""
+    }
+    pr_text.slice(start, pr_pos)
+}
+
+fn read_int() -> Int {
+    skip_ws()
+    let start = pr_pos
+    if peek_is("-") { pr_pos += 1 }
+    while pr_pos < pr_text.len() && pr_text.byte_at(pr_pos) >= 48 && pr_text.byte_at(pr_pos) <= 57 { pr_pos += 1 }
+    if pr_pos == start || (pr_pos == start + 1 && pr_text.byte_at(start) == 45) {
+        return fail()
+    }
+    pr_text.slice(start, pr_pos).to_int()
+}
+
+fn read_string() -> Str {
+    skip_ws()
+    if !eat("\"") {
+        fail()
+        return ""
+    }
+    let sb = StringBuilder.new()
+    while pr_pos < pr_text.len() {
+        let b = pr_text.byte_at(pr_pos)
+        if b == 34 {
+            pr_pos += 1
+            return sb.to_str()
+        }
+        if b == 92 && pr_pos + 1 < pr_text.len() {
+            let e = pr_text.byte_at(pr_pos + 1)
+            if e == 110 { sb.write("\n") } else { sb.write(pr_text.slice(pr_pos + 1, pr_pos + 2)) }
+            pr_pos += 2
+        } else {
+            sb.write(pr_text.slice(pr_pos, pr_pos + 1))
+            pr_pos += 1
+        }
+    }
+    fail()
+    ""
+}

@@ -184,16 +184,35 @@ tasks:
       - echo "Installed blink to ~/.local/bin/blink (stdlib archive in ~/.local/share/blink/)"
 
   test-fmt:
-    desc: Test formatter idempotency and golden outputs
+    desc: Test formatter idempotency and golden outputs (release compiler at build/blinkc)
     deps: [bootstrap]
+    cmds:
+      - task: __fmt-goldens
+        vars: { FMT_BLINKC: "{{.BLINKC}}" }
+
+  # Formatter goldens, idempotency and (FMT_SEMANTIC=1) semantic checks with
+  # any blinkc. `task ci` drives it with the gen1 compiler and no semantic
+  # pass; `task test-fmt` and `ci-release` use the release build with all
+  # three. The skip list names tests the formatter cannot round-trip.
+  __fmt-goldens:
+    internal: true
+    silent: true
+    vars:
+      FMT_SEMANTIC: '{{.FMT_SEMANTIC | default "1"}}'
     cmds:
       - mkdir -p .tmp
       - |
         printf '%s\n' test_hof test_lazy_iter test_semver test_toml test_manifest test_lockfile test_http_types test_http_error test_json test_json_builder test_args test_args_cli test_derive_nested test_embed test_combining_iterators test_http_client test_iterators test_match_void_if test_multifile_visibility test_question_ops test_string_iter test_audit test_e2e_gitdep test_e2e_transitive test_e2e_pub_visibility test_async_spawn_types test_tcp_socket test_pub_import test_std_testing test_c_reserved_names test_module_qualified_types test_ue_complex_returns test_effects test_effect_vtable test_sqlite test_builtin_methods test_priv_access test_unused_import test_cross_module_effects test_cross_module_effects_helper test_map_seed_deterministic > .tmp/fmt_skip.txt
 
-        golden_results=$(systemd-run --user --scope -p MemoryMax=50G --quiet parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.BLINKC}} ::: tests/fmt/input_*.bl 2>&1 || true)
-        idem_results=$(systemd-run --user --scope -p MemoryMax=50G --quiet parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.BLINKC}} .tmp/fmt_skip.txt ::: tests/test_*.bl 2>&1 || true)
-        sem_results=$(systemd-run --user --scope -p MemoryMax=50G --quiet parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.BLINKC}} .tmp/fmt_skip.txt ::: tests/test_*.bl 2>&1 || true)
+        golden_results=$(systemd-run --user --scope -p MemoryMax=50G --quiet parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.FMT_BLINKC}} ::: tests/fmt/input_*.bl 2>&1 || true)
+        idem_results=$(systemd-run --user --scope -p MemoryMax=50G --quiet parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.FMT_BLINKC}} .tmp/fmt_skip.txt ::: tests/test_*.bl 2>&1 || true)
+        # The semantic pass compiles and RUNS every formatted test. Those
+        # binaries call the relative build/blink and build/blinkc, which only
+        # a release build provides, so the rewrite gate skips this pass.
+        sem_results=""
+        if [ "{{.FMT_SEMANTIC}}" = 1 ]; then
+          sem_results=$(systemd-run --user --scope -p MemoryMax=50G --quiet parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.FMT_BLINKC}} .tmp/fmt_skip.txt ::: tests/test_*.bl 2>&1 || true)
+        fi
 
         all_results=$(printf '%s\n%s\n%s' "$golden_results" "$idem_results" "$sem_results")
 
@@ -446,12 +465,12 @@ tasks:
         fi
         echo "PASS test-installed (install.sh layout — std.db_sqlite statically vendored from sidecar)"
 
-  # `ci` is the canonical gate: it runs the full monolith verification
-  # (`ci-monolith`) AND the four per-module emit invariants
-  # (`ci-per-module-checks`). Per-module .c/.h emit is the path we are
-  # promoting toward default — see decisions/per-module-o-default.md. The
-  # monolith path stays reachable via `task ci-monolith` so a codegen
-  # regression can be bisected against the single-TU output.
+  # `ci-release` runs the full monolith verification (`ci-monolith`) AND the
+  # four per-module emit invariants (`ci-per-module-checks`). Per-module
+  # .c/.h emit is the path we are promoting toward default; see
+  # decisions/per-module-o-default.md. The monolith path stays reachable via
+  # `task ci-monolith` so a codegen regression can be bisected against the
+  # single-TU output.
   ratchet:
     desc: Fail if any tracked compiler-debt count rose above the baseline or the previous commit
     silent: true
@@ -464,6 +483,12 @@ tasks:
     cmds:
       - ./scripts/test_ratchet.sh
 
+  test-lint:
+    desc: Self-test scripts/lint_codegen.sh row detection on a fixture
+    silent: true
+    cmds:
+      - ./scripts/test_lint_codegen.sh
+
   test-node-tid-diff:
     desc: Self-test the node-tid diff harness on two hand-written files
     silent: true
@@ -471,8 +496,13 @@ tasks:
     cmds:
       - ./scripts/test_node_tid_diff.sh
 
-  ci:
-    desc: Full CI — monolith verification + per-module emit invariants
+  # Release gate: the old full CI under its new name. Self-host regen, the
+  # whole test suite, per-module invariants, installed-layout smoke. Run it
+  # at release points; during the codegen rewrite `task ci` below is the
+  # daily gate. mono-diff and node-tid-diff are parked: the tasks still
+  # exist, but neither gate runs them.
+  ci-release:
+    desc: Release CI (self-host regen + full suite + per-module invariants)
     silent: true
     cmds:
       - task: ratchet
@@ -480,8 +510,78 @@ tasks:
       - task: test-node-tid-diff
       - task: ci-monolith
       - task: ci-per-module-checks
-      - task: mono-diff
-      - task: node-tid-diff
+
+  gen1:
+    desc: Compile the current compiler sources with the pinned gen0 (build/gen1/blinkc)
+    silent: true
+    cmds:
+      - task: gen0
+      - ./scripts/gen1.sh
+
+  corpus:
+    desc: Compile+run every tests/test_*.bl under gen0 independently; writes build/corpus.json, then lints
+    silent: true
+    vars:
+      CORPUS_LINT: '{{.CORPUS_LINT | default "1"}}'
+    cmds:
+      - task: gen0
+      # ci already ran the lint through ratchet; it passes CORPUS_LINT=0.
+      - ./scripts/corpus.sh {{if ne .CORPUS_LINT "1"}}--no-lint{{end}}
+
+  corpus-check:
+    desc: Fail if build/corpus.json lost a passing test or a pass count against the baseline or the previous commit
+    silent: true
+    cmds:
+      - ./scripts/corpus_check.sh
+
+  corpus-baseline:
+    desc: Rewrite scripts/corpus_baseline.json from build/corpus.json (only after a real gain)
+    silent: true
+    cmds:
+      - ./scripts/corpus_check.sh --update
+
+  lint:
+    desc: Codegen-rewrite lint rows L1-L11 over layout/cname/mono/ir/cg_* against the baseline and the previous commit
+    silent: true
+    cmds:
+      - ./scripts/lint_codegen.sh
+
+  typecheck-suite:
+    desc: Run the typechecker tests listed in scripts/typecheck_suite.txt under gen0; all must pass
+    silent: true
+    cmds:
+      - task: gen0
+      - |
+        CORPUS_OUT={{.BUILD_DIR}}/typecheck_suite.json ./scripts/corpus.sh --only scripts/typecheck_suite.txt --no-lint
+        passed=$(jq -r .passed {{.BUILD_DIR}}/typecheck_suite.json)
+        total=$(jq -r .total {{.BUILD_DIR}}/typecheck_suite.json)
+        if [ "$passed" != "$total" ]; then
+          echo "typecheck-suite: FAIL $passed/$total"
+          exit 1
+        fi
+        echo "typecheck-suite: ok $passed/$total"
+
+  # The daily gate for the codegen rewrite. Four checks, in order:
+  #   (a) gen0 compiles the current compiler sources (gen1)
+  #   (b) the corpus pass count is monotone (corpus + lint, then corpus-check)
+  #   (c) formatter goldens with the gen1 compiler
+  #   (d) the typecheck suite passes in full
+  # No self-host regen here: the rewrite cannot self-host until it is done.
+  # gen0 runs first: its provenance check is cheap and rebuilds a stale pin.
+  ci:
+    desc: Rewrite CI (gen0 compiles src, corpus monotone, lint, fmt goldens, typecheck suite)
+    silent: true
+    cmds:
+      - task: gen1
+      - task: ratchet
+      - task: test-ratchet
+      - task: test-lint
+      - task: corpus
+        vars: { CORPUS_LINT: "0" }
+      - task: corpus-check
+      - task: __fmt-goldens
+        vars: { FMT_BLINKC: "{{.BUILD_DIR}}/gen1/blinkc", FMT_SEMANTIC: "0" }
+      - task: typecheck-suite
 
   # Legacy monolith-only verification: regen bootstrap + run all tests on
   # the single-TU (monolith) codegen path. Kept green as a fallback so users
@@ -527,31 +627,14 @@ tasks:
       - '{{.BUILD_DIR}}/blink test tests/ --parallel {{.JOBS}} --quiet'
       - task: test-bootstrap-cold
       - task: test-sqlite-peel
-      - |
-        mkdir -p .tmp
-        printf '%s\n' test_hof test_lazy_iter test_semver test_toml test_manifest test_lockfile test_http_types test_http_error test_json test_json_builder test_args test_args_cli test_derive_nested test_embed test_combining_iterators test_http_client test_iterators test_match_void_if test_multifile_visibility test_question_ops test_string_iter test_audit test_e2e_gitdep test_e2e_transitive test_e2e_pub_visibility test_async_spawn_types test_tcp_socket test_pub_import test_std_testing test_c_reserved_names test_module_qualified_types test_ue_complex_returns test_effects test_effect_vtable test_sqlite test_builtin_methods test_priv_access test_unused_import test_cross_module_effects test_cross_module_effects_helper test_map_seed_deterministic > .tmp/fmt_skip.txt
-
-        golden_results=$(systemd-run --user --scope -p MemoryMax=50G --quiet parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.BLINKC}} ::: tests/fmt/input_*.bl 2>&1 || true)
-        idem_results=$(systemd-run --user --scope -p MemoryMax=50G --quiet parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.BLINKC}} .tmp/fmt_skip.txt ::: tests/test_*.bl 2>&1 || true)
-        sem_results=$(systemd-run --user --scope -p MemoryMax=50G --quiet parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.BLINKC}} .tmp/fmt_skip.txt ::: tests/test_*.bl 2>&1 || true)
-
-        all_results=$(printf '%s\n%s\n%s' "$golden_results" "$idem_results" "$sem_results")
-
-        passed=$(echo "$all_results" | grep -c "^PASS" || true)
-        failed=$(echo "$all_results" | grep -c "^FAIL" || true)
-        skipped=$(echo "$all_results" | grep -c "^SKIP" || true)
-        echo "fmt: ${passed} passed, ${failed} failed, ${skipped} skipped"
-        if [ "$failed" -gt 0 ]; then
-          echo "Failures:"
-          echo "$all_results" | grep "^FAIL" | sed 's/^/  /'
-          exit 1
-        fi
+      - task: __fmt-goldens
+        vars: { FMT_BLINKC: "{{.BLINKC}}" }
       - task: test-installed
       - task: __build-binaries-smoke
 
   ci-profile:
     desc: |
-      Measure wall-clock per phase of `task ci`. Re-runnable. Outputs:
+      Measure wall-clock per phase of `task ci-release`. Re-runnable. Outputs:
         build/ci-timings.<mode>.tsv          — one row per phase (cmd, elapsed_s, max_rss_kb, exit_code)
         .tmp/fmt-{golden,idem,sem}.<mode>.joblog — GNU parallel per-file timings
       Modes:
@@ -1141,7 +1224,7 @@ tasks:
       - sh: test -z "$(git status --porcelain)"
         msg: "Working directory must be clean. Commit or stash changes first."
     cmds:
-      - task: ci
+      - task: ci-release
       - task: build-binaries
       - git tag {{.CLI_ARGS}}
       - git push origin {{.CLI_ARGS}}

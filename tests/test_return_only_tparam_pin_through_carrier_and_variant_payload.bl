@@ -1,0 +1,49 @@
+import compile_test_helpers.{compile_and_run}
+
+// A return-only type param of a generic fn must be pinned from the declared type at the
+// call site even when that declared type names the generic instance THROUGH a carrier
+// (Option[RGT[Int]]) or a struct-style enum-variant payload (Tree[RGT[Int]]'s Leaf.value),
+// not only when it is named directly (RGT[Int]).
+
+type RGT[T] { s: Set[T] }
+fn mk[T]() -> RGT[T] { RGT { s: Set() } }
+
+test "a return-only type param pins through an Option carrier around the call site's declared type" {
+    let o: Option[RGT[Int]] = Some(mk())
+    match o {
+        Some(rgt) => {
+            let mut r = rgt
+            r.s.insert(256)
+            r.s.insert(512)
+            assert_eq(r.s.len(), 2)
+            assert(r.s.contains(256))
+        }
+        None => assert(false)
+    }
+}
+
+test.failing(
+    "a return-only type param pins through a struct-style enum-variant payload's declared field type",
+    reason: "tc_pin_admits_declared does not resolve a struct-style variant payload's declared field type, so the call inside the variant literal reaches monomorphization with the type param unsolved (ICE UnsolvedTypeVarAtCodegen)",
+    ticket: "sjh9xd",
+) {
+    let src = #"
+type RGT[T] { s: Set[T] }
+type Tree[T] { Leaf { value: T }, Branch { n: Int } }
+fn mk[T]() -> RGT[T] { RGT { s: Set() } }
+fn main() ! IO {
+    let t: Tree[RGT[Int]] = Leaf { value: mk() }
+    match t {
+        Leaf { value } => {
+            let mut r = value
+            r.s.insert(256)
+            io.println("{r.s.len()} {r.s.contains(256)}")
+        }
+        Branch { n: _n } => io.println("branch")
+    }
+}
+"#
+    let r = compile_and_run(src, "_return_only_tparam_pin_variant_payload")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "1 true\n")
+}

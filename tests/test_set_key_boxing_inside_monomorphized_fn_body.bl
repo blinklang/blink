@@ -1,0 +1,60 @@
+import compile_test_helpers.{compile_and_run}
+
+// A Set/Map key insert or lookup inside a MONOMORPHIZED fn body must box the key through
+// the runtime's `const void*` ABI using the mono context's substituted element type, not
+// the def-side typevar-bearing annotation.
+
+fn wrap_tuple_key[T](x: T) -> Set[(T, Int)] {
+    let mut s: Set[(T, Int)] = Set()
+    s.insert((x, 2))
+    s
+}
+
+test "a bare tuple-of-typevar Set element inside a monomorphized fn body boxes and round-trips" {
+    let s: Set[(Int, Int)] = wrap_tuple_key(1)
+    assert(s.contains((1, 2)))
+}
+
+test.failing(
+    "a bare typevar Set element reached through a generic-struct field boxes inside a monomorphized fn body",
+    reason: "codegen skips the boxing temp for a bare-typevar Set element inside a monomorphized fn body, passing the scalar where the runtime expects a boxed pointer, so the emitted C declares the boxing temp void",
+    ticket: "vc40w6",
+) {
+    let src = #"
+type GT[T] { s: Set[T] }
+fn wrap[T](x: T) -> GT[T] {
+    let mut e: GT[T] = GT { s: Set() }
+    e.s.insert(x)
+    e
+}
+fn main() ! IO {
+    let g: GT[Int] = wrap(1)
+    io.println("{g.s.contains(1)}")
+}
+"#
+    let r = compile_and_run(src, "_set_key_boxing_mono_struct_field_scalar")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "true\n")
+}
+
+test.failing(
+    "a tuple-over-typevar Set element reached through a generic-struct field boxes inside a monomorphized fn body",
+    reason: "codegen skips the boxing temp for a tuple-over-typevar Set element inside a monomorphized fn body, passing the tuple by value where the runtime expects a boxed pointer, so the emitted C declares the boxing temp void",
+    ticket: "vc40w6",
+) {
+    let src = #"
+type GT[T] { s: Set[T] }
+fn wrap[T](x: T) -> GT[(T, Int)] {
+    let mut e: GT[(T, Int)] = GT { s: Set() }
+    e.s.insert((x, 2))
+    e
+}
+fn main() ! IO {
+    let g: GT[(Int, Int)] = wrap(1)
+    io.println("{g.s.contains((1, 2))}")
+}
+"#
+    let r = compile_and_run(src, "_set_key_boxing_mono_struct_field_tuple")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "true\n")
+}

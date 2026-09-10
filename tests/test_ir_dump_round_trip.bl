@@ -1,0 +1,119 @@
+import std.io
+import ir.{
+    IrKind, ir_new, ir_kid, ir_reset, ir_node_count, ir_dump, ir_parse, ir_verify, ir_mark_materialize, ir_kind, ir_kind_name,
+    ir_kid_count, ir_kids, ir_c_name, ir_c_spelling, ir_must_materialize,
+    ir_const, ir_var_ref, ir_binary, ir_call_runtime, ir_carrier_wrap, ir_carrier_unwrap, ir_field_get,
+    ir_let, ir_assign, ir_expr_stmt, ir_return, ir_if, ir_loop, ir_break, ir_block, ir_switch, ir_unreachable,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+import codegen_expr
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}:\n--- got\n{got}\n--- want\n{want}") }
+    assert_eq(got, want)
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn int_const(text: Str) -> Int { ir_const(1, 0, "int64_t", text) }
+fn int_var(name: Str) -> Int { ir_var_ref(1, 0, "int64_t", name, SlotForm.InlineWord) }
+
+
+test "a leaf dumps as one line with every field in a fixed order" {
+    ir_reset()
+    let c = ir_const(1, 7, "int64_t", "42")
+    assert_eq_str("leaf", ir_dump(c), "(Const 1 7 InlineWord 0 \"int64_t\" \"42\")")
+}
+
+test "a tree dumps with kids indented by two spaces per depth" {
+    ir_reset()
+    let sum = ir_binary(1, 9, "int64_t", "+", ir_const(1, 7, "int64_t", "1"), ir_var_ref(1, 8, "int64_t", "x", SlotForm.InlineWord))
+    let l = ir_let(1, 10, "int64_t", "y", SlotForm.InlineWord, sum)
+    let want = [
+        "(Let 1 10 InlineWord 0 \"int64_t\" \"y\"",
+        "  (Binary 1 9 InlineWord 0 \"int64_t\" \"+\"",
+        "    (Const 1 7 InlineWord 0 \"int64_t\" \"1\")",
+        "    (VarRef 1 8 InlineWord 0 \"int64_t\" \"x\")))",
+    ].join("\n")
+    assert_eq_str("tree", ir_dump(l), want)
+}
+
+test "quotes, backslashes and newlines in a literal are escaped and restored" {
+    ir_reset()
+    let s = ir_const(2, 1, "blink_str*", "\"a\\b\"\n")
+    let text = ir_dump(s)
+    assert_eq_str("escaped", text, "(Const 2 1 InlineWord 0 \"blink_str*\" \"\\\"a\\\\b\\\"\\n\")")
+    let back = ir_parse(text)
+    assert_eq_str("literal restored", ir_c_name(back), "\"a\\b\"\n")
+    assert_eq_str("re-dump is stable", ir_dump(back), text)
+}
+
+fn build_fn_body() -> Int {
+    let opt = ir_var_ref(8, 20, "blink_Option_int", "o", SlotForm.Inline)
+    ir_mark_materialize(opt)
+    let tag = ir_carrier_wrap(8, 21, "blink_Option_int", "value", int_const("1"), int_const("5"))
+    let l = ir_let(8, 22, "blink_Option_int", "o", SlotForm.Inline, tag)
+    let un = ir_carrier_unwrap(1, 23, "int64_t", "value", SlotForm.InlineWord, opt)
+    let p = ir_var_ref(5, 24, "blink_Point*", "p", SlotForm.PointerBoxed)
+    let fx = ir_field_get(1, 25, "int64_t", "x", SlotForm.InlineWord, p)
+    let arm0 = ir_block(0, [ir_assign(26, int_var("r"), ir_binary(1, 27, "int64_t", "+", un, fx))])
+    let arm1 = ir_block(0, [ir_expr_stmt(28, ir_call_runtime(9, 28, "void", "blink_gc_collect", SlotForm.InlineWord, []))])
+    let sw = ir_switch(29, ir_field_get(1, 29, "int", "tag", SlotForm.InlineWord, opt), [int_const("0"), arm0, int_const("1"), arm1], ir_block(0, [ir_unreachable(30)]))
+    let lp = ir_loop(31, ir_block(0, [ir_if(32, ir_binary(3, 32, "int", "<", int_var("r"), int_const("10")), ir_block(0, [ir_break(33)]), -1), sw]))
+    ir_block(0, [ir_let(1, 34, "int64_t", "r", SlotForm.InlineWord, int_const("0")), l, lp, ir_return(35, int_var("r"))])
+}
+
+test "a hand-built function body round-trips through dump and parse" {
+    ir_reset()
+    let root = build_fn_body()
+    assert_eq_int("source verifies", ir_verify(root).len(), 0)
+    let text = ir_dump(root)
+    let before = ir_node_count()
+    let back = ir_parse(text)
+    assert_eq_int("parse allocates fresh nodes", if back >= before { 1 } else { 0 }, 1)
+    assert_eq_str("parsed root kind", ir_kind_name(ir_kind(back)), "Block")
+    assert_eq_int("parsed root kids", ir_kid_count(back), 4)
+    assert_eq_int("parsed tree verifies", ir_verify(back).len(), 0)
+    assert_eq_str("dump(parse(dump(t))) == dump(t)", ir_dump(back), text)
+}
+
+test "the dump is stable across arenas: the same tree built twice dumps the same text" {
+    ir_reset()
+    let a = ir_dump(build_fn_body())
+    ir_reset()
+    ir_const(1, 0, "int64_t", "pad")
+    let b = ir_dump(build_fn_body())
+    assert_eq_str("independent of node ids", a, b)
+}
+
+test "a shared node stays one node across the round trip: the dump labels it" {
+    ir_reset()
+    let shared = int_var("s")
+    ir_mark_materialize(shared)
+    let e = ir_expr_stmt(0, ir_binary(1, 0, "int64_t", "*", shared, shared))
+    let text = ir_dump(e)
+    assert_eq_str("labelled once, referenced once", text,
+        "(ExprStmt -1 0 Inline 0 \"\" \"\"\n  (Binary 1 0 InlineWord 0 \"int64_t\" \"*\"\n    (VarRef #0 1 0 InlineWord 1 \"int64_t\" \"s\")\n    #0))")
+    let back = ir_parse(text)
+    let binary = ir_kid(back, 0)
+    assert_eq_int("both kids are the same node", if ir_kid(binary, 0) == ir_kid(binary, 1) { 1 } else { 0 }, 1)
+    assert_eq_int("flag on the parsed kid", ir_must_materialize(ir_kid(binary, 0)), 1)
+    assert_eq_int("parsed tree verifies", ir_verify(back).len(), 0)
+    assert_eq_str("dump(parse(dump(t))) == dump(t)", ir_dump(back), text)
+}
+
+test "a dump of a malformed tree terminates and names the defect" {
+    ir_reset()
+    assert_eq_str("root out of range", ir_dump(7), "(out-of-range 7)")
+    let self_loop = ir_new(IrKind.Block, -1, 0, "", "", SlotForm.Inline, [ir_node_count()])
+    assert_eq_str("a cycle dumps as a label reference", ir_dump(self_loop), "(Block #0 -1 0 Inline 0 \"\" \"\"\n  #0)")
+    let dangling = ir_new(IrKind.Block, -1, 0, "", "", SlotForm.Inline, [99])
+    assert_eq_str("a kid out of range is named", ir_dump(dangling), "(Block -1 0 Inline 0 \"\" \"\"\n  (out-of-range 99))")
+    assert_eq_int("a forward label reference is malformed", ir_parse("(Block #0 -1 0 Inline 0 \"\" \"\"\n  #0)"), -1)
+}

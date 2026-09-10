@@ -63,11 +63,12 @@ affected by the per-module *program* emit path.
 
 ### 4. CI gate restructure
 
-- `task ci` is the canonical gate. It runs **`ci-monolith`** (full
+- `task ci-release` (named `task ci` until the codegen rewrite) is the
+  canonical release gate. It runs **`ci-monolith`** (full
   monolith verification: regen bootstrap + all tests + fmt + installed
   smoke + cross-compile smoke) **and** **`ci-per-module-checks`** (the
-  four per-module invariants). So `task ci` covers all four invariants
-  by construction.
+  four per-module invariants). So `task ci-release` covers all four
+  invariants by construction.
 - `task ci-monolith` is the legacy monolith-only verification, kept green
   as a standalone fallback so a codegen regression can be bisected
   against single-TU output.

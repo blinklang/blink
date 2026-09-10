@@ -4,6 +4,15 @@
 It reads the interned type tree (`ty_pool`) and the type declaration nodes.
 It does not read a codegen table, a flat CT code or a type-name string.
 
+It decides storage only. It spells no C symbol name of its own: every nominal C name,
+carrier tag, typedef guard, handler vtable name and kops table name comes from
+`cname.bl` (`c_typedef_name`, `c_type_decl_name`, `c_seg_inner`, `c_vtable_type_name`,
+`c_kops_table_name`, `td_guard_*`). The C spellings of the fixed runtime kinds
+(`int64_t`, `blink_list*`, ...) are layout facts and stay here. A name cname refuses
+(an `ICE_SEG_*` sentinel) is a decline in `layout_of`; a refused carrier tag is an
+empty `carrier_tag`. The import edge is one way: layout imports cname, cname never
+imports layout or an emitter. `scripts/lint_import_dag.sh` asserts both.
+
 ## The eight questions
 
 | Function | Answer |
@@ -14,11 +23,28 @@ It does not read a codegen table, a flat CT code or a type-name string.
 | `child_tid(tid, slot: Slot) -> Int` | A child tid by role: `Inner1`, `Inner2`, `Param(i)`, `Elem(i)`. `-1` when the kind has no such slot. |
 | `tid_of_node(node) -> Int ! Diag.Report` | The recorded tid of an AST node. Raises `I0001` and answers `-1` on a node with no type. Never a default. |
 | `tid_of_binder(scope, name) -> Int` | The tid bound to a name, walking parent scopes. `-1` when unbound. |
-| `nominal_name_of(tid) -> Str` | The bare declared name of a struct or enum. `""` for every structural type. |
+| `nominal_name_of(tid) -> Str` | The declared name of a struct or enum, read from its declaration node. `""` for every structural type and when the declaration is missing or ambiguous. |
 | `layout_of(tid, position) -> LayoutRecord` | All of the above in one record. Total, pure, memoised on `(tid, position)`. |
+| `field_layout_of(owner_decl, field_tid) -> LayoutRecord` | A field in its owner. See "Self-recursive fields". |
 
 `LayoutRecord` fields: `c_spelling`, `slot_form`, `carrier_tag`, `is_transparent`,
-`boxed_selfrec`, `kops_table`, `decline_reason`.
+`kops_table`, `decline_reason`.
+
+## Self-recursive fields
+
+Whether a variant field is boxed because it reaches its own enum is a relation between
+the owner and the field, not a fact about the field's tid: `Tree[Int]` is boxed inside
+`Tree` and held by value inside `Holder { t: Tree[Int] }`. So it is not a
+`LayoutRecord` field. `field_layout_of(owner_decl, field_tid)` answers it:
+
+- The field is the owner itself (bare or any instance of it), or a tuple that reaches
+  the owner at any depth: `PointerBoxed`, spelled `int64_t`. The owner's C typedef is
+  incomplete while its own members are declared, so the member is an opaque word that
+  holds the heap pointer.
+- The field's declaration is ambiguous (`DECL_NODE_AMBIGUOUS`): a decline.
+- Anything else: `layout_of(field_tid, Position.Field)`.
+
+The comparison is on declaration nodes through `tc_tid_decl_node`, never on a name.
 
 ## Position
 
@@ -53,7 +79,12 @@ The caller that needs a spelling turns a decline into `I0001`.
 ## Side effects and state
 
 - `layout_memo` caches `layout_of` answers. `layout_reset()` clears every table;
-  call it after `check_types`, because the pool is rebuilt.
+  call it after `check_types`, because the pool is rebuilt. It also calls
+  `cname_reset()` and re-marks the two declaration facts cname reads
+  (`cname_mark_transparent_newtype`, `cname_mark_runtime_owned`). Until an annotation
+  or typecheck owns those facts, this marking pass is their interim owner and the only
+  place a type is known by its name (`Errno` with one `Int` variant; `ConversionError`
+  and `ProcessResult`).
 - `ensure_typedef_for` appends to an append-only buffer. Each block is wrapped in
   `#ifndef BLINK_TD_<name>` / `#define` / `#endif`. `layout_take_typedefs()` drains
   the buffer in emit order.
@@ -78,4 +109,5 @@ has no nominal name.
   `ok` is by value. A struct (not enum) `err` is `<err>*`. `Void` is `int64_t`.
   `blink_Result_str_str` comes from the runtime header and is not re-emitted.
 - Tuple: one field per element, by value, `Void` as `int64_t`. A transparent newtype
-  element is named `int` in the tuple tag, because it lowers to a bare `int64_t`.
+  element is named `int` in the tuple tag, because it lowers to a bare `int64_t`
+  (cname reads the transparent mark for that).

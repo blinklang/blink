@@ -1,0 +1,70 @@
+// Golden names for the runtime symbols cname.bl spells from a tid: the handler
+// vtable struct and the key-operations table. Expected bytes come from the pinned
+// compiler's C and from runtime_core.h.
+
+import typecheck.{tc_type_decl_nodes}
+import diagnostics.{diag_is_ice_seg}
+import cname.{c_vtable_type_name, c_kops_table_name, cname_mark_transparent_newtype, cname_is_transparent_newtype, cname_mark_runtime_owned, cname_is_runtime_owned, cname_reset}
+import cname_test_helpers.{assert_eq_str, tid_of, compile_probe}
+import std.io
+// Pulls the lowering layer into the program; compile_to_program needs it linked.
+import codegen_expr
+
+fn probe_src() -> Str {
+    #"@derive(Hash, Eq)
+type Key { id: Int }
+type Point { x: Int, y: Int }
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str)
+    }
+}
+fn main() {
+    let k = Key { id: 1 }
+    let p = Point { x: 1, y: 2 }
+    let i: Int = 1
+    let s: Str = "s"
+    let c: Char = 'c'
+    let u: U8 = 1
+    let h: Handler[IO] = handler IO { fn print(_m: Str) {} }
+    let hm: Handler[Metrics] = handler Metrics {
+        fn counter(_name: Str) {}
+    }
+    let l: List[Int] = []
+    io.println("{k.id} {p.x} {i} {s} {c} {u} {l.len()}")
+}
+"#
+}
+
+test "builtin effect handlers share the runtime vtable of their root effect" {
+    let m = compile_probe("cname_runtime_symbols", probe_src())
+    assert_eq_str("IO", c_vtable_type_name(tid_of(m, "Handler[IO]")), "blink_io_vtable")
+    assert_eq_str("Metrics", c_vtable_type_name(tid_of(m, "Handler[Metrics]")), "blink_ue_metrics_vtable")
+    assert(diag_is_ice_seg(c_vtable_type_name(tid_of(m, "Int"))))
+}
+
+test "kops tables: runtime table per scalar, kops_<C name> per nominal" {
+    let m = compile_probe("cname_runtime_symbols", probe_src())
+    assert_eq_str("Int", c_kops_table_name(tid_of(m, "Int")), "blink_kops_i64")
+    assert_eq_str("Str", c_kops_table_name(tid_of(m, "Str")), "blink_kops_str")
+    assert_eq_str("Char", c_kops_table_name(tid_of(m, "Char")), "blink_kops_char")
+    assert_eq_str("U8", c_kops_table_name(tid_of(m, "U8")), "blink_kops_u8")
+    assert_eq_str("Key", c_kops_table_name(tid_of(m, "Key")), "kops_blink_Key")
+    assert_eq_str("Point", c_kops_table_name(tid_of(m, "Point")), "kops_blink_Point")
+    assert(diag_is_ice_seg(c_kops_table_name(tid_of(m, "List[Int]"))))
+}
+
+test "marks read back and clear with cname_reset" {
+    let _ = compile_probe("cname_runtime_symbols", probe_src())
+    let td = tc_type_decl_nodes.get("Point") ?? -1
+    assert(td >= 0)
+    assert(!cname_is_transparent_newtype(td))
+    assert(!cname_is_runtime_owned(td))
+    cname_mark_transparent_newtype(td)
+    cname_mark_runtime_owned(td)
+    assert(cname_is_transparent_newtype(td))
+    assert(cname_is_runtime_owned(td))
+    cname_reset()
+    assert(!cname_is_transparent_newtype(td))
+    assert(!cname_is_runtime_owned(td))
+}
