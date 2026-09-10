@@ -34,11 +34,13 @@ Build CLI: `task build-cli` — produces `build/blink`
 Test: `task test` — compile+run all test_*.bl in tests/
 Test formatter: `task test-fmt` — golden outputs + idempotency + semantic checks
 Single test: `task compile-test -- test_name`
-Verify: `task ci` — regen + test + test-fmt. Always run after compiler changes
+Rewrite gate: `task ci` — gen0 compiles src (gen1) + corpus monotone + lint + fmt goldens + typecheck suite. Run after every change during the codegen rewrite. See docs/codegen-rewrite/harness.md
+Release gate: `task ci-release` — regen + test + test-fmt + per-module invariants. Run at release points
+Corpus: `task corpus` — every tests/test_*.bl compiled+run on its own under the pinned gen0; result in build/corpus.json; `task corpus-check` gates it against scripts/corpus_baseline.json
 Quick run: `build/blink run <file.bl>` — compiles and runs in one step. Prefer this over manual blinkc+cc
 Low-level (dev): `build/blinkc <file.bl> <output.c>` then `cc -o <binary> <output.c> -lm`
 Archive-linked (dev): `build/blinkc --link-archive build/libblink_std.h <file.bl> <out.c>` then `cc -o <bin> <out.c> -Ibuild build/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections`
-After modifying compiler sources: `task regen` then `task ci` to verify
+After modifying compiler sources: `task ci` during the rewrite; `task regen` then `task ci-release` at release points
 
 ## Debugging
 

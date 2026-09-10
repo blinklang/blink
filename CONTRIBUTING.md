@@ -46,8 +46,9 @@ build/blink check examples/hello.bl
 After modifying compiler sources, regenerate and verify:
 
 ```sh
-task regen    # regenerate bootstrap C from source + verify
-task ci       # full CI: regen + test + test-fmt
+task ci           # rewrite gate: gen0 compiles src, corpus monotone, lint, fmt goldens
+task regen        # regenerate bootstrap C from source + verify (release points)
+task ci-release   # full CI: regen + test + test-fmt (release points)
 ```
 
 ## Tests
@@ -55,7 +56,8 @@ task ci       # full CI: regen + test + test-fmt
 ```sh
 task test         # compile+run all test_*.bl in tests/
 task test-fmt     # formatter golden outputs + idempotency
-task ci           # full verification (regen + test + test-fmt)
+task corpus       # every test file compiled+run on its own under the pinned gen0
+task ci-release   # full verification (regen + test + test-fmt)
 ```
 
 ## Architecture
