@@ -1,0 +1,53 @@
+// A block-scoped `let` that shadows an outer Map/Set with a different key or
+// element type must not poison the outer binding's key/element type reader
+// after the block ends. The runtime pointer resolves correctly via C block
+// scoping, but the map-key and set-element type readers walk scope_vars
+// top-down and can hit the shadowing (inner) entry instead of the binding
+// actually in scope at the outer read site.
+
+import compile_test_helpers.{compile_and_run}
+
+test.failing(
+    "an outer Map/Set is read with its own key/element type after an inner block shadows it with a different one",
+    reason: "get_map_key_type/get_map_key_struct and get_set_elem_type/get_set_elem_struct walk scope_vars without honoring block-scope boundaries, so a same-named inner-block Map/Set with a different key or element type poisons the outer read site's key/element temp after the block ends -- for structs this is a cc-error (invalid initializer), for scalars it is a silent wrong answer",
+    ticket: "se3bxk",
+) {
+    let map_src = #"
+import std.io
+
+@derive(Hash, Eq)
+type Point { x: Int, y: Int }
+
+fn main() ! IO {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("s", 3)
+    if true {
+        let mut m: Map[Point, Int] = Map()
+        m.insert(Point { x: 1, y: 2 }, 42)
+        io.println("inner={m.get(Point { x: 1, y: 2 }).unwrap()}")
+    }
+    io.println("outer={m.get(\"s\").unwrap()}")
+}
+"#
+    let map_r = compile_and_run(map_src, "_block_scope_shadow_map_key_type")
+    assert(map_r.exit_code == 0, "map case: compile or run failed: {map_r.out}{map_r.err_out}")
+    assert(map_r.out.contains("outer=3"), "map case: unexpected output: {map_r.out}")
+
+    let set_src = #"
+import std.io
+
+fn main() ! IO {
+    let mut s: Set[Str] = Set()
+    s.insert("a")
+    if true {
+        let mut s: Set[Int] = Set()
+        s.insert(7)
+        io.println("inner={s.contains(7)}")
+    }
+    io.println("outer={s.contains(\"a\")}")
+}
+"#
+    let set_r = compile_and_run(set_src, "_block_scope_shadow_set_elem_type")
+    assert(set_r.exit_code == 0, "set case: compile or run failed: {set_r.out}{set_r.err_out}")
+    assert(set_r.out.contains("outer=true"), "set case: outer set lookup returned wrong answer after shadowing block: {set_r.out}")
+}
