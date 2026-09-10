@@ -1,0 +1,37 @@
+// A match in VALUE position, used as a struct-literal field's initializer, where
+// every arm of the match diverges (returns), gets its result-temp's C type from
+// get_fn_ret_struct(cg_current_fn_name) instead of from the field it initializes.
+// When the enclosing function's own return type happens to be a struct, the temp
+// is wrongly declared with THAT struct type instead of the field's scalar type,
+// and the consuming initializer fails to compile in C. This only manifests when
+// the enclosing fn returns a struct; the same match tail inside a -> Int fn
+// compiles fine, which is what pins the fault to the struct-name fallback rather
+// than to match-arm divergence analysis itself.
+//
+// Distinct from tests/test_diverging_tail_codegen_backstop.bl's "a match whose
+// arms all return also gets the unreachable marker" row, which puts the
+// all-diverging match directly at the FUNCTION's own tail (matching the fn's own
+// return type), not nested inside a struct-literal field whose type differs from
+// the enclosing fn's return type.
+
+import compile_test_helpers.{compile_and_run}
+
+test.failing(
+    "an all-arms-diverge match used as a struct-literal field value compiles",
+    reason: "emit_match_expr's struct-name fallback (src/codegen_stmt.bl around line 1356) takes the match result-temp's type from get_fn_ret_struct(cg_current_fn_name) rather than from the field context that consumes it, so a struct-returning enclosing fn makes the temp declared with the WRONG struct type and the C compiler rejects the field initializer",
+    ticket: "4zzh8n",
+) {
+    let src = #"
+import std.io
+
+type P { a: Int, b: Int }
+fn g(n: Int) -> P {
+    P { a: match n { 0 => return P { a: 1, b: 1 }
+                     _ => return P { a: 2, b: 2 } }, b: 3 }
+}
+fn main() { let p = g(0)  io.println("a={p.a}") }
+"#
+    let r = compile_and_run(src, "_all_arms_diverge_match_in_struct_field_value")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "a=1\n")
+}
