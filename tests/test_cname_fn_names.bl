@@ -1,0 +1,135 @@
+// Golden names for the function and global forms cname.bl produces.
+//
+// Every expected string below was read from the C the pinned compiler emits
+// (`blink build --emit c`) for the same probe source. The rows prove that
+// cname.bl, reading only the declaration node and the type ids, spells the
+// same bytes. A probe is compiled per row group so a row never depends on
+// which other row ran first.
+
+import typecheck.{make_tuple_type}
+
+import compiler.{compile_to_program}
+import ast.{NodeKind}
+import cname.{c_fn_decl_name, c_global_name, c_mono_fn_name}
+import cname_test_helpers.{assert_eq_str, find_decl, tid_of, compile_probe, compile_pkg_probe}
+import std.io
+// Pulls the lowering layer into the program; compile_to_program needs it linked.
+import codegen_expr
+
+fn single_probe_src() -> Str {
+    #"type Point { x: Int, y: Int }
+type Box[T] { v: T }
+type My_Box[T] { v: T }
+type Shape {
+    Circle(r: Int)
+    Rect(w: Int, h: Int)
+}
+type Tree[T] {
+    Leaf
+    Node(v: T)
+}
+fn tree_len(t: Tree[Int]) -> Int { 0 }
+let counter: Int = 5
+fn helper(a: Int) -> Int { a + 1 }
+fn identity[T](x: T) -> T { x }
+fn my_fn[T](x: T) -> T { x }
+@trusted
+@ffi("libc", "getpid")
+fn getpid() -> Int ! FFI
+fn main() {
+    let b: Box[Int] = Box { v: 1 }
+    let mb: My_Box[Int] = My_Box { v: 1 }
+    let bo: Box[Option[Int]] = Box { v: Some(1) }
+    let t: Tree[Int] = Tree.Node(1)
+    let _tl = tree_len(t)
+    let o: Option[Int] = Some(1)
+    let tu: (Int, Str) = (1, "a")
+    let tu3: ((Int, Int), Char) = ((1, 2), 'a')
+    let f: Float = 1.5
+    let bl: Bool = true
+    let s = Shape.Rect(1, 2)
+    let i1 = identity(1)
+    let m1 = my_fn(1)
+    io.println("{helper(counter)} {i1} {m1} {getpid()}")
+}
+"#
+}
+
+fn mymod_src() -> Str {
+    #"pub type Ngx { n: Int }
+pub type Box2[T] { v: T }
+pub type My_Box2[T] { v: T }
+pub type Kind {
+    Aa
+    Bb(v: Int)
+}
+pub let mod_counter: Int = 3
+pub fn ping(a: Int) -> Int { a }
+pub fn wrap[T](x: T) -> T { x }
+"#
+}
+
+fn pkg_main_src() -> Str {
+    #"import mymod.{Ngx, Box2, My_Box2, Kind, ping, wrap, mod_counter}
+fn main() {
+    let n = Ngx { n: 1 }
+    let b: Box2[Int] = Box2 { v: 1 }
+    let mb: My_Box2[Str] = My_Box2 { v: "s" }
+    let k = Kind.Bb(1)
+    let w1 = wrap(1)
+    io.println("{ping(1)} {mod_counter} {w1}")
+}
+"#
+}
+
+test "main-module fn is blink_u_<name>; main stays blink_main" {
+    let _m = compile_probe("cname_fn_names", single_probe_src())
+    assert_eq_str("helper", c_fn_decl_name(find_decl(NodeKind.FnDef, "helper", "")), "blink_u_helper")
+    assert_eq_str("main", c_fn_decl_name(find_decl(NodeKind.FnDef, "main", "")), "blink_main")
+}
+
+test "@ffi fn keeps its bare symbol under blink_" {
+    let _m = compile_probe("cname_fn_names", single_probe_src())
+    assert_eq_str("getpid", c_fn_decl_name(find_decl(NodeKind.FnDef, "getpid", "")), "blink_getpid")
+}
+
+test "module fn is blink_<module>_<name>" {
+    let _m = compile_pkg_probe("cname_fn_names", "cnamefn", mymod_src(), pkg_main_src())
+    assert_eq_str("ping", c_fn_decl_name(find_decl(NodeKind.FnDef, "ping", "mymod")), "blink_mymod_ping")
+}
+
+test "top-level let keeps its bare name in every module" {
+    let _m = compile_probe("cname_fn_names", single_probe_src())
+    assert_eq_str("counter", c_global_name(find_decl(NodeKind.LetBinding, "counter", "")), "counter")
+    let _p = compile_pkg_probe("cname_fn_names", "cnamefn", mymod_src(), pkg_main_src())
+    assert_eq_str("mod_counter", c_global_name(find_decl(NodeKind.LetBinding, "mod_counter", "mymod")), "mod_counter")
+}
+
+test "mono fn instance: escaped base, _0 per arg, TOP-position segments" {
+    let m = compile_probe("cname_fn_names", single_probe_src())
+    let id = find_decl(NodeKind.FnDef, "identity", "")
+    let myfn = find_decl(NodeKind.FnDef, "my_fn", "")
+    let int_t = tid_of(m, "Int")
+    assert_eq_str("identity[Int]", c_mono_fn_name(id, make_tuple_type([int_t])), "blink_identity_0Int")
+    assert_eq_str("identity[Str]", c_mono_fn_name(id, make_tuple_type([tid_of(m, "Str")])), "blink_identity_0Str")
+    assert_eq_str("identity[Float]", c_mono_fn_name(id, make_tuple_type([tid_of(m, "Float")])), "blink_identity_0Float")
+    assert_eq_str("identity[Bool]", c_mono_fn_name(id, make_tuple_type([tid_of(m, "Bool")])), "blink_identity_0Bool")
+    assert_eq_str("my_fn[Int]", c_mono_fn_name(myfn, make_tuple_type([int_t])), "blink_my_1fn_0Int")
+    assert_eq_str("identity[Box[Int]]", c_mono_fn_name(id, make_tuple_type([tid_of(m, "Box[Int]")])), "blink_identity_0Box_10Int")
+    assert_eq_str("identity[My_Box[Int]]", c_mono_fn_name(id, make_tuple_type([tid_of(m, "My_Box[Int]")])), "blink_identity_0My_11Box_10Int")
+    assert_eq_str("identity[Option[Int]]", c_mono_fn_name(id, make_tuple_type([tid_of(m, "Option[Int]")])), "blink_identity_0Option_1int")
+    assert_eq_str("identity[Shape]", c_mono_fn_name(id, make_tuple_type([tid_of(m, "Shape")])), "blink_identity_0Shape")
+    assert_eq_str("identity[Tree[Int]]", c_mono_fn_name(id, make_tuple_type([tid_of(m, "Tree[Int]")])), "blink_identity_0Tree_10Int")
+    assert_eq_str("identity[(Int, Str)]", c_mono_fn_name(id, make_tuple_type([tid_of(m, "(Int, Str)")])), "blink_identity_0Tuple2_1int_1str")
+    assert_eq_str("identity[((Int, Int), Char)]", c_mono_fn_name(id, make_tuple_type([tid_of(m, "((Int, Int), Char)")])), "blink_identity_0Tuple2_1Tuple2_1int_1int_1char")
+}
+
+test "mono fn instance of a module fn carries no module prefix; struct args do" {
+    let m = compile_pkg_probe("cname_fn_names", "cnamefn", mymod_src(), pkg_main_src())
+    let wrap = find_decl(NodeKind.FnDef, "wrap", "mymod")
+    assert_eq_str("wrap[Int]", c_mono_fn_name(wrap, make_tuple_type([tid_of(m, "Int")])), "blink_wrap_0Int")
+    assert_eq_str("wrap[Ngx]", c_mono_fn_name(wrap, make_tuple_type([tid_of(m, "Ngx")])), "blink_wrap_0Ngx")
+    assert_eq_str("wrap[Kind]", c_mono_fn_name(wrap, make_tuple_type([tid_of(m, "Kind")])), "blink_wrap_0Kind")
+    assert_eq_str("wrap[Box2[Int]]", c_mono_fn_name(wrap, make_tuple_type([tid_of(m, "Box2[Int]")])), "blink_wrap_0mymod_11Box2_10Int")
+    assert_eq_str("wrap[My_Box2[Str]]", c_mono_fn_name(wrap, make_tuple_type([tid_of(m, "My_Box2[Str]")])), "blink_wrap_0mymod_11My_11Box2_10Str")
+}
