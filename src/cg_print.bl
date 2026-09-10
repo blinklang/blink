@@ -1,0 +1,577 @@
+// cg_print.bl: the C printer. It walks the IR and writes C through cg_emit.
+//
+// The printer decides C syntax, parenthesisation, statement order inside a block, temporary
+// names and whether a value node prints inline or binds a temporary first. It never asks a
+// type question: it imports no typecheck, layout, mono, ast or cname, branches on no TyKind
+// and reads no ty_pool. Its only type-shaped input is whether a value is held by pointer.
+//
+// Inline rule. A value node prints inline into its parent unless must_materialize is set, in
+// which case it is bound to a temporary once and every later reach prints the temporary.
+// Lowering sets the flag for effectful nodes and shared nodes and for nothing else, so the
+// C keeps the nested expression shape gcc -O2 already handles well.
+//
+// Every kind is handled by an exhaustive match. A statement kind in value position or a
+// value kind in statement position is an ICE, never a silent skip.
+
+import cg_emit.{
+    em_reset, em_reset_temps, em_line, em_temp, em_take, em_indent_push, em_indent_pop,
+    em_prologue, em_epilogue, em_fn_decl, em_fn_open, em_fn_close, closure_thunk_params,
+    em_global_decl, em_td_guard_open, em_td_guard_close, em_struct_typedef_body, em_tuple_typedef_body, em_simple_enum_typedef_body,
+    em_tagged_enum_typedef_body, em_tag_macro, em_option_typedef_body, em_result_typedef_body,
+    em_effect_vtable_typedef_body, em_effect_default_vtable, em_ev_typedef_body, em_ev_default_fn,
+    em_scope_restore_support, em_main_shim,
+}
+import ir.{
+    IrKind, ir_kind, ir_kind_name, ir_span, ir_c_spelling, ir_c_name, ir_held_by_pointer, ir_must_materialize,
+    ir_kid_count, ir_kid, ir_kids,
+}
+import diagnostics.{diag_ice, MISPLACED_IR_KIND_AT_PRINT}
+
+// A materialised node's temporary, so a second reach prints the same name.
+let mut materialized: Map[Int, Str] = Map()
+
+pub fn print_reset() {
+    em_reset()
+    materialized.clear()
+}
+
+pub fn print_take() -> Str { em_take() }
+
+// ── Values ───────────────────────────────────────────────────────────────────
+
+pub fn print_expr(id: Int) -> Str ! Diag.Report {
+    match materialized.get(id) {
+        Some(t) => return t
+        None => {}
+    }
+    let text = expr_text(id)
+    // A kind that binds its own temporary has registered it during expr_text.
+    match materialized.get(id) {
+        Some(t) => return t
+        None => {}
+    }
+    if ir_must_materialize(id) == 0 { return text }
+    bind_temp(id, "_t", text)
+}
+
+fn bind_temp(id: Int, prefix: Str, text: Str) -> Str {
+    let tmp = em_temp(prefix)
+    em_line("{ir_c_spelling(id)} {tmp} = {text};")
+    materialized.insert(id, tmp)
+    tmp
+}
+
+// A value the printer must read more than once binds first unless it is already a name.
+fn name_or_bind(id: Int, prefix: Str) -> Str ! Diag.Report {
+    let text = print_expr(id)
+    if is_name(id) || materialized.contains_key(id) { return text }
+    bind_temp(id, prefix, text)
+}
+
+// An lvalue prints in place even when a read of the same node bound a temporary: a store
+// into the temporary would land in a copy.
+fn lvalue_text(id: Int) -> Str ! Diag.Report { expr_text(id) }
+
+fn expr_text(id: Int) -> Str ! Diag.Report {
+    match ir_kind(id) {
+        IrKind.Const => ir_c_name(id)
+        IrKind.VarRef => ir_c_name(id)
+        IrKind.GlobalRef => ir_c_name(id)
+        IrKind.Unary => "({ir_c_name(id)}{print_expr(ir_kid(id, 0))})"
+        IrKind.Binary => binary_text(id)
+        IrKind.Cast => "(({ir_c_spelling(id)})({print_expr(ir_kid(id, 0))}))"
+        IrKind.FieldGet => "{print_expr(ir_kid(id, 0))}{access(ir_kid(id, 0))}{ir_c_name(id)}"
+        IrKind.StructNew => compound_literal(id)
+        IrKind.TupleNew => compound_literal(id)
+        IrKind.ContainerNew => container_new_text(id)
+        IrKind.Box => box_text(id)
+        IrKind.Unbox => "(*({print_expr(ir_kid(id, 0))}))"
+        IrKind.CarrierWrap => carrier_wrap_text(id)
+        IrKind.CarrierUnwrap => "{print_expr(ir_kid(id, 0))}{access(ir_kid(id, 0))}{ir_c_name(id)}"
+        IrKind.CarrierTag => "{print_expr(ir_kid(id, 0))}{access(ir_kid(id, 0))}tag"
+        IrKind.CallDirect => "{ir_c_name(id)}({args_text(id, 0)})"
+        IrKind.CallIndirect => call_indirect_text(id)
+        IrKind.CallClosure => call_closure_text(id)
+        IrKind.CallVirtual => call_virtual_text(id)
+        IrKind.CallRuntime => "{ir_c_name(id)}({args_text(id, 0)})"
+        IrKind.ClosureNew => closure_new_text(id)
+        IrKind.EffectPerform => "__ev->{ir_c_name(id)}({args_text(id, 0)})"
+        IrKind.FieldSet => misplaced(id, "value")
+        IrKind.HandlerInstall => misplaced(id, "value")
+        IrKind.Let => misplaced(id, "value")
+        IrKind.Assign => misplaced(id, "value")
+        IrKind.ExprStmt => misplaced(id, "value")
+        IrKind.Return => misplaced(id, "value")
+        IrKind.If => misplaced(id, "value")
+        IrKind.Loop => misplaced(id, "value")
+        IrKind.Break => misplaced(id, "value")
+        IrKind.Continue => misplaced(id, "value")
+        IrKind.Block => misplaced(id, "value")
+        IrKind.Switch => misplaced(id, "value")
+        IrKind.WithScope => misplaced(id, "value")
+        IrKind.Panic => misplaced(id, "value")
+        IrKind.Unreachable => misplaced(id, "value")
+    }
+}
+
+// Each operand is bound in its own statement, in source order, before the text is joined:
+// the holes of one interpolated string do not promise an evaluation order.
+fn binary_text(id: Int) -> Str ! Diag.Report {
+    let lhs = print_expr(ir_kid(id, 0))
+    let rhs = print_expr(ir_kid(id, 1))
+    "({lhs} {ir_c_name(id)} {rhs})"
+}
+
+fn call_indirect_text(id: Int) -> Str ! Diag.Report {
+    let callee = print_expr(ir_kid(id, 0))
+    let args = args_text(id, 1)
+    "({callee})({args})"
+}
+
+fn call_virtual_text(id: Int) -> Str ! Diag.Report {
+    let recv = ir_kid(id, 0)
+    let recv_text = print_expr(recv)
+    let args = args_text(id, 1)
+    "({recv_text}){access(recv)}{ir_c_name(id)}({args})"
+}
+
+fn misplaced(id: Int, wanted: Str) -> Str ! Diag.Report {
+    diag_ice("MisplacedIrKind", MISPLACED_IR_KIND_AT_PRINT,
+        "IR node {id} ({ir_kind_name(ir_kind(id))}, span {ir_span(id)}) reached the printer where a {wanted} is required",
+        0, 0, "run ir_verify on the tree before printing it")
+    "BLINK_I0003_misplaced_{ir_kind_name(ir_kind(id))}"
+}
+
+// A held pointer is reached through `->`; an inline value through `.`.
+fn access(obj: Int) -> Str {
+    if ir_held_by_pointer(obj) { "->" } else { "." }
+}
+
+fn args_text(id: Int, first: Int) -> Str ! Diag.Report {
+    let mut parts: List[Str] = []
+    let mut i = first
+    while i < ir_kid_count(id) {
+        parts.push(print_expr(ir_kid(id, i)))
+        i += 1
+    }
+    parts.join(", ")
+}
+
+fn compound_literal(id: Int) -> Str ! Diag.Report {
+    let body = if ir_kid_count(id) == 0 { "0" } else { args_text(id, 0) }
+    "(({ir_c_spelling(id)})\{{body}})"
+}
+
+fn carrier_wrap_text(id: Int) -> Str ! Diag.Report {
+    let tag = print_expr(ir_kid(id, 0))
+    if ir_kid_count(id) == 1 { return "(({ir_c_spelling(id)})\{.tag = {tag}})" }
+    "(({ir_c_spelling(id)})\{.tag = {tag}, .{ir_c_name(id)} = {print_expr(ir_kid(id, 1))}})"
+}
+
+// A heap copy needs two statements, so a Box always binds its pointer.
+fn box_text(id: Int) -> Str ! Diag.Report {
+    let value = print_expr(ir_kid(id, 0))
+    let tmp = bind_temp(id, "_box", "({ir_c_spelling(id)})blink_alloc(sizeof({ir_c_name(id)}))")
+    em_line("*{tmp} = {value};")
+    tmp
+}
+
+// The append symbol and its arity are a runtime convention keyed on the constructor
+// symbol; it is an ABI table, not a type test.
+fn container_append_symbol(ctor: Str) -> Str {
+    if ctor == "blink_list_new" { return "blink_list_push" }
+    if ctor == "blink_map_new" { return "blink_map_set" }
+    if ctor == "blink_set_new" { return "blink_set_insert" }
+    ""
+}
+
+fn container_append_arity(ctor: Str) -> Int {
+    if ctor == "blink_map_new" { 2 } else { 1 }
+}
+
+// blink_map_new and blink_set_new take a key-operations table the IR cannot yet carry, so a
+// map or set literal is reported rather than printed with a call that does not compile.
+fn container_new_text(id: Int) -> Str ! Diag.Report {
+    let ctor = ir_c_name(id)
+    let n = ir_kid_count(id)
+    let append = container_append_symbol(ctor)
+    if append == "" {
+        diag_ice("UnknownContainerCtor", MISPLACED_IR_KIND_AT_PRINT,
+            "ContainerNew node {id} names constructor '{ctor}' which has no append symbol", 0, 0,
+            "add the constructor to container_append_symbol in cg_print.bl")
+        return "BLINK_I0003_unknown_ctor_{ctor}"
+    }
+    if ctor != "blink_list_new" {
+        diag_ice("ContainerNewNeedsKops", MISPLACED_IR_KIND_AT_PRINT,
+            "ContainerNew node {id} calls {ctor}, which needs a key-operations table the IR has no slot for",
+            0, 0, "add the kops slot to ir.bl before lowering a map or set literal")
+        return "BLINK_I0003_missing_kops_{ctor}"
+    }
+    let arity = container_append_arity(ctor)
+    if n % arity != 0 {
+        diag_ice("ContainerNewKidCount", MISPLACED_IR_KIND_AT_PRINT,
+            "ContainerNew node {id} has {n} kids, not a multiple of {arity}", 0, 0,
+            "run ir_verify on the tree before printing it")
+        return "BLINK_I0003_odd_kids_{ctor}"
+    }
+    if n == 0 { return "{ctor}()" }
+    let tmp = bind_temp(id, "_c", "{ctor}()")
+    let mut i = 0
+    while i < n {
+        let mut parts: List[Str] = [tmp]
+        let mut j = 0
+        while j < arity {
+            parts.push(print_expr(ir_kid(id, i + j)))
+            j += 1
+        }
+        em_line("{append}({parts.join(", ")});")
+        i += arity
+    }
+    tmp
+}
+
+// The closure is read twice (fn_ptr and self argument), so anything but a name binds first.
+fn call_closure_text(id: Int) -> Str ! Diag.Report {
+    let cl_text = name_or_bind(ir_kid(id, 0), "_cl")
+    let rest = args_text(id, 1)
+    let sep = if rest == "" { "" } else { ", " }
+    "(({ir_c_name(id)}){cl_text}->fn_ptr)({cl_text}{sep}{rest})"
+}
+
+fn is_name(id: Int) -> Bool {
+    match ir_kind(id) {
+        IrKind.VarRef => true
+        IrKind.GlobalRef => true
+        _ => false
+    }
+}
+
+// Captures arrive already boxed to pointers by lowering. The record has no slot yet for
+// capture descriptors or a promoter, so both are NULL.
+fn closure_new_text(id: Int) -> Str ! Diag.Report {
+    let n = ir_kid_count(id)
+    let sym = "(void*){ir_c_name(id)}"
+    if n == 0 { return "blink_closure_new_typed({sym}, NULL, NULL, 0, NULL)" }
+    let caps = em_temp("_caps")
+    em_line("void** {caps} = (void**)blink_alloc(sizeof(void*) * {n});")
+    let mut i = 0
+    while i < n {
+        em_line("{caps}[{i}] = (void*){print_expr(ir_kid(id, i))};")
+        i += 1
+    }
+    bind_temp(id, "_cl", "blink_closure_new_typed({sym}, {caps}, NULL, {n}, NULL)")
+}
+
+// ── Statements ───────────────────────────────────────────────────────────────
+
+pub fn print_stmt(id: Int) ! Diag.Report {
+    match ir_kind(id) {
+        IrKind.FieldSet => print_field_set(id)
+        IrKind.HandlerInstall => print_handler_install(id)
+        IrKind.Let => print_let(id)
+        IrKind.Assign => print_assign(id)
+        IrKind.ExprStmt => print_expr_stmt(id)
+        IrKind.Return => print_return(id)
+        IrKind.If => print_if(id)
+        IrKind.Loop => print_braced("while (1)", ir_kid(id, 0))
+        IrKind.Break => em_line("break;")
+        IrKind.Continue => em_line("continue;")
+        IrKind.Block => print_braced("", id)
+        IrKind.Switch => print_switch(id)
+        IrKind.WithScope => print_with_scope(id)
+        IrKind.Panic => print_panic(id)
+        IrKind.Unreachable => em_line("__builtin_unreachable();")
+        IrKind.Const => stmt_misplaced(id)
+        IrKind.VarRef => stmt_misplaced(id)
+        IrKind.GlobalRef => stmt_misplaced(id)
+        IrKind.Unary => stmt_misplaced(id)
+        IrKind.Binary => stmt_misplaced(id)
+        IrKind.Cast => stmt_misplaced(id)
+        IrKind.FieldGet => stmt_misplaced(id)
+        IrKind.StructNew => stmt_misplaced(id)
+        IrKind.TupleNew => stmt_misplaced(id)
+        IrKind.ContainerNew => stmt_misplaced(id)
+        IrKind.Box => stmt_misplaced(id)
+        IrKind.Unbox => stmt_misplaced(id)
+        IrKind.CarrierWrap => stmt_misplaced(id)
+        IrKind.CarrierUnwrap => stmt_misplaced(id)
+        IrKind.CarrierTag => stmt_misplaced(id)
+        IrKind.CallDirect => stmt_misplaced(id)
+        IrKind.CallIndirect => stmt_misplaced(id)
+        IrKind.CallClosure => stmt_misplaced(id)
+        IrKind.CallVirtual => stmt_misplaced(id)
+        IrKind.CallRuntime => stmt_misplaced(id)
+        IrKind.ClosureNew => stmt_misplaced(id)
+        IrKind.EffectPerform => stmt_misplaced(id)
+    }
+}
+
+fn stmt_misplaced(id: Int) ! Diag.Report {
+    em_line("{misplaced(id, "statement")};")
+}
+
+// The statements of a Block, at the current indent. The caller owns the braces.
+pub fn print_block_body(block: Int) ! Diag.Report {
+    if ir_kind(block) != IrKind.Block {
+        em_line("{misplaced(block, "Block")};")
+        return
+    }
+    for s in ir_kids(block) { print_stmt(s) }
+}
+
+fn print_braced(head: Str, block: Int) ! Diag.Report {
+    if head == "" { em_line("\{") } else { em_line("{head} \{") }
+    em_indent_push()
+    print_block_body(block)
+    em_indent_pop()
+    em_line("}")
+}
+
+fn print_field_set(id: Int) ! Diag.Report {
+    let obj = ir_kid(id, 0)
+    let target = lvalue_text(obj)
+    let value = print_expr(ir_kid(id, 1))
+    em_line("{target}{access(obj)}{ir_c_name(id)} = {value};")
+}
+
+fn print_assign(id: Int) ! Diag.Report {
+    let target = lvalue_text(ir_kid(id, 0))
+    let value = print_expr(ir_kid(id, 1))
+    em_line("{target} = {value};")
+}
+
+fn print_let(id: Int) ! Diag.Report {
+    if ir_kid_count(id) == 0 {
+        em_line("{ir_c_spelling(id)} {ir_c_name(id)};")
+        return
+    }
+    em_line("{ir_c_spelling(id)} {ir_c_name(id)} = {print_expr(ir_kid(id, 0))};")
+}
+
+// A flagged value may be reached again later, so it binds here like anywhere else. A void
+// value has nothing to bind, so it prints bare once and is recorded, so that a second reach
+// runs its effect no second time. A kind that bound its own temporary has already run.
+fn print_expr_stmt(id: Int) ! Diag.Report {
+    let e = ir_kid(id, 0)
+    if materialized.contains_key(e) { return }
+    if ir_must_materialize(e) == 1 && ir_c_spelling(e) != "void" {
+        let tmp = print_expr(e)
+        em_line("(void){tmp};")
+        return
+    }
+    let text = expr_text(e)
+    if materialized.contains_key(e) { return }
+    em_line("{text};")
+    if ir_must_materialize(e) == 1 { materialized.insert(e, "((void)0)") }
+}
+
+fn print_return(id: Int) ! Diag.Report {
+    if ir_kid_count(id) == 0 {
+        em_line("return;")
+        return
+    }
+    em_line("return {print_expr(ir_kid(id, 0))};")
+}
+
+fn print_if(id: Int) ! Diag.Report {
+    let cond = print_expr(ir_kid(id, 0))
+    print_braced("if ({cond})", ir_kid(id, 1))
+    if ir_kid_count(id) == 3 { print_braced("else", ir_kid(id, 2)) }
+}
+
+// A match prints as an if-else chain, not a C switch: a Break or Continue inside an arm
+// must reach the enclosing loop, and a C switch would capture it.
+fn print_switch(id: Int) ! Diag.Report {
+    let n = ir_kid_count(id)
+    let s = if n > 1 { name_or_bind(ir_kid(id, 0), "_sw") } else { print_expr(ir_kid(id, 0)) }
+    let pairs = (n - 1) / 2
+    let mut i = 0
+    while i < pairs {
+        let label = print_expr(ir_kid(id, 1 + i * 2))
+        let head = if i == 0 { "if" } else { "else if" }
+        print_braced("{head} ({s} == {label})", ir_kid(id, 2 + i * 2))
+        i += 1
+    }
+    if (n - 1) % 2 == 1 {
+        let dflt = ir_kid(id, n - 1)
+        if pairs == 0 { print_braced("", dflt) } else { print_braced("else", dflt) }
+    }
+}
+
+// With a resource: the value is copied into a guard local and the cleanup symbol gets a
+// pointer to that local on every exit. Without one: a fresh arena for the block.
+fn print_with_scope(id: Int) ! Diag.Report {
+    em_line("\{")
+    em_indent_push()
+    if ir_kid_count(id) == 1 {
+        let ar = em_temp("_ar")
+        em_line("blink_arena_t* {ar} = blink_arena_create(BLINK_ARENA_DEFAULT_CHUNK_SIZE);")
+        em_line("__blink_arena_restore_t {ar}_st __attribute__((cleanup(__blink_arena_restore))) = \{ .prev = __blink_current_arena, .arena = {ar} };")
+        em_line("__blink_current_arena = {ar};")
+        print_block_body(ir_kid(id, 0))
+    } else {
+        let res = ir_kid(id, 0)
+        let value = print_expr(res)
+        let wr = em_temp("_wr")
+        let cleanup = ir_c_name(id)
+        let attr = if cleanup == "" { "" } else { " __attribute__((cleanup({cleanup})))" }
+        em_line("{ir_c_spelling(res)} {wr}{attr} = {value};")
+        print_block_body(ir_kid(id, 1))
+    }
+    em_indent_pop()
+    em_line("}")
+}
+
+// The handler pointer replaces one field of the global effect vector for the block; the
+// cleanup restores it on every exit. Callees see the new vector through a fresh __ev.
+fn print_handler_install(id: Int) ! Diag.Report {
+    let field = ir_c_name(id)
+    em_line("\{")
+    em_indent_push()
+    let hv = print_expr(ir_kid(id, 0))
+    let evr = em_temp("_evr")
+    em_line("__blink_ev_restore_t {evr} __attribute__((cleanup(__blink_ev_restore))) = \{ .slot = (void**)&__blink_ev.{field}, .saved = (void*)__blink_ev.{field} };")
+    em_line("__blink_ev.{field} = {hv};")
+    let evw = em_temp("_evw")
+    em_line("blink_ev {evw} = __blink_ev;")
+    em_line("blink_ev* __ev = &{evw};")
+    print_block_body(ir_kid(id, 1))
+    em_indent_pop()
+    em_line("}")
+}
+
+// The dispatcher never returns; the unreachable marker lets the C compiler see that.
+fn print_panic(id: Int) ! Diag.Report {
+    em_line("__blink_panic_dispatch({print_expr(ir_kid(id, 0))});")
+    em_line("__builtin_unreachable();")
+}
+
+// ── Declarations: functions, typedefs, effects, program shell ───────────────
+//
+// The driver reaches cg_emit only through these. Each takes strings the caller already
+// holds (spellings from layout_of, names from cname) and an IR body where there is one.
+
+pub fn print_prologue(user_tu: Bool, define_storage: Bool, test_build: Bool, header_guard: Str, self_header: Str) {
+    em_prologue(user_tu, define_storage, test_build, header_guard, self_header)
+}
+
+pub fn print_epilogue(header_guard: Str) { em_epilogue(header_guard) }
+
+// C spells an empty parameter list `(void)`, or the declaration is not a prototype.
+fn params_or_void(params: List[Str], takes_ev: Bool) -> List[Str] {
+    if params.len() == 0 && !takes_ev { ["void"] } else { params }
+}
+
+pub fn print_fn_decl(is_static: Bool, ret: Str, symbol: Str, params: List[Str], takes_ev: Bool) {
+    em_fn_decl(is_static, ret, symbol, params_or_void(params, takes_ev), takes_ev)
+}
+
+// Temporaries are function-local, so each function starts its own numbering.
+pub fn print_fn(is_static: Bool, ret: Str, symbol: Str, params: List[Str], takes_ev: Bool, body: Int) ! Diag.Report {
+    em_reset_temps()
+    materialized.clear()
+    em_fn_open(is_static, ret, symbol, params_or_void(params, takes_ev), takes_ev)
+    print_block_body(body)
+    em_fn_close()
+}
+
+pub fn print_closure_thunk_decl(ret: Str, symbol: Str, params: List[Str]) {
+    em_fn_decl(true, ret, symbol, closure_thunk_params(params), false)
+}
+
+pub fn print_closure_thunk(ret: Str, symbol: Str, params: List[Str], body: Int) ! Diag.Report {
+    print_fn(true, ret, symbol, closure_thunk_params(params), false, body)
+}
+
+pub fn print_global_decl(spelling: Str, name: Str, is_extern: Bool) {
+    em_global_decl(spelling, name, is_extern)
+}
+
+// Each typedef sits between the guard lines the driver names (cname owns the BLINK_TD_ name).
+
+pub fn print_struct_typedef(guard: Str, c_name: Str, field_decls: List[Str]) {
+    em_td_guard_open(guard)
+    em_struct_typedef_body(c_name, field_decls)
+    em_td_guard_close(guard)
+}
+
+pub fn print_tuple_typedef(guard: Str, c_name: Str, elem_spellings: List[Str]) {
+    em_td_guard_open(guard)
+    em_tuple_typedef_body(c_name, elem_spellings)
+    em_td_guard_close(guard)
+}
+
+pub fn print_simple_enum_typedef(guard: Str, c_name: Str, variant_c_names: List[Str]) {
+    em_td_guard_open(guard)
+    em_simple_enum_typedef_body(c_name, variant_c_names)
+    em_td_guard_close(guard)
+}
+
+// Parallel lists from the driver must agree in length, or an unwrap would panic without a
+// diagnostic.
+fn same_len(what: Str, a: Int, b: Int) -> Bool ! Diag.Report {
+    if a == b { return true }
+    diag_ice("PrinterListMismatch", MISPLACED_IR_KIND_AT_PRINT,
+        "{what}: the driver passed lists of {a} and {b} entries", 0, 0,
+        "pass one entry per slot, variant or effect in every list")
+    em_line("BLINK_I0003_list_mismatch_{what};")
+    false
+}
+
+// tag_macros holds one macro name per variant, in variant order.
+pub fn print_tagged_enum_typedef(guard: Str, c_name: Str, variant_names: List[Str], variant_fields: List[List[Str]], tag_macros: List[Str]) ! Diag.Report {
+    if !same_len("{c_name}_variants", variant_names.len(), variant_fields.len()) { return }
+    if !same_len("{c_name}_tags", variant_names.len(), tag_macros.len()) { return }
+    em_td_guard_open(guard)
+    em_tagged_enum_typedef_body(c_name, variant_names, variant_fields)
+    em_td_guard_close(guard)
+    let mut i = 0
+    while i < tag_macros.len() {
+        em_tag_macro(tag_macros.get(i).unwrap(), i)
+        i += 1
+    }
+}
+
+pub fn print_option_typedef(guard: Str, c_name: Str, value_spelling: Str) {
+    em_td_guard_open(guard)
+    em_option_typedef_body(c_name, value_spelling)
+    em_td_guard_close(guard)
+}
+
+// runtime.h declares blink_Result_str_str itself; printing it again would redefine it.
+pub fn print_result_typedef(guard: Str, c_name: Str, ok_spelling: Str, err_spelling: Str) {
+    if c_name == "blink_Result_str_str" { return }
+    em_td_guard_open(guard)
+    em_result_typedef_body(c_name, ok_spelling, err_spelling)
+    em_td_guard_close(guard)
+}
+
+pub fn print_effect_vtable_typedef(guard: Str, vtable_c_name: Str, slots: List[Str], slot_rets: List[Str], slot_params: List[List[Str]]) ! Diag.Report {
+    if !same_len("{vtable_c_name}_rets", slots.len(), slot_rets.len()) { return }
+    if !same_len("{vtable_c_name}_params", slots.len(), slot_params.len()) { return }
+    let mut ps: List[List[Str]] = []
+    for p in slot_params { ps.push(params_or_void(p, false)) }
+    em_td_guard_open(guard)
+    em_effect_vtable_typedef_body(vtable_c_name, slots, slot_rets, ps)
+    em_td_guard_close(guard)
+}
+
+pub fn print_effect_default_vtable(vtable_c_name: Str, default_fn_symbols: List[Str]) {
+    em_effect_default_vtable(vtable_c_name, default_fn_symbols)
+}
+
+// ev_storage is the storage class of `__blink_ev`: "" for the TU that owns it and is linked
+// against by others, "static " for a single TU, "extern " for a TU that only refers to it.
+pub fn print_ev(guard: Str, user_vtables: List[Str], user_fields: List[Str], ev_storage: Str) ! Diag.Report {
+    if !same_len("blink_ev_user_effects", user_vtables.len(), user_fields.len()) { return }
+    em_td_guard_open(guard)
+    em_ev_typedef_body(user_vtables, user_fields)
+    em_td_guard_close(guard)
+    em_ev_default_fn(user_vtables, user_fields, ev_storage)
+}
+
+pub fn print_scope_restore_support() { em_scope_restore_support() }
+
+pub fn print_main_shim(has_main: Bool, has_tests: Bool, uses_async: Bool, user_tu: Bool, trace: Bool, deterministic: Int, init_fns: List[Str]) {
+    em_main_shim(has_main, has_tests, uses_async, user_tu, trace, deterministic, init_fns)
+}
