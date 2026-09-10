@@ -1,0 +1,180 @@
+import std.io
+import ir.{
+    IrKind, ir_reset, ir_new, ir_node_count, ir_verify, ir_mark_materialize, ir_kid_count, ir_kids,
+    ir_const, ir_var_ref, ir_binary, ir_field_get, ir_carrier_wrap, ir_call_direct,
+    ir_let, ir_assign, ir_expr_stmt, ir_return, ir_if, ir_loop, ir_break, ir_block, ir_switch,
+    ir_with_scope, ir_handler_install, ir_unreachable,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+import codegen_expr
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+// One error class per bad tree: the verifier must name the defect, and must not drown it
+// in follow-on noise from the same node.
+fn assert_rejects(label: Str, root: Int, needle: Str) {
+    let errs = ir_verify(root)
+    let mut hit = 0
+    for e in errs { if e.contains(needle) { hit += 1 } }
+    if hit == 0 { io.println("FAIL: {label}: no error contains '{needle}'; got: {errs.join(" | ")}") }
+    assert_eq_int("{label} reports '{needle}'", if hit > 0 { 1 } else { 0 }, 1)
+}
+
+fn assert_valid(label: Str, root: Int) {
+    let errs = ir_verify(root)
+    if errs.len() > 0 { io.println("FAIL: {label}: {errs.join(" | ")}") }
+    assert_eq_int("{label} verifies", errs.len(), 0)
+}
+
+fn int_const(text: Str) -> Int { ir_const(1, 0, "int64_t", text) }
+fn int_var(name: Str) -> Int { ir_var_ref(1, 0, "int64_t", name, SlotForm.InlineWord) }
+
+
+test "a well-formed tree verifies with no errors" {
+    ir_reset()
+    let l = ir_let(1, 0, "int64_t", "x", SlotForm.InlineWord, ir_binary(1, 0, "int64_t", "+", int_const("1"), int_const("2")))
+    assert_valid("let of a sum", ir_block(0, [l, ir_return(0, int_var("x"))]))
+}
+
+test "a value node without a tid is rejected, and tid 0 is a real tid" {
+    ir_reset()
+    let neg = ir_var_ref(-1, 3, "int64_t", "x", SlotForm.InlineWord)
+    assert_rejects("VarRef tid -1", ir_expr_stmt(0, neg), "without a tid")
+    assert_valid("tid 0 is the first interned type, not unset", ir_expr_stmt(0, ir_const(0, 3, "int64_t", "1")))
+    assert_valid("a statement carries no tid", ir_block(0, [ir_break(0)]))
+}
+
+test "a value node with an empty c_spelling is rejected" {
+    ir_reset()
+    let bad = ir_const(1, 3, "", "1")
+    assert_rejects("Const spelling", ir_expr_stmt(0, bad), "empty c_spelling")
+    let call = ir_call_direct(1, 0, "", "f", SlotForm.InlineWord, [])
+    assert_rejects("CallDirect spelling", ir_expr_stmt(0, call), "empty c_spelling")
+    let l = ir_let(1, 0, "", "x", SlotForm.InlineWord, int_const("1"))
+    assert_rejects("Let spelling", l, "empty c_spelling")
+}
+
+test "an empty c_name is rejected only where the kind names something" {
+    ir_reset()
+    assert_rejects("VarRef name", ir_expr_stmt(0, ir_var_ref(1, 0, "int64_t", "", SlotForm.InlineWord)), "empty c_name")
+    assert_rejects("Binary op", ir_expr_stmt(0, ir_binary(1, 0, "int64_t", "", int_const("1"), int_const("2"))), "empty c_name")
+    assert_rejects("CallDirect symbol", ir_expr_stmt(0, ir_call_direct(1, 0, "int64_t", "", SlotForm.InlineWord, [])), "empty c_name")
+    assert_rejects("Let name", ir_let(1, 0, "int64_t", "", SlotForm.InlineWord, -1), "empty c_name")
+    let none = ir_carrier_wrap(8, 0, "blink_Option_int", "", int_const("0"), -1)
+    assert_valid("None has no member name", ir_expr_stmt(0, none))
+    assert_valid("a WithScope arena has no cleanup symbol", ir_with_scope(0, "", -1, ir_block(0, [])))
+}
+
+test "a kid id outside the arena is rejected" {
+    ir_reset()
+    let bad = ir_new(IrKind.Binary, 1, 0, "int64_t", "+", SlotForm.InlineWord, [int_const("1"), 999])
+    assert_rejects("kid 999", ir_expr_stmt(0, bad), "out of range")
+    let neg = ir_new(IrKind.Block, 0, 0, "", "", SlotForm.Inline, [-1])
+    assert_rejects("kid -1", neg, "out of range")
+}
+
+test "the kid count must match the kind's arity" {
+    ir_reset()
+    let one = ir_new(IrKind.Binary, 1, 0, "int64_t", "+", SlotForm.InlineWord, [int_const("1")])
+    assert_rejects("Binary with one kid", ir_expr_stmt(0, one), "expects 2 kids")
+    let leaf = ir_new(IrKind.Const, 1, 0, "int64_t", "1", SlotForm.InlineWord, [int_const("2")])
+    assert_rejects("Const with a kid", ir_expr_stmt(0, leaf), "expects 0 kids")
+    let four = ir_new(IrKind.If, 0, 0, "", "", SlotForm.Inline, [int_const("1"), ir_block(0, []), ir_block(0, []), ir_block(0, [])])
+    assert_rejects("If with four kids", four, "expects 2 or 3 kids")
+    let empty = ir_new(IrKind.CallIndirect, 1, 0, "int64_t", "", SlotForm.InlineWord, [])
+    assert_rejects("CallIndirect without a callee", ir_expr_stmt(0, empty), "expects at least 1 kid")
+}
+
+test "a statement where a value is required is rejected" {
+    ir_reset()
+    let stmt = ir_break(0)
+    let bad = ir_new(IrKind.Binary, 1, 0, "int64_t", "+", SlotForm.InlineWord, [int_const("1"), stmt])
+    assert_rejects("Break as an operand", ir_expr_stmt(0, bad), "statement where a value is required")
+    let bad_let = ir_new(IrKind.Let, 1, 0, "int64_t", "x", SlotForm.InlineWord, [ir_block(0, [])])
+    assert_rejects("Block as a Let initialiser", bad_let, "statement where a value is required")
+    let bad_ret = ir_new(IrKind.Return, 0, 0, "", "", SlotForm.Inline, [ir_unreachable(0)])
+    assert_rejects("Unreachable as a return value", bad_ret, "statement where a value is required")
+}
+
+test "a value where a statement is required is rejected, and a branch must be a Block" {
+    ir_reset()
+    let bare = ir_new(IrKind.Block, 0, 0, "", "", SlotForm.Inline, [int_const("1")])
+    assert_rejects("Const inside a Block", bare, "value where a statement is required")
+    let no_block = ir_new(IrKind.If, 0, 0, "", "", SlotForm.Inline, [int_const("1"), ir_break(0)])
+    assert_rejects("Break as an If branch", no_block, "must be a Block")
+    let loop_bad = ir_new(IrKind.Loop, 0, 0, "", "", SlotForm.Inline, [ir_expr_stmt(0, int_const("1"))])
+    assert_rejects("ExprStmt as a Loop body", loop_bad, "must be a Block")
+    let hi = ir_new(IrKind.HandlerInstall, 0, 0, "", "ev", SlotForm.Inline, [int_var("h"), ir_break(0)])
+    assert_rejects("Break as a handler body", hi, "must be a Block")
+}
+
+test "a Switch must be a discriminant, Const-Block pairs, and at most one default Block" {
+    ir_reset()
+    let good = ir_switch(0, int_var("t"), [int_const("0"), ir_block(0, []), int_const("1"), ir_block(0, [ir_break(0)])], ir_block(0, [ir_unreachable(0)]))
+    assert_valid("two arms and a default", good)
+    let no_default = ir_switch(0, int_var("t"), [int_const("0"), ir_block(0, [])], -1)
+    assert_valid("one arm, no default", no_default)
+    let default_only = ir_switch(0, int_var("t"), [], ir_block(0, [ir_unreachable(0)]))
+    assert_valid("a default and no arms", default_only)
+    let empty = ir_new(IrKind.Switch, 0, 0, "", "", SlotForm.Inline, [])
+    assert_rejects("no discriminant", empty, "expects at least 1 kid")
+    let stmt_scrut = ir_new(IrKind.Switch, 0, 0, "", "", SlotForm.Inline, [ir_break(0), int_const("0"), ir_block(0, [])])
+    assert_rejects("statement discriminant", stmt_scrut, "statement where a value is required")
+    let var_case = ir_new(IrKind.Switch, 0, 0, "", "", SlotForm.Inline, [int_var("t"), int_var("k"), ir_block(0, [])])
+    assert_rejects("VarRef as a case label", var_case, "case label must be a Const")
+    let no_body = ir_new(IrKind.Switch, 0, 0, "", "", SlotForm.Inline, [int_var("t"), int_const("0"), ir_break(0)])
+    assert_rejects("Break as an arm body", no_body, "must be a Block")
+    let two_defaults = ir_new(IrKind.Switch, 0, 0, "", "", SlotForm.Inline, [int_var("t"), int_const("0"), ir_block(0, []), ir_block(0, []), ir_block(0, [])])
+    assert_rejects("Block where a case label goes", two_defaults, "case label must be a Const")
+}
+
+test "a CarrierWrap tag kid must be a Const and an Assign target must be an lvalue" {
+    ir_reset()
+    let wrap = ir_new(IrKind.CarrierWrap, 8, 0, "blink_Option_int", "value", SlotForm.Inline, [int_var("t"), int_const("1")])
+    assert_rejects("VarRef as a carrier tag", ir_expr_stmt(0, wrap), "tag must be a Const")
+    let no_member = ir_carrier_wrap(8, 0, "blink_Option_int", "", int_const("1"), int_const("5"))
+    assert_rejects("payload without a member name", ir_expr_stmt(0, no_member), "empty c_name")
+    assert_valid("None needs no member name", ir_expr_stmt(0, ir_carrier_wrap(8, 0, "blink_Option_int", "", int_const("0"), -1)))
+    let bad = ir_assign(0, int_const("1"), int_const("2"))
+    assert_rejects("Const as an assign target", bad, "target must be an lvalue")
+    let obj = ir_var_ref(5, 0, "blink_Point*", "p", SlotForm.PointerBoxed)
+    assert_valid("FieldGet as an assign target", ir_assign(0, ir_field_get(1, 0, "int64_t", "x", SlotForm.InlineWord, obj), int_const("2")))
+}
+
+// A kid id equal to the next arena id names the node under construction, so a cycle is
+// buildable through the raw constructor and the verifier must stop instead of recursing forever.
+test "a cycle is rejected instead of looping" {
+    ir_reset()
+    let self_loop = ir_new(IrKind.Block, 0, 0, "", "", SlotForm.Inline, [ir_node_count()])
+    assert_rejects("self cycle", self_loop, "cycle")
+    let body = ir_new(IrKind.Block, 0, 0, "", "", SlotForm.Inline, [ir_node_count() + 1])
+    let lp = ir_new(IrKind.Loop, 0, 0, "", "", SlotForm.Inline, [body])
+    assert_rejects("two-node cycle", lp, "cycle")
+}
+
+test "the root itself is checked" {
+    ir_reset()
+    assert_rejects("root out of range", 42, "out of range")
+    assert_rejects("negative root", -1, "out of range")
+}
+
+test "a node keeps its own kid list: neither the caller's list nor ir_kids can rewrite it" {
+    ir_reset()
+    let mut scratch: List[Int] = [int_const("1")]
+    let first = ir_block(0, [ir_expr_stmt(0, ir_binary(1, 0, "int64_t", "+", int_const("2"), int_const("3")))])
+    let mut stmts: List[Int] = [first]
+    let blk = ir_block(0, stmts)
+    stmts.push(ir_break(0))
+    assert_eq_int("a later push to the caller's list is not seen", ir_kid_count(blk), 1)
+    let mut leaked = ir_kids(blk)
+    leaked.push(ir_break(0))
+    assert_eq_int("a push to the returned list is not seen", ir_kid_count(blk), 1)
+    scratch.push(int_const("4"))
+    assert_eq_int("scratch is a plain list", scratch.len(), 2)
+}
