@@ -1,0 +1,49 @@
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
+import parser.{nodes, node_kind, node_method}
+import ast.{NodeKind}
+// Pulls the codegen module set into the probe program; without it the
+// compiler module graph does not resolve typecheck helpers used by codegen_types.
+import codegen_expr
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 0)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn first_method_call_type_str(name: Str) -> Str {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.MethodCall {
+            if node_method(i) == name {
+                return tc_type_str(tc_lookup_node_tid(i))
+            }
+        }
+        i = i + 1
+    }
+    ""
+}
+
+let QUAL_SRC: Str = #"import std.io
+type Pt { x: Int }
+trait Maker { fn make(self) -> Self }
+impl Maker for Pt { fn make(self) -> Self { Pt { x: 1 } } }
+fn probe[T: Maker](v: T) -> T { Maker.make(v) }
+fn main() {
+    let p = probe(Pt { x: 2 })
+    io.println("{p.x}")
+}
+"#
+
+test.failing(
+    "the qualified trait call Maker.make(v) on a bounded type parameter T types as T, not Self",
+    reason: "the qualified-call arm for a bounded typevar receiver returns the trait method's declared return tid verbatim (qtm.ret_tid), which for 'fn make(self) -> Self' is the abstract Self typevar; it is never substituted to the caller's bound type parameter T, so typecheck never compares the call's result against the enclosing fn's declared return type T",
+    ticket: "wjss85",
+) {
+    typecheck_probe(".tmp/_qualified_trait_call_self_return_typevar_probe.bl", QUAL_SRC)
+    let t = first_method_call_type_str("make")
+    assert(t == "T", "expected the qualified call to type as T, got '{t}'")
+}
