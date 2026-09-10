@@ -1,0 +1,80 @@
+import std.io
+import std.process.{ProcessResult}
+import ir.{ir_reset, ir_verify, ir_const, ir_effect_perform, ir_expr_stmt, ir_block}
+import layout.{SlotForm}
+import cg_print.{print_reset, print_take, print_prologue, print_ev, print_fn_decl, print_fn, print_main_shim}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+import codegen_expr
+
+fn scratch_dir() -> Str {
+    let d = env.var("BLINK_TEST_SCRATCH") ?? "build/cg_print_scratch"
+    shell_exec("mkdir -p {d}")
+    d
+}
+
+// The printed C targets the pinned gen0 archive. gen0 lives under build/gen0/ at the repo
+// root, which is a parent of a worktree, so walk up from the working directory.
+fn gen0_share_dir() -> Str {
+    let forced = env.var("BLINK_GEN0") ?? ""
+    if forced != "" { return "{forced}/share/blink" }
+    let mut prefix = ""
+    let mut depth = 0
+    while depth < 6 {
+        let cand = "{prefix}build/gen0/share/blink"
+        if file_exists("{cand}/libblink_std.a") == 1 { return cand }
+        prefix = "{prefix}../"
+        depth += 1
+    }
+    ""
+}
+
+fn cc_and_run(tag: Str, c_text: Str) -> ProcessResult {
+    let share = gen0_share_dir()
+    if share == "" {
+        io.println("FAIL[{tag}]: build/gen0/share/blink not found from the working directory")
+        assert(false)
+    }
+    let dir = scratch_dir()
+    let c_path = "{dir}/{tag}.c"
+    let bin = "{dir}/{tag}"
+    write_file(c_path, c_text)
+    let cc = process_run("cc", ["-o", bin, c_path, "-I{share}", "{share}/libblink_std.a", "-lm", "-lgc", "-pthread", "-Wl,--gc-sections"])
+    if cc.exit_code != 0 {
+        io.println("FAIL[{tag}] cc exit={cc.exit_code}\n{cc.err_out}{cc.out}")
+        return cc
+    }
+    process_run(bin, [])
+}
+
+// blink_main prints one literal through the io effect slot. This is the smallest program
+// that proves the prologue, effect vector, function signature, effect perform and main shim
+// agree with the archive.
+test "hand-built IR for hello world compiles against gen0 and runs" {
+    ir_reset()
+    print_reset()
+    let msg = ir_const(2, 0, "const char*", "\"hello world\"")
+    let say = ir_effect_perform(0, 0, "void", "io->print", SlotForm.Inline, [msg])
+    let body = ir_block(0, [ir_expr_stmt(0, say)])
+    let errs = ir_verify(body)
+    if errs.len() > 0 { io.println("FAIL verify: {errs.join(" | ")}") }
+    assert_eq(errs.len(), 0)
+
+    print_prologue(true, false, false, "", "")
+    print_ev("BLINK_TD_blink_ev", [], [], "")
+    print_fn_decl(false, "void", "blink_main", [], true)
+    print_fn(false, "void", "blink_main", [], true, body)
+    print_main_shim(true, false, false, true, false, 0, [])
+    let c_text = print_take()
+
+    assert(c_text.contains("#include \"libblink_std.h\""))
+    assert(c_text.contains("void blink_main(blink_ev* __ev) \{"))
+    assert(c_text.contains("    __ev->io->print(\"hello world\");"))
+    assert(c_text.contains("blink_main(&__blink_ev);"))
+
+    let r = cc_and_run("cg_print_hello_world", c_text)
+    if r.exit_code != 0 { io.println("FAIL run exit={r.exit_code}\n{r.err_out}{r.out}") }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, "hello world\n")
+}

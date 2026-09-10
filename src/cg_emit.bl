@@ -1,0 +1,303 @@
+// cg_emit.bl: the C text buffer and the C-ABI text forms.
+//
+// This module holds the only C text the compiler writes. It knows nothing about types:
+// every function takes strings (a spelling, a symbol, a field name) and writes them into
+// the buffer verbatim. cg_print.bl is the only module that may import it.
+//
+// The three pub globals are the buffer, the indent depth and the temp counter. They are the
+// whole mutable state of emission and are on the lint allowlist.
+
+pub let mut em_lines: List[Str] = []
+pub let mut em_indent: Int = 0
+pub let mut em_temp_counter: Int = 0
+
+pub fn em_reset() {
+    em_lines = []
+    em_indent = 0
+    em_temp_counter = 0
+}
+
+pub fn em_line(line: Str) {
+    if line == "" {
+        em_lines.push("")
+        return
+    }
+    let mut pad = ""
+    let mut i = 0
+    while i < em_indent {
+        pad = pad.concat("    ")
+        i += 1
+    }
+    em_lines.push(pad.concat(line))
+}
+
+// Lines that must start in column 0 whatever the indent: preprocessor directives.
+pub fn em_directive(line: Str) { em_lines.push(line) }
+
+pub fn em_indent_push() { em_indent += 1 }
+
+pub fn em_indent_pop() {
+    if em_indent > 0 { em_indent -= 1 }
+}
+
+pub fn em_reset_temps() { em_temp_counter = 0 }
+
+pub fn em_temp(prefix: Str) -> Str {
+    let n = em_temp_counter
+    em_temp_counter += 1
+    "{prefix}{n}"
+}
+
+pub fn em_take() -> Str {
+    let out = em_lines.join("\n")
+    em_lines = []
+    out.concat("\n")
+}
+
+pub fn em_open_brace(head: Str) {
+    em_line("{head} \{")
+    em_indent_push()
+}
+
+pub fn em_close_brace(tail: Str) {
+    em_indent_pop()
+    em_line("}{tail}")
+}
+
+// ── Prologue and storage gating ──────────────────────────────────────────────
+//
+// A user TU includes the stdlib archive header and shares runtime storage with it. The
+// archive monolith defines that storage. A standalone TU includes runtime.h and owns
+// everything itself.
+
+pub fn em_prologue(user_tu: Bool, define_storage: Bool, test_build: Bool, header_guard: Str, self_header: Str) {
+    if header_guard != "" {
+        em_directive("#ifndef {header_guard}")
+        em_directive("#define {header_guard}")
+    }
+    if user_tu || header_guard != "" || define_storage {
+        em_directive("#define BLINK_USE_EXTERN_RUNTIME_STORAGE 1")
+    }
+    if define_storage { em_directive("#define BLINK_RUNTIME_STORAGE_DEFINE 1") }
+    if test_build { em_directive("#define BLINK_TEST_BUILD 1") }
+    if user_tu {
+        em_directive("#include \"libblink_std.h\"")
+    } else {
+        em_directive("#include \"runtime.h\"")
+    }
+    if self_header != "" { em_directive("#include \"{self_header}\"") }
+    em_line("")
+}
+
+pub fn em_epilogue(header_guard: Str) {
+    if header_guard != "" { em_directive("#endif") }
+}
+
+// ── Functions ────────────────────────────────────────────────────────────────
+
+// `static int64_t sym(int64_t a, blink_ev* __ev)`. The caller spells an empty parameter
+// list as `void`; this helper only joins what it is given.
+pub fn fn_signature(is_static: Bool, ret: Str, symbol: Str, params: List[Str], takes_ev: Bool) -> Str {
+    let mut ps: List[Str] = []
+    for p in params { ps.push(p) }
+    if takes_ev { ps.push("blink_ev* __ev") }
+    let plist = ps.join(", ")
+    let prefix = if is_static { "static " } else { "" }
+    "{prefix}{ret} {symbol}({plist})"
+}
+
+pub fn em_fn_decl(is_static: Bool, ret: Str, symbol: Str, params: List[Str], takes_ev: Bool) {
+    em_line("{fn_signature(is_static, ret, symbol, params, takes_ev)};")
+}
+
+pub fn em_fn_open(is_static: Bool, ret: Str, symbol: Str, params: List[Str], takes_ev: Bool) {
+    em_open_brace(fn_signature(is_static, ret, symbol, params, takes_ev))
+}
+
+pub fn em_fn_close() { em_close_brace("") }
+
+// A closure thunk receives its own closure record first so it can read captures.
+pub fn closure_thunk_params(params: List[Str]) -> List[Str] {
+    let mut ps: List[Str] = ["const blink_closure* __self"]
+    for p in params { ps.push(p) }
+    ps
+}
+
+pub fn em_global_decl(spelling: Str, name: Str, is_extern: Bool) {
+    let prefix = if is_extern { "extern " } else { "" }
+    em_line("{prefix}{spelling} {name};")
+}
+
+// ── Typedef bodies ───────────────────────────────────────────────────────────
+//
+// The guard macro name comes from cname through the driver; an empty guard writes none.
+
+pub fn em_td_guard_open(guard: Str) {
+    if guard == "" { return }
+    em_directive("#ifndef {guard}")
+    em_directive("#define {guard}")
+}
+
+pub fn em_td_guard_close(guard: Str) {
+    if guard != "" { em_directive("#endif") }
+}
+
+pub fn em_struct_typedef_body(c_name: Str, field_decls: List[Str]) {
+    em_open_brace("typedef struct")
+    for f in field_decls { em_line("{f};") }
+    em_close_brace(" {c_name};")
+}
+
+// A tuple is a struct whose fields are `_0`, `_1`, ...
+pub fn em_tuple_typedef_body(c_name: Str, elem_spellings: List[Str]) {
+    let mut decls: List[Str] = []
+    let mut i = 0
+    while i < elem_spellings.len() {
+        decls.push("{elem_spellings.get(i).unwrap()} _{i}")
+        i += 1
+    }
+    em_struct_typedef_body(c_name, decls)
+}
+
+pub fn em_simple_enum_typedef_body(c_name: Str, variant_c_names: List[Str]) {
+    em_line("typedef enum \{ {variant_c_names.join(", ")} } {c_name};")
+}
+
+// A payload enum: `{ int tag; union { struct { ... } Variant; ... } data; }`.
+// variant_fields holds one `type name` list per variant, in variant order.
+pub fn em_tagged_enum_typedef_body(c_name: Str, variant_names: List[Str], variant_fields: List[List[Str]]) {
+    em_open_brace("typedef struct")
+    em_line("int tag;")
+    em_open_brace("union")
+    let mut i = 0
+    while i < variant_names.len() {
+        em_open_brace("struct")
+        for f in variant_fields.get(i).unwrap() { em_line("{f};") }
+        em_close_brace(" {variant_names.get(i).unwrap()};")
+        i += 1
+    }
+    em_close_brace(" data;")
+    em_close_brace(" {c_name};")
+}
+
+pub fn em_tag_macro(macro_name: Str, value: Int) {
+    em_directive("#ifndef {macro_name}")
+    em_directive("#define {macro_name} {value}")
+    em_directive("#endif")
+}
+
+pub fn em_option_typedef_body(c_name: Str, value_spelling: Str) {
+    em_line("typedef struct \{ int tag; {value_spelling} value; } {c_name};")
+}
+
+pub fn em_result_typedef_body(c_name: Str, ok_spelling: Str, err_spelling: Str) {
+    em_line("typedef struct \{ int tag; union \{ {ok_spelling} ok; {err_spelling} err; }; } {c_name};")
+}
+
+// ── Effects ──────────────────────────────────────────────────────────────────
+
+// `typedef struct { RET (*slot)(params); ... void* __userdata_slot; ... } <vtable>;`
+// All function pointers come first, then one capture word per op, as the archive was built.
+// An effect with no ops keeps one word so the struct is never empty.
+pub fn em_effect_vtable_typedef_body(vtable_c_name: Str, slots: List[Str], slot_rets: List[Str], slot_params: List[List[Str]]) {
+    em_open_brace("typedef struct")
+    let mut i = 0
+    while i < slots.len() {
+        let plist = slot_params.get(i).unwrap().join(", ")
+        em_line("{slot_rets.get(i).unwrap()} (*{slots.get(i).unwrap()})({plist});")
+        i += 1
+    }
+    for slot in slots { em_line("void* __userdata_{slot};") }
+    if slots.len() == 0 { em_line("void* __userdata;") }
+    em_close_brace(" {vtable_c_name};")
+}
+
+pub fn em_effect_default_vtable(vtable_c_name: Str, default_fn_symbols: List[Str]) {
+    em_open_brace("static {vtable_c_name} {vtable_c_name}_default =")
+    for s in default_fn_symbols { em_line("{s},") }
+    for _s in default_fn_symbols { em_line("NULL,") }
+    if default_fn_symbols.len() == 0 { em_line("NULL,") }
+    em_close_brace(";")
+}
+
+// blink_ev is the effect vector every function threads. The archive is compiled against a
+// vector with only the builtin fields, so those stay first and in this order; a user effect
+// appends after them.
+fn builtin_ev_fields() -> List[Str] {
+    ["io", "fs", "net", "crypto", "rand", "time", "env", "process"]
+}
+
+pub fn em_ev_typedef_body(user_vtables: List[Str], user_fields: List[Str]) {
+    em_open_brace("typedef struct")
+    for f in builtin_ev_fields() { em_line("blink_{f}_vtable* {f};") }
+    let mut i = 0
+    while i < user_fields.len() {
+        em_line("{user_vtables.get(i).unwrap()}* {user_fields.get(i).unwrap()};")
+        i += 1
+    }
+    em_close_brace(" blink_ev;")
+}
+
+// A TU that only refers to the vector declares it extern and defines no default.
+pub fn em_ev_default_fn(user_vtables: List[Str], user_fields: List[Str], ev_storage: Str) {
+    if ev_storage == "extern " {
+        em_line("extern blink_ev __blink_ev;")
+        return
+    }
+    em_open_brace("BLINK_UNUSED static blink_ev blink_ev_default(void)")
+    em_line("blink_ev ev;")
+    for f in builtin_ev_fields() { em_line("ev.{f} = &blink_{f}_vtable_default;") }
+    let mut i = 0
+    while i < user_fields.len() {
+        em_line("ev.{user_fields.get(i).unwrap()} = &{user_vtables.get(i).unwrap()}_default;")
+        i += 1
+    }
+    em_line("return ev;")
+    em_close_brace("")
+    em_line("{ev_storage}blink_ev __blink_ev;")
+}
+
+// The cleanup records a handler install and an arena scope use to restore state on any exit.
+pub fn em_scope_restore_support() {
+    em_line("typedef struct \{ void** slot; void* saved; } __blink_ev_restore_t;")
+    em_open_brace("static void __blink_ev_restore(__blink_ev_restore_t* st)")
+    em_line("*st->slot = st->saved;")
+    em_close_brace("")
+    em_line("typedef struct \{ blink_arena_t* prev; blink_arena_t* arena; } __blink_arena_restore_t;")
+    em_open_brace("static void __blink_arena_restore(__blink_arena_restore_t* st)")
+    em_line("__blink_current_arena = st->prev;")
+    em_line("blink_arena_destroy(st->arena);")
+    em_close_brace("")
+}
+
+// ── main ─────────────────────────────────────────────────────────────────────
+
+pub fn em_main_shim(has_main: Bool, has_tests: Bool, uses_async: Bool, user_tu: Bool, trace: Bool, deterministic: Int, init_fns: List[Str]) {
+    em_open_brace("int main(int argc, char** argv)")
+    em_line("GC_INIT();")
+    em_line("blink_map_init_seed({deterministic});")
+    em_line("blink_g_argc = argc;")
+    em_line("blink_g_argv = (const char**)argv;")
+    em_line("__blink_ev = blink_ev_default();")
+    if trace { em_line("blink_trace_init(argc, argv);") }
+    if uses_async { em_line("__blink_pool = blink_threadpool_init(4);") }
+    if user_tu { em_line("__blink_init_stdlib_globals();") }
+    for f in init_fns { em_line("{f}();") }
+    if has_tests && has_main {
+        em_open_brace("for (int i = 1; i < argc; i++)")
+        em_open_brace("if (strcmp(argv[i], \"--test\") == 0)")
+        em_line("__blink_run_tests(argc, (const char**)argv);")
+        if uses_async { em_line("blink_threadpool_shutdown(__blink_pool);") }
+        em_line("return 0;")
+        em_close_brace("")
+        em_close_brace("")
+    }
+    if has_main {
+        em_line("blink_main(&__blink_ev);")
+    } else if has_tests {
+        em_line("__blink_run_tests(argc, (const char**)argv);")
+    }
+    if uses_async { em_line("blink_threadpool_shutdown(__blink_pool);") }
+    em_line("return 0;")
+    em_close_brace("")
+}

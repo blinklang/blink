@@ -1,0 +1,294 @@
+import std.io
+import ir.{
+    IrKind, ir_reset, ir_verify, ir_all_kinds, ir_kind_name, ir_kind_is_value, ir_kind, ir_held_by_pointer,
+    ir_const, ir_var_ref, ir_global_ref, ir_unary, ir_binary, ir_cast, ir_field_get, ir_struct_new, ir_tuple_new,
+    ir_container_new, ir_box, ir_unbox, ir_carrier_wrap, ir_carrier_unwrap, ir_carrier_tag,
+    ir_call_direct, ir_call_indirect, ir_call_closure, ir_call_virtual, ir_call_runtime, ir_closure_new,
+    ir_effect_perform, ir_field_set, ir_handler_install, ir_let, ir_assign, ir_expr_stmt, ir_return, ir_if,
+    ir_loop, ir_break, ir_continue, ir_block, ir_switch, ir_with_scope, ir_panic, ir_unreachable,
+}
+import layout.{SlotForm}
+import cg_print.{
+    print_reset, print_take, print_expr, print_stmt, print_block_body,
+    print_struct_typedef, print_tuple_typedef, print_simple_enum_typedef, print_tagged_enum_typedef,
+    print_option_typedef, print_result_typedef, print_effect_vtable_typedef, print_effect_default_vtable,
+    print_ev, print_main_shim,
+}
+import diagnostics.{diag_reset, diag_ice_count}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+import codegen_expr
+
+fn int_const(text: Str) -> Int { ir_const(1, 0, "int64_t", text) }
+fn int_var(name: Str) -> Int { ir_var_ref(1, 0, "int64_t", name, SlotForm.InlineWord) }
+fn s_var() -> Int { ir_var_ref(6, 0, "blink_S", "s", SlotForm.Inline) }
+fn sp_var() -> Int { ir_var_ref(7, 0, "blink_S*", "sp", SlotForm.PointerBoxed) }
+fn opt_var() -> Int { ir_var_ref(8, 0, "blink_Option_int", "o", SlotForm.Inline) }
+fn cl_var() -> Int { ir_var_ref(9, 0, "blink_closure*", "cl", SlotForm.PointerBoxed) }
+
+// One node of every value kind, as a `(kind, node)` pair, in the same order as ir_all_kinds.
+fn value_sample(k: IrKind) -> Int {
+    match k {
+        IrKind.Const => int_const("1")
+        IrKind.VarRef => int_var("a")
+        IrKind.GlobalRef => ir_global_ref(1, 0, "int64_t", "g", SlotForm.InlineWord)
+        IrKind.Unary => ir_unary(1, 0, "int64_t", "-", int_var("a"))
+        IrKind.Binary => ir_binary(1, 0, "int64_t", "+", int_var("a"), int_const("2"))
+        IrKind.Cast => ir_cast(5, 0, "double", int_var("a"))
+        IrKind.FieldGet => ir_field_get(1, 0, "int64_t", "x", SlotForm.InlineWord, sp_var())
+        IrKind.StructNew => ir_struct_new(6, 0, "blink_S", [int_const("1"), int_const("2")])
+        IrKind.TupleNew => ir_tuple_new(10, 0, "blink_Tuple_int_int", [int_const("1"), int_const("2")])
+        IrKind.ContainerNew => ir_container_new(4, 0, "blink_list*", "blink_list_new", [int_var("a")])
+        IrKind.Box => ir_box(7, 0, "blink_S*", "blink_S", s_var())
+        IrKind.Unbox => ir_unbox(6, 0, "blink_S", SlotForm.Inline, sp_var())
+        IrKind.CarrierWrap => ir_carrier_wrap(8, 0, "blink_Option_int", "value", int_const("1"), int_var("a"))
+        IrKind.CarrierUnwrap => ir_carrier_unwrap(1, 0, "int64_t", "value", SlotForm.InlineWord, opt_var())
+        IrKind.CarrierTag => ir_carrier_tag(5, 0, "int", opt_var())
+        IrKind.CallDirect => ir_call_direct(1, 0, "int64_t", "main_f", SlotForm.InlineWord, [int_var("a")])
+        IrKind.CallIndirect => ir_call_indirect(1, 0, "int64_t", SlotForm.InlineWord, ir_var_ref(11, 0, "int64_t (*)(int64_t)", "fp", SlotForm.InlineWord), [int_var("a")])
+        IrKind.CallClosure => ir_call_closure(1, 0, "int64_t", "int64_t(*)(const blink_closure*, int64_t)", SlotForm.InlineWord, cl_var(), [int_var("a")])
+        IrKind.CallVirtual => ir_call_virtual(1, 0, "int64_t", "get", SlotForm.InlineWord, sp_var(), [int_var("a")])
+        IrKind.CallRuntime => ir_call_runtime(1, 0, "int64_t", "blink_list_len", SlotForm.InlineWord, [ir_var_ref(4, 0, "blink_list*", "xs", SlotForm.PointerBoxed)])
+        IrKind.ClosureNew => ir_closure_new(9, 0, "blink_closure*", "__closure_0", [sp_var()])
+        IrKind.EffectPerform => ir_effect_perform(1, 0, "int64_t", "ue_x->get", SlotForm.InlineWord, [int_var("a")])
+        _ => -1
+    }
+}
+
+fn stmt_sample(k: IrKind) -> Int {
+    match k {
+        IrKind.FieldSet => ir_field_set(0, "x", sp_var(), int_const("3"))
+        IrKind.HandlerInstall => ir_handler_install(0, "ue_x", ir_var_ref(12, 0, "blink_ue_x_vtable*", "hv", SlotForm.PointerBoxed), ir_block(0, []))
+        IrKind.Let => ir_let(1, 0, "int64_t", "b", SlotForm.InlineWord, int_const("4"))
+        IrKind.Assign => ir_assign(0, int_var("a"), int_const("5"))
+        IrKind.ExprStmt => ir_expr_stmt(0, ir_call_direct(1, 0, "int64_t", "main_f", SlotForm.InlineWord, []))
+        IrKind.Return => ir_return(0, int_var("a"))
+        IrKind.If => ir_if(0, int_var("a"), ir_block(0, []), ir_block(0, []))
+        IrKind.Loop => ir_loop(0, ir_block(0, [ir_break(0)]))
+        IrKind.Break => ir_loop(0, ir_block(0, [ir_break(0)]))
+        IrKind.Continue => ir_loop(0, ir_block(0, [ir_continue(0)]))
+        IrKind.Block => ir_block(0, [])
+        IrKind.Switch => ir_switch(0, int_var("a"), [int_const("1"), ir_block(0, [])], ir_block(0, []))
+        IrKind.WithScope => ir_with_scope(0, "blink_file_close", ir_var_ref(13, 0, "blink_file*", "f", SlotForm.PointerBoxed), ir_block(0, []))
+        IrKind.Panic => ir_panic(0, ir_const(2, 0, "const char*", "\"boom\""))
+        IrKind.Unreachable => ir_unreachable(0)
+        _ => -1
+    }
+}
+
+fn expect_c(label: Str, got: Str, needle: Str) {
+    if !got.contains(needle) { io.println("FAIL: {label}: want '{needle}' in:\n{got}") }
+    assert(got.contains(needle))
+}
+
+test "every value kind prints in value position without an ICE" {
+    ir_reset()
+    diag_reset()
+    let mut seen = 0
+    for k in ir_all_kinds() {
+        if ir_kind_is_value(k) == 0 { continue }
+        let n = value_sample(k)
+        assert(n >= 0)
+        assert_eq(ir_kind(n), k)
+        print_reset()
+        let text = print_expr(n)
+        let pre = print_take()
+        assert(text != "")
+        assert(!text.contains("I0003"))
+        assert(!pre.contains("I0003"))
+        seen += 1
+    }
+    assert_eq(seen, 22)
+    assert_eq(diag_ice_count, 0)
+}
+
+test "every statement kind prints in statement position without an ICE" {
+    ir_reset()
+    diag_reset()
+    let mut seen = 0
+    for k in ir_all_kinds() {
+        if ir_kind_is_value(k) == 1 { continue }
+        let n = stmt_sample(k)
+        assert(n >= 0)
+        let errs = ir_verify(n)
+        if errs.len() > 0 { io.println("FAIL verify {ir_kind_name(k)}: {errs.join(" | ")}") }
+        assert_eq(errs.len(), 0)
+        print_reset()
+        print_stmt(n)
+        let c = print_take()
+        assert(!c.contains("I0003"))
+        seen += 1
+    }
+    assert_eq(seen, 15)
+    assert_eq(diag_ice_count, 0)
+}
+
+test "each kind prints its documented C form" {
+    ir_reset()
+    diag_reset()
+    print_reset()
+    expect_c("Unary", print_expr(value_sample(IrKind.Unary)), "(-a)")
+    expect_c("Binary", print_expr(value_sample(IrKind.Binary)), "(a + 2)")
+    expect_c("Cast", print_expr(value_sample(IrKind.Cast)), "((double)(a))")
+    expect_c("FieldGet through pointer", print_expr(value_sample(IrKind.FieldGet)), "sp->x")
+    expect_c("StructNew", print_expr(value_sample(IrKind.StructNew)), "((blink_S)\{1, 2})")
+    expect_c("TupleNew", print_expr(value_sample(IrKind.TupleNew)), "((blink_Tuple_int_int)\{1, 2})")
+    expect_c("Unbox", print_expr(value_sample(IrKind.Unbox)), "(*(sp))")
+    expect_c("CarrierWrap", print_expr(value_sample(IrKind.CarrierWrap)), "((blink_Option_int)\{.tag = 1, .value = a})")
+    expect_c("CarrierUnwrap", print_expr(value_sample(IrKind.CarrierUnwrap)), "o.value")
+    expect_c("CarrierTag", print_expr(value_sample(IrKind.CarrierTag)), "o.tag")
+    expect_c("CallDirect", print_expr(value_sample(IrKind.CallDirect)), "main_f(a)")
+    expect_c("CallIndirect", print_expr(value_sample(IrKind.CallIndirect)), "(fp)(a)")
+    expect_c("CallClosure", print_expr(value_sample(IrKind.CallClosure)), "((int64_t(*)(const blink_closure*, int64_t))cl->fn_ptr)(cl, a)")
+    expect_c("CallVirtual", print_expr(value_sample(IrKind.CallVirtual)), "(sp)->get(a)")
+    expect_c("CallRuntime", print_expr(value_sample(IrKind.CallRuntime)), "blink_list_len(xs)")
+    expect_c("EffectPerform", print_expr(value_sample(IrKind.EffectPerform)), "__ev->ue_x->get(a)")
+    let box_tmp = print_expr(value_sample(IrKind.Box))
+    let cont_tmp = print_expr(value_sample(IrKind.ContainerNew))
+    let cl_tmp = print_expr(value_sample(IrKind.ClosureNew))
+    let pre = print_take()
+    expect_c("Box alloc", pre, "blink_S* {box_tmp} = (blink_S*)blink_alloc(sizeof(blink_S));")
+    expect_c("Box store", pre, "*{box_tmp} = s;")
+    expect_c("ContainerNew ctor", pre, "blink_list* {cont_tmp} = blink_list_new();")
+    expect_c("ContainerNew push", pre, "blink_list_push({cont_tmp}, a);")
+    expect_c("ClosureNew", pre, "blink_closure* {cl_tmp} = blink_closure_new_typed((void*)__closure_0, ")
+
+    print_reset()
+    for k in ir_all_kinds() {
+        if ir_kind_is_value(k) == 0 { print_stmt(stmt_sample(k)) }
+    }
+    let c = print_take()
+    expect_c("FieldSet", c, "sp->x = 3;")
+    expect_c("HandlerInstall", c, "__blink_ev.ue_x = hv;")
+    expect_c("HandlerInstall fresh ev", c, "blink_ev* __ev = &_evw")
+    expect_c("Let", c, "int64_t b = 4;")
+    expect_c("Assign", c, "a = 5;")
+    expect_c("ExprStmt", c, "main_f();")
+    expect_c("Return", c, "return a;")
+    expect_c("If", c, "if (a) \{")
+    expect_c("Else", c, "else \{")
+    expect_c("Loop", c, "while (1) \{")
+    expect_c("Break", c, "break;")
+    expect_c("Continue", c, "continue;")
+    expect_c("Switch", c, "if (a == 1) \{")
+    expect_c("WithScope resource", c, "__attribute__((cleanup(blink_file_close))) = f;")
+    expect_c("Panic", c, "__blink_panic_dispatch(\"boom\");")
+    expect_c("Unreachable", c, "__builtin_unreachable();")
+    assert_eq(diag_ice_count, 0)
+}
+
+test "a statement kind in value position is an ICE, not a silent skip" {
+    ir_reset()
+    diag_reset()
+    print_reset()
+    let text = print_expr(ir_break(0))
+    assert(text.contains("I0003"))
+    assert_eq(diag_ice_count, 1)
+}
+
+test "a value kind in statement position is an ICE, not a silent skip" {
+    ir_reset()
+    diag_reset()
+    print_reset()
+    print_stmt(int_const("1"))
+    let c = print_take()
+    assert(c.contains("I0003"))
+    assert_eq(diag_ice_count, 1)
+}
+
+test "a non-Block where a Block is required is an ICE with a visible marker" {
+    ir_reset()
+    diag_reset()
+    print_reset()
+    print_block_body(ir_break(0))
+    assert(print_take().contains("I0003"))
+    assert_eq(diag_ice_count, 1)
+}
+
+test "a map or set literal is an ICE until the IR carries a key-operations table" {
+    ir_reset()
+    diag_reset()
+    print_reset()
+    let m = ir_container_new(12, 0, "blink_map*", "blink_map_new", [int_var("k"), int_var("v")])
+    assert(print_expr(m).contains("I0003"))
+    assert_eq(diag_ice_count, 1)
+    let st = ir_container_new(13, 0, "blink_set*", "blink_set_new", [])
+    assert(print_expr(st).contains("I0003"))
+    assert_eq(diag_ice_count, 2)
+}
+
+test "a typedef helper given lists of unequal length is an ICE with a visible marker" {
+    diag_reset()
+    print_reset()
+    print_effect_vtable_typedef("", "blink_ue_y_vtable", ["get"], [], [[]])
+    print_ev("", ["blink_ue_y_vtable"], [], "")
+    let c = print_take()
+    assert(c.contains("I0003"))
+    assert_eq(diag_ice_count, 2)
+}
+
+test "the effect vector takes the storage class the driver names" {
+    print_reset()
+    print_ev("", [], [], "static ")
+    let a = print_take()
+    assert(a.contains("static blink_ev __blink_ev;"))
+    assert(a.contains("blink_ev_default(void)"))
+    print_reset()
+    print_ev("", [], [], "extern ")
+    let b = print_take()
+    assert(b.contains("extern blink_ev __blink_ev;"))
+    assert(!b.contains("blink_ev_default"))
+}
+
+test "main initialises the runtime trace only when the driver asks" {
+    print_reset()
+    print_main_shim(true, false, false, false, true, 0, [])
+    let a = print_take()
+    assert(a.contains("blink_trace_init(argc, argv);"))
+    print_reset()
+    print_main_shim(true, false, false, false, false, 0, [])
+    assert(!print_take().contains("blink_trace_init"))
+}
+
+test "each typedef helper prints its documented form inside the guard it is given" {
+    print_reset()
+    print_struct_typedef("BLINK_TD_blink_S", "blink_S", ["int64_t x", "const char* name"])
+    print_tuple_typedef("", "blink_Tuple_int_str", ["int64_t", "const char*"])
+    print_simple_enum_typedef("BLINK_TD_blink_Color", "blink_Color", ["blink_Color_Red", "blink_Color_Blue"])
+    print_tagged_enum_typedef("BLINK_TD_blink_Shape", "blink_Shape", ["Dot", "Line"], [[], ["int64_t _0"]], ["BLINK_TAG_Shape_Dot", "BLINK_TAG_Shape_Line"])
+    print_option_typedef("BLINK_TD_blink_Option_S", "blink_Option_S", "blink_S")
+    print_result_typedef("BLINK_TD_blink_Result_int_str", "blink_Result_int_str", "int64_t", "const char*")
+    print_result_typedef("BLINK_TD_blink_Result_str_str", "blink_Result_str_str", "const char*", "const char*")
+    print_effect_vtable_typedef("BLINK_TD_blink_ue_x_vtable", "blink_ue_x_vtable", ["get", "put"], ["int64_t", "void"], [["int64_t a"], []])
+    print_effect_vtable_typedef("", "blink_ue_bare_vtable", [], [], [])
+    print_effect_default_vtable("blink_ue_x_vtable", ["blink_ue_x_default_get", "blink_ue_x_default_put"])
+    let c = print_take()
+    expect_c("struct guard", c, "#ifndef BLINK_TD_blink_S\n#define BLINK_TD_blink_S\ntypedef struct \{\n    int64_t x;\n    const char* name;\n} blink_S;\n#endif")
+    expect_c("tuple without guard", c, "} blink_Tuple_int_str;\n#ifndef BLINK_TD_blink_Color")
+    expect_c("tuple fields", c, "    int64_t _0;\n    const char* _1;")
+    expect_c("simple enum", c, "typedef enum \{ blink_Color_Red, blink_Color_Blue } blink_Color;")
+    expect_c("tagged enum tag", c, "    int tag;\n    union \{")
+    expect_c("tagged enum variant", c, "        struct \{\n            int64_t _0;\n        } Line;")
+    expect_c("tagged enum data", c, "    } data;\n} blink_Shape;")
+    expect_c("tag macro", c, "#ifndef BLINK_TAG_Shape_Line\n#define BLINK_TAG_Shape_Line 1\n#endif")
+    expect_c("option", c, "typedef struct \{ int tag; blink_S value; } blink_Option_S;")
+    expect_c("result", c, "typedef struct \{ int tag; union \{ int64_t ok; const char* err; }; } blink_Result_int_str;")
+    assert(!c.contains("blink_Result_str_str"))
+    expect_c("vtable slots then capture words", c, "    int64_t (*get)(int64_t a);\n    void (*put)(void);\n    void* __userdata_get;\n    void* __userdata_put;\n} blink_ue_x_vtable;")
+    expect_c("bare vtable is never empty", c, "typedef struct \{\n    void* __userdata;\n} blink_ue_bare_vtable;")
+    expect_c("default vtable order", c, "blink_ue_x_vtable_default = \{\n    blink_ue_x_default_get,\n    blink_ue_x_default_put,\n    NULL,\n    NULL,\n};")
+}
+
+test "field access spells -> through a pointer-held object and . through an inline one" {
+    ir_reset()
+    print_reset()
+    let sp = sp_var()
+    let sv = s_var()
+    assert(ir_held_by_pointer(sp))
+    assert(!ir_held_by_pointer(sv))
+    assert_eq(print_expr(ir_field_get(1, 0, "int64_t", "x", SlotForm.InlineWord, sp)), "sp->x")
+    assert_eq(print_expr(ir_field_get(1, 0, "int64_t", "x", SlotForm.InlineWord, sv)), "s.x")
+    assert_eq(print_expr(ir_call_virtual(1, 0, "int64_t", "get", SlotForm.InlineWord, sp, [])), "(sp)->get()")
+    assert_eq(print_expr(ir_call_virtual(1, 0, "int64_t", "get", SlotForm.InlineWord, sv, [])), "(s).get()")
+}
