@@ -1,0 +1,73 @@
+import std.fs
+import std.io
+import typecheck.{check_types, tc_type_str}
+import mono2.{run_mono, instances, MonoInst}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+// typecheck still reaches its CT bridge in codegen_types; linking needs it until that bridge goes.
+import codegen_expr
+
+// Each `Holder { m: Map() }` infers its V through a fresh metavar. The metavar binds
+// later, so the pool holds one `Holder[Map[Key, ?n]]` entry per construction site. The
+// pass must key on the solved type, not on the entry: one instance per printed type.
+fn probe_src() -> Str {
+    #"@derive(Hash, Eq)
+type Key { id: Int }
+type Holder[V] { m: Map[Key, V] }
+fn main() {
+    let a = Holder { m: Map() }
+    a.m.insert(Key { id: 1 }, "one")
+    let b = Holder { m: Map() }
+    b.m.insert(Key { id: 2 }, "two")
+    let c = Holder { m: Map() }
+    c.m.insert(Key { id: 3 }, "three")
+    let d = Holder { m: Map() }
+    d.m.insert(Key { id: 4 }, 4)
+    assert(a.m.len() + b.m.len() + c.m.len() + d.m.len() == 4)
+}
+"#
+}
+
+fn find_type(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.TypeDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn instances_of(decl: Int) -> List[MonoInst] {
+    let mut out: List[MonoInst] = []
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(inst) }
+    }
+    out
+}
+
+test "metavar-inferred struct args collapse to one instance per solved type" {
+    let path = "build/mono_metavar_canon_probe.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+    let holder = find_type("Holder")
+    assert(holder >= 0)
+    let insts = instances_of(holder)
+    for inst in insts {
+        io.println("instance {inst.c_name} args={tc_type_str(inst.arg_tids)}")
+    }
+    assert_eq(insts.len(), 2)
+    let mut seen_str = 0
+    let mut seen_int = 0
+    for inst in insts {
+        let s = tc_type_str(inst.arg_tids)
+        assert(!s.contains("?"))
+        if s.contains("Str") { seen_str = seen_str + 1 }
+        if s.contains("Int") { seen_int = seen_int + 1 }
+    }
+    assert_eq(seen_str, 1)
+    assert_eq(seen_int, 1)
+}

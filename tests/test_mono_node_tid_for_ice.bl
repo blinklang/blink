@@ -1,0 +1,84 @@
+import std.fs
+import std.io
+import typecheck.{check_types}
+import mono2.{run_mono, instances, node_tid_for_inst, MonoInst}
+import diagnostics.{diag_ice_count}
+import parser.{nodes, node_kind, node_name, node_body}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+// typecheck still reaches its CT bridge in codegen_types; linking needs it until that bridge goes.
+import codegen_expr
+
+fn probe_src() -> Str {
+    #"fn id[T](x: T) -> T { x }
+fn never_called[T](x: T) -> T { x }
+fn main() {
+    assert(id(1) == 1)
+}
+"#
+}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn first_instance_of(decl: Int) -> MonoInst {
+    for inst in instances() {
+        if inst.base_decl_node == decl { return inst }
+    }
+    io.println("FAIL: no instance for decl {decl}")
+    assert(false)
+    instances().get(0).unwrap()
+}
+
+test "node outside the instance's body is an ICE, not a guess" {
+    let path = "build/mono_node_tid_ice_probe.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+    let id = find_fn("id")
+    let nc = find_fn("never_called")
+    assert(id >= 0)
+    assert(nc >= 0)
+    let inst = first_instance_of(id)
+    let before = diag_ice_count
+    let got = node_tid_for_inst(inst, node_body(nc))
+    assert_eq(got, -1)
+    assert_eq(diag_ice_count, before + 1)
+}
+
+test "node inside the instance's body answers without an ICE" {
+    let path = "build/mono_node_tid_ok_probe.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+    let id = find_fn("id")
+    let inst = first_instance_of(id)
+    let before = diag_ice_count
+    let got = node_tid_for_inst(inst, node_body(id))
+    assert(got >= 0)
+    assert_eq(diag_ice_count, before)
+}
+
+test "the program node itself is outside every instance" {
+    let path = "build/mono_node_tid_prog_probe.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+    let inst = first_instance_of(find_fn("id"))
+    let before = diag_ice_count
+    let got = node_tid_for_inst(inst, program)
+    assert_eq(got, -1)
+    assert_eq(diag_ice_count, before + 1)
+}

@@ -1,0 +1,118 @@
+import std.fs
+import std.io
+import typecheck.{check_types, tc_type_str}
+import mono2.{run_mono, instances, MonoInst}
+import cname.{c_poly_method_name}
+import parser.{nodes, node_kind, node_name, node_methods, sublist_get}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+// typecheck still reaches its CT bridge in codegen_types; linking needs it until that bridge goes.
+import codegen_expr
+
+fn find_decl(kind: NodeKind, name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == kind && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn instances_of(decl: Int) -> List[MonoInst] {
+    let mut out: List[MonoInst] = []
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(inst) }
+    }
+    out
+}
+
+// The nested compile resolves the prelude from BLINK_ROOT; the harness runs
+// from the repo root, so the cwd is that root.
+fn run_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    env.set_var("BLINK_ROOT", env.cwd())
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+}
+
+// A field default is an expression body that no function owns.
+test "a struct field default that calls a generic fn registers the instance" {
+    run_probe("build/mono_root_field_default.bl", #"type Wrap[T] { v: T }
+fn mk[T](x: T) -> Wrap[T] { Wrap { v: x } }
+type Cfg { w: Wrap[Int] = mk(5) }
+fn main() {
+    let c = Cfg {}
+    assert(c.w.v == 5)
+}
+"#)
+    let mk = find_decl(NodeKind.FnDef, "mk")
+    assert(mk >= 0)
+    assert_eq(instances_of(mk).len(), 1)
+}
+
+// `Outer[Int]` names `Wrap[Int]` only through its field type; no root spells it.
+test "a generic type instance reaches the generic types its fields name" {
+    run_probe("build/mono_reach_type_body.bl", #"type Wrap[T] { v: T }
+type Outer[T] { xs: List[Wrap[T]] }
+fn main() {
+    let o: Outer[Int] = Outer { xs: [] }
+    assert(o.xs.len() == 0)
+}
+"#)
+    let wrap = find_decl(NodeKind.TypeDef, "Wrap")
+    assert(wrap >= 0)
+    let insts = instances_of(wrap)
+    assert_eq(insts.len(), 1)
+    assert_eq(tc_type_str(insts.get(0).unwrap().arg_tids), "(Int)")
+}
+
+// The local closure shadows the generic item; the call is a value call.
+test "a local value that shadows a generic fn name is not a generic call" {
+    run_probe("build/mono_shadow_local_callee.bl", #"fn pick[A, B](a: A, b: B) -> A { a }
+fn main() {
+    let pick = fn(x: Int) -> Int { x }
+    assert(pick(1) == 1)
+}
+"#)
+    let pick = find_decl(NodeKind.FnDef, "pick")
+    assert(pick >= 0)
+    assert_eq(instances_of(pick).len(), 0)
+}
+
+// `list` is also the name of a prelude module; the receiver here is a value.
+test "a list HOF on a local named like a module registers the HOF instance" {
+    run_probe("build/mono_hof_on_module_named_local.bl", #"fn main() {
+    let list = [1, 2, 3]
+    assert(list.fold(0, fn(a: Int, b: Int) -> Int { a + b }) == 6)
+}
+"#)
+    let list_fold = find_decl(NodeKind.FnDef, "list_fold")
+    assert(list_fold >= 0)
+    assert_eq(instances_of(list_fold).len(), 1)
+}
+
+// The element segment carries an underscore; cname escapes it so two spellings
+// cannot share a C symbol.
+test "a poly-impl method instance takes its C name from cname" {
+    run_probe("build/mono_poly_method_cname.bl", #"trait Head { fn head(self) -> Option[T] }
+impl[T] Head for List[T] {
+    fn head(self) -> Option[T] { self.get(0) }
+}
+fn main() {
+    let xs: List[Option[Int]] = [Some(1)]
+    assert(xs.head().is_some())
+}
+"#)
+    let im = find_decl(NodeKind.ImplBlock, "List")
+    assert(im >= 0)
+    let head = sublist_get(node_methods(im), 0)
+    assert_eq(node_name(head), "head")
+    let insts = instances_of(head)
+    assert_eq(insts.len(), 1)
+    let inst = insts.get(0).unwrap()
+    assert_eq(inst.c_name, c_poly_method_name(im, "head", inst.arg_tids))
+    assert(inst.c_name.contains("_1"))
+    io.println("poly c_name {inst.c_name}")
+}

@@ -1,0 +1,110 @@
+import std.fs
+import std.io
+import typecheck.{check_types, tc_type_str}
+import mono2.{run_mono, instances, node_tid_for_inst, MonoInst}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind, nk_of}
+import compiler.{compile_to_program}
+// typecheck still reaches its CT bridge in codegen_types; linking needs it until that bridge goes.
+import codegen_expr
+
+// Box[T] declares its own T, and mk[T] declares another T of the same name. The
+// substitution must follow the binder that owns each use, not the spelling.
+fn probe_src() -> Str {
+    #"type Box[T] { val: T }
+fn mk[T](x: T) -> Box[T] { Box { val: x } }
+fn unbox[T](b: Box[T]) -> T { b.val }
+fn main() {
+    let bi = mk(1)
+    let bs = mk("s")
+    assert(unbox(bi) == 1)
+    assert(unbox(bs) == "s")
+}
+"#
+}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// The parser numbers a body before the FnDef node that owns it, so the body node of
+// `decl` is the nearest node of `kind` below the declaration's own id.
+fn find_kind_before(kind: NodeKind, decl: Int) -> Int {
+    let mut i = decl - 1
+    while i >= 0 {
+        if nk_of(node_kind(i)) == kind { return i }
+        i = i - 1
+    }
+    -1
+}
+
+fn instances_of(decl: Int) -> List[MonoInst] {
+    let mut out: List[MonoInst] = []
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(inst) }
+    }
+    out
+}
+
+fn type_strs(decl: Int, node: Int) -> List[Str] ! Diag.Report {
+    let mut out: List[Str] = []
+    for inst in instances_of(decl) {
+        out.push(tc_type_str(node_tid_for_inst(inst, node)))
+    }
+    out
+}
+
+fn has(xs: List[Str], want: Str) -> Bool {
+    for x in xs {
+        if x == want { return true }
+    }
+    false
+}
+
+test "each mk[T] instance sees Box literal under its own T" {
+    let path = "build/mono_binder_identity_probe.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+    let mk = find_fn("mk")
+    assert(mk >= 0)
+    let box_lit = find_kind_before(NodeKind.StructLit, mk)
+    assert(box_lit >= 0)
+    let strs = type_strs(mk, box_lit)
+    if strs.len() != 2 {
+        io.println("FAIL: expected 2 mk instances, got {strs.len()}")
+    }
+    assert_eq(strs.len(), 2)
+    assert(has(strs, "Box[Int]"))
+    assert(has(strs, "Box[Str]"))
+}
+
+test "unbox[T] field access resolves through Box's own binder" {
+    let path = "build/mono_binder_identity_probe2.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+    let unbox = find_fn("unbox")
+    assert(unbox >= 0)
+    let fa = find_kind_before(NodeKind.FieldAccess, unbox)
+    assert(fa >= 0)
+    let strs = type_strs(unbox, fa)
+    assert_eq(strs.len(), 2)
+    assert(has(strs, "Int"))
+    assert(has(strs, "Str"))
+    let mut inst_strs: List[Str] = []
+    for inst in instances_of(unbox) {
+        inst_strs.push(tc_type_str(inst.inst_tid))
+    }
+    assert(has(inst_strs, "Fn(Box[Int]) -> Int"))
+    assert(has(inst_strs, "Fn(Box[Str]) -> Str"))
+}
