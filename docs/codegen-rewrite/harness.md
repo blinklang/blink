@@ -107,9 +107,9 @@ yet counts as empty. Tests and docs are never scanned.
 | L3 | `pub_let_mut_unlisted` | 0 | A mutable global whose name is not in `scripts/lint_pub_let_mut_allow.txt` |
 | L4 | `typename_compares` | 0 | A type name compared as a string |
 | L5 | `no_infer` | 0 | A call to any `infer_*` function |
-| L6 | `layout_outside_layer` | 0 | A C type spelled outside `layout.bl` and `cg_print.bl`; a `TyKind` test inside `cg_print.bl` |
+| L6 | `layout_outside_layer` | 0 | A C type spelled outside `layout.bl`, `cname.bl` and `cg_print.bl`; a `TyKind` test inside `cg_print.bl` |
 | L7 | `single_producer` | 0 | A name producer defined twice anywhere in `src/`, or missing while its owner file exists |
-| L8 | `import_dag` | 0 | An import that goes the wrong way in the layer order |
+| L8 | `import_dag` | 0 | An import that goes the wrong way in the layer order. The `layout.bl` and `cname.bl` edges come from `scripts/lint_import_dag.sh`, the printer's from `scripts/lint_print_imports.sh` when it exists |
 | L9 | `fn_length` | 0 | A function longer than 80 lines |
 | L10 | `br_ids_in_source` | 0 | A br ticket id in source |
 | L11 | `untested_pub_fns` | 0 | A `pub fn` in the reading layer or mono that no test names |
