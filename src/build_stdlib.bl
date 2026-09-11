@@ -13,11 +13,10 @@ import lexer.{Lex}
 import parser.{Parse}
 import typecheck.{TypeCheck, check_types}
 import compiler.{compile_to_program, check_unused_imports, embedded_keys}
-import codegen.{Codegen, generate, generate_archive_header}
-import codegen_types.{cg_emit_only_module, cg_skip_modules, cg_archive_build_mode, list_contains_str}
+import cg.{Codegen, CgConfig, generate, generate_archive_header}
 import mutation_analysis.{analyze_mutations, analyze_save_restore}
 import escape.{analyze_escapes}
-import mono2.{run_mono}
+import mono.{run_mono}
 import diagnostics.{Diag, diag_count, diag_ice_count, diag_flush}
 import cli.{resolve_install_root, run_cc, sha256_of_file_first, process_blinkc_sha, blink_cli_version}
 import stdlib_native_deps.{peeled_module_keys, peeled_module_dotted, peeled_module_underscored}
@@ -106,7 +105,7 @@ pub fn list_stdlib_modules() -> List[Str] {
 
 // Same module list as list_stdlib_modules() but in the underscore form
 // node_source_module() yields ("std_json", not "std.json"). Used to
-// populate cg_skip_modules so the archive provides those bodies.
+// populate the emit config's skip_modules so the archive provides those bodies.
 //
 // Peeled modules (those backed by a vendored native dep, see
 // stdlib_native_deps) are excluded here because they're NOT in the
@@ -119,7 +118,7 @@ pub fn list_stdlib_module_keys() -> List[Str] {
     let mut i = 0
     while i < mods.len() {
         let key = mods.get(i).unwrap().replace(".", "_")
-        if list_contains_str(peeled, key) == 0 { out.push(key) }
+        if !peeled.contains(key) { out.push(key) }
         i = i + 1
     }
     out
@@ -262,14 +261,14 @@ pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Par
     let all_modules = list_stdlib_modules()
     // Strip peeled (dotted-form) modules from the archive entry imports.
     // Their bodies are excluded from monolith.o; codegen emits them into
-    // the user TU on demand (gated by cg_skip_modules subtraction in
+    // the user TU on demand (gated by the emit config's skip_modules subtraction in
     // list_stdlib_module_keys).
     let peeled_set = peeled_module_dotted()
     let mut modules: List[Str] = []
     let mut mi = 0
     while mi < all_modules.len() {
         let m = all_modules.get(mi).unwrap()
-        if list_contains_str(peeled_set, m) == 0 { modules.push(m) }
+        if !peeled_set.contains(m) { modules.push(m) }
         mi = mi + 1
     }
     let manifest = build_manifest(blinkc, std_dir, modules, rt_path_final, peeled)
@@ -306,19 +305,20 @@ pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Par
     let esc_rc = bail_on_diag()
     if esc_rc != 0 { return esc_rc }
 
-    cg_emit_only_module = ""
-    cg_skip_modules = Map()
-    cg_archive_build_mode = 0
-
-    let header = generate_archive_header(program)
+    // The archive is the whole stdlib in one TU: no module filter, nothing skipped.
+    let hdr_cfg = CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0,
+        emit_only_module: "", skip_modules: Map(), user_tu_mode: 0,
+        blink_ev_extern_only: 0, archive_build_mode: 0 }
+    let header = generate_archive_header(program, hdr_cfg)
     let hdr_rc = bail_on_diag()
     if hdr_rc != 0 { return hdr_rc }
     write_file("{cache_dir}/libblink_std.h", header)
     write_file("{cache_dir}/runtime.h", read_file(rt_path_final))
 
-    cg_archive_build_mode = 1
-    let monolith_c = generate(program)
-    cg_archive_build_mode = 0
+    let mono_cfg = CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0,
+        emit_only_module: "", skip_modules: Map(), user_tu_mode: 0,
+        blink_ev_extern_only: 0, archive_build_mode: 1 }
+    let monolith_c = generate(program, mono_cfg)
     let mono_rc = bail_on_diag()
     if mono_rc != 0 { return mono_rc }
     write_file("{cache_dir}/monolith.c", monolith_c)

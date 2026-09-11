@@ -66,8 +66,8 @@ expect_red layout_outside_layer cg_b.bl 'let s = "int64_t"'
 # single_producer: the same producer defined in two files is a twin.
 dir="$WORK/case_single_producer"
 write_clean "$dir"
-printf 'fn c_fn_name(x: Int) -> Str { "" }\n' > "$dir/src/cg_b.bl"
-printf 'fn c_fn_name(x: Int) -> Str { "" }\n' >> "$dir/src/cg_a.bl"
+printf 'fn c_fn_decl_name(x: Int) -> Str { "" }\n' > "$dir/src/cg_b.bl"
+printf 'fn c_fn_decl_name(x: Int) -> Str { "" }\n' >> "$dir/src/cg_a.bl"
 if run_lint "$dir" > "$dir.out" 2>&1 || ! grep -qE '^L7 +single_producer .*OVER' "$dir.out"; then
     echo "FAIL single_producer: twin definition not caught:"; cat "$dir.out"; fail=1
 else
@@ -78,7 +78,7 @@ expect_red import_dag          cg_b.bl 'import codegen'
 dir="$WORK/case_import_dag_shared"
 write_clean "$dir"
 printf 'import typecheck.{tc_x}\npub fn layout_of() -> Int { 1 }\n' > "$dir/src/layout.bl"
-printf 'pub fn c_fn_name() -> Str { "" }\n' > "$dir/src/cname.bl"
+printf 'pub fn c_fn_decl_name() -> Str { "" }\n' > "$dir/src/cname.bl"
 if run_lint "$dir" > "$dir.out" 2>&1 || ! grep -qE '^L8 +import_dag .*OVER' "$dir.out" || ! grep -q 'must import cname' "$dir.out"; then
     echo "FAIL import_dag: missing layout -> cname edge not caught:"; cat "$dir.out"; fail=1
 else

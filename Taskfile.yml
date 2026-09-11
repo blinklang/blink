@@ -497,10 +497,13 @@ tasks:
       - ./scripts/test_node_tid_diff.sh
 
   # Release gate: the old full CI under its new name. Self-host regen, the
-  # whole test suite, per-module invariants, installed-layout smoke. Run it
-  # at release points; during the codegen rewrite `task ci` below is the
-  # daily gate. mono-diff and node-tid-diff are parked: the tasks still
-  # exist, but neither gate runs them.
+  # whole test suite, per-module invariants, installed-layout smoke.
+  #
+  # NOT RUNNABLE during the codegen rewrite: every step below needs a compiler
+  # that can emit C, and this tree raises I0004 until the emitters land. `task ci`
+  # is the daily gate. mono-diff, node-tid-diff and test-node-tid-diff read a
+  # stderr census that run_mono_diff produced; that pass went with the old mono,
+  # so those three cannot pass either until the rewrite restores or retires them.
   ci-release:
     desc: Release CI (self-host regen + full suite + per-module invariants)
     silent: true
@@ -519,12 +522,12 @@ tasks:
       - ./scripts/gen1.sh
 
   corpus:
-    desc: Compile+run every tests/test_*.bl under gen0 independently; writes build/corpus.json, then lints
+    desc: Compile+run every tests/test_*.bl under gen1 independently; writes build/corpus.json, then lints
     silent: true
     vars:
       CORPUS_LINT: '{{.CORPUS_LINT | default "1"}}'
     cmds:
-      - task: gen0
+      - task: gen1
       # ci already ran the lint through ratchet; it passes CORPUS_LINT=0.
       - ./scripts/corpus.sh {{if ne .CORPUS_LINT "1"}}--no-lint{{end}}
 
@@ -546,13 +549,21 @@ tasks:
     cmds:
       - ./scripts/lint_codegen.sh
 
+  # Pinned to gen0 on purpose. These files assert typechecker behaviour by
+  # RUNNING, so they need a compiler that can emit, and gen1 cannot until the
+  # tid-native emitters land. Under gen0 the suite measures gen0's typechecker,
+  # not this tree's; see docs/codegen-rewrite/harness.md.
   typecheck-suite:
     desc: Run the typechecker tests listed in scripts/typecheck_suite.txt under gen0; all must pass
     silent: true
     cmds:
       - task: gen0
       - |
-        CORPUS_OUT={{.BUILD_DIR}}/typecheck_suite.json ./scripts/corpus.sh --only scripts/typecheck_suite.txt --no-lint
+        # set -e, or a corpus.sh that exits without writing the JSON leaves passed and
+        # total empty, `[ "" != "" ]` is false, and the gate reports ok on a run that
+        # never happened.
+        set -e
+        CORPUS_COMPILER={{.BUILD_DIR}}/gen0 CORPUS_OUT={{.BUILD_DIR}}/typecheck_suite.json ./scripts/corpus.sh --only scripts/typecheck_suite.txt --no-lint
         passed=$(jq -r .passed {{.BUILD_DIR}}/typecheck_suite.json)
         total=$(jq -r .total {{.BUILD_DIR}}/typecheck_suite.json)
         if [ "$passed" != "$total" ]; then

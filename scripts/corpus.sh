@@ -5,10 +5,14 @@
 # pre-typecheck, so a tree that compiles only part of the corpus still gets
 # an honest number.
 #
+# The compiler under test is gen1 — the CURRENT source compiled by the pinned
+# gen0. gen0 itself is a fixed binary, so a corpus run against it measures
+# nothing about the tree and never moves.
+#
 #   scripts/corpus.sh [--only <list file>] [--no-lint]
 #
 # Env:
-#   CORPUS_COMPILER  dir holding blink/blinkc/libblink_std.* (default build/gen0)
+#   CORPUS_COMPILER  dir holding blink/blinkc/libblink_std.* (default build/gen1)
 #   CORPUS_JOBS      parallel workers (default: nproc)
 #   CORPUS_OUT       output JSON (default build/corpus.json)
 #
@@ -28,7 +32,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-comp="${CORPUS_COMPILER:-build/gen0}"
+comp="${CORPUS_COMPILER:-build/gen1}"
 jobs="${CORPUS_JOBS:-$(nproc 2>/dev/null || echo 8)}"
 if [ -n "$only" ]; then
     out="${CORPUS_OUT:-build/corpus_subset.json}"
@@ -37,7 +41,7 @@ else
 fi
 
 if [ ! -x "$comp/blink" ] || [ ! -x "$comp/blinkc" ]; then
-    echo "corpus: no compiler at $comp (run 'task gen0' or set CORPUS_COMPILER)" >&2
+    echo "corpus: no compiler at $comp (run 'task gen1' or set CORPUS_COMPILER)" >&2
     exit 2
 fi
 for tool in parallel jq bc timeout; do

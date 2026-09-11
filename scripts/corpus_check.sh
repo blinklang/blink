@@ -15,6 +15,24 @@
 # would land them, so HEAD is the real parent), else HEAD~1. Override with
 # CORPUS_HEAD1_REF. A ref with no baseline file skips that half.
 #
+# One-time reset: a change that removes the ability to compile at all (the
+# codegen rewrite deleting the emitters) drops the pass count to zero for a
+# reason no gain can offset. The baseline may then carry a hand-written
+# "reset" object naming the PREDECESSOR COMMIT whose baseline it gives up:
+#
+#   "reset": {
+#     "reason": "<why the count went to zero>",
+#     "resets_from_commit": "<short sha of the predecessor being left behind>",
+#     "previous_passed": <that baseline's pass count>
+#   }
+#
+# That skips the previous-commit half for exactly that one predecessor and
+# reports what was given up. Keying on the commit, not on a field inside its
+# baseline, is what makes it one-shot: consecutive commits share a baseline
+# and so share its git_head, but only one commit is the named predecessor.
+# --update never writes the object, so a reset is always a deliberate hand
+# edit, and it warns when it drops one. The baseline half always runs.
+#
 # Env:
 #   CORPUS_JSON       result file (default build/corpus.json)
 #   CORPUS_BASELINE   baseline file (default scripts/corpus_baseline.json)
@@ -41,6 +59,10 @@ if ! well_formed "$json"; then
 fi
 
 if [ "${1:-}" = "--update" ]; then
+    if [ -f "$baseline" ] && jq -e 'has("reset")' "$baseline" >/dev/null 2>&1; then
+        echo "corpus-check: WARNING the baseline carried a one-time reset object; --update drops it." >&2
+        echo "corpus-check:   re-add it by hand if the previous-commit half must still be skipped." >&2
+    fi
     # Only what the gate reads: the summary and each file's status. Timings
     # and error lines change run to run and would make every diff noisy.
     jq '{
@@ -122,7 +144,19 @@ if git rev-parse --verify --quiet "${head1_ref}^{commit}" >/dev/null 2>&1; then
     head1_file=$(mktemp)
     trap 'rm -f "$head1_file"' EXIT
     if git show "${head1_ref}:$baseline" > "$head1_file" 2>/dev/null; then
-        compare "$head1_ref" "$head1_file"
+        # One read, so the three fields cannot come from different parses.
+        IFS=$(printf '\t') read -r reset_from reset_passed reset_reason <<EOF
+$(jq -r '[.reset.resets_from_commit // "", .reset.previous_passed // "", .reset.reason // ""] | @tsv' "$baseline")
+EOF
+        head1_sha=$(git rev-parse --short "$head1_ref" 2>/dev/null || echo "")
+        if [ -n "$reset_from" ] && [ "$reset_from" = "$head1_sha" ]; then
+            echo "corpus-check: baseline declares a one-time reset from commit $reset_from"
+            echo "corpus-check:   reason: $reset_reason"
+            echo "corpus-check:   given up: $reset_passed passing files"
+            echo "corpus-check: skipping the previous-commit comparison for that commit only"
+        else
+            compare "$head1_ref" "$head1_file"
+        fi
     else
         echo "corpus-check: no baseline in $head1_ref; skipping the previous-commit comparison"
     fi
