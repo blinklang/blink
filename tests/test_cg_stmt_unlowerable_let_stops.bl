@@ -1,0 +1,98 @@
+// A `let` whose declared type was never recorded cannot be lowered. This file reads what
+// the statement stage does about it: it stops, and it stops before the name binds.
+//
+// Nothing here calls check_types. The node-to-type table is presized only by that call
+// and survives between tests in one process, so a parse that never reached typecheck is
+// the way to build a statement whose type is missing. Every test in this file depends on
+// that, which is why none of them typechecks a program.
+
+import std.fs
+import typecheck.{TYPE_INT}
+import layout.{bind_binder, binder_scope_pop, binder_scope_push, layout_reset}
+import ir.{ir_reset}
+import parser.{nodes, node_body, node_kind, node_name}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import cg_stmt.{cg_stmt_reset, lower_block}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// Parses one probe and answers its named function, with no types recorded for it.
+fn parse_probe(path: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, FS.Delete {
+    env.set_var("BLINK_ROOT", env.cwd())
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    diag_reset()
+    write_file(path, src)
+    let _program = compile_to_program(path, 1)
+    let _ = fs.delete(path)
+    let f = find_fn(name)
+    assert(f >= 0)
+    f
+}
+
+fn ice_mentioning(text: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.message.contains(text) { n = n + 1 }
+    }
+    n
+}
+
+test "an inner let with no recorded type does not resolve to an outer binder" {
+    let f = parse_probe("build/cg_stmt_stop_shadow.bl", #"fn probe_shadow() {
+    let x = 1
+    x = 2
+}
+fn main() { probe_shadow() }
+"#, "probe_shadow")
+    // An outer frame holds the same name at a type the inner declaration is not. If the
+    // inner `let` binds anyway, its entry answers nothing and the assignment below reads
+    // this outer type instead, which is the wrong type reported as if it were the right
+    // one. The lowering must stop at the `let` and build no assignment at all.
+    let outer = binder_scope_push()
+    bind_binder(outer, "x", TYPE_INT)
+    let block = lower_block(node_body(f))
+    binder_scope_pop()
+    assert(block < 0)
+    // The stop must be the `let`'s missing type, not a later statement declining for its
+    // own reason: a stop at the assignment would pass this file while the shadowing hole
+    // stayed open.
+    assert(ice_mentioning("no recorded type") > 0)
+    assert_eq(ice_mentioning("not a local"), 0)
+}
+
+test "a let with no recorded type is reported once, not once per stage that reads it" {
+    let f = parse_probe("build/cg_stmt_stop_once.bl", #"fn probe_once() {
+    let y = 1
+}
+fn main() { probe_once() }
+"#, "probe_once")
+    let block = lower_block(node_body(f))
+    assert(block < 0)
+    assert(ice_mentioning("no recorded type") > 0)
+    // The missing type is the one error. Handing the missing type on to layout would
+    // report a declined layout on top of it, and the reader would meet that one first.
+    assert_eq(ice_mentioning("layout declined"), 0)
+}
+
+test "a destructuring let with no recorded type stops the same way" {
+    let f = parse_probe("build/cg_stmt_stop_tuple.bl", #"fn probe_tuple() {
+    let (a, b) = (1, 2)
+}
+fn main() { probe_tuple() }
+"#, "probe_tuple")
+    let block = lower_block(node_body(f))
+    assert(block < 0)
+    assert(ice_mentioning("no recorded type") > 0)
+    assert_eq(ice_mentioning("layout declined"), 0)
+}

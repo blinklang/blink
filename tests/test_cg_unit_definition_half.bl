@@ -1,10 +1,11 @@
 import std.fs
 import std.io
-import typecheck.{check_types}
+import typecheck.{check_types, tc_type_decl_nodes}
 import layout.{layout_reset}
-import cname.{cname_reset}
+import cname.{cname_reset, cname_is_transparent_newtype}
 import diagnostics.{diag_entries}
-import cg.{CgConfig, generate}
+import cg.{CgConfig, generate, generate_module_header, generate_module_object}
+import mono.{run_mono, instances}
 import compiler.{compile_to_program}
 
 fn assert_eq_int(label: Str, got: Int, want: Int) {
@@ -32,6 +33,16 @@ fn ices_naming(stage: Str) -> Int {
     n
 }
 
+// A diagnostic's name is a field of its own, not part of its message, so a stage counted
+// by message text and a failure named by code need different readers.
+fn ices_named(name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.name == name { n = n + 1 }
+    }
+    n
+}
+
 fn assert_ice_names(stage: Str, before: Int) {
     let after = ices_naming(stage)
     if after <= before {
@@ -47,11 +58,14 @@ fn assert_lacks(text: Str, needle: Str) {
     assert(text.index_of(needle) < 0)
 }
 
+// The same order the real drivers use. The mono pass is not part of generate, so a probe
+// that skips it has no instance table and a generic base looks like a base with no uses.
 fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
     let path = "build/{name}.bl"
     write_file(path, src)
     let program = compile_to_program(path, 1)
     check_types(program)
+    run_mono(program)
     layout_reset()
     cname_reset()
     let _ = fs.delete(path)
@@ -66,10 +80,12 @@ fn standalone_cfg() -> CgConfig {
 // `plain` is a root body: every type in it is concrete, so it has one definition. `ident`
 // is a generic base, which has a definition only once a type argument is chosen — one per
 // monomorphized instance, and none under the base itself.
+// `main` holds only a leaf value so this whole unit lowers without a report. A probe that
+// reports for an unrelated reason cannot be used to prove that some other shape is silent.
 fn root_src() -> Str {
     #"fn plain(a: Int) -> Int { a }
 fn ident[T](x: T) -> T { x }
-fn main() { assert(true) }
+fn main() { let x = 1 }
 "#
 }
 
@@ -92,13 +108,16 @@ test "a generic base contributes no root definition" {
     assert_lacks(text, "blink_u_ident")
 }
 
-// The per-instance loop is the next stage, not a shape this one may skip quietly: a
-// generic base with instances whose bodies nobody emitted links as an undefined symbol.
-test "a generic base reports the per-instance body stage as not built" {
-    let program = build_probe(root_src(), "cg_def_generic_ice_probe")
-    let before = ices_naming("cg mono instance bodies")
-    let _text = generate(program, standalone_cfg())
-    assert_ice_names("cg mono instance bodies", before)
+// A generic base nobody used has no instances, so there is no body to write and no caller
+// left undefined. That is the one shape where a generic base contributes nothing and is
+// not a gap, so it must stay silent rather than report a stage it does not need.
+test "an unused generic base emits nothing and reports nothing" {
+    let program = build_probe(root_src(), "cg_def_unused_generic_probe")
+    let before = ices_naming("is not built")
+    let text = generate(program, standalone_cfg())
+    assert_lacks(text, "blink_u_ident")
+    assert_eq_int("an unused generic base reports no stage",
+        ices_naming("is not built"), before)
 }
 
 // A foreign binding's Blink body is empty by construction: the call it stands for is a
@@ -186,4 +205,107 @@ test "a body of leaf values lowers end to end with no stage left unbuilt" {
     assert_has(text, "void blink_main(blink_ev* __ev) \{")
     assert_has(text, "int64_t x = 1;")
     assert_eq_int("no stage is left unbuilt", ices_naming("is not built"), before)
+}
+
+// A generic base has one body per instance, and each instance spells its own substituted
+// types. Two instances of one base therefore produce two definitions that differ in their
+// signature, not two copies of the binder.
+fn two_instance_src() -> Str {
+    #"fn ident[T](x: T) -> T { x }
+
+fn use_both() {
+    let a = ident(1)
+    let b = ident(true)
+}
+
+fn after(n: Int) -> Int { n }
+
+fn main() { let x = 1 }
+"#
+}
+
+test "a generic base with two instances emits one definition per instance" {
+    let program = build_probe(two_instance_src(), "cg_def_two_inst_probe")
+    assert_eq_int("the base has two instances", instances().len(), 2)
+    let text = generate(program, standalone_cfg())
+
+    // Each instance spells its own substituted types. Int is the machine word and Bool is
+    // C's int, so a body that still read the binder could not produce both.
+    assert_has(text, "int64_t blink_ident_0Int(int64_t x) \{")
+    assert_has(text, "int blink_ident_0Bool(int x) \{")
+    assert_has(text, "return x;")
+
+    // Declared as well as defined. A caller compiled before the definition needs the
+    // prototype, and the base itself is declared by neither half.
+    assert_has(text, "int64_t blink_ident_0Int(int64_t x);")
+    assert_has(text, "int blink_ident_0Bool(int x);")
+    assert_lacks(text, "blink_u_ident")
+}
+
+// The instance walk makes an instance current and must put the root back. A declaration
+// node belongs to no instance, so a root left unrestored is refused by name rather than
+// answered, and the declarations after it would vanish from the unit.
+test "declarations still emit after an instance body has run" {
+    let program = build_probe(two_instance_src(), "cg_def_after_inst_probe")
+    let before = ices_named("MonoNodeNotInInstance")
+    let text = generate(program, standalone_cfg())
+    assert_has(text, "int64_t blink_ident_0Int(int64_t x) \{")
+    // `after` is the discriminating one: it is emitted after the instance bodies and its
+    // param and return annotation are declaration nodes, so it is the first thing in the
+    // unit that reads a type through whatever the instance walk left current.
+    assert_has(text, "int64_t blink_u_after(int64_t n);")
+    assert_has(text, "int64_t blink_u_after(int64_t n) \{")
+    assert_has(text, "void blink_main(blink_ev* __ev) \{")
+    assert_eq_int("no declaration was read through an instance",
+        ices_named("MonoNodeNotInInstance"), before)
+}
+
+// The per-module mode selects declarations by the module they were written in, and only
+// an imported file carries a module key of its own, so this shape needs a package: a
+// generic base in one module and the calls that instantiate it in another.
+fn pkg_probe(stem: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let root = "build/{stem}_pkg"
+    let _clean = process_run("rm", ["-rf", root])
+    let _mk = process_run("mkdir", ["-p", "{root}/src"])
+    write_file("{root}/blink.toml", "[package]\nname = \"{stem}\"\nversion = \"0.1.0\"\n")
+    write_file("{root}/src/mymod.bl", #"pub fn ident[T](x: T) -> T { x }
+"#)
+    let path = "{root}/src/probe.bl"
+    write_file(path, #"import mymod.{ident}
+
+fn use_both() {
+    let _a = ident(1)
+    let _b = ident(true)
+}
+
+fn main() { let _x = 1 }
+"#)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let _rm = process_run("rm", ["-rf", root])
+    program
+}
+
+// The per-module mode splits one module into a header of declarations and an object of
+// definitions. Whatever the object defines the header must declare, or a caller in
+// another module reads a name this translation unit never told it about. Instances are
+// where the two halves can drift, because an instance is named after itself and not
+// after any declaration that a walk over declarations would find on its own. The names
+// come from the instance table rather than being written out here, so this proves the
+// symmetry and not one particular spelling.
+test "a module header declares every instance its object defines" {
+    let program = pkg_probe("cg_def_split")
+    assert_eq_int("the base has two instances", instances().len(), 2)
+    let header = generate_module_header(program, "mymod", standalone_cfg())
+    let object = generate_module_object(program, "mymod", "mymod.h", standalone_cfg())
+    for inst in instances() {
+        assert_has(object, "{inst.c_name}(")
+        assert_has(header, "{inst.c_name}(")
+    }
+    // The split stays a split: the bodies are in the object and in no header.
+    assert_has(object, "return x;")
+    assert_lacks(header, "return x;")
 }

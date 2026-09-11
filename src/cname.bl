@@ -32,6 +32,12 @@ import diagnostics.{
 
 let mut runtime_owned_decls: Map[Int, Int] = Map()
 let mut transparent_decls: Map[Int, Int] = Map()
+let mut c_mint_seq: Int = 0
+
+// The two namespaces this module owns in the emitted C. A user name is moved out of both
+// by `c_escape_reserved`, which is what lets an escaped name and a minted name be unique.
+let C_ESCAPE_PREFIX: Str = "_blink_"
+let C_MINTED_PREFIX: Str = "_cg_"
 
 // Runtime C symbols that a user function must not shadow.
 let blink_reserved: List[Str] = [
@@ -43,6 +49,7 @@ let blink_reserved: List[Str] = [
 pub fn cname_reset() {
     runtime_owned_decls.clear()
     transparent_decls.clear()
+    c_mint_seq = 0
 }
 
 // A type declared in lib/std whose C typedef lives in runtime.h keeps the bare
@@ -596,9 +603,7 @@ pub fn c_kops_table_name(key_tid: Int) -> Str {
 
 // ── Names carried over from Blink ────────────────────────────────────────────────
 
-// A Blink local keeps its own spelling in C. A name C or libc already owns gets one
-// prefix; `_blink_` is not a Blink identifier start, so the escape cannot collide with
-// a second user name.
+// A Blink local keeps its own spelling in C unless the escape has to move it.
 pub fn c_local_name(name: Str) -> Str { c_escape_reserved(name) }
 
 // A struct field keeps its Blink spelling too. It is a separate producer from the local
@@ -606,8 +611,32 @@ pub fn c_local_name(name: Str) -> Str { c_escape_reserved(name) }
 // if the two rules ever diverge.
 pub fn c_field_name(name: Str) -> Str { c_escape_reserved(name) }
 
+// A local no Blink source named: the temp an expression is materialised into, the holder
+// a destructure binds through, the bound a loop tests against. Every stage mints from
+// this one counter, so a name is unique across the whole unit rather than within the
+// stage that asked for it; two stages with two counters would eventually hand back one
+// identifier for two different values. The stem only tells a reader of the C what the
+// temp was for.
+//
+// The prefix does not make a minted name safe on its own, because a program can write
+// the same spelling. It is safe because `c_escape_reserved` reserves the namespace and
+// moves a user name out of it.
+pub fn c_mint_local(stem: Str) -> Str {
+    c_mint_seq = c_mint_seq + 1
+    "{C_MINTED_PREFIX}{stem}{c_mint_seq}"
+}
+
+// A user name that C or libc already owns cannot keep its spelling, so it gets the
+// `_blink_` prefix. A user name already inside one of the two prefixed namespaces has to
+// move as well, or the escape is not injective: an underscore starts a legal Blink
+// identifier, so a program may write `_blink_int` or `_cg_tmp1`, and left alone the first
+// lands on the answer for `int` and the second on a minted temp. Prefixing those too
+// keeps every answer distinct, because an escaped name always carries the prefix and a
+// name that keeps its spelling never does.
 fn c_escape_reserved(name: Str) -> Str {
-    if c_reserved_words().contains_key(name) != 0 { return "_blink_{name}" }
+    let owned = c_reserved_words().contains_key(name) != 0
+    let prefixed = name.starts_with(C_ESCAPE_PREFIX) || name.starts_with(C_MINTED_PREFIX)
+    if owned || prefixed { return "{C_ESCAPE_PREFIX}{name}" }
     name
 }
 
