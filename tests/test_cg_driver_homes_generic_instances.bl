@@ -1,0 +1,156 @@
+// Where the monomorphized instances of a generic are written.
+//
+// Inside one program the unit that declares the generic writes them, and another unit
+// calls them through that unit's header. A generic already compiled into the stdlib
+// archive cannot be homed that way: the archive was built before this program existed, so
+// its own monomorphization pass never saw the type this program instantiates the generic
+// at. The unit that needs such an instance writes its own copy, with internal linkage,
+// because the archive may define the same name for its own use.
+
+import std.io
+import layout.{layout_reset}
+import cname.{cname_reset}
+import cg_test_helpers.{cg_probe_compile}
+import cg.{CgConfig, generate, generate_archive_header, generate_module_header, generate_module_object}
+import cg_reg.{cg_reg_fn_decls}
+import mono.{instances, run_mono}
+import parser.{node_name}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output must not have '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+fn standalone_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+// The unit the archive is linked against: the generic's module is already compiled, so
+// this unit declares that module rather than compiling it again.
+fn user_tu_cfg() -> CgConfig {
+    let mut skip: Map[Str, Int] = Map()
+    skip.insert("mymod", 1)
+    CgConfig { skip_modules: skip, user_tu_mode: 1, ..standalone_cfg() }
+}
+
+// A package whose library module declares a generic and whose entry module instantiates
+// it at a type only the entry module declares. That is the instance the archive could not
+// have built: the type it is over did not exist when the archive was compiled.
+fn pkg_probe(stem: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let root = "build/{stem}_pkg"
+    let _clean = process_run("rm", ["-rf", root])
+    let _mk = process_run("mkdir", ["-p", "{root}/src"])
+    write_file("{root}/blink.toml", "[package]\nname = \"{stem}\"\nversion = \"0.1.0\"\n")
+    write_file("{root}/src/mymod.bl", #"pub fn ident[T](x: T) -> T { x }
+"#)
+    let path = "{root}/src/probe.bl"
+    let program = cg_probe_compile(path, #"import mymod.{ident}
+
+type Wrap { v: Int }
+
+fn main() {
+    let w = Wrap { v: 1 }
+    let _r = ident(w)
+}
+"#)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let _rm = process_run("rm", ["-rf", root])
+    program
+}
+
+// The symbol comes from the monomorphization pass that chose it, so these tests prove the
+// driver wrote the instance rather than that one spelling of its name survived.
+fn instance_name(base: Str) -> Str {
+    let mut decl = -1
+    for f in cg_reg_fn_decls() {
+        if node_name(f) == base { decl = f }
+    }
+    if decl < 0 {
+        io.println("FAIL: no generic named '{base}' in the registry")
+    }
+    assert(decl >= 0)
+    for mi in instances() {
+        if mi.base_decl_node == decl { return mi.c_name }
+    }
+    io.println("FAIL: the mono pass registered no instance of '{base}'")
+    assert(false)
+    ""
+}
+
+// A declaration is written at file scope, so its line is unindented; a call to the same
+// symbol sits inside a body and is indented. Taking the reference line from the emitter
+// itself keeps the signature out of this file, where it would be a second spelling of it.
+fn top_level_line(text: Str, needle: Str, tail: Str) -> Str {
+    for l in text.split("\n") {
+        if l.starts_with(" ") { continue }
+        if l.contains(needle) && l.ends_with(tail) { return l }
+    }
+    ""
+}
+
+test "the unit that needs an instance of an archive generic writes it" {
+    let program = pkg_probe("cg_drv_inst_need")
+    let whole = generate(program, standalone_cfg())
+    let iname = instance_name("ident")
+    let proto = top_level_line(whole, iname, ");")
+    let body = top_level_line(whole, iname, #"{"#)
+    assert(proto != "")
+    assert(body != "")
+    let user = generate(program, user_tu_cfg())
+    assert_has(user, proto)
+    assert_has(user, body)
+}
+
+// Two definitions of one external symbol do not link. The archive defines the instances
+// its own sources asked for, under names chosen the same way, so a unit that adds its own
+// must keep them to itself.
+test "an instance of an archive generic has internal linkage" {
+    let program = pkg_probe("cg_drv_inst_linkage")
+    let whole = generate(program, standalone_cfg())
+    let iname = instance_name("ident")
+    let proto = top_level_line(whole, iname, ");")
+    let body = top_level_line(whole, iname, #"{"#)
+    assert_lacks(whole, "static {proto}")
+    let user = generate(program, user_tu_cfg())
+    assert_has(user, "static {proto}")
+    assert_has(user, "static {body}")
+}
+
+// The archive cannot offer an instance to the units linked against it: which instances a
+// program needs follows from that program's call sites, and the archive was compiled
+// without them. Declaring one would also collide with the copy the user's unit writes.
+test "the archive header exports no instance" {
+    let program = pkg_probe("cg_drv_inst_header")
+    let _whole = generate(program, standalone_cfg())
+    let iname = instance_name("ident")
+    let header = generate_archive_header(program, standalone_cfg())
+    assert_lacks(header, iname)
+}
+
+// Inside one program nothing is compiled ahead of the call sites, so the ordinary rule
+// holds and an instance keeps one home: the unit that declares the generic.
+test "inside one program an instance keeps one home" {
+    let program = pkg_probe("cg_drv_inst_home")
+    let whole = generate(program, standalone_cfg())
+    let iname = instance_name("ident")
+    let body = top_level_line(whole, iname, #"{"#)
+    assert(body != "")
+    let owner = generate_module_object(program, "mymod", "mymod.h", standalone_cfg())
+    assert_has(owner, body)
+    let user = generate_module_object(program, "__main__", "probe.h", standalone_cfg())
+    assert_lacks(user, body)
+    let owner_header = generate_module_header(program, "mymod", standalone_cfg())
+    assert_has(owner_header, top_level_line(whole, iname, ");"))
+}
