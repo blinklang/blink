@@ -4947,8 +4947,14 @@ fn tc_ctor_arity(name: Str) -> Int {
     if n == "Map" || n == "Result" {
         return 2
     }
+    // `Self` names the receiver and takes no type arguments of its own
+    // (sections/03_types.md §"The `Self` Type"). The `Self` arm in resolve_type_parts
+    // answers with the receiver and ignores its argument list, so without this row
+    // `Self[Int]` is silently accepted as the bare receiver with the arguments dropped.
+    // Arity 0 makes the over-application a reported error instead.
+    if n == "Self" { return 0 }
     // The 0-arity scalars: a bare name is correct, any application over-applies.
-    // Ptr/Tuple/Fn/Self/Handler/Template are left to fall through (variadic,
+    // Ptr/Tuple/Fn/Handler/Template are left to fall through (variadic,
     // FFI-shaped, or resolved by another rule) so E0303 never fires on them here.
     if n == "Int" || n == "Float" || n == "F32" || n == "F64" || n == "Bool" || n == "Str" {
         return 0
@@ -5012,6 +5018,20 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     // locationless diagnostic.
     if ann_node != -1 {
         tc_check_type_arg_arity(name, elems_sl, ann_node)
+    }
+    // `Self` is a built-in type ALIAS for the type being implemented (sections/03_types.md
+    // §"The `Self` Type"), so inside an impl block it lowers to the receiver's tid — the same
+    // answer `self` already gets. Resolved here, at the single lowering site every type
+    // position goes through, so `-> Self`, `other: Self`, `-> Option[Self]` and `-> List[Self]`
+    // all get it from one implementation; the container arms below recurse back in here.
+    //
+    // Inside a TRAIT declaration there is no receiver yet, so `Self` stays the abstract type
+    // variable that subst_trait_type_tid binds per impl. tc_current_self_tid is the gate: the
+    // impl walk sets it to the receiver, the trait default-body walk sets it to that same
+    // abstract typevar, and it is -1 everywhere else. First, so no user name can take `Self`.
+    if name == "Self" {
+        if tc_current_self_tid != -1 { return tc_current_self_tid }
+        return make_typevar(name)
     }
     if name == "List" {
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
@@ -15551,6 +15571,18 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
     let sig = if tc_current_method_sig_key != "" { lookup_fnsig(tc_current_method_sig_key) } else { lookup_fnsig(fn_name) }
     if sig != -1 {
         tc_current_fn_ret = fnsig_pool.get(sig).unwrap().ret
+        // Signatures are registered before any impl receiver is in scope, so a `-> Self`
+        // method's recorded return is still the abstract `Self` typevar. types_compatible
+        // short-circuits on a typevar, which made the declared-return compare VACUOUS for
+        // every `-> Self` body in the language: `-> Self { 42 }` was accepted. The receiver
+        // is what `Self` means here, and the annotation node is stamped with it, so the body
+        // must be checked against the same type — otherwise the two channels disagree and a
+        // wrong body lands as a C error with no Blink span.
+        if tc_current_self_tid != -1 {
+            let mut self_ret_binds: Map[Str, Int] = Map()
+            self_ret_binds.insert("Self", tc_current_self_tid)
+            tc_current_fn_ret = substitute_typevar_tid(tc_current_fn_ret, self_ret_binds)
+        }
     }
 
     let is_ffi = has_annotation(fn_node, "ffi")
