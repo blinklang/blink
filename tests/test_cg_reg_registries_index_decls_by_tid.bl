@@ -1,6 +1,6 @@
 import std.fs
 import std.io
-import typecheck.{check_types, lookup_named_type}
+import typecheck.{lookup_named_type}
 import parser.{node_name, node_set_module}
 import cg_reg.{
     cg_reg_reset, cg_reg_build, cg_reg_type_decls, cg_reg_fn_decls, cg_reg_effect_decls,
@@ -8,7 +8,7 @@ import cg_reg.{
     cg_reg_decl_for_tid, cg_reg_tid_for_decl, cg_reg_module_of, cg_reg_modules, cg_reg_has_main,
 }
 import layout.{layout_reset}
-import compiler.{compile_to_program}
+import cg_test_helpers.{cg_probe_compile, cg_probe_key_count, cg_probe_key_index}
 
 fn assert_eq_int(label: Str, got: Int, want: Int) {
     if got != want {
@@ -24,8 +24,8 @@ fn assert_eq_str(label: Str, got: Str, want: Str) {
     assert_eq(got, want)
 }
 
-// An import cannot be resolved from inside a test process, so the probe names no module.
-// The module rows below stamp the keys they need onto the parsed declarations instead.
+// The module rows below stamp the keys they need onto the parsed declarations, so they
+// read the same whatever key the front end gave the probe's own file.
 fn probe_src() -> Str {
     #"type Point { x: Int, y: Int }
 type Color { Red, Green }
@@ -54,9 +54,7 @@ test "point keeps its x" {
 // The probe is deleted BEFORE any assertion so a red row never leaves the file behind.
 fn build_probe() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
     let path = "build/cg_reg_registry_probe_src.bl"
-    write_file(path, probe_src())
-    let program = compile_to_program(path, 1)
-    check_types(program)
+    let program = cg_probe_compile(path, probe_src())
     layout_reset()
     let _ = fs.delete(path)
     cg_reg_reset()
@@ -127,22 +125,33 @@ test "an unregistered type id answers no declaration node" {
 // The module list holds each key once in first-seen order, which is the order the
 // per-module driver emits in. A declaration the parser left unattributed rides in the
 // aggregate output and names no module of its own.
+//
+// The keys below are stamped by hand, and the claims are about those keys' positions
+// relative to each other rather than about the length of the list. The list also carries a
+// key for every prelude module the unit lowers, so a claim about its length would be a
+// claim about the prelude and would move whenever the prelude does.
 test "the module list is first-seen, unique, and skips unattributed declarations" {
     let program = build_probe()
     let point_decl = assert_registered("types", cg_reg_type_decls(), "Point")
     let color_decl = assert_registered("types", cg_reg_type_decls(), "Color")
     let helper_decl = assert_registered("fns", cg_reg_fn_decls(), "helper")
     let main_decl = assert_registered("fns", cg_reg_fn_decls(), "main")
-    assert_eq_str("unattributed before stamping", cg_reg_module_of(point_decl), "")
+    // The front end stamps a probe's own declarations with the main-module key. Naming
+    // the key is the point: cg_reg_module_of passes a plain declaration's key straight
+    // through, so comparing it to node_source_module would compare a reader to itself.
+    assert_eq_str("the key the front end stamped", cg_reg_module_of(point_decl), "__main__")
     node_set_module(point_decl, "probe.alpha")
     node_set_module(color_decl, "probe.beta")
     node_set_module(helper_decl, "probe.alpha")
+    node_set_module(main_decl, "")
 
     cg_reg_build(program)
     let mods = cg_reg_modules()
-    assert_eq_int("two module keys", mods.len(), 2)
-    assert_eq_str("first seen", mods.get(0).unwrap(), "probe.alpha")
-    assert_eq_str("second seen", mods.get(1).unwrap(), "probe.beta")
+    assert_eq_int("the key two declarations share is listed once",
+        cg_probe_key_count(mods, "probe.alpha"), 1)
+    assert_eq_int("the second key is listed once", cg_probe_key_count(mods, "probe.beta"), 1)
+    assert_eq_int("an unattributed declaration contributes no key", cg_probe_key_count(mods, ""), 0)
+    assert(cg_probe_key_index(mods, "probe.alpha") < cg_probe_key_index(mods, "probe.beta"))
     assert_eq_str("Point's module", cg_reg_module_of(point_decl), "probe.alpha")
     assert_eq_str("helper's module", cg_reg_module_of(helper_decl), "probe.alpha")
     assert_eq_str("main is unattributed", cg_reg_module_of(main_decl), "")

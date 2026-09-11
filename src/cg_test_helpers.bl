@@ -1,0 +1,168 @@
+// Shared harness for tests/test_cg_*.bl: prove the front end built a probe source before
+// the emitters are measured against it.
+//
+// A module the front end cannot resolve is answered with an error diagnostic and then left
+// out. Nothing throws, and the program that comes back still parses and still emits. So a
+// probe that does not read the error count can measure a program whose prelude never
+// arrived, and every claim it then makes is about a unit missing most of its types.
+
+import diagnostics.{DiagEntry, diag_entries, diag_reset}
+import parser.{node_name, node_source_module}
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import std.io
+
+// The file the probe in flight compiles. A report names the file of the node it was made
+// on, which is what separates a probe's own gaps from the gaps of the prelude modules a
+// whole-program unit also lowers.
+let mut cg_probe_path: Str = ""
+
+// Start a probe: drop the diagnostics the previous probe left, and record which file this
+// one compiles. Both are needed for a probe to answer for itself — the counts below are
+// then this probe's counts, and the reports it owns are the reports on its own file.
+pub fn cg_probe_begin(path: Str) {
+    diag_reset()
+    cg_probe_path = path
+}
+
+// Error diagnostics this probe recorded, over every stage so far.
+pub fn cg_probe_errors() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" { n = n + 1 }
+    }
+    n
+}
+
+// The same count narrowed to one code, for a test that must say which failure it means
+// rather than accept any error at all.
+pub fn cg_probe_errors_named(name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.name == name { n = n + 1 }
+    }
+    n
+}
+
+// The front end must leave a probe with no errors before the probe measures codegen.
+// Called after each front-end stage, so a failure names the stage that produced it
+// rather than the stage that noticed.
+pub fn cg_probe_front_end_clean(stage: Str) {
+    let errs = cg_probe_errors()
+    if errs > 0 {
+        io.println("FAIL: {stage} recorded {errs} error diagnostics, so this probe is not a program:")
+        for d in diag_entries {
+            if d.severity == "error" { io.println("  {d.name}: {d.message}") }
+        }
+    }
+    assert_eq(errs, 0)
+}
+
+// A probe whose source names something the front end does not yet support cannot be
+// clean, but it must still say which failure it expects. An error of any other name
+// still fails, so the probe keeps its ability to notice a prelude that never arrived.
+//
+// The expected error must actually be recorded. That is what retires the allowance: once
+// the front end supports the construct, this call goes red and the probe is cleaned up.
+pub fn cg_probe_front_end_clean_but(stage: Str, expected: Str) {
+    let mut others = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.name != expected {
+            io.println("FAIL: {stage} recorded an error the probe does not expect: {d.name}: {d.message}")
+            others = others + 1
+        }
+    }
+    assert_eq(others, 0)
+    let want = cg_probe_errors_named(expected)
+    if want == 0 {
+        io.println("FAIL: {stage} recorded no {expected}, so this probe no longer needs to allow one")
+    }
+    assert(want > 0)
+}
+
+// Compile a probe source and prove the front end built it. The guard lives here rather
+// than at each probe because a probe that forgets it still emits, and what it then
+// measures is a unit missing its prelude.
+pub fn cg_probe_compile(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    cg_probe_begin(path)
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    cg_probe_front_end_clean("import resolution")
+    check_types(program)
+    cg_probe_front_end_clean("type checking")
+    program
+}
+
+// The same, for a probe whose source names one construct the front end does not yet
+// support. Every other error still fails, and the named one must still be recorded.
+pub fn cg_probe_compile_but(path: Str, src: Str, expected: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    cg_probe_begin(path)
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    cg_probe_front_end_clean("import resolution")
+    check_types(program)
+    cg_probe_front_end_clean_but("type checking", expected)
+    program
+}
+
+// A report this probe answers for: an ICE on the probe's own file. A whole-program unit
+// also lowers the prelude, whose unbuilt stages belong to the modules that own them and
+// would otherwise satisfy a premise about this probe's own code.
+fn cg_probe_owns(entry: DiagEntry) -> Bool {
+    if entry.severity != "ice" { return false }
+    entry.file == cg_probe_path
+}
+
+// The stage a report names, not merely that some report was made. A probe that calls
+// `assert` already draws whatever the expression stage has not built, so a bare count of
+// reports cannot tell one stage's gap from another's.
+pub fn cg_probe_ices_naming(stage: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if cg_probe_owns(d) && d.message.contains(stage) { n = n + 1 }
+    }
+    n
+}
+
+// A diagnostic's name is a field of its own and not part of its message, so a stage
+// counted by message text and a failure named by code need different readers.
+pub fn cg_probe_ices_named(name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if cg_probe_owns(d) && d.name == name { n = n + 1 }
+    }
+    n
+}
+
+// How many times a module key appears in a driver's module list, and where. A claim about
+// first-seen order is a claim about two keys' positions relative to each other; the length
+// of the list and a key's absolute index are claims about the prelude, whose modules the
+// merge step also stamps keys for.
+pub fn cg_probe_key_count(mods: List[Str], key: Str) -> Int {
+    let mut n = 0
+    for m in mods {
+        if m == key { n = n + 1 }
+    }
+    n
+}
+
+pub fn cg_probe_key_index(mods: List[Str], key: Str) -> Int {
+    let mut i = 0
+    while i < mods.len() {
+        if mods.get(i).unwrap() == key { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// The module key the front end stamped on a probe's own declarations, read off a
+// declaration the probe made. The front end owns that key, so a test that needs it asks
+// for it here rather than writing a spelling down beside the one producer of it.
+pub fn cg_probe_module_of(decls: List[Int], name: Str) -> Str {
+    for d in decls {
+        if node_name(d) == name { return node_source_module(d) }
+    }
+    io.println("FAIL: no declaration named '{name}' to read a module key from")
+    assert(false)
+    ""
+}
