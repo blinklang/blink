@@ -91,11 +91,13 @@ row names the helper in `cg_emit.bl` or the kind in `cg_print.bl` that writes it
 | Function | `static RET sym(params, blink_ev* __ev)`; `(void)` when there are no parameters | `fn_signature` |
 | Entry | `void blink_main(blink_ev* __ev)` | `print_fn` |
 | Effect vtable | `{ RET (*slot)(params); ... void* __userdata_slot; ... }`: all function pointers, then one capture word per op, `void* __userdata;` alone when the effect has no op; a `<vtable>_default` instance in the same order | `em_effect_vtable_typedef_body`, `em_effect_default_vtable` |
+| Key operations | `static uint64_t hash_<table>(const void* k)` and `static int eq_<table>(const void*, const void*)` adapters that cast `*(K const*)` into the by-value hash and eq methods, then `const blink_kops <table> = { hash, eq, sizeof(K), inline_key };` in the runtime's member order; `extern const blink_kops <table>;` for a TU that binds a table before or without its definition | `em_kops_table`, `em_kops_table_decl` |
 | Effect vector | `blink_ev` with `io fs net crypto rand time env process` first, user effects after; `blink_ev_default()`; `__blink_ev` with the storage class the driver names, or only `extern blink_ev __blink_ev;` | `em_ev_typedef_body`, `em_ev_default_fn` |
 | Effect perform | `__ev-><slot>(args)`; slot is `field->fn` | `EffectPerform` |
 | Handler install | block with `__blink_ev_restore_t` cleanup guard, the field store, a copy of the vector and `blink_ev* __ev = &copy;` | `HandlerInstall` |
 | Arena scope | block with `blink_arena_create`, `__blink_arena_restore_t` cleanup guard and `__blink_current_arena = arena;` | `WithScope`, one kid |
-| Resource scope | block with `T guard __attribute__((cleanup(sym))) = value;` | `WithScope`, two kids |
+| Resource scope | block with `__blink_rs_state_<exit> guard __attribute__((cleanup(__blink_rs_cleanup_<exit>))) = { .resource = value, .ok = 0, .done = 0 };`, then `if (__blink_panic_armed) { __blink_cleanup_push(&guard, __blink_rs_run_<exit>, &guard.done); }`, the body, and `guard.ok = 1;` | `WithScope`, two kids; `em_resource_guard_open`, `em_resource_guard_ok` |
+| Resource guard support | `typedef struct { T resource; int ok; int done; } __blink_rs_state_<exit>;`, a run-once `static void __blink_rs_run_<exit>(void* p, int ok)` that calls `<exit>(st->resource[, ok])`, and `static void __blink_rs_cleanup_<exit>(state*)` that pops the cleanup stack and runs it with the recorded ok; once per TU per exit symbol | `em_resource_guard_support` via `print_resource_guard_support` |
 | Restore typedefs | both `__blink_*_restore_t` typedefs and their cleanup functions, once per TU | `em_scope_restore_support` |
 | Closure thunk | `static RET __closure_N(const blink_closure* __self, params)` | `closure_thunk_params` |
 | Closure new | `blink_closure_new_typed((void*)sym, caps, NULL, n, NULL)` | `ClosureNew` |
@@ -118,7 +120,8 @@ arm must reach the enclosing loop, and a C `switch` would capture it.
 Two forms carry less than the old codegen did, because the IR has no slot for the
 data yet: `ClosureNew` passes `NULL` for the capture descriptors and the promoter, and
 `ContainerNew` for a map or set has no key-operations table to pass to the
-constructor, so the printer reports it as an `I0003` and writes a marker instead of a
+constructor (the table itself is printable through `em_kops_table`; the ctor slot is
+what is missing), so the printer reports it as an `I0003` and writes a marker instead of a
 call that does not compile. Both gaps have tickets against `ir.bl`.
 
 `StructNew` prints a positional compound literal, because the IR carries no field
