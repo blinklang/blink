@@ -1,0 +1,239 @@
+import std.fs
+import std.io
+import typecheck.{check_types}
+import layout.{layout_reset}
+import mono.{run_mono}
+import ir.{ir_dump, ir_reset, ir_verify}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+import diagnostics.{diag_ice_count, diag_reset}
+import cg_stmt.{cg_stmt_reset, lower_fn_body}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// The nested compile resolves the prelude from BLINK_ROOT; the harness runs from the
+// repo root, so the cwd is that root.
+fn run_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    env.set_var("BLINK_ROOT", env.cwd())
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    diag_reset()
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+}
+
+// Lowers one named function of the probe and answers its dump. The expression stage is
+// not built yet, so every value in the tree is a placeholder; the statement shape around
+// those placeholders is what these tests read.
+fn dump_of(name: Str) -> Str ! Diag.Report {
+    let f = find_fn(name)
+    assert(f >= 0)
+    let root = lower_fn_body(f)
+    for err in ir_verify(root) { io.println("VERIFY: {err}") }
+    assert_eq(ir_verify(root).len(), 0)
+    ir_dump(root)
+}
+
+fn count_of(text: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut rest = text
+    while rest.contains(needle) {
+        n = n + 1
+        rest = rest.slice(rest.index_of(needle) + needle.len(), rest.len())
+    }
+    n
+}
+
+test "a let binding lowers to one Let under the binder's own C name" {
+    run_probe("build/cg_stmt_let.bl", #"fn probe() -> Int {
+    let a = 1
+    let b: Int = 2
+    a + b
+}
+fn main() { assert(probe() == 3) }
+"#)
+    let d = dump_of("probe")
+    assert_eq(count_of(d, "(Let "), 2)
+    assert(d.contains("\"a\""))
+    assert(d.contains("\"b\""))
+    assert(d.contains("(Return "))
+}
+
+test "a tuple destructuring let binds every element from one holder" {
+    run_probe("build/cg_stmt_destructure.bl", #"fn probe() -> Int {
+    let (x, y) = (1, 2)
+    x + y
+}
+fn main() { assert(probe() == 3) }
+"#)
+    let d = dump_of("probe")
+    assert_eq(count_of(d, "(Let "), 3)
+    assert_eq(count_of(d, "(FieldGet "), 2)
+    assert(d.contains("\"_0\""))
+    assert(d.contains("\"_1\""))
+}
+
+test "an if in tail position returns from inside both arms" {
+    run_probe("build/cg_stmt_if_tail.bl", #"fn probe(n: Int) -> Int {
+    if n > 0 { 1 } else { 2 }
+}
+fn main() { assert(probe(1) == 1) }
+"#)
+    let d = dump_of("probe")
+    assert_eq(count_of(d, "(If "), 1)
+    assert_eq(count_of(d, "(Return "), 2)
+}
+
+test "a while loop breaks on the negated condition before its body" {
+    run_probe("build/cg_stmt_while.bl", #"fn probe() -> Int {
+    let mut i = 0
+    while i < 3 { i = i + 1 }
+    i
+}
+fn main() { assert(probe() == 3) }
+"#)
+    let d = dump_of("probe")
+    assert_eq(count_of(d, "(Loop "), 1)
+    assert_eq(count_of(d, "(Break "), 1)
+    assert(d.contains("\"==\""))
+}
+
+test "a counted for-in lowers to an init, a break guard, the body and a step" {
+    run_probe("build/cg_stmt_for_range.bl", #"fn probe() -> Int {
+    let mut total = 0
+    for i in 0..3 { total = total + i }
+    total
+}
+fn main() { assert(probe() == 3) }
+"#)
+    let d = dump_of("probe")
+    assert_eq(count_of(d, "(Loop "), 1)
+    assert_eq(count_of(d, "(Break "), 1)
+    assert(d.contains("\">=\""))
+    assert(d.contains("\"+\""))
+}
+
+test "an unguarded enum match lowers to a switch over the discriminant" {
+    run_probe("build/cg_stmt_match_enum.bl", #"type Color { Red, Green, Blue }
+fn probe(c: Color) -> Int {
+    match c {
+        Color.Red => 1
+        Color.Green => 2
+        _ => 3
+    }
+}
+fn main() { assert(probe(Color.Red) == 1) }
+"#)
+    let d = dump_of("probe")
+    assert_eq(count_of(d, "(Switch "), 1)
+    assert_eq(count_of(d, "(CarrierTag "), 1)
+    assert(d.contains("_Red_TAG"))
+    assert(d.contains("_Green_TAG"))
+}
+
+test "an Option match binds its payload through the carrier member" {
+    run_probe("build/cg_stmt_match_option.bl", #"fn probe(o: Option[Int]) -> Int {
+    match o {
+        Some(v) => v
+        None => 0
+    }
+}
+fn main() { assert(probe(Some(4)) == 4) }
+"#)
+    let d = dump_of("probe")
+    assert_eq(count_of(d, "(Switch "), 1)
+    assert_eq(count_of(d, "(CarrierUnwrap "), 1)
+    assert(d.contains("\"value\""))
+}
+
+test "a guarded match arm lowers to a flag-gated chain, not a switch" {
+    run_probe("build/cg_stmt_match_guard.bl", #"fn probe(n: Int) -> Int {
+    match n {
+        x if x > 5 => 1
+        _ => 2
+    }
+}
+fn main() { assert(probe(9) == 1) }
+"#)
+    let d = dump_of("probe")
+    assert_eq(count_of(d, "(Switch "), 0)
+    assert_eq(count_of(d, "(Unreachable "), 1)
+    assert(d.contains("\"&&\"") || d.contains("(Assign "))
+}
+
+test "a with arena block lowers to a scope that carries no resource" {
+    run_probe("build/cg_stmt_with_arena.bl", #"fn probe() -> Int {
+    with arena {
+        let xs = [1, 2]
+        xs.len()
+    }
+}
+fn main() { assert(probe() == 2) }
+"#)
+    let d = dump_of("probe")
+    assert_eq(count_of(d, "(WithScope "), 1)
+}
+
+test "a for-in over a list is an internal error, not a partial loop" {
+    run_probe("build/cg_stmt_for_list.bl", #"fn probe() -> Int {
+    let mut total = 0
+    for x in [1, 2] { total = total + x }
+    total
+}
+fn main() { assert(probe() == 3) }
+"#)
+    let before = diag_ice_count
+    let f = find_fn("probe")
+    assert(f >= 0)
+    let _ = lower_fn_body(f)
+    assert(diag_ice_count > before)
+}
+
+test "a match on a string is an internal error, not a partial switch" {
+    run_probe("build/cg_stmt_match_str.bl", #"fn probe(s: Str) -> Int {
+    match s {
+        "a" => 1
+        _ => 0
+    }
+}
+fn main() { assert(probe("a") == 1) }
+"#)
+    let before = diag_ice_count
+    let f = find_fn("probe")
+    assert(f >= 0)
+    let _ = lower_fn_body(f)
+    assert(diag_ice_count > before)
+}
+
+test "a body whose types were never recorded is an internal error" {
+    env.set_var("BLINK_ROOT", env.cwd())
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    diag_reset()
+    write_file("build/cg_stmt_unstamped.bl", #"fn probe() -> Int {
+    let a = 1
+    a
+}
+fn main() { assert(probe() == 1) }
+"#)
+    let _program = compile_to_program("build/cg_stmt_unstamped.bl", 1)
+    let _ = fs.delete("build/cg_stmt_unstamped.bl")
+    let before = diag_ice_count
+    let f = find_fn("probe")
+    assert(f >= 0)
+    let _ = lower_fn_body(f)
+    assert(diag_ice_count > before)
+}
