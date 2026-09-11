@@ -1,0 +1,134 @@
+// The C a Map or Set key type gets: one blink_kops table, with two static adapters that
+// bridge the runtime's `const void*` slots to the type's own hash and eq methods. The
+// printer is handed every name and spelling; it decides only the C text.
+
+import std.io
+import std.process.{ProcessResult}
+import cg_print.{print_reset, print_take, print_prologue, print_kops_table, print_kops_table_decl}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn lines_of(c: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for l in c.split("\n") { if l != "" { out.push(l) } }
+    out
+}
+
+fn scratch_dir() -> Str {
+    let d = env.var("BLINK_TEST_SCRATCH") ?? "build/cg_print_scratch"
+    shell_exec("mkdir -p {d}")
+    d
+}
+
+// The printed C targets the pinned gen0 archive. gen0 lives under build/gen0/ at the repo
+// root, which is a parent of a worktree, so walk up from the working directory.
+fn gen0_share_dir() -> Str {
+    let forced = env.var("BLINK_GEN0") ?? ""
+    if forced != "" { return "{forced}/share/blink" }
+    let mut prefix = ""
+    let mut depth = 0
+    while depth < 6 {
+        let cand = "{prefix}build/gen0/share/blink"
+        if file_exists("{cand}/libblink_std.a") == 1 { return cand }
+        prefix = "{prefix}../"
+        depth += 1
+    }
+    ""
+}
+
+fn cc_and_run(tag: Str, c_text: Str) -> ProcessResult {
+    let share = gen0_share_dir()
+    if share == "" {
+        io.println("FAIL[{tag}]: build/gen0/share/blink not found from the working directory")
+        assert(false)
+    }
+    let dir = scratch_dir()
+    let c_path = "{dir}/{tag}.c"
+    let bin = "{dir}/{tag}"
+    write_file(c_path, c_text)
+    let cc = process_run("cc", ["-o", bin, c_path, "-I{share}", "{share}/libblink_std.a", "-lm", "-lgc", "-pthread", "-Wl,--gc-sections"])
+    if cc.exit_code != 0 {
+        io.println("FAIL[{tag}] cc exit={cc.exit_code}\n{cc.err_out}{cc.out}")
+        return cc
+    }
+    process_run(bin, [])
+}
+
+test "a key stored through a pointer slot gets adapters that read the whole value" {
+    print_reset()
+    print_kops_table("kops_blink_main_Point", "blink_main_Point", "blink_main_Point_hash", "blink_main_Point_eq", false)
+    let ls = lines_of(print_take())
+    assert_eq(ls.len(), 3)
+    assert_eq(ls.get(0).unwrap(), "static uint64_t hash_kops_blink_main_Point(const void* k) \{ return blink_main_Point_hash(*(blink_main_Point const*)k); }")
+    assert_eq(ls.get(1).unwrap(), "static int eq_kops_blink_main_Point(const void* a, const void* b) \{ return blink_main_Point_eq(*(blink_main_Point const*)a, *(blink_main_Point const*)b); }")
+    assert_eq(ls.get(2).unwrap(), "const blink_kops kops_blink_main_Point = \{ hash_kops_blink_main_Point, eq_kops_blink_main_Point, sizeof(blink_main_Point), 0 };")
+}
+
+test "a key the caller stores inline gets inline_key one and the same adapters" {
+    print_reset()
+    print_kops_table("kops_blink_main_Color", "blink_main_Color", "blink_main_Color_hash", "blink_main_Color_eq", true)
+    let ls = lines_of(print_take())
+    assert_eq(ls.len(), 3)
+    assert_eq(ls.get(0).unwrap(), "static uint64_t hash_kops_blink_main_Color(const void* k) \{ return blink_main_Color_hash(*(blink_main_Color const*)k); }")
+    assert_eq(ls.get(2).unwrap(), "const blink_kops kops_blink_main_Color = \{ hash_kops_blink_main_Color, eq_kops_blink_main_Color, sizeof(blink_main_Color), 1 };")
+}
+
+test "a type named like another type's hash adapter gets its own distinct adapter names" {
+    print_reset()
+    print_kops_table("kops_blink_main_A", "blink_main_A", "blink_main_A_hash", "blink_main_A_eq", false)
+    print_kops_table("kops_blink_main_A_hash", "blink_main_A_hash", "blink_main_A_hash_hash", "blink_main_A_hash_eq", false)
+    let c = print_take()
+    assert(c.contains("static uint64_t hash_kops_blink_main_A(const void* k)"))
+    assert(c.contains("static uint64_t hash_kops_blink_main_A_hash(const void* k)"))
+    assert(c.contains("const blink_kops kops_blink_main_A_hash = \{ hash_kops_blink_main_A_hash,"))
+    assert(!c.contains(" kops_blink_main_A_hash(const void* k)"))
+}
+
+test "a TU that uses a table before its definition declares it extern and defines nothing" {
+    print_reset()
+    print_kops_table_decl("kops_blink_main_Point")
+    let ls = lines_of(print_take())
+    assert_eq(ls.len(), 1)
+    assert_eq(ls.get(0).unwrap(), "extern const blink_kops kops_blink_main_Point;")
+}
+
+// A two-word struct key with hand-written by-value hash and eq methods, the shape a derived
+// key type gets. The table binds through blink_map_new and two equal keys built apart must
+// find each other while an unequal one must miss.
+fn pt_key_program(prologue: Str, table: Str, main_body: Str) -> Str {
+    let head = "typedef struct \{ int64_t x; int64_t y; } Pt;\nstatic uint64_t Pt_hash(Pt s) \{ return blink_kops_mix_u64((uint64_t)s.x * 31u + (uint64_t)s.y); }\nstatic int Pt_eq(Pt a, Pt b) \{ return a.x == b.x && a.y == b.y; }\n"
+    let keys = "    Pt* k1 = (Pt*)blink_alloc(sizeof(Pt)); k1->x = 3; k1->y = 4;\n    Pt* k2 = (Pt*)blink_alloc(sizeof(Pt)); k2->x = 3; k2->y = 4;\n    Pt* k3 = (Pt*)blink_alloc(sizeof(Pt)); k3->x = 3; k3->y = 5;\n"
+    "{prologue}{head}{table}int main(void) \{\n    GC_INIT();\n    blink_map_init_seed(1);\n{keys}{main_body}    return 0;\n}\n"
+}
+
+fn map_probe() -> Str {
+    "    blink_map* m = blink_map_new(&kops_Pt);\n    blink_map_set(m, k1, (void*)\"hit\");\n    const char* got = (const char*)blink_map_get(m, k2);\n    const char* miss = (const char*)blink_map_get(m, k3);\n    printf(\"%s %s %lld\\n\", got ? got : \"null\", miss ? miss : \"null\", (long long)blink_map_len(m));\n"
+}
+
+// The runtime reads the table's four members at the offsets it expects; a member out of
+// place gives a miss or a crash, not a passing run.
+test "an emitted pointer-slot table binds to blink_map_new and round-trips a struct key" {
+    print_reset()
+    print_prologue(true, false, false, "", "")
+    let prologue = print_take()
+    print_kops_table("kops_Pt", "Pt", "Pt_hash", "Pt_eq", false)
+    let r = cc_and_run("cg_print_kops_table_boxed", pt_key_program(prologue, print_take(), map_probe()))
+    if r.exit_code != 0 { io.println("FAIL run exit={r.exit_code}\n{r.err_out}{r.out}") }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, "hit null 1\n")
+}
+
+// With inline storage the runtime copies key_size bytes into the slot and hands the adapter
+// the slot itself, so a wrong key_size or a wrong inline_key truncates or misreads the key.
+// Keys that differ only in the second word prove the whole value is stored and compared.
+test "an emitted inline table stores every byte of a two-word struct key" {
+    print_reset()
+    print_prologue(true, false, false, "", "")
+    let prologue = print_take()
+    print_kops_table("kops_Pt", "Pt", "Pt_hash", "Pt_eq", true)
+    let r = cc_and_run("cg_print_kops_table_inline", pt_key_program(prologue, print_take(), map_probe()))
+    if r.exit_code != 0 { io.println("FAIL run exit={r.exit_code}\n{r.err_out}{r.out}") }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, "hit null 1\n")
+}

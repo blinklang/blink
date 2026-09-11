@@ -55,6 +55,10 @@ let mut mono_binds: List[Map[Str, Int]] = []
 // Raw tids whose type instances are already registered; the same tid is recorded on
 // every node that carries it.
 let mut type_insts_done: Map[Int, Int] = Map()
+// The instance each generic call reaches, keyed by the body the call sits in and the call
+// node. The body is part of the key because one call node inside a generic body reaches a
+// different instance for every instance of that body.
+let mut mono_call_target: Map[Int, Int] = Map()
 
 // Declaration lookups the walk resolves a call through. Names here are how source
 // spells a callee; instance identity never depends on them.
@@ -76,6 +80,12 @@ fn sl_len(sl: Int) -> Int {
 // Node ids and tids both stay far below 2^32, so one Int holds the pair exactly.
 fn seen_key(base_decl_node: Int, arg_tids: Int) -> Int {
     base_decl_node * 4294967296 + arg_tids
+}
+
+// The same packing for a call site. A root walk is ctx -1, so the context is shifted up
+// by one to keep the high half non-negative.
+fn call_site_key(ctx: Int, call_node: Int) -> Int {
+    (ctx + 1) * 4294967296 + call_node
 }
 
 // ── Public surface ─────────────────────────────────────────────────────────────
@@ -101,6 +111,14 @@ pub fn node_tid_for_inst(inst: MonoInstance, node: Int) -> Int ! Diag.Report {
     -1
 }
 
+// The instance a generic call reaches, as an index into `instances()`. `ctx_inst` is the
+// body the call sits in: -1 for a body the pass walked as a root, else the index of the
+// instance being walked. -1 comes back when the walk resolved no generic callee at this
+// call, which is every call of a plain function.
+pub fn instance_for_call(ctx_inst: Int, call_node: Int) -> Int {
+    mono_call_target.get(call_site_key(ctx_inst, call_node)) ?? -1
+}
+
 // Run the pass over `program`. Every emit path calls this once after typecheck.
 pub fn run_mono(program: Int) ! Diag.Report {
     mono_reset()
@@ -116,6 +134,7 @@ fn mono_reset() {
     mono_node_tids = []
     mono_binds = []
     type_insts_done = Map()
+    mono_call_target = Map()
     generic_fn_by_name = Map()
     poly_method_by_name = Map()
     poly_method_by_qualified = Map()
@@ -469,28 +488,35 @@ fn fn_signature_tid(fn_node: Int, binds: Map[Str, Int]) -> Int {
 }
 
 // `arg_tids` are canonical (see canon_tid); the caller made them so to spell c_name.
-fn register(base_decl_node: Int, binders_sl: Int, arg_tids: List[Int], inst_tid: Int, c_name: Str) {
+// Answers where the instance sits in the table, whether this call minted it or an
+// earlier one did.
+fn register(base_decl_node: Int, binders_sl: Int, arg_tids: List[Int], inst_tid: Int, c_name: Str) -> Int {
     let tuple = make_tuple_type(arg_tids)
     let key = seen_key(base_decl_node, tuple)
     match mono_seen_keys.get(key) {
-        Some(_) => return
+        Some(idx) => return idx
         None => {}
     }
-    mono_seen_keys.insert(key, mono_table.len())
+    let idx = mono_table.len()
+    mono_seen_keys.insert(key, idx)
     mono_table.push(MonoInstance { base_decl_node: base_decl_node, arg_tids: tuple, inst_tid: inst_tid, c_name: c_name })
     mono_node_tids.push(Map())
     mono_binds.push(binds_from_binders(binders_sl, arg_tids))
     if dbg_channel_on("mono") != 0 {
         dbg_trace("mono", "instance {c_name} args={tc_type_str(tuple)} inst={tc_type_str(inst_tid)}")
     }
+    idx
 }
 
-fn register_fn(gfn: Int, arg_tids0: List[Int]) {
-    if arg_tids0.len() == 0 { return }
+// Answers the instance index so the call site that asked can be recorded against it. -1
+// means nothing was registered, which is what an unsolved type parameter leaves behind.
+fn register_fn(gfn: Int, arg_tids0: List[Int]) -> Int {
+    if arg_tids0.len() == 0 { return -1 }
     let arg_tids = canon_tids(arg_tids0)
     let binders_sl = node_type_params(gfn)
+    let args_tid = make_tuple_type(arg_tids)
     let inst_tid = canon_tid(fn_signature_tid(gfn, binds_from_binders(binders_sl, arg_tids)))
-    register(gfn, binders_sl, arg_tids, inst_tid, c_mono_fn_name(gfn, make_tuple_type(arg_tids)))
+    register(gfn, binders_sl, arg_tids, inst_tid, c_mono_fn_name(gfn, args_tid))
 }
 
 fn register_poly_method(m: Int, elem_tid0: Int) {
@@ -500,6 +526,11 @@ fn register_poly_method(m: Int, elem_tid0: Int) {
     let inst_tid = canon_tid(fn_signature_tid(m, binds_from_binders(binders_sl, [elem_tid])))
     let c_name = c_poly_method_name(im, node_name(m), make_tuple_type([elem_tid]))
     register(m, binders_sl, [elem_tid], inst_tid, c_name)
+}
+
+fn note_call_target(ctx: Int, call_node: Int, inst_index: Int) {
+    if inst_index < 0 { return }
+    mono_call_target.insert(call_site_key(ctx, call_node), inst_index)
 }
 
 // A generic struct or enum instance reached through a type. The declaration comes from
@@ -547,7 +578,7 @@ fn register_type_instances_in(tid: Int) ! Diag.Report {
 
 fn discover_generic_call(ctx: Int, gfn: Int, call_node: Int, lead: List[Int], args_sl: Int) ! Diag.Report {
     let binds = solve_call_binds(ctx, gfn, call_node, lead, args_sl)
-    register_fn(gfn, binder_args(ctx, gfn, call_node, binds))
+    note_call_target(ctx, call_node, register_fn(gfn, binder_args(ctx, gfn, call_node, binds)))
 }
 
 // A callee Ident that typecheck stamped with a type names a local value (a closure or

@@ -1,9 +1,9 @@
 import std.fs
 import std.io
-import typecheck.{check_types, tc_type_decl_nodes}
 import layout.{layout_reset}
-import cname.{cname_reset, cname_is_transparent_newtype}
-import diagnostics.{diag_entries}
+import cname.{cname_reset}
+import cg_test_helpers.{cg_probe_begin, cg_probe_compile, cg_probe_errors, cg_probe_errors_named,
+    cg_probe_ices_named, cg_probe_ices_naming}
 import cg.{CgConfig, generate, generate_module_header, generate_module_object}
 import mono.{run_mono, instances}
 import compiler.{compile_to_program}
@@ -22,33 +22,12 @@ fn assert_has(text: Str, needle: Str) {
     assert(text.index_of(needle) >= 0)
 }
 
-// The stage a report names, not merely that some report was made. Every probe here calls
-// `assert`, whose expression the unbuilt expression stage already reports, so a count of
-// reports cannot tell one stage's gap from another's.
-fn ices_naming(stage: Str) -> Int {
-    let mut n = 0
-    for d in diag_entries {
-        if d.severity == "ice" && d.message.contains(stage) { n = n + 1 }
+fn assert_ice_names(stage: Str) {
+    let after = cg_probe_ices_naming(stage)
+    if after <= 0 {
+        io.println("FAIL: no ice naming '{stage}' on the probe's own file")
     }
-    n
-}
-
-// A diagnostic's name is a field of its own, not part of its message, so a stage counted
-// by message text and a failure named by code need different readers.
-fn ices_named(name: Str) -> Int {
-    let mut n = 0
-    for d in diag_entries {
-        if d.severity == "ice" && d.name == name { n = n + 1 }
-    }
-    n
-}
-
-fn assert_ice_names(stage: Str, before: Int) {
-    let after = ices_naming(stage)
-    if after <= before {
-        io.println("FAIL: no new ice naming '{stage}': {before} before, {after} after")
-    }
-    assert(after > before)
+    assert(after > 0)
 }
 
 fn assert_lacks(text: Str, needle: Str) {
@@ -62,9 +41,7 @@ fn assert_lacks(text: Str, needle: Str) {
 // that skips it has no instance table and a generic base looks like a base with no uses.
 fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
     let path = "build/{name}.bl"
-    write_file(path, src)
-    let program = compile_to_program(path, 1)
-    check_types(program)
+    let program = cg_probe_compile(path, src)
     run_mono(program)
     layout_reset()
     cname_reset()
@@ -75,6 +52,28 @@ fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, D
 fn standalone_cfg() -> CgConfig {
     CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
         skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+// A module the front end cannot resolve is reported and then left out, so the program is
+// still a program and the emitters still run. Every probe here guards against that by
+// counting error diagnostics. This test proves the count they read can rise.
+fn lost_import_src() -> Str {
+    #"import no_such_module_at_all.{nope}
+
+fn main() { let x = 1 }
+"#
+}
+
+test "a module the front end cannot resolve is an error rather than a silent omission" {
+    let path = "build/cg_def_lost_import_probe.bl"
+    cg_probe_begin(path)
+    write_file(path, lost_import_src())
+    let _program = compile_to_program(path, 1)
+    let _rm = fs.delete(path)
+    assert_eq_int("the module that could not be resolved is reported",
+        cg_probe_errors_named("ModuleNotFound"), 1)
+    assert_eq_int("and it is the only error, so the count a probe reads is this one",
+        cg_probe_errors(), 1)
 }
 
 // `plain` is a root body: every type in it is concrete, so it has one definition. `ident`
@@ -113,11 +112,10 @@ test "a generic base contributes no root definition" {
 // not a gap, so it must stay silent rather than report a stage it does not need.
 test "an unused generic base emits nothing and reports nothing" {
     let program = build_probe(root_src(), "cg_def_unused_generic_probe")
-    let before = ices_naming("is not built")
     let text = generate(program, standalone_cfg())
     assert_lacks(text, "blink_u_ident")
     assert_eq_int("an unused generic base reports no stage",
-        ices_naming("is not built"), before)
+        cg_probe_ices_naming("is not built"), 0)
 }
 
 // A foreign binding's Blink body is empty by construction: the call it stands for is a
@@ -134,11 +132,10 @@ fn main() { assert(true) }
 
 test "a foreign binding wrapper is never emitted as an empty body" {
     let program = build_probe(ffi_src(), "cg_def_ffi_probe")
-    let before = ices_naming("cg foreign wrapper bodies")
     let text = generate(program, standalone_cfg())
     assert_has(text, "int64_t blink_wrapped(int64_t x);")
     assert_lacks(text, "int64_t blink_wrapped(int64_t x) \{")
-    assert_ice_names("cg foreign wrapper bodies", before)
+    assert_ice_names("cg foreign wrapper bodies")
 }
 
 // The statement stage numbers its temporaries from zero in each unit. Two emits of one
@@ -195,7 +192,6 @@ fn main() { let x = 1 }
 
 test "a body of leaf values lowers end to end with no stage left unbuilt" {
     let program = build_probe(leaf_src(), "cg_def_leaf_probe")
-    let before = ices_naming("is not built")
     let text = generate(program, standalone_cfg())
     assert_has(text, "void blink_u_vals(void) \{")
     assert_has(text, "int64_t a = 1;")
@@ -204,7 +200,7 @@ test "a body of leaf values lowers end to end with no stage left unbuilt" {
     assert_has(text, "int64_t d = a;")
     assert_has(text, "void blink_main(blink_ev* __ev) \{")
     assert_has(text, "int64_t x = 1;")
-    assert_eq_int("no stage is left unbuilt", ices_naming("is not built"), before)
+    assert_eq_int("no stage is left unbuilt", cg_probe_ices_naming("is not built"), 0)
 }
 
 // A generic base has one body per instance, and each instance spells its own substituted
@@ -247,7 +243,6 @@ test "a generic base with two instances emits one definition per instance" {
 // answered, and the declarations after it would vanish from the unit.
 test "declarations still emit after an instance body has run" {
     let program = build_probe(two_instance_src(), "cg_def_after_inst_probe")
-    let before = ices_named("MonoNodeNotInInstance")
     let text = generate(program, standalone_cfg())
     assert_has(text, "int64_t blink_ident_0Int(int64_t x) \{")
     // `after` is the discriminating one: it is emitted after the instance bodies and its
@@ -257,7 +252,7 @@ test "declarations still emit after an instance body has run" {
     assert_has(text, "int64_t blink_u_after(int64_t n) \{")
     assert_has(text, "void blink_main(blink_ev* __ev) \{")
     assert_eq_int("no declaration was read through an instance",
-        ices_named("MonoNodeNotInInstance"), before)
+        cg_probe_ices_named("MonoNodeNotInInstance"), 0)
 }
 
 // The per-module mode selects declarations by the module they were written in, and only
@@ -271,7 +266,7 @@ fn pkg_probe(stem: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, 
     write_file("{root}/src/mymod.bl", #"pub fn ident[T](x: T) -> T { x }
 "#)
     let path = "{root}/src/probe.bl"
-    write_file(path, #"import mymod.{ident}
+    let program = cg_probe_compile(path, #"import mymod.{ident}
 
 fn use_both() {
     let _a = ident(1)
@@ -280,8 +275,6 @@ fn use_both() {
 
 fn main() { let _x = 1 }
 "#)
-    let program = compile_to_program(path, 1)
-    check_types(program)
     run_mono(program)
     layout_reset()
     cname_reset()
