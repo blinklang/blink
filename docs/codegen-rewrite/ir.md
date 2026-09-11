@@ -127,7 +127,7 @@ spelling `void`. Its parent is an `ExprStmt`.
 | `Continue` | `ir_continue(span)` | none | empty |
 | `Block` | `ir_block(span, stmts)` | `[stmt_0 .. : stmt]` | empty |
 | `Switch` | `ir_switch(span, scrutinee, cases, default_block)` | `[scrutinee: value, (label: Const, body: Block)*, default: Block?]` | empty |
-| `WithScope` | `ir_with_scope(span, cleanup_symbol, resource, body)` | `[body: Block]` or `[resource: value, body: Block]` | the cleanup runtime symbol; empty for a plain arena scope |
+| `WithScope` | `ir_with_scope(span, cleanup_symbol, resource, body)` | `[body: Block]` or `[resource: value, body: Block]` | the resource's exit symbol (close, exit or blink_ffi_scope_cleanup), from which the printer spells the guard family; empty for a plain arena scope |
 | `Panic` | `ir_panic(span, message)` | `[message: value]` | empty |
 | `Unreachable` | `ir_unreachable(span)` | none | empty |
 
