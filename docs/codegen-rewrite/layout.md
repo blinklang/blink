@@ -24,6 +24,8 @@ imports layout or an emitter. `scripts/lint_import_dag.sh` asserts both.
 | `tid_of_node(node) -> Int ! Diag.Report` | The recorded tid of an AST node. Raises `I0001` and answers `-1` on a node with no type. Never a default. |
 | `tid_of_binder(scope, name) -> Int` | The tid bound to a name, walking parent scopes. `-1` when unbound. |
 | `nominal_name_of(tid) -> Str` | The declared name of a struct or enum, read from its declaration node. `""` for every structural type and when the declaration is missing or ambiguous. |
+| `format_spec_of(tid) -> Str` | The printf conversion an interpolation hole or derived Debug uses for a value of the tid (`%lld`, `%llu`, `%g`, `%s`). `""` for a kind no conversion prints, which the caller renders through Display. A transparent newtype prints as its integer unless the program gives it a Display impl: then it answers `""`, so the hole calls that impl instead of printing the raw word. |
+| `varargs_spelling(tid) -> Str` | The promoted width a value takes across C varargs (`long long`, `unsigned long long`). `""` when C already promotes it. |
 | `layout_of(tid, position) -> LayoutRecord` | All of the above in one record. Total, pure, memoised on `(tid, position)`. |
 | `field_layout_of(owner_decl, field_tid) -> LayoutRecord` | A field in its owner. See "Self-recursive fields". |
 
