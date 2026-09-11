@@ -22,7 +22,7 @@ import layout.{
     Position, Slot, SlotForm, LayoutRecord, bind_binder, binder_scope_pop, binder_scope_push,
     child_tid, ensure_typedef_for, layout_of, tid_of_binder, tid_of_node,
 }
-import cname.{c_decl_for_tid, c_local_name, c_mono_variant_tag_macro}
+import cname.{c_decl_for_tid, c_local_name, c_mint_local, c_mono_variant_tag_macro}
 import ir.{
     IrKind, ir_assign, ir_binary, ir_block, ir_break, ir_carrier_tag, ir_carrier_unwrap,
     ir_const, ir_continue, ir_expr_stmt, ir_field_get, ir_if, ir_kind, ir_let, ir_loop,
@@ -68,11 +68,9 @@ let TAIL_DISCARD = 0
 let TAIL_RETURN = 1
 let TAIL_ASSIGN = 2
 
-let mut tmp_seq: Int = 0
 let mut scope_stack: List[Int] = []
 
 pub fn cg_stmt_reset() {
-    tmp_seq = 0
     scope_stack = []
 }
 
@@ -111,13 +109,6 @@ fn int_form(span: Int) -> SlotForm ! Diag.Report {
 // stage so a binder and every read of it spell the same identifier.
 pub fn cg_local_c_name(name: Str) -> Str {
     c_local_name(name)
-}
-
-// A compiler-minted local. The prefix is not a legal Blink identifier start, so a name
-// minted here can never collide with one a program wrote.
-fn mint_local(stem: Str) -> Str {
-    tmp_seq = tmp_seq + 1
-    "_cg_{stem}{tmp_seq}"
 }
 
 fn open_scope() -> Int {
@@ -312,7 +303,7 @@ fn lower_destructuring_let(node: Int) -> Int ! Diag.Report {
     if tid < 0 { return -1 }
     let rec = layout_at(tid, Position.Local, node)
     let _ = ensure_typedef_for(tid)
-    let holder = mint_local("tup")
+    let holder = c_mint_local("tup")
     let init = node_value(node)
     let value = if init < 0 { poison_value(node) } else { lower_value(init) }
     let mut out: List[Int] = [ir_let(tid, node, rec.c_spelling, holder, rec.slot_form, value)]
@@ -351,7 +342,7 @@ fn bind_sub_pattern(sub: Int, tid: Int, value: Int, rec: LayoutRecord, out: List
     let kind = nk_of(node_kind(sub))
     if kind == NodeKind.WildcardPattern { return true }
     if kind == NodeKind.TuplePattern {
-        let inner = mint_local("tup")
+        let inner = c_mint_local("tup")
         out.push(ir_let(tid, sub, rec.c_spelling, inner, rec.slot_form, value))
         return bind_tuple_pattern(sub, tid, inner, rec.c_spelling, rec.slot_form, out)
     }
@@ -524,9 +515,9 @@ fn lower_for_range(node: Int, iter: Int) -> Int ! Diag.Report {
     let rec = layout_at(tid, Position.Local, binder)
     let name = cg_local_c_name(node_name(binder))
     let init = ir_let(tid, node, rec.c_spelling, name, rec.slot_form, lower_value(node_start(iter)))
-    let end_name = mint_local("end")
+    let end_name = c_mint_local("end")
     let end_let = ir_let(tid, iter, rec.c_spelling, end_name, rec.slot_form, lower_value(node_end(iter)))
-    let first = mint_local("first")
+    let first = c_mint_local("first")
     let first_let = ir_let(TYPE_INT, node, int_spelling(node), first, int_form(node), int_const(node, "1"))
     bind_binder(cur_scope(), node_name(binder), tid)
     let step = ir_if(node, flag_ref(node, first),
@@ -646,7 +637,7 @@ fn lower_match(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Rep
     if stid < 0 { return -1 }
     let rec = layout_at(stid, Position.Local, scrut)
     let _ = ensure_typedef_for(stid)
-    let holder = mint_local("scrut")
+    let holder = c_mint_local("scrut")
     let ctx = MatchCtx { tid: stid, holder: holder, rec: rec, tail: tail, dest: dest, dest_tid: dest_tid }
     let arms = node_arms(node)
     let n = if arms == -1 { 0 } else { sublist_length(arms) }
@@ -1255,7 +1246,7 @@ fn lower_match_switch(node: Int, arms: Int, n: Int, ctx: MatchCtx) -> Int ! Diag
 // guard that fails falls through to the next arm without the rest of the chain being
 // built twice. A match none of whose arms ran is unreachable by construction.
 fn lower_match_chain(node: Int, arms: Int, n: Int, ctx: MatchCtx, covered: Bool, out: List[Int]) -> Bool ! Diag.Report {
-    let flag = mint_local("taken")
+    let flag = c_mint_local("taken")
     out.push(ir_let(TYPE_INT, node, int_spelling(node), flag, int_form(node),
         int_const(node, "0")))
     let mut i = 0
