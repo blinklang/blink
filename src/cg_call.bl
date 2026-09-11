@@ -20,12 +20,13 @@ import parser.{
 import ast.{NodeKind, nk_of, node_kind_name}
 import typecheck.{
     TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, lookup_named_type,
-    is_import_module_name, is_builtin_namespace, is_builtin_fn, TYPE_STR,
+    is_import_module_name, is_builtin_namespace, is_builtin_fn, tc_alias_to_original, TYPE_STR,
 }
 import layout.{
     LayoutRecord, Position, SlotForm, layout_of, tid_of_node,
-    tid_of_binder, current_binder_scope,
+    tid_of_binder, current_binder_scope, current_inst,
 }
+import mono.{instances, instance_for_call}
 import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls, cg_reg_entry_point}
 import cname.{
     c_fn_decl_name, c_impl_method_name, c_display_dispatch_name, c_derive_method_name,
@@ -170,17 +171,57 @@ fn lower_fn_call(node: Int) -> Int ! Diag.Report {
         diag_ice_stage_not_built("cg_call qualified calls", node)
         return -1
     }
-    let decl = cc_fn_by_name(node, node_name(callee))
-    if decl < 0 { return -1 }
-    if cc_is_generic(decl) {
-        diag_ice_stage_not_built("cg_call monomorphised calls", node)
+    if !cc_is_free_name(callee) {
+        diag_ice_stage_not_built("cg_call closure values", node)
         return -1
     }
+    let decl = cc_fn_by_name(node, cc_declared_name(node_name(callee)))
+    if decl < 0 { return -1 }
+    let symbol = cc_callee_symbol(node, decl)
+    if symbol == "" { return -1 }
     if cc_takes_ev(decl) {
         cc_ev_not_in_ir(node)
         return -1
     }
-    cc_direct(node, decl, c_fn_decl_name(decl), [])
+    cc_direct(node, decl, symbol, [])
+}
+
+// The name the declaration was written under. An import may rename what it brings in, and
+// every register is keyed on the original.
+fn cc_declared_name(written: Str) -> Str {
+    tc_alias_to_original.get(written) ?? written
+}
+
+// The C name of the function this call reaches. A plain declaration is its own symbol; a
+// template has no symbol at all, so the answer is the name of the instance the
+// monomorphisation pass registered for this very call site. "" after an internal error.
+fn cc_callee_symbol(node: Int, decl: Int) -> Str ! Diag.Report {
+    if !cc_is_instantiated(decl) { return c_fn_decl_name(decl) }
+    cc_instance_name(node, decl)
+}
+
+// Whether a call of this declaration reaches an instance rather than the declaration
+// itself. A generic declaration is a template, which has no C name until its binders are
+// chosen. A declaration bridged to C is the one exception: the bridge is a single
+// type-erased symbol, so the pass instantiates nothing for it.
+fn cc_is_instantiated(decl: Int) -> Bool {
+    if get_annotation(decl, "ffi") != -1 { return false }
+    cc_is_generic(decl)
+}
+
+// The registered instance for a generic call, which must be an instance of the very
+// declaration this call resolved to. The pass walks every reachable call and records one,
+// so anything else is a compiler bug: the walk never reached this body, the driver has
+// another instance current, or the two stages read the call as different callees.
+fn cc_instance_name(node: Int, decl: Int) -> Str ! Diag.Report {
+    match instances().get(instance_for_call(current_inst(), node)) {
+        Some(inst) => if inst.base_decl_node == decl { return inst.c_name }
+        None => {}
+    }
+    diag_ice_at("MonoInstanceNotRegistered", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "the call of generic '{node_name(decl)}' has no monomorphised instance here", node,
+        "the pass must record an instance of this declaration for this call site")
+    ""
 }
 
 // The declaration a bare name means: the one in the caller's own module, else the only
@@ -214,12 +255,9 @@ fn cc_fn_by_name(node: Int, name: Str) -> Int ! Diag.Report {
 
 fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let obj = node_obj(node)
-    if cc_is_namespace(obj) {
-        diag_ice_stage_not_built("cg_call intrinsic namespaces", node)
-        return -1
-    }
-    if cc_names_a_type(obj) {
-        diag_ice_stage_not_built("cg_call static and associated calls", node)
+    let stage = cc_receiverless_stage(obj)
+    if stage != "" {
+        diag_ice_stage_not_built(stage, node)
         return -1
     }
     let recv_tid = tid_of_node(obj)
@@ -244,25 +282,21 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     cc_direct(node, method, c_impl_method_name(im, node_method(node)), [receiver])
 }
 
-// A receiver that names a namespace is not a value: the call has no receiver to lower
-// and is keyed on the namespace instead. The compiler provides its own namespaces, which
-// no import declares, so both registers are read.
-fn cc_is_namespace(obj: Int) -> Bool {
-    if !cc_is_free_name(obj) { return false }
+// A receiver that names something other than a value: the call has no receiver to lower
+// and is keyed on the name instead. Each such name is a different lowering, so each one
+// says which lowering it waits for rather than blaming whichever is listed first. "" means
+// the receiver is a value after all. A namespace the compiler provides is read before an
+// imported module, because a module of that name does not take the namespace over; a
+// builtin type has no declaration to look up, so the register of compiler-provided names
+// answers for it, the way typecheck decides the same call on the name alone.
+fn cc_receiverless_stage(obj: Int) -> Str {
+    if !cc_is_free_name(obj) { return "" }
     let name = node_name(obj)
-    if is_import_module_name(name) == 1 { return true }
-    is_builtin_namespace(name) == 1
-}
-
-// A receiver that names a type is not a value either: `StringBuilder.new()` and a
-// qualified variant name the type and construct rather than read a receiver. A builtin
-// type has no declaration to look up, so the register of compiler-provided names answers
-// for it, the way typecheck decides the same call on the name alone.
-fn cc_names_a_type(obj: Int) -> Bool {
-    if !cc_is_free_name(obj) { return false }
-    let name = node_name(obj)
-    if lookup_named_type(name) >= 0 { return true }
-    is_builtin_fn(name) == 1
+    if is_builtin_namespace(name) == 1 { return "cg_call intrinsic namespaces" }
+    if is_import_module_name(name) == 1 { return "cg_call module-qualified calls" }
+    if lookup_named_type(name) >= 0 { return "cg_call static and associated calls" }
+    if is_builtin_fn(name) == 1 { return "cg_call static and associated calls" }
+    ""
 }
 
 // Whether the receiver is a bare name that binds no value here. A binder in scope wins
