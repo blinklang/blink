@@ -1,0 +1,210 @@
+// Which equality method a `==` reaches.
+//
+// A type carries equality either by deriving it or by writing the impl out, and the two
+// emit different C symbols. Typecheck accepts both, so the call stage has to read which
+// one the declaration has: naming the other is a call to a function nothing emits.
+
+import lower_test_helpers.{
+    probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies, assert_ice,
+}
+import parser.{
+    node_kind, node_name, node_left, node_right, node_trait_name, nodes,
+}
+import ast.{NodeKind, nk_of}
+import ir.{IrKind, ir_c_name}
+import cname.{c_derive_method_name, c_impl_method_name}
+import layout.{decl_has_derive}
+import cg_expr.{lower_expr}
+import cg_call.{lower_operator_method}
+import cg_reg.{cg_reg_impl_decls}
+import cg_test_helpers.{cg_probe_begin, cg_probe_front_end_clean}
+import diagnostics.{diag_entries}
+import std.io
+
+fn src_equality() -> Str {
+    #"trait Eq {
+    fn eq(self, other: Self) -> Bool
+}
+
+@derive(Eq)
+type Derived { x: Int }
+
+@derive(Ord)
+type Ranked { x: Int }
+
+type Written { x: Int }
+
+impl Eq for Written {
+    fn eq(self, other: Written) -> Bool { self.x == other.x }
+}
+
+fn main() {
+    let d1 = Derived { x: 1 }
+    let d2 = Derived { x: 2 }
+    let derived_same = d1 == d2
+    let r1 = Ranked { x: 1 }
+    let r2 = Ranked { x: 2 }
+    let ranked_same = r1 == r2
+    let w1 = Written { x: 1 }
+    let w2 = Written { x: 2 }
+    let written_same = w1 == w2
+    let written_differ = w1 != w2
+    let _keep = [derived_same, ranked_same, written_same, written_differ]
+}
+"#
+}
+
+// A type that both derives equality and writes the impl out. It lives in its own probe
+// because the lowering harness opens one binder frame, and a second `self` parameter
+// would need a second.
+fn src_both() -> Str {
+    #"trait Eq {
+    fn eq(self, other: Self) -> Bool
+}
+
+@derive(Eq)
+type Both { x: Int }
+
+impl Eq for Both {
+    fn eq(self, other: Both) -> Bool { self.x == other.x }
+}
+
+fn main() {
+    let b1 = Both { x: 1 }
+    let b2 = Both { x: 2 }
+    let both_same = b1 == b2
+    let _keep = [both_same]
+}
+"#
+}
+
+fn src_no_equality() -> Str {
+    #"type Plain { x: Int }
+
+fn ask(a: Plain) -> Bool { true }
+
+fn main() {
+    let p1 = Plain { x: 1 }
+    let echoed = p1
+    let asked = ask(echoed)
+    let _keep = [asked]
+}
+"#
+}
+
+// A probe the front end built. The lowering harness hands back a program whether or not
+// the front end accepted the source, so a probe that does not ask could measure a
+// rejected unit and still report every claim it then makes as proved.
+fn clean_probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    cg_probe_begin("build/{stem}_probe.bl")
+    let program = probe(stem, src)
+    cg_probe_front_end_clean("the probe source")
+    program
+}
+
+// The comparison bound to `name`, with both operands already lowered, the way the
+// expression stage hands them over.
+fn lower_comparison(name: Str, op: Str) -> Int ! Diag.Report {
+    let node = rhs_of(name)
+    let lhs = lower_expr(node_left(node))
+    let rhs = lower_expr(node_right(node))
+    lower_operator_method(node, op, lhs, rhs)
+}
+
+fn type_decl_of(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.TypeDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    io.println("FAIL: the probe declares no type '{name}'")
+    assert(false)
+    -1
+}
+
+fn impl_decl_of(type_name: Str, trait_name: Str) -> Int {
+    for im in cg_reg_impl_decls() {
+        if node_name(im) == type_name && node_trait_name(im) == trait_name { return im }
+    }
+    io.println("FAIL: the probe declares no 'impl {trait_name} for {type_name}'")
+    assert(false)
+    -1
+}
+
+test "a derived equality reaches the method the derive emits" {
+    clean_probe("cg_call_equality", src_equality())
+    let id = lower_comparison("derived_same", "==")
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_shape("shape", id, "CallDirect(VarRef, VarRef)")
+    assert_verifies("verify", id)
+    assert_eq_str("symbol", ir_c_name(id), c_derive_method_name(type_decl_of("Derived"), "eq"))
+}
+
+test "a written equality reaches the impl method, not the symbol a derive would emit" {
+    clean_probe("cg_call_equality", src_equality())
+    let id = lower_comparison("written_same", "==")
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_verifies("verify", id)
+    assert_eq_str("symbol", ir_c_name(id), c_impl_method_name(impl_decl_of("Written", "Eq"), "eq"))
+}
+
+test "an ordering derive carries equality, because its derive builds an eq method too" {
+    clean_probe("cg_call_equality", src_equality())
+    let decl = type_decl_of("Ranked")
+    assert(!decl_has_derive(decl, "Eq"))
+    let id = lower_comparison("ranked_same", "==")
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_verifies("verify", id)
+    assert_eq_str("symbol", ir_c_name(id), c_derive_method_name(decl, "eq"))
+}
+
+// A type may both derive equality and write the impl out. The derive stage emits its own
+// body either way, so both symbols exist and the operator has to choose one; the program
+// said the impl, so the impl is what a comparison reaches.
+test "a type that both derives and writes equality reaches the written impl" {
+    clean_probe("cg_call_equality_both", src_both())
+    let decl = type_decl_of("Both")
+    assert(decl_has_derive(decl, "Eq"))
+    let id = lower_comparison("both_same", "==")
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_verifies("verify", id)
+    assert_eq_str("symbol", ir_c_name(id), c_impl_method_name(impl_decl_of("Both", "Eq"), "eq"))
+}
+
+test "a written equality does not reach the symbol only a derive emits" {
+    clean_probe("cg_call_equality", src_equality())
+    let id = lower_comparison("written_same", "==")
+    let derived = c_derive_method_name(type_decl_of("Written"), "eq")
+    if ir_c_name(id) == derived {
+        io.println("FAIL: the call names '{derived}', which no derive emits for this type")
+    }
+    assert(ir_c_name(id) != derived)
+}
+
+test "a written inequality negates the same impl method" {
+    clean_probe("cg_call_equality", src_equality())
+    let id = lower_comparison("written_differ", "!=")
+    assert_kind("kind", id, IrKind.Unary)
+    assert_shape("shape", id, "Unary(CallDirect(VarRef, VarRef))")
+    assert_verifies("verify", id)
+}
+
+// Internal errors this probe recorded under one name that also say one thing. A count
+// alone passes on any other break that happens to carry the name, and a phrase alone
+// passes on a report made twice or made about another type, so the claim needs both.
+fn ices_named_saying(name: Str, phrase: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.name == name && d.message.contains(phrase) { n = n + 1 }
+    }
+    n
+}
+
+test "an operand with neither a derive nor an impl is refused, not given a symbol by guess" {
+    clean_probe("cg_call_equality_none", src_no_equality())
+    let span = rhs_of("asked")
+    let operand = lower_expr(rhs_of("echoed"))
+    assert_ice("no equality method", lower_operator_method(span, "==", operand, operand),
+        "EqualityMethodNotFound")
+    assert_eq(ices_named_saying("EqualityMethodNotFound", "'Plain' has neither"), 1)
+}
