@@ -1,0 +1,104 @@
+// Shared harness for tests/test_cg_expr_*.bl: compile a probe source in-process, then
+// lower one expression of it and read the IR tree back.
+//
+// The tests assert structure, not text: ir_dump carries the AST node id of every value,
+// which changes whenever the probe source gains a line, so a text golden would break for
+// reasons that have nothing to do with lowering.
+
+import typecheck.{check_types}
+import parser.{node_kind, node_name, node_value, nodes}
+import compiler.{compile_to_program}
+import ast.{NodeKind, nk_of}
+import layout.{layout_reset}
+import ir.{
+    ir_reset, ir_kind, ir_kind_name, ir_c_name, ir_c_spelling, ir_kid, ir_kid_count,
+    ir_verify, IrKind,
+}
+import diagnostics.{diag_entries, diag_ice_count}
+import std.io
+
+pub fn probe(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    let _rm = process_run("rm", ["-f", path])
+    check_types(program)
+    layout_reset()
+    ir_reset()
+}
+
+// The `let <name> = ...` node itself, for a test that must name a module-level binding.
+pub fn let_node_of(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.LetBinding && node_name(i) == name { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no binding '{name}'")
+    assert(false)
+    -1
+}
+
+// The right-hand side of `let <name> = ...` in the probe. Each test names its bindings,
+// so a test reads as the expression it is about rather than as a node index.
+pub fn rhs_of(name: Str) -> Int {
+    node_value(let_node_of(name))
+}
+
+pub fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+pub fn assert_kind(label: Str, id: Int, want: IrKind) {
+    assert(id >= 0)
+    assert_eq_str(label, ir_kind_name(ir_kind(id)), ir_kind_name(want))
+}
+
+// The kind tree of one IR node, written as `Kind(kid, kid)`. Spans stay out of it, so a
+// probe can gain a line without breaking a test.
+pub fn shape(id: Int) -> Str {
+    if id < 0 { return "-" }
+    if ir_kid_count(id) == 0 { return ir_kind_name(ir_kind(id)) }
+    let mut out = "{ir_kind_name(ir_kind(id))}("
+    let mut i = 0
+    while i < ir_kid_count(id) {
+        if i > 0 { out = out.concat(", ") }
+        out = out.concat(shape(ir_kid(id, i)))
+        i = i + 1
+    }
+    out.concat(")")
+}
+
+pub fn assert_shape(label: Str, id: Int, want: Str) {
+    assert_eq_str(label, shape(id), want)
+}
+
+pub fn assert_verifies(label: Str, id: Int) {
+    let problems = ir_verify(id)
+    if problems.len() > 0 { io.println("FAIL: {label}: {problems.join("; ")}") }
+    assert_eq(problems.len(), 0)
+}
+
+// ── Internal errors ───────────────────────────────────────────────────────
+
+// The name of the last internal error recorded, or "" when none was. diag_ice_at records
+// and returns rather than unwinding, so a test reads the record instead of catching.
+pub fn last_ice() -> Str {
+    let mut i = diag_entries.len()
+    while i > 0 {
+        i = i - 1
+        let d = diag_entries.get(i).unwrap()
+        if d.severity == "ice" { return d.name }
+    }
+    ""
+}
+
+pub fn ice_count() -> Int { diag_ice_count }
+
+pub fn assert_ice(label: Str, got: Int, want_name: Str) {
+    if got >= 0 { io.println("FAIL: {label}: lowering answered {got} instead of refusing") }
+    assert(got < 0)
+    assert_eq_str(label, last_ice(), want_name)
+}
