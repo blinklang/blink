@@ -1,11 +1,416 @@
-// cg_call.bl: calls, method dispatch and builtin methods, lowered to IR.
+// cg_call.bl: every call, lowered to typed IR.
 //
-// A stage of the tid-native emitter, not yet written. Its entry point reports I0004 and
-// returns, so the driver's diag_ice_count check turns a call into a loud failure rather
-// than a translation unit that is silently empty.
+// One owner for "what C function does this call reach, and what arguments does it take".
+// Dispatch is keyed on the callee's declaration node and on the receiver's type id, never
+// on a method-name string crossed with a C-type ladder: the name a caller writes decides
+// which declaration is meant, and the declaration plus cname decide the symbol.
+//
+// The seams this module publishes replace the refusals cg_expr records for the shapes it
+// does not own: the Eq or Ord method a comparison operator desugars to, the Display call
+// an interpolation hole needs, the container copy a spread performs, and the element read
+// that `[i]` and `.get(i)` share. Each takes its operands already lowered, so cg_expr
+// keeps control of evaluation order and of the statements an operand hoisted.
 
-import diagnostics.{Diag, diag_ice_stage_not_built}
+import parser.{
+    node_kind, node_name, node_left, node_obj, node_method, node_args,
+    node_effects, node_methods, node_impl_binders, node_type_params, node_trait_name,
+    node_source_module,
+    get_annotation, sublist_get, sublist_length,
+}
+import ast.{NodeKind, nk_of, node_kind_name}
+import typecheck.{
+    TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, lookup_named_type,
+    is_import_module_name, is_builtin_namespace, is_builtin_fn, TYPE_STR,
+}
+import layout.{
+    LayoutRecord, Position, SlotForm, layout_of, tid_of_node,
+    tid_of_binder, current_binder_scope,
+}
+import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls, cg_reg_entry_point}
+import cname.{
+    c_fn_decl_name, c_impl_method_name, c_display_dispatch_name, c_derive_method_name,
+    c_runtime_helper,
+}
+import ir.{ir_tid, ir_call_direct, ir_call_runtime, ir_cast, ir_unary}
+import cg_expr.{lower_expr}
+import diagnostics.{
+    Diag, diag_ice_at, diag_ice_stage_not_built, CODEGEN_STAGE_NOT_BUILT,
+    UNSOLVED_TYPEVAR_AT_CODEGEN,
+}
 
-pub fn cg_call_lower(node: Int) ! Diag.Report {
-    diag_ice_stage_not_built("cg_call", node)
+// The trait whose synthesized dispatcher renders a value into a string, and the derived
+// method an equality operator reaches. Both are compiler-owned names, not user-written
+// ones, so the name is the only key there is until a trait carries a declaration id.
+let trait_display = "Display"
+let derived_eq = "eq"
+
+// ── Seams ─────────────────────────────────────────────────────────────────
+
+// Every call the language spells: a free function, an impl method, and the qualified
+// forms of both. cg_expr lowers the carrier constructors itself and hands over the rest.
+pub fn lower_call(node: Int) -> Int ! Diag.Report {
+    match nk_of(node_kind(node)) {
+        NodeKind.Call => lower_fn_call(node)
+        NodeKind.MethodCall => lower_method_call(node)
+        _ => cc_unhandled(node)
+    }
+}
+
+// `a == b` on a struct or data enum operand: C's own operators do not compare an
+// aggregate, so the comparison is the method the type derived.
+pub fn lower_operator_method(node: Int, op: Str, lhs: Int, rhs: Int) -> Int ! Diag.Report {
+    if lhs < 0 || rhs < 0 { return -1 }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    if op != "==" && op != "!=" {
+        diag_ice_at("OrderingMethodNotLowered", CODEGEN_STAGE_NOT_BUILT,
+            "operator '{op}' has no ordering method lowering here", node,
+            "an ordering operator desugars to Ord.cmp against an Ordering variant")
+        return -1
+    }
+    let decl = tc_tid_decl_node(ir_tid(lhs))
+    if decl < 0 {
+        diag_ice_at("EqualityOperandNotDerived", CODEGEN_STAGE_NOT_BUILT,
+            "a {tk_name(cc_kind(ir_tid(lhs)))} operand has no derived equality method", node,
+            "only a declared struct or enum derives Eq; another operand needs its own lowering")
+        return -1
+    }
+    let eq = ir_call_direct(tid, node, rec.c_spelling, c_derive_method_name(decl, derived_eq),
+        rec.slot_form, [lhs, rhs])
+    if op == "==" { return eq }
+    ir_unary(tid, node, rec.c_spelling, "!", eq)
+}
+
+// An interpolation hole whose type has no printf form renders through the sealed
+// dispatcher the compiler synthesizes next to the user's `Display.fmt`. A missing impl is
+// an internal error: typecheck has already proved one exists.
+pub fn lower_display_call(part: Int, value: Int) -> Int ! Diag.Report {
+    if value < 0 { return -1 }
+    let tid = ir_tid(value)
+    let im = cc_impl_for(tid, trait_display)
+    if im < 0 {
+        diag_ice_at("DisplayImplNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "a {tk_name(cc_kind(tid))} hole has no Display impl to call", part,
+            "typecheck must reject a hole whose type cannot be shown; this is a compiler bug")
+        return -1
+    }
+    let rec = cc_local(TYPE_STR, part)
+    if cc_stopped(rec) { return -1 }
+    ir_call_direct(TYPE_STR, part, rec.c_spelling, c_display_dispatch_name(im), rec.slot_form, [value])
+}
+
+// `[..xs, y]` copies every element of `xs` into the container being built. The copy is a
+// runtime call that takes the destination, which no IR node names yet: a ContainerNew
+// kid is written as one appended element, so the destination is not in hand here.
+pub fn lower_spread(node: Int, into_tid: Int) -> Int ! Diag.Report {
+    diag_ice_at("SpreadCopyNotLowered", CODEGEN_STAGE_NOT_BUILT,
+        "a spread into a {tk_name(cc_kind(into_tid))} has no lowering", node,
+        "the container copy needs an IR node that names the destination it extends")
+    -1
+}
+
+// One owner for reading an element out of a container: `[i]`, which answers the element
+// type, and `.get(i)`, which answers an Option over it. The node's own type says which.
+pub fn lower_element_read(node: Int, obj: Int, index: Int) -> Int ! Diag.Report {
+    if obj < 0 || index < 0 { return -1 }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    if cc_kind(tid) == TyKind.Option {
+        diag_ice_at("CheckedElementReadNotLowered", CODEGEN_STAGE_NOT_BUILT,
+            "an element read answering Option has no lowering here", node,
+            "the bounds test and the carrier it fills are statements cg_expr must hoist")
+        return -1
+    }
+    let helper = cc_element_helper(node, ir_tid(obj))
+    if helper == "" { return -1 }
+    let slot = cc_element_slot(node, tid)
+    if cc_stopped(slot) { return -1 }
+    let raw = ir_call_runtime(tid, node, slot.c_spelling, helper, slot.slot_form, [obj, index])
+    ir_cast(tid, node, slot.c_spelling, raw)
+}
+
+// ── Element reads ─────────────────────────────────────────────────────────
+
+// The runtime reader for a container kind. "" after an internal error is recorded.
+fn cc_element_helper(node: Int, container_tid: Int) -> Str ! Diag.Report {
+    if cc_kind(container_tid) == TyKind.List { return c_runtime_helper("list_get") }
+    diag_ice_at("ElementReadContainerNotLowered", CODEGEN_STAGE_NOT_BUILT,
+        "an element read on a {tk_name(cc_kind(container_tid))} has no lowering", node,
+        "a keyed container reads through its key-operations table, which is not built here")
+    ""
+}
+
+// How the element type is held in a runtime slot. The slot is one machine word, so an
+// element the layer holds behind a pointer, and a double the runtime heap-boxes, each
+// need a dereference this stage does not write yet.
+fn cc_element_slot(node: Int, elem_tid: Int) -> LayoutRecord ! Diag.Report {
+    let rec = layout_of(elem_tid, Position.ContainerSlot)
+    let why = "container element has no C layout: {rec.decline_reason}"
+    if rec.decline_reason != "" {
+        diag_ice_at("UnspellableElementType", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
+            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+        return rec
+    }
+    if rec.slot_form != SlotForm.InlineWord || cc_kind(elem_tid) == TyKind.Float {
+        diag_ice_at("BoxedElementReadNotLowered", CODEGEN_STAGE_NOT_BUILT,
+            "a {tk_name(cc_kind(elem_tid))} element is held behind a pointer in its slot", node,
+            "reading it is a dereference of the slot's pointer spelling, which layout omits")
+        return cc_stop(rec)
+    }
+    rec
+}
+
+// ── Free functions ────────────────────────────────────────────────────────
+
+fn lower_fn_call(node: Int) -> Int ! Diag.Report {
+    let callee = node_left(node)
+    if callee < 0 || nk_of(node_kind(callee)) != NodeKind.Ident {
+        diag_ice_stage_not_built("cg_call qualified calls", node)
+        return -1
+    }
+    let decl = cc_fn_by_name(node, node_name(callee))
+    if decl < 0 { return -1 }
+    if cc_is_generic(decl) {
+        diag_ice_stage_not_built("cg_call monomorphised calls", node)
+        return -1
+    }
+    if cc_takes_ev(decl) {
+        cc_ev_not_in_ir(node)
+        return -1
+    }
+    cc_direct(node, decl, c_fn_decl_name(decl), [])
+}
+
+// The declaration a bare name means: the one in the caller's own module, else the only
+// one any module declares. Two modules that spell the same name are an internal error
+// rather than a guess, because the wrong choice is a call to the wrong function.
+fn cc_fn_by_name(node: Int, name: Str) -> Int ! Diag.Report {
+    let here = node_source_module(node)
+    let mut found = -1
+    let mut clashes = 0
+    for f in cg_reg_fn_decls() {
+        if node_name(f) != name { continue }
+        if node_source_module(f) == here { return f }
+        if found >= 0 { clashes = clashes + 1 }
+        found = f
+    }
+    if found >= 0 && clashes == 0 { return found }
+    if found < 0 {
+        // Typecheck accepted the call, so the name is not undeclared: it binds a closure
+        // value, or it is one of the call forms the compiler provides itself. Both are
+        // calls this stage does not lower yet, and neither is a front-end fault.
+        diag_ice_stage_not_built("cg_call closure values and compiler-provided calls", node)
+        return -1
+    }
+    diag_ice_at("CalleeAmbiguous", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{name}' is declared in more than one module and the call names neither", node,
+        "the call needs the declaration typecheck resolved, which it does not record yet")
+    -1
+}
+
+// ── Methods ───────────────────────────────────────────────────────────────
+
+fn lower_method_call(node: Int) -> Int ! Diag.Report {
+    let obj = node_obj(node)
+    if cc_is_namespace(obj) {
+        diag_ice_stage_not_built("cg_call intrinsic namespaces", node)
+        return -1
+    }
+    if cc_names_a_type(obj) {
+        diag_ice_stage_not_built("cg_call static and associated calls", node)
+        return -1
+    }
+    let recv_tid = tid_of_node(obj)
+    if recv_tid < 0 { return -1 }
+    let im = cc_impl_with_method(recv_tid, node_method(node))
+    if im < 0 {
+        diag_ice_stage_not_built("cg_call builtin and trait-object methods", node)
+        return -1
+    }
+    if cc_is_generic(im) {
+        diag_ice_stage_not_built("cg_call monomorphised impl methods", node)
+        return -1
+    }
+    let method = cc_method_of(im, node_method(node))
+    if method < 0 { return -1 }
+    if cc_takes_ev(method) {
+        cc_ev_not_in_ir(node)
+        return -1
+    }
+    let receiver = lower_expr(obj)
+    if receiver < 0 { return -1 }
+    cc_direct(node, method, c_impl_method_name(im, node_method(node)), [receiver])
+}
+
+// A receiver that names a namespace is not a value: the call has no receiver to lower
+// and is keyed on the namespace instead. The compiler provides its own namespaces, which
+// no import declares, so both registers are read.
+fn cc_is_namespace(obj: Int) -> Bool {
+    if !cc_is_free_name(obj) { return false }
+    let name = node_name(obj)
+    if is_import_module_name(name) == 1 { return true }
+    is_builtin_namespace(name) == 1
+}
+
+// A receiver that names a type is not a value either: `StringBuilder.new()` and a
+// qualified variant name the type and construct rather than read a receiver. A builtin
+// type has no declaration to look up, so the register of compiler-provided names answers
+// for it, the way typecheck decides the same call on the name alone.
+fn cc_names_a_type(obj: Int) -> Bool {
+    if !cc_is_free_name(obj) { return false }
+    let name = node_name(obj)
+    if lookup_named_type(name) >= 0 { return true }
+    is_builtin_fn(name) == 1
+}
+
+// Whether the receiver is a bare name that binds no value here. A binder in scope wins
+// over every other reading of the same spelling, so a value named like a module or a type
+// is still a value.
+fn cc_is_free_name(obj: Int) -> Bool {
+    if obj < 0 { return false }
+    if nk_of(node_kind(obj)) != NodeKind.Ident { return false }
+    tid_of_binder(current_binder_scope(), node_name(obj)) < 0
+}
+
+// The impl block that extends the receiver's own declaration with a method of this name.
+// Matching on the declaration, not on the type id, lets an instance of a generic type
+// find the impl its base declares.
+fn cc_impl_with_method(recv_tid: Int, mname: Str) -> Int {
+    let want = tc_tid_decl_node(recv_tid)
+    if want < 0 { return -1 }
+    for im in cg_reg_impl_decls() {
+        if cc_impl_owner(im) != want { continue }
+        if cc_method_index(im, mname) >= 0 { return im }
+    }
+    -1
+}
+
+// The declaration an impl block extends. Two modules may spell the same bare type name,
+// so the impl's own module qualifies the name first, the way the type registry keys it;
+// the bare name is the answer only when no module owns one.
+fn cc_impl_owner(im: Int) -> Int {
+    let name = node_name(im)
+    if name == "" { return -1 }
+    let module_key = node_source_module(im)
+    let mut tid = -1
+    if module_key != "" { tid = lookup_named_type("{module_key}.{name}") }
+    if tid < 0 { tid = lookup_named_type(name) }
+    if tid < 0 { return -1 }
+    tc_tid_decl_node(tid)
+}
+
+// The impl block of one trait over the receiver's declaration, whatever its methods.
+fn cc_impl_for(recv_tid: Int, trait_name: Str) -> Int {
+    let want = tc_tid_decl_node(recv_tid)
+    if want < 0 { return -1 }
+    for im in cg_reg_impl_decls() {
+        if node_trait_name(im) != trait_name { continue }
+        if cc_impl_owner(im) == want { return im }
+    }
+    -1
+}
+
+fn cc_method_index(im: Int, mname: Str) -> Int {
+    let ms = node_methods(im)
+    if ms == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(ms) {
+        if node_name(sublist_get(ms, i)) == mname { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn cc_method_of(im: Int, mname: Str) -> Int ! Diag.Report {
+    let i = cc_method_index(im, mname)
+    if i >= 0 { return sublist_get(node_methods(im), i) }
+    diag_ice_at("ImplMethodNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "the impl block has no method '{mname}'", im,
+        "the caller must only ask an impl block that declares the method")
+    -1
+}
+
+// ── Shared ────────────────────────────────────────────────────────────────
+
+// One direct call: the declaration's C name, the receiver arguments already lowered, then
+// the written arguments in source order.
+fn cc_direct(node: Int, decl: Int, symbol: Str, leading: List[Int]) -> Int ! Diag.Report {
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    let mut args: List[Int] = []
+    for a in leading { args.push(a) }
+    let written = node_args(node)
+    let mut i = 0
+    while i < sublist_length(written) {
+        let a = lower_expr(sublist_get(written, i))
+        if a < 0 { return -1 }
+        args.push(a)
+        i = i + 1
+    }
+    ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, args)
+}
+
+fn cc_kind(tid: Int) -> TyKind {
+    tc_tid_kind(tc_resolve(tid))
+}
+
+fn cc_local(tid: Int, node: Int) -> LayoutRecord ! Diag.Report {
+    let rec = layout_of(tid, Position.Local)
+    let why = "call result has no C layout: {rec.decline_reason}"
+    if rec.decline_reason != "" {
+        diag_ice_at("UnspellableCallType", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
+            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    }
+    rec
+}
+
+// layout.bl answers every decline with an empty spelling, and no answer it accepts is
+// empty, so that is the one question a caller has to ask after recording an ICE.
+fn cc_stopped(rec: LayoutRecord) -> Bool {
+    rec.c_spelling == ""
+}
+
+fn cc_stop(rec: LayoutRecord) -> LayoutRecord {
+    LayoutRecord { c_spelling: "", ..rec }
+}
+
+// A generic declaration is a template: it has a C name only once its binders are chosen,
+// which is one monomorphised instance per choice. A function names its binders in its own
+// type parameters, and an impl block only in its `impl[...]` header: an impl block's type
+// parameters hold the arguments its trait was written with, which bind nothing.
+fn cc_is_generic(decl: Int) -> Bool {
+    if nk_of(node_kind(decl)) == NodeKind.ImplBlock { return cc_has_entries(node_impl_binders(decl)) }
+    cc_has_entries(node_type_params(decl))
+}
+
+fn cc_has_entries(sl: Int) -> Bool {
+    sl != -1 && sublist_length(sl) > 0
+}
+
+// Whether the callee's signature ends in the evidence vector. cg_decl decides this for
+// the declaration it prints; the two answers must agree or a caller passes the wrong
+// arity, so this reading belongs with that one and is asked here only until it moves.
+fn cc_takes_ev(decl: Int) -> Bool {
+    if get_annotation(decl, "ffi") != -1 { return false }
+    if decl == cg_reg_entry_point() { return true }
+    let sl = node_effects(decl)
+    if sl == -1 { return false }
+    sublist_length(sl) > 0
+}
+
+fn cc_ev_not_in_ir(node: Int) ! Diag.Report {
+    diag_ice_at("EvidenceVectorNotInIr", CODEGEN_STAGE_NOT_BUILT,
+        "the callee takes the evidence vector, which no IR argument spells", node,
+        "a call to an effectful function needs an IR node the printer writes as the vector")
+}
+
+fn cc_unhandled(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("UnhandledCallKind", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "call kind {node_kind_name(node_kind(node))} has no lowering", node,
+        "every call kind the parser produces needs an arm in lower_call")
+    -1
 }
