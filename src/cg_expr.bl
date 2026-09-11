@@ -78,8 +78,14 @@ type InterpHole {
 
 let mut cx_pending: List[Int] = []
 let mut cx_temp_n: Int = 0
-let mut cx_value_name: Map[Str, Str] = Map()
-let mut cx_value_type: Map[Str, Int] = Map()
+// The temp an `if` or `match` in value position was materialised into. Name and type
+// travel together in one row, so a lookup cannot find one and miss the other.
+type MaterialisedValue {
+    c_name: Str
+    tid: Int
+}
+
+let mut cx_value: Map[Str, MaterialisedValue] = Map()
 let mut cx_return_type: Int = -1
 
 // ── Seam ──────────────────────────────────────────────────────────────────
@@ -87,8 +93,7 @@ let mut cx_return_type: Int = -1
 pub fn cg_expr_reset() {
     cx_pending = []
     cx_temp_n = 0
-    cx_value_name = Map()
-    cx_value_type = Map()
+    cx_value = Map()
     cx_return_type = -1
 }
 
@@ -100,8 +105,7 @@ pub fn cg_expr_set_return_type(tid: Int) {
 // An `if` or `match` in value position: cg_stmt declares the temp, lowers the arms into
 // assignments to it, and names it here before lowering the expression that reads it.
 pub fn cg_expr_register_value(node: Int, c_name: Str, tid: Int) {
-    cx_value_name.insert("{node}", c_name)
-    cx_value_type.insert("{node}", tid)
+    cx_value.insert("{node}", MaterialisedValue { c_name: c_name, tid: tid })
 }
 
 pub fn cg_expr_pending_count() -> Int { cx_pending.len() }
@@ -351,9 +355,8 @@ fn x_global_decl(module: Str, name: Str) -> Int {
 // them into a temp and names it here. Reaching one that was never registered means the
 // statement stage lowered the arms without claiming the value.
 fn lower_registered(node: Int) -> Int ! Diag.Report {
-    let key = "{node}"
-    match cx_value_name.get(key) {
-        Some(name) => return lower_registered_ref(node, key, name)
+    match cx_value.get("{node}") {
+        Some(v) => return lower_registered_ref(node, v)
         None => {}
     }
     diag_ice_at("UnmaterialisedValueExpr", CODEGEN_STAGE_NOT_BUILT,
@@ -362,19 +365,14 @@ fn lower_registered(node: Int) -> Int ! Diag.Report {
     -1
 }
 
-fn lower_registered_ref(node: Int, key: Str, name: Str) -> Int ! Diag.Report {
-    let mut tid = -1
-    match cx_value_type.get(key) {
-        Some(t) => tid = t
-        None => {}
-    }
-    if tid < 0 {
+fn lower_registered_ref(node: Int, v: MaterialisedValue) -> Int ! Diag.Report {
+    if v.tid < 0 {
         diag_ice_at("MaterialisedValueHasNoType", CODEGEN_STAGE_NOT_BUILT,
-            "the temp '{name}' was registered without a type", node,
+            "the temp '{v.c_name}' was registered without a type", node,
             "cg_expr_register_value takes the temp's tid; it must be the one the arms assign")
         return -1
     }
-    x_ref(tid, node, name)
+    x_ref(v.tid, node, v.c_name)
 }
 
 // ── Carriers ──────────────────────────────────────────────────────────────
