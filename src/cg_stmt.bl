@@ -28,7 +28,6 @@ import ir.{
     ir_const, ir_continue, ir_expr_stmt, ir_field_get, ir_if, ir_kind, ir_let, ir_loop,
     ir_return, ir_span, ir_switch, ir_unreachable, ir_var_ref, ir_with_scope,
 }
-import mono.{MonoInstance, instances, node_tid_for_inst}
 import diagnostics.{
     Diag, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
     UNHANDLED_ITERABLE_AT_CODEGEN, UNSOLVED_TYPEVAR_AT_CODEGEN,
@@ -73,44 +72,21 @@ let TAIL_ASSIGN = 2
 // list literal so no word here can be read as a C type spelling decided outside layout.
 let C_RESERVED_WORDS = "auto break case char const continue default do double else enum extern float for goto if inline int long register restrict return short signed sizeof static struct switch typedef union unsigned void volatile while _Bool _Complex _Imaginary _Alignas _Alignof _Atomic _Generic _Noreturn _Static_assert _Thread_local errno stdin stdout stderr printf fprintf sprintf snprintf scanf malloc calloc realloc free exit abort strlen strcmp strcpy strcat memcpy memset memmove memcmp strncmp strncpy strncat strstr strchr strdup strtok fopen fclose fread fwrite atoi atof strtol strtod getenv system qsort read write close open"
 
-// The mono instance whose body is being lowered, as an index into instances(), or -1 at
-// a root. The instance decides what every node in the body means, so it is state of the
-// walk rather than an argument every helper would have to carry.
-let mut cur_inst: Int = -1
 let mut reserved_set: Map[Str, Int] = Map()
 let mut tmp_seq: Int = 0
 let mut scope_stack: List[Int] = []
 
 pub fn cg_stmt_reset() {
-    cur_inst = -1
     tmp_seq = 0
     scope_stack = []
 }
 
-// The driver selects the instance before it lowers that instance's body; -1 lowers a
-// body that no instance substitutes.
-pub fn cg_stmt_set_instance(idx: Int) {
-    cur_inst = idx
-}
-
-pub fn cg_stmt_instance() -> Int {
-    cur_inst
-}
-
 // ── Types, spellings and names ────────────────────────────────────────────
 
-// The type of a node under the instance being lowered. A root reads typecheck directly.
-// Both paths report and answer -1 on a miss; neither substitutes a default.
+// The type of a node under the instance being lowered. layout holds which instance that
+// is, so this module carries no walk state of its own and cannot disagree with cg_expr.
 fn stmt_tid(node: Int) -> Int ! Diag.Report {
-    if cur_inst < 0 { return tid_of_node(node) }
-    let table = instances()
-    if cur_inst >= table.len() {
-        diag_ice_at("MonoInstanceOutOfRange", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "instance {cur_inst} is not in a table of {table.len()}", node,
-            "the driver must select an instance that run_mono registered")
-        return -1
-    }
-    node_tid_for_inst(table.get(cur_inst).unwrap(), node)
+    tid_of_node(node)
 }
 
 // layout_of in a position, with the decline contract honoured on the spot: a declined
@@ -195,7 +171,7 @@ fn poison_value(node: Int) -> Int ! Diag.Report {
 
 // A function body. Parameters bind in the body's scope so a read of one resolves to its
 // declared type, and the body's tail value becomes the function's return.
-pub fn lower_fn_body(fn_node: Int) -> Int ! Diag.Report {
+pub fn lower_fn(fn_node: Int) -> Int ! Diag.Report {
     let scope = open_scope()
     bind_params(fn_node, scope)
     let tail = if fn_returns_value(fn_node) { TAIL_RETURN } else { TAIL_DISCARD }
@@ -236,6 +212,10 @@ fn bind_params(fn_node: Int, scope: Int) ! Diag.Report {
 }
 
 // A block in statement position: its own binder scope, and a tail value nobody reads.
+pub fn cg_stmt_lower_fn(fn_node: Int) ! Diag.Report {
+    let _ = lower_fn(fn_node)
+}
+
 pub fn lower_block(node: Int) -> Int ! Diag.Report {
     lower_body_block(node, TAIL_DISCARD, "", -1)
 }
