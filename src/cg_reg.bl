@@ -21,12 +21,14 @@ let mut reg_effects: List[Int] = []
 let mut reg_globals: List[Int] = []
 let mut reg_traits: List[Int] = []
 let mut reg_impls: List[Int] = []
+let mut reg_impl_methods: List[Int] = []
+let mut reg_impl_owner: Map[Int, Int] = Map()
 let mut reg_tests: List[Int] = []
 let mut reg_modules: List[Str] = []
 let mut reg_module_seen: Map[Str, Int] = Map()
 let mut reg_decl_by_tid: Map[Int, Int] = Map()
 let mut reg_tid_by_decl: Map[Int, Int] = Map()
-let mut reg_main: Int = 0
+let mut reg_main: Int = -1
 
 pub fn cg_reg_reset() {
     reg_types = []
@@ -35,12 +37,14 @@ pub fn cg_reg_reset() {
     reg_globals = []
     reg_traits = []
     reg_impls = []
+    reg_impl_methods = []
+    reg_impl_owner.clear()
     reg_tests = []
     reg_modules = []
     reg_module_seen.clear()
     reg_decl_by_tid.clear()
     reg_tid_by_decl.clear()
-    reg_main = 0
+    reg_main = -1
 }
 
 // First-seen module order. It is topologically friendly — a module tends to be parsed
@@ -93,11 +97,36 @@ fn index_types() {
     }
 }
 
+// An impl block's methods, flattened in impl-then-method order, each remembering the
+// block it came from. A method node carries neither the receiver's name nor the trait's,
+// so the owner is the only way back to the C name it is declared under.
+fn index_impl_methods() {
+    let mut i = 0
+    while i < reg_impls.len() {
+        let im = reg_impls.get(i).unwrap()
+        let ms = node_methods(im)
+        if ms != -1 {
+            let mut j = 0
+            while j < sublist_length(ms) {
+                let m = sublist_get(ms, j)
+                reg_impl_methods.push(m)
+                reg_impl_owner.insert(m, im)
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+// The entry point is a top-level function named `main`, and nothing else. An impl method
+// may carry that name too, so the fact is settled once here and read from the node rather
+// than re-derived from a name wherever a later stage needs it.
 fn find_main() {
     let mut i = 0
     while i < reg_fns.len() {
-        if node_name(reg_fns.get(i).unwrap()) == "main" {
-            reg_main = 1
+        let f = reg_fns.get(i).unwrap()
+        if node_name(f) == "main" {
+            reg_main = f
             return
         }
         i = i + 1
@@ -114,6 +143,7 @@ pub fn cg_reg_build(program: Int) {
     reg_effects = collect(node_args(program))
     reg_tests = collect(node_captures(program))
     index_types()
+    index_impl_methods()
     find_main()
 }
 
@@ -123,9 +153,19 @@ pub fn cg_reg_effect_decls() -> List[Int] { reg_effects }
 pub fn cg_reg_global_decls() -> List[Int] { reg_globals }
 pub fn cg_reg_trait_decls() -> List[Int] { reg_traits }
 pub fn cg_reg_impl_decls() -> List[Int] { reg_impls }
+pub fn cg_reg_impl_methods() -> List[Int] { reg_impl_methods }
 pub fn cg_reg_test_decls() -> List[Int] { reg_tests }
+
+// The impl block a method was written in, or -1 for a node that is not an impl method.
+pub fn cg_reg_impl_of(method: Int) -> Int {
+    if method < 0 { return -1 }
+    reg_impl_owner.get(method) ?? -1
+}
 pub fn cg_reg_modules() -> List[Str] { reg_modules }
-pub fn cg_reg_has_main() -> Bool { reg_main != 0 }
+pub fn cg_reg_has_main() -> Bool { reg_main >= 0 }
+
+// The program's entry-point function node, or -1 when the program has none.
+pub fn cg_reg_entry_point() -> Int { reg_main }
 
 // A tid with no declaration of its own answers -1 rather than a neighbour's node.
 pub fn cg_reg_decl_for_tid(tid: Int) -> Int {
@@ -138,7 +178,11 @@ pub fn cg_reg_tid_for_decl(decl: Int) -> Int {
     reg_tid_by_decl.get(decl) ?? -1
 }
 
+// An impl method belongs to the module its impl block was written in. The method node
+// itself was never filed as a top-level declaration, so it carries no module of its own.
 pub fn cg_reg_module_of(decl: Int) -> Str {
     if decl < 0 { return "" }
+    let owner = cg_reg_impl_of(decl)
+    if owner >= 0 { return node_source_module(owner) }
     node_source_module(decl)
 }
