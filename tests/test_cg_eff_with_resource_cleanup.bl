@@ -13,13 +13,12 @@
 // answer their protocol and record an internal error naming what is missing. A guessed
 // symbol would link against nothing or, worse, read a neighbouring stack slot as a flag.
 
-import typecheck.{check_types}
-import cname_test_helpers.{find_decl, find_impl, harvest_tids}
+import cname_test_helpers.{find_decl, find_impl}
+import cg_test_helpers.{cg_probe_compile, cg_probe_compile_but}
 import ast.{NodeKind}
 import cg_reg.{cg_reg_build}
 import cg_eff.{CleanupProtocol, cg_eff_resource_cleanup}
 import diagnostics.{diag_entries, diag_reset}
-import compiler.{compile_to_program}
 import std.fs
 import std.io
 
@@ -92,23 +91,22 @@ fn main() {
 "#
 }
 
-fn errors() -> Int {
-    let mut n = 0
-    for d in diag_entries {
-        if d.severity == "error" { n = n + 1 }
-    }
-    n
-}
-
 fn compile(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
     env.set_var("BLINK_ROOT", env.cwd())
     let path = "build/{stem}.bl"
-    write_file(path, src)
-    let program = compile_to_program(path, 1)
+    let program = cg_probe_compile(path, src)
     let _ = fs.delete(path)
-    check_types(program)
     cg_reg_build(program)
-    let _ = harvest_tids()
+}
+
+// The same for a probe whose source the front end rejects by one named error, which the
+// probe expects and which must still be recorded.
+fn compile_expecting(stem: Str, src: Str, expected: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    env.set_var("BLINK_ROOT", env.cwd())
+    let path = "build/{stem}.bl"
+    let program = cg_probe_compile_but(path, src, expected)
+    let _ = fs.delete(path)
+    cg_reg_build(program)
 }
 
 // The probe is compiled once per test: the registry and the diagnostics list are process
@@ -118,15 +116,6 @@ fn compile(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report,
 fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
     diag_reset()
     compile("cg_eff_with_resource_cleanup_probe", probe_src())
-    // A probe that does not compile proves nothing about the protocol it was written to
-    // select: every answer below would be read off a poisoned type.
-    if errors() != 0 {
-        io.println("FAIL: probe does not compile:")
-        for d in diag_entries {
-            if d.severity == "error" { io.println("  {d.code} {d.message}") }
-        }
-    }
-    assert_eq(errors(), 0)
 }
 
 fn ices() -> Int {
@@ -248,11 +237,11 @@ test "a node that is not a with-resource item is an internal error, not a plain 
 // A receiver written with type arguments matches the generic's declaration, so the
 // protocol selector would hand `Boxed[Str]` the impl written for `Boxed[Int]`. It reports
 // instead, and reports for `Boxed[Int]` too: the two are indistinguishable here. E0908
-// rejects the shape at typecheck today, so the probe is compiled on its own with its
-// errors expected.
+// rejects the shape at typecheck today, so the probe is compiled on its own with that
+// error expected.
 test "a Closeable impl written for one instance of a generic type is reported, not matched" {
     diag_reset()
-    compile("cg_eff_generic_recv_probe", illegal_probe_src())
+    compile_expecting("cg_eff_generic_recv_probe", illegal_probe_src(), "PolyImplUnsupported")
     for binder in ["ai", "bs"] {
         diag_reset()
         let rc = cg_eff_resource_cleanup(item(binder))
