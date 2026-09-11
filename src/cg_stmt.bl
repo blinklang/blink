@@ -15,18 +15,18 @@ import parser.{
     node_fields, node_for_binder, node_guard, node_handlers, node_inclusive, node_int_val,
     node_iterable, node_kind, node_name, node_op, node_params, node_pattern, node_scrutinee,
     node_start, node_stmts, node_str_val, node_target, node_then_body, node_type_name,
-    node_value, sublist_get, sublist_length,
+    node_type_ann, node_value, sublist_get, sublist_length,
 }
 import typecheck.{TyKind, TYPE_INT, tc_tid_handler_effect, tc_tid_kind}
 import layout.{
     Position, Slot, SlotForm, LayoutRecord, bind_binder, binder_scope_pop, binder_scope_push,
     child_tid, ensure_typedef_for, layout_of, tid_of_binder, tid_of_node,
 }
-import cname.{c_decl_for_tid, c_derive_method_name, c_mono_variant_tag_macro}
+import cname.{c_decl_for_tid, c_mono_variant_tag_macro}
 import ir.{
-    ir_assign, ir_binary, ir_block, ir_break, ir_carrier_tag, ir_carrier_unwrap, ir_const,
-    ir_continue, ir_expr_stmt, ir_field_get, ir_handler_install, ir_if, ir_let, ir_loop,
-    ir_return, ir_switch, ir_unreachable, ir_var_ref, ir_with_scope,
+    IrKind, ir_assign, ir_binary, ir_block, ir_break, ir_carrier_tag, ir_carrier_unwrap,
+    ir_const, ir_continue, ir_expr_stmt, ir_field_get, ir_if, ir_kind, ir_let, ir_loop,
+    ir_return, ir_span, ir_switch, ir_unreachable, ir_var_ref, ir_with_scope,
 }
 import mono.{MonoInstance, instances, node_tid_for_inst}
 import diagnostics.{
@@ -63,10 +63,6 @@ let PAYLOAD_UNION = "data"
 
 // The `with` item that asks for a fresh allocation arena rather than a resource.
 let ARENA_ITEM = "arena"
-
-// The synthesized one-argument function that runs a resource's cleanup. The emitter of
-// the resource's own type defines it; this module only asks for its name.
-let CLEANUP_METHOD = "with_cleanup"
 
 // What a block does with the value its last expression produces.
 let TAIL_DISCARD = 0
@@ -124,8 +120,20 @@ fn layout_at(tid: Int, position: Position, node: Int) -> LayoutRecord ! Diag.Rep
     let why = rec.decline_reason
     if why != "" { diag_ice_at("LayoutDeclined", UNSOLVED_TYPEVAR_AT_CODEGEN,
             "layout declined type {tid}: {why}", node,
-            "layout answers every type codegen reads; this is a compiler bug") }
+            "layout answers every type codegen reads; this is a compiler bug")
+        // A declined record carries no spelling, and a node without one fails the
+        // verifier before the reported error can be read. The integer record stands in.
+        let sub = layout_of(TYPE_INT, position)
+        let subwhy = sub.decline_reason
+        if subwhy != "" { diag_ice_at("LayoutDeclined", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "layout declined the integer type: {subwhy}", node,
+                "every position spells an integer; this is a compiler bug") }
+        return sub }
     rec
+}
+
+fn int_form(span: Int) -> SlotForm ! Diag.Report {
+    layout_at(TYPE_INT, Position.Local, span).slot_form
 }
 
 fn reserved_words() -> Map[Str, Int] {
@@ -190,10 +198,29 @@ fn poison_value(node: Int) -> Int ! Diag.Report {
 pub fn lower_fn_body(fn_node: Int) -> Int ! Diag.Report {
     let scope = open_scope()
     bind_params(fn_node, scope)
+    let tail = if fn_returns_value(fn_node) { TAIL_RETURN } else { TAIL_DISCARD }
     let body = node_body(fn_node)
-    let block = if body < 0 { ir_block(fn_node, []) } else { lower_body_block(body, TAIL_RETURN, "", -1) }
+    let block = if body < 0 { ir_block(fn_node, []) } else { lower_body_block(body, tail, "", -1) }
     close_scope()
     block
+}
+
+// Whether the tail expression of the body is the function's result. A function that
+// declares no return type, or declares one with no values, discards its tail instead:
+// C rejects a value on a return out of a function that returns nothing.
+fn fn_returns_value(fn_node: Int) -> Bool ! Diag.Report {
+    let ann = node_type_ann(fn_node)
+    if ann < 0 { return false }
+    let tid = stmt_tid(ann)
+    if tid < 0 {
+        diag_ice_at("NoTypeForReturnAnnotation", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "the return annotation of this function has no recorded type", fn_node,
+            "typecheck stamps every annotation codegen reads; this is a compiler bug")
+        // Returning the value is the shape that keeps C's own return-type rule: a
+        // function that declares a result must produce one.
+        return true
+    }
+    tc_tid_kind(tid) != TyKind.Void
 }
 
 fn bind_params(fn_node: Int, scope: Int) ! Diag.Report {
@@ -251,7 +278,6 @@ fn lower_stmt_tail(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag
         NodeKind.LoopExpr => ir_loop(node, lower_block(node_body(node)))
         NodeKind.ForIn => lower_for_in(node)
         NodeKind.WithBlock => lower_with_block(node, tail, dest, dest_tid)
-        NodeKind.WithResource => lower_with_resource(node, tail, dest, dest_tid)
         _ => lower_value_stmt(node, tail, dest, dest_tid)
     }
 }
@@ -279,12 +305,16 @@ fn lower_let(node: Int) -> Int ! Diag.Report {
     let rec = layout_at(tid, Position.Local, node)
     let _ = ensure_typedef_for(tid)
     let name = node_name(node)
-    bind_binder(cur_scope(), name, tid)
     let init = node_value(node)
     if init < 0 {
+        bind_binder(cur_scope(), name, tid)
         return ir_let(tid, node, rec.c_spelling, cg_local_c_name(name), rec.slot_form, -1)
     }
-    ir_let(tid, node, rec.c_spelling, cg_local_c_name(name), rec.slot_form, lower_value(init))
+    // The initializer is lowered before the name binds, so `let x = x + 1` reads the
+    // outer `x` the source names rather than the one this statement is declaring.
+    let value = lower_value(init)
+    bind_binder(cur_scope(), name, tid)
+    ir_let(tid, node, rec.c_spelling, cg_local_c_name(name), rec.slot_form, value)
 }
 
 // `let (a, b) = e`. The tuple binds once so the initializer runs once, and each element
@@ -318,7 +348,7 @@ fn bind_tuple_pattern(pat: Int, tid: Int, holder: Str, spell: Str, form: SlotFor
         let rec = layout_at(elem_tid, Position.Local, sub)
         let _ = ensure_typedef_for(elem_tid)
         let obj = ir_var_ref(tid, sub, spell, holder, form)
-        let get = ir_field_get(elem_tid, sub, rec.c_spelling, "_{i}", rec.slot_form, obj)
+        let get = ir_field_get(elem_tid, sub, rec.c_spelling, tuple_member(i), rec.slot_form, obj)
         bind_sub_pattern(sub, elem_tid, get, rec, out)
         i = i + 1
     }
@@ -341,17 +371,31 @@ fn bind_sub_pattern(sub: Int, tid: Int, value: Int, rec: LayoutRecord, out: List
 }
 
 fn lower_assign(node: Int) -> Int ! Diag.Report {
-    ir_assign(node, lower_target(node_target(node)), lower_value(node_value(node)))
+    let target = node_target(node)
+    if !is_local_place(target) {
+        diag_ice_stage_not_built("an assignment to a place that is not a local", node)
+        return ir_expr_stmt(node, poison_value(node))
+    }
+    ir_assign(node, lower_target(target), lower_value(node_value(node)))
+}
+
+// Whether a target is a name this module bound itself. Anything else is a place the
+// expression stage builds, and it has no lvalue producer yet.
+fn is_local_place(node: Int) -> Bool ! Diag.Report {
+    if nk_of(node_kind(node)) != NodeKind.Ident { return false }
+    tid_of_binder(cur_scope(), node_name(node)) >= 0
 }
 
 // The left side of an assignment must be an lvalue. A bare local is one this module bound
 // itself, so it is read straight from the binder scope; anything else is a place the
 // expression stage builds.
 fn lower_target(node: Int) -> Int ! Diag.Report {
-    if nk_of(node_kind(node)) != NodeKind.Ident { return lower_value(node) }
     let name = node_name(node)
     let tid = tid_of_binder(cur_scope(), name)
-    if tid < 0 { return lower_value(node) }
+    if tid < 0 {
+        diag_ice_stage_not_built("an assignment to a place that is not a local", node)
+        return poison_value(node)
+    }
     let rec = layout_at(tid, Position.Local, node)
     ir_var_ref(tid, node, rec.c_spelling, cg_local_c_name(name), rec.slot_form)
 }
@@ -361,6 +405,10 @@ fn lower_target(node: Int) -> Int ! Diag.Report {
 // place inline on its own.
 fn lower_compound_assign(node: Int) -> Int ! Diag.Report {
     let target = node_target(node)
+    if !is_local_place(target) {
+        diag_ice_stage_not_built("an assignment to a place that is not a local", node)
+        return ir_expr_stmt(node, poison_value(node))
+    }
     let tid = stmt_tid(target)
     let rec = layout_at(tid, Position.Local, node)
     let lhs = lower_target(target)
@@ -449,27 +497,44 @@ fn lower_for_in(node: Int) -> Int ! Diag.Report {
     lower_for_range(node, iter)
 }
 
-// `for i in lo..hi { b }` becomes `T i = lo; while (1) { if (i >= hi) break; b; i = i + 1; }`.
-// An inclusive range compares with `>` so the last value runs.
+// `for i in lo..hi { b }` becomes
+//   T i = lo; T end = hi; int first = 1;
+//   while (1) { if (first) { first = 0; } else { i = i + 1; } if (i >= end) break; b }
+// The step runs at the top of the loop, so a `continue` in the body cannot skip it, and
+// the end of the range is read once rather than on every turn. An inclusive range
+// compares with `>` so the last value runs.
 fn lower_for_range(node: Int, iter: Int) -> Int ! Diag.Report {
     let _ = open_scope()
     let binder = node_for_binder(node)
     let tid = stmt_tid(binder)
     let rec = layout_at(tid, Position.Local, binder)
     let name = cg_local_c_name(node_name(binder))
-    bind_binder(cur_scope(), node_name(binder), tid)
     let init = ir_let(tid, node, rec.c_spelling, name, rec.slot_form, lower_value(node_start(iter)))
-    let stop = if node_inclusive(node) == 1 { ">" } else { ">=" }
-    let cond = ir_binary(tid, iter, rec.c_spelling, stop,
-        ir_var_ref(tid, iter, rec.c_spelling, name, rec.slot_form), lower_value(node_end(iter)))
+    let end_name = mint_local("end")
+    let end_let = ir_let(tid, iter, rec.c_spelling, end_name, rec.slot_form, lower_value(node_end(iter)))
+    let first = mint_local("first")
+    let first_let = ir_let(TYPE_INT, node, int_spelling(node), first, int_form(node), int_const(node, "1"))
+    bind_binder(cur_scope(), node_name(binder), tid)
+    let step = ir_if(node, flag_ref(node, first),
+        ir_block(node, [ir_assign(node, flag_ref(node, first), int_const(node, "0"))]),
+        ir_block(node, [ir_assign(node, ir_var_ref(tid, node, rec.c_spelling, name, rec.slot_form),
+            ir_binary(tid, node, rec.c_spelling, "+",
+                ir_var_ref(tid, node, rec.c_spelling, name, rec.slot_form),
+                ir_const(tid, node, rec.c_spelling, "1")))]))
+    let stop = if node_inclusive(iter) == 1 { ">" } else { ">=" }
+    let cond = ir_binary(TYPE_INT, iter, int_spelling(iter), stop,
+        ir_var_ref(tid, iter, rec.c_spelling, name, rec.slot_form),
+        ir_var_ref(tid, iter, rec.c_spelling, end_name, rec.slot_form))
     let guard = ir_if(iter, cond, ir_block(iter, [ir_break(iter)]), -1)
     let body = lower_block(node_body(node))
-    let step = ir_assign(node, ir_var_ref(tid, node, rec.c_spelling, name, rec.slot_form),
-        ir_binary(tid, node, rec.c_spelling, "+",
-            ir_var_ref(tid, node, rec.c_spelling, name, rec.slot_form),
-            ir_const(tid, node, rec.c_spelling, "1")))
     close_scope()
-    ir_block(node, [init, ir_loop(node, ir_block(node, [guard, body, step]))])
+    ir_block(node, [init, end_let, first_let, ir_loop(node, ir_block(node, [step, guard, body]))])
+}
+
+// A read of a compiler-minted integer flag. Each read is a node of its own, because the
+// verifier rejects one node reached from two places.
+fn flag_ref(span: Int, name: Str) -> Int ! Diag.Report {
+    ir_var_ref(TYPE_INT, span, int_spelling(span), name, int_form(span))
 }
 
 // ── With blocks ───────────────────────────────────────────────────────────
@@ -486,64 +551,57 @@ fn lower_with_block(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Dia
 fn wrap_with_items(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
     if i >= n { return lower_body_block(node_body(node), tail, dest, dest_tid) }
     let item = sublist_get(items, i)
-    let inner = wrap_with_items(node, items, n, i + 1, tail, dest, dest_tid)
     let kind = nk_of(node_kind(item))
+    if kind == NodeKind.WithResource { return wrap_resource(node, items, n, i, tail, dest, dest_tid) }
+    let inner = as_block(wrap_with_items(node, items, n, i + 1, tail, dest, dest_tid))
     if kind == NodeKind.Ident && node_name(item) == ARENA_ITEM {
         return ir_with_scope(item, "", -1, inner)
     }
-    if kind == NodeKind.WithResource { return wrap_resource(item, inner) }
     wrap_handler(item, inner)
 }
 
-// The resource binds under its own name so the body can read it; the scope holds a second
-// copy whose cleanup attribute fires on every exit, which is what the printer builds.
-fn wrap_resource(item: Int, inner: Int) -> Int ! Diag.Report {
+// A scope and a handler each carry their body as a block, so an item that wraps another
+// item seals that item's tree in a block of its own.
+fn as_block(id: Int) -> Int {
+    if ir_kind(id) == IrKind.Block { return id }
+    ir_block(ir_span(id), [id])
+}
+
+// The resource binds before the body is lowered, so the body reads it, and the resource
+// expression is lowered before the bind, so it cannot read the name it is defining.
+//
+// Which cleanup a resource gets is a question about the traits its type implements:
+// Closeable closes it, BlockHandler hands it the block, an FFI scope frees its arena and
+// a type with none of those is a plain binding. No producer answers that question yet,
+// so nothing here names a cleanup function into existence.
+fn wrap_resource(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
+    let item = sublist_get(items, i)
+    let _ = open_scope()
     let tid = stmt_tid(item)
     let rec = layout_at(tid, Position.Local, item)
     let _ = ensure_typedef_for(tid)
-    let name = cg_local_c_name(node_name(item))
-    bind_binder(cur_scope(), node_name(item), tid)
-    let bind = ir_let(tid, item, rec.c_spelling, name, rec.slot_form, lower_value(node_value(item)))
-    let held = ir_var_ref(tid, item, rec.c_spelling, name, rec.slot_form)
-    ir_block(item, [bind, ir_with_scope(item, cleanup_symbol(tid, item), held, inner)])
+    let name = node_name(item)
+    let value = lower_value(node_value(item))
+    bind_binder(cur_scope(), name, tid)
+    let bind = ir_let(tid, item, rec.c_spelling, cg_local_c_name(name), rec.slot_form, value)
+    diag_ice_stage_not_built("with-resource cleanup protocol selection", item)
+    let inner = as_block(wrap_with_items(node, items, n, i + 1, tail, dest, dest_tid))
+    close_scope()
+    ir_block(item, [bind, inner])
 }
 
-// The cleanup is a synthesized one-argument function next to the resource's own type, so
-// its name comes from the same producer that names a derived method. A resource with no
-// declaration of its own has no such function and is reported rather than left uncleaned.
-fn cleanup_symbol(tid: Int, item: Int) -> Str ! Diag.Report {
-    let td = c_decl_for_tid(tid)
-    if td < 0 {
-        diag_ice_stage_not_built("with-resource cleanup for a resource with no declaration", item)
-        return ""
-    }
-    let sym = c_derive_method_name(td, CLEANUP_METHOD)
-    if diag_is_ice_seg(sym) {
-        diag_ice_at("UnnameableCleanup", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "the resource type has no spellable cleanup symbol", item,
-            "a `with` resource needs a fully solved type")
-        return ""
-    }
-    sym
-}
-
-// An effect handler replaces one slot of the effect vector for the body.
+// A handler replaces one slot of the effect vector for the body. The slot is a C field
+// name: a builtin effect names its root, a user effect names its handle under a prefix
+// of its own. No producer spells either yet, so nothing here installs a handler.
 fn wrap_handler(item: Int, inner: Int) -> Int ! Diag.Report {
     let tid = stmt_tid(item)
-    if tid < 0 { return inner }
-    let eff = tc_tid_handler_effect(tid)
-    if eff == "" {
+    if tid >= 0 && tc_tid_handler_effect(tid) == "" {
         diag_ice_at("UnnamedHandlerEffect", UNSOLVED_TYPEVAR_AT_CODEGEN,
             "handler type {tid} names no effect", item,
             "a handler's tid carries the effect it handles")
-        return inner
     }
-    ir_handler_install(item, eff, lower_value(item), inner)
-}
-
-// A bare `with r = e` outside a `with` block is the one-item case of the same shape.
-fn lower_with_resource(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
-    wrap_resource(node, lower_body_block(node_body(node), tail, dest, dest_tid))
+    diag_ice_stage_not_built("the effect vtable field a handler install writes", item)
+    ir_block(item, [ir_expr_stmt(item, lower_value(item)), inner])
 }
 
 // ── Match ─────────────────────────────────────────────────────────────────
@@ -570,12 +628,81 @@ fn lower_match(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Rep
     let arms = node_arms(node)
     let n = if arms == -1 { 0 } else { sublist_length(arms) }
     let mut out: List[Int] = [ir_let(stid, scrut, rec.c_spelling, holder, rec.slot_form, lower_value(scrut))]
+    let covered = arms_cover(arms, n, ctx)
+    if !covered {
+        // Nothing below may claim the match cannot fall through: a C `switch` that runs
+        // no arm is well defined, and an unreachable marker on one that can is not.
+        diag_ice_stage_not_built("a match with no arm that is guaranteed to run", node)
+    }
     if arms_are_switchable(arms, n, ctx) {
         out.push(lower_match_switch(node, arms, n, ctx))
     } else {
-        lower_match_chain(node, arms, n, ctx, out)
+        lower_match_chain(node, arms, n, ctx, covered, out)
     }
     ir_block(node, out)
+}
+
+// Whether one arm is guaranteed to run. An unguarded arm that matches anything covers the
+// match; short of that, the unguarded arms must name every variant the scrutinee has.
+// The names are collected rather than counted, so a variant written twice counts once and
+// this does not rest on another pass having rejected the repeat. Nothing else is provable
+// here, so nothing else is claimed.
+fn arms_cover(arms: Int, n: Int, ctx: MatchCtx) -> Bool ! Diag.Report {
+    let mut named: Map[Str, Int] = Map()
+    let mut i = 0
+    while i < n {
+        let arm = sublist_get(arms, i)
+        if node_guard(arm) < 0 {
+            let pat = node_pattern(arm)
+            if pattern_is_irrefutable(pat, ctx.tid) { return true }
+            collect_labels(ctx, pat, named)
+        }
+        i = i + 1
+    }
+    let total = variant_count(ctx.tid)
+    total > 0 && named.len() >= total
+}
+
+// Every variant one arm names. An or-pattern names one per alternative, so an arm written
+// `A | B` covers two.
+fn collect_labels(ctx: MatchCtx, raw: Int, named: Map[Str, Int]) ! Diag.Report {
+    let pat = pattern_core(raw)
+    if nk_of(node_kind(pat)) == NodeKind.OrPattern {
+        let elems = node_elements(pat)
+        if elems == -1 { return }
+        let mut i = 0
+        while i < sublist_length(elems) {
+            collect_labels(ctx, sublist_get(elems, i), named)
+            i = i + 1
+        }
+        return
+    }
+    if !pattern_is_labelled(pat, ctx.tid) { return }
+    if nk_of(node_kind(pat)) == NodeKind.IntPattern {
+        named.insert(node_str_val(pat), 1)
+        return
+    }
+    named.insert(pattern_variant_name(pat), 1)
+}
+
+// How many variants the scrutinee's type has, or 0 when naming variants cannot exhaust
+// it. A carrier has its two arms, a boolean its two values, an enum the ones its
+// declaration lists.
+fn variant_count(tid: Int) -> Int {
+    if tid_is_carrier(tid) { return 2 }
+    if tc_tid_kind(tid) == TyKind.Bool { return 2 }
+    if tc_tid_kind(tid) != TyKind.Enum { return 0 }
+    let td = c_decl_for_tid(tid)
+    if td < 0 { return 0 }
+    let flds = node_fields(td)
+    if flds == -1 { return 0 }
+    let mut n = 0
+    let mut i = 0
+    while i < sublist_length(flds) {
+        if nk_of(node_kind(sublist_get(flds, i))) == NodeKind.TypeVariant { n = n + 1 }
+        i = i + 1
+    }
+    n
 }
 
 fn scrut_ref(ctx: MatchCtx, span: Int) -> Int {
@@ -594,7 +721,21 @@ fn int_const(span: Int, literal: Str) -> Int ! Diag.Report {
 // a carrier or enum compares with its discriminant.
 fn discriminant(ctx: MatchCtx, span: Int) -> Int ! Diag.Report {
     if tid_is_ordinal(ctx.tid) { return scrut_ref(ctx, span) }
+    if !tid_is_tagged(ctx.tid) {
+        diag_ice_stage_not_built("a match that compares a value holding no discriminant", span)
+        return int_const(span, "0")
+    }
     ir_carrier_tag(TYPE_INT, span, int_spelling(span), scrut_ref(ctx, span))
+}
+
+// A value one tag read tells apart: a carrier or a user enum. A struct, a tuple, a string
+// and a float all hold no such member, so no arm of theirs is one equality.
+fn tid_is_tagged(tid: Int) -> Bool {
+    tid_is_carrier(tid) || tc_tid_kind(tid) == TyKind.Enum
+}
+
+fn tid_is_discriminable(tid: Int) -> Bool {
+    tid_is_ordinal(tid) || tid_is_tagged(tid)
 }
 
 fn tid_is_ordinal(tid: Int) -> Bool {
@@ -638,6 +779,10 @@ fn is_variant_name(tid: Int, name: Str) -> Bool {
     find_variant(c_decl_for_tid(tid), name) >= 0
 }
 
+// A tuple's members are positional: element i is the member the type's emitter laid out
+// under that position. One spelling, so the three readers below cannot drift apart.
+fn tuple_member(i: Int) -> Str { "_{i}" }
+
 fn find_variant(td: Int, name: Str) -> Int {
     if td < 0 { return -1 }
     let flds = node_fields(td)
@@ -657,19 +802,16 @@ fn variant_label(ctx: MatchCtx, pat: Int, vname: Str) -> Int ! Diag.Report {
     let k = tc_tid_kind(ctx.tid)
     if k == TyKind.Option {
         if vname == VARIANT_SOME { return int_const(pat, "{TAG_SOME}") }
-        return int_const(pat, "{TAG_NONE}")
+        if vname == VARIANT_NONE { return int_const(pat, "{TAG_NONE}") }
+        return unknown_variant(ctx, pat, vname)
     }
     if k == TyKind.Result {
         if vname == VARIANT_OK { return int_const(pat, "{TAG_OK}") }
-        return int_const(pat, "{TAG_ERR}")
+        if vname == VARIANT_ERR { return int_const(pat, "{TAG_ERR}") }
+        return unknown_variant(ctx, pat, vname)
     }
     let v = find_variant(c_decl_for_tid(ctx.tid), vname)
-    if v < 0 {
-        diag_ice_at("UnknownVariant", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "type {ctx.tid} has no variant {vname}", pat,
-            "a pattern is checked against its scrutinee's type before codegen runs")
-        return int_const(pat, "0")
-    }
+    if v < 0 { return unknown_variant(ctx, pat, vname) }
     let macro = c_mono_variant_tag_macro(ctx.tid, v)
     if diag_is_ice_seg(macro) {
         diag_ice_at("UnnameableVariantTag", UNSOLVED_TYPEVAR_AT_CODEGEN,
@@ -680,30 +822,88 @@ fn variant_label(ctx: MatchCtx, pat: Int, vname: Str) -> Int ! Diag.Report {
     int_const(pat, macro)
 }
 
-// A pattern that matches whatever it is given: the fallthrough arm of a switch.
-fn pattern_is_irrefutable(pat: Int, tid: Int) -> Bool {
+// A variant a pattern names that the scrutinee's type does not have. Codegen never
+// decides which arm that is, so it reports and poisons the label.
+fn unknown_variant(ctx: MatchCtx, pat: Int, vname: Str) -> Int ! Diag.Report {
+    diag_ice_at("UnknownVariant", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "type {ctx.tid} has no variant {vname}", pat,
+        "a pattern is checked against its scrutinee's type before codegen runs")
+    int_const(pat, "0")
+}
+
+// A pattern that matches whatever it is given: the fallthrough arm of a switch. A tuple
+// or a struct pattern matches anything only when every part of it does, so `(1, y)` is
+// refutable even though its shape always fits.
+fn pattern_is_irrefutable(pat: Int, tid: Int) -> Bool ! Diag.Report {
     match nk_of(node_kind(pat)) {
         NodeKind.WildcardPattern => true
         NodeKind.IdentPattern => !is_variant_name(tid, node_name(pat))
-        NodeKind.TuplePattern => true
-        NodeKind.StructPattern => true
+        NodeKind.TuplePattern => elements_are_irrefutable(node_elements(pat))
+        NodeKind.StructPattern => fields_are_irrefutable(node_fields(pat))
         NodeKind.AsPattern => pattern_is_irrefutable(node_pattern(pat), tid)
         _ => false
     }
 }
 
+// A part of a pattern decides on its own recorded type, because whether a bare name
+// there binds or names a variant depends on what that part is matched against.
+fn sub_is_irrefutable(sub: Int) -> Bool ! Diag.Report {
+    if nk_of(node_kind(sub)) == NodeKind.WildcardPattern { return true }
+    pattern_is_irrefutable(sub, stmt_tid(sub))
+}
+
+fn elements_are_irrefutable(elems: Int) -> Bool ! Diag.Report {
+    if elems == -1 { return true }
+    let mut i = 0
+    while i < sublist_length(elems) {
+        if !sub_is_irrefutable(sublist_get(elems, i)) { return false }
+        i = i + 1
+    }
+    true
+}
+
+// A field written as `x` alone binds a fresh name and matches anything; only a field
+// written as `x: p` carries a sub-pattern that can refuse.
+fn fields_are_irrefutable(flds: Int) -> Bool ! Diag.Report {
+    if flds == -1 { return true }
+    let mut i = 0
+    while i < sublist_length(flds) {
+        let sub = node_pattern(sublist_get(flds, i))
+        if sub >= 0 && !sub_is_irrefutable(sub) { return false }
+        i = i + 1
+    }
+    true
+}
+
 // A pattern whose whole cond is one equality against a constant, which is what a switch
 // can carry. Everything else needs an `if` chain.
-fn pattern_is_labelled(pat: Int, tid: Int) -> Bool {
+fn pattern_core(pat: Int) -> Int {
+    if nk_of(node_kind(pat)) == NodeKind.AsPattern { return node_pattern(pat) }
+    pat
+}
+
+fn pattern_is_labelled(raw: Int, tid: Int) -> Bool ! Diag.Report {
+    let pat = pattern_core(raw)
     match nk_of(node_kind(pat)) {
         NodeKind.IntPattern => tid_is_ordinal(tid)
-        NodeKind.EnumPattern => true
+        NodeKind.EnumPattern => payload_is_irrefutable(pat)
         NodeKind.IdentPattern => is_variant_name(tid, node_name(pat))
         _ => false
     }
 }
 
-fn pattern_label(ctx: MatchCtx, pat: Int) -> Int ! Diag.Report {
+// Whether the payload of a variant pattern accepts every value the variant can hold. When
+// it does not, the arm is more than one tag comparison, so it is neither a switch label
+// nor proof that the variant is covered.
+fn payload_is_irrefutable(pat: Int) -> Bool ! Diag.Report {
+    let flds = node_fields(pat)
+    if flds == -1 { return true }
+    if node_int_val(pat) == 1 { return fields_are_irrefutable(flds) }
+    elements_are_irrefutable(flds)
+}
+
+fn pattern_label(ctx: MatchCtx, raw: Int) -> Int ! Diag.Report {
+    let pat = pattern_core(raw)
     if nk_of(node_kind(pat)) == NodeKind.IntPattern {
         return ir_const(ctx.tid, pat, ctx.rec.c_spelling, node_str_val(pat))
     }
@@ -747,10 +947,18 @@ fn bind_slot(sub: Int, value: Int, out: List[Int]) ! Diag.Report {
     }
     let tid = stmt_tid(sub)
     if tid < 0 { return }
-    let rec = layout_at(tid, Position.Local, sub)
+    if is_variant_name(tid, node_name(sub)) {
+        diag_ice_stage_not_built("a variant named inside a variant payload", sub)
+        return
+    }
+    bind_named(sub, node_name(sub), tid, layout_at(tid, Position.Local, sub), value, out)
+}
+
+// One name, declared and bound to a value read out of the scrutinee.
+fn bind_named(span: Int, name: Str, tid: Int, rec: LayoutRecord, value: Int, out: List[Int]) ! Diag.Report {
     let _ = ensure_typedef_for(tid)
-    bind_binder(cur_scope(), node_name(sub), tid)
-    out.push(ir_let(tid, sub, rec.c_spelling, cg_local_c_name(node_name(sub)), rec.slot_form, value))
+    bind_binder(cur_scope(), name, tid)
+    out.push(ir_let(tid, span, rec.c_spelling, cg_local_c_name(name), rec.slot_form, value))
 }
 
 // A carrier keeps its payload in a named member; a user enum keeps its in the union arm
@@ -789,7 +997,7 @@ fn positional_payload_binds(ctx: MatchCtx, vname: Str, flds: Int, out: List[Int]
         let tid = stmt_tid(sub)
         if tid >= 0 {
             let rec = layout_at(tid, Position.Local, sub)
-            let path = "{PAYLOAD_UNION}.{vname}._{i}"
+            let path = "{PAYLOAD_UNION}.{vname}.{tuple_member(i)}"
             bind_slot(sub, ir_field_get(tid, sub, rec.c_spelling, path, rec.slot_form,
                 scrut_ref(ctx, sub)), out)
         }
@@ -805,13 +1013,20 @@ fn field_pattern_binds(ctx: MatchCtx, pat: Int, prefix: Str, out: List[Int]) ! D
     let mut i = 0
     while i < sublist_length(flds) {
         let f = sublist_get(flds, i)
-        let sub = if node_pattern(f) < 0 { f } else { node_pattern(f) }
-        let tid = stmt_tid(sub)
+        // A field written as `x` is its own binder; only `x: p` carries a sub-pattern.
+        let sub = node_pattern(f)
+        let holder = if sub < 0 { f } else { sub }
+        let tid = stmt_tid(holder)
         if tid >= 0 {
-            let rec = layout_at(tid, Position.Local, sub)
+            let rec = layout_at(tid, Position.Local, holder)
             let path = if prefix == "" { node_name(f) } else { "{prefix}.{node_name(f)}" }
-            bind_slot(sub, ir_field_get(tid, sub, rec.c_spelling, path, rec.slot_form,
-                scrut_ref(ctx, sub)), out)
+            let read = ir_field_get(tid, holder, rec.c_spelling, path, rec.slot_form,
+                scrut_ref(ctx, holder))
+            if sub < 0 {
+                bind_named(holder, node_name(f), tid, rec, read, out)
+            } else {
+                bind_slot(sub, read, out)
+            }
         }
         i = i + 1
     }
@@ -826,7 +1041,7 @@ fn tuple_pattern_binds(ctx: MatchCtx, pat: Int, out: List[Int]) ! Diag.Report {
         let tid = stmt_tid(sub)
         if tid >= 0 {
             let rec = layout_at(tid, Position.Local, sub)
-            bind_slot(sub, ir_field_get(tid, sub, rec.c_spelling, "_{i}", rec.slot_form,
+            bind_slot(sub, ir_field_get(tid, sub, rec.c_spelling, tuple_member(i), rec.slot_form,
                 scrut_ref(ctx, sub)), out)
         }
         i = i + 1
@@ -924,8 +1139,9 @@ fn guarded_arm_block(ctx: MatchCtx, arm: Int, guard: Int, extra: List[Int]) -> I
 
 // A match every arm of which is one equality against a constant, with at most a single
 // catch-all last. That shape is a switch; anything else needs the chain below.
-fn arms_are_switchable(arms: Int, n: Int, ctx: MatchCtx) -> Bool {
+fn arms_are_switchable(arms: Int, n: Int, ctx: MatchCtx) -> Bool ! Diag.Report {
     if n == 0 { return false }
+    if !tid_is_discriminable(ctx.tid) { return false }
     let mut i = 0
     while i < n {
         let arm = sublist_get(arms, i)
@@ -956,35 +1172,33 @@ fn lower_match_switch(node: Int, arms: Int, n: Int, ctx: MatchCtx) -> Int ! Diag
         }
         i = i + 1
     }
-    let dflt = if default_block < 0 { ir_block(node, [ir_unreachable(node)]) } else { default_block }
-    ir_switch(node, discriminant(ctx, node), cases, dflt)
+    // No default arm when none was written: the arms already name every variant, so a
+    // fallthrough branch would be dead code the printer would still have to place.
+    ir_switch(node, discriminant(ctx, node), cases, default_block)
 }
 
 // The general shape: one `if` per arm, each gated on a flag that later arms read, so a
 // guard that fails falls through to the next arm without the rest of the chain being
 // built twice. A match none of whose arms ran is unreachable by construction.
-fn lower_match_chain(node: Int, arms: Int, n: Int, ctx: MatchCtx, out: List[Int]) ! Diag.Report {
+fn lower_match_chain(node: Int, arms: Int, n: Int, ctx: MatchCtx, covered: Bool, out: List[Int]) ! Diag.Report {
     let flag = mint_local("taken")
-    out.push(ir_let(TYPE_INT, node, int_spelling(node), flag, SlotForm.InlineWord,
+    out.push(ir_let(TYPE_INT, node, int_spelling(node), flag, int_form(node),
         int_const(node, "0")))
     let mut i = 0
     while i < n {
         let arm = sublist_get(arms, i)
-        let mark: List[Int] = [ir_assign(arm,
-            ir_var_ref(TYPE_INT, arm, int_spelling(arm), flag, SlotForm.InlineWord),
-            int_const(arm, "1"))]
+        let mark: List[Int] = [ir_assign(arm, flag_ref(arm, flag), int_const(arm, "1"))]
         let guard = node_guard(arm)
         let block = if guard < 0 { arm_block(ctx, arm, mark) } else { guarded_arm_block(ctx, arm, guard, mark) }
         let cond = pattern_test(ctx, node_pattern(arm))
         out.push(ir_if(arm, chain_condition(arm, flag, cond), block, -1))
         i = i + 1
     }
-    out.push(ir_if(node, not_taken(node, flag), ir_block(node, [ir_unreachable(node)]), -1))
+    if covered { out.push(ir_if(node, not_taken(node, flag), ir_block(node, [ir_unreachable(node)]), -1)) }
 }
 
 fn not_taken(span: Int, flag: Str) -> Int ! Diag.Report {
-    ir_binary(TYPE_INT, span, int_spelling(span), "==",
-        ir_var_ref(TYPE_INT, span, int_spelling(span), flag, SlotForm.InlineWord),
+    ir_binary(TYPE_INT, span, int_spelling(span), "==", flag_ref(span, flag),
         int_const(span, "0"))
 }
 
