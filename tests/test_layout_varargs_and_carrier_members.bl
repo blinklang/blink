@@ -1,0 +1,112 @@
+// Two storage questions that are not layout_of: the width a value takes when it crosses
+// C varargs, and the shape of one member inside a carrier.
+
+import std.io
+import layout.{
+    varargs_spelling, format_spec_of, carrier_member_layout, layout_reset, Slot, SlotForm,
+}
+import cname_test_helpers.{compile_probe, tid_of, assert_eq_str}
+
+fn src() -> Str {
+    #"type Errno { Errno(Int) }
+type Point { x: Int, y: Int }
+type Big { a: Int, b: Int, c: Int, d: Int, e: Int, f: Str }
+fn main() {
+    let i: Int = 1
+    let f: Float = 1.5
+    let s: Str = "s"
+    let b: Bool = true
+    let c: Char = 'c'
+    let n1: I8 = 1
+    let n2: I32 = 1
+    let u1: U8 = 1
+    let u2: U64 = 1
+    let e: Errno = Errno(1)
+    let l: List[Int] = []
+    let oi: Option[Int] = None
+    let op: Option[Point] = None
+    let ob: Option[Big] = None
+    let rs: Result[Int, Str] = Ok(1)
+    let _k = [i, n2]
+    let _k2 = [f]
+    let _k3 = [s]
+    let _k4 = [b]
+    let _k5 = [c]
+    let _k6 = [n1]
+    let _k7 = [u1]
+    let _k8 = [u2]
+    let _k9 = [e]
+    let _ka = [l]
+    let _kb = [oi]
+    let _kc = [op]
+    let _kd = [ob]
+    let _ke = [rs]
+}
+"#
+}
+
+fn probe() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let m = compile_probe("layout_varargs", src())
+    layout_reset()
+    m
+}
+
+fn assert_spec(m: Map[Str, Int], key: Str, spec: Str, width: Str) {
+    let tid = tid_of(m, key)
+    assert_eq_str("{key} conversion", format_spec_of(tid), spec)
+    assert_eq_str("{key} varargs width", varargs_spelling(tid), width)
+}
+
+test "a signed integer is promoted to the widest signed type and printed with lld" {
+    let m = probe()
+    assert_spec(m, "Int", "%lld", "long long")
+    assert_spec(m, "I8", "%lld", "long long")
+    assert_spec(m, "I32", "%lld", "long long")
+}
+
+test "an unsigned integer keeps its sign across the boundary" {
+    let m = probe()
+    assert_spec(m, "U8", "%llu", "unsigned long long")
+    assert_spec(m, "U64", "%llu", "unsigned long long")
+}
+
+test "a transparent newtype crosses as the integer it wraps" {
+    let m = probe()
+    assert_spec(m, "Errno", "%lld", "long long")
+}
+
+test "a value C already promotes for us names a conversion but no width" {
+    let m = probe()
+    assert_spec(m, "Float", "%g", "")
+    assert_spec(m, "Str", "%s", "")
+    assert_spec(m, "Bool", "%s", "")
+    assert_spec(m, "Char", "%s", "")
+}
+
+test "a value with no printf conversion names neither" {
+    let m = probe()
+    assert_spec(m, "List[Int]", "", "")
+    assert_spec(m, "Option[Int]", "", "")
+}
+
+test "a carrier member is spelled from the inner type, by value when it fits a word" {
+    let m = probe()
+    let rec = carrier_member_layout(tid_of(m, "Option[Int]"), Slot.Inner1)
+    assert_eq_str("payload decline", rec.decline_reason, "")
+    assert_eq_str("payload spelling", rec.c_spelling, "int64_t")
+    assert(rec.slot_form == SlotForm.InlineWord)
+}
+
+test "each side of a Result answers its own slot" {
+    let m = probe()
+    let tid = tid_of(m, "Result[Int, Str]")
+    assert_eq_str("ok side", carrier_member_layout(tid, Slot.Inner1).c_spelling, "int64_t")
+    assert_eq_str("err side", carrier_member_layout(tid, Slot.Inner2).c_spelling, "const char*")
+}
+
+test "a slot the carrier does not have is declined and not guessed" {
+    let m = probe()
+    let rec = carrier_member_layout(tid_of(m, "Option[Int]"), Slot.Inner2)
+    assert(rec.decline_reason != "")
+    assert_eq_str("declined spelling is empty", rec.c_spelling, "")
+}
