@@ -5,20 +5,23 @@
 // which changes whenever the probe source gains a line, so a text golden would break for
 // reasons that have nothing to do with lowering.
 
-import typecheck.{check_types}
-import parser.{node_kind, node_name, node_value, nodes}
+import typecheck.{check_types, tc_lookup_node_tid}
+import parser.{node_kind, node_name, node_value, node_source_module, nodes}
 import compiler.{compile_to_program}
 import ast.{NodeKind, nk_of}
-import layout.{layout_reset}
+import layout.{layout_reset, binder_scope_push, bind_binder}
 import ir.{
     ir_reset, ir_kind, ir_kind_name, ir_c_name, ir_c_spelling, ir_kid, ir_kid_count,
     ir_verify, IrKind,
 }
 import cg_expr.{cg_expr_reset}
+import cg_reg.{cg_reg_reset, cg_reg_build, cg_reg_global_decls}
 import diagnostics.{diag_entries, diag_ice_count}
 import std.io
 
-pub fn probe(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+// The Program node of the compiled probe. A test that runs a later pass by hand needs it,
+// so it is the answer rather than a cell another test could read stale.
+pub fn probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
     let path = "build/{stem}_probe.bl"
     write_file(path, src)
@@ -28,10 +31,60 @@ pub fn probe(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     layout_reset()
     ir_reset()
     cg_expr_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    bind_probe_locals()
+    program
 }
 
-// The `let <name> = ...` node itself. A test that must name a module-level binding hands
-// this to cg_expr_bind_global, which is what the driver does with the same node.
+// The probe's own module. Its sources compile against the whole stdlib graph, so a walk
+// over every node has to tell the probe's lines from the library's.
+let probe_module = "__main__"
+
+// The binder frame the statement stage would have opened. A test lowers one expression
+// without that stage, so the probe's locals are bound here at their own types; a name with
+// no binder is refused by design, and every probe local would hit that refusal otherwise.
+// Module-level `let`s stay out: they are globals, which a local is allowed to shadow.
+fn bind_probe_locals() {
+    let scope = binder_scope_push()
+    let mut i = 0
+    while i < nodes.len() {
+        if node_source_module(i) == probe_module && is_binder_node(i) {
+            let tid = binder_tid(i)
+            if tid >= 0 { bind_binder(scope, node_name(i), tid) }
+        }
+        i = i + 1
+    }
+}
+
+fn is_binder_node(node: Int) -> Bool {
+    let k = nk_of(node_kind(node))
+    if k == NodeKind.Param { return true }
+    if k != NodeKind.LetBinding { return false }
+    !is_module_global(node)
+}
+
+fn is_module_global(node: Int) -> Bool {
+    let decls = cg_reg_global_decls()
+    let mut i = 0
+    while i < decls.len() {
+        if decls.get(i).unwrap() == node { return true }
+        i = i + 1
+    }
+    false
+}
+
+// A binder's own stamp where typecheck left one, else the type of what it binds. Read
+// through typecheck rather than layout so a node with no stamp answers -1 instead of
+// recording an internal error a test would then read as its own.
+fn binder_tid(node: Int) -> Int {
+    let own = tc_lookup_node_tid(node)
+    if own >= 0 { return own }
+    tc_lookup_node_tid(node_value(node))
+}
+
+// The `let <name> = ...` node itself. A test names a binding this way so it reads as the
+// source line it is about rather than as a node index.
 pub fn let_node_of(name: Str) -> Int {
     let mut i = 0
     while i < nodes.len() {
@@ -45,6 +98,32 @@ pub fn let_node_of(name: Str) -> Int {
 
 // The right-hand side of `let <name> = ...` in the probe. Each test names its bindings,
 // so a test reads as the expression it is about rather than as a node index.
+// The first `Ident` in the program that spells `name`. A probe picks a name nothing in the
+// stdlib graph spells, so the hit is the probe's own line.
+pub fn ident_node_of(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.Ident && node_name(i) == name { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no name '{name}'")
+    assert(false)
+    -1
+}
+
+// The `fn <name>` declaration node. A generic declaration identifies its own monomorphised
+// instances, which is how a test tells them from the rest of the stdlib graph's.
+pub fn fn_decl_of(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no function '{name}'")
+    assert(false)
+    -1
+}
+
 pub fn rhs_of(name: Str) -> Int {
     node_value(let_node_of(name))
 }

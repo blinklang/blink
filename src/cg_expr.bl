@@ -24,12 +24,15 @@ import ast.{NodeKind, nk_of, node_kind_name}
 import typecheck.{
     TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_child_count, tc_tid_decl_node,
     lookup_named_type, get_struct_field_tid, is_import_module_name,
+    tc_qualifier_to_module_or_self,
     TYPE_INT, TYPE_BOOL, TYPE_STR,
 }
 import layout.{
     LayoutRecord, Position, Slot, SlotForm, layout_of, carrier_member_layout, child_tid,
-    field_layout_of, tid_of_node, ensure_typedef_for, format_spec_of, varargs_spelling,
+    current_binder_scope, field_layout_of, tid_of_binder, tid_of_node, ensure_typedef_for,
+    format_spec_of, varargs_spelling,
 }
+import cg_reg.{cg_reg_global_decls, cg_reg_module_of}
 import cname.{
     c_local_name, c_field_name, c_global_name, c_string_literal, c_container_ctor,
     c_runtime_helper, c_variant_tag_macro, c_mono_variant_tag_macro,
@@ -45,7 +48,6 @@ import diagnostics.{
     Diag, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg, UNSOLVED_TYPEVAR_AT_CODEGEN,
     CODEGEN_STAGE_NOT_BUILT,
 }
-import mono.{MonoInstance, node_tid_for_inst}
 
 // The constructor and member spellings this stage compares against, held as data so no
 // branch here dispatches on a type's name.
@@ -74,67 +76,25 @@ type InterpHole {
     arg: Int = -1
 }
 
-let mut cx_inst: List[MonoInstance] = []
 let mut cx_pending: List[Int] = []
 let mut cx_temp_n: Int = 0
 let mut cx_value_name: Map[Str, Str] = Map()
 let mut cx_value_type: Map[Str, Int] = Map()
-let mut cx_globals: Map[Str, Int] = Map()
 let mut cx_return_type: Int = -1
-let mut cx_local_names: List[Str] = []
-let mut cx_scope_marks: List[Int] = []
 
 // ── Seam ──────────────────────────────────────────────────────────────────
 
 pub fn cg_expr_reset() {
-    cx_inst = []
     cx_pending = []
     cx_temp_n = 0
     cx_value_name = Map()
     cx_value_type = Map()
-    cx_globals = Map()
     cx_return_type = -1
-    cx_local_names = []
-    cx_scope_marks = []
-}
-
-// Inside a monomorphised body a node's type is the instance's, not the generic one.
-pub fn cg_expr_enter_instance(inst: MonoInstance) {
-    cx_inst.push(inst)
-}
-
-pub fn cg_expr_leave_instance() {
-    if cx_inst.len() > 0 { cx_inst.pop() }
 }
 
 // The carrier `?` returns on the error path.
 pub fn cg_expr_set_return_type(tid: Int) {
     cx_return_type = tid
-}
-
-// A module-level binding. A bare name spells this symbol only where no local of the same
-// name is in scope, and a qualified key also answers `mod.NAME` from another module.
-pub fn cg_expr_bind_global(name: Str, let_node: Int) {
-    cx_globals.insert(name, let_node)
-}
-
-// The names in scope decide whether a bare name is a local or a module global, because
-// the language lets a local shadow a global. cg_fn opens a scope for the parameters and
-// cg_stmt one for every block, and each binds the names it declares.
-pub fn cg_expr_push_scope() {
-    cx_scope_marks.push(cx_local_names.len())
-}
-
-pub fn cg_expr_pop_scope() {
-    let n = cx_scope_marks.len()
-    if n == 0 { return }
-    let mark = cx_scope_marks.get(n - 1).unwrap()
-    cx_scope_marks.pop()
-    while cx_local_names.len() > mark { cx_local_names.pop() }
-}
-
-pub fn cg_expr_bind_local(name: Str) {
-    cx_local_names.push(name)
 }
 
 // An `if` or `match` in value position: cg_stmt declares the temp, lowers the arms into
@@ -181,15 +141,6 @@ pub fn lower_expr(node: Int) -> Int ! Diag.Report {
 }
 
 // ── Type and layout ───────────────────────────────────────────────────────
-
-// The tid of a node, read from the mono instance when one is open. Both readers report a
-// miss and answer -1; nothing here substitutes a default type.
-fn x_tid(node: Int) -> Int ! Diag.Report {
-    if cx_inst.len() > 0 {
-        return node_tid_for_inst(cx_inst.get(cx_inst.len() - 1).unwrap(), node)
-    }
-    tid_of_node(node)
-}
 
 // The shape of a value in hand. A decline here means monomorphisation left a type codegen
 // cannot spell, so it is an ICE and the caller stops.
@@ -318,7 +269,7 @@ fn x_ref(tid: Int, node: Int, name: Str) -> Int ! Diag.Report {
 // ── Literals ──────────────────────────────────────────────────────────────
 
 fn lower_literal(node: Int, literal: Str) -> Int ! Diag.Report {
-    let tid = x_tid(node)
+    let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
@@ -343,28 +294,50 @@ fn x_kind(tid: Int) -> TyKind {
 }
 
 fn lower_ident(node: Int) -> Int ! Diag.Report {
-    let tid = x_tid(node)
+    let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let name = node_name(node)
     if name == ctor_none { return lower_none(node, tid) }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
-    if !x_is_local(name) {
-        match cx_globals.get(name) {
-            Some(decl) => return ir_global_ref(tid, node, rec.c_spelling, c_global_name(decl), rec.slot_form)
-            None => {}
-        }
+    if x_is_local(name) {
+        return ir_var_ref(tid, node, rec.c_spelling, c_local_name(name), rec.slot_form)
     }
-    ir_var_ref(tid, node, rec.c_spelling, c_local_name(name), rec.slot_form)
+    let decl = x_global_decl("", name)
+    if decl >= 0 {
+        return ir_global_ref(tid, node, rec.c_spelling, c_global_name(decl), rec.slot_form)
+    }
+    // Typecheck already refused an undefined name, so a name that is neither a binder in
+    // scope nor a module global means the statement stage never bound it. Spelling it as a
+    // local anyway would emit a C identifier no declaration introduces.
+    diag_ice_at("NameNotBound", CODEGEN_STAGE_NOT_BUILT,
+        "'{name}' is neither a binder in scope nor a module global", node,
+        "the statement stage binds every local before lowering an expression that reads it")
+    -1
 }
 
+// The language lets a local shadow a module global, so a bare name is a local wherever
+// the statement stage has a binder of that name in the open frame. Both stages read the
+// one set of frames layout keeps, so they cannot disagree about what is in scope.
 fn x_is_local(name: Str) -> Bool {
+    tid_of_binder(current_binder_scope(), name) >= 0
+}
+
+// The module-level `let` a name refers to, or -1. The driver's registry is the only list
+// of them, so it is read rather than copied into a table here that could fall behind it.
+// An empty module means any module answers, which is how a bare name resolves.
+fn x_global_decl(module: Str, name: Str) -> Int {
+    let decls = cg_reg_global_decls()
     let mut i = 0
-    while i < cx_local_names.len() {
-        if cx_local_names.get(i).unwrap() == name { return true }
+    while i < decls.len() {
+        let decl = decls.get(i).unwrap()
+        if node_name(decl) == name {
+            if module == "" { return decl }
+            if cg_reg_module_of(decl) == module { return decl }
+        }
         i = i + 1
     }
-    false
+    -1
 }
 
 // An `if` or `match` in value position: the arms are statements, so cg_stmt materialises
@@ -426,7 +399,7 @@ fn lower_none(node: Int, tid: Int) -> Int ! Diag.Report {
 // Some, Ok and Err all write one tag and one member. Which member and which tag is the
 // only difference, and the member's physical form is layout's answer, not a guess here.
 fn lower_wrap(node: Int, slot: Slot, member: Str, tag_value: Int) -> Int ! Diag.Report {
-    let tid = x_tid(node)
+    let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let args = node_args(node)
     let n = sublist_length(args)
@@ -516,7 +489,7 @@ fn lower_binop(node: Int) -> Int ! Diag.Report {
     if op == "??" { return lower_coalesce(node) }
     if op == "&&" { return lower_short_circuit(node, op) }
     if op == "||" { return lower_short_circuit(node, op) }
-    let lhs_tid = x_tid(node_left(node))
+    let lhs_tid = tid_of_node(node_left(node))
     if lhs_tid < 0 { return -1 }
     if x_kind(lhs_tid) == TyKind.Str { return lower_str_binop(node, op) }
     let lhs_rec = x_local(lhs_tid, node_left(node))
@@ -527,7 +500,7 @@ fn lower_binop(node: Int) -> Int ! Diag.Report {
             "cg_call must lower the Eq or Ord method this operator desugars to")
         return -1
     }
-    let tid = x_tid(node)
+    let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
@@ -554,7 +527,7 @@ fn x_is_c_comparable(tid: Int, rec: LayoutRecord) -> Bool {
 
 // C compares a const char* by address, so every Str comparison goes through the runtime.
 fn lower_str_binop(node: Int, op: Str) -> Int ! Diag.Report {
-    let tid = x_tid(node)
+    let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
@@ -583,7 +556,7 @@ fn lower_str_order(node: Int, tid: Int, rec: LayoutRecord, op: Str, lhs: Int, rh
 // operand needs no statement of its own. When it does, the statement would run
 // unconditionally inside the operand, so the operator becomes a temp and an `if`.
 fn lower_short_circuit(node: Int, op: Str) -> Int ! Diag.Report {
-    let tid = x_tid(node)
+    let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
@@ -618,7 +591,7 @@ fn lower_short_circuit_guarded(node: Int, tid: Int, op: Str, lhs: Int, rhs: Int,
 // statements either arm may need, so this is a temp and an `if`.
 fn lower_coalesce(node: Int) -> Int ! Diag.Report {
     let opt_node = node_left(node)
-    let opt_tid = x_tid(opt_node)
+    let opt_tid = tid_of_node(opt_node)
     if opt_tid < 0 { return -1 }
     if x_kind(opt_tid) != TyKind.Option {
         diag_ice_at("CoalesceOnNonOption", CODEGEN_STAGE_NOT_BUILT,
@@ -634,7 +607,7 @@ fn lower_coalesce(node: Int) -> Int ! Diag.Report {
 }
 
 fn lower_coalesce_arms(node: Int, opt_tid: Int, carrier: Str) -> Int ! Diag.Report {
-    let tid = x_tid(node)
+    let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let result = x_bind(tid, node, -1)
     if result == "" { return -1 }
@@ -682,7 +655,7 @@ fn x_tag_is(node: Int, carrier_tid: Int, carrier: Str, want: Int) -> Int ! Diag.
 fn lower_unary(node: Int) -> Int ! Diag.Report {
     let op = node_op(node)
     if op == "?" { return lower_try(node) }
-    let tid = x_tid(node)
+    let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
@@ -696,7 +669,7 @@ fn lower_unary(node: Int) -> Int ! Diag.Report {
 // rather than anything C can write inline.
 fn lower_try(node: Int) -> Int ! Diag.Report {
     let src = node_left(node)
-    let carrier_tid = x_tid(src)
+    let carrier_tid = tid_of_node(src)
     if carrier_tid < 0 { return -1 }
     let k = x_kind(carrier_tid)
     if k != TyKind.Option && k != TyKind.Result {
@@ -725,7 +698,7 @@ fn lower_try_arms(node: Int, carrier_tid: Int, k: TyKind, carrier: Str) -> Int !
     let propagated = lower_try_propagate(node, carrier_tid, k, carrier)
     if propagated < 0 { return -1 }
     x_hoist(ir_if(node, cond, ir_block(node, [ir_return(node, propagated)]), -1))
-    let inner_tid = x_tid(node)
+    let inner_tid = tid_of_node(node)
     if inner_tid < 0 { return -1 }
     // Both carriers hold their success in the first slot; only the member name differs.
     let member = if k == TyKind.Option { member_value } else { member_ok }
@@ -753,7 +726,7 @@ fn lower_try_propagate(node: Int, carrier_tid: Int, k: TyKind, carrier: Str) -> 
 // ── Aggregates ────────────────────────────────────────────────────────────
 
 fn lower_tuple_lit(node: Int) -> Int ! Diag.Report {
-    let tid = x_tid(node)
+    let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
@@ -784,7 +757,7 @@ fn x_lower_all(sl: Int) -> List[Int] ! Diag.Report {
 // A container literal hands its elements to the runtime constructor. A map or set literal
 // also needs the key-operations table for its key tid, and the IR carries no slot for one.
 fn lower_list_lit(node: Int) -> Int ! Diag.Report {
-    let tid = x_tid(node)
+    let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let k = x_kind(tid)
     if k != TyKind.List {
@@ -809,7 +782,7 @@ fn lower_list_lit(node: Int) -> Int ! Diag.Report {
 // A struct literal writes its fields in declaration order, whatever order the source
 // names them, because C fills a compound literal positionally.
 fn lower_struct_lit(node: Int) -> Int ! Diag.Report {
-    let tid = x_tid(node)
+    let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
@@ -882,7 +855,7 @@ fn x_spread_node(node: Int) -> Int {
 
 fn x_bind_spread(sp: Int) -> SpreadBase ! Diag.Report {
     let src = node_value(sp)
-    let tid = x_tid(src)
+    let tid = tid_of_node(src)
     if tid < 0 { return SpreadBase {} }
     let value = lower_expr(src)
     if value < 0 { return SpreadBase {} }
@@ -919,7 +892,7 @@ fn lower_field_access(node: Int) -> Int ! Diag.Report {
     let obj = node_obj(node)
     if x_variant_of(node, obj) >= 0 { return x_variant_const(node, obj) }
     if x_module_qualifier(obj) != "" { return lower_module_global(node, obj) }
-    let obj_tid = x_tid(obj)
+    let obj_tid = tid_of_node(obj)
     if obj_tid < 0 { return -1 }
     if x_kind(obj_tid) == TyKind.Tuple { return lower_tuple_index(node, obj, obj_tid) }
     lower_struct_field(node, obj, obj_tid)
@@ -927,37 +900,30 @@ fn lower_field_access(node: Int) -> Int ! Diag.Report {
 
 // `mod.NAME` reads another module's global. The qualifier names a module, not a value, so
 // nothing reads a type for it. A binding of that name outranks the module, which is the
-// same rule name resolution applied when it typed the access.
+// same rule name resolution applied when it typed the access. The answer is the module
+// key a declaration is filed under, because `import std.process` is written `process.` at
+// the use site and only typecheck's import map knows the two are the same module.
 fn x_module_qualifier(obj: Int) -> Str {
     if nk_of(node_kind(obj)) != NodeKind.Ident { return "" }
     let name = node_name(obj)
     if x_is_local(name) { return "" }
-    if cx_globals.contains_key(name) { return "" }
+    if x_global_decl("", name) >= 0 { return "" }
     if is_import_module_name(name) == 0 { return "" }
-    name
+    tc_qualifier_to_module_or_self(name)
 }
 
 fn lower_module_global(node: Int, obj: Int) -> Int ! Diag.Report {
-    let tid = x_tid(node)
+    let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
+    let module = x_module_qualifier(obj)
     let field = node_name(node)
-    let mut decl = -1
-    match cx_globals.get("{x_module_qualifier(obj)}.{field}") {
-        Some(d) => decl = d
-        None => {}
-    }
-    if decl < 0 {
-        match cx_globals.get(field) {
-            Some(d) => decl = d
-            None => {}
-        }
-    }
+    let decl = x_global_decl(module, field)
     if decl < 0 {
         diag_ice_at("ModuleGlobalNotBound", CODEGEN_STAGE_NOT_BUILT,
-            "no global is bound for '{x_module_qualifier(obj)}.{field}'", node,
-            "the driver must call cg_expr_bind_global for every module-level binding a body reads")
+            "module '{module}' has no global named '{field}' in the declaration registry", node,
+            "the driver must build the registries before a body that reads a module global is lowered")
         return -1
     }
     ir_global_ref(tid, node, rec.c_spelling, c_global_name(decl), rec.slot_form)
@@ -976,7 +942,7 @@ fn x_variant_of(node: Int, obj: Int) -> Int {
 }
 
 fn x_variant_const(node: Int, obj: Int) -> Int ! Diag.Report {
-    let tid = x_tid(node)
+    let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
@@ -1005,7 +971,7 @@ fn x_variant_decl(decl: Int, name: Str) -> Int {
 
 fn lower_tuple_index(node: Int, obj: Int, obj_tid: Int) -> Int ! Diag.Report {
     let idx = node_name(node).to_int()
-    let tid = x_tid(node)
+    let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let mem = x_member(obj_tid, Slot.Elem(idx), node)
     if x_stopped(mem) { return -1 }
@@ -1015,7 +981,7 @@ fn lower_tuple_index(node: Int, obj: Int, obj_tid: Int) -> Int ! Diag.Report {
 }
 
 fn lower_struct_field(node: Int, obj: Int, obj_tid: Int) -> Int ! Diag.Report {
-    let tid = x_tid(node)
+    let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let decl = tc_tid_decl_node(obj_tid)
     if decl < 0 {
@@ -1054,7 +1020,7 @@ fn lower_call_expr(node: Int) -> Int ! Diag.Report {
             if name == ctor_ok { return lower_wrap(node, Slot.Inner1, member_ok, 0) }
             if name == ctor_err { return lower_wrap(node, Slot.Inner2, member_err, 1) }
             if name == ctor_none {
-                let tid = x_tid(node)
+                let tid = tid_of_node(node)
                 if tid < 0 { return -1 }
                 return lower_none(node, tid)
             }
@@ -1069,7 +1035,7 @@ fn lower_call_expr(node: Int) -> Int ! Diag.Report {
 // call to the runtime formatter, which sizes the buffer exactly, because the spec puts no
 // length cap on interpolation.
 fn lower_interp(node: Int) -> Int ! Diag.Report {
-    let tid = x_tid(node)
+    let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
@@ -1106,7 +1072,7 @@ fn lower_interp_call(node: Int, tid: Int, rec: LayoutRecord, parts: Int) -> Int 
 // Lowers one hole to the conversion the format string needs and the argument that feeds
 // it. An empty spec means the hole has already reported an ICE.
 fn x_interp_hole(part: Int) -> InterpHole ! Diag.Report {
-    let tid = x_tid(part)
+    let tid = tid_of_node(part)
     if tid < 0 { return InterpHole {} }
     let spec = format_spec_of(tid)
     if spec == "" {

@@ -1,15 +1,12 @@
 // Literals, names and the string that has no holes: the shapes that lower to one IR leaf.
 
 import lower_test_helpers.{
-    probe, rhs_of, let_node_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
-    assert_ice,
+    probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies, assert_ice,
 }
 import ir.{IrKind, ir_c_name, ir_c_spelling, ir_tid}
-import cg_expr.{
-    lower_expr, cg_expr_pending_count, cg_expr_bind_global, cg_expr_bind_local,
-    cg_expr_push_scope, cg_expr_pop_scope,
-}
-import layout.{tid_of_node}
+import cg_expr.{lower_expr, cg_expr_pending_count}
+import layout.{tid_of_node, binder_scope_push, binder_scope_pop, bind_binder}
+import cg_reg.{cg_reg_reset}
 
 fn src() -> Str {
     #"fn main() {
@@ -93,36 +90,38 @@ let COUNT = 5
 fn main() {
     let read = COUNT + 0
     let sig = process.SIGKILL
-    let _keep = [read, sig]
+    let gone = process.SIGTERM
+    let _keep = [read, sig, gone]
 }
 "#
 }
 
 test "a module global is read by its own symbol where no local shadows it" {
     probe("cg_expr_names", src_names())
-    cg_expr_bind_global("COUNT", let_node_of("COUNT"))
     assert_shape("global", lower_expr(rhs_of("read")), "Binary(GlobalRef, Const)")
 }
 
 test "a local outranks a module global of the same name, and only inside its scope" {
     probe("cg_expr_names", src_names())
-    cg_expr_bind_global("COUNT", let_node_of("COUNT"))
-    cg_expr_push_scope()
-    cg_expr_bind_local("COUNT")
+    let scope = binder_scope_push()
+    bind_binder(scope, "COUNT", tid_of_node(rhs_of("read")))
     assert_shape("shadowed", lower_expr(rhs_of("read")), "Binary(VarRef, Const)")
-    cg_expr_pop_scope()
+    binder_scope_pop()
     assert_shape("scope closed", lower_expr(rhs_of("read")), "Binary(GlobalRef, Const)")
 }
 
 test "a module-qualified name reads the other module's global" {
     probe("cg_expr_names", src_names())
-    cg_expr_bind_global("process.SIGKILL", let_node_of("SIGKILL"))
     let id = lower_expr(rhs_of("sig"))
     assert_kind("kind", id, IrKind.GlobalRef)
     assert_eq_str("type", ir_c_spelling(id), "int64_t")
 }
 
-test "a module-qualified name with no binding is refused, not spelled by guess" {
+// The declaration registry is the only list of module globals, so a name it cannot answer
+// is refused. Guessing the C symbol from the written name would emit a call to something
+// no translation unit declares.
+test "a module global the registry cannot answer is refused, not spelled by guess" {
     probe("cg_expr_names", src_names())
-    assert_ice("unbound", lower_expr(rhs_of("sig")), "ModuleGlobalNotBound")
+    cg_reg_reset()
+    assert_ice("unbound", lower_expr(rhs_of("gone")), "ModuleGlobalNotBound")
 }
