@@ -44,9 +44,10 @@ import ir.{
     ir_carrier_unwrap, ir_carrier_tag, ir_call_runtime, ir_let, ir_assign, ir_return,
     ir_expr_stmt, ir_if, ir_block,
 }
+import cg_call.{lower_call, lower_operator_method, lower_display_call, lower_spread}
 import diagnostics.{
-    Diag, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg, UNSOLVED_TYPEVAR_AT_CODEGEN,
-    CODEGEN_STAGE_NOT_BUILT,
+    Diag, diag_ice, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
+    UNSOLVED_TYPEVAR_AT_CODEGEN, CODEGEN_STAGE_NOT_BUILT, POISONED_IR_AT_SEAM,
 }
 
 // The constructor and member spellings this stage compares against, held as data so no
@@ -109,11 +110,27 @@ pub fn cg_expr_register_value(node: Int, c_name: Str, tid: Int) {
 pub fn cg_expr_pending_count() -> Int { cx_pending.len() }
 
 // A statement the caller's own lowering needs run before the expression that reads its
-// result. The call stage owns the shapes this stage refuses, materialises each into a
-// temp, and has no other way to emit the statements that fill them: the buffer is this
-// module's cell and the import edge does not point back here from a stage this one calls.
-pub fn cg_expr_push_pending(stmt: Int) {
-    x_hoist(stmt)
+// result. The call stage materialises the shapes this stage refuses into temps, and the
+// buffer for the statements that fill them is this module's cell, so the push is a seam.
+//
+// `node` is the expression the statement belongs to, and gives the refusal a span to
+// blame. Buffering a poisoned statement would put an id the pool does not hold in front
+// of the expression that reads the temp, and the printer would read it as a real node.
+// Node 0 is real, so both tests are for negative: a caller that lost the statement may
+// have lost the expression too, and the node readers exit the process on an id the pool
+// does not hold, which would turn the refusal into a silent exit.
+pub fn cg_expr_push_pending(node: Int, stmt: Int) ! Diag.Report {
+    if stmt >= 0 {
+        x_hoist(stmt)
+        return
+    }
+    let why = "a statement that was never lowered was handed to the pending buffer"
+    let fix = "the caller must stop when its own lowering reports, not push the poisoned node"
+    if node < 0 {
+        diag_ice("PendingStatementNotLowered", POISONED_IR_AT_SEAM, why, 0, 0, fix)
+        return
+    }
+    diag_ice_at("PendingStatementNotLowered", POISONED_IR_AT_SEAM, why, node, fix)
 }
 
 // Statements the lowered expression needs run before it. The caller emits them in order.
@@ -145,7 +162,7 @@ pub fn lower_expr(node: Int) -> Int ! Diag.Report {
         NodeKind.MatchExpr => lower_registered(node)
         NodeKind.SpreadExpr => x_spread_not_built(node)
         NodeKind.Closure => x_not_built(node, "cg_eff closures")
-        NodeKind.MethodCall => x_not_built(node, "cg_call")
+        NodeKind.MethodCall => lower_call(node)
         _ => x_unhandled(node)
     }
 }
@@ -205,12 +222,13 @@ fn x_not_built(node: Int, stage: Str) -> Int ! Diag.Report {
     -1
 }
 
-// `[..a, b]` copies the source's elements into the new container. That copy is a runtime
-// call on the container, not an element the literal can write in place.
+// `..a` copies a container into the one being built, so it is not a value that stands on
+// its own: it needs the destination, which only the literal around it names. Reaching this
+// arm means a spread was lowered with no literal to fill.
 fn x_spread_not_built(node: Int) -> Int ! Diag.Report {
     diag_ice_at("SpreadElementNotLowered", CODEGEN_STAGE_NOT_BUILT,
-        "a spread element has no lowering here", node,
-        "cg_call owns the container copy a spread performs")
+        "a spread has no container to copy into here", node,
+        "a spread lowers through the container literal that names its destination")
     -1
 }
 
@@ -500,11 +518,14 @@ fn lower_binop(node: Int) -> Int ! Diag.Report {
     if x_kind(lhs_tid) == TyKind.Str { return lower_str_binop(node, op) }
     let lhs_rec = x_local(lhs_tid, node_left(node))
     if x_stopped(lhs_rec) { return -1 }
+    // The method takes its operands already lowered, so evaluation order stays this
+    // stage's: left before right, whichever operator the pair desugars to.
     if !x_is_c_comparable(lhs_tid, lhs_rec) {
-        diag_ice_at("OperandNotCComparable", CODEGEN_STAGE_NOT_BUILT,
-            "operator '{op}' on a {tk_name(x_kind(lhs_tid))} operand needs trait dispatch", node,
-            "cg_call must lower the Eq or Ord method this operator desugars to")
-        return -1
+        let left = lower_expr(node_left(node))
+        if left < 0 { return -1 }
+        let right = lower_expr(node_right(node))
+        if right < 0 { return -1 }
+        return lower_operator_method(node, op, left, right)
     }
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
@@ -760,6 +781,25 @@ fn x_lower_all(sl: Int) -> List[Int] ! Diag.Report {
     out
 }
 
+// The elements a container literal is written with. A written element is an expression; a
+// spread copies another container into this one. Only the literal names the container being
+// filled, so the literal calls the copy and passes that destination.
+fn x_lower_container_elements(sl: Int, into_tid: Int) -> List[Int] ! Diag.Report {
+    let mut out: List[Int] = []
+    if sl < 0 { return out }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        let e = sublist_get(sl, i)
+        if nk_of(node_kind(e)) == NodeKind.SpreadExpr {
+            out.push(lower_spread(e, into_tid))
+        } else {
+            out.push(lower_expr(e))
+        }
+        i = i + 1
+    }
+    out
+}
+
 // A container literal hands its elements to the runtime constructor. A map or set literal
 // also needs the key-operations table for its key tid, and the IR carries no slot for one.
 fn lower_list_lit(node: Int) -> Int ! Diag.Report {
@@ -776,7 +816,7 @@ fn lower_list_lit(node: Int) -> Int ! Diag.Report {
     if x_stopped(rec) { return -1 }
     let ctor = c_container_ctor(tid)
     if diag_is_ice_seg(ctor) { return x_unhandled(node) }
-    let elems = x_lower_all(node_elements(node))
+    let elems = x_lower_container_elements(node_elements(node), tid)
     let mut i = 0
     while i < elems.len() {
         if elems.get(i).unwrap() < 0 { return -1 }
@@ -1032,7 +1072,7 @@ fn lower_call_expr(node: Int) -> Int ! Diag.Report {
             }
         }
     }
-    x_not_built(node, "cg_call")
+    lower_call(node)
 }
 
 // ── Interpolation ─────────────────────────────────────────────────────────
@@ -1081,15 +1121,31 @@ fn x_interp_hole(part: Int) -> InterpHole ! Diag.Report {
     let tid = tid_of_node(part)
     if tid < 0 { return InterpHole {} }
     let spec = format_spec_of(tid)
-    if spec == "" {
-        diag_ice_at("InterpolatedValueNeedsDisplay", CODEGEN_STAGE_NOT_BUILT,
-            "a {tk_name(x_kind(tid))} hole has no printf form and needs its Display method", part,
-            "cg_call must lower the Display call typecheck already proved exists")
-        return InterpHole {}
-    }
+    if spec == "" { return x_unprintable_hole(part, tid) }
     let arg = x_interp_arg(part, tid)
     if arg < 0 { return InterpHole {} }
     InterpHole { spec: spec, arg: arg }
+}
+
+// A hole no printf conversion prints. Only a struct or an enum declares a type that can
+// carry `impl Display`, so only those two call that impl. Typecheck also shows a tuple, and
+// it shows one from its elements, which this stage does not render yet.
+//
+// The call answers a string, so the formatter takes the conversion a string takes. Layout
+// answers what that is, because this file spells no conversion of its own.
+fn x_unprintable_hole(part: Int, tid: Int) -> InterpHole ! Diag.Report {
+    let k = x_kind(tid)
+    if k != TyKind.Struct && k != TyKind.Enum {
+        diag_ice_at("StructuralHoleNotRendered", CODEGEN_STAGE_NOT_BUILT,
+            "a {tk_name(k)} hole renders from its parts, and this stage does not build that", part,
+            "only a struct or an enum can carry the Display impl this stage calls")
+        return InterpHole {}
+    }
+    let value = lower_expr(part)
+    if value < 0 { return InterpHole {} }
+    let shown = lower_display_call(part, value)
+    if shown < 0 { return InterpHole {} }
+    InterpHole { spec: format_spec_of(TYPE_STR), arg: shown }
 }
 
 fn x_interp_arg(part: Int, tid: Int) -> Int ! Diag.Report {

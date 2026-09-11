@@ -60,7 +60,10 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | Name | Code | One-line |
 |------|------|----------|
 | UnsolvedTypeVarAtCodegen | I0001 | An unsolved type variable reached monomorphization — the front end should have reported `CannotInferType` (E0301) first |
-| *(reserved for future use)* | I0002+ | Internal compiler errors will be cataloged as they are defined |
+| UnhandledIterableAtCodegen | I0002 | A `for` loop's iterable passed the front-end check but code generation has no emitter for its type |
+| MisplacedIrKindAtPrint | I0003 | An IR node of the wrong class reached the C printer — a statement where a value is required, or the reverse |
+| CodegenStageNotBuilt | I0004 | A code-generation stage this build does not contain was reached |
+| PoisonedIrAtSeam | I0005 | A negative IR node id was handed to a producer that must embed it — the caller ignored a stop it had already been told about |
 
 ---
 
