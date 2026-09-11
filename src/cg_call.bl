@@ -25,7 +25,7 @@ import typecheck.{
 }
 import layout.{
     LayoutRecord, Position, SlotForm, layout_of, tid_of_node,
-    tid_of_binder, current_binder_scope, current_inst,
+    tid_of_binder, current_binder_scope, current_inst, decl_has_derive,
 }
 import mono.{instances, instance_for_call}
 import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls}
@@ -41,11 +41,14 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 
-// The trait whose synthesized dispatcher renders a value into a string, and the derived
-// method an equality operator reaches. Both are compiler-owned names, not user-written
-// ones, so the name is the only key there is until a trait carries a declaration id.
+// The trait whose synthesized dispatcher renders a value into a string, the two traits
+// whose derive builds an equality method, and the method those traits name. All are
+// compiler-owned names, not user-written ones, so the name is the only key there is until
+// a trait carries a declaration id.
 let trait_display = "Display"
-let derived_eq = "eq"
+let trait_eq = "Eq"
+let trait_ord = "Ord"
+let method_eq = "eq"
 
 // ── Seams ─────────────────────────────────────────────────────────────────
 
@@ -80,10 +83,32 @@ pub fn lower_operator_method(node: Int, op: Str, lhs: Int, rhs: Int) -> Int ! Di
             "only a declared struct or enum derives Eq; another operand needs its own lowering")
         return -1
     }
-    let eq = ir_call_direct(tid, node, rec.c_spelling, c_derive_method_name(decl, derived_eq),
-        rec.slot_form, [lhs, rhs])
+    let symbol = cc_equality_symbol(node, decl, ir_tid(lhs))
+    if symbol == "" { return -1 }
+    let eq = ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, [lhs, rhs])
     if op == "==" { return eq }
     ir_unary(tid, node, rec.c_spelling, "!", eq)
+}
+
+// The C function an equality operator reaches. A type carries equality by writing the impl
+// out or by deriving it, and the two spell the same method differently, so the declaration
+// decides the name. A type may do both, and then the hand-written impl is what the program
+// said: the derive stage still emits its own body, and nothing reaches it. "" is answered
+// after an internal error is recorded.
+fn cc_equality_symbol(node: Int, decl: Int, recv_tid: Int) -> Str ! Diag.Report {
+    let im = cc_impl_for(recv_tid, trait_eq)
+    if im >= 0 { return c_impl_method_name(im, method_eq) }
+    if cc_derives_equality(decl) { return c_derive_method_name(decl, method_eq) }
+    diag_ice_at("EqualityMethodNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{node_name(decl)}' has neither a derived nor a written {trait_eq} method", node,
+        "typecheck must reject a comparison whose operand carries no equality; this is a compiler bug")
+    ""
+}
+
+// Ord is the second name that builds an equality method, because an ordering answers
+// whether two values are equal on the way to answering which is smaller.
+fn cc_derives_equality(decl: Int) -> Bool {
+    decl_has_derive(decl, trait_eq) || decl_has_derive(decl, trait_ord)
 }
 
 // An interpolation hole whose type has no printf form renders through the sealed
