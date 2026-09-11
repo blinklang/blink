@@ -2,7 +2,7 @@
 // vtable struct and the key-operations table. Expected bytes come from the pinned
 // compiler's C and from runtime_core.h.
 
-import typecheck.{tc_type_decl_nodes}
+import typecheck.{tc_type_decl_nodes, lookup_named_type}
 import diagnostics.{diag_is_ice_seg}
 import cname.{c_vtable_type_name, c_kops_table_name, cname_mark_transparent_newtype, cname_is_transparent_newtype, cname_mark_runtime_owned, cname_is_runtime_owned, cname_reset}
 import cname_test_helpers.{assert_eq_str, tid_of, compile_probe}
@@ -12,6 +12,9 @@ fn probe_src() -> Str {
     #"@derive(Hash, Eq)
 type Key { id: Int }
 type Point { x: Int, y: Int }
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn use_cf(c: Option[CFile]) -> Int { 1 }
 effect Metrics {
     effect Emit {
         fn counter(name: Str)
@@ -29,6 +32,8 @@ fn main() {
         fn counter(_name: Str) {}
     }
     let l: List[Int] = []
+    let tp: (Int, Str) = (1, "a")
+    let tn: ((Int, Str), Bool) = (tp, true)
     io.println("{k.id} {p.x} {i} {s} {c} {u} {l.len()}")
 }
 "#
@@ -50,6 +55,18 @@ test "kops tables: runtime table per scalar, kops_<C name> per nominal" {
     assert_eq_str("Key", c_kops_table_name(tid_of(m, "Key")), "kops_blink_Key")
     assert_eq_str("Point", c_kops_table_name(tid_of(m, "Point")), "kops_blink_Point")
     assert(diag_is_ice_seg(c_kops_table_name(tid_of(m, "List[Int]"))))
+}
+
+// A tuple key hashes through a table named after its typedef, the same stem every other
+// tuple symbol embeds. An opaque handle's C name is a pointer, so it can never be a table
+// stem: the speller declines instead of leaking `*` into a symbol.
+test "kops tables: kops_<typedef> for a tuple key; an opaque handle declines" {
+    let m = compile_probe("cname_runtime_symbols", probe_src())
+    assert_eq_str("(Int, Str)", c_kops_table_name(tid_of(m, "(Int, Str)")), "kops_blink_Tuple2_int_str")
+    assert_eq_str("nested", c_kops_table_name(tid_of(m, "((Int, Str), Bool)")), "kops_blink_Tuple2_Tuple2_int_str_bool")
+    let cfile = c_kops_table_name(lookup_named_type("CFile"))
+    assert(diag_is_ice_seg(cfile))
+    assert(!cfile.contains("*"))
 }
 
 test "marks read back and clear with cname_reset" {

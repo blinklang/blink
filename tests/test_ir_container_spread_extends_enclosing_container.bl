@@ -1,0 +1,97 @@
+import std.io
+import ir.{
+    IrKind, ir_reset, ir_new, ir_verify, ir_kind, ir_kind_name, ir_kind_is_value, ir_kid_count,
+    ir_c_name, ir_c_spelling, ir_tid, ir_slot_form, ir_slot_form_name, ir_dump, ir_parse,
+    ir_const, ir_var_ref, ir_container_new, ir_container_spread, ir_let, ir_expr_stmt, ir_binary,
+    ir_call_runtime,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn assert_rejects(label: Str, root: Int, needle: Str) {
+    let errs = ir_verify(root)
+    let mut hit = 0
+    for e in errs { if e.contains(needle) { hit += 1 } }
+    if hit == 0 { io.println("FAIL: {label}: no error contains '{needle}'; got: {errs.join(" | ")}") }
+    assert_eq_int("{label} reports '{needle}'", if hit > 0 { 1 } else { 0 }, 1)
+}
+
+fn assert_valid(label: Str, root: Int) {
+    let errs = ir_verify(root)
+    if errs.len() > 0 { io.println("FAIL: {label}: {errs.join(" | ")}") }
+    assert_eq_int("{label} verifies", errs.len(), 0)
+}
+
+fn int_const(text: Str) -> Int { ir_const(1, 0, "int64_t", text) }
+fn list_var(name: Str) -> Int { ir_var_ref(4, 0, "blink_list*", name, SlotForm.InlineWord) }
+fn spread_of(name: Str) -> Int { ir_container_spread(4, 0, "blink_list*", "blink_list_extend", list_var(name)) }
+
+// `[..nums, 9]`: the spread is one kid of the literal's ContainerNew, so the destination
+// it extends is the container the printer is building, and no other node has to name it.
+test "a ContainerSpread is a value kid of ContainerNew that names the extend symbol" {
+    ir_reset()
+    let sp = spread_of("nums")
+    assert_eq_str("kind", ir_kind_name(ir_kind(sp)), "ContainerSpread")
+    assert_eq_int("is a value", if ir_kind_is_value(IrKind.ContainerSpread) { 1 } else { 0 }, 1)
+    assert_eq_int("one source kid", ir_kid_count(sp), 1)
+    assert_eq_int("tid is the source container", ir_tid(sp), 4)
+    assert_eq_str("spelling", ir_c_spelling(sp), "blink_list*")
+    assert_eq_str("extend symbol", ir_c_name(sp), "blink_list_extend")
+    assert_eq_str("slot", ir_slot_form_name(ir_slot_form(sp)), "InlineWord")
+    let lit = ir_container_new(4, 0, "blink_list*", "blink_list_new", [sp, int_const("9")])
+    assert_valid("spread then element", ir_expr_stmt(0, lit))
+    let both = ir_container_new(4, 0, "blink_list*", "blink_list_new", [int_const("1"), spread_of("a"), spread_of("b")])
+    assert_valid("element then two spreads", ir_expr_stmt(0, both))
+}
+
+test "a ContainerSpread anywhere but directly under ContainerNew is rejected" {
+    ir_reset()
+    let needle = "ContainerSpread outside a ContainerNew"
+    assert_rejects("as a Let initialiser", ir_let(4, 0, "blink_list*", "xs", SlotForm.InlineWord, spread_of("nums")), needle)
+    assert_rejects("as a Binary operand", ir_expr_stmt(0, ir_binary(1, 0, "int64_t", "+", spread_of("nums"), int_const("1"))), needle)
+    assert_rejects("as a runtime call argument", ir_expr_stmt(0, ir_call_runtime(1, 0, "int64_t", "blink_list_len", SlotForm.InlineWord, [spread_of("nums")])), needle)
+    assert_rejects("as the root", spread_of("nums"), needle)
+    let nested = ir_container_spread(4, 0, "blink_list*", "blink_list_extend", spread_of("inner"))
+    assert_rejects("as the source of another spread", ir_expr_stmt(0, ir_container_new(4, 0, "blink_list*", "blink_list_new", [nested])), needle)
+}
+
+test "a ContainerSpread needs exactly one source kid and a symbol" {
+    ir_reset()
+    let no_source = ir_new(IrKind.ContainerSpread, 4, 0, "blink_list*", "blink_list_extend", SlotForm.InlineWord, [])
+    assert_rejects("no source", ir_expr_stmt(0, ir_container_new(4, 0, "blink_list*", "blink_list_new", [no_source])), "expects 1 kid")
+    let two = ir_new(IrKind.ContainerSpread, 4, 0, "blink_list*", "blink_list_extend", SlotForm.InlineWord, [list_var("a"), list_var("b")])
+    assert_rejects("two sources", ir_expr_stmt(0, ir_container_new(4, 0, "blink_list*", "blink_list_new", [two])), "expects 1 kid")
+    let unnamed = ir_new(IrKind.ContainerSpread, 4, 0, "blink_list*", "", SlotForm.InlineWord, [list_var("a")])
+    assert_rejects("no extend symbol", ir_expr_stmt(0, ir_container_new(4, 0, "blink_list*", "blink_list_new", [unnamed])), "empty c_name")
+    let stmt_source = ir_new(IrKind.ContainerSpread, 4, 0, "blink_list*", "blink_list_extend", SlotForm.InlineWord, [ir_expr_stmt(0, int_const("1"))])
+    assert_rejects("statement source", ir_expr_stmt(0, ir_container_new(4, 0, "blink_list*", "blink_list_new", [stmt_source])), "statement where a value is required")
+}
+
+test "a ContainerNew holding a spread round-trips through dump and parse" {
+    ir_reset()
+    let lit = ir_container_new(4, 3, "blink_list*", "blink_list_new", [spread_of("nums"), int_const("9")])
+    let text = ir_dump(lit)
+    let want = [
+        "(ContainerNew 4 3 InlineWord 0 \"blink_list*\" \"blink_list_new\"",
+        "  (ContainerSpread 4 0 InlineWord 0 \"blink_list*\" \"blink_list_extend\"",
+        "    (VarRef 4 0 InlineWord 0 \"blink_list*\" \"nums\"))",
+        "  (Const 1 0 InlineWord 0 \"int64_t\" \"9\"))",
+    ].join("\n")
+    assert_eq_str("dump", text, want)
+    let back = ir_parse(text)
+    assert_eq_int("parses", if back >= 0 { 1 } else { 0 }, 1)
+    assert_eq_str("re-dump is stable", ir_dump(back), text)
+    assert_valid("parsed tree verifies", ir_expr_stmt(0, back))
+}

@@ -1,0 +1,407 @@
+// A closure literal lowered as a value, and the thunk it leaves behind.
+//
+// A closure literal is two things at once: a value at its own site, and a function
+// definition somewhere else. The IR carries no definition, so the value is a closure
+// record and the definition is queued for the driver to drain. The thunk is a function
+// like any other — its parameters are binders at their own types, and its body is lowered
+// through the statement stage — so the only thing new here is where those binders come
+// from and where the definition waits.
+//
+// A thunk reads its parameters and its captures and nothing else. Captures need a C word
+// that every captured type can be punned into and read back out of, which is a layout
+// question no stage answers yet, so a closure that reads a local of its enclosing function
+// records an internal error instead of a record with a capture it cannot spell. That makes
+// the capture set the substance of this file: every name a closure body binds for itself
+// must stay out of it, or a closure that captures nothing would be refused.
+
+import typecheck.{TYPE_INT}
+import cname_test_helpers.{find_decl, assert_eq_str}
+import cg_test_helpers.{cg_probe_compile}
+import ast.{NodeKind}
+import parser.{node_value}
+import layout.{bind_binder, binder_scope_pop, binder_scope_push, current_binder_scope, layout_reset, tid_of_binder}
+import ir.{IrKind, ir_c_name, ir_kid_count, ir_kind, ir_reset, ir_verify}
+import cg_reg.{cg_reg_build}
+import cg_expr.{cg_expr_reset}
+import cg_stmt.{cg_local_c_name, cg_stmt_reset, lower_block_returning}
+import cg_eff.{
+    cg_eff_lower_closure, cg_eff_pending_thunks, cg_eff_reset, cg_eff_thunk_body_node,
+    cg_eff_thunk_close, cg_eff_thunk_open, cg_eff_thunk_params, cg_eff_thunk_ret,
+    cg_eff_thunk_symbol, cg_eff_thunks_drained,
+}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+
+// Every closure is bound to a `let` of its own name, so a case can name the one it means.
+// The bodies are written to bind, between them, every form that introduces a name: a
+// block-local `let`, a `for` binder, a match arm's payload, a `with`-`as` binder and a
+// nested closure's parameter. `reads_enclosing` is the one body that reads a name it does
+// not bind, and `shadows_enclosing` reads a name of the same spelling that it does bind.
+fn probe_src() -> Str {
+    #"import std.io
+
+fn plain_closure() -> Int {
+    let g_plain = fn(x: Int) -> Int { x + 1 }
+    g_plain(1)
+}
+
+fn body_local() -> Int {
+    let g_local = fn(x: Int) -> Int {
+        let y = x + 1
+        y * 2
+    }
+    g_local(2)
+}
+
+fn body_for_loop() -> Int {
+    let g_for = fn(x: Int) -> Int {
+        let mut t = 0
+        for i in 0..x { t = t + i }
+        t
+    }
+    g_for(3)
+}
+
+fn body_match() -> Int {
+    let g_match = fn(x: Option[Int]) -> Int {
+        match x {
+            Some(v) => v
+            None => 0
+        }
+    }
+    g_match(Some(4))
+}
+
+fn body_with() -> Int {
+    let g_with = fn(x: Int) -> Int {
+        with x as held {
+            held + 1
+        }
+    }
+    g_with(5)
+}
+
+fn body_nested() -> Int {
+    let g_nested = fn(x: Int) -> Int {
+        let inner = fn(y: Int) -> Int { y * 2 }
+        inner(x)
+    }
+    g_nested(6)
+}
+
+fn two_params() -> Int {
+    let g_two = fn(a: Int, b: Str) -> Int { a + b.len() }
+    g_two(7, "ab")
+}
+
+fn no_result() -> Int {
+    let g_void = fn(x: Int) { io.println("{x}") }
+    g_void(8)
+    0
+}
+
+fn reads_enclosing() -> Int {
+    let n = 5
+    let g_cap = fn(x: Int) -> Int { x + n }
+    g_cap(9)
+}
+
+fn shadows_enclosing() -> Int {
+    let n = 5
+    let g_shadow = fn(x: Int) -> Int {
+        let n = 1
+        x + n
+    }
+    g_shadow(n)
+}
+
+fn literal_spelled_like_local() -> Int {
+    let n = 5
+    let g_lit = fn(x: Int) -> Str { "n is {x}" }
+    let _ = g_lit(n)
+    n
+}
+
+fn main() {
+    io.println("{plain_closure()}")
+    io.println("{body_local()}")
+    io.println("{body_for_loop()}")
+    io.println("{body_match()}")
+    io.println("{body_with()}")
+    io.println("{body_nested()}")
+    io.println("{two_params()}")
+    io.println("{no_result()}")
+    io.println("{reads_enclosing()}")
+    io.println("{shadows_enclosing()}")
+    io.println("{literal_spelled_like_local()}")
+}
+"#
+}
+
+fn ices() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" { n = n + 1 }
+    }
+    n
+}
+
+fn ices_mentioning(text: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.message.contains(text) { n = n + 1 }
+    }
+    n
+}
+
+fn report_ices() {
+    for d in diag_entries {
+        if d.severity == "ice" { io.println("  ICE {d.code} {d.message}") }
+    }
+}
+
+// The probe is compiled once per test: the registry, the binder frames and the
+// diagnostics list are process globals, so a test reading another test's leftovers would
+// not be reading its own. The nested compile resolves the prelude through BLINK_ROOT, and
+// the harness runs from the repo root.
+fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    env.set_var("BLINK_ROOT", env.cwd())
+    diag_reset()
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    cg_expr_reset()
+    cg_eff_reset()
+    let path = "build/cg_eff_closure_values_probe.bl"
+    let program = cg_probe_compile(path, probe_src())
+    let _ = fs.delete(path)
+    cg_reg_build(program)
+    diag_reset()
+}
+
+// The closure literal a `let` of this name is initialized with.
+fn closure_of(let_name: Str) -> Int {
+    let binding = find_decl(NodeKind.LetBinding, let_name, "")
+    assert(binding >= 0)
+    node_value(binding)
+}
+
+// Lowers one closure with `names` bound in an enclosing frame, and answers its value node.
+// A body that binds a name for itself must not report it as a capture even when the
+// enclosing function binds the same spelling, which is what the enclosing frame is for.
+fn lower_under(let_name: Str, names: List[Str]) -> Int ! Diag.Report {
+    let outer = binder_scope_push()
+    for nm in names { bind_binder(outer, nm, TYPE_INT) }
+    let v = cg_eff_lower_closure(closure_of(let_name))
+    binder_scope_pop()
+    v
+}
+
+fn assert_no_capture(let_name: Str, names: List[Str]) ! Diag.Report {
+    let v = lower_under(let_name, names)
+    if v < 0 || ices() != 0 {
+        io.println("FAIL: {let_name} reported a capture it does not have:")
+        report_ices()
+    }
+    assert(v >= 0)
+    assert_eq(ices(), 0)
+}
+
+test "a closure that captures nothing lowers to a closure record with no capture words" {
+    setup()
+    let v = cg_eff_lower_closure(closure_of("g_plain"))
+    assert(v >= 0)
+    assert(ir_kind(v) == IrKind.ClosureNew)
+    assert_eq(ir_kid_count(v), 0)
+    assert_eq(ices(), 0)
+}
+
+test "each closure literal is queued as a thunk under its own symbol" {
+    setup()
+    let a = cg_eff_lower_closure(closure_of("g_plain"))
+    let b = cg_eff_lower_closure(closure_of("g_local"))
+    assert_eq(cg_eff_pending_thunks(), 2)
+    assert(cg_eff_thunk_symbol(0) != "")
+    assert(cg_eff_thunk_symbol(0) != cg_eff_thunk_symbol(1))
+    // The record names the function it points at, so the value and the queued definition
+    // cannot drift apart.
+    assert_eq_str("first", ir_c_name(a), cg_eff_thunk_symbol(0))
+    assert_eq_str("second", ir_c_name(b), cg_eff_thunk_symbol(1))
+}
+
+test "a drained queue starts the next body's thunks from zero" {
+    setup()
+    let _ = cg_eff_lower_closure(closure_of("g_plain"))
+    assert_eq(cg_eff_pending_thunks(), 1)
+    cg_eff_thunks_drained(1)
+    assert_eq(cg_eff_pending_thunks(), 0)
+    // A thunk queued after the drain is not the one that was already printed.
+    let c = cg_eff_lower_closure(closure_of("g_local"))
+    assert_eq(cg_eff_pending_thunks(), 1)
+    assert_eq_str("requeued", ir_c_name(c), cg_eff_thunk_symbol(0))
+}
+
+// A thunk body can queue a nested closure while the driver is draining. A driver that
+// fixed its count before the loop would print too few and leave a record pointing at a
+// function nothing defines, so the queue refuses to go until the counts agree.
+test "a queue is not drained until every queued thunk was printed" {
+    setup()
+    let _ = cg_eff_lower_closure(closure_of("g_plain"))
+    let _ = cg_eff_lower_closure(closure_of("g_local"))
+    cg_eff_thunks_drained(1)
+    assert_eq(cg_eff_pending_thunks(), 2)
+    assert(ices_mentioning("queued") > 0)
+}
+
+test "the queued thunk carries the closure's own body" {
+    setup()
+    let closure = closure_of("g_plain")
+    let _ = cg_eff_lower_closure(closure)
+    assert_eq(cg_eff_pending_thunks(), 1)
+    assert(cg_eff_thunk_body_node(0) >= 0)
+    assert(cg_eff_thunk_body_node(0) != closure)
+}
+
+test "a closure parameter is bound at its own type inside the thunk frame" {
+    setup()
+    let _ = cg_eff_lower_closure(closure_of("g_two"))
+    let scope = cg_eff_thunk_open(0)
+    assert(scope >= 0)
+    assert_eq(tid_of_binder(scope, "a"), TYPE_INT)
+    let b = tid_of_binder(scope, "b")
+    assert(b >= 0)
+    assert(b != TYPE_INT)
+    cg_eff_thunk_close()
+}
+
+test "a thunk frame is never opened inside another function's frame" {
+    // Layout parents a new frame to whatever frame is open. A thunk opened inside the
+    // enclosing function's frame would resolve that function's locals, and the body would
+    // then read C identifiers the thunk never declares.
+    setup()
+    let _ = cg_eff_lower_closure(closure_of("g_plain"))
+    let outer = binder_scope_push()
+    bind_binder(outer, "n", TYPE_INT)
+    let scope = cg_eff_thunk_open(0)
+    binder_scope_pop()
+    assert_eq(scope, -1)
+    assert(ices_mentioning("frame") > 0)
+}
+
+test "the thunk body lowers with its parameters in scope" {
+    setup()
+    let _ = cg_eff_lower_closure(closure_of("g_plain"))
+    let scope = cg_eff_thunk_open(0)
+    assert(scope >= 0)
+    let body = lower_block_returning(cg_eff_thunk_body_node(0))
+    cg_eff_thunk_close()
+    if body < 0 || ices() != 0 {
+        io.println("FAIL: the thunk body did not lower:")
+        report_ices()
+    }
+    assert(body >= 0)
+    assert_eq(ir_verify(body).len(), 0)
+    assert_eq(ices(), 0)
+}
+
+test "a thunk body that binds its own local lowers inside the thunk frame" {
+    setup()
+    let _ = cg_eff_lower_closure(closure_of("g_local"))
+    assert(cg_eff_thunk_open(0) >= 0)
+    let body = lower_block_returning(cg_eff_thunk_body_node(0))
+    cg_eff_thunk_close()
+    if body < 0 || ices() != 0 {
+        io.println("FAIL: the thunk body did not lower:")
+        report_ices()
+    }
+    assert(body >= 0)
+    assert_eq(ir_verify(body).len(), 0)
+    assert_eq(ices(), 0)
+    assert_eq(current_binder_scope(), -1)
+}
+
+test "closing a thunk that is not open is a driver error" {
+    setup()
+    cg_eff_thunk_close()
+    assert(ices_mentioning("none is open") > 0)
+}
+
+test "closing a thunk under a frame its body left open is a driver error" {
+    setup()
+    let _ = cg_eff_lower_closure(closure_of("g_plain"))
+    let scope = cg_eff_thunk_open(0)
+    assert(scope >= 0)
+    let inner = binder_scope_push()
+    cg_eff_thunk_close()
+    assert(ices_mentioning("still open") > 0)
+    // The thunk's frame was not taken: the inner frame is still the top.
+    assert_eq(current_binder_scope(), inner)
+    binder_scope_pop()
+    cg_eff_thunk_close()
+    assert_eq(current_binder_scope(), -1)
+}
+
+test "the thunk signature is spelled from the closure's own type" {
+    setup()
+    let _ = cg_eff_lower_closure(closure_of("g_two"))
+    assert_eq_str("return", cg_eff_thunk_ret(0), "int64_t")
+    let ps = cg_eff_thunk_params(0)
+    assert_eq(ps.len(), 2)
+    // The body reads a parameter through the expression stage, which spells a local one
+    // way only, so the declaration has to spell it the same way.
+    assert_eq_str("first param", ps.get(0).unwrap(), "int64_t {cg_local_c_name("a")}")
+    assert_eq_str("second param", ps.get(1).unwrap(), "const char* {cg_local_c_name("b")}")
+}
+
+test "a closure that declares no result returns nothing" {
+    setup()
+    let _ = cg_eff_lower_closure(closure_of("g_void"))
+    assert_eq_str("return", cg_eff_thunk_ret(0), "void")
+    assert_eq(cg_eff_thunk_params(0).len(), 1)
+}
+
+test "a block local of the closure body is not a capture" {
+    setup()
+    assert_no_capture("g_local", ["y"])
+}
+
+test "a for binder of the closure body is not a capture" {
+    setup()
+    assert_no_capture("g_for", ["t", "i"])
+}
+
+test "a match arm payload of the closure body is not a capture" {
+    setup()
+    assert_no_capture("g_match", ["v"])
+}
+
+test "a with-as binder of the closure body is not a capture" {
+    setup()
+    assert_no_capture("g_with", ["held"])
+}
+
+test "a nested closure's own parameter is not a capture of the outer closure" {
+    setup()
+    assert_no_capture("g_nested", ["inner", "y"])
+}
+
+test "a closure local that shadows an enclosing name is not a capture" {
+    setup()
+    assert_no_capture("g_shadow", ["n"])
+}
+
+test "a closure that reads a local of its enclosing function is not built" {
+    // The capture word is a layout question: a captured Int is punned into it, a Float is
+    // boxed into it, and a pointer passes through. No stage answers that yet, so the
+    // record cannot be spelled and the name is reported instead of dropped.
+    setup()
+    let v = lower_under("g_cap", ["n"])
+    assert_eq(v, -1)
+    assert(ices_mentioning("'n'") > 0)
+}
+
+test "a string chunk spelled like an enclosing local is not a capture" {
+    setup()
+    assert_no_capture("g_lit", ["n"])
+}

@@ -1,18 +1,32 @@
 // cg_eff.bl: closures, effects, handlers and async, lowered to IR.
 //
 // A stage of the tid-native emitter. What it answers today is the with-resource cleanup
-// protocol; closures, handler installs and async are still to come and report I0004.
+// protocol and a closure literal as a value; handler installs and async are still to come
+// and report I0004.
 //
 // Nothing here falls back. A protocol whose exit runner no stage emits yet answers the
 // protocol and records an internal error, never a symbol. A guessed symbol would link
 // against nothing, or link against a runtime function whose first parameter is a
 // different struct and read a neighbouring stack slot as its done flag.
 
-import parser.{node_name, node_recv_type_args, node_trait_name, node_value, sublist_length}
+import ast.{NodeKind, nk_of}
+import parser.{
+    is_literal_string_part, node_body, node_elements, node_for_binder, node_guard, node_handlers, node_iterable,
+    node_kind, node_name, node_params, node_pattern, node_recv_type_args, node_stmts,
+    node_trait_name, node_value, node_value_child_ids, sublist_get, sublist_length,
+}
 import typecheck.{TyKind, lookup_named_type, tc_resolve, tc_tid_decl_node, tc_tid_kind, tk_name, ty_pool}
-import layout.{tid_of_node}
+import layout.{
+    Position, Slot, bind_binder, binder_scope_pop, binder_scope_push, child_tid,
+    current_binder_scope, layout_of, tid_of_binder, tid_of_node,
+}
+import cname.{c_local_name, c_mint_local}
+import ir.{ir_closure_new}
 import cg_reg.{cg_reg_impl_decls}
-import diagnostics.{Diag, diag_ice_at, diag_ice_stage_not_built, UNSOLVED_TYPEVAR_AT_CODEGEN}
+import diagnostics.{
+    Diag, diag_ice, diag_ice_at, diag_ice_stage_not_built, CODEGEN_STAGE_NOT_BUILT, POISONED_IR_AT_SEAM,
+    UNSOLVED_TYPEVAR_AT_CODEGEN,
+}
 
 // ── With-resource cleanup ─────────────────────────────────────────────────────────
 
@@ -142,7 +156,372 @@ fn needs_exit_runner(protocol: CleanupProtocol, im: Int, what: Str, node: Int) -
     ResourceCleanup { protocol: protocol, impl_block: im }
 }
 
-// ── Closures, handler installs and async ──────────────────────────────────────────
+// ── Closures as values ────────────────────────────────────────────────────────────
+
+// A closure literal is a value at its own site and a function definition somewhere
+// else. The IR carries no definitions, so the value is a ClosureNew record naming
+// `symbol` and the definition waits here until the driver drains the queue.
+//
+// The driver drains after the enclosing body and BEFORE it leaves that body's instance:
+// the thunk's body reads its types through tid_of_node, which answers under the current
+// instance, so a thunk drained under a different one would read a different
+// substitution from the one its literal was lowered under.
+type PendingThunk {
+    closure: Int
+    symbol: Str
+    fn_tid: Int
+}
+
+let mut eff_thunks: List[PendingThunk] = []
+
+// The frame cg_eff_thunk_open pushed, or -1 between thunks, so a close with nothing open
+// cannot pop a frame that belongs to someone else.
+let mut eff_thunk_scope: Int = -1
+
+pub fn cg_eff_reset() {
+    eff_thunks = []
+    eff_thunk_scope = -1
+}
+
+// The closure record for one closure literal, or -1 after a recorded internal error.
+//
+// A capture needs a C word that every captured type can be punned into and read back out
+// of, which is a layout question no stage answers yet. A closure that reads a local of its
+// enclosing function is therefore refused by name rather than built with a capture list it
+// cannot spell, and nothing is queued for it: a poisoned unit never reaches the printer.
+pub fn cg_eff_lower_closure(node: Int) -> Int ! Diag.Report {
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let free = closure_free_names(node)
+    if free.len() > 0 {
+        diag_ice_at("ClosureCaptureNotLowered", CODEGEN_STAGE_NOT_BUILT,
+            "closure reads {join_names(free)} from its enclosing function, and a captured local has no C layout yet",
+            node, "the capture word is a layout question; until layout answers it a closure may read only its own parameters and locals")
+        return -1
+    }
+    let rec = layout_of(tid, Position.Local)
+    let why = rec.decline_reason
+    if why != "" {
+        diag_ice_at("UnspellableClosureType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "closure has no C layout: {why}", node,
+            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+        return -1
+    }
+    let symbol = c_mint_local("closure")
+    eff_thunks.push(PendingThunk { closure: node, symbol: symbol, fn_tid: tid })
+    ir_closure_new(tid, node, rec.c_spelling, symbol, [])
+}
+
+fn join_names(names: List[Str]) -> Str {
+    let mut out = ""
+    let mut i = 0
+    while i < names.len() {
+        if i > 0 { out = "{out}, " }
+        out = "{out}'{names.get(i).unwrap()}'"
+        i = i + 1
+    }
+    out
+}
+
+// ── The thunk queue ───────────────────────────────────────────────────────────────
+
+pub fn cg_eff_pending_thunks() -> Int { eff_thunks.len() }
+
+// The driver calls this once it has printed every queued thunk, so the next body's
+// queue starts empty and a thunk is never defined twice. A thunk body can queue a
+// nested closure while the driver is draining, so a driver that fixed its count before
+// the loop would leave a closure record pointing at a function nothing defines; the
+// count it printed has to match the queue before the queue may go.
+pub fn cg_eff_thunks_drained(printed: Int) ! Diag.Report {
+    if printed != eff_thunks.len() {
+        diag_ice("ThunkQueueNotDrained", POISONED_IR_AT_SEAM,
+            "the driver printed {printed} thunks but {eff_thunks.len()} are queued", 0, 0,
+            "re-read cg_eff_pending_thunks on every step: a thunk body can queue another thunk")
+        return
+    }
+    eff_thunks = []
+}
+
+// A queue index the driver never handed out is a driver bug, and the readers below have
+// no node to blame it on, so the report carries no position.
+fn thunk_at(i: Int) -> Int ! Diag.Report {
+    if i >= 0 && i < eff_thunks.len() { return i }
+    diag_ice("NoSuchThunk", POISONED_IR_AT_SEAM,
+        "thunk {i} is not in the queue of {eff_thunks.len()}", 0, 0,
+        "the driver must read the queue through cg_eff_pending_thunks before indexing it")
+    -1
+}
+
+pub fn cg_eff_thunk_symbol(i: Int) -> Str ! Diag.Report {
+    let t = thunk_at(i)
+    if t < 0 { return "" }
+    eff_thunks.get(t).unwrap().symbol
+}
+
+// The block the thunk's body lowers from, in the same shape lower_block_returning takes.
+pub fn cg_eff_thunk_body_node(i: Int) -> Int ! Diag.Report {
+    let t = thunk_at(i)
+    if t < 0 { return -1 }
+    node_body(eff_thunks.get(t).unwrap().closure)
+}
+
+// The C spelling of the thunk's result, read from the closure's own Fn type. A closure
+// that declares no result carries the void type there, and the return position is where
+// layout spells that type as nothing.
+pub fn cg_eff_thunk_ret(i: Int) -> Str ! Diag.Report {
+    let t = thunk_at(i)
+    if t < 0 { return "" }
+    let th = eff_thunks.get(t).unwrap()
+    thunk_spelling(child_tid(th.fn_tid, Slot.Inner1), Position.Return, th.closure)
+}
+
+// One `<spelling> <name>` per parameter, in declaration order. The name is the local's
+// own producer, because the body reads each parameter as a local and the declaration has
+// to introduce the identifier those reads spell.
+pub fn cg_eff_thunk_params(i: Int) -> List[Str] ! Diag.Report {
+    let mut out: List[Str] = []
+    let t = thunk_at(i)
+    if t < 0 { return out }
+    let th = eff_thunks.get(t).unwrap()
+    let ps = node_params(th.closure)
+    if ps == -1 { return out }
+    let mut k = 0
+    while k < sublist_length(ps) {
+        let p = sublist_get(ps, k)
+        let spelling = thunk_spelling(child_tid(th.fn_tid, Slot.Param(k)), Position.Param, p)
+        if spelling == "" { return [] }
+        out.push("{spelling} {c_local_name(node_name(p))}")
+        k = k + 1
+    }
+    out
+}
+
+// A layout decline is an ICE and an empty spelling, so a caller can stop on "".
+fn thunk_spelling(tid: Int, position: Position, node: Int) -> Str ! Diag.Report {
+    if tid < 0 {
+        diag_ice_at("ClosureTypeHasNoSlot", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "the closure's Fn type has no type in the slot this parameter or result needs", node,
+            "typecheck stamps a closure with one type per parameter and one result; this is a compiler bug")
+        return ""
+    }
+    let rec = layout_of(tid, position)
+    let why = rec.decline_reason
+    if why != "" {
+        diag_ice_at("UnspellableThunkSlot", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "closure parameter or result has no C layout: {why}", node,
+            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+        return ""
+    }
+    rec.c_spelling
+}
+
+// Opens the thunk's own binder frame with its parameters bound at their types, and answers
+// the frame; the caller lowers the body inside it and then calls cg_eff_thunk_close.
+//
+// Layout parents a new frame to whatever frame is open. A thunk opened inside another
+// function's frame would resolve that function's locals, and the body would then read C
+// identifiers the thunk never declares. So an open frame is refused, not adopted.
+pub fn cg_eff_thunk_open(i: Int) -> Int ! Diag.Report {
+    let t = thunk_at(i)
+    if t < 0 { return -1 }
+    let th = eff_thunks.get(t).unwrap()
+    if current_binder_scope() != -1 {
+        diag_ice_at("ThunkFrameNested", POISONED_IR_AT_SEAM,
+            "a closure thunk's frame cannot open while another function's frame is open", th.closure,
+            "the driver drains the thunk queue after the enclosing body has closed its frame")
+        return -1
+    }
+    let scope = binder_scope_push()
+    eff_thunk_scope = scope
+    if !bind_thunk_params(th, scope) {
+        cg_eff_thunk_close()
+        return -1
+    }
+    scope
+}
+
+// Pops only the frame cg_eff_thunk_open pushed. A close with no thunk open, or with a
+// body's frame still above the thunk's, is a caller that lost track of its frames, and
+// popping there would take a frame that belongs to someone else.
+pub fn cg_eff_thunk_close() ! Diag.Report {
+    if eff_thunk_scope < 0 {
+        diag_ice("ThunkNotOpen", POISONED_IR_AT_SEAM, "a closure thunk was closed but none is open", 0, 0,
+            "the driver pairs every cg_eff_thunk_close with the cg_eff_thunk_open before it")
+        return
+    }
+    if current_binder_scope() != eff_thunk_scope {
+        diag_ice("ThunkFrameUnbalanced", POISONED_IR_AT_SEAM,
+            "a closure thunk was closed while a frame opened inside its body is still open", 0, 0,
+            "every frame the body lowering opens must close before the thunk does")
+        return
+    }
+    binder_scope_pop()
+    eff_thunk_scope = -1
+}
+
+// The parameter types come from the Fn tid, the same source the signature is spelled
+// from, so a binder and its declaration cannot disagree. Answers false when a slot has no
+// type: a parameter left unbound would resolve to an outer name instead.
+fn bind_thunk_params(th: PendingThunk, scope: Int) -> Bool ! Diag.Report {
+    let ps = node_params(th.closure)
+    if ps == -1 { return true }
+    let mut k = 0
+    while k < sublist_length(ps) {
+        let p = sublist_get(ps, k)
+        let tid = child_tid(th.fn_tid, Slot.Param(k))
+        if tid < 0 {
+            diag_ice_at("ClosureParamHasNoType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "closure parameter '{node_name(p)}' has no type in the closure's Fn type", p,
+                "typecheck stamps a closure with one type per parameter; this is a compiler bug")
+            return false
+        }
+        bind_binder(scope, node_name(p), tid)
+        k = k + 1
+    }
+    true
+}
+
+// ── Captures ──────────────────────────────────────────────────────────────────────
+
+// The names a closure body reads that are locals of the enclosing function: bound in the
+// frame open at the literal's site and not bound by the closure itself. A name the body
+// binds for itself, in any of the forms that introduce one, is not a capture even when the
+// enclosing function binds the same spelling. A name bound nowhere is a module-level name
+// or a namespace, which a thunk reaches without help.
+fn closure_free_names(closure: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    let mut bound: List[Str] = []
+    push_param_names(closure, bound)
+    scan_free(node_body(closure), bound, out)
+    out
+}
+
+fn scan_free(node: Int, bound: List[Str], out: List[Str]) {
+    if node < 0 { return }
+    match nk_of(node_kind(node)) {
+        NodeKind.Ident => note_ident(node, bound, out)
+        NodeKind.Block => scan_block(node, bound, out)
+        NodeKind.ForIn => scan_for(node, bound, out)
+        NodeKind.MatchArm => scan_arm(node, bound, out)
+        NodeKind.WithBlock => scan_with(node, bound, out)
+        NodeKind.Closure => scan_fn_like(node, bound, out)
+        NodeKind.FnDef => scan_fn_like(node, bound, out)
+        _ => scan_kids(node, bound, out)
+    }
+}
+
+fn scan_kids(node: Int, bound: List[Str], out: List[Str]) {
+    for kid in node_value_child_ids(node) { scan_free(kid, bound, out) }
+}
+
+// The parser stores each literal chunk of an interpolated string as an Ident whose name
+// is the chunk's text, so a chunk spelled like an enclosing local is not a read of it.
+fn note_ident(node: Int, bound: List[Str], out: List[Str]) {
+    if is_literal_string_part(node) == 1 { return }
+    note_free(node_name(node), bound, out)
+}
+
+fn note_free(name: Str, bound: List[Str], out: List[Str]) {
+    if bound.contains(name) || out.contains(name) { return }
+    if tid_of_binder(current_binder_scope(), name) >= 0 { out.push(name) }
+}
+
+// A block's `let` binds from the statement after it, and its initializer is read before
+// the name binds, so `let n = n + 1` reads the outer `n` the source names.
+fn scan_block(node: Int, bound: List[Str], out: List[Str]) {
+    let sl = node_stmts(node)
+    if sl == -1 { return }
+    let mut inner = copy_names(bound)
+    let mut i = 0
+    while i < sublist_length(sl) {
+        let s = sublist_get(sl, i)
+        if nk_of(node_kind(s)) == NodeKind.LetBinding {
+            scan_free(node_value(s), inner, out)
+            if node_name(s) != "" { inner.push(node_name(s)) }
+            pattern_names(node_elements(s), inner)
+        } else {
+            scan_free(s, inner, out)
+        }
+        i = i + 1
+    }
+}
+
+fn scan_for(node: Int, bound: List[Str], out: List[Str]) {
+    scan_free(node_iterable(node), bound, out)
+    let inner = copy_names(bound)
+    pattern_names(node_for_binder(node), inner)
+    pattern_names(node_elements(node), inner)
+    scan_free(node_body(node), inner, out)
+}
+
+fn scan_arm(node: Int, bound: List[Str], out: List[Str]) {
+    let inner = copy_names(bound)
+    pattern_names(node_pattern(node), inner)
+    scan_free(node_guard(node), inner, out)
+    scan_free(node_body(node), inner, out)
+}
+
+// A later `with` item can read an earlier item's binder, so the items bind in order.
+fn scan_with(node: Int, bound: List[Str], out: List[Str]) {
+    let mut inner = copy_names(bound)
+    let hs = node_handlers(node)
+    if hs != -1 {
+        let mut i = 0
+        while i < sublist_length(hs) {
+            let h = sublist_get(hs, i)
+            scan_kids(h, inner, out)
+            if nk_of(node_kind(h)) == NodeKind.WithResource && node_name(h) != "" { inner.push(node_name(h)) }
+            i = i + 1
+        }
+    }
+    scan_free(node_body(node), inner, out)
+}
+
+// A nested closure, or a handler method written inside the body: its parameters are its
+// own, and what its body reads from outside is what the outer closure reads.
+fn scan_fn_like(node: Int, bound: List[Str], out: List[Str]) {
+    let inner = copy_names(bound)
+    push_param_names(node, inner)
+    scan_free(node_body(node), inner, out)
+}
+
+fn push_param_names(fn_like: Int, bound: List[Str]) {
+    let ps = node_params(fn_like)
+    if ps == -1 { return }
+    let mut i = 0
+    while i < sublist_length(ps) {
+        bound.push(node_name(sublist_get(ps, i)))
+        i = i + 1
+    }
+}
+
+// Every name a pattern introduces. A variant name written as a pattern lands here too,
+// which is harmless: a pattern never reads a local, so nothing it names can be a capture.
+fn pattern_names(pat: Int, bound: List[Str]) {
+    if pat < 0 { return }
+    match nk_of(node_kind(pat)) {
+        NodeKind.Ident => bound.push(node_name(pat))
+        NodeKind.IdentPattern => bound.push(node_name(pat))
+        NodeKind.AsPattern => {
+            bound.push(node_name(pat))
+            pattern_names(node_pattern(pat), bound)
+        }
+        // `Point { x }` binds the field's own name; `Point { x: p }` binds through p.
+        NodeKind.StructLitField => {
+            if node_pattern(pat) >= 0 { pattern_names(node_pattern(pat), bound) } else { bound.push(node_name(pat)) }
+        }
+        _ => { for kid in node_value_child_ids(pat) { pattern_names(kid, bound) } }
+    }
+}
+
+// Lists are references, so a scope that adds names works on a copy of its parent's.
+fn copy_names(names: List[Str]) -> List[Str] {
+    let mut out: List[Str] = []
+    for n in names { out.push(n) }
+    out
+}
+
+// ── Handler installs and async ────────────────────────────────────────────────────
 
 pub fn cg_eff_lower_handler(node: Int) ! Diag.Report {
     diag_ice_stage_not_built("cg_eff", node)

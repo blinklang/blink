@@ -10,20 +10,21 @@
 // result, or an unbuilt stage looks like a program that legitimately emits nothing.
 
 import diagnostics.{Diag, diag_ice_stage_not_built}
-import parser.{get_annotation, node_effects, sublist_length}
 import cname.{c_archive_header_guard, c_module_header_guard}
 import layout.{layout_reset, set_current_inst}
 import cg_print.{print_main_shim, print_reset, print_scope_restore_support, print_take}
 import cg_reg.{
     cg_reg_build, cg_reg_entry_point, cg_reg_fn_decls, cg_reg_has_main, cg_reg_impl_methods,
     cg_reg_impl_of, cg_reg_modules, cg_reg_module_of, cg_reg_reset, cg_reg_test_decls,
+    cg_reg_type_decls,
 }
 import cg_decl.{
-    BodySite, cg_decl_body_site, cg_decl_emit_epilogue, cg_decl_emit_ev,
+    BodySite, cg_decl_body_site, cg_decl_takes_ev, cg_decl_emit_epilogue, cg_decl_emit_ev,
     cg_decl_emit_fn_decl, cg_decl_emit_fn_def, cg_decl_emit_impl_method_decl,
     cg_decl_emit_globals, cg_decl_emit_signature_decl, cg_decl_emit_signature_def,
     cg_decl_emit_prologue, cg_decl_emit_typedefs, cg_decl_reset,
 }
+import cg_derive.{cg_derive_emit_bodies, cg_derive_emit_decls, cg_derive_reset}
 import mono.{instances}
 import cg_stmt.{cg_stmt_reset, lower_fn}
 import cg_expr.{cg_expr_reset}
@@ -73,6 +74,7 @@ fn begin_unit(program: Int) ! Diag.Report {
     cg_reg_reset()
     cg_reg_build(program)
     cg_decl_reset()
+    cg_derive_reset()
     cg_stmt_reset()
     cg_expr_reset()
 }
@@ -99,22 +101,13 @@ fn emit_root_signatures(decls: List[Int], methods: List[Int]) ! Diag.Report {
     for m in methods { cg_decl_emit_impl_method_decl(m, false) }
 }
 
-// Every signature a unit declares: the roots, then one per instance of each generic base.
-// Both the whole-program header and a per-module header come through here, so a mode
-// cannot declare a different set of functions from the mode that defines them.
-fn emit_signatures_in_scope(fns: List[Int], methods: List[Int]) ! Diag.Report {
-    emit_root_signatures(fns, methods)
-    emit_instance_signatures(fns)
-    emit_instance_signatures(methods)
-}
-
 // One prototype per instance. A unit that defines an instance and declares none puts the
 // definition after the call that reads it, which C rejects, so the two halves walk the
 // same table in the same order.
-fn emit_instance_signatures(decls: List[Int]) ! Diag.Report {
+fn emit_instance_signatures(cfg: CgConfig, decls: List[Int]) ! Diag.Report {
     for d in decls {
         match cg_decl_body_site(d) {
-            BodySite.PerInstance => emit_instance_decls(d)
+            BodySite.PerInstance => emit_instance_decls(d, instance_is_private_copy(cfg, d))
             BodySite.ThisUnit => {}
             BodySite.ForeignWrapper => {}
             BodySite.Nothing => {}
@@ -122,11 +115,11 @@ fn emit_instance_signatures(decls: List[Int]) ! Diag.Report {
     }
 }
 
-fn emit_instance_decls(decl: Int) ! Diag.Report {
+fn emit_instance_decls(decl: Int, is_static: Bool) ! Diag.Report {
     let table = instances()
     for row in instance_rows_of(decl) {
         set_current_inst(row)
-        cg_decl_emit_signature_decl(decl, table.get(row).unwrap().c_name, false)
+        cg_decl_emit_signature_decl(decl, table.get(row).unwrap().c_name, is_static)
         set_current_inst(-1)
     }
 }
@@ -134,15 +127,26 @@ fn emit_instance_decls(decl: Int) ! Diag.Report {
 // One body per instance, under the instance's own name and its substituted types. The
 // instance is current only for the lowering and the signature that wraps it, and the root
 // is restored immediately after so nothing later reads a declaration through an instance.
-fn emit_instance_bodies(decl: Int) ! Diag.Report {
+fn emit_instance_bodies(decl: Int, is_static: Bool) ! Diag.Report {
     let table = instances()
     let rows = instance_rows_of(decl)
     if rows.len() == 0 { return no_instance_bodies(decl) }
     for row in rows {
         set_current_inst(row)
-        cg_decl_emit_signature_def(decl, table.get(row).unwrap().c_name, false, lower_fn(decl))
+        cg_decl_emit_signature_def(decl, table.get(row).unwrap().c_name, is_static, lower_fn(decl))
         set_current_inst(-1)
     }
+}
+
+// Whether this unit keeps its copies of one generic's instances to itself. Inside a
+// program it does not: the unit that declares the generic defines every instance of it and
+// another unit calls them through that unit's header. A generic already compiled into the
+// archive cannot be homed that way, because the archive was built before this program
+// existed and its own monomorphization pass never saw the types this program instantiates
+// the generic at. Every unit that needs one of those writes its own copy, and two
+// definitions of one external symbol do not link, so those copies are internal.
+fn instance_is_private_copy(cfg: CgConfig, decl: Int) -> Bool {
+    cfg.skip_modules.contains_key(cg_reg_module_of(decl))
 }
 
 // A generic declaration the mono pass registered no instance for. For a free function
@@ -167,19 +171,8 @@ fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_
     cg_decl_emit_typedefs()
     if define_ev { cg_decl_emit_ev(ev_storage(cfg)) }
     cg_decl_emit_globals(globals_extern)
-    emit_signatures_in_scope(fns_in_scope(cfg, "", shared), methods_in_scope(cfg, "", shared))
-}
-
-// A function whose body reads the program's own evidence cannot live in the shared
-// stdlib archive: many programs link one archive, and the archive does not even define
-// the evidence vector such a signature names. Those functions are compiled into the
-// user's translation unit instead. A foreign binding carries `! FFI` but is a plain C
-// wrapper that reads no evidence, so it stays.
-fn is_evidence_bound(fn_node: Int) -> Bool {
-    if get_annotation(fn_node, "ffi") != -1 { return false }
-    let sl = node_effects(fn_node)
-    if sl == -1 { return false }
-    sublist_length(sl) > 0
+    emit_root_signatures(fns_in_scope(cfg, "", shared), methods_in_scope(cfg, "", shared))
+    cg_derive_emit_decls(derived_decls_declared_everywhere())
 }
 
 // "" for the unit that owns the vector and is linked against, "extern " for a unit that
@@ -202,6 +195,14 @@ fn decls_in_scope(cfg: CgConfig, module_key: Str, decls: List[Int]) -> List[Int]
     out
 }
 
+// A derived method is declared in every unit and defined in one. A unit that only uses a
+// type still calls the method that type's own module defines, and every unit already
+// carries every typedef, so the declaration half takes no module filter. The definition
+// half takes the same filter every other body takes, or two objects define one symbol.
+fn derived_decls_declared_everywhere() -> List[Int] {
+    cg_reg_type_decls()
+}
+
 // The entry point belongs to the unit that carries the program's shim. One archive
 // serves many programs, and the archive build synthesizes a main of its own just to pull
 // every module into one unit.
@@ -210,18 +211,32 @@ fn is_entry_point(fn_node: Int) -> Bool {
 }
 
 // A module compiled into the archive is declared by the user's unit, not compiled again
-// — except for the functions the archive could not hold. An evidence-bound signature
-// names the program's own evidence vector, which the archive does not define, so the
-// archive left those out and the user's unit is the only place left to compile them.
+// — except for the declarations the archive could not hold. A signature that takes the
+// evidence vector names a type the archive does not define, and one archive serves many
+// programs, so the archive left those out. A generic has no body of its own at all: what a program links
+// are its instances, and which instances a program needs follows from that program's call
+// sites, which the archive was compiled without. Both are left for the user's unit.
 fn kept_for_user(cfg: CgConfig, decl: Int) -> Bool {
-    cfg.user_tu_mode != 0 && is_evidence_bound(decl)
+    if cfg.user_tu_mode == 0 { return false }
+    if cg_decl_takes_ev(decl) { return true }
+    match cg_decl_body_site(decl) {
+        BodySite.PerInstance => true
+        BodySite.ThisUnit => false
+        BodySite.ForeignWrapper => false
+        BodySite.Nothing => false
+    }
 }
 
+// The archive holds neither the entry point nor a function that takes the evidence
+// vector: one archive serves many programs, and it does not define the vector such a
+// signature names. Those are compiled into the user's unit instead. A foreign binding
+// carries `! FFI` but is a plain C wrapper that reads no evidence, which is why the
+// signature is asked rather than the effects list.
 fn fns_in_scope(cfg: CgConfig, module_key: Str, shared: Bool) -> List[Int] {
     let mut out: List[Int] = []
     for f in decls_in_scope(cfg, module_key, cg_reg_fn_decls()) {
         if shared && is_entry_point(f) { continue }
-        if shared && is_evidence_bound(f) { continue }
+        if shared && cg_decl_takes_ev(f) { continue }
         out.push(f)
     }
     out
@@ -232,7 +247,7 @@ fn fns_in_scope(cfg: CgConfig, module_key: Str, shared: Bool) -> List[Int] {
 fn methods_in_scope(cfg: CgConfig, module_key: Str, shared: Bool) -> List[Int] {
     let mut out: List[Int] = []
     for m in decls_in_scope(cfg, module_key, cg_reg_impl_methods()) {
-        if shared && is_evidence_bound(m) { continue }
+        if shared && cg_decl_takes_ev(m) { continue }
         out.push(m)
     }
     out
@@ -246,12 +261,12 @@ fn methods_in_scope(cfg: CgConfig, module_key: Str, shared: Bool) -> List[Int] {
 // Nothing here reads the diagnostic count to decide whether to go on. A report that
 // repeats one already made does not raise that count, so it cannot tell a body that
 // failed from one that succeeded. The caller discards the whole unit instead.
-fn emit_bodies(decls: List[Int]) ! Diag.Report {
+fn emit_bodies(cfg: CgConfig, decls: List[Int]) ! Diag.Report {
     set_current_inst(-1)
     for d in decls {
         match cg_decl_body_site(d) {
             BodySite.ThisUnit => cg_decl_emit_fn_def(d, false, lower_fn(d))
-            BodySite.PerInstance => emit_instance_bodies(d)
+            BodySite.PerInstance => emit_instance_bodies(d, instance_is_private_copy(cfg, d))
             BodySite.ForeignWrapper => diag_ice_stage_not_built("cg foreign wrapper bodies", d)
             BodySite.Nothing => {}
         }
@@ -261,8 +276,16 @@ fn emit_bodies(decls: List[Int]) ! Diag.Report {
 // The definition half. A test block is a body too, and the entry shim calls a runner
 // that only the test table defines, so a unit with tests is not whole without it.
 fn emit_definitions(cfg: CgConfig, module_key: Str, shared: Bool) ! Diag.Report {
-    emit_bodies(fns_in_scope(cfg, module_key, shared))
-    emit_bodies(methods_in_scope(cfg, module_key, shared))
+    let fns = fns_in_scope(cfg, module_key, shared)
+    let methods = methods_in_scope(cfg, module_key, shared)
+    // A unit declares every instance it defines, in its own text, ahead of every body.
+    // The declaration half cannot do it: a header is read by units that define nothing,
+    // and the archive's header would then offer instances the archive does not have.
+    emit_instance_signatures(cfg, fns)
+    emit_instance_signatures(cfg, methods)
+    emit_bodies(cfg, fns)
+    emit_bodies(cfg, methods)
+    cg_derive_emit_bodies(decls_in_scope(cfg, module_key, cg_reg_type_decls()))
     let tests = decls_in_scope(cfg, module_key, cg_reg_test_decls())
     if tests.len() == 0 { return }
     diag_ice_stage_not_built("cg test bodies", tests.get(0).unwrap())
@@ -300,8 +323,15 @@ pub fn generate_module_header(program: Int, module_key: Str, cfg: CgConfig) -> S
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, false, false, guard, "")
     cg_decl_emit_typedefs()
     cg_decl_emit_globals(true)
-    emit_signatures_in_scope(fns_in_scope(cfg, module_key, false),
-        methods_in_scope(cfg, module_key, false))
+    let fns = fns_in_scope(cfg, module_key, false)
+    let methods = methods_in_scope(cfg, module_key, false)
+    emit_root_signatures(fns, methods)
+    // The one header that does declare instances. Nothing is compiled ahead of this
+    // program, so its modules home their own generics' instances, and a module that calls
+    // one compiled into another module's object needs the name from that module's header.
+    emit_instance_signatures(cfg, fns)
+    emit_instance_signatures(cfg, methods)
+    cg_derive_emit_decls(derived_decls_declared_everywhere())
     cg_decl_emit_epilogue(guard)
     print_take()
 }

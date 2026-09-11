@@ -41,6 +41,7 @@ asks it and never builds a name from parts.
 | Impl method | `c_impl_method_name(im, m)` / `_q(im, trait, m)` | impl node, method | `impl Greet for Point` `greet` -> `blink_Point_Greet_greet`; `impl From[Int] for Point` `from` -> `blink_Point_from_Int`; in `mymod` -> `blink_mymod_Ngx_Greet2_greet2` |
 | Display dispatcher | `c_display_dispatch_name(im)` | impl node | `blink_Point_Display_display` |
 | Segment | `c_seg_top(tid)` / `c_seg_inner(tid)` | tid | `Int` -> `Int` / `int`; `Float` -> `Float` / `double`; `Map[K, V]` -> `Map` / `map`; `Point` -> `Point` / `Point`; `Ngx` in `mymod` -> `Ngx` / `mymod_Ngx`; fn type -> ICE / `closure` |
+| Kops table | `c_kops_table_name(tid)` | key tid | `Int` -> `blink_kops_i64`; `Str` -> `blink_kops_str`; struct, enum or tuple -> `kops_` + typedef name (`Key` -> `kops_blink_Key`, `(Int, Str)` -> `kops_blink_Tuple2_int_str`); opaque handle -> ICE segment, its C name is a pointer |
 | Typedef guard | `td_guard_name(c)`, `td_guard_open_lines(c)`, `td_guard_close_line()` | C name | `BLINK_TD_blink_Point`, `#ifndef ...` + `#define ...`, `#endif` |
 
 ## Mono stem

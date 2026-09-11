@@ -2,13 +2,14 @@ import std.io
 import ir.{
     IrKind, ir_reset, ir_verify, ir_all_kinds, ir_kind_name, ir_kind_is_value, ir_kind, ir_held_by_pointer,
     ir_const, ir_var_ref, ir_global_ref, ir_unary, ir_binary, ir_cast, ir_field_get, ir_struct_new, ir_tuple_new,
-    ir_container_new, ir_box, ir_unbox, ir_carrier_wrap, ir_carrier_unwrap, ir_carrier_tag,
+    ir_container_new, ir_container_spread, ir_box, ir_unbox, ir_carrier_wrap, ir_carrier_unwrap, ir_carrier_tag,
     ir_call_direct, ir_call_indirect, ir_call_closure, ir_call_virtual, ir_call_runtime, ir_closure_new,
     ir_effect_perform, ir_field_set, ir_handler_install, ir_let, ir_assign, ir_expr_stmt, ir_return, ir_if,
     ir_loop, ir_break, ir_continue, ir_block, ir_switch, ir_with_scope, ir_panic, ir_unreachable,
 }
 import layout.{SlotForm}
 import cg_print.{
+    print_resource_guard_support,
     print_reset, print_take, print_expr, print_stmt, print_block_body,
     print_struct_typedef, print_tuple_typedef, print_simple_enum_typedef, print_tagged_enum_typedef,
     print_option_typedef, print_result_typedef, print_effect_vtable_typedef, print_effect_default_vtable,
@@ -26,6 +27,8 @@ fn sp_var() -> Int { ir_var_ref(7, 0, "blink_S*", "sp", SlotForm.PointerBoxed) }
 fn opt_var() -> Int { ir_var_ref(8, 0, "blink_Option_int", "o", SlotForm.Inline) }
 fn cl_var() -> Int { ir_var_ref(9, 0, "blink_closure*", "cl", SlotForm.PointerBoxed) }
 
+fn spread_sample() -> Int { ir_container_spread(4, 0, "blink_list*", "blink_list_extend", ir_var_ref(4, 0, "blink_list*", "xs", SlotForm.PointerBoxed)) }
+
 // One node of every value kind, as a `(kind, node)` pair, in the same order as ir_all_kinds.
 fn value_sample(k: IrKind) -> Int {
     match k {
@@ -38,7 +41,8 @@ fn value_sample(k: IrKind) -> Int {
         IrKind.FieldGet => ir_field_get(1, 0, "int64_t", "x", SlotForm.InlineWord, sp_var())
         IrKind.StructNew => ir_struct_new(6, 0, "blink_S", [int_const("1"), int_const("2")])
         IrKind.TupleNew => ir_tuple_new(10, 0, "blink_Tuple_int_int", [int_const("1"), int_const("2")])
-        IrKind.ContainerNew => ir_container_new(4, 0, "blink_list*", "blink_list_new", [int_var("a")])
+        IrKind.ContainerNew => ir_container_new(4, 0, "blink_list*", "blink_list_new", [int_var("a"), spread_sample()])
+        IrKind.ContainerSpread => spread_sample()
         IrKind.Box => ir_box(7, 0, "blink_S*", "blink_S", s_var())
         IrKind.Unbox => ir_unbox(6, 0, "blink_S", SlotForm.Inline, sp_var())
         IrKind.CarrierWrap => ir_carrier_wrap(8, 0, "blink_Option_int", "value", int_const("1"), int_var("a"))
@@ -81,12 +85,14 @@ fn expect_c(label: Str, got: Str, needle: Str) {
     assert(got.contains(needle))
 }
 
+// ContainerSpread is the one value kind that never prints on its own: its ContainerNew
+// writes it, so it is left out here and checked as an ICE below.
 test "every value kind prints in value position without an ICE" {
     ir_reset()
     diag_reset()
     let mut seen = 0
     for k in ir_all_kinds() {
-        if ir_kind_is_value(k) == 0 { continue }
+        if ir_kind_is_value(k) == 0 || k == IrKind.ContainerSpread { continue }
         let n = value_sample(k)
         assert(n >= 0)
         assert_eq(ir_kind(n), k)
@@ -102,6 +108,9 @@ test "every value kind prints in value position without an ICE" {
     assert_eq(diag_ice_count, 0)
 }
 
+// The WithScope sample names a Closeable exit whose guard support the TU must define first.
+fn with_scope_support() ! Diag.Report { print_resource_guard_support("blink_file_close", "blink_file*", false) }
+
 test "every statement kind prints in statement position without an ICE" {
     ir_reset()
     diag_reset()
@@ -114,6 +123,8 @@ test "every statement kind prints in statement position without an ICE" {
         if errs.len() > 0 { io.println("FAIL verify {ir_kind_name(k)}: {errs.join(" | ")}") }
         assert_eq(errs.len(), 0)
         print_reset()
+        with_scope_support()
+        let _ = print_take()
         print_stmt(n)
         let c = print_take()
         assert(!c.contains("I0003"))
@@ -151,9 +162,12 @@ test "each kind prints its documented C form" {
     expect_c("Box store", pre, "*{box_tmp} = s;")
     expect_c("ContainerNew ctor", pre, "blink_list* {cont_tmp} = blink_list_new();")
     expect_c("ContainerNew push", pre, "blink_list_push({cont_tmp}, a);")
+    expect_c("ContainerSpread", pre, "blink_list_extend({cont_tmp}, xs);")
     expect_c("ClosureNew", pre, "blink_closure* {cl_tmp} = blink_closure_new_typed((void*)__closure_0, ")
 
     print_reset()
+    with_scope_support()
+    let _ = print_take()
     for k in ir_all_kinds() {
         if ir_kind_is_value(k) == 0 { print_stmt(stmt_sample(k)) }
     }
@@ -171,7 +185,7 @@ test "each kind prints its documented C form" {
     expect_c("Break", c, "break;")
     expect_c("Continue", c, "continue;")
     expect_c("Switch", c, "if (a == 1) \{")
-    expect_c("WithScope resource", c, "__attribute__((cleanup(blink_file_close))) = f;")
+    expect_c("WithScope resource", c, "__attribute__((cleanup(__blink_rs_cleanup_blink_file_close))) = \{ .resource = f, .ok = 0, .done = 0 };")
     expect_c("Panic", c, "__blink_panic_dispatch(\"boom\");")
     expect_c("Unreachable", c, "__builtin_unreachable();")
     assert_eq(diag_ice_count, 0)
@@ -183,6 +197,15 @@ test "a statement kind in value position is an ICE, not a silent skip" {
     print_reset()
     let text = print_expr(ir_break(0))
     assert(text.contains("I0003"))
+    assert_eq(diag_ice_count, 1)
+}
+
+test "a ContainerSpread reached on its own is an ICE, it prints only through its ContainerNew" {
+    ir_reset()
+    diag_reset()
+    print_reset()
+    let sp = ir_container_spread(4, 0, "blink_list*", "blink_list_extend", ir_var_ref(4, 0, "blink_list*", "xs", SlotForm.InlineWord))
+    assert(print_expr(sp).contains("I0003"))
     assert_eq(diag_ice_count, 1)
 }
 
