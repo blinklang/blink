@@ -11,13 +11,17 @@
 // typedef names it, so a declaration is emitted only after every nominal type its
 // members reach by value.
 
-import diagnostics.{Diag, diag_ice, diag_ice_stage_not_built, UNSOLVED_TYPEVAR_AT_CODEGEN}
+import diagnostics.{
+    Diag, diag_ice, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
+    UNSOLVED_TYPEVAR_AT_CODEGEN,
+}
 import layout.{
     LayoutRecord, Position, layout_of, field_layout_of, ensure_typedef_for,
     layout_take_typedefs, tid_of_node,
 }
 import cname.{
-    c_ev_type_name, c_ffi_symbol, c_field_name, c_fn_decl_name, c_global_name,
+    c_ev_field_name, c_ev_type_name, c_ffi_symbol, c_field_name, c_fn_decl_name,
+    c_global_name, c_vtable_type_name,
     c_impl_method_name, c_local_name, c_type_decl_name, c_variant_ordinal,
     c_variant_tag_macro,
     cname_is_runtime_owned, td_guard_name,
@@ -34,8 +38,8 @@ import cg_reg.{
 import typecheck.{
     TyKind, tc_enum_variant_slots, tc_evar_field_slots, tc_evar_name, tc_evfield_name,
     tc_evfield_tid, tc_resolve, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
-    tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind, tc_type_str,
-    tc_void_tid,
+    make_handler_type, tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind,
+    tc_type_str, tc_void_tid,
 }
 import parser.{
     get_annotation, node_effects, node_fields, node_impl_binders, node_name, node_params,
@@ -434,15 +438,33 @@ pub fn cg_decl_emit_epilogue(header_guard: Str) {
 // unit that owns it, "static " for a single unit, "extern " for a unit that only refers
 // to it.
 //
-// A user-declared effect appends a vtable pointer to the vector and needs a default
-// vtable and a default body per operation. None of that is written yet, and a vector
-// that silently dropped the field would miscompile every handler of that effect, so the
-// gap reports instead.
+// A user-declared effect takes a slot of its own, after the eight builtin fields. The
+// order is the printer's, and it is what lets the stdlib archive be compiled against a
+// vector that stops at the builtins and still read the same field at the same offset.
+//
+// The vtable type that slot points at, and the default instance the default vector takes
+// its address of, are still to come, along with a default body per operation. The slot is
+// emitted anyway: a vector that dropped the field would put every later field at the
+// wrong offset, which miscompiles silently, where a missing vtable is named here.
 pub fn cg_decl_emit_ev(ev_storage: Str) ! Diag.Report {
     let effects = cg_reg_effect_decls()
-    if effects.len() > 0 {
-        diag_ice_stage_not_built("cg_decl user effects", effects.get(0).unwrap())
-        return
+    let mut vtables: List[Str] = []
+    let mut fields: List[Str] = []
+    for e in effects {
+        let slot_tid = make_handler_type(node_name(e))
+        let vtable = c_vtable_type_name(slot_tid)
+        let field = c_ev_field_name(slot_tid)
+        if diag_is_ice_seg(vtable) || diag_is_ice_seg(field) {
+            diag_ice_at("EvidenceFieldNotNameable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "no evidence field for effect '{node_name(e)}'", e,
+                "every declared effect must name a slot of the evidence vector; this is a compiler bug")
+            return
+        }
+        vtables.push(vtable)
+        fields.push(field)
     }
-    print_ev(td_guard_name(c_ev_type_name()), [], [], ev_storage)
+    print_ev(td_guard_name(c_ev_type_name()), vtables, fields, ev_storage)
+    if effects.len() > 0 {
+        diag_ice_stage_not_built("cg_decl user effect vtables", effects.get(0).unwrap())
+    }
 }
