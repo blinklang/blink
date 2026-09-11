@@ -1,0 +1,114 @@
+import std.fs
+import std.io
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, make_metavar, tc_unknown_tid, make_option_type}
+import layout.{layout_reset, Position}
+import diagnostics.{diag_ice_count}
+import parser.{nodes}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_decl.{cg_decl_reset, cg_decl_require_spelling}
+import compiler.{compile_to_program}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.println("FAIL: {label}: got '{got}' want '{want}'")
+    }
+    assert_eq(got, want)
+}
+
+fn probe_src() -> Str {
+    #"type Point { x: Int, y: Int }
+fn ident[T](x: T) -> T { x }
+fn main() {
+    let p: Point = Point { x: 1, y: 2 }
+    assert(ident(p.x) == 1)
+}
+"#
+}
+
+// The probe is deleted BEFORE any assertion so a red row never leaves the file behind.
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/cg_decl_decline_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    while idx < nodes.len() {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 { m.insert(tc_type_str(tid), tid) }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 {
+        io.println("FAIL: harvested map has no tid for rendered type string '{key}'")
+    }
+    assert(tid != -1)
+    tid
+}
+
+// A type the reading layer declines has no C spelling. The declaration layer turns the
+// decline into I0001 and writes nothing: a default spelling would be a wrong C type that
+// the C compiler is happy to accept.
+fn assert_ices(label: Str, tid: Int) ! Diag.Report {
+    let _drained = print_take()
+    let before = diag_ice_count
+    let got = cg_decl_require_spelling(tid, Position.Local)
+    assert_eq_str("{label} spells nothing", got, "")
+    assert_eq_int("{label} raises one ICE", diag_ice_count - before, 1)
+    assert_eq_int("{label} prints nothing", print_take().trim().len(), 0)
+}
+
+test "an unbound metavar declines into an ICE instead of a spelling" {
+    let _m = harvest_type_tids()
+    assert_ices("fresh metavar", make_metavar())
+}
+
+test "an Unknown type declines into an ICE instead of a spelling" {
+    let _m = harvest_type_tids()
+    assert_ices("Unknown", tc_unknown_tid())
+}
+
+test "a free type parameter declines into an ICE instead of a spelling" {
+    let m = harvest_type_tids()
+    assert_ices("typevar T", expect_tid(m, "T"))
+}
+
+test "a carrier over an undetermined child declines into an ICE" {
+    let _m = harvest_type_tids()
+    assert_ices("Option[metavar]", make_option_type(make_metavar()))
+}
+
+// A type the reading layer can spell is answered with no diagnostic at all.
+test "a determined type answers its spelling and raises nothing" {
+    let m = harvest_type_tids()
+    let before = diag_ice_count
+    assert_eq_str("Point", cg_decl_require_spelling(expect_tid(m, "Point"), Position.Local), "blink_Point")
+    assert_eq_str("Int", cg_decl_require_spelling(expect_tid(m, "Int"), Position.Local), "int64_t")
+    assert_eq_int("raises nothing", diag_ice_count - before, 0)
+}
+
+// Void is a value everywhere but a return type, where C spells it `void`.
+test "the return position answers the C return spelling"  {
+    let m = harvest_type_tids()
+    let before = diag_ice_count
+    assert_eq_str("Point returned", cg_decl_require_spelling(expect_tid(m, "Point"), Position.Return), "blink_Point")
+    assert_eq_int("raises nothing", diag_ice_count - before, 0)
+}

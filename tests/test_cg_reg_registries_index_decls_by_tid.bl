@@ -1,0 +1,166 @@
+import std.fs
+import std.io
+import typecheck.{check_types, lookup_named_type}
+import parser.{node_name, node_set_module}
+import cg_reg.{
+    cg_reg_reset, cg_reg_build, cg_reg_type_decls, cg_reg_fn_decls, cg_reg_effect_decls,
+    cg_reg_global_decls, cg_reg_trait_decls, cg_reg_impl_decls, cg_reg_test_decls,
+    cg_reg_decl_for_tid, cg_reg_tid_for_decl, cg_reg_module_of, cg_reg_modules, cg_reg_has_main,
+}
+import layout.{layout_reset}
+import compiler.{compile_to_program}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.println("FAIL: {label}: got '{got}' want '{want}'")
+    }
+    assert_eq(got, want)
+}
+
+// An import cannot be resolved from inside a test process, so the probe names no module.
+// The module rows below stamp the keys they need onto the parsed declarations instead.
+fn probe_src() -> Str {
+    #"type Point { x: Int, y: Int }
+type Color { Red, Green }
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str)
+    }
+}
+trait Named {
+    fn label(self) -> Str
+}
+impl Named for Point {
+    fn label(self) -> Str { "p" }
+}
+let origin: Int = 0
+fn helper(p: Point) -> Int { p.x }
+fn main() {
+    assert(helper(Point { x: 1, y: 2 }) == 1)
+}
+test "point keeps its x" {
+    assert(Point { x: 3, y: 4 }.x == 3)
+}
+"#
+}
+
+// The probe is deleted BEFORE any assertion so a red row never leaves the file behind.
+fn build_probe() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/cg_reg_registry_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    cg_reg_reset()
+    cg_reg_build(program)
+    program
+}
+
+fn named(decls: List[Int], name: Str) -> Int {
+    let mut i = 0
+    while i < decls.len() {
+        let d = decls.get(i).unwrap()
+        if node_name(d) == name { return d }
+        i = i + 1
+    }
+    -1
+}
+
+fn assert_registered(label: Str, decls: List[Int], name: Str) -> Int {
+    let d = named(decls, name)
+    if d == -1 {
+        io.println("FAIL: {label}: no registered declaration named '{name}'")
+    }
+    assert(d != -1)
+    d
+}
+
+// Every declaration kind the driver walks lands in its own registry, so no later stage
+// re-walks the AST hunting for one.
+test "cg_reg_build files each declaration kind in its own registry" {
+    let _program = build_probe()
+    let _ = assert_registered("types", cg_reg_type_decls(), "Point")
+    let _ = assert_registered("types", cg_reg_type_decls(), "Color")
+    let _ = assert_registered("fns", cg_reg_fn_decls(), "helper")
+    let _ = assert_registered("fns", cg_reg_fn_decls(), "main")
+    let _ = assert_registered("effects", cg_reg_effect_decls(), "Metrics")
+    let _ = assert_registered("traits", cg_reg_trait_decls(), "Named")
+    let _ = assert_registered("globals", cg_reg_global_decls(), "origin")
+    assert(cg_reg_impl_decls().len() > 0)
+    assert(cg_reg_test_decls().len() > 0)
+    assert(cg_reg_has_main())
+}
+
+// The registry is keyed on the type id, not on the printed type name: a tid answers its
+// declaration node and that node answers the same tid back.
+test "a nominal type id round-trips to its declaration node" {
+    let _program = build_probe()
+    let point_decl = assert_registered("types", cg_reg_type_decls(), "Point")
+    let point_tid = lookup_named_type("Point")
+    assert(point_tid >= 0)
+    assert_eq_int("tid answers decl", cg_reg_decl_for_tid(point_tid), point_decl)
+    assert_eq_int("decl answers tid", cg_reg_tid_for_decl(point_decl), point_tid)
+
+    let color_decl = assert_registered("types", cg_reg_type_decls(), "Color")
+    let color_tid = lookup_named_type("Color")
+    assert(color_tid >= 0)
+    assert_eq_int("enum tid answers decl", cg_reg_decl_for_tid(color_tid), color_decl)
+    assert_eq_int("enum decl answers tid", cg_reg_tid_for_decl(color_decl), color_tid)
+}
+
+// A type id with no declaration of its own answers -1 rather than a neighbour's node.
+test "an unregistered type id answers no declaration node" {
+    let _program = build_probe()
+    assert_eq_int("Int has no decl node", cg_reg_decl_for_tid(lookup_named_type("Int")), -1)
+    assert_eq_int("negative tid", cg_reg_decl_for_tid(-1), -1)
+    assert_eq_int("unregistered node", cg_reg_tid_for_decl(999999), -1)
+}
+
+// The module list holds each key once in first-seen order, which is the order the
+// per-module driver emits in. A declaration the parser left unattributed rides in the
+// aggregate output and names no module of its own.
+test "the module list is first-seen, unique, and skips unattributed declarations" {
+    let program = build_probe()
+    let point_decl = assert_registered("types", cg_reg_type_decls(), "Point")
+    let color_decl = assert_registered("types", cg_reg_type_decls(), "Color")
+    let helper_decl = assert_registered("fns", cg_reg_fn_decls(), "helper")
+    let main_decl = assert_registered("fns", cg_reg_fn_decls(), "main")
+    assert_eq_str("unattributed before stamping", cg_reg_module_of(point_decl), "")
+    node_set_module(point_decl, "probe.alpha")
+    node_set_module(color_decl, "probe.beta")
+    node_set_module(helper_decl, "probe.alpha")
+
+    cg_reg_build(program)
+    let mods = cg_reg_modules()
+    assert_eq_int("two module keys", mods.len(), 2)
+    assert_eq_str("first seen", mods.get(0).unwrap(), "probe.alpha")
+    assert_eq_str("second seen", mods.get(1).unwrap(), "probe.beta")
+    assert_eq_str("Point's module", cg_reg_module_of(point_decl), "probe.alpha")
+    assert_eq_str("helper's module", cg_reg_module_of(helper_decl), "probe.alpha")
+    assert_eq_str("main is unattributed", cg_reg_module_of(main_decl), "")
+}
+
+// A reset empties every registry, so a second compilation in one process never sees the
+// first one's declarations.
+test "cg_reg_reset empties every registry" {
+    let _program = build_probe()
+    assert(cg_reg_type_decls().len() > 0)
+    cg_reg_reset()
+    assert_eq_int("types", cg_reg_type_decls().len(), 0)
+    assert_eq_int("fns", cg_reg_fn_decls().len(), 0)
+    assert_eq_int("effects", cg_reg_effect_decls().len(), 0)
+    assert_eq_int("globals", cg_reg_global_decls().len(), 0)
+    assert_eq_int("traits", cg_reg_trait_decls().len(), 0)
+    assert_eq_int("impls", cg_reg_impl_decls().len(), 0)
+    assert_eq_int("tests", cg_reg_test_decls().len(), 0)
+    assert_eq_int("modules", cg_reg_modules().len(), 0)
+    assert_eq_int("no main", if cg_reg_has_main() { 1 } else { 0 }, 0)
+}

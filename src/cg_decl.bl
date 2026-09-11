@@ -1,11 +1,366 @@
-// cg_decl.bl: typedefs, function declarations, globals and the translation-unit prologue.
+// cg_decl.bl: the declaration half of a translation unit — typedefs, function
+// declarations, globals, effect vtables and the prologue.
 //
-// A stage of the tid-native emitter, not yet written. Its entry point reports I0004 and
-// returns, so the driver's diag_ice_count check turns a call into a loud failure rather
-// than a translation unit that is silently empty.
+// Every C spelling here comes from the reading layer through one gate,
+// cg_decl_require_spelling. layout_of never guesses, so a type it declines has no
+// spelling at all and the gate raises I0001 rather than writing a default: a wrong C
+// type compiles cleanly and then gets the program wrong at run time.
+//
+// Typedef order is a dependency order read off the type graph, not the order the
+// declarations were written in. A member's type must be complete where the embedding
+// typedef names it, so a declaration is emitted only after every nominal type its
+// members reach by value.
 
-import diagnostics.{Diag, diag_ice_stage_not_built}
+import diagnostics.{Diag, diag_ice, diag_ice_stage_not_built, UNSOLVED_TYPEVAR_AT_CODEGEN}
+import layout.{
+    LayoutRecord, Position, layout_of, field_layout_of, ensure_typedef_for,
+    layout_take_typedefs, tid_of_node,
+}
+import cname.{
+    c_ev_type_name, c_ffi_symbol, c_fn_decl_name, c_global_name, c_impl_method_name,
+    c_safe_name, c_type_decl_name, c_variant_tag_macro, cname_is_runtime_owned,
+    td_guard_name,
+}
+import cg_print.{
+    print_ev, print_epilogue, print_fn_decl, print_global_decl, print_prologue,
+    print_simple_enum_typedef, print_struct_typedef, print_tagged_enum_typedef,
+    print_typedef_blocks,
+}
+import cg_reg.{
+    cg_reg_effect_decls, cg_reg_entry_point, cg_reg_fn_decls, cg_reg_global_decls,
+    cg_reg_impl_methods, cg_reg_impl_of, cg_reg_tid_for_decl, cg_reg_type_decls,
+}
+import typecheck.{
+    TyKind, tc_enum_variant_slots, tc_evar_field_slots, tc_evar_name, tc_evfield_name,
+    tc_evfield_tid, tc_resolve, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
+    tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind, tc_type_str,
+    tc_void_tid,
+}
+import parser.{
+    get_annotation, node_effects, node_fields, node_impl_binders, node_name, node_params,
+    node_type_ann, node_type_params, node_value, sublist_get, sublist_length,
+}
 
-pub fn cg_decl_lower_prologue(program: Int) ! Diag.Report {
-    diag_ice_stage_not_built("cg_decl", program)
+// 1 while a declaration's dependencies are being emitted, 2 once its typedef is written.
+let mut decl_state: Map[Int, Int] = Map()
+
+pub fn cg_decl_reset() {
+    decl_state = Map()
+}
+
+// ── The spelling gate ─────────────────────────────────────────────────────
+
+fn spelling_or_ice(rec: LayoutRecord, what: Str) -> Str ! Diag.Report {
+    let reason = rec.decline_reason
+    if reason == "" { return rec.c_spelling }
+    diag_ice("NoCSpellingForType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "no C spelling for {what}: {reason}", 0, 0,
+        "every type that reaches code generation must be concrete and nameable; this is a compiler bug")
+    ""
+}
+
+// The one place a type id becomes a C spelling for a declaration. A declined type
+// answers "" and has raised I0001; no caller may substitute anything for it.
+pub fn cg_decl_require_spelling(tid: Int, position: Position) -> Str ! Diag.Report {
+    spelling_or_ice(layout_of(tid, position), tc_type_str(tid))
+}
+
+// ── Typedefs ──────────────────────────────────────────────────────────────
+
+pub fn cg_decl_emit_typedefs() ! Diag.Report {
+    for decl in cg_reg_type_decls() { emit_type_decl(decl) }
+}
+
+// A generic declaration is a template. Only its instances have a C spelling, so asking
+// the reading layer for the base's types would ask for the C type of a free type
+// variable and get a decline this stage must report as a compiler bug.
+fn is_generic_base(decl: Int) -> Bool {
+    let tps = node_type_params(decl)
+    tps != -1 && sublist_length(tps) > 0
+}
+
+// A declaration whose C typedef this translation unit does not write: a generic base
+// (mono writes one typedef per instance), an alias (it has no storage of its own), an
+// opaque foreign handle (the foreign header declares the pointee) and a type whose
+// typedef lives in runtime.h.
+fn skips_typedef(decl: Int) -> Bool {
+    if is_generic_base(decl) { return true }
+    if node_fields(decl) == -1 && node_value(decl) != -1 { return true }
+    if get_annotation(decl, "ffi.opaque") != -1 { return true }
+    cname_is_runtime_owned(decl)
+}
+
+fn emit_type_decl(decl: Int) ! Diag.Report {
+    if decl < 0 { return }
+    // 1 means this declaration is already on the stack: the only way back to it is a
+    // member that reaches its own owner, and such a member is stored boxed, so the
+    // cycle needs no completed typedef and is not followed.
+    if (decl_state.get(decl) ?? 0) != 0 { return }
+    decl_state.insert(decl, 1)
+    let tid = cg_reg_tid_for_decl(decl)
+    if tid < 0 || skips_typedef(decl) {
+        decl_state.insert(decl, 2)
+        return
+    }
+    for mtid in member_tids(tid) {
+        for dep in nominal_deps(mtid) { emit_type_decl(dep) }
+    }
+    decl_state.insert(decl, 2)
+    emit_one(decl, tid)
+}
+
+// The declared member types of a nominal type, in declaration order: a struct's fields,
+// or every field of every enum variant.
+fn member_tids(tid: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    if tc_tid_kind(tc_resolve(tid)) == TyKind.Enum {
+        for v in tc_enum_variant_slots(tid) {
+            for f in tc_evar_field_slots(v) { out.push(tc_evfield_tid(f)) }
+        }
+        return out
+    }
+    for f in tc_struct_field_slots(tid) { out.push(tc_sfield_tid(f)) }
+    out
+}
+
+// The nominal declarations a member type reaches BY VALUE. A carrier or tuple names its
+// members inside its own typedef, so the walk goes through it; a runtime container is one
+// C type whatever it holds, so the walk stops there.
+fn nominal_deps(tid: Int) -> List[Int] {
+    let r = tc_resolve(tid)
+    let k = tc_tid_kind(r)
+    if k == TyKind.Struct || k == TyKind.Enum {
+        let decl = tc_tid_decl_node(r)
+        if decl < 0 { return [] }
+        return [decl]
+    }
+    if k != TyKind.Option && k != TyKind.Result && k != TyKind.Tuple { return [] }
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < tc_tid_child_count(r) {
+        for d in nominal_deps(tc_tid_child(r, i)) { out.push(d) }
+        i = i + 1
+    }
+    out
+}
+
+// layout.bl builds a member's Option, Result and Tuple typedefs children-first as
+// finished blocks. Draining them here, before the typedef that names them, is what puts
+// an inner carrier ahead of the outer one.
+fn flush_member_typedefs(tid: Int) {
+    let _ = ensure_typedef_for(tid)
+    print_typedef_blocks(layout_take_typedefs())
+}
+
+fn emit_one(decl: Int, tid: Int) ! Diag.Report {
+    let c_name = c_type_decl_name(decl)
+    let guard = td_guard_name(c_name)
+    if tc_tid_kind(tc_resolve(tid)) == TyKind.Enum {
+        emit_enum(decl, tid, guard, c_name)
+        return
+    }
+    emit_struct(decl, tid, guard, c_name)
+}
+
+fn emit_struct(decl: Int, tid: Int, guard: Str, c_name: Str) ! Diag.Report {
+    let mut fields: List[Str] = []
+    for slot in tc_struct_field_slots(tid) {
+        let ftid = tc_sfield_tid(slot)
+        flush_member_typedefs(ftid)
+        let fname = tc_sfield_name(slot)
+        let spelling = spelling_or_ice(field_layout_of(decl, ftid), "{node_name(decl)}.{fname}")
+        if spelling == "" { return }
+        fields.push("{spelling} {c_safe_name(fname)}")
+    }
+    print_struct_typedef(guard, c_name, fields)
+}
+
+// A variant's declaration node, needed for the tag macro cname spells. The variant
+// entries typecheck registered are in declaration order, so they line up by index.
+fn variant_node(decl: Int, index: Int) -> Int {
+    let vars = node_fields(decl)
+    if vars == -1 || index >= sublist_length(vars) { return -1 }
+    sublist_get(vars, index)
+}
+
+fn emit_enum(decl: Int, tid: Int, guard: Str, c_name: Str) ! Diag.Report {
+    let slots = tc_enum_variant_slots(tid)
+    let mut names: List[Str] = []
+    let mut fields: List[List[Str]] = []
+    let mut macros: List[Str] = []
+    let mut carries_data = false
+    let mut i = 0
+    while i < slots.len() {
+        let slot = slots.get(i).unwrap()
+        let vnode = variant_node(decl, i)
+        if vnode < 0 { return }
+        let decls = variant_field_decls(decl, slot)
+        if decls.len() > 0 { carries_data = true }
+        names.push(tc_evar_name(slot))
+        fields.push(decls)
+        macros.push(c_variant_tag_macro(decl, vnode))
+        i += 1
+    }
+    if !carries_data {
+        let mut ordinals: List[Str] = []
+        for n in names { ordinals.push("{c_name}_{n}") }
+        print_simple_enum_typedef(guard, c_name, ordinals)
+        return
+    }
+    print_tagged_enum_typedef(guard, c_name, names, fields, macros)
+}
+
+fn variant_field_decls(owner: Int, var_slot: Int) -> List[Str] ! Diag.Report {
+    let mut out: List[Str] = []
+    for f in tc_evar_field_slots(var_slot) {
+        let ftid = tc_evfield_tid(f)
+        flush_member_typedefs(ftid)
+        let fname = tc_evfield_name(f)
+        let spelling = spelling_or_ice(field_layout_of(owner, ftid), "{node_name(owner)}.{tc_evar_name(var_slot)}.{fname}")
+        if spelling == "" { return out }
+        out.push("{spelling} {c_safe_name(fname)}")
+    }
+    out
+}
+
+// ── Function declarations ────────────────────────────────────────────────────
+//
+// A function's signature types are not on the function node: typecheck stamps each
+// parameter node and the return annotation node, so those are what the spelling gate
+// reads. A function with no return annotation returns void.
+
+// A declared effect is what puts the evidence vector in the signature. The entry point is
+// the exception in both directions: the shim always passes it one, and an FFI extern binds
+// a C function that knows nothing about evidence. Which node is the entry point is the
+// registry's answer, not a name compare: an impl method may be named `main` too.
+fn fn_takes_ev(fn_node: Int) -> Bool {
+    if get_annotation(fn_node, "ffi") != -1 { return false }
+    if fn_node == cg_reg_entry_point() { return true }
+    let sl = node_effects(fn_node)
+    if sl == -1 { return false }
+    sublist_length(sl) > 0
+}
+
+// A function with no return annotation returns the void type, which the reading layer
+// already spells for the return position; naming that spelling here would be a twin.
+fn fn_ret_spelling(fn_node: Int) -> Str ! Diag.Report {
+    let ann = node_type_ann(fn_node)
+    let tid = if ann == -1 { tc_void_tid() } else { tid_of_node(ann) }
+    flush_member_typedefs(tid)
+    cg_decl_require_spelling(tid, Position.Return)
+}
+
+fn fn_param_decls(fn_node: Int) -> List[Str] ! Diag.Report {
+    let mut out: List[Str] = []
+    let sl = node_params(fn_node)
+    if sl == -1 { return out }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        let p = sublist_get(sl, i)
+        flush_member_typedefs(tid_of_node(p))
+        let spelling = cg_decl_require_spelling(tid_of_node(p), Position.Param)
+        out.push("{spelling} {c_safe_name(node_name(p))}")
+        i = i + 1
+    }
+    out
+}
+
+// A foreign binding is reached through a C wrapper under the Blink name. When that
+// wrapper would carry the foreign symbol's own name there is no wrapper at all: the
+// call goes straight to the foreign function, whose own header declares it. A second
+// prototype guessed from the Blink signature loses the qualifiers that header spells,
+// and C rejects the mismatch. The name the wrapper would carry is the caller's to say:
+// a free function and an impl method spell it differently.
+fn needs_no_wrapper(fn_node: Int, decl_name: Str) -> Bool {
+    let symbol = c_ffi_symbol(fn_node)
+    symbol != "" && symbol == decl_name
+}
+
+// A carrier type has no declaration of its own, so the only thing that asks for it is
+// the signature that names it. Spelling it records its typedef, which must be written
+// before the declaration that reads it, so the spellings are taken first.
+pub fn cg_decl_emit_fn_decl(fn_node: Int, is_static: Bool) ! Diag.Report {
+    // A foreign binding is the exception to the generic-base rule: a foreign symbol has
+    // one address, so a binding over it has one wrapper however many binders its Blink
+    // signature carries. Those binders may only reach types whose C spelling does not
+    // depend on them, and a spelling that does depend on one is reported, not guessed.
+    if is_generic_base(fn_node) && c_ffi_symbol(fn_node) == "" { return }
+    let name = c_fn_decl_name(fn_node)
+    if needs_no_wrapper(fn_node, name) { return }
+    let ret = fn_ret_spelling(fn_node)
+    let params = fn_param_decls(fn_node)
+    print_fn_decl(is_static, ret, name, params, fn_takes_ev(fn_node))
+}
+
+pub fn cg_decl_emit_fn_decls() ! Diag.Report {
+    for f in cg_reg_fn_decls() { cg_decl_emit_fn_decl(f, false) }
+}
+
+// ── Impl method declarations ─────────────────────────────────────────────────
+//
+// An impl method is a plain C function that takes the receiver first. Typecheck stamps
+// the `self` parameter node with the receiver's type id exactly as it stamps every other
+// parameter, so the signature needs nothing the free-function path does not already have.
+// Only the name differs: it carries the receiver type and the trait.
+
+// A generic impl block is a template over its binders. Its methods have a C spelling only
+// once a receiver type is chosen, which is one monomorphized instance per choice.
+fn impl_is_generic(im: Int) -> Bool {
+    let binders = node_impl_binders(im)
+    binders != -1 && sublist_length(binders) > 0
+}
+
+pub fn cg_decl_emit_impl_method_decl(method: Int, is_static: Bool) ! Diag.Report {
+    let im = cg_reg_impl_of(method)
+    if im < 0 { return }
+    if impl_is_generic(im) || is_generic_base(method) { return }
+    let name = c_impl_method_name(im, node_name(method))
+    if needs_no_wrapper(method, name) { return }
+    let ret = fn_ret_spelling(method)
+    let params = fn_param_decls(method)
+    print_fn_decl(is_static, ret, name, params, fn_takes_ev(method))
+}
+
+pub fn cg_decl_emit_impl_method_decls() ! Diag.Report {
+    for m in cg_reg_impl_methods() { cg_decl_emit_impl_method_decl(m, false) }
+}
+
+// ── Globals ──────────────────────────────────────────────────────────────────
+//
+// A top-level `let` is a C global under its bare Blink name, in every module. The name
+// is unmangled on purpose: it is the linkage another translation unit refers to.
+
+pub fn cg_decl_emit_globals(is_extern: Bool) ! Diag.Report {
+    for g in cg_reg_global_decls() {
+        flush_member_typedefs(tid_of_node(g))
+        let spelling = cg_decl_require_spelling(tid_of_node(g), Position.Local)
+        print_global_decl(spelling, c_global_name(g), is_extern)
+    }
+}
+
+// ── Prologue and evidence vector ─────────────────────────────────────────────
+
+pub fn cg_decl_emit_prologue(user_tu: Bool, define_storage: Bool, test_build: Bool, header_guard: Str, self_header: Str) {
+    print_prologue(user_tu, define_storage, test_build, header_guard, self_header)
+}
+
+pub fn cg_decl_emit_epilogue(header_guard: Str) {
+    print_epilogue(header_guard)
+}
+
+// `ev_storage` is the storage class of the one `__blink_ev` the program has: "" for the
+// unit that owns it, "static " for a single unit, "extern " for a unit that only refers
+// to it.
+//
+// A user-declared effect appends a vtable pointer to the vector and needs a default
+// vtable and a default body per operation. None of that is written yet, and a vector
+// that silently dropped the field would miscompile every handler of that effect, so the
+// gap reports instead.
+pub fn cg_decl_emit_ev(ev_storage: Str) ! Diag.Report {
+    let effects = cg_reg_effect_decls()
+    if effects.len() > 0 {
+        diag_ice_stage_not_built("cg_decl user effects", effects.get(0).unwrap())
+        return
+    }
+    print_ev(td_guard_name(c_ev_type_name()), [], [], ev_storage)
 }
