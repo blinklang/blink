@@ -27,7 +27,7 @@ import layout.{SlotForm}
 pub type IrKind {
     Const, VarRef, GlobalRef,
     Unary, Binary, Cast,
-    FieldGet, FieldSet, StructNew, TupleNew, ContainerNew,
+    FieldGet, FieldSet, StructNew, TupleNew, ContainerNew, ContainerSpread,
     Box, Unbox, CarrierWrap, CarrierUnwrap, CarrierTag,
     CallDirect, CallIndirect, CallClosure, CallVirtual, CallRuntime,
     ClosureNew, EffectPerform, HandlerInstall,
@@ -108,7 +108,7 @@ pub fn ir_all_kinds() -> List[IrKind] {
         IrKind.Const, IrKind.VarRef, IrKind.GlobalRef,
         IrKind.Unary, IrKind.Binary, IrKind.Cast,
         IrKind.FieldGet, IrKind.FieldSet, IrKind.StructNew, IrKind.TupleNew, IrKind.ContainerNew,
-        IrKind.Box, IrKind.Unbox, IrKind.CarrierWrap, IrKind.CarrierUnwrap, IrKind.CarrierTag,
+        IrKind.ContainerSpread, IrKind.Box, IrKind.Unbox, IrKind.CarrierWrap, IrKind.CarrierUnwrap, IrKind.CarrierTag,
         IrKind.CallDirect, IrKind.CallIndirect, IrKind.CallClosure, IrKind.CallVirtual, IrKind.CallRuntime,
         IrKind.ClosureNew, IrKind.EffectPerform, IrKind.HandlerInstall,
         IrKind.Let, IrKind.Assign, IrKind.ExprStmt, IrKind.Return, IrKind.If, IrKind.Loop,
@@ -130,6 +130,7 @@ pub fn ir_kind_name(kind: IrKind) -> Str {
         IrKind.StructNew => "StructNew"
         IrKind.TupleNew => "TupleNew"
         IrKind.ContainerNew => "ContainerNew"
+        IrKind.ContainerSpread => "ContainerSpread"
         IrKind.Box => "Box"
         IrKind.Unbox => "Unbox"
         IrKind.CarrierWrap => "CarrierWrap"
@@ -202,6 +203,7 @@ fn kind_needs_c_name(kind: IrKind) -> Bool {
         IrKind.FieldGet => true
         IrKind.FieldSet => true
         IrKind.ContainerNew => true
+        IrKind.ContainerSpread => true
         IrKind.Box => true
         IrKind.CarrierUnwrap => true
         IrKind.CallDirect => true
@@ -224,6 +226,7 @@ fn kind_min_kids(kind: IrKind) -> Int {
         IrKind.Cast => 1
         IrKind.FieldGet => 1
         IrKind.FieldSet => 2
+        IrKind.ContainerSpread => 1
         IrKind.Box => 1
         IrKind.Unbox => 1
         IrKind.CarrierWrap => 1
@@ -254,6 +257,7 @@ fn kind_max_kids(kind: IrKind) -> Int {
         IrKind.Cast => 1
         IrKind.FieldGet => 1
         IrKind.FieldSet => 2
+        IrKind.ContainerSpread => 1
         IrKind.Box => 1
         IrKind.Unbox => 1
         IrKind.CarrierWrap => 2
@@ -316,6 +320,14 @@ pub fn ir_tuple_new(tid: Int, span: Int, c_spelling: Str, elems: List[Int]) -> I
 
 pub fn ir_container_new(tid: Int, span: Int, c_spelling: Str, ctor_symbol: Str, elems: List[Int]) -> Int {
     ir_new(IrKind.ContainerNew, tid, span, c_spelling, ctor_symbol, SlotForm.InlineWord, elems)
+}
+
+// `[..xs, y]`: the spread copies every element of xs into the container being built. It
+// is a kid of that ContainerNew and of nothing else, so the destination it extends is the
+// container the printer is building and no node has to name it. c_name is the runtime
+// copy symbol (blink_list_extend); the one kid is the source container.
+pub fn ir_container_spread(tid: Int, span: Int, c_spelling: Str, extend_symbol: Str, source: Int) -> Int {
+    ir_new(IrKind.ContainerSpread, tid, span, c_spelling, extend_symbol, SlotForm.InlineWord, [source])
 }
 
 // c_spelling is the box's own pointer type like every other value node. The pointee type
@@ -457,9 +469,14 @@ pub fn ir_verify(root: Int) -> List[Str] {
         on_stack.push(0)
         i += 1
     }
+    if ir_kind(root) == IrKind.ContainerSpread {
+        errs.push("root {root} (ContainerSpread): {SPREAD_MISPLACED}")
+    }
     verify_node(root, seen, on_stack, errs)
     errs
 }
+
+let SPREAD_MISPLACED: Str = "ContainerSpread outside a ContainerNew, it extends only the container that holds it"
 
 fn verify_node(id: Int, seen: List[Int], on_stack: List[Int], errs: List[Str]) {
     let kind = ir_kind(id)
@@ -531,6 +548,9 @@ fn plural(n: Int) -> Str { if n == 1 { "" } else { "s" } }
 fn verify_kid_shape(kind: IrKind, label: Str, i: Int, n: Int, kid: Int, errs: List[Str]) {
     let kid_kind = ir_kind(kid)
     let kid_is_value = ir_kind_is_value(kid_kind)
+    if kid_kind == IrKind.ContainerSpread && kind != IrKind.ContainerNew {
+        errs.push("{label}: kid {i} is a {SPREAD_MISPLACED}")
+    }
     match kid_slot(kind, i, n) {
         KidSlot.Value => {
             if !kid_is_value { errs.push("{label}: kid {i} is a statement where a value is required") }

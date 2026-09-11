@@ -28,7 +28,13 @@ imports layout or an emitter. `scripts/lint_import_dag.sh` asserts both.
 | `field_layout_of(owner_decl, field_tid) -> LayoutRecord` | A field in its owner. See "Self-recursive fields". |
 
 `LayoutRecord` fields: `c_spelling`, `slot_form`, `carrier_tag`, `is_transparent`,
-`kops_table`, `decline_reason`.
+`kops_table`, `kops_inline_key`, `decline_reason`.
+
+`kops_inline_key` is the runtime's storage choice for a key that has a table: `true`
+when the key's own bytes sit in the map or set slot (a word-sized key: scalar,
+ordinal enum, transparent newtype), `false` when the slot holds a pointer to a heap
+copy (struct, data enum, tuple). `Str` is `false`: `blink_kops_str` reads the slot's
+pointer as the string itself. A key without a table answers `false`.
 
 ## Self-recursive fields
 
