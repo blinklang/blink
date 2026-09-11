@@ -11,19 +11,22 @@
 
 import diagnostics.{Diag, diag_ice_stage_not_built}
 import parser.{get_annotation, node_effects, sublist_length}
-import cname.{c_archive_header_guard, c_module_header_guard, cname_reset}
-import layout.{layout_reset}
+import cname.{c_archive_header_guard, c_module_header_guard}
+import layout.{layout_reset, set_current_inst}
 import cg_print.{print_main_shim, print_reset, print_scope_restore_support, print_take}
 import cg_reg.{
     cg_reg_build, cg_reg_entry_point, cg_reg_fn_decls, cg_reg_has_main, cg_reg_impl_methods,
-    cg_reg_modules, cg_reg_module_of, cg_reg_reset, cg_reg_test_decls,
+    cg_reg_impl_of, cg_reg_modules, cg_reg_module_of, cg_reg_reset, cg_reg_test_decls,
 }
 import cg_decl.{
     BodySite, cg_decl_body_site, cg_decl_emit_epilogue, cg_decl_emit_ev,
     cg_decl_emit_fn_decl, cg_decl_emit_fn_def, cg_decl_emit_impl_method_decl,
-    cg_decl_emit_globals, cg_decl_emit_prologue, cg_decl_emit_typedefs, cg_decl_reset,
+    cg_decl_emit_globals, cg_decl_emit_signature_decl, cg_decl_emit_signature_def,
+    cg_decl_emit_prologue, cg_decl_emit_typedefs, cg_decl_reset,
 }
+import mono.{instances}
 import cg_stmt.{cg_stmt_reset, lower_fn}
+import cg_expr.{cg_expr_reset}
 
 effect Codegen {
     effect Emit
@@ -64,12 +67,94 @@ pub type CgConfig {
 // each other's memo tables, and a stale entry would be read as a fact about this program.
 fn begin_unit(program: Int) ! Diag.Report {
     print_reset()
+    // layout_reset resets cname and then re-marks the declaration facts that cname holds,
+    // so a second cname_reset here would clear the facts it had just written.
     layout_reset()
-    cname_reset()
     cg_reg_reset()
     cg_reg_build(program)
     cg_decl_reset()
     cg_stmt_reset()
+    cg_expr_reset()
+}
+
+// The instances of one generic base, as rows of the whole-program table. The row number is
+// what makes an instance current, so the numbers travel rather than the instances.
+fn instance_rows_of(decl: Int) -> List[Int] {
+    let table = instances()
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < table.len() {
+        if table.get(i).unwrap().base_decl_node == decl { out.push(i) }
+        i = i + 1
+    }
+    out
+}
+
+// A declaration node belongs to no instance, so reading one while an instance is current
+// is refused rather than answered. Every walk over declarations therefore starts from the
+// root, whatever the walk before it left current.
+fn emit_root_signatures(decls: List[Int], methods: List[Int]) ! Diag.Report {
+    set_current_inst(-1)
+    for f in decls { cg_decl_emit_fn_decl(f, false) }
+    for m in methods { cg_decl_emit_impl_method_decl(m, false) }
+}
+
+// Every signature a unit declares: the roots, then one per instance of each generic base.
+// Both the whole-program header and a per-module header come through here, so a mode
+// cannot declare a different set of functions from the mode that defines them.
+fn emit_signatures_in_scope(fns: List[Int], methods: List[Int]) ! Diag.Report {
+    emit_root_signatures(fns, methods)
+    emit_instance_signatures(fns)
+    emit_instance_signatures(methods)
+}
+
+// One prototype per instance. A unit that defines an instance and declares none puts the
+// definition after the call that reads it, which C rejects, so the two halves walk the
+// same table in the same order.
+fn emit_instance_signatures(decls: List[Int]) ! Diag.Report {
+    for d in decls {
+        match cg_decl_body_site(d) {
+            BodySite.PerInstance => emit_instance_decls(d)
+            BodySite.ThisUnit => {}
+            BodySite.ForeignWrapper => {}
+            BodySite.Nothing => {}
+        }
+    }
+}
+
+fn emit_instance_decls(decl: Int) ! Diag.Report {
+    let table = instances()
+    for row in instance_rows_of(decl) {
+        set_current_inst(row)
+        cg_decl_emit_signature_decl(decl, table.get(row).unwrap().c_name, false)
+        set_current_inst(-1)
+    }
+}
+
+// One body per instance, under the instance's own name and its substituted types. The
+// instance is current only for the lowering and the signature that wraps it, and the root
+// is restored immediately after so nothing later reads a declaration through an instance.
+fn emit_instance_bodies(decl: Int) ! Diag.Report {
+    let table = instances()
+    let rows = instance_rows_of(decl)
+    if rows.len() == 0 { return no_instance_bodies(decl) }
+    for row in rows {
+        set_current_inst(row)
+        cg_decl_emit_signature_def(decl, table.get(row).unwrap().c_name, false, lower_fn(decl))
+        set_current_inst(-1)
+    }
+}
+
+// A generic declaration the mono pass registered no instance for. For a free function
+// that means nothing called it: there is no body to write and no caller left undefined,
+// so this is not a gap. For a method it means the pass did not monomorphize the impl it
+// belongs to, which is a narrower rule than the one that sent the method here, so the
+// body a call needs is written nowhere and this stage must say so rather than emit
+// nothing and leave the name to fail at link.
+fn no_instance_bodies(decl: Int) ! Diag.Report {
+    if cg_reg_impl_of(decl) >= 0 {
+        diag_ice_stage_not_built("cg generic impl method bodies", decl)
+    }
 }
 
 // The declaration half, in the order C requires: a type must be complete where a later
@@ -82,8 +167,7 @@ fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_
     cg_decl_emit_typedefs()
     if define_ev { cg_decl_emit_ev(ev_storage(cfg)) }
     cg_decl_emit_globals(globals_extern)
-    for f in fns_in_scope(cfg, "", shared) { cg_decl_emit_fn_decl(f, false) }
-    for m in methods_in_scope(cfg, "", shared) { cg_decl_emit_impl_method_decl(m, false) }
+    emit_signatures_in_scope(fns_in_scope(cfg, "", shared), methods_in_scope(cfg, "", shared))
 }
 
 // A function whose body reads the program's own evidence cannot live in the shared
@@ -163,10 +247,11 @@ fn methods_in_scope(cfg: CgConfig, module_key: Str, shared: Bool) -> List[Int] {
 // repeats one already made does not raise that count, so it cannot tell a body that
 // failed from one that succeeded. The caller discards the whole unit instead.
 fn emit_bodies(decls: List[Int]) ! Diag.Report {
+    set_current_inst(-1)
     for d in decls {
         match cg_decl_body_site(d) {
             BodySite.ThisUnit => cg_decl_emit_fn_def(d, false, lower_fn(d))
-            BodySite.PerInstance => diag_ice_stage_not_built("cg mono instance bodies", d)
+            BodySite.PerInstance => emit_instance_bodies(d)
             BodySite.ForeignWrapper => diag_ice_stage_not_built("cg foreign wrapper bodies", d)
             BodySite.Nothing => {}
         }
@@ -215,8 +300,8 @@ pub fn generate_module_header(program: Int, module_key: Str, cfg: CgConfig) -> S
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, false, false, guard, "")
     cg_decl_emit_typedefs()
     cg_decl_emit_globals(true)
-    for f in fns_in_scope(cfg, module_key, false) { cg_decl_emit_fn_decl(f, false) }
-    for m in methods_in_scope(cfg, module_key, false) { cg_decl_emit_impl_method_decl(m, false) }
+    emit_signatures_in_scope(fns_in_scope(cfg, module_key, false),
+        methods_in_scope(cfg, module_key, false))
     cg_decl_emit_epilogue(guard)
     print_take()
 }
