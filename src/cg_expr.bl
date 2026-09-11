@@ -1,11 +1,144 @@
-// cg_expr.bl: expressions, literals and operators, lowered to IR.
+// cg_expr.bl: every Blink expression becomes one typed IR value.
 //
-// A stage of the tid-native emitter, not yet written. Its entry point reports I0004 and
-// returns, so the driver's diag_ice_count check turns a call into a loud failure rather
-// than a translation unit that is silently empty.
+// A node's tid is the only thing that decides its C shape. Every spelling and slot form
+// comes from layout_of, every symbol from cname, and no C text is written here.
+//
+// The leaf kinds are lowered: the five literal forms and a read of a binder in scope.
+// Every other kind reports I0004 and answers -1, so a caller that reaches an unbuilt
+// shape fails loudly instead of receiving a guess. Nothing here falls back.
+//
+// A tid is always read through layout.tid_of_node. The instance a monomorphised body
+// belongs to is the driver's state, not this module's, so no instance is held here.
 
-import diagnostics.{Diag, diag_ice_stage_not_built}
+import parser.{
+    node_kind, node_name, node_str_val, node_int_val, node_elements,
+    sublist_get, sublist_length,
+}
+import ast.{NodeKind, nk_of}
+import layout.{
+    LayoutRecord, Position, current_binder_scope, layout_of, tid_of_binder,
+    tid_of_node,
+}
+import cname.{c_local_name, c_string_literal}
+import ir.{ir_const, ir_var_ref}
+import diagnostics.{
+    Diag, diag_ice_at, diag_ice_stage_not_built, UNSOLVED_TYPEVAR_AT_CODEGEN,
+}
 
-pub fn cg_expr_lower(node: Int) ! Diag.Report {
+// ── Seam ──────────────────────────────────────────────────────────────────
+
+// The one entry point. The answer is an IR value node whose tid is the node's own and
+// whose C spelling came from layout_of; -1 means an internal error was recorded and the
+// caller must stop.
+pub fn lower_expr(node: Int) -> Int ! Diag.Report {
+    match nk_of(node_kind(node)) {
+        NodeKind.IntLit => lower_int_lit(node)
+        NodeKind.FloatLit => lower_literal(node, node_str_val(node))
+        NodeKind.CharLit => lower_literal(node, node_str_val(node))
+        NodeKind.BoolLit => lower_bool_lit(node)
+        NodeKind.InterpString => lower_string(node)
+        NodeKind.Ident => lower_ident(node)
+        _ => x_not_built(node)
+    }
+}
+
+// ── Literals ──────────────────────────────────────────────────────────────
+
+// An integer keeps the spelling the program wrote, so a hex or underscored literal
+// survives into the C. Only a literal the lexer folded has none.
+fn lower_int_lit(node: Int) -> Int ! Diag.Report {
+    let s = node_str_val(node)
+    if s == "" { return lower_literal(node, "{node_int_val(node)}") }
+    lower_literal(node, s)
+}
+
+fn lower_bool_lit(node: Int) -> Int ! Diag.Report {
+    if node_int_val(node) != 0 { return lower_literal(node, "1") }
+    lower_literal(node, "0")
+}
+
+// Every string is an interpolation node. One with no hole is a constant; one with a hole
+// needs a conversion per hole, which is not built yet.
+fn lower_string(node: Int) -> Int ! Diag.Report {
+    let parts = node_elements(node)
+    if !x_all_literal(parts) { return x_not_built(node) }
+    lower_literal(node, c_string_literal(x_joined(parts)))
+}
+
+fn lower_literal(node: Int, literal: Str) -> Int ! Diag.Report {
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    ir_const(tid, node, rec.c_spelling, literal)
+}
+
+// ── Names ─────────────────────────────────────────────────────────────────
+
+// A bare name is a read of a binder the statement stage put in scope. A name that is not
+// in scope is a module global or a constructor, and neither is built yet, so it is
+// refused rather than spelled as a local that does not exist.
+fn lower_ident(node: Int) -> Int ! Diag.Report {
+    let name = node_name(node)
+    if tid_of_binder(current_binder_scope(), name) < 0 { return x_not_built(node) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    ir_var_ref(tid, node, rec.c_spelling, c_local_name(name), rec.slot_form)
+}
+
+// ── Layout ────────────────────────────────────────────────────────────────
+
+// The shape of a value in hand. A decline here means monomorphisation left a type codegen
+// cannot spell, so it is an internal error and the caller stops.
+fn x_local(tid: Int, node: Int) -> LayoutRecord ! Diag.Report {
+    let rec = layout_of(tid, Position.Local)
+    if rec.decline_reason != "" {
+        let why = "expression has no C layout: {rec.decline_reason}"
+        diag_ice_at("UnspellableExprType", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
+            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    }
+    rec
+}
+
+// Only a declined layout has an empty spelling, so this is the one stop signal.
+fn x_stopped(rec: LayoutRecord) -> Bool {
+    rec.c_spelling == ""
+}
+
+// ── Parts ─────────────────────────────────────────────────────────────────
+
+// A literal part carries the same text as name and value; a hole does not.
+fn x_is_literal_part(part: Int) -> Bool {
+    if nk_of(node_kind(part)) != NodeKind.Ident { return false }
+    node_str_val(part) == node_name(part)
+}
+
+fn x_all_literal(parts: Int) -> Bool {
+    if parts < 0 { return true }
+    let mut i = 0
+    while i < sublist_length(parts) {
+        if !x_is_literal_part(sublist_get(parts, i)) { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn x_joined(parts: Int) -> Str {
+    if parts < 0 { return "" }
+    let mut sb = StringBuilder.new()
+    let mut i = 0
+    while i < sublist_length(parts) {
+        sb.write(node_str_val(sublist_get(parts, i)))
+        i = i + 1
+    }
+    sb.to_str()
+}
+
+// ── Refusal ───────────────────────────────────────────────────────────────
+
+fn x_not_built(node: Int) -> Int ! Diag.Report {
     diag_ice_stage_not_built("cg_expr", node)
+    -1
 }
