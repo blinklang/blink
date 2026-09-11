@@ -11,14 +11,19 @@
 // typedef names it, so a declaration is emitted only after every nominal type its
 // members reach by value.
 
-import diagnostics.{Diag, diag_ice, diag_ice_stage_not_built, UNSOLVED_TYPEVAR_AT_CODEGEN}
+import diagnostics.{
+    Diag, diag_ice, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
+    UNSOLVED_TYPEVAR_AT_CODEGEN,
+}
 import layout.{
     LayoutRecord, Position, layout_of, field_layout_of, ensure_typedef_for,
     layout_take_typedefs, tid_of_node,
 }
 import cname.{
-    c_ev_type_name, c_ffi_symbol, c_field_name, c_fn_decl_name, c_global_name,
-    c_impl_method_name, c_local_name, c_type_decl_name, c_variant_tag_macro,
+    c_ev_field_name, c_ev_type_name, c_ffi_symbol, c_field_name, c_fn_decl_name,
+    c_global_name, c_vtable_type_name,
+    c_impl_method_name, c_local_name, c_type_decl_name, c_variant_ordinal,
+    c_variant_tag_macro,
     cname_is_runtime_owned, td_guard_name,
 }
 import cg_print.{
@@ -33,8 +38,8 @@ import cg_reg.{
 import typecheck.{
     TyKind, tc_enum_variant_slots, tc_evar_field_slots, tc_evar_name, tc_evfield_name,
     tc_evfield_tid, tc_resolve, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
-    tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind, tc_type_str,
-    tc_void_tid,
+    make_handler_type, tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind,
+    tc_type_str, tc_void_tid,
 }
 import parser.{
     get_annotation, node_effects, node_fields, node_impl_binders, node_name, node_params,
@@ -188,6 +193,7 @@ fn emit_enum(decl: Int, tid: Int, guard: Str, c_name: Str) ! Diag.Report {
     let mut names: List[Str] = []
     let mut fields: List[List[Str]] = []
     let mut macros: List[Str] = []
+    let mut ordinals: List[Str] = []
     let mut carries_data = false
     let mut i = 0
     while i < slots.len() {
@@ -199,11 +205,10 @@ fn emit_enum(decl: Int, tid: Int, guard: Str, c_name: Str) ! Diag.Report {
         names.push(tc_evar_name(slot))
         fields.push(decls)
         macros.push(c_variant_tag_macro(decl, vnode))
+        ordinals.push(c_variant_ordinal(decl, vnode))
         i += 1
     }
     if !carries_data {
-        let mut ordinals: List[Str] = []
-        for n in names { ordinals.push("{c_name}_{n}") }
         print_simple_enum_typedef(guard, c_name, ordinals)
         return
     }
@@ -233,7 +238,13 @@ fn variant_field_decls(owner: Int, var_slot: Int) -> List[Str] ! Diag.Report {
 // the exception in both directions: the shim always passes it one, and an FFI extern binds
 // a C function that knows nothing about evidence. Which node is the entry point is the
 // registry's answer, not a name compare: an impl method may be named `main` too.
-fn fn_takes_ev(fn_node: Int) -> Bool {
+//
+// This is published because it is an ABI fact, not a private detail of printing: a call
+// site must pass exactly the arguments the printed signature takes, and the driver must
+// know which signatures name a vector the stdlib archive does not define. A second copy
+// of the rule is an arity mismatch waiting to happen, found by the C compiler rather than
+// by this one.
+pub fn cg_decl_takes_ev(fn_node: Int) -> Bool {
     if get_annotation(fn_node, "ffi") != -1 { return false }
     if fn_node == cg_reg_entry_point() { return true }
     let sl = node_effects(fn_node)
@@ -302,13 +313,13 @@ pub fn cg_decl_emit_fn_decl(fn_node: Int, is_static: Bool) ! Diag.Report {
 pub fn cg_decl_emit_signature_decl(fn_node: Int, name: Str, is_static: Bool) ! Diag.Report {
     let ret = fn_ret_spelling(fn_node)
     let params = fn_param_decls(fn_node)
-    print_fn_decl(is_static, ret, name, params, fn_takes_ev(fn_node))
+    print_fn_decl(is_static, ret, name, params, cg_decl_takes_ev(fn_node))
 }
 
 pub fn cg_decl_emit_signature_def(fn_node: Int, name: Str, is_static: Bool, body: Int) ! Diag.Report {
     let ret = fn_ret_spelling(fn_node)
     let params = fn_param_decls(fn_node)
-    print_fn(is_static, ret, name, params, fn_takes_ev(fn_node), body)
+    print_fn(is_static, ret, name, params, cg_decl_takes_ev(fn_node), body)
 }
 
 pub fn cg_decl_emit_fn_decls() ! Diag.Report {
@@ -433,15 +444,33 @@ pub fn cg_decl_emit_epilogue(header_guard: Str) {
 // unit that owns it, "static " for a single unit, "extern " for a unit that only refers
 // to it.
 //
-// A user-declared effect appends a vtable pointer to the vector and needs a default
-// vtable and a default body per operation. None of that is written yet, and a vector
-// that silently dropped the field would miscompile every handler of that effect, so the
-// gap reports instead.
+// A user-declared effect takes a slot of its own, after the eight builtin fields. The
+// order is the printer's, and it is what lets the stdlib archive be compiled against a
+// vector that stops at the builtins and still read the same field at the same offset.
+//
+// The vtable type that slot points at, and the default instance the default vector takes
+// its address of, are still to come, along with a default body per operation. The slot is
+// emitted anyway: a vector that dropped the field would put every later field at the
+// wrong offset, which miscompiles silently, where a missing vtable is named here.
 pub fn cg_decl_emit_ev(ev_storage: Str) ! Diag.Report {
     let effects = cg_reg_effect_decls()
-    if effects.len() > 0 {
-        diag_ice_stage_not_built("cg_decl user effects", effects.get(0).unwrap())
-        return
+    let mut vtables: List[Str] = []
+    let mut fields: List[Str] = []
+    for e in effects {
+        let slot_tid = make_handler_type(node_name(e))
+        let vtable = c_vtable_type_name(slot_tid)
+        let field = c_ev_field_name(slot_tid)
+        if diag_is_ice_seg(vtable) || diag_is_ice_seg(field) {
+            diag_ice_at("EvidenceFieldNotNameable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "no evidence field for effect '{node_name(e)}'", e,
+                "every declared effect must name a slot of the evidence vector; this is a compiler bug")
+            return
+        }
+        vtables.push(vtable)
+        fields.push(field)
     }
-    print_ev(td_guard_name(c_ev_type_name()), [], [], ev_storage)
+    print_ev(td_guard_name(c_ev_type_name()), vtables, fields, ev_storage)
+    if effects.len() > 0 {
+        diag_ice_stage_not_built("cg_decl user effect vtables", effects.get(0).unwrap())
+    }
 }
