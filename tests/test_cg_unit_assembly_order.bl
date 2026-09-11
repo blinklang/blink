@@ -4,7 +4,7 @@ import typecheck.{check_types}
 import layout.{layout_reset}
 import cname.{cname_reset, c_archive_header_guard, c_module_header_guard}
 import cg.{CgConfig, generate, generate_archive_header, generate_module_header, enumerate_program_modules}
-import parser.{node_fields, node_set_module, node_stmts, sublist_get, sublist_length}
+import parser.{node_fields, node_methods, node_params, node_set_module, node_stmts, sublist_get, sublist_length}
 import compiler.{compile_to_program}
 
 fn assert_eq_int(label: Str, got: Int, want: Int) {
@@ -123,4 +123,100 @@ test "the module list keeps first-seen order" {
     assert_eq_int("module count", modules.len(), 2)
     assert_eq(modules.get(0).unwrap(), "probe.earlier")
     assert_eq(modules.get(1).unwrap(), "probe.later")
+}
+
+// The archive is one shared object for every program that links it, so a function whose
+// body reads the program's own evidence cannot live there. Those functions are compiled
+// into the user's translation unit instead, and the archive header must not declare
+// them: it does not even define the evidence vector type their signature names.
+fn effects_probe_src() -> Str {
+    #"type Unit { z: Int }
+
+trait Says { fn say(self) -> Int ! IO }
+
+impl Says for Unit {
+    fn say(self) -> Int ! IO { self.z }
+}
+
+trait Counts { fn count(self) -> Int }
+
+impl Counts for Unit {
+    fn count(self) -> Int { self.z }
+}
+
+fn pure_one(a: Int) -> Int { a }
+fn speaks(a: Int) -> Int ! IO { a }
+fn quiet() -> Handler[IO.Print] {
+    handler IO.Print {
+        fn print(msg: Str) {}
+    }
+}
+fn main() { assert(pure_one(1) == 1) }
+"#
+}
+
+fn effects_probe(name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    write_file(path, effects_probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    program
+}
+
+test "the archive header leaves out the functions the user unit owns" {
+    let program = effects_probe("cg_unit_archive_effects_probe")
+    let text = generate_archive_header(program, standalone_cfg())
+    let _ = find_at(text, "blink_u_pure_one")
+    assert_lacks(text, "blink_u_speaks")
+}
+
+// One archive serves many programs, each with its own entry point. The archive build
+// synthesizes a main just to pull every module into one unit, and that main must not
+// reach the header a user program includes.
+test "the archive header leaves out the entry point" {
+    let program = effects_probe("cg_unit_archive_main_probe")
+    let text = generate_archive_header(program, standalone_cfg())
+    assert_lacks(text, "blink_main")
+}
+
+// What keeps a function out of the shared archive is the evidence vector in its own
+// signature, which is what a declared effect puts there. A function that merely BUILDS a
+// handler declares no effect and takes no evidence, so the archive keeps it: it is the
+// only way a user program gets hold of the handler at all.
+test "the archive header keeps a function that returns a handler" {
+    let program = effects_probe("cg_unit_archive_handler_probe")
+    let text = generate_archive_header(program, standalone_cfg())
+    let _ = find_at(text, "blink_u_quiet")
+}
+
+// A user unit is linked against the archive, so it declares the archived modules rather
+// than compiling them again — except for the evidence-bound ones the archive could not
+// hold. Being archived is not reason enough to drop those: the user's unit is the only
+// place left that can compile them, and a unit that declares neither cannot link.
+fn user_tu_cfg(archived: Str) -> CgConfig {
+    let mut skip: Map[Str, Int] = Map()
+    skip.insert(archived, 1)
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: skip, user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+test "a user unit keeps the archived module's evidence-bound functions" {
+    let program = effects_probe("cg_unit_user_tu_keep_probe")
+    stamp_module(node_params(program), "probe_archived")
+    stamp_module(node_methods(program), "probe_archived")
+    let text = generate(program, user_tu_cfg("probe_archived"))
+    let _ = find_at(text, "blink_probe_archived_speaks")
+    assert_lacks(text, "blink_probe_archived_pure_one")
+}
+
+test "a user unit keeps the archived module's evidence-bound impl methods" {
+    let program = effects_probe("cg_unit_user_tu_keep_method_probe")
+    stamp_module(node_params(program), "probe_archived")
+    stamp_module(node_methods(program), "probe_archived")
+    let text = generate(program, user_tu_cfg("probe_archived"))
+    let _ = find_at(text, "_Unit_Says_say")
+    assert_lacks(text, "_Unit_Counts_count")
 }

@@ -1,0 +1,86 @@
+import std.fs
+import std.io
+import typecheck.{check_types}
+import layout.{layout_reset}
+import cname.{cname_reset}
+import diagnostics.{diag_ice_count}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_decl.{cg_decl_reset, cg_decl_emit_fn_decls}
+import cg.{CgConfig, generate}
+import compiler.{compile_to_program}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output must not have '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    program
+}
+
+fn generic_src() -> Str {
+    #"fn ident[T](x: T) -> T { x }
+fn plain(x: Int) -> Int { x }
+fn main() { assert(plain(ident(1)) == 1) }
+"#
+}
+
+fn test_block_src() -> Str {
+    #"test "a case" { assert_eq(1, 1) }
+"#
+}
+
+fn standalone_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+// A generic function is a template, not a function. Only its instances have a C
+// signature, so spelling the base would ask the reading layer for the C type of a free
+// type variable and get a decline it must report as a compiler bug.
+test "a generic function base gets no C declaration" {
+    let _ = build_probe(generic_src(), "cg_decl_generic_base_probe")
+    let before = diag_ice_count
+    cg_decl_emit_fn_decls()
+    let text = print_take()
+    assert_eq_int("ice raised", diag_ice_count - before, 0)
+    assert_has(text, "blink_u_plain")
+    assert_lacks(text, "blink_u_ident")
+}
+
+// A test block is a function body. Until bodies are lowered, an entry shim that calls
+// the test runner would name a runner this unit never defines, so the gap reports.
+test "a unit with test blocks reports the unbuilt stage" {
+    let program = build_probe(test_block_src(), "cg_decl_test_block_probe")
+    let before = diag_ice_count
+    let _ = generate(program, standalone_cfg())
+    assert(diag_ice_count - before > 0)
+}
