@@ -20,6 +20,7 @@ import parser.{
     get_annotation, sublist_get, sublist_length,
 }
 import ast.{NodeKind}
+import mono.{instances, node_tid_for_inst}
 import diagnostics.{diag_ice_at, diag_is_ice_seg, UNSOLVED_TYPEVAR_AT_CODEGEN}
 import cname.{
     c_typedef_name, c_type_decl_name, c_seg_inner, c_vtable_type_name, c_kops_table_name,
@@ -76,6 +77,7 @@ pub fn layout_reset() {
     binder_entry_frame = []
     binder_entry_name = []
     binder_entry_tid = []
+    lo_current_inst = -1
 }
 
 // ── The eight questions ───────────────────────────────────────────────────
@@ -123,15 +125,43 @@ pub fn child_tid(tid: Int, slot: Slot) -> Int {
     }
 }
 
+// The monomorphised body being lowered. -1 is the root walk, whose nodes carry the types
+// typecheck stamped; any other value indexes the instance table, where the same node
+// carries the substituted type instead. The driver is the only caller, and it sets -1
+// again on the way out of an instance body: a declaration node belongs to no instance, so
+// reading one while an instance is current is an error rather than an answer. A lowering
+// stage asks tid_of_node and never needs to know which of the two answers it is getting.
+let mut lo_current_inst: Int = -1
+
+pub fn set_current_inst(inst_index: Int) {
+    lo_current_inst = inst_index
+}
+
 // A node with no recorded type is a compiler bug; report it and answer -1 so the caller
 // can stop. Nothing here ever substitutes a default type.
 pub fn tid_of_node(node: Int) -> Int ! Diag.Report {
+    if lo_current_inst != -1 { return lo_tid_in_current_inst(node) }
     let tid = tc_lookup_node_tid(node)
     if tid >= 0 { return tid }
     diag_ice_at("NoTypeForNode", UNSOLVED_TYPEVAR_AT_CODEGEN,
         "node {node} reached layout with no recorded type", node,
         "typecheck must stamp every node codegen reads; this is a compiler bug")
     -1
+}
+
+// Inside an instance the substituted type is the only right answer, so a node the
+// instance never recorded is an internal error rather than a read of the generic stamp.
+// Only -1 means the root walk; any other number that is not a row of the table is a
+// driver bug, and answering the generic stamp for it would be a silent wrong type.
+fn lo_tid_in_current_inst(node: Int) -> Int ! Diag.Report {
+    let table = instances()
+    if lo_current_inst < 0 || lo_current_inst >= table.len() {
+        diag_ice_at("NoInstanceForIndex", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "instance {lo_current_inst} is not in the instance table", node,
+            "the driver must set the current instance from the table it is walking")
+        return -1
+    }
+    node_tid_for_inst(table.get(lo_current_inst).unwrap(), node)
 }
 
 pub fn tid_of_binder(scope: Int, name: Str) -> Int {
@@ -192,6 +222,101 @@ pub fn layout_take_typedefs() -> List[Str] {
     let out = typedef_buffer
     typedef_buffer = []
     out
+}
+
+// What one carrier slot physically holds. This is NOT the slot's own Local layout:
+// an Option payload that does not fit a word is stored by pointer, a Result ok arm is
+// always by value, a Result err arm is by pointer only for a non-word struct, and every
+// tuple element is by value. A Void or Ptr payload is erased the same way the typedef
+// emitter erases it, so a wrap and the typedef always agree on the member's type.
+pub fn carrier_member_layout(carrier_tid: Int, slot: Slot) -> LayoutRecord {
+    let reason = lo_decline_reason_of(carrier_tid)
+    if reason != "" { return lo_declined(reason) }
+    let r = lo_res(carrier_tid)
+    let inner = child_tid(r, slot)
+    if inner < 0 { return lo_declined("carrier of kind {tk_name(tc_tid_kind(r))} has no such member slot") }
+    let inner_reason = lo_decline_reason_of(inner)
+    if inner_reason != "" { return lo_declined(inner_reason) }
+    let ir = lo_res(inner)
+    let spelling = lo_member_spelling(ir)
+    if diag_is_ice_seg(spelling) { return lo_declined("cname refused the name: {spelling}") }
+    lo_member_record(r, ir, slot, spelling)
+}
+
+fn lo_member_record(r: Int, ir: Int, slot: Slot, spelling: Str) -> LayoutRecord {
+    let boxed = lo_member_is_boxed(r, ir, slot)
+    let mut form = SlotForm.Inline
+    if boxed {
+        form = SlotForm.PointerBoxed
+    } else if lo_fits_word(ir) {
+        form = SlotForm.InlineWord
+    }
+    let mut member = spelling
+    if boxed { member = "{spelling}*" }
+    LayoutRecord {
+        c_spelling: member,
+        slot_form: form,
+        carrier_tag: lo_tag_of(ir),
+        is_transparent: if lo_is_transparent_newtype(ir) { 1 } else { 0 },
+        kops_table: lo_kops_of(ir),
+        decline_reason: "",
+    }
+}
+
+fn lo_member_is_boxed(r: Int, ir: Int, slot: Slot) -> Bool {
+    let k = tc_tid_kind(r)
+    if k == TyKind.Option { return !lo_fits_word(ir) }
+    if k != TyKind.Result { return false }
+    match slot {
+        Slot.Inner2 => lo_is_struct_by_pointer_err(ir)
+        _ => false
+    }
+}
+
+// ── The varargs boundary ──────────────────────────────────────────────────
+
+// A value crossing `...` is not stored, it is converted, so this is a separate question
+// from layout_of. C promotes every integer argument to at least int and every float to
+// double, and the promoted type must match the conversion the format string names, or
+// the read is undefined. `long long` is that ABI width, not a storage spelling, which is
+// why it appears here and in no layout record.
+//
+// An empty spelling means the value passes unchanged. An empty spec means this tid has no
+// printf form at all and the caller must render it some other way.
+pub fn varargs_spelling(tid: Int) -> Str {
+    let reason = lo_decline_reason_of(tid)
+    if reason != "" { return "" }
+    let r = lo_res(tid)
+    if lo_is_transparent_newtype(r) { return "long long" }
+    let k = tc_tid_kind(r)
+    if lo_spec_is_signed(k) { return "long long" }
+    if lo_spec_is_unsigned(k) { return "unsigned long long" }
+    ""
+}
+
+pub fn format_spec_of(tid: Int) -> Str {
+    let reason = lo_decline_reason_of(tid)
+    if reason != "" { return "" }
+    let r = lo_res(tid)
+    if lo_is_transparent_newtype(r) { return "%lld" }
+    let k = tc_tid_kind(r)
+    if lo_spec_is_signed(k) { return "%lld" }
+    if lo_spec_is_unsigned(k) { return "%llu" }
+    if k == TyKind.Float { return "%g" }
+    if k == TyKind.Str { return "%s" }
+    if k == TyKind.Bool { return "%s" }
+    if k == TyKind.Char { return "%s" }
+    ""
+}
+
+// A transparent newtype prints as the word it is. Char is signed but never printed as a
+// number, so it is not listed here.
+fn lo_spec_is_signed(k: TyKind) -> Bool {
+    k == TyKind.Int || k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32
+}
+
+fn lo_spec_is_unsigned(k: TyKind) -> Bool {
+    k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64
 }
 
 // ── Binder scopes ─────────────────────────────────────────────────────────

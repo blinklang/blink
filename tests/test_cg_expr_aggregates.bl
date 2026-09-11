@@ -1,0 +1,109 @@
+// Tuples, structs, lists and the ways a value is read out of them.
+
+import lower_test_helpers.{probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies}
+import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid}
+import cg_expr.{lower_expr, cg_expr_pending_count}
+import layout.{layout_take_typedefs}
+
+fn src() -> Str {
+    #"type Point { x: Int, y: Int }
+type Sized { w: Int, h: Int = 7 }
+type Colour { Red, Green }
+fn main() {
+    let tup = (1, "a")
+    let first = tup.0
+    let second = tup.1
+    let p = Point { y: 2, x: 1 }
+    let px = p.x
+    let d = Sized { w: 3 }
+    let list = [1, 2, 3]
+    let red = Colour.Red
+    let base = Point { x: 1, y: 2 }
+    let moved = Point { x: 9, ..base }
+    let sbase = Sized { w: 3, h: 4 }
+    let scopy = Sized { w: 5, ..sbase }
+    let _keep = [first]
+    let _keep2 = [second]
+    let _keep3 = [px, d.w, list.len()]
+    let _keep5 = [red, Colour.Green]
+    let _keep6 = [moved.y, scopy.h]
+}
+"#
+}
+
+test "a tuple literal writes its elements in order into the tuple typedef" {
+    probe("cg_expr_agg", src())
+    let id = lower_expr(rhs_of("tup"))
+    assert_kind("kind", id, IrKind.TupleNew)
+    assert_shape("shape", id, "TupleNew(Const, Const)")
+    assert_verifies("verify", id)
+    assert(layout_take_typedefs().len() > 0)
+}
+
+test "a tuple index reads the positional member of its own element type" {
+    probe("cg_expr_agg", src())
+    let first = lower_expr(rhs_of("first"))
+    assert_kind("kind", first, IrKind.FieldGet)
+    assert_eq_str("member", ir_c_name(first), "_0")
+    assert_eq_str("type", ir_c_spelling(first), "int64_t")
+    let second = lower_expr(rhs_of("second"))
+    assert_eq_str("member", ir_c_name(second), "_1")
+    assert_eq_str("type", ir_c_spelling(second), "const char*")
+}
+
+test "a struct literal is written in declaration order, not in source order" {
+    probe("cg_expr_agg", src())
+    let id = lower_expr(rhs_of("p"))
+    assert_kind("kind", id, IrKind.StructNew)
+    assert_shape("shape", id, "StructNew(Const, Const)")
+    assert_eq_str("x first", ir_c_name(ir_kid(id, 0)), "1")
+    assert_eq_str("y second", ir_c_name(ir_kid(id, 1)), "2")
+}
+
+test "a field the literal leaves out takes the declared default" {
+    probe("cg_expr_agg", src())
+    let id = lower_expr(rhs_of("d"))
+    assert_shape("shape", id, "StructNew(Const, Const)")
+    assert_eq_str("default", ir_c_name(ir_kid(id, 1)), "7")
+}
+
+test "a struct field read names the field on the receiver" {
+    probe("cg_expr_agg", src())
+    let id = lower_expr(rhs_of("px"))
+    assert_kind("kind", id, IrKind.FieldGet)
+    assert_eq_str("member", ir_c_name(id), "x")
+    assert_shape("shape", id, "FieldGet(VarRef)")
+}
+
+test "a list literal hands its elements to the runtime constructor" {
+    probe("cg_expr_agg", src())
+    let id = lower_expr(rhs_of("list"))
+    assert_kind("kind", id, IrKind.ContainerNew)
+    assert_eq_str("ctor", ir_c_name(id), "blink_list_new")
+    assert_shape("shape", id, "ContainerNew(Const, Const, Const)")
+}
+
+test "an ordinal variant is a constant, not a field read" {
+    probe("cg_expr_agg", src())
+    let id = lower_expr(rhs_of("red"))
+    assert_kind("kind", id, IrKind.Const)
+    assert_eq_str("tag", ir_c_name(id), "blink_Colour_Red_TAG")
+    assert_eq(cg_expr_pending_count(), 0)
+}
+
+test "a spread fills every field the literal does not name, reading the source once" {
+    probe("cg_expr_agg", src())
+    let id = lower_expr(rhs_of("moved"))
+    assert_kind("kind", id, IrKind.StructNew)
+    assert_shape("shape", id, "StructNew(Const, FieldGet(VarRef))")
+    assert_eq_str("named field wins", ir_c_name(ir_kid(id, 0)), "9")
+    assert_eq_str("the rest comes from the source", ir_c_name(ir_kid(id, 1)), "y")
+    assert_eq(cg_expr_pending_count(), 1)
+}
+
+test "a spread outranks a field default, because the source's value is the one asked for" {
+    probe("cg_expr_agg", src())
+    let id = lower_expr(rhs_of("scopy"))
+    assert_shape("shape", id, "StructNew(Const, FieldGet(VarRef))")
+    assert_eq_str("h read from the source", ir_c_name(ir_kid(id, 1)), "h")
+}

@@ -1,0 +1,105 @@
+// Which of two answers `tid_of_node` gives. A generic body has one node per source line
+// but one type per instantiation, so the tid of that node depends on which instance the
+// driver says it is walking. Nothing outside layout holds that choice.
+
+import lower_test_helpers.{probe, ident_node_of, fn_decl_of, assert_eq_str, last_ice, ice_count}
+import layout.{tid_of_node, set_current_inst}
+import mono.{run_mono, instances}
+import typecheck.{tc_lookup_node_tid, TYPE_INT, TYPE_STR}
+
+// One generic function called at two types. `probe_arg` is spelled nowhere in the stdlib
+// graph, so the only Ident of that name is the body of this function.
+fn src() -> Str {
+    #"fn probe_ident[T](probe_arg: T) -> T { probe_arg }
+fn main() {
+    let _i = probe_ident(1)
+    let _s = probe_ident("s")
+}
+"#
+}
+
+// The instance numbers of one declaration, in table order. Other generic code in the
+// stdlib graph is instantiated too, so the table is filtered by the declaration itself.
+fn insts_of(decl: Int) -> List[Int] {
+    let table = instances()
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < table.len() {
+        if table.get(i).unwrap().base_decl_node == decl { out.push(i) }
+        i = i + 1
+    }
+    out
+}
+
+test "the root walk answers the type typecheck stamped" {
+    probe("layout_inst", src())
+    let body = ident_node_of("probe_arg")
+    set_current_inst(-1)
+    assert_eq(tid_of_node(body), tc_lookup_node_tid(body))
+}
+
+test "an instance answers the substituted type, not the generic stamp" {
+    let program = probe("layout_inst", src())
+    run_mono(program)
+    let body = ident_node_of("probe_arg")
+    let insts = insts_of(fn_decl_of("probe_ident"))
+    assert_eq(insts.len(), 2)
+    let mut seen_int = 0
+    let mut seen_str = 0
+    let mut i = 0
+    while i < insts.len() {
+        set_current_inst(insts.get(i).unwrap())
+        let tid = tid_of_node(body)
+        if tid == TYPE_INT { seen_int = seen_int + 1 }
+        if tid == TYPE_STR { seen_str = seen_str + 1 }
+        i = i + 1
+    }
+    set_current_inst(-1)
+    assert_eq(seen_int, 1)
+    assert_eq(seen_str, 1)
+}
+
+test "a node the current instance never recorded is an internal error, not the raw stamp" {
+    let program = probe("layout_inst", src())
+    run_mono(program)
+    let insts = insts_of(fn_decl_of("probe_ident"))
+    assert(insts.len() > 0)
+    // The callee name in `main`, which belongs to no instance body.
+    let outsider = ident_node_of("probe_ident")
+    set_current_inst(insts.get(0).unwrap())
+    let before = ice_count()
+    let answer = tid_of_node(outsider)
+    set_current_inst(-1)
+    assert(answer < 0)
+    assert(ice_count() > before)
+    assert_eq_str("ice", last_ice(), "MonoNodeNotInInstance")
+}
+
+// Only -1 selects the root walk. A driver that computed an index and got some other
+// negative number must be told, because answering the generic stamp there would be a
+// wrong type nothing reports.
+test "a negative instance number other than -1 is an internal error" {
+    let program = probe("layout_inst", src())
+    run_mono(program)
+    let body = ident_node_of("probe_arg")
+    set_current_inst(-2)
+    let before = ice_count()
+    let answer = tid_of_node(body)
+    set_current_inst(-1)
+    assert(answer < 0)
+    assert(ice_count() > before)
+    assert_eq_str("ice", last_ice(), "NoInstanceForIndex")
+}
+
+test "an instance number past the table is an internal error, not a silent root walk" {
+    let program = probe("layout_inst", src())
+    run_mono(program)
+    let body = ident_node_of("probe_arg")
+    set_current_inst(instances().len() + 1)
+    let before = ice_count()
+    let answer = tid_of_node(body)
+    set_current_inst(-1)
+    assert(answer < 0)
+    assert(ice_count() > before)
+    assert_eq_str("ice", last_ice(), "NoInstanceForIndex")
+}

@@ -1,0 +1,77 @@
+// Interpolation: one runtime format call, with the conversion and the promotion that each
+// hole's type requires.
+
+import lower_test_helpers.{probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies}
+import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid, ir_kid_count}
+import cg_expr.{lower_expr, cg_expr_take_pending, cg_expr_pending_count}
+
+fn src() -> Str {
+    #"fn main() {
+    let n = 7
+    let w: U8 = 3
+    let f = 1.5
+    let s = "x"
+    let c = 'q'
+    let b = true
+    let ints = "n is {n}"
+    let mixed = "{s}/{f}"
+    let narrow = "{w}"
+    let chars = "{c}"
+    let bools = "{b}"
+    let pct = "100% of {n}"
+    let _keep = [ints, mixed, narrow, chars, bools, pct]
+}
+"#
+}
+
+test "an Int hole is one format call whose argument is promoted to the varargs width" {
+    probe("cg_expr_interp", src())
+    let id = lower_expr(rhs_of("ints"))
+    assert_kind("kind", id, IrKind.CallRuntime)
+    assert_eq_str("symbol", ir_c_name(id), "blink_str_format")
+    assert_eq_str("format", ir_c_name(ir_kid(id, 0)), #""n is %lld""#)
+    assert_kind("promotion", ir_kid(id, 1), IrKind.Cast)
+    assert_eq_str("width", ir_c_spelling(ir_kid(id, 1)), "long long")
+    assert_verifies("verify", id)
+}
+
+test "a Str hole passes through and a Float hole takes the float conversion" {
+    probe("cg_expr_interp", src())
+    let id = lower_expr(rhs_of("mixed"))
+    assert_eq_str("format", ir_c_name(ir_kid(id, 0)), #""%s/%g""#)
+    assert_kind("str arg", ir_kid(id, 1), IrKind.VarRef)
+    assert_kind("float arg", ir_kid(id, 2), IrKind.VarRef)
+}
+
+test "a narrow unsigned hole takes the unsigned conversion and width" {
+    probe("cg_expr_interp", src())
+    let id = lower_expr(rhs_of("narrow"))
+    assert_eq_str("format", ir_c_name(ir_kid(id, 0)), #""%llu""#)
+    assert_eq_str("width", ir_c_spelling(ir_kid(id, 1)), "unsigned long long")
+}
+
+test "a Char hole is rendered by the runtime, because a code point is not a string" {
+    probe("cg_expr_interp", src())
+    let id = lower_expr(rhs_of("chars"))
+    assert_eq_str("format", ir_c_name(ir_kid(id, 0)), #""%s""#)
+    assert_kind("arg", ir_kid(id, 1), IrKind.CallRuntime)
+    assert_eq_str("symbol", ir_c_name(ir_kid(id, 1)), "blink_char_to_str")
+}
+
+test "a Bool hole becomes a text temp an if fills, since C has no conditional node here" {
+    probe("cg_expr_interp", src())
+    let id = lower_expr(rhs_of("bools"))
+    assert_eq_str("format", ir_c_name(ir_kid(id, 0)), #""%s""#)
+    assert_kind("arg", ir_kid(id, 1), IrKind.VarRef)
+    let pending = cg_expr_take_pending()
+    assert_eq(pending.len(), 2)
+    assert_kind("temp", pending.get(0).unwrap(), IrKind.Let)
+    assert_shape("branch", pending.get(1).unwrap(), "If(VarRef, Block(Assign(VarRef, Const)))")
+}
+
+test "a per cent sign in literal text is doubled so the formatter reads it as data" {
+    probe("cg_expr_interp", src())
+    let id = lower_expr(rhs_of("pct"))
+    assert_eq_str("format", ir_c_name(ir_kid(id, 0)), #""100%% of %lld""#)
+    assert_eq(ir_kid_count(id), 2)
+}
