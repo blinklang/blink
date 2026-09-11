@@ -17,8 +17,9 @@ import layout.{
     layout_take_typedefs, tid_of_node,
 }
 import cname.{
-    c_ev_type_name, c_fn_decl_name, c_global_name, c_safe_name, c_type_decl_name,
-    c_variant_tag_macro, cname_is_runtime_owned, td_guard_name,
+    c_ev_type_name, c_ffi_symbol, c_fn_decl_name, c_global_name, c_impl_method_name,
+    c_safe_name, c_type_decl_name, c_variant_tag_macro, cname_is_runtime_owned,
+    td_guard_name,
 }
 import cg_print.{
     print_ev, print_epilogue, print_fn_decl, print_global_decl, print_prologue,
@@ -26,8 +27,8 @@ import cg_print.{
     print_typedef_blocks,
 }
 import cg_reg.{
-    cg_reg_effect_decls, cg_reg_fn_decls, cg_reg_global_decls, cg_reg_tid_for_decl,
-    cg_reg_type_decls,
+    cg_reg_effect_decls, cg_reg_entry_point, cg_reg_fn_decls, cg_reg_global_decls,
+    cg_reg_impl_methods, cg_reg_impl_of, cg_reg_tid_for_decl, cg_reg_type_decls,
 }
 import typecheck.{
     TyKind, tc_enum_variant_slots, tc_evar_field_slots, tc_evar_name, tc_evfield_name,
@@ -36,8 +37,8 @@ import typecheck.{
     tc_void_tid,
 }
 import parser.{
-    get_annotation, node_effects, node_fields, node_name, node_params, node_type_ann,
-    node_type_params, node_value, sublist_get, sublist_length,
+    get_annotation, node_effects, node_fields, node_impl_binders, node_name, node_params,
+    node_type_ann, node_type_params, node_value, sublist_get, sublist_length,
 }
 
 // 1 while a declaration's dependencies are being emitted, 2 once its typedef is written.
@@ -70,13 +71,20 @@ pub fn cg_decl_emit_typedefs() ! Diag.Report {
     for decl in cg_reg_type_decls() { emit_type_decl(decl) }
 }
 
+// A generic declaration is a template. Only its instances have a C spelling, so asking
+// the reading layer for the base's types would ask for the C type of a free type
+// variable and get a decline this stage must report as a compiler bug.
+fn is_generic_base(decl: Int) -> Bool {
+    let tps = node_type_params(decl)
+    tps != -1 && sublist_length(tps) > 0
+}
+
 // A declaration whose C typedef this translation unit does not write: a generic base
 // (mono writes one typedef per instance), an alias (it has no storage of its own), an
 // opaque foreign handle (the foreign header declares the pointee) and a type whose
 // typedef lives in runtime.h.
 fn skips_typedef(decl: Int) -> Bool {
-    let tps = node_type_params(decl)
-    if tps != -1 && sublist_length(tps) > 0 { return true }
+    if is_generic_base(decl) { return true }
     if node_fields(decl) == -1 && node_value(decl) != -1 { return true }
     if get_annotation(decl, "ffi.opaque") != -1 { return true }
     cname_is_runtime_owned(decl)
@@ -221,12 +229,13 @@ fn variant_field_decls(owner: Int, var_slot: Int) -> List[Str] ! Diag.Report {
 // parameter node and the return annotation node, so those are what the spelling gate
 // reads. A function with no return annotation returns void.
 
-// A declared effect is what puts the evidence vector in the signature. main is the
-// exception in both directions: the shim always passes it one, and an FFI extern binds a
-// C function that knows nothing about evidence.
+// A declared effect is what puts the evidence vector in the signature. The entry point is
+// the exception in both directions: the shim always passes it one, and an FFI extern binds
+// a C function that knows nothing about evidence. Which node is the entry point is the
+// registry's answer, not a name compare: an impl method may be named `main` too.
 fn fn_takes_ev(fn_node: Int) -> Bool {
     if get_annotation(fn_node, "ffi") != -1 { return false }
-    if node_name(fn_node) == "main" { return true }
+    if fn_node == cg_reg_entry_point() { return true }
     let sl = node_effects(fn_node)
     if sl == -1 { return false }
     sublist_length(sl) > 0
@@ -237,6 +246,7 @@ fn fn_takes_ev(fn_node: Int) -> Bool {
 fn fn_ret_spelling(fn_node: Int) -> Str ! Diag.Report {
     let ann = node_type_ann(fn_node)
     let tid = if ann == -1 { tc_void_tid() } else { tid_of_node(ann) }
+    flush_member_typedefs(tid)
     cg_decl_require_spelling(tid, Position.Return)
 }
 
@@ -247,6 +257,7 @@ fn fn_param_decls(fn_node: Int) -> List[Str] ! Diag.Report {
     let mut i = 0
     while i < sublist_length(sl) {
         let p = sublist_get(sl, i)
+        flush_member_typedefs(tid_of_node(p))
         let spelling = cg_decl_require_spelling(tid_of_node(p), Position.Param)
         out.push("{spelling} {c_safe_name(node_name(p))}")
         i = i + 1
@@ -254,13 +265,64 @@ fn fn_param_decls(fn_node: Int) -> List[Str] ! Diag.Report {
     out
 }
 
+// A foreign binding is reached through a C wrapper under the Blink name. When that
+// wrapper would carry the foreign symbol's own name there is no wrapper at all: the
+// call goes straight to the foreign function, whose own header declares it. A second
+// prototype guessed from the Blink signature loses the qualifiers that header spells,
+// and C rejects the mismatch. The name the wrapper would carry is the caller's to say:
+// a free function and an impl method spell it differently.
+fn needs_no_wrapper(fn_node: Int, decl_name: Str) -> Bool {
+    let symbol = c_ffi_symbol(fn_node)
+    symbol != "" && symbol == decl_name
+}
+
+// A carrier type has no declaration of its own, so the only thing that asks for it is
+// the signature that names it. Spelling it records its typedef, which must be written
+// before the declaration that reads it, so the spellings are taken first.
 pub fn cg_decl_emit_fn_decl(fn_node: Int, is_static: Bool) ! Diag.Report {
-    print_fn_decl(is_static, fn_ret_spelling(fn_node), c_fn_decl_name(fn_node),
-        fn_param_decls(fn_node), fn_takes_ev(fn_node))
+    // A foreign binding is the exception to the generic-base rule: a foreign symbol has
+    // one address, so a binding over it has one wrapper however many binders its Blink
+    // signature carries. Those binders may only reach types whose C spelling does not
+    // depend on them, and a spelling that does depend on one is reported, not guessed.
+    if is_generic_base(fn_node) && c_ffi_symbol(fn_node) == "" { return }
+    let name = c_fn_decl_name(fn_node)
+    if needs_no_wrapper(fn_node, name) { return }
+    let ret = fn_ret_spelling(fn_node)
+    let params = fn_param_decls(fn_node)
+    print_fn_decl(is_static, ret, name, params, fn_takes_ev(fn_node))
 }
 
 pub fn cg_decl_emit_fn_decls() ! Diag.Report {
     for f in cg_reg_fn_decls() { cg_decl_emit_fn_decl(f, false) }
+}
+
+// ── Impl method declarations ─────────────────────────────────────────────────
+//
+// An impl method is a plain C function that takes the receiver first. Typecheck stamps
+// the `self` parameter node with the receiver's type id exactly as it stamps every other
+// parameter, so the signature needs nothing the free-function path does not already have.
+// Only the name differs: it carries the receiver type and the trait.
+
+// A generic impl block is a template over its binders. Its methods have a C spelling only
+// once a receiver type is chosen, which is one monomorphized instance per choice.
+fn impl_is_generic(im: Int) -> Bool {
+    let binders = node_impl_binders(im)
+    binders != -1 && sublist_length(binders) > 0
+}
+
+pub fn cg_decl_emit_impl_method_decl(method: Int, is_static: Bool) ! Diag.Report {
+    let im = cg_reg_impl_of(method)
+    if im < 0 { return }
+    if impl_is_generic(im) || is_generic_base(method) { return }
+    let name = c_impl_method_name(im, node_name(method))
+    if needs_no_wrapper(method, name) { return }
+    let ret = fn_ret_spelling(method)
+    let params = fn_param_decls(method)
+    print_fn_decl(is_static, ret, name, params, fn_takes_ev(method))
+}
+
+pub fn cg_decl_emit_impl_method_decls() ! Diag.Report {
+    for m in cg_reg_impl_methods() { cg_decl_emit_impl_method_decl(m, false) }
 }
 
 // ── Globals ──────────────────────────────────────────────────────────────────
@@ -270,6 +332,7 @@ pub fn cg_decl_emit_fn_decls() ! Diag.Report {
 
 pub fn cg_decl_emit_globals(is_extern: Bool) ! Diag.Report {
     for g in cg_reg_global_decls() {
+        flush_member_typedefs(tid_of_node(g))
         let spelling = cg_decl_require_spelling(tid_of_node(g), Position.Local)
         print_global_decl(spelling, c_global_name(g), is_extern)
     }

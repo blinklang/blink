@@ -1,0 +1,137 @@
+import std.fs
+import std.io
+import typecheck.{check_types}
+import layout.{layout_reset}
+import cname.{cname_reset}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_decl.{cg_decl_reset, cg_decl_emit_impl_method_decls, cg_decl_emit_typedefs}
+import compiler.{compile_to_program}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output must not have '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+fn assert_precedes(text: Str, first: Str, second: Str) {
+    let a = text.index_of(first)
+    let b = text.index_of(second)
+    if a < 0 || b < 0 || a >= b {
+        io.println("FAIL: '{first}' must come before '{second}'\n--- output ---\n{text}")
+    }
+    assert(a >= 0)
+    assert(b >= 0)
+    assert(a < b)
+}
+
+fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    program
+}
+
+fn impl_src() -> Str {
+    #"type Point { x: Int, y: Int }
+
+type Box[T] { v: T }
+
+trait Shown { fn show(self) -> Str }
+
+trait Shifted { fn shifted(self, d: Int) -> Point }
+
+trait Held { fn held(self) -> Option[Int] }
+
+trait Sz { fn sz(self) -> Int }
+
+trait Booted { fn main(self) -> Int }
+
+impl Shown for Point {
+    fn show(self) -> Str { "p" }
+}
+
+impl Shown for Int {
+    fn show(self) -> Str { "i" }
+}
+
+impl Shifted for Point {
+    fn shifted(self, d: Int) -> Point { Point { x: self.x + d, y: self.y } }
+}
+
+impl Held for Point {
+    fn held(self) -> Option[Int] { Some(self.x) }
+}
+
+impl[T] Sz for Box[T] {
+    fn sz(self) -> Int { 1 }
+}
+
+impl Booted for Point {
+    fn main(self) -> Int { 0 }
+}
+
+fn main() { assert(true) }
+"#
+}
+
+// An impl method is a C function whose name carries the receiver type and the trait, and
+// whose first parameter is the receiver. Both facts come from what typecheck already
+// stamped: the `self` parameter node carries the receiver's type id like any other
+// parameter, so the receiver needs no separate spelling path.
+test "an impl method is declared under its trait-qualified name" {
+    let _ = build_probe(impl_src(), "cg_decl_impl_probe")
+    cg_decl_emit_impl_method_decls()
+    let text = print_take()
+    assert_has(text, "const char* blink_Point_Shown_show(blink_Point self);")
+    assert_has(text, "const char* blink_Int_Shown_show(int64_t self);")
+    assert_has(text, "blink_Point blink_Point_Shifted_shifted(blink_Point self, int64_t d);")
+}
+
+// A generic impl block is a template. Its methods have a C spelling only once a concrete
+// receiver is chosen, and that is the monomorphizer's output, not this one's.
+test "a generic impl block declares no method" {
+    let _ = build_probe(impl_src(), "cg_decl_impl_poly_probe")
+    cg_decl_emit_impl_method_decls()
+    let text = print_take()
+    assert_lacks(text, "_Sz_sz")
+}
+
+// A carrier named by a method signature has no declaration of its own, so the signature
+// is the only thing that asks for its typedef. It must be written before the declaration
+// that reads it.
+test "a carrier in an impl method signature is typedefed before the declaration" {
+    let _ = build_probe(impl_src(), "cg_decl_impl_carrier_probe")
+    cg_decl_emit_typedefs()
+    cg_decl_emit_impl_method_decls()
+    let text = print_take()
+    assert_precedes(text, "} blink_Option_int;", "blink_Point_Held_held(")
+}
+
+// The program's entry point is the one the registry found among the top-level functions,
+// not every node that happens to be spelled `main`. A trait may declare a method of that
+// name, and a method is never handed the program's evidence vector.
+test "a method named main is not the entry point" {
+    let program = build_probe(impl_src(), "cg_decl_impl_main_probe")
+    cg_decl_emit_typedefs()
+    cg_decl_emit_impl_method_decls()
+    let text = print_take()
+    assert_has(text, "blink_Point_Booted_main(blink_Point self);")
+    assert_lacks(text, "blink_ev")
+}
