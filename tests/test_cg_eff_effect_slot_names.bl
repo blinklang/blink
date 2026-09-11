@@ -1,0 +1,123 @@
+// The effect vector slot a handler installs into, named from the handler's tid.
+//
+// Two names come off one fact, the ROOT effect: the blink_ev field the install writes and
+// the vtable struct the handler value points at. A sub-effect shares its root's slot, so
+// the sub-effect rides neither name. The eight builtin roots come first in blink_ev and
+// in a fixed order, because the archive is compiled against a shorter blink_ev than the
+// user unit sees. A user effect takes a slot behind a prefix, which is what keeps an
+// effect spelled `Io` off the builtin `io` slot.
+//
+// Expected bytes come from the pinned compiler's C: builtin fields `io fs net crypto rand
+// time env process`, user fields `ue_<effect name lowercased>`, vtables `blink_<root>_
+// vtable` and `blink_ue_<root>_vtable`.
+
+import typecheck.{make_handler_type}
+import cname.{c_ev_field_name, c_vtable_type_name}
+import cname_test_helpers.{assert_eq_str, compile_probe, tid_of}
+import diagnostics.{diag_entries, diag_is_ice_seg}
+import std.io
+
+fn probe_src() -> Str {
+    #"effect Metrics {
+    effect Emit {
+        fn counter(name: Str)
+    }
+}
+effect Io {
+    effect Write {
+        fn put(line: Str)
+    }
+}
+fn main() {
+    let hm: Handler[Metrics] = handler Metrics {
+        fn counter(_name: Str) {}
+    }
+    let hi: Handler[Io] = handler Io {
+        fn put(_line: Str) {}
+    }
+    let h: Handler[IO] = handler IO { fn print(_m: Str) {} }
+    io.println("ok")
+}
+"#
+}
+
+// The probe registers the user effects; a handler type for an effect nobody declared owns
+// no slot, so these tests must compile a program rather than mint tids on their own.
+//
+// A probe that does not compile registers no effect, and every user-effect case below
+// would then pass for the wrong reason, so the compile itself is asserted.
+fn setup() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let m = compile_probe("cg_eff_effect_slot_names", probe_src())
+    let mut errs = 0
+    for d in diag_entries {
+        if d.severity == "error" {
+            io.println("FAIL: probe does not compile: {d.code} {d.message}")
+            errs = errs + 1
+        }
+    }
+    assert_eq(errs, 0)
+    m
+}
+
+test "each builtin effect root names its own blink_ev field" {
+    let _ = setup()
+    for pair in [["IO", "io"], ["FS", "fs"], ["Net", "net"], ["Crypto", "crypto"],
+                 ["Rand", "rand"], ["Time", "time"], ["Env", "env"], ["Process", "process"]] {
+        let root = pair.get(0).unwrap()
+        let field = pair.get(1).unwrap()
+        assert_eq_str(root, c_ev_field_name(make_handler_type(root)), field)
+        assert_eq_str(root, c_vtable_type_name(make_handler_type(root)), "blink_{field}_vtable")
+    }
+}
+
+test "a sub-effect installs into its root's field and shares its root's vtable" {
+    let _ = setup()
+    assert_eq_str("IO.Print", c_ev_field_name(make_handler_type("IO.Print")), "io")
+    assert_eq_str("FS.Write", c_ev_field_name(make_handler_type("FS.Write")), "fs")
+    assert_eq_str("Time.Sleep", c_ev_field_name(make_handler_type("Time.Sleep")), "time")
+    // The deleted emitter listed sub-effect names by hand and had none for Rand, so a
+    // Rand sub-effect resolved to no field at all. Reading the root fixes that; nobody
+    // should restore the hand-written list.
+    assert_eq_str("Rand.Bytes", c_ev_field_name(make_handler_type("Rand.Bytes")), "rand")
+    assert_eq_str("IO.Eprint", c_vtable_type_name(make_handler_type("IO.Eprint")), "blink_io_vtable")
+}
+
+test "a declared user effect takes a field behind a prefix a builtin cannot reach" {
+    let _ = setup()
+    assert_eq_str("Metrics", c_ev_field_name(make_handler_type("Metrics")), "ue_metrics")
+    assert_eq_str("Metrics.Emit", c_ev_field_name(make_handler_type("Metrics.Emit")), "ue_metrics")
+    assert_eq_str("Metrics", c_vtable_type_name(make_handler_type("Metrics")), "blink_ue_metrics_vtable")
+    // Lowercasing alone would put this effect in the builtin `io` field.
+    assert_eq_str("Io", c_ev_field_name(make_handler_type("Io")), "ue_io")
+    assert_eq_str("Io.Write", c_ev_field_name(make_handler_type("Io.Write")), "ue_io")
+}
+
+test "an effect nobody declared owns no slot and no vtable" {
+    let _ = setup()
+    assert(diag_is_ice_seg(c_ev_field_name(make_handler_type("Undeclared"))))
+    assert(diag_is_ice_seg(c_vtable_type_name(make_handler_type("Undeclared"))))
+}
+
+// Arena is a Handler type that escape analysis consumes, not a dispatched effect: it has
+// no blink_ev field and no vtable in the runtime. Naming `ue_arena` here would compile to
+// a field no translation unit defines.
+test "the arena marker effect owns no slot and no vtable" {
+    let _ = setup()
+    assert(diag_is_ice_seg(c_ev_field_name(make_handler_type("Arena"))))
+    assert(diag_is_ice_seg(c_vtable_type_name(make_handler_type("Arena"))))
+}
+
+test "a tid that is not a handler answers an ICE segment, never a field" {
+    let m = setup()
+    assert(diag_is_ice_seg(c_ev_field_name(tid_of(m, "Int"))))
+    assert(diag_is_ice_seg(c_ev_field_name(tid_of(m, "Str"))))
+    assert(diag_is_ice_seg(c_ev_field_name(-1)))
+    assert(diag_is_ice_seg(c_ev_field_name(1 << 40)))
+    assert(diag_is_ice_seg(c_vtable_type_name(tid_of(m, "Int"))))
+}
+
+test "a handler type naming no effect answers an ICE segment" {
+    let _ = setup()
+    assert(diag_is_ice_seg(c_ev_field_name(make_handler_type(""))))
+    assert(diag_is_ice_seg(c_vtable_type_name(make_handler_type(""))))
+}
