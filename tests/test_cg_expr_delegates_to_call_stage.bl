@@ -1,0 +1,125 @@
+// Where the expression stage stops owning a shape and the call stage takes it. Every test
+// here starts at lower_expr, the entry a statement actually reaches, and asserts the tree
+// cg_call builds. A test that called the seam directly would pass with the wiring absent.
+
+import lower_test_helpers.{
+    probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies, assert_ice,
+}
+import ir.{IrKind, ir_c_name, ir_kid}
+import cg_expr.{lower_expr}
+
+fn src_calls() -> Str {
+    #"import std.io
+
+@derive(Eq)
+type Point { x: Int, y: Int }
+
+trait Shown { fn shown(self) -> Int }
+
+impl Shown for Point {
+    fn shown(self) -> Int { self.x }
+}
+
+fn twice(n: Int) -> Int { n + n }
+
+fn counted() -> Int ! IO { 1 }
+
+fn effectful() -> Int ! IO {
+    let raised = counted()
+    raised
+}
+
+fn main() {
+    let plain = twice(3)
+    let one = Point { x: 1, y: 2 }
+    let two = Point { x: 1, y: 3 }
+    let viewed = one.shown()
+    let same = one == two
+    let differs = one != two
+    let nums = [1, 2, 3]
+    let copied = [..nums, 9]
+    let _keep = [plain, viewed]
+    let _keep2 = [same, differs]
+    let _keep3 = [copied.len(), two.y]
+}
+"#
+}
+
+fn src_display() -> Str {
+    #"import std.traits
+
+type Wrapped { n: Int }
+
+impl Display for Wrapped {
+    fn fmt(self, sb: StringBuilder) { sb.write("w") }
+}
+
+fn main() {
+    let shown_once = Wrapped { n: 1 }
+    let text = "{shown_once}"
+    let pair = (1, 2)
+    let paired = "{pair}"
+    let _keep = [text, paired]
+}
+"#
+}
+
+test "a free call lowered as an expression is the direct call the call stage builds" {
+    probe("cg_expr_delegates", src_calls())
+    let id = lower_expr(rhs_of("plain"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_eq_str("symbol", ir_c_name(id), "blink_u_twice")
+    assert_shape("shape", id, "CallDirect(Const)")
+    assert_verifies("verify", id)
+}
+
+test "a method call lowered as an expression passes the receiver as the first argument" {
+    probe("cg_expr_delegates", src_calls())
+    let id = lower_expr(rhs_of("viewed"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_eq_str("symbol", ir_c_name(id), "blink_Point_Shown_shown")
+    assert_shape("shape", id, "CallDirect(VarRef)")
+    assert_verifies("verify", id)
+}
+
+test "a struct equality reaches the derived eq method with both operands lowered" {
+    probe("cg_expr_delegates", src_calls())
+    let id = lower_expr(rhs_of("same"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_eq_str("symbol", ir_c_name(id), "blink_Point_eq")
+    assert_shape("shape", id, "CallDirect(VarRef, VarRef)")
+    assert_verifies("verify", id)
+}
+
+test "a struct inequality reaches the same derived method under a negation" {
+    probe("cg_expr_delegates", src_calls())
+    let id = lower_expr(rhs_of("differs"))
+    assert_kind("kind", id, IrKind.Unary)
+    assert_shape("shape", id, "Unary(CallDirect(VarRef, VarRef))")
+    assert_eq_str("symbol", ir_c_name(ir_kid(id, 0)), "blink_Point_eq")
+    assert_verifies("verify", id)
+}
+
+test "an interpolation hole with no printf form reaches its own display dispatcher" {
+    probe("cg_expr_delegates_display", src_display())
+    let id = lower_expr(rhs_of("text"))
+    assert_shape("shape", id, "CallRuntime(Const, CallDirect(VarRef))")
+    assert_eq_str("hole", ir_c_name(ir_kid(id, 1)), "blink_Wrapped_Display_display")
+    assert_verifies("verify", id)
+}
+
+test "a spread element of a container literal is refused by the stage that owns the copy" {
+    probe("cg_expr_delegates", src_calls())
+    assert_ice("spread in literal", lower_expr(rhs_of("copied")), "SpreadCopyNotLowered")
+}
+
+
+test "a call this stage cannot finish is refused by the call stage, under its own name" {
+    probe("cg_expr_delegates", src_calls())
+    assert_ice("evidence vector", lower_expr(rhs_of("raised")), "EvidenceVectorNotInIr")
+}
+
+test "a hole typecheck shows structurally, with no impl to call, is refused by this stage" {
+    probe("cg_expr_delegates_display", src_display())
+    assert_ice("tuple hole", lower_expr(rhs_of("paired")), "StructuralHoleNotRendered")
+}

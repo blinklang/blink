@@ -1,0 +1,376 @@
+// The C a @derive(Debug) type gets. The spec fixes the rendered text: a product type is
+// "TypeName { f1: <f1.debug()>, ... }", a unit variant is its own bare name, and a
+// data-carrying variant is "Variant(<f1.debug()>, ...)".
+//
+// A field this stage cannot render is an internal error. The spec rules out a
+// placeholder: rendering "<?>" for a field with no debug form is forbidden, because a
+// debug string that silently drops a value is a wrong answer that compiles cleanly.
+
+import std.fs
+import std.io
+import typecheck.{check_types, tc_type_decl_nodes}
+import layout.{layout_reset}
+import cname.{c_variant_ordinal}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_derive.{cg_derive_reset, cg_derive_emit_decls, cg_derive_emit_bodies}
+import compiler.{compile_to_program}
+import parser.{node_fields, sublist_get}
+import diagnostics.{diag_ice_count}
+
+// Point is two scalars, Named holds a string, Mixed holds the three scalars with no
+// printf form of their own, Pair nests a derived type, Color rides its tag alone, and
+// Shape and Maybe carry payloads.
+fn debug_src() -> Str {
+    #"@derive(Debug)
+type Point { x: Int, y: Int }
+@derive(Debug)
+type Named { name: Str, id: Int }
+@derive(Debug)
+type Mixed { ratio: Float, flag: Bool, letter: Char }
+@derive(Debug)
+type Pair { p: Point, n: Int }
+@derive(Debug)
+type Color { Red, Green, Blue }
+@derive(Debug)
+type Shape {
+    Circle(radius: Int)
+    Rect(w: Int, h: Int)
+}
+@derive(Debug)
+type Maybe {
+    Nothing
+    Just(v: Int)
+}
+fn main() { }
+"#
+}
+
+// Compiling resets the diagnostic counters, so a test that counts what this stage
+// records must read the counters after the probe is built, never before it.
+fn program_of(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{stem}_probe_src.bl"
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_derive_reset()
+    program
+}
+
+fn bodies_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let _p = program_of(stem, src)
+    cg_derive_emit_bodies()
+    print_take()
+}
+
+fn decls_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let _p = program_of(stem, src)
+    cg_derive_emit_decls()
+    print_take()
+}
+
+// How many internal errors the body pass records for a probe, and nothing the compile
+// itself recorded.
+fn ices_of(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let _p = program_of(stem, src)
+    let before = diag_ice_count
+    cg_derive_emit_bodies()
+    diag_ice_count - before
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output still has '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+// The C of one function, from its opening line to the brace that closes it in column
+// zero. A needle checked against the whole unit would match another function's body.
+fn one_fn(text: Str, head: Str) -> Str {
+    let start = text.index_of(head)
+    if start < 0 { io.println("FAIL: output has no '{head}'\n--- output ---\n{text}") }
+    assert(start >= 0)
+    let rest = text.substring(start, text.len() - start)
+    let end = rest.index_of("\n}")
+    assert(end >= 0)
+    rest.substring(0, end)
+}
+
+test "a derived debug takes one value of its own type and answers a string" {
+    assert_has(bodies_of("cg_derive_debug", debug_src()), #"const char* blink_Point_debug(blink_Point self) {"#)
+}
+
+// One formatter call renders the whole value: the runtime sizes the buffer exactly, and
+// the spec puts no length cap on a debug string.
+test "a product type renders its name and every field in one formatter call" {
+    let text = one_fn(bodies_of("cg_derive_debug", debug_src()), "const char* blink_Point_debug")
+    assert_has(text, #"return blink_str_format("Point { x: %lld, y: %lld }", ((long long)(self.x)), ((long long)(self.y)));"#)
+}
+
+// A debug string is re-readable, so a string field is quoted and escaped rather than
+// pasted raw the way a Display would paste it.
+test "a string field is quoted and escaped by the runtime debug helper" {
+    let text = one_fn(bodies_of("cg_derive_debug", debug_src()), "const char* blink_Named_debug")
+    assert_has(text, #"Named { name: %s, id: %lld }"#)
+    assert_has(text, "blink_str_debug(self.name)")
+}
+
+// A Float carries its own printf form and C promotes it across the varargs boundary
+// already, so it needs no cast.
+test "a float field renders bare with no width cast" {
+    let text = one_fn(bodies_of("cg_derive_debug", debug_src()), "const char* blink_Mixed_debug")
+    assert_has(text, "ratio: %g")
+    assert_has(text, "self.ratio")
+    assert_lacks(text, "(self.ratio)))")
+}
+
+// C has no conditional IR node and the runtime exports no bool-to-text helper, so a
+// Bool field becomes a string temp an `if` fills with one of its two display words.
+test "a bool field renders as one of its two display words" {
+    let text = one_fn(bodies_of("cg_derive_debug", debug_src()), "const char* blink_Mixed_debug")
+    assert_has(text, "flag: %s")
+    assert_has(text, #" = "false";"#)
+    assert_has(text, #"if (self.flag) {"#)
+    assert_has(text, #" = "true";"#)
+}
+
+// The runtime owns Char quote and escape logic, so a Char field is one call to it and
+// never its bare code point.
+test "a char field renders through the runtime char debug helper" {
+    let text = one_fn(bodies_of("cg_derive_debug", debug_src()), "const char* blink_Mixed_debug")
+    assert_has(text, "letter: %s")
+    assert_has(text, "blink_char_debug(self.letter)")
+}
+
+// A nested type that derives Debug itself is rendered by calling its derived method, so
+// the rendering stays one call deep however far the nesting goes.
+test "a nested derived field is rendered by calling the nested derived method" {
+    let text = one_fn(bodies_of("cg_derive_debug", debug_src()), "const char* blink_Pair_debug")
+    assert_has(text, #"Pair { p: %s, n: %lld }"#)
+    assert_has(text, "blink_Point_debug(self.p)")
+}
+
+// A payload-less enum is a C enum, so the whole value is the tag and the answer is a
+// constant. Nothing is formatted, because nothing varies.
+test "a payload-less enum answers the bare name of its variant" {
+    let text = one_fn(bodies_of("cg_derive_debug", debug_src()), "const char* blink_Color_debug")
+    assert_has(text, "blink_Color_Red")
+    assert_has(text, #"return "Red";"#)
+    assert_has(text, #"return "Green";"#)
+    assert_has(text, #"return "Blue";"#)
+    assert_lacks(text, "blink_str_format")
+    assert_lacks(text, "self.tag")
+}
+
+// A tag no variant claims means the value's memory is corrupt. Answering a stand-in
+// string there would report a value the program does not hold.
+test "an enum whose tag matches no variant panics instead of naming a fallback" {
+    let text = one_fn(bodies_of("cg_derive_debug", debug_src()), "const char* blink_Color_debug")
+    assert_has(text, "__blink_panic_dispatch(")
+    assert_lacks(text, "unknown")
+}
+
+test "a data-carrying variant renders its name and payload in parentheses" {
+    let text = one_fn(bodies_of("cg_derive_debug", debug_src()), "const char* blink_Shape_debug")
+    assert_has(text, #"return blink_str_format("Circle(%lld)", ((long long)(self.data.Circle.radius)));"#)
+    assert_has(text, #"return blink_str_format("Rect(%lld, %lld)", ((long long)(self.data.Rect.w)), ((long long)(self.data.Rect.h)));"#)
+}
+
+// One enum may hold both variant shapes, and a unit variant carries no parentheses.
+test "a unit variant of a payload enum answers its bare name" {
+    let text = one_fn(bodies_of("cg_derive_debug", debug_src()), "const char* blink_Maybe_debug")
+    assert_has(text, #"return "Nothing";"#)
+    assert_has(text, #"return blink_str_format("Just(%lld)", ((long long)(self.data.Just.v)));"#)
+}
+
+// The tag label and the rendering block are two adjacent switch kids. Swapping them by
+// one position renders every payload under the neighbouring variant's name, which a
+// presence-only assertion cannot see.
+test "each variant's payload is rendered under that variant's own tag" {
+    let text = one_fn(bodies_of("cg_derive_debug", debug_src()), "const char* blink_Shape_debug")
+    let circle_tag = text.index_of("blink_Shape_Circle_TAG")
+    let circle_body = text.index_of(#"Circle(%lld)"#)
+    let rect_tag = text.index_of("blink_Shape_Rect_TAG")
+    let rect_body = text.index_of(#"Rect(%lld, %lld)"#)
+    assert(circle_tag >= 0 && circle_body >= 0 && rect_tag >= 0 && rect_body >= 0)
+    assert(circle_tag < circle_body)
+    assert(circle_body < rect_tag)
+    assert(rect_tag < rect_body)
+}
+
+// The declaration pass writes signatures only. The driver runs it before the body pass
+// so a type declared after the type that renders it is still declared first.
+test "the declaration pass writes a debug signature for every derived type and no body" {
+    let text = decls_of("cg_derive_debug_decls", debug_src())
+    for name in ["Point", "Named", "Mixed", "Pair", "Color", "Shape", "Maybe"] {
+        assert_has(text, "const char* blink_{name}_debug(blink_{name} self);")
+    }
+    assert_lacks(text, "blink_str_format")
+}
+
+// A transparent newtype is a bare word, so its parameter has no tag member and no union
+// to read: the payload is the parameter itself.
+fn newtype_src() -> Str {
+    #"@derive(Debug)
+type Errno { Errno(Int) }
+fn main() { }
+"#
+}
+
+test "a transparent newtype renders its word as the payload of its one variant" {
+    let text = bodies_of("cg_derive_debug_newtype", newtype_src())
+    assert_has(text, #"return blink_str_format("Errno(%lld)", ((long long)(self)));"#)
+    assert_lacks(text, "self.tag")
+    assert_lacks(text, "self.data")
+}
+
+// An @ffi.opaque handle is a pointer to a body this compiler cannot see. It has no
+// fields, so a field walk over it renders a name with an empty body.
+fn opaque_src() -> Str {
+    #"@derive(Debug)
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn main() { }
+"#
+}
+
+test "an opaque handle is refused, not rendered as a name with no fields" {
+    assert(ices_of("cg_derive_debug_opaque", opaque_src()) > 0)
+    assert_lacks(bodies_of("cg_derive_debug_opaque", opaque_src()), "_debug")
+}
+
+// A generic type gets one body per instance, which this stage has not built, so a field
+// of one must not be handed a call to a symbol nothing will define.
+fn generic_field_src() -> Str {
+    #"@derive(Debug)
+type Box[T] { v: T }
+@derive(Debug)
+type Holder { b: Box[Int], n: Int }
+fn main() { }
+"#
+}
+
+test "a field of a generic type gets no call to a body this stage will not write" {
+    assert(ices_of("cg_derive_debug_generic", generic_field_src()) > 0)
+    assert_lacks(bodies_of("cg_derive_debug_generic", generic_field_src()), "blink_Box_debug(")
+}
+
+// The spec ratifies a container debug-form, and it needs one recursive renderer per
+// nested container shape. Until those are built the field has no rendering, and the
+// spec rules out a placeholder in its place.
+fn container_field_src() -> Str {
+    #"@derive(Debug)
+type Bag { items: List[Int] }
+fn main() { }
+"#
+}
+
+test "a container field is an internal error, not a placeholder" {
+    assert(ices_of("cg_derive_debug_container", container_field_src()) > 0)
+    let text = bodies_of("cg_derive_debug_container", container_field_src())
+    assert_lacks(text, "<?>")
+    assert_lacks(text, "items: %s")
+}
+
+// cname owns the C name of a variant in both its forms. A payload-less enum declares C
+// enumerators and a payload enum declares tag macros; a second speller of either would
+// be free to disagree with the typedef.
+test "cname spells the enumerator of a payload-less enum variant" {
+    let program = program_of("cg_derive_debug_names", debug_src())
+    assert(program >= 0)
+    let color = tc_type_decl_nodes.get("Color") ?? -1
+    assert(color >= 0)
+    let red = sublist_get(node_fields(color), 0)
+    assert_eq(c_variant_ordinal(color, red), "blink_Color_Red")
+}
+
+// A field narrower than the promotion C applies across `...` must be cast to the width
+// the conversion reads, or the formatter walks the wrong number of bytes.
+fn narrow_src() -> Str {
+    #"@derive(Debug)
+type Gauge { small: I8, big: U64, wide: I32 }
+fn main() { }
+"#
+}
+
+test "a field narrower than its varargs promotion is cast to the promoted width" {
+    let text = one_fn(bodies_of("cg_derive_debug_narrow", narrow_src()), "const char* blink_Gauge_debug")
+    assert_has(text, #"return blink_str_format("Gauge { small: %lld, big: %llu, wide: %lld }", ((long long)(self.small)), ((unsigned long long)(self.big)), ((long long)(self.wide)));"#)
+}
+
+// A Bool needs a statement before the formatter call. Inside a variant that statement
+// belongs in the case block: hoisted out, it would run whatever tag the value carries,
+// and a second variant's temp would collide with it.
+fn variant_scalar_src() -> Str {
+    #"@derive(Debug)
+type Reading {
+    Flag(on: Bool)
+    Label(text: Str, mark: Char)
+}
+fn main() { }
+"#
+}
+
+test "a variant payload needing a statement keeps that statement inside its own case" {
+    let text = one_fn(bodies_of("cg_derive_debug_vscalar", variant_scalar_src()), "const char* blink_Reading_debug")
+    let tag = text.index_of("blink_Reading_Flag_TAG")
+    let bind = text.index_of(#" = "false";"#)
+    let fill = text.index_of("self.data.Flag.on")
+    let call = text.index_of(#"blink_str_format("Flag(%s)""#)
+    assert(tag >= 0 && bind > tag && fill > bind && call > fill)
+    assert_has(text, #"blink_str_format("Label(%s, %s)", blink_str_debug(self.data.Label.text), blink_char_debug(self.data.Label.mark))"#)
+}
+
+// A product type with no fields still names itself: the braces say it is a product, and
+// an empty pair is what a reader expects where the fields would be.
+fn empty_src() -> Str {
+    #"@derive(Debug)
+type Marker { }
+fn main() { }
+"#
+}
+
+test "a product type with no fields renders its name and an empty brace pair" {
+    let text = one_fn(bodies_of("cg_derive_debug_empty", empty_src()), "const char* blink_Marker_debug")
+    assert_has(text, #"return blink_str_format("Marker {}");"#)
+}
+
+// Two derives on one declaration are two bodies. A pass that recorded only the
+// declaration would answer the first and drop the second.
+fn two_derives_src() -> Str {
+    #"@derive(Debug, Eq)
+type Tick { n: Int }
+fn main() { }
+"#
+}
+
+test "a type carrying two derives gets a body for each of them" {
+    let text = bodies_of("cg_derive_debug_two", two_derives_src())
+    assert_has(text, #"const char* blink_Tick_debug(blink_Tick self) {"#)
+    assert_has(text, #"int blink_Tick_eq(blink_Tick self, blink_Tick other) {"#)
+}
+
+test "a derive written twice on one declaration gets one body, not two" {
+    let text = bodies_of("cg_derive_debug_dup", #"@derive(Debug)
+@derive(Debug)
+type Once { n: Int }
+fn main() { }
+"#)
+    let first = text.index_of("const char* blink_Once_debug")
+    assert(first >= 0)
+    let rest = text.substring(first + 1, text.len() - first - 1)
+    assert(rest.index_of("const char* blink_Once_debug") < 0)
+}

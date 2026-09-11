@@ -14,20 +14,21 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 import layout.{
-    LayoutRecord, Position, SlotForm, decl_derive_args, field_layout_of, layout_of,
-    tid_is_opaque_handle,
+    LayoutRecord, Position, SlotForm, decl_derive_args, field_layout_of, format_spec_of,
+    layout_of, tid_is_opaque_handle, varargs_spelling,
 }
 import cname.{
-    c_derive_method_name, c_field_name, c_runtime_helper, c_variant_tag_macro,
+    c_derive_method_name, c_field_name, c_mint_local, c_runtime_helper, c_string_literal,
+    c_variant_ordinal, c_variant_tag_macro,
 }
 import cg_print.{print_fn, print_fn_decl}
 import cg_reg.{cg_reg_tid_for_decl}
 import ir.{
-    ir_binary, ir_block, ir_call_direct, ir_call_runtime, ir_const, ir_field_get, ir_if,
-    ir_return, ir_switch, ir_unary, ir_var_ref,
+    ir_assign, ir_binary, ir_block, ir_call_direct, ir_call_runtime, ir_cast, ir_const,
+    ir_field_get, ir_if, ir_let, ir_panic, ir_return, ir_switch, ir_unary, ir_var_ref,
 }
 import typecheck.{
-    DECL_NODE_AMBIGUOUS, TYPE_BOOL, TYPE_INT, TyKind, tc_enum_variant_slots,
+    DECL_NODE_AMBIGUOUS, TYPE_BOOL, TYPE_CHAR, TYPE_INT, TYPE_STR, TyKind, tc_enum_variant_slots,
     tc_evar_field_slots, tc_evar_name, tc_evfield_name, tc_evfield_tid, tc_resolve,
     tc_sfield_name, tc_sfield_tid, tc_struct_field_slots, tc_tid_decl_node, tc_tid_kind,
     tk_name,
@@ -42,21 +43,35 @@ let TAG_MEMBER = "tag"
 // The derive names, held as data so no branch here compares against a literal.
 let derive_eq = "Eq"
 let derive_ord = "Ord"
+let derive_debug = "Debug"
+
+// The two words a Bool renders as. They are the Display of a Bool, not C text, and the
+// runtime holds the same pair in blink_sb_write_bool.
+let bool_true = "true"
+let bool_false = "false"
 
 // Every name @derive accepts. A name outside this set is the author's mistake; a name
 // inside it that this stage has not built is a compiler bug, so the two answer with
 // different diagnostics.
 fn known_derives() -> List[Str] {
-    ["Serialize", "Deserialize", derive_eq, derive_ord, "Clone", "Hash", "Debug"]
+    ["Serialize", "Deserialize", derive_eq, derive_ord, "Clone", "Hash", derive_debug]
 }
 
 // A declaration may write the same derive twice, in one annotation or in two, so a pass
-// records the declarations it has answered. Keyed on the declaration rather than on the
-// symbol: two declarations that collided on one symbol would otherwise lose a body.
-let mut written: Map[Int, Int] = Map()
+// records the pairs it has answered. Keyed on the declaration and the derive name: on the
+// declaration alone one type's second derive would be dropped, and on the symbol alone
+// two declarations that collided on one symbol would lose a body.
+let mut written: Map[Str, Int] = Map()
 
 pub fn cg_derive_reset() {
     written = Map()
+}
+
+fn already_written(decl: Int, name: Str) -> Bool {
+    let key = "{decl}|{name}"
+    if written.contains_key(key) != 0 { return true }
+    written.insert(key, 1)
+    false
 }
 
 // ── The passes the driver runs ────────────────────────────────────────────
@@ -91,7 +106,9 @@ fn derive_one(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
             arg, "remove or replace this derive name")
         return
     }
+    if already_written(decl, name) { return }
     if name == derive_eq { return eq_method(decl, arg, bodies) }
+    if name == derive_debug { return debug_method(decl, arg, bodies) }
     not_built(arg, "@derive({name})")
 }
 
@@ -132,26 +149,64 @@ fn int_spelling(node: Int) -> Str ! Diag.Report {
 
 // ── Eq ───────────────────────────────────────────────────────────────────
 
-// Why this stage writes no comparison for a type, or "" when it writes one. The field
-// reader and the method writer both ask: a field's comparison calls the type's method,
-// and a call to a method nobody writes is an undefined symbol at link time.
-fn eq_refusal(decl: Int, tid: Int) -> Str {
+// ── What a declaration's own shape refuses ───────────────────────────────
+
+// Why this stage writes no body for a type, or "" when it writes one. Both the field
+// reader and the method writer ask, because a field is rendered or compared by calling
+// the type's own method, and a call to a method nobody writes is an undefined symbol at
+// link time. The two refusals are facts about the declaration, so every derive shares
+// them: an opaque handle exposes no fields at all, and a generic type has one body per
+// instance rather than one body.
+fn shape_refusal(decl: Int, tid: Int, derive: Str) -> Str {
     if tid_is_opaque_handle(tid) {
-        return "@derive(Eq) on the opaque handle '{node_name(decl)}', which has no fields to compare"
+        return "@derive({derive}) on the opaque handle '{node_name(decl)}', which exposes no fields"
     }
     let tparams = node_type_params(decl)
     if tparams != -1 && sublist_length(tparams) > 0 {
-        return "@derive on the generic type '{node_name(decl)}'"
+        return "@derive({derive}) on the generic type '{node_name(decl)}'"
     }
     ""
+}
+
+// The value of one field of `self` or `other`, or -1 after a refusal. A declined layout
+// has no spelling and a boxed field is behind a pointer this stage does not walk.
+fn field_value(owner: Int, owner_tid: Int, ftid: Int, path: Str, holder: Str, derive: Str, span: Int) -> Int ! Diag.Report {
+    let frec = field_layout_of(owner, ftid)
+    let reason = frec.decline_reason
+    if reason != "" {
+        diag_ice_at("DeriveBodyNotBuildable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "no C spelling for field '{path}': {reason}", span,
+            "every type that reaches code generation must be concrete and nameable; this is a compiler bug")
+        return -1
+    }
+    if frec.slot_form == SlotForm.PointerBoxed {
+        not_built(span, "@derive({derive}) on the boxed field '{path}'")
+        return -1
+    }
+    field_ref(owner_tid, holder, ftid, frec, path, span)
+}
+
+// The declaration node of the variant a registered entry describes. The tag label comes
+// from the declaration node and the payload from the registered entry, so if the two
+// orders ever diverged both halves would move into the same wrong variant, which reads a
+// payload through the wrong tag.
+fn variant_decl_node(decl: Int, slot: Int, index: Int, span: Int) -> Int ! Diag.Report {
+    let vnode = variant_node(decl, index)
+    if vnode < 0 {
+        derive_ice(span, "variant {index} of '{node_name(decl)}' has no declaration node")
+        return -1
+    }
+    if tc_evar_name(slot) != node_name(vnode) {
+        derive_ice(span, "variant {index} of '{node_name(decl)}' is registered as '{tc_evar_name(slot)}' but declared as '{node_name(vnode)}'")
+        return -1
+    }
+    vnode
 }
 
 fn eq_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
     let tid = cg_reg_tid_for_decl(decl)
     if tid < 0 { return derive_ice(arg, "type '{node_name(decl)}' reached cg_derive with no type id") }
-    if written.contains_key(decl) != 0 { return }
-    written.insert(decl, 1)
-    let refusal = eq_refusal(decl, tid)
+    let refusal = shape_refusal(decl, tid, derive_eq)
     if refusal != "" { return not_built(arg, refusal) }
     let self_spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), arg)
     let ret = bool_spelling(arg)
@@ -231,18 +286,8 @@ fn eq_variant_cases(decl: Int, tid: Int, slots: List[Int], ints: Str, span: Int)
     let mut i = 0
     while i < slots.len() {
         let slot = slots.get(i).unwrap()
-        let vnode = variant_node(decl, i)
-        if vnode < 0 {
-            derive_ice(span, "variant {i} of '{node_name(decl)}' has no declaration node")
-            return []
-        }
-        // The tag label comes from the declaration node and the payload from the
-        // registered entry. If the two orders ever diverged, both halves would move
-        // into the same wrong variant, which reads a payload through the wrong tag.
-        if tc_evar_name(slot) != node_name(vnode) {
-            derive_ice(span, "variant {i} of '{node_name(decl)}' is registered as '{tc_evar_name(slot)}' but declared as '{node_name(vnode)}'")
-            return []
-        }
+        let vnode = variant_decl_node(decl, slot, i, span)
+        if vnode < 0 { return [] }
         let body = eq_variant_block(decl, tid, slot, span)
         if body < 0 { return [] }
         cases.push(ir_const(TYPE_INT, span, ints, c_variant_tag_macro(decl, vnode)))
@@ -299,22 +344,10 @@ fn eq_guard(owner: Int, owner_tid: Int, ftid: Int, path: Str, span: Int) -> Int 
 }
 
 fn eq_differs(owner: Int, owner_tid: Int, ftid: Int, path: Str, span: Int) -> Int ! Diag.Report {
-    let frec = field_layout_of(owner, ftid)
-    let freason = frec.decline_reason
-    if freason != "" {
-        diag_ice_at("DeriveBodyNotBuildable", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "no C spelling for field '{path}': {freason}", span,
-            "every type that reaches code generation must be concrete and nameable; this is a compiler bug")
-        return -1
-    }
-    if frec.slot_form == SlotForm.PointerBoxed {
-        not_built(span, "@derive(Eq) on the boxed field '{path}'")
-        return -1
-    }
     let bools = bool_spelling(span)
     if bools == "" { return -1 }
-    let lhs = field_ref(owner_tid, "self", ftid, frec, path, span)
-    let rhs = field_ref(owner_tid, "other", ftid, frec, path, span)
+    let lhs = field_value(owner, owner_tid, ftid, path, "self", derive_eq, span)
+    let rhs = field_value(owner, owner_tid, ftid, path, "other", derive_eq, span)
     if lhs < 0 || rhs < 0 { return -1 }
     let k = tc_tid_kind(tc_resolve(ftid))
     // A Str is a pointer, so == would compare addresses rather than bytes.
@@ -343,7 +376,7 @@ fn eq_nested_differs(ftid: Int, lhs: Int, rhs: Int, bools: Str, path: Str, span:
         not_built(span, "@derive(Eq) on a field whose type '{node_name(fdecl)}' implements Eq by hand")
         return -1
     }
-    let refusal = eq_refusal(fdecl, ftid)
+    let refusal = shape_refusal(fdecl, ftid, derive_eq)
     if refusal != "" {
         not_built(span, "{refusal}, which the field '{path}' would have to call")
         return -1
@@ -385,4 +418,325 @@ fn eq_is_scalar(k: TyKind) -> Bool {
     if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return true }
     if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return true }
     false
+}
+
+// ── Debug ────────────────────────────────────────────────────────────────
+
+// One field's contribution to a debug string: the printf conversion it needs, the
+// argument that feeds it, and the statements that argument depends on. `ok` is false
+// when a refusal was recorded, which a zero argument id could not say.
+type DebugPart {
+    spec: Str
+    arg: Int
+    pre: List[Int]
+    ok: Bool
+}
+
+// The answer when a refusal has been recorded. Spelled out rather than left to the field
+// defaults, which the language does not define for a List field.
+fn debug_refused() -> DebugPart {
+    DebugPart { spec: "", arg: -1, pre: [], ok: false }
+}
+
+fn str_spelling(node: Int) -> Str ! Diag.Report {
+    spelling_or_ice(layout_of(TYPE_STR, Position.Return), "Str", node)
+}
+
+fn debug_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
+    let tid = cg_reg_tid_for_decl(decl)
+    if tid < 0 { return derive_ice(arg, "type '{node_name(decl)}' reached cg_derive with no type id") }
+    let refusal = shape_refusal(decl, tid, derive_debug)
+    if refusal != "" { return not_built(arg, refusal) }
+    let self_spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), arg)
+    let ret = str_spelling(arg)
+    if self_spelling == "" || ret == "" { return }
+    let symbol = c_derive_method_name(decl, "debug")
+    let params = ["{self_spelling} self"]
+    if !bodies { return print_fn_decl(false, ret, symbol, params, false) }
+    let body = debug_body(decl, tid, arg)
+    if body < 0 { return }
+    print_fn(false, ret, symbol, params, false, body)
+}
+
+// A value layout gives as one word has no member to read. A transparent newtype is the
+// payload of its one variant and an ordinal enum is its own tag, and asking layout which
+// is which keeps this stage from deciding the shape for itself.
+fn debug_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let rec = layout_of(tid, Position.Param)
+    if rec.slot_form == SlotForm.InlineWord {
+        if rec.is_transparent != 0 { return debug_newtype_body(decl, tid, span) }
+        return debug_ordinal_body(decl, tid, span)
+    }
+    let k = tc_tid_kind(tc_resolve(tid))
+    if k == TyKind.Struct { return debug_struct_body(decl, tid, span) }
+    if k == TyKind.Enum { return debug_tagged_body(decl, tid, span) }
+    not_built(span, "@derive(Debug) on a {tk_name(k)} type")
+    -1
+}
+
+// ── Assembling one rendered string ───────────────────────────────────────
+
+// The runtime formatter sizes its buffer exactly, so the whole value is one call however
+// many fields it has. An empty answer means a refusal was recorded.
+fn debug_stmts(fmt: Str, parts: List[DebugPart], span: Int) -> List[Int] ! Diag.Report {
+    let rec = layout_of(TYPE_STR, Position.Return)
+    let spelling = spelling_or_ice(rec, "Str", span)
+    if spelling == "" { return [] }
+    let mut stmts: List[Int] = []
+    let mut args = [ir_const(TYPE_STR, span, spelling, c_string_literal(fmt))]
+    for p in parts {
+        for s in p.pre { stmts.push(s) }
+        args.push(p.arg)
+    }
+    stmts.push(ir_return(span, ir_call_runtime(TYPE_STR, span, spelling,
+        c_runtime_helper("str_format"), rec.slot_form, args)))
+    stmts
+}
+
+// A value with nothing to render is one constant. Nothing is formatted because nothing
+// varies: a unit variant and a payload-less enum both answer this way.
+fn debug_constant(text: Str, span: Int) -> Int ! Diag.Report {
+    let spelling = str_spelling(span)
+    if spelling == "" { return -1 }
+    ir_return(span, ir_const(TYPE_STR, span, spelling, c_string_literal(text)))
+}
+
+// A tag no variant declares means the value's memory is corrupt. Naming a stand-in
+// variant there would report a value the program does not hold.
+fn debug_corrupt_block(decl: Int, span: Int) -> Int ! Diag.Report {
+    let spelling = str_spelling(span)
+    if spelling == "" { return -1 }
+    let text = "blink: @derive(Debug) on {node_name(decl)} met a tag no variant declares"
+    ir_block(span, [ir_panic(span, ir_const(TYPE_STR, span, spelling, c_string_literal(text)))])
+}
+
+fn struct_fmt(name: Str, labels: List[Str], parts: List[DebugPart]) -> Str {
+    if parts.len() == 0 { return "{name} \{\}" }
+    let mut inner: List[Str] = []
+    let mut i = 0
+    while i < parts.len() {
+        inner.push("{labels.get(i).unwrap()}: {parts.get(i).unwrap().spec}")
+        i = i + 1
+    }
+    "{name} \{ {inner.join(", ")} \}"
+}
+
+fn variant_fmt(vname: Str, parts: List[DebugPart]) -> Str {
+    let mut specs: List[Str] = []
+    for p in parts { specs.push(p.spec) }
+    "{vname}({specs.join(", ")})"
+}
+
+// ── The four shapes ──────────────────────────────────────────────────────
+
+fn debug_struct_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let mut parts: List[DebugPart] = []
+    let mut labels: List[Str] = []
+    for slot in tc_struct_field_slots(tid) {
+        let ftid = tc_sfield_tid(slot)
+        let name = tc_sfield_name(slot)
+        let value = field_value(decl, tid, ftid, c_field_name(name), "self", derive_debug, span)
+        if value < 0 { return -1 }
+        let part = debug_part(ftid, value, name, span)
+        if !part.ok { return -1 }
+        parts.push(part)
+        labels.push(name)
+    }
+    let stmts = debug_stmts(struct_fmt(node_name(decl), labels, parts), parts, span)
+    if stmts.len() == 0 { return -1 }
+    ir_block(span, stmts)
+}
+
+// An enum with a payload reads its union through the tag, so the tag chooses the variant
+// before any payload is read: reading a payload through the wrong variant is undefined.
+fn debug_tagged_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let slots = tc_enum_variant_slots(tid)
+    if slots.len() == 0 {
+        derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
+        return -1
+    }
+    let ints = int_spelling(span)
+    if ints == "" { return -1 }
+    let scrutinee = tag_ref(tid, "self", ints, span)
+    let unknown = debug_corrupt_block(decl, span)
+    if scrutinee < 0 || unknown < 0 { return -1 }
+    let cases = debug_variant_cases(decl, tid, slots, ints, span)
+    if cases.len() == 0 { return -1 }
+    ir_block(span, [ir_switch(span, scrutinee, cases, unknown)])
+}
+
+// One case per variant, as the switch kids alternate: the tag label, then the block that
+// renders that variant. An empty answer means a refusal was recorded.
+fn debug_variant_cases(decl: Int, tid: Int, slots: List[Int], ints: Str, span: Int) -> List[Int] ! Diag.Report {
+    let mut cases: List[Int] = []
+    let mut i = 0
+    while i < slots.len() {
+        let slot = slots.get(i).unwrap()
+        let vnode = variant_decl_node(decl, slot, i, span)
+        if vnode < 0 { return [] }
+        let body = debug_variant_block(decl, tid, slot, span)
+        if body < 0 { return [] }
+        cases.push(ir_const(TYPE_INT, span, ints, c_variant_tag_macro(decl, vnode)))
+        cases.push(body)
+        i = i + 1
+    }
+    cases
+}
+
+fn debug_variant_block(decl: Int, tid: Int, slot: Int, span: Int) -> Int ! Diag.Report {
+    let vname = tc_evar_name(slot)
+    let mut parts: List[DebugPart] = []
+    for f in tc_evar_field_slots(slot) {
+        let ftid = tc_evfield_tid(f)
+        let fname = tc_evfield_name(f)
+        let path = "{PAYLOAD_UNION}.{vname}.{c_field_name(fname)}"
+        let value = field_value(decl, tid, ftid, path, "self", derive_debug, span)
+        if value < 0 { return -1 }
+        // The C member path is what an internal error about the emitted access should
+        // name, but a refusal a user can meet names the field they wrote.
+        let part = debug_part(ftid, value, "{vname}.{fname}", span)
+        if !part.ok { return -1 }
+        parts.push(part)
+    }
+    if parts.len() == 0 {
+        let answer = debug_constant(vname, span)
+        if answer < 0 { return -1 }
+        return ir_block(span, [answer])
+    }
+    let stmts = debug_stmts(variant_fmt(vname, parts), parts, span)
+    if stmts.len() == 0 { return -1 }
+    ir_block(span, stmts)
+}
+
+// A payload-less enum is a C enum, so its variants are enumerators rather than tag
+// macros and the whole value is the tag.
+fn debug_ordinal_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let slots = tc_enum_variant_slots(tid)
+    if slots.len() == 0 {
+        derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
+        return -1
+    }
+    let spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), span)
+    let scrutinee = self_ref(tid, "self", span)
+    let unknown = debug_corrupt_block(decl, span)
+    if spelling == "" || scrutinee < 0 || unknown < 0 { return -1 }
+    let cases = debug_ordinal_cases(decl, slots, spelling, tid, span)
+    if cases.len() == 0 { return -1 }
+    ir_block(span, [ir_switch(span, scrutinee, cases, unknown)])
+}
+
+fn debug_ordinal_cases(decl: Int, slots: List[Int], spelling: Str, tid: Int, span: Int) -> List[Int] ! Diag.Report {
+    let mut cases: List[Int] = []
+    let mut i = 0
+    while i < slots.len() {
+        let slot = slots.get(i).unwrap()
+        let vnode = variant_decl_node(decl, slot, i, span)
+        if vnode < 0 { return [] }
+        let answer = debug_constant(tc_evar_name(slot), span)
+        if answer < 0 { return [] }
+        cases.push(ir_const(tid, span, spelling, c_variant_ordinal(decl, vnode)))
+        cases.push(ir_block(span, [answer]))
+        i = i + 1
+    }
+    cases
+}
+
+// A transparent newtype is the bare word its one field holds, so the parameter itself is
+// that field's value and there is no union to read.
+fn debug_newtype_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let slots = tc_enum_variant_slots(tid)
+    if slots.len() != 1 {
+        derive_ice(span, "transparent newtype '{node_name(decl)}' has {slots.len()} variants, not one")
+        return -1
+    }
+    let slot = slots.get(0).unwrap()
+    let fields = tc_evar_field_slots(slot)
+    if fields.len() != 1 {
+        derive_ice(span, "transparent newtype '{node_name(decl)}' carries {fields.len()} fields, not one")
+        return -1
+    }
+    let value = self_ref(tid, "self", span)
+    if value < 0 { return -1 }
+    let part = debug_part(tc_evfield_tid(fields.get(0).unwrap()), value, node_name(decl), span)
+    if !part.ok { return -1 }
+    let stmts = debug_stmts(variant_fmt(tc_evar_name(slot), [part]), [part], span)
+    if stmts.len() == 0 { return -1 }
+    ir_block(span, stmts)
+}
+
+// ── One field's rendering ────────────────────────────────────────────────
+
+// The textual scalars and the nested types each have their own debug form, so they are
+// asked before the printf table: a Char is quoted rather than printed as its code point,
+// and a nested type renders through its own derived method.
+fn debug_part(ftid: Int, value: Int, path: Str, span: Int) -> DebugPart ! Diag.Report {
+    let k = tc_tid_kind(tc_resolve(ftid))
+    if k == TyKind.Bool { return debug_bool_part(value, span) }
+    if k == TyKind.Char { return debug_helper_part(TYPE_CHAR, "char_debug", value, span) }
+    if k == TyKind.Str { return debug_helper_part(TYPE_STR, "str_debug", value, span) }
+    if k == TyKind.Struct || k == TyKind.Enum { return debug_nested_part(ftid, value, path, span) }
+    let spec = format_spec_of(ftid)
+    if spec == "" {
+        not_built(span, "@derive(Debug) on the {tk_name(k)} field '{path}'")
+        return debug_refused()
+    }
+    // C promotes a narrow integer across `...`, and the cast must name the promoted
+    // width or the formatter reads the wrong number of bytes.
+    let promoted = varargs_spelling(ftid)
+    let arg = if promoted == "" { value } else { ir_cast(ftid, span, promoted, value) }
+    DebugPart { spec: spec, arg: arg, pre: [], ok: true }
+}
+
+// A scalar whose debug form the runtime owns: the helper answers a string, so the
+// conversion is the one the scalar's own kind already names.
+fn debug_helper_part(tid: Int, helper: Str, value: Int, span: Int) -> DebugPart ! Diag.Report {
+    let rec = layout_of(TYPE_STR, Position.Local)
+    let spelling = spelling_or_ice(rec, "Str", span)
+    let spec = format_spec_of(tid)
+    if spelling == "" || spec == "" { return debug_refused() }
+    let arg = ir_call_runtime(TYPE_STR, span, spelling, c_runtime_helper(helper), rec.slot_form, [value])
+    DebugPart { spec: spec, arg: arg, pre: [], ok: true }
+}
+
+// C has no conditional IR node and the runtime exports no bool-to-text helper, so a Bool
+// becomes a string temp an `if` fills.
+fn debug_bool_part(value: Int, span: Int) -> DebugPart ! Diag.Report {
+    let rec = layout_of(TYPE_STR, Position.Local)
+    let spelling = spelling_or_ice(rec, "Str", span)
+    let spec = format_spec_of(TYPE_BOOL)
+    if spelling == "" || spec == "" { return debug_refused() }
+    let name = c_mint_local("d")
+    let no = ir_const(TYPE_STR, span, spelling, c_string_literal(bool_false))
+    let bind = ir_let(TYPE_STR, span, spelling, name, rec.slot_form, no)
+    let target = ir_var_ref(TYPE_STR, span, spelling, name, rec.slot_form)
+    let yes = ir_const(TYPE_STR, span, spelling, c_string_literal(bool_true))
+    let fill = ir_if(span, value, ir_block(span, [ir_assign(span, target, yes)]), -1)
+    let arg = ir_var_ref(TYPE_STR, span, spelling, name, rec.slot_form)
+    DebugPart { spec: spec, arg: arg, pre: [bind, fill], ok: true }
+}
+
+// A nested type is rendered by its own derived method, so the rendering stays one call
+// deep however far the nesting goes.
+fn debug_nested_part(ftid: Int, value: Int, path: Str, span: Int) -> DebugPart ! Diag.Report {
+    let rec = layout_of(TYPE_STR, Position.Local)
+    let spelling = spelling_or_ice(rec, "Str", span)
+    let spec = format_spec_of(TYPE_STR)
+    if spelling == "" || spec == "" { return debug_refused() }
+    let fdecl = tc_tid_decl_node(ftid)
+    if fdecl < 0 || fdecl == DECL_NODE_AMBIGUOUS {
+        derive_ice(span, "field type {ftid} has no unambiguous declaration to render through")
+        return debug_refused()
+    }
+    if !has_str(derive_names(fdecl), derive_debug) {
+        not_built(span, "@derive(Debug) on a field whose type '{node_name(fdecl)}' implements Debug by hand")
+        return debug_refused()
+    }
+    let refusal = shape_refusal(fdecl, ftid, derive_debug)
+    if refusal != "" {
+        not_built(span, "{refusal}, which the field '{path}' would have to call")
+        return debug_refused()
+    }
+    let arg = ir_call_direct(TYPE_STR, span, spelling, c_derive_method_name(fdecl, "debug"),
+        rec.slot_form, [value])
+    DebugPart { spec: spec, arg: arg, pre: [], ok: true }
 }

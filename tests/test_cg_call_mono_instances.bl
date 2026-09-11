@@ -1,0 +1,204 @@
+// A call of a generic function reaches one monomorphised instance, chosen per call site.
+//
+// The template has no C name: only an instance does. So the call stage must read which
+// instance the monomorphisation pass registered for this call, and two calls of the same
+// template at different type arguments must reach two different symbols.
+
+import lower_test_helpers.{
+    probe, rhs_of, fn_decl_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
+    assert_ice,
+}
+import ir.{IrKind, ir_c_name}
+import cg_call.{lower_call}
+import mono.{run_mono, instances, instance_for_call, MonoInstance}
+import layout.{set_current_inst, current_inst}
+import std.io
+
+fn src_mono() -> Str {
+    #"fn twice[T](x: T) -> T { x }
+
+fn plainly(k: Int) -> Int { k }
+
+fn main() {
+    let first = twice(3)
+    let again = twice(4)
+    let worded = twice("a")
+    let plain = plainly(5)
+    let _keep = [first, again, plain, worded.len()]
+}
+"#
+}
+
+fn src_nested() -> Str {
+    #"fn ident[T](v: T) -> T { v }
+
+fn wrap[U](w: U) -> U {
+    let inner = ident(w)
+    inner
+}
+
+fn main() {
+    let numbered = wrap(1)
+    let lettered = wrap("s")
+    let _keep = [numbered, lettered.len()]
+}
+"#
+}
+
+fn src_uninstanced() -> Str {
+    #"@ffi("blink_probe_len")
+fn probe_len[T](xs: List[T]) -> Int ! FFI {}
+
+fn shadowed[T](v: T) -> T { v }
+
+fn main() {
+    let counted = probe_len([1, 2, 3])
+    let shadowed = fn(q: Int) -> Int { q }
+    let taken = shadowed(2)
+    let _keep = [counted, taken]
+}
+"#
+}
+
+fn src_renamed() -> Str {
+    #"import std.map.{map_merge as merged}
+
+fn main() {
+    let left: Map[Str, Int] = Map()
+    let right: Map[Str, Int] = Map()
+    let joined = merged(left, right)
+    let _keep = [joined.len()]
+}
+"#
+}
+
+// Every instance the pass registered for one template, by its C name.
+fn names_for(decl: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(inst.c_name) }
+    }
+    out
+}
+
+fn assert_holds(label: Str, names: List[Str], want: Str) {
+    if !names.contains(want) { io.println("FAIL: {label}: '{want}' is not a registered instance") }
+    assert(names.contains(want))
+}
+
+test "a call of a generic function is a call of its monomorphised instance" {
+    let program = probe("cg_call_mono", src_mono())
+    run_mono(program)
+    let id = lower_call(rhs_of("first"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_shape("shape", id, "CallDirect(Const)")
+    assert_verifies("verify", id)
+    assert_holds("symbol", names_for(fn_decl_of("twice")), ir_c_name(id))
+}
+
+test "two calls of one template at different type arguments reach different symbols" {
+    let program = probe("cg_call_mono", src_mono())
+    run_mono(program)
+    let num = lower_call(rhs_of("first"))
+    let word = lower_call(rhs_of("worded"))
+    assert_kind("num kind", num, IrKind.CallDirect)
+    assert_kind("word kind", word, IrKind.CallDirect)
+    let names = names_for(fn_decl_of("twice"))
+    assert_eq_str("instances", "{names.len()}", "2")
+    assert_holds("num symbol", names, ir_c_name(num))
+    assert_holds("word symbol", names, ir_c_name(word))
+    if ir_c_name(num) == ir_c_name(word) {
+        io.println("FAIL: both calls reached '{ir_c_name(num)}'")
+    }
+    assert(ir_c_name(num) != ir_c_name(word))
+}
+
+test "two calls of one template at the same type argument reach one symbol" {
+    let program = probe("cg_call_mono", src_mono())
+    run_mono(program)
+    let one = lower_call(rhs_of("first"))
+    let other = lower_call(rhs_of("again"))
+    assert_kind("first kind", one, IrKind.CallDirect)
+    assert_kind("again kind", other, IrKind.CallDirect)
+    assert_eq_str("symbol", ir_c_name(other), ir_c_name(one))
+}
+
+test "a generic call the current instance does not contain has no instance to name" {
+    let program = probe("cg_call_mono", src_mono())
+    run_mono(program)
+    set_current_inst(0)
+    assert_ice("stale", lower_call(rhs_of("first")), "MonoInstanceNotRegistered")
+    set_current_inst(-1)
+}
+
+// The index of every instance of one template, in registration order.
+fn indexes_for(decl: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut i = 0
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(i) }
+        i = i + 1
+    }
+    out
+}
+
+test "one call inside a generic body reaches one callee instance per instance of that body" {
+    let program = probe("cg_call_mono_nested", src_nested())
+    run_mono(program)
+    let call = rhs_of("inner")
+    let bodies = indexes_for(fn_decl_of("wrap"))
+    assert_eq_str("bodies", "{bodies.len()}", "2")
+    let mut reached: List[Str] = []
+    for body in bodies {
+        set_current_inst(body)
+        assert_eq_str("body", "{current_inst()}", "{body}")
+        let id = lower_call(call)
+        assert_kind("kind", id, IrKind.CallDirect)
+        reached.push(ir_c_name(id))
+    }
+    set_current_inst(-1)
+    let callees = names_for(fn_decl_of("ident"))
+    assert_eq_str("callees", "{callees.len()}", "2")
+    assert_holds("first", callees, reached.get(0).unwrap())
+    assert_holds("second", callees, reached.get(1).unwrap())
+    if reached.get(0).unwrap() == reached.get(1).unwrap() {
+        io.println("FAIL: both bodies reached '{reached.get(0).unwrap()}'")
+    }
+    assert(reached.get(0).unwrap() != reached.get(1).unwrap())
+}
+
+// ── The two facts the call stage reads ────────────────────────────────────
+
+test "the pass records the instance a generic call reaches and nothing for a plain call" {
+    let program = probe("cg_call_mono", src_mono())
+    run_mono(program)
+    let idx = instance_for_call(-1, rhs_of("first"))
+    assert(idx >= 0)
+    let inst = instances().get(idx).unwrap()
+    assert_eq_str("template", "{inst.base_decl_node}", "{fn_decl_of("twice")}")
+    assert_eq_str("plain", "{instance_for_call(-1, rhs_of("plain"))}", "-1")
+}
+
+// ── Templates the pass never instantiates ─────────────────────────────────
+
+test "a generic bridged to one C symbol is called by that symbol, not by an instance" {
+    let program = probe("cg_call_uninstanced", src_uninstanced())
+    run_mono(program)
+    let id = lower_call(rhs_of("counted"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_eq_str("symbol", ir_c_name(id), "blink_probe_len")
+}
+
+test "a closure shadowing a generic function is a call form this stage has not built" {
+    let program = probe("cg_call_uninstanced", src_uninstanced())
+    run_mono(program)
+    assert_ice("shadowed", lower_call(rhs_of("taken")), "CodegenStageNotBuilt")
+}
+
+test "a call of a generic imported under another name reaches the same instance" {
+    let program = probe("cg_call_renamed", src_renamed())
+    run_mono(program)
+    let id = lower_call(rhs_of("joined"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_holds("symbol", names_for(fn_decl_of("map_merge")), ir_c_name(id))
+}
