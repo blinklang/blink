@@ -109,6 +109,7 @@ row names the helper in `cg_emit.bl` or the kind in `cg_print.bl` that writes it
 | Carrier wrap | `((T){.tag = t, .member = v})`; `((T){.tag = t})` with no payload | `CarrierWrap` |
 | Struct or tuple new | `((T){a, b})`; `((T){0})` when empty | `StructNew`, `TupleNew` |
 | Container new | `T c = ctor(); append(c, elems...)`; the append symbol is a table keyed on the constructor symbol | `ContainerNew` |
+| Container spread | `extend(c, source);` in the place of the append for that kid, where `extend` is the kid's c_name (`blink_list_extend`) and `c` is the container under construction; a `ContainerSpread` anywhere else is the misplaced-kind ICE | `ContainerSpread` under `ContainerNew` |
 | Match | `if (s == a) { } else if (s == b) { } else { }`; a non-name scrutinee binds first | `Switch` |
 | Loop | `while (1) { }` | `Loop` |
 | Panic | `__blink_panic_dispatch(msg); __builtin_unreachable();` | `Panic` |
