@@ -19,10 +19,11 @@ import cg_reg.{
     cg_reg_modules, cg_reg_module_of, cg_reg_reset, cg_reg_test_decls,
 }
 import cg_decl.{
-    cg_decl_emit_epilogue, cg_decl_emit_ev, cg_decl_emit_fn_decl,
-    cg_decl_emit_impl_method_decl, cg_decl_emit_globals, cg_decl_emit_prologue,
-    cg_decl_emit_typedefs, cg_decl_reset,
+    BodySite, cg_decl_body_site, cg_decl_emit_epilogue, cg_decl_emit_ev,
+    cg_decl_emit_fn_decl, cg_decl_emit_fn_def, cg_decl_emit_impl_method_decl,
+    cg_decl_emit_globals, cg_decl_emit_prologue, cg_decl_emit_typedefs, cg_decl_reset,
 }
+import cg_stmt.{cg_stmt_reset, lower_fn}
 
 effect Codegen {
     effect Emit
@@ -68,6 +69,7 @@ fn begin_unit(program: Int) ! Diag.Report {
     cg_reg_reset()
     cg_reg_build(program)
     cg_decl_reset()
+    cg_stmt_reset()
 }
 
 // The declaration half, in the order C requires: a type must be complete where a later
@@ -152,21 +154,30 @@ fn methods_in_scope(cfg: CgConfig, module_key: Str, shared: Bool) -> List[Int] {
     out
 }
 
-// Function bodies are the one part of a unit this stage cannot produce yet. Reporting
-// here rather than emitting a body-less unit is what keeps a half-written compiler from
-// linking and running as if it were whole. A test block is a body too, and the entry shim
-// calls a runner that only the test table defines.
+// One declaration's body, or the report that names the stage which would write it. A
+// unit that leaves a body out links as an undefined symbol at best, so every gap is
+// named here rather than discovered by the linker. A binding that needs no wrapper is the
+// one shape with no body at all, and it is not a gap.
+//
+// Nothing here reads the diagnostic count to decide whether to go on. A report that
+// repeats one already made does not raise that count, so it cannot tell a body that
+// failed from one that succeeded. The caller discards the whole unit instead.
+fn emit_bodies(decls: List[Int]) ! Diag.Report {
+    for d in decls {
+        match cg_decl_body_site(d) {
+            BodySite.ThisUnit => cg_decl_emit_fn_def(d, false, lower_fn(d))
+            BodySite.PerInstance => diag_ice_stage_not_built("cg mono instance bodies", d)
+            BodySite.ForeignWrapper => diag_ice_stage_not_built("cg foreign wrapper bodies", d)
+            BodySite.Nothing => {}
+        }
+    }
+}
+
+// The definition half. A test block is a body too, and the entry shim calls a runner
+// that only the test table defines, so a unit with tests is not whole without it.
 fn emit_definitions(cfg: CgConfig, module_key: Str, shared: Bool) ! Diag.Report {
-    let fns = fns_in_scope(cfg, module_key, shared)
-    if fns.len() > 0 {
-        diag_ice_stage_not_built("cg function bodies", fns.get(0).unwrap())
-        return
-    }
-    let methods = methods_in_scope(cfg, module_key, shared)
-    if methods.len() > 0 {
-        diag_ice_stage_not_built("cg impl method bodies", methods.get(0).unwrap())
-        return
-    }
+    emit_bodies(fns_in_scope(cfg, module_key, shared))
+    emit_bodies(methods_in_scope(cfg, module_key, shared))
     let tests = decls_in_scope(cfg, module_key, cg_reg_test_decls())
     if tests.len() == 0 { return }
     diag_ice_stage_not_built("cg test bodies", tests.get(0).unwrap())

@@ -1,0 +1,159 @@
+import std.fs
+import std.io
+import typecheck.{check_types}
+import layout.{layout_reset}
+import cname.{cname_reset}
+import diagnostics.{diag_entries}
+import cg.{CgConfig, generate}
+import compiler.{compile_to_program}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+// The stage a report names, not merely that some report was made. Every probe here calls
+// `assert`, whose expression the unbuilt expression stage already reports, so a count of
+// reports cannot tell one stage's gap from another's.
+fn ices_naming(stage: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.message.contains(stage) { n = n + 1 }
+    }
+    n
+}
+
+fn assert_ice_names(stage: Str, before: Int) {
+    let after = ices_naming(stage)
+    if after <= before {
+        io.println("FAIL: no new ice naming '{stage}': {before} before, {after} after")
+    }
+    assert(after > before)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output must not have '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    program
+}
+
+fn standalone_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+// `plain` is a root body: every type in it is concrete, so it has one definition. `ident`
+// is a generic base, which has a definition only once a type argument is chosen — one per
+// monomorphized instance, and none under the base itself.
+fn root_src() -> Str {
+    #"fn plain(a: Int) -> Int { a }
+fn ident[T](x: T) -> T { x }
+fn main() { assert(true) }
+"#
+}
+
+// A root body reaches the statement stage and comes back as a definition, not only the
+// prototype the declaration half already wrote.
+test "a root function body is emitted as a definition" {
+    let program = build_probe(root_src(), "cg_def_root_probe")
+    let text = generate(program, standalone_cfg())
+    assert_has(text, "int64_t blink_u_plain(int64_t a);")
+    assert_has(text, "int64_t blink_u_plain(int64_t a) \{")
+}
+
+// The definition of a generic base is one per instance, so the base itself contributes
+// none. An empty body under the base's own name would be a function that returns nothing
+// where its signature promises a value.
+test "a generic base contributes no root definition" {
+    let program = build_probe(root_src(), "cg_def_generic_probe")
+    let text = generate(program, standalone_cfg())
+    assert_has(text, "int64_t blink_u_plain(int64_t a) \{")
+    assert_lacks(text, "blink_u_ident")
+}
+
+// The per-instance loop is the next stage, not a shape this one may skip quietly: a
+// generic base with instances whose bodies nobody emitted links as an undefined symbol.
+test "a generic base reports the per-instance body stage as not built" {
+    let program = build_probe(root_src(), "cg_def_generic_ice_probe")
+    let before = ices_naming("cg mono instance bodies")
+    let _text = generate(program, standalone_cfg())
+    assert_ice_names("cg mono instance bodies", before)
+}
+
+// A foreign binding's Blink body is empty by construction: the call it stands for is a
+// call to the foreign symbol, which this stage does not write yet. Lowering the empty
+// body would emit a wrapper that falls off the end of a value-returning function.
+fn ffi_src() -> Str {
+    #"@ffi("foreign_thing")
+@trusted
+fn wrapped(x: Int) -> Int ! FFI {}
+
+fn main() { assert(true) }
+"#
+}
+
+test "a foreign binding wrapper is never emitted as an empty body" {
+    let program = build_probe(ffi_src(), "cg_def_ffi_probe")
+    let before = ices_naming("cg foreign wrapper bodies")
+    let text = generate(program, standalone_cfg())
+    assert_has(text, "int64_t blink_wrapped(int64_t x);")
+    assert_lacks(text, "int64_t blink_wrapped(int64_t x) \{")
+    assert_ice_names("cg foreign wrapper bodies", before)
+}
+
+// The statement stage numbers its temporaries from zero in each unit. Two emits of one
+// program in one process must therefore agree, or the second is reading state the first
+// left behind.
+test "two emits of one program produce the same unit" {
+    let program = build_probe(root_src(), "cg_def_reset_probe")
+    let first = generate(program, standalone_cfg())
+    let second = generate(program, standalone_cfg())
+    assert_eq_int("the two emits are the same length", second.len(), first.len())
+    assert(first == second)
+}
+
+// A method's name carries its receiver type and trait, so the declaration and the definition
+// must agree on it. One producer answers for both, and a prototype the definition does not
+// match compiles a caller against a symbol no unit defines.
+fn method_src() -> Str {
+    #"type Box { v: Int }
+
+trait Peek {
+    fn peek(self) -> Int
+}
+
+impl Peek for Box {
+    fn peek(self) -> Int { self.v }
+}
+
+fn main() { assert(true) }
+"#
+}
+
+test "an impl method is declared and defined under one name" {
+    let program = build_probe(method_src(), "cg_def_method_probe")
+    let text = generate(program, standalone_cfg())
+    assert_has(text, "int64_t blink_Box_Peek_peek(blink_Box self);")
+    assert_has(text, "int64_t blink_Box_Peek_peek(blink_Box self) \{")
+}
