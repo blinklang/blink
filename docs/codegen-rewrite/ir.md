@@ -52,7 +52,7 @@ interned type, `Int`) and its c_spelling is
 empty, except `Let`, which holds the declared type. A statement has one owner:
 the verifier rejects a statement reached twice even when it is flagged.
 
-22 kinds are values. 15 kinds are statements.
+23 kinds are values. 15 kinds are statements.
 
 ## Inline rule
 
@@ -66,7 +66,7 @@ computed; it does not change what the tree means.
 `match` lowers to `Let` with no initialiser, followed by `Assign` inside each
 arm, followed by a `VarRef`.
 
-## The 37 kinds
+## The 38 kinds
 
 The tables list kids in order. `n` is the kid count. A kid marked *value* must be
 a value node; *stmt* any statement; *Block* the `Block` kind; *Const* the
@@ -86,7 +86,8 @@ a value node; *stmt* any statement; *Block* the `Block` kind; *Const* the
 | `FieldGet` | `ir_field_get(tid, span, c_spelling, field, slot_form, obj)` | `[obj: value]` | the C field name | caller |
 | `StructNew` | `ir_struct_new(tid, span, c_spelling, fields)` | `[field_0 .. field_n-1: value]` in declaration order | empty | `Inline` |
 | `TupleNew` | `ir_tuple_new(tid, span, c_spelling, elems)` | `[elem_0 .. : value]` | empty | `Inline` |
-| `ContainerNew` | `ir_container_new(tid, span, c_spelling, ctor_symbol, elems)` | `[elem_0 .. : value]` (Map: key, value, key, value ...) | the runtime constructor symbol | `InlineWord` |
+| `ContainerNew` | `ir_container_new(tid, span, c_spelling, ctor_symbol, elems)` | `[elem_0 .. : value]` (Map: key, value, key, value ...); an element may be a `ContainerSpread` | the runtime constructor symbol | `InlineWord` |
+| `ContainerSpread` | `ir_container_spread(tid, span, c_spelling, extend_symbol, source)` | `[source: value]` | the runtime copy symbol (`blink_list_extend`) | `InlineWord` |
 | `Box` | `ir_box(tid, span, c_spelling, pointee_spelling, value)` | `[value: value]` | the pointee C type, the `sizeof` operand | `PointerBoxed` |
 | `Unbox` | `ir_unbox(tid, span, c_spelling, slot_form, ptr)` | `[ptr: value]` | empty | caller |
 | `CarrierWrap` | `ir_carrier_wrap(tid, span, c_spelling, member, tag, payload)` | `[tag: Const]` or `[tag: Const, payload: value]` | the payload member: `value`, `ok`, `err`; empty for None | `Inline` |
@@ -99,6 +100,13 @@ a value node; *stmt* any statement; *Block* the `Block` kind; *Const* the
 | `CallRuntime` | `ir_call_runtime(tid, span, c_spelling, symbol, slot_form, args)` | `[arg_0 .. : value]` | a `blink_*` runtime symbol | caller |
 | `ClosureNew` | `ir_closure_new(tid, span, c_spelling, fn_symbol, captures)` | `[capture_0 .. : value]` | the lifted function's C symbol | `InlineWord` |
 | `EffectPerform` | `ir_effect_perform(tid, span, c_spelling, slot, slot_form, args)` | `[arg_0 .. : value]` | the handler vtable slot | caller |
+
+`ContainerSpread` is `[..xs, y]`: it copies every element of its source into the
+container being built. It is legal only as a direct kid of `ContainerNew`, so the
+destination it extends is the container the printer is building and no node
+has to name it. Its tid and c_spelling are the source container's. The printer
+writes it as `<extend_symbol>(<tmp>, <source>)` in place of the append for that
+kid; a `ContainerSpread` reached anywhere else is a misplaced-kind ICE.
 
 `Box.c_spelling` is the pointer type the node produces. `Box.c_name` is the
 pointee type; the printer uses it as the `sizeof` operand for the heap copy.
@@ -163,11 +171,12 @@ begins `root <r>: `. It rejects:
 | non-Const Switch label | `kid <i> case label must be a Const` |
 | non-Const CarrierWrap tag | `kid <i> tag must be a Const` |
 | non-lvalue Assign target | `kid <i> target must be an lvalue` |
+| ContainerSpread not directly under ContainerNew | `ContainerSpread outside a ContainerNew` |
 | value reached twice, flag clear | `value reached twice without must_materialize` |
 | statement reached twice | `statement reached twice, a statement has one owner` |
 
 The kinds that print a c_name: `Const`, `VarRef`, `GlobalRef`, `Unary`,
-`Binary`, `FieldGet`, `FieldSet`, `ContainerNew`, `Box`, `CarrierUnwrap`,
+`Binary`, `FieldGet`, `FieldSet`, `ContainerNew`, `ContainerSpread`, `Box`, `CarrierUnwrap`,
 `CallDirect`, `CallClosure`, `CallVirtual`, `CallRuntime`, `ClosureNew`,
 `EffectPerform`, `HandlerInstall`, `Let`, and `CarrierWrap` with a payload.
 `CarrierWrap` without a payload and `WithScope` take a c_name that may be empty.
