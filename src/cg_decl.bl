@@ -1,11 +1,207 @@
-// cg_decl.bl: typedefs, function declarations, globals and the translation-unit prologue.
+// cg_decl.bl: the declaration half of a translation unit — typedefs, function
+// declarations, globals, effect vtables and the prologue.
 //
-// A stage of the tid-native emitter, not yet written. Its entry point reports I0004 and
-// returns, so the driver's diag_ice_count check turns a call into a loud failure rather
-// than a translation unit that is silently empty.
+// Every C spelling here comes from the reading layer through one gate,
+// cg_decl_require_spelling. layout_of never guesses, so a type it declines has no
+// spelling at all and the gate raises I0001 rather than writing a default: a wrong C
+// type compiles cleanly and then gets the program wrong at run time.
+//
+// Typedef order is a dependency order read off the type graph, not the order the
+// declarations were written in. A member's type must be complete where the embedding
+// typedef names it, so a declaration is emitted only after every nominal type its
+// members reach by value.
 
-import diagnostics.{Diag, diag_ice_stage_not_built}
+import diagnostics.{Diag, diag_ice, UNSOLVED_TYPEVAR_AT_CODEGEN}
+import layout.{
+    LayoutRecord, Position, layout_of, field_layout_of, ensure_typedef_for,
+    layout_take_typedefs,
+}
+import cname.{c_safe_name, c_type_decl_name, c_variant_tag_macro, cname_is_runtime_owned, td_guard_name}
+import cg_print.{
+    print_simple_enum_typedef, print_struct_typedef, print_tagged_enum_typedef,
+    print_typedef_blocks,
+}
+import cg_reg.{cg_reg_tid_for_decl, cg_reg_type_decls}
+import typecheck.{
+    TyKind, tc_enum_variant_slots, tc_evar_field_slots, tc_evar_name, tc_evfield_name,
+    tc_evfield_tid, tc_resolve, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
+    tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind, tc_type_str,
+}
+import parser.{
+    get_annotation, node_fields, node_name, node_type_params, node_value, sublist_get,
+    sublist_length,
+}
 
-pub fn cg_decl_lower_prologue(program: Int) ! Diag.Report {
-    diag_ice_stage_not_built("cg_decl", program)
+// 1 while a declaration's dependencies are being emitted, 2 once its typedef is written.
+let mut decl_state: Map[Int, Int] = Map()
+
+pub fn cg_decl_reset() {
+    decl_state = Map()
+}
+
+// ── The spelling gate ─────────────────────────────────────────────────────
+
+fn spelling_or_ice(rec: LayoutRecord, what: Str) -> Str ! Diag.Report {
+    if rec.decline_reason == "" { return rec.c_spelling }
+    diag_ice("NoCSpellingForType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "no C spelling for {what}: {rec.decline_reason}", 0, 0,
+        "every type that reaches code generation must be concrete and nameable; this is a compiler bug")
+    ""
+}
+
+// The one place a type id becomes a C spelling for a declaration. A declined type
+// answers "" and has raised I0001; no caller may substitute anything for it.
+pub fn cg_decl_require_spelling(tid: Int, position: Position) -> Str ! Diag.Report {
+    spelling_or_ice(layout_of(tid, position), tc_type_str(tid))
+}
+
+// ── Typedefs ──────────────────────────────────────────────────────────────
+
+pub fn cg_decl_emit_typedefs() ! Diag.Report {
+    for decl in cg_reg_type_decls() { emit_type_decl(decl) }
+}
+
+// A declaration whose C typedef this translation unit does not write: a generic base
+// (mono writes one typedef per instance), an alias (it has no storage of its own), an
+// opaque foreign handle (the foreign header declares the pointee) and a type whose
+// typedef lives in runtime.h.
+fn skips_typedef(decl: Int) -> Bool {
+    let tps = node_type_params(decl)
+    if tps != -1 && sublist_length(tps) > 0 { return true }
+    if node_fields(decl) == -1 && node_value(decl) != -1 { return true }
+    if get_annotation(decl, "ffi.opaque") != -1 { return true }
+    cname_is_runtime_owned(decl)
+}
+
+fn emit_type_decl(decl: Int) ! Diag.Report {
+    if decl < 0 { return }
+    // 1 means this declaration is already on the stack: the only way back to it is a
+    // member that reaches its own owner, and such a member is stored boxed, so the
+    // cycle needs no completed typedef and is not followed.
+    if (decl_state.get(decl) ?? 0) != 0 { return }
+    decl_state.insert(decl, 1)
+    let tid = cg_reg_tid_for_decl(decl)
+    if tid < 0 || skips_typedef(decl) {
+        decl_state.insert(decl, 2)
+        return
+    }
+    for mtid in member_tids(tid) {
+        for dep in nominal_deps(mtid) { emit_type_decl(dep) }
+    }
+    decl_state.insert(decl, 2)
+    emit_one(decl, tid)
+}
+
+// The declared member types of a nominal type, in declaration order: a struct's fields,
+// or every field of every enum variant.
+fn member_tids(tid: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    if tc_tid_kind(tc_resolve(tid)) == TyKind.Enum {
+        for v in tc_enum_variant_slots(tid) {
+            for f in tc_evar_field_slots(v) { out.push(tc_evfield_tid(f)) }
+        }
+        return out
+    }
+    for f in tc_struct_field_slots(tid) { out.push(tc_sfield_tid(f)) }
+    out
+}
+
+// The nominal declarations a member type reaches BY VALUE. A carrier or tuple names its
+// members inside its own typedef, so the walk goes through it; a runtime container is one
+// C type whatever it holds, so the walk stops there.
+fn nominal_deps(tid: Int) -> List[Int] {
+    let r = tc_resolve(tid)
+    let k = tc_tid_kind(r)
+    if k == TyKind.Struct || k == TyKind.Enum {
+        let decl = tc_tid_decl_node(r)
+        if decl < 0 { return [] }
+        return [decl]
+    }
+    if k != TyKind.Option && k != TyKind.Result && k != TyKind.Tuple { return [] }
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < tc_tid_child_count(r) {
+        for d in nominal_deps(tc_tid_child(r, i)) { out.push(d) }
+        i = i + 1
+    }
+    out
+}
+
+// layout.bl builds a member's Option, Result and Tuple typedefs children-first as
+// finished blocks. Draining them here, before the typedef that names them, is what puts
+// an inner carrier ahead of the outer one.
+fn flush_member_typedefs(tid: Int) {
+    let _ = ensure_typedef_for(tid)
+    print_typedef_blocks(layout_take_typedefs())
+}
+
+fn emit_one(decl: Int, tid: Int) ! Diag.Report {
+    let c_name = c_type_decl_name(decl)
+    let guard = td_guard_name(c_name)
+    if tc_tid_kind(tc_resolve(tid)) == TyKind.Enum {
+        emit_enum(decl, tid, guard, c_name)
+        return
+    }
+    emit_struct(decl, tid, guard, c_name)
+}
+
+fn emit_struct(decl: Int, tid: Int, guard: Str, c_name: Str) ! Diag.Report {
+    let mut fields: List[Str] = []
+    for slot in tc_struct_field_slots(tid) {
+        let ftid = tc_sfield_tid(slot)
+        flush_member_typedefs(ftid)
+        let fname = tc_sfield_name(slot)
+        let spelling = spelling_or_ice(field_layout_of(decl, ftid), "{node_name(decl)}.{fname}")
+        if spelling == "" { return }
+        fields.push("{spelling} {c_safe_name(fname)}")
+    }
+    print_struct_typedef(guard, c_name, fields)
+}
+
+// A variant's declaration node, needed for the tag macro cname spells. The variant
+// entries typecheck registered are in declaration order, so they line up by index.
+fn variant_node(decl: Int, index: Int) -> Int {
+    let vars = node_fields(decl)
+    if vars == -1 || index >= sublist_length(vars) { return -1 }
+    sublist_get(vars, index)
+}
+
+fn emit_enum(decl: Int, tid: Int, guard: Str, c_name: Str) ! Diag.Report {
+    let slots = tc_enum_variant_slots(tid)
+    let mut names: List[Str] = []
+    let mut fields: List[List[Str]] = []
+    let mut macros: List[Str] = []
+    let mut carries_data = false
+    let mut i = 0
+    while i < slots.len() {
+        let slot = slots.get(i).unwrap()
+        let vnode = variant_node(decl, i)
+        if vnode < 0 { return }
+        let decls = variant_field_decls(decl, slot)
+        if decls.len() > 0 { carries_data = true }
+        names.push(tc_evar_name(slot))
+        fields.push(decls)
+        macros.push(c_variant_tag_macro(decl, vnode))
+        i += 1
+    }
+    if !carries_data {
+        let mut ordinals: List[Str] = []
+        for n in names { ordinals.push("{c_name}_{n}") }
+        print_simple_enum_typedef(guard, c_name, ordinals)
+        return
+    }
+    print_tagged_enum_typedef(guard, c_name, names, fields, macros)
+}
+
+fn variant_field_decls(owner: Int, var_slot: Int) -> List[Str] ! Diag.Report {
+    let mut out: List[Str] = []
+    for f in tc_evar_field_slots(var_slot) {
+        let ftid = tc_evfield_tid(f)
+        flush_member_typedefs(ftid)
+        let fname = tc_evfield_name(f)
+        let spelling = spelling_or_ice(field_layout_of(owner, ftid), "{node_name(owner)}.{tc_evar_name(var_slot)}.{fname}")
+        if spelling == "" { return out }
+        out.push("{spelling} {c_safe_name(fname)}")
+    }
+    out
 }

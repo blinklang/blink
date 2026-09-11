@@ -1,0 +1,107 @@
+import std.fs
+import std.io
+import typecheck.{check_types}
+import layout.{layout_reset}
+import cname.{c_safe_name}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_decl.{cg_decl_reset, cg_decl_emit_typedefs}
+import compiler.{compile_to_program}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.println("FAIL: {label}: got '{got}' want '{want}'")
+    }
+    assert_eq(got, want)
+}
+
+// Grade carries no payload anywhere, so it is an ordinal. Shape mixes payload-carrying
+// and payload-less variants, which is the case a union member per variant gets wrong.
+// Odd names two fields after C keywords, which are legal Blink and illegal C.
+fn probe_src() -> Str {
+    #"type Grade { Pass, Fail }
+type Shape { Circle(radius: Int), Dot, Rect(width: Int, height: Int) }
+type Odd { default: Int, register: Int }
+fn main() {
+    let g: Grade = Grade.Pass
+    let s: Shape = Shape.Dot
+    let o: Odd = Odd { default: 1, register: 2 }
+    assert(o.default + o.register == 3)
+    match g {
+        Grade.Pass => assert(true)
+        Grade.Fail => assert(false)
+    }
+    match s {
+        Shape.Circle(r) => assert(r == 0)
+        Shape.Dot => assert(true)
+        Shape.Rect(w, h) => assert(w == h)
+    }
+}
+"#
+}
+
+// The probe is deleted BEFORE any assertion so a red row never leaves the file behind.
+fn typedef_text() -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/cg_decl_enum_keyword_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    cg_decl_emit_typedefs()
+    print_take()
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: typedef output has no '{needle}'")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: typedef output must not have '{needle}'")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+// An enum whose every variant is payload-less is a C ordinal enum, not a tagged union.
+test "a payload-less enum lowers to a C enum of its variant ordinals" {
+    let text = typedef_text()
+    assert_has(text, "typedef enum \{ blink_Grade_Pass, blink_Grade_Fail } blink_Grade;")
+}
+
+// A payload-less variant of a data enum rides the tag alone: an empty struct member is
+// not C, and the variants that do carry data still need theirs.
+test "a data enum gives a union member only to the variants that carry data" {
+    let text = typedef_text()
+    assert_has(text, "} Circle;")
+    assert_has(text, "} Rect;")
+    assert_lacks(text, "} Dot;")
+    assert_has(text, "} blink_Shape;")
+}
+
+// The tag of a variant is its declaration index, counting the payload-less ones.
+test "every variant gets a tag macro numbered by declaration order" {
+    let text = typedef_text()
+    assert_has(text, "#define blink_Shape_Circle_TAG 0")
+    assert_has(text, "#define blink_Shape_Dot_TAG 1")
+    assert_has(text, "#define blink_Shape_Rect_TAG 2")
+}
+
+// A field named after a C keyword is escaped where it is declared.
+test "a field named after a C keyword is escaped in the typedef" {
+    let text = typedef_text()
+    assert_has(text, "_blink_default;")
+    assert_has(text, "_blink_register;")
+}
+
+test "the escape leaves a name C already accepts alone" {
+    assert_eq_str("plain name", c_safe_name("radius"), "radius")
+    assert_eq_str("keyword", c_safe_name("default"), "_blink_default")
+}

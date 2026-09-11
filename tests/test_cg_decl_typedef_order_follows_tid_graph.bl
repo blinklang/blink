@@ -1,0 +1,106 @@
+import std.fs
+import std.io
+import typecheck.{check_types}
+import layout.{layout_reset}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_decl.{cg_decl_reset, cg_decl_emit_typedefs}
+import compiler.{compile_to_program}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+// Holder and Outer are written BEFORE the Leaf they embed, so an emitter that follows
+// source order or first-writer-wins puts Leaf last and the C compiler sees an incomplete
+// member. Only an order computed from the type graph puts Leaf first.
+fn probe_src() -> Str {
+    #"type Holder { pair: (Option[Int], Leaf) }
+type Outer { inner: Leaf }
+type Leaf { n: Int }
+fn main() {
+    let h: Holder = Holder { pair: (None, Leaf { n: 1 }) }
+    let o: Outer = Outer { inner: Leaf { n: 2 } }
+    assert(o.inner.n == 2)
+    match h.pair.0 {
+        Some(v) => assert(v == 0)
+        None => assert(true)
+    }
+}
+"#
+}
+
+// The probe is deleted BEFORE any assertion so a red row never leaves the file behind.
+fn typedef_text() -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/cg_decl_typedef_order_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    cg_decl_emit_typedefs()
+    print_take()
+}
+
+fn at(text: Str, needle: Str) -> Int {
+    let i = text.index_of(needle)
+    if i < 0 {
+        io.println("FAIL: typedef output has no '{needle}'")
+    }
+    assert(i >= 0)
+    i
+}
+
+fn assert_before(text: Str, first: Str, second: Str) {
+    let a = at(text, first)
+    let b = at(text, second)
+    if a >= b {
+        io.println("FAIL: '{first}' at {a} must come before '{second}' at {b}")
+    }
+    assert(a < b)
+}
+
+fn count_of(text: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut rest = text
+    while true {
+        let i = rest.index_of(needle)
+        if i < 0 { break }
+        n = n + 1
+        rest = rest.slice(i + needle.len(), rest.len())
+    }
+    n
+}
+
+// A member's type must be complete where the embedding typedef names it, so the emission
+// order is the dependency order of the type graph, not the order the declarations were
+// written in.
+test "a struct over a tuple over an Option emits its members first" {
+    let text = typedef_text()
+    assert_before(text, "} blink_Option_int;", "} blink_Tuple2_Option_int_Leaf;")
+    assert_before(text, "} blink_Leaf;", "} blink_Tuple2_Option_int_Leaf;")
+    assert_before(text, "} blink_Tuple2_Option_int_Leaf;", "} blink_Holder;")
+}
+
+// A struct embedding another struct by value follows the same rule, even when the embedded
+// declaration is written later in the file.
+test "an embedded struct declared later still emits first" {
+    let text = typedef_text()
+    assert_before(text, "} blink_Leaf;", "} blink_Outer;")
+}
+
+// Each typedef is written once, under its guard, however many members reach it.
+test "a shared member type is emitted once under one guard" {
+    let text = typedef_text()
+    assert_eq_int("one Leaf typedef", count_of(text, "} blink_Leaf;"), 1)
+    assert_eq_int("one Leaf guard", count_of(text, "#ifndef BLINK_TD_blink_Leaf\n"), 1)
+    assert_eq_int("one Holder typedef", count_of(text, "} blink_Holder;"), 1)
+}
+
