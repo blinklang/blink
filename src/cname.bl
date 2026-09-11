@@ -18,7 +18,7 @@
 import typecheck.{
     TAGPOS_INNER, TAGPOS_TOP, TyKind, TypePoolEntry, tc_resolve,
     tc_resolve_transparent_alias_name, tc_tid_decl_node, DECL_NODE_AMBIGUOUS, ty_param_list, ty_pool,
-    tc_tid_handler_effect, tc_handler_effect_root,
+    tc_tid_handler_effect, tc_handler_effect_root, is_user_effect_handle_name,
 }
 import parser.{
     get_annotation, get_str_named_arg, node_args, node_name, node_source_module,
@@ -511,23 +511,65 @@ fn scalar_inner(k: TyKind) -> Str {
 
 // ── Runtime symbols keyed on a tid ───────────────────────────────────────────────
 
-// The vtable struct of a Handler tid. Every handler of one root effect shares one
-// vtable type, so the sub-effect does not ride the name. The eight builtin effects
-// have runtime-declared vtables; a user effect gets `blink_ue_<root>_vtable`.
-pub fn c_vtable_type_name(handler_tid: Int) -> Str {
+// The builtin effects, each in the blink_ev slot it owns, written in the order the
+// struct declares them. Prefix compatibility is what that order buys: the archive is
+// compiled against a shorter blink_ev than the user unit sees, so a builtin field can
+// never move and none can be dropped. Nothing here reads the index yet — the stage that
+// emits the struct is still to come, and it must walk this list in order. Both names
+// below come off this one list, so a ninth builtin effect is one line rather than two
+// tables to keep level.
+let builtin_effect_roots: List[Str] = ["IO", "FS", "Net", "Crypto", "Rand", "Time", "Env", "Process"]
+
+fn is_builtin_effect_root(root: Str) -> Bool {
+    let mut i = 0
+    while i < builtin_effect_roots.len() {
+        if builtin_effect_roots.get(i).unwrap() == root { return true }
+        i = i + 1
+    }
+    false
+}
+
+// The root effect a handler tid installs for. A sub-effect shares its root's slot and a
+// full-size vtable, so the sub-effect rides neither name.
+//
+// Only a root that dispatches through the effect vector has a slot at all. `Arena` is a
+// Handler type and is NOT one: the spec makes it a marker effect that escape analysis
+// consumes, so it owns no field and no vtable. Neither does a root nobody declared. Both
+// answer an ICE segment, because inventing `ue_arena` would name a field that no
+// translation unit defines.
+//
+// Reading the declared handles makes both names below depend on the program under
+// compilation, not on the tid alone: typecheck clears that list per program, so the same
+// tid harvested from an earlier program answers an ICE segment afterwards.
+fn effect_root_of(handler_tid: Int) -> Str {
     let tid = tc_resolve(handler_tid)
     if tid < 0 || tid >= ty_pool.len() { return ICE_SEG_TID_OUT_OF_RANGE }
     if ty_pool.get(tid).unwrap().kind != TyKind.Handler { return ICE_SEG_UNHANDLED_KIND }
     let root = tc_handler_effect_root(tc_tid_handler_effect(tid))
-    if root == "IO" { return "blink_io_vtable" }
-    if root == "FS" { return "blink_fs_vtable" }
-    if root == "Net" { return "blink_net_vtable" }
-    if root == "Crypto" { return "blink_crypto_vtable" }
-    if root == "Rand" { return "blink_rand_vtable" }
-    if root == "Time" { return "blink_time_vtable" }
-    if root == "Env" { return "blink_env_vtable" }
-    if root == "Process" { return "blink_process_vtable" }
+    if root == "" { return ICE_SEG_UNSOLVED_TYPEVAR }
+    if is_builtin_effect_root(root) { return root }
+    if is_user_effect_handle_name(root.to_lower()) == 0 { return ICE_SEG_UNHANDLED_KIND }
+    root
+}
+
+// The vtable struct of a Handler tid. The eight builtin effects have runtime-declared
+// vtables; a user effect gets `blink_ue_<root>_vtable`.
+pub fn c_vtable_type_name(handler_tid: Int) -> Str {
+    let root = effect_root_of(handler_tid)
+    if diag_is_ice_seg(root) { return root }
+    if is_builtin_effect_root(root) { return "blink_{root.to_lower()}_vtable" }
     "blink_ue_{root.to_lower()}_vtable"
+}
+
+// The blink_ev field a handler install writes for a Handler tid. A builtin effect names
+// its own root; a user effect sits behind `ue_`, which is what stops an effect spelled
+// `Io` from taking the builtin `io` slot. Two USER effects whose names differ only in
+// case still collide here, because the handle typecheck registers is already lowered.
+pub fn c_ev_field_name(handler_tid: Int) -> Str {
+    let root = effect_root_of(handler_tid)
+    if diag_is_ice_seg(root) { return root }
+    if is_builtin_effect_root(root) { return root.to_lower() }
+    "ue_{root.to_lower()}"
 }
 
 // The key-operations table a Map or Set keyed on this tid binds at construction. A
