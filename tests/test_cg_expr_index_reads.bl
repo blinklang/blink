@@ -1,0 +1,99 @@
+// `xs[i]` lowered as an expression. The read itself belongs to the call stage, which owns
+// the one reader `[i]` and `.get(i)` share; this stage only finds the two operands and
+// hands them over. Every test starts at lower_expr, the entry a statement reaches, so a
+// test here fails if the dispatch arm is missing rather than passing on a direct call.
+
+import lower_test_helpers.{
+    probe, probe_but, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
+    assert_ice,
+}
+import ir.{IrKind, ir_c_name, ir_kid}
+import cg_expr.{lower_expr}
+
+fn src_reads() -> Str {
+    #"fn main() {
+    let nums = [1, 2, 3]
+    let at = 1
+    let literal_read = nums[0]
+    let named_read = nums[at]
+    let compound_read = nums[at + 1]
+    let past_end = nums[99]
+    let words = ["a", "b"]
+    let word_read = words[at]
+    let reals = [1.5, 2.5]
+    let real_read = reals[at]
+    let _keep = [literal_read, named_read, compound_read, past_end]
+    let _keep2 = [word_read.len(), real_read.to_int()]
+}
+"#
+}
+
+test "a literal index reads the element through the container's runtime reader" {
+    probe("cg_expr_index", src_reads())
+    let id = lower_expr(rhs_of("literal_read"))
+    assert_kind("kind", id, IrKind.Cast)
+    assert_shape("shape", id, "Cast(CallRuntime(VarRef, Const))")
+    assert_eq_str("reader", ir_c_name(ir_kid(id, 0)), "blink_list_get")
+    assert_verifies("verify", id)
+}
+
+test "a named index lowers its operand like any other expression" {
+    probe("cg_expr_index", src_reads())
+    let id = lower_expr(rhs_of("named_read"))
+    assert_shape("shape", id, "Cast(CallRuntime(VarRef, VarRef))")
+    assert_eq_str("reader", ir_c_name(ir_kid(id, 0)), "blink_list_get")
+    assert_verifies("verify", id)
+}
+
+test "a compound index is lowered whole, not folded or re-read" {
+    probe("cg_expr_index", src_reads())
+    let id = lower_expr(rhs_of("compound_read"))
+    assert_shape("shape", id, "Cast(CallRuntime(VarRef, Binary(VarRef, Const)))")
+    assert_verifies("verify", id)
+}
+
+// Nothing here knows the container's length, and a constant index is not a promise about
+// it: the bounds test is the runtime reader's. An index past the end must therefore lower
+// exactly like any other constant, or this stage would be deciding a question it cannot see.
+test "an index past the end lowers like any other constant index" {
+    probe("cg_expr_index", src_reads())
+    let past = lower_expr(rhs_of("past_end"))
+    let inside = lower_expr(rhs_of("literal_read"))
+    assert_shape("past the end", past, "Cast(CallRuntime(VarRef, Const))")
+    assert_eq_str("same reader", ir_c_name(ir_kid(past, 0)), ir_c_name(ir_kid(inside, 0)))
+    assert_verifies("verify", past)
+}
+
+fn src_str_index() -> Str {
+    #"fn main() {
+    let nums = [1, 2, 3]
+    let key = "one"
+    let refused = nums[key]
+    let _keep = [refused]
+}
+"#
+}
+
+// A Str index is typecheck's to refuse, and it does. This stage never sees one, so it needs
+// no arm for it; the test is here to keep that boundary where it is.
+test "an index that is not an Int is refused before this stage, by typecheck" {
+    probe_but("cg_expr_index_str", src_str_index(), "TypeError")
+}
+
+// A Str is a pointer, but one that fits the runtime's word, so it needs no more than the
+// cast an Int needs. One reader serves both, which is the point of there being one.
+test "an element the runtime holds as a word reads through the same one reader" {
+    probe("cg_expr_index", src_reads())
+    let id = lower_expr(rhs_of("word_read"))
+    assert_shape("shape", id, "Cast(CallRuntime(VarRef, VarRef))")
+    assert_eq_str("reader", ir_c_name(ir_kid(id, 0)), "blink_list_get")
+    assert_verifies("verify", id)
+}
+
+// A Float does not fit that word, so the runtime holds it behind a pointer and reading it
+// is a dereference the call stage does not write yet. This stage still hands the operands
+// over: the refusal that comes back names that gap, rather than this stage guessing.
+test "an element held behind a pointer is refused by the stage that owns the read" {
+    probe("cg_expr_index", src_reads())
+    assert_ice("float element", lower_expr(rhs_of("real_read")), "BoxedElementReadNotLowered")
+}
