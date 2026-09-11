@@ -2,9 +2,10 @@ import std.fs
 import std.io
 import layout.{layout_reset}
 import cg_test_helpers.{cg_probe_compile, cg_probe_ices_named}
-import cname.{c_ev_type_name}
+import cname.{c_ev_field_name, c_ev_type_name, c_vtable_type_name}
 import cg_print.{print_reset, print_take}
 import cg_reg.{cg_reg_reset, cg_reg_build}
+import typecheck.{make_handler_type}
 import cg_decl.{cg_decl_reset, cg_decl_emit_prologue, cg_decl_emit_epilogue, cg_decl_emit_ev}
 
 fn assert_eq_int(label: Str, got: Int, want: Int) {
@@ -129,4 +130,42 @@ test "a user-declared effect reports the unbuilt stage" {
     cg_decl_emit_ev("")
     assert_eq_int("the probe's own effect reports the unbuilt stage once",
         cg_probe_ices_named("CodegenStageNotBuilt"), 1)
+}
+
+// The slot a user effect owns. Both names come from cname, which is what the handler
+// install reads, so a test that wrote them down here would prove only its own spelling.
+fn logger_vtable() -> Str { c_vtable_type_name(make_handler_type("Logger")) }
+fn logger_field() -> Str { c_ev_field_name(make_handler_type("Logger")) }
+
+// A handler install writes one field of the vector, so an effect with no field of its own
+// has nowhere to install to.
+test "a user-declared effect gets a field of its own in the evidence vector" {
+    let _ = build_probe(user_effect_src(), "cg_decl_ev_user_field_probe")
+    cg_decl_emit_ev("")
+    let text = print_take()
+    assert_has(text, "{logger_vtable()}* {logger_field()};")
+}
+
+// The archive is compiled against a vector that stops after the builtin fields, so a user
+// field that moved ahead of one of them would read the archive's slot as its own.
+test "a user field sits after every builtin field" {
+    let _ = build_probe(user_effect_src(), "cg_decl_ev_user_order_probe")
+    cg_decl_emit_ev("")
+    let text = print_take()
+    let at = text.index_of("{logger_vtable()}* {logger_field()};")
+    assert(at >= 0)
+    for f in ["io", "fs", "net", "crypto", "rand", "time", "env", "process"] {
+        let b = text.index_of("blink_{f}_vtable* {f};")
+        assert(b >= 0)
+        assert(b < at)
+    }
+}
+
+// Every field of the vector starts at its default, or an effect nobody handles is read
+// through a pointer the program never set.
+test "the default vector initializes the user field too" {
+    let _ = build_probe(user_effect_src(), "cg_decl_ev_user_default_probe")
+    cg_decl_emit_ev("")
+    let text = print_take()
+    assert_has(text, "ev.{logger_field()} = &{logger_vtable()}_default;")
 }
