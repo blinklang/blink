@@ -37,7 +37,7 @@ count means anything.
 
 | Task | What it does | Fails when |
 | --- | --- | --- |
-| `task ci` | The rewrite gate: `gen1`, `ratchet`, `test-ratchet`, `test-lint`, `corpus`, `corpus-check`, formatter goldens and idempotency with gen1, `typecheck-suite`. | Any step fails. |
+| `task ci` | The rewrite gate: `gen1`, `ratchet`, `test-ratchet`, `test-lint`, `corpus`, `corpus-check`, formatter goldens and idempotency with gen1, `typecheck-suite`, `rewrite-suite`. | Any step fails. |
 | `task gen1` | gen0 compiles `src/blinkc_main.bl` and `src/cli.bl`, then links `build/gen1/bin/blinkc` and `build/gen1/bin/blink`. | Nonzero exit, an `error[` line, or a link error. |
 | `task corpus` | Compiles and runs every `tests/test_*.bl` on its own under gen1. Writes `build/corpus.json`. Then runs the lint. | Never for a test result. Only when the lint fails. |
 | `task corpus-check` | Compares `build/corpus.json` with `scripts/corpus_baseline.json` and with the baseline in the previous commit. A test that now lives in `tests/pinned/` is dropped from both references first. | The pass count drops, or a file that passed no longer passes. |
@@ -46,6 +46,7 @@ count means anything.
 | `task test-lint` | Runs `scripts/test_lint_codegen.sh`: each row goes red on a fixture. | A row does not catch its construct. |
 | `task ratchet` | Three debt counts over the whole compiler (see below), then the lint. | A count rises, or a zero-gate row is not zero. |
 | `task typecheck-suite` | Runs the files in `scripts/typecheck_suite.txt` under gen0. They assert typechecker behaviour by RUNNING, so they need a compiler that can emit; under gen0 the suite measures gen0's typechecker, not this tree's. | Any file does not pass. |
+| `task rewrite-suite` | Runs every rewrite unit-test file under gen0: `tests/test_cg_*.bl`, `test_layout_*.bl`, `test_cname_*.bl`, `test_ir_*.bl`, minus `scripts/rewrite_suite_exclude.txt`. Writes `build/rewrite_suite.json`. | Any file does not pass, a prelude root is missing, one of the four prefixes matches no file, the exclude file is gone, or an exclude line names a file that does not exist or that the glob does not select. |
 | `task ci-release` | The old full gate: self-host regen, `blink test`, per-module invariants, installed smoke. `mono-diff` and `node-tid-diff` are parked: still tasks, no longer in any gate. | Any step fails. |
 
 `mono-diff` and `node-tid-diff` still exist as tasks. Neither gate runs
@@ -55,6 +56,47 @@ The formatter step in `task ci` runs the golden and idempotency checks
 only. The semantic check compiles and runs every formatted test, and
 those binaries call the relative `build/blink`, which only a release
 build provides. `task test-fmt` and `task ci-release` run all three.
+
+## The rewrite unit suite
+
+`task rewrite-suite` runs `scripts/rewrite_suite.sh`. These files test the
+rewrite layer directly: `cg_*`, `layout`, `cname` and `ir`. They test it by
+RUNNING, so they need a compiler that can emit C. This tree cannot, so the
+suite runs under gen0 and measures this tree's rewrite sources compiled by
+the pin.
+
+The file list is a glob over four prefixes, not a list file: a new test file
+joins the suite by existing, and nobody can forget it. To keep a file out,
+name it in `scripts/rewrite_suite_exclude.txt` with a reason above the line.
+A line there must name a file that exists and that the glob selects, or the
+suite stops; an exclusion that names no file hides a file instead of skipping
+it. The glob is not recursive, so a test parked in `tests/pinned/` needs no
+line. Each prefix must also match at least one file, or a whole group could
+leave the suite and the other three would still report ok.
+
+The suite runs through `corpus.sh --only`, so each file gets the same private
+sandbox the corpus gives it, and the row fails unless every file passes.
+
+Every one of these files compiles a probe program in process, which needs the
+`std.*` prelude. A compiler resolves it from `<dir of argv[0]>/lib/std`, then
+`$BLINK_ROOT/lib/std`, then the embedded registry — and a test binary leaves
+the registry empty. So a test binary with neither directory compiles nothing,
+reports no error the probe reads, and its assertions hold over an empty
+program. The suite checks both roots and stops when one is missing: the
+compiler's own `lib/`, which `corpus_one.sh` links beside the `blinkc` in each
+sandbox, and `build/lib`, which serves the same file run straight from the
+checkout root. The script removes the old `.bl` files and copies `lib/std` and
+`lib/pkg` into `build/lib` on every run, so neither an edit nor a deleted
+module under `lib/` can leave a stale prelude behind; it copies rather than
+links because `bootstrap.sh` copies into the same place and a link to `lib/`
+would make that a copy onto itself. A `build/lib` that already points at
+`lib/` needs no copy and gets none. A `build/lib`, `build/lib/std` or
+`build/lib/pkg` that links somewhere else stops the run, because the copy
+would write into a tree the run was never asked to touch.
+
+`corpus_one.sh` stops a file the same way when the compiler under test has no
+`lib/std`, so `task corpus` and `task typecheck-suite` cannot run a probe over
+an empty program either.
 
 ## How the corpus runs a file
 

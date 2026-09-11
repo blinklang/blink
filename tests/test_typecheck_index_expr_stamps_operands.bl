@@ -1,0 +1,113 @@
+// `xs[i]` is one expression with two operands. Codegen reads the type of all three from the
+// same memo it reads every other expression from, so typecheck must stamp the index
+// expression with the element type and stamp both the receiver and the index. A stamp
+// that lands only on the surrounding `let` leaves the element read with no type to lower.
+
+import lower_test_helpers.{probe, rhs_of, assert_eq_str}
+import typecheck.{check_types, tc_lookup_node_tid, tc_resolve, tc_type_str, TYPE_INT}
+import parser.{node_kind, node_obj, node_index}
+import ast.{NodeKind, nk_of}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_entry_count, diag_truncate}
+import std.fs
+import std.io
+
+fn src_index() -> Str {
+    #"fn pick(nums: List[Int], at: Int) -> Int {
+    let elem = nums[at]
+    let first = nums[0]
+    let shifted = nums[at + 1]
+    let words = ["a", "b"]
+    let word = words[at]
+    elem + first + shifted + word.len()
+}
+
+fn main() {
+    let _keep = pick([1, 2, 3], 1)
+}
+"#
+}
+
+fn stamp_of(label: Str, node: Int) -> Int {
+    let tid = tc_lookup_node_tid(node)
+    if tid < 0 { io.println("FAIL: {label} (node {node}) has no recorded type") }
+    assert(tid >= 0)
+    tid
+}
+
+fn assert_index_stamped(name: Str, want_elem: Str, want_recv: Str) {
+    let idx = rhs_of(name)
+    assert(nk_of(node_kind(idx)) == NodeKind.IndexExpr)
+    let elem = stamp_of("{name}: index expression", idx)
+    assert_eq_str("{name}: element type", tc_type_str(tc_resolve(elem)), want_elem)
+    let recv = stamp_of("{name}: receiver", node_obj(idx))
+    assert_eq_str("{name}: receiver type", tc_type_str(tc_resolve(recv)), want_recv)
+    let index = stamp_of("{name}: index", node_index(idx))
+    assert(tc_resolve(index) == TYPE_INT)
+}
+
+test "an index expression carries the element type and both operands carry theirs" {
+    let _p = probe("index_expr_stamps", src_index())
+    assert_index_stamped("elem", "Int", "List[Int]")
+    assert_index_stamped("word", "Str", "List[Str]")
+}
+
+test "a literal index and a compound index are stamped like a named one" {
+    let _p = probe("index_expr_stamps_forms", src_index())
+    assert_index_stamped("first", "Int", "List[Int]")
+    assert_index_stamped("shifted", "Int", "List[Int]")
+}
+
+fn src_str_index() -> Str {
+    #"fn main() {
+    let nums = [1, 2, 3]
+    let key = "one"
+    let _elem = nums[key]
+}
+"#
+}
+
+// Diagnostics this probe adds that name the wanted error. The shared buffer is truncated
+// back afterwards so the entry cannot surface as a failure of a later test in this binary.
+fn count_type_errors(path: Str, src: Str, must_mention: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    let before = diag_entry_count()
+    check_types(program)
+    let _ = fs.delete(path)
+    let mut hits = 0
+    let mut i = before
+    while i < diag_entries.len() {
+        let d = diag_entries.get(i).unwrap()
+        if d.name == "TypeError" && d.severity == "error" && d.message.contains(must_mention) {
+            hits = hits + 1
+        }
+        i = i + 1
+    }
+    diag_truncate(before)
+    hits
+}
+
+test "a non-Int index is reported as a type error on the index operand" {
+    let hits = count_type_errors("build/index_expr_str_index.bl", src_str_index(), "index must be an Int")
+    if hits == 0 { io.println("FAIL: no TypeError for a Str index") }
+    assert(hits >= 1)
+}
+
+fn src_open_index() -> Str {
+    #"fn main() {
+    let nums = [1, 2, 3]
+    let mut holder = []
+    let last = holder.pop().unwrap()
+    let picked = nums[last]
+    let _keep = [picked]
+}
+"#
+}
+
+// `holder` is never constrained elsewhere, so the index expression is the only thing that can
+// settle its element type; left open it would be an E0301 and the stamp would not read Int.
+test "an index whose type is still open is pinned to Int by the index expression" {
+    let _p = probe("index_expr_open_index", src_open_index())
+    assert_index_stamped("picked", "Int", "List[Int]")
+}
