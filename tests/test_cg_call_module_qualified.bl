@@ -1,0 +1,149 @@
+// `mod.f(args)` is a free-function call the caller qualified with a module.
+//
+// The parser gives it the shape of a method call, so the call stage has to tell a module
+// qualifier from a receiver: there is no value to lower, and the declaration is the one
+// that module declares rather than whichever module happens to spell the name.
+
+import lower_test_helpers.{
+    probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
+}
+import cg_test_helpers.{cg_probe_front_end_clean}
+import diagnostics.{diag_reset}
+import parser.{node_kind, node_name, node_source_module, nodes}
+import ast.{NodeKind, nk_of}
+import ir.{IrKind, ir_c_name}
+import cname.{c_fn_decl_name}
+import cg_call.{lower_call}
+import mono.{run_mono, instances}
+import std.io
+
+fn src_plain() -> Str {
+    #"import std.num
+
+fn main() {
+    let worded = num.int_to_str(7)
+    let _keep = [worded.len()]
+}
+"#
+}
+
+fn src_generic() -> Str {
+    #"import std.map
+
+fn main() {
+    let left: Map[Str, Int] = Map()
+    let right: Map[Str, Int] = Map()
+    let joined = map.map_merge(left, right)
+    let _keep = [joined.len()]
+}
+"#
+}
+
+fn src_reexport() -> Str {
+    #"import std.http
+
+fn main() {
+    let why = http.status_reason(404)
+    let _keep = [why.len()]
+}
+"#
+}
+
+fn src_shadowing() -> Str {
+    #"import std.num
+
+fn int_to_str(n: Int) -> Str { "mine" }
+
+fn main() {
+    let theirs = num.int_to_str(7)
+    let _keep = [theirs.len()]
+}
+"#
+}
+
+// A probe the front end built. The lowering harness compiles a source and hands back a
+// program whether or not the front end accepted it, so a probe that does not ask could
+// measure a unit whose prelude never arrived and hold every claim it then makes.
+fn clean_probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    diag_reset()
+    let program = probe(stem, src)
+    cg_probe_front_end_clean("the probe source")
+    program
+}
+
+// The probe's own module key. A test about which module a call resolved in has to name
+// both sides of that question, and only the probe's own key is a spelling the test writes
+// down: the library's is derived by the front end and belongs to it.
+let own_module = "__main__"
+
+fn fn_decl_where(name: Str, in_probe: Bool) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.FnDef && node_name(i) == name {
+            if (node_source_module(i) == own_module) == in_probe { return i }
+        }
+        i = i + 1
+    }
+    io.println("FAIL: no function '{name}' declared where the test expects it")
+    assert(false)
+    -1
+}
+
+fn library_fn_decl(name: Str) -> Int { fn_decl_where(name, false) }
+
+fn probe_fn_decl(name: Str) -> Int { fn_decl_where(name, true) }
+
+fn names_for(decl: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(inst.c_name) }
+    }
+    out
+}
+
+fn assert_holds(label: Str, names: List[Str], want: Str) {
+    if !names.contains(want) { io.println("FAIL: {label}: '{want}' is not a registered instance") }
+    assert(names.contains(want))
+}
+
+test "a module-qualified call of a plain function calls that module's function" {
+    let program = clean_probe("cg_call_qualified", src_plain())
+    run_mono(program)
+    let id = lower_call(rhs_of("worded"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_verifies("verify", id)
+    assert_eq_str("symbol", ir_c_name(id), c_fn_decl_name(library_fn_decl("int_to_str")))
+}
+
+test "a module qualifier is not a receiver, so the call takes only its written arguments" {
+    let program = clean_probe("cg_call_qualified", src_plain())
+    run_mono(program)
+    assert_shape("shape", lower_call(rhs_of("worded")), "CallDirect(Const)")
+}
+
+test "a module-qualified call of a generic function reaches its monomorphised instance" {
+    let program = clean_probe("cg_call_qualified_generic", src_generic())
+    run_mono(program)
+    let id = lower_call(rhs_of("joined"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_holds("symbol", names_for(library_fn_decl("map_merge")), ir_c_name(id))
+}
+
+test "a qualifier that re-exports another module's function still reaches it" {
+    let program = clean_probe("cg_call_qualified_reexport", src_reexport())
+    run_mono(program)
+    let id = lower_call(rhs_of("why"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_eq_str("symbol", ir_c_name(id), c_fn_decl_name(library_fn_decl("status_reason")))
+}
+
+test "the qualifier decides the module, so a same-named function here is not the callee" {
+    let program = clean_probe("cg_call_qualified_shadow", src_shadowing())
+    run_mono(program)
+    let id = lower_call(rhs_of("theirs"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_eq_str("symbol", ir_c_name(id), c_fn_decl_name(library_fn_decl("int_to_str")))
+    let mine = c_fn_decl_name(probe_fn_decl("int_to_str"))
+    if ir_c_name(id) == mine { io.println("FAIL: the call reached this file's '{mine}'") }
+    assert(ir_c_name(id) != mine)
+}
