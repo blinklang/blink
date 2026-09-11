@@ -1,14 +1,12 @@
 import std.fs
 import std.io
-import typecheck.{check_types}
 import layout.{layout_reset}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_named, cg_probe_ices_naming}
 import cname.{cname_reset}
-import diagnostics.{diag_ice_count}
 import cg_print.{print_reset, print_take}
 import cg_reg.{cg_reg_reset, cg_reg_build}
 import cg_decl.{cg_decl_reset, cg_decl_emit_fn_decls}
 import cg.{CgConfig, generate}
-import compiler.{compile_to_program}
 
 fn assert_eq_int(label: Str, got: Int, want: Int) {
     if got != want {
@@ -33,9 +31,7 @@ fn assert_lacks(text: Str, needle: Str) {
 
 fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
     let path = "build/{name}.bl"
-    write_file(path, src)
-    let program = compile_to_program(path, 1)
-    check_types(program)
+    let program = cg_probe_compile(path, src)
     layout_reset()
     cname_reset()
     let _ = fs.delete(path)
@@ -68,19 +64,23 @@ fn standalone_cfg() -> CgConfig {
 // type variable and get a decline it must report as a compiler bug.
 test "a generic function base gets no C declaration" {
     let _ = build_probe(generic_src(), "cg_decl_generic_base_probe")
-    let before = diag_ice_count
     cg_decl_emit_fn_decls()
     let text = print_take()
-    assert_eq_int("ice raised", diag_ice_count - before, 0)
+    assert_eq_int("the probe's own declarations report no stage",
+        cg_probe_ices_named("CodegenStageNotBuilt"), 0)
     assert_has(text, "blink_u_plain")
     assert_lacks(text, "blink_u_ident")
 }
 
 // A test block is a function body. Until bodies are lowered, an entry shim that calls
 // the test runner would name a runner this unit never defines, so the gap reports.
+//
+// The report must name the test-body stage and be made on the probe's own file. A whole-
+// program unit also lowers the prelude, whose own unbuilt stages would satisfy a bare
+// count of reports without this unit's test blocks having been looked at at all.
 test "a unit with test blocks reports the unbuilt stage" {
     let program = build_probe(test_block_src(), "cg_decl_test_block_probe")
-    let before = diag_ice_count
     let _ = generate(program, standalone_cfg())
-    assert(diag_ice_count - before > 0)
+    assert_eq_int("the test-body stage reports once, on the probe's own test block",
+        cg_probe_ices_naming("cg test bodies"), 1)
 }
