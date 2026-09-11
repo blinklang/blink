@@ -10,7 +10,12 @@
 # Rows:
 #   br_ids_in_source         a br ticket id anywhere in src/ or Taskfile.yml;
 #                            absolute zero gate (br is local-only)
-#   pub_let_mut              mutable module globals in the old codegen + mono
+#   pub_let_mut              mutable module globals anywhere in src/. Scoped to the
+#                            whole surface on purpose: a row named after the files it
+#                            exists to empty reads 0 by construction once they are
+#                            deleted, and then gates nothing. The codegen-surface half
+#                            of this rule lives in lint_codegen.sh rows L3, which hold
+#                            src/cg*.bl to an allowlist and an absolute zero
 #   layout_decline_unhandled a layout decline read outside layout.bl that no
 #                            diag_ice within the next three lines turns into
 #                            an ICE (a swallowed decline is a guessed answer)
@@ -97,14 +102,12 @@ decline_unhandled() {
 # synthetic test fixture without duplicating the row list three times.
 compute_rows() {
   root="$1"
-  cg="$root/src/codegen*.bl"
-  mono="$root/src/mono.bl"
   allbl="$root/src/*.bl"
   tf="$root/Taskfile.yml"
 
   cat <<ROWS
 br_ids_in_source $(( $(cnt '\bbr [0-9a-z]{6}\b' "$allbl $tf") + $(cnt '\b(g3sba0|qf1vzx|0kpmac)\b' "$allbl $tf") ))
-pub_let_mut $(cnt '^pub let mut' "$cg $mono")
+pub_let_mut $(cnt '^pub let mut' "$allbl")
 layout_decline_unhandled $(decline_unhandled "$root")
 ROWS
 }

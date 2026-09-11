@@ -19,24 +19,32 @@ Ignore short-term gain, and always think about what is most correct according to
 
 ## Architecture
 
-Pipeline: lexer → parser → typecheck → codegen → C output
+Pipeline: lexer → parser → typecheck → mono → lowering to IR → C printer
+Codegen layer: src/cg.bl (driver, four emit modes) over src/cg_*.bl (stages), src/mono.bl,
+src/layout.bl (C shape of a tid), src/cname.bl (C symbol names), src/ir.bl (typed lowered IR)
+IMPORTANT: the tid-native emitters land stage by stage. A stage that has not landed
+reports ICE I0004 CodegenStageNotBuilt, so this tree cannot yet emit C. Every task that
+compiles a program is therefore NOT runnable until the emitters return: `bootstrap`,
+`build-cli`, `regen`, `test`, `test-fmt`, `compile-test`, `ci-release`, and everything
+under Debugging below. `task ci` is the only gate that runs, and it measures the tree
+with the pinned gen0
 Entry points: src/compiler.bl (compiler), src/cli.bl (CLI tool), src/blinkc_main.bl (compiler binary)
 Stdlib: lib/std/. Tests: tests/. Spec: sections/. Decisions: decisions/
 Build output: build/ (gitignored)
 
 ## Build & Verify
 
-Bootstrap: `task bootstrap` — builds blinkc at `build/blinkc`. Requires `blink` on PATH or existing build/blinkc + build/blink (gen0 needs both: blinkc to emit gen1.c, blink to build the stdlib archive)
-Regen: `task regen` — rebuild compiler from source + verify (Gen1 vs Gen2 fixed-point)
+Bootstrap: `task bootstrap` — builds blinkc at `build/blinkc`. Requires `blink` on PATH or existing build/blinkc + build/blink (gen0 needs both: blinkc to emit gen1.c, blink to build the stdlib archive). NOT runnable during the codegen rewrite: it self-compiles, which needs an emitter
+Regen: `task regen` — rebuild compiler from source + verify (Gen1 vs Gen2 fixed-point). NOT runnable during the codegen rewrite: the tree cannot emit C until the emitters land
 Adding a lib/std or lib/pkg module: just run `task regen` — the embedded registry refresh is automatic (no manual edit to src/embedded_stdlib_registry.bl)
 CLI: `build/blink build <file.bl>` | `build/blink run <file.bl>` | `build/blink check <file.bl>` | `build/blink doc <module>`
-Build CLI: `task build-cli` — produces `build/blink`
-Test: `task test` — compile+run all test_*.bl in tests/
-Test formatter: `task test-fmt` — golden outputs + idempotency + semantic checks
-Single test: `task compile-test -- test_name`
+Build CLI: `task build-cli` — produces `build/blink`. NOT runnable during the rewrite (depends on bootstrap). Use `task gen1`, which produces `build/gen1/bin/{blinkc,blink}`
+Test: `task test` — compile+run all test_*.bl in tests/. NOT runnable during the rewrite
+Test formatter: `task test-fmt` — golden outputs + idempotency + semantic checks. NOT runnable during the rewrite (depends on bootstrap); `task ci` runs the goldens under gen1
+Single test: `task compile-test -- test_name`. NOT runnable during the rewrite (depends on build-cli)
 Rewrite gate: `task ci` — gen0 compiles src (gen1) + corpus monotone + lint + fmt goldens + typecheck suite. Run after every change during the codegen rewrite. See docs/codegen-rewrite/harness.md
-Release gate: `task ci-release` — regen + test + test-fmt + per-module invariants. Run at release points
-Corpus: `task corpus` — every tests/test_*.bl compiled+run on its own under the pinned gen0; result in build/corpus.json; `task corpus-check` gates it against scripts/corpus_baseline.json
+Release gate: `task ci-release` — regen + test + test-fmt + per-module invariants. Run at release points. Also not runnable until the emitters land
+Corpus: `task corpus` — every tests/test_*.bl compiled+run on its own under gen1 (the current source compiled by the pinned gen0); result in build/corpus.json; `task corpus-check` gates it against scripts/corpus_baseline.json
 Quick run: `build/blink run <file.bl>` — compiles and runs in one step. Prefer this over manual blinkc+cc
 Low-level (dev): `build/blinkc <file.bl> <output.c>` then `cc -o <binary> <output.c> -lm`
 Archive-linked (dev): `build/blinkc --link-archive build/libblink_std.h <file.bl> <out.c>` then `cc -o <bin> <out.c> -Ibuild build/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections`
@@ -44,8 +52,13 @@ After modifying compiler sources: `task ci` during the rewrite; `task regen` the
 
 ## Debugging
 
+IMPORTANT: every command in this section needs a compiler that can emit C, so none of them
+works on this tree until the tid-native emitters land. They describe a released build.
+Front-end work (lexer, parser, typecheck, mono) is still debuggable: `build/gen1/bin/blink
+check <file.bl>` and the trace flags below stop before codegen.
+
 Inspect generated C: `build/blink build --emit c <file.bl>` — output goes to `build/<name>.c`
-Trace compiler phases: `build/blink run --blink-trace codegen <file.bl>` (also: lex, parse, typecheck, all)
+Trace compiler phases: `build/blink run --blink-trace typecheck <file.bl>` (also: lex, parse, mono, all)
 Fine-grained trace: `BLINK_TRACE_CHANNELS=<ch>[,<ch>...|all] build/blink build --emit c <file.bl>` — must
 be built from `src/cli.bl` (not `src/blinkc_main.bl`); `build/blinkc` ignores this env var. Channels are
 defined via `dbg_trace(channel, msg)` calls (`grep dbg_trace\( src/`) — read the call site for what a
@@ -57,6 +70,10 @@ Debug build: `build/blink run --debug <file.bl>` — enables debug_assert, compi
 
 The compiler compiles itself. `task regen` verifies by compiling the compiler twice (Gen1 + Gen2)
 and diffing the output — they must match
+
+IMPORTANT: this whole protocol is suspended during the codegen rewrite. `task regen` needs an
+emitter and this tree has none, so a feature cannot be locked in by a regen. Add the feature,
+run `task ci`, and leave the two-step and three-step dances below for when the emitters return
 
 Adding a new feature (2-step):
 1. Add the feature to the compiler (parser/codegen/etc) → `task regen`

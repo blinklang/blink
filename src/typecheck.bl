@@ -1,6 +1,5 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on, nk_of, nk_is_typed}
 import std.str.{str_to_lower}
-import codegen_types.{impl_is_element_agnostic, is_intrinsic_method, strip_module_qualifier}
 import parser.{
     get_annotation, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
@@ -13103,7 +13102,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
 
         // A local value shadowing a trait/module name makes `obj.method(args)` an
         // instance call, not a qualified trait call (§03c:590, §10.1:1164). Capture
-        // it here while scope is live so codegen/mono can route it correctly after
+        // it here while scope is live so the mono pass can route it correctly after
         // nr scope is torn down. Monotonic, so a later scope-torn-down re-inference
         // never un-marks it.
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident && nr_has_binding(node_name(obj_node)) != 0 {
@@ -18619,4 +18618,145 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
         if stood.contains_key(-1) { return }
     }
     tc_stamp_assert(order, owner, stood)
+}
+
+// ── Name and impl-shape helpers ────────────────────────────────────────────────
+//
+// These three answer questions typecheck itself asks. They lived in the old
+// codegen_types.bl only because that file was compiled into every program; the
+// answers were never a storage fact and nothing in codegen consumed them.
+
+// `std.db.row.Row` → `db.row.Row`. Strips one leading segment, not all of them.
+pub fn strip_module_qualifier(name: Str) -> Str {
+    let dot_pos = name.index_of(".")
+    if dot_pos >= 0 {
+        return name.substr(dot_pos + 1, name.len() - dot_pos - 1)
+    }
+    name
+}
+
+// Every `namespace.method` the compiler types itself rather than resolving to a
+// declared signature. This list must be a SUPERSET of the arms codegen emits: an
+// unlisted name falls out of the intrinsic gate and into the bare-name
+// fallthrough, which asks `lookup_fnsig("write")` rather than
+// `lookup_fnsig("io.write")` — nothing answers and the call types as unknown,
+// which unifies with anything.
+//
+// Short is the bug; long is harmless. `debug` is listed with no codegen arm
+// behind it and STAYS: a listed-but-unsigned name gets no type from either arm
+// and falls to the loud codegen backstop, and being listed is what keeps it off
+// the bare-name path where a free fn named `debug` could answer for it.
+// `println` has always been in that state. `env.vars` is deliberately NOT listed:
+// it is spelled in the effects spec but no codegen arm emits it, so it must keep
+// reaching the backstop rather than being affirmed here.
+pub fn is_intrinsic_method(namespace: Str, method: Str) -> Int {
+    if namespace == "net" {
+        if method == "connect" || method == "close" || method == "read" || method == "write" || method == "read_all" || method == "read_line" || method == "set_timeout" || method == "listen" || method == "accept" || method == "request" || method == "read_bytes" || method == "write_bytes" {
+            return 1
+        }
+    }
+    if namespace == "io" {
+        if method == "println" || method == "print" || method == "print_raw" || method == "eprintln" || method == "eprint" || method == "eprint_raw" || method == "log" || method == "debug" || method == "read_line" || method == "read_bytes" || method == "write" || method == "write_bytes" {
+            return 1
+        }
+    }
+    if namespace == "fs" {
+        if method == "read" || method == "write" || method == "list_dir" || method == "delete" || method == "errno" {
+            return 1
+        }
+    }
+    if namespace == "term" {
+        if method == "isatty" || method == "width" || method == "height" {
+            return 1
+        }
+    }
+    if namespace == "env" {
+        if method == "args" || method == "var" || method == "cwd" || method == "set_var" || method == "remove_var" || method == "exit" {
+            return 1
+        }
+    }
+    if namespace == "time" {
+        if method == "read" || method == "sleep" {
+            return 1
+        }
+    }
+    if namespace == "async" {
+        if method == "spawn" {
+            return 1
+        }
+    }
+    if namespace == "ffi" {
+        if method == "scope" {
+            return 1
+        }
+    }
+    0
+}
+
+fn tc_collect_type_ann_names(ann: Int, out: List[Str]) {
+    if ann == -1 { return }
+    let n = node_name(ann)
+    if n != "" { out.push(n) }
+    let elems = node_elements(ann)
+    if elems != -1 {
+        let mut i = 0
+        while i < sublist_length(elems) {
+            tc_collect_type_ann_names(sublist_get(elems, i), out)
+            i = i + 1
+        }
+    }
+    // A fn-type annotation stores its parameters in `elements` but its return
+    // type in `type_ann`, so the return binder is only reachable this way.
+    if n == "Fn" {
+        tc_collect_type_ann_names(node_type_ann(ann), out)
+    }
+}
+
+// True when no impl binder is bounded and no binder name appears in any method
+// signature. Such an impl cannot materialize an element by value nor operate on
+// one, so it is accepted where a per-element poly impl would not be.
+pub fn impl_is_element_agnostic(im: Int) -> Int {
+    let binders_sl = node_impl_binders(im)
+    if binders_sl == -1 { return 1 }
+    let nb = sublist_length(binders_sl)
+    if nb == 0 { return 1 }
+    // A where-clause bounds a binder just as an inline `[T: Bound]` does.
+    let where_sl = node_impl_where_bounds(im)
+    if where_sl != -1 && sublist_length(where_sl) != 0 { return 0 }
+    let mut bnames: List[Str] = []
+    let mut bi = 0
+    while bi < nb {
+        let b = sublist_get(binders_sl, bi)
+        if node_elements(b) != -1 { return 0 }
+        bnames.push(node_name(b))
+        bi = bi + 1
+    }
+    let methods_sl = node_methods(im)
+    if methods_sl == -1 { return 1 }
+    let mut j = 0
+    while j < sublist_length(methods_sl) {
+        let m = sublist_get(methods_sl, j)
+        let mut names: List[Str] = []
+        tc_collect_type_ann_names(node_type_ann(m), names)
+        let params_sl = node_params(m)
+        if params_sl != -1 {
+            let mut pi = 0
+            while pi < sublist_length(params_sl) {
+                tc_collect_type_ann_names(node_type_ann(sublist_get(params_sl, pi)), names)
+                pi = pi + 1
+            }
+        }
+        let mut ni = 0
+        while ni < names.len() {
+            let nm = names.get(ni).unwrap()
+            let mut bk = 0
+            while bk < bnames.len() {
+                if nm == bnames.get(bk).unwrap() { return 0 }
+                bk = bk + 1
+            }
+            ni = ni + 1
+        }
+        j = j + 1
+    }
+    1
 }

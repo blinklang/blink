@@ -177,7 +177,7 @@ echo 'pub let mut a: Int = 0' > "$GITWORK/src/codegen.bl"
   # reference commit counts 0 of it and the row would be failed for rising 0 -> 1 if a row
   # this commit adds were compared at all.
   printf '%s\n' '// newrow_marker' >> src/codegen.bl
-  awk '/^ROWS$/ { print "newrow $(cnt \047newrow_marker\047 \"$cg\")" } { print }' scripts/ratchet.sh > new.sh
+  awk '/^ROWS$/ { print "newrow $(cnt \047newrow_marker\047 \"$allbl\")" } { print }' scripts/ratchet.sh > new.sh
   cat new.sh > scripts/ratchet.sh
   rm -f new.sh
   ./scripts/ratchet.sh --update > /dev/null

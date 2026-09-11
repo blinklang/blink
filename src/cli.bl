@@ -34,9 +34,10 @@ import parser.{
     node_right, node_index, node_fields, node_handlers, node_start, node_end,
     node_methods, node_captures,
     sublist_length, sublist_get, get_annotation,
+    ann_str_val, positional_str_arg, positional_str_arg_count,
 }
 import ast.{NodeKind, dbg_channels}
-import typecheck.{TypeCheck, check_types}
+import typecheck.{TypeCheck, check_types, strip_module_qualifier}
 import compiler.{
     compile_to_program, reset_compiler_state, resolve_module_path,
     find_src_root, check_unused_imports, check_file_exists,
@@ -44,8 +45,7 @@ import compiler.{
     collect_imports, collect_root_imports, inject_prelude, merge_programs,
     set_strict_struct_layout,
 }
-import codegen.{Codegen, generate, generate_archive_header, generate_module_header, generate_module_object, enumerate_program_modules, cg_debug_mode, cg_trace_codegen, cg_deterministic}
-import codegen_types.{cg_emit_only_module, cg_skip_modules, cg_user_tu_mode, cg_blink_ev_extern_only, list_contains_str, strip_module_qualifier}
+import cg.{Codegen, CgConfig, generate, generate_archive_header, generate_module_header, generate_module_object, enumerate_program_modules}
 import build_stdlib.{build_stdlib_archive, list_stdlib_module_keys, resolve_blinkc_path, resolve_runtime_h}
 import stdlib_native_deps.{
     stdlib_native_dep_names, stdlib_native_dep_gate_macro, stdlib_native_dep_source_paths,
@@ -53,13 +53,11 @@ import stdlib_native_deps.{
     peeled_module_keys,
 }
 import build_objcache
-import codegen_stmt.{ann_str_val, positional_str_arg, positional_str_arg_count}
 import ast_dump.{ast_to_json}
 import formatter.{Format, format}
 import mutation_analysis.{analyze_mutations, analyze_save_restore}
 import escape.{analyze_escapes, ffi_scope_resource_name}
-import mono.{run_mono_shadow, run_mono_diff}
-import mono2.{run_mono}
+import mono.{run_mono}
 import symbol_index.{collect_effects, si_build, si_reset}
 import query.{query_filtered_layer}
 import diagnostics.{
@@ -163,6 +161,12 @@ fn extract_embedded_gc() -> Str {
     write_file("{base}/include/zig-stubs/mach-o/getsect.h", embedded_gc_h_stubs_macho_getsect)
     base
 }
+
+// Two emit settings the CLI learns while parsing arguments and needs again at the
+// emit call, several frames down. Everything else the emit needs is set beside the
+// call itself and travels in the CgConfig record.
+let mut cli_trace_codegen: Int = 0
+let mut cli_deterministic: Int = 0
 
 let mut ccache_checked: Int = 0
 let mut ccache_available: Int = 0
@@ -514,7 +518,6 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, 
     analyze_mutations(final_program)
     analyze_save_restore(final_program)
     analyze_escapes(final_program)
-    run_mono_shadow(final_program)
     run_mono(final_program)
     if diag_ice_count > 0 {
         diag_flush()
@@ -525,23 +528,15 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, 
         return 1
     }
 
-    if debug_mode != 0 {
-        cg_debug_mode = 1
-    } else {
-        cg_debug_mode = 0
-    }
-
-    cg_emit_only_module = env.var("BLINK_ONLY_MODULE") ?? ""
-
     let skip_raw = env.var("BLINK_SKIP_MODULES") ?? ""
-    cg_skip_modules = Map()
+    let mut skip_modules: Map[Str, Int] = Map()
     if skip_raw != "" {
         let parts = skip_raw.split(",")
         let mut si = 0
         while si < parts.len() {
             let part = parts.get(si).unwrap()
             if part != "" {
-                cg_skip_modules.insert(part, 1)
+                skip_modules.insert(part, 1)
             }
             si = si + 1
         }
@@ -549,16 +544,15 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, 
     let archived = list_stdlib_module_keys()
     let mut ai = 0
     while ai < archived.len() {
-        cg_skip_modules.insert(archived.get(ai).unwrap(), 1)
+        skip_modules.insert(archived.get(ai).unwrap(), 1)
         ai = ai + 1
     }
-    cg_user_tu_mode = 1
 
-    let c_output = generate(final_program)
-    // BLINK_MONO_DIFF-gated shadow-vs-live diff. No-op when unset, so
-    // normal/regen builds are byte-neutral; runs here because mono_instances is
-    // populated only after generate(). The mono-diff task reads the stderr census.
-    run_mono_diff()
+    let cfg = CgConfig { debug_mode: if debug_mode != 0 { 1 } else { 0 },
+        trace_codegen: cli_trace_codegen, deterministic: cli_deterministic,
+        emit_only_module: env.var("BLINK_ONLY_MODULE") ?? "", skip_modules: skip_modules,
+        user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0 }
+    let c_output = generate(final_program, cfg)
 
     if diag_ice_count > 0 {
         diag_flush()
@@ -799,7 +793,7 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
         if manifest_native_dep_type(name) != "vendored" { continue }
         // Registry-managed deps already came in via used_deps above; skip
         // the manifest entry so the same .o isn't compiled and linked twice.
-        if list_contains_str(used_deps, name) == 1 { continue }
+        if used_deps.contains(name) { continue }
         let dep_path = manifest_native_dep_path(name)
         if dep_path == "" { continue }
         if did_mkdir == 0 {
@@ -852,7 +846,7 @@ fn resolve_vendored_includes(used_deps: List[Str], target: Str) -> Str {
         let name = manifest_native_dep_name_at(i)
         i = i + 1
         if manifest_native_dep_type(name) != "vendored" { continue }
-        if list_contains_str(used_deps, name) == 1 { continue }
+        if used_deps.contains(name) { continue }
         let dep_path = manifest_native_dep_path(name)
         if dep_path == "" { continue }
         includes.push("-I{path_dirname(dep_path)}")
@@ -2305,9 +2299,9 @@ fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     trace_mode = args_get(a, "blink-trace")
     let build_trace_val = args_get(a, "trace")
     if build_trace_val != "" {
-        cg_trace_codegen = 1
+        cli_trace_codegen = 1
     }
-    cg_deterministic = if args_has(a, "deterministic") { 1 } else { 0 }
+    cli_deterministic = if args_has(a, "deterministic") { 1 } else { 0 }
     let basename = path_basename(source_path)
     let name = strip_extension(basename)
     let mut output_path = args_get(a, "output")
@@ -2380,9 +2374,9 @@ fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     let trace_val = args_get(a, "trace")
     let trace_env = env.var("BLINK_TRACE") ?? ""
     if trace_val != "" || trace_env != "" {
-        cg_trace_codegen = 1
+        cli_trace_codegen = 1
     }
-    cg_deterministic = if args_has(a, "deterministic") { 1 } else { 0 }
+    cli_deterministic = if args_has(a, "deterministic") { 1 } else { 0 }
     ensure_deps_resolved()
     let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, "", targets, 0, strict_flag)
     if rc != 0 {
@@ -2831,10 +2825,10 @@ fn cmd_emit_archive_header(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Bu
         exit(1)
     }
 
-    cg_emit_only_module = ""
-    cg_skip_modules = Map()
-
-    let header = generate_archive_header(final_program)
+    let hdr_cfg = CgConfig { debug_mode: 0, trace_codegen: cli_trace_codegen,
+        deterministic: cli_deterministic, emit_only_module: "", skip_modules: Map(),
+        user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+    let header = generate_archive_header(final_program, hdr_cfg)
 
     if diag_ice_count > 0 {
         diag_flush()
@@ -2852,7 +2846,7 @@ fn cmd_emit_archive_header(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Bu
 // Hidden subcommand `__emit-per-module <entry.bl> <out_dir>`: emit a .h
 // and .c per source module discovered in the merged program. The entry
 // file's source module ("__main__") owns __blink_ev; every other module
-// emits with cg_blink_ev_extern_only=1 so the linker resolves the single
+// emits with blink_ev_extern_only=1 so the linker resolves the single
 // definition. Each .c #includes its own .h. Headers are #ifndef-guarded
 // so cross-module #includes (added by callers driving cc) compose safely.
 fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
@@ -2889,11 +2883,22 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
         exit(1)
     }
 
-    cg_emit_only_module = ""
-    cg_skip_modules = Map()
-    cg_user_tu_mode = 0
+    let mod_cfg = CgConfig { debug_mode: 0, trace_codegen: cli_trace_codegen,
+        deterministic: cli_deterministic, emit_only_module: "", skip_modules: Map(),
+        user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
 
     let modules = enumerate_program_modules(final_program)
+    // Gate the module list before the loops below read it. An empty list makes both
+    // loops no-ops, so without this an ICE here would leave the command writing only
+    // the aggregator header and exiting 0 -- a build that emitted nothing and said ok.
+    if diag_ice_count > 0 {
+        diag_flush()
+        exit(101)
+    }
+    if diag_count > 0 {
+        diag_flush()
+        exit(1)
+    }
 
     // First pass: emit each module's header AND build the aggregator
     // (every module .c #includes this so cross-module fn calls and
@@ -2906,7 +2911,7 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
     let mut mi = 0
     while mi < modules.len() {
         let m = modules.get(mi).unwrap()
-        let header = generate_module_header(final_program, m)
+        let header = generate_module_header(final_program, m, mod_cfg)
         if diag_ice_count > 0 {
             diag_flush()
             exit(101)
@@ -2928,13 +2933,10 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
     let mut ci = 0
     while ci < modules.len() {
         let m = modules.get(ci).unwrap()
-        if m != "__main__" {
-            cg_blink_ev_extern_only = 1
-        } else {
-            cg_blink_ev_extern_only = 0
-        }
-        let obj_c = generate_module_object(final_program, m, "_blink_all.h")
-        cg_blink_ev_extern_only = 0
+        // Copy-update, not a fresh literal: a field added to CgConfig later must inherit
+        // mod_cfg's value here, and a hand-copied literal would silently take the default.
+        let obj_cfg = CgConfig { blink_ev_extern_only: if m != "__main__" { 1 } else { 0 }, ..mod_cfg }
+        let obj_c = generate_module_object(final_program, m, "_blink_all.h", obj_cfg)
         if diag_ice_count > 0 {
             diag_flush()
             exit(101)
@@ -4081,9 +4083,9 @@ fn main() {
     p = command_add_option(p, "check", "--format", "-f", "Output format")
     p = command_add_option(p, "fmt", "--format", "-f", "Output format")
 
-    p = command_add_option(p, "build", "--blink-trace", "", "Trace compiler phase (lex, parse, codegen, typecheck, all)")
-    p = command_add_option(p, "run", "--blink-trace", "", "Trace compiler phase (lex, parse, codegen, typecheck, all)")
-    p = command_add_option(p, "check", "--blink-trace", "", "Trace compiler phase (lex, parse, codegen, typecheck, all)")
+    p = command_add_option(p, "build", "--blink-trace", "", "Trace compiler phase (lex, parse, typecheck, mono, all)")
+    p = command_add_option(p, "run", "--blink-trace", "", "Trace compiler phase (lex, parse, typecheck, mono, all)")
+    p = command_add_option(p, "check", "--blink-trace", "", "Trace compiler phase (lex, parse, typecheck, mono, all)")
     p = command_add_option(p, "run", "--trace", "", "Runtime execution trace (NDJSON to stderr). Use --trace all or --trace fn:name,module:mod,depth:N")
     p = command_add_option(p, "build", "--trace", "", "Compile with trace instrumentation. Binary accepts --trace[=filter] at runtime")
     p = command_add_option(p, "run", "--trace-limit", "", "Cap trace output to N events")

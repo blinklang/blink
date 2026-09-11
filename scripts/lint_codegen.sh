@@ -4,7 +4,10 @@
 # what each row means and how to add one). The scanned modules are only the
 # new-codegen files:
 #
-#   src/layout.bl src/cname.bl src/mono.bl src/ir.bl src/cg_*.bl
+#   src/layout.bl src/cname.bl src/mono.bl src/ir.bl src/cg.bl src/cg_*.bl
+#
+# src/cg.bl is named on its own: the `cg_*.bl` glob does not match it, and a
+# driver outside the scope escapes every row.
 #
 # Files that do not exist yet contribute nothing. tests/ and docs/ are never
 # scanned for violations; L11 reads tests/ only to find references.
@@ -62,16 +65,30 @@ L11 untested_pub_fns 0
 # The producers rule 7 names, with the file that must define each. A name
 # defined twice anywhere in src/ is a twin; a name missing while its owner
 # exists is an unported producer.
+#
+# These are cname.bl's own spellings, not the pre-rewrite ones. Three old names
+# have no successor and are gone for a reason: c_fn_name_in and c_type_c_name_in
+# took an explicit mangling module, which cname.bl now derives unconditionally
+# from node_source_module, and mangle_from_method folded into the qualified
+# impl-method namer.
 PRODUCERS="
-c_fn_name cname
-c_fn_name_in cname
-c_type_c_name cname
-c_type_c_name_in cname
-mangle_impl_method cname
-mangle_impl_method_q cname
-mangle_from_method cname
-mangle_generic_name cname
-derive_method_cname cname
+c_fn_decl_name cname
+c_global_name cname
+c_type_decl_name cname
+c_type_decl_tag cname
+c_typedef_name cname
+c_mono_fn_name cname
+c_mono_type_c_name cname
+c_poly_method_name cname
+c_impl_method_name cname
+c_impl_method_name_q cname
+c_display_dispatch_name cname
+c_derive_method_name cname
+c_variant_tag_macro cname
+c_mono_variant_tag_macro cname
+c_vtable_type_name cname
+c_kops_table_name cname
+td_guard_name cname
 c_type_of layout
 carrier_tag_of layout
 ensure_typedef_for layout
@@ -85,7 +102,7 @@ layout_of layout
 # Files in scope under a root, as paths. Missing files are simply absent.
 scope_files() {
     root="$1"
-    for f in "$root"/src/layout.bl "$root"/src/cname.bl "$root"/src/mono.bl "$root"/src/ir.bl "$root"/src/cg_*.bl; do
+    for f in "$root"/src/layout.bl "$root"/src/cname.bl "$root"/src/mono.bl "$root"/src/ir.bl "$root"/src/cg.bl "$root"/src/cg_*.bl; do
         [ -f "$f" ] && echo "$f"
     done
 }
