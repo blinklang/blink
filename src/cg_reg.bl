@@ -1,11 +1,144 @@
-// cg_reg.bl: the nominal registries: structs, enums, traits, impls and functions, keyed by tid.
+// cg_reg.bl: the declaration registries the driver walks.
 //
-// A stage of the tid-native emitter, not yet written. Its entry point reports I0004 and
-// returns, so the driver's diag_ice_count check turns a call into a loud failure rather
-// than a translation unit that is silently empty.
+// The parser files a program's top-level declarations into sublists on the Program node,
+// one per declaration kind. This module reads them once and answers them by kind, so no
+// later stage re-walks the AST hunting for a declaration.
+//
+// A nominal type is indexed by its type id. The declaration's name is only the bridge
+// typecheck offers between a node and a tid, and the tid it yields is checked back
+// against the node before the pair is filed: a bare name two modules both declare
+// identifies no single declaration, so it is not indexed at all.
 
-import diagnostics.{Diag, diag_ice_stage_not_built}
+import parser.{
+    node_name, node_fields, node_stmts, node_params, node_arms, node_methods,
+    node_args, node_captures, node_source_module, sublist_get, sublist_length,
+}
+import typecheck.{lookup_named_type, tc_tid_decl_node}
 
-pub fn cg_reg_build(program: Int) ! Diag.Report {
-    diag_ice_stage_not_built("cg_reg", program)
+let mut reg_types: List[Int] = []
+let mut reg_fns: List[Int] = []
+let mut reg_effects: List[Int] = []
+let mut reg_globals: List[Int] = []
+let mut reg_traits: List[Int] = []
+let mut reg_impls: List[Int] = []
+let mut reg_tests: List[Int] = []
+let mut reg_modules: List[Str] = []
+let mut reg_module_seen: Map[Str, Int] = Map()
+let mut reg_decl_by_tid: Map[Int, Int] = Map()
+let mut reg_tid_by_decl: Map[Int, Int] = Map()
+let mut reg_main: Int = 0
+
+pub fn cg_reg_reset() {
+    reg_types = []
+    reg_fns = []
+    reg_effects = []
+    reg_globals = []
+    reg_traits = []
+    reg_impls = []
+    reg_tests = []
+    reg_modules = []
+    reg_module_seen.clear()
+    reg_decl_by_tid.clear()
+    reg_tid_by_decl.clear()
+    reg_main = 0
+}
+
+// First-seen module order. It is topologically friendly — a module tends to be parsed
+// before the module that imports it — and the per-module driver emits in this order.
+fn note_module(decl: Int) {
+    let key = node_source_module(decl)
+    if key == "" { return }
+    if reg_module_seen.contains_key(key) != 0 { return }
+    reg_module_seen.insert(key, 1)
+    reg_modules.push(key)
+}
+
+fn collect(sublist: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    if sublist == -1 { return out }
+    let mut i = 0
+    while i < sublist_length(sublist) {
+        let decl = sublist_get(sublist, i)
+        note_module(decl)
+        out.push(decl)
+        i = i + 1
+    }
+    out
+}
+
+// The qualified spelling is tried first: two modules may declare the same bare name, and
+// the bare key holds whichever was parsed last.
+fn tid_for_type_decl(decl: Int) -> Int {
+    let name = node_name(decl)
+    if name == "" { return -1 }
+    let module_key = node_source_module(decl)
+    let mut tid = -1
+    if module_key != "" { tid = lookup_named_type("{module_key}.{name}") }
+    if tid < 0 { tid = lookup_named_type(name) }
+    if tid < 0 { return -1 }
+    if tc_tid_decl_node(tid) != decl { return -1 }
+    tid
+}
+
+fn index_types() {
+    let mut i = 0
+    while i < reg_types.len() {
+        let decl = reg_types.get(i).unwrap()
+        let tid = tid_for_type_decl(decl)
+        if tid >= 0 {
+            reg_decl_by_tid.insert(tid, decl)
+            reg_tid_by_decl.insert(decl, tid)
+        }
+        i = i + 1
+    }
+}
+
+fn find_main() {
+    let mut i = 0
+    while i < reg_fns.len() {
+        if node_name(reg_fns.get(i).unwrap()) == "main" {
+            reg_main = 1
+            return
+        }
+        i = i + 1
+    }
+}
+
+pub fn cg_reg_build(program: Int) {
+    cg_reg_reset()
+    reg_types = collect(node_fields(program))
+    reg_fns = collect(node_params(program))
+    reg_globals = collect(node_stmts(program))
+    reg_traits = collect(node_arms(program))
+    reg_impls = collect(node_methods(program))
+    reg_effects = collect(node_args(program))
+    reg_tests = collect(node_captures(program))
+    index_types()
+    find_main()
+}
+
+pub fn cg_reg_type_decls() -> List[Int] { reg_types }
+pub fn cg_reg_fn_decls() -> List[Int] { reg_fns }
+pub fn cg_reg_effect_decls() -> List[Int] { reg_effects }
+pub fn cg_reg_global_decls() -> List[Int] { reg_globals }
+pub fn cg_reg_trait_decls() -> List[Int] { reg_traits }
+pub fn cg_reg_impl_decls() -> List[Int] { reg_impls }
+pub fn cg_reg_test_decls() -> List[Int] { reg_tests }
+pub fn cg_reg_modules() -> List[Str] { reg_modules }
+pub fn cg_reg_has_main() -> Bool { reg_main != 0 }
+
+// A tid with no declaration of its own answers -1 rather than a neighbour's node.
+pub fn cg_reg_decl_for_tid(tid: Int) -> Int {
+    if tid < 0 { return -1 }
+    reg_decl_by_tid.get(tid) ?? -1
+}
+
+pub fn cg_reg_tid_for_decl(decl: Int) -> Int {
+    if decl < 0 { return -1 }
+    reg_tid_by_decl.get(decl) ?? -1
+}
+
+pub fn cg_reg_module_of(decl: Int) -> Str {
+    if decl < 0 { return "" }
+    node_source_module(decl)
 }
