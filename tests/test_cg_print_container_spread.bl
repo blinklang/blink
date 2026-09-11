@@ -1,0 +1,130 @@
+// The C a `[..xs, y]` gets: a ContainerSpread kid of a ContainerNew prints as the runtime's
+// extend call on the container being built, in the position the kid holds, so elements
+// land in source order. The printer never sees a spread anywhere else; a bare one is the
+// misplaced-kind ICE.
+
+import std.io
+import std.process.{ProcessResult}
+import cg_print.{print_reset, print_take, print_prologue, print_fn, print_expr}
+import ir.{ir_var_ref, ir_const, ir_block, ir_expr_stmt, ir_let, ir_call_runtime, ir_container_new, ir_container_spread, SlotForm}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+import diagnostics.{diag_reset, diag_ice_count}
+
+fn lines_of(c: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for l in c.split("\n") { if l != "" { out.push(l.trim()) } }
+    out
+}
+
+fn scratch_dir() -> Str {
+    let d = env.var("BLINK_TEST_SCRATCH") ?? "build/cg_print_scratch"
+    shell_exec("mkdir -p {d}")
+    d
+}
+
+// The printed C targets the pinned gen0 archive. gen0 lives under build/gen0/ at the repo
+// root, which is a parent of a worktree, so walk up from the working directory.
+fn gen0_share_dir() -> Str {
+    let forced = env.var("BLINK_GEN0") ?? ""
+    if forced != "" { return "{forced}/share/blink" }
+    let mut prefix = ""
+    let mut depth = 0
+    while depth < 6 {
+        let cand = "{prefix}build/gen0/share/blink"
+        if file_exists("{cand}/libblink_std.a") == 1 { return cand }
+        prefix = "{prefix}../"
+        depth += 1
+    }
+    ""
+}
+
+fn cc_and_run(tag: Str, c_text: Str) -> ProcessResult {
+    let share = gen0_share_dir()
+    if share == "" {
+        io.println("FAIL[{tag}]: build/gen0/share/blink not found from the working directory")
+        assert(false)
+    }
+    let dir = scratch_dir()
+    let c_path = "{dir}/{tag}.c"
+    let bin = "{dir}/{tag}"
+    write_file(c_path, c_text)
+    let cc = process_run("cc", ["-o", bin, c_path, "-I{share}", "{share}/libblink_std.a", "-lm", "-lgc", "-pthread", "-Wl,--gc-sections"])
+    if cc.exit_code != 0 {
+        io.println("FAIL[{tag}] cc exit={cc.exit_code}\n{cc.err_out}{cc.out}")
+        return cc
+    }
+    process_run(bin, [])
+}
+
+fn int_const(s: Str) -> Int { ir_const(1, 0, "int64_t", s) }
+// list elements are word-boxed by lowering; the runtime slot is a void*
+fn word_const(s: Str) -> Int { ir_const(1, 0, "void*", "(void*)(intptr_t){s}") }
+fn list_var(name: Str) -> Int { ir_var_ref(4, 0, "blink_list*", name, SlotForm.PointerBoxed) }
+fn spread_of(name: Str) -> Int { ir_container_spread(4, 0, "blink_list*", "blink_list_extend", list_var(name)) }
+fn list_of(kids: List[Int]) -> Int { ir_container_new(4, 0, "blink_list*", "blink_list_new", kids) }
+
+test "a spread kid prints as an extend on the container under construction, in kid order" {
+    diag_reset()
+    print_reset()
+    let text = print_expr(list_of([int_const("1"), spread_of("xs"), int_const("2"), spread_of("ys")]))
+    let ls = lines_of(print_take())
+    assert_eq(text, "_c0")
+    assert_eq(ls.len(), 5)
+    assert_eq(ls.get(0).unwrap(), "blink_list* _c0 = blink_list_new();")
+    assert_eq(ls.get(1).unwrap(), "blink_list_push(_c0, 1);")
+    assert_eq(ls.get(2).unwrap(), "blink_list_extend(_c0, xs);")
+    assert_eq(ls.get(3).unwrap(), "blink_list_push(_c0, 2);")
+    assert_eq(ls.get(4).unwrap(), "blink_list_extend(_c0, ys);")
+    assert_eq(diag_ice_count, 0)
+}
+
+test "a list that is only a spread still binds a fresh container and extends it" {
+    diag_reset()
+    print_reset()
+    let text = print_expr(list_of([spread_of("xs")]))
+    let ls = lines_of(print_take())
+    assert_eq(ls.len(), 2)
+    assert_eq(ls.get(0).unwrap(), "blink_list* {text} = blink_list_new();")
+    assert_eq(ls.get(1).unwrap(), "blink_list_extend({text}, xs);")
+    assert_eq(diag_ice_count, 0)
+}
+
+test "a spread whose source is an expression evaluates the source once, in the extend call" {
+    diag_reset()
+    print_reset()
+    let src = ir_call_runtime(4, 0, "blink_list*", "blink_list_slice", SlotForm.PointerBoxed, [list_var("xs"), int_const("0"), int_const("1")])
+    print_expr(list_of([ir_container_spread(4, 0, "blink_list*", "blink_list_extend", src)]))
+    let c = print_take()
+    assert(c.contains("blink_list_extend(_c0, blink_list_slice(xs, 0, 1));"))
+    assert_eq(diag_ice_count, 0)
+}
+
+test "a spread outside a ContainerNew is a misplaced-kind ICE with a visible marker" {
+    diag_reset()
+    print_reset()
+    let text = print_expr(spread_of("xs"))
+    assert(text.contains("I0003"))
+    assert_eq(diag_ice_count, 1)
+    assert(!print_take().contains("blink_list_extend"))
+}
+
+test "the extended list holds the source elements in order between the pushed ones" {
+    print_reset()
+    print_prologue(true, false, false, "", "")
+    let prologue = print_take()
+    let built = list_of([word_const("1"), spread_of("xs"), word_const("4")])
+    let body = ir_block(0, [
+        ir_let(4, 0, "blink_list*", "out", SlotForm.PointerBoxed, built),
+        ir_expr_stmt(0, ir_call_runtime(-1, 0, "void", "show", SlotForm.Inline, [list_var("out")])),
+    ])
+    print_fn(true, "void", "probe", ["blink_list* xs"], false, body)
+    let fns = print_take()
+    let head = "static void show(blink_list* l) \{ for (int64_t i = 0; i < l->len; i++) printf(\"%lld \", (long long)(intptr_t)l->items[i]); puts(\"\"); }\n"
+    let main_body = "    blink_list* xs = blink_list_new();\n    blink_list_push(xs, (void*)(intptr_t)2);\n    blink_list_push(xs, (void*)(intptr_t)3);\n    probe(xs);\n    probe(blink_list_new());\n"
+    let r = cc_and_run("cg_print_container_spread", "{prologue}{head}{fns}int main(void) \{\n    GC_INIT();\n{main_body}    return 0;\n}\n")
+    if r.exit_code != 0 { io.println("FAIL run exit={r.exit_code}\n{r.err_out}{r.out}") }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, "1 2 3 4 \n1 4 \n")
+}
