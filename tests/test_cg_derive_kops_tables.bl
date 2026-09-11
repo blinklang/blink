@@ -1,0 +1,152 @@
+// The key-operations table a Map or Set binds for a derived key: two adapters that take
+// the key through a void pointer, and one constant that holds them, the key's size and
+// the runtime's storage choice. Every part is layout's answer or cname's. A wrong inline
+// flag makes the runtime read the key the wrong way, so a lookup misses a key that is
+// there. Nothing fails until then.
+
+import std.io
+import layout.{layout_reset}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build, cg_reg_type_decls}
+import cg_derive.{cg_derive_reset, cg_derive_emit_decls, cg_derive_emit_bodies}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_naming}
+
+// Point is a two-field struct, Color is an enum of bare ordinals, Shape is an enum with
+// payloads, and Plain derives only Eq. The first three are keys, the fourth is not.
+fn kops_src() -> Str {
+    #"@derive(Hash, Eq)
+type Point { x: Int, y: Int }
+@derive(Hash, Eq)
+type Color { Red, Green, Blue }
+@derive(Hash, Eq)
+type Shape {
+    Circle(radius: Int)
+    Rect(w: Int, h: Int)
+}
+@derive(Eq)
+type Plain { a: Int }
+fn main() { }
+"#
+}
+
+fn program_of(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let program = cg_probe_compile("build/{stem}_probe_src.bl", src)
+    layout_reset()
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_derive_reset()
+    program
+}
+
+fn bodies_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _p = program_of(stem, src)
+    cg_derive_emit_bodies(cg_reg_type_decls())
+    print_take()
+}
+
+fn decls_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _p = program_of(stem, src)
+    cg_derive_emit_decls(cg_reg_type_decls())
+    print_take()
+}
+
+// How many internal errors this stage recorded whose message names the given phrase. A
+// bare count would pass on any internal error, including one raised for an unrelated
+// reason in the same probe.
+fn ices_naming(stem: Str, src: Str, phrase: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _p = program_of(stem, src)
+    cg_derive_emit_bodies(cg_reg_type_decls())
+    cg_probe_ices_naming(phrase)
+}
+
+fn assert_has(text: Str, want: Str) {
+    if !text.contains(want) {
+        io.println("FAIL: expected to find:\n  {want}\nin:\n{text}")
+    }
+    assert(text.contains(want))
+}
+
+fn assert_lacks(text: Str, unwanted: Str) {
+    if text.contains(unwanted) {
+        io.println("FAIL: expected not to find:\n  {unwanted}\nin:\n{text}")
+    }
+    assert(!text.contains(unwanted))
+}
+
+// A table defined twice is a duplicate symbol the C compiler rejects, and a table defined
+// under two different bodies is worse: the one that wins is decided by link order.
+fn occurrences(text: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut rest = text
+    let mut at = rest.index_of(needle)
+    while at >= 0 {
+        n = n + 1
+        let from = at + needle.len()
+        rest = rest.substring(from, rest.len() - from)
+        at = rest.index_of(needle)
+    }
+    n
+}
+
+test "a derived key gets a table naming its own hash and equality methods" {
+    let text = bodies_of("cg_derive_kops_struct", kops_src())
+    assert_has(text, #"static uint64_t hash_kops_blink_Point(const void* k) { return blink_Point_hash(*(blink_Point const*)k); }"#)
+    assert_has(text, #"static int eq_kops_blink_Point(const void* a, const void* b) { return blink_Point_eq(*(blink_Point const*)a, *(blink_Point const*)b); }"#)
+}
+
+test "the table carries the key's own size, not the size of a pointer to it" {
+    let text = bodies_of("cg_derive_kops_size", kops_src())
+    assert_has(text, #"const blink_kops kops_blink_Point = { hash_kops_blink_Point, eq_kops_blink_Point, sizeof(blink_Point), 0 };"#)
+}
+
+test "a key the runtime stores by its own bytes is marked inline" {
+    let text = bodies_of("cg_derive_kops_inline", kops_src())
+    assert_has(text, #"const blink_kops kops_blink_Color = { hash_kops_blink_Color, eq_kops_blink_Color, sizeof(blink_Color), 1 };"#)
+}
+
+test "a key too wide for a slot is not marked inline" {
+    let text = bodies_of("cg_derive_kops_wide", kops_src())
+    assert_has(text, #"const blink_kops kops_blink_Shape = { hash_kops_blink_Shape, eq_kops_blink_Shape, sizeof(blink_Shape), 0 };"#)
+}
+
+test "a type that derives equality without hashing gets no table" {
+    let text = bodies_of("cg_derive_kops_eq_only", kops_src())
+    assert_lacks(text, "kops_blink_Plain")
+}
+
+test "each derived key is defined once, whatever else the pass emits" {
+    let text = bodies_of("cg_derive_kops_once", kops_src())
+    assert(occurrences(text, "const blink_kops kops_blink_Point = ") == 1)
+    assert(occurrences(text, "const blink_kops kops_blink_Color = ") == 1)
+    assert(occurrences(text, "const blink_kops kops_blink_Shape = ") == 1)
+}
+
+test "the declaration pass declares every derived key so any unit can bind it" {
+    let text = decls_of("cg_derive_kops_decls", kops_src())
+    assert_has(text, "extern const blink_kops kops_blink_Point;")
+    assert_has(text, "extern const blink_kops kops_blink_Color;")
+    assert_has(text, "extern const blink_kops kops_blink_Shape;")
+    assert_lacks(text, "kops_blink_Plain")
+}
+
+// The definition is the one thing a unit must not repeat, so the pass that every unit
+// runs over the whole program emits declarations only.
+test "the declaration pass defines no table and writes no adapter" {
+    let text = decls_of("cg_derive_kops_no_defs", kops_src())
+    assert_lacks(text, "static uint64_t hash_kops_")
+    assert_lacks(text, "static int eq_kops_")
+    assert_lacks(text, "const blink_kops kops_blink_Point = ")
+}
+
+// The body pass runs per unit, so a declaration from it would land in every unit that
+// defines the table rather than in the units that only bind it.
+test "the body pass defines the table and declares nothing" {
+    let text = bodies_of("cg_derive_kops_no_decls", kops_src())
+    assert_lacks(text, "extern const blink_kops")
+}
+
+test "producing a table is no longer refused as unbuilt" {
+    let n = ices_naming("cg_derive_kops_built", kops_src(), "key-operations table")
+    assert(n == 0)
+}

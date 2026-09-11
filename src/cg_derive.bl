@@ -21,7 +21,7 @@ import cname.{
     c_derive_method_name, c_field_name, c_mint_local, c_runtime_helper, c_string_literal,
     c_variant_ordinal, c_variant_tag_macro,
 }
-import cg_print.{print_fn, print_fn_decl}
+import cg_print.{print_fn, print_fn_decl, print_kops_table, print_kops_table_decl}
 import cg_reg.{cg_reg_tid_for_decl}
 import ir.{
     ir_assign, ir_binary, ir_block, ir_call_direct, ir_call_runtime, ir_cast, ir_const,
@@ -766,16 +766,20 @@ fn hash_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
     if tid < 0 { return derive_ice(arg, "type '{node_name(decl)}' reached cg_derive with no type id") }
     let refusal = hash_refusal(decl, tid)
     if refusal != "" { return not_built(arg, refusal) }
-    let self_spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), arg)
+    let rec = layout_of(tid, Position.Param)
+    let self_spelling = spelling_or_ice(rec, node_name(decl), arg)
     let ret = u64_spelling(arg)
     if self_spelling == "" || ret == "" { return }
     let symbol = c_derive_method_name(decl, "hash")
     let params = ["{self_spelling} self"]
-    if !bodies { return print_fn_decl(false, ret, symbol, params, false) }
+    if !bodies {
+        print_fn_decl(false, ret, symbol, params, false)
+        return kops_table_decl(rec)
+    }
     let body = hash_body(decl, tid, arg)
     if body < 0 { return }
     print_fn(false, ret, symbol, params, false, body)
-    kops_table(decl, tid, arg)
+    kops_table(decl, rec, self_spelling)
 }
 
 // Hash requires Eq, so a type that derives one without the other has no body to name in
@@ -788,14 +792,22 @@ fn hash_refusal(decl: Int, tid: Int) -> Str {
     "@derive(Hash) on '{node_name(decl)}', which does not also derive Eq"
 }
 
-// The table binds a key type to the two methods a keyed container calls on it, and to
-// whether the runtime stores the key inline in a list slot. Nothing answers that last
-// question yet. Guessing it from the slot form gets a one-field struct wrong, which
-// silently mis-reads every key a Map or Set hands back.
-fn kops_table(decl: Int, tid: Int, span: Int) ! Diag.Report {
-    let table = layout_of(tid, Position.Param).kops_table
-    if table == "" { return }
-    not_built(span, "the key-operations table '{table}' for '{node_name(decl)}', whose inline-key storage has no producer in layout")
+// The adapters take the key by value, so the size and the spelling must be the ones
+// layout gives a parameter, not the ones it gives a container slot. Whether the runtime
+// keeps the key's own bytes in the slot is layout's answer too, never this stage's guess:
+// a guess from the slot form gets a one-field struct wrong and mis-reads every key.
+fn kops_table(decl: Int, rec: LayoutRecord, key_spelling: Str) {
+    if rec.kops_table == "" { return }
+    print_kops_table(rec.kops_table, key_spelling, c_derive_method_name(decl, "hash"),
+        c_derive_method_name(decl, "eq"), rec.kops_inline_key)
+}
+
+// A unit that binds the table needs the symbol, and it may not be the unit that defines
+// it. The declaration pass walks the whole program, so declaring here reaches every unit;
+// the definition stays with the bodies pass, which walks one unit's own types.
+fn kops_table_decl(rec: LayoutRecord) {
+    if rec.kops_table == "" { return }
+    print_kops_table_decl(rec.kops_table)
 }
 
 // A value layout gives as one word is its own hash input, but which input depends on
