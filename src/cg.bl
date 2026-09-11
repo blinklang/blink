@@ -10,7 +10,6 @@
 // result, or an unbuilt stage looks like a program that legitimately emits nothing.
 
 import diagnostics.{Diag, diag_ice_stage_not_built}
-import parser.{get_annotation, node_effects, sublist_length}
 import cname.{c_archive_header_guard, c_module_header_guard}
 import layout.{layout_reset, set_current_inst}
 import cg_print.{print_main_shim, print_reset, print_scope_restore_support, print_take}
@@ -20,7 +19,7 @@ import cg_reg.{
     cg_reg_type_decls,
 }
 import cg_decl.{
-    BodySite, cg_decl_body_site, cg_decl_emit_epilogue, cg_decl_emit_ev,
+    BodySite, cg_decl_body_site, cg_decl_takes_ev, cg_decl_emit_epilogue, cg_decl_emit_ev,
     cg_decl_emit_fn_decl, cg_decl_emit_fn_def, cg_decl_emit_impl_method_decl,
     cg_decl_emit_globals, cg_decl_emit_signature_decl, cg_decl_emit_signature_def,
     cg_decl_emit_prologue, cg_decl_emit_typedefs, cg_decl_reset,
@@ -176,18 +175,6 @@ fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_
     cg_derive_emit_decls(derived_decls_declared_everywhere())
 }
 
-// A function whose body reads the program's own evidence cannot live in the shared
-// stdlib archive: many programs link one archive, and the archive does not even define
-// the evidence vector such a signature names. Those functions are compiled into the
-// user's translation unit instead. A foreign binding carries `! FFI` but is a plain C
-// wrapper that reads no evidence, so it stays.
-fn is_evidence_bound(fn_node: Int) -> Bool {
-    if get_annotation(fn_node, "ffi") != -1 { return false }
-    let sl = node_effects(fn_node)
-    if sl == -1 { return false }
-    sublist_length(sl) > 0
-}
-
 // "" for the unit that owns the vector and is linked against, "extern " for a unit that
 // only refers to it. Exactly one unit of a program may own it.
 fn ev_storage(cfg: CgConfig) -> Str {
@@ -224,14 +211,14 @@ fn is_entry_point(fn_node: Int) -> Bool {
 }
 
 // A module compiled into the archive is declared by the user's unit, not compiled again
-// — except for the declarations the archive could not hold. An evidence-bound signature
-// names the program's own evidence vector, which the archive does not define, so the
-// archive left those out. A generic has no body of its own at all: what a program links
+// — except for the declarations the archive could not hold. A signature that takes the
+// evidence vector names a type the archive does not define, and one archive serves many
+// programs, so the archive left those out. A generic has no body of its own at all: what a program links
 // are its instances, and which instances a program needs follows from that program's call
 // sites, which the archive was compiled without. Both are left for the user's unit.
 fn kept_for_user(cfg: CgConfig, decl: Int) -> Bool {
     if cfg.user_tu_mode == 0 { return false }
-    if is_evidence_bound(decl) { return true }
+    if cg_decl_takes_ev(decl) { return true }
     match cg_decl_body_site(decl) {
         BodySite.PerInstance => true
         BodySite.ThisUnit => false
@@ -240,11 +227,16 @@ fn kept_for_user(cfg: CgConfig, decl: Int) -> Bool {
     }
 }
 
+// The archive holds neither the entry point nor a function that takes the evidence
+// vector: one archive serves many programs, and it does not define the vector such a
+// signature names. Those are compiled into the user's unit instead. A foreign binding
+// carries `! FFI` but is a plain C wrapper that reads no evidence, which is why the
+// signature is asked rather than the effects list.
 fn fns_in_scope(cfg: CgConfig, module_key: Str, shared: Bool) -> List[Int] {
     let mut out: List[Int] = []
     for f in decls_in_scope(cfg, module_key, cg_reg_fn_decls()) {
         if shared && is_entry_point(f) { continue }
-        if shared && is_evidence_bound(f) { continue }
+        if shared && cg_decl_takes_ev(f) { continue }
         out.push(f)
     }
     out
@@ -255,7 +247,7 @@ fn fns_in_scope(cfg: CgConfig, module_key: Str, shared: Bool) -> List[Int] {
 fn methods_in_scope(cfg: CgConfig, module_key: Str, shared: Bool) -> List[Int] {
     let mut out: List[Int] = []
     for m in decls_in_scope(cfg, module_key, cg_reg_impl_methods()) {
-        if shared && is_evidence_bound(m) { continue }
+        if shared && cg_decl_takes_ev(m) { continue }
         out.push(m)
     }
     out
