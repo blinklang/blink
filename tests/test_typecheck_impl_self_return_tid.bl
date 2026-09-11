@@ -1,0 +1,303 @@
+// `Self` inside an impl block is a type alias for the receiver (sections/03_types.md
+// §"The `Self` Type": "`Self` refers to the type being implemented"). typecheck lowered it
+// through resolve_type_parts' final fall-through to make_typevar("Self"), so the tid stamped
+// on an impl method's `-> Self` annotation node was a FREE TYPE VARIABLE, not the receiver.
+// The tid-native reading layer declines a free typevar (ICE NoCSpellingForType), which the
+// old codegen hid with a string substitution of the receiver's name.
+//
+// RED before the fix: each impl return-annotation tid below reads "Self", and the two
+// diagnostic tests report nothing at all.
+//
+// `Self` stays abstract inside a TRAIT — there is no receiver there yet — which the trait
+// default-body test pins so the fix cannot over-reach.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, lookup_named_type}
+import parser.{nodes, node_kind, node_name, node_type_ann, node_body, node_params, sublist_get, sublist_length}
+import ast.{NodeKind}
+import diagnostics.{diag_entries}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// The tid stamped on the return annotation of the impl method named `fname`. A trait
+// declares the same method name, so a body is what tells the impl's copy apart. Returns -2
+// when the name is ambiguous: under first-match-wins a later case could silently measure a
+// different node than the one it names.
+fn ret_ann_tid(fname: Str) -> Int {
+    let mut found = -1
+    let mut hits = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == fname && node_body(i) != -1 {
+            hits = hits + 1
+            let ann = node_type_ann(i)
+            if ann != -1 { found = tc_lookup_node_tid(ann) }
+        }
+        i = i + 1
+    }
+    if hits > 1 { return -2 }
+    found
+}
+
+// The tid the receiver parameter of the impl method `fname` was bound to. `Self` and `self`
+// name the same type, so this is what a `-> Self` must agree with — whatever convention the
+// receiver's own tid follows.
+fn self_param_tid(fname: Str) -> Int {
+    let mut found = -1
+    let mut hits = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == fname && node_body(i) != -1 {
+            hits = hits + 1
+            let ps = node_params(i)
+            if ps != -1 && sublist_length(ps) > 0 {
+                let p0 = sublist_get(ps, 0)
+                // Only param 0 of an impl method can be the receiver, but a STATIC impl
+                // method has an ordinary param there. `_self` marks an unused receiver and
+                // is still the receiver. -3 keeps a non-receiver from reading as one.
+                if node_name(p0) == "self" || node_name(p0) == "_self" {
+                    found = tc_lookup_node_tid(p0)
+                } else {
+                    found = -3
+                }
+            }
+        }
+        i = i + 1
+    }
+    if hits > 1 { return -2 }
+    found
+}
+
+fn ret_ann_str(fname: Str) -> Str {
+    let t = ret_ann_tid(fname)
+    // Distinct from "<unstamped>": an ambiguous name is the measurement failure the
+    // hits-count guard exists to make visible, not a missing stamp.
+    if t == -2 { return "<ambiguous>" }
+    if t < 0 { return "<unstamped>" }
+    tc_type_str(t)
+}
+
+fn plain_src() -> Str {
+    let mut s = "trait Wrap[T] \{\n"
+    s = s.concat("    fn zzwrap(v: T) -> Self\n")
+    s = s.concat("}\n")
+    s = s.concat("type Holder \{ v: Int }\n")
+    s = s.concat("impl Wrap[Int] for Holder \{\n")
+    s = s.concat("    fn zzwrap(v: Int) -> Self \{ Holder \{ v: v } }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let h = Holder.zzwrap(1)\n")
+    s = s.concat("    assert(h.v == 1)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "an impl method's bare -> Self return annotation is stamped with the receiver tid" {
+    typecheck_probe("build/tc_impl_self_ret_plain.bl", plain_src())
+    if ret_ann_str("zzwrap") != "Holder" {
+        io.println("FAIL: `-> Self` stamped as {ret_ann_str(\"zzwrap\")}, want Holder")
+    }
+    assert(ret_ann_str("zzwrap") == "Holder")
+    assert(ret_ann_tid("zzwrap") == lookup_named_type("Holder"))
+}
+
+// `Self` is a type, so it is legal wherever a type is — including under a container.
+// The container arms of resolve_type_parts recurse into resolve_type_ann, so a fix at the
+// `Self` lowering site reaches them; a fix that only rewrote the top-level return tid would
+// leave these carrying a free typevar INSIDE the carrier, which the reading layer declines
+// just as hard.
+fn nested_src() -> Str {
+    let mut s = "trait Zzholder \{\n"
+    s = s.concat("    fn zzopt(self) -> Option[Self]\n")
+    s = s.concat("    fn zzlist(self) -> List[Self]\n")
+    s = s.concat("    fn zzpair(self, other: Self) -> Self\n")
+    s = s.concat("}\n")
+    s = s.concat("type Cell \{ n: Int }\n")
+    s = s.concat("impl Zzholder for Cell \{\n")
+    s = s.concat("    fn zzopt(self) -> Option[Self] \{ Some(self) }\n")
+    s = s.concat("    fn zzlist(self) -> List[Self] \{ [self] }\n")
+    s = s.concat("    fn zzpair(self, other: Self) -> Self \{ other }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let c = Cell \{ n: 1 }\n")
+    s = s.concat("    assert(c.zzlist().len() == 1)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "Self under a carrier or list return annotation resolves to the receiver" {
+    typecheck_probe("build/tc_impl_self_ret_nested.bl", nested_src())
+    if ret_ann_str("zzopt") != "Option[Cell]" {
+        io.println("FAIL: `-> Option[Self]` stamped as {ret_ann_str(\"zzopt\")}, want Option[Cell]")
+    }
+    assert(ret_ann_str("zzopt") == "Option[Cell]")
+    if ret_ann_str("zzlist") != "List[Cell]" {
+        io.println("FAIL: `-> List[Self]` stamped as {ret_ann_str(\"zzlist\")}, want List[Cell]")
+    }
+    assert(ret_ann_str("zzlist") == "List[Cell]")
+    assert(ret_ann_str("zzpair") == "Cell")
+}
+
+// A generic impl's receiver over its own binders is the bare generic base: an all-typevar
+// instance is deliberately not interned, because inference variables must not enter the type
+// pool. `Self` has to land on exactly the tid the receiver got, base and all.
+fn generic_src() -> Str {
+    let mut s = "trait Zzid[T] \{\n"
+    s = s.concat("    fn zzid(self) -> Self\n")
+    s = s.concat("}\n")
+    s = s.concat("type Box[T] \{ item: T }\n")
+    s = s.concat("impl[T] Zzid[T] for Box[T] \{\n")
+    s = s.concat("    fn zzid(self) -> Self \{ self }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b = Box[Int] \{ item: 3 }\n")
+    s = s.concat("    assert(b.zzid().item == 3)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "Self in a generic impl agrees with the receiver parameter, not a free typevar" {
+    typecheck_probe("build/tc_impl_self_ret_generic.bl", generic_src())
+    // Pinned by name as well as by agreement: both reads go through the same stamping
+    // channel, so agreement alone would still hold if `Self` and `self` moved together to
+    // some third type. "Self" is the pre-fix reading of this annotation.
+    if ret_ann_str("zzid") != "Box" {
+        io.println("FAIL: generic `-> Self` stamped as {ret_ann_str(\"zzid\")}, want Box")
+    }
+    assert(ret_ann_str("zzid") == "Box")
+    if ret_ann_tid("zzid") != self_param_tid("zzid") {
+        io.println("FAIL: `-> Self` is {ret_ann_str(\"zzid\")} but `self` is bound to a different tid")
+    }
+    assert(ret_ann_tid("zzid") == self_param_tid("zzid"))
+    assert(self_param_tid("zzid") >= 0)
+}
+
+// A receiver written with CONCRETE type arguments takes the other branch of the receiver
+// producer: an instance with a non-typevar argument IS interned, so `Self` must be that
+// structural instance and not the bare base the all-typevar case above lands on. Without
+// this case a fix that resolved `Self` to the base for every generic impl would still pass.
+fn concrete_instance_src() -> Str {
+    let mut s = "trait Zzci[T] \{\n"
+    s = s.concat("    fn zzci(self) -> Self\n")
+    s = s.concat("}\n")
+    s = s.concat("type Crate[T] \{ item: T }\n")
+    s = s.concat("impl Zzci[Int] for Crate[Int] \{\n")
+    s = s.concat("    fn zzci(self) -> Self \{ self }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let c = Crate[Int] \{ item: 5 }\n")
+    s = s.concat("    assert(c.zzci().item == 5)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "Self for a concrete generic receiver is the applied instance, not the bare base" {
+    typecheck_probe("build/tc_impl_self_ret_concrete.bl", concrete_instance_src())
+    if ret_ann_str("zzci") != "Crate[Int]" {
+        io.println("FAIL: `-> Self` stamped as {ret_ann_str(\"zzci\")}, want Crate[Int]")
+    }
+    assert(ret_ann_str("zzci") == "Crate[Int]")
+    assert(ret_ann_tid("zzci") == self_param_tid("zzci"))
+}
+
+// The guard rail. A trait declaration has no receiver, so `Self` there must stay the abstract
+// type variable that subst_trait_type_tid binds per impl — "inside a trait's default method
+// body, `self` has the abstract type `Self`" (sections/03_types.md §"The `Self` Type").
+//
+// A trait's DEFAULT BODY is what this pins, not a bodiless declaration: a declaration's
+// annotation is never stamped at all, so it proves nothing about the stamping path. A default
+// body reaches the same stamping code an impl method does, so it is the one place inside a
+// trait where an over-reaching fix would show up.
+fn trait_default_src() -> Str {
+    let mut s = "trait Zzmaker \{\n"
+    s = s.concat("    fn zzdflt(self) -> Self \{ self }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ assert(1 == 1) }\n")
+    s
+}
+
+test "Self in a trait default body stays abstract" {
+    typecheck_probe("build/tc_impl_self_ret_trait.bl", trait_default_src())
+    if ret_ann_str("zzdflt") != "Self" {
+        io.println("FAIL: trait default `-> Self` resolved to {ret_ann_str(\"zzdflt\")}; a trait has no receiver")
+    }
+    assert(ret_ann_str("zzdflt") == "Self")
+}
+
+// The stamped tid and the tid the BODY is checked against must be the same type, or the fix
+// trades a loud decline for a quiet one. An impl method's signature is registered before any
+// receiver is in scope, so its recorded return is still the abstract `Self`; types_compatible
+// short-circuits on a typevar, which made every `-> Self` body's return check vacuous. With the
+// annotation node now stamped with the receiver, a body that returns something else would emit
+// a receiver-returning C function around an int64_t tail — a C error with no Blink span.
+//
+// RED before the fix: no diagnostic at all.
+fn bad_ret_src() -> Str {
+    let mut s = "trait Zzdup \{\n"
+    s = s.concat("    fn zzdup(self) -> Self\n")
+    s = s.concat("}\n")
+    s = s.concat("type Foo \{ x: Int }\n")
+    s = s.concat("impl Zzdup for Foo \{\n")
+    s = s.concat("    fn zzdup(self) -> Self \{ 42 }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ assert(1 == 1) }\n")
+    s
+}
+
+// How many reported errors are `dname` AND name `subject`. Keyed on the diagnostic's
+// identity, not on its wording alone: `Self` and a method name are short, common tokens, and
+// a different check reporting a different problem about the same name would otherwise stand
+// in for the one under test.
+fn errors_named(dname: Str, subject: Str) -> Int {
+    let mut n = 0
+    let mut i = 0
+    while i < diag_entries.len() {
+        let e = diag_entries.get(i).unwrap()
+        if e.severity == "error" && e.name == dname && e.message.contains(subject) { n = n + 1 }
+        i = i + 1
+    }
+    n
+}
+
+test "an impl method whose -> Self body returns another type is reported" {
+    typecheck_probe("build/tc_impl_self_ret_badbody.bl", bad_ret_src())
+    // TypeError, specifically: the trait-contract check reports the same method name for a
+    // different comparison, and it must not stand in for the body's declared-return check.
+    if errors_named("TypeError", "zzdup") == 0 {
+        io.println("FAIL: `-> Self \{ 42 }` was accepted; the return check is vacuous")
+    }
+    assert(errors_named("TypeError", "zzdup") >= 1)
+}
+
+// `Self` names the receiver and takes no type arguments of its own. The `Self` arm resolves
+// to the receiver and ignores the argument list entirely, so left unchecked `Self[Int]` is
+// SILENTLY ACCEPTED as the bare receiver, arguments dropped. An annotation the language has
+// no meaning for has to be reported, not quietly reinterpreted.
+//
+// RED before the fix: no diagnostic.
+fn self_applied_src() -> Str {
+    let mut s = "trait Zzap \{\n"
+    s = s.concat("    fn zzap(self) -> Self\n")
+    s = s.concat("}\n")
+    s = s.concat("type Bar \{ x: Int }\n")
+    s = s.concat("impl Zzap for Bar \{\n")
+    s = s.concat("    fn zzap(self) -> Self[Int] \{ self }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ assert(1 == 1) }\n")
+    s
+}
+
+test "applying type arguments to Self is reported, not silently dropped" {
+    typecheck_probe("build/tc_impl_self_ret_applied.bl", self_applied_src())
+    if errors_named("TypeArgArity", "Self") == 0 {
+        io.println("FAIL: `-> Self[Int]` was accepted with no arity diagnostic")
+    }
+    assert(errors_named("TypeArgArity", "Self") >= 1)
+}
