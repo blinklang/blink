@@ -14,22 +14,25 @@
 import diagnostics.{Diag, diag_ice, UNSOLVED_TYPEVAR_AT_CODEGEN}
 import layout.{
     LayoutRecord, Position, layout_of, field_layout_of, ensure_typedef_for,
-    layout_take_typedefs,
+    layout_take_typedefs, tid_of_node,
 }
-import cname.{c_safe_name, c_type_decl_name, c_variant_tag_macro, cname_is_runtime_owned, td_guard_name}
+import cname.{
+    c_fn_decl_name, c_global_name, c_safe_name, c_type_decl_name, c_variant_tag_macro,
+    cname_is_runtime_owned, td_guard_name,
+}
 import cg_print.{
-    print_simple_enum_typedef, print_struct_typedef, print_tagged_enum_typedef,
-    print_typedef_blocks,
+    print_fn_decl, print_global_decl, print_simple_enum_typedef, print_struct_typedef,
+    print_tagged_enum_typedef, print_typedef_blocks,
 }
-import cg_reg.{cg_reg_tid_for_decl, cg_reg_type_decls}
+import cg_reg.{cg_reg_fn_decls, cg_reg_global_decls, cg_reg_tid_for_decl, cg_reg_type_decls}
 import typecheck.{
     TyKind, tc_enum_variant_slots, tc_evar_field_slots, tc_evar_name, tc_evfield_name,
     tc_evfield_tid, tc_resolve, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
     tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind, tc_type_str,
 }
 import parser.{
-    get_annotation, node_fields, node_name, node_type_params, node_value, sublist_get,
-    sublist_length,
+    get_annotation, node_effects, node_fields, node_name, node_params, node_type_ann,
+    node_type_params, node_value, sublist_get, sublist_length,
 }
 
 // 1 while a declaration's dependencies are being emitted, 2 once its typedef is written.
@@ -204,4 +207,68 @@ fn variant_field_decls(owner: Int, var_slot: Int) -> List[Str] ! Diag.Report {
         out.push("{spelling} {c_safe_name(fname)}")
     }
     out
+}
+
+// ── Function declarations ────────────────────────────────────────────────────
+//
+// A function's signature types are not on the function node: typecheck stamps each
+// parameter node and the return annotation node, so those are what the spelling gate
+// reads. A function with no return annotation returns void.
+
+// A declared effect is what puts the evidence vector in the signature. main is the
+// exception in both directions: the shim always passes it one, and an FFI extern binds a
+// C function that knows nothing about evidence.
+fn fn_takes_ev(fn_node: Int) -> Bool {
+    if get_annotation(fn_node, "ffi") != -1 { return false }
+    if node_name(fn_node) == "main" { return true }
+    let sl = node_effects(fn_node)
+    if sl == -1 { return false }
+    sublist_length(sl) > 0
+}
+
+fn fn_ret_spelling(fn_node: Int) -> Str ! Diag.Report {
+    let ann = node_type_ann(fn_node)
+    if ann == -1 { return "void" }
+    cg_decl_require_spelling(tid_of_node(ann), Position.Return)
+}
+
+// An empty C parameter list must be spelled `void`, or the declaration takes an
+// unchecked list and every call to it goes unchecked with it.
+fn fn_param_decls(fn_node: Int) -> List[Str] ! Diag.Report {
+    let mut out: List[Str] = []
+    let sl = node_params(fn_node)
+    if sl == -1 {
+        if fn_takes_ev(fn_node) { return out }
+        return ["void"]
+    }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        let p = sublist_get(sl, i)
+        let spelling = cg_decl_require_spelling(tid_of_node(p), Position.Param)
+        out.push("{spelling} {c_safe_name(node_name(p))}")
+        i = i + 1
+    }
+    if out.len() == 0 && !fn_takes_ev(fn_node) { return ["void"] }
+    out
+}
+
+pub fn cg_decl_emit_fn_decl(fn_node: Int, is_static: Bool) ! Diag.Report {
+    print_fn_decl(is_static, fn_ret_spelling(fn_node), c_fn_decl_name(fn_node),
+        fn_param_decls(fn_node), fn_takes_ev(fn_node))
+}
+
+pub fn cg_decl_emit_fn_decls() ! Diag.Report {
+    for f in cg_reg_fn_decls() { cg_decl_emit_fn_decl(f, false) }
+}
+
+// ── Globals ──────────────────────────────────────────────────────────────────
+//
+// A top-level `let` is a C global under its bare Blink name, in every module. The name
+// is unmangled on purpose: it is the linkage another translation unit refers to.
+
+pub fn cg_decl_emit_globals(is_extern: Bool) ! Diag.Report {
+    for g in cg_reg_global_decls() {
+        let spelling = cg_decl_require_spelling(tid_of_node(g), Position.Local)
+        print_global_decl(spelling, c_global_name(g), is_extern)
+    }
 }
