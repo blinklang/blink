@@ -22,7 +22,7 @@ import cname.{
     td_guard_name,
 }
 import cg_print.{
-    print_ev, print_epilogue, print_fn_decl, print_global_decl, print_prologue,
+    print_ev, print_epilogue, print_fn, print_fn_decl, print_global_decl, print_prologue,
     print_simple_enum_typedef, print_struct_typedef, print_tagged_enum_typedef,
     print_typedef_blocks,
 }
@@ -276,17 +276,22 @@ fn needs_no_wrapper(fn_node: Int, decl_name: Str) -> Bool {
     symbol != "" && symbol == decl_name
 }
 
+// The C name a declaration is both declared and defined under. A method carries its
+// receiver type and trait, a free function its module; which of the two a node is comes
+// from the registry, so the rule is settled here once and every signature this module
+// writes reads it from the same place.
+fn decl_c_name(decl: Int) -> Str {
+    let im = cg_reg_impl_of(decl)
+    if im >= 0 { return c_impl_method_name(im, node_name(decl)) }
+    c_fn_decl_name(decl)
+}
+
 // A carrier type has no declaration of its own, so the only thing that asks for it is
 // the signature that names it. Spelling it records its typedef, which must be written
 // before the declaration that reads it, so the spellings are taken first.
 pub fn cg_decl_emit_fn_decl(fn_node: Int, is_static: Bool) ! Diag.Report {
-    // A foreign binding is the exception to the generic-base rule: a foreign symbol has
-    // one address, so a binding over it has one wrapper however many binders its Blink
-    // signature carries. Those binders may only reach types whose C spelling does not
-    // depend on them, and a spelling that does depend on one is reported, not guessed.
-    if is_generic_base(fn_node) && c_ffi_symbol(fn_node) == "" { return }
-    let name = c_fn_decl_name(fn_node)
-    if needs_no_wrapper(fn_node, name) { return }
+    if !site_is_declared(cg_decl_body_site(fn_node)) { return }
+    let name = decl_c_name(fn_node)
     let ret = fn_ret_spelling(fn_node)
     let params = fn_param_decls(fn_node)
     print_fn_decl(is_static, ret, name, params, fn_takes_ev(fn_node))
@@ -311,11 +316,9 @@ fn impl_is_generic(im: Int) -> Bool {
 }
 
 pub fn cg_decl_emit_impl_method_decl(method: Int, is_static: Bool) ! Diag.Report {
-    let im = cg_reg_impl_of(method)
-    if im < 0 { return }
-    if impl_is_generic(im) || is_generic_base(method) { return }
-    let name = c_impl_method_name(im, node_name(method))
-    if needs_no_wrapper(method, name) { return }
+    if cg_reg_impl_of(method) < 0 { return }
+    if !site_is_declared(cg_decl_body_site(method)) { return }
+    let name = decl_c_name(method)
     let ret = fn_ret_spelling(method)
     let params = fn_param_decls(method)
     print_fn_decl(is_static, ret, name, params, fn_takes_ev(method))
@@ -323,6 +326,75 @@ pub fn cg_decl_emit_impl_method_decl(method: Int, is_static: Bool) ! Diag.Report
 
 pub fn cg_decl_emit_impl_method_decls() ! Diag.Report {
     for m in cg_reg_impl_methods() { cg_decl_emit_impl_method_decl(m, false) }
+}
+
+// ── Definitions ──────────────────────────────────────────────────────────────
+//
+// A definition repeats the declaration's signature and adds the body the statement
+// stage lowered. The signature comes from the same three producers the declaration used,
+// so a definition can never disagree with the prototype a caller compiled against.
+
+// Where a declaration's body is written. Both the prototype and the body follow from
+// this one answer, so this unit can never declare what it does not define, nor define
+// what it never declared.
+pub type BodySite {
+    // This unit, under the declaration's own name.
+    ThisUnit
+    // One body per monomorphized instance, because the declaration's own types are
+    // binders and a body needs concrete ones.
+    PerInstance
+    // A C wrapper whose body calls the foreign symbol. It has no Blink statements.
+    ForeignWrapper
+    // Nowhere: the call goes straight to the foreign function under its own name, so
+    // there is no wrapper and no body to write.
+    Nothing
+}
+
+pub fn cg_decl_body_site(decl: Int) -> BodySite {
+    let im = cg_reg_impl_of(decl)
+    if im >= 0 { return method_body_site(decl, im) }
+    free_fn_body_site(decl)
+}
+
+// A free binding over a foreign symbol has one wrapper however many binders its Blink
+// signature carries, because the foreign symbol has one address. That makes the binding
+// the exception to the per-instance rule, so it is asked about first.
+fn free_fn_body_site(fn_node: Int) -> BodySite {
+    if c_ffi_symbol(fn_node) != "" { return foreign_body_site(fn_node) }
+    if is_generic_base(fn_node) { return BodySite.PerInstance }
+    BodySite.ThisUnit
+}
+
+// A method has no such exception. Its name carries the receiver type, so a binding over
+// one foreign symbol still needs a wrapper for each receiver the binders admit, and
+// genericity therefore decides first.
+fn method_body_site(method: Int, im: Int) -> BodySite {
+    if impl_is_generic(im) || is_generic_base(method) { return BodySite.PerInstance }
+    if c_ffi_symbol(method) != "" { return foreign_body_site(method) }
+    BodySite.ThisUnit
+}
+
+fn foreign_body_site(decl: Int) -> BodySite {
+    if needs_no_wrapper(decl, decl_c_name(decl)) { return BodySite.Nothing }
+    BodySite.ForeignWrapper
+}
+
+// A prototype is written for exactly the bodies that exist under the declaration's own
+// name. A per-instance body is declared with its instance, and a direct binding has no
+// wrapper for a prototype to describe.
+fn site_is_declared(site: BodySite) -> Bool {
+    match site {
+        BodySite.ThisUnit => true
+        BodySite.ForeignWrapper => true
+        BodySite.PerInstance => false
+        BodySite.Nothing => false
+    }
+}
+
+pub fn cg_decl_emit_fn_def(fn_node: Int, is_static: Bool, body: Int) ! Diag.Report {
+    let ret = fn_ret_spelling(fn_node)
+    let params = fn_param_decls(fn_node)
+    print_fn(is_static, ret, decl_c_name(fn_node), params, fn_takes_ev(fn_node), body)
 }
 
 // ── Globals ──────────────────────────────────────────────────────────────────
