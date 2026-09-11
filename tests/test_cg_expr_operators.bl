@@ -1,0 +1,100 @@
+// Operators: what C can write inline, what needs the runtime, and what needs a statement.
+
+import lower_test_helpers.{probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies}
+import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid}
+import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
+
+fn src() -> Str {
+    #"fn main() {
+    let a = 1 + 2
+    let lt = a < 3
+    let s = "x"
+    let eq = s == "y"
+    let ne = s != "y"
+    let ord = s < "y"
+    let both = lt && eq
+    let either = lt || eq
+    let neg = -a
+    let not = !lt
+    let opt: Option[Int] = Some(a)
+    let dflt = opt ?? 0
+    let _keep = [both, either, not, ne, ord]
+    let _keep2 = [neg, dflt]
+}
+"#
+}
+
+test "arithmetic is one C binary at the result tid, printed inline" {
+    probe("cg_expr_ops", src())
+    let id = lower_expr(rhs_of("a"))
+    assert_kind("kind", id, IrKind.Binary)
+    assert_eq_str("op", ir_c_name(id), "+")
+    assert_eq_str("type", ir_c_spelling(id), "int64_t")
+    assert_shape("shape", id, "Binary(Const, Const)")
+    assert_eq(cg_expr_pending_count(), 0)
+    assert_verifies("verify", id)
+}
+
+test "a comparison answers Bool, not the operand type" {
+    probe("cg_expr_ops", src())
+    let id = lower_expr(rhs_of("lt"))
+    assert_kind("kind", id, IrKind.Binary)
+    assert_eq_str("op", ir_c_name(id), "<")
+    assert_eq_str("type", ir_c_spelling(id), "int")
+}
+
+test "string equality is a runtime call, because C compares pointers" {
+    probe("cg_expr_ops", src())
+    let id = lower_expr(rhs_of("eq"))
+    assert_kind("kind", id, IrKind.CallRuntime)
+    assert_eq_str("symbol", ir_c_name(id), "blink_str_eq")
+    assert_shape("shape", id, "CallRuntime(VarRef, Const)")
+}
+
+test "string inequality negates the one equality call" {
+    probe("cg_expr_ops", src())
+    let id = lower_expr(rhs_of("ne"))
+    assert_kind("kind", id, IrKind.Unary)
+    assert_eq_str("op", ir_c_name(id), "!")
+    assert_shape("shape", id, "Unary(CallRuntime(VarRef, Const))")
+}
+
+test "string ordering compares the runtime answer against zero" {
+    probe("cg_expr_ops", src())
+    let id = lower_expr(rhs_of("ord"))
+    assert_kind("kind", id, IrKind.Binary)
+    assert_eq_str("op", ir_c_name(id), "<")
+    assert_shape("shape", id, "Binary(CallRuntime(VarRef, Const), Const)")
+    assert_eq_str("symbol", ir_c_name(ir_kid(id, 0)), "blink_str_cmp")
+}
+
+test "and and or stay C operators while neither side needs a statement" {
+    probe("cg_expr_ops", src())
+    let both = lower_expr(rhs_of("both"))
+    assert_eq_str("and", ir_c_name(both), "&&")
+    assert_eq(cg_expr_pending_count(), 0)
+    let either = lower_expr(rhs_of("either"))
+    assert_eq_str("or", ir_c_name(either), "||")
+    assert_eq(cg_expr_pending_count(), 0)
+}
+
+test "negation and logical not are one C unary each" {
+    probe("cg_expr_ops", src())
+    let neg = lower_expr(rhs_of("neg"))
+    assert_kind("neg kind", neg, IrKind.Unary)
+    assert_eq_str("neg op", ir_c_name(neg), "-")
+    let not = lower_expr(rhs_of("not"))
+    assert_eq_str("not op", ir_c_name(not), "!")
+}
+
+test "the Option default operator binds the carrier once and branches on its tag" {
+    probe("cg_expr_ops", src())
+    let id = lower_expr(rhs_of("dflt"))
+    assert_kind("kind", id, IrKind.VarRef)
+    let pending = cg_expr_take_pending()
+    assert_eq(pending.len(), 3)
+    assert_kind("carrier temp", pending.get(0).unwrap(), IrKind.Let)
+    assert_kind("result temp", pending.get(1).unwrap(), IrKind.Let)
+    assert_shape("branch", pending.get(2).unwrap(),
+        "If(Binary(CarrierTag(VarRef), Const), Block(Assign(VarRef, CarrierUnwrap(VarRef))), Block(Assign(VarRef, Const)))")
+}

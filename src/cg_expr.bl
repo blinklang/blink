@@ -1,11 +1,1203 @@
-// cg_expr.bl: expressions, literals and operators, lowered to IR.
+// cg_expr.bl: every Blink expression becomes one typed IR value.
 //
-// A stage of the tid-native emitter, not yet written. Its entry point reports I0004 and
-// returns, so the driver's diag_ice_count check turns a call into a loud failure rather
-// than a translation unit that is silently empty.
+// A node's tid is the only thing that decides its C shape. Every spelling and slot form
+// comes from layout_of, every symbol from cname, and no C text is written here. A shape
+// this stage cannot lower is an ICE, never a guess.
+//
+// Three things an expression cannot finish alone belong to the statement stage:
+//   - a hoisted statement (a heap box, a short-circuit arm, a coalesce, a `?` return)
+//     lands in a pending buffer that cg_stmt drains ahead of the statement it serves;
+//   - an `if` or `match` in value position is materialised by cg_stmt, which registers
+//     the temp here before lowering the expression that reads it;
+//   - `?` returns from the enclosing function, so cg_stmt hands over that return tid.
+//
+// The inline rule (docs/codegen-rewrite/printer.md) is why so little is hoisted: a value
+// prints into its parent unless it is effectful or the tree reaches it twice. Every temp
+// below exists because C has no expression form for the shape, not for readability.
 
-import diagnostics.{Diag, diag_ice_stage_not_built}
-
-pub fn cg_expr_lower(node: Int) ! Diag.Report {
-    diag_ice_stage_not_built("cg_expr", node)
+import parser.{
+    node_kind, node_name, node_op, node_left, node_right, node_value, node_obj,
+    node_str_val, node_int_val, node_elements, node_fields, node_args, node_condition,
+    sublist_get, sublist_length,
 }
+import ast.{NodeKind, nk_of, node_kind_name}
+import typecheck.{
+    TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_child_count, tc_tid_decl_node,
+    lookup_named_type, get_struct_field_tid, is_import_module_name,
+    TYPE_INT, TYPE_BOOL, TYPE_STR,
+}
+import layout.{
+    LayoutRecord, Position, Slot, SlotForm, layout_of, carrier_member_layout, child_tid,
+    field_layout_of, tid_of_node, ensure_typedef_for, format_spec_of, varargs_spelling,
+}
+import cname.{
+    c_local_name, c_field_name, c_global_name, c_string_literal, c_container_ctor,
+    c_runtime_helper, c_variant_tag_macro, c_mono_variant_tag_macro,
+}
+import ir.{
+    IrKind, ir_kind, ir_kid, ir_kid_count,
+    ir_const, ir_var_ref, ir_global_ref, ir_unary, ir_binary, ir_cast, ir_field_get,
+    ir_struct_new, ir_tuple_new, ir_container_new, ir_box, ir_unbox, ir_carrier_wrap,
+    ir_carrier_unwrap, ir_carrier_tag, ir_call_runtime, ir_let, ir_assign, ir_return,
+    ir_expr_stmt, ir_if, ir_block,
+}
+import diagnostics.{
+    Diag, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg, UNSOLVED_TYPEVAR_AT_CODEGEN,
+    CODEGEN_STAGE_NOT_BUILT,
+}
+import mono.{MonoInstance, node_tid_for_inst}
+
+// The constructor and member spellings this stage compares against, held as data so no
+// branch here dispatches on a type's name.
+let ctor_none = "None"
+let ctor_some = "Some"
+let ctor_ok = "Ok"
+let ctor_err = "Err"
+let member_value = "value"
+let member_ok = "ok"
+let member_err = "err"
+let bool_true = "true"
+let bool_false = "false"
+
+// The value a struct literal spreads. Every field the literal omits reads it, so it is
+// bound to a temp and the expression that produced it runs once.
+type SpreadBase {
+    name: Str = ""
+    tid: Int = -1
+    decl: Int = -1
+}
+
+// One interpolation hole: the conversion the format string needs and the argument that
+// feeds it. An empty spec means the hole has already reported an ICE.
+type InterpHole {
+    spec: Str = ""
+    arg: Int = -1
+}
+
+let mut cx_inst: List[MonoInstance] = []
+let mut cx_pending: List[Int] = []
+let mut cx_temp_n: Int = 0
+let mut cx_value_name: Map[Str, Str] = Map()
+let mut cx_value_type: Map[Str, Int] = Map()
+let mut cx_globals: Map[Str, Int] = Map()
+let mut cx_return_type: Int = -1
+let mut cx_local_names: List[Str] = []
+let mut cx_scope_marks: List[Int] = []
+
+// ── Seam ──────────────────────────────────────────────────────────────────
+
+pub fn cg_expr_reset() {
+    cx_inst = []
+    cx_pending = []
+    cx_temp_n = 0
+    cx_value_name = Map()
+    cx_value_type = Map()
+    cx_globals = Map()
+    cx_return_type = -1
+    cx_local_names = []
+    cx_scope_marks = []
+}
+
+// Inside a monomorphised body a node's type is the instance's, not the generic one.
+pub fn cg_expr_enter_instance(inst: MonoInstance) {
+    cx_inst.push(inst)
+}
+
+pub fn cg_expr_leave_instance() {
+    if cx_inst.len() > 0 { cx_inst.pop() }
+}
+
+// The carrier `?` returns on the error path.
+pub fn cg_expr_set_return_type(tid: Int) {
+    cx_return_type = tid
+}
+
+// A module-level binding. A bare name spells this symbol only where no local of the same
+// name is in scope, and a qualified key also answers `mod.NAME` from another module.
+pub fn cg_expr_bind_global(name: Str, let_node: Int) {
+    cx_globals.insert(name, let_node)
+}
+
+// The names in scope decide whether a bare name is a local or a module global, because
+// the language lets a local shadow a global. cg_fn opens a scope for the parameters and
+// cg_stmt one for every block, and each binds the names it declares.
+pub fn cg_expr_push_scope() {
+    cx_scope_marks.push(cx_local_names.len())
+}
+
+pub fn cg_expr_pop_scope() {
+    let n = cx_scope_marks.len()
+    if n == 0 { return }
+    let mark = cx_scope_marks.get(n - 1).unwrap()
+    cx_scope_marks.pop()
+    while cx_local_names.len() > mark { cx_local_names.pop() }
+}
+
+pub fn cg_expr_bind_local(name: Str) {
+    cx_local_names.push(name)
+}
+
+// An `if` or `match` in value position: cg_stmt declares the temp, lowers the arms into
+// assignments to it, and names it here before lowering the expression that reads it.
+pub fn cg_expr_register_value(node: Int, c_name: Str, tid: Int) {
+    cx_value_name.insert("{node}", c_name)
+    cx_value_type.insert("{node}", tid)
+}
+
+pub fn cg_expr_pending_count() -> Int { cx_pending.len() }
+
+// Statements the lowered expression needs run before it. The caller emits them in order.
+pub fn cg_expr_take_pending() -> List[Int] {
+    let out = cx_pending
+    cx_pending = []
+    out
+}
+
+// ── Dispatch ──────────────────────────────────────────────────────────────
+
+pub fn lower_expr(node: Int) -> Int ! Diag.Report {
+    match nk_of(node_kind(node)) {
+        NodeKind.IntLit => lower_int_lit(node)
+        NodeKind.FloatLit => lower_literal(node, node_str_val(node))
+        NodeKind.CharLit => lower_literal(node, node_str_val(node))
+        NodeKind.BoolLit => lower_bool_lit(node)
+        NodeKind.InterpString => lower_interp(node)
+        NodeKind.Ident => lower_ident(node)
+        NodeKind.BinOp => lower_binop(node)
+        NodeKind.UnaryOp => lower_unary(node)
+        NodeKind.TupleLit => lower_tuple_lit(node)
+        NodeKind.ListLit => lower_list_lit(node)
+        NodeKind.StructLit => lower_struct_lit(node)
+        NodeKind.FieldAccess => lower_field_access(node)
+        NodeKind.IndexExpr => lower_index(node)
+        NodeKind.Call => lower_call_expr(node)
+        NodeKind.IfExpr => lower_registered(node)
+        NodeKind.MatchExpr => lower_registered(node)
+        NodeKind.SpreadExpr => x_spread_not_built(node)
+        NodeKind.Closure => x_not_built(node, "cg_eff closures")
+        NodeKind.MethodCall => x_not_built(node, "cg_call")
+        _ => x_unhandled(node)
+    }
+}
+
+// ── Type and layout ───────────────────────────────────────────────────────
+
+// The tid of a node, read from the mono instance when one is open. Both readers report a
+// miss and answer -1; nothing here substitutes a default type.
+fn x_tid(node: Int) -> Int ! Diag.Report {
+    if cx_inst.len() > 0 {
+        return node_tid_for_inst(cx_inst.get(cx_inst.len() - 1).unwrap(), node)
+    }
+    tid_of_node(node)
+}
+
+// The shape of a value in hand. A decline here means monomorphisation left a type codegen
+// cannot spell, so it is an ICE and the caller stops.
+fn x_local(tid: Int, node: Int) -> LayoutRecord ! Diag.Report {
+    let rec = layout_of(tid, Position.Local)
+    if rec.decline_reason != "" {
+        let why = "expression has no C layout: {rec.decline_reason}"
+        diag_ice_at("UnspellableExprType", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
+            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    }
+    rec
+}
+
+fn x_member(carrier: Int, slot: Slot, node: Int) -> LayoutRecord ! Diag.Report {
+    let rec = carrier_member_layout(carrier, slot)
+    if rec.decline_reason != "" {
+        let why = "carrier member has no C layout: {rec.decline_reason}"
+        diag_ice_at("UnspellableCarrierMember", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
+            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    }
+    rec
+}
+
+// x_local and x_member have already turned a decline into an ICE, so a caller is only
+// asking whether lowering may go on. layout.bl answers every decline with an empty
+// spelling, and no answer it accepts is empty, so that is the question to ask.
+fn x_stopped(rec: LayoutRecord) -> Bool {
+    rec.c_spelling == ""
+}
+
+// A field read takes the owner's stored form: a field whose type reaches its own owner
+// by value is held as a boxed word, which the field's own Local layout does not say.
+fn x_field(owner_decl: Int, field_tid: Int, node: Int) -> LayoutRecord ! Diag.Report {
+    let rec = field_layout_of(owner_decl, field_tid)
+    if rec.decline_reason != "" {
+        let why = "struct field has no C layout: {rec.decline_reason}"
+        diag_ice_at("UnspellableFieldType", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
+            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    }
+    rec
+}
+
+fn x_unhandled(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("UnhandledExprKind", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "expression kind {node_kind_name(node_kind(node))} has no lowering", node,
+        "every expression kind the parser produces needs an arm in lower_expr")
+    -1
+}
+
+fn x_not_built(node: Int, stage: Str) -> Int ! Diag.Report {
+    diag_ice_stage_not_built(stage, node)
+    -1
+}
+
+// `[..a, b]` copies the source's elements into the new container. That copy is a runtime
+// call on the container, not an element the literal can write in place.
+fn x_spread_not_built(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("SpreadElementNotLowered", CODEGEN_STAGE_NOT_BUILT,
+        "a spread element has no lowering here", node,
+        "cg_call owns the container copy a spread performs")
+    -1
+}
+
+// Whether running this value can be observed. Only a call, a performed effect or an
+// installed handler acts; every other kind answers for the kids it is built from.
+fn x_has_effect(id: Int) -> Bool {
+    if id < 0 { return false }
+    if x_kind_acts(ir_kind(id)) { return true }
+    let mut i = 0
+    while i < ir_kid_count(id) {
+        if x_has_effect(ir_kid(id, i)) { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn x_kind_acts(k: IrKind) -> Bool {
+    if k == IrKind.CallDirect { return true }
+    if k == IrKind.CallIndirect { return true }
+    if k == IrKind.CallClosure { return true }
+    if k == IrKind.CallVirtual { return true }
+    if k == IrKind.CallRuntime { return true }
+    if k == IrKind.EffectPerform { return true }
+    k == IrKind.HandlerInstall
+}
+
+// ── Hoisting ──────────────────────────────────────────────────────────────
+
+fn x_hoist(stmt: Int) {
+    cx_pending.push(stmt)
+}
+
+// Statements pushed since `mark`, removed from the buffer. A short-circuit or coalesce arm
+// owns the statements its own operand needed, so they move into that arm's block.
+fn x_take_from(mark: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut i = mark
+    while i < cx_pending.len() {
+        out.push(cx_pending.get(i).unwrap())
+        i = i + 1
+    }
+    while cx_pending.len() > mark { cx_pending.pop() }
+    out
+}
+
+fn x_temp() -> Str {
+    cx_temp_n = cx_temp_n + 1
+    "_x{cx_temp_n}"
+}
+
+// Declares a temp of `tid` and answers its name. init < 0 declares without initialising.
+fn x_bind(tid: Int, node: Int, init: Int) -> Str ! Diag.Report {
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return "" }
+    let name = x_temp()
+    x_hoist(ir_let(tid, node, rec.c_spelling, name, rec.slot_form, init))
+    name
+}
+
+fn x_ref(tid: Int, node: Int, name: Str) -> Int ! Diag.Report {
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    ir_var_ref(tid, node, rec.c_spelling, name, rec.slot_form)
+}
+
+// ── Literals ──────────────────────────────────────────────────────────────
+
+fn lower_literal(node: Int, literal: Str) -> Int ! Diag.Report {
+    let tid = x_tid(node)
+    if tid < 0 { return -1 }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    ir_const(tid, node, rec.c_spelling, literal)
+}
+
+fn lower_int_lit(node: Int) -> Int ! Diag.Report {
+    let s = node_str_val(node)
+    if s == "" { return lower_literal(node, "{node_int_val(node)}") }
+    lower_literal(node, s)
+}
+
+fn lower_bool_lit(node: Int) -> Int ! Diag.Report {
+    if node_int_val(node) != 0 { return lower_literal(node, "1") }
+    lower_literal(node, "0")
+}
+
+// ── Names ─────────────────────────────────────────────────────────────────
+
+fn x_kind(tid: Int) -> TyKind {
+    tc_tid_kind(tc_resolve(tid))
+}
+
+fn lower_ident(node: Int) -> Int ! Diag.Report {
+    let tid = x_tid(node)
+    if tid < 0 { return -1 }
+    let name = node_name(node)
+    if name == ctor_none { return lower_none(node, tid) }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    if !x_is_local(name) {
+        match cx_globals.get(name) {
+            Some(decl) => return ir_global_ref(tid, node, rec.c_spelling, c_global_name(decl), rec.slot_form)
+            None => {}
+        }
+    }
+    ir_var_ref(tid, node, rec.c_spelling, c_local_name(name), rec.slot_form)
+}
+
+fn x_is_local(name: Str) -> Bool {
+    let mut i = 0
+    while i < cx_local_names.len() {
+        if cx_local_names.get(i).unwrap() == name { return true }
+        i = i + 1
+    }
+    false
+}
+
+// An `if` or `match` in value position: the arms are statements, so cg_stmt materialises
+// them into a temp and names it here. Reaching one that was never registered means the
+// statement stage lowered the arms without claiming the value.
+fn lower_registered(node: Int) -> Int ! Diag.Report {
+    let key = "{node}"
+    match cx_value_name.get(key) {
+        Some(name) => return lower_registered_ref(node, key, name)
+        None => {}
+    }
+    diag_ice_at("UnmaterialisedValueExpr", CODEGEN_STAGE_NOT_BUILT,
+        "{node_kind_name(node_kind(node))} in value position was not materialised", node,
+        "cg_stmt must declare the temp and call cg_expr_register_value before lowering the reader")
+    -1
+}
+
+fn lower_registered_ref(node: Int, key: Str, name: Str) -> Int ! Diag.Report {
+    let mut tid = -1
+    match cx_value_type.get(key) {
+        Some(t) => tid = t
+        None => {}
+    }
+    if tid < 0 {
+        diag_ice_at("MaterialisedValueHasNoType", CODEGEN_STAGE_NOT_BUILT,
+            "the temp '{name}' was registered without a type", node,
+            "cg_expr_register_value takes the temp's tid; it must be the one the arms assign")
+        return -1
+    }
+    x_ref(tid, node, name)
+}
+
+// ── Carriers ──────────────────────────────────────────────────────────────
+
+fn x_tag(node: Int, value: Int) -> Int ! Diag.Report {
+    let rec = x_local(TYPE_INT, node)
+    if x_stopped(rec) { return -1 }
+    ir_const(TYPE_INT, node, rec.c_spelling, "{value}")
+}
+
+// An Option over an opaque handle is the bare handle pointer, with NULL for None, so it
+// has no tag to write. layout says which shape applies by answering a word slot form.
+fn lower_none(node: Int, tid: Int) -> Int ! Diag.Report {
+    if x_kind(tid) != TyKind.Option {
+        diag_ice_at("NoneOutsideOption", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "None lowered at a type that is not an Option", node,
+            "typecheck must give every None an Option type")
+        return -1
+    }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    let _td = ensure_typedef_for(tid)
+    if rec.slot_form == SlotForm.InlineWord { return ir_const(tid, node, rec.c_spelling, "0") }
+    let tag = x_tag(node, 0)
+    if tag < 0 { return -1 }
+    ir_carrier_wrap(tid, node, rec.c_spelling, "", tag, -1)
+}
+
+// Some, Ok and Err all write one tag and one member. Which member and which tag is the
+// only difference, and the member's physical form is layout's answer, not a guess here.
+fn lower_wrap(node: Int, slot: Slot, member: Str, tag_value: Int) -> Int ! Diag.Report {
+    let tid = x_tid(node)
+    if tid < 0 { return -1 }
+    let args = node_args(node)
+    let n = sublist_length(args)
+    // `Ok()` is the spelling of a Void success, so a missing argument is an arity of its
+    // own rather than an error; only a second argument is one.
+    if n > 1 {
+        diag_ice_at("CarrierCtorArity", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "carrier constructor takes one argument, got {n}", node,
+            "typecheck must reject a carrier constructor of the wrong arity")
+        return -1
+    }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    let _td = ensure_typedef_for(tid)
+    let arg = if n == 1 { sublist_get(args, 0) } else { -1 }
+    lower_wrap_body(node, tid, slot, member, tag_value, rec, arg)
+}
+
+fn lower_wrap_body(node: Int, tid: Int, slot: Slot, member: Str, tag_value: Int, rec: LayoutRecord, arg: Int) -> Int ! Diag.Report {
+    let mem = x_member(tid, slot, node)
+    if x_stopped(mem) { return -1 }
+    let inner = child_tid(tid, slot)
+    // A Void arm holds an int64_t placeholder, so the unit value writes the placeholder
+    // rather than a compound literal of the empty tuple.
+    if x_is_void_like(inner) { return lower_wrap_unit(node, tid, member, tag_value, rec, mem, arg) }
+    if arg < 0 {
+        diag_ice_at("CarrierCtorArity", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "carrier constructor over a {tk_name(x_kind(inner))} payload was given no argument", node,
+            "typecheck must reject a carrier constructor of the wrong arity")
+        return -1
+    }
+    let payload = lower_expr(arg)
+    if payload < 0 { return -1 }
+    x_wrap_value(node, tid, slot, member, tag_value, payload)
+}
+
+// Wrapping a payload that is already lowered. `?` reaches here too: it rebuilds the
+// caller's error carrier from a payload it unwrapped rather than from an argument node.
+fn x_wrap_value(node: Int, tid: Int, slot: Slot, member: Str, tag_value: Int, payload: Int) -> Int ! Diag.Report {
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    let _td = ensure_typedef_for(tid)
+    let mem = x_member(tid, slot, node)
+    if x_stopped(mem) { return -1 }
+    // The opaque-handle Option is the payload pointer itself: no tag, no member.
+    if rec.slot_form == SlotForm.InlineWord { return ir_cast(tid, node, rec.c_spelling, payload) }
+    let mut value = payload
+    if mem.slot_form == SlotForm.PointerBoxed {
+        value = x_box(node, child_tid(tid, slot), payload, mem.c_spelling)
+        if value < 0 { return -1 }
+    }
+    let tag = x_tag(node, tag_value)
+    if tag < 0 { return -1 }
+    ir_carrier_wrap(tid, node, rec.c_spelling, member, tag, value)
+}
+
+// The unit carries no value, but the argument that produced it is an ordinary expression
+// and may be a call written for its effect, so it runs ahead of the wrap.
+fn lower_wrap_unit(node: Int, tid: Int, member: Str, tag_value: Int, rec: LayoutRecord, mem: LayoutRecord, arg: Int) -> Int ! Diag.Report {
+    if arg >= 0 {
+        let produced = lower_expr(arg)
+        if produced < 0 { return -1 }
+        if x_has_effect(produced) { x_hoist(ir_expr_stmt(node, produced)) }
+    }
+    let tag = x_tag(node, tag_value)
+    if tag < 0 { return -1 }
+    ir_carrier_wrap(tid, node, rec.c_spelling, member, tag, ir_const(TYPE_INT, node, mem.c_spelling, "0"))
+}
+
+fn x_is_void_like(tid: Int) -> Bool {
+    let k = x_kind(tid)
+    k == TyKind.Void || k == TyKind.Never
+}
+
+// A payload wider than the carrier's pointer member gets a heap copy. The box's tid is the
+// pointee's: the slot form, not the tid, records that the value sits behind a pointer.
+fn x_box(node: Int, tid: Int, value: Int, ptr_spelling: Str) -> Int ! Diag.Report {
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    ir_box(tid, node, ptr_spelling, rec.c_spelling, value)
+}
+
+// ── Operators ─────────────────────────────────────────────────────────────
+
+fn lower_binop(node: Int) -> Int ! Diag.Report {
+    let op = node_op(node)
+    if op == "??" { return lower_coalesce(node) }
+    if op == "&&" { return lower_short_circuit(node, op) }
+    if op == "||" { return lower_short_circuit(node, op) }
+    let lhs_tid = x_tid(node_left(node))
+    if lhs_tid < 0 { return -1 }
+    if x_kind(lhs_tid) == TyKind.Str { return lower_str_binop(node, op) }
+    let lhs_rec = x_local(lhs_tid, node_left(node))
+    if x_stopped(lhs_rec) { return -1 }
+    if !x_is_c_comparable(lhs_tid, lhs_rec) {
+        diag_ice_at("OperandNotCComparable", CODEGEN_STAGE_NOT_BUILT,
+            "operator '{op}' on a {tk_name(x_kind(lhs_tid))} operand needs trait dispatch", node,
+            "cg_call must lower the Eq or Ord method this operator desugars to")
+        return -1
+    }
+    let tid = x_tid(node)
+    if tid < 0 { return -1 }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    let lhs = lower_expr(node_left(node))
+    let rhs = lower_expr(node_right(node))
+    if lhs < 0 { return -1 }
+    if rhs < 0 { return -1 }
+    ir_binary(tid, node, rec.c_spelling, op, lhs, rhs)
+}
+
+// Kinds C's own operators compare and arithmetic correctly: the scalars and the ordinal
+// enums. A struct, data enum, Bytes or container operand desugars to a trait method.
+fn x_is_c_comparable(tid: Int, rec: LayoutRecord) -> Bool {
+    if rec.slot_form != SlotForm.InlineWord { return false }
+    let k = x_kind(tid)
+    if k == TyKind.Option { return false }
+    if k == TyKind.List { return false }
+    if k == TyKind.Map { return false }
+    if k == TyKind.Set { return false }
+    if k == TyKind.Bytes { return false }
+    if k == TyKind.Fn { return false }
+    true
+}
+
+// C compares a const char* by address, so every Str comparison goes through the runtime.
+fn lower_str_binop(node: Int, op: Str) -> Int ! Diag.Report {
+    let tid = x_tid(node)
+    if tid < 0 { return -1 }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    let lhs = lower_expr(node_left(node))
+    let rhs = lower_expr(node_right(node))
+    if lhs < 0 { return -1 }
+    if rhs < 0 { return -1 }
+    if op == "==" { return x_str_eq(node, tid, rec, lhs, rhs) }
+    if op == "!=" { return ir_unary(tid, node, rec.c_spelling, "!", x_str_eq(node, tid, rec, lhs, rhs)) }
+    lower_str_order(node, tid, rec, op, lhs, rhs)
+}
+
+fn x_str_eq(node: Int, tid: Int, rec: LayoutRecord, lhs: Int, rhs: Int) -> Int ! Diag.Report {
+    ir_call_runtime(tid, node, rec.c_spelling, c_runtime_helper("str_eq"), rec.slot_form, [lhs, rhs])
+}
+
+fn lower_str_order(node: Int, tid: Int, rec: LayoutRecord, op: Str, lhs: Int, rhs: Int) -> Int ! Diag.Report {
+    if op != "<" && op != "<=" && op != ">" && op != ">=" { return x_unhandled(node) }
+    let cmp_rec = x_local(TYPE_INT, node)
+    if x_stopped(cmp_rec) { return -1 }
+    let cmp = ir_call_runtime(TYPE_INT, node, cmp_rec.c_spelling, c_runtime_helper("str_cmp"), SlotForm.InlineWord, [lhs, rhs])
+    ir_binary(tid, node, rec.c_spelling, op, cmp, ir_const(TYPE_INT, node, cmp_rec.c_spelling, "0"))
+}
+
+// C's own && and || short-circuit, so the whole operator prints inline whenever the right
+// operand needs no statement of its own. When it does, the statement would run
+// unconditionally inside the operand, so the operator becomes a temp and an `if`.
+fn lower_short_circuit(node: Int, op: Str) -> Int ! Diag.Report {
+    let tid = x_tid(node)
+    if tid < 0 { return -1 }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    let lhs = lower_expr(node_left(node))
+    if lhs < 0 { return -1 }
+    let mark = cx_pending.len()
+    let rhs = lower_expr(node_right(node))
+    if rhs < 0 { return -1 }
+    if cx_pending.len() == mark { return ir_binary(tid, node, rec.c_spelling, op, lhs, rhs) }
+    let arm = x_take_from(mark)
+    lower_short_circuit_guarded(node, tid, op, lhs, rhs, arm)
+}
+
+fn lower_short_circuit_guarded(node: Int, tid: Int, op: Str, lhs: Int, rhs: Int, arm: List[Int]) -> Int ! Diag.Report {
+    let name = x_bind(tid, node, lhs)
+    if name == "" { return -1 }
+    let target = x_ref(tid, node, name)
+    if target < 0 { return -1 }
+    let mut stmts = arm
+    stmts.push(ir_assign(node, target, rhs))
+    let mut cond = x_ref(tid, node, name)
+    if cond < 0 { return -1 }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    if op == "||" { cond = ir_unary(tid, node, rec.c_spelling, "!", cond) }
+    x_hoist(ir_if(node, cond, ir_block(node, stmts), -1))
+    x_ref(tid, node, name)
+}
+
+// `a ?? b` reads the carrier's tag once, so the carrier is bound before it is read twice,
+// and the default only runs on the None arm. C's conditional operator cannot hold the
+// statements either arm may need, so this is a temp and an `if`.
+fn lower_coalesce(node: Int) -> Int ! Diag.Report {
+    let opt_node = node_left(node)
+    let opt_tid = x_tid(opt_node)
+    if opt_tid < 0 { return -1 }
+    if x_kind(opt_tid) != TyKind.Option {
+        diag_ice_at("CoalesceOnNonOption", CODEGEN_STAGE_NOT_BUILT,
+            "'??' on a {tk_name(x_kind(opt_tid))} operand has no lowering", node,
+            "'??' is the Option default operator; any other carrier needs its own lowering")
+        return -1
+    }
+    let opt = lower_expr(opt_node)
+    if opt < 0 { return -1 }
+    let carrier = x_bind(opt_tid, opt_node, opt)
+    if carrier == "" { return -1 }
+    lower_coalesce_arms(node, opt_tid, carrier)
+}
+
+fn lower_coalesce_arms(node: Int, opt_tid: Int, carrier: Str) -> Int ! Diag.Report {
+    let tid = x_tid(node)
+    if tid < 0 { return -1 }
+    let result = x_bind(tid, node, -1)
+    if result == "" { return -1 }
+    let mark = cx_pending.len()
+    let fallback = lower_expr(node_right(node))
+    if fallback < 0 { return -1 }
+    let mut none_arm = x_take_from(mark)
+    let none_target = x_ref(tid, node, result)
+    if none_target < 0 { return -1 }
+    none_arm.push(ir_assign(node, none_target, fallback))
+    let some = x_payload_of(node, opt_tid, tid, carrier, Slot.Inner1, member_value)
+    if some < 0 { return -1 }
+    let some_target = x_ref(tid, node, result)
+    if some_target < 0 { return -1 }
+    let cond = x_tag_is(node, opt_tid, carrier, 1)
+    if cond < 0 { return -1 }
+    x_hoist(ir_if(node, cond, ir_block(node, [ir_assign(node, some_target, some)]), ir_block(node, none_arm)))
+    x_ref(tid, node, result)
+}
+
+// The payload a carrier temp holds, unboxed when the member stores a pointer.
+fn x_payload_of(node: Int, carrier_tid: Int, inner_tid: Int, carrier: Str, slot: Slot, member: Str) -> Int ! Diag.Report {
+    let mem = x_member(carrier_tid, slot, node)
+    if x_stopped(mem) { return -1 }
+    let obj = x_ref(carrier_tid, node, carrier)
+    if obj < 0 { return -1 }
+    let got = ir_carrier_unwrap(inner_tid, node, mem.c_spelling, member, mem.slot_form, obj)
+    if mem.slot_form != SlotForm.PointerBoxed { return got }
+    let rec = x_local(inner_tid, node)
+    if x_stopped(rec) { return -1 }
+    ir_unbox(inner_tid, node, rec.c_spelling, rec.slot_form, got)
+}
+
+fn x_tag_is(node: Int, carrier_tid: Int, carrier: Str, want: Int) -> Int ! Diag.Report {
+    let obj = x_ref(carrier_tid, node, carrier)
+    if obj < 0 { return -1 }
+    let int_rec = x_local(TYPE_INT, node)
+    let bool_rec = x_local(TYPE_BOOL, node)
+    if x_stopped(int_rec) { return -1 }
+    if x_stopped(bool_rec) { return -1 }
+    let tag = ir_carrier_tag(TYPE_INT, node, int_rec.c_spelling, obj)
+    ir_binary(TYPE_BOOL, node, bool_rec.c_spelling, "==", tag, ir_const(TYPE_INT, node, int_rec.c_spelling, "{want}"))
+}
+
+fn lower_unary(node: Int) -> Int ! Diag.Report {
+    let op = node_op(node)
+    if op == "?" { return lower_try(node) }
+    let tid = x_tid(node)
+    if tid < 0 { return -1 }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    let operand = lower_expr(node_left(node))
+    if operand < 0 { return -1 }
+    ir_unary(tid, node, rec.c_spelling, op, operand)
+}
+
+// `x?` reads the carrier twice, so the carrier is bound first. The failure arm returns
+// from the enclosing function, which is why this is a statement the expression hoists
+// rather than anything C can write inline.
+fn lower_try(node: Int) -> Int ! Diag.Report {
+    let src = node_left(node)
+    let carrier_tid = x_tid(src)
+    if carrier_tid < 0 { return -1 }
+    let k = x_kind(carrier_tid)
+    if k != TyKind.Option && k != TyKind.Result {
+        diag_ice_at("TryOnNonCarrier", CODEGEN_STAGE_NOT_BUILT,
+            "'?' on a {tk_name(k)} operand has no lowering", node,
+            "'?' propagates an Option or a Result; nothing else carries a failure arm")
+        return -1
+    }
+    if cx_return_type < 0 {
+        diag_ice_at("TryWithoutReturnType", CODEGEN_STAGE_NOT_BUILT,
+            "'?' needs the enclosing function's return type and none was given", node,
+            "the statement stage must call cg_expr_set_return_type before lowering a body")
+        return -1
+    }
+    let value = lower_expr(src)
+    if value < 0 { return -1 }
+    let carrier = x_bind(carrier_tid, src, value)
+    if carrier == "" { return -1 }
+    lower_try_arms(node, carrier_tid, k, carrier)
+}
+
+fn lower_try_arms(node: Int, carrier_tid: Int, k: TyKind, carrier: Str) -> Int ! Diag.Report {
+    let fail_tag = if k == TyKind.Option { 0 } else { 1 }
+    let cond = x_tag_is(node, carrier_tid, carrier, fail_tag)
+    if cond < 0 { return -1 }
+    let propagated = lower_try_propagate(node, carrier_tid, k, carrier)
+    if propagated < 0 { return -1 }
+    x_hoist(ir_if(node, cond, ir_block(node, [ir_return(node, propagated)]), -1))
+    let inner_tid = x_tid(node)
+    if inner_tid < 0 { return -1 }
+    // Both carriers hold their success in the first slot; only the member name differs.
+    let member = if k == TyKind.Option { member_value } else { member_ok }
+    x_payload_of(node, carrier_tid, inner_tid, carrier, Slot.Inner1, member)
+}
+
+// The failure the caller sees. A None stays a None whatever the function returns; an Err
+// carries its payload across, which is sound only when both sides name the same error.
+fn lower_try_propagate(node: Int, carrier_tid: Int, k: TyKind, carrier: Str) -> Int ! Diag.Report {
+    let ret = cx_return_type
+    if k == TyKind.Option { return lower_none(node, ret) }
+    if x_kind(ret) != TyKind.Result {
+        diag_ice_at("TryResultInNonResultFn", CODEGEN_STAGE_NOT_BUILT,
+            "'?' on a Result inside a function returning {tk_name(x_kind(ret))}", node,
+            "typecheck must reject this before codegen; there is no error arm to return into")
+        return -1
+    }
+    let err_tid = child_tid(ret, Slot.Inner2)
+    if err_tid < 0 { return -1 }
+    let payload = x_payload_of(node, carrier_tid, err_tid, carrier, Slot.Inner2, member_err)
+    if payload < 0 { return -1 }
+    x_wrap_value(node, ret, Slot.Inner2, member_err, 1, payload)
+}
+
+// ── Aggregates ────────────────────────────────────────────────────────────
+
+fn lower_tuple_lit(node: Int) -> Int ! Diag.Report {
+    let tid = x_tid(node)
+    if tid < 0 { return -1 }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    // `()` parses as the empty tuple and types as Void, which C holds as the placeholder
+    // word, so it is a constant and not a compound literal with no members.
+    if x_is_void_like(tid) { return ir_const(tid, node, rec.c_spelling, "0") }
+    ensure_typedef_for(tid)
+    let elems = x_lower_all(node_elements(node))
+    let mut i = 0
+    while i < elems.len() {
+        if elems.get(i).unwrap() < 0 { return -1 }
+        i = i + 1
+    }
+    ir_tuple_new(tid, node, rec.c_spelling, elems)
+}
+
+fn x_lower_all(sl: Int) -> List[Int] ! Diag.Report {
+    let mut out: List[Int] = []
+    if sl < 0 { return out }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        out.push(lower_expr(sublist_get(sl, i)))
+        i = i + 1
+    }
+    out
+}
+
+// A container literal hands its elements to the runtime constructor. A map or set literal
+// also needs the key-operations table for its key tid, and the IR carries no slot for one.
+fn lower_list_lit(node: Int) -> Int ! Diag.Report {
+    let tid = x_tid(node)
+    if tid < 0 { return -1 }
+    let k = x_kind(tid)
+    if k != TyKind.List {
+        diag_ice_at("ContainerLiteralNeedsKops", CODEGEN_STAGE_NOT_BUILT,
+            "a {tk_name(k)} literal needs a key-operations table and the IR has no slot for one", node,
+            "give ContainerNew a key-operations kid before lowering map and set literals")
+        return -1
+    }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    let ctor = c_container_ctor(tid)
+    if diag_is_ice_seg(ctor) { return x_unhandled(node) }
+    let elems = x_lower_all(node_elements(node))
+    let mut i = 0
+    while i < elems.len() {
+        if elems.get(i).unwrap() < 0 { return -1 }
+        i = i + 1
+    }
+    ir_container_new(tid, node, rec.c_spelling, ctor, elems)
+}
+
+// A struct literal writes its fields in declaration order, whatever order the source
+// names them, because C fills a compound literal positionally.
+fn lower_struct_lit(node: Int) -> Int ! Diag.Report {
+    let tid = x_tid(node)
+    if tid < 0 { return -1 }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    let decl = tc_tid_decl_node(tid)
+    if decl < 0 {
+        diag_ice_at("StructLiteralWithoutDecl", CODEGEN_STAGE_NOT_BUILT,
+            "the literal's tid has no type declaration to take a field order from", node,
+            "only a declared struct has a field order; a literal of any other tid is a typecheck bug")
+        return -1
+    }
+    ensure_typedef_for(tid)
+    let sp = x_spread_node(node)
+    let mut base = SpreadBase {}
+    if sp >= 0 {
+        base = x_bind_spread(sp)
+        if base.name == "" { return -1 }
+    }
+    let values = x_struct_fields(node, decl, base)
+    let mut i = 0
+    while i < values.len() {
+        if values.get(i).unwrap() < 0 { return -1 }
+        i = i + 1
+    }
+    ir_struct_new(tid, node, rec.c_spelling, values)
+}
+
+fn x_struct_fields(node: Int, decl: Int, base: SpreadBase) -> List[Int] ! Diag.Report {
+    let decls = node_fields(decl)
+    let given = node_fields(node)
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < sublist_length(decls) {
+        let fd = sublist_get(decls, i)
+        out.push(x_struct_field_value(node, fd, given, base))
+        i = i + 1
+    }
+    out
+}
+
+fn x_struct_field_value(node: Int, fd: Int, given: Int, base: SpreadBase) -> Int ! Diag.Report {
+    let want = node_name(fd)
+    let mut j = 0
+    while j < sublist_length(given) {
+        let g = sublist_get(given, j)
+        if node_name(g) == want { return lower_expr(node_value(g)) }
+        j = j + 1
+    }
+    // A spread supplies every field the literal does not name, and it outranks the
+    // field's default: the reader asked for the source's value, not for a fresh one.
+    if base.name != "" { return x_field_of_spread(node, want, base) }
+    let default = node_condition(fd)
+    if default >= 0 { return lower_expr(default) }
+    diag_ice_at("StructLiteralFieldMissing", CODEGEN_STAGE_NOT_BUILT,
+        "the literal gives no value for field '{want}' and the field has no default", node,
+        "typecheck must reject an incomplete struct literal before codegen")
+    -1
+}
+
+// The spread entry of a struct literal, or -1 when the literal names every field itself.
+fn x_spread_node(node: Int) -> Int {
+    let given = node_fields(node)
+    let mut j = 0
+    while j < sublist_length(given) {
+        let g = sublist_get(given, j)
+        if nk_of(node_kind(g)) == NodeKind.SpreadExpr { return g }
+        j = j + 1
+    }
+    -1
+}
+
+fn x_bind_spread(sp: Int) -> SpreadBase ! Diag.Report {
+    let src = node_value(sp)
+    let tid = x_tid(src)
+    if tid < 0 { return SpreadBase {} }
+    let value = lower_expr(src)
+    if value < 0 { return SpreadBase {} }
+    let decl = tc_tid_decl_node(tid)
+    if decl < 0 {
+        diag_ice_at("SpreadSourceWithoutDecl", CODEGEN_STAGE_NOT_BUILT,
+            "the spread source is a {tk_name(x_kind(tid))}, which declares no fields", sp,
+            "typecheck must reject a spread source that is not a struct")
+        return SpreadBase {}
+    }
+    let name = x_bind(tid, src, value)
+    if name == "" { return SpreadBase {} }
+    SpreadBase { name: name, tid: tid, decl: decl }
+}
+
+fn x_field_of_spread(node: Int, want: Str, base: SpreadBase) -> Int ! Diag.Report {
+    let ftid = get_struct_field_tid(base.tid, want)
+    if ftid < 0 {
+        diag_ice_at("SpreadSourceHasNoField", CODEGEN_STAGE_NOT_BUILT,
+            "the spread source has no field '{want}' for the literal to take", node,
+            "typecheck must reject a spread that leaves a field of the literal unfilled")
+        return -1
+    }
+    let mem = x_field(base.decl, ftid, node)
+    if x_stopped(mem) { return -1 }
+    let obj = x_ref(base.tid, node, base.name)
+    if obj < 0 { return -1 }
+    ir_field_get(ftid, node, mem.c_spelling, c_field_name(want), mem.slot_form, obj)
+}
+
+// ── Access ────────────────────────────────────────────────────────────────
+
+fn lower_field_access(node: Int) -> Int ! Diag.Report {
+    let obj = node_obj(node)
+    if x_variant_of(node, obj) >= 0 { return x_variant_const(node, obj) }
+    if x_module_qualifier(obj) != "" { return lower_module_global(node, obj) }
+    let obj_tid = x_tid(obj)
+    if obj_tid < 0 { return -1 }
+    if x_kind(obj_tid) == TyKind.Tuple { return lower_tuple_index(node, obj, obj_tid) }
+    lower_struct_field(node, obj, obj_tid)
+}
+
+// `mod.NAME` reads another module's global. The qualifier names a module, not a value, so
+// nothing reads a type for it. A binding of that name outranks the module, which is the
+// same rule name resolution applied when it typed the access.
+fn x_module_qualifier(obj: Int) -> Str {
+    if nk_of(node_kind(obj)) != NodeKind.Ident { return "" }
+    let name = node_name(obj)
+    if x_is_local(name) { return "" }
+    if cx_globals.contains_key(name) { return "" }
+    if is_import_module_name(name) == 0 { return "" }
+    name
+}
+
+fn lower_module_global(node: Int, obj: Int) -> Int ! Diag.Report {
+    let tid = x_tid(node)
+    if tid < 0 { return -1 }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    let field = node_name(node)
+    let mut decl = -1
+    match cx_globals.get("{x_module_qualifier(obj)}.{field}") {
+        Some(d) => decl = d
+        None => {}
+    }
+    if decl < 0 {
+        match cx_globals.get(field) {
+            Some(d) => decl = d
+            None => {}
+        }
+    }
+    if decl < 0 {
+        diag_ice_at("ModuleGlobalNotBound", CODEGEN_STAGE_NOT_BUILT,
+            "no global is bound for '{x_module_qualifier(obj)}.{field}'", node,
+            "the driver must call cg_expr_bind_global for every module-level binding a body reads")
+        return -1
+    }
+    ir_global_ref(tid, node, rec.c_spelling, c_global_name(decl), rec.slot_form)
+}
+
+// `Colour.Red` names a variant, not a field: the object is a type name and has no value.
+// The answer is the variant's own declaration node, or -1 when the object is a value.
+fn x_variant_of(node: Int, obj: Int) -> Int {
+    if nk_of(node_kind(obj)) != NodeKind.Ident { return -1 }
+    if node_str_val(obj) != "" { return -1 }
+    let named = lookup_named_type(node_name(obj))
+    if named < 0 { return -1 }
+    let decl = tc_tid_decl_node(named)
+    if decl < 0 { return -1 }
+    x_variant_decl(decl, node_name(node))
+}
+
+fn x_variant_const(node: Int, obj: Int) -> Int ! Diag.Report {
+    let tid = x_tid(node)
+    if tid < 0 { return -1 }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    let macro = x_variant_macro(tid, x_variant_of(node, obj))
+    if diag_is_ice_seg(macro) { return x_unhandled(node) }
+    ir_const(tid, node, rec.c_spelling, macro)
+}
+
+// A generic enum's variant tag belongs to the instance, not to the generic declaration,
+// so the two namers are chosen by whether the tid carries arguments.
+fn x_variant_macro(tid: Int, vd: Int) -> Str {
+    if tc_tid_child_count(tid) > 0 { return c_mono_variant_tag_macro(tid, vd) }
+    c_variant_tag_macro(tc_tid_decl_node(tid), vd)
+}
+
+fn x_variant_decl(decl: Int, name: Str) -> Int {
+    let vs = node_fields(decl)
+    let mut i = 0
+    while i < sublist_length(vs) {
+        let v = sublist_get(vs, i)
+        if node_name(v) == name { return v }
+        i = i + 1
+    }
+    -1
+}
+
+fn lower_tuple_index(node: Int, obj: Int, obj_tid: Int) -> Int ! Diag.Report {
+    let idx = node_name(node).to_int()
+    let tid = x_tid(node)
+    if tid < 0 { return -1 }
+    let mem = x_member(obj_tid, Slot.Elem(idx), node)
+    if x_stopped(mem) { return -1 }
+    let target = lower_expr(obj)
+    if target < 0 { return -1 }
+    ir_field_get(tid, node, mem.c_spelling, x_tuple_field(idx), mem.slot_form, target)
+}
+
+fn lower_struct_field(node: Int, obj: Int, obj_tid: Int) -> Int ! Diag.Report {
+    let tid = x_tid(node)
+    if tid < 0 { return -1 }
+    let decl = tc_tid_decl_node(obj_tid)
+    if decl < 0 {
+        diag_ice_at("FieldOwnerWithoutDecl", CODEGEN_STAGE_NOT_BUILT,
+            "field '{node_name(node)}' read from a {tk_name(x_kind(obj_tid))}, which declares no fields", node,
+            "only a declared type has fields; any other owner is a typecheck bug")
+        return -1
+    }
+    let rec = x_field(decl, tid, node)
+    if x_stopped(rec) { return -1 }
+    let target = lower_expr(obj)
+    if target < 0 { return -1 }
+    ir_field_get(tid, node, rec.c_spelling, c_field_name(node_name(node)), rec.slot_form, target)
+}
+
+// The language has no index operator: `[i]` type checks on a List and nowhere else, and
+// reading a List element means decoding the runtime slot for the element type, which is
+// the container method path's work, not this one's.
+fn lower_index(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("IndexOperatorNotLowered", CODEGEN_STAGE_NOT_BUILT,
+        "'[i]' has no lowering here", node,
+        "cg_call owns the container element read that '[i]' and '.get(i)' share")
+    -1
+}
+
+// ── Calls ─────────────────────────────────────────────────────────────────
+
+// Only the carrier constructors are lowered here: they build a value out of layout's
+// answer and need no dispatch. Every other call, free or method, is cg_call's.
+fn lower_call_expr(node: Int) -> Int ! Diag.Report {
+    let callee = node_left(node)
+    if callee >= 0 {
+        if nk_of(node_kind(callee)) == NodeKind.Ident {
+            let name = node_name(callee)
+            if name == ctor_some { return lower_wrap(node, Slot.Inner1, member_value, 1) }
+            if name == ctor_ok { return lower_wrap(node, Slot.Inner1, member_ok, 0) }
+            if name == ctor_err { return lower_wrap(node, Slot.Inner2, member_err, 1) }
+            if name == ctor_none {
+                let tid = x_tid(node)
+                if tid < 0 { return -1 }
+                return lower_none(node, tid)
+            }
+        }
+    }
+    x_not_built(node, "cg_call")
+}
+
+// ── Interpolation ─────────────────────────────────────────────────────────
+
+// An interpolated string with no holes is one C string constant. With holes it is one
+// call to the runtime formatter, which sizes the buffer exactly, because the spec puts no
+// length cap on interpolation.
+fn lower_interp(node: Int) -> Int ! Diag.Report {
+    let tid = x_tid(node)
+    if tid < 0 { return -1 }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    let parts = node_elements(node)
+    if x_all_literal(parts) { return ir_const(tid, node, rec.c_spelling, c_string_literal(x_joined(parts))) }
+    lower_interp_call(node, tid, rec, parts)
+}
+
+fn lower_interp_call(node: Int, tid: Int, rec: LayoutRecord, parts: Int) -> Int ! Diag.Report {
+    let mut fmt = ""
+    let mut holes: List[Int] = []
+    let mut i = 0
+    while i < sublist_length(parts) {
+        let part = sublist_get(parts, i)
+        if x_is_literal_part(part) {
+            fmt = fmt.concat(x_pct_escape(node_str_val(part)))
+        } else {
+            let hole = x_interp_hole(part)
+            if hole.spec == "" { return -1 }
+            fmt = fmt.concat(hole.spec)
+            holes.push(hole.arg)
+        }
+        i = i + 1
+    }
+    let mut args = [ir_const(TYPE_STR, node, rec.c_spelling, c_string_literal(fmt))]
+    let mut j = 0
+    while j < holes.len() {
+        args.push(holes.get(j).unwrap())
+        j = j + 1
+    }
+    ir_call_runtime(tid, node, rec.c_spelling, c_runtime_helper("str_format"), rec.slot_form, args)
+}
+
+// Lowers one hole to the conversion the format string needs and the argument that feeds
+// it. An empty spec means the hole has already reported an ICE.
+fn x_interp_hole(part: Int) -> InterpHole ! Diag.Report {
+    let tid = x_tid(part)
+    if tid < 0 { return InterpHole {} }
+    let spec = format_spec_of(tid)
+    if spec == "" {
+        diag_ice_at("InterpolatedValueNeedsDisplay", CODEGEN_STAGE_NOT_BUILT,
+            "a {tk_name(x_kind(tid))} hole has no printf form and needs its Display method", part,
+            "cg_call must lower the Display call typecheck already proved exists")
+        return InterpHole {}
+    }
+    let arg = x_interp_arg(part, tid)
+    if arg < 0 { return InterpHole {} }
+    InterpHole { spec: spec, arg: arg }
+}
+
+fn x_interp_arg(part: Int, tid: Int) -> Int ! Diag.Report {
+    let k = x_kind(tid)
+    if k == TyKind.Bool { return x_bool_text(part, tid) }
+    let value = lower_expr(part)
+    if value < 0 { return -1 }
+    if k == TyKind.Char { return x_char_text(part, value) }
+    x_promote_for_varargs(part, tid, value)
+}
+
+// C promotes a narrow integer across `...`, and the cast must name the promoted width or
+// the formatter reads the wrong number of bytes.
+fn x_promote_for_varargs(part: Int, tid: Int, value: Int) -> Int ! Diag.Report {
+    let promoted = varargs_spelling(tid)
+    if promoted == "" { return value }
+    ir_cast(tid, part, promoted, value)
+}
+
+fn x_char_text(part: Int, value: Int) -> Int ! Diag.Report {
+    let rec = x_local(TYPE_STR, part)
+    if x_stopped(rec) { return -1 }
+    ir_call_runtime(TYPE_STR, part, rec.c_spelling, c_runtime_helper("char_to_str"), rec.slot_form, [value])
+}
+
+// C has no conditional IR node and the runtime has no bool-to-text helper, so a Bool hole
+// becomes a Str temp an `if` fills. The two words are the Display of a Bool, not C text.
+fn x_bool_text(part: Int, _tid: Int) -> Int ! Diag.Report {
+    let cond = lower_expr(part)
+    if cond < 0 { return -1 }
+    let rec = x_local(TYPE_STR, part)
+    if x_stopped(rec) { return -1 }
+    let name = x_bind(TYPE_STR, part, ir_const(TYPE_STR, part, rec.c_spelling, c_string_literal(bool_false)))
+    if name == "" { return -1 }
+    let target = x_ref(TYPE_STR, part, name)
+    if target < 0 { return -1 }
+    let yes = ir_const(TYPE_STR, part, rec.c_spelling, c_string_literal(bool_true))
+    x_hoist(ir_if(part, cond, ir_block(part, [ir_assign(part, target, yes)]), -1))
+    x_ref(TYPE_STR, part, name)
+}
+
+// The parser stores a literal part as an identifier whose text is its own name; a hole is
+// any other node, including an identifier with no text.
+fn x_is_literal_part(part: Int) -> Bool {
+    if nk_of(node_kind(part)) != NodeKind.Ident { return false }
+    node_str_val(part) == node_name(part)
+}
+
+fn x_all_literal(parts: Int) -> Bool {
+    if parts < 0 { return true }
+    let mut i = 0
+    while i < sublist_length(parts) {
+        if !x_is_literal_part(sublist_get(parts, i)) { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn x_joined(parts: Int) -> Str {
+    if parts < 0 { return "" }
+    let mut sb = StringBuilder.new()
+    let mut i = 0
+    while i < sublist_length(parts) {
+        sb.write(node_str_val(sublist_get(parts, i)))
+        i = i + 1
+    }
+    sb.to_str()
+}
+
+// A per cent sign in literal text is data, so the formatter must be told not to read it
+// as the start of a conversion.
+fn x_pct_escape(s: Str) -> Str {
+    let mut sb = StringBuilder.new()
+    let mut i = 0
+    while i < s.len() {
+        if s.byte_at(i) == 37 { sb.write("%") }
+        sb.write(s.substring(i, 1))
+        i = i + 1
+    }
+    sb.to_str()
+}
+
+fn x_tuple_field(idx: Int) -> Str { "_{idx}" }

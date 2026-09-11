@@ -1,0 +1,123 @@
+// Option and Result: the tag, the member, the box, and the two propagating operators.
+
+import lower_test_helpers.{
+    probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies, assert_ice,
+}
+import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid}
+import cg_expr.{lower_expr, cg_expr_take_pending, cg_expr_set_return_type, cg_expr_pending_count}
+import layout.{tid_of_node}
+
+fn src() -> Str {
+    #"type Big { a: Int, b: Int, c: Int }
+fn opt_chain() -> Option[Int] {
+    let inner: Option[Int] = Some(1)
+    let got = inner?
+    Some(got)
+}
+fn res_chain() -> Result[Int, Str] {
+    let inner2: Result[Int, Str] = Ok(1)
+    let got2 = inner2?
+    Ok(got2)
+}
+fn touch() {
+}
+fn main() {
+    let none: Option[Int] = None
+    let some: Option[Int] = Some(1)
+    let ok: Result[Int, Str] = Ok(2)
+    let err: Result[Int, Str] = Err("bad")
+    let big: Option[Big] = Some(Big { a: 1, b: 2, c: 3 })
+    let _keep = [none, some]
+    let _keep2 = [ok, err]
+    let _keep3 = [big]
+    let _keep4 = [opt_chain()]
+    let bare: Result[Void, Str] = Ok()
+    let unit: Result[Void, Str] = Ok(())
+    let acted: Result[Void, Str] = Ok(touch())
+    let _keep5 = [res_chain()]
+    let _keep6 = [bare, unit, acted]
+}
+"#
+}
+
+test "None writes the tag alone, with no member" {
+    probe("cg_expr_carrier", src())
+    let id = lower_expr(rhs_of("none"))
+    assert_kind("kind", id, IrKind.CarrierWrap)
+    assert_eq_str("member", ir_c_name(id), "")
+    assert_shape("shape", id, "CarrierWrap(Const)")
+    assert_verifies("verify", id)
+}
+
+test "Some writes tag one into the value member" {
+    probe("cg_expr_carrier", src())
+    let id = lower_expr(rhs_of("some"))
+    assert_kind("kind", id, IrKind.CarrierWrap)
+    assert_eq_str("member", ir_c_name(id), "value")
+    assert_shape("shape", id, "CarrierWrap(Const, Const)")
+    assert_eq_str("tag", ir_c_name(ir_kid(id, 0)), "1")
+}
+
+test "Ok writes tag zero into the ok member and Err tag one into the err member" {
+    probe("cg_expr_carrier", src())
+    let ok = lower_expr(rhs_of("ok"))
+    assert_eq_str("ok member", ir_c_name(ok), "ok")
+    assert_eq_str("ok tag", ir_c_name(ir_kid(ok, 0)), "0")
+    let err = lower_expr(rhs_of("err"))
+    assert_eq_str("err member", ir_c_name(err), "err")
+    assert_eq_str("err tag", ir_c_name(ir_kid(err, 0)), "1")
+}
+
+test "an Option payload too wide for a word is boxed on the heap" {
+    probe("cg_expr_carrier", src())
+    let id = lower_expr(rhs_of("big"))
+    assert_shape("shape", id, "CarrierWrap(Const, Box(StructNew(Const, Const, Const)))")
+    assert_eq_str("box type", ir_c_spelling(ir_kid(id, 1)), "blink_Big*")
+    assert_verifies("verify", id)
+}
+
+test "the question operator returns None early and answers the payload" {
+    probe("cg_expr_carrier", src())
+    let node = rhs_of("got")
+    cg_expr_set_return_type(tid_of_node(rhs_of("inner")))
+    let id = lower_expr(node)
+    assert_kind("value", id, IrKind.CarrierUnwrap)
+    assert_eq_str("member", ir_c_name(id), "value")
+    let pending = cg_expr_take_pending()
+    assert_eq(pending.len(), 2)
+    assert_shape("guard", pending.get(1).unwrap(),
+        "If(Binary(CarrierTag(VarRef), Const), Block(Return(CarrierWrap(Const))))")
+}
+
+test "the question operator on a Result carries the error arm into the caller's carrier" {
+    probe("cg_expr_carrier", src())
+    let node = rhs_of("got2")
+    cg_expr_set_return_type(tid_of_node(rhs_of("inner2")))
+    let id = lower_expr(node)
+    assert_eq_str("member", ir_c_name(id), "ok")
+    let pending = cg_expr_take_pending()
+    assert_shape("guard", pending.get(1).unwrap(),
+        "If(Binary(CarrierTag(VarRef), Const), Block(Return(CarrierWrap(Const, CarrierUnwrap(VarRef)))))")
+}
+
+test "a Void success is written with no argument at all" {
+    probe("cg_expr_carrier", src())
+    let id = lower_expr(rhs_of("bare"))
+    assert_kind("kind", id, IrKind.CarrierWrap)
+    assert_eq_str("member", ir_c_name(id), "ok")
+    assert_shape("shape", id, "CarrierWrap(Const, Const)")
+    assert_verifies("verify", id)
+}
+
+test "the unit value is the placeholder word, not a compound literal with no members" {
+    probe("cg_expr_carrier", src())
+    let id = lower_expr(rhs_of("unit"))
+    assert_shape("shape", id, "CarrierWrap(Const, Const)")
+    assert_eq_str("placeholder", ir_c_name(ir_kid(id, 1)), "0")
+    assert_eq(cg_expr_pending_count(), 0)
+}
+
+test "a Void payload still runs, because the expression that produced it may act" {
+    probe("cg_expr_carrier", src())
+    assert_ice("the call is lowered, not dropped", lower_expr(rhs_of("acted")), "CodegenStageNotBuilt")
+}

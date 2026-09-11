@@ -1,0 +1,128 @@
+// Literals, names and the string that has no holes: the shapes that lower to one IR leaf.
+
+import lower_test_helpers.{
+    probe, rhs_of, let_node_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
+    assert_ice,
+}
+import ir.{IrKind, ir_c_name, ir_c_spelling, ir_tid}
+import cg_expr.{
+    lower_expr, cg_expr_pending_count, cg_expr_bind_global, cg_expr_bind_local,
+    cg_expr_push_scope, cg_expr_pop_scope,
+}
+import layout.{tid_of_node}
+
+fn src() -> Str {
+    #"fn main() {
+    let i = 42
+    let f = 1.5
+    let b = true
+    let c = 'q'
+    let s = "hi"
+    let esc = "a\"b\n"
+    let again = i
+    let _keep = [f, 2.0]
+    let _keep2 = [b, false]
+    let _keep3 = [c, 'z']
+    let _keep4 = [s, esc, "{again}"]
+}
+"#
+}
+
+test "an int literal is one constant carrying the literal text and the Int spelling" {
+    probe("cg_expr_lit", src())
+    let id = lower_expr(rhs_of("i"))
+    assert_kind("kind", id, IrKind.Const)
+    assert_eq_str("text", ir_c_name(id), "42")
+    assert_eq_str("type", ir_c_spelling(id), "int64_t")
+    assert_verifies("verify", id)
+}
+
+test "a float literal keeps its written form" {
+    probe("cg_expr_lit", src())
+    let id = lower_expr(rhs_of("f"))
+    assert_kind("kind", id, IrKind.Const)
+    assert_eq_str("text", ir_c_name(id), "1.5")
+    assert_eq_str("type", ir_c_spelling(id), "double")
+}
+
+test "a bool literal is 1 or 0, not a C keyword" {
+    probe("cg_expr_lit", src())
+    let id = lower_expr(rhs_of("b"))
+    assert_eq_str("text", ir_c_name(id), "1")
+    assert_eq_str("type", ir_c_spelling(id), "int")
+}
+
+test "a char literal is its code point at the Char spelling" {
+    probe("cg_expr_lit", src())
+    let id = lower_expr(rhs_of("c"))
+    assert_kind("kind", id, IrKind.Const)
+    assert_eq_str("text", ir_c_name(id), "113")
+    assert_eq_str("type", ir_c_spelling(id), "int32_t")
+}
+
+test "a string with no holes is one quoted constant, no runtime call" {
+    probe("cg_expr_lit", src())
+    let id = lower_expr(rhs_of("s"))
+    assert_kind("kind", id, IrKind.Const)
+    assert_eq_str("text", ir_c_name(id), #""hi""#)
+    assert_eq_str("type", ir_c_spelling(id), "const char*")
+    assert_eq(cg_expr_pending_count(), 0)
+}
+
+test "a quote, a backslash and a newline are escaped for C" {
+    probe("cg_expr_lit", src())
+    let id = lower_expr(rhs_of("esc"))
+    assert_eq_str("text", ir_c_name(id), #""a\"b\n""#)
+}
+
+test "a name reads the local of the same spelling at its own tid" {
+    probe("cg_expr_lit", src())
+    let src_node = rhs_of("again")
+    let id = lower_expr(src_node)
+    assert_kind("kind", id, IrKind.VarRef)
+    assert_eq_str("name", ir_c_name(id), "i")
+    assert_eq(ir_tid(id), tid_of_node(src_node))
+    assert_verifies("verify", id)
+}
+
+// Names are resolved against the scopes a body opens, which is why the same spelling can
+// mean a local in one block and a module global in the next.
+fn src_names() -> Str {
+    #"import std.process
+let COUNT = 5
+fn main() {
+    let read = COUNT + 0
+    let sig = process.SIGKILL
+    let _keep = [read, sig]
+}
+"#
+}
+
+test "a module global is read by its own symbol where no local shadows it" {
+    probe("cg_expr_names", src_names())
+    cg_expr_bind_global("COUNT", let_node_of("COUNT"))
+    assert_shape("global", lower_expr(rhs_of("read")), "Binary(GlobalRef, Const)")
+}
+
+test "a local outranks a module global of the same name, and only inside its scope" {
+    probe("cg_expr_names", src_names())
+    cg_expr_bind_global("COUNT", let_node_of("COUNT"))
+    cg_expr_push_scope()
+    cg_expr_bind_local("COUNT")
+    assert_shape("shadowed", lower_expr(rhs_of("read")), "Binary(VarRef, Const)")
+    cg_expr_pop_scope()
+    assert_shape("scope closed", lower_expr(rhs_of("read")), "Binary(GlobalRef, Const)")
+}
+
+test "a module-qualified name reads the other module's global" {
+    probe("cg_expr_names", src_names())
+    cg_expr_bind_global("process.SIGKILL", let_node_of("SIGKILL"))
+    let id = lower_expr(rhs_of("sig"))
+    assert_kind("kind", id, IrKind.GlobalRef)
+    assert_eq_str("type", ir_c_spelling(id), "int64_t")
+}
+
+test "a module-qualified name with no binding is refused, not spelled by guess" {
+    probe("cg_expr_names", src_names())
+    assert_ice("unbound", lower_expr(rhs_of("sig")), "ModuleGlobalNotBound")
+}
