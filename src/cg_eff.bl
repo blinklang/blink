@@ -1,10 +1,148 @@
 // cg_eff.bl: closures, effects, handlers and async, lowered to IR.
 //
-// A stage of the tid-native emitter, not yet written. Its entry point reports I0004 and
-// returns, so the driver's diag_ice_count check turns a call into a loud failure rather
-// than a translation unit that is silently empty.
+// A stage of the tid-native emitter. What it answers today is the with-resource cleanup
+// protocol; closures, handler installs and async are still to come and report I0004.
+//
+// Nothing here falls back. A protocol whose exit runner no stage emits yet answers the
+// protocol and records an internal error, never a symbol. A guessed symbol would link
+// against nothing, or link against a runtime function whose first parameter is a
+// different struct and read a neighbouring stack slot as its done flag.
 
-import diagnostics.{Diag, diag_ice_stage_not_built}
+import parser.{node_name, node_recv_type_args, node_trait_name, node_value, sublist_length}
+import typecheck.{TyKind, lookup_named_type, tc_resolve, tc_tid_decl_node, tc_tid_kind, tk_name, ty_pool}
+import layout.{tid_of_node}
+import cg_reg.{cg_reg_impl_decls}
+import diagnostics.{Diag, diag_ice_at, diag_ice_stage_not_built, UNSOLVED_TYPEVAR_AT_CODEGEN}
+
+// ── With-resource cleanup ─────────────────────────────────────────────────────────
+
+// Which of the four protocols a `with <expr> as <name>` resource takes on the way out.
+pub type CleanupProtocol { Plain, Closeable, BlockHandler, FfiScope }
+
+pub type ResourceCleanup {
+    protocol: CleanupProtocol
+    // The impl block carrying the protocol's methods, -1 when no trait answers. The C
+    // symbols of those methods are cname's to spell, so no name is carried here.
+    impl_block: Int
+}
+
+// The traits that claim a resource. Held as names because an impl block's trait is a
+// name, and written once each so no comparison against a literal type name is needed.
+let TRAIT_BLOCK_HANDLER = "BlockHandler"
+let TRAIT_CLOSEABLE = "Closeable"
+
+// Nothing runs on the way out. This is also what a recorded internal error hands back,
+// so a poisoned answer cannot install a cleanup nobody asked for.
+fn plain_binding() -> ResourceCleanup {
+    ResourceCleanup { protocol: CleanupProtocol.Plain, impl_block: -1 }
+}
+
+// A kind that names a declaration of its own, so an impl block can be written for it.
+// Anything else is a plain binding without consulting the impls at all.
+fn kind_can_carry_impl(k: TyKind) -> Bool {
+    k == TyKind.Struct || k == TyKind.Enum
+}
+
+// The impl block of one trait for one type declaration, or -1.
+//
+// The bridge from an impl block to its receiver is the type name it was written with —
+// the same bridge typecheck's own impl resolution uses — and the declaration node behind
+// that name is what identifies the type: a generic type and each of its instances share
+// one declaration where they share no spelling. A name two modules both declare resolves
+// to no declaration, so it matches nothing here and the caller reports it.
+fn impl_of_trait_for_decl(trait_name: Str, decl: Int, node: Int) -> Int ! Diag.Report {
+    let impls = cg_reg_impl_decls()
+    let mut i = 0
+    while i < impls.len() {
+        let im = impls.get(i).unwrap()
+        if node_trait_name(im) == trait_name {
+            let recv = tc_tid_decl_node(lookup_named_type(node_name(im)))
+            if recv >= 0 && recv == decl {
+                // A receiver written with type arguments claims ONE instance, and the
+                // declaration node is shared by every instance, so the match above
+                // cannot tell `Box[Int]` from `Box[Str]`. Answering either way would
+                // close the wrong resource or none.
+                let args = node_recv_type_args(im)
+                if args != -1 && sublist_length(args) > 0 {
+                    diag_ice_stage_not_built(
+                        "matching a {trait_name} impl written for one instance of a generic type", node)
+                    return -1
+                }
+                return im
+            }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+// The cleanup protocol of one `with <expr> as <name>` item, read from the tid of the
+// resource EXPRESSION.
+//
+// The item node is the whole argument on purpose. Under the BlockHandler protocol the
+// binder holds the handler's Context, which is a different type from the resource, and a
+// Context of `Int` is a legitimate plain binding — so a caller that passed the binder's
+// tid instead would get a silently wrong answer rather than a loud one. Taking the item
+// leaves the caller no tid to choose.
+pub fn cg_eff_resource_cleanup(item: Int) -> ResourceCleanup ! Diag.Report {
+    let node = node_value(item)
+    if node < 0 {
+        diag_ice_at("NoResourceExpr", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "with-resource item {item} carries no resource expression", item,
+            "the parser gives every with-item a value; this is a compiler bug")
+        return plain_binding()
+    }
+    let tid = tc_resolve(tid_of_node(node))
+    if tid < 0 || tid >= ty_pool.len() {
+        diag_ice_at("NoTypeForResource", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "with-resource reached codegen with a resource type that is not a type", node,
+            "typecheck must stamp the resource expression; this is a compiler bug")
+        return plain_binding()
+    }
+    let kind = tc_tid_kind(tid)
+    if kind == TyKind.Unknown || kind == TyKind.Typevar {
+        diag_ice_at("UnknownResourceKind", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "resource type {tid} reached codegen unsubstituted, as {tk_name(kind)}", node,
+            "an unsubstituted type cannot be asked which cleanup protocol it takes; a plain binding here would leave a Closeable resource unclosed")
+        return plain_binding()
+    }
+    if kind == TyKind.FfiScope {
+        return needs_exit_runner(CleanupProtocol.FfiScope, -1,
+            "an FFI scope's cleanup", node)
+    }
+    if !kind_can_carry_impl(kind) { return plain_binding() }
+    let decl = tc_tid_decl_node(tid)
+    if decl < 0 {
+        diag_ice_at("NoDeclForResource", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "resource type {tid} names no single declaration, so its impl blocks cannot be found", node,
+            "a nominal type reaching codegen must carry one declaration node; a bare name two modules both declare carries none")
+        return plain_binding()
+    }
+    // BlockHandler is tried first: a type that implements both also feeds the block's
+    // binder its context, and only the BlockHandler protocol does that. Typecheck
+    // rejects the pair outright, so this order is a guard rather than a live choice.
+    let bh = impl_of_trait_for_decl(TRAIT_BLOCK_HANDLER, decl, node)
+    if bh >= 0 {
+        return needs_exit_runner(CleanupProtocol.BlockHandler, bh,
+            "a {TRAIT_BLOCK_HANDLER} resource's cleanup", node)
+    }
+    let cl = impl_of_trait_for_decl(TRAIT_CLOSEABLE, decl, node)
+    if cl >= 0 {
+        return needs_exit_runner(CleanupProtocol.Closeable, cl,
+            "a {TRAIT_CLOSEABLE} resource's cleanup", node)
+    }
+    plain_binding()
+}
+
+// A protocol that is selected but cannot yet be spelled. The guard local's cleanup
+// attribute needs a function taking a pointer to the local's own C type, and no stage
+// emits one, so the protocol travels with an empty symbol and a loud error.
+fn needs_exit_runner(protocol: CleanupProtocol, im: Int, what: Str, node: Int) -> ResourceCleanup ! Diag.Report {
+    diag_ice_stage_not_built(what, node)
+    ResourceCleanup { protocol: protocol, impl_block: im }
+}
+
+// ── Closures, handler installs and async ──────────────────────────────────────────
 
 pub fn cg_eff_lower_handler(node: Int) ! Diag.Report {
     diag_ice_stage_not_built("cg_eff", node)

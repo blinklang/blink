@@ -225,6 +225,12 @@ pub const MISPLACED_IR_KIND_AT_PRINT = "I0003"
 // diag_ice_count before it uses the result -- otherwise an unbuilt stage looks like a
 // program that legitimately emits nothing.
 pub const CODEGEN_STAGE_NOT_BUILT = "I0004"
+// I0005: a negative IR node id was handed to a producer that must embed it. The upstream
+// stop was already reported, so this is not that failure a second time: it catches the
+// CALLER that read the stop and carried on instead of propagating it. Embedding the id
+// would put a node the pool does not hold inside a verified tree, so the seam refuses and
+// blames the caller rather than the stage that stopped first.
+pub const POISONED_IR_AT_SEAM = "I0005"
 
 // ── I0001 mangler sentinels ──────────────────────────────
 //
@@ -816,6 +822,9 @@ pub fn diag_explain(code: Str) -> Str {
     if code == CODEGEN_STAGE_NOT_BUILT {
         return "I0004 -- CodegenStageNotBuilt\n\nAn INTERNAL COMPILER ERROR. The compiler reached a code-generation\nstage that this build does not contain.\n\nThe C emitters are being rewritten stage by stage. An entry point\nwhose stage has not landed yet raises this rather than returning\nempty output, so a missing stage can never be mistaken for a\nprogram that legitimately emits nothing.\n\nThis is a bug in the compiler, not in your program. Fix: use a\nreleased compiler build to compile this program."
     }
+    if code == POISONED_IR_AT_SEAM {
+        return "I0005 -- PoisonedIrAtSeam\n\nAn INTERNAL COMPILER ERROR. One code-generation stage handed\nanother a lowered node that does not exist.\n\nWhen a stage cannot lower something it reports the reason and\nanswers a negative id. A caller that receives one must stop and\npass it on. This fires when a caller instead handed that id to a\nproducer that has to embed it in the tree, so the real failure was\nalready reported above this one -- this second report names the\ncaller that ignored it.\n\nThe compiler stops here rather than building a tree that holds a\nnode the pool does not contain, which the C printer would read as\nif it were real.\n\nThis is a bug in the compiler, not in your program. Fix: please\nreport this, ideally with the smallest program that reproduces it,\nand include the internal error printed just before this one."
+    }
     if code == UNDECLARED_EFFECT {
         return "E0500 -- UndeclaredEffect\n\nA function calls another function that requires an effect, but the\ncaller does not declare that effect in its signature.\n\nFix: add '! EffectName' to the calling function's signature.\n\n  fn greet() ! IO \{\n      io.println(\"hello\")  // IO effect declared\n  \}\n\n  fn bad() \{\n      io.println(\"hello\")  // E0500: requires IO but bad() has none\n  \}"
     }
@@ -1088,6 +1097,9 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == MAP_KEY_NOT_HASHABLE {
         return "E1400 -- MapKeyNotHashable\n\nThe key type of a Map[K, V] (or the element type of a Set[T])\ndoes not implement Hash. Two distinct shapes trigger this:\n\nFloat/Double: not hashable in Blink — NaN does not compare equal to\nitself, and two distinct float bit patterns can compare equal, so\nthey cannot satisfy the Hash + Eq contract a key/element requires.\n\nContainers and other non-derivable builtins: List/Map/Set/Option/\nResult, Bytes, StringBuilder, and fn types have no Hash impl in v1\nand cannot gain one via @derive — only builtin scalars\n(Int/sized-int/Bool/Char/Str), a tuple of hashable types, and\nuser structs/enums with @derive(Hash, Eq) are hashable.\n\nFix: for a Float key, round it to an Int (or another integer width)\nor use a stable surrogate key. For a container/non-derivable key or\nelement, use a hashable scalar or a @derive(Hash, Eq) struct/enum\ninstead.\n\n  let m: Map[F64, Int] = Map()          // E1400 -- Float\n  let m: Map[Int, Int] = Map()          // OK\n  let s: Set[Option[Int]] = Set()       // E1400 -- Option has no Hash\n  let s: Set[Int] = Set()               // OK"
+    }
+    if code == UNKNOWN_DERIVE_NAME {
+        return "E1112 -- UnknownDerive\n\n@derive names a trait the compiler does not synthesize. The accepted\nnames are Debug, Clone, Eq, Ord, Hash, Serialize and Deserialize. A\nname outside that set is reported rather than ignored: a silently\ndropped derive leaves the type without the method, and the failure\nthen shows up as a missing method far from the annotation.\n\nFix: correct the spelling, or write the impl by hand.\n\n  @derive(Eqq) type P \{ x: Int \}   // E1112 -- no trait named Eqq\n  @derive(Eq)  type P \{ x: Int \}   // OK"
     }
     if code == NON_DERIVABLE_TRAIT {
         return "E1401 -- NonDerivableTrait\n\nA field of a @derive(Hash/Eq/Ord/Serialize) type has a type that does\nnot implement the derived trait, so the compiler cannot synthesize the\nmethod. For Hash/Eq/Ord: collection types (List/Map/Set/Option/Result)\nhave no value-equality/hash/ordering in v1 — `==` on them is pointer\nidentity — so they cannot appear under a derive; Float is not Hashable\n(NaN and bit-pattern hazards); Bool is not Orderable. For Serialize the\nv1 to_json emitter renders only Int/Float/Bool/Str, a List of a\nserializable element, and a struct/enum that itself derives Serialize —\nChar, the sized ints, F32/F64, a Ptr, an @ffi.opaque handle, or an\nOption/Map/Set/Result field is rejected rather than silently serialized\nto null. An enum-variant field is more restricted: no List, and only a\nstruct (not an enum) field may derive-recurse. A user type must itself\nderive (or impl) the same trait.\n\nFix: drop the offending field from the derive, implement the trait\nby hand, or give the field a type that derives it.\n\n  @derive(Hash)      type S \{ m: Map\\[Str, Int\\] \}   // E1401 -- Map not Hash\n  @derive(Ord)       type T \{ b: Bool \}             // E1401 -- Bool not Ord\n  @derive(Serialize) type W \{ p: Ptr\\[U8\\] \}         // E1401 -- Ptr not Serialize\n  @derive(Eq)        type U \{ n: Int \}              // OK"
