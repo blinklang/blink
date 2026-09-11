@@ -1990,6 +1990,52 @@ BLINK_RT_FN const char* blink_char_to_str(int64_t code) {
 }
 #endif
 
+/* Debug-form of a Str: the bytes in double quotes, escaping exactly the ratified
+ * string-literal escape set (sections/02_syntax.md): \n \r \t \\ \" \{ \}.
+ * The braces are in the set because a bare { opens an interpolation, so a debug
+ * form that left them raw would not re-read as the same Str. \b, \f and \0 are
+ * NOT in it: they are Char-literal escapes only, and a Str cannot hold a NUL
+ * anyway. Every other byte -- printable ASCII, a control byte with no named
+ * escape, and every byte of a multi-byte UTF-8 character alike -- is copied raw,
+ * the same v1 gap blink_char_debug has for a non-printable scalar.
+ * Sole owner of Str quote/escape logic across every @derive(Debug) site, the
+ * counterpart of blink_char_debug below. */
+BLINK_RT_FN const char* blink_str_debug(const char* s);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_str_debug(const char* s) {
+    if (!s) return "\"\"";
+    int64_t n = 0;
+    while (s[n] != '\0') n++;
+    /* Two bytes is the widest escape, so twice the input plus the quotes and the
+     * terminator can never be exceeded. */
+    char* buf = (char*)blink_alloc(n * 2 + 3);
+    int64_t w = 0;
+    buf[w++] = '"';
+    for (int64_t i = 0; i < n; i++) {
+        char esc = 0;
+        switch (s[i]) {
+            case '\n': esc = 'n'; break;
+            case '\r': esc = 'r'; break;
+            case '\t': esc = 't'; break;
+            case '\\': esc = '\\'; break;
+            case '"': esc = '"'; break;
+            case '{': esc = '{'; break;
+            case '}': esc = '}'; break;
+            default: break;
+        }
+        if (esc) {
+            buf[w++] = '\\';
+            buf[w++] = esc;
+        } else {
+            buf[w++] = s[i];
+        }
+    }
+    buf[w++] = '"';
+    buf[w] = '\0';
+    return buf;
+}
+#endif
+
 /* Debug-form of a Char: the character in single quotes, escaping exactly the
  * ratified Char-literal escape set (\n \r \t \\ \b \f \0 \'); every other scalar
  * (printable ASCII + all non-ASCII) is emitted as its literal UTF-8 char between

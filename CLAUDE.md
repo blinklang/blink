@@ -42,7 +42,7 @@ Build CLI: `task build-cli` — produces `build/blink`. NOT runnable during the 
 Test: `task test` — compile+run all test_*.bl in tests/. NOT runnable during the rewrite
 Test formatter: `task test-fmt` — golden outputs + idempotency + semantic checks. NOT runnable during the rewrite (depends on bootstrap); `task ci` runs the goldens under gen1
 Single test: `task compile-test -- test_name`. NOT runnable during the rewrite (depends on build-cli)
-Rewrite gate: `task ci` — gen0 compiles src (gen1) + corpus monotone + lint + fmt goldens + typecheck suite. Run after every change during the codegen rewrite. See docs/codegen-rewrite/harness.md
+Rewrite gate: `task ci` — gen0 compiles src (gen1) + corpus monotone + lint + fmt goldens + typecheck suite + rewrite unit suite. Run after every change during the codegen rewrite. See docs/codegen-rewrite/harness.md
 Release gate: `task ci-release` — regen + test + test-fmt + per-module invariants. Run at release points. Also not runnable until the emitters land
 Corpus: `task corpus` — every tests/test_*.bl compiled+run on its own under gen1 (the current source compiled by the pinned gen0); result in build/corpus.json; `task corpus-check` gates it against scripts/corpus_baseline.json
 Quick run: `build/blink run <file.bl>` — compiles and runs in one step. Prefer this over manual blinkc+cc

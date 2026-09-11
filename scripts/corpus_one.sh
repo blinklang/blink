@@ -62,10 +62,15 @@ for f in blink blinkc libblink_std.a libblink_std.h skip_modules.txt runtime.h .
     fi
 done
 # blinkc reads its stdlib from <dir of argv[0]>/lib/std, so the sandbox
-# build/ needs the compiler's lib/ beside the blinkc symlink.
-if [ -d "$comp_dir/lib/std" ]; then
-    ln -s "$(readlink -f "$comp_dir/lib")" "$work/build/lib"
+# build/ needs the compiler's lib/ beside the blinkc symlink. A missing one
+# stops the file instead of running it: a test binary that compiles a program
+# in process resolves the prelude through the same path, and with no prelude
+# it compiles nothing and its assertions hold over an empty program.
+if [ ! -d "$comp_dir/lib/std" ]; then
+    echo "corpus_one: no stdlib at $comp_dir/lib/std" >&2
+    exit 2
 fi
+ln -s "$(readlink -f "$comp_dir/lib")" "$work/build/lib"
 if [ ! -x "$work/build/blink" ]; then
     echo "corpus_one: no blink binary in $comp_dir" >&2
     exit 2
