@@ -13,7 +13,7 @@
 import typecheck.{
     TyKind, tk_name, tc_tid_kind, tc_tid_child, tc_tid_child_count, tc_tid_name, tc_resolve,
     tc_is_unbound_metavar, tc_lookup_node_tid, tc_type_decl_nodes, tc_tid_decl_node,
-    DECL_NODE_AMBIGUOUS, tc_resolve_transparent_alias_name,
+    DECL_NODE_AMBIGUOUS, tc_resolve_transparent_alias_name, tc_type_has_display_impl,
 }
 import parser.{
     node_fields, node_name, node_value, node_kind, node_handlers, node_args, node_type_params,
@@ -45,6 +45,7 @@ pub type LayoutRecord {
     carrier_tag: Str
     is_transparent: Int
     kops_table: Str
+    kops_inline_key: Bool
     decline_reason: Str
 }
 
@@ -204,7 +205,7 @@ pub fn field_layout_of(owner_decl: Int, field_tid: Int) -> LayoutRecord {
     if selfrec == 0 { return layout_of(field_tid, Position.Field) }
     LayoutRecord {
         c_spelling: "int64_t", slot_form: SlotForm.PointerBoxed, carrier_tag: "",
-        is_transparent: 0, kops_table: "", decline_reason: "",
+        is_transparent: 0, kops_table: "", kops_inline_key: false, decline_reason: "",
     }
 }
 
@@ -261,12 +262,14 @@ fn lo_member_record(r: Int, ir: Int, slot: Slot, spelling: Str) -> LayoutRecord 
     }
     let mut member = spelling
     if boxed { member = "{spelling}*" }
+    let table = lo_kops_of(ir)
     LayoutRecord {
         c_spelling: member,
         slot_form: form,
         carrier_tag: lo_tag_of(ir),
         is_transparent: if lo_is_transparent_newtype(ir) { 1 } else { 0 },
-        kops_table: lo_kops_of(ir),
+        kops_table: table,
+        kops_inline_key: lo_kops_inline_key(ir, table),
         decline_reason: "",
     }
 }
@@ -306,7 +309,12 @@ pub fn format_spec_of(tid: Int) -> Str {
     let reason = lo_decline_reason_of(tid)
     if reason != "" { return "" }
     let r = lo_res(tid)
-    if lo_is_transparent_newtype(r) { return "%lld" }
+    // The integer is the newtype's storage, not its face. A Display impl says how the
+    // type shows itself, so no conversion prints the raw word past it.
+    if lo_is_transparent_newtype(r) {
+        if lo_decl_has_display_impl(tc_tid_decl_node(r)) { return "" }
+        return "%lld"
+    }
     let k = tc_tid_kind(r)
     if lo_spec_is_signed(k) { return "%lld" }
     if lo_spec_is_unsigned(k) { return "%llu" }
@@ -409,7 +417,7 @@ fn lo_position_index(position: Position) -> Int {
 fn lo_declined(reason: Str) -> LayoutRecord {
     LayoutRecord {
         c_spelling: "", slot_form: SlotForm.InlineWord, carrier_tag: "",
-        is_transparent: 0, kops_table: "", decline_reason: reason,
+        is_transparent: 0, kops_table: "", kops_inline_key: false, decline_reason: reason,
     }
 }
 
@@ -436,9 +444,11 @@ fn lo_compute_layout(tid: Int, position: Position) -> LayoutRecord {
         // nominal payload is erased to the pointer carrier in the vtable slot.
         spelling = "blink_Option_ptr"
     }
+    let table = lo_kops_of(r)
     LayoutRecord {
         c_spelling: spelling, slot_form: form, carrier_tag: lo_tag_of(r),
-        is_transparent: transparent, kops_table: lo_kops_of(r),
+        is_transparent: transparent, kops_table: table,
+        kops_inline_key: lo_kops_inline_key(r, table),
         decline_reason: "",
     }
 }
@@ -541,7 +551,9 @@ fn lo_fits_word(r: Int) -> Bool {
     if k == TyKind.Struct || k == TyKind.Enum {
         if lo_is_transparent_newtype(r) { return true }
         if lo_is_opaque(r) { return true }
-        if k == TyKind.Enum && tc_tid_child_count(r) == 0 { return !lo_decl_is_data_enum(tc_tid_decl_node(r)) }
+        // A type argument does not add a payload: a generic enum whose variants carry no
+        // fields is still one ordinal word.
+        if k == TyKind.Enum { return !lo_decl_is_data_enum(tc_tid_decl_node(r)) }
         return false
     }
     if k == TyKind.Option { return lo_is_opaque(lo_res(tc_tid_child(r, 0))) }
@@ -666,6 +678,16 @@ fn lo_kops_of(r: Int) -> Str {
     table
 }
 
+// Whether the runtime stores the key's own bytes in the map or set slot, or a pointer to
+// a heap copy. A word-sized key is inline, which is also what every List[K] producer puts
+// in a list slot, so blink_map_keys can pack the same way. Str is the runtime's exception:
+// blink_kops_str reads the slot's pointer as the string itself. No table, no choice.
+fn lo_kops_inline_key(r: Int, table: Str) -> Bool {
+    if table == "" { return false }
+    if tc_tid_kind(r) == TyKind.Str { return false }
+    lo_fits_word(r)
+}
+
 // ── Declaration node facts ────────────────────────────────────────────────
 
 fn lo_decl_is_generic(decl: Int) -> Bool {
@@ -774,6 +796,12 @@ fn lo_push_args(args_sl: Int, out: List[Int]) {
         out.push(sublist_get(args_sl, j))
         j = j + 1
     }
+}
+
+// Typecheck owns which types have Display. A transparent newtype has no type arguments,
+// so the impl registered under its bare name is the whole answer.
+fn lo_decl_has_display_impl(decl: Int) -> Bool {
+    decl >= 0 && tc_type_has_display_impl(node_name(decl)) != 0
 }
 
 fn lo_decl_has_derive(decl: Int, derive_name: Str) -> Bool {

@@ -14,13 +14,14 @@
 import parser.{
     node_kind, node_name, node_left, node_obj, node_method, node_args,
     node_methods, node_impl_binders, node_type_params, node_trait_name,
-    node_source_module,
+    node_module, node_source_module,
     get_annotation, sublist_get, sublist_length,
 }
 import ast.{NodeKind, nk_of, node_kind_name}
 import typecheck.{
     TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, lookup_named_type,
-    is_import_module_name, is_builtin_namespace, is_builtin_fn, tc_alias_to_original, TYPE_STR,
+    is_import_module_name, is_builtin_namespace, is_builtin_fn, tc_alias_to_original,
+    tc_qualifier_to_module_or_self, tc_get_symbol_module, TYPE_STR,
 }
 import layout.{
     LayoutRecord, Position, SlotForm, layout_of, tid_of_node,
@@ -176,7 +177,21 @@ fn lower_fn_call(node: Int) -> Int ! Diag.Report {
         diag_ice_stage_not_built("cg_call closure values", node)
         return -1
     }
-    let decl = cc_fn_by_name(node, cc_declared_name(node_name(callee)))
+    cc_free_call(node, cc_fn_anywhere(node, cc_declared_name(node_name(callee))))
+}
+
+// `mod.f(args)`: the same free-function call, written with the module the function was
+// declared in. The qualifier names no value, so nothing precedes the written arguments,
+// and the declaration is the one that module declares rather than whichever module
+// happens to spell the name.
+fn lower_module_call(node: Int, obj: Int) -> Int ! Diag.Report {
+    let module_key = tc_qualifier_to_module_or_self(node_name(obj))
+    cc_free_call(node, cc_fn_in_module(node, module_key, cc_declared_name(node_method(node))))
+}
+
+// The tail every free-function call shares once its declaration is known. A declaration of
+// -1 is a refusal the resolver already reported.
+fn cc_free_call(node: Int, decl: Int) -> Int ! Diag.Report {
     if decl < 0 { return -1 }
     let symbol = cc_callee_symbol(node, decl)
     if symbol == "" { return -1 }
@@ -184,7 +199,7 @@ fn lower_fn_call(node: Int) -> Int ! Diag.Report {
         cc_ev_not_in_ir(node)
         return -1
     }
-    cc_direct(node, decl, symbol, [])
+    cc_direct(node, symbol, [])
 }
 
 // The name the declaration was written under. An import may rename what it brings in, and
@@ -225,30 +240,60 @@ fn cc_instance_name(node: Int, decl: Int) -> Str ! Diag.Report {
     ""
 }
 
-// The declaration a bare name means: the one in the caller's own module, else the only
-// one any module declares. Two modules that spell the same name are an internal error
-// rather than a guess, because the wrong choice is a call to the wrong function.
-fn cc_fn_by_name(node: Int, name: Str) -> Int ! Diag.Report {
-    let here = node_source_module(node)
+// The function one named module exposes: the one it declares, else the one it re-exports.
+// A qualifier settles the module, so another module's declaration of the same name is a
+// candidate only through a re-export, and the front end has already decided which module
+// each name resolves to.
+fn cc_fn_in_module(node: Int, module_key: Str, name: Str) -> Int ! Diag.Report {
+    let own = cc_fn_declared_in(module_key, name)
+    if own >= 0 { return own }
+    if tc_get_symbol_module(name) == module_key { return cc_fn_anywhere(node, name) }
+    cc_no_module_member(node)
+}
+
+// A module is named twice over: by the path its file was read from, and by the name it
+// announces itself under. A qualifier is the announced name, so the declarations it reaches
+// are the ones filed under that name, not the ones filed under the path.
+fn cc_fn_declared_in(module_key: Str, name: Str) -> Int {
+    for f in cg_reg_fn_decls() {
+        if node_name(f) == name && node_module(f) == module_key { return f }
+    }
+    -1
+}
+
+// The declaration a bare name means. The front end refuses a bare name that a second
+// loaded module also declares, so one declaration is the whole answer here; more than one
+// is an internal error rather than a guess, because the wrong choice is a call to the
+// wrong function.
+fn cc_fn_anywhere(node: Int, name: Str) -> Int ! Diag.Report {
     let mut found = -1
     let mut clashes = 0
     for f in cg_reg_fn_decls() {
         if node_name(f) != name { continue }
-        if node_source_module(f) == here { return f }
         if found >= 0 { clashes = clashes + 1 }
         found = f
     }
     if found >= 0 && clashes == 0 { return found }
-    if found < 0 {
-        // Typecheck accepted the call, so the name is not undeclared: it binds a closure
-        // value, or it is one of the call forms the compiler provides itself. Both are
-        // calls this stage does not lower yet, and neither is a front-end fault.
-        diag_ice_stage_not_built("cg_call closure values and compiler-provided calls", node)
-        return -1
-    }
+    if found < 0 { return cc_no_such_callee(node) }
     diag_ice_at("CalleeAmbiguous", UNSOLVED_TYPEVAR_AT_CODEGEN,
         "'{name}' is declared in more than one module and the call names neither", node,
         "the call needs the declaration typecheck resolved, which it does not record yet")
+    -1
+}
+
+// Typecheck accepted the call, so the name is not undeclared: it binds a closure value, or
+// it is one of the call forms the compiler provides itself. Both are calls this stage does
+// not lower yet, and neither is a front-end fault.
+fn cc_no_such_callee(node: Int) -> Int ! Diag.Report {
+    diag_ice_stage_not_built("cg_call closure values and compiler-provided calls", node)
+    -1
+}
+
+// A qualifier reaches a member its module declares as something other than a function: a
+// type it exports, or a constant that holds one. A qualified receiver never binds a
+// closure, so the refusal above would name the wrong shape.
+fn cc_no_module_member(node: Int) -> Int ! Diag.Report {
+    diag_ice_stage_not_built("cg_call qualified constructors and constant callees", node)
     -1
 }
 
@@ -256,9 +301,10 @@ fn cc_fn_by_name(node: Int, name: Str) -> Int ! Diag.Report {
 
 fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let obj = node_obj(node)
-    let stage = cc_receiverless_stage(obj)
-    if stage != "" {
-        diag_ice_stage_not_built(stage, node)
+    let role = cc_receiver_role(obj)
+    if role == Receiver.Module { return lower_module_call(node, obj) }
+    if role != Receiver.Value {
+        diag_ice_stage_not_built(cc_role_stage(role), node)
         return -1
     }
     let recv_tid = tid_of_node(obj)
@@ -280,24 +326,32 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     }
     let receiver = lower_expr(obj)
     if receiver < 0 { return -1 }
-    cc_direct(node, method, c_impl_method_name(im, node_method(node)), [receiver])
+    cc_direct(node, c_impl_method_name(im, node_method(node)), [receiver])
 }
 
-// A receiver that names something other than a value: the call has no receiver to lower
-// and is keyed on the name instead. Each such name is a different lowering, so each one
-// says which lowering it waits for rather than blaming whichever is listed first. "" means
-// the receiver is a value after all. A namespace the compiler provides is read before an
-// imported module, because a module of that name does not take the namespace over; a
-// builtin type has no declaration to look up, so the register of compiler-provided names
-// answers for it, the way typecheck decides the same call on the name alone.
-fn cc_receiverless_stage(obj: Int) -> Str {
-    if !cc_is_free_name(obj) { return "" }
+// What the left of the dot names. Only a Value is a receiver to lower; the other three are
+// qualifiers, and each keys a different lowering.
+pub type Receiver { Value, Namespace, Module, TypeOwner }
+
+// A namespace the compiler provides is read before an imported module, because a module of
+// that name does not take the namespace over. A builtin type has no declaration to look up,
+// so the register of compiler-provided names answers for it, the way typecheck decides the
+// same call on the name alone.
+fn cc_receiver_role(obj: Int) -> Receiver {
+    if !cc_is_free_name(obj) { return Receiver.Value }
     let name = node_name(obj)
-    if is_builtin_namespace(name) == 1 { return "cg_call intrinsic namespaces" }
-    if is_import_module_name(name) == 1 { return "cg_call module-qualified calls" }
-    if lookup_named_type(name) >= 0 { return "cg_call static and associated calls" }
-    if is_builtin_fn(name) == 1 { return "cg_call static and associated calls" }
-    ""
+    if is_builtin_namespace(name) == 1 { return Receiver.Namespace }
+    if is_import_module_name(name) == 1 { return Receiver.Module }
+    if lookup_named_type(name) >= 0 { return Receiver.TypeOwner }
+    if is_builtin_fn(name) == 1 { return Receiver.TypeOwner }
+    Receiver.Value
+}
+
+// The lowering a qualifier this stage does not own is waiting for. Each qualifier says
+// which one rather than blaming whichever is listed first.
+fn cc_role_stage(role: Receiver) -> Str {
+    if role == Receiver.Namespace { return "cg_call intrinsic namespaces" }
+    "cg_call static and associated calls"
 }
 
 // Whether the receiver is a bare name that binds no value here. A binder in scope wins
@@ -369,9 +423,9 @@ fn cc_method_of(im: Int, mname: Str) -> Int ! Diag.Report {
 
 // ── Shared ────────────────────────────────────────────────────────────────
 
-// One direct call: the declaration's C name, the receiver arguments already lowered, then
-// the written arguments in source order.
-fn cc_direct(node: Int, decl: Int, symbol: Str, leading: List[Int]) -> Int ! Diag.Report {
+// One direct call: the callee's C name, the receiver arguments already lowered, then the
+// written arguments in source order.
+fn cc_direct(node: Int, symbol: Str, leading: List[Int]) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = cc_local(tid, node)

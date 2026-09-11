@@ -20,6 +20,7 @@ import cg_emit.{
     em_tagged_enum_typedef_body, em_tag_macro, em_option_typedef_body, em_result_typedef_body,
     em_effect_vtable_typedef_body, em_effect_default_vtable, em_ev_typedef_body, em_ev_default_fn,
     em_scope_restore_support, em_main_shim, em_kops_table, em_kops_table_decl,
+    em_resource_guard_support, em_resource_guard_open, em_resource_guard_ok, em_resource_plain,
 }
 import ir.{
     IrKind, ir_kind, ir_kind_name, ir_span, ir_c_spelling, ir_c_name, ir_held_by_pointer, ir_must_materialize,
@@ -30,9 +31,14 @@ import diagnostics.{diag_ice, MISPLACED_IR_KIND_AT_PRINT}
 // A materialised node's temporary, so a second reach prints the same name.
 let mut materialized: Map[Int, Str] = Map()
 
+// The exit symbols whose guard support this TU already defines, each with the resource
+// spelling its state struct was built for.
+let mut guard_support_done: Map[Str, Str] = Map()
+
 pub fn print_reset() {
     em_reset()
     materialized.clear()
+    guard_support_done.clear()
 }
 
 pub fn print_take() -> Str { em_take() }
@@ -84,6 +90,7 @@ fn expr_text(id: Int) -> Str ! Diag.Report {
         IrKind.StructNew => compound_literal(id)
         IrKind.TupleNew => compound_literal(id)
         IrKind.ContainerNew => container_new_text(id)
+        IrKind.ContainerSpread => misplaced(id, "ContainerNew kid")
         IrKind.Box => box_text(id)
         IrKind.Unbox => "(*({print_expr(ir_kid(id, 0))}))"
         IrKind.CarrierWrap => carrier_wrap_text(id)
@@ -191,6 +198,8 @@ fn container_append_arity(ctor: Str) -> Int {
 
 // blink_map_new and blink_set_new take a key-operations table the IR cannot yet carry, so a
 // map or set literal is reported rather than printed with a call that does not compile.
+// A ContainerSpread kid stands for every element of its source: it takes the place of one
+// append and calls the copy symbol it names on the container under construction.
 fn container_new_text(id: Int) -> Str ! Diag.Report {
     let ctor = ir_c_name(id)
     let n = ir_kid_count(id)
@@ -218,6 +227,12 @@ fn container_new_text(id: Int) -> Str ! Diag.Report {
     let tmp = bind_temp(id, "_c", "{ctor}()")
     let mut i = 0
     while i < n {
+        let kid = ir_kid(id, i)
+        if ir_kind(kid) == IrKind.ContainerSpread {
+            em_line("{ir_c_name(kid)}({tmp}, {print_expr(ir_kid(kid, 0))});")
+            i += 1
+            continue
+        }
         let mut parts: List[Str] = [tmp]
         let mut j = 0
         while j < arity {
@@ -291,6 +306,7 @@ pub fn print_stmt(id: Int) ! Diag.Report {
         IrKind.StructNew => stmt_misplaced(id)
         IrKind.TupleNew => stmt_misplaced(id)
         IrKind.ContainerNew => stmt_misplaced(id)
+        IrKind.ContainerSpread => stmt_misplaced(id)
         IrKind.Box => stmt_misplaced(id)
         IrKind.Unbox => stmt_misplaced(id)
         IrKind.CarrierWrap => stmt_misplaced(id)
@@ -398,8 +414,13 @@ fn print_switch(id: Int) ! Diag.Report {
     }
 }
 
-// With a resource: the value is copied into a guard local and the cleanup symbol gets a
-// pointer to that local on every exit. Without one: a fresh arena for the block.
+// With a resource: the value is copied into a guard whose attribute cleanup runs the exit
+// symbol the node names (see em_resource_guard_support) on every exit. Without one: a
+// fresh arena for the block.
+//
+// The ok mark sits after the body, so the body must fall off its end on normal completion:
+// a tail value the scope yields is assigned to a destination inside the body and returned
+// after the scope, never returned from inside it, or the mark is dead and exit sees false.
 fn print_with_scope(id: Int) ! Diag.Report {
     em_line("\{")
     em_indent_push()
@@ -412,14 +433,46 @@ fn print_with_scope(id: Int) ! Diag.Report {
     } else {
         let res = ir_kid(id, 0)
         let value = print_expr(res)
-        let wr = em_temp("_wr")
-        let cleanup = ir_c_name(id)
-        let attr = if cleanup == "" { "" } else { " __attribute__((cleanup({cleanup})))" }
-        em_line("{ir_c_spelling(res)} {wr}{attr} = {value};")
-        print_block_body(ir_kid(id, 1))
+        let guard = em_temp("_rs")
+        if guard_is_printable(id, res) {
+            em_resource_guard_open(guard, ir_c_name(id), value)
+            print_block_body(ir_kid(id, 1))
+            em_resource_guard_ok(guard)
+        } else {
+            em_resource_plain(guard, ir_c_spelling(res), value)
+            print_block_body(ir_kid(id, 1))
+        }
     }
     em_indent_pop()
     em_line("}")
+}
+
+// A guard compiles only when this TU defined the support for its exit symbol, with a state
+// struct holding the resource in the spelling the value has. Anything else is an ICE and
+// the scope prints as a plain binding, so the C stays compilable and the ICE is the signal.
+fn guard_is_printable(id: Int, res: Int) -> Bool ! Diag.Report {
+    let exit_symbol = ir_c_name(id)
+    if exit_symbol == "" {
+        diag_ice("ResourceScopeWithoutExit", MISPLACED_IR_KIND_AT_PRINT,
+            "WithScope node {id} (span {ir_span(id)}) carries a resource but names no exit symbol", 0, 0,
+            "a resource with nothing to run on exit is a Let, not a WithScope")
+        return false
+    }
+    match guard_support_done.get(exit_symbol) {
+        None => {
+            diag_ice("ResourceGuardSupportMissing", MISPLACED_IR_KIND_AT_PRINT,
+                "WithScope node {id} (span {ir_span(id)}) names exit symbol {exit_symbol}, whose guard support this TU has not defined", 0, 0,
+                "call print_resource_guard_support for the exit symbol before printing the function that uses it")
+            false
+        }
+        Some(spelling) => {
+            if spelling == ir_c_spelling(res) { return true }
+            diag_ice("ResourceGuardSpellingMismatch", MISPLACED_IR_KIND_AT_PRINT,
+                "WithScope node {id} (span {ir_span(id)}) holds a {ir_c_spelling(res)} but the guard support for {exit_symbol} stores a {spelling}", 0, 0,
+                "the resource value and the exit method's self parameter must share one C spelling")
+            false
+        }
+    }
 }
 
 // The handler pointer replaces one field of the global effect vector for the block; the
@@ -589,6 +642,30 @@ pub fn print_ev(guard: Str, user_vtables: List[Str], user_fields: List[Str], ev_
 }
 
 pub fn print_scope_restore_support() { em_scope_restore_support() }
+
+// exit_symbol is the C symbol of the method that runs when the resource's scope ends: a
+// Closeable's close, a BlockHandler's exit, or the runtime's blink_ffi_scope_cleanup. It is
+// also what the scope's WithScope node carries as its c_name. resource_spelling is the
+// resource's C type as that method takes it and as the scope's resource value is spelled,
+// so the guard holds the value by that spelling and passes it through unchanged. passes_ok
+// says the method takes the ok flag after the resource. The support is defined once per TU
+// whatever the call count; a second request that disagrees with the first is an ICE, since
+// one exit symbol has one self parameter.
+pub fn print_resource_guard_support(exit_symbol: Str, resource_spelling: Str, passes_ok: Bool) ! Diag.Report {
+    match guard_support_done.get(exit_symbol) {
+        Some(prev) => {
+            if prev != resource_spelling {
+                diag_ice("ResourceGuardSupportConflict", MISPLACED_IR_KIND_AT_PRINT,
+                    "guard support for {exit_symbol} was defined for a {prev} and is now requested for a {resource_spelling}", 0, 0,
+                    "one exit method takes its resource in one spelling; the caller's layout query is inconsistent")
+            }
+        }
+        None => {
+            guard_support_done.insert(exit_symbol, resource_spelling)
+            em_resource_guard_support(exit_symbol, resource_spelling, passes_ok)
+        }
+    }
+}
 
 pub fn print_main_shim(has_main: Bool, has_tests: Bool, uses_async: Bool, user_tu: Bool, trace: Bool, deterministic: Int, init_fns: List[Str]) {
     em_main_shim(has_main, has_tests, uses_async, user_tu, trace, deterministic, init_fns)

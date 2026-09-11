@@ -28,7 +28,7 @@ import ir.{
     ir_field_get, ir_if, ir_let, ir_panic, ir_return, ir_switch, ir_unary, ir_var_ref,
 }
 import typecheck.{
-    DECL_NODE_AMBIGUOUS, TYPE_BOOL, TYPE_CHAR, TYPE_INT, TYPE_STR, TyKind, tc_enum_variant_slots,
+    DECL_NODE_AMBIGUOUS, TYPE_BOOL, TYPE_CHAR, TYPE_INT, TYPE_STR, TYPE_U64, TyKind, tc_enum_variant_slots,
     tc_evar_field_slots, tc_evar_name, tc_evfield_name, tc_evfield_tid, tc_resolve,
     tc_sfield_name, tc_sfield_tid, tc_struct_field_slots, tc_tid_decl_node, tc_tid_kind,
     tk_name,
@@ -44,6 +44,7 @@ let TAG_MEMBER = "tag"
 let derive_eq = "Eq"
 let derive_ord = "Ord"
 let derive_debug = "Debug"
+let derive_hash = "Hash"
 
 // The two words a Bool renders as. They are the Display of a Bool, not C text, and the
 // runtime holds the same pair in blink_sb_write_bool.
@@ -54,7 +55,7 @@ let bool_false = "false"
 // inside it that this stage has not built is a compiler bug, so the two answer with
 // different diagnostics.
 fn known_derives() -> List[Str] {
-    ["Serialize", "Deserialize", derive_eq, derive_ord, "Clone", "Hash", derive_debug]
+    ["Serialize", "Deserialize", derive_eq, derive_ord, "Clone", derive_hash, derive_debug]
 }
 
 // A declaration may write the same derive twice, in one annotation or in two, so a pass
@@ -109,6 +110,7 @@ fn derive_one(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
     if already_written(decl, name) { return }
     if name == derive_eq { return eq_method(decl, arg, bodies) }
     if name == derive_debug { return debug_method(decl, arg, bodies) }
+    if name == derive_hash { return hash_method(decl, arg, bodies) }
     not_built(arg, "@derive({name})")
 }
 
@@ -739,4 +741,284 @@ fn debug_nested_part(ftid: Int, value: Int, path: Str, span: Int) -> DebugPart !
     let arg = ir_call_direct(TYPE_STR, span, spelling, c_derive_method_name(fdecl, "debug"),
         rec.slot_form, [value])
     DebugPart { spec: spec, arg: arg, pre: [], ok: true }
+}
+
+// ── Hash ─────────────────────────────────────────────────────────────────
+
+// Where the accumulator starts. The runtime owns the constant, so this stage only names
+// it. It carries the process seed today, which the Hash contract says a hash must not
+// observe; correcting that moves the seed into the table's adapter, where every builtin
+// key already mixes it, and is not a change this stage can make alone.
+let HASH_INIT = "BLINK_HASH_INIT"
+
+fn u64_spelling(node: Int) -> Str ! Diag.Report {
+    spelling_or_ice(layout_of(TYPE_U64, Position.Return), "U64", node)
+}
+
+// How a slot holds a U64 is layout's answer, the same as for every other type. A literal
+// here would be a second answer to a question one producer already owns.
+fn u64_form() -> SlotForm {
+    layout_of(TYPE_U64, Position.Return).slot_form
+}
+
+fn hash_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
+    let tid = cg_reg_tid_for_decl(decl)
+    if tid < 0 { return derive_ice(arg, "type '{node_name(decl)}' reached cg_derive with no type id") }
+    let refusal = hash_refusal(decl, tid)
+    if refusal != "" { return not_built(arg, refusal) }
+    let self_spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), arg)
+    let ret = u64_spelling(arg)
+    if self_spelling == "" || ret == "" { return }
+    let symbol = c_derive_method_name(decl, "hash")
+    let params = ["{self_spelling} self"]
+    if !bodies { return print_fn_decl(false, ret, symbol, params, false) }
+    let body = hash_body(decl, tid, arg)
+    if body < 0 { return }
+    print_fn(false, ret, symbol, params, false, body)
+    kops_table(decl, tid, arg)
+}
+
+// Hash requires Eq, so a type that derives one without the other has no body to name in
+// the half of the table that compares keys. Refusing where the derive is written beats
+// an undefined symbol at link time.
+fn hash_refusal(decl: Int, tid: Int) -> Str {
+    let shape = shape_refusal(decl, tid, derive_hash)
+    if shape != "" { return shape }
+    if has_str(derive_names(decl), derive_eq) { return "" }
+    "@derive(Hash) on '{node_name(decl)}', which does not also derive Eq"
+}
+
+// The table binds a key type to the two methods a keyed container calls on it, and to
+// whether the runtime stores the key inline in a list slot. Nothing answers that last
+// question yet. Guessing it from the slot form gets a one-field struct wrong, which
+// silently mis-reads every key a Map or Set hands back.
+fn kops_table(decl: Int, tid: Int, span: Int) ! Diag.Report {
+    let table = layout_of(tid, Position.Param).kops_table
+    if table == "" { return }
+    not_built(span, "the key-operations table '{table}' for '{node_name(decl)}', whose inline-key storage has no producer in layout")
+}
+
+// A value layout gives as one word is its own hash input, but which input depends on
+// what the word holds: an ordinal enum is its tag, and a transparent newtype is the
+// field it stands for, which may be a string rather than a number.
+fn hash_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let rec = layout_of(tid, Position.Param)
+    if rec.slot_form == SlotForm.InlineWord {
+        if rec.is_transparent != 0 { return hash_newtype_body(decl, tid, span) }
+        return hash_ordinal_body(decl, tid, span)
+    }
+    let k = tc_tid_kind(tc_resolve(tid))
+    if k == TyKind.Struct { return hash_struct_body(decl, tid, span) }
+    if k == TyKind.Enum { return hash_tagged_body(decl, tid, span) }
+    not_built(span, "@derive(Hash) on a {tk_name(k)} type")
+    -1
+}
+
+fn hash_init_const(span: Int) -> Int ! Diag.Report {
+    let u64s = u64_spelling(span)
+    if u64s == "" { return -1 }
+    ir_const(TYPE_U64, span, u64s, HASH_INIT)
+}
+
+// One value folded in: the accumulator is mixed after the exclusive-or, so a field's
+// bits reach every bit of the answer before the next field is folded. Mixing only at
+// the end would let two fields cancel each other out.
+fn hash_mix(acc: Int, value: Int, span: Int) -> Int ! Diag.Report {
+    let u64s = u64_spelling(span)
+    if u64s == "" { return -1 }
+    let xored = ir_binary(TYPE_U64, span, u64s, "^", acc, value)
+    ir_call_runtime(TYPE_U64, span, u64s, c_runtime_helper("kops_mix_u64"), u64_form(), [xored])
+}
+
+// A shape with no accumulator to carry: one value, mixed once, returned.
+fn hash_single(value: Int, span: Int) -> Int ! Diag.Report {
+    let init = hash_init_const(span)
+    if init < 0 || value < 0 { return -1 }
+    let mixed = hash_mix(init, value, span)
+    if mixed < 0 { return -1 }
+    ir_block(span, [ir_return(span, mixed)])
+}
+
+fn hash_struct_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let u64s = u64_spelling(span)
+    let init = hash_init_const(span)
+    if u64s == "" || init < 0 { return -1 }
+    let acc = c_mint_local("h")
+    let mut stmts = [ir_let(TYPE_U64, span, u64s, acc, u64_form(), init)]
+    for slot in tc_struct_field_slots(tid) {
+        let ftid = tc_sfield_tid(slot)
+        let name = tc_sfield_name(slot)
+        let value = field_value(decl, tid, ftid, c_field_name(name), "self", derive_hash, span)
+        if value < 0 { return -1 }
+        let folded = hash_fold(acc, ftid, value, name, span)
+        if folded < 0 { return -1 }
+        stmts.push(folded)
+    }
+    stmts.push(ir_return(span, ir_var_ref(TYPE_U64, span, u64s, acc, u64_form())))
+    ir_block(span, stmts)
+}
+
+// One field's whole contribution as a statement: read it, mix it, put it back.
+fn hash_fold(acc: Str, ftid: Int, value: Int, path: Str, span: Int) -> Int ! Diag.Report {
+    let u64s = u64_spelling(span)
+    let contribution = hash_contribution(ftid, value, path, span)
+    if u64s == "" || contribution < 0 { return -1 }
+    let read = ir_var_ref(TYPE_U64, span, u64s, acc, u64_form())
+    let mixed = hash_mix(read, contribution, span)
+    if mixed < 0 { return -1 }
+    ir_assign(span, ir_var_ref(TYPE_U64, span, u64s, acc, u64_form()), mixed)
+}
+
+// The tag is folded first, so two variants that carry the same payload still hash
+// differently. Then the tag chooses which payload may be read at all.
+fn hash_tagged_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let slots = tc_enum_variant_slots(tid)
+    if slots.len() == 0 {
+        derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
+        return -1
+    }
+    let u64s = u64_spelling(span)
+    let ints = int_spelling(span)
+    if u64s == "" || ints == "" { return -1 }
+    let tag = tag_ref(tid, "self", ints, span)
+    let init = hash_init_const(span)
+    if tag < 0 || init < 0 { return -1 }
+    let seeded = hash_mix(init, ir_cast(TYPE_U64, span, u64s, tag), span)
+    if seeded < 0 { return -1 }
+    let acc = c_mint_local("h")
+    let scrutinee = tag_ref(tid, "self", ints, span)
+    let unknown = hash_corrupt_block(decl, span)
+    if scrutinee < 0 || unknown < 0 { return -1 }
+    let cases = hash_variant_cases(decl, tid, slots, acc, span)
+    if cases.len() == 0 { return -1 }
+    ir_block(span, [
+        ir_let(TYPE_U64, span, u64s, acc, u64_form(), seeded),
+        ir_switch(span, scrutinee, cases, unknown),
+        ir_return(span, ir_var_ref(TYPE_U64, span, u64s, acc, u64_form())),
+    ])
+}
+
+fn hash_variant_cases(decl: Int, tid: Int, slots: List[Int], acc: Str, span: Int) -> List[Int] ! Diag.Report {
+    let ints = int_spelling(span)
+    if ints == "" { return [] }
+    let mut cases: List[Int] = []
+    let mut i = 0
+    while i < slots.len() {
+        let slot = slots.get(i).unwrap()
+        let vnode = variant_decl_node(decl, slot, i, span)
+        if vnode < 0 { return [] }
+        let body = hash_variant_block(decl, tid, slot, acc, span)
+        if body < 0 { return [] }
+        cases.push(ir_const(TYPE_INT, span, ints, c_variant_tag_macro(decl, vnode)))
+        cases.push(body)
+        i = i + 1
+    }
+    cases
+}
+
+fn hash_variant_block(decl: Int, tid: Int, slot: Int, acc: Str, span: Int) -> Int ! Diag.Report {
+    let vname = tc_evar_name(slot)
+    let mut stmts: List[Int] = []
+    for f in tc_evar_field_slots(slot) {
+        let ftid = tc_evfield_tid(f)
+        let fname = tc_evfield_name(f)
+        let path = "{PAYLOAD_UNION}.{vname}.{c_field_name(fname)}"
+        let value = field_value(decl, tid, ftid, path, "self", derive_hash, span)
+        if value < 0 { return -1 }
+        let folded = hash_fold(acc, ftid, value, "{vname}.{fname}", span)
+        if folded < 0 { return -1 }
+        stmts.push(folded)
+    }
+    ir_block(span, stmts)
+}
+
+// A tag no variant declares means the value's memory is corrupt. Answering a number
+// there would put a corrupt key in a bucket and let a later lookup find it.
+fn hash_corrupt_block(decl: Int, span: Int) -> Int ! Diag.Report {
+    let spelling = str_spelling(span)
+    if spelling == "" { return -1 }
+    let text = "blink: @derive(Hash) on {node_name(decl)} met a tag no variant declares"
+    ir_block(span, [ir_panic(span, ir_const(TYPE_STR, span, spelling, c_string_literal(text)))])
+}
+
+// A payload-less enum is its own tag, so the value itself is the whole hash input.
+fn hash_ordinal_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let u64s = u64_spelling(span)
+    let value = self_ref(tid, "self", span)
+    if u64s == "" || value < 0 { return -1 }
+    if tc_enum_variant_slots(tid).len() == 0 {
+        derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
+        return -1
+    }
+    hash_single(ir_cast(TYPE_U64, span, u64s, value), span)
+}
+
+// A transparent newtype is the bare word its one field holds, so the parameter itself
+// is that field's value. Which hash that word needs is still the field's question: a
+// newtype over a string holds a pointer, and hashing the pointer is not hashing the key.
+fn hash_newtype_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let slots = tc_enum_variant_slots(tid)
+    if slots.len() != 1 {
+        derive_ice(span, "transparent newtype '{node_name(decl)}' has {slots.len()} variants, not one")
+        return -1
+    }
+    let fields = tc_evar_field_slots(slots.get(0).unwrap())
+    if fields.len() != 1 {
+        derive_ice(span, "transparent newtype '{node_name(decl)}' carries {fields.len()} fields, not one")
+        return -1
+    }
+    let value = self_ref(tid, "self", span)
+    if value < 0 { return -1 }
+    let contribution = hash_contribution(tc_evfield_tid(fields.get(0).unwrap()), value, node_name(decl), span)
+    if contribution < 0 { return -1 }
+    hash_single(contribution, span)
+}
+
+// The unsigned word one value contributes. A string is hashed by its bytes, a nested
+// type by its own derived method, and an integral scalar by widening. A Float has no
+// hash coherent with its equality and a container has none at all, so both are refused
+// here as well as at the gate that keeps them from arriving.
+fn hash_contribution(ftid: Int, value: Int, path: Str, span: Int) -> Int ! Diag.Report {
+    let u64s = u64_spelling(span)
+    if u64s == "" { return -1 }
+    let k = tc_tid_kind(tc_resolve(ftid))
+    if k == TyKind.Str {
+        return ir_call_runtime(TYPE_U64, span, u64s, c_runtime_helper("map_hash"), u64_form(), [value])
+    }
+    if k == TyKind.Struct || k == TyKind.Enum { return hash_nested(ftid, value, path, span) }
+    if !hash_is_integral(k) {
+        not_built(span, "@derive(Hash) on the {tk_name(k)} field '{path}'")
+        return -1
+    }
+    ir_cast(TYPE_U64, span, u64s, value)
+}
+
+// The kinds whose bits are the value. Float is absent on purpose: -0.0 equals 0.0 with
+// a different bit pattern, so a bitwise hash of a Float cannot stay coherent with its
+// equality, and the spec makes that a permanent contract rather than a missing impl.
+fn hash_is_integral(k: TyKind) -> Bool {
+    if k == TyKind.Int || k == TyKind.Bool || k == TyKind.Char { return true }
+    if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return true }
+    if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return true }
+    false
+}
+
+fn hash_nested(ftid: Int, value: Int, path: Str, span: Int) -> Int ! Diag.Report {
+    let u64s = u64_spelling(span)
+    if u64s == "" { return -1 }
+    let fdecl = tc_tid_decl_node(ftid)
+    if fdecl < 0 || fdecl == DECL_NODE_AMBIGUOUS {
+        derive_ice(span, "field type {ftid} has no unambiguous declaration to hash through")
+        return -1
+    }
+    if !has_str(derive_names(fdecl), derive_hash) {
+        not_built(span, "@derive(Hash) on a field whose type '{node_name(fdecl)}' implements Hash by hand")
+        return -1
+    }
+    let refusal = hash_refusal(fdecl, ftid)
+    if refusal != "" {
+        not_built(span, "{refusal}, which the field '{path}' would have to call")
+        return -1
+    }
+    ir_call_direct(TYPE_U64, span, u64s, c_derive_method_name(fdecl, "hash"), u64_form(), [value])
 }

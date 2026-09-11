@@ -293,6 +293,54 @@ pub fn em_scope_restore_support() {
     em_close_brace("")
 }
 
+// ── Resource guards ──────────────────────────────────────────────────────────
+//
+// A `with expr as name` resource leaves through a guard local of a state struct, not through
+// the resource's own type: the cleanup attribute can only take a pointer to the guard, and
+// the exit needs two flags the resource cannot hold. `done` makes the exit run once whether
+// the attribute fires first or the runtime's panic drain does, and `ok` tells a BlockHandler
+// whether the body completed. Both are `int` because the runtime's drain callback and the
+// Bool parameter of exit are spelled `int`. The three symbols hang off the exit symbol under
+// the reserved `__blink_` prefix, so one exit method gets one family and no user symbol can
+// meet it.
+
+pub fn rs_state_name(exit_symbol: Str) -> Str { "__blink_rs_state_{exit_symbol}" }
+pub fn rs_run_name(exit_symbol: Str) -> Str { "__blink_rs_run_{exit_symbol}" }
+pub fn rs_cleanup_name(exit_symbol: Str) -> Str { "__blink_rs_cleanup_{exit_symbol}" }
+
+// The runner has the `void (*)(void*, int)` shape the runtime's cleanup stack calls; the
+// attribute cleanup pops the stack entry the scope pushed and runs it with the recorded ok.
+pub fn em_resource_guard_support(exit_symbol: Str, resource_spelling: Str, passes_ok: Bool) {
+    let st = rs_state_name(exit_symbol)
+    let run = rs_run_name(exit_symbol)
+    em_line("typedef struct \{ {resource_spelling} resource; int ok; int done; } {st};")
+    em_open_brace("static void {run}(void* p, int ok)")
+    if !passes_ok { em_line("(void)ok;") }
+    em_line("{st}* st = ({st}*)p;")
+    em_line("if (st->done) \{ return; }")
+    em_line("st->done = 1;")
+    if passes_ok { em_line("{exit_symbol}(st->resource, ok);") } else { em_line("{exit_symbol}(st->resource);") }
+    em_close_brace("")
+    em_open_brace("static void {rs_cleanup_name(exit_symbol)}({st}* st)")
+    em_line("__blink_cleanup_pop((void*)st);")
+    em_line("{run}((void*)st, st->ok);")
+    em_close_brace("")
+}
+
+// The guard copies the resource value in, registers with the cleanup stack only while a
+// panic frame is armed, and marks ok after the body. A return or `?` skips the mark, so
+// the attribute cleanup then runs the exit with ok still zero. A scope that has no exit to
+// run keeps the plain declaration, so a TU carrying that ICE still compiles.
+pub fn em_resource_guard_open(guard: Str, exit_symbol: Str, value: Str) {
+    let st = rs_state_name(exit_symbol)
+    em_line("{st} {guard} __attribute__((cleanup({rs_cleanup_name(exit_symbol)}))) = \{ .resource = {value}, .ok = 0, .done = 0 };")
+    em_line("if (__blink_panic_armed) \{ __blink_cleanup_push((void*)&{guard}, {rs_run_name(exit_symbol)}, &{guard}.done); }")
+}
+
+pub fn em_resource_guard_ok(guard: Str) { em_line("{guard}.ok = 1;") }
+
+pub fn em_resource_plain(guard: Str, spelling: Str, value: Str) { em_line("{spelling} {guard} = {value};") }
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 pub fn em_main_shim(has_main: Bool, has_tests: Bool, uses_async: Bool, user_tu: Bool, trace: Bool, deterministic: Int, init_fns: List[Str]) {
