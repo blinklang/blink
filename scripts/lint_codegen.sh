@@ -89,6 +89,7 @@ c_mono_variant_tag_macro cname
 c_vtable_type_name cname
 c_kops_table_name cname
 td_guard_name cname
+c_mint_local cname
 c_type_of layout
 carrier_tag_of layout
 ensure_typedef_for layout
