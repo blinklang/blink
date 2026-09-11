@@ -1,0 +1,134 @@
+import std.fs
+import std.io
+import typecheck.{check_types}
+import layout.{layout_reset}
+import diagnostics.{diag_ice_count}
+import cname.{c_ev_type_name}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_decl.{cg_decl_reset, cg_decl_emit_prologue, cg_decl_emit_epilogue, cg_decl_emit_ev}
+import compiler.{compile_to_program}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output must not have '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    program
+}
+
+fn plain_src() -> Str {
+    #"fn main() { assert(true) }
+"#
+}
+
+// A standalone unit owns the runtime outright.
+test "a standalone unit includes the runtime header and no archive header" {
+    let _ = build_probe(plain_src(), "cg_decl_prologue_plain_probe")
+    cg_decl_emit_prologue(false, false, false, "", "")
+    let text = print_take()
+    assert_has(text, "#include \"runtime.h\"")
+    assert_lacks(text, "libblink_std.h")
+    assert_lacks(text, "BLINK_USE_EXTERN_RUNTIME_STORAGE")
+}
+
+// User code linked against the archive shares the archive's runtime storage rather than
+// defining a second copy of it.
+test "a unit linked against the archive shares the archive storage" {
+    let _ = build_probe(plain_src(), "cg_decl_prologue_user_probe")
+    cg_decl_emit_prologue(true, false, false, "", "")
+    let text = print_take()
+    assert_has(text, "#include \"libblink_std.h\"")
+    assert_has(text, "#define BLINK_USE_EXTERN_RUNTIME_STORAGE 1")
+    assert_lacks(text, "#define BLINK_RUNTIME_STORAGE_DEFINE 1")
+}
+
+test "the archive itself defines the runtime storage" {
+    let _ = build_probe(plain_src(), "cg_decl_prologue_archive_probe")
+    cg_decl_emit_prologue(false, true, false, "", "")
+    let text = print_take()
+    assert_has(text, "#define BLINK_RUNTIME_STORAGE_DEFINE 1")
+}
+
+// A header is included more than once, so it carries an include guard.
+test "a header opens and closes its include guard" {
+    let _ = build_probe(plain_src(), "cg_decl_prologue_header_probe")
+    cg_decl_emit_prologue(false, false, false, "BLINK_STD_H", "")
+    cg_decl_emit_epilogue("BLINK_STD_H")
+    let text = print_take()
+    assert_has(text, "#ifndef BLINK_STD_H")
+    assert_has(text, "#define BLINK_STD_H")
+    assert_has(text, "#endif")
+}
+
+// The archive is compiled against a shorter evidence vector than a user unit sees, so the
+// builtin fields must stay first and in this order forever.
+test "the evidence vector keeps the builtin fields first and in order" {
+    let _ = build_probe(plain_src(), "cg_decl_ev_probe")
+    cg_decl_emit_ev("")
+    let text = print_take()
+    let want = ["io", "fs", "net", "crypto", "rand", "time", "env", "process"]
+    let mut prev = -1
+    for f in want {
+        let at = text.index_of("blink_{f}_vtable* {f};")
+        if at < 0 { io.println("FAIL: no field '{f}'\n--- output ---\n{text}") }
+        assert(at > prev)
+        prev = at
+    }
+    assert_has(text, "} {c_ev_type_name()};")
+    assert_has(text, "{c_ev_type_name()} blink_ev_default(void)")
+}
+
+// A unit that only refers to the vector declares it and defines no default, so the
+// program keeps exactly one definition.
+test "a referring unit declares the evidence vector extern" {
+    let _ = build_probe(plain_src(), "cg_decl_ev_extern_probe")
+    cg_decl_emit_ev("extern ")
+    let text = print_take()
+    assert_has(text, "extern {c_ev_type_name()} __blink_ev;")
+    assert_lacks(text, "blink_ev_default(void)")
+}
+
+fn user_effect_src() -> Str {
+    #"effect Logger {
+    fn log(msg: Str)
+}
+fn main() { assert(true) }
+"#
+}
+
+// A user effect adds a vtable and an evidence field. That is not built yet, and a vector
+// missing the field would miscompile every handler, so the gap reports rather than emits.
+test "a user-declared effect reports the unbuilt stage" {
+    let _ = build_probe(user_effect_src(), "cg_decl_ev_user_effect_probe")
+    let before = diag_ice_count
+    cg_decl_emit_ev("")
+    assert_eq_int("ice raised", diag_ice_count - before, 1)
+}

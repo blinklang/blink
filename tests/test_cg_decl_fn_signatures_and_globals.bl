@@ -1,0 +1,123 @@
+import std.fs
+import std.io
+import typecheck.{check_types}
+import layout.{layout_reset}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_decl.{cg_decl_reset, cg_decl_emit_fn_decls, cg_decl_emit_globals}
+import compiler.{compile_to_program}
+
+// `plain` takes an effect-free signature, `talks` carries one, `main` is the entry point
+// the runtime calls, and the two globals cover a scalar and a container.
+fn probe_src() -> Str {
+    #"let counter: Int = 0
+let names: List[Str] = []
+let seat: Option[Int] = None
+fn plain(a: Int, b: Str) -> Int { a }
+fn noargs() { }
+fn talks(x: Int) -> Int ! IO { x }
+fn carries(o: Option[Int]) -> Result[Int, Str] { Ok(o ?? 0) }
+fn main() ! IO { talks(counter); noargs(); plain(1, "x"); assert(names.len() == 0) }
+"#
+}
+
+fn probe_program() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/cg_decl_fn_globals_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    program
+}
+
+fn fn_decl_text() -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let program = probe_program()
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    cg_decl_emit_fn_decls()
+    print_take()
+}
+
+fn global_text(is_extern: Bool) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let program = probe_program()
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    cg_decl_emit_globals(is_extern)
+    print_take()
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+test "a function declaration spells its return and parameters from the type graph" {
+    assert_has(fn_decl_text(), "int64_t blink_u_plain(int64_t a, const char* b);")
+}
+
+// A function that declares no effect takes no evidence pointer, and a C function of no
+// parameters must say void or it declares an unchecked parameter list.
+test "an effect-free function of no parameters declares void" {
+    assert_has(fn_decl_text(), "void blink_u_noargs(void);")
+}
+
+// The evidence vector rides last, after the declared parameters.
+test "a function that declares an effect takes the evidence vector last" {
+    assert_has(fn_decl_text(), "int64_t blink_u_talks(int64_t x, blink_ev* __ev);")
+}
+
+// main is the entry point the shim calls, so it keeps the runtime name and always
+// takes the evidence vector.
+test "the entry point keeps its runtime name" {
+    assert_has(fn_decl_text(), "void blink_main(blink_ev* __ev);")
+}
+
+// A top-level let is a C global under its own unmangled Blink name.
+test "a global keeps its bare Blink name" {
+    let text = global_text(false)
+    assert_has(text, "int64_t counter;")
+    assert_has(text, "blink_list* names;")
+}
+
+// A header declares the globals another translation unit defines.
+test "a header declares the globals extern" {
+    let text = global_text(true)
+    assert_has(text, "extern int64_t counter;")
+    assert_has(text, "extern blink_list* names;")
+}
+
+fn find_at(text: Str, needle: Str) -> Int {
+    let i = text.index_of(needle)
+    if i < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(i >= 0)
+    i
+}
+
+// A carrier type has no declaration of its own: the only thing that asks for it is the
+// signature that names it. The reading layer records the typedef when it spells the
+// type, and it has to land before the declaration that reads it.
+test "a signature carrier is typedefed before the declaration that names it" {
+    let text = fn_decl_text()
+    let typedef = find_at(text, "} blink_Option_int;")
+    let decl = find_at(text, "blink_u_carries(blink_Option_int o);")
+    assert(typedef < decl)
+    let ok_typedef = find_at(text, "} blink_Result_int_str;")
+    assert(ok_typedef < decl)
+}
+
+// A global names a carrier the same way, and nothing else in the unit declares it.
+test "a global carrier is typedefed before the global that names it" {
+    let text = global_text(false)
+    let typedef = find_at(text, "} blink_Option_int;")
+    let global = find_at(text, "blink_Option_int seat;")
+    assert(typedef < global)
+}

@@ -9,8 +9,20 @@
 // empty string. Every caller must therefore read diag_ice_count before it uses the
 // result, or an unbuilt stage looks like a program that legitimately emits nothing.
 
-import diagnostics.{Diag}
-import cg_reg.{cg_reg_build}
+import diagnostics.{Diag, diag_ice_stage_not_built}
+import parser.{get_annotation, node_effects, sublist_length}
+import cname.{c_archive_header_guard, c_module_header_guard, cname_reset}
+import layout.{layout_reset}
+import cg_print.{print_main_shim, print_reset, print_scope_restore_support, print_take}
+import cg_reg.{
+    cg_reg_build, cg_reg_entry_point, cg_reg_fn_decls, cg_reg_has_main, cg_reg_impl_methods,
+    cg_reg_modules, cg_reg_module_of, cg_reg_reset, cg_reg_test_decls,
+}
+import cg_decl.{
+    cg_decl_emit_epilogue, cg_decl_emit_ev, cg_decl_emit_fn_decl,
+    cg_decl_emit_impl_method_decl, cg_decl_emit_globals, cg_decl_emit_prologue,
+    cg_decl_emit_typedefs, cg_decl_reset,
+}
 
 effect Codegen {
     effect Emit
@@ -46,34 +58,177 @@ pub type CgConfig {
     archive_build_mode: Int
 }
 
-// The whole program as one translation unit.
-pub fn generate(program: Int, _cfg: CgConfig) -> Str ! Codegen, Diag.Report {
+
+// Every mode starts from the same clean state. Two emits in one process must not see
+// each other's memo tables, and a stale entry would be read as a fact about this program.
+fn begin_unit(program: Int) ! Diag.Report {
+    print_reset()
+    layout_reset()
+    cname_reset()
+    cg_reg_reset()
     cg_reg_build(program)
+    cg_decl_reset()
+}
+
+// The declaration half, in the order C requires: a type must be complete where a later
+// declaration names it, the evidence vector's fields name those types, and a global or a
+// signature names them again.
+fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_ev: Bool, globals_extern: Bool, shared: Bool) ! Diag.Report {
+    let user_tu = cfg.user_tu_mode != 0
+    let define_storage = cfg.archive_build_mode != 0
+    cg_decl_emit_prologue(user_tu, define_storage, false, header_guard, self_header)
+    cg_decl_emit_typedefs()
+    if define_ev { cg_decl_emit_ev(ev_storage(cfg)) }
+    cg_decl_emit_globals(globals_extern)
+    for f in fns_in_scope(cfg, "", shared) { cg_decl_emit_fn_decl(f, false) }
+    for m in methods_in_scope(cfg, "", shared) { cg_decl_emit_impl_method_decl(m, false) }
+}
+
+// A function whose body reads the program's own evidence cannot live in the shared
+// stdlib archive: many programs link one archive, and the archive does not even define
+// the evidence vector such a signature names. Those functions are compiled into the
+// user's translation unit instead. A foreign binding carries `! FFI` but is a plain C
+// wrapper that reads no evidence, so it stays.
+fn is_evidence_bound(fn_node: Int) -> Bool {
+    if get_annotation(fn_node, "ffi") != -1 { return false }
+    let sl = node_effects(fn_node)
+    if sl == -1 { return false }
+    sublist_length(sl) > 0
+}
+
+// "" for the unit that owns the vector and is linked against, "extern " for a unit that
+// only refers to it. Exactly one unit of a program may own it.
+fn ev_storage(cfg: CgConfig) -> Str {
+    if cfg.blink_ev_extern_only != 0 { return "extern " }
     ""
+}
+
+// A module filter of "" means the whole program. The per-module modes pass a key and get
+// only what that module declared.
+fn decls_in_scope(cfg: CgConfig, module_key: Str, decls: List[Int]) -> List[Int] {
+    let mut out: List[Int] = []
+    for f in decls {
+        if module_key != "" && cg_reg_module_of(f) != module_key { continue }
+        if cfg.emit_only_module != "" && cg_reg_module_of(f) != cfg.emit_only_module { continue }
+        if cfg.skip_modules.contains_key(cg_reg_module_of(f)) && !kept_for_user(cfg, f) { continue }
+        out.push(f)
+    }
+    out
+}
+
+// The entry point belongs to the unit that carries the program's shim. One archive
+// serves many programs, and the archive build synthesizes a main of its own just to pull
+// every module into one unit.
+fn is_entry_point(fn_node: Int) -> Bool {
+    fn_node == cg_reg_entry_point()
+}
+
+// A module compiled into the archive is declared by the user's unit, not compiled again
+// — except for the functions the archive could not hold. An evidence-bound signature
+// names the program's own evidence vector, which the archive does not define, so the
+// archive left those out and the user's unit is the only place left to compile them.
+fn kept_for_user(cfg: CgConfig, decl: Int) -> Bool {
+    cfg.user_tu_mode != 0 && is_evidence_bound(decl)
+}
+
+fn fns_in_scope(cfg: CgConfig, module_key: Str, shared: Bool) -> List[Int] {
+    let mut out: List[Int] = []
+    for f in decls_in_scope(cfg, module_key, cg_reg_fn_decls()) {
+        if shared && is_entry_point(f) { continue }
+        if shared && is_evidence_bound(f) { continue }
+        out.push(f)
+    }
+    out
+}
+
+// An impl method is in scope on the same terms as a free function, minus the entry
+// point: a method named `main` is a method, not the program's entry.
+fn methods_in_scope(cfg: CgConfig, module_key: Str, shared: Bool) -> List[Int] {
+    let mut out: List[Int] = []
+    for m in decls_in_scope(cfg, module_key, cg_reg_impl_methods()) {
+        if shared && is_evidence_bound(m) { continue }
+        out.push(m)
+    }
+    out
+}
+
+// Function bodies are the one part of a unit this stage cannot produce yet. Reporting
+// here rather than emitting a body-less unit is what keeps a half-written compiler from
+// linking and running as if it were whole. A test block is a body too, and the entry shim
+// calls a runner that only the test table defines.
+fn emit_definitions(cfg: CgConfig, module_key: Str, shared: Bool) ! Diag.Report {
+    let fns = fns_in_scope(cfg, module_key, shared)
+    if fns.len() > 0 {
+        diag_ice_stage_not_built("cg function bodies", fns.get(0).unwrap())
+        return
+    }
+    let methods = methods_in_scope(cfg, module_key, shared)
+    if methods.len() > 0 {
+        diag_ice_stage_not_built("cg impl method bodies", methods.get(0).unwrap())
+        return
+    }
+    let tests = decls_in_scope(cfg, module_key, cg_reg_test_decls())
+    if tests.len() == 0 { return }
+    diag_ice_stage_not_built("cg test bodies", tests.get(0).unwrap())
+}
+
+// The whole program as one translation unit.
+pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
+    begin_unit(program)
+    let shared = cfg.archive_build_mode != 0
+    emit_declarations(cfg, "", "", true, false, shared)
+    print_scope_restore_support()
+    emit_definitions(cfg, "", shared)
+    print_main_shim(cg_reg_has_main(), cg_reg_test_decls().len() > 0, false,
+        cfg.user_tu_mode != 0, cfg.trace_codegen != 0, cfg.deterministic, [])
+    print_take()
 }
 
 // The stdlib archive's public header: every declaration a user TU needs to link
 // against the archive, and no definition.
-pub fn generate_archive_header(program: Int, _cfg: CgConfig) -> Str ! Codegen, Diag.Report {
-    cg_reg_build(program)
-    ""
+//
+// The evidence vector is left out on purpose. A user unit declares its own, longer
+// vector — the archive's builtin fields followed by the user program's effects — and two
+// definitions of one C type is an ODR violation.
+pub fn generate_archive_header(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
+    begin_unit(program)
+    emit_declarations(cfg, c_archive_header_guard(), "", false, true, true)
+    cg_decl_emit_epilogue(c_archive_header_guard())
+    print_take()
 }
 
 // One module's public header, for the per-module object mode.
-pub fn generate_module_header(program: Int, _module_key: Str, _cfg: CgConfig) -> Str ! Codegen, Diag.Report {
-    cg_reg_build(program)
-    ""
+pub fn generate_module_header(program: Int, module_key: Str, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
+    begin_unit(program)
+    let guard = c_module_header_guard(module_key)
+    cg_decl_emit_prologue(cfg.user_tu_mode != 0, false, false, guard, "")
+    cg_decl_emit_typedefs()
+    cg_decl_emit_globals(true)
+    for f in fns_in_scope(cfg, module_key, false) { cg_decl_emit_fn_decl(f, false) }
+    for m in methods_in_scope(cfg, module_key, false) { cg_decl_emit_impl_method_decl(m, false) }
+    cg_decl_emit_epilogue(guard)
+    print_take()
 }
 
-// One module's translation unit, including `self_header` for its own declarations.
-pub fn generate_module_object(program: Int, _module_key: Str, _self_header: Str, _cfg: CgConfig) -> Str ! Codegen, Diag.Report {
-    cg_reg_build(program)
-    ""
+// One module's translation unit, including `self_header` for its own declarations. The
+// declarations come from that header, so this unit carries definitions only.
+pub fn generate_module_object(program: Int, module_key: Str, self_header: Str, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
+    begin_unit(program)
+    cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_build_mode != 0, false, "", self_header)
+    cg_decl_emit_ev(ev_storage(cfg))
+    cg_decl_emit_globals(false)
+    print_scope_restore_support()
+    emit_definitions(cfg, module_key, cfg.archive_build_mode != 0)
+    if module_key == "__main__" {
+        print_main_shim(cg_reg_has_main(), cg_reg_test_decls().len() > 0, false,
+            cfg.user_tu_mode != 0, cfg.trace_codegen != 0, cfg.deterministic, [])
+    }
+    print_take()
 }
 
 // The modules of `program` in the order the per-module mode must emit them: first-seen
 // order, which is dependency order, never sorted.
 pub fn enumerate_program_modules(program: Int) -> List[Str] ! Diag.Report {
-    cg_reg_build(program)
-    []
+    begin_unit(program)
+    cg_reg_modules()
 }

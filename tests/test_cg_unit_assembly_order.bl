@@ -1,0 +1,222 @@
+import std.fs
+import std.io
+import typecheck.{check_types}
+import layout.{layout_reset}
+import cname.{cname_reset, c_archive_header_guard, c_module_header_guard}
+import cg.{CgConfig, generate, generate_archive_header, generate_module_header, enumerate_program_modules}
+import parser.{node_fields, node_methods, node_params, node_set_module, node_stmts, sublist_get, sublist_length}
+import compiler.{compile_to_program}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+fn find_at(text: Str, needle: Str) -> Int {
+    let i = text.index_of(needle)
+    if i < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(i >= 0)
+    i
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output must not have '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+// No functions, so no function body is lowered and the unit is the declaration half
+// alone. A global carries no initializer in C: the init function assigns it.
+fn probe_src() -> Str {
+    #"type Point { x: Int, y: Int }
+let origin: Point = Point { x: 0, y: 0 }
+let tally: Int = 0
+"#
+}
+
+fn probe_program(name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    program
+}
+
+fn standalone_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+// Every declaration a later line names must already be complete, so the unit runs
+// prologue, types, evidence vector, globals, then the entry shim.
+test "a translation unit is assembled in declaration order" {
+    let program = probe_program("cg_unit_order_probe")
+    let text = generate(program, standalone_cfg())
+    let prologue = find_at(text, "#include \"runtime.h\"")
+    let point = find_at(text, "} blink_Point;")
+    let ev = find_at(text, "} blink_ev;")
+    let global = find_at(text, "blink_Point origin;")
+    let shim = find_at(text, "int main(int argc, char** argv)")
+    assert(prologue < point)
+    assert(point < ev)
+    assert(ev < global)
+    assert(global < shim)
+}
+
+// A global is a definition in the unit that owns it, never an extern there, or nothing
+// reserves storage for it.
+test "the owning unit defines its globals" {
+    let program = probe_program("cg_unit_global_probe")
+    let text = generate(program, standalone_cfg())
+    assert_lacks(text, "extern blink_Point origin;")
+    let _ = find_at(text, "int64_t tally;")
+}
+
+// The archive header is declarations only: a user unit includes it and must not get a
+// second definition of anything, nor a second entry point.
+test "the archive header declares and defines nothing" {
+    let program = probe_program("cg_unit_archive_probe")
+    let text = generate_archive_header(program, standalone_cfg())
+    let _ = find_at(text, "#ifndef {c_archive_header_guard()}")
+    let _ = find_at(text, "extern blink_Point origin;")
+    let _ = find_at(text, "} blink_Point;")
+    assert_lacks(text, "int main(int argc, char** argv)")
+    assert_lacks(text, "} blink_ev;")
+    let _ = find_at(text, "#endif")
+}
+
+// A module header is included by every other module's unit, so it too is declarations
+// only, under its own guard.
+test "a module header declares its module under its own guard" {
+    let program = probe_program("cg_unit_module_header_probe")
+    let text = generate_module_header(program, "__main__", standalone_cfg())
+    let _ = find_at(text, "#ifndef {c_module_header_guard(\"__main__\")}")
+    let _ = find_at(text, "extern blink_Point origin;")
+    assert_lacks(text, "int main(int argc, char** argv)")
+}
+
+fn stamp_module(sublist: Int, key: Str) {
+    if sublist == -1 { return }
+    let mut i = 0
+    while i < sublist_length(sublist) {
+        node_set_module(sublist_get(sublist, i), key)
+        i = i + 1
+    }
+}
+
+// Modules are emitted in the order they were first seen, which is dependency order. A
+// sorted list would put a module ahead of the one it depends on. Import resolution does
+// not run here, so the probe stamps the keys the merge step would have written.
+test "the module list keeps first-seen order" {
+    let program = probe_program("cg_unit_modules_probe")
+    stamp_module(node_stmts(program), "probe.later")
+    stamp_module(node_fields(program), "probe.earlier")
+    let modules = enumerate_program_modules(program)
+    assert_eq_int("module count", modules.len(), 2)
+    assert_eq(modules.get(0).unwrap(), "probe.earlier")
+    assert_eq(modules.get(1).unwrap(), "probe.later")
+}
+
+// The archive is one shared object for every program that links it, so a function whose
+// body reads the program's own evidence cannot live there. Those functions are compiled
+// into the user's translation unit instead, and the archive header must not declare
+// them: it does not even define the evidence vector type their signature names.
+fn effects_probe_src() -> Str {
+    #"type Unit { z: Int }
+
+trait Says { fn say(self) -> Int ! IO }
+
+impl Says for Unit {
+    fn say(self) -> Int ! IO { self.z }
+}
+
+trait Counts { fn count(self) -> Int }
+
+impl Counts for Unit {
+    fn count(self) -> Int { self.z }
+}
+
+fn pure_one(a: Int) -> Int { a }
+fn speaks(a: Int) -> Int ! IO { a }
+fn quiet() -> Handler[IO.Print] {
+    handler IO.Print {
+        fn print(msg: Str) {}
+    }
+}
+fn main() { assert(pure_one(1) == 1) }
+"#
+}
+
+fn effects_probe(name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    write_file(path, effects_probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    program
+}
+
+test "the archive header leaves out the functions the user unit owns" {
+    let program = effects_probe("cg_unit_archive_effects_probe")
+    let text = generate_archive_header(program, standalone_cfg())
+    let _ = find_at(text, "blink_u_pure_one")
+    assert_lacks(text, "blink_u_speaks")
+}
+
+// One archive serves many programs, each with its own entry point. The archive build
+// synthesizes a main just to pull every module into one unit, and that main must not
+// reach the header a user program includes.
+test "the archive header leaves out the entry point" {
+    let program = effects_probe("cg_unit_archive_main_probe")
+    let text = generate_archive_header(program, standalone_cfg())
+    assert_lacks(text, "blink_main")
+}
+
+// What keeps a function out of the shared archive is the evidence vector in its own
+// signature, which is what a declared effect puts there. A function that merely BUILDS a
+// handler declares no effect and takes no evidence, so the archive keeps it: it is the
+// only way a user program gets hold of the handler at all.
+test "the archive header keeps a function that returns a handler" {
+    let program = effects_probe("cg_unit_archive_handler_probe")
+    let text = generate_archive_header(program, standalone_cfg())
+    let _ = find_at(text, "blink_u_quiet")
+}
+
+// A user unit is linked against the archive, so it declares the archived modules rather
+// than compiling them again — except for the evidence-bound ones the archive could not
+// hold. Being archived is not reason enough to drop those: the user's unit is the only
+// place left that can compile them, and a unit that declares neither cannot link.
+fn user_tu_cfg(archived: Str) -> CgConfig {
+    let mut skip: Map[Str, Int] = Map()
+    skip.insert(archived, 1)
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: skip, user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+test "a user unit keeps the archived module's evidence-bound functions" {
+    let program = effects_probe("cg_unit_user_tu_keep_probe")
+    stamp_module(node_params(program), "probe_archived")
+    stamp_module(node_methods(program), "probe_archived")
+    let text = generate(program, user_tu_cfg("probe_archived"))
+    let _ = find_at(text, "blink_probe_archived_speaks")
+    assert_lacks(text, "blink_probe_archived_pure_one")
+}
+
+test "a user unit keeps the archived module's evidence-bound impl methods" {
+    let program = effects_probe("cg_unit_user_tu_keep_method_probe")
+    stamp_module(node_params(program), "probe_archived")
+    stamp_module(node_methods(program), "probe_archived")
+    let text = generate(program, user_tu_cfg("probe_archived"))
+    let _ = find_at(text, "_Unit_Says_say")
+    assert_lacks(text, "_Unit_Counts_count")
+}
