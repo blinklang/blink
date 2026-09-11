@@ -1,11 +1,383 @@
-// cg_derive.bl: @derive bodies and the kops tables they need.
+// cg_derive.bl: the method bodies @derive writes, and the key-operations tables a Map
+// or Set binds for a derived key.
 //
-// A stage of the tid-native emitter, not yet written. Its entry point reports I0004 and
-// returns, so the driver's diag_ice_count check turns a call into a loud failure rather
-// than a translation unit that is silently empty.
+// A derived method has no function declaration in the source, so this stage builds its
+// body as typed IR and hands it to the printer itself. Every type spelling comes from
+// layout_of and every symbol from cname; nothing here writes a C type.
+//
+// A field this stage cannot compare is an internal error, never a skipped field. The
+// pre-rewrite emitter dropped a field it had no rule for, which made two unequal values
+// answer equal: a wrong answer that compiles cleanly.
 
-import diagnostics.{Diag, diag_ice_stage_not_built}
+import diagnostics.{
+    Diag, diag_error_at, diag_ice_at, diag_ice_stage_not_built, UNKNOWN_DERIVE_NAME,
+    UNSOLVED_TYPEVAR_AT_CODEGEN,
+}
+import layout.{
+    LayoutRecord, Position, SlotForm, decl_derive_args, field_layout_of, layout_of,
+    tid_is_opaque_handle,
+}
+import cname.{
+    c_derive_method_name, c_field_name, c_runtime_helper, c_variant_tag_macro,
+}
+import cg_print.{print_fn, print_fn_decl}
+import cg_reg.{cg_reg_tid_for_decl, cg_reg_type_decls}
+import ir.{
+    ir_binary, ir_block, ir_call_direct, ir_call_runtime, ir_const, ir_field_get, ir_if,
+    ir_return, ir_switch, ir_unary, ir_var_ref,
+}
+import typecheck.{
+    DECL_NODE_AMBIGUOUS, TYPE_BOOL, TYPE_INT, TyKind, tc_enum_variant_slots,
+    tc_evar_field_slots, tc_evar_name, tc_evfield_name, tc_evfield_tid, tc_resolve,
+    tc_sfield_name, tc_sfield_tid, tc_struct_field_slots, tc_tid_decl_node, tc_tid_kind,
+    tk_name,
+}
+import parser.{node_name, node_fields, node_type_params, sublist_get, sublist_length}
 
-pub fn cg_derive_lower(type_decl: Int) ! Diag.Report {
-    diag_ice_stage_not_built("cg_derive", type_decl)
+// The two members a tagged enum's typedef declares. Member names, not type spellings;
+// the typedef emitter writes the same two names.
+let PAYLOAD_UNION = "data"
+let TAG_MEMBER = "tag"
+
+// The derive names, held as data so no branch here compares against a literal.
+let derive_eq = "Eq"
+let derive_ord = "Ord"
+
+// Every name @derive accepts. A name outside this set is the author's mistake; a name
+// inside it that this stage has not built is a compiler bug, so the two answer with
+// different diagnostics.
+fn known_derives() -> List[Str] {
+    ["Serialize", "Deserialize", derive_eq, derive_ord, "Clone", "Hash", "Debug"]
+}
+
+// A declaration may write the same derive twice, in one annotation or in two, so a pass
+// records the declarations it has answered. Keyed on the declaration rather than on the
+// symbol: two declarations that collided on one symbol would otherwise lose a body.
+let mut written: Map[Int, Int] = Map()
+
+pub fn cg_derive_reset() {
+    written = Map()
+}
+
+// ── The passes the driver runs ────────────────────────────────────────────
+
+// Every derived method, declared. A type declared after the type that compares it
+// would otherwise be called before the C compiler has seen its definition.
+pub fn cg_derive_emit_decls() ! Diag.Report {
+    derive_walk(false)
+}
+
+pub fn cg_derive_emit_bodies() ! Diag.Report {
+    derive_walk(true)
+}
+
+fn derive_walk(bodies: Bool) ! Diag.Report {
+    written = Map()
+    for decl in cg_reg_type_decls() {
+        for arg in decl_derive_args(decl) { derive_one(decl, arg, bodies) }
+    }
+}
+
+fn derive_one(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
+    let name = node_name(arg)
+    if !has_str(known_derives(), name) {
+        diag_error_at("UnknownDerive", UNKNOWN_DERIVE_NAME,
+            "unknown @derive name '{name}'; expected one of {known_derives().join(", ")}",
+            arg, "remove or replace this derive name")
+        return
+    }
+    if name == derive_eq { return eq_method(decl, arg, bodies) }
+    not_built(arg, "@derive({name})")
+}
+
+fn has_str(names: List[Str], want: Str) -> Bool {
+    for n in names { if n == want { return true } }
+    false
+}
+
+// ── Refusals ─────────────────────────────────────────────────────────────
+
+fn not_built(node: Int, what: Str) ! Diag.Report {
+    diag_ice_stage_not_built("cg_derive for {what}", node)
+}
+
+fn derive_ice(node: Int, message: Str) ! Diag.Report {
+    diag_ice_at("DeriveBodyNotBuildable", UNSOLVED_TYPEVAR_AT_CODEGEN, message, node,
+        "every type that reaches code generation must be concrete and nameable; this is a compiler bug")
+}
+
+// A declined layout has no spelling at all. Writing a default here would compile and
+// then get the comparison wrong at run time.
+fn spelling_or_ice(rec: LayoutRecord, what: Str, node: Int) -> Str ! Diag.Report {
+    let reason = rec.decline_reason
+    if reason == "" { return rec.c_spelling }
+    diag_ice_at("DeriveBodyNotBuildable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "no C spelling for {what}: {reason}", node,
+        "every type that reaches code generation must be concrete and nameable; this is a compiler bug")
+    ""
+}
+
+fn bool_spelling(node: Int) -> Str ! Diag.Report {
+    spelling_or_ice(layout_of(TYPE_BOOL, Position.Return), "Bool", node)
+}
+
+fn int_spelling(node: Int) -> Str ! Diag.Report {
+    spelling_or_ice(layout_of(TYPE_INT, Position.Field), "Int", node)
+}
+
+// ── Eq ───────────────────────────────────────────────────────────────────
+
+// Why this stage writes no comparison for a type, or "" when it writes one. The field
+// reader and the method writer both ask: a field's comparison calls the type's method,
+// and a call to a method nobody writes is an undefined symbol at link time.
+fn eq_refusal(decl: Int, tid: Int) -> Str {
+    if tid_is_opaque_handle(tid) {
+        return "@derive(Eq) on the opaque handle '{node_name(decl)}', which has no fields to compare"
+    }
+    let tparams = node_type_params(decl)
+    if tparams != -1 && sublist_length(tparams) > 0 {
+        return "@derive on the generic type '{node_name(decl)}'"
+    }
+    ""
+}
+
+fn eq_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
+    let tid = cg_reg_tid_for_decl(decl)
+    if tid < 0 { return derive_ice(arg, "type '{node_name(decl)}' reached cg_derive with no type id") }
+    if written.contains_key(decl) != 0 { return }
+    written.insert(decl, 1)
+    let refusal = eq_refusal(decl, tid)
+    if refusal != "" { return not_built(arg, refusal) }
+    let self_spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), arg)
+    let ret = bool_spelling(arg)
+    if self_spelling == "" || ret == "" { return }
+    let symbol = c_derive_method_name(decl, "eq")
+    let params = ["{self_spelling} self", "{self_spelling} other"]
+    if !bodies { return print_fn_decl(false, ret, symbol, params, false) }
+    let body = eq_body(decl, tid, arg)
+    if body < 0 { return }
+    print_fn(false, ret, symbol, params, false, body)
+}
+
+// A value layout gives as one word is its own whole value, so it compares as a word and
+// has no member to read: an ordinal enum and a transparent newtype both land here, and
+// asking layout is what keeps this stage from deciding the shape for itself.
+fn eq_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let rec = layout_of(tid, Position.Param)
+    if rec.slot_form == SlotForm.InlineWord { return eq_word_body(tid, span) }
+    let k = tc_tid_kind(tc_resolve(tid))
+    if k == TyKind.Struct { return eq_struct_body(decl, tid, span) }
+    if k == TyKind.Enum { return eq_enum_body(decl, tid, span) }
+    not_built(span, "@derive(Eq) on a {tk_name(k)} type")
+    -1
+}
+
+// Each field guards the answer: the first field that differs answers false, and
+// reaching the end means every field agreed.
+fn eq_struct_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let mut stmts: List[Int] = []
+    for slot in tc_struct_field_slots(tid) {
+        let guard = eq_guard(decl, tid, tc_sfield_tid(slot), c_field_name(tc_sfield_name(slot)), span)
+        if guard < 0 { return -1 }
+        stmts.push(guard)
+    }
+    let agreed = eq_answer(span, "1")
+    if agreed < 0 { return -1 }
+    stmts.push(agreed)
+    ir_block(span, stmts)
+}
+
+// An enum with a payload must agree on the tag before it reads the union: reading a
+// payload through the wrong variant is undefined.
+fn eq_enum_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let slots = tc_enum_variant_slots(tid)
+    if slots.len() == 0 {
+        derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
+        return -1
+    }
+    let ints = int_spelling(span)
+    let bools = bool_spelling(span)
+    if ints == "" || bools == "" { return -1 }
+    let self_tag = tag_ref(tid, "self", ints, span)
+    let other_tag = tag_ref(tid, "other", ints, span)
+    let switch_tag = tag_ref(tid, "self", ints, span)
+    let mismatch = eq_false_block(span)
+    let unknown = eq_false_block(span)
+    if self_tag < 0 || other_tag < 0 || switch_tag < 0 || mismatch < 0 || unknown < 0 { return -1 }
+    let differs = ir_binary(TYPE_BOOL, span, bools, "!=", self_tag, other_tag)
+    let guard = ir_if(span, differs, mismatch, -1)
+    let cases = eq_variant_cases(decl, tid, slots, ints, span)
+    if cases.len() == 0 { return -1 }
+    ir_block(span, [guard, ir_switch(span, switch_tag, cases, unknown)])
+}
+
+fn eq_word_body(tid: Int, span: Int) -> Int ! Diag.Report {
+    let bools = bool_spelling(span)
+    let lhs = self_ref(tid, "self", span)
+    let rhs = self_ref(tid, "other", span)
+    if bools == "" || lhs < 0 || rhs < 0 { return -1 }
+    ir_block(span, [ir_return(span, ir_binary(TYPE_BOOL, span, bools, "==", lhs, rhs))])
+}
+
+// One case per variant, as the switch kids alternate: the tag label, then the block
+// that compares that variant's payload. An empty answer means a refusal was recorded.
+fn eq_variant_cases(decl: Int, tid: Int, slots: List[Int], ints: Str, span: Int) -> List[Int] ! Diag.Report {
+    let mut cases: List[Int] = []
+    let mut i = 0
+    while i < slots.len() {
+        let slot = slots.get(i).unwrap()
+        let vnode = variant_node(decl, i)
+        if vnode < 0 {
+            derive_ice(span, "variant {i} of '{node_name(decl)}' has no declaration node")
+            return []
+        }
+        // The tag label comes from the declaration node and the payload from the
+        // registered entry. If the two orders ever diverged, both halves would move
+        // into the same wrong variant, which reads a payload through the wrong tag.
+        if tc_evar_name(slot) != node_name(vnode) {
+            derive_ice(span, "variant {i} of '{node_name(decl)}' is registered as '{tc_evar_name(slot)}' but declared as '{node_name(vnode)}'")
+            return []
+        }
+        let body = eq_variant_block(decl, tid, slot, span)
+        if body < 0 { return [] }
+        cases.push(ir_const(TYPE_INT, span, ints, c_variant_tag_macro(decl, vnode)))
+        cases.push(body)
+        i = i + 1
+    }
+    cases
+}
+
+fn eq_variant_block(decl: Int, tid: Int, slot: Int, span: Int) -> Int ! Diag.Report {
+    let vname = tc_evar_name(slot)
+    let mut stmts: List[Int] = []
+    for f in tc_evar_field_slots(slot) {
+        let path = "{PAYLOAD_UNION}.{vname}.{c_field_name(tc_evfield_name(f))}"
+        let guard = eq_guard(decl, tid, tc_evfield_tid(f), path, span)
+        if guard < 0 { return -1 }
+        stmts.push(guard)
+    }
+    let agreed = eq_answer(span, "1")
+    if agreed < 0 { return -1 }
+    stmts.push(agreed)
+    ir_block(span, stmts)
+}
+
+// A variant's declaration node, for the tag macro cname spells. The variant entries
+// typecheck registered are in declaration order, so they line up by index.
+fn variant_node(decl: Int, index: Int) -> Int {
+    let vars = node_fields(decl)
+    if vars == -1 || index >= sublist_length(vars) { return -1 }
+    sublist_get(vars, index)
+}
+
+// ── One field's comparison ───────────────────────────────────────────────
+
+fn eq_answer(span: Int, literal: Str) -> Int ! Diag.Report {
+    let bools = bool_spelling(span)
+    if bools == "" { return -1 }
+    ir_return(span, ir_const(TYPE_BOOL, span, bools, literal))
+}
+
+// What a guard runs when a comparison differs, and what the switch runs for a tag no
+// variant claims: both answer false.
+fn eq_false_block(span: Int) -> Int ! Diag.Report {
+    let answer = eq_answer(span, "0")
+    if answer < 0 { return -1 }
+    ir_block(span, [answer])
+}
+
+fn eq_guard(owner: Int, owner_tid: Int, ftid: Int, path: Str, span: Int) -> Int ! Diag.Report {
+    let differs = eq_differs(owner, owner_tid, ftid, path, span)
+    let answer = eq_false_block(span)
+    if differs < 0 || answer < 0 { return -1 }
+    ir_if(span, differs, answer, -1)
+}
+
+fn eq_differs(owner: Int, owner_tid: Int, ftid: Int, path: Str, span: Int) -> Int ! Diag.Report {
+    let frec = field_layout_of(owner, ftid)
+    let freason = frec.decline_reason
+    if freason != "" {
+        diag_ice_at("DeriveBodyNotBuildable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "no C spelling for field '{path}': {freason}", span,
+            "every type that reaches code generation must be concrete and nameable; this is a compiler bug")
+        return -1
+    }
+    if frec.slot_form == SlotForm.PointerBoxed {
+        not_built(span, "@derive(Eq) on the boxed field '{path}'")
+        return -1
+    }
+    let bools = bool_spelling(span)
+    if bools == "" { return -1 }
+    let lhs = field_ref(owner_tid, "self", ftid, frec, path, span)
+    let rhs = field_ref(owner_tid, "other", ftid, frec, path, span)
+    if lhs < 0 || rhs < 0 { return -1 }
+    let k = tc_tid_kind(tc_resolve(ftid))
+    // A Str is a pointer, so == would compare addresses rather than bytes.
+    if k == TyKind.Str {
+        return ir_unary(TYPE_BOOL, span, bools, "!",
+            ir_call_runtime(TYPE_BOOL, span, bools, c_runtime_helper("str_eq"),
+                SlotForm.InlineWord, [lhs, rhs]))
+    }
+    if eq_is_scalar(k) { return ir_binary(TYPE_BOOL, span, bools, "!=", lhs, rhs) }
+    if k == TyKind.Struct || k == TyKind.Enum {
+        return eq_nested_differs(ftid, lhs, rhs, bools, path, span)
+    }
+    not_built(span, "@derive(Eq) on the {tk_name(k)} field '{path}'")
+    -1
+}
+
+// A nested type is compared by its own derived method, so the comparison stays one
+// call deep however far the nesting goes.
+fn eq_nested_differs(ftid: Int, lhs: Int, rhs: Int, bools: Str, path: Str, span: Int) -> Int ! Diag.Report {
+    let fdecl = tc_tid_decl_node(ftid)
+    if fdecl < 0 || fdecl == DECL_NODE_AMBIGUOUS {
+        derive_ice(span, "field type {ftid} has no unambiguous declaration to compare through")
+        return -1
+    }
+    if !has_str(derive_names(fdecl), derive_eq) && !has_str(derive_names(fdecl), derive_ord) {
+        not_built(span, "@derive(Eq) on a field whose type '{node_name(fdecl)}' implements Eq by hand")
+        return -1
+    }
+    let refusal = eq_refusal(fdecl, ftid)
+    if refusal != "" {
+        not_built(span, "{refusal}, which the field '{path}' would have to call")
+        return -1
+    }
+    ir_unary(TYPE_BOOL, span, bools, "!",
+        ir_call_direct(TYPE_BOOL, span, bools, c_derive_method_name(fdecl, "eq"),
+            SlotForm.InlineWord, [lhs, rhs]))
+}
+
+fn derive_names(decl: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    for a in decl_derive_args(decl) { out.push(node_name(a)) }
+    out
+}
+
+fn self_ref(owner_tid: Int, name: Str, span: Int) -> Int ! Diag.Report {
+    let rec = layout_of(owner_tid, Position.Param)
+    let spelling = spelling_or_ice(rec, "the value being compared", span)
+    if spelling == "" { return -1 }
+    ir_var_ref(owner_tid, span, spelling, name, rec.slot_form)
+}
+
+fn tag_ref(owner_tid: Int, name: Str, ints: Str, span: Int) -> Int ! Diag.Report {
+    let base = self_ref(owner_tid, name, span)
+    if base < 0 { return -1 }
+    ir_field_get(TYPE_INT, span, ints, TAG_MEMBER, SlotForm.InlineWord, base)
+}
+
+fn field_ref(owner_tid: Int, name: Str, ftid: Int, frec: LayoutRecord, path: Str, span: Int) -> Int ! Diag.Report {
+    let base = self_ref(owner_tid, name, span)
+    if base < 0 { return -1 }
+    ir_field_get(ftid, span, frec.c_spelling, path, frec.slot_form, base)
+}
+
+// Float's == is a bit comparison, which is what a derived Eq promises; whether a Float
+// field may appear under a derive at all is typecheck's question, not this stage's.
+fn eq_is_scalar(k: TyKind) -> Bool {
+    if k == TyKind.Int || k == TyKind.Bool || k == TyKind.Char || k == TyKind.Float { return true }
+    if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return true }
+    if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return true }
+    false
 }

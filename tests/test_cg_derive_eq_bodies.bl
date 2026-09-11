@@ -1,0 +1,318 @@
+// The C a @derive(Eq) type gets: one comparison per declared field, read off the
+// declared shape and spelled by layout. A field kind this stage cannot compare is an
+// internal error, not a skipped field: skipping one makes two unequal values answer
+// equal, which is a wrong answer that compiles cleanly.
+
+import std.fs
+import std.io
+import typecheck.{check_types, tc_type_decl_nodes}
+import layout.{layout_reset, decl_derive_args, tid_is_opaque_handle}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build, cg_reg_tid_for_decl}
+import cg_derive.{cg_derive_reset, cg_derive_emit_decls, cg_derive_emit_bodies}
+import compiler.{compile_to_program}
+import parser.{node_name}
+import diagnostics.{diag_entries, diag_ice_count}
+
+// Point is compared by two scalars, Named by a string and a scalar, Pair by a nested
+// derived type and a bool, Color rides its tag alone, and Shape carries payloads.
+fn eq_src() -> Str {
+    #"@derive(Eq)
+type Point { x: Int, y: Int }
+@derive(Eq)
+type Named { name: Str, id: Int }
+@derive(Eq)
+type Pair { p: Point, flag: Bool }
+@derive(Eq)
+type Color { Red, Green, Blue }
+@derive(Eq)
+type Shape {
+    Circle(radius: Int)
+    Rect(w: Int, h: Int)
+}
+fn main() { }
+"#
+}
+
+// Compiling resets the diagnostic counters, so a test that counts what this stage
+// records must read the counters after the probe is built, never before it.
+fn program_of(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{stem}_probe_src.bl"
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_derive_reset()
+    program
+}
+
+fn bodies_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let _p = program_of(stem, src)
+    cg_derive_emit_bodies()
+    print_take()
+}
+
+fn decls_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let _p = program_of(stem, src)
+    cg_derive_emit_decls()
+    print_take()
+}
+
+// How many internal errors the body pass records for a probe, and nothing the compile
+// itself recorded.
+fn ices_of(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let _p = program_of(stem, src)
+    let before = diag_ice_count
+    cg_derive_emit_bodies()
+    diag_ice_count - before
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output still has '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+// The C of one function, from its opening line to the brace that closes it in column
+// zero. A needle checked against the whole unit would match another function's body.
+fn one_fn(text: Str, head: Str) -> Str {
+    let start = text.index_of(head)
+    if start < 0 { io.println("FAIL: output has no '{head}'\n--- output ---\n{text}") }
+    assert(start >= 0)
+    let rest = text.substring(start, text.len() - start)
+    let end = rest.index_of("\n}")
+    assert(end >= 0)
+    rest.substring(0, end)
+}
+
+test "a derived eq takes two values of its own type and answers an int" {
+    assert_has(bodies_of("cg_derive_eq", eq_src()), #"int blink_Point_eq(blink_Point self, blink_Point other) {"#)
+}
+
+test "a scalar field is compared with the C inequality operator" {
+    let text = one_fn(bodies_of("cg_derive_eq", eq_src()), "int blink_Point_eq")
+    assert_has(text, #"if ((self.x != other.x)) {"#)
+    assert_has(text, #"if ((self.y != other.y)) {"#)
+    assert_has(text, "return 0;")
+    assert_has(text, "return 1;")
+}
+
+// A Str is a pointer, so == would compare addresses. The runtime helper compares bytes.
+test "a string field is compared through the runtime helper" {
+    assert_has(bodies_of("cg_derive_eq", eq_src()), #"if ((!blink_str_eq(self.name, other.name))) {"#)
+}
+
+test "a bool field is compared with the inequality operator" {
+    assert_has(bodies_of("cg_derive_eq", eq_src()), #"if ((self.flag != other.flag)) {"#)
+}
+
+// A nested type that derives Eq itself is compared by calling its derived method, so
+// the comparison stays one call deep however far the nesting goes.
+test "a nested derived field is compared by calling the nested derived method" {
+    assert_has(bodies_of("cg_derive_eq", eq_src()), #"if ((!blink_Point_eq(self.p, other.p))) {"#)
+}
+
+// A payload-less enum is a C enum, so the ordinal is the whole value.
+test "a payload-less enum compares its whole value" {
+    let text = one_fn(bodies_of("cg_derive_eq", eq_src()), "int blink_Color_eq")
+    assert_has(text, #"int blink_Color_eq(blink_Color self, blink_Color other) {"#)
+    assert_has(text, "return (self == other);")
+    assert_lacks(text, "self.tag")
+}
+
+// A payload enum must agree on the variant before it reads a payload: reading the union
+// through the wrong variant is undefined.
+test "a payload enum compares the tag first, then the payload of the shared variant" {
+    let text = one_fn(bodies_of("cg_derive_eq", eq_src()), "int blink_Shape_eq")
+    assert_has(text, #"if ((self.tag != other.tag)) {"#)
+    assert_has(text, "blink_Shape_Circle_TAG")
+    assert_has(text, #"if ((self.data.Circle.radius != other.data.Circle.radius)) {"#)
+    assert_has(text, #"if ((self.data.Rect.w != other.data.Rect.w)) {"#)
+    assert_has(text, #"if ((self.data.Rect.h != other.data.Rect.h)) {"#)
+}
+
+// The declaration pass writes signatures only. The driver runs it before the body
+// pass so a type declared after the type that compares it is still declared first.
+test "the declaration pass writes a signature for every derived method and no body" {
+    let text = decls_of("cg_derive_eq_decls", eq_src())
+    assert_has(text, "int blink_Point_eq(blink_Point self, blink_Point other);")
+    assert_has(text, "int blink_Shape_eq(blink_Shape self, blink_Shape other);")
+    assert_lacks(text, "return 1;")
+}
+
+fn unknown_src() -> Str {
+    #"@derive(Eqq)
+type Thing { x: Int }
+fn main() { }
+"#
+}
+
+test "a derive name the compiler does not know is an error, not a silent skip" {
+    let _p = program_of("cg_derive_unknown", unknown_src())
+    let before = diag_entries.len()
+    cg_derive_emit_bodies()
+    let mut found = ""
+    let mut i = before
+    while i < diag_entries.len() {
+        let d = diag_entries.get(i).unwrap()
+        if d.code == "E1112" { found = d.name }
+        i = i + 1
+    }
+    assert_eq(found, "UnknownDerive")
+}
+
+fn unbuilt_src() -> Str {
+    #"@derive(Serialize)
+type Rec { x: Int }
+fn main() { }
+"#
+}
+
+// A derive this stage has not built reports an internal error. A body it wrote by
+// guessing would compile and then answer wrongly at run time.
+test "a derive this stage has not built reports an internal error" {
+    assert(ices_of("cg_derive_unbuilt", unbuilt_src()) > 0)
+}
+
+// A raw pointer field passes the front end's derive-field check, and no comparison of
+// one is a value comparison.
+fn unsupported_field_src() -> Str {
+    #"@derive(Eq)
+type Handle { raw: Ptr[U8] }
+fn main() { }
+"#
+}
+
+// The pre-rewrite emitter dropped a field it had no rule for, so two different values
+// answered equal. A field with no comparison is an internal error instead.
+test "a field kind with no comparison is an internal error, not a dropped field" {
+    assert(ices_of("cg_derive_unsupported", unsupported_field_src()) > 0)
+}
+
+// layout.bl owns the one reader of the @derive annotation, so the derive stage and
+// layout's own kops question ask the same nodes.
+test "the derive annotation reader answers every name written on a declaration" {
+    let program = program_of("cg_derive_reader", eq_src())
+    assert(program >= 0)
+    let names = derive_names_of(find_type_decl("Point"))
+    assert_eq(names.len(), 1)
+    assert_eq(names.get(0).unwrap(), "Eq")
+    assert_eq(derive_names_of(find_type_decl("Shape")).len(), 1)
+}
+
+fn find_type_decl(name: Str) -> Int {
+    let td = tc_type_decl_nodes.get(name) ?? -1
+    if td < 0 { io.println("FAIL: probe has no type '{name}'") }
+    assert(td >= 0)
+    td
+}
+
+fn derive_names_of(decl: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    for a in decl_derive_args(decl) { out.push(node_name(a)) }
+    out
+}
+
+// An @ffi.opaque handle is a pointer to a body this compiler cannot see. It has no
+// fields, so a field walk over it answers "every field agreed" and two distinct
+// handles compare equal.
+fn opaque_src() -> Str {
+    #"@derive(Eq)
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn main() { }
+"#
+}
+
+test "an opaque handle is refused, not compared as always equal" {
+    assert(ices_of("cg_derive_opaque", opaque_src()) > 0)
+    assert_lacks(bodies_of("cg_derive_opaque", opaque_src()), "_eq")
+}
+
+// A transparent newtype is a bare word, so its parameter has no tag member to read.
+fn newtype_src() -> Str {
+    #"@derive(Eq)
+type Errno { Errno(Int) }
+fn main() { }
+"#
+}
+
+test "a transparent newtype compares its word instead of reading a tag" {
+    let text = bodies_of("cg_derive_newtype", newtype_src())
+    assert_has(text, "return (self == other);")
+    assert_lacks(text, "self.tag")
+    assert_lacks(text, "self.data")
+}
+
+// A generic type gets one body per instance, which this stage has not built, so a
+// field of one must not be handed a call to a symbol nothing will define.
+fn generic_field_src() -> Str {
+    #"@derive(Eq)
+type Box[T] { v: T }
+@derive(Eq)
+type Holder { b: Box[Int], n: Int }
+fn main() { }
+"#
+}
+
+test "a field of a generic type gets no call to a body this stage will not write" {
+    assert(ices_of("cg_derive_generic_field", generic_field_src()) > 0)
+    assert_lacks(bodies_of("cg_derive_generic_field", generic_field_src()), "blink_Box_eq(")
+}
+
+// The tag label and the payload block are two adjacent switch kids. Swapping them by
+// one position reads every payload through the neighbouring variant, which is
+// undefined and which a presence-only assertion cannot see.
+test "each variant's payload is compared under that variant's own tag" {
+    let text = one_fn(bodies_of("cg_derive_eq", eq_src()), "int blink_Shape_eq")
+    let circle_tag = text.index_of("blink_Shape_Circle_TAG")
+    let circle_field = text.index_of("self.data.Circle.radius")
+    let rect_tag = text.index_of("blink_Shape_Rect_TAG")
+    let rect_field = text.index_of("self.data.Rect.w")
+    assert(circle_tag >= 0 && circle_field >= 0 && rect_tag >= 0 && rect_field >= 0)
+    assert(circle_tag < circle_field)
+    assert(circle_field < rect_tag)
+    assert(rect_tag < rect_field)
+}
+
+// Two names in one annotation and two annotations on one declaration are both legal
+// spellings, so the reader must answer every name from both.
+fn many_derives_src() -> Str {
+    #"@derive(Eq, Hash)
+@derive(Debug)
+type Many { x: Int }
+fn main() { }
+"#
+}
+
+test "the derive annotation reader answers names from every annotation on a declaration" {
+    let program = program_of("cg_derive_many", many_derives_src())
+    assert(program >= 0)
+    let names = derive_names_of(find_type_decl("Many"))
+    assert_eq(names.len(), 3)
+    assert_eq(names.get(0).unwrap(), "Eq")
+    assert_eq(names.get(1).unwrap(), "Hash")
+    assert_eq(names.get(2).unwrap(), "Debug")
+}
+
+// layout owns the opaque-handle question: the handle's word form is a layout fact, and
+// a second reader of the annotation would be free to disagree with it.
+test "layout answers whether a type id is an opaque handle" {
+    let program = program_of("cg_derive_opaque_query", opaque_src())
+    assert(program >= 0)
+    assert(tid_is_opaque_handle(cg_reg_tid_for_decl(find_type_decl("CFile"))))
+    let _q = program_of("cg_derive_opaque_query", eq_src())
+    assert(!tid_is_opaque_handle(cg_reg_tid_for_decl(find_type_decl("Point"))))
+}
