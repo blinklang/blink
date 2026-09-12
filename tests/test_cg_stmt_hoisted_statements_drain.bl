@@ -1,0 +1,176 @@
+// A statement whose value needed a temp must carry that temp's statements into the block,
+// in front of the statement that reads them.
+//
+// The expression stage cannot finish some values on its own: a coalesce, a short-circuit
+// arm, a `?`, an interpolation with a Bool hole, a carrier unwrap. Each declares a temp,
+// fills it with statements, and answers a read of that temp. Those statements go to a
+// buffer the expression stage holds. The block is the only place they can land, because a
+// C block is the only thing that holds a statement, so this stage has to take them.
+//
+// A block that does not take them still lowers, still verifies and still prints: the read
+// of the temp is a well formed node, and the verifier has no scope check to notice that
+// nothing declares the name. The C compiler is what finds it. So these tests read the
+// block and pin the order, and pin the buffer empty afterwards.
+
+import std.io
+import mono.{run_mono}
+import parser.{nodes, node_body, node_kind, node_name}
+import ast.{NodeKind}
+import diagnostics.{diag_reset}
+import layout.{layout_reset}
+import ir.{ir_reset}
+import cg_test_helpers.{cg_probe_compile}
+import cg_stmt.{cg_stmt_reset, lower_block, lower_fn}
+import cg_expr.{cg_expr_reset, cg_expr_pending_count}
+import lower_test_helpers.{shape, assert_eq_str, assert_ice_saying}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// Lowers one named function of a probe through the statement stage. Unlike the expression
+// tests, no binder is bound by hand: lower_fn opens the scopes and binds the names as it
+// walks, which is the behaviour under test.
+fn probe_fn(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", env.cwd())
+    let path = "build/{stem}_probe.bl"
+    let program = cg_probe_compile(path, src)
+    let _rm = process_run("rm", ["-f", path])
+    run_mono(program)
+    layout_reset()
+    ir_reset()
+    cg_expr_reset()
+    cg_stmt_reset()
+    let f = find_fn(name)
+    assert(f >= 0)
+    lower_fn(f)
+}
+
+// `??` is the shortest value that cannot be an expression in C. It binds the carrier,
+// declares a result temp, fills it from one arm or the other, and answers a read of it.
+fn src_coalesce_in_let() -> Str {
+    #"fn main() {
+    let opt: Option[Int] = None
+    let picked = opt ?? 7
+    let _keep = [picked]
+}
+"#
+}
+
+// The three statements between the two `Let`s are the coalesce's own: it binds the
+// carrier, declares a result temp with no value, and fills the temp from one arm or the
+// other. `let picked` then reads that temp, so all three stand in front of it.
+test "the statements a coalesce hoisted land in the block in front of its let" {
+    let body = probe_fn("cg_stmt_drain_coalesce", src_coalesce_in_let(), "main")
+    let want = "Block(Let(CarrierWrap(Const)), Let(VarRef), Let, If(Binary(CarrierTag(VarRef), Const), Block(Assign(VarRef, CarrierUnwrap(VarRef))), Block(Assign(VarRef, Const))), Let(VarRef), Let(ContainerNew(VarRef)))"
+    assert_eq_str("block shape", shape(body), want)
+}
+
+// This proves only that nothing is left over, which is what keeps one statement's temps
+// out of the next statement's block. That the statements reached the tree is the test
+// above; a drain that took them and dropped them would pass this one.
+test "the buffer is empty once the body is lowered" {
+    let _body = probe_fn("cg_stmt_drain_empty", src_coalesce_in_let(), "main")
+    assert_eq_str("statements left", "{cg_expr_pending_count()}", "0")
+}
+
+// `?` returns the enclosing function's carrier on the failure arm. The expression stage
+// lowers `?` and reads no function of its own, so the statement stage has to hand it the
+// return type. Without that hand-off `?` refuses and this body is empty.
+fn src_try_in_carrier_fn() -> Str {
+    #"fn pick(o: Option[Int]) -> Option[Int] {
+    let v = o?
+    Some(v + 1)
+}
+"#
+}
+
+test "a `?` lowers because the statement stage handed over the return type" {
+    let body = probe_fn("cg_stmt_try_return_type", src_try_in_carrier_fn(), "pick")
+    let want = "Block(Let(VarRef), If(Binary(CarrierTag(VarRef), Const), Block(Return(CarrierWrap(Const)))), Let(CarrierUnwrap(VarRef)), Return(CarrierWrap(Const, Binary(VarRef, Const))))"
+    assert_eq_str("try shape", shape(body), want)
+}
+
+// Two places read a value more than once, or read it only on one path, so a statement the
+// value needed cannot stand in the enclosing block. Each refuses by name until it gets a
+// lowering of its own. The body block is lowered directly here because lower_fn answers an
+// empty block on a stop, which would hide the refusal these tests are about.
+fn probe_body(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", env.cwd())
+    let path = "build/{stem}_probe.bl"
+    let program = cg_probe_compile(path, src)
+    let _rm = process_run("rm", ["-f", path])
+    run_mono(program)
+    layout_reset()
+    ir_reset()
+    cg_expr_reset()
+    cg_stmt_reset()
+    diag_reset()
+    let f = find_fn(name)
+    assert(f >= 0)
+    lower_block(node_body(f))
+}
+
+fn src_hoisting_loop_test() -> Str {
+    #"fn main() {
+    let opt: Option[Bool] = None
+    let mut n = 0
+    while (opt ?? false) {
+        n = n + 1
+    }
+    let _keep = [n]
+}
+"#
+}
+
+fn src_hoisting_match_guard() -> Str {
+    #"fn main() {
+    let opt: Option[Bool] = None
+    let v: Option[Int] = Some(1)
+    let mut n = 0
+    match v {
+        Some(x) if (opt ?? false) => { n = x }
+        _ => { n = 0 }
+    }
+    let _keep = [n]
+}
+"#
+}
+
+// A braceless arm body is one statement, not a block, so it takes the other path into the
+// block builder. That path has to drain too, and it is the only one with nowhere else to
+// put the statements: the arm's block is built for this one statement.
+fn src_coalesce_in_braceless_arm() -> Str {
+    #"fn main() {
+    let opt: Option[Int] = None
+    let v: Option[Int] = Some(1)
+    let mut n = 0
+    match v {
+        Some(_x) => n = opt ?? 7
+        None => n = 0
+    }
+    let _keep = [n]
+}
+"#
+}
+
+test "the statements a braceless arm body hoisted land in that arm's own block" {
+    let body = probe_fn("cg_stmt_drain_arm", src_coalesce_in_braceless_arm(), "main")
+    let want = "Block(Let(CarrierWrap(Const)), Let(CarrierWrap(Const, Const)), Let(Const), Block(Let(VarRef), Switch(CarrierTag(VarRef), Const, Block(Let(CarrierUnwrap(VarRef)), Block(Let(VarRef), Let, If(Binary(CarrierTag(VarRef), Const), Block(Assign(VarRef, CarrierUnwrap(VarRef))), Block(Assign(VarRef, Const))), Assign(VarRef, VarRef))), Const, Block(Block(Assign(VarRef, Const))))), Let(ContainerNew(VarRef)))"
+    assert_eq_str("arm shape", shape(body), want)
+}
+
+test "a loop test that needs a statement refuses instead of hoisting above the loop" {
+    let got = probe_body("cg_stmt_loop_test_hoist", src_hoisting_loop_test(), "main")
+    assert_ice_saying("loop test", got, "HoistOutOfLoopTest", "run once instead of each turn")
+}
+
+test "a match guard that needs a statement refuses instead of hoisting above the match" {
+    let got = probe_body("cg_stmt_match_guard_hoist", src_hoisting_match_guard(), "main")
+    assert_ice_saying("match guard", got, "HoistOutOfMatchGuard", "run for arms that never match")
+}
