@@ -1,0 +1,184 @@
+// Which body a method call reaches. The mono pass writes one body per element for the
+// impls it registers instances of, and one shared body for an impl whose C is the same
+// whatever the element is. A call has to name the body that was actually written, so it
+// asks the same producer the body stage asked rather than re-deciding from the binders:
+// an impl header carries `[T]` in both cases, so the binders cannot tell them apart.
+
+import lower_test_helpers.{
+    probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
+    assert_ice_saying,
+}
+import ir.{IrKind, ir_c_name}
+import cg_call.{lower_call}
+import mono.{run_mono, instances}
+
+// An impl over `List[T]` that names T nowhere in a signature. Its C reads no element, so
+// one body serves every element and the mono pass registers no instance of it.
+fn src_shared() -> Str {
+    #"trait Tally { fn tally_from(self, base: Int, step: Int) -> Int }
+
+impl[T] Tally for List[T] {
+    fn tally_from(self, base: Int, step: Int) -> Int { base + step }
+}
+
+fn main() {
+    let xs = [1, 2, 3]
+    let counted = xs.tally_from(4, 5)
+    let _keep = counted
+}
+"#
+}
+
+// The same header, but the method signature names T, so the C differs per element and the
+// mono pass writes one body for each element the program asks for.
+fn src_per_element() -> Str {
+    #"trait Held[T] { fn first_or(self, d: T) -> T }
+
+impl[T] Held[T] for List[T] {
+    fn first_or(self, d: T) -> T { d }
+}
+
+fn main() {
+    let xs = [1, 2, 3]
+    let held = xs.first_or(9)
+    let _keep = held
+}
+"#
+}
+
+// A generic free function: a template with no C name until an argument is chosen.
+fn src_generic_free() -> Str {
+    #"fn echo[E](e: E) -> E { e }
+
+fn main() {
+    let kept = echo(3)
+    let _keep = kept
+}
+"#
+}
+
+// The same element-agnostic impl, in a program that also declares a type called `List`.
+// Both receivers are written, because the header answers for one of them and not the other.
+fn src_namesake() -> Str {
+    #"type List { n: Int }
+
+trait Tally { fn tally_from(self, base: Int) -> Int }
+
+impl[T] Tally for List[T] {
+    fn tally_from(self, base: Int) -> Int { base }
+}
+
+fn main() {
+    let ys = [1, 2, 3]
+    let tallied = ys.tally_from(4)
+    let p = List { n: 1 }
+    let shadowed = p.tally_from(5)
+    let _keep = [tallied, shadowed]
+}
+"#
+}
+
+// A plain impl over a plain type: one body under the declaration's own name, which is the
+// case that already worked and must keep working.
+fn src_concrete() -> Str {
+    #"type Plain { n: Int }
+
+trait Flat { fn flat(self, k: Int) -> Int }
+
+impl Flat for Plain {
+    fn flat(self, k: Int) -> Int { self.n + k }
+}
+
+fn main() {
+    let p = Plain { n: 1 }
+    let flat = p.flat(2)
+    let _keep = flat
+}
+"#
+}
+
+test "an element-agnostic container method reaches the one body every element shares" {
+    let program = probe("cg_call_shared", src_shared())
+    run_mono(program)
+    let id = lower_call(rhs_of("counted"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_eq_str("symbol", ir_c_name(id), "blink_List_Tally_tally_from")
+    assert_verifies("verify", id)
+}
+
+test "a container method call carries the receiver and every argument written" {
+    let program = probe("cg_call_shared_args", src_shared())
+    run_mono(program)
+    let id = lower_call(rhs_of("counted"))
+    assert_shape("shape", id, "CallDirect(VarRef, Const, Const)")
+}
+
+// A per-element body exists, but the call that asked for it is not filed against it: the
+// pass registers the instance from the receiver and drops the index instead of recording
+// which call site reached it. So the call has an instance to name and no way to find it.
+//
+// This is the whole of what still stands between a per-element method and its body. The
+// day the pass files the call site, the refusal below stops being recorded and this test
+// goes red, which is how the call side gets revisited rather than left asking.
+test "a per-element body is written but the call site that asked for it is not filed" {
+    let program = probe("cg_call_per_element", src_per_element())
+    run_mono(program)
+    assert_eq_str("body written", instance_named("blink_List_1Held_1first_1or_0Int"),
+        "blink_List_1Held_1first_1or_0Int")
+    assert_ice_saying("call unfiled", lower_call(rhs_of("held")),
+        "MonoInstanceNotRegistered", "has no monomorphised instance here")
+}
+
+// A free function reads the same producer, so the refactor that gave methods their answer
+// has to leave the free side naming its instance rather than its template.
+test "a generic free function call names the instance the pass registered for it" {
+    let program = probe("cg_call_generic_free", src_generic_free())
+    run_mono(program)
+    let id = lower_call(rhs_of("kept"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_eq_str("body written", instance_named("blink_echo_0Int"), "blink_echo_0Int")
+    assert_eq_str("symbol", ir_c_name(id), "blink_echo_0Int")
+    assert_verifies("verify", id)
+}
+
+// The c_name of the registered instance, or "". Read by name rather than by index so the
+// claim is about the body that was written and not about how many others were.
+fn instance_named(c_name: Str) -> Str {
+    for inst in instances() {
+        if inst.c_name == c_name { return inst.c_name }
+    }
+    ""
+}
+
+// `impl[T] Tally for List[T]` extends the container whether or not the program declares a
+// type under that name: an impl header resolves its receiver to the builtin first, and the
+// front end refuses a generic impl over a declared type outright. So the declaration takes
+// nothing away from the container, and the call still reaches the body written for it.
+test "a container method reaches its body while a namesake declaration shares the name" {
+    let program = probe("cg_call_namesake", src_namesake())
+    run_mono(program)
+    let id = lower_call(rhs_of("tallied"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_eq_str("symbol", ir_c_name(id), "blink_List_Tally_tally_from")
+    assert_verifies("verify", id)
+}
+
+// The other half of the same header, and the one that has to refuse: the declaration named
+// `List` has no impl of its own, and the container's body reads a list. Calling it with a
+// struct would compile C that reads the wrong bytes, so the call is refused instead.
+test "a declaration sharing a container's name does not inherit the container's impl" {
+    let program = probe("cg_call_shadowed", src_namesake())
+    run_mono(program)
+    assert_ice_saying("shadowed", lower_call(rhs_of("shadowed")),
+        "CodegenStageNotBuilt", "cg_call builtin and trait-object methods")
+}
+
+test "a plain impl method still reaches the body under its own name" {
+    let program = probe("cg_call_concrete", src_concrete())
+    run_mono(program)
+    let id = lower_call(rhs_of("flat"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_eq_str("symbol", ir_c_name(id), "blink_Plain_Flat_flat")
+    assert_shape("shape", id, "CallDirect(VarRef, Const)")
+    assert_verifies("verify", id)
+}
