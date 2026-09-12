@@ -8902,10 +8902,14 @@ pub fn tc_qualifier_to_module_or_self(qualifier: Str) -> Str {
 fn nr_check_selective_access(name: Str, node: Int) -> Int ! Diag.Report {
     if nr_current_module == "" { return 0 }
     if is_builtin_name(name) != 0 { return 0 }
+    if nr_module_declares(nr_current_module, name) != 0 { return 0 }
     let source_mod = match tc_symbol_module.get(name) {
         Some(v) => v
         None => return 0
     }
+    // A private declaration cannot be selected or qualified, so the import list is not the
+    // fix; the private-access check names the real problem.
+    if nr_is_private_in(name, source_mod) != 0 { return 0 }
     if is_filtered_for_module(name, source_mod, nr_current_module) != 0 {
         let display_mod = tc_qualifier_for_module(source_mod)
         if node == -1 {
@@ -8923,6 +8927,26 @@ fn nr_check_selective_access(name: Str, node: Int) -> Int ! Diag.Report {
 let mut nr_private_imports: Map[Str, Str] = Map()
 let mut nr_current_module: Str = ""
 let mut nr_name_source_module: Map[Str, Str] = Map()
+// Every top-level declaration, keyed "module|name". A module's own declaration is what its
+// bare name means, whatever other loaded modules declare under the same spelling.
+let mut nr_module_decls: Map[Str, Int] = Map()
+
+fn nr_record_decl(name: Str, mod_name: Str) {
+    nr_module_decls.insert("{mod_name}|{name}", 1)
+}
+
+fn nr_module_declares(mod_name: Str, name: Str) -> Int {
+    if nr_module_decls.contains_key("{mod_name}|{name}") { 1 } else { 0 }
+}
+
+// True when `name` is declared in `source_mod` without a pub declaration anywhere, so no
+// import can select it and no qualifier can reach it.
+fn nr_is_private_in(name: Str, source_mod: Str) -> Int {
+    match nr_private_imports.get(name) {
+        Some(mods) => if mods.contains("|{source_mod}|") != 0 { 1 } else { 0 }
+        None => 0
+    }
+}
 
 fn nr_check_ambiguity(name: Str, mod_name: Str, local_names: Map[Str, Int]) ! Diag.Report {
     if mod_name == "" || mod_name == "__main__" { return }
@@ -10341,6 +10365,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     nr_bh_context = Map()
     nr_private_imports = Map()
     nr_name_source_module = Map()
+    nr_module_decls = Map()
     nr_push_scope()
 
     // Build private import set: imported non-pub fns, types, lets
@@ -10416,6 +10441,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             let fn_node = sublist_get(fns_sl_priv, i)
             let fn_name = node_name(fn_node)
             let mod_name = node_module(fn_node)
+            nr_record_decl(fn_name, mod_name)
             if mod_name != "" && node_is_pub(fn_node) == 0 && nr_pub_names.contains_key(fn_name) == 0 {
                 nr_register_private(fn_name, mod_name)
             }
@@ -10428,6 +10454,17 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             let td = sublist_get(types_sl_priv, i)
             let td_name = node_name(td)
             let mod_name = node_module(td)
+            nr_record_decl(td_name, mod_name)
+            let all_flds = node_fields(td)
+            if all_flds != -1 && sublist_length(all_flds) > 0 {
+                if node_kind(sublist_get(all_flds, 0)) == NodeKind.TypeVariant {
+                    let mut vi = 0
+                    while vi < sublist_length(all_flds) {
+                        nr_record_decl(node_name(sublist_get(all_flds, vi)), mod_name)
+                        vi = vi + 1
+                    }
+                }
+            }
             if mod_name != "" && node_is_pub(td) == 0 && nr_pub_names.contains_key(td_name) == 0 {
                 nr_register_private(td_name, mod_name)
                 let td_flds = node_fields(td)
@@ -10457,6 +10494,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             let tr = sublist_get(traits_sl_priv, i)
             let tr_name = node_name(tr)
             let mod_name = node_module(tr)
+            nr_record_decl(tr_name, mod_name)
             if mod_name != "" && node_is_pub(tr) == 0 && nr_pub_names.contains_key(tr_name) == 0 {
                 nr_register_private(tr_name, mod_name)
             }
@@ -10469,6 +10507,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             let l = sublist_get(lets_sl_priv, i)
             let l_name = node_name(l)
             let mod_name = node_module(l)
+            nr_record_decl(l_name, mod_name)
             if mod_name != "" && node_is_pub(l) == 0 && nr_pub_names.contains_key(l_name) == 0 {
                 nr_register_private(l_name, mod_name)
             }
