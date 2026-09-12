@@ -1,13 +1,18 @@
-// A refusal in this stage must build no IR node. An operand built for an
-// expression that then refuses has no parent, and the printer walks what the unit holds
-// rather than what the lowering answered, so that operand becomes emitted C for an
-// expression nothing lowered. Each test pins the node count as well as the refusal,
-// because a refusal that reports correctly and still strands a node is identical from the
-// answer alone.
+// A refusal in this stage must leave behind neither a built node nor a hoisted statement.
+//
+// The two cost different things. The printer reaches a node only by following the kids of a
+// root it is given, so a node with no parent is dead weight in the arena and is never
+// printed; the count is pinned because it is the cheapest proof that the seam resolved
+// before it lowered, which is the rule these seams follow. A hoisted statement is the one
+// that reaches emitted C: the pending buffer is spliced into the enclosing block whole, so a
+// statement left in it runs for an expression nothing lowered.
+//
+// Each test pins a count as well as the refusal, because a refusal that reports correctly
+// and still leaves something behind is identical from the answer alone.
 
 import lower_test_helpers.{probe, probe_but, rhs_of, assert_ice_saying, assert_eq_str}
 import ir.{ir_node_count}
-import cg_expr.{lower_expr}
+import cg_expr.{lower_expr, cg_expr_pending_count}
 
 // An ordering operator over a struct. `@derive(Ord)` is what makes this a program:
 // typecheck accepts `<` on the pair, and the operator seam then has no ordering lowering
@@ -64,6 +69,31 @@ fn main() {
 "#
 }
 
+// One string with a Bool hole in front of a hole that refuses. A Bool hole has no printf
+// conversion, so it becomes a Str temp that an `if` fills, and that `if` goes to the pending
+// buffer. The second hole then refuses and the whole call answers nothing. The buffer is
+// spliced into the enclosing block, so a statement left in it is emitted C for an
+// expression nothing lowered.
+fn src_hoisting_hole_before_refusal() -> Str {
+    #"type Wrapped { n: Int }
+
+impl Display for Wrapped {
+    fn fmt(self, sb: StringBuilder) { sb.write("a") }
+}
+
+impl Display for Wrapped {
+    fn fmt(_self, sb2: StringBuilder) { sb2.write("b") }
+}
+
+fn main() {
+    let flag = true
+    let w = Wrapped { n: 1 }
+    let text = "{flag} {w}"
+    let _keep = [text]
+}
+"#
+}
+
 test "a refused ordering operator leaves neither of its operands in the unit" {
     probe("cg_expr_orphan_ordering", src_ordering())
     let before = ir_node_count()
@@ -88,4 +118,12 @@ test "a refused display hole leaves the value it would have shown out of the uni
     assert_ice_saying("ambiguous display", lower_expr(rhs_of("text")),
         "ImplAmbiguous", "more than one impl over Struct declares the trait 'Display'")
     assert_eq_str("nodes built", "{ir_node_count() - before}", "0")
+}
+
+test "a refused interpolation leaves no statement its earlier holes hoisted" {
+    probe("cg_expr_orphan_interp", src_hoisting_hole_before_refusal())
+    let before = cg_expr_pending_count()
+    assert_ice_saying("ambiguous display", lower_expr(rhs_of("text")),
+        "ImplAmbiguous", "more than one impl over Struct declares the trait 'Display'")
+    assert_eq_str("statements hoisted", "{cg_expr_pending_count() - before}", "0")
 }
