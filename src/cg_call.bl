@@ -20,7 +20,7 @@
 import parser.{
     node_kind, node_name, node_left, node_right, node_obj, node_index, node_method, node_args,
     node_methods, node_trait_name, node_impl_binders, node_type_params,
-    node_module, node_source_module,
+    node_module, node_source_module, node_params,
     sublist_get, sublist_length,
 }
 import ast.{NodeKind, nk_of, node_kind_name}
@@ -790,12 +790,17 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if role == Receiver.TypeOwner { return lower_static_call(node, obj) }
     let recv_tid = tid_of_node(obj)
     if recv_tid < 0 { return -1 }
-    let im = cc_impl_with_method(node, recv_tid, node_method(node))
+    let kind = cc_kind(recv_tid)
+    let mname = node_method(node)
+    // The intrinsic table is read BEFORE the impls, because that is the order typecheck
+    // reads the same two in (src/typecheck.bl:14382): a builtin method wins over a
+    // same-named user impl. Reading them the other way round here would emit the impl
+    // method for a call typecheck had already typed as the stdlib function.
+    let declared = cc_intrinsic_callee(node, kind, mname)
+    if declared != "" { return lower_intrinsic_method(node, obj, kind, mname, declared) }
+    let im = cc_impl_with_method(node, recv_tid, mname)
     if im == IMPL_REFUSED { return -1 }
-    if im < 0 {
-        diag_ice_stage_not_built("cg_call builtin and trait-object methods", node)
-        return -1
-    }
+    if im < 0 { return cc_intrinsic_not_built(node, kind, mname) }
     let method = cc_method_of(im, node_method(node))
     if method < 0 { return -1 }
     if cg_decl_takes_ev(method) {
@@ -805,6 +810,206 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let symbol = cc_call_symbol(node, method, c_impl_method_name(im, node_method(node)))
     if symbol == "" { return -1 }
     cc_build_call(node, symbol, obj, CallForm.Declared)
+}
+
+// ── Intrinsic methods ─────────────────────────────────────────────────────
+//
+// A method of a builtin receiver that no program declares a body for. The sealed ops
+// traits in lib/std/traits.bl declare these and nothing implements them, by design, so
+// the impl path can never resolve one: the compiler knows what each means. Typecheck
+// knows the same thing from a table of the same shape (tc_ops_trait_qualified_ret), and
+// the two tables must name the same declaration for every pair, because a call typed as
+// one function and emitted as another is the failure this stage exists to exclude. That
+// is also why this table is read BEFORE the impls, as typecheck reads its twin.
+//
+// The table answers with a DECLARATION NAME, never a C symbol. Every callee then spells
+// its own name: a function written in Blink carries the module it was written in, and a
+// foreign binding carries the symbol its annotation gives, which its Blink name does not
+// always spell. Naming symbols here would repeat both rules and could disagree with them.
+fn lower_intrinsic_method(node: Int, obj: Int, kind: TyKind, method: Str, declared: Str) -> Int ! Diag.Report {
+    let decl = cc_stdlib_fn_named(node, declared)
+    if decl == DECL_REFUSED { return -1 }
+    if decl < 0 { return cc_intrinsic_undeclared(node, kind, method, declared) }
+    if cg_decl_takes_ev(decl) {
+        cc_ev_not_in_ir(node)
+        return -1
+    }
+    // The receiver is the declaration's first parameter, so the method takes one fewer
+    // argument than the function does. Typecheck checks the arity of a few of these and
+    // not the rest, so the check is made here rather than assumed: a call built from the
+    // wrong count reaches the C compiler with no Blink span on the error.
+    let want = sublist_length(node_params(decl)) - 1
+    let given = sublist_length(node_args(node))
+    if want != given { return cc_intrinsic_arity_wrong(node, kind, method, want, given) }
+    let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
+    if symbol == "" { return -1 }
+    cc_build_call(node, symbol, obj, CallForm.Declared)
+}
+
+// The declaration each intrinsic means, keyed on what the receiver IS and what the method
+// is called. "" for a pair this stage does not own.
+fn cc_intrinsic_callee(node: Int, kind: TyKind, method: Str) -> Str ! Diag.Report {
+    if kind == TyKind.Str { return cc_str_intrinsic(method) }
+    if kind == TyKind.Bytes { return cc_bytes_intrinsic(method) }
+    if kind == TyKind.StringBuilder { return cc_sb_intrinsic(node, method) }
+    ""
+}
+
+// `len` and `is_empty` are absent on purpose: a real `impl Sized for Str` answers both,
+// and this table declining is what lets the impl path answer them. `substring` and
+// `substr` are two spellings of one function, and `to_int` and `parse_int` likewise,
+// exactly as typecheck has them. `as_cstr` is absent because no stdlib function answers
+// it: the pointer it hands back is made by codegen, not by a call.
+fn cc_str_intrinsic(method: Str) -> Str {
+    if method == "byte_at" { return "str_char_at" }
+    if method == "char_at" { return "str_char_at_opt" }
+    if method == "contains" { return "str_contains" }
+    if method == "starts_with" { return "str_starts_with" }
+    if method == "ends_with" { return "str_ends_with" }
+    if method == "index_of" { return "str_index_of" }
+    if method == "substring" || method == "substr" { return "str_substr" }
+    if method == "slice" { return "str_slice" }
+    if method == "concat" { return "str_concat" }
+    if method == "trim" { return "str_trim" }
+    if method == "trim_left" { return "str_trim_left" }
+    if method == "trim_right" { return "str_trim_right" }
+    if method == "to_upper" { return "str_to_upper" }
+    if method == "to_lower" { return "str_to_lower" }
+    if method == "replace" { return "str_replace" }
+    if method == "split" { return "str_split" }
+    if method == "lines" { return "str_lines" }
+    if method == "to_int" || method == "parse_int" { return "parse_int" }
+    if method == "parse_float" { return "parse_float" }
+    ""
+}
+
+// `get` reads through the checked wrapper rather than the raw binding beside it, because
+// the method answers an Option and the raw binding answers a bare Int. `with_ptr` is
+// absent because it hands its body a pointer into the buffer, which is a block and not a
+// call. `len` and `is_empty` are answered by a real impl, as they are for Str.
+fn cc_bytes_intrinsic(method: Str) -> Str {
+    if method == "get" { return "bytes_get_opt" }
+    if method == "push" { return "bytes_push" }
+    if method == "set" { return "bytes_set" }
+    if method == "slice" { return "bytes_slice" }
+    if method == "concat" { return "bytes_concat" }
+    if method == "to_hex" { return "bytes_to_hex" }
+    if method == "to_str" { return "bytes_to_str_result" }
+    if cc_bytes_offset_method(method) { return "bytes_{method}" }
+    ""
+}
+
+// The three Bytes offset families, each declared under the method's own name. The names
+// are written out rather than matched by prefix and width: typecheck names exactly these
+// and no others, and a rule that admits more than a list admits cannot be held level
+// with the list as either side grows.
+fn cc_bytes_offset_method(method: Str) -> Bool {
+    if cc_bytes_read_method(method) { return true }
+    if cc_bytes_write_method(method) { return true }
+    cc_bytes_set_method(method)
+}
+
+fn cc_bytes_read_method(method: Str) -> Bool {
+    if method == "read_u16_be" || method == "read_u32_be" || method == "read_i32_be" || method == "read_i64_be" { return true }
+    if method == "read_u16_le" || method == "read_u32_le" || method == "read_i32_le" || method == "read_i64_le" { return true }
+    false
+}
+
+fn cc_bytes_write_method(method: Str) -> Bool {
+    if method == "write_u16_be" || method == "write_u32_be" || method == "write_i32_be" || method == "write_i64_be" { return true }
+    if method == "write_u16_le" || method == "write_u32_le" || method == "write_i32_le" || method == "write_i64_le" { return true }
+    false
+}
+
+fn cc_bytes_set_method(method: Str) -> Bool {
+    if method == "set_u16_be" || method == "set_u32_be" || method == "set_u64_be" { return true }
+    if method == "set_i16_be" || method == "set_i32_be" || method == "set_i64_be" { return true }
+    if method == "set_u16_le" || method == "set_u32_le" || method == "set_u64_le" { return true }
+    if method == "set_i16_le" || method == "set_i32_le" || method == "set_i64_le" { return true }
+    false
+}
+
+// `write_char` is absent: its binding takes a Str where the method takes a Char, so the
+// call needs a conversion between the two and is not one plain call. `len` and `is_empty`
+// are answered by a real impl, as they are for Str.
+fn cc_sb_intrinsic(node: Int, method: Str) -> Str ! Diag.Report {
+    if method == "write" { return cc_sb_write_callee(node) }
+    if method == "to_str" { return "sb_to_str" }
+    if method == "capacity" { return "sb_capacity" }
+    if method == "clear" { return "sb_clear" }
+    ""
+}
+
+// Which of the four write bindings a `write` means. Typecheck leaves the argument of this
+// one method unconstrained and records that codegen picks the binding from what the
+// argument IS, so this is the only row keyed on an argument rather than on the method
+// name. Each binding takes one type and no other, so naming the wrong one hands the C
+// compiler a value of a type its parameter cannot hold.
+fn cc_sb_write_callee(node: Int) -> Str ! Diag.Report {
+    let args = node_args(node)
+    if sublist_length(args) != 1 { return "sb_write" }
+    let arg_tid = tid_of_node(sublist_get(args, 0))
+    if arg_tid < 0 { return "sb_write" }
+    let k = cc_kind(arg_tid)
+    if k == TyKind.Int { return "sb_write_int" }
+    if k == TyKind.Float { return "sb_write_float" }
+    if k == TyKind.Bool { return "sb_write_bool" }
+    if k == TyKind.Str { return "sb_write" }
+    ""
+}
+
+// The declaration an intrinsic names. The search is over the stdlib alone: an intrinsic
+// means the function the language publishes under that name, so a program that writes its
+// own function of the same name must not take it over. Every module this table reaches is
+// in the prelude, so the declaration is registered whether the program imports it or not.
+fn cc_stdlib_fn_named(node: Int, name: Str) -> Int ! Diag.Report {
+    let mut found = -1
+    let mut clashes = 0
+    for f in cg_reg_fn_decls() {
+        if node_name(f) != name { continue }
+        if !cc_is_stdlib_module(node_source_module(f)) { continue }
+        if found >= 0 { clashes = clashes + 1 }
+        found = f
+    }
+    if clashes == 0 { return found }
+    diag_ice_at("IntrinsicCalleeAmbiguous", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "the stdlib declares '{name}' in more than one module, so the intrinsic names neither", node,
+        "an intrinsic must name one declaration; the stdlib has to keep these names apart")
+    DECL_REFUSED
+}
+
+// A module of the standard library. Its modules are named for the files they are written
+// in under lib/std, so they all carry that prefix and nothing a program writes does.
+fn cc_is_stdlib_module(module: Str) -> Bool {
+    module.starts_with("std_")
+}
+
+// A pair the table owns whose declaration is not in the program. The stdlib is registered
+// whole, so this is the two ends disagreeing: the table names a function the library does
+// not declare, or no longer declares under that name.
+fn cc_intrinsic_undeclared(node: Int, kind: TyKind, method: Str, declared: Str) -> Int ! Diag.Report {
+    diag_ice_at("IntrinsicCalleeUndeclared", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{tk_name(kind)}.{method}' names the stdlib function '{declared}', which the library does not declare", node,
+        "the table and the standard library have to name the same function")
+    -1
+}
+
+// An intrinsic written with the wrong number of arguments. The receiver is not counted:
+// the method is what the program wrote, so the count it is judged by is the one the call
+// spells, not the one the declaration underneath it takes.
+fn cc_intrinsic_arity_wrong(node: Int, kind: TyKind, method: Str, want: Int, got: Int) -> Int ! Diag.Report {
+    diag_ice_at("IntrinsicArityWrong", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{tk_name(kind)}.{method}' takes {want} argument(s), and this call was given {got}", node,
+        "typecheck must reject this call before codegen reads it; this is a compiler bug")
+    -1
+}
+
+// A method call this table does not own and no impl answers. Named by the receiver's kind
+// and the method, so what is missing stays legible and countable rather than arriving as
+// one blanket count over every receiver at once.
+fn cc_intrinsic_not_built(node: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    diag_ice_stage_not_built("cg_call methods: {tk_name(kind)}.{method}", node)
+    -1
 }
 
 // What the left of the dot names. Only a Value is a receiver to lower; the other three are
