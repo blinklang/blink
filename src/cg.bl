@@ -10,9 +10,17 @@
 // result, or an unbuilt stage looks like a program that legitimately emits nothing.
 
 import diagnostics.{Diag, diag_ice_stage_not_built}
-import cname.{c_archive_header_guard, c_module_header_guard}
+import cname.{c_archive_header_guard, c_module_header_guard, c_string_literal, c_test_fn_name}
+import ast.{NodeKind, nk_of}
+import parser.{
+    ann_str_val, node_args, node_handlers, node_int_val, node_kind, node_name, node_str_val,
+    node_xfail_reason, node_xfail_ticket, sublist_get, sublist_length,
+}
 import layout.{layout_reset, set_current_inst}
-import cg_print.{print_main_shim, print_reset, print_scope_restore_support, print_take}
+import cg_print.{
+    print_main_shim, print_reset, print_scope_restore_support, print_take, print_test_fn,
+    print_test_table,
+}
 import cg_reg.{
     cg_reg_build, cg_reg_entry_point, cg_reg_fn_decls, cg_reg_has_main, cg_reg_impl_methods,
     cg_reg_impl_of, cg_reg_modules, cg_reg_module_of, cg_reg_reset, cg_reg_test_decls,
@@ -307,8 +315,8 @@ fn lower_body(decl: Int) -> Int ! Diag.Report {
     body
 }
 
-// The definition half. A test block is a body too, and the entry shim calls a runner
-// that only the test table defines, so a unit with tests is not whole without it.
+// The definition half. Test blocks are not here: they are written beside the entry shim,
+// which is a different unit under the per-module mode.
 fn emit_definitions(cfg: CgConfig, module_key: Str, shared: Bool) ! Diag.Report {
     let fns = fns_in_scope(cfg, module_key, shared)
     let methods = methods_in_scope(cfg, module_key, shared)
@@ -320,9 +328,100 @@ fn emit_definitions(cfg: CgConfig, module_key: Str, shared: Bool) ! Diag.Report 
     emit_bodies(cfg, fns)
     emit_bodies(cfg, methods)
     cg_derive_emit_bodies(decls_in_scope(cfg, module_key, cg_reg_type_decls()))
-    let tests = decls_in_scope(cfg, module_key, cg_reg_test_decls())
+}
+
+// ── Test blocks ──────────────────────────────────────────────────────────────
+//
+// A test block is a body with no parameters and no result, so it lowers through the
+// producers a function body goes through and prints as a static void function. What it
+// needs beyond the body is registration. The runtime supplies the runner and the row
+// type; this unit supplies the table of rows and the `__blink_run_tests` the entry shim
+// calls. A unit that wrote the bodies and left the table out links against a name nothing
+// defines, so the two are written together or not at all.
+//
+// Both are written beside the entry shim rather than beside the module that declared the
+// test. The table, the runner and the shim that calls it are one linkage unit: the runner
+// and the table are file-static, and the table holds the address of every body. Under the
+// per-module mode only the entry module gets a shim, so putting any of the three in
+// another module's file leaves the shim naming a static it cannot see.
+//
+// The rows carry C tokens, not Blink values: the printer spells no literal, so the names
+// and the expected-failure reasons are quoted here, where the one producer of a C literal
+// is in scope.
+fn emit_test_bodies(tests: List[Int]) ! Diag.Report {
     if tests.len() == 0 { return }
-    diag_ice_stage_not_built("cg test bodies", tests.get(0).unwrap())
+    set_current_inst(-1)
+    let mut name_lits: List[Str] = []
+    let mut symbols: List[Str] = []
+    let mut tag_lits: List[List[Str]] = []
+    let mut xfail_lits: List[Str] = []
+    for t in tests {
+        let symbol = c_test_fn_name(t)
+        print_test_fn(symbol, lower_body(t))
+        name_lits.push(c_string_literal(node_str_val(t)))
+        symbols.push(symbol)
+        tag_lits.push(test_tag_literals(t))
+        xfail_lits.push(test_xfail_literal(t))
+    }
+    print_test_table(name_lits, symbols, tag_lits, xfail_lits)
+}
+
+// The tags one test block carries. A tag selector on the command line matches these, so a
+// tag the parser recorded and the row dropped silently changes which tests run.
+//
+// A tag is written either quoted or bare, and both spellings mean the same tag. The two
+// reach the parser as different nodes: a quoted one is a string whose text lives in its own
+// slot, a bare one is an identifier whose text is its name. A reader that answers only one
+// of the two empties the table for every file written in the other, so this reads both.
+fn test_tag_literals(tb: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    let anns = node_handlers(tb)
+    if anns == -1 { return out }
+    let mut i = 0
+    while i < sublist_length(anns) {
+        let ann = sublist_get(anns, i)
+        if node_name(ann) == "tags" {
+            let args = node_args(ann)
+            if args != -1 {
+                let mut j = 0
+                while j < sublist_length(args) {
+                    let arg = sublist_get(args, j)
+                    if tag_arg_is_positional(arg) { out.push(c_string_literal(ann_str_val(arg))) }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    out
+}
+
+// Whether one annotation argument is a tag rather than a named option. A named argument is
+// written `key: value`, and the parser records the key in the node's name: on a string
+// argument the name is the key and the text stays in the slot, on an identifier argument
+// the key and the value are joined with a colon into the one name.
+fn tag_arg_is_positional(arg: Int) -> Bool {
+    if nk_of(node_kind(arg)) == NodeKind.InterpString { return node_name(arg) == "" }
+    node_name(arg).index_of(":") < 0
+}
+
+// The sentence the runner prints for a test that is expected to fail, and the empty string
+// for a test that is not one. `int_val` is the parser's marker for the `test.failing`
+// form; typecheck has already refused that form with an empty reason or ticket, so both
+// halves of the sentence are there by the time this reads them.
+// The entry of a whole program: the test bodies and their table, then the shim that calls
+// the runner. One list answers both what is written and whether the shim calls it, because
+// a shim that calls a runner the unit did not write is a name the linker cannot resolve.
+fn emit_entry(cfg: CgConfig) ! Diag.Report {
+    let tests = cg_reg_test_decls()
+    emit_test_bodies(tests)
+    print_main_shim(cg_reg_has_main(), tests.len() > 0, false,
+        cfg.user_tu_mode != 0, cfg.trace_codegen != 0, cfg.deterministic, [])
+}
+
+fn test_xfail_literal(tb: Int) -> Str {
+    if node_int_val(tb) == 0 { return "" }
+    c_string_literal("br:{node_xfail_ticket(tb)} — {node_xfail_reason(tb)}")
 }
 
 // The whole program as one translation unit.
@@ -332,8 +431,7 @@ pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
     emit_declarations(cfg, "", "", true, false, shared)
     print_scope_restore_support()
     emit_definitions(cfg, "", shared)
-    print_main_shim(cg_reg_has_main(), cg_reg_test_decls().len() > 0, false,
-        cfg.user_tu_mode != 0, cfg.trace_codegen != 0, cfg.deterministic, [])
+    emit_entry(cfg)
     print_take()
 }
 
@@ -379,10 +477,7 @@ pub fn generate_module_object(program: Int, module_key: Str, self_header: Str, c
     cg_decl_emit_globals(false)
     print_scope_restore_support()
     emit_definitions(cfg, module_key, cfg.archive_build_mode != 0)
-    if module_key == "__main__" {
-        print_main_shim(cg_reg_has_main(), cg_reg_test_decls().len() > 0, false,
-            cfg.user_tu_mode != 0, cfg.trace_codegen != 0, cfg.deterministic, [])
-    }
+    if module_key == "__main__" { emit_entry(cfg) }
     print_take()
 }
 
