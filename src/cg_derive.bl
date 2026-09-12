@@ -28,7 +28,8 @@ import ir.{
     ir_field_get, ir_if, ir_let, ir_panic, ir_return, ir_switch, ir_unary, ir_var_ref,
 }
 import typecheck.{
-    DECL_NODE_AMBIGUOUS, TYPE_BOOL, TYPE_CHAR, TYPE_INT, TYPE_STR, TYPE_U64, TyKind, tc_enum_variant_slots,
+    DECL_NODE_AMBIGUOUS, TYPE_BOOL, TYPE_CHAR, TYPE_INT, TYPE_STR, TYPE_U64, TyKind, lookup_named_type,
+    tc_enum_variant_slots,
     tc_evar_field_slots, tc_evar_name, tc_evfield_name, tc_evfield_tid, tc_resolve,
     tc_sfield_name, tc_sfield_tid, tc_struct_field_slots, tc_tid_decl_node, tc_tid_kind,
     tk_name,
@@ -110,6 +111,7 @@ fn derive_one(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
     }
     if already_written(decl, name) { return }
     if name == derive_eq { return eq_method(decl, arg, bodies) }
+    if name == derive_ord { return ord_method(decl, arg, bodies) }
     if name == derive_debug { return debug_method(decl, arg, bodies) }
     if name == derive_hash { return hash_method(decl, arg, bodies) }
     if name == derive_clone { return clone_method(decl, arg, bodies) }
@@ -125,6 +127,26 @@ fn has_str(names: List[Str], want: Str) -> Bool {
 
 fn not_built(node: Int, what: Str) ! Diag.Report {
     diag_ice_stage_not_built("cg_derive for {what}", node)
+}
+
+// A refusal, reported. An empty reason means the derive may go ahead. Every derive asks
+// the same way, so one place decides whether a body may be written.
+fn refused(refusal: Str, node: Int) -> Bool ! Diag.Report {
+    if refusal == "" { return false }
+    not_built(node, refusal)
+    true
+}
+
+// The type id of the declaration a derive is written on. Every derive needs it before it
+// can ask layout anything, and a declaration that reached this stage without one is a
+// compiler bug rather than an author's mistake.
+fn derive_tid(decl: Int, node: Int) -> Int ! Diag.Report {
+    let tid = cg_reg_tid_for_decl(decl)
+    if tid < 0 {
+        derive_ice(node, "type '{node_name(decl)}' reached cg_derive with no type id")
+        return -1
+    }
+    tid
 }
 
 fn derive_ice(node: Int, message: Str) ! Diag.Report {
@@ -149,6 +171,11 @@ fn bool_spelling(node: Int) -> Str ! Diag.Report {
 
 fn int_spelling(node: Int) -> Str ! Diag.Report {
     spelling_or_ice(layout_of(TYPE_INT, Position.Field), "Int", node)
+}
+
+// How a slot holds an Int is layout's answer, the same as for every other type.
+fn int_form() -> SlotForm {
+    layout_of(TYPE_INT, Position.Field).slot_form
 }
 
 // ── Eq ───────────────────────────────────────────────────────────────────
@@ -201,8 +228,8 @@ fn field_value(owner: Int, owner_tid: Int, ftid: Int, path: Str, holder: Str, de
 }
 
 // One case per variant, in the order the switch kids alternate: the tag label, then the
-// block the named derive builds for that variant. Eq, Debug and Hash differ only in that
-// block. Three copies of the label half could become different while each copy still
+// block the named derive builds for that variant. Eq, Ord, Debug and Hash differ only in
+// that block. Four copies of the label half could become different while each copy still
 // passed its own tests, and a label that names the wrong variant reads a payload through
 // the wrong tag. An empty answer means a refusal was recorded.
 fn variant_cases(decl: Int, tid: Int, slots: List[Int], ints: Str, derive: Str, acc: Str, span: Int) -> List[Int] ! Diag.Report {
@@ -222,12 +249,13 @@ fn variant_cases(decl: Int, tid: Int, slots: List[Int], ints: Str, derive: Str, 
 }
 
 // The block one derive builds for one variant. `acc` is the local the derive builds its
-// answer in, which only Hash has. Eq and Debug answer from the block itself, so they pass
-// an empty name they never read. A derive with no builder here is refused. A last branch
+// answer in, which only Hash has. Eq, Ord and Debug answer from the block itself, so they
+// pass an empty name they never read. A derive with no builder here is refused. A last branch
 // that accepted any name would hand one derive another derive's block, which compiles and
 // then answers wrongly.
 fn variant_block(decl: Int, tid: Int, slot: Int, derive: Str, acc: Str, span: Int) -> Int ! Diag.Report {
     if derive == derive_eq { return eq_variant_block(decl, tid, slot, span) }
+    if derive == derive_ord { return cmp_variant_block(decl, tid, slot, span) }
     if derive == derive_debug { return debug_variant_block(decl, tid, slot, span) }
     if derive == derive_hash { return hash_variant_block(decl, tid, slot, acc, span) }
     derive_ice(span, "no per-variant block for @derive({derive})")
@@ -252,10 +280,9 @@ fn variant_decl_node(decl: Int, slot: Int, index: Int, span: Int) -> Int ! Diag.
 }
 
 fn eq_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
-    let tid = cg_reg_tid_for_decl(decl)
-    if tid < 0 { return derive_ice(arg, "type '{node_name(decl)}' reached cg_derive with no type id") }
-    let refusal = shape_refusal(decl, tid, derive_eq)
-    if refusal != "" { return not_built(arg, refusal) }
+    let tid = derive_tid(decl, arg)
+    if tid < 0 { return }
+    if refused(shape_refusal(decl, tid, derive_eq), arg) { return }
     let self_spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), arg)
     let ret = bool_spelling(arg)
     if self_spelling == "" || ret == "" { return }
@@ -456,6 +483,295 @@ fn eq_is_scalar(k: TyKind) -> Bool {
     false
 }
 
+// ── Ord ──────────────────────────────────────────────────────────────────
+
+// The type a derived cmp answers, and its three variants. The language declares them, so
+// this stage names the declaration rather than an integer of its own. C accepts an integer
+// where an Ordering is wanted, so an integer here would compile and mean something else.
+let ordering_type = "Ordering"
+let ordering_less = "Less"
+let ordering_equal = "Equal"
+let ordering_greater = "Greater"
+
+fn ordering_tid(span: Int) -> Int ! Diag.Report {
+    let tid = lookup_named_type(ordering_type)
+    if tid < 0 {
+        derive_ice(span, "the '{ordering_type}' type @derive(Ord) answers is not declared")
+        return -1
+    }
+    tid
+}
+
+fn ordering_spelling(tid: Int, span: Int) -> Str ! Diag.Report {
+    spelling_or_ice(layout_of(tid, Position.Return), ordering_type, span)
+}
+
+// One of the three answers, as the C name its own declaration carries.
+fn ordering_const(tid: Int, name: Str, span: Int) -> Int ! Diag.Report {
+    let spelling = ordering_spelling(tid, span)
+    if spelling == "" { return -1 }
+    let decl = tc_tid_decl_node(tid)
+    if decl < 0 || decl == DECL_NODE_AMBIGUOUS {
+        derive_ice(span, "the '{ordering_type}' type has no unambiguous declaration to answer through")
+        return -1
+    }
+    let vnode = variant_named(decl, name)
+    if vnode < 0 {
+        derive_ice(span, "the '{ordering_type}' type declares no variant '{name}'")
+        return -1
+    }
+    ir_const(tid, span, spelling, c_variant_ordinal(decl, vnode))
+}
+
+fn ordering_return(name: Str, span: Int) -> Int ! Diag.Report {
+    let tid = ordering_tid(span)
+    if tid < 0 { return -1 }
+    let answer = ordering_const(tid, name, span)
+    if answer < 0 { return -1 }
+    ir_return(span, answer)
+}
+
+fn variant_named(decl: Int, name: Str) -> Int {
+    let vars = node_fields(decl)
+    if vars == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(vars) {
+        let v = sublist_get(vars, i)
+        if node_name(v) == name { return v }
+        i = i + 1
+    }
+    -1
+}
+
+// Ord requires Eq, and the language derives the supertrait rather than asking the author
+// for it, so one annotation writes both methods. Without the eq an Ord-only type answers
+// `a < b` through cmp and has no `a == b` to call at all. The record of what this pass has
+// written keeps @derive(Eq, Ord) to one eq, in either order.
+fn ord_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
+    let tid = derive_tid(decl, arg)
+    if tid < 0 { return }
+    if refused(shape_refusal(decl, tid, derive_ord), arg) { return }
+    if !already_written(decl, derive_eq) { eq_method(decl, arg, bodies) }
+    cmp_method(decl, tid, arg, bodies)
+}
+
+fn cmp_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
+    let otid = ordering_tid(arg)
+    if otid < 0 { return }
+    let self_spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), arg)
+    let ret = ordering_spelling(otid, arg)
+    if self_spelling == "" || ret == "" { return }
+    let symbol = c_derive_method_name(decl, "cmp")
+    let params = ["{self_spelling} self", "{self_spelling} other"]
+    if !bodies { return print_fn_decl(false, ret, symbol, params, false) }
+    let body = cmp_body(decl, tid, arg)
+    if body < 0 { return }
+    print_fn(false, ret, symbol, params, false, body)
+}
+
+// A value layout gives as one word is its own whole value, so it orders as a word and has
+// no member to read: an ordinal enum and a transparent newtype both land here, and asking
+// layout is what keeps this stage from deciding the shape for itself.
+fn cmp_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let rec = layout_of(tid, Position.Param)
+    if rec.slot_form == SlotForm.InlineWord { return cmp_word_body(tid, span) }
+    let k = tc_tid_kind(tc_resolve(tid))
+    if k == TyKind.Struct { return cmp_struct_body(decl, tid, span) }
+    if k == TyKind.Enum { return cmp_tagged_body(decl, tid, span) }
+    not_built(span, "@derive(Ord) on a {tk_name(k)} type")
+    -1
+}
+
+// One test and the answer it settles. Reaching past the guard means the two values agreed
+// on what it compared, so the next guard decides.
+fn cmp_guard(cond: Int, answer: Str, span: Int) -> Int ! Diag.Report {
+    let ret = ordering_return(answer, span)
+    if cond < 0 || ret < 0 { return -1 }
+    ir_if(span, cond, ir_block(span, [ret]), -1)
+}
+
+fn cmp_word_body(tid: Int, span: Int) -> Int ! Diag.Report {
+    let less = cmp_word_guard(tid, "<", ordering_less, span)
+    let greater = cmp_word_guard(tid, ">", ordering_greater, span)
+    let equal = ordering_return(ordering_equal, span)
+    if less < 0 || greater < 0 || equal < 0 { return -1 }
+    ir_block(span, [less, greater, equal])
+}
+
+fn cmp_word_guard(tid: Int, op: Str, answer: Str, span: Int) -> Int ! Diag.Report {
+    let bools = bool_spelling(span)
+    let lhs = value_ref(tid, "self", Position.Param, span)
+    let rhs = value_ref(tid, "other", Position.Param, span)
+    if bools == "" || lhs < 0 || rhs < 0 { return -1 }
+    cmp_guard(ir_binary(TYPE_BOOL, span, bools, op, lhs, rhs), answer, span)
+}
+
+// Lexicographic in declaration order: the first field that differs decides, and the fields
+// after it are never read. Reaching the end means every field agreed.
+fn cmp_struct_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let mut stmts: List[Int] = []
+    for slot in tc_struct_field_slots(tid) {
+        let part = cmp_field(decl, tid, tc_sfield_tid(slot), c_field_name(tc_sfield_name(slot)), span)
+        if part.len() == 0 { return -1 }
+        for s in part { stmts.push(s) }
+    }
+    let equal = ordering_return(ordering_equal, span)
+    if equal < 0 { return -1 }
+    stmts.push(equal)
+    ir_block(span, stmts)
+}
+
+// An enum orders by variant before it reads a payload: the tag decides which member of the
+// union may be read at all, so comparing payloads across two variants would read one of
+// them through the wrong variant.
+fn cmp_tagged_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let slots = tc_enum_variant_slots(tid)
+    if slots.len() == 0 {
+        derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
+        return -1
+    }
+    let ints = int_spelling(span)
+    if ints == "" { return -1 }
+    let less = cmp_tag_guard(tid, ints, "<", ordering_less, span)
+    let greater = cmp_tag_guard(tid, ints, ">", ordering_greater, span)
+    let scrutinee = tag_ref(tid, "self", Position.Param, ints, span)
+    let unknown = corrupt_tag_block(decl, derive_ord, span)
+    let equal = ordering_return(ordering_equal, span)
+    if less < 0 || greater < 0 || scrutinee < 0 || unknown < 0 || equal < 0 { return -1 }
+    let cases = variant_cases(decl, tid, slots, ints, derive_ord, "", span)
+    if cases.len() == 0 { return -1 }
+    ir_block(span, [less, greater, ir_switch(span, scrutinee, cases, unknown), equal])
+}
+
+fn cmp_tag_guard(tid: Int, ints: Str, op: Str, answer: Str, span: Int) -> Int ! Diag.Report {
+    let bools = bool_spelling(span)
+    let lhs = tag_ref(tid, "self", Position.Param, ints, span)
+    let rhs = tag_ref(tid, "other", Position.Param, ints, span)
+    if bools == "" || lhs < 0 || rhs < 0 { return -1 }
+    cmp_guard(ir_binary(TYPE_BOOL, span, bools, op, lhs, rhs), answer, span)
+}
+
+// The payload of one variant, ordered field by field. A variant whose fields all agree
+// runs past its last guard and reaches the answer that the two values are equal.
+fn cmp_variant_block(decl: Int, tid: Int, slot: Int, span: Int) -> Int ! Diag.Report {
+    let vname = tc_evar_name(slot)
+    let mut stmts: List[Int] = []
+    for f in tc_evar_field_slots(slot) {
+        let path = "{PAYLOAD_UNION}.{vname}.{c_field_name(tc_evfield_name(f))}"
+        let part = cmp_field(decl, tid, tc_evfield_tid(f), path, span)
+        if part.len() == 0 { return -1 }
+        for s in part { stmts.push(s) }
+    }
+    ir_block(span, stmts)
+}
+
+// ── One field's order ────────────────────────────────────────────────────
+
+// The statements one field contributes: the guards that can answer from it, and the local
+// a guard reads when the comparison is a call rather than an operator. Every field that is
+// ordered contributes at least one statement, so an empty answer means a refusal was
+// recorded. A field this stage drops instead would make two values that differ answer
+// Equal, which sorts wrongly and compiles cleanly.
+fn cmp_field(owner: Int, owner_tid: Int, ftid: Int, path: Str, span: Int) -> List[Int] ! Diag.Report {
+    let frec = field_layout_of(owner, ftid)
+    if field_refused(frec, path, derive_ord, span) { return [] }
+    let k = tc_tid_kind(tc_resolve(ftid))
+    if k == TyKind.Str { return cmp_str_field(owner_tid, ftid, frec, path, span) }
+    if cmp_is_scalar(k) { return cmp_scalar_field(owner_tid, ftid, frec, path, span) }
+    if k == TyKind.Struct || k == TyKind.Enum {
+        return cmp_nested_field(owner_tid, ftid, frec, path, span)
+    }
+    not_built(span, "@derive(Ord) on the {tk_name(k)} field '{path}'")
+    []
+}
+
+fn cmp_scalar_field(owner_tid: Int, ftid: Int, frec: LayoutRecord, path: Str, span: Int) -> List[Int] ! Diag.Report {
+    let less = cmp_field_guard(owner_tid, ftid, frec, path, "<", ordering_less, span)
+    let greater = cmp_field_guard(owner_tid, ftid, frec, path, ">", ordering_greater, span)
+    if less < 0 || greater < 0 { return [] }
+    [less, greater]
+}
+
+fn cmp_field_guard(owner_tid: Int, ftid: Int, frec: LayoutRecord, path: Str, op: Str, answer: Str, span: Int) -> Int ! Diag.Report {
+    let bools = bool_spelling(span)
+    let lhs = field_ref(owner_tid, "self", Position.Param, ftid, frec, path, span)
+    let rhs = field_ref(owner_tid, "other", Position.Param, ftid, frec, path, span)
+    if bools == "" || lhs < 0 || rhs < 0 { return -1 }
+    cmp_guard(ir_binary(TYPE_BOOL, span, bools, op, lhs, rhs), answer, span)
+}
+
+// A Str is a pointer, so < would order two addresses rather than bytes. The runtime helper
+// orders the bytes and answers a sign. A local holds that sign because two guards read it:
+// calling the helper twice would order the two strings twice.
+fn cmp_str_field(owner_tid: Int, ftid: Int, frec: LayoutRecord, path: Str, span: Int) -> List[Int] ! Diag.Report {
+    let ints = int_spelling(span)
+    let lhs = field_ref(owner_tid, "self", Position.Param, ftid, frec, path, span)
+    let rhs = field_ref(owner_tid, "other", Position.Param, ftid, frec, path, span)
+    if ints == "" || lhs < 0 || rhs < 0 { return [] }
+    let name = c_mint_local("ord")
+    let call = ir_call_runtime(TYPE_INT, span, ints, c_runtime_helper("str_cmp"), int_form(), [lhs, rhs])
+    let less = cmp_sign_guard(name, ints, "<", ordering_less, span)
+    let greater = cmp_sign_guard(name, ints, ">", ordering_greater, span)
+    if less < 0 || greater < 0 { return [] }
+    [ir_let(TYPE_INT, span, ints, name, int_form(), call), less, greater]
+}
+
+fn cmp_sign_guard(name: Str, ints: Str, op: Str, answer: Str, span: Int) -> Int ! Diag.Report {
+    let bools = bool_spelling(span)
+    if bools == "" { return -1 }
+    let read = ir_var_ref(TYPE_INT, span, ints, name, int_form())
+    let zero = ir_const(TYPE_INT, span, ints, "0")
+    cmp_guard(ir_binary(TYPE_BOOL, span, bools, op, read, zero), answer, span)
+}
+
+// A nested type is ordered by its own derived method, so the comparison stays one call
+// deep however far the nesting goes. A local holds the answer because the guard tests it
+// and then returns that same answer.
+fn cmp_nested_field(owner_tid: Int, ftid: Int, frec: LayoutRecord, path: Str, span: Int) -> List[Int] ! Diag.Report {
+    let fdecl = tc_tid_decl_node(ftid)
+    if fdecl < 0 || fdecl == DECL_NODE_AMBIGUOUS {
+        derive_ice(span, "field type {ftid} has no unambiguous declaration to order through")
+        return []
+    }
+    if !has_str(derive_names(fdecl), derive_ord) {
+        not_built(span, "@derive(Ord) on a field whose type '{node_name(fdecl)}' implements Ord by hand")
+        return []
+    }
+    let refusal = shape_refusal(fdecl, ftid, derive_ord)
+    if refusal != "" {
+        not_built(span, "{refusal}, which the field '{path}' would have to call")
+        return []
+    }
+    let otid = ordering_tid(span)
+    if otid < 0 { return [] }
+    let ospelling = ordering_spelling(otid, span)
+    let bools = bool_spelling(span)
+    let equal = ordering_const(otid, ordering_equal, span)
+    let lhs = field_ref(owner_tid, "self", Position.Param, ftid, frec, path, span)
+    let rhs = field_ref(owner_tid, "other", Position.Param, ftid, frec, path, span)
+    if ospelling == "" || bools == "" || equal < 0 || lhs < 0 || rhs < 0 { return [] }
+    let form = layout_of(otid, Position.Return).slot_form
+    let name = c_mint_local("ord")
+    let call = ir_call_direct(otid, span, ospelling, c_derive_method_name(fdecl, "cmp"), form, [lhs, rhs])
+    let differs = ir_binary(TYPE_BOOL, span, bools, "!=",
+        ir_var_ref(otid, span, ospelling, name, form), equal)
+    let answer = ir_return(span, ir_var_ref(otid, span, ospelling, name, form))
+    [ir_let(otid, span, ospelling, name, form, call),
+        ir_if(span, differs, ir_block(span, [answer]), -1)]
+}
+
+// The kinds C orders the way the language does. Bool is a backstop: the language gives a
+// Bool equality and no order at all, and typecheck rejects a Bool field under @derive(Ord)
+// before this stage runs. Float is absent for a reason this stage cannot work around: the
+// language orders a Float totally, with NaN greater than every other value, and C's < and
+// > both answer false for a NaN, which would make every NaN compare Equal.
+fn cmp_is_scalar(k: TyKind) -> Bool {
+    if k == TyKind.Int || k == TyKind.Char { return true }
+    if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return true }
+    if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return true }
+    false
+}
+
 // ── Debug ────────────────────────────────────────────────────────────────
 
 // One field's contribution to a debug string: the printf conversion it needs, the
@@ -479,10 +795,9 @@ fn str_spelling(node: Int) -> Str ! Diag.Report {
 }
 
 fn debug_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
-    let tid = cg_reg_tid_for_decl(decl)
-    if tid < 0 { return derive_ice(arg, "type '{node_name(decl)}' reached cg_derive with no type id") }
-    let refusal = shape_refusal(decl, tid, derive_debug)
-    if refusal != "" { return not_built(arg, refusal) }
+    let tid = derive_tid(decl, arg)
+    if tid < 0 { return }
+    if refused(shape_refusal(decl, tid, derive_debug), arg) { return }
     let self_spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), arg)
     let ret = str_spelling(arg)
     if self_spelling == "" || ret == "" { return }
@@ -538,8 +853,9 @@ fn debug_constant(text: Str, span: Int) -> Int ! Diag.Report {
 }
 
 // A tag no variant declares means the value's memory is corrupt. A derive that reads a
-// payload has to choose which payload to read, and no choice is right, so Debug and Hash
-// stop here rather than report or hash a value the program does not hold. Eq answers false
+// payload has to choose which payload to read, and no choice is right, so Ord, Debug and
+// Hash stop here rather than order, report or hash a value the program does not hold. Eq
+// answers false
 // instead, because two values it cannot read are not known to be equal.
 fn corrupt_tag_block(decl: Int, derive: Str, span: Int) -> Int ! Diag.Report {
     let spelling = str_spelling(span)
@@ -780,10 +1096,9 @@ fn u64_form() -> SlotForm {
 }
 
 fn hash_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
-    let tid = cg_reg_tid_for_decl(decl)
-    if tid < 0 { return derive_ice(arg, "type '{node_name(decl)}' reached cg_derive with no type id") }
-    let refusal = hash_refusal(decl, tid)
-    if refusal != "" { return not_built(arg, refusal) }
+    let tid = derive_tid(decl, arg)
+    if tid < 0 { return }
+    if refused(hash_refusal(decl, tid), arg) { return }
     let rec = layout_of(tid, Position.Param)
     let self_spelling = spelling_or_ice(rec, node_name(decl), arg)
     let ret = u64_spelling(arg)
@@ -1037,10 +1352,9 @@ fn hash_nested(ftid: Int, value: Int, path: Str, span: Int) -> Int ! Diag.Report
 // method. To recurse would deep-copy what the language says two values share, and no test
 // of the copy's contents would show it.
 fn clone_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
-    let tid = cg_reg_tid_for_decl(decl)
-    if tid < 0 { return derive_ice(arg, "type '{node_name(decl)}' reached cg_derive with no type id") }
-    let refusal = shape_refusal(decl, tid, derive_clone)
-    if refusal != "" { return not_built(arg, refusal) }
+    let tid = derive_tid(decl, arg)
+    if tid < 0 { return }
+    if refused(shape_refusal(decl, tid, derive_clone), arg) { return }
     let self_spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), arg)
     if self_spelling == "" { return }
     let ret = spelling_or_ice(layout_of(tid, Position.Return), node_name(decl), arg)

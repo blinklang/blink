@@ -1,0 +1,415 @@
+// The C a @derive(Ord) type gets: a cmp that answers an Ordering, and the eq that Ord's
+// Eq supertrait needs. The language says Ord requires Eq and that the compiler derives
+// the supertrait rather than asking the author for it (sections/03_types.md, Supertrait
+// Auto-Derivation), so one annotation writes two methods and @derive(Eq, Ord) still
+// writes eq once.
+//
+// A struct is compared field by field in declaration order and stops at the first field
+// that differs. An enum compares its tag first, because the variant decides which payload
+// may be read at all, and reading a union through the wrong variant is undefined.
+//
+// A field this stage cannot order is an internal error, never a skipped field. A skipped
+// field makes two values that differ answer Equal, which sorts wrongly and compiles
+// cleanly.
+
+import std.io
+import layout.{layout_reset}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build, cg_reg_type_decls}
+import cg_derive.{cg_derive_reset, cg_derive_emit_decls, cg_derive_emit_bodies}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_saying, cg_text_occurrences, CG_ICE_STAGE_NOT_BUILT}
+
+// The Ordering type and its three variants come from lib/std/traits.bl, so their C names
+// carry that module. A test writes them out rather than deriving them, because a name the
+// test computed the same way the compiler does would agree with a wrong answer.
+let ORD_TYPE = "blink_std_traits_Ordering"
+let ORD_LESS = "blink_std_traits_Ordering_Less"
+let ORD_EQUAL = "blink_std_traits_Ordering_Equal"
+let ORD_GREATER = "blink_std_traits_Ordering_Greater"
+
+// Point is ordered by two scalars, Named by a string then a scalar, Pair by a nested
+// derived type, Color by its ordinal alone, and Shape by a payload under one of two tags.
+fn ord_src() -> Str {
+    #"@derive(Ord)
+type Point { x: Int, y: Int }
+@derive(Ord)
+type Named { name: Str, id: Int }
+@derive(Ord)
+type Pair { p: Point, id: Int }
+@derive(Ord)
+type Color { Red, Green, Blue }
+@derive(Ord)
+type Shape {
+    Circle(radius: Int)
+    Rect(w: Int, h: Int)
+}
+fn main() { }
+"#
+}
+
+fn program_of(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let program = cg_probe_compile("build/{stem}_probe_src.bl", src)
+    layout_reset()
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_derive_reset()
+    program
+}
+
+fn bodies_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _p = program_of(stem, src)
+    cg_derive_emit_bodies(cg_reg_type_decls())
+    print_take()
+}
+
+fn decls_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _p = program_of(stem, src)
+    cg_derive_emit_decls(cg_reg_type_decls())
+    print_take()
+}
+
+// How many times the body pass records one named refusal saying one thing, for a probe's
+// own file. A count of every internal error would be satisfied by an unrelated refusal in
+// the same probe, so a test that names one refusal would pass whether or not it fired.
+fn refusals_saying(stem: Str, src: Str, name: Str, marker: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _p = program_of(stem, src)
+    cg_derive_emit_bodies(cg_reg_type_decls())
+    cg_probe_ices_saying(name, marker)
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+// One needle before another, with both required. A bare index comparison would read
+// -1 < n and pass for a needle the output does not hold at all.
+fn assert_before(text: Str, first: Str, second: Str) {
+    assert_has(text, first)
+    assert_has(text, second)
+    assert(text.index_of(first) < text.index_of(second))
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output still has '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+// The C of one function, from its opening line to the brace that closes it in column
+// zero. A needle checked against the whole unit would match another function's body.
+fn one_fn(text: Str, head: Str) -> Str {
+    let start = text.index_of(head)
+    if start < 0 { io.println("FAIL: output has no '{head}'\n--- output ---\n{text}") }
+    assert(start >= 0)
+    let rest = text.substring(start, text.len() - start)
+    let end = rest.index_of("\n}")
+    assert(end >= 0)
+    rest.substring(0, end)
+}
+
+// The name of the local a body declares to hold one comparison, read off the declaration
+// rather than written down here, because the minter owns that spelling.
+fn local_named(text: Str, type_spelling: Str) -> Str {
+    for line in text.lines() {
+        let t = line.trim()
+        if t.starts_with("{type_spelling} ") && t.index_of(" = ") >= 0 {
+            return t.split(" ").get(1).unwrap()
+        }
+    }
+    io.println("FAIL: no '{type_spelling}' local declared in:\n{text}")
+    assert(false)
+    ""
+}
+
+test "a derived cmp takes two values of its own type and answers an Ordering" {
+    assert_has(bodies_of("cg_derive_ord", ord_src()),
+        "{ORD_TYPE} blink_Point_cmp(blink_Point self, blink_Point other) \{")
+}
+
+// Ord requires Eq and the compiler derives the supertrait, so one annotation writes both
+// methods. Without this an Ord-only type answers `a < b` and has no `a == b` to call.
+test "deriving Ord also writes the eq its Eq supertrait requires" {
+    assert_has(bodies_of("cg_derive_ord", ord_src()),
+        "int blink_Point_eq(blink_Point self, blink_Point other) \{")
+}
+
+fn both_src() -> Str {
+    #"@derive(Eq, Ord)
+type Both { x: Int }
+fn main() { }
+"#
+}
+
+// The language says listing both is allowed and derives Eq once. Two definitions of one
+// symbol is a duplicate-symbol error at link time.
+test "deriving Eq and Ord together writes one eq definition, not two" {
+    let text = bodies_of("cg_derive_ord_both", both_src())
+    assert_eq(cg_text_occurrences(text, "int blink_Both_eq(blink_Both self, blink_Both other) \{"), 1)
+    assert_eq(cg_text_occurrences(text, "{ORD_TYPE} blink_Both_cmp(blink_Both self, blink_Both other) \{"), 1)
+}
+
+// Lexicographic in declaration order: the first field that differs decides, and the
+// fields after it are never read. A body that compared the second field first would
+// order two values by the wrong key and still compile.
+test "a struct is ordered field by field in declaration order" {
+    let text = one_fn(bodies_of("cg_derive_ord", ord_src()), "{ORD_TYPE} blink_Point_cmp")
+    assert_has(text, "if ((self.x < other.x)) \{")
+    assert_has(text, "if ((self.x > other.x)) \{")
+    assert_has(text, "if ((self.y < other.y)) \{")
+    assert_has(text, "return {ORD_LESS};")
+    assert_has(text, "return {ORD_GREATER};")
+    assert_has(text, "return {ORD_EQUAL};")
+    assert_before(text, "self.x < other.x", "self.y < other.y")
+}
+
+// A Str is a pointer, so < would order two addresses, which is whatever the allocator
+// did. The runtime helper orders the bytes.
+test "a string field is ordered through the runtime helper, not as two addresses" {
+    let text = one_fn(bodies_of("cg_derive_ord", ord_src()), "{ORD_TYPE} blink_Named_cmp")
+    assert_has(text, "blink_str_cmp(self.name, other.name)")
+    let c = local_named(text, "int64_t")
+    assert_has(text, "if (({c} < 0)) \{")
+    assert_has(text, "if (({c} > 0)) \{")
+    assert_lacks(text, "self.name < other.name")
+}
+
+// A nested type is ordered by its own derived method, so the comparison stays one call
+// deep however far the nesting goes.
+test "a nested derived field is ordered by its own cmp, one call deep" {
+    let text = one_fn(bodies_of("cg_derive_ord", ord_src()), "{ORD_TYPE} blink_Pair_cmp")
+    assert_has(text, "blink_Point_cmp(self.p, other.p)")
+    let c = local_named(text, ORD_TYPE)
+    assert_has(text, "if (({c} != {ORD_EQUAL})) \{")
+    assert_has(text, "return {c};")
+}
+
+// A payload enum orders by variant before it reads a payload. The tag decides which
+// member of the union may be read at all, so comparing payloads across variants would
+// read one of them through the wrong variant.
+test "an enum is ordered by its tag before any payload is read" {
+    let text = one_fn(bodies_of("cg_derive_ord", ord_src()), "{ORD_TYPE} blink_Shape_cmp")
+    assert_has(text, "if ((self.tag < other.tag)) \{")
+    assert_has(text, "if ((self.tag > other.tag)) \{")
+    let scrut = local_named(text, "int64_t")
+    assert_before(text, "self.tag < other.tag", "{scrut} = self.tag;")
+    assert_before(text, "{scrut} = self.tag;", "self.data.")
+}
+
+test "two values of one variant are ordered by payload in declaration order" {
+    let text = one_fn(bodies_of("cg_derive_ord", ord_src()), "{ORD_TYPE} blink_Shape_cmp")
+    assert_has(text, "blink_Shape_Circle_TAG")
+    assert_has(text, "if ((self.data.Circle.radius < other.data.Circle.radius)) \{")
+    assert_has(text, "if ((self.data.Rect.w < other.data.Rect.w)) \{")
+    assert_has(text, "if ((self.data.Rect.h < other.data.Rect.h)) \{")
+    assert_has(text, "if ((self.data.Circle.radius > other.data.Circle.radius)) \{")
+    assert_has(text, "if ((self.data.Rect.h > other.data.Rect.h)) \{")
+    assert_before(text, "self.data.Rect.w <", "self.data.Rect.h <")
+}
+
+// A payload-less enum is a C enum, so the ordinal is the whole value and there is no
+// member to read.
+test "a payload-less enum is ordered as its own word" {
+    let text = one_fn(bodies_of("cg_derive_ord", ord_src()), "{ORD_TYPE} blink_Color_cmp")
+    assert_has(text, "if ((self < other)) \{")
+    assert_has(text, "if ((self > other)) \{")
+    assert_lacks(text, "self.tag")
+}
+
+// Every Ordering an enum body answers has to be a variant of Ordering. A tag no variant
+// declares means the value's memory is corrupt, and no order over a value the program
+// does not hold is right, so the body stops rather than answer one.
+test "a tag no variant declares stops the program instead of answering an order" {
+    let text = one_fn(bodies_of("cg_derive_ord", ord_src()), "{ORD_TYPE} blink_Shape_cmp")
+    assert_has(text, "__blink_panic_dispatch")
+    assert_has(text, "@derive(Ord) on Shape met a tag no variant declares")
+}
+
+// The declaration pass writes signatures only. The driver runs it before the body pass so
+// a type declared after the type that orders it is still declared first.
+test "the declaration pass writes a signature for both derived methods and no body" {
+    let text = decls_of("cg_derive_ord_decls", ord_src())
+    assert_has(text, "{ORD_TYPE} blink_Point_cmp(blink_Point self, blink_Point other);")
+    assert_has(text, "int blink_Point_eq(blink_Point self, blink_Point other);")
+    assert_lacks(text, "return {ORD_EQUAL};")
+}
+
+// The Eq field walk compares a field whose type derives only Ord through that type's
+// eq symbol, so Ord must define one. Without it the call is an undefined reference at
+// link time.
+fn ord_only_field_src() -> Str {
+    #"@derive(Ord)
+type F { n: Int }
+@derive(Eq)
+type P { f: F }
+fn main() { }
+"#
+}
+
+test "a field whose type derives only Ord is compared through an eq that is defined" {
+    let text = bodies_of("cg_derive_ord_only_field", ord_only_field_src())
+    assert_has(text, "if ((!blink_F_eq(self.f, other.f))) \{")
+    assert_eq(cg_text_occurrences(text, "int blink_F_eq(blink_F self, blink_F other) \{"), 1)
+}
+
+// An @ffi.opaque handle is a pointer to a body this compiler cannot see. It has no
+// fields, so a field walk over it answers Equal for every pair of handles.
+fn opaque_src() -> Str {
+    #"@derive(Ord)
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn main() { }
+"#
+}
+
+test "an opaque handle is refused, not ordered as always equal" {
+    assert_eq(refusals_saying("cg_derive_ord_opaque", opaque_src(), CG_ICE_STAGE_NOT_BUILT,
+        "@derive(Ord) on the opaque handle 'CFile'"), 1)
+    assert_lacks(bodies_of("cg_derive_ord_opaque", opaque_src()), "_cmp")
+}
+
+// A generic type gets one body per instance, which this stage has not built, so its
+// fields must not be handed a call to a symbol nothing will define.
+fn generic_src() -> Str {
+    #"@derive(Ord)
+type Box[T] { v: T }
+fn main() { }
+"#
+}
+
+test "a generic type is refused, not given one body for every instance" {
+    assert_eq(refusals_saying("cg_derive_ord_generic", generic_src(), CG_ICE_STAGE_NOT_BUILT,
+        "@derive(Ord) on the generic type 'Box'"), 1)
+}
+
+// A raw pointer field passes the front end's derive-field check, and no order over one
+// is an order over a value.
+fn unsupported_field_src() -> Str {
+    #"@derive(Ord)
+type Handle { raw: Ptr[U8] }
+fn main() { }
+"#
+}
+
+test "a field kind with no order is an internal error, not a dropped field" {
+    assert_eq(refusals_saying("cg_derive_ord_unsupported", unsupported_field_src(), CG_ICE_STAGE_NOT_BUILT,
+        "@derive(Ord) on the Ptr field 'raw'"), 1)
+}
+
+// A transparent newtype is a bare word, so its parameter has no tag member to read.
+fn newtype_src() -> Str {
+    #"@derive(Ord)
+type Errno { Errno(Int) }
+fn main() { }
+"#
+}
+
+test "a transparent newtype is ordered as its word instead of reading a tag" {
+    let text = one_fn(bodies_of("cg_derive_ord_newtype", newtype_src()), "{ORD_TYPE} blink_Errno_cmp")
+    assert_has(text, "if ((self < other)) \{")
+    assert_lacks(text, "self.tag")
+    assert_lacks(text, "self.data")
+}
+
+// A variant with no payload has nothing to compare, so its block is empty and the two
+// values reach the answer that they are equal. Every other derive writes at least one
+// statement per variant, so this is the only shape whose block can be empty.
+fn mixed_enum_src() -> Str {
+    #"@derive(Ord)
+type Step { Start, Jump(to: Int) }
+fn main() { }
+"#
+}
+
+test "a variant with no payload still reaches the answer that two values are equal" {
+    let text = one_fn(bodies_of("cg_derive_ord_mixed", mixed_enum_src()), "{ORD_TYPE} blink_Step_cmp")
+    assert_has(text, "if ((self.data.Jump.to < other.data.Jump.to)) \{")
+    assert_has(text, "return {ORD_EQUAL};")
+    assert_lacks(text, "self.data.Start")
+}
+
+// A struct with no fields has one answer for every pair. The field loop never runs, so the
+// body is the answer alone.
+fn empty_struct_src() -> Str {
+    #"@derive(Ord)
+type Unit { }
+fn main() { }
+"#
+}
+
+test "a struct with no fields answers that any two values are equal" {
+    let text = one_fn(bodies_of("cg_derive_ord_empty", empty_struct_src()), "{ORD_TYPE} blink_Unit_cmp")
+    assert_has(text, "return {ORD_EQUAL};")
+    assert_lacks(text, "if (")
+}
+
+// The nested call is the same one call deep whether the field is a struct or an enum, so
+// both kinds reach the field type's own cmp.
+fn nested_enum_src() -> Str {
+    #"@derive(Ord)
+type Level { Low, High }
+@derive(Ord)
+type Alarm { at: Level, id: Int }
+fn main() { }
+"#
+}
+
+test "a nested enum field is ordered by its own cmp, the same as a nested struct" {
+    let text = one_fn(bodies_of("cg_derive_ord_nested_enum", nested_enum_src()), "{ORD_TYPE} blink_Alarm_cmp")
+    assert_has(text, "blink_Level_cmp(self.at, other.at)")
+    let c = local_named(text, ORD_TYPE)
+    assert_has(text, "if (({c} != {ORD_EQUAL})) \{")
+}
+
+// The language orders a Float totally, with NaN greater than every other value. C's < and
+// > both answer false for a NaN, so the two guards this stage writes would make every NaN
+// compare Equal, which is neither the language's order nor an order at all. Refusing where
+// the derive is written beats a sort that reads correct and is not.
+fn float_field_src() -> Str {
+    #"@derive(Ord)
+type Reading { v: Float }
+fn main() { }
+"#
+}
+
+test "a Float field is refused rather than ordered by an operator that drops NaN" {
+    assert_eq(refusals_saying("cg_derive_ord_float", float_field_src(), CG_ICE_STAGE_NOT_BUILT,
+        "@derive(Ord) on the Float field 'v'"), 1)
+}
+
+// An unsigned field and a Char field both order the way C orders the word layout gives
+// them, so neither needs a call.
+fn word_fields_src() -> Str {
+    #"@derive(Ord)
+type Key { n: U64, c: Char }
+fn main() { }
+"#
+}
+
+test "an unsigned field and a Char field are ordered by operator, not by a call" {
+    let text = one_fn(bodies_of("cg_derive_ord_words", word_fields_src()), "{ORD_TYPE} blink_Key_cmp")
+    assert_has(text, "if ((self.n < other.n)) \{")
+    assert_has(text, "if ((self.c > other.c)) \{")
+    assert_before(text, "self.n < other.n", "self.c < other.c")
+    assert_lacks(text, "_cmp(self.n")
+}
+
+// A generic type gets one body per instance, which this stage has not built, so a field of
+// one must not be handed a call to a symbol nothing will define.
+fn generic_field_src() -> Str {
+    #"@derive(Ord)
+type Box[T] { v: T }
+@derive(Ord)
+type Holder { b: Box[Int], n: Int }
+fn main() { }
+"#
+}
+
+test "a field of a generic type gets no call to a body this stage will not write" {
+    assert_eq(refusals_saying("cg_derive_ord_generic_field", generic_field_src(), CG_ICE_STAGE_NOT_BUILT,
+        "@derive(Ord) on the generic type 'Box', which the field 'b' would have to call"), 1)
+}
