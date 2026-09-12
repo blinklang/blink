@@ -1,0 +1,54 @@
+// A closure literal reaching the expression stage. The record and the thunk behind it are
+// the effect stage's to build; this file is about the one step before that, which is that a
+// closure in expression position is routed there at all rather than refused.
+//
+// Every test starts at lower_expr, the entry a statement reaches. A test that called the
+// effect stage directly would pass whether or not the dispatch arm exists, which is the
+// only thing this file is here to prove.
+
+import lower_test_helpers.{probe, rhs_of, assert_kind, assert_ice_saying, assert_verifies}
+import ir.{IrKind}
+import cg_expr.{lower_expr}
+import cg_eff.{cg_eff_pending_thunks}
+
+fn src_closures() -> Str {
+    #"fn main() {
+    let plain = fn(x: Int) -> Int { x + 1 }
+    let held = 5
+    let capturing = fn(y: Int) -> Int { y + held }
+    let _keep = [plain(1), capturing(2)]
+}
+"#
+}
+
+test "a closure literal in expression position lowers to a closure record" {
+    probe("cg_expr_closure", src_closures())
+    let id = lower_expr(rhs_of("plain"))
+    assert_kind("closure value", id, IrKind.ClosureNew)
+    assert_verifies("verify", id)
+}
+
+// The record names a function the IR does not carry, so the definition has to be waiting
+// somewhere for the driver to print. One literal is one definition: a stage that queued
+// none would name a function nothing defines, and one that queued two would define it twice.
+test "lowering a closure literal queues exactly one thunk for the driver" {
+    probe("cg_expr_closure", src_closures())
+    let before = cg_eff_pending_thunks()
+    let id = lower_expr(rhs_of("plain"))
+    assert_kind("closure value", id, IrKind.ClosureNew)
+    assert_eq(cg_eff_pending_thunks(), before + 1)
+}
+
+// A capture needs a C word every captured type can be punned through, which is a layout
+// question nothing answers yet, so such a closure is refused. Routing a closure to the
+// stage that builds it must carry that refusal through rather than turn an unbuildable
+// closure into a record with a capture list it cannot spell. Nothing may be queued for it
+// either: a queued definition for a record no expression produced is a definition whoever
+// drains the queue would have to print for a caller that does not exist.
+test "a closure refused for its capture carries the refusal through and queues no thunk" {
+    probe("cg_expr_closure", src_closures())
+    let before = cg_eff_pending_thunks()
+    assert_ice_saying("capture", lower_expr(rhs_of("capturing")),
+        "ClosureCaptureNotLowered", "from its enclosing function")
+    assert_eq(cg_eff_pending_thunks(), before)
+}
