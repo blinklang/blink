@@ -1,0 +1,253 @@
+// An impl block extends one receiver type. Typecheck resolves that receiver once, while it
+// checks the impl header, and records the tid on the impl node. Codegen keys impl lookup on
+// that recorded tid, not on the receiver's written name: a user `type List` and the builtin
+// `List` share a name but never a tid.
+//
+// The reader is pure. It answers -1 for a node that is not an impl block and for an impl
+// header with no `for` clause, and it never re-resolves the header.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_impl_recv_tid, tc_lookup_node_tid, tc_type_str, tc_tid_kind, lookup_named_type, TyKind}
+import parser.{nodes, node_kind, node_name, node_trait_name, node_params, node_methods, sublist_get, sublist_length}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn assert_only_error(label: Str, name: Str, want: Str) {
+    let errs = error_messages()
+    let mut hits = 0
+    for d in diag_entries {
+        if d.name == name && d.message == want { hits = hits + 1 }
+    }
+    if hits != 1 || errs.len() != 1 {
+        io.println("FAIL: {label}: want exactly one {name} '{want}', got:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(hits == 1)
+    assert(errs.len() == 1)
+}
+
+// The one impl block whose trait is `trait_name`. Trait names below carry a `Zz` prefix so
+// no stdlib impl shares them. -2 marks an ambiguous measurement.
+fn impl_for_trait(trait_name: Str) -> Int {
+    let mut found = -1
+    let mut hits = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.ImplBlock && node_trait_name(i) == trait_name {
+            hits = hits + 1
+            found = i
+        }
+        i = i + 1
+    }
+    if hits > 1 { return -2 }
+    found
+}
+
+// The tid parameter `idx` of the impl's first method was bound to. Index 0 is the receiver
+// parameter, the fact the recorded receiver tid must agree with. A later parameter annotated
+// with the receiver's own spelling (`peers: List[T]`) goes through the annotation path, so it
+// is a second, independent measurement of the same type.
+fn first_method_param_tid(im: Int, idx: Int) -> Int {
+    let ms = node_methods(im)
+    if ms == -1 || sublist_length(ms) == 0 { return -3 }
+    let ps = node_params(sublist_get(ms, 0))
+    if ps == -1 || sublist_length(ps) <= idx { return -3 }
+    let p = sublist_get(ps, idx)
+    if idx == 0 && node_name(p) != "self" && node_name(p) != "_self" { return -3 }
+    tc_lookup_node_tid(p)
+}
+
+fn main_fn_node() -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == "main" { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn recv_str(im: Int) -> Str ! Diag.Report {
+    let t = tc_impl_recv_tid(im)
+    if t < 0 { return "<none>" }
+    tc_type_str(t)
+}
+
+fn struct_src() -> Str {
+    let mut s = "type Bag \{ n: Int }\n"
+    s = s.concat("trait Zzsz \{ fn zzsz(self) -> Int }\n")
+    s = s.concat("impl Zzsz for Bag \{ fn zzsz(self) -> Int \{ self.n } }\n")
+    s = s.concat("fn main() \{ assert(Bag \{ n: 2 }.zzsz() == 2) }\n")
+    s
+}
+
+test "a struct impl records the struct's own tid as its receiver" {
+    typecheck_probe("build/tc_impl_recv_struct.bl", struct_src())
+    assert_no_errors("struct impl")
+    let im = impl_for_trait("Zzsz")
+    assert(im >= 0)
+    if recv_str(im) != "Bag" { io.println("FAIL: struct receiver recorded as {recv_str(im)}, want Bag") }
+    assert(recv_str(im) == "Bag")
+    assert(tc_impl_recv_tid(im) == lookup_named_type("Bag"))
+    assert(tc_impl_recv_tid(im) == first_method_param_tid(im, 0))
+    assert(tc_tid_kind(tc_impl_recv_tid(im)) == TyKind.Struct)
+}
+
+fn enum_src() -> Str {
+    let mut s = "type Sig \{\n    On\n    Off\n}\n"
+    s = s.concat("trait Zzsz \{ fn zzsz(self) -> Int }\n")
+    s = s.concat("impl Zzsz for Sig \{ fn zzsz(_self) -> Int \{ 1 } }\n")
+    s = s.concat("fn main() \{ assert(Sig.On.zzsz() == 1) }\n")
+    s
+}
+
+test "an enum impl records the enum's own tid as its receiver" {
+    typecheck_probe("build/tc_impl_recv_enum.bl", enum_src())
+    assert_no_errors("enum impl")
+    let im = impl_for_trait("Zzsz")
+    assert(im >= 0)
+    if recv_str(im) != "Sig" { io.println("FAIL: enum receiver recorded as {recv_str(im)}, want Sig") }
+    assert(recv_str(im) == "Sig")
+    assert(tc_impl_recv_tid(im) == lookup_named_type("Sig"))
+    assert(tc_impl_recv_tid(im) == first_method_param_tid(im, 0))
+    assert(tc_tid_kind(tc_impl_recv_tid(im)) == TyKind.Enum)
+}
+
+fn container_src() -> Str {
+    let mut s = "trait Zztally \{ fn zztally(self, base: Int, peers: List[T]) -> Int }\n"
+    s = s.concat("impl[T] Zztally for List[T] \{ fn zztally(self, base: Int, peers: List[T]) -> Int \{ base + self.len() + peers.len() } }\n")
+    s = s.concat("fn main() \{ assert([1, 2].zztally(4, [7]) == 7) }\n")
+    s
+}
+
+// A poly impl over a builtin container records the structural receiver with its binder
+// slot, the same fact the receiver parameter is bound to.
+test "a builtin container impl records the container tid with its binder slot" {
+    typecheck_probe("build/tc_impl_recv_container.bl", container_src())
+    assert_no_errors("container impl")
+    let im = impl_for_trait("Zztally")
+    assert(im >= 0)
+    if recv_str(im) != "List[T]" { io.println("FAIL: container receiver recorded as {recv_str(im)}, want List[T]") }
+    assert(recv_str(im) == "List[T]")
+    assert(tc_tid_kind(tc_impl_recv_tid(im)) == TyKind.List)
+    assert(tc_impl_recv_tid(im) == first_method_param_tid(im, 0))
+    assert(tc_impl_recv_tid(im) == first_method_param_tid(im, 2))
+}
+
+fn shadowed_list_src() -> Str {
+    let mut s = "type List \{ n: Int }\n"
+    s = s.concat("trait Zztally \{ fn zztally(self, base: Int, peers: List[T]) -> Int }\n")
+    s = s.concat("impl[T] Zztally for List[T] \{ fn zztally(self, base: Int, peers: List[T]) -> Int \{ base + peers.len() } }\n")
+    s = s.concat("trait Zzown \{ fn zzown(self) -> Int }\n")
+    s = s.concat("impl Zzown for Bag \{ fn zzown(self) -> Int \{ self.n } }\n")
+    s = s.concat("type Bag \{ n: Int }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let ys = [1, 2, 3]\n")
+    s = s.concat("    let tallied = ys.zztally(4, [9])\n")
+    s = s.concat("    let p = List \{ n: 1 }\n")
+    s = s.concat("    let _keep = [tallied, p.n, Bag \{ n: 2 }.zzown()]\n")
+    s = s.concat("}\n")
+    s
+}
+
+// A user `type List` shares the builtin's name. The recorded receiver of `impl[T] .. for
+// List[T]` is the builtin container, and it is not the tid of any user struct: the name key
+// cannot tell these apart, the tid can.
+test "a container impl beside a user type of the same name records the container, not the struct" {
+    typecheck_probe("build/tc_impl_recv_shadowed.bl", shadowed_list_src())
+    assert_no_errors("shadowed List")
+    let im = impl_for_trait("Zztally")
+    assert(im >= 0)
+    if recv_str(im) != "List[T]" { io.println("FAIL: shadowed receiver recorded as {recv_str(im)}, want List[T]") }
+    assert(recv_str(im) == "List[T]")
+    assert(tc_tid_kind(tc_impl_recv_tid(im)) == TyKind.List)
+    let own = impl_for_trait("Zzown")
+    assert(own >= 0)
+    assert(tc_tid_kind(tc_impl_recv_tid(own)) == TyKind.Struct)
+    assert(tc_impl_recv_tid(own) != tc_impl_recv_tid(im))
+    assert(tc_impl_recv_tid(im) == first_method_param_tid(im, 0))
+    assert(tc_impl_recv_tid(im) == first_method_param_tid(im, 2))
+}
+
+test "a node that is not an impl block has no receiver" {
+    typecheck_probe("build/tc_impl_recv_not_impl.bl", struct_src())
+    assert_no_errors("not an impl")
+    let f = main_fn_node()
+    assert(f >= 0)
+    assert(tc_impl_recv_tid(f) == -1)
+    assert(tc_impl_recv_tid(-1) == -1)
+}
+
+fn no_for_src() -> Str {
+    let mut s = "trait Zzsz \{ fn zzsz(self) -> Int }\n"
+    s = s.concat("impl Zzsz \{ fn zzsz(self) -> Int \{ 1 } }\n")
+    s = s.concat("fn main() \{ }\n")
+    s
+}
+
+// A header with no `for` clause names no receiver at all; the reader says so with -1 rather
+// than a type nobody wrote.
+test "an impl header with no for clause has no receiver" {
+    typecheck_probe("build/tc_impl_recv_no_for.bl", no_for_src())
+    let im = impl_for_trait("Zzsz")
+    assert(im >= 0)
+    assert(tc_impl_recv_tid(im) == -1)
+}
+
+fn unknown_recv_src() -> Str {
+    let mut s = "trait Zzsz \{ fn zzsz(self) -> Int }\n"
+    s = s.concat("impl Zzsz for Nope \{ fn zzsz(_self) -> Int \{ 1 } }\n")
+    s = s.concat("fn main() \{ }\n")
+    s
+}
+
+// The receiver is a type position, so an unknown name there is an unknown type, reported
+// once against the impl header.
+test "an impl whose receiver names no type is one UnknownType error" {
+    typecheck_probe("build/tc_impl_recv_unknown.bl", unknown_recv_src())
+    assert_only_error("unknown receiver", "UnknownType", "unknown type 'Nope' in receiver of impl 'Zzsz'")
+}
+
+fn sentinel_recv_src() -> Str {
+    let mut s = "trait Zzsz \{ fn zzsz(self) -> Int }\n"
+    s = s.concat("impl Zzsz for Self \{ fn zzsz(_self) -> Int \{ 1 } }\n")
+    s = s.concat("fn main() \{ }\n")
+    s
+}
+
+// `Self` is a builtin name that lowers to an open type variable. The unknown-receiver check
+// judges the written name, not the shape it lowered to, so this is not an unknown type.
+test "a builtin sentinel receiver is not an unknown type" {
+    typecheck_probe("build/tc_impl_recv_sentinel.bl", sentinel_recv_src())
+    let mut hits = 0
+    for d in diag_entries {
+        if d.name == "UnknownType" { hits = hits + 1 }
+    }
+    assert(hits == 0)
+}

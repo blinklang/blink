@@ -923,7 +923,7 @@ fn tc_impl_matches_instance(im: Int, tid: Int) -> Int ! TypeCheck.Resolve, Diag.
     let binders = node_impl_binders(im)
     let has_binders = if binders != -1 && sublist_length(binders) > 0 { 1 } else { 0 }
     if has_binders == 0 {
-        let recv_tid = tc_impl_self_tid(im)
+        let recv_tid = tc_impl_recv_tid(im)
         return if tc_tid_same_type(recv_tid, tid) { 1 } else { 0 }
     }
     let recv_args = node_recv_type_args(im)
@@ -1006,9 +1006,12 @@ let mut tc_current_fn_ret: Int = -1
 let mut tc_current_fn_name: Str = ""
 // The receiver type of the impl block whose method body is being checked, or -1 outside one
 // (free functions, trait default bodies, test blocks). `self` is the only parameter with no
-// annotation to resolve, so this is where its type comes from — see tc_impl_self_tid. Set and
+// annotation to resolve, so this is where its type comes from — see tc_record_impl_recv_tid. Set and
 // restored by tc_infer_program's impl loop, which is the only place the impl node is in hand.
 let mut tc_current_self_tid: Int = -1
+// The receiver tid of every impl block that has a `for` clause, keyed by impl node. Written
+// once, while validate_trait_impls checks the header; read through tc_impl_recv_tid.
+let mut tc_impl_recv_tids: Map[Int, Int] = Map()
 // The fnsig KEY of the impl method being checked, or "" outside one. An impl method registers its
 // signature under the trait-mangled spelling (tc_mangle_impl_fnsig) but is checked under
 // "{impl_type}_{method}", so without this key, tc_check_fn's `lookup_fnsig(fn_name)` misses and
@@ -5372,40 +5375,69 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     make_typevar(name)
 }
 
-// The receiver type of an impl block, as a tid — i.e. what `self` is.
+// The one write of an impl block's receiver tid — i.e. what `self` is — made while the header
+// is checked.
 //
 // `self` is the one parameter in the language that carries no type annotation, so
-// resolve_param_type (:9786) answers TYPE_UNKNOWN for it and tc_check_fn binds it that way in
+// resolve_param_type answers TYPE_UNKNOWN for it and tc_check_fn would bind it that way in
 // EVERY impl method body. TYPE_UNKNOWN unifies with anything, so that made both the declared-type
 // compare AND the argument check vacuous for every `self.method(...)` call in every Blink
 // program: `self.get(42)` against `fn get(self, k: Str)` passed typecheck and landed as a C
-// compiler error with no Blink span. The impl node has had the answer all along — tc_infer_program
-// reads `node_name(im)` for the qualified method name three lines before checking the body.
+// compiler error with no Blink span. The impl header has had the answer all along.
 //
 // Structural, not the erased base: a poly impl's receiver (`for List[T]`, `for Box[T]`) must carry
 // its type-arg slots, exactly as tc_fnsig_param_instance_tid does for an annotated generic param,
 // or substitute_typevar_tid has nothing to rewrite at the call site. Going through
 // resolve_type_parts gets that for free and keeps one implementation of "name + args is a type".
+// The binders are in scope so the slot reads as a type variable, the same way the method
+// bodies later see it.
 //
 // Validation is suppressed over the arg resolution: these annotation nodes are resolved again
 // here, and the Map/Set branches emit non-deduped E1400 hashability diagnostics that
-// check_impl_type_arg_names (:4643) has already reported against the same header.
+// check_impl_type_arg_names has already reported against the same header.
+//
+// The receiver is a type position (spec §3.4). resolve_type_parts lowers a name it cannot
+// place to a free type variable because other callers need that, so the unknown-name check
+// for the receiver base lives here, with the acceptance set check_impl_type_arg_names uses
+// for the receiver's arguments: a declared or builtin type, or one of the impl's own binders.
 @allow(UnrestoredMutation)
-pub fn tc_impl_self_tid(im: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
-    // -1, not the give-up singleton: there is no receiver here, which is not the same claim as
-    // "the receiver has a type nobody could work out". tc_current_self_tid gates on -1, so the
-    // singleton made a trait default-method body type its own `self` as unknown — and unknown
-    // unifies with everything, which is the vacuous check this function exists to prevent.
-    if im == -1 { return -1 }
+fn tc_record_impl_recv_tid(im: Int) ! TypeCheck.Resolve, Diag.Report {
     // A trait's own default-method bodies have no receiver type to speak of, and the parser
     // leaves the name empty for a header with no `for` clause.
-    if node_name(im) == "" { return -1 }
+    let written = node_name(im)
+    if written == "" { return }
+    let binders_sl = node_impl_binders(im)
+    // The module-resolved name: a namesake type is keyed under its module, not its bare name.
     let name = tc_impl_target_name(im)
+    if impl_binder_declared(binders_sl, written) == 0 && is_primitive_type(written) == 0 && lookup_named_type(name) == -1 {
+        diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type '{written}' in receiver of impl '{node_trait_name(im)}'", im, "the receiver must be a declared type, a builtin type, or a name declared in 'impl[...]' binders")
+    }
+    tc_push_tparam_scope(binders_sl)
     let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
     let t = resolve_type_parts(name, node_recv_type_args(im), -1)
     tc_suppress_ann_validation = saved_suppress
-    t
+    tc_pop_tparam_scope(binders_sl)
+    tc_impl_recv_tids.insert(im, t)
+}
+
+// The receiver tid typecheck recorded for the impl block `im`; pure, so lowering can read it.
+// -1 for a node that is not an impl block and for a header with no `for` clause: neither has
+// a receiver, which is a different claim from "a receiver nobody could type". An impl block
+// with a `for` clause and no record is a compiler bug.
+pub fn tc_impl_recv_tid(im: Int) -> Int ! Diag.Report {
+    if im == -1 { return -1 }
+    if node_kind(im) != NodeKind.ImplBlock { return -1 }
+    if node_name(im) == "" { return -1 }
+    match tc_impl_recv_tids.get(im) {
+        Some(t) => t
+        None => {
+            diag_ice_at("ImplReceiverNotRecorded", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "impl block {im} has no recorded receiver type", im,
+                "validate_trait_impls records every impl receiver before anything reads it; this is a compiler defect, not a program error")
+            -1
+        }
+    }
 }
 
 // OFF-PATH monomorphized-struct-instance producer. Called only
@@ -7938,6 +7970,7 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
         let im = sublist_get(impls_sl, ii)
         let trait_name = node_trait_name(im)
         let impl_type = tc_impl_target_name(im)
+        tc_record_impl_recv_tid(im)
         if is_trait_name(trait_name) == 0 {
             if is_sealed_builtin_type(trait_name) != 0 && is_user_sourced(im) != 0 {
                 diag_error_at("TraitContract", TRAIT_CONTRACT_907, "'{trait_name}' is a sealed built-in type and cannot be implemented for user types", im, "'{trait_name}' is a closed built-in; define your own trait with the methods you need and impl that instead")
@@ -7980,7 +8013,7 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
         // The impl-header RECEIVER is a type position (spec §3.4): a bare
         // `impl Show for Box` on a generic `Box[T]` is error[TypeArgArity] just
         // as a bare `Box` param would be. The receiver is resolved through
-        // tc_impl_self_tid with annotation validation suppressed, so its arity
+        // tc_record_impl_recv_tid with annotation validation suppressed, so its arity
         // is checked here rather than in resolve_type_parts.
         tc_push_tparam_scope(binders_sl)
         let recv_want = tc_ctor_arity(impl_type)
@@ -8079,10 +8112,10 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
         // Deep (tid) contract audit runs alongside the string compare below: the
         // impl's own binders are in scope for its receiver + method signatures.
         // Validation suppression for the re-resolutions lives inside
-        // tc_impl_self_tid and tc_trait_contract_tid_check, so this function
-        // keeps no save/restore idiom of its own.
+        // tc_trait_contract_tid_check, so this function keeps no save/restore
+        // idiom of its own.
         tc_push_tparam_scope(binders_sl)
-        let impl_recv_tid = tc_impl_self_tid(im)
+        let impl_recv_tid = tc_impl_recv_tid(im)
         let mut si = 0
         while si < tc_tmsig_pool.len() {
             let tmsig = tc_tmsig_pool.get(si).unwrap()
@@ -8267,6 +8300,7 @@ fn init_types() ! TypeCheck.Register {
     tc_type_decl_node_by_tid.clear()
     tc_type_decl_ambiguous_names = Map()
     tc_namesake_type_modules = Map()
+    tc_impl_recv_tids = Map()
     tc_active_tparams.clear()
     tc_tp_arith_names.clear()
     tc_tp_bound_traits.clear()
@@ -8794,7 +8828,7 @@ fn register_ue_handle(name: Str) {
 // tc_infer_program; registering under the bare op name would collide with any free function
 // of that name. Annotation validation is suppressed: the op's types are validated where the
 // effect is DECLARED, and a consuming module that never selectively imported `Row` must not
-// be told about it here (the same reason tc_impl_self_tid suppresses it).
+// be told about it here (the same reason tc_record_impl_recv_tid suppresses it).
 @allow(UnrestoredMutation)
 fn register_ue_op_sigs(ed: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     let handle = str_to_lower(node_name(ed))
@@ -17838,12 +17872,10 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
             let im = sublist_get(impls_sl, i)
             nr_current_module = node_module(im)
             let impl_type = tc_impl_target_name(im)
-            // What `self` is inside these bodies. Resolved once per impl block, not per
-            // method: the receiver is a property of the header, and resolve_type_parts
-            // interns through the pool so a repeat would only churn it. The binders are
-            // pushed first so a receiver arg that shadows a builtin (`impl[Map] Sz for
-            // List[Map]`) reads as the in-scope type variable, not the constructor
-            // (§3.4:1259).
+            // The binders are in scope for the span of the method bodies. The receiver
+            // itself was recorded under the same scope when the header was checked, so a
+            // receiver arg that shadows a builtin (`impl[Map] Sz for List[Map]`) already
+            // reads as the type variable, not the constructor (§3.4:1259).
             let impl_binders_sl = node_impl_binders(im)
             tc_push_tparam_scope(impl_binders_sl)
             // The binders (`[T]`) carry no bounds; an impl's arithmetic bounds live
@@ -17852,7 +17884,7 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
             // the bounded `where T` frame shadows the unbounded binder `T` frame.
             let impl_where_sl = node_impl_where_bounds(im)
             tc_push_arith_frames(impl_where_sl)
-            tc_current_self_tid = tc_impl_self_tid(im)
+            tc_current_self_tid = tc_impl_recv_tid(im)
             let methods_sl = node_methods(im)
             if methods_sl != -1 {
                 let mut j = 0
