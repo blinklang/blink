@@ -1,0 +1,297 @@
+// The C a @derive(Clone) type gets: one copy per declared field, read off the declared
+// shape and spelled by layout. Clone is a logical copy one level deep, so a field is
+// copied as a value and a pointer field shares what it points at. That is the one place
+// Clone parts from Eq, Debug and Hash: those call the field type's own derived method,
+// and Clone must not, because a copy that recursed would deep-copy what the language
+// says it shares.
+//
+// A field this stage has no copy rule for is a recorded internal error, never a field
+// copied without a rule. The copy is written one field at a time so that layout is asked
+// about each field before that field is copied.
+
+import std.io
+import layout.{layout_reset}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build, cg_reg_type_decls}
+import cg_derive.{cg_derive_reset, cg_derive_emit_decls, cg_derive_emit_bodies}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_saying, cg_text_occurrences, CG_ICE_STAGE_NOT_BUILT}
+
+// Point is copied by two scalars, Named holds a pointer field beside a scalar, Color has
+// a tag and no payload, and Shape carries payloads under two tags.
+fn clone_src() -> Str {
+    #"@derive(Clone)
+type Point { x: Int, y: Int }
+@derive(Clone)
+type Named { name: Str, id: Int }
+@derive(Clone)
+type Color { Red, Green, Blue }
+@derive(Clone)
+type Shape {
+    Circle(radius: Int)
+    Rect(w: Int, h: Int)
+}
+fn main() { }
+"#
+}
+
+// Compiling resets the diagnostic counters, so a test that counts what this stage
+// records must read the counters after the probe is built, never before it.
+fn program_of(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let program = cg_probe_compile("build/{stem}_probe_src.bl", src)
+    layout_reset()
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_derive_reset()
+    program
+}
+
+fn bodies_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _p = program_of(stem, src)
+    cg_derive_emit_bodies(cg_reg_type_decls())
+    print_take()
+}
+
+fn decls_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _p = program_of(stem, src)
+    cg_derive_emit_decls(cg_reg_type_decls())
+    print_take()
+}
+
+// How many times the body pass records one named refusal saying one thing, for a probe's
+// own file. A count of every internal error would be satisfied by an unrelated refusal in
+// the same probe, so a test that names one refusal would pass whether or not it fired.
+fn refusals_saying(stem: Str, src: Str, name: Str, marker: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _p = program_of(stem, src)
+    cg_derive_emit_bodies(cg_reg_type_decls())
+    cg_probe_ices_saying(name, marker)
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output still has '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+// The C of one function, from its opening line to the brace that closes it in column
+// zero. A needle checked against the whole unit would match another function's body.
+fn one_fn(text: Str, head: Str) -> Str {
+    let start = text.index_of(head)
+    if start < 0 { io.println("FAIL: output has no '{head}'\n--- output ---\n{text}") }
+    assert(start >= 0)
+    let rest = text.substring(start, text.len() - start)
+    let end = rest.index_of("\n}")
+    assert(end >= 0)
+    rest.substring(0, end)
+}
+
+test "a derived clone takes its own type and answers its own type" {
+    assert_has(bodies_of("cg_derive_clone", clone_src()),
+        #"blink_Point blink_Point_clone(blink_Point self) {"#)
+}
+
+// One definition per type. A second definition of the same symbol is a duplicate the C
+// compiler rejects, and the name stage is the only thing that may choose the spelling.
+test "a struct is cloned by exactly one definition of the symbol the name stage chose" {
+    let text = bodies_of("cg_derive_clone", clone_src())
+    assert_eq(cg_text_occurrences(text, #"blink_Point blink_Point_clone(blink_Point self) {"#), 1)
+    assert_eq(cg_text_occurrences(text, #"blink_Named blink_Named_clone(blink_Named self) {"#), 1)
+    assert_eq(cg_text_occurrences(text, #"blink_Shape blink_Shape_clone(blink_Shape self) {"#), 1)
+}
+
+test "each scalar field is copied by name into the value that is answered" {
+    let text = one_fn(bodies_of("cg_derive_clone", clone_src()), "blink_Point blink_Point_clone")
+    assert_has(text, ".x = self.x;")
+    assert_has(text, ".y = self.y;")
+}
+
+// A Str is a pointer and the language says a clone shares what it points at, so the
+// copy is the pointer itself. A call to a string-copying helper here would deep-copy a
+// value the spec keeps shared.
+test "a pointer field is copied as the pointer, not through a copying helper" {
+    let text = one_fn(bodies_of("cg_derive_clone", clone_src()), "blink_Named blink_Named_clone")
+    assert_has(text, ".name = self.name;")
+    assert_lacks(text, "blink_Str")
+    assert_lacks(text, "strdup")
+}
+
+// A value layout gives as one word is its own whole value, so there is no member to copy
+// and nothing to build: it answers itself.
+test "a payload-less enum answers its own word instead of reading a member" {
+    let text = one_fn(bodies_of("cg_derive_clone", clone_src()), "blink_Color blink_Color_clone")
+    assert_has(text, "return self;")
+    assert_lacks(text, ".tag =")
+}
+
+// The tag has to be copied before the payload, because the tag is what says which payload
+// the new value may be read through at all. The order is asserted rather than assumed: a
+// copy that wrote the payload first would leave a value whose tag and payload disagree for
+// as long as the write took.
+test "a payload enum copies the tag before it copies any payload" {
+    let text = one_fn(bodies_of("cg_derive_clone", clone_src()), "blink_Shape blink_Shape_clone")
+    assert_has(text, ".tag = self.tag;")
+    assert_has(text, ".data.Circle.radius = self.data.Circle.radius;")
+    assert(text.index_of(".tag = self.tag;") < text.index_of(".data.Circle.radius"))
+}
+
+// Each variant's payload is copied under that variant's own tag. A payload copied under
+// another variant's tag reads a union member the value does not hold.
+test "each variant's payload is copied under that variant's own tag" {
+    let text = one_fn(bodies_of("cg_derive_clone", clone_src()), "blink_Shape blink_Shape_clone")
+    let circle = text.index_of("blink_Shape_Circle_TAG")
+    let rect = text.index_of("blink_Shape_Rect_TAG")
+    assert(circle >= 0)
+    assert(rect >= 0)
+    assert(circle < text.index_of(".data.Circle.radius = self.data.Circle.radius;"))
+    assert(text.index_of(".data.Circle.radius = self.data.Circle.radius;") < rect)
+    assert(rect < text.index_of(".data.Rect.w = self.data.Rect.w;"))
+    assert_has(text, ".data.Rect.h = self.data.Rect.h;")
+}
+
+// A tag no variant declares means the value was already corrupt. Copying it would carry
+// the corruption into a second value and hide where it came from.
+// The panic names the derive it came from. One builder writes this text for every derive
+// that switches on a tag, and it is handed the name, so a body given another derive's name
+// would compile and then report the wrong derive to whoever reads the crash.
+test "a tag no variant declares panics instead of copying an unknown payload" {
+    let text = one_fn(bodies_of("cg_derive_clone", clone_src()), "blink_Shape blink_Shape_clone")
+    assert_has(text, "@derive(Clone) on Shape met a tag no variant declares")
+}
+
+test "the declaration pass writes a signature for the clone method and no body" {
+    let text = decls_of("cg_derive_clone_decls", clone_src())
+    assert_has(text, "blink_Point blink_Point_clone(blink_Point self);")
+    assert_lacks(text, "= self.x;")
+}
+
+test "a clone body is no longer refused as unbuilt" {
+    assert_eq(refusals_saying("cg_derive_clone_built", clone_src(), CG_ICE_STAGE_NOT_BUILT,
+        "@derive(Clone)"), 0)
+}
+
+// A field whose own type derives Clone is the shape where a recursive copy would compile
+// and link, because the nested method exists. The language says a clone is one level deep,
+// so the copy stays a value copy and the nested method is never called.
+fn nested_derive_src() -> Str {
+    #"@derive(Clone)
+type Inner { v: Int }
+@derive(Clone)
+type Outer { i: Inner, n: Int }
+fn main() { }
+"#
+}
+
+test "a field whose type also derives Clone is copied, not cloned recursively" {
+    let text = one_fn(bodies_of("cg_derive_clone_nested", nested_derive_src()),
+        "blink_Outer blink_Outer_clone")
+    assert_has(text, ".i = self.i;")
+    assert_lacks(text, "blink_Inner_clone(")
+}
+
+// Clone does not call the field type's own method, so a field of a generic type is
+// copied like any other value. Eq, Debug and Hash have to refuse this shape because they
+// would call a body that has one definition per instance and none yet.
+fn generic_field_src() -> Str {
+    #"type Box[T] { v: T }
+@derive(Clone)
+type Holder { b: Box[Int], n: Int }
+fn main() { }
+"#
+}
+
+test "a field of a generic type is copied rather than refused" {
+    assert_eq(refusals_saying("cg_derive_clone_generic", generic_field_src(),
+        CG_ICE_STAGE_NOT_BUILT, "@derive(Clone)"), 0)
+    assert_eq(cg_text_occurrences(bodies_of("cg_derive_clone_generic", generic_field_src()),
+        #"blink_Holder blink_Holder_clone(blink_Holder self) {"#), 1)
+    let text = one_fn(bodies_of("cg_derive_clone_generic", generic_field_src()),
+        "blink_Holder_clone")
+    assert_has(text, ".b = self.b;")
+    assert_has(text, ".n = self.n;")
+    assert_lacks(text, "_clone(self.b)")
+}
+
+// An @ffi.opaque handle is a pointer to a body this compiler cannot see. It exposes no
+// fields, so a field walk over it answers a value with nothing copied into it.
+fn opaque_src() -> Str {
+    #"@derive(Clone)
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn main() { }
+"#
+}
+
+test "an opaque handle is refused, not answered as a value with nothing copied" {
+    assert_eq(refusals_saying("cg_derive_clone_opaque", opaque_src(), CG_ICE_STAGE_NOT_BUILT,
+        "@derive(Clone) on the opaque handle 'CFile'"), 1)
+    assert_lacks(bodies_of("cg_derive_clone_opaque", opaque_src()), "_clone")
+}
+
+// A field that reaches its own enum is stored as an opaque word holding a heap pointer.
+// Eq, Debug and Hash have to refuse that word, because each of them answers from what is
+// behind it and this stage does not walk a pointer. A clone never looks behind it: the
+// language says a clone copies a pointer field as the pointer, so copying the word is the
+// whole answer, and refusing here would report a compiler bug for a program that is fine.
+fn recursive_field_src() -> Str {
+    #"@derive(Clone)
+type Tree {
+    Leaf
+    Node(v: Int, next: Tree)
+}
+fn main() { }
+"#
+}
+
+test "a field stored as a boxed word is copied as the word, not refused" {
+    assert_eq(refusals_saying("cg_derive_clone_boxed", recursive_field_src(),
+        CG_ICE_STAGE_NOT_BUILT, "@derive(Clone)"), 0)
+    let text = one_fn(bodies_of("cg_derive_clone_boxed", recursive_field_src()),
+        "blink_Tree blink_Tree_clone")
+    assert_has(text, ".data.Node.v = self.data.Node.v;")
+    assert_has(text, ".data.Node.next = self.data.Node.next;")
+}
+
+// An enum with one variant that carries a payload and one that carries none. Cloning the
+// variant with no payload writes the tag and nothing else, so the value being answered has
+// members no statement wrote unless it starts determinate.
+fn mixed_enum_src() -> Str {
+    #"@derive(Clone)
+type Maybe {
+    Nothing
+    Just(v: Int)
+}
+fn main() { }
+"#
+}
+
+test "the value a clone answers is written whole, including under a variant with no payload" {
+    let text = one_fn(bodies_of("cg_derive_clone_mixed", mixed_enum_src()),
+        "blink_Maybe blink_Maybe_clone")
+    assert_has(text, #"= {0};"#)
+    assert_has(text, ".tag = self.tag;")
+    assert_has(text, ".data.Just.v = self.data.Just.v;")
+}
+
+// A transparent newtype is a bare word, so the word is the whole value and there is no
+// member to copy.
+fn newtype_src() -> Str {
+    #"@derive(Clone)
+type Errno { Errno(Int) }
+fn main() { }
+"#
+}
+
+test "a transparent newtype answers its word instead of building a value" {
+    let text = one_fn(bodies_of("cg_derive_clone_newtype", newtype_src()), "blink_Errno_clone")
+    assert_has(text, "return self;")
+    assert_lacks(text, "self.tag")
+    assert_lacks(text, "self.data")
+}
