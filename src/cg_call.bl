@@ -10,11 +10,13 @@
 // The seams this module publishes replace the refusals cg_expr records for the shapes it
 // does not own: the Eq or Ord method a comparison operator desugars to, the Display call
 // an interpolation hole needs, the container copy a spread performs, and the element read
-// that `[i]` and `.get(i)` share. Each takes its operands already lowered, so cg_expr
-// keeps control of evaluation order and of the statements an operand hoisted.
+// that `[i]` and `.get(i)` share. An operator seam takes its operands already lowered, so
+// cg_expr keeps the statements an operand hoisted; the element read takes the written node
+// instead, because it can refuse off the types alone and an operand built for a refused
+// read is still in the unit.
 
 import parser.{
-    node_kind, node_name, node_left, node_obj, node_method, node_args,
+    node_kind, node_name, node_left, node_obj, node_index, node_method, node_args,
     node_methods, node_trait_name, node_impl_binders,
     node_module, node_source_module,
     sublist_get, sublist_length,
@@ -159,16 +161,22 @@ pub fn lower_spread(node: Int, into_tid: Int) -> Int ! Diag.Report {
 // type, and `.get(i)`, which answers an Option over it. Only the index is routed here yet;
 // the checked read keeps its arm so that the refusal names the right gap when it is.
 //
-// Everything the read can refuse is settled before any node is built, so a refusal leaves
-// no half-made read behind. The operands arrive already lowered, which is the caller's
-// choice of evaluation order, so those two nodes are the caller's to account for.
-pub fn lower_element_read(node: Int, obj: Int, index: Int) -> Int ! Diag.Report {
-    if obj < 0 || index < 0 { return -1 }
+// The read takes the written node and lowers its own operands, last of all. Everything
+// this seam can refuse is settled first, off the types alone, so a read it cannot build
+// returns before either operand is built: an IR node no result reaches is still in the
+// unit, and the printer walks what the unit holds, not what the answer reached. An operand
+// that refuses on its own account is a different matter, and one this seam cannot undo.
+pub fn lower_element_read(node: Int) -> Int ! Diag.Report {
     if cc_read_is_checked(node) { return cc_checked_read(node) }
     if nk_of(node_kind(node)) != NodeKind.IndexExpr { return cc_not_an_element_read(node) }
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
-    let helper = cc_element_helper(node, ir_tid(obj))
+    // The container's own type is read before the helper is chosen, because a helper asked
+    // for the kind of a type that was never recorded names a second, invented gap on top of
+    // the one already reported.
+    let container = tid_of_node(node_obj(node))
+    if container < 0 { return -1 }
+    let helper = cc_element_helper(node, container)
     if helper == "" { return -1 }
     let slot = cc_element_layout(node, tid, Position.ContainerSlot)
     if cc_stopped(slot) { return -1 }
@@ -176,6 +184,10 @@ pub fn lower_element_read(node: Int, obj: Int, index: Int) -> Int ! Diag.Report 
     if !boxed && slot.slot_form != SlotForm.InlineWord { return cc_element_slot_form(node, tid) }
     let value = if boxed { cc_element_layout(node, tid, Position.Local) } else { slot }
     if cc_stopped(value) { return -1 }
+    let obj = lower_expr(node_obj(node))
+    if obj < 0 { return -1 }
+    let index = lower_expr(node_index(node))
+    if index < 0 { return -1 }
     let raw = ir_call_runtime(tid, node, slot.c_spelling, helper, slot.slot_form, [obj, index])
     let read = ir_cast(tid, node, slot.c_spelling, raw)
     if !boxed { return read }
