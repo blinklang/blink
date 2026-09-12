@@ -1,0 +1,185 @@
+// The thunk queue on its way out: one definition per queued closure, and an empty queue
+// at the start of every unit.
+//
+// A closure literal leaves its definition in a queue for the driver to print after the
+// enclosing body. This file proves the two ends of that protocol the driver relies on:
+// one queued thunk prints as exactly one definition and then leaves the queue with no
+// report, and a unit begun after another one starts from an empty queue, so a thunk of a
+// program that is no longer current can never be printed into the next unit.
+
+import cname_test_helpers.{find_decl}
+import cg_test_helpers.{cg_probe_compile, cg_text_occurrences}
+import ast.{NodeKind}
+import parser.{node_value}
+import layout.{layout_reset}
+import ir.{ir_reset}
+import mono.{run_mono}
+import cg_reg.{cg_reg_build}
+import cg.{CgConfig, generate}
+import cg_print.{print_reset, print_take}
+import cg_expr.{cg_expr_reset}
+import cg_stmt.{cg_stmt_reset, lower_block_returning}
+import cg_eff.{
+    cg_eff_lower_closure, cg_eff_pending_thunks, cg_eff_print_thunk, cg_eff_reset,
+    cg_eff_thunk_body_node, cg_eff_thunk_close, cg_eff_thunk_open, cg_eff_thunk_symbol,
+    cg_eff_thunks_drained,
+}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+
+fn closure_src() -> Str {
+    #"fn plain_closure() -> Int {
+    let g_plain = fn(x: Int) -> Int { x + 1 }
+    g_plain(1)
+}
+
+fn main() { let x = 1 }
+"#
+}
+
+// A unit with no closure in it, so a thunk found in its output can only be a stale one.
+fn plain_src() -> Str {
+    #"fn plain(a: Int) -> Int { a }
+fn main() { let x = 1 }
+"#
+}
+
+fn ices() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" { n = n + 1 }
+    }
+    n
+}
+
+// The queue's own reports carry no position, so the probe-owned counters in
+// cg_test_helpers, which read a report's file, cannot see them.
+fn ices_saying(name: Str, marker: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.name == name && d.message.contains(marker) { n = n + 1 }
+    }
+    n
+}
+
+fn ices_named(name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.name == name { n = n + 1 }
+    }
+    n
+}
+
+fn report_ices() {
+    for d in diag_entries {
+        if d.severity == "ice" { io.println("  ICE {d.name} {d.message}") }
+    }
+}
+
+fn reset_stages() {
+    diag_reset()
+    ir_reset()
+    print_reset()
+    layout_reset()
+    cg_stmt_reset()
+    cg_expr_reset()
+    cg_eff_reset()
+}
+
+fn probe_program(name: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    env.set_var("BLINK_ROOT", env.cwd())
+    let path = "build/{name}.bl"
+    let program = cg_probe_compile(path, src)
+    let _ = fs.delete(path)
+    program
+}
+
+fn setup_closure_program() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    reset_stages()
+    let program = probe_program("cg_eff_thunk_drain_closure_probe", closure_src())
+    cg_reg_build(program)
+    diag_reset()
+    program
+}
+
+fn closure_of(let_name: Str) -> Int {
+    let binding = find_decl(NodeKind.LetBinding, let_name, "")
+    assert(binding >= 0)
+    node_value(binding)
+}
+
+fn standalone_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+// The same steps the driver takes for one queued thunk: open its frame, lower its body
+// through the statement stage, close the frame, print the definition.
+fn drain_one(i: Int) ! Diag.Report {
+    assert(cg_eff_thunk_open(i) >= 0)
+    let body = lower_block_returning(cg_eff_thunk_body_node(i))
+    cg_eff_thunk_close()
+    assert(body >= 0)
+    cg_eff_print_thunk(i, body)
+}
+
+test "one non-capturing closure prints exactly one thunk definition and the drain records nothing" {
+    let _ = setup_closure_program()
+    let _ = cg_eff_lower_closure(closure_of("g_plain"))
+    assert_eq(cg_eff_pending_thunks(), 1)
+    let symbol = cg_eff_thunk_symbol(0)
+    drain_one(0)
+    let text = print_take()
+    if cg_text_occurrences(text, "{symbol}(") != 1 || ices() != 0 {
+        io.println("FAIL: expected one definition of {symbol}:")
+        report_ices()
+        io.println(text)
+    }
+    assert_eq(cg_text_occurrences(text, "{symbol}("), 1)
+    assert_eq(cg_text_occurrences(text, "{symbol}(const blink_closure* __self, int64_t"), 1)
+    cg_eff_thunks_drained(1)
+    assert_eq(cg_eff_pending_thunks(), 0)
+    assert_eq(ices(), 0)
+}
+
+test "two emits in one process start the second with an empty queue" {
+    let _ = setup_closure_program()
+    let _ = cg_eff_lower_closure(closure_of("g_plain"))
+    let stale = cg_eff_thunk_symbol(0)
+    assert_eq(cg_eff_pending_thunks(), 1)
+    let plain = probe_program("cg_eff_thunk_drain_plain_probe", plain_src())
+    run_mono(plain)
+    let text = generate(plain, standalone_cfg())
+    if cg_eff_pending_thunks() != 0 || text.index_of(stale) >= 0 {
+        io.println("FAIL: the stale thunk {stale} survived into the next unit:")
+        report_ices()
+    }
+    assert_eq(cg_eff_pending_thunks(), 0)
+    assert(text.index_of(stale) < 0)
+    assert_eq(ices_named("ThunkQueueNotDrained"), 0)
+    assert_eq(ices_named("NoSuchThunk"), 0)
+    assert_eq(ices_named("ThunkFrameNested"), 0)
+    assert_eq(ices_named("UnspellableThunkSlot"), 0)
+    assert_eq(ices_named("ClosureTypeHasNoSlot"), 0)
+}
+
+test "a drain count that does not match the queue is an internal error and keeps the queue" {
+    let _ = setup_closure_program()
+    let _ = cg_eff_lower_closure(closure_of("g_plain"))
+    cg_eff_thunks_drained(0)
+    assert_eq(ices_saying("ThunkQueueNotDrained", "the driver printed 0 thunks but 1 are queued"), 1)
+    assert_eq(ices(), 1)
+    assert_eq(cg_eff_pending_thunks(), 1)
+}
+
+test "printing a thunk the queue does not hold is an internal error and prints nothing" {
+    let _ = setup_closure_program()
+    let _ = cg_eff_lower_closure(closure_of("g_plain"))
+    drain_one(0)
+    let _ = print_take()
+    cg_eff_print_thunk(1, 0)
+    assert_eq(ices_saying("NoSuchThunk", "thunk 1 is not in the queue of 1"), 1)
+    assert_eq(ices(), 1)
+    assert_eq(cg_text_occurrences(print_take(), "closure"), 0)
+}
