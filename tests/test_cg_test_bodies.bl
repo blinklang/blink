@@ -1,0 +1,295 @@
+// A test block is a body like any other, and the unit that holds one is not whole without
+// the table and the entry the runtime's runner reads. These prove both halves: the body
+// the driver lowers through the same producers a function body goes through, and the
+// registration the released runner expects to find beside it.
+
+import std.fs
+import std.io
+import layout.{layout_reset}
+import cname.{cname_reset, c_test_fn_name}
+import parser.{node_str_val}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_naming, cg_probe_ices_saying,
+    cg_text_occurrences, CG_ICE_STAGE_NOT_BUILT}
+import cg.{CgConfig, generate, generate_module_object}
+import cg_expr.{cg_expr_pending_count}
+import cg_reg.{cg_reg_test_decls}
+import mono.{run_mono}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output must not have '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+// The same order the real drivers use. The mono pass is not part of generate, so a probe
+// that skips it has no instance table and a generic base looks like a base with no uses.
+fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    let program = cg_probe_compile(path, src)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    program
+}
+
+fn standalone_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+// The symbol one test block is written under, read from the producer rather than spelled
+// again here. A test that wrote the name itself would keep passing after the producer
+// changed, and the C it measures would then name a function the table does not.
+fn symbol_of(name: Str) -> Str {
+    for t in cg_reg_test_decls() {
+        if node_str_val(t) == name { return c_test_fn_name(t) }
+    }
+    io.println("FAIL: no test block named '{name}' in the registry")
+    assert(false)
+    ""
+}
+
+// How many times a symbol is defined, which is the claim "written once". The symbol also
+// appears in the table that points at it, so a bare occurrence count cannot say it.
+fn definitions_of(text: Str, symbol: Str) -> Int {
+    cg_text_occurrences(text, "static void {symbol}(void)")
+}
+
+// A body of one binding. Nothing in it reaches a stage that has not landed, so a report
+// from this probe is a report about the test-body path itself.
+fn one_test_src() -> Str {
+    #"fn main() { let x = 1 }
+
+test "keeps one binding" {
+    let y = 2
+}
+"#
+}
+
+test "a test block is emitted as a body" {
+    let program = build_probe(one_test_src(), "cg_test_one_probe")
+    let text = generate(program, standalone_cfg())
+    let sym = symbol_of("keeps one binding")
+    assert_eq_int("the body is written once", definitions_of(text, sym), 1)
+    assert_has(text, "static void {sym}(void) \{")
+    assert_eq_int("a body that reaches no unbuilt stage reports none",
+        cg_probe_ices_naming("is not built"), 0)
+}
+
+fn two_tests_src() -> Str {
+    #"fn main() { let x = 1 }
+
+test "first" {
+    let a = 1
+}
+
+test "second" {
+    let b = 2
+}
+"#
+}
+
+test "two test blocks are emitted under two distinct symbols" {
+    let program = build_probe(two_tests_src(), "cg_test_two_probe")
+    let text = generate(program, standalone_cfg())
+    let first = symbol_of("first")
+    let second = symbol_of("second")
+    assert(first != second)
+    assert_eq_int("the first body is written once", definitions_of(text, first), 1)
+    assert_eq_int("the second body is written once", definitions_of(text, second), 1)
+}
+
+// The runner is the contract with the runtime: the shim calls __blink_run_tests, and the
+// runtime's blink_test_run reads a table of blink_test_entry. A unit that writes the
+// bodies and not the table links against a runner that does not exist.
+test "the table and the runner entry the runtime reads are emitted beside the bodies" {
+    let program = build_probe(two_tests_src(), "cg_test_table_probe")
+    let text = generate(program, standalone_cfg())
+    assert_has(text, "static const blink_test_entry __blink_tests[] = \{")
+    assert_has(text, "static void __blink_run_tests(int argc, const char** argv) \{")
+    assert_has(text, "blink_test_run(__blink_tests, 2, argc, argv);")
+    assert_has(text, #""first""#)
+    assert_has(text, #""second""#)
+}
+
+// Every name a filter or a tag selector matches is the test's own string, and the xfail
+// reason is what the runner prints for an expected failure. All three live in the table
+// row, so a row that drops one silently changes which tests run.
+fn tagged_src() -> Str {
+    #"fn main() { let x = 1 }
+
+@tags("slow", "net")
+test "carries its tags" {
+    let a = 1
+}
+
+test.failing("known to fail", reason: "the shape is not built", ticket: "abcdef") {
+    let b = 2
+}
+"#
+}
+
+test "a test row carries the tags and the expected-failure reason the runner prints" {
+    let program = build_probe(tagged_src(), "cg_test_tags_probe")
+    let text = generate(program, standalone_cfg())
+    let tagged = symbol_of("carries its tags")
+    assert_has(text, "static const char* {tagged}_tags[] = \{\"slow\", \"net\"};")
+    assert_has(text, "{tagged}_tags, 2, 0, NULL}")
+    // The flag, not just the sentence: it is what inverts the runner's verdict, so a row
+    // that carried the reason and a zero would read as an ordinary failing test.
+    assert_has(text, "NULL, 0, 1, \"br:abcdef — the shape is not built\"}")
+}
+
+// A test body is lowered through the same statement and expression producers a function
+// body goes through, so a construct those have not built is refused there in the same way.
+// The pending buffer holds statements that fill temps only the refused expression reads;
+// one left behind would be spliced in front of a body that never reads it.
+fn unbuilt_src() -> Str {
+    #"fn main() { let x = 1 }
+
+test "names a call the stage has not built" {
+    assert(true)
+}
+"#
+}
+
+test "a test body whose statement is not built is refused once and leaves no pending statement" {
+    let program = build_probe(unbuilt_src(), "cg_test_unbuilt_probe")
+    let _text = generate(program, standalone_cfg())
+    assert_eq_int("the refusal names the stage that would write the call, once",
+        cg_probe_ices_saying(CG_ICE_STAGE_NOT_BUILT,
+            "cg_call closure values and compiler-provided calls"), 1)
+    assert_eq_int("and the buffer the refusal unwound is empty",
+        cg_expr_pending_count(), 0)
+}
+
+// The per-module mode cuts one program into one C file per module, and the entry module's
+// file is the only one that gets the shim. The shim calls the runner, so the runner and
+// the table it reads belong in that same file: a static the shim's own translation unit
+// does not define is a name the linker cannot resolve.
+test "the per-module entry unit carries the runner its own shim calls" {
+    let program = build_probe(two_tests_src(), "cg_test_permodule_probe")
+    let text = generate_module_object(program, "__main__", "mod___main__.h", standalone_cfg())
+    assert_has(text, "static void __blink_run_tests(int argc, const char** argv) \{")
+    assert_has(text, "blink_test_run(__blink_tests, 2, argc, argv);")
+    assert_has(text, "__blink_run_tests(argc, (const char**)argv)")
+    assert_eq_int("and the first body is written once beside it",
+        definitions_of(text, symbol_of("first")), 1)
+}
+
+// A tag is written either quoted or bare, and the runner matches a selector against
+// whichever spelling the source used. A reader that answers only one of the two silently
+// empties the table for every file written in the other.
+fn bare_tag_src() -> Str {
+    #"fn main() { let x = 1 }
+
+@tags(unit)
+test "carries a bare tag" {
+    let a = 1
+}
+"#
+}
+
+test "a tag written without quotes reaches the row" {
+    let program = build_probe(bare_tag_src(), "cg_test_bare_tag_probe")
+    let text = generate(program, standalone_cfg())
+    let tagged = symbol_of("carries a bare tag")
+    assert_has(text, "static const char* {tagged}_tags[] = \{\"unit\"};")
+    assert_has(text, "{tagged}_tags, 1, 0, NULL}")
+}
+
+// A module that is not the entry module gets no shim, so it must get no table and no test
+// body either. Both are file-static and the table holds the address of every body, so a
+// copy in a second unit is either a runner nothing calls or a body the entry unit's table
+// cannot name.
+fn two_module_probe(stem: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let root = "build/{stem}_pkg"
+    let _clean = process_run("rm", ["-rf", root])
+    let _mk = process_run("mkdir", ["-p", "{root}/src"])
+    write_file("{root}/blink.toml", "[package]\nname = \"{stem}\"\nversion = \"0.1.0\"\n")
+    write_file("{root}/src/mymod.bl", #"pub fn helper(x: Int) -> Int { x }
+"#)
+    let program = cg_probe_compile("{root}/src/probe.bl", #"import mymod.{helper}
+
+fn main() { let _x = helper(1) }
+
+test "first" {
+    let a = 1
+}
+"#)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let _rm = process_run("rm", ["-rf", root])
+    program
+}
+
+test "a module that gets no shim gets no test table and no test body" {
+    let program = two_module_probe("cg_test_other_mod")
+    let other = generate_module_object(program, "mymod", "mymod.h", standalone_cfg())
+    assert_lacks(other, "__blink_tests")
+    assert_lacks(other, "__blink_run_tests")
+    assert_lacks(other, "static void blink_test__")
+    let entry = generate_module_object(program, "__main__", "mod___main__.h", standalone_cfg())
+    assert_has(entry, "blink_test_run(__blink_tests, 1, argc, argv);")
+}
+
+// The shape `blink test` links: a file of test blocks and no main. The shim then calls the
+// runner with no flag to read, so a unit that wrote the table only for a program with a
+// main would build a binary that runs nothing.
+fn no_main_src() -> Str {
+    #"test "stands alone" {
+    let a = 1
+}
+"#
+}
+
+test "a file of tests and no main still gets the runner the shim calls" {
+    let program = build_probe(no_main_src(), "cg_test_no_main_probe")
+    let text = generate(program, standalone_cfg())
+    assert_has(text, "blink_test_run(__blink_tests, 1, argc, argv);")
+    assert_has(text, "__blink_run_tests(argc, (const char**)argv);")
+    assert_eq_int("the body is written once",
+        definitions_of(text, symbol_of("stands alone")), 1)
+}
+
+// The runtime's header spells `blink_test_run` and `blink_test_entry`. A test named after
+// either of them must not be written under that same C name: the table is handed to the
+// runner by name, so redefining it makes the unit uncompilable.
+fn runner_name_src() -> Str {
+    #"fn main() { let x = 1 }
+
+test "run" {
+    let a = 1
+}
+
+test "entry" {
+    let b = 2
+}
+"#
+}
+
+test "a test named after the runtime's own function gets a different C name" {
+    let program = build_probe(runner_name_src(), "cg_test_runner_name_probe")
+    let text = generate(program, standalone_cfg())
+    assert(symbol_of("run") != "blink_test_run")
+    assert(symbol_of("entry") != "blink_test_entry")
+    assert_eq_int("the runner is still called once, under its own name",
+        cg_text_occurrences(text, "blink_test_run(__blink_tests"), 1)
+}
