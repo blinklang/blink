@@ -19,7 +19,7 @@
 
 import parser.{
     node_kind, node_name, node_left, node_right, node_obj, node_index, node_method, node_args,
-    node_methods, node_trait_name, node_impl_binders,
+    node_methods, node_trait_name, node_impl_binders, node_type_params,
     node_module, node_source_module,
     sublist_get, sublist_length,
 }
@@ -27,7 +27,8 @@ import ast.{NodeKind, nk_of, node_kind_name}
 import typecheck.{
     TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, lookup_named_type,
     is_import_module_name, is_builtin_namespace, is_builtin_fn, tc_alias_to_original,
-    tc_qualifier_to_module_or_self, tc_get_symbol_module, TYPE_STR,
+    tc_qualifier_to_module_or_self, tc_get_symbol_module, tc_type_str,
+    tc_enum_variant_slots, tc_evar_name, TYPE_STR,
 }
 import layout.{
     LayoutRecord, Position, SlotForm, layout_of, tid_of_node,
@@ -36,7 +37,8 @@ import layout.{
 import mono.{instances, instance_for_call}
 import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls}
 import cname.{
-    c_fn_decl_name, c_impl_method_name, c_display_dispatch_name, c_derive_method_name,
+    c_fn_decl_name, c_impl_method_name, c_impl_method_name_q,
+    c_display_dispatch_name, c_derive_method_name,
     c_runtime_helper, c_ffi_symbol,
 }
 import ir.{ir_call_direct, ir_call_runtime, ir_cast, ir_unary, ir_unbox}
@@ -62,6 +64,14 @@ let method_get = "get"
 // written at all: a caller that reads a refusal as an absence goes on to its own second
 // choice and swallows the report.
 let IMPL_REFUSED = -2
+
+// What the declaration resolver answers when the name is declared more than once: a
+// refusal already reported, told apart from a name nothing declares at all.
+let DECL_REFUSED = -2
+
+// What the constructor arity table answers for a pair it does not own. No call is written
+// with a negative number of arguments, so it can never equal a count read off a call.
+let NO_CTOR_ARITY = -1
 
 // What typecheck answers for a type that declares no node of its own. Every other answer
 // names a declaration, including the one that says two modules declare the name and the
@@ -371,19 +381,10 @@ fn cc_fn_declared_in(module_key: Str, name: Str) -> Int {
 // is an internal error rather than a guess, because the wrong choice is a call to the
 // wrong function.
 fn cc_fn_anywhere(node: Int, name: Str) -> Int ! Diag.Report {
-    let mut found = -1
-    let mut clashes = 0
-    for f in cg_reg_fn_decls() {
-        if node_name(f) != name { continue }
-        if found >= 0 { clashes = clashes + 1 }
-        found = f
-    }
-    if found >= 0 && clashes == 0 { return found }
-    if found < 0 { return cc_no_such_callee(node) }
-    diag_ice_at("CalleeAmbiguous", UNSOLVED_TYPEVAR_AT_CODEGEN,
-        "'{name}' is declared in more than one module and the call names neither", node,
-        "the call needs the declaration typecheck resolved, which it does not record yet")
-    -1
+    let decl = cc_sole_fn_named(node, name)
+    if decl == DECL_REFUSED { return -1 }
+    if decl < 0 { return cc_no_such_callee(node) }
+    decl
 }
 
 // Typecheck accepted the call, so the name is not undeclared: it binds a closure value, or
@@ -505,6 +506,280 @@ fn cc_ns_not_built(node: Int, ns: Str, method: Str) -> Int ! Diag.Report {
     -1
 }
 
+// ── Static and associated calls ───────────────────────────────────────────
+
+// A call whose qualifier names a type rather than a value. Blink has no inherent methods
+// (sections/03c_protocols.md:758): `Duration.seconds(2)` IS the free function
+// `Duration_seconds`, written under a qualifier. So the resolution here is the same one
+// typecheck performs to give the call a type, read from the same declarations, and the
+// only calls it cannot answer for are the ones no declaration stands behind.
+//
+// A builtin type declares nothing at all, so its constructors are calls the runtime
+// publishes and the register of runtime names answers first. Everything else resolves to a
+// declaration; failing that, a qualifier that names an enum is naming a variant, which is a
+// construction and not a call.
+fn lower_static_call(node: Int, obj: Int) -> Int ! Diag.Report {
+    let owner = node_name(obj)
+    let method = node_method(node)
+    if is_builtin_fn(owner) == 1 { return lower_builtin_static_call(node, owner, method) }
+    lower_declared_static_call(node, owner, method)
+}
+
+// A constructor of a type the compiler provides. Read BEFORE any declaration, because that
+// is the order typecheck resolves these in: tc_builtin_static_ret answers first and only a
+// pair it does not own falls through to the `{Type}_{method}` signature. Resolving a
+// declaration first would let a program that declares `Bytes_new` reach a different
+// function than the one its call was typed as, which is a call typed as one thing and
+// emitted as another. A pair this table does not own falls through the same way.
+fn lower_builtin_static_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
+    let answer = tid_of_node(node)
+    if answer < 0 { return -1 }
+    let symbol = cc_runtime_ctor_symbol(cc_kind(answer), method)
+    if symbol != "" {
+        let want = cc_runtime_ctor_arity(cc_kind(answer), method)
+        let given = sublist_length(node_args(node))
+        if given != want { return cc_ctor_arity_wrong(node, owner, method, want, given) }
+        return cc_build_call(node, symbol, NO_RECEIVER, CallForm.Runtime)
+    }
+    if method == "new" && cc_is_keyed_container(cc_kind(answer)) {
+        return cc_container_ctor_not_built(node, cc_kind(answer))
+    }
+    lower_declared_static_call(node, owner, method)
+}
+
+// Everything the qualifier can name once the compiler's own constructors have declined.
+// The rungs are the ones typecheck resolves a static call through, in its order, because
+// the two ends have to reach ONE declaration: a call typed as one function and emitted as
+// another is the failure this stage exists to exclude.
+//
+//   1. a variant of an enum the qualifier names. Typecheck decides this above the whole
+//      static ladder, so a free function spelled `{Enum}_{Variant}` never takes it over.
+//   2. a method written in an impl over the type, under the trait-qualified key.
+//   3. the free function the qualifier and the method name spell.
+//   4. a conversion, which is keyed source-typed and so is read only after 3 misses.
+fn lower_declared_static_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
+    if cc_names_variant(owner, method) { return cc_enum_ctor_not_in_ir(node, owner, method) }
+    let im = cc_trait_qualified_impl(owner, method)
+    if im >= 0 { return cc_impl_static_call(node, im, method) }
+    let decl = cc_sole_fn_named(node, cc_assoc_name(owner, method))
+    if decl == DECL_REFUSED { return -1 }
+    if decl >= 0 { return cc_free_call(node, decl) }
+    if cc_is_conversion(method) { return cc_conversion_call(node, owner, method) }
+    if cc_impls_declaring(owner, method) > 1 { return cc_static_impl_ambiguous(node, owner, method) }
+    diag_ice_stage_not_built("cg_call static call '{owner}.{method}'", node)
+    -1
+}
+
+// Whether the qualifier names an enum and the method names one of its variants. Both
+// halves matter: an enum also carries associated functions, and those are not variants.
+fn cc_names_variant(owner: Str, method: Str) -> Bool {
+    let owner_tid = lookup_named_type(owner)
+    if owner_tid < 0 { return false }
+    if cc_kind(owner_tid) != TyKind.Enum { return false }
+    for slot in tc_enum_variant_slots(owner_tid) {
+        if tc_evar_name(slot) == method { return true }
+    }
+    false
+}
+
+// The impl over the qualified type that declares this method under the trait-qualified
+// key. A conversion is excluded because it is keyed source-typed instead, and is read a
+// rung lower; more than one answering impl leaves no single key either, so the rung
+// declines and the free function below is asked, exactly as typecheck does.
+fn cc_trait_qualified_impl(owner: Str, method: Str) -> Int {
+    let mut found = -1
+    let mut matches = 0
+    for im in cc_impls_over(owner, method) {
+        if cc_is_source_typed(im, method) { continue }
+        matches = matches + 1
+        found = im
+    }
+    if matches == 1 { return found }
+    -1
+}
+
+// A conversion. One target can carry a conversion from several sources, so these are keyed
+// `{Target}_{method}_{Source}` and the argument's own type is the third of the key. That is
+// why they are read below the free function rather than beside the other impl methods.
+fn cc_conversion_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
+    let args = node_args(node)
+    if args == -1 || sublist_length(args) != 1 { return cc_static_impl_ambiguous(node, owner, method) }
+    let src_tid = tid_of_node(sublist_get(args, 0))
+    if src_tid < 0 { return -1 }
+    let src = tc_type_str(src_tid)
+    let mut found = -1
+    let mut matches = 0
+    for im in cc_impls_over(owner, method) {
+        if cc_impl_source_name(im) != src { continue }
+        matches = matches + 1
+        found = im
+    }
+    if matches == 1 { return cc_impl_static_call(node, found, method) }
+    cc_static_impl_ambiguous(node, owner, method)
+}
+
+// Every impl written over the qualified type that declares a method of this name.
+fn cc_impls_over(owner: Str, method: Str) -> List[Int] {
+    let mut out: List[Int] = []
+    let owner_tid = lookup_named_type(owner)
+    if owner_tid < 0 { return out }
+    let want = tc_tid_decl_node(owner_tid)
+    let builtin = cc_builtin_owner_name(owner_tid)
+    if want < 0 && builtin == "" { return out }
+    for im in cg_reg_impl_decls() {
+        if cc_method_index(im, method) < 0 { continue }
+        if !cc_impl_answers_for(im, want, builtin) { continue }
+        out.push(im)
+    }
+    out
+}
+
+fn cc_impls_declaring(owner: Str, method: Str) -> Int {
+    cc_impls_over(owner, method).len()
+}
+
+// The two methods Blink keys source-typed. Typecheck gates its own source-typed rung on
+// these same two names, so the rung is entered from both ends on one rule.
+fn cc_is_conversion(method: Str) -> Bool {
+    method == "from" || method == "try_from"
+}
+
+// Whether cname keys this impl's method by the source it converts from rather than by the
+// trait that declares it. The rule lives in cname and is read back from it rather than
+// written out a second time: the two spellings agree exactly when the key carries no source.
+fn cc_is_source_typed(im: Int, method: Str) -> Bool {
+    c_impl_method_name(im, method) != c_impl_method_name_q(im, node_trait_name(im), method)
+}
+
+// The source type an impl converts from: the first type argument of the trait it writes,
+// which is the same slot cname spells the symbol from and typecheck registers the key
+// under, so the selection and the symbol cannot disagree.
+fn cc_impl_source_name(im: Int) -> Str {
+    let tps = node_type_params(im)
+    if tps == -1 || sublist_length(tps) == 0 { return "" }
+    node_name(sublist_get(tps, 0))
+}
+
+fn cc_static_impl_ambiguous(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("StaticImplAmbiguous", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "more than one impl over '{owner}' declares '{method}' and the argument names neither", node,
+        "the call needs the impl typecheck resolved, which it does not record yet")
+    -1
+}
+
+// A call of an impl method under a type name rather than on a value. It passes no receiver:
+// the qualifier names where the method is written, and every operand is an ordinary
+// argument, which is what makes it associated rather than a method on anything.
+fn cc_impl_static_call(node: Int, im: Int, method: Str) -> Int ! Diag.Report {
+    let decl = cc_method_of(im, method)
+    if decl < 0 { return -1 }
+    if cg_decl_takes_ev(decl) {
+        cc_ev_not_in_ir(node)
+        return -1
+    }
+    let symbol = cc_call_symbol(node, decl, c_impl_method_name(im, method))
+    if symbol == "" { return -1 }
+    cc_build_call(node, symbol, NO_RECEIVER, CallForm.Declared)
+}
+
+// The runtime call a builtin type's constructor reaches. An empty answer means the pair
+// names no runtime constructor. Keyed on the KIND the call answers with rather than on the
+// qualifier's spelling; the method is the other half of the key, because `new` names a
+// different constructor under every type and two of these answer for a second name.
+fn cc_runtime_ctor_symbol(answer: TyKind, method: Str) -> Str {
+    if answer == TyKind.Bytes {
+        if method == "new" { return c_runtime_helper("bytes_new") }
+        if method == "from_str" { return c_runtime_helper("bytes_from_str") }
+        if method == "zeroed" { return c_runtime_helper("bytes_zeroed") }
+        return ""
+    }
+    if answer == TyKind.StringBuilder {
+        if method == "new" { return c_runtime_helper("sb_new") }
+        if method == "with_capacity" { return c_runtime_helper("sb_with_capacity") }
+    }
+    ""
+}
+
+// How many arguments that same runtime call takes. Keyed exactly as the symbol above is, so
+// the two read the same table; a pair the symbol declines is never asked for an arity.
+fn cc_runtime_ctor_arity(answer: TyKind, method: Str) -> Int {
+    if answer == TyKind.Bytes {
+        if method == "new" { return 0 }
+        if method == "from_str" { return 1 }
+        if method == "zeroed" { return 1 }
+        return NO_CTOR_ARITY
+    }
+    if answer == TyKind.StringBuilder {
+        if method == "new" { return 0 }
+        if method == "with_capacity" { return 1 }
+    }
+    NO_CTOR_ARITY
+}
+
+// A container whose keys the runtime compares and hashes through a table it is handed.
+fn cc_is_keyed_container(answer: TyKind) -> Bool {
+    answer == TyKind.Map || answer == TyKind.Set
+}
+
+// A constructor written with the wrong number of arguments. Typecheck checks the arity of
+// some of these and not others, so the check is repeated here rather than assumed: the
+// runtime call takes a fixed count, and building it from a different one would hand the C
+// compiler a call it cannot compile, with no Blink span on the error.
+fn cc_ctor_arity_wrong(node: Int, owner: Str, method: Str, want: Int, got: Int) -> Int ! Diag.Report {
+    diag_ice_at("RuntimeCtorArityWrong", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{owner}.{method}' takes {want} argument(s), and this call was given {got}", node,
+        "typecheck must reject this call before codegen reads it; this is a compiler bug")
+    -1
+}
+
+// The name an associated function is declared under. The qualifier and the method are
+// joined, which is the key typecheck resolves the call through and therefore the only
+// spelling that can name the same declaration from here.
+fn cc_assoc_name(owner: Str, method: Str) -> Str {
+    "{cc_declared_name(owner)}_{method}"
+}
+
+// The one declaration of this name, or ABSENT when the program declares none. A name two
+// modules both declare is refused rather than guessed, and says so once, so the caller
+// stops instead of refusing a second time under another heading.
+fn cc_sole_fn_named(node: Int, name: Str) -> Int ! Diag.Report {
+    let mut found = -1
+    let mut clashes = 0
+    for f in cg_reg_fn_decls() {
+        if node_name(f) != name { continue }
+        if found >= 0 { clashes = clashes + 1 }
+        found = f
+    }
+    if clashes == 0 { return found }
+    diag_ice_at("CalleeAmbiguous", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{name}' is declared in more than one module and the call names neither", node,
+        "the call needs the declaration typecheck resolved, which it does not record yet")
+    DECL_REFUSED
+}
+
+// A variant constructor. The value is one arm of a tagged union, written as a tag beside a
+// member of the union the tag selects, and the member is itself a struct with one field per
+// payload element. The carrier node builds a tag beside ONE named member and nothing
+// deeper, so there is no node here that builds this and no spelling for the member's own
+// type to build it with.
+fn cc_enum_ctor_not_in_ir(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("EnumConstructorNotInIr", CODEGEN_STAGE_NOT_BUILT,
+        "'{owner}.{method}' fills one arm of a tagged union, and no node builds that shape", node,
+        "the IR needs a variant constructor that names the arm as well as the tag")
+    -1
+}
+
+// A container constructor. The value the runtime answers with carries a table of the
+// operations its keys are compared and hashed by, chosen from the key type and passed by
+// address; no written argument supplies it and no node names it, so the call cannot be
+// built from what the program wrote.
+fn cc_container_ctor_not_built(node: Int, answer: TyKind) -> Int ! Diag.Report {
+    diag_ice_at("ContainerCtorNeedsKeyOps", CODEGEN_STAGE_NOT_BUILT,
+        "'{tk_name(answer)}.new' answers a container whose key operations are chosen from the key type", node,
+        "the IR needs a node that names the key-operations table for a key type")
+    -1
+}
+
 // ── Methods ───────────────────────────────────────────────────────────────
 
 fn lower_method_call(node: Int) -> Int ! Diag.Report {
@@ -512,10 +787,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let role = cc_receiver_role(obj)
     if role == Receiver.Module { return lower_module_call(node, obj) }
     if role == Receiver.Namespace { return lower_namespace_call(node, obj) }
-    if role != Receiver.Value {
-        diag_ice_stage_not_built("cg_call static and associated calls", node)
-        return -1
-    }
+    if role == Receiver.TypeOwner { return lower_static_call(node, obj) }
     let recv_tid = tid_of_node(obj)
     if recv_tid < 0 { return -1 }
     let im = cc_impl_with_method(node, recv_tid, node_method(node))

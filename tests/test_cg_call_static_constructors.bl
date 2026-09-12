@@ -1,0 +1,389 @@
+// A call whose left of the dot names a TYPE, not a value.
+//
+// Blink has no inherent methods (sections/03c_protocols.md:758), so `Duration.seconds(2)`
+// is not a method on anything: it is the free function `Duration_seconds` written under a
+// qualifier. That is the rule these calls follow, and it is the rule typecheck already
+// follows to give them a type, so codegen resolves the same declaration rather than
+// re-deciding the answer from the two spellings.
+//
+// Two kinds reach that rule and two do not. A builtin type declares no Blink function at
+// all, so its constructors are calls the runtime publishes and the register of runtime
+// names answers for them. A declared type answers through the declaration itself. Against
+// those, a container constructor needs a table of key operations chosen from the key type,
+// which no written argument supplies, and a variant constructor fills one arm of a tagged
+// union, a shape no node in the IR builds. Both are refused by name here, so what is
+// missing stays legible and countable.
+
+import lower_test_helpers.{
+    probe, rhs_of, let_node_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
+    assert_ice_saying,
+}
+import parser.{node_kind, node_method, nodes}
+import ast.{NodeKind, nk_of}
+import ir.{IrKind, ir_c_name}
+import cg_expr.{lower_expr}
+import std.io
+
+// A call written as a statement binds no name, so it is found by walking forward from a
+// binding the probe does name: a statement parses after the binding above it, so its node
+// id is higher.
+fn call_after(anchor: Str, method: Str) -> Int {
+    let mut i = let_node_of(anchor)
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.MethodCall && node_method(i) == method { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no call of '{method}' after '{anchor}'")
+    assert(false)
+    -1
+}
+
+// The five constructors of a builtin type. Each one is a call the runtime publishes, and
+// each is written with the arity its runtime call takes.
+fn src_builtin() -> Str {
+    #"fn main() {
+    let cap = 16
+    let text = "hi"
+    let builder = StringBuilder.new()
+    let sized = StringBuilder.with_capacity(cap)
+    let empty = Bytes.new()
+    let filled = Bytes.from_str(text)
+    let zeros = Bytes.zeroed(cap)
+    let _keep = [empty.len(), filled.len(), zeros.len()]
+    let _also = builder
+    let _more = sized
+}
+"#
+}
+
+// A constructor of a builtin type written with the wrong number of arguments. Typecheck
+// lets this through today, so the call arrives here to be refused rather than built.
+fn src_wrong_arity() -> Str {
+    #"fn main() {
+    let zeros = Bytes.zeroed()
+    let _keep = zeros.len()
+}
+"#
+}
+
+// A type the program declares, with the associated function the qualifier names. The
+// declaration is an ordinary free function; the qualified spelling is the only thing that
+// makes it associated. A second declaration is written under the builtin buffer's own
+// constructor name, to prove the compiler's table still wins there.
+fn src_declared() -> Str {
+    #"type Meters {
+    v: Int
+}
+
+fn Meters_of(n: Int) -> Meters {
+    Meters { v: n }
+}
+
+fn Bytes_new() -> Bytes {
+    Bytes.from_str("shadowed")
+}
+
+fn main() {
+    let width = 3
+    let m = Meters.of(width)
+    let fresh = Bytes.new()
+    let _keep = m.v
+    let _also = fresh.len()
+}
+"#
+}
+
+// One call of each refused shape. Each is written once, so a test that lowers one records
+// exactly one refusal. A free function spelled like the variant is declared beside it,
+// because typecheck reads a qualified variant above the whole static ladder and the free
+// function must not take it over. The two containers are given an element so their types are pinned;
+// an unpinned container is a different error, reported before codegen.
+fn src_refused() -> Str {
+    #"type Shape {
+    Circle(Int)
+    Rect(Int, Int)
+}
+
+fn Shape_Circle(n: Int) -> Int {
+    n
+}
+
+fn main() {
+    let radius = 2
+    let mut table = Map.new()
+    table.insert("a", 1)
+    let mut seen = Set.new()
+    seen.insert(7)
+    let round = Shape.Circle(radius)
+    let _keep = [table.len(), seen.len()]
+    let _more = round
+}
+"#
+}
+
+// A conversion written as a trait impl over the target type. Blink keys these SOURCE-TYPED,
+// `{Target}_{method}_{Source}`, because one target can carry a conversion from several
+// sources; so the qualifier and the method name alone do not spell the declaration, and the
+// argument's own type is the third of the key. Two sources are written, so selecting one
+// takes more than the qualifier and the method name.
+fn src_impl_static() -> Str {
+    #"trait From[T] {
+    fn from(value: T) -> Self
+}
+
+type Inches {
+    v: Int
+}
+
+type Feet {
+    v: Int
+}
+
+type Centimetres {
+    v: Int
+}
+
+impl From[Inches] for Centimetres {
+    fn from(inch: Inches) -> Self {
+        Centimetres { v: inch.v }
+    }
+}
+
+impl From[Feet] for Centimetres {
+    fn from(foot: Feet) -> Self {
+        Centimetres { v: foot.v }
+    }
+}
+
+fn main() {
+    let small = Inches { v: 2 }
+    let tall = Feet { v: 6 }
+    let near = Centimetres.from(small)
+    let far = Centimetres.from(tall)
+    let _keep = [near.v, far.v]
+}
+"#
+}
+
+// Two traits that both declare the same associated function, both written over one type.
+// The qualifier and the method name spell both impls, and the call takes no argument to
+// tell them apart, so there is no key that names one. Typecheck accepts this today.
+fn src_ambiguous_impl() -> Str {
+    #"trait Alpha {
+    fn make() -> Self
+}
+
+trait Beta {
+    fn make() -> Self
+}
+
+type Widget {
+    v: Int
+}
+
+impl Alpha for Widget {
+    fn make() -> Self {
+        Widget { v: 1 }
+    }
+}
+
+impl Beta for Widget {
+    fn make() -> Self {
+        Widget { v: 2 }
+    }
+}
+
+fn main() {
+    let w = Widget.make()
+    let _keep = w.v
+}
+"#
+}
+
+// A conversion and a free function of the bare name, both written for one target. The bare
+// name is the higher rung, so the free function is what this call reaches; the conversion is
+// keyed source-typed and is never consulted.
+fn src_bare_over_conversion() -> Str {
+    #"trait From[T] {
+    fn from(value: T) -> Self
+}
+
+type Yards {
+    v: Int
+}
+
+type Metres {
+    v: Int
+}
+
+impl From[Yards] for Metres {
+    fn from(yard: Yards) -> Self {
+        Metres { v: yard.v }
+    }
+}
+
+fn Metres_from(y: Yards) -> Metres {
+    Metres { v: y.v }
+}
+
+fn main() {
+    let len = Yards { v: 4 }
+    let near = Metres.from(len)
+    let _keep = near.v
+}
+"#
+}
+
+// A method written in an impl of an ordinary trait, and a free function of the bare name.
+// An impl method is keyed trait-qualified and is the higher rung, so the impl wins here,
+// which is the opposite of the conversion above. The method answers with a concrete type
+// rather than `Self`, which is a shape the front end still gives a typevar.
+fn src_impl_over_bare() -> Str {
+    #"trait Spawn {
+    fn make(n: Int) -> Int
+}
+
+type Gadget {
+    v: Int
+}
+
+impl Spawn for Gadget {
+    fn make(n: Int) -> Int {
+        n
+    }
+}
+
+fn Gadget_make(k: Int) -> Int {
+    k
+}
+
+fn main() {
+    let size = 5
+    let g = Gadget.make(size)
+    let _keep = g
+}
+"#
+}
+
+test "StringBuilder.new reaches the runtime builder constructor with no argument" {
+    probe("cg_call_sb_new", src_builtin())
+    let built = lower_expr(rhs_of("builder"))
+    assert_kind("kind", built, IrKind.CallRuntime)
+    assert_shape("shape", built, "CallRuntime")
+    assert_eq_str("symbol", ir_c_name(built), "blink_sb_new")
+    assert_verifies("sb_new", built)
+}
+
+test "StringBuilder.with_capacity passes its capacity to the runtime constructor" {
+    probe("cg_call_sb_cap", src_builtin())
+    let built = lower_expr(rhs_of("sized"))
+    assert_shape("shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_sb_with_capacity")
+    assert_verifies("sb_with_capacity", built)
+}
+
+test "Bytes.new reaches the runtime buffer constructor with no argument" {
+    probe("cg_call_bytes_new", src_builtin())
+    let built = lower_expr(rhs_of("empty"))
+    assert_shape("shape", built, "CallRuntime")
+    assert_eq_str("symbol", ir_c_name(built), "blink_bytes_new")
+    assert_verifies("bytes_new", built)
+}
+
+test "Bytes.from_str passes its text to the runtime buffer constructor" {
+    probe("cg_call_bytes_from_str", src_builtin())
+    let built = lower_expr(rhs_of("filled"))
+    assert_shape("shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_bytes_from_str")
+    assert_verifies("bytes_from_str", built)
+}
+
+test "Bytes.zeroed passes its length to the runtime buffer constructor" {
+    probe("cg_call_bytes_zeroed", src_builtin())
+    let built = lower_expr(rhs_of("zeros"))
+    assert_shape("shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_bytes_zeroed")
+    assert_verifies("bytes_zeroed", built)
+}
+
+test "an associated call reaches the free function the qualifier and the method name spell" {
+    probe("cg_call_assoc", src_declared())
+    let built = lower_expr(rhs_of("m"))
+    assert_kind("kind", built, IrKind.CallDirect)
+    assert_shape("shape", built, "CallDirect(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_u_Meters_of")
+    assert_verifies("assoc", built)
+}
+
+test "Map.new refuses because its key operations are chosen from the key type" {
+    probe("cg_call_map_new", src_refused())
+    assert_ice_saying("Map.new", lower_expr(rhs_of("table")),
+        "ContainerCtorNeedsKeyOps",
+        "'Map.new' answers a container whose key operations are chosen from the key type")
+}
+
+test "Set.new refuses because its key operations are chosen from the element type" {
+    probe("cg_call_set_new", src_refused())
+    assert_ice_saying("Set.new", lower_expr(rhs_of("seen")),
+        "ContainerCtorNeedsKeyOps",
+        "'Set.new' answers a container whose key operations are chosen from the key type")
+}
+
+test "a qualified variant constructor refuses because it fills one arm of a tagged union" {
+    probe("cg_call_variant_ctor", src_refused())
+    assert_ice_saying("Shape.Circle", lower_expr(rhs_of("round")),
+        "EnumConstructorNotInIr",
+        "'Shape.Circle' fills one arm of a tagged union")
+}
+
+test "a declared namesake does not take over a builtin type's own constructor" {
+    probe("cg_call_shadowed_ctor", src_declared())
+    let built = lower_expr(rhs_of("fresh"))
+    assert_shape("shape", built, "CallRuntime")
+    assert_eq_str("symbol", ir_c_name(built), "blink_bytes_new")
+    assert_verifies("shadowed", built)
+}
+
+test "a constructor given the wrong number of arguments refuses instead of building a call" {
+    probe("cg_call_ctor_arity", src_wrong_arity())
+    assert_ice_saying("Bytes.zeroed", lower_expr(rhs_of("zeros")),
+        "RuntimeCtorArityWrong",
+        "'Bytes.zeroed' takes 1 argument(s), and this call was given 0")
+}
+
+test "a conversion reaches the impl written for the source type it is given" {
+    probe("cg_call_impl_static", src_impl_static())
+    let built = lower_expr(rhs_of("near"))
+    assert_kind("kind", built, IrKind.CallDirect)
+    assert_shape("shape", built, "CallDirect(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_Centimetres_from_Inches")
+    assert_verifies("impl static", built)
+}
+
+test "a second conversion to the same target is told from the first by its argument type" {
+    probe("cg_call_impl_static_second", src_impl_static())
+    let built = lower_expr(rhs_of("far"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_Centimetres_from_Feet")
+    assert_verifies("impl static second", built)
+}
+
+test "an associated function two impls both declare refuses instead of guessing one" {
+    probe("cg_call_impl_static_ambiguous", src_ambiguous_impl())
+    assert_ice_saying("Widget.make", lower_expr(rhs_of("w")),
+        "StaticImplAmbiguous",
+        "more than one impl over 'Widget' declares 'make' and the argument names neither")
+}
+
+test "a free function of the bare name is read above a conversion impl" {
+    probe("cg_call_bare_over_conversion", src_bare_over_conversion())
+    let built = lower_expr(rhs_of("near"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_u_Metres_from")
+    assert_verifies("bare over conversion", built)
+}
+
+test "an impl method is read above a free function of the bare name" {
+    probe("cg_call_impl_over_bare", src_impl_over_bare())
+    let built = lower_expr(rhs_of("g"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_Gadget_Spawn_make")
+    assert_verifies("impl over bare", built)
+}
