@@ -127,3 +127,81 @@ test "a refused interpolation leaves no statement its earlier holes hoisted" {
         "ImplAmbiguous", "more than one impl over Struct declares the trait 'Display'")
     assert_eq_str("statements hoisted", "{cg_expr_pending_count() - before}", "0")
 }
+
+// A short-circuit whose left operand hoists and whose right operand then refuses. The coalesce
+// on the left lowers cleanly and leaves a carrier temp, a result temp and an `if` behind. The
+// comparison on the right refuses, so the whole operator answers nothing and all three have to
+// come back out.
+fn src_short_circuit_hoist_then_refusal() -> Str {
+    #"@derive(Ord)
+type Point { x: Int, y: Int }
+
+fn main() {
+    let opt: Option[Bool] = None
+    let p = Point { x: 1, y: 2 }
+    let q = Point { x: 1, y: 3 }
+    let joined = (opt ?? true) && (p < q)
+    let _keep = [joined]
+}
+"#
+}
+
+// Two coalesces, one inside the other's fallback. Each binds a carrier temp and a result temp
+// before it lowers that fallback, so four statements stand in the buffer when the innermost
+// comparison refuses. The refusal has to travel out through both frames.
+fn src_coalesce_hoist_then_refusal() -> Str {
+    #"@derive(Ord)
+type Point { x: Int, y: Int }
+
+fn main() {
+    let maybe: Option[Bool] = None
+    let opt: Option[Bool] = None
+    let p = Point { x: 1, y: 2 }
+    let q = Point { x: 1, y: 3 }
+    let chosen = maybe ?? (opt ?? (p < q))
+    let _keep = [chosen]
+}
+"#
+}
+
+test "a refused short-circuit operand leaves no statement the other operand hoisted" {
+    probe("cg_expr_orphan_short_circuit", src_short_circuit_hoist_then_refusal())
+    let before = cg_expr_pending_count()
+    assert_ice_saying("ordering", lower_expr(rhs_of("joined")),
+        "OrderingMethodNotLowered", "has no ordering method lowering here")
+    assert_eq_str("statements hoisted", "{cg_expr_pending_count() - before}", "0")
+}
+
+test "a refused coalesce fallback leaves no statement it hoisted" {
+    probe("cg_expr_orphan_coalesce", src_coalesce_hoist_then_refusal())
+    let before = cg_expr_pending_count()
+    assert_ice_saying("ordering", lower_expr(rhs_of("chosen")),
+        "OrderingMethodNotLowered", "has no ordering method lowering here")
+    assert_eq_str("statements hoisted", "{cg_expr_pending_count() - before}", "0")
+}
+
+// A tuple literal lowers every element before it reads any answer, so a later element that
+// refuses finds an earlier element's statements already in the buffer. Nothing in the tuple
+// seam takes them back, which is why the rule belongs at the expression seam all of them
+// reach rather than in each seam that hoists.
+fn src_tuple_element_hoist_then_refusal() -> Str {
+    #"@derive(Ord)
+type Point { x: Int, y: Int }
+
+fn main() {
+    let opt: Option[Bool] = None
+    let p = Point { x: 1, y: 2 }
+    let q = Point { x: 1, y: 3 }
+    let pair = (opt ?? true, p < q)
+    let _keep = [pair]
+}
+"#
+}
+
+test "a refused tuple element leaves no statement an earlier element hoisted" {
+    probe("cg_expr_orphan_tuple", src_tuple_element_hoist_then_refusal())
+    let before = cg_expr_pending_count()
+    assert_ice_saying("ordering", lower_expr(rhs_of("pair")),
+        "OrderingMethodNotLowered", "has no ordering method lowering here")
+    assert_eq_str("statements hoisted", "{cg_expr_pending_count() - before}", "0")
+}
