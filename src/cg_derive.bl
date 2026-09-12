@@ -45,6 +45,7 @@ let derive_eq = "Eq"
 let derive_ord = "Ord"
 let derive_debug = "Debug"
 let derive_hash = "Hash"
+let derive_clone = "Clone"
 
 // The two words a Bool renders as. They are the Display of a Bool, not C text, and the
 // runtime holds the same pair in blink_sb_write_bool.
@@ -55,7 +56,7 @@ let bool_false = "false"
 // inside it that this stage has not built is a compiler bug, so the two answer with
 // different diagnostics.
 fn known_derives() -> List[Str] {
-    ["Serialize", "Deserialize", derive_eq, derive_ord, "Clone", derive_hash, derive_debug]
+    ["Serialize", "Deserialize", derive_eq, derive_ord, derive_clone, derive_hash, derive_debug]
 }
 
 // A declaration may write the same derive twice, in one annotation or in two, so a pass
@@ -111,6 +112,7 @@ fn derive_one(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
     if name == derive_eq { return eq_method(decl, arg, bodies) }
     if name == derive_debug { return debug_method(decl, arg, bodies) }
     if name == derive_hash { return hash_method(decl, arg, bodies) }
+    if name == derive_clone { return clone_method(decl, arg, bodies) }
     not_built(arg, "@derive({name})")
 }
 
@@ -170,22 +172,41 @@ fn shape_refusal(decl: Int, tid: Int, derive: Str) -> Str {
     ""
 }
 
-// The value of one field of `self` or `other`, or -1 after a refusal. A declined layout
-// has no spelling and a boxed field is behind a pointer this stage does not walk.
-fn field_value(owner: Int, owner_tid: Int, ftid: Int, path: Str, holder: Str, derive: Str, span: Int) -> Int ! Diag.Report {
-    let frec = field_layout_of(owner, ftid)
+// Whether the derive reads the value a field holds, rather than only copying the field.
+// Eq, Debug and Hash each answer from what is inside a field. A clone copies the field
+// itself, because the language defines a clone as a copy one level deep, so the copy shares
+// what a pointer field points at. A derive not named here is taken to read, which refuses a
+// boxed field rather than copying one it has no rule for.
+fn derive_walks_fields(derive: Str) -> Bool {
+    derive != derive_clone
+}
+
+// Whether this stage may touch a field at all, recorded once. A declined layout has no
+// spelling. A boxed field is an opaque word holding a heap pointer, so it stops a derive
+// that must read through it and not one that only copies it. The caller passes the field
+// layout and asks before it builds either side, because Clone names the same field twice,
+// as the value read and the place written: asked twice it would record the same refusal
+// twice, and a count of refusals could no longer tell one gap from two.
+fn field_refused(frec: LayoutRecord, path: Str, derive: Str, span: Int) -> Bool ! Diag.Report {
     let reason = frec.decline_reason
     if reason != "" {
         diag_ice_at("DeriveBodyNotBuildable", UNSOLVED_TYPEVAR_AT_CODEGEN,
             "no C spelling for field '{path}': {reason}", span,
             "every type that reaches code generation must be concrete and nameable; this is a compiler bug")
-        return -1
+        return true
     }
-    if frec.slot_form == SlotForm.PointerBoxed {
+    if frec.slot_form == SlotForm.PointerBoxed && derive_walks_fields(derive) {
         not_built(span, "@derive({derive}) on the boxed field '{path}'")
-        return -1
+        return true
     }
-    field_ref(owner_tid, holder, ftid, frec, path, span)
+    false
+}
+
+// The value of one field of `self` or `other`, or -1 after a refusal.
+fn field_value(owner: Int, owner_tid: Int, ftid: Int, path: Str, holder: Str, derive: Str, span: Int) -> Int ! Diag.Report {
+    let frec = field_layout_of(owner, ftid)
+    if field_refused(frec, path, derive, span) { return -1 }
+    field_ref(owner_tid, holder, Position.Param, ftid, frec, path, span)
 }
 
 // One case per variant, in the order the switch kids alternate: the tag label, then the
@@ -209,14 +230,16 @@ fn variant_cases(decl: Int, tid: Int, slots: List[Int], ints: Str, derive: Str, 
     cases
 }
 
-// The block one derive builds for one variant. Only Hash carries an accumulator, so the
-// other two pass an empty name they never read. A derive with no builder here is refused.
-// Clone and Ord arrive next, and a last branch that accepted any name would give one of
-// them another derive's block, which compiles and then answers wrongly.
+// The block one derive builds for one variant. `acc` is the local the derive builds its
+// answer in: the accumulator for Hash and the value being filled for Clone. Eq and Debug
+// answer from the block itself, so they pass an empty name they never read. A derive with
+// no builder here is refused. A last branch that accepted any name would hand one derive
+// another derive's block, which compiles and then answers wrongly.
 fn variant_block(decl: Int, tid: Int, slot: Int, derive: Str, acc: Str, span: Int) -> Int ! Diag.Report {
     if derive == derive_eq { return eq_variant_block(decl, tid, slot, span) }
     if derive == derive_debug { return debug_variant_block(decl, tid, slot, span) }
     if derive == derive_hash { return hash_variant_block(decl, tid, slot, acc, span) }
+    if derive == derive_clone { return clone_variant_block(decl, tid, slot, acc, span) }
     derive_ice(span, "no per-variant block for @derive({derive})")
     -1
 }
@@ -293,9 +316,9 @@ fn eq_enum_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
     let ints = int_spelling(span)
     let bools = bool_spelling(span)
     if ints == "" || bools == "" { return -1 }
-    let self_tag = tag_ref(tid, "self", ints, span)
-    let other_tag = tag_ref(tid, "other", ints, span)
-    let switch_tag = tag_ref(tid, "self", ints, span)
+    let self_tag = tag_ref(tid, "self", Position.Param, ints, span)
+    let other_tag = tag_ref(tid, "other", Position.Param, ints, span)
+    let switch_tag = tag_ref(tid, "self", Position.Param, ints, span)
     let mismatch = eq_false_block(span)
     let unknown = eq_false_block(span)
     if self_tag < 0 || other_tag < 0 || switch_tag < 0 || mismatch < 0 || unknown < 0 { return -1 }
@@ -308,8 +331,8 @@ fn eq_enum_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
 
 fn eq_word_body(tid: Int, span: Int) -> Int ! Diag.Report {
     let bools = bool_spelling(span)
-    let lhs = self_ref(tid, "self", span)
-    let rhs = self_ref(tid, "other", span)
+    let lhs = value_ref(tid, "self", Position.Param, span)
+    let rhs = value_ref(tid, "other", Position.Param, span)
     if bools == "" || lhs < 0 || rhs < 0 { return -1 }
     ir_block(span, [ir_return(span, ir_binary(TYPE_BOOL, span, bools, "==", lhs, rhs))])
 }
@@ -363,8 +386,10 @@ fn eq_guard(owner: Int, owner_tid: Int, ftid: Int, path: Str, span: Int) -> Int 
 fn eq_differs(owner: Int, owner_tid: Int, ftid: Int, path: Str, span: Int) -> Int ! Diag.Report {
     let bools = bool_spelling(span)
     if bools == "" { return -1 }
-    let lhs = field_value(owner, owner_tid, ftid, path, "self", derive_eq, span)
-    let rhs = field_value(owner, owner_tid, ftid, path, "other", derive_eq, span)
+    let frec = field_layout_of(owner, ftid)
+    if field_refused(frec, path, derive_eq, span) { return -1 }
+    let lhs = field_ref(owner_tid, "self", Position.Param, ftid, frec, path, span)
+    let rhs = field_ref(owner_tid, "other", Position.Param, ftid, frec, path, span)
     if lhs < 0 || rhs < 0 { return -1 }
     let k = tc_tid_kind(tc_resolve(ftid))
     // A Str is a pointer, so == would compare addresses rather than bytes.
@@ -409,21 +434,26 @@ fn derive_names(decl: Int) -> List[Str] {
     out
 }
 
-fn self_ref(owner_tid: Int, name: Str, span: Int) -> Int ! Diag.Report {
-    let rec = layout_of(owner_tid, Position.Param)
-    let spelling = spelling_or_ice(rec, "the value being compared", span)
+// One whole value of the derived type, named by its C variable. The caller says which
+// position layout is to spell it at, because a derive names two such values: the parameter
+// it is given, and the local a clone fills. One position for both would spell a local the
+// way a parameter is spelled, and the declaration of that local and every read of it would
+// then disagree the moment layout gives the two positions different answers.
+fn value_ref(owner_tid: Int, name: Str, at_pos: Position, span: Int) -> Int ! Diag.Report {
+    let rec = layout_of(owner_tid, at_pos)
+    let spelling = spelling_or_ice(rec, "the value '{name}'", span)
     if spelling == "" { return -1 }
     ir_var_ref(owner_tid, span, spelling, name, rec.slot_form)
 }
 
-fn tag_ref(owner_tid: Int, name: Str, ints: Str, span: Int) -> Int ! Diag.Report {
-    let base = self_ref(owner_tid, name, span)
+fn tag_ref(owner_tid: Int, name: Str, at_pos: Position, ints: Str, span: Int) -> Int ! Diag.Report {
+    let base = value_ref(owner_tid, name, at_pos, span)
     if base < 0 { return -1 }
     ir_field_get(TYPE_INT, span, ints, TAG_MEMBER, SlotForm.InlineWord, base)
 }
 
-fn field_ref(owner_tid: Int, name: Str, ftid: Int, frec: LayoutRecord, path: Str, span: Int) -> Int ! Diag.Report {
-    let base = self_ref(owner_tid, name, span)
+fn field_ref(owner_tid: Int, name: Str, at_pos: Position, ftid: Int, frec: LayoutRecord, path: Str, span: Int) -> Int ! Diag.Report {
+    let base = value_ref(owner_tid, name, at_pos, span)
     if base < 0 { return -1 }
     ir_field_get(ftid, span, frec.c_spelling, path, frec.slot_form, base)
 }
@@ -518,12 +548,13 @@ fn debug_constant(text: Str, span: Int) -> Int ! Diag.Report {
     ir_return(span, ir_const(TYPE_STR, span, spelling, c_string_literal(text)))
 }
 
-// A tag no variant declares means the value's memory is corrupt. Naming a stand-in
-// variant there would report a value the program does not hold.
-fn debug_corrupt_block(decl: Int, span: Int) -> Int ! Diag.Report {
+// A tag no variant declares means the value's memory is corrupt. Every derive that
+// switches on a tag stops there: a stand-in variant would report, hash or copy a value the
+// program does not hold, and the copy would carry the corruption into a second value.
+fn corrupt_tag_block(decl: Int, derive: Str, span: Int) -> Int ! Diag.Report {
     let spelling = str_spelling(span)
     if spelling == "" { return -1 }
-    let text = "blink: @derive(Debug) on {node_name(decl)} met a tag no variant declares"
+    let text = "blink: @derive({derive}) on {node_name(decl)} met a tag no variant declares"
     ir_block(span, [ir_panic(span, ir_const(TYPE_STR, span, spelling, c_string_literal(text)))])
 }
 
@@ -574,8 +605,8 @@ fn debug_tagged_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
     }
     let ints = int_spelling(span)
     if ints == "" { return -1 }
-    let scrutinee = tag_ref(tid, "self", ints, span)
-    let unknown = debug_corrupt_block(decl, span)
+    let scrutinee = tag_ref(tid, "self", Position.Param, ints, span)
+    let unknown = corrupt_tag_block(decl, derive_debug, span)
     if scrutinee < 0 || unknown < 0 { return -1 }
     let cases = variant_cases(decl, tid, slots, ints, derive_debug, "", span)
     if cases.len() == 0 { return -1 }
@@ -616,8 +647,8 @@ fn debug_ordinal_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
         return -1
     }
     let spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), span)
-    let scrutinee = self_ref(tid, "self", span)
-    let unknown = debug_corrupt_block(decl, span)
+    let scrutinee = value_ref(tid, "self", Position.Param, span)
+    let unknown = corrupt_tag_block(decl, derive_debug, span)
     if spelling == "" || scrutinee < 0 || unknown < 0 { return -1 }
     let cases = debug_ordinal_cases(decl, slots, spelling, tid, span)
     if cases.len() == 0 { return -1 }
@@ -654,7 +685,7 @@ fn debug_newtype_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
         derive_ice(span, "transparent newtype '{node_name(decl)}' carries {fields.len()} fields, not one")
         return -1
     }
-    let value = self_ref(tid, "self", span)
+    let value = value_ref(tid, "self", Position.Param, span)
     if value < 0 { return -1 }
     let part = debug_part(tc_evfield_tid(fields.get(0).unwrap()), value, node_name(decl), span)
     if !part.ok { return -1 }
@@ -889,14 +920,14 @@ fn hash_tagged_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
     let u64s = u64_spelling(span)
     let ints = int_spelling(span)
     if u64s == "" || ints == "" { return -1 }
-    let tag = tag_ref(tid, "self", ints, span)
+    let tag = tag_ref(tid, "self", Position.Param, ints, span)
     let init = hash_init_const(span)
     if tag < 0 || init < 0 { return -1 }
     let seeded = hash_mix(init, ir_cast(TYPE_U64, span, u64s, tag), span)
     if seeded < 0 { return -1 }
     let acc = c_mint_local("h")
-    let scrutinee = tag_ref(tid, "self", ints, span)
-    let unknown = hash_corrupt_block(decl, span)
+    let scrutinee = tag_ref(tid, "self", Position.Param, ints, span)
+    let unknown = corrupt_tag_block(decl, derive_hash, span)
     if scrutinee < 0 || unknown < 0 { return -1 }
     let cases = variant_cases(decl, tid, slots, ints, derive_hash, acc, span)
     if cases.len() == 0 { return -1 }
@@ -923,19 +954,10 @@ fn hash_variant_block(decl: Int, tid: Int, slot: Int, acc: Str, span: Int) -> In
     ir_block(span, stmts)
 }
 
-// A tag no variant declares means the value's memory is corrupt. Answering a number
-// there would put a corrupt key in a bucket and let a later lookup find it.
-fn hash_corrupt_block(decl: Int, span: Int) -> Int ! Diag.Report {
-    let spelling = str_spelling(span)
-    if spelling == "" { return -1 }
-    let text = "blink: @derive(Hash) on {node_name(decl)} met a tag no variant declares"
-    ir_block(span, [ir_panic(span, ir_const(TYPE_STR, span, spelling, c_string_literal(text)))])
-}
-
 // A payload-less enum is its own tag, so the value itself is the whole hash input.
 fn hash_ordinal_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
     let u64s = u64_spelling(span)
-    let value = self_ref(tid, "self", span)
+    let value = value_ref(tid, "self", Position.Param, span)
     if u64s == "" || value < 0 { return -1 }
     if tc_enum_variant_slots(tid).len() == 0 {
         derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
@@ -958,7 +980,7 @@ fn hash_newtype_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
         derive_ice(span, "transparent newtype '{node_name(decl)}' carries {fields.len()} fields, not one")
         return -1
     }
-    let value = self_ref(tid, "self", span)
+    let value = value_ref(tid, "self", Position.Param, span)
     if value < 0 { return -1 }
     let contribution = hash_contribution(tc_evfield_tid(fields.get(0).unwrap()), value, node_name(decl), span)
     if contribution < 0 { return -1 }
@@ -1012,4 +1034,132 @@ fn hash_nested(ftid: Int, value: Int, path: Str, span: Int) -> Int ! Diag.Report
         return -1
     }
     ir_call_direct(TYPE_U64, span, u64s, c_derive_method_name(fdecl, "hash"), u64_form(), [value])
+}
+
+// ── Clone ────────────────────────────────────────────────────────────────
+
+// Clone is a logical copy one level deep: a new value of the same shape, with every
+// field's value copied into it. A pointer field is copied as the pointer, so the copy
+// shares what it points at, which is what the language promises for a Str, a List, a Map
+// and a Set. So this is the one derive that must NOT call the field type's own derived
+// method. Recursing would deep-copy what the language says two values share, and nothing
+// about that answer would look wrong until a program relied on the sharing.
+//
+// The copy is written field by field rather than as one whole-value assignment, so that
+// layout is asked about every field before that field is copied. A whole-value assignment
+// would carry a field this stage has no rule for without ever asking about it.
+fn clone_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
+    let tid = cg_reg_tid_for_decl(decl)
+    if tid < 0 { return derive_ice(arg, "type '{node_name(decl)}' reached cg_derive with no type id") }
+    let refusal = shape_refusal(decl, tid, derive_clone)
+    if refusal != "" { return not_built(arg, refusal) }
+    let self_spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), arg)
+    if self_spelling == "" { return }
+    let ret = spelling_or_ice(layout_of(tid, Position.Return), node_name(decl), arg)
+    if ret == "" { return }
+    let symbol = c_derive_method_name(decl, "clone")
+    let params = ["{self_spelling} self"]
+    if !bodies { return print_fn_decl(false, ret, symbol, params, false) }
+    let body = clone_body(decl, tid, arg)
+    if body < 0 { return }
+    print_fn(false, ret, symbol, params, false, body)
+}
+
+// A value layout gives as one word is its own whole value, so an ordinal enum and a
+// transparent newtype both answer themselves. Asking layout is what keeps this stage from
+// deciding the shape for itself.
+fn clone_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let rec = layout_of(tid, Position.Param)
+    if rec.slot_form == SlotForm.InlineWord { return clone_word_body(tid, span) }
+    let k = tc_tid_kind(tc_resolve(tid))
+    if k == TyKind.Struct { return clone_struct_body(decl, tid, span) }
+    if k == TyKind.Enum { return clone_tagged_body(decl, tid, span) }
+    not_built(span, "@derive(Clone) on a {tk_name(k)} type")
+    -1
+}
+
+fn clone_word_body(tid: Int, span: Int) -> Int ! Diag.Report {
+    let value = value_ref(tid, "self", Position.Param, span)
+    if value < 0 { return -1 }
+    ir_block(span, [ir_return(span, value)])
+}
+
+// The value being filled. It starts at zero because the statements that follow do not
+// write all of it: a variant that carries no payload writes no union member, and a struct
+// that declares no field writes nothing at all. Left uninitialised, the value returned
+// would carry bytes no statement wrote.
+fn clone_out_decl(tid: Int, out: Str, span: Int) -> Int ! Diag.Report {
+    let rec = layout_of(tid, Position.Local)
+    let spelling = spelling_or_ice(rec, "the value '{out}'", span)
+    if spelling == "" { return -1 }
+    ir_let(tid, span, spelling, out, rec.slot_form, ir_const(tid, span, spelling, #"{0}"#))
+}
+
+fn clone_struct_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let out = c_mint_local("c")
+    let head = clone_out_decl(tid, out, span)
+    let answer = value_ref(tid, out, Position.Local, span)
+    if head < 0 || answer < 0 { return -1 }
+    let mut stmts = [head]
+    for slot in tc_struct_field_slots(tid) {
+        let copy = clone_copy(decl, tid, tc_sfield_tid(slot), c_field_name(tc_sfield_name(slot)), out, span)
+        if copy < 0 { return -1 }
+        stmts.push(copy)
+    }
+    stmts.push(ir_return(span, answer))
+    ir_block(span, stmts)
+}
+
+// The tag is copied before the switch, because the tag is what says which payload the new
+// value may be read through at all. A copy that wrote the payload first would leave a
+// value whose tag and payload disagree if the switch then refused.
+fn clone_tagged_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let slots = tc_enum_variant_slots(tid)
+    if slots.len() == 0 {
+        derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
+        return -1
+    }
+    let ints = int_spelling(span)
+    if ints == "" { return -1 }
+    let out = c_mint_local("c")
+    let head = clone_out_decl(tid, out, span)
+    let tag_src = tag_ref(tid, "self", Position.Param, ints, span)
+    let tag_dst = tag_ref(tid, out, Position.Local, ints, span)
+    let scrutinee = tag_ref(tid, "self", Position.Param, ints, span)
+    let unknown = corrupt_tag_block(decl, derive_clone, span)
+    let answer = value_ref(tid, out, Position.Local, span)
+    if head < 0 || tag_src < 0 || tag_dst < 0 { return -1 }
+    if scrutinee < 0 || unknown < 0 || answer < 0 { return -1 }
+    let cases = variant_cases(decl, tid, slots, ints, derive_clone, out, span)
+    if cases.len() == 0 { return -1 }
+    ir_block(span, [
+        head,
+        ir_assign(span, tag_dst, tag_src),
+        ir_switch(span, scrutinee, cases, unknown),
+        ir_return(span, answer),
+    ])
+}
+
+fn clone_variant_block(decl: Int, tid: Int, slot: Int, out: Str, span: Int) -> Int ! Diag.Report {
+    let vname = tc_evar_name(slot)
+    let mut stmts: List[Int] = []
+    for f in tc_evar_field_slots(slot) {
+        let path = "{PAYLOAD_UNION}.{vname}.{c_field_name(tc_evfield_name(f))}"
+        let copy = clone_copy(decl, tid, tc_evfield_tid(f), path, out, span)
+        if copy < 0 { return -1 }
+        stmts.push(copy)
+    }
+    ir_block(span, stmts)
+}
+
+// One field's whole contribution: the same member of the value being filled, given the
+// same member of the value handed in. Both sides name one field, so the question of
+// whether this stage may touch it is asked once, before either side is built.
+fn clone_copy(owner: Int, owner_tid: Int, ftid: Int, path: Str, out: Str, span: Int) -> Int ! Diag.Report {
+    let frec = field_layout_of(owner, ftid)
+    if field_refused(frec, path, derive_clone, span) { return -1 }
+    let src = field_ref(owner_tid, "self", Position.Param, ftid, frec, path, span)
+    let dst = field_ref(owner_tid, out, Position.Local, ftid, frec, path, span)
+    if src < 0 || dst < 0 { return -1 }
+    ir_assign(span, dst, src)
 }
