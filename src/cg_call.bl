@@ -31,7 +31,7 @@ import typecheck.{
     tc_enum_variant_slots, tc_evar_name, TYPE_STR,
 }
 import layout.{
-    LayoutRecord, Position, SlotForm, layout_of, tid_of_node,
+    LayoutRecord, Position, SlotForm, Slot, layout_of, tid_of_node, child_tid, ensure_typedef_for,
     tid_of_binder, current_binder_scope, current_inst, decl_has_derive,
 }
 import mono.{instances, instance_for_call}
@@ -41,7 +41,7 @@ import cname.{
     c_display_dispatch_name, c_derive_method_name,
     c_runtime_helper, c_ffi_symbol,
 }
-import ir.{ir_call_direct, ir_call_runtime, ir_cast, ir_unary, ir_unbox}
+import ir.{ir_call_direct, ir_call_runtime, ir_cast, ir_unary, ir_unbox, ir_box}
 import cg_expr.{lower_expr}
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
 import diagnostics.{
@@ -69,9 +69,15 @@ let IMPL_REFUSED = -2
 // refusal already reported, told apart from a name nothing declares at all.
 let DECL_REFUSED = -2
 
-// What the constructor arity table answers for a pair it does not own. No call is written
-// with a negative number of arguments, so it can never equal a count read off a call.
-let NO_CTOR_ARITY = -1
+// What the intrinsic table answers when it owns the method but cannot build this call: a
+// refusal already reported. It has to stay apart from the empty row that means the table
+// does not own the method, because that row sends the caller on to the impls and then to
+// a second refusal for the same cause. No table writes a row of one colon.
+let ROW_REFUSED = ":"
+
+// What an arity table answers for a key it does not own. No call is written with a
+// negative number of arguments, so it can never equal a count read off a call.
+let NO_ARITY = -1
 
 // What typecheck answers for a type that declares no node of its own. Every other answer
 // names a declaration, including the one that says two modules declare the name and the
@@ -203,21 +209,54 @@ pub fn lower_element_read(node: Int) -> Int ! Diag.Report {
     if container < 0 { return -1 }
     let helper = cc_element_helper(node, container)
     if helper == "" { return -1 }
-    let slot = cc_element_layout(node, tid, Position.ContainerSlot)
-    if cc_stopped(slot) { return -1 }
-    let boxed = slot.slot_form == SlotForm.PointerBoxed
-    if !boxed && slot.slot_form != SlotForm.InlineWord { return cc_element_slot_form(node, tid) }
-    let value = if boxed { cc_element_layout(node, tid, Position.Local) } else { slot }
-    if cc_stopped(value) { return -1 }
+    let shape = cc_element_shape(node, tid)
+    if cc_shape_stopped(shape) { return -1 }
     let obj = lower_expr(node_obj(node))
     if obj < 0 { return -1 }
     let index = lower_expr(node_index(node))
     if index < 0 { return -1 }
-    let raw = ir_call_runtime(tid, node, slot.c_spelling, helper, slot.slot_form, [obj, index])
-    let read = ir_cast(tid, node, slot.c_spelling, raw)
-    if !boxed { return read }
-    ir_unbox(tid, node, value.c_spelling, value.slot_form, read)
+    let raw = ir_call_runtime(tid, node, shape.slot.c_spelling, helper, shape.slot.slot_form, [obj, index])
+    let read = ir_cast(tid, node, shape.slot.c_spelling, raw)
+    if !shape.boxed { return read }
+    ir_unbox(tid, node, shape.value.c_spelling, shape.value.slot_form, read)
 }
+
+// ── Element shape ─────────────────────────────────────────────────────────
+
+// What one element IS once it sits in a container slot. A slot is one machine word, so a
+// value wider than that word goes on the heap and the slot holds the pointer to it. The
+// decision is layout's: PointerBoxed IS the answer "box it", and reading it here rather
+// than re-deriving it keeps one producer for the fact.
+//
+// The read and the store both ask this, which is what holds them in step. A store that
+// boxed where the read unboxes would hand the runtime a pointer the read then treats as a
+// value, and nothing downstream could tell the two apart.
+type ElementShape {
+    slot: LayoutRecord
+    value: LayoutRecord
+    boxed: Bool
+}
+
+fn cc_element_shape(node: Int, elem_tid: Int) -> ElementShape ! Diag.Report {
+    let slot = cc_element_layout(node, elem_tid, Position.ContainerSlot)
+    let stopped = ElementShape { slot: cc_stop(slot), value: cc_stop(slot), boxed: false }
+    if cc_stopped(slot) { return stopped }
+    let boxed = slot.slot_form == SlotForm.PointerBoxed
+    if !boxed && slot.slot_form != SlotForm.InlineWord {
+        cc_element_slot_form(node, elem_tid)
+        return stopped
+    }
+    if !boxed { return ElementShape { slot: slot, value: slot, boxed: false } }
+    let value = cc_element_layout(node, elem_tid, Position.Local)
+    if cc_stopped(value) { return stopped }
+    // A boxed element is allocated and dereferenced by its own spelling, and for a carrier
+    // that spelling names a typedef the unit has to declare first. Queueing it is what
+    // every other producer of a carrier-typed value does; cg_decl drains the queue.
+    ensure_typedef_for(elem_tid)
+    ElementShape { slot: slot, value: value, boxed: true }
+}
+
+fn cc_shape_stopped(shape: ElementShape) -> Bool { cc_stopped(shape.slot) }
 
 // ── Element reads ─────────────────────────────────────────────────────────
 
@@ -253,6 +292,18 @@ fn cc_element_slot_form(node: Int, elem_tid: Int) -> Int ! Diag.Report {
     diag_ice_at("ElementSlotFormNotLowered", CODEGEN_STAGE_NOT_BUILT,
         "a {tk_name(cc_kind(elem_tid))} element sits in its slot in neither of the two forms",
         node, "an element slot is one machine word, so layout answers InlineWord or PointerBoxed")
+    -1
+}
+
+// A word-sized element entering a slot. The read converts the other way and can spell what
+// it converts to, because that is the element's own type and layout answers it. A store
+// converts to what the slot HOLDS, and layout has no answer for that word yet, so the
+// element would be passed as written: an integer where the runtime reads a pointer.
+// Refusing keeps the two directions honest until one answer serves both.
+fn cc_element_slot_word(node: Int, elem_tid: Int) -> Int ! Diag.Report {
+    diag_ice_at("ElementSlotFormNotLowered", CODEGEN_STAGE_NOT_BUILT,
+        "a {tk_name(cc_kind(elem_tid))} element has no spelling for what it becomes going into the slot word",
+        node, "layout has to answer the slot word for a tid before a store can convert to it")
     -1
 }
 
@@ -707,13 +758,13 @@ fn cc_runtime_ctor_arity(answer: TyKind, method: Str) -> Int {
         if method == "new" { return 0 }
         if method == "from_str" { return 1 }
         if method == "zeroed" { return 1 }
-        return NO_CTOR_ARITY
+        return NO_ARITY
     }
     if answer == TyKind.StringBuilder {
         if method == "new" { return 0 }
         if method == "with_capacity" { return 1 }
     }
-    NO_CTOR_ARITY
+    NO_ARITY
 }
 
 // A container whose keys the runtime compares and hashes through a table it is handed.
@@ -797,10 +848,13 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     // same-named user impl. Reading them the other way round here would emit the impl
     // method for a call typecheck had already typed as the stdlib function.
     let declared = cc_intrinsic_callee(node, kind, mname)
+    if declared == ROW_REFUSED { return -1 }
     if declared != "" { return lower_intrinsic_method(node, obj, kind, mname, declared) }
+    let primitive = cc_runtime_method(kind, mname)
+    if primitive != "" { return cc_lower_runtime_method(node, obj, kind, mname, primitive) }
     let im = cc_impl_with_method(node, recv_tid, mname)
     if im == IMPL_REFUSED { return -1 }
-    if im < 0 { return cc_intrinsic_not_built(node, kind, mname) }
+    if im < 0 { return cc_method_not_built(node, kind, mname) }
     let method = cc_method_of(im, node_method(node))
     if method < 0 { return -1 }
     if cg_decl_takes_ev(method) {
@@ -826,10 +880,14 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
 // its own name: a function written in Blink carries the module it was written in, and a
 // foreign binding carries the symbol its annotation gives, which its Blink name does not
 // always spell. Naming symbols here would repeat both rules and could disagree with them.
-fn lower_intrinsic_method(node: Int, obj: Int, kind: TyKind, method: Str, declared: Str) -> Int ! Diag.Report {
-    let decl = cc_stdlib_fn_named(node, declared)
+fn lower_intrinsic_method(node: Int, obj: Int, kind: TyKind, method: Str, row: Str) -> Int ! Diag.Report {
+    let cut = row.index_of(":")
+    if cut < 0 { return cc_intrinsic_row_malformed(node, row) }
+    let module = row.substring(0, cut)
+    let name = row.substring(cut + 1, row.len() - cut - 1)
+    let decl = cc_stdlib_fn_named(node, module, name)
     if decl == DECL_REFUSED { return -1 }
-    if decl < 0 { return cc_intrinsic_undeclared(node, kind, method, declared) }
+    if decl < 0 { return cc_intrinsic_undeclared(node, kind, method, module, name) }
     if cg_decl_takes_ev(decl) {
         cc_ev_not_in_ir(node)
         return -1
@@ -846,13 +904,116 @@ fn lower_intrinsic_method(node: Int, obj: Int, kind: TyKind, method: Str, declar
     cc_build_call(node, symbol, obj, CallForm.Declared)
 }
 
+// ── Element stores ────────────────────────────────────────────────────────
+
+// A method the standard library declares nothing for, which reaches a runtime primitive
+// instead. These are the stores, and a store is where an element enters a slot: what shape
+// it takes there is cc_element_shape's answer, read and not decided again here.
+//
+// Everything the store can refuse is settled off the types before any operand is lowered,
+// so a refusal has built nothing and hoisted nothing.
+fn cc_lower_runtime_method(node: Int, obj: Int, kind: TyKind, method: Str, op: Str) -> Int ! Diag.Report {
+    let want = cc_runtime_method_arity(op)
+    if want == NO_ARITY { return cc_runtime_arity_unrecorded(node, kind, method, op) }
+    let given = sublist_length(node_args(node))
+    if want != given { return cc_intrinsic_arity_wrong(node, kind, method, want, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let container = tid_of_node(obj)
+    if container < 0 { return -1 }
+    let elem = child_tid(container, Slot.Inner1)
+    if elem < 0 { return cc_element_type_unrecorded(node, kind) }
+    let shape = cc_element_shape(node, elem)
+    if cc_shape_stopped(shape) { return -1 }
+    if !shape.boxed { return cc_element_slot_word(node, elem) }
+    let result = cc_local(tid, node)
+    if cc_stopped(result) { return -1 }
+    let receiver = lower_expr(obj)
+    if receiver < 0 { return -1 }
+    let args = cc_store_args(node, receiver, want, elem, shape)
+    if args.len() == 0 { return -1 }
+    ir_call_runtime(tid, node, result.c_spelling, c_runtime_helper(op), result.slot_form, args)
+}
+
+// The receiver followed by the written arguments, with the element boxed if the slot holds
+// a pointer. The element is the LAST argument of every one of these: a store names where
+// it goes before it names what goes there, so a position argument can only come first.
+// An empty list is the refusal: every built list holds the receiver, so no answer this
+// builds can be empty.
+fn cc_store_args(node: Int, receiver: Int, count: Int, elem: Int, shape: ElementShape) -> List[Int] ! Diag.Report {
+    let mut out: List[Int] = [receiver]
+    let written = node_args(node)
+    let mut i = 0
+    while i < count {
+        let a = lower_expr(sublist_get(written, i))
+        if a < 0 { return [] }
+        // The box carries the ELEMENT's tid: the slot form, not the tid, is what records
+        // that the value sits behind a pointer. Its own spelling is the pointer type and
+        // the pointee spelling is what the printer writes inside sizeof.
+        if i == count - 1 && shape.boxed {
+            out.push(ir_box(elem, node, shape.slot.c_spelling, shape.value.c_spelling, a))
+        } else {
+            out.push(a)
+        }
+        i = i + 1
+    }
+    out
+}
+
+// Which runtime primitive a receiver's method reaches, for the methods no Blink
+// declaration answers. Kept apart from the declaration table because the two answer
+// different things: that one names a function to call, this one names an ABI symbol.
+fn cc_runtime_method(kind: TyKind, method: Str) -> Str {
+    if kind != TyKind.List { return "" }
+    if method == "push" { return "list_push" }
+    if method == "set" { return "list_set" }
+    ""
+}
+
+// How many arguments each of those takes. A primitive with no row here is refused by name
+// rather than built from the sentinel, which would report a call as taking -1 arguments.
+fn cc_runtime_method_arity(op: Str) -> Int {
+    if op == "list_push" { return 1 }
+    if op == "list_set" { return 2 }
+    NO_ARITY
+}
+
+// ── Intrinsic tables ──────────────────────────────────────────────────────
+
 // The declaration each intrinsic means, keyed on what the receiver IS and what the method
 // is called. "" for a pair this stage does not own.
 fn cc_intrinsic_callee(node: Int, kind: TyKind, method: Str) -> Str ! Diag.Report {
     if kind == TyKind.Str { return cc_str_intrinsic(method) }
     if kind == TyKind.Bytes { return cc_bytes_intrinsic(method) }
     if kind == TyKind.StringBuilder { return cc_sb_intrinsic(node, method) }
+    if kind == TyKind.List { return cc_list_intrinsic(node, method) }
     ""
+}
+
+// `len`, `is_empty` and `clear` are absent because real impls answer them, as they do for
+// Str. `push` and `set` are absent because no Blink declaration answers them; they reach
+// cc_runtime_method instead. `get`, `pop` and `contains` are absent because none of the
+// three is one call: the first two fill a carrier behind a bounds or emptiness test, and
+// the last is a scan. Each is refused under its own name in cc_list_not_built.
+fn cc_list_intrinsic(node: Int, method: Str) -> Str ! Diag.Report {
+    if method == "append" { return "std_list:list_concat" }
+    if method == "slice" { return "std_list:list_slice" }
+    if method == "join" { return cc_list_join_callee(node) }
+    ""
+}
+
+// `str_join` reads every slot as a string, so it answers `join` only over Str elements.
+// Typecheck rejects the rest at the call site but its check fails open on a type variable,
+// so a generic body reaches this stage with whatever element it carries. Following a slot
+// that holds something other than a string pointer is a read of an arbitrary address.
+fn cc_list_join_callee(node: Int) -> Str ! Diag.Report {
+    let container = tid_of_node(node_obj(node))
+    if container < 0 { return ROW_REFUSED }
+    let elem = child_tid(container, Slot.Inner1)
+    if elem < 0 { return ROW_REFUSED }
+    if cc_kind(elem) == TyKind.Str { return "std_str:str_join" }
+    cc_join_element_not_str(node, elem)
+    ROW_REFUSED
 }
 
 // `len` and `is_empty` are absent on purpose: a real `impl Sized for Str` answers both,
@@ -964,11 +1125,7 @@ fn cc_sb_write_callee(node: Int) -> Str ! Diag.Report {
 // name must not take it over, and neither must a second stdlib module that happens to
 // declare that name. Every module reached here is in the prelude, so the declaration is
 // registered whether the program imports it or not.
-fn cc_stdlib_fn_named(node: Int, row: Str) -> Int ! Diag.Report {
-    let cut = row.index_of(":")
-    if cut < 0 { return cc_intrinsic_row_malformed(node, row) }
-    let module = row.substring(0, cut)
-    let name = row.substring(cut + 1, row.len() - cut - 1)
+fn cc_stdlib_fn_named(node: Int, module: Str, name: Str) -> Int ! Diag.Report {
     let mut found = -1
     let mut clashes = 0
     for f in cg_reg_fn_decls() {
@@ -996,9 +1153,9 @@ fn cc_intrinsic_row_malformed(node: Int, row: Str) -> Int ! Diag.Report {
 // A pair the table owns whose declaration is not in the program. The stdlib is registered
 // whole, so this is the two ends disagreeing: the table names a function the library does
 // not declare, or no longer declares under that name.
-fn cc_intrinsic_undeclared(node: Int, kind: TyKind, method: Str, declared: Str) -> Int ! Diag.Report {
+fn cc_intrinsic_undeclared(node: Int, kind: TyKind, method: Str, module: Str, name: Str) -> Int ! Diag.Report {
     diag_ice_at("IntrinsicCalleeUndeclared", UNSOLVED_TYPEVAR_AT_CODEGEN,
-        "'{tk_name(kind)}.{method}' names '{declared}', which that module does not declare", node,
+        "'{tk_name(kind)}.{method}' names '{name}', which module '{module}' does not declare", node,
         "the table and the standard library have to name the same function")
     -1
 }
@@ -1013,9 +1170,61 @@ fn cc_intrinsic_arity_wrong(node: Int, kind: TyKind, method: Str, want: Int, got
     -1
 }
 
-// A method call this table does not own and no impl answers. Named by the receiver's kind
-// and the method, so what is missing stays legible and countable rather than arriving as
-// one blanket count over every receiver at once.
+// A method call this table does not own and no impl answers. A receiver with a name for
+// what is missing gives that name; the rest are named by kind and method, so what is
+// missing stays legible and countable rather than arriving as one blanket count.
+fn cc_method_not_built(node: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    if kind == TyKind.List { return cc_list_not_built(node, method) }
+    cc_intrinsic_not_built(node, kind, method)
+}
+
+// The three List methods that are not one call. `get` and `pop` both answer a carrier
+// filled behind a test the runtime cannot make for them, which is the same gap the index
+// read already names. `contains` walks the elements comparing each, which is a loop and a
+// choice of comparison, and the runtime publishes no primitive for it.
+fn cc_list_not_built(node: Int, method: Str) -> Int ! Diag.Report {
+    if method == "get" || method == "pop" { return cc_checked_read(node) }
+    if method == "contains" { return cc_element_scan_not_lowered(node) }
+    cc_intrinsic_not_built(node, TyKind.List, method)
+}
+
+// A scan over the elements. It is a loop over statements and a comparison chosen per
+// element type, so no one call names it and no layout answer decides it.
+fn cc_element_scan_not_lowered(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("ElementScanNotLowered", CODEGEN_STAGE_NOT_BUILT,
+        "a scan that compares each element has no lowering here", node,
+        "the loop and the comparison it makes are statements cg_expr must hoist")
+    -1
+}
+
+
+// `join` over an element `str_join` cannot read. The call would hand the runtime a slot
+// holding something other than a string pointer, which it would follow anyway.
+fn cc_join_element_not_str(node: Int, elem_tid: Int) -> Int ! Diag.Report {
+    diag_ice_at("JoinElementNotStr", CODEGEN_STAGE_NOT_BUILT,
+        "joining a List of {tk_name(cc_kind(elem_tid))} has no lowering here", node,
+        "only a List of Str reaches str_join; any other element needs its own conversion first")
+    -1
+}
+
+// A runtime primitive named by the method table with no row in the arity table. The two
+// are kept in step by hand, so the gap is reported rather than read as an argument count.
+fn cc_runtime_arity_unrecorded(node: Int, kind: TyKind, method: Str, op: Str) -> Int ! Diag.Report {
+    diag_ice_at("RuntimeMethodArityUnrecorded", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{tk_name(kind)}.{method}' names primitive '{op}', which records no argument count",
+        node, "every primitive the method table names has to have a row in the arity table")
+    -1
+}
+
+// A container whose element type was never recorded. The store reads the element off the
+// receiver's own type, so this is the receiver typed as a container of nothing.
+fn cc_element_type_unrecorded(node: Int, kind: TyKind) -> Int ! Diag.Report {
+    diag_ice_at("ElementTypeUnrecorded", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "a {tk_name(kind)} receiver records no element type, so the store cannot shape it", node,
+        "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    -1
+}
+
 fn cc_intrinsic_not_built(node: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
     diag_ice_stage_not_built("cg_call methods: {tk_name(kind)}.{method}", node)
     -1
