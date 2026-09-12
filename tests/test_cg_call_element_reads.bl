@@ -1,0 +1,134 @@
+// Reading one element out of a container.
+//
+// The runtime slot is one machine word. An element that fits the word is read by casting
+// the word back to the element's own type. An element that does not fit, and a double that
+// must not be punned through an integer, live behind a pointer instead: the slot holds the
+// address, so the read casts to the pointer type and then dereferences it.
+//
+// Which of the two a read is does not depend on what the element type is. `[i]` answers the
+// element and `.get(i)` answers an Option over it, and a container of Option elements makes
+// those two answers the same type, so the syntax that was written is what says which.
+
+import lower_test_helpers.{
+    probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
+    assert_ice_saying,
+}
+import parser.{node_obj}
+import ir.{IrKind, ir_c_spelling, ir_kid}
+import cg_expr.{lower_expr}
+import cg_call.{lower_element_read}
+
+fn src_reads() -> Str {
+    #"type Point { x: Int, y: Int }
+
+fn main() {
+    let at = 0
+    let ints = [1, 2, 3]
+    let int_read = ints[at]
+    let words = ["a", "b"]
+    let word_read = words[at]
+    let reals = [1.5, 2.5]
+    let real_read = reals[at]
+    let points = [Point { x: 1, y: 2 }]
+    let point_read = points[at]
+    let opts = [Some(1), None]
+    let opt_read = opts[at]
+    let checked = ints.get(at)
+    let counted = words.len()
+    let _keep = [int_read, real_read.to_int(), point_read.x, opt_read.unwrap()]
+    let _keep2 = [word_read.len(), checked.unwrap(), counted]
+}
+"#
+}
+
+// ── Elements that fit the runtime's word ─────────────────────────────────
+
+test "an Int element is the word itself, so the read is one cast" {
+    probe("cg_call_element", src_reads())
+    let id = lower_expr(rhs_of("int_read"))
+    assert_kind("kind", id, IrKind.Cast)
+    assert_shape("shape", id, "Cast(CallRuntime(VarRef, VarRef))")
+    assert_eq_str("cast type", ir_c_spelling(id), "int64_t")
+    assert_verifies("verify", id)
+}
+
+test "a Str element is a pointer that fits the word, so it too is one cast" {
+    probe("cg_call_element", src_reads())
+    let id = lower_expr(rhs_of("word_read"))
+    assert_shape("shape", id, "Cast(CallRuntime(VarRef, VarRef))")
+    assert_eq_str("cast type", ir_c_spelling(id), "const char*")
+    assert_verifies("verify", id)
+}
+
+// ── Elements the slot holds behind a pointer ─────────────────────────────
+
+// A double punned through the runtime's integer word would come back as a different
+// number, so the slot holds its address. The cast names the pointer type layout gives for
+// the slot, and the dereference names the element's own type.
+test "a Float element is read by casting to the pointer type and dereferencing it" {
+    probe("cg_call_element", src_reads())
+    let id = lower_expr(rhs_of("real_read"))
+    assert_kind("kind", id, IrKind.Unbox)
+    assert_shape("shape", id, "Unbox(Cast(CallRuntime(VarRef, VarRef)))")
+    assert_eq_str("cast type", ir_c_spelling(ir_kid(id, 0)), "double*")
+    assert_eq_str("element type", ir_c_spelling(id), "double")
+    assert_verifies("verify", id)
+}
+
+// An aggregate cannot fit a word at all, so it takes the same path a double does. The two
+// share it because the slot's shape decides, not the element's kind.
+test "a struct element is read the same way, through the slot's pointer" {
+    probe("cg_call_element", src_reads())
+    let id = lower_expr(rhs_of("point_read"))
+    assert_kind("kind", id, IrKind.Unbox)
+    assert_shape("shape", id, "Unbox(Cast(CallRuntime(VarRef, VarRef)))")
+    assert_eq_str("cast type", ir_c_spelling(ir_kid(id, 0)), "blink_Point*")
+    assert_eq_str("element type", ir_c_spelling(id), "blink_Point")
+    assert_verifies("verify", id)
+}
+
+// ── Which read was written ───────────────────────────────────────────────
+
+// `[i]` on a container of Option elements answers an Option, and so does `.get(i)` on a
+// container of anything. Reading the answer's type cannot tell them apart, so this read
+// must be the plain one: it was written as an index.
+test "an index into a container of carriers is a plain read, not a checked one" {
+    probe("cg_call_element", src_reads())
+    let id = lower_expr(rhs_of("opt_read"))
+    assert_kind("kind", id, IrKind.Unbox)
+    assert_shape("shape", id, "Unbox(Cast(CallRuntime(VarRef, VarRef)))")
+    assert_verifies("verify", id)
+}
+
+// The bounds-checked read is still unbuilt. It is selected by the syntax that was written,
+// so the refusal follows the `.get(i)` node rather than the type of what it answers.
+test "a bounds-checked read is refused, and is selected by the syntax not the answer" {
+    probe("cg_call_element", src_reads())
+    let node = rhs_of("checked")
+    let obj = lower_expr(node_obj(node))
+    let index = lower_expr(rhs_of("at"))
+    assert_ice_saying("checked read", lower_element_read(node, obj, index),
+        "CheckedElementReadNotLowered", "an element read answering Option has no lowering")
+}
+
+// The seam is reached from two arms of the caller's dispatch and from nowhere else. A node
+// that is neither read is a wrong arm, not a shape this stage has yet to build, so it is
+// named as the caller's fault and not as a gap here.
+test "a node that is neither read is refused as a wrong dispatch, not as a gap" {
+    probe("cg_call_element", src_reads())
+    let index = lower_expr(rhs_of("at"))
+    let obj = lower_expr(rhs_of("ints"))
+    assert_ice_saying("not a read", lower_element_read(rhs_of("at"), obj, index),
+        "NotAnElementRead", "is not an element read")
+}
+
+// `.get(i)` is the checked read, and no other method is. A seam that took any method call
+// for a checked read would answer that refusal for `.len()` too, which names the wrong
+// gap: the length of a container is not an element of it.
+test "a method that is not the checked read is a wrong dispatch, not a bounds test" {
+    probe("cg_call_element", src_reads())
+    let index = lower_expr(rhs_of("at"))
+    let obj = lower_expr(rhs_of("ints"))
+    assert_ice_saying("other method", lower_element_read(rhs_of("counted"), obj, index),
+        "NotAnElementRead", "is not an element read")
+}
