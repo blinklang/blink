@@ -1,11 +1,12 @@
 // `xs[i]` lowered as an expression. The read itself belongs to the call stage, which owns
 // the one reader `[i]` and `.get(i)` share; this stage only finds the two operands and
-// hands them over. Every test starts at lower_expr, the entry a statement reaches, so a
-// test here fails if the dispatch arm is missing rather than passing on a direct call.
+// hands them over. Every test of a lowering starts at lower_expr, the entry a statement
+// reaches, so such a test fails if the dispatch arm is missing rather than passing on a
+// direct call to the seam.
 
 import lower_test_helpers.{
     probe, probe_but, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
-    assert_ice,
+    assert_ice_saying, assert_refused_saying,
 }
 import ir.{IrKind, ir_c_name, ir_kid}
 import cg_expr.{lower_expr}
@@ -22,8 +23,10 @@ fn src_reads() -> Str {
     let word_read = words[at]
     let reals = [1.5, 2.5]
     let real_read = reals[at]
+    let opts = [Some(1), None]
+    let opt_read = opts[at]
     let _keep = [literal_read, named_read, compound_read, past_end]
-    let _keep2 = [word_read.len(), real_read.to_int()]
+    let _keep2 = [word_read.len(), real_read.to_int(), opt_read.unwrap()]
 }
 "#
 }
@@ -60,6 +63,7 @@ test "an index past the end lowers like any other constant index" {
     let past = lower_expr(rhs_of("past_end"))
     let inside = lower_expr(rhs_of("literal_read"))
     assert_shape("past the end", past, "Cast(CallRuntime(VarRef, Const))")
+    assert_shape("inside", inside, "Cast(CallRuntime(VarRef, Const))")
     assert_eq_str("same reader", ir_c_name(ir_kid(past, 0)), ir_c_name(ir_kid(inside, 0)))
     assert_verifies("verify", past)
 }
@@ -75,9 +79,11 @@ fn src_str_index() -> Str {
 }
 
 // A Str index is typecheck's to refuse, and it does. This stage never sees one, so it needs
-// no arm for it; the test is here to keep that boundary where it is.
+// no arm for it; the test is here to keep that boundary where it is. The code alone would
+// not say so — every type error carries it — so the sentence is what the test reads.
 test "an index that is not an Int is refused before this stage, by typecheck" {
     probe_but("cg_expr_index_str", src_str_index(), "TypeError")
+    assert_refused_saying("str index", "index must be an Int", 1)
 }
 
 // A Str is a pointer, but one that fits the runtime's word, so it needs no more than the
@@ -90,10 +96,22 @@ test "an element the runtime holds as a word reads through the same one reader" 
     assert_verifies("verify", id)
 }
 
-// A Float does not fit that word, so the runtime holds it behind a pointer and reading it
-// is a dereference the call stage does not write yet. This stage still hands the operands
-// over: the refusal that comes back names that gap, rather than this stage guessing.
+// A double must not be punned through the runtime's integer word, so the runtime holds a
+// Float behind a pointer and reading one is a dereference the call stage does not write
+// yet. This stage still hands the operands over: the refusal that comes back names that
+// gap, rather than this stage guessing.
 test "an element held behind a pointer is refused by the stage that owns the read" {
     probe("cg_expr_index", src_reads())
-    assert_ice("float element", lower_expr(rhs_of("real_read")), "BoxedElementReadNotLowered")
+    assert_ice_saying("float element", lower_expr(rhs_of("real_read")),
+        "BoxedElementReadNotLowered", "a Float element is held behind a pointer")
+}
+
+// An element that simply is an Option takes the same branch as a read that answers Option
+// because it was bounds-checked, since both are told apart only by the answer's type. Both
+// are refused today, so nothing is wrong yet; this test goes red the day the checked read
+// is built, which is when the two have to be told apart by something else.
+test "an element whose own type is a carrier is refused, not read as a checked result" {
+    probe("cg_expr_index", src_reads())
+    assert_ice_saying("option element", lower_expr(rhs_of("opt_read")),
+        "CheckedElementReadNotLowered", "an element read answering Option has no lowering")
 }

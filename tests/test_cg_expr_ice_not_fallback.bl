@@ -1,10 +1,10 @@
 // What lowering refuses. Every miss here is an internal error with a name and a node; none
 // of them is a guess, a default type or a placeholder value.
 
-import lower_test_helpers.{probe, rhs_of, assert_ice, assert_eq_str, last_ice}
+import lower_test_helpers.{probe, rhs_of, assert_ice_saying, assert_eq_str, assert_kind, ice_count}
 import parser.{node_obj, node_elements, sublist_get}
 import cg_expr.{lower_expr, cg_expr_register_value}
-import ir.{ir_c_name, ir_kid}
+import ir.{IrKind, ir_c_name, ir_kid}
 
 fn src() -> Str {
     #"type Colour { Red, Green }
@@ -36,58 +36,71 @@ fn main() {
 test "an expression carrying no type refuses to lower" {
     probe("cg_expr_ice", src())
     let type_name = node_obj(rhs_of("red"))
-    assert_ice("bare type name", lower_expr(type_name), "NoTypeForNode")
+    assert_ice_saying("bare type name", lower_expr(type_name), "NoTypeForNode",
+        "reached layout with no recorded type")
 }
 
 test "a carrier whose payload is still a type parameter refuses to lower" {
     probe("cg_expr_ice", src())
-    assert_ice("generic Some", lower_expr(rhs_of("held")), "UnspellableExprType")
+    assert_ice_saying("generic Some", lower_expr(rhs_of("held")), "UnspellableExprType",
+        "no C layout")
 }
 
-// C has a subscript and the runtime slot is not one: the element is stored encoded, so a
-// read has to go through the reader that decodes it. Spelling `[]` here would compile and
-// answer the raw slot, which is why this asserts the call rather than merely a non-refusal.
-test "the index operator reads through the runtime reader, not a C subscript" {
+// This file's other tests say a gap is refused out loud. This one says the opposite of the
+// same rule: a read that IS built answers a value and records nothing, because a stage that
+// quietly recorded an internal error and answered anyway would read as built from outside.
+test "a built index read answers a value and records no internal error" {
     probe("cg_expr_ice", src())
+    let before = ice_count()
     let id = lower_expr(rhs_of("at"))
+    assert_kind("index read", id, IrKind.Cast)
     assert_eq_str("reader", ir_c_name(ir_kid(id, 0)), "blink_list_get")
+    assert_eq(ice_count(), before)
 }
 
 test "a closure value is refused until the effect stage builds its thunk" {
     probe("cg_expr_ice", src())
-    assert_ice("closure", lower_expr(rhs_of("f")), "CodegenStageNotBuilt")
+    assert_ice_saying("closure", lower_expr(rhs_of("f")), "CodegenStageNotBuilt",
+        "cg_eff closures")
 }
 
 test "a call and a method call this build cannot dispatch are refused by the call stage" {
     probe("cg_expr_ice", src())
-    assert_ice("free call", lower_expr(rhs_of("called")), "CodegenStageNotBuilt")
-    assert_ice("method call", lower_expr(rhs_of("m")), "CodegenStageNotBuilt")
+    assert_ice_saying("free call", lower_expr(rhs_of("called")), "CodegenStageNotBuilt",
+        "cg_call")
+    assert_ice_saying("method call", lower_expr(rhs_of("m")), "CodegenStageNotBuilt",
+        "methods")
 }
 
 test "an if in value position is refused unless the statement stage claimed its temp" {
     probe("cg_expr_ice", src())
-    assert_ice("unmaterialised if", lower_expr(rhs_of("branch")), "UnmaterialisedValueExpr")
+    assert_ice_saying("unmaterialised if", lower_expr(rhs_of("branch")), "UnmaterialisedValueExpr",
+        "in value position was not materialised")
 }
 
 test "an expression kind with no arm is named, not silently dropped" {
     probe("cg_expr_ice", src())
-    assert_ice("range", lower_expr(rhs_of("span")), "UnhandledExprKind")
+    assert_ice_saying("range", lower_expr(rhs_of("span")), "UnhandledExprKind",
+        "has no lowering")
 }
 
 test "a spread with no container around it is refused: no literal names its destination" {
     probe("cg_expr_ice", src())
     let element = sublist_get(node_elements(rhs_of("copied")), 0)
-    assert_ice("bare spread", lower_expr(element), "SpreadElementNotLowered")
+    assert_ice_saying("bare spread", lower_expr(element), "SpreadElementNotLowered",
+        "no container to copy into")
 }
 
 test "a materialised value registered without a type is refused, not read untyped" {
     probe("cg_expr_ice", src())
     let branch = rhs_of("branch")
     cg_expr_register_value(branch, "_t1", -1)
-    assert_ice("typeless temp", lower_expr(branch), "MaterialisedValueHasNoType")
+    assert_ice_saying("typeless temp", lower_expr(branch), "MaterialisedValueHasNoType",
+        "registered without a type")
 }
 
 test "an operand with no C layout is named as unspellable, not as needing dispatch" {
     probe("cg_expr_ice", src())
-    assert_ice("typevar operand", lower_expr(rhs_of("alike")), "UnspellableExprType")
+    assert_ice_saying("typevar operand", lower_expr(rhs_of("alike")), "UnspellableExprType",
+        "no C layout")
 }
