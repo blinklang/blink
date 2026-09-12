@@ -188,6 +188,39 @@ fn field_value(owner: Int, owner_tid: Int, ftid: Int, path: Str, holder: Str, de
     field_ref(owner_tid, holder, ftid, frec, path, span)
 }
 
+// One case per variant, in the order the switch kids alternate: the tag label, then the
+// block the named derive builds for that variant. Eq, Debug and Hash differ only in that
+// block. Three copies of the label half could become different while each copy still
+// passed its own tests, and a label that names the wrong variant reads a payload through
+// the wrong tag. An empty answer means a refusal was recorded.
+fn variant_cases(decl: Int, tid: Int, slots: List[Int], ints: Str, derive: Str, acc: Str, span: Int) -> List[Int] ! Diag.Report {
+    let mut cases: List[Int] = []
+    let mut i = 0
+    while i < slots.len() {
+        let slot = slots.get(i).unwrap()
+        let vnode = variant_decl_node(decl, slot, i, span)
+        if vnode < 0 { return [] }
+        let body = variant_block(decl, tid, slot, derive, acc, span)
+        if body < 0 { return [] }
+        cases.push(ir_const(TYPE_INT, span, ints, c_variant_tag_macro(decl, vnode)))
+        cases.push(body)
+        i = i + 1
+    }
+    cases
+}
+
+// The block one derive builds for one variant. Only Hash carries an accumulator, so the
+// other two pass an empty name they never read. A derive with no builder here is refused.
+// Clone and Ord arrive next, and a last branch that accepted any name would give one of
+// them another derive's block, which compiles and then answers wrongly.
+fn variant_block(decl: Int, tid: Int, slot: Int, derive: Str, acc: Str, span: Int) -> Int ! Diag.Report {
+    if derive == derive_eq { return eq_variant_block(decl, tid, slot, span) }
+    if derive == derive_debug { return debug_variant_block(decl, tid, slot, span) }
+    if derive == derive_hash { return hash_variant_block(decl, tid, slot, acc, span) }
+    derive_ice(span, "no per-variant block for @derive({derive})")
+    -1
+}
+
 // The declaration node of the variant a registered entry describes. The tag label comes
 // from the declaration node and the payload from the registered entry, so if the two
 // orders ever diverged both halves would move into the same wrong variant, which reads a
@@ -268,7 +301,7 @@ fn eq_enum_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
     if self_tag < 0 || other_tag < 0 || switch_tag < 0 || mismatch < 0 || unknown < 0 { return -1 }
     let differs = ir_binary(TYPE_BOOL, span, bools, "!=", self_tag, other_tag)
     let guard = ir_if(span, differs, mismatch, -1)
-    let cases = eq_variant_cases(decl, tid, slots, ints, span)
+    let cases = variant_cases(decl, tid, slots, ints, derive_eq, "", span)
     if cases.len() == 0 { return -1 }
     ir_block(span, [guard, ir_switch(span, switch_tag, cases, unknown)])
 }
@@ -279,24 +312,6 @@ fn eq_word_body(tid: Int, span: Int) -> Int ! Diag.Report {
     let rhs = self_ref(tid, "other", span)
     if bools == "" || lhs < 0 || rhs < 0 { return -1 }
     ir_block(span, [ir_return(span, ir_binary(TYPE_BOOL, span, bools, "==", lhs, rhs))])
-}
-
-// One case per variant, as the switch kids alternate: the tag label, then the block
-// that compares that variant's payload. An empty answer means a refusal was recorded.
-fn eq_variant_cases(decl: Int, tid: Int, slots: List[Int], ints: Str, span: Int) -> List[Int] ! Diag.Report {
-    let mut cases: List[Int] = []
-    let mut i = 0
-    while i < slots.len() {
-        let slot = slots.get(i).unwrap()
-        let vnode = variant_decl_node(decl, slot, i, span)
-        if vnode < 0 { return [] }
-        let body = eq_variant_block(decl, tid, slot, span)
-        if body < 0 { return [] }
-        cases.push(ir_const(TYPE_INT, span, ints, c_variant_tag_macro(decl, vnode)))
-        cases.push(body)
-        i = i + 1
-    }
-    cases
 }
 
 fn eq_variant_block(decl: Int, tid: Int, slot: Int, span: Int) -> Int ! Diag.Report {
@@ -562,27 +577,9 @@ fn debug_tagged_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
     let scrutinee = tag_ref(tid, "self", ints, span)
     let unknown = debug_corrupt_block(decl, span)
     if scrutinee < 0 || unknown < 0 { return -1 }
-    let cases = debug_variant_cases(decl, tid, slots, ints, span)
+    let cases = variant_cases(decl, tid, slots, ints, derive_debug, "", span)
     if cases.len() == 0 { return -1 }
     ir_block(span, [ir_switch(span, scrutinee, cases, unknown)])
-}
-
-// One case per variant, as the switch kids alternate: the tag label, then the block that
-// renders that variant. An empty answer means a refusal was recorded.
-fn debug_variant_cases(decl: Int, tid: Int, slots: List[Int], ints: Str, span: Int) -> List[Int] ! Diag.Report {
-    let mut cases: List[Int] = []
-    let mut i = 0
-    while i < slots.len() {
-        let slot = slots.get(i).unwrap()
-        let vnode = variant_decl_node(decl, slot, i, span)
-        if vnode < 0 { return [] }
-        let body = debug_variant_block(decl, tid, slot, span)
-        if body < 0 { return [] }
-        cases.push(ir_const(TYPE_INT, span, ints, c_variant_tag_macro(decl, vnode)))
-        cases.push(body)
-        i = i + 1
-    }
-    cases
 }
 
 fn debug_variant_block(decl: Int, tid: Int, slot: Int, span: Int) -> Int ! Diag.Report {
@@ -901,31 +898,13 @@ fn hash_tagged_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
     let scrutinee = tag_ref(tid, "self", ints, span)
     let unknown = hash_corrupt_block(decl, span)
     if scrutinee < 0 || unknown < 0 { return -1 }
-    let cases = hash_variant_cases(decl, tid, slots, acc, span)
+    let cases = variant_cases(decl, tid, slots, ints, derive_hash, acc, span)
     if cases.len() == 0 { return -1 }
     ir_block(span, [
         ir_let(TYPE_U64, span, u64s, acc, u64_form(), seeded),
         ir_switch(span, scrutinee, cases, unknown),
         ir_return(span, ir_var_ref(TYPE_U64, span, u64s, acc, u64_form())),
     ])
-}
-
-fn hash_variant_cases(decl: Int, tid: Int, slots: List[Int], acc: Str, span: Int) -> List[Int] ! Diag.Report {
-    let ints = int_spelling(span)
-    if ints == "" { return [] }
-    let mut cases: List[Int] = []
-    let mut i = 0
-    while i < slots.len() {
-        let slot = slots.get(i).unwrap()
-        let vnode = variant_decl_node(decl, slot, i, span)
-        if vnode < 0 { return [] }
-        let body = hash_variant_block(decl, tid, slot, acc, span)
-        if body < 0 { return [] }
-        cases.push(ir_const(TYPE_INT, span, ints, c_variant_tag_macro(decl, vnode)))
-        cases.push(body)
-        i = i + 1
-    }
-    cases
 }
 
 fn hash_variant_block(decl: Int, tid: Int, slot: Int, acc: Str, span: Int) -> Int ! Diag.Report {
