@@ -1,0 +1,228 @@
+// Which impl methods the body stage writes per instance, and which it writes once.
+//
+// The mono pass registers one instance per element only for the impl shape that is
+// per-element: a List receiver over a single binder whose methods can see the element.
+// Every other impl it walks as a root, which asks the body stage for one shared body.
+// So the rule that sends a method down the per-instance path must be the same rule,
+// or the two stages disagree about the same declaration: codegen waits for instances
+// the pass never registers, and the body a live call needs is written nowhere.
+//
+// The disagreement is not a missing body alone. A method whose binder is named in a
+// signature has no single correct body either, and for those the body stage must still
+// say so rather than leave the symbol to fail at link.
+
+import std.io
+import layout.{layout_reset}
+import cname.{cname_reset, c_impl_method_name}
+import cg_test_helpers.{cg_probe_compile, cg_probe_compile_but, cg_probe_ices_naming}
+import cg.{CgConfig, generate}
+import cg_reg.{cg_reg_impl_methods, cg_reg_impl_of}
+import mono.{run_mono, instances, is_poly_impl, poly_impl_is_element_agnostic}
+import parser.{node_name}
+import diagnostics.{diag_entries}
+
+// The report the body stage makes for a declaration it was sent and cannot write.
+let BODY_GAP = "cg generic impl method bodies"
+
+fn standalone_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+fn probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let program = cg_probe_compile("build/{stem}.bl", src)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    program
+}
+
+// The same, for a probe naming a construct the front end declines. The body stage is
+// still asked to write the program, which is what a test of that stage needs.
+fn probe_but(stem: Str, src: Str, expected: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let program = cg_probe_compile_but("build/{stem}.bl", src, expected)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    program
+}
+
+// The same report, counted on the files this probe does not own. A whole-program unit
+// lowers the prelude too, so the container impls the standard library writes are
+// measured here rather than folded into the probe's own count.
+fn prelude_body_gaps(stem: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.file != "build/{stem}.bl" && d.message.contains(BODY_GAP) {
+            n = n + 1
+        }
+    }
+    n
+}
+
+// The impl block a probe's method was written in, so a claim about the two stages can be
+// made on the node both of them classify.
+fn impl_of(mname: Str) -> Int {
+    for m in cg_reg_impl_methods() {
+        if node_name(m) == mname { return cg_reg_impl_of(m) }
+    }
+    io.println("FAIL: no impl method named '{mname}' in the registry")
+    assert(false)
+    -1
+}
+
+// The symbol the name stage chose for an impl method, so a claim about the body that was
+// written is not a second spelling of the naming rule.
+fn method_symbol(mname: Str) -> Str {
+    c_impl_method_name(impl_of(mname), mname)
+}
+
+// The symbol the mono pass chose for one instance of an impl method, for the same reason.
+fn instance_symbol(mname: Str) -> Str {
+    for m in cg_reg_impl_methods() {
+        if node_name(m) != mname { continue }
+        for mi in instances() {
+            if mi.base_decl_node == m { return mi.c_name }
+        }
+    }
+    io.println("FAIL: the mono pass registered no instance of '{mname}'")
+    assert(false)
+    ""
+}
+
+// A definition is written at file scope, so its line is unindented and opens a brace.
+fn definitions_of(text: Str, symbol: Str) -> Int {
+    let open_brace = #"{"#
+    let call = "{symbol}("
+    let mut n = 0
+    for l in text.split("\n") {
+        if l.starts_with(" ") { continue }
+        if l.contains(call) && l.ends_with(open_brace) { n = n + 1 }
+    }
+    n
+}
+
+// No method signature names the binder, so the impl cannot move or inspect an element and
+// its C does not depend on the element type. The mono pass registers no instance for it
+// and expects the one shared body instead, which is the body a call to it reaches.
+test "an element-agnostic container impl method is written once and reported never" {
+    let stem = "cg_pim_agnostic"
+    let program = probe(stem, #"trait Tally {
+    fn tally(self) -> Int
+}
+
+impl[T] Tally for List[T] {
+    fn tally(self) -> Int { 7 }
+}
+
+fn main() {
+    let xs = [1, 2, 3]
+    let n = xs.tally()
+    assert(n == 7)
+}
+"#)
+    let text = generate(program, standalone_cfg())
+    let im = impl_of("tally")
+    assert(poly_impl_is_element_agnostic(im))
+    assert(!is_poly_impl(im))
+    assert_eq(cg_probe_ices_naming(BODY_GAP), 0)
+    assert_eq(definitions_of(text, method_symbol("tally")), 1)
+}
+
+// The other side of the same predicate. A method signature names the binder, so the C
+// does depend on the element and the pass registers one instance per element. Here the
+// per-instance path is the right one and its rows are there, so nothing is reported.
+test "a per-element container impl method is written per instance" {
+    let stem = "cg_pim_per_element"
+    let program = probe(stem, #"trait Pick[T] {
+    fn pick(self, d: T) -> T
+}
+
+impl[T] Pick[T] for List[T] {
+    fn pick(self, d: T) -> T { d }
+}
+
+fn main() {
+    let xs = [1, 2, 3]
+    let n = xs.pick(4)
+    assert(n == 4)
+}
+"#)
+    let text = generate(program, standalone_cfg())
+    assert(!poly_impl_is_element_agnostic(impl_of("pick")))
+    assert(is_poly_impl(impl_of("pick")))
+    assert_eq(cg_probe_ices_naming(BODY_GAP), 0)
+    assert_eq(definitions_of(text, instance_symbol("pick")), 1)
+}
+
+// The standard library's own container impls are element-agnostic in the same way, and a
+// whole-program unit lowers all of them. They are the standing measure of whether the two
+// stages agree: one report from any of them is the same disagreement, on prelude code.
+test "the prelude's container impl methods are reported never" {
+    let stem = "cg_pim_prelude"
+    let program = probe(stem, #"fn main() {
+    let xs = [1, 2, 3]
+    let n = xs.len()
+    assert(n == 3)
+}
+"#)
+    let text = generate(program, standalone_cfg())
+    assert_eq(prelude_body_gaps(stem), 0)
+    assert_eq(definitions_of(text, method_symbol("len")), 1)
+}
+
+// A method carrying its own type parameters is not instantiated by the mono pass at all:
+// the pass builds its generic table from top-level functions, so a call to this one finds
+// no body under any name. The binder is named in the signature, so there is no single
+// body to write either, and the stage must report the gap rather than emit nothing.
+test "a generic method in a concrete impl is reported once and by the prelude never" {
+    let stem = "cg_pim_generic_method"
+    let program = probe(stem, #"type Holder {
+    v: Int
+}
+
+trait Peek {
+    fn peek[T](self, x: T) -> Int
+}
+
+impl Peek for Holder {
+    fn peek[T](self, _x: T) -> Int { self.v }
+}
+
+fn main() {
+    let h = Holder { v: 7 }
+    let n = h.peek(3)
+    assert(n == 7)
+}
+"#)
+    let _text = generate(program, standalone_cfg())
+    assert_eq(cg_probe_ices_naming(BODY_GAP), 1)
+    assert_eq(prelude_body_gaps(stem), 0)
+}
+
+// A generic user type is a different C struct per argument and has no spelling at all
+// until one is chosen. So an impl over one has no single body either, however little its
+// methods say about the binder, and the stage must report it rather than write a body
+// naming a struct that does not exist.
+test "a generic user type receiver is reported however agnostic its methods are" {
+    let stem = "cg_pim_user_generic_recv"
+    let program = probe_but(stem, #"type Box[T] {
+    v: T
+}
+
+trait Sz {
+    fn sz(self) -> Int
+}
+
+impl[T] Sz for Box[T] {
+    fn sz(self) -> Int { 1 }
+}
+
+fn main() {
+    assert(true)
+}
+"#, "PolyImplUnsupported")
+    let _text = generate(program, standalone_cfg())
+    assert(poly_impl_is_element_agnostic(impl_of("sz")))
+    assert_eq(cg_probe_ices_naming(BODY_GAP), 1)
+}
