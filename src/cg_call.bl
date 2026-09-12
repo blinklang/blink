@@ -68,6 +68,10 @@ let IMPL_REFUSED = -2
 // pair is unresolved, so only this exact value means "there is no declaration".
 let NO_DECL_NODE = -1
 
+// What a call with no receiver passes where a receiver node would go. A free function is
+// written without one, so there is no node to lower and nothing precedes the arguments.
+let NO_RECEIVER = -1
+
 // ── Seams ─────────────────────────────────────────────────────────────────
 
 // Every call the language spells: a free function, an impl method, and the qualified
@@ -174,9 +178,9 @@ pub fn lower_spread(node: Int, into_tid: Int) -> Int ! Diag.Report {
 //
 // The read takes the written node and lowers its own operands, last of all. Everything
 // this seam can refuse is settled first, off the types alone, so a read it cannot build
-// returns before either operand is built: an IR node no result reaches is still in the
-// unit, and the printer walks what the unit holds, not what the answer reached. An operand
-// that refuses on its own account is a different matter, and one this seam cannot undo.
+// returns before either operand is built. The order is the whole gain here, not one line
+// of emitted C: a node no answer names is never printed. The statements an operand hoists
+// are what would reach C, and lower_expr already takes those back on any refusal.
 pub fn lower_element_read(node: Int) -> Int ! Diag.Report {
     if cc_read_is_checked(node) { return cc_checked_read(node) }
     if nk_of(node_kind(node)) != NodeKind.IndexExpr { return cc_not_an_element_read(node) }
@@ -298,7 +302,7 @@ fn cc_free_call(node: Int, decl: Int) -> Int ! Diag.Report {
         cc_ev_not_in_ir(node)
         return -1
     }
-    cc_direct(node, symbol, [])
+    cc_direct(node, symbol, NO_RECEIVER)
 }
 
 // The name the declaration was written under. An import may rename what it brings in, and
@@ -424,9 +428,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     }
     let symbol = cc_call_symbol(node, method, c_impl_method_name(im, node_method(node)))
     if symbol == "" { return -1 }
-    let receiver = lower_expr(obj)
-    if receiver < 0 { return -1 }
-    cc_direct(node, symbol, [receiver])
+    cc_direct(node, symbol, obj)
 }
 
 // What the left of the dot names. Only a Value is a receiver to lower; the other three are
@@ -579,15 +581,24 @@ fn cc_method_of(im: Int, mname: Str) -> Int ! Diag.Report {
 
 // ── Shared ────────────────────────────────────────────────────────────────
 
-// One direct call: the callee's C name, the receiver arguments already lowered, then the
-// written arguments in source order.
-fn cc_direct(node: Int, symbol: Str, leading: List[Int]) -> Int ! Diag.Report {
+// One direct call: the callee's C name, the receiver if the call has one, then the written
+// arguments in source order.
+//
+// The receiver arrives as the node it was written as, not as a lowered one, so that this
+// stage settles what it can refuse before it builds anything. A receiver lowered by the
+// caller is built whether or not a call can be built out of it, and what this stage refuses
+// is read off the call's own type, which it can read without lowering anything.
+fn cc_direct(node: Int, symbol: Str, recv: Int) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = cc_local(tid, node)
     if cc_stopped(rec) { return -1 }
     let mut args: List[Int] = []
-    for a in leading { args.push(a) }
+    if recv != NO_RECEIVER {
+        let receiver = lower_expr(recv)
+        if receiver < 0 { return -1 }
+        args.push(receiver)
+    }
     let written = node_args(node)
     let mut i = 0
     while i < sublist_length(written) {
