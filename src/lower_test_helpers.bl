@@ -5,9 +5,9 @@
 // which changes whenever the probe source gains a line, so a text golden would break for
 // reasons that have nothing to do with lowering.
 
-import typecheck.{check_types, tc_lookup_node_tid}
+import typecheck.{tc_lookup_node_tid}
+import cg_test_helpers.{cg_probe_compile, cg_probe_compile_but}
 import parser.{node_kind, node_name, node_value, node_source_module, nodes}
-import compiler.{compile_to_program}
 import ast.{NodeKind, nk_of}
 import layout.{layout_reset, binder_scope_push, bind_binder}
 import ir.{
@@ -22,12 +22,28 @@ import std.io
 // The Program node of the compiled probe. A test that runs a later pass by hand needs it,
 // so it is the answer rather than a cell another test could read stale.
 pub fn probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    probe_program(stem, src, "")
+}
+
+// The same, for a probe whose source names one thing the front end refuses on purpose.
+// The named error must be recorded and every other error still fails, so the probe keeps
+// saying which refusal it means instead of accepting any failure at all.
+pub fn probe_but(stem: Str, src: Str, expected: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    probe_program(stem, src, expected)
+}
+
+// The front-end guard is cg_test_helpers', not this file's: a probe whose prelude never
+// arrived still parses and still lowers, so a test that skips the guard measures a unit
+// missing most of its types and every claim it makes is about that unit.
+fn probe_program(stem: Str, src: Str, expected: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
     let path = "build/{stem}_probe.bl"
-    write_file(path, src)
-    let program = compile_to_program(path, 1)
+    let program = if expected == "" {
+        cg_probe_compile(path, src)
+    } else {
+        cg_probe_compile_but(path, src, expected)
+    }
     let _rm = process_run("rm", ["-f", path])
-    check_types(program)
     layout_reset()
     ir_reset()
     cg_expr_reset()
@@ -209,8 +225,65 @@ pub fn last_ice_code() -> Str {
     diag_entries.get(idx).unwrap().code
 }
 
+// The message of the last internal error recorded, or "" when none was. The name says which
+// invariant broke; the message says which case of it this was, and one name covers several.
+pub fn last_ice_message() -> Str {
+    let idx = last_ice_at()
+    if idx < 0 { return "" }
+    diag_entries.get(idx).unwrap().message
+}
+
+// How many internal errors are this exact refusal, name and sentence together. One name
+// covers several cases — a whole stage refuses under one — so counting by name alone says
+// nothing about whether the refusal under test was recorded once. A test that reads only
+// the last record cannot tell a single refusal from a run of them.
+pub fn ice_count_exactly(name: Str, message: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.name == name && d.message == message { n = n + 1 }
+    }
+    n
+}
+
+// The text of a refusal the front end made, not merely its code. One code names a whole
+// family — every type error carries the same one — so a test that means one particular
+// refusal reads the sentence that separates it from the rest of the family, and reads how
+// many times it was said, because a second unexpected refusal is a second gap.
+pub fn assert_refused_saying(label: Str, marker: Str, want_count: Int) {
+    let mut found = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.message.contains(marker) { found = found + 1 }
+    }
+    if found != want_count {
+        io.println("FAIL: {label}: {found} errors say '{marker}', want {want_count}:")
+        for d in diag_entries {
+            if d.severity == "error" { io.println("  {d.name}: {d.message}") }
+        }
+    }
+    assert_eq(found, want_count)
+}
+
 pub fn assert_ice(label: Str, got: Int, want_name: Str) {
     if got >= 0 { io.println("FAIL: {label}: lowering answered {got} instead of refusing") }
     assert(got < 0)
     assert_eq_str(label, last_ice(), want_name)
+    let n = ice_count_exactly(want_name, last_ice_message())
+    if n != 1 {
+        io.println("FAIL: {label}: this refusal was recorded {n} times, want exactly one")
+        for d in diag_entries {
+            if d.severity == "ice" { io.println("  {d.name}: {d.message}") }
+        }
+    }
+    assert_eq(n, 1)
+}
+
+// A refusal pinned by name, by sentence and by count. The name alone covers several cases,
+// so a test that means one of them says which sentence it means.
+pub fn assert_ice_saying(label: Str, got: Int, want_name: Str, marker: Str) {
+    assert_ice(label, got, want_name)
+    let msg = last_ice_message()
+    if !msg.contains(marker) {
+        io.println("FAIL: {label}: refusal says '{msg}', which does not say '{marker}'")
+    }
+    assert(msg.contains(marker))
 }
