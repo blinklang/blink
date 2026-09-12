@@ -33,7 +33,7 @@ import cname.{
     c_fn_decl_name, c_impl_method_name, c_display_dispatch_name, c_derive_method_name,
     c_runtime_helper,
 }
-import ir.{ir_tid, ir_call_direct, ir_call_runtime, ir_cast, ir_unary}
+import ir.{ir_tid, ir_call_direct, ir_call_runtime, ir_cast, ir_unary, ir_unbox}
 import cg_expr.{lower_expr}
 import cg_decl.{cg_decl_takes_ev}
 import diagnostics.{
@@ -49,6 +49,7 @@ let trait_display = "Display"
 let trait_eq = "Eq"
 let trait_ord = "Ord"
 let method_eq = "eq"
+let method_get = "get"
 
 // ── Seams ─────────────────────────────────────────────────────────────────
 
@@ -140,26 +141,68 @@ pub fn lower_spread(node: Int, into_tid: Int) -> Int ! Diag.Report {
 }
 
 // One owner for reading an element out of a container: `[i]`, which answers the element
-// type, and `.get(i)`, which answers an Option over it. The node's own type says which.
+// type, and `.get(i)`, which answers an Option over it. Only the index is routed here yet;
+// the checked read keeps its arm so that the refusal names the right gap when it is.
+//
+// Everything the read can refuse is settled before any node is built, so a refusal leaves
+// no half-made read behind. The operands arrive already lowered, which is the caller's
+// choice of evaluation order, so those two nodes are the caller's to account for.
 pub fn lower_element_read(node: Int, obj: Int, index: Int) -> Int ! Diag.Report {
     if obj < 0 || index < 0 { return -1 }
+    if cc_read_is_checked(node) { return cc_checked_read(node) }
+    if nk_of(node_kind(node)) != NodeKind.IndexExpr { return cc_not_an_element_read(node) }
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
-    if cc_kind(tid) == TyKind.Option {
-        diag_ice_at("CheckedElementReadNotLowered", CODEGEN_STAGE_NOT_BUILT,
-            "an element read answering Option has no lowering here", node,
-            "the bounds test and the carrier it fills are statements cg_expr must hoist")
-        return -1
-    }
     let helper = cc_element_helper(node, ir_tid(obj))
     if helper == "" { return -1 }
-    let slot = cc_element_slot(node, tid)
+    let slot = cc_element_layout(node, tid, Position.ContainerSlot)
     if cc_stopped(slot) { return -1 }
+    let boxed = slot.slot_form == SlotForm.PointerBoxed
+    if !boxed && slot.slot_form != SlotForm.InlineWord { return cc_element_slot_form(node, tid) }
+    let value = if boxed { cc_element_layout(node, tid, Position.Local) } else { slot }
+    if cc_stopped(value) { return -1 }
     let raw = ir_call_runtime(tid, node, slot.c_spelling, helper, slot.slot_form, [obj, index])
-    ir_cast(tid, node, slot.c_spelling, raw)
+    let read = ir_cast(tid, node, slot.c_spelling, raw)
+    if !boxed { return read }
+    ir_unbox(tid, node, value.c_spelling, value.slot_form, read)
 }
 
 // ── Element reads ─────────────────────────────────────────────────────────
+
+// `.get(i)`, which tests the bounds and answers a carrier. Which of the two reads was
+// written is read off the syntax, because the answer's type cannot say: over a container
+// of Option elements both reads answer Option, so keying on the type would send every
+// such index down the bounds-checked path. The method name is part of the syntax, so a
+// call of some other method is not this read written a second way.
+fn cc_read_is_checked(node: Int) -> Bool {
+    nk_of(node_kind(node)) == NodeKind.MethodCall && node_method(node) == method_get
+}
+
+fn cc_checked_read(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("CheckedElementReadNotLowered", CODEGEN_STAGE_NOT_BUILT,
+        "an element read answering Option has no lowering here", node,
+        "the bounds test and the carrier it fills are statements cg_expr must hoist")
+    -1
+}
+
+// Neither syntax. The seam reads an element, so a node that is not one of the two reads
+// reached it by a wrong dispatch arm rather than by a gap in this stage.
+fn cc_not_an_element_read(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("NotAnElementRead", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "{node_kind_name(node_kind(node))} is not an element read", node,
+        "only an index and a checked get reach this seam; the caller's dispatch is wrong")
+    -1
+}
+
+// A slot holds the element in the word or behind a pointer, and the read answers each of
+// those. A third form would need a third read, so it is refused rather than cast as if it
+// were the word.
+fn cc_element_slot_form(node: Int, elem_tid: Int) -> Int ! Diag.Report {
+    diag_ice_at("ElementSlotFormNotLowered", CODEGEN_STAGE_NOT_BUILT,
+        "a {tk_name(cc_kind(elem_tid))} element sits in its slot in neither of the two forms",
+        node, "an element slot is one machine word, so layout answers InlineWord or PointerBoxed")
+    -1
+}
 
 // The runtime reader for a container kind. "" after an internal error is recorded.
 fn cc_element_helper(node: Int, container_tid: Int) -> Str ! Diag.Report {
@@ -170,24 +213,17 @@ fn cc_element_helper(node: Int, container_tid: Int) -> Str ! Diag.Report {
     ""
 }
 
-// How the element type is held in a runtime slot. The slot is one machine word, so an
-// element the layer holds behind a pointer, and a double the runtime heap-boxes, each
-// need a dereference this stage does not write yet.
-fn cc_element_slot(node: Int, elem_tid: Int) -> LayoutRecord ! Diag.Report {
-    let rec = layout_of(elem_tid, Position.ContainerSlot)
+// The element's C shape. A container slot answers the word itself or a pointer to the
+// element, and the same element at Position.Local answers the type that pointer points at.
+fn cc_element_layout(node: Int, elem_tid: Int, position: Position) -> LayoutRecord ! Diag.Report {
+    let rec = layout_of(elem_tid, position)
+    // The reason is read into the message before the test, so that every read of a decline
+    // sits next to the internal error that reports it and none can be left to be swallowed.
     let why = "container element has no C layout: {rec.decline_reason}"
-    if rec.decline_reason != "" {
-        diag_ice_at("UnspellableElementType", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
-            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
-        return rec
-    }
-    if rec.slot_form != SlotForm.InlineWord || cc_kind(elem_tid) == TyKind.Float {
-        diag_ice_at("BoxedElementReadNotLowered", CODEGEN_STAGE_NOT_BUILT,
-            "a {tk_name(cc_kind(elem_tid))} element is held behind a pointer in its slot", node,
-            "reading it is a dereference of the slot's pointer spelling, which layout omits")
-        return cc_stop(rec)
-    }
-    rec
+    if rec.decline_reason == "" { return rec }
+    diag_ice_at("UnspellableElementType", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
+        "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    cc_stop(rec)
 }
 
 // ── Free functions ────────────────────────────────────────────────────────
