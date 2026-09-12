@@ -1,0 +1,131 @@
+// Calls on the `io` and `env` namespaces the compiler provides itself.
+//
+// Neither namespace is a module, so neither has a declaration to resolve. What the call
+// reaches is decided from the namespace and the method name alone, the same two spellings
+// typecheck reads to accept the call in the first place.
+//
+// The names divide three ways, and the division is not cosmetic. Five io operations and
+// five env operations are operations of an EFFECT: each one is a slot of a vtable the
+// evidence vector points at, so a handler installed over the call site replaces it.
+// Calling the runtime's default directly would ignore that handler and print where a test
+// meant to capture. Those names are refused here until an IR node names the vector. The
+// two `_raw` names have no slot by design, so nothing would be ignored, but the runtime
+// publishes no call that writes a rendered value, so they are refused on that ground and
+// say so. The last four read and write the standard streams through calls the runtime does
+// publish, so they are built.
+
+import lower_test_helpers.{
+    probe, rhs_of, let_node_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
+    assert_ice_saying,
+}
+import parser.{node_kind, node_method, nodes}
+import ast.{NodeKind, nk_of}
+import ir.{IrKind, ir_c_name}
+import cg_expr.{lower_expr}
+import std.io
+
+// A call written as a statement binds no name, so it is found by walking forward from a
+// binding the probe does name. An expression node carries no source module, and the stdlib
+// graph calls these same methods, so the anchor is what separates the probe's own line
+// from the library's: a statement parses after the binding above it, so its node id is
+// higher.
+fn call_after(anchor: Str, method: Str) -> Int {
+    let mut i = let_node_of(anchor)
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.MethodCall && node_method(i) == method { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no call of '{method}' after '{anchor}'")
+    assert(false)
+    -1
+}
+
+// The four io names that reach the standard streams with no handler between. Two answer a
+// value and two answer nothing, so the probe writes each in the position its type allows.
+fn src_streams() -> Str {
+    #"fn main() {
+    let count = 4
+    let line = io.read_line()
+    let buffer = io.read_bytes(count)
+    io.write(line)
+    io.write_bytes(buffer)
+    let _keep = [line.len()]
+}
+"#
+}
+
+// One name from each group that is refused: a handler-replaceable print, a raw print, an
+// env read whose answer is a carrier, and the argument list. The probe calls each once so
+// a test that lowers one records one refusal.
+fn src_refused() -> Str {
+    #"fn main() {
+    let home = env.var("HOME")
+    let argv = env.args()
+    io.println("hi")
+    io.print_raw("hi")
+    let _keep = [argv.len()]
+    let _also = home
+}
+"#
+}
+
+test "io.read_line reaches the runtime line reader with no argument" {
+    probe("cg_call_io_read_line", src_streams())
+    let built = lower_expr(rhs_of("line"))
+    assert_kind("read_line kind", built, IrKind.CallRuntime)
+    assert_shape("read_line shape", built, "CallRuntime")
+    assert_eq_str("read_line symbol", ir_c_name(built), "blink_stdin_read_line")
+    assert_verifies("read_line", built)
+}
+
+test "io.read_bytes passes its count to the runtime byte reader" {
+    probe("cg_call_io_read_bytes", src_streams())
+    let built = lower_expr(rhs_of("buffer"))
+    assert_shape("read_bytes shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("read_bytes symbol", ir_c_name(built), "blink_stdin_read_bytes")
+    assert_verifies("read_bytes", built)
+}
+
+test "io.write passes its text to the runtime stream writer" {
+    probe("cg_call_io_write", src_streams())
+    let built = lower_expr(call_after("count", "write"))
+    assert_shape("write shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("write symbol", ir_c_name(built), "blink_stdout_write")
+    assert_verifies("write", built)
+}
+
+test "io.write_bytes passes its buffer to the runtime stream writer" {
+    probe("cg_call_io_write_bytes", src_streams())
+    let built = lower_expr(call_after("count", "write_bytes"))
+    assert_shape("write_bytes shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("write_bytes symbol", ir_c_name(built), "blink_stdout_write_bytes")
+    assert_verifies("write_bytes", built)
+}
+
+test "io.println refuses because printing is dispatched through the evidence vector" {
+    probe("cg_call_io_println", src_refused())
+    assert_ice_saying("println", lower_expr(call_after("home", "println")),
+        "IntrinsicEffectOpNotInIr",
+        "'io.println' is dispatched through the evidence vector")
+}
+
+test "env.var refuses because reading the environment is dispatched through the vector" {
+    probe("cg_call_env_var", src_refused())
+    assert_ice_saying("env.var", lower_expr(rhs_of("home")),
+        "IntrinsicEffectOpNotInIr",
+        "'env.var' is dispatched through the evidence vector")
+}
+
+test "env.args refuses because its list is filled one element at a time" {
+    probe("cg_call_env_args", src_refused())
+    assert_ice_saying("env.args", lower_expr(rhs_of("argv")),
+        "EnvArgumentListNotBuilt",
+        "'env.args' fills its list one element at a time")
+}
+
+test "io.print_raw refuses because no runtime call writes a rendered value raw" {
+    probe("cg_call_io_print_raw", src_refused())
+    assert_ice_saying("print_raw", lower_expr(call_after("home", "print_raw")),
+        "RawPrintNotInRuntime",
+        "'io.print_raw' writes a rendered value raw")
+}
