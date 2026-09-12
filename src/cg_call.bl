@@ -19,6 +19,7 @@
 
 import parser.{
     node_kind, node_name, node_left, node_right, node_obj, node_index, node_method, node_args,
+    node_line,
     node_methods, node_trait_name, node_impl_binders, node_type_params,
     node_module, node_source_module, node_params,
     sublist_get, sublist_length,
@@ -28,10 +29,11 @@ import typecheck.{
     TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, lookup_named_type,
     is_import_module_name, is_builtin_namespace, is_builtin_fn, tc_alias_to_original,
     tc_qualifier_to_module_or_self, tc_get_symbol_module, tc_type_str,
-    tc_enum_variant_slots, tc_evar_name, TYPE_STR,
+    tc_enum_variant_slots, tc_evar_name, TYPE_INT, TYPE_BOOL, TYPE_STR,
 }
 import layout.{
-    LayoutRecord, Position, SlotForm, Slot, layout_of, tid_of_node, child_tid, ensure_typedef_for,
+    LayoutRecord, Position, SlotForm, Slot, layout_of, carrier_member_layout, tid_of_node,
+    child_tid, ensure_typedef_for,
     tid_of_binder, current_binder_scope, current_inst, decl_has_derive,
 }
 import mono.{instances, instance_for_call}
@@ -39,14 +41,18 @@ import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls}
 import cname.{
     c_fn_decl_name, c_impl_method_name, c_impl_method_name_q,
     c_display_dispatch_name, c_derive_method_name,
-    c_runtime_helper, c_ffi_symbol,
+    c_runtime_helper, c_ffi_symbol, c_mint_local, c_string_literal,
 }
-import ir.{ir_call_direct, ir_call_runtime, ir_cast, ir_unary, ir_unbox, ir_box}
-import cg_expr.{lower_expr}
+import ir.{
+    ir_call_direct, ir_call_runtime, ir_cast, ir_unary, ir_unbox, ir_box,
+    ir_binary, ir_block, ir_carrier_tag, ir_carrier_unwrap, ir_const, ir_if, ir_let,
+    ir_panic, ir_var_ref,
+}
+import cg_expr.{lower_expr, cg_expr_push_pending}
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
 import diagnostics.{
-    Diag, diag_ice_at, diag_ice_stage_not_built, CODEGEN_STAGE_NOT_BUILT,
-    UNSOLVED_TYPEVAR_AT_CODEGEN,
+    Diag, diag_ice_at, diag_ice_stage_not_built, diag_file_for_node, diag_source_file,
+    CODEGEN_STAGE_NOT_BUILT, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 
 // The trait whose synthesized dispatcher renders a value into a string, the two traits
@@ -852,6 +858,8 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if declared != "" { return lower_intrinsic_method(node, obj, kind, mname, declared) }
     let primitive = cc_runtime_method(kind, mname)
     if primitive != "" { return cc_lower_runtime_method(node, obj, kind, mname, primitive) }
+    if cc_is_carrier_test(kind, mname) { return cc_carrier_test(node, obj, kind, mname) }
+    if cc_is_carrier_read(kind, mname) { return cc_carrier_read(node, obj, kind, mname) }
     let im = cc_impl_with_method(node, recv_tid, mname)
     if im == IMPL_REFUSED { return -1 }
     if im < 0 { return cc_method_not_built(node, kind, mname) }
@@ -976,6 +984,197 @@ fn cc_runtime_method_arity(op: Str) -> Int {
     if op == "list_push" { return 1 }
     if op == "list_set" { return 2 }
     NO_ARITY
+}
+
+// ── Carriers ──────────────────────────────────────────────────────────────
+//
+// Option and Result are built by the compiler, so no declaration answers their methods and
+// no runtime primitive does either: each one reads the carrier that is already in hand.
+// Four of them answer the tag alone and build one comparison. The other two read the
+// payload of one arm, which is only there when the tag says so, so each guards the read
+// and panics when the other arm is what it was given.
+//
+// The tag numbers and the member names are the ones a carrier is written with. A stage
+// that builds a carrier and a stage that matches on one spell the same pairs, and reading
+// Option's numbers for a Result would answer every value backwards.
+
+let carrier_value_member = "value"
+
+let TAG_NONE = 0
+let TAG_SOME = 1
+let TAG_OK = 0
+let TAG_ERR = 1
+
+fn cc_is_carrier_test(kind: TyKind, method: Str) -> Bool {
+    if kind == TyKind.Option { return method == "is_some" || method == "is_none" }
+    if kind == TyKind.Result { return method == "is_ok" || method == "is_err" }
+    false
+}
+
+fn cc_is_carrier_read(kind: TyKind, method: Str) -> Bool {
+    if kind == TyKind.Option { return method == "unwrap" }
+    if kind == TyKind.Result { return method == "unwrap" || method == "unwrap_err" }
+    false
+}
+
+// A test reads the tag and compares it. No arm is read, so there is nothing to guard, the
+// receiver is named once by the comparison itself, and no statement precedes it.
+fn cc_carrier_test(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    if !cc_carrier_arity_ok(node, kind, method) { return -1 }
+    let carrier = tid_of_node(obj)
+    if carrier < 0 { return -1 }
+    let held = cc_local(carrier, node)
+    if cc_stopped(held) { return -1 }
+    let g = cc_guard_spellings(node)
+    if cc_guard_stopped(g) { return -1 }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    if held.slot_form == SlotForm.InlineWord {
+        return cc_handle_is(node, carrier, held, g, recv, method == "is_some")
+    }
+    cc_tag_equals(node, ir_carrier_tag(TYPE_INT, node, g.tag, recv), cc_carrier_true_tag(kind, method), g)
+}
+
+// A carrier layout answers one machine word only for the Option over an @ffi.opaque
+// handle, which is the handle itself: no tag member and no value member. None is written
+// as the null handle, so that one comparison is the whole test.
+fn cc_handle_is(node: Int, carrier: Int, held: LayoutRecord, g: GuardSpellings, on: Int,
+                present: Bool) -> Int {
+    let op = if present { "!=" } else { "==" }
+    ir_binary(TYPE_BOOL, node, g.answer, op, on, ir_const(carrier, node, held.c_spelling, "0"))
+}
+
+// The tag each test answers true for. It is read off the carrier kind as well as the name
+// so that an Option method can never answer a Result's numbering: the two disagree on
+// which arm is 1, and a name alone would answer every value of one of them backwards.
+fn cc_carrier_true_tag(kind: TyKind, method: Str) -> Int {
+    if kind == TyKind.Option { return if method == "is_some" { TAG_SOME } else { TAG_NONE } }
+    if method == "is_ok" { return TAG_OK }
+    TAG_ERR
+}
+
+// A read answers the arm the tag promises. Everything it can refuse — the argument count,
+// the three layouts it spells and, for a Result, the value a panic would have to render —
+// is settled before the receiver is lowered, so a refusal has built nothing and hoisted
+// nothing.
+fn cc_carrier_read(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    if !cc_carrier_arity_ok(node, kind, method) { return -1 }
+    if kind == TyKind.Result { return cc_carrier_panic_unrendered(node, method) }
+    let carrier = tid_of_node(obj)
+    if carrier < 0 { return -1 }
+    let inner = tid_of_node(node)
+    if inner < 0 { return -1 }
+    let held = cc_local(carrier, node)
+    if cc_stopped(held) { return -1 }
+    let _td = ensure_typedef_for(carrier)
+    let member = cc_member_layout(node, carrier, Slot.Inner1)
+    if cc_stopped(member) { return -1 }
+    let value = cc_local(inner, node)
+    if cc_stopped(value) { return -1 }
+    let g = cc_guard_spellings(node)
+    if cc_guard_stopped(g) { return -1 }
+    // The receiver is bound before it is read twice. The guard and the read each name the
+    // binding, so an expression that produced the carrier runs once however many times the
+    // carrier itself is read.
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    let name = c_mint_local("u")
+    cg_expr_push_pending(node, ir_let(carrier, node, held.c_spelling, name, held.slot_form, recv))
+    let ref = cc_carrier_ref(node, carrier, held, name)
+    if held.slot_form == SlotForm.InlineWord {
+        cc_push_guard(node, g, cc_handle_is(node, carrier, held, g, ref, false))
+        return ir_cast(inner, node, value.c_spelling, cc_carrier_ref(node, carrier, held, name))
+    }
+    let tag = ir_carrier_tag(TYPE_INT, node, g.tag, ref)
+    cc_push_guard(node, g, cc_tag_equals(node, tag, TAG_NONE, g))
+    let read = ir_carrier_unwrap(inner, node, member.c_spelling, carrier_value_member, member.slot_form,
+        cc_carrier_ref(node, carrier, held, name))
+    if member.slot_form != SlotForm.PointerBoxed { return read }
+    ir_unbox(inner, node, value.c_spelling, value.slot_form, read)
+}
+
+// The statement that panics unless the carrier holds the arm about to be read. The
+// condition tests the arm that is NOT read: that is the one value the read cannot be
+// given, and every other tag the carrier could hold is a tag no arm of it declares.
+fn cc_push_guard(node: Int, g: GuardSpellings, absent: Int) ! Diag.Report {
+    let message = cc_panic_message(node, "unwrap called on None")
+    let said = ir_const(TYPE_STR, node, g.message, c_string_literal(message))
+    cg_expr_push_pending(node, ir_if(node, absent, ir_block(node, [ir_panic(node, said)]), -1))
+}
+
+fn cc_tag_equals(node: Int, tag: Int, want: Int, g: GuardSpellings) -> Int {
+    ir_binary(TYPE_BOOL, node, g.answer, "==", tag, ir_const(TYPE_INT, node, g.tag, "{want}"))
+}
+
+fn cc_carrier_ref(node: Int, carrier: Int, held: LayoutRecord, name: Str) -> Int {
+    ir_var_ref(carrier, node, held.c_spelling, name, held.slot_form)
+}
+
+// The three spellings a tag test is written with: the integer the tag is read as, the Bool
+// the comparison answers, and the string a panic carries. One record because a guard needs
+// all three or none of them.
+type GuardSpellings { tag: Str  answer: Str  message: Str }
+
+fn cc_guard_spellings(node: Int) -> GuardSpellings ! Diag.Report {
+    GuardSpellings {
+        tag: cc_local(TYPE_INT, node).c_spelling,
+        answer: cc_local(TYPE_BOOL, node).c_spelling,
+        message: cc_local(TYPE_STR, node).c_spelling,
+    }
+}
+
+fn cc_guard_stopped(g: GuardSpellings) -> Bool {
+    g.tag == "" || g.answer == "" || g.message == ""
+}
+
+// A carrier member's C shape. The member holds the payload itself or a pointer to it, and
+// which of the two it is decides whether the read follows a pointer.
+fn cc_member_layout(node: Int, carrier_tid: Int, slot: Slot) -> LayoutRecord ! Diag.Report {
+    let rec = carrier_member_layout(carrier_tid, slot)
+    let why = "carrier member has no C layout: {rec.decline_reason}"
+    if rec.decline_reason == "" { return rec }
+    diag_ice_at("UnspellableCarrierMember", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
+        "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    cc_stop(rec)
+}
+
+// What a caught panic reads. The wording, the file and the line are what a program that
+// catches one is shown, so the call's own position is what the message names, and a node
+// that carries no line says so rather than naming a line the program never wrote.
+fn cc_panic_message(node: Int, what: Str) -> Str {
+    "panic: {what} at {cc_panic_file(node)}:{cc_panic_line(node)}"
+}
+
+fn cc_panic_file(node: Int) -> Str {
+    let named = diag_file_for_node(node)
+    if named != "" { return named }
+    diag_source_file
+}
+
+fn cc_panic_line(node: Int) -> Str {
+    let line = node_line(node)
+    if line <= 0 { return "<synthesized>" }
+    "{line}"
+}
+
+// None of these six takes an argument. Typecheck accepts one written anyway, and building
+// the call without it would drop an expression the program wrote, side effects and all.
+fn cc_carrier_arity_ok(node: Int, kind: TyKind, method: Str) -> Bool ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given == 0 { return true }
+    let _refused = cc_intrinsic_arity_wrong(node, kind, method, 0, given)
+    false
+}
+
+// A Result panic names the value it panicked on, rendered the way an interpolation hole
+// renders one. That rendering takes a written expression and lowers it itself, and what a
+// panic has in hand is a value already lowered, so the two panicking Result methods refuse
+// rather than panic with a sentence whose value is missing.
+fn cc_carrier_panic_unrendered(node: Int, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("CarrierPanicValueNotRendered", CODEGEN_STAGE_NOT_BUILT,
+        "'{method}' on a Result names the value it panicked on, and nothing here renders a lowered value",
+        node, "the rendering a Display hole performs has to take a value already lowered")
+    -1
 }
 
 // ── Intrinsic tables ──────────────────────────────────────────────────────
