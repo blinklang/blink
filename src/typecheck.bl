@@ -405,13 +405,124 @@ fn tc_mangle_impl_fnsig(impl_type: Str, trait_name: Str, mname: Str, im: Int) ->
     "{impl_type}_{trait_name}_{mname}"
 }
 
+// Bare type names declared by more than one module, each with the modules that declare it
+// as "|m1|m2|". Only these carry a module in their nominal name; every other type keeps its
+// bare spelling, so a program without a namesake registers exactly as before.
+let mut tc_namesake_type_modules: Map[Str, Str] = Map()
+
+fn tc_is_namesake_type_name(bare: Str) -> Int {
+    if tc_namesake_type_modules.contains_key(bare) { 1 } else { 0 }
+}
+
+fn tc_collect_namesake_type_names(types_sl: Int) {
+    tc_namesake_type_modules = Map()
+    let mut first_module: Map[Str, Str] = Map()
+    let mut i = 0
+    while i < sublist_length(types_sl) {
+        let td = sublist_get(types_sl, i)
+        let bare = node_name(td)
+        let m = node_module(td)
+        match first_module.get(bare) {
+            Some(prev) => {
+                if prev != m {
+                    let mods = tc_namesake_type_modules.get(bare) ?? "|{prev}|"
+                    if mods.contains("|{m}|") == 0 {
+                        tc_namesake_type_modules.insert(bare, "{mods}{m}|")
+                    }
+                }
+            }
+            None => first_module.insert(bare, m)
+        }
+        i = i + 1
+    }
+}
+
+// A single-file build tags the program's own nodes "", a package build "__main__".
+fn tc_module_key_is_main(m: Str) -> Int {
+    if m == "" || m == "__main__" { 1 } else { 0 }
+}
+
+// The name a declaration is known by in the type pool: its bare name, or `module.bare` when
+// another module declares the same bare name. The main file keeps the bare spelling.
+fn tc_nominal_type_name(td: Int) -> Str {
+    let bare = node_name(td)
+    if tc_is_namesake_type_name(bare) == 0 { return bare }
+    let m = node_module(td)
+    if tc_module_key_is_main(m) != 0 { return bare }
+    "{m}.{bare}"
+}
+
+// The pool key of a type name as WRITTEN in the module under check (`Point`, `alpha.Point`).
+// Only a namesake goes through lookup; every other name is its own key.
+fn tc_written_type_nominal(name: Str) -> Str {
+    let segs = name.split(".")
+    let bare = segs.get(segs.len() - 1) ?? name
+    if tc_is_namesake_type_name(bare) == 0 { return name }
+    let t = lookup_named_type(name)
+    if t == -1 { return name }
+    tc_tid_name(t)
+}
+
+// The tid of a STRUCT declared under the bare name `bare` in any module, or -1. A namesake
+// is registered only under its module-qualified key, so each declaring module is tried.
+fn tc_struct_tid_declared_as(bare: Str) -> Int {
+    let mods = match tc_namesake_type_modules.get(bare) {
+        Some(v) => v
+        None => {
+            let t = named_type_map.get(bare) ?? -1
+            if t != -1 && type_kind(t) == TyKind.Struct { return t }
+            return -1
+        }
+    }
+    for m in mods.split("|") {
+        let key = if tc_module_key_is_main(m) != 0 { bare } else { "{m}.{bare}" }
+        let t = named_type_map.get(key) ?? -1
+        if t != -1 && type_kind(t) == TyKind.Struct { return t }
+    }
+    -1
+}
+
+// What the bare type name `bare` means inside module `reader`: the module's own declaration,
+// else the one its import list selects, else the bare spelling (the main file's, if any).
+fn tc_nominal_type_name_in(bare: Str, reader: Str) -> Str {
+    let mods = match tc_namesake_type_modules.get(bare) {
+        Some(v) => v
+        None => return bare
+    }
+    if tc_module_key_is_main(reader) != 0 {
+        if mods.contains("|__main__|") != 0 || mods.contains("||") != 0 { return bare }
+    } else if mods.contains("|{reader}|") != 0 {
+        return "{reader}.{bare}"
+    }
+    for source_mod in mods.split("|") {
+        if source_mod == "" { continue }
+        match per_module_imports.get("{reader}:{source_mod}") {
+            Some(imp_node) => {
+                if imp_node != -1 && is_selected_import(bare, imp_node) != 0 { return "{source_mod}.{bare}" }
+            }
+            None => {}
+        }
+    }
+    bare
+}
+
+// The type an impl header names, resolved in the impl's own module.
+fn tc_impl_target_name(im: Int) -> Str {
+    tc_nominal_type_name_in(node_name(im), node_module(im))
+}
+
+// The tid a declaration node registered.
+fn tc_decl_tid(td: Int) -> Int {
+    named_type_map.get(tc_nominal_type_name(td)) ?? -1
+}
+
 // Index a declaration under its bare name, under `<module>.<bare>`, and under its tid.
 // The bare key is what an unqualified annotation looks up, but it holds only ONE
 // declaration, so a second module declaring the same bare name would otherwise answer
 // for the first. The qualified key resolves a written `m.Point`; the tid key resolves a
 // value whose type was inferred, where no spelling survives to look up.
-fn tc_register_type_decl_node(name: Str, tid: Int, td: Int) {
-    // Read the previous declaration of this bare name BEFORE overwriting either key.
+fn tc_register_type_decl_node(bare: Str, name: Str, tid: Int, td: Int) {
+    // Read the previous declaration of this name BEFORE overwriting either key.
     let prev = tc_type_decl_nodes.get(name) ?? -1
     let prev_tid = named_type_map.get(name) ?? -1
     if prev != -1 && prev != td {
@@ -423,13 +534,13 @@ fn tc_register_type_decl_node(name: Str, tid: Int, td: Int) {
     }
     tc_type_decl_nodes.insert(name, td)
     let m = node_source_module(td)
-    if m != "" { tc_type_decl_nodes.insert("{m}.{name}", td) }
+    if m != "" { tc_type_decl_nodes.insert("{m}.{bare}", td) }
 }
 
 // The declaration node behind a struct/enum tid: the node registered for the base tid,
 // else the node its name indexes (an INSTANCE tid `Box[Int]` is minted per use and never
 // registered, so it reaches its base through the name the pool entry carries). -1 when
-// no declaration exists; DECL_NODE_AMBIGUOUS when two modules declared the bare name.
+// no declaration exists; DECL_NODE_AMBIGUOUS when two declarations share one nominal name.
 pub fn tc_tid_decl_node(tid0: Int) -> Int {
     let tid = tc_resolve(tid0)
     if tid < 0 || tid >= ty_pool.len() { return -1 }
@@ -2227,13 +2338,28 @@ pub fn tc_unify(a0: Int, b0: Int) -> Int {
 // ── Type lookup ─────────────────────────────────────────────────────
 
 pub fn lookup_named_type(name: Str) -> Int {
+    let dot = name.index_of(".")
+    // A bare namesake means the reading module's own declaration, or the one its imports
+    // select, before the bare key (which only the main file can hold).
+    if dot < 0 && tc_is_namesake_type_name(name) != 0 {
+        match named_type_map.get(tc_nominal_type_name_in(name, nr_current_module)) {
+            Some(v) => return v
+            None => {}
+        }
+    }
     match named_type_map.get(name) {
         Some(v) => return v
         None => {}
     }
-    let dot = name.index_of(".")
     if dot >= 0 {
         let bare = name.slice(dot + 1, name.len())
+        // A written qualifier on a namesake names one module's declaration and nothing else:
+        // the bare key would answer with another module's type of the same name.
+        if tc_is_namesake_type_name(bare) != 0 {
+            let qual = name.slice(0, dot)
+            let mod_key = tc_qualifier_to_module.get(qual) ?? qual
+            return named_type_map.get("{mod_key}.{bare}") ?? -1
+        }
         let resolved = tc_alias_to_original.get(bare) ?? bare
         match named_type_map.get(resolved) {
             Some(v) => return v
@@ -4965,7 +5091,7 @@ fn tc_ctor_arity(name: Str) -> Int {
     if n == "U8" || n == "U16" || n == "U32" || n == "U64" || n == "I8" || n == "I16" || n == "I32" || n == "I64" {
         return 0
     }
-    let decl = tc_type_decl_nodes.get(n) ?? -1
+    let decl = tc_type_decl_nodes.get(tc_written_type_nominal(n)) ?? -1
     if decl == -1 { return -1 }
     let tps = node_type_params(decl)
     if tps == -1 { return 0 }
@@ -5220,7 +5346,7 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
             tc_validate_type_arg_hashability(elems_sl)
         }
         if type_kind(resolved) == TyKind.Struct && elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-            let inst = tc_produce_struct_instance_tid(ann_node, name, elems_sl)
+            let inst = tc_produce_struct_instance_tid(ann_node, tc_instance_base_name(resolved), elems_sl)
             if inst != -1 { return inst }
         }
         // A generic-enum instance annotation (`t: Tree[Int]`) likewise memoizes its
@@ -5228,7 +5354,7 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
         // can lower it to the mono carrier (blink_Tree_Int), not the erased bare enum.
         // Same all-typevar skip as the struct producer.
         if type_kind(resolved) == TyKind.Enum && elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-            let inst = tc_produce_enum_instance_tid(ann_node, name, elems_sl)
+            let inst = tc_produce_enum_instance_tid(ann_node, tc_instance_base_name(resolved), elems_sl)
             if inst != -1 { return inst }
         }
         return resolved
@@ -5271,10 +5397,10 @@ pub fn tc_impl_self_tid(im: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     // singleton made a trait default-method body type its own `self` as unknown — and unknown
     // unifies with everything, which is the vacuous check this function exists to prevent.
     if im == -1 { return -1 }
-    let name = node_name(im)
     // A trait's own default-method bodies have no receiver type to speak of, and the parser
-    // leaves `name` empty for a header with no `for` clause.
-    if name == "" { return -1 }
+    // leaves the name empty for a header with no `for` clause.
+    if node_name(im) == "" { return -1 }
+    let name = tc_impl_target_name(im)
     let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
     let t = resolve_type_parts(name, node_recv_type_args(im), -1)
@@ -5441,7 +5567,7 @@ fn tc_fnsig_param_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.
         ai = ai + 1
     }
     tc_suppress_ann_validation = saved_suppress
-    let base = strip_module_qualifier(node_name(ann_node))
+    let base = tc_instance_base_name(bare_tid)
     if bk == TyKind.Enum {
         return make_enum_instance_type(base, arg_tids)
     }
@@ -5470,7 +5596,7 @@ fn tc_evfield_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.Reso
         ai = ai + 1
     }
     tc_suppress_ann_validation = saved_suppress
-    make_enum_instance_type(strip_module_qualifier(node_name(ann_node)), arg_tids)
+    make_enum_instance_type(tc_instance_base_name(bare_tid), arg_tids)
 }
 
 // The tuple-aware extension of tc_evfield_instance_tid. A self-recursive tuple
@@ -5704,10 +5830,10 @@ fn tc_field_target_hint(bare: Str, declared: Int) -> Int {
     tc_subst_evfield_from_instance(declared, h)
 }
 
-fn tc_struct_lit_instance_tid(stid: Int, sname: Str, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_struct_lit_instance_tid(stid: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     tc_check_struct_lit_field_closures(stid, node)
     tc_pin_struct_lit_field_ret_mints(stid, node)
-    let bare = strip_module_qualifier(sname)
+    let bare = tc_instance_base_name(stid)
     let decl = tc_struct_decl_nodes.get(bare) ?? -1
     if decl == -1 {
         tc_infer_struct_lit_field_values(stid, node)
@@ -5846,8 +5972,9 @@ fn is_builtin_hashable(name: Str) -> Int {
 fn alias_name_decidable(name: Str) -> Int {
     if name == "Tuple" { return 0 }
     if is_primitive_type(name) != 0 { return 1 }
+    let nominal = tc_written_type_nominal(name)
     let bare = strip_module_qualifier(name)
-    if named_type_map.contains_key(name) || named_type_map.contains_key(bare) { return 1 }
+    if named_type_map.contains_key(nominal) || named_type_map.contains_key(bare) { return 1 }
     0
 }
 
@@ -5891,7 +6018,8 @@ fn validate_map_key(key_ann: Int) ! Diag.Report {
     }
     if is_builtin_hashable(key_name) != 0 { return }
     let bare = strip_module_qualifier(key_name)
-    if tc_type_name_derives(key_name, "Hash") != 0 {
+    let nominal = tc_written_type_nominal(key_name)
+    if tc_type_name_derives(nominal, "Hash") != 0 {
         return
     }
     // Generic type params and unknown names — let later phases handle them.
@@ -5900,7 +6028,7 @@ fn validate_map_key(key_ann: Int) ! Diag.Report {
     // The message names what the user wrote; the help names the type that actually has to carry the
     // derive. For `type MyKey = Point` those differ, and pointing the fix at Point is the useful
     // half — @derive on the alias would be the category error described above.
-    if named_type_map.contains_key(key_name) || named_type_map.contains_key(bare) {
+    if named_type_map.contains_key(nominal) || named_type_map.contains_key(bare) {
         diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Map key type '{decl_name}' does not implement Hash — user types used as Map keys must carry the @derive(Hash, Eq) annotation", key_ann, "add @derive(Hash, Eq) to the '{key_name}' type definition")
         return
     }
@@ -5943,10 +6071,11 @@ fn validate_set_elem(elem_ann: Int) ! Diag.Report {
     }
     if is_builtin_hashable(elem_name) != 0 { return }
     let bare = strip_module_qualifier(elem_name)
-    if tc_type_name_derives(elem_name, "Hash") != 0 {
+    let nominal = tc_written_type_nominal(elem_name)
+    if tc_type_name_derives(nominal, "Hash") != 0 {
         return
     }
-    if named_type_map.contains_key(elem_name) || named_type_map.contains_key(bare) {
+    if named_type_map.contains_key(nominal) || named_type_map.contains_key(bare) {
         diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Set element type '{decl_name}' does not implement Hash — user types used as Set elements must carry the @derive(Hash, Eq) annotation", elem_ann, "add @derive(Hash, Eq) to the '{elem_name}' type definition")
         return
     }
@@ -6058,11 +6187,11 @@ fn reject_reserved_type_name(td: Int) ! Diag.Report {
 
 fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     reject_reserved_type_name(td)
-    let name = node_name(td)
+    let name = tc_nominal_type_name(td)
     let tid = new_type(TyKind.Struct, name)
     named_type_names.push(name)
     named_type_ids.push(tid)
-    tc_register_type_decl_node(name, tid, td)
+    tc_register_type_decl_node(node_name(td), name, tid, td)
     named_type_map.insert(name, tid)
     tc_struct_decl_nodes.insert(name, td)
     if has_annotation(td, "ffi.struct") != 0 {
@@ -6084,8 +6213,7 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
 // whose own declaration — comes later in the file, and resolving it during the
 // name-registration pass would peel to an orphan typevar.
 fn resolve_struct_fields(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
-    let name = node_name(td)
-    let tid = named_type_map.get(name) ?? -1
+    let tid = tc_decl_tid(td)
     let is_ffi_struct = has_annotation(td, "ffi.struct")
     let decl_tparams = node_type_params(td)
     tc_push_tparam_scope(decl_tparams)
@@ -6125,11 +6253,11 @@ fn resolve_struct_fields(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.
 
 fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     reject_reserved_type_name(td)
-    let name = node_name(td)
+    let name = tc_nominal_type_name(td)
     let tid = new_type(TyKind.Enum, name)
     named_type_names.push(name)
     named_type_ids.push(tid)
-    tc_register_type_decl_node(name, tid, td)
+    tc_register_type_decl_node(node_name(td), name, tid, td)
     named_type_map.insert(name, tid)
     if has_annotation(td, "deprecated") != 0 {
         depr_type_nodes.insert(name, td)
@@ -6142,8 +6270,8 @@ fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Rep
 // whose own declaration — comes later in the file, and resolving it during the
 // name-registration pass would peel to an orphan typevar.
 fn resolve_enum_variants(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
-    let name = node_name(td)
-    let tid = named_type_map.get(name) ?? -1
+    let name = tc_nominal_type_name(td)
+    let tid = tc_decl_tid(td)
     let decl_tparams = node_type_params(td)
     tc_push_tparam_scope(decl_tparams)
     let flds_sl = node_fields(td)
@@ -6427,17 +6555,18 @@ fn tc_field_type_derivable(ftype_name: Str, tr: Str) -> Int {
 
     // User type: it must itself carry the trait (derive or hand-impl).
     let bare = strip_module_qualifier(ftype_name)
-    if named_type_map.contains_key(ftype_name) || named_type_map.contains_key(bare) {
+    let nominal = tc_written_type_nominal(ftype_name)
+    if named_type_map.contains_key(nominal) || named_type_map.contains_key(bare) {
         if tr == "Hash" {
-            if tc_type_name_derives(ftype_name, "Hash") != 0 { return 1 }
+            if tc_type_name_derives(nominal, "Hash") != 0 { return 1 }
             return 0
         }
         if tr == "Eq" {
-            if tc_type_has_eq_impl(ftype_name) != 0 || tc_type_has_eq_impl(bare) != 0 { return 1 }
+            if tc_type_has_eq_impl(nominal) != 0 || tc_type_has_eq_impl(bare) != 0 { return 1 }
             return 0
         }
         // Ord
-        if tc_type_has_ord_impl(ftype_name) != 0 || tc_type_has_ord_impl(bare) != 0 { return 1 }
+        if tc_type_has_ord_impl(nominal) != 0 || tc_type_has_ord_impl(bare) != 0 { return 1 }
         return 0
     }
 
@@ -6459,6 +6588,8 @@ fn tc_check_one_derive_trait(tr: Str) ! Diag.Report {
         let tname = named_type_names.get(ti).unwrap()
         let td = tc_type_decl_nodes.get(tname) ?? -1
         if td != -1 && type_has_derive(td, tr) != 0 {
+            let saved_module = nr_current_module
+            nr_current_module = node_module(td)
             let flds_sl = node_fields(td)
             let mut i = 0
             while flds_sl != -1 && i < sublist_length(flds_sl) {
@@ -6475,6 +6606,7 @@ fn tc_check_one_derive_trait(tr: Str) ! Diag.Report {
                 }
                 i = i + 1
             }
+            nr_current_module = saved_module
         }
         ti = ti + 1
     }
@@ -6521,8 +6653,9 @@ fn tc_serialize_scalar_ok(n: Str) -> Int {
 // passes do.
 fn tc_serialize_user_type_ok(name: Str) -> Int {
     let bare = strip_module_qualifier(name)
-    if named_type_map.contains_key(name) || named_type_map.contains_key(bare) {
-        if tc_type_name_derives(name, "Serialize") != 0 { return 1 }
+    let nominal = tc_written_type_nominal(name)
+    if named_type_map.contains_key(nominal) || named_type_map.contains_key(bare) {
+        if tc_type_name_derives(nominal, "Serialize") != 0 { return 1 }
         return 0
     }
     1
@@ -6569,9 +6702,10 @@ fn tc_serialize_variant_field_ok(ann: Int) -> Int {
     if tc_serialize_scalar_ok(name) != 0 { return 1 }
     if is_primitive_type(name) != 0 { return 0 }
     let bare = strip_module_qualifier(name)
-    if named_type_map.contains_key(name) || named_type_map.contains_key(bare) {
-        if tc_type_name_derives(name, "Serialize") != 0 {
-            if tc_type_is_struct(name) != 0 || tc_type_is_struct(bare) != 0 { return 1 }
+    let nominal = tc_written_type_nominal(name)
+    if named_type_map.contains_key(nominal) || named_type_map.contains_key(bare) {
+        if tc_type_name_derives(nominal, "Serialize") != 0 {
+            if tc_type_is_struct(nominal) != 0 || tc_type_is_struct(bare) != 0 { return 1 }
             return 0
         }
         return 0
@@ -6594,6 +6728,8 @@ fn tc_check_derive_serialize() ! Diag.Report {
         let tname = named_type_names.get(ti).unwrap()
         let td = tc_decl_node_for_type(tname)
         if td != -1 && type_has_derive(td, "Serialize") != 0 {
+            let saved_module = nr_current_module
+            nr_current_module = node_module(td)
             let flds_sl = node_fields(td)
             let mut i = 0
             while flds_sl != -1 && i < sublist_length(flds_sl) {
@@ -6610,6 +6746,7 @@ fn tc_check_derive_serialize() ! Diag.Report {
                 }
                 i = i + 1
             }
+            nr_current_module = saved_module
         }
         ti = ti + 1
     }
@@ -6624,10 +6761,10 @@ fn tc_check_name_collisions() ! TypeCheck.Register, Diag.Report {
     let mut i = 0
     while i < evar_pool.len() {
         let vname = evar_pool.get(i).unwrap().name
-        let stid = named_type_map.get(vname) ?? -1
-        if tc_collision_reported.contains_key(vname) == 0 && stid != -1 && type_kind(stid) == TyKind.Struct {
+        let stid = tc_struct_tid_declared_as(vname)
+        if tc_collision_reported.contains_key(vname) == 0 && stid != -1 {
             tc_collision_reported.insert(vname, 1)
-            let struct_node = tc_struct_decl_nodes.get(vname) ?? -1
+            let struct_node = tc_struct_decl_nodes.get(tc_tid_name(stid)) ?? -1
             let enum_node = tc_variant_enum_decl_nodes.get(vname) ?? -1
             diag_error_at("NameCollision", NAME_COLLISION, "struct '{vname}' has the same name as an enum variant '{vname}'; bare construction would be ambiguous (note: two different enums MAY share a variant name — only a struct-vs-variant clash is rejected)", struct_node, "rename either the struct or the variant")
             if enum_node != -1 {
@@ -6814,8 +6951,9 @@ fn check_deprecated_fn(fn_name: Str, call_node: Int) ! Diag.Report {
 }
 
 fn check_deprecated_type(type_name: Str, usage_node: Int) ! Diag.Report {
-    if depr_type_nodes.contains_key(type_name) == 0 { return }
-    let def_node = depr_type_nodes.get(type_name) ?? -1
+    let key = tc_written_type_nominal(type_name)
+    if depr_type_nodes.contains_key(key) == 0 { return }
+    let def_node = depr_type_nodes.get(key) ?? -1
     if def_node == -1 { return }
     let ann = get_annotation(def_node, "deprecated")
     if ann == -1 { return }
@@ -7799,7 +7937,7 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
     while ii < sublist_length(impls_sl) {
         let im = sublist_get(impls_sl, ii)
         let trait_name = node_trait_name(im)
-        let impl_type = node_name(im)
+        let impl_type = tc_impl_target_name(im)
         if is_trait_name(trait_name) == 0 {
             if is_sealed_builtin_type(trait_name) != 0 && is_user_sourced(im) != 0 {
                 diag_error_at("TraitContract", TRAIT_CONTRACT_907, "'{trait_name}' is a sealed built-in type and cannot be implemented for user types", im, "'{trait_name}' is a closed built-in; define your own trait with the methods you need and impl that instead")
@@ -8127,6 +8265,8 @@ fn init_types() ! TypeCheck.Register {
     fs_error_runtime_tid_cache = -1
     tc_type_decl_nodes.clear()
     tc_type_decl_node_by_tid.clear()
+    tc_type_decl_ambiguous_names = Map()
+    tc_namesake_type_modules = Map()
     tc_active_tparams.clear()
     tc_tp_arith_names.clear()
     tc_tp_bound_traits.clear()
@@ -8211,7 +8351,12 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
 
     // Register all type definitions (structs and enums)
     let types_sl = node_fields(program)
+    // Declarations resolve their annotations in their own module, so a bare namesake reads
+    // as the declaring module's type. Restored after each pass: the module context also
+    // gates the used-import bookkeeping, which these passes must not touch.
+    let saved_module = nr_current_module
     if types_sl != -1 {
+        tc_collect_namesake_type_names(types_sl)
         let mut i = 0
         while i < sublist_length(types_sl) {
             let td = sublist_get(types_sl, i)
@@ -8241,6 +8386,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
                 // a binder that shadows a builtin (`type Wrap[List] = List`) is a type
                 // variable there, not the constructor (§3.4:1259).
                 let alias_tparams = node_type_params(atd)
+                nr_current_module = node_module(atd)
                 tc_push_tparam_scope(alias_tparams)
                 tc_alias_underlying.insert(node_name(atd), resolve_type_ann(alias_ann))
                 tc_pop_tparam_scope(alias_tparams)
@@ -8255,6 +8401,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
         let mut k = 0
         while k < sublist_length(types_sl) {
             let etd = sublist_get(types_sl, k)
+            nr_current_module = node_module(etd)
             let etd_flds = node_fields(etd)
             let mut is_enum = 0
             if etd_flds != -1 && sublist_length(etd_flds) > 0 {
@@ -8270,6 +8417,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             k = k + 1
         }
     }
+    nr_current_module = saved_module
 
     // Kind A: a struct name equal to an enum variant name is a hard error (E0518).
     // Detected over the whole-program symbol table (catches cross-module collisions).
@@ -8291,9 +8439,12 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     if fns_sl != -1 {
         let mut i = 0
         while i < sublist_length(fns_sl) {
-            register_fn_sig(sublist_get(fns_sl, i))
+            let fn_node = sublist_get(fns_sl, i)
+            nr_current_module = node_module(fn_node)
+            register_fn_sig(fn_node)
             i = i + 1
         }
+        nr_current_module = saved_module
     }
 
     // Validate FFI annotations and Ptr[T] usage
@@ -8434,7 +8585,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
         let mut i = 0
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
-            let impl_type = node_name(im)
+            let impl_type = tc_impl_target_name(im)
             let trait_name = node_trait_name(im)
             // Register the canonical monomorphized poly impl
             // `impl[T] Trait[T] for List[T]` for binder recovery in the
@@ -8541,7 +8692,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             let im = sublist_get(impls_sl, i)
             let mod_name = node_module(im)
             if mod_name != "" && mod_name != "__main__" {
-                let impl_type = node_name(im)
+                let impl_type = tc_impl_target_name(im)
                 let trait_name = node_trait_name(im)
                 tc_symbol_module.insert(impl_type, mod_name)
                 let methods_sl_sym = node_methods(im)
@@ -8903,6 +9054,9 @@ fn nr_check_selective_access(name: Str, node: Int) -> Int ! Diag.Report {
     if nr_current_module == "" { return 0 }
     if is_builtin_name(name) != 0 { return 0 }
     if nr_module_declares(nr_current_module, name) != 0 { return 0 }
+    // A namesake type is in scope when this module's import list selects one declaration of
+    // it; the last-writer symbol table below knows only one module for the name.
+    if tc_nominal_type_name_in(name, nr_current_module) != name { return 0 }
     let source_mod = match tc_symbol_module.get(name) {
         Some(v) => v
         None => return 0
@@ -9801,7 +9955,7 @@ fn tc_enum_ctor_instance_tid(enum_tid: Int, decl: Int, vname: Str, args_sl: Int)
         }
         ti = ti + 1
     }
-    make_enum_instance_type(strip_module_qualifier(type_to_str(enum_tid)), arg_tids)
+    make_enum_instance_type(tc_instance_base_name(enum_tid), arg_tids)
 }
 
 // Struct-style analogue of tc_enum_ctor_instance_tid for a `Variant { field: val }`
@@ -9866,7 +10020,7 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl:
         let f = sublist_get(flds_sl, fi)
         let declared = lookup_evfield_type_by_name(var_idx, node_name(f))
         if declared != -1 {
-            let ebare = strip_module_qualifier(type_to_str(enum_tid))
+            let ebare = tc_instance_base_name(enum_tid)
             let ftid = tc_infer_field_value_under(tc_field_target_hint(ebare, declared), node_value(f))
             unify_typevar_binds(declared, ftid, binds)
         } else {
@@ -9900,7 +10054,7 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl:
         }
         ti = ti + 1
     }
-    make_enum_instance_type(strip_module_qualifier(type_to_str(enum_tid)), arg_tids)
+    make_enum_instance_type(tc_instance_base_name(enum_tid), arg_tids)
 }
 
 // When a generic-enum ctor slot is unbound after arg-unification (a subset variant
@@ -10602,7 +10756,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
         let mut i = 0
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
-            let impl_type = node_name(im)
+            let impl_type = tc_impl_target_name(im)
             let methods_sl = node_methods(im)
             if methods_sl != -1 {
                 let mut j = 0
@@ -10641,7 +10795,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
         let mut i = 0
         while i < sublist_length(derive_types_sl) {
             let td = sublist_get(derive_types_sl, i)
-            let dtname = node_name(td)
+            let dtname = tc_nominal_type_name(td)
             if type_has_derive(td, "Clone") != 0 { nr_register_impl_method(dtname, "clone") }
             if type_has_derive(td, "Eq") != 0 { nr_register_impl_method(dtname, "eq") }
             if type_has_derive(td, "Ord") != 0 {
@@ -13369,7 +13523,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         // A generic-enum qualified ctor (`Tree.Leaf(1)`) reverse-infers
                         // its concrete instance tid; a non-generic enum keeps the bare
                         // ctor_tid.
-                        let cdecl = tc_type_decl_nodes.get(cname) ?? -1
+                        let cdecl = tc_type_decl_nodes.get(tc_written_type_nominal(cname)) ?? -1
                         return tc_enum_ctor_instance_tid(ctor_tid, cdecl, method, cargs_sl)
                     }
                 }
@@ -14990,7 +15144,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 let qtid = lookup_named_type(qual)
                 if qtid != -1 && type_kind(qtid) == TyKind.Enum && get_variant_by_name(qtid, vname) != -1 {
                     check_deprecated_type(qual, node)
-                    let edecl = tc_type_decl_nodes.get(strip_module_qualifier(type_to_str(qtid))) ?? -1
+                    let edecl = tc_decl_node_for_type(type_to_str(qtid))
                     return tc_enum_structlit_instance_tid(qtid, edecl, vname, node_fields(node))
                 }
                 let etid = lookup_named_type(sname)
@@ -15004,7 +15158,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // answer the same way — the bare spelling reverse-infers its instance and
                     // types its field values, this one returned the head and looked at nothing,
                     // so every field value under a qualified literal carried no type.
-                    return tc_struct_lit_instance_tid(etid, sname, node)
+                    return tc_struct_lit_instance_tid(etid, node)
                 }
             } else {
                 // 1) hint FIRST (monotonicity: a distant enum decl must never retroactively
@@ -15031,7 +15185,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // field values so the literal carries its specialization, not the
                     // bare generic tid. Falls back to the bare stid when no concrete
                     // bind is discoverable (all-typevar / empty collection fields).
-                    return tc_struct_lit_instance_tid(stid, sname, node)
+                    return tc_struct_lit_instance_tid(stid, node)
                 }
                 // A builtin type used as a struct-literal head — scalar (`Int { }`) or
                 // structural (`List { }`, `Map { }`, `Option { }`) — is not a product struct
@@ -17683,7 +17837,7 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
             nr_current_module = node_module(im)
-            let impl_type = node_name(im)
+            let impl_type = tc_impl_target_name(im)
             // What `self` is inside these bodies. Resolved once per impl block, not per
             // method: the receiver is a property of the header, and resolve_type_parts
             // interns through the pool so a repeat would only churn it. The binders are
@@ -18113,6 +18267,12 @@ fn ty_param_at(t: TypePoolEntry, i: Int) -> Int {
 // Unlike tc_tid_struct below, this does not strip the module qualifier and does not
 // restrict to Struct/Enum, because a caller walking a tree needs a name for whatever it
 // lands on.
+// The base name a monomorphized instance of `base_tid` carries: the pool name of the
+// base itself, so a namesake declared by two modules keeps its module on every instance.
+fn tc_instance_base_name(base_tid: Int) -> Str {
+    tc_tid_name(tc_resolve(base_tid))
+}
+
 pub fn tc_tid_name(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "" }
     ty_pool.get(tid).unwrap().name
@@ -18503,7 +18663,7 @@ fn tc_stamp_recover_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.
 fn tc_stamp_type_field_defaults(td: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let flds_sl = node_fields(td)
     if flds_sl == -1 { return }
-    let struct_tid = named_type_map.get(node_name(td)) ?? -1
+    let struct_tid = tc_decl_tid(td)
     let tparams = node_type_params(td)
     tc_push_tparam_scope(tparams)
     // A bare name in a default resolves through the module the DECLARATION came from: the local
@@ -18775,11 +18935,15 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
 // codegen_types.bl only because that file was compiled into every program; the
 // answers were never a storage fact and nothing in codegen consumed them.
 
-// `std.db.row.Row` → `db.row.Row`. Strips one leading segment, not all of them.
+// `std.db.row.Row` → `db.row.Row`. Strips one leading segment, not all of them. A namesake
+// keeps its qualifier: `alpha.Point` IS the nominal name when another module also declares
+// `Point`, so stripping it would collapse the two types every comparison keeps apart.
 pub fn strip_module_qualifier(name: Str) -> Str {
     let dot_pos = name.index_of(".")
     if dot_pos >= 0 {
-        return name.substr(dot_pos + 1, name.len() - dot_pos - 1)
+        let rest = name.substr(dot_pos + 1, name.len() - dot_pos - 1)
+        if tc_is_namesake_type_name(rest) != 0 { return name }
+        return rest
     }
     name
 }
