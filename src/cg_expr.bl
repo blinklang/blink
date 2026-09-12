@@ -145,7 +145,19 @@ pub fn cg_expr_take_pending() -> List[Int] {
 
 // ── Dispatch ──────────────────────────────────────────────────────────────
 
+// Every expression reaches its own lowering through here, so the buffer rule lives here and
+// not in each seam that hoists: a lowering that answers -1 leaves no statement behind. Those
+// statements fill temps only the refused expression reads, and cg_stmt splices the buffer
+// into the enclosing block whole, so one left behind runs for nothing.
 pub fn lower_expr(node: Int) -> Int ! Diag.Report {
+    let mark = cx_pending.len()
+    let out = x_dispatch(node)
+    if out >= 0 { return out }
+    let _dropped = x_take_from(mark)
+    -1
+}
+
+fn x_dispatch(node: Int) -> Int ! Diag.Report {
     match nk_of(node_kind(node)) {
         NodeKind.IntLit => lower_int_lit(node)
         NodeKind.FloatLit => lower_literal(node, node_str_val(node))
@@ -583,6 +595,8 @@ fn lower_short_circuit(node: Int, op: Str) -> Int ! Diag.Report {
     if x_stopped(rec) { return -1 }
     let lhs = lower_expr(node_left(node))
     if lhs < 0 { return -1 }
+    // The mark splits the right operand's own statements from the left's. Only the right
+    // operand's move into the guarded arm, because only they must wait on the test.
     let mark = cx_pending.len()
     let rhs = lower_expr(node_right(node))
     if rhs < 0 { return -1 }
@@ -1084,11 +1098,6 @@ fn lower_interp(node: Int) -> Int ! Diag.Report {
 fn lower_interp_call(node: Int, tid: Int, rec: LayoutRecord, parts: Int) -> Int ! Diag.Report {
     let mut fmt = ""
     let mut holes: List[Int] = []
-    // A hole may hoist statements that fill a temp only this call reads. One later hole that
-    // refuses means the call answers nothing, so nothing reads those temps and the statements
-    // must come back out. The buffer is spliced into the enclosing block, so a statement left
-    // in it is emitted for an expression nothing lowered.
-    let mark = cx_pending.len()
     let mut i = 0
     while i < sublist_length(parts) {
         let part = sublist_get(parts, i)
@@ -1096,10 +1105,7 @@ fn lower_interp_call(node: Int, tid: Int, rec: LayoutRecord, parts: Int) -> Int 
             fmt = fmt.concat(x_pct_escape(node_str_val(part)))
         } else {
             let hole = x_interp_hole(part)
-            if hole.spec == "" {
-                let _dropped = x_take_from(mark)
-                return -1
-            }
+            if hole.spec == "" { return -1 }
             fmt = fmt.concat(hole.spec)
             holes.push(hole.arg)
         }
