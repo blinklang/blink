@@ -10,13 +10,13 @@
 // The seams this module publishes replace the refusals cg_expr records for the shapes it
 // does not own: the Eq or Ord method a comparison operator desugars to, the Display call
 // an interpolation hole needs, the container copy a spread performs, and the element read
-// that `[i]` and `.get(i)` share. An operator seam takes its operands already lowered, so
-// cg_expr keeps the statements an operand hoisted; the element read takes the written node
-// instead, because it can refuse off the types alone and an operand built for a refused
-// read is still in the unit.
+// that `[i]` and `.get(i)` share. Every one of them takes the written node and lowers its
+// own operands only once it has resolved, because a seam handed an operand it then refuses
+// leaves that operand in the unit with no parent, and the printer walks what the unit holds
+// rather than what the lowering answered.
 
 import parser.{
-    node_kind, node_name, node_left, node_obj, node_index, node_method, node_args,
+    node_kind, node_name, node_left, node_right, node_obj, node_index, node_method, node_args,
     node_methods, node_trait_name, node_impl_binders,
     node_module, node_source_module,
     sublist_get, sublist_length,
@@ -37,7 +37,7 @@ import cname.{
     c_fn_decl_name, c_impl_method_name, c_display_dispatch_name, c_derive_method_name,
     c_runtime_helper, c_ffi_symbol,
 }
-import ir.{ir_tid, ir_call_direct, ir_call_runtime, ir_cast, ir_unary, ir_unbox}
+import ir.{ir_call_direct, ir_call_runtime, ir_cast, ir_unary, ir_unbox}
 import cg_expr.{lower_expr}
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
 import diagnostics.{
@@ -80,8 +80,7 @@ pub fn lower_call(node: Int) -> Int ! Diag.Report {
 
 // `a == b` on a struct or data enum operand: C's own operators do not compare an
 // aggregate, so the comparison is the method the type derived.
-pub fn lower_operator_method(node: Int, op: Str, lhs: Int, rhs: Int) -> Int ! Diag.Report {
-    if lhs < 0 || rhs < 0 { return -1 }
+pub fn lower_operator_method(node: Int, op: Str) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = cc_local(tid, node)
@@ -92,15 +91,23 @@ pub fn lower_operator_method(node: Int, op: Str, lhs: Int, rhs: Int) -> Int ! Di
             "an ordering operator desugars to Ord.cmp against an Ordering variant")
         return -1
     }
-    let decl = tc_tid_decl_node(ir_tid(lhs))
+    // The operand's own type, not the Bool the comparison answers: the method belongs to
+    // what is being compared.
+    let operand = tid_of_node(node_left(node))
+    if operand < 0 { return -1 }
+    let decl = tc_tid_decl_node(operand)
     if decl < 0 {
         diag_ice_at("EqualityOperandNotDerived", CODEGEN_STAGE_NOT_BUILT,
-            "a {tk_name(cc_kind(ir_tid(lhs)))} operand has no derived equality method", node,
+            "a {tk_name(cc_kind(operand))} operand has no derived equality method", node,
             "only a declared struct or enum derives Eq; another operand needs its own lowering")
         return -1
     }
-    let symbol = cc_equality_symbol(node, decl, ir_tid(lhs))
+    let symbol = cc_equality_symbol(node, decl, operand)
     if symbol == "" { return -1 }
+    let lhs = lower_expr(node_left(node))
+    if lhs < 0 { return -1 }
+    let rhs = lower_expr(node_right(node))
+    if rhs < 0 { return -1 }
     let eq = ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, [lhs, rhs])
     if op == "==" { return eq }
     ir_unary(tid, node, rec.c_spelling, "!", eq)
@@ -131,9 +138,9 @@ fn cc_derives_equality(decl: Int) -> Bool {
 // An interpolation hole whose type has no printf form renders through the sealed
 // dispatcher the compiler synthesizes next to the user's `Display.fmt`. A missing impl is
 // an internal error: typecheck has already proved one exists.
-pub fn lower_display_call(part: Int, value: Int) -> Int ! Diag.Report {
-    if value < 0 { return -1 }
-    let tid = ir_tid(value)
+pub fn lower_display_call(part: Int) -> Int ! Diag.Report {
+    let tid = tid_of_node(part)
+    if tid < 0 { return -1 }
     let im = cc_impl_for(part, tid, trait_display)
     if im == IMPL_REFUSED { return -1 }
     if im < 0 {
@@ -144,6 +151,8 @@ pub fn lower_display_call(part: Int, value: Int) -> Int ! Diag.Report {
     }
     let rec = cc_local(TYPE_STR, part)
     if cc_stopped(rec) { return -1 }
+    let value = lower_expr(part)
+    if value < 0 { return -1 }
     ir_call_direct(TYPE_STR, part, rec.c_spelling, c_display_dispatch_name(im), rec.slot_form, [value])
 }
 

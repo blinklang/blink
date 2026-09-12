@@ -1,0 +1,91 @@
+// A refusal in this stage must build no IR node. An operand built for an
+// expression that then refuses has no parent, and the printer walks what the unit holds
+// rather than what the lowering answered, so that operand becomes emitted C for an
+// expression nothing lowered. Each test pins the node count as well as the refusal,
+// because a refusal that reports correctly and still strands a node is identical from the
+// answer alone.
+
+import lower_test_helpers.{probe, probe_but, rhs_of, assert_ice_saying, assert_eq_str}
+import ir.{ir_node_count}
+import cg_expr.{lower_expr}
+
+// An ordering operator over a struct. `@derive(Ord)` is what makes this a program:
+// typecheck accepts `<` on the pair, and the operator seam then has no ordering lowering
+// to give. Both operands are in reach at that point, which is what makes the count a test.
+fn src_ordering() -> Str {
+    #"@derive(Ord)
+type Point { x: Int, y: Int }
+
+fn main() {
+    let one = Point { x: 1, y: 2 }
+    let two = Point { x: 1, y: 3 }
+    let ranked = one < two
+    let _keep = [ranked]
+}
+"#
+}
+
+// Two impls of one trait for one type. The overlap rule that would reject this pair is not
+// enforced, so the hole passes its Display gate and the call seam is the first stage to see
+// that the impl is unresolvable. That overlap is the only way in: a hole whose type has no
+// impl at all is rejected by typecheck before codegen runs.
+fn src_ambiguous_display() -> Str {
+    #"type Wrapped { n: Int }
+
+impl Display for Wrapped {
+    fn fmt(self, sb: StringBuilder) { sb.write("a") }
+}
+
+impl Display for Wrapped {
+    fn fmt(_self, sb2: StringBuilder) { sb2.write("b") }
+}
+
+fn main() {
+    let w = Wrapped { n: 1 }
+    let text = "{w}"
+    let _keep = [text]
+}
+"#
+}
+
+// A struct that carries no equality at all. The equality operator resolves further than the
+// ordering one does: it reaches the operand declaration and asks for a symbol, and refuses
+// only when the declaration has neither a derive nor an impl. That later refusal point is a
+// separate count, because it is the one the operands sit closest to.
+fn src_no_equality() -> Str {
+    #"type Plain { x: Int }
+
+fn main() {
+    let p1 = Plain { x: 1 }
+    let p2 = Plain { x: 2 }
+    let asked = p1 == p2
+    let _keep = [asked]
+}
+"#
+}
+
+test "a refused ordering operator leaves neither of its operands in the unit" {
+    probe("cg_expr_orphan_ordering", src_ordering())
+    let before = ir_node_count()
+    assert_ice_saying("ordering", lower_expr(rhs_of("ranked")),
+        "OrderingMethodNotLowered", "has no ordering method lowering here")
+    assert_eq_str("nodes built", "{ir_node_count() - before}", "0")
+}
+
+// Typecheck rejects a comparison over a type that carries no equality, so no accepted
+// program reaches this refusal and the probe has to let that one rejection through.
+test "a refused equality operator leaves neither of its operands in the unit" {
+    probe_but("cg_expr_orphan_equality", src_no_equality(), "TypeError")
+    let before = ir_node_count()
+    assert_ice_saying("no equality method", lower_expr(rhs_of("asked")),
+        "EqualityMethodNotFound", "'Plain' has neither")
+    assert_eq_str("nodes built", "{ir_node_count() - before}", "0")
+}
+
+test "a refused display hole leaves the value it would have shown out of the unit" {
+    probe("cg_expr_orphan_display", src_ambiguous_display())
+    let before = ir_node_count()
+    assert_ice_saying("ambiguous display", lower_expr(rhs_of("text")),
+        "ImplAmbiguous", "more than one impl over Struct declares the trait 'Display'")
+    assert_eq_str("nodes built", "{ir_node_count() - before}", "0")
+}
