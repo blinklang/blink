@@ -228,15 +228,18 @@ fn main() { }
     assert_lacks(text, "(uint64_t)(self.data")
 }
 
-// Hash requires Eq: the spec declares `trait Hash: Eq`, and the key-operations table a
-// keyed container binds names both methods. A table naming an eq nothing defines is an
-// undefined symbol at link time, which is why this is refused where it is written.
+// The key-operations table a keyed container binds names a hash and an eq, so a type with
+// no eq gives the table an undefined symbol at link time. The spec says Hash requires Eq
+// and that the compiler derives a supertrait the author leaves out, which would make this
+// type legal. This stage does not derive Eq for Hash yet, and the front end does not give
+// such a type an equality either, so the refusal holds until both change together.
+// A type naming Ord instead does get an eq, and is covered below.
 test "a type deriving Hash without Eq is refused rather than left to fail at link time" {
     let n = ices_naming("cg_derive_hash_without_eq", #"@derive(Hash)
 type Lonely { x: Int }
 fn main() { }
-"#, "does not also derive Eq")
-    assert(n > 0)
+"#, "@derive(Hash) on 'Lonely', which does not also derive Eq or Ord")
+    assert_eq(n, 1)
 }
 
 // A type becomes usable as a key when it gets a hash body, so the body pass emits the
@@ -305,4 +308,30 @@ type Box[T] { v: T }
 fn main() { }
 "#, "@derive(Hash) on the generic type 'Box'")
     assert(n == 1)
+}
+
+// Ord's supertrait is Eq, and this stage derives it for a type that names only Ord. A type
+// deriving Hash and Ord therefore has an eq definition, and the key table names a symbol
+// that exists. Refusing this shape refuses what the spec allows.
+test "a type deriving Hash and Ord is hashed through the eq Ord derives" {
+    let text = bodies_of("cg_derive_hash_with_ord", #"@derive(Hash, Ord)
+type Keyed { x: Int }
+fn main() { }
+"#)
+    assert_has(text, "uint64_t blink_Keyed_hash(blink_Keyed self) \{")
+    assert_eq(cg_text_occurrences(text, "int blink_Keyed_eq(blink_Keyed self, blink_Keyed other) \{"), 1)
+    assert_has(text, "blink_Keyed_eq(*(blink_Keyed const*)a, *(blink_Keyed const*)b)")
+}
+
+// Whether an eq exists is a property of the declaration, not of the order the derive
+// names are written in. Reading a record the earlier derive left behind would answer one
+// order and refuse the other.
+test "the order Hash and Ord are written in does not decide whether the hash is built" {
+    let text = bodies_of("cg_derive_hash_ord_first", #"@derive(Ord, Hash)
+type Sorted { x: Int }
+fn main() { }
+"#)
+    assert_has(text, "uint64_t blink_Sorted_hash(blink_Sorted self) \{")
+    assert_eq(cg_text_occurrences(text, "int blink_Sorted_eq(blink_Sorted self, blink_Sorted other) \{"), 1)
+    assert_has(text, "blink_Sorted_eq(*(blink_Sorted const*)a, *(blink_Sorted const*)b)")
 }
