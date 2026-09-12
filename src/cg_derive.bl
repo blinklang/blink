@@ -410,11 +410,9 @@ fn eq_differs(owner: Int, owner_tid: Int, ftid: Int, path: Str, span: Int) -> In
     if lhs < 0 || rhs < 0 { return -1 }
     let k = tc_tid_kind(tc_resolve(ftid))
     // A Str is a pointer, so == would compare addresses rather than bytes.
-    if k == TyKind.Str {
-        return ir_unary(TYPE_BOOL, span, bools, "!",
-            ir_call_runtime(TYPE_BOOL, span, bools, c_runtime_helper("str_eq"),
-                SlotForm.InlineWord, [lhs, rhs]))
-    }
+    if k == TyKind.Str { return eq_helper_differs("str_eq", lhs, rhs, bools, span) }
+    // A Float's equality is total, and C's != is not: it answers true for two NaNs.
+    if k == TyKind.Float { return eq_helper_differs("float_eq", lhs, rhs, bools, span) }
     if eq_is_scalar(k) { return ir_binary(TYPE_BOOL, span, bools, "!=", lhs, rhs) }
     if k == TyKind.Struct || k == TyKind.Enum {
         return eq_nested_differs(ftid, lhs, rhs, bools, path, span)
@@ -483,10 +481,18 @@ fn field_ref(owner_tid: Int, name: Str, at_pos: Position, ftid: Int, frec: Layou
     ir_field_get(ftid, span, frec.c_spelling, path, frec.slot_form, base)
 }
 
-// Float's == is a bit comparison, which is what a derived Eq promises; whether a Float
-// field may appear under a derive at all is typecheck's question, not this stage's.
+// Whether two values differ, when a runtime helper answers whether they are equal. The
+// helper answers equality and the caller wants the opposite, so the call is negated.
+fn eq_helper_differs(helper: Str, lhs: Int, rhs: Int, bools: Str, span: Int) -> Int ! Diag.Report {
+    ir_unary(TYPE_BOOL, span, bools, "!",
+        ir_call_runtime(TYPE_BOOL, span, bools, c_runtime_helper(helper),
+            SlotForm.InlineWord, [lhs, rhs]))
+}
+
+// The kinds whose C inequality is the language's. Float is absent: the language equates
+// NaN with NaN and C's != does not, so a Float is compared through a helper instead.
 fn eq_is_scalar(k: TyKind) -> Bool {
-    if k == TyKind.Int || k == TyKind.Bool || k == TyKind.Char || k == TyKind.Float { return true }
+    if k == TyKind.Int || k == TyKind.Bool || k == TyKind.Char { return true }
     if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return true }
     if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return true }
     false
@@ -685,7 +691,8 @@ fn cmp_field(owner: Int, owner_tid: Int, ftid: Int, path: Str, span: Int) -> Lis
     let frec = field_layout_of(owner, ftid)
     if field_refused(frec, path, derive_ord, span) { return [] }
     let k = tc_tid_kind(tc_resolve(ftid))
-    if k == TyKind.Str { return cmp_str_field(owner_tid, ftid, frec, path, span) }
+    if k == TyKind.Str { return cmp_sign_field("str_cmp", owner_tid, ftid, frec, path, span) }
+    if k == TyKind.Float { return cmp_sign_field("float_cmp", owner_tid, ftid, frec, path, span) }
     if cmp_is_scalar(k) { return cmp_scalar_field(owner_tid, ftid, frec, path, span) }
     if k == TyKind.Struct || k == TyKind.Enum {
         return cmp_nested_field(owner_tid, ftid, frec, path, span)
@@ -709,16 +716,18 @@ fn cmp_field_guard(owner_tid: Int, ftid: Int, frec: LayoutRecord, path: Str, op:
     cmp_guard(ir_binary(TYPE_BOOL, span, bools, op, lhs, rhs), answer, span)
 }
 
-// A Str is a pointer, so < would order two addresses rather than bytes. The runtime helper
-// orders the bytes and answers a sign. A local holds that sign because two guards read it:
-// calling the helper twice would order the two strings twice.
-fn cmp_str_field(owner_tid: Int, ftid: Int, frec: LayoutRecord, path: Str, span: Int) -> List[Int] ! Diag.Report {
+// A field whose order a runtime helper answers as a sign. A Str is a pointer, so < would
+// order two addresses rather than bytes. A Float has a total order the language defines and
+// C's < does not give: both < and > answer false for a NaN, which would order every NaN
+// equal to everything. A local holds the sign because two guards read it: calling the
+// helper twice would order the same pair twice.
+fn cmp_sign_field(helper: Str, owner_tid: Int, ftid: Int, frec: LayoutRecord, path: Str, span: Int) -> List[Int] ! Diag.Report {
     let ints = int_spelling(span)
     let lhs = field_ref(owner_tid, "self", Position.Param, ftid, frec, path, span)
     let rhs = field_ref(owner_tid, "other", Position.Param, ftid, frec, path, span)
     if ints == "" || lhs < 0 || rhs < 0 { return [] }
     let name = c_mint_local("ord")
-    let call = ir_call_runtime(TYPE_INT, span, ints, c_runtime_helper("str_cmp"), int_form(), [lhs, rhs])
+    let call = ir_call_runtime(TYPE_INT, span, ints, c_runtime_helper(helper), int_form(), [lhs, rhs])
     let less = cmp_sign_guard(name, ints, "<", ordering_less, span)
     let greater = cmp_sign_guard(name, ints, ">", ordering_greater, span)
     if less < 0 || greater < 0 { return [] }
@@ -771,9 +780,8 @@ fn cmp_nested_field(owner_tid: Int, ftid: Int, frec: LayoutRecord, path: Str, sp
 
 // The kinds C orders the way the language does. Bool is a backstop: the language gives a
 // Bool equality and no order at all, and typecheck rejects a Bool field under @derive(Ord)
-// before this stage runs. Float is absent for a reason this stage cannot work around: the
-// language orders a Float totally, with NaN greater than every other value, and C's < and
-// > both answer false for a NaN, which would make every NaN compare Equal.
+// before this stage runs. Float is absent because C's operators do not give its order; it
+// reaches a helper above rather than a refusal.
 fn cmp_is_scalar(k: TyKind) -> Bool {
     if k == TyKind.Int || k == TyKind.Char { return true }
     if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return true }
