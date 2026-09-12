@@ -1,8 +1,7 @@
 // cg_eff.bl: closures, effects, handlers and async, lowered to IR.
 //
 // A stage of the tid-native emitter. What it answers today is the with-resource cleanup
-// protocol and a closure literal as a value; handler installs and async are still to come
-// and report I0004.
+// protocol, a closure literal as a value and a handler install; async is still to come.
 //
 // Nothing here falls back. A protocol whose exit runner no stage emits yet answers the
 // protocol and records an internal error, never a symbol. A guessed symbol would link
@@ -15,17 +14,20 @@ import parser.{
     node_kind, node_name, node_params, node_pattern, node_recv_type_args, node_stmts,
     node_trait_name, node_value, node_value_child_ids, sublist_get, sublist_length,
 }
-import typecheck.{TyKind, lookup_named_type, tc_resolve, tc_tid_decl_node, tc_tid_kind, tk_name, ty_pool}
+import typecheck.{
+    TyKind, lookup_named_type, tc_resolve, tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tk_name,
+    ty_pool,
+}
 import layout.{
     Position, Slot, bind_binder, binder_scope_pop, binder_scope_push, child_tid,
     current_binder_scope, layout_of, tid_of_binder, tid_of_node,
 }
-import cname.{c_local_name, c_mint_local}
-import ir.{ir_closure_new}
+import cname.{c_ev_field_name, c_local_name, c_mint_local}
+import ir.{ir_closure_new, ir_handler_install}
 import cg_reg.{cg_reg_impl_decls}
 import diagnostics.{
-    Diag, diag_ice, diag_ice_at, diag_ice_stage_not_built, CODEGEN_STAGE_NOT_BUILT, POISONED_IR_AT_SEAM,
-    UNSOLVED_TYPEVAR_AT_CODEGEN,
+    Diag, diag_ice, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg, CODEGEN_STAGE_NOT_BUILT,
+    POISONED_IR_AT_SEAM, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 
 // ── With-resource cleanup ─────────────────────────────────────────────────────────
@@ -521,8 +523,33 @@ fn copy_names(names: List[Str]) -> List[Str] {
     out
 }
 
-// ── Handler installs and async ────────────────────────────────────────────────────
+// ── Handler installs ──────────────────────────────────────────────────────────────
 
-pub fn cg_eff_lower_handler(node: Int) ! Diag.Report {
-    diag_ice_stage_not_built("cg_eff", node)
+// A `with` item that is not a resource and not `arena` installs a handler: one field of the
+// effect vector holds the handler for the length of the body. Which field is a fact about
+// the handler's type, read off the tid typecheck stamped on the item, so an inline
+// `handler E { }`, a local of type Handler[E] and a call answering one all land in the
+// same slot. The handler value and the body arrive lowered by the stages that own them.
+//
+// A caller that already recorded an error hands in -1, and gets -1 back without a second
+// report, so one bug reads as one.
+pub fn cg_eff_lower_handler_install(item: Int, handler_value: Int, body: Int) -> Int ! Diag.Report {
+    if handler_value < 0 || body < 0 { return -1 }
+    let tid = tc_resolve(tid_of_node(item))
+    if tid < 0 { return -1 }
+    let effect_name = tc_tid_handler_effect(tid)
+    if effect_name == "" {
+        diag_ice_at("WithItemNotAHandler", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "with-item type {tid} is not a handler of a named effect", item,
+            "typecheck stamps every non-resource with-item as Handler[E]; this is a compiler bug")
+        return -1
+    }
+    let field = c_ev_field_name(tid)
+    if diag_is_ice_seg(field) {
+        diag_ice_at("EffectSlotUnnamed", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "handler for effect '{effect_name}' names no effect vector field: {field}", item,
+            "an effect that reaches codegen is declared or builtin, so its root owns a field")
+        return -1
+    }
+    ir_handler_install(item, field, handler_value, body)
 }
