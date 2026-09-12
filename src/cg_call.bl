@@ -302,7 +302,7 @@ fn cc_free_call(node: Int, decl: Int) -> Int ! Diag.Report {
         cc_ev_not_in_ir(node)
         return -1
     }
-    cc_direct(node, symbol, NO_RECEIVER)
+    cc_build_call(node, symbol, NO_RECEIVER, CallForm.Declared)
 }
 
 // The name the declaration was written under. An import may rename what it brings in, and
@@ -402,14 +402,118 @@ fn cc_no_module_member(node: Int) -> Int ! Diag.Report {
     -1
 }
 
+// ── Intrinsic namespaces ─────────────────────────────────────
+//
+// `io` and `env` are provided by the compiler rather than declared by a module, so there
+// is no declaration to resolve and the method name is the whole key, which is what
+// typecheck reads to accept the call in the first place.
+//
+// The names divide by what stands between the call and the stream it reaches. Five io
+// names and five env names are operations of an effect: each is a slot of a vtable the
+// evidence vector points at, so a handler installed over the call site replaces it for the
+// length of its body, and lib/std's own testing module installs one. Calling the runtime
+// default for those would build a program no handler can change, which is a wrong answer
+// rather than a missing one. The two `_raw` names deliberately have no slot, so nothing
+// stands between them and the stream, but the runtime publishes no call that writes a
+// rendered value raw either. The last four read and write the standard streams through
+// calls the runtime does publish, so those are built.
+
+let ns_io = "io"
+let ns_env = "env"
+
+// The io names a handler can replace, and the env names it can. Both lists are written
+// under the names a caller writes, not under the vtable slots they reach, because the
+// slot is only needed by a lowering that builds the dispatch.
+let io_handler_ops: List[Str] = ["println", "print", "eprintln", "eprint", "log"]
+let env_effect_ops: List[Str] = ["var", "cwd", "set_var", "remove_var", "exit"]
+
+// The two io names the spec holds outside the handler system: they write the stream
+// directly and raise no trace.
+let io_raw_ops: List[Str] = ["print_raw", "eprint_raw"]
+
+fn lower_namespace_call(node: Int, obj: Int) -> Int ! Diag.Report {
+    let ns = node_name(obj)
+    if ns == ns_io { return lower_io_call(node, node_method(node)) }
+    if ns == ns_env { return lower_env_call(node, node_method(node)) }
+    cc_ns_not_built(node, ns, node_method(node))
+}
+
+fn lower_io_call(node: Int, method: Str) -> Int ! Diag.Report {
+    if io_handler_ops.contains(method) { return cc_effect_op(node, ns_io, method) }
+    if io_raw_ops.contains(method) { return cc_raw_print(node, method) }
+    let helper = io_stream_helper(method)
+    if helper == "" { return cc_ns_not_built(node, ns_io, method) }
+    cc_build_call(node, helper, NO_RECEIVER, CallForm.Runtime)
+}
+
+// The four io names with nothing in the path: two read the standard input and two write
+// the standard output. None of them is a slot of the io vtable, so none of them is an
+// operation a handler replaces.
+fn io_stream_helper(method: Str) -> Str {
+    if method == "read_line" { return c_runtime_helper("stdin_read_line") }
+    if method == "read_bytes" { return c_runtime_helper("stdin_read_bytes") }
+    if method == "write" { return c_runtime_helper("stdout_write") }
+    if method == "write_bytes" { return c_runtime_helper("stdout_write_bytes") }
+    ""
+}
+
+fn lower_env_call(node: Int, method: Str) -> Int ! Diag.Report {
+    if env_effect_ops.contains(method) { return cc_effect_op(node, ns_env, method) }
+    if method == "args" { return cc_env_args(node) }
+    cc_ns_not_built(node, ns_env, method)
+}
+
+// An operation a handler can replace. The call reaches a slot of a vtable the evidence
+// vector points at, and no IR node reads one: the perform node the printer writes names a
+// single member where a builtin effect needs two, the vector's field and the operation in
+// the vtable behind it.
+fn cc_effect_op(node: Int, ns: Str, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("IntrinsicEffectOpNotInIr", CODEGEN_STAGE_NOT_BUILT,
+        "'{ns}.{method}' is dispatched through the evidence vector, which no IR node reads", node,
+        "an effect operation needs an IR node the printer writes as a vtable slot of the vector")
+    -1
+}
+
+// A raw write. It takes any value the Display trait renders, and the runtime publishes no
+// call that accepts one: the four stream calls above take text or bytes already, and the
+// step that turns a value into text belongs to the seam that lowers an interpolation.
+fn cc_raw_print(node: Int, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("RawPrintNotInRuntime", CODEGEN_STAGE_NOT_BUILT,
+        "'io.{method}' writes a rendered value raw, and the runtime publishes no such call", node,
+        "a raw write needs a runtime call taking text, and the value rendered into it first")
+    -1
+}
+
+// The runtime exposes the argument count and one reader per index, and no call that
+// answers the whole list, so the list is filled one element at a time by a loop. A loop is
+// a statement, and the call seam hoists none.
+fn cc_env_args(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("EnvArgumentListNotBuilt", CODEGEN_STAGE_NOT_BUILT,
+        "'env.args' fills its list one element at a time, and this stage hoists no loop", node,
+        "the list needs the statement stage to hold the loop, or a runtime call answering it whole")
+    -1
+}
+
+// A namespace method with no lowering here. Two shapes arrive: a namespace whose whole
+// lowering is still to come, and a name typecheck leaves unsigned on purpose, io.debug,
+// which is meant to stop at the unresolved-method error before codegen ever sees it. Both
+// answer the same way, naming the namespace and the method rather than the group, and both
+// answer before the call's type is read, because a node typecheck never stamped has no
+// type to read.
+fn cc_ns_not_built(node: Int, ns: Str, method: Str) -> Int ! Diag.Report {
+    diag_ice_stage_not_built("cg_call intrinsic '{ns}.{method}'", node)
+    -1
+}
+
 // ── Methods ───────────────────────────────────────────────────────────────
 
 fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let obj = node_obj(node)
     let role = cc_receiver_role(obj)
     if role == Receiver.Module { return lower_module_call(node, obj) }
+    if role == Receiver.Namespace { return lower_namespace_call(node, obj) }
     if role != Receiver.Value {
-        diag_ice_stage_not_built(cc_role_stage(role), node)
+        diag_ice_stage_not_built("cg_call static and associated calls", node)
         return -1
     }
     let recv_tid = tid_of_node(obj)
@@ -428,7 +532,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     }
     let symbol = cc_call_symbol(node, method, c_impl_method_name(im, node_method(node)))
     if symbol == "" { return -1 }
-    cc_direct(node, symbol, obj)
+    cc_build_call(node, symbol, obj, CallForm.Declared)
 }
 
 // What the left of the dot names. Only a Value is a receiver to lower; the other three are
@@ -447,13 +551,6 @@ fn cc_receiver_role(obj: Int) -> Receiver {
     if lookup_named_type(name) >= 0 { return Receiver.TypeOwner }
     if is_builtin_fn(name) == 1 { return Receiver.TypeOwner }
     Receiver.Value
-}
-
-// The lowering a qualifier this stage does not own is waiting for. Each qualifier says
-// which one rather than blaming whichever is listed first.
-fn cc_role_stage(role: Receiver) -> Str {
-    if role == Receiver.Namespace { return "cg_call intrinsic namespaces" }
-    "cg_call static and associated calls"
 }
 
 // Whether the receiver is a bare name that binds no value here. A binder in scope wins
@@ -588,7 +685,7 @@ fn cc_method_of(im: Int, mname: Str) -> Int ! Diag.Report {
 // stage settles what it can refuse before it builds anything. A receiver lowered by the
 // caller is built whether or not a call can be built out of it, and what this stage refuses
 // is read off the call's own type, which it can read without lowering anything.
-fn cc_direct(node: Int, symbol: Str, recv: Int) -> Int ! Diag.Report {
+fn cc_build_call(node: Int, symbol: Str, recv: Int, form: CallForm) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = cc_local(tid, node)
@@ -607,8 +704,16 @@ fn cc_direct(node: Int, symbol: Str, recv: Int) -> Int ! Diag.Report {
         args.push(a)
         i = i + 1
     }
+    if form == CallForm.Runtime {
+        return ir_call_runtime(tid, node, rec.c_spelling, symbol, rec.slot_form, args)
+    }
     ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, args)
 }
+
+// Which C name a built call reaches: one the compiler emits for a declaration, or one the
+// runtime owns and no Blink source declares. The two print the same, and the kinds are
+// what a later stage reads them back by.
+type CallForm { Declared, Runtime }
 
 fn cc_kind(tid: Int) -> TyKind {
     tc_tid_kind(tc_resolve(tid))
