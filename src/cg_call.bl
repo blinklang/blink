@@ -1,9 +1,11 @@
 // cg_call.bl: every call, lowered to typed IR.
 //
 // One owner for "what C function does this call reach, and what arguments does it take".
-// Dispatch is keyed on the callee's declaration node and on the receiver's type id, never
-// on a method-name string crossed with a C-type ladder: the name a caller writes decides
-// which declaration is meant, and the declaration plus cname decide the symbol.
+// Dispatch is keyed on declarations, never on a method-name string crossed with a C-type
+// ladder: the name a caller writes decides which declaration is meant, and the declaration
+// plus cname decide the symbol. A receiver reaches its impls through the declaration its
+// type id names, and, for the builtin containers that declare nothing at all, through the
+// kind name an `impl ... for List[T]` header writes.
 //
 // The seams this module publishes replace the refusals cg_expr records for the shapes it
 // does not own: the Eq or Ord method a comparison operator desugars to, the Display call
@@ -13,9 +15,9 @@
 
 import parser.{
     node_kind, node_name, node_left, node_obj, node_method, node_args,
-    node_methods, node_impl_binders, node_type_params, node_trait_name,
+    node_methods, node_trait_name, node_impl_binders,
     node_module, node_source_module,
-    get_annotation, sublist_get, sublist_length,
+    sublist_get, sublist_length,
 }
 import ast.{NodeKind, nk_of, node_kind_name}
 import typecheck.{
@@ -31,11 +33,11 @@ import mono.{instances, instance_for_call}
 import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls}
 import cname.{
     c_fn_decl_name, c_impl_method_name, c_display_dispatch_name, c_derive_method_name,
-    c_runtime_helper,
+    c_runtime_helper, c_ffi_symbol,
 }
 import ir.{ir_tid, ir_call_direct, ir_call_runtime, ir_cast, ir_unary, ir_unbox}
 import cg_expr.{lower_expr}
-import cg_decl.{cg_decl_takes_ev}
+import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
 import diagnostics.{
     Diag, diag_ice_at, diag_ice_stage_not_built, CODEGEN_STAGE_NOT_BUILT,
     UNSOLVED_TYPEVAR_AT_CODEGEN,
@@ -50,6 +52,17 @@ let trait_eq = "Eq"
 let trait_ord = "Ord"
 let method_eq = "eq"
 let method_get = "get"
+
+// What the impl selector answers when more than one impl is written over the receiver and
+// the refusal is already recorded. It has to stay apart from the -1 that means no impl is
+// written at all: a caller that reads a refusal as an absence goes on to its own second
+// choice and swallows the report.
+let IMPL_REFUSED = -2
+
+// What typecheck answers for a type that declares no node of its own. Every other answer
+// names a declaration, including the one that says two modules declare the name and the
+// pair is unresolved, so only this exact value means "there is no declaration".
+let NO_DECL_NODE = -1
 
 // ── Seams ─────────────────────────────────────────────────────────────────
 
@@ -97,7 +110,8 @@ pub fn lower_operator_method(node: Int, op: Str, lhs: Int, rhs: Int) -> Int ! Di
 // said: the derive stage still emits its own body, and nothing reaches it. "" is answered
 // after an internal error is recorded.
 fn cc_equality_symbol(node: Int, decl: Int, recv_tid: Int) -> Str ! Diag.Report {
-    let im = cc_impl_for(recv_tid, trait_eq)
+    let im = cc_impl_for(node, recv_tid, trait_eq)
+    if im == IMPL_REFUSED { return "" }
     if im >= 0 { return c_impl_method_name(im, method_eq) }
     if cc_derives_equality(decl) { return c_derive_method_name(decl, method_eq) }
     diag_ice_at("EqualityMethodNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
@@ -118,7 +132,8 @@ fn cc_derives_equality(decl: Int) -> Bool {
 pub fn lower_display_call(part: Int, value: Int) -> Int ! Diag.Report {
     if value < 0 { return -1 }
     let tid = ir_tid(value)
-    let im = cc_impl_for(tid, trait_display)
+    let im = cc_impl_for(part, tid, trait_display)
+    if im == IMPL_REFUSED { return -1 }
     if im < 0 {
         diag_ice_at("DisplayImplNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
             "a {tk_name(cc_kind(tid))} hole has no Display impl to call", part,
@@ -254,7 +269,7 @@ fn lower_module_call(node: Int, obj: Int) -> Int ! Diag.Report {
 // -1 is a refusal the resolver already reported.
 fn cc_free_call(node: Int, decl: Int) -> Int ! Diag.Report {
     if decl < 0 { return -1 }
-    let symbol = cc_callee_symbol(node, decl)
+    let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
     if symbol == "" { return -1 }
     if cg_decl_takes_ev(decl) {
         cc_ev_not_in_ir(node)
@@ -269,21 +284,23 @@ fn cc_declared_name(written: Str) -> Str {
     tc_alias_to_original.get(written) ?? written
 }
 
-// The C name of the function this call reaches. A plain declaration is its own symbol; a
-// template has no symbol at all, so the answer is the name of the instance the
-// monomorphisation pass registered for this very call site. "" after an internal error.
-fn cc_callee_symbol(node: Int, decl: Int) -> Str ! Diag.Report {
-    if !cc_is_instantiated(decl) { return c_fn_decl_name(decl) }
-    cc_instance_name(node, decl)
-}
-
-// Whether a call of this declaration reaches an instance rather than the declaration
-// itself. A generic declaration is a template, which has no C name until its binders are
-// chosen. A declaration bridged to C is the one exception: the bridge is a single
-// type-erased symbol, so the pass instantiates nothing for it.
-fn cc_is_instantiated(decl: Int) -> Bool {
-    if get_annotation(decl, "ffi") != -1 { return false }
-    cc_is_generic(decl)
+// The C name of the function this call reaches. `declared` is the name a body written
+// under the declaration's own name would carry, which is the answer for every site but
+// two: a template has no name of its own, so the call names the instance the
+// monomorphisation pass registered for this very call site, and a declaration bound
+// straight to a foreign symbol names that symbol. "" after an internal error.
+//
+// Where the body was written is cg_decl's question and is asked there. Both ends of a
+// call have to read the same answer, and the declaration cannot be re-read for it here:
+// an impl header carries `[T]` whether its C is one shared body or one per element, so
+// the binders alone cannot tell the two apart.
+fn cc_call_symbol(node: Int, decl: Int, declared: Str) -> Str ! Diag.Report {
+    match cg_decl_body_site(decl) {
+        BodySite.ThisUnit => declared
+        BodySite.ForeignWrapper => declared
+        BodySite.PerInstance => cc_instance_name(node, decl)
+        BodySite.Nothing => c_ffi_symbol(decl)
+    }
 }
 
 // The registered instance for a generic call, which must be an instance of the very
@@ -370,13 +387,10 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     }
     let recv_tid = tid_of_node(obj)
     if recv_tid < 0 { return -1 }
-    let im = cc_impl_with_method(recv_tid, node_method(node))
+    let im = cc_impl_with_method(node, recv_tid, node_method(node))
+    if im == IMPL_REFUSED { return -1 }
     if im < 0 {
         diag_ice_stage_not_built("cg_call builtin and trait-object methods", node)
-        return -1
-    }
-    if cc_is_generic(im) {
-        diag_ice_stage_not_built("cg_call monomorphised impl methods", node)
         return -1
     }
     let method = cc_method_of(im, node_method(node))
@@ -385,9 +399,11 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
         cc_ev_not_in_ir(node)
         return -1
     }
+    let symbol = cc_call_symbol(node, method, c_impl_method_name(im, node_method(node)))
+    if symbol == "" { return -1 }
     let receiver = lower_expr(obj)
     if receiver < 0 { return -1 }
-    cc_direct(node, c_impl_method_name(im, node_method(node)), [receiver])
+    cc_direct(node, symbol, [receiver])
 }
 
 // What the left of the dot names. Only a Value is a receiver to lower; the other three are
@@ -424,17 +440,67 @@ fn cc_is_free_name(obj: Int) -> Bool {
     tid_of_binder(current_binder_scope(), node_name(obj)) < 0
 }
 
-// The impl block that extends the receiver's own declaration with a method of this name.
-// Matching on the declaration, not on the type id, lets an instance of a generic type
-// find the impl its base declares.
-fn cc_impl_with_method(recv_tid: Int, mname: Str) -> Int {
+// The impl block that extends the receiver with a method of this name. Matching on what
+// the receiver is, not on its type id, lets every instance of one base find the impls
+// written over that base: a generic struct through its declaration, and a container
+// through its kind however it is parameterized.
+fn cc_impl_with_method(node: Int, recv_tid: Int, mname: Str) -> Int ! Diag.Report {
     let want = tc_tid_decl_node(recv_tid)
-    if want < 0 { return -1 }
+    let builtin = cc_builtin_owner_name(recv_tid)
+    if want < 0 && builtin == "" { return -1 }
+    let mut found = -1
+    let mut clashes = 0
     for im in cg_reg_impl_decls() {
-        if cc_impl_owner(im) != want { continue }
-        if cc_method_index(im, mname) >= 0 { return im }
+        if cc_method_index(im, mname) < 0 { continue }
+        if !cc_impl_answers_for(im, want, builtin) { continue }
+        if found >= 0 { clashes = clashes + 1 }
+        found = im
     }
-    -1
+    if clashes == 0 { return found }
+    cc_impl_ambiguous(node, recv_tid, "a method '{mname}'")
+}
+
+// A receiver identifies the impls written over it in one of two ways. A struct or enum is
+// its declaration node, which keeps two modules' namesakes apart. Every other type
+// declares nothing at all, so it is its kind, which is the name `impl ... for List[T]`
+// writes; a struct or enum with no declaration is a gap and not one of these.
+fn cc_builtin_owner_name(recv_tid: Int) -> Str {
+    let k = cc_kind(recv_tid)
+    if k == TyKind.Struct || k == TyKind.Enum { return "" }
+    tk_name(k)
+}
+
+// A kind name is a weaker key than a declaration node: every impl over `List` writes the
+// same one, and so does an impl over a type the program itself declares under that name.
+// So an impl that binds type parameters answers for the container alone, whatever the
+// program declares, and one that binds none answers for a declaration and, failing that,
+// for the container it names. An impl whose owner is a name two modules both declare is in
+// neither channel: it extends a declaration, the pair is just unresolved here.
+fn cc_impl_answers_for(im: Int, want: Int, builtin: Str) -> Bool {
+    if cc_impl_binds_parameters(im) { return want < 0 && node_name(im) == builtin }
+    if want >= 0 { return cc_impl_owner(im) == want }
+    cc_impl_owner(im) == NO_DECL_NODE && node_name(im) == builtin
+}
+
+// An impl that binds type parameters extends a builtin container and nothing else. Two
+// rules together say so: an impl header resolves its receiver name to the builtin before
+// any declaration of that name, and a generic impl over a declared type is refused outright
+// (PolyImplUnsupported). So the binders answer what the receiver's own type id would, which
+// typecheck works out for an impl header but records nowhere a later stage can read.
+fn cc_impl_binds_parameters(im: Int) -> Bool {
+    let binders = node_impl_binders(im)
+    binders != -1 && sublist_length(binders) > 0
+}
+
+// Two impls that both answer for one receiver leave no choice to make here: picking either
+// calls a body that may have been written for the other, so the ambiguity is reported the
+// way an ambiguous free-function name already is. Typecheck refuses the calls that reach
+// this today, which is what makes it a backstop rather than a message a program draws.
+fn cc_impl_ambiguous(node: Int, recv_tid: Int, what: Str) -> Int ! Diag.Report {
+    diag_ice_at("ImplAmbiguous", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "more than one impl over {tk_name(cc_kind(recv_tid))} declares {what}", node,
+        "the call needs the impl typecheck resolved, which it does not record yet")
+    IMPL_REFUSED
 }
 
 // The declaration an impl block extends. Two modules may spell the same bare type name,
@@ -452,14 +518,20 @@ fn cc_impl_owner(im: Int) -> Int {
 }
 
 // The impl block of one trait over the receiver's declaration, whatever its methods.
-fn cc_impl_for(recv_tid: Int, trait_name: Str) -> Int {
+fn cc_impl_for(node: Int, recv_tid: Int, trait_name: Str) -> Int ! Diag.Report {
     let want = tc_tid_decl_node(recv_tid)
-    if want < 0 { return -1 }
+    let builtin = cc_builtin_owner_name(recv_tid)
+    if want < 0 && builtin == "" { return -1 }
+    let mut found = -1
+    let mut clashes = 0
     for im in cg_reg_impl_decls() {
         if node_trait_name(im) != trait_name { continue }
-        if cc_impl_owner(im) == want { return im }
+        if !cc_impl_answers_for(im, want, builtin) { continue }
+        if found >= 0 { clashes = clashes + 1 }
+        found = im
     }
-    -1
+    if clashes == 0 { return found }
+    cc_impl_ambiguous(node, recv_tid, "the trait '{trait_name}'")
 }
 
 fn cc_method_index(im: Int, mname: Str) -> Int {
@@ -526,19 +598,6 @@ fn cc_stopped(rec: LayoutRecord) -> Bool {
 
 fn cc_stop(rec: LayoutRecord) -> LayoutRecord {
     LayoutRecord { c_spelling: "", ..rec }
-}
-
-// A generic declaration is a template: it has a C name only once its binders are chosen,
-// which is one monomorphised instance per choice. A function names its binders in its own
-// type parameters, and an impl block only in its `impl[...]` header: an impl block's type
-// parameters hold the arguments its trait was written with, which bind nothing.
-fn cc_is_generic(decl: Int) -> Bool {
-    if nk_of(node_kind(decl)) == NodeKind.ImplBlock { return cc_has_entries(node_impl_binders(decl)) }
-    cc_has_entries(node_type_params(decl))
-}
-
-fn cc_has_entries(sl: Int) -> Bool {
-    sl != -1 && sublist_length(sl) > 0
 }
 
 fn cc_ev_not_in_ir(node: Int) ! Diag.Report {
