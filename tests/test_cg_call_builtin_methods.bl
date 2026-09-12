@@ -1,0 +1,347 @@
+// A method call whose receiver is a builtin type and whose method no impl answers.
+//
+// Blink has no inherent methods (sections/03c_protocols.md:758). The methods a builtin
+// receiver answers are declared by the sealed, impl-less ops traits in lib/std/traits.bl,
+// so nothing in the program declares a body for them and the impl path cannot resolve
+// them. They are compiler intrinsics: the compiler knows which stdlib function each one
+// means, and typecheck already knows, because it reads its own table of the same shape to
+// give the call a type. This stage reads the twin of that table so the two ends reach ONE
+// declaration.
+//
+// The declaration is the answer, not a symbol. The stdlib is registered whole, so the
+// declaration is always in reach, and every callee family then spells itself: a function
+// written in Blink spells its module into its C name, and a foreign binding spells the
+// symbol its annotation names, which is not always the one its Blink name would give. A
+// table of symbols would have to repeat both rules and could disagree with either.
+//
+// What this stage must NOT do is answer for a method an impl already answers. `len` is
+// written as a real impl over Str, List, Map, Set, Bytes and StringBuilder, so the table
+// is read only after the impl path has declined, and these tests pin that order.
+
+import lower_test_helpers.{
+    probe, rhs_of, let_node_of, assert_eq_str, assert_shape, assert_verifies,
+    assert_ice_saying,
+}
+import parser.{node_kind, node_method, node_name, node_obj, nodes}
+import ast.{NodeKind, nk_of}
+import ir.{ir_c_name}
+import diagnostics.{diag_entries}
+import cg_expr.{lower_expr}
+import std.io
+
+// A call written as a statement binds no name, so it is found by walking forward from a
+// binding the probe does name: a statement parses after the binding above it, so its node
+// id is higher.
+fn call_after(anchor: Str, method: Str) -> Int {
+    let mut i = let_node_of(anchor)
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.MethodCall && node_method(i) == method { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no call of '{method}' after '{anchor}'")
+    assert(false)
+    -1
+}
+
+// The two callee families a Str method reaches. `trim` is a function written in Blink, so
+// its C name carries the module it was written in; `index_of` is a foreign binding, so its
+// C name is the symbol its annotation gives. `len` is neither: a real impl answers it.
+fn src_str() -> Str {
+    #"fn main() {
+    let text = "  hi  "
+    let needle = "h"
+    let tidy = text.trim()
+    let where = text.index_of(needle)
+    let size = text.len()
+    let _keep = [where, size, tidy.len()]
+}
+"#
+}
+
+// One method of a Bytes offset family. The whole family is declared under the method's own
+// name, so resolving one resolves the rule the other twenty-seven follow.
+fn src_offset() -> Str {
+    #"fn main() {
+    let buf = Bytes.new()
+    let value = 7
+    buf.write_u32_be(value)
+    let _keep = buf.len()
+}
+"#
+}
+
+// A user function written under the very name an intrinsic is declared with. The intrinsic
+// is the one the call means, so the namesake must not take it over.
+fn src_namesake() -> Str {
+    #"fn str_trim(s: Str) -> Str {
+    s
+}
+
+fn main() {
+    let text = "  hi  "
+    let tidy = text.trim()
+    let _keep = tidy.len()
+}
+"#
+}
+
+// A receiver whose methods this table does not own yet.
+fn src_unowned() -> Str {
+    #"fn main() {
+    let mut items: List[Int] = []
+    items.push(1)
+    let _keep = items.len()
+}
+"#
+}
+
+test "a Str method written in Blink names the stdlib function" {
+    probe("bm_str_a", src_str())
+    let built = lower_expr(rhs_of("tidy"))
+    assert_shape("shape", built, "CallDirect(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_std_str_str_trim")
+    assert_verifies("trim", built)
+}
+
+test "a Str method bound to a foreign symbol names that symbol" {
+    probe("bm_str_b", src_str())
+    let built = lower_expr(rhs_of("where"))
+    assert_shape("shape", built, "CallDirect(VarRef, VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_str_index_of")
+    assert_verifies("index_of", built)
+}
+
+test "the receiver is the call's first argument" {
+    probe("bm_recv", src_str())
+    let built = lower_expr(rhs_of("tidy"))
+    assert_shape("receiver first", built, "CallDirect(VarRef)")
+    assert_verifies("receiver", built)
+}
+
+test "a method an impl answers is not taken over by the table" {
+    probe("bm_impl", src_str())
+    let built = lower_expr(rhs_of("size"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_std_str_Str_Sized_len")
+    assert_verifies("len", built)
+}
+
+test "a Bytes offset method resolves under the method's own name" {
+    probe("bm_off", src_offset())
+    let built = lower_expr(call_after("value", "write_u32_be"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_bytes_write_u32_be")
+    assert_verifies("write_u32_be", built)
+}
+
+test "a user function named like an intrinsic does not take it over" {
+    probe("bm_name", src_namesake())
+    let built = lower_expr(rhs_of("tidy"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_std_str_str_trim")
+    assert_verifies("namesake", built)
+}
+
+test "a receiver this table does not own is refused by name" {
+    probe("bm_unowned", src_unowned())
+    let built = lower_expr(call_after("items", "push"))
+    assert_ice_saying("unowned", built, "CodegenStageNotBuilt", "cg_call methods: List.push")
+}
+
+// Every pair the table owns, written once each. The table names a declaration and the
+// standard library is what declares it, so the two can only be held together by reaching
+// the library itself: a renamed stdlib function turns this red on the day it is renamed,
+// which no refusal test can do.
+fn src_every_row() -> Str {
+    #"fn main() {
+    let pv_text = "  Hi There  "
+    let pv_part = "H"
+    let pv_idx = 0
+    let pv_two = 2
+    let _s_b0 = pv_text.byte_at(pv_idx)
+    let _s_c0 = pv_text.char_at(pv_idx)
+    let _s_has = pv_text.contains(pv_part)
+    let _s_pre = pv_text.starts_with(pv_part)
+    let _s_suf = pv_text.ends_with(pv_part)
+    let _s_at = pv_text.index_of(pv_part)
+    let _s_sub1 = pv_text.substring(pv_idx, pv_two)
+    let _s_sub2 = pv_text.substr(pv_idx, pv_two)
+    let _s_sl = pv_text.slice(pv_idx, pv_two)
+    let _s_cat = pv_text.concat(pv_part)
+    let _s_t0 = pv_text.trim()
+    let _s_t1 = pv_text.trim_left()
+    let _s_t2 = pv_text.trim_right()
+    let _s_up = pv_text.to_upper()
+    let _s_low = pv_text.to_lower()
+    let _s_rep = pv_text.replace(pv_part, pv_part)
+    let _s_parts = pv_text.split(pv_part)
+    let _s_lns = pv_text.lines()
+    let _s_ti = pv_part.to_int()
+    let _s_pi = pv_part.parse_int()
+    let _s_pf = pv_part.parse_float()
+    let pv_buf = Bytes.new()
+    let _b_get = pv_buf.get(pv_idx)
+    pv_buf.push(pv_two)
+    pv_buf.set(pv_idx, pv_two)
+    let pv_bsl = pv_buf.slice(pv_idx, pv_two)
+    let _b_cat = pv_buf.concat(pv_bsl)
+    let _b_hex = pv_buf.to_hex()
+    let _b_str = pv_buf.to_str()
+    let _b_read_u16_be = pv_buf.read_u16_be(pv_idx)
+    let _b_read_u32_be = pv_buf.read_u32_be(pv_idx)
+    let _b_read_i32_be = pv_buf.read_i32_be(pv_idx)
+    let _b_read_i64_be = pv_buf.read_i64_be(pv_idx)
+    let _b_read_u16_le = pv_buf.read_u16_le(pv_idx)
+    let _b_read_u32_le = pv_buf.read_u32_le(pv_idx)
+    let _b_read_i32_le = pv_buf.read_i32_le(pv_idx)
+    let _b_read_i64_le = pv_buf.read_i64_le(pv_idx)
+    pv_buf.write_u16_be(pv_two)
+    pv_buf.write_u32_be(pv_two)
+    pv_buf.write_i32_be(pv_two)
+    pv_buf.write_i64_be(pv_two)
+    pv_buf.write_u16_le(pv_two)
+    pv_buf.write_u32_le(pv_two)
+    pv_buf.write_i32_le(pv_two)
+    pv_buf.write_i64_le(pv_two)
+    let _b_set_u16_be = pv_buf.set_u16_be(pv_idx, pv_two)
+    let _b_set_u32_be = pv_buf.set_u32_be(pv_idx, pv_two)
+    let _b_set_u64_be = pv_buf.set_u64_be(pv_idx, pv_two)
+    let _b_set_i16_be = pv_buf.set_i16_be(pv_idx, pv_two)
+    let _b_set_i32_be = pv_buf.set_i32_be(pv_idx, pv_two)
+    let _b_set_i64_be = pv_buf.set_i64_be(pv_idx, pv_two)
+    let _b_set_u16_le = pv_buf.set_u16_le(pv_idx, pv_two)
+    let _b_set_u32_le = pv_buf.set_u32_le(pv_idx, pv_two)
+    let _b_set_u64_le = pv_buf.set_u64_le(pv_idx, pv_two)
+    let _b_set_i16_le = pv_buf.set_i16_le(pv_idx, pv_two)
+    let _b_set_i32_le = pv_buf.set_i32_le(pv_idx, pv_two)
+    let _b_set_i64_le = pv_buf.set_i64_le(pv_idx, pv_two)
+    let pv_sb = StringBuilder.new()
+    pv_sb.write(pv_part)
+    let _sb_str = pv_sb.to_str()
+    let _sb_cap = pv_sb.capacity()
+    pv_sb.clear()
+}
+"#
+}
+
+// Every method call the probe writes on one of the receivers it binds. The library's nodes
+// are interleaved with the probe's and its bodies call these same methods, so the receiver
+// is what tells the two apart: these names are the probe's own.
+fn probe_calls() -> List[Int] {
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.MethodCall {
+            if probe_receiver(node_obj(i)) { out.push(i) }
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn probe_receiver(obj: Int) -> Bool {
+    if obj < 0 { return false }
+    if nk_of(node_kind(obj)) != NodeKind.Ident { return false }
+    let n = node_name(obj)
+    n == "pv_text" || n == "pv_part" || n == "pv_buf" || n == "pv_bsl" || n == "pv_sb"
+}
+
+fn ice_names() -> Str {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out.join("; ")
+}
+
+test "every pair the table owns reaches a declaration the stdlib has" {
+    probe("bm_rows", src_every_row())
+    let calls = probe_calls()
+    let mut built = 0
+    for c in calls {
+        let id = lower_expr(c)
+        if id >= 0 {
+            built = built + 1
+            assert_verifies(node_method(c), id)
+        }
+    }
+    if built != calls.len() {
+        io.println("FAIL: {built} of {calls.len()} calls lowered: {ice_names()}")
+    }
+    assert_eq(built, calls.len())
+    // 21 over Str, 35 over Bytes, 4 over StringBuilder. The count is asserted so that a
+    // row quietly dropped from the probe cannot pass this test by not being written.
+    assert_eq(calls.len(), 60)
+}
+
+// A user impl written over a builtin receiver under the very name an intrinsic carries.
+// Typecheck reads its builtin arms ABOVE its user-impl lookup and says so at the seam
+// (src/typecheck.bl:14382), so the intrinsic is what the call is typed as. Reading the
+// impl first here would emit the impl method for a call typed as the stdlib function.
+fn src_impl_namesake() -> Str {
+    #"trait Tidy {
+    fn trim(self) -> Str
+}
+
+impl Tidy for Str {
+    fn trim(self) -> Str {
+        "X"
+    }
+}
+
+fn main() {
+    let text = "  hi  "
+    let tidy = text.trim()
+    let _keep = tidy.len()
+}
+"#
+}
+
+// `StringBuilder.write` takes ANY argument: typecheck leaves it unconstrained on purpose
+// and records that codegen picks the binding from what the argument IS. Four bindings
+// answer it, one per argument type, and each takes that type and no other.
+fn src_sb_write() -> Str {
+    #"fn main() {
+    let sb = StringBuilder.new()
+    let ws = "s"
+    sb.write(ws)
+    let wi = 5
+    sb.write(wi)
+    let wf = 1.5
+    sb.write(wf)
+    let wb = true
+    sb.write(wb)
+    let _keep = sb.to_str()
+}
+"#
+}
+
+// A method written with fewer arguments than its declaration takes. Typecheck checks the
+// arity of some builtin methods and not this one, so a call that reaches C short an
+// argument is a C error with no Blink span.
+fn src_short_call() -> Str {
+    #"fn main() {
+    let text = "abcdef"
+    let cut = text.substring(0)
+    let _keep = cut.len()
+}
+"#
+}
+
+test "a builtin method wins over a user impl of the same name" {
+    probe("bm_over", src_impl_namesake())
+    let built = lower_expr(rhs_of("tidy"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_std_str_str_trim")
+    assert_verifies("over", built)
+}
+
+test "a StringBuilder write names the binding its argument's type takes" {
+    probe("bm_sbw", src_sb_write())
+    assert_eq_str("str", ir_c_name(lower_expr(call_after("ws", "write"))), "blink_sb_write")
+    assert_eq_str("int", ir_c_name(lower_expr(call_after("wi", "write"))), "blink_sb_write_int")
+    assert_eq_str("float", ir_c_name(lower_expr(call_after("wf", "write"))), "blink_sb_write_float")
+    assert_eq_str("bool", ir_c_name(lower_expr(call_after("wb", "write"))), "blink_sb_write_bool")
+}
+
+test "an intrinsic called with too few arguments is refused by name" {
+    probe("bm_short", src_short_call())
+    let built = lower_expr(rhs_of("cut"))
+    assert_ice_saying("short", built, "IntrinsicArityWrong", "takes 2 argument(s)")
+}
