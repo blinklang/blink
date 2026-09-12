@@ -26,8 +26,12 @@ import cg_decl.{
 }
 import cg_derive.{cg_derive_emit_bodies, cg_derive_emit_decls, cg_derive_reset}
 import mono.{instances}
-import cg_stmt.{cg_stmt_reset, lower_fn}
+import cg_stmt.{cg_stmt_reset, lower_block_returning, lower_fn}
 import cg_expr.{cg_expr_reset}
+import cg_eff.{
+    cg_eff_pending_thunks, cg_eff_print_thunk, cg_eff_reset, cg_eff_thunk_body_node,
+    cg_eff_thunk_close, cg_eff_thunk_open, cg_eff_thunks_drained,
+}
 
 effect Codegen {
     effect Emit
@@ -77,6 +81,7 @@ fn begin_unit(program: Int) ! Diag.Report {
     cg_derive_reset()
     cg_stmt_reset()
     cg_expr_reset()
+    cg_eff_reset()
 }
 
 // The instances of one generic base, as rows of the whole-program table. The row number is
@@ -133,7 +138,7 @@ fn emit_instance_bodies(decl: Int, is_static: Bool) ! Diag.Report {
     if rows.len() == 0 { return no_instance_bodies(decl) }
     for row in rows {
         set_current_inst(row)
-        cg_decl_emit_signature_def(decl, table.get(row).unwrap().c_name, is_static, lower_fn(decl))
+        cg_decl_emit_signature_def(decl, table.get(row).unwrap().c_name, is_static, lower_body(decl))
         set_current_inst(-1)
     }
 }
@@ -265,12 +270,41 @@ fn emit_bodies(cfg: CgConfig, decls: List[Int]) ! Diag.Report {
     set_current_inst(-1)
     for d in decls {
         match cg_decl_body_site(d) {
-            BodySite.ThisUnit => cg_decl_emit_fn_def(d, false, lower_fn(d))
+            BodySite.ThisUnit => cg_decl_emit_fn_def(d, false, lower_body(d))
             BodySite.PerInstance => emit_instance_bodies(d, instance_is_private_copy(cfg, d))
             BodySite.ForeignWrapper => diag_ice_stage_not_built("cg foreign wrapper bodies", d)
             BodySite.Nothing => {}
         }
     }
+}
+
+// One body, with every closure it queued defined ahead of it. The thunks print before the
+// body that names them because C reads a name only after its definition, and they print
+// under the same mono instance the body was lowered under, because a thunk's types are
+// read through that instance. A thunk body can queue a nested closure, so the count is
+// re-read on every step, and the queue keeps the count it was told against its own length.
+fn lower_body(decl: Int) -> Int ! Diag.Report {
+    let body = lower_fn(decl)
+    let mut bodies: List[Int] = []
+    while bodies.len() < cg_eff_pending_thunks() {
+        let n = bodies.len()
+        // An open that refused has made its report; a close would only add a second.
+        if cg_eff_thunk_open(n) >= 0 {
+            bodies.push(lower_block_returning(cg_eff_thunk_body_node(n)))
+            cg_eff_thunk_close()
+        } else {
+            bodies.push(-1)
+        }
+    }
+    // A nested closure is queued after the thunk whose body names it, so the later thunk
+    // prints first.
+    let mut k = bodies.len()
+    while k > 0 {
+        k = k - 1
+        cg_eff_print_thunk(k, bodies.get(k).unwrap())
+    }
+    cg_eff_thunks_drained(bodies.len())
+    body
 }
 
 // The definition half. A test block is a body too, and the entry shim calls a runner
