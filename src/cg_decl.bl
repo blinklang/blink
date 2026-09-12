@@ -35,6 +35,7 @@ import cg_reg.{
     cg_reg_effect_decls, cg_reg_entry_point, cg_reg_fn_decls, cg_reg_global_decls,
     cg_reg_impl_methods, cg_reg_impl_of, cg_reg_tid_for_decl, cg_reg_type_decls,
 }
+import mono.{is_poly_impl, poly_impl_is_element_agnostic}
 import typecheck.{
     TyKind, tc_enum_variant_slots, tc_evar_field_slots, tc_evar_name, tc_evfield_name,
     tc_evfield_tid, tc_resolve, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
@@ -388,12 +389,48 @@ fn free_fn_body_site(fn_node: Int) -> BodySite {
 }
 
 // A method has no such exception. Its name carries the receiver type, so a binding over
-// one foreign symbol still needs a wrapper for each receiver the binders admit, and
-// genericity therefore decides first.
+// one foreign symbol still needs a wrapper for each receiver the binders admit. So the
+// question of which bodies exist is settled before the question of where they come from.
+//
+// The mono pass answers the first question. It writes one instance per element for the
+// impls `is_poly_impl` admits and walks every other impl as a root, which asks for one
+// shared body. Reading its own predicate here is what keeps the two stages naming the same
+// set: a second rule sends methods down a path whose rows are never registered.
 fn method_body_site(method: Int, im: Int) -> BodySite {
-    if impl_is_generic(im) || is_generic_base(method) { return BodySite.PerInstance }
+    if is_poly_impl(im) || method_is_mono_gap(method, im) { return BodySite.PerInstance }
     if c_ffi_symbol(method) != "" { return foreign_body_site(method) }
     BodySite.ThisUnit
+}
+
+// A method the mono pass registers no instance for and for which one shared body is wrong
+// too. Sending these down the per-instance path leaves no rows, which is how the body
+// stage names the gap rather than emitting nothing and leaving the symbol to fail at link.
+//
+// Three ways a method gets here. It carries its own type parameters, which the pass never
+// instantiates at all because it builds its generic table from top-level functions alone.
+// Or its impl names a binder in a method signature, so the C differs per choice and no
+// single body is the right one. Or its receiver is a generic user type, which has no C
+// spelling until an argument is chosen: a shared body would have to name a struct that
+// does not exist.
+fn method_is_mono_gap(method: Int, im: Int) -> Bool {
+    if is_poly_impl(im) { return false }
+    if is_generic_base(method) { return true }
+    if !impl_is_generic(im) { return false }
+    receiver_is_generic_user_type(im) || !poly_impl_is_element_agnostic(im)
+}
+
+// Whether the receiver names a generic declaration this program writes. A builtin
+// container is one erased pointer however it is parameterized, so an impl over it has one
+// C body; a generic user type is a different struct per argument and has none.
+//
+// A bare name two modules both declare identifies no single declaration, so a generic
+// namesake is answer enough. Reporting a gap that is not one costs a diagnostic; the other
+// way round writes a body naming a struct that does not exist.
+fn receiver_is_generic_user_type(im: Int) -> Bool {
+    for d in cg_reg_type_decls() {
+        if node_name(d) == node_name(im) && is_generic_base(d) { return true }
+    }
+    false
 }
 
 fn foreign_body_site(decl: Int) -> BodySite {
