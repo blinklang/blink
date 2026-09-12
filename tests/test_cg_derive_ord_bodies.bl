@@ -17,7 +17,7 @@ import layout.{layout_reset}
 import cg_print.{print_reset, print_take}
 import cg_reg.{cg_reg_reset, cg_reg_build, cg_reg_type_decls}
 import cg_derive.{cg_derive_reset, cg_derive_emit_decls, cg_derive_emit_bodies}
-import cg_test_helpers.{cg_probe_compile, cg_probe_ices_saying, cg_text_occurrences, CG_ICE_STAGE_NOT_BUILT}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_named, cg_probe_ices_saying, cg_text_occurrences, CG_ICE_STAGE_NOT_BUILT}
 
 // The Ordering type and its three variants come from lib/std/traits.bl, so their C names
 // carry that module. A test writes them out rather than deriving them, because a name the
@@ -72,6 +72,14 @@ fn decls_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag
 // How many times the body pass records one named refusal saying one thing, for a probe's
 // own file. A count of every internal error would be satisfied by an unrelated refusal in
 // the same probe, so a test that names one refusal would pass whether or not it fired.
+// Every refusal the probe records under one name, whatever it says. A test that claims a
+// field is admitted has to read this and not a sentence, because an unexpected second
+// refusal is also a failure to admit.
+fn refusals_named(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    bodies_of(stem, src)
+    cg_probe_ices_named(name)
+}
+
 fn refusals_saying(stem: Str, src: Str, name: Str, marker: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     let _p = program_of(stem, src)
     cg_derive_emit_bodies(cg_reg_type_decls())
@@ -366,9 +374,10 @@ test "a nested enum field is ordered by its own cmp, the same as a nested struct
 }
 
 // The language orders a Float totally, with NaN greater than every other value. C's < and
-// > both answer false for a NaN, so the two guards this stage writes would make every NaN
-// compare Equal, which is neither the language's order nor an order at all. Refusing where
-// the derive is written beats a sort that reads correct and is not.
+// > both answer false for a NaN, so the two guards this stage writes for a word would make
+// every NaN compare Equal, which is neither the language's order nor an order at all. The
+// runtime helper answers the order the language names, and a Float is ordered through it
+// the same way a Str is.
 fn float_field_src() -> Str {
     #"@derive(Ord)
 type Reading { v: Float }
@@ -376,9 +385,49 @@ fn main() { }
 "#
 }
 
-test "a Float field is refused rather than ordered by an operator that drops NaN" {
-    assert_eq(refusals_saying("cg_derive_ord_float", float_field_src(), CG_ICE_STAGE_NOT_BUILT,
-        "@derive(Ord) on the Float field 'v'"), 1)
+test "a Float field is ordered by the runtime helper, not by an operator that drops NaN" {
+    let text = one_fn(bodies_of("cg_derive_ord_float", float_field_src()), "{ORD_TYPE} blink_Reading_cmp")
+    assert_has(text, "blink_float_cmp(self.v, other.v)")
+    assert_lacks(text, "self.v < other.v")
+    assert_lacks(text, "self.v > other.v")
+}
+
+// The helper answers a sign, so one call serves both guards. Calling it twice would order
+// the same pair twice and cost twice as much.
+test "a Float field is ordered by one call to the helper, read by both guards" {
+    let text = one_fn(bodies_of("cg_derive_ord_float_once", float_field_src()), "{ORD_TYPE} blink_Reading_cmp")
+    assert_eq(cg_text_occurrences(text, "blink_float_cmp("), 1)
+    let sign = local_named(text, "int64_t")
+    assert_has(text, "if (({sign} < 0)) \{")
+    assert_has(text, "if (({sign} > 0)) \{")
+}
+
+// Counted by name, not by sentence. A count of the old sentence would also read 0 after a
+// reword, or after a typo in the needle, and would call the derive admitted either way.
+test "a Float field is admitted, and the derive refuses nothing else either" {
+    assert_eq(refusals_named("cg_derive_ord_float_admitted", float_field_src(),
+        CG_ICE_STAGE_NOT_BUILT), 0)
+}
+
+// A payload reaches the same field walk as a struct member, so a Float in a variant is
+// ordered by the helper too. The tag guards come first and a NaN must not slip past them
+// into a bare operator.
+fn float_payload_src() -> Str {
+    #"@derive(Ord)
+type Sample {
+    Empty
+    Reading(v: Float)
+}
+fn main() { }
+"#
+}
+
+test "a Float in an enum payload is ordered by the runtime helper" {
+    let text = one_fn(bodies_of("cg_derive_ord_float_payload", float_payload_src()),
+        "{ORD_TYPE} blink_Sample_cmp")
+    assert_has(text, "blink_float_cmp(self.data.Reading.v, other.data.Reading.v)")
+    assert_lacks(text, "self.data.Reading.v < other.data.Reading.v")
+    assert_lacks(text, "self.data.Reading.v > other.data.Reading.v")
 }
 
 // An unsigned field and a Char field both order the way C orders the word layout gives
