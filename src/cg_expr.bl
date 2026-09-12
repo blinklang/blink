@@ -260,7 +260,8 @@ fn x_hoist(stmt: Int) {
 }
 
 // Statements pushed since `mark`, removed from the buffer. A short-circuit or coalesce arm
-// owns the statements its own operand needed, so they move into that arm's block.
+// owns the statements its own operand needed, so they move into that arm's block. A caller
+// that refuses drops them instead: they fill a temp only the refused expression reads.
 fn x_take_from(mark: Int) -> List[Int] {
     let mut out: List[Int] = []
     let mut i = mark
@@ -517,8 +518,8 @@ fn lower_binop(node: Int) -> Int ! Diag.Report {
     let lhs_rec = x_local(lhs_tid, node_left(node))
     if x_stopped(lhs_rec) { return -1 }
     // The whole comparison goes over, and the method stage lowers the two operands itself
-    // after it knows which method it can call. Operands handed over before that stay in the
-    // unit whenever that stage refuses.
+    // after it knows which method it can call, so that a refusal there has built nothing and
+    // hoisted nothing.
     if !x_is_c_comparable(lhs_tid, lhs_rec) { return lower_operator_method(node, op) }
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
@@ -1083,6 +1084,11 @@ fn lower_interp(node: Int) -> Int ! Diag.Report {
 fn lower_interp_call(node: Int, tid: Int, rec: LayoutRecord, parts: Int) -> Int ! Diag.Report {
     let mut fmt = ""
     let mut holes: List[Int] = []
+    // A hole may hoist statements that fill a temp only this call reads. One later hole that
+    // refuses means the call answers nothing, so nothing reads those temps and the statements
+    // must come back out. The buffer is spliced into the enclosing block, so a statement left
+    // in it is emitted for an expression nothing lowered.
+    let mark = cx_pending.len()
     let mut i = 0
     while i < sublist_length(parts) {
         let part = sublist_get(parts, i)
@@ -1090,7 +1096,10 @@ fn lower_interp_call(node: Int, tid: Int, rec: LayoutRecord, parts: Int) -> Int 
             fmt = fmt.concat(x_pct_escape(node_str_val(part)))
         } else {
             let hole = x_interp_hole(part)
-            if hole.spec == "" { return -1 }
+            if hole.spec == "" {
+                let _dropped = x_take_from(mark)
+                return -1
+            }
             fmt = fmt.concat(hole.spec)
             holes.push(hole.arg)
         }
