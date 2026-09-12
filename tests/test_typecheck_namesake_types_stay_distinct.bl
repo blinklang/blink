@@ -1,0 +1,163 @@
+// Two modules may each declare a type with the same bare name. Each declaration is its own
+// nominal type: it has its own tid, its own fields, and its own trait impls, and a value of
+// one is not a value of the other. The nominal key must therefore carry the declaring
+// module, or the second registration answers for the first.
+
+import typecheck.{check_types, lookup_named_type, get_struct_field_tid, tc_tid_decl_node}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import parser.{node_module}
+import std.io
+
+let PKG = "build/tc_namesake_pkg"
+
+fn write_module(name: Str, src: Str) {
+    write_file("{PKG}/src/{name}.bl", src)
+}
+
+fn compile_probe(probe_src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let _mk = process_run("mkdir", ["-p", "{PKG}/src"])
+    write_file("{PKG}/blink.toml", "[package]\nname = \"tcnamesake\"\nversion = \"0.1.0\"\n")
+    write_module("alpha", src_alpha())
+    write_module("beta", src_beta())
+    write_module("gamma", src_gamma())
+    write_module("probe", probe_src)
+    diag_reset()
+    let program = compile_to_program("{PKG}/src/probe.bl", 1)
+    check_types(program)
+}
+
+fn cleanup() {
+    let _rm = process_run("rm", ["-rf", PKG])
+}
+
+fn src_alpha() -> Str {
+    "pub type Point \{ a: Int \}\npub trait TagA \{ fn tag_a(self) -> Int \}\nimpl TagA for Point \{ fn tag_a(self) -> Int \{ 1 \} \}\npub fn make_a() -> Int \{ Point \{ a: 7 \}.tag_a() \}\npub fn get_a(p: Point) -> Int \{ p.a \}\n"
+}
+
+fn src_beta() -> Str {
+    "pub type Point \{ b: Int \}\npub trait TagB \{ fn tag_b(self) -> Int \}\nimpl TagB for Point \{ fn tag_b(self) -> Int \{ 2 \} \}\npub fn make_b() -> Int \{ Point \{ b: 9 \}.tag_b() \}\npub fn get_b(p: Point) -> Int \{ p.b \}\n"
+}
+
+// A third namesake, plus a derive whose field names it by its bare spelling.
+fn src_gamma() -> Str {
+    "pub type Point \{ g: Int \}\n@derive(Eq)\npub type Wrap \{ p: Point \}\npub fn wrapped() -> Int \{ Wrap \{ p: Point \{ g: 1 \} \}.p.g \}\n"
+}
+
+fn src_probe_uses_gamma_wrap() -> Str {
+    "import alpha.\{make_a\}\nimport gamma.\{wrapped\}\nfn main() \{ assert(make_a() == 1) assert(wrapped() == 1) \}\n"
+}
+
+fn src_probe_uses_both() -> Str {
+    "import alpha.\{make_a\}\nimport beta.\{make_b\}\nfn main() \{ assert(make_a() == 1) assert(make_b() == 2) \}\n"
+}
+
+fn src_probe_cross_assign() -> Str {
+    "import alpha.\{Point\}\nimport beta\nfn main() \{ let p: Point = beta.Point \{ b: 1 \} \}\n"
+}
+
+fn src_probe_main_declares_point() -> Str {
+    "import alpha.\{make_a\}\ntype Point \{ c: Int \}\nfn main() \{ let p = Point \{ c: 3 \} assert(p.c == 3) assert(make_a() == 1) \}\n"
+}
+
+fn src_probe_namesake_map_key() -> Str {
+    "import alpha.\{Point\}\nfn main() \{ let m: Map[Point, Int] = Map() assert(m.len() == 0) \}\n"
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn assert_only_error(label: Str, name: Str, want: Str) {
+    let errs = error_messages()
+    let mut hits = 0
+    for d in diag_entries {
+        if d.name == name && d.message == want { hits = hits + 1 }
+    }
+    if hits != 1 || errs.len() != 1 {
+        io.println("FAIL: {label}: want exactly one {name} '{want}', got:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(hits == 1)
+    assert(errs.len() == 1)
+}
+
+fn test_each_module_owns_its_point() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe(src_probe_uses_both())
+    assert_no_errors("namesake Point in two modules")
+
+    let alpha_tid = lookup_named_type("alpha.Point")
+    let beta_tid = lookup_named_type("beta.Point")
+    assert(alpha_tid != -1)
+    assert(beta_tid != -1)
+    assert(alpha_tid != beta_tid)
+
+    assert(get_struct_field_tid(alpha_tid, "a") != -1)
+    assert(get_struct_field_tid(alpha_tid, "b") == -1)
+    assert(get_struct_field_tid(beta_tid, "b") != -1)
+    assert(get_struct_field_tid(beta_tid, "a") == -1)
+
+    let alpha_decl = tc_tid_decl_node(alpha_tid)
+    let beta_decl = tc_tid_decl_node(beta_tid)
+    assert(alpha_decl >= 0)
+    assert(beta_decl >= 0)
+    assert(alpha_decl != beta_decl)
+    assert(node_module(alpha_decl) == "alpha")
+    assert(node_module(beta_decl) == "beta")
+    cleanup()
+}
+
+fn test_cross_assignment_is_a_type_error() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe(src_probe_cross_assign())
+    assert_only_error("alpha.Point from beta.Point", "TypeError", "variable 'p': declared type alpha.Point but got beta.Point")
+    cleanup()
+}
+
+fn test_main_file_keeps_the_bare_name() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe(src_probe_main_declares_point())
+    assert_no_errors("main declares its own Point beside alpha and beta")
+    let main_tid = lookup_named_type("Point")
+    assert(main_tid != -1)
+    assert(main_tid != lookup_named_type("alpha.Point"))
+    assert(get_struct_field_tid(main_tid, "c") != -1)
+    assert(get_struct_field_tid(main_tid, "a") == -1)
+    cleanup()
+}
+
+// A check keyed on the bare name would not find a namesake at all and fail open.
+fn test_selected_namesake_is_checked_as_a_map_key() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe(src_probe_namesake_map_key())
+    assert_only_error("Map[alpha.Point, Int] without Hash", "MapKeyNotHashable", "Map key type 'Point' does not implement Hash — user types used as Map keys must carry the @derive(Hash, Eq) annotation")
+    cleanup()
+}
+
+// The derive pass reads a field's type by its written spelling; inside gamma a bare `Point`
+// must reach gamma's own declaration, or the check finds nothing and fails open.
+fn test_derive_field_check_finds_the_namesake() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe(src_probe_uses_gamma_wrap())
+    assert_only_error("@derive(Eq) over a namesake field", "NonDerivableTrait", "@derive(Eq) on 'Wrap': field 'p' has type 'Point' which does not implement Eq")
+    cleanup()
+}
+
+fn main() {
+    test_each_module_owns_its_point()
+    test_derive_field_check_finds_the_namesake()
+    test_cross_assignment_is_a_type_error()
+    test_main_file_keeps_the_bare_name()
+    test_selected_namesake_is_checked_as_a_map_key()
+    io.println("PASS: namesake types stay distinct")
+}
