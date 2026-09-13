@@ -22,12 +22,14 @@
 // that ordering: it walks the tree and reports a cycle.
 
 import layout.{SlotForm}
+import typecheck.{TyKind, tc_tid_kind, tc_tid_decl_node}
+import parser.{node_name, node_fields, sublist_length, sublist_get, node_count}
 
 @derive(Eq)
 pub type IrKind {
     Const, VarRef, GlobalRef,
     Unary, Binary, Cast,
-    FieldGet, FieldSet, StructNew, TupleNew, ContainerNew, ContainerSpread,
+    FieldGet, FieldSet, StructNew, TupleNew, EnumNew, ContainerNew, ContainerSpread,
     Box, Unbox, CarrierWrap, CarrierUnwrap, CarrierTag,
     CallDirect, CallIndirect, CallClosure, CallVirtual, CallRuntime,
     ClosureNew, EffectPerform, HandlerInstall,
@@ -44,6 +46,10 @@ pub type IrNode {
     slot_form: SlotForm
     must_materialize: Int
     kids: List[Int]
+    // The declaration node the value is one arm of: an enum variant for EnumNew, -1 for
+    // every other kind. Identity is the node, not a name string, so the printer asks cname
+    // for the arm's spelling and two variants that share a name never collide.
+    decl: Int
 }
 
 // The arena. A node id is an index into this list, the same shape parser.bl uses for AST
@@ -62,7 +68,7 @@ pub fn ir_node_count() -> Int { ir_nodes.len() }
 pub fn ir_new(kind: IrKind, tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm, kids: List[Int]) -> Int {
     ir_nodes.push(IrNode {
         kind: kind, tid: tid, span: span, c_spelling: c_spelling, c_name: c_name,
-        slot_form: slot_form, must_materialize: 0, kids: copy_ids(kids),
+        slot_form: slot_form, must_materialize: 0, kids: copy_ids(kids), decl: -1,
     })
     ir_nodes.len() - 1
 }
@@ -90,6 +96,7 @@ pub fn ir_held_by_pointer(id: Int) -> Bool {
     }
 }
 pub fn ir_must_materialize(id: Int) -> Int { ir_node(id).must_materialize }
+pub fn ir_decl(id: Int) -> Int { ir_node(id).decl }
 pub fn ir_kid_count(id: Int) -> Int { ir_node(id).kids.len() }
 pub fn ir_kid(id: Int, i: Int) -> Int { ir_node(id).kids.get(i).unwrap() }
 
@@ -107,7 +114,7 @@ pub fn ir_all_kinds() -> List[IrKind] {
     [
         IrKind.Const, IrKind.VarRef, IrKind.GlobalRef,
         IrKind.Unary, IrKind.Binary, IrKind.Cast,
-        IrKind.FieldGet, IrKind.FieldSet, IrKind.StructNew, IrKind.TupleNew, IrKind.ContainerNew,
+        IrKind.FieldGet, IrKind.FieldSet, IrKind.StructNew, IrKind.TupleNew, IrKind.EnumNew, IrKind.ContainerNew,
         IrKind.ContainerSpread, IrKind.Box, IrKind.Unbox, IrKind.CarrierWrap, IrKind.CarrierUnwrap, IrKind.CarrierTag,
         IrKind.CallDirect, IrKind.CallIndirect, IrKind.CallClosure, IrKind.CallVirtual, IrKind.CallRuntime,
         IrKind.ClosureNew, IrKind.EffectPerform, IrKind.HandlerInstall,
@@ -129,6 +136,7 @@ pub fn ir_kind_name(kind: IrKind) -> Str {
         IrKind.FieldSet => "FieldSet"
         IrKind.StructNew => "StructNew"
         IrKind.TupleNew => "TupleNew"
+        IrKind.EnumNew => "EnumNew"
         IrKind.ContainerNew => "ContainerNew"
         IrKind.ContainerSpread => "ContainerSpread"
         IrKind.Box => "Box"
@@ -191,8 +199,8 @@ pub fn ir_kind_is_value(kind: IrKind) -> Bool {
 
 // c_name is the C token the kind prints verbatim: a literal, an identifier, an operator, a
 // field or union member, a symbol, a vtable slot, a cast type or a sizeof operand. These
-// kinds print nothing without it. CarrierWrap is checked by shape instead: only the
-// payload-carrying form needs a member name.
+// kinds print nothing without it. CarrierWrap and EnumNew are checked by shape instead: only
+// the payload-carrying form needs a member name.
 fn kind_needs_c_name(kind: IrKind) -> Bool {
     match kind {
         IrKind.Const => true
@@ -226,6 +234,7 @@ fn kind_min_kids(kind: IrKind) -> Int {
         IrKind.Cast => 1
         IrKind.FieldGet => 1
         IrKind.FieldSet => 2
+        IrKind.EnumNew => 1
         IrKind.ContainerSpread => 1
         IrKind.Box => 1
         IrKind.Unbox => 1
@@ -316,6 +325,26 @@ pub fn ir_struct_new(tid: Int, span: Int, c_spelling: Str, fields: List[Int]) ->
 
 pub fn ir_tuple_new(tid: Int, span: Int, c_spelling: Str, elems: List[Int]) -> Int {
     ir_new(IrKind.TupleNew, tid, span, c_spelling, "", SlotForm.Inline, elems)
+}
+
+// One arm of a tagged union: `Shape.Circle(2)`. tid is the enum (a mono instance tid for a
+// generic enum), variant is the variant's declaration node, and the kids are the tag Const
+// followed by the payload in declaration order. member is the union member the payload
+// fills, spelled by cname.c_variant_member_name; "" for a payload-less arm. The tag Const's
+// literal is the cname tag macro too, so the typedef and the literal share one producer.
+// A payload the layout boxes (a self-recursive field) arrives already boxed: the kid's shape
+// is lowering's decision, read from layout_of, and this node re-derives nothing.
+pub fn ir_enum_new(tid: Int, span: Int, c_spelling: Str, variant: Int, member: Str, tag: Int, payload: List[Int]) -> Int {
+    let mut kids = [tag]
+    for p in payload { kids.push(p) }
+    let id = ir_new(IrKind.EnumNew, tid, span, c_spelling, member, SlotForm.Inline, kids)
+    set_decl(id, variant)
+    id
+}
+
+fn set_decl(id: Int, decl: Int) {
+    let n = ir_node(id)
+    ir_nodes.set(id, IrNode { decl: decl, ..n })
 }
 
 pub fn ir_container_new(tid: Int, span: Int, c_spelling: Str, ctor_symbol: Str, elems: List[Int]) -> Int {
@@ -498,6 +527,7 @@ fn verify_node(id: Int, seen: List[Int], on_stack: List[Int], errs: List[Str]) {
     verify_fields(id, kind, label, errs)
     let kids = ir_kids(id)
     if verify_arity(kind, label, kids.len(), errs) {
+        if kind == IrKind.EnumNew { verify_enum_new(id, label, kids.len(), errs) }
         let mut i = 0
         while i < kids.len() {
             let kid = kids.get(i).unwrap()
@@ -521,9 +551,57 @@ fn verify_fields(id: Int, kind: IrKind, label: Str, errs: List[Str]) {
         errs.push("{label}: empty c_spelling")
     }
     let wrap_with_payload = kind == IrKind.CarrierWrap && ir_kid_count(id) == 2
-    if (kind_needs_c_name(kind) || wrap_with_payload) && ir_c_name(id) == "" {
+    let arm_with_payload = kind == IrKind.EnumNew && ir_kid_count(id) > 1
+    if (kind_needs_c_name(kind) || wrap_with_payload || arm_with_payload) && ir_c_name(id) == "" {
         errs.push("{label}: empty c_name")
     }
+}
+
+// The node is held to its declaration: the tid is an enum, the variant is one of that
+// enum's, and the payload count is the variant's arity.
+fn verify_enum_new(id: Int, label: Str, n: Int, errs: List[Str]) {
+    let variant = ir_decl(id)
+    if variant < 0 {
+        errs.push("{label}: no variant declaration")
+        return
+    }
+    // node_name aborts the process on a bad id; the verifier must report, not die.
+    if variant >= node_count() {
+        errs.push("{label}: variant declaration {variant} out of range (parser holds {node_count()})")
+        return
+    }
+    let vname = node_name(variant)
+    if tc_tid_kind(ir_tid(id)) != TyKind.Enum {
+        errs.push("{label}: tid is not an enum, variant '{vname}' has no union to fill")
+        return
+    }
+    if !enum_declares_variant(tc_tid_decl_node(ir_tid(id)), variant) {
+        errs.push("{label}: variant '{vname}' is not declared by this enum")
+        return
+    }
+    let arity = variant_arity(variant)
+    let have = n - 1
+    if have != arity {
+        errs.push("{label}: variant '{vname}' takes {arity} payload{plural(arity)}, has {have}")
+    }
+}
+
+fn enum_declares_variant(enum_decl: Int, variant: Int) -> Bool {
+    if enum_decl < 0 { return false }
+    let variants = node_fields(enum_decl)
+    if variants < 0 { return false }
+    let mut i = 0
+    while i < sublist_length(variants) {
+        if sublist_get(variants, i) == variant { return true }
+        i += 1
+    }
+    false
+}
+
+// A payload-less variant has no field sublist at all.
+fn variant_arity(variant: Int) -> Int {
+    let fields = node_fields(variant)
+    if fields < 0 { 0 } else { sublist_length(fields) }
 }
 
 fn verify_arity(kind: IrKind, label: Str, n: Int, errs: List[Str]) -> Bool {
@@ -584,6 +662,7 @@ fn kid_slot(kind: IrKind, i: Int, n: Int) -> KidSlot {
         IrKind.WithScope => if i == n - 1 { KidSlot.BlockOnly } else { KidSlot.Value }
         IrKind.Switch => switch_kid_slot(i, n)
         IrKind.CarrierWrap => if i == 0 { KidSlot.ConstTag } else { KidSlot.Value }
+        IrKind.EnumNew => if i == 0 { KidSlot.ConstTag } else { KidSlot.Value }
         IrKind.Assign => if i == 0 { KidSlot.Lvalue } else { KidSlot.Value }
         _ => KidSlot.Value
     }
@@ -611,8 +690,8 @@ fn is_lvalue_kind(kind: IrKind) -> Bool {
 
 // ── Dump ──────────────────────────────────────────────────────────────────
 
-// (Kind tid span SlotForm must_materialize "c_spelling" "c_name" kids...), one kid per
-// line, two spaces per depth. Node ids do not appear, so two arenas holding the same tree
+// (Kind tid span SlotForm must_materialize "c_spelling" "c_name" @decl kids...), one kid
+// per line, two spaces per depth. @decl is written only when the node has a declaration. Node ids do not appear, so two arenas holding the same tree
 // dump the same text. A node the tree reaches twice is written in full once, with a label
 // #k after its c_name; every later reach is the bare #k. Labels count from 0 in dump order,
 // so sharing survives a parse and the text stays arena-independent. The label also ends the
@@ -676,6 +755,7 @@ fn dump_node(sb: StringBuilder, id: Int, depth: Int, refs: List[Int], labels: Li
     sb.write(quote(n.c_spelling))
     sb.write(" ")
     sb.write(quote(n.c_name))
+    if n.decl >= 0 { sb.write(" @{n.decl}") }
     for kid in n.kids {
         sb.write("\n")
         dump_node(sb, kid, depth + 1, refs, labels, next_label)
@@ -751,6 +831,8 @@ fn parse_node() -> Int {
     let mat = read_int()
     let spelling = read_string()
     let name = read_string()
+    skip_ws()
+    let decl = if eat("@") { read_int() } else { -1 }
     if pr_failed { return -1 }
     let mut kids: List[Int] = []
     skip_ws()
@@ -772,6 +854,7 @@ fn parse_node() -> Int {
     }
     let id = ir_new(kind, tid, span, spelling, name, slot, kids)
     if mat == 1 { ir_mark_materialize(id) }
+    if decl >= 0 { set_decl(id, decl) }
     if label >= 0 { bind_label(label, id) }
     id
 }
