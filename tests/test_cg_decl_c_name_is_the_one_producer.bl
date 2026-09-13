@@ -1,0 +1,196 @@
+// The C name a declaration carries. The declaration half writes the prototype under it and
+// the definition half writes the body's header under it, so it has one producer and these
+// tests hold it to that.
+//
+// The rule turns on where a declaration was written, not on the call that reaches it. Two
+// traits can declare the same method name for one receiver, and then the trait is the only
+// thing that keeps their two C names apart.
+//
+// These tests cover the declaration side only. Nothing here lowers a call.
+
+import std.fs
+import std.io
+import layout.{layout_reset}
+import cname.{cname_reset}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_build, cg_reg_fn_decls, cg_reg_impl_methods, cg_reg_module_of, cg_reg_reset}
+import cg_decl.{
+    cg_decl_c_name, cg_decl_emit_fn_decls, cg_decl_emit_impl_method_decls, cg_decl_reset,
+}
+import cg_test_helpers.{cg_probe_compile, cg_text_occurrences}
+import ast.{node_name}
+
+// Two traits declaring the same method name, both implemented for one type, plus a free
+// function. The two methods share a receiver and a name, so nothing but the trait keeps
+// their C names apart, and both are reached through the static call shape, which from the
+// outside is indistinguishable from a free call.
+fn probe_src() -> Str {
+    #"type Dial {
+    ticks: Int
+}
+
+trait Wound {
+    fn turn(self) -> Int
+}
+
+trait Spring {
+    fn turn(self) -> Int
+}
+
+impl Wound for Dial {
+    fn turn(self) -> Int {
+        self.ticks + 1
+    }
+}
+
+impl Spring for Dial {
+    fn turn(self) -> Int {
+        self.ticks + 2
+    }
+}
+
+fn spin(d: Dial) -> Int {
+    Wound.turn(d) + Spring.turn(d)
+}
+
+fn main() {
+    let d = Dial { ticks: 1 }
+    assert(spin(d) == 5)
+}
+"#
+}
+
+fn build_probe() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/cg_decl_c_name_probe.bl"
+    let program = cg_probe_compile(path, probe_src())
+    let _ = fs.delete(path)
+    layout_reset()
+    cname_reset()
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    program
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+fn find_named(decls: List[Int], name: Str) -> Int {
+    let mut i = 0
+    while i < decls.len() {
+        if node_name(decls.get(i).unwrap()) == name { return decls.get(i).unwrap() }
+        i = i + 1
+    }
+    -1
+}
+
+// The declarations the probe's own module contributes. The registry also holds every
+// standard-library declaration the probe reached, and the unit writes a prototype for a
+// declaration only when its body belongs to this unit, so sweeping the whole registry
+// would count a library function the unit deliberately left to the archive.
+fn probe_module_decls(all: List[Int], module_key: Str) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < all.len() {
+        let d = all.get(i).unwrap()
+        if cg_reg_module_of(d) == module_key { out.push(d) }
+        i = i + 1
+    }
+    out
+}
+
+fn count_unwritten(decls: List[Int], text: Str) -> Int {
+    let mut missing = 0
+    let mut i = 0
+    while i < decls.len() {
+        let name = cg_decl_c_name(decls.get(i).unwrap())
+        if name == "" || cg_text_occurrences(text, "{name}(") == 0 {
+            io.println("FAIL: no declaration written under '{name}'")
+            missing = missing + 1
+        }
+        i = i + 1
+    }
+    missing
+}
+
+test "every declaration this unit writes is written under the name the seam answers" {
+    // Not a hand-listed name, but every declaration the probe's module contributes, checked
+    // against the seam. A prototype under a name the seam does not answer is a prototype
+    // nothing will call.
+    let _ = build_probe()
+    let spin = find_named(cg_reg_fn_decls(), "spin")
+    assert(spin >= 0)
+    let module_key = cg_reg_module_of(spin)
+    let fns = probe_module_decls(cg_reg_fn_decls(), module_key)
+    let ms = probe_module_decls(cg_reg_impl_methods(), module_key)
+    assert_eq_int("the probe contributes both free functions", fns.len(), 2)
+    assert_eq_int("the probe contributes both trait methods", ms.len(), 2)
+    cg_decl_emit_fn_decls()
+    cg_decl_emit_impl_method_decls()
+    let text = print_take()
+    let missing = count_unwritten(fns, text) + count_unwritten(ms, text)
+    if missing > 0 { io.println("--- output ---\n{text}") }
+    assert_eq_int("declarations written under a name the seam does not answer", missing, 0)
+}
+
+test "two traits declaring one method name for one receiver get two C names" {
+    // The trait is the only thing separating them. A namer that took the receiver and the
+    // method name and stopped would answer once for both, and the second definition would
+    // redefine the first.
+    let _ = build_probe()
+    let ms = cg_reg_impl_methods()
+    let mut seen: Map[Str, Int] = Map()
+    let mut turns = 0
+    let mut i = 0
+    while i < ms.len() {
+        let m = ms.get(i).unwrap()
+        if node_name(m) == "turn" {
+            turns = turns + 1
+            let name = cg_decl_c_name(m)
+            if name == "" { io.println("FAIL: a written method has no C name") }
+            assert(name != "")
+            seen.insert(name, 1)
+        }
+        i = i + 1
+    }
+    assert_eq_int("both same-named trait methods were registered", turns, 2)
+    assert_eq_int("the two same-named trait methods share one C name", seen.len(), 2)
+}
+
+test "a free function's name is not spelled as if it lived in an impl" {
+    // The other side of the same rule. `spin` is in no impl block, so its name carries its
+    // module and no receiver. A seam that reached for a receiver anyway would answer a name
+    // with the type in it, or an empty one.
+    let _ = build_probe()
+    let spin = find_named(cg_reg_fn_decls(), "spin")
+    assert(spin >= 0)
+    let name = cg_decl_c_name(spin)
+    if name.index_of("Dial") >= 0 || name == "" {
+        io.println("FAIL: a free function was named through a receiver: '{name}'")
+    }
+    assert(name.index_of("Dial") < 0)
+    assert(name != "")
+}
+
+test "the emitted prototype and the seam agree on the free function" {
+    // Ties the seam to the text rather than to another reader of the same rule. If the
+    // declaration half stopped asking the seam, this is what would notice.
+    let _ = build_probe()
+    let spin = find_named(cg_reg_fn_decls(), "spin")
+    assert(spin >= 0)
+    let name = cg_decl_c_name(spin)
+    cg_decl_emit_fn_decls()
+    assert_has(print_take(), "{name}(")
+}
