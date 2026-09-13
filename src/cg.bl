@@ -9,7 +9,7 @@
 // empty string. Every caller must therefore read diag_ice_count before it uses the
 // result, or an unbuilt stage looks like a program that legitimately emits nothing.
 
-import diagnostics.{Diag, diag_ice_stage_not_built}
+import diagnostics.{Diag, diag_ice_at, diag_ice_stage_not_built, UNSOLVED_TYPEVAR_AT_CODEGEN}
 import cname.{c_archive_header_guard, c_module_header_guard, c_string_literal, c_test_fn_name}
 import ast.{NodeKind, nk_of}
 import parser.{
@@ -35,11 +35,12 @@ import cg_decl.{
 }
 import cg_derive.{cg_derive_emit_bodies, cg_derive_emit_decls, cg_derive_reset}
 import mono.{instances}
-import cg_stmt.{cg_stmt_reset, lower_block_returning, lower_fn}
-import cg_expr.{cg_expr_reset}
+import typecheck.{TyKind, tc_resolve, tc_tid_kind}
+import cg_stmt.{cg_stmt_reset, lower_block, lower_block_returning, lower_fn}
+import cg_expr.{cg_expr_reset, cg_expr_set_return_type}
 import cg_eff.{
     cg_eff_pending_thunks, cg_eff_print_thunk, cg_eff_reset, cg_eff_thunk_body_node,
-    cg_eff_thunk_close, cg_eff_thunk_open, cg_eff_thunks_drained,
+    cg_eff_thunk_close, cg_eff_thunk_open, cg_eff_thunk_ret_tid, cg_eff_thunks_drained,
 }
 
 effect Codegen {
@@ -299,7 +300,7 @@ fn lower_body(decl: Int) -> Int ! Diag.Report {
         let n = bodies.len()
         // An open that refused has made its report; a close would only add a second.
         if cg_eff_thunk_open(n) >= 0 {
-            bodies.push(lower_block_returning(cg_eff_thunk_body_node(n)))
+            bodies.push(lower_thunk_body(n))
             cg_eff_thunk_close()
         } else {
             bodies.push(-1)
@@ -313,6 +314,37 @@ fn lower_body(decl: Int) -> Int ! Diag.Report {
         cg_eff_print_thunk(k, bodies.get(k).unwrap())
     }
     cg_eff_thunks_drained(bodies.len())
+    body
+}
+
+// One thunk's body, lowered against the closure's own result, which decides two things a
+// function body's result decides for it.
+//
+// The first is where a `?` goes. `?` lowers in the expression stage, which reads no
+// function of its own and is told the enclosing result instead. A closure is that
+// enclosing function for its own body: the arm a `?` takes there belongs to what the
+// closure returns, not to whatever function the closure happens to sit inside.
+//
+// The second is whether the tail is the answer. A closure returning nothing is spelled
+// `void` in C, and C rejects a value on a return out of it, so its tail is a statement
+// like any other. This is the test lower_fn makes for the same reason, on the same fact.
+fn lower_thunk_body(n: Int) -> Int ! Diag.Report {
+    let body_node = cg_eff_thunk_body_node(n)
+    let ret = cg_eff_thunk_ret_tid(n)
+    if ret < 0 {
+        diag_ice_at("ThunkResultHasNoType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "the closure result this body propagates into carries no type", body_node,
+            "typecheck stamps every closure with one result type; this is a compiler bug")
+        return -1
+    }
+    cg_expr_set_return_type(ret)
+    let k = tc_tid_kind(tc_resolve(ret))
+    let body = if k == TyKind.Void || k == TyKind.Never {
+        lower_block(body_node)
+    } else {
+        lower_block_returning(body_node)
+    }
+    cg_expr_set_return_type(-1)
     body
 }
 
