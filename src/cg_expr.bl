@@ -18,14 +18,15 @@
 import parser.{
     node_kind, node_name, node_op, node_left, node_right, node_value, node_obj,
     node_str_val, node_int_val, node_elements, node_fields, node_args, node_condition,
+    node_line, node_col,
     sublist_get, sublist_length,
 }
 import ast.{NodeKind, nk_of, node_kind_name}
 import typecheck.{
     TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_child_count, tc_tid_decl_node,
     lookup_named_type, get_struct_field_tid, is_import_module_name,
-    tc_qualifier_to_module_or_self,
-    TYPE_INT, TYPE_BOOL, TYPE_STR,
+    tc_qualifier_to_module_or_self, tc_tid_struct,
+    TYPE_INT, TYPE_BOOL, TYPE_STR, TYPE_VOID,
 }
 import layout.{
     LayoutRecord, Position, Slot, SlotForm, layout_of, carrier_member_layout, child_tid,
@@ -36,6 +37,7 @@ import cg_reg.{cg_reg_global_decls, cg_reg_module_of}
 import cname.{
     c_local_name, c_field_name, c_global_name, c_string_literal, c_container_ctor,
     c_runtime_helper, c_variant_tag_macro, c_mono_variant_tag_macro, c_mint_local,
+    c_test_propagate_name,
 }
 import ir.{
     IrKind, ir_kind, ir_kid, ir_kid_count,
@@ -45,11 +47,12 @@ import ir.{
     ir_expr_stmt, ir_if, ir_block,
 }
 import cg_call.{
-    lower_call, lower_operator_method, lower_display_call, lower_spread, lower_element_read,
+    lower_call, lower_operator_method, lower_display_call, lower_display_of_value,
+    lower_spread, lower_element_read,
 }
 import cg_eff.{cg_eff_lower_closure}
 import diagnostics.{
-    Diag, diag_ice, diag_ice_at, diag_is_ice_seg,
+    Diag, diag_ice, diag_ice_at, diag_is_ice_seg, diag_file_for_node,
     UNSOLVED_TYPEVAR_AT_CODEGEN, CODEGEN_STAGE_NOT_BUILT, POISONED_IR_AT_SEAM,
 }
 
@@ -90,6 +93,7 @@ type MaterialisedValue {
 
 let mut cx_value: Map[Str, MaterialisedValue] = Map()
 let mut cx_return_type: Int = -1
+let mut cx_test_body: Bool = false
 
 // ── Seam ──────────────────────────────────────────────────────────────────
 
@@ -97,11 +101,24 @@ pub fn cg_expr_reset() {
     cx_pending = []
     cx_value = Map()
     cx_return_type = -1
+    cx_test_body = false
 }
 
 // The carrier `?` returns on the error path.
 pub fn cg_expr_set_return_type(tid: Int) {
     cx_return_type = tid
+}
+
+// Whether the body being lowered is a test block. A test body is a third propagation mode
+// beside a function with a Result result and a function with an Option result, and it is
+// not a return type: the C body has no result, so `?` calls the runtime and then returns
+// with no value. The driver sets this the same way it sets a return type, around the body,
+// and clears it after.
+//
+// A closure written inside a test body is its own enclosing function for the `?` in it, so
+// the driver clears this before it lowers a thunk body.
+pub fn cg_expr_set_test_body(on: Bool) {
+    cx_test_body = on
 }
 
 // An `if` or `match` in value position: cg_stmt declares the temp, lowers the arms into
@@ -729,7 +746,8 @@ fn lower_try(node: Int) -> Int ! Diag.Report {
             "'?' propagates an Option or a Result; nothing else carries a failure arm")
         return -1
     }
-    if cx_return_type < 0 {
+    // A test body declares no result, so it has no return type to want.
+    if !cx_test_body && cx_return_type < 0 {
         diag_ice_at("TryWithoutReturnType", CODEGEN_STAGE_NOT_BUILT,
             "'?' needs the enclosing function's return type and none was given", node,
             "the statement stage must call cg_expr_set_return_type before lowering a body")
@@ -746,14 +764,102 @@ fn lower_try_arms(node: Int, carrier_tid: Int, k: TyKind, carrier: Str) -> Int !
     let fail_tag = if k == TyKind.Option { 0 } else { 1 }
     let cond = x_tag_is(node, carrier_tid, carrier, fail_tag)
     if cond < 0 { return -1 }
-    let propagated = lower_try_propagate(node, carrier_tid, k, carrier)
-    if propagated < 0 { return -1 }
-    x_hoist(ir_if(node, cond, ir_block(node, [ir_return(node, propagated)]), -1))
+    let arm = if cx_test_body {
+        x_test_propagate_arm(node, carrier_tid, k, carrier)
+    } else {
+        x_carrier_return_arm(node, carrier_tid, k, carrier)
+    }
+    if arm < 0 { return -1 }
+    x_hoist(ir_if(node, cond, arm, -1))
     let inner_tid = tid_of_node(node)
     if inner_tid < 0 { return -1 }
     // Both carriers hold their success in the first slot; only the member name differs.
     let member = if k == TyKind.Option { member_value } else { member_ok }
     x_payload_of(node, carrier_tid, inner_tid, carrier, Slot.Inner1, member)
+}
+
+// The failure arm of an ordinary body: the carrier the enclosing function declares,
+// returned out of it.
+fn x_carrier_return_arm(node: Int, carrier_tid: Int, k: TyKind, carrier: Str) -> Int ! Diag.Report {
+    let propagated = lower_try_propagate(node, carrier_tid, k, carrier)
+    if propagated < 0 { return -1 }
+    ir_block(node, [ir_return(node, propagated)])
+}
+
+// The failure arm of a test body. The body has no result, so it cannot return a carrier.
+// It calls the runtime to record the failure and then returns with no value.
+//
+// The return with no value is required, not a formality. It runs the cleanup destructor of
+// every in-scope `with` binding. A jump out of the frame would skip them.
+//
+// The message and the error type name come from the operand's own carrier, never from an
+// annotation. The carrier is the type the failure comes out of.
+fn x_test_propagate_arm(node: Int, carrier_tid: Int, k: TyKind, carrier: Str) -> Int ! Diag.Report {
+    // The runtime records the line and the column as numbers and has no spelling for
+    // "no position", so a node without both has nothing to give it.
+    if node_line(node) <= 0 || node_col(node) <= 0 {
+        diag_ice_at("TryInTestBodyHasNoPosition", CODEGEN_STAGE_NOT_BUILT,
+            "'?' in a test body has no source position to report the failure at", node,
+            "the runtime records a line and a column as numbers; a synthesized '?' must copy the position of the expression it replaces")
+        return -1
+    }
+    // Both the message and the type name read the Result error slot, so it is read once
+    // here. An Option has no error slot and neither reads this tid.
+    let err_tid = if k == TyKind.Option { TYPE_VOID } else { child_tid(carrier_tid, Slot.Inner2) }
+    if err_tid < 0 {
+        diag_ice_at("TestErrorTypeMissing", CODEGEN_STAGE_NOT_BUILT,
+            "the Result a test body's '?' propagates has no error type", node,
+            "a Result holds its error in the second slot; the runtime is given the type from there")
+        return -1
+    }
+    let message = x_test_propagate_message(node, carrier_tid, k, carrier, err_tid)
+    if message < 0 { return -1 }
+    let str_rec = x_local(TYPE_STR, node)
+    let int_rec = x_local(TYPE_INT, node)
+    if x_stopped(str_rec) { return -1 }
+    if x_stopped(int_rec) { return -1 }
+    // The C body has no result, so the call's own value has no type to take.
+    let void_rec = layout_of(TYPE_VOID, Position.Return)
+    if x_stopped(void_rec) { return -1 }
+    let args = [
+        message,
+        ir_const(TYPE_STR, node, str_rec.c_spelling,
+            c_string_literal(x_test_error_type_name(k, err_tid))),
+        ir_const(TYPE_STR, node, str_rec.c_spelling, c_string_literal(diag_file_for_node(node))),
+        ir_const(TYPE_INT, node, int_rec.c_spelling, "{node_line(node)}"),
+        ir_const(TYPE_INT, node, int_rec.c_spelling, "{node_col(node)}"),
+    ]
+    let call = ir_call_runtime(TYPE_VOID, node, void_rec.c_spelling, c_test_propagate_name(),
+        void_rec.slot_form, args)
+    ir_block(node, [ir_expr_stmt(node, call), ir_return(node, -1)])
+}
+
+// The text the runner prints for the failure. An Option has no error value, so the word is
+// fixed. A Str error is already that text. Any other error is rendered by a call to its
+// Display impl on the payload, which is the route a Display hole takes. An error type with
+// no Display impl is refused there by name.
+fn x_test_propagate_message(node: Int, carrier_tid: Int, k: TyKind, carrier: Str,
+        err_tid: Int) -> Int ! Diag.Report {
+    if k == TyKind.Option {
+        let str_rec = x_local(TYPE_STR, node)
+        if x_stopped(str_rec) { return -1 }
+        return ir_const(TYPE_STR, node, str_rec.c_spelling, c_string_literal(ctor_none))
+    }
+    let payload = x_payload_of(node, carrier_tid, err_tid, carrier, Slot.Inner2, member_err)
+    if payload < 0 { return -1 }
+    if x_kind(err_tid) == TyKind.Str { return payload }
+    lower_display_of_value(node, err_tid, payload)
+}
+
+// The error type name the runner prints beside the message. A nominal type gives its own
+// name without the module that declares it. Any other type is named by its kind, which is
+// the name the surface language spells it with. Every kind has such a name, so this is
+// total and cannot fail.
+fn x_test_error_type_name(k: TyKind, err_tid: Int) -> Str {
+    if k == TyKind.Option { return tk_name(TyKind.Option) }
+    let nominal = tc_tid_struct(tc_resolve(err_tid))
+    if nominal != "" { return nominal }
+    tk_name(x_kind(err_tid))
 }
 
 // The failure the caller sees. A None stays a None whatever the function returns; an Err

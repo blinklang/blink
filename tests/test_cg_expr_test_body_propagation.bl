@@ -1,0 +1,320 @@
+// Where a `?` in a test body goes. A test body is a third propagation mode beside a
+// function with a Result result and a function with an Option result, and it is not a
+// return type: the C body is declared `void (*)(void)`, so a return with a carrier in it
+// does not compile. The body calls the runtime instead. The call records the message, the
+// error type name and the source position. The body then returns with no value, which runs
+// the cleanup destructor of every in-scope `with` binding. A longjmp would skip them.
+//
+// The three message arms come from the released compiler, not from this stage's own
+// reasoning. Each pinned line below was read out of the C that compiler emits for the
+// same source.
+
+import std.fs
+import std.io
+import layout.{layout_reset}
+import cname.{cname_reset, c_test_propagate_name}
+import cg.{CgConfig, generate}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_named, cg_text_occurrences}
+import mono.{run_mono}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output must not have '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    let program = cg_probe_compile(path, src)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    program
+}
+
+// The symbol the emitted call must name, read from the one producer of it rather than
+// spelled again here: a test that spells its own copy passes while the two disagree.
+fn propagate_call() -> Str {
+    "{c_test_propagate_name()}("
+}
+
+fn standalone_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+// A Str error is already the text the runtime wants, so it is passed straight through.
+// The `?` is at line 6, column 13.
+fn str_error_src() -> Str {
+    #"fn ok42() -> Result[Int, Str] {
+    Ok(42)
+}
+
+test "a Str error propagates its own text" {
+    let v = ok42()?
+    assert_eq(v, 42)
+}
+"#
+}
+
+// An Option carries no error value at all, so the message is a fixed word and the error
+// type's name is the carrier's. The inner type is never asked for a Display: this probe's
+// inner type has none, and it still lowers.
+// The `?` is at line 10, column 13.
+fn option_src() -> Str {
+    #"type Row {
+    n: Int
+}
+
+fn found() -> Option[Row] {
+    Some(Row { n: 9 })
+}
+
+test "an Option propagates the None literal" {
+    let v = found()?
+    assert_eq(v.n, 9)
+}
+"#
+}
+
+// Any other error type is shown by calling its Display impl on the err payload. The
+// payload is a struct, which the carrier holds behind a pointer, so the call reads
+// through that pointer.
+// The `?` is at line 16, column 13.
+fn display_error_src() -> Str {
+    #"type Boom {
+    msg: Str
+}
+
+impl Display for Boom {
+    fn fmt(self, sb: StringBuilder) {
+        sb.write(self.msg)
+    }
+}
+
+fn risky() -> Result[Int, Boom] {
+    Ok(5)
+}
+
+test "a struct error renders through Display" {
+    let v = risky()?
+    assert_eq(v, 5)
+}
+"#
+}
+
+// A function body, not a test body. Nothing here changes: `?` returns the carrier the
+// function declares.
+fn plain_fn_src() -> Str {
+    #"fn ok42() -> Result[Int, Str] {
+    Ok(42)
+}
+
+fn caller() -> Result[Int, Str] {
+    let v = ok42()?
+    Ok(v + 1)
+}
+
+fn main() {
+    let _ = caller()
+}
+"#
+}
+
+// A closure written inside a test body. The closure is its own enclosing function for the
+// `?` in it, so the arm belongs to what the closure returns and not to the test block
+// around it. A stage that read the test-body mode here would call the runtime out of a
+// thunk that has a carrier to return.
+fn closure_in_test_src() -> Str {
+    #"fn find() -> Option[Int] {
+    Some(3)
+}
+
+test "a closure keeps its own propagation" {
+    let run = fn() -> Option[Int] {
+        let v = find()?
+        Some(v)
+    }
+    match run() {
+        Some(v) => assert_eq(v, 3)
+        None => assert_eq(0, 1)
+    }
+}
+"#
+}
+
+// Two test blocks in one unit. The mode is set for each body and cleared after it, so a
+// block with no `?` in it is not left in the mode the block before it was lowered under.
+fn two_bodies_src() -> Str {
+    #"fn ok42() -> Result[Int, Str] {
+    Ok(42)
+}
+
+test "the first body propagates" {
+    let v = ok42()?
+    assert_eq(v, 42)
+}
+
+test "the second body propagates nothing" {
+    assert_eq(1, 1)
+}
+"#
+}
+
+// A scalar error type. It is neither a Str nor a type with a Display impl, so rendering it
+// is refused by name. Typecheck accepts the program, so this stage is the first to see it.
+// The `?` is at line 6, column 13.
+fn scalar_error_src() -> Str {
+    #"fn ok42() -> Result[Int, Int] {
+    Ok(42)
+}
+
+test "a scalar error has no rendering" {
+    let v = ok42()?
+    assert_eq(v, 42)
+}
+"#
+}
+
+// A closure and a `?` in one test body, with the `?` written after the closure. The thunk
+// the closure queues lowers after the whole body, so clearing the mode for that thunk must
+// not reach the `?` before it.
+fn closure_then_try_src() -> Str {
+    #"fn find() -> Option[Int] {
+    Some(3)
+}
+
+test "a ? after a closure still propagates" {
+    let run = fn() -> Option[Int] {
+        let v = find()?
+        Some(v)
+    }
+    let _ = run()
+    let w = find()?
+    assert_eq(w, 3)
+}
+"#
+}
+
+// The producer names a function the runtime declares, so the two have to agree. The test
+// reads the header rather than spelling the symbol a second time: a spelling written here
+// would agree with the producer and with nothing else.
+test "the runtime declares the function the producer names" {
+    let header = fs.read("bootstrap/runtime_test.h").unwrap()
+    assert_has(header, "static void {c_test_propagate_name()}(")
+}
+
+test "a Str error in a test body passes the err binder to the runtime" {
+    let program = build_probe(str_error_src(), "cg_try_test_str")
+    let text = generate(program, standalone_cfg())
+    assert_eq_int("no ? refused for want of a return type",
+        cg_probe_ices_named("TryWithoutReturnType"), 0)
+    assert_has(text, propagate_call())
+    assert_has(text, ".err, \"Str\", \"build/cg_try_test_str.bl\", 6, 13);")
+    assert_eq_int("one propagation call",
+        cg_text_occurrences(text, propagate_call()), 1)
+}
+
+test "a Str error's propagation is followed by a bare return" {
+    let program = build_probe(str_error_src(), "cg_try_test_str_return")
+    let text = generate(program, standalone_cfg())
+    // The bare return is what runs the cleanup destructors of in-scope `with` bindings.
+    assert_has(text, "\", 6, 13);\n        return;")
+}
+
+test "a test body's propagation builds no carrier to return" {
+    let program = build_probe(str_error_src(), "cg_try_test_str_no_carrier")
+    let text = generate(program, standalone_cfg())
+    // The other arm reads the enclosing return type to build the carrier it returns. A test
+    // body has no return type, so that arm refuses by this name. Silence proves the arm was
+    // never entered, which a check for the absence of a returned carrier cannot prove: the
+    // binder is minted and its spelling is not fixed here.
+    assert_eq_int("the carrier arm was not entered",
+        cg_probe_ices_named("TryResultInNonResultFn"), 0)
+    assert_has(text, propagate_call())
+}
+
+test "an Option in a test body propagates the fixed None message" {
+    let program = build_probe(option_src(), "cg_try_test_option")
+    let text = generate(program, standalone_cfg())
+    assert_eq_int("no ? refused for want of a return type",
+        cg_probe_ices_named("TryWithoutReturnType"), 0)
+    assert_has(text, "{propagate_call()}\"None\", \"Option\", \"build/cg_try_test_option.bl\", 10, 13);")
+}
+
+test "an Option in a test body asks its inner type for no Display" {
+    let program = build_probe(option_src(), "cg_try_test_option_display")
+    let _ = generate(program, standalone_cfg())
+    // Row carries no Display impl. The Option arm must never reach the lookup.
+    assert_eq_int("no Display impl was looked for",
+        cg_probe_ices_named("DisplayImplNotFound"), 0)
+}
+
+test "a struct error in a test body renders through its Display impl" {
+    let program = build_probe(display_error_src(), "cg_try_test_display")
+    let text = generate(program, standalone_cfg())
+    assert_eq_int("no ? refused for want of a return type",
+        cg_probe_ices_named("TryWithoutReturnType"), 0)
+    assert_has(text, "{propagate_call()}blink_Boom_Display_display(")
+    assert_has(text, ", \"Boom\", \"build/cg_try_test_display.bl\", 16, 13);")
+}
+
+test "a function body's ? still returns the carrier it declares" {
+    let program = build_probe(plain_fn_src(), "cg_try_fn_body")
+    let text = generate(program, standalone_cfg())
+    assert_eq_int("no ? refused for want of a return type",
+        cg_probe_ices_named("TryWithoutReturnType"), 0)
+    assert_eq_int("the runtime is not called out of a function body",
+        cg_text_occurrences(text, propagate_call()), 0)
+}
+
+test "a closure inside a test body propagates on its own account" {
+    let program = build_probe(closure_in_test_src(), "cg_try_closure_in_test")
+    let text = generate(program, standalone_cfg())
+    assert_eq_int("no ? refused for want of a return type",
+        cg_probe_ices_named("TryWithoutReturnType"), 0)
+    assert_eq_int("the thunk returns its own None, it does not call the runtime",
+        cg_text_occurrences(text, propagate_call()), 0)
+}
+
+test "a scalar error in a test body is refused for want of a rendering" {
+    let program = build_probe(scalar_error_src(), "cg_try_test_scalar")
+    let _ = generate(program, standalone_cfg())
+    // An Int error is neither the text itself nor a type that can render itself, so the
+    // Display route refuses it rather than printing a placeholder.
+    assert_eq_int("the missing Display impl is reported once",
+        cg_probe_ices_named("DisplayImplNotFound"), 1)
+}
+
+test "a ? written after a closure in the same test body still propagates" {
+    let program = build_probe(closure_then_try_src(), "cg_try_closure_then_try")
+    let text = generate(program, standalone_cfg())
+    assert_eq_int("no ? refused for want of a return type",
+        cg_probe_ices_named("TryWithoutReturnType"), 0)
+    // The closure's own `?` returns its carrier; only the body's `?` calls the runtime.
+    assert_eq_int("the body's ? calls the runtime and the closure's does not",
+        cg_text_occurrences(text, propagate_call()), 1)
+}
+
+test "the test-body mode is cleared between two bodies" {
+    let program = build_probe(two_bodies_src(), "cg_try_two_bodies")
+    let text = generate(program, standalone_cfg())
+    assert_eq_int("only the body that wrote a ? calls the runtime",
+        cg_text_occurrences(text, propagate_call()), 1)
+}
