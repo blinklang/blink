@@ -1,0 +1,395 @@
+// An `if` or a `match` that produces a value is a statement in C, not an expression.
+//
+// C has a conditional operator, but it cannot hold the statements an arm needs, and an arm
+// here is a block. So the value an arm produces reaches its reader through a temp: the
+// statement stage declares the temp, lowers each arm tail into an assignment to it, and
+// names the temp to the expression stage. The expression stage then answers a read of that
+// temp wherever the `if` or the `match` stood.
+//
+// These tests read the lowered block and pin both halves: the temp and the arms that fill
+// it stand in front of the statement, and the reader reads the temp rather than a value of
+// its own. They also pin the shapes that have no lowering yet, each by the name it refuses
+// under, so a gap stays one honest report rather than wrong C.
+
+import std.io
+import diagnostics.{diag_reset}
+import mono.{run_mono}
+import parser.{nodes, node_body, node_kind, node_name}
+import ast.{NodeKind}
+import layout.{layout_reset}
+import ir.{ir_reset}
+import cg_test_helpers.{cg_probe_compile}
+import cg_stmt.{cg_stmt_reset, lower_block, lower_fn}
+import cg_expr.{cg_expr_reset, cg_expr_pending_count}
+import lower_test_helpers.{
+    assert_eq_str, assert_ice_saying, ice_count, ice_count_exactly, last_ice, shape,
+}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn lowered_program(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", env.cwd())
+    let path = "build/{stem}_probe.bl"
+    let program = cg_probe_compile(path, src)
+    let _rm = process_run("rm", ["-f", path])
+    run_mono(program)
+    layout_reset()
+    ir_reset()
+    cg_expr_reset()
+    cg_stmt_reset()
+    diag_reset()
+    let f = find_fn(name)
+    assert(f >= 0)
+    f
+}
+
+// The whole function, so a parameter the body reads is bound.
+fn probe_fn(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    lower_fn(lowered_program(stem, src, name))
+}
+
+// The body alone. lower_fn turns a stopped body into an empty block, so a refusal is only
+// visible through the block seam, which answers -1.
+fn probe_body(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    lower_block(node_body(lowered_program(stem, src, name)))
+}
+
+fn src_let_if() -> Str {
+    #"fn main() {
+    let c = 1
+    let picked = if c > 0 { 10 } else { 20 }
+    let _keep = [picked]
+}
+"#
+}
+
+test "an if in value position fills a temp and its reader reads that temp" {
+    let body = probe_fn("cg_stmt_value_if", src_let_if(), "main")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(VarRef), Let(ContainerNew(VarRef)))")
+}
+
+test "the buffer is empty once an if in value position is materialised" {
+    let _body = probe_fn("cg_stmt_value_if_empty", src_let_if(), "main")
+    assert_eq_str("statements left", "{cg_expr_pending_count()}", "0")
+}
+
+test "a match in value position fills a temp from every arm" {
+    let body = probe_fn("cg_stmt_value_match", #"fn main() {
+    let c = 1
+    let picked = match c {
+        1 => 10
+        _ => 20
+    }
+    let _keep = [picked]
+}
+"#, "main")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let, Block(Let(VarRef), Switch(VarRef, Const, Block(Block(Assign(VarRef, Const))), Block(Block(Assign(VarRef, Const))))), Let(VarRef), Let(ContainerNew(VarRef)))")
+}
+
+test "an if nested in a tuple element is materialised above the statement" {
+    let body = probe_fn("cg_stmt_value_tuple", #"fn main() {
+    let c = 1
+    let pair = (1, if c > 0 { 2 } else { 3 })
+    let _keep = [pair]
+}
+"#, "main")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(TupleNew(Const, VarRef)), Let(ContainerNew(VarRef)))")
+}
+
+test "an if in a condition gets a temp of its own above the if that reads it" {
+    let body = probe_fn("cg_stmt_value_cond", #"fn main() {
+    let c = 1
+    let picked = if (if c > 0 { true } else { false }) { 1 } else { 2 }
+    let _keep = [picked]
+}
+"#, "main")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let, If(VarRef, Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(VarRef), Let(ContainerNew(VarRef)))")
+}
+
+test "an if whose arms nest keeps one temp and fills it from the innermost arm" {
+    let body = probe_fn("cg_stmt_value_nested_arm", #"fn main() {
+    let c = 1
+    let picked = if c > 0 { if c > 1 { 1 } else { 2 } } else { 3 }
+    let _keep = [picked]
+}
+"#, "main")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let, If(Binary(VarRef, Const), Block(If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const)))), Block(Assign(VarRef, Const))), Let(VarRef), Let(ContainerNew(VarRef)))")
+}
+
+// An arm that returns leaves the block, so it never reaches the read and owes the temp
+// nothing. This is a materialised shape, not a refused one.
+test "an arm that returns leaves the temp to the arm that does produce a value" {
+    let body = probe_fn("cg_stmt_value_diverge", #"fn pick(c: Int) -> Int {
+    let picked = if c > 0 { 10 } else { return 0 }
+    picked
+}
+"#, "pick")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Return(Const))), Let(VarRef), Return(VarRef))")
+}
+
+test "an if whose arms produce no value refuses by name" {
+    let body = probe_body("cg_stmt_value_void", #"fn main() {
+    let c = 1
+    let picked = if c > 0 { io.println("a") } else { io.println("b") }
+    let _keep = [picked]
+}
+"#, "main")
+    assert_ice_saying("void value if", body, "ValuePositionExprHasNoValue",
+        "in value position produces no value")
+}
+
+test "an arm that neither produces a value nor leaves the block refuses by name" {
+    let body = probe_body("cg_stmt_value_unfilled", #"fn main() {
+    let c = 1
+    let picked = if c > 0 { 10 } else { loop { } }
+    let _keep = [picked]
+}
+"#, "main")
+    assert_ice_saying("arm fills nothing", body, "ValuePositionArmFillsNothing",
+        "neither produces a value nor leaves the block")
+}
+
+// The three places the materialiser will not put a temp, because a temp filled in front of
+// the statement runs a different number of times than the expression that reads it. Each
+// leaves the expression stage with no temp to read, and it refuses by name.
+
+test "an if in the right operand of a short-circuit is left to refuse in the reader" {
+    let body = probe_body("cg_stmt_value_short_circuit", #"fn main() {
+    let c = 1
+    let held = c > 0 && (if c > 1 { true } else { false })
+    let _keep = [held]
+}
+"#, "main")
+    assert_eq_str("reader shape", shape(body),
+        "Block(Let(Const), Let(Const), Let(ContainerNew(VarRef)))")
+    assert_eq_str("refusal", last_ice(), "UnmaterialisedValueExpr")
+    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+}
+
+test "an if in a loop test is left to refuse in the reader" {
+    let body = probe_body("cg_stmt_value_loop_test", #"fn main() {
+    let mut c = 1
+    while (if c > 0 { true } else { false }) { c = c - 1 }
+}
+"#, "main")
+    assert_eq_str("reader shape", shape(body),
+        "Block(Let(Const), Loop(Block(If(Binary(Const, Const), Block(Break)), Block(Assign(VarRef, Binary(VarRef, Const))))))")
+    assert_eq_str("refusal", last_ice(), "UnmaterialisedValueExpr")
+    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+}
+
+test "an if in a match guard is left to refuse in the reader" {
+    let body = probe_body("cg_stmt_value_guard", #"fn main() {
+    let c = 1
+    let picked = match c {
+        n if (if c > 0 { true } else { false }) => n
+        _ => 20
+    }
+    let _keep = [picked]
+}
+"#, "main")
+    assert_eq_str("reader shape", shape(body),
+        "Block(Let(Const), Let, Block(Let(VarRef), Let(Const), If(Binary(VarRef, Const), Block(Let(VarRef), If(Const, Block(Assign(VarRef, Const), Block(Assign(VarRef, VarRef)))))), If(Binary(VarRef, Const), Block(Assign(VarRef, Const), Block(Assign(VarRef, Const)))), If(Binary(VarRef, Const), Block(Unreachable))), Let(VarRef), Let(ContainerNew(VarRef)))")
+    assert_eq_str("refusal", last_ice(), "UnmaterialisedValueExpr")
+    assert_eq_str("refusals recorded",
+        "{ice_count_exactly("UnmaterialisedValueExpr", "IfExpr in value position was not materialised")}", "1")
+}
+
+// A temp stands at the top of the block, so an arm moved into it runs before everything
+// the source wrote after the point the arm came from. That is only safe when nothing
+// earlier in the statement can decide the arm never runs.
+
+test "an if standing after a question mark refuses by name" {
+    let body = probe_fn("cg_stmt_value_after_try", #"fn pick(h: Option[Int], d: Int) -> Option[Int] {
+    let x = h? + (if d == 0 { 1 } else { 2 })
+    Some(x)
+}
+"#, "pick")
+    assert_eq_str("block shape", shape(body), "Block")
+    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
+    assert_eq_str("refusals recorded",
+        "{ice_count_exactly("ValuePositionExprMovesWork", "IfExpr in value position stands after work its arms would run before")}", "1")
+}
+
+test "an if standing after a call refuses by name" {
+    let body = probe_fn("cg_stmt_value_after_call", #"fn g(n: Int) -> Int { n }
+fn main() {
+    let c = 1
+    let pair = (g(1), if c > 0 { 2 } else { 3 })
+    let _keep = [pair]
+}
+"#, "main")
+    assert_eq_str("block shape", shape(body), "Block")
+    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
+    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+}
+
+test "an if standing after a literal is materialised" {
+    let body = probe_fn("cg_stmt_value_after_literal", #"fn main() {
+    let c = 1
+    let x = 1 + (if c > 0 { 2 } else { 3 })
+    let _keep = [x]
+}
+"#, "main")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(Binary(Const, VarRef)), Let(ContainerNew(VarRef)))")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}
+
+// The mirror of the refusal above: the `?` stands after the `if`, so the arms already run
+// first in the source, and the temp changes nothing about the order.
+test "a question mark standing after an if keeps its guard below the arms" {
+    let body = probe_fn("cg_stmt_value_try_after", #"fn pick(h: Option[Int], d: Int) -> Option[Int] {
+    let x = (if d == 0 { 1 } else { 2 }) + h?
+    Some(x)
+}
+"#, "pick")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(VarRef), If(Binary(CarrierTag(VarRef), Const), Block(Return(CarrierWrap(Const)))), Let(Binary(VarRef, CarrierUnwrap(VarRef))), Return(CarrierWrap(Const, VarRef)))")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}
+
+// A shape the walk does not know is work, so nothing after it is moved. A list spread
+// copies its source, and the walk knows nothing about when that copy runs.
+test "an if standing after a shape the walk does not know refuses by name" {
+    let body = probe_fn("cg_stmt_value_after_spread", #"fn main() {
+    let c = 1
+    let head = [1, 2]
+    let joined = [..head, if c > 0 { 1 } else { 2 }]
+    let _keep = [joined]
+}
+"#, "main")
+    assert_eq_str("block shape", shape(body), "Block")
+    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
+    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+}
+
+// The literal writes `b` and leaves `a` to its default, and the default runs between the
+// fields in declaration order. So an arm hoisted above the literal would run before it.
+test "an if in a struct literal field refuses by name" {
+    let body = probe_fn("cg_stmt_value_struct_field", #"type Cfg { a: Int = 7, b: Int }
+fn main() {
+    let c = 1
+    let made = Cfg { b: if c > 0 { 1 } else { 2 } }
+    let _keep = [made]
+}
+"#, "main")
+    assert_eq_str("refusal", last_ice(), "UnmaterialisedValueExpr")
+    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+    assert_eq_str("body", "{body < 0}", "false")
+}
+
+// The condition lowers inside the `if` the temp stands under, so it keeps its place ahead
+// of the arms and the work it holds moves nothing.
+test "a checked read in the condition does not refuse the if it belongs to" {
+    let body = probe_fn("cg_stmt_value_read_head", #"fn main() {
+    let xs = [1, 2]
+    let x = if xs[0] > 0 { 1 } else { 2 }
+    let _keep = [x]
+}
+"#, "main")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(ContainerNew(Const, Const)), Let, If(Binary(Cast(CallRuntime(VarRef, Const)), Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(VarRef), Let(ContainerNew(VarRef)))")
+}
+
+// Each temp stands under the one minted before it, in the order the source wrote them, so
+// the arms of the first do not put the second out of reach.
+test "a second if materialises after one whose arms hold work" {
+    let body = probe_fn("cg_stmt_value_two_temps", #"fn main() {
+    let c = 1
+    let xs = [1, 2]
+    let pair = (if c > 0 { xs[0] } else { xs[1] }, if c > 1 { 3 } else { 4 })
+    let _keep = [pair]
+}
+"#, "main")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let(ContainerNew(Const, Const)), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Cast(CallRuntime(VarRef, Const)))), Block(Assign(VarRef, Cast(CallRuntime(VarRef, Const))))), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(TupleNew(VarRef, VarRef)), Let(ContainerNew(VarRef)))")
+}
+
+test "an if standing after a name read refuses by name" {
+    let body = probe_fn("cg_stmt_value_after_read", #"fn main() {
+    let c = 1
+    let a = 5
+    let x = [a, if c > 0 { 1 } else { 2 }]
+    let _keep = [x]
+}
+"#, "main")
+    assert_eq_str("block shape", shape(body), "Block")
+    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
+    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+}
+
+test "an if standing after an operator refuses by name" {
+    let body = probe_fn("cg_stmt_value_after_binop", #"fn main() {
+    let c = 1
+    let x = [1 / 2, if c > 0 { 1 } else { 2 }]
+    let _keep = [x]
+}
+"#, "main")
+    assert_eq_str("block shape", shape(body), "Block")
+    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
+    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+}
+
+test "an if standing after a string with a hole refuses by name" {
+    let body = probe_fn("cg_stmt_value_after_interp", #"fn main() {
+    let c = 1
+    let x = ("{c}", if c > 0 { 1 } else { 2 })
+    let _keep = [x]
+}
+"#, "main")
+    assert_eq_str("block shape", shape(body), "Block")
+    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
+    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+}
+
+test "an if standing after a method call refuses by name" {
+    let body = probe_fn("cg_stmt_value_after_method", #"fn main() {
+    let c = 1
+    let x = (1.to_str(), if c > 0 { 1 } else { 2 })
+    let _keep = [x]
+}
+"#, "main")
+    assert_eq_str("block shape", shape(body), "Block")
+    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
+    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+}
+
+test "an if standing after a checked read refuses by name" {
+    let body = probe_fn("cg_stmt_value_after_index", #"fn main() {
+    let c = 1
+    let x = ([1, 2][0], if c > 0 { 1 } else { 2 })
+    let _keep = [x]
+}
+"#, "main")
+    assert_eq_str("block shape", shape(body), "Block")
+    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
+    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+}
+
+test "an if standing after a unary operator refuses by name" {
+    let body = probe_fn("cg_stmt_value_after_unary", #"fn main() {
+    let c = 1
+    let x = (-1, if c > 0 { 1 } else { 2 })
+    let _keep = [x]
+}
+"#, "main")
+    assert_eq_str("block shape", shape(body), "Block")
+    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
+    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+}
