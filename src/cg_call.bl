@@ -858,6 +858,9 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if declared != "" { return lower_intrinsic_method(node, obj, kind, mname, declared) }
     let primitive = cc_runtime_method(kind, mname)
     if primitive != "" { return cc_lower_runtime_method(node, obj, kind, mname, primitive) }
+    let keyed = cc_keyed_row(kind, mname)
+    if keyed.op != "" { return cc_lower_keyed_method(node, obj, kind, mname, keyed) }
+    if cc_is_map_slot_method(kind, mname) { return cc_map_slot_method(node, obj, kind, mname) }
     if cc_is_scalar_cast(kind, mname) { return cc_scalar_cast(node, obj, kind, mname) }
     if cc_is_char_text(kind, mname) { return cc_char_text(node, obj, kind, mname) }
     if cc_is_carrier_test(kind, mname) { return cc_carrier_test(node, obj, kind, mname) }
@@ -986,6 +989,236 @@ fn cc_runtime_method_arity(op: Str) -> Int {
     if op == "list_push" { return 1 }
     if op == "list_set" { return 2 }
     NO_ARITY
+}
+
+// ── Keyed containers ──────────────────────────────────────────────────────
+//
+// A Map and a Set hold their keys behind a table of the operations the runtime compares
+// and hashes them by. That table is chosen from the key type and baked into the value when
+// it is constructed, and every entry point reads it back off the receiver, so no method
+// passes one. What the key type decides here is only how the key ARGUMENT travels, because
+// the runtime takes every key as an address it may copy bytes out of.
+//
+// These rows are read before the impls for the same reason the intrinsic table is. The
+// standard library declares most of these methods on a `key: Str` parameter while
+// typecheck answers them for every key type, so a call with an Int key that reached those
+// declarations would pass an integer where the declaration says pointer, and the runtime
+// would read the integer as an address.
+
+// How a key argument reaches the runtime.
+//
+// Skipped: the argument is not a key at all, so it is lowered as written. Value: the
+// runtime reads the slot's pointer as the key itself, which it does for a Str and for
+// nothing else. Address: the entry point reads the key through the address it is given
+// and keeps nothing after it answers, so a local it reads from is enough, and every
+// lookup travels this way whatever the key's width. Boxed: the slot keeps the pointer,
+// so what it points at has to outlive the call, which is what a store puts there.
+type KeyTravel { Skipped, Value, Address, Boxed }
+
+type KeyPlan { travel: KeyTravel  tid: Int  value: LayoutRecord  slot: LayoutRecord }
+
+fn cc_key_stopped(p: KeyPlan) -> Bool { p.tid < 0 }
+
+// A key type with no table. The table is chosen from the key type alone: a builtin scalar
+// has one the runtime ships, a struct or an enum earns one by deriving Hash, and every
+// other type has none at all. A call on such a key has nothing to reach the runtime
+// through, whichever of those left it without one.
+fn cc_key_has_no_ops(node: Int, key_tid: Int) -> Int ! Diag.Report {
+    diag_ice_at("KeyOperationsNotAvailable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "a {tk_name(cc_kind(key_tid))} key has no table of the operations it is compared and hashed by",
+        node, "typecheck must reject a key type with no such table; this is a compiler bug")
+    -1
+}
+
+// A key the slot does not hold inline and does not hold as a pointer either. Layout answers
+// one of the two for every key that has a table, so a third answer is a broken invariant
+// rather than a shape this stage could build for.
+fn cc_key_slot_not_pointer(node: Int, key_tid: Int) -> Int ! Diag.Report {
+    diag_ice_at("KeySlotFormNotLowered", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "a {tk_name(cc_kind(key_tid))} key is neither stored inline nor stored behind a pointer",
+        node, "layout answers a key slot with one of those two forms; this is a compiler bug")
+    -1
+}
+
+// Every layout question a key raises, asked in one place and before anything is built.
+fn cc_key_plan(node: Int, container: Int, kind: TyKind, row: KeyedRow) -> KeyPlan ! Diag.Report {
+    let nothing = layout_of(-1, Position.Local)
+    let stopped = KeyPlan { travel: KeyTravel.Skipped, tid: -1, value: nothing, slot: nothing }
+    if !row.keyed { return KeyPlan { travel: KeyTravel.Skipped, tid: 0, value: nothing, slot: nothing } }
+    let key = child_tid(container, Slot.Inner1)
+    if key < 0 {
+        cc_element_type_unrecorded(node, kind)
+        return stopped
+    }
+    let value = cc_local(key, node)
+    if cc_stopped(value) { return stopped }
+    if value.kops_table == "" {
+        cc_key_has_no_ops(node, key)
+        return stopped
+    }
+    if cc_kind(key) == TyKind.Str {
+        return KeyPlan { travel: KeyTravel.Value, tid: key, value: value, slot: value }
+    }
+    if value.kops_inline_key {
+        return KeyPlan { travel: KeyTravel.Address, tid: key, value: value, slot: value }
+    }
+    let slot = cc_element_layout(node, key, Position.ContainerSlot)
+    if cc_stopped(slot) { return stopped }
+    if slot.slot_form != SlotForm.PointerBoxed {
+        cc_key_slot_not_pointer(node, key)
+        return stopped
+    }
+    // A key wider than a word is written by its own spelling wherever it is declared,
+    // whether that is the heap copy a store leaves behind or the local a lookup is read
+    // from, and for a carrier that spelling names a typedef the unit has to declare first.
+    ensure_typedef_for(key)
+    // Only a store leaves the key somewhere the container keeps reading. A lookup is
+    // answered before it returns, so it hands over the address of a local and allocates
+    // nothing, which is what every entry point but a store is owed.
+    if !row.retains { return KeyPlan { travel: KeyTravel.Address, tid: key, value: value, slot: slot } }
+    KeyPlan { travel: KeyTravel.Boxed, tid: key, value: value, slot: slot }
+}
+
+// The address an entry point reads the key through is the address of a local. Two things
+// about that local are load-bearing. It is declared by the KEY's spelling and not by the
+// argument's, so the bytes behind the address are the width the table was built to read.
+// And it is bound as a statement the enclosing expression can see, so a guarded operand
+// stays guarded: a value left for the printer to bind lands ahead of the test that was
+// written to skip it.
+fn cc_key_address(node: Int, plan: KeyPlan, value: Int) -> Int ! Diag.Report {
+    let name = c_mint_local("k")
+    // The declaration, the read and the address are one fact about the local written three
+    // times, so they are spelled from one answer and cannot come apart.
+    let spelling = plan.value.c_spelling
+    let form = plan.value.slot_form
+    cg_expr_push_pending(node, ir_let(plan.tid, node, spelling, name, form, value))
+    let held = ir_var_ref(plan.tid, node, spelling, name, form)
+    // The node answers an address while it is spelled by what the address points at,
+    // because layout mints no pointer spelling for a key. Its operand is already a name,
+    // so the printer writes this node in place and never reads the spelling back.
+    ir_unary(plan.tid, node, spelling, "&", held)
+}
+
+fn cc_key_arg(node: Int, plan: KeyPlan, written: Int) -> Int ! Diag.Report {
+    let a = lower_expr(written)
+    if a < 0 { return -1 }
+    match plan.travel {
+        KeyTravel.Skipped => a
+        KeyTravel.Value => a
+        KeyTravel.Address => cc_key_address(node, plan, a)
+        KeyTravel.Boxed => ir_box(plan.tid, node, plan.slot.c_spelling, plan.value.c_spelling, a)
+    }
+}
+
+// What the runtime hands back, and what the call answers with it.
+//
+// Truth: the entry point answers a flag as an integer and the call answers whether it was
+// not zero. Empty: the entry point answers a count and the call answers whether it was
+// zero. Plain: what the entry point answers is what the call answers.
+type KeyedForm { Truth, Empty, Plain }
+
+// One row: the runtime entry point, how many arguments the call is written with, whether
+// the first of them is a key, whether the entry point keeps that key after it answers,
+// and what shape the answer takes coming back.
+type KeyedRow { op: Str  arity: Int  keyed: Bool  retains: Bool  form: KeyedForm }
+
+fn cc_keyed_none() -> KeyedRow {
+    KeyedRow { op: "", arity: 0, keyed: false, retains: false, form: KeyedForm.Plain }
+}
+
+fn cc_keyed_row(kind: TyKind, method: Str) -> KeyedRow {
+    if kind == TyKind.Map {
+        if method == "contains_key" { return KeyedRow { op: "map_has", arity: 1, keyed: true, retains: false, form: KeyedForm.Truth } }
+        if method == "contains" { return KeyedRow { op: "map_has", arity: 1, keyed: true, retains: false, form: KeyedForm.Truth } }
+        if method == "remove" { return KeyedRow { op: "map_remove", arity: 1, keyed: true, retains: false, form: KeyedForm.Truth } }
+        if method == "len" { return KeyedRow { op: "map_len", arity: 0, keyed: false, retains: false, form: KeyedForm.Plain } }
+        if method == "is_empty" { return KeyedRow { op: "map_len", arity: 0, keyed: false, retains: false, form: KeyedForm.Empty } }
+        if method == "clear" { return KeyedRow { op: "map_clear", arity: 0, keyed: false, retains: false, form: KeyedForm.Plain } }
+        if method == "keys" { return KeyedRow { op: "map_keys", arity: 0, keyed: false, retains: false, form: KeyedForm.Plain } }
+        if method == "values" { return KeyedRow { op: "map_values", arity: 0, keyed: false, retains: false, form: KeyedForm.Plain } }
+        return cc_keyed_none()
+    }
+    if kind == TyKind.Set {
+        // The one entry point here that keeps what it is handed: a set stores the item it
+        // is given, and every other row has finished with the key by the time it answers.
+        if method == "insert" { return KeyedRow { op: "set_insert", arity: 1, keyed: true, retains: true, form: KeyedForm.Truth } }
+        if method == "contains" { return KeyedRow { op: "set_contains", arity: 1, keyed: true, retains: false, form: KeyedForm.Truth } }
+        if method == "remove" { return KeyedRow { op: "set_remove", arity: 1, keyed: true, retains: false, form: KeyedForm.Truth } }
+        if method == "len" { return KeyedRow { op: "set_len", arity: 0, keyed: false, retains: false, form: KeyedForm.Plain } }
+        if method == "is_empty" { return KeyedRow { op: "set_len", arity: 0, keyed: false, retains: false, form: KeyedForm.Empty } }
+        // A union takes the other SET, not a key, so its argument is lowered as written.
+        if method == "union" { return KeyedRow { op: "set_union", arity: 1, keyed: false, retains: false, form: KeyedForm.Plain } }
+        return cc_keyed_none()
+    }
+    cc_keyed_none()
+}
+
+// The two Map methods that move a value through the slot beside the key. A store puts one
+// in and a read takes one out, and both need the answer layout does not have yet: what a
+// value BECOMES going into the slot word. Asking that question here is what counts these
+// two with every other store blocked on the same answer, rather than under a blanket name
+// that says only that the method is missing.
+fn cc_is_map_slot_method(kind: TyKind, method: Str) -> Bool {
+    kind == TyKind.Map && (method == "insert" || method == "get")
+}
+
+fn cc_map_slot_not_built(node: Int, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("MapSlotMethodNotLowered", CODEGEN_STAGE_NOT_BUILT,
+        "'Map.{method}' moves a value through the slot beside the key, and no node builds that", node,
+        "the IR needs a keyed store, and a keyed read that answers the value wrapped")
+    -1
+}
+
+// A store is blocked on one answer: what the value becomes going into the slot word. A read
+// is blocked on that answer AND on the carrier it wraps what it took out in, so naming the
+// slot word as its blocker would count it against a seam that would not finish it.
+fn cc_map_slot_method(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    let container = tid_of_node(obj)
+    if container < 0 { return -1 }
+    let held = child_tid(container, Slot.Inner2)
+    if held < 0 { return cc_element_type_unrecorded(node, kind) }
+    if method != "insert" { return cc_map_slot_not_built(node, method) }
+    // Asked of layout rather than of the element shape, because the shape queues the
+    // element's typedef into the unit and this path answers with a refusal either way.
+    let slot = cc_element_layout(node, held, Position.ContainerSlot)
+    if cc_stopped(slot) { return -1 }
+    if slot.slot_form != SlotForm.PointerBoxed { return cc_element_slot_word(node, held) }
+    cc_map_slot_not_built(node, method)
+}
+
+fn cc_lower_keyed_method(node: Int, obj: Int, kind: TyKind, method: Str, row: KeyedRow) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if row.arity != given { return cc_intrinsic_arity_wrong(node, kind, method, row.arity, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let container = tid_of_node(obj)
+    if container < 0 { return -1 }
+    let answer = cc_local(tid, node)
+    if cc_stopped(answer) { return -1 }
+    let plain = row.form == KeyedForm.Plain
+    // A row that reshapes the answer reads an integer back and compares it, so it needs the
+    // spelling of that integer as well as the spelling of what it answers. A row that hands
+    // back what the entry point answered needs neither, so it is not held to them.
+    let g = cc_guard_spellings(node)
+    if !plain && cc_guard_stopped(g) { return -1 }
+    let plan = cc_key_plan(node, container, kind, row)
+    if cc_key_stopped(plan) { return -1 }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    let mut args = [recv]
+    if row.arity == 1 {
+        let a = cc_key_arg(node, plan, sublist_get(node_args(node), 0))
+        if a < 0 { return -1 }
+        args.push(a)
+    }
+    let call = ir_call_runtime(
+        if plain { tid } else { TYPE_INT }, node,
+        if plain { answer.c_spelling } else { g.tag },
+        c_runtime_helper(row.op),
+        if plain { answer.slot_form } else { SlotForm.InlineWord }, args)
+    if plain { return call }
+    let op = if row.form == KeyedForm.Truth { "!=" } else { "==" }
+    ir_binary(tid, node, answer.c_spelling, op, call, ir_const(TYPE_INT, node, g.tag, "0"))
 }
 
 // ── Scalar conversions ────────────────────────────────────────────────────
