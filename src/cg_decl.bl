@@ -13,21 +13,23 @@
 
 import diagnostics.{
     Diag, diag_ice, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
-    UNSOLVED_TYPEVAR_AT_CODEGEN,
+    CODEGEN_STAGE_NOT_BUILT, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 import layout.{
-    LayoutRecord, Position, layout_of, field_layout_of, ensure_typedef_for,
+    LayoutRecord, Position, SlotForm, layout_of, field_layout_of, ensure_typedef_for,
     layout_take_typedefs, tid_of_node,
 }
 import cname.{
-    c_ev_field_name, c_ev_type_name, c_ffi_symbol, c_field_name, c_fn_decl_name,
+    c_ev_field_name, c_ev_type_name, c_ffi_struct_ptr_name, c_ffi_symbol, c_field_name,
+    c_fn_decl_name, cname_ffi_struct_mirror,
     c_global_name, c_vtable_type_name,
     c_impl_method_name, c_local_name, c_type_decl_name, c_variant_ordinal,
     c_variant_tag_macro,
     cname_is_runtime_owned, td_guard_name,
 }
 import cg_print.{
-    print_ev, print_epilogue, print_fn, print_fn_decl, print_global_decl, print_prologue,
+    print_ev, print_epilogue, print_fn, print_fn_decl, print_foreign_decl, print_global_decl,
+    print_prologue, print_prologue_declares,
     print_simple_enum_typedef, print_struct_typedef, print_tagged_enum_typedef,
     print_typedef_blocks,
 }
@@ -35,6 +37,7 @@ import cg_reg.{
     cg_reg_effect_decls, cg_reg_entry_point, cg_reg_fn_decls, cg_reg_global_decls,
     cg_reg_impl_methods, cg_reg_impl_of, cg_reg_tid_for_decl, cg_reg_type_decls,
 }
+import ir.{ir_block, ir_call_direct, ir_cast, ir_expr_stmt, ir_return, ir_var_ref}
 import mono.{is_poly_impl, poly_impl_is_element_agnostic}
 import typecheck.{
     TyKind, tc_enum_variant_slots, tc_evar_field_slots, tc_evar_name, tc_evfield_name,
@@ -255,9 +258,14 @@ pub fn cg_decl_takes_ev(fn_node: Int) -> Bool {
 
 // A function with no return annotation returns the void type, which the reading layer
 // already spells for the return position; naming that spelling here would be a twin.
-fn fn_ret_spelling(fn_node: Int) -> Str ! Diag.Report {
+fn fn_ret_tid(fn_node: Int) -> Int ! Diag.Report {
     let ann = node_type_ann(fn_node)
-    let tid = if ann == -1 { tc_void_tid() } else { tid_of_node(ann) }
+    if ann == -1 { return tc_void_tid() }
+    tid_of_node(ann)
+}
+
+fn fn_ret_spelling(fn_node: Int) -> Str ! Diag.Report {
+    let tid = fn_ret_tid(fn_node)
     flush_member_typedefs(tid)
     cg_decl_require_spelling(tid, Position.Return)
 }
@@ -452,6 +460,127 @@ fn site_is_declared(site: BodySite) -> Bool {
 
 pub fn cg_decl_emit_fn_def(fn_node: Int, is_static: Bool, body: Int) ! Diag.Report {
     cg_decl_emit_signature_def(fn_node, decl_c_name(fn_node), is_static, body)
+}
+
+// ── Foreign wrappers ─────────────────────────────────────────────────────────
+//
+// A binding declares a Blink signature over a C symbol and has no Blink body, so the body
+// this stage writes is the whole conversion: the wrapper's own parameters, handed to the
+// foreign symbol in the shape C reads them, and the answer handed straight back. The
+// signature is the developer's claim about what the foreign function expects, so an
+// argument crosses unchanged unless C would read it as a different type.
+//
+// Which declaration the call is checked against decides the rest. A symbol the prologue
+// already declares is checked against the real header, so an @ffi.struct mirror has to be
+// cast to the C struct that header names. A symbol nothing declares is checked against the
+// prototype written here from the Blink signature, so the same argument crosses under the
+// mirror's own spelling and needs no cast.
+pub fn cg_decl_emit_foreign_wrapper(fn_node: Int) ! Diag.Report {
+    let symbol = c_ffi_symbol(fn_node)
+    let declared = print_prologue_declares(symbol)
+    if declared && !foreign_shapes_convertible(fn_node) { return }
+    let ret = fn_ret_spelling(fn_node)
+    let params = fn_param_decls(fn_node)
+    if !declared { print_foreign_decl(ret, symbol, params) }
+    let args = foreign_call_args(fn_node, declared)
+    print_fn(false, ret, decl_c_name(fn_node), params, cg_decl_takes_ev(fn_node),
+        foreign_call_block(fn_node, symbol, ret, args))
+}
+
+// A value-returning wrapper that drops the call's answer falls off the end of a function
+// whose signature promises one, so the return type decides the statement, not the call.
+fn foreign_call_block(fn_node: Int, symbol: Str, ret: Str, args: List[Int]) -> Int ! Diag.Report {
+    let tid = fn_ret_tid(fn_node)
+    let call = ir_call_direct(tid, fn_node, ret, symbol, SlotForm.Inline, args)
+    let stmt = if tid == tc_void_tid() { ir_expr_stmt(fn_node, call) } else { ir_return(fn_node, call) }
+    ir_block(fn_node, [stmt])
+}
+
+fn foreign_call_args(fn_node: Int, declared: Bool) -> List[Int] ! Diag.Report {
+    let mut out: List[Int] = []
+    let sl = node_params(fn_node)
+    if sl == -1 { return out }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        let p = sublist_get(sl, i)
+        let tid = tid_of_node(p)
+        let rec = layout_of(tid, Position.Param)
+        let arg = ir_var_ref(tid, p, spelling_or_ice(rec, tc_type_str(tid)),
+            c_local_name(node_name(p)), rec.slot_form)
+        let mirror = if declared { ptr_mirror_decl(tid) } else { -1 }
+        out.push(if mirror >= 0 { ir_cast(tid, p, c_ffi_struct_ptr_name(mirror), arg) } else { arg })
+        i = i + 1
+    }
+    out
+}
+
+// The @ffi.struct mirror a Ptr points at, as its declaration node, or -1.
+fn ptr_mirror_decl(tid: Int) -> Int {
+    let r = tc_resolve(tid)
+    if tc_tid_kind(r) != TyKind.Ptr { return -1 }
+    if tc_tid_child_count(r) == 0 { return -1 }
+    let decl = tc_tid_decl_node(tc_resolve(tc_tid_child(r, 0)))
+    if cname_ffi_struct_mirror(decl) && c_ffi_struct_ptr_name(decl) != "" { return decl }
+    -1
+}
+
+// The @ffi.struct mirror a value of this type is, as its declaration node, or -1.
+fn value_mirror_decl(tid: Int) -> Int {
+    let r = tc_resolve(tid)
+    if tc_tid_kind(r) == TyKind.Ptr { return -1 }
+    let decl = tc_tid_decl_node(r)
+    if cname_ffi_struct_mirror(decl) { return decl }
+    -1
+}
+
+// Every position whose C shape this stage can write when the call is checked against the
+// real header. Each position that refuses says so once and by name, so the count reads the
+// number of shapes in the way rather than the number of wrappers that went missing.
+fn foreign_shapes_convertible(fn_node: Int) -> Bool ! Diag.Report {
+    let mut ok = true
+    let sl = node_params(fn_node)
+    let n = if sl == -1 { 0 } else { sublist_length(sl) }
+    let mut i = 0
+    while i < n {
+        let p = sublist_get(sl, i)
+        if !param_shape_convertible(tid_of_node(p), p) { ok = false }
+        i = i + 1
+    }
+    if !return_shape_convertible(fn_node) { ok = false }
+    ok
+}
+
+// A mirror crossing by value has no conversion: C forbids a cast between two struct types,
+// so the wrapper would hand the foreign function the wrong type under a name that compiles.
+// A mirror that names no C struct cannot be spelled as the original at all.
+fn param_shape_convertible(tid: Int, site: Int) -> Bool ! Diag.Report {
+    let byval = value_mirror_decl(tid)
+    if byval >= 0 { return refuse_foreign_shape(site, "a value of the @ffi.struct type {node_name(byval)}") }
+    let r = tc_resolve(tid)
+    if tc_tid_kind(r) != TyKind.Ptr { return true }
+    if tc_tid_child_count(r) == 0 { return true }
+    let pointee = tc_tid_decl_node(tc_resolve(tc_tid_child(r, 0)))
+    if !cname_ffi_struct_mirror(pointee) { return true }
+    if c_ffi_struct_ptr_name(pointee) != "" { return true }
+    refuse_foreign_shape(site, "a pointer to the @ffi.struct type {node_name(pointee)}, which names no C struct")
+}
+
+// The answer comes back under the foreign spelling, and this stage writes no conversion on
+// the way out, so a return that reaches a mirror at all is refused rather than mis-spelled.
+fn return_shape_convertible(fn_node: Int) -> Bool ! Diag.Report {
+    let tid = fn_ret_tid(fn_node)
+    let byval = value_mirror_decl(tid)
+    if byval >= 0 { return refuse_foreign_shape(fn_node, "a returned value of the @ffi.struct type {node_name(byval)}") }
+    let ptr = ptr_mirror_decl(tid)
+    if ptr < 0 { return true }
+    refuse_foreign_shape(fn_node, "a returned pointer to the @ffi.struct type {node_name(ptr)}")
+}
+
+fn refuse_foreign_shape(site: Int, what: Str) -> Bool ! Diag.Report {
+    diag_ice_at("ForeignShapeNotConvertible", CODEGEN_STAGE_NOT_BUILT,
+        "cg foreign wrapper bodies cannot convert {what} for a foreign function the prologue already declares",
+        site, "pass the type through a Ptr and give its @ffi.struct annotation a name: argument")
+    false
 }
 
 // ── Globals ──────────────────────────────────────────────────────────────────
