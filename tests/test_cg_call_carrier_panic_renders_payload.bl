@@ -1,0 +1,343 @@
+// The panic a carrier read leaves behind when the arm it is about to read is not the arm
+// the value holds.
+//
+// An Option read has nothing to say about the value: None carries none. A Result read does.
+// `unwrap` panics on Err and `unwrap_err` panics on Ok, and in both the message names the
+// value it panicked on, so the program that catches one is told which error it was and not
+// merely that there was one.
+//
+// Naming that value is a rendering, and the only rendering this compiler has is the one an
+// interpolation hole performs: a conversion layout answers for the type, or, for a type no
+// conversion prints, the Display impl typecheck proved exists. These tests hold the panic
+// path to that same route. A type with no conversion and no impl is refused by name here,
+// never rendered as its own type name, because a message naming the type instead of the
+// value tells the reader nothing the static type did not already say.
+import lower_test_helpers.{
+    probe, rhs_of, ident_node_of, assert_eq_str, assert_shape, assert_verifies,
+    assert_ice_saying,
+}
+import ir.{ir_c_name, ir_c_spelling, ir_kid}
+import layout.{layout_of, tid_of_node, Position}
+import typecheck.{TYPE_STR}
+import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
+import cg_call.{lower_display_of_value}
+import diagnostics.{Diag}
+import std.io
+
+// A carrier read leaves two statements: it binds the receiver once, then guards that
+// binding. The guard is the second, and a read that left any other number of statements
+// has stopped being the shape these tests are about.
+fn guard_after(mark: Int) -> Int {
+    let stmts = cg_expr_take_pending(mark)
+    if stmts.len() != 2 {
+        io.println("FAIL: a carrier read left {stmts.len()} statements, want 2")
+        assert(false)
+        return -1
+    }
+    stmts.get(1).unwrap()
+}
+
+// The guard is `If(cond, Block(Panic(message)))`, so the message is three kids in.
+fn message_of(guard: Int) -> Int {
+    ir_kid(ir_kid(ir_kid(guard, 1), 0), 0)
+}
+
+// The format the panic is built from, and the value it renders into it. Reading them as a
+// pair keeps every test from spelling the same two descents.
+fn format_of(message: Int) -> Str { ir_c_name(ir_kid(message, 0)) }
+fn rendered_of(message: Int) -> Int { ir_kid(message, 1) }
+
+// The tag the guard tests for. The condition is `CarrierTag(u) == <tag>`, so the number it
+// is compared against is the second kid.
+fn panicked_tag_of(guard: Int) -> Str { ir_c_name(ir_kid(ir_kid(guard, 0), 1)) }
+
+// The whole read, with the statements it hoisted left in place for the caller to count.
+fn lower_counting(name: Str) -> Int ! Diag.Report {
+    let mark = cg_expr_pending_count()
+    let built = lower_expr(rhs_of(name))
+    let left = cg_expr_pending_count() - mark
+    if built < 0 {
+        assert_eq_str("a refusal hoists nothing", "{left}", "0")
+    }
+    let _drop = cg_expr_take_pending(mark)
+    built
+}
+
+fn lower_guarded(name: Str) -> Int ! Diag.Report {
+    let mark = cg_expr_pending_count()
+    let built = lower_expr(rhs_of(name))
+    assert(built >= 0)
+    guard_after(mark)
+}
+
+// ── The message names the value ───────────────────────────────────────────
+
+test "an unwrap panics on Err and renders the Err value into the message" {
+    probe("panic_err_str", #"fn main() {
+    let r: Result[Int, Str] = Ok(1)
+    let v = r.unwrap()
+}
+"#)
+    let message = message_of(lower_guarded("v"))
+    assert_eq_str("built by the formatter", ir_c_name(message), "blink_str_format")
+    assert_eq_str("names the arm it panicked on and renders its value",
+        format_of(message), "\"panic: unwrap called on Err: %s at %s:%s\"")
+}
+
+test "an unwrap_err panics on Ok and renders the Ok value into the message" {
+    probe("panic_ok_int", #"fn main() {
+    let r: Result[Int, Str] = Ok(1)
+    let e = r.unwrap_err()
+}
+"#)
+    let message = message_of(lower_guarded("e"))
+    assert_eq_str("names the arm it panicked on and renders its value",
+        format_of(message), "\"panic: unwrap_err called on Ok: %lld at %s:%s\"")
+}
+
+// The value the message renders and the value the read answers come out of one binding, so
+// an expression that produced the carrier runs once however the read turns out.
+test "the rendered value is read out of the binding the read itself reads" {
+    probe("panic_one_binding", #"fn main() {
+    let r: Result[Int, Str] = Ok(1)
+    let v = r.unwrap()
+}
+"#)
+    let mark = cg_expr_pending_count()
+    let built = lower_expr(rhs_of("v"))
+    let guard = guard_after(mark)
+    let rendered = rendered_of(message_of(guard))
+    assert_shape("rendered from the binding", rendered, "CarrierUnwrap(VarRef)")
+    assert_eq_str("the same binding the read reads",
+        ir_c_name(ir_kid(rendered, 0)), ir_c_name(ir_kid(built, 0)))
+}
+
+// ── The conversion comes from layout, and the promotion with it ───────────
+
+test "an Int payload is promoted to the width the conversion it is written with names" {
+    probe("panic_promote", #"fn main() {
+    let r: Result[Str, Int] = Ok("a")
+    let v = r.unwrap()
+}
+"#)
+    let message = message_of(lower_guarded("v"))
+    assert_eq_str("the conversion an Int is printed by",
+        format_of(message), "\"panic: unwrap called on Err: %lld at %s:%s\"")
+    assert_shape("promoted across the varargs boundary", rendered_of(message),
+        "Cast(CarrierUnwrap(VarRef))")
+}
+
+test "the file and the line travel as values, so a path is never read as a conversion" {
+    probe("panic_path_is_a_value", #"fn main() {
+    let r: Result[Int, Str] = Ok(1)
+    let v = r.unwrap()
+}
+"#)
+    let message = message_of(lower_guarded("v"))
+    assert_shape("three values follow the format", message,
+        "CallRuntime(Const, CarrierUnwrap(VarRef), Const, Const)")
+    assert_verifies("verifies", message)
+}
+
+// ── A payload no conversion prints ────────────────────────────────────────
+
+test "a payload with a Display impl renders through that impl's dispatcher" {
+    probe("panic_display", #"type Fault { code: Int }
+impl Display for Fault {
+    fn fmt(self, sb: StringBuilder) { sb.append("fault {self.code}") }
+}
+fn main() {
+    let r: Result[Int, Fault] = Ok(1)
+    let v = r.unwrap()
+}
+"#)
+    let message = message_of(lower_guarded("v"))
+    assert_eq_str("rendered as the string the impl answers",
+        format_of(message), "\"panic: unwrap called on Err: %s at %s:%s\"")
+    let rendered = rendered_of(message)
+    assert_eq_str("spelled as a string",
+        ir_c_spelling(rendered), layout_of(TYPE_STR, Position.Local).c_spelling)
+    // The carrier holds a struct arm in a box, and what the impl is given is the value, so
+    // the box is followed first. The read of the same arm follows it the same way.
+    assert_shape("called on the value the box holds", rendered, "CallDirect(Unbox(CarrierUnwrap(VarRef)))")
+}
+
+test "a payload with no conversion and no Display impl is refused, not named by its type" {
+    probe("panic_no_display", #"type Fault { code: Int }
+fn main() {
+    let r: Result[Int, Fault] = Ok(1)
+    let v = r.unwrap()
+}
+"#)
+    assert_ice_saying("no impl to render it", lower_expr(rhs_of("v")), "PanicPayloadHasNoDisplay",
+        "will not name it by its type instead")
+}
+
+test "a payload that renders from its parts is refused under a name that says so" {
+    probe("panic_structural", #"fn main() {
+    let r: Result[Int, List[Int]] = Ok(1)
+    let v = r.unwrap()
+}
+"#)
+    assert_ice_saying("renders from its parts", lower_expr(rhs_of("v")),
+        "PanicPayloadNotRendered", "renders from its parts")
+}
+
+// A Bool is written with the conversion strings are written with and is not a string, so
+// its text has to be built first. Building it takes a statement, and a guard holds one
+// expression, so this stage refuses rather than hoisting a statement into a panic.
+test "a Bool payload, whose text needs a statement, is refused under its own name" {
+    probe("panic_bool", #"fn main() {
+    let r: Result[Int, Bool] = Ok(1)
+    let v = r.unwrap()
+}
+"#)
+    assert_ice_saying("text form built elsewhere", lower_expr(rhs_of("v")),
+        "PanicPayloadTextFormNotBuilt", "into text")
+}
+
+// ── The Option half is unchanged ──────────────────────────────────────────
+
+test "an Option unwrap keeps the sentence that names no value" {
+    probe("panic_none", #"fn main() {
+    let o: Option[Int] = Some(1)
+    let v = o.unwrap()
+}
+"#)
+    let message = message_of(lower_guarded("v"))
+    assert_shape("said outright, with nothing to render", message, "Const")
+    let said = ir_c_name(message)
+    if !said.contains("unwrap called on None") {
+        io.println("FAIL: a None read panics saying {said}")
+    }
+    assert(said.contains("unwrap called on None"))
+}
+
+// ── The guard tests the arm the read is not given ─────────────────────────
+//
+// Reading the arm the value does not hold is the mistake that costs nothing at compile
+// time and hands the caller the other arm's bytes at run time. Option and Result disagree
+// on which arm is numbered 1, so the number each read guards against is pinned here for
+// both of the Result methods. Without these two, swapping the arms leaves every other test
+// in this file green.
+
+test "an unwrap guards against the tag Err writes" {
+    probe("panic_tag_u", #"fn main() {
+    let r: Result[Int, Str] = Ok(1)
+    let v = r.unwrap()
+}
+"#)
+    assert_eq_str("tag", panicked_tag_of(lower_guarded("v")), "1")
+}
+
+test "an unwrap_err guards against the tag Ok writes" {
+    probe("panic_tag_ue", #"fn main() {
+    let r: Result[Int, Str] = Ok(1)
+    let e = r.unwrap_err()
+}
+"#)
+    assert_eq_str("tag", panicked_tag_of(lower_guarded("e")), "0")
+}
+
+// The message reads the arm the read did not answer. Reading the other one would render
+// the value the caller is about to be handed, and say it was the reason for the panic.
+// Both arms are written the same here, so what the test sees is the arm and not the
+// conversion the arm's type chose.
+test "the message reads the arm the read did not answer" {
+    probe("panic_arm_u", #"fn main() {
+    let r: Result[Str, Str] = Ok("a")
+    let v = r.unwrap()
+}
+"#)
+    assert_eq_str("arm", ir_c_name(rendered_of(message_of(lower_guarded("v")))), "err")
+}
+
+test "an unwrap_err message reads the Ok arm it did not answer" {
+    probe("panic_arm_ue", #"fn main() {
+    let r: Result[Str, Str] = Ok("a")
+    let e = r.unwrap_err()
+}
+"#)
+    assert_eq_str("arm", ir_c_name(rendered_of(message_of(lower_guarded("e")))), "ok")
+}
+
+// The file and the line are two different values. Passing the file twice, or a line no node
+// answered, still builds a message with three arguments in it.
+test "the file and the line the message carries are the call's own" {
+    probe("panic_where", #"fn main() {
+    let r: Result[Int, Str] = Ok(1)
+    let v = r.unwrap()
+}
+"#)
+    let message = message_of(lower_guarded("v"))
+    assert_eq_str("file", ir_c_name(ir_kid(message, 2)), "\"build/panic_where_probe.bl\"")
+    assert_eq_str("line", ir_c_name(ir_kid(message, 3)), "\"3\"")
+}
+
+// ── What a refusal costs ──────────────────────────────────────────────────
+//
+// A refusal answers -1, and the caller drops what it was building. Anything already hoisted
+// is not dropped with it: the pending buffer is spliced into the enclosing block whole, so
+// a statement left there is emitted next to an expression that was never built. Every
+// refusal this stage can reach has to be settled before the receiver is bound.
+
+test "a refused read hoists nothing" {
+    probe("panic_cost", #"type Fault { code: Int }
+fn main() {
+    let r: Result[Int, Fault] = Ok(1)
+    let v = r.unwrap()
+}
+"#)
+    assert(lower_counting("v") < 0)
+}
+
+// ── Payloads the message can and cannot name ──────────────────────────────
+
+// A Char is one code point, and the string conversion it is written with needs it turned
+// into text first. That is a pure expression, so the guard can hold it.
+test "a Char payload is turned into text and rendered" {
+    probe("panic_char", #"fn main() {
+    let r: Result[Int, Char] = Ok(1)
+    let v = r.unwrap()
+}
+"#)
+    let message = message_of(lower_guarded("v"))
+    assert_eq_str("rendered as text", format_of(message),
+        "\"panic: unwrap called on Err: %s at %s:%s\"")
+    assert_shape("turned into text first", rendered_of(message),
+        "CallRuntime(CarrierUnwrap(VarRef))")
+}
+
+// An arm holding no value has nothing for the message to name, whichever carrier it is on.
+test "a Void arm keeps the sentence that names no value" {
+    probe("panic_void", #"fn work() -> Result[Void, Str] { Ok(()) }
+fn main() {
+    let r = work()
+    let e = r.unwrap_err()
+}
+"#)
+    assert_shape("said outright", message_of(lower_guarded("e")), "Const")
+}
+
+// ── The entry a value already built is rendered through ───────────────────
+//
+// The panic path has a value and no expression to lower, and so does a test body's `?`.
+// One entry answers both; a second would be a second answer to how this compiler shows a
+// value.
+test "a value the caller already built renders through the Display entry" {
+    probe("panic_entry", #"type Fault { code: Int }
+impl Display for Fault {
+    fn fmt(self, sb: StringBuilder) { sb.append("fault {self.code}") }
+}
+fn main() {
+    let f = Fault { code: 1 }
+    let s = "{f}"
+}
+"#)
+    let value = lower_expr(ident_node_of("f"))
+    assert(value >= 0)
+    let shown = lower_display_of_value(ident_node_of("f"), tid_of_node(ident_node_of("f")), value)
+    assert_shape("called on the value it was given", shown, "CallDirect(VarRef)")
+    assert_eq_str("answers a string", ir_c_spelling(shown),
+        layout_of(TYPE_STR, Position.Local).c_spelling)
+}
