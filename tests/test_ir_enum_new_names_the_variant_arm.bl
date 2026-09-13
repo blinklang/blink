@@ -1,0 +1,222 @@
+import std.io
+import std.fs
+import ir.{
+    IrKind, ir_reset, ir_new, ir_verify, ir_kind, ir_kind_name, ir_c_name, ir_kind_is_value, ir_kind_from_name,
+    ir_all_kinds, ir_tid, ir_decl, ir_kid_count, ir_kid, ir_dump, ir_parse, ir_const, ir_var_ref,
+    ir_enum_new, ir_expr_stmt,
+}
+import layout.{SlotForm, layout_reset}
+import typecheck.{tc_type_str, tc_lookup_node_tid, check_types, lookup_named_type, tc_tid_decl_node, TYPE_INT}
+import parser.{nodes, node_fields, sublist_get}
+import cname.{c_variant_member_name, c_variant_tag_macro, c_mono_variant_tag_macro}
+import compiler.{compile_to_program}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn assert_rejects(label: Str, root: Int, needle: Str) {
+    let errs = ir_verify(root)
+    let mut hit = 0
+    for e in errs { if e.contains(needle) { hit += 1 } }
+    let joined = errs.join(" | ")
+    if hit == 0 { io.println("FAIL: {label}: no error contains '{needle}'; got: {joined}") }
+    assert_eq_int("{label} reports '{needle}'", if hit > 0 { 1 } else { 0 }, 1)
+}
+
+fn assert_valid(label: Str, root: Int) {
+    let errs = ir_verify(root)
+    let joined = errs.join(" | ")
+    if errs.len() > 0 { io.println("FAIL: {label}: {joined}") }
+    assert_eq_int("{label} verifies", errs.len(), 0)
+}
+
+// Shape has a positional payload, a named payload and no payload; Tree is generic and
+// self-recursive, so its instance tid is not its declaration's tid.
+fn probe_src() -> Str {
+    #"type Shape { Circle(Int), Rect { w: Int, h: Int }, Empty }
+type Tree[T] { Leaf(T), Node(Tree[T], Tree[T]) }
+type Point { x: Int, y: Int }
+fn main() {
+    let s = Shape.Circle(2)
+    let t: Tree[Int] = Tree.Leaf(1)
+    let p = Point { x: 1, y: 2 }
+    let _k = s
+    let _t = t
+    let _p = p
+}
+"#
+}
+
+// The probe is deleted BEFORE any assertion so a red row never leaks the file.
+// check_types resets the type pool, so the layout memo must be reset with it.
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/ir_enum_new_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    ir_reset()
+    let _ = fs.delete(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 { m.insert(tc_type_str(tid), tid) }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 { io.println("FAIL: harvested map has no tid for rendered type string '{key}'") }
+    assert(tid != -1)
+    tid
+}
+
+fn variant(type_name: Str, index: Int) -> Int {
+    sublist_get(node_fields(tc_tid_decl_node(lookup_named_type(type_name))), index)
+}
+
+fn int_const(text: Str) -> Int { ir_const(TYPE_INT, 0, "int64_t", text) }
+
+// The tag literal and the union member come from cname, the producer the enum typedef
+// uses for its _TAG macros and member names, so a literal can never disagree with it.
+fn tag(type_name: Str, v: Int) -> Int {
+    ir_const(TYPE_INT, 0, "int", c_variant_tag_macro(tc_tid_decl_node(lookup_named_type(type_name)), v))
+}
+fn mono_tag(inst_tid: Int, v: Int) -> Int { ir_const(TYPE_INT, 0, "int", c_mono_variant_tag_macro(inst_tid, v)) }
+fn member(v: Int) -> Str { c_variant_member_name(v) }
+fn arm(tid: Int, type_name: Str, v: Int, payload: List[Int]) -> Int {
+    ir_enum_new(tid, 0, "blink_{type_name}", v, member(v), tag(type_name, v), payload)
+}
+
+// A variant with a payload is one arm of a tagged union: the tag beside the union member
+// the tag selects, and that member holds one field per payload element. The node carries
+// the variant's declaration node and the enum tid, so the printer can ask cname for the
+// arm's spelling and no name string is carried in the tree.
+test "an enum constructor node carries the variant declaration, the tag and positional payload" {
+    let _m = harvest_type_tids()
+    let shape = lookup_named_type("Shape")
+    let circle = variant("Shape", 0)
+    let n = arm(shape, "Shape", circle, [int_const("2")])
+    assert_eq_str("kind", ir_kind_name(ir_kind(n)), "EnumNew")
+    assert_eq_str("c_name is the union member", ir_c_name(n), "Circle")
+    assert_eq_str("kid 0 literal is the cname tag macro", ir_c_name(ir_kid(n, 0)), "blink_Shape_Circle_TAG")
+    assert_eq_int("tid is the enum", ir_tid(n), shape)
+    assert_eq_int("decl is the variant", ir_decl(n), circle)
+    assert_eq_int("kids are tag then payload", ir_kid_count(n), 2)
+    assert_eq_str("kid 0 is the tag", ir_kind_name(ir_kind(ir_kid(n, 0))), "Const")
+    assert_eq_int("EnumNew is a value", if ir_kind_is_value(IrKind.EnumNew) { 1 } else { 0 }, 1)
+    assert_valid("Circle(2)", ir_expr_stmt(0, n))
+    let rect = arm(shape, "Shape", variant("Shape", 1), [int_const("1"), int_const("2")])
+    assert_valid("Rect with two named payloads", ir_expr_stmt(0, rect))
+    let empty = ir_enum_new(shape, 0, "blink_Shape", variant("Shape", 2), "", tag("Shape", variant("Shape", 2)), [])
+    assert_eq_int("payload-less arm has only the tag", ir_kid_count(empty), 1)
+    assert_eq_str("payload-less arm has no member", ir_c_name(empty), "")
+    assert_valid("Empty", ir_expr_stmt(0, empty))
+}
+
+// A generic enum's instance tid still resolves to the one declaration its variants belong to.
+test "a generic enum instance accepts its declaration's variants" {
+    let m = harvest_type_tids()
+    // tc_type_str renders a generic instance by its base name; the tid is still the instance.
+    let tree_int = expect_tid(m, "Tree")
+    let leaf = variant("Tree", 0)
+    let n = ir_enum_new(tree_int, 0, "blink_Tree_0Int", leaf, member(leaf), mono_tag(tree_int, leaf), [int_const("1")])
+    assert_valid("Tree[Int].Leaf(1)", ir_expr_stmt(0, n))
+    let node = variant("Tree", 1)
+    let sub = ir_var_ref(tree_int, 0, "blink_Tree_0Int", "l", SlotForm.Inline)
+    let boxed = ir_var_ref(tree_int, 0, "int64_t", "r", SlotForm.PointerBoxed)
+    let n2 = ir_enum_new(tree_int, 0, "blink_Tree_0Int", node, member(node), mono_tag(tree_int, node), [sub, boxed])
+    assert_valid("Tree[Int].Node(l, r) with payload kids already shaped by lowering", ir_expr_stmt(0, n2))
+}
+
+// The verifier holds the node to its declaration: the tid must be an enum, the variant
+// must belong to it, and the payload count must be the variant's arity.
+test "the verifier rejects a payload count that is not the variant's arity" {
+    let _m = harvest_type_tids()
+    let shape = lookup_named_type("Shape")
+    let circle = variant("Shape", 0)
+    let two = arm(shape, "Shape", circle, [int_const("1"), int_const("2")])
+    assert_rejects("Circle with two payloads", ir_expr_stmt(0, two), "variant 'Circle' takes 1 payload, has 2")
+    let none = arm(shape, "Shape", variant("Shape", 1), [])
+    assert_rejects("Rect with no payload", ir_expr_stmt(0, none), "variant 'Rect' takes 2 payloads, has 0")
+}
+
+test "the verifier rejects a tid that is not an enum and a variant of another enum" {
+    let m = harvest_type_tids()
+    let shape = lookup_named_type("Shape")
+    let circle = variant("Shape", 0)
+    let point = expect_tid(m, "Point")
+    let not_enum = ir_enum_new(point, 0, "blink_Point", circle, member(circle), tag("Shape", circle), [int_const("1")])
+    assert_rejects("Point tid", ir_expr_stmt(0, not_enum), "tid is not an enum")
+    let int_tid = ir_enum_new(TYPE_INT, 0, "int64_t", circle, member(circle), tag("Shape", circle), [int_const("1")])
+    assert_rejects("Int tid", ir_expr_stmt(0, int_tid), "tid is not an enum")
+    let leaf = variant("Tree", 0)
+    let foreign = ir_enum_new(shape, 0, "blink_Shape", leaf, member(leaf), tag("Tree", leaf), [int_const("1")])
+    assert_rejects("Tree.Leaf on Shape", ir_expr_stmt(0, foreign), "variant 'Leaf' is not declared by this enum")
+}
+
+test "the verifier rejects a missing variant declaration and a tag that is not a Const" {
+    let _m = harvest_type_tids()
+    let shape = lookup_named_type("Shape")
+    let circle = variant("Shape", 0)
+    let raw = ir_new(IrKind.EnumNew, shape, 0, "blink_Shape", "Circle", SlotForm.Inline, [tag("Shape", circle), int_const("1")])
+    assert_rejects("raw node without a variant", ir_expr_stmt(0, raw), "no variant declaration")
+    let stray = ir_enum_new(shape, 0, "blink_Shape", 1000000, "Circle", tag("Shape", circle), [int_const("1")])
+    assert_rejects("declaration id past the parser arena", ir_expr_stmt(0, stray), "variant declaration 1000000 out of range")
+    let bare = ir_new(IrKind.EnumNew, shape, 0, "blink_Shape", "", SlotForm.Inline, [])
+    assert_rejects("raw node without a tag", ir_expr_stmt(0, bare), "expects at least 1 kid")
+    let v = ir_var_ref(TYPE_INT, 0, "int", "t", SlotForm.InlineWord)
+    let var_tag = ir_enum_new(shape, 0, "blink_Shape", circle, member(circle), v, [int_const("1")])
+    assert_rejects("VarRef tag", ir_expr_stmt(0, var_tag), "tag must be a Const")
+}
+
+// The printer writes `.data.<c_name> = {...}` for a payload arm, so an empty member would
+// print a hole. A payload-less arm has no member to name and passes with "".
+test "the verifier rejects a payload arm without a union member" {
+    let _m = harvest_type_tids()
+    let shape = lookup_named_type("Shape")
+    let circle = variant("Shape", 0)
+    let unnamed = ir_enum_new(shape, 0, "blink_Shape", circle, "", tag("Shape", circle), [int_const("1")])
+    assert_rejects("Circle without a member", ir_expr_stmt(0, unnamed), "empty c_name")
+    let empty = variant("Shape", 2)
+    assert_valid("Empty without a member", ir_expr_stmt(0, ir_enum_new(shape, 0, "blink_Shape", empty, "", tag("Shape", empty), [])))
+}
+
+// The dump carries the declaration so a parsed tree verifies the same way.
+test "the variant declaration survives a dump and parse round trip" {
+    let _m = harvest_type_tids()
+    let shape = lookup_named_type("Shape")
+    let circle = variant("Shape", 0)
+    let n = ir_enum_new(shape, 3, "blink_Shape", circle, member(circle), tag("Shape", circle), [int_const("2")])
+    let text = ir_dump(n)
+    assert_eq_int("dump names the variant declaration", if text.contains(" @{circle}") { 1 } else { 0 }, 1)
+    let back = ir_parse(text)
+    assert(back >= 0)
+    assert_eq_int("parsed decl", ir_decl(back), circle)
+    assert_eq_str("parsed dump is the same text", ir_dump(back), text)
+    assert_valid("parsed tree", ir_expr_stmt(0, back))
+    let leaf = ir_const(TYPE_INT, 0, "int64_t", "1")
+    assert_eq_int("a node without a declaration carries -1", ir_decl(leaf), -1)
+    assert_eq_int("and dumps without one", if ir_dump(leaf).contains("@") { 1 } else { 0 }, 0)
+}
+
+test "EnumNew is a schema kind whose name round-trips" {
+    let mut found = 0
+    for k in ir_all_kinds() { if ir_kind_name(k) == "EnumNew" { found += 1 } }
+    assert_eq_int("listed once", found, 1)
+    match ir_kind_from_name("EnumNew") {
+        Some(k) => assert_eq_str("resolves", ir_kind_name(k), "EnumNew")
+        None => assert_eq_str("resolves", "missing", "EnumNew")
+    }
+}
