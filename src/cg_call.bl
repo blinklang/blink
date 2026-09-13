@@ -35,19 +35,20 @@ import layout.{
     LayoutRecord, Position, SlotForm, Slot, layout_of, carrier_member_layout, tid_of_node,
     child_tid, ensure_typedef_for, format_spec_of, varargs_spelling,
     tid_of_binder, current_binder_scope, current_inst, decl_has_derive,
-    container_slot_spelling,
+    container_slot_spelling, field_layout_of,
 }
 import mono.{instances, instance_for_call}
 import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls}
 import cname.{
     c_fn_decl_name, c_impl_method_name, c_impl_method_name_q,
     c_display_dispatch_name, c_derive_method_name,
-    c_runtime_helper, c_ffi_symbol, c_mint_local, c_string_literal,
+    c_runtime_helper, c_ffi_symbol, c_mint_local, c_string_literal, c_field_name,
+    cname_ffi_struct_mirror,
 }
 import ir.{
     ir_call_direct, ir_call_runtime, ir_cast, ir_unary, ir_unbox, ir_box,
     ir_binary, ir_block, ir_carrier_tag, ir_carrier_unwrap, ir_const, ir_if, ir_let,
-    ir_panic, ir_var_ref,
+    ir_panic, ir_var_ref, ir_field_get,
 }
 import cg_expr.{lower_expr, cg_expr_push_pending}
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
@@ -549,6 +550,7 @@ fn cc_no_module_member(node: Int) -> Int ! Diag.Report {
 
 let ns_io = "io"
 let ns_env = "env"
+let ns_ffi = "ffi"
 
 // The io names a handler can replace, and the env names it can. Both lists are written
 // under the names a caller writes, not under the vtable slots they reach, because the
@@ -564,7 +566,18 @@ fn lower_namespace_call(node: Int, obj: Int) -> Int ! Diag.Report {
     let ns = node_name(obj)
     if ns == ns_io { return lower_io_call(node, node_method(node)) }
     if ns == ns_env { return lower_env_call(node, node_method(node)) }
+    if ns == ns_ffi { return lower_ffi_call(node, node_method(node)) }
     cc_ns_not_built(node, ns, node_method(node))
+}
+
+// The whole of what the `ffi` namespace answers is a new arena. Every operation over that
+// arena is a method of the scope the `with` binds, so this one name is the only one here,
+// and the arena is the runtime's own: it holds the pointers it later frees.
+fn lower_ffi_call(node: Int, method: Str) -> Int ! Diag.Report {
+    if method != "scope" { return cc_ns_not_built(node, ns_ffi, method) }
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_ctor_arity_wrong(node, ns_ffi, method, 0, given) }
+    cc_build_call(node, c_runtime_helper("ffi_scope_new"), NO_RECEIVER, CallForm.Runtime)
 }
 
 fn lower_io_call(node: Int, method: Str) -> Int ! Diag.Report {
@@ -632,6 +645,180 @@ fn cc_env_args(node: Int) -> Int ! Diag.Report {
 fn cc_ns_not_built(node: Int, ns: Str, method: Str) -> Int ! Diag.Report {
     diag_ice_stage_not_built("cg_call intrinsic '{ns}.{method}'", node)
     -1
+}
+
+
+// ── The foreign surface ───────────────────────────────────────────────────
+//
+// Three receivers reach C with no Blink body between them and it: the arena a
+// `with ffi.scope()` opens, a raw pointer, and a field reached through one. Each needs
+// only the tid the call already carries. The arena's operations are runtime calls over the
+// handle it holds; pointer arithmetic is C's own, which steps by the pointee the receiver
+// is spelled at; a field through a pointer is a dereference and then the field, which is
+// the pair the printer writes for every other field of that struct.
+
+// The arena operations the runtime publishes. `alloc` and `alloc_n` are absent because
+// each is sized by the type it allocates and no argument carries a size.
+fn cc_scope_runtime_op(method: Str) -> Str {
+    if method == "cstr" { return "ffi_scope_cstr" }
+    if method == "take" { return "ffi_scope_take" }
+    ""
+}
+
+// Each takes the one pointer or string it is handed. The count is checked here because
+// the front end lets a call with too few arguments through, and a runtime call built
+// short of its prototype is a C error rather than a Blink one.
+fn cc_scope_op_arity(op: Str) -> Int {
+    if op == "ffi_scope_cstr" { return 1 }
+    if op == "ffi_scope_take" { return 1 }
+    NO_ARITY
+}
+
+fn cc_lower_scope_method(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
+    if method == "alloc" || method == "alloc_n" { return cc_allocation_size_not_in_ir(node, method) }
+    let op = cc_scope_runtime_op(method)
+    if op == "" { return cc_intrinsic_not_built(node, TyKind.FfiScope, method) }
+    let want = cc_scope_op_arity(op)
+    let given = sublist_length(node_args(node))
+    if given != want { return cc_intrinsic_arity_wrong(node, TyKind.FfiScope, method, want, given) }
+    cc_build_call(node, c_runtime_helper(op), obj, CallForm.Runtime)
+}
+
+// `scope.alloc()` and `scope.alloc_n(n)` take room for a type, and the room is that type's
+// size in bytes. No IR node carries a size. The one size the printer writes is the heap
+// copy a Box makes, and it writes it from that node's own pointee name; an allocation is
+// not a copy, so nothing here can borrow it. Writing the size into this stage instead
+// would put C text in a producer, which is the one thing no producer here may do.
+fn cc_allocation_size_not_in_ir(node: Int, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("AllocationSizeNotInIr", CODEGEN_STAGE_NOT_BUILT,
+        "'scope.{method}' must say how many bytes its pointee takes, and no IR node carries a size",
+        node, "the IR needs a node the printer writes as the size of a named type")
+    -1
+}
+
+// `p.offset(n)` steps the pointer by n of what it points at. C does the stepping and steps
+// by the pointee, so the whole of what makes the answer right is that the pointer is
+// spelled at its own type. The call's tid is that type: typecheck preserves the pointee
+// across an offset, so the result is spelled exactly as the receiver is.
+fn cc_lower_ptr_method(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
+    if method != "offset" { return cc_intrinsic_not_built(node, TyKind.Ptr, method) }
+    let given = sublist_length(node_args(node))
+    if given != 1 { return cc_intrinsic_arity_wrong(node, TyKind.Ptr, method, 1, given) }
+    let recv = tid_of_node(obj)
+    if recv < 0 { return -1 }
+    if !cc_stride_is_known(recv) { return cc_offset_stride_unknown(node) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    let base = lower_expr(obj)
+    if base < 0 { return -1 }
+    let step = lower_expr(sublist_get(node_args(node), 0))
+    if step < 0 { return -1 }
+    ir_binary(tid, node, rec.c_spelling, "+", base, step)
+}
+
+// `p.f.read()` and `p.f.write(v)`. The receiver is the PLACE the field occupies, not a
+// value of the field's type, so the pair is recognised by the SHAPE of the receiver — a
+// field access whose own object points at a declared type — and by no type at all.
+// Typecheck resolves the same pair on the same shape (src/typecheck.bl:13437); recognising
+// it by the field's type instead would put `read` and `write` on every value of that type.
+fn cc_is_ptr_field_place(obj: Int, method: Str) -> Bool ! Diag.Report {
+    if method != "read" && method != "write" { return false }
+    if nk_of(node_kind(obj)) != NodeKind.FieldAccess { return false }
+    let inner = node_obj(obj)
+    if cc_names_a_module(inner) { return false }
+    let base = tid_of_node(inner)
+    if base < 0 { return false }
+    cc_points_at_foreign_struct(base)
+}
+
+// `mod.NAME.read()` reads another module's global. The qualifier names a module, not a
+// value, so nothing records a type for it and asking for one reports a bug that is not
+// one. A binding of that name outranks the module, which is the rule name resolution
+// applied when it typed the access.
+fn cc_names_a_module(obj: Int) -> Bool {
+    if nk_of(node_kind(obj)) != NodeKind.Ident { return false }
+    if tid_of_binder(current_binder_scope(), node_name(obj)) >= 0 { return false }
+    is_import_module_name(node_name(obj)) != 0
+}
+
+// A pointer at a type a foreign header lays out. The annotation is the whole of the test,
+// because it is what typecheck tests (tc_ptr_ffi_struct_pointee): a pointer at an ordinary
+// Blink struct resolves `read` and `write` on the field's own type instead, and lowering a
+// field store for it would emit a different program than the one that typechecked.
+fn cc_points_at_foreign_struct(ptr_tid: Int) -> Bool {
+    if cc_kind(ptr_tid) != TyKind.Ptr { return false }
+    let pointee = child_tid(ptr_tid, Slot.Inner1)
+    if pointee < 0 { return false }
+    cname_ffi_struct_mirror(tc_tid_decl_node(pointee))
+}
+
+// `p.offset(n)` steps by the pointee, so the pointee has to be a type whose size C knows.
+// A foreign mirror is spelled as the struct the header declares and steps by it; `Ptr[Void]`
+// and a pointer at a type no header lays out spell one word and step by a byte, which is
+// the wrong answer written as if it were the right one.
+fn cc_stride_is_known(ptr_tid: Int) -> Bool {
+    cc_points_at_foreign_struct(ptr_tid)
+}
+
+fn cc_offset_stride_unknown(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("PointerStrideUnknown", CODEGEN_STAGE_NOT_BUILT,
+        "'Ptr.offset' steps by what the pointer points at, and this pointer points at a type no foreign header lays out",
+        node, "offset a Ptr to an @ffi.struct type, whose stride is the struct the header declares")
+    -1
+}
+
+fn cc_lower_ptr_field(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
+    if method == "write" { return cc_field_store_not_a_value(node) }
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, TyKind.Ptr, method, 0, given) }
+    let base = tid_of_node(node_obj(obj))
+    if base < 0 { return -1 }
+    let field_tid = tid_of_node(obj)
+    if field_tid < 0 { return -1 }
+    let decl = tc_tid_decl_node(child_tid(base, Slot.Inner1))
+    let rec = cc_foreign_field(node, decl, field_tid)
+    if cc_stopped(rec) { return -1 }
+    let place = cc_deref(node, obj, base)
+    if place < 0 { return -1 }
+    ir_field_get(field_tid, node, rec.c_spelling, c_field_name(node_name(obj)), rec.slot_form, place)
+}
+
+// `p.f.write(v)` stores into the field. A store is a statement, and this stage answers with
+// a value: the IR says so itself, because it refuses a statement in every slot that wants a
+// value, and a method call reaches the printer through one of those slots. So the store
+// cannot be built here, under any spelling, without emitting C the printer has to reject.
+fn cc_field_store_not_a_value(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("FieldStoreNotAValue", CODEGEN_STAGE_NOT_BUILT,
+        "'write' through a pointer stores into a field, and a store is a statement this stage cannot answer with",
+        node, "the statement stage owns the store: it holds the only slot a FieldSet fits")
+    -1
+}
+
+// The struct the pointer addresses. A pointer local is one machine word and reads as a
+// value, so nothing about the pointer itself says the field behind it is reached through
+// it: the dereference is written, and it is written at the pointee's own layout.
+fn cc_deref(node: Int, obj: Int, ptr_tid: Int) -> Int ! Diag.Report {
+    let pointee = child_tid(ptr_tid, Slot.Inner1)
+    let held = cc_local(pointee, node)
+    if cc_stopped(held) { return -1 }
+    let ptr = lower_expr(node_obj(obj))
+    if ptr < 0 { return -1 }
+    ir_unbox(pointee, node, held.c_spelling, held.slot_form, ptr)
+}
+
+// A field of a type laid out by a foreign header. Every one of those fields is a sized
+// integer or a pointer, so a decline here is not a type this stage cannot spell but a
+// declaration that never reached layout at all.
+fn cc_foreign_field(node: Int, decl: Int, field_tid: Int) -> LayoutRecord ! Diag.Report {
+    let rec = field_layout_of(decl, field_tid)
+    let why = "a field reached through a pointer has no C layout: {rec.decline_reason}"
+    if rec.decline_reason != "" {
+        diag_ice_at("UnspellableForeignField", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
+            "a foreign struct lays out every field at a width C names; this is a compiler bug")
+    }
+    rec
 }
 
 // ── Static and associated calls ───────────────────────────────────────────
@@ -916,10 +1103,11 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if role == Receiver.Module { return lower_module_call(node, obj) }
     if role == Receiver.Namespace { return lower_namespace_call(node, obj) }
     if role == Receiver.TypeOwner { return lower_static_call(node, obj) }
+    let mname = node_method(node)
+    if cc_is_ptr_field_place(obj, mname) { return cc_lower_ptr_field(node, obj, mname) }
     let recv_tid = tid_of_node(obj)
     if recv_tid < 0 { return -1 }
     let kind = cc_kind(recv_tid)
-    let mname = node_method(node)
     // The intrinsic table is read BEFORE the impls, because that is the order typecheck
     // reads the same two in (src/typecheck.bl:14382): a builtin method wins over a
     // same-named user impl. Reading them the other way round here would emit the impl
@@ -936,6 +1124,8 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if cc_is_char_text(kind, mname) { return cc_char_text(node, obj, kind, mname) }
     if cc_is_carrier_test(kind, mname) { return cc_carrier_test(node, obj, kind, mname) }
     if cc_is_carrier_read(kind, mname) { return cc_carrier_read(node, obj, kind, mname) }
+    if kind == TyKind.FfiScope { return cc_lower_scope_method(node, obj, mname) }
+    if kind == TyKind.Ptr { return cc_lower_ptr_method(node, obj, mname) }
     let im = cc_impl_with_method(node, recv_tid, mname)
     if im == IMPL_REFUSED { return -1 }
     if im < 0 { return cc_method_not_built(node, kind, mname) }
@@ -2036,7 +2226,19 @@ fn cc_intrinsic_arity_wrong(node: Int, kind: TyKind, method: Str, want: Int, got
 // missing stays legible and countable rather than arriving as one blanket count.
 fn cc_method_not_built(node: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
     if kind == TyKind.List { return cc_list_not_built(node, method) }
+    if kind == TyKind.Bytes && method == "with_ptr" { return cc_pointer_body_not_lowered(node) }
     cc_intrinsic_not_built(node, kind, method)
+}
+
+// `b.with_ptr(f)` binds a pointer into the buffer to the body's own parameter, runs the
+// body there, and answers what the body computed. A binding and a block are both
+// statements, so what this needs is the stage that builds statements. No call node stands
+// for either, which is why it is named here rather than counted with the rest.
+fn cc_pointer_body_not_lowered(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("PointerBodyNotLowered", CODEGEN_STAGE_NOT_BUILT,
+        "'Bytes.with_ptr' binds a pointer into the buffer and runs its body there", node,
+        "the statement stage owns the block and the binding; no call node stands for either")
+    -1
 }
 
 // The three List methods that are not one call. `get` and `pop` both answer a carrier
