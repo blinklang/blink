@@ -261,28 +261,65 @@ test "a union passes the other set as written" {
 
 // ── What is not lowered ───────────────────────────────────────────────────
 
-// Both of these move a value through the slot the map stores beside the key, and neither is
-// built. They refuse under different names because they are waiting on different things. A
-// store waits on one layout answer, what a value becomes going into the slot word, so it
-// refuses under the name that counts that answer. A read waits on that answer AND on the
-// carrier it hands the value back in, so counting it against the slot word alone would
-// promise that closing the slot word finishes it.
-test "a store into a map refuses under the slot-word name" {
+// Both of these move a value through the slot the map stores beside the key, and only one
+// of them is built. Reaching the slot is the whole of what a store does, so a store is
+// finished by it. A read is not: it hands the value back in a carrier, and filling one takes
+// statements this stage does not hoist. So the read keeps refusing under its own name, which
+// is what stops the count from claiming that the slot word finished it.
+test "a store into a map goes into the slot beside the key" {
     probe("map_insert", #"fn main() {
     let mut m: Map[Str, Int] = Map.new()
     m.insert("k", 1)
 }
 "#)
     let built = lower_expr(call_after("m", "insert"))
-    assert_ice_saying("insert", built, "ElementSlotFormNotLowered", "going into the slot")
+    assert_eq_str("symbol", ir_c_name(built), "blink_map_set")
+    assert_shape("shape", built, "CallRuntime(VarRef, Const, Cast(Cast(Const)))")
+    assert_verifies("insert", built)
 }
 
-test "a read out of a map refuses under its own name and not the slot-word one" {
+// A map store is the only call that carries a key AND a value, so it is the only place the
+// two rules can be read as one. The key follows the rule every other keyed call follows,
+// and the value follows the slot rule a list element follows. These two pin that neither
+// rule is applied to the other's argument.
+test "a map store passes a narrow key by address and its value by the slot word" {
+    probe("map_ins_int", #"fn main() {
+    let mut m: Map[Int, Int] = Map.new()
+    m.insert(7, 1)
+}
+"#)
+    let built = lower_expr(call_after("m", "insert"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_map_set")
+    assert_shape("shape", built, "CallRuntime(VarRef, Unary(VarRef), Cast(Cast(Const)))")
+    assert_eq_str("key by address", ir_c_name(ir_kid(built, 1)), "&")
+    assert_verifies("insert", built)
+}
+
+// A wide key outlives the call that wrote it, because the container keeps reading the bytes
+// it was handed. A copy is what makes that safe, and a store that passed the local's own
+// address would leave the map pointing at a dead frame.
+test "a map store copies a wide key where the container can keep reading it" {
+    probe("map_ins_struct", #"@derive(Hash)
+type Point { x: Int  y: Int }
+
+fn main() {
+    let mut m: Map[Point, Int] = Map.new()
+    let p = Point { x: 1, y: 2 }
+    m.insert(p, 1)
+}
+"#)
+    let built = lower_expr(call_after("p", "insert"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_map_set")
+    assert_shape("shape", built, "CallRuntime(VarRef, Box(VarRef), Cast(Cast(Const)))")
+    assert_verifies("insert", built)
+}
+
+test "a read out of a map refuses on the carrier it has to answer" {
     probe("map_get", #"fn main() {
     let m: Map[Str, Int] = Map.new()
     let v = m.get("k")
 }
 "#)
     let built = lower_expr(rhs_of("v"))
-    assert_ice_saying("get", built, "MapSlotMethodNotLowered", "moves a value through the slot")
+    assert_ice_saying("get", built, "MapSlotMethodNotLowered", "takes a value back out of the slot")
 }

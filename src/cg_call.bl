@@ -35,6 +35,7 @@ import layout.{
     LayoutRecord, Position, SlotForm, Slot, layout_of, carrier_member_layout, tid_of_node,
     child_tid, ensure_typedef_for, format_spec_of, varargs_spelling,
     tid_of_binder, current_binder_scope, current_inst, decl_has_derive,
+    container_slot_spelling,
 }
 import mono.{instances, instance_for_call}
 import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls}
@@ -241,7 +242,7 @@ pub fn lower_element_read(node: Int) -> Int ! Diag.Report {
     let index = lower_expr(node_index(node))
     if index < 0 { return -1 }
     let raw = ir_call_runtime(tid, node, shape.slot.c_spelling, helper, shape.slot.slot_form, [obj, index])
-    let read = ir_cast(tid, node, shape.slot.c_spelling, raw)
+    let read = ir_cast(tid, node, shape.slot.c_spelling, cc_from_slot_word(tid, node, shape.slot, raw))
     if !shape.boxed { return read }
     ir_unbox(tid, node, shape.value.c_spelling, shape.value.slot_form, read)
 }
@@ -257,6 +258,7 @@ pub fn lower_element_read(node: Int) -> Int ! Diag.Report {
 // boxed where the read unboxes would hand the runtime a pointer the read then treats as a
 // value, and nothing downstream could tell the two apart.
 type ElementShape {
+    tid: Int
     slot: LayoutRecord
     value: LayoutRecord
     boxed: Bool
@@ -264,24 +266,76 @@ type ElementShape {
 
 fn cc_element_shape(node: Int, elem_tid: Int) -> ElementShape ! Diag.Report {
     let slot = cc_element_layout(node, elem_tid, Position.ContainerSlot)
-    let stopped = ElementShape { slot: cc_stop(slot), value: cc_stop(slot), boxed: false }
+    let stopped = ElementShape { tid: -1, slot: cc_stop(slot), value: cc_stop(slot), boxed: false }
     if cc_stopped(slot) { return stopped }
     let boxed = slot.slot_form == SlotForm.PointerBoxed
     if !boxed && slot.slot_form != SlotForm.InlineWord {
         cc_element_slot_form(node, elem_tid)
         return stopped
     }
-    if !boxed { return ElementShape { slot: slot, value: slot, boxed: false } }
+    if !boxed { return ElementShape { tid: elem_tid, slot: slot, value: slot, boxed: false } }
     let value = cc_element_layout(node, elem_tid, Position.Local)
     if cc_stopped(value) { return stopped }
     // A boxed element is allocated and dereferenced by its own spelling, and for a carrier
     // that spelling names a typedef the unit has to declare first. Queueing it is what
     // every other producer of a carrier-typed value does; cg_decl drains the queue.
     ensure_typedef_for(elem_tid)
-    ElementShape { slot: slot, value: value, boxed: true }
+    ElementShape { tid: elem_tid, slot: slot, value: value, boxed: true }
 }
 
 fn cc_shape_stopped(shape: ElementShape) -> Bool { cc_stopped(shape.slot) }
+
+// The shape of a call that stores nothing. It reads as stopped, and reports nothing on its
+// way there: no layout was asked for, so none declined. A caller that reached for it by
+// mistake refuses instead of building from a record nothing filled in.
+fn cc_absent_shape() -> ElementShape {
+    let none = layout_of(-1, Position.Local)
+    ElementShape { tid: -1, slot: none, value: none, boxed: false }
+}
+
+// ── An element and the slot word ──────────────────────────────────────────
+//
+// A slot is one pointer-wide cell, and a word-sized element moves through it as an integer
+// of the cell's own width. The width is the reason for that integer: an element narrower
+// than a pointer converted straight to or from the cell asks C to change a value's kind and
+// its size in one step, which it diagnoses. Layout leaves the word empty for an element
+// that is already a pointer, and for every boxed one, so both directions fall through to
+// the single conversion they had before.
+//
+// Both directions read the word off one record. A store that converted where the read did
+// not would put a value in the cell that comes back as a different value, and nothing
+// between them could tell.
+
+// The cell's content at the cell's own width, ready for the conversion that spells it as
+// the element's own type.
+fn cc_from_slot_word(tid: Int, node: Int, slot: LayoutRecord, value: Int) -> Int {
+    if slot.slot_word == "" { return value }
+    ir_cast(tid, node, slot.slot_word, value)
+}
+
+// The element at the cell's own width, and then the cell's own type. The second conversion
+// is not decoration: every entry point takes the cell as a pointer, and C makes no pointer
+// out of an integer on its own, nor drops a const on the way in.
+fn cc_to_slot_word(tid: Int, node: Int, slot: LayoutRecord, value: Int) -> Int {
+    let widened = if slot.slot_word == "" { value } else { ir_cast(tid, node, slot.slot_word, value) }
+    ir_cast(tid, node, container_slot_spelling(), widened)
+}
+
+// One element entering one slot, by whichever of the two routes this element takes. A value
+// too wide for the word is copied to the heap, and the address left behind is already the
+// cell's own width and its own kind, so it converts once.
+//
+// The box carries the ELEMENT's tid: the slot form, not the tid, is what records that the
+// value sits behind a pointer. Its own spelling is the pointer type, and the pointee
+// spelling is what the printer writes inside sizeof.
+fn cc_into_slot(node: Int, shape: ElementShape, value: Int) -> Int ! Diag.Report {
+    // An empty slot word is how layout spells a pointer element, and it is also all a
+    // stopped record has left. Testing the word alone would read one as the other and
+    // convert a declined type once, silently, instead of refusing it.
+    if cc_shape_stopped(shape) { return cc_slot_shape_missing(node) }
+    if shape.boxed { return ir_box(shape.tid, node, shape.slot.c_spelling, shape.value.c_spelling, value) }
+    cc_to_slot_word(shape.tid, node, shape.slot, value)
+}
 
 // ── Element reads ─────────────────────────────────────────────────────────
 
@@ -310,25 +364,23 @@ fn cc_not_an_element_read(node: Int) -> Int ! Diag.Report {
     -1
 }
 
-// A slot holds the element in the word or behind a pointer, and the read answers each of
-// those. A third form would need a third read, so it is refused rather than cast as if it
-// were the word.
+// A slot holds the element in the word or behind a pointer, and both directions answer
+// each of those. A third form would need a third conversion, so it is refused rather than
+// converted as if it were the word. Layout answers only those two at a container slot, so
+// reaching this is a fault in layout and not a stage that was never written.
 fn cc_element_slot_form(node: Int, elem_tid: Int) -> Int ! Diag.Report {
-    diag_ice_at("ElementSlotFormNotLowered", CODEGEN_STAGE_NOT_BUILT,
+    diag_ice_at("ElementSlotFormNotLowered", UNSOLVED_TYPEVAR_AT_CODEGEN,
         "a {tk_name(cc_kind(elem_tid))} element sits in its slot in neither of the two forms",
         node, "an element slot is one machine word, so layout answers InlineWord or PointerBoxed")
     -1
 }
 
-// A word-sized element entering a slot. The read converts the other way and can spell what
-// it converts to, because that is the element's own type and layout answers it. A store
-// converts to what the slot HOLDS, and layout has no answer for that word yet, so the
-// element would be passed as written: an integer where the runtime reads a pointer.
-// Refusing keeps the two directions honest until one answer serves both.
-fn cc_element_slot_word(node: Int, elem_tid: Int) -> Int ! Diag.Report {
-    diag_ice_at("ElementSlotFormNotLowered", CODEGEN_STAGE_NOT_BUILT,
-        "a {tk_name(cc_kind(elem_tid))} element has no spelling for what it becomes going into the slot word",
-        node, "layout has to answer the slot word for a tid before a store can convert to it")
+// A store reached a slot whose element layout never spelled. The decline was reported where
+// it was found, so this says only that nothing was built on top of it.
+fn cc_slot_shape_missing(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("ElementSlotFormNotLowered", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "a value entering a container slot has no element layout to enter it by",
+        node, "the layout that declined was reported already; no store is built on a declined one")
     -1
 }
 
@@ -953,16 +1005,13 @@ fn cc_lower_runtime_method(node: Int, obj: Int, kind: TyKind, method: Str, op: S
     if tid < 0 { return -1 }
     let container = tid_of_node(obj)
     if container < 0 { return -1 }
-    let elem = child_tid(container, Slot.Inner1)
-    if elem < 0 { return cc_element_type_unrecorded(node, kind) }
-    let shape = cc_element_shape(node, elem)
+    let shape = cc_slot_shape(node, container, kind, Slot.Inner1)
     if cc_shape_stopped(shape) { return -1 }
-    if !shape.boxed { return cc_element_slot_word(node, elem) }
     let result = cc_local(tid, node)
     if cc_stopped(result) { return -1 }
     let receiver = lower_expr(obj)
     if receiver < 0 { return -1 }
-    let args = cc_store_args(node, receiver, want, elem, shape)
+    let args = cc_store_args(node, receiver, want, shape)
     if args.len() == 0 { return -1 }
     ir_call_runtime(tid, node, result.c_spelling, c_runtime_helper(op), result.slot_form, args)
 }
@@ -972,18 +1021,15 @@ fn cc_lower_runtime_method(node: Int, obj: Int, kind: TyKind, method: Str, op: S
 // it goes before it names what goes there, so a position argument can only come first.
 // An empty list is the refusal: every built list holds the receiver, so no answer this
 // builds can be empty.
-fn cc_store_args(node: Int, receiver: Int, count: Int, elem: Int, shape: ElementShape) -> List[Int] ! Diag.Report {
+fn cc_store_args(node: Int, receiver: Int, count: Int, shape: ElementShape) -> List[Int] ! Diag.Report {
     let mut out: List[Int] = [receiver]
     let written = node_args(node)
     let mut i = 0
     while i < count {
         let a = lower_expr(sublist_get(written, i))
         if a < 0 { return [] }
-        // The box carries the ELEMENT's tid: the slot form, not the tid, is what records
-        // that the value sits behind a pointer. Its own spelling is the pointer type and
-        // the pointee spelling is what the printer writes inside sizeof.
-        if i == count - 1 && shape.boxed {
-            out.push(ir_box(elem, node, shape.slot.c_spelling, shape.value.c_spelling, a))
+        if i == count - 1 {
+            out.push(cc_into_slot(node, shape, a))
         } else {
             out.push(a)
         }
@@ -1138,71 +1184,73 @@ type KeyedForm { Truth, Empty, Plain }
 
 // One row: the runtime entry point, how many arguments the call is written with, whether
 // the first of them is a key, whether the entry point keeps that key after it answers,
-// and what shape the answer takes coming back.
-type KeyedRow { op: Str  arity: Int  keyed: Bool  retains: Bool  form: KeyedForm }
+// whether the LAST of them is a value the container stores in a slot beside the key, and
+// what shape the answer takes coming back.
+type KeyedRow { op: Str  arity: Int  keyed: Bool  retains: Bool  slotted: Bool  form: KeyedForm }
 
 fn cc_keyed_none() -> KeyedRow {
-    KeyedRow { op: "", arity: 0, keyed: false, retains: false, form: KeyedForm.Plain }
+    KeyedRow { op: "", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Plain }
 }
 
 fn cc_keyed_row(kind: TyKind, method: Str) -> KeyedRow {
     if kind == TyKind.Map {
-        if method == "contains_key" { return KeyedRow { op: "map_has", arity: 1, keyed: true, retains: false, form: KeyedForm.Truth } }
-        if method == "contains" { return KeyedRow { op: "map_has", arity: 1, keyed: true, retains: false, form: KeyedForm.Truth } }
-        if method == "remove" { return KeyedRow { op: "map_remove", arity: 1, keyed: true, retains: false, form: KeyedForm.Truth } }
-        if method == "len" { return KeyedRow { op: "map_len", arity: 0, keyed: false, retains: false, form: KeyedForm.Plain } }
-        if method == "is_empty" { return KeyedRow { op: "map_len", arity: 0, keyed: false, retains: false, form: KeyedForm.Empty } }
-        if method == "clear" { return KeyedRow { op: "map_clear", arity: 0, keyed: false, retains: false, form: KeyedForm.Plain } }
-        if method == "keys" { return KeyedRow { op: "map_keys", arity: 0, keyed: false, retains: false, form: KeyedForm.Plain } }
-        if method == "values" { return KeyedRow { op: "map_values", arity: 0, keyed: false, retains: false, form: KeyedForm.Plain } }
+        // The one row that stores a value beside its key, so the one row whose last
+        // argument goes into a slot. The key is kept, the same way a set keeps one.
+        if method == "insert" { return KeyedRow { op: "map_set", arity: 2, keyed: true, retains: true, slotted: true, form: KeyedForm.Plain } }
+        if method == "contains_key" { return KeyedRow { op: "map_has", arity: 1, keyed: true, retains: false, slotted: false, form: KeyedForm.Truth } }
+        if method == "contains" { return KeyedRow { op: "map_has", arity: 1, keyed: true, retains: false, slotted: false, form: KeyedForm.Truth } }
+        if method == "remove" { return KeyedRow { op: "map_remove", arity: 1, keyed: true, retains: false, slotted: false, form: KeyedForm.Truth } }
+        if method == "len" { return KeyedRow { op: "map_len", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Plain } }
+        if method == "is_empty" { return KeyedRow { op: "map_len", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Empty } }
+        if method == "clear" { return KeyedRow { op: "map_clear", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Plain } }
+        if method == "keys" { return KeyedRow { op: "map_keys", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Plain } }
+        if method == "values" { return KeyedRow { op: "map_values", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Plain } }
         return cc_keyed_none()
     }
     if kind == TyKind.Set {
         // The one entry point here that keeps what it is handed: a set stores the item it
         // is given, and every other row has finished with the key by the time it answers.
-        if method == "insert" { return KeyedRow { op: "set_insert", arity: 1, keyed: true, retains: true, form: KeyedForm.Truth } }
-        if method == "contains" { return KeyedRow { op: "set_contains", arity: 1, keyed: true, retains: false, form: KeyedForm.Truth } }
-        if method == "remove" { return KeyedRow { op: "set_remove", arity: 1, keyed: true, retains: false, form: KeyedForm.Truth } }
-        if method == "len" { return KeyedRow { op: "set_len", arity: 0, keyed: false, retains: false, form: KeyedForm.Plain } }
-        if method == "is_empty" { return KeyedRow { op: "set_len", arity: 0, keyed: false, retains: false, form: KeyedForm.Empty } }
+        if method == "insert" { return KeyedRow { op: "set_insert", arity: 1, keyed: true, retains: true, slotted: false, form: KeyedForm.Truth } }
+        if method == "contains" { return KeyedRow { op: "set_contains", arity: 1, keyed: true, retains: false, slotted: false, form: KeyedForm.Truth } }
+        if method == "remove" { return KeyedRow { op: "set_remove", arity: 1, keyed: true, retains: false, slotted: false, form: KeyedForm.Truth } }
+        if method == "len" { return KeyedRow { op: "set_len", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Plain } }
+        if method == "is_empty" { return KeyedRow { op: "set_len", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Empty } }
         // A union takes the other SET, not a key, so its argument is lowered as written.
-        if method == "union" { return KeyedRow { op: "set_union", arity: 1, keyed: false, retains: false, form: KeyedForm.Plain } }
+        if method == "union" { return KeyedRow { op: "set_union", arity: 1, keyed: false, retains: false, slotted: false, form: KeyedForm.Plain } }
         return cc_keyed_none()
     }
     cc_keyed_none()
 }
 
-// The two Map methods that move a value through the slot beside the key. A store puts one
-// in and a read takes one out, and both need the answer layout does not have yet: what a
-// value BECOMES going into the slot word. Asking that question here is what counts these
-// two with every other store blocked on the same answer, rather than under a blanket name
-// that says only that the method is missing.
+// The one Map method left that moves a value through the slot beside the key. The store
+// takes the slot word and is built with every other keyed call; the read is not finished by
+// taking it. It answers an Option, and filling a carrier takes statements this stage does
+// not hoist, which is the same thing that holds the bounds-checked list read. Counting it
+// against the slot word would have said that the word finishes it.
 fn cc_is_map_slot_method(kind: TyKind, method: Str) -> Bool {
-    kind == TyKind.Map && (method == "insert" || method == "get")
+    kind == TyKind.Map && method == "get"
 }
 
-fn cc_map_slot_not_built(node: Int, method: Str) -> Int ! Diag.Report {
-    diag_ice_at("MapSlotMethodNotLowered", CODEGEN_STAGE_NOT_BUILT,
-        "'Map.{method}' moves a value through the slot beside the key, and no node builds that", node,
-        "the IR needs a keyed store, and a keyed read that answers the value wrapped")
-    -1
-}
-
-// A store is blocked on one answer: what the value becomes going into the slot word. A read
-// is blocked on that answer AND on the carrier it wraps what it took out in, so naming the
-// slot word as its blocker would count it against a seam that would not finish it.
 fn cc_map_slot_method(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
     let container = tid_of_node(obj)
     if container < 0 { return -1 }
-    let held = child_tid(container, Slot.Inner2)
-    if held < 0 { return cc_element_type_unrecorded(node, kind) }
-    if method != "insert" { return cc_map_slot_not_built(node, method) }
-    // Asked of layout rather than of the element shape, because the shape queues the
-    // element's typedef into the unit and this path answers with a refusal either way.
-    let slot = cc_element_layout(node, held, Position.ContainerSlot)
-    if cc_stopped(slot) { return -1 }
-    if slot.slot_form != SlotForm.PointerBoxed { return cc_element_slot_word(node, held) }
-    cc_map_slot_not_built(node, method)
+    if child_tid(container, Slot.Inner2) < 0 { return cc_element_type_unrecorded(node, kind) }
+    diag_ice_at("MapSlotMethodNotLowered", CODEGEN_STAGE_NOT_BUILT,
+        "'Map.{method}' takes a value back out of the slot beside the key, and no node wraps it",
+        node, "the IR needs a keyed read that answers the value in the carrier it was asked for, and a present test the value cannot supply: a stored 0 leaves the slot as the same null the runtime answers for a key it does not hold")
+    -1
+}
+
+// What a container holds in one of its slots. A container that recorded no type for that
+// slot is reported here and answered with a stopped shape, so every caller tests one thing
+// and a store never builds on a record nothing filled in.
+fn cc_slot_shape(node: Int, container: Int, kind: TyKind, slot: Slot) -> ElementShape ! Diag.Report {
+    let held = child_tid(container, slot)
+    if held < 0 {
+        cc_element_type_unrecorded(node, kind)
+        return cc_absent_shape()
+    }
+    cc_element_shape(node, held)
 }
 
 fn cc_lower_keyed_method(node: Int, obj: Int, kind: TyKind, method: Str, row: KeyedRow) -> Int ! Diag.Report {
@@ -1222,13 +1270,31 @@ fn cc_lower_keyed_method(node: Int, obj: Int, kind: TyKind, method: Str, row: Ke
     if !plain && cc_guard_stopped(g) { return -1 }
     let plan = cc_key_plan(node, container, kind, row)
     if cc_key_stopped(plan) { return -1 }
+    // The shape of the stored value is settled here, beside every other layout question and
+    // ahead of the receiver, so a call this stage cannot build has lowered no operand.
+    let stored = if row.slotted { cc_slot_shape(node, container, kind, Slot.Inner2) } else { cc_absent_shape() }
+    if row.slotted && cc_shape_stopped(stored) { return -1 }
     let recv = lower_expr(obj)
     if recv < 0 { return -1 }
     let mut args = [recv]
-    if row.arity == 1 {
-        let a = cc_key_arg(node, plan, sublist_get(node_args(node), 0))
+    let written = node_args(node)
+    // Every written argument is lowered once, at the position the row puts it in: the key
+    // first when the row is keyed, the stored value last when the row stores one. Choosing
+    // by position rather than by count keeps a row that takes more than those two from
+    // dropping the arguments between them.
+    let mut i = 0
+    while i < row.arity {
+        let w = sublist_get(written, i)
+        let mut a = 0
+        if row.keyed && i == 0 {
+            a = cc_key_arg(node, plan, w)
+        } else {
+            a = lower_expr(w)
+            if a >= 0 && row.slotted && i == row.arity - 1 { a = cc_into_slot(node, stored, a) }
+        }
         if a < 0 { return -1 }
         args.push(a)
+        i = i + 1
     }
     let call = ir_call_runtime(
         if plain { tid } else { TYPE_INT }, node,
@@ -2251,8 +2317,12 @@ fn cc_stopped(rec: LayoutRecord) -> Bool {
     rec.c_spelling == ""
 }
 
+// A record whose decline has been reported, kept only so a caller can test it. Both
+// spellings go: a reader that asks "is there a slot word?" would otherwise read a live
+// answer off a record whose own type was never spelled, and convert by a word that was
+// reported as missing.
 fn cc_stop(rec: LayoutRecord) -> LayoutRecord {
-    LayoutRecord { c_spelling: "", ..rec }
+    LayoutRecord { c_spelling: "", slot_word: "", ..rec }
 }
 
 fn cc_ev_not_in_ir(node: Int) ! Diag.Report {

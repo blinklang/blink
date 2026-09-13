@@ -1,0 +1,242 @@
+// An element moving between its own type and the container's slot.
+//
+// A container slot is one pointer-wide cell. An element that fits a machine word goes into
+// that cell as an integer of the cell's own width and comes back out the same way, and
+// layout spells that integer. An element that is already a pointer needs no integer
+// between: the slot holds the pointer itself. An element that does not fit at all is
+// copied to the heap, and the slot holds the address of the copy.
+//
+// The two directions are one fact read twice. A store that converted one way while a read
+// converted the other would put a value in the cell that comes back as a different value,
+// and nothing between them could tell. So every test here pins BOTH ends of the same
+// element type, and the conversions are read off one layout answer.
+import lower_test_helpers.{
+    probe, rhs_of, let_node_of, assert_eq_str, assert_shape, assert_verifies,
+    assert_ice_saying,
+}
+import parser.{node_kind, node_method, nodes}
+import ast.{NodeKind, nk_of}
+import ir.{ir_c_spelling, ir_kid}
+import cg_expr.{lower_expr}
+import layout.{container_slot_spelling}
+import std.io
+
+// What every store's outermost conversion has to name. Reading it from the same producer
+// the lowering reads it from is the point: a test that spelled the cell for itself would
+// still pass if the two ever disagreed, which is the one thing worth catching here.
+fn assert_reaches_the_cell(label: Str, built: Int) {
+    assert_eq_str(label, ir_c_spelling(built), container_slot_spelling())
+}
+
+// A call written as a statement binds no name, so it is found by walking forward from the
+// binding above it: a statement parses after that binding, so its node id is higher.
+fn call_after(anchor: Str, method: Str) -> Int {
+    let mut i = let_node_of(anchor)
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.MethodCall && node_method(i) == method { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no call of '{method}' after '{anchor}'")
+    assert(false)
+    -1
+}
+
+// The five element types that separate the three ways a slot can hold one: two integer
+// widths, an unsigned one that takes a different word, a pointer that takes no word, and a
+// value too wide for the word at all.
+fn src_reads() -> Str {
+    #"fn main() {
+    let at = 0
+    let ints: List[Int] = [1]
+    let int_read = ints[at]
+    let narrows: List[I32] = [1.to_i32()]
+    let narrow_read = narrows[at]
+    let wides: List[U64] = [1.to_u64()]
+    let wide_read = wides[at]
+    let words: List[Str] = ["a"]
+    let word_read = words[at]
+    let reals: List[Float] = [1.5]
+    let real_read = reals[at]
+    let _keep = [int_read, narrow_read.to_int(), word_read.len(), real_read.to_int()]
+}
+"#
+}
+
+fn src_stores() -> Str {
+    #"type Point { x: Int, y: Int }
+
+fn main() {
+    let mut ints: List[Int] = []
+    let n = 5
+    ints.push(n)
+    ints.set(0, n)
+    let mut narrows: List[I32] = []
+    let s = 5.to_i32()
+    narrows.push(s)
+    let mut wides: List[U64] = []
+    let u = 5.to_u64()
+    wides.push(u)
+    let mut words: List[Str] = []
+    let w = "a"
+    words.push(w)
+    let mut pts: List[Point] = []
+    let p = Point { x: 1, y: 2 }
+    pts.push(p)
+    let _keep = [ints.len(), narrows.len(), wides.len(), words.len(), pts.len()]
+}
+"#
+}
+
+// ── Out of the slot ──────────────────────────────────────────────────────
+
+// The element's own width is not the cell's width, so the value is read back at the cell's
+// width first and narrowed second. Reading it straight at its own width would ask C to
+// change the size of a pointer in one step, which is what the middle cast exists to avoid.
+test "an Int element is read back through the pointer-wide word" {
+    probe("sw_ri", src_reads())
+    let id = lower_expr(rhs_of("int_read"))
+    assert_shape("shape", id, "Cast(Cast(CallRuntime(VarRef, VarRef)))")
+    assert_eq_str("element", ir_c_spelling(id), "int64_t")
+    assert_eq_str("word", ir_c_spelling(ir_kid(id, 0)), "intptr_t")
+    assert_verifies("verify", id)
+}
+
+// The narrow element is the case the middle cast is FOR. Without it the read asks C for a
+// pointer at half the width of a pointer, which is a diagnosable conversion and not a
+// value the runtime ever stored.
+test "a narrow element is read back at the cell's width before it is narrowed" {
+    probe("sw_rn", src_reads())
+    let id = lower_expr(rhs_of("narrow_read"))
+    assert_shape("shape", id, "Cast(Cast(CallRuntime(VarRef, VarRef)))")
+    assert_eq_str("element", ir_c_spelling(id), "int32_t")
+    assert_eq_str("word", ir_c_spelling(ir_kid(id, 0)), "intptr_t")
+    assert_verifies("verify", id)
+}
+
+// A U64 above the signed maximum read back through a SIGNED word is sign-extended and
+// comes out as a different number. The unsigned word is what keeps the round trip whole,
+// so which word this element takes is asserted and not assumed to be the other one.
+test "a U64 element takes the unsigned word, not the signed one" {
+    probe("sw_rw", src_reads())
+    let id = lower_expr(rhs_of("wide_read"))
+    assert_eq_str("element", ir_c_spelling(id), "uint64_t")
+    assert_eq_str("word", ir_c_spelling(ir_kid(id, 0)), "uintptr_t")
+    assert_verifies("verify", id)
+}
+
+// A pointer element is already the width of the cell, so an integer between the two would
+// be a conversion that changes nothing and names a type the value never has.
+test "a pointer element is read back with no integer between" {
+    probe("sw_rp", src_reads())
+    let id = lower_expr(rhs_of("word_read"))
+    assert_shape("shape", id, "Cast(CallRuntime(VarRef, VarRef))")
+    assert_eq_str("element", ir_c_spelling(id), "const char*")
+    assert_verifies("verify", id)
+}
+
+// A value too wide for the cell is not punned at all: the cell holds the address of a heap
+// copy. The word belongs to the values that fit, so this read must not grow one.
+test "an element held behind a pointer is read through that pointer alone" {
+    probe("sw_rb", src_reads())
+    let id = lower_expr(rhs_of("real_read"))
+    assert_shape("shape", id, "Unbox(Cast(CallRuntime(VarRef, VarRef)))")
+    assert_eq_str("slot", ir_c_spelling(ir_kid(id, 0)), "double*")
+    assert_verifies("verify", id)
+}
+
+// ── Into the slot ────────────────────────────────────────────────────────
+
+// The mirror of the read. The value goes up to the cell's width as an integer and then
+// becomes the cell's own pointer type, because the entry point takes a pointer and C will
+// not make one out of an integer on its own.
+test "an Int element enters the slot through the pointer-wide word" {
+    probe("sw_si", src_stores())
+    let id = lower_expr(call_after("n", "push"))
+    assert_shape("shape", id, "CallRuntime(VarRef, Cast(Cast(VarRef)))")
+    let stored = ir_kid(id, 1)
+    assert_reaches_the_cell("slot", stored)
+    assert_eq_str("word", ir_c_spelling(ir_kid(stored, 0)), "intptr_t")
+    assert_verifies("verify", id)
+}
+
+test "a narrow element widens to the cell's word before it enters the slot" {
+    probe("sw_sn", src_stores())
+    let id = lower_expr(call_after("s", "push"))
+    let stored = ir_kid(id, 1)
+    assert_reaches_the_cell("slot", stored)
+    assert_eq_str("word", ir_c_spelling(ir_kid(stored, 0)), "intptr_t")
+    assert_verifies("verify", id)
+}
+
+test "a U64 element enters the slot on the unsigned word it leaves on" {
+    probe("sw_sw", src_stores())
+    let id = lower_expr(call_after("u", "push"))
+    let stored = ir_kid(id, 1)
+    assert_reaches_the_cell("slot", stored)
+    assert_eq_str("word", ir_c_spelling(ir_kid(stored, 0)), "uintptr_t")
+    assert_verifies("verify", id)
+}
+
+// A pointer element needs the cell's type and nothing else. A second conversion here would
+// put an integer in the middle of a pointer's journey for no reason.
+test "a pointer element enters the slot with one conversion" {
+    probe("sw_sp", src_stores())
+    let id = lower_expr(call_after("w", "push"))
+    assert_shape("shape", id, "CallRuntime(VarRef, Cast(VarRef))")
+    assert_reaches_the_cell("slot", ir_kid(id, 1))
+    assert_verifies("verify", id)
+}
+
+// `set` writes the element second, not first. Converting the wrong argument would send the
+// position through the word and hand the runtime a pointer where it reads an index.
+test "set converts the element it writes and leaves the position alone" {
+    probe("sw_ss", src_stores())
+    let id = lower_expr(call_after("n", "set"))
+    assert_shape("shape", id, "CallRuntime(VarRef, Const, Cast(Cast(VarRef)))")
+    assert_reaches_the_cell("slot", ir_kid(id, 2))
+    assert_verifies("verify", id)
+}
+
+// A value too wide for the word is copied to the heap, and the address it leaves behind is
+// already the cell's width. Casting a box through an integer would be the read's mirror of
+// a journey the value never took.
+test "an element too wide for the word is boxed and takes no word" {
+    probe("sw_sb", src_stores())
+    let id = lower_expr(call_after("p", "push"))
+    assert_shape("shape", id, "CallRuntime(VarRef, Box(VarRef))")
+    assert_verifies("verify", id)
+}
+
+// ── Beside a key ─────────────────────────────────────────────────────────
+
+// A map stores a value in the same kind of cell a list does, so the value travels on the
+// same word. What is different is only that a key travels beside it.
+test "a map stores its value through the same word a list element takes" {
+    probe("sw_mi", #"fn main() {
+    let mut m: Map[Str, Int] = Map.new()
+    let v = 1
+    m.insert("k", v)
+    let _keep = m.len()
+}
+"#)
+    let id = lower_expr(call_after("v", "insert"))
+    assert_shape("shape", id, "CallRuntime(VarRef, Const, Cast(Cast(VarRef)))")
+    let stored = ir_kid(id, 2)
+    assert_reaches_the_cell("slot", stored)
+    assert_eq_str("word", ir_c_spelling(ir_kid(stored, 0)), "intptr_t")
+    assert_verifies("verify", id)
+}
+
+// The read out of a map is NOT finished by the word. It answers an Option, and filling a
+// carrier takes statements this stage does not hoist, so it keeps its own name. Counting it
+// against the word would have promised that the word finished it.
+test "a map read still refuses under its own name, because the word is not its blocker" {
+    probe("sw_mg", #"fn main() {
+    let m: Map[Str, Int] = Map.new()
+    let v = m.get("k")
+    let _keep = v.is_some()
+}
+"#)
+    let built = lower_expr(rhs_of("v"))
+    assert_ice_saying("get", built, "MapSlotMethodNotLowered", "takes a value back out of the slot")
+}
