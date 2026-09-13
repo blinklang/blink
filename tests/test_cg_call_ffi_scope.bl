@@ -1,0 +1,248 @@
+// The FFI surface's calls: the scope a `with` opens, the three operations that put a
+// pointer under it, and the two ways a program reaches into what a pointer addresses.
+//
+// Every one of these is a C-level operation with no Blink body anywhere, so the stage has
+// to build each out of IR nodes and the runtime's own symbols. What decides the shape of
+// each is the tid the call carries: the scope is a runtime handle, `cstr` and `take` are
+// runtime calls over it, pointer arithmetic is arithmetic on the receiver's own pointer
+// type, and a field reached through a pointer is a dereference and then the field.
+//
+// The two allocators are the exception and are pinned here as refusals. A size is what
+// they need and no IR node spells one, so building them would mean writing a `sizeof` into
+// this stage, which is the C text no producer here may write.
+import lower_test_helpers.{
+    probe, rhs_of, let_node_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
+    assert_ice, assert_ice_saying, ice_count,
+}
+import parser.{node_kind, node_method, node_name, nodes}
+import ast.{NodeKind, nk_of}
+import layout.{binder_scope_push, bind_binder, tid_of_node}
+import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid}
+import cg_call.{lower_call}
+import std.io
+
+// A call written after `anchor`, named by the method it spells. The stdlib graph spells
+// `ffi.scope` in its own libc module, so a scan from the top of the program could answer
+// with a node this probe did not write; starting at the probe's own binding cannot.
+// The probe source, with the name the `with` binds made visible to the stage. The probe's
+// own frame holds the parameters and the `let`s of each function, and a resource binder is
+// neither, so its name is bound here. The tid is the one the RESOURCE NODE carries, which
+// is the tid the statement stage binds the name at when it opens the block; the tid of the
+// expression the resource evaluates to is a second channel, and for a handler resource the
+// two differ, so binding through that one would make this probe a different program.
+fn probe_ffi() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    probe("cg_call_ffi_scope", src_ffi())
+    bind_binder(binder_scope_push(), "scope", tid_of_node(with_resource_of("scope")))
+}
+
+fn with_resource_of(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.WithResource && node_name(i) == name { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe binds no resource named '{name}'")
+    assert(false)
+    -1
+}
+
+fn call_after(anchor: Str, method: Str) -> Int {
+    let mut i = let_node_of(anchor)
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.MethodCall && node_method(i) == method { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no call of '{method}' after '{anchor}'")
+    assert(false)
+    -1
+}
+
+fn src_ffi() -> Str {
+    #"@ffi.struct(header: "poll.h", name: "pollfd")
+type Pollfd { fd: I32, events: I16, revents: I16 }
+
+type Plain { fd: I32 }
+
+@trusted(audit: "cg-call-ffi-test")
+fn go() ! FFI {
+    let anchor = 1
+    with ffi.scope() as scope {
+        let text = scope.cstr("hello")
+        let kept = scope.take(text)
+        let sized: Ptr[Pollfd] = scope.alloc_n(2)
+        let one: Ptr[Pollfd] = scope.alloc()
+        let next = sized.offset(1)
+        let stepped = kept.offset(1)
+        let home: Ptr[Plain] = scope.alloc_n(1)
+        let stepped_home = home.offset(1)
+        let got = next.fd.read()
+        next.fd.write(7)
+        let _keep = [kept.is_null(), one.is_null(), got.to_int() == 0, next.is_null()]
+    }
+}
+
+@trusted(audit: "cg-call-ffi-test")
+fn peek(b: Bytes) -> Int ! FFI {
+    let seen = b.with_ptr(fn(p: Ptr[U8]) -> Int { p.addr() })
+    seen
+}
+
+fn main() { go() }
+"#
+}
+
+// ── The scope itself ──────────────────────────────────────────────────────
+
+test "ffi.scope opens the arena with the runtime call that answers one" {
+    probe_ffi()
+    let id = lower_call(call_after("anchor", "scope"))
+    assert_kind("kind", id, IrKind.CallRuntime)
+    assert_eq_str("symbol", ir_c_name(id), "blink_ffi_scope_new")
+    assert_shape("shape", id, "CallRuntime")
+    assert_verifies("verify", id)
+}
+
+test "the scope is spelled at the type its own tid carries, not at the pointer it holds" {
+    probe_ffi()
+    let id = lower_call(call_after("anchor", "scope"))
+    assert_eq_str("spelling", ir_c_spelling(id), "blink_list*")
+}
+
+
+// ── The two operations that put a pointer under the scope ─────────────────
+
+test "scope.cstr copies the text into the arena through the runtime call" {
+    probe_ffi()
+    let id = lower_call(rhs_of("text"))
+    assert_kind("kind", id, IrKind.CallRuntime)
+    assert_eq_str("symbol", ir_c_name(id), "blink_ffi_scope_cstr")
+    assert_shape("shape", id, "CallRuntime(VarRef, Const)")
+    assert_eq_str("receiver", ir_c_name(ir_kid(id, 0)), "scope")
+    assert_verifies("verify", id)
+}
+
+test "scope.cstr answers a pointer to bytes, which is what its tid says" {
+    probe_ffi()
+    assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("text"))), "uint8_t*")
+}
+
+test "scope.take releases the pointer from the arena and answers it back" {
+    probe_ffi()
+    let id = lower_call(rhs_of("kept"))
+    assert_kind("kind", id, IrKind.CallRuntime)
+    assert_eq_str("symbol", ir_c_name(id), "blink_ffi_scope_take")
+    assert_shape("shape", id, "CallRuntime(VarRef, VarRef)")
+    assert_verifies("verify", id)
+}
+
+test "take keeps the pointee its argument had, so its spelling is the argument's" {
+    probe_ffi()
+    assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("kept"))), "uint8_t*")
+}
+
+// ── The two allocators, refused for the size they cannot spell ────────────
+
+test "scope.alloc_n refuses: no IR node carries the size of the type it allocates" {
+    probe_ffi()
+    assert_ice_saying("alloc_n", lower_call(rhs_of("sized")), "AllocationSizeNotInIr",
+        "how many bytes")
+}
+
+test "scope.alloc refuses for the same missing size as the counted form" {
+    probe_ffi()
+    assert_ice_saying("alloc", lower_call(rhs_of("one")), "AllocationSizeNotInIr",
+        "how many bytes")
+}
+
+// ── Pointer arithmetic ────────────────────────────────────────────────────
+
+test "Ptr.offset is arithmetic on the receiver's own pointer type" {
+    probe_ffi()
+    let id = lower_call(rhs_of("next"))
+    assert_kind("kind", id, IrKind.Binary)
+    assert_eq_str("operator", ir_c_name(id), "+")
+    assert_shape("shape", id, "Binary(VarRef, Const)")
+    assert_verifies("verify", id)
+}
+
+// C steps a pointer by the size of what it points at, so the pointee is the whole of what
+// makes the arithmetic right. The spelling is pinned to the literal the foreign header
+// declares, not compared with the receiver's: the two come from one tid through one
+// memoized layout, so comparing them is an identity that no wrong spelling can fail.
+test "the step of the arithmetic is the pointee the foreign header declares" {
+    probe_ffi()
+    assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("next"))), "blink_Pollfd*")
+}
+
+// The stride is the pointee's size, so a pointer at a type no foreign header lays out has
+// no stride C can step by. `blink_list*` and `uint8_t*` both spell one word and would step
+// by a byte, which is a wrong answer written in the shape of a right one.
+test "Ptr.offset refuses when nothing declares the size of what the pointer addresses" {
+    probe_ffi()
+    assert_ice_saying("stride", lower_call(rhs_of("stepped")), "PointerStrideUnknown",
+        "no foreign header lays out")
+}
+
+// A pointer at an ordinary Blink struct is not a pointer into a foreign layout. Typecheck
+// tests the @ffi.struct annotation itself, and this stage has to test the same thing: a
+// struct C does not lay out has no size the header fixes, and reaching a field through it
+// would emit a program different from the one that typechecked.
+test "a pointer at a struct no foreign header declares has no stride either" {
+    probe_ffi()
+    assert_ice_saying("plain stride", lower_call(rhs_of("stepped_home")), "PointerStrideUnknown",
+        "no foreign header lays out")
+}
+
+// Every accepting call in the family, lowered in one probe, with the internal-error count
+// read before and after. A stage that reaches for a type a node does not carry reports a
+// compiler bug, and a report raised while merely TESTING the shape of a receiver would be
+// a bug the program does not have: the count is what proves no test on this path reports.
+test "lowering the accepted FFI calls reports no internal error" {
+    probe_ffi()
+    let before = ice_count()
+    let _ = lower_call(call_after("anchor", "scope"))
+    let _ = lower_call(rhs_of("text"))
+    let _ = lower_call(rhs_of("kept"))
+    let _ = lower_call(rhs_of("next"))
+    let _ = lower_call(rhs_of("got"))
+    assert_eq_str("ice count", "{ice_count()}", "{before}")
+}
+
+// ── A field reached through a pointer ─────────────────────────────────────
+
+test "a field read through a pointer dereferences first and reads the field second" {
+    probe_ffi()
+    let id = lower_call(rhs_of("got"))
+    assert_kind("kind", id, IrKind.FieldGet)
+    assert_eq_str("field", ir_c_name(id), "fd")
+    assert_shape("shape", id, "FieldGet(Unbox(VarRef))")
+    assert_verifies("verify", id)
+}
+
+// The field's own width, not the pointer's and not the machine word's. A read spelled at
+// any other width would take the wrong bytes out of the struct the foreign header laid out.
+test "the read is spelled at the field's declared width" {
+    probe_ffi()
+    assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("got"))), "int32_t")
+}
+
+// A store is a statement. The IR says so itself: it refuses a statement in every slot that
+// asks for a value, and a method call reaches the printer through one of those slots. So a
+// store built here could only ever be C the printer has to reject, and the refusal names
+// the stage that holds the slot a store fits.
+test "a field written through a pointer refuses: a store is a statement, not a value" {
+    probe_ffi()
+    assert_ice_saying("write", lower_call(call_after("got", "write")), "FieldStoreNotAValue",
+        "a store is a statement")
+}
+
+// ── The one operation that is not a call ──────────────────────────────────
+
+// `with_ptr` hands its body a pointer into the buffer and answers what the body computed,
+// so what it needs is a block with a binding in it. This stage builds expressions, and a
+// refusal that names the block is what tells the next reader where the work belongs.
+test "Bytes.with_ptr refuses: it is a block with a binding, not a call" {
+    probe_ffi()
+    assert_ice_saying("with_ptr", lower_call(rhs_of("seen")), "PointerBodyNotLowered",
+        "binds a pointer into the buffer")
+}
