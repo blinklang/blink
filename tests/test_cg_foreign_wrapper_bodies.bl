@@ -1,0 +1,303 @@
+// The wrapper a foreign binding stands for. A binding declares a Blink signature over a
+// C symbol and has no Blink body, so the body this stage writes is the whole conversion:
+// take the wrapper's own parameters, hand them to the foreign symbol in the shape C reads
+// them, and hand the answer back.
+//
+// The prototype is the other half. A symbol the unit's prologue already declares owns its
+// own prototype, and a second one written from a Blink signature guesses at qualifiers the
+// real header has; C rejects the mismatch. A symbol nothing declares has no prototype at
+// all, and calling it without one is not C99.
+
+import std.fs
+import std.io
+import layout.{layout_reset}
+import cname.{cname_reset, c_ffi_struct_ptr_name, cname_ffi_struct_mirror}
+import cg.{CgConfig, generate}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_named, cg_probe_ices_naming, cg_text_occurrences}
+import mono.{run_mono}
+import cg_reg.{cg_reg_type_decls}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output must not have '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    let program = cg_probe_compile(path, src)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    program
+}
+
+fn standalone_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+// `foreign_thing` is a symbol nothing declares; `labs` comes from stdlib.h, which the
+// prologue's runtime header reaches; `blink_bytes_len` is a runtime export whose wrapper
+// would carry the symbol's own name, so it is not a wrapper at all.
+fn binding_src() -> Str {
+    #"@ffi("foreign_thing")
+@trusted
+fn wrapped(x: Int) -> Int ! FFI {}
+
+@ffi("labs")
+@trusted
+fn c_labs(v: Int) -> Int ! FFI {}
+
+@ffi("noisy_thing")
+@trusted
+fn noisy(x: Int) ! FFI {}
+
+@ffi("tick_thing")
+@trusted
+fn tick() -> Int ! FFI {}
+
+@ffi("blink_bytes_len")
+@trusted
+fn bytes_len(b: Bytes) -> Int ! FFI {}
+
+fn main() { assert(true) }
+"#
+}
+
+test "a wrapper body calls the foreign symbol with the wrapper's own parameters" {
+    let program = build_probe(binding_src(), "cg_fw_call_probe")
+    let text = generate(program, standalone_cfg())
+    assert_has(text, "int64_t blink_wrapped(int64_t x) \{")
+    assert_has(text, "return foreign_thing(x);")
+    assert_eq_int("no foreign-wrapper refusal", cg_probe_ices_naming("cg foreign wrapper bodies"), 0)
+}
+
+// A value-returning wrapper that drops the call's answer would fall off the end of a
+// function whose signature promises one, so `return` is decided by the return type and
+// not by the fact that a call was written.
+test "a wrapper over a void-returning binding drops the return" {
+    let program = build_probe(binding_src(), "cg_fw_void_probe")
+    let text = generate(program, standalone_cfg())
+    assert_has(text, "void blink_noisy(int64_t x) \{")
+    assert_has(text, "noisy_thing(x);")
+    assert_lacks(text, "return noisy_thing(x);")
+}
+
+// C spells an empty parameter list `(void)`, in the wrapper and in the prototype alike,
+// or neither is a prototype and the call is unchecked.
+test "a no-parameter binding spells its empty parameter list void" {
+    let program = build_probe(binding_src(), "cg_fw_noparam_probe")
+    let text = generate(program, standalone_cfg())
+    assert_has(text, "extern int64_t tick_thing(void);")
+    assert_has(text, "int64_t blink_tick(void) \{")
+    assert_has(text, "return tick_thing();")
+}
+
+// The prototype is written for exactly the symbols the unit does not already have one
+// for. Writing a second `labs` from the Blink signature would declare `int64_t labs(int64_t)`
+// against stdlib.h's `long labs(long)`, and C rejects the pair.
+test "only a symbol the prologue does not declare gets a prototype" {
+    let program = build_probe(binding_src(), "cg_fw_proto_probe")
+    let text = generate(program, standalone_cfg())
+    assert_has(text, "extern int64_t foreign_thing(int64_t x);")
+    assert_lacks(text, "extern int64_t labs(")
+    assert_has(text, "return labs(v);")
+}
+
+// A binding whose wrapper would carry the foreign symbol's own name is not a wrapper: the
+// call goes straight to the foreign function. A body under that name would define the
+// runtime's own symbol a second time.
+test "a binding that needs no wrapper gets no body and no prototype" {
+    let program = build_probe(binding_src(), "cg_fw_nowrapper_probe")
+    let text = generate(program, standalone_cfg())
+    assert_lacks(text, "blink_bytes_len(blink_bytes b) \{")
+    assert_lacks(text, "extern int64_t blink_bytes_len(")
+}
+
+// One symbol, one wrapper, however many times the unit walks the declaration.
+test "a binding is wrapped once" {
+    let program = build_probe(binding_src(), "cg_fw_once_probe")
+    let text = generate(program, standalone_cfg())
+    assert_eq_int("one prototype for the undeclared symbol",
+        cg_text_occurrences(text, "extern int64_t foreign_thing(int64_t x);"), 1)
+    assert_eq_int("one wrapper definition",
+        cg_text_occurrences(text, "int64_t blink_wrapped(int64_t x) \{"), 1)
+}
+
+// An @ffi.struct type is a Blink mirror of a C struct that a foreign header declares. The
+// mirror and the original are different types to C, so an argument crossing to a symbol
+// the real header declared must be spelled as the original.
+fn mirror_src() -> Str {
+    #"@ffi.struct(header: "poll.h", name: "pollfd")
+pub type Pollfd { fd: I32, events: I16, revents: I16 }
+
+@ffi("poll")
+@trusted(audit: "test row: wraps poll(2)")
+fn my_poll(fds: Ptr[Pollfd], nfds: U64, t: I32) -> I32 ! FFI {}
+
+fn main() { assert(true) }
+"#
+}
+
+test "a pointer to an @ffi.struct mirror crosses as the C struct the mirror names" {
+    let program = build_probe(mirror_src(), "cg_fw_mirror_probe")
+    let text = generate(program, standalone_cfg())
+    assert_lacks(text, "extern int32_t poll(")
+    assert_has(text, "(struct pollfd*)")
+    assert_eq_int("the other two arguments cross unchanged",
+        cg_text_occurrences(text, "nfds, t)"), 1)
+}
+
+// The mirror's own C name reaches the boundary from one producer, so a reader that wants
+// the foreign original asks for it rather than assembling it from the annotation again.
+test "the mirror's foreign spelling comes from the name it declares" {
+    let program = build_probe(mirror_src(), "cg_fw_mirror_name_probe")
+    let _text = generate(program, standalone_cfg())
+    let decl = first_mirror_decl()
+    assert(decl >= 0)
+    assert(cname_ffi_struct_mirror(decl))
+    assert(c_ffi_struct_ptr_name(decl) == "struct pollfd*")
+}
+
+fn first_mirror_decl() -> Int {
+    for td in cg_reg_type_decls() {
+        if cname_ffi_struct_mirror(td) { return td }
+    }
+    -1
+}
+
+// A mirror passed by value has no conversion: C forbids a cast between two struct types,
+// so the wrapper would hand the foreign function a struct of the wrong type under a name
+// that compiles. The gap is named rather than emitted.
+fn by_value_src() -> Str {
+    #"@ffi.struct(header: "poll.h", name: "pollfd")
+pub type Pollfd { fd: I32, events: I16, revents: I16 }
+
+@ffi("poll")
+@trusted(audit: "test row: a mirror by value")
+fn by_value(p: Pollfd) -> I32 ! FFI {}
+
+fn main() { assert(true) }
+"#
+}
+
+test "an @ffi.struct mirror passed by value refuses by name" {
+    let program = build_probe(by_value_src(), "cg_fw_byvalue_probe")
+    let _text = generate(program, standalone_cfg())
+    assert_eq_int("the shape that cannot be converted is named once",
+        cg_probe_ices_named("ForeignShapeNotConvertible"), 1)
+}
+
+// A mirror that names no C original cannot be spelled as the original at all.
+fn unnamed_mirror_src() -> Str {
+    #"@ffi.struct(header: "poll.h")
+pub type Pollfd { fd: I32, events: I16, revents: I16 }
+
+@ffi("poll")
+@trusted(audit: "test row: a mirror with no C name")
+fn my_poll(fds: Ptr[Pollfd], nfds: U64, t: I32) -> I32 ! FFI {}
+
+fn main() { assert(true) }
+"#
+}
+
+test "a mirror that names no C original refuses by name" {
+    let program = build_probe(unnamed_mirror_src(), "cg_fw_unnamed_probe")
+    let _text = generate(program, standalone_cfg())
+    assert_eq_int("the mirror with no C name is named once",
+        cg_probe_ices_named("ForeignShapeNotConvertible"), 1)
+}
+
+// An answer is stricter than an argument. It arrives under the foreign spelling and this
+// stage writes no conversion on the way out, so a mirror the wrapper returns is refused
+// whether or not the mirror names a C struct.
+fn mirror_return_src(ann: Str) -> Str {
+    let head = #"@ffi.struct("#.concat(ann).concat(#")
+pub type Pollfd { fd: I32, events: I16, revents: I16 }
+
+@ffi("poll")
+@trusted(audit: "test row: a mirror in the answer")
+fn ret_mirror(x: Int) -> Ptr[Pollfd] ! FFI {}
+
+fn main() { assert(true) }
+"#)
+    head
+}
+
+test "a returned pointer to a named mirror refuses by name" {
+    let program = build_probe(mirror_return_src(#"header: "poll.h", name: "pollfd""#),
+        "cg_fw_ret_named_probe")
+    let _text = generate(program, standalone_cfg())
+    assert_eq_int("the returned mirror is named once",
+        cg_probe_ices_named("ForeignShapeNotConvertible"), 1)
+}
+
+test "a returned pointer to a mirror that names no C original refuses by name" {
+    let program = build_probe(mirror_return_src(#"header: "poll.h""#), "cg_fw_ret_unnamed_probe")
+    let _text = generate(program, standalone_cfg())
+    assert_eq_int("the returned unnamed mirror is named once",
+        cg_probe_ices_named("ForeignShapeNotConvertible"), 1)
+}
+
+// A cast reaches one pointer level. A second level would hand the foreign function a
+// pointer to the mirror's own spelling under the original's name.
+fn mirror_ptr_ptr_src() -> Str {
+    #"@ffi.struct(header: "poll.h", name: "pollfd")
+pub type Pollfd { fd: I32, events: I16, revents: I16 }
+
+@ffi("poll")
+@trusted(audit: "test row: two pointer levels to a mirror")
+fn ptr_ptr(fds: Ptr[Ptr[Pollfd]]) -> I32 ! FFI {}
+
+fn main() { assert(true) }
+"#
+}
+
+test "a pointer to a pointer to a mirror refuses by name" {
+    let program = build_probe(mirror_ptr_ptr_src(), "cg_fw_ptr_ptr_probe")
+    let _text = generate(program, standalone_cfg())
+    assert_eq_int("the second pointer level is named once",
+        cg_probe_ices_named("ForeignShapeNotConvertible"), 1)
+}
+
+// C takes one declaration per symbol. Two bindings that ask for different prototypes over
+// one symbol cannot both be written, and picking either makes one wrapper call the foreign
+// function under a signature its own source never wrote.
+fn two_prototypes_src() -> Str {
+    #"@ffi("foreign_thing")
+@trusted
+fn as_int(x: Int) -> Int ! FFI {}
+
+@ffi("foreign_thing")
+@trusted
+fn as_i32(x: I32) -> Int ! FFI {}
+
+fn main() { assert(true) }
+"#
+}
+
+test "two bindings over one symbol asking for different prototypes refuse by name" {
+    let program = build_probe(two_prototypes_src(), "cg_fw_two_protos_probe")
+    let text = generate(program, standalone_cfg())
+    assert_eq_int("the disagreement is named once",
+        cg_probe_ices_named("ForeignSymbolTwoPrototypes"), 1)
+    assert_eq_int("one prototype is written",
+        cg_text_occurrences(text, "extern int64_t foreign_thing("), 1)
+}
