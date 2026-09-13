@@ -224,3 +224,80 @@ test "a mirror that names no C original refuses by name" {
     assert_eq_int("the mirror with no C name is named once",
         cg_probe_ices_named("ForeignShapeNotConvertible"), 1)
 }
+
+// An answer is stricter than an argument. It arrives under the foreign spelling and this
+// stage writes no conversion on the way out, so a mirror the wrapper returns is refused
+// whether or not the mirror names a C struct.
+fn mirror_return_src(ann: Str) -> Str {
+    let head = #"@ffi.struct("#.concat(ann).concat(#")
+pub type Pollfd { fd: I32, events: I16, revents: I16 }
+
+@ffi("poll")
+@trusted(audit: "test row: a mirror in the answer")
+fn ret_mirror(x: Int) -> Ptr[Pollfd] ! FFI {}
+
+fn main() { assert(true) }
+"#)
+    head
+}
+
+test "a returned pointer to a named mirror refuses by name" {
+    let program = build_probe(mirror_return_src(#"header: "poll.h", name: "pollfd""#),
+        "cg_fw_ret_named_probe")
+    let _text = generate(program, standalone_cfg())
+    assert_eq_int("the returned mirror is named once",
+        cg_probe_ices_named("ForeignShapeNotConvertible"), 1)
+}
+
+test "a returned pointer to a mirror that names no C original refuses by name" {
+    let program = build_probe(mirror_return_src(#"header: "poll.h""#), "cg_fw_ret_unnamed_probe")
+    let _text = generate(program, standalone_cfg())
+    assert_eq_int("the returned unnamed mirror is named once",
+        cg_probe_ices_named("ForeignShapeNotConvertible"), 1)
+}
+
+// A cast reaches one pointer level. A second level would hand the foreign function a
+// pointer to the mirror's own spelling under the original's name.
+fn mirror_ptr_ptr_src() -> Str {
+    #"@ffi.struct(header: "poll.h", name: "pollfd")
+pub type Pollfd { fd: I32, events: I16, revents: I16 }
+
+@ffi("poll")
+@trusted(audit: "test row: two pointer levels to a mirror")
+fn ptr_ptr(fds: Ptr[Ptr[Pollfd]]) -> I32 ! FFI {}
+
+fn main() { assert(true) }
+"#
+}
+
+test "a pointer to a pointer to a mirror refuses by name" {
+    let program = build_probe(mirror_ptr_ptr_src(), "cg_fw_ptr_ptr_probe")
+    let _text = generate(program, standalone_cfg())
+    assert_eq_int("the second pointer level is named once",
+        cg_probe_ices_named("ForeignShapeNotConvertible"), 1)
+}
+
+// C takes one declaration per symbol. Two bindings that ask for different prototypes over
+// one symbol cannot both be written, and picking either makes one wrapper call the foreign
+// function under a signature its own source never wrote.
+fn two_prototypes_src() -> Str {
+    #"@ffi("foreign_thing")
+@trusted
+fn as_int(x: Int) -> Int ! FFI {}
+
+@ffi("foreign_thing")
+@trusted
+fn as_i32(x: I32) -> Int ! FFI {}
+
+fn main() { assert(true) }
+"#
+}
+
+test "two bindings over one symbol asking for different prototypes refuse by name" {
+    let program = build_probe(two_prototypes_src(), "cg_fw_two_protos_probe")
+    let text = generate(program, standalone_cfg())
+    assert_eq_int("the disagreement is named once",
+        cg_probe_ices_named("ForeignSymbolTwoPrototypes"), 1)
+    assert_eq_int("one prototype is written",
+        cg_text_occurrences(text, "extern int64_t foreign_thing("), 1)
+}
