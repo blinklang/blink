@@ -1,0 +1,172 @@
+// What a container literal puts in each slot. A slot is one pointer-wide cell, and an
+// element enters it in one of three forms. A value that is already a pointer is spelled as
+// the cell and nothing more. A word-sized value that is not a pointer is first spelled as an
+// integer of the cell's width, then as the cell, because C converts a kind or a width in one
+// step and not both. Anything else is copied to the heap and the cell holds the address.
+//
+// The literal is not a second way into that cell. A push writes the same slot and a read
+// takes the value out of it, so all three ask the layout layer and none of them decides for
+// itself. A literal that converted where the read does not would fill a list whose elements
+// give back other values than the ones written, and no stage between the two could detect it.
+
+import lower_test_helpers.{
+    probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
+    assert_ice_saying, ice_count,
+}
+import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid, ir_node_count}
+import layout.{container_slot_spelling}
+import cg_expr.{lower_expr}
+
+// The outermost conversion of every element. It is read from the producer the lowering
+// reads it from, because a test that spelled the cell for itself would still pass if the
+// two ever disagreed, which is the one failure worth catching here.
+fn assert_reaches_the_cell(label: Str, built: Int) {
+    assert_eq_str(label, ir_c_spelling(built), container_slot_spelling())
+}
+
+fn src_slots() -> Str {
+    #"type Point { x: Int, y: Int }
+type Colour { Red, Green }
+fn main() {
+    let ints = [1, 2, 3]
+    let words = ["a", "b"]
+    let reals = [1.5, 2.5]
+    let flags = [true, false]
+    let hues = [Colour.Red, Colour.Green]
+    let points = [Point { x: 1, y: 2 }]
+    let opts = [Some(1), None]
+    let empty: List[Int] = []
+    let _keep = [ints.len(), words.len(), reals.len(), flags.len()]
+    let _keep2 = [hues.len(), points.len(), opts.len(), empty.len()]
+}
+"#
+}
+
+// An Int is the width of a pointer on every target this compiler builds for, but it is an
+// integer and the cell is a pointer. The integer of the cell's width separates the two
+// conversions.
+test "an integer element is spelled as the cell's own integer before the cell" {
+    probe("cg_expr_slots", src_slots())
+    let id = lower_expr(rhs_of("ints"))
+    assert_kind("kind", id, IrKind.ContainerNew)
+    assert_shape("shape", id, "ContainerNew(Cast(Cast(Const)), Cast(Cast(Const)), Cast(Cast(Const)))")
+    let first = ir_kid(id, 0)
+    assert_reaches_the_cell("the cell", first)
+    assert_eq_str("the width between", ir_c_spelling(ir_kid(first, 0)), "intptr_t")
+    assert_eq_str("the element", ir_c_name(ir_kid(ir_kid(first, 0), 0)), "1")
+    assert_verifies("verify", id)
+}
+
+// A Str is a pointer and is already the cell's width, so an integer between the two would
+// convert a pointer to an integer and back to no effect.
+test "a pointer element is spelled as the cell once, with no integer between" {
+    probe("cg_expr_slots", src_slots())
+    let id = lower_expr(rhs_of("words"))
+    assert_shape("shape", id, "ContainerNew(Cast(Const), Cast(Const))")
+    assert_reaches_the_cell("the cell", ir_kid(id, 0))
+    assert_verifies("verify", id)
+}
+
+// A double read back through an integer is a different number, so layout answers a pointer
+// for a Float and the literal copies the value to the heap.
+test "a float element is copied to the heap and the address enters the slot" {
+    probe("cg_expr_slots", src_slots())
+    let id = lower_expr(rhs_of("reals"))
+    assert_shape("shape", id, "ContainerNew(Box(Const), Box(Const))")
+    assert_eq_str("the slot's pointer", ir_c_spelling(ir_kid(id, 0)), "double*")
+    assert_verifies("verify", id)
+}
+
+// A struct is wider than one cell. The form is the one a Float takes, for the other reason:
+// a Float is word-sized and a struct is not.
+test "a struct element too wide for one cell is copied to the heap" {
+    probe("cg_expr_slots", src_slots())
+    let id = lower_expr(rhs_of("points"))
+    assert_shape("shape", id, "ContainerNew(Box(StructNew(Const, Const)))")
+    assert_eq_str("the slot's pointer", ir_c_spelling(ir_kid(id, 0)), "blink_Point*")
+    assert_verifies("verify", id)
+}
+
+// An Option over an Int holds a tag and a payload, which is wider than one cell. An Option
+// is not boxed for being an Option: one over an opaque handle is the handle itself and is
+// word-sized, so the form is read from the layout and not from the kind.
+test "a carrier element wider than one cell is copied to the heap" {
+    probe("cg_expr_slots", src_slots())
+    let id = lower_expr(rhs_of("opts"))
+    assert_shape("shape", id, "ContainerNew(Box(CarrierWrap(Const, Const)), Box(CarrierWrap(Const)))")
+    assert_eq_str("the slot's pointer", ir_c_spelling(ir_kid(id, 0)), "blink_Option_int*")
+    assert_verifies("verify", id)
+}
+
+// A Bool and an ordinal variant are word-sized values that are not pointers, so both take
+// the integer. Naming them pins the form to the slot and not to the Int type.
+test "a bool and an ordinal variant take the same integer an Int takes" {
+    probe("cg_expr_slots", src_slots())
+    let flags = lower_expr(rhs_of("flags"))
+    assert_shape("bools", flags, "ContainerNew(Cast(Cast(Const)), Cast(Cast(Const)))")
+    assert_eq_str("the width between", ir_c_spelling(ir_kid(ir_kid(flags, 0), 0)), "intptr_t")
+    assert_verifies("verify bools", flags)
+    let hues = lower_expr(rhs_of("hues"))
+    assert_shape("ordinals", hues, "ContainerNew(Cast(Cast(Const)), Cast(Cast(Const)))")
+    assert_eq_str("the width between", ir_c_spelling(ir_kid(ir_kid(hues, 0), 0)), "intptr_t")
+    assert_verifies("verify ordinals", hues)
+}
+
+// A literal with no elements names the element type and fills no slot. The constructor is
+// still built, and it refuses nothing: a slot that is never filled cannot decline.
+test "an empty literal converts nothing and refuses nothing" {
+    probe("cg_expr_slots", src_slots())
+    let before = ice_count()
+    let id = lower_expr(rhs_of("empty"))
+    assert_kind("kind", id, IrKind.ContainerNew)
+    assert_shape("shape", id, "ContainerNew")
+    assert_eq(ice_count(), before)
+    assert_verifies("verify", id)
+}
+
+fn src_unspellable_element() -> Str {
+    #"fn hold[T](v: T) -> Int {
+    let xs = [v]
+    xs.len()
+}
+fn main() {
+    let _keep = hold(1)
+}
+"#
+}
+
+// An element whose type never resolved has no layout to enter a slot by, so the literal
+// refuses by the name of that gap rather than filling the cell in the form the raw value
+// happens to carry. The name is the one the read route refuses under, because the gap is the
+// same one: neither route can shape a slot the layout layer declined.
+//
+// The count of arena nodes does not move. The slot is shaped before the element is lowered,
+// so a refusal leaves no operand behind that nothing names.
+test "an element with no slot form is refused by name and strands no node" {
+    probe("cg_expr_slots_unspellable", src_unspellable_element())
+    let before = ir_node_count()
+    assert_ice_saying("refused", lower_expr(rhs_of("xs")),
+        "UnspellableElementType", "container element has no C layout")
+    assert_eq(ir_node_count(), before)
+}
+
+fn src_two_unspellable_elements() -> Str {
+    #"fn hold[T](v: T) -> Int {
+    let xs = [v, v]
+    xs.len()
+}
+fn main() {
+    let _keep = hold(1)
+}
+"#
+}
+
+// Every element of one literal has the same type, so every element after the first would
+// report the same gap for the same reason. One cause is one refusal: the loop stops at the
+// first element it cannot build. A reader given the same sentence once per element cannot
+// tell one gap from several.
+test "a literal with two unspellable elements refuses once, not once per element" {
+    probe("cg_expr_slots_two_unspellable", src_two_unspellable_elements())
+    assert_ice_saying("refused once", lower_expr(rhs_of("xs")),
+        "UnspellableElementType", "container element has no C layout")
+}
