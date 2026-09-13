@@ -1,0 +1,214 @@
+// A method call that converts one scalar to another.
+//
+// Every one of these is a single C cast, and the type it casts to is the type the CALL
+// answers, not the type the receiver has: `to_i8` narrows and `to_int` widens from the
+// same receiver, and a cast that spelled the receiver would answer both of them wrong.
+// The spelling is layout's answer for the call's own tid, so nothing here writes a C type
+// and the cast can never disagree with what the value is declared as elsewhere.
+//
+// A conversion that is not one cast is not here. `to_string` calls the standard library
+// function that renders the number, and it is pinned as a call rather than a cast so the
+// two families cannot be confused for one another.
+import lower_test_helpers.{
+    probe, rhs_of, assert_eq_str, assert_shape, assert_verifies, assert_ice_saying,
+}
+import ir.{ir_c_spelling, ir_c_name, ir_tid}
+import layout.{tid_of_node}
+import cg_expr.{lower_expr, cg_expr_take_pending}
+
+// The conversions that widen, narrow and reinterpret, each written on the receiver the
+// method is declared for.
+fn src_casts() -> Str {
+    #"fn main() {
+    let i = 7
+    let f = 1.5
+    let c: Char = 'q'
+    let w = i.to_float()
+    let t = f.to_int()
+    let n = i.to_i8()
+    let u = i.to_u8()
+    let m = i.to_i32()
+    let b = i.to_u64()
+    let back = m.to_int()
+    let p = c.to_int()
+    let _keep = [t, n.to_int(), u.to_int(), back, p]
+    let _also = [w]
+    let _more = b
+}
+"#
+}
+
+// An unsigned receiver at the widest size, converting both up to Int and down to a byte.
+// U64 is the one sized type whose values do not all fit in the Int it converts to.
+fn src_unsigned() -> Str {
+    #"fn main() {
+    let u: U64 = 9
+    let wide = u.to_int()
+    let narrow = u.to_u8()
+    let _keep = [wide, narrow.to_int()]
+}
+"#
+}
+
+// A receiver that is itself built by a statement. `unwrap` binds the carrier and guards
+// it before reading, so lowering this receiver runs two statements before the value
+// exists.
+fn src_hoisting_receiver() -> Str {
+    #"fn main() {
+    let o: Option[Int] = Some(1)
+    let hv = o.unwrap().to_float()
+    let _keep = hv
+}
+"#
+}
+
+// A conversion written with an argument it does not take. Typecheck accepts this, so the
+// count is checked here or the argument is dropped without ever being evaluated.
+fn src_long_cast() -> Str {
+    #"fn main() {
+    let i = 7
+    let w = i.to_float(1)
+    let _keep = w
+}
+"#
+}
+
+// A Char rendered as text. The character is a code point and a string is bytes, so this
+// one encodes rather than reinterprets.
+fn src_char_to_str() -> Str {
+    #"fn main() {
+    let c: Char = 'q'
+    let s = c.to_str()
+    let _keep = s
+}
+"#
+}
+
+// Rendering a number as text. This is a call into the standard library, not a cast.
+fn src_to_string() -> Str {
+    #"fn main() {
+    let i = 7
+    let f = 1.5
+    let a = i.to_string()
+    let b = f.to_string()
+    let _keep = [a, b]
+}
+"#
+}
+
+// The cast target is read off the call, so a widening conversion answers the wide type.
+test "to_float casts the receiver to the float spelling" {
+    probe("sc_f", src_casts())
+    let built = lower_expr(rhs_of("w"))
+    assert_shape("widen", built, "Cast(VarRef)")
+    assert_eq_str("target", ir_c_spelling(built), "double")
+    assert_verifies("widen", built)
+}
+
+// Float to Int truncates toward zero, which is what a plain C cast does. What is pinned
+// here is that it IS a plain cast: a rounding helper would answer a different number for
+// every value that is not already whole.
+test "to_int on a Float casts rather than calling a rounding helper" {
+    probe("sc_t", src_casts())
+    let built = lower_expr(rhs_of("t"))
+    assert_shape("truncate", built, "Cast(VarRef)")
+    assert_eq_str("target", ir_c_spelling(built), "int64_t")
+}
+
+// The narrowing conversions. Each answers its own width, and each is unsigned or signed
+// as its name says: casting to the wrong one of a pair changes what every value above
+// half the range converts to.
+test "each sized conversion casts to its own width and signedness" {
+    probe("sc_n", src_casts())
+    assert_eq_str("to_i8", ir_c_spelling(lower_expr(rhs_of("n"))), "int8_t")
+    assert_eq_str("to_u8", ir_c_spelling(lower_expr(rhs_of("u"))), "uint8_t")
+    assert_eq_str("to_i32", ir_c_spelling(lower_expr(rhs_of("m"))), "int32_t")
+    assert_eq_str("to_u64", ir_c_spelling(lower_expr(rhs_of("b"))), "uint64_t")
+}
+
+// A sized receiver widening back to Int. The receiver is an I32 here and an Int in the
+// test above, and both answer the call's type: a cast spelled from the receiver would
+// answer int32_t for this one.
+test "to_int on a sized receiver widens to the int spelling" {
+    probe("sc_w", src_casts())
+    let built = lower_expr(rhs_of("back"))
+    assert_shape("widen", built, "Cast(VarRef)")
+    assert_eq_str("target", ir_c_spelling(built), "int64_t")
+}
+
+// A Char is narrower than an Int, so this conversion widens. It is a cast and not a
+// lookup: a Char holds its own code point.
+test "to_int on a Char widens to the int spelling" {
+    probe("sc_c", src_casts())
+    let built = lower_expr(rhs_of("p"))
+    assert_shape("widen", built, "Cast(VarRef)")
+    assert_eq_str("target", ir_c_spelling(built), "int64_t")
+}
+
+// A cast is one expression. Nothing is bound and nothing runs before it, so a conversion
+// written inside a condition or an argument cannot move work out of the place it was
+// written in.
+test "a conversion hoists no statement" {
+    probe("sc_h", src_casts())
+    let _built = lower_expr(rhs_of("w"))
+    let stmts = cg_expr_take_pending(0)
+    assert_eq_str("hoisted", "{stmts.len()}", "0")
+}
+
+// A U64 receiver converts like any other sized integer. Pinned separately because U64 is
+// the only one that reaches `to_int` through the unsigned half of the table.
+test "an unsigned receiver converts both up and down" {
+    probe("sc_u", src_unsigned())
+    assert_eq_str("to_int", ir_c_spelling(lower_expr(rhs_of("wide"))), "int64_t")
+    assert_eq_str("to_u8", ir_c_spelling(lower_expr(rhs_of("narrow"))), "uint8_t")
+}
+
+// The receiver is lowered once. Lowering it a second time would run the statements it
+// hoists a second time, so a carrier would be bound and guarded twice and any call in the
+// receiver would run twice.
+test "a conversion lowers its receiver once" {
+    probe("sc_r", src_hoisting_receiver())
+    let built = lower_expr(rhs_of("hv"))
+    assert_shape("cast", built, "Cast(CarrierUnwrap(VarRef))")
+    let stmts = cg_expr_take_pending(0)
+    assert_eq_str("hoisted", "{stmts.len()}", "2")
+}
+
+// Rendering is a call, not a cast. Pinned apart from the casts because the two answer the
+// same question for different types and only one of them evaluates anything.
+test "to_string calls the library function that renders the number" {
+    probe("sc_s", src_to_string())
+    let int_call = lower_expr(rhs_of("a"))
+    let float_call = lower_expr(rhs_of("b"))
+    assert_shape("int", int_call, "CallDirect(VarRef)")
+    assert_shape("float", float_call, "CallDirect(VarRef)")
+    // Which function each reaches, not merely that each reaches one. The two render
+    // different types and the same shape, so a swapped pair would read a double out of an
+    // integer and print whatever those bits spell.
+    assert_eq_str("int renderer", ir_c_name(int_call), "blink_std_num_int_to_str")
+    assert_eq_str("float renderer", ir_c_name(float_call), "blink_std_num_float_to_str")
+}
+
+// Encoding a code point as bytes is the runtime's work: the answer is a string whose
+// length depends on the character, so no cast can produce it.
+test "to_str on a Char calls the runtime encoder" {
+    probe("sc_cs", src_char_to_str())
+    let built = lower_expr(rhs_of("s"))
+    assert_shape("encode", built, "CallRuntime(VarRef)")
+    assert_eq_str("helper", ir_c_name(built), "blink_char_to_str")
+    assert_eq_str("answers", ir_c_spelling(built), "const char*")
+    // The type the node carries is the one typecheck put on the call, not a type this
+    // stage picked. They agree today; pinning them together is what makes a later
+    // disagreement a failing test instead of a silently mistyped node.
+    assert_eq_str("answers the call's own type",
+        "{ir_tid(built)}", "{tid_of_node(rhs_of("s"))}")
+    assert_verifies("encode", built)
+}
+
+// An argument the method does not take is refused by name. Dropping it would discard
+// whatever the argument evaluates to, and a call written that way would silently do less
+// than it says.
+test "a conversion written with an argument is refused by name" {
+    probe("sc_a", src_long_cast())
+    assert_ice_saying("arity", lower_expr(rhs_of("w")), "IntrinsicArityWrong", "takes 0 argument(s), and this call was given 1")
+}

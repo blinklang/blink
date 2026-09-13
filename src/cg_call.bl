@@ -858,6 +858,8 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if declared != "" { return lower_intrinsic_method(node, obj, kind, mname, declared) }
     let primitive = cc_runtime_method(kind, mname)
     if primitive != "" { return cc_lower_runtime_method(node, obj, kind, mname, primitive) }
+    if cc_is_scalar_cast(kind, mname) { return cc_scalar_cast(node, obj, kind, mname) }
+    if cc_is_char_text(kind, mname) { return cc_char_text(node, obj, kind, mname) }
     if cc_is_carrier_test(kind, mname) { return cc_carrier_test(node, obj, kind, mname) }
     if cc_is_carrier_read(kind, mname) { return cc_carrier_read(node, obj, kind, mname) }
     let im = cc_impl_with_method(node, recv_tid, mname)
@@ -986,6 +988,87 @@ fn cc_runtime_method_arity(op: Str) -> Int {
     NO_ARITY
 }
 
+// ── Scalar conversions ────────────────────────────────────────────────────
+//
+// A conversion between two scalars is one C cast: the value is reinterpreted at a new
+// width, and no call, no check and no rounding stands between the receiver and the
+// answer. Narrowing wraps and Float to Int truncates toward zero, both of which are what
+// the cast itself does, so neither needs anything written for it.
+//
+// Which pairs these are is typecheck's table, read here by the same two keys it is
+// written with: a receiver that IS a scalar, and a method named for what it answers.
+
+fn cc_is_scalar_cast(kind: TyKind, method: Str) -> Bool {
+    if method == "to_int" { return kind == TyKind.Float || kind == TyKind.Char || cc_is_sized_int(kind) }
+    if kind == TyKind.Int && method == "to_float" { return true }
+    if kind != TyKind.Int && !cc_is_sized_int(kind) { return false }
+    cc_names_int_width(method)
+}
+
+fn cc_is_sized_int(kind: TyKind) -> Bool {
+    match kind {
+        TyKind.I8 => true
+        TyKind.I16 => true
+        TyKind.I32 => true
+        TyKind.U8 => true
+        TyKind.U16 => true
+        TyKind.U32 => true
+        TyKind.U64 => true
+        _ => false
+    }
+}
+
+fn cc_names_int_width(method: Str) -> Bool {
+    if method == "to_i8" { return true }
+    if method == "to_i16" { return true }
+    if method == "to_i32" { return true }
+    if method == "to_u8" { return true }
+    if method == "to_u16" { return true }
+    if method == "to_u32" { return true }
+    if method == "to_u64" { return true }
+    false
+}
+
+// The cast is spelled from the type the CALL answers, never from the receiver's. One
+// method name narrows from one receiver and widens from another -- `to_int` is both --
+// so the receiver's own width says nothing about which of the two this call is, and the
+// call's tid is the only thing that does.
+fn cc_scalar_cast(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, kind, method, 0, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let answer = cc_local(tid, node)
+    if cc_stopped(answer) { return -1 }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    ir_cast(tid, node, answer.c_spelling, recv)
+}
+
+fn cc_is_char_text(kind: TyKind, method: Str) -> Bool {
+    kind == TyKind.Char && method == "to_str"
+}
+
+// A Char rendered as text. This is the one conversion off a scalar that no cast can make:
+// a code point becomes one to four bytes, and how many it becomes depends on the value.
+// The runtime encodes it, and the same helper the interpolation of a Char reaches.
+//
+// What the call answers is read off the call, the same way a cast reads it. Str is what
+// typecheck records here today, but writing Str instead of asking would make this the
+// second place that decides, and the one place that could not be told it was wrong.
+fn cc_char_text(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, kind, method, 0, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let answer = cc_local(tid, node)
+    if cc_stopped(answer) { return -1 }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    ir_call_runtime(tid, node, answer.c_spelling, c_runtime_helper("char_to_str"),
+        answer.slot_form, [recv])
+}
+
 // ── Carriers ──────────────────────────────────────────────────────────────
 //
 // Option and Result are built by the compiler, so no declaration answers their methods and
@@ -1021,27 +1104,22 @@ fn cc_is_carrier_read(kind: TyKind, method: Str) -> Bool {
 // receiver is named once by the comparison itself, and no statement precedes it.
 fn cc_carrier_test(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
     if !cc_carrier_arity_ok(node, kind, method) { return -1 }
-    let carrier = tid_of_node(obj)
-    if carrier < 0 { return -1 }
-    let held = cc_local(carrier, node)
-    if cc_stopped(held) { return -1 }
-    let g = cc_guard_spellings(node)
-    if cc_guard_stopped(g) { return -1 }
+    let c = cc_carrier_of(node, obj)
+    if cc_carrier_missing(c) { return -1 }
     let recv = lower_expr(obj)
     if recv < 0 { return -1 }
-    if held.slot_form == SlotForm.InlineWord {
-        return cc_handle_is(node, carrier, held, g, recv, method == "is_some")
+    if c.held.slot_form == SlotForm.InlineWord {
+        return cc_handle_is(node, c, recv, method == "is_some")
     }
-    cc_tag_equals(node, ir_carrier_tag(TYPE_INT, node, g.tag, recv), cc_carrier_true_tag(kind, method), g)
+    cc_tag_equals(node, ir_carrier_tag(TYPE_INT, node, c.g.tag, recv), cc_carrier_true_tag(kind, method), c)
 }
 
 // A carrier layout answers one machine word only for the Option over an @ffi.opaque
 // handle, which is the handle itself: no tag member and no value member. None is written
 // as the null handle, so that one comparison is the whole test.
-fn cc_handle_is(node: Int, carrier: Int, held: LayoutRecord, g: GuardSpellings, on: Int,
-                present: Bool) -> Int {
+fn cc_handle_is(node: Int, c: CarrierRef, on: Int, present: Bool) -> Int {
     let op = if present { "!=" } else { "==" }
-    ir_binary(TYPE_BOOL, node, g.answer, op, on, ir_const(carrier, node, held.c_spelling, "0"))
+    ir_binary(TYPE_BOOL, node, c.g.answer, op, on, ir_const(c.tid, node, c.held.c_spelling, "0"))
 }
 
 // The tag each test answers true for. It is read off the carrier kind as well as the name
@@ -1060,35 +1138,30 @@ fn cc_carrier_true_tag(kind: TyKind, method: Str) -> Int {
 fn cc_carrier_read(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
     if !cc_carrier_arity_ok(node, kind, method) { return -1 }
     if kind == TyKind.Result { return cc_carrier_panic_unrendered(node, method) }
-    let carrier = tid_of_node(obj)
-    if carrier < 0 { return -1 }
+    let c = cc_carrier_of(node, obj)
+    if cc_carrier_missing(c) { return -1 }
     let inner = tid_of_node(node)
     if inner < 0 { return -1 }
-    let held = cc_local(carrier, node)
-    if cc_stopped(held) { return -1 }
-    let _td = ensure_typedef_for(carrier)
-    let member = cc_member_layout(node, carrier, Slot.Inner1)
+    let _td = ensure_typedef_for(c.tid)
+    let member = cc_member_layout(node, c.tid, Slot.Inner1)
     if cc_stopped(member) { return -1 }
     let value = cc_local(inner, node)
     if cc_stopped(value) { return -1 }
-    let g = cc_guard_spellings(node)
-    if cc_guard_stopped(g) { return -1 }
     // The receiver is bound before it is read twice. The guard and the read each name the
     // binding, so an expression that produced the carrier runs once however many times the
     // carrier itself is read.
     let recv = lower_expr(obj)
     if recv < 0 { return -1 }
     let name = c_mint_local("u")
-    cg_expr_push_pending(node, ir_let(carrier, node, held.c_spelling, name, held.slot_form, recv))
-    let ref = cc_carrier_ref(node, carrier, held, name)
-    if held.slot_form == SlotForm.InlineWord {
-        cc_push_guard(node, g, cc_handle_is(node, carrier, held, g, ref, false))
-        return ir_cast(inner, node, value.c_spelling, cc_carrier_ref(node, carrier, held, name))
+    cg_expr_push_pending(node, ir_let(c.tid, node, c.held.c_spelling, name, c.held.slot_form, recv))
+    if c.held.slot_form == SlotForm.InlineWord {
+        cc_push_guard(node, c, cc_handle_is(node, c, cc_carrier_ref(node, c, name), false))
+        return ir_cast(inner, node, value.c_spelling, cc_carrier_ref(node, c, name))
     }
-    let tag = ir_carrier_tag(TYPE_INT, node, g.tag, ref)
-    cc_push_guard(node, g, cc_tag_equals(node, tag, TAG_NONE, g))
+    let tag = ir_carrier_tag(TYPE_INT, node, c.g.tag, cc_carrier_ref(node, c, name))
+    cc_push_guard(node, c, cc_tag_equals(node, tag, TAG_NONE, c))
     let read = ir_carrier_unwrap(inner, node, member.c_spelling, carrier_value_member, member.slot_form,
-        cc_carrier_ref(node, carrier, held, name))
+        cc_carrier_ref(node, c, name))
     if member.slot_form != SlotForm.PointerBoxed { return read }
     ir_unbox(inner, node, value.c_spelling, value.slot_form, read)
 }
@@ -1096,18 +1169,43 @@ fn cc_carrier_read(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag
 // The statement that panics unless the carrier holds the arm about to be read. The
 // condition tests the arm that is NOT read: that is the one value the read cannot be
 // given, and every other tag the carrier could hold is a tag no arm of it declares.
-fn cc_push_guard(node: Int, g: GuardSpellings, absent: Int) ! Diag.Report {
+fn cc_push_guard(node: Int, c: CarrierRef, absent: Int) ! Diag.Report {
     let message = cc_panic_message(node, "unwrap called on None")
-    let said = ir_const(TYPE_STR, node, g.message, c_string_literal(message))
+    let said = ir_const(TYPE_STR, node, c.g.message, c_string_literal(message))
     cg_expr_push_pending(node, ir_if(node, absent, ir_block(node, [ir_panic(node, said)]), -1))
 }
 
-fn cc_tag_equals(node: Int, tag: Int, want: Int, g: GuardSpellings) -> Int {
-    ir_binary(TYPE_BOOL, node, g.answer, "==", tag, ir_const(TYPE_INT, node, g.tag, "{want}"))
+fn cc_tag_equals(node: Int, tag: Int, want: Int, c: CarrierRef) -> Int {
+    ir_binary(TYPE_BOOL, node, c.g.answer, "==", tag, ir_const(TYPE_INT, node, c.g.tag, "{want}"))
 }
 
-fn cc_carrier_ref(node: Int, carrier: Int, held: LayoutRecord, name: Str) -> Int {
-    ir_var_ref(carrier, node, held.c_spelling, name, held.slot_form)
+fn cc_carrier_ref(node: Int, c: CarrierRef, name: Str) -> Int {
+    ir_var_ref(c.tid, node, c.held.c_spelling, name, c.held.slot_form)
+}
+
+// The carrier a call reads, with every spelling a test or a read of it is written with.
+// They are one fact: a reader holding the tid alone would have to ask layout for the rest
+// again, and a second answer to a type question is a second producer of it.
+type CarrierRef { tid: Int  held: LayoutRecord  g: GuardSpellings }
+
+// A tid that does not spell, or a guard that does not, leaves the tid negative: the caller
+// asks that one question instead of the three the pieces used to be asked separately.
+//
+// A call with no carrier type asks layout about the tid it does not have, rather than
+// about some other tid standing in for it: layout declines a negative tid on its own, and
+// that decline is the record. Substituting a type that does spell would put a real layout
+// in a record whose carrier has none. The decline is taken without cc_local because
+// tid_of_node has already reported the missing type by name, and one fault is one report.
+fn cc_carrier_of(node: Int, obj: Int) -> CarrierRef ! Diag.Report {
+    let tid = tid_of_node(obj)
+    let held = if tid < 0 { layout_of(tid, Position.Local) } else { cc_local(tid, node) }
+    let g = cc_guard_spellings(node)
+    let spells = !cc_stopped(held) && !cc_guard_stopped(g)
+    CarrierRef { tid: if spells { tid } else { -1 }, held: held, g: g }
+}
+
+fn cc_carrier_missing(c: CarrierRef) -> Bool {
+    c.tid < 0
 }
 
 // The three spellings a tag test is written with: the integer the tag is read as, the Bool
@@ -1186,6 +1284,20 @@ fn cc_intrinsic_callee(node: Int, kind: TyKind, method: Str) -> Str ! Diag.Repor
     if kind == TyKind.Bytes { return cc_bytes_intrinsic(method) }
     if kind == TyKind.StringBuilder { return cc_sb_intrinsic(node, method) }
     if kind == TyKind.List { return cc_list_intrinsic(node, method) }
+    if kind == TyKind.Int || kind == TyKind.Float { return cc_num_intrinsic(kind, method) }
+    ""
+}
+
+// Rendering a number as text. This is the one numeric conversion that is not a cast: it
+// builds a string, which is a function's work and not a reinterpretation of the bits.
+//
+// `to_str` is absent although typecheck answers Str for it on an Int receiver. The spec
+// gives `to_str` to Char and to Ptr[U8], not to Int, so answering it here would build a
+// surface no section declares. It stays refused until typecheck and the spec agree.
+fn cc_num_intrinsic(kind: TyKind, method: Str) -> Str {
+    if method != "to_string" { return "" }
+    if kind == TyKind.Int { return "std_num:int_to_str" }
+    if kind == TyKind.Float { return "std_num:float_to_str" }
     ""
 }
 
@@ -1384,7 +1496,33 @@ fn cc_method_not_built(node: Int, kind: TyKind, method: Str) -> Int ! Diag.Repor
 fn cc_list_not_built(node: Int, method: Str) -> Int ! Diag.Report {
     if method == "get" || method == "pop" { return cc_checked_read(node) }
     if method == "contains" { return cc_element_scan_not_lowered(node) }
+    if cc_names_list_hof(method) { return cc_list_hof_not_registered(node, method) }
     cc_intrinsic_not_built(node, TyKind.List, method)
+}
+
+// The higher-order methods the standard library already has a body for. Each names a
+// generic in lib/std/list.bl, so a loop emitted here would be a second answer to what the
+// method means, and the two could disagree.
+fn cc_names_list_hof(method: Str) -> Bool {
+    if method == "map" { return true }
+    if method == "filter" { return true }
+    if method == "fold" { return true }
+    if method == "any" { return true }
+    if method == "all" { return true }
+    if method == "for_each" { return true }
+    false
+}
+
+// What is missing is the instance, not the body. Mono registers an instance of a generic
+// for each call of it that it can see, and a method call is not a call of list_map as far
+// as it can see, so the types this one uses have none. Naming the generic without an
+// instance reports mono's refusal for a decision made here, which blames the wrong stage,
+// so the call is refused under its own name and says which instance would answer it.
+fn cc_list_hof_not_registered(node: Int, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("ListHofInstanceNotRegistered", CODEGEN_STAGE_NOT_BUILT,
+        "'{method}' over a List is the standard library generic 'list_{method}', which mono registers no instance of for a method call",
+        node, "mono has to register an instance for a builtin method that stands for a generic function")
+    -1
 }
 
 // A scan over the elements. It is a loop over statements and a comparison chosen per
