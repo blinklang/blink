@@ -21,7 +21,7 @@ import parser.{
     node_kind, node_name, node_left, node_right, node_obj, node_index, node_method, node_args,
     node_line,
     node_methods, node_trait_name, node_impl_binders, node_type_params,
-    node_module, node_source_module, node_params, node_fields,
+    node_module, node_source_module, node_params, node_fields, node_value,
     sublist_get, sublist_length,
 }
 import ast.{NodeKind, nk_of, node_kind_name}
@@ -1199,7 +1199,14 @@ fn cc_enum_variant_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report
     let macro = cc_variant_tag(tid, decl, vnode)
     if diag_is_ice_seg(macro) { return cc_variant_tag_unspellable(node, owner, method, macro) }
     let arity = cc_variant_arity(vnode)
-    let payload = cc_variant_payload(node, decl, owner, method, arity)
+    let args = node_args(node)
+    let given = if args == -1 { 0 } else { sublist_length(args) }
+    // One written argument per declared field is the payload's precondition, and typecheck
+    // checks that count before codegen reads it. The check is repeated rather than assumed
+    // because the payload is built by walking the declaration: a count that disagrees would
+    // otherwise read past the written arguments.
+    if given != arity { return cc_variant_arity_wrong(node, owner, method, arity, given) }
+    let payload = cc_variant_payload(node, decl, vnode, owner, method, arity)
     if payload.len() != arity { return -1 }
     let member = if arity == 0 { "" } else { c_variant_member_name(vnode) }
     let tag_rec = cc_local(TYPE_INT, node)
@@ -1208,37 +1215,44 @@ fn cc_enum_variant_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report
         ir_const(TYPE_INT, node, tag_rec.c_spelling, macro), payload)
 }
 
-// The payload in written order, each element in the physical form its member was declared
-// with. A field that reaches its own enum is stored by pointer, because the enum's typedef
-// is still incomplete where the member is declared, so a value for such a member is boxed
-// here rather than written into a word it does not fit.
+// The payload in DECLARED order, each element in the physical form its member was declared
+// with. The order is the declaration's because that is the order the arm's struct fields are
+// written in, and a payload may be written by field name: `Crate.Box(h: 4, w: 3)` fills the
+// same two fields as `Crate.Box(3, 4)`. So the walk is over the declared fields and each one
+// asks which written argument fills it, rather than over the written arguments in the order
+// they appear.
+//
+// A field that reaches its own enum is stored by pointer, because the enum's typedef is
+// still incomplete where the member is declared, so a value for such a member is boxed here
+// rather than written into a word it does not fit.
 //
 // The type each element is laid out at is the type typecheck gave the written argument.
 // A generic enum's fields are declared at its type parameters, which have no C layout at
 // all; the argument carries the substituted type, so it is the only reading of the field
 // that answers for an instance as well as for a bare enum.
-fn cc_variant_payload(node: Int, decl: Int, owner: Str, method: Str, arity: Int) -> List[Int] ! Diag.Report {
+//
+// A refusal returns an empty list, which the caller reads as short. The count is already
+// known to match, so a complete list is the only other answer this can give.
+fn cc_variant_payload(node: Int, decl: Int, vnode: Int, owner: Str, method: Str, arity: Int) -> List[Int] ! Diag.Report {
     let args = node_args(node)
-    let given = if args == -1 { 0 } else { sublist_length(args) }
+    let fields = node_fields(vnode)
+    let refused: List[Int] = []
     let mut out: List[Int] = []
-    // The loop below reads one written argument per declared field, so the two counts
-    // agreeing is its precondition, not a check typecheck has left undone.
-    if given != arity {
-        cc_variant_arity_wrong(node, owner, method, arity, given)
-        return out
-    }
     let mut i = 0
     while i < arity {
-        let arg = sublist_get(args, i)
+        let arg = cc_variant_arg_for_field(args, sublist_get(fields, i), i)
+        if arg < 0 { return cc_variant_field_unfilled(node, owner, method, node_name(sublist_get(fields, i))) }
         let ftid = tid_of_node(arg)
-        if ftid < 0 { return out }
-        let value = lower_expr(arg)
-        if value < 0 { return out }
+        if ftid < 0 { return refused }
+        // The layout is answered before the operand is lowered, so that a field with no C
+        // form refuses without the statements lowering an operand can hoist ahead of it.
         let mem = cc_variant_field_layout(node, decl, ftid)
-        if cc_stopped(mem) { return out }
+        if cc_stopped(mem) { return refused }
+        let value = lower_expr(arg)
+        if value < 0 { return refused }
         if mem.slot_form == SlotForm.PointerBoxed {
             let held = cc_local(ftid, node)
-            if cc_stopped(held) { return out }
+            if cc_stopped(held) { return refused }
             out.push(ir_box(ftid, node, mem.c_spelling, held.c_spelling, value))
         } else {
             out.push(value)
@@ -1246,6 +1260,31 @@ fn cc_variant_payload(node: Int, decl: Int, owner: Str, method: Str, arity: Int)
         i = i + 1
     }
     out
+}
+
+// The written argument that fills one declared field. A name fills the field it names,
+// wherever it is written; anything else fills the field at its own position. This is the
+// rule typecheck resolves the payload by, so it is the rule the payload is built by.
+fn cc_variant_arg_for_field(args: Int, field: Int, slot: Int) -> Int {
+    if args == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(args) {
+        let arg = sublist_get(args, i)
+        if nk_of(node_kind(arg)) == NodeKind.NamedArg {
+            if node_name(arg) == node_name(field) { return node_value(arg) }
+        } else {
+            if i == slot { return arg }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn cc_variant_field_unfilled(node: Int, owner: Str, method: Str, field: Str) -> List[Int] ! Diag.Report {
+    diag_ice_at("VariantFieldUnfilled", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{owner}.{method}' declares a field '{field}' that this call fills with nothing", node,
+        "typecheck matches every payload field to an argument before codegen builds it; this is a compiler bug")
+    []
 }
 
 fn cc_variant_field_layout(node: Int, decl: Int, ftid: Int) -> LayoutRecord ! Diag.Report {
@@ -1307,10 +1346,11 @@ fn cc_variant_tag_unspellable(node: Int, owner: Str, method: Str, why: Str) -> I
     -1
 }
 
-fn cc_variant_arity_wrong(node: Int, owner: Str, method: Str, want: Int, given: Int) ! Diag.Report {
+fn cc_variant_arity_wrong(node: Int, owner: Str, method: Str, want: Int, given: Int) -> Int ! Diag.Report {
     diag_ice_at("EnumPayloadArityWrong", UNSOLVED_TYPEVAR_AT_CODEGEN,
         "'{owner}.{method}' takes {want} payload fields, and this call gives {given}", node,
         "typecheck checks a variant's payload count before codegen builds it; this is a compiler bug")
+    -1
 }
 
 // A container constructor. The value the runtime answers with carries a table of the
@@ -2664,10 +2704,28 @@ fn cc_names_list_hof(method: Str) -> Bool {
 // an ordinary generic taking the list first, so the receiver is that first parameter and
 // the call is the generic's own, under the instance mono registered for this call site.
 fn cc_list_hof_call(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
-    let decl = cc_sole_fn_named(node, "{list_hof_prefix}{method}")
+    let name = "{list_hof_prefix}{method}"
+    // The search is over the one module the method's meaning is written in, for the reason
+    // the intrinsic table gives: a program is free to write its own function under this name,
+    // and the method must keep meaning the standard library's.
+    let decl = cc_stdlib_fn_named(node, list_hof_module, name)
     if decl == DECL_REFUSED { return -1 }
     if decl < 0 { return cc_list_hof_no_body(node, method) }
+    // The receiver is the generic's first parameter, so the method takes one fewer argument
+    // than the function does. Typecheck checks the count for some of this family and not the
+    // rest, so it is checked here: a call built short reaches the C compiler, where the error
+    // can no longer name a line of Blink.
+    let want = sublist_length(node_params(decl)) - 1
+    let given = sublist_length(node_args(node))
+    if want != given { return cc_list_hof_arity_wrong(node, method, want, given) }
     cc_declared_call(node, decl, obj)
+}
+
+fn cc_list_hof_arity_wrong(node: Int, method: Str, want: Int, given: Int) -> Int ! Diag.Report {
+    diag_ice_at("ListHofArityWrong", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{method}' over a List takes {want} argument(s), and this call gives {given}", node,
+        "typecheck checks a call's argument count before codegen builds it; this is a compiler bug")
+    -1
 }
 
 // The standard library is loaded for every program, so the generic behind a sealed method
@@ -2681,6 +2739,7 @@ fn cc_list_hof_no_body(node: Int, method: Str) -> Int ! Diag.Report {
 }
 
 let list_hof_prefix = "list_"
+let list_hof_module = "std_list"
 
 
 // A scan over the elements. It is a loop over statements and a comparison chosen per
