@@ -1,0 +1,104 @@
+// The address of the evidence vector is a node of its own, not a Unary `&`. The vector has
+// no Blink type, so neither does its address; a Unary carrying it would be a value node
+// with no tid, which the verifier rejects by the rule that keeps every other value typed.
+// The kid is the vector it takes the address of, so the pointer-spelling rule reads the
+// operand's spelling exactly as it does for `&`.
+
+import std.io
+import ir.{
+    IrKind, ir_reset, ir_kind, ir_tid, ir_kid_count, ir_kid, ir_c_name, ir_c_spelling, ir_slot_form,
+    ir_slot_form_name, ir_kind_name, ir_kind_from_name, ir_kind_is_value, ir_verify, ir_dump, ir_parse,
+    ir_new, ir_const, ir_var_ref, ir_evidence_vector, ir_evidence_address, ir_expr_stmt, ir_call_direct,
+}
+import layout.{SlotForm, pointer_spelling}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn assert_valid(label: Str, root: Int) {
+    let errs = ir_verify(root)
+    if errs.len() > 0 { io.println("FAIL: {label}: {errs.join(" | ")}") }
+    assert_eq_int("{label} verifies", errs.len(), 0)
+}
+
+fn assert_rejects(label: Str, root: Int, needle: Str) {
+    let errs = ir_verify(root)
+    let mut hit = 0
+    for e in errs {
+        if e.contains(needle) { hit = 1 }
+    }
+    if hit == 0 { io.println("FAIL: {label}: no message contains '{needle}': {errs.join(" | ")}") }
+    assert_eq_int("{label} rejected", hit, 1)
+}
+
+fn ev_global() -> Int { ir_evidence_vector(0, "blink_ev", "__blink_ev", SlotForm.Inline) }
+fn ev_param() -> Int { ir_evidence_vector(0, "blink_ev*", "__ev", SlotForm.PointerBoxed) }
+fn int_var(name: Str) -> Int { ir_var_ref(1, 0, "int64_t", name, SlotForm.InlineWord) }
+
+test "the address of the vector is a value kind with no tid and a pointer spelling" {
+    ir_reset()
+    let addr = ir_evidence_address(0, ev_global())
+    assert_eq_str("kind", ir_kind_name(ir_kind(addr)), "EvidenceAddress")
+    assert_eq_int("is a value", if ir_kind_is_value(IrKind.EvidenceAddress) { 1 } else { 0 }, 1)
+    assert_eq_int("one kid", ir_kid_count(addr), 1)
+    assert_eq_str("the kid is the vector", ir_kind_name(ir_kind(ir_kid(addr, 0))), "EvidenceVector")
+    assert_eq_int("no tid", ir_tid(addr), -1)
+    assert_eq_str("spelling", ir_c_spelling(addr), pointer_spelling("blink_ev"))
+    assert_eq_str("the vector owns the name", ir_c_name(addr), "")
+    assert_eq_str("a pointer held inline", ir_slot_form_name(ir_slot_form(addr)), "InlineWord")
+    match ir_kind_from_name("EvidenceAddress") {
+        Some(k) => assert_eq_str("name round-trips", ir_kind_name(k), "EvidenceAddress")
+        None => assert_eq_str("name resolves", "missing", "EvidenceAddress")
+    }
+}
+
+test "the address of the global vector stands where a value is required" {
+    ir_reset()
+    assert_valid("expression statement", ir_expr_stmt(0, ir_evidence_address(0, ev_global())))
+    let call = ir_call_direct(1, 0, "int64_t", "main_work", SlotForm.InlineWord,
+        [ir_const(1, 0, "int64_t", "1"), ir_evidence_address(0, ev_global())])
+    assert_valid("trailing vector argument", ir_expr_stmt(0, call))
+}
+
+test "the verifier holds the address of the vector to its shape" {
+    ir_reset()
+    let typed = ir_new(IrKind.EvidenceAddress, 7, 0, "blink_ev*", "", SlotForm.InlineWord, [ev_global()])
+    assert_rejects("a tid", ir_expr_stmt(0, typed), "no Blink type")
+    let lying = ir_new(IrKind.EvidenceAddress, -1, 0, "blink_ev", "", SlotForm.InlineWord, [ev_global()])
+    assert_rejects("spelled as the vector itself", ir_expr_stmt(0, lying),
+        "the pointer form of its operand's 'blink_ev' is 'blink_ev*'")
+    let unspelled = ir_new(IrKind.EvidenceAddress, -1, 0, "", "", SlotForm.InlineWord, [ev_global()])
+    assert_rejects("no spelling", ir_expr_stmt(0, unspelled), "empty c_spelling")
+    let bare = ir_new(IrKind.EvidenceAddress, -1, 0, "blink_ev*", "", SlotForm.InlineWord, [])
+    assert_rejects("no operand", ir_expr_stmt(0, bare), "expects 1")
+    let of_local = ir_new(IrKind.EvidenceAddress, -1, 0, "int64_t*", "", SlotForm.InlineWord, [int_var("k")])
+    assert_rejects("operand is a local", ir_expr_stmt(0, of_local), "kid 0 must be the EvidenceVector")
+    let of_param = ir_new(IrKind.EvidenceAddress, -1, 0, "blink_ev**", "", SlotForm.InlineWord, [ev_param()])
+    assert_rejects("operand is the vector parameter", ir_expr_stmt(0, of_param), "already held by pointer")
+}
+
+test "the address of the vector dumps and parses back" {
+    ir_reset()
+    let addr = ir_evidence_address(4, ev_global())
+    let want = [
+        "(EvidenceAddress -1 4 InlineWord 0 \"blink_ev*\" \"\"",
+        "  (EvidenceVector -1 0 Inline 0 \"blink_ev\" \"__blink_ev\"))",
+    ].join("\n")
+    let text = ir_dump(addr)
+    assert_eq_str("dump", text, want)
+    let back = ir_parse(text)
+    assert_eq_str("parsed kind", ir_kind_name(ir_kind(back)), "EvidenceAddress")
+    assert_eq_int("parsed tid", ir_tid(back), -1)
+    assert_eq_str("re-dump is stable", ir_dump(back), text)
+    assert_valid("parsed tree", ir_expr_stmt(0, back))
+}

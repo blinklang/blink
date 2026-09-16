@@ -32,7 +32,7 @@ pub type IrKind {
     FieldGet, FieldSet, StructNew, TupleNew, EnumNew, ContainerNew, ContainerSpread,
     Box, Unbox, CarrierWrap, CarrierUnwrap, CarrierTag,
     CallDirect, CallIndirect, CallClosure, CallVirtual, CallRuntime,
-    ClosureNew, EvidenceVector, EffectPerform, HandlerInstall,
+    ClosureNew, EvidenceVector, EvidenceAddress, EffectPerform, HandlerInstall,
     Let, Assign, ExprStmt, Return, If, Loop, Break, Continue, Block, Switch, WithScope,
     Panic, Unreachable,
 }
@@ -138,7 +138,8 @@ pub fn ir_all_kinds() -> List[IrKind] {
         IrKind.FieldGet, IrKind.FieldSet, IrKind.StructNew, IrKind.TupleNew, IrKind.EnumNew, IrKind.ContainerNew,
         IrKind.ContainerSpread, IrKind.Box, IrKind.Unbox, IrKind.CarrierWrap, IrKind.CarrierUnwrap, IrKind.CarrierTag,
         IrKind.CallDirect, IrKind.CallIndirect, IrKind.CallClosure, IrKind.CallVirtual, IrKind.CallRuntime,
-        IrKind.ClosureNew, IrKind.EvidenceVector, IrKind.EffectPerform, IrKind.HandlerInstall,
+        IrKind.ClosureNew, IrKind.EvidenceVector, IrKind.EvidenceAddress, IrKind.EffectPerform,
+        IrKind.HandlerInstall,
         IrKind.Let, IrKind.Assign, IrKind.ExprStmt, IrKind.Return, IrKind.If, IrKind.Loop,
         IrKind.Break, IrKind.Continue, IrKind.Block, IrKind.Switch, IrKind.WithScope,
         IrKind.Panic, IrKind.Unreachable,
@@ -172,6 +173,7 @@ pub fn ir_kind_name(kind: IrKind) -> Str {
         IrKind.CallRuntime => "CallRuntime"
         IrKind.ClosureNew => "ClosureNew"
         IrKind.EvidenceVector => "EvidenceVector"
+        IrKind.EvidenceAddress => "EvidenceAddress"
         IrKind.EffectPerform => "EffectPerform"
         IrKind.HandlerInstall => "HandlerInstall"
         IrKind.Let => "Let"
@@ -267,6 +269,7 @@ fn kind_min_kids(kind: IrKind) -> Int {
         IrKind.CallIndirect => 1
         IrKind.CallClosure => 1
         IrKind.CallVirtual => 1
+        IrKind.EvidenceAddress => 1
         IrKind.EffectPerform => 1
         IrKind.HandlerInstall => 2
         IrKind.Assign => 2
@@ -297,6 +300,7 @@ fn kind_max_kids(kind: IrKind) -> Int {
         IrKind.CarrierUnwrap => 1
         IrKind.CarrierTag => 1
         IrKind.EvidenceVector => 0
+        IrKind.EvidenceAddress => 1
         IrKind.HandlerInstall => 2
         IrKind.Let => 1
         IrKind.Assign => 2
@@ -441,6 +445,16 @@ pub fn ir_evidence_vector(span: Int, c_spelling: Str, c_name: Str, slot_form: Sl
     ir_new(IrKind.EvidenceVector, -1, span, c_spelling, c_name, slot_form, [])
 }
 
+// The address of the vector: what a call to an effectful function passes when the caller
+// holds the global instance inline rather than a vector parameter. It is a kind of its own
+// rather than a Unary `&` because the vector has no Blink type, so neither has its address,
+// and every other value node carries a tid. The spelling is the pointer form of the
+// operand's, so the vector stays the one producer of both the type name and the C name.
+pub fn ir_evidence_address(span: Int, vector: Int) -> Int {
+    ir_new(IrKind.EvidenceAddress, -1, span, pointer_spelling(ir_c_spelling(vector)), "",
+        SlotForm.InlineWord, [vector])
+}
+
 // A perform is a virtual call through the vector: `slot_read` is a FieldGet that reads the
 // effect's slot off an EvidenceVector, and `slot` is the vtable member the runtime or the
 // user effect declares. Printing it as `(handler)->slot(args)` is the printer's rule.
@@ -581,6 +595,10 @@ fn verify_node(id: Int, seen: List[Int], on_stack: List[Int], errs: List[Str]) {
 fn verify_fields(id: Int, kind: IrKind, label: Str, errs: List[Str]) {
     if kind == IrKind.EvidenceVector {
         if ir_tid(id) >= 0 { errs.push("{label}: carries tid {ir_tid(id)}, the vector has no Blink type") }
+    } else if kind == IrKind.EvidenceAddress {
+        if ir_tid(id) >= 0 {
+            errs.push("{label}: carries tid {ir_tid(id)}, the address of the vector has no Blink type")
+        }
     } else if ir_kind_is_value(kind) && ir_tid(id) < 0 {
         errs.push("{label}: value node without a tid")
     }
@@ -603,7 +621,7 @@ fn verify_fields(id: Int, kind: IrKind, label: Str, errs: List[Str]) {
     }
     // An address is a value of its own, a pointer to where the operand lives; a node
     // spelled by the pointee states something false about what it produces.
-    if kind == IrKind.Unary && ir_c_name(id) == "&" && ir_kid_count(id) == 1 {
+    if is_address_node(kind, id) && ir_kid_count(id) == 1 {
         // The kid-range walk runs after this, so an operand outside the arena is left
         // for it to report rather than read here.
         let kid = ir_kid(id, 0)
@@ -615,6 +633,13 @@ fn verify_fields(id: Int, kind: IrKind, label: Str, errs: List[Str]) {
             }
         }
     }
+}
+
+// The two nodes that produce an address: a Unary `&` over any value, and the address of
+// the evidence vector, which is a kind of its own because the vector carries no tid.
+fn is_address_node(kind: IrKind, id: Int) -> Bool {
+    if kind == IrKind.EvidenceAddress { return true }
+    kind == IrKind.Unary && ir_c_name(id) == "&"
 }
 
 // The node is held to its declaration: the tid is an enum, the variant is one of that
@@ -709,6 +734,13 @@ fn verify_kid_shape(kind: IrKind, label: Str, i: Int, n: Int, kid: Int, errs: Li
         KidSlot.Lvalue => {
             if !is_lvalue_kind(kid_kind) { errs.push("{label}: kid {i} target must be an lvalue") }
         }
+        KidSlot.VectorOnly => {
+            if kid_kind != IrKind.EvidenceVector {
+                errs.push("{label}: kid {i} must be the EvidenceVector, is a {ir_kind_name(kid_kind)}")
+            } else if ir_held_by_pointer(kid) {
+                errs.push("{label}: kid {i} is already held by pointer, a vector parameter is its own address")
+            }
+        }
         KidSlot.HandlerSlot => {
             if !reads_evidence_vector(kid) {
                 errs.push("{label}: kid {i} must read a handler slot of the EvidenceVector, is a {ir_kind_name(kid_kind)}")
@@ -728,7 +760,7 @@ fn reads_evidence_vector(read: Int) -> Bool {
     ir_kind(obj) == IrKind.EvidenceVector
 }
 
-type KidSlot { Value, Stmt, BlockOnly, ConstLabel, ConstTag, Lvalue, HandlerSlot }
+type KidSlot { Value, Stmt, BlockOnly, ConstLabel, ConstTag, Lvalue, HandlerSlot, VectorOnly }
 
 fn kid_slot(kind: IrKind, i: Int, n: Int) -> KidSlot {
     match kind {
@@ -742,6 +774,7 @@ fn kid_slot(kind: IrKind, i: Int, n: Int) -> KidSlot {
         IrKind.EnumNew => if i == 0 { KidSlot.ConstTag } else { KidSlot.Value }
         IrKind.Assign => if i == 0 { KidSlot.Lvalue } else { KidSlot.Value }
         IrKind.EffectPerform => if i == 0 { KidSlot.HandlerSlot } else { KidSlot.Value }
+        IrKind.EvidenceAddress => KidSlot.VectorOnly
         _ => KidSlot.Value
     }
 }
