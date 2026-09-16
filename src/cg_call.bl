@@ -31,7 +31,7 @@ import typecheck.{
     is_import_module_name, is_builtin_namespace, is_builtin_fn, tc_alias_to_original,
     tc_qualifier_to_module_or_self, tc_get_symbol_module, tc_type_str,
     tc_enum_variant_slots, tc_evar_name, tc_tid_child_count,
-    tc_names_a_type, tc_is_sealed_list_hof,
+    tc_names_a_type, tc_is_sealed_list_hof, is_user_effect_handle_name,
     TYPE_INT, TYPE_BOOL, TYPE_STR,
 }
 import layout.{
@@ -56,7 +56,7 @@ import ir.{
     ir_enum_new,
 }
 import cg_expr.{lower_expr, cg_expr_push_pending}
-import cg_eff.{cg_eff_ev_argument, cg_eff_lower_builtin_perform}
+import cg_eff.{cg_eff_ev_argument, cg_eff_lower_builtin_perform, cg_eff_lower_user_perform}
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
 import diagnostics.{
     Diag, diag_ice_at, diag_ice_stage_not_built, diag_file_for_node, diag_source_file,
@@ -1523,6 +1523,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if role == Receiver.Namespace { return lower_namespace_call(node, obj) }
     if role == Receiver.TypeOwner { return lower_static_call(node, obj) }
     if role == Receiver.TraitOwner { return lower_trait_qualified_call(node, obj) }
+    if role == Receiver.EffectHandle { return cg_eff_lower_user_perform(node) }
     let mname = node_method(node)
     if cc_is_ptr_field_place(obj, mname) { return cc_lower_ptr_field(node, obj, mname) }
     let recv_tid = tid_of_node(obj)
@@ -2755,15 +2756,20 @@ fn cc_intrinsic_not_built(node: Int, kind: TyKind, method: Str) -> Int ! Diag.Re
     -1
 }
 
-// What the left of the dot names. Only a Value is a receiver to lower; the other four are
+// What the left of the dot names. Only a Value is a receiver to lower; the other five are
 // qualifiers, and each keys a different lowering.
-pub type Receiver { Value, Namespace, Module, TypeOwner, TraitOwner }
+pub type Receiver { Value, Namespace, Module, TypeOwner, TraitOwner, EffectHandle }
 
 // A namespace the compiler provides is read before an imported module, because a module of
 // that name does not take the namespace over. A type is then read through the one predicate
 // typecheck decides the same call by, so a builtin type, which has no declaration to look
-// up, is a qualifier here exactly when it is one there. A trait name is last: it is the only
+// up, is a qualifier here exactly when it is one there. A trait name is next: it is the only
 // reading left for a name that binds nothing and names no type.
+//
+// An effect handle is read last, after every name another reading already claims, so
+// declaring an effect cannot take a namespace, a module, a type or a trait over. The table
+// is typecheck's, keyed on the lowercased root effect name, which is the spelling a perform
+// is written with and the one the effect stage looks its declaration up by.
 fn cc_receiver_role(obj: Int) -> Receiver {
     if !cc_is_free_name(obj) { return Receiver.Value }
     let name = node_name(obj)
@@ -2771,6 +2777,7 @@ fn cc_receiver_role(obj: Int) -> Receiver {
     if is_import_module_name(name) == 1 { return Receiver.Module }
     if tc_names_a_type(name) { return Receiver.TypeOwner }
     if cc_names_a_trait(name) { return Receiver.TraitOwner }
+    if is_user_effect_handle_name(name) == 1 { return Receiver.EffectHandle }
     Receiver.Value
 }
 
