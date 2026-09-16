@@ -1,0 +1,135 @@
+// An address is a value of its own: a pointer to where the operand lives. layout is the
+// only module that may write the `*`, so a producer that passes an address asks
+// address_layout_of instead of spelling the pointee and calling it the address.
+import std.fs
+import std.io
+import typecheck.{tc_type_str, tc_lookup_node_tid, check_types, make_metavar, make_ptr_type, make_list_type}
+import layout.{layout_of, address_layout_of, layout_reset, Position, SlotForm}
+import parser.{nodes}
+import compiler.{compile_to_program}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn probe_src() -> Str {
+    #"type Point { x: Int, y: Int }
+type Color { Red, Green }
+fn id[T](x: T) -> T { x }
+fn main() {
+    let i: Int = 7
+    let f: Float = 1.5
+    let s: Str = "s"
+    let u: Void = ()
+    let l: List[Int] = []
+    let o: Option[Int] = None
+    let op: Option[Point] = None
+    let r: Result[Int, Str] = Ok(1)
+    let t: (Int, Str) = (1, "a")
+    let p: Point = Point { x: 1, y: 2 }
+    let col: Color = Color.Red
+    with ffi.scope() as scope {
+        let pt: Ptr[Int] = scope.alloc()
+        assert(l.len() == 0)
+    }
+    assert(i == 7)
+}
+"#
+}
+
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/layout_address_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    while idx < nodes.len() {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 { m.insert(tc_type_str(tid), tid) }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 { io.println("FAIL: harvested map has no tid for rendered type string '{key}'") }
+    assert(tid != -1)
+    tid
+}
+
+fn slot_form_name(f: SlotForm) -> Str {
+    match f {
+        SlotForm.Inline => "Inline"
+        SlotForm.PointerBoxed => "PointerBoxed"
+        SlotForm.InlineWord => "InlineWord"
+    }
+}
+
+// The address of a value is the value's spelling with one more `*`, whatever the
+// value's own form: a word, an aggregate, or a pointer already.
+fn assert_address(label: Str, tid: Int, want: Str) {
+    let rec = address_layout_of(tid, Position.Local)
+    assert_eq_str("{label} decline", rec.decline_reason, "")
+    assert_eq_str("{label} spelling", rec.c_spelling, want)
+    assert_eq_str("{label} form", slot_form_name(rec.slot_form), "InlineWord")
+    assert_eq_str("{label} agrees with the value", rec.c_spelling, "{layout_of(tid, Position.Local).c_spelling}*")
+}
+
+test "the address of a value is spelled as a pointer to the value's spelling" {
+    let m = harvest_type_tids()
+    assert_address("Int", expect_tid(m, "Int"), "int64_t*")
+    assert_address("Float", expect_tid(m, "Float"), "double*")
+    assert_address("Str", expect_tid(m, "Str"), "const char**")
+    assert_address("Point", expect_tid(m, "Point"), "blink_Point*")
+    assert_address("Color", expect_tid(m, "Color"), "blink_Color*")
+    assert_address("List[Int]", expect_tid(m, "List[Int]"), "blink_list**")
+    assert_address("Option[Int]", expect_tid(m, "Option[Int]"), "blink_Option_int*")
+    assert_address("Option[Point]", expect_tid(m, "Option[Point]"), "blink_Option_Point*")
+    assert_address("Result[Int, Str]", expect_tid(m, "Result[Int, Str]"), "blink_Result_int_str*")
+    assert_address("(Int, Str)", expect_tid(m, "(Int, Str)"), "blink_Tuple2_int_str*")
+    assert_address("Ptr[Int]", expect_tid(m, "Ptr[Int]"), "int64_t**")
+}
+
+// An address is one machine word and carries nothing a container or a carrier reads.
+test "an address record is a bare word: no carrier tag, no key table, no slot word" {
+    let m = harvest_type_tids()
+    let rec = address_layout_of(expect_tid(m, "Point"), Position.Local)
+    assert_eq_str("tag", rec.carrier_tag, "")
+    assert_eq_str("kops", rec.kops_table, "")
+    assert_eq_str("slot word", rec.slot_word, "")
+    assert_eq(rec.is_transparent, 0)
+    assert_eq(rec.kops_inline_key, false)
+}
+
+// The position is the operand's: a Float element sits behind a pointer in a container
+// slot, so its address there is the address of that pointer.
+test "the address follows the operand's position" {
+    let m = harvest_type_tids()
+    let f = expect_tid(m, "Float")
+    assert_eq_str("Float slot", address_layout_of(f, Position.ContainerSlot).c_spelling, "double**")
+    assert_eq_str("Float local", address_layout_of(f, Position.Local).c_spelling, "double*")
+}
+
+// Nothing has an address when the value has no spelling, and a void-like value is not
+// a place at all. Neither is guessed as void*.
+test "an address declines when its operand declines or is void-like" {
+    let m = harvest_type_tids()
+    let v = address_layout_of(expect_tid(m, "Void"), Position.Local)
+    assert_eq_str("Void spelling", v.c_spelling, "")
+    assert(v.decline_reason.contains("void-like"))
+    let tv = address_layout_of(expect_tid(m, "T"), Position.Local)
+    assert_eq_str("typevar spelling", tv.c_spelling, "")
+    assert_eq_str("typevar reason", tv.decline_reason, layout_of(expect_tid(m, "T"), Position.Local).decline_reason)
+    let mv = address_layout_of(make_metavar(), Position.Local)
+    assert(mv.decline_reason.contains("metavariable"))
+    let neg = address_layout_of(-1, Position.Local)
+    assert(neg.decline_reason != "")
+    // A pointer container never declines, so neither does its address.
+    assert_eq_str("List[T]", address_layout_of(make_list_type(expect_tid(m, "T")), Position.Local).c_spelling, "blink_list**")
+    assert_eq_str("Ptr[?]", address_layout_of(make_ptr_type(make_metavar()), Position.Local).c_spelling, "void**")
+}

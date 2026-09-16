@@ -80,7 +80,7 @@ a value node; *stmt* any statement; *Block* the `Block` kind; *Const* the
 | `Const` | `ir_const(tid, span, c_spelling, literal)` | none | the C literal text | `InlineWord` |
 | `VarRef` | `ir_var_ref(tid, span, c_spelling, c_name, slot_form)` | none | the local's C identifier | caller |
 | `GlobalRef` | `ir_global_ref(tid, span, c_spelling, c_name, slot_form)` | none | the global's C identifier | caller |
-| `Unary` | `ir_unary(tid, span, c_spelling, op, operand)` | `[operand: value]` | the C operator | `InlineWord` |
+| `Unary` | `ir_unary(tid, span, c_spelling, op, operand)` | `[operand: value]` | the C operator; for `&` the spelling is `address_layout_of(...).c_spelling`, the operand's spelling plus `*` | `InlineWord` |
 | `Binary` | `ir_binary(tid, span, c_spelling, op, lhs, rhs)` | `[lhs: value, rhs: value]` | the C operator | `InlineWord` |
 | `Cast` | `ir_cast(tid, span, c_spelling, expr)` | `[expr: value]` | empty; c_spelling is the target type | `InlineWord` |
 | `FieldGet` | `ir_field_get(tid, span, c_spelling, field, slot_form, obj)` | `[obj: value]` | the C field name | caller |
@@ -166,6 +166,7 @@ begins `root <r>: `. It rejects:
 | an `EvidenceVector` with tid >= 0 | `carries tid <t>, the vector has no Blink type` |
 | an empty c_spelling on a value or a `Let` | `empty c_spelling` |
 | an empty c_name where the kind prints one | `empty c_name` |
+| a `Unary` `&` whose spelling is not the pointer form of its operand's | `address spelled '<s>', the pointer form of its operand's '<o>' is '<o>*'` |
 | wrong kid count | `expects <n> kids, has <m>`, `expects <lo> or <hi> kids, has <m>`, `expects at least <n> kids, has <m>` |
 | statement in a value slot | `kid <i> is a statement where a value is required` |
 | value in a statement slot | `kid <i> is a value where a statement is required` |

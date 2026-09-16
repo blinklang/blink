@@ -1,0 +1,78 @@
+// A Unary '&' node answers an address, so its spelling is the pointer form of its
+// operand's spelling. A node spelled by what the address points at states something
+// false about itself, and the verifier names it.
+import std.io
+import ir.{ir_reset, ir_verify, ir_const, ir_var_ref, ir_unary, ir_expr_stmt, ir_let}
+import layout.{SlotForm, pointer_spelling}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn assert_rejects(label: Str, root: Int, needle: Str) {
+    let errs = ir_verify(root)
+    let mut hit = 0
+    for e in errs { if e.contains(needle) { hit += 1 } }
+    if hit == 0 { io.println("FAIL: {label}: no error contains '{needle}'; got: {errs.join(" | ")}") }
+    assert(hit > 0)
+}
+
+fn assert_valid(label: Str, root: Int) {
+    let errs = ir_verify(root)
+    if errs.len() > 0 { io.println("FAIL: {label}: {errs.join(" | ")}") }
+    assert_eq(errs.len(), 0)
+}
+
+fn int_var(name: Str) -> Int { ir_var_ref(1, 0, "int64_t", name, SlotForm.InlineWord) }
+
+// The rule compares against layout's one producer of the star, so what it demands is
+// exactly what address_layout_of hands a lowering.
+test "the verifier holds an address to layout's pointer spelling" {
+    ir_reset()
+    assert_eq(pointer_spelling("int64_t"), "int64_t*")
+    assert_valid("&k", ir_expr_stmt(0, ir_unary(1, 0, pointer_spelling("int64_t"), "&", int_var("k"))))
+}
+
+// An operand outside the arena is the kid-range walk's report, not a crash here.
+test "an address whose operand is outside the arena is reported, not read" {
+    ir_reset()
+    let stray = ir_unary(1, 0, "int64_t*", "&", 999)
+    assert_rejects("&<999>", ir_expr_stmt(0, stray), "kid 0 id 999 out of range")
+}
+
+test "an address spelled by its pointee is rejected" {
+    ir_reset()
+    let lie = ir_unary(1, 0, "int64_t", "&", int_var("k"))
+    assert_rejects("&k spelled int64_t", ir_expr_stmt(0, lie), "address spelled 'int64_t', the pointer form of its operand's 'int64_t' is 'int64_t*'")
+}
+
+test "an address spelled as a pointer to its operand's spelling verifies" {
+    ir_reset()
+    assert_valid("&k", ir_expr_stmt(0, ir_unary(1, 0, "int64_t*", "&", int_var("k"))))
+    let pt = ir_var_ref(2, 0, "blink_Point", "p", SlotForm.Inline)
+    assert_valid("&p", ir_expr_stmt(0, ir_unary(2, 0, "blink_Point*", "&", pt)))
+    let held = ir_var_ref(3, 0, "double*", "f", SlotForm.PointerBoxed)
+    assert_valid("&f of a boxed slot", ir_expr_stmt(0, ir_unary(3, 0, "double**", "&", held)))
+}
+
+test "a wrong pointer spelling on an address is rejected, not only the bare pointee" {
+    ir_reset()
+    let wrong = ir_unary(1, 0, "void*", "&", int_var("k"))
+    assert_rejects("&k spelled void*", ir_expr_stmt(0, wrong), "address spelled 'void*'")
+    let two = ir_unary(1, 0, "int64_t**", "&", int_var("k"))
+    assert_rejects("&k spelled int64_t**", ir_expr_stmt(0, two), "is 'int64_t*'")
+}
+
+test "every other unary operator keeps its operand's spelling" {
+    ir_reset()
+    assert_valid("-x", ir_expr_stmt(0, ir_unary(1, 0, "int64_t", "-", int_var("x"))))
+    assert_valid("!b", ir_expr_stmt(0, ir_unary(4, 0, "bool", "!", ir_var_ref(4, 0, "bool", "b", SlotForm.InlineWord))))
+    assert_valid("~x", ir_expr_stmt(0, ir_unary(1, 0, "int64_t", "~", int_var("x"))))
+}
+
+test "the address rule reads the operand, so a let over an address is held to it too" {
+    ir_reset()
+    let good = ir_let(1, 0, "int64_t*", "kp", SlotForm.InlineWord, ir_unary(1, 0, "int64_t*", "&", int_var("k")))
+    assert_valid("let kp = &k", good)
+    let bad = ir_let(1, 0, "int64_t*", "kp", SlotForm.InlineWord, ir_unary(1, 0, "int64_t", "&", int_var("k")))
+    assert_rejects("let kp = &k with the lie", bad, "address spelled")
+}
