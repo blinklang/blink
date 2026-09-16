@@ -29,7 +29,7 @@ import ir.{
 }
 import typecheck.{
     DECL_NODE_AMBIGUOUS, TYPE_BOOL, TYPE_CHAR, TYPE_INT, TYPE_STR, TYPE_U64, TyKind, lookup_named_type,
-    tc_enum_variant_slots,
+    tc_decl_derives, tc_enum_variant_slots,
     tc_evar_field_slots, tc_evar_name, tc_evfield_name, tc_evfield_tid, tc_resolve,
     tc_sfield_name, tc_sfield_tid, tc_struct_field_slots, tc_tid_decl_node, tc_tid_kind,
     tk_name,
@@ -443,13 +443,12 @@ fn eq_nested_differs(ftid: Int, lhs: Int, rhs: Int, bools: Str, path: Str, span:
             SlotForm.InlineWord, [lhs, rhs]))
 }
 
-// Whether a declaration's derives write it an eq. Ord's supertrait is Eq and this stage
-// derives it, so @derive(Ord) writes an eq as well as a cmp. Eq's field walk calls a field
-// type's eq and Hash's key table names its own type's eq, and the two must agree on which
-// types have one.
+// Whether a declaration's derives write it an eq. Ord and Hash both have Eq for a
+// supertrait and this stage derives it, so either one writes an eq. Which derives oblige
+// which is typecheck's answer, not a second list here: the front end decides whether a
+// type has an equality at all, and a stage that disagreed would refuse what it admits.
 fn defines_eq(decl: Int) -> Bool {
-    let names = derive_names(decl)
-    has_str(names, derive_eq) || has_str(names, derive_ord)
+    tc_decl_derives(decl, derive_eq) != 0
 }
 
 fn derive_names(decl: Int) -> List[Str] {
@@ -1116,6 +1115,7 @@ fn hash_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
     let tid = derive_tid(decl, arg)
     if tid < 0 { return }
     if refused(hash_refusal(decl, tid), arg) { return }
+    if !already_written(decl, derive_eq) { eq_method(decl, arg, bodies) }
     let rec = layout_of(tid, Position.Param)
     let self_spelling = spelling_or_ice(rec, node_name(decl), arg)
     let ret = u64_spelling(arg)
@@ -1130,16 +1130,6 @@ fn hash_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
     if body < 0 { return }
     print_fn(false, ret, symbol, params, false, body)
     kops_table(decl, rec, self_spelling)
-}
-
-// Hash requires Eq, so a type that derives one without the other has no body to name in
-// the half of the table that compares keys. Refusing where the derive is written beats
-// an undefined symbol at link time.
-fn hash_refusal(decl: Int, tid: Int) -> Str {
-    let shape = shape_refusal(decl, tid, derive_hash)
-    if shape != "" { return shape }
-    if defines_eq(decl) { return "" }
-    "@derive(Hash) on '{node_name(decl)}', which does not also derive Eq or Ord"
 }
 
 // The adapters take the key by value, so the size and the spelling must be the ones
@@ -1336,6 +1326,13 @@ fn hash_is_integral(k: TyKind) -> Bool {
     if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return true }
     if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return true }
     false
+}
+
+// What stops this stage hashing `decl`. Hash's supertrait Eq is derived alongside it, so
+// a type naming Hash alone is not refused for want of an equality; only the shape can
+// refuse now.
+fn hash_refusal(decl: Int, tid: Int) -> Str {
+    shape_refusal(decl, tid, derive_hash)
 }
 
 fn hash_nested(ftid: Int, value: Int, path: Str, span: Int) -> Int ! Diag.Report {

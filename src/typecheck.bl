@@ -569,18 +569,17 @@ fn tc_decl_node_for_type(tname: Str) -> Int {
 fn tc_type_name_derives(tname: Str, tr: Str) -> Int {
     let td = tc_decl_node_for_type(tname)
     if td == -1 { return 0 }
-    type_has_derive(td, tr)
+    tc_decl_derives(td, tr)
 }
 
 // Does `tname` carry an Eq impl usable by the `==`/`!=` operators?
-// Covers BOTH @derive(Eq)/@derive(Ord) (Ord: Eq) and a user `impl Eq for T`.
-// The user-impl signal is the trait→method index above: an `impl Eq for T`
-// records method `eq` under trait `Eq` for `T`.
+// Covers BOTH a derive that obliges Eq (Eq itself, or Ord or Hash through their
+// supertrait) and a user `impl Eq for T`. The user-impl signal is the trait→method
+// index above: an `impl Eq for T` records method `eq` under trait `Eq` for `T`.
 fn tc_type_has_eq_impl(tname: Str) -> Int {
     let td = tc_type_decl_nodes.get(tname) ?? -1
     if td != -1 {
-        if type_has_derive(td, "Eq") != 0 { return 1 }
-        if type_has_derive(td, "Ord") != 0 { return 1 }
+        if tc_decl_derives(td, "Eq") != 0 { return 1 }
     }
     if tc_method_trait_names(tname, "eq").contains("Eq") != 0 { return 1 }
     0
@@ -591,7 +590,7 @@ fn tc_type_has_eq_impl(tname: Str) -> Int {
 fn tc_type_has_ord_impl(tname: Str) -> Int {
     let td = tc_type_decl_nodes.get(tname) ?? -1
     if td != -1 {
-        if type_has_derive(td, "Ord") != 0 { return 1 }
+        if tc_decl_derives(td, "Ord") != 0 { return 1 }
     }
     if tc_method_trait_names(tname, "cmp").contains("Ord") != 0 { return 1 }
     0
@@ -643,13 +642,13 @@ fn tc_type_satisfies_trait(tname: Str, sname: Str, impls_sl: Int) -> Int {
     if sname == "Display" { return tc_type_has_display_impl(tname) }
     if sname == "Hash" {
         let td = tc_type_decl_nodes.get(tname) ?? -1
-        if td != -1 && type_has_derive(td, "Hash") != 0 { return 1 }
+        if td != -1 && tc_decl_derives(td, "Hash") != 0 { return 1 }
         if tc_method_trait_names(tname, "hash").contains("Hash") != 0 { return 1 }
         return 0
     }
     if sname == "Clone" {
         let td = tc_type_decl_nodes.get(tname) ?? -1
-        if td != -1 && type_has_derive(td, "Clone") != 0 { return 1 }
+        if td != -1 && tc_decl_derives(td, "Clone") != 0 { return 1 }
         if tc_method_trait_names(tname, "clone").contains("Clone") != 0 { return 1 }
         return 0
     }
@@ -682,15 +681,13 @@ fn tc_method_resolvable_on_type(obj_k: TyKind, tname: Str, method: Str) -> Int {
     //     tc_type_decl_nodes covers BOTH structs (850) and enums (902).
     let td = tc_type_decl_nodes.get(tname) ?? -1
     if td != -1 {
-        if method == "to_json"   && type_has_derive(td, "Serialize")   != 0 { return 1 }
-        if method == "from_json" && type_has_derive(td, "Deserialize") != 0 { return 1 }
-        if method == "eq"        && type_has_derive(td, "Eq")          != 0 { return 1 }
-        // Ord: Eq (spec §3.6) — deriving Ord synthesizes both cmp and eq.
-        if method == "eq"        && type_has_derive(td, "Ord")         != 0 { return 1 }
-        if method == "cmp"       && type_has_derive(td, "Ord")         != 0 { return 1 }
-        if method == "clone"     && type_has_derive(td, "Clone")       != 0 { return 1 }
-        if method == "hash"      && type_has_derive(td, "Hash")        != 0 { return 1 }
-        if method == "debug"     && type_has_derive(td, "Debug")       != 0 { return 1 }
+        if method == "to_json"   && tc_decl_derives(td, "Serialize")   != 0 { return 1 }
+        if method == "from_json" && tc_decl_derives(td, "Deserialize") != 0 { return 1 }
+        if method == "eq"        && tc_decl_derives(td, "Eq")          != 0 { return 1 }
+        if method == "cmp"       && tc_decl_derives(td, "Ord")         != 0 { return 1 }
+        if method == "clone"     && tc_decl_derives(td, "Clone")       != 0 { return 1 }
+        if method == "hash"      && tc_decl_derives(td, "Hash")        != 0 { return 1 }
+        if method == "debug"     && tc_decl_derives(td, "Debug")       != 0 { return 1 }
     }
     // (c') str-backed enum intrinsics (to_str/from_str) are synthesized in
     //      codegen (codegen_stmt.bl:5983) and not modeled here → fail-open.
@@ -860,7 +857,7 @@ fn tc_tid_derive_fact(tid: Int, tr: Str) -> Int ! TypeCheck.Resolve, Diag.Report
     if td == DECL_NODE_AMBIGUOUS { return 0 }
     if td == -1 { td = tc_decl_node_for_type(tc_tid_name(tid)) }
     if td == -1 { return -1 }
-    if type_has_derive(td, tr) == 0 { return -1 }
+    if tc_decl_derives(td, tr) == 0 { return -1 }
     if tc_tid_struct_arg_count(tid) == 0 { return 1 }
     let tps = node_type_params(td)
     let flds = node_fields(td)
@@ -4107,26 +4104,25 @@ fn register_derive_method_sigs(program: Int) {
         let tname = node_name(td)
         let ttid = lookup_named_type(tname)
         if ttid != -1 {
-            if type_has_derive(td, "Serialize") != 0 {
+            if tc_decl_derives(td, "Serialize") != 0 {
                 register_derive_method_sig(tname, "to_json", [ttid], TYPE_STR)
             }
-            if type_has_derive(td, "Deserialize") != 0 {
+            if tc_decl_derives(td, "Deserialize") != 0 {
                 register_derive_method_sig(tname, "from_json", [TYPE_STR], make_result_type(ttid, TYPE_STR))
             }
-            if type_has_derive(td, "Clone") != 0 {
+            if tc_decl_derives(td, "Clone") != 0 {
                 register_derive_method_sig(tname, "clone", [ttid], ttid)
             }
-            if type_has_derive(td, "Debug") != 0 {
+            if tc_decl_derives(td, "Debug") != 0 {
                 register_derive_method_sig(tname, "debug", [ttid], TYPE_STR)
             }
-            // Ord: Eq (spec §3.6) — deriving Ord synthesizes eq as well as cmp.
-            if type_has_derive(td, "Eq") != 0 || type_has_derive(td, "Ord") != 0 {
+            if tc_decl_derives(td, "Eq") != 0 {
                 register_derive_method_sig(tname, "eq", [ttid, ttid], TYPE_BOOL)
             }
-            if type_has_derive(td, "Ord") != 0 && ordering_t != -1 {
+            if tc_decl_derives(td, "Ord") != 0 && ordering_t != -1 {
                 register_derive_method_sig(tname, "cmp", [ttid, ttid], ordering_t)
             }
-            if type_has_derive(td, "Hash") != 0 {
+            if tc_decl_derives(td, "Hash") != 0 {
                 register_derive_method_sig(tname, "hash", [ttid], TYPE_U64)
             }
             if tc_is_str_backed_enum_decl(td) != 0 {
@@ -6172,11 +6168,28 @@ fn tc_validate_type_arg_hashability(elems_sl: Int) ! Diag.Report {
     }
 }
 
-// Scan EVERY @derive annotation, not just the first. get_annotation
-// returns only the first match, so `@derive(Eq)` + `@derive(Ord)` on separate
-// lines hid the second derive (codegen's register_derive_annotations already
-// walks all of node_handlers, so this aligns typecheck with codegen).
-fn type_has_derive(td: Int, derive_name: Str) -> Int {
+// Does deriving `listed` oblige `tr`: the trait itself, or one its built-in supertraits
+// reach. The relation is shallow and acyclic (Ord -> Eq, Hash -> Eq); the walk is bounded
+// so a future entry that closed a cycle could not hang the compiler.
+fn tc_derive_obliges(listed: Str, tr: Str) -> Int {
+    let mut cur = listed
+    let mut steps = 0
+    while cur != "" && steps < 8 {
+        if cur == tr { return 1 }
+        cur = builtin_trait_supers(cur)
+        steps = steps + 1
+    }
+    0
+}
+
+// Does the declaration `td` derive `tr`, by naming it or by naming a trait whose
+// supertrait obligation reaches it? Deriving Ord or Hash derives Eq as well when the
+// author did not list it (spec sections/03_types.md, "Supertrait Auto-Derivation"), so
+// every reader of a derive fact answers from the expanded set; a reader that answered
+// from the written list alone would disagree with the methods codegen synthesizes.
+// Scans EVERY @derive annotation, not just the first. get_annotation returns only the
+// first match, so `@derive(Eq)` + `@derive(Ord)` on separate lines hid the second derive.
+pub fn tc_decl_derives(td: Int, tr: Str) -> Int {
     let anns = node_handlers(td)
     if anns == -1 { return 0 }
     let mut i = 0
@@ -6187,7 +6200,7 @@ fn type_has_derive(td: Int, derive_name: Str) -> Int {
             if args_sl != -1 {
                 let mut j = 0
                 while j < sublist_length(args_sl) {
-                    if node_name(sublist_get(args_sl, j)) == derive_name { return 1 }
+                    if tc_derive_obliges(node_name(sublist_get(args_sl, j)), tr) != 0 { return 1 }
                     j = j + 1
                 }
             }
@@ -6508,7 +6521,7 @@ fn tc_check_derive_debug() ! Diag.Report {
     while ti < named_type_names.len() {
         let tname = named_type_names.get(ti).unwrap()
         let td = tc_decl_node_for_type(tname)
-        if td != -1 && type_has_derive(td, "Debug") != 0 {
+        if td != -1 && tc_decl_derives(td, "Debug") != 0 {
             let flds_sl = node_fields(td)
             let mut i = 0
             while flds_sl != -1 && i < sublist_length(flds_sl) {
@@ -6619,7 +6632,7 @@ fn tc_check_one_derive_trait(tr: Str) ! Diag.Report {
     while ti < named_type_names.len() {
         let tname = named_type_names.get(ti).unwrap()
         let td = tc_type_decl_nodes.get(tname) ?? -1
-        if td != -1 && type_has_derive(td, tr) != 0 {
+        if td != -1 && tc_decl_derives(td, tr) != 0 {
             let saved_module = nr_current_module
             nr_current_module = node_module(td)
             let flds_sl = node_fields(td)
@@ -6759,7 +6772,7 @@ fn tc_check_derive_serialize() ! Diag.Report {
     while ti < named_type_names.len() {
         let tname = named_type_names.get(ti).unwrap()
         let td = tc_decl_node_for_type(tname)
-        if td != -1 && type_has_derive(td, "Serialize") != 0 {
+        if td != -1 && tc_decl_derives(td, "Serialize") != 0 {
             let saved_module = nr_current_module
             nr_current_module = node_module(td)
             let flds_sl = node_fields(td)
@@ -10877,16 +10890,13 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
         while i < sublist_length(derive_types_sl) {
             let td = sublist_get(derive_types_sl, i)
             let dtname = tc_nominal_type_name(td)
-            if type_has_derive(td, "Clone") != 0 { nr_register_impl_method(dtname, "clone") }
-            if type_has_derive(td, "Eq") != 0 { nr_register_impl_method(dtname, "eq") }
-            if type_has_derive(td, "Ord") != 0 {
-                nr_register_impl_method(dtname, "cmp")
-                nr_register_impl_method(dtname, "eq")
-            }
-            if type_has_derive(td, "Hash") != 0 { nr_register_impl_method(dtname, "hash") }
-            if type_has_derive(td, "Debug") != 0 { nr_register_impl_method(dtname, "debug") }
-            if type_has_derive(td, "Serialize") != 0 { nr_register_impl_method(dtname, "to_json") }
-            if type_has_derive(td, "Deserialize") != 0 { nr_register_impl_method(dtname, "from_json") }
+            if tc_decl_derives(td, "Clone") != 0 { nr_register_impl_method(dtname, "clone") }
+            if tc_decl_derives(td, "Eq") != 0 { nr_register_impl_method(dtname, "eq") }
+            if tc_decl_derives(td, "Ord") != 0 { nr_register_impl_method(dtname, "cmp") }
+            if tc_decl_derives(td, "Hash") != 0 { nr_register_impl_method(dtname, "hash") }
+            if tc_decl_derives(td, "Debug") != 0 { nr_register_impl_method(dtname, "debug") }
+            if tc_decl_derives(td, "Serialize") != 0 { nr_register_impl_method(dtname, "to_json") }
+            if tc_decl_derives(td, "Deserialize") != 0 { nr_register_impl_method(dtname, "from_json") }
             i = i + 1
         }
     }
