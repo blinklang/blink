@@ -1,0 +1,128 @@
+// A variant constructor written as a call: `Shape.Circle(2)`.
+//
+// The value is one arm of a tagged union: a tag beside the union member the tag selects,
+// and the member is a struct with one field per payload element. The type's own typedef
+// emitter lays that shape out, so the constructor reads the same two facts the emitter
+// wrote with: the variant node, in declaration order, and the field layout of each
+// payload field. Reading either of them a second way here would let a value be built in
+// a shape the typedef does not declare.
+import lower_test_helpers.{ probe, rhs_of, assert_eq_str, assert_kind, assert_shape,
+    assert_verifies }
+import cg_expr.{lower_expr}
+import ir.{ir_c_name, ir_kid, IrKind}
+import mono.{run_mono}
+
+fn src_shapes() -> Str {
+    #"type Shape {
+    Circle(r: Int)
+    Rect(w: Int, h: Int)
+    Dot
+}
+
+fn main() {
+    let ring = Shape.Circle(2)
+    let slab = Shape.Rect(3, 4)
+    let _keep = [ring, slab]
+}
+"#
+}
+
+// The union member the payload fills is named after the variant, because that is the name
+// the typedef gave the member.
+test "a variant constructor fills the union member the variant names" {
+    probe("enum_ctor_member", src_shapes())
+    let built = lower_expr(rhs_of("ring"))
+    assert_kind("kind", built, IrKind.EnumNew)
+    assert_eq_str("member", ir_c_name(built), "Circle")
+}
+
+// The tag is a constant, and its literal is the macro the type's typedef defines. A number
+// written here instead would be a second answer to which arm is which.
+test "the tag is the macro the type's own typedef defines" {
+    probe("enum_ctor_tag", src_shapes())
+    let tag = ir_kid(lower_expr(rhs_of("ring")), 0)
+    assert_kind("tag kind", tag, IrKind.Const)
+    assert_eq_str("tag", ir_c_name(tag), "blink_Shape_Circle_TAG")
+}
+
+// Two payload fields travel in declaration order, after the tag.
+test "the payload travels in declaration order after the tag" {
+    probe("enum_ctor_order", src_shapes())
+    assert_shape("rect", lower_expr(rhs_of("slab")), "EnumNew(Const, Const, Const)")
+}
+
+// The node is held to its declaration: the tid is the enum, the variant is one the enum
+// declares, and the payload count is the variant's arity.
+test "a variant constructor verifies against its declaration" {
+    probe("enum_ctor_verify", src_shapes())
+    assert_verifies("circle", lower_expr(rhs_of("ring")))
+    assert_verifies("rect", lower_expr(rhs_of("slab")))
+}
+
+fn src_tree() -> Str {
+    #"type Tree {
+    Leaf(v: Int)
+    Node(kid: Tree)
+}
+
+fn main() {
+    let tip = Tree.Leaf(1)
+    let up = Tree.Node(tip)
+    let _keep = [tip, up]
+}
+"#
+}
+
+// A field that reaches its own enum is stored by pointer, because the enum's typedef is
+// still incomplete where the member is declared. The constructor boxes it, so the value
+// written into the member is the shape the member was declared with.
+test "a payload that reaches its own enum is boxed" {
+    probe("enum_ctor_boxed", src_tree())
+    assert_shape("node", lower_expr(rhs_of("up")), "EnumNew(Const, Box(VarRef))")
+}
+
+fn src_side() -> Str {
+    #"type Side[L, R] {
+    Left(l: L)
+    Right(r: R)
+}
+
+fn main() {
+    let picked: Side[Int, Str] = Side.Left(7)
+    let _keep = picked
+}
+"#
+}
+
+// A generic enum's tags belong to the instance, not to the generic declaration: two
+// instances lay out two typedefs and two sets of macros.
+test "a generic enum names the instance's own tag" {
+    run_mono(probe("enum_ctor_generic", src_side()))
+    let tag = ir_kid(lower_expr(rhs_of("picked")), 0)
+    assert_eq_str("tag", ir_c_name(tag), "blink_Side_0Int_0Str_Left_TAG")
+}
+
+// A payload may be written by field name, and a name carries its own position: the field it
+// names is the field it fills, whatever order the names are written in. The arm is a struct
+// whose fields are written in the order they were declared, so a payload built in written
+// order would put `h` where `w` is declared and cross the two.
+fn src_named() -> Str {
+    #"type Crate {
+    Box(w: Int, h: Int)
+}
+
+fn main() {
+    let c = Crate.Box(h: 4, w: 3)
+    let _keep = c
+}
+"#
+}
+
+test "a payload written by field name is built in declared order" {
+    probe("enum_named", src_named())
+    let built = lower_expr(rhs_of("c"))
+    assert_shape("arm", built, "EnumNew(Const, Const, Const)")
+    assert_eq_str("the w field first", ir_c_name(ir_kid(built, 1)), "3")
+    assert_eq_str("then the h field", ir_c_name(ir_kid(built, 2)), "4")
+    assert_verifies("arm", built)
+}

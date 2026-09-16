@@ -6,12 +6,12 @@
 // follows to give them a type, so codegen resolves the same declaration rather than
 // re-deciding the answer from the two spellings.
 //
-// Two kinds reach that rule and two do not. A builtin type declares no Blink function at
-// all, so its constructors are calls the runtime publishes and the register of runtime
-// names answers for them. A declared type answers through the declaration itself. Against
-// those, a container constructor needs a table of key operations chosen from the key type,
-// which no written argument supplies, and a variant constructor fills one arm of a tagged
-// union, a shape no node in the IR builds. Both are refused by name here, so what is
+// Three kinds reach that rule and one does not. A builtin type declares no Blink function
+// at all, so its constructors are calls the runtime publishes and the register of runtime
+// names answers for them. A declared type answers through the declaration itself. A variant
+// constructor answers with the arm it fills, which is read from the enum's declaration.
+// Against those, a container constructor needs a table of key operations chosen from the key
+// type, which no written argument supplies, so it is refused by name here and what is
 // missing stays legible and countable.
 
 import lower_test_helpers.{
@@ -20,7 +20,7 @@ import lower_test_helpers.{
 }
 import parser.{node_kind, node_method, nodes}
 import ast.{NodeKind, nk_of}
-import ir.{IrKind, ir_c_name}
+import ir.{IrKind, ir_c_name, ir_kid}
 import cg_expr.{lower_expr}
 import std.io
 
@@ -93,11 +93,12 @@ fn main() {
 "#
 }
 
-// One call of each refused shape. Each is written once, so a test that lowers one records
-// exactly one refusal. A free function spelled like the variant is declared beside it,
-// because typecheck reads a qualified variant above the whole static ladder and the free
-// function must not take it over. The two containers are given an element so their types are pinned;
-// an unpinned container is a different error, reported before codegen.
+// The two container constructors that are refused, and a variant constructor that is not.
+// Each is written once, so a test that lowers one reads exactly one answer. A free function
+// spelled like the variant is declared beside it, because typecheck reads a qualified variant
+// above the whole static ladder and the free function must not take it over. The two
+// containers are given an element so their types are pinned; an unpinned container is a
+// different error, reported before codegen.
 fn src_refused() -> Str {
     #"type Shape {
     Circle(Int)
@@ -329,11 +330,23 @@ test "Set.new refuses because its key operations are chosen from the element typ
         "'Set.new' answers a container whose key operations are chosen from the key type")
 }
 
-test "a qualified variant constructor refuses because it fills one arm of a tagged union" {
+// The arm carries the tag its own typedef defines, ahead of the payload. The enum is written
+// with its payload fields unnamed, which is the spelling that reaches the payload by position
+// rather than by field name.
+test "a qualified variant constructor builds the arm it fills" {
     probe("cg_call_variant_ctor", src_refused())
-    assert_ice_saying("Shape.Circle", lower_expr(rhs_of("round")),
-        "EnumConstructorNotInIr",
-        "'Shape.Circle' fills one arm of a tagged union")
+    let built = lower_expr(rhs_of("round"))
+    assert_kind("kind", built, IrKind.EnumNew)
+    assert_shape("shape", built, "EnumNew(Const, VarRef)")
+    assert_eq_str("tag", ir_c_name(ir_kid(built, 0)), "blink_Shape_Circle_TAG")
+    assert_verifies("variant ctor", built)
+}
+
+// A qualified variant is read above the whole static ladder, so a free function written
+// under the name the qualifier and the variant spell does not take the constructor over.
+test "a free function spelled like the variant does not take over the constructor" {
+    probe("cg_call_variant_ctor_shadowed", src_refused())
+    assert_kind("kind", lower_expr(rhs_of("round")), IrKind.EnumNew)
 }
 
 test "a declared namesake does not take over a builtin type's own constructor" {

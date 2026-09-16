@@ -21,7 +21,7 @@ import parser.{
     node_kind, node_name, node_left, node_right, node_obj, node_index, node_method, node_args,
     node_line,
     node_methods, node_trait_name, node_impl_binders, node_type_params,
-    node_module, node_source_module, node_params, node_fields,
+    node_module, node_source_module, node_params, node_fields, node_value,
     sublist_get, sublist_length,
 }
 import ast.{NodeKind, nk_of, node_kind_name}
@@ -30,7 +30,8 @@ import typecheck.{
     DECL_NODE_AMBIGUOUS,
     is_import_module_name, is_builtin_namespace, is_builtin_fn, tc_alias_to_original,
     tc_qualifier_to_module_or_self, tc_get_symbol_module, tc_type_str,
-    tc_enum_variant_slots, tc_evar_name, tc_names_a_type,
+    tc_enum_variant_slots, tc_evar_name, tc_tid_child_count,
+    tc_names_a_type, tc_is_sealed_list_hof,
     TYPE_INT, TYPE_BOOL, TYPE_STR,
 }
 import layout.{
@@ -46,17 +47,20 @@ import cname.{
     c_display_dispatch_name, c_derive_method_name,
     c_runtime_helper, c_ffi_symbol, c_mint_local, c_string_literal, c_field_name,
     cname_ffi_struct_mirror,
+    c_variant_tag_macro, c_mono_variant_tag_macro, c_variant_member_name,
 }
 import ir.{
     ir_call_direct, ir_call_runtime, ir_cast, ir_unary, ir_unbox, ir_box,
     ir_assign, ir_binary, ir_block, ir_carrier_tag, ir_carrier_unwrap, ir_carrier_wrap,
     ir_const, ir_if, ir_let, ir_panic, ir_struct_new, ir_var_ref, ir_field_get,
+    ir_enum_new,
 }
 import cg_expr.{lower_expr, cg_expr_push_pending}
 import cg_eff.{cg_eff_lower_builtin_perform}
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
 import diagnostics.{
     Diag, diag_ice_at, diag_ice_stage_not_built, diag_file_for_node, diag_source_file,
+    diag_is_ice_seg,
     CODEGEN_STAGE_NOT_BUILT, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 
@@ -452,6 +456,13 @@ fn lower_module_call(node: Int, obj: Int) -> Int ! Diag.Report {
 // The tail every free-function call shares once its declaration is known. A declaration of
 // -1 is a refusal the resolver already reported.
 fn cc_free_call(node: Int, decl: Int) -> Int ! Diag.Report {
+    cc_declared_call(node, decl, NO_RECEIVER)
+}
+
+// A call of one declaration, with the receiver it was written on if it was written on one.
+// `xs.map(f)` and `list_map(xs, f)` reach the same body, so they are one producer here and
+// differ only in whether a receiver travels ahead of the written arguments.
+fn cc_declared_call(node: Int, decl: Int, recv: Int) -> Int ! Diag.Report {
     if decl < 0 { return -1 }
     let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
     if symbol == "" { return -1 }
@@ -459,7 +470,7 @@ fn cc_free_call(node: Int, decl: Int) -> Int ! Diag.Report {
         cc_ev_not_in_ir(node)
         return -1
     }
-    cc_build_call(node, symbol, NO_RECEIVER, CallForm.Declared)
+    cc_build_call(node, symbol, recv, CallForm.Declared)
 }
 
 // The name the declaration was written under. An import may rename what it brings in, and
@@ -888,7 +899,7 @@ fn lower_builtin_static_call(node: Int, owner: Str, method: Str) -> Int ! Diag.R
 //   3. the free function the qualifier and the method name spell.
 //   4. a conversion, which is keyed source-typed and so is read only after 3 misses.
 fn lower_declared_static_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
-    if cc_names_variant(owner, method) { return cc_enum_ctor_not_in_ir(node, owner, method) }
+    if cc_names_variant(owner, method) { return cc_enum_variant_call(node, owner, method) }
     let im = cc_trait_qualified_impl(owner, method)
     if im >= 0 { return cc_impl_static_call(node, im, method) }
     let decl = cc_sole_fn_named(node, cc_assoc_name(owner, method))
@@ -1155,15 +1166,180 @@ fn cc_sole_fn_named(node: Int, name: Str) -> Int ! Diag.Report {
     DECL_REFUSED
 }
 
-// A variant constructor. The value is one arm of a tagged union, written as a tag beside a
-// member of the union the tag selects, and the member is itself a struct with one field per
-// payload element. The carrier node builds a tag beside ONE named member and nothing
-// deeper, so there is no node here that builds this and no spelling for the member's own
-// type to build it with.
-fn cc_enum_ctor_not_in_ir(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
-    diag_ice_at("EnumConstructorNotInIr", CODEGEN_STAGE_NOT_BUILT,
-        "'{owner}.{method}' fills one arm of a tagged union, and no node builds that shape", node,
-        "the IR needs a variant constructor that names the arm as well as the tag")
+// ── Variant constructors ──────────────────────────────────────────────────
+//
+// `Shape.Circle(2)` builds one arm of a tagged union: a tag beside the union member the
+// tag selects, and that member is a struct with one field per payload element.
+//
+// Everything about the arm is read from the declaration, because that is what the reading
+// side reads too: a pattern finds the arm by name in the declaration's own variant nodes,
+// and this finds the same node the same way. The variant entries typecheck registered are
+// not a second route to it: a generic enum's instance tid carries none of them, so the
+// declaration is the only place both a bare enum and an instance can be read from.
+fn cc_enum_variant_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    if cc_kind(tid) != TyKind.Enum { return cc_variant_answer_not_enum(node, owner, method, tid) }
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    let _td = ensure_typedef_for(tid)
+    let decl = tc_tid_decl_node(tid)
+    let vnode = cc_variant_node(decl, method)
+    if vnode < 0 { return cc_variant_not_declared(node, owner, method) }
+    let macro = cc_variant_tag(tid, decl, vnode)
+    if diag_is_ice_seg(macro) { return cc_variant_tag_unspellable(node, owner, method, macro) }
+    let arity = cc_variant_arity(vnode)
+    let args = node_args(node)
+    let given = if args == -1 { 0 } else { sublist_length(args) }
+    // One written argument per declared field is the payload's precondition, and typecheck
+    // checks that count before codegen reads it. The check is repeated rather than assumed
+    // because the payload is built by walking the declaration: a count that disagrees would
+    // otherwise read past the written arguments.
+    if given != arity { return cc_variant_arity_wrong(node, owner, method, arity, given) }
+    let payload = cc_variant_payload(node, decl, vnode, owner, method, arity)
+    if payload.len() != arity { return -1 }
+    let member = if arity == 0 { "" } else { c_variant_member_name(vnode) }
+    let tag_rec = cc_local(TYPE_INT, node)
+    if cc_stopped(tag_rec) { return -1 }
+    ir_enum_new(tid, node, rec.c_spelling, vnode, member,
+        ir_const(TYPE_INT, node, tag_rec.c_spelling, macro), payload)
+}
+
+// The payload in DECLARED order, each element in the physical form its member was declared
+// with. The order is the declaration's because that is the order the arm's struct fields are
+// written in, and a payload may be written by field name: `Crate.Box(h: 4, w: 3)` fills the
+// same two fields as `Crate.Box(3, 4)`. So the walk is over the declared fields and each one
+// asks which written argument fills it, rather than over the written arguments in the order
+// they appear.
+//
+// A field that reaches its own enum is stored by pointer, because the enum's typedef is
+// still incomplete where the member is declared, so a value for such a member is boxed here
+// rather than written into a word it does not fit.
+//
+// The type each element is laid out at is the type typecheck gave the written argument.
+// A generic enum's fields are declared at its type parameters, which have no C layout at
+// all; the argument carries the substituted type, so it is the only reading of the field
+// that answers for an instance as well as for a bare enum.
+//
+// A refusal returns an empty list, which the caller reads as short. The count is already
+// known to match, so a complete list is the only other answer this can give.
+fn cc_variant_payload(node: Int, decl: Int, vnode: Int, owner: Str, method: Str, arity: Int) -> List[Int] ! Diag.Report {
+    let args = node_args(node)
+    let fields = node_fields(vnode)
+    let refused: List[Int] = []
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < arity {
+        let arg = cc_variant_arg_for_field(args, sublist_get(fields, i), i)
+        if arg < 0 { return cc_variant_field_unfilled(node, owner, method, node_name(sublist_get(fields, i))) }
+        let ftid = tid_of_node(arg)
+        if ftid < 0 { return refused }
+        // The layout is answered before the operand is lowered, so that a field with no C
+        // form refuses without the statements lowering an operand can hoist ahead of it.
+        let mem = cc_variant_field_layout(node, decl, ftid)
+        if cc_stopped(mem) { return refused }
+        let value = lower_expr(arg)
+        if value < 0 { return refused }
+        if mem.slot_form == SlotForm.PointerBoxed {
+            let held = cc_local(ftid, node)
+            if cc_stopped(held) { return refused }
+            out.push(ir_box(ftid, node, mem.c_spelling, held.c_spelling, value))
+        } else {
+            out.push(value)
+        }
+        i = i + 1
+    }
+    out
+}
+
+// The written argument that fills one declared field. A name fills the field it names,
+// wherever it is written; anything else fills the field at its own position. This is the
+// rule typecheck resolves the payload by, so it is the rule the payload is built by.
+fn cc_variant_arg_for_field(args: Int, field: Int, slot: Int) -> Int {
+    if args == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(args) {
+        let arg = sublist_get(args, i)
+        if nk_of(node_kind(arg)) == NodeKind.NamedArg {
+            if node_name(arg) == node_name(field) { return node_value(arg) }
+        } else {
+            if i == slot { return arg }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn cc_variant_field_unfilled(node: Int, owner: Str, method: Str, field: Str) -> List[Int] ! Diag.Report {
+    diag_ice_at("VariantFieldUnfilled", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{owner}.{method}' declares a field '{field}' that this call fills with nothing", node,
+        "typecheck matches every payload field to an argument before codegen builds it; this is a compiler bug")
+    []
+}
+
+fn cc_variant_field_layout(node: Int, decl: Int, ftid: Int) -> LayoutRecord ! Diag.Report {
+    let rec = field_layout_of(decl, ftid)
+    // The reason is read into the message before the test, so that every read of a decline
+    // sits next to the internal error that reports it and none can be left to be swallowed.
+    let why = "a variant payload field has no C layout: {rec.decline_reason}"
+    if rec.decline_reason == "" { return rec }
+    diag_ice_at("UnspellableVariantField", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
+        "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    cc_stop(rec)
+}
+
+// A generic enum's tags belong to the instance, not to the generic declaration: two
+// instances declare two typedefs and two sets of macros. Whether the tid carries arguments
+// is what decides which namer applies, on the reading side as well as here.
+fn cc_variant_tag(tid: Int, decl: Int, vnode: Int) -> Str {
+    if tc_tid_child_count(tid) > 0 { return c_mono_variant_tag_macro(tid, vnode) }
+    c_variant_tag_macro(decl, vnode)
+}
+
+// A payload-less variant has no field sublist at all.
+fn cc_variant_arity(vnode: Int) -> Int {
+    let fields = node_fields(vnode)
+    if fields == -1 { 0 } else { sublist_length(fields) }
+}
+
+fn cc_variant_node(decl: Int, name: Str) -> Int {
+    if decl < 0 { return -1 }
+    let vars = node_fields(decl)
+    if vars == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(vars) {
+        let v = sublist_get(vars, i)
+        if nk_of(node_kind(v)) == NodeKind.TypeVariant && node_name(v) == name { return v }
+        i = i + 1
+    }
+    -1
+}
+
+fn cc_variant_answer_not_enum(node: Int, owner: Str, method: Str, tid: Int) -> Int ! Diag.Report {
+    diag_ice_at("VariantCallNotAnEnum", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{owner}.{method}' names a variant, and this call was typed '{tc_type_str(tid)}'", node,
+        "a variant constructor answers the enum that declares it; this is a compiler bug")
+    -1
+}
+
+fn cc_variant_not_declared(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("VariantNotDeclared", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{owner}' declares no variant named '{method}' at the type this call answers", node,
+        "typecheck resolves the variant before codegen builds it; this is a compiler bug")
+    -1
+}
+
+fn cc_variant_tag_unspellable(node: Int, owner: Str, method: Str, why: Str) -> Int ! Diag.Report {
+    diag_ice_at("UnnameableVariantTag", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{owner}.{method}' has no spellable tag: {why}", node,
+        "an enum must be fully solved before its tags are spelled; this is a compiler bug")
+    -1
+}
+
+fn cc_variant_arity_wrong(node: Int, owner: Str, method: Str, want: Int, given: Int) -> Int ! Diag.Report {
+    diag_ice_at("EnumPayloadArityWrong", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{owner}.{method}' takes {want} payload fields, and this call gives {given}", node,
+        "typecheck checks a variant's payload count before codegen builds it; this is a compiler bug")
     -1
 }
 
@@ -1234,34 +1410,46 @@ fn cc_char_from_code_point(node: Int) -> Int ! Diag.Report {
     let code = lower_expr(arg)
     if code < 0 { return -1 }
     let _td = ensure_typedef_for(tid)
-    cc_char_result(node, tid, carrier, verdict, answered, ok_mem, err_mem, fault, code)
+    cc_char_result(node, CharResultPlan { tid: tid, carrier: carrier, verdict: verdict,
+        answered: answered, ok_mem: ok_mem, err_mem: err_mem, fault: fault }, code)
+}
+
+// Every spelling the two arms are written with, settled before the argument is lowered.
+// They are one fact about one answer, so they travel as one: asked for again at the point
+// of use, each would be a second producer of a question layout has already answered.
+type CharResultPlan {
+    tid: Int
+    carrier: LayoutRecord
+    verdict: LayoutRecord
+    answered: LayoutRecord
+    ok_mem: LayoutRecord
+    err_mem: LayoutRecord
+    fault: ConversionErrorPlan
 }
 
 // The three statements the call leaves behind, and the temp they fill. The verdict is bound
 // because the test reads it and the accepted arm holds it, so the runtime is asked once
 // however many times its answer is read.
-fn cc_char_result(node: Int, tid: Int, carrier: LayoutRecord, verdict: LayoutRecord,
-        answered: LayoutRecord, ok_mem: LayoutRecord, err_mem: LayoutRecord,
-        fault: ConversionErrorPlan, code: Int) -> Int ! Diag.Report {
+fn cc_char_result(node: Int, p: CharResultPlan, code: Int) -> Int ! Diag.Report {
     let said = c_mint_local("u")
     let held = c_mint_local("u")
-    cg_expr_push_pending(node, ir_let(TYPE_INT, node, verdict.c_spelling, said, verdict.slot_form,
-        ir_call_runtime(TYPE_INT, node, verdict.c_spelling,
-            c_runtime_helper(char_validate_primitive), verdict.slot_form, [code])))
-    cg_expr_push_pending(node, ir_let(tid, node, carrier.c_spelling, held, carrier.slot_form, -1))
-    let accepted = ir_binary(TYPE_BOOL, node, answered.c_spelling, ">=",
-        cc_temp_ref(node, TYPE_INT, verdict, said),
-        ir_const(TYPE_INT, node, verdict.c_spelling, "{code_point_refused_below}"))
-    let good = ir_carrier_wrap(tid, node, carrier.c_spelling, carrier_ok_member,
-        ir_const(TYPE_INT, node, verdict.c_spelling, "{TAG_OK}"),
-        ir_cast(child_tid(tid, Slot.Inner1), node, ok_mem.c_spelling,
-            cc_temp_ref(node, TYPE_INT, verdict, said)))
-    let bad = ir_carrier_wrap(tid, node, carrier.c_spelling, carrier_err_member,
-        ir_const(TYPE_INT, node, verdict.c_spelling, "{TAG_ERR}"), cc_conversion_error_value(node, err_mem, fault))
+    cg_expr_push_pending(node, ir_let(TYPE_INT, node, p.verdict.c_spelling, said, p.verdict.slot_form,
+        ir_call_runtime(TYPE_INT, node, p.verdict.c_spelling,
+            c_runtime_helper(char_validate_primitive), p.verdict.slot_form, [code])))
+    cg_expr_push_pending(node, ir_let(p.tid, node, p.carrier.c_spelling, held, p.carrier.slot_form, -1))
+    let accepted = ir_binary(TYPE_BOOL, node, p.answered.c_spelling, ">=",
+        cc_temp_ref(node, TYPE_INT, p.verdict, said),
+        ir_const(TYPE_INT, node, p.verdict.c_spelling, "{code_point_refused_below}"))
+    let good = ir_carrier_wrap(p.tid, node, p.carrier.c_spelling, carrier_ok_member,
+        ir_const(TYPE_INT, node, p.verdict.c_spelling, "{TAG_OK}"),
+        ir_cast(child_tid(p.tid, Slot.Inner1), node, p.ok_mem.c_spelling,
+            cc_temp_ref(node, TYPE_INT, p.verdict, said)))
+    let bad = ir_carrier_wrap(p.tid, node, p.carrier.c_spelling, carrier_err_member,
+        ir_const(TYPE_INT, node, p.verdict.c_spelling, "{TAG_ERR}"), cc_conversion_error_value(node, p.err_mem, p.fault))
     cg_expr_push_pending(node, ir_if(node, accepted,
-        ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), good)]),
-        ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), bad)])))
-    cc_temp_ref(node, tid, carrier, held)
+        ir_block(node, [ir_assign(node, cc_temp_ref(node, p.tid, p.carrier, held), good)]),
+        ir_block(node, [ir_assign(node, cc_temp_ref(node, p.tid, p.carrier, held), bad)])))
+    cc_temp_ref(node, p.tid, p.carrier, held)
 }
 
 // One read of a bound temp. Each read is its own node: a node reached twice is a tree that
@@ -1355,6 +1543,10 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let declared = cc_intrinsic_callee(node, kind, mname)
     if declared == ROW_REFUSED { return -1 }
     if declared != "" { return lower_intrinsic_method(node, obj, kind, mname, declared) }
+    // Read beside the intrinsic table and above the impls, for the same reason: the sealed
+    // List higher-order surface is a builtin method, so it wins over a same-named user impl
+    // exactly as typecheck resolves it.
+    if kind == TyKind.List && cc_names_list_hof(mname) { return cc_list_hof_call(node, obj, mname) }
     let primitive = cc_runtime_method(kind, mname)
     if primitive != "" { return cc_lower_runtime_method(node, obj, kind, mname, primitive) }
     let keyed = cc_keyed_row(kind, mname)
@@ -2485,34 +2677,57 @@ fn cc_pointer_body_not_lowered(node: Int) -> Int ! Diag.Report {
 fn cc_list_not_built(node: Int, method: Str) -> Int ! Diag.Report {
     if method == "get" || method == "pop" { return cc_checked_read(node) }
     if method == "contains" { return cc_element_scan_not_lowered(node) }
-    if cc_names_list_hof(method) { return cc_list_hof_not_registered(node, method) }
     cc_intrinsic_not_built(node, TyKind.List, method)
 }
 
-// The higher-order methods the standard library already has a body for. Each names a
-// generic in lib/std/list.bl, so a loop emitted here would be a second answer to what the
-// method means, and the two could disagree.
+// The higher-order methods the standard library already has a body for. The list of names
+// is typecheck's, read back from it rather than written out a second time: the surface is
+// sealed, and two spellings of one sealed list could disagree about a member.
 fn cc_names_list_hof(method: Str) -> Bool {
-    if method == "map" { return true }
-    if method == "filter" { return true }
-    if method == "fold" { return true }
-    if method == "any" { return true }
-    if method == "all" { return true }
-    if method == "for_each" { return true }
-    false
+    tc_is_sealed_list_hof(method) == 1
 }
 
-// What is missing is the instance, not the body. Mono registers an instance of a generic
-// for each call of it that it can see, and a method call is not a call of list_map as far
-// as it can see, so the types this one uses have none. Naming the generic without an
-// instance reports mono's refusal for a decision made here, which blames the wrong stage,
-// so the call is refused under its own name and says which instance would answer it.
-fn cc_list_hof_not_registered(node: Int, method: Str) -> Int ! Diag.Report {
-    diag_ice_at("ListHofInstanceNotRegistered", CODEGEN_STAGE_NOT_BUILT,
-        "'{method}' over a List is the standard library generic 'list_{method}', which mono registers no instance of for a method call",
-        node, "mono has to register an instance for a builtin method that stands for a generic function")
+// The generic a higher-order method stands for. `lib/std/list.bl` declares each of them as
+// an ordinary generic taking the list first, so the receiver is that first parameter and
+// the call is the generic's own, under the instance mono registered for this call site.
+fn cc_list_hof_call(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
+    let name = "{list_hof_prefix}{method}"
+    // The search is over the one module the method's meaning is written in, for the reason
+    // the intrinsic table gives: a program is free to write its own function under this name,
+    // and the method must keep meaning the standard library's.
+    let decl = cc_stdlib_fn_named(node, list_hof_module, name)
+    if decl == DECL_REFUSED { return -1 }
+    if decl < 0 { return cc_list_hof_no_body(node, method) }
+    // The receiver is the generic's first parameter, so the method takes one fewer argument
+    // than the function does. Typecheck checks the count for some of this family and not the
+    // rest, so it is checked here: a call built short reaches the C compiler, where the error
+    // can no longer name a line of Blink.
+    let want = sublist_length(node_params(decl)) - 1
+    let given = sublist_length(node_args(node))
+    if want != given { return cc_list_hof_arity_wrong(node, method, want, given) }
+    cc_declared_call(node, decl, obj)
+}
+
+fn cc_list_hof_arity_wrong(node: Int, method: Str, want: Int, given: Int) -> Int ! Diag.Report {
+    diag_ice_at("ListHofArityWrong", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{method}' over a List takes {want} argument(s), and this call gives {given}", node,
+        "typecheck checks a call's argument count before codegen builds it; this is a compiler bug")
     -1
 }
+
+// The standard library is loaded for every program, so the generic behind a sealed method
+// is always declared. Missing means the module the method's meaning lives in was not read,
+// which is a broken build rather than a program this stage can refuse in terms of.
+fn cc_list_hof_no_body(node: Int, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("ListHofBodyNotDeclared", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{method}' over a List stands for '{list_hof_prefix}{method}', which no loaded module declares", node,
+        "lib/std/list.bl declares the generic every sealed List higher-order method means")
+    -1
+}
+
+let list_hof_prefix = "list_"
+let list_hof_module = "std_list"
+
 
 // A scan over the elements. It is a loop over statements and a comparison chosen per
 // element type, so no one call names it and no layout answer decides it.
