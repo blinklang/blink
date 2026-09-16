@@ -31,6 +31,7 @@ import typecheck.{
     is_import_module_name, is_builtin_namespace, is_builtin_fn, tc_alias_to_original,
     tc_qualifier_to_module_or_self, tc_get_symbol_module, tc_type_str,
     tc_enum_variant_slots, tc_evar_name, tc_tid_child_count,
+    tc_struct_field_slots, tc_sfield_name,
     tc_names_a_type, tc_is_sealed_list_hof, is_user_effect_handle_name,
     TYPE_INT, TYPE_BOOL, TYPE_STR,
 }
@@ -433,8 +434,13 @@ fn cc_element_layout(node: Int, elem_tid: Int, position: Position) -> LayoutReco
 
 fn lower_fn_call(node: Int) -> Int ! Diag.Report {
     let callee = node_left(node)
+    // `mod.f(args)` never reaches here: a qualifier is written on the left of a dot, which
+    // parses as MethodCall and routes through lower_module_call before lower_call ever
+    // dispatches to this function. So a callee that is not a plain written name is a call
+    // expression, a closure literal, a container element or the like standing where a name
+    // would go: an expression that PRODUCES a closure value, not one that names a function.
     if callee < 0 || nk_of(node_kind(callee)) != NodeKind.Ident {
-        diag_ice_stage_not_built("cg_call qualified calls", node)
+        diag_ice_stage_not_built("cg_call closure-value callees", node)
         return -1
     }
     if !cc_is_free_name(callee) {
@@ -1459,20 +1465,21 @@ type ConversionErrorPlan { tid: Int  spelling: Str  string_spelling: Str  texts:
 fn cc_conversion_error_plan(node: Int, err_tid: Int, from_tid: Int, to_tid: Int) -> ConversionErrorPlan ! Diag.Report {
     let empty = ConversionErrorPlan { tid: -1, spelling: "", string_spelling: "", texts: [] }
     if err_tid < 0 { return cc_conversion_error_refused(node, "no error arm to build", empty) }
-    let decl = tc_tid_decl_node(err_tid)
-    if decl == DECL_NODE_AMBIGUOUS { return cc_conversion_error_refused(node, "a name more than one module declares", empty) }
-    let fields = if decl < 0 { -1 } else { node_fields(decl) }
-    if fields == -1 { return cc_conversion_error_refused(node, "no declaration to read fields from", empty) }
     let shape = cc_local(err_tid, node)
     if cc_stopped(shape) { return empty }
     let text = cc_local(TYPE_STR, node)
     if cc_stopped(text) { return empty }
     let from = tc_type_str(from_tid)
     let to = tc_type_str(to_tid)
+    // The fields come from the type, not from a declaration written for it. Typecheck mints
+    // this error through ensure_runtime_struct_type, which fills its field pool whether or
+    // not a named type is declared anywhere, so a read of the declaration answers only while
+    // one happens to exist. Reading the pool asks typecheck what the type IS.
+    let slots = tc_struct_field_slots(err_tid)
     let mut texts: List[Str] = []
     let mut i = 0
-    while i < sublist_length(fields) {
-        let fname = node_name(sublist_get(fields, i))
+    while i < slots.len() {
+        let fname = tc_sfield_name(slots.get(i).unwrap())
         let wrote = cc_conversion_error_text(fname, from, to)
         if wrote == "" { return cc_conversion_error_refused(node, "a field '{fname}' with no text to write", empty) }
         texts.push(wrote)
@@ -1547,6 +1554,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if cc_is_map_slot_method(kind, mname) { return cc_map_slot_method(node, obj, kind, mname) }
     if cc_is_scalar_cast(kind, mname) { return cc_scalar_cast(node, obj, kind, mname) }
     if cc_is_char_text(kind, mname) { return cc_char_text(node, obj, kind, mname) }
+    if cc_is_str_as_cstr(kind, mname) { return cc_str_as_cstr(node, obj, kind, mname) }
     if cc_is_carrier_test(kind, mname) { return cc_carrier_test(node, obj, kind, mname) }
     if cc_is_carrier_read(kind, mname) { return cc_carrier_read(node, obj, kind, mname) }
     if kind == TyKind.FfiScope { return cc_lower_scope_method(node, obj, mname) }
@@ -1994,6 +2002,26 @@ fn cc_char_text(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Re
 // value it already holds, and a second spelling of it would be a second answer.
 fn cc_char_text_of_value(node: Int, spelling: Str, form: SlotForm, value: Int) -> Int {
     ir_call_runtime(TYPE_STR, node, spelling, c_runtime_helper("char_to_str"), form, [value])
+}
+
+fn cc_is_str_as_cstr(kind: TyKind, method: Str) -> Bool {
+    kind == TyKind.Str && method == "as_cstr"
+}
+
+// `Str.as_cstr` (sections/07_trust_modules_metadata.md:234): a heap copy of the string's
+// bytes as a Ptr[U8], made by the runtime and not by a declaration this stage could dispatch
+// to. Typecheck answers Ptr[U8] for the call's own tid, so what the copy is spelled at is
+// read off the call the same way every other builtin conversion reads its answer.
+fn cc_str_as_cstr(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, kind, method, 0, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let answer = cc_local(tid, node)
+    if cc_stopped(answer) { return -1 }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    ir_call_runtime(tid, node, answer.c_spelling, c_runtime_helper("strdup"), answer.slot_form, [recv])
 }
 
 // ── Carriers ──────────────────────────────────────────────────────────────
@@ -2485,7 +2513,8 @@ fn cc_list_join_callee(node: Int) -> Str ! Diag.Report {
 // and this table declining is what lets the impl path answer them. `substring` and
 // `substr` are two spellings of one function, and `to_int` and `parse_int` likewise,
 // exactly as typecheck has them. `as_cstr` is absent because no stdlib function answers
-// it: the pointer it hands back is made by codegen, not by a call.
+// it: the copy it hands back is a direct runtime call this stage builds itself
+// (cc_str_as_cstr), read before the impls the same way this table is.
 fn cc_str_intrinsic(method: Str) -> Str {
     if method == "byte_at" { return "std_str:str_char_at" }
     if method == "char_at" { return "std_str:str_char_at_opt" }
