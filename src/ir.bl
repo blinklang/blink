@@ -103,6 +103,27 @@ pub fn ir_kid(id: Int, i: Int) -> Int { ir_node(id).kids.get(i).unwrap() }
 // A copy, so a caller can not grow a node's kid list behind the verifier's back.
 pub fn ir_kids(id: Int) -> List[Int] { copy_ids(ir_node(id).kids) }
 
+// Whether printing this value writes a statement before the expression that reads it: a
+// Box, a container or closure built from elements, or a node marked to materialise binds
+// a temporary, and so does any node that holds one of those below it. A C operator that
+// skips an operand cannot skip those statements, so a lowering asks this before it puts a
+// value under one.
+pub fn ir_binds_statement(id: Int) -> Bool { binds_statement_within(id, ir_node_count()) }
+
+// A walk deeper than the arena has revisited a node; that tree is a cycle, which the
+// verifier reports on its own, so the walk stops rather than recurse without end.
+fn binds_statement_within(id: Int, budget: Int) -> Bool {
+    if budget < 0 { return false }
+    if ir_must_materialize(id) == 1 { return true }
+    let kind = ir_kind(id)
+    if kind == IrKind.Box { return true }
+    if (kind == IrKind.ContainerNew || kind == IrKind.ClosureNew) && ir_kid_count(id) > 0 { return true }
+    for kid in ir_node(id).kids {
+        if kid >= 0 && kid < ir_node_count() && binds_statement_within(kid, budget - 1) { return true }
+    }
+    false
+}
+
 pub fn ir_mark_materialize(id: Int) {
     let n = ir_node(id)
     ir_nodes.set(id, IrNode { must_materialize: 1, ..n })
@@ -570,6 +591,15 @@ fn verify_fields(id: Int, kind: IrKind, label: Str, errs: List[Str]) {
     let arm_with_payload = kind == IrKind.EnumNew && ir_kid_count(id) > 1
     if (kind_needs_c_name(kind) || wrap_with_payload || arm_with_payload) && ir_c_name(id) == "" {
         errs.push("{label}: empty c_name")
+    }
+    // C's && and || skip the right operand, but a statement the printer binds for it is
+    // written before the operator and runs regardless. The lowering guards such an operand
+    // with a temp and an `if`; a Binary still holding one is a tree the printer cannot order.
+    if kind == IrKind.Binary && (ir_c_name(id) == "&&" || ir_c_name(id) == "||") && ir_kid_count(id) == 2 {
+        let rhs = ir_kid(id, 1)
+        if rhs >= 0 && rhs < ir_node_count() && ir_binds_statement(rhs) {
+            errs.push("{label}: right operand of '{ir_c_name(id)}' binds a statement the operator cannot skip")
+        }
     }
     // An address is a value of its own, a pointer to where the operand lives; a node
     // spelled by the pointee states something false about what it produces.
