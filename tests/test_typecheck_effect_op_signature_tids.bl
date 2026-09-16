@@ -1,0 +1,189 @@
+// An effect operation is a function signature with no body. The stamp that fills a function's
+// param and return slots runs over a body, so nothing fills an operation's slots unless the
+// declaration path does it. Codegen reads an operation's signature through the same node-tid
+// channel it reads a function's, so an unfilled slot is a vtable written with no types in it.
+//
+// What this file pins is that an operation's param nodes and its return annotation node carry
+// the type that was written, down to every level of a nested carrier, and that an operation
+// and a free function of the same signature come out with the same types in the same slots.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, lookup_named_type}
+import parser.{nodes, node_kind, node_name, node_params, node_methods, node_elements, node_type_ann, sublist_get, sublist_length}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_reset}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.println("FAIL: {label}: got '{got}' want '{want}'")
+    }
+    assert(got == want)
+}
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// The one operation of the given name, wherever under an effect declaration it was written.
+// Operations sit under the sub-effects of a root, so the walk is the one the registration
+// path takes. -1 marks absent and -2 marks a name written twice.
+fn op_named(want: Str) -> Int {
+    let mut found = -1
+    let mut hits = 0
+    let mut n = 0
+    while n < nodes.len() {
+        if node_kind(n) == NodeKind.EffectDecl {
+            let children = node_elements(n)
+            let mut ci = 0
+            while children != -1 && ci < sublist_length(children) {
+                let ops = node_methods(sublist_get(children, ci))
+                let mut oi = 0
+                while ops != -1 && oi < sublist_length(ops) {
+                    let op = sublist_get(ops, oi)
+                    if node_name(op) == want {
+                        hits = hits + 1
+                        found = op
+                    }
+                    oi = oi + 1
+                }
+                ci = ci + 1
+            }
+        }
+        n = n + 1
+    }
+    if hits > 1 { return -2 }
+    found
+}
+
+fn param_tid(op: Int, idx: Int) -> Int {
+    let ps = node_params(op)
+    if ps == -1 || sublist_length(ps) <= idx { return -3 }
+    tc_lookup_node_tid(sublist_get(ps, idx))
+}
+
+fn ret_tid(op: Int) -> Int {
+    let ann = node_type_ann(op)
+    if ann == -1 { return -3 }
+    tc_lookup_node_tid(ann)
+}
+
+fn error_count() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { n = n + 1 }
+    }
+    n
+}
+
+fn logger_src() -> Str {
+    #"type Row { n: Int }
+effect Zzlogger {
+    effect Write { fn zzemit(msg: Str, row: Row) }
+    effect Read { fn zzpeek() -> Int }
+}
+fn main() { assert(true) }
+"#
+}
+
+test "an operation's parameters carry the types they were written with" {
+    typecheck_probe("build/tc_effect_op_params.bl", logger_src())
+    let op = op_named("zzemit")
+    assert(op >= 0)
+    assert_eq_int("two parameters", sublist_length(node_params(op)), 2)
+    assert_eq_str("first parameter", tc_type_str(param_tid(op, 0)), "Str")
+    assert_eq_str("second parameter", tc_type_str(param_tid(op, 1)), "Row")
+    assert(param_tid(op, 1) == lookup_named_type("Row"))
+}
+
+test "an operation's return annotation carries the type it was written with" {
+    typecheck_probe("build/tc_effect_op_ret.bl", logger_src())
+    let op = op_named("zzpeek")
+    assert(op >= 0)
+    assert_eq_str("return annotation", tc_type_str(ret_tid(op)), "Int")
+}
+
+// Nothing was written after the operation's parameters, so there is no annotation node to
+// carry a type. The slot has to stay empty: a type put here would be one the program does
+// not have.
+test "an operation that returns nothing has no return annotation to carry a type" {
+    typecheck_probe("build/tc_effect_op_void.bl", logger_src())
+    let op = op_named("zzemit")
+    assert(op >= 0)
+    assert_eq_int("no return annotation", node_type_ann(op), -1)
+}
+
+fn carrier_src() -> Str {
+    #"type Row { n: Int }
+effect Zzstore {
+    effect Fetch { fn zzget(key: Str) -> Result[Option[Row], Str] }
+}
+fn main() { assert(true) }
+"#
+}
+
+// A carrier two deep is the case the flat signature fields cannot hold, so it is the one
+// that proves the slot carries the whole written type and not its head.
+test "a nested carrier return keeps every level it was written with" {
+    typecheck_probe("build/tc_effect_op_carrier.bl", carrier_src())
+    let op = op_named("zzget")
+    assert(op >= 0)
+    assert_eq_str("nested carrier return", tc_type_str(ret_tid(op)), "Result[Option[Row], Str]")
+}
+
+fn twin_src() -> Str {
+    #"type Row { n: Int }
+effect Zztwin {
+    effect Op { fn zzop(msg: Str, row: Row) -> Result[Option[Row], Str] }
+}
+fn zzfree(msg: Str, row: Row) -> Result[Option[Row], Str] { Ok(None) }
+fn main() { assert(true) }
+"#
+}
+
+fn fn_named(want: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == want { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// An operation and a free function that were written with the same signature must end up
+// with the same types in the same slots. Codegen reads the two through one reader, so two
+// resolutions here would let the same written signature come out as two different vtable
+// entries depending on which path filled the slot.
+test "an operation and a function of the same signature carry the same types" {
+    typecheck_probe("build/tc_effect_op_twin.bl", twin_src())
+    let op = op_named("zzop")
+    let fr = fn_named("zzfree")
+    assert(op >= 0)
+    assert(fr >= 0)
+    assert_eq_int("first parameter", param_tid(op, 0), param_tid(fr, 0))
+    assert_eq_int("second parameter", param_tid(op, 1), param_tid(fr, 1))
+    assert_eq_int("return annotation", ret_tid(op), ret_tid(fr))
+    assert_eq_str("the shared return type", tc_type_str(ret_tid(op)), "Result[Option[Row], Str]")
+}
+
+// The declaration of an effect is where its operation types are validated. Registering the
+// signatures must not add an error of its own on a program that is correct.
+test "recording an operation's types reports nothing on a correct program" {
+    typecheck_probe("build/tc_effect_op_clean.bl", logger_src())
+    if error_count() != 0 {
+        for d in diag_entries { io.println("  {d.severity} {d.name}: {d.message}") }
+    }
+    assert_eq_int("no diagnostics", error_count(), 0)
+}
