@@ -66,7 +66,7 @@ computed; it does not change what the tree means.
 `match` lowers to `Let` with no initialiser, followed by `Assign` inside each
 arm, followed by a `VarRef`.
 
-## The 40 kinds
+## The 41 kinds
 
 The tables list kids in order. `n` is the kid count. A kid marked *value* must be
 a value node; *stmt* any statement; *Block* the `Block` kind; *Const* the
@@ -100,6 +100,7 @@ a value node; *stmt* any statement; *Block* the `Block` kind; *Const* the
 | `CallRuntime` | `ir_call_runtime(tid, span, c_spelling, symbol, slot_form, args)` | `[arg_0 .. : value]` | a `blink_*` runtime symbol | caller |
 | `ClosureNew` | `ir_closure_new(tid, span, c_spelling, fn_symbol, captures)` | `[capture_0 .. : value]` | the lifted function's C symbol | `InlineWord` |
 | `EvidenceVector` | `ir_evidence_vector(span, c_spelling, c_name, slot_form)` | none | `__ev` (PointerBoxed param) or `__blink_ev` (Inline global) | caller |
+| `EvidenceAddress` | `ir_evidence_address(span, vector)` | `[vector: EvidenceVector held inline]` | empty; the vector owns the name | `InlineWord` |
 | `EffectPerform` | `ir_effect_perform(tid, span, c_spelling, slot, slot_form, slot_read, args)` | `[slot_read: FieldGet over an EvidenceVector, held by pointer; arg_0 .. : value]` | the handler vtable slot | caller |
 
 `ContainerSpread` is `[..xs, y]`: it copies every element of its source into the
@@ -108,6 +109,25 @@ destination it extends is the container the printer is building and no node
 has to name it. Its tid and c_spelling are the source container's. The printer
 writes it as `<extend_symbol>(<tmp>, <source>)` in place of the append for that
 kid; a `ContainerSpread` reached anywhere else is a misplaced-kind ICE.
+
+`EvidenceAddress` is what a call to an effectful function passes for the vector
+parameter when the caller holds the global instance inline rather than a vector
+parameter of its own. The printer writes it as `(&__blink_ev)`.
+
+It is a kind of its own rather than a `Unary` `&` over an `EvidenceVector`. The
+vector has no Blink type, and nor has its address, so a `Unary` holding it would
+be a value node with tid -1: the verifier would have to exempt it by sniffing the
+operator string and the operand's kind, and an untyped value node would survive
+in the IR under a kind whose every other use is typed. A kind carries the
+exemption instead, where it is one named rule the verifier reads off the kind
+rather than a rule that reads a c_name string to decide whether a tid is
+required.
+
+The operand is a kid rather than nothing, so `c_spelling` is the pointer form of
+the operand's spelling under the same rule that holds a `Unary` `&`, and `cname`
+stays the one producer of both the vector's type name and its C name: ir.bl never
+has to know either. The operand must be held inline, because a vector parameter
+is already the address of a vector and its address would be a `blink_ev**`.
 
 `Box.c_spelling` is the pointer type the node produces. `Box.c_name` is the
 pointee type; the printer uses it as the `sizeof` operand for the heap copy.
@@ -164,9 +184,10 @@ begins `root <r>: `. It rejects:
 | a node that contains itself | `cycle, the node contains itself` |
 | a value node with tid < 0 | `value node without a tid` |
 | an `EvidenceVector` with tid >= 0 | `carries tid <t>, the vector has no Blink type` |
+| an `EvidenceAddress` with tid >= 0 | `carries tid <t>, the address of the vector has no Blink type` |
 | an empty c_spelling on a value or a `Let` | `empty c_spelling` |
 | an empty c_name where the kind prints one | `empty c_name` |
-| a `Unary` `&` whose spelling is not the pointer form of its operand's | `address spelled '<s>', the pointer form of its operand's '<o>' is '<o>*'` |
+| a `Unary` `&` or an `EvidenceAddress` whose spelling is not the pointer form of its operand's | `address spelled '<s>', the pointer form of its operand's '<o>' is '<o>*'` |
 | a `Binary` `&&`/`\|\|` whose right operand binds a statement (see `ir_binds_statement`) | `right operand of '<op>' binds a statement the operator cannot skip` |
 | wrong kid count | `expects <n> kids, has <m>`, `expects <lo> or <hi> kids, has <m>`, `expects at least <n> kids, has <m>` |
 | statement in a value slot | `kid <i> is a statement where a value is required` |
@@ -175,6 +196,8 @@ begins `root <r>: `. It rejects:
 | non-Const Switch label | `kid <i> case label must be a Const` |
 | `EffectPerform` kid 0 not a `FieldGet` over an `EvidenceVector` | `kid 0 must read a handler slot of the EvidenceVector, is a <Kind>` |
 | `EffectPerform` kid 0 held by value | `handler slot must be held by pointer, a handler is a vtable pointer` |
+| `EvidenceAddress` kid 0 not an `EvidenceVector` | `kid 0 must be the EvidenceVector, is a <Kind>` |
+| `EvidenceAddress` kid 0 held by pointer | `kid 0 is already held by pointer, a vector parameter is its own address` |
 | non-Const CarrierWrap tag | `kid <i> tag must be a Const` |
 | non-lvalue Assign target | `kid <i> target must be an lvalue` |
 | ContainerSpread not directly under ContainerNew | `ContainerSpread outside a ContainerNew` |
