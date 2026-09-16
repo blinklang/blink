@@ -1,0 +1,127 @@
+// `Char.from_code_point(n)`: the one call that turns a number into a character, and the
+// only static call on a builtin type whose answer is a carrier.
+//
+// Unicode assigns a scalar value to some numbers and not to others, so the call answers
+// `Result[Char, ConversionError]` and which arm it fills is decided while the program runs.
+// The runtime owns that decision: it answers the code point back, or a negative number for
+// one it refuses. Two arms filled from one test is a temp two assignments write, because an
+// `if` is a statement and no IR node holds a value a condition chooses.
+//
+// The error arm carries a value, not a type name: the message, the type converted from and
+// the type converted to. Those three are the fields `ConversionError` declares, and they are
+// written by the names the declaration gives them rather than by position, so a field added
+// or reordered is refused here instead of filling the wrong slot.
+
+import lower_test_helpers.{
+    probe, rhs_of, assert_eq_str, assert_shape, assert_verifies, assert_ice_saying,
+}
+import ir.{ir_c_name, ir_kid}
+import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
+import diagnostics.{Diag}
+import std.io
+
+fn src_valid() -> Str {
+    #"fn main() {
+    let code = 65
+    let ch = Char.from_code_point(code)
+    let _keep = ch.is_ok()
+}
+"#
+}
+
+fn src_wrong_arity() -> Str {
+    #"fn main() {
+    let ch = Char.from_code_point()
+    let _keep = ch.is_ok()
+}
+"#
+}
+
+// The call hoists three statements and answers the temp the last of them filled: the
+// runtime's verdict is bound, the carrier is declared, and one test fills it.
+type Lowered { answer: Int  checked: Int  declared: Int  branch: Int }
+
+fn cc_probe_call(name: Str) -> Lowered ! Diag.Report {
+    let mark = cg_expr_pending_count()
+    let built = lower_expr(rhs_of(name))
+    let stmts = cg_expr_take_pending(mark)
+    if stmts.len() != 3 {
+        io.println("FAIL: the call left {stmts.len()} statements, want 3")
+        assert(false)
+    }
+    Lowered {
+        answer: built,
+        checked: stmts.get(0).unwrap(),
+        declared: stmts.get(1).unwrap(),
+        branch: stmts.get(2).unwrap(),
+    }
+}
+
+// The value one arm of the test assigns into the carrier. An `If` holds its condition and
+// then one block per arm, and each block holds the one assignment that fills the carrier.
+fn arm_value(branch: Int, which: Int) -> Int {
+    ir_kid(ir_kid(ir_kid(branch, which), 0), 1)
+}
+
+test "the call asks the runtime for its verdict on the code point it was given" {
+    probe("cg_call_from_code_point_check", src_valid())
+    let low = cc_probe_call("ch")
+    assert_shape("verdict", low.checked, "Let(CallRuntime(VarRef))")
+    assert_eq_str("symbol", ir_c_name(ir_kid(low.checked, 0)), "blink_char_validate_code_point")
+}
+
+test "the carrier is declared without a value, because a condition chooses the value" {
+    probe("cg_call_from_code_point_temp", src_valid())
+    let low = cc_probe_call("ch")
+    assert_shape("declaration", low.declared, "Let")
+    assert_shape("answer", low.answer, "VarRef")
+    assert_eq_str("the answer names the carrier the test filled",
+        ir_c_name(low.answer), ir_c_name(low.declared))
+}
+
+test "the test reads the verdict and accepts every number the runtime did not refuse" {
+    probe("cg_call_from_code_point_test", src_valid())
+    let low = cc_probe_call("ch")
+    assert_shape("test", low.branch, "If(Binary(VarRef, Const), Block(Assign(VarRef, CarrierWrap(Const, Cast(VarRef)))), Block(Assign(VarRef, CarrierWrap(Const, Box(StructNew(Const, Const, Const))))))")
+    let cond = ir_kid(low.branch, 0)
+    assert_eq_str("operator", ir_c_name(cond), ">=")
+    assert_eq_str("refused below", ir_c_name(ir_kid(cond, 1)), "0")
+    assert_eq_str("the test reads the verdict", ir_c_name(ir_kid(cond, 0)), ir_c_name(low.checked))
+}
+
+test "the accepted arm holds the code point in the ok member" {
+    probe("cg_call_from_code_point_ok", src_valid())
+    let low = cc_probe_call("ch")
+    let good = arm_value(low.branch, 1)
+    assert_eq_str("member", ir_c_name(good), "ok")
+    assert_eq_str("tag", ir_c_name(ir_kid(good, 0)), "0")
+    assert_eq_str("the ok arm holds the verdict", ir_c_name(ir_kid(ir_kid(good, 1), 0)), ir_c_name(low.checked))
+}
+
+test "the refused arm holds a conversion error naming both types" {
+    probe("cg_call_from_code_point_err", src_valid())
+    let low = cc_probe_call("ch")
+    let bad = arm_value(low.branch, 2)
+    assert_eq_str("member", ir_c_name(bad), "err")
+    assert_eq_str("tag", ir_c_name(ir_kid(bad, 0)), "1")
+    let fault = ir_kid(ir_kid(bad, 1), 0)
+    assert_eq_str("message", ir_c_name(ir_kid(fault, 0)), "\"not a valid Unicode scalar value\"")
+    assert_eq_str("source", ir_c_name(ir_kid(fault, 1)), "\"Int\"")
+    assert_eq_str("target", ir_c_name(ir_kid(fault, 2)), "\"Char\"")
+}
+
+test "the whole call, with the statements it hoists, is a well-formed tree" {
+    probe("cg_call_from_code_point_verify", src_valid())
+    let low = cc_probe_call("ch")
+    assert_verifies("verdict", low.checked)
+    assert_verifies("declaration", low.declared)
+    assert_verifies("test", low.branch)
+    assert_verifies("answer", low.answer)
+}
+
+test "a call written with no code point refuses instead of building a call" {
+    probe("cg_call_from_code_point_arity", src_wrong_arity())
+    assert_ice_saying("Char.from_code_point", lower_expr(rhs_of("ch")),
+        "RuntimeCtorArityWrong",
+        "'Char.from_code_point' takes 1 argument(s), and this call was given 0")
+}
