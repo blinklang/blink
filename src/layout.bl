@@ -13,7 +13,7 @@
 import typecheck.{
     TyKind, tk_name, tc_tid_kind, tc_tid_child, tc_tid_child_count, tc_tid_name, tc_resolve,
     tc_is_unbound_metavar, tc_lookup_node_tid, tc_type_decl_nodes, tc_tid_decl_node,
-    DECL_NODE_AMBIGUOUS, tc_resolve_transparent_alias_name, tc_type_has_display_impl,
+    DECL_NODE_AMBIGUOUS, tc_resolve_transparent_alias_name, tc_type_has_display_impl, tc_type_str,
 }
 import parser.{
     node_fields, node_name, node_value, node_kind, node_handlers, node_args, node_type_params,
@@ -218,6 +218,51 @@ pub fn address_layout_of(tid: Int, position: Position) -> LayoutRecord {
 
 // The one place the C pointer star is written: a pointer to a value spelled `pointee`.
 pub fn pointer_spelling(pointee: Str) -> Str { "{pointee}*" }
+
+// The receiver word every closure thunk takes first: the closure the call went through.
+pub fn closure_self_spelling() -> Str { "const blink_closure*" }
+
+// The C function-pointer type a closure's fn_ptr is cast to before a call: the result at
+// its Return layout, then the receiver word, then each parameter at its Param layout, in
+// declaration order. A Fn tid is one runtime pointer in every position, so this is the one
+// question that looks inside it. A slot with no layout is an I0001 at `node` and an empty
+// answer; nothing here ever spells a placeholder.
+pub fn fn_pointer_spelling_of(tid: Int, node: Int) -> Str ! Diag.Report {
+    let r = lo_res(tid)
+    let k = if r < 0 { TyKind.Unknown } else { tc_tid_kind(r) }
+    if k != TyKind.Fn {
+        let why = lo_decline_reason_of(tid)
+        let shown = if why != "" { why } else { tc_type_str(r) }
+        diag_ice_at("NotAFnType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "a function-pointer type was asked of {shown}, which is not a Fn type", node,
+            "the call stage must ask this only of a callee whose tid is a Fn; this is a compiler bug")
+        return ""
+    }
+    let ret = lo_fn_slot_spelling(tc_tid_child(r, 0), Position.Return, node)
+    if ret == "" { return "" }
+    let mut params = closure_self_spelling()
+    let n = tc_tid_child_count(r)
+    let mut i = 1
+    while i < n {
+        let p = lo_fn_slot_spelling(tc_tid_child(r, i), Position.Param, node)
+        if p == "" { return "" }
+        params = "{params}, {p}"
+        i = i + 1
+    }
+    "{ret}(*)({params})"
+}
+
+fn lo_fn_slot_spelling(tid: Int, position: Position, node: Int) -> Str ! Diag.Report {
+    let rec = layout_of(tid, position)
+    let why = rec.decline_reason
+    if why != "" {
+        diag_ice_at("UnspellableFnPointer", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "a Fn type's parameter or result has no C layout: {why}", node,
+            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+        return ""
+    }
+    rec.c_spelling
+}
 
 // A variant or struct field in its owner. A field that reaches its own enum by value
 // (directly, or through a tuple at any depth) is stored boxed: the owner's C typedef is

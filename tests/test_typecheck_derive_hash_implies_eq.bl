@@ -1,0 +1,84 @@
+// sections/03_types.md "Supertrait Auto-Derivation": Ord requires Eq and Hash requires
+// Eq, and the compiler auto-derives a supertrait the author did not list. So a type that
+// derives Hash alone has an Eq impl, and the front end must admit `==`, `.eq()` and an
+// Eq-deriving field of that type. Nothing obliges Ord, so Hash alone still does not order.
+import lower_test_helpers.{probe, probe_but}
+import typecheck.{tc_decl_derives, tc_type_decl_nodes}
+import std.io
+
+fn hash_only_src() -> Str {
+    #"@derive(Hash)
+type Key { x: Int }
+@derive(Ord)
+type Rank { n: Int }
+type Plain { p: Int }
+@derive(Eq)
+type Holder { k: Key }
+fn main() {
+    let a = Key { x: 1 }
+    let b = Key { x: 2 }
+    assert((a == b) == false)
+    assert(a.eq(a) == true)
+    let h = Holder { k: a }
+    assert(h.eq(h) == true)
+    let mut m: Map[Key, Int] = Map()
+    m.insert(a, 7)
+    assert(m.len() == 1)
+    let r = Rank { n: 1 }
+    assert(r.n == 1)
+    let p = Plain { p: 2 }
+    assert(p.p == 2)
+}
+"#
+}
+
+fn relational_src() -> Str {
+    #"@derive(Hash)
+type Key { x: Int }
+fn main() {
+    let a = Key { x: 1 }
+    let b = Key { x: 2 }
+    assert((a < b) == false)
+}
+"#
+}
+
+test "deriving Hash admits ==, .eq() and an Eq-deriving field of that type" {
+    let program = probe("typecheck_hash_implies_eq", hash_only_src())
+    assert(program >= 0)
+}
+
+test "Hash alone still does not order its type" {
+    let program = probe_but("typecheck_hash_not_ord", relational_src(), "TypeError")
+    assert(program >= 0)
+}
+
+// The declaration node the typechecker recorded for `tname`. Keyed by the written name,
+// with the module-qualified spelling as the fallback the registry may hold instead.
+fn decl_of(tname: Str) -> Int {
+    let bare = tc_type_decl_nodes.get(tname) ?? -1
+    if bare != -1 { return bare }
+    let q = tc_type_decl_nodes.get("__main__.{tname}") ?? -1
+    if q == -1 { io.println("FAIL: no declaration node for '{tname}'") }
+    assert(q != -1)
+    q
+}
+
+test "a derive that obliges Eq answers to Eq, and one that does not answers 0" {
+    let program = probe("typecheck_hash_eq_reader", hash_only_src())
+    assert_eq(tc_decl_derives(decl_of("Key"), "Eq"), 1)
+    assert_eq(tc_decl_derives(decl_of("Rank"), "Eq"), 1)
+    assert_eq(tc_decl_derives(decl_of("Holder"), "Eq"), 1)
+    assert_eq(tc_decl_derives(decl_of("Plain"), "Eq"), 0)
+    assert(program >= 0)
+}
+
+test "the supertrait walk runs one way only: nothing obliges Hash or Ord but itself" {
+    let program = probe("typecheck_hash_ord_reader", hash_only_src())
+    assert_eq(tc_decl_derives(decl_of("Key"), "Ord"), 0)
+    assert_eq(tc_decl_derives(decl_of("Rank"), "Hash"), 0)
+    assert_eq(tc_decl_derives(decl_of("Holder"), "Hash"), 0)
+    assert_eq(tc_decl_derives(decl_of("Key"), "Hash"), 1)
+    assert_eq(tc_decl_derives(decl_of("Rank"), "Ord"), 1)
+    assert(program >= 0)
+}
