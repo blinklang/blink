@@ -56,7 +56,7 @@ import ir.{
     ir_enum_new,
 }
 import cg_expr.{lower_expr, cg_expr_push_pending}
-import cg_eff.{cg_eff_lower_builtin_perform}
+import cg_eff.{cg_eff_ev_argument, cg_eff_lower_builtin_perform}
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
 import diagnostics.{
     Diag, diag_ice_at, diag_ice_stage_not_built, diag_file_for_node, diag_source_file,
@@ -466,11 +466,7 @@ fn cc_declared_call(node: Int, decl: Int, recv: Int) -> Int ! Diag.Report {
     if decl < 0 { return -1 }
     let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
     if symbol == "" { return -1 }
-    if cg_decl_takes_ev(decl) {
-        cc_ev_not_in_ir(node)
-        return -1
-    }
-    cc_build_call(node, symbol, recv, CallForm.Declared)
+    cc_build_call(node, symbol, recv, CallForm.Declared, cg_decl_takes_ev(decl))
 }
 
 // The name the declaration was written under. An import may rename what it brings in, and
@@ -606,7 +602,7 @@ fn lower_ffi_call(node: Int, method: Str) -> Int ! Diag.Report {
     if method != "scope" { return cc_ns_not_built(node, ns_ffi, method) }
     let given = sublist_length(node_args(node))
     if given != 0 { return cc_ctor_arity_wrong(node, ns_ffi, method, 0, given) }
-    cc_build_call(node, c_runtime_helper("ffi_scope_new"), NO_RECEIVER, CallForm.Runtime)
+    cc_build_call(node, c_runtime_helper("ffi_scope_new"), NO_RECEIVER, CallForm.Runtime, false)
 }
 
 fn lower_io_call(node: Int, method: Str) -> Int ! Diag.Report {
@@ -614,7 +610,7 @@ fn lower_io_call(node: Int, method: Str) -> Int ! Diag.Report {
     if io_raw_ops.contains(method) { return cc_raw_print(node, method) }
     let helper = io_stream_helper(method)
     if helper == "" { return cc_ns_not_built(node, ns_io, method) }
-    cc_build_call(node, helper, NO_RECEIVER, CallForm.Runtime)
+    cc_build_call(node, helper, NO_RECEIVER, CallForm.Runtime, false)
 }
 
 // The four io names with nothing in the path: two read the standard input and two write
@@ -699,7 +695,7 @@ fn cc_lower_scope_method(node: Int, obj: Int, method: Str) -> Int ! Diag.Report 
     let want = cc_scope_op_arity(op)
     let given = sublist_length(node_args(node))
     if given != want { return cc_intrinsic_arity_wrong(node, TyKind.FfiScope, method, want, given) }
-    cc_build_call(node, c_runtime_helper(op), obj, CallForm.Runtime)
+    cc_build_call(node, c_runtime_helper(op), obj, CallForm.Runtime, false)
 }
 
 // `scope.alloc()` and `scope.alloc_n(n)` take room for a type, and the room is that type's
@@ -880,7 +876,7 @@ fn lower_builtin_static_call(node: Int, owner: Str, method: Str) -> Int ! Diag.R
         let want = cc_runtime_ctor_arity(cc_kind(answer), method)
         let given = sublist_length(node_args(node))
         if given != want { return cc_ctor_arity_wrong(node, owner, method, want, given) }
-        return cc_build_call(node, symbol, NO_RECEIVER, CallForm.Runtime)
+        return cc_build_call(node, symbol, NO_RECEIVER, CallForm.Runtime, false)
     }
     if method == "new" && cc_is_keyed_container(cc_kind(answer)) {
         return cc_container_ctor_not_built(node, cc_kind(answer))
@@ -1082,13 +1078,9 @@ fn cc_static_impl_ambiguous(node: Int, owner: Str, method: Str) -> Int ! Diag.Re
 fn cc_impl_static_call(node: Int, im: Int, method: Str) -> Int ! Diag.Report {
     let decl = cc_method_of(im, method)
     if decl < 0 { return -1 }
-    if cg_decl_takes_ev(decl) {
-        cc_ev_not_in_ir(node)
-        return -1
-    }
     let symbol = cc_call_symbol(node, decl, c_impl_method_name(im, method))
     if symbol == "" { return -1 }
-    cc_build_call(node, symbol, NO_RECEIVER, CallForm.Declared)
+    cc_build_call(node, symbol, NO_RECEIVER, CallForm.Declared, cg_decl_takes_ev(decl))
 }
 
 // The runtime call a builtin type's constructor reaches. An empty answer means the pair
@@ -1563,13 +1555,9 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if im < 0 { return cc_method_not_built(node, kind, mname) }
     let method = cc_method_of(im, node_method(node))
     if method < 0 { return -1 }
-    if cg_decl_takes_ev(method) {
-        cc_ev_not_in_ir(node)
-        return -1
-    }
     let symbol = cc_call_symbol(node, method, c_impl_method_name(im, node_method(node)))
     if symbol == "" { return -1 }
-    cc_build_call(node, symbol, obj, CallForm.Declared)
+    cc_build_call(node, symbol, obj, CallForm.Declared, cg_decl_takes_ev(method))
 }
 
 // ── Intrinsic methods ─────────────────────────────────────────────────────
@@ -1594,10 +1582,6 @@ fn lower_intrinsic_method(node: Int, obj: Int, kind: TyKind, method: Str, row: S
     let decl = cc_stdlib_fn_named(node, module, name)
     if decl == DECL_REFUSED { return -1 }
     if decl < 0 { return cc_intrinsic_undeclared(node, kind, method, module, name) }
-    if cg_decl_takes_ev(decl) {
-        cc_ev_not_in_ir(node)
-        return -1
-    }
     // The receiver is the declaration's first parameter, so the method takes one fewer
     // argument than the function does. Typecheck checks the arity of a few of these and
     // not the rest, so the check is made here rather than assumed: a call built from the
@@ -1607,7 +1591,7 @@ fn lower_intrinsic_method(node: Int, obj: Int, kind: TyKind, method: Str, row: S
     if want != given { return cc_intrinsic_arity_wrong(node, kind, method, want, given) }
     let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
     if symbol == "" { return -1 }
-    cc_build_call(node, symbol, obj, CallForm.Declared)
+    cc_build_call(node, symbol, obj, CallForm.Declared, cg_decl_takes_ev(decl))
 }
 
 // ── Element stores ────────────────────────────────────────────────────────
@@ -2926,17 +2910,29 @@ fn cc_method_of(im: Int, mname: Str) -> Int ! Diag.Report {
 // ── Shared ────────────────────────────────────────────────────────────────
 
 // One direct call: the callee's C name, the receiver if the call has one, then the written
-// arguments in source order.
+// arguments in source order, then the evidence vector when the callee takes one.
 //
 // The receiver arrives as the node it was written as, not as a lowered one, so that this
 // stage settles what it can refuse before it builds anything. A receiver lowered by the
 // caller is built whether or not a call can be built out of it, and what this stage refuses
 // is read off the call's own type, which it can read without lowering anything.
-fn cc_build_call(node: Int, symbol: Str, recv: Int, form: CallForm) -> Int ! Diag.Report {
+//
+// `takes_ev` is the callee's own answer, so every caller has to ask it of the declaration
+// it resolved. A runtime helper is a C function no Blink source declares a row for and
+// never takes the vector.
+fn cc_build_call(node: Int, symbol: Str, recv: Int, form: CallForm, takes_ev: Bool) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = cc_local(tid, node)
     if cc_stopped(rec) { return -1 }
+    // Asked before anything is built, because the callee's row is readable without
+    // lowering and a call that cannot pass the vector is refused whatever its arguments
+    // would have lowered to.
+    let mut ev = -1
+    if takes_ev {
+        ev = cg_eff_ev_argument(node)
+        if ev < 0 { return -1 }
+    }
     let mut args: List[Int] = []
     if recv != NO_RECEIVER {
         let receiver = lower_expr(recv)
@@ -2951,6 +2947,8 @@ fn cc_build_call(node: Int, symbol: Str, recv: Int, form: CallForm) -> Int ! Dia
         args.push(a)
         i = i + 1
     }
+    // Last, because that is the position the callee declares it in.
+    if takes_ev { args.push(ev) }
     if form == CallForm.Runtime {
         return ir_call_runtime(tid, node, rec.c_spelling, symbol, rec.slot_form, args)
     }
@@ -2988,12 +2986,6 @@ fn cc_stopped(rec: LayoutRecord) -> Bool {
 // reported as missing.
 fn cc_stop(rec: LayoutRecord) -> LayoutRecord {
     LayoutRecord { c_spelling: "", slot_word: "", ..rec }
-}
-
-fn cc_ev_not_in_ir(node: Int) ! Diag.Report {
-    diag_ice_at("EvidenceVectorNotInIr", CODEGEN_STAGE_NOT_BUILT,
-        "the callee takes the evidence vector, which no IR argument spells", node,
-        "a call to an effectful function needs an IR node the printer writes as the vector")
 }
 
 fn cc_unhandled(node: Int) -> Int ! Diag.Report {
