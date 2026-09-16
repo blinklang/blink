@@ -10,7 +10,7 @@
 #   REWRITE_SUITE_COMPILER  dir holding blink/blinkc (default build/gen0)
 #   REWRITE_SUITE_OUT       output JSON (default build/rewrite_suite.json)
 #
-# The file list is a glob over four prefixes minus the paths named in
+# The file list is a glob over five prefixes minus the paths named in
 # scripts/rewrite_suite_exclude.txt, so a new test file joins the suite by
 # existing and nobody can forget it. Every excluded path must exist and must
 # match the glob, or this script stops: an exclusion that names no file hides
@@ -81,7 +81,7 @@ trap 'rm -f "$all" "$ex"' EXIT
 # the remaining groups would still report ok. The test runs before the list is
 # built, because an exit inside a pipeline exits the pipeline and not this
 # script.
-patterns='tests/test_cg_*.bl tests/test_layout_*.bl tests/test_cname_*.bl tests/test_ir_*.bl'
+patterns='tests/test_cg_*.bl tests/test_layout_*.bl tests/test_cname_*.bl tests/test_ir_*.bl tests/test_mono_*.bl'
 for pat in $patterns; do
     if ! compgen -G "$pat" >/dev/null; then
         echo "rewrite-suite: ERROR no file matches $pat" >&2
