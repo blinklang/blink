@@ -28,9 +28,14 @@ imports layout or an emitter. `scripts/lint_import_dag.sh` asserts both.
 | `varargs_spelling(tid) -> Str` | The promoted width a value takes across C varargs (`long long`, `unsigned long long`). `""` when C already promotes it. |
 | `layout_of(tid, position) -> LayoutRecord` | All of the above in one record. Total, pure, memoised on `(tid, position)`. |
 | `field_layout_of(owner_decl, field_tid) -> LayoutRecord` | A field in its owner. See "Self-recursive fields". |
+| `address_layout_of(tid, position) -> LayoutRecord` | The address of a value held at `position`: one `InlineWord` spelled as the value's spelling with one more `*` (`int64_t*`, `blink_Point*`, `double**` for a boxed container element). No carrier tag, no key table, no slot word. Declines with the value's reason, and by name for a void-like value, which is not a place. |
+| `pointer_spelling(pointee: Str) -> Str` | The one place the C pointer star is written. `lo_spell_ptr`, `address_layout_of` and the verifier's address rule all read it. |
 
 `LayoutRecord` fields: `c_spelling`, `slot_form`, `carrier_tag`, `is_transparent`,
-`kops_table`, `kops_inline_key`, `decline_reason`.
+`kops_table`, `kops_inline_key`, `slot_word`, `decline_reason`.
+
+Layout writes the star nowhere else, and no other module writes it at all: a lowering that takes
+`&x` asks `address_layout_of` for the node's spelling instead of reusing `x`'s.
 
 `kops_inline_key` is the runtime's storage choice for a key that has a table: `true`
 when the key's own bytes sit in the map or set slot (a word-sized key: scalar,
