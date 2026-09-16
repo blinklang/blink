@@ -1,0 +1,185 @@
+// The C an effect declaration turns into. A user effect gets one vtable struct, one default
+// body per operation, and one default instance of that struct. The evidence vector points at
+// the default instance, so a program that installs no handler still calls something.
+//
+// The vtable is per ROOT effect and holds every operation of every sub-effect. A handler for
+// a sub-effect copies the whole struct and overwrites only the slots it names, so a vtable
+// sized to one sub-effect would drop the rest. Each operation also owns a capture word of its
+// own, because an operation an inner handler did not name must keep reading the outer
+// handler's captures.
+//
+// The names come from cname and the shape from cg_print. What this file pins is which names
+// are asked for and in what order they are written.
+
+import std.fs
+import std.io
+import layout.{layout_reset}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_named, cg_text_occurrences}
+import cname.{c_effect_default_op_name, c_ev_type_name, c_field_name, c_vtable_type_name, td_guard_name}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build}
+import typecheck.{make_handler_type}
+import cg_decl.{cg_decl_reset, cg_decl_emit_ev}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output must not have '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+fn emitted(src: Str, name: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    let program = cg_probe_compile(path, src)
+    layout_reset()
+    let _ = fs.delete(path)
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    cg_decl_emit_ev("")
+    print_take()
+}
+
+// Two sub-effects under one root, one operation each, one returning a value and one not.
+fn two_ops_src() -> Str {
+    #"effect Logger {
+    effect Write { fn emit(msg: Str) }
+    effect Read { fn peek() -> Int }
+}
+fn main() { assert(true) }
+"#
+}
+
+// `log` is a name C already owns, so the slot, its capture word and its default body all
+// have to move off it together.
+fn reserved_op_src() -> Str {
+    #"effect Logger {
+    effect Write { fn log(msg: Str) }
+}
+fn main() { assert(true) }
+"#
+}
+
+fn bare_src() -> Str {
+    #"effect Bare {
+    effect Nothing { }
+}
+fn main() { assert(true) }
+"#
+}
+
+fn logger_vtable() -> Str { c_vtable_type_name(make_handler_type("Logger")) }
+fn bare_vtable() -> Str { c_vtable_type_name(make_handler_type("Bare")) }
+fn logger_default(op: Str) -> Str { c_effect_default_op_name(make_handler_type("Logger"), op) }
+
+// The perform site reads a slot by the name cname gives the operation, so the struct must
+// carry one function pointer under that name for every operation the root declares.
+test "one vtable carries the operations of every sub-effect under its root" {
+    let text = emitted(two_ops_src(), "cg_decl_effect_two_ops_probe")
+    assert_has(text, "typedef struct \{\n    void (*emit)(const char* msg);\n    int64_t (*peek)(void);")
+    assert_has(text, "} {logger_vtable()};")
+    assert_eq_int("one vtable, not one per sub-effect",
+        cg_text_occurrences(text, "} {logger_vtable()};"), 1)
+    assert_lacks(text, "blink_ue_write_vtable")
+    assert_lacks(text, "blink_ue_read_vtable")
+}
+
+// An inner handler copies the vtable and overwrites only the slots it names. One shared
+// capture word would let an operation it did not name read the inner handler's data.
+test "the capture words come after every function pointer, one for each operation" {
+    let text = emitted(two_ops_src(), "cg_decl_effect_captures_probe")
+    assert_has(text, "    void* __userdata_emit;\n    void* __userdata_peek;\n} {logger_vtable()};")
+}
+
+// C rejects a struct with no members, so an effect that declares no operation keeps one word.
+test "an effect with no operations keeps one word so the struct is never empty" {
+    let text = emitted(bare_src(), "cg_decl_effect_bare_probe")
+    assert_has(text, "typedef struct \{\n    void* __userdata;\n} {bare_vtable()};")
+    assert_lacks(text, "__userdata_")
+}
+
+// The default instance names a body per slot. A slot left null would be called through by a
+// program that installs no handler for the effect.
+test "every operation has a default body the default instance names" {
+    let text = emitted(two_ops_src(), "cg_decl_effect_defaults_probe")
+    assert_has(text, "static void {logger_default("emit")}(const char* msg) \{")
+    assert_has(text, "static int64_t {logger_default("peek")}(void) \{")
+    assert_has(text, "static {logger_vtable()} {logger_vtable()}_default = \{\n    {logger_default("emit")},\n    {logger_default("peek")},\n    NULL,\n    NULL,\n};")
+}
+
+// A default body gives back a zero of the operation's own return type rather than a value
+// read from memory nobody wrote. The zero is spelled once, so it holds for a struct return as
+// well as for a number.
+test "a value-returning default body gives back a zero of its own type" {
+    let text = emitted(two_ops_src(), "cg_decl_effect_zero_probe")
+    assert_has(text, "static int64_t {logger_default("peek")}(void) \{\n    return (int64_t)\{0};\n}")
+}
+
+// An operation that returns nothing has nothing to give back, so its body is empty.
+test "a default body for an operation that returns nothing is empty" {
+    let text = emitted(two_ops_src(), "cg_decl_effect_void_probe")
+    assert_has(text, "static void {logger_default("emit")}(const char* msg) \{\n}")
+}
+
+// An effect with no operations has no body to name, and the instance keeps one null to match
+// the one word of the struct.
+test "an effect with no operations has no default body and one null" {
+    let text = emitted(bare_src(), "cg_decl_effect_bare_default_probe")
+    assert_lacks(text, "_default_")
+    assert_has(text, "static {bare_vtable()} {bare_vtable()}_default = \{\n    NULL,\n};")
+}
+
+// A slot, its capture word and its default body all name the same operation. cname moves a
+// name C owns out of the way, and all three have to move with it or the vtable names a slot
+// that no body fills.
+test "an operation whose name C owns is moved out of the way in every place it is written" {
+    let text = emitted(reserved_op_src(), "cg_decl_effect_reserved_probe")
+    let slot = c_field_name("log")
+    assert(slot != "log")
+    assert_has(text, "    void (*{slot})(const char* msg);")
+    assert_has(text, "    void* __userdata_{slot};")
+    assert_has(text, "static void {logger_default("log")}(const char* msg) \{")
+    assert_has(text, "    {logger_default("log")},")
+}
+
+// The vector holds a pointer to the vtable, so C must have read the vtable typedef first.
+test "the vtable typedef is written before the evidence vector that points at it" {
+    let text = emitted(two_ops_src(), "cg_decl_effect_order_probe")
+    let vtable_at = text.index_of("} {logger_vtable()};")
+    let ev_at = text.index_of("} {c_ev_type_name()};")
+    assert(vtable_at >= 0)
+    assert(ev_at >= 0)
+    assert(vtable_at < ev_at)
+}
+
+// The typedef is written once per unit, so a unit that already read it must not read a second
+// copy under the same name.
+test "the vtable typedef carries its own guard" {
+    let text = emitted(two_ops_src(), "cg_decl_effect_guard_probe")
+    assert_has(text, "#ifndef {td_guard_name(logger_vtable())}\n#define {td_guard_name(logger_vtable())}\ntypedef struct \{")
+}
+
+// The declaration half writes C. A gap reported here would stop a program whose effect this
+// stage can already spell. The handler value and the perform site are a separate stage and
+// report gaps of their own.
+test "a user-declared effect emits its vtable rather than reporting an unbuilt stage" {
+    let text = emitted(two_ops_src(), "cg_decl_effect_no_gap_probe")
+    assert_has(text, "} {logger_vtable()};")
+    assert_eq_int("no unbuilt stage from the declaration half",
+        cg_probe_ices_named("CodegenStageNotBuilt"), 0)
+}

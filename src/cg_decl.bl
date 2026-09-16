@@ -12,7 +12,7 @@
 // members reach by value.
 
 import diagnostics.{
-    Diag, diag_ice, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
+    Diag, diag_ice, diag_ice_at, diag_is_ice_seg,
     CODEGEN_STAGE_NOT_BUILT, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 import layout.{
@@ -20,7 +20,8 @@ import layout.{
     layout_take_typedefs, tid_of_node,
 }
 import cname.{
-    c_ev_field_name, c_ev_type_name, c_ffi_struct_ptr_name, c_ffi_symbol, c_field_name,
+    c_effect_default_op_name, c_ev_field_name, c_ev_type_name, c_ffi_struct_ptr_name,
+    c_ffi_symbol, c_field_name,
     c_fn_decl_name, cname_ffi_struct_mirror,
     c_global_name, c_vtable_type_name,
     c_impl_method_name, c_local_name, c_type_decl_name, c_variant_ordinal,
@@ -28,6 +29,7 @@ import cname.{
     cname_is_runtime_owned, td_guard_name,
 }
 import cg_print.{
+    print_effect_default_vtable, print_effect_vtable_typedef,
     print_ev, print_epilogue, print_fn, print_fn_decl, print_foreign_decl, print_global_decl,
     print_prologue, print_prologue_declares,
     print_simple_enum_typedef, print_struct_typedef, print_tagged_enum_typedef,
@@ -37,7 +39,7 @@ import cg_reg.{
     cg_reg_effect_decls, cg_reg_entry_point, cg_reg_fn_decls, cg_reg_global_decls,
     cg_reg_impl_methods, cg_reg_impl_of, cg_reg_tid_for_decl, cg_reg_type_decls,
 }
-import ir.{ir_block, ir_call_direct, ir_cast, ir_expr_stmt, ir_return, ir_var_ref}
+import ir.{ir_block, ir_call_direct, ir_cast, ir_const, ir_expr_stmt, ir_return, ir_var_ref}
 import mono.{is_poly_impl, poly_impl_is_element_agnostic}
 import typecheck.{
     TyKind, tc_enum_variant_slots, tc_evar_field_slots, tc_evar_name, tc_evfield_name,
@@ -46,8 +48,9 @@ import typecheck.{
     tc_type_str, tc_void_tid, DECL_NODE_AMBIGUOUS,
 }
 import parser.{
-    get_annotation, node_effects, node_fields, node_impl_binders, node_name, node_params,
-    node_type_ann, node_type_params, node_value, sublist_get, sublist_length,
+    get_annotation, node_effects, node_elements, node_fields, node_impl_binders, node_methods,
+    node_name, node_params, node_type_ann, node_type_params, node_value, sublist_get,
+    sublist_length,
 }
 
 // 1 while a declaration's dependencies are being emitted, 2 once its typedef is written.
@@ -659,10 +662,9 @@ pub fn cg_decl_emit_epilogue(header_guard: Str) {
 // order is the printer's, and it is what lets the stdlib archive be compiled against a
 // vector that stops at the builtins and still read the same field at the same offset.
 //
-// The vtable type that slot points at, and the default instance the default vector takes
-// its address of, are still to come, along with a default body per operation. The slot is
-// emitted anyway: a vector that dropped the field would put every later field at the
-// wrong offset, which miscompiles silently, where a missing vtable is named here.
+// The vtable each slot points at is written first, because the vector names it by value and
+// C must have read the typedef by then. A vector that dropped a field would put every later
+// field at a different offset, which the archive reads as the field it expected.
 pub fn cg_decl_emit_ev(ev_storage: Str) ! Diag.Report {
     let effects = cg_reg_effect_decls()
     let mut vtables: List[Str] = []
@@ -677,11 +679,91 @@ pub fn cg_decl_emit_ev(ev_storage: Str) ! Diag.Report {
                 "every declared effect must name a slot of the evidence vector; this is a compiler bug")
             return
         }
+        emit_effect_vtable(e, slot_tid, vtable)
         vtables.push(vtable)
         fields.push(field)
     }
     print_ev(td_guard_name(c_ev_type_name()), vtables, fields, ev_storage)
-    if effects.len() > 0 {
-        diag_ice_stage_not_built("cg_decl user effect vtables", effects.get(0).unwrap())
+}
+
+// The operations a root effect owns, in the order the sub-effects and their operations are
+// written. That order is the vtable's layout: a perform site reads a slot by name, but a
+// handler install copies the whole struct, so every unit that spells this vtable has to walk
+// the declaration the same way.
+fn effect_ops(effect_decl: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    let children = node_elements(effect_decl)
+    if children == -1 { return out }
+    let mut ci = 0
+    while ci < sublist_length(children) {
+        let ops = node_methods(sublist_get(children, ci))
+        if ops != -1 {
+            let mut oi = 0
+            while oi < sublist_length(ops) {
+                out.push(sublist_get(ops, oi))
+                oi = oi + 1
+            }
+        }
+        ci = ci + 1
     }
+    out
+}
+
+// One root effect's vtable struct, a default body per operation, and the default instance the
+// evidence vector takes the address of.
+//
+// The whole root is one struct, because a handler for one sub-effect copies the instance and
+// overwrites only the slots it names; a struct sized to that sub-effect would drop the rest.
+// Each operation also owns a capture word, so an operation the inner handler left alone still
+// reads the captures of the handler that did define it.
+//
+// The signatures are read before the typedef is opened. Reading one can write a member
+// typedef, and a typedef opened inside the struct would nest one declaration in another.
+fn emit_effect_vtable(effect_decl: Int, slot_tid: Int, vtable: Str) ! Diag.Report {
+    let ops = effect_ops(effect_decl)
+    let mut slots: List[Str] = []
+    let mut rets: List[Str] = []
+    let mut params: List[List[Str]] = []
+    // The slot is a struct member, so it takes the member-name producer. The perform site
+    // reads the slot by name and must ask the same producer, or an operation whose name C
+    // owns is written one way here and read another way there.
+    for op in ops {
+        slots.push(c_field_name(node_name(op)))
+        rets.push(fn_ret_spelling(op))
+        params.push(fn_param_decls(op))
+    }
+    print_effect_vtable_typedef(td_guard_name(vtable), vtable, slots, rets, params)
+    let mut defaults: List[Str] = []
+    let mut i = 0
+    while i < ops.len() {
+        let op = ops.get(i).unwrap()
+        let symbol = c_effect_default_op_name(slot_tid, node_name(op))
+        if diag_is_ice_seg(symbol) {
+            diag_ice_at("EffectDefaultBodyNotNameable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "no default body name for operation '{node_name(op)}' of effect '{node_name(effect_decl)}'", op,
+                "a declared effect that is not builtin names a default body per operation; this is a compiler bug")
+            return
+        }
+        print_fn(true, rets.get(i).unwrap(), symbol, params.get(i).unwrap(), false,
+            default_op_body(op, rets.get(i).unwrap()))
+        defaults.push(symbol)
+        i = i + 1
+    }
+    print_effect_default_vtable(vtable, defaults)
+}
+
+// What an operation gives back when the program installs no handler for its effect.
+//
+// A zero of the operation's own return type is the one answer that holds for a number, a
+// pointer and a struct alike, and it is written rather than left unset so nothing reads memory
+// the program never wrote. C spells it as a compound literal, which needs the type named; the
+// name is the same one the slot is declared with.
+//
+// An operation that returns nothing has nothing to give back. The test is the one the foreign
+// wrapper uses to decide the same thing, or the two could disagree on what `void` covers.
+fn default_op_body(op: Int, ret: Str) -> Int ! Diag.Report {
+    let tid = fn_ret_tid(op)
+    let k = tc_tid_kind(tc_resolve(tid))
+    if k == TyKind.Void || k == TyKind.Never { return ir_block(op, []) }
+    ir_block(op, [ir_return(op, ir_const(tid, op, ret, "({ret})\{0}"))])
 }
