@@ -1554,6 +1554,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if cc_is_map_slot_method(kind, mname) { return cc_map_slot_method(node, obj, kind, mname) }
     if cc_is_scalar_cast(kind, mname) { return cc_scalar_cast(node, obj, kind, mname) }
     if cc_is_char_text(kind, mname) { return cc_char_text(node, obj, kind, mname) }
+    if cc_is_str_as_cstr(kind, mname) { return cc_str_as_cstr(node, obj, kind, mname) }
     if cc_is_carrier_test(kind, mname) { return cc_carrier_test(node, obj, kind, mname) }
     if cc_is_carrier_read(kind, mname) { return cc_carrier_read(node, obj, kind, mname) }
     if kind == TyKind.FfiScope { return cc_lower_scope_method(node, obj, mname) }
@@ -2001,6 +2002,26 @@ fn cc_char_text(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Re
 // value it already holds, and a second spelling of it would be a second answer.
 fn cc_char_text_of_value(node: Int, spelling: Str, form: SlotForm, value: Int) -> Int {
     ir_call_runtime(TYPE_STR, node, spelling, c_runtime_helper("char_to_str"), form, [value])
+}
+
+fn cc_is_str_as_cstr(kind: TyKind, method: Str) -> Bool {
+    kind == TyKind.Str && method == "as_cstr"
+}
+
+// `Str.as_cstr` (sections/07_trust_modules_metadata.md:234): a heap copy of the string's
+// bytes as a Ptr[U8], made by the runtime and not by a declaration this stage could dispatch
+// to. Typecheck answers Ptr[U8] for the call's own tid, so what the copy is spelled at is
+// read off the call the same way every other builtin conversion reads its answer.
+fn cc_str_as_cstr(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, kind, method, 0, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let answer = cc_local(tid, node)
+    if cc_stopped(answer) { return -1 }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    ir_call_runtime(tid, node, answer.c_spelling, c_runtime_helper("strdup"), answer.slot_form, [recv])
 }
 
 // ── Carriers ──────────────────────────────────────────────────────────────
@@ -2492,7 +2513,8 @@ fn cc_list_join_callee(node: Int) -> Str ! Diag.Report {
 // and this table declining is what lets the impl path answer them. `substring` and
 // `substr` are two spellings of one function, and `to_int` and `parse_int` likewise,
 // exactly as typecheck has them. `as_cstr` is absent because no stdlib function answers
-// it: the pointer it hands back is made by codegen, not by a call.
+// it: the copy it hands back is a direct runtime call this stage builds itself
+// (cc_str_as_cstr), read before the impls the same way this table is.
 fn cc_str_intrinsic(method: Str) -> Str {
     if method == "byte_at" { return "std_str:str_char_at" }
     if method == "char_at" { return "std_str:str_char_at_opt" }
