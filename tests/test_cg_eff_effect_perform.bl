@@ -1,0 +1,311 @@
+// An effect operation is a virtual call through the evidence vector: the vector's field
+// for the effect's root holds a vtable pointer, and the operation is one slot of it.
+//
+// Both halves of the address are producers' answers, never spellings made here: the field
+// is cname's for the handler tid, the slot is cname's for a builtin pair or the member name
+// of a user operation. The vector read is the program's global instance, which every
+// handler install writes in place, so the read is exact wherever the perform sits.
+//
+// What this stage cannot yet build it refuses by name: a print of a value that is not text
+// and has no Display impl, and a user operation whose answer the vtable slot erases to a
+// different C type than the call site holds.
+
+import cname_test_helpers.{find_decl}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_named}
+import ast.{NodeKind, nk_of}
+import parser.{node_body, node_kind, node_stmts, node_value, sublist_get, sublist_length}
+import layout.{layout_reset}
+import typecheck.{TYPE_INT, TYPE_STR}
+import ir.{
+    IrKind, ir_c_name, ir_c_spelling, ir_expr_stmt, ir_kid, ir_kid_count, ir_kind, ir_reset, ir_tid,
+    ir_verify,
+}
+import cg_reg.{cg_reg_build}
+import cg_expr.{cg_expr_pending_count, cg_expr_reset, cg_expr_take_pending}
+import cg_stmt.{cg_stmt_reset}
+import cg_eff.{cg_eff_lower_builtin_perform, cg_eff_lower_user_perform, cg_eff_reset}
+import cg_print.{print_expr, print_reset, print_stmt, print_take}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+
+// One perform per function, so a case names the perform it means by the function around it.
+// Arguments are literals: the seam under test lowers them through the expression stage, and
+// a binder would need a scope this probe does not open.
+fn probe_src() -> Str {
+    #"import std.io
+
+effect Metrics {
+    effect Emit {
+        fn count(name: Str, n: Int)
+        fn peek(name: Str) -> Int
+    }
+}
+
+type Row {
+    id: Int
+    label: Str
+}
+
+impl Display for Row {
+    fn fmt(self, sb: StringBuilder) { sb.write(self.label) }
+}
+
+effect Store {
+    effect Find {
+        fn find(name: Str) -> Option[Row]
+    }
+}
+
+fn say_text() { io.println("hi") }
+fn say_no_nl() { io.print("a") }
+fn say_err() { io.eprintln("e") }
+fn say_log() { io.log("l") }
+fn say_number() { io.println(3) }
+fn say_row() { io.println(Row { id: 1, label: "x" }) }
+fn read_home() -> Option[Str] { env.var("HOME") }
+fn where_am_i() -> Str { env.cwd() }
+fn set_it() { env.set_var("A", "b") }
+fn drop_it() { env.remove_var("A") }
+fn leave() { env.exit(1) }
+fn count_it() ! Metrics.Emit { metrics.count("w", 2) }
+fn peek_it() -> Int ! Metrics.Emit { metrics.peek("w") }
+fn find_it() -> Option[Row] ! Store.Find { store.find("w") }
+
+fn main() {
+    say_text()
+    say_no_nl()
+    say_err()
+    say_log()
+    say_number()
+    say_row()
+    let _h = read_home()
+    let _w = where_am_i()
+    set_it()
+    drop_it()
+    count_it()
+    let _p = peek_it()
+    let _f = find_it()
+    if _p > 99 { leave() }
+}
+"#
+}
+
+fn ices() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" { n = n + 1 }
+    }
+    n
+}
+
+fn report_ices() {
+    for d in diag_entries {
+        if d.severity == "ice" { io.println("  ICE {d.name} {d.message}") }
+    }
+}
+
+// The registry, the IR table and the diagnostics list are process globals, so each test
+// compiles the probe for itself. The nested compile resolves the prelude through
+// BLINK_ROOT, and the harness runs from the repo root.
+fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    env.set_var("BLINK_ROOT", env.cwd())
+    diag_reset()
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    cg_expr_reset()
+    cg_eff_reset()
+    print_reset()
+    let path = "build/cg_eff_effect_perform_probe.bl"
+    let program = cg_probe_compile(path, probe_src())
+    let _ = fs.delete(path)
+    cg_reg_build(program)
+    diag_reset()
+}
+
+// The one method call in the named function's body: the single statement, or the tail
+// expression when the body has no statement wrapper around it.
+fn perform_of(fn_name: Str) -> Int {
+    let f = find_decl(NodeKind.FnDef, fn_name, "")
+    assert(f >= 0)
+    let stmts = node_stmts(node_body(f))
+    assert_eq(sublist_length(stmts), 1)
+    let s = sublist_get(stmts, 0)
+    let call = if nk_of(node_kind(s)) == NodeKind.ExprStmt { node_value(s) } else { s }
+    assert(nk_of(node_kind(call)) == NodeKind.MethodCall)
+    call
+}
+
+fn builtin(fn_name: Str, ns: Str, method: Str) -> Int ! Diag.Report {
+    cg_eff_lower_builtin_perform(perform_of(fn_name), ns, method)
+}
+
+fn user(fn_name: Str) -> Int ! Diag.Report {
+    cg_eff_lower_user_perform(perform_of(fn_name))
+}
+
+// The vector field a perform reads and the vector it reads it off.
+fn field_of(perform: Int) -> Int {
+    assert(ir_kind(perform) == IrKind.EffectPerform)
+    let read = ir_kid(perform, 0)
+    assert(ir_kind(read) == IrKind.FieldGet)
+    read
+}
+
+fn vector_of(perform: Int) -> Int {
+    let read = field_of(perform)
+    let ev = ir_kid(read, 0)
+    assert(ir_kind(ev) == IrKind.EvidenceVector)
+    ev
+}
+
+fn assert_verifies(perform: Int) {
+    let problems = ir_verify(ir_expr_stmt(perform, perform))
+    for p in problems { io.println("  verify: {p}") }
+    assert_eq(problems.len(), 0)
+}
+
+fn pending_text() -> Str ! Diag.Report {
+    let stmts = cg_expr_take_pending(0)
+    for s in stmts { print_stmt(s) }
+    print_take()
+}
+
+test "io.println is a perform through the io field's print slot" {
+    setup()
+    let p = builtin("say_text", "io", "println")
+    report_ices()
+    assert_eq(ices(), 0)
+    assert(p >= 0)
+    assert_eq(ir_c_name(p), "print")
+    assert_eq(ir_c_name(field_of(p)), "io")
+    assert_eq(ir_c_name(vector_of(p)), "__blink_ev")
+    assert_eq(ir_kid_count(p), 2)
+    assert_verifies(p)
+    assert_eq(print_expr(p), "(__blink_ev.io)->print(\"hi\")")
+}
+
+test "the other io print names reach their own slots" {
+    setup()
+    let no_nl = builtin("say_no_nl", "io", "print")
+    let err = builtin("say_err", "io", "eprintln")
+    let log = builtin("say_log", "io", "log")
+    report_ices()
+    assert_eq(ices(), 0)
+    assert_eq(ir_c_name(no_nl), "print_no_nl")
+    assert_eq(ir_c_name(err), "eprint")
+    assert_eq(ir_c_name(log), "log")
+    assert_eq(ir_c_name(field_of(err)), "io")
+}
+
+test "a print of a struct renders it through its Display impl" {
+    setup()
+    let p = builtin("say_row", "io", "println")
+    report_ices()
+    assert_eq(ices(), 0)
+    assert(p >= 0)
+    assert_eq(ir_kid_count(p), 2)
+    assert(ir_kind(ir_kid(p, 1)) == IrKind.CallDirect)
+    assert_eq(ir_tid(ir_kid(p, 1)), TYPE_STR)
+    assert_verifies(p)
+}
+
+test "a print of a number is refused by name, not rendered by a guess" {
+    setup()
+    let p = builtin("say_number", "io", "println")
+    assert_eq(p, -1)
+    assert_eq(cg_probe_ices_named("PrintValueNotText"), 1)
+    assert_eq(ices(), 1)
+    assert_eq(cg_expr_pending_count(), 0)
+}
+
+test "env.var reads the slot into a text temp and answers the Option built from it" {
+    setup()
+    let v = builtin("read_home", "env", "var")
+    report_ices()
+    assert_eq(ices(), 0)
+    assert(v >= 0)
+    assert(ir_kind(v) == IrKind.VarRef)
+    assert_eq(ir_c_spelling(v), "blink_Option_str")
+    assert_eq(cg_expr_pending_count(), 3)
+    let text = pending_text()
+    io.println(text)
+    assert(text.contains("const char* "))
+    assert(text.contains(" = (__blink_ev.env)->read(\"HOME\");"))
+    assert(text.contains("blink_Option_str "))
+    assert(text.contains("\{.tag = 0}"))
+    assert(text.contains("\{.tag = 1, .value = "))
+    assert(text.contains("if ("))
+}
+
+test "env.var's pending statements are well formed" {
+    setup()
+    let v = builtin("read_home", "env", "var")
+    assert(v >= 0)
+    let stmts = cg_expr_take_pending(0)
+    assert_eq(stmts.len(), 3)
+    for s in stmts {
+        let problems = ir_verify(s)
+        for p in problems { io.println("  verify: {p}") }
+        assert_eq(problems.len(), 0)
+    }
+}
+
+test "the env names without an Option answer are direct performs" {
+    setup()
+    let cwd = builtin("where_am_i", "env", "cwd")
+    let set = builtin("set_it", "env", "set_var")
+    let drop = builtin("drop_it", "env", "remove_var")
+    let leave = builtin("leave", "env", "exit")
+    report_ices()
+    assert_eq(ices(), 0)
+    assert_eq(cg_expr_pending_count(), 0)
+    assert_eq(ir_c_name(cwd), "cwd")
+    assert_eq(ir_tid(cwd), TYPE_STR)
+    assert_eq(ir_c_name(set), "write")
+    assert_eq(ir_c_name(drop), "remove")
+    assert_eq(ir_c_name(leave), "exit_fn")
+    assert_eq(ir_c_name(field_of(set)), "env")
+    assert_eq(print_expr(set), "(__blink_ev.env)->write(\"A\", \"b\")")
+    assert_eq(print_expr(leave), "(__blink_ev.env)->exit_fn(1)")
+    assert_verifies(cwd)
+}
+
+test "a builtin pair the runtime has no slot for is refused by name" {
+    setup()
+    let p = builtin("say_text", "io", "print_raw")
+    assert_eq(p, -1)
+    assert_eq(cg_probe_ices_named("BuiltinEffectOpNotASlot"), 1)
+    assert_eq(ices(), 1)
+}
+
+test "a user operation is a perform through the user prefix field and its member slot" {
+    setup()
+    let p = user("count_it")
+    report_ices()
+    assert_eq(ices(), 0)
+    assert(p >= 0)
+    assert_eq(ir_c_name(p), "count")
+    assert_eq(ir_c_name(field_of(p)), "ue_metrics")
+    assert_eq(ir_kid_count(p), 3)
+    assert_verifies(p)
+    assert_eq(print_expr(p), "(__blink_ev.ue_metrics)->count(\"w\", 2)")
+}
+
+test "a user operation's answer takes the call's type" {
+    setup()
+    let p = user("peek_it")
+    report_ices()
+    assert_eq(ices(), 0)
+    assert_eq(ir_tid(p), TYPE_INT)
+    assert_eq(ir_c_spelling(p), "int64_t")
+}
+
+test "a user operation whose answer the slot erases is refused by name" {
+    setup()
+    let p = user("find_it")
+    assert_eq(p, -1)
+    assert_eq(cg_probe_ices_named("PerformAnswerErasedInSlot"), 1)
+    assert_eq(ices(), 1)
+}
