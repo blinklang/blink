@@ -1,0 +1,84 @@
+// A higher-order method over a List.
+//
+// Every one of these already has a body: `lib/std/list.bl` declares list_map, list_filter,
+// list_fold, list_any, list_all and list_for_each as ordinary generic functions, and a
+// loop emitted here would be a second answer to what each of them means. So the call
+// reaches the generic rather than being built a second time.
+//
+// The receiver is the generic's first parameter. `xs.map(f)` and `list_map(xs, f)` are one
+// call written two ways, so the receiver travels ahead of the written arguments and the
+// symbol is the instance mono registered for the element types this call uses.
+//
+// A probe stops at typecheck, and a call of a generic names the instance registered for it,
+// so each of these runs the monomorphisation pass over the probe's own program first. That
+// is the pass the symbol comes from: without it the call has no instance to name and the
+// row would measure the harness rather than the route.
+import lower_test_helpers.{ probe, rhs_of, fn_decl_of, assert_eq_str, ice_count }
+import cg_expr.{lower_expr}
+import cg_stmt.{lower_fn}
+import ir.{ir_c_name, ir_kid, ir_kind, ir_kind_name}
+import mono.{run_mono}
+import std.io
+
+fn src_hofs() -> Str {
+    #"fn main() {
+    let xs = [1, 2, 3]
+    let m = xs.map(fn(mv: Int) -> Int { mv * 2 })
+    let f = xs.filter(fn(fv: Int) -> Bool { fv > 1 })
+    let d = xs.fold(0, fn(da: Int, db: Int) -> Int { da + db })
+    let a = xs.any(fn(av: Int) -> Bool { av > 1 })
+    let l = xs.all(fn(lv: Int) -> Bool { lv > 0 })
+    let _keep = [m.len(), f.len(), d]
+    let _also = [a, l]
+}
+"#
+}
+
+// The call reaches the generic's instance, and it is a direct call: the callee is a name
+// the compiler emits, not a value read at run time.
+test "a List higher-order method reaches the standard library generic" {
+    run_mono(probe("hof_m", src_hofs()))
+    assert_eq_str("symbol", ir_c_name(lower_expr(rhs_of("m"))), "blink_list_1map_0Int_0Int")
+}
+
+// The receiver is the generic's first parameter, ahead of everything written in the
+// parentheses. Passing it anywhere else would call the body with its arguments crossed.
+test "the receiver travels ahead of the written arguments" {
+    run_mono(probe("hof_r", src_hofs()))
+    let built = lower_expr(rhs_of("m"))
+    assert_eq_str("receiver", ir_c_name(ir_kid(built, 0)), "xs")
+    assert_eq_str("then the closure", ir_kind_name(ir_kind(ir_kid(built, 1))), "ClosureNew")
+}
+
+// Every method of the family reaches its own generic, not just the one read first. A member
+// left out would fall through to the generic "not built" report.
+test "the whole higher-order family reaches its own generic" {
+    run_mono(probe("hof_f", src_hofs()))
+    assert_eq_str("filter", ir_c_name(lower_expr(rhs_of("f"))), "blink_list_1filter_0Int")
+    assert_eq_str("fold", ir_c_name(lower_expr(rhs_of("d"))), "blink_list_1fold_0Int_0Int")
+    assert_eq_str("any", ir_c_name(lower_expr(rhs_of("a"))), "blink_list_1any_0Int")
+    assert_eq_str("all", ir_c_name(lower_expr(rhs_of("l"))), "blink_list_1all_0Int")
+}
+
+// for_each is the one member of the family that answers Void, so it is written as a
+// statement rather than as the right side of a binding, and it reaches the same seam by the
+// statement stage instead of by a read of a bound name. A member reachable only that way is
+// the one a table is most likely to be missing, so it is pinned through the path it takes.
+fn src_for_each() -> Str {
+    #"fn main() {
+    let xs = [1, 2, 3]
+    xs.for_each(fn(ev: Int) { })
+}
+"#
+}
+
+test "a statement-position for_each reaches its generic" {
+    run_mono(probe("hof_e", src_for_each()))
+    let before = ice_count()
+    let _b = lower_fn(fn_decl_of("main"))
+    if ice_count() != before {
+        io.println("FAIL: a statement-position for_each recorded an internal error")
+        assert(false)
+    }
+}
+

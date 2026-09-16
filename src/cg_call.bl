@@ -30,7 +30,7 @@ import typecheck.{
     DECL_NODE_AMBIGUOUS,
     is_import_module_name, is_builtin_namespace, is_builtin_fn, tc_alias_to_original,
     tc_qualifier_to_module_or_self, tc_get_symbol_module, tc_type_str,
-    tc_enum_variant_slots, tc_evar_name, tc_names_a_type,
+    tc_enum_variant_slots, tc_evar_name, tc_names_a_type, tc_is_sealed_list_hof,
     TYPE_INT, TYPE_BOOL, TYPE_STR,
 }
 import layout.{
@@ -451,6 +451,13 @@ fn lower_module_call(node: Int, obj: Int) -> Int ! Diag.Report {
 // The tail every free-function call shares once its declaration is known. A declaration of
 // -1 is a refusal the resolver already reported.
 fn cc_free_call(node: Int, decl: Int) -> Int ! Diag.Report {
+    cc_declared_call(node, decl, NO_RECEIVER)
+}
+
+// A call of one declaration, with the receiver it was written on if it was written on one.
+// `xs.map(f)` and `list_map(xs, f)` reach the same body, so they are one producer here and
+// differ only in whether a receiver travels ahead of the written arguments.
+fn cc_declared_call(node: Int, decl: Int, recv: Int) -> Int ! Diag.Report {
     if decl < 0 { return -1 }
     let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
     if symbol == "" { return -1 }
@@ -458,7 +465,7 @@ fn cc_free_call(node: Int, decl: Int) -> Int ! Diag.Report {
         cc_ev_not_in_ir(node)
         return -1
     }
-    cc_build_call(node, symbol, NO_RECEIVER, CallForm.Declared)
+    cc_build_call(node, symbol, recv, CallForm.Declared)
 }
 
 // The name the declaration was written under. An import may rename what it brings in, and
@@ -1377,6 +1384,10 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let declared = cc_intrinsic_callee(node, kind, mname)
     if declared == ROW_REFUSED { return -1 }
     if declared != "" { return lower_intrinsic_method(node, obj, kind, mname, declared) }
+    // Read beside the intrinsic table and above the impls, for the same reason: the sealed
+    // List higher-order surface is a builtin method, so it wins over a same-named user impl
+    // exactly as typecheck resolves it.
+    if kind == TyKind.List && cc_names_list_hof(mname) { return cc_list_hof_call(node, obj, mname) }
     let primitive = cc_runtime_method(kind, mname)
     if primitive != "" { return cc_lower_runtime_method(node, obj, kind, mname, primitive) }
     let keyed = cc_keyed_row(kind, mname)
@@ -2510,34 +2521,38 @@ fn cc_pointer_body_not_lowered(node: Int) -> Int ! Diag.Report {
 fn cc_list_not_built(node: Int, method: Str) -> Int ! Diag.Report {
     if method == "get" || method == "pop" { return cc_checked_read(node) }
     if method == "contains" { return cc_element_scan_not_lowered(node) }
-    if cc_names_list_hof(method) { return cc_list_hof_not_registered(node, method) }
     cc_intrinsic_not_built(node, TyKind.List, method)
 }
 
-// The higher-order methods the standard library already has a body for. Each names a
-// generic in lib/std/list.bl, so a loop emitted here would be a second answer to what the
-// method means, and the two could disagree.
+// The higher-order methods the standard library already has a body for. The list of names
+// is typecheck's, read back from it rather than written out a second time: the surface is
+// sealed, and two spellings of one sealed list could disagree about a member.
 fn cc_names_list_hof(method: Str) -> Bool {
-    if method == "map" { return true }
-    if method == "filter" { return true }
-    if method == "fold" { return true }
-    if method == "any" { return true }
-    if method == "all" { return true }
-    if method == "for_each" { return true }
-    false
+    tc_is_sealed_list_hof(method) == 1
 }
 
-// What is missing is the instance, not the body. Mono registers an instance of a generic
-// for each call of it that it can see, and a method call is not a call of list_map as far
-// as it can see, so the types this one uses have none. Naming the generic without an
-// instance reports mono's refusal for a decision made here, which blames the wrong stage,
-// so the call is refused under its own name and says which instance would answer it.
-fn cc_list_hof_not_registered(node: Int, method: Str) -> Int ! Diag.Report {
-    diag_ice_at("ListHofInstanceNotRegistered", CODEGEN_STAGE_NOT_BUILT,
-        "'{method}' over a List is the standard library generic 'list_{method}', which mono registers no instance of for a method call",
-        node, "mono has to register an instance for a builtin method that stands for a generic function")
+// The generic a higher-order method stands for. `lib/std/list.bl` declares each of them as
+// an ordinary generic taking the list first, so the receiver is that first parameter and
+// the call is the generic's own, under the instance mono registered for this call site.
+fn cc_list_hof_call(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
+    let decl = cc_sole_fn_named(node, "{list_hof_prefix}{method}")
+    if decl == DECL_REFUSED { return -1 }
+    if decl < 0 { return cc_list_hof_no_body(node, method) }
+    cc_declared_call(node, decl, obj)
+}
+
+// The standard library is loaded for every program, so the generic behind a sealed method
+// is always declared. Missing means the module the method's meaning lives in was not read,
+// which is a broken build rather than a program this stage can refuse in terms of.
+fn cc_list_hof_no_body(node: Int, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("ListHofBodyNotDeclared", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{method}' over a List stands for '{list_hof_prefix}{method}', which no loaded module declares", node,
+        "lib/std/list.bl declares the generic every sealed List higher-order method means")
     -1
 }
+
+let list_hof_prefix = "list_"
+
 
 // A scan over the elements. It is a loop over statements and a comparison chosen per
 // element type, so no one call names it and no layout answer decides it.
