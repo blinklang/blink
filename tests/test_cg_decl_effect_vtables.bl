@@ -1,6 +1,6 @@
 // The C an effect declaration turns into. A user effect gets one vtable struct, one default
 // body per operation, and one default instance of that struct. The evidence vector points at
-// the default instance, so a program that installs no handler still calls something.
+// the default instance, so a program that installs no handler calls something defined.
 //
 // The vtable is per ROOT effect and holds every operation of every sub-effect. A handler for
 // a sub-effect copies the whole struct and overwrites only the slots it names, so a vtable
@@ -182,4 +182,75 @@ test "a user-declared effect emits its vtable rather than reporting an unbuilt s
     assert_has(text, "} {logger_vtable()};")
     assert_eq_int("no unbuilt stage from the declaration half",
         cg_probe_ices_named("CodegenStageNotBuilt"), 0)
+}
+
+// The value an unhandled operation gives back has to be one the caller can act on. A zero of
+// the whole carrier is Ok, because tag 0 is Ok, so a program with no handler would read a
+// success holding a payload nobody wrote. Err is the answer, and it is the one the emitter
+// this replaced gave.
+fn result_op_src() -> Str {
+    #"effect Zzstore {
+    effect Fetch { fn zzget() -> Result[Int, Str] }
+}
+fn main() { assert(true) }
+"#
+}
+
+test "an unhandled operation that answers a Result gives back the error side" {
+    let c = emitted(result_op_src(), "cg_decl_ev_result_probe")
+    assert_has(c, "    return (blink_Result_int_str)\{ .tag = 1 };")
+    assert_lacks(c, "(blink_Result_int_str)\{0}")
+}
+
+// A list handle is a pointer the caller reads through at once. A zero of it is NULL, so the
+// first read of an unhandled operation's list would read address zero. An empty list is the
+// value that carries the same meaning and can be read.
+fn list_op_src() -> Str {
+    #"effect Zzfeed {
+    effect All { fn zzall() -> List[Int] }
+}
+fn main() { assert(true) }
+"#
+}
+
+test "an unhandled operation that answers a list gives back an empty list" {
+    let c = emitted(list_op_src(), "cg_decl_ev_list_probe")
+    assert_has(c, "    return blink_list_new();")
+    assert_lacks(c, "(blink_list*)\{0}")
+}
+
+// Every handler of one effect shares one C signature, so a slot that answers an Option over a
+// nominal is written with the shared pointer carrier. The perform site and the handler install
+// spell it that way, and a slot spelled with the payload's own name is a different type there.
+fn option_struct_op_src() -> Str {
+    #"type Zzitem { name: Str }
+effect Zzlookup {
+    effect Find { fn zzfind() -> Option[Zzitem] }
+}
+fn main() { assert(true) }
+"#
+}
+
+test "a slot that answers an Option over a nominal takes the shared pointer carrier" {
+    let c = emitted(option_struct_op_src(), "cg_decl_ev_option_probe")
+    assert_has(c, "blink_Option_ptr (*zzfind)(void);")
+    assert_lacks(c, "blink_Option_blink_Zzitem (*zzfind)")
+}
+
+// Two sub-effects under one root share the one vtable, so two operations of one name would be
+// two members of that name and two definitions of one static. C rejects both, with no span
+// pointing back at the declaration, so the gap is reported here instead.
+fn duplicate_op_src() -> Str {
+    #"effect Zzdup {
+    effect A { fn zzsame() }
+    effect B { fn zzsame() }
+}
+fn main() { assert(true) }
+"#
+}
+
+test "two operations of one name under a root effect report a gap rather than writing C" {
+    let _ = emitted(duplicate_op_src(), "cg_decl_ev_dup_probe")
+    assert_eq_int("one gap for the repeated name",
+        cg_probe_ices_named("EffectOperationNameRepeated"), 1)
 }

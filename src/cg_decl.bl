@@ -679,7 +679,7 @@ pub fn cg_decl_emit_ev(ev_storage: Str) ! Diag.Report {
                 "every declared effect must name a slot of the evidence vector; this is a compiler bug")
             return
         }
-        emit_effect_vtable(e, slot_tid, vtable)
+        if emit_effect_vtable(e, slot_tid, vtable) == 0 { return }
         vtables.push(vtable)
         fields.push(field)
     }
@@ -714,50 +714,82 @@ fn effect_ops(effect_decl: Int) -> List[Int] {
 //
 // The whole root is one struct, because a handler for one sub-effect copies the instance and
 // overwrites only the slots it names; a struct sized to that sub-effect would drop the rest.
-// Each operation also owns a capture word, so an operation the inner handler left alone still
-// reads the captures of the handler that did define it.
+// Each operation also owns a capture word, so an operation the inner handler left alone reads
+// the captures of the handler that did define it.
 //
-// The signatures are read before the typedef is opened. Reading one can write a member
-// typedef, and a typedef opened inside the struct would nest one declaration in another.
-fn emit_effect_vtable(effect_decl: Int, slot_tid: Int, vtable: Str) ! Diag.Report {
+// Every name and every signature is read before anything is written. Two reasons: reading a
+// signature can write a member typedef, and a typedef opened inside the struct would nest one
+// declaration in another; and a name this stage cannot spell must stop it before the typedef
+// lands, or the unit carries a vtable type whose instance nothing defines.
+//
+// Answers 0 when it wrote nothing, so the caller leaves the effect out of the vector rather
+// than pointing a field at an instance that is not there.
+fn emit_effect_vtable(effect_decl: Int, slot_tid: Int, vtable: Str) -> Int ! Diag.Report {
     let ops = effect_ops(effect_decl)
     let mut slots: List[Str] = []
     let mut rets: List[Str] = []
     let mut params: List[List[Str]] = []
-    // The slot is a struct member, so it takes the member-name producer. The perform site
-    // reads the slot by name and must ask the same producer, or an operation whose name C
-    // owns is written one way here and read another way there.
-    for op in ops {
-        slots.push(c_field_name(node_name(op)))
-        rets.push(fn_ret_spelling(op))
-        params.push(fn_param_decls(op))
-    }
-    print_effect_vtable_typedef(td_guard_name(vtable), vtable, slots, rets, params)
     let mut defaults: List[Str] = []
-    let mut i = 0
-    while i < ops.len() {
-        let op = ops.get(i).unwrap()
+    for op in ops {
+        // The slot is a struct member, so it takes the member-name producer. The perform site
+        // reads the slot by name and must ask the same producer, or an operation whose name C
+        // owns is written one way here and read another way there.
+        let slot = c_field_name(node_name(op))
+        // The sub-effects share the one struct, so two operations of one name would be two
+        // members of that name and two definitions of one static. C rejects both with no span
+        // that points back at the declaration, so the stop is reported here with one.
+        if slots.contains(slot) {
+            diag_ice_at("EffectOperationNameRepeated", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "effect '{node_name(effect_decl)}' declares operation '{node_name(op)}' more than once", op,
+                "the operations under one root effect share a vtable, so their names must differ; the declaration should have been rejected before codegen")
+            return 0
+        }
         let symbol = c_effect_default_op_name(slot_tid, node_name(op))
         if diag_is_ice_seg(symbol) {
             diag_ice_at("EffectDefaultBodyNotNameable", UNSOLVED_TYPEVAR_AT_CODEGEN,
                 "no default body name for operation '{node_name(op)}' of effect '{node_name(effect_decl)}'", op,
                 "a declared effect that is not builtin names a default body per operation; this is a compiler bug")
-            return
+            return 0
         }
-        print_fn(true, rets.get(i).unwrap(), symbol, params.get(i).unwrap(), false,
-            default_op_body(op, rets.get(i).unwrap()))
+        slots.push(slot)
+        rets.push(op_ret_spelling(op))
+        params.push(fn_param_decls(op))
         defaults.push(symbol)
+    }
+    print_effect_vtable_typedef(td_guard_name(vtable), vtable, slots, rets, params)
+    let mut i = 0
+    while i < ops.len() {
+        print_fn(true, rets.get(i).unwrap(), defaults.get(i).unwrap(), params.get(i).unwrap(), false,
+            default_op_body(ops.get(i).unwrap(), rets.get(i).unwrap()))
         i = i + 1
     }
     print_effect_default_vtable(vtable, defaults)
+    1
+}
+
+// The C type a vtable slot answers with. It is a return position, so it takes the slot
+// position rather than the plain return one: every handler of one effect is assigned into the
+// same slot, and the erasure that gives them one signature is attached to that position.
+fn op_ret_spelling(op: Int) -> Str ! Diag.Report {
+    let tid = fn_ret_tid(op)
+    flush_member_typedefs(tid)
+    cg_decl_require_spelling(tid, Position.VtableSlot)
 }
 
 // What an operation gives back when the program installs no handler for its effect.
 //
-// A zero of the operation's own return type is the one answer that holds for a number, a
-// pointer and a struct alike, and it is written rather than left unset so nothing reads memory
-// the program never wrote. C spells it as a compound literal, which needs the type named; the
-// name is the same one the slot is declared with.
+// The value has to be one the caller can act on with no further knowledge, so it is the empty
+// or failed value of the operation's own return type, never memory nobody wrote.
+//
+// A Result answers its error side. Zeroing the carrier would set tag 0, which is Ok, and hand
+// the caller a success holding a payload the program never produced.
+//
+// A list answers an empty list. The handle is a pointer the caller reads through at once, and
+// a zero of it is the address the first read would take.
+//
+// Everything else answers a zero of its own type, written as a compound literal so a number, a
+// pointer, a carrier and a by-value struct all take the one rule. An Option zeroes to tag 0,
+// which is None, so it needs no arm of its own.
 //
 // An operation that returns nothing has nothing to give back. The test is the one the foreign
 // wrapper uses to decide the same thing, or the two could disagree on what `void` covers.
@@ -765,5 +797,11 @@ fn default_op_body(op: Int, ret: Str) -> Int ! Diag.Report {
     let tid = fn_ret_tid(op)
     let k = tc_tid_kind(tc_resolve(tid))
     if k == TyKind.Void || k == TyKind.Never { return ir_block(op, []) }
+    if k == TyKind.Result {
+        return ir_block(op, [ir_return(op, ir_const(tid, op, ret, "({ret})\{ .tag = 1 }"))])
+    }
+    if k == TyKind.List {
+        return ir_block(op, [ir_return(op, ir_const(tid, op, ret, "blink_list_new()"))])
+    }
     ir_block(op, [ir_return(op, ir_const(tid, op, ret, "({ret})\{0}"))])
 }
