@@ -1,0 +1,74 @@
+// A callee that carries an effect row receives the evidence vector as a trailing
+// `blink_ev*` parameter, so every call to one has to append the address of the program's
+// one vector as its last argument. No IR node spells that address yet: the form is a
+// Unary '&' over the EvidenceVector, and the verifier holds every value node to a tid
+// while the vector has no Blink type to give one.
+//
+// So the argument is refused by name, from one producer in the effect stage, and the call
+// stage reaches that producer from every path that can resolve an effectful callee. What
+// these tests pin is that the refusal is the same on all of those paths, is recorded once
+// per call rather than once per path, and is not reached at all by a callee with no row.
+
+import lower_test_helpers.{probe, rhs_of, assert_kind, assert_ice, assert_verifies}
+import ir.{IrKind}
+import cg_call.{lower_call}
+import cg_eff.{cg_eff_ev_argument}
+
+fn src_effectful_callees() -> Str {
+    #"import std.io
+
+type Meter { n: Int }
+
+trait Ticks { fn tick(self) -> Int ! IO }
+
+impl Ticks for Meter {
+    fn tick(self) -> Int ! IO { self.n }
+}
+
+fn counted() -> Int ! IO { 1 }
+
+fn pure_twice(n: Int) -> Int { n + n }
+
+fn effectful() -> Int ! IO {
+    let meter = Meter { n: 2 }
+    let freed = counted()
+    let ticked = meter.tick()
+    let qualified = Ticks.tick(meter)
+    let plain = pure_twice(3)
+    freed + ticked + qualified + plain
+}
+
+fn main() {
+    let _k = effectful()
+}
+"#
+}
+
+test "the evidence argument is refused by name, from the effect stage" {
+    probe("cg_eff_ev_argument", src_effectful_callees())
+    assert_ice("producer", cg_eff_ev_argument(rhs_of("freed")), "EvidenceVectorNotInIr")
+}
+
+test "a free call to an effectful function refuses the evidence argument" {
+    probe("cg_eff_ev_argument", src_effectful_callees())
+    assert_ice("free call", lower_call(rhs_of("freed")), "EvidenceVectorNotInIr")
+}
+
+test "a method call on a value whose impl method is effectful refuses the evidence argument" {
+    probe("cg_eff_ev_argument", src_effectful_callees())
+    assert_ice("value method", lower_call(rhs_of("ticked")), "EvidenceVectorNotInIr")
+}
+
+test "a trait-qualified call to an effectful impl method refuses the evidence argument" {
+    probe("cg_eff_ev_argument", src_effectful_callees())
+    assert_ice("trait qualified", lower_call(rhs_of("qualified")), "EvidenceVectorNotInIr")
+}
+
+// The refusal belongs to the callee's row, so a callee without one reaches no producer and
+// the call lowers. A gate that asked something else would refuse this call too.
+test "a call to a function with no effect row appends nothing and lowers" {
+    probe("cg_eff_ev_argument", src_effectful_callees())
+    let id = lower_call(rhs_of("plain"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_verifies("verify", id)
+}

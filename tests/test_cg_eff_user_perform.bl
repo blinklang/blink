@@ -1,0 +1,131 @@
+// A call written on the handle of a declared effect is a perform, not a method on a value.
+// The handle binds nothing, so the call stage has to read the left of the dot as a
+// qualifier the same way it reads a namespace, a module, a type and a trait name, and send
+// the call to the effect stage rather than looking for an impl over the handle's type.
+//
+// A binder wins over every other reading of the same spelling, so a local named like a
+// handle is a value again and its method call is an ordinary impl call. That is the case
+// these tests exist to keep apart: the two lower to different things from the same text.
+//
+// The two live in separate probes on purpose. One binder frame holds every local of a
+// probe, so a probe that declared the shadowing local would bind the handle's spelling for
+// its perform as well, and the perform case would pass for the wrong reason.
+
+import lower_test_helpers.{
+    probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
+}
+import ir.{IrKind, ir_c_name, ir_kid}
+import cg_call.{lower_call}
+
+fn src_performs() -> Str {
+    #"import std.io
+
+effect Metrics {
+    effect Emit {
+        fn count(name: Str, n: Int) -> Int
+    }
+}
+
+fn performed() -> Int ! Metrics.Emit {
+    let counted = metrics.count("w", 2)
+    counted
+}
+
+fn main() {
+    let _a = performed()
+}
+"#
+}
+
+// A user effect spelled to lower to the builtin `io` handle, next to a call on the builtin
+// namespace of that spelling. The two readings of `io` are told apart by order alone.
+fn src_namespace_collision() -> Str {
+    #"import std.io
+
+effect Io {
+    effect Emit {
+        fn shout(name: Str) -> Int
+    }
+}
+
+fn printed() -> Int ! IO {
+    let shouted = io.println("p")
+    let _keep = [shouted]
+    1
+}
+
+fn main() {
+    let _a = printed()
+}
+"#
+}
+
+// The same effect, and a type whose impl declares a method of the same name. The local
+// binds the handle's spelling, which is what makes the call a method again.
+fn src_shadowed() -> Str {
+    #"import std.io
+
+effect Metrics {
+    effect Emit {
+        fn count(name: Str, n: Int) -> Int
+    }
+}
+
+type Row { id: Int }
+
+trait Tally {
+    fn count(self, name: Str, n: Int) -> Int
+}
+
+impl Tally for Row {
+    fn count(self, name: Str, n: Int) -> Int { self.id + n }
+}
+
+fn shadowed() -> Int {
+    let metrics = Row { id: 1 }
+    let tallied = metrics.count("w", 2)
+    tallied
+}
+
+fn main() {
+    let _a = shadowed()
+}
+"#
+}
+
+test "a call on the handle of a declared effect lowers to a perform through the vector" {
+    probe("cg_eff_user_perform", src_performs())
+    let id = lower_call(rhs_of("counted"))
+    assert_kind("kind", id, IrKind.EffectPerform)
+    assert_eq_str("slot", ir_c_name(id), "count")
+    assert_shape("shape", id, "EffectPerform(FieldGet(EvidenceVector), Const, Const)")
+    assert_verifies("verify", id)
+}
+
+// The handler slot the perform reads is the root effect's field of the vector, not the
+// sub-effect's: a handler is installed for a root, and the operation is one member of it.
+// The field sits behind `ue_`, which is what keeps a user effect off a builtin's slot.
+test "the perform reads the root effect's handler slot off the vector" {
+    probe("cg_eff_user_perform", src_performs())
+    let id = lower_call(rhs_of("counted"))
+    assert_eq_str("field", ir_c_name(ir_kid(id, 0)), "ue_metrics")
+}
+
+// A builtin namespace is read before a handle, so an effect whose handle is spelled like a
+// namespace cannot take that namespace over. Without the order, `io.println` here would go
+// looking for an operation named `println` on a user effect that declares no such thing.
+test "a builtin namespace outranks a user handle spelled the same" {
+    probe("cg_eff_user_perform_io", src_namespace_collision())
+    let id = lower_call(rhs_of("shouted"))
+    assert_kind("kind", id, IrKind.EffectPerform)
+    assert_eq_str("slot", ir_c_name(id), "print")
+    assert_verifies("verify", id)
+}
+
+test "a local named like a handle is a value, so its method call is an impl call" {
+    probe("cg_eff_user_perform_shadowed", src_shadowed())
+    let id = lower_call(rhs_of("tallied"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_eq_str("symbol", ir_c_name(id), "blink_Row_Tally_count")
+    assert_verifies("verify", id)
+}
