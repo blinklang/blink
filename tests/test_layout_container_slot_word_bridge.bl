@@ -1,0 +1,185 @@
+import std.fs
+import std.io
+import typecheck.{tc_type_str, tc_lookup_node_tid, check_types, make_metavar, lookup_named_type}
+import layout.{layout_of, layout_reset, Position, SlotForm}
+import parser.{nodes}
+import compiler.{compile_to_program}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.println("FAIL: {label}: got '{got}' want '{want}'")
+    }
+    assert_eq(got, want)
+}
+
+// Every word kind a slot can hold, integer and pointer, plus the aggregates and Float
+// that the slot boxes.
+fn probe_src() -> Str {
+    #"type Point { x: Int, y: Int }
+type Color { Red, Green }
+type Errno { Errno(Int) }
+type Port = Int
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn use_cf(c: Option[CFile]) -> Int { 1 }
+fn use_t(t: Template[Point]) -> Int { 1 }
+fn use_h(h: Handle[Int]) -> Int { 1 }
+fn main() {
+    let i: Int = 7
+    let f: Float = 1.5
+    let b: Bool = true
+    let s: Str = "s"
+    let c: Char = 'c'
+    let a1: I8 = 1
+    let a2: I16 = 1
+    let a3: I32 = 1
+    let a4: U8 = 1
+    let a5: U16 = 1
+    let a6: U32 = 1
+    let a7: U64 = 1
+    let u: Void = ()
+    let l: List[Int] = []
+    let o: Option[Int] = None
+    let r: Result[Int, Str] = Ok(1)
+    let t: (Int, Str) = (1, "a")
+    let m: Map[Str, Int] = Map()
+    let st: Set[Int] = Set()
+    let by: Bytes = Bytes()
+    let sb: StringBuilder = StringBuilder()
+    let ch: Channel[Int] = Channel(1)
+    let it: Iterator[Int] = l.into_iter()
+    let p: Point = Point { x: 1, y: 2 }
+    let col: Color = Color.Red
+    let e: Errno = Errno(3)
+    let h: Handler[IO] = handler IO { fn print(_m: Str) {} }
+    let fnv: fn(Int) -> Int = fn(x: Int) -> Int { x }
+    with ffi.scope() as scope {
+        let pt: Ptr[Int] = scope.alloc()
+        assert(l.len() == 0)
+    }
+    assert(i == 7)
+}
+"#
+}
+
+// The probe is deleted BEFORE any assertion so a red row never leaks the file.
+// check_types resets the type pool, so the layout memo must be reset with it.
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/layout_slot_word_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 {
+            m.insert(tc_type_str(tid), tid)
+        }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 {
+        io.println("FAIL: harvested map has no tid for rendered type string '{key}'")
+    }
+    assert(tid != -1)
+    tid
+}
+
+fn slot_form_name(f: SlotForm) -> Str {
+    match f {
+        SlotForm.Inline => "Inline"
+        SlotForm.PointerBoxed => "PointerBoxed"
+        SlotForm.InlineWord => "InlineWord"
+    }
+}
+
+fn assert_bridge(label: Str, tid: Int, want_form: SlotForm, want_word: Str) {
+    let rec = layout_of(tid, Position.ContainerSlot)
+    assert_eq_str("{label} decline", rec.decline_reason, "")
+    assert_eq_str("{label} form", slot_form_name(rec.slot_form), slot_form_name(want_form))
+    assert_eq_str("{label} slot word", rec.slot_word, want_word)
+}
+
+// A list slot is a void*. An integer word cannot become a pointer directly, so it rides
+// through the integer type that is as wide as a pointer: (void*)(intptr_t)x going in,
+// (int64_t)(intptr_t)slot coming out. The same bridge serves store, read and literal fill.
+test "an integer word element bridges the void* slot through intptr_t" {
+    let m = harvest_type_tids()
+    assert_bridge("Int", expect_tid(m, "Int"), SlotForm.InlineWord, "intptr_t")
+    assert_bridge("Bool", expect_tid(m, "Bool"), SlotForm.InlineWord, "intptr_t")
+    assert_bridge("Char", expect_tid(m, "Char"), SlotForm.InlineWord, "intptr_t")
+    assert_bridge("I8", expect_tid(m, "I8"), SlotForm.InlineWord, "intptr_t")
+    assert_bridge("I16", expect_tid(m, "I16"), SlotForm.InlineWord, "intptr_t")
+    assert_bridge("I32", expect_tid(m, "I32"), SlotForm.InlineWord, "intptr_t")
+    assert_bridge("U8", expect_tid(m, "U8"), SlotForm.InlineWord, "intptr_t")
+    assert_bridge("U16", expect_tid(m, "U16"), SlotForm.InlineWord, "intptr_t")
+    assert_bridge("U32", expect_tid(m, "U32"), SlotForm.InlineWord, "intptr_t")
+    assert_bridge("Void", expect_tid(m, "Void"), SlotForm.InlineWord, "intptr_t")
+    assert_bridge("Color ordinal", expect_tid(m, "Color"), SlotForm.InlineWord, "intptr_t")
+    assert_bridge("Errno transparent", expect_tid(m, "Errno"), SlotForm.InlineWord, "intptr_t")
+    assert_bridge("Port alias", lookup_named_type("Port"), SlotForm.InlineWord, "intptr_t")
+}
+
+// An unsigned 64-bit word above INT64_MAX would not survive a signed hop, so it rides the
+// unsigned bridge.
+test "a U64 element bridges the void* slot through uintptr_t" {
+    let m = harvest_type_tids()
+    assert_bridge("U64", expect_tid(m, "U64"), SlotForm.InlineWord, "uintptr_t")
+}
+
+// A pointer word is already a pointer: (void*)x is the whole conversion, so no bridge.
+test "a pointer word element needs no bridge into the void* slot" {
+    let m = harvest_type_tids()
+    assert_bridge("Str", expect_tid(m, "Str"), SlotForm.InlineWord, "")
+    assert_bridge("List[Int]", expect_tid(m, "List[Int]"), SlotForm.InlineWord, "")
+    assert_bridge("Fn", expect_tid(m, "Fn(Int) -> Int"), SlotForm.InlineWord, "")
+    assert_bridge("Handler[IO]", expect_tid(m, "Handler[IO]"), SlotForm.InlineWord, "")
+    assert_bridge("Option[CFile]", expect_tid(m, "Option[CFile]"), SlotForm.InlineWord, "")
+    assert_bridge("Ptr[Int]", expect_tid(m, "Ptr[Int]"), SlotForm.InlineWord, "")
+    assert_bridge("Map[Str, Int]", expect_tid(m, "Map[Str, Int]"), SlotForm.InlineWord, "")
+    assert_bridge("Set[Int]", expect_tid(m, "Set[Int]"), SlotForm.InlineWord, "")
+    assert_bridge("Bytes", expect_tid(m, "Bytes"), SlotForm.InlineWord, "")
+    assert_bridge("StringBuilder", expect_tid(m, "StringBuilder"), SlotForm.InlineWord, "")
+    assert_bridge("Channel[Int]", expect_tid(m, "Channel[Int]"), SlotForm.InlineWord, "")
+    assert_bridge("Iterator[Int]", expect_tid(m, "Iterator[Int]"), SlotForm.InlineWord, "")
+    assert_bridge("Handle[Int]", expect_tid(m, "Handle[Int]"), SlotForm.InlineWord, "")
+    assert_bridge("Template[Point]", expect_tid(m, "Template[Point]"), SlotForm.InlineWord, "")
+}
+
+// A boxed element's slot holds the box pointer, which is a pointer already.
+test "a boxed element needs no bridge into the void* slot" {
+    let m = harvest_type_tids()
+    assert_bridge("Point", expect_tid(m, "Point"), SlotForm.PointerBoxed, "")
+    assert_bridge("Float", expect_tid(m, "Float"), SlotForm.PointerBoxed, "")
+    assert_bridge("Option[Int]", expect_tid(m, "Option[Int]"), SlotForm.PointerBoxed, "")
+    assert_bridge("Result[Int, Str]", expect_tid(m, "Result[Int, Str]"), SlotForm.PointerBoxed, "")
+    assert_bridge("(Int, Str)", expect_tid(m, "(Int, Str)"), SlotForm.PointerBoxed, "")
+}
+
+// Only a container slot is a void*; every other position holds the element as itself.
+test "positions other than ContainerSlot have no slot word" {
+    let m = harvest_type_tids()
+    let tid = expect_tid(m, "Int")
+    assert_eq_str("Local", layout_of(tid, Position.Local).slot_word, "")
+    assert_eq_str("Field", layout_of(tid, Position.Field).slot_word, "")
+    assert_eq_str("Param", layout_of(tid, Position.Param).slot_word, "")
+    assert_eq_str("Return", layout_of(tid, Position.Return).slot_word, "")
+    assert_eq_str("TupleElem", layout_of(tid, Position.TupleElem).slot_word, "")
+    assert_eq_str("VtableSlot", layout_of(tid, Position.VtableSlot).slot_word, "")
+}
+
+// A tid layout cannot spell has no slot word either: the decline is the whole answer.
+test "a declined element has no slot word" {
+    let _ = harvest_type_tids()
+    let rec = layout_of(make_metavar(), Position.ContainerSlot)
+    assert(rec.decline_reason != "")
+    assert_eq_str("declined slot word", rec.slot_word, "")
+}

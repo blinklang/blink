@@ -1,0 +1,135 @@
+// An effect perform is a virtual call through the evidence vector: kid 0 reads the
+// handler out of the vector's slot for that effect, the rest are the arguments, and
+// c_name is the vtable slot the runtime declares. The vector itself is a value node
+// with no Blink type, so it is the one value kind that carries no tid.
+
+import std.io
+import ir.{
+    IrKind, ir_reset, ir_kind, ir_tid, ir_kid_count, ir_kid, ir_c_name, ir_c_spelling, ir_slot_form,
+    ir_slot_form_name, ir_kind_name, ir_kind_from_name, ir_kind_is_value, ir_verify, ir_dump, ir_parse,
+    ir_new, ir_const, ir_var_ref, ir_field_get, ir_effect_perform, ir_evidence_vector, ir_expr_stmt,
+    ir_call_direct,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn assert_valid(label: Str, root: Int) {
+    let errs = ir_verify(root)
+    if errs.len() > 0 { io.println("FAIL: {label}: {errs.join(" | ")}") }
+    assert_eq_int("{label} verifies", errs.len(), 0)
+}
+
+fn assert_rejects(label: Str, root: Int, needle: Str) {
+    let errs = ir_verify(root)
+    let mut hit = 0
+    for e in errs {
+        if e.contains(needle) { hit = 1 }
+    }
+    if hit == 0 { io.println("FAIL: {label}: no message contains '{needle}': {errs.join(" | ")}") }
+    assert_eq_int("{label} rejected", hit, 1)
+}
+
+fn ev_param() -> Int { ir_evidence_vector(0, "blink_ev*", "__ev", SlotForm.PointerBoxed) }
+fn ev_global() -> Int { ir_evidence_vector(0, "blink_ev", "__blink_ev", SlotForm.Inline) }
+fn io_slot(ev: Int) -> Int { ir_field_get(30, 0, "blink_io_vtable*", "io", SlotForm.PointerBoxed, ev) }
+fn msg() -> Int { ir_const(2, 0, "const char*", "\"hi\"") }
+
+test "EvidenceVector is a value kind with no tid, no kids and a fixed name" {
+    ir_reset()
+    let ev = ev_param()
+    assert_eq_str("kind", ir_kind_name(ir_kind(ev)), "EvidenceVector")
+    assert_eq_int("is a value", if ir_kind_is_value(IrKind.EvidenceVector) { 1 } else { 0 }, 1)
+    assert_eq_int("no kids", ir_kid_count(ev), 0)
+    assert_eq_int("no tid", ir_tid(ev), -1)
+    assert_eq_str("spelling", ir_c_spelling(ev), "blink_ev*")
+    assert_eq_str("name", ir_c_name(ev), "__ev")
+    assert_eq_str("param is held by pointer", ir_slot_form_name(ir_slot_form(ev)), "PointerBoxed")
+    assert_eq_str("global is held inline", ir_slot_form_name(ir_slot_form(ev_global())), "Inline")
+    match ir_kind_from_name("EvidenceVector") {
+        Some(k) => assert_eq_str("name round-trips", ir_kind_name(k), "EvidenceVector")
+        None => assert_eq_str("name resolves", "missing", "EvidenceVector")
+    }
+}
+
+test "a perform prepends the handler slot read to its arguments and verifies" {
+    ir_reset()
+    let say = ir_effect_perform(0, 0, "void", "print", SlotForm.Inline, io_slot(ev_param()), [msg()])
+    assert_eq_str("kind", ir_kind_name(ir_kind(say)), "EffectPerform")
+    assert_eq_int("handler + one arg", ir_kid_count(say), 2)
+    assert_eq_str("kid 0 reads the slot", ir_kind_name(ir_kind(ir_kid(say, 0))), "FieldGet")
+    assert_eq_str("slot field", ir_c_name(ir_kid(say, 0)), "io")
+    assert_eq_str("vtable op", ir_c_name(say), "print")
+    assert_valid("perform through the param vector", ir_expr_stmt(0, say))
+    let read = ir_effect_perform(3, 0, "blink_str*", "read", SlotForm.PointerBoxed,
+        ir_field_get(31, 0, "blink_env_vtable*", "env", SlotForm.PointerBoxed, ev_global()), [msg()])
+    assert_eq_int("no arguments beyond the handler is fine", ir_kid_count(
+        ir_effect_perform(3, 0, "blink_str*", "cwd", SlotForm.PointerBoxed, io_slot(ev_param()), [])), 1)
+    assert_valid("perform through the global vector", ir_expr_stmt(0, read))
+}
+
+test "the vector may stand as a plain argument of a direct call" {
+    ir_reset()
+    let call = ir_call_direct(1, 0, "int64_t", "main_helper", SlotForm.InlineWord, [ir_const(1, 0, "int64_t", "1"), ev_param()])
+    assert_valid("trailing vector argument", ir_expr_stmt(0, call))
+}
+
+test "the verifier holds the vector to its shape" {
+    ir_reset()
+    assert_rejects("empty name", ir_expr_stmt(0, ir_evidence_vector(0, "blink_ev*", "", SlotForm.PointerBoxed)), "empty c_name")
+    assert_rejects("empty spelling", ir_expr_stmt(0, ir_evidence_vector(0, "", "__ev", SlotForm.PointerBoxed)), "empty c_spelling")
+    let typed = ir_new(IrKind.EvidenceVector, 7, 0, "blink_ev*", "__ev", SlotForm.PointerBoxed, [])
+    assert_rejects("a tid", ir_expr_stmt(0, typed), "the vector has no Blink type")
+    let with_kid = ir_new(IrKind.EvidenceVector, -1, 0, "blink_ev*", "__ev", SlotForm.PointerBoxed, [msg()])
+    assert_rejects("a kid", ir_expr_stmt(0, with_kid), "expects 0 kids")
+    assert_rejects("VarRef still needs a tid", ir_expr_stmt(0, ir_var_ref(-1, 0, "int64_t", "x", SlotForm.InlineWord)), "without a tid")
+}
+
+test "the verifier holds a perform to a handler read off the vector" {
+    ir_reset()
+    let bare = ir_new(IrKind.EffectPerform, 0, 0, "void", "print", SlotForm.Inline, [])
+    assert_rejects("no handler", ir_expr_stmt(0, bare), "expects at least 1 kid")
+    let var_handler = ir_var_ref(30, 0, "blink_io_vtable*", "h", SlotForm.PointerBoxed)
+    let from_var = ir_effect_perform(0, 0, "void", "print", SlotForm.Inline, var_handler, [msg()])
+    assert_rejects("handler is a VarRef", ir_expr_stmt(0, from_var), "kid 0 must read a handler slot of the EvidenceVector")
+    let obj = ir_var_ref(5, 0, "blink_Point*", "p", SlotForm.PointerBoxed)
+    let field_of_var = ir_field_get(30, 0, "blink_io_vtable*", "io", SlotForm.PointerBoxed, obj)
+    let from_field = ir_effect_perform(0, 0, "void", "print", SlotForm.Inline, field_of_var, [msg()])
+    assert_rejects("handler is a field of a struct", ir_expr_stmt(0, from_field), "kid 0 must read a handler slot of the EvidenceVector")
+    let by_value = ir_field_get(30, 0, "blink_io_vtable", "io", SlotForm.Inline, ev_param())
+    let inline_handler = ir_effect_perform(0, 0, "void", "print", SlotForm.Inline, by_value, [msg()])
+    assert_rejects("handler slot held by value", ir_expr_stmt(0, inline_handler), "handler slot must be held by pointer")
+    let unnamed = ir_effect_perform(0, 0, "void", "", SlotForm.Inline, io_slot(ev_param()), [msg()])
+    assert_rejects("no vtable op", ir_expr_stmt(0, unnamed), "empty c_name")
+    let stmt_arg = ir_effect_perform(0, 0, "void", "print", SlotForm.Inline, io_slot(ev_param()), [ir_expr_stmt(0, msg())])
+    assert_rejects("statement argument", ir_expr_stmt(0, stmt_arg), "statement where a value is required")
+}
+
+test "a perform tree dumps with the vector as a tid -1 leaf and parses back" {
+    ir_reset()
+    let say = ir_effect_perform(0, 4, "void", "print", SlotForm.Inline, io_slot(ev_param()), [msg()])
+    let want = [
+        "(EffectPerform 0 4 Inline 0 \"void\" \"print\"",
+        "  (FieldGet 30 0 PointerBoxed 0 \"blink_io_vtable*\" \"io\"",
+        "    (EvidenceVector -1 0 PointerBoxed 0 \"blink_ev*\" \"__ev\"))",
+        "  (Const 2 0 InlineWord 0 \"const char*\" \"\\\"hi\\\"\"))",
+    ].join("\n")
+    let text = ir_dump(say)
+    assert_eq_str("dump", text, want)
+    let back = ir_parse(text)
+    assert_eq_str("parsed kind", ir_kind_name(ir_kind(back)), "EffectPerform")
+    assert_eq_int("parsed vector tid", ir_tid(ir_kid(ir_kid(back, 0), 0)), -1)
+    assert_eq_str("re-dump is stable", ir_dump(back), text)
+    assert_valid("parsed tree", ir_expr_stmt(0, back))
+}

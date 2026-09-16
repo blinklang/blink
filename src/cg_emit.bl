@@ -5,7 +5,8 @@
 // the buffer verbatim. cg_print.bl is the only module that may import it.
 //
 // The three pub globals are the buffer, the indent depth and the temp counter. They are the
-// whole mutable state of emission and are on the lint allowlist.
+// whole mutable state of emission that a unit changes, and are on the lint allowlist. The
+// one other global below holds a constant table and is filled once per process.
 
 pub let mut em_lines: List[Str] = []
 pub let mut em_indent: Int = 0
@@ -91,6 +92,71 @@ pub fn em_prologue(user_tu: Bool, define_storage: Bool, test_build: Bool, header
 
 pub fn em_epilogue(header_guard: Str) {
     if header_guard != "" { em_directive("#endif") }
+}
+
+// ── What the prologue already declares ───────────────────────────────────────
+//
+// The header the prologue includes reaches the C standard headers these names come from, so
+// a foreign binding over one of them already has a prototype in the unit. A second one
+// written from a Blink signature declares `int64_t labs(int64_t)` against stdlib.h's
+// `long labs(long)`, and C rejects the pair.
+//
+// Only names the prologue reaches unconditionally belong here. math.h is absent because
+// nothing includes it; `usleep` because runtime_core.h asks for _POSIX_C_SOURCE 200809L,
+// which removed it; the sqlite3 entry points because runtime_sqlite.h includes their header
+// only under BLINK_USE_SQLITE. A name listed here that the unit does not in fact declare
+// leaves the call with no prototype at all, which is the worse of the two failures: the
+// missing name only writes a second declaration that C rejects out loud.
+//
+// The runtime's own exports carry a reserved prefix and are declared the same way, which
+// is why they are a prefix rule here rather than a hundred more names.
+fn prologue_symbol_names() -> List[Str] {
+    [
+        "printf", "fprintf", "sprintf", "snprintf", "fopen", "fclose", "fread", "fwrite",
+        "fgets", "fputs", "puts", "scanf", "fflush", "fseek", "ftell", "rewind", "remove",
+        "rename", "perror",
+        "malloc", "calloc", "realloc", "free", "exit", "abort", "atoi", "atol", "atof",
+        "strtol", "strtod", "abs", "labs", "llabs", "rand", "srand", "getenv", "system",
+        "qsort", "bsearch",
+        "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat", "strncat", "memcpy",
+        "memset", "memmove", "memcmp", "strstr", "strchr", "strrchr", "strdup", "strtok",
+        "strerror",
+        "__errno_location",
+        "time", "clock", "difftime", "mktime", "strftime", "localtime", "gmtime",
+        "read", "write", "close", "sleep", "getcwd", "chdir", "fork", "execvp", "pipe",
+        "dup", "dup2", "access", "unlink", "rmdir", "isatty", "getpid", "lseek", "ftruncate",
+        "open", "fcntl",
+        "poll",
+        "stat", "fstat", "mkdir", "chmod",
+        "wait", "waitpid",
+        "signal", "kill", "raise",
+        "setjmp", "longjmp",
+        "opendir", "readdir", "closedir",
+        "pthread_create", "pthread_join", "pthread_mutex_init", "pthread_mutex_lock",
+        "pthread_mutex_unlock", "pthread_mutex_destroy",
+        "socket", "bind", "listen", "accept", "connect", "send", "recv", "sendto",
+        "recvfrom", "setsockopt", "getsockopt", "shutdown", "getaddrinfo", "freeaddrinfo",
+        "gai_strerror",
+        "htons", "htonl", "ntohs", "ntohl", "inet_ntop", "inet_pton",
+    ]
+}
+
+let mut prologue_symbols: Map[Str, Int] = Map()
+
+pub fn em_prologue_declares(symbol: Str) -> Bool {
+    if symbol.starts_with("blink_") { return true }
+    if symbol.starts_with("blinkrt_") { return true }
+    if symbol.starts_with("__blink") { return true }
+    if prologue_symbols.len() == 0 {
+        for name in prologue_symbol_names() { prologue_symbols.insert(name, 1) }
+    }
+    prologue_symbols.contains_key(symbol) != 0
+}
+
+// The prototype for a foreign symbol nothing else declares. `extern` is written out
+// because a bare declaration reads as a definition to a reader, not because C needs it.
+pub fn em_foreign_decl(ret: Str, symbol: Str, params: List[Str]) {
+    em_line("extern {fn_signature(false, ret, symbol, params, false)};")
 }
 
 // ── Functions ────────────────────────────────────────────────────────────────
@@ -371,4 +437,46 @@ pub fn em_main_shim(has_main: Bool, has_tests: Bool, uses_async: Bool, user_tu: 
     if uses_async { em_line("blink_threadpool_shutdown(__blink_pool);") }
     em_line("return 0;")
     em_close_brace("")
+}
+
+// ── Test registration ────────────────────────────────────────────────────────
+//
+// The runtime declares `blink_test_entry` and `blink_test_run`; a unit with tests
+// supplies the table and the `__blink_run_tests` the shim above calls. Every field
+// arrives already spelled as the C token it prints as, because this module writes no
+// literal of its own.
+
+// One row of the table. An empty tag list and an empty expected-failure reason both print
+// as the null pointer, which is what the runner tests for before it reads either slot.
+fn test_row(name_lit: Str, symbol: Str, tag_count: Int, xfail_lit: Str, comma: Str) -> Str {
+    let tags = if tag_count > 0 { "{symbol}_tags" } else { "NULL" }
+    let expected_fail = if xfail_lit == "" { 0 } else { 1 }
+    let reason = if xfail_lit == "" { "NULL" } else { xfail_lit }
+    "\{{name_lit}, {symbol}, __FILE__, 0, 0, {tags}, {tag_count}, {expected_fail}, {reason}}{comma}"
+}
+
+pub fn em_test_table(name_lits: List[Str], symbols: List[Str], tag_lits: List[List[Str]], xfail_lits: List[Str]) {
+    let count = symbols.len()
+    let mut i = 0
+    while i < count {
+        let tags = tag_lits.get(i).unwrap()
+        if tags.len() > 0 {
+            em_line("static const char* {symbols.get(i).unwrap()}_tags[] = \{{tags.join(", ")}};")
+        }
+        i += 1
+    }
+    em_open_brace("static const blink_test_entry __blink_tests[] =")
+    let mut r = 0
+    while r < count {
+        let comma = if r < count - 1 { "," } else { "" }
+        em_line(test_row(name_lits.get(r).unwrap(), symbols.get(r).unwrap(),
+            tag_lits.get(r).unwrap().len(), xfail_lits.get(r).unwrap(), comma))
+        r += 1
+    }
+    em_close_brace(";")
+    em_line("")
+    em_open_brace("static void __blink_run_tests(int argc, const char** argv)")
+    em_line("blink_test_run(__blink_tests, {count}, argc, argv);")
+    em_close_brace("")
+    em_line("")
 }

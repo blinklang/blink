@@ -1,0 +1,79 @@
+// What a refused call costs.
+//
+// Two costs, and only one of them reaches emitted C. A built IR node is reached only by
+// following the kids of a root, so a node no answer names is never printed. Its count is
+// still worth pinning, because it is the cheapest proof that a seam resolved before it
+// lowered. A hoisted statement is the one that reaches emitted C: the
+// pending buffer is spliced into the enclosing block whole, so a statement left standing
+// runs for a call nothing lowered.
+//
+// The call seam needs no restore of its own. Every operand it lowers goes through
+// lower_expr, which marks the buffer and takes back whatever a refusal left. These tests
+// pin that the rule reaches this seam, which is the claim that would break silently if a
+// seam ever lowered an operand by some other route.
+
+import lower_test_helpers.{probe, rhs_of, assert_ice_saying, assert_eq_str}
+import ir.{ir_node_count}
+import cg_expr.{lower_expr, cg_expr_pending_count}
+
+// A method call whose argument is an ordering this stage cannot lower. The call itself
+// resolves: the impl is concrete, the symbol is known and the result type is an Int with a
+// C layout, so the refusal arrives from inside the argument, which is the only way to reach
+// a call seam that has already resolved everything it owns.
+fn src_argument_refuses() -> Str {
+    #"@derive(Ord)
+type Point { x: Int, y: Int }
+
+trait Tell { fn tell(self, flag: Bool) -> Int }
+
+impl Tell for Point {
+    fn tell(self, flag: Bool) -> Int { if flag { self.x } else { self.y } }
+}
+
+fn main() {
+    let p = Point { x: 1, y: 2 }
+    let q = Point { x: 1, y: 3 }
+    let told = p.tell(p < q)
+    let _keep = [told]
+}
+"#
+}
+
+// A hoisting argument in front of a refusing one. The coalesce binds a carrier temp and a
+// result temp and hoists the `if` that fills them, and the ordering after it then refuses.
+// Both statements stand in the buffer at that moment, so the buffer is what this measures.
+fn src_argument_hoists_then_refuses() -> Str {
+    #"@derive(Ord)
+type Point { x: Int, y: Int }
+
+trait Tell { fn tell(self, first: Bool, second: Bool) -> Int }
+
+impl Tell for Point {
+    fn tell(self, first: Bool, second: Bool) -> Int { if first && second { self.x } else { self.y } }
+}
+
+fn main() {
+    let opt: Option[Bool] = None
+    let p = Point { x: 1, y: 2 }
+    let q = Point { x: 1, y: 3 }
+    let told = p.tell(opt ?? true, p < q)
+    let _keep = [told]
+}
+"#
+}
+
+test "a refused call argument leaves no statement standing in the pending buffer" {
+    probe("cg_call_cost_argument", src_argument_refuses())
+    let before = cg_expr_pending_count()
+    assert_ice_saying("ordering argument", lower_expr(rhs_of("told")),
+        "OrderingMethodNotLowered", "has no ordering method lowering here")
+    assert_eq_str("statements hoisted", "{cg_expr_pending_count() - before}", "0")
+}
+
+test "a refused call argument leaves no statement an earlier argument hoisted" {
+    probe("cg_call_cost_hoisted", src_argument_hoists_then_refuses())
+    let before = cg_expr_pending_count()
+    assert_ice_saying("ordering argument", lower_expr(rhs_of("told")),
+        "OrderingMethodNotLowered", "has no ordering method lowering here")
+    assert_eq_str("statements hoisted", "{cg_expr_pending_count() - before}", "0")
+}

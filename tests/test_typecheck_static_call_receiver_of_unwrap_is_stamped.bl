@@ -1,0 +1,84 @@
+// `T.method(args).unwrap()` reads the carrier the static call returns. Codegen lowers the
+// receiver from the same memo it reads every other expression from, so the static-call
+// node must carry the concrete Result tid, whichever spelling reaches it: a builtin
+// static, a user impl static, a trait static through the type, `Type.try_from`, or the
+// qualified escape hatch `Trait.method(receiver)`.
+
+import lower_test_helpers.{probe, rhs_of, assert_eq_str}
+import typecheck.{tc_lookup_node_tid, tc_resolve, tc_type_str}
+import parser.{node_kind, node_obj, node_method}
+import ast.{NodeKind, nk_of}
+import std.io
+
+fn src() -> Str {
+    #"type Parsed { n: Int }
+
+fn Parsed_parse(s: Str) -> Result[Parsed, Str] { Ok(Parsed { n: s.len() }) }
+
+trait Build {
+    fn build(n: Int) -> Result[Self, Str]
+}
+
+impl Build for Parsed {
+    fn build(n: Int) -> Result[Parsed, Str] { Ok(Parsed { n: n }) }
+}
+
+trait Conv {
+    fn conv(self) -> Result[Int, Str]
+}
+
+impl Conv for Parsed {
+    fn conv(self) -> Result[Int, Str] { Ok(self.n) }
+}
+
+fn main() {
+    let builtin = Char.from_code_point(65).unwrap()
+    let try_from = Char.try_from(66).unwrap()
+    let assoc_fn = Parsed.parse("ab").unwrap()
+    let trait_static = Parsed.build(3).unwrap()
+    let p = Parsed { n: 4 }
+    let escape = Conv.conv(p).unwrap()
+    io.println("{builtin}{try_from}{assoc_fn.n}{trait_static.n}{escape}")
+}
+"#
+}
+
+fn receiver_of_unwrap(name: Str) -> Int {
+    let call = rhs_of(name)
+    assert(nk_of(node_kind(call)) == NodeKind.MethodCall)
+    assert_eq_str("{name}: outer call", node_method(call), "unwrap")
+    node_obj(call)
+}
+
+fn assert_receiver_stamped(name: Str, want: Str) {
+    let recv = receiver_of_unwrap(name)
+    let tid = tc_lookup_node_tid(recv)
+    if tid < 0 { io.println("FAIL: {name}: receiver node {recv} has no recorded type") }
+    assert(tid >= 0)
+    assert_eq_str("{name}: receiver type", tc_type_str(tc_resolve(tid)), want)
+}
+
+test "a builtin static call under unwrap carries its Result" {
+    let _p = probe("static_recv_builtin", src())
+    assert_receiver_stamped("builtin", "Result[Char, ConversionError]")
+}
+
+test "Type.try_from under unwrap carries its Result" {
+    let _p = probe("static_recv_try_from", src())
+    assert_receiver_stamped("try_from", "Result[Char, ConversionError]")
+}
+
+test "a user associated-function call under unwrap carries its Result" {
+    let _p = probe("static_recv_impl", src())
+    assert_receiver_stamped("assoc_fn", "Result[Parsed, Str]")
+}
+
+test "a trait static call through the type under unwrap carries its Result" {
+    let _p = probe("static_recv_trait", src())
+    assert_receiver_stamped("trait_static", "Result[Parsed, Str]")
+}
+
+test "the qualified Trait.method(receiver) call under unwrap carries its Result" {
+    let _p = probe("static_recv_escape", src())
+    assert_receiver_stamped("escape", "Result[Int, Str]")
+}

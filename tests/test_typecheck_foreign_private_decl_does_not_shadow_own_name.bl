@@ -1,0 +1,134 @@
+// A private declaration in a loaded module is visible only inside that module. It must not
+// take part in resolving another module's bare name, and no diagnostic may suggest reaching
+// it through a qualifier, because that access is not legal either. Three stdlib modules
+// each hold a private `CH_0` let and a private `is_digit` fn, so importing them stands in
+// for any loaded module with a private name that the reader also declares.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn compile_only(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    let _rm = process_run("rm", ["-f", path])
+    check_types(program)
+}
+
+fn messages_named(name: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.name == name { out.push(d.message) }
+    }
+    out
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn assert_one_message_containing(label: Str, name: Str, want: Str) {
+    let msgs = messages_named(name)
+    let mut hits = 0
+    for m in msgs {
+        if m.contains(want) { hits = hits + 1 }
+    }
+    if hits != 1 {
+        io.println("FAIL: {label}: want one {name} containing '{want}', got:")
+        for m in msgs { io.println("  {m}") }
+    }
+    assert(hits == 1)
+}
+
+fn assert_no_message_containing(label: Str, want: Str) {
+    for d in diag_entries {
+        if d.message.contains(want) {
+            io.println("FAIL: {label}: a diagnostic offers '{want}': {d.name}: {d.message}")
+            assert(false)
+        }
+    }
+}
+
+fn src_own_let() -> Str {
+    #"import std.json
+
+let CH_0 = 1
+
+fn main() {
+    let read = CH_0 + 0
+    let _keep = [read]
+}
+"#
+}
+
+fn src_own_fn() -> Str {
+    #"import std.json
+import std.toml
+
+fn is_digit(c: Str) -> Bool { c == "1" }
+
+fn main() {
+    let yes = is_digit("1")
+    let _keep = [yes]
+}
+"#
+}
+
+fn src_foreign_private_fn() -> Str {
+    #"import std.json
+
+fn main() {
+    let yes = is_digit(49)
+    let _keep = [yes]
+}
+"#
+}
+
+fn src_foreign_pub_fn_unselected() -> Str {
+    #"import std.json
+
+fn main() {
+    let v = json_parse("1")
+    let _keep = [v]
+}
+"#
+}
+
+test "the reader's own top-level let wins over a private let of the same name in an imported module" {
+    compile_only("tc_own_let_vs_foreign_private", src_own_let())
+    assert_no_errors("own let CH_0")
+}
+
+test "the reader's own fn wins over private fns of the same name in imported modules" {
+    compile_only("tc_own_fn_vs_foreign_private", src_own_fn())
+    assert_no_errors("own fn is_digit")
+}
+
+test "a bare call to another module's private fn is a private-access error, never a qualified suggestion" {
+    compile_only("tc_foreign_private_fn_bare", src_foreign_private_fn())
+    assert_one_message_containing("private is_digit", "PrivateItemAccess", "cannot access private function 'is_digit'")
+    assert_no_message_containing("private is_digit", "json.is_digit")
+    assert(messages_named("ImportNotSelected").len() == 0)
+}
+
+test "a pub fn the import did not select still needs the import list or a qualifier" {
+    compile_only("tc_foreign_pub_fn_unselected", src_foreign_pub_fn_unselected())
+    assert_one_message_containing("unselected parse", "ImportNotSelected", "qualified access 'json.json_parse'")
+}

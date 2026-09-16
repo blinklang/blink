@@ -1,0 +1,251 @@
+// A method call whose receiver is an Option or a Result.
+//
+// These six methods read a carrier the compiler builds and no program declares a body
+// for. Four of them answer a Bool from the tag alone, so each is one comparison and
+// nothing precedes it. `unwrap` answers the payload, which only one of the two arms
+// holds, so it guards the read with the tag and panics when the other arm is the one in
+// hand. What these tests pin is which tag each predicate is true for, that the guard runs
+// before the read and reads the same temp the read does, and the exact sentence the panic
+// carries: a program that catches a panic reads that sentence.
+import lower_test_helpers.{
+    probe, rhs_of, assert_eq_str, assert_shape, assert_verifies, assert_ice_saying,
+}
+import ir.{ir_c_name, ir_kid}
+import cg_expr.{lower_expr, cg_expr_take_pending}
+
+// The statements the lowered expression hoisted, with the count pinned first: a test that
+// indexes past the end of the buffer reports the wrong failure.
+fn hoisted(label: Str, want: Int) -> List[Int] {
+    let stmts = cg_expr_take_pending(0)
+    assert_eq_str("{label} statement count", "{stmts.len()}", "{want}")
+    stmts
+}
+
+// The message a guard panics with. The guard is the second hoisted statement, its then
+// block holds the panic, and the panic holds one string constant.
+fn panic_text(stmts: List[Int]) -> Str {
+    ir_c_name(ir_kid(ir_kid(ir_kid(stmts.get(1).unwrap(), 1), 0), 0))
+}
+
+// An Option over a word-sized inner: the member holds the value itself.
+fn src_option() -> Str {
+    #"fn main() {
+    let o: Option[Int] = Some(1)
+    let v = o.unwrap()
+    let s = o.is_some()
+    let n = o.is_none()
+    let _keep = [s, n]
+    let _also = v
+}
+"#
+}
+
+// A Result over two word-sized arms.
+fn src_result() -> Str {
+    #"fn main() {
+    let r: Result[Int, Str] = Ok(1)
+    let v = r.unwrap()
+    let e = r.unwrap_err()
+    let k = r.is_ok()
+    let b = r.is_err()
+    let _keep = [k, b]
+    let _also = [v, e.len()]
+}
+"#
+}
+
+// An inner wider than the word. layout answers PointerBoxed for the member, so the value
+// sits behind a pointer and the read follows it.
+fn src_boxed_inner() -> Str {
+    #"type Point {
+    x: Int
+    y: Int
+}
+
+fn main() {
+    let o: Option[Point] = Some(Point { x: 1, y: 2 })
+    let p = o.unwrap()
+    let _keep = p.x
+}
+"#
+}
+
+// An Option over an @ffi.opaque handle. layout answers InlineWord for the carrier itself:
+// the handle pointer IS the carrier, None is the null pointer, and there is no tag member
+// and no value member to read.
+fn src_opaque_inner() -> Str {
+    #"@ffi.opaque(name: "probe_handle")
+type Conn
+
+@ffi("probe_open")
+@trusted
+fn open_handle() -> Option[Conn] ! FFI {}
+
+fn main() {
+    let o: Option[Conn] = open_handle()
+    let s = o.is_some()
+    let n = o.is_none()
+    let v = o.unwrap()
+    let _keep = [s, n]
+    let _also = v
+}
+"#
+}
+
+// A method written with an argument it does not take. Typecheck accepts this, so the
+// count is checked here or the argument is dropped without ever being evaluated.
+fn src_long_unwrap() -> Str {
+    #"fn main() {
+    let o: Option[Int] = Some(1)
+    let v = o.unwrap(1)
+    let _keep = v
+}
+"#
+}
+
+test "unwrap reads the carrier's value member" {
+    probe("cm_uw", src_option())
+    let built = lower_expr(rhs_of("v"))
+    assert_shape("read", built, "CarrierUnwrap(VarRef)")
+    assert_eq_str("member", ir_c_name(built), "value")
+    assert_verifies("unwrap", built)
+}
+
+// The receiver is bound once and both the guard and the read name that binding. Reading
+// the carrier twice would evaluate the expression that produced it twice, and a call in
+// that position would run twice.
+test "unwrap binds the receiver once and guards it before reading" {
+    probe("cm_uwg", src_option())
+    let built = lower_expr(rhs_of("v"))
+    let stmts = hoisted("unwrap", 2)
+    assert_shape("bind", stmts.get(0).unwrap(), "Let(VarRef)")
+    assert_shape("guard", stmts.get(1).unwrap(),
+        "If(Binary(CarrierTag(VarRef), Const), Block(Panic(Const)))")
+    assert_shape("read", built, "CarrierUnwrap(VarRef)")
+}
+
+// The tag the guard panics on is None's, not Some's. Comparing against the wrong one
+// would panic on every value that holds something and read the empty arm of the rest.
+test "unwrap panics on the None tag" {
+    probe("cm_uwt", src_option())
+    let _built = lower_expr(rhs_of("v"))
+    let stmts = hoisted("unwrap", 2)
+    let cond = ir_kid(stmts.get(1).unwrap(), 0)
+    assert_eq_str("tag", ir_c_name(ir_kid(cond, 1)), "0")
+}
+
+// The sentence a caught panic reads, the file it names and the line it names. This is the
+// released wording; a program that matches on it keeps working.
+test "unwrap's panic carries the released sentence and the call's own line" {
+    probe("cm_uwm", src_option())
+    let _built = lower_expr(rhs_of("v"))
+    let stmts = hoisted("unwrap", 2)
+    assert_eq_str("message", panic_text(stmts),
+        "\"panic: unwrap called on None at build/cm_uwm_probe.bl:3\"")
+}
+
+test "is_some is true for the tag Some writes" {
+    probe("cm_is", src_option())
+    let built = lower_expr(rhs_of("s"))
+    assert_shape("test", built, "Binary(CarrierTag(VarRef), Const)")
+    assert_eq_str("tag", ir_c_name(ir_kid(built, 1)), "1")
+    let _none = hoisted("is_some", 0)
+    assert_verifies("is_some", built)
+}
+
+test "is_none is true for the tag None writes" {
+    probe("cm_in", src_option())
+    let built = lower_expr(rhs_of("n"))
+    assert_shape("test", built, "Binary(CarrierTag(VarRef), Const)")
+    assert_eq_str("tag", ir_c_name(ir_kid(built, 1)), "0")
+    assert_verifies("is_none", built)
+}
+
+// Ok is tag 0 and Err is tag 1, the other way round from Option. A predicate that read
+// Option's tags would answer every Result backwards.
+test "is_ok is true for the tag Ok writes" {
+    probe("cm_ik", src_result())
+    let built = lower_expr(rhs_of("k"))
+    assert_shape("test", built, "Binary(CarrierTag(VarRef), Const)")
+    assert_eq_str("tag", ir_c_name(ir_kid(built, 1)), "0")
+    assert_verifies("is_ok", built)
+}
+
+test "is_err is true for the tag Err writes" {
+    probe("cm_ie", src_result())
+    let built = lower_expr(rhs_of("b"))
+    assert_shape("test", built, "Binary(CarrierTag(VarRef), Const)")
+    assert_eq_str("tag", ir_c_name(ir_kid(built, 1)), "1")
+    assert_verifies("is_err", built)
+}
+
+// An inner the member holds behind a pointer is read through it. Answering the pointer
+// itself would hand the caller an address where it reads a value.
+test "an inner wider than the word is read out of the box" {
+    probe("cm_ub", src_boxed_inner())
+    let built = lower_expr(rhs_of("p"))
+    assert_shape("read", built, "Unbox(CarrierUnwrap(VarRef))")
+    assert_verifies("boxed unwrap", built)
+}
+
+// Each of the two panicking Result methods reads one arm and panics on the other. Reading
+// the wrong arm is the mistake that costs nothing at compile time and hands the caller
+// another type's bytes at run time, so the arm each one reads is pinned by name. What the
+// panic says about the arm it did not read is pinned where the rendering is.
+test "unwrap on a Result reads the arm Ok writes" {
+    probe("cm_ru", src_result())
+    let built = lower_expr(rhs_of("v"))
+    assert_shape("read", built, "CarrierUnwrap(VarRef)")
+    assert_eq_str("arm", ir_c_name(built), "ok")
+    assert_verifies("result unwrap", built)
+}
+
+test "unwrap_err on a Result reads the arm Err writes" {
+    probe("cm_re", src_result())
+    let built = lower_expr(rhs_of("e"))
+    assert_shape("read", built, "CarrierUnwrap(VarRef)")
+    assert_eq_str("arm", ir_c_name(built), "err")
+    assert_verifies("unwrap_err", built)
+}
+
+// The argument is written, so it is evaluated or it is not. Building the call without it
+// drops an expression the program wrote, side effects and all.
+test "a carrier method written with an argument it does not take is refused" {
+    probe("cm_la", src_long_unwrap())
+    let built = lower_expr(rhs_of("v"))
+    assert_ice_saying("long unwrap", built, "IntrinsicArityWrong", "takes 0 argument(s)")
+}
+
+// A bare-handle Option has no tag member. Reading one would name a field the C type does
+// not declare, so the test is the null check the handle itself answers.
+test "a predicate on a bare-handle Option tests the handle, not a tag" {
+    probe("cm_oq", src_opaque_inner())
+    let built = lower_expr(rhs_of("s"))
+    assert_shape("test", built, "Binary(VarRef, Const)")
+    assert_eq_str("null", ir_c_name(ir_kid(built, 1)), "0")
+    assert_eq_str("op", ir_c_name(built), "!=")
+    assert_verifies("opaque is_some", built)
+}
+
+// The two directions are one operator apart, so each is pinned: answering is_none with the
+// test is_some asks reports every handle backwards.
+test "is_none on a bare-handle Option is the null test" {
+    probe("cm_oqn", src_opaque_inner())
+    let built = lower_expr(rhs_of("n"))
+    assert_shape("test", built, "Binary(VarRef, Const)")
+    assert_eq_str("op", ir_c_name(built), "==")
+    assert_verifies("opaque is_none", built)
+}
+
+// The handle IS the payload, so the read is the carrier itself. Reading a value member
+// would name a field the C type does not declare.
+test "unwrap on a bare-handle Option answers the handle itself" {
+    probe("cm_oqu", src_opaque_inner())
+    let built = lower_expr(rhs_of("v"))
+    let stmts = hoisted("opaque unwrap", 2)
+    assert_shape("guard", stmts.get(1).unwrap(),
+        "If(Binary(VarRef, Const), Block(Panic(Const)))")
+    assert_eq_str("guard op", ir_c_name(ir_kid(stmts.get(1).unwrap(), 0)), "==")
+    assert_shape("read", built, "Cast(VarRef)")
+    assert_verifies("opaque unwrap", built)
+}

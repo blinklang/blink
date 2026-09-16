@@ -1,0 +1,143 @@
+// A List HOF method call (`xs.map(f)`) resolves to the standard library generic
+// `list_map`; the mono pass must register an instance of that generic for the call,
+// exactly as it does for `fold`, `any`, `all` and `for_each`.
+import std.fs
+import typecheck.{check_types, tc_type_str}
+import mono.{run_mono, instances, instance_for_call, MonoInstance}
+import parser.{nodes, node_kind, node_name, node_method}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+
+fn find_decl(kind: NodeKind, name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == kind && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn method_calls(method: Str) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.MethodCall && node_method(i) == method { out.push(i) }
+        i = i + 1
+    }
+    out
+}
+
+fn instances_of(decl: Int) -> List[MonoInstance] {
+    let mut out: List[MonoInstance] = []
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(inst) }
+    }
+    out
+}
+
+fn run_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    env.set_var("BLINK_ROOT", env.cwd())
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+}
+
+fn one_instance(gname: Str) -> MonoInstance {
+    let decl = find_decl(NodeKind.FnDef, gname)
+    assert(decl >= 0)
+    let insts = instances_of(decl)
+    assert_eq(insts.len(), 1)
+    insts.get(0).unwrap()
+}
+
+test "the ticket shape: xs.map(f) registers one list_map instance over (Int, Int)" {
+    run_probe("build/mono_hof_map_ticket.bl", #"fn main() {
+    let xs = [1, 2, 3]
+    let m = xs.map(fn(v: Int) -> Int { v * 2 })
+    let _k = m.len()
+}
+"#)
+    let inst = one_instance("list_map")
+    assert_eq(tc_type_str(inst.arg_tids), "(Int, Int)")
+    let calls = method_calls("map")
+    assert_eq(calls.len(), 1)
+    let idx = instance_for_call(-1, calls.get(0).unwrap())
+    assert(idx >= 0)
+    assert_eq(instances().get(idx).unwrap().c_name, inst.c_name)
+}
+
+test "map solves U from the closure's return type, not from T" {
+    run_probe("build/mono_hof_map_to_str.bl", #"fn main() {
+    let xs = [1, 2, 3]
+    let s = xs.map(fn(v: Int) -> Str { "{v}" })
+    let _k = s.len()
+}
+"#)
+    let inst = one_instance("list_map")
+    assert_eq(tc_type_str(inst.arg_tids), "(Int, Str)")
+}
+
+test "filter registers one list_filter instance over the element type" {
+    run_probe("build/mono_hof_filter.bl", #"fn main() {
+    let xs = ["a", "bb"]
+    let f = xs.filter(fn(v: Str) -> Bool { v.len() > 1 })
+    let _k = f.len()
+}
+"#)
+    let inst = one_instance("list_filter")
+    assert_eq(tc_type_str(inst.arg_tids), "(Str)")
+}
+
+test "every method of the sealed list HOF family registers its generic" {
+    run_probe("build/mono_hof_family.bl", #"fn main() {
+    let xs = [1, 2, 3]
+    let _m = xs.map(fn(v: Int) -> Int { v + 1 }).len()
+    let _f = xs.filter(fn(v: Int) -> Bool { v > 1 }).len()
+    let _s = xs.fold(0, fn(a: Int, b: Int) -> Int { a + b })
+    let _a = xs.any(fn(v: Int) -> Bool { v > 2 })
+    let _b = xs.all(fn(v: Int) -> Bool { v > 0 })
+    xs.for_each(fn(v: Int) -> Void { let _ = v })
+}
+"#)
+    assert_eq(tc_type_str(one_instance("list_map").arg_tids), "(Int, Int)")
+    assert_eq(tc_type_str(one_instance("list_filter").arg_tids), "(Int)")
+    assert_eq(tc_type_str(one_instance("list_fold").arg_tids), "(Int, Int)")
+    assert_eq(tc_type_str(one_instance("list_any").arg_tids), "(Int)")
+    assert_eq(tc_type_str(one_instance("list_all").arg_tids), "(Int)")
+    assert_eq(tc_type_str(one_instance("list_for_each").arg_tids), "(Int)")
+}
+
+test "two map calls at the same types share one instance, a third type adds one" {
+    run_probe("build/mono_hof_map_dedup.bl", #"fn main() {
+    let xs = [1, 2, 3]
+    let _a = xs.map(fn(v: Int) -> Int { v + 1 }).len()
+    let _b = xs.map(fn(v: Int) -> Int { v + 2 }).len()
+    let _c = xs.map(fn(v: Int) -> Bool { v > 1 }).len()
+}
+"#)
+    let decl = find_decl(NodeKind.FnDef, "list_map")
+    assert(decl >= 0)
+    let insts = instances_of(decl)
+    assert_eq(insts.len(), 2)
+    let mut names: List[Str] = []
+    for inst in insts { names.push(tc_type_str(inst.arg_tids)) }
+    assert(names.contains("(Int, Int)"))
+    assert(names.contains("(Int, Bool)"))
+}
+
+test "a user method named map on a struct receiver registers no list_map instance" {
+    run_probe("build/mono_hof_map_user_struct.bl", #"type Box { v: Int }
+impl Box {
+    fn map(self, f: fn(Int) -> Int) -> Box { Box { v: f(self.v) } }
+}
+fn main() {
+    let b = Box { v: 1 }
+    let _c = b.map(fn(v: Int) -> Int { v + 1 }).v
+}
+"#)
+    let decl = find_decl(NodeKind.FnDef, "list_map")
+    assert(decl >= 0)
+    assert_eq(instances_of(decl).len(), 0)
+}

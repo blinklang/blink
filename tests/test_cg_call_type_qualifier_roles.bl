@@ -1,0 +1,147 @@
+// What the left of the dot names, when it is a bare name that binds no value.
+//
+// Three readings share that position and only one of them is a receiver. A module name
+// selects another module's function. A type name writes an associated call, which Blink has
+// no inherent methods for (sections/03c_protocols.md:758). A trait name writes the
+// explicit-trait form the resolution table calls "Explicit trait + method" (:773), whose
+// first argument is the receiver.
+//
+// The reading has to be the one typecheck already made, because typecheck stamped the call
+// from it. A narrower reading here leaves the qualifier looking like a value, and a value is
+// asked for its type; a bare type name carries none, so the call is refused for a missing
+// type that was never missing. That is why a type is recognised by the answer typecheck
+// publishes rather than by the declared types alone: a builtin type declares nothing at all,
+// and a trait is registered in neither place.
+
+import lower_test_helpers.{
+    probe, rhs_of, assert_eq_str, assert_shape, assert_verifies, ice_count,
+}
+import ir.{ir_c_name}
+import cg_expr.{lower_expr}
+import std.io
+
+// A builtin type as the qualifier. `Char` declares nothing, so no declared type answers for
+// it, and the conversion it names is written in the prelude as an impl over that same
+// builtin name.
+fn src_builtin_type() -> Str {
+    #"fn main() {
+    let code = 65
+    let ch = Char.try_from(code)
+    let _keep = ch.is_ok()
+}
+"#
+}
+
+// A trait as the qualifier. Two traits declare a method of one name over one type, which is
+// the case this form exists to tell apart: the type name before the dot names both impls and
+// is refused as ambiguous, and the trait name before the dot names exactly one.
+fn src_trait_qualifier() -> Str {
+    #"trait Sizer {
+    fn size(sized: Crate) -> Int
+}
+
+trait Weigher {
+    fn size(weighed: Crate) -> Int
+}
+
+type Crate {
+    v: Int
+}
+
+impl Sizer for Crate {
+    fn size(wide: Crate) -> Int {
+        wide.v
+    }
+}
+
+impl Weigher for Crate {
+    fn size(heavy: Crate) -> Int {
+        heavy.v + 1
+    }
+}
+
+fn main() {
+    let p = Crate { v: 5 }
+    let thin = Sizer.size(p)
+    let dense = Weigher.size(p)
+    let _keep = [thin, dense]
+}
+"#
+}
+
+// A type this module declares under a name a library module also declares. A namesake is
+// resolved against the module doing the reading, and codegen reads it after typecheck has
+// finished, so the row pins which of the two declarations an associated call reaches.
+fn src_namesake() -> Str {
+    #"type Ordering {
+    v: Int
+}
+
+fn Ordering_of(n: Int) -> Ordering {
+    Ordering { v: n }
+}
+
+fn main() {
+    let width = 3
+    let mine = Ordering.of(width)
+    let _keep = mine.v
+}
+"#
+}
+
+// A value bound under the spelling of a type. A binder outranks every other reading of one
+// name, so this is a method call on that value and not an associated call.
+fn src_shadowed_type() -> Str {
+    #"type Crate {
+    v: Int
+}
+
+fn main() {
+    let Crate = "hi"
+    let held = Crate.len()
+    let _keep = held
+}
+"#
+}
+
+test "a builtin type qualifier reaches the conversion impl written over that type" {
+    probe("cg_call_builtin_type_qualifier", src_builtin_type())
+    let built = lower_expr(rhs_of("ch"))
+    assert_shape("shape", built, "CallDirect(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_std_char_Char_try_from_Int")
+    assert_verifies("builtin type qualifier", built)
+}
+
+test "a trait qualifier reaches the impl of that trait over the argument's type" {
+    probe("cg_call_trait_qualifier", src_trait_qualifier())
+    let built = lower_expr(rhs_of("thin"))
+    assert_shape("shape", built, "CallDirect(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_Crate_Sizer_size")
+    assert_verifies("trait qualifier", built)
+}
+
+test "a second trait declaring the same method is told from the first by the qualifier" {
+    probe("cg_call_trait_qualifier_second", src_trait_qualifier())
+    let built = lower_expr(rhs_of("dense"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_Crate_Weigher_size")
+    assert_verifies("trait qualifier second", built)
+}
+
+test "an associated call on a namesake type reads this module's declaration" {
+    probe("cg_call_namesake_qualifier", src_namesake())
+    let built = lower_expr(rhs_of("mine"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_u_Ordering_of")
+    assert_verifies("namesake qualifier", built)
+}
+
+test "a value bound under a type's spelling is a receiver, not a qualifier" {
+    probe("cg_call_shadowed_type_qualifier", src_shadowed_type())
+    let before = ice_count()
+    let built = lower_expr(rhs_of("held"))
+    assert_shape("shape", built, "CallDirect(VarRef)")
+    if ice_count() != before {
+        io.println("FAIL: shadowed type qualifier recorded an internal error")
+        assert(false)
+    }
+    assert_verifies("shadowed type qualifier", built)
+}

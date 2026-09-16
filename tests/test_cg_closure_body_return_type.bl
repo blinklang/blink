@@ -1,0 +1,263 @@
+// What a closure body's `?` returns into. `?` lowers in the expression stage, which reads
+// no function of its own and is told the enclosing return type instead. A function body is
+// told; a closure thunk was not, so every `?` inside a closure literal refused for want of
+// a type the closure had declared all along.
+//
+// The type is read, not re-derived: the queued thunk already holds the closure's Fn tid,
+// and the result is that tid's first child, which is the same child the thunk's C return
+// spelling comes from. The two cannot disagree because there is one producer.
+
+import std.fs
+import std.io
+import layout.{layout_reset}
+import cname.{cname_reset}
+import cg.{CgConfig, generate}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_named, cg_probe_ices_naming}
+import mono.{run_mono}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output must not have '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    let program = cg_probe_compile(path, src)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    program
+}
+
+fn standalone_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+// A closure that declares a Result result and propagates one out of its own body. The
+// enclosing function returns the same shape, so a stage that read the enclosing function
+// instead of the closure would still look right here; the Option probe below is the one
+// that tells the two apart.
+fn result_closure_src() -> Str {
+    #"type Boom {
+    msg: Str
+}
+
+fn inner() -> Result[Int, Boom] {
+    Ok(7)
+}
+
+fn outer() -> Result[Int, Boom] {
+    let run = fn() -> Result[Int, Boom] {
+        let v = inner()?
+        Ok(v)
+    }
+    run()
+}
+
+fn main() {
+    let _ = outer()
+}
+"#
+}
+
+// The closure returns an Option and the function around it returns a Result. Only the
+// closure's own declared result carries a None arm, so a body lowered against the
+// enclosing function's type refuses here instead of propagating.
+fn option_closure_src() -> Str {
+    #"type Boom {
+    msg: Str
+}
+
+fn find() -> Option[Int] {
+    Some(3)
+}
+
+fn outer() -> Result[Int, Boom] {
+    let run = fn() -> Option[Int] {
+        let v = find()?
+        Some(v)
+    }
+    match run() {
+        Some(v) => Ok(v)
+        None => Err(Boom { msg: "none" })
+    }
+}
+
+fn main() {
+    let _ = outer()
+}
+"#
+}
+
+// A closure inside a closure. The inner thunk is queued while the outer thunk's body is
+// lowering, so the type the inner body reads has to be the inner closure's own and not
+// whatever the outer one left behind.
+fn nested_closure_src() -> Str {
+    #"fn find() -> Option[Int] {
+    Some(3)
+}
+
+fn outer() -> Option[Int] {
+    let run = fn() -> Option[Int] {
+        let step = fn() -> Option[Int] {
+            let v = find()?
+            Some(v)
+        }
+        let w = step()?
+        Some(w)
+    }
+    run()
+}
+
+fn main() {
+    let _ = outer()
+}
+"#
+}
+
+// A closure body that propagates nothing. Nothing here needs a return type, so the wiring
+// must leave the ordinary path alone.
+fn plain_closure_src() -> Str {
+    #"fn outer() -> Int {
+    let run = fn() -> Int { 5 }
+    run()
+}
+
+fn main() {
+    let _ = outer()
+}
+"#
+}
+
+// A closure whose result is Void. Its C signature returns nothing, so its tail value is
+// discarded rather than returned: C rejects a value on a return out of a void function.
+// The released compiler writes `(void)<call>;` here.
+fn void_closure_src() -> Str {
+    #"fn twice(x: Int) -> Int {
+    x * 2
+}
+
+fn outer() -> Int {
+    let run = fn(x: Int) -> Void { twice(x) }
+    run(3)
+    9
+}
+
+fn main() {
+    let _ = outer()
+}
+"#
+}
+
+// A closure inside a test body. The test block declares no result, so the closure's own
+// is the only one there is.
+fn closure_in_test_src() -> Str {
+    #"fn find() -> Option[Int] {
+    Some(3)
+}
+
+test "closure propagates on its own account" {
+    let run = fn() -> Option[Int] {
+        let v = find()?
+        Some(v)
+    }
+    match run() {
+        Some(v) => assert_eq(v, 3)
+        None => assert_eq(0, 1)
+    }
+}
+"#
+}
+
+test "a closure body's ? propagates into the closure's own declared result" {
+    let program = build_probe(result_closure_src(), "cg_closure_ret_result")
+    let text = generate(program, standalone_cfg())
+    assert_eq_int("no ? refused for want of a return type",
+        cg_probe_ices_named("TryWithoutReturnType"), 0)
+    assert_eq_int("no stage refuses on the closure's result",
+        cg_probe_ices_named("TryResultInNonResultFn"), 0)
+    assert_eq_int("no closure result went unread",
+        cg_probe_ices_naming("closure result"), 0)
+    // The closure's own Ok arm, returned out of the thunk rather than out of `outer`.
+    assert_has(text, "return")
+}
+
+test "a closure returning Option propagates None, not the enclosing function's error" {
+    let program = build_probe(option_closure_src(), "cg_closure_ret_option")
+    let _ = generate(program, standalone_cfg())
+    assert_eq_int("no ? refused for want of a return type",
+        cg_probe_ices_named("TryWithoutReturnType"), 0)
+    // The enclosing function returns a Result. A body lowered against it would take the
+    // Result arm for an Option operand and refuse there instead.
+    assert_eq_int("the Option arm is taken, not the enclosing Result arm",
+        cg_probe_ices_named("TryResultInNonResultFn"), 0)
+    assert_eq_int("no closure result went unread",
+        cg_probe_ices_naming("closure result"), 0)
+}
+
+test "a closure nested in a closure reads its own result" {
+    let program = build_probe(nested_closure_src(), "cg_closure_ret_nested")
+    let _ = generate(program, standalone_cfg())
+    assert_eq_int("no ? refused for want of a return type",
+        cg_probe_ices_named("TryWithoutReturnType"), 0)
+    assert_eq_int("no stage refuses on a nested closure's result",
+        cg_probe_ices_named("TryResultInNonResultFn"), 0)
+    assert_eq_int("no closure result went unread",
+        cg_probe_ices_naming("closure result"), 0)
+}
+
+test "a closure that propagates nothing is lowered as before" {
+    let program = build_probe(plain_closure_src(), "cg_closure_ret_plain")
+    let text = generate(program, standalone_cfg())
+    assert_eq_int("no ? refused for want of a return type",
+        cg_probe_ices_named("TryWithoutReturnType"), 0)
+    assert_eq_int("no closure result went unread",
+        cg_probe_ices_naming("closure result"), 0)
+    // An Int result still returns its tail; only a void one discards.
+    assert_has(text, "return 5;")
+}
+
+test "a closure in a test body reads its own result, not the body's absence of one" {
+    // The strongest form of "read, not re-derived": the thing the closure sits inside
+    // declares no result at all. A stage that reached outward for a type would find
+    // nothing here and refuse, though the closure named its result on its own line.
+    let program = build_probe(closure_in_test_src(), "cg_closure_ret_in_test")
+    let _ = generate(program, standalone_cfg())
+    assert_eq_int("no ? refused for want of a return type",
+        cg_probe_ices_named("TryWithoutReturnType"), 0)
+    assert_eq_int("the closure's own Option arm is taken",
+        cg_probe_ices_named("TryResultInNonResultFn"), 0)
+    assert_eq_int("no closure result went unread",
+        cg_probe_ices_naming("closure result"), 0)
+}
+
+test "a closure whose result is Void discards its tail instead of returning it" {
+    let program = build_probe(void_closure_src(), "cg_closure_ret_void")
+    let text = generate(program, standalone_cfg())
+    assert_eq_int("no ? refused for want of a return type",
+        cg_probe_ices_named("TryWithoutReturnType"), 0)
+    assert_eq_int("no closure result went unread",
+        cg_probe_ices_naming("closure result"), 0)
+    // The thunk's own line. A value returned out of a void function is a C error, so the
+    // call stands as a statement and the thunk falls off its end.
+    assert_has(text, "blink_u_twice(x);")
+    assert_lacks(text, "return blink_u_twice(x);")
+}

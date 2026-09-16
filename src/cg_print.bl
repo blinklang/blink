@@ -15,11 +15,12 @@
 
 import cg_emit.{
     em_reset, em_reset_temps, em_line, em_temp, em_take, em_indent_push, em_indent_pop, em_directive,
-    em_prologue, em_epilogue, em_fn_decl, em_fn_open, em_fn_close, closure_thunk_params,
+    em_prologue, em_epilogue, em_foreign_decl, em_prologue_declares, em_fn_decl, em_fn_open,
+    em_fn_close, closure_thunk_params,
     em_global_decl, em_td_guard_open, em_td_guard_close, em_struct_typedef_body, em_tuple_typedef_body, em_simple_enum_typedef_body,
     em_tagged_enum_typedef_body, em_tag_macro, em_option_typedef_body, em_result_typedef_body,
     em_effect_vtable_typedef_body, em_effect_default_vtable, em_ev_typedef_body, em_ev_default_fn,
-    em_scope_restore_support, em_main_shim, em_kops_table, em_kops_table_decl,
+    em_scope_restore_support, em_main_shim, em_test_table, em_kops_table, em_kops_table_decl,
     em_resource_guard_support, em_resource_guard_open, em_resource_guard_ok, em_resource_plain,
 }
 import ir.{
@@ -89,6 +90,7 @@ fn expr_text(id: Int) -> Str ! Diag.Report {
         IrKind.FieldGet => "{print_expr(ir_kid(id, 0))}{access(ir_kid(id, 0))}{ir_c_name(id)}"
         IrKind.StructNew => compound_literal(id)
         IrKind.TupleNew => compound_literal(id)
+        IrKind.EnumNew => enum_new_text(id)
         IrKind.ContainerNew => container_new_text(id)
         IrKind.ContainerSpread => misplaced(id, "ContainerNew kid")
         IrKind.Box => box_text(id)
@@ -102,7 +104,8 @@ fn expr_text(id: Int) -> Str ! Diag.Report {
         IrKind.CallVirtual => call_virtual_text(id)
         IrKind.CallRuntime => "{ir_c_name(id)}({args_text(id, 0)})"
         IrKind.ClosureNew => closure_new_text(id)
-        IrKind.EffectPerform => "__ev->{ir_c_name(id)}({args_text(id, 0)})"
+        IrKind.EvidenceVector => ir_c_name(id)
+        IrKind.EffectPerform => call_virtual_text(id)
         IrKind.FieldSet => misplaced(id, "value")
         IrKind.HandlerInstall => misplaced(id, "value")
         IrKind.Let => misplaced(id, "value")
@@ -173,6 +176,14 @@ fn carrier_wrap_text(id: Int) -> Str ! Diag.Report {
     let tag = print_expr(ir_kid(id, 0))
     if ir_kid_count(id) == 1 { return "(({ir_c_spelling(id)})\{.tag = {tag}})" }
     "(({ir_c_spelling(id)})\{.tag = {tag}, .{ir_c_name(id)} = {print_expr(ir_kid(id, 1))}})"
+}
+
+// One arm of a tagged union. The member's struct is anonymous, so its initializer is a
+// braced list under the nested designator, unlike the flat member a CarrierWrap fills.
+fn enum_new_text(id: Int) -> Str ! Diag.Report {
+    let tag = print_expr(ir_kid(id, 0))
+    if ir_kid_count(id) == 1 { return "(({ir_c_spelling(id)})\{.tag = {tag}})" }
+    "(({ir_c_spelling(id)})\{.tag = {tag}, .data.{ir_c_name(id)} = \{{args_text(id, 1)}}})"
 }
 
 // A heap copy needs two statements, so a Box always binds its pointer.
@@ -305,6 +316,7 @@ pub fn print_stmt(id: Int) ! Diag.Report {
         IrKind.FieldGet => stmt_misplaced(id)
         IrKind.StructNew => stmt_misplaced(id)
         IrKind.TupleNew => stmt_misplaced(id)
+        IrKind.EnumNew => stmt_misplaced(id)
         IrKind.ContainerNew => stmt_misplaced(id)
         IrKind.ContainerSpread => stmt_misplaced(id)
         IrKind.Box => stmt_misplaced(id)
@@ -318,6 +330,7 @@ pub fn print_stmt(id: Int) ! Diag.Report {
         IrKind.CallVirtual => stmt_misplaced(id)
         IrKind.CallRuntime => stmt_misplaced(id)
         IrKind.ClosureNew => stmt_misplaced(id)
+        IrKind.EvidenceVector => stmt_misplaced(id)
         IrKind.EffectPerform => stmt_misplaced(id)
     }
 }
@@ -510,6 +523,12 @@ pub fn print_prologue(user_tu: Bool, define_storage: Bool, test_build: Bool, hea
 
 pub fn print_epilogue(header_guard: Str) { em_epilogue(header_guard) }
 
+pub fn print_prologue_declares(symbol: Str) -> Bool { em_prologue_declares(symbol) }
+
+pub fn print_foreign_decl(ret: Str, symbol: Str, params: List[Str]) {
+    em_foreign_decl(ret, symbol, params_or_void(params, false))
+}
+
 // C spells an empty parameter list `(void)`, or the declaration is not a prototype.
 fn params_or_void(params: List[Str], takes_ev: Bool) -> List[Str] {
     if params.len() == 0 && !takes_ev { ["void"] } else { params }
@@ -526,6 +545,13 @@ pub fn print_fn(is_static: Bool, ret: Str, symbol: Str, params: List[Str], takes
     em_fn_open(is_static, ret, symbol, params_or_void(params, takes_ev), takes_ev)
     print_block_body(body)
     em_fn_close()
+}
+
+// A test body takes nothing and answers nothing. The runner's table holds it behind a
+// `void (*)(void)`, and that pointer type is the reason the spelling is fixed here rather
+// than asked of a node: a test block declares no return annotation for layout to read.
+pub fn print_test_fn(symbol: Str, body: Int) ! Diag.Report {
+    print_fn(true, "void", symbol, [], false, body)
 }
 
 pub fn print_closure_thunk_decl(ret: Str, symbol: Str, params: List[Str]) {
@@ -669,4 +695,14 @@ pub fn print_resource_guard_support(exit_symbol: Str, resource_spelling: Str, pa
 
 pub fn print_main_shim(has_main: Bool, has_tests: Bool, uses_async: Bool, user_tu: Bool, trace: Bool, deterministic: Int, init_fns: List[Str]) {
     em_main_shim(has_main, has_tests, uses_async, user_tu, trace, deterministic, init_fns)
+}
+
+// The test table and the runner the shim above calls. Every field arrives as the C token
+// it prints as: the driver quotes the names and the expected-failure reasons first.
+pub fn print_test_table(name_lits: List[Str], symbols: List[Str], tag_lits: List[List[Str]], xfail_lits: List[Str]) ! Diag.Report {
+    let rows = symbols.len()
+    if !same_len("test_names", rows, name_lits.len()) { return }
+    if !same_len("test_tags", rows, tag_lits.len()) { return }
+    if !same_len("test_xfail", rows, xfail_lits.len()) { return }
+    em_test_table(name_lits, symbols, tag_lits, xfail_lits)
 }

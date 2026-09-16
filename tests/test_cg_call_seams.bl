@@ -8,11 +8,10 @@ import lower_test_helpers.{
     assert_verifies, assert_ice,
 }
 import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid}
-import cg_expr.{lower_expr}
 import cg_call.{
     lower_call, lower_operator_method, lower_display_call, lower_spread, lower_element_read,
 }
-import parser.{node_left, node_right, node_obj, node_elements, sublist_get}
+import parser.{node_elements, sublist_get}
 
 fn src_calls() -> Str {
     #"import std.io
@@ -129,17 +128,15 @@ test "a call to an effectful function refuses: no IR argument spells the evidenc
     assert_ice("ev", lower_call(rhs_of("raised")), "EvidenceVectorNotInIr")
 }
 
-test "a call on an imported namespace has no intrinsic lowering yet" {
+test "a call on a namespace takes the intrinsic route, not the receiver route" {
     probe("cg_call_seams", src_calls())
-    assert_ice("namespace", lower_call(rhs_of("printed")), "CodegenStageNotBuilt")
+    assert_ice("namespace", lower_call(rhs_of("printed")), "IntrinsicEffectOpNotInIr")
 }
 
 test "a struct equality desugars to the derived eq method over both operands" {
     probe("cg_call_seams", src_calls())
     let node = rhs_of("same")
-    let lhs = lower_expr(node_left(node))
-    let rhs = lower_expr(node_right(node))
-    let id = lower_operator_method(node, "==", lhs, rhs)
+    let id = lower_operator_method(node, "==")
     assert_kind("kind", id, IrKind.CallDirect)
     assert_eq_str("symbol", ir_c_name(id), "blink_Point_eq")
     assert_shape("shape", id, "CallDirect(VarRef, VarRef)")
@@ -149,9 +146,7 @@ test "a struct equality desugars to the derived eq method over both operands" {
 test "a struct inequality negates the same derived eq method" {
     probe("cg_call_seams", src_calls())
     let node = rhs_of("differs")
-    let lhs = lower_expr(node_left(node))
-    let rhs = lower_expr(node_right(node))
-    let id = lower_operator_method(node, "!=", lhs, rhs)
+    let id = lower_operator_method(node, "!=")
     assert_kind("kind", id, IrKind.Unary)
     assert_eq_str("op", ir_c_name(id), "!")
     assert_shape("shape", id, "Unary(CallDirect(VarRef, VarRef))")
@@ -162,9 +157,7 @@ test "a struct inequality negates the same derived eq method" {
 test "a data enum equality desugars to that enum's own derived eq method" {
     probe("cg_call_seams", src_calls())
     let node = rhs_of("tagged")
-    let lhs = lower_expr(node_left(node))
-    let rhs = lower_expr(node_right(node))
-    let id = lower_operator_method(node, "==", lhs, rhs)
+    let id = lower_operator_method(node, "==")
     assert_eq_str("symbol", ir_c_name(id), "blink_Tagged_eq")
     assert_verifies("verify", id)
 }
@@ -172,16 +165,13 @@ test "a data enum equality desugars to that enum's own derived eq method" {
 test "an ordering operator on a struct operand has no lowering yet" {
     probe("cg_call_seams", src_calls())
     let node = rhs_of("same")
-    let lhs = lower_expr(node_left(node))
-    let rhs = lower_expr(node_right(node))
-    assert_ice("ord", lower_operator_method(node, "<", lhs, rhs), "OrderingMethodNotLowered")
+    assert_ice("ord", lower_operator_method(node, "<"), "OrderingMethodNotLowered")
 }
 
 test "an interpolation hole calls the sealed display dispatcher of its own impl" {
     probe("cg_call_display", src_display())
     let part = ident_node_of("shown_once")
-    let value = lower_expr(part)
-    let id = lower_display_call(part, value)
+    let id = lower_display_call(part)
     assert_kind("kind", id, IrKind.CallDirect)
     assert_eq_str("symbol", ir_c_name(id), "blink_Wrapped_Display_display")
     assert_eq_str("type", ir_c_spelling(id), "const char*")
@@ -195,22 +185,18 @@ test "a spread element has no container copy yet" {
     assert_ice("spread", lower_spread(element, -1), "SpreadCopyNotLowered")
 }
 
-test "an element read of the element type is one cast of the runtime slot" {
+test "an element read of the element type casts the slot back through the word it rode" {
     probe("cg_call_seams", src_calls())
-    let obj = lower_expr(ident_node_of("nums"))
-    let index = lower_expr(ident_node_of("at"))
-    let id = lower_element_read(rhs_of("elem"), obj, index)
-    assert_shape("shape", id, "Cast(CallRuntime(VarRef, VarRef))")
-    assert_eq_str("symbol", ir_c_name(ir_kid(id, 0)), "blink_list_get")
+    let id = lower_element_read(rhs_of("elem"))
+    assert_shape("shape", id, "Cast(Cast(CallRuntime(VarRef, VarRef)))")
+    assert_eq_str("symbol", ir_c_name(ir_kid(ir_kid(id, 0), 0)), "blink_list_get")
     assert_eq_str("type", ir_c_spelling(id), "int64_t")
     assert_verifies("verify", id)
 }
 
 test "an element read answering Option needs statements this stage cannot hoist" {
     probe("cg_call_seams", src_calls())
-    let obj = lower_expr(ident_node_of("nums"))
-    let index = lower_expr(ident_node_of("at"))
-    assert_ice("checked", lower_element_read(rhs_of("maybe"), obj, index),
+    assert_ice("checked", lower_element_read(rhs_of("maybe")),
         "CheckedElementReadNotLowered")
 }
 
@@ -224,7 +210,7 @@ test "an impl of a trait with type arguments is not a generic template" {
 
 test "a call on a builtin namespace needs no import to reach the intrinsic stage" {
     probe("cg_call_display", src_display())
-    assert_ice("builtin", lower_call(rhs_of("shouted")), "CodegenStageNotBuilt")
+    assert_ice("builtin", lower_call(rhs_of("shouted")), "IntrinsicEffectOpNotInIr")
 }
 
 test "a call of a closure value is a call form this stage has not built" {
@@ -232,7 +218,10 @@ test "a call of a closure value is a call form this stage has not built" {
     assert_ice("closure", lower_call(rhs_of("called")), "CodegenStageNotBuilt")
 }
 
-test "a call on a type's own name is a call form this stage has not built" {
+test "a call on a type's own name takes the static route, not the receiver route" {
     probe("cg_call_seams", src_calls())
-    assert_ice("static", lower_call(rhs_of("built")), "CodegenStageNotBuilt")
+    let id = lower_call(rhs_of("built"))
+    assert_kind("static kind", id, IrKind.CallRuntime)
+    assert_eq_str("static symbol", ir_c_name(id), "blink_sb_new")
+    assert_verifies("static", id)
 }

@@ -12,22 +12,26 @@
 // members reach by value.
 
 import diagnostics.{
-    Diag, diag_ice, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
-    UNSOLVED_TYPEVAR_AT_CODEGEN,
+    Diag, diag_ice, diag_ice_at, diag_is_ice_seg,
+    CODEGEN_STAGE_NOT_BUILT, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 import layout.{
-    LayoutRecord, Position, layout_of, field_layout_of, ensure_typedef_for,
+    LayoutRecord, Position, SlotForm, layout_of, field_layout_of, ensure_typedef_for,
     layout_take_typedefs, tid_of_node,
 }
 import cname.{
-    c_ev_field_name, c_ev_type_name, c_ffi_symbol, c_field_name, c_fn_decl_name,
+    c_effect_default_op_name, c_ev_field_name, c_ev_type_name, c_ffi_struct_ptr_name,
+    c_ffi_symbol, c_field_name,
+    c_fn_decl_name, cname_ffi_struct_mirror,
     c_global_name, c_vtable_type_name,
     c_impl_method_name, c_local_name, c_type_decl_name, c_variant_ordinal,
     c_variant_tag_macro,
     cname_is_runtime_owned, td_guard_name,
 }
 import cg_print.{
-    print_ev, print_epilogue, print_fn, print_fn_decl, print_global_decl, print_prologue,
+    print_effect_default_vtable, print_effect_vtable_typedef,
+    print_ev, print_epilogue, print_fn, print_fn_decl, print_foreign_decl, print_global_decl,
+    print_prologue, print_prologue_declares,
     print_simple_enum_typedef, print_struct_typedef, print_tagged_enum_typedef,
     print_typedef_blocks,
 }
@@ -35,23 +39,31 @@ import cg_reg.{
     cg_reg_effect_decls, cg_reg_entry_point, cg_reg_fn_decls, cg_reg_global_decls,
     cg_reg_impl_methods, cg_reg_impl_of, cg_reg_tid_for_decl, cg_reg_type_decls,
 }
+import ir.{ir_block, ir_call_direct, ir_cast, ir_const, ir_expr_stmt, ir_return, ir_var_ref}
 import mono.{is_poly_impl, poly_impl_is_element_agnostic}
 import typecheck.{
     TyKind, tc_enum_variant_slots, tc_evar_field_slots, tc_evar_name, tc_evfield_name,
     tc_evfield_tid, tc_resolve, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
     make_handler_type, tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind,
-    tc_type_str, tc_void_tid,
+    tc_type_str, tc_void_tid, DECL_NODE_AMBIGUOUS,
 }
 import parser.{
-    get_annotation, node_effects, node_fields, node_impl_binders, node_name, node_params,
-    node_type_ann, node_type_params, node_value, sublist_get, sublist_length,
+    get_annotation, node_effects, node_elements, node_fields, node_impl_binders, node_methods,
+    node_name, node_params, node_type_ann, node_type_params, node_value, sublist_get,
+    sublist_length,
 }
 
 // 1 while a declaration's dependencies are being emitted, 2 once its typedef is written.
 let mut decl_state: Map[Int, Int] = Map()
 
+// The prototype this unit wrote for each foreign symbol, as its return and parameter
+// spellings. C takes one declaration per symbol, so two bindings over one symbol either
+// ask for the same prototype or one of them is wrong.
+let mut foreign_decls: Map[Str, Str] = Map()
+
 pub fn cg_decl_reset() {
     decl_state = Map()
+    foreign_decls = Map()
 }
 
 // ── The spelling gate ─────────────────────────────────────────────────────
@@ -255,9 +267,14 @@ pub fn cg_decl_takes_ev(fn_node: Int) -> Bool {
 
 // A function with no return annotation returns the void type, which the reading layer
 // already spells for the return position; naming that spelling here would be a twin.
-fn fn_ret_spelling(fn_node: Int) -> Str ! Diag.Report {
+fn fn_ret_tid(fn_node: Int) -> Int ! Diag.Report {
     let ann = node_type_ann(fn_node)
-    let tid = if ann == -1 { tc_void_tid() } else { tid_of_node(ann) }
+    if ann == -1 { return tc_void_tid() }
+    tid_of_node(ann)
+}
+
+fn fn_ret_spelling(fn_node: Int) -> Str ! Diag.Report {
+    let tid = fn_ret_tid(fn_node)
     flush_member_typedefs(tid)
     cg_decl_require_spelling(tid, Position.Return)
 }
@@ -288,11 +305,17 @@ fn needs_no_wrapper(fn_node: Int, decl_name: Str) -> Bool {
     symbol != "" && symbol == decl_name
 }
 
-// The C name a declaration is both declared and defined under. A method carries its
-// receiver type and trait, a free function its module; which of the two a node is comes
-// from the registry, so the rule is settled here once and every signature this module
-// writes reads it from the same place.
-fn decl_c_name(decl: Int) -> Str {
+// The C name a declaration carries. A method takes its receiver type and its trait, a
+// free function its module. Which of the two applies comes from the registry, so it is
+// a property of where the declaration was written and not of the call that reaches it.
+// A static call of an impl method is spelled like a free call, so a reader that decided
+// from the call site would have to be right about every call shape.
+//
+// Pub so a stage outside this module asks instead of deciding. Whoever writes a prototype
+// and whoever writes the call to it must answer this the same way, and two readers that
+// decide it apart agree until the rule changes under one of them. C reports the result as
+// an undefined symbol, with no Blink span on it.
+pub fn cg_decl_c_name(decl: Int) -> Str {
     let im = cg_reg_impl_of(decl)
     if im >= 0 { return c_impl_method_name(im, node_name(decl)) }
     c_fn_decl_name(decl)
@@ -303,7 +326,7 @@ fn decl_c_name(decl: Int) -> Str {
 // before the declaration that reads it, so the spellings are taken first.
 pub fn cg_decl_emit_fn_decl(fn_node: Int, is_static: Bool) ! Diag.Report {
     if !site_is_declared(cg_decl_body_site(fn_node)) { return }
-    cg_decl_emit_signature_decl(fn_node, decl_c_name(fn_node), is_static)
+    cg_decl_emit_signature_decl(fn_node, cg_decl_c_name(fn_node), is_static)
 }
 
 // A signature under a name the caller chose. The spellings come from the declaration's
@@ -344,7 +367,7 @@ fn impl_is_generic(im: Int) -> Bool {
 pub fn cg_decl_emit_impl_method_decl(method: Int, is_static: Bool) ! Diag.Report {
     if cg_reg_impl_of(method) < 0 { return }
     if !site_is_declared(cg_decl_body_site(method)) { return }
-    cg_decl_emit_signature_decl(method, decl_c_name(method), is_static)
+    cg_decl_emit_signature_decl(method, cg_decl_c_name(method), is_static)
 }
 
 pub fn cg_decl_emit_impl_method_decls() ! Diag.Report {
@@ -434,7 +457,7 @@ fn receiver_is_generic_user_type(im: Int) -> Bool {
 }
 
 fn foreign_body_site(decl: Int) -> BodySite {
-    if needs_no_wrapper(decl, decl_c_name(decl)) { return BodySite.Nothing }
+    if needs_no_wrapper(decl, cg_decl_c_name(decl)) { return BodySite.Nothing }
     BodySite.ForeignWrapper
 }
 
@@ -451,7 +474,161 @@ fn site_is_declared(site: BodySite) -> Bool {
 }
 
 pub fn cg_decl_emit_fn_def(fn_node: Int, is_static: Bool, body: Int) ! Diag.Report {
-    cg_decl_emit_signature_def(fn_node, decl_c_name(fn_node), is_static, body)
+    cg_decl_emit_signature_def(fn_node, cg_decl_c_name(fn_node), is_static, body)
+}
+
+// ── Foreign wrappers ───────────────────────────────────────────────────
+//
+// A binding declares a Blink signature over a C symbol and has no Blink body, so the body
+// this stage writes is the whole conversion: the wrapper's own parameters, handed to the
+// foreign symbol in the shape C reads them, and the answer handed straight back. The
+// signature is the developer's claim about what the foreign function expects, so an
+// argument crosses unchanged unless C would read it as a different type.
+//
+// Which declaration the call is checked against decides the rest. A symbol the prologue
+// already declares is checked against the real header, so an @ffi.struct mirror has to be
+// cast to the C struct that header names. A symbol nothing declares is checked against the
+// prototype written here from the Blink signature, so the same argument crosses under the
+// mirror's own spelling and needs no cast.
+pub fn cg_decl_emit_foreign_wrapper(fn_node: Int) ! Diag.Report {
+    let symbol = c_ffi_symbol(fn_node)
+    let declared = print_prologue_declares(symbol)
+    if declared && !foreign_shapes_convertible(fn_node) { return }
+    let ret = fn_ret_spelling(fn_node)
+    let params = fn_param_decls(fn_node)
+    if !declared && !write_foreign_decl(fn_node, ret, symbol, params) { return }
+    let args = foreign_call_args(fn_node, declared)
+    print_fn(false, ret, cg_decl_c_name(fn_node), params, cg_decl_takes_ev(fn_node),
+        foreign_call_block(fn_node, symbol, ret, args))
+}
+
+// Whether the unit's prototype for `symbol` is the one this binding needs, writing it when
+// the unit has none yet. A second binding that asks for a different one is refused: C
+// rejects the pair, and picking either prototype makes one of the two wrappers call the
+// foreign function under a signature its own source never wrote.
+fn write_foreign_decl(site: Int, ret: Str, symbol: Str, params: List[Str]) -> Bool ! Diag.Report {
+    let shape = ret.concat("(").concat(params.join(", ")).concat(")")
+    if foreign_decls.contains_key(symbol) == 0 {
+        foreign_decls.insert(symbol, shape)
+        print_foreign_decl(ret, symbol, params)
+        return true
+    }
+    if foreign_decls.get(symbol).unwrap() == shape { return true }
+    diag_ice_at("ForeignSymbolTwoPrototypes", CODEGEN_STAGE_NOT_BUILT,
+        "two bindings over the foreign symbol '{symbol}' ask for different prototypes",
+        site, "C takes one declaration per symbol: give the two bindings one signature")
+    false
+}
+
+// A value-returning wrapper that drops the call's answer falls off the end of a function
+// whose signature promises one, so the return type decides the statement, not the call. The
+// test is the one layout uses to spell a return `void`, or the two could disagree.
+fn foreign_call_block(fn_node: Int, symbol: Str, ret: Str, args: List[Int]) -> Int ! Diag.Report {
+    let tid = fn_ret_tid(fn_node)
+    let k = tc_tid_kind(tc_resolve(tid))
+    let drops = k == TyKind.Void || k == TyKind.Never
+    let call = ir_call_direct(tid, fn_node, ret, symbol, SlotForm.Inline, args)
+    let stmt = if drops { ir_expr_stmt(fn_node, call) } else { ir_return(fn_node, call) }
+    ir_block(fn_node, [stmt])
+}
+
+fn foreign_call_args(fn_node: Int, declared: Bool) -> List[Int] ! Diag.Report {
+    let mut out: List[Int] = []
+    let sl = node_params(fn_node)
+    if sl == -1 { return out }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        let p = sublist_get(sl, i)
+        let tid = tid_of_node(p)
+        let rec = layout_of(tid, Position.Param)
+        let arg = ir_var_ref(tid, p, spelling_or_ice(rec, tc_type_str(tid)),
+            c_local_name(node_name(p)), rec.slot_form)
+        let cast_to = if declared { foreign_cast_name(tid) } else { "" }
+        out.push(if cast_to != "" { ir_cast(tid, p, cast_to, arg) } else { arg })
+        i = i + 1
+    }
+    out
+}
+
+// What a type reaches on its way across: the @ffi.struct mirror behind its pointers, and
+// how many Ptr levels stand in front of it. C casts one level, so those two facts together
+// decide between a cast, a plain argument and a refusal. `decl` is -1 when the type reaches
+// no mirror at all.
+type Crossing {
+    decl: Int
+    ptr_depth: Int
+}
+
+fn crossing_of(tid: Int) -> Crossing {
+    let mut t = tc_resolve(tid)
+    let mut depth = 0
+    while tc_tid_kind(t) == TyKind.Ptr && tc_tid_child_count(t) > 0 {
+        t = tc_resolve(tc_tid_child(t, 0))
+        depth = depth + 1
+    }
+    let decl = tc_tid_decl_node(t)
+    if decl == DECL_NODE_AMBIGUOUS { return Crossing { decl: decl, ptr_depth: depth } }
+    if cname_ffi_struct_mirror(decl) { return Crossing { decl: decl, ptr_depth: depth } }
+    Crossing { decl: -1, ptr_depth: depth }
+}
+
+// The C struct an argument must be cast to, or "" when it crosses as the wrapper spells it.
+fn foreign_cast_name(tid: Int) -> Str {
+    let cross = crossing_of(tid)
+    if cross.decl < 0 || cross.ptr_depth != 1 { return "" }
+    c_ffi_struct_ptr_name(cross.decl)
+}
+
+// Every position whose C shape this stage can write when the call is checked against the
+// real header. Each position refuses on its own, so one wrapper can name more than one
+// shape it has no conversion for.
+fn foreign_shapes_convertible(fn_node: Int) -> Bool ! Diag.Report {
+    let mut ok = true
+    let sl = node_params(fn_node)
+    let n = if sl == -1 { 0 } else { sublist_length(sl) }
+    let mut i = 0
+    while i < n {
+        let p = sublist_get(sl, i)
+        if !shape_convertible(tid_of_node(p), p, false) { ok = false }
+        i = i + 1
+    }
+    if !shape_convertible(fn_ret_tid(fn_node), fn_node, true) { ok = false }
+    ok
+}
+
+// A mirror crossing by value has no conversion: C forbids a cast between two struct types,
+// so the wrapper would hand the foreign function the wrong type under a name that compiles.
+// A cast reaches one pointer level, and a mirror that names no C struct cannot be spelled as
+// the original at all. An answer is stricter: it arrives under the foreign spelling and this
+// stage writes no conversion on the way out, so any mirror in the return is refused.
+fn shape_convertible(tid: Int, site: Int, is_return: Bool) -> Bool ! Diag.Report {
+    let cross = crossing_of(tid)
+    if cross.decl == DECL_NODE_AMBIGUOUS {
+        return refuse_foreign_shape(site, is_return, "a type whose name two modules declare")
+    }
+    if cross.decl < 0 { return true }
+    let what = "the @ffi.struct type {node_name(cross.decl)}"
+    if cross.ptr_depth == 0 { return refuse_foreign_shape(site, is_return, "a value of {what}") }
+    if cross.ptr_depth > 1 {
+        return refuse_foreign_shape(site, is_return, "a pointer to a pointer to {what}")
+    }
+    if is_return { return refuse_foreign_shape(site, is_return, "a pointer to {what}") }
+    if c_ffi_struct_ptr_name(cross.decl) != "" { return true }
+    refuse_foreign_shape(site, is_return,
+        "a pointer to {what}, which names no C struct")
+}
+
+fn refuse_foreign_shape(site: Int, is_return: Bool, what: Str) -> Bool ! Diag.Report {
+    let position = if is_return { "returns" } else { "takes" }
+    let fix = if is_return {
+        "return an Int or a Ptr to a type no foreign header declares, and read the struct through a second binding"
+    } else {
+        "pass the type through a single Ptr and give its @ffi.struct annotation a name"
+    }
+    diag_ice_at("ForeignShapeNotConvertible", CODEGEN_STAGE_NOT_BUILT,
+        "cg foreign wrapper bodies cannot convert {what}, which this binding {position}, for a foreign function the prologue already declares",
+        site, fix)
+    false
 }
 
 // ── Globals ──────────────────────────────────────────────────────────────────
@@ -485,10 +662,9 @@ pub fn cg_decl_emit_epilogue(header_guard: Str) {
 // order is the printer's, and it is what lets the stdlib archive be compiled against a
 // vector that stops at the builtins and still read the same field at the same offset.
 //
-// The vtable type that slot points at, and the default instance the default vector takes
-// its address of, are still to come, along with a default body per operation. The slot is
-// emitted anyway: a vector that dropped the field would put every later field at the
-// wrong offset, which miscompiles silently, where a missing vtable is named here.
+// The vtable each slot points at is written first, because the vector names it by value and
+// C must have read the typedef by then. A vector that dropped a field would put every later
+// field at a different offset, which the archive reads as the field it expected.
 pub fn cg_decl_emit_ev(ev_storage: Str) ! Diag.Report {
     let effects = cg_reg_effect_decls()
     let mut vtables: List[Str] = []
@@ -503,11 +679,129 @@ pub fn cg_decl_emit_ev(ev_storage: Str) ! Diag.Report {
                 "every declared effect must name a slot of the evidence vector; this is a compiler bug")
             return
         }
+        if emit_effect_vtable(e, slot_tid, vtable) == 0 { return }
         vtables.push(vtable)
         fields.push(field)
     }
     print_ev(td_guard_name(c_ev_type_name()), vtables, fields, ev_storage)
-    if effects.len() > 0 {
-        diag_ice_stage_not_built("cg_decl user effect vtables", effects.get(0).unwrap())
+}
+
+// The operations a root effect owns, in the order the sub-effects and their operations are
+// written. That order is the vtable's layout: a perform site reads a slot by name, but a
+// handler install copies the whole struct, so every unit that spells this vtable has to walk
+// the declaration the same way.
+fn effect_ops(effect_decl: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    let children = node_elements(effect_decl)
+    if children == -1 { return out }
+    let mut ci = 0
+    while ci < sublist_length(children) {
+        let ops = node_methods(sublist_get(children, ci))
+        if ops != -1 {
+            let mut oi = 0
+            while oi < sublist_length(ops) {
+                out.push(sublist_get(ops, oi))
+                oi = oi + 1
+            }
+        }
+        ci = ci + 1
     }
+    out
+}
+
+// One root effect's vtable struct, a default body per operation, and the default instance the
+// evidence vector takes the address of.
+//
+// The whole root is one struct, because a handler for one sub-effect copies the instance and
+// overwrites only the slots it names; a struct sized to that sub-effect would drop the rest.
+// Each operation also owns a capture word, so an operation the inner handler left alone reads
+// the captures of the handler that did define it.
+//
+// Every name and every signature is read before anything is written. Two reasons: reading a
+// signature can write a member typedef, and a typedef opened inside the struct would nest one
+// declaration in another; and a name this stage cannot spell must stop it before the typedef
+// lands, or the unit carries a vtable type whose instance nothing defines.
+//
+// Answers 0 when it wrote nothing, so the caller leaves the effect out of the vector rather
+// than pointing a field at an instance that is not there.
+fn emit_effect_vtable(effect_decl: Int, slot_tid: Int, vtable: Str) -> Int ! Diag.Report {
+    let ops = effect_ops(effect_decl)
+    let mut slots: List[Str] = []
+    let mut rets: List[Str] = []
+    let mut params: List[List[Str]] = []
+    let mut defaults: List[Str] = []
+    for op in ops {
+        // The slot is a struct member, so it takes the member-name producer. The perform site
+        // reads the slot by name and must ask the same producer, or an operation whose name C
+        // owns is written one way here and read another way there.
+        let slot = c_field_name(node_name(op))
+        // The sub-effects share the one struct, so two operations of one name would be two
+        // members of that name and two definitions of one static. C rejects both with no span
+        // that points back at the declaration, so the stop is reported here with one.
+        if slots.contains(slot) {
+            diag_ice_at("EffectOperationNameRepeated", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "effect '{node_name(effect_decl)}' declares operation '{node_name(op)}' more than once", op,
+                "the operations under one root effect share a vtable, so their names must differ; the declaration should have been rejected before codegen")
+            return 0
+        }
+        let symbol = c_effect_default_op_name(slot_tid, node_name(op))
+        if diag_is_ice_seg(symbol) {
+            diag_ice_at("EffectDefaultBodyNotNameable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "no default body name for operation '{node_name(op)}' of effect '{node_name(effect_decl)}'", op,
+                "a declared effect that is not builtin names a default body per operation; this is a compiler bug")
+            return 0
+        }
+        slots.push(slot)
+        rets.push(op_ret_spelling(op))
+        params.push(fn_param_decls(op))
+        defaults.push(symbol)
+    }
+    print_effect_vtable_typedef(td_guard_name(vtable), vtable, slots, rets, params)
+    let mut i = 0
+    while i < ops.len() {
+        print_fn(true, rets.get(i).unwrap(), defaults.get(i).unwrap(), params.get(i).unwrap(), false,
+            default_op_body(ops.get(i).unwrap(), rets.get(i).unwrap()))
+        i = i + 1
+    }
+    print_effect_default_vtable(vtable, defaults)
+    1
+}
+
+// The C type a vtable slot answers with. It is a return position, so it takes the slot
+// position rather than the plain return one: every handler of one effect is assigned into the
+// same slot, and the erasure that gives them one signature is attached to that position.
+fn op_ret_spelling(op: Int) -> Str ! Diag.Report {
+    let tid = fn_ret_tid(op)
+    flush_member_typedefs(tid)
+    cg_decl_require_spelling(tid, Position.VtableSlot)
+}
+
+// What an operation gives back when the program installs no handler for its effect.
+//
+// The value has to be one the caller can act on with no further knowledge, so it is the empty
+// or failed value of the operation's own return type, never memory nobody wrote.
+//
+// A Result answers its error side. Zeroing the carrier would set tag 0, which is Ok, and hand
+// the caller a success holding a payload the program never produced.
+//
+// A list answers an empty list. The handle is a pointer the caller reads through at once, and
+// a zero of it is the address the first read would take.
+//
+// Everything else answers a zero of its own type, written as a compound literal so a number, a
+// pointer, a carrier and a by-value struct all take the one rule. An Option zeroes to tag 0,
+// which is None, so it needs no arm of its own.
+//
+// An operation that returns nothing has nothing to give back. The test is the one the foreign
+// wrapper uses to decide the same thing, or the two could disagree on what `void` covers.
+fn default_op_body(op: Int, ret: Str) -> Int ! Diag.Report {
+    let tid = fn_ret_tid(op)
+    let k = tc_tid_kind(tc_resolve(tid))
+    if k == TyKind.Void || k == TyKind.Never { return ir_block(op, []) }
+    if k == TyKind.Result {
+        return ir_block(op, [ir_return(op, ir_const(tid, op, ret, "({ret})\{ .tag = 1 }"))])
+    }
+    if k == TyKind.List {
+        return ir_block(op, [ir_return(op, ir_const(tid, op, ret, "blink_list_new()"))])
+    }
+    ir_block(op, [ir_return(op, ir_const(tid, op, ret, "({ret})\{0}"))])
 }

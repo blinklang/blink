@@ -39,6 +39,12 @@ pub type Slot { Inner1, Inner2, Param(Int), Elem(Int) }
 // A record answers a tid in a position. Whether a variant field is boxed because it
 // reaches its own enum is a relation between the owner and the field, so it is not
 // a record field; field_layout_of answers it.
+// slot_word is set at Position.ContainerSlot only: the pointer-wide integer an integer
+// word rides through to enter and leave a void* element slot (a list element, a map or
+// channel value): "(void*)(slot_word)x" in, "(c_spelling)(slot_word)slot" out. It is
+// empty when the element is a pointer already, boxed or not, because (void*)x is then
+// the whole conversion. A map or set KEY is not a void* slot: the runtime copies it by
+// address, so kops_inline_key governs it, not slot_word.
 pub type LayoutRecord {
     c_spelling: Str
     slot_form: SlotForm
@@ -46,6 +52,7 @@ pub type LayoutRecord {
     is_transparent: Int
     kops_table: Str
     kops_inline_key: Bool
+    slot_word: Str
     decline_reason: Str
 }
 
@@ -205,7 +212,7 @@ pub fn field_layout_of(owner_decl: Int, field_tid: Int) -> LayoutRecord {
     if selfrec == 0 { return layout_of(field_tid, Position.Field) }
     LayoutRecord {
         c_spelling: "int64_t", slot_form: SlotForm.PointerBoxed, carrier_tag: "",
-        is_transparent: 0, kops_table: "", kops_inline_key: false, decline_reason: "",
+        is_transparent: 0, kops_table: "", kops_inline_key: false, slot_word: "", decline_reason: "",
     }
 }
 
@@ -270,6 +277,7 @@ fn lo_member_record(r: Int, ir: Int, slot: Slot, spelling: Str) -> LayoutRecord 
         is_transparent: if lo_is_transparent_newtype(ir) { 1 } else { 0 },
         kops_table: table,
         kops_inline_key: lo_kops_inline_key(ir, table),
+        slot_word: "",
         decline_reason: "",
     }
 }
@@ -417,7 +425,7 @@ fn lo_position_index(position: Position) -> Int {
 fn lo_declined(reason: Str) -> LayoutRecord {
     LayoutRecord {
         c_spelling: "", slot_form: SlotForm.InlineWord, carrier_tag: "",
-        is_transparent: 0, kops_table: "", kops_inline_key: false, decline_reason: reason,
+        is_transparent: 0, kops_table: "", kops_inline_key: false, slot_word: "", decline_reason: reason,
     }
 }
 
@@ -431,7 +439,10 @@ fn lo_compute_layout(tid: Int, position: Position) -> LayoutRecord {
     let mut spelling = lo_spell(r)
     if diag_is_ice_seg(spelling) { return lo_declined("cname refused the name: {spelling}") }
     let mut form = if word { SlotForm.InlineWord } else { SlotForm.Inline }
-    if position == Position.Return && lo_is_void_like(k) {
+    // A vtable slot holds an operation's answer, so it takes void for an operation that answers
+    // nothing, the same as a plain return. The storage placeholder would give the slot a return
+    // type that a handler function answering nothing cannot be assigned to.
+    if lo_is_void_like(k) && (position == Position.Return || position == Position.VtableSlot) {
         spelling = "void"
         form = SlotForm.Inline
     } else if position == Position.ContainerSlot && (!word || k == TyKind.Float) {
@@ -445,13 +456,45 @@ fn lo_compute_layout(tid: Int, position: Position) -> LayoutRecord {
         spelling = "blink_Option_ptr"
     }
     let table = lo_kops_of(r)
+    let slot_word = if position == Position.ContainerSlot && form == SlotForm.InlineWord { lo_slot_word(r, k) } else { "" }
     LayoutRecord {
         c_spelling: spelling, slot_form: form, carrier_tag: lo_tag_of(r),
         is_transparent: transparent, kops_table: table,
         kops_inline_key: lo_kops_inline_key(r, table),
+        slot_word: slot_word,
         decline_reason: "",
     }
 }
+
+// The integer a word element is punned through into the void* slot. A pointer word needs
+// none. U64 takes the unsigned bridge so a value above INT64_MAX survives the round trip.
+// Struct and Enum here are the word-sized nominals: an opaque handle is a pointer, a
+// transparent newtype or an ordinal enum is an integer.
+fn lo_slot_word(r: Int, k: TyKind) -> Str {
+    if k == TyKind.Struct || k == TyKind.Enum {
+        if lo_is_transparent_newtype(r) { return "intptr_t" }
+        return if lo_is_opaque(r) { "" } else { "intptr_t" }
+    }
+    match k {
+        TyKind.Int => "intptr_t"
+        TyKind.Bool => "intptr_t"
+        TyKind.Char => "intptr_t"
+        TyKind.I8 => "intptr_t"
+        TyKind.I16 => "intptr_t"
+        TyKind.I32 => "intptr_t"
+        TyKind.U8 => "intptr_t"
+        TyKind.U16 => "intptr_t"
+        TyKind.U32 => "intptr_t"
+        TyKind.U64 => "uintptr_t"
+        TyKind.Void => "intptr_t"
+        TyKind.Never => "intptr_t"
+        _ => ""
+    }
+}
+
+// Every container slot is one pointer-wide cell, so this is one spelling, not a question
+// about a tid: the slot word says how a value travels through the cell, this says what it is.
+pub fn container_slot_spelling() -> Str { "void*" }
 
 // Does a field of this type embed its owner by value? 1 when the field is the owner
 // itself (bare or any instance of it) or a tuple that reaches the owner at any depth;

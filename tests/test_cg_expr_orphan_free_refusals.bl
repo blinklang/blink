@@ -1,0 +1,207 @@
+// A refusal in this stage must leave behind neither a built node nor a hoisted statement.
+//
+// The two cost different things. The printer reaches a node only by following the kids of a
+// root it is given, so a node with no parent is dead weight in the arena and is never
+// printed; the count is pinned because it is the cheapest proof that the seam resolved
+// before it lowered, which is the rule these seams follow. A hoisted statement is the one
+// that reaches emitted C: the pending buffer is spliced into the enclosing block whole, so a
+// statement left in it runs for an expression nothing lowered.
+//
+// Each test pins a count as well as the refusal, because a refusal that reports correctly
+// and still leaves something behind is identical from the answer alone.
+
+import lower_test_helpers.{probe, probe_but, rhs_of, assert_ice_saying, assert_eq_str}
+import ir.{ir_node_count}
+import cg_expr.{lower_expr, cg_expr_pending_count}
+
+// An ordering operator over a struct. `@derive(Ord)` is what makes this a program:
+// typecheck accepts `<` on the pair, and the operator seam then has no ordering lowering
+// to give. Both operands are in reach at that point, which is what makes the count a test.
+fn src_ordering() -> Str {
+    #"@derive(Ord)
+type Point { x: Int, y: Int }
+
+fn main() {
+    let one = Point { x: 1, y: 2 }
+    let two = Point { x: 1, y: 3 }
+    let ranked = one < two
+    let _keep = [ranked]
+}
+"#
+}
+
+// Two impls of one trait for one type. The overlap rule that would reject this pair is not
+// enforced, so the hole passes its Display gate and the call seam is the first stage to see
+// that the impl is unresolvable. That overlap is the only way in: a hole whose type has no
+// impl at all is rejected by typecheck before codegen runs.
+fn src_ambiguous_display() -> Str {
+    #"type Wrapped { n: Int }
+
+impl Display for Wrapped {
+    fn fmt(self, sb: StringBuilder) { sb.write("a") }
+}
+
+impl Display for Wrapped {
+    fn fmt(_self, sb2: StringBuilder) { sb2.write("b") }
+}
+
+fn main() {
+    let w = Wrapped { n: 1 }
+    let text = "{w}"
+    let _keep = [text]
+}
+"#
+}
+
+// A struct that carries no equality at all. The equality operator resolves further than the
+// ordering one does: it reaches the operand declaration and asks for a symbol, and refuses
+// only when the declaration has neither a derive nor an impl. That later refusal point is a
+// separate count, because it is the one the operands sit closest to.
+fn src_no_equality() -> Str {
+    #"type Plain { x: Int }
+
+fn main() {
+    let p1 = Plain { x: 1 }
+    let p2 = Plain { x: 2 }
+    let asked = p1 == p2
+    let _keep = [asked]
+}
+"#
+}
+
+// One string with a Bool hole in front of a hole that refuses. A Bool hole has no printf
+// conversion, so it becomes a Str temp that an `if` fills, and that `if` goes to the pending
+// buffer. The second hole then refuses and the whole call answers nothing. The buffer is
+// spliced into the enclosing block, so a statement left in it is emitted C for an
+// expression nothing lowered.
+fn src_hoisting_hole_before_refusal() -> Str {
+    #"type Wrapped { n: Int }
+
+impl Display for Wrapped {
+    fn fmt(self, sb: StringBuilder) { sb.write("a") }
+}
+
+impl Display for Wrapped {
+    fn fmt(_self, sb2: StringBuilder) { sb2.write("b") }
+}
+
+fn main() {
+    let flag = true
+    let w = Wrapped { n: 1 }
+    let text = "{flag} {w}"
+    let _keep = [text]
+}
+"#
+}
+
+test "a refused ordering operator leaves neither of its operands in the unit" {
+    probe("cg_expr_orphan_ordering", src_ordering())
+    let before = ir_node_count()
+    assert_ice_saying("ordering", lower_expr(rhs_of("ranked")),
+        "OrderingMethodNotLowered", "has no ordering method lowering here")
+    assert_eq_str("nodes built", "{ir_node_count() - before}", "0")
+}
+
+// Typecheck rejects a comparison over a type that carries no equality, so no accepted
+// program reaches this refusal and the probe has to let that one rejection through.
+test "a refused equality operator leaves neither of its operands in the unit" {
+    probe_but("cg_expr_orphan_equality", src_no_equality(), "TypeError")
+    let before = ir_node_count()
+    assert_ice_saying("no equality method", lower_expr(rhs_of("asked")),
+        "EqualityMethodNotFound", "'Plain' has neither")
+    assert_eq_str("nodes built", "{ir_node_count() - before}", "0")
+}
+
+test "a refused display hole leaves the value it would have shown out of the unit" {
+    probe("cg_expr_orphan_display", src_ambiguous_display())
+    let before = ir_node_count()
+    assert_ice_saying("ambiguous display", lower_expr(rhs_of("text")),
+        "ImplAmbiguous", "more than one impl over Struct declares the trait 'Display'")
+    assert_eq_str("nodes built", "{ir_node_count() - before}", "0")
+}
+
+test "a refused interpolation leaves no statement its earlier holes hoisted" {
+    probe("cg_expr_orphan_interp", src_hoisting_hole_before_refusal())
+    let before = cg_expr_pending_count()
+    assert_ice_saying("ambiguous display", lower_expr(rhs_of("text")),
+        "ImplAmbiguous", "more than one impl over Struct declares the trait 'Display'")
+    assert_eq_str("statements hoisted", "{cg_expr_pending_count() - before}", "0")
+}
+
+// A short-circuit whose left operand hoists and whose right operand then refuses. The coalesce
+// on the left lowers cleanly and leaves a carrier temp, a result temp and an `if` behind. The
+// comparison on the right refuses, so the whole operator answers nothing and all three have to
+// come back out.
+fn src_short_circuit_hoist_then_refusal() -> Str {
+    #"@derive(Ord)
+type Point { x: Int, y: Int }
+
+fn main() {
+    let opt: Option[Bool] = None
+    let p = Point { x: 1, y: 2 }
+    let q = Point { x: 1, y: 3 }
+    let joined = (opt ?? true) && (p < q)
+    let _keep = [joined]
+}
+"#
+}
+
+// Two coalesces, one inside the other's fallback. Each binds a carrier temp and a result temp
+// before it lowers that fallback, so four statements stand in the buffer when the innermost
+// comparison refuses. The refusal has to travel out through both frames.
+fn src_coalesce_hoist_then_refusal() -> Str {
+    #"@derive(Ord)
+type Point { x: Int, y: Int }
+
+fn main() {
+    let maybe: Option[Bool] = None
+    let opt: Option[Bool] = None
+    let p = Point { x: 1, y: 2 }
+    let q = Point { x: 1, y: 3 }
+    let chosen = maybe ?? (opt ?? (p < q))
+    let _keep = [chosen]
+}
+"#
+}
+
+test "a refused short-circuit operand leaves no statement the other operand hoisted" {
+    probe("cg_expr_orphan_short_circuit", src_short_circuit_hoist_then_refusal())
+    let before = cg_expr_pending_count()
+    assert_ice_saying("ordering", lower_expr(rhs_of("joined")),
+        "OrderingMethodNotLowered", "has no ordering method lowering here")
+    assert_eq_str("statements hoisted", "{cg_expr_pending_count() - before}", "0")
+}
+
+test "a refused coalesce fallback leaves no statement it hoisted" {
+    probe("cg_expr_orphan_coalesce", src_coalesce_hoist_then_refusal())
+    let before = cg_expr_pending_count()
+    assert_ice_saying("ordering", lower_expr(rhs_of("chosen")),
+        "OrderingMethodNotLowered", "has no ordering method lowering here")
+    assert_eq_str("statements hoisted", "{cg_expr_pending_count() - before}", "0")
+}
+
+// A tuple literal lowers every element before it reads any answer, so a later element that
+// refuses finds an earlier element's statements already in the buffer. Nothing in the tuple
+// seam takes them back, which is why the rule belongs at the expression seam all of them
+// reach rather than in each seam that hoists.
+fn src_tuple_element_hoist_then_refusal() -> Str {
+    #"@derive(Ord)
+type Point { x: Int, y: Int }
+
+fn main() {
+    let opt: Option[Bool] = None
+    let p = Point { x: 1, y: 2 }
+    let q = Point { x: 1, y: 3 }
+    let pair = (opt ?? true, p < q)
+    let _keep = [pair]
+}
+"#
+}
+
+test "a refused tuple element leaves no statement an earlier element hoisted" {
+    probe("cg_expr_orphan_tuple", src_tuple_element_hoist_then_refusal())
+    let before = cg_expr_pending_count()
+    assert_ice_saying("ordering", lower_expr(rhs_of("pair")),
+        "OrderingMethodNotLowered", "has no ordering method lowering here")
+    assert_eq_str("statements hoisted", "{cg_expr_pending_count() - before}", "0")
+}

@@ -1,0 +1,325 @@
+// A method call whose receiver is a Map or a Set.
+//
+// These two receivers share one rule: the runtime compares and hashes their keys through a
+// table baked into the value when it was constructed, so a method never passes one and the
+// key type decides only how the key argument TRAVELS to the runtime. That is what these
+// tests split on. A Str key is passed as written, because the runtime reads the slot's
+// pointer as the string itself. Any other key is passed as an address, because the runtime
+// copies the key's bytes out of one.
+//
+// The standard library declares most of these methods on a `key: Str` parameter while
+// typecheck answers them for every key type, so a call with a non-Str key that reached
+// those declarations would pass an integer where the declaration says pointer. Reaching
+// the runtime directly is what keeps the two honest, and several of these tests exist to
+// pin that the call no longer names a declared symbol at all.
+import lower_test_helpers.{
+    probe, rhs_of, let_node_of, assert_eq_str, assert_shape, assert_verifies, assert_ice_saying,
+}
+import parser.{node_kind, node_method, nodes}
+import ast.{NodeKind, nk_of}
+import ir.{ir_c_name, ir_c_spelling, ir_kid}
+import layout.{layout_of, tid_of_node, Position}
+import typecheck.{TYPE_INT}
+import cg_expr.{lower_expr}
+import diagnostics.{Diag}
+import std.io
+
+// A row that hands back what the runtime entry point answered has to be spelled by the type
+// typecheck recorded for the call, not by a type this stage picked for itself.
+fn assert_spelled_as_the_call(label: Str, built: Int, call: Int) ! Diag.Report {
+    assert_eq_str("{label} spelled as the call",
+        ir_c_spelling(built), layout_of(tid_of_node(call), Position.Local).c_spelling)
+}
+
+// A call written as a statement binds no name, so it is found by walking forward from the
+// binding above it: a statement parses after that binding, so its node id is higher.
+fn call_after(anchor: Str, method: Str) -> Int {
+    let mut i = let_node_of(anchor)
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.MethodCall && node_method(i) == method { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no call of '{method}' after '{anchor}'")
+    assert(false)
+    -1
+}
+
+// ── Map, read through a Str key ───────────────────────────────────────────
+
+test "a Str-keyed membership test reaches the runtime and answers a truth value" {
+    probe("map_has_str", #"fn main() {
+    let m: Map[Str, Int] = Map.new()
+    let hit = m.contains_key("k")
+}
+"#)
+    let built = lower_expr(rhs_of("hit"))
+    assert_shape("shape", built, "Binary(CallRuntime(VarRef, Const), Const)")
+    assert_eq_str("symbol", ir_c_name(ir_kid(built, 0)), "blink_map_has")
+    assert_eq_str("compared against zero", ir_c_name(built), "!=")
+    assert_verifies("verifies", built)
+}
+
+test "the alias membership test names the same runtime entry point" {
+    probe("map_contains_str", #"fn main() {
+    let m: Map[Str, Int] = Map.new()
+    let hit = m.contains("k")
+}
+"#)
+    let built = lower_expr(rhs_of("hit"))
+    assert_eq_str("symbol", ir_c_name(ir_kid(built, 0)), "blink_map_has")
+}
+
+test "a removal answers whether anything was removed" {
+    probe("map_remove_str", #"fn main() {
+    let mut m: Map[Str, Int] = Map.new()
+    let gone = m.remove("k")
+}
+"#)
+    let built = lower_expr(rhs_of("gone"))
+    assert_shape("shape", built, "Binary(CallRuntime(VarRef, Const), Const)")
+    assert_eq_str("symbol", ir_c_name(ir_kid(built, 0)), "blink_map_remove")
+    assert_verifies("verifies", built)
+}
+
+test "a length is the runtime count itself and an emptiness test compares it to zero" {
+    probe("map_len", #"fn main() {
+    let m: Map[Str, Int] = Map.new()
+    let n = m.len()
+    let none = m.is_empty()
+}
+"#)
+    let count = lower_expr(rhs_of("n"))
+    assert_shape("count shape", count, "CallRuntime(VarRef)")
+    assert_eq_str("count symbol", ir_c_name(count), "blink_map_len")
+    assert_spelled_as_the_call("count", count, rhs_of("n"))
+    let empty = lower_expr(rhs_of("none"))
+    assert_shape("empty shape", empty, "Binary(CallRuntime(VarRef), Const)")
+    assert_eq_str("empty symbol", ir_c_name(ir_kid(empty, 0)), "blink_map_len")
+    assert_eq_str("compared against zero", ir_c_name(empty), "==")
+    assert_verifies("verifies", empty)
+}
+
+test "the two projections name the runtime entry point that builds each list" {
+    probe("map_proj", #"fn main() {
+    let m: Map[Str, Int] = Map.new()
+    let ks = m.keys()
+    let vs = m.values()
+}
+"#)
+    let keys = lower_expr(rhs_of("ks"))
+    assert_shape("keys shape", keys, "CallRuntime(VarRef)")
+    assert_eq_str("keys symbol", ir_c_name(keys), "blink_map_keys")
+    assert_spelled_as_the_call("keys", keys, rhs_of("ks"))
+    let values = lower_expr(rhs_of("vs"))
+    assert_eq_str("values symbol", ir_c_name(values), "blink_map_values")
+    assert_verifies("verifies", values)
+}
+
+test "emptying a map is one runtime call written as a statement" {
+    probe("map_clear", #"fn main() {
+    let mut m: Map[Str, Int] = Map.new()
+    m.clear()
+}
+"#)
+    let built = lower_expr(call_after("m", "clear"))
+    assert_shape("shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_map_clear")
+    assert_verifies("verifies", built)
+}
+
+// ── Map, read through a key the runtime copies ────────────────────────────
+
+// The address is taken of a NAME, not of the argument written at the call. The name is a
+// local bound ahead of the call, and it is declared by the spelling the KEY type is given
+// rather than by the spelling the argument carries, which is what makes the bytes behind
+// the address the width the table was built to read.
+test "an Int key travels as the address of a local declared by the key's own spelling" {
+    probe("map_has_int", #"fn main() {
+    let m: Map[Int, Int] = Map.new()
+    let hit = m.contains_key(7)
+}
+"#)
+    let built = lower_expr(rhs_of("hit"))
+    assert_shape("shape", built, "Binary(CallRuntime(VarRef, Unary(VarRef)), Const)")
+    assert_eq_str("symbol", ir_c_name(ir_kid(built, 0)), "blink_map_has")
+    let addr = ir_kid(ir_kid(built, 0), 1)
+    assert_eq_str("passed by address", ir_c_name(addr), "&")
+    assert_eq_str("declared as the key is",
+        ir_c_spelling(ir_kid(addr, 0)), layout_of(TYPE_INT, Position.Local).c_spelling)
+    assert_verifies("verifies", built)
+}
+
+// The local the address is taken of is bound as a statement the expression around the call
+// can see. That is what keeps it under a guard that was written to skip the call: a local
+// left for the printer to bind on its own would be written out ahead of the test, and the
+// key expression would run whether the guard held or not. A guarded operand answers as a
+// name here, because the statements the operand needed moved into the guarded arm.
+test "a key bound for an address stays inside the guard written around the call" {
+    probe("map_has_guarded", #"fn main() {
+    let m: Map[Int, Int] = Map.new()
+    let n = 1
+    let hit = n > 0 && m.contains_key(n)
+}
+"#)
+    let built = lower_expr(rhs_of("hit"))
+    assert_shape("guarded", built, "VarRef")
+}
+
+// ── A key wider than a word ───────────────────────────────────────────────
+//
+// A key the slot cannot hold inline splits the rows by what the entry point does with the
+// key after it answers. A lookup has finished with it, so it reads a local and allocates
+// nothing. A store leaves the key where the container keeps reading it, so what it is
+// given has to outlive the call and is copied to the heap.
+
+test "a lookup over a wide key reads a local and allocates nothing" {
+    probe("map_has_struct", #"@derive(Hash)
+type Point { x: Int  y: Int }
+
+fn main() {
+    let m: Map[Point, Int] = Map.new()
+    let p = Point { x: 1, y: 2 }
+    let hit = m.contains_key(p)
+}
+"#)
+    let built = lower_expr(rhs_of("hit"))
+    assert_shape("shape", built, "Binary(CallRuntime(VarRef, Unary(VarRef)), Const)")
+    assert_eq_str("symbol", ir_c_name(ir_kid(built, 0)), "blink_map_has")
+    assert_eq_str("passed by address", ir_c_name(ir_kid(ir_kid(built, 0), 1)), "&")
+    assert_verifies("verifies", built)
+}
+
+test "a store of a wide key copies it where the container can keep reading it" {
+    probe("set_ins_struct", #"@derive(Hash)
+type Point { x: Int  y: Int }
+
+fn main() {
+    let mut s: Set[Point] = Set.new()
+    let p = Point { x: 1, y: 2 }
+    let fresh = s.insert(p)
+}
+"#)
+    let built = lower_expr(rhs_of("fresh"))
+    assert_shape("shape", built, "Binary(CallRuntime(VarRef, Box(VarRef)), Const)")
+    assert_eq_str("symbol", ir_c_name(ir_kid(built, 0)), "blink_set_insert")
+    assert_verifies("verifies", built)
+}
+
+// ── Set ───────────────────────────────────────────────────────────────────
+
+test "adding to a Str set answers whether the set grew" {
+    probe("set_ins_str", #"fn main() {
+    let mut s: Set[Str] = Set.new()
+    let fresh = s.insert("a")
+}
+"#)
+    let built = lower_expr(rhs_of("fresh"))
+    assert_shape("shape", built, "Binary(CallRuntime(VarRef, Const), Const)")
+    assert_eq_str("symbol", ir_c_name(ir_kid(built, 0)), "blink_set_insert")
+    assert_verifies("verifies", built)
+}
+
+test "a set membership test over an Int element travels by address" {
+    probe("set_has_int", #"fn main() {
+    let s: Set[Int] = Set.new()
+    let hit = s.contains(3)
+}
+"#)
+    let built = lower_expr(rhs_of("hit"))
+    assert_shape("shape", built, "Binary(CallRuntime(VarRef, Unary(VarRef)), Const)")
+    assert_eq_str("symbol", ir_c_name(ir_kid(built, 0)), "blink_set_contains")
+}
+
+test "a set removal and a set length name their own runtime entry points" {
+    probe("set_rest", #"fn main() {
+    let mut s: Set[Str] = Set.new()
+    let gone = s.remove("a")
+    let n = s.len()
+}
+"#)
+    let removed = lower_expr(rhs_of("gone"))
+    assert_eq_str("remove symbol", ir_c_name(ir_kid(removed, 0)), "blink_set_remove")
+    let count = lower_expr(rhs_of("n"))
+    assert_eq_str("len symbol", ir_c_name(count), "blink_set_len")
+}
+
+// A union takes another SET, not a key, so its argument is lowered as written and no
+// address is taken of it. Keying the argument off the method rather than off the arity is
+// what separates this call from the three that take one key.
+test "a union passes the other set as written" {
+    probe("set_union", #"fn main() {
+    let s: Set[Int] = Set.new()
+    let t: Set[Int] = Set.new()
+    let both = s.union(t)
+}
+"#)
+    let built = lower_expr(rhs_of("both"))
+    assert_shape("shape", built, "CallRuntime(VarRef, VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_set_union")
+    assert_verifies("verifies", built)
+}
+
+// ── What is not lowered ───────────────────────────────────────────────────
+
+// Both of these move a value through the slot the map stores beside the key, and only one
+// of them is built. Reaching the slot is the whole of what a store does, so a store is
+// finished by it. A read is not: it hands the value back in a carrier, and filling one takes
+// statements this stage does not hoist. So the read keeps refusing under its own name, which
+// is what stops the count from claiming that the slot word finished it.
+test "a store into a map goes into the slot beside the key" {
+    probe("map_insert", #"fn main() {
+    let mut m: Map[Str, Int] = Map.new()
+    m.insert("k", 1)
+}
+"#)
+    let built = lower_expr(call_after("m", "insert"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_map_set")
+    assert_shape("shape", built, "CallRuntime(VarRef, Const, Cast(Cast(Const)))")
+    assert_verifies("insert", built)
+}
+
+// A map store is the only call that carries a key AND a value, so it is the only place the
+// two rules can be read as one. The key follows the rule every other keyed call follows,
+// and the value follows the slot rule a list element follows. These two pin that neither
+// rule is applied to the other's argument.
+test "a map store passes a narrow key by address and its value by the slot word" {
+    probe("map_ins_int", #"fn main() {
+    let mut m: Map[Int, Int] = Map.new()
+    m.insert(7, 1)
+}
+"#)
+    let built = lower_expr(call_after("m", "insert"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_map_set")
+    assert_shape("shape", built, "CallRuntime(VarRef, Unary(VarRef), Cast(Cast(Const)))")
+    assert_eq_str("key by address", ir_c_name(ir_kid(built, 1)), "&")
+    assert_verifies("insert", built)
+}
+
+// A wide key outlives the call that wrote it, because the container keeps reading the bytes
+// it was handed. A copy is what makes that safe, and a store that passed the local's own
+// address would leave the map pointing at a dead frame.
+test "a map store copies a wide key where the container can keep reading it" {
+    probe("map_ins_struct", #"@derive(Hash)
+type Point { x: Int  y: Int }
+
+fn main() {
+    let mut m: Map[Point, Int] = Map.new()
+    let p = Point { x: 1, y: 2 }
+    m.insert(p, 1)
+}
+"#)
+    let built = lower_expr(call_after("p", "insert"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_map_set")
+    assert_shape("shape", built, "CallRuntime(VarRef, Box(VarRef), Cast(Cast(Const)))")
+    assert_verifies("insert", built)
+}
+
+test "a read out of a map refuses on the carrier it has to answer" {
+    probe("map_get", #"fn main() {
+    let m: Map[Str, Int] = Map.new()
+    let v = m.get("k")
+}
+"#)
+    let built = lower_expr(rhs_of("v"))
+    assert_ice_saying("get", built, "MapSlotMethodNotLowered", "takes a value back out of the slot")
+}

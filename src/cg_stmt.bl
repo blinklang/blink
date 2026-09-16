@@ -9,13 +9,14 @@
 // with no lowering is a recorded ICE and a poisoned node, never a guessed answer. The
 // driver must read diag_ice_count before it prints a unit this module built.
 
-import ast.{NodeKind, nk_of}
+import ast.{NodeKind, nk_of, node_kind_name}
 import parser.{
-    node_arms, node_body, node_col, node_condition, node_elements, node_else_body, node_end,
-    node_fields, node_for_binder, node_guard, node_handlers, node_inclusive, node_int_val,
-    node_iterable, node_kind, node_name, node_op, node_params, node_pattern, node_scrutinee,
-    node_start, node_stmts, node_str_val, node_target, node_then_body, node_type_name,
-    node_type_ann, node_value, sublist_get, sublist_length,
+    node_args, node_arms, node_body, node_col, node_condition, node_elements, node_else_body,
+    node_end, node_fields, node_for_binder, node_guard, node_handlers, node_inclusive,
+    node_index, node_int_val, node_iterable, node_kind, node_left, node_name, node_obj,
+    node_op, node_params, node_pattern, node_right, node_scrutinee, node_start, node_stmts,
+    node_str_val, node_target, node_then_body, node_type_name, node_type_ann, node_value,
+    sublist_get, sublist_length,
 }
 import typecheck.{TyKind, TYPE_INT, tc_tid_handler_effect, tc_tid_kind}
 import layout.{
@@ -30,9 +31,12 @@ import ir.{
 }
 import diagnostics.{
     Diag, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
-    UNHANDLED_ITERABLE_AT_CODEGEN, UNSOLVED_TYPEVAR_AT_CODEGEN,
+    CODEGEN_STAGE_NOT_BUILT, UNHANDLED_ITERABLE_AT_CODEGEN, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
-import cg_expr.{lower_expr}
+import cg_expr.{
+    cg_expr_drain_pending, cg_expr_pending_count, cg_expr_push_pending,
+    cg_expr_register_value, cg_expr_set_return_type, cg_expr_take_pending, lower_expr,
+}
 
 // A carrier holds its discriminant in `tag`, its Option payload in `value` and its
 // Result arms in `ok` and `err`. These are member names in a struct layout.bl emits,
@@ -72,6 +76,7 @@ let mut scope_stack: List[Int] = []
 
 pub fn cg_stmt_reset() {
     scope_stack = []
+    mv_clean = true
 }
 
 // ── Types, spellings and names ────────────────────────────────────────────
@@ -169,7 +174,14 @@ pub fn lower_fn(fn_node: Int) -> Int ! Diag.Report {
     let bound = bind_params(fn_node, scope)
     let tail = if fn_returns_value(fn_node) { TAIL_RETURN } else { TAIL_DISCARD }
     let body = node_body(fn_node)
+    // `?` in the body returns the enclosing function's carrier on the failure arm, and `?`
+    // lowers in the expression stage, which reads no function of its own. The annotation is
+    // the only place the carrier is named, so the type goes across before the body lowers
+    // and comes back off after, leaving nothing for the next function to read.
+    let ann = node_type_ann(fn_node)
+    cg_expr_set_return_type(if ann < 0 { -1 } else { stmt_tid(ann) })
     let block = if bound && body >= 0 { lower_body_block(body, tail, "", -1) } else { -1 }
+    cg_expr_set_return_type(-1)
     close_scope()
     // A stopped body, a parameter with no type and a declaration with no body all leave
     // nothing worth printing, and the seam still answers a node.
@@ -408,6 +420,35 @@ fn lower_return(node: Int) -> Int ! Diag.Report {
 
 // ── Blocks in value position ──────────────────────────────────────────────
 
+// One statement, with the statements its value needed in front of it.
+//
+// A value the expression stage cannot finish on its own (a coalesce, a short-circuit arm,
+// a `?`, a carrier unwrap) declares a temp, leaves the statements that fill it in that
+// stage's buffer, and answers a read of the temp. A block is where those statements land,
+// because a C block is the only thing that holds a statement, and they go in front of the
+// statement that reads the temp.
+//
+// The mark is taken per statement rather than per block. A seam that lowers a value of its
+// own before recursing into a block (an `if` its condition) owns that value's statements,
+// so a block must take only what was pushed while it lowered its own statement.
+//
+// An `if` or a `match` the statement reads as a value is materialised into a temp first,
+// because the expression stage can only answer a read of a temp something else declared.
+//
+// Answers false on a stop, having left `out` as it found it.
+fn lower_stmt_hoisted(s: Int, tail: Int, dest: Str, dest_tid: Int, out: List[Int]) -> Bool ! Diag.Report {
+    let mark = cg_expr_pending_count()
+    let lowered = if materialise_stmt_values(s) { lower_stmt_tail(s, tail, dest, dest_tid) } else { -1 }
+    if lowered < 0 {
+        // The statements filled temps only the stopped statement reads, so they go nowhere.
+        let _dropped = cg_expr_take_pending(mark)
+        return false
+    }
+    cg_expr_drain_pending(mark, out)
+    out.push(lowered)
+    true
+}
+
 fn lower_tail_block_into(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
     let _ = open_scope()
     let stmts = node_stmts(node)
@@ -417,17 +458,255 @@ fn lower_tail_block_into(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int 
     while i < n {
         let s = sublist_get(stmts, i)
         let mode = if i == n - 1 { tail } else { TAIL_DISCARD }
-        let lowered = lower_stmt_tail(s, mode, dest, dest_tid)
-        if lowered < 0 {
+        if !lower_stmt_hoisted(s, mode, dest, dest_tid, out) {
             close_scope()
             return -1
         }
-        out.push(lowered)
         i = i + 1
     }
     if n == 0 && tail == TAIL_RETURN { out.push(ir_return(node, -1)) }
     close_scope()
     ir_block(node, out)
+}
+
+// ── Values an arm has to fill ─────────────────────────────────────────────
+
+// An `if` or a `match` written where a value is wanted. Its arms are blocks, and only a
+// statement can stand in a block, so C has no expression to put one in. The lowering is a
+// temp declared in front of the statement that reads it, each arm assigning into that
+// temp, and the temp's name given to the expression stage, which spells a read of it.
+//
+// The walk runs before the statement lowers, so the temp and the arms that fill it reach
+// the block ahead of the reader. It stops at every boundary that would move work to a
+// place it does not belong: a block of its own, which is walked for each of its own
+// statements; a closure body, which is another function; a loop test, a match guard and
+// the right operand of a short-circuit, each of which runs a different number of times
+// than the statement around it. A shape left unwalked is not wrong C. The expression
+// stage refuses a value it was given no temp for, by name.
+//
+// Answers false when a shape was refused, so the statement stops on the one named report
+// rather than lowering into a read of a temp nothing declared; see The stop above.
+fn materialise_stmt_values(s: Int) -> Bool ! Diag.Report {
+    mv_clean = true
+    mv_stmt(s)
+}
+
+fn mv_stmt(s: Int) -> Bool ! Diag.Report {
+    match nk_of(node_kind(s)) {
+        NodeKind.LetBinding => mv_expr(node_value(s))
+        NodeKind.Assignment => mv_pair(node_target(s), node_value(s))
+        NodeKind.CompoundAssign => mv_pair(node_target(s), node_value(s))
+        NodeKind.ExprStmt => mv_stmt(node_value(s))
+        NodeKind.Return => mv_expr(node_value(s))
+        NodeKind.IfExpr => mv_expr(node_condition(s))
+        NodeKind.MatchExpr => mv_expr(node_scrutinee(s))
+        // The ends of a counted range are read once above the loop, so a temp in front of
+        // the statement is read exactly as often as they are.
+        NodeKind.ForIn => mv_expr(node_iterable(s))
+        NodeKind.Block => true
+        NodeKind.WhileLoop => true
+        NodeKind.LoopExpr => true
+        NodeKind.WithBlock => true
+        NodeKind.Break => true
+        NodeKind.Continue => true
+        _ => mv_expr(s)
+    }
+}
+
+// False once the walk has passed a part of the statement that an arm may not run before.
+//
+// The arms of a materialised `if` run in front of the whole statement, not where the
+// source wrote them. So every part the walk passed first must be a part that runs the same
+// whether it goes before the arms or after them. Only a value that reads nothing, writes
+// nothing, cannot trap and calls nothing qualifies: a number, a character and a boolean,
+// and the tuples, lists and ranges built out of those.
+//
+// Everything else is work: it reads a cell an arm can write, it traps, or it calls a
+// function. Past any of it the `if` is left to the expression stage, which refuses it by
+// name. Each arm below gives the reason for its kind.
+let mut mv_clean: Bool = true
+
+// Work the walk may not move an arm above. Whatever follows in the same statement is left
+// to the expression stage.
+fn mv_moves_work() -> Bool {
+    mv_clean = false
+    true
+}
+
+fn mv_pair(a: Int, b: Int) -> Bool ! Diag.Report {
+    if !mv_expr(a) { return false }
+    mv_expr(b)
+}
+
+fn mv_list(sl: Int) -> Bool ! Diag.Report {
+    if sl == -1 { return true }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        if !mv_expr(sublist_get(sl, i)) { return false }
+        i = i + 1
+    }
+    true
+}
+
+// One expression, in the order its parts run. A kind whose parts this does not know is
+// walked no further and counts as work, so nothing inside it is moved and nothing after it
+// is either.
+fn mv_expr(e: Int) -> Bool ! Diag.Report {
+    if e < 0 { return true }
+    match nk_of(node_kind(e)) {
+        NodeKind.IntLit => true
+        NodeKind.FloatLit => true
+        NodeKind.CharLit => true
+        NodeKind.BoolLit => true
+        NodeKind.TupleLit => mv_list(node_elements(e))
+        NodeKind.ListLit => mv_list(node_elements(e))
+        NodeKind.RangeLit => mv_pair(node_start(e), node_end(e))
+        NodeKind.NamedArg => mv_expr(node_value(e))
+        NodeKind.IfExpr => materialise_value_expr(e, node_condition(e))
+        NodeKind.MatchExpr => materialise_value_expr(e, node_scrutinee(e))
+        NodeKind.BinOp => mv_binop(e)
+        // `?` returns out of the function on its failure arm, and an operator on a type
+        // that carries an impl is a call into it.
+        NodeKind.UnaryOp => mv_after(mv_expr(node_left(e)))
+        // A name and a field read a cell an arm can write.
+        NodeKind.Ident => mv_moves_work()
+        NodeKind.FieldAccess => mv_after(mv_expr(node_obj(e)))
+        // A hole calls the formatter, and a field the literal left out can carry a default
+        // that runs between the fields the literal did write.
+        NodeKind.InterpString => mv_moves_work()
+        NodeKind.StructLit => mv_moves_work()
+        // A read through an index is checked, and the check is a statement of its own.
+        NodeKind.IndexExpr => mv_after(mv_pair(node_obj(e), node_index(e)))
+        // A call's left is the callee, which runs before its arguments.
+        NodeKind.Call => mv_after(mv_expr(node_left(e)) && mv_list(node_args(e)))
+        NodeKind.MethodCall => mv_after(mv_expr(node_obj(e)) && mv_list(node_args(e)))
+        _ => mv_moves_work()
+    }
+}
+
+// A part whose own work runs after the parts inside it.
+fn mv_after(walked: Bool) -> Bool {
+    if !walked { return false }
+    mv_moves_work()
+}
+
+fn mv_binop(e: Int) -> Bool ! Diag.Report {
+    if !mv_expr(node_left(e)) { return false }
+    let op = node_op(e)
+    // The right operand of `&&`, `||` and `??` runs only when the left one decided
+    // nothing, and the expression stage builds each as an `if`. A temp filled in front of
+    // the statement would run it every time, which both changes what the program does and
+    // can run work the left operand was guarding.
+    if op == "&&" { return mv_moves_work() }
+    if op == "||" { return mv_moves_work() }
+    if op == "??" { return mv_moves_work() }
+    if !mv_expr(node_right(e)) { return false }
+    // A divide traps on a zero right operand, and an operator on a type that carries an
+    // impl is a call into it.
+    mv_moves_work()
+}
+
+// The temp for one value-position `if` or `match`: declared unset, filled by the arms,
+// and named to the expression stage before the statement that reads it lowers.
+//
+// What the walk passed before it reached this node decides whether the temp is safe, so
+// the test comes before anything else this does. The head is not part of that: it lowers
+// inside the `if` the temp stands under, so it keeps its place ahead of the arms whatever
+// work it holds. Walking it materialises a value-position `if` in a condition or a
+// scrutinee into a temp of its own above this one.
+fn materialise_value_expr(node: Int, head: Int) -> Bool ! Diag.Report {
+    if !mv_clean {
+        diag_ice_at("ValuePositionExprMovesWork", CODEGEN_STAGE_NOT_BUILT,
+            "{node_kind_name(node_kind(node))} in value position stands after work its arms would run before", node,
+            "materialising this needs the temp declared where the reader is lowered; bind the value in a let above the statement")
+        return false
+    }
+    if !mv_expr(head) { return false }
+    let tid = stmt_tid(node)
+    if tid < 0 { return false }
+    if tc_tid_kind(tid) == TyKind.Void {
+        diag_ice_at("ValuePositionExprHasNoValue", CODEGEN_STAGE_NOT_BUILT,
+            "{node_kind_name(node_kind(node))} in value position produces no value", node,
+            "a temp of no type cannot be declared, and the reader wants one; this is a typecheck bug")
+        return false
+    }
+    if !arms_fill_tail(node) {
+        diag_ice_at("ValuePositionArmFillsNothing", CODEGEN_STAGE_NOT_BUILT,
+            "an arm of this {node_kind_name(node_kind(node))} in value position neither produces a value nor leaves the block", node,
+            "every arm must end in a value, a return, a break or a continue; an arm ending in a let or a loop has no lowering yet")
+        return false
+    }
+    let rec = layout_at(tid, Position.Local, node)
+    let _ = ensure_typedef_for(tid)
+    let name = c_mint_local("val")
+    cg_expr_push_pending(node, ir_let(tid, node, rec.c_spelling, name, rec.slot_form, -1))
+    let filled = lower_stmt_tail(node, TAIL_ASSIGN, name, tid)
+    if filled < 0 { return false }
+    cg_expr_push_pending(node, filled)
+    cg_expr_register_value(node, name, tid)
+    // The head and the arms both stand under this temp, and a temp minted later stands
+    // under this one. So nothing they hold is work a later part of the same statement has
+    // to move above. Lowering the arms ran this same walk over each arm statement, which
+    // left the flag holding the last of them; this is what puts it back.
+    mv_clean = true
+    true
+}
+
+// Whether every arm of a value-position `if` or `match` either assigns the temp or leaves
+// the block without reaching the read. A `return`, a `break` and a `continue` all leave;
+// anything that runs to the end of its arm without producing a value would let the temp be
+// read before anything wrote it, which is the one shape this must never build.
+fn arms_fill_tail(node: Int) -> Bool ! Diag.Report {
+    if nk_of(node_kind(node)) == NodeKind.MatchExpr { return match_arms_fill(node) }
+    let els = node_else_body(node)
+    // With no else arm there is a path around the whole `if`, and it writes nothing.
+    if els < 0 { return false }
+    if !body_fills(node_then_body(node)) { return false }
+    body_fills(els)
+}
+
+fn match_arms_fill(node: Int) -> Bool ! Diag.Report {
+    let arms = node_arms(node)
+    let n = if arms == -1 { 0 } else { sublist_length(arms) }
+    if n == 0 { return false }
+    let mut i = 0
+    while i < n {
+        if !body_fills(node_body(sublist_get(arms, i))) { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn body_fills(body: Int) -> Bool ! Diag.Report {
+    if body < 0 { return false }
+    if nk_of(node_kind(body)) != NodeKind.Block { return tail_fills(body) }
+    let stmts = node_stmts(body)
+    let n = if stmts == -1 { 0 } else { sublist_length(stmts) }
+    if n == 0 { return false }
+    tail_fills(sublist_get(stmts, n - 1))
+}
+
+// Whether the last statement of an arm hands its value to the tail mode. The arms answer
+// the same question lower_stmt_tail does: the shapes that reach tail_wrap produce a value,
+// the shapes that jump leave the block, and the rest fall off the end writing nothing.
+fn tail_fills(s: Int) -> Bool ! Diag.Report {
+    match nk_of(node_kind(s)) {
+        NodeKind.LetBinding => false
+        NodeKind.Assignment => false
+        NodeKind.CompoundAssign => false
+        NodeKind.WhileLoop => false
+        NodeKind.LoopExpr => false
+        NodeKind.ForIn => false
+        NodeKind.Return => true
+        NodeKind.Break => true
+        NodeKind.Continue => true
+        NodeKind.ExprStmt => tail_fills(node_value(s))
+        NodeKind.Block => body_fills(s)
+        NodeKind.IfExpr => arms_fill_tail(s)
+        NodeKind.MatchExpr => match_arms_fill(s)
+        NodeKind.WithBlock => body_fills(node_body(s))
+        _ => true
+    }
 }
 
 // ── If ────────────────────────────────────────────────────────────────────
@@ -452,10 +731,11 @@ fn lower_body_block(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Dia
         return lower_tail_block_into(node, tail, dest, dest_tid)
     }
     let _ = open_scope()
-    let stmt = lower_stmt_tail(node, tail, dest, dest_tid)
+    let mut out: List[Int] = []
+    let ok = lower_stmt_hoisted(node, tail, dest, dest_tid, out)
     close_scope()
-    if stmt < 0 { return -1 }
-    ir_block(node, [stmt])
+    if !ok { return -1 }
+    ir_block(node, out)
 }
 
 // ── Loops ─────────────────────────────────────────────────────────────────
@@ -467,8 +747,23 @@ fn lower_while(node: Int) -> Int ! Diag.Report {
     let tid = stmt_tid(cond_node)
     if tid < 0 { return -1 }
     let rec = layout_at(tid, Position.Local, cond_node)
+    // The test is read once per turn, and the guard the test becomes sits inside the loop.
+    // A statement the test needed has no place there: the enclosing block would take it,
+    // which puts it above the loop, where it runs once and the turns after the first read
+    // a stale temp. The shape that works copies those statements into the guard block ahead
+    // of the test, and nothing builds that yet.
+    let mark = cg_expr_pending_count()
+    let tested = lower_value(cond_node)
+    let hoisted = cg_expr_take_pending(mark)
+    if hoisted.len() > 0 {
+        diag_ice_at("HoistOutOfLoopTest", CODEGEN_STAGE_NOT_BUILT,
+            "this loop test needs a statement run before it, and there it would run once instead of each turn",
+            cond_node,
+            "a test that needs a temp has no lowering yet; bind the value in a let above the loop and test that")
+        return -1
+    }
     let cond = ir_binary(tid, cond_node, rec.c_spelling, "==",
-        lower_value(cond_node), ir_const(tid, cond_node, rec.c_spelling, "0"))
+        tested, ir_const(tid, cond_node, rec.c_spelling, "0"))
     let guard = ir_if(cond_node, cond, ir_block(cond_node, [ir_break(cond_node)]), -1)
     let body = lower_block(node_body(node))
     if body < 0 { return -1 }
@@ -1189,7 +1484,23 @@ fn guarded_arm_block(ctx: MatchCtx, arm: Int, guard: Int, extra: List[Int]) -> I
         return -1
     }
     inner.push(body)
-    out.push(ir_if(arm, lower_value(guard), ir_block(arm, inner), -1))
+    // The guard is read only once this arm's pattern matched. A statement the guard needed
+    // has no place in this arm's block either: the block is reached after the pattern test,
+    // but the statements would have to stand above the guard's own `if`, and the enclosing
+    // block is what takes them, which puts them above the whole match. There they run for
+    // arms that never match, and the guard of one arm would read a temp another arm filled.
+    let mark = cg_expr_pending_count()
+    let tested = lower_value(guard)
+    let hoisted = cg_expr_take_pending(mark)
+    if hoisted.len() > 0 {
+        close_scope()
+        diag_ice_at("HoistOutOfMatchGuard", CODEGEN_STAGE_NOT_BUILT,
+            "this match guard needs a statement run before it, and there it would run for arms that never match",
+            guard,
+            "a guard that needs a temp has no lowering yet; bind the value in a let above the match and test that")
+        return -1
+    }
+    out.push(ir_if(arm, tested, ir_block(arm, inner), -1))
     close_scope()
     ir_block(arm, out)
 }

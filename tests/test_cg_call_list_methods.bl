@@ -1,0 +1,244 @@
+// A method call whose receiver is a List.
+//
+// These tests split the eight List methods the way the lowering does: by what answers the
+// call. Three reach a function the standard library declares, two reach a runtime
+// primitive, and three are refused under their own names. What each test pins is the symbol
+// the call names, the shape of the built node, and for the stores which argument was the
+// element that went into the slot.
+import lower_test_helpers.{
+    probe, rhs_of, let_node_of, assert_eq_str, assert_shape, assert_verifies,
+    assert_ice_saying,
+}
+import parser.{node_kind, node_method, nodes}
+import ast.{NodeKind, nk_of}
+import ir.{ir_c_name, ir_kid}
+import layout.{layout_take_typedefs}
+import cg_expr.{lower_expr}
+import std.io
+
+// Whether anything queued the typedef that a spelling names. The queue is drained here, so
+// this is asked once per probe.
+fn queued(spelling: Str) -> Str {
+    for t in layout_take_typedefs() {
+        if t.index_of(spelling) >= 0 { return "queued" }
+    }
+    "missing"
+}
+
+// A call written as a statement binds no name, so it is found by walking forward from the
+// binding above it: a statement parses after that binding, so its node id is higher.
+fn call_after(anchor: Str, method: Str) -> Int {
+    let mut i = let_node_of(anchor)
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.MethodCall && node_method(i) == method { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no call of '{method}' after '{anchor}'")
+    assert(false)
+    -1
+}
+
+// The three methods the standard library declares a function for. `append` and `slice`
+// are foreign bindings, so each spells the symbol its annotation names; `join` is written
+// in Blink and spells the module it was written in.
+fn src_declared() -> Str {
+    #"fn main() {
+    let xs: List[Int] = [1, 2]
+    let ys: List[Int] = [3]
+    let both = xs.append(ys)
+    let part = xs.slice(0, 1)
+    let words: List[Str] = ["a", "b"]
+    let sentence = words.join(",")
+    let _keep = [both.len(), part.len(), sentence.len(), words.len(), ys.len()]
+}
+"#
+}
+
+// An element that fits the word. Nothing is boxed: the value goes in as the slot's own word.
+fn src_word_elem() -> Str {
+    #"fn main() {
+    let mut xs: List[Int] = []
+    let n = 5
+    xs.push(n)
+    xs.set(0, n)
+    let _keep = xs.len()
+}
+"#
+}
+
+// An element wider than the word. layout answers PointerBoxed for a struct in a container
+// slot, so the value is copied to the heap and the slot holds the pointer.
+fn src_boxed_elem() -> Str {
+    #"type Point {
+    x: Int
+    y: Int
+}
+
+fn main() {
+    let mut pts: List[Point] = []
+    let p = Point { x: 1, y: 2 }
+    pts.push(p)
+    let q = Point { x: 3, y: 4 }
+    pts.set(0, q)
+    let _keep = pts.len()
+}
+"#
+}
+
+// An element whose C spelling is a carrier typedef. layout spells it, but nothing has
+// emitted the typedef that spelling names, so the call would reach C naming a type the
+// unit does not declare.
+fn src_carrier_elem() -> Str {
+    #"fn main() {
+    let mut opts: List[Option[Int]] = []
+    let o: Option[Int] = Some(1)
+    opts.push(o)
+    let _keep = opts.len()
+}
+"#
+}
+
+// `join` reads every slot as a string pointer, so the element type decides whether the
+// call is buildable at all. Typecheck rejects `List[Int].join` outright, so the only way
+// to reach this stage with an element str_join cannot read is through a generic body,
+// where typecheck's own check fails open. That is what this probe writes.
+fn src_join_int() -> Str {
+    #"fn nums[T](xs: List[T]) -> Str {
+    let xs_joined = xs.join(",")
+    xs_joined
+}
+
+fn main() {
+    let ints: List[Int] = [1, 2]
+    let text = nums(ints)
+    let _keep = text.len()
+}
+"#
+}
+
+// The three this stage cannot build. `get` and `pop` answer an Option, which is a carrier
+// filled by statements; `contains` is a scan, which is a loop.
+fn src_refused() -> Str {
+    #"fn main() {
+    let mut xs: List[Int] = [1]
+    let g = xs.get(0)
+    let p = xs.pop()
+    let c = xs.contains(1)
+    let _keep = [g.is_some(), p.is_some(), c]
+}
+"#
+}
+
+// A method written with more arguments than it takes.
+fn src_long_push() -> Str {
+    #"fn main() {
+    let mut xs: List[Int] = []
+    xs.push(1, 2)
+    let _keep = xs.len()
+}
+"#
+}
+
+test "append names the standard library's list concatenation" {
+    probe("lm_app", src_declared())
+    let built = lower_expr(rhs_of("both"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_list_concat")
+    assert_verifies("append", built)
+}
+
+test "slice names the standard library's list slice" {
+    probe("lm_sl", src_declared())
+    let built = lower_expr(rhs_of("part"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_list_slice")
+    assert_verifies("slice", built)
+}
+
+test "join names the string function that joins a list of strings" {
+    probe("lm_join", src_declared())
+    let built = lower_expr(rhs_of("sentence"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_std_str_str_join")
+    assert_verifies("join", built)
+}
+
+// A word-sized element reaches the same two runtime entry points a boxed one does. It gets
+// there differently, by riding the slot's own word rather than by leaving a heap copy
+// behind, and that difference is the whole of what separates these two tests from the two
+// below. Which symbol each store names does not depend on it.
+test "a word-sized element push names the runtime append and leaves nothing on the heap" {
+    probe("lm_pw", src_word_elem())
+    let built = lower_expr(call_after("n", "push"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_list_push")
+    assert_shape("shape", built, "CallRuntime(VarRef, Cast(Cast(VarRef)))")
+    assert_verifies("push word", built)
+}
+
+test "a word-sized element set names the runtime write and leaves nothing on the heap" {
+    probe("lm_sw", src_word_elem())
+    let built = lower_expr(call_after("n", "set"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_list_set")
+    assert_shape("shape", built, "CallRuntime(VarRef, Const, Cast(Cast(VarRef)))")
+    assert_verifies("set word", built)
+}
+
+test "an element wider than the word is boxed before it is pushed" {
+    probe("lm_pb", src_boxed_elem())
+    let built = lower_expr(call_after("p", "push"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_list_push")
+    assert_shape("shape", built, "CallRuntime(VarRef, Box(VarRef))")
+    assert_verifies("push boxed", built)
+}
+
+// `set` writes the element second, not first. Boxing the wrong argument would put the
+// index on the heap and hand the runtime a pointer where it reads a position, so which
+// argument IS the element is asserted and not assumed.
+test "an element wider than the word is boxed before it is set, and the index is not" {
+    probe("lm_sb", src_boxed_elem())
+    let built = lower_expr(call_after("q", "set"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_list_set")
+    assert_shape("shape", built, "CallRuntime(VarRef, Const, Box(VarRef))")
+    assert_verifies("set boxed", built)
+}
+
+// A boxed element is allocated and dereferenced by its own C spelling. For a carrier that
+// spelling names a typedef, so the store has to queue it: a call naming a type the unit
+// never declares does not compile, and this stage is the only one that knows the element
+// went into a slot.
+test "a carrier element is boxed and its typedef is queued" {
+    probe("lm_pc", src_carrier_elem())
+    let built = lower_expr(call_after("o", "push"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_list_push")
+    assert_shape("shape", built, "CallRuntime(VarRef, Box(VarRef))")
+    let pointee = ir_c_name(ir_kid(built, 1))
+    assert_eq_str("typedef", queued(pointee), "queued")
+    assert_verifies("push carrier", built)
+}
+
+test "a join is refused by name unless the element is Str" {
+    probe("lm_ji", src_join_int())
+    let built = lower_expr(rhs_of("xs_joined"))
+    assert_ice_saying("join", built, "JoinElementNotStr", "joining a List of")
+}
+
+test "a get answering a carrier is refused by name" {
+    probe("lm_get", src_refused())
+    let built = lower_expr(rhs_of("g"))
+    assert_ice_saying("get", built, "CheckedElementReadNotLowered", "answering Option")
+}
+
+test "a pop answering a carrier is refused by name" {
+    probe("lm_pop", src_refused())
+    let built = lower_expr(rhs_of("p"))
+    assert_ice_saying("pop", built, "CheckedElementReadNotLowered", "answering Option")
+}
+
+test "a contains scanning the elements is refused by name" {
+    probe("lm_con", src_refused())
+    let built = lower_expr(rhs_of("c"))
+    assert_ice_saying("contains", built, "ElementScanNotLowered", "compares each element")
+}
+
+test "a runtime-backed method called with too many arguments is refused by name" {
+    probe("lm_long", src_long_push())
+    let built = lower_expr(call_after("xs", "push"))
+    assert_ice_saying("long", built, "IntrinsicArityWrong", "takes 1 argument(s)")
+}

@@ -1,0 +1,87 @@
+// A higher-order method over a List.
+//
+// Every one of these already has a body: `lib/std/list.bl` declares list_map, list_filter,
+// list_fold, list_any, list_all and list_for_each as ordinary generic functions, and a
+// loop emitted here would be a second answer to what each of them means. So the call is
+// meant to reach the generic rather than to be built.
+//
+// What stops it is the instance. Mono reads the program and registers an instance of a
+// generic for each call of it that it can see, and a method call is not a call of
+// list_map as far as it can see, so the types this call uses have no instance registered
+// for them. Naming the generic without one reports mono's refusal for a decision made
+// here, which blames the wrong stage. Until mono registers the instance a builtin method
+// stands for, the call is refused under its own name.
+//
+// These tests pin that refusal so it cannot quietly become a second loop, and so the
+// count is exact: one method call is one refusal, not one per element type it is used at.
+import lower_test_helpers.{ probe, rhs_of, fn_decl_of, assert_eq_str, assert_ice_saying, ice_count_exactly }
+import cg_expr.{lower_expr}
+import cg_stmt.{lower_fn}
+
+fn src_hofs() -> Str {
+    #"fn main() {
+    let xs = [1, 2, 3]
+    let m = xs.map(fn(mv: Int) -> Int { mv * 2 })
+    let f = xs.filter(fn(fv: Int) -> Bool { fv > 1 })
+    let d = xs.fold(0, fn(da: Int, db: Int) -> Int { da + db })
+    let a = xs.any(fn(av: Int) -> Bool { av > 1 })
+    let l = xs.all(fn(lv: Int) -> Bool { lv > 0 })
+    let _keep = [m.len(), f.len(), d]
+    let _also = [a, l]
+}
+"#
+}
+
+// The refusal names the generic the call is meant to reach, so the report says what has to
+// exist rather than only that something does not.
+test "a List higher-order method is refused by the generic it stands for" {
+    probe("hof_m", src_hofs())
+    assert_ice_saying("map", lower_expr(rhs_of("m")),
+        "ListHofInstanceNotRegistered", "list_map")
+}
+
+// One call is one refusal. A refusal raised per element type, or per walk of the same
+// node, would report the same missing instance many times and bury the rest of the run.
+test "each higher-order call is refused exactly once" {
+    probe("hof_c", src_hofs())
+    let _m = lower_expr(rhs_of("m"))
+    let n = ice_count_exactly("ListHofInstanceNotRegistered",
+        "'map' over a List is the standard library generic 'list_map', which mono registers no instance of for a method call")
+    assert_eq_str("refusals", "{n}", "1")
+}
+
+// Every method of the family is refused, not just the one that happens to be read first.
+// A member left out would fall through to the generic "not built" report and lose the
+// dependency this names.
+test "the whole higher-order family is refused under the same name" {
+    probe("hof_f", src_hofs())
+    assert_ice_saying("filter", lower_expr(rhs_of("f")),
+        "ListHofInstanceNotRegistered", "list_filter")
+    assert_ice_saying("fold", lower_expr(rhs_of("d")),
+        "ListHofInstanceNotRegistered", "list_fold")
+    assert_ice_saying("any", lower_expr(rhs_of("a")),
+        "ListHofInstanceNotRegistered", "list_any")
+    assert_ice_saying("all", lower_expr(rhs_of("l")),
+        "ListHofInstanceNotRegistered", "list_all")
+}
+
+// for_each is the one member of the family that answers Void, so it is written as a
+// statement rather than as the right side of a binding, and it reaches the same seam by
+// the statement stage instead of by a read of a bound name. A member reachable only that
+// way is the one a table is most likely to be missing, so it is pinned through the path
+// it actually takes.
+fn src_for_each() -> Str {
+    #"fn main() {
+    let xs = [1, 2, 3]
+    xs.for_each(fn(ev: Int) { })
+}
+"#
+}
+
+test "a statement-position for_each is refused under the same name" {
+    probe("hof_e", src_for_each())
+    let _b = lower_fn(fn_decl_of("main"))
+    let n = ice_count_exactly("ListHofInstanceNotRegistered",
+        "'for_each' over a List is the standard library generic 'list_for_each', which mono registers no instance of for a method call")
+    assert_eq_str("refusals", "{n}", "1")
+}

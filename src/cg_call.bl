@@ -1,44 +1,62 @@
 // cg_call.bl: every call, lowered to typed IR.
 //
 // One owner for "what C function does this call reach, and what arguments does it take".
-// Dispatch is keyed on the callee's declaration node and on the receiver's type id, never
-// on a method-name string crossed with a C-type ladder: the name a caller writes decides
-// which declaration is meant, and the declaration plus cname decide the symbol.
+// Dispatch is keyed on declarations, never on a method-name string crossed with a C-type
+// ladder: the name a caller writes decides which declaration is meant, and the declaration
+// plus cname decide the symbol. A receiver reaches its impls through the declaration its
+// type id names, and, for the builtin containers that declare nothing at all, through the
+// kind name an `impl ... for List[T]` header writes.
 //
 // The seams this module publishes replace the refusals cg_expr records for the shapes it
 // does not own: the Eq or Ord method a comparison operator desugars to, the Display call
 // an interpolation hole needs, the container copy a spread performs, and the element read
-// that `[i]` and `.get(i)` share. Each takes its operands already lowered, so cg_expr
-// keeps control of evaluation order and of the statements an operand hoisted.
+// that `[i]` and `.get(i)` share. Every one of them takes the written node and lowers its
+// own operands only once it has resolved, so that a seam which refuses has built nothing.
+// The printer reaches a node only by following the kids of a root it is given, so a node
+// with no parent is never printed; what a refusal must not leave behind is a hoisted
+// statement, because the pending buffer is spliced into the enclosing block whole. Lowering
+// last is what keeps a refusal clear of both.
 
 import parser.{
-    node_kind, node_name, node_left, node_obj, node_method, node_args,
-    node_methods, node_impl_binders, node_type_params, node_trait_name,
-    node_module, node_source_module,
-    get_annotation, sublist_get, sublist_length,
+    node_kind, node_name, node_left, node_right, node_obj, node_index, node_method, node_args,
+    node_line,
+    node_methods, node_trait_name, node_impl_binders, node_type_params,
+    node_module, node_source_module, node_params, node_fields,
+    sublist_get, sublist_length,
 }
 import ast.{NodeKind, nk_of, node_kind_name}
 import typecheck.{
     TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, lookup_named_type,
+    DECL_NODE_AMBIGUOUS,
     is_import_module_name, is_builtin_namespace, is_builtin_fn, tc_alias_to_original,
-    tc_qualifier_to_module_or_self, tc_get_symbol_module, TYPE_STR,
+    tc_qualifier_to_module_or_self, tc_get_symbol_module, tc_type_str,
+    tc_enum_variant_slots, tc_evar_name, tc_names_a_type,
+    TYPE_INT, TYPE_BOOL, TYPE_STR,
 }
 import layout.{
-    LayoutRecord, Position, SlotForm, layout_of, tid_of_node,
+    LayoutRecord, Position, SlotForm, Slot, layout_of, carrier_member_layout, tid_of_node,
+    child_tid, ensure_typedef_for, format_spec_of, varargs_spelling,
     tid_of_binder, current_binder_scope, current_inst, decl_has_derive,
+    container_slot_spelling, field_layout_of,
 }
 import mono.{instances, instance_for_call}
-import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls}
+import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls, cg_reg_trait_decls}
 import cname.{
-    c_fn_decl_name, c_impl_method_name, c_display_dispatch_name, c_derive_method_name,
-    c_runtime_helper,
+    c_fn_decl_name, c_impl_method_name, c_impl_method_name_q,
+    c_display_dispatch_name, c_derive_method_name,
+    c_runtime_helper, c_ffi_symbol, c_mint_local, c_string_literal, c_field_name,
+    cname_ffi_struct_mirror,
 }
-import ir.{ir_tid, ir_call_direct, ir_call_runtime, ir_cast, ir_unary, ir_unbox}
-import cg_expr.{lower_expr}
-import cg_decl.{cg_decl_takes_ev}
+import ir.{
+    ir_call_direct, ir_call_runtime, ir_cast, ir_unary, ir_unbox, ir_box,
+    ir_assign, ir_binary, ir_block, ir_carrier_tag, ir_carrier_unwrap, ir_carrier_wrap,
+    ir_const, ir_if, ir_let, ir_panic, ir_struct_new, ir_var_ref, ir_field_get,
+}
+import cg_expr.{lower_expr, cg_expr_push_pending}
+import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
 import diagnostics.{
-    Diag, diag_ice_at, diag_ice_stage_not_built, CODEGEN_STAGE_NOT_BUILT,
-    UNSOLVED_TYPEVAR_AT_CODEGEN,
+    Diag, diag_ice_at, diag_ice_stage_not_built, diag_file_for_node, diag_source_file,
+    CODEGEN_STAGE_NOT_BUILT, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 
 // The trait whose synthesized dispatcher renders a value into a string, the two traits
@@ -50,6 +68,35 @@ let trait_eq = "Eq"
 let trait_ord = "Ord"
 let method_eq = "eq"
 let method_get = "get"
+
+// What the impl selector answers when more than one impl is written over the receiver and
+// the refusal is already recorded. It has to stay apart from the -1 that means no impl is
+// written at all: a caller that reads a refusal as an absence goes on to its own second
+// choice and swallows the report.
+let IMPL_REFUSED = -2
+
+// What the declaration resolver answers when the name is declared more than once: a
+// refusal already reported, told apart from a name nothing declares at all.
+let DECL_REFUSED = -2
+
+// What the intrinsic table answers when it owns the method but cannot build this call: a
+// refusal already reported. It has to stay apart from the empty row that means the table
+// does not own the method, because that row sends the caller on to the impls and then to
+// a second refusal for the same cause. No table writes a row of one colon.
+let ROW_REFUSED = ":"
+
+// What an arity table answers for a key it does not own. No call is written with a
+// negative number of arguments, so it can never equal a count read off a call.
+let NO_ARITY = -1
+
+// What typecheck answers for a type that declares no node of its own. Every other answer
+// names a declaration, including the one that says two modules declare the name and the
+// pair is unresolved, so only this exact value means "there is no declaration".
+let NO_DECL_NODE = -1
+
+// What a call with no receiver passes where a receiver node would go. A free function is
+// written without one, so there is no node to lower and nothing precedes the arguments.
+let NO_RECEIVER = -1
 
 // ── Seams ─────────────────────────────────────────────────────────────────
 
@@ -65,8 +112,7 @@ pub fn lower_call(node: Int) -> Int ! Diag.Report {
 
 // `a == b` on a struct or data enum operand: C's own operators do not compare an
 // aggregate, so the comparison is the method the type derived.
-pub fn lower_operator_method(node: Int, op: Str, lhs: Int, rhs: Int) -> Int ! Diag.Report {
-    if lhs < 0 || rhs < 0 { return -1 }
+pub fn lower_operator_method(node: Int, op: Str) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = cc_local(tid, node)
@@ -77,15 +123,23 @@ pub fn lower_operator_method(node: Int, op: Str, lhs: Int, rhs: Int) -> Int ! Di
             "an ordering operator desugars to Ord.cmp against an Ordering variant")
         return -1
     }
-    let decl = tc_tid_decl_node(ir_tid(lhs))
+    // The operand's own type, not the Bool the comparison answers: the method belongs to
+    // what is being compared.
+    let operand = tid_of_node(node_left(node))
+    if operand < 0 { return -1 }
+    let decl = tc_tid_decl_node(operand)
     if decl < 0 {
         diag_ice_at("EqualityOperandNotDerived", CODEGEN_STAGE_NOT_BUILT,
-            "a {tk_name(cc_kind(ir_tid(lhs)))} operand has no derived equality method", node,
+            "a {tk_name(cc_kind(operand))} operand has no derived equality method", node,
             "only a declared struct or enum derives Eq; another operand needs its own lowering")
         return -1
     }
-    let symbol = cc_equality_symbol(node, decl, ir_tid(lhs))
+    let symbol = cc_equality_symbol(node, decl, operand)
     if symbol == "" { return -1 }
+    let lhs = lower_expr(node_left(node))
+    if lhs < 0 { return -1 }
+    let rhs = lower_expr(node_right(node))
+    if rhs < 0 { return -1 }
     let eq = ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, [lhs, rhs])
     if op == "==" { return eq }
     ir_unary(tid, node, rec.c_spelling, "!", eq)
@@ -97,7 +151,8 @@ pub fn lower_operator_method(node: Int, op: Str, lhs: Int, rhs: Int) -> Int ! Di
 // said: the derive stage still emits its own body, and nothing reaches it. "" is answered
 // after an internal error is recorded.
 fn cc_equality_symbol(node: Int, decl: Int, recv_tid: Int) -> Str ! Diag.Report {
-    let im = cc_impl_for(recv_tid, trait_eq)
+    let im = cc_impl_for(node, recv_tid, trait_eq)
+    if im == IMPL_REFUSED { return "" }
     if im >= 0 { return c_impl_method_name(im, method_eq) }
     if cc_derives_equality(decl) { return c_derive_method_name(decl, method_eq) }
     diag_ice_at("EqualityMethodNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
@@ -115,19 +170,41 @@ fn cc_derives_equality(decl: Int) -> Bool {
 // An interpolation hole whose type has no printf form renders through the sealed
 // dispatcher the compiler synthesizes next to the user's `Display.fmt`. A missing impl is
 // an internal error: typecheck has already proved one exists.
-pub fn lower_display_call(part: Int, value: Int) -> Int ! Diag.Report {
+pub fn lower_display_call(part: Int) -> Int ! Diag.Report {
+    let tid = tid_of_node(part)
+    if tid < 0 { return -1 }
+    // The impl is found before the hole is lowered, so a type that cannot be shown is
+    // refused having built nothing.
+    let im = cc_display_impl(part, tid)
+    if im < 0 { return -1 }
+    let value = lower_expr(part)
     if value < 0 { return -1 }
-    let tid = ir_tid(value)
-    let im = cc_impl_for(tid, trait_display)
-    if im < 0 {
-        diag_ice_at("DisplayImplNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "a {tk_name(cc_kind(tid))} hole has no Display impl to call", part,
-            "typecheck must reject a hole whose type cannot be shown; this is a compiler bug")
-        return -1
-    }
-    let rec = cc_local(TYPE_STR, part)
+    cc_display_call(part, im, value)
+}
+
+// The same rendering for a value this stage built rather than read from an expression: the
+// value a panic names is taken out of a carrier, so there is no node left to lower. The
+// route is the impl lookup and the call, which is why they are two functions and not one.
+pub fn lower_display_of_value(node: Int, tid: Int, value: Int) -> Int ! Diag.Report {
+    let im = cc_display_impl(node, tid)
+    if im < 0 { return -1 }
+    cc_display_call(node, im, value)
+}
+
+fn cc_display_impl(node: Int, tid: Int) -> Int ! Diag.Report {
+    let im = cc_impl_for(node, tid, trait_display)
+    if im == IMPL_REFUSED { return -1 }
+    if im >= 0 { return im }
+    diag_ice_at("DisplayImplNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "a {tk_name(cc_kind(tid))} value has no Display impl to call", node,
+        "typecheck must reject a value whose type cannot be shown; this is a compiler bug")
+    -1
+}
+
+fn cc_display_call(node: Int, im: Int, value: Int) -> Int ! Diag.Report {
+    let rec = cc_local(TYPE_STR, node)
     if cc_stopped(rec) { return -1 }
-    ir_call_direct(TYPE_STR, part, rec.c_spelling, c_display_dispatch_name(im), rec.slot_form, [value])
+    ir_call_direct(TYPE_STR, node, rec.c_spelling, c_display_dispatch_name(im), rec.slot_form, [value])
 }
 
 // `[..xs, y]` copies every element of `xs` into the container being built. The copy is a
@@ -144,27 +221,138 @@ pub fn lower_spread(node: Int, into_tid: Int) -> Int ! Diag.Report {
 // type, and `.get(i)`, which answers an Option over it. Only the index is routed here yet;
 // the checked read keeps its arm so that the refusal names the right gap when it is.
 //
-// Everything the read can refuse is settled before any node is built, so a refusal leaves
-// no half-made read behind. The operands arrive already lowered, which is the caller's
-// choice of evaluation order, so those two nodes are the caller's to account for.
-pub fn lower_element_read(node: Int, obj: Int, index: Int) -> Int ! Diag.Report {
-    if obj < 0 || index < 0 { return -1 }
+// The read takes the written node and lowers its own operands, last of all. Everything
+// this seam can refuse is settled first, off the types alone, so a read it cannot build
+// returns before either operand is built. The order is the whole gain here, not one line
+// of emitted C: a node no answer names is never printed. The statements an operand hoists
+// are what would reach C, and lower_expr already takes those back on any refusal.
+pub fn lower_element_read(node: Int) -> Int ! Diag.Report {
     if cc_read_is_checked(node) { return cc_checked_read(node) }
     if nk_of(node_kind(node)) != NodeKind.IndexExpr { return cc_not_an_element_read(node) }
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
-    let helper = cc_element_helper(node, ir_tid(obj))
+    // The container's own type is read before the helper is chosen, because a helper asked
+    // for the kind of a type that was never recorded names a second, invented gap on top of
+    // the one already reported.
+    let container = tid_of_node(node_obj(node))
+    if container < 0 { return -1 }
+    let helper = cc_element_helper(node, container)
     if helper == "" { return -1 }
-    let slot = cc_element_layout(node, tid, Position.ContainerSlot)
-    if cc_stopped(slot) { return -1 }
+    let shape = cc_element_shape(node, tid)
+    if cc_shape_stopped(shape) { return -1 }
+    let obj = lower_expr(node_obj(node))
+    if obj < 0 { return -1 }
+    let index = lower_expr(node_index(node))
+    if index < 0 { return -1 }
+    let raw = ir_call_runtime(tid, node, shape.slot.c_spelling, helper, shape.slot.slot_form, [obj, index])
+    let read = ir_cast(tid, node, shape.slot.c_spelling, cc_from_slot_word(tid, node, shape.slot, raw))
+    if !shape.boxed { return read }
+    ir_unbox(tid, node, shape.value.c_spelling, shape.value.slot_form, read)
+}
+
+// ── Element shape ─────────────────────────────────────────────────────────
+
+// What one element IS once it sits in a container slot. A slot is one machine word, so a
+// value wider than that word goes on the heap and the slot holds the pointer to it. The
+// decision is layout's: PointerBoxed IS the answer "box it", and reading it here rather
+// than re-deriving it keeps one producer for the fact.
+//
+// The read and the store both ask this, which is what holds them in step. A store that
+// boxed where the read unboxes would hand the runtime a pointer the read then treats as a
+// value, and nothing downstream could tell the two apart.
+type ElementShape {
+    tid: Int
+    slot: LayoutRecord
+    value: LayoutRecord
+    boxed: Bool
+}
+
+fn cc_element_shape(node: Int, elem_tid: Int) -> ElementShape ! Diag.Report {
+    let slot = cc_element_layout(node, elem_tid, Position.ContainerSlot)
+    let stopped = ElementShape { tid: -1, slot: cc_stop(slot), value: cc_stop(slot), boxed: false }
+    if cc_stopped(slot) { return stopped }
     let boxed = slot.slot_form == SlotForm.PointerBoxed
-    if !boxed && slot.slot_form != SlotForm.InlineWord { return cc_element_slot_form(node, tid) }
-    let value = if boxed { cc_element_layout(node, tid, Position.Local) } else { slot }
-    if cc_stopped(value) { return -1 }
-    let raw = ir_call_runtime(tid, node, slot.c_spelling, helper, slot.slot_form, [obj, index])
-    let read = ir_cast(tid, node, slot.c_spelling, raw)
-    if !boxed { return read }
-    ir_unbox(tid, node, value.c_spelling, value.slot_form, read)
+    if !boxed && slot.slot_form != SlotForm.InlineWord {
+        cc_element_slot_form(node, elem_tid)
+        return stopped
+    }
+    if !boxed { return ElementShape { tid: elem_tid, slot: slot, value: slot, boxed: false } }
+    let value = cc_element_layout(node, elem_tid, Position.Local)
+    if cc_stopped(value) { return stopped }
+    // A boxed element is allocated and dereferenced by its own spelling, and for a carrier
+    // that spelling names a typedef the unit has to declare first. Queueing it is what
+    // every other producer of a carrier-typed value does; cg_decl drains the queue.
+    ensure_typedef_for(elem_tid)
+    ElementShape { tid: elem_tid, slot: slot, value: value, boxed: true }
+}
+
+fn cc_shape_stopped(shape: ElementShape) -> Bool { cc_stopped(shape.slot) }
+
+// The shape of a call that stores nothing. It reads as stopped, and reports nothing on its
+// way there: no layout was asked for, so none declined. A caller that reached for it by
+// mistake refuses instead of building from a record nothing filled in.
+fn cc_absent_shape() -> ElementShape {
+    let none = layout_of(-1, Position.Local)
+    ElementShape { tid: -1, slot: none, value: none, boxed: false }
+}
+
+// ── An element and the slot word ──────────────────────────────────────────
+//
+// A slot is one pointer-wide cell, and a word-sized element moves through it as an integer
+// of the cell's own width. The width is the reason for that integer: an element narrower
+// than a pointer converted straight to or from the cell asks C to change a value's kind and
+// its size in one step, which it diagnoses. Layout leaves the word empty for an element
+// that is already a pointer, and for every boxed one, so both directions fall through to
+// the single conversion they had before.
+//
+// Both directions read the word off one record. A store that converted where the read did
+// not would put a value in the cell that comes back as a different value, and nothing
+// between them could tell.
+
+// The cell's content at the cell's own width, ready for the conversion that spells it as
+// the element's own type.
+fn cc_from_slot_word(tid: Int, node: Int, slot: LayoutRecord, value: Int) -> Int {
+    if slot.slot_word == "" { return value }
+    ir_cast(tid, node, slot.slot_word, value)
+}
+
+// The element at the cell's own width, and then the cell's own type. The second conversion
+// is not decoration: every entry point takes the cell as a pointer, and C makes no pointer
+// out of an integer on its own, nor drops a const on the way in.
+fn cc_to_slot_word(tid: Int, node: Int, slot: LayoutRecord, value: Int) -> Int {
+    let widened = if slot.slot_word == "" { value } else { ir_cast(tid, node, slot.slot_word, value) }
+    ir_cast(tid, node, container_slot_spelling(), widened)
+}
+
+// One element entering one slot, by whichever of the two routes this element takes. A value
+// too wide for the word is copied to the heap, and the address left behind is already the
+// cell's own width and its own kind, so it converts once.
+//
+// The box carries the ELEMENT's tid: the slot form, not the tid, is what records that the
+// value sits behind a pointer. Its own spelling is the pointer type, and the pointee
+// spelling is what the printer writes inside sizeof.
+fn cc_into_slot(node: Int, shape: ElementShape, value: Int) -> Int ! Diag.Report {
+    // An empty slot word is how layout spells a pointer element, and it is also all a
+    // stopped record has left. Testing the word alone would read one as the other and
+    // convert a declined type once, silently, instead of refusing it.
+    if cc_shape_stopped(shape) { return cc_slot_shape_missing(node) }
+    if shape.boxed { return ir_box(shape.tid, node, shape.slot.c_spelling, shape.value.c_spelling, value) }
+    cc_to_slot_word(shape.tid, node, shape.slot, value)
+}
+
+// One element of a container literal entering one slot. The expression stage selects which
+// elements a literal writes; this stage selects the form each one takes in the cell. A
+// literal that converted where a push and a read do not would fill cells that give back
+// other values than the ones written.
+//
+// Shaping the slot first is what keeps a refusal from stranding an operand in the arena.
+// The layout that declined has reported its own reason, so this adds none.
+pub fn lower_element_store(node: Int, container_tid: Int, slot: Slot) -> Int ! Diag.Report {
+    let shape = cc_slot_shape(node, container_tid, cc_kind(container_tid), slot)
+    if cc_shape_stopped(shape) { return -1 }
+    let value = lower_expr(node)
+    if value < 0 { return -1 }
+    cc_into_slot(node, shape, value)
 }
 
 // ── Element reads ─────────────────────────────────────────────────────────
@@ -194,13 +382,23 @@ fn cc_not_an_element_read(node: Int) -> Int ! Diag.Report {
     -1
 }
 
-// A slot holds the element in the word or behind a pointer, and the read answers each of
-// those. A third form would need a third read, so it is refused rather than cast as if it
-// were the word.
+// A slot holds the element in the word or behind a pointer, and both directions answer
+// each of those. A third form would need a third conversion, so it is refused rather than
+// converted as if it were the word. Layout answers only those two at a container slot, so
+// reaching this is a fault in layout and not a stage that was never written.
 fn cc_element_slot_form(node: Int, elem_tid: Int) -> Int ! Diag.Report {
-    diag_ice_at("ElementSlotFormNotLowered", CODEGEN_STAGE_NOT_BUILT,
+    diag_ice_at("ElementSlotFormNotLowered", UNSOLVED_TYPEVAR_AT_CODEGEN,
         "a {tk_name(cc_kind(elem_tid))} element sits in its slot in neither of the two forms",
         node, "an element slot is one machine word, so layout answers InlineWord or PointerBoxed")
+    -1
+}
+
+// A store reached a slot whose element layout never spelled. The decline was reported where
+// it was found, so this says only that nothing was built on top of it.
+fn cc_slot_shape_missing(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("ElementSlotFormNotLowered", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "a value entering a container slot has no element layout to enter it by",
+        node, "the layout that declined was reported already; no store is built on a declined one")
     -1
 }
 
@@ -254,13 +452,13 @@ fn lower_module_call(node: Int, obj: Int) -> Int ! Diag.Report {
 // -1 is a refusal the resolver already reported.
 fn cc_free_call(node: Int, decl: Int) -> Int ! Diag.Report {
     if decl < 0 { return -1 }
-    let symbol = cc_callee_symbol(node, decl)
+    let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
     if symbol == "" { return -1 }
     if cg_decl_takes_ev(decl) {
         cc_ev_not_in_ir(node)
         return -1
     }
-    cc_direct(node, symbol, [])
+    cc_build_call(node, symbol, NO_RECEIVER, CallForm.Declared)
 }
 
 // The name the declaration was written under. An import may rename what it brings in, and
@@ -269,21 +467,23 @@ fn cc_declared_name(written: Str) -> Str {
     tc_alias_to_original.get(written) ?? written
 }
 
-// The C name of the function this call reaches. A plain declaration is its own symbol; a
-// template has no symbol at all, so the answer is the name of the instance the
-// monomorphisation pass registered for this very call site. "" after an internal error.
-fn cc_callee_symbol(node: Int, decl: Int) -> Str ! Diag.Report {
-    if !cc_is_instantiated(decl) { return c_fn_decl_name(decl) }
-    cc_instance_name(node, decl)
-}
-
-// Whether a call of this declaration reaches an instance rather than the declaration
-// itself. A generic declaration is a template, which has no C name until its binders are
-// chosen. A declaration bridged to C is the one exception: the bridge is a single
-// type-erased symbol, so the pass instantiates nothing for it.
-fn cc_is_instantiated(decl: Int) -> Bool {
-    if get_annotation(decl, "ffi") != -1 { return false }
-    cc_is_generic(decl)
+// The C name of the function this call reaches. `declared` is the name a body written
+// under the declaration's own name would carry, which is the answer for every site but
+// two: a template has no name of its own, so the call names the instance the
+// monomorphisation pass registered for this very call site, and a declaration bound
+// straight to a foreign symbol names that symbol. "" after an internal error.
+//
+// Where the body was written is cg_decl's question and is asked there. Both ends of a
+// call have to read the same answer, and the declaration cannot be re-read for it here:
+// an impl header carries `[T]` whether its C is one shared body or one per element, so
+// the binders alone cannot tell the two apart.
+fn cc_call_symbol(node: Int, decl: Int, declared: Str) -> Str ! Diag.Report {
+    match cg_decl_body_site(decl) {
+        BodySite.ThisUnit => declared
+        BodySite.ForeignWrapper => declared
+        BodySite.PerInstance => cc_instance_name(node, decl)
+        BodySite.Nothing => c_ffi_symbol(decl)
+    }
 }
 
 // The registered instance for a generic call, which must be an instance of the very
@@ -327,19 +527,10 @@ fn cc_fn_declared_in(module_key: Str, name: Str) -> Int {
 // is an internal error rather than a guess, because the wrong choice is a call to the
 // wrong function.
 fn cc_fn_anywhere(node: Int, name: Str) -> Int ! Diag.Report {
-    let mut found = -1
-    let mut clashes = 0
-    for f in cg_reg_fn_decls() {
-        if node_name(f) != name { continue }
-        if found >= 0 { clashes = clashes + 1 }
-        found = f
-    }
-    if found >= 0 && clashes == 0 { return found }
-    if found < 0 { return cc_no_such_callee(node) }
-    diag_ice_at("CalleeAmbiguous", UNSOLVED_TYPEVAR_AT_CODEGEN,
-        "'{name}' is declared in more than one module and the call names neither", node,
-        "the call needs the declaration typecheck resolved, which it does not record yet")
-    -1
+    let decl = cc_sole_fn_named(node, name)
+    if decl == DECL_REFUSED { return -1 }
+    if decl < 0 { return cc_no_such_callee(node) }
+    decl
 }
 
 // Typecheck accepted the call, so the name is not undeclared: it binds a closure value, or
@@ -358,61 +549,2053 @@ fn cc_no_module_member(node: Int) -> Int ! Diag.Report {
     -1
 }
 
+// ── Intrinsic namespaces ─────────────────────────────────────
+//
+// `io` and `env` are provided by the compiler rather than declared by a module, so there
+// is no declaration to resolve and the method name is the whole key, which is what
+// typecheck reads to accept the call in the first place.
+//
+// The names divide by what stands between the call and the stream it reaches. Five io
+// names and five env names are operations of an effect: each is a slot of a vtable the
+// evidence vector points at, so a handler installed over the call site replaces it for the
+// length of its body, and lib/std's own testing module installs one. Calling the runtime
+// default for those would build a program no handler can change, which is a wrong answer
+// rather than a missing one. The two `_raw` names deliberately have no slot, so nothing
+// stands between them and the stream, but the runtime publishes no call that writes a
+// rendered value raw either. The last four read and write the standard streams through
+// calls the runtime does publish, so those are built.
+
+let ns_io = "io"
+let ns_env = "env"
+let ns_ffi = "ffi"
+
+// The io names a handler can replace, and the env names it can. Both lists are written
+// under the names a caller writes, not under the vtable slots they reach, because the
+// slot is only needed by a lowering that builds the dispatch.
+let io_handler_ops: List[Str] = ["println", "print", "eprintln", "eprint", "log"]
+let env_effect_ops: List[Str] = ["var", "cwd", "set_var", "remove_var", "exit"]
+
+// The two io names the spec holds outside the handler system: they write the stream
+// directly and raise no trace.
+let io_raw_ops: List[Str] = ["print_raw", "eprint_raw"]
+
+fn lower_namespace_call(node: Int, obj: Int) -> Int ! Diag.Report {
+    let ns = node_name(obj)
+    if ns == ns_io { return lower_io_call(node, node_method(node)) }
+    if ns == ns_env { return lower_env_call(node, node_method(node)) }
+    if ns == ns_ffi { return lower_ffi_call(node, node_method(node)) }
+    cc_ns_not_built(node, ns, node_method(node))
+}
+
+// The whole of what the `ffi` namespace answers is a new arena. Every operation over that
+// arena is a method of the scope the `with` binds, so this one name is the only one here,
+// and the arena is the runtime's own: it holds the pointers it later frees.
+fn lower_ffi_call(node: Int, method: Str) -> Int ! Diag.Report {
+    if method != "scope" { return cc_ns_not_built(node, ns_ffi, method) }
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_ctor_arity_wrong(node, ns_ffi, method, 0, given) }
+    cc_build_call(node, c_runtime_helper("ffi_scope_new"), NO_RECEIVER, CallForm.Runtime)
+}
+
+fn lower_io_call(node: Int, method: Str) -> Int ! Diag.Report {
+    if io_handler_ops.contains(method) { return cc_effect_op(node, ns_io, method) }
+    if io_raw_ops.contains(method) { return cc_raw_print(node, method) }
+    let helper = io_stream_helper(method)
+    if helper == "" { return cc_ns_not_built(node, ns_io, method) }
+    cc_build_call(node, helper, NO_RECEIVER, CallForm.Runtime)
+}
+
+// The four io names with nothing in the path: two read the standard input and two write
+// the standard output. None of them is a slot of the io vtable, so none of them is an
+// operation a handler replaces.
+fn io_stream_helper(method: Str) -> Str {
+    if method == "read_line" { return c_runtime_helper("stdin_read_line") }
+    if method == "read_bytes" { return c_runtime_helper("stdin_read_bytes") }
+    if method == "write" { return c_runtime_helper("stdout_write") }
+    if method == "write_bytes" { return c_runtime_helper("stdout_write_bytes") }
+    ""
+}
+
+fn lower_env_call(node: Int, method: Str) -> Int ! Diag.Report {
+    if env_effect_ops.contains(method) { return cc_effect_op(node, ns_env, method) }
+    if method == "args" { return cc_env_args(node) }
+    cc_ns_not_built(node, ns_env, method)
+}
+
+// An operation a handler can replace. The call reaches a slot of a vtable the evidence
+// vector points at, and no IR node reads one: the perform node the printer writes names a
+// single member where a builtin effect needs two, the vector's field and the operation in
+// the vtable behind it.
+fn cc_effect_op(node: Int, ns: Str, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("IntrinsicEffectOpNotInIr", CODEGEN_STAGE_NOT_BUILT,
+        "'{ns}.{method}' is dispatched through the evidence vector, which no IR node reads", node,
+        "an effect operation needs an IR node the printer writes as a vtable slot of the vector")
+    -1
+}
+
+// A raw write. It takes any value the Display trait renders, and the runtime publishes no
+// call that accepts one: the four stream calls above take text or bytes already, and the
+// step that turns a value into text belongs to the seam that lowers an interpolation.
+fn cc_raw_print(node: Int, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("RawPrintNotInRuntime", CODEGEN_STAGE_NOT_BUILT,
+        "'io.{method}' writes a rendered value raw, and the runtime publishes no such call", node,
+        "a raw write needs a runtime call taking text, and the value rendered into it first")
+    -1
+}
+
+// The runtime exposes the argument count and one reader per index, and no call that
+// answers the whole list, so the list is filled one element at a time by a loop. A loop is
+// a statement, and the call seam hoists none.
+fn cc_env_args(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("EnvArgumentListNotBuilt", CODEGEN_STAGE_NOT_BUILT,
+        "'env.args' fills its list one element at a time, and this stage hoists no loop", node,
+        "the list needs the statement stage to hold the loop, or a runtime call answering it whole")
+    -1
+}
+
+// A namespace method with no lowering here. Two shapes arrive: a namespace whose whole
+// lowering is still to come, and a name typecheck leaves unsigned on purpose, io.debug,
+// which is meant to stop at the unresolved-method error before codegen ever sees it. Both
+// answer the same way, naming the namespace and the method rather than the group, and both
+// answer before the call's type is read, because a node typecheck never stamped has no
+// type to read.
+fn cc_ns_not_built(node: Int, ns: Str, method: Str) -> Int ! Diag.Report {
+    diag_ice_stage_not_built("cg_call intrinsic '{ns}.{method}'", node)
+    -1
+}
+
+
+// ── The foreign surface ───────────────────────────────────────────────────
+//
+// Three receivers reach C with no Blink body between them and it: the arena a
+// `with ffi.scope()` opens, a raw pointer, and a field reached through one. Each needs
+// only the tid the call already carries. The arena's operations are runtime calls over the
+// handle it holds; pointer arithmetic is C's own, which steps by the pointee the receiver
+// is spelled at; a field through a pointer is a dereference and then the field, which is
+// the pair the printer writes for every other field of that struct.
+
+// The arena operations the runtime publishes. `alloc` and `alloc_n` are absent because
+// each is sized by the type it allocates and no argument carries a size.
+fn cc_scope_runtime_op(method: Str) -> Str {
+    if method == "cstr" { return "ffi_scope_cstr" }
+    if method == "take" { return "ffi_scope_take" }
+    ""
+}
+
+// Each takes the one pointer or string it is handed. The count is checked here because
+// the front end lets a call with too few arguments through, and a runtime call built
+// short of its prototype is a C error rather than a Blink one.
+fn cc_scope_op_arity(op: Str) -> Int {
+    if op == "ffi_scope_cstr" { return 1 }
+    if op == "ffi_scope_take" { return 1 }
+    NO_ARITY
+}
+
+fn cc_lower_scope_method(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
+    if method == "alloc" || method == "alloc_n" { return cc_allocation_size_not_in_ir(node, method) }
+    let op = cc_scope_runtime_op(method)
+    if op == "" { return cc_intrinsic_not_built(node, TyKind.FfiScope, method) }
+    let want = cc_scope_op_arity(op)
+    let given = sublist_length(node_args(node))
+    if given != want { return cc_intrinsic_arity_wrong(node, TyKind.FfiScope, method, want, given) }
+    cc_build_call(node, c_runtime_helper(op), obj, CallForm.Runtime)
+}
+
+// `scope.alloc()` and `scope.alloc_n(n)` take room for a type, and the room is that type's
+// size in bytes. No IR node carries a size. The one size the printer writes is the heap
+// copy a Box makes, and it writes it from that node's own pointee name; an allocation is
+// not a copy, so nothing here can borrow it. Writing the size into this stage instead
+// would put C text in a producer, which is the one thing no producer here may do.
+fn cc_allocation_size_not_in_ir(node: Int, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("AllocationSizeNotInIr", CODEGEN_STAGE_NOT_BUILT,
+        "'scope.{method}' must say how many bytes its pointee takes, and no IR node carries a size",
+        node, "the IR needs a node the printer writes as the size of a named type")
+    -1
+}
+
+// `p.offset(n)` steps the pointer by n of what it points at. C does the stepping and steps
+// by the pointee, so the whole of what makes the answer right is that the pointer is
+// spelled at its own type. The call's tid is that type: typecheck preserves the pointee
+// across an offset, so the result is spelled exactly as the receiver is.
+fn cc_lower_ptr_method(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
+    if method != "offset" { return cc_intrinsic_not_built(node, TyKind.Ptr, method) }
+    let given = sublist_length(node_args(node))
+    if given != 1 { return cc_intrinsic_arity_wrong(node, TyKind.Ptr, method, 1, given) }
+    let recv = tid_of_node(obj)
+    if recv < 0 { return -1 }
+    if !cc_stride_is_known(recv) { return cc_offset_stride_unknown(node) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    let base = lower_expr(obj)
+    if base < 0 { return -1 }
+    let step = lower_expr(sublist_get(node_args(node), 0))
+    if step < 0 { return -1 }
+    ir_binary(tid, node, rec.c_spelling, "+", base, step)
+}
+
+// `p.f.read()` and `p.f.write(v)`. The receiver is the PLACE the field occupies, not a
+// value of the field's type, so the pair is recognised by the SHAPE of the receiver — a
+// field access whose own object points at a declared type — and by no type at all.
+// Typecheck resolves the same pair on the same shape (src/typecheck.bl:13437); recognising
+// it by the field's type instead would put `read` and `write` on every value of that type.
+fn cc_is_ptr_field_place(obj: Int, method: Str) -> Bool ! Diag.Report {
+    if method != "read" && method != "write" { return false }
+    if nk_of(node_kind(obj)) != NodeKind.FieldAccess { return false }
+    let inner = node_obj(obj)
+    if cc_names_a_module(inner) { return false }
+    let base = tid_of_node(inner)
+    if base < 0 { return false }
+    cc_points_at_foreign_struct(base)
+}
+
+// `mod.NAME.read()` reads another module's global. The qualifier names a module, not a
+// value, so nothing records a type for it and asking for one reports a bug that is not
+// one. A binding of that name outranks the module, which is the rule name resolution
+// applied when it typed the access.
+fn cc_names_a_module(obj: Int) -> Bool {
+    if nk_of(node_kind(obj)) != NodeKind.Ident { return false }
+    if tid_of_binder(current_binder_scope(), node_name(obj)) >= 0 { return false }
+    is_import_module_name(node_name(obj)) != 0
+}
+
+// A pointer at a type a foreign header lays out. The annotation is the whole of the test,
+// because it is what typecheck tests (tc_ptr_ffi_struct_pointee): a pointer at an ordinary
+// Blink struct resolves `read` and `write` on the field's own type instead, and lowering a
+// field store for it would emit a different program than the one that typechecked.
+fn cc_points_at_foreign_struct(ptr_tid: Int) -> Bool {
+    if cc_kind(ptr_tid) != TyKind.Ptr { return false }
+    let pointee = child_tid(ptr_tid, Slot.Inner1)
+    if pointee < 0 { return false }
+    cname_ffi_struct_mirror(tc_tid_decl_node(pointee))
+}
+
+// `p.offset(n)` steps by the pointee, so the pointee has to be a type whose size C knows.
+// A foreign mirror is spelled as the struct the header declares and steps by it; `Ptr[Void]`
+// and a pointer at a type no header lays out spell one word and step by a byte, which is
+// the wrong answer written as if it were the right one.
+fn cc_stride_is_known(ptr_tid: Int) -> Bool {
+    cc_points_at_foreign_struct(ptr_tid)
+}
+
+fn cc_offset_stride_unknown(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("PointerStrideUnknown", CODEGEN_STAGE_NOT_BUILT,
+        "'Ptr.offset' steps by what the pointer points at, and this pointer points at a type no foreign header lays out",
+        node, "offset a Ptr to an @ffi.struct type, whose stride is the struct the header declares")
+    -1
+}
+
+fn cc_lower_ptr_field(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
+    if method == "write" { return cc_field_store_not_a_value(node) }
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, TyKind.Ptr, method, 0, given) }
+    let base = tid_of_node(node_obj(obj))
+    if base < 0 { return -1 }
+    let field_tid = tid_of_node(obj)
+    if field_tid < 0 { return -1 }
+    let decl = tc_tid_decl_node(child_tid(base, Slot.Inner1))
+    let rec = cc_foreign_field(node, decl, field_tid)
+    if cc_stopped(rec) { return -1 }
+    let place = cc_deref(node, obj, base)
+    if place < 0 { return -1 }
+    ir_field_get(field_tid, node, rec.c_spelling, c_field_name(node_name(obj)), rec.slot_form, place)
+}
+
+// `p.f.write(v)` stores into the field. A store is a statement, and this stage answers with
+// a value: the IR says so itself, because it refuses a statement in every slot that wants a
+// value, and a method call reaches the printer through one of those slots. So the store
+// cannot be built here, under any spelling, without emitting C the printer has to reject.
+fn cc_field_store_not_a_value(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("FieldStoreNotAValue", CODEGEN_STAGE_NOT_BUILT,
+        "'write' through a pointer stores into a field, and a store is a statement this stage cannot answer with",
+        node, "the statement stage owns the store: it holds the only slot a FieldSet fits")
+    -1
+}
+
+// The struct the pointer addresses. A pointer local is one machine word and reads as a
+// value, so nothing about the pointer itself says the field behind it is reached through
+// it: the dereference is written, and it is written at the pointee's own layout.
+fn cc_deref(node: Int, obj: Int, ptr_tid: Int) -> Int ! Diag.Report {
+    let pointee = child_tid(ptr_tid, Slot.Inner1)
+    let held = cc_local(pointee, node)
+    if cc_stopped(held) { return -1 }
+    let ptr = lower_expr(node_obj(obj))
+    if ptr < 0 { return -1 }
+    ir_unbox(pointee, node, held.c_spelling, held.slot_form, ptr)
+}
+
+// A field of a type laid out by a foreign header. Every one of those fields is a sized
+// integer or a pointer, so a decline here is not a type this stage cannot spell but a
+// declaration that never reached layout at all.
+fn cc_foreign_field(node: Int, decl: Int, field_tid: Int) -> LayoutRecord ! Diag.Report {
+    let rec = field_layout_of(decl, field_tid)
+    let why = "a field reached through a pointer has no C layout: {rec.decline_reason}"
+    if rec.decline_reason != "" {
+        diag_ice_at("UnspellableForeignField", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
+            "a foreign struct lays out every field at a width C names; this is a compiler bug")
+    }
+    rec
+}
+
+// ── Static and associated calls ───────────────────────────────────────────
+
+// A call whose qualifier names a type rather than a value. Blink has no inherent methods
+// (sections/03c_protocols.md:758): `Duration.seconds(2)` IS the free function
+// `Duration_seconds`, written under a qualifier. So the resolution here is the same one
+// typecheck performs to give the call a type, read from the same declarations, and the
+// only calls it cannot answer for are the ones no declaration stands behind.
+//
+// A builtin type declares nothing at all, so its constructors are calls the runtime
+// publishes and the register of runtime names answers first. Everything else resolves to a
+// declaration; failing that, a qualifier that names an enum is naming a variant, which is a
+// construction and not a call.
+fn lower_static_call(node: Int, obj: Int) -> Int ! Diag.Report {
+    let owner = node_name(obj)
+    let method = node_method(node)
+    // Read on the qualifier's SPELLING, and above the builtin gate, because that is what
+    // typecheck resolves this one pair on: its arm keys on the name `Char` alone, takes no
+    // declaration into account, and sits above its own builtin gate. Keying this on the
+    // answer instead, or reading it below the declaration rung, would let a program that
+    // declares `Char_from_code_point` be typed as one function and emitted as another.
+    if owner == char_type_name && method == from_code_point_method {
+        return cc_char_from_code_point(node)
+    }
+    if is_builtin_fn(owner) == 1 { return lower_builtin_static_call(node, owner, method) }
+    lower_declared_static_call(node, owner, method)
+}
+
+// A constructor of a type the compiler provides. Read BEFORE any declaration, because that
+// is the order typecheck resolves these in: tc_builtin_static_ret answers first and only a
+// pair it does not own falls through to the `{Type}_{method}` signature. Resolving a
+// declaration first would let a program that declares `Bytes_new` reach a different
+// function than the one its call was typed as, which is a call typed as one thing and
+// emitted as another. A pair this table does not own falls through the same way.
+fn lower_builtin_static_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
+    let answer = tid_of_node(node)
+    if answer < 0 { return -1 }
+    let symbol = cc_runtime_ctor_symbol(cc_kind(answer), method)
+    if symbol != "" {
+        let want = cc_runtime_ctor_arity(cc_kind(answer), method)
+        let given = sublist_length(node_args(node))
+        if given != want { return cc_ctor_arity_wrong(node, owner, method, want, given) }
+        return cc_build_call(node, symbol, NO_RECEIVER, CallForm.Runtime)
+    }
+    if method == "new" && cc_is_keyed_container(cc_kind(answer)) {
+        return cc_container_ctor_not_built(node, cc_kind(answer))
+    }
+    lower_declared_static_call(node, owner, method)
+}
+
+// Everything the qualifier can name once the compiler's own constructors have declined.
+// The rungs are the ones typecheck resolves a static call through, in its order, because
+// the two ends have to reach ONE declaration: a call typed as one function and emitted as
+// another is the failure this stage exists to exclude.
+//
+//   1. a variant of an enum the qualifier names. Typecheck decides this above the whole
+//      static ladder, so a free function spelled `{Enum}_{Variant}` never takes it over.
+//   2. a method written in an impl over the type, under the trait-qualified key.
+//   3. the free function the qualifier and the method name spell.
+//   4. a conversion, which is keyed source-typed and so is read only after 3 misses.
+fn lower_declared_static_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
+    if cc_names_variant(owner, method) { return cc_enum_ctor_not_in_ir(node, owner, method) }
+    let im = cc_trait_qualified_impl(owner, method)
+    if im >= 0 { return cc_impl_static_call(node, im, method) }
+    let decl = cc_sole_fn_named(node, cc_assoc_name(owner, method))
+    if decl == DECL_REFUSED { return -1 }
+    if decl >= 0 { return cc_free_call(node, decl) }
+    if cc_is_conversion(method) { return cc_conversion_call(node, owner, method) }
+    if cc_impls_declaring(owner, method) > 1 { return cc_static_impl_ambiguous(node, owner, method) }
+    diag_ice_stage_not_built("cg_call static call '{owner}.{method}'", node)
+    -1
+}
+
+// `Trait.method(value, ...)`: the qualifier says which trait's method is meant when more
+// than one trait over the same type declares the name. The value is the first written
+// argument rather than a receiver, so nothing here is a receiver and the qualifier only
+// picks the symbol; every argument then travels in source order, as it is written.
+fn lower_trait_qualified_call(node: Int, obj: Int) -> Int ! Diag.Report {
+    let trait_name = node_name(obj)
+    let method = node_method(node)
+    let args = node_args(node)
+    if args == -1 || sublist_length(args) == 0 {
+        return cc_trait_call_without_value(node, trait_name, method)
+    }
+    let recv_tid = tid_of_node(sublist_get(args, 0))
+    if recv_tid < 0 { return -1 }
+    let im = cc_impl_for(node, recv_tid, trait_name)
+    if im == IMPL_REFUSED { return -1 }
+    if im < 0 || cc_method_index(im, method) < 0 {
+        return cc_trait_impl_not_found(node, trait_name, method, recv_tid)
+    }
+    cc_impl_static_call(node, im, method)
+}
+
+// A trait qualifier with no value after it. The trait names where the method is written and
+// nothing else, so a call that passes nothing names no type to write it over.
+fn cc_trait_call_without_value(node: Int, trait_name: Str, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("TraitCallWithoutValue", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{trait_name}.{method}' was given no value to call it on", node,
+        "typecheck must reject a trait-qualified call that passes no value; this is a compiler bug")
+    -1
+}
+
+// A trait-qualified call this stage cannot resolve to an impl. The traits the compiler
+// dispatches itself are declared and never implemented in source, so a call qualified by
+// one of those arrives here and is refused rather than built from a symbol no impl writes.
+fn cc_trait_impl_not_found(node: Int, trait_name: Str, method: Str, recv_tid: Int) -> Int ! Diag.Report {
+    diag_ice_stage_not_built(
+        "cg_call trait-qualified call '{trait_name}.{method}' over {tk_name(cc_kind(recv_tid))}", node)
+    -1
+}
+
+// Whether the qualifier names an enum and the method names one of its variants. Both
+// halves matter: an enum also carries associated functions, and those are not variants.
+fn cc_names_variant(owner: Str, method: Str) -> Bool {
+    let owner_tid = lookup_named_type(owner)
+    if owner_tid < 0 { return false }
+    if cc_kind(owner_tid) != TyKind.Enum { return false }
+    for slot in tc_enum_variant_slots(owner_tid) {
+        if tc_evar_name(slot) == method { return true }
+    }
+    false
+}
+
+// The impl over the qualified type that declares this method under the trait-qualified
+// key. A conversion is excluded because it is keyed source-typed instead, and is read a
+// rung lower; more than one answering impl leaves no single key either, so the rung
+// declines and the free function below is asked, exactly as typecheck does.
+fn cc_trait_qualified_impl(owner: Str, method: Str) -> Int {
+    let mut found = -1
+    let mut matches = 0
+    for im in cc_impls_over(owner, method) {
+        if cc_is_source_typed(im, method) { continue }
+        matches = matches + 1
+        found = im
+    }
+    if matches == 1 { return found }
+    -1
+}
+
+// A conversion. One target can carry a conversion from several sources, so these are keyed
+// `{Target}_{method}_{Source}` and the argument's own type is the third of the key. That is
+// why they are read below the free function rather than beside the other impl methods.
+fn cc_conversion_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
+    let args = node_args(node)
+    let given = if args == -1 { 0 } else { sublist_length(args) }
+    if given != 1 { return cc_ctor_arity_wrong(node, owner, method, 1, given) }
+    let src_tid = tid_of_node(sublist_get(args, 0))
+    if src_tid < 0 { return -1 }
+    let src = tc_type_str(src_tid)
+    let mut found = -1
+    let mut matches = 0
+    for im in cc_impls_over(owner, method) {
+        if cc_impl_source_name(im) != src { continue }
+        matches = matches + 1
+        found = im
+    }
+    if matches == 1 { return cc_impl_static_call(node, found, method) }
+    if matches == 0 { return cc_conversion_not_declared(node, owner, method, src) }
+    cc_static_impl_ambiguous(node, owner, method)
+}
+
+// A conversion no impl declares. Ambiguity and absence are different faults, and the one
+// that reads "more than one" for a call that matched none names a cause the program does
+// not have.
+fn cc_conversion_not_declared(node: Int, owner: Str, method: Str, src: Str) -> Int ! Diag.Report {
+    diag_ice_at("ConversionImplNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "no impl over '{owner}' declares '{method}' from '{src}'", node,
+        "typecheck resolved this call, so the impl it chose has to be readable here")
+    -1
+}
+
+// Every impl written over the qualified type that declares a method of this name.
+fn cc_impls_over(owner: Str, method: Str) -> List[Int] {
+    let mut out: List[Int] = []
+    let key = cc_owner_key(owner)
+    if key.decl < 0 && key.builtin == "" { return out }
+    for im in cg_reg_impl_decls() {
+        if cc_method_index(im, method) < 0 { continue }
+        if !cc_impl_answers_for(im, key.decl, key.builtin) { continue }
+        out.push(im)
+    }
+    out
+}
+
+fn cc_impls_declaring(owner: Str, method: Str) -> Int {
+    cc_impls_over(owner, method).len()
+}
+
+// What an impl over the qualifier is matched by. A declared type is matched by its
+// declaration; a builtin declares nothing, so it is matched by the name an impl over it
+// writes in its header. One type answers one of the two, which is why both are read at once
+// and the registry is asked for the qualifier only once.
+//
+// A name more than one module declares matches NEITHER: the declaration is unknown, and
+// reading it as absent would make the qualifier a builtin it is not.
+type OwnerKey { decl: Int  builtin: Str }
+
+fn cc_owner_key(owner: Str) -> OwnerKey {
+    let owner_tid = lookup_named_type(owner)
+    if owner_tid < 0 {
+        if tc_names_a_type(owner) { return OwnerKey { decl: -1, builtin: owner } }
+        return OwnerKey { decl: -1, builtin: "" }
+    }
+    let decl = tc_tid_decl_node(owner_tid)
+    if decl == DECL_NODE_AMBIGUOUS { return OwnerKey { decl: -1, builtin: "" } }
+    OwnerKey { decl: decl, builtin: cc_builtin_owner_name(owner_tid) }
+}
+
+// The two methods Blink keys source-typed. Typecheck gates its own source-typed rung on
+// these same two names, so the rung is entered from both ends on one rule.
+fn cc_is_conversion(method: Str) -> Bool {
+    method == "from" || method == "try_from"
+}
+
+// Whether cname keys this impl's method by the source it converts from rather than by the
+// trait that declares it. The rule lives in cname and is read back from it rather than
+// written out a second time: the two spellings agree exactly when the key carries no source.
+fn cc_is_source_typed(im: Int, method: Str) -> Bool {
+    c_impl_method_name(im, method) != c_impl_method_name_q(im, node_trait_name(im), method)
+}
+
+// The source type an impl converts from: the first type argument of the trait it writes,
+// which is the same slot cname spells the symbol from and typecheck registers the key
+// under, so the selection and the symbol cannot disagree.
+fn cc_impl_source_name(im: Int) -> Str {
+    let tps = node_type_params(im)
+    if tps == -1 || sublist_length(tps) == 0 { return "" }
+    node_name(sublist_get(tps, 0))
+}
+
+fn cc_static_impl_ambiguous(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("StaticImplAmbiguous", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "more than one impl over '{owner}' declares '{method}' and the argument names neither", node,
+        "the call needs the impl typecheck resolved, which it does not record yet")
+    -1
+}
+
+// A call of an impl method under a type name rather than on a value. It passes no receiver:
+// the qualifier names where the method is written, and every operand is an ordinary
+// argument, which is what makes it associated rather than a method on anything.
+fn cc_impl_static_call(node: Int, im: Int, method: Str) -> Int ! Diag.Report {
+    let decl = cc_method_of(im, method)
+    if decl < 0 { return -1 }
+    if cg_decl_takes_ev(decl) {
+        cc_ev_not_in_ir(node)
+        return -1
+    }
+    let symbol = cc_call_symbol(node, decl, c_impl_method_name(im, method))
+    if symbol == "" { return -1 }
+    cc_build_call(node, symbol, NO_RECEIVER, CallForm.Declared)
+}
+
+// The runtime call a builtin type's constructor reaches. An empty answer means the pair
+// names no runtime constructor. Keyed on the KIND the call answers with rather than on the
+// qualifier's spelling; the method is the other half of the key, because `new` names a
+// different constructor under every type and two of these answer for a second name.
+fn cc_runtime_ctor_symbol(answer: TyKind, method: Str) -> Str {
+    if answer == TyKind.Bytes {
+        if method == "new" { return c_runtime_helper("bytes_new") }
+        if method == "from_str" { return c_runtime_helper("bytes_from_str") }
+        if method == "zeroed" { return c_runtime_helper("bytes_zeroed") }
+        return ""
+    }
+    if answer == TyKind.StringBuilder {
+        if method == "new" { return c_runtime_helper("sb_new") }
+        if method == "with_capacity" { return c_runtime_helper("sb_with_capacity") }
+    }
+    ""
+}
+
+// How many arguments that same runtime call takes. Keyed exactly as the symbol above is, so
+// the two read the same table; a pair the symbol declines is never asked for an arity.
+fn cc_runtime_ctor_arity(answer: TyKind, method: Str) -> Int {
+    if answer == TyKind.Bytes {
+        if method == "new" { return 0 }
+        if method == "from_str" { return 1 }
+        if method == "zeroed" { return 1 }
+        return NO_ARITY
+    }
+    if answer == TyKind.StringBuilder {
+        if method == "new" { return 0 }
+        if method == "with_capacity" { return 1 }
+    }
+    NO_ARITY
+}
+
+// A container whose keys the runtime compares and hashes through a table it is handed.
+fn cc_is_keyed_container(answer: TyKind) -> Bool {
+    answer == TyKind.Map || answer == TyKind.Set
+}
+
+// A constructor written with the wrong number of arguments. Typecheck checks the arity of
+// some of these and not others, so the check is repeated here rather than assumed: the
+// runtime call takes a fixed count, and building it from a different one would hand the C
+// compiler a call it cannot compile, with no Blink span on the error.
+fn cc_ctor_arity_wrong(node: Int, owner: Str, method: Str, want: Int, got: Int) -> Int ! Diag.Report {
+    diag_ice_at("RuntimeCtorArityWrong", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{owner}.{method}' takes {want} argument(s), and this call was given {got}", node,
+        "typecheck must reject this call before codegen reads it; this is a compiler bug")
+    -1
+}
+
+// The name an associated function is declared under. The qualifier and the method are
+// joined, which is the key typecheck resolves the call through and therefore the only
+// spelling that can name the same declaration from here.
+fn cc_assoc_name(owner: Str, method: Str) -> Str {
+    "{cc_declared_name(owner)}_{method}"
+}
+
+// The one declaration of this name, or ABSENT when the program declares none. A name two
+// modules both declare is refused rather than guessed, and says so once, so the caller
+// stops instead of refusing a second time under another heading.
+fn cc_sole_fn_named(node: Int, name: Str) -> Int ! Diag.Report {
+    let mut found = -1
+    let mut clashes = 0
+    for f in cg_reg_fn_decls() {
+        if node_name(f) != name { continue }
+        if found >= 0 { clashes = clashes + 1 }
+        found = f
+    }
+    if clashes == 0 { return found }
+    diag_ice_at("CalleeAmbiguous", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{name}' is declared in more than one module and the call names neither", node,
+        "the call needs the declaration typecheck resolved, which it does not record yet")
+    DECL_REFUSED
+}
+
+// A variant constructor. The value is one arm of a tagged union, written as a tag beside a
+// member of the union the tag selects, and the member is itself a struct with one field per
+// payload element. The carrier node builds a tag beside ONE named member and nothing
+// deeper, so there is no node here that builds this and no spelling for the member's own
+// type to build it with.
+fn cc_enum_ctor_not_in_ir(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("EnumConstructorNotInIr", CODEGEN_STAGE_NOT_BUILT,
+        "'{owner}.{method}' fills one arm of a tagged union, and no node builds that shape", node,
+        "the IR needs a variant constructor that names the arm as well as the tag")
+    -1
+}
+
+// A container constructor. The value the runtime answers with carries a table of the
+// operations its keys are compared and hashed by, chosen from the key type and passed by
+// address; no written argument supplies it and no node names it, so the call cannot be
+// built from what the program wrote.
+fn cc_container_ctor_not_built(node: Int, answer: TyKind) -> Int ! Diag.Report {
+    diag_ice_at("ContainerCtorNeedsKeyOps", CODEGEN_STAGE_NOT_BUILT,
+        "'{tk_name(answer)}.new' answers a container whose key operations are chosen from the key type", node,
+        "the IR needs a node that names the key-operations table for a key type")
+    -1
+}
+
+// ── Char.from_code_point ──────────────────────────────────────────────────
+//
+// The one associated function on a builtin type that answers a carrier. Unicode assigns a
+// scalar value to some numbers and reserves the rest, so which arm the call fills is decided
+// while the program runs. The runtime owns that decision and answers the code point back, or
+// a number below zero for one it refuses; this stage only writes the two arms.
+//
+// Two arms filled from one test is a temp two assignments write, because an `if` is a
+// statement and no IR node holds a value a condition chooses.
+
+let char_type_name = "Char"
+let from_code_point_method = "from_code_point"
+let char_validate_primitive = "char_validate_code_point"
+let code_point_refused_below = 0
+let code_point_refused_said = "not a valid Unicode scalar value"
+
+fn cc_is_an_integer(kind: TyKind) -> Bool {
+    kind == TyKind.Int || cc_is_sized_int(kind)
+}
+
+fn cc_code_point_not_an_integer(node: Int, from_tid: Int) -> Int ! Diag.Report {
+    diag_ice_at("CodePointNotAnInteger", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{char_type_name}.{from_code_point_method}' reads a code point, and this call was given '{tc_type_str(from_tid)}'", node,
+        "typecheck must reject this call before codegen reads it; this is a compiler bug")
+    -1
+}
+
+fn cc_char_from_code_point(node: Int) -> Int ! Diag.Report {
+    let args = node_args(node)
+    let given = if args == -1 { 0 } else { sublist_length(args) }
+    if given != 1 { return cc_ctor_arity_wrong(node, char_type_name, from_code_point_method, 1, given) }
+    let arg = sublist_get(args, 0)
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let from_tid = tid_of_node(arg)
+    if from_tid < 0 { return -1 }
+    // The runtime reads the code point as one machine integer, so a value of any other kind
+    // would be handed to it under a spelling it does not answer for.
+    if !cc_is_an_integer(cc_kind(from_tid)) { return cc_code_point_not_an_integer(node, from_tid) }
+    // Every spelling and every refusal is settled before the argument is lowered, so a call
+    // this stage cannot write leaves no statement hoisted behind it.
+    let carrier = cc_local(tid, node)
+    if cc_stopped(carrier) { return -1 }
+    let verdict = cc_local(TYPE_INT, node)
+    if cc_stopped(verdict) { return -1 }
+    let answered = cc_local(TYPE_BOOL, node)
+    if cc_stopped(answered) { return -1 }
+    let ok_mem = cc_member_layout(node, tid, Slot.Inner1)
+    if cc_stopped(ok_mem) { return -1 }
+    let err_mem = cc_member_layout(node, tid, Slot.Inner2)
+    if cc_stopped(err_mem) { return -1 }
+    let fault = cc_conversion_error_plan(node, child_tid(tid, Slot.Inner2), from_tid, child_tid(tid, Slot.Inner1))
+    if fault.texts.len() == 0 { return -1 }
+    let code = lower_expr(arg)
+    if code < 0 { return -1 }
+    let _td = ensure_typedef_for(tid)
+    cc_char_result(node, tid, carrier, verdict, answered, ok_mem, err_mem, fault, code)
+}
+
+// The three statements the call leaves behind, and the temp they fill. The verdict is bound
+// because the test reads it and the accepted arm holds it, so the runtime is asked once
+// however many times its answer is read.
+fn cc_char_result(node: Int, tid: Int, carrier: LayoutRecord, verdict: LayoutRecord,
+        answered: LayoutRecord, ok_mem: LayoutRecord, err_mem: LayoutRecord,
+        fault: ConversionErrorPlan, code: Int) -> Int ! Diag.Report {
+    let said = c_mint_local("u")
+    let held = c_mint_local("u")
+    cg_expr_push_pending(node, ir_let(TYPE_INT, node, verdict.c_spelling, said, verdict.slot_form,
+        ir_call_runtime(TYPE_INT, node, verdict.c_spelling,
+            c_runtime_helper(char_validate_primitive), verdict.slot_form, [code])))
+    cg_expr_push_pending(node, ir_let(tid, node, carrier.c_spelling, held, carrier.slot_form, -1))
+    let accepted = ir_binary(TYPE_BOOL, node, answered.c_spelling, ">=",
+        cc_temp_ref(node, TYPE_INT, verdict, said),
+        ir_const(TYPE_INT, node, verdict.c_spelling, "{code_point_refused_below}"))
+    let good = ir_carrier_wrap(tid, node, carrier.c_spelling, carrier_ok_member,
+        ir_const(TYPE_INT, node, verdict.c_spelling, "{TAG_OK}"),
+        ir_cast(child_tid(tid, Slot.Inner1), node, ok_mem.c_spelling,
+            cc_temp_ref(node, TYPE_INT, verdict, said)))
+    let bad = ir_carrier_wrap(tid, node, carrier.c_spelling, carrier_err_member,
+        ir_const(TYPE_INT, node, verdict.c_spelling, "{TAG_ERR}"), cc_conversion_error_value(node, err_mem, fault))
+    cg_expr_push_pending(node, ir_if(node, accepted,
+        ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), good)]),
+        ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), bad)])))
+    cc_temp_ref(node, tid, carrier, held)
+}
+
+// One read of a bound temp. Each read is its own node: a node reached twice is a tree that
+// is not one, and the verifier says so.
+fn cc_temp_ref(node: Int, tid: Int, rec: LayoutRecord, name: Str) -> Int {
+    ir_var_ref(tid, node, rec.c_spelling, name, rec.slot_form)
+}
+
+// The text of a conversion error, in the order its declaration writes its fields. A struct
+// is written as a positional literal, so the order is read off the declaration rather than
+// assumed: a field this call has no text for is refused here instead of being filled with
+// the text of the field beside it.
+type ConversionErrorPlan { tid: Int  spelling: Str  string_spelling: Str  texts: List[Str] }
+
+fn cc_conversion_error_plan(node: Int, err_tid: Int, from_tid: Int, to_tid: Int) -> ConversionErrorPlan ! Diag.Report {
+    let empty = ConversionErrorPlan { tid: -1, spelling: "", string_spelling: "", texts: [] }
+    if err_tid < 0 { return cc_conversion_error_refused(node, "no error arm to build", empty) }
+    let decl = tc_tid_decl_node(err_tid)
+    if decl == DECL_NODE_AMBIGUOUS { return cc_conversion_error_refused(node, "a name more than one module declares", empty) }
+    let fields = if decl < 0 { -1 } else { node_fields(decl) }
+    if fields == -1 { return cc_conversion_error_refused(node, "no declaration to read fields from", empty) }
+    let shape = cc_local(err_tid, node)
+    if cc_stopped(shape) { return empty }
+    let text = cc_local(TYPE_STR, node)
+    if cc_stopped(text) { return empty }
+    let from = tc_type_str(from_tid)
+    let to = tc_type_str(to_tid)
+    let mut texts: List[Str] = []
+    let mut i = 0
+    while i < sublist_length(fields) {
+        let fname = node_name(sublist_get(fields, i))
+        let wrote = cc_conversion_error_text(fname, from, to)
+        if wrote == "" { return cc_conversion_error_refused(node, "a field '{fname}' with no text to write", empty) }
+        texts.push(wrote)
+        i = i + 1
+    }
+    if texts.len() == 0 { return cc_conversion_error_refused(node, "no fields at all", empty) }
+    ConversionErrorPlan { tid: err_tid, spelling: shape.c_spelling, string_spelling: text.c_spelling, texts: texts }
+}
+
+fn cc_conversion_error_text(field: Str, from: Str, to: Str) -> Str {
+    if field == conversion_error_message_field { return code_point_refused_said }
+    if field == conversion_error_source_field { return from }
+    if field == conversion_error_target_field { return to }
+    ""
+}
+
+fn cc_conversion_error_refused(node: Int, why: Str, empty: ConversionErrorPlan) -> ConversionErrorPlan ! Diag.Report {
+    diag_ice_at("ConversionErrorShapeUnknown", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "the conversion error this call builds has {why}", node,
+        "the declaration of the error and the text this call writes have to agree")
+    empty
+}
+
+// The value the refused arm holds. A member the carrier keeps by pointer gets a heap copy,
+// which is the same rule every other wrap of a payload follows.
+fn cc_conversion_error_value(node: Int, err_mem: LayoutRecord, fault: ConversionErrorPlan) -> Int {
+    let mut fields: List[Int] = []
+    for text in fault.texts {
+        fields.push(ir_const(TYPE_STR, node, fault.string_spelling, c_string_literal(text)))
+    }
+    let built = ir_struct_new(fault.tid, node, fault.spelling, fields)
+    if err_mem.slot_form != SlotForm.PointerBoxed { return built }
+    ir_box(fault.tid, node, err_mem.c_spelling, fault.spelling, built)
+}
+
+// The fields a conversion error declares. Written out here because this call fills them by
+// name and a name it does not know is a shape it cannot write.
+let conversion_error_message_field = "message"
+let conversion_error_source_field = "source_type"
+let conversion_error_target_field = "target_type"
+
 // ── Methods ───────────────────────────────────────────────────────────────
 
 fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let obj = node_obj(node)
     let role = cc_receiver_role(obj)
     if role == Receiver.Module { return lower_module_call(node, obj) }
-    if role != Receiver.Value {
-        diag_ice_stage_not_built(cc_role_stage(role), node)
-        return -1
-    }
+    if role == Receiver.Namespace { return lower_namespace_call(node, obj) }
+    if role == Receiver.TypeOwner { return lower_static_call(node, obj) }
+    if role == Receiver.TraitOwner { return lower_trait_qualified_call(node, obj) }
+    let mname = node_method(node)
+    if cc_is_ptr_field_place(obj, mname) { return cc_lower_ptr_field(node, obj, mname) }
     let recv_tid = tid_of_node(obj)
     if recv_tid < 0 { return -1 }
-    let im = cc_impl_with_method(recv_tid, node_method(node))
-    if im < 0 {
-        diag_ice_stage_not_built("cg_call builtin and trait-object methods", node)
-        return -1
-    }
-    if cc_is_generic(im) {
-        diag_ice_stage_not_built("cg_call monomorphised impl methods", node)
-        return -1
-    }
+    let kind = cc_kind(recv_tid)
+    // The intrinsic table is read BEFORE the impls, because that is the order typecheck
+    // reads the same two in (src/typecheck.bl:14382): a builtin method wins over a
+    // same-named user impl. Reading them the other way round here would emit the impl
+    // method for a call typecheck had already typed as the stdlib function.
+    let declared = cc_intrinsic_callee(node, kind, mname)
+    if declared == ROW_REFUSED { return -1 }
+    if declared != "" { return lower_intrinsic_method(node, obj, kind, mname, declared) }
+    let primitive = cc_runtime_method(kind, mname)
+    if primitive != "" { return cc_lower_runtime_method(node, obj, kind, mname, primitive) }
+    let keyed = cc_keyed_row(kind, mname)
+    if keyed.op != "" { return cc_lower_keyed_method(node, obj, kind, mname, keyed) }
+    if cc_is_map_slot_method(kind, mname) { return cc_map_slot_method(node, obj, kind, mname) }
+    if cc_is_scalar_cast(kind, mname) { return cc_scalar_cast(node, obj, kind, mname) }
+    if cc_is_char_text(kind, mname) { return cc_char_text(node, obj, kind, mname) }
+    if cc_is_carrier_test(kind, mname) { return cc_carrier_test(node, obj, kind, mname) }
+    if cc_is_carrier_read(kind, mname) { return cc_carrier_read(node, obj, kind, mname) }
+    if kind == TyKind.FfiScope { return cc_lower_scope_method(node, obj, mname) }
+    if kind == TyKind.Ptr { return cc_lower_ptr_method(node, obj, mname) }
+    let im = cc_impl_with_method(node, recv_tid, mname)
+    if im == IMPL_REFUSED { return -1 }
+    if im < 0 { return cc_method_not_built(node, kind, mname) }
     let method = cc_method_of(im, node_method(node))
     if method < 0 { return -1 }
     if cg_decl_takes_ev(method) {
         cc_ev_not_in_ir(node)
         return -1
     }
-    let receiver = lower_expr(obj)
-    if receiver < 0 { return -1 }
-    cc_direct(node, c_impl_method_name(im, node_method(node)), [receiver])
+    let symbol = cc_call_symbol(node, method, c_impl_method_name(im, node_method(node)))
+    if symbol == "" { return -1 }
+    cc_build_call(node, symbol, obj, CallForm.Declared)
 }
 
-// What the left of the dot names. Only a Value is a receiver to lower; the other three are
+// ── Intrinsic methods ─────────────────────────────────────────────────────
+//
+// A method of a builtin receiver that no program declares a body for. The sealed ops
+// traits in lib/std/traits.bl declare these and nothing implements them, by design, so
+// the impl path can never resolve one: the compiler knows what each means. Typecheck
+// knows the same thing from a table of the same shape (tc_ops_trait_qualified_ret), and
+// the two tables must name the same declaration for every pair, because a call typed as
+// one function and emitted as another is the failure this stage exists to exclude. That
+// is also why this table is read BEFORE the impls, as typecheck reads its twin.
+//
+// The table answers with a DECLARATION NAME, never a C symbol. Every callee then spells
+// its own name: a function written in Blink carries the module it was written in, and a
+// foreign binding carries the symbol its annotation gives, which its Blink name does not
+// always spell. Naming symbols here would repeat both rules and could disagree with them.
+fn lower_intrinsic_method(node: Int, obj: Int, kind: TyKind, method: Str, row: Str) -> Int ! Diag.Report {
+    let cut = row.index_of(":")
+    if cut < 0 { return cc_intrinsic_row_malformed(node, row) }
+    let module = row.substring(0, cut)
+    let name = row.substring(cut + 1, row.len() - cut - 1)
+    let decl = cc_stdlib_fn_named(node, module, name)
+    if decl == DECL_REFUSED { return -1 }
+    if decl < 0 { return cc_intrinsic_undeclared(node, kind, method, module, name) }
+    if cg_decl_takes_ev(decl) {
+        cc_ev_not_in_ir(node)
+        return -1
+    }
+    // The receiver is the declaration's first parameter, so the method takes one fewer
+    // argument than the function does. Typecheck checks the arity of a few of these and
+    // not the rest, so the check is made here rather than assumed: a call built from the
+    // wrong count reaches the C compiler with no Blink span on the error.
+    let want = sublist_length(node_params(decl)) - 1
+    let given = sublist_length(node_args(node))
+    if want != given { return cc_intrinsic_arity_wrong(node, kind, method, want, given) }
+    let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
+    if symbol == "" { return -1 }
+    cc_build_call(node, symbol, obj, CallForm.Declared)
+}
+
+// ── Element stores ────────────────────────────────────────────────────────
+
+// A method the standard library declares nothing for, which reaches a runtime primitive
+// instead. These are the stores, and a store is where an element enters a slot: what shape
+// it takes there is cc_element_shape's answer, read and not decided again here.
+//
+// Everything the store can refuse is settled off the types before any operand is lowered,
+// so a refusal has built nothing and hoisted nothing.
+fn cc_lower_runtime_method(node: Int, obj: Int, kind: TyKind, method: Str, op: Str) -> Int ! Diag.Report {
+    let want = cc_runtime_method_arity(op)
+    if want == NO_ARITY { return cc_runtime_arity_unrecorded(node, kind, method, op) }
+    let given = sublist_length(node_args(node))
+    if want != given { return cc_intrinsic_arity_wrong(node, kind, method, want, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let container = tid_of_node(obj)
+    if container < 0 { return -1 }
+    let shape = cc_slot_shape(node, container, kind, Slot.Inner1)
+    if cc_shape_stopped(shape) { return -1 }
+    let result = cc_local(tid, node)
+    if cc_stopped(result) { return -1 }
+    let receiver = lower_expr(obj)
+    if receiver < 0 { return -1 }
+    let args = cc_store_args(node, receiver, want, shape)
+    if args.len() == 0 { return -1 }
+    ir_call_runtime(tid, node, result.c_spelling, c_runtime_helper(op), result.slot_form, args)
+}
+
+// The receiver followed by the written arguments, with the element boxed if the slot holds
+// a pointer. The element is the LAST argument of every one of these: a store names where
+// it goes before it names what goes there, so a position argument can only come first.
+// An empty list is the refusal: every built list holds the receiver, so no answer this
+// builds can be empty.
+fn cc_store_args(node: Int, receiver: Int, count: Int, shape: ElementShape) -> List[Int] ! Diag.Report {
+    let mut out: List[Int] = [receiver]
+    let written = node_args(node)
+    let mut i = 0
+    while i < count {
+        let a = lower_expr(sublist_get(written, i))
+        if a < 0 { return [] }
+        if i == count - 1 {
+            out.push(cc_into_slot(node, shape, a))
+        } else {
+            out.push(a)
+        }
+        i = i + 1
+    }
+    out
+}
+
+// Which runtime primitive a receiver's method reaches, for the methods no Blink
+// declaration answers. Kept apart from the declaration table because the two answer
+// different things: that one names a function to call, this one names an ABI symbol.
+fn cc_runtime_method(kind: TyKind, method: Str) -> Str {
+    if kind != TyKind.List { return "" }
+    if method == "push" { return "list_push" }
+    if method == "set" { return "list_set" }
+    ""
+}
+
+// How many arguments each of those takes. A primitive with no row here is refused by name
+// rather than built from the sentinel, which would report a call as taking -1 arguments.
+fn cc_runtime_method_arity(op: Str) -> Int {
+    if op == "list_push" { return 1 }
+    if op == "list_set" { return 2 }
+    NO_ARITY
+}
+
+// ── Keyed containers ──────────────────────────────────────────────────────
+//
+// A Map and a Set hold their keys behind a table of the operations the runtime compares
+// and hashes them by. That table is chosen from the key type and baked into the value when
+// it is constructed, and every entry point reads it back off the receiver, so no method
+// passes one. What the key type decides here is only how the key ARGUMENT travels, because
+// the runtime takes every key as an address it may copy bytes out of.
+//
+// These rows are read before the impls for the same reason the intrinsic table is. The
+// standard library declares most of these methods on a `key: Str` parameter while
+// typecheck answers them for every key type, so a call with an Int key that reached those
+// declarations would pass an integer where the declaration says pointer, and the runtime
+// would read the integer as an address.
+
+// How a key argument reaches the runtime.
+//
+// Skipped: the argument is not a key at all, so it is lowered as written. Value: the
+// runtime reads the slot's pointer as the key itself, which it does for a Str and for
+// nothing else. Address: the entry point reads the key through the address it is given
+// and keeps nothing after it answers, so a local it reads from is enough, and every
+// lookup travels this way whatever the key's width. Boxed: the slot keeps the pointer,
+// so what it points at has to outlive the call, which is what a store puts there.
+type KeyTravel { Skipped, Value, Address, Boxed }
+
+type KeyPlan { travel: KeyTravel  tid: Int  value: LayoutRecord  slot: LayoutRecord }
+
+fn cc_key_stopped(p: KeyPlan) -> Bool { p.tid < 0 }
+
+// A key type with no table. The table is chosen from the key type alone: a builtin scalar
+// has one the runtime ships, a struct or an enum earns one by deriving Hash, and every
+// other type has none at all. A call on such a key has nothing to reach the runtime
+// through, whichever of those left it without one.
+fn cc_key_has_no_ops(node: Int, key_tid: Int) -> Int ! Diag.Report {
+    diag_ice_at("KeyOperationsNotAvailable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "a {tk_name(cc_kind(key_tid))} key has no table of the operations it is compared and hashed by",
+        node, "typecheck must reject a key type with no such table; this is a compiler bug")
+    -1
+}
+
+// A key the slot does not hold inline and does not hold as a pointer either. Layout answers
+// one of the two for every key that has a table, so a third answer is a broken invariant
+// rather than a shape this stage could build for.
+fn cc_key_slot_not_pointer(node: Int, key_tid: Int) -> Int ! Diag.Report {
+    diag_ice_at("KeySlotFormNotLowered", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "a {tk_name(cc_kind(key_tid))} key is neither stored inline nor stored behind a pointer",
+        node, "layout answers a key slot with one of those two forms; this is a compiler bug")
+    -1
+}
+
+// Every layout question a key raises, asked in one place and before anything is built.
+fn cc_key_plan(node: Int, container: Int, kind: TyKind, row: KeyedRow) -> KeyPlan ! Diag.Report {
+    let nothing = layout_of(-1, Position.Local)
+    let stopped = KeyPlan { travel: KeyTravel.Skipped, tid: -1, value: nothing, slot: nothing }
+    if !row.keyed { return KeyPlan { travel: KeyTravel.Skipped, tid: 0, value: nothing, slot: nothing } }
+    let key = child_tid(container, Slot.Inner1)
+    if key < 0 {
+        cc_element_type_unrecorded(node, kind)
+        return stopped
+    }
+    let value = cc_local(key, node)
+    if cc_stopped(value) { return stopped }
+    if value.kops_table == "" {
+        cc_key_has_no_ops(node, key)
+        return stopped
+    }
+    if cc_kind(key) == TyKind.Str {
+        return KeyPlan { travel: KeyTravel.Value, tid: key, value: value, slot: value }
+    }
+    if value.kops_inline_key {
+        return KeyPlan { travel: KeyTravel.Address, tid: key, value: value, slot: value }
+    }
+    let slot = cc_element_layout(node, key, Position.ContainerSlot)
+    if cc_stopped(slot) { return stopped }
+    if slot.slot_form != SlotForm.PointerBoxed {
+        cc_key_slot_not_pointer(node, key)
+        return stopped
+    }
+    // A key wider than a word is written by its own spelling wherever it is declared,
+    // whether that is the heap copy a store leaves behind or the local a lookup is read
+    // from, and for a carrier that spelling names a typedef the unit has to declare first.
+    ensure_typedef_for(key)
+    // Only a store leaves the key somewhere the container keeps reading. A lookup is
+    // answered before it returns, so it hands over the address of a local and allocates
+    // nothing, which is what every entry point but a store is owed.
+    if !row.retains { return KeyPlan { travel: KeyTravel.Address, tid: key, value: value, slot: slot } }
+    KeyPlan { travel: KeyTravel.Boxed, tid: key, value: value, slot: slot }
+}
+
+// The address an entry point reads the key through is the address of a local. Two things
+// about that local are load-bearing. It is declared by the KEY's spelling and not by the
+// argument's, so the bytes behind the address are the width the table was built to read.
+// And it is bound as a statement the enclosing expression can see, so a guarded operand
+// stays guarded: a value left for the printer to bind lands ahead of the test that was
+// written to skip it.
+fn cc_key_address(node: Int, plan: KeyPlan, value: Int) -> Int ! Diag.Report {
+    let name = c_mint_local("k")
+    // The declaration, the read and the address are one fact about the local written three
+    // times, so they are spelled from one answer and cannot come apart.
+    let spelling = plan.value.c_spelling
+    let form = plan.value.slot_form
+    cg_expr_push_pending(node, ir_let(plan.tid, node, spelling, name, form, value))
+    let held = ir_var_ref(plan.tid, node, spelling, name, form)
+    // The node answers an address while it is spelled by what the address points at,
+    // because layout mints no pointer spelling for a key. Its operand is already a name,
+    // so the printer writes this node in place and never reads the spelling back.
+    ir_unary(plan.tid, node, spelling, "&", held)
+}
+
+fn cc_key_arg(node: Int, plan: KeyPlan, written: Int) -> Int ! Diag.Report {
+    let a = lower_expr(written)
+    if a < 0 { return -1 }
+    match plan.travel {
+        KeyTravel.Skipped => a
+        KeyTravel.Value => a
+        KeyTravel.Address => cc_key_address(node, plan, a)
+        KeyTravel.Boxed => ir_box(plan.tid, node, plan.slot.c_spelling, plan.value.c_spelling, a)
+    }
+}
+
+// What the runtime hands back, and what the call answers with it.
+//
+// Truth: the entry point answers a flag as an integer and the call answers whether it was
+// not zero. Empty: the entry point answers a count and the call answers whether it was
+// zero. Plain: what the entry point answers is what the call answers.
+type KeyedForm { Truth, Empty, Plain }
+
+// One row: the runtime entry point, how many arguments the call is written with, whether
+// the first of them is a key, whether the entry point keeps that key after it answers,
+// whether the LAST of them is a value the container stores in a slot beside the key, and
+// what shape the answer takes coming back.
+type KeyedRow { op: Str  arity: Int  keyed: Bool  retains: Bool  slotted: Bool  form: KeyedForm }
+
+fn cc_keyed_none() -> KeyedRow {
+    KeyedRow { op: "", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Plain }
+}
+
+fn cc_keyed_row(kind: TyKind, method: Str) -> KeyedRow {
+    if kind == TyKind.Map {
+        // The one row that stores a value beside its key, so the one row whose last
+        // argument goes into a slot. The key is kept, the same way a set keeps one.
+        if method == "insert" { return KeyedRow { op: "map_set", arity: 2, keyed: true, retains: true, slotted: true, form: KeyedForm.Plain } }
+        if method == "contains_key" { return KeyedRow { op: "map_has", arity: 1, keyed: true, retains: false, slotted: false, form: KeyedForm.Truth } }
+        if method == "contains" { return KeyedRow { op: "map_has", arity: 1, keyed: true, retains: false, slotted: false, form: KeyedForm.Truth } }
+        if method == "remove" { return KeyedRow { op: "map_remove", arity: 1, keyed: true, retains: false, slotted: false, form: KeyedForm.Truth } }
+        if method == "len" { return KeyedRow { op: "map_len", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Plain } }
+        if method == "is_empty" { return KeyedRow { op: "map_len", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Empty } }
+        if method == "clear" { return KeyedRow { op: "map_clear", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Plain } }
+        if method == "keys" { return KeyedRow { op: "map_keys", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Plain } }
+        if method == "values" { return KeyedRow { op: "map_values", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Plain } }
+        return cc_keyed_none()
+    }
+    if kind == TyKind.Set {
+        // The one entry point here that keeps what it is handed: a set stores the item it
+        // is given, and every other row has finished with the key by the time it answers.
+        if method == "insert" { return KeyedRow { op: "set_insert", arity: 1, keyed: true, retains: true, slotted: false, form: KeyedForm.Truth } }
+        if method == "contains" { return KeyedRow { op: "set_contains", arity: 1, keyed: true, retains: false, slotted: false, form: KeyedForm.Truth } }
+        if method == "remove" { return KeyedRow { op: "set_remove", arity: 1, keyed: true, retains: false, slotted: false, form: KeyedForm.Truth } }
+        if method == "len" { return KeyedRow { op: "set_len", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Plain } }
+        if method == "is_empty" { return KeyedRow { op: "set_len", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Empty } }
+        // A union takes the other SET, not a key, so its argument is lowered as written.
+        if method == "union" { return KeyedRow { op: "set_union", arity: 1, keyed: false, retains: false, slotted: false, form: KeyedForm.Plain } }
+        return cc_keyed_none()
+    }
+    cc_keyed_none()
+}
+
+// The one Map method left that moves a value through the slot beside the key. The store
+// takes the slot word and is built with every other keyed call; the read is not finished by
+// taking it. It answers an Option, and filling a carrier takes statements this stage does
+// not hoist, which is the same thing that holds the bounds-checked list read. Counting it
+// against the slot word would have said that the word finishes it.
+fn cc_is_map_slot_method(kind: TyKind, method: Str) -> Bool {
+    kind == TyKind.Map && method == "get"
+}
+
+fn cc_map_slot_method(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    let container = tid_of_node(obj)
+    if container < 0 { return -1 }
+    if child_tid(container, Slot.Inner2) < 0 { return cc_element_type_unrecorded(node, kind) }
+    diag_ice_at("MapSlotMethodNotLowered", CODEGEN_STAGE_NOT_BUILT,
+        "'Map.{method}' takes a value back out of the slot beside the key, and no node wraps it",
+        node, "the IR needs a keyed read that answers the value in the carrier it was asked for, and a present test the value cannot supply: a stored 0 leaves the slot as the same null the runtime answers for a key it does not hold")
+    -1
+}
+
+// What a container holds in one of its slots. A container that recorded no type for that
+// slot is reported here and answered with a stopped shape, so every caller tests one thing
+// and a store never builds on a record nothing filled in.
+fn cc_slot_shape(node: Int, container: Int, kind: TyKind, slot: Slot) -> ElementShape ! Diag.Report {
+    let held = child_tid(container, slot)
+    if held < 0 {
+        cc_element_type_unrecorded(node, kind)
+        return cc_absent_shape()
+    }
+    cc_element_shape(node, held)
+}
+
+fn cc_lower_keyed_method(node: Int, obj: Int, kind: TyKind, method: Str, row: KeyedRow) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if row.arity != given { return cc_intrinsic_arity_wrong(node, kind, method, row.arity, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let container = tid_of_node(obj)
+    if container < 0 { return -1 }
+    let answer = cc_local(tid, node)
+    if cc_stopped(answer) { return -1 }
+    let plain = row.form == KeyedForm.Plain
+    // A row that reshapes the answer reads an integer back and compares it, so it needs the
+    // spelling of that integer as well as the spelling of what it answers. A row that hands
+    // back what the entry point answered needs neither, so it is not held to them.
+    let g = cc_guard_spellings(node)
+    if !plain && cc_guard_stopped(g) { return -1 }
+    let plan = cc_key_plan(node, container, kind, row)
+    if cc_key_stopped(plan) { return -1 }
+    // The shape of the stored value is settled here, beside every other layout question and
+    // ahead of the receiver, so a call this stage cannot build has lowered no operand.
+    let stored = if row.slotted { cc_slot_shape(node, container, kind, Slot.Inner2) } else { cc_absent_shape() }
+    if row.slotted && cc_shape_stopped(stored) { return -1 }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    let mut args = [recv]
+    let written = node_args(node)
+    // Every written argument is lowered once, at the position the row puts it in: the key
+    // first when the row is keyed, the stored value last when the row stores one. Choosing
+    // by position rather than by count keeps a row that takes more than those two from
+    // dropping the arguments between them.
+    let mut i = 0
+    while i < row.arity {
+        let w = sublist_get(written, i)
+        let mut a = 0
+        if row.keyed && i == 0 {
+            a = cc_key_arg(node, plan, w)
+        } else {
+            a = lower_expr(w)
+            if a >= 0 && row.slotted && i == row.arity - 1 { a = cc_into_slot(node, stored, a) }
+        }
+        if a < 0 { return -1 }
+        args.push(a)
+        i = i + 1
+    }
+    let call = ir_call_runtime(
+        if plain { tid } else { TYPE_INT }, node,
+        if plain { answer.c_spelling } else { g.tag },
+        c_runtime_helper(row.op),
+        if plain { answer.slot_form } else { SlotForm.InlineWord }, args)
+    if plain { return call }
+    let op = if row.form == KeyedForm.Truth { "!=" } else { "==" }
+    ir_binary(tid, node, answer.c_spelling, op, call, ir_const(TYPE_INT, node, g.tag, "0"))
+}
+
+// ── Scalar conversions ────────────────────────────────────────────────────
+//
+// A conversion between two scalars is one C cast: the value is reinterpreted at a new
+// width, and no call, no check and no rounding stands between the receiver and the
+// answer. Narrowing wraps and Float to Int truncates toward zero, both of which are what
+// the cast itself does, so neither needs anything written for it.
+//
+// Which pairs these are is typecheck's table, read here by the same two keys it is
+// written with: a receiver that IS a scalar, and a method named for what it answers.
+
+fn cc_is_scalar_cast(kind: TyKind, method: Str) -> Bool {
+    if method == "to_int" { return kind == TyKind.Float || kind == TyKind.Char || cc_is_sized_int(kind) }
+    if kind == TyKind.Int && method == "to_float" { return true }
+    if kind != TyKind.Int && !cc_is_sized_int(kind) { return false }
+    cc_names_int_width(method)
+}
+
+fn cc_is_sized_int(kind: TyKind) -> Bool {
+    match kind {
+        TyKind.I8 => true
+        TyKind.I16 => true
+        TyKind.I32 => true
+        TyKind.U8 => true
+        TyKind.U16 => true
+        TyKind.U32 => true
+        TyKind.U64 => true
+        _ => false
+    }
+}
+
+fn cc_names_int_width(method: Str) -> Bool {
+    if method == "to_i8" { return true }
+    if method == "to_i16" { return true }
+    if method == "to_i32" { return true }
+    if method == "to_u8" { return true }
+    if method == "to_u16" { return true }
+    if method == "to_u32" { return true }
+    if method == "to_u64" { return true }
+    false
+}
+
+// The cast is spelled from the type the CALL answers, never from the receiver's. One
+// method name narrows from one receiver and widens from another -- `to_int` is both --
+// so the receiver's own width says nothing about which of the two this call is, and the
+// call's tid is the only thing that does.
+fn cc_scalar_cast(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, kind, method, 0, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let answer = cc_local(tid, node)
+    if cc_stopped(answer) { return -1 }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    ir_cast(tid, node, answer.c_spelling, recv)
+}
+
+fn cc_is_char_text(kind: TyKind, method: Str) -> Bool {
+    kind == TyKind.Char && method == "to_str"
+}
+
+// A Char rendered as text. This is the one conversion off a scalar that no cast can make:
+// a code point becomes one to four bytes, and how many it becomes depends on the value.
+// The runtime encodes it, and the same helper the interpolation of a Char reaches.
+//
+// What the call answers is read off the call, the same way a cast reads it. Str is what
+// typecheck records here today, but writing Str instead of asking would make this the
+// second place that decides, and the one place that could not be told it was wrong.
+fn cc_char_text(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, kind, method, 0, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let answer = cc_local(tid, node)
+    if cc_stopped(answer) { return -1 }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    cc_char_text_of_value(node, answer.c_spelling, answer.slot_form, recv)
+}
+
+// How a code point becomes text. A panic that names a Char needs the same answer from a
+// value it already holds, and a second spelling of it would be a second answer.
+fn cc_char_text_of_value(node: Int, spelling: Str, form: SlotForm, value: Int) -> Int {
+    ir_call_runtime(TYPE_STR, node, spelling, c_runtime_helper("char_to_str"), form, [value])
+}
+
+// ── Carriers ──────────────────────────────────────────────────────────────
+//
+// Option and Result are built by the compiler, so no declaration answers their methods and
+// no runtime primitive does either: each one reads the carrier that is already in hand.
+// Four of them answer the tag alone and build one comparison. The other two read the
+// payload of one arm, which is only there when the tag says so, so each guards the read
+// and panics when the other arm is what it was given.
+//
+// The tag numbers and the member names are the ones a carrier is written with. A stage
+// that builds a carrier and a stage that matches on one spell the same pairs, and reading
+// Option's numbers for a Result would answer every value backwards.
+
+let carrier_value_member = "value"
+let carrier_ok_member = "ok"
+let carrier_err_member = "err"
+
+let TAG_NONE = 0
+let TAG_SOME = 1
+let TAG_OK = 0
+let TAG_ERR = 1
+
+fn cc_is_carrier_test(kind: TyKind, method: Str) -> Bool {
+    if kind == TyKind.Option { return method == "is_some" || method == "is_none" }
+    if kind == TyKind.Result { return method == "is_ok" || method == "is_err" }
+    false
+}
+
+fn cc_is_carrier_read(kind: TyKind, method: Str) -> Bool {
+    if kind == TyKind.Option { return method == "unwrap" }
+    if kind == TyKind.Result { return method == "unwrap" || method == "unwrap_err" }
+    false
+}
+
+// A test reads the tag and compares it. No arm is read, so there is nothing to guard, the
+// receiver is named once by the comparison itself, and no statement precedes it.
+fn cc_carrier_test(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    if !cc_carrier_arity_ok(node, kind, method) { return -1 }
+    let c = cc_carrier_of(node, obj)
+    if cc_carrier_missing(c) { return -1 }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    if c.held.slot_form == SlotForm.InlineWord {
+        return cc_handle_is(node, c, recv, method == "is_some")
+    }
+    cc_tag_equals(node, ir_carrier_tag(TYPE_INT, node, c.g.tag, recv), cc_carrier_true_tag(kind, method), c)
+}
+
+// A carrier layout answers one machine word only for the Option over an @ffi.opaque
+// handle, which is the handle itself: no tag member and no value member. None is written
+// as the null handle, so that one comparison is the whole test.
+fn cc_handle_is(node: Int, c: CarrierRef, on: Int, present: Bool) -> Int {
+    let op = if present { "!=" } else { "==" }
+    ir_binary(TYPE_BOOL, node, c.g.answer, op, on, ir_const(c.tid, node, c.held.c_spelling, "0"))
+}
+
+// The tag each test answers true for. It is read off the carrier kind as well as the name
+// so that an Option method can never answer a Result's numbering: the two disagree on
+// which arm is 1, and a name alone would answer every value of one of them backwards.
+fn cc_carrier_true_tag(kind: TyKind, method: Str) -> Int {
+    if kind == TyKind.Option { return if method == "is_some" { TAG_SOME } else { TAG_NONE } }
+    if method == "is_ok" { return TAG_OK }
+    TAG_ERR
+}
+
+// A read answers the arm the tag promises. Everything it can refuse — the argument count,
+// the layouts it spells and the way the value a panic names would be rendered — is settled
+// before the receiver is lowered, so a refusal has built nothing and hoisted nothing.
+fn cc_carrier_read(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    if !cc_carrier_arity_ok(node, kind, method) { return -1 }
+    let c = cc_carrier_of(node, obj)
+    if cc_carrier_missing(c) { return -1 }
+    let inner = tid_of_node(node)
+    if inner < 0 { return -1 }
+    let member = cc_member_layout(node, c.tid, cc_read_slot(kind, method))
+    if cc_stopped(member) { return -1 }
+    let value = cc_local(inner, node)
+    if cc_stopped(value) { return -1 }
+    let render = cc_panic_render(node, c.tid, kind, method)
+    if cc_panic_stopped(render) { return -1 }
+    let _td = ensure_typedef_for(c.tid)
+    // The receiver is bound before it is read twice. The guard and the read each name the
+    // binding, so an expression that produced the carrier runs once however many times the
+    // carrier itself is read.
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    let name = c_mint_local("u")
+    cg_expr_push_pending(node, ir_let(c.tid, node, c.held.c_spelling, name, c.held.slot_form, recv))
+    if c.held.slot_form == SlotForm.InlineWord {
+        if !cc_push_guard(node, c, name, render, cc_handle_is(node, c, cc_carrier_ref(node, c, name), false)) { return -1 }
+        return ir_cast(inner, node, value.c_spelling, cc_carrier_ref(node, c, name))
+    }
+    let tag = ir_carrier_tag(TYPE_INT, node, c.g.tag, cc_carrier_ref(node, c, name))
+    let absent = cc_tag_equals(node, tag, cc_panicked_tag(kind, method), c)
+    if !cc_push_guard(node, c, name, render, absent) { return -1 }
+    let read = ir_carrier_unwrap(inner, node, member.c_spelling, cc_arm_member(kind, cc_read_slot(kind, method)),
+        member.slot_form, cc_carrier_ref(node, c, name))
+    if member.slot_form != SlotForm.PointerBoxed { return read }
+    ir_unbox(inner, node, value.c_spelling, value.slot_form, read)
+}
+
+// Which arm the read answers, and which arm it panicked on. They are always the two
+// different arms of the same carrier, so one function answering both would have to be told
+// which it was being asked for; two functions say it in their names.
+fn cc_read_slot(kind: TyKind, method: Str) -> Slot {
+    if kind == TyKind.Option { return Slot.Inner1 }
+    if method == "unwrap" { return Slot.Inner1 }
+    Slot.Inner2
+}
+
+fn cc_panicked_slot(method: Str) -> Slot {
+    if method == "unwrap" { return Slot.Inner2 }
+    Slot.Inner1
+}
+
+// The member each arm is held in. An Option has one arm and calls it by the only name it
+// needs; a Result has two and tells them apart.
+fn cc_arm_member(kind: TyKind, slot: Slot) -> Str {
+    if kind == TyKind.Option { return carrier_value_member }
+    match slot {
+        Slot.Inner1 => carrier_ok_member
+        _ => carrier_err_member
+    }
+}
+
+// The tag the read cannot be given. Read off the kind as well as the name, because Option
+// and Result disagree on which arm is 1: a name alone would guard every read of one of them
+// against the arm it was about to answer.
+fn cc_panicked_tag(kind: TyKind, method: Str) -> Int {
+    if kind == TyKind.Option { return TAG_NONE }
+    if method == "unwrap" { return TAG_ERR }
+    TAG_OK
+}
+
+// What the panic says it was called on. The sentence names the arm the value held, which is
+// the arm the read was not given.
+fn cc_panicked_on(kind: TyKind, method: Str) -> Str {
+    if kind == TyKind.Option { return "unwrap called on None" }
+    if method == "unwrap" { return "unwrap called on Err" }
+    "unwrap_err called on Ok"
+}
+
+// The statement that panics unless the carrier holds the arm about to be read. The
+// condition tests the arm that is NOT read: that is the one value the read cannot be
+// given, and every other tag the carrier could hold is a tag no arm of it declares.
+fn cc_push_guard(node: Int, c: CarrierRef, name: Str, render: PanicRender, absent: Int) -> Bool ! Diag.Report {
+    let said = cc_panic_said(node, c, name, render)
+    if said < 0 { return false }
+    cg_expr_push_pending(node, ir_if(node, absent, ir_block(node, [ir_panic(node, said)]), -1))
+    true
+}
+
+// What the panic is told to say. A sentence with nothing to name is one string constant. A
+// sentence that names a value is built at the moment it panics, because the value is only
+// known then, and the formatter sizes the result exactly.
+//
+// The file and the line travel as values rather than as text written into the format. A
+// path is chosen by whoever runs the compiler, so a path holding the character a conversion
+// starts with would otherwise be read as a conversion and print some other argument.
+fn cc_panic_said(node: Int, c: CarrierRef, name: Str, render: PanicRender) -> Int ! Diag.Report {
+    match render.say {
+        PanicSay.Nothing => ir_const(TYPE_STR, node, c.g.message, c_string_literal(cc_panic_message(node, render.what)))
+        _ => cc_panic_formatted(node, c, name, render)
+    }
+}
+
+fn cc_panic_formatted(node: Int, c: CarrierRef, name: Str, render: PanicRender) -> Int ! Diag.Report {
+    let shown = cc_panic_payload(node, c, name, render)
+    if shown < 0 { return -1 }
+    let text = format_spec_of(TYPE_STR)
+    let fmt = cc_panic_sentence(render.what, ": {render.spec}", text, text)
+    let args = [
+        ir_const(TYPE_STR, node, c.g.message, c_string_literal(fmt)),
+        shown,
+        ir_const(TYPE_STR, node, c.g.message, c_string_literal(cc_panic_file(node))),
+        ir_const(TYPE_STR, node, c.g.message, c_string_literal(cc_panic_line(node))),
+    ]
+    ir_call_runtime(TYPE_STR, node, c.g.message, c_runtime_helper("str_format"),
+        c.g.message_form, args)
+}
+
+// The value the message names, read out of the same binding the read itself reads. A boxed
+// arm is followed to what it points at first, because what renders the value is given the
+// value and never the box. Every layout this reads was settled by the plan, so nothing here
+// can refuse after the binding has been hoisted.
+fn cc_panic_payload(node: Int, c: CarrierRef, name: Str, render: PanicRender) -> Int ! Diag.Report {
+    let _td = ensure_typedef_for(render.tid)
+    let read = ir_carrier_unwrap(render.tid, node, render.member.c_spelling, render.arm,
+        render.member.slot_form, cc_carrier_ref(node, c, name))
+    let value = if render.member.slot_form == SlotForm.PointerBoxed {
+        ir_unbox(render.tid, node, render.held.c_spelling, render.held.slot_form, read)
+    } else {
+        read
+    }
+    match render.say {
+        PanicSay.Shown => cc_display_call(node, render.display, value)
+        PanicSay.Text => cc_char_text_of_value(node, c.g.message, c.g.message_form, value)
+        _ => cc_panic_promoted(node, render, value)
+    }
+}
+
+// C widens every integer it passes through `...`, and the conversion the format names has
+// to be the widened one or the formatter reads the wrong number of bytes.
+fn cc_panic_promoted(node: Int, render: PanicRender, value: Int) -> Int {
+    let promote = varargs_spelling(render.tid)
+    if promote == "" { return value }
+    ir_cast(render.tid, node, promote, value)
+}
+
+// What the panic message says about the value it panicked on.
+//
+// Nothing: the arm holds no value to name. That is every Option read, whose None carries
+// none, and a Result arm holding Void. Printed: a conversion layout answers prints the
+// value where it stands. Text: the conversion is the one written for strings and the value
+// is not a string, so it is turned into text first. Shown: no conversion prints it, so its
+// Display impl renders it and the string conversion prints that. Refused: the plan stopped,
+// and the read stops with it.
+type PanicSay { Refused, Nothing, Printed, Text, Shown }
+
+// Everything the panic needs, settled before the receiver is bound. Every question that can
+// refuse is asked while this is being settled, because the pending buffer is spliced into
+// the enclosing block whole: a refusal after the binding is hoisted leaves a statement
+// beside an expression that was never built.
+type PanicRender {
+    say: PanicSay
+    what: Str
+    tid: Int
+    arm: Str
+    spec: Str
+    display: Int
+    member: LayoutRecord
+    held: LayoutRecord
+}
+
+fn cc_panic_stopped(r: PanicRender) -> Bool { r.say == PanicSay.Refused }
+
+// A plan that names no value, and so needs no layout of one. The declined record is what
+// layout answers for a type there is none of; nothing on this road reads it.
+fn cc_panic_plain(say: PanicSay, what: Str) -> PanicRender {
+    let none = layout_of(-1, Position.Local)
+    PanicRender { say: say, what: what, tid: -1, arm: "", spec: "", display: -1,
+        member: none, held: none }
+}
+
+fn cc_panic_refused() -> PanicRender { cc_panic_plain(PanicSay.Refused, "") }
+
+fn cc_panic_on_road(plan: PanicRender, say: PanicSay, spec: Str, display: Int) -> PanicRender {
+    PanicRender { say: say, what: plan.what, tid: plan.tid, arm: plan.arm, spec: spec,
+        display: display, member: plan.member, held: plan.held }
+}
+
+// An Option read names no value, so it plans none. A Result read names the arm it did not
+// answer, and every layout that arm is spelled with is asked for here, where refusing still
+// costs nothing.
+fn cc_panic_render(node: Int, carrier: Int, kind: TyKind, method: Str) -> PanicRender ! Diag.Report {
+    let what = cc_panicked_on(kind, method)
+    if kind != TyKind.Result { return cc_panic_plain(PanicSay.Nothing, what) }
+    let slot = cc_panicked_slot(method)
+    let tid = child_tid(carrier, slot)
+    if tid < 0 {
+        cc_panic_arm_unrecorded(node, method)
+        return cc_panic_refused()
+    }
+    if cc_kind(tid) == TyKind.Void { return cc_panic_plain(PanicSay.Nothing, what) }
+    let member = cc_member_layout(node, carrier, slot)
+    if cc_stopped(member) { return cc_panic_refused() }
+    let held = cc_local(tid, node)
+    if cc_stopped(held) { return cc_panic_refused() }
+    cc_panic_road(node, PanicRender { say: PanicSay.Refused, what: what, tid: tid,
+        arm: cc_arm_member(kind, slot), spec: "", display: -1, member: member, held: held })
+}
+
+// Which way the value reaches the message. A type codegen cannot spell has already stopped
+// the plan, so an empty conversion here means the type has no printed form at all and not
+// that layout declined it.
+fn cc_panic_road(node: Int, plan: PanicRender) -> PanicRender ! Diag.Report {
+    let spec = format_spec_of(plan.tid)
+    if spec == "" { return cc_panic_shown(node, plan) }
+    let k = cc_kind(plan.tid)
+    if k == TyKind.Char { return cc_panic_on_road(plan, PanicSay.Text, format_spec_of(TYPE_STR), -1) }
+    if k == TyKind.Bool {
+        cc_panic_text_form(node, k)
+        return cc_panic_refused()
+    }
+    cc_panic_on_road(plan, PanicSay.Printed, spec, -1)
+}
+
+// No conversion prints this value, so the message shows it the way an interpolation hole
+// shows one. Only a struct or an enum can carry the impl that does the showing.
+fn cc_panic_shown(node: Int, plan: PanicRender) -> PanicRender ! Diag.Report {
+    let k = cc_kind(plan.tid)
+    if k != TyKind.Struct && k != TyKind.Enum {
+        cc_panic_structural(node, k)
+        return cc_panic_refused()
+    }
+    let im = cc_impl_for(node, plan.tid, trait_display)
+    if im == IMPL_REFUSED { return cc_panic_refused() }
+    if im < 0 {
+        cc_panic_no_display(node, k)
+        return cc_panic_refused()
+    }
+    cc_panic_on_road(plan, PanicSay.Shown, format_spec_of(TYPE_STR), im)
+}
+
+fn cc_panic_structural(node: Int, k: TyKind) ! Diag.Report {
+    diag_ice_at("PanicPayloadNotRendered", CODEGEN_STAGE_NOT_BUILT,
+        "a {tk_name(k)} value a panic names renders from its parts, and this stage does not build that",
+        node, "only a struct or an enum can carry the Display impl this stage calls")
+}
+
+// A value with no Display impl is not named by its type here. A message carrying the type
+// tells the reader what the static type already said, and hides that the value was never
+// rendered. Nothing yet requires the arm of a Result to be showable, so what is missing is
+// the gate and not the value.
+fn cc_panic_no_display(node: Int, k: TyKind) ! Diag.Report {
+    diag_ice_at("PanicPayloadHasNoDisplay", CODEGEN_STAGE_NOT_BUILT,
+        "a {tk_name(k)} value a panic names has no Display impl, and this stage will not name it by its type instead",
+        node, "the check that accepts the call has to require a showable arm, the way a test body's `?` does")
+}
+
+// A Bool is written with the conversion strings are written with and is not a string: the
+// value that reaches the formatter has to be its text, and building that text needs a
+// statement, which a guard's own expression cannot hold.
+fn cc_panic_text_form(node: Int, k: TyKind) ! Diag.Report {
+    diag_ice_at("PanicPayloadTextFormNotBuilt", CODEGEN_STAGE_NOT_BUILT,
+        "a {tk_name(k)} value a panic names has to be turned into text first, and this stage does not build that",
+        node, "the interpolation stage builds that text with a statement; a guard holds an expression")
+}
+
+fn cc_panic_arm_unrecorded(node: Int, method: Str) ! Diag.Report {
+    diag_ice_at("CarrierArmTypeUnrecorded", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{method}' panics on the arm it did not answer, and that arm records no type", node,
+        "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+}
+
+fn cc_tag_equals(node: Int, tag: Int, want: Int, c: CarrierRef) -> Int {
+    ir_binary(TYPE_BOOL, node, c.g.answer, "==", tag, ir_const(TYPE_INT, node, c.g.tag, "{want}"))
+}
+
+fn cc_carrier_ref(node: Int, c: CarrierRef, name: Str) -> Int {
+    cc_temp_ref(node, c.tid, c.held, name)
+}
+
+// The carrier a call reads, with every spelling a test or a read of it is written with.
+// They are one fact: a reader holding the tid alone would have to ask layout for the rest
+// again, and a second answer to a type question is a second producer of it.
+type CarrierRef { tid: Int  held: LayoutRecord  g: GuardSpellings }
+
+// A tid that does not spell, or a guard that does not, leaves the tid negative: the caller
+// asks that one question instead of the three the pieces used to be asked separately.
+//
+// A call with no carrier type asks layout about the tid it does not have, rather than
+// about some other tid standing in for it: layout declines a negative tid on its own, and
+// that decline is the record. Substituting a type that does spell would put a real layout
+// in a record whose carrier has none. The decline is taken without cc_local because
+// tid_of_node has already reported the missing type by name, and one fault is one report.
+fn cc_carrier_of(node: Int, obj: Int) -> CarrierRef ! Diag.Report {
+    let tid = tid_of_node(obj)
+    let held = if tid < 0 { layout_of(tid, Position.Local) } else { cc_local(tid, node) }
+    let g = cc_guard_spellings(node)
+    let spells = !cc_stopped(held) && !cc_guard_stopped(g)
+    CarrierRef { tid: if spells { tid } else { -1 }, held: held, g: g }
+}
+
+fn cc_carrier_missing(c: CarrierRef) -> Bool {
+    c.tid < 0
+}
+
+// The three spellings a tag test is written with: the integer the tag is read as, the Bool
+// the comparison answers, and the string a panic carries. One record because a guard needs
+// all three or none of them. The string carries its slot form as well, because a message
+// the panic builds is a call answering a string and a call is written with both.
+type GuardSpellings { tag: Str  answer: Str  message: Str  message_form: SlotForm }
+
+fn cc_guard_spellings(node: Int) -> GuardSpellings ! Diag.Report {
+    let said = cc_local(TYPE_STR, node)
+    GuardSpellings {
+        tag: cc_local(TYPE_INT, node).c_spelling,
+        answer: cc_local(TYPE_BOOL, node).c_spelling,
+        message: said.c_spelling,
+        message_form: said.slot_form,
+    }
+}
+
+fn cc_guard_stopped(g: GuardSpellings) -> Bool {
+    g.tag == "" || g.answer == "" || g.message == ""
+}
+
+// A carrier member's C shape. The member holds the payload itself or a pointer to it, and
+// which of the two it is decides whether the read follows a pointer.
+fn cc_member_layout(node: Int, carrier_tid: Int, slot: Slot) -> LayoutRecord ! Diag.Report {
+    let rec = carrier_member_layout(carrier_tid, slot)
+    let why = "carrier member has no C layout: {rec.decline_reason}"
+    if rec.decline_reason == "" { return rec }
+    diag_ice_at("UnspellableCarrierMember", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
+        "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    cc_stop(rec)
+}
+
+// What a caught panic reads. The wording, the file and the line are what a program that
+// catches one is shown, so the call's own position is what the message names, and a node
+// that carries no line says so rather than naming a line the program never wrote.
+fn cc_panic_message(node: Int, what: Str) -> Str {
+    cc_panic_sentence(what, "", cc_panic_file(node), cc_panic_line(node))
+}
+
+// The one sentence a carrier panic says. It is read by programs that catch a panic and by
+// people reading a crash, and it comes in two shapes: said outright, or built when it
+// panics so it can name a value. Spelling it twice is how the two shapes drift apart.
+fn cc_panic_sentence(what: Str, clause: Str, where_file: Str, where_line: Str) -> Str {
+    "panic: {what}{clause} at {where_file}:{where_line}"
+}
+
+fn cc_panic_file(node: Int) -> Str {
+    let named = diag_file_for_node(node)
+    if named != "" { return named }
+    diag_source_file
+}
+
+fn cc_panic_line(node: Int) -> Str {
+    let line = node_line(node)
+    if line <= 0 { return "<synthesized>" }
+    "{line}"
+}
+
+// None of these six takes an argument. Typecheck accepts one written anyway, and building
+// the call without it would drop an expression the program wrote, side effects and all.
+fn cc_carrier_arity_ok(node: Int, kind: TyKind, method: Str) -> Bool ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given == 0 { return true }
+    let _refused = cc_intrinsic_arity_wrong(node, kind, method, 0, given)
+    false
+}
+
+// ── Intrinsic tables ──────────────────────────────────────────────────────
+
+// The declaration each intrinsic means, keyed on what the receiver IS and what the method
+// is called. "" for a pair this stage does not own.
+fn cc_intrinsic_callee(node: Int, kind: TyKind, method: Str) -> Str ! Diag.Report {
+    if kind == TyKind.Str { return cc_str_intrinsic(method) }
+    if kind == TyKind.Bytes { return cc_bytes_intrinsic(method) }
+    if kind == TyKind.StringBuilder { return cc_sb_intrinsic(node, method) }
+    if kind == TyKind.List { return cc_list_intrinsic(node, method) }
+    if kind == TyKind.Int || kind == TyKind.Float { return cc_num_intrinsic(kind, method) }
+    ""
+}
+
+// Rendering a number as text. This is the one numeric conversion that is not a cast: it
+// builds a string, which is a function's work and not a reinterpretation of the bits.
+//
+// `to_str` is absent although typecheck answers Str for it on an Int receiver. The spec
+// gives `to_str` to Char and to Ptr[U8], not to Int, so answering it here would build a
+// surface no section declares. It stays refused until typecheck and the spec agree.
+fn cc_num_intrinsic(kind: TyKind, method: Str) -> Str {
+    if method != "to_string" { return "" }
+    if kind == TyKind.Int { return "std_num:int_to_str" }
+    if kind == TyKind.Float { return "std_num:float_to_str" }
+    ""
+}
+
+// `len`, `is_empty` and `clear` are absent because real impls answer them, as they do for
+// Str. `push` and `set` are absent because no Blink declaration answers them; they reach
+// cc_runtime_method instead. `get`, `pop` and `contains` are absent because none of the
+// three is one call: the first two fill a carrier behind a bounds or emptiness test, and
+// the last is a scan. Each is refused under its own name in cc_list_not_built.
+fn cc_list_intrinsic(node: Int, method: Str) -> Str ! Diag.Report {
+    if method == "append" { return "std_list:list_concat" }
+    if method == "slice" { return "std_list:list_slice" }
+    if method == "join" { return cc_list_join_callee(node) }
+    ""
+}
+
+// `str_join` reads every slot as a string, so it answers `join` only over Str elements.
+// Typecheck rejects the rest at the call site but its check fails open on a type variable,
+// so a generic body reaches this stage with whatever element it carries. Following a slot
+// that holds something other than a string pointer is a read of an arbitrary address.
+fn cc_list_join_callee(node: Int) -> Str ! Diag.Report {
+    let container = tid_of_node(node_obj(node))
+    if container < 0 { return ROW_REFUSED }
+    let elem = child_tid(container, Slot.Inner1)
+    if elem < 0 { return ROW_REFUSED }
+    if cc_kind(elem) == TyKind.Str { return "std_str:str_join" }
+    cc_join_element_not_str(node, elem)
+    ROW_REFUSED
+}
+
+// `len` and `is_empty` are absent on purpose: a real `impl Sized for Str` answers both,
+// and this table declining is what lets the impl path answer them. `substring` and
+// `substr` are two spellings of one function, and `to_int` and `parse_int` likewise,
+// exactly as typecheck has them. `as_cstr` is absent because no stdlib function answers
+// it: the pointer it hands back is made by codegen, not by a call.
+fn cc_str_intrinsic(method: Str) -> Str {
+    if method == "byte_at" { return "std_str:str_char_at" }
+    if method == "char_at" { return "std_str:str_char_at_opt" }
+    if method == "contains" { return "std_str:str_contains" }
+    if method == "starts_with" { return "std_str:str_starts_with" }
+    if method == "ends_with" { return "std_str:str_ends_with" }
+    if method == "index_of" { return "std_str:str_index_of" }
+    if method == "substring" || method == "substr" { return "std_str:str_substr" }
+    if method == "slice" { return "std_str:str_slice" }
+    if method == "concat" { return "std_str:str_concat" }
+    if method == "trim" { return "std_str:str_trim" }
+    if method == "trim_left" { return "std_str:str_trim_left" }
+    if method == "trim_right" { return "std_str:str_trim_right" }
+    if method == "to_upper" { return "std_str:str_to_upper" }
+    if method == "to_lower" { return "std_str:str_to_lower" }
+    if method == "replace" { return "std_str:str_replace" }
+    if method == "split" { return "std_str:str_split" }
+    if method == "lines" { return "std_str:str_lines" }
+    if method == "to_int" || method == "parse_int" { return "std_num:parse_int" }
+    if method == "parse_float" { return "std_num:parse_float" }
+    ""
+}
+
+// `get` reads through the checked wrapper rather than the raw binding beside it, because
+// the method answers an Option and the raw binding answers a bare Int. `with_ptr` is
+// absent because it hands its body a pointer into the buffer, which is a block and not a
+// call. `len` and `is_empty` are answered by a real impl, as they are for Str.
+fn cc_bytes_intrinsic(method: Str) -> Str {
+    if method == "get" { return "std_bytes:bytes_get_opt" }
+    if method == "push" { return "std_bytes:bytes_push" }
+    if method == "set" { return "std_bytes:bytes_set" }
+    if method == "slice" { return "std_bytes:bytes_slice" }
+    if method == "concat" { return "std_bytes:bytes_concat" }
+    if method == "to_hex" { return "std_bytes:bytes_to_hex" }
+    if method == "to_str" { return "std_bytes:bytes_to_str_result" }
+    if cc_bytes_offset_method(method) { return "std_bytes:bytes_{method}" }
+    ""
+}
+
+// The three Bytes offset families, each declared under the method's own name. The names
+// are written out rather than matched by prefix and width: typecheck names exactly these
+// and no others, and a rule that admits more than a list admits cannot be held level
+// with the list as either side grows.
+fn cc_bytes_offset_method(method: Str) -> Bool {
+    if cc_bytes_read_method(method) { return true }
+    if cc_bytes_write_method(method) { return true }
+    cc_bytes_set_method(method)
+}
+
+fn cc_bytes_read_method(method: Str) -> Bool {
+    if method == "read_u16_be" || method == "read_u32_be" || method == "read_i32_be" || method == "read_i64_be" { return true }
+    if method == "read_u16_le" || method == "read_u32_le" || method == "read_i32_le" || method == "read_i64_le" { return true }
+    false
+}
+
+fn cc_bytes_write_method(method: Str) -> Bool {
+    if method == "write_u16_be" || method == "write_u32_be" || method == "write_i32_be" || method == "write_i64_be" { return true }
+    if method == "write_u16_le" || method == "write_u32_le" || method == "write_i32_le" || method == "write_i64_le" { return true }
+    false
+}
+
+fn cc_bytes_set_method(method: Str) -> Bool {
+    if method == "set_u16_be" || method == "set_u32_be" || method == "set_u64_be" { return true }
+    if method == "set_i16_be" || method == "set_i32_be" || method == "set_i64_be" { return true }
+    if method == "set_u16_le" || method == "set_u32_le" || method == "set_u64_le" { return true }
+    if method == "set_i16_le" || method == "set_i32_le" || method == "set_i64_le" { return true }
+    false
+}
+
+// `write_char` is absent: its binding takes a Str where the method takes a Char, so the
+// call needs a conversion between the two and is not one plain call. `len` and `is_empty`
+// are answered by a real impl, as they are for Str.
+fn cc_sb_intrinsic(node: Int, method: Str) -> Str ! Diag.Report {
+    if method == "write" { return cc_sb_write_callee(node) }
+    if method == "to_str" { return "std_sb:sb_to_str" }
+    if method == "capacity" { return "std_sb:sb_capacity" }
+    if method == "clear" { return "std_sb:sb_clear" }
+    ""
+}
+
+// Which of the four write bindings a `write` means. Typecheck leaves the argument of this
+// one method unconstrained and records that codegen picks the binding from what the
+// argument IS, so this is the only row keyed on an argument rather than on the method
+// name. Each binding takes one type and no other, so naming the wrong one hands the C
+// compiler a value of a type its parameter cannot hold.
+fn cc_sb_write_callee(node: Int) -> Str ! Diag.Report {
+    let args = node_args(node)
+    if sublist_length(args) != 1 { return "std_sb:sb_write" }
+    let arg_tid = tid_of_node(sublist_get(args, 0))
+    if arg_tid < 0 { return "std_sb:sb_write" }
+    let k = cc_kind(arg_tid)
+    if k == TyKind.Int { return "std_sb:sb_write_int" }
+    if k == TyKind.Float { return "std_sb:sb_write_float" }
+    if k == TyKind.Bool { return "std_sb:sb_write_bool" }
+    if k == TyKind.Str { return "std_sb:sb_write" }
+    ""
+}
+
+// The declaration an intrinsic names. Every row spells the module its function is written
+// in as well as the function's name, so the search is over one module and not over a
+// family of module names: a program that writes its own function under an intrinsic's
+// name must not take it over, and neither must a second stdlib module that happens to
+// declare that name. Every module reached here is in the prelude, so the declaration is
+// registered whether the program imports it or not.
+fn cc_stdlib_fn_named(node: Int, module: Str, name: Str) -> Int ! Diag.Report {
+    let mut found = -1
+    let mut clashes = 0
+    for f in cg_reg_fn_decls() {
+        if node_name(f) != name { continue }
+        if node_source_module(f) != module { continue }
+        if found >= 0 { clashes = clashes + 1 }
+        found = f
+    }
+    if clashes == 0 { return found }
+    diag_ice_at("IntrinsicCalleeAmbiguous", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "module '{module}' declares '{name}' more than once, so the intrinsic names neither", node,
+        "an intrinsic must name one declaration; a module has to keep its own names apart")
+    DECL_REFUSED
+}
+
+// A row that does not spell a module and a name. Every row is written in this file, so
+// this is a row written wrongly rather than anything a program can reach.
+fn cc_intrinsic_row_malformed(node: Int, row: Str) -> Int ! Diag.Report {
+    diag_ice_at("IntrinsicRowMalformed", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "the intrinsic row '{row}' does not name a module and a function", node,
+        "every row is written as 'module:function'; this one is not")
+    DECL_REFUSED
+}
+
+// A pair the table owns whose declaration is not in the program. The stdlib is registered
+// whole, so this is the two ends disagreeing: the table names a function the library does
+// not declare, or no longer declares under that name.
+fn cc_intrinsic_undeclared(node: Int, kind: TyKind, method: Str, module: Str, name: Str) -> Int ! Diag.Report {
+    diag_ice_at("IntrinsicCalleeUndeclared", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{tk_name(kind)}.{method}' names '{name}', which module '{module}' does not declare", node,
+        "the table and the standard library have to name the same function")
+    -1
+}
+
+// An intrinsic written with the wrong number of arguments. The receiver is not counted:
+// the method is what the program wrote, so the count it is judged by is the one the call
+// spells, not the one the declaration underneath it takes.
+fn cc_intrinsic_arity_wrong(node: Int, kind: TyKind, method: Str, want: Int, got: Int) -> Int ! Diag.Report {
+    diag_ice_at("IntrinsicArityWrong", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{tk_name(kind)}.{method}' takes {want} argument(s), and this call was given {got}", node,
+        "typecheck must reject this call before codegen reads it; this is a compiler bug")
+    -1
+}
+
+// A method call this table does not own and no impl answers. A receiver with a name for
+// what is missing gives that name; the rest are named by kind and method, so what is
+// missing stays legible and countable rather than arriving as one blanket count.
+fn cc_method_not_built(node: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    if kind == TyKind.List { return cc_list_not_built(node, method) }
+    if kind == TyKind.Bytes && method == "with_ptr" { return cc_pointer_body_not_lowered(node) }
+    cc_intrinsic_not_built(node, kind, method)
+}
+
+// `b.with_ptr(f)` binds a pointer into the buffer to the body's own parameter, runs the
+// body there, and answers what the body computed. A binding and a block are both
+// statements, so what this needs is the stage that builds statements. No call node stands
+// for either, which is why it is named here rather than counted with the rest.
+fn cc_pointer_body_not_lowered(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("PointerBodyNotLowered", CODEGEN_STAGE_NOT_BUILT,
+        "'Bytes.with_ptr' binds a pointer into the buffer and runs its body there", node,
+        "the statement stage owns the block and the binding; no call node stands for either")
+    -1
+}
+
+// The three List methods that are not one call. `get` and `pop` both answer a carrier
+// filled behind a test the runtime cannot make for them, which is the same gap the index
+// read already names. `contains` walks the elements comparing each, which is a loop and a
+// choice of comparison, and the runtime publishes no primitive for it.
+fn cc_list_not_built(node: Int, method: Str) -> Int ! Diag.Report {
+    if method == "get" || method == "pop" { return cc_checked_read(node) }
+    if method == "contains" { return cc_element_scan_not_lowered(node) }
+    if cc_names_list_hof(method) { return cc_list_hof_not_registered(node, method) }
+    cc_intrinsic_not_built(node, TyKind.List, method)
+}
+
+// The higher-order methods the standard library already has a body for. Each names a
+// generic in lib/std/list.bl, so a loop emitted here would be a second answer to what the
+// method means, and the two could disagree.
+fn cc_names_list_hof(method: Str) -> Bool {
+    if method == "map" { return true }
+    if method == "filter" { return true }
+    if method == "fold" { return true }
+    if method == "any" { return true }
+    if method == "all" { return true }
+    if method == "for_each" { return true }
+    false
+}
+
+// What is missing is the instance, not the body. Mono registers an instance of a generic
+// for each call of it that it can see, and a method call is not a call of list_map as far
+// as it can see, so the types this one uses have none. Naming the generic without an
+// instance reports mono's refusal for a decision made here, which blames the wrong stage,
+// so the call is refused under its own name and says which instance would answer it.
+fn cc_list_hof_not_registered(node: Int, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("ListHofInstanceNotRegistered", CODEGEN_STAGE_NOT_BUILT,
+        "'{method}' over a List is the standard library generic 'list_{method}', which mono registers no instance of for a method call",
+        node, "mono has to register an instance for a builtin method that stands for a generic function")
+    -1
+}
+
+// A scan over the elements. It is a loop over statements and a comparison chosen per
+// element type, so no one call names it and no layout answer decides it.
+fn cc_element_scan_not_lowered(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("ElementScanNotLowered", CODEGEN_STAGE_NOT_BUILT,
+        "a scan that compares each element has no lowering here", node,
+        "the loop and the comparison it makes are statements cg_expr must hoist")
+    -1
+}
+
+
+// `join` over an element `str_join` cannot read. The call would hand the runtime a slot
+// holding something other than a string pointer, which it would follow anyway.
+fn cc_join_element_not_str(node: Int, elem_tid: Int) -> Int ! Diag.Report {
+    diag_ice_at("JoinElementNotStr", CODEGEN_STAGE_NOT_BUILT,
+        "joining a List of {tk_name(cc_kind(elem_tid))} has no lowering here", node,
+        "only a List of Str reaches str_join; any other element needs its own conversion first")
+    -1
+}
+
+// A runtime primitive named by the method table with no row in the arity table. The two
+// are kept in step by hand, so the gap is reported rather than read as an argument count.
+fn cc_runtime_arity_unrecorded(node: Int, kind: TyKind, method: Str, op: Str) -> Int ! Diag.Report {
+    diag_ice_at("RuntimeMethodArityUnrecorded", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{tk_name(kind)}.{method}' names primitive '{op}', which records no argument count",
+        node, "every primitive the method table names has to have a row in the arity table")
+    -1
+}
+
+// A container whose element type was never recorded. The store reads the element off the
+// receiver's own type, so this is the receiver typed as a container of nothing.
+fn cc_element_type_unrecorded(node: Int, kind: TyKind) -> Int ! Diag.Report {
+    diag_ice_at("ElementTypeUnrecorded", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "a {tk_name(kind)} receiver records no element type, so the store cannot shape it", node,
+        "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    -1
+}
+
+fn cc_intrinsic_not_built(node: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    diag_ice_stage_not_built("cg_call methods: {tk_name(kind)}.{method}", node)
+    -1
+}
+
+// What the left of the dot names. Only a Value is a receiver to lower; the other four are
 // qualifiers, and each keys a different lowering.
-pub type Receiver { Value, Namespace, Module, TypeOwner }
+pub type Receiver { Value, Namespace, Module, TypeOwner, TraitOwner }
 
 // A namespace the compiler provides is read before an imported module, because a module of
-// that name does not take the namespace over. A builtin type has no declaration to look up,
-// so the register of compiler-provided names answers for it, the way typecheck decides the
-// same call on the name alone.
+// that name does not take the namespace over. A type is then read through the one predicate
+// typecheck decides the same call by, so a builtin type, which has no declaration to look
+// up, is a qualifier here exactly when it is one there. A trait name is last: it is the only
+// reading left for a name that binds nothing and names no type.
 fn cc_receiver_role(obj: Int) -> Receiver {
     if !cc_is_free_name(obj) { return Receiver.Value }
     let name = node_name(obj)
     if is_builtin_namespace(name) == 1 { return Receiver.Namespace }
     if is_import_module_name(name) == 1 { return Receiver.Module }
-    if lookup_named_type(name) >= 0 { return Receiver.TypeOwner }
-    if is_builtin_fn(name) == 1 { return Receiver.TypeOwner }
+    if tc_names_a_type(name) { return Receiver.TypeOwner }
+    if cc_names_a_trait(name) { return Receiver.TraitOwner }
     Receiver.Value
 }
 
-// The lowering a qualifier this stage does not own is waiting for. Each qualifier says
-// which one rather than blaming whichever is listed first.
-fn cc_role_stage(role: Receiver) -> Str {
-    if role == Receiver.Namespace { return "cg_call intrinsic namespaces" }
-    "cg_call static and associated calls"
+// Whether the program declares a trait of this name. The register of declarations is the
+// one this stage reads every other declaration through, so a trait is found the same way
+// an impl or a function is.
+fn cc_names_a_trait(name: Str) -> Bool {
+    for tr in cg_reg_trait_decls() {
+        if node_name(tr) == name { return true }
+    }
+    false
 }
 
 // Whether the receiver is a bare name that binds no value here. A binder in scope wins
@@ -424,17 +2607,67 @@ fn cc_is_free_name(obj: Int) -> Bool {
     tid_of_binder(current_binder_scope(), node_name(obj)) < 0
 }
 
-// The impl block that extends the receiver's own declaration with a method of this name.
-// Matching on the declaration, not on the type id, lets an instance of a generic type
-// find the impl its base declares.
-fn cc_impl_with_method(recv_tid: Int, mname: Str) -> Int {
+// The impl block that extends the receiver with a method of this name. Matching on what
+// the receiver is, not on its type id, lets every instance of one base find the impls
+// written over that base: a generic struct through its declaration, and a container
+// through its kind however it is parameterized.
+fn cc_impl_with_method(node: Int, recv_tid: Int, mname: Str) -> Int ! Diag.Report {
     let want = tc_tid_decl_node(recv_tid)
-    if want < 0 { return -1 }
+    let builtin = cc_builtin_owner_name(recv_tid)
+    if want < 0 && builtin == "" { return -1 }
+    let mut found = -1
+    let mut clashes = 0
     for im in cg_reg_impl_decls() {
-        if cc_impl_owner(im) != want { continue }
-        if cc_method_index(im, mname) >= 0 { return im }
+        if cc_method_index(im, mname) < 0 { continue }
+        if !cc_impl_answers_for(im, want, builtin) { continue }
+        if found >= 0 { clashes = clashes + 1 }
+        found = im
     }
-    -1
+    if clashes == 0 { return found }
+    cc_impl_ambiguous(node, recv_tid, "a method '{mname}'")
+}
+
+// A receiver identifies the impls written over it in one of two ways. A struct or enum is
+// its declaration node, which keeps two modules' namesakes apart. Every other type
+// declares nothing at all, so it is its kind, which is the name `impl ... for List[T]`
+// writes; a struct or enum with no declaration is a gap and not one of these.
+fn cc_builtin_owner_name(recv_tid: Int) -> Str {
+    let k = cc_kind(recv_tid)
+    if k == TyKind.Struct || k == TyKind.Enum { return "" }
+    tk_name(k)
+}
+
+// A kind name is a weaker key than a declaration node: every impl over `List` writes the
+// same one, and so does an impl over a type the program itself declares under that name.
+// So an impl that binds type parameters answers for the container alone, whatever the
+// program declares, and one that binds none answers for a declaration and, failing that,
+// for the container it names. An impl whose owner is a name two modules both declare is in
+// neither channel: it extends a declaration, the pair is just unresolved here.
+fn cc_impl_answers_for(im: Int, want: Int, builtin: Str) -> Bool {
+    if cc_impl_binds_parameters(im) { return want < 0 && node_name(im) == builtin }
+    if want >= 0 { return cc_impl_owner(im) == want }
+    cc_impl_owner(im) == NO_DECL_NODE && node_name(im) == builtin
+}
+
+// An impl that binds type parameters extends a builtin container and nothing else. Two
+// rules together say so: an impl header resolves its receiver name to the builtin before
+// any declaration of that name, and a generic impl over a declared type is refused outright
+// (PolyImplUnsupported). So the binders answer what the receiver's own type id would, which
+// typecheck works out for an impl header but records nowhere a later stage can read.
+fn cc_impl_binds_parameters(im: Int) -> Bool {
+    let binders = node_impl_binders(im)
+    binders != -1 && sublist_length(binders) > 0
+}
+
+// Two impls that both answer for one receiver leave no choice to make here: picking either
+// calls a body that may have been written for the other, so the ambiguity is reported the
+// way an ambiguous free-function name already is. Typecheck refuses the calls that reach
+// this today, which is what makes it a backstop rather than a message a program draws.
+fn cc_impl_ambiguous(node: Int, recv_tid: Int, what: Str) -> Int ! Diag.Report {
+    diag_ice_at("ImplAmbiguous", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "more than one impl over {tk_name(cc_kind(recv_tid))} declares {what}", node,
+        "the call needs the impl typecheck resolved, which it does not record yet")
+    IMPL_REFUSED
 }
 
 // The declaration an impl block extends. Two modules may spell the same bare type name,
@@ -452,14 +2685,20 @@ fn cc_impl_owner(im: Int) -> Int {
 }
 
 // The impl block of one trait over the receiver's declaration, whatever its methods.
-fn cc_impl_for(recv_tid: Int, trait_name: Str) -> Int {
+fn cc_impl_for(node: Int, recv_tid: Int, trait_name: Str) -> Int ! Diag.Report {
     let want = tc_tid_decl_node(recv_tid)
-    if want < 0 { return -1 }
+    let builtin = cc_builtin_owner_name(recv_tid)
+    if want < 0 && builtin == "" { return -1 }
+    let mut found = -1
+    let mut clashes = 0
     for im in cg_reg_impl_decls() {
         if node_trait_name(im) != trait_name { continue }
-        if cc_impl_owner(im) == want { return im }
+        if !cc_impl_answers_for(im, want, builtin) { continue }
+        if found >= 0 { clashes = clashes + 1 }
+        found = im
     }
-    -1
+    if clashes == 0 { return found }
+    cc_impl_ambiguous(node, recv_tid, "the trait '{trait_name}'")
 }
 
 fn cc_method_index(im: Int, mname: Str) -> Int {
@@ -484,15 +2723,24 @@ fn cc_method_of(im: Int, mname: Str) -> Int ! Diag.Report {
 
 // ── Shared ────────────────────────────────────────────────────────────────
 
-// One direct call: the callee's C name, the receiver arguments already lowered, then the
-// written arguments in source order.
-fn cc_direct(node: Int, symbol: Str, leading: List[Int]) -> Int ! Diag.Report {
+// One direct call: the callee's C name, the receiver if the call has one, then the written
+// arguments in source order.
+//
+// The receiver arrives as the node it was written as, not as a lowered one, so that this
+// stage settles what it can refuse before it builds anything. A receiver lowered by the
+// caller is built whether or not a call can be built out of it, and what this stage refuses
+// is read off the call's own type, which it can read without lowering anything.
+fn cc_build_call(node: Int, symbol: Str, recv: Int, form: CallForm) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = cc_local(tid, node)
     if cc_stopped(rec) { return -1 }
     let mut args: List[Int] = []
-    for a in leading { args.push(a) }
+    if recv != NO_RECEIVER {
+        let receiver = lower_expr(recv)
+        if receiver < 0 { return -1 }
+        args.push(receiver)
+    }
     let written = node_args(node)
     let mut i = 0
     while i < sublist_length(written) {
@@ -501,8 +2749,16 @@ fn cc_direct(node: Int, symbol: Str, leading: List[Int]) -> Int ! Diag.Report {
         args.push(a)
         i = i + 1
     }
+    if form == CallForm.Runtime {
+        return ir_call_runtime(tid, node, rec.c_spelling, symbol, rec.slot_form, args)
+    }
     ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, args)
 }
+
+// Which C name a built call reaches: one the compiler emits for a declaration, or one the
+// runtime owns and no Blink source declares. The two print the same, and the kinds are
+// what a later stage reads them back by.
+type CallForm { Declared, Runtime }
 
 fn cc_kind(tid: Int) -> TyKind {
     tc_tid_kind(tc_resolve(tid))
@@ -524,21 +2780,12 @@ fn cc_stopped(rec: LayoutRecord) -> Bool {
     rec.c_spelling == ""
 }
 
+// A record whose decline has been reported, kept only so a caller can test it. Both
+// spellings go: a reader that asks "is there a slot word?" would otherwise read a live
+// answer off a record whose own type was never spelled, and convert by a word that was
+// reported as missing.
 fn cc_stop(rec: LayoutRecord) -> LayoutRecord {
-    LayoutRecord { c_spelling: "", ..rec }
-}
-
-// A generic declaration is a template: it has a C name only once its binders are chosen,
-// which is one monomorphised instance per choice. A function names its binders in its own
-// type parameters, and an impl block only in its `impl[...]` header: an impl block's type
-// parameters hold the arguments its trait was written with, which bind nothing.
-fn cc_is_generic(decl: Int) -> Bool {
-    if nk_of(node_kind(decl)) == NodeKind.ImplBlock { return cc_has_entries(node_impl_binders(decl)) }
-    cc_has_entries(node_type_params(decl))
-}
-
-fn cc_has_entries(sl: Int) -> Bool {
-    sl != -1 && sublist_length(sl) > 0
+    LayoutRecord { c_spelling: "", slot_word: "", ..rec }
 }
 
 fn cc_ev_not_in_ir(node: Int) ! Diag.Report {

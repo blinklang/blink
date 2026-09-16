@@ -8,7 +8,7 @@ import lower_test_helpers.{
     probe, probe_but, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
     assert_ice_saying, assert_refused_saying,
 }
-import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid}
+import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid, ir_node_count}
 import cg_expr.{lower_expr}
 
 fn src_reads() -> Str {
@@ -35,23 +35,23 @@ test "a literal index reads the element through the container's runtime reader" 
     probe("cg_expr_index", src_reads())
     let id = lower_expr(rhs_of("literal_read"))
     assert_kind("kind", id, IrKind.Cast)
-    assert_shape("shape", id, "Cast(CallRuntime(VarRef, Const))")
-    assert_eq_str("reader", ir_c_name(ir_kid(id, 0)), "blink_list_get")
+    assert_shape("shape", id, "Cast(Cast(CallRuntime(VarRef, Const)))")
+    assert_eq_str("reader", ir_c_name(ir_kid(ir_kid(id, 0), 0)), "blink_list_get")
     assert_verifies("verify", id)
 }
 
 test "a named index lowers its operand like any other expression" {
     probe("cg_expr_index", src_reads())
     let id = lower_expr(rhs_of("named_read"))
-    assert_shape("shape", id, "Cast(CallRuntime(VarRef, VarRef))")
-    assert_eq_str("reader", ir_c_name(ir_kid(id, 0)), "blink_list_get")
+    assert_shape("shape", id, "Cast(Cast(CallRuntime(VarRef, VarRef)))")
+    assert_eq_str("reader", ir_c_name(ir_kid(ir_kid(id, 0), 0)), "blink_list_get")
     assert_verifies("verify", id)
 }
 
 test "a compound index is lowered whole, not folded or re-read" {
     probe("cg_expr_index", src_reads())
     let id = lower_expr(rhs_of("compound_read"))
-    assert_shape("shape", id, "Cast(CallRuntime(VarRef, Binary(VarRef, Const)))")
+    assert_shape("shape", id, "Cast(Cast(CallRuntime(VarRef, Binary(VarRef, Const))))")
     assert_verifies("verify", id)
 }
 
@@ -62,8 +62,8 @@ test "an index past the end lowers like any other constant index" {
     probe("cg_expr_index", src_reads())
     let past = lower_expr(rhs_of("past_end"))
     let inside = lower_expr(rhs_of("literal_read"))
-    assert_shape("past the end", past, "Cast(CallRuntime(VarRef, Const))")
-    assert_shape("inside", inside, "Cast(CallRuntime(VarRef, Const))")
+    assert_shape("past the end", past, "Cast(Cast(CallRuntime(VarRef, Const)))")
+    assert_shape("inside", inside, "Cast(Cast(CallRuntime(VarRef, Const)))")
     assert_eq_str("same reader", ir_c_name(ir_kid(past, 0)), ir_c_name(ir_kid(inside, 0)))
     assert_verifies("verify", past)
 }
@@ -86,9 +86,10 @@ test "an index that is not an Int is refused before this stage, by typecheck" {
     assert_refused_saying("str index", "index must be an Int", 1)
 }
 
-// A Str is a pointer, but one that fits the runtime's word, so it needs no more than the
-// cast an Int needs. One reader serves both, which is the point of there being one.
-test "an element the runtime holds as a word reads through the same one reader" {
+// A Str is already the width of the runtime's word, so it takes no integer on the way back
+// and needs one cast where an Int needs two. One reader serves both, which is the point of
+// there being one.
+test "a pointer element reads through the same one reader, with no word between" {
     probe("cg_expr_index", src_reads())
     let id = lower_expr(rhs_of("word_read"))
     assert_shape("shape", id, "Cast(CallRuntime(VarRef, VarRef))")
@@ -121,4 +122,29 @@ test "an element whose own type is a carrier is read, not taken for a checked re
     assert_eq_str("cast type", ir_c_spelling(ir_kid(id, 0)), "blink_Option_int*")
     assert_eq_str("element type", ir_c_spelling(id), "blink_Option_int")
     assert_verifies("verify", id)
+}
+
+fn src_unspellable_element() -> Str {
+    #"fn pick[T](xs: List[T]) -> T {
+    let got = xs[0]
+    got
+}
+fn main() {
+    let nums = [1, 2, 3]
+    let _keep = [pick(nums)]
+}
+"#
+}
+
+// The dispatch arm must not build an operand of its own before handing the read on. It has
+// none to build while the read is a straight delegation, so what this pins is that it stays
+// one: an arm that lowered an operand first would strand it whenever the read refuses. The
+// stage that owns the read pins the same count from its own side, where the reasons for the
+// fixture and for counting rather than checking a shape are written down.
+test "a refused index read leaves no orphan node behind in the arena" {
+    probe("cg_expr_index_unspellable", src_unspellable_element())
+    let before = ir_node_count()
+    assert_ice_saying("unspellable element", lower_expr(rhs_of("got")),
+        "UnspellableElementType", "container element has no C layout")
+    assert_eq(ir_node_count(), before)
 }
