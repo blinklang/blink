@@ -71,6 +71,13 @@ The comparison is on declaration nodes through `tc_tid_decl_node`, never on a na
 A word is a scalar, a runtime pointer type, an ordinal enum, a transparent newtype,
 an opaque handle or an Option over an opaque handle.
 
+`Bool` is a C `int` in every position. That is the width the runtime's Bool entry
+points take and return and the width every emitted field, parameter and return has
+always had. The key table a Bool-keyed map or set uses must copy and hash that same
+width; a table that declares another width reads part of the key. Today the runtime's
+`blink_kops_bool` declares one byte, so it reads the low byte of the `int` and is
+right only on a little-endian target. The fix is on the runtime side, not here.
+
 ## Decline contract
 
 `layout_of` never guesses. It declines (non-empty `decline_reason`, empty
