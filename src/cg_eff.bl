@@ -10,22 +10,31 @@
 
 import ast.{NodeKind, nk_of}
 import parser.{
-    is_literal_string_part, node_body, node_elements, node_for_binder, node_guard, node_handlers, node_iterable,
-    node_kind, node_name, node_params, node_pattern, node_recv_type_args, node_stmts,
-    node_trait_name, node_value, node_value_child_ids, sublist_get, sublist_length,
+    is_literal_string_part, node_args, node_body, node_elements, node_for_binder, node_guard, node_handlers,
+    node_iterable, node_kind, node_method, node_methods, node_name, node_obj, node_params, node_pattern,
+    node_recv_type_args, node_stmts, node_trait_name, node_value, node_value_child_ids, sublist_get,
+    sublist_length,
 }
 import typecheck.{
-    TyKind, lookup_named_type, tc_resolve, tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tk_name,
-    ty_pool,
+    TyKind, TYPE_INT, TYPE_STR, lookup_named_type, make_handler_type, tc_resolve, tc_tid_decl_node,
+    tc_tid_handler_effect, tc_tid_kind, tk_name, ty_pool,
 }
 import layout.{
-    Position, Slot, bind_binder, binder_scope_pop, binder_scope_push, child_tid,
+    LayoutRecord, Position, Slot, SlotForm, bind_binder, binder_scope_pop, binder_scope_push, child_tid,
     current_binder_scope, layout_of, tid_of_binder, tid_of_node,
 }
-import cname.{c_ev_field_name, c_local_name, c_mint_local}
-import ir.{ir_closure_new, ir_handler_install}
+import cname.{
+    c_builtin_effect_slot, c_ev_field_name, c_ev_global_name, c_ev_type_name, c_field_name, c_local_name,
+    c_mint_local,
+}
+import ir.{
+    ir_assign, ir_block, ir_carrier_wrap, ir_closure_new, ir_const, ir_effect_perform, ir_evidence_vector,
+    ir_field_get, ir_handler_install, ir_if, ir_let, ir_var_ref,
+}
 import cg_print.{print_closure_thunk}
-import cg_reg.{cg_reg_impl_decls}
+import cg_reg.{cg_reg_effect_decls, cg_reg_impl_decls}
+import cg_expr.{cg_expr_push_pending, lower_expr}
+import cg_call.{lower_display_call}
 import diagnostics.{
     Diag, diag_ice, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg, CODEGEN_STAGE_NOT_BUILT,
     POISONED_IR_AT_SEAM, UNSOLVED_TYPEVAR_AT_CODEGEN,
@@ -321,15 +330,19 @@ fn thunk_spelling(tid: Int, position: Position, node: Int) -> Str ! Diag.Report 
             "typecheck stamps a closure with one type per parameter and one result; this is a compiler bug")
         return ""
     }
+    layout_or_ice(tid, position, node, "UnspellableThunkSlot", "closure parameter or result").c_spelling
+}
+
+// A layout this stage reads. A decline is reported once here under the caller's name for
+// the slot, and the caller reads the empty spelling as the stop.
+fn layout_or_ice(tid: Int, position: Position, node: Int, ice: Str, what: Str) -> LayoutRecord ! Diag.Report {
     let rec = layout_of(tid, position)
     let why = rec.decline_reason
     if why != "" {
-        diag_ice_at("UnspellableThunkSlot", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "closure parameter or result has no C layout: {why}", node,
+        diag_ice_at(ice, UNSOLVED_TYPEVAR_AT_CODEGEN, "{what} has no C layout: {why}", node,
             "monomorphisation must resolve every type codegen reads; this is a compiler bug")
-        return ""
     }
-    rec.c_spelling
+    rec
 }
 
 // Prints one queued thunk as a function definition. The body arrives already lowered: it
@@ -577,12 +590,257 @@ pub fn cg_eff_lower_handler_install(item: Int, handler_value: Int, body: Int) ->
             "typecheck stamps every non-resource with-item as Handler[E]; this is a compiler bug")
         return -1
     }
-    let field = c_ev_field_name(tid)
+    let field = ev_field_of(tid, item)
+    if field == "" { return -1 }
+    ir_handler_install(item, field, handler_value, body)
+}
+
+// The vector field a handler tid owns. A tid that names none is a compiler bug: an effect
+// that reaches codegen is declared or builtin, so its root owns a field.
+fn ev_field_of(handler_tid: Int, node: Int) -> Str ! Diag.Report {
+    let field = c_ev_field_name(handler_tid)
     if diag_is_ice_seg(field) {
         diag_ice_at("EffectSlotUnnamed", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "handler for effect '{effect_name}' names no effect vector field: {field}", item,
+            "effect '{tc_tid_handler_effect(handler_tid)}' names no effect vector field: {field}", node,
             "an effect that reaches codegen is declared or builtin, so its root owns a field")
+        return ""
+    }
+    field
+}
+
+// ── Effect performs ───────────────────────────────────────────────────────────
+
+// A perform is a virtual call: the vector's field for the effect's root holds a vtable
+// pointer, and the operation is one slot of it. Both halves of the address are producers'
+// answers, the field cname's for the handler tid and the slot cname's for a builtin pair
+// or the member name of a user operation.
+//
+// The vector read is the program's one global instance. A handler install writes the
+// global in place for the length of its body and restores it on the way out, so the global
+// is the innermost handler wherever the perform sits, inside a function that also holds a
+// vector parameter or not.
+
+// The two builtin namespaces whose operations the runtime dispatches through a vtable, and
+// the one operation whose slot answers a nullable text where the call answers an Option.
+let NS_IO = "io"
+let NS_ENV = "env"
+let ENV_VAR = "var"
+
+// The carrier member an Option payload lands in; the printer designates it by this name.
+let CARRIER_VALUE = "value"
+
+fn ev_read(node: Int) -> Int {
+    ir_evidence_vector(node, c_ev_type_name(), c_ev_global_name(), SlotForm.Inline)
+}
+
+fn perform_layout(tid: Int, position: Position, node: Int) -> LayoutRecord ! Diag.Report {
+    layout_or_ice(tid, position, node, "UnspellablePerformType", "effect operation")
+}
+
+// The handler slot of the vector for a root effect. A handler is a vtable pointer, so the
+// slot is held by pointer, which is what lets the perform reach its member through it.
+fn slot_read(node: Int, handler_tid: Int) -> Int ! Diag.Report {
+    let field = ev_field_of(handler_tid, node)
+    if field == "" { return -1 }
+    let rec = perform_layout(handler_tid, Position.Local, node)
+    if rec.c_spelling == "" { return -1 }
+    ir_field_get(handler_tid, node, rec.c_spelling, field, SlotForm.PointerBoxed, ev_read(node))
+}
+
+// The root effect behind a builtin namespace. The pair is checked against cname's field
+// producer, so the namespace a caller writes and the field the vector holds cannot drift
+// apart without a report.
+fn builtin_handler_tid(ns: Str, node: Int) -> Int ! Diag.Report {
+    let root = if ns == NS_IO { "IO" } else if ns == NS_ENV { "Env" } else { "" }
+    let tid = if root == "" { -1 } else { make_handler_type(root) }
+    if tid < 0 || c_ev_field_name(tid) != ns {
+        diag_ice_at("BuiltinNamespaceNotAnEffect", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "namespace '{ns}' owns no field of the evidence vector", node,
+            "only the io and env namespaces perform through the vector; this is a compiler bug")
         return -1
     }
-    ir_handler_install(item, field, handler_value, body)
+    tid
+}
+
+fn lower_args(node: Int) -> Option[List[Int]] ! Diag.Report {
+    let written = node_args(node)
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < sublist_length(written) {
+        let a = lower_expr(sublist_get(written, i))
+        if a < 0 { return None }
+        out.push(a)
+        i = i + 1
+    }
+    Some(out)
+}
+
+// An operation of the io or env namespace, reached through the runtime's vtable for it.
+//
+// The io slots take text, and the surface accepts any value the Display trait renders, so
+// an io argument is rendered first: text passes as it is, a struct or enum through its
+// Display impl, and a kind whose rendering is private to the expression stage is refused
+// before anything is built. The env slots take what their signatures declare, which
+// typecheck has already checked, so an env argument passes as it is.
+pub fn cg_eff_lower_builtin_perform(node: Int, ns: Str, method: Str) -> Int ! Diag.Report {
+    let slot = c_builtin_effect_slot(ns, method)
+    if diag_is_ice_seg(slot) {
+        diag_ice_at("BuiltinEffectOpNotASlot", CODEGEN_STAGE_NOT_BUILT,
+            "'{ns}.{method}' is no slot of the runtime's {ns} vtable", node,
+            "the runtime dispatches the io print names and the env names through a vtable; nothing else performs here")
+        return -1
+    }
+    let handler_tid = builtin_handler_tid(ns, node)
+    if handler_tid < 0 { return -1 }
+    let call_tid = tid_of_node(node)
+    if call_tid < 0 { return -1 }
+    let wraps = ns == NS_ENV && method == ENV_VAR
+    // The read slot answers a nullable text, not the Option the call holds.
+    let tid = if wraps { TYPE_STR } else { call_tid }
+    let rec = perform_layout(tid, Position.Local, node)
+    if rec.c_spelling == "" { return -1 }
+    let args = if ns == NS_IO { lower_text_args(node) } else { lower_args(node) }
+    match args {
+        None => -1
+        Some(lowered) => {
+            let read = slot_read(node, handler_tid)
+            if read < 0 { return -1 }
+            let perform = ir_effect_perform(tid, node, rec.c_spelling, slot, rec.slot_form, read, lowered)
+            if wraps { return wrap_nullable_text(node, call_tid, perform) }
+            perform
+        }
+    }
+}
+
+// Every io argument rendered to text. The kinds are read before any argument is lowered,
+// so a refusal leaves nothing hoisted behind it.
+fn lower_text_args(node: Int) -> Option[List[Int]] ! Diag.Report {
+    let written = node_args(node)
+    let mut kinds: List[TyKind] = []
+    let mut i = 0
+    while i < sublist_length(written) {
+        let arg = sublist_get(written, i)
+        let tid = tid_of_node(arg)
+        if tid < 0 { return None }
+        let k = tc_tid_kind(tc_resolve(tid))
+        if k != TyKind.Str && k != TyKind.Struct && k != TyKind.Enum {
+            diag_ice_at("PrintValueNotText", CODEGEN_STAGE_NOT_BUILT,
+                "the io slot takes text, and a {tk_name(k)} value has no rendering this stage can call", arg,
+                "the value-to-text step is private to the expression stage and needs a seam a print can call")
+            return None
+        }
+        kinds.push(k)
+        i = i + 1
+    }
+    let mut out: List[Int] = []
+    i = 0
+    while i < sublist_length(written) {
+        let arg = sublist_get(written, i)
+        let k = kinds.get(i).unwrap()
+        let value = if k == TyKind.Str { lower_expr(arg) } else { lower_display_call(arg) }
+        if value < 0 { return None }
+        out.push(value)
+        i = i + 1
+    }
+    Some(out)
+}
+
+// The runtime's env read answers a text pointer that is null for an unset name, and the
+// call holds an Option. The read lands in a temp, the Option starts as None, and the Some
+// is written only when the temp holds text; the answer is a reference to the Option temp.
+fn wrap_nullable_text(node: Int, opt_tid: Int, perform: Int) -> Int ! Diag.Report {
+    if tc_tid_kind(tc_resolve(opt_tid)) != TyKind.Option {
+        diag_ice_at("NullableSlotAnswerNotOption", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "a nullable slot read is typed {tk_name(tc_tid_kind(tc_resolve(opt_tid)))} where an Option is needed", node,
+            "typecheck signs env.var as Option[Str]; this is a compiler bug")
+        return -1
+    }
+    let text = perform_layout(TYPE_STR, Position.Local, node)
+    let opt = perform_layout(opt_tid, Position.Local, node)
+    let tag_rec = perform_layout(TYPE_INT, Position.Local, node)
+    if text.c_spelling == "" || opt.c_spelling == "" || tag_rec.c_spelling == "" { return -1 }
+    let raw_name = c_mint_local("env_raw")
+    let opt_name = c_mint_local("env_opt")
+    let none = ir_carrier_wrap(opt_tid, node, opt.c_spelling, "", ir_const(TYPE_INT, node, tag_rec.c_spelling, "0"), -1)
+    let payload = ir_var_ref(TYPE_STR, node, text.c_spelling, raw_name, text.slot_form)
+    let some = ir_carrier_wrap(opt_tid, node, opt.c_spelling, CARRIER_VALUE,
+        ir_const(TYPE_INT, node, tag_rec.c_spelling, "1"), payload)
+    let target = ir_var_ref(opt_tid, node, opt.c_spelling, opt_name, opt.slot_form)
+    let cond = ir_var_ref(TYPE_STR, node, text.c_spelling, raw_name, text.slot_form)
+    cg_expr_push_pending(node, ir_let(TYPE_STR, node, text.c_spelling, raw_name, text.slot_form, perform))
+    cg_expr_push_pending(node, ir_let(opt_tid, node, opt.c_spelling, opt_name, opt.slot_form, none))
+    cg_expr_push_pending(node, ir_if(node, cond, ir_block(node, [ir_assign(node, target, some)]), -1))
+    ir_var_ref(opt_tid, node, opt.c_spelling, opt_name, opt.slot_form)
+}
+
+// An operation of a user effect, written `handle.op(args)` on the lowered handle name of
+// its root effect. The slot is the operation's member of the root's vtable, spelled by the
+// same producer the declaration used.
+//
+// The vtable slot erases a bare Option over a boxed nominal answer to the shared pointer
+// Option, and C holds the two as different struct types, so a call whose own type is the
+// nominal Option cannot take the slot's answer without a conversion no IR node writes
+// yet. That perform is refused by name rather than assigned across the two types.
+pub fn cg_eff_lower_user_perform(node: Int) -> Int ! Diag.Report {
+    let handle = node_name(node_obj(node))
+    let op = node_method(node)
+    let decl = user_effect_decl(handle, op, node)
+    if decl < 0 { return -1 }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = perform_layout(tid, Position.Local, node)
+    if rec.c_spelling == "" { return -1 }
+    let k = tc_tid_kind(tc_resolve(tid))
+    if k != TyKind.Void && k != TyKind.Never {
+        let slot_rec = perform_layout(tid, Position.VtableSlot, node)
+        if slot_rec.c_spelling == "" { return -1 }
+        if slot_rec.c_spelling != rec.c_spelling {
+            diag_ice_at("PerformAnswerErasedInSlot", CODEGEN_STAGE_NOT_BUILT,
+                "'{handle}.{op}' answers {slot_rec.c_spelling} from its slot where the call holds {rec.c_spelling}", node,
+                "a perform whose slot erases its answer needs a conversion node between the two struct types")
+            return -1
+        }
+    }
+    match lower_args(node) {
+        None => -1
+        Some(lowered) => {
+            let read = slot_read(node, make_handler_type(node_name(decl)))
+            if read < 0 { return -1 }
+            ir_effect_perform(tid, node, rec.c_spelling, c_field_name(op), rec.slot_form, read, lowered)
+        }
+    }
+}
+
+// The root effect declaration a handle names, checked to declare the operation. The
+// handle typecheck registers is the lowered root name, so the same lowering finds it.
+fn user_effect_decl(handle: Str, op: Str, node: Int) -> Int ! Diag.Report {
+    for e in cg_reg_effect_decls() {
+        if node_name(e).to_lower() != handle { continue }
+        if declares_op(e, op) { return e }
+        diag_ice_at("UserEffectOpUnknown", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "effect '{node_name(e)}' declares no operation '{op}'", node,
+            "typecheck resolves every perform against the effect's operations; this is a compiler bug")
+        return -1
+    }
+    diag_ice_at("UserEffectHandleUnknown", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{handle}' is the handle of no declared effect", node,
+        "typecheck registers one handle per root effect; this is a compiler bug")
+    -1
+}
+
+// Operations live under the sub-effects of a root, never on the root itself.
+fn declares_op(effect_decl: Int, op: Str) -> Bool {
+    let children = node_elements(effect_decl)
+    if children == -1 { return false }
+    let mut ci = 0
+    while ci < sublist_length(children) {
+        let ops = node_methods(sublist_get(children, ci))
+        let mut oi = 0
+        while ops != -1 && oi < sublist_length(ops) {
+            if node_name(sublist_get(ops, oi)) == op { return true }
+            oi = oi + 1
+        }
+        ci = ci + 1
+    }
+    false
 }
