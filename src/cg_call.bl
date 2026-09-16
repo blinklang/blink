@@ -27,6 +27,7 @@ import parser.{
 import ast.{NodeKind, nk_of, node_kind_name}
 import typecheck.{
     TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, lookup_named_type,
+    DECL_NODE_AMBIGUOUS,
     is_import_module_name, is_builtin_namespace, is_builtin_fn, tc_alias_to_original,
     tc_qualifier_to_module_or_self, tc_get_symbol_module, tc_type_str,
     tc_enum_variant_slots, tc_evar_name, tc_names_a_type,
@@ -852,10 +853,11 @@ fn cc_foreign_field(node: Int, decl: Int, field_tid: Int) -> LayoutRecord ! Diag
 fn lower_static_call(node: Int, obj: Int) -> Int ! Diag.Report {
     let owner = node_name(obj)
     let method = node_method(node)
-    // Read above the builtin gate, because typecheck answers this one pair in an arm above
-    // its own gate (src/typecheck.bl:14586). Reading it below would put the pair in front of
-    // the constructor table, which keys on the answer's kind and not on the qualifier, and
-    // that table has no row for a carrier.
+    // Read on the qualifier's SPELLING, and above the builtin gate, because that is what
+    // typecheck resolves this one pair on: its arm keys on the name `Char` alone, takes no
+    // declaration into account, and sits above its own builtin gate. Keying this on the
+    // answer instead, or reading it below the declaration rung, would let a program that
+    // declares `Char_from_code_point` be typed as one function and emitted as another.
     if owner == char_type_name && method == from_code_point_method {
         return cc_char_from_code_point(node)
     }
@@ -980,7 +982,8 @@ fn cc_trait_qualified_impl(owner: Str, method: Str) -> Int {
 // why they are read below the free function rather than beside the other impl methods.
 fn cc_conversion_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
     let args = node_args(node)
-    if args == -1 || sublist_length(args) != 1 { return cc_static_impl_ambiguous(node, owner, method) }
+    let given = if args == -1 { 0 } else { sublist_length(args) }
+    if given != 1 { return cc_ctor_arity_wrong(node, owner, method, 1, given) }
     let src_tid = tid_of_node(sublist_get(args, 0))
     if src_tid < 0 { return -1 }
     let src = tc_type_str(src_tid)
@@ -1009,12 +1012,11 @@ fn cc_conversion_not_declared(node: Int, owner: Str, method: Str, src: Str) -> I
 // Every impl written over the qualified type that declares a method of this name.
 fn cc_impls_over(owner: Str, method: Str) -> List[Int] {
     let mut out: List[Int] = []
-    let want = cc_owner_decl(owner)
-    let builtin = cc_owner_builtin_name(owner)
-    if want < 0 && builtin == "" { return out }
+    let key = cc_owner_key(owner)
+    if key.decl < 0 && key.builtin == "" { return out }
     for im in cg_reg_impl_decls() {
         if cc_method_index(im, method) < 0 { continue }
-        if !cc_impl_answers_for(im, want, builtin) { continue }
+        if !cc_impl_answers_for(im, key.decl, key.builtin) { continue }
         out.push(im)
     }
     out
@@ -1024,22 +1026,24 @@ fn cc_impls_declaring(owner: Str, method: Str) -> Int {
     cc_impls_over(owner, method).len()
 }
 
-// The declaration the qualifier names, if it names one at all. A builtin type declares
-// nothing, so this is negative for it and the name below is its key instead.
-fn cc_owner_decl(owner: Str) -> Int {
-    let owner_tid = lookup_named_type(owner)
-    if owner_tid < 0 { return -1 }
-    tc_tid_decl_node(owner_tid)
-}
+// What an impl over the qualifier is matched by. A declared type is matched by its
+// declaration; a builtin declares nothing, so it is matched by the name an impl over it
+// writes in its header. One type answers one of the two, which is why both are read at once
+// and the registry is asked for the qualifier only once.
+//
+// A name more than one module declares matches NEITHER: the declaration is unknown, and
+// reading it as absent would make the qualifier a builtin it is not.
+type OwnerKey { decl: Int  builtin: Str }
 
-// The name an impl over the qualifier writes in its header. A type the registry knows
-// answers through its own kind; a type it does not know is a builtin the registry holds no
-// entry for, and the spelling the qualifier was written with is then the header's own.
-fn cc_owner_builtin_name(owner: Str) -> Str {
+fn cc_owner_key(owner: Str) -> OwnerKey {
     let owner_tid = lookup_named_type(owner)
-    if owner_tid >= 0 { return cc_builtin_owner_name(owner_tid) }
-    if tc_names_a_type(owner) { return owner }
-    ""
+    if owner_tid < 0 {
+        if tc_names_a_type(owner) { return OwnerKey { decl: -1, builtin: owner } }
+        return OwnerKey { decl: -1, builtin: "" }
+    }
+    let decl = tc_tid_decl_node(owner_tid)
+    if decl == DECL_NODE_AMBIGUOUS { return OwnerKey { decl: -1, builtin: "" } }
+    OwnerKey { decl: decl, builtin: cc_builtin_owner_name(owner_tid) }
 }
 
 // The two methods Blink keys source-typed. Typecheck gates its own source-typed rung on
@@ -1200,6 +1204,17 @@ let char_validate_primitive = "char_validate_code_point"
 let code_point_refused_below = 0
 let code_point_refused_said = "not a valid Unicode scalar value"
 
+fn cc_is_an_integer(kind: TyKind) -> Bool {
+    kind == TyKind.Int || cc_is_sized_int(kind)
+}
+
+fn cc_code_point_not_an_integer(node: Int, from_tid: Int) -> Int ! Diag.Report {
+    diag_ice_at("CodePointNotAnInteger", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{char_type_name}.{from_code_point_method}' reads a code point, and this call was given '{tc_type_str(from_tid)}'", node,
+        "typecheck must reject this call before codegen reads it; this is a compiler bug")
+    -1
+}
+
 fn cc_char_from_code_point(node: Int) -> Int ! Diag.Report {
     let args = node_args(node)
     let given = if args == -1 { 0 } else { sublist_length(args) }
@@ -1209,6 +1224,9 @@ fn cc_char_from_code_point(node: Int) -> Int ! Diag.Report {
     if tid < 0 { return -1 }
     let from_tid = tid_of_node(arg)
     if from_tid < 0 { return -1 }
+    // The runtime reads the code point as one machine integer, so a value of any other kind
+    // would be handed to it under a spelling it does not answer for.
+    if !cc_is_an_integer(cc_kind(from_tid)) { return cc_code_point_not_an_integer(node, from_tid) }
     // Every spelling and every refusal is settled before the argument is lowered, so a call
     // this stage cannot write leaves no statement hoisted behind it.
     let carrier = cc_local(tid, node)
@@ -1223,9 +1241,9 @@ fn cc_char_from_code_point(node: Int) -> Int ! Diag.Report {
     if cc_stopped(err_mem) { return -1 }
     let fault = cc_conversion_error_plan(node, child_tid(tid, Slot.Inner2), from_tid, child_tid(tid, Slot.Inner1))
     if fault.texts.len() == 0 { return -1 }
-    let _td = ensure_typedef_for(tid)
     let code = lower_expr(arg)
     if code < 0 { return -1 }
+    let _td = ensure_typedef_for(tid)
     cc_char_result(node, tid, carrier, verdict, answered, ok_mem, err_mem, fault, code)
 }
 
@@ -1245,11 +1263,11 @@ fn cc_char_result(node: Int, tid: Int, carrier: LayoutRecord, verdict: LayoutRec
         cc_temp_ref(node, TYPE_INT, verdict, said),
         ir_const(TYPE_INT, node, verdict.c_spelling, "{code_point_refused_below}"))
     let good = ir_carrier_wrap(tid, node, carrier.c_spelling, carrier_ok_member,
-        cc_char_tag(node, verdict, TAG_OK),
+        ir_const(TYPE_INT, node, verdict.c_spelling, "{TAG_OK}"),
         ir_cast(child_tid(tid, Slot.Inner1), node, ok_mem.c_spelling,
             cc_temp_ref(node, TYPE_INT, verdict, said)))
     let bad = ir_carrier_wrap(tid, node, carrier.c_spelling, carrier_err_member,
-        cc_char_tag(node, verdict, TAG_ERR), cc_conversion_error_value(node, tid, err_mem, fault))
+        ir_const(TYPE_INT, node, verdict.c_spelling, "{TAG_ERR}"), cc_conversion_error_value(node, err_mem, fault))
     cg_expr_push_pending(node, ir_if(node, accepted,
         ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), good)]),
         ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), bad)])))
@@ -1262,10 +1280,6 @@ fn cc_temp_ref(node: Int, tid: Int, rec: LayoutRecord, name: Str) -> Int {
     ir_var_ref(tid, node, rec.c_spelling, name, rec.slot_form)
 }
 
-fn cc_char_tag(node: Int, verdict: LayoutRecord, tag: Int) -> Int {
-    ir_const(TYPE_INT, node, verdict.c_spelling, "{tag}")
-}
-
 // The text of a conversion error, in the order its declaration writes its fields. A struct
 // is written as a positional literal, so the order is read off the declaration rather than
 // assumed: a field this call has no text for is refused here instead of being filled with
@@ -1275,18 +1289,21 @@ type ConversionErrorPlan { tid: Int  spelling: Str  string_spelling: Str  texts:
 fn cc_conversion_error_plan(node: Int, err_tid: Int, from_tid: Int, to_tid: Int) -> ConversionErrorPlan ! Diag.Report {
     let empty = ConversionErrorPlan { tid: -1, spelling: "", string_spelling: "", texts: [] }
     if err_tid < 0 { return cc_conversion_error_refused(node, "no error arm to build", empty) }
+    let decl = tc_tid_decl_node(err_tid)
+    if decl == DECL_NODE_AMBIGUOUS { return cc_conversion_error_refused(node, "a name more than one module declares", empty) }
+    let fields = if decl < 0 { -1 } else { node_fields(decl) }
+    if fields == -1 { return cc_conversion_error_refused(node, "no declaration to read fields from", empty) }
     let shape = cc_local(err_tid, node)
     if cc_stopped(shape) { return empty }
     let text = cc_local(TYPE_STR, node)
     if cc_stopped(text) { return empty }
-    let decl = tc_tid_decl_node(err_tid)
-    let fields = if decl < 0 { -1 } else { node_fields(decl) }
-    if fields == -1 { return cc_conversion_error_refused(node, "no declaration to read fields from", empty) }
+    let from = tc_type_str(from_tid)
+    let to = tc_type_str(to_tid)
     let mut texts: List[Str] = []
     let mut i = 0
     while i < sublist_length(fields) {
         let fname = node_name(sublist_get(fields, i))
-        let wrote = cc_conversion_error_text(fname, tc_type_str(from_tid), tc_type_str(to_tid))
+        let wrote = cc_conversion_error_text(fname, from, to)
         if wrote == "" { return cc_conversion_error_refused(node, "a field '{fname}' with no text to write", empty) }
         texts.push(wrote)
         i = i + 1
@@ -1311,7 +1328,7 @@ fn cc_conversion_error_refused(node: Int, why: Str, empty: ConversionErrorPlan) 
 
 // The value the refused arm holds. A member the carrier keeps by pointer gets a heap copy,
 // which is the same rule every other wrap of a payload follows.
-fn cc_conversion_error_value(node: Int, tid: Int, err_mem: LayoutRecord, fault: ConversionErrorPlan) -> Int {
+fn cc_conversion_error_value(node: Int, err_mem: LayoutRecord, fault: ConversionErrorPlan) -> Int {
     let mut fields: List[Int] = []
     for text in fault.texts {
         fields.push(ir_const(TYPE_STR, node, fault.string_spelling, c_string_literal(text)))
@@ -2154,7 +2171,7 @@ fn cc_tag_equals(node: Int, tag: Int, want: Int, c: CarrierRef) -> Int {
 }
 
 fn cc_carrier_ref(node: Int, c: CarrierRef, name: Str) -> Int {
-    ir_var_ref(c.tid, node, c.held.c_spelling, name, c.held.slot_form)
+    cc_temp_ref(node, c.tid, c.held, name)
 }
 
 // The carrier a call reads, with every spelling a test or a read of it is written with.
