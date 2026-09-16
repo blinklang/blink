@@ -167,6 +167,7 @@ begins `root <r>: `. It rejects:
 | an empty c_spelling on a value or a `Let` | `empty c_spelling` |
 | an empty c_name where the kind prints one | `empty c_name` |
 | a `Unary` `&` whose spelling is not the pointer form of its operand's | `address spelled '<s>', the pointer form of its operand's '<o>' is '<o>*'` |
+| a `Binary` `&&`/`\|\|` whose right operand binds a statement (see `ir_binds_statement`) | `right operand of '<op>' binds a statement the operator cannot skip` |
 | wrong kid count | `expects <n> kids, has <m>`, `expects <lo> or <hi> kids, has <m>`, `expects at least <n> kids, has <m>` |
 | statement in a value slot | `kid <i> is a statement where a value is required` |
 | value in a statement slot | `kid <i> is a value where a statement is required` |
@@ -185,6 +186,14 @@ The kinds that print a c_name: `Const`, `VarRef`, `GlobalRef`, `Unary`,
 `CallDirect`, `CallClosure`, `CallVirtual`, `CallRuntime`, `ClosureNew`,
 `EvidenceVector`, `EffectPerform`, `HandlerInstall`, `Let`, and `CarrierWrap` with a payload.
 `CarrierWrap` without a payload and `WithScope` take a c_name that may be empty.
+
+`ir_binds_statement(id) -> Bool` says whether printing the value at `id` writes a
+statement before the expression that reads it: a `Box`, a `ContainerNew` or
+`ClosureNew` with elements, a node with `must_materialize` set, or any node above
+one of those. C's `&&` and `||` skip the right operand but not a statement bound
+for it, so a lowering that finds a binding right operand guards it with a temp and
+an `if` instead of building the `Binary`. The left operand always runs, so it may
+bind.
 
 ## Dump
 

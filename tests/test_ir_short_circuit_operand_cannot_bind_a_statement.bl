@@ -1,0 +1,90 @@
+// C's && and || skip their right operand, but a node the printer binds to a temporary
+// (a Box, a filled ContainerNew or ClosureNew, or a node marked to materialise) writes
+// its statements before the operator, so they run whether or not the test passes. A
+// lowering that meets one on the right of a short-circuit operator must guard it with a
+// temp and an `if`; a Binary that still holds one is a tree the printer cannot order.
+import ir.{
+    ir_reset, ir_verify, ir_const, ir_var_ref, ir_binary, ir_box, ir_container_new,
+    ir_closure_new, ir_call_runtime, ir_mark_materialize, ir_binds_statement, ir_node_count,
+}
+import layout.{SlotForm}
+import compiler.{compile_to_program}
+import std.io
+
+fn int_const(text: Str) -> Int { ir_const(1, 0, "int64_t", text) }
+fn bool_var(name: Str) -> Int { ir_var_ref(2, 0, "int", name, SlotForm.InlineWord) }
+fn boxed_int() -> Int { ir_box(1, 0, "int64_t*", "int64_t", int_const("7")) }
+
+fn errors_of(root: Int) -> Str { ir_verify(root).join(" | ") }
+
+fn assert_rejected(label: Str, root: Int, saying: Str) {
+    let got = errors_of(root)
+    if !got.contains(saying) { io.println("FAIL: {label}: errors '{got}' do not say '{saying}'") }
+    assert(got.contains(saying))
+}
+
+fn assert_verifies(label: Str, root: Int) {
+    let got = errors_of(root)
+    if got != "" { io.println("FAIL: {label}: unexpected errors '{got}'") }
+    assert_eq(got, "")
+}
+
+test "a Box binds a statement and a Const or VarRef does not" {
+    ir_reset()
+    assert(ir_binds_statement(boxed_int()))
+    assert(!ir_binds_statement(int_const("1")))
+    assert(!ir_binds_statement(bool_var("a")))
+}
+
+test "a Box anywhere below the node counts, not only at the top" {
+    ir_reset()
+    let under = ir_binary(2, 0, "int", "==", boxed_int(), int_const("0"))
+    assert(ir_binds_statement(under))
+}
+
+test "a filled container or closure binds, an empty one does not" {
+    ir_reset()
+    assert(ir_binds_statement(ir_container_new(3, 0, "blink_list*", "blink_list_new", [int_const("1")])))
+    assert(!ir_binds_statement(ir_container_new(3, 0, "blink_list*", "blink_list_new", [])))
+    assert(ir_binds_statement(ir_closure_new(4, 0, "blink_closure*", "thunk", [bool_var("c")])))
+    assert(!ir_binds_statement(ir_closure_new(4, 0, "blink_closure*", "thunk", [])))
+}
+
+test "a node marked to materialise binds" {
+    ir_reset()
+    let call = ir_call_runtime(1, 0, "int64_t", "blink_len", SlotForm.InlineWord, [])
+    assert(!ir_binds_statement(call))
+    ir_mark_materialize(call)
+    assert(ir_binds_statement(call))
+}
+
+test "a short-circuit operator whose right operand binds a statement is rejected" {
+    ir_reset()
+    let rhs = ir_binary(2, 0, "int", "==", boxed_int(), int_const("0"))
+    let and = ir_binary(2, 0, "int", "&&", bool_var("a"), rhs)
+    assert_rejected("&&", and, "right operand of '&&' binds a statement the operator cannot skip")
+    let or = ir_binary(2, 0, "int", "||", bool_var("a"), boxed_int())
+    assert_rejected("||", or, "right operand of '||' binds a statement the operator cannot skip")
+}
+
+test "the left operand may bind a statement: it always runs" {
+    ir_reset()
+    let lhs = ir_binary(2, 0, "int", "==", boxed_int(), int_const("0"))
+    assert_verifies("box on the left", ir_binary(2, 0, "int", "&&", lhs, bool_var("b")))
+}
+
+test "an operator that does not short-circuit takes a binding operand on either side" {
+    ir_reset()
+    assert_verifies("+", ir_binary(1, 0, "int64_t", "+", int_const("1"), ir_binary(1, 0, "int64_t", "*", boxed_int(), int_const("2"))))
+    assert_verifies("==", ir_binary(2, 0, "int", "==", int_const("1"), boxed_int()))
+}
+
+test "a cyclic right operand is reported as a cycle, the walk does not recurse without end" {
+    ir_reset()
+    let lhs = int_const("1")
+    let self_id = ir_node_count()
+    let cyclic = ir_binary(2, 0, "int", "==", lhs, self_id)
+    assert(cyclic == self_id)
+    assert(!ir_binds_statement(cyclic))
+    assert_rejected("cycle under &&", ir_binary(2, 0, "int", "&&", bool_var("a"), cyclic), "cycle")
+}
