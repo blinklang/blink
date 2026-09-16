@@ -30,7 +30,8 @@ import typecheck.{
     DECL_NODE_AMBIGUOUS,
     is_import_module_name, is_builtin_namespace, is_builtin_fn, tc_alias_to_original,
     tc_qualifier_to_module_or_self, tc_get_symbol_module, tc_type_str,
-    tc_enum_variant_slots, tc_evar_name, tc_names_a_type, tc_is_sealed_list_hof,
+    tc_enum_variant_slots, tc_evar_name, tc_tid_child_count,
+    tc_names_a_type, tc_is_sealed_list_hof,
     TYPE_INT, TYPE_BOOL, TYPE_STR,
 }
 import layout.{
@@ -46,16 +47,19 @@ import cname.{
     c_display_dispatch_name, c_derive_method_name,
     c_runtime_helper, c_ffi_symbol, c_mint_local, c_string_literal, c_field_name,
     cname_ffi_struct_mirror,
+    c_variant_tag_macro, c_mono_variant_tag_macro, c_variant_member_name,
 }
 import ir.{
     ir_call_direct, ir_call_runtime, ir_cast, ir_unary, ir_unbox, ir_box,
     ir_assign, ir_binary, ir_block, ir_carrier_tag, ir_carrier_unwrap, ir_carrier_wrap,
     ir_const, ir_if, ir_let, ir_panic, ir_struct_new, ir_var_ref, ir_field_get,
+    ir_enum_new,
 }
 import cg_expr.{lower_expr, cg_expr_push_pending}
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
 import diagnostics.{
     Diag, diag_ice_at, diag_ice_stage_not_built, diag_file_for_node, diag_source_file,
+    diag_is_ice_seg,
     CODEGEN_STAGE_NOT_BUILT, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 
@@ -905,7 +909,7 @@ fn lower_builtin_static_call(node: Int, owner: Str, method: Str) -> Int ! Diag.R
 //   3. the free function the qualifier and the method name spell.
 //   4. a conversion, which is keyed source-typed and so is read only after 3 misses.
 fn lower_declared_static_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
-    if cc_names_variant(owner, method) { return cc_enum_ctor_not_in_ir(node, owner, method) }
+    if cc_names_variant(owner, method) { return cc_enum_variant_call(node, owner, method) }
     let im = cc_trait_qualified_impl(owner, method)
     if im >= 0 { return cc_impl_static_call(node, im, method) }
     let decl = cc_sole_fn_named(node, cc_assoc_name(owner, method))
@@ -1172,16 +1176,141 @@ fn cc_sole_fn_named(node: Int, name: Str) -> Int ! Diag.Report {
     DECL_REFUSED
 }
 
-// A variant constructor. The value is one arm of a tagged union, written as a tag beside a
-// member of the union the tag selects, and the member is itself a struct with one field per
-// payload element. The carrier node builds a tag beside ONE named member and nothing
-// deeper, so there is no node here that builds this and no spelling for the member's own
-// type to build it with.
-fn cc_enum_ctor_not_in_ir(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
-    diag_ice_at("EnumConstructorNotInIr", CODEGEN_STAGE_NOT_BUILT,
-        "'{owner}.{method}' fills one arm of a tagged union, and no node builds that shape", node,
-        "the IR needs a variant constructor that names the arm as well as the tag")
+// ── Variant constructors ──────────────────────────────────────────────────
+//
+// `Shape.Circle(2)` builds one arm of a tagged union: a tag beside the union member the
+// tag selects, and that member is a struct with one field per payload element.
+//
+// Everything about the arm is read from the declaration, because that is what the reading
+// side reads too: a pattern finds the arm by name in the declaration's own variant nodes,
+// and this finds the same node the same way. The variant entries typecheck registered are
+// not a second route to it: a generic enum's instance tid carries none of them, so the
+// declaration is the only place both a bare enum and an instance can be read from.
+fn cc_enum_variant_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    if cc_kind(tid) != TyKind.Enum { return cc_variant_answer_not_enum(node, owner, method, tid) }
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    let _td = ensure_typedef_for(tid)
+    let decl = tc_tid_decl_node(tid)
+    let vnode = cc_variant_node(decl, method)
+    if vnode < 0 { return cc_variant_not_declared(node, owner, method) }
+    let macro = cc_variant_tag(tid, decl, vnode)
+    if diag_is_ice_seg(macro) { return cc_variant_tag_unspellable(node, owner, method, macro) }
+    let arity = cc_variant_arity(vnode)
+    let payload = cc_variant_payload(node, decl, owner, method, arity)
+    if payload.len() != arity { return -1 }
+    let member = if arity == 0 { "" } else { c_variant_member_name(vnode) }
+    let tag_rec = cc_local(TYPE_INT, node)
+    if cc_stopped(tag_rec) { return -1 }
+    ir_enum_new(tid, node, rec.c_spelling, vnode, member,
+        ir_const(TYPE_INT, node, tag_rec.c_spelling, macro), payload)
+}
+
+// The payload in written order, each element in the physical form its member was declared
+// with. A field that reaches its own enum is stored by pointer, because the enum's typedef
+// is still incomplete where the member is declared, so a value for such a member is boxed
+// here rather than written into a word it does not fit.
+//
+// The type each element is laid out at is the type typecheck gave the written argument.
+// A generic enum's fields are declared at its type parameters, which have no C layout at
+// all; the argument carries the substituted type, so it is the only reading of the field
+// that answers for an instance as well as for a bare enum.
+fn cc_variant_payload(node: Int, decl: Int, owner: Str, method: Str, arity: Int) -> List[Int] ! Diag.Report {
+    let args = node_args(node)
+    let given = if args == -1 { 0 } else { sublist_length(args) }
+    let mut out: List[Int] = []
+    // The loop below reads one written argument per declared field, so the two counts
+    // agreeing is its precondition, not a check typecheck has left undone.
+    if given != arity {
+        cc_variant_arity_wrong(node, owner, method, arity, given)
+        return out
+    }
+    let mut i = 0
+    while i < arity {
+        let arg = sublist_get(args, i)
+        let ftid = tid_of_node(arg)
+        if ftid < 0 { return out }
+        let value = lower_expr(arg)
+        if value < 0 { return out }
+        let mem = cc_variant_field_layout(node, decl, ftid)
+        if cc_stopped(mem) { return out }
+        if mem.slot_form == SlotForm.PointerBoxed {
+            let held = cc_local(ftid, node)
+            if cc_stopped(held) { return out }
+            out.push(ir_box(ftid, node, mem.c_spelling, held.c_spelling, value))
+        } else {
+            out.push(value)
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn cc_variant_field_layout(node: Int, decl: Int, ftid: Int) -> LayoutRecord ! Diag.Report {
+    let rec = field_layout_of(decl, ftid)
+    // The reason is read into the message before the test, so that every read of a decline
+    // sits next to the internal error that reports it and none can be left to be swallowed.
+    let why = "a variant payload field has no C layout: {rec.decline_reason}"
+    if rec.decline_reason == "" { return rec }
+    diag_ice_at("UnspellableVariantField", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
+        "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    cc_stop(rec)
+}
+
+// A generic enum's tags belong to the instance, not to the generic declaration: two
+// instances declare two typedefs and two sets of macros. Whether the tid carries arguments
+// is what decides which namer applies, on the reading side as well as here.
+fn cc_variant_tag(tid: Int, decl: Int, vnode: Int) -> Str {
+    if tc_tid_child_count(tid) > 0 { return c_mono_variant_tag_macro(tid, vnode) }
+    c_variant_tag_macro(decl, vnode)
+}
+
+// A payload-less variant has no field sublist at all.
+fn cc_variant_arity(vnode: Int) -> Int {
+    let fields = node_fields(vnode)
+    if fields == -1 { 0 } else { sublist_length(fields) }
+}
+
+fn cc_variant_node(decl: Int, name: Str) -> Int {
+    if decl < 0 { return -1 }
+    let vars = node_fields(decl)
+    if vars == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(vars) {
+        let v = sublist_get(vars, i)
+        if nk_of(node_kind(v)) == NodeKind.TypeVariant && node_name(v) == name { return v }
+        i = i + 1
+    }
     -1
+}
+
+fn cc_variant_answer_not_enum(node: Int, owner: Str, method: Str, tid: Int) -> Int ! Diag.Report {
+    diag_ice_at("VariantCallNotAnEnum", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{owner}.{method}' names a variant, and this call was typed '{tc_type_str(tid)}'", node,
+        "a variant constructor answers the enum that declares it; this is a compiler bug")
+    -1
+}
+
+fn cc_variant_not_declared(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
+    diag_ice_at("VariantNotDeclared", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{owner}' declares no variant named '{method}' at the type this call answers", node,
+        "typecheck resolves the variant before codegen builds it; this is a compiler bug")
+    -1
+}
+
+fn cc_variant_tag_unspellable(node: Int, owner: Str, method: Str, why: Str) -> Int ! Diag.Report {
+    diag_ice_at("UnnameableVariantTag", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{owner}.{method}' has no spellable tag: {why}", node,
+        "an enum must be fully solved before its tags are spelled; this is a compiler bug")
+    -1
+}
+
+fn cc_variant_arity_wrong(node: Int, owner: Str, method: Str, want: Int, given: Int) ! Diag.Report {
+    diag_ice_at("EnumPayloadArityWrong", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{owner}.{method}' takes {want} payload fields, and this call gives {given}", node,
+        "typecheck checks a variant's payload count before codegen builds it; this is a compiler bug")
 }
 
 // A container constructor. The value the runtime answers with carries a table of the
