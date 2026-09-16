@@ -52,7 +52,7 @@ interned type, `Int`) and its c_spelling is
 empty, except `Let`, which holds the declared type. A statement has one owner:
 the verifier rejects a statement reached twice even when it is flagged.
 
-23 kinds are values. 15 kinds are statements.
+25 kinds are values. 15 kinds are statements.
 
 ## Inline rule
 
@@ -66,7 +66,7 @@ computed; it does not change what the tree means.
 `match` lowers to `Let` with no initialiser, followed by `Assign` inside each
 arm, followed by a `VarRef`.
 
-## The 38 kinds
+## The 40 kinds
 
 The tables list kids in order. `n` is the kid count. A kid marked *value* must be
 a value node; *stmt* any statement; *Block* the `Block` kind; *Const* the
@@ -99,7 +99,8 @@ a value node; *stmt* any statement; *Block* the `Block` kind; *Const* the
 | `CallVirtual` | `ir_call_virtual(tid, span, c_spelling, slot, slot_form, receiver, args)` | `[receiver: value, arg_0 .. : value]` | the vtable slot name | caller |
 | `CallRuntime` | `ir_call_runtime(tid, span, c_spelling, symbol, slot_form, args)` | `[arg_0 .. : value]` | a `blink_*` runtime symbol | caller |
 | `ClosureNew` | `ir_closure_new(tid, span, c_spelling, fn_symbol, captures)` | `[capture_0 .. : value]` | the lifted function's C symbol | `InlineWord` |
-| `EffectPerform` | `ir_effect_perform(tid, span, c_spelling, slot, slot_form, args)` | `[arg_0 .. : value]` | the handler vtable slot | caller |
+| `EvidenceVector` | `ir_evidence_vector(span, c_spelling, c_name, slot_form)` | none | `__ev` (PointerBoxed param) or `__blink_ev` (Inline global) | caller |
+| `EffectPerform` | `ir_effect_perform(tid, span, c_spelling, slot, slot_form, slot_read, args)` | `[slot_read: FieldGet over an EvidenceVector, held by pointer; arg_0 .. : value]` | the handler vtable slot | caller |
 
 `ContainerSpread` is `[..xs, y]`: it copies every element of its source into the
 container being built. It is legal only as a direct kid of `ContainerNew`, so the
@@ -162,6 +163,7 @@ begins `root <r>: `. It rejects:
 | kid id outside the arena | `kid <i> id <k> out of range (arena holds <n>)` |
 | a node that contains itself | `cycle, the node contains itself` |
 | a value node with tid < 0 | `value node without a tid` |
+| an `EvidenceVector` with tid >= 0 | `carries tid <t>, the vector has no Blink type` |
 | an empty c_spelling on a value or a `Let` | `empty c_spelling` |
 | an empty c_name where the kind prints one | `empty c_name` |
 | wrong kid count | `expects <n> kids, has <m>`, `expects <lo> or <hi> kids, has <m>`, `expects at least <n> kids, has <m>` |
@@ -169,6 +171,8 @@ begins `root <r>: `. It rejects:
 | value in a statement slot | `kid <i> is a value where a statement is required` |
 | non-Block where a Block is required | `kid <i> must be a Block` |
 | non-Const Switch label | `kid <i> case label must be a Const` |
+| `EffectPerform` kid 0 not a `FieldGet` over an `EvidenceVector` | `kid 0 must read a handler slot of the EvidenceVector, is a <Kind>` |
+| `EffectPerform` kid 0 held by value | `handler slot must be held by pointer, a handler is a vtable pointer` |
 | non-Const CarrierWrap tag | `kid <i> tag must be a Const` |
 | non-lvalue Assign target | `kid <i> target must be an lvalue` |
 | ContainerSpread not directly under ContainerNew | `ContainerSpread outside a ContainerNew` |
@@ -178,7 +182,7 @@ begins `root <r>: `. It rejects:
 The kinds that print a c_name: `Const`, `VarRef`, `GlobalRef`, `Unary`,
 `Binary`, `FieldGet`, `FieldSet`, `ContainerNew`, `ContainerSpread`, `Box`, `CarrierUnwrap`,
 `CallDirect`, `CallClosure`, `CallVirtual`, `CallRuntime`, `ClosureNew`,
-`EffectPerform`, `HandlerInstall`, `Let`, and `CarrierWrap` with a payload.
+`EvidenceVector`, `EffectPerform`, `HandlerInstall`, `Let`, and `CarrierWrap` with a payload.
 `CarrierWrap` without a payload and `WithScope` take a c_name that may be empty.
 
 ## Dump

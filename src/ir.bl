@@ -32,7 +32,7 @@ pub type IrKind {
     FieldGet, FieldSet, StructNew, TupleNew, EnumNew, ContainerNew, ContainerSpread,
     Box, Unbox, CarrierWrap, CarrierUnwrap, CarrierTag,
     CallDirect, CallIndirect, CallClosure, CallVirtual, CallRuntime,
-    ClosureNew, EffectPerform, HandlerInstall,
+    ClosureNew, EvidenceVector, EffectPerform, HandlerInstall,
     Let, Assign, ExprStmt, Return, If, Loop, Break, Continue, Block, Switch, WithScope,
     Panic, Unreachable,
 }
@@ -117,7 +117,7 @@ pub fn ir_all_kinds() -> List[IrKind] {
         IrKind.FieldGet, IrKind.FieldSet, IrKind.StructNew, IrKind.TupleNew, IrKind.EnumNew, IrKind.ContainerNew,
         IrKind.ContainerSpread, IrKind.Box, IrKind.Unbox, IrKind.CarrierWrap, IrKind.CarrierUnwrap, IrKind.CarrierTag,
         IrKind.CallDirect, IrKind.CallIndirect, IrKind.CallClosure, IrKind.CallVirtual, IrKind.CallRuntime,
-        IrKind.ClosureNew, IrKind.EffectPerform, IrKind.HandlerInstall,
+        IrKind.ClosureNew, IrKind.EvidenceVector, IrKind.EffectPerform, IrKind.HandlerInstall,
         IrKind.Let, IrKind.Assign, IrKind.ExprStmt, IrKind.Return, IrKind.If, IrKind.Loop,
         IrKind.Break, IrKind.Continue, IrKind.Block, IrKind.Switch, IrKind.WithScope,
         IrKind.Panic, IrKind.Unreachable,
@@ -150,6 +150,7 @@ pub fn ir_kind_name(kind: IrKind) -> Str {
         IrKind.CallVirtual => "CallVirtual"
         IrKind.CallRuntime => "CallRuntime"
         IrKind.ClosureNew => "ClosureNew"
+        IrKind.EvidenceVector => "EvidenceVector"
         IrKind.EffectPerform => "EffectPerform"
         IrKind.HandlerInstall => "HandlerInstall"
         IrKind.Let => "Let"
@@ -219,6 +220,7 @@ fn kind_needs_c_name(kind: IrKind) -> Bool {
         IrKind.CallVirtual => true
         IrKind.CallRuntime => true
         IrKind.ClosureNew => true
+        IrKind.EvidenceVector => true
         IrKind.EffectPerform => true
         IrKind.HandlerInstall => true
         IrKind.Let => true
@@ -244,6 +246,7 @@ fn kind_min_kids(kind: IrKind) -> Int {
         IrKind.CallIndirect => 1
         IrKind.CallClosure => 1
         IrKind.CallVirtual => 1
+        IrKind.EffectPerform => 1
         IrKind.HandlerInstall => 2
         IrKind.Assign => 2
         IrKind.ExprStmt => 1
@@ -272,6 +275,7 @@ fn kind_max_kids(kind: IrKind) -> Int {
         IrKind.CarrierWrap => 2
         IrKind.CarrierUnwrap => 1
         IrKind.CarrierTag => 1
+        IrKind.EvidenceVector => 0
         IrKind.HandlerInstall => 2
         IrKind.Let => 1
         IrKind.Assign => 2
@@ -409,8 +413,18 @@ pub fn ir_closure_new(tid: Int, span: Int, c_spelling: Str, fn_symbol: Str, capt
     ir_new(IrKind.ClosureNew, tid, span, c_spelling, fn_symbol, SlotForm.InlineWord, captures)
 }
 
-pub fn ir_effect_perform(tid: Int, span: Int, c_spelling: Str, slot: Str, slot_form: SlotForm, args: List[Int]) -> Int {
-    ir_new(IrKind.EffectPerform, tid, span, c_spelling, slot, slot_form, args)
+// The evidence vector in scope: the `blink_ev*` parameter of an effectful function
+// (PointerBoxed) or the program's global vector (Inline). It has no Blink type, so it is
+// the one value node whose tid is -1; c_name comes from cname's two vector producers.
+pub fn ir_evidence_vector(span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm) -> Int {
+    ir_new(IrKind.EvidenceVector, -1, span, c_spelling, c_name, slot_form, [])
+}
+
+// A perform is a virtual call through the vector: `slot_read` is a FieldGet that reads the
+// effect's slot off an EvidenceVector, and `slot` is the vtable member the runtime or the
+// user effect declares. Printing it as `(handler)->slot(args)` is the printer's rule.
+pub fn ir_effect_perform(tid: Int, span: Int, c_spelling: Str, slot: Str, slot_form: SlotForm, slot_read: Int, args: List[Int]) -> Int {
+    ir_new(IrKind.EffectPerform, tid, span, c_spelling, slot, slot_form, prepend(slot_read, args))
 }
 
 fn prepend(head: Int, rest: List[Int]) -> List[Int] { [head].append(rest) }
@@ -544,7 +558,9 @@ fn verify_node(id: Int, seen: List[Int], on_stack: List[Int], errs: List[Str]) {
 }
 
 fn verify_fields(id: Int, kind: IrKind, label: Str, errs: List[Str]) {
-    if ir_kind_is_value(kind) && ir_tid(id) < 0 {
+    if kind == IrKind.EvidenceVector {
+        if ir_tid(id) >= 0 { errs.push("{label}: carries tid {ir_tid(id)}, the vector has no Blink type") }
+    } else if ir_kind_is_value(kind) && ir_tid(id) < 0 {
         errs.push("{label}: value node without a tid")
     }
     if (ir_kind_is_value(kind) || kind == IrKind.Let) && ir_c_spelling(id) == "" {
@@ -622,7 +638,8 @@ fn verify_arity(kind: IrKind, label: Str, n: Int, errs: List[Str]) -> Bool {
 
 fn plural(n: Int) -> Str { if n == 1 { "" } else { "s" } }
 
-// Which category each kid position takes: a value, any statement, or a Block.
+// Which category each kid position takes: a value, any statement, a Block, or a handler
+// slot read off the evidence vector.
 fn verify_kid_shape(kind: IrKind, label: Str, i: Int, n: Int, kid: Int, errs: List[Str]) {
     let kid_kind = ir_kind(kid)
     let kid_is_value = ir_kind_is_value(kid_kind)
@@ -648,10 +665,26 @@ fn verify_kid_shape(kind: IrKind, label: Str, i: Int, n: Int, kid: Int, errs: Li
         KidSlot.Lvalue => {
             if !is_lvalue_kind(kid_kind) { errs.push("{label}: kid {i} target must be an lvalue") }
         }
+        KidSlot.HandlerSlot => {
+            if !reads_evidence_vector(kid) {
+                errs.push("{label}: kid {i} must read a handler slot of the EvidenceVector, is a {ir_kind_name(kid_kind)}")
+            } else if !ir_held_by_pointer(kid) {
+                errs.push("{label}: handler slot must be held by pointer, a handler is a vtable pointer")
+            }
+        }
     }
 }
 
-type KidSlot { Value, Stmt, BlockOnly, ConstLabel, ConstTag, Lvalue }
+// The handler a perform calls through is never a free value: it is read out of the
+// vector's slot for the effect, and a handler is a vtable pointer.
+fn reads_evidence_vector(read: Int) -> Bool {
+    if ir_kind(read) != IrKind.FieldGet || ir_kid_count(read) != 1 { return false }
+    let obj = ir_kid(read, 0)
+    if obj < 0 || obj >= ir_node_count() { return false }
+    ir_kind(obj) == IrKind.EvidenceVector
+}
+
+type KidSlot { Value, Stmt, BlockOnly, ConstLabel, ConstTag, Lvalue, HandlerSlot }
 
 fn kid_slot(kind: IrKind, i: Int, n: Int) -> KidSlot {
     match kind {
@@ -664,6 +697,7 @@ fn kid_slot(kind: IrKind, i: Int, n: Int) -> KidSlot {
         IrKind.CarrierWrap => if i == 0 { KidSlot.ConstTag } else { KidSlot.Value }
         IrKind.EnumNew => if i == 0 { KidSlot.ConstTag } else { KidSlot.Value }
         IrKind.Assign => if i == 0 { KidSlot.Lvalue } else { KidSlot.Value }
+        IrKind.EffectPerform => if i == 0 { KidSlot.HandlerSlot } else { KidSlot.Value }
         _ => KidSlot.Value
     }
 }
