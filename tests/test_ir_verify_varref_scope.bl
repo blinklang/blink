@@ -1,0 +1,108 @@
+// A VarRef names a C local, so the tree must say where that local comes from: an
+// enclosing Let, or the frame the verifier is handed (parameters and module globals).
+// A reference to a name nothing declares is how an undrained buffer or a dropped Let
+// reaches the printer, so the verifier names it instead of passing the tree.
+//
+// ir_verify judges shape alone, because a fragment handed to it has no frame at all.
+// A caller holding a whole function body passes that frame and gets the scope check.
+import std.io
+import ir.{
+    ir_reset, ir_verify, ir_verify_in_frame, ir_const, ir_var_ref, ir_global_ref, ir_let,
+    ir_block, ir_expr_stmt, ir_assign, ir_if, ir_loop, ir_closure_new,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals compiler.bl owns, so a test reaching
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+let NO_FRAME: List[Str] = []
+
+fn iv(name: Str) -> Int { ir_var_ref(1, 0, "int64_t", name, SlotForm.InlineWord) }
+fn ic() -> Int { ir_const(1, 0, "int64_t", "1") }
+fn ilet(name: Str) -> Int { ir_let(1, 0, "int64_t", name, SlotForm.InlineWord, ic()) }
+
+fn assert_rejects(label: Str, root: Int, frame: List[Str], needle: Str) {
+    let errs = ir_verify_in_frame(root, frame)
+    let mut hit = 0
+    for e in errs { if e.contains(needle) { hit += 1 } }
+    if hit == 0 { io.println("FAIL: {label}: no error contains '{needle}'; got: {errs.join(" | ")}") }
+    assert(hit > 0)
+}
+
+fn assert_valid(label: Str, root: Int, frame: List[Str]) {
+    let errs = ir_verify_in_frame(root, frame)
+    if errs.len() > 0 { io.println("FAIL: {label}: {errs.join(" | ")}") }
+    assert_eq(errs.len(), 0)
+}
+
+test "a VarRef no Let and no frame declares is a named verifier failure" {
+    ir_reset()
+    let root = ir_block(0, [ir_expr_stmt(0, iv("x"))])
+    assert_rejects("read of x", root, NO_FRAME, "reads 'x'")
+    assert_rejects("read of x", root, NO_FRAME, "no enclosing Let, parameter or global declares it")
+}
+
+test "a VarRef declared in a sibling block is out of scope" {
+    ir_reset()
+    let sibling = ir_block(0, [ilet("y"), ir_expr_stmt(0, iv("y"))])
+    let reader = ir_block(0, [ir_expr_stmt(0, iv("y"))])
+    assert_rejects("y across siblings", ir_block(0, [sibling, reader]), NO_FRAME, "reads 'y'")
+}
+
+test "a VarRef declared in an enclosing block is in scope" {
+    ir_reset()
+    let inner = ir_block(0, [ir_expr_stmt(0, iv("z"))])
+    assert_valid("z from the enclosing block", ir_block(0, [ilet("z"), inner]), NO_FRAME)
+}
+
+test "a Let is in scope for the statements after it, not for its own initialiser" {
+    ir_reset()
+    let after = ir_block(0, [ilet("a"), ir_expr_stmt(0, iv("a"))])
+    assert_valid("read after the let", after, NO_FRAME)
+    ir_reset()
+    let selfref = ir_block(0, [ir_let(1, 0, "int64_t", "b", SlotForm.InlineWord, iv("b"))])
+    assert_rejects("let b = b", selfref, NO_FRAME, "reads 'b'")
+}
+
+test "a name the frame declares is in scope, which is how a parameter resolves" {
+    ir_reset()
+    assert_valid("parameter n", ir_block(0, [ir_expr_stmt(0, iv("n"))]), ["n"])
+    ir_reset()
+    assert_rejects("another parameter's name", ir_block(0, [ir_expr_stmt(0, iv("n"))]), ["m"], "reads 'n'")
+}
+
+test "a GlobalRef carries its own declaration, so no frame entry is needed" {
+    ir_reset()
+    let g = ir_global_ref(1, 0, "int64_t", "blink_counter", SlotForm.InlineWord)
+    assert_valid("global read", ir_block(0, [ir_expr_stmt(0, g)]), NO_FRAME)
+}
+
+test "the scope rule reaches an assignment target, a condition and a loop body" {
+    ir_reset()
+    assert_rejects("assign to c", ir_block(0, [ir_assign(0, iv("c"), ic())]), NO_FRAME, "reads 'c'")
+    ir_reset()
+    let branch = ir_if(0, iv("d"), ir_block(0, []), -1)
+    assert_rejects("if on d", ir_block(0, [branch]), NO_FRAME, "reads 'd'")
+    ir_reset()
+    let body = ir_loop(0, ir_block(0, [ir_expr_stmt(0, iv("e"))]))
+    assert_rejects("loop over e", ir_block(0, [body]), NO_FRAME, "reads 'e'")
+    ir_reset()
+    let ok = ir_loop(0, ir_block(0, [ir_expr_stmt(0, iv("f"))]))
+    assert_valid("loop over an outer f", ir_block(0, [ilet("f"), ok]), NO_FRAME)
+}
+
+test "a closure capture is a read in the enclosing frame" {
+    ir_reset()
+    let cl = ir_closure_new(1, 0, "blink_closure", "blink_lambda_0", [iv("g")])
+    assert_rejects("capture of g", ir_block(0, [ir_expr_stmt(0, cl)]), NO_FRAME, "reads 'g'")
+    ir_reset()
+    let cl2 = ir_closure_new(1, 0, "blink_closure", "blink_lambda_0", [iv("h")])
+    assert_valid("capture of a declared h", ir_block(0, [ilet("h"), ir_expr_stmt(0, cl2)]), NO_FRAME)
+}
+
+test "ir_verify judges shape alone, so a fragment with a bare VarRef still verifies" {
+    ir_reset()
+    let errs = ir_verify(ir_expr_stmt(0, iv("loose")))
+    if errs.len() > 0 { io.println("FAIL: bare fragment: {errs.join(" | ")}") }
+    assert_eq(errs.len(), 0)
+}

@@ -532,8 +532,22 @@ pub fn ir_unreachable(span: Int) -> Int { ir_new(IrKind.Unreachable, -1, span, "
 
 // ── Verifier ──────────────────────────────────────────────────────────────
 
-// Empty means valid. Each string names the node, its kind and one defect.
+// Empty means valid. Each string names the node, its kind and one defect. This form
+// judges shape alone: a VarRef names a C local, and a fragment handed here carries no
+// frame to resolve that name against, so the scope rule cannot apply.
 pub fn ir_verify(root: Int) -> List[Str] {
+    let no_frame: List[Str] = []
+    verify_root(root, no_frame, false)
+}
+
+// The whole-body form. `declared` is the frame the tree sits in: its parameter names
+// and the module globals it may read. Every VarRef must resolve to an enclosing Let or
+// to that frame, so a read of a name nothing declares is a failure rather than a pass.
+pub fn ir_verify_in_frame(root: Int, declared: List[Str]) -> List[Str] {
+    verify_root(root, declared, true)
+}
+
+fn verify_root(root: Int, declared: List[Str], scoped: Bool) -> List[Str] {
     let mut errs: List[Str] = []
     if root < 0 || root >= ir_node_count() {
         errs.push("root {root}: node id out of range (arena holds {ir_node_count()})")
@@ -550,13 +564,15 @@ pub fn ir_verify(root: Int) -> List[Str] {
     if ir_kind(root) == IrKind.ContainerSpread {
         errs.push("root {root} (ContainerSpread): {SPREAD_MISPLACED}")
     }
-    verify_node(root, seen, on_stack, errs)
+    let mut scope: List[Str] = []
+    verify_node(root, seen, on_stack, errs, scope, declared, scoped)
     errs
 }
 
 let SPREAD_MISPLACED: Str = "ContainerSpread outside a ContainerNew, it extends only the container that holds it"
+let VARREF_UNDECLARED: Str = "no enclosing Let, parameter or global declares it"
 
-fn verify_node(id: Int, seen: List[Int], on_stack: List[Int], errs: List[Str]) {
+fn verify_node(id: Int, seen: List[Int], on_stack: List[Int], errs: List[Str], scope: List[Str], declared: List[Str], scoped: Bool) {
     let kind = ir_kind(id)
     let label = "node {id} ({ir_kind_name(kind)})"
     if on_stack.get(id).unwrap() == 1 {
@@ -574,7 +590,11 @@ fn verify_node(id: Int, seen: List[Int], on_stack: List[Int], errs: List[Str]) {
     seen.set(id, 1)
     on_stack.set(id, 1)
     verify_fields(id, kind, label, errs)
+    if scoped && kind == IrKind.VarRef && !in_scope(ir_c_name(id), scope, declared) {
+        errs.push("{label}: reads '{ir_c_name(id)}', {VARREF_UNDECLARED}")
+    }
     let kids = ir_kids(id)
+    let block_mark = scope.len()
     if verify_arity(kind, label, kids.len(), errs) {
         if kind == IrKind.EnumNew { verify_enum_new(id, label, kids.len(), errs) }
         let mut i = 0
@@ -584,12 +604,28 @@ fn verify_node(id: Int, seen: List[Int], on_stack: List[Int], errs: List[Str]) {
                 errs.push("{label}: kid {i} id {kid} out of range (arena holds {ir_node_count()})")
             } else {
                 verify_kid_shape(kind, label, i, kids.len(), kid, errs)
-                verify_node(kid, seen, on_stack, errs)
+                verify_node(kid, seen, on_stack, errs, scope, declared, scoped)
             }
             i += 1
         }
     }
+    if kind == IrKind.Block { drop_to(scope, block_mark) }
+    // A Let declares its name only after its own initialiser is verified, so `let b = b`
+    // reads a name that is not in scope yet, exactly as the C it prints would.
+    if scoped && kind == IrKind.Let { scope.push(ir_c_name(id)) }
     on_stack.set(id, 0)
+}
+
+fn in_scope(name: Str, scope: List[Str], declared: List[Str]) -> Bool {
+    scope.contains(name) || declared.contains(name)
+}
+
+// A Block owns the names its statements declare, so they leave scope with it. That is
+// what keeps a sibling block's Let from answering this block's read.
+fn drop_to(scope: List[Str], mark: Int) {
+    while scope.len() > mark {
+        let _ = scope.pop()
+    }
 }
 
 fn verify_fields(id: Int, kind: IrKind, label: Str, errs: List[Str]) {

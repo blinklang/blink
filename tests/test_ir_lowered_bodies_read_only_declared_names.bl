@@ -1,0 +1,144 @@
+// The scope rule is worth nothing unless a real tree is held to it. The statement
+// stage lowers whole function bodies, so each body is verified in the frame its
+// parameters provide: every VarRef the stage emits must resolve to an enclosing Let
+// or to one of those parameters.
+//
+// A body that reads a name nothing declares is how a dropped Let or an undrained
+// buffer reaches the printer, and this is where that shows up first.
+import std.fs
+import std.io
+import typecheck.{check_types}
+import layout.{layout_reset}
+import mono.{run_mono}
+import ir.{ir_dump, ir_reset, ir_verify_in_frame}
+import parser.{nodes, node_kind, node_name, node_params, sublist_get, sublist_length}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+import diagnostics.{diag_reset}
+import cg_stmt.{cg_stmt_reset, lower_fn}
+
+fn probe_src() -> Str {
+    #"type Point { x: Int, y: Int }
+type Shape { Circle { r: Int }, Dot }
+fn add(a: Int, b: Int) -> Int {
+    let s = a + b
+    s
+}
+fn loops(n: Int) -> Int {
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        let step = i * 2
+        acc = acc + step
+        i = i + 1
+    }
+    if acc > 3 {
+        let big = acc
+        return big
+    }
+    acc
+}
+fn iterate(xs: List[Int]) -> Int {
+    let mut total = 0
+    for x in xs {
+        total = total + x
+    }
+    for j in 0..3 {
+        total = total + j
+    }
+    total
+}
+fn matches(sh: Shape, p: Point) -> Int {
+    let m = match sh {
+        Shape.Circle { r } => r
+        Shape.Dot => p.x
+    }
+    let t = (1, 2)
+    match t {
+        (l, r) => l + r + m
+    }
+}
+fn scoped_res(path: Str) -> Int {
+    let mut seen = 0
+    with ffi.scope() as sc {
+        let cell: Ptr[Int] = sc.alloc()
+        seen = 1
+    }
+    seen
+}
+fn main() {
+    assert(add(1, 2) == 3)
+    assert(loops(3) >= 0)
+    assert(iterate([1, 2]) == 6)
+    assert(matches(Shape.Dot, Point { x: 1, y: 2 }) >= 0)
+    assert(scoped_res("p") == 1)
+}
+"#
+}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn param_names(f: Int) -> List[Str] {
+    let ps = node_params(f)
+    let mut out: List[Str] = []
+    if ps == -1 { return out }
+    let mut i = 0
+    while i < sublist_length(ps) {
+        out.push(node_name(sublist_get(ps, i)))
+        i = i + 1
+    }
+    out
+}
+
+fn var_ref_count(dump: Str) -> Int {
+    let mut n = 0
+    let mut rest = dump
+    while rest.contains("VarRef") {
+        n = n + 1
+        rest = rest.slice(rest.index_of("VarRef") + 6, rest.len())
+    }
+    n
+}
+
+// The nested compile resolves the prelude from BLINK_ROOT; the suite runs from the
+// repo root, so the cwd is that root.
+fn compile_probe(path: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    env.set_var("BLINK_ROOT", env.cwd())
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    diag_reset()
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+}
+
+test "every lowered body reads only names its own lets or its parameters declare" {
+    compile_probe("build/ir_lowered_frame_probe.bl")
+    let mut reads = 0
+    for name in ["add", "loops", "iterate", "matches", "scoped_res", "main"] {
+        let f = find_fn(name)
+        assert(f >= 0)
+        let root = lower_fn(f)
+        let errs = ir_verify_in_frame(root, param_names(f))
+        if errs.len() > 0 {
+            io.println("FAIL: {name}: {errs.join(" | ")}")
+            io.println(ir_dump(root))
+        }
+        assert_eq(errs.len(), 0)
+        reads = reads + var_ref_count(ir_dump(root))
+    }
+    // A stage that emitted no VarRef at all would satisfy the rule by saying nothing,
+    // so the count is part of the claim.
+    if reads < 10 { io.println("FAIL: only {reads} VarRef nodes lowered; the scope rule went unexercised") }
+    assert(reads >= 10)
+}
