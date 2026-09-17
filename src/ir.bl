@@ -26,6 +26,7 @@
 // that ordering: it walks the tree and reports a cycle.
 
 import layout.{SlotForm, pointer_spelling}
+import cname.{c_enum_tag_member, c_enum_payload_member}
 import typecheck.{TyKind, tc_tid_kind, tc_tid_decl_node}
 import parser.{node_name, node_fields, sublist_length, sublist_get, node_count}
 
@@ -54,6 +55,12 @@ pub type IrNode {
     // every other kind. Identity is the node, not a name string, so the printer asks cname
     // for the arm's spelling and two variants that share a name never collide.
     decl: Int
+    // What the two fixed members of a tagged union are called at this node. The printer
+    // may not ask a type question, so a node that prints one of those designators carries
+    // the answer; "" on every kind whose C shape declares no such member. A carrier names
+    // no payload union: its payload is a plain field beside the tag.
+    tag_member: Str
+    payload_member: Str
 }
 
 // The arena. A node id is an index into this list, the same shape parser.bl uses for AST
@@ -73,6 +80,7 @@ pub fn ir_new(kind: IrKind, tid: Int, span: Int, c_spelling: Str, c_name: Str, s
     ir_nodes.push(IrNode {
         kind: kind, tid: tid, span: span, c_spelling: c_spelling, c_name: c_name,
         slot_form: slot_form, must_materialize: 0, kids: copy_ids(kids), decl: -1,
+        tag_member: "", payload_member: "",
     })
     ir_nodes.len() - 1
 }
@@ -91,6 +99,10 @@ pub fn ir_tid(id: Int) -> Int { ir_node(id).tid }
 pub fn ir_span(id: Int) -> Int { ir_node(id).span }
 pub fn ir_c_spelling(id: Int) -> Str { ir_node(id).c_spelling }
 pub fn ir_c_name(id: Int) -> Str { ir_node(id).c_name }
+
+pub fn ir_tag_member(id: Int) -> Str { ir_node(id).tag_member }
+
+pub fn ir_payload_member(id: Int) -> Str { ir_node(id).payload_member }
 pub fn ir_slot_form(id: Int) -> SlotForm { ir_node(id).slot_form }
 // The printer's one type-shaped question, asked without importing SlotForm.
 pub fn ir_held_by_pointer(id: Int) -> Bool {
@@ -372,12 +384,28 @@ pub fn ir_enum_new(tid: Int, span: Int, c_spelling: Str, variant: Int, member: S
     for p in payload { kids.push(p) }
     let id = ir_new(IrKind.EnumNew, tid, span, c_spelling, member, SlotForm.Inline, kids)
     set_decl(id, variant)
-    id
+    stamp_tagged_members(id)
 }
 
 fn set_decl(id: Int, decl: Int) {
     let n = ir_node(id)
     ir_nodes.set(id, IrNode { decl: decl, ..n })
+}
+
+// Stamped wherever a node is built, from the one producer of each name, so that no build
+// site spells either word and no two of them can disagree. Which designator a kind prints
+// is a property of the kind, so the answer is read from the kind and a node that arrives
+// through ir_parse is stamped alike.
+fn stamp_tagged_members(id: Int) -> Int {
+    let payload = match ir_kind(id) {
+        IrKind.EnumNew => c_enum_payload_member()
+        IrKind.CarrierWrap => ""
+        IrKind.CarrierTag => ""
+        _ => return id
+    }
+    let n = ir_node(id)
+    ir_nodes.set(id, IrNode { tag_member: c_enum_tag_member(), payload_member: payload, ..n })
+    id
 }
 
 pub fn ir_container_new(tid: Int, span: Int, c_spelling: Str, ctor_symbol: Str, elems: List[Int]) -> Int {
@@ -406,7 +434,7 @@ pub fn ir_unbox(tid: Int, span: Int, c_spelling: Str, slot_form: SlotForm, ptr: 
 // The tag kid is a Const so the printer writes both designators without knowing the carrier.
 pub fn ir_carrier_wrap(tid: Int, span: Int, c_spelling: Str, member: Str, tag: Int, payload: Int) -> Int {
     let kids = if payload < 0 { [tag] } else { [tag, payload] }
-    ir_new(IrKind.CarrierWrap, tid, span, c_spelling, member, SlotForm.Inline, kids)
+    stamp_tagged_members(ir_new(IrKind.CarrierWrap, tid, span, c_spelling, member, SlotForm.Inline, kids))
 }
 
 pub fn ir_carrier_unwrap(tid: Int, span: Int, c_spelling: Str, member: Str, slot_form: SlotForm, carrier: Int) -> Int {
@@ -414,7 +442,7 @@ pub fn ir_carrier_unwrap(tid: Int, span: Int, c_spelling: Str, member: Str, slot
 }
 
 pub fn ir_carrier_tag(tid: Int, span: Int, c_spelling: Str, carrier: Int) -> Int {
-    ir_new(IrKind.CarrierTag, tid, span, c_spelling, "", SlotForm.InlineWord, [carrier])
+    stamp_tagged_members(ir_new(IrKind.CarrierTag, tid, span, c_spelling, "", SlotForm.InlineWord, [carrier]))
 }
 
 pub fn ir_call_direct(tid: Int, span: Int, c_spelling: Str, symbol: Str, slot_form: SlotForm, args: List[Int]) -> Int {
@@ -1022,7 +1050,7 @@ fn parse_node() -> Int {
         Some(f) => f
         None => return fail()
     }
-    let id = ir_new(kind, tid, span, spelling, name, slot, kids)
+    let id = stamp_tagged_members(ir_new(kind, tid, span, spelling, name, slot, kids))
     if mat == 1 { ir_mark_materialize(id) }
     if decl >= 0 { set_decl(id, decl) }
     if label >= 0 { bind_label(label, id) }

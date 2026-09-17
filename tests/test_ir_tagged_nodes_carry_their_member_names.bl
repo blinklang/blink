@@ -1,0 +1,82 @@
+import std.io
+import ir.{
+    IrKind, ir_reset, ir_kind, ir_all_kinds, ir_kind_name, ir_const,
+    ir_var_ref, ir_enum_new, ir_carrier_wrap, ir_carrier_tag, ir_carrier_unwrap,
+    ir_struct_new, ir_tuple_new, ir_tag_member, ir_payload_member,
+    ir_dump, ir_parse, ir_expr_stmt, ir_kid,
+}
+import cname.{c_enum_tag_member, c_enum_payload_member}
+import layout.{SlotForm}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn int_const(text: Str) -> Int { ir_const(1, 0, "int64_t", text) }
+
+fn int_var(name: Str) -> Int { ir_var_ref(1, 0, "int64_t", name, SlotForm.InlineWord) }
+
+fn an_enum() -> Int {
+    ir_enum_new(12, 0, "blink_Shape", 0, "Rect", int_const("blink_Shape_Rect_TAG"), [int_const("1")])
+}
+
+fn a_some() -> Int {
+    ir_carrier_wrap(8, 0, "blink_Option_int", "value", int_const("1"), int_var("a"))
+}
+
+fn a_none() -> Int {
+    ir_carrier_wrap(8, 0, "blink_Option_int", "", int_const("0"), -1)
+}
+
+// The printer may not ask a type question, so a node that prints one of the two fixed
+// designators has to carry what that designator is called. The value comes from cname
+// when the node is built, which is why no build site spells it and no two can disagree.
+test "a node that prints a tagged designator carries what the member is called" {
+    ir_reset()
+    assert_eq_str("EnumNew tag", ir_tag_member(an_enum()), c_enum_tag_member())
+    assert_eq_str("EnumNew payload", ir_payload_member(an_enum()), c_enum_payload_member())
+    assert_eq_str("CarrierWrap tag", ir_tag_member(a_some()), c_enum_tag_member())
+    assert_eq_str("None tag", ir_tag_member(a_none()), c_enum_tag_member())
+    assert_eq_str("CarrierTag tag", ir_tag_member(ir_carrier_tag(5, 0, "int", int_var("o"))),
+        c_enum_tag_member())
+}
+
+// A carrier's payload lands in a plain field, not in the union, so a carrier node that
+// claimed a payload member would be claiming a member its typedef does not declare.
+test "a carrier names no payload union because its typedef declares none" {
+    ir_reset()
+    assert_eq_str("CarrierWrap payload", ir_payload_member(a_some()), "")
+    assert_eq_str("None payload", ir_payload_member(a_none()), "")
+    assert_eq_str("CarrierTag payload", ir_payload_member(ir_carrier_tag(5, 0, "int", int_var("o"))), "")
+}
+
+// Every other kind prints no designator of its own, so carrying a member name would
+// invite a reader to print one where the C shape has none.
+test "a node that prints no tagged designator carries no member name" {
+    ir_reset()
+    let plain = [
+        int_const("1"),
+        int_var("a"),
+        ir_struct_new(9, 0, "blink_Point", [int_const("1"), int_const("2")]),
+        ir_tuple_new(10, 0, "blink_tuple_int_int", [int_const("1"), int_const("2")]),
+        ir_carrier_unwrap(1, 0, "int64_t", "value", SlotForm.InlineWord, a_some()),
+    ]
+    for p in plain {
+        assert_eq_str("{ir_kind_name(ir_kind(p))} tag", ir_tag_member(p), "")
+        assert_eq_str("{ir_kind_name(ir_kind(p))} payload", ir_payload_member(p), "")
+    }
+}
+
+// The dump writes no member name, because which designator a kind prints is a property of
+// the kind and not of the node. A tree read back therefore has to be stamped the same way
+// a built one is, or the printer would refuse a tree that dumped and parsed cleanly.
+test "a tree read back from a dump names its members again" {
+    ir_reset()
+    let text = ir_dump(ir_expr_stmt(0, an_enum()))
+    assert_eq_str("the dump carries no member name", if text.contains(c_enum_payload_member()) { "yes" } else { "no" }, "no")
+    ir_reset()
+    let arm = ir_kid(ir_parse(text), 0)
+    assert_eq_str("parsed tag", ir_tag_member(arm), c_enum_tag_member())
+    assert_eq_str("parsed payload", ir_payload_member(arm), c_enum_payload_member())
+}
