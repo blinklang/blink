@@ -1,0 +1,157 @@
+import typecheck.{check_types, tc_type_str, lookup_named_type, get_struct_field_tid, tc_lookup_node_tid, type_kind, TyKind, substitute_typevar_tid, tc_binder_key, tc_tid_binder, TYPE_INT, NO_BINDER_NODE}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import parser.{nodes, node_kind, node_name, node_params, sublist_get, sublist_length}
+import ast.{NodeKind}
+import std.io
+
+// A type parameter is identified by the declaration that BINDS it, not by how it is
+// spelled. `T` of `type Box[T]` and `T` of `fn pick[T, U]` name two unrelated types that
+// happen to share a letter. While they are one tid, a substitution that reaches the wrong
+// binder cannot be detected: it silently answers the other declaration's argument instead
+// of reporting that it had no bind to apply.
+fn probe_src() -> Str {
+    #"type Box[T] { val: T }
+type Crate[T] { item: T }
+fn pick[T, U](b: Box[U], x: T) -> U { b.val }
+fn id[T](x: T) -> T { x }
+fn id_of[T, U](b: Box[U], x: T) -> U { id(b.val) }
+fn main() {
+    let b = Box { val: "s" }
+    let r = pick(b, 1)
+    assert(r == "s")
+    assert(id_of(b, 1) == "s")
+}
+"#
+}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn find_let(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.LetBinding && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn param_tid(fn_name: Str, idx: Int) -> Int {
+    let f = find_fn(fn_name)
+    if f < 0 { return -1 }
+    let ps = node_params(f)
+    if ps == -1 { return -1 }
+    if idx >= sublist_length(ps) { return -1 }
+    tc_lookup_node_tid(sublist_get(ps, idx))
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn compile_probe(src: Str, stem: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    diag_reset()
+    let path = "build/{stem}.bl"
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+}
+
+test "a binder is identified by its declaration, not by its spelling" {
+    compile_probe(probe_src(), "typevar_binder_identity_probe")
+    let box_t = get_struct_field_tid(lookup_named_type("Box"), "val")
+    let crate_t = get_struct_field_tid(lookup_named_type("Crate"), "item")
+    let pick_t = param_tid("pick", 1)
+    assert(box_t >= 0)
+    assert(crate_t >= 0)
+    assert(pick_t >= 0)
+    assert(type_kind(box_t) == TyKind.Typevar)
+    assert(type_kind(crate_t) == TyKind.Typevar)
+    assert(type_kind(pick_t) == TyKind.Typevar)
+    assert(box_t != crate_t)
+    assert(box_t != pick_t)
+    assert(crate_t != pick_t)
+}
+
+// The call the hardening exists to protect. `pick` returns its own `U`, bound to the
+// receiver's argument, while its `T` is bound to Int by the second argument. An answer of
+// Int here is the leak: it means the substitution followed the spelling `T` into a type
+// that is written in terms of a different declaration's binder.
+test "a call substitutes the binder its own declaration owns" {
+    compile_probe(probe_src(), "typevar_binder_identity_probe")
+    assert_no_errors("Box[U] beside a same-spelled T")
+    let r = find_let("r")
+    assert(r >= 0)
+    let rt = tc_lookup_node_tid(r)
+    assert(tc_type_str(rt) == "Str")
+}
+
+// Two generic functions, one calling the other, each binding its own `T`. This is the
+// shape the fixed leak had: the inner call is substituted under the caller's binds, so a
+// spelling-keyed substitution reaches the caller's `T` for a type that belongs to the
+// callee. Their tids must differ for the pass to be able to tell.
+test "each generic function owns its binder" {
+    compile_probe(probe_src(), "typevar_binder_identity_probe")
+    let id_t = param_tid("id", 0)
+    let id_of_t = param_tid("id_of", 1)
+    assert(id_t >= 0)
+    assert(id_of_t >= 0)
+    assert(type_kind(id_t) == TyKind.Typevar)
+    assert(type_kind(id_of_t) == TyKind.Typevar)
+    assert(tc_type_str(id_t) == "T")
+    assert(tc_type_str(id_of_t) == "T")
+    assert(id_t != id_of_t)
+}
+
+// Every binder is a real declaration node, so no type parameter falls back to the
+// unbound key. A typevar left at NO_BINDER_NODE would key on its spelling alone and
+// reopen the leak for every declaration that shares the letter.
+test "a declared type parameter carries its declaration node as its binder" {
+    compile_probe(probe_src(), "typevar_binder_identity_probe")
+    let box_t = get_struct_field_tid(lookup_named_type("Box"), "val")
+    let pick_t = param_tid("pick", 1)
+    let id_t = param_tid("id", 0)
+    assert(tc_tid_binder(box_t) != NO_BINDER_NODE)
+    assert(tc_tid_binder(pick_t) != NO_BINDER_NODE)
+    assert(tc_tid_binder(id_t) != NO_BINDER_NODE)
+    assert(tc_tid_binder(box_t) != tc_tid_binder(pick_t))
+    assert(tc_tid_binder(id_t) != tc_tid_binder(pick_t))
+}
+
+// The injection. Stamp a type that belongs to `pick` with binds built from `Box`, the
+// mistake the spelling key made on every call. A substitution that answers Int here has
+// silently handed one declaration another's type argument. Answering the typevar
+// unchanged is what lets the unsolved-type-parameter report fire instead.
+test "a foreign binder in a stamp leaves the type parameter unsolved" {
+    compile_probe(probe_src(), "typevar_binder_identity_probe")
+    let box_t = get_struct_field_tid(lookup_named_type("Box"), "val")
+    let pick_t = param_tid("pick", 1)
+    assert(box_t != pick_t)
+    let mut foreign: Map[Str, Int] = Map()
+    foreign.insert(tc_binder_key(tc_tid_binder(box_t), "T"), TYPE_INT)
+    assert(substitute_typevar_tid(pick_t, foreign) == pick_t)
+    assert(substitute_typevar_tid(pick_t, foreign) != TYPE_INT)
+    let mut own: Map[Str, Int] = Map()
+    own.insert(tc_binder_key(tc_tid_binder(pick_t), "T"), TYPE_INT)
+    assert(substitute_typevar_tid(pick_t, own) == TYPE_INT)
+}

@@ -32,7 +32,8 @@ import typecheck.{
     make_fn_type, make_handle_type, make_iterator_type, make_list_type, make_map_type, make_option_type,
     make_ptr_type, make_result_type, make_set_type, make_struct_instance_type, make_template_type,
     make_tuple_type,
-    substitute_typevar_tid, tc_alias_to_original, tc_field_tid_at_instance,
+    substitute_typevar_tid, tc_binder_key, tc_tid_typevar_key,
+    tc_alias_to_original, tc_call_decl_node, tc_field_tid_at_instance,
     tc_lookup_node_tid, tc_mc_obj_is_value, tc_is_sealed_list_hof, tc_resolve,
     tc_ret_mint_at, tc_tid_child, tc_tid_child_count,
     tc_tid_decl_node, tc_tid_kind,
@@ -65,6 +66,10 @@ let mut mono_call_target: Map[Int, Int] = Map()
 // Declaration lookups the walk resolves a call through. Names here are how source
 // spells a callee; instance identity never depends on them.
 let mut generic_fn_by_name: Map[Str, Int] = Map()
+// The same declarations as a set of nodes. A call resolved by typecheck arrives as a node,
+// and only a generic free function may be discovered through it: a generic type declaration
+// also carries type parameters and is not a callee of this kind.
+let mut generic_fn_nodes: Map[Int, Int] = Map()
 let mut poly_method_by_name: Map[Str, Int] = Map()
 let mut poly_method_by_qualified: Map[Str, Int] = Map()
 let mut poly_block_of_method: Map[Int, Int] = Map()
@@ -138,6 +143,7 @@ fn mono_reset() {
     type_insts_done = Map()
     mono_call_target = Map()
     generic_fn_by_name = Map()
+    generic_fn_nodes = Map()
     poly_method_by_name = Map()
     poly_method_by_qualified = Map()
     poly_block_of_method = Map()
@@ -158,6 +164,7 @@ fn mono_build_decl_maps(program: Int) {
         // An FFI-bridged generic is one type-erased C symbol, never an instance.
         if has_type_params(fn_node) && get_annotation(fn_node, "ffi") == -1 {
             generic_fn_by_name.insert(node_name(fn_node), fn_node)
+            generic_fn_nodes.insert(fn_node, 1)
         }
         i = i + 1
     }
@@ -375,11 +382,18 @@ fn unify(ptid: Int, atid0: Int, binds: Map[Str, Int]) {
     let pk = tc_tid_kind(ptid)
     if pk == TyKind.Typevar {
         let name = tc_tid_name(ptid)
-        match binds.get(name) {
+        let bkey = tc_tid_typevar_key(ptid)
+        match binds.get(bkey) {
             Some(prev) => {
-                if tid_is_open(prev) && !tid_is_open(atid) { binds.insert(name, atid) }
+                if tid_is_open(prev) && !tid_is_open(atid) {
+                    binds.insert(name, atid)
+                    binds.insert(bkey, atid)
+                }
             }
-            None => { binds.insert(name, atid) }
+            None => {
+                binds.insert(name, atid)
+                binds.insert(bkey, atid)
+            }
         }
         return
     }
@@ -446,7 +460,10 @@ fn binder_args(ctx: Int, gfn: Int, call_node: Int, binds: Map[Str, Int]) -> List
     let mut pi = 0
     while pi < n {
         let b = sublist_get(tparams, pi)
-        let mut t = binds.get(node_name(b)) ?? -1
+        let mut t = match binds.get(tc_binder_key(b, node_name(b))) {
+            Some(bt) => bt
+            None => binds.get(node_name(b)) ?? -1
+        }
         if t < 0 || tid_is_open(t) {
             let minted = tc_ret_mint_at(call_node, n, pi)
             if minted >= 0 { t = substitute_typevar_tid(minted, ctx_binds(ctx)) }
@@ -469,7 +486,10 @@ fn binds_from_binders(binders_sl: Int, arg_tids: List[Int]) -> Map[Str, Int] {
     let mut binds: Map[Str, Int] = Map()
     let mut i = 0
     while i < sl_len(binders_sl) && i < arg_tids.len() {
-        binds.insert(node_name(sublist_get(binders_sl, i)), arg_tids.get(i).unwrap())
+        let b = sublist_get(binders_sl, i)
+        let btid = arg_tids.get(i).unwrap()
+        binds.insert(node_name(b), btid)
+        binds.insert(tc_binder_key(b, node_name(b)), btid)
         i = i + 1
     }
     binds
@@ -521,7 +541,7 @@ fn register_fn(gfn: Int, arg_tids0: List[Int]) -> Int {
     register(gfn, binders_sl, arg_tids, inst_tid, c_mono_fn_name(gfn, args_tid))
 }
 
-fn register_poly_method(m: Int, elem_tid0: Int) {
+fn register_poly_method(m: Int, elem_tid0: Int) -> Int {
     let elem_tid = canon_tid(elem_tid0)
     let im = poly_block_of_method.get(m).unwrap()
     let binders_sl = node_impl_binders(im)
@@ -583,12 +603,26 @@ fn discover_generic_call(ctx: Int, gfn: Int, call_node: Int, lead: List[Int], ar
     note_call_target(ctx, call_node, register_fn(gfn, binder_args(ctx, gfn, call_node, binds)))
 }
 
+// The generic free function typecheck resolved this call to, or -1. The name cannot stand in
+// for it: two modules may declare the name, and only the calling file's import list said
+// which declaration the call reached.
+fn resolved_generic_fn(call_node: Int) -> Int {
+    let d = tc_call_decl_node(call_node)
+    if d < 0 { return -1 }
+    if generic_fn_nodes.contains_key(d) { d } else { -1 }
+}
+
 // A callee Ident that typecheck stamped with a type names a local value (a closure or
 // parameter) that shadows any item of that name; an item callee carries no stamp.
 fn discover_call(ctx: Int, node: Int) ! Diag.Report {
     let callee = node_left(node)
     if callee == -1 || nk_of(node_kind(callee)) != NodeKind.Ident { return }
     if tc_tid_is_no_info(tc_lookup_node_tid(callee)) == 0 { return }
+    let resolved = resolved_generic_fn(node)
+    if resolved != -1 {
+        discover_generic_call(ctx, resolved, node, [], node_args(node))
+        return
+    }
     let fn_name = tc_alias_to_original.get(node_name(callee)) ?? node_name(callee)
     match generic_fn_by_name.get(fn_name) {
         Some(gfn) => discover_generic_call(ctx, gfn, node, [], node_args(node))
@@ -598,6 +632,11 @@ fn discover_call(ctx: Int, node: Int) ! Diag.Report {
 
 // `mod.f(args)` parses as a MethodCall on a module Ident; it is a free-fn call.
 fn discover_module_call(ctx: Int, node: Int) ! Diag.Report {
+    let resolved = resolved_generic_fn(node)
+    if resolved != -1 {
+        discover_generic_call(ctx, resolved, node, [], node_args(node))
+        return
+    }
     let fn_name = tc_alias_to_original.get(node_method(node)) ?? node_method(node)
     match generic_fn_by_name.get(fn_name) {
         Some(gfn) => discover_generic_call(ctx, gfn, node, [], node_args(node))
@@ -613,24 +652,24 @@ fn discover_poly_impl_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
         match poly_method_by_qualified.get("{node_name(obj)}.{method}") {
             Some(m) => {
                 let args_sl = node_args(node)
-                if sl_len(args_sl) >= 1 { register_poly_recv(ctx, m, sublist_get(args_sl, 0)) }
+                if sl_len(args_sl) >= 1 { register_poly_recv(ctx, m, sublist_get(args_sl, 0), node) }
             }
             None => {}
         }
         return
     }
     match poly_method_by_name.get(method) {
-        Some(m) => register_poly_recv(ctx, m, obj)
+        Some(m) => register_poly_recv(ctx, m, obj, node)
         None => {}
     }
 }
 
-fn register_poly_recv(ctx: Int, m: Int, recv_node: Int) {
+fn register_poly_recv(ctx: Int, m: Int, recv_node: Int, call_node: Int) {
     let recv_tid = ctx_node_tid(ctx, recv_node)
     if recv_tid < 0 { return }
     let elem_tid = tc_tid_list_elem(recv_tid)
     if elem_tid < 0 || tid_is_open(elem_tid) { return }
-    register_poly_method(m, elem_tid)
+    note_call_target(ctx, call_node, register_poly_method(m, elem_tid))
 }
 
 // A sealed List HOF method (`.map/.filter/.fold/.for_each/.any/.all`) calls the

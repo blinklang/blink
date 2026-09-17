@@ -1,4 +1,4 @@
-import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on, nk_of, nk_is_typed}
+import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on, nk_of, nk_is_typed, trace, trace_mode}
 import std.str.{str_to_lower}
 import parser.{
     get_annotation, has_annotation, is_literal_string_part,
@@ -48,7 +48,7 @@ import diagnostics.{
     MODULE_QUALIFIED_TYPE,
     UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE,
     BITWISE_PRECEDENCE, UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
-    NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME,
+    NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, UNKNOWN_DERIVE_NAME,
     NO_SUCH_FIELD,
 }
 
@@ -257,6 +257,11 @@ let mut tc_active_tparams: Map[Str, Int] = Map()
 // operation is licensed on a type parameter. A name absent from this stack is not a
 // type parameter (e.g. Self, or an unmodeled builtin that lowers to a typevar).
 let mut tc_tp_arith_names: List[Str] = []
+// Parallel to tc_tp_arith_names, one entry per frame: the NODE that binds this type
+// parameter. A type parameter is identified by its binder, not by its spelling, so
+// `T` of `type Box[T]` and `T` of `fn pick[T, U]` are two types that share a letter.
+// The implicit `Self` frame binds nothing and carries SELF_BINDER_NODE.
+let mut tc_tp_binder_nodes: List[Int] = []
 // Parallel to tc_tp_arith_names, one entry per frame: the full trait-bound set
 // (pipe-framed, e.g. "|Add|Ord|Eq|") and — for the implicit `Self` frame of a trait
 // default body — the guarantee-set METHOD names ("|eq|ne|"). Type-parameter frames
@@ -294,6 +299,9 @@ let mut fnsig_param_list: List[Int] = []
 // against another.
 let mut fnsig_param_names: List[Str] = []
 let mut fnsig_type_param_names: List[Str] = []
+// Flat side-table PARALLEL to fnsig_type_param_names (same index, same length): the NODE
+// that declares that type parameter. A name alone cannot tell two declarations' `T` apart.
+let mut fnsig_tparam_nodes: List[Int] = []
 // Flat side-table PARALLEL to fnsig_type_param_names (same index, same length):
 // 1 iff that type param is RETURN-ONLY — named by the fn's return annotation and by
 // no parameter annotation. Only those slots get a call-site metavar; every
@@ -1042,6 +1050,9 @@ let mut tc_tmsig_pool: List[TraitMethodSigEntry] = []
 // left as typevars for per-impl binding by subst_trait_type_tid.
 let mut tc_tmsig_param_tids: List[Int] = []
 let mut tc_trait_tparam_names: List[Str] = []
+// Flat side-table PARALLEL to tc_trait_tparam_names (same index, same length): the NODE
+// that declares that trait type parameter, which is the identity a substitution keys on.
+let mut tc_trait_tparam_nodes: List[Int] = []
 
 let mut tc_current_fn_ret: Int = -1
 let mut tc_current_fn_name: Str = ""
@@ -1379,8 +1390,69 @@ pub fn make_fn_type(ret_type: Int, param_types: List[Int]) -> Int {
 // INTERNS — safe because tc_tid_same_type compares TyKind.Typevar by
 // name alone (:11672-11673 above), so name-keying IS its equality, and a TyKind.Typevar entry
 // is never mutated post-construction (same invariant as every other ty_intern_* ctor).
+// A type parameter with no binder in scope. The fallback mints of resolve_type_ann land
+// here: `Self.Context`, an effect name used as a type argument, an unknown name in a
+// formatter fixture. None of those is a type parameter, and no declaration binds a
+// parameter under any of those spellings, so keying them together collides with nothing.
+pub let NO_BINDER_NODE: Int = -1
+// `Self` binds once per compile, not at a node. It needs an identity distinct from
+// NO_BINDER_NODE so an unsolved fallback mint can never be mistaken for the receiver.
+pub let SELF_BINDER_NODE: Int = -2
+
+// The innermost binder of `name`, or NO_BINDER_NODE when `name` is not an active type
+// parameter. Scans the frame stack from the top, so an inner declaration's parameter
+// shadows an outer one of the same spelling.
+fn tc_active_binder_node(name: Str) -> Int {
+    let mut i = tc_tp_arith_names.len() - 1
+    while i >= 0 {
+        if tc_tp_arith_names.get(i).unwrap() == name {
+            return tc_tp_binder_nodes.get(i).unwrap()
+        }
+        i = i - 1
+    }
+    NO_BINDER_NODE
+}
+
+// A typevar is interned per (spelling, binder), so the same letter bound by two
+// declarations is two types. inner1 carries the binder: ty_intern_simple already keys on
+// it and tc_tid_child_count reports Typevar as a leaf, so no reader walks into it.
+fn make_typevar_bound(name: Str, binder: Int) -> Int {
+    ty_intern_simple(TyKind.Typevar, name, binder, -1)
+}
+
+// The key a substitution binds a type parameter under: its binder AND its spelling.
+// The binder alone is not enough, because every fallback mint with no binder in scope
+// shares NO_BINDER_NODE -- `Self.Context`, an effect name used as a type argument, an
+// unknown name in a fixture. The spelling alone is the bug this pair replaces. Together
+// they are exact: one declaration's `T` never keys the same as another's.
+pub fn tc_binder_key(binder: Int, name: Str) -> Str {
+    "{binder}|{name}"
+}
+
+// The binds key of a typevar tid, or "" when the tid is not a typevar.
+pub fn tc_tid_typevar_key(tid0: Int) -> Str {
+    let t = tc_resolve(tid0)
+    if t < 0 || t >= ty_pool.len() { return "" }
+    let e = ty_pool.get(t).unwrap()
+    if e.kind != TyKind.Typevar { return "" }
+    tc_binder_key(e.inner1, e.name)
+}
+
+// The node that binds this typevar, or NO_BINDER_NODE when it is not a typevar or has
+// no binder in scope.
+pub fn tc_tid_binder(tid0: Int) -> Int {
+    let t = tc_resolve(tid0)
+    if t < 0 || t >= ty_pool.len() { return NO_BINDER_NODE }
+    let e = ty_pool.get(t).unwrap()
+    if e.kind != TyKind.Typevar { return NO_BINDER_NODE }
+    e.inner1
+}
+
 fn make_typevar(name: Str) -> Int {
-    ty_intern_simple(TyKind.Typevar, name, -1, -1)
+    // `Self` is bound by the impl, which is not a type-parameter scope. Pinning it here
+    // keeps one key for it whether or not an impl frame happens to be on the stack.
+    if name == "Self" { return make_typevar_bound(name, SELF_BINDER_NODE) }
+    make_typevar_bound(name, tc_active_binder_node(name))
 }
 
 // `pub` FOR THE TEST ONLY — see make_option_type above.
@@ -2695,7 +2767,9 @@ fn tc_subst_evfield_from_instance(field_tid: Int, inst_tid: Int) -> Int {
     let mut i = 0
     while i < sublist_length(tparams_sl) && i < ie.params_count {
         let arg = ty_param_list.get(ie.params_start + i).unwrap()
-        binds.insert(node_name(sublist_get(tparams_sl, i)), arg)
+        let tp = sublist_get(tparams_sl, i)
+        binds.insert(node_name(tp), arg)
+        binds.insert(tc_binder_key(tp, node_name(tp)), arg)
         i = i + 1
     }
     substitute_typevar_tid(field_tid, binds)
@@ -2857,7 +2931,11 @@ pub fn substitute_typevar_tid(t: Int, binds: Map[Str, Int]) -> Int {
     let e = ty_pool.get(t).unwrap()
     let k = e.kind
     if k == TyKind.Typevar {
-        match binds.get(e.name) {
+        // Keyed on the BINDER, so a typevar bound by a different declaration finds no
+        // entry and survives substitution unchanged. It then reaches monomorphization
+        // unsolved and is reported, instead of silently taking this context's argument
+        // for the same letter.
+        match binds.get(tc_binder_key(e.inner1, e.name)) {
             Some(tid) => return tid
             None => return t
         }
@@ -3011,7 +3089,9 @@ pub fn tc_mono_binds_map(mono_tparams_sl: Int, mono_arg_tids: List[Int]) -> Map[
     while mi < sublist_length(mono_tparams_sl) && mi < mono_arg_tids.len() {
         let tid = mono_arg_tids.get(mi).unwrap()
         if tid >= 0 {
-            binds.insert(node_name(sublist_get(mono_tparams_sl, mi)), tid)
+            let tp = sublist_get(mono_tparams_sl, mi)
+            binds.insert(node_name(tp), tid)
+            binds.insert(tc_binder_key(tp, node_name(tp)), tid)
         }
         mi = mi + 1
     }
@@ -3080,14 +3160,17 @@ fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
         // `256` arg could bind K:=Int). So: record a bind only when it is absent, or
         // when the existing bind is itself non-concrete (a placeholder α/typevar) and
         // the new atid IS concrete. Never let a non-concrete atid overwrite or claim.
-        match binds.get(pe.name) {
+        let bkey = tc_binder_key(pe.inner1, pe.name)
+        match binds.get(bkey) {
             Some(prev) => {
                 if bind_target_is_concrete(atid) != 0 && bind_target_is_concrete(prev) == 0 {
                     binds.insert(pe.name, atid)
+                    binds.insert(bkey, atid)
                 }
             }
             None => {
                 binds.insert(pe.name, atid)
+                binds.insert(bkey, atid)
             }
         }
         return
@@ -3403,6 +3486,10 @@ fn instantiate_return_type(sig: Int, args_sl: Int, call_node: Int) -> Int ! Type
                 // belt-and-braces guard against a future producer inserting both.
                 if binds.contains_key(tpn) == 0 {
                     binds.insert(tpn, a)
+                    if nidx < fnsig_tparam_nodes.len() {
+                        let tpnode = fnsig_tparam_nodes.get(nidx).unwrap()
+                        binds.insert(tc_binder_key(tpnode, tpn), a)
+                    }
                 }
             }
         }
@@ -5002,6 +5089,7 @@ fn tc_push_arith_frames(sl: Int) {
     while i < sublist_length(sl) {
         let tp = sublist_get(sl, i)
         tc_tp_arith_names.push(node_name(tp))
+        tc_tp_binder_nodes.push(tp)
         tc_tp_bound_traits.push(tparam_node_bound_traits(tp))
         tc_tp_bound_methods.push("|")
         i = i + 1
@@ -5014,6 +5102,7 @@ fn tc_pop_arith_frames(sl: Int) {
     let mut i = 0
     while i < sublist_length(sl) {
         let _ = tc_tp_arith_names.pop()
+        let _ = tc_tp_binder_nodes.pop()
         let _ = tc_tp_bound_traits.pop()
         let _ = tc_tp_bound_methods.pop()
         i = i + 1
@@ -5146,12 +5235,14 @@ fn tc_push_self_frame(tr_node: Int) {
         }
     }
     tc_tp_arith_names.push("Self")
+    tc_tp_binder_nodes.push(SELF_BINDER_NODE)
     tc_tp_bound_traits.push(traits)
     tc_tp_bound_methods.push(methods)
 }
 
 fn tc_pop_self_frame() {
     let _ = tc_tp_arith_names.pop()
+    let _ = tc_tp_binder_nodes.pop()
     let _ = tc_tp_bound_traits.pop()
     let _ = tc_tp_bound_methods.pop()
 }
@@ -5515,6 +5606,20 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
         }
         return make_fn_type(ret_t, param_types)
     }
+
+    // A type parameter is a BINDING occurrence, so inside the declaration that binds it its
+    // spelling names the parameter and nothing else. Asked before the alias and declared-type
+    // lookups below, which would otherwise answer the outer type and make
+    // `fn ident[Shape](x: Shape)` take the struct `Shape` instead of any type at all. The
+    // scan is innermost-first, so a nested binder shadows an outer one of the same spelling
+    // the same way.
+    //
+    // After the builtin and carrier branches, not before: those names are reserved
+    // (is_primitive_type claims them), so no declaration can bind a parameter under one, and
+    // reaching this first would let `[List]` turn every `List` in the signature into a
+    // structureless type variable.
+    let tp_binder = tc_active_binder_node(name)
+    if tp_binder != NO_BINDER_NODE { return make_typevar_bound(name, tp_binder) }
 
     // A transparent `type Alias = X` peels to X's tid HERE, at the leaf the
     // recursion reaches for every child position — so `Map[Port, Int]` gets Int
@@ -6133,12 +6238,13 @@ fn tc_struct_lit_instance_tid(stid: Int, node: Int) -> Int ! TypeCheck.Resolve, 
     let mut arg_tids: List[Int] = []
     let mut ti = 0
     while ti < sublist_length(tparams_sl) {
-        let tpname = node_name(sublist_get(tparams_sl, ti))
+        let tp = sublist_get(tparams_sl, ti)
+        let tpname = node_name(tp)
         let bound = binds.get(tpname) ?? -1
         if bound != -1 {
             arg_tids.push(bound)
         } else {
-            arg_tids.push(make_typevar(tpname))
+            arg_tids.push(make_typevar_bound(tpname, tp))
         }
         ti = ti + 1
     }
@@ -6382,16 +6488,42 @@ fn tc_derive_obliges(listed: Str, tr: Str) -> Int {
     0
 }
 
-// Does the declaration `td` derive `tr`, by naming it or by naming a trait whose
-// supertrait obligation reaches it? Deriving Ord or Hash derives Eq as well when the
-// author did not list it (spec sections/03_types.md, "Supertrait Auto-Derivation"), so
-// every reader of a derive fact answers from the expanded set; a reader that answered
-// from the written list alone would disagree with the methods codegen synthesizes.
-// Scans EVERY @derive annotation, not just the first. get_annotation returns only the
-// first match, so `@derive(Eq)` + `@derive(Ord)` on separate lines hid the second derive.
-pub fn tc_decl_derives(td: Int, tr: Str) -> Int {
-    let anns = node_handlers(td)
-    if anns == -1 { return 0 }
+// Every name @derive accepts. This is the one list: the derive stage of codegen reads it
+// here rather than keeping a second copy, because two copies disagree the day one gains a
+// name and the check that rejects an unknown name starts rejecting a legal one.
+pub fn tc_derive_names() -> List[Str] {
+    ["Serialize", "Deserialize", "Eq", "Ord", "Clone", "Hash", "Debug"]
+}
+
+fn tc_derive_name_is_known(name: Str) -> Int {
+    for d in tc_derive_names() {
+        if d == name { return 1 }
+    }
+    0
+}
+
+// A @derive name outside the accepted set is reported where the author can still see the
+// annotation. Codegen used to be the only reader, so a program that never reached codegen
+// kept the misspelling and lost the method silently.
+fn tc_reject_unknown_derives(td: Int) ! Diag.Report {
+    for a in tc_decl_derive_args(td) {
+        let name = node_name(a)
+        if tc_derive_name_is_known(name) == 0 {
+            diag_error_at("UnknownDerive", UNKNOWN_DERIVE_NAME,
+                "unknown @derive name '{name}'; expected one of {tc_derive_names().join(", ")}",
+                a, "remove or replace this derive name")
+        }
+    }
+}
+
+// Every name written in every @derive on a declaration, as the annotation argument nodes.
+// A node carries both the name and its span, so a diagnostic about one derive name can
+// point at that name.
+pub fn tc_decl_derive_args(decl: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    if decl < 0 { return out }
+    let anns = node_handlers(decl)
+    if anns == -1 { return out }
     let mut i = 0
     while i < sublist_length(anns) {
         let ann = sublist_get(anns, i)
@@ -6400,12 +6532,26 @@ pub fn tc_decl_derives(td: Int, tr: Str) -> Int {
             if args_sl != -1 {
                 let mut j = 0
                 while j < sublist_length(args_sl) {
-                    if tc_derive_obliges(node_name(sublist_get(args_sl, j)), tr) != 0 { return 1 }
+                    out.push(sublist_get(args_sl, j))
                     j = j + 1
                 }
             }
         }
         i = i + 1
+    }
+    out
+}
+
+// Does the declaration `td` derive `tr`, by naming it or by naming a trait whose
+// supertrait obligation reaches it? Deriving Ord or Hash derives Eq as well when the
+// author did not list it (spec sections/03_types.md, "Supertrait Auto-Derivation"), so
+// every reader of a derive fact answers from the expanded set; a reader that answered
+// from the written list alone would disagree with the methods codegen synthesizes.
+// Scans EVERY @derive annotation, not just the first. get_annotation returns only the
+// first match, so `@derive(Eq)` + `@derive(Ord)` on separate lines hid the second derive.
+pub fn tc_decl_derives(td: Int, tr: Str) -> Int {
+    for a in tc_decl_derive_args(td) {
+        if tc_derive_obliges(node_name(a), tr) != 0 { return 1 }
     }
     0
 }
@@ -6432,6 +6578,7 @@ fn reject_reserved_type_name(td: Int) ! Diag.Report {
 
 fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     reject_reserved_type_name(td)
+    tc_reject_unknown_derives(td)
     let name = tc_nominal_type_name(td)
     let tid = new_type(TyKind.Struct, name)
     named_type_names.push(name)
@@ -6498,6 +6645,7 @@ fn resolve_struct_fields(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.
 
 fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     reject_reserved_type_name(td)
+    tc_reject_unknown_derives(td)
     let name = tc_nominal_type_name(td)
     let tid = new_type(TyKind.Enum, name)
     named_type_names.push(name)
@@ -6770,7 +6918,12 @@ fn tc_is_float_scalar(n: Str) -> Int {
 // Does the named field type satisfy `tr` ("Hash"/"Eq"/"Ord")? Returns 1 for
 // OK, 0 for reject. Fails OPEN (returns 1) for names that are neither a builtin
 // scalar nor a known user type — generics / type params we can't resolve here.
-fn tc_field_type_derivable(ftype_name: Str, tr: Str) -> Int {
+fn tc_field_type_derivable(written: Str, tr: Str) -> Int {
+    // An alias stands for its target everywhere else in the type system, so the trait is
+    // asked of what the name resolves to. The caller keeps the written name for the
+    // message, because that is the text the author can change.
+    let ftype_name = resolve_alias_type_name(written)
+
     // Collections are never value-comparable/hashable/orderable in v1.
     if tc_is_container_name(ftype_name) != 0 { return 0 }
 
@@ -7133,6 +7286,7 @@ fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
             let tp = sublist_get(tparams_sl, ti)
             let tp_name = node_name(tp)
             fnsig_type_param_names.push(tp_name)
+            fnsig_tparam_nodes.push(tp)
             fnsig_tparam_ret_only.push(tc_tparam_is_ret_only(tp_name, ret_ann, params_sl))
             fnsig_tparam_bounds.push(tparam_node_bound_traits(tp))
             tp_count = tp_count + 1
@@ -7942,6 +8096,67 @@ fn is_user_sourced(node: Int) -> Int {
     0
 }
 
+// Whether a name written in a trait method signature resolves to anything. The impl
+// header's acceptance set (a declared type, a builtin, a trait name) plus what only a
+// trait has: `Self`, an associated type reached through it, the trait's own type
+// parameters, and the method's own. The trait's parameters answer through the active
+// scope, which register_trait has pushed; the method's are not pushed there, so they are
+// read off the method node.
+// A trait whose declaration already reported an unknown type in a method signature.
+// The recorded signature is then whatever the resolver could salvage, so a contract
+// difference measured against it names two types the programmer cannot tell apart and
+// cannot repair. Report the declaration once and stay quiet about its impls.
+let mut tc_trait_sig_poisoned: Map[Str, Int] = Map()
+
+fn tc_trait_sig_name_declared(name: Str, m: Int) -> Int {
+    if name == "Self" { return 1 }
+    if name.starts_with("Self.") { return 1 }
+    if is_known_type(name) != 0 { return 1 }
+    if is_trait_name(name) != 0 { return 1 }
+    if tc_active_binder_node(name) != NO_BINDER_NODE { return 1 }
+    let mtp = node_type_params(m)
+    if mtp != -1 {
+        let mut i = 0
+        while i < sublist_length(mtp) {
+            if node_name(sublist_get(mtp, i)) == name { return 1 }
+            i = i + 1
+        }
+    }
+    0
+}
+
+// Report every name in one written trait-signature annotation that nothing declares.
+// resolve_type_parts lowers a name it cannot place to a free type variable, because its
+// other callers need that; a trait signature is a declaration site, so here the name has
+// to be an error instead. Left as a type variable it became a parameter the trait never
+// declared and no caller could solve, which an impl then matched by accident.
+//
+// Reports the outermost unknown name and stops descending: a name that resolves to
+// nothing has no arguments worth blaming separately.
+fn tc_check_trait_sig_ann(ann: Int, trait_name: Str, mname: Str, m: Int) ! Diag.Report {
+    if ann == -1 { return }
+    let name = node_name(ann)
+    if name != "" && tc_trait_sig_name_declared(name, m) == 0 {
+        tc_trait_sig_poisoned.insert(trait_name, 1)
+        diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type '{name}' in method '{mname}' of trait '{trait_name}'", ann,
+            "a trait signature may name a declared type, a builtin type, 'Self', an associated type, or one of the trait's or method's own type parameters")
+        return
+    }
+    // `Template[E]` and `Handler[E]` carry an EFFECT in their argument position. An effect
+    // is not in the type namespace, so that position is not read as a type here either.
+    if name == "Template" || name == "Handler" { return }
+    let elems = node_elements(ann)
+    if elems != -1 {
+        let mut i = 0
+        while i < sublist_length(elems) {
+            tc_check_trait_sig_ann(sublist_get(elems, i), trait_name, mname, m)
+            i = i + 1
+        }
+    }
+    // `fn(A, B) -> R` keeps its parameters in `elements` and its return in `type_ann`.
+    if name == "Fn" { tc_check_trait_sig_ann(node_type_ann(ann), trait_name, mname, m) }
+}
+
 fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     let name = node_name(tr_node)
     tc_trait_names.push(name)
@@ -7954,6 +8169,7 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
         while ti < sublist_length(tparams_sl) {
             let tp = sublist_get(tparams_sl, ti)
             tc_trait_tparam_names.push(node_name(tp))
+            tc_trait_tparam_nodes.push(tp)
             tp_count = tp_count + 1
             ti = ti + 1
         }
@@ -7998,6 +8214,7 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
                     // `self` carries no annotation. That is an absence, not a type the
                     // impl must match, and the contract check skips it on that basis.
                     let p_ann = node_type_ann(p)
+                    tc_check_trait_sig_ann(p_ann, name, mname, m)
                     tc_tmsig_param_tids.push(if p_ann == -1 { -1 } else { resolve_type_ann(p_ann) })
                     p_count = p_count + 1
                     j = j + 1
@@ -8007,6 +8224,7 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
             // side already takes below. Left as a no-info value it skipped the return
             // contract check entirely, so an impl could return anything at all.
             let m_ann = node_type_ann(m)
+            tc_check_trait_sig_ann(m_ann, name, mname, m)
             let m_ret = if m_ann == -1 { TYPE_VOID } else { resolve_type_ann(m_ann) }
             tc_tmsig_pool.push(TraitMethodSigEntry { trait_name: name, method: mname, ret_tid: m_ret, tparams_start: tp_start, tparams_count: tp_count, params_start: p_start, params_count: p_count })
             i = i + 1
@@ -8036,6 +8254,7 @@ fn subst_trait_type_tid(type_tid: Int, impl_recv_tid: Int, tmsig_idx: Int, impl_
     if tc_tid_is_no_info(type_tid) != 0 { return type_tid }
     let mut binds: Map[Str, Int] = Map()
     binds.insert("Self", impl_recv_tid)
+    binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), impl_recv_tid)
     let _tmsig = tc_tmsig_pool.get(tmsig_idx).unwrap()
     let tp_start = _tmsig.tparams_start
     let tp_count = _tmsig.tparams_count
@@ -8044,8 +8263,11 @@ fn subst_trait_type_tid(type_tid: Int, impl_recv_tid: Int, tmsig_idx: Int, impl_
         let mut k = 0
         while k < tp_count {
             let tp_name = tc_trait_tparam_names.get(tp_start + k).unwrap()
+            let tp_node = tc_trait_tparam_nodes.get(tp_start + k) ?? NO_BINDER_NODE
             if impl_targs_sl != -1 && k < sublist_length(impl_targs_sl) {
-                binds.insert(tp_name, resolve_type_ann(sublist_get(impl_targs_sl, k)))
+                let tp_tid = resolve_type_ann(sublist_get(impl_targs_sl, k))
+                binds.insert(tp_name, tp_tid)
+                binds.insert(tc_binder_key(tp_node, tp_name), tp_tid)
             }
             k = k + 1
         }
@@ -8055,7 +8277,10 @@ fn subst_trait_type_tid(type_tid: Int, impl_recv_tid: Int, tmsig_idx: Int, impl_
         let mut ai = 0
         while ai < sublist_length(assoc_sl) {
             let at_node = sublist_get(assoc_sl, ai)
-            binds.insert("Self.{node_name(at_node)}", resolve_type_ann(node_type_ann(at_node)))
+            let at_name = "Self.{node_name(at_node)}"
+            let at_tid = resolve_type_ann(node_type_ann(at_node))
+            binds.insert(at_name, at_tid)
+            binds.insert(tc_binder_key(NO_BINDER_NODE, at_name), at_tid)
             ai = ai + 1
         }
     }
@@ -8065,6 +8290,19 @@ fn subst_trait_type_tid(type_tid: Int, impl_recv_tid: Int, tmsig_idx: Int, impl_
 // One deep trait-contract compare: `verdict` is -1 when a side is unknown
 // (can't judge — fail-open), 0 when the deep tids agree, 1 when they differ.
 // `actual`/`expected` carry the tids so the caller can render them.
+// Two distinct types can render to a single string: a type parameter prints as its spelling,
+// which an impl binder may share with a declared type. Identity is in the binder, not the
+// letters, so where two renderings collide the message says where each type came from.
+// `type_to_str` itself is not touched — one string per type identity is what its other
+// readers depend on.
+fn tc_type_origin_qualifier(tid: Int) -> Str {
+    if tc_tid_kind(tid) != TyKind.Typevar { return " (the declared type)" }
+    let b = tc_tid_binder(tid)
+    if b == SELF_BINDER_NODE { return " (the implementing type)" }
+    if b == NO_BINDER_NODE { return " (a type parameter)" }
+    " (the type parameter declared at line {node_line(b)})"
+}
+
 type TraitContractTidResult {
     verdict: Int
     actual: Int
@@ -8086,6 +8324,7 @@ fn tc_trait_contract_tid_check(trait_tid: Int, impl_ann: Int, impl_recv_tid: Int
     tc_suppress_ann_validation = 1
     let mut self_binds: Map[Str, Int] = Map()
     self_binds.insert("Self", impl_recv_tid)
+    self_binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), impl_recv_tid)
     let actual = substitute_typevar_tid(resolve_type_ann(impl_ann), self_binds)
     tc_suppress_ann_validation = saved_suppress
     tc_trait_contract_tid_check_actual(trait_tid, actual, impl_recv_tid, tmsig_idx, im)
@@ -8363,8 +8602,12 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
                                     if tc_tid_is_no_info(trait_ptid) == 0 {
                                         let impl_p = sublist_get(impl_params_sl, pi)
                                         let r = tc_trait_contract_tid_check(trait_ptid, node_type_ann(impl_p), impl_recv_tid, si, im)
-                                        if r.verdict == 1 {
-                                            diag_error_at("TraitContract", TRAIT_CONTRACT_902, "method '{expected_method}' param has type '{type_to_str(r.actual)}', expected '{type_to_str(r.expected)}'", impl_p, "change type to '{type_to_str(r.expected)}' to match trait {trait_name}")
+                                        if r.verdict == 1 && (tc_trait_sig_poisoned.get(trait_name) ?? 0) == 0 {
+                                            let a_s = type_to_str(r.actual)
+                                            let e_s = type_to_str(r.expected)
+                                            let a_q = if a_s == e_s { tc_type_origin_qualifier(r.actual) } else { "" }
+                                            let e_q = if a_s == e_s { tc_type_origin_qualifier(r.expected) } else { "" }
+                                            diag_error_at("TraitContract", TRAIT_CONTRACT_902, "method '{expected_method}' param has type '{a_s}'{a_q}, expected '{e_s}'{e_q}", impl_p, "change type to '{e_s}'{e_q} to match trait {trait_name}")
                                         }
                                     }
                                     pi = pi + 1
@@ -8380,17 +8623,21 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
                                     } else {
                                         tc_trait_contract_tid_check(tmsig.ret_tid, impl_ret_ann, impl_recv_tid, si, im)
                                     }
-                                    if r.verdict == 1 {
+                                    if r.verdict == 1 && (tc_trait_sig_poisoned.get(trait_name) ?? 0) == 0 {
                                         // Void is not a return type a user may write, so the
                                         // repair for a trait method declared without an arrow
                                         // is to drop the impl's arrow, not to spell Void out.
-                                        let want = if r.expected == TYPE_VOID { "no return value" } else { "'{type_to_str(r.expected)}'" }
+                                        let ra_s = type_to_str(r.actual)
+                                        let re_s = type_to_str(r.expected)
+                                        let ra_q = if ra_s == re_s { tc_type_origin_qualifier(r.actual) } else { "" }
+                                        let re_q = if ra_s == re_s { tc_type_origin_qualifier(r.expected) } else { "" }
+                                        let want = if r.expected == TYPE_VOID { "no return value" } else { "'{re_s}'{re_q}" }
                                         let fix = if r.expected == TYPE_VOID {
                                             "remove the return type — trait {trait_name} declares '{expected_method}' with no return"
                                         } else {
-                                            "change return type to '{type_to_str(r.expected)}' to match trait {trait_name}"
+                                            "change return type to '{re_s}'{re_q} to match trait {trait_name}"
                                         }
-                                        diag_error_at("TraitContract", TRAIT_CONTRACT_903, "method '{expected_method}' returns '{type_to_str(r.actual)}', expected {want}", impl_m, fix)
+                                        diag_error_at("TraitContract", TRAIT_CONTRACT_903, "method '{expected_method}' returns '{ra_s}'{ra_q}, expected {want}", impl_m, fix)
                                     }
                                 }
                             }
@@ -8530,6 +8777,7 @@ fn init_types() ! TypeCheck.Register {
     fnsig_param_list.clear()
     fnsig_param_names.clear()
     fnsig_type_param_names.clear()
+    fnsig_tparam_nodes.clear()
     fnsig_tparam_ret_only.clear()
     fnsig_tparam_bounds.clear()
     fnsig_effect_names.clear()
@@ -8546,6 +8794,7 @@ fn init_types() ! TypeCheck.Register {
     tc_tmsig_pool.clear()
     tc_tmsig_param_tids.clear()
     tc_trait_tparam_names.clear()
+    tc_trait_tparam_nodes.clear()
     tc_trait_tparam_count_idx.clear()
     tc_trait_supers_idx.clear()
     tc_current_fn_ret = -1
@@ -9123,6 +9372,9 @@ pub fn is_user_effect_handle_name(name: Str) -> Int {
 }
 
 // ── Selective import filtering ──────────────────────────────────────
+// Key: "consuming_mod:source_mod" → the import node, or -1 for a whole-module import.
+// The driver fills it while it resolves imports; the checks that read it live here.
+pub let mut per_module_imports: Map[Str, Int] = Map()
 pub let mut tc_import_modules: List[Str] = []
 pub let mut tc_import_qualifiers: List[Str] = []
 pub let mut tc_import_nodes: List[Int] = []
@@ -9278,7 +9530,13 @@ fn is_filtered_for_module(name: Str, source_mod: Str, consuming_mod: Str) -> Int
         }
         None => {}
     }
-    0
+    // No import of this module at all. A file's imports say what it depends on, so a name
+    // it never asked for is not in its scope, however many other modules pulled the
+    // declaration in. A prelude module is the exception: its types and traits stay visible
+    // without an import, and a bare call to one of its free functions is E0504, reported by
+    // nr_is_unimported_prelude_free_fn below, not a missing selection.
+    if tc_prelude_modules.contains_key(source_mod) { return 0 }
+    1
 }
 
 // True when `name` is a free function exported by a prelude module that the
@@ -9343,6 +9601,9 @@ pub fn tc_qualifier_to_module_or_self(qualifier: Str) -> Str {
 fn nr_check_selective_access(name: Str, node: Int) -> Int ! Diag.Report {
     if nr_current_module == "" { return 0 }
     if is_builtin_name(name) != 0 { return 0 }
+    // A local binding holds a value, not a declaration some module exported. It may be spelled
+    // like an exported name, and an import list has nothing to say about a local.
+    if nr_name_top.contains_key(name) && nr_top_binding_is_global(name) == 0 { return 0 }
     if nr_module_declares(nr_current_module, name) != 0 { return 0 }
     // A namesake type is in scope when this module's import list selects one declaration of
     // it; the last-writer symbol table below knows only one module for the name.
@@ -9354,6 +9615,9 @@ fn nr_check_selective_access(name: Str, node: Int) -> Int ! Diag.Report {
     // A private declaration cannot be selected or qualified, so the import list is not the
     // fix; the private-access check names the real problem.
     if nr_is_private_in(name, source_mod) != 0 { return 0 }
+    // The same last-writer limit as the namesake-type check above: `source_mod` is whichever
+    // module was recorded last for the spelling, not the one this file's import list picked.
+    if nr_bare_name_in_scope_here(name, nr_current_module) != 0 { return 0 }
     if is_filtered_for_module(name, source_mod, nr_current_module) != 0 {
         let display_mod = tc_qualifier_for_module(source_mod)
         if node == -1 {
@@ -9371,16 +9635,93 @@ fn nr_check_selective_access(name: Str, node: Int) -> Int ! Diag.Report {
 let mut nr_private_imports: Map[Str, Str] = Map()
 let mut nr_current_module: Str = ""
 let mut nr_name_source_module: Map[Str, Str] = Map()
-// Every top-level declaration, keyed "module|name". A module's own declaration is what its
-// bare name means, whatever other loaded modules declare under the same spelling.
+// Every top-level declaration, keyed "module|name" and holding the declaration node. A
+// module's own declaration is what its bare name means, whatever other loaded modules
+// declare under the same spelling.
 let mut nr_module_decls: Map[Str, Int] = Map()
+// The same declarations gathered by bare name, so a caller can see every module that spells
+// it and let its own import list choose between them.
+let mut nr_decls_by_name: Map[Str, List[Int]] = Map()
 
-fn nr_record_decl(name: Str, mod_name: Str) {
-    nr_module_decls.insert("{mod_name}|{name}", 1)
+fn nr_record_decl(name: Str, mod_name: Str, decl_node: Int) {
+    nr_module_decls.insert("{mod_name}|{name}", decl_node)
+    let mut seen = nr_decls_by_name.get(name) ?? []
+    seen.push(decl_node)
+    nr_decls_by_name.insert(name, seen)
 }
 
 fn nr_module_declares(mod_name: Str, name: Str) -> Int {
     if nr_module_decls.contains_key("{mod_name}|{name}") { 1 } else { 0 }
+}
+
+// ── The declaration a call resolved to ──────────────────────────────
+//
+// Name resolution already decides this and used to discard it, leaving every later stage to
+// re-derive it from the spelling. The spelling does not carry the answer: two modules may
+// declare it, and only the calling file's import list says which one it reached.
+let mut tc_call_decl: Map[Int, Int] = Map()
+
+// The declaration node this call resolved to, or -1 for a callee that is not a declaration:
+// a closure value, a builtin, an intrinsic.
+pub fn tc_call_decl_node(call_node: Int) -> Int {
+    tc_call_decl.get(call_node) ?? -1
+}
+
+fn nr_note_call_decl(call_node: Int, decl_node: Int) {
+    if decl_node < 0 { return }
+    tc_call_decl.insert(call_node, decl_node)
+}
+
+// Which declaration of `name` the bare spelling means inside `consuming_mod`.
+fn nr_resolve_bare_decl(name: Str, consuming_mod: Str) -> Int {
+    let cands = nr_decls_by_name.get(name) ?? []
+    if cands.len() == 0 { return -1 }
+    // A module's own declaration wins over any import, so it is asked for first.
+    for c in cands {
+        if node_module(c) == consuming_mod { return c }
+    }
+    let mut found = -1
+    let mut hits = 0
+    for c in cands {
+        if is_filtered_for_module(name, node_module(c), consuming_mod) == 0 {
+            found = c
+            hits = hits + 1
+        }
+    }
+    if hits == 1 { return found }
+    -1
+}
+
+// A module qualifier settles the module before any name is looked up, so an alias another
+// file bound to the same spelling has nothing to say here.
+fn nr_resolve_qualified_decl(qualifier: Str, member: Str) -> Int {
+    let target = tc_qualifier_to_module.get(qualifier) ?? qualifier
+    nr_module_decls.get("{target}|{member}") ?? -1
+}
+
+// Whether this file's own import list reaches any declaration of the bare `name`. The
+// declarations answer this, not tc_symbol_module: that table holds one module per name and
+// a `pub import` re-export overwrites it, so it can name a module that only forwards the
+// declaration while the importing file selected the module that owns it.
+fn nr_bare_name_in_scope_here(name: Str, consuming_mod: Str) -> Int {
+    let cands = nr_decls_by_name.get(name) ?? []
+    for c in cands {
+        if node_module(c) == consuming_mod { return 1 }
+        if is_filtered_for_module(name, node_module(c), consuming_mod) == 0 { return 1 }
+    }
+    0
+}
+
+// A name is ambiguous only where two declarations of it are both in a file's bare scope. A
+// selective import names one of them, which settles the question the clash was asking.
+fn nr_ambiguity_settled_by_import(name: Str) -> Int {
+    let cands = nr_decls_by_name.get(name) ?? []
+    if cands.len() == 0 { return 0 }
+    let mut hits = 0
+    for c in cands {
+        if is_filtered_for_module(name, node_module(c), "__main__") == 0 { hits = hits + 1 }
+    }
+    if hits <= 1 { 1 } else { 0 }
 }
 
 // True when `name` is declared in `source_mod` without a pub declaration anywhere, so no
@@ -9398,7 +9739,7 @@ fn nr_check_ambiguity(name: Str, mod_name: Str, local_names: Map[Str, Int]) ! Di
     if local_names.contains_key(name) { return }
     match nr_name_source_module.get(name) {
         Some(existing_mod) => {
-            if existing_mod != mod_name && existing_mod != "__main__" {
+            if existing_mod != mod_name && existing_mod != "__main__" && nr_ambiguity_settled_by_import(name) == 0 {
                 diag_error_no_loc("AmbiguousImport", AMBIGUOUS_IMPORT, "name '{name}' is ambiguous — imported from both '{existing_mod}' and '{mod_name}'", "use selective imports to disambiguate, e.g. import {existing_mod}.\{name}")
             }
         }
@@ -10256,7 +10597,8 @@ fn tc_enum_ctor_instance_tid(enum_tid: Int, decl: Int, vname: Str, args_sl: Int)
     let mut arg_tids: List[Int] = []
     let mut ti = 0
     while ti < sublist_length(tparams_sl) {
-        let tpname = node_name(sublist_get(tparams_sl, ti))
+        let tp = sublist_get(tparams_sl, ti)
+        let tpname = node_name(tp)
         let bound = binds.get(tpname) ?? -1
         if bound != -1 {
             arg_tids.push(bound)
@@ -10265,7 +10607,7 @@ fn tc_enum_ctor_instance_tid(enum_tid: Int, decl: Int, vname: Str, args_sl: Int)
             if h != -1 {
                 arg_tids.push(h)
             } else {
-                arg_tids.push(make_typevar(tpname))
+                arg_tids.push(make_typevar_bound(tpname, tp))
             }
         }
         ti = ti + 1
@@ -10356,7 +10698,8 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl:
     let mut arg_tids: List[Int] = []
     let mut ti = 0
     while ti < sublist_length(tparams_sl) {
-        let bound = binds.get(node_name(sublist_get(tparams_sl, ti))) ?? -1
+        let tp = sublist_get(tparams_sl, ti)
+        let bound = binds.get(node_name(tp)) ?? -1
         if bound != -1 {
             arg_tids.push(bound)
         } else {
@@ -10364,7 +10707,7 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl:
             if h != -1 {
                 arg_tids.push(h)
             } else {
-                arg_tids.push(make_typevar(node_name(sublist_get(tparams_sl, ti))))
+                arg_tids.push(make_typevar_bound(node_name(tp), tp))
             }
         }
         ti = ti + 1
@@ -10873,6 +11216,8 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     nr_private_imports = Map()
     nr_name_source_module = Map()
     nr_module_decls = Map()
+    nr_decls_by_name = Map()
+    tc_call_decl = Map()
     nr_push_scope()
 
     // Build private import set: imported non-pub fns, types, lets
@@ -10948,7 +11293,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             let fn_node = sublist_get(fns_sl_priv, i)
             let fn_name = node_name(fn_node)
             let mod_name = node_module(fn_node)
-            nr_record_decl(fn_name, mod_name)
+            nr_record_decl(fn_name, mod_name, fn_node)
             if mod_name != "" && node_is_pub(fn_node) == 0 && nr_pub_names.contains_key(fn_name) == 0 {
                 nr_register_private(fn_name, mod_name)
             }
@@ -10961,13 +11306,13 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             let td = sublist_get(types_sl_priv, i)
             let td_name = node_name(td)
             let mod_name = node_module(td)
-            nr_record_decl(td_name, mod_name)
+            nr_record_decl(td_name, mod_name, td)
             let all_flds = node_fields(td)
             if all_flds != -1 && sublist_length(all_flds) > 0 {
                 if node_kind(sublist_get(all_flds, 0)) == NodeKind.TypeVariant {
                     let mut vi = 0
                     while vi < sublist_length(all_flds) {
-                        nr_record_decl(node_name(sublist_get(all_flds, vi)), mod_name)
+                        nr_record_decl(node_name(sublist_get(all_flds, vi)), mod_name, sublist_get(all_flds, vi))
                         vi = vi + 1
                     }
                 }
@@ -11001,7 +11346,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             let tr = sublist_get(traits_sl_priv, i)
             let tr_name = node_name(tr)
             let mod_name = node_module(tr)
-            nr_record_decl(tr_name, mod_name)
+            nr_record_decl(tr_name, mod_name, tr)
             if mod_name != "" && node_is_pub(tr) == 0 && nr_pub_names.contains_key(tr_name) == 0 {
                 nr_register_private(tr_name, mod_name)
             }
@@ -11014,7 +11359,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             let l = sublist_get(lets_sl_priv, i)
             let l_name = node_name(l)
             let mod_name = node_module(l)
-            nr_record_decl(l_name, mod_name)
+            nr_record_decl(l_name, mod_name, l)
             if mod_name != "" && node_is_pub(l) == 0 && nr_pub_names.contains_key(l_name) == 0 {
                 nr_register_private(l_name, mod_name)
             }
@@ -11286,10 +11631,11 @@ fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report 
 
 fn nr_check_type_ref(name: Str) ! TypeCheck.Resolve, Diag.Report {
     if name == "" { return }
-    // A single-letter name is a type variable only where a generic binder in scope
-    // declares it. Undeclared, it names no type — fall through to the unknown-type
-    // check below instead of passing it unchecked.
-    if name.len() == 1 && (tc_active_tparams.get(name) ?? 0) > 0 { return }
+    // A name is a type variable exactly where a generic binder in scope declares it. The
+    // spelling carries nothing, so the length of the name is not part of the test.
+    // Undeclared, the name is no type at all — fall through to the unknown-type check
+    // below instead of passing it unchecked.
+    if (tc_active_tparams.get(name) ?? 0) > 0 { return }
     if is_known_type(name) != 0 {
         if nr_check_selective_access(name, -1) != 0 { return }
         if is_private_access(name) != 0 {
@@ -11687,6 +12033,11 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     } else {
                         tc_mark_symbol_used(fn_name)
                     }
+                    // A local binding of the same spelling holds a value, not a declaration,
+                    // so a call through it is a call through a closure and records nothing.
+                    if nr_top_binding_is_global(fn_name) != 0 || nr_is_defined(fn_name) == 0 {
+                        nr_note_call_decl(node, nr_resolve_bare_decl(fn_name, nr_current_module))
+                    }
                 }
             } else {
                 nr_check_node(callee)
@@ -11716,6 +12067,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 } else {
                     tc_mark_symbol_used(mq_method)
                 }
+                nr_note_call_decl(node, nr_resolve_qualified_decl(obj_name, mq_method))
                 tc_mark_qualifier_used(obj_name)
             }
         }
@@ -14315,9 +14667,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     if im != -1 && im_binders != -1 && sublist_length(im_binders) == 1 {
                         let elem = ty_pool.get(obj_t).unwrap().inner1
                         check_arg_shapes("List.{method}", sig, node_args(node), 1)
-                        let binder = node_name(sublist_get(im_binders, 0))
+                        let binder_node = sublist_get(im_binders, 0)
+                        let binder = node_name(binder_node)
                         let mut binds: Map[Str, Int] = Map()
                         binds.insert(binder, elem)
+                        binds.insert(tc_binder_key(binder_node, binder), elem)
                         let raw_ret = fnsig_pool.get(sig).unwrap().ret
                         return substitute_typevar_tid(raw_ret, binds)
                     }
@@ -15274,6 +15628,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         if self_tid == -1 { return q_ret }
                         let mut self_bind: Map[Str, Int] = Map()
                         self_bind.insert("Self", self_tid)
+                        self_bind.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), self_tid)
                         return substitute_typevar_tid(q_ret, self_bind)
                     }
                 }
@@ -15431,11 +15786,14 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                             let mut binds: Map[Str, Int] = Map()
                             let mut i = 0
                             while i < sublist_length(tparams_sl) && i < inst.params_count {
-                                let tpname = node_name(sublist_get(tparams_sl, i))
+                                let tpnode = sublist_get(tparams_sl, i)
+                                let tpname = node_name(tpnode)
+                                let tpkey = tc_binder_key(tpnode, tpname)
                                 let arg_tid = ty_param_list.get(inst.params_start + i).unwrap()
                                 let ak = type_kind(arg_tid)
                                 if ak != TyKind.Unknown {
                                     binds.insert(tpname, arg_tid)
+                                    binds.insert(tpkey, arg_tid)
                                 } else if tc_is_unbound_metavar(arg_tid) != 0 {
                                     // The instance param is an as-yet-unpinned
                                     // metavar α (`let b = GBox { s: Set() }`). Bind the
@@ -15446,6 +15804,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                                     // type is a fresh disconnected Set[T] and the pin is
                                     // lost (→ spurious E0301 on the recovery idiom).
                                     binds.insert(tpname, arg_tid)
+                                    binds.insert(tpkey, arg_tid)
                                 }
                                 i = i + 1
                             }
@@ -16343,6 +16702,7 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
         if tc_current_self_tid != -1 {
             let mut self_ret_binds: Map[Str, Int] = Map()
             self_ret_binds.insert("Self", tc_current_self_tid)
+            self_ret_binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), tc_current_self_tid)
             tc_current_fn_ret = substitute_typevar_tid(tc_current_fn_ret, self_ret_binds)
         }
     }
@@ -18598,7 +18958,7 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
             tc_trait_node_idx.insert(node_name(trn0), trn0)
             ti = ti + 1
         }
-        let self_tv = make_typevar("Self")
+        let self_tv = make_typevar_bound("Self", SELF_BINDER_NODE)
         let mut wi = 0
         while wi < sublist_length(traits_walk_sl) {
             let trn = sublist_get(traits_walk_sl, wi)

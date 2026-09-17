@@ -1,0 +1,85 @@
+// Two types that print the same are still two types. A type parameter is identified by the
+// binder that declares it, so an impl binder spelled like a declared type gives the contract
+// check an actual and an expected whose renderings are identical. Reported as-is the sentence
+// reads "has type Zt, expected Zt", which tells the programmer nothing.
+//
+// The repair is in the diagnostic, not in the rendering: type_to_str keeps one string per
+// type identity, and the message adds where each type comes from only when the two strings
+// collide.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn first_message(name: Str) -> Str {
+    for d in diag_entries {
+        if d.name == name { return d.message }
+    }
+    ""
+}
+
+// A declared struct and an impl type parameter that share a spelling. The trait names the
+// struct; the impl names its own binder.
+fn collide_src() -> Str {
+    let mut s = "type Zt \{ n: Int }\n"
+    s = s.concat("trait Zzsame \{ fn zzsame(self, p: Zt) -> Int }\n")
+    s = s.concat("impl[Zt] Zzsame for List[Zt] \{ fn zzsame(self, p: Zt) -> Int \{ 0 } }\n")
+    s = s.concat("fn main() \{ }\n")
+    s
+}
+
+test "a contract mismatch between two types of the same spelling is still reported" {
+    typecheck_probe("build/zz_contract_same.bl", collide_src())
+    let m = first_message("TraitContract")
+    if m == "" {
+        io.println("FAIL: no TraitContract diagnostic for a same-spelling mismatch")
+        for d in diag_entries { io.println("  {d.name}: {d.message}") }
+    }
+    assert(m != "")
+}
+
+test "the two types are told apart in the message" {
+    typecheck_probe("build/zz_contract_same2.bl", collide_src())
+    let m = first_message("TraitContract")
+    if m.contains("has type 'Zt', expected 'Zt'") {
+        io.println("FAIL: the two types render the same and the message adds nothing:")
+        io.println("  {m}")
+    }
+    assert(m.contains("has type 'Zt', expected 'Zt'") == false)
+}
+
+test "the message says which of the two is the type parameter" {
+    typecheck_probe("build/zz_contract_same3.bl", collide_src())
+    let m = first_message("TraitContract")
+    if m.contains("type parameter") == false {
+        io.println("FAIL: the message does not name the type parameter:")
+        io.println("  {m}")
+    }
+    assert(m.contains("type parameter"))
+}
+
+// The qualifier is added only where it is needed. An ordinary mismatch between two types
+// that already print differently keeps the plain sentence.
+test "a mismatch between types that already read differently is left alone" {
+    let mut s = "trait Zzplain \{ fn zzplain(self, p: Int) -> Int }\n"
+    s = s.concat("impl Zzplain for Str \{ fn zzplain(self, p: Str) -> Int \{ 0 } }\n")
+    s = s.concat("fn main() \{ }\n")
+    typecheck_probe("build/zz_contract_plain.bl", s)
+    let m = first_message("TraitContract")
+    if m.contains("has type 'Str', expected 'Int'") == false {
+        io.println("FAIL: plain mismatch sentence changed:")
+        io.println("  {m}")
+    }
+    assert(m.contains("has type 'Str', expected 'Int'"))
+    assert(m.contains("type parameter") == false)
+}
