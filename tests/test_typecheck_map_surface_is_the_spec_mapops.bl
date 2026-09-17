@@ -7,11 +7,12 @@
 // probe resolves the prelude through the compiler that built this binary, whose stdlib is
 // pinned; the file beside this test is the one the change lands in.
 //
-// Two of the nine are not callable yet (`entries`, `get_or_default`) and one non-spec name
-// still is (`set`); those are open bugs against the method surface, not the trait text, so
-// the resolution test below covers the seven the front end implements.
+// Two of the nine are not callable yet (`entries`, `get_or_default`): an open bug against the
+// method surface, not the trait text, so the resolution test below covers the seven the front
+// end implements.
 import lower_test_helpers.{probe, probe_but, rhs_of, assert_eq_str}
 import typecheck.{tc_lookup_node_tid, tc_resolve, tc_type_str}
+import diagnostics.{diag_entries}
 
 fn mapops_declared_methods() -> List[Str] {
     let text = read_file("lib/std/traits.bl")
@@ -74,6 +75,29 @@ fn type_of_rhs(name: Str) -> Str {
     tc_type_str(tc_resolve(tc_lookup_node_tid(rhs_of(name))))
 }
 
+fn set_src() -> Str {
+    #"fn main() {
+    let mut m: Map[Str, Int] = Map()
+    m.set("x", 1)
+    assert(m.len() == 1)
+}
+"#
+}
+
+// `set` is a builtin method name, so refusing it on a Map must be receiver-aware: the two
+// receivers the spec does give a `set` keep it.
+fn list_and_bytes_set_src() -> Str {
+    #"fn main() {
+    let mut xs: List[Int] = [1, 2]
+    xs.set(0, 9)
+    let mut b = Bytes()
+    b.push(1)
+    b.set(0, 99)
+    assert(xs.get(0).unwrap() == 9)
+}
+"#
+}
+
 fn has_src() -> Str {
     #"fn main() {
     let m: Map[Str, Int] = Map()
@@ -105,6 +129,28 @@ test "the MapOps trait declares no method the spec withholds from Map" {
 
 test "every trait method the front end implements resolves on a Map receiver" {
     let program = probe("typecheck_map_implemented_surface", implemented_surface_src())
+    assert(program >= 0)
+}
+
+test "a method the spec does not give Map does not resolve: set" {
+    let program = probe_but("typecheck_map_no_set", set_src(), "UnresolvedMethod")
+    assert(program >= 0)
+}
+
+// `get` is one edit from `set`, so the near-miss suggester answers a read where the caller
+// meant a write. The help must name the mutator the spec does give a Map.
+test "the refusal for set names insert" {
+    let program = probe_but("typecheck_map_set_help", set_src(), "UnresolvedMethod")
+    assert(program >= 0)
+    let mut help = ""
+    for d in diag_entries {
+        if d.name == "UnresolvedMethod" { help = d.help }
+    }
+    assert_eq_str("help", help, "a Map is written with `.insert(key, value)`")
+}
+
+test "the receivers the spec gives a set keep it: List and Bytes" {
+    let program = probe("typecheck_list_and_bytes_keep_set", list_and_bytes_set_src())
     assert(program >= 0)
 }
 
