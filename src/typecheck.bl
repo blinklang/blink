@@ -1,5 +1,6 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on, nk_of, nk_is_typed}
 import std.str.{str_to_lower}
+import compiler.{per_module_imports, trace, trace_mode}
 import parser.{
     get_annotation, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
@@ -9480,7 +9481,13 @@ fn is_filtered_for_module(name: Str, source_mod: Str, consuming_mod: Str) -> Int
         }
         None => {}
     }
-    0
+    // No import of this module at all. A file's imports say what it depends on, so a name
+    // it never asked for is not in its scope, however many other modules pulled the
+    // declaration in. A prelude module is the exception: its types and traits stay visible
+    // without an import, and a bare call to one of its free functions is E0504, reported by
+    // nr_is_unimported_prelude_free_fn below, not a missing selection.
+    if tc_prelude_modules.contains_key(source_mod) { return 0 }
+    1
 }
 
 // True when `name` is a free function exported by a prelude module that the
@@ -9545,6 +9552,9 @@ pub fn tc_qualifier_to_module_or_self(qualifier: Str) -> Str {
 fn nr_check_selective_access(name: Str, node: Int) -> Int ! Diag.Report {
     if nr_current_module == "" { return 0 }
     if is_builtin_name(name) != 0 { return 0 }
+    // A local binding holds a value, not a declaration some module exported. It may be spelled
+    // like an exported name, and an import list has nothing to say about a local.
+    if nr_name_top.contains_key(name) && nr_top_binding_is_global(name) == 0 { return 0 }
     if nr_module_declares(nr_current_module, name) != 0 { return 0 }
     // A namesake type is in scope when this module's import list selects one declaration of
     // it; the last-writer symbol table below knows only one module for the name.
@@ -9556,10 +9566,9 @@ fn nr_check_selective_access(name: Str, node: Int) -> Int ! Diag.Report {
     // A private declaration cannot be selected or qualified, so the import list is not the
     // fix; the private-access check names the real problem.
     if nr_is_private_in(name, source_mod) != 0 { return 0 }
-    // The same last-writer limit as the namesake-type check above: where two modules declare
-    // the name, `source_mod` is whichever was recorded last, not the one this module's
-    // import list selected.
-    if nr_bare_name_selected_elsewhere(name, nr_current_module) != 0 { return 0 }
+    // The same last-writer limit as the namesake-type check above: `source_mod` is whichever
+    // module was recorded last for the spelling, not the one this file's import list picked.
+    if nr_bare_name_in_scope_here(name, nr_current_module) != 0 { return 0 }
     if is_filtered_for_module(name, source_mod, nr_current_module) != 0 {
         let display_mod = tc_qualifier_for_module(source_mod)
         if node == -1 {
@@ -9641,11 +9650,12 @@ fn nr_resolve_qualified_decl(qualifier: Str, member: Str) -> Int {
     nr_module_decls.get("{target}|{member}") ?? -1
 }
 
-// Whether this module's own import list keeps the bare `name` in scope, asked only where
-// more than one module declares it. Below that, the symbol table's single answer is right.
-fn nr_bare_name_selected_elsewhere(name: Str, consuming_mod: Str) -> Int {
+// Whether this file's own import list reaches any declaration of the bare `name`. The
+// declarations answer this, not tc_symbol_module: that table holds one module per name and
+// a `pub import` re-export overwrites it, so it can name a module that only forwards the
+// declaration while the importing file selected the module that owns it.
+fn nr_bare_name_in_scope_here(name: Str, consuming_mod: Str) -> Int {
     let cands = nr_decls_by_name.get(name) ?? []
-    if cands.len() < 2 { return 0 }
     for c in cands {
         if node_module(c) == consuming_mod { return 1 }
         if is_filtered_for_module(name, node_module(c), consuming_mod) == 0 { return 1 }
