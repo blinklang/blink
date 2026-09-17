@@ -11,7 +11,7 @@ import std.fs
 import std.io
 import compiler.{compile_to_program}
 import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
-import parser.{nodes, node_kind, node_name}
+import parser.{nodes, node_kind, node_name, node_obj}
 import ast.{NodeKind}
 import diagnostics.{diag_entries, diag_reset}
 import embedded_stdlib_registry.{init_embedded_stdlib}
@@ -35,6 +35,28 @@ fn rendered_type_of_read(nm: Str) -> Str {
         if node_kind(i) == NodeKind.Ident && node_name(i) == nm {
             if hit != -1 { return "<ambiguous>" }
             hit = i
+        }
+        i = i + 1
+    }
+    if hit == -1 { return "<absent>" }
+    tc_type_str(tc_lookup_node_tid(hit))
+}
+
+// The rendered type of the one MethodCall whose receiver is spelled `nm`. A variant
+// constructor is written as one, so this reads the type the constructor itself answers,
+// which is not the same node as the binding it is assigned to. -2 marks an ambiguous one.
+fn rendered_type_of_call_on(nm: Str) -> Str {
+    let mut hit = -1
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.MethodCall {
+            let o = node_obj(i)
+            if o != -1 {
+                if node_kind(o) == NodeKind.Ident && node_name(o) == nm {
+                    if hit != -1 { return "<ambiguous>" }
+                    hit = i
+                }
+            }
         }
         i = i + 1
     }
@@ -91,6 +113,26 @@ fn main() {
 "#
 }
 
+fn hint_src() -> Str {
+    #"type ZzSide[L, R] {
+    Left(l: L)
+    Right(r: R)
+}
+
+fn zzhint() -> Int {
+    let zzpicked: ZzSide[Int, Str] = ZzSide.Left(7)
+    match zzpicked {
+        ZzSide.Left(l) => l
+        ZzSide.Right(r) => r.len()
+    }
+}
+
+fn main() {
+    let _ = zzhint()
+}
+"#
+}
+
 test "a generic enum instance renders its type arguments" {
     enum_probe("build/generic_enum_render.bl", instances_src())
 
@@ -107,4 +149,19 @@ test "a mismatch between two instances of one enum names both sides apart" {
     // got ZzTree", which states no difference and asks for no repair.
     assert_eq(errors_saying("declared type ZzTree[Str] but got ZzTree[Int]"), 1)
     assert_eq(errors_saying("declared type ZzTree but got ZzTree"), 0)
+}
+
+// A variant that writes only one of the enum's parameters leaves the rest to the enclosing
+// annotation, and that hint is matched to the enum by BASE name. The rendering is not that
+// name once an instance spells its arguments, so a hint read through the rendering stops
+// matching the enum it pins and the untouched parameter is left unfilled. The pool holds the
+// base name whatever the rendering does, and that is what the match reads.
+test "an annotation still pins the parameter a variant leaves untouched" {
+    enum_probe("build/generic_enum_hint.bl", hint_src())
+
+    // The binding takes its type from its own annotation either way, so it is the
+    // CONSTRUCTOR that shows whether the hint reached the untouched parameter. Read
+    // through the rendering, the hint stops matching and this answers ZzSide[Int, R].
+    assert_eq(rendered_type_of_call_on("ZzSide"), "ZzSide[Int, Str]")
+    assert_eq(rendered_type_of_read("zzpicked"), "ZzSide[Int, Str]")
 }
