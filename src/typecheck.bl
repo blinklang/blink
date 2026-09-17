@@ -257,6 +257,11 @@ let mut tc_active_tparams: Map[Str, Int] = Map()
 // operation is licensed on a type parameter. A name absent from this stack is not a
 // type parameter (e.g. Self, or an unmodeled builtin that lowers to a typevar).
 let mut tc_tp_arith_names: List[Str] = []
+// Parallel to tc_tp_arith_names, one entry per frame: the NODE that binds this type
+// parameter. A type parameter is identified by its binder, not by its spelling, so
+// `T` of `type Box[T]` and `T` of `fn pick[T, U]` are two types that share a letter.
+// The implicit `Self` frame binds nothing and carries SELF_BINDER_NODE.
+let mut tc_tp_binder_nodes: List[Int] = []
 // Parallel to tc_tp_arith_names, one entry per frame: the full trait-bound set
 // (pipe-framed, e.g. "|Add|Ord|Eq|") and — for the implicit `Self` frame of a trait
 // default body — the guarantee-set METHOD names ("|eq|ne|"). Type-parameter frames
@@ -294,6 +299,9 @@ let mut fnsig_param_list: List[Int] = []
 // against another.
 let mut fnsig_param_names: List[Str] = []
 let mut fnsig_type_param_names: List[Str] = []
+// Flat side-table PARALLEL to fnsig_type_param_names (same index, same length): the NODE
+// that declares that type parameter. A name alone cannot tell two declarations' `T` apart.
+let mut fnsig_tparam_nodes: List[Int] = []
 // Flat side-table PARALLEL to fnsig_type_param_names (same index, same length):
 // 1 iff that type param is RETURN-ONLY — named by the fn's return annotation and by
 // no parameter annotation. Only those slots get a call-site metavar; every
@@ -1042,6 +1050,9 @@ let mut tc_tmsig_pool: List[TraitMethodSigEntry] = []
 // left as typevars for per-impl binding by subst_trait_type_tid.
 let mut tc_tmsig_param_tids: List[Int] = []
 let mut tc_trait_tparam_names: List[Str] = []
+// Flat side-table PARALLEL to tc_trait_tparam_names (same index, same length): the NODE
+// that declares that trait type parameter, which is the identity a substitution keys on.
+let mut tc_trait_tparam_nodes: List[Int] = []
 
 let mut tc_current_fn_ret: Int = -1
 let mut tc_current_fn_name: Str = ""
@@ -1379,8 +1390,69 @@ pub fn make_fn_type(ret_type: Int, param_types: List[Int]) -> Int {
 // INTERNS — safe because tc_tid_same_type compares TyKind.Typevar by
 // name alone (:11672-11673 above), so name-keying IS its equality, and a TyKind.Typevar entry
 // is never mutated post-construction (same invariant as every other ty_intern_* ctor).
+// A type parameter with no binder in scope. The fallback mints of resolve_type_ann land
+// here: `Self.Context`, an effect name used as a type argument, an unknown name in a
+// formatter fixture. None of those is a type parameter, and no declaration binds a
+// parameter under any of those spellings, so keying them together collides with nothing.
+pub let NO_BINDER_NODE: Int = -1
+// `Self` binds once per compile, not at a node. It needs an identity distinct from
+// NO_BINDER_NODE so an unsolved fallback mint can never be mistaken for the receiver.
+pub let SELF_BINDER_NODE: Int = -2
+
+// The innermost binder of `name`, or NO_BINDER_NODE when `name` is not an active type
+// parameter. Scans the frame stack from the top, so an inner declaration's parameter
+// shadows an outer one of the same spelling.
+fn tc_active_binder_node(name: Str) -> Int {
+    let mut i = tc_tp_arith_names.len() - 1
+    while i >= 0 {
+        if tc_tp_arith_names.get(i).unwrap() == name {
+            return tc_tp_binder_nodes.get(i).unwrap()
+        }
+        i = i - 1
+    }
+    NO_BINDER_NODE
+}
+
+// A typevar is interned per (spelling, binder), so the same letter bound by two
+// declarations is two types. inner1 carries the binder: ty_intern_simple already keys on
+// it and tc_tid_child_count reports Typevar as a leaf, so no reader walks into it.
+fn make_typevar_bound(name: Str, binder: Int) -> Int {
+    ty_intern_simple(TyKind.Typevar, name, binder, -1)
+}
+
+// The key a substitution binds a type parameter under: its binder AND its spelling.
+// The binder alone is not enough, because every fallback mint with no binder in scope
+// shares NO_BINDER_NODE -- `Self.Context`, an effect name used as a type argument, an
+// unknown name in a fixture. The spelling alone is the bug this pair replaces. Together
+// they are exact: one declaration's `T` never keys the same as another's.
+pub fn tc_binder_key(binder: Int, name: Str) -> Str {
+    "{binder}|{name}"
+}
+
+// The binds key of a typevar tid, or "" when the tid is not a typevar.
+pub fn tc_tid_typevar_key(tid0: Int) -> Str {
+    let t = tc_resolve(tid0)
+    if t < 0 || t >= ty_pool.len() { return "" }
+    let e = ty_pool.get(t).unwrap()
+    if e.kind != TyKind.Typevar { return "" }
+    tc_binder_key(e.inner1, e.name)
+}
+
+// The node that binds this typevar, or NO_BINDER_NODE when it is not a typevar or has
+// no binder in scope.
+pub fn tc_tid_binder(tid0: Int) -> Int {
+    let t = tc_resolve(tid0)
+    if t < 0 || t >= ty_pool.len() { return NO_BINDER_NODE }
+    let e = ty_pool.get(t).unwrap()
+    if e.kind != TyKind.Typevar { return NO_BINDER_NODE }
+    e.inner1
+}
+
 fn make_typevar(name: Str) -> Int {
-    ty_intern_simple(TyKind.Typevar, name, -1, -1)
+    // `Self` is bound by the impl, which is not a type-parameter scope. Pinning it here
+    // keeps one key for it whether or not an impl frame happens to be on the stack.
+    if name == "Self" { return make_typevar_bound(name, SELF_BINDER_NODE) }
+    make_typevar_bound(name, tc_active_binder_node(name))
 }
 
 // `pub` FOR THE TEST ONLY — see make_option_type above.
@@ -2695,7 +2767,9 @@ fn tc_subst_evfield_from_instance(field_tid: Int, inst_tid: Int) -> Int {
     let mut i = 0
     while i < sublist_length(tparams_sl) && i < ie.params_count {
         let arg = ty_param_list.get(ie.params_start + i).unwrap()
-        binds.insert(node_name(sublist_get(tparams_sl, i)), arg)
+        let tp = sublist_get(tparams_sl, i)
+        binds.insert(node_name(tp), arg)
+        binds.insert(tc_binder_key(tp, node_name(tp)), arg)
         i = i + 1
     }
     substitute_typevar_tid(field_tid, binds)
@@ -2857,7 +2931,11 @@ pub fn substitute_typevar_tid(t: Int, binds: Map[Str, Int]) -> Int {
     let e = ty_pool.get(t).unwrap()
     let k = e.kind
     if k == TyKind.Typevar {
-        match binds.get(e.name) {
+        // Keyed on the BINDER, so a typevar bound by a different declaration finds no
+        // entry and survives substitution unchanged. It then reaches monomorphization
+        // unsolved and is reported, instead of silently taking this context's argument
+        // for the same letter.
+        match binds.get(tc_binder_key(e.inner1, e.name)) {
             Some(tid) => return tid
             None => return t
         }
@@ -3011,7 +3089,9 @@ pub fn tc_mono_binds_map(mono_tparams_sl: Int, mono_arg_tids: List[Int]) -> Map[
     while mi < sublist_length(mono_tparams_sl) && mi < mono_arg_tids.len() {
         let tid = mono_arg_tids.get(mi).unwrap()
         if tid >= 0 {
-            binds.insert(node_name(sublist_get(mono_tparams_sl, mi)), tid)
+            let tp = sublist_get(mono_tparams_sl, mi)
+            binds.insert(node_name(tp), tid)
+            binds.insert(tc_binder_key(tp, node_name(tp)), tid)
         }
         mi = mi + 1
     }
@@ -3080,14 +3160,17 @@ fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
         // `256` arg could bind K:=Int). So: record a bind only when it is absent, or
         // when the existing bind is itself non-concrete (a placeholder α/typevar) and
         // the new atid IS concrete. Never let a non-concrete atid overwrite or claim.
-        match binds.get(pe.name) {
+        let bkey = tc_binder_key(pe.inner1, pe.name)
+        match binds.get(bkey) {
             Some(prev) => {
                 if bind_target_is_concrete(atid) != 0 && bind_target_is_concrete(prev) == 0 {
                     binds.insert(pe.name, atid)
+                    binds.insert(bkey, atid)
                 }
             }
             None => {
                 binds.insert(pe.name, atid)
+                binds.insert(bkey, atid)
             }
         }
         return
@@ -3403,6 +3486,10 @@ fn instantiate_return_type(sig: Int, args_sl: Int, call_node: Int) -> Int ! Type
                 // belt-and-braces guard against a future producer inserting both.
                 if binds.contains_key(tpn) == 0 {
                     binds.insert(tpn, a)
+                    if nidx < fnsig_tparam_nodes.len() {
+                        let tpnode = fnsig_tparam_nodes.get(nidx).unwrap()
+                        binds.insert(tc_binder_key(tpnode, tpn), a)
+                    }
                 }
             }
         }
@@ -5002,6 +5089,7 @@ fn tc_push_arith_frames(sl: Int) {
     while i < sublist_length(sl) {
         let tp = sublist_get(sl, i)
         tc_tp_arith_names.push(node_name(tp))
+        tc_tp_binder_nodes.push(tp)
         tc_tp_bound_traits.push(tparam_node_bound_traits(tp))
         tc_tp_bound_methods.push("|")
         i = i + 1
@@ -5014,6 +5102,7 @@ fn tc_pop_arith_frames(sl: Int) {
     let mut i = 0
     while i < sublist_length(sl) {
         let _ = tc_tp_arith_names.pop()
+        let _ = tc_tp_binder_nodes.pop()
         let _ = tc_tp_bound_traits.pop()
         let _ = tc_tp_bound_methods.pop()
         i = i + 1
@@ -5146,12 +5235,14 @@ fn tc_push_self_frame(tr_node: Int) {
         }
     }
     tc_tp_arith_names.push("Self")
+    tc_tp_binder_nodes.push(SELF_BINDER_NODE)
     tc_tp_bound_traits.push(traits)
     tc_tp_bound_methods.push(methods)
 }
 
 fn tc_pop_self_frame() {
     let _ = tc_tp_arith_names.pop()
+    let _ = tc_tp_binder_nodes.pop()
     let _ = tc_tp_bound_traits.pop()
     let _ = tc_tp_bound_methods.pop()
 }
@@ -6133,12 +6224,13 @@ fn tc_struct_lit_instance_tid(stid: Int, node: Int) -> Int ! TypeCheck.Resolve, 
     let mut arg_tids: List[Int] = []
     let mut ti = 0
     while ti < sublist_length(tparams_sl) {
-        let tpname = node_name(sublist_get(tparams_sl, ti))
+        let tp = sublist_get(tparams_sl, ti)
+        let tpname = node_name(tp)
         let bound = binds.get(tpname) ?? -1
         if bound != -1 {
             arg_tids.push(bound)
         } else {
-            arg_tids.push(make_typevar(tpname))
+            arg_tids.push(make_typevar_bound(tpname, tp))
         }
         ti = ti + 1
     }
@@ -7133,6 +7225,7 @@ fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
             let tp = sublist_get(tparams_sl, ti)
             let tp_name = node_name(tp)
             fnsig_type_param_names.push(tp_name)
+            fnsig_tparam_nodes.push(tp)
             fnsig_tparam_ret_only.push(tc_tparam_is_ret_only(tp_name, ret_ann, params_sl))
             fnsig_tparam_bounds.push(tparam_node_bound_traits(tp))
             tp_count = tp_count + 1
@@ -7954,6 +8047,7 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
         while ti < sublist_length(tparams_sl) {
             let tp = sublist_get(tparams_sl, ti)
             tc_trait_tparam_names.push(node_name(tp))
+            tc_trait_tparam_nodes.push(tp)
             tp_count = tp_count + 1
             ti = ti + 1
         }
@@ -8036,6 +8130,7 @@ fn subst_trait_type_tid(type_tid: Int, impl_recv_tid: Int, tmsig_idx: Int, impl_
     if tc_tid_is_no_info(type_tid) != 0 { return type_tid }
     let mut binds: Map[Str, Int] = Map()
     binds.insert("Self", impl_recv_tid)
+    binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), impl_recv_tid)
     let _tmsig = tc_tmsig_pool.get(tmsig_idx).unwrap()
     let tp_start = _tmsig.tparams_start
     let tp_count = _tmsig.tparams_count
@@ -8044,8 +8139,11 @@ fn subst_trait_type_tid(type_tid: Int, impl_recv_tid: Int, tmsig_idx: Int, impl_
         let mut k = 0
         while k < tp_count {
             let tp_name = tc_trait_tparam_names.get(tp_start + k).unwrap()
+            let tp_node = tc_trait_tparam_nodes.get(tp_start + k) ?? NO_BINDER_NODE
             if impl_targs_sl != -1 && k < sublist_length(impl_targs_sl) {
-                binds.insert(tp_name, resolve_type_ann(sublist_get(impl_targs_sl, k)))
+                let tp_tid = resolve_type_ann(sublist_get(impl_targs_sl, k))
+                binds.insert(tp_name, tp_tid)
+                binds.insert(tc_binder_key(tp_node, tp_name), tp_tid)
             }
             k = k + 1
         }
@@ -8055,7 +8153,10 @@ fn subst_trait_type_tid(type_tid: Int, impl_recv_tid: Int, tmsig_idx: Int, impl_
         let mut ai = 0
         while ai < sublist_length(assoc_sl) {
             let at_node = sublist_get(assoc_sl, ai)
-            binds.insert("Self.{node_name(at_node)}", resolve_type_ann(node_type_ann(at_node)))
+            let at_name = "Self.{node_name(at_node)}"
+            let at_tid = resolve_type_ann(node_type_ann(at_node))
+            binds.insert(at_name, at_tid)
+            binds.insert(tc_binder_key(NO_BINDER_NODE, at_name), at_tid)
             ai = ai + 1
         }
     }
@@ -8086,6 +8187,7 @@ fn tc_trait_contract_tid_check(trait_tid: Int, impl_ann: Int, impl_recv_tid: Int
     tc_suppress_ann_validation = 1
     let mut self_binds: Map[Str, Int] = Map()
     self_binds.insert("Self", impl_recv_tid)
+    self_binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), impl_recv_tid)
     let actual = substitute_typevar_tid(resolve_type_ann(impl_ann), self_binds)
     tc_suppress_ann_validation = saved_suppress
     tc_trait_contract_tid_check_actual(trait_tid, actual, impl_recv_tid, tmsig_idx, im)
@@ -8530,6 +8632,7 @@ fn init_types() ! TypeCheck.Register {
     fnsig_param_list.clear()
     fnsig_param_names.clear()
     fnsig_type_param_names.clear()
+    fnsig_tparam_nodes.clear()
     fnsig_tparam_ret_only.clear()
     fnsig_tparam_bounds.clear()
     fnsig_effect_names.clear()
@@ -8546,6 +8649,7 @@ fn init_types() ! TypeCheck.Register {
     tc_tmsig_pool.clear()
     tc_tmsig_param_tids.clear()
     tc_trait_tparam_names.clear()
+    tc_trait_tparam_nodes.clear()
     tc_trait_tparam_count_idx.clear()
     tc_trait_supers_idx.clear()
     tc_current_fn_ret = -1
@@ -10256,7 +10360,8 @@ fn tc_enum_ctor_instance_tid(enum_tid: Int, decl: Int, vname: Str, args_sl: Int)
     let mut arg_tids: List[Int] = []
     let mut ti = 0
     while ti < sublist_length(tparams_sl) {
-        let tpname = node_name(sublist_get(tparams_sl, ti))
+        let tp = sublist_get(tparams_sl, ti)
+        let tpname = node_name(tp)
         let bound = binds.get(tpname) ?? -1
         if bound != -1 {
             arg_tids.push(bound)
@@ -10265,7 +10370,7 @@ fn tc_enum_ctor_instance_tid(enum_tid: Int, decl: Int, vname: Str, args_sl: Int)
             if h != -1 {
                 arg_tids.push(h)
             } else {
-                arg_tids.push(make_typevar(tpname))
+                arg_tids.push(make_typevar_bound(tpname, tp))
             }
         }
         ti = ti + 1
@@ -10356,7 +10461,8 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl:
     let mut arg_tids: List[Int] = []
     let mut ti = 0
     while ti < sublist_length(tparams_sl) {
-        let bound = binds.get(node_name(sublist_get(tparams_sl, ti))) ?? -1
+        let tp = sublist_get(tparams_sl, ti)
+        let bound = binds.get(node_name(tp)) ?? -1
         if bound != -1 {
             arg_tids.push(bound)
         } else {
@@ -10364,7 +10470,7 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl:
             if h != -1 {
                 arg_tids.push(h)
             } else {
-                arg_tids.push(make_typevar(node_name(sublist_get(tparams_sl, ti))))
+                arg_tids.push(make_typevar_bound(node_name(tp), tp))
             }
         }
         ti = ti + 1
@@ -14315,9 +14421,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     if im != -1 && im_binders != -1 && sublist_length(im_binders) == 1 {
                         let elem = ty_pool.get(obj_t).unwrap().inner1
                         check_arg_shapes("List.{method}", sig, node_args(node), 1)
-                        let binder = node_name(sublist_get(im_binders, 0))
+                        let binder_node = sublist_get(im_binders, 0)
+                        let binder = node_name(binder_node)
                         let mut binds: Map[Str, Int] = Map()
                         binds.insert(binder, elem)
+                        binds.insert(tc_binder_key(binder_node, binder), elem)
                         let raw_ret = fnsig_pool.get(sig).unwrap().ret
                         return substitute_typevar_tid(raw_ret, binds)
                     }
@@ -15274,6 +15382,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         if self_tid == -1 { return q_ret }
                         let mut self_bind: Map[Str, Int] = Map()
                         self_bind.insert("Self", self_tid)
+                        self_bind.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), self_tid)
                         return substitute_typevar_tid(q_ret, self_bind)
                     }
                 }
@@ -15431,11 +15540,14 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                             let mut binds: Map[Str, Int] = Map()
                             let mut i = 0
                             while i < sublist_length(tparams_sl) && i < inst.params_count {
-                                let tpname = node_name(sublist_get(tparams_sl, i))
+                                let tpnode = sublist_get(tparams_sl, i)
+                                let tpname = node_name(tpnode)
+                                let tpkey = tc_binder_key(tpnode, tpname)
                                 let arg_tid = ty_param_list.get(inst.params_start + i).unwrap()
                                 let ak = type_kind(arg_tid)
                                 if ak != TyKind.Unknown {
                                     binds.insert(tpname, arg_tid)
+                                    binds.insert(tpkey, arg_tid)
                                 } else if tc_is_unbound_metavar(arg_tid) != 0 {
                                     // The instance param is an as-yet-unpinned
                                     // metavar α (`let b = GBox { s: Set() }`). Bind the
@@ -15446,6 +15558,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                                     // type is a fresh disconnected Set[T] and the pin is
                                     // lost (→ spurious E0301 on the recovery idiom).
                                     binds.insert(tpname, arg_tid)
+                                    binds.insert(tpkey, arg_tid)
                                 }
                                 i = i + 1
                             }
@@ -16343,6 +16456,7 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
         if tc_current_self_tid != -1 {
             let mut self_ret_binds: Map[Str, Int] = Map()
             self_ret_binds.insert("Self", tc_current_self_tid)
+            self_ret_binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), tc_current_self_tid)
             tc_current_fn_ret = substitute_typevar_tid(tc_current_fn_ret, self_ret_binds)
         }
     }
@@ -18598,7 +18712,7 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
             tc_trait_node_idx.insert(node_name(trn0), trn0)
             ti = ti + 1
         }
-        let self_tv = make_typevar("Self")
+        let self_tv = make_typevar_bound("Self", SELF_BINDER_NODE)
         let mut wi = 0
         while wi < sublist_length(traits_walk_sl) {
             let trn = sublist_get(traits_walk_sl, wi)
