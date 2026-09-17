@@ -1947,7 +1947,8 @@ fn tc_ops_trait_qualified_ret(method: Str, args_sl: Int) -> Int ! TypeCheck.Reso
         let val_t = ty_pool.get(recv).unwrap().inner2
         if method == "get" { return make_option_type(val_t) }
         if method == "insert" || method == "clear" { return TYPE_VOID }
-        if method == "contains_key" || method == "contains" || method == "remove" { return TYPE_BOOL }
+        if method == "contains_key" || method == "contains" { return TYPE_BOOL }
+        if method == "remove" { return make_option_type(val_t) }
         if method == "keys" { return make_list_type(key_t) }
         if method == "values" { return make_list_type(val_t) }
     }
@@ -9875,6 +9876,31 @@ fn is_builtin_method(name: Str) -> Int {
     0
 }
 
+// The Map method surface, sections/03_types.md "The MapOps Trait": the nine MapOps methods,
+// plus len and is_empty from Sized and contains from Contains. Two of the nine are not
+// callable yet, and they stay listed here: this answers what the SPEC gives a Map, and the
+// name-level check reports the ones the front end has not built.
+fn tc_map_surface_has(name: Str) -> Int {
+    if name == "get" || name == "keys" || name == "values" { return 1 }
+    if name == "entries" || name == "get_or_default" { return 1 }
+    if name == "insert" || name == "remove" { return 1 }
+    if name == "contains_key" || name == "clear" { return 1 }
+    if name == "len" || name == "is_empty" || name == "contains" { return 1 }
+    0
+}
+
+// Does a builtin method name belong to THIS receiver kind? is_builtin_method answers per
+// name, which is the right question for a typo suggestion and for "does this name resolve
+// anywhere in the program", and the wrong one for a call: `set` is a builtin name because
+// List and Bytes have one, and that name-level answer is what accepted `m.set(k, v)` on a
+// Map, whose surface the spec closes. A kind is named here only once its surface is closed;
+// every other kind keeps the name-level answer.
+fn is_builtin_method_on_receiver(obj_k: TyKind, name: Str) -> Int {
+    if is_builtin_method(name) == 0 { return 0 }
+    if obj_k == TyKind.Map { return tc_map_surface_has(name) }
+    1
+}
+
 fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "arg_count" { return TYPE_INT }
     if name == "get_arg" { return TYPE_STR }
@@ -10451,6 +10477,20 @@ fn nr_method_name_unresolvable(method: Str) -> Int {
     1
 }
 
+// Does this call name nothing the receiver can answer? Two ways to fail, and the receiver's
+// kind separates them: a name that resolves NOWHERE in the program, and a builtin name that
+// resolves on some other kind but not on this one. The impl registry is asked before the
+// second refusal, so a declared method always outranks a closed builtin surface: no impl can
+// target a builtin container today, and a name rule must not be what decides that.
+fn tc_method_unavailable_on_receiver(obj_k: TyKind, method: Str) -> Int {
+    if nr_method_name_unresolvable(method) != 0 { return 1 }
+    if is_builtin_method(method) != 0 && is_builtin_method_on_receiver(obj_k, method) == 0 {
+        if nr_has_impl_method(tk_name(obj_k), method) != 0 { return 0 }
+        return 1
+    }
+    0
+}
+
 // The identifier alphabet a near-miss neighbour is drawn from. Method names are
 // lowercase with underscores and the occasional digit.
 fn tc_ident_alphabet() -> Str {
@@ -10554,6 +10594,11 @@ fn tc_unresolved_method_help(obj_k: TyKind, tname: Str, method: Str) -> Str {
     if obj_k == TyKind.List {
         let rename = tc_list_rename_help(method)
         if rename != "" { return rename }
+    }
+    // A Map is the one receiver where the near-miss neighbour of `set` is `get`, which reads
+    // the entry the caller meant to write. Name the mutator instead.
+    if obj_k == TyKind.Map && method == "set" {
+        return "a Map is written with `.insert(key, value)`"
     }
     let near = tc_suggest_method(obj_k, tname, method)
     if near != "" { return "did you mean '.{near}'?" }
@@ -14157,9 +14202,15 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             let key_t = ty_pool.get(obj_t).unwrap().inner1
             let val_t = ty_pool.get(obj_t).unwrap().inner2
             if method == "len" { return TYPE_INT }
-            if method == "contains_key" || method == "contains" || method == "remove" {
+            if method == "contains_key" || method == "contains" {
                 check_builtin_arg(method, 0, key_t, args_sl, "Map")
                 return TYPE_BOOL
+            }
+            // MapOps gives `remove` the value it took out, not a presence test: a Bool answer
+            // throws the value away and leaves the caller a second lookup to get it back.
+            if method == "remove" {
+                check_builtin_arg(method, 0, key_t, args_sl, "Map")
+                return make_option_type(val_t)
             }
             if method == "insert" {
                 check_builtin_arg(method, 0, key_t, args_sl, "Map")
@@ -14999,15 +15050,15 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
         }
         // The receiver is a BUILTIN type the front end knows, the per-kind dispatch above
-        // did not claim the call, and the method name resolves nowhere in the program. That
-        // is a name error, the same one a struct receiver already draws, and nothing later
-        // can supply the method. Struct and enum receivers never reach here — their own gate
+        // did not claim the call, and nothing the receiver has answers the name. That is a
+        // name error, the same one a struct receiver already draws, and nothing later can
+        // supply the method. Struct and enum receivers never reach here — their own gate
         // above answers them with the impl registries in hand.
         //
         // The poison return is what keeps this to ONE diagnostic: a declared type over the
         // call unifies with the recovery tid instead of drawing a second, derived error
         // about a type the program never had.
-        if tc_recv_type_is_determined(obj_k, obj_t) != 0 && nr_method_name_unresolvable(method) != 0 {
+        if tc_recv_type_is_determined(obj_k, obj_t) != 0 && tc_method_unavailable_on_receiver(obj_k, method) != 0 {
             let mc_tname = type_to_str(obj_t)
             tc_unresolved_method_hard.insert(node, 1)
             diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method '.{method}' on type {mc_tname}", node, tc_unresolved_method_help(obj_k, mc_tname, method))
