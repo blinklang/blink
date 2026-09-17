@@ -3,10 +3,11 @@
 // one is not a value of the other. The nominal key must therefore carry the declaring
 // module, or the second registration answers for the first.
 
-import typecheck.{check_types, lookup_named_type, get_struct_field_tid, tc_tid_decl_node}
+import typecheck.{check_types, lookup_named_type, get_struct_field_tid, tc_tid_decl_node, tc_lookup_node_tid, tc_type_str, DECL_NODE_AMBIGUOUS}
 import compiler.{compile_to_program}
 import diagnostics.{diag_entries, diag_reset}
-import parser.{node_module}
+import parser.{node_module, nodes, node_kind, node_name}
+import ast.{NodeKind}
 import std.io
 
 let PKG = "build/tc_namesake_pkg"
@@ -33,11 +34,11 @@ fn cleanup() {
 }
 
 fn src_alpha() -> Str {
-    "pub type Point \{ a: Int \}\npub trait TagA \{ fn tag_a(self) -> Int \}\nimpl TagA for Point \{ fn tag_a(self) -> Int \{ 1 \} \}\npub fn make_a() -> Int \{ Point \{ a: 7 \}.tag_a() \}\npub fn get_a(p: Point) -> Int \{ p.a \}\n"
+    "pub type Point \{ a: Int \}\npub trait TagA \{ fn tag_a(self) -> Int \}\nimpl TagA for Point \{ fn tag_a(self) -> Int \{ 1 \} \}\npub fn make_a() -> Int \{ Point \{ a: 7 \}.tag_a() \}\npub fn get_a(p: Point) -> Int \{ p.a \}\npub type Box[T] \{ v: T \}\npub fn boxed_a(x: Int) -> Box[Int] \{ Box \{ v: x \} \}\n"
 }
 
 fn src_beta() -> Str {
-    "pub type Point \{ b: Int \}\npub trait TagB \{ fn tag_b(self) -> Int \}\nimpl TagB for Point \{ fn tag_b(self) -> Int \{ 2 \} \}\npub fn make_b() -> Int \{ Point \{ b: 9 \}.tag_b() \}\npub fn get_b(p: Point) -> Int \{ p.b \}\n"
+    "pub type Point \{ b: Int \}\npub trait TagB \{ fn tag_b(self) -> Int \}\nimpl TagB for Point \{ fn tag_b(self) -> Int \{ 2 \} \}\npub fn make_b() -> Int \{ Point \{ b: 9 \}.tag_b() \}\npub fn get_b(p: Point) -> Int \{ p.b \}\npub type Box[T] \{ v: T \}\npub fn boxed_b(x: Int) -> Box[Int] \{ Box \{ v: x \} \}\n"
 }
 
 // A third namesake, plus a derive whose field names it by its bare spelling.
@@ -59,6 +60,12 @@ fn src_probe_cross_assign() -> Str {
 
 fn src_probe_main_declares_point() -> Str {
     "import alpha.\{make_a\}\ntype Point \{ c: Int \}\nfn main() \{ let p = Point \{ c: 3 \} assert(p.c == 3) assert(make_a() == 1) \}\n"
+}
+
+// Neither binding is annotated: each tid comes from the callee's return type, so the
+// rows below cannot pass on an annotation the probe itself wrote.
+fn src_probe_uses_both_boxes() -> Str {
+    "import alpha.\{boxed_a\}\nimport beta.\{boxed_b\}\nfn main() \{ let ba = boxed_a(1) let bb = boxed_b(2) assert(ba.v + bb.v == 3) \}\n"
 }
 
 fn src_probe_namesake_map_key() -> Str {
@@ -153,8 +160,42 @@ fn test_derive_field_check_finds_the_namesake() ! Lex.Tokenize, Parse, Parse.Bui
     cleanup()
 }
 
+fn let_tid(nm: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.LetBinding && node_name(i) == nm { return tc_lookup_node_tid(i) }
+        i = i + 1
+    }
+    -1
+}
+
+// A generic INSTANCE is minted per use and never registered, so it reaches its declaration
+// through the name its pool entry carries. That name must stay module-qualified for a
+// namesake, or the two instances intern as one entry and the declaration lookup has
+// nothing left to tell them apart.
+fn test_generic_instances_of_a_namesake_stay_distinct() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe(src_probe_uses_both_boxes())
+    assert_no_errors("alpha.Box[Int] beside beta.Box[Int]")
+    let ta = let_tid("ba")
+    let tb = let_tid("bb")
+    assert(ta >= 0)
+    assert(tb >= 0)
+    assert(ta != tb)
+    let da = tc_tid_decl_node(ta)
+    let db = tc_tid_decl_node(tb)
+    assert(da >= 0)
+    assert(db >= 0)
+    assert(da != DECL_NODE_AMBIGUOUS)
+    assert(db != DECL_NODE_AMBIGUOUS)
+    assert(da != db)
+    assert(tc_type_str(ta) == "alpha.Box[Int]")
+    assert(tc_type_str(tb) == "beta.Box[Int]")
+    cleanup()
+}
+
 fn main() {
     test_each_module_owns_its_point()
+    test_generic_instances_of_a_namesake_stay_distinct()
     test_derive_field_check_finds_the_namesake()
     test_cross_assignment_is_a_type_error()
     test_main_file_keeps_the_bare_name()
