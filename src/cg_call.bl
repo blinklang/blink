@@ -484,6 +484,9 @@ fn lower_fn_call(node: Int) -> Int ! Diag.Report {
 // container element) build the same way.
 fn cc_closure_call(node: Int, callee: Int) -> Int ! Diag.Report {
     if callee < 0 { return cc_not_a_callee(node) }
+    if nk_of(node_kind(callee)) == NodeKind.IndexExpr && cc_is_call_site_type_arg(callee) {
+        return cc_call_site_type_arg_call(node)
+    }
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = cc_local(tid, node)
@@ -510,6 +513,30 @@ fn cc_not_a_callee(node: Int) -> Int ! Diag.Report {
     diag_ice_at("MissingCallee", UNSOLVED_TYPEVAR_AT_CODEGEN,
         "a call has no callee to lower", node,
         "typecheck accepts only a call written over some expression; this is a compiler bug")
+    -1
+}
+
+// `f[Int]()`, `scope.alloc[U8]()`: a call written with its own type argument in brackets.
+// The parser has no shape of its own for a call-site type argument, so it reads the
+// bracket exactly as it reads indexing a container, and a real index and a written type
+// name build the identical IndexExpr either way. What tells the two apart is not the node
+// kind but what the written index NAMES: tc_names_a_type is the one answer already
+// published for exactly that question, so reading it here is what keeps this shape from
+// falling into cc_closure_call, which would otherwise lower the bracket as a read of a
+// container element that was never there.
+fn cc_is_call_site_type_arg(callee: Int) -> Bool {
+    let idx = node_index(callee)
+    idx >= 0 && nk_of(node_kind(idx)) == NodeKind.Ident && tc_names_a_type(node_name(idx))
+}
+
+// A call written with its own bracketed type argument. Whether call-site type application
+// belongs in this language at all is still an open question elsewhere, and nothing here
+// takes a side on it: this refuses only because no lowering exists yet either way, so the
+// call never reaches the printer as leaked source text or a fabricated element read.
+fn cc_call_site_type_arg_call(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("CallSiteTypeArgumentNotLowered", UNHANDLED_ITERABLE_AT_CODEGEN,
+        "a call written with its own type argument in brackets has no lowering here", node,
+        "whether call-site type application belongs in this language is still under discussion; codegen does not lower it either way")
     -1
 }
 
@@ -3217,7 +3244,10 @@ fn cc_unhandled(node: Int) -> Int ! Diag.Report {
 // materialize_symbol answers the elements directly, so pair_symbol stays empty; a Map's
 // answers the keys, and pair_symbol names a second entry point that answers the values at
 // the same positions, so reading both at one index is the (K, V) pair element_tid promises.
-pub type ForInStrategy { Indexed, Materialized }
+// Drained: a Channel has no position at all -- sections/04_effects.md's own `for value in
+// ch` reads it by calling recv_symbol once per iteration and stopping the loop the moment
+// it answers "closed and empty", so there is no length to ask for up front.
+pub type ForInStrategy { Indexed, Materialized, Drained }
 
 pub type ForInIteration {
     strategy: ForInStrategy
@@ -3225,6 +3255,7 @@ pub type ForInIteration {
     get_symbol: Str
     materialize_symbol: Str
     pair_symbol: Str
+    recv_symbol: Str
     element_tid: Int
 }
 
@@ -3234,13 +3265,13 @@ pub type ForInIteration {
 // looks empty by coincidence.
 fn cc_for_in_refused() -> ForInIteration {
     ForInIteration { strategy: ForInStrategy.Indexed, len_symbol: "", get_symbol: "",
-        materialize_symbol: "", pair_symbol: "", element_tid: -1 }
+        materialize_symbol: "", pair_symbol: "", recv_symbol: "", element_tid: -1 }
 }
 
 fn cc_for_in_indexed(len_op: Str, get_op: Str, elem: Int) -> ForInIteration {
     ForInIteration { strategy: ForInStrategy.Indexed,
         len_symbol: c_runtime_helper(len_op), get_symbol: c_runtime_helper(get_op),
-        materialize_symbol: "", pair_symbol: "", element_tid: elem }
+        materialize_symbol: "", pair_symbol: "", recv_symbol: "", element_tid: elem }
 }
 
 fn cc_for_in_materialized(materialize_op: Str, pair_op: Str, elem: Int) -> ForInIteration {
@@ -3248,6 +3279,12 @@ fn cc_for_in_materialized(materialize_op: Str, pair_op: Str, elem: Int) -> ForIn
     ForInIteration { strategy: ForInStrategy.Materialized,
         len_symbol: c_runtime_helper("list_len"), get_symbol: c_runtime_helper("list_get"),
         materialize_symbol: c_runtime_helper(materialize_op), pair_symbol: pair,
+        recv_symbol: "", element_tid: elem }
+}
+
+fn cc_for_in_drained(recv_op: Str, elem: Int) -> ForInIteration {
+    ForInIteration { strategy: ForInStrategy.Drained, len_symbol: "", get_symbol: "",
+        materialize_symbol: "", pair_symbol: "", recv_symbol: c_runtime_helper(recv_op),
         element_tid: elem }
 }
 
@@ -3289,5 +3326,6 @@ pub fn for_in_iteration_of(iterable_tid: Int, node: Int) -> ForInIteration ! Dia
     if kind == TyKind.Bytes { return cc_for_in_indexed("bytes_len", "bytes_get", elem) }
     if kind == TyKind.Set { return cc_for_in_materialized("set_to_list", "", elem) }
     if kind == TyKind.Map { return cc_for_in_materialized("map_keys", "map_values", elem) }
+    if kind == TyKind.Channel { return cc_for_in_drained("channel_recv", elem) }
     cc_for_in_not_built(node)
 }
