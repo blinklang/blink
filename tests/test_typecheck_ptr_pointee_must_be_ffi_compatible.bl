@@ -1,0 +1,109 @@
+// sections/07_trust_modules_metadata.md, §9.1.3: a `Ptr[T]` pointee must be one of the
+// FFI-compatible types, and a C record reaches Blink only as an `@ffi.struct`. The typed
+// field pair `p.field.read()` / `p.field.write(v)` is given to `Ptr[@ffi.struct T]` alone.
+//
+// E0810 already says that, but only a parameter or a return type was ever measured
+// against it, so a `let` annotation named any pointee at all. A plain struct behind a
+// pointer then typed `p.f` at the field's own type, which put `read` and `write` on an
+// Int, and the front end passed a program no back end can lower.
+import lower_test_helpers.{probe, probe_but}
+
+fn plain_pointee_let_src() -> Str {
+    #"type Zs { zf: Int }
+
+@trusted(audit: "ptr-pointee-test")
+fn go() ! FFI {
+    with ffi.scope() as scope {
+        let zp: Ptr[Zs] = scope.alloc()
+        zp.zf.write(9)
+        io.println("{zp.zf.read()}")
+    }
+}
+
+fn main() ! FFI { go() }
+"#
+}
+
+fn ffi_struct_pointee_let_src() -> Str {
+    #"@ffi.struct(header: "poll.h", name: "pollfd")
+type Pollfd { fd: I32, events: I16, revents: I16 }
+
+@trusted(audit: "ptr-pointee-test")
+fn go() ! FFI {
+    with ffi.scope() as scope {
+        let p: Ptr[Pollfd] = scope.alloc()
+        p.fd.write(7)
+        io.println("{p.fd.read()}")
+    }
+}
+
+fn main() ! FFI { go() }
+"#
+}
+
+fn scalar_pointee_let_src() -> Str {
+    #"@trusted(audit: "ptr-pointee-test")
+fn go() ! FFI {
+    with ffi.scope() as scope {
+        let p: Ptr[U8] = scope.alloc_n(4)
+        let q: Ptr[Void] = scope.alloc()
+        io.println("{p.is_null()} {q.is_null()}")
+    }
+}
+
+fn main() ! FFI { go() }
+"#
+}
+
+fn plain_pointee_param_src() -> Str {
+    #"type Zs { zf: Int }
+
+@ffi("zs_peek")
+@trusted(audit: "ptr-pointee-test")
+fn zs_peek(p: Ptr[Zs]) -> Int ! FFI { }
+
+fn main() { }
+"#
+}
+
+fn plain_pointee_nested_let_src() -> Str {
+    #"type Zs { zf: Int }
+
+@trusted(audit: "ptr-pointee-test")
+fn go() ! FFI {
+    with ffi.scope() as scope {
+        let zs: List[Ptr[Zs]] = []
+        io.println("{zs.len()}")
+    }
+}
+
+fn main() ! FFI { go() }
+"#
+}
+
+test "a let annotation whose pointee is a plain struct is refused" {
+    let program = probe_but("tc_ptr_pointee_plain_let", plain_pointee_let_src(), "InvalidPtrType")
+    assert(program >= 0)
+}
+
+test "a let annotation whose pointee is an ffi.struct is accepted with its field pair" {
+    let program = probe("tc_ptr_pointee_ffi_struct_let", ffi_struct_pointee_let_src())
+    assert(program >= 0)
+}
+
+test "a let annotation whose pointee is a scalar or Void is accepted" {
+    let program = probe("tc_ptr_pointee_scalar_let", scalar_pointee_let_src())
+    assert(program >= 0)
+}
+
+test "a parameter whose pointee is a plain struct is still refused" {
+    let program = probe_but("tc_ptr_pointee_plain_param", plain_pointee_param_src(), "InvalidPtrType")
+    assert(program >= 0)
+}
+
+// The annotation is walked, not matched at its head: a pointer named inside another type
+// carries the same pointee rule.
+test "a plain struct pointee nested inside a let annotation is refused" {
+    let program = probe_but("tc_ptr_pointee_plain_nested", plain_pointee_nested_let_src(), "InvalidPtrType")
+    assert(program >= 0)
+}
