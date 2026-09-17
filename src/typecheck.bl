@@ -19058,7 +19058,8 @@ fn tc_stamp_type_field_defaults(td: Int) ! TypeCheck.Resolve, TypeCheck.Report, 
                 // declaration, so a node that reads its type from a child — a closure body's
                 // block from its tail — had nothing to read then. Recover the subtree again now
                 // that the check above has typed it.
-                let _ = tc_stamp_walk(dflt)
+                let mut dflt_owner: Map[Int, Int] = Map()
+                let _ = tc_stamp_walk(dflt, dflt_owner)
             }
         }
         i = i + 1
@@ -19086,15 +19087,24 @@ fn tc_stamp_field_default(dflt: Int, ftid: Int) ! TypeCheck.Resolve, TypeCheck.R
 // Post-order over the value children of `node`. Explicitly iterative: the AST is as deep as
 // the source nests, and a recursive walk over the compiler's own longest functions is a
 // stack the recovery pass has no reason to spend.
-fn tc_stamp_walk(root: Int) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+// The assert order, and `owner` filled with the body each node sits in: the nearest enclosing
+// function or test block, or -1 for a node at module level. Both columns come off ONE descent,
+// so a change to how children are enumerated cannot move one and leave the other behind.
+//
+// A closure is not a body here. Its result type may be inferred from its tail, so an absence
+// inside it flows out into the function that holds it, and the fence has to be that function.
+pub fn tc_stamp_walk(root: Int, owner: Map[Int, Int]) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let mut order: List[Int] = []
     if root == -1 { return order }
     let mut seen: Map[Int, Int] = Map()
     let mut stack: List[Int] = [root]
+    let mut owners: List[Int] = [-1]
     while stack.len() > 0 {
         let n = stack.pop().unwrap()
+        let o = owners.pop().unwrap()
         if seen.contains_key(n) { continue }
         seen.insert(n, 1)
+        owner.insert(n, o)
         order.push(n)
         // An `@ffi` declaration's body is never checked — tc_check_fn skips it, and name
         // resolution does not even bind its params — so nothing in it was ever given a type.
@@ -19106,11 +19116,16 @@ fn tc_stamp_walk(root: Int) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, 
         } else {
             -1
         }
+        let nk = node_kind(n)
+        let inner = if nk == NodeKind.FnDef || nk == NodeKind.TestBlock { n } else { o }
         let kids = node_value_child_ids(n)
         let mut i = 0
         while i < kids.len() {
             let kid = kids.get(i).unwrap()
-            if kid != skip_body { stack.push(kid) }
+            if kid != skip_body {
+                stack.push(kid)
+                owners.push(inner)
+            }
             i = i + 1
         }
     }
@@ -19170,32 +19185,6 @@ fn tc_stamp_is_cascade(n: Int) -> Int {
         i = i + 1
     }
     0
-}
-
-// The body each node sits in: the nearest enclosing function or test block, or -1 for a node at
-// module level. Iterative, and over the WHOLE tree including the bodies the recovery walk
-// skips, so every node an unclaimed call can be recorded at has an answer here.
-fn tc_stamp_owner_map(root: Int) -> Map[Int, Int] {
-    let mut owner: Map[Int, Int] = Map()
-    if root == -1 { return owner }
-    let mut stack: List[Int] = [root]
-    let mut owners: List[Int] = [-1]
-    while stack.len() > 0 {
-        let n = stack.pop().unwrap()
-        let o = owners.pop().unwrap()
-        if owner.contains_key(n) { continue }
-        owner.insert(n, o)
-        let k = node_kind(n)
-        let inner = if k == NodeKind.FnDef || k == NodeKind.TestBlock { n } else { o }
-        let kids = node_value_child_ids(n)
-        let mut i = 0
-        while i < kids.len() {
-            stack.push(kids.get(i).unwrap())
-            owners.push(inner)
-            i = i + 1
-        }
-    }
-    owner
 }
 
 // The bodies the stand-down covers: one entry per body that still holds an unclaimed call, and
@@ -19258,7 +19247,8 @@ fn tc_stamp_assert(order: List[Int], owner: Map[Int, Int], stood: Map[Int, Int])
 // Phases 4 and 5 over one program. Separate from check_types so `blink check` and the test
 // harness reach the same pass by the same name.
 pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let order = tc_stamp_walk(program)
+    let mut owner: Map[Int, Int] = Map()
+    let order = tc_stamp_walk(program, owner)
     // A program that already has an error has nodes inference deliberately never typed: the
     // arm that would have typed them reported instead and returned. Asserting there turns
     // every ordinary type error into an internal-compiler-error cascade, so the total-stamp
@@ -19270,11 +19260,9 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     // apart from a real hole — inside the BODY that holds the call. Every other body keeps its
     // claim, so one unclaimed call buys silence for itself and not for the program.
     // Traced rather than silent, so "the pass stood down" is a thing a build can be asked.
-    let mut owner: Map[Int, Int] = Map()
     let mut stood: Map[Int, Int] = Map()
     let live_unclaimed = tc_unresolved_call_count()
     if live_unclaimed > 0 {
-        owner = tc_stamp_owner_map(program)
         stood = tc_stamp_standdown_bodies(owner)
         if dbg_channel_on("stamp") != 0 {
             // The module-level pseudo-body is a key in `stood` but is not a body, so it is not

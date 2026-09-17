@@ -1,0 +1,177 @@
+// A module's private top-level binding is not a candidate for another file's bare name.
+// Items are module-private by default (§10.2), so a reader's own top-level `let` of the same
+// spelling binds, and the private name draws no unselected-import report: neither adding a
+// private name to an import list nor reaching it through a qualifier is legal, so neither is
+// a fix the reader could apply (§10.5). A pub name is unchanged — the import list governs it.
+//
+// The own-declaration rows go through a probe instead of declaring the name in this file.
+// This file is built by the pinned reference compiler, which still binds such a bare name to
+// the imported module's private binding; the probe is checked by the compiler in this tree.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import std.json.{JSON_NULL}
+import std.io
+
+fn compile_only(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    let _rm = process_run("rm", ["-f", path])
+    check_types(program)
+}
+
+fn messages_named(name: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.name == name { out.push(d.message) }
+    }
+    out
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn assert_one_message_containing(label: Str, name: Str, want: Str) {
+    let msgs = messages_named(name)
+    let mut hits = 0
+    for m in msgs {
+        if m.contains(want) { hits = hits + 1 }
+    }
+    if hits != 1 {
+        io.println("FAIL: {label}: want one {name} containing '{want}', got:")
+        for m in msgs { io.println("  {m}") }
+    }
+    assert(hits == 1)
+}
+
+fn assert_no_message_containing(label: Str, want: Str) {
+    for d in diag_entries {
+        if d.message.contains(want) {
+            io.println("FAIL: {label}: a diagnostic offers '{want}': {d.name}: {d.message}")
+            assert(false)
+        }
+    }
+}
+
+// src/ir.bl holds a private `let SPREAD_MISPLACED`, so importing it stands in for any loaded
+// module that uses a name behind its own wall. The compiler import rides along because the
+// lexer and parser read trace globals that compiler.bl owns.
+fn src_own_let_in_fn() -> Str {
+    #"import ir.{ir_reset}
+import compiler.{compile_to_program}
+
+let SPREAD_MISPLACED = "mine"
+
+fn main() {
+    let read = SPREAD_MISPLACED
+    let _keep = [read]
+}
+"#
+}
+
+fn src_own_let_in_test_block() -> Str {
+    #"import ir.{ir_reset}
+import compiler.{compile_to_program}
+
+let SPREAD_MISPLACED = "mine"
+
+test "reads its own binding" {
+    ir_reset()
+    assert_eq(SPREAD_MISPLACED, "mine")
+}
+"#
+}
+
+fn src_foreign_private_let() -> Str {
+    #"import ir.{ir_reset}
+import compiler.{compile_to_program}
+
+fn main() {
+    let read = SPREAD_MISPLACED
+    let _keep = [read]
+}
+"#
+}
+
+fn src_own_let_vs_unselected_pub_let() -> Str {
+    #"import std.json
+
+let JSON_NULL = 7
+
+fn main() {
+    let read = JSON_NULL + 0
+    let _keep = [read]
+}
+"#
+}
+
+fn src_pub_let_unselected() -> Str {
+    #"import std.json
+
+fn main() {
+    let read = JSON_NULL
+    let _keep = [read]
+}
+"#
+}
+
+fn src_pub_let_selected() -> Str {
+    #"import std.json.{JSON_NULL}
+
+fn main() {
+    let read = JSON_NULL
+    let _keep = [read]
+}
+"#
+}
+
+test "a file's own top-level let wins over a private let of the same name in an imported module" {
+    compile_only("own_let_vs_foreign_private_let", src_own_let_in_fn())
+    assert_no_errors("own let SPREAD_MISPLACED")
+}
+
+test "the reader's own top-level let also wins when a test block is what reads it" {
+    compile_only("own_let_read_from_test_block", src_own_let_in_test_block())
+    assert_no_errors("own let read from a test block")
+}
+
+test "another module's private let is a private-access error, never an unselected import" {
+    compile_only("foreign_private_let_bare", src_foreign_private_let())
+    assert_one_message_containing("private SPREAD_MISPLACED", "PrivateItemAccess", "SPREAD_MISPLACED")
+    assert(messages_named("ImportNotSelected").len() == 0)
+    assert_no_message_containing("private SPREAD_MISPLACED", "ir.SPREAD_MISPLACED")
+}
+
+test "a file's own top-level let wins over an unselected pub let of the same name" {
+    compile_only("own_let_vs_unselected_pub_let", src_own_let_vs_unselected_pub_let())
+    assert_no_errors("own let JSON_NULL")
+}
+
+test "a pub let the import did not select still needs the import list or a qualifier" {
+    compile_only("pub_let_unselected", src_pub_let_unselected())
+    assert_one_message_containing("unselected JSON_NULL", "ImportNotSelected", "qualified access 'json.JSON_NULL'")
+}
+
+test "a selected pub let resolves and carries the value its own module gave it" {
+    compile_only("pub_let_selected", src_pub_let_selected())
+    assert_no_errors("selected JSON_NULL")
+    assert_eq(JSON_NULL, 0)
+}
