@@ -34,6 +34,7 @@ import typecheck.{
     tc_struct_field_slots, tc_sfield_name,
     tc_names_a_type, tc_is_sealed_list_hof, is_user_effect_handle_name,
     tc_lookup_node_tid, tc_unclaimed_call_tid, tc_list_rename_help, tc_tid_iter_elem,
+    tc_call_decl_node,
     TYPE_INT, TYPE_BOOL, TYPE_STR,
 }
 import layout.{
@@ -493,6 +494,17 @@ fn lower_fn_call(node: Int) -> Int ! Diag.Report {
     // something else reaches the builtin under its own name regardless.
     let name = cc_declared_name(node_name(callee))
     if is_builtin_fn(name) == 1 { return lower_builtin_free_call(node, name) }
+    // typecheck's own call-site table is read first: it is keyed on this call node rather
+    // than on a spelling, so two modules declaring the same name are told apart the way the
+    // caller's own import list already told them apart, with no re-derived search that could
+    // land on the wrong one. Its one known gap is a name that reaches here only through an
+    // import alias binding no OTHER declaration shares (`nr_resolve_bare_decl` reads
+    // `nr_decls_by_name`, which is keyed on declared spellings, so a pure alias with no
+    // declaration of its own is invisible to it) — a call through `merged` where the import
+    // read `map_merge as merged` and nothing else in the program is named `merged` at all.
+    // That shape still falls back to the alias-resolved name search below.
+    let decl = tc_call_decl_node(node)
+    if decl >= 0 { return cc_free_call(node, decl) }
     cc_free_call(node, cc_fn_anywhere(node, name))
 }
 
@@ -633,9 +645,20 @@ fn cc_call_site_type_arg_call(node: Int) -> Int ! Diag.Report {
 // declared in. The qualifier names no value, so nothing precedes the written arguments,
 // and the declaration is the one that module declares rather than whichever module
 // happens to spell the name.
+//
+// typecheck's own call-site table is read first and is the answer for every ordinary
+// qualified call, the same table a bare call reads. It has one known gap: a qualifier that
+// only re-exports the member (`nr_resolve_qualified_decl` matches the qualifier's own
+// declarations, not a chain of `pub import`s), so a miss here still falls back to naming
+// the member through the flat symbol table rather than refusing a program the front end
+// accepted. The method name is read exactly as written, never through the alias table: a
+// qualified access is never subject to another file's import alias, which only ever
+// renames a bare name inside the file that bound it.
 fn lower_module_call(node: Int, obj: Int) -> Int ! Diag.Report {
+    let decl = tc_call_decl_node(node)
+    if decl >= 0 { return cc_free_call(node, decl) }
     let module_key = tc_qualifier_to_module_or_self(node_name(obj))
-    cc_free_call(node, cc_fn_in_module(node, module_key, cc_declared_name(node_method(node))))
+    cc_free_call(node, cc_fn_in_module(node, module_key, node_method(node)))
 }
 
 // The tail every free-function call shares once its declaration is known. A declaration of
