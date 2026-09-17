@@ -1,0 +1,281 @@
+// The sealed built-in ops traits are the spec's disambiguating spelling for a built-in
+// method: `MapOps.get(m, k)` denotes the same call as `m.get(k)`. They declare no impl, so
+// the qualified resolution arm skips them, and the call then had no type at all — its
+// declared type went uncompared and the node reached codegen with nothing to dispatch on.
+//
+// Two claims here, and they are different claims. A method the front end answers must get
+// the same type through the qualified spelling as through the instance one, so a wrong
+// declared type is caught. A method the front end does NOT answer must draw the same
+// refusal through the qualified spelling as through the instance one — `entries` and
+// `get_or_default` are written in the MapOps trait but nothing implements them, so the
+// instance spelling reports UnresolvedMethod while the qualified spelling used to pass
+// `blink check` with a warning claiming the receiver's type was unknown. It was known, and
+// it was the very thing that refuses the method.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
+import parser.{nodes, node_kind, node_method, node_obj, node_name}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn error_names() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push(d.name) }
+    }
+    out
+}
+
+fn count_errors(name: Str) -> Int {
+    let mut n = 0
+    for e in error_names() {
+        if e == name { n = n + 1 }
+    }
+    n
+}
+
+fn assert_no_errors(label: Str) {
+    let names = error_names()
+    if names.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for n in names { io.println("  {n}") }
+    }
+    assert(names.len() == 0)
+}
+
+// The one MethodCall spelled `trait_name.method(..)`. The node arena holds the whole
+// program, the stdlib included, so a bare method name like `get` matches hundreds of
+// instance calls — the qualifier is what makes the measurement unambiguous. -2 marks an
+// ambiguous one anyway, so the row fails rather than reading whichever came last.
+fn only_qualified_call(trait_name: Str, method: Str) -> Int {
+    let mut found = -1
+    let mut hits = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.MethodCall && node_method(i) == method {
+            let recv = node_obj(i)
+            if recv != -1 && node_kind(recv) == NodeKind.Ident && node_name(recv) == trait_name {
+                hits = hits + 1
+                found = i
+            }
+        }
+        i = i + 1
+    }
+    if hits > 1 { return -2 }
+    found
+}
+
+fn tid_str(t: Int) -> Str ! Diag.Report {
+    if t < 0 { return "<unset>" }
+    tc_type_str(t)
+}
+
+fn assert_tid(label: Str, t: Int, want: Str) ! Diag.Report {
+    let got = tid_str(t)
+    if got != want { io.println("FAIL: {label}: tid is {got}, want {want}") }
+    assert(got == want)
+}
+
+fn wrong_declared_src() -> Str {
+    #"
+import std.traits.{MapOps, ListOps, StrOps}
+fn main() {
+    let mut m: Map[Str, Int] = Map()
+    MapOps.insert(m, "k", 42)
+    let xs: List[Int] = [1]
+    let s = "hay"
+    let bad1: Bool = MapOps.get(m, "k")
+    let bad2: Str = ListOps.get(xs, 0)
+    let bad3: Str = StrOps.contains(s, "a")
+}
+"#
+}
+
+test "a qualified sealed-ops call answers with a type, so a wrong declared type is caught" {
+    typecheck_probe("build/tc_ops_qual_wrong.bl", wrong_declared_src())
+    // One per binding, and no more: the answer must not also draw a derived error about a
+    // type the program never had.
+    assert(count_errors("TypeError") == 3)
+    assert(count_errors("UnresolvedMethod") == 0)
+}
+
+fn right_declared_src() -> Str {
+    #"
+import std.traits.{MapOps, ListOps, StrOps, SetOps}
+fn main() {
+    let mut m: Map[Str, Int] = Map()
+    MapOps.insert(m, "k", 42)
+    let xs: List[Int] = [1]
+    ListOps.push(xs, 2)
+    let mut st: Set[Int] = Set()
+    let s = "hay"
+    let ok1: Option[Int] = MapOps.get(m, "k")
+    let ok2: Option[Int] = ListOps.get(xs, 0)
+    let ok3: Bool = StrOps.contains(s, "a")
+    let ok4: List[Str] = MapOps.keys(m)
+    let ok5: Bool = SetOps.insert(st, 3)
+    let ok6: Int = MapOps.len(m)
+}
+"#
+}
+
+test "the well-typed qualified spellings stay accepted across the sealed traits" {
+    typecheck_probe("build/tc_ops_qual_right.bl", right_declared_src())
+    assert_no_errors("well-typed qualified ops calls")
+}
+
+fn map_get_src() -> Str {
+    #"
+import std.traits.{MapOps}
+fn main() {
+    let mut m: Map[Str, Int] = Map()
+    MapOps.insert(m, "k", 42)
+    let ok: Option[Int] = MapOps.get(m, "k")
+}
+"#
+}
+
+test "the qualified MapOps.get node carries the receiver's value type inside an Option" {
+    typecheck_probe("build/tc_ops_qual_mapget.bl", map_get_src())
+    assert_no_errors("MapOps.get stamping")
+    let c = only_qualified_call("MapOps", "get")
+    assert(c >= 0)
+    assert_tid("MapOps.get node", tc_lookup_node_tid(c), "Option[Int]")
+}
+
+fn list_get_src() -> Str {
+    #"
+import std.traits.{ListOps}
+fn main() {
+    let xs: List[Str] = ["a"]
+    let ok: Option[Str] = ListOps.get(xs, 0)
+}
+"#
+}
+
+test "the qualified ListOps.get node carries the receiver's element type inside an Option" {
+    typecheck_probe("build/tc_ops_qual_listget.bl", list_get_src())
+    assert_no_errors("ListOps.get stamping")
+    let c = only_qualified_call("ListOps", "get")
+    assert(c >= 0)
+    assert_tid("ListOps.get node", tc_lookup_node_tid(c), "Option[Str]")
+}
+
+fn unanswered_src() -> Str {
+    #"
+import std.traits.{MapOps}
+fn main() {
+    let mut m: Map[Str, Int] = Map()
+    MapOps.insert(m, "k", 42)
+    let bad: Bool = MapOps.entries(m)
+}
+"#
+}
+
+// `entries` is written in the MapOps trait and implemented nowhere, so the instance
+// spelling `m.entries()` is a hard UnresolvedMethod. The qualified spelling has to agree:
+// a warning that let it reach the C compiler is the fail-open this file closes.
+test "a qualified sealed-ops method the front end does not answer is refused, not warned" {
+    typecheck_probe("build/tc_ops_qual_entries.bl", unanswered_src())
+    assert(count_errors("UnresolvedMethod") == 1)
+    // The refusal is the whole report: a poisoned answer must not also draw a declared-type
+    // error about the Bool, which is a type the call never had.
+    assert(count_errors("TypeError") == 0)
+}
+
+fn unanswered_default_src() -> Str {
+    #"
+import std.traits.{MapOps}
+fn main() {
+    let mut m: Map[Str, Int] = Map()
+    MapOps.insert(m, "k", 42)
+    let bad: Bool = MapOps.get_or_default(m, "k", 0)
+}
+"#
+}
+
+test "the other unimplemented MapOps method is refused through the qualified spelling too" {
+    typecheck_probe("build/tc_ops_qual_getdefault.bl", unanswered_default_src())
+    assert(count_errors("UnresolvedMethod") == 1)
+    assert(count_errors("TypeError") == 0)
+}
+
+fn undetermined_receiver_src() -> Str {
+    #"
+import std.traits.{ListOps}
+fn take(xs: List[Int]) {
+    let _ = ListOps.get(xs, 0)
+}
+fn main() {
+    take([1])
+}
+"#
+}
+
+// The refusal is gated on the receiver's type being determined, the same gate the instance
+// arm uses. A receiver whose type is still open must not be refused: nothing has decided
+// yet what its surface is.
+test "a qualified ops call on a determined receiver of a covered method is left alone" {
+    typecheck_probe("build/tc_ops_qual_open.bl", undetermined_receiver_src())
+    assert_no_errors("covered method on a determined receiver")
+}
+
+fn paired_src() -> Str {
+    #"
+import std.traits.{MapOps}
+fn main() {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("k", 1)
+    let inst: Str = m.remove("k")
+    let qual: Str = MapOps.remove(m, "k")
+}
+"#
+}
+
+// The principle behind both claims above, asserted on its own so a future table row that
+// disagrees with the instance arm is caught by something other than reading both tables.
+// The two spellings denote one call, so they answer alike: the same wrong declared type
+// draws the same report through each, naming the same type.
+test "the instance and qualified spellings of one sealed-ops call answer alike" {
+    typecheck_probe("build/tc_ops_qual_paired.bl", paired_src())
+    assert(count_errors("TypeError") == 2)
+    let mut both = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.message.contains("got Option[Int]") { both = both + 1 }
+    }
+    assert(both == 2)
+}
+
+fn paired_refusal_src() -> Str {
+    #"
+import std.traits.{MapOps}
+fn main() {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("k", 1)
+    let a = m.entries()
+    let b = MapOps.entries(m)
+}
+"#
+}
+
+// And they refuse alike. Before the qualified refusal existed this row read one error, not
+// two: the instance spelling was rejected and the qualified one reached the C compiler.
+test "the instance and qualified spellings of an unanswered sealed-ops call refuse alike" {
+    typecheck_probe("build/tc_ops_qual_paired_refuse.bl", paired_refusal_src())
+    assert(count_errors("UnresolvedMethod") == 2)
+    let mut named = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.message.contains("on type Map[Str, Int]") { named = named + 1 }
+    }
+    assert(named == 2)
+}

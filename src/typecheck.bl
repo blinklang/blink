@@ -1946,19 +1946,14 @@ fn tc_pin_ops_trait_receiver(trait_name: Str, method: Str, args_sl: Int) ! TypeC
 // (`MapOps.get(m, k).unwrap()`) then reached codegen with no type to dispatch on.
 //
 // The qualified spelling denotes the same call as `m.get(k)`, so it answers with the
-// same type, read off the receiver at args[0]. Only the ANSWER is given here — the
-// checks the instance arms make are not repeated, so this adds a type where there was
-// none and rejects nothing that compiles today. It therefore does not close the gaps
-// the qualified spelling already had: the trait qualifier goes unverified, arity goes
-// unchecked, and a receiver the instance arm would refuse still passes. Declines with
-// -1 for anything outside the sealed method surface.
-fn tc_ops_trait_qualified_ret(method: Str, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if args_sl == -1 || sublist_length(args_sl) < 1 { return -1 }
-    // Only the receiver is inferred here. infer_type sweeps this call's still-untyped
-    // arguments itself once this answer returns, and inference is uncached — a second
-    // walk of an already-typed argument re-runs its reports and re-mints the metavars
-    // an empty literal binds.
-    let recv = tc_resolve(infer_type(sublist_get(args_sl, 0)))
+// same type, read off the receiver the caller inferred. Only the ANSWER is given here —
+// the checks the instance arms make are not repeated. Two of the gaps that leaves are
+// still open: the trait qualifier goes unverified, so `ListOps.get(m, k)` on a Map is
+// answered by the Map row, and arity goes unchecked. The third is closed next door:
+// tc_ops_trait_qualified_unresolved refuses a method the instance arm would refuse, so
+// declining here no longer means the call passes. Declines with -1 for anything outside
+// the sealed method surface.
+fn tc_ops_trait_qualified_ret(method: Str, recv: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let k = type_kind(recv)
     // `len` and `is_empty` are the two every sized receiver answers; `count` is List's
     // alone and `capacity` StringBuilder's, exactly as the instance arms below have them.
@@ -2015,6 +2010,32 @@ fn tc_ops_trait_qualified_ret(method: Str, args_sl: Int) -> Int ! TypeCheck.Reso
         if method == "to_str" { return TYPE_STR }
     }
     -1
+}
+
+// A qualified sealed-Ops call the return table above declined, judged the way the INSTANCE
+// spelling judges it. `MapOps.get_or_default(m, k, d)` denotes the same call as
+// `m.get_or_default(k, d)`, which is a hard UnresolvedMethod: the method is written in the
+// trait the spec gives Map, and nothing in the front end answers it. Through the qualified
+// spelling that same call used to pass `blink check` carrying a warning that the receiver's
+// type was not known — it was known, and it was the very thing that refuses the method.
+//
+// Both gates are the instance arm's own, so this refuses exactly what that arm refuses. A
+// receiver whose type is not yet determined keeps its silence, because nothing has decided
+// its surface yet; and a method that IS on the receiver's surface is not refused here just
+// because the table above has no row for that receiver kind, which keeps the table free to
+// decline without turning every gap into an error.
+//
+// Poisons the answer rather than leaving it absent, so a declared type over the call unifies
+// with the recovery tid instead of drawing a second, derived error about a type the program
+// never had. Declines with -1, which the caller reads as "not mine".
+fn tc_ops_trait_qualified_unresolved(method: Str, recv: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let k = type_kind(recv)
+    if tc_recv_type_is_determined(k, recv) == 0 { return -1 }
+    if tc_method_unavailable_on_receiver(k, method) == 0 { return -1 }
+    let tname = type_to_str(recv)
+    tc_unresolved_method_hard.insert(node, 1)
+    diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method '.{method}' on type {tname}", node, tc_unresolved_method_help(k, tname, method))
+    tc_error_recovery_tid()
 }
 
 // The receivers that answer `Sized`. Anything else declines, so a sized method on a
@@ -14883,9 +14904,19 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // element metavar(s) from the payload args so `let m = Map();
             // MapOps.insert(m,"k",42)` infers Map[Str,Int] rather than E0301.
             if is_sealed_builtin_trait(obj_name) != 0 {
-                tc_pin_ops_trait_receiver(obj_name, method, node_args(node))
-                let ops_ret = tc_ops_trait_qualified_ret(method, node_args(node))
-                if ops_ret != -1 { return ops_ret }
+                let ops_args = node_args(node)
+                tc_pin_ops_trait_receiver(obj_name, method, ops_args)
+                if ops_args != -1 && sublist_length(ops_args) >= 1 {
+                    // Inferred ONCE here and handed to both the answer and the refusal.
+                    // Inference is uncached, so a second walk of the receiver re-runs its
+                    // reports and re-mints the metavars an empty literal binds. The call's
+                    // remaining arguments are swept by infer_type once this answer returns.
+                    let ops_recv = tc_resolve(infer_type(sublist_get(ops_args, 0)))
+                    let ops_ret = tc_ops_trait_qualified_ret(method, ops_recv)
+                    if ops_ret != -1 { return ops_ret }
+                    let ops_refused = tc_ops_trait_qualified_unresolved(method, ops_recv, node)
+                    if ops_refused != -1 { return ops_refused }
+                }
             }
             if obj_name == "Char" {
                 if method == "from_code_point" {
@@ -16753,10 +16784,21 @@ fn tc_walk_stmt_value(val: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
 
 // An assignment right-hand side: expression context (§2.9), so an else-less `if` (no value on
 // the false path) is rejected, then walked like any other statement value.
+//
+// Inferred under the TARGET's type as its construction hint, the same channel a let annotation
+// opens and for the same reason. A value with no type of its own is the only kind that reads
+// the hint — the arena allocators name their pointee from nothing else, so `p = scope.alloc_n(4)`
+// had no pointee at all while this site was missing — and a value that has its own type is
+// unaffected, so the caller's compare still fires on a disagreement. Only the inference runs
+// under the hint, as at the let site: the body walk that follows types nested constructs
+// against their own expectations, not against this statement's.
 // @allow: as tc_walk_stmt_value.
 @allow(UnrestoredMutation)
-fn tc_infer_assigned_value(val: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_infer_assigned_value(target_t: Int, val: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let saved_hint = tc_construct_hint
+    if tc_tid_is_no_info(target_t) == 0 { tc_construct_hint = resolve_alias_tid(target_t) }
     let t = tc_infer_value(val)
+    tc_construct_hint = saved_hint
     tc_walk_stmt_value(val)
     t
 }
@@ -17122,7 +17164,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let val = node_value(node)
         if target != -1 && val != -1 {
             let target_t = infer_type(target)
-            let val_t = tc_infer_assigned_value(val)
+            let val_t = tc_infer_assigned_value(target_t, val)
             if kind == NodeKind.CompoundAssign {
                 reject_non_numeric_arith_operand(node_op(node), target_t, node, 0)
                 reject_non_numeric_arith_operand(node_op(node), val_t, node, 0)
