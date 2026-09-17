@@ -1,0 +1,192 @@
+// sections/03c_protocols.md, "No Inherent Methods": a type-specific operation is written as
+// a trait and an impl, and the section's own example is `impl Parse for Str` — a user trait
+// on a builtin receiver. "Built-in Type Method Dispatch" seals the compiler-known surfaces
+// of Str/List/Map/Set/Bytes/StringBuilder/Instant/Duration/Iterator against reimplementation;
+// it does not withhold a NEW trait from a builtin, and Int is not in that list at all.
+//
+// So typecheck is right to accept the call. What it did not do is say WHICH declaration the
+// call reached: nr_note_call_decl had two callers, a bare call and a module-qualified call,
+// and an instance method resolved through an impl recorded nothing. A later stage handed a
+// method name and a receiver kind cannot re-derive the answer, because the same method name
+// may be implemented for several receivers.
+import compiler.{compile_to_program}
+import typecheck.{tc_call_decl_node, check_types}
+import diagnostics.{diag_entries, diag_reset}
+import parser.{
+    nodes, node_kind, node_name, node_obj, node_method, node_methods,
+    sublist_length, sublist_get,
+}
+import ast.{NodeKind}
+import std.io
+
+// lower_test_helpers' probe binds every local of the probe source in ONE frame, and two
+// impls each bind `self`. So the source is compiled and checked directly here: this test
+// reads what type checking recorded, and needs no lowering frame at all.
+fn probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            io.println("FAIL: {stem}: unexpected {d.severity}: {d.name}: {d.message}")
+            assert(false)
+        }
+    }
+    program
+}
+
+// The diagnostic names a source draws, joined. Used where the point is that a source is
+// REFUSED, so the probe above would assert the opposite of the claim.
+fn probe_diag_names(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out = "{out}{d.name} " }
+    }
+    out.trim()
+}
+
+fn two_impls_src() -> Str {
+    #"trait Doubler {
+    fn dbl(self) -> Int
+}
+
+impl Doubler for Int {
+    fn dbl(self) -> Int { self * 2 }
+}
+
+impl Doubler for Float {
+    fn dbl(self) -> Int { 7 }
+}
+
+fn main() {
+    let x = 21
+    let f = 1.5
+    let a = x.dbl()
+    let b = f.dbl()
+    io.println("{a} {b}")
+}
+"#
+}
+
+// The result is bound to a Str. The impl returns Int, so the binding is wrong and has to be
+// refused. A call that reached no arm is typed as unknown instead, and unknown satisfies every
+// annotation, so this same source is accepted — which is the shape of the whole divergence.
+fn result_bound_to_wrong_type_src() -> Str {
+    #"trait Doubler {
+    fn dbl(self) -> Int
+}
+
+impl Doubler for Int {
+    fn dbl(self) -> Int { self * 2 }
+}
+
+fn main() {
+    let x = 21
+    let a: Str = x.dbl()
+    io.println("{a}")
+}
+"#
+}
+
+fn len_call_src() -> Str {
+    #"fn main() {
+    let s = "abc"
+    let n = s.len()
+    io.println("{n}")
+}
+"#
+}
+
+// The method call whose receiver is the local named `recv`.
+fn call_on(recv: Str, method: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.MethodCall && node_method(i) == method {
+            let obj = node_obj(i)
+            if obj != -1 && node_kind(obj) == NodeKind.Ident && node_name(obj) == recv { return i }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+// The method named `method` declared by the impl whose target type is `target`.
+fn impl_method_of(program: Int, target: Str, method: Str) -> Int {
+    let impls_sl = node_methods(program)
+    if impls_sl == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(impls_sl) {
+        let im = sublist_get(impls_sl, i)
+        if node_name(im) == target {
+            let ms = node_methods(im)
+            if ms != -1 {
+                let mut j = 0
+                while j < sublist_length(ms) {
+                    let m = sublist_get(ms, j)
+                    if node_name(m) == method { return m }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn assert_records(label: Str, call: Int, want: Int) {
+    if call < 0 { io.println("FAIL: {label}: no call node found") }
+    assert(call >= 0)
+    if want < 0 { io.println("FAIL: {label}: the probe declares no such impl method") }
+    assert(want >= 0)
+    let got = tc_call_decl_node(call)
+    if got != want {
+        io.println("FAIL: {label}: call records declaration {got}, want {want}")
+    }
+    assert(got == want)
+}
+
+test "a call through an impl on a builtin records that impl's method declaration" {
+    let program = probe("tc_impl_builtin_decl", two_impls_src())
+    assert(program >= 0)
+    assert_records("Int", call_on("x", "dbl"), impl_method_of(program, "Int", "dbl"))
+}
+
+// The same method name is implemented for two builtins. The receiver is the only thing that
+// tells the two declarations apart, so a record keyed on the name alone would answer one of
+// them for both calls.
+test "a second impl of the same method name records its own declaration" {
+    let program = probe("tc_impl_builtin_decl_two", two_impls_src())
+    assert(program >= 0)
+    assert_records("Float", call_on("f", "dbl"), impl_method_of(program, "Float", "dbl"))
+}
+
+// The recorded answer is a DECLARATION. A sealed builtin surface is not one, so it stays -1
+// and a reader can still tell "resolved to a declaration" from "resolved elsewhere".
+test "a sealed builtin method records no declaration" {
+    let program = probe("tc_impl_builtin_len", len_call_src())
+    assert(program >= 0)
+    let call = call_on("s", "len")
+    assert(call >= 0)
+    let got = tc_call_decl_node(call)
+    if got != -1 { io.println("FAIL: len records declaration {got}, want -1") }
+    assert(got == -1)
+}
+
+// The declaration record is the mechanism; the return type is what a program sees. The same
+// arm produces both, so this reads the half a program can observe.
+test "a call through an impl on a builtin is typed by that impl's return type" {
+    let names = probe_diag_names("tc_impl_builtin_ret", result_bound_to_wrong_type_src())
+    if names != "TypeError" { io.println("FAIL: wrong-type binding drew '{names}', want 'TypeError'") }
+    assert(names == "TypeError")
+}
