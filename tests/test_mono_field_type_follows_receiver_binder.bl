@@ -1,0 +1,116 @@
+import std.fs
+import std.io
+import typecheck.{check_types, tc_type_str}
+import mono.{run_mono, instances, node_tid_for_inst, MonoInstance}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind, nk_of}
+import compiler.{compile_to_program}
+
+// The declaring type and the using function each spell a binder `T`/`U`, and the using
+// function binds them to different types. A field's type must follow the binder of the
+// type that DECLARES the field, carried through the receiver's type argument -- never the
+// same-spelled binder of the function that reads the field.
+fn probe_src() -> Str {
+    #"type Box[T] { val: T }
+type Crate[T] { items: List[T] }
+fn field_of[T, U](b: Box[U], x: T) -> U { b.val }
+fn items_of[T, U](c: Crate[U], x: T) -> List[U] { c.items }
+fn id[T](x: T) -> T { x }
+fn id_of[T, U](b: Box[U], x: T) -> U { id(b.val) }
+fn main() {
+    let b = Box { val: "s" }
+    let c = Crate { items: ["s"] }
+    assert(field_of(b, 1) == "s")
+    assert(items_of(c, 1).len() == 1)
+    assert(id_of(b, 1) == "s")
+}
+"#
+}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// The parser numbers a body before the FnDef node that owns it, so the body node of
+// `decl` is the nearest node of `kind` below the declaration's own id.
+fn find_kind_before(kind: NodeKind, decl: Int) -> Int {
+    let mut i = decl - 1
+    while i >= 0 {
+        if nk_of(node_kind(i)) == kind { return i }
+        i = i - 1
+    }
+    -1
+}
+
+fn assert_type(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn only_instance_of(decl: Int) -> MonoInstance {
+    let mut out: List[MonoInstance] = []
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(inst) }
+    }
+    if out.len() != 1 {
+        io.println("FAIL: expected 1 instance of decl {decl}, got {out.len()}")
+    }
+    assert_eq(out.len(), 1)
+    out.get(0).unwrap()
+}
+
+fn build_probe(path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+    program
+}
+
+test "scalar field reads through the receiver's type argument" {
+    let _ = build_probe("build/mono_field_binder_scalar_probe.bl")
+    let f = find_fn("field_of")
+    assert(f >= 0)
+    let fa = find_kind_before(NodeKind.FieldAccess, f)
+    assert(fa >= 0)
+    let inst = only_instance_of(f)
+    assert_type("field_of signature", tc_type_str(inst.inst_tid), "Fn(Box[Str], Int) -> Str")
+    assert_type("b.val", tc_type_str(node_tid_for_inst(inst, fa)), "Str")
+}
+
+test "list-typed field reads through the receiver's type argument" {
+    let _ = build_probe("build/mono_field_binder_list_probe.bl")
+    let f = find_fn("items_of")
+    assert(f >= 0)
+    let fa = find_kind_before(NodeKind.FieldAccess, f)
+    assert(fa >= 0)
+    let inst = only_instance_of(f)
+    assert_type("items_of signature", tc_type_str(inst.inst_tid), "Fn(Crate[Str], Int) -> List[Str]")
+    assert_type("c.items", tc_type_str(node_tid_for_inst(inst, fa)), "List[Str]")
+}
+
+// A wrong field type does not stop at the node table: it decides which instance of the
+// callee the argument reaches, so the call would be lowered to a monomorphic function of
+// the wrong type.
+test "a generic call taking the field reaches the field's own instance" {
+    let _ = build_probe("build/mono_field_binder_callee_probe.bl")
+    let idf = find_fn("id")
+    assert(idf >= 0)
+    let inst = only_instance_of(idf)
+    assert_type("id instance", tc_type_str(inst.inst_tid), "Fn(Str) -> Str")
+}
+
+test "the body's own tid agrees with the instance signature's return" {
+    let _ = build_probe("build/mono_field_binder_body_probe.bl")
+    let f = find_fn("field_of")
+    let body = find_kind_before(NodeKind.Block, f)
+    assert(body >= 0)
+    let inst = only_instance_of(f)
+    assert_type("field_of body", tc_type_str(node_tid_for_inst(inst, body)), "Str")
+}

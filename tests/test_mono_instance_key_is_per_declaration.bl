@@ -1,0 +1,172 @@
+import std.fs
+import std.io
+import typecheck.{check_types, tc_type_str}
+import mono.{run_mono, instances, node_tid_for_inst, MonoInstance}
+import parser.{nodes, node_kind, node_name, node_methods, node_trait_name, sublist_get, sublist_length}
+import ast.{NodeKind, nk_of}
+import compiler.{compile_to_program}
+
+// One program holding every instance shape the pass registers: a generic function
+// instantiated twice, a generic struct reached through it, and a per-element impl on
+// List. An instance is identified by its declaration node together with its argument
+// tuple, and the recorded node types hang off that identity, so two instances of one
+// body must answer the same body node differently.
+fn probe_src() -> Str {
+    #"type Box[T] { val: T }
+trait Tagged[T] {
+    fn first_tag(self) -> T
+}
+impl[T] Tagged[T] for List[T] {
+    fn first_tag(self) -> T { self.get(0).unwrap() }
+}
+fn wrap[T](x: T) -> Box[T] { Box { val: x } }
+fn main() {
+    let bi = wrap(1)
+    let bs = wrap("s")
+    assert(bi.val == 1)
+    assert(bs.val == "s")
+    assert([1, 2].first_tag() == 1)
+    assert(["a"].first_tag() == "a")
+}
+"#
+}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// The impl block's own method node, which is a different FnDef from the same-named
+// declaration in the trait.
+fn find_impl_method(trait_name: Str, method: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.ImplBlock && node_trait_name(i) == trait_name {
+            let ms = node_methods(i)
+            let mut j = 0
+            while j < sublist_length(ms) {
+                let m = sublist_get(ms, j)
+                if node_name(m) == method { return m }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn find_type_def(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.TypeDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// The parser numbers a body before the FnDef node that owns it, so the body node of
+// `decl` is the nearest node of `kind` below the declaration's own id.
+fn find_kind_before(kind: NodeKind, decl: Int) -> Int {
+    let mut i = decl - 1
+    while i >= 0 {
+        if nk_of(node_kind(i)) == kind { return i }
+        i = i - 1
+    }
+    -1
+}
+
+fn instances_of(decl: Int) -> List[MonoInstance] {
+    let mut out: List[MonoInstance] = []
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(inst) }
+    }
+    out
+}
+
+fn type_strs(decl: Int, node: Int) -> List[Str] ! Diag.Report {
+    let mut out: List[Str] = []
+    for inst in instances_of(decl) {
+        out.push(tc_type_str(node_tid_for_inst(inst, node)))
+    }
+    out
+}
+
+fn has(xs: List[Str], want: Str) -> Bool {
+    for x in xs {
+        if x == want { return true }
+    }
+    false
+}
+
+fn build_probe() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/mono_instance_key_probe.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+}
+
+test "no two instances share one declaration-and-arguments identity" {
+    build_probe()
+    let all = instances()
+    assert(all.len() >= 5)
+    let mut seen: Map[Str, Int] = Map()
+    for inst in all {
+        let key = "{inst.base_decl_node}/{inst.arg_tids}"
+        if seen.contains_key(key) {
+            io.println("FAIL: two instances share the identity {key}: {inst.c_name}")
+        }
+        assert(!seen.contains_key(key))
+        seen.insert(key, 1)
+    }
+}
+
+test "two instances of one body answer the same node differently" {
+    build_probe()
+    let wrap = find_fn("wrap")
+    assert(wrap >= 0)
+    let lit = find_kind_before(NodeKind.StructLit, wrap)
+    assert(lit >= 0)
+    let strs = type_strs(wrap, lit)
+    assert_eq(strs.len(), 2)
+    assert(has(strs, "Box[Int]"))
+    assert(has(strs, "Box[Str]"))
+}
+
+test "a poly-impl method instance is keyed on the method, not the impl's receiver type" {
+    build_probe()
+    let m = find_impl_method("Tagged", "first_tag")
+    let box_decl = find_type_def("Box")
+    assert(m >= 0)
+    assert(box_decl >= 0)
+    assert(m != box_decl)
+    let insts = instances_of(m)
+    assert_eq(insts.len(), 2)
+    for inst in insts {
+        assert_eq(inst.base_decl_node, m)
+    }
+    let mut sigs: List[Str] = []
+    for inst in insts {
+        sigs.push(tc_type_str(inst.inst_tid))
+    }
+    assert(has(sigs, "Fn(List[Int]) -> Int"))
+    assert(has(sigs, "Fn(List[Str]) -> Str"))
+}
+
+test "the struct instances reached through the generic body stay separate" {
+    build_probe()
+    let box_decl = find_type_def("Box")
+    let insts = instances_of(box_decl)
+    assert_eq(insts.len(), 2)
+    let mut args: List[Str] = []
+    for inst in insts {
+        args.push(tc_type_str(inst.arg_tids))
+    }
+    assert(has(args, "(Int)"))
+    assert(has(args, "(Str)"))
+}
