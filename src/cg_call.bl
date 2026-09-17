@@ -33,6 +33,7 @@ import typecheck.{
     tc_enum_variant_slots, tc_evar_name, tc_tid_child_count,
     tc_struct_field_slots, tc_sfield_name,
     tc_names_a_type, tc_is_sealed_list_hof, is_user_effect_handle_name,
+    tc_lookup_node_tid, tc_unclaimed_call_tid, tc_list_rename_help, tc_tid_iter_elem,
     TYPE_INT, TYPE_BOOL, TYPE_STR,
 }
 import layout.{
@@ -62,9 +63,10 @@ import cg_stmt.{lower_block_into}
 import cg_eff.{cg_eff_ev_argument, cg_eff_lower_builtin_perform, cg_eff_lower_user_perform}
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
 import diagnostics.{
-    Diag, diag_ice_at, diag_ice_stage_not_built, diag_file_for_node, diag_source_file,
+    Diag, diag_ice_at, diag_ice_stage_not_built, diag_error_at, diag_file_for_node, diag_source_file,
     diag_is_ice_seg,
-    CODEGEN_STAGE_NOT_BUILT, UNSOLVED_TYPEVAR_AT_CODEGEN,
+    CODEGEN_STAGE_NOT_BUILT, UNSOLVED_TYPEVAR_AT_CODEGEN, UNRESOLVED_METHOD,
+    UNHANDLED_ITERABLE_AT_CODEGEN,
 }
 
 // The trait whose synthesized dispatcher renders a value into a string, the two traits
@@ -111,11 +113,34 @@ let NO_RECEIVER = -1
 // Every call the language spells: a free function, an impl method, and the qualified
 // forms of both. cg_expr lowers the carrier constructors itself and hands over the rest.
 pub fn lower_call(node: Int) -> Int ! Diag.Report {
+    if nk_of(node_kind(node)) == NodeKind.MethodCall && tc_lookup_node_tid(node) == tc_unclaimed_call_tid() {
+        return cc_unclaimed_method_call(node)
+    }
     match nk_of(node_kind(node)) {
         NodeKind.Call => lower_fn_call(node)
         NodeKind.MethodCall => lower_method_call(node)
         _ => cc_unhandled(node)
     }
+}
+
+// A method call no arm of inference claimed: typecheck's total-stamp pass stands the whole
+// program down about it on purpose (src/typecheck.bl: tc_mark_unclaimed_call), keyed on the
+// call node's own tid reading back tc_unclaimed_call_tid(). Nothing upstream of codegen ever
+// names the receiver or the method for this node, so this is the one place that still can —
+// the dispatch chain below this guard reads intrinsic tables and impl lists keyed on a
+// method name it has never heard of, and would otherwise fall through every one of them into
+// an unbuilt-method ICE that names no method at all. This backstop reports the same E0505 a
+// receiver typecheck could fully determine would have reported, and refuses before any of
+// that dispatch runs, so nothing here is ever lowered for a call that carries no type.
+fn cc_unclaimed_method_call(node: Int) -> Int ! Diag.Report {
+    let obj = node_obj(node)
+    let mname = node_method(node)
+    let recv_tid = tid_of_node(obj)
+    if recv_tid < 0 { return -1 }
+    let tname = tc_type_str(recv_tid)
+    diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD,
+        "unresolved method '.{mname}' on type {tname}", node, tc_list_rename_help(mname))
+    -1
 }
 
 // `a == b` on a struct or data enum operand: C's own operators do not compare an
@@ -3179,4 +3204,90 @@ fn cc_unhandled(node: Int) -> Int ! Diag.Report {
         "call kind {node_kind_name(node_kind(node))} has no lowering", node,
         "every call kind the parser produces needs an arm in lower_call")
     -1
+}
+
+// ── For-in iteration ─────────────────────────────────────────────────────────
+
+// Indexed: a loop over `iterable_tid` calls len_symbol once, then get_symbol at every
+// position from 0 up to it -- List and Bytes both keep every element in one run the
+// runtime already walks by position, and neither needs anything converted first.
+// Materialized: the container has no by-position read of its own (a Map and a Set both
+// address their storage by hash, not by position), so a loop reads materialize_symbol
+// once to get a List, then walks THAT list by len_symbol/get_symbol instead. A Set's
+// materialize_symbol answers the elements directly, so pair_symbol stays empty; a Map's
+// answers the keys, and pair_symbol names a second entry point that answers the values at
+// the same positions, so reading both at one index is the (K, V) pair element_tid promises.
+pub type ForInStrategy { Indexed, Materialized }
+
+pub type ForInIteration {
+    strategy: ForInStrategy
+    len_symbol: Str
+    get_symbol: Str
+    materialize_symbol: Str
+    pair_symbol: Str
+    element_tid: Int
+}
+
+// A shape nothing above ever answers with: every symbol empty, an element_tid no real
+// type is ever given (-1), so a caller that forgets to check for a refusal reads a Str
+// field back as "" and a tid field back as unspellable rather than an answer that merely
+// looks empty by coincidence.
+fn cc_for_in_refused() -> ForInIteration {
+    ForInIteration { strategy: ForInStrategy.Indexed, len_symbol: "", get_symbol: "",
+        materialize_symbol: "", pair_symbol: "", element_tid: -1 }
+}
+
+fn cc_for_in_indexed(len_op: Str, get_op: Str, elem: Int) -> ForInIteration {
+    ForInIteration { strategy: ForInStrategy.Indexed,
+        len_symbol: c_runtime_helper(len_op), get_symbol: c_runtime_helper(get_op),
+        materialize_symbol: "", pair_symbol: "", element_tid: elem }
+}
+
+fn cc_for_in_materialized(materialize_op: Str, pair_op: Str, elem: Int) -> ForInIteration {
+    let pair = if pair_op == "" { "" } else { c_runtime_helper(pair_op) }
+    ForInIteration { strategy: ForInStrategy.Materialized,
+        len_symbol: c_runtime_helper("list_len"), get_symbol: c_runtime_helper("list_get"),
+        materialize_symbol: c_runtime_helper(materialize_op), pair_symbol: pair,
+        element_tid: elem }
+}
+
+// A kind tc_tid_iter_elem already answers an element for, but that this producer has no
+// runtime symbol for yet. Str's element is a one-character Str (tc_tid_iter_elem's own
+// words), and the only runtime reader at a position -- blink_str_char_at -- is byte
+// indexed with no way to say how many bytes the character at that position took, so a
+// len/get pair built from blink_str_len/blink_str_char_at would walk multi-byte text
+// wrong; Iterator has no runtime representation at all (layout_of spells it "void*"). Both
+// refuse the same way cg_stmt's own lower_for_in refuses every non-range iterable today:
+// an internal error, never a user-facing one, because typecheck's NotIterable has already
+// turned away anything that is not a legal iterable before codegen ever sees the node.
+fn cc_for_in_not_built(node: Int) -> ForInIteration ! Diag.Report {
+    diag_ice_at("UnhandledIterable", UNHANDLED_ITERABLE_AT_CODEGEN,
+        "for-in over this iterable has no lowering yet", node,
+        "a container or iterator needs a runtime symbol producer; only ranges lower today")
+    cc_for_in_refused()
+}
+
+// The runtime symbol producer a for-in loop over `iterable_tid` needs: which entry
+// points to call and the element tid to bind the loop variable at, keyed on TyKind alone
+// -- every kind this covers is a builtin container with no declaration of its own, so
+// there is no nominal name to key on beyond the kind itself. Reads the element from
+// tc_tid_iter_elem, the one place typecheck's own ForIn arm already reads an iterable's
+// element from, so a loop variable's declared type and this producer's element_tid are
+// never two different answers to the same fact. cg_stmt owns turning this into an actual
+// loop; this only answers what one would call.
+pub fn for_in_iteration_of(iterable_tid: Int, node: Int) -> ForInIteration ! Diag.Report {
+    let tid = tc_resolve(iterable_tid)
+    let kind = cc_kind(tid)
+    // tc_tid_iter_elem answers List/Set/Iterator straight off the container's own inner
+    // slot, unresolved: a type parameter filled in through a generic instantiation (as
+    // `Set[Int]`'s Int slot is) can carry a distinct-but-equal tid there until resolved,
+    // the same aliasing tc_tid_list_elem already resolves through for List. Every other
+    // arm (Map's freshly interned pair tuple, Str, Bytes' TYPE_U8 constant) is already
+    // canonical, so resolving again is a no-op for them.
+    let elem = tc_resolve(tc_tid_iter_elem(tid))
+    if kind == TyKind.List { return cc_for_in_indexed("list_len", "list_get", elem) }
+    if kind == TyKind.Bytes { return cc_for_in_indexed("bytes_len", "bytes_get", elem) }
+    if kind == TyKind.Set { return cc_for_in_materialized("set_to_list", "", elem) }
+    if kind == TyKind.Map { return cc_for_in_materialized("map_keys", "map_values", elem) }
+    cc_for_in_not_built(node)
 }
