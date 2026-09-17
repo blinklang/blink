@@ -1,0 +1,169 @@
+// A callee or qualifier written as a bare Ident is a NAME, not a value, and the total-stamp
+// pass excuses it from carrying a type on exactly that ground. Which spellings are names is
+// decided against the item tables, and those tables know nothing about scope: a local
+// binding whose name also names a type, a module or a function is spelled the same way and
+// was being excused too. That excuse is the alignment guarantee for the whole pass, so a
+// binding that wrongly falls under it un-guards a real hole wherever one appears later.
+//
+// The rows below fix the boundary from both sides. A local that shadows an item name stands
+// in a value position whatever the item tables say, and the qualifier of a genuine item call
+// is still a name.
+//
+// Read at the pass's own seam rather than through a diagnostic, because the excuse is what
+// changed: a node that carries a type is not reported either way, so a row keyed on the
+// report would pass without the fix.
+import std.fs
+import std.io
+import compiler { compile_to_program }
+import typecheck { check_types, tc_lookup_node_tid, tc_tid_is_concrete, tc_stamp_name_child, tc_name_is_item, TYPE_INT }
+import parser { nodes, node_kind, node_name, node_obj, node_left, node_method }
+import ast { NodeKind }
+import diagnostics { diag_count, diag_ice_count, diag_reset }
+import embedded_stdlib_registry { init_embedded_stdlib }
+
+fn shadow_probe(
+    path: Str,
+    src: Str
+) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    diag_count + diag_ice_count
+}
+
+// The one MethodCall whose receiver is the bare Ident `recv`. The node arena holds the whole
+// program, the stdlib included, so a bare method name matches hundreds of instance calls and
+// the receiver is what makes the measurement exact. -2 marks an ambiguous one anyway, so a
+// row fails rather than reading whichever came last.
+fn only_method_call_on(recv: Str, method: Str) -> Int {
+    let mut hit = -1
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.MethodCall && node_method(i) == method {
+            let o = node_obj(i)
+            if o != -1 && node_kind(o) == NodeKind.Ident && node_name(o) == recv {
+                if hit != -1 {
+                    return -2
+                }
+                hit = i
+            }
+        }
+        i = i + 1
+    }
+    hit
+}
+
+// The one Call whose callee is the bare Ident `callee`.
+fn only_call_to(callee: Str) -> Int {
+    let mut hit = -1
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.Call {
+            let c = node_left(i)
+            if c != -1 && node_kind(c) == NodeKind.Ident && node_name(c) == callee {
+                if hit != -1 {
+                    return -2
+                }
+                hit = i
+            }
+        }
+        i = i + 1
+    }
+    hit
+}
+
+// The one FieldAccess whose object is the bare Ident `obj`.
+fn only_field_access_on(obj: Str, field: Str) -> Int {
+    let mut hit = -1
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FieldAccess && node_name(i) == field {
+            let o = node_obj(i)
+            if o != -1 && node_kind(o) == NodeKind.Ident && node_name(o) == obj {
+                if hit != -1 {
+                    return -2
+                }
+                hit = i
+            }
+        }
+        i = i + 1
+    }
+    hit
+}
+
+// Every Ident node spelled `nm`, so a row can say something about all of them at once.
+fn idents_named(nm: Str) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.Ident && node_name(i) == nm {
+            out.push(i)
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn shadow_src() -> Str {
+    "type ZzHue \{\n    Red\n    Green\n\}\n\ntype ZzBox \{\n    width: Int\n\}\n\nfn zzhelper(n: Int) -> Int \{\n    n + 1\n\}\n\nfn zzshadows() -> Int \{\n    let ZzHue = [1, 2]\n    let zzhelper = \"ab\"\n    let ZzBox = ZzBox \{ width: 4 \}\n    io.println(\"\{ZzHue.len()\}\")\n    zzhelper.len() + ZzBox.width\n\}\n\nfn main() \{\n    let _ = zzshadows()\n\}\n"
+}
+
+fn plain_src() -> Str {
+    "fn zzplain() \{\n    io.println(\"plain\")\n\}\n\nfn main() \{\n    zzplain()\n\}\n"
+}
+
+test "a local shadowing an item name is not excused from carrying a type" {
+    assert(shadow_probe("build/shadow_name_position.bl", shadow_src()) == 0)
+    // All three names are in the item tables, so the ladder that reads those tables alone
+    // still answers `item` for each. That answer is exactly what the name position must no
+    // longer take on its own.
+    assert(tc_name_is_item("ZzHue") != 0)
+    assert(tc_name_is_item("ZzBox") != 0)
+    assert(tc_name_is_item("zzhelper") != 0)
+    let mc = only_method_call_on("ZzHue", "len")
+    assert(mc >= 0)
+    assert(tc_stamp_name_child(mc) == -1)
+    let cl = only_method_call_on("zzhelper", "len")
+    assert(cl >= 0)
+    assert(tc_stamp_name_child(cl) == -1)
+    let fa = only_field_access_on("ZzBox", "width")
+    assert(fa >= 0)
+    assert(tc_stamp_name_child(fa) == -1)
+}
+
+test "the shadowed receiver carries the local's type, and the interpolation reads it" {
+    assert(shadow_probe("build/shadow_receiver_type.bl", shadow_src()) == 0)
+    // Every `ZzHue` written as a value stands for the list, not the enum. The declaration
+    // spells its name in a type position, which is not an Ident node, so the list below
+    // holds value reads only.
+    let reads = idents_named("ZzHue")
+    assert(reads.len() > 0)
+    for r in reads {
+        assert(tc_tid_is_concrete(tc_lookup_node_tid(r)) != 0)
+    }
+    // The interpolation is one of those reads and is typed like any other.
+    let mc = only_method_call_on("ZzHue", "len")
+    assert(mc >= 0)
+    assert(tc_lookup_node_tid(mc) == TYPE_INT)
+}
+
+test "the qualifier of a genuine item call is still a name" {
+    assert(shadow_probe("build/shadow_item_still_name.bl", plain_src()) == 0)
+    // Nothing shadows `io` or `zzplain`, so both keep the excuse the pass gives a spelling,
+    // and neither carries a type.
+    let pr = only_method_call_on("io", "println")
+    assert(pr >= 0)
+    let pq = tc_stamp_name_child(pr)
+    assert(pq != -1)
+    assert(node_name(pq) == "io")
+    assert(tc_tid_is_concrete(tc_lookup_node_tid(pq)) == 0)
+    let cl = only_call_to("zzplain")
+    assert(cl >= 0)
+    let cc = tc_stamp_name_child(cl)
+    assert(cc != -1)
+    assert(node_name(cc) == "zzplain")
+    assert(tc_tid_is_concrete(tc_lookup_node_tid(cc)) == 0)
+}

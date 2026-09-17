@@ -148,6 +148,14 @@ let mut tc_node_tid: List[Int] = []
 // re-inference with scope torn down cannot un-mark it.
 let mut tc_mc_obj_is_value: List[Int] = []
 
+// Ident node id → 1 when that Ident, standing in a callee or qualifier position,
+// resolved to a live VALUE binding. Written only while nr scope is live, which is
+// the only time the question can be asked; read by tc_stamp_name_child long after
+// the scope is gone. Monotonic, like tc_mc_obj_is_value and for the same reason: a
+// later re-inference with the scope torn down must not un-mark what it can no
+// longer see.
+let mut tc_name_position_is_value: List[Int] = []
+
 // Call node → the metavars minted for that call's RETURN-ONLY type params.
 // Presized to node_count() with -1 in init_types, exactly like tc_node_tid, so a
 // stale index can never survive a pool reset.
@@ -8478,11 +8486,13 @@ fn init_types() ! TypeCheck.Register {
     tc_node_tid.clear()
     tc_ret_mint_start.clear()
     tc_mc_obj_is_value.clear()
+    tc_name_position_is_value.clear()
     let mut nti = 0
     while nti < node_count() {
         tc_node_tid.push(-1)
         tc_ret_mint_start.push(-1)
         tc_mc_obj_is_value.push(0)
+        tc_name_position_is_value.push(0)
         nti = nti + 1
     }
     tc_ret_mint_tids.clear()
@@ -13147,6 +13157,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     // No node is an absence, not a type. Every caller reads it through tc_tid_is_no_info.
     if node == -1 { return -1 }
     let kind = node_kind(node)
+
+    // Scope is live here and nowhere later, so the one question the total-stamp pass cannot
+    // answer for itself is settled now: whether this node's callee or qualifier names a value.
+    tc_record_name_position_value(node)
 
     // §2.9 value-context flag. `incoming` is whether THIS node is a consumed value (its else-less
     // `if` needs an `else`). Reset to 1 so every consuming child descent below — operand, element,
@@ -19163,10 +19177,15 @@ fn tc_ann_names_tparam(ann: Int, param_name: Str) -> Bool {
 // (tc_stamp_name_child), a cascade from a hole one level down (tc_stamp_is_cascade), and a
 // body inference never checked (the @ffi skip in tc_stamp_walk).
 
-// Whether `name` denotes an ITEM — a namespace, an imported module, a type, a trait, a
-// variant, a function — rather than a value. The ladder is name resolution's own, from the
-// Ident arm of nr_check_node: what that pass accepts with no value binding behind it is
-// exactly what has no value behind it.
+// Whether the SPELLING `name` is one an item answers to — a namespace, an imported module, a
+// type, a trait, a variant, a function. The ladder is name resolution's own, from the Ident
+// arm of nr_check_node: what that pass accepts with no value binding behind it is exactly
+// what has no value behind it.
+//
+// A spelling and not a position: a local can be bound under any of these names and is then
+// the thing that name denotes. Asking this alone therefore answers "could be an item", not
+// "is one" — tc_stamp_name_child asks the scope first and reaches here only when nothing was
+// bound under the name.
 pub fn tc_name_is_item(name: Str) -> Int {
     // `import m.{add as plus}` registers `add` in the item tables and nothing under `plus`,
     // so the ladder has to ask about the original name — the same resolution the Call arm
@@ -19188,14 +19207,12 @@ pub fn tc_name_is_item(name: Str) -> Int {
 //
 // Exactly three positions can hold a name: a call's callee, and the qualifier of a method call
 // or of a field access. Each is written as a bare Ident whether it names a value or an item —
-// `f(x)` and `emit_line(x)`, `xs.len()` and `io.println(x)`, `p.zzf` and `NodeKind.Ident` — and
-// only name resolution can tell the two apart, because a local BINDING shadows an item of the
-// same name. node_children sees the syntax and nothing else, so it cannot file these as
-// spellings the way it files a type annotation; the rule is applied here instead, against the
-// item tables name resolution itself uses. A name is a spelling: there is no value under it
-// for a type to describe. Everything else in those three positions is a value and must carry
-// a type like any other.
-pub fn tc_stamp_name_child(n: Int) -> Int {
+// `f(x)` and `emit_line(x)`, `xs.len()` and `io.println(x)`, `p.zzf` and `NodeKind.Ident`.
+// node_children sees the syntax and nothing else, so it cannot file these as spellings the
+// way it files a type annotation; the rule is applied here instead. THIS function answers the
+// syntactic half only — which child, if any, could be a name. Whether it is one is a question
+// about scope, and tc_stamp_name_child puts it.
+pub fn tc_name_position_child(n: Int) -> Int {
     let k = node_kind(n)
     let c = if k == NodeKind.Call {
         node_left(n)
@@ -19206,6 +19223,42 @@ pub fn tc_stamp_name_child(n: Int) -> Int {
     }
     if c == -1 { return -1 }
     if node_kind(c) != NodeKind.Ident { return -1 }
+    c
+}
+
+// Record that the Ident in `n`'s name position denotes a VALUE. Called from inference, which
+// is the only pass that runs with nr scope live, so it is the only place the question can be
+// put. A name position is the one place a local BINDING and an item are spelled alike, and
+// the item tables the ladder above reads cannot tell them apart — `ZzHue.len()` on a list
+// named after an enum is written exactly like `io.println(x)`.
+//
+// An INNER-frame binding, because the global frame holds the items themselves: every
+// top-level function is bound under its own name there, so `set_len(s)` would otherwise
+// record its own callee as a value. A param or local is the only binding that can stand
+// between a spelling and the item it would otherwise name, and it is always a value.
+fn tc_record_name_position_value(n: Int) {
+    let c = tc_name_position_child(n)
+    if c == -1 { return }
+    let nm = node_name(c)
+    if nr_has_binding(nm) == 0 { return }
+    if nr_top_binding_is_global(nm) != 0 { return }
+    if c >= tc_name_position_is_value.len() { return }
+    tc_name_position_is_value.set(c, 1)
+}
+
+// The one child of `n` that really IS a name — a spelling with no value under it for a type
+// to describe. Everything else in those three positions is a value and must carry a type like
+// any other, which is what the total-stamp pass excuses against this answer.
+pub fn tc_stamp_name_child(n: Int) -> Int {
+    let c = tc_name_position_child(n)
+    if c == -1 { return -1 }
+    // The scope is asked first, through the record inference left behind. A binding shadows
+    // an item of the same name, so what the item tables say about the SPELLING settles
+    // nothing once something is bound under it: the position holds a value, and a value
+    // carries a type like any other.
+    if c < tc_name_position_is_value.len() {
+        if tc_name_position_is_value.get(c).unwrap() != 0 { return -1 }
+    }
     if tc_name_is_item(node_name(c)) == 0 { return -1 }
     c
 }
