@@ -1,0 +1,114 @@
+// A call may not carry its type arguments in brackets. `scope.alloc[U8]()` parses as a call
+// whose callee is an index expression, and nothing downstream reads that shape as a type
+// application, so the compiler used to accept the program and hand the bracketed source text
+// to the C compiler verbatim. A Blink diagnostic has to come first.
+//
+// The same bracket syntax over a VALUE is a real index — `fns[0]()` calls the closure at
+// index 0 and must keep checking clean. What separates the two is what the brackets hold: a
+// name that names a type and binds no value, versus anything else.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn count_named(name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            if d.name == name { n = n + 1 }
+        }
+    }
+    n
+}
+
+fn report(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("  [{label}] diagnostics:")
+        for e in errs { io.println("    {e}") }
+    }
+}
+
+test "a method call carrying bracketed type arguments is reported" {
+    typecheck_probe("build/tc_cs_targs_method.bl", #"import blink.ffi
+fn main() {
+    with ffi.scope() as scope {
+        let p: Ptr[U8] = scope.alloc[U8]()
+        let _ = p
+    }
+}
+"#)
+    report("method")
+    assert(count_named("CallSiteTypeArgs") == 1)
+}
+
+test "a free function call carrying bracketed type arguments is reported" {
+    typecheck_probe("build/tc_cs_targs_free.bl", #"fn make[T]() -> Int { 0 }
+fn main() {
+    let v = make[Int]()
+    let _ = v
+}
+"#)
+    report("free fn")
+    assert(count_named("CallSiteTypeArgs") == 1)
+}
+
+test "the same call typed from its annotation instead is accepted" {
+    typecheck_probe("build/tc_cs_targs_annotated.bl", #"import blink.ffi
+fn main() {
+    with ffi.scope() as scope {
+        let p: Ptr[U8] = scope.alloc()
+        let _ = p
+    }
+}
+"#)
+    report("annotated")
+    assert(count_named("CallSiteTypeArgs") == 0)
+    assert(error_messages().len() == 0)
+}
+
+test "calling the closure at an index is not a type application" {
+    typecheck_probe("build/tc_cs_targs_index.bl", #"fn a() -> Int { 1 }
+fn b() -> Int { 2 }
+fn main() {
+    let fns: List[fn() -> Int] = [a, b]
+    let v = fns[0]()
+    let _ = v
+}
+"#)
+    report("index call")
+    assert(count_named("CallSiteTypeArgs") == 0)
+    assert(error_messages().len() == 0)
+}
+
+test "a local shadowing a type name is still indexed as a value" {
+    typecheck_probe("build/tc_cs_targs_shadow.bl", #"type Slot { n: Int }
+fn a() -> Int { 1 }
+fn main() {
+    let Slot = 0
+    let fns: List[fn() -> Int] = [a]
+    let v = fns[Slot]()
+    let _ = v
+}
+"#)
+    report("shadowed type name")
+    assert(count_named("CallSiteTypeArgs") == 0)
+}

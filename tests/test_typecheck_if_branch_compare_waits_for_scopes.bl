@@ -1,0 +1,211 @@
+// The two branches of an `if` can only be compared once both have been typed inside their
+// own scopes. A branch tail naming a binding that branch declares is resolved against the
+// ENCLOSING scope by the inference that runs first, so it answers with whatever that name
+// means outside — confidently, and wrongly. Comparing then rejects a correct program.
+//
+// Deferring the compare must not lose it. A real mismatch is still a mismatch, including
+// when the branch that declares a binding is the one that disagrees.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
+import parser.{nodes, node_kind, node_name, node_value}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn count_incompatible_branch_errors() -> Int {
+    let mut n = 0
+    for m in error_messages() {
+        if m.contains("if branches have incompatible types") { n = n + 1 }
+    }
+    n
+}
+
+// The one let binding named `name`. -2 marks an ambiguous measurement.
+fn let_named(name: Str) -> Int {
+    let mut found = -1
+    let mut hits = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.LetBinding && node_name(i) == name {
+            hits = hits + 1
+            found = i
+        }
+        i = i + 1
+    }
+    if hits > 1 { return -2 }
+    found
+}
+
+fn assert_tid(label: Str, n: Int, want: Str) ! Diag.Report {
+    let t = if n < 0 { -1 } else { tc_lookup_node_tid(n) }
+    let got = if t < 0 { "<unset>" } else { tc_type_str(t) }
+    if got != want { io.println("FAIL: {label}: tid is {got}, want {want}") }
+    assert(got == want)
+}
+
+fn one_branch_shadow_src() -> Str {
+    #"
+fn main() {
+    let v = 1
+    let c = true
+    let x = if c {
+        let v = "s"
+        v
+    } else {
+        "t"
+    }
+    let _n = x.len()
+}
+"#
+}
+
+test "an if where only one branch shadows an outer binding is not a mismatch" {
+    typecheck_probe("build/tc_if_one_branch_shadow.bl", one_branch_shadow_src())
+    assert_no_errors("one-branch shadow")
+    let lx = let_named("x")
+    assert(lx >= 0)
+    let f = node_value(lx)
+    assert(node_kind(f) == NodeKind.IfExpr)
+    assert_tid("if node", f, "Str")
+    assert_tid("binding x", lx, "Str")
+}
+
+fn plain_mismatch_src() -> Str {
+    #"
+fn main() {
+    let c = true
+    let x = if c {
+        1
+    } else {
+        "s"
+    }
+    let _u = x
+}
+"#
+}
+
+test "an if with two plainly incompatible branches still reports once" {
+    typecheck_probe("build/tc_if_plain_mismatch.bl", plain_mismatch_src())
+    assert(count_incompatible_branch_errors() == 1)
+}
+
+fn binding_mismatch_src() -> Str {
+    #"
+fn main() {
+    let c = true
+    let x = if c {
+        let a = 1
+        a
+    } else {
+        "s"
+    }
+    let _u = x
+}
+"#
+}
+
+test "an if whose declaring branch disagrees still reports once" {
+    typecheck_probe("build/tc_if_binding_mismatch.bl", binding_mismatch_src())
+    assert(count_incompatible_branch_errors() == 1)
+}
+
+// A branch may declare a binding its tail does not name. That tail was read correctly before
+// the scope existed, so the mismatch is real and has to survive the deferral — reported once,
+// by whichever of the two sites owns this shape, and never twice.
+fn declares_but_tail_is_a_literal_src() -> Str {
+    #"
+fn main() {
+    let c = true
+    let x = if c {
+        let a = 1
+        2
+    } else {
+        "s"
+    }
+    let _u = x
+}
+"#
+}
+
+test "a branch that declares a binding its tail does not name is still compared" {
+    typecheck_probe("build/tc_if_declares_unused.bl", declares_but_tail_is_a_literal_src())
+    assert(count_incompatible_branch_errors() == 1)
+}
+
+// An `if` in STATEMENT position discards its value, so branch tails of different types are
+// not a mismatch. This is the shape of an else-if chain whose arms end in calls returning
+// different things, which is ordinary code — the deferred compare must not reach it. The
+// compare cannot see whether the `if` is consumed, so what keeps it away from this row is the
+// gate: neither tail is a bare read of a local the branch declares.
+fn statement_context_chain_src() -> Str {
+    #"
+fn adv() -> Int { 1 }
+fn nom() -> Str { "z" }
+
+fn main() {
+    let c = true
+    if c {
+        let a = 1
+        let _ = a
+        adv()
+    } else {
+        nom()
+    }
+}
+"#
+}
+
+test "a statement-position if with branch tails of different types is not a mismatch" {
+    typecheck_probe("build/tc_if_statement_chain.bl", statement_context_chain_src())
+    assert(count_incompatible_branch_errors() == 0)
+}
+
+// The deferred compare belongs to whatever CONSUMES the `if`, not to the walk of the `if`.
+// This row is the same branch shape as the first rows, in statement position: the value is
+// discarded, so the branches differing is not an error, and a compare made during the walk
+// would have no way to tell this row from those.
+fn statement_context_tail_reads_own_local_src() -> Str {
+    #"
+fn main() {
+    let c = true
+    if c {
+        let a = 1
+        a
+    } else {
+        "s"
+    }
+}
+"#
+}
+
+test "a discarded if is not compared even when a branch tail reads its own local" {
+    typecheck_probe("build/tc_if_statement_own_local.bl", statement_context_tail_reads_own_local_src())
+    assert(count_incompatible_branch_errors() == 0)
+}

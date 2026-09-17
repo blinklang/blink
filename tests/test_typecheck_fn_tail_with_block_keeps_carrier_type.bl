@@ -1,0 +1,131 @@
+// A `with` block that IS a function's tail produces the function's return value, so the
+// carrier it builds must survive with its carried type intact. The fn-body tail check
+// re-infers that tail out of scope to compare it against the declared return, and an
+// out-of-scope answer for a value built from the block's own bindings erases what the
+// carrier carries. A head that is right over an inner that is gone is the worst outcome
+// of the three: codegen trusts the head and reads the missing inner.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, tc_tid_child, tc_tid_child_count}
+import parser.{nodes, node_kind}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn diag_names() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push(d.name) }
+    }
+    out
+}
+
+// ArenaValueEscapes is excluded, not tolerated: the carrier row below returns a list built
+// inside `with arena` from the function, which the escape pass rejects on its own grounds.
+// That refusal is a separate open bug about the escape analysis, and it reproduces the same
+// with and without the tail typing this file measures. Admitting it here keeps the row on
+// one claim; the day the escape pass stops firing, the row still holds.
+fn assert_no_type_errors(label: Str) {
+    let mut bad: List[Str] = []
+    for n in diag_names() {
+        if n != "ArenaValueEscapes" { bad.push(n) }
+    }
+    if bad.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for b in bad { io.println("  {b}") }
+    }
+    assert(bad.len() == 0)
+}
+
+// The one node of `kind`. -2 marks an ambiguous measurement.
+fn only_node_of_kind(kind: NodeKind) -> Int {
+    let mut found = -1
+    let mut hits = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == kind {
+            hits = hits + 1
+            found = i
+        }
+        i = i + 1
+    }
+    if hits > 1 { return -2 }
+    found
+}
+
+fn tid_str(t: Int) -> Str ! Diag.Report {
+    if t < 0 { return "<unset>" }
+    tc_type_str(t)
+}
+
+fn assert_tid(label: Str, t: Int, want: Str) ! Diag.Report {
+    let got = tid_str(t)
+    if got != want { io.println("FAIL: {label}: tid is {got}, want {want}") }
+    assert(got == want)
+}
+
+fn carrier_src() -> Str {
+    #"
+type MyErr {
+    Bad
+}
+fn build() -> Result[List[Int], MyErr] {
+    with arena {
+        let mut out: List[Int] = []
+        out.push(1)
+        Ok(out)
+    }
+}
+fn main() {
+    let _r = build()
+}
+"#
+}
+
+test "a fn-tail with-block keeps the carried type inside its Result" {
+    typecheck_probe("build/tc_fn_tail_carrier.bl", carrier_src())
+    assert_no_type_errors("fn-tail carrier")
+    let w = only_node_of_kind(NodeKind.WithBlock)
+    assert(w >= 0)
+    let t = tc_lookup_node_tid(w)
+    assert_tid("with node", t, "Result[List[Int], MyErr]")
+    // The head being right is not the claim. Read the slots.
+    assert(tc_tid_child_count(t) == 2)
+    assert_tid("ok slot", tc_tid_child(t, 0), "List[Int]")
+    assert_tid("ok element", tc_tid_child(tc_tid_child(t, 0), 0), "Int")
+    assert_tid("err slot", tc_tid_child(t, 1), "MyErr")
+}
+
+fn wrapped_src() -> Str {
+    #"
+fn build() -> Option[Str] {
+    with arena {
+        let s = "x"
+        Some(s)
+    }
+}
+fn main() {
+    let _o = build()
+}
+"#
+}
+
+test "a fn-tail with-block that wraps a block-local keeps the wrapped type" {
+    typecheck_probe("build/tc_fn_tail_wrapped.bl", wrapped_src())
+    assert_no_type_errors("fn-tail wrapped")
+    let w = only_node_of_kind(NodeKind.WithBlock)
+    assert(w >= 0)
+    let t = tc_lookup_node_tid(w)
+    assert_tid("with node", t, "Option[Str]")
+    assert(tc_tid_child_count(t) == 1)
+    assert_tid("some slot", tc_tid_child(t, 0), "Str")
+}
