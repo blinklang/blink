@@ -35,6 +35,7 @@ import diagnostics.{
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905,
     TRAIT_CONTRACT_906, TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
     POLY_IMPL_UNSUPPORTED, IMPL_BINDER_UNUSED, TRAIT_ARG_ARITY, MISSING_SUPERTRAIT_IMPL, TYPE_ARG_ARITY,
+    CALL_SITE_TYPE_ARGS,
     CONTRACT_PREDICATE_NOT_DECIDABLE, EFFECTFUL_CALL_IN_PREDICATE,
     IMPURE_CALL_IN_PREDICATE, LOOP_IN_PREDICATE,
     RESULT_OUTSIDE_ENSURES, OLD_OUTSIDE_ENSURES,
@@ -8474,6 +8475,7 @@ fn init_types() ! TypeCheck.Register {
     tc_namesake_type_modules = Map()
     tc_impl_recv_tids = Map()
     tc_active_tparams.clear()
+    tc_call_site_type_args.clear()
     tc_tp_arith_names.clear()
     tc_tp_bound_traits.clear()
     tc_tp_bound_methods.clear()
@@ -11620,7 +11622,13 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let callee = node_left(node)
         if callee != -1 {
             let callee_kind = node_kind(callee)
-            if callee_kind == NodeKind.Ident {
+            if callee_kind == NodeKind.IndexExpr && tc_index_is_type_application(callee) != 0 {
+                let ty_name = node_name(node_index(callee))
+                tc_call_site_type_args.insert(callee, 1)
+                tc_errors.push("type arguments at a call site are not accepted")
+                diag_error_at("CallSiteTypeArgs", CALL_SITE_TYPE_ARGS, "type argument '[{ty_name}]' is written at the call site, which the compiler does not accept", callee, "let the type argument come from context — annotate the binding, or the parameter the result flows into, as in 'let p: Ptr[{ty_name}] = scope.alloc()'")
+                nr_check_node(node_obj(callee))
+            } else if callee_kind == NodeKind.Ident {
                 let fn_name = node_name(callee)
                 if nr_check_selective_access(fn_name, node) == 0 {
                     if nr_is_defined(fn_name) != 0 && nr_top_binding_is_global(fn_name) != 0 && is_private_access(fn_name) != 0 {
@@ -15434,6 +15442,14 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     }
 
     if kind == NodeKind.IndexExpr {
+        if (tc_call_site_type_args.get(node) ?? 0) != 0 {
+            // Reported already, as a type application. The operands are still walked so the
+            // nodes under them carry types, and the answer is the error-recovery type: the
+            // program has no reading in which this expression holds a value.
+            let _ = infer_type(node_obj(node))
+            let _ = infer_type(node_index(node))
+            return tc_error_recovery_tid()
+        }
         let obj_t = tc_resolve(infer_type(node_obj(node)))
         // The index is an operand like any other: codegen reads its type from the memo, so
         // it must be walked even when the receiver already settles the answer. Only a
@@ -16118,6 +16134,30 @@ fn tc_scoped_value_memo(node: Int, depth: Int) -> Int {
 // name then resolves against the enclosing scope, so the answer is about a different
 // variable. Comparing two branches on those terms is what rejects a correct program, and
 // what silently accepts an incorrect one when the out-of-scope read finds nothing at all.
+// Calls whose callee is a bracketed type application, recorded when name resolution reports
+// them. The index-typing arm reads this to stay quiet: the construct already has its
+// diagnostic, and "cannot index a value of type Fn() -> Int" describes a reading of the
+// brackets that the program did not intend.
+let mut tc_call_site_type_args: Map[Int, Int] = Map()
+
+// Whether an index expression is a type applied in brackets rather than a position read.
+// The brackets hold a NAME, that name names a type or a type parameter in scope, and no
+// value of that name is in scope to be indexed by. `fns[0]` fails the Ident test and
+// `fns[Slot]` with a local `Slot` fails the binding test, so both stay index reads.
+fn tc_index_is_type_application(idx: Int) -> Int {
+    if idx == -1 { return 0 }
+    if node_kind(idx) != NodeKind.IndexExpr { return 0 }
+    let arg = node_index(idx)
+    if arg == -1 { return 0 }
+    if node_kind(arg) != NodeKind.Ident { return 0 }
+    let nm = node_name(arg)
+    if nm == "" { return 0 }
+    if nr_has_binding(nm) != 0 { return 0 }
+    if (tc_active_tparams.get(nm) ?? 0) > 0 { return 1 }
+    if tc_names_a_type(nm) { return 1 }
+    0
+}
+
 fn tc_block_declares_binding(body: Int) -> Int {
     if body == -1 { return 0 }
     if node_kind(body) != NodeKind.Block { return 0 }
