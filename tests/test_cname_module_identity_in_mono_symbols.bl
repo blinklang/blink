@@ -1,0 +1,98 @@
+// A mono symbol must name one thing. Two modules may each declare a generic fn with the
+// same bare name, and each may declare a type the other also declares. The fn's own module
+// and every struct argument's module therefore ride the symbol: without them the two
+// instances collapse onto one C name and the unit defines one symbol twice.
+//
+// The TOP and INNER positions must agree on this. A struct argument spelled bare at TOP and
+// module-qualified inside a carrier is two answers to the same question, and the position a
+// type happens to land in is not a fact about the type.
+import typecheck.{check_types, make_tuple_type}
+import compiler.{compile_to_program}
+import ast.{NodeKind}
+import cname.{cname_reset, c_mono_fn_name, c_mono_type_c_name, c_seg_top, c_seg_inner}
+import cname_test_helpers.{assert_eq_str, find_decl, tid_of, harvest_tids}
+import std.io
+
+fn moda_src() -> Str {
+    #"pub type Ngx { n: Int }
+pub type Box[T] { v: T }
+pub fn wrap[T](x: T) -> T { x }
+"#
+}
+
+fn modb_src() -> Str {
+    #"pub type Ngx { n: Int }
+pub type Box[T] { v: T }
+pub fn wrap[T](x: T) -> T { x }
+"#
+}
+
+fn main_src() -> Str {
+    #"import moda
+import modb
+
+fn main() {
+    let na = moda.Ngx { n: 1 }
+    let nb = modb.Ngx { n: 2 }
+    let ba = moda.Box { v: 1 }
+    let bb = modb.Box { v: 2 }
+    io.println("{na.n} {nb.n} {ba.v} {bb.v}")
+}
+"#
+}
+
+// compile_pkg_probe stages exactly one module; these rows need two that declare the same
+// names, so the package is staged here.
+fn compile_twin_module_probe() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let root = "build/cname_twin_modules_pkg"
+    let _clean = process_run("rm", ["-rf", root])
+    let _mk = process_run("mkdir", ["-p", "{root}/src"])
+    write_file("{root}/blink.toml", "[package]\nname = \"cnametwinmods\"\nversion = \"0.1.0\"\n")
+    write_file("{root}/src/moda.bl", moda_src())
+    write_file("{root}/src/modb.bl", modb_src())
+    let path = "{root}/src/main.bl"
+    write_file(path, main_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    cname_reset()
+    let m = harvest_tids()
+    let _rm = process_run("rm", ["-rf", root])
+    m
+}
+
+test "a generic fn two modules declare gives two mono symbols" {
+    let m = compile_twin_module_probe()
+    let wrap_a = find_decl(NodeKind.FnDef, "wrap", "moda")
+    let wrap_b = find_decl(NodeKind.FnDef, "wrap", "modb")
+    assert(wrap_a != wrap_b)
+    let args = make_tuple_type([tid_of(m, "Int")])
+    assert_eq_str("moda.wrap[Int]", c_mono_fn_name(wrap_a, args), "blink_moda_1wrap_0Int")
+    assert_eq_str("modb.wrap[Int]", c_mono_fn_name(wrap_b, args), "blink_modb_1wrap_0Int")
+}
+
+test "a struct argument two modules declare gives two mono symbols" {
+    let m = compile_twin_module_probe()
+    let wrap_a = find_decl(NodeKind.FnDef, "wrap", "moda")
+    let ngx_a = make_tuple_type([tid_of(m, "moda.Ngx")])
+    let ngx_b = make_tuple_type([tid_of(m, "modb.Ngx")])
+    assert_eq_str("moda.wrap[moda.Ngx]", c_mono_fn_name(wrap_a, ngx_a), "blink_moda_1wrap_0moda_1Ngx")
+    assert_eq_str("moda.wrap[modb.Ngx]", c_mono_fn_name(wrap_a, ngx_b), "blink_moda_1wrap_0modb_1Ngx")
+}
+
+// The same claim one layer down: the segment itself, not the symbol built from it.
+test "a bare struct spells its module at TOP as it already does at INNER" {
+    let m = compile_twin_module_probe()
+    let a = tid_of(m, "moda.Ngx")
+    let b = tid_of(m, "modb.Ngx")
+    assert_eq_str("moda.Ngx TOP", c_seg_top(a), "moda_Ngx")
+    assert_eq_str("modb.Ngx TOP", c_seg_top(b), "modb_Ngx")
+    assert_eq_str("moda.Ngx INNER", c_seg_inner(a), "moda_Ngx")
+    assert_eq_str("modb.Ngx INNER", c_seg_inner(b), "modb_Ngx")
+}
+
+test "a generic type two modules declare already spells its own module" {
+    let m = compile_twin_module_probe()
+    assert_eq_str("moda.Box[Int]", c_mono_type_c_name(tid_of(m, "moda.Box[Int]")), "blink_moda_1Box_0Int")
+    assert_eq_str("modb.Box[Int]", c_mono_type_c_name(tid_of(m, "modb.Box[Int]")), "blink_modb_1Box_0Int")
+}
