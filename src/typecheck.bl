@@ -15626,10 +15626,19 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // walk that runs before the typecheck pass settles the block's locals — is not a
             // mismatch with `Option[?]`, it is the same branch not yet typed. The compare
             // runs again on the typecheck pass, where both sides are settled.
-            if tc_tid_is_no_info(then_t) == 0 && tc_tid_is_no_info(else_t) == 0 {
-                if tc_tid_has_unknown(then_t) == 0 && tc_tid_has_unknown(else_t) == 0 {
-                    if types_compatible(then_t, else_t) == 0 {
-                        tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
+            //
+            // A branch that declares a binding is not compared HERE at all. This runs before
+            // either branch scope exists, so such a branch was read against the enclosing
+            // scope and its answer is about some other variable of the same name, or about
+            // nothing. tc_check_body's IfExpr arm compares those two branches once it has
+            // walked them in their own scopes, and the gate there is this same test, so
+            // exactly one of the two sites reports any one `if`.
+            if tc_if_declaring_branch(node) == 0 {
+                if tc_tid_is_no_info(then_t) == 0 && tc_tid_is_no_info(else_t) == 0 {
+                    if tc_tid_has_unknown(then_t) == 0 && tc_tid_has_unknown(else_t) == 0 {
+                        if types_compatible(then_t, else_t) == 0 {
+                            tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
+                        }
                     }
                 }
             }
@@ -16102,6 +16111,32 @@ fn tc_scoped_value_memo(node: Int, depth: Int) -> Int {
         return own
     }
     tc_lookup_node_tid(node)
+}
+
+// Whether a block introduces a binding of its own. A branch that does cannot be typed by
+// an inference that runs before its scope exists: its tail may name that binding, and the
+// name then resolves against the enclosing scope, so the answer is about a different
+// variable. Comparing two branches on those terms is what rejects a correct program, and
+// what silently accepts an incorrect one when the out-of-scope read finds nothing at all.
+fn tc_block_declares_binding(body: Int) -> Int {
+    if body == -1 { return 0 }
+    if node_kind(body) != NodeKind.Block { return 0 }
+    let stmts_sl = node_stmts(body)
+    if stmts_sl == -1 { return 0 }
+    let mut i = 0
+    while i < sublist_length(stmts_sl) {
+        if node_kind(sublist_get(stmts_sl, i)) == NodeKind.LetBinding { return 1 }
+        i = i + 1
+    }
+    0
+}
+
+// The gate shared by the two sites that compare an `if`'s branches, so neither can start
+// reporting what the other already reports.
+fn tc_if_declaring_branch(node: Int) -> Int {
+    if tc_block_declares_binding(node_then_body(node)) != 0 { return 1 }
+    if tc_block_declares_binding(node_else_body(node)) != 0 { return 1 }
+    0
 }
 
 // Put `tid` back on every node tc_scoped_value_memo read through to reach it, undoing an
@@ -17088,6 +17123,21 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // that codegen lowers without a result temp (emit_if_expr's else==-1 && tid<0 fast path);
         // publishing a tid there would defeat that and resurrect a dead temp. A consumed else-less
         // if-tail keeps its own publish path, unaffected here.
+        // The compare infer_type declined to make, made here instead, where both branches
+        // have been walked inside their own scopes and their tails mean what they say. The
+        // gate is the one infer_type suppressed on, so an `if` is compared at exactly one of
+        // the two sites and reports at most once.
+        if node_else_body(node) != -1 && tc_if_declaring_branch(node) != 0 {
+            let in_then_t = tc_scoped_value_memo(node_then_body(node), 0)
+            let in_else_t = tc_scoped_value_memo(node_else_body(node), 0)
+            if tc_tid_is_no_info(in_then_t) == 0 && tc_tid_is_no_info(in_else_t) == 0 {
+                if tc_tid_has_unknown(in_then_t) == 0 && tc_tid_has_unknown(in_else_t) == 0 {
+                    if types_compatible(in_then_t, in_else_t) == 0 {
+                        tc_error_at("if branches have incompatible types: {type_to_str(in_then_t)} vs {type_to_str(in_else_t)}", node)
+                    }
+                }
+            }
+        }
         if node_else_body(node) != -1 {
             let own_tid = tc_lookup_node_tid(node)
             let post_if_memo = tc_scoped_value_memo(node, 0)
