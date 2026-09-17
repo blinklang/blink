@@ -49,7 +49,7 @@ import diagnostics.{
     MODULE_QUALIFIED_TYPE,
     UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE,
     BITWISE_PRECEDENCE, UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
-    NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME,
+    NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, UNKNOWN_DERIVE_NAME,
     NO_SUCH_FIELD,
 }
 
@@ -6489,16 +6489,42 @@ fn tc_derive_obliges(listed: Str, tr: Str) -> Int {
     0
 }
 
-// Does the declaration `td` derive `tr`, by naming it or by naming a trait whose
-// supertrait obligation reaches it? Deriving Ord or Hash derives Eq as well when the
-// author did not list it (spec sections/03_types.md, "Supertrait Auto-Derivation"), so
-// every reader of a derive fact answers from the expanded set; a reader that answered
-// from the written list alone would disagree with the methods codegen synthesizes.
-// Scans EVERY @derive annotation, not just the first. get_annotation returns only the
-// first match, so `@derive(Eq)` + `@derive(Ord)` on separate lines hid the second derive.
-pub fn tc_decl_derives(td: Int, tr: Str) -> Int {
-    let anns = node_handlers(td)
-    if anns == -1 { return 0 }
+// Every name @derive accepts. This is the one list: the derive stage of codegen reads it
+// here rather than keeping a second copy, because two copies disagree the day one gains a
+// name and the check that rejects an unknown name starts rejecting a legal one.
+pub fn tc_derive_names() -> List[Str] {
+    ["Serialize", "Deserialize", "Eq", "Ord", "Clone", "Hash", "Debug"]
+}
+
+fn tc_derive_name_is_known(name: Str) -> Int {
+    for d in tc_derive_names() {
+        if d == name { return 1 }
+    }
+    0
+}
+
+// A @derive name outside the accepted set is reported where the author can still see the
+// annotation. Codegen used to be the only reader, so a program that never reached codegen
+// kept the misspelling and lost the method silently.
+fn tc_reject_unknown_derives(td: Int) ! Diag.Report {
+    for a in tc_decl_derive_args(td) {
+        let name = node_name(a)
+        if tc_derive_name_is_known(name) == 0 {
+            diag_error_at("UnknownDerive", UNKNOWN_DERIVE_NAME,
+                "unknown @derive name '{name}'; expected one of {tc_derive_names().join(", ")}",
+                a, "remove or replace this derive name")
+        }
+    }
+}
+
+// Every name written in every @derive on a declaration, as the annotation argument nodes.
+// A node carries both the name and its span, so a diagnostic about one derive name can
+// point at that name.
+pub fn tc_decl_derive_args(decl: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    if decl < 0 { return out }
+    let anns = node_handlers(decl)
+    if anns == -1 { return out }
     let mut i = 0
     while i < sublist_length(anns) {
         let ann = sublist_get(anns, i)
@@ -6507,12 +6533,26 @@ pub fn tc_decl_derives(td: Int, tr: Str) -> Int {
             if args_sl != -1 {
                 let mut j = 0
                 while j < sublist_length(args_sl) {
-                    if tc_derive_obliges(node_name(sublist_get(args_sl, j)), tr) != 0 { return 1 }
+                    out.push(sublist_get(args_sl, j))
                     j = j + 1
                 }
             }
         }
         i = i + 1
+    }
+    out
+}
+
+// Does the declaration `td` derive `tr`, by naming it or by naming a trait whose
+// supertrait obligation reaches it? Deriving Ord or Hash derives Eq as well when the
+// author did not list it (spec sections/03_types.md, "Supertrait Auto-Derivation"), so
+// every reader of a derive fact answers from the expanded set; a reader that answered
+// from the written list alone would disagree with the methods codegen synthesizes.
+// Scans EVERY @derive annotation, not just the first. get_annotation returns only the
+// first match, so `@derive(Eq)` + `@derive(Ord)` on separate lines hid the second derive.
+pub fn tc_decl_derives(td: Int, tr: Str) -> Int {
+    for a in tc_decl_derive_args(td) {
+        if tc_derive_obliges(node_name(a), tr) != 0 { return 1 }
     }
     0
 }
@@ -6539,6 +6579,7 @@ fn reject_reserved_type_name(td: Int) ! Diag.Report {
 
 fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     reject_reserved_type_name(td)
+    tc_reject_unknown_derives(td)
     let name = tc_nominal_type_name(td)
     let tid = new_type(TyKind.Struct, name)
     named_type_names.push(name)
@@ -6605,6 +6646,7 @@ fn resolve_struct_fields(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.
 
 fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     reject_reserved_type_name(td)
+    tc_reject_unknown_derives(td)
     let name = tc_nominal_type_name(td)
     let tid = new_type(TyKind.Enum, name)
     named_type_names.push(name)
