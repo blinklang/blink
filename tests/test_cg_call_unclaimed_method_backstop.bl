@@ -1,0 +1,52 @@
+// A method call no arm of inference claimed carries typecheck's stand-down marker in its
+// own tid (src/typecheck.bl: tc_unclaimed_call_tid, tc_mark_unclaimed_call). The stand-down
+// pass stays quiet about it on purpose — that silence is what lets an unrelated body finish
+// typechecking — so codegen is the only stage left to name the receiver and the method. A
+// call this dispatch chain never learns of falls through the same holes an ordinary unbuilt
+// method would, and lands on an internal-error refusal that names no method at all. The
+// backstop in lower_call intercepts before any of that dispatch runs.
+
+import lower_test_helpers.{probe, rhs_of, assert_refused_saying, ice_count}
+import cg_call.{lower_call}
+import std.io
+
+// `.concat` is a builtin method name (Str and Bytes both declare one), so name resolution
+// lets it pass, and List declares no method by that name, so no arm of inference claims it.
+// `.append` is what typecheck's own help text points a caller toward instead.
+fn src_unclaimed() -> Str {
+    #"fn main() {
+    let xs: List[Int] = [1]
+    let ys = xs.concat([2])
+    let _keep = [xs.len()]
+}
+"#
+}
+
+// The same receiver, a method List does declare. Nothing about the guard this test adds
+// should ever be reached for a call inference already typed.
+fn src_claimed() -> Str {
+    #"fn main() {
+    let xs: List[Int] = [1]
+    let n = xs.len()
+    let _keep = [n]
+}
+"#
+}
+
+test "an unclaimed method call reports the receiver type and method, never an ICE" {
+    let _program = probe("cg_call_unclaimed_concat", src_unclaimed())
+    let id = lower_call(rhs_of("ys"))
+    if id != -1 { io.println("FAIL: lower_call answered {id} for an unclaimed call instead of refusing") }
+    assert_eq(id, -1)
+    assert_eq(ice_count(), 0)
+    assert_refused_saying("unclaimed call", "unresolved method '.concat' on type List[Int]", 1)
+}
+
+test "a claimed call is unaffected by the unclaimed-call backstop" {
+    let _program = probe("cg_call_claimed_len", src_claimed())
+    let id = lower_call(rhs_of("n"))
+    if id < 0 { io.println("FAIL: lower_call refused a call inference had already claimed") }
+    assert(id >= 0)
+    assert_eq(ice_count(), 0)
+    assert_refused_saying("claimed call", "unresolved method", 0)
+}
