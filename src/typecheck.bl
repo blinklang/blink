@@ -9827,14 +9827,47 @@ fn nr_note_call_decl(call_node: Int, decl_node: Int) {
     tc_call_decl.insert(call_node, decl_node)
 }
 
+// The declaration a renaming selective import (`import m.{f as g}`) binds to `name` in
+// `consuming_mod`. The declaration keeps its own spelling, so the alias is translated back
+// to its module and original name before any declaration is looked for.
+fn nr_resolve_alias_decl(name: Str, consuming_mod: Str) -> Int {
+    if name == "" { return -1 }
+    if consuming_mod == "" { return -1 }
+    let prefix = "{consuming_mod}:"
+    for key in per_module_imports.keys() {
+        if key.starts_with(prefix) == 0 { continue }
+        let imp_node = per_module_imports.get(key) ?? -1
+        if imp_node == -1 { continue }
+        let names_sl = node_args(imp_node)
+        if names_sl == -1 { continue }
+        let source_mod = key.substring(prefix.len(), key.len() - prefix.len())
+        let mut i = 0
+        while i < sublist_length(names_sl) {
+            let name_node = sublist_get(names_sl, i)
+            if node_str_val(name_node) == name {
+                let original = node_name(name_node)
+                let hit = nr_resolve_decl_in_module(source_mod, original, 0)
+                if hit != -1 { return hit }
+            }
+            i = i + 1
+        }
+    }
+    -1
+}
+
 // Which declaration of `name` the bare spelling means inside `consuming_mod`.
 fn nr_resolve_bare_decl(name: Str, consuming_mod: Str) -> Int {
     let cands = nr_decls_by_name.get(name) ?? []
-    if cands.len() == 0 { return -1 }
     // A module's own declaration wins over any import, so it is asked for first.
     for c in cands {
         if node_module(c) == consuming_mod { return c }
     }
+    // An alias is this file's own binding for the spelling, so it outranks whatever other
+    // modules declare under it — and it is the only way a renamed import resolves at all,
+    // since no declaration carries the alias as its name.
+    let aliased = nr_resolve_alias_decl(name, consuming_mod)
+    if aliased != -1 { return aliased }
+    if cands.len() == 0 { return -1 }
     let mut found = -1
     let mut hits = 0
     for c in cands {
@@ -9847,11 +9880,35 @@ fn nr_resolve_bare_decl(name: Str, consuming_mod: Str) -> Int {
     -1
 }
 
+// The declaration `member` names inside `target`, following any `pub import` that re-exports
+// it. A facade module holds no declaration of its own: the re-export makes the name reachable
+// under the facade's qualifier while the declaration stays in the module that wrote it.
+fn nr_resolve_decl_in_module(target: Str, member: Str, depth: Int) -> Int {
+    let direct = nr_module_decls.get("{target}|{member}") ?? -1
+    if direct != -1 { return direct }
+    if depth >= 8 { return -1 }
+    match tc_reexport_source.get("{target}:{member}") {
+        Some(src) => {
+            let hit = nr_resolve_decl_in_module(src, member, depth + 1)
+            if hit != -1 { return hit }
+        }
+        None => {}
+    }
+    let wildcard_prefix = "{target}:*:"
+    for key in tc_reexport_source.keys() {
+        if key.starts_with(wildcard_prefix) == 0 { continue }
+        let src = key.substring(wildcard_prefix.len(), key.len() - wildcard_prefix.len())
+        let hit = nr_resolve_decl_in_module(src, member, depth + 1)
+        if hit != -1 { return hit }
+    }
+    -1
+}
+
 // A module qualifier settles the module before any name is looked up, so an alias another
 // file bound to the same spelling has nothing to say here.
 fn nr_resolve_qualified_decl(qualifier: Str, member: Str) -> Int {
     let target = tc_qualifier_to_module.get(qualifier) ?? qualifier
-    nr_module_decls.get("{target}|{member}") ?? -1
+    nr_resolve_decl_in_module(target, member, 0)
 }
 
 // Whether this file's own import list reaches any declaration of the bare `name`. The
@@ -9864,6 +9921,9 @@ fn nr_bare_name_in_scope_here(name: Str, consuming_mod: Str) -> Int {
         if node_module(c) == consuming_mod { return 1 }
         if is_filtered_for_module(name, node_module(c), consuming_mod) == 0 { return 1 }
     }
+    // A renaming import binds the spelling too, and no declaration carries the alias as its
+    // name, so the candidate list above can never answer for one.
+    if nr_resolve_alias_decl(name, consuming_mod) != -1 { return 1 }
     0
 }
 
