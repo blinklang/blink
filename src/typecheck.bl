@@ -2160,22 +2160,6 @@ fn tc_ud_judge_binder(vname: Str, tid: Int, decl_node: Int) ! Diag.Report {
     tc_ud_pending_nodes.push(decl_node)
 }
 
-// How many blames are queued. Paired with tc_ud_truncate_pending to undo the queueing
-// a SPECULATIVE walk did: the module-global read infers an initializer only to learn
-// whether the read is clean and throws its diagnostics away (diag_truncate), so the
-// blames that walk queued must go with them or a discarded read reports an error.
-fn tc_ud_pending_count() -> Int {
-    tc_ud_pending_names.len()
-}
-
-fn tc_ud_truncate_pending(n: Int) {
-    while tc_ud_pending_names.len() > n {
-        let _dn = tc_ud_pending_names.pop()
-        let _dt = tc_ud_pending_tids.pop()
-        let _dd = tc_ud_pending_nodes.pop()
-    }
-}
-
 // Report the deferred alias blames nothing else answered. Runs once, after the whole
 // inference pass: a metavar a LATER statement pinned is solved by now and drops out,
 // which is what makes deferral sound rather than merely late.
@@ -4850,15 +4834,6 @@ fn tc_error(msg: Str) ! TypeCheck.Report, Diag.Report {
 fn tc_error_at(msg: Str, node_id: Int) ! TypeCheck.Report, Diag.Report {
     tc_errors.push(msg)
     diag_error_at("TypeError", TYPE_ERROR, msg, node_id, "")
-}
-
-// Drops every type error recorded after the first `n`. tc_error writes TWO channels, and
-// diag_truncate empties only one of them, so a speculative read that rolls back its diagnostics
-// must roll back this list with them. Otherwise check_types counts errors that nothing printed.
-fn tc_errors_truncate(n: Int) {
-    while tc_errors.len() > n {
-        tc_errors.pop()
-    }
 }
 
 
@@ -11035,23 +11010,28 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
         let mut i = 0
         while i < sublist_length(lets_sl) {
             let l = sublist_get(lets_sl, i)
-            let l_name = node_name(l)
             let l_mod = node_module(l)
-            if l_mod != "__main__" {
-                match tc_original_to_alias.get(l_name) {
-                    Some(alias) => {
-                        nr_check_ambiguity(alias, l_mod, main_names)
-                        nr_define(alias)
-                        nr_register_private(l_name, l_mod)
+            let bound = tc_module_let_bound_names(l)
+            let mut bi = 0
+            while bi < bound.len() {
+                let l_name = bound.get(bi).unwrap()
+                if l_mod != "__main__" {
+                    match tc_original_to_alias.get(l_name) {
+                        Some(alias) => {
+                            nr_check_ambiguity(alias, l_mod, main_names)
+                            nr_define(alias)
+                            nr_register_private(l_name, l_mod)
+                        }
+                        None => {
+                            nr_check_ambiguity(l_name, l_mod, main_names)
+                            nr_define(l_name)
+                        }
                     }
-                    None => {
-                        nr_check_ambiguity(l_name, l_mod, main_names)
-                        nr_define(l_name)
-                    }
+                } else {
+                    nr_check_ambiguity(l_name, l_mod, main_names)
+                    nr_define(l_name)
                 }
-            } else {
-                nr_check_ambiguity(l_name, l_mod, main_names)
-                nr_define(l_name)
+                bi = bi + 1
             }
             i = i + 1
         }
@@ -18003,6 +17983,61 @@ fn tc_register_module_let_tid(l: Int, l_tid: Int) {
     if l_mod_key != "" {
         tc_module_let_decl.insert("{l_mod_key}.{node_name(l)}", l)
     }
+    tc_register_module_let_pattern(l, l_tid)
+}
+
+// The names a module-level `let` puts in scope. A destructuring form carries the
+// parser's placeholder in the node name and its real binders in the pattern, so the
+// node name alone would register a spelling no source can write and leave every leaf
+// undefined.
+fn tc_module_let_bound_names(l: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    let pat_sl = node_elements(l)
+    if pat_sl != -1 {
+        let elems_sl = node_elements(pat_sl)
+        if elems_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(elems_sl) {
+                out.push(node_name(sublist_get(elems_sl, i)))
+                i = i + 1
+            }
+            return out
+        }
+    }
+    out.push(node_name(l))
+    out
+}
+
+// A destructuring module-level `let` binds its leaves, not the node's own name. The
+// node name is the pattern's internal placeholder, so without this the leaves are the
+// only spelling a body can use and none of them is in scope — every use reads as an
+// undefined variable. Decomposition matches the fn-body arm: a leaf past the tuple's
+// arity stays unknown rather than borrowing a neighbour's type.
+fn tc_register_module_let_pattern(l: Int, l_tid: Int) {
+    let pat_sl = node_elements(l)
+    if pat_sl == -1 { return }
+    let elems_sl = node_elements(pat_sl)
+    if elems_sl == -1 { return }
+    let is_mut = node_is_mut(l)
+    let l_mod_key = node_module(l)
+    let tup = tc_tid_resolved(l_tid)
+    let mut arity = -1
+    if tc_tid_kind(tup) == TyKind.Tuple { arity = tc_tid_child_count(tup) }
+    let mut i = 0
+    while i < sublist_length(elems_sl) {
+        let leaf = sublist_get(elems_sl, i)
+        let mut leaf_tid = TYPE_UNKNOWN
+        if i < arity {
+            leaf_tid = tc_tid_child(tup, i)
+            if leaf_tid < 0 { leaf_tid = TYPE_UNKNOWN }
+        }
+        nr_define_typed(node_name(leaf), is_mut, leaf_tid, leaf)
+        tc_publish_node_tid(leaf, leaf_tid)
+        if l_mod_key != "" {
+            tc_module_let_decl.insert("{l_mod_key}.{node_name(leaf)}", leaf)
+        }
+        i = i + 1
+    }
 }
 
 // Types an ANNOTATED module-level global's initializer for its node tids alone.
@@ -18013,22 +18048,14 @@ fn tc_register_module_let_tid(l: Int, l_tid: Int) {
 // it, an annotation removed the initializer's types and codegen had nothing to read for
 // `[1, 2]` in `let xs: List[Int] = [1, 2]`.
 //
-// The read is speculative on the same terms as the unannotated pass below: codegen validates a
-// global initializer, not this site (and blinkc stops on diag_count > 0), so this pass rolls
-// back every diagnostic and every under-determined blame the read records.
+// The read REPORTS. A module-level binding is typechecked at its own site, exactly as a `let`
+// in a fn body is, so a declared type its initializer contradicts is an error here and not a
+// question deferred to codegen.
 //
 // The declared type drives the walk — construct hint, closure expected fn type, and the metavar
 // pin — so `let m: Map[Str, Int] = Map()` records `Map[Str, Int]` on the ctor and not `Map[?, ?]`.
-//
-// @allow: the read is speculative by design and restores the two things it must — the construct
-// hint and the diagnostic channels. What it keeps is the point of the pass: node tids and metavar
-// bindings.
-@allow(UnrestoredMutation, IncompleteStateRestore)
 fn tc_stamp_annotated_global_init(l: Int, l_val: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let declared = tc_lookup_node_tid(l)
-    let saved = diag_entry_count()
-    let saved_errors = tc_errors.len()
-    let saved_blames = tc_ud_pending_count()
     tc_seed_closure_expected_fn(l_val, declared)
     let saved_hint = tc_construct_hint
     if tc_tid_is_no_info(declared) == 0 { tc_construct_hint = resolve_alias_tid(declared) }
@@ -18039,9 +18066,10 @@ fn tc_stamp_annotated_global_init(l: Int, l_val: Int) ! TypeCheck.Resolve, TypeC
     tc_check_body(l_val)
     if tc_tid_is_no_info(declared) == 0 && tc_tid_is_no_info(v_tid) == 0 {
         // Behind the compare, for the reason the LetBinding arm gives at its own pin: a pin
-        // ahead of the compare can turn a mismatch into a silent success. The compare only
-        // reports through the diagnostics this pass discards, so it gates and nothing more.
-        if assignment_types_compatible(declared, v_tid, l_val) != 0 {
+        // ahead of the compare can turn a mismatch into a silent success.
+        if assignment_types_compatible(declared, v_tid, l_val) == 0 {
+            tc_error_at("variable '{node_name(l)}': declared type {type_to_str(declared)} but got {type_to_str(v_tid)}", l)
+        } else {
             if tc_pin_ok_for_declared(l_val, declared) != 0 {
                 tc_pin_tail_ret_generic(declared, v_tid)
             } else if tc_ifmatch_arms_all_ret_mint(l_val) != 0 {
@@ -18049,9 +18077,6 @@ fn tc_stamp_annotated_global_init(l: Int, l_val: Int) ! TypeCheck.Resolve, TypeC
             }
         }
     }
-    diag_truncate(saved)
-    tc_errors_truncate(saved_errors)
-    tc_ud_truncate_pending(saved_blames)
 }
 
 // Second pass over every global's initializer, in source order. The first pass registered the
@@ -18066,11 +18091,10 @@ fn tc_stamp_annotated_global_init(l: Int, l_val: Int) ! TypeCheck.Resolve, TypeC
 // registered now, so infer again: a later global that reads an earlier one (`let b = a`) sees a's
 // fresh tid, and codegen spells the declaration from it and not from its flat arm.
 //
-// infer_type both REPORTS and mints metavars, so the read stays contained: this pass rolls back
-// every diagnostic it raises (codegen validates a global initializer, not this site — and blinkc
-// stops on diag_count > 0), and adopts the tid only when the read was clean AND fully ground. An
-// open tid (`[]` -> List[α]) or a read that errored leaves the binding UNKNOWN, as before — this
-// pass only turns UNKNOWN into a concrete tid.
+// infer_type both REPORTS and mints metavars. The report stands: a module-level initializer is
+// checked at its own site, as a fn-body `let` is. The binding takes the tid only when the read
+// was clean AND fully ground; an open tid (`[]` -> List[α]) or a read that errored leaves it
+// UNKNOWN, so this pass only turns UNKNOWN into a concrete tid.
 //
 // A clean but still-open tid is the module-scope form of the region-boundary under-determined
 // case (nr_pop_scope): a top-level binding takes its type at its own site from its RHS and
@@ -18093,16 +18117,8 @@ fn tc_infer_global_initializers(lets_sl: Int) ! TypeCheck.Resolve, TypeCheck.Rep
                 if vk != NodeKind.IntLit && vk != NodeKind.FloatLit && vk != NodeKind.BoolLit && vk != NodeKind.InterpString {
                     nr_current_module = node_module(l)
                     let saved = diag_entry_count()
-                    let saved_errors = tc_errors.len()
-                    let saved_blames = tc_ud_pending_count()
                     let l_tid = infer_type(l_val)
                     let clean = diag_entry_count() == saved
-                    diag_truncate(saved)
-                    tc_errors_truncate(saved_errors)
-                    // This read is speculative and its diagnostics go away, so the blames it
-                    // recorded go with them. The binding takes its type below from its RHS and
-                    // annotation alone.
-                    tc_ud_truncate_pending(saved_blames)
                     if clean && tc_tid_is_no_info(l_tid) == 0 {
                         if tc_tid_has_unbound_metavar(l_tid) != 0 {
                             tc_ud_judge_binder(node_name(l), l_tid, l)
@@ -18159,6 +18175,15 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
             let l = sublist_get(lets_sl, i)
             let l_ann = node_target(l)
             let l_type_str = node_type_name(l)
+            // An annotation is a type reference wherever it is written, so a global's
+            // annotation answers to the same resolution a fn-body let's does. Without this
+            // a name no type owns resolves to UNKNOWN in silence and reaches codegen.
+            nr_current_module = node_module(l)
+            if l_ann != -1 {
+                nr_check_type_ann_visibility(l_ann)
+            } else if l_type_str != "" {
+                nr_check_type_ref(l_type_str)
+            }
             let mut l_tid = TYPE_UNKNOWN
             if l_ann != -1 {
                 l_tid = resolve_type_ann(l_ann)

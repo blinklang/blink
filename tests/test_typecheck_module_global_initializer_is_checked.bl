@@ -1,0 +1,136 @@
+// A module-level `let` is typechecked at its own site, exactly as a `let` in a function body
+// is. Four properties, one row each: an annotation naming no known type is reported; an
+// initializer may call any function the module declares, in either order; a destructuring
+// binder registers every leaf with the leaf's own type; and a declared type that the
+// initializer contradicts is reported with the wording a function body already produces.
+//
+// Every row goes through a probe rather than declaring the shape in this file. The shapes
+// under test are module-scope declarations, so this file cannot hold them, and the pinned
+// reference compiler that builds this file accepts three of the four in silence. The probe is
+// checked by the compiler in this tree.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn compile_only(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    let _rm = process_run("rm", ["-f", path])
+    check_types(program)
+}
+
+fn messages_named(name: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.name == name { out.push(d.message) }
+    }
+    out
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn assert_one_message_containing(label: Str, name: Str, want: Str) {
+    let msgs = messages_named(name)
+    let mut hits = 0
+    for m in msgs {
+        if m.contains(want) { hits = hits + 1 }
+    }
+    if hits != 1 {
+        io.println("FAIL: {label}: want one {name} containing '{want}', got:")
+        for d in diag_entries { io.println("  {d.name}: {d.message}") }
+    }
+    assert(hits == 1)
+}
+
+fn only_message(label: Str, name: Str) -> Str {
+    let msgs = messages_named(name)
+    if msgs.len() != 1 {
+        io.println("FAIL: {label}: want exactly one {name}, got {msgs.len()}:")
+        for d in diag_entries { io.println("  {d.name}: {d.message}") }
+    }
+    assert(msgs.len() == 1)
+    msgs.get(0).unwrap()
+}
+
+test "a module-global annotation naming no known type is reported" {
+    let src = #"let g: Nope = [1, 2]
+
+fn main() {
+    let n = g.len()
+    let _ = n
+}
+"#
+    compile_only("mod_global_unknown_type", src)
+    assert_one_message_containing("unknown global annotation", "UnknownType", "Nope")
+}
+
+test "a module-global initializer calls a fn the module declares, in either order" {
+    let src = #"let early: Int = mk()
+
+fn mk() -> Int { 7 }
+
+let late: Int = mk()
+
+fn main() {
+    let n = early + late
+    let _ = n
+}
+"#
+    compile_only("mod_global_calls_toplevel_fn", src)
+    assert_no_errors("global initializer calls a top-level fn")
+}
+
+test "a module-level destructuring let binds every leaf with the leaf's own type" {
+    let src = #"let (ga, gb): (Int, Str) = (1, "x")
+
+fn main() {
+    let n = ga + gb.len()
+    let _ = n
+}
+"#
+    compile_only("mod_global_tuple_destructure", src)
+    assert_no_errors("module-level tuple destructure")
+}
+
+test "a module-global whose initializer contradicts its annotation reports as a fn body does" {
+    let at_module = #"let g: Int = "x"
+
+fn main() {
+    let n = g
+    let _ = n
+}
+"#
+    compile_only("mod_global_type_mismatch", at_module)
+    let module_msg = only_message("module-scope mismatch", "TypeError")
+
+    let in_body = #"fn main() {
+    let g: Int = "x"
+    let n = g
+    let _ = n
+}
+"#
+    compile_only("fn_body_type_mismatch", in_body)
+    let body_msg = only_message("fn-body mismatch", "TypeError")
+
+    assert_eq(module_msg, body_msg)
+}
