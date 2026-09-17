@@ -29,7 +29,8 @@ import diagnostics.{
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
     ASSERT_PANICS_OUTSIDE_TEST, ASSERT_PANICS_NESTED_EXPECT_PANIC, XFAIL_MISSING_REASON,
     PUB_FFI, FFI_NO_EFFECTS, CONTRACT_ON_FFI, INVALID_PTR_TYPE,
-    COALESCE_REQUIRES_OPT,
+    COALESCE_REQUIRES_OPT, MISSING_KEYWORD_ARG, INVALID_KEYWORD_ARG,
+    BARE_GENERIC_FN_AS_VALUE, FFI_SCOPE_NOT_WITH_RESOURCE, RAW_BYPASSES_PARAM,
     PTR_OUTSIDE_FFI, FFI_STRUCT_GC_FIELD, BYTES_GROW_IN_WITH_PTR,
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
@@ -1060,6 +1061,12 @@ let mut tc_trait_tparam_names: List[Str] = []
 let mut tc_trait_tparam_nodes: List[Int] = []
 
 let mut tc_current_fn_ret: Int = -1
+// The expression a `with` is holding open, while that expression is being checked. An ffi
+// scope frees its allocations when the block ends, so it is only meaningful in this one
+// position, and this is how the check below tells that position from every other.
+let mut tc_with_resource_node: Int = -1
+// The function whose body is being walked, for the annotations a rule reads off it.
+let mut tc_current_fn_node: Int = -1
 let mut tc_current_fn_name: Str = ""
 // The receiver type of the impl block whose method body is being checked, or -1 outside one
 // (free functions, trait default bodies, test blocks). `self` is the only parameter with no
@@ -3911,6 +3918,96 @@ fn tc_fnsig_param_index_by_name(param_start: Int, param_count: Int, self_offset:
     -1
 }
 
+// The shape rules for a call that names its parameters, from sections/02_syntax.md's keyword
+// arguments: labels come after the positional arguments, every label names a parameter of the
+// callee, and every parameter from the first label onward gets exactly one argument.
+//
+// Runs only when the arity already agrees. A call with the wrong number of arguments has one
+// mistake, and the arity report is the one that names it; adding "missing keyword argument"
+// on top would report the same mistake twice under two codes.
+fn tc_check_keyword_args(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int, call_node: Int) ! Diag.Report {
+    if args_sl == -1 { return }
+    let fs = fnsig_pool.get(sig).unwrap()
+    let param_start = fs.params_start
+    let param_count = fs.params_count
+    let argc = sublist_length(args_sl)
+    if argc + self_offset != param_count { return }
+    let mut positional_end = -1
+    let mut i = 0
+    while i < argc {
+        if node_kind(sublist_get(args_sl, i)) == NodeKind.NamedArg {
+            positional_end = i
+            i = argc
+        }
+        i = i + 1
+    }
+    if positional_end == -1 { return }
+    i = positional_end
+    while i < argc {
+        let arg = sublist_get(args_sl, i)
+        if node_kind(arg) == NodeKind.NamedArg {
+            let label = node_name(arg)
+            if tc_fnsig_param_index_by_name(param_start, param_count, self_offset, label) == -1 {
+                diag_error_at("InvalidKeywordArg", INVALID_KEYWORD_ARG, "no parameter named '{label}' in function '{fn_name}'", arg, "check the function signature")
+                return
+            }
+        } else {
+            diag_error_at("InvalidKeywordArg", INVALID_KEYWORD_ARG, "positional argument after named argument in call to '{fn_name}'", arg, "place all positional arguments before named arguments")
+            return
+        }
+        i = i + 1
+    }
+    let mut pi = positional_end + self_offset
+    while pi < param_count {
+        let param_name = fnsig_param_names.get(param_start + pi) ?? ""
+        let mut found = 0
+        let mut j = positional_end
+        while j < argc {
+            let arg = sublist_get(args_sl, j)
+            if node_kind(arg) == NodeKind.NamedArg && node_name(arg) == param_name { found = 1 }
+            j = j + 1
+        }
+        if found == 0 {
+            diag_error_at("MissingKeywordArg", MISSING_KEYWORD_ARG, "missing keyword argument '{param_name}' in call to '{fn_name}'", call_node, "add '{param_name}: <value>'")
+            return
+        }
+        pi = pi + 1
+    }
+}
+
+// A bare function name standing where the parameter asks for a closure. A concrete function
+// has one body and one set of types, so its name is enough to build the value from. A generic
+// one does not: the type arguments would have to come from the parameter, and a parameter
+// typed `fn(Int) -> Int` says nothing about which instantiation the caller meant. The closure
+// literal is where the caller writes that down.
+fn tc_check_bare_fn_arg(arg_node: Int, ptid: Int) ! Diag.Report {
+    if type_kind(resolve_alias_tid(ptid)) != TyKind.Fn { return }
+    if node_kind(arg_node) != NodeKind.Ident { return }
+    let name = node_name(arg_node)
+    // A local of the same name wins: it is a value already, and the function it shadows is
+    // not what the caller wrote. Asks for a TYPE and not for definedness — the resolver holds
+    // every top-level function under its own name too, so definedness cannot tell the two apart.
+    if tc_tid_is_no_info(nr_get_type(name)) == 0 { return }
+    let callee_sig = lookup_fnsig(name)
+    if callee_sig == -1 { return }
+    if fnsig_pool.get(callee_sig).unwrap().type_params_count == 0 { return }
+    diag_error_at("BareGenericFnAsValue", BARE_GENERIC_FN_AS_VALUE, "cannot pass generic fn '{name}' as a closure value", arg_node, "wrap it in a closure literal that names the type, e.g. `\{x => {name}(x)\}`")
+}
+
+// `Raw(x)` written inside an interpolation. Raw is what puts a value into a template without
+// a parameter placeholder, so it is the one part of a template the database sees as text.
+fn tc_is_raw_call(node: Int) -> Int {
+    if node_kind(node) != NodeKind.Call { return 0 }
+    let left = node_left(node)
+    if left == -1 { return 0 }
+    if node_kind(left) != NodeKind.Ident { return 0 }
+    if node_name(left) != "Raw" { return 0 }
+    let args_sl = node_args(node)
+    if args_sl == -1 { return 0 }
+    if sublist_length(args_sl) != 1 { return 0 }
+    1
+}
+
 // Validate call args against a fnsig's param types (type only, no arity).
 // `self_offset` skips leading implicit params: 0 for free functions, 1 for
 // methods whose fnsig carries `self` as param 0 (so explicit arg `i` aligns to
@@ -3937,6 +4034,7 @@ fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int) ! Ty
         if pidx >= 0 && pidx < param_count {
             let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
             if tc_tid_is_no_info(ptid) == 0 {
+                tc_check_bare_fn_arg(arg_node, ptid)
                 tc_seed_closure_expected_fn(arg_node, ptid)
                 let saved_hint = tc_construct_hint
                 tc_construct_hint = resolve_alias_tid(ptid)
@@ -8854,6 +8952,8 @@ fn init_types() ! TypeCheck.Register {
     tc_trait_supers_idx.clear()
     tc_current_fn_ret = -1
     tc_current_fn_name = ""
+    tc_with_resource_node = -1
+    tc_current_fn_node = -1
     tc_current_self_tid = -1
     tc_current_method_sig_key = ""
     tc_in_closure_depth = 0
@@ -13620,6 +13720,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             let mut pi = 0
             while pi < sublist_length(parts_sl) {
                 let part = sublist_get(parts_sl, pi)
+                if tc_is_raw_call(part) != 0 {
+                    // -1 is a body with no enclosing user function — a test body, or the top
+                    // level. No function means no audit to find, so the warning stands.
+                    if tc_current_fn_node == -1 || has_annotation(tc_current_fn_node, "trusted") == 0 {
+                        diag_warn_at("RawBypassesParam", RAW_BYPASSES_PARAM, "Raw() bypasses query parameterization", part, "add @trusted(audit: \"AUDIT-ID\") to suppress")
+                    }
+                }
                 if is_interp_literal_part(part) == 0 {
                     let ptid = infer_type(part)
                     // Spec §3.6 (DECISIONS.md:191-192): every interpolated
@@ -14073,6 +14180,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         let expected = fs.params_count
                         tc_error_at("function '{fn_name}' expects {expected} argument(s), got {arg_count}", node)
                     }
+                    tc_check_keyword_args(fn_name, sig, args_sl, 0, node)
                     check_arg_shapes(fn_name, sig, args_sl, 0)
                     if fs.type_params_count > 0 {
                         // Enforce each type param's declared bound against the concrete
@@ -15438,6 +15546,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         tc_error_at("function '{obj_name}.{method}' expects {nsi_fs.params_count} argument(s), got {nsi_got}", node)
                     }
                     check_arg_shapes("{obj_name}.{method}", nsi, nsi_args, 0)
+                    if obj_name == "ffi" && method == "scope" && node != tc_with_resource_node {
+                        diag_error_at("FfiScopeNotWithResource", FFI_SCOPE_NOT_WITH_RESOURCE, "ffi.scope() is only valid as a `with`-resource — its allocations are freed at block exit", node, "use `with ffi.scope() as scope \{ ... \}`")
+                    }
                     return nsi_fs.ret
                 }
                 // The print family is listed by is_intrinsic_method and deliberately
@@ -16766,7 +16877,9 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
     let fn_name = node_name(fn_node)
     let prev_fn_name = tc_current_fn_name
     let prev_fn_ret = tc_current_fn_ret
+    let prev_fn_node = tc_current_fn_node
     tc_current_fn_name = fn_name
+    tc_current_fn_node = fn_node
     // An impl method's signature lives under the trait-mangled key, not under the display name the
     // caller installed on the node.
     let sig = if tc_current_method_sig_key != "" { lookup_fnsig(tc_current_method_sig_key) } else { lookup_fnsig(fn_name) }
@@ -16895,6 +17008,7 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
     diag_clear_allows()
     tc_pop_tparam_scope(fn_tparams)
     tc_current_fn_name = prev_fn_name
+    tc_current_fn_node = prev_fn_node
     tc_current_fn_ret = prev_fn_ret
     nr_pop_scope()
     tc_boundary_check_active = prev_boundary
@@ -17109,8 +17223,11 @@ fn tc_with_binder_tid(res_tid: Int) -> Int ! TypeCheck.Resolve {
 
 fn tc_bind_with_resource(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let res_expr = node_value(item)
+    let prev_res = tc_with_resource_node
+    tc_with_resource_node = res_expr
     tc_check_body(res_expr)
     let res_tid = infer_type(res_expr)
+    tc_with_resource_node = prev_res
     let bind_tid = tc_with_binder_tid(res_tid)
     // The node's tid is the BINDER's type, not the resource expression's: codegen's only consumer
     // reads it to stamp the binder's ScopeVar, so keeping the resource type here would just move

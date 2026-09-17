@@ -1,0 +1,202 @@
+// Five rules the compiler has always had, reported by the phase that owns them.
+//
+// Each of these was written as an emitter inside the old back end, so a program only heard
+// about the mistake if it got that far, and `blink check` — which stops before codegen —
+// passed it. The back end is gone, and with it went the reports; the diagnostic index still
+// carries all five codes, so `blink explain` describes rules nothing enforced.
+//
+// Every one of them is decidable from the call's shape and the signature it names, which
+// typecheck already has in hand. Nothing here changes which programs are legal: these are the
+// same refusals, moved to the phase that can make them.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn run_probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    0
+}
+
+// The error names a source draws, joined, so a row states the whole answer instead of
+// asserting one entry sits somewhere among others.
+fn probe_error_names(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let _r = run_probe(stem, src)
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out = "{out}{d.name} " }
+    }
+    out.trim()
+}
+
+fn probe_warning_names(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let _r = run_probe(stem, src)
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "warning" { out = "{out}{d.name} " }
+    }
+    out.trim()
+}
+
+fn assert_names(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: drew '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+fn unknown_label_src() -> Str {
+    #"fn greet(name: Str, greeting: Str) -> Str { "{greeting}, {name}" }
+
+fn main() {
+    io.println(greet("ada", salutation: "hello"))
+}
+"#
+}
+
+fn positional_after_named_src() -> Str {
+    #"fn greet(name: Str, greeting: Str) -> Str { "{greeting}, {name}" }
+
+fn main() {
+    io.println(greet(name: "ada", "hello"))
+}
+"#
+}
+
+fn repeated_label_src() -> Str {
+    #"fn greet(name: Str, greeting: Str) -> Str { "{greeting}, {name}" }
+
+fn main() {
+    io.println(greet(name: "ada", name: "grace"))
+}
+"#
+}
+
+fn keyword_args_in_order_src() -> Str {
+    #"fn greet(name: Str, greeting: Str) -> Str { "{greeting}, {name}" }
+
+fn main() {
+    io.println(greet("ada", greeting: "hello"))
+}
+"#
+}
+
+fn generic_fn_as_value_src() -> Str {
+    #"fn identity[T](x: T) -> T { x }
+
+fn apply(f: fn(Int) -> Int, v: Int) -> Int { f(v) }
+
+fn main() {
+    io.println("{apply(identity, 3)}")
+}
+"#
+}
+
+fn concrete_fn_as_value_src() -> Str {
+    #"fn bump(x: Int) -> Int { x + 1 }
+
+fn apply(f: fn(Int) -> Int, v: Int) -> Int { f(v) }
+
+fn main() {
+    io.println("{apply(bump, 3)}")
+}
+"#
+}
+
+fn ffi_scope_as_let_src() -> Str {
+    #"fn main() {
+    let scope = ffi.scope()
+    io.println("made one")
+}
+"#
+}
+
+fn ffi_scope_as_resource_src() -> Str {
+    #"fn main() {
+    with ffi.scope() as scope {
+        io.println("made one")
+    }
+}
+"#
+}
+
+fn raw_interpolation_src() -> Str {
+    #"fn main() {
+    let col = "name"
+    let q = "select {Raw(col)} from t"
+    io.println(q)
+}
+"#
+}
+
+fn trusted_raw_interpolation_src() -> Str {
+    #"@trusted(audit: "AUDIT-1")
+fn build_query(col: Str) -> Str {
+    "select {Raw(col)} from t"
+}
+
+fn main() {
+    io.println(build_query("name"))
+}
+"#
+}
+
+test "a keyword argument naming no parameter is refused" {
+    assert_names("unknown label", probe_error_names("tc_kw_unknown", unknown_label_src()),
+        "InvalidKeywordArg")
+}
+
+test "a positional argument after a keyword argument is refused" {
+    assert_names("positional after named",
+        probe_error_names("tc_kw_positional_after", positional_after_named_src()),
+        "InvalidKeywordArg")
+}
+
+// Two arguments naming the same parameter leave another parameter with nothing bound to it,
+// and the arity count alone cannot see that, because the count is right.
+test "a parameter that no keyword argument names is refused" {
+    assert_names("repeated label", probe_error_names("tc_kw_repeated", repeated_label_src()),
+        "MissingKeywordArg")
+}
+
+test "positional arguments followed by keyword arguments are accepted" {
+    assert_names("keywords in order",
+        probe_error_names("tc_kw_ok", keyword_args_in_order_src()), "")
+}
+
+test "a bare generic function passed where a closure is expected is refused" {
+    assert_names("generic fn value",
+        probe_error_names("tc_generic_fn_value", generic_fn_as_value_src()),
+        "BareGenericFnAsValue")
+}
+
+test "a bare concrete function passed where a closure is expected is accepted" {
+    assert_names("concrete fn value",
+        probe_error_names("tc_concrete_fn_value", concrete_fn_as_value_src()), "")
+}
+
+// The allocations an ffi scope hands out are freed when its block ends, so a scope with no
+// block would free them at a point no reader can name.
+test "an ffi scope bound outside a with-resource is refused" {
+    assert_names("scope in let", probe_error_names("tc_ffi_scope_let", ffi_scope_as_let_src()),
+        "FfiScopeNotWithResource")
+}
+
+test "an ffi scope used as a with-resource is accepted" {
+    assert_names("scope as resource",
+        probe_error_names("tc_ffi_scope_with", ffi_scope_as_resource_src()), "")
+}
+
+test "an interpolated Raw call warns that it bypasses parameterization" {
+    assert_names("raw in interpolation",
+        probe_warning_names("tc_raw_warn", raw_interpolation_src()), "RawBypassesParam")
+}
+
+test "an interpolated Raw call inside an audited function does not warn" {
+    assert_names("trusted raw",
+        probe_warning_names("tc_raw_trusted", trusted_raw_interpolation_src()), "")
+}
