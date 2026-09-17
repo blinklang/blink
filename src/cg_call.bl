@@ -39,7 +39,7 @@ import layout.{
     LayoutRecord, Position, SlotForm, Slot, layout_of, carrier_member_layout, tid_of_node,
     child_tid, ensure_typedef_for, format_spec_of, varargs_spelling,
     tid_of_binder, current_binder_scope, current_inst, decl_has_derive,
-    container_slot_spelling, field_layout_of, address_layout_of,
+    container_slot_spelling, field_layout_of, address_layout_of, fn_pointer_spelling_of,
 }
 import mono.{instances, instance_for_call}
 import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls, cg_reg_trait_decls}
@@ -51,7 +51,7 @@ import cname.{
     c_variant_tag_macro, c_mono_variant_tag_macro, c_variant_member_name,
 }
 import ir.{
-    ir_call_direct, ir_call_runtime, ir_cast, ir_unary, ir_unbox, ir_box,
+    ir_call_direct, ir_call_runtime, ir_call_closure, ir_cast, ir_unary, ir_unbox, ir_box,
     ir_assign, ir_binary, ir_block, ir_carrier_tag, ir_carrier_unwrap, ir_carrier_wrap,
     ir_const, ir_if, ir_let, ir_panic, ir_struct_new, ir_var_ref, ir_field_get,
     ir_enum_new,
@@ -439,15 +439,51 @@ fn lower_fn_call(node: Int) -> Int ! Diag.Report {
     // dispatches to this function. So a callee that is not a plain written name is a call
     // expression, a closure literal, a container element or the like standing where a name
     // would go: an expression that PRODUCES a closure value, not one that names a function.
+    // A bound name is the same: the binder shadows whatever the name would name as a
+    // function, so it is a closure value too, only spelled with one less step in between.
     if callee < 0 || nk_of(node_kind(callee)) != NodeKind.Ident {
-        diag_ice_stage_not_built("cg_call closure-value callees", node)
-        return -1
+        return cc_closure_call(node, callee)
     }
     if !cc_is_free_name(callee) {
-        diag_ice_stage_not_built("cg_call closure values", node)
-        return -1
+        return cc_closure_call(node, callee)
     }
     cc_free_call(node, cc_fn_anywhere(node, cc_declared_name(node_name(callee))))
+}
+
+// A call whose callee is a closure value rather than a function's own name: the callee
+// expression is lowered like any other value, and the call reads its `fn_ptr` field
+// through the C function-pointer type its Fn tid spells. Layout answers that type from
+// the tid alone, so a bound local and an expression that returns a closure (an IIFE, a
+// container element) build the same way.
+fn cc_closure_call(node: Int, callee: Int) -> Int ! Diag.Report {
+    if callee < 0 { return cc_not_a_callee(node) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    let fn_type = fn_pointer_spelling_of(tid_of_node(callee), node)
+    if fn_type == "" { return -1 }
+    let closure = lower_expr(callee)
+    if closure < 0 { return -1 }
+    let mut args: List[Int] = []
+    let written = node_args(node)
+    let mut i = 0
+    while i < sublist_length(written) {
+        let a = lower_expr(sublist_get(written, i))
+        if a < 0 { return -1 }
+        args.push(a)
+        i = i + 1
+    }
+    ir_call_closure(tid, node, rec.c_spelling, fn_type, rec.slot_form, closure, args)
+}
+
+// A call node the front end accepted with no callee at all: a compiler bug elsewhere, not
+// a gap in this stage.
+fn cc_not_a_callee(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("MissingCallee", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "a call has no callee to lower", node,
+        "typecheck accepts only a call written over some expression; this is a compiler bug")
+    -1
 }
 
 // `mod.f(args)`: the same free-function call, written with the module the function was
