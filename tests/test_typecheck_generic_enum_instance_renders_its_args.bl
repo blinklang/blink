@@ -1,0 +1,110 @@
+// A monomorphized enum instance is a different type per argument, and the surface rendering
+// has to say so. Rendered bare, `ZzTree[Int]` and `ZzTree[Str]` are one word, which makes a
+// mismatch between them read "declared type ZzTree but got ZzTree" — a line that contradicts
+// itself and names no repair. A struct instance has always rendered its args; an enum
+// instance is the same kind of type and is now rendered the same way.
+//
+// The rows read the rendering directly and then read one diagnostic built from it, because
+// the rendering is a lens on the type and the diagnostic is what it is for.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn enum_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// The type of the one Ident read spelled `nm`, rendered. The declaration spells its name in
+// a type position, which is not an Ident node, so a read is what this finds. -2 marks an
+// ambiguous one, so a row fails rather than reading whichever came last.
+fn rendered_type_of_read(nm: Str) -> Str {
+    let mut hit = -1
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.Ident && node_name(i) == nm {
+            if hit != -1 { return "<ambiguous>" }
+            hit = i
+        }
+        i = i + 1
+    }
+    if hit == -1 { return "<absent>" }
+    tc_type_str(tc_lookup_node_tid(hit))
+}
+
+fn errors_saying(text: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.message.contains(text) { n = n + 1 }
+    }
+    n
+}
+
+fn instances_src() -> Str {
+    #"type ZzTree[T] {
+    Leaf
+    Node(v: T)
+}
+
+fn zzreads() -> Int {
+    let zzint: ZzTree[Int] = ZzTree.Node(1)
+    let zzstr: ZzTree[Str] = ZzTree.Node("x")
+    let zzintread = zzint
+    let zzstrread = zzstr
+    match zzintread {
+        ZzTree.Node(v) => v
+        ZzTree.Leaf => 0
+    }
+}
+
+fn main() {
+    let _ = zzreads()
+}
+"#
+}
+
+fn mismatch_src() -> Str {
+    #"type ZzTree[T] {
+    Leaf
+    Node(v: T)
+}
+
+fn zzmismatch() {
+    let zzint: ZzTree[Int] = ZzTree.Node(1)
+    let zzwrong: ZzTree[Str] = zzint
+    io.println("{zzwrong}")
+}
+
+fn main() {
+    zzmismatch()
+}
+"#
+}
+
+test "a generic enum instance renders its type arguments" {
+    enum_probe("build/generic_enum_render.bl", instances_src())
+
+    // Two instances of the same enum, distinct types, and the rendering now says which is
+    // which. Rendered bare, both of these read "ZzTree".
+    assert_eq(rendered_type_of_read("zzint"), "ZzTree[Int]")
+    assert_eq(rendered_type_of_read("zzstr"), "ZzTree[Str]")
+}
+
+test "a mismatch between two instances of one enum names both sides apart" {
+    enum_probe("build/generic_enum_mismatch.bl", mismatch_src())
+
+    // The whole point of the rendering: before this, the line read "declared type ZzTree but
+    // got ZzTree", which states no difference and asks for no repair.
+    assert_eq(errors_saying("declared type ZzTree[Str] but got ZzTree[Int]"), 1)
+    assert_eq(errors_saying("declared type ZzTree but got ZzTree"), 0)
+}
