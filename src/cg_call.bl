@@ -28,12 +28,13 @@ import ast.{NodeKind, nk_of, node_kind_name}
 import typecheck.{
     TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, lookup_named_type,
     DECL_NODE_AMBIGUOUS,
-    is_import_module_name, is_builtin_namespace, is_builtin_fn, tc_alias_to_original,
+    is_import_module_name, is_builtin_namespace, is_builtin_fn, is_intrinsic_method, tc_alias_to_original,
     tc_qualifier_to_module_or_self, tc_get_symbol_module, tc_type_str,
     tc_enum_variant_slots, tc_evar_name, tc_tid_child_count,
     tc_struct_field_slots, tc_sfield_name,
     tc_names_a_type, tc_is_sealed_list_hof, is_user_effect_handle_name,
     tc_lookup_node_tid, tc_unclaimed_call_tid, tc_list_rename_help, tc_tid_iter_elem,
+    tc_call_decl_node,
     TYPE_INT, TYPE_BOOL, TYPE_STR,
 }
 import layout.{
@@ -132,9 +133,21 @@ pub fn lower_call(node: Int) -> Int ! Diag.Report {
 // an unbuilt-method ICE that names no method at all. This backstop reports the same E0505 a
 // receiver typecheck could fully determine would have reported, and refuses before any of
 // that dispatch runs, so nothing here is ever lowered for a call that carries no type.
+//
+// A namespace or module qualifier is not a value, so it carries no type for `tid_of_node`
+// to read: asking for one anyway would report the wrong bug, an internal NoTypeForNode
+// that names neither the qualifier nor the method. That receiver shape is named directly,
+// before the value-typed path below ever asks a namespace qualifier for a type it does
+// not have.
 fn cc_unclaimed_method_call(node: Int) -> Int ! Diag.Report {
     let obj = node_obj(node)
     let mname = node_method(node)
+    let qualifier = node_name(obj)
+    if is_builtin_namespace(qualifier) == 1 || is_import_module_name(qualifier) == 1 {
+        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD,
+            "no member '{mname}' on module '{qualifier}'", node, "")
+        return -1
+    }
     let recv_tid = tid_of_node(obj)
     if recv_tid < 0 { return -1 }
     let tname = tc_type_str(recv_tid)
@@ -481,6 +494,17 @@ fn lower_fn_call(node: Int) -> Int ! Diag.Report {
     // something else reaches the builtin under its own name regardless.
     let name = cc_declared_name(node_name(callee))
     if is_builtin_fn(name) == 1 { return lower_builtin_free_call(node, name) }
+    // typecheck's own call-site table is read first: it is keyed on this call node rather
+    // than on a spelling, so two modules declaring the same name are told apart the way the
+    // caller's own import list already told them apart, with no re-derived search that could
+    // land on the wrong one. Its one known gap is a name that reaches here only through an
+    // import alias binding no OTHER declaration shares (`nr_resolve_bare_decl` reads
+    // `nr_decls_by_name`, which is keyed on declared spellings, so a pure alias with no
+    // declaration of its own is invisible to it) — a call through `merged` where the import
+    // read `map_merge as merged` and nothing else in the program is named `merged` at all.
+    // That shape still falls back to the alias-resolved name search below.
+    let decl = tc_call_decl_node(node)
+    if decl >= 0 { return cc_free_call(node, decl) }
     cc_free_call(node, cc_fn_anywhere(node, name))
 }
 
@@ -621,9 +645,20 @@ fn cc_call_site_type_arg_call(node: Int) -> Int ! Diag.Report {
 // declared in. The qualifier names no value, so nothing precedes the written arguments,
 // and the declaration is the one that module declares rather than whichever module
 // happens to spell the name.
+//
+// typecheck's own call-site table is read first and is the answer for every ordinary
+// qualified call, the same table a bare call reads. It has one known gap: a qualifier that
+// only re-exports the member (`nr_resolve_qualified_decl` matches the qualifier's own
+// declarations, not a chain of `pub import`s), so a miss here still falls back to naming
+// the member through the flat symbol table rather than refusing a program the front end
+// accepted. The method name is read exactly as written, never through the alias table: a
+// qualified access is never subject to another file's import alias, which only ever
+// renames a bare name inside the file that bound it.
 fn lower_module_call(node: Int, obj: Int) -> Int ! Diag.Report {
+    let decl = tc_call_decl_node(node)
+    if decl >= 0 { return cc_free_call(node, decl) }
     let module_key = tc_qualifier_to_module_or_self(node_name(obj))
-    cc_free_call(node, cc_fn_in_module(node, module_key, cc_declared_name(node_method(node))))
+    cc_free_call(node, cc_fn_in_module(node, module_key, node_method(node)))
 }
 
 // The tail every free-function call shares once its declaration is known. A declaration of
@@ -745,10 +780,21 @@ fn cc_no_module_member(node: Int) -> Int ! Diag.Report {
 // stands between them and the stream, but the runtime publishes no call that writes a
 // rendered value raw either. The last four read and write the standard streams through
 // calls the runtime does publish, so those are built.
+//
+// A namespace is not always PURELY a compiler namespace: `net` and `term` (and others) are
+// also the name of a real stdlib module, and most of what a caller writes through them is
+// an ordinary declared function that module exports, not a runtime call this stage builds
+// itself. `is_intrinsic_method` is typecheck's own per-method gate for exactly this
+// question, already read the same way at the call's typecheck; reading it again here before
+// committing to the namespace lowering is what keeps `net.tcp_connect` and `term.cyan`
+// resolving as the module calls they are, while `net.connect` and `term.isatty`, which
+// typecheck answers itself, still reach the runtime call below.
 
 let ns_io = "io"
 let ns_env = "env"
 let ns_ffi = "ffi"
+let ns_net = "net"
+let ns_term = "term"
 
 // The io names a handler can replace, and the env names it can. Both lists are written
 // under the names a caller writes, not under the vtable slots they reach, because the
@@ -762,10 +808,32 @@ let io_raw_ops: List[Str] = ["print_raw", "eprint_raw"]
 
 fn lower_namespace_call(node: Int, obj: Int) -> Int ! Diag.Report {
     let ns = node_name(obj)
-    if ns == ns_io { return lower_io_call(node, node_method(node)) }
-    if ns == ns_env { return lower_env_call(node, node_method(node)) }
-    if ns == ns_ffi { return lower_ffi_call(node, node_method(node)) }
-    cc_ns_not_built(node, ns, node_method(node))
+    let method = node_method(node)
+    if is_intrinsic_method(ns, method) == 0 && is_import_module_name(ns) == 1 {
+        return lower_module_call(node, obj)
+    }
+    if ns == ns_io { return lower_io_call(node, method) }
+    if ns == ns_env { return lower_env_call(node, method) }
+    if ns == ns_ffi { return lower_ffi_call(node, method) }
+    if ns == ns_net { return lower_net_call(node, method) }
+    if ns == ns_term { return lower_term_call(node, method) }
+    cc_ns_not_built(node, ns, method)
+}
+
+// The one net method the runtime publishes a call for. The rest of the intrinsic surface
+// typecheck lists (`net.listen`, `net.read`, ...) has no runtime call behind it yet, so it
+// stays refused; the module-declared surface above it (`net.tcp_connect` and its kin) is a
+// declared call, not this table's concern.
+fn lower_net_call(node: Int, method: Str) -> Int ! Diag.Report {
+    if method == "connect" { return cc_build_call(node, c_runtime_helper("tcp_connect"), NO_RECEIVER, CallForm.Runtime, false) }
+    cc_ns_not_built(node, ns_net, method)
+}
+
+// The one term method the runtime publishes a call for. `term.width` and `term.height`
+// are listed the same way `net.listen` is: signed, not yet built.
+fn lower_term_call(node: Int, method: Str) -> Int ! Diag.Report {
+    if method == "isatty" { return cc_build_call(node, c_runtime_helper("term_isatty"), NO_RECEIVER, CallForm.Runtime, false) }
+    cc_ns_not_built(node, ns_term, method)
 }
 
 // The whole of what the `ffi` namespace answers is a new arena. Every operation over that

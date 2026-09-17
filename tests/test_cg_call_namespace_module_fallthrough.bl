@@ -1,0 +1,148 @@
+// `net` and `term` are builtin namespaces AND real stdlib module names at once. A handful
+// of their methods are compiler intrinsics the runtime answers directly (net.connect,
+// term.isatty); the rest are ordinary functions the net/term modules declare, which happen
+// to call those intrinsics internally (net.tcp_connect, term.is_tty, term.cyan). Both
+// spellings type through the same qualifier, so codegen has to read the method, not just
+// the namespace, to tell which lowering owns the call: an intrinsic method is built here,
+// and every other method falls through to the module dispatch a plain qualified call gets.
+
+import lower_test_helpers.{
+    probe, rhs_of, let_node_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
+    assert_ice_saying,
+}
+import cg_test_helpers.{cg_probe_front_end_clean}
+import diagnostics.{diag_reset}
+import parser.{node_kind, node_name, node_source_module, node_method, nodes}
+import ast.{NodeKind, nk_of}
+import ir.{IrKind, ir_c_name}
+import cname.{c_fn_decl_name}
+import cg_call.{lower_call}
+import mono.{run_mono}
+import std.io
+
+// A probe the front end built and mono has walked, which is what a module-dispatched call
+// needs: `lower_call` reads a declaration mono already knows about.
+fn clean_probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    diag_reset()
+    let program = probe(stem, src)
+    cg_probe_front_end_clean("the probe source")
+    run_mono(program)
+    program
+}
+
+let own_module = "__main__"
+
+// The library's own declaration of a name, told apart from a same-named binder the probe
+// itself might write, by which module the front end filed it under.
+fn library_fn_decl(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.FnDef && node_name(i) == name && node_source_module(i) != own_module {
+            return i
+        }
+        i = i + 1
+    }
+    io.println("FAIL: no library function '{name}' declared")
+    assert(false)
+    -1
+}
+
+fn call_after(anchor: Str, method: Str) -> Int {
+    let mut i = let_node_of(anchor)
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.MethodCall && node_method(i) == method { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no call of '{method}' after '{anchor}'")
+    assert(false)
+    -1
+}
+
+fn src_intrinsics() -> Str {
+    #"fn main() {
+    let host = "localhost"
+    let port = 8080
+    let fd = 1
+    let socket = net.connect(host, port)
+    let tty = term.isatty(fd)
+    let _keep = [socket, tty]
+}
+"#
+}
+
+fn src_module_fns() -> Str {
+    #"import std.net
+import std.term
+
+fn main() {
+    let host = "localhost"
+    let port = 8080
+    let label = "x"
+    let socket = net.tcp_connect(host, port)
+    let is_a_tty = term.is_tty()
+    let painted = term.cyan(label)
+    let _keep = [painted.len()]
+    let _also = socket.is_err()
+    let _tty = is_a_tty
+}
+"#
+}
+
+fn src_still_refused() -> Str {
+    #"fn main() {
+    let host = "localhost"
+    let port = 8080
+    let fd = net.listen(host, port)
+    let _keep = [fd]
+}
+"#
+}
+
+test "net.connect reaches the runtime tcp connector with both arguments" {
+    clean_probe("cg_call_net_connect", src_intrinsics())
+    let built = lower_call(rhs_of("socket"))
+    assert_kind("net.connect kind", built, IrKind.CallRuntime)
+    assert_shape("net.connect shape", built, "CallRuntime(VarRef, VarRef)")
+    assert_eq_str("net.connect symbol", ir_c_name(built), "blink_tcp_connect")
+    assert_verifies("net.connect", built)
+}
+
+test "term.isatty reaches the runtime tty check with its descriptor" {
+    clean_probe("cg_call_term_isatty", src_intrinsics())
+    let built = lower_call(rhs_of("tty"))
+    assert_kind("term.isatty kind", built, IrKind.CallRuntime)
+    assert_shape("term.isatty shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("term.isatty symbol", ir_c_name(built), "blink_term_isatty")
+    assert_verifies("term.isatty", built)
+}
+
+test "net.tcp_connect is not the intrinsic; it is the net module's own function" {
+    clean_probe("cg_call_net_tcp_connect", src_module_fns())
+    let built = lower_call(rhs_of("socket"))
+    assert_kind("net.tcp_connect kind", built, IrKind.CallDirect)
+    assert_verifies("net.tcp_connect", built)
+    assert_eq_str("net.tcp_connect symbol", ir_c_name(built), c_fn_decl_name(library_fn_decl("tcp_connect")))
+}
+
+test "term.is_tty is not the intrinsic; it is the term module's own function" {
+    clean_probe("cg_call_term_is_tty", src_module_fns())
+    let built = lower_call(rhs_of("is_a_tty"))
+    assert_kind("term.is_tty kind", built, IrKind.CallDirect)
+    assert_verifies("term.is_tty", built)
+    assert_eq_str("term.is_tty symbol", ir_c_name(built), c_fn_decl_name(library_fn_decl("is_tty")))
+}
+
+test "term.cyan is not the intrinsic; it is the term module's own function" {
+    clean_probe("cg_call_term_cyan", src_module_fns())
+    let built = lower_call(rhs_of("painted"))
+    assert_kind("term.cyan kind", built, IrKind.CallDirect)
+    assert_verifies("term.cyan", built)
+    assert_eq_str("term.cyan symbol", ir_c_name(built), c_fn_decl_name(library_fn_decl("cyan")))
+}
+
+test "net.listen stays refused by name; the module fallthrough does not widen it" {
+    clean_probe("cg_call_net_listen_refused", src_still_refused())
+    assert_ice_saying("net.listen", lower_call(rhs_of("fd")),
+        "CodegenStageNotBuilt",
+        "cg_call intrinsic 'net.listen'")
+}
