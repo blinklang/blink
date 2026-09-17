@@ -1,0 +1,144 @@
+// The runtime symbol producer a for-in loop over a container or iterator needs.
+//
+// cg_stmt's lower_for_in lowers a range with no help from the runtime, and refuses
+// everything else outright: no producer names a runtime symbol for any other iterable
+// yet. This is that producer, kept apart from cg_stmt so the loop shape it eventually
+// drives stays a wiring question for whoever owns that file, not this one.
+//
+// Every kind here reads its element type from tc_tid_iter_elem, the one place typecheck's
+// own ForIn arm already reads an iterable's element from -- reusing it instead of asking
+// layout the same question twice is what keeps a loop variable's declared type and this
+// producer's element_tid from ever being two different answers to one fact.
+//
+// List, Bytes and Set all keep their elements where a runtime symbol can read one by
+// position: List and Bytes read the container itself, and Set materializes to a List
+// first because a hash table's buckets are addressed by hash, not by position. A Map
+// pairs two such materializations, keys and values, read at the same position. Str and
+// Iterator are NOT covered here even though tc_tid_iter_elem answers an element for both:
+// Str's element is a one-character Str (tc_tid_iter_elem's own words), and the only
+// runtime reader at a position is byte-indexed with no way to say how many bytes one
+// character took, so a len/get pair built from it would walk multi-byte text wrong --
+// that is a real gap, not a shape this producer chose not to build. Iterator has no
+// runtime representation at all yet (layout_of spells it "void*"; nothing in codegen
+// gives one a `next`). Both refuse the same way cg_stmt's own blanket refusal does today:
+// I0002, an internal error, never a user-facing one, because typecheck's NotIterable has
+// already rejected anything that is not a legal iterable before codegen ever sees the node.
+
+import lower_test_helpers.{probe, rhs_of, assert_eq_str}
+import cg_call.{ForInStrategy, ForInIteration, for_in_iteration_of}
+import layout.{tid_of_node}
+import typecheck.{tc_type_str, TYPE_INT, TYPE_U8}
+import diagnostics.{diag_entries}
+import std.io
+
+fn src() -> Str {
+    #"fn main() {
+    let xs: List[Int] = [1, 2, 3]
+    let bs: Bytes = Bytes.new()
+    let s: Set[Int] = Set.new()
+    let m: Map[Int, Str] = Map.new()
+    let st: Str = "hi"
+    let it = xs.into_iter()
+    let n: Int = 5
+    let _keep = [n]
+}
+"#
+}
+
+fn ice_count_exactly_here(name: Str, message: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.name == name && d.message == message { n = n + 1 }
+    }
+    n
+}
+
+// The sentinel shape unlikely to answer any covered kind: symbols empty, element_tid -1.
+fn assert_refused(label: Str, r: ForInIteration, want_name: Str, marker: Str) {
+    if r.element_tid != -1 {
+        io.println("FAIL: {label}: answered element_tid {r.element_tid} instead of refusing")
+    }
+    assert_eq(r.element_tid, -1)
+    let mut found = ""
+    let mut found_msg = ""
+    for d in diag_entries {
+        if d.severity == "ice" && d.name == want_name && d.message.contains(marker) {
+            found = d.name
+            found_msg = d.message
+        }
+    }
+    if found != want_name {
+        io.println("FAIL: {label}: no ICE named '{want_name}' saying '{marker}' was recorded")
+    }
+    assert_eq_str(label, found, want_name)
+    let n = ice_count_exactly_here(want_name, found_msg)
+    if n != 1 {
+        io.println("FAIL: {label}: this refusal was recorded {n} times, want exactly one")
+    }
+    assert_eq(n, 1)
+}
+
+test "List reads by position through the runtime's own len and get" {
+    let _program = probe("for_in_iter_list", src())
+    let tid = tid_of_node(rhs_of("xs"))
+    let r = for_in_iteration_of(tid, rhs_of("xs"))
+    assert_eq(r.strategy == ForInStrategy.Indexed, true)
+    assert_eq_str("List len symbol", r.len_symbol, "blink_list_len")
+    assert_eq_str("List get symbol", r.get_symbol, "blink_list_get")
+    assert_eq_str("List element", tc_type_str(r.element_tid), "Int")
+}
+
+test "Bytes reads by position through the runtime's own len and get" {
+    let _program = probe("for_in_iter_bytes", src())
+    let tid = tid_of_node(rhs_of("bs"))
+    let r = for_in_iteration_of(tid, rhs_of("bs"))
+    assert_eq(r.strategy == ForInStrategy.Indexed, true)
+    assert_eq_str("Bytes len symbol", r.len_symbol, "blink_bytes_len")
+    assert_eq_str("Bytes get symbol", r.get_symbol, "blink_bytes_get")
+    assert_eq(r.element_tid, TYPE_U8)
+}
+
+test "Set materializes to a List first, then reads that List by position" {
+    let _program = probe("for_in_iter_set", src())
+    let tid = tid_of_node(rhs_of("s"))
+    let r = for_in_iteration_of(tid, rhs_of("s"))
+    assert_eq(r.strategy == ForInStrategy.Materialized, true)
+    assert_eq_str("Set materialize symbol", r.materialize_symbol, "blink_set_to_list")
+    assert_eq_str("Set len symbol", r.len_symbol, "blink_list_len")
+    assert_eq_str("Set get symbol", r.get_symbol, "blink_list_get")
+    assert_eq_str("Set pair symbol", r.pair_symbol, "")
+    assert_eq(r.element_tid, TYPE_INT)
+}
+
+test "Map materializes keys and values as two parallel Lists, paired by position" {
+    let _program = probe("for_in_iter_map", src())
+    let tid = tid_of_node(rhs_of("m"))
+    let r = for_in_iteration_of(tid, rhs_of("m"))
+    assert_eq(r.strategy == ForInStrategy.Materialized, true)
+    assert_eq_str("Map materialize symbol", r.materialize_symbol, "blink_map_keys")
+    assert_eq_str("Map pair symbol", r.pair_symbol, "blink_map_values")
+    assert_eq_str("Map len symbol", r.len_symbol, "blink_list_len")
+    assert_eq_str("Map get symbol", r.get_symbol, "blink_list_get")
+    assert_eq_str("Map element", tc_type_str(r.element_tid), "(Int, Str)")
+}
+
+test "Str has no runtime symbol that reads one character by position without guessing its width" {
+    let _program = probe("for_in_iter_str", src())
+    let tid = tid_of_node(rhs_of("st"))
+    let r = for_in_iteration_of(tid, rhs_of("st"))
+    assert_refused("Str", r, "UnhandledIterable", "for-in over this iterable has no lowering yet")
+}
+
+test "Iterator has no runtime 'next' yet" {
+    let _program = probe("for_in_iter_iterator", src())
+    let tid = tid_of_node(rhs_of("it"))
+    let r = for_in_iteration_of(tid, rhs_of("it"))
+    assert_refused("Iterator", r, "UnhandledIterable", "for-in over this iterable has no lowering yet")
+}
+
+test "a kind this producer does not cover refuses the same way, never guesses a symbol" {
+    let _program = probe("for_in_iter_scalar", src())
+    let tid = tid_of_node(rhs_of("n"))
+    let r = for_in_iteration_of(tid, rhs_of("n"))
+    assert_refused("Int", r, "UnhandledIterable", "for-in over this iterable has no lowering yet")
+}
