@@ -1,0 +1,120 @@
+// `Trait.method(v)` names ONE trait (§3c:668-682, and the resolution table at :748 resolves
+// the form by "Explicit trait + method"). On a type-parameter receiver the bound is what
+// licenses the call, so a qualifier the bound does not name licenses nothing: the form whose
+// whole purpose is to select a trait must not fall through to a different one that happens to
+// define the same method name. §3c:677-680 writes the generic shape, so a type-parameter
+// receiver is in scope for the rule.
+//
+// Each row drives a probe, because the rejected row is a compile error and cannot live in this
+// file, and because the pinned reference compiler that builds this file accepts it.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn compile_only(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    let _rm = process_run("rm", ["-f", path])
+    check_types(program)
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn assert_one_error_named(label: Str, name: Str, want: Str) {
+    let mut hits = 0
+    for d in diag_entries {
+        if d.name == name && d.message.contains(want) { hits = hits + 1 }
+    }
+    if hits != 1 {
+        io.println("FAIL: {label}: want one {name} mentioning '{want}', got:")
+        for d in diag_entries { io.println("  {d.name}: {d.message}") }
+    }
+    assert(hits == 1)
+}
+
+// Two traits declare `go`. Pt implements A only, so whichever trait the call names decides
+// both the answer and whether the program is legal at all.
+fn preamble() -> Str {
+    #"type Pt { x: Int }
+
+trait A {
+    fn go(self) -> Int
+}
+
+trait B {
+    fn go(self) -> Str
+}
+
+impl A for Pt {
+    fn go(self) -> Int { self.x }
+}
+
+impl B for Pt {
+    fn go(self) -> Str { "b" }
+}
+
+"#
+}
+
+test "a qualified call naming a trait the bound declares is accepted" {
+    let src = "{preamble()}fn f[T: A](v: T) -> Int \{
+    A.go(v)
+}
+
+fn main() \{
+    let n = f(Pt \{ x: 1 })
+    let _ = n
+}
+"
+    compile_only("qual_bound_names_the_trait", src)
+    assert_no_errors("qualified call inside its own bound")
+}
+
+test "a qualified call naming a trait outside the bound is rejected" {
+    let src = "{preamble()}fn f[T: A](v: T) -> Int \{
+    B.go(v)
+}
+
+fn main() \{
+    let n = f(Pt \{ x: 1 })
+    let _ = n
+}
+"
+    compile_only("qual_trait_outside_bound", src)
+    assert_one_error_named("qualified call outside the bound", "TraitBoundNotSatisfied", "B")
+}
+
+test "both qualifiers are accepted when the parameter is bound by both traits" {
+    let src = "{preamble()}fn f[T: A + B](v: T) -> Int \{
+    let s = B.go(v)
+    A.go(v) + s.len()
+}
+
+fn main() \{
+    let n = f(Pt \{ x: 1 })
+    let _ = n
+}
+"
+    compile_only("qual_two_bounds", src)
+    assert_no_errors("qualified calls under two bounds")
+}
