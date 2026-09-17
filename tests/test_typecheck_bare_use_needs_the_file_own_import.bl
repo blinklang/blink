@@ -1,0 +1,79 @@
+// A file's imports are supposed to describe what it depends on. They did not: a bare name
+// was filtered only against a module the file DID import and did not select, so a module
+// the file never imported at all was not filtered and its pub names resolved bare, as long
+// as some other module in the program had pulled it in.
+//
+// That dependency is real and invisible, so it breaks later, in an unrelated commit, when
+// the last intermediate importer drops the name. The prelude path already reads an absent
+// import as unimported; the rest of the rule now agrees with it.
+
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+
+fn probe(path: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    diag_reset()
+    check_types(compile_to_program(path, 1))
+}
+
+fn errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn has_error_naming(name: Str, subject: Str) -> Bool {
+    for e in errors() {
+        if e.starts_with("{name}: ") && e.contains(subject) { return true }
+    }
+    false
+}
+
+test "a bare name from a module the file never imported is not in scope" {
+    probe("tests/zzcd_calls/src/main_unimported.bl")
+    if !has_error_naming("ImportNotSelected", "zzcd_left_tag") {
+        io.println("FAIL: no ImportNotSelected for 'zzcd_left_tag'; got:")
+        for e in errors() { io.println("  {e}") }
+    }
+    assert(has_error_naming("ImportNotSelected", "zzcd_left_tag"))
+}
+
+// The same name, in a file that does import it. Tightening the absent-import case must not
+// reject a file whose import list names what it uses.
+test "the same name is in scope where the file imports it" {
+    probe("tests/zzcd_calls/src/main_right.bl")
+    let errs = errors()
+    if errs.len() != 0 {
+        io.println("FAIL: importing the name still reported:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+// The flat symbol table records one module per spelling, so a `pub import` re-export
+// overwrites the module that declares the name. The declarations have to answer instead,
+// or a file that imported the declaring module directly is told its own import is missing.
+test "a name is in scope through the module that declares it, not the one that re-exports it" {
+    probe("tests/zzcd_calls/src/main_reexport.bl")
+    let errs = errors()
+    if errs.len() != 0 {
+        io.println("FAIL: importing the declaring module still reported:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+// A local binding holds a value, not a declaration some module exported. An import list
+// has nothing to say about it, however the local happens to be spelled.
+test "a local binding spelled like another module's pub name is not measured against imports" {
+    probe("tests/zzcd_calls/src/main_local_shadow.bl")
+    let errs = errors()
+    if errs.len() != 0 {
+        io.println("FAIL: a local binding was measured against the import list:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}

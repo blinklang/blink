@@ -1,0 +1,107 @@
+// A call inside a generic body reaches a different callee for every instance of that body,
+// so the pass records the instance each call reaches under the pair (body, call node).
+// Generic free functions were recorded; poly-impl methods were not, and every poly method
+// call answered -1 no matter which instance was asking.
+
+import std.io
+import mono.{run_mono, instances, instance_for_call}
+import cg_test_helpers.{cg_probe_compile}
+import parser.{node_kind, node_left, node_method, node_name, node_count}
+import ast.{NodeKind, nk_of}
+
+// A per-element impl: the method signature names the binder, so the C differs per element
+// and the pass registers one instance for each element the program asks for.
+fn src() -> Str {
+    #"trait Held[T] { fn first_or(self, d: T) -> T }
+
+impl[T] Held[T] for List[T] {
+    fn first_or(self, d: T) -> T { d }
+}
+
+fn pick[U](xs: List[U], d: U) -> U { xs.first_or(d) }
+
+fn plain() -> Int { 7 }
+
+fn main() {
+    assert(pick([1, 2], 9) == 9)
+    assert(pick(["x"], "y") == "y")
+    assert(plain() == 7)
+}
+"#
+}
+
+fn probe(stem: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    run_mono(cg_probe_compile("build/{stem}.bl", src()))
+}
+
+fn only_method_call(method: Str) -> Int {
+    let mut found = -1
+    let mut i = 0
+    while i < node_count() {
+        if nk_of(node_kind(i)) == NodeKind.MethodCall && node_method(i) == method { found = i }
+        i = i + 1
+    }
+    found
+}
+
+fn only_bare_call(name: Str) -> Int {
+    let mut found = -1
+    let mut i = 0
+    while i < node_count() {
+        if nk_of(node_kind(i)) == NodeKind.Call {
+            let callee = node_left(i)
+            if callee != -1 && nk_of(node_kind(callee)) == NodeKind.Ident && node_name(callee) == name {
+                found = i
+            }
+        }
+        i = i + 1
+    }
+    found
+}
+
+// Every instance index whose body is the declaration named `fn_name`.
+fn instance_indexes_of(fn_name: Str) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut i = 0
+    for inst in instances() {
+        if node_name(inst.base_decl_node) == fn_name { out.push(i) }
+        i = i + 1
+    }
+    out
+}
+
+test "a poly method call answers a different instance for each instance of its body" {
+    probe("zz_poly_call_target")
+    let call = only_method_call("first_or")
+    if call < 0 { io.println("FAIL: no 'first_or' call node found") }
+    assert(call >= 0)
+
+    let bodies = instance_indexes_of("pick")
+    if bodies.len() != 2 {
+        io.println("FAIL: 'pick' has {bodies.len()} instances, want 2")
+    }
+    assert(bodies.len() == 2)
+
+    let first = instance_for_call(bodies.get(0).unwrap(), call)
+    let second = instance_for_call(bodies.get(1).unwrap(), call)
+    if first < 0 || second < 0 {
+        io.println("FAIL: the call answers {first} and {second}; both must name an instance")
+    }
+    assert(first >= 0)
+    assert(second >= 0)
+    if first == second {
+        io.println("FAIL: both instances of 'pick' reach instance {first}")
+    }
+    assert(first != second)
+}
+
+// A plain function has one body and no instance, so nothing is recorded for a call to it.
+test "a call to a plain function answers no instance" {
+    probe("zz_poly_call_target_plain")
+    let call = only_bare_call("plain")
+    if call < 0 { io.println("FAIL: no 'plain' call node found") }
+    assert(call >= 0)
+    let got = instance_for_call(-1, call)
+    if got != -1 { io.println("FAIL: the call to 'plain' answers instance {got}") }
+    assert(got == -1)
+}

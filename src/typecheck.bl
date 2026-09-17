@@ -1,4 +1,4 @@
-import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on, nk_of, nk_is_typed}
+import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on, nk_of, nk_is_typed, trace, trace_mode}
 import std.str.{str_to_lower}
 import parser.{
     get_annotation, has_annotation, is_literal_string_part,
@@ -48,7 +48,7 @@ import diagnostics.{
     MODULE_QUALIFIED_TYPE,
     UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE,
     BITWISE_PRECEDENCE, UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
-    NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME,
+    NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, UNKNOWN_DERIVE_NAME,
     NO_SUCH_FIELD,
 }
 
@@ -6488,16 +6488,42 @@ fn tc_derive_obliges(listed: Str, tr: Str) -> Int {
     0
 }
 
-// Does the declaration `td` derive `tr`, by naming it or by naming a trait whose
-// supertrait obligation reaches it? Deriving Ord or Hash derives Eq as well when the
-// author did not list it (spec sections/03_types.md, "Supertrait Auto-Derivation"), so
-// every reader of a derive fact answers from the expanded set; a reader that answered
-// from the written list alone would disagree with the methods codegen synthesizes.
-// Scans EVERY @derive annotation, not just the first. get_annotation returns only the
-// first match, so `@derive(Eq)` + `@derive(Ord)` on separate lines hid the second derive.
-pub fn tc_decl_derives(td: Int, tr: Str) -> Int {
-    let anns = node_handlers(td)
-    if anns == -1 { return 0 }
+// Every name @derive accepts. This is the one list: the derive stage of codegen reads it
+// here rather than keeping a second copy, because two copies disagree the day one gains a
+// name and the check that rejects an unknown name starts rejecting a legal one.
+pub fn tc_derive_names() -> List[Str] {
+    ["Serialize", "Deserialize", "Eq", "Ord", "Clone", "Hash", "Debug"]
+}
+
+fn tc_derive_name_is_known(name: Str) -> Int {
+    for d in tc_derive_names() {
+        if d == name { return 1 }
+    }
+    0
+}
+
+// A @derive name outside the accepted set is reported where the author can still see the
+// annotation. Codegen used to be the only reader, so a program that never reached codegen
+// kept the misspelling and lost the method silently.
+fn tc_reject_unknown_derives(td: Int) ! Diag.Report {
+    for a in tc_decl_derive_args(td) {
+        let name = node_name(a)
+        if tc_derive_name_is_known(name) == 0 {
+            diag_error_at("UnknownDerive", UNKNOWN_DERIVE_NAME,
+                "unknown @derive name '{name}'; expected one of {tc_derive_names().join(", ")}",
+                a, "remove or replace this derive name")
+        }
+    }
+}
+
+// Every name written in every @derive on a declaration, as the annotation argument nodes.
+// A node carries both the name and its span, so a diagnostic about one derive name can
+// point at that name.
+pub fn tc_decl_derive_args(decl: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    if decl < 0 { return out }
+    let anns = node_handlers(decl)
+    if anns == -1 { return out }
     let mut i = 0
     while i < sublist_length(anns) {
         let ann = sublist_get(anns, i)
@@ -6506,12 +6532,26 @@ pub fn tc_decl_derives(td: Int, tr: Str) -> Int {
             if args_sl != -1 {
                 let mut j = 0
                 while j < sublist_length(args_sl) {
-                    if tc_derive_obliges(node_name(sublist_get(args_sl, j)), tr) != 0 { return 1 }
+                    out.push(sublist_get(args_sl, j))
                     j = j + 1
                 }
             }
         }
         i = i + 1
+    }
+    out
+}
+
+// Does the declaration `td` derive `tr`, by naming it or by naming a trait whose
+// supertrait obligation reaches it? Deriving Ord or Hash derives Eq as well when the
+// author did not list it (spec sections/03_types.md, "Supertrait Auto-Derivation"), so
+// every reader of a derive fact answers from the expanded set; a reader that answered
+// from the written list alone would disagree with the methods codegen synthesizes.
+// Scans EVERY @derive annotation, not just the first. get_annotation returns only the
+// first match, so `@derive(Eq)` + `@derive(Ord)` on separate lines hid the second derive.
+pub fn tc_decl_derives(td: Int, tr: Str) -> Int {
+    for a in tc_decl_derive_args(td) {
+        if tc_derive_obliges(node_name(a), tr) != 0 { return 1 }
     }
     0
 }
@@ -6538,6 +6578,7 @@ fn reject_reserved_type_name(td: Int) ! Diag.Report {
 
 fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     reject_reserved_type_name(td)
+    tc_reject_unknown_derives(td)
     let name = tc_nominal_type_name(td)
     let tid = new_type(TyKind.Struct, name)
     named_type_names.push(name)
@@ -6604,6 +6645,7 @@ fn resolve_struct_fields(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.
 
 fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     reject_reserved_type_name(td)
+    tc_reject_unknown_derives(td)
     let name = tc_nominal_type_name(td)
     let tid = new_type(TyKind.Enum, name)
     named_type_names.push(name)
@@ -9325,6 +9367,9 @@ pub fn is_user_effect_handle_name(name: Str) -> Int {
 }
 
 // ── Selective import filtering ──────────────────────────────────────
+// Key: "consuming_mod:source_mod" → the import node, or -1 for a whole-module import.
+// The driver fills it while it resolves imports; the checks that read it live here.
+pub let mut per_module_imports: Map[Str, Int] = Map()
 pub let mut tc_import_modules: List[Str] = []
 pub let mut tc_import_qualifiers: List[Str] = []
 pub let mut tc_import_nodes: List[Int] = []
@@ -9480,7 +9525,13 @@ fn is_filtered_for_module(name: Str, source_mod: Str, consuming_mod: Str) -> Int
         }
         None => {}
     }
-    0
+    // No import of this module at all. A file's imports say what it depends on, so a name
+    // it never asked for is not in its scope, however many other modules pulled the
+    // declaration in. A prelude module is the exception: its types and traits stay visible
+    // without an import, and a bare call to one of its free functions is E0504, reported by
+    // nr_is_unimported_prelude_free_fn below, not a missing selection.
+    if tc_prelude_modules.contains_key(source_mod) { return 0 }
+    1
 }
 
 // True when `name` is a free function exported by a prelude module that the
@@ -9545,6 +9596,9 @@ pub fn tc_qualifier_to_module_or_self(qualifier: Str) -> Str {
 fn nr_check_selective_access(name: Str, node: Int) -> Int ! Diag.Report {
     if nr_current_module == "" { return 0 }
     if is_builtin_name(name) != 0 { return 0 }
+    // A local binding holds a value, not a declaration some module exported. It may be spelled
+    // like an exported name, and an import list has nothing to say about a local.
+    if nr_name_top.contains_key(name) && nr_top_binding_is_global(name) == 0 { return 0 }
     if nr_module_declares(nr_current_module, name) != 0 { return 0 }
     // A namesake type is in scope when this module's import list selects one declaration of
     // it; the last-writer symbol table below knows only one module for the name.
@@ -9556,10 +9610,9 @@ fn nr_check_selective_access(name: Str, node: Int) -> Int ! Diag.Report {
     // A private declaration cannot be selected or qualified, so the import list is not the
     // fix; the private-access check names the real problem.
     if nr_is_private_in(name, source_mod) != 0 { return 0 }
-    // The same last-writer limit as the namesake-type check above: where two modules declare
-    // the name, `source_mod` is whichever was recorded last, not the one this module's
-    // import list selected.
-    if nr_bare_name_selected_elsewhere(name, nr_current_module) != 0 { return 0 }
+    // The same last-writer limit as the namesake-type check above: `source_mod` is whichever
+    // module was recorded last for the spelling, not the one this file's import list picked.
+    if nr_bare_name_in_scope_here(name, nr_current_module) != 0 { return 0 }
     if is_filtered_for_module(name, source_mod, nr_current_module) != 0 {
         let display_mod = tc_qualifier_for_module(source_mod)
         if node == -1 {
@@ -9641,11 +9694,12 @@ fn nr_resolve_qualified_decl(qualifier: Str, member: Str) -> Int {
     nr_module_decls.get("{target}|{member}") ?? -1
 }
 
-// Whether this module's own import list keeps the bare `name` in scope, asked only where
-// more than one module declares it. Below that, the symbol table's single answer is right.
-fn nr_bare_name_selected_elsewhere(name: Str, consuming_mod: Str) -> Int {
+// Whether this file's own import list reaches any declaration of the bare `name`. The
+// declarations answer this, not tc_symbol_module: that table holds one module per name and
+// a `pub import` re-export overwrites it, so it can name a module that only forwards the
+// declaration while the importing file selected the module that owns it.
+fn nr_bare_name_in_scope_here(name: Str, consuming_mod: Str) -> Int {
     let cands = nr_decls_by_name.get(name) ?? []
-    if cands.len() < 2 { return 0 }
     for c in cands {
         if node_module(c) == consuming_mod { return 1 }
         if is_filtered_for_module(name, node_module(c), consuming_mod) == 0 { return 1 }
