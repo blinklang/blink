@@ -327,6 +327,14 @@ let mut tc_display_impl_nodes: Map[Str, List[Int]] = Map()
 // Both keyed "{type}\t{method}".
 let mut tc_method_trait_count_idx: Map[Str, Int] = Map()
 let mut tc_method_trait_names_idx: Map[Str, Str] = Map()
+// The same two answers counting each trait ONCE. One trait can own a method for one type
+// through several impls: `From` reaches U8 from Int, U16, U32 and U64, four impls of one
+// trait declaring one `try_from`. That is four rows in the pair above, which is the count
+// the trait-qualified fnsig key wants, and it is not ambiguity -- the source-typed key
+// tells those four apart by the argument. Ambiguity is two DIFFERENT traits, so the
+// ambiguity reports read these.
+let mut tc_method_distinct_trait_count_idx: Map[Str, Int] = Map()
+let mut tc_method_distinct_trait_names_idx: Map[Str, Str] = Map()
 // Trait-level type-param count keyed by trait NAME, populated in
 // register_trait for EVERY trait (methodless or not). validate_trait_impls
 // reads this for the E0910 arg-arity check; deriving it from tc_tmsig_pool
@@ -356,6 +364,33 @@ fn tc_record_method_trait(tname: Str, method: Str, trait_name: Str) {
     } else {
         tc_method_trait_names_idx.insert(key, "{prev_names} and {trait_name}")
     }
+    let prev_d_names = tc_method_distinct_trait_names_idx.get(key) ?? ""
+    if tc_trait_names_list_has(prev_d_names, trait_name) == 0 {
+        let d_names = if prev_d_names == "" { trait_name } else { "{prev_d_names} and {trait_name}" }
+        tc_method_distinct_trait_names_idx.insert(key, d_names)
+        let prev_d = tc_method_distinct_trait_count_idx.get(key) ?? 0
+        tc_method_distinct_trait_count_idx.insert(key, prev_d + 1)
+    }
+}
+
+// Whether a " and "-joined list of trait names already lists this one. Matched on the whole
+// name between the joiners, never as a substring: `Ord` must not be found inside `Ordered`.
+fn tc_trait_names_list_has(names: Str, one: Str) -> Int {
+    if names == one { return 1 }
+    if names.starts_with("{one} and ") != 0 { return 1 }
+    if names.ends_with(" and {one}") != 0 { return 1 }
+    if names.contains(" and {one} and ") != 0 { return 1 }
+    0
+}
+
+// How many DIFFERENT traits declare `method` for `tname`. >=2 is ambiguity; several impls
+// of one trait are not.
+fn tc_method_distinct_trait_count(tname: Str, method: Str) -> Int {
+    tc_method_distinct_trait_count_idx.get(tc_method_traits_key(tname, method)) ?? 0
+}
+
+fn tc_method_distinct_trait_names(tname: Str, method: Str) -> Str {
+    tc_method_distinct_trait_names_idx.get(tc_method_traits_key(tname, method)) ?? ""
 }
 
 // Count of distinct traits defining `method` for `tname` (the synthesized
@@ -1396,6 +1431,14 @@ pub fn make_set_type(elem_type: Int) -> Int {
 // tc_tid_ct answers -1 for the Unknown kind. The global itself stays private; a test that could
 // assign it could invalidate the pool.
 pub fn tc_unknown_tid() -> Int { TYPE_UNKNOWN }
+
+// The memo's second absence. -1 says "nobody has typed this"; this says "an inference arm
+// looked at this method call and none of them claimed it", which is the one absence the
+// total-stamp pass is allowed to pass over. It is NEGATIVE on purpose: every reader already
+// treats a negative tid as no type at all, so the reason rides along without ever reading as
+// an answer. A real pool index could not, which is why infer_type refuses to memoize
+// TYPE_UNKNOWN.
+pub fn tc_unclaimed_call_tid() -> Int { -2 }
 
 // True when a tid carries no information about a type. Two spellings reach the same state and
 // both must be skipped wherever a type is merged or compared: ABSENCE — -1, or a tid outside
@@ -8429,7 +8472,6 @@ fn init_types() ! TypeCheck.Register {
     // cleared here rather than in resolve_names with the registries that feed it.
     nr_unresolved_method_nodes = []
     tc_unresolved_method_hard = Map()
-    tc_unresolved_calls = Map()
     // Load-bearing for the daemon/LSP (long-lived processes, daemon.bl / lsp.bl): a
     // surviving intern map would hand out tids keyed against the PREVIOUS, since-cleared
     // pool on the next check_types() call — out-of-bounds unwrap panic or a silently
@@ -8480,6 +8522,8 @@ fn init_types() ! TypeCheck.Register {
     tc_display_impl_nodes.clear()
     tc_method_trait_count_idx.clear()
     tc_method_trait_names_idx.clear()
+    tc_method_distinct_trait_count_idx.clear()
+    tc_method_distinct_trait_names_idx.clear()
     tc_poly_list_impl_node.clear()
     tc_tmsig_pool.clear()
     tc_tmsig_param_tids.clear()
@@ -10544,26 +10588,37 @@ let mut nr_callable_field_names: List[Str] = []
 let mut nr_unresolved_method_nodes: List[Int] = []
 let mut tc_unresolved_method_hard: Map[Int, Int] = Map()
 
-// Method calls the inference pass could not type and did not report on: the name resolves
-// somewhere in the program, so name resolution let it pass, but no arm here claims this
-// receiver-and-method pair. Codegen's backstop is what names them, and it needs the program to
-// reach it, so the total-stamp pass excuses these NODES rather than reporting a hole over the
-// top of the report that is coming. Only the inference pass records: name resolution walks
-// before anything is typed, so a receiver that is merely not typed YET is not one of these.
-let mut tc_unresolved_calls: Map[Int, Int] = Map()
-
-// How many recorded calls are STILL unclaimed. A branch of an if-expression is inferred once
-// for the `if`'s own type, before tc_check_body walks that branch and binds the block's lets,
-// so a tail whose receiver is one of those lets reads as untyped there and falls through; the
-// second walk types it. The record therefore says "absent" only while the node it names still
-// carries nothing, and the count has to be taken at the point it is read.
-pub fn tc_unresolved_call_count() -> Int {
-    let mut live = 0
-    for uc in tc_unresolved_calls.keys() {
-        if tc_tid_is_no_info(tc_lookup_node_tid(uc)) != 0 { live = live + 1 }
-    }
-    live
+// Mark a method call the inference pass could not type and did not report on: the name
+// resolves somewhere in the program, so name resolution let it pass, but no arm here claims
+// this receiver-and-method pair. Codegen's backstop is what names them, and it needs the
+// program to reach it, so the total-stamp pass excuses these nodes rather than reporting a
+// hole over the top of the report that is coming.
+//
+// Only an absence is marked. A node an earlier walk already typed keeps that type: the mark
+// says "no arm claimed this", and an arm did.
+fn tc_mark_unclaimed_call(node: Int) {
+    if node == -1 { return }
+    if node >= tc_node_tid.len() { return }
+    if tc_tid_is_no_info(tc_lookup_node_tid(node)) == 0 { return }
+    tc_node_tid.set(node, tc_unclaimed_call_tid())
 }
+
+// The calls that are STILL unclaimed. A branch of an if-expression is inferred once for the
+// `if`'s own type, before tc_check_body walks that branch and binds the block's lets, so a
+// tail whose receiver is one of those lets reads as untyped there and falls through; the
+// second walk types it, and that walk overwrites the mark with the type it found. The marker
+// therefore says "absent" by being present, and needs no second liveness question.
+fn tc_unclaimed_call_nodes() -> List[Int] {
+    let mut out: List[Int] = []
+    let mut n = 0
+    while n < tc_node_tid.len() {
+        if tc_node_tid.get(n).unwrap() == tc_unclaimed_call_tid() { out.push(n) }
+        n = n + 1
+    }
+    out
+}
+
+pub fn tc_unresolved_call_count() -> Int { tc_unclaimed_call_nodes().len() }
 
 // `with X as ctx` does not always bind X: for a BlockHandler the binder is what
 // `enter()` returns, i.e. the impl's `type Context`. Resource type name -> Context type name,
@@ -15129,6 +15184,21 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // (sections/03c_protocols.md:758): `pub fn Duration_seconds(s: Int)`
             // (lib/std/time.bl:3) IS `Duration.seconds(2)`.
             if obj_is_value == 0 {
+                // §3c rule-3 ambiguity at the static rung. Two different traits declare this
+                // associated function for this type, so the call names no one declaration. The
+                // rung just below is gated on exactly one owner, and a trait method keeps no
+                // bare `{Type}_{method}` signature, so without this the call resolved to
+                // nothing and was accepted anyway.
+                //
+                // The help cannot offer the qualified call §3c:671 documents for the ambiguous
+                // INSTANCE call: `Trait.method(receiver)` names the trait by passing the
+                // receiver as the first argument, and an associated function has no receiver to
+                // pass. So the fixes it can offer are both in the declarations.
+                if tc_method_distinct_trait_count(obj_name, method) >= 2 {
+                    let amb_traits = tc_method_distinct_trait_names(obj_name, method)
+                    diag_error_at("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous static call: '{obj_name}.{method}' is declared by multiple traits implemented by {obj_name} ({amb_traits})", node, "rename one of the methods, or drop one of the impls: a qualified call names the trait by passing the receiver first, and an associated function has no receiver to pass")
+                    return tc_error_recovery_tid()
+                }
                 let static_trait = tc_method_trait_names(obj_name, method)
                 if static_trait != "" && tc_method_trait_count(obj_name, method) == 1 {
                     let q_sig = lookup_fnsig("{obj_name}_{static_trait}_{method}")
@@ -15218,9 +15288,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             return tc_error_recovery_tid()
         }
         // Nothing above claimed this node, so nothing has typed it — an absence. Codegen's
-        // backstop is what names the receiver and the method, so record the absence and let
-        // the stamp pass leave that report standing.
-        if tc_boundary_check_active != 0 { tc_unresolved_calls.insert(node, 1) }
+        // backstop is what names the receiver and the method, so the node says WHY it carries
+        // nothing and the stamp pass leaves that report standing.
+        if tc_boundary_check_active != 0 { tc_mark_unclaimed_call(node) }
         return -1
     }
 
@@ -15269,17 +15339,24 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // declaration order, so name[i] ↔ arg[i] needs no unify_typevar_binds.
                 // A bare tid (arg_count 0) leaves the map empty and returns ft as-is.
                 //
-                // Bind ONLY genuinely-concrete args. An instance whose args are
-                // themselves unresolved — a typevar, or TYPE_UNKNOWN from an empty
+                // A TYPEVAR arg is bound like any other. `Box[U]` inside
+                // `fn f[T, U]` must answer `b.val` as U: the field tid is written in
+                // the DECLARING type's binder, and only this substitution carries it
+                // over into the binder language of the function that reads the field.
+                // Leaving it unbound hands the reader the declaring type's `T`, which
+                // monomorphization then resolves against the reader's own same-spelled
+                // `T` — a silently wrong type wherever the two binders disagree.
+                // Typevars are interned by spelling, so nothing downstream can tell
+                // those two `T`s apart; the substitution has to happen here.
+                //
+                // TYPE_UNKNOWN is the one arg kind left UNBOUND — an empty
                 // `Map()`/`Set()` literal (`let b = GKV { m: Map() }` mints a
-                // GKV[?,?] instance, tc_struct_lit_instance_tid) — must leave the
-                // field's typevar UNBOUND. Substituting `Map[K,V]` with `K→?` yields
-                // `Map[?,?]` whose key C type is void, which defeats the codegen
-                // erased-default guard (recover_set_elem_from_tid keys on a -1 no-op
-                // for an unresolved inner) and regresses the arg-node element
-                // recovery. Skipping the bind keeps the field typevar, so
-                // substitute_typevar_tid returns ft unchanged and the pre-C fallback
-                // path is byte-identical for the unknowable case.
+                // GKV[?,?] instance, tc_struct_lit_instance_tid). Substituting
+                // `Map[K,V]` with `K→?` yields `Map[?,?]` whose key C type is void,
+                // which defeats the codegen erased-default guard
+                // (recover_set_elem_from_tid keys on a -1 no-op for an unresolved
+                // inner) and regresses the arg-node element recovery. Skipping the
+                // bind keeps the field typevar for the unknowable case.
                 if tc_tid_struct_arg_count(obj_t) >= 1 {
                     let inst = ty_pool.get(obj_t).unwrap()
                     let decl = tc_struct_decl_nodes.get(strip_module_qualifier(inst.name)) ?? -1
@@ -15292,7 +15369,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                                 let tpname = node_name(sublist_get(tparams_sl, i))
                                 let arg_tid = ty_param_list.get(inst.params_start + i).unwrap()
                                 let ak = type_kind(arg_tid)
-                                if ak != TyKind.Typevar && ak != TyKind.Unknown {
+                                if ak != TyKind.Unknown {
                                     binds.insert(tpname, arg_tid)
                                 } else if tc_is_unbound_metavar(arg_tid) != 0 {
                                     // The instance param is an as-yet-unpinned
@@ -19134,10 +19211,8 @@ fn tc_stamp_owner_map(root: Int) -> Map[Int, Int] {
 // module level has no fence at all — it types a global whose readers are the whole program.
 fn tc_stamp_standdown_bodies(owner: Map[Int, Int]) -> Map[Int, Int] {
     let mut bodies: Map[Int, Int] = Map()
-    for uc in tc_unresolved_calls.keys() {
-        if tc_tid_is_no_info(tc_lookup_node_tid(uc)) != 0 {
-            bodies.insert(owner.get(uc) ?? -1, 1)
-        }
+    for uc in tc_unclaimed_call_nodes() {
+        bodies.insert(owner.get(uc) ?? -1, 1)
     }
     bodies
 }
@@ -19206,19 +19281,17 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
             // counted as one.
             let bodies = stood.len() - (if stood.contains_key(-1) { 1 } else { 0 })
             dbg_trace("stamp", "stood down: {live_unclaimed} call(s) left to the codegen backstop, in {bodies} body(ies)")
-            for uc in tc_unresolved_calls.keys() {
-                if tc_tid_is_no_info(tc_lookup_node_tid(uc)) != 0 {
-                    // A call the owner walk never reached is fenced by nothing, which stands the
-                    // pass down everywhere — the same effect as a module-level call and a
-                    // different cause, so the trace names them apart.
-                    let where_ = if owner.contains_key(uc) == false {
-                        "<unowned: the whole program stands down>"
-                    } else {
-                        let ob = owner.get(uc) ?? -1
-                        if ob == -1 { "<module level>" } else { node_name(ob) }
-                    }
-                    dbg_trace("stamp", "  .{node_method(uc)}() at {node_line(uc)}:{node_col(uc)} in {where_}")
+            for uc in tc_unclaimed_call_nodes() {
+                // A call the owner walk never reached is fenced by nothing, which stands the
+                // pass down everywhere — the same effect as a module-level call and a
+                // different cause, so the trace names them apart.
+                let where_ = if owner.contains_key(uc) == false {
+                    "<unowned: the whole program stands down>"
+                } else {
+                    let ob = owner.get(uc) ?? -1
+                    if ob == -1 { "<module level>" } else { node_name(ob) }
                 }
+                dbg_trace("stamp", "  .{node_method(uc)}() at {node_line(uc)}:{node_col(uc)} in {where_}")
             }
         }
         // A module-level call has no body to be fenced by: it types a global, and a global's

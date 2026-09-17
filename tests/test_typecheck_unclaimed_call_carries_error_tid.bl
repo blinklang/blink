@@ -1,0 +1,113 @@
+// A method call no arm of inference claimed used to be an absence with no spelling: the node
+// kept -1, which says "nobody has typed this" and nothing more, so a node-keyed side table
+// carried the reason. The reason now lives on the node, in the tid slot itself.
+//
+// The marker is negative, like the -1 it replaces, so every reader that already treats an
+// absence as an absence is untouched; what it adds is a name for WHY the absence is there,
+// which the total-stamp pass reads to decide whose holes it may pass over.
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{
+    check_types, tc_stamp_program, tc_lookup_node_tid, tc_tid_is_concrete,
+    tc_unclaimed_call_tid, tc_unresolved_call_count,
+}
+import parser.{nodes, node_kind, node_name, node_method, node_body, node_value_child_ids}
+import ast.{NodeKind}
+import diagnostics.{diag_count, diag_ice_count, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+// `.concat` on a List receiver is a name that resolves somewhere in the program, so name
+// resolution lets it pass, and no arm of inference here claims it. `zzclean` shares nothing
+// with it and every call in it is claimed.
+fn probe_src() -> Str {
+    let mut s = "fn zzunres() -> Int \{\n"
+    s = s.concat("    let zzxs: List[Int] = [1]\n")
+    s = s.concat("    let zzys = zzxs.concat([2])\n")
+    s = s.concat("    zzys.len()\n")
+    s = s.concat("}\n")
+    s = s.concat("fn zzclean() -> Int \{\n")
+    s = s.concat("    let zzas: List[Int] = [1, 2]\n")
+    s = s.concat("    zzas.len()\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = zzunres() + zzclean() }\n")
+    s
+}
+
+fn compile_probe(path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, probe_src())
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+// The nodes of one body, so a call is found in the function that holds it and not in a
+// namesake elsewhere in the program.
+fn body_of(nm: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == nm { return node_body(i) }
+        i = i + 1
+    }
+    -1
+}
+
+// Walks the body's own subtree, so a call is found in the function that holds it. An arena
+// scan would not do: `.len()` is called in both probes and node ids say nothing about which
+// body a node belongs to.
+fn call_in(body: Int, method: Str) -> Int {
+    if body == -1 { return -1 }
+    let mut stack: List[Int] = [body]
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap()
+        if node_kind(n) == NodeKind.MethodCall && node_method(n) == method { return n }
+        for kid in node_value_child_ids(n) { stack.push(kid) }
+    }
+    -1
+}
+
+test "a method call no inference arm claimed carries the unclaimed marker in its tid" {
+    let _p = compile_probe("build/tc_unclaimed_marker.bl")
+    assert(diag_count == 0)
+    let call = call_in(body_of("zzunres"), "concat")
+    assert(call >= 0)
+    if tc_lookup_node_tid(call) != tc_unclaimed_call_tid() {
+        io.println("FAIL: .concat carries tid {tc_lookup_node_tid(call)}, want {tc_unclaimed_call_tid()}")
+    }
+    assert_eq(tc_lookup_node_tid(call), tc_unclaimed_call_tid())
+    // The marker is what the stand-down counts, so the count must see it.
+    assert(tc_unresolved_call_count() > 0)
+}
+
+test "the marker is an absence, so a reader asking for a type still gets none" {
+    let _p = compile_probe("build/tc_unclaimed_absence.bl")
+    let call = call_in(body_of("zzunres"), "concat")
+    assert(call >= 0)
+    assert_eq(tc_tid_is_concrete(tc_lookup_node_tid(call)), 0)
+    assert(tc_lookup_node_tid(call) < 0)
+}
+
+test "a use downstream of an unclaimed call is passed over and not reported as a hole" {
+    let program = compile_probe("build/tc_unclaimed_downstream.bl")
+    assert(diag_count == 0)
+    // `zzys` is initialised by the unclaimed call, so the read of it carries nothing either.
+    // That untyped node is the one the stand-down has to cover; asserting it is untyped keeps
+    // the row from passing because the program happened to be clean.
+    let downstream = call_in(body_of("zzunres"), "len")
+    assert(downstream >= 0)
+    assert_eq(tc_tid_is_concrete(tc_lookup_node_tid(downstream)), 0)
+    diag_reset()
+    tc_stamp_program(program)
+    assert_eq(diag_ice_count, 0)
+}
+
+test "a call an inference arm claimed keeps its own type and never the marker" {
+    let _p = compile_probe("build/tc_unclaimed_claimed.bl")
+    let claimed = call_in(body_of("zzclean"), "len")
+    assert(claimed >= 0)
+    assert(tc_lookup_node_tid(claimed) != tc_unclaimed_call_tid())
+    assert_eq(tc_tid_is_concrete(tc_lookup_node_tid(claimed)), 1)
+}

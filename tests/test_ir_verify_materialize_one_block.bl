@@ -1,0 +1,113 @@
+// The printer binds a flagged value once, at the point it is first reached, and remembers
+// the C temporary for every later reach. The temporary lives in the braces of the Block
+// that held the first reach, so a second reach from another Block names a local that is
+// not in scope there and the C does not compile.
+//
+// A flagged value therefore belongs to exactly one Block. Lowering satisfies that by
+// putting the value in its own Let and reading the Let from each place.
+import std.io
+import ir.{
+    IrKind, ir_reset, ir_verify, ir_const, ir_var_ref, ir_let, ir_block, ir_expr_stmt,
+    ir_if, ir_loop, ir_return, ir_switch, ir_call_direct, ir_mark_materialize,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals compiler.bl owns, so a test reaching
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn ic() -> Int { ir_const(1, 0, "int64_t", "1") }
+fn iv(name: Str) -> Int { ir_var_ref(1, 0, "int64_t", name, SlotForm.InlineWord) }
+
+fn flagged_call() -> Int {
+    let c = ir_call_direct(1, 0, "int64_t", "work", SlotForm.InlineWord, [])
+    ir_mark_materialize(c)
+    c
+}
+
+fn plain_call() -> Int {
+    ir_call_direct(1, 0, "int64_t", "work", SlotForm.InlineWord, [])
+}
+
+fn assert_rejects(label: Str, root: Int, needle: Str) {
+    let errs = ir_verify(root)
+    let mut hit = 0
+    for e in errs { if e.contains(needle) { hit += 1 } }
+    if hit == 0 { io.println("FAIL: {label}: no error contains '{needle}'; got: {errs.join(" | ")}") }
+    assert(hit > 0)
+}
+
+fn assert_no_reason(label: Str, root: Int, needle: Str) {
+    let errs = ir_verify(root)
+    let mut hit = 0
+    for e in errs { if e.contains(needle) { hit += 1 } }
+    if hit > 0 { io.println("FAIL: {label}: unexpected '{needle}' in: {errs.join(" | ")}") }
+    assert_eq(hit, 0)
+}
+
+fn assert_valid(label: Str, root: Int) {
+    let errs = ir_verify(root)
+    if errs.len() > 0 { io.println("FAIL: {label}: {errs.join(" | ")}") }
+    assert_eq(errs.len(), 0)
+}
+
+test "a flagged value reached from a second block is a named verifier failure" {
+    ir_reset()
+    let call = flagged_call()
+    let arm = ir_block(0, [ir_expr_stmt(0, call)])
+    let root = ir_block(0, [ir_if(0, ic(), arm, -1), ir_return(0, call)])
+    assert_rejects("call shared with the if arm", root, "reached from a second block")
+    assert_rejects("call shared with the if arm", root, "bound in block {arm}")
+}
+
+test "a flagged value reached twice inside one block is bound and read in the same scope" {
+    ir_reset()
+    let call = flagged_call()
+    let root = ir_block(0, [ir_expr_stmt(0, call), ir_return(0, call)])
+    assert_valid("call reached twice in one block", root)
+}
+
+test "a flagged value reached twice with no enclosing block at all is one scope" {
+    ir_reset()
+    let call = flagged_call()
+    let root = ir_loop(0, ir_block(0, [ir_expr_stmt(0, call), ir_expr_stmt(0, call)]))
+    assert_valid("call reached twice under one loop body", root)
+}
+
+test "the block rule keys on the flag and leaves an unflagged shared value to the flag rule" {
+    ir_reset()
+    let call = plain_call()
+    let arm = ir_block(0, [ir_expr_stmt(0, call)])
+    let root = ir_block(0, [ir_if(0, ic(), arm, -1), ir_return(0, call)])
+    // An unflagged value reached twice is already a failure for a reason of its own; the
+    // block rule must not also claim it, or the report names a cause that is not the cure.
+    assert_no_reason("unflagged shared call", root, "reached from a second block")
+    assert_rejects("unflagged shared call", root, "value reached twice without must_materialize")
+}
+
+test "a flagged value in its own Let is read from another block through a VarRef" {
+    ir_reset()
+    let bind = ir_let(1, 0, "int64_t", "t", SlotForm.InlineWord, flagged_call())
+    let arm = ir_block(0, [ir_expr_stmt(0, iv("t"))])
+    let root = ir_block(0, [bind, ir_if(0, ic(), arm, -1), ir_return(0, iv("t"))])
+    assert_valid("call bound to a Let and read twice", root)
+}
+
+test "a flagged value first reached in an outer block is still in scope in a nested one" {
+    ir_reset()
+    let call = flagged_call()
+    let arm = ir_block(0, [ir_return(0, call)])
+    let root = ir_block(0, [ir_expr_stmt(0, call), ir_if(0, ic(), arm, -1)])
+    // The braces of the nested block sit inside the braces that hold the temporary, so the
+    // name it binds is in scope at the second reach and the C compiles. The rule is about
+    // reach, not about counting blocks, so this tree passes.
+    assert_valid("call shared with a nested block", root)
+}
+
+test "a flagged value first reached in a switch scrutinee is in scope in its arms" {
+    ir_reset()
+    let call = flagged_call()
+    let arm0 = ir_block(0, [ir_expr_stmt(0, call)])
+    let arm1 = ir_block(0, [ir_expr_stmt(0, ic())])
+    let sw = ir_switch(0, call, [ic(), arm0, ic(), arm1], ir_block(0, []))
+    assert_valid("scrutinee read again inside an arm", ir_block(0, [sw]))
+}
