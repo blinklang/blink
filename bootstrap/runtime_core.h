@@ -1290,6 +1290,13 @@ BLINK_RT_FN int64_t blink_bytes_len(const blink_bytes* b) {
 }
 #endif
 
+BLINK_RT_FN uint8_t* blink_bytes_ptr(blink_bytes* b);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN uint8_t* blink_bytes_ptr(blink_bytes* b) {
+    return b->data;
+}
+#endif
+
 BLINK_RT_FN int64_t blink_bytes_is_empty(const blink_bytes* b);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_bytes_is_empty(const blink_bytes* b) {

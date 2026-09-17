@@ -19,7 +19,7 @@
 
 import parser.{
     node_kind, node_name, node_left, node_right, node_obj, node_index, node_method, node_args,
-    node_line,
+    node_line, node_body,
     node_methods, node_trait_name, node_impl_binders, node_type_params,
     node_module, node_source_module, node_params, node_fields, node_value,
     sublist_get, sublist_length,
@@ -40,6 +40,7 @@ import layout.{
     child_tid, ensure_typedef_for, format_spec_of, varargs_spelling,
     tid_of_binder, current_binder_scope, current_inst, decl_has_derive,
     container_slot_spelling, field_layout_of, address_layout_of, fn_pointer_spelling_of,
+    binder_scope_push, binder_scope_pop, bind_binder,
 }
 import mono.{instances, instance_for_call}
 import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls, cg_reg_trait_decls}
@@ -47,7 +48,7 @@ import cname.{
     c_fn_decl_name, c_impl_method_name, c_impl_method_name_q,
     c_display_dispatch_name, c_derive_method_name,
     c_runtime_helper, c_ffi_symbol, c_mint_local, c_string_literal, c_field_name,
-    cname_ffi_struct_mirror,
+    cname_ffi_struct_mirror, c_local_name,
     c_variant_tag_macro, c_mono_variant_tag_macro, c_variant_member_name,
 }
 import ir.{
@@ -57,6 +58,7 @@ import ir.{
     ir_enum_new,
 }
 import cg_expr.{lower_expr, cg_expr_push_pending}
+import cg_stmt.{lower_block_into}
 import cg_eff.{cg_eff_ev_argument, cg_eff_lower_builtin_perform, cg_eff_lower_user_perform}
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
 import diagnostics.{
@@ -1591,6 +1593,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if cc_is_scalar_cast(kind, mname) { return cc_scalar_cast(node, obj, kind, mname) }
     if cc_is_char_text(kind, mname) { return cc_char_text(node, obj, kind, mname) }
     if cc_is_str_as_cstr(kind, mname) { return cc_str_as_cstr(node, obj, kind, mname) }
+    if cc_is_bytes_with_ptr(kind, mname) { return cc_bytes_with_ptr(node, obj, kind, mname) }
     if cc_is_carrier_test(kind, mname) { return cc_carrier_test(node, obj, kind, mname) }
     if cc_is_carrier_read(kind, mname) { return cc_carrier_read(node, obj, kind, mname) }
     if kind == TyKind.FfiScope { return cc_lower_scope_method(node, obj, mname) }
@@ -2058,6 +2061,53 @@ fn cc_str_as_cstr(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.
     let recv = lower_expr(obj)
     if recv < 0 { return -1 }
     ir_call_runtime(tid, node, answer.c_spelling, c_runtime_helper("strdup"), answer.slot_form, [recv])
+}
+
+fn cc_is_bytes_with_ptr(kind: TyKind, method: Str) -> Bool {
+    kind == TyKind.Bytes && method == "with_ptr"
+}
+
+// `b.with_ptr(fn(p) { BODY })` pins the buffer for one call and hands BODY the raw
+// pointer, so BODY is inlined at the call site rather than turned into a value the
+// runtime calls back into: there is no closure to build, store or pass anywhere. The
+// pointer's own let and the destination temp both go through the pending buffer ahead
+// of the block, exactly as a value-position `if` hoists its own temp (materialise_value_expr
+// in cg_stmt.bl); the difference is that a with_ptr call always reaches this seam
+// directly; it is never itself a value-position construct the statement stage has to
+// spot ahead of time.
+fn cc_bytes_with_ptr(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    let args = node_args(node)
+    let given = sublist_length(args)
+    if given != 1 { return cc_intrinsic_arity_wrong(node, kind, method, 1, given) }
+    let cls = sublist_get(args, 0)
+    if nk_of(node_kind(cls)) != NodeKind.Closure { return cc_pointer_body_not_lowered(node) }
+    let params = node_params(cls)
+    if params == -1 || sublist_length(params) != 1 { return cc_pointer_body_not_lowered(node) }
+    let param = sublist_get(params, 0)
+    let pname = node_name(param)
+    let ptid = tid_of_node(param)
+    if ptid < 0 { return -1 }
+    let precord = cc_local(ptid, param)
+    if cc_stopped(precord) { return -1 }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    let ptr_init = ir_call_runtime(ptid, node, precord.c_spelling,
+        c_runtime_helper("bytes_ptr"), precord.slot_form, [recv])
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    cg_expr_push_pending(node, ir_let(ptid, param, precord.c_spelling,
+        c_local_name(pname), precord.slot_form, ptr_init))
+    let scope = binder_scope_push()
+    bind_binder(scope, pname, ptid)
+    let dest = c_mint_local("wp")
+    cg_expr_push_pending(node, ir_let(tid, node, rec.c_spelling, dest, rec.slot_form, -1))
+    let body = lower_block_into(node_body(cls), dest, tid)
+    binder_scope_pop()
+    if body < 0 { return -1 }
+    cg_expr_push_pending(node, body)
+    cc_temp_ref(node, tid, rec, dest)
 }
 
 // ── Carriers ──────────────────────────────────────────────────────────────
@@ -2576,8 +2626,9 @@ fn cc_str_intrinsic(method: Str) -> Str {
 
 // `get` reads through the checked wrapper rather than the raw binding beside it, because
 // the method answers an Option and the raw binding answers a bare Int. `with_ptr` is
-// absent because it hands its body a pointer into the buffer, which is a block and not a
-// call. `len` and `is_empty` are answered by a real impl, as they are for Str.
+// absent because its body is inlined at the call site (cc_bytes_with_ptr), never turned
+// into one runtime call. `len` and `is_empty` are answered by a real impl, as they are
+// for Str.
 fn cc_bytes_intrinsic(method: Str) -> Str {
     if method == "get" { return "std_bytes:bytes_get_opt" }
     if method == "push" { return "std_bytes:bytes_push" }
@@ -2705,18 +2756,18 @@ fn cc_intrinsic_arity_wrong(node: Int, kind: TyKind, method: Str, want: Int, got
 // missing stays legible and countable rather than arriving as one blanket count.
 fn cc_method_not_built(node: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
     if kind == TyKind.List { return cc_list_not_built(node, method) }
-    if kind == TyKind.Bytes && method == "with_ptr" { return cc_pointer_body_not_lowered(node) }
     cc_intrinsic_not_built(node, kind, method)
 }
 
-// `b.with_ptr(f)` binds a pointer into the buffer to the body's own parameter, runs the
-// body there, and answers what the body computed. A binding and a block are both
-// statements, so what this needs is the stage that builds statements. No call node stands
-// for either, which is why it is named here rather than counted with the rest.
+// `b.with_ptr(f)` inlines `f`'s body at the call site (cc_bytes_with_ptr), which needs
+// `f` written as a one-parameter closure literal right there in the call: that is the one
+// shape typecheck admits (sections/07_trust_modules_metadata.md), and the only shape this
+// stage has a body to inline. A stored closure value or the wrong arity reaches here
+// instead of a body, and there is nothing to inline.
 fn cc_pointer_body_not_lowered(node: Int) -> Int ! Diag.Report {
     diag_ice_at("PointerBodyNotLowered", CODEGEN_STAGE_NOT_BUILT,
-        "'Bytes.with_ptr' binds a pointer into the buffer and runs its body there", node,
-        "the statement stage owns the block and the binding; no call node stands for either")
+        "'Bytes.with_ptr' needs a one-parameter closure literal written at the call site to inline",
+        node, "pass a closure literal with exactly one parameter directly to with_ptr")
     -1
 }
 
