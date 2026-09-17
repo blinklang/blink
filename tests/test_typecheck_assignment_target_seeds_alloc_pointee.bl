@@ -1,0 +1,154 @@
+// An assignment target is a declared type, exactly as a let annotation is. The arena
+// allocators read the type expected of the call to learn what they point at, and that
+// channel had a let site and no assignment site — so `p = scope.alloc_n(4)` could not see
+// the `Ptr[I64]` that `p` was declared with, one line up. The allocation then had no
+// pointee at all: first it was sized from `sizeof(void)`, four bytes for four 8-byte cells,
+// and since the under-determined-type decision it is a refusal to compile valid code.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, tc_tid_child, tc_tid_child_count}
+import parser.{nodes, node_kind, node_method}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn diag_names() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push(d.name) }
+    }
+    out
+}
+
+fn assert_no_errors(label: Str) {
+    let names = diag_names()
+    if names.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for n in names { io.println("  {n}") }
+    }
+    assert(names.len() == 0)
+}
+
+// The one MethodCall naming `method`. -2 marks an ambiguous measurement.
+fn only_method_call(method: Str) -> Int {
+    let mut found = -1
+    let mut hits = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.MethodCall && node_method(i) == method {
+            hits = hits + 1
+            found = i
+        }
+        i = i + 1
+    }
+    if hits > 1 { return -2 }
+    found
+}
+
+fn tid_str(t: Int) -> Str ! Diag.Report {
+    if t < 0 { return "<unset>" }
+    tc_type_str(t)
+}
+
+fn assert_tid(label: Str, t: Int, want: Str) ! Diag.Report {
+    let got = tid_str(t)
+    if got != want { io.println("FAIL: {label}: tid is {got}, want {want}") }
+    assert(got == want)
+}
+
+fn alloc_n_assign_src() -> Str {
+    #"
+@trusted(audit: "x")
+fn go() ! FFI {
+    with ffi.scope() as scope {
+        let mut p: Ptr[I64] = scope.alloc()
+        p.write(5)
+        p = scope.alloc_n(4)
+        p.write(1)
+    }
+}
+fn main() { go() }
+"#
+}
+
+test "an assignment target's declared type names the pointee of an alloc_n on its right" {
+    typecheck_probe("build/tc_assign_alloc_n.bl", alloc_n_assign_src())
+    assert_no_errors("alloc_n in assignment position")
+    let c = only_method_call("alloc_n")
+    assert(c >= 0)
+    let t = tc_lookup_node_tid(c)
+    // Ptr[Int], not Ptr[I64]: `I64` is a spelling of `Int` that name resolution collapses, so
+    // there is no distinct I64 tid for the pointee to be. The row below carries a width that
+    // does stay distinct, which is where "the pointee is carried, not defaulted" is proved.
+    assert_tid("alloc_n call", t, "Ptr[Int]")
+    // The head being right is not the claim. The pointee is what sizes the allocation.
+    assert(tc_tid_child_count(t) == 1)
+    assert_tid("pointee", tc_tid_child(t, 0), "Int")
+}
+
+fn alloc_assign_src() -> Str {
+    #"
+@trusted(audit: "x")
+fn go() ! FFI {
+    with ffi.scope() as scope {
+        let mut p: Ptr[U8] = scope.alloc()
+        p = scope.alloc()
+        p.write(7)
+    }
+}
+fn main() { go() }
+"#
+}
+
+// alloc reads the same channel as alloc_n, so the seed has to serve both or the fix is
+// specific to one method name rather than to the missing channel.
+test "the same assignment seed answers a plain alloc on the right" {
+    typecheck_probe("build/tc_assign_alloc.bl", alloc_assign_src())
+    assert_no_errors("alloc in assignment position")
+    let mut i = 0
+    let mut hits = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.MethodCall && node_method(i) == "alloc" {
+            assert_tid("alloc call", tc_lookup_node_tid(i), "Ptr[U8]")
+            hits = hits + 1
+        }
+        i = i + 1
+    }
+    // The let's allocator and the assignment's, both typed.
+    assert(hits == 2)
+}
+
+fn mismatch_src() -> Str {
+    #"
+@trusted(audit: "x")
+fn go() ! FFI {
+    with ffi.scope() as scope {
+        let mut p: Ptr[I64] = scope.alloc()
+        let mut q: Ptr[U8] = scope.alloc()
+        p = q
+        p.write(1)
+    }
+}
+fn main() { go() }
+"#
+}
+
+// The seed must not become a way to pass an assignment that disagrees. A hint says what is
+// expected of a value that has no type of its own; it does not overwrite one that has.
+test "seeding the target type still rejects an assignment between unlike pointers" {
+    typecheck_probe("build/tc_assign_ptr_mismatch.bl", mismatch_src())
+    let mut hits = 0
+    for n in diag_names() {
+        if n == "TypeError" { hits = hits + 1 }
+    }
+    assert(hits >= 1)
+}
