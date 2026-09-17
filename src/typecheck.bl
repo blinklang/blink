@@ -1952,13 +1952,7 @@ fn tc_pin_ops_trait_receiver(trait_name: Str, method: Str, args_sl: Int) ! TypeC
 // the qualified spelling already had: the trait qualifier goes unverified, arity goes
 // unchecked, and a receiver the instance arm would refuse still passes. Declines with
 // -1 for anything outside the sealed method surface.
-fn tc_ops_trait_qualified_ret(method: Str, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if args_sl == -1 || sublist_length(args_sl) < 1 { return -1 }
-    // Only the receiver is inferred here. infer_type sweeps this call's still-untyped
-    // arguments itself once this answer returns, and inference is uncached — a second
-    // walk of an already-typed argument re-runs its reports and re-mints the metavars
-    // an empty literal binds.
-    let recv = tc_resolve(infer_type(sublist_get(args_sl, 0)))
+fn tc_ops_trait_qualified_ret(method: Str, recv: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let k = type_kind(recv)
     // `len` and `is_empty` are the two every sized receiver answers; `count` is List's
     // alone and `capacity` StringBuilder's, exactly as the instance arms below have them.
@@ -2015,6 +2009,32 @@ fn tc_ops_trait_qualified_ret(method: Str, args_sl: Int) -> Int ! TypeCheck.Reso
         if method == "to_str" { return TYPE_STR }
     }
     -1
+}
+
+// A qualified sealed-Ops call the return table above declined, judged the way the INSTANCE
+// spelling judges it. `MapOps.get_or_default(m, k, d)` denotes the same call as
+// `m.get_or_default(k, d)`, which is a hard UnresolvedMethod: the method is written in the
+// trait the spec gives Map, and nothing in the front end answers it. Through the qualified
+// spelling that same call used to pass `blink check` carrying a warning that the receiver's
+// type was not known — it was known, and it was the very thing that refuses the method.
+//
+// Both gates are the instance arm's own, so this refuses exactly what that arm refuses. A
+// receiver whose type is not yet determined keeps its silence, because nothing has decided
+// its surface yet; and a method that IS on the receiver's surface is not refused here just
+// because the table above has no row for that receiver kind, which keeps the table free to
+// decline without turning every gap into an error.
+//
+// Poisons the answer rather than leaving it absent, so a declared type over the call unifies
+// with the recovery tid instead of drawing a second, derived error about a type the program
+// never had. Declines with -1, which the caller reads as "not mine".
+fn tc_ops_trait_qualified_unresolved(method: Str, recv: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let k = type_kind(recv)
+    if tc_recv_type_is_determined(k, recv) == 0 { return -1 }
+    if tc_method_unavailable_on_receiver(k, method) == 0 { return -1 }
+    let tname = type_to_str(recv)
+    tc_unresolved_method_hard.insert(node, 1)
+    diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method '.{method}' on type {tname}", node, tc_unresolved_method_help(k, tname, method))
+    tc_error_recovery_tid()
 }
 
 // The receivers that answer `Sized`. Anything else declines, so a sized method on a
@@ -14883,9 +14903,19 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // element metavar(s) from the payload args so `let m = Map();
             // MapOps.insert(m,"k",42)` infers Map[Str,Int] rather than E0301.
             if is_sealed_builtin_trait(obj_name) != 0 {
-                tc_pin_ops_trait_receiver(obj_name, method, node_args(node))
-                let ops_ret = tc_ops_trait_qualified_ret(method, node_args(node))
-                if ops_ret != -1 { return ops_ret }
+                let ops_args = node_args(node)
+                tc_pin_ops_trait_receiver(obj_name, method, ops_args)
+                if ops_args != -1 && sublist_length(ops_args) >= 1 {
+                    // Inferred ONCE here and handed to both the answer and the refusal.
+                    // Inference is uncached, so a second walk of the receiver re-runs its
+                    // reports and re-mints the metavars an empty literal binds. The call's
+                    // remaining arguments are swept by infer_type once this answer returns.
+                    let ops_recv = tc_resolve(infer_type(sublist_get(ops_args, 0)))
+                    let ops_ret = tc_ops_trait_qualified_ret(method, ops_recv)
+                    if ops_ret != -1 { return ops_ret }
+                    let ops_refused = tc_ops_trait_qualified_unresolved(method, ops_recv, node)
+                    if ops_refused != -1 { return ops_refused }
+                }
             }
             if obj_name == "Char" {
                 if method == "from_code_point" {
