@@ -1,0 +1,161 @@
+// Inside a generic body a field reached through a binder typed by the type parameter
+// has no tid at the definition site: the receiver is an unbound T, which declares no
+// fields, so typecheck stamps nothing and is right not to. The tid exists only once an
+// instance says what T stands for, so the mono walk is what must record it.
+import std.fs
+import typecheck.{check_types, tc_type_str}
+import mono.{run_mono, instances, node_tid_for_inst, MonoInstance}
+import parser.{nodes, node_kind, node_name, node_obj}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+
+fn find_decl(kind: NodeKind, name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == kind && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// The field access `<recv>.<field>`, by the receiver's spelling so a probe that reaches
+// the same field through two binders still names one node.
+fn field_access_on(recv: Str, field: Str) -> Int {
+    let mut hit = -1
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FieldAccess && node_name(i) == field {
+            let o = node_obj(i)
+            if o != -1 {
+                if node_kind(o) == NodeKind.Ident && node_name(o) == recv {
+                    if hit != -1 { return -1 }
+                    hit = i
+                }
+            }
+        }
+        i = i + 1
+    }
+    hit
+}
+
+fn instances_of(decl: Int) -> List[MonoInstance] {
+    let mut out: List[MonoInstance] = []
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(inst) }
+    }
+    out
+}
+
+fn one_instance(gname: Str) -> MonoInstance {
+    let decl = find_decl(NodeKind.FnDef, gname)
+    assert(decl >= 0)
+    let insts = instances_of(decl)
+    assert_eq(insts.len(), 1)
+    insts.get(0).unwrap()
+}
+
+fn run_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    env.set_var("BLINK_ROOT", env.cwd())
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+}
+
+fn field_type_in(inst: MonoInstance, recv: Str, field: Str) -> Str ! Diag.Report {
+    let n = field_access_on(recv, field)
+    if n == -1 { return "<no such field access>" }
+    tc_type_str(node_tid_for_inst(inst, n))
+}
+
+test "the ticket shape: v.x inside handle_result[T] is Int in the SomeStruct instance" {
+    run_probe("build/mono_field_generic_binder_ticket.bl", #"type SomeStruct {
+    x: Int
+}
+
+fn handle_result[T](r: Result[T, Str]) -> Int {
+    match r {
+        Ok(v) => { return v.x }
+        Err(_m) => { return 0 }
+    }
+}
+
+fn main() {
+    let n = handle_result(Ok(SomeStruct { x: 10 }))
+    io.println("{n}")
+}
+"#)
+    let inst = one_instance("handle_result")
+    assert_eq(tc_type_str(inst.arg_tids), "(SomeStruct)")
+    assert_eq(field_type_in(inst, "v", "x"), "Int")
+}
+
+test "the field is read at the instance, so two instances answer two field types" {
+    run_probe("build/mono_field_generic_binder_two.bl", #"type IntBox {
+    v: Int
+}
+
+type StrBox {
+    v: Str
+}
+
+fn unbox[T](b: T) -> Int {
+    let _f = b.v
+    0
+}
+
+fn main() {
+    let _a = unbox(IntBox { v: 1 })
+    let _b = unbox(StrBox { v: "s" })
+    io.println("ok")
+}
+"#)
+    let decl = find_decl(NodeKind.FnDef, "unbox")
+    assert(decl >= 0)
+    let insts = instances_of(decl)
+    assert_eq(insts.len(), 2)
+    let mut seen: List[Str] = []
+    for inst in insts { seen.push(field_type_in(inst, "b", "v")) }
+    assert(seen.contains("Int"))
+    assert(seen.contains("Str"))
+}
+
+test "a generic struct's field is answered at the struct's own arguments" {
+    run_probe("build/mono_field_generic_binder_generic_struct.bl", #"type Cell[E] {
+    e: E
+}
+
+fn peek[T](c: T) -> Int {
+    let _f = c.e
+    0
+}
+
+fn main() {
+    let _a = peek(Cell { e: 7 })
+    io.println("ok")
+}
+"#)
+    let inst = one_instance("peek")
+    assert_eq(field_type_in(inst, "c", "e"), "Int")
+}
+
+test "a field reached on a ground receiver still comes from typecheck's stamp" {
+    run_probe("build/mono_field_generic_binder_ground.bl", #"type Pair {
+    a: Int
+}
+
+fn widen[T](t: T) -> Int {
+    let p = Pair { a: 3 }
+    let _u = t
+    p.a
+}
+
+fn main() {
+    let _n = widen(1)
+    io.println("ok")
+}
+"#)
+    let inst = one_instance("widen")
+    assert_eq(field_type_in(inst, "p", "a"), "Int")
+}
