@@ -28,8 +28,10 @@ there is no index to count.
 
 ## Optional arguments
 
-**None.** Blink has no default parameter values and no variadic parameters, so
-every row below is an exact count, and no index is optional.
+**None. Every builtin method takes a fixed number of arguments.** Blink has no
+default parameter values and no variadic parameters, so a method cannot have an
+optional index, and no survey of these arms will find one. Every row below is an
+exact count: one method, one arity, always. Do not go looking for optionals.
 
 Three arms *tolerate* a missing argument rather than allow it, which is a
 different thing: `StringBuilder.write`, `StringBuilder.write_char`, `Ptr.write`
