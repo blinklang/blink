@@ -1,18 +1,22 @@
 // A callee that carries an effect row receives the evidence vector as a trailing
-// `blink_ev*` parameter, so every call to one has to append the address of the program's
-// one vector as its last argument. No IR node spells that address yet: the form is a
-// Unary '&' over the EvidenceVector, and the verifier holds every value node to a tid
-// while the vector has no Blink type to give one.
+// `blink_ev*` parameter, so every call to one appends the address of the program's one
+// vector as its last argument. That address is exact at every call site, including inside
+// an effectful function, because a handler install writes the one vector in place and
+// restores it on the way out, so there is never a second vector to choose between.
 //
-// So the argument is refused by name, from one producer in the effect stage, and the call
-// stage reaches that producer from every path that can resolve an effectful callee. What
-// these tests pin is that the refusal is the same on all of those paths, is recorded once
-// per call rather than once per path, and is not reached at all by a callee with no row.
+// The argument comes from one producer in the effect stage, and the call stage reaches it
+// from every path that can resolve an effectful callee. What these tests pin is that the
+// argument is the same on all of those paths, that it lands LAST so it matches the
+// position the callee declares, and that a callee with no row appends nothing.
 
-import lower_test_helpers.{probe, rhs_of, assert_kind, assert_ice, assert_verifies}
-import ir.{IrKind}
+import lower_test_helpers.{
+    probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
+}
+import ir.{IrKind, ir_kid, ir_c_spelling, ir_c_name}
 import cg_call.{lower_call}
 import cg_eff.{cg_eff_ev_argument}
+import cname.{c_ev_type_name, c_ev_global_name}
+import layout.{pointer_spelling}
 
 fn src_effectful_callees() -> Str {
     #"import std.io
@@ -44,31 +48,55 @@ fn main() {
 "#
 }
 
-test "the evidence argument is refused by name, from the effect stage" {
+// The producer reads through cname for both spellings, so the argument cannot drift from
+// the vector it takes the address of.
+test "the evidence argument is the address of the one vector, spelled as a pointer" {
     probe("cg_eff_ev_argument", src_effectful_callees())
-    assert_ice("producer", cg_eff_ev_argument(rhs_of("freed")), "EvidenceVectorNotInIr")
+    let id = cg_eff_ev_argument(rhs_of("freed"))
+    assert_kind("kind", id, IrKind.EvidenceAddress)
+    assert_shape("shape", id, "EvidenceAddress(EvidenceVector)")
+    assert_eq_str("spelling", ir_c_spelling(id), pointer_spelling(c_ev_type_name()))
+    assert_eq_str("vector", ir_c_name(ir_kid(id, 0)), c_ev_global_name())
+    assert_verifies("verify", id)
 }
 
-test "a free call to an effectful function refuses the evidence argument" {
+// Last, because that is the position the callee declares the parameter in. A free call
+// writes no receiver, so the vector's address is its only argument.
+test "a free call to an effectful function appends the address last" {
     probe("cg_eff_ev_argument", src_effectful_callees())
-    assert_ice("free call", lower_call(rhs_of("freed")), "EvidenceVectorNotInIr")
+    let id = lower_call(rhs_of("freed"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_shape("shape", id, "CallDirect(EvidenceAddress(EvidenceVector))")
+    assert_verifies("verify", id)
 }
 
-test "a method call on a value whose impl method is effectful refuses the evidence argument" {
+// The receiver travels first and the vector last, so an effectful method call proves the
+// two ends do not trade places.
+test "a method call on an effectful impl method appends the address after the receiver" {
     probe("cg_eff_ev_argument", src_effectful_callees())
-    assert_ice("value method", lower_call(rhs_of("ticked")), "EvidenceVectorNotInIr")
+    let id = lower_call(rhs_of("ticked"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_shape("shape", id, "CallDirect(VarRef, EvidenceAddress(EvidenceVector))")
+    assert_eq_str("receiver", ir_c_name(ir_kid(id, 0)), "meter")
+    assert_verifies("verify", id)
 }
 
-test "a trait-qualified call to an effectful impl method refuses the evidence argument" {
+// Written under the trait rather than on the value, the same body is reached, so the
+// argument list has to come out the same as the method call's above.
+test "a trait-qualified call to an effectful impl method appends the address too" {
     probe("cg_eff_ev_argument", src_effectful_callees())
-    assert_ice("trait qualified", lower_call(rhs_of("qualified")), "EvidenceVectorNotInIr")
+    let id = lower_call(rhs_of("qualified"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_shape("shape", id, "CallDirect(VarRef, EvidenceAddress(EvidenceVector))")
+    assert_verifies("verify", id)
 }
 
-// The refusal belongs to the callee's row, so a callee without one reaches no producer and
-// the call lowers. A gate that asked something else would refuse this call too.
-test "a call to a function with no effect row appends nothing and lowers" {
+// The argument belongs to the callee's row, so a callee without one appends nothing. A
+// gate that asked something else would hand this call a vector it never declared.
+test "a call to a function with no effect row appends nothing" {
     probe("cg_eff_ev_argument", src_effectful_callees())
     let id = lower_call(rhs_of("plain"))
     assert_kind("kind", id, IrKind.CallDirect)
+    assert_shape("shape", id, "CallDirect(Const)")
     assert_verifies("verify", id)
 }
