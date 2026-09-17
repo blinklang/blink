@@ -474,7 +474,84 @@ fn lower_fn_call(node: Int) -> Int ! Diag.Report {
     if !cc_is_free_name(callee) {
         return cc_closure_call(node, callee)
     }
-    cc_free_call(node, cc_fn_anywhere(node, cc_declared_name(node_name(callee))))
+    // Read on the ALIAS-RESOLVED name, above declaration lookup, because that is the order
+    // typecheck resolves a bare call in: it resolves an alias first and only then asks
+    // is_builtin_fn of the result, so a program that imports a module fn under a builtin's
+    // name cannot shadow the builtin, and a program that aliases a builtin's name to
+    // something else reaches the builtin under its own name regardless.
+    let name = cc_declared_name(node_name(callee))
+    if is_builtin_fn(name) == 1 { return lower_builtin_free_call(node, name) }
+    cc_free_call(node, cc_fn_anywhere(node, name))
+}
+
+// A bare call to a name the compiler recognises without any Blink declaration standing
+// behind it: a runtime function such as `read_file`, or a builtin type's own constructor
+// spelled bare (`Bytes()`) rather than through its qualified `Type.new()` form. A pair
+// neither table owns is one of the builtins this stage does not lower yet (`assert`, a
+// keyed container's bare constructor, and the rest), and falls to the same refusal a
+// declaration miss would reach.
+fn lower_builtin_free_call(node: Int, name: Str) -> Int ! Diag.Report {
+    let symbol = cc_builtin_free_symbol(name)
+    if symbol != "" {
+        let want = cc_builtin_free_arity(name)
+        let given = sublist_length(node_args(node))
+        if given != want { return cc_free_arity_wrong(node, name, want, given) }
+        return cc_build_call(node, symbol, NO_RECEIVER, CallForm.Runtime, false)
+    }
+    let answer = tid_of_node(node)
+    if answer < 0 { return -1 }
+    let ctor = cc_runtime_ctor_symbol(cc_kind(answer), "new")
+    if ctor == "" { return cc_no_such_callee(node) }
+    let want = cc_runtime_ctor_arity(cc_kind(answer), "new")
+    let given = sublist_length(node_args(node))
+    if given != want { return cc_ctor_arity_wrong(node, name, "new", want, given) }
+    cc_build_call(node, ctor, NO_RECEIVER, CallForm.Runtime, false)
+}
+
+// The runtime call a compiler-provided free function reaches. An empty answer means the
+// name is not one of these: it may still be a builtin type's constructor called bare, which
+// the caller reads from the runtime-ctor table instead.
+fn cc_builtin_free_symbol(name: Str) -> Str {
+    if name == "file_exists" { return c_runtime_helper("file_exists") }
+    if name == "is_dir" { return c_runtime_helper("is_dir") }
+    if name == "read_file" { return c_runtime_helper("read_file") }
+    if name == "write_file" { return c_runtime_helper("write_file") }
+    if name == "list_dir" { return c_runtime_helper("list_dir") }
+    if name == "fs_remove" { return c_runtime_helper("fs_remove") }
+    if name == "shell_exec" { return c_runtime_helper("shell_exec") }
+    if name == "exit" { return c_runtime_helper("exit") }
+    if name == "time_ms" { return c_runtime_helper("time_ms") }
+    if name == "arg_count" { return c_runtime_helper("arg_count") }
+    if name == "get_arg" { return c_runtime_helper("get_arg") }
+    ""
+}
+
+// How many arguments that same runtime call takes. Keyed exactly as the symbol above is, so
+// the two read the same table; a name the symbol declines is never asked for an arity.
+fn cc_builtin_free_arity(name: Str) -> Int {
+    if name == "file_exists" { return 1 }
+    if name == "is_dir" { return 1 }
+    if name == "read_file" { return 1 }
+    if name == "write_file" { return 2 }
+    if name == "list_dir" { return 1 }
+    if name == "fs_remove" { return 1 }
+    if name == "shell_exec" { return 1 }
+    if name == "exit" { return 1 }
+    if name == "time_ms" { return 0 }
+    if name == "arg_count" { return 0 }
+    if name == "get_arg" { return 1 }
+    NO_ARITY
+}
+
+// A compiler-provided free function written with the wrong number of arguments. Typecheck
+// does not check the arity of these, so the check is repeated here rather than assumed: the
+// runtime call takes a fixed count, and building it from a different one would hand the C
+// compiler a call it cannot compile, with no Blink span on the error.
+fn cc_free_arity_wrong(node: Int, name: Str, want: Int, got: Int) -> Int ! Diag.Report {
+    diag_ice_at("RuntimeFreeCallArityWrong", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{name}' takes {want} argument(s), and this call was given {got}", node,
+        "typecheck must reject this call before codegen reads it; this is a compiler bug")
+    -1
 }
 
 // A call whose callee is a closure value rather than a function's own name: the callee
@@ -1193,6 +1270,10 @@ fn cc_runtime_ctor_symbol(answer: TyKind, method: Str) -> Str {
     if answer == TyKind.StringBuilder {
         if method == "new" { return c_runtime_helper("sb_new") }
         if method == "with_capacity" { return c_runtime_helper("sb_with_capacity") }
+        return ""
+    }
+    if answer == TyKind.Channel {
+        if method == "new" { return c_runtime_helper("channel_new") }
     }
     ""
 }
@@ -1209,6 +1290,10 @@ fn cc_runtime_ctor_arity(answer: TyKind, method: Str) -> Int {
     if answer == TyKind.StringBuilder {
         if method == "new" { return 0 }
         if method == "with_capacity" { return 1 }
+        return NO_ARITY
+    }
+    if answer == TyKind.Channel {
+        if method == "new" { return 1 }
     }
     NO_ARITY
 }

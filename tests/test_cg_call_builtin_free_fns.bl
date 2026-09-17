@@ -1,0 +1,283 @@
+// Bare calls to a name the compiler recognises without any Blink declaration behind it.
+//
+// `is_builtin_fn` is the front end's own list of these names, read before any declared
+// function is looked up, so a program cannot shadow one by declaring a function of the same
+// name. Three shapes reach that list through the ordinary bare-call path (`Ident(args)`):
+// a plain runtime call such as `file_exists`, a builtin type's own constructor spelled bare
+// (`Bytes()`) rather than through its qualified `Type.new()` form, and a name this stage
+// does not lower yet (`assert`, `Set`), which must keep refusing exactly as it did before.
+
+import lower_test_helpers.{
+    probe, probe_but, rhs_of, let_node_of, assert_kind, assert_eq_str, assert_shape,
+    assert_verifies, assert_ice_saying,
+}
+import parser.{node_kind, node_left, node_name, nodes}
+import ast.{NodeKind, nk_of}
+import ir.{IrKind, ir_c_name}
+import cg_expr.{lower_expr}
+import std.io
+
+// A call written as a statement binds no name, so it is found by walking forward from a
+// binding the probe does name: a statement parses after the binding above it, so its node
+// id is higher. The callee is read off the Call node's own left child, not a method name,
+// because a bare call has no qualifier for a method name to sit after.
+fn call_after(anchor: Str, name: Str) -> Int {
+    let mut i = let_node_of(anchor)
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.Call {
+            let callee = node_left(i)
+            if callee >= 0 && nk_of(node_kind(callee)) == NodeKind.Ident && node_name(callee) == name {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no call of '{name}' after '{anchor}'")
+    assert(false)
+    -1
+}
+
+// One call per plain runtime name, each written with the arity its runtime call takes.
+// `write_file` and `exit` answer nothing, so they sit as statements; the rest answer a
+// value and are bound.
+fn src_plain() -> Str {
+    #"fn main() {
+    let path = "hi.txt"
+    let content = "hi"
+    let exists = file_exists(path)
+    let dir = is_dir(path)
+    let text = read_file(path)
+    write_file(path, content)
+    let entries = list_dir(path)
+    fs_remove(path)
+    let code = shell_exec("true")
+    let now = time_ms()
+    let n = arg_count()
+    let a0 = get_arg(0)
+    let _keep = [exists, dir, code, now, n]
+    let _also = [text.len(), entries.len(), a0.len()]
+    exit(0)
+}
+"#
+}
+
+// A builtin type's own constructor spelled bare, and a bare `Channel(n)` under the
+// annotation that resolves its element metavar.
+fn src_ctors() -> Str {
+    #"fn main() {
+    let cap = 16
+    let text = "hi"
+    let builder = StringBuilder()
+    let empty = Bytes()
+    let ch: Channel[Int] = Channel(4)
+    let _keep = [cap.to_str(), text]
+    let _also = ch
+    let _also2 = builder
+    let _also3 = empty
+}
+"#
+}
+
+// A closure value called where a plain name would go, and one bound name shadowing what
+// would otherwise be a builtin's own name. Neither is a free name (cc_is_free_name reads
+// the binder scope before is_builtin_fn is ever asked), so both must keep going through
+// the closure-call path unchanged.
+fn src_closure_arg() -> Str {
+    #"fn main() {
+    let add_one = fn(x: Int) -> Int { x + 1 }
+    let via_binding = add_one(4)
+    let via_iife = (fn(y: Int) -> Int { y * 2 })(3)
+    let _keep = [via_binding, via_iife]
+}
+"#
+}
+
+// The tail this slice leaves refused: `assert` is statement-shaped compiler sugar with no
+// value-returning lowering here, and `Set()` names a keyed container whose key operations
+// this stage cannot choose from a call alone. Both must still refuse through the exact
+// mechanism they refused through before this slice touched the free-call path.
+fn src_refused() -> Str {
+    #"fn main() {
+    let mut seen = Set()
+    seen.insert(7)
+    assert(1 == 1)
+    let _keep = seen.len()
+}
+"#
+}
+
+// A wrong-arity call to a plain runtime name. Typecheck does not check the arity of these,
+// so this program still type-checks and the backstop this slice adds is what refuses it.
+fn src_free_arity_wrong() -> Str {
+    #"fn main() {
+    let now = time_ms(1)
+    let _keep = now
+}
+"#
+}
+
+// A wrong-arity bare `Channel(...)` call, exercising the new Channel row through the same
+// backstop the other builtin constructors already share.
+fn src_channel_arity_wrong() -> Str {
+    #"fn main() {
+    let ch: Channel[Int] = Channel()
+    let _keep = ch
+}
+"#
+}
+
+test "file_exists reaches the runtime call with its path argument" {
+    probe("cg_call_bf_file_exists", src_plain())
+    let built = lower_expr(rhs_of("exists"))
+    assert_kind("kind", built, IrKind.CallRuntime)
+    assert_shape("shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_file_exists")
+    assert_verifies("file_exists", built)
+}
+
+test "is_dir reaches the runtime call with its path argument" {
+    probe("cg_call_bf_is_dir", src_plain())
+    let built = lower_expr(rhs_of("dir"))
+    assert_shape("shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_is_dir")
+    assert_verifies("is_dir", built)
+}
+
+test "read_file reaches the runtime call with its path argument" {
+    probe("cg_call_bf_read_file", src_plain())
+    let built = lower_expr(rhs_of("text"))
+    assert_shape("shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_read_file")
+    assert_verifies("read_file", built)
+}
+
+test "write_file passes its path and content to the runtime call" {
+    probe("cg_call_bf_write_file", src_plain())
+    let built = lower_expr(call_after("text", "write_file"))
+    assert_shape("shape", built, "CallRuntime(VarRef, VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_write_file")
+    assert_verifies("write_file", built)
+}
+
+test "list_dir reaches the runtime call with its path argument" {
+    probe("cg_call_bf_list_dir", src_plain())
+    let built = lower_expr(rhs_of("entries"))
+    assert_shape("shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_list_dir")
+    assert_verifies("list_dir", built)
+}
+
+test "fs_remove passes its path to the runtime call" {
+    probe("cg_call_bf_fs_remove", src_plain())
+    let built = lower_expr(call_after("entries", "fs_remove"))
+    assert_shape("shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_fs_remove")
+    assert_verifies("fs_remove", built)
+}
+
+test "shell_exec passes its command to the runtime call" {
+    probe("cg_call_bf_shell_exec", src_plain())
+    let built = lower_expr(rhs_of("code"))
+    assert_shape("shape", built, "CallRuntime(Const)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_shell_exec")
+    assert_verifies("shell_exec", built)
+}
+
+test "time_ms reaches the runtime clock with no argument" {
+    probe("cg_call_bf_time_ms", src_plain())
+    let built = lower_expr(rhs_of("now"))
+    assert_shape("shape", built, "CallRuntime")
+    assert_eq_str("symbol", ir_c_name(built), "blink_time_ms")
+    assert_verifies("time_ms", built)
+}
+
+test "arg_count reaches the runtime argv reader with no argument" {
+    probe("cg_call_bf_arg_count", src_plain())
+    let built = lower_expr(rhs_of("n"))
+    assert_shape("shape", built, "CallRuntime")
+    assert_eq_str("symbol", ir_c_name(built), "blink_arg_count")
+    assert_verifies("arg_count", built)
+}
+
+test "get_arg passes its index to the runtime argv reader" {
+    probe("cg_call_bf_get_arg", src_plain())
+    let built = lower_expr(rhs_of("a0"))
+    assert_shape("shape", built, "CallRuntime(Const)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_get_arg")
+    assert_verifies("get_arg", built)
+}
+
+test "exit passes its code to the runtime call" {
+    probe("cg_call_bf_exit", src_plain())
+    let built = lower_expr(call_after("a0", "exit"))
+    assert_shape("shape", built, "CallRuntime(Const)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_exit")
+    assert_verifies("exit", built)
+}
+
+test "a bare StringBuilder() reaches the same runtime constructor as StringBuilder.new()" {
+    probe("cg_call_bf_sb_bare", src_ctors())
+    let built = lower_expr(rhs_of("builder"))
+    assert_kind("kind", built, IrKind.CallRuntime)
+    assert_shape("shape", built, "CallRuntime")
+    assert_eq_str("symbol", ir_c_name(built), "blink_sb_new")
+    assert_verifies("StringBuilder bare", built)
+}
+
+test "a bare Bytes() reaches the same runtime constructor as Bytes.new()" {
+    probe("cg_call_bf_bytes_bare", src_ctors())
+    let built = lower_expr(rhs_of("empty"))
+    assert_shape("shape", built, "CallRuntime")
+    assert_eq_str("symbol", ir_c_name(built), "blink_bytes_new")
+    assert_verifies("Bytes bare", built)
+}
+
+test "a bare Channel(n) reaches the runtime channel constructor with its capacity" {
+    probe("cg_call_bf_channel_bare", src_ctors())
+    let built = lower_expr(rhs_of("ch"))
+    assert_shape("shape", built, "CallRuntime(Const)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_channel_new")
+    assert_verifies("Channel bare", built)
+}
+
+test "a closure value bound to a name is still called through the closure-call path" {
+    probe("cg_call_bf_closure_binding", src_closure_arg())
+    let built = lower_expr(rhs_of("via_binding"))
+    assert_kind("kind", built, IrKind.CallClosure)
+    assert_verifies("closure via binding", built)
+}
+
+test "an immediately-invoked closure literal is still called through the closure-call path" {
+    probe("cg_call_bf_closure_iife", src_closure_arg())
+    let built = lower_expr(rhs_of("via_iife"))
+    assert_kind("kind", built, IrKind.CallClosure)
+    assert_verifies("closure via iife", built)
+}
+
+test "a bare Set() still refuses through the same call this stage does not lower" {
+    probe("cg_call_bf_set_bare", src_refused())
+    assert_ice_saying("Set()", lower_expr(rhs_of("seen")),
+        "CodegenStageNotBuilt",
+        "cg_call closure values and compiler-provided calls")
+}
+
+test "assert still refuses as a call this stage does not lower" {
+    probe("cg_call_bf_assert", src_refused())
+    assert_ice_saying("assert", lower_expr(call_after("seen", "assert")),
+        "CodegenStageNotBuilt",
+        "cg_call closure values and compiler-provided calls")
+}
+
+test "a wrong-arity plain runtime call refuses rather than emit an uncompilable call" {
+    probe("cg_call_bf_time_ms_arity", src_free_arity_wrong())
+    assert_ice_saying("time_ms(1)", lower_expr(rhs_of("now")),
+        "RuntimeFreeCallArityWrong",
+        "'time_ms' takes 0 argument(s), and this call was given 1")
+}
+
+test "a wrong-arity bare Channel() refuses through the same ctor-arity backstop" {
+    probe("cg_call_bf_channel_arity", src_channel_arity_wrong())
+    assert_ice_saying("Channel()", lower_expr(rhs_of("ch")),
+        "RuntimeCtorArityWrong",
+        "'Channel.new' takes 1 argument(s), and this call was given 0")
+}
