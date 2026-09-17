@@ -804,9 +804,9 @@ BLINK_RT_FN int64_t blink_map_has(const blink_map* m, const void* key) {
 }
 #endif
 
-BLINK_RT_FN int64_t blink_map_remove(blink_map* m, const void* key);
+BLINK_RT_FN int64_t blink_map_remove(blink_map* m, const void* key, void** out_value);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_map_remove(blink_map* m, const void* key) {
+BLINK_RT_FN int64_t blink_map_remove(blink_map* m, const void* key, void** out_value) {
     const blink_kops* k = m->kops;
     size_t stride = blink_kops_stride(k);
     int64_t mask = m->cap - 1;
@@ -816,6 +816,7 @@ BLINK_RT_FN int64_t blink_map_remove(blink_map* m, const void* key) {
         if (m->states[idx] == 1) {
             const void* existing = blink_map_key_slot(m, idx, stride);
             if (k->eq(existing, key)) {
+                if (out_value) *out_value = m->values[idx];
                 m->states[idx] = 2;
                 m->len--;
                 return 1;
@@ -1287,6 +1288,13 @@ BLINK_RT_FN int64_t blink_bytes_len(const blink_bytes* b);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_bytes_len(const blink_bytes* b) {
     return b->len;
+}
+#endif
+
+BLINK_RT_FN uint8_t* blink_bytes_ptr(blink_bytes* b);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN uint8_t* blink_bytes_ptr(blink_bytes* b) {
+    return b->data;
 }
 #endif
 

@@ -20,7 +20,7 @@ import ast.{NodeKind, nk_of}
 import ir.{ir_c_name, ir_c_spelling, ir_kid}
 import layout.{layout_of, tid_of_node, Position}
 import typecheck.{TYPE_INT}
-import cg_expr.{lower_expr}
+import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
 import diagnostics.{Diag}
 import std.io
 
@@ -69,15 +69,113 @@ test "the alias membership test names the same runtime entry point" {
     assert_eq_str("symbol", ir_c_name(ir_kid(built, 0)), "blink_map_has")
 }
 
-test "a removal answers whether anything was removed" {
+// A removal moves the value out of the slot beside the key, so it answers the Option a
+// store returns rather than a presence test: the entry point's own return says whether the
+// key was held, and a cell passed by address holds what it found there, and the two are
+// wrapped into the carrier together. Four statements do it: the cell is declared, the
+// entry point is called, the carrier is declared, and one test fills it.
+type RemoveLowered { answer: Int  cell: Int  called: Int  declared: Int  branch: Int }
+
+fn cc_probe_remove(anchor: Str) -> RemoveLowered ! Diag.Report {
+    let mark = cg_expr_pending_count()
+    let built = lower_expr(rhs_of(anchor))
+    let stmts = cg_expr_take_pending(mark)
+    if stmts.len() != 4 {
+        io.println("FAIL: the call left {stmts.len()} statements, want 4")
+        assert(false)
+    }
+    RemoveLowered {
+        answer: built,
+        cell: stmts.get(0).unwrap(),
+        called: stmts.get(1).unwrap(),
+        declared: stmts.get(2).unwrap(),
+        branch: stmts.get(3).unwrap(),
+    }
+}
+
+fn removal_arm_value(branch: Int, which: Int) -> Int {
+    ir_kid(ir_kid(ir_kid(branch, which), 0), 1)
+}
+
+test "a removal calls the entry point with the key and the address of an out cell" {
     probe("map_remove_str", #"fn main() {
     let mut m: Map[Str, Int] = Map.new()
     let gone = m.remove("k")
 }
 "#)
+    let low = cc_probe_remove("gone")
+    assert_shape("out cell", low.cell, "Let")
+    assert_shape("entry point", low.called, "Let(CallRuntime(VarRef, Const, Unary(VarRef)))")
+    assert_eq_str("symbol", ir_c_name(ir_kid(low.called, 0)), "blink_map_remove")
+}
+
+test "the carrier is declared without a value, because a condition chooses the value" {
+    probe("map_remove_str", #"fn main() {
+    let mut m: Map[Str, Int] = Map.new()
+    let gone = m.remove("k")
+}
+"#)
+    let low = cc_probe_remove("gone")
+    assert_shape("declaration", low.declared, "Let")
+    assert_shape("answer", low.answer, "VarRef")
+    assert_eq_str("the answer names the carrier the test filled",
+        ir_c_name(low.answer), ir_c_name(low.declared))
+}
+
+test "the test reads whether the entry point held the key" {
+    probe("map_remove_str", #"fn main() {
+    let mut m: Map[Str, Int] = Map.new()
+    let gone = m.remove("k")
+}
+"#)
+    let low = cc_probe_remove("gone")
+    let cond = ir_kid(low.branch, 0)
+    assert_eq_str("operator", ir_c_name(cond), "!=")
+    assert_eq_str("compared against zero", ir_c_name(ir_kid(cond, 1)), "0")
+    assert_eq_str("reads what the entry point answered",
+        ir_c_name(ir_kid(cond, 0)), ir_c_name(low.called))
+}
+
+test "the held arm carries the value out of the cell, and the absent arm carries none" {
+    probe("map_remove_str", #"fn main() {
+    let mut m: Map[Str, Int] = Map.new()
+    let gone = m.remove("k")
+}
+"#)
+    let low = cc_probe_remove("gone")
+    let some = removal_arm_value(low.branch, 1)
+    assert_eq_str("member", ir_c_name(some), "value")
+    assert_eq_str("tag", ir_c_name(ir_kid(some, 0)), "1")
+    let none = removal_arm_value(low.branch, 2)
+    assert_eq_str("member", ir_c_name(none), "")
+    assert_eq_str("tag", ir_c_name(ir_kid(none, 0)), "0")
+}
+
+test "the whole removal, with the statements it hoists, is a well-formed tree" {
+    probe("map_remove_str", #"fn main() {
+    let mut m: Map[Str, Int] = Map.new()
+    let gone = m.remove("k")
+}
+"#)
+    let low = cc_probe_remove("gone")
+    assert_verifies("cell", low.cell)
+    assert_verifies("called", low.called)
+    assert_verifies("declaration", low.declared)
+    assert_verifies("test", low.branch)
+    assert_verifies("answer", low.answer)
+}
+
+// A Set keeps the row it always had: remove is still a presence test, because a set holds
+// no value beside the key for a removal to hand back.
+test "removing from a set still answers whether anything was removed" {
+    probe("set_remove", #"fn main() {
+    let mut s: Set[Str] = Set.new()
+    let gone = s.remove("k")
+}
+"#)
     let built = lower_expr(rhs_of("gone"))
     assert_shape("shape", built, "Binary(CallRuntime(VarRef, Const), Const)")
-    assert_eq_str("symbol", ir_c_name(ir_kid(built, 0)), "blink_map_remove")
+    assert_eq_str("symbol", ir_c_name(ir_kid(built, 0)), "blink_set_remove")
     assert_verifies("verifies", built)
 }
 
