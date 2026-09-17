@@ -29,6 +29,7 @@ import diagnostics.{
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
     ASSERT_PANICS_OUTSIDE_TEST, ASSERT_PANICS_NESTED_EXPECT_PANIC, XFAIL_MISSING_REASON,
     PUB_FFI, FFI_NO_EFFECTS, CONTRACT_ON_FFI, INVALID_PTR_TYPE,
+    COALESCE_REQUIRES_OPT,
     PTR_OUTSIDE_FFI, FFI_STRUCT_GC_FIELD, BYTES_GROW_IN_WITH_PTR,
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
@@ -427,6 +428,10 @@ fn tc_builtin_receiver_name(tid: Int) -> Str {
     let k = type_kind(tid)
     if k == TyKind.Str || k == TyKind.List || k == TyKind.Map || k == TyKind.Set { return tk_name(k) }
     if k == TyKind.Bytes || k == TyKind.StringBuilder || k == TyKind.Template || k == TyKind.Float { return tk_name(k) }
+    // The scalars. §3c "No Inherent Methods" gives a user trait to any receiver, and the
+    // caller's own arm already names Int; without these three the arm skipped them, so the
+    // call reached no arm at all, typed as unclaimed, and was refused at the back end.
+    if k == TyKind.Int || k == TyKind.Bool || k == TyKind.Char { return tk_name(k) }
     ""
 }
 
@@ -4963,6 +4968,14 @@ fn tc_error_at(msg: Str, node_id: Int) ! TypeCheck.Report, Diag.Report {
     diag_error_at("TypeError", TYPE_ERROR, msg, node_id, "")
 }
 
+// The same error under the code the rule owns. A rule the diagnostic index already names
+// should report under that name; TYPE_ERROR is the code for a rule that has none. The push
+// stays, so a reader counting type errors sees the same number either way.
+fn tc_error_at_code(msg: Str, node_id: Int, name: Str, code: Str, help: Str) ! TypeCheck.Report, Diag.Report {
+    tc_errors.push(msg)
+    diag_error_at(name, code, msg, node_id, help)
+}
+
 
 // ── Incremental filter API ──────────────────────────────────────────
 
@@ -7425,14 +7438,6 @@ fn check_ptr_in_type_ann(ann_node: Int, has_ffi: Int) ! Diag.Report {
         if has_ffi == 0 {
             diag_error_at("PtrOutsideFFI", PTR_OUTSIDE_FFI, "Ptr[T] type can only be used in @ffi functions or @trusted blocks", ann_node, "add @ffi annotation to the function or wrap usage in @trusted")
         }
-        let elems_sl = node_elements(ann_node)
-        if elems_sl != -1 && sublist_length(elems_sl) > 0 {
-            let inner = sublist_get(elems_sl, 0)
-            let inner_name = node_name(inner)
-            if is_valid_ptr_inner(inner_name) == 0 {
-                diag_error_at("InvalidPtrType", INVALID_PTR_TYPE, "invalid Ptr type parameter '{inner_name}' — only Void, U8-U64, I8-I64, Int, Float, Ptr, or @ffi.struct types are allowed", inner, "use a valid FFI-compatible type or annotate the type with @ffi.struct")
-            }
-        }
         return
     }
     let elems_sl = node_elements(ann_node)
@@ -7442,6 +7447,32 @@ fn check_ptr_in_type_ann(ann_node: Int, has_ffi: Int) ! Diag.Report {
             check_ptr_in_type_ann(sublist_get(elems_sl, i), has_ffi)
             i = i + 1
         }
+    }
+}
+
+// The pointee half of the §9.1.3 Ptr rule, split from the context half above because the
+// two answer different questions: a pointee outside the closed set is wrong wherever it is
+// named, while PtrOutsideFFI is a property of the enclosing function. Only a parameter and
+// a return type ever asked the first question, so a `let` named any pointee at all and a
+// plain record behind a pointer typed its fields at their own types.
+fn check_ptr_pointee_in_ann(ann_node: Int) ! Diag.Report {
+    if ann_node == -1 { return }
+    let elems_sl = node_elements(ann_node)
+    if node_name(ann_node) == "Ptr" {
+        if elems_sl != -1 && sublist_length(elems_sl) > 0 {
+            let inner = sublist_get(elems_sl, 0)
+            let inner_name = node_name(inner)
+            if is_valid_ptr_inner(inner_name) == 0 {
+                diag_error_at("InvalidPtrType", INVALID_PTR_TYPE, "invalid Ptr type parameter '{inner_name}' — only Void, U8-U64, I8-I64, Int, Float, Ptr, or @ffi.struct types are allowed", inner, "use a valid FFI-compatible type or annotate the type with @ffi.struct")
+            }
+        }
+        return
+    }
+    if elems_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(elems_sl) {
+        check_ptr_pointee_in_ann(sublist_get(elems_sl, i))
+        i = i + 1
     }
 }
 
@@ -8000,6 +8031,7 @@ fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
             let ptype_ann = node_type_ann(p)
             if ptype_ann != -1 {
                 check_ptr_in_type_ann(ptype_ann, has_ffi)
+                check_ptr_pointee_in_ann(ptype_ann)
             } else {
                 check_ptr_in_type_name(node_type_name(p), p, has_ffi)
             }
@@ -8011,6 +8043,7 @@ fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
     let ret_ann = node_type_ann(fn_node)
     if ret_ann != -1 {
         check_ptr_in_type_ann(ret_ann, has_ffi)
+        check_ptr_pointee_in_ann(ret_ann)
     } else {
         let ret_str = node_return_type(fn_node)
         if ret_str == "Ptr" && has_ffi == 0 {
@@ -10961,6 +10994,9 @@ pub fn tc_names_a_type(name: Str) -> Bool {
 // Impl method registry for name resolution
 let mut nr_impl_type_names: List[Str] = []
 let mut nr_impl_method_names: List[Str] = []
+// The declaration node of entry i, or -1 for a method the compiler synthesizes and no
+// source declares: a Display `display()`, a derived `clone`/`eq`/`cmp`/`hash`/`debug`.
+let mut nr_impl_method_nodes: List[Int] = []
 let mut nr_callable_field_names: List[Str] = []
 
 // Method calls whose NAME resolves nowhere, found in Phase 1. Phase 1 cannot decide the
@@ -11020,12 +11056,27 @@ fn is_callable_field_name(name: Str) -> Int {
     0
 }
 
-// The two registry lists are index-parallel: entry i is the pair (type, method). Every
-// push must go through here, or a reader that walks one list and indexes the other reads
-// past the end.
-fn nr_register_impl_method(type_name: Str, method: Str) {
+// The three registry lists are index-parallel: entry i is the triple (type, method,
+// declaration). Every push must go through here, or a reader that walks one list and
+// indexes another reads past the end.
+fn nr_register_impl_method(type_name: Str, method: Str, decl_node: Int) {
     nr_impl_type_names.push(type_name)
     nr_impl_method_names.push(method)
+    nr_impl_method_nodes.push(decl_node)
+}
+
+// Which declaration `type_name.method` names, or -1 if none does. The pair is the key: the
+// same method name may be implemented for several receivers, so the name alone would answer
+// one of them for every call.
+fn nr_impl_method_decl(type_name: Str, method: Str) -> Int {
+    let mut i = 0
+    while i < nr_impl_type_names.len() {
+        if nr_impl_type_names.get(i).unwrap() == type_name && nr_impl_method_names.get(i).unwrap() == method {
+            return nr_impl_method_nodes.get(i).unwrap()
+        }
+        i = i + 1
+    }
+    -1
 }
 
 fn nr_has_impl_method(type_name: Str, method: Str) -> Int {
@@ -11234,6 +11285,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     nr_warn_unused = 1
     nr_impl_type_names = []
     nr_impl_method_names = []
+    nr_impl_method_nodes = []
     nr_bh_context = Map()
     nr_private_imports = Map()
     nr_name_source_module = Map()
@@ -11487,14 +11539,14 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
                 let mut j = 0
                 while j < sublist_length(methods_sl) {
                     let m = sublist_get(methods_sl, j)
-                    nr_register_impl_method(impl_type, node_name(m))
+                    nr_register_impl_method(impl_type, node_name(m), m)
                     j = j + 1
                 }
             }
             // The compiler synthesizes a sealed display() for every Display
             // impl; register it so calls resolve.
             if node_trait_name(im) == "Display" {
-                nr_register_impl_method(impl_type, "display")
+                nr_register_impl_method(impl_type, "display", -1)
             }
             if node_trait_name(im) == "BlockHandler" {
                 let ctx_sl = node_assoc_types(im)
@@ -11521,13 +11573,13 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
         while i < sublist_length(derive_types_sl) {
             let td = sublist_get(derive_types_sl, i)
             let dtname = tc_nominal_type_name(td)
-            if tc_decl_derives(td, "Clone") != 0 { nr_register_impl_method(dtname, "clone") }
-            if tc_decl_derives(td, "Eq") != 0 { nr_register_impl_method(dtname, "eq") }
-            if tc_decl_derives(td, "Ord") != 0 { nr_register_impl_method(dtname, "cmp") }
-            if tc_decl_derives(td, "Hash") != 0 { nr_register_impl_method(dtname, "hash") }
-            if tc_decl_derives(td, "Debug") != 0 { nr_register_impl_method(dtname, "debug") }
-            if tc_decl_derives(td, "Serialize") != 0 { nr_register_impl_method(dtname, "to_json") }
-            if tc_decl_derives(td, "Deserialize") != 0 { nr_register_impl_method(dtname, "from_json") }
+            if tc_decl_derives(td, "Clone") != 0 { nr_register_impl_method(dtname, "clone", -1) }
+            if tc_decl_derives(td, "Eq") != 0 { nr_register_impl_method(dtname, "eq", -1) }
+            if tc_decl_derives(td, "Ord") != 0 { nr_register_impl_method(dtname, "cmp", -1) }
+            if tc_decl_derives(td, "Hash") != 0 { nr_register_impl_method(dtname, "hash", -1) }
+            if tc_decl_derives(td, "Debug") != 0 { nr_register_impl_method(dtname, "debug", -1) }
+            if tc_decl_derives(td, "Serialize") != 0 { nr_register_impl_method(dtname, "to_json", -1) }
+            if tc_decl_derives(td, "Deserialize") != 0 { nr_register_impl_method(dtname, "from_json", -1) }
             i = i + 1
         }
     }
@@ -13788,7 +13840,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if op == "??" {
             let left_k = type_kind(lt)
             if left_k != TyKind.Option && left_k != TyKind.Unknown {
-                tc_error_at("'??' operator requires Option value, got {type_to_str(lt)}", node)
+                tc_error_at_code("'??' operator requires Option value, got {type_to_str(lt)}", node,
+                    "CoalesceRequiresOption", COALESCE_REQUIRES_OPT,
+                    "use '??' only on an Option; for a Result use 'match' or '?'")
             }
             if left_k == TyKind.Option {
                 // `y ?? default` is a constraining use: the default's type
@@ -15147,6 +15201,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let bsig = lookup_fnsig("{bname}_{btrait}_{method}")
                     if bsig != -1 {
                         check_arg_shapes("{bname}.{method}", bsig, node_args(node), 1)
+                        // Which declaration this call reached. Phase 1 could not say: it has
+                        // no receiver type, and the receiver is the only thing that tells two
+                        // impls of one method name apart.
+                        nr_note_call_decl(node, nr_impl_method_decl(bname, method))
                         return fnsig_pool.get(bsig).unwrap().ret
                     }
                 }
@@ -17365,6 +17423,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let type_ann = node_target(node)
         let mut declared_tid = TYPE_UNKNOWN
         if type_ann != -1 {
+            check_ptr_pointee_in_ann(type_ann)
             declared_tid = resolve_type_ann(type_ann)
         } else if type_str != "" {
             let rt = resolve_type_name(type_str)
