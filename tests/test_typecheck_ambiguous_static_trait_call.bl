@@ -1,0 +1,172 @@
+// An unqualified call to a method two traits both declare is ambiguous (§3c "Method
+// Resolution"), and the instance rung has rejected it for a while. The static rung did not:
+// its trait-qualified lookup is gated on exactly one trait owning the method, no bare
+// `{Type}_{method}` signature exists for a trait method, and nothing below either rung
+// answers. So `Widget.make()` resolved to no declaration at all and was accepted anyway.
+//
+// The rows here pin the refusal and the two shapes it must not swallow: a static method one
+// trait owns, and the qualified form of a method that takes a receiver.
+import lower_test_helpers.{probe, probe_but, assert_eq_str}
+import diagnostics.{diag_entries}
+
+fn two_traits_one_static_src() -> Str {
+    #"trait Alpha {
+    fn make() -> Self
+}
+
+trait Beta {
+    fn make() -> Self
+}
+
+type Widget {
+    v: Int
+}
+
+impl Alpha for Widget {
+    fn make() -> Self {
+        Widget { v: 1 }
+    }
+}
+
+impl Beta for Widget {
+    fn make() -> Self {
+        Widget { v: 2 }
+    }
+}
+
+fn main() {
+    let w = Widget.make()
+    io.println("{w.v}")
+}
+"#
+}
+
+// One owner, so the call names one declaration and must still resolve. Without this row the
+// refusal could be written to reject every static trait call and still look green.
+fn one_trait_one_static_src() -> Str {
+    #"trait Alpha {
+    fn make() -> Self
+}
+
+type Widget {
+    v: Int
+}
+
+impl Alpha for Widget {
+    fn make() -> Self {
+        Widget { v: 1 }
+    }
+}
+
+fn main() {
+    let w = Widget.make()
+    io.println("{w.v}")
+}
+"#
+}
+
+// The disambiguation §3c:671 documents, for the methods that can use it:
+// `Trait.method(receiver)` passes the receiver as the first argument. The two traits answer
+// with DIFFERENT types, so the declared type of each binding proves the call reached that
+// trait's own declaration and not the other one.
+//
+// One trait per source, because the probe harness binds every local of a probe in a single
+// frame and refuses a name two functions declare: two impl methods taking a receiver would
+// both bind `self`.
+fn qualified_alpha_src() -> Str {
+    #"trait Alpha {
+    fn tag(self) -> Int
+}
+
+type Widget {
+    v: Int
+}
+
+impl Alpha for Widget {
+    fn tag(self) -> Int {
+        self.v
+    }
+}
+
+fn main() {
+    let w = Widget { v: 3 }
+    let a: Int = Alpha.tag(w)
+    io.println("{a}")
+}
+"#
+}
+
+fn qualified_beta_src() -> Str {
+    #"trait Beta {
+    fn tag(self) -> Str
+}
+
+type Widget {
+    v: Int
+}
+
+impl Beta for Widget {
+    fn tag(self) -> Str {
+        "beta"
+    }
+}
+
+fn main() {
+    let w = Widget { v: 3 }
+    let b: Str = Beta.tag(w)
+    io.println("{b} {w.v}")
+}
+"#
+}
+
+// One trait, several impls: `TryFrom` reaches U8 from Int, U16, U32 and U64, so four impls
+// declare one `try_from` for U8. That is one owner asked about four ways, not four owners,
+// and the source-typed key tells them apart by the argument. Counting rows rather than
+// traits would refuse every conversion in the stdlib.
+fn one_trait_many_impls_src() -> Str {
+    #"fn main() {
+    let big = 300
+    let narrow = U8.try_from(big)
+    let wide: U64 = U64.from(7)
+    match narrow {
+        Ok(v) => { io.println("{v} {wide}") }
+        Err(_e) => { io.println("out of range {wide}") }
+    }
+}
+"#
+}
+
+test "a static method two traits both declare is refused" {
+    let program = probe_but("amb_static_two_traits", two_traits_one_static_src(), "AmbiguousMethodCall")
+    assert(program >= 0)
+}
+
+test "the refusal names both traits that declare the method" {
+    let program = probe_but("amb_static_message", two_traits_one_static_src(), "AmbiguousMethodCall")
+    assert(program >= 0)
+    let mut msg = ""
+    for d in diag_entries {
+        if d.name == "AmbiguousMethodCall" { msg = d.message }
+    }
+    assert_eq_str("message", msg, "ambiguous static call: 'Widget.make' is declared by multiple traits implemented by Widget (Alpha and Beta)")
+}
+
+test "a static method one trait declares still resolves" {
+    let program = probe("amb_static_one_trait", one_trait_one_static_src())
+    assert(program >= 0)
+}
+
+test "a qualified call still reaches the first trait's own declaration" {
+    let program = probe("amb_static_qualified_alpha", qualified_alpha_src())
+    assert(program >= 0)
+}
+
+test "a qualified call still reaches the second trait's own declaration" {
+    let program = probe("amb_static_qualified_beta", qualified_beta_src())
+    assert(program >= 0)
+}
+
+test "several impls of one trait are one owner, not an ambiguity" {
+    let program = probe("amb_static_one_trait_many_impls", one_trait_many_impls_src())
+    assert(program >= 0)
+}

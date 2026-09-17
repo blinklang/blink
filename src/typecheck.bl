@@ -327,6 +327,14 @@ let mut tc_display_impl_nodes: Map[Str, List[Int]] = Map()
 // Both keyed "{type}\t{method}".
 let mut tc_method_trait_count_idx: Map[Str, Int] = Map()
 let mut tc_method_trait_names_idx: Map[Str, Str] = Map()
+// The same two answers counting each trait ONCE. One trait can own a method for one type
+// through several impls: `From` reaches U8 from Int, U16, U32 and U64, four impls of one
+// trait declaring one `try_from`. That is four rows in the pair above, which is the count
+// the trait-qualified fnsig key wants, and it is not ambiguity -- the source-typed key
+// tells those four apart by the argument. Ambiguity is two DIFFERENT traits, so the
+// ambiguity reports read these.
+let mut tc_method_distinct_trait_count_idx: Map[Str, Int] = Map()
+let mut tc_method_distinct_trait_names_idx: Map[Str, Str] = Map()
 // Trait-level type-param count keyed by trait NAME, populated in
 // register_trait for EVERY trait (methodless or not). validate_trait_impls
 // reads this for the E0910 arg-arity check; deriving it from tc_tmsig_pool
@@ -356,6 +364,33 @@ fn tc_record_method_trait(tname: Str, method: Str, trait_name: Str) {
     } else {
         tc_method_trait_names_idx.insert(key, "{prev_names} and {trait_name}")
     }
+    let prev_d_names = tc_method_distinct_trait_names_idx.get(key) ?? ""
+    if tc_trait_names_list_has(prev_d_names, trait_name) == 0 {
+        let d_names = if prev_d_names == "" { trait_name } else { "{prev_d_names} and {trait_name}" }
+        tc_method_distinct_trait_names_idx.insert(key, d_names)
+        let prev_d = tc_method_distinct_trait_count_idx.get(key) ?? 0
+        tc_method_distinct_trait_count_idx.insert(key, prev_d + 1)
+    }
+}
+
+// Whether a " and "-joined list of trait names already lists this one. Matched on the whole
+// name between the joiners, never as a substring: `Ord` must not be found inside `Ordered`.
+fn tc_trait_names_list_has(names: Str, one: Str) -> Int {
+    if names == one { return 1 }
+    if names.starts_with("{one} and ") != 0 { return 1 }
+    if names.ends_with(" and {one}") != 0 { return 1 }
+    if names.contains(" and {one} and ") != 0 { return 1 }
+    0
+}
+
+// How many DIFFERENT traits declare `method` for `tname`. >=2 is ambiguity; several impls
+// of one trait are not.
+fn tc_method_distinct_trait_count(tname: Str, method: Str) -> Int {
+    tc_method_distinct_trait_count_idx.get(tc_method_traits_key(tname, method)) ?? 0
+}
+
+fn tc_method_distinct_trait_names(tname: Str, method: Str) -> Str {
+    tc_method_distinct_trait_names_idx.get(tc_method_traits_key(tname, method)) ?? ""
 }
 
 // Count of distinct traits defining `method` for `tname` (the synthesized
@@ -8480,6 +8515,8 @@ fn init_types() ! TypeCheck.Register {
     tc_display_impl_nodes.clear()
     tc_method_trait_count_idx.clear()
     tc_method_trait_names_idx.clear()
+    tc_method_distinct_trait_count_idx.clear()
+    tc_method_distinct_trait_names_idx.clear()
     tc_poly_list_impl_node.clear()
     tc_tmsig_pool.clear()
     tc_tmsig_param_tids.clear()
@@ -15129,6 +15166,21 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // (sections/03c_protocols.md:758): `pub fn Duration_seconds(s: Int)`
             // (lib/std/time.bl:3) IS `Duration.seconds(2)`.
             if obj_is_value == 0 {
+                // §3c rule-3 ambiguity at the static rung. Two different traits declare this
+                // associated function for this type, so the call names no one declaration. The
+                // rung just below is gated on exactly one owner, and a trait method keeps no
+                // bare `{Type}_{method}` signature, so without this the call resolved to
+                // nothing and was accepted anyway.
+                //
+                // The help cannot offer the qualified call §3c:671 documents for the ambiguous
+                // INSTANCE call: `Trait.method(receiver)` names the trait by passing the
+                // receiver as the first argument, and an associated function has no receiver to
+                // pass. So the fixes it can offer are both in the declarations.
+                if tc_method_distinct_trait_count(obj_name, method) >= 2 {
+                    let amb_traits = tc_method_distinct_trait_names(obj_name, method)
+                    diag_error_at("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous static call: '{obj_name}.{method}' is declared by multiple traits implemented by {obj_name} ({amb_traits})", node, "rename one of the methods, or drop one of the impls: a qualified call names the trait by passing the receiver first, and an associated function has no receiver to pass")
+                    return tc_error_recovery_tid()
+                }
                 let static_trait = tc_method_trait_names(obj_name, method)
                 if static_trait != "" && tc_method_trait_count(obj_name, method) == 1 {
                     let q_sig = lookup_fnsig("{obj_name}_{static_trait}_{method}")
