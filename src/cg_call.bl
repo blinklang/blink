@@ -40,7 +40,7 @@ import layout.{
     child_tid, ensure_typedef_for, format_spec_of, varargs_spelling,
     tid_of_binder, current_binder_scope, current_inst, decl_has_derive,
     container_slot_spelling, field_layout_of, address_layout_of, fn_pointer_spelling_of,
-    binder_scope_push, binder_scope_pop, bind_binder,
+    binder_scope_push, binder_scope_pop, bind_binder, pointer_spelling,
 }
 import mono.{instances, instance_for_call}
 import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls, cg_reg_trait_decls}
@@ -1830,8 +1830,11 @@ fn cc_key_arg(node: Int, plan: KeyPlan, written: Int) -> Int ! Diag.Report {
 //
 // Truth: the entry point answers a flag as an integer and the call answers whether it was
 // not zero. Empty: the entry point answers a count and the call answers whether it was
-// zero. Plain: what the entry point answers is what the call answers.
-type KeyedForm { Truth, Empty, Plain }
+// zero. Plain: what the entry point answers is what the call answers. Carrier: the entry
+// point answers whether the key was held through its own return, and the value through an
+// out-parameter, and the call wraps the two into the Option a store returns from moving a
+// value out of the slot beside a key.
+type KeyedForm { Truth, Empty, Plain, Carrier }
 
 // One row: the runtime entry point, how many arguments the call is written with, whether
 // the first of them is a key, whether the entry point keeps that key after it answers,
@@ -1850,7 +1853,7 @@ fn cc_keyed_row(kind: TyKind, method: Str) -> KeyedRow {
         if method == "insert" { return KeyedRow { op: "map_set", arity: 2, keyed: true, retains: true, slotted: true, form: KeyedForm.Plain } }
         if method == "contains_key" { return KeyedRow { op: "map_has", arity: 1, keyed: true, retains: false, slotted: false, form: KeyedForm.Truth } }
         if method == "contains" { return KeyedRow { op: "map_has", arity: 1, keyed: true, retains: false, slotted: false, form: KeyedForm.Truth } }
-        if method == "remove" { return KeyedRow { op: "map_remove", arity: 1, keyed: true, retains: false, slotted: false, form: KeyedForm.Truth } }
+        if method == "remove" { return KeyedRow { op: "map_remove", arity: 1, keyed: true, retains: false, slotted: false, form: KeyedForm.Carrier } }
         if method == "len" { return KeyedRow { op: "map_len", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Plain } }
         if method == "is_empty" { return KeyedRow { op: "map_len", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Empty } }
         if method == "clear" { return KeyedRow { op: "map_clear", arity: 0, keyed: false, retains: false, slotted: false, form: KeyedForm.Plain } }
@@ -1911,6 +1914,7 @@ fn cc_lower_keyed_method(node: Int, obj: Int, kind: TyKind, method: Str, row: Ke
     if tid < 0 { return -1 }
     let container = tid_of_node(obj)
     if container < 0 { return -1 }
+    if row.form == KeyedForm.Carrier { return cc_map_remove_carrier(node, obj, kind, tid, container, row) }
     let answer = cc_local(tid, node)
     if cc_stopped(answer) { return -1 }
     let plain = row.form == KeyedForm.Plain
@@ -1955,6 +1959,63 @@ fn cc_lower_keyed_method(node: Int, obj: Int, kind: TyKind, method: Str, row: Ke
     if plain { return call }
     let op = if row.form == KeyedForm.Truth { "!=" } else { "==" }
     ir_binary(tid, node, answer.c_spelling, op, call, ir_const(TYPE_INT, node, g.tag, "0"))
+}
+
+// A store that moves a value out of the slot beside a key answers whether it held one and
+// the value itself, and the two arrive through different channels: the entry point's own
+// return says whether the key was there, and a cell passed by address holds what it found
+// beside it. What is bound in that cell is only good when the return said so, so the
+// carrier is wrapped in an If rather than read unconditionally: the cell is left at
+// whatever the runtime does not touch when there was nothing to remove, which the tag on
+// the None arm keeps from ever being read as a value.
+fn cc_map_remove_carrier(node: Int, obj: Int, kind: TyKind, tid: Int, container: Int, row: KeyedRow) -> Int ! Diag.Report {
+    let carrier = cc_local(tid, node)
+    if cc_stopped(carrier) { return -1 }
+    let shape = cc_slot_shape(node, container, kind, Slot.Inner2)
+    if cc_shape_stopped(shape) { return -1 }
+    let found = cc_local(TYPE_INT, node)
+    if cc_stopped(found) { return -1 }
+    let plan = cc_key_plan(node, container, kind, row)
+    if cc_key_stopped(plan) { return -1 }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    let key_arg = cc_key_arg(node, plan, sublist_get(node_args(node), 0))
+    if key_arg < 0 { return -1 }
+    let _td = ensure_typedef_for(tid)
+
+    // The cell the value comes back in is the container's own cell type, at the width
+    // every other slot in it is written at, so the runtime writes through the same
+    // pointer it writes every other removal through.
+    let cell_spelling = container_slot_spelling()
+    let cell_name = c_mint_local("mr")
+    cg_expr_push_pending(node, ir_let(shape.tid, node, cell_spelling, cell_name, SlotForm.InlineWord, -1))
+    let cell_addr = ir_unary(shape.tid, node, pointer_spelling(cell_spelling), "&",
+        ir_var_ref(shape.tid, node, cell_spelling, cell_name, SlotForm.InlineWord))
+
+    let said = c_mint_local("mr")
+    cg_expr_push_pending(node, ir_let(TYPE_INT, node, found.c_spelling, said, found.slot_form,
+        ir_call_runtime(TYPE_INT, node, found.c_spelling, c_runtime_helper(row.op), found.slot_form,
+            [recv, key_arg, cell_addr])))
+
+    let held = c_mint_local("mr")
+    cg_expr_push_pending(node, ir_let(tid, node, carrier.c_spelling, held, carrier.slot_form, -1))
+
+    let present = ir_binary(TYPE_BOOL, node, found.c_spelling, "!=",
+        cc_temp_ref(node, TYPE_INT, found, said), ir_const(TYPE_INT, node, found.c_spelling, "0"))
+
+    let raw = ir_var_ref(shape.tid, node, cell_spelling, cell_name, SlotForm.InlineWord)
+    let native = ir_cast(shape.tid, node, shape.slot.c_spelling, cc_from_slot_word(shape.tid, node, shape.slot, raw))
+    let payload = if shape.boxed { ir_unbox(shape.tid, node, shape.value.c_spelling, shape.value.slot_form, native) } else { native }
+
+    let some = ir_carrier_wrap(tid, node, carrier.c_spelling, carrier_value_member,
+        ir_const(TYPE_INT, node, found.c_spelling, "{TAG_SOME}"), payload)
+    let none = ir_carrier_wrap(tid, node, carrier.c_spelling, "",
+        ir_const(TYPE_INT, node, found.c_spelling, "{TAG_NONE}"), -1)
+
+    cg_expr_push_pending(node, ir_if(node, present,
+        ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), some)]),
+        ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), none)])))
+    cc_temp_ref(node, tid, carrier, held)
 }
 
 // ── Scalar conversions ────────────────────────────────────────────────────
