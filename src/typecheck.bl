@@ -16104,6 +16104,27 @@ fn tc_scoped_value_memo(node: Int, depth: Int) -> Int {
     tc_lookup_node_tid(node)
 }
 
+// Put `tid` back on every node tc_scoped_value_memo read through to reach it, undoing an
+// out-of-scope re-inference that overwrote the walk's answer on the way down. Only the
+// single-valued links are followed — a `with`/`async` wrapper, and a block's tail — because
+// an `if`/`match` merge is the type of no one branch, so stamping the merge down a branch
+// would claim more than the walk proved.
+fn tc_republish_value_spine(node: Int, tid: Int, depth: Int) {
+    if node == -1 { return }
+    if depth >= 8 { return }
+    tc_publish_node_tid(node, tid)
+    let k = node_kind(node)
+    if k == NodeKind.WithBlock || k == NodeKind.AsyncScope {
+        tc_republish_value_spine(node_body(node), tid, depth + 1)
+        return
+    }
+    if k == NodeKind.Block {
+        let tail = tc_block_tail_stmt(node)
+        if tail == -1 { return }
+        tc_republish_value_spine(tc_block_tail_value(tail), tid, depth + 1)
+    }
+}
+
 // The value node of a match arm body, or -1 when the body diverges and therefore contributes
 // no type. The by-kind -1 is load-bearing: it keeps tc_check_body's publish off a braceless
 // diverging body, whose own node already carries Never from infer_arm_body.
@@ -16741,6 +16762,23 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                         if tc_tid_is_no_info(memo) == 0 {
                             tail_t = if tc_tid_is_no_info(tail_t) != 0 { memo } else { tc_tid_fill_unknowns(tail_t, memo) }
                         }
+                    } else if tc_tid_is_no_info(memo) == 0 && tc_tid_has_unknown(memo) == 0 && tc_scoped_value_memo(tail_val, 0) != memo {
+                        // A CONFIDENT answer from out of scope needs recovering too, and neither
+                        // guard above sees it: a tail that names a binding its own construct
+                        // introduces resolves to whatever the enclosing scope calls that name, so
+                        // the erasure is a different real type rather than an unknown. The memo
+                        // MOVING across the re-inference is the proof, since the walk above wrote
+                        // it in scope and only this re-inference could have changed it.
+                        //
+                        // A memo with unknowns in it does NOT win, even though it moved: the
+                        // re-inference above runs under the declared return as its hint, so for an
+                        // open tail like `[]` it is the BETTER answer and the walk's is the
+                        // incomplete one. Only a fully concrete memo can outrank it.
+                        //
+                        // The spine is repaired, not just the local compare: the re-inference
+                        // published its answer on every node it walked, and codegen reads those.
+                        tail_t = memo
+                        tc_republish_value_spine(tail_val, memo, 0)
                     }
                     tc_check_returned_value(tail_t, tail_val)
                 }
