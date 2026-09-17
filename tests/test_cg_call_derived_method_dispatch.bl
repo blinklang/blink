@@ -1,0 +1,46 @@
+// A `.clone()` call on a type that only derives Clone, never writes an impl for it.
+//
+// The impl search this stage runs before falling back to "not built" only ever looks at
+// declared impl blocks (cc_impl_with_method / cg_reg_impl_decls). A derive registers no
+// impl block of its own — src/cg_derive.bl writes the C body straight from the type decl
+// under the derive's own symbol (c_derive_method_name) — so a derived method with no
+// hand-written impl beside it has nothing for that search to find, and the call falls
+// through to the same "no method built" refusal an unimplemented trait method would get.
+// This is the same shape cc_equality_symbol already closes for `==`; a `.clone()` call
+// needs the matching fallback in the general method-dispatch path.
+
+import lower_test_helpers.{probe, rhs_of, assert_kind, assert_shape, assert_eq_str, assert_verifies, assert_ice}
+import parser.{node_kind, node_name, nodes}
+import ast.{NodeKind, nk_of}
+import ir.{IrKind, ir_c_name}
+import cname.{c_derive_method_name}
+import cg_call.{lower_call}
+
+fn src_derived_clone() -> Str {
+    #"@derive(Clone)
+type Point { x: Int, y: Int }
+
+fn main() {
+    let p = Point { x: 1, y: 2 }
+    let q = p.clone()
+    let _keep = [q.x]
+}
+"#
+}
+
+fn type_decl_of(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.TypeDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+test "a derived clone with no hand-written impl reaches the symbol the derive emits" {
+    probe("cg_call_derived_clone", src_derived_clone())
+    let id = lower_call(rhs_of("q"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_verifies("verify", id)
+    assert_eq_str("symbol", ir_c_name(id), c_derive_method_name(type_decl_of("Point"), "clone"))
+}
