@@ -1,0 +1,103 @@
+// A trait method signature is a written type position like any other, so a name in it must
+// resolve to something. An undeclared name used to be minted as a free type variable in
+// silence, which gave the trait a parameter no caller could ever solve and let an impl
+// satisfy the contract by accident.
+//
+// The acceptance set is the one the impl header already uses, plus what only a trait has:
+// `Self`, the trait's own type parameters, an associated type reached through `Self`, and
+// the method's own type parameters. An effect name written as a phantom context is not a
+// type and is not read as one.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+// Exactly one error, of `name`, whose message names `needle`. The message text itself is
+// not pinned here: this proves the name is reported, not how the sentence reads.
+fn assert_one_error_naming(label: Str, name: Str, needle: Str) {
+    let errs = error_messages()
+    let mut hits = 0
+    for d in diag_entries {
+        if d.name == name && d.message.contains(needle) { hits = hits + 1 }
+    }
+    if hits != 1 || errs.len() != 1 {
+        io.println("FAIL: {label}: want exactly one {name} naming '{needle}', got:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(hits == 1)
+    assert(errs.len() == 1)
+}
+
+test "an undeclared name inside a container in a trait parameter is an unknown type" {
+    let mut s = "trait Zzuk \{ fn zzuk(self, peers: List[Zt]) -> Int }\n"
+    s = s.concat("fn main() \{ }\n")
+    typecheck_probe("build/zz_trait_unknown_a.bl", s)
+    assert_one_error_naming("List[Zt] in a trait parameter", "UnknownType", "Zt")
+}
+
+test "a bare undeclared name in a trait parameter is an unknown type" {
+    let mut s = "trait Zzuk \{ fn zzuk(self, peer: Zt) -> Int }\n"
+    s = s.concat("fn main() \{ }\n")
+    typecheck_probe("build/zz_trait_unknown_b.bl", s)
+    assert_one_error_naming("bare Zt in a trait parameter", "UnknownType", "Zt")
+}
+
+test "an undeclared name in a trait return type is an unknown type" {
+    let mut s = "trait Zzuk \{ fn zzuk(self) -> Zt }\n"
+    s = s.concat("fn main() \{ }\n")
+    typecheck_probe("build/zz_trait_unknown_c.bl", s)
+    assert_one_error_naming("Zt in a trait return", "UnknownType", "Zt")
+}
+
+// The accidental pass this closes: nothing binds the trait's `T`, so the impl matched it
+// only because every `T` in the program was one type. The error must arrive at the trait,
+// where the name is undeclared, and not as a contract mismatch at the impl.
+test "an impl no longer covers for an undeclared name in the trait it implements" {
+    let mut s = "trait Zzuk \{ fn zzuk(self, peers: List[Zt]) -> Int }\n"
+    s = s.concat("impl[Zt] Zzuk for List[Zt] \{ fn zzuk(self, peers: List[Zt]) -> Int \{ peers.len() } }\n")
+    s = s.concat("fn main() \{ }\n")
+    typecheck_probe("build/zz_trait_unknown_d.bl", s)
+    assert_one_error_naming("undeclared T covered by the impl binder", "UnknownType", "Zt")
+}
+
+// Everything a trait signature is allowed to name, in one trait, so a fix that reports the
+// undeclared name cannot pay for it by rejecting the legal set.
+test "a trait signature may name its own parameters, Self, an associated type, and declared types" {
+    let mut s = "type Zbag \{ n: Int }\n"
+    s = s.concat("trait Zzok[T] \{\n")
+    s = s.concat("    type Out\n")
+    s = s.concat("    fn zzok(self, a: T, b: Zbag, c: Int, d: List[T], e: Map[Str, Zbag]) -> Self\n")
+    s = s.concat("    fn zzout(self) -> Self.Out\n")
+    s = s.concat("    fn zzown[U](self, u: U) -> Int\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ }\n")
+    typecheck_probe("build/zz_trait_unknown_e.bl", s)
+    assert_no_errors("the legal set of names in a trait signature")
+}

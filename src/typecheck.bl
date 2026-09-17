@@ -5607,6 +5607,20 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
         return make_fn_type(ret_t, param_types)
     }
 
+    // A type parameter is a BINDING occurrence, so inside the declaration that binds it its
+    // spelling names the parameter and nothing else. Asked before the alias and declared-type
+    // lookups below, which would otherwise answer the outer type and make
+    // `fn ident[Shape](x: Shape)` take the struct `Shape` instead of any type at all. The
+    // scan is innermost-first, so a nested binder shadows an outer one of the same spelling
+    // the same way.
+    //
+    // After the builtin and carrier branches, not before: those names are reserved
+    // (is_primitive_type claims them), so no declaration can bind a parameter under one, and
+    // reaching this first would let `[List]` turn every `List` in the signature into a
+    // structureless type variable.
+    let tp_binder = tc_active_binder_node(name)
+    if tp_binder != NO_BINDER_NODE { return make_typevar_bound(name, tp_binder) }
+
     // A transparent `type Alias = X` peels to X's tid HERE, at the leaf the
     // recursion reaches for every child position — so `Map[Port, Int]` gets Int
     // in its key slot, not the alias's own name. Without this the tid kept `Port`
@@ -8035,6 +8049,67 @@ fn is_user_sourced(node: Int) -> Int {
     0
 }
 
+// Whether a name written in a trait method signature resolves to anything. The impl
+// header's acceptance set (a declared type, a builtin, a trait name) plus what only a
+// trait has: `Self`, an associated type reached through it, the trait's own type
+// parameters, and the method's own. The trait's parameters answer through the active
+// scope, which register_trait has pushed; the method's are not pushed there, so they are
+// read off the method node.
+// A trait whose declaration already reported an unknown type in a method signature.
+// The recorded signature is then whatever the resolver could salvage, so a contract
+// difference measured against it names two types the programmer cannot tell apart and
+// cannot repair. Report the declaration once and stay quiet about its impls.
+let mut tc_trait_sig_poisoned: Map[Str, Int] = Map()
+
+fn tc_trait_sig_name_declared(name: Str, m: Int) -> Int {
+    if name == "Self" { return 1 }
+    if name.starts_with("Self.") { return 1 }
+    if is_known_type(name) != 0 { return 1 }
+    if is_trait_name(name) != 0 { return 1 }
+    if tc_active_binder_node(name) != NO_BINDER_NODE { return 1 }
+    let mtp = node_type_params(m)
+    if mtp != -1 {
+        let mut i = 0
+        while i < sublist_length(mtp) {
+            if node_name(sublist_get(mtp, i)) == name { return 1 }
+            i = i + 1
+        }
+    }
+    0
+}
+
+// Report every name in one written trait-signature annotation that nothing declares.
+// resolve_type_parts lowers a name it cannot place to a free type variable, because its
+// other callers need that; a trait signature is a declaration site, so here the name has
+// to be an error instead. Left as a type variable it became a parameter the trait never
+// declared and no caller could solve, which an impl then matched by accident.
+//
+// Reports the outermost unknown name and stops descending: a name that resolves to
+// nothing has no arguments worth blaming separately.
+fn tc_check_trait_sig_ann(ann: Int, trait_name: Str, mname: Str, m: Int) ! Diag.Report {
+    if ann == -1 { return }
+    let name = node_name(ann)
+    if name != "" && tc_trait_sig_name_declared(name, m) == 0 {
+        tc_trait_sig_poisoned.insert(trait_name, 1)
+        diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type '{name}' in method '{mname}' of trait '{trait_name}'", ann,
+            "a trait signature may name a declared type, a builtin type, 'Self', an associated type, or one of the trait's or method's own type parameters")
+        return
+    }
+    // `Template[E]` and `Handler[E]` carry an EFFECT in their argument position. An effect
+    // is not in the type namespace, so that position is not read as a type here either.
+    if name == "Template" || name == "Handler" { return }
+    let elems = node_elements(ann)
+    if elems != -1 {
+        let mut i = 0
+        while i < sublist_length(elems) {
+            tc_check_trait_sig_ann(sublist_get(elems, i), trait_name, mname, m)
+            i = i + 1
+        }
+    }
+    // `fn(A, B) -> R` keeps its parameters in `elements` and its return in `type_ann`.
+    if name == "Fn" { tc_check_trait_sig_ann(node_type_ann(ann), trait_name, mname, m) }
+}
+
 fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     let name = node_name(tr_node)
     tc_trait_names.push(name)
@@ -8092,6 +8167,7 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
                     // `self` carries no annotation. That is an absence, not a type the
                     // impl must match, and the contract check skips it on that basis.
                     let p_ann = node_type_ann(p)
+                    tc_check_trait_sig_ann(p_ann, name, mname, m)
                     tc_tmsig_param_tids.push(if p_ann == -1 { -1 } else { resolve_type_ann(p_ann) })
                     p_count = p_count + 1
                     j = j + 1
@@ -8101,6 +8177,7 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
             // side already takes below. Left as a no-info value it skipped the return
             // contract check entirely, so an impl could return anything at all.
             let m_ann = node_type_ann(m)
+            tc_check_trait_sig_ann(m_ann, name, mname, m)
             let m_ret = if m_ann == -1 { TYPE_VOID } else { resolve_type_ann(m_ann) }
             tc_tmsig_pool.push(TraitMethodSigEntry { trait_name: name, method: mname, ret_tid: m_ret, tparams_start: tp_start, tparams_count: tp_count, params_start: p_start, params_count: p_count })
             i = i + 1
@@ -8166,6 +8243,19 @@ fn subst_trait_type_tid(type_tid: Int, impl_recv_tid: Int, tmsig_idx: Int, impl_
 // One deep trait-contract compare: `verdict` is -1 when a side is unknown
 // (can't judge — fail-open), 0 when the deep tids agree, 1 when they differ.
 // `actual`/`expected` carry the tids so the caller can render them.
+// Two distinct types can render to a single string: a type parameter prints as its spelling,
+// which an impl binder may share with a declared type. Identity is in the binder, not the
+// letters, so where two renderings collide the message says where each type came from.
+// `type_to_str` itself is not touched — one string per type identity is what its other
+// readers depend on.
+fn tc_type_origin_qualifier(tid: Int) -> Str {
+    if tc_tid_kind(tid) != TyKind.Typevar { return " (the declared type)" }
+    let b = tc_tid_binder(tid)
+    if b == SELF_BINDER_NODE { return " (the implementing type)" }
+    if b == NO_BINDER_NODE { return " (a type parameter)" }
+    " (the type parameter declared at line {node_line(b)})"
+}
+
 type TraitContractTidResult {
     verdict: Int
     actual: Int
@@ -8465,8 +8555,12 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
                                     if tc_tid_is_no_info(trait_ptid) == 0 {
                                         let impl_p = sublist_get(impl_params_sl, pi)
                                         let r = tc_trait_contract_tid_check(trait_ptid, node_type_ann(impl_p), impl_recv_tid, si, im)
-                                        if r.verdict == 1 {
-                                            diag_error_at("TraitContract", TRAIT_CONTRACT_902, "method '{expected_method}' param has type '{type_to_str(r.actual)}', expected '{type_to_str(r.expected)}'", impl_p, "change type to '{type_to_str(r.expected)}' to match trait {trait_name}")
+                                        if r.verdict == 1 && (tc_trait_sig_poisoned.get(trait_name) ?? 0) == 0 {
+                                            let a_s = type_to_str(r.actual)
+                                            let e_s = type_to_str(r.expected)
+                                            let a_q = if a_s == e_s { tc_type_origin_qualifier(r.actual) } else { "" }
+                                            let e_q = if a_s == e_s { tc_type_origin_qualifier(r.expected) } else { "" }
+                                            diag_error_at("TraitContract", TRAIT_CONTRACT_902, "method '{expected_method}' param has type '{a_s}'{a_q}, expected '{e_s}'{e_q}", impl_p, "change type to '{e_s}'{e_q} to match trait {trait_name}")
                                         }
                                     }
                                     pi = pi + 1
@@ -8482,17 +8576,21 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
                                     } else {
                                         tc_trait_contract_tid_check(tmsig.ret_tid, impl_ret_ann, impl_recv_tid, si, im)
                                     }
-                                    if r.verdict == 1 {
+                                    if r.verdict == 1 && (tc_trait_sig_poisoned.get(trait_name) ?? 0) == 0 {
                                         // Void is not a return type a user may write, so the
                                         // repair for a trait method declared without an arrow
                                         // is to drop the impl's arrow, not to spell Void out.
-                                        let want = if r.expected == TYPE_VOID { "no return value" } else { "'{type_to_str(r.expected)}'" }
+                                        let ra_s = type_to_str(r.actual)
+                                        let re_s = type_to_str(r.expected)
+                                        let ra_q = if ra_s == re_s { tc_type_origin_qualifier(r.actual) } else { "" }
+                                        let re_q = if ra_s == re_s { tc_type_origin_qualifier(r.expected) } else { "" }
+                                        let want = if r.expected == TYPE_VOID { "no return value" } else { "'{re_s}'{re_q}" }
                                         let fix = if r.expected == TYPE_VOID {
                                             "remove the return type — trait {trait_name} declares '{expected_method}' with no return"
                                         } else {
-                                            "change return type to '{type_to_str(r.expected)}' to match trait {trait_name}"
+                                            "change return type to '{re_s}'{re_q} to match trait {trait_name}"
                                         }
-                                        diag_error_at("TraitContract", TRAIT_CONTRACT_903, "method '{expected_method}' returns '{type_to_str(r.actual)}', expected {want}", impl_m, fix)
+                                        diag_error_at("TraitContract", TRAIT_CONTRACT_903, "method '{expected_method}' returns '{ra_s}'{ra_q}, expected {want}", impl_m, fix)
                                     }
                                 }
                             }
@@ -11392,10 +11490,11 @@ fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report 
 
 fn nr_check_type_ref(name: Str) ! TypeCheck.Resolve, Diag.Report {
     if name == "" { return }
-    // A single-letter name is a type variable only where a generic binder in scope
-    // declares it. Undeclared, it names no type — fall through to the unknown-type
-    // check below instead of passing it unchecked.
-    if name.len() == 1 && (tc_active_tparams.get(name) ?? 0) > 0 { return }
+    // A name is a type variable exactly where a generic binder in scope declares it. The
+    // spelling carries nothing, so the length of the name is not part of the test.
+    // Undeclared, the name is no type at all — fall through to the unknown-type check
+    // below instead of passing it unchecked.
+    if (tc_active_tparams.get(name) ?? 0) > 0 { return }
     if is_known_type(name) != 0 {
         if nr_check_selective_access(name, -1) != 0 { return }
         if is_private_access(name) != 0 {
