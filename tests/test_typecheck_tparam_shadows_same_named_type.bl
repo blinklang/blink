@@ -1,0 +1,128 @@
+// A type parameter is a binding occurrence. Inside the declaration that binds it, the
+// parameter's spelling names the parameter, not whatever type outside happens to share the
+// letter. `fn ident[Shape](x: Shape)` takes any type and returns it; it does not take the
+// struct `Shape`, even where a struct `Shape` is declared beside it.
+//
+// The declaration has to keep working both ways: the same spelling names the struct again
+// as soon as the parameter's scope ends.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, tc_tid_kind, tc_tid_binder, lookup_named_type, NO_BINDER_NODE, TyKind}
+import parser.{nodes, node_kind, node_name, node_params, node_type_params, sublist_get, sublist_length}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn param_tid(fn_name: Str, idx: Int) -> Int {
+    let f = find_fn(fn_name)
+    if f < 0 { return -1 }
+    let ps = node_params(f)
+    if ps == -1 { return -1 }
+    if idx >= sublist_length(ps) { return -1 }
+    tc_lookup_node_tid(sublist_get(ps, idx))
+}
+
+// The type parameter's own declaration node, so a parameter's binder can be checked
+// against the declaration that actually binds it rather than against "not nothing".
+fn tparam_node(fn_name: Str, idx: Int) -> Int {
+    let f = find_fn(fn_name)
+    if f < 0 { return -1 }
+    let tps = node_type_params(f)
+    if tps == -1 { return -1 }
+    if idx >= sublist_length(tps) { return -1 }
+    sublist_get(tps, idx)
+}
+
+fn shadow_src() -> Str {
+    let mut s = "type Zshape \{ n: Int }\n"
+    s = s.concat("fn zzident[Zshape](x: Zshape) -> Zshape \{ x }\n")
+    s = s.concat("fn zztake(s: Zshape) -> Int \{ s.n }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    assert(zzident(3) == 3)\n")
+    s = s.concat("    assert(zztake(Zshape \{ n: 7 }) == 7)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a type parameter shadows a type of the same name inside its own declaration" {
+    typecheck_probe("build/zz_tparam_shadow.bl", shadow_src())
+    assert_no_errors("type parameter beside a struct of the same name")
+}
+
+test "the shadowed parameter resolves to the parameter, not to the struct" {
+    typecheck_probe("build/zz_tparam_shadow.bl", shadow_src())
+    let pt = param_tid("zzident", 0)
+    assert(pt >= 0)
+    assert(tc_tid_kind(pt) == TyKind.Typevar)
+    assert(tc_type_str(pt) == "Zshape")
+    assert(pt != lookup_named_type("Zshape"))
+}
+
+// The parameter is bound by this function's own declaration of it. Any other binder, and
+// the spelling was resolved somewhere other than the scope that introduced it.
+test "the shadowed parameter is bound by the declaration that introduced it" {
+    typecheck_probe("build/zz_tparam_shadow.bl", shadow_src())
+    let pt = param_tid("zzident", 0)
+    assert(tc_tid_binder(pt) != NO_BINDER_NODE)
+    assert(tc_tid_binder(pt) == tparam_node("zzident", 0))
+}
+
+// Shadowing ends with the scope. A sibling function that never declared the parameter
+// still means the struct by that spelling.
+test "the same spelling outside the binding scope is still the struct" {
+    typecheck_probe("build/zz_tparam_shadow.bl", shadow_src())
+    let st = param_tid("zztake", 0)
+    assert(st >= 0)
+    assert(tc_tid_kind(st) == TyKind.Struct)
+    assert(st == lookup_named_type("Zshape"))
+}
+
+// A type parameter is identified by the binder that declares it. Its spelling carries no
+// meaning at all, so a multi-letter parameter is a parameter on exactly the same terms as
+// a one-letter one. Name resolution used to honour only single-letter binders and reject
+// every longer name as an unknown type, which made the letter load-bearing.
+test "a type parameter of more than one letter is still a type parameter" {
+    let mut s = "fn zzlong[Elem](x: Elem) -> Elem \{ x }\n"
+    s = s.concat("fn main() \{ assert(zzlong(3) == 3) }\n")
+    typecheck_probe("build/zz_tparam_long.bl", s)
+    assert_no_errors("a multi-letter type parameter")
+    let pt = param_tid("zzlong", 0)
+    assert(pt >= 0)
+    assert(tc_tid_kind(pt) == TyKind.Typevar)
+    assert(tc_tid_binder(pt) == tparam_node("zzlong", 0))
+}
