@@ -16129,11 +16129,6 @@ fn tc_scoped_value_memo(node: Int, depth: Int) -> Int {
     tc_lookup_node_tid(node)
 }
 
-// Whether a block introduces a binding of its own. A branch that does cannot be typed by
-// an inference that runs before its scope exists: its tail may name that binding, and the
-// name then resolves against the enclosing scope, so the answer is about a different
-// variable. Comparing two branches on those terms is what rejects a correct program, and
-// what silently accepts an incorrect one when the out-of-scope read finds nothing at all.
 // Calls whose callee is a bracketed type application, recorded when name resolution reports
 // them. The index-typing arm reads this to stay quiet: the construct already has its
 // diagnostic, and "cannot index a value of type Fn() -> Int" describes a reading of the
@@ -16158,14 +16153,28 @@ fn tc_index_is_type_application(idx: Int) -> Int {
     0
 }
 
-fn tc_block_declares_binding(body: Int) -> Int {
+// Whether a block's tail value is a bare read of a binding that same block declares. Such a
+// block cannot be typed by an inference that runs before its scope exists: the tail resolves
+// the name against the ENCLOSING scope, so the answer describes a different variable of that
+// spelling, or nothing at all.
+//
+// A block that declares a binding its tail does not name is NOT this shape. Its tail was read
+// correctly out of scope, so nothing about it needs deferring.
+fn tc_block_tail_reads_own_local(body: Int) -> Int {
     if body == -1 { return 0 }
     if node_kind(body) != NodeKind.Block { return 0 }
+    let tail = tc_block_tail_stmt(body)
+    if tail == -1 { return 0 }
+    let tail_val = tc_block_tail_value(tail)
+    if tail_val == -1 { return 0 }
+    if node_kind(tail_val) != NodeKind.Ident { return 0 }
+    let nm = node_name(tail_val)
     let stmts_sl = node_stmts(body)
     if stmts_sl == -1 { return 0 }
     let mut i = 0
     while i < sublist_length(stmts_sl) {
-        if node_kind(sublist_get(stmts_sl, i)) == NodeKind.LetBinding { return 1 }
+        let st = sublist_get(stmts_sl, i)
+        if node_kind(st) == NodeKind.LetBinding && node_name(st) == nm { return 1 }
         i = i + 1
     }
     0
@@ -16174,8 +16183,8 @@ fn tc_block_declares_binding(body: Int) -> Int {
 // The gate shared by the two sites that compare an `if`'s branches, so neither can start
 // reporting what the other already reports.
 fn tc_if_declaring_branch(node: Int) -> Int {
-    if tc_block_declares_binding(node_then_body(node)) != 0 { return 1 }
-    if tc_block_declares_binding(node_else_body(node)) != 0 { return 1 }
+    if tc_block_tail_reads_own_local(node_then_body(node)) != 0 { return 1 }
+    if tc_block_tail_reads_own_local(node_else_body(node)) != 0 { return 1 }
     0
 }
 
@@ -17163,6 +17172,17 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // that codegen lowers without a result temp (emit_if_expr's else==-1 && tid<0 fast path);
         // publishing a tid there would defeat that and resurrect a dead temp. A consumed else-less
         // if-tail keeps its own publish path, unaffected here.
+        if node_else_body(node) != -1 {
+            let own_tid = tc_lookup_node_tid(node)
+            let post_if_memo = tc_scoped_value_memo(node, 0)
+            if tc_tid_is_no_info(own_tid) != 0 {
+                tc_publish_node_tid(node, post_if_memo)
+            } else if post_if_memo != pre_if_memo {
+                // Same delta gate as the MatchExpr arm: a branch tail that names a
+                // block-local shadowing an outer binding was typed against the outer one.
+                tc_publish_node_tid(node, post_if_memo)
+            }
+        }
         // The compare infer_type declined to make, made here instead, where both branches
         // have been walked inside their own scopes and their tails mean what they say. The
         // gate is the one infer_type suppressed on, so an `if` is compared at exactly one of
@@ -17176,17 +17196,6 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                         tc_error_at("if branches have incompatible types: {type_to_str(in_then_t)} vs {type_to_str(in_else_t)}", node)
                     }
                 }
-            }
-        }
-        if node_else_body(node) != -1 {
-            let own_tid = tc_lookup_node_tid(node)
-            let post_if_memo = tc_scoped_value_memo(node, 0)
-            if tc_tid_is_no_info(own_tid) != 0 {
-                tc_publish_node_tid(node, post_if_memo)
-            } else if post_if_memo != pre_if_memo {
-                // Same delta gate as the MatchExpr arm: a branch tail that names a
-                // block-local shadowing an outer binding was typed against the outer one.
-                tc_publish_node_tid(node, post_if_memo)
             }
         }
         return
