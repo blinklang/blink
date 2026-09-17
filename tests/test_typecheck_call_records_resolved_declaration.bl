@@ -1,0 +1,124 @@
+// Name resolution decides which declaration every call reaches, then throws the answer away.
+// The name alone cannot be re-derived into that answer later: two modules may declare it, an
+// import list may select one of them, and an alias written in one file says nothing about
+// what the same spelling means in another.
+//
+// So the answer is recorded per call node and published. A callee that is not a declaration
+// at all, a closure value or a builtin, records nothing.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_call_decl_node}
+import parser.{nodes, node_kind, node_name, node_left, node_obj, node_method, node_module, node_count}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn probe(path: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+// The first Call node in the root file whose callee is the bare name `name`.
+fn bare_call(name: Str) -> Int {
+    let mut i = 0
+    while i < node_count() {
+        if node_kind(i) == NodeKind.Call {
+            let callee = node_left(i)
+            if callee != -1 && node_kind(callee) == NodeKind.Ident && node_name(callee) == name {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+// A module-qualified call wears the shape of a method call, so it is found by the member
+// name and the qualifier that precedes it.
+fn qualified_call(qualifier: Str, member: Str) -> Int {
+    let mut i = 0
+    while i < node_count() {
+        if node_kind(i) == NodeKind.MethodCall && node_method(i) == member {
+            let obj = node_obj(i)
+            if obj != -1 && node_kind(obj) == NodeKind.Ident && node_name(obj) == qualifier {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn assert_decl_is(label: Str, call: Int, want_mod: Str, want_name: Str) {
+    if call < 0 {
+        io.println("FAIL: {label}: no call node found")
+    }
+    assert(call >= 0)
+    let decl = tc_call_decl_node(call)
+    if decl < 0 {
+        io.println("FAIL: {label}: call records no declaration")
+    }
+    assert(decl >= 0)
+    let got_mod = node_module(decl)
+    let got_name = node_name(decl)
+    if got_mod != want_mod || got_name != want_name {
+        io.println("FAIL: {label}: call resolved to '{got_mod}.{got_name}', want '{want_mod}.{want_name}'")
+    }
+    assert(got_mod == want_mod)
+    assert(got_name == want_name)
+}
+
+// Two modules declare `zzcd_pick`. The bare name in the caller is not enough to say which
+// one the call means; the caller's import list is.
+test "a call to a name two modules declare records the imported declaration" {
+    probe("tests/zzcd_calls/src/main_left.bl")
+    assert_no_errors("left")
+    assert_decl_is("left", bare_call("zzcd_pick"), "zzcd_left", "zzcd_pick")
+}
+
+// The same program with the other import. The recorded declaration follows the import, so
+// this is not a fixed winner picked by scan order.
+test "the same call spelling in a second program records the other declaration" {
+    probe("tests/zzcd_calls/src/main_right.bl")
+    assert_no_errors("right")
+    assert_decl_is("right", bare_call("zzcd_pick"), "zzcd_right", "zzcd_pick")
+}
+
+// One file renames an import to `zzcd_tag`. Another module declares a function of that name
+// and a third file calls it through the module qualifier. The alias belongs to the file that
+// wrote it and must not reach across into a name the qualifier has already settled.
+test "a module-qualified call ignores an alias another file bound to the same spelling" {
+    probe("tests/zzcd_calls/src/main_qualified.bl")
+    assert_no_errors("qualified")
+    assert_decl_is("qualified", qualified_call("zzcd_tagger", "zzcd_tag"), "zzcd_tagger", "zzcd_tag")
+}
+
+// A closure is a value, not a declaration. Nothing is recorded for a call through one.
+test "a call through a closure value records no declaration" {
+    probe("tests/zzcd_calls/src/main_negative.bl")
+    assert_no_errors("negative")
+    let call = bare_call("f")
+    if call < 0 { io.println("FAIL: negative: no closure call found") }
+    assert(call >= 0)
+    let decl = tc_call_decl_node(call)
+    if decl != -1 { io.println("FAIL: negative: closure call recorded declaration {decl}") }
+    assert(decl == -1)
+}

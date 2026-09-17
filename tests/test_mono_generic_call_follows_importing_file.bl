@@ -1,0 +1,71 @@
+// Monomorphization used to find a generic callee by its name alone. A name is not an
+// identity: two modules may declare the same generic function, and a by-name table keeps
+// whichever was recorded last, so both callers reached one declaration and one instance.
+//
+// The declaration typecheck resolved under the calling file's own import list is what the
+// call means, so the walk reads that instead.
+
+import std.io
+import typecheck.{check_types}
+import mono.{run_mono, instances}
+import parser.{node_module, node_name}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+
+fn probe(path: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Mono {
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+}
+
+fn assert_no_errors(label: Str) {
+    let mut errs: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { errs.push("{d.name}: {d.message}") }
+    }
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+// Every module that owns an instance of a generic function of this name.
+fn instance_modules(fn_name: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for inst in instances() {
+        if node_name(inst.base_decl_node) == fn_name {
+            out.push(node_module(inst.base_decl_node))
+        }
+    }
+    out
+}
+
+fn assert_only_module(label: Str, fn_name: Str, want: Str) {
+    let mods = instance_modules(fn_name)
+    if mods.len() == 0 {
+        io.println("FAIL: {label}: no instance of '{fn_name}' was registered")
+    }
+    assert(mods.len() > 0)
+    for m in mods {
+        if m != want {
+            io.println("FAIL: {label}: an instance of '{fn_name}' came from '{m}', want '{want}'")
+        }
+        assert(m == want)
+    }
+}
+
+test "a generic call monomorphizes the declaration the calling file imported" {
+    probe("tests/zzcd_calls/src/main_left.bl")
+    assert_no_errors("left")
+    assert_only_module("left", "zzcd_gen", "zzcd_left")
+}
+
+// The same spelling in a second program. The instance follows the import, so this is not a
+// fixed winner picked by load order.
+test "the same generic spelling in a second program monomorphizes the other declaration" {
+    probe("tests/zzcd_calls/src/main_right.bl")
+    assert_no_errors("right")
+    assert_only_module("right", "zzcd_gen", "zzcd_right")
+}

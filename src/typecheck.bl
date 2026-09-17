@@ -9556,6 +9556,10 @@ fn nr_check_selective_access(name: Str, node: Int) -> Int ! Diag.Report {
     // A private declaration cannot be selected or qualified, so the import list is not the
     // fix; the private-access check names the real problem.
     if nr_is_private_in(name, source_mod) != 0 { return 0 }
+    // The same last-writer limit as the namesake-type check above: where two modules declare
+    // the name, `source_mod` is whichever was recorded last, not the one this module's
+    // import list selected.
+    if nr_bare_name_selected_elsewhere(name, nr_current_module) != 0 { return 0 }
     if is_filtered_for_module(name, source_mod, nr_current_module) != 0 {
         let display_mod = tc_qualifier_for_module(source_mod)
         if node == -1 {
@@ -9573,16 +9577,92 @@ fn nr_check_selective_access(name: Str, node: Int) -> Int ! Diag.Report {
 let mut nr_private_imports: Map[Str, Str] = Map()
 let mut nr_current_module: Str = ""
 let mut nr_name_source_module: Map[Str, Str] = Map()
-// Every top-level declaration, keyed "module|name". A module's own declaration is what its
-// bare name means, whatever other loaded modules declare under the same spelling.
+// Every top-level declaration, keyed "module|name" and holding the declaration node. A
+// module's own declaration is what its bare name means, whatever other loaded modules
+// declare under the same spelling.
 let mut nr_module_decls: Map[Str, Int] = Map()
+// The same declarations gathered by bare name, so a caller can see every module that spells
+// it and let its own import list choose between them.
+let mut nr_decls_by_name: Map[Str, List[Int]] = Map()
 
-fn nr_record_decl(name: Str, mod_name: Str) {
-    nr_module_decls.insert("{mod_name}|{name}", 1)
+fn nr_record_decl(name: Str, mod_name: Str, decl_node: Int) {
+    nr_module_decls.insert("{mod_name}|{name}", decl_node)
+    let mut seen = nr_decls_by_name.get(name) ?? []
+    seen.push(decl_node)
+    nr_decls_by_name.insert(name, seen)
 }
 
 fn nr_module_declares(mod_name: Str, name: Str) -> Int {
     if nr_module_decls.contains_key("{mod_name}|{name}") { 1 } else { 0 }
+}
+
+// ── The declaration a call resolved to ──────────────────────────────
+//
+// Name resolution already decides this and used to discard it, leaving every later stage to
+// re-derive it from the spelling. The spelling does not carry the answer: two modules may
+// declare it, and only the calling file's import list says which one it reached.
+let mut tc_call_decl: Map[Int, Int] = Map()
+
+// The declaration node this call resolved to, or -1 for a callee that is not a declaration:
+// a closure value, a builtin, an intrinsic.
+pub fn tc_call_decl_node(call_node: Int) -> Int {
+    tc_call_decl.get(call_node) ?? -1
+}
+
+fn nr_note_call_decl(call_node: Int, decl_node: Int) {
+    if decl_node < 0 { return }
+    tc_call_decl.insert(call_node, decl_node)
+}
+
+// Which declaration of `name` the bare spelling means inside `consuming_mod`.
+fn nr_resolve_bare_decl(name: Str, consuming_mod: Str) -> Int {
+    let cands = nr_decls_by_name.get(name) ?? []
+    if cands.len() == 0 { return -1 }
+    // A module's own declaration wins over any import, so it is asked for first.
+    for c in cands {
+        if node_module(c) == consuming_mod { return c }
+    }
+    let mut found = -1
+    let mut hits = 0
+    for c in cands {
+        if is_filtered_for_module(name, node_module(c), consuming_mod) == 0 {
+            found = c
+            hits = hits + 1
+        }
+    }
+    if hits == 1 { return found }
+    -1
+}
+
+// A module qualifier settles the module before any name is looked up, so an alias another
+// file bound to the same spelling has nothing to say here.
+fn nr_resolve_qualified_decl(qualifier: Str, member: Str) -> Int {
+    let target = tc_qualifier_to_module.get(qualifier) ?? qualifier
+    nr_module_decls.get("{target}|{member}") ?? -1
+}
+
+// Whether this module's own import list keeps the bare `name` in scope, asked only where
+// more than one module declares it. Below that, the symbol table's single answer is right.
+fn nr_bare_name_selected_elsewhere(name: Str, consuming_mod: Str) -> Int {
+    let cands = nr_decls_by_name.get(name) ?? []
+    if cands.len() < 2 { return 0 }
+    for c in cands {
+        if node_module(c) == consuming_mod { return 1 }
+        if is_filtered_for_module(name, node_module(c), consuming_mod) == 0 { return 1 }
+    }
+    0
+}
+
+// A name is ambiguous only where two declarations of it are both in a file's bare scope. A
+// selective import names one of them, which settles the question the clash was asking.
+fn nr_ambiguity_settled_by_import(name: Str) -> Int {
+    let cands = nr_decls_by_name.get(name) ?? []
+    if cands.len() == 0 { return 0 }
+    let mut hits = 0
+    for c in cands {
+        if is_filtered_for_module(name, node_module(c), "__main__") == 0 { hits = hits + 1 }
+    }
+    if hits <= 1 { 1 } else { 0 }
 }
 
 // True when `name` is declared in `source_mod` without a pub declaration anywhere, so no
@@ -9600,7 +9680,7 @@ fn nr_check_ambiguity(name: Str, mod_name: Str, local_names: Map[Str, Int]) ! Di
     if local_names.contains_key(name) { return }
     match nr_name_source_module.get(name) {
         Some(existing_mod) => {
-            if existing_mod != mod_name && existing_mod != "__main__" {
+            if existing_mod != mod_name && existing_mod != "__main__" && nr_ambiguity_settled_by_import(name) == 0 {
                 diag_error_no_loc("AmbiguousImport", AMBIGUOUS_IMPORT, "name '{name}' is ambiguous — imported from both '{existing_mod}' and '{mod_name}'", "use selective imports to disambiguate, e.g. import {existing_mod}.\{name}")
             }
         }
@@ -11077,6 +11157,8 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     nr_private_imports = Map()
     nr_name_source_module = Map()
     nr_module_decls = Map()
+    nr_decls_by_name = Map()
+    tc_call_decl = Map()
     nr_push_scope()
 
     // Build private import set: imported non-pub fns, types, lets
@@ -11152,7 +11234,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             let fn_node = sublist_get(fns_sl_priv, i)
             let fn_name = node_name(fn_node)
             let mod_name = node_module(fn_node)
-            nr_record_decl(fn_name, mod_name)
+            nr_record_decl(fn_name, mod_name, fn_node)
             if mod_name != "" && node_is_pub(fn_node) == 0 && nr_pub_names.contains_key(fn_name) == 0 {
                 nr_register_private(fn_name, mod_name)
             }
@@ -11165,13 +11247,13 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             let td = sublist_get(types_sl_priv, i)
             let td_name = node_name(td)
             let mod_name = node_module(td)
-            nr_record_decl(td_name, mod_name)
+            nr_record_decl(td_name, mod_name, td)
             let all_flds = node_fields(td)
             if all_flds != -1 && sublist_length(all_flds) > 0 {
                 if node_kind(sublist_get(all_flds, 0)) == NodeKind.TypeVariant {
                     let mut vi = 0
                     while vi < sublist_length(all_flds) {
-                        nr_record_decl(node_name(sublist_get(all_flds, vi)), mod_name)
+                        nr_record_decl(node_name(sublist_get(all_flds, vi)), mod_name, sublist_get(all_flds, vi))
                         vi = vi + 1
                     }
                 }
@@ -11205,7 +11287,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             let tr = sublist_get(traits_sl_priv, i)
             let tr_name = node_name(tr)
             let mod_name = node_module(tr)
-            nr_record_decl(tr_name, mod_name)
+            nr_record_decl(tr_name, mod_name, tr)
             if mod_name != "" && node_is_pub(tr) == 0 && nr_pub_names.contains_key(tr_name) == 0 {
                 nr_register_private(tr_name, mod_name)
             }
@@ -11218,7 +11300,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             let l = sublist_get(lets_sl_priv, i)
             let l_name = node_name(l)
             let mod_name = node_module(l)
-            nr_record_decl(l_name, mod_name)
+            nr_record_decl(l_name, mod_name, l)
             if mod_name != "" && node_is_pub(l) == 0 && nr_pub_names.contains_key(l_name) == 0 {
                 nr_register_private(l_name, mod_name)
             }
@@ -11892,6 +11974,11 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     } else {
                         tc_mark_symbol_used(fn_name)
                     }
+                    // A local binding of the same spelling holds a value, not a declaration,
+                    // so a call through it is a call through a closure and records nothing.
+                    if nr_top_binding_is_global(fn_name) != 0 || nr_is_defined(fn_name) == 0 {
+                        nr_note_call_decl(node, nr_resolve_bare_decl(fn_name, nr_current_module))
+                    }
                 }
             } else {
                 nr_check_node(callee)
@@ -11921,6 +12008,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 } else {
                     tc_mark_symbol_used(mq_method)
                 }
+                nr_note_call_decl(node, nr_resolve_qualified_decl(obj_name, mq_method))
                 tc_mark_qualifier_used(obj_name)
             }
         }
