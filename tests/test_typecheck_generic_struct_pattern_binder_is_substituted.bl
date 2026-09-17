@@ -1,0 +1,177 @@
+// A struct pattern decomposes a value of a GENERIC struct at the instance the scrutinee
+// carries. A field declared with the struct's own type parameter therefore binds that
+// instance's argument, not the parameter: destructuring a `Box[Str]` binds `v` at Str.
+// The qualified enum-variant pattern already substitutes this way; the struct pattern is
+// the same rule on the other spelling, in both its shorthand and its named form.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
+import parser.{nodes, node_kind, node_name, node_type_name, node_fields, node_pattern, sublist_get, sublist_length}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+// The one struct pattern written against `tname`. -2 marks an ambiguous measurement.
+fn struct_pattern_for(tname: Str) -> Int {
+    let mut found = -1
+    let mut hits = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.StructPattern && node_type_name(i) == tname {
+            hits = hits + 1
+            found = i
+        }
+        i = i + 1
+    }
+    if hits > 1 { return -2 }
+    found
+}
+
+// The pattern's field node named `fname`: the node the shorthand form binds on.
+fn pattern_field(pat: Int, fname: Str) -> Int {
+    if pat < 0 { return -1 }
+    let flds = node_fields(pat)
+    if flds == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(flds) {
+        let f = sublist_get(flds, i)
+        if node_name(f) == fname { return f }
+        i = i + 1
+    }
+    -1
+}
+
+fn tid_str(n: Int) -> Str ! Diag.Report {
+    if n < 0 { return "<no node>" }
+    let t = tc_lookup_node_tid(n)
+    if t < 0 { return "<unset>" }
+    tc_type_str(t)
+}
+
+fn assert_tid_str(label: Str, n: Int, want: Str) ! Diag.Report {
+    let got = tid_str(n)
+    if got != want { io.println("FAIL: {label}: tid is {got}, want {want}") }
+    assert(got == want)
+}
+
+fn shorthand_src() -> Str {
+    #"
+type Box[T] { v: T, tag: Str }
+
+fn main() {
+    let b = Box { v: "hello", tag: "t1" }
+    match b {
+        Box { v, tag } => {
+            let _n = v.len() + tag.len()
+        }
+    }
+}
+"#
+}
+
+test "a shorthand struct-pattern binder takes the instance argument, not the type parameter" {
+    typecheck_probe("build/tc_gsp_shorthand.bl", shorthand_src())
+    assert_no_errors("shorthand binder")
+    let pat = struct_pattern_for("Box")
+    assert(pat >= 0)
+    assert_tid_str("shorthand v", pattern_field(pat, "v"), "Str")
+    assert_tid_str("shorthand tag", pattern_field(pat, "tag"), "Str")
+}
+
+fn named_src() -> Str {
+    #"
+type Box[T] { v: T, tag: Str }
+
+fn main() {
+    let b = Box { v: "hello", tag: "t1" }
+    match b {
+        Box { v: inner, tag: tg } => {
+            let _n = inner.len() + tg.len()
+        }
+    }
+}
+"#
+}
+
+test "a named struct-pattern binder takes the instance argument, not the type parameter" {
+    typecheck_probe("build/tc_gsp_named.bl", named_src())
+    assert_no_errors("named binder")
+    let pat = struct_pattern_for("Box")
+    assert(pat >= 0)
+    assert_tid_str("named inner", node_pattern(pattern_field(pat, "v")), "Str")
+    assert_tid_str("named tg", node_pattern(pattern_field(pat, "tag")), "Str")
+}
+
+fn nested_src() -> Str {
+    #"
+type Box[T] { v: T, tag: Str }
+
+fn main() {
+    let b = Box { v: [1, 2], tag: "t1" }
+    match b {
+        Box { v, tag } => {
+            let _n = v.len() + tag.len()
+        }
+    }
+}
+"#
+}
+
+test "a struct-pattern binder over a container instance argument takes the whole container" {
+    typecheck_probe("build/tc_gsp_nested.bl", nested_src())
+    assert_no_errors("nested binder")
+    let pat = struct_pattern_for("Box")
+    assert(pat >= 0)
+    assert_tid_str("nested v", pattern_field(pat, "v"), "List[Int]")
+}
+
+fn let_destructure_src() -> Str {
+    #"
+type Box[T] { v: T, tag: Str }
+
+fn main() {
+    let b = Box { v: "hello", tag: "t1" }
+    match b {
+        Box { v: inner } => {
+            let _n = inner.len()
+        }
+    }
+}
+"#
+}
+
+// A partial pattern names a subset of the fields and must type the ones it names the same
+// way: the instance argument reaches the binder however many siblings are left out.
+test "a partial struct pattern still substitutes the field it names" {
+    typecheck_probe("build/tc_gsp_partial.bl", let_destructure_src())
+    assert_no_errors("partial binder")
+    let pat = struct_pattern_for("Box")
+    assert(pat >= 0)
+    assert_tid_str("partial inner", node_pattern(pattern_field(pat, "v")), "Str")
+}
