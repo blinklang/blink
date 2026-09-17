@@ -16153,6 +16153,27 @@ fn tc_index_is_type_application(idx: Int) -> Int {
     0
 }
 
+// The branch compare infer_type declined to make, made once both branches have been walked
+// inside their own scopes, so their tails mean what they say.
+//
+// Called from the CONSUMER of the `if`, never from the walk of the `if` itself. Whether the
+// value is used decides whether a difference between the branches is an error at all — an
+// `if` in statement position discards it, and an else-if chain whose arms end in calls of
+// unrelated types is ordinary code. The walk cannot see which it is; the consumer can, because
+// it is the thing doing the consuming.
+fn tc_report_deferred_if_mismatch(node: Int) ! Diag.Report, TypeCheck.Report {
+    if node == -1 { return }
+    if node_kind(node) != NodeKind.IfExpr { return }
+    if node_else_body(node) == -1 { return }
+    if tc_if_declaring_branch(node) == 0 { return }
+    let then_t = tc_scoped_value_memo(node_then_body(node), 0)
+    let else_t = tc_scoped_value_memo(node_else_body(node), 0)
+    if tc_tid_is_no_info(then_t) != 0 || tc_tid_is_no_info(else_t) != 0 { return }
+    if tc_tid_has_unknown(then_t) != 0 || tc_tid_has_unknown(else_t) != 0 { return }
+    if types_compatible(then_t, else_t) != 0 { return }
+    tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
+}
+
 // Whether a block's tail value is a bare read of a binding that same block declares. Such a
 // block cannot be typed by an inference that runs before its scope exists: the tail resolves
 // the name against the ENCLOSING scope, so the answer describes a different variable of that
@@ -16925,6 +16946,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // descends a call or a struct literal, not a list, and infer_type types the closure's
             // signature without its body. tc_walk_stmt_value picks the walk the value's kind needs.
             tc_walk_stmt_value(val)
+            tc_report_deferred_if_mismatch(val)
             // `let x = { let h = 5  h }` and
             // `let x = match sh { Circle(a) => a  Square(a) => a }` — the value names a binding
             // the construct itself introduces, which the infer_type above could not see because
@@ -17181,21 +17203,6 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 // Same delta gate as the MatchExpr arm: a branch tail that names a
                 // block-local shadowing an outer binding was typed against the outer one.
                 tc_publish_node_tid(node, post_if_memo)
-            }
-        }
-        // The compare infer_type declined to make, made here instead, where both branches
-        // have been walked inside their own scopes and their tails mean what they say. The
-        // gate is the one infer_type suppressed on, so an `if` is compared at exactly one of
-        // the two sites and reports at most once.
-        if node_else_body(node) != -1 && tc_if_declaring_branch(node) != 0 {
-            let in_then_t = tc_scoped_value_memo(node_then_body(node), 0)
-            let in_else_t = tc_scoped_value_memo(node_else_body(node), 0)
-            if tc_tid_is_no_info(in_then_t) == 0 && tc_tid_is_no_info(in_else_t) == 0 {
-                if tc_tid_has_unknown(in_then_t) == 0 && tc_tid_has_unknown(in_else_t) == 0 {
-                    if types_compatible(in_then_t, in_else_t) == 0 {
-                        tc_error_at("if branches have incompatible types: {type_to_str(in_then_t)} vs {type_to_str(in_else_t)}", node)
-                    }
-                }
             }
         }
         return
