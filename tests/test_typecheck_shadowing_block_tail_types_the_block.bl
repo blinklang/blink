@@ -1,0 +1,171 @@
+// A block-shaped value — a `with` block, a match arm, a bare block — whose tail names a
+// binding the block itself introduces takes THAT binding's type. When the name also exists
+// outside the block, the speculative inference that runs before the block's scope exists
+// resolves the outer one and answers confidently. The answer is wrong, and the block's own
+// tid must not keep it: the in-scope walk has since typed the tail, and that answer wins.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
+import parser.{nodes, node_kind, node_name, node_value, node_body}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+// The one let binding named `name`. -2 marks an ambiguous measurement.
+fn let_named(name: Str) -> Int {
+    let mut found = -1
+    let mut hits = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.LetBinding && node_name(i) == name {
+            hits = hits + 1
+            found = i
+        }
+        i = i + 1
+    }
+    if hits > 1 { return -2 }
+    found
+}
+
+fn tid_str(n: Int) -> Str ! Diag.Report {
+    if n < 0 { return "<no node>" }
+    let t = tc_lookup_node_tid(n)
+    if t < 0 { return "<unset>" }
+    tc_type_str(t)
+}
+
+fn assert_tid_str(label: Str, n: Int, want: Str) ! Diag.Report {
+    let got = tid_str(n)
+    if got != want { io.println("FAIL: {label}: tid is {got}, want {want}") }
+    assert(got == want)
+}
+
+fn with_src() -> Str {
+    #"
+import std.io
+fn main() ! IO {
+    let v = 1
+    let x = with arena {
+        let mut v: List[Str] = []
+        v.push("a")
+        v.push("b")
+        v
+    }
+    io.println("outer={v} inner_len={x.len()} first={x.get(0).unwrap()}")
+}
+"#
+}
+
+test "a with-block tail naming a block-local keeps the block-local's type" {
+    typecheck_probe("build/tc_shadow_tail_with.bl", with_src())
+    assert_no_errors("with tail")
+    let lx = let_named("x")
+    assert(lx >= 0)
+    let w = node_value(lx)
+    assert(node_kind(w) == NodeKind.WithBlock)
+    assert_tid_str("with node", w, "List[Str]")
+    assert_tid_str("with body block", node_body(w), "List[Str]")
+    assert_tid_str("binding x", lx, "List[Str]")
+}
+
+fn match_src() -> Str {
+    #"
+fn main() {
+    let v = 1
+    let x = match v {
+        _ => {
+            let v = "s"
+            v
+        }
+    }
+    let _n = x.len()
+}
+"#
+}
+
+test "a match arm naming an arm-local gives the match the arm-local's type" {
+    typecheck_probe("build/tc_shadow_tail_match.bl", match_src())
+    assert_no_errors("match arm tail")
+    let lx = let_named("x")
+    assert(lx >= 0)
+    let m = node_value(lx)
+    assert(node_kind(m) == NodeKind.MatchExpr)
+    assert_tid_str("match node", m, "Str")
+    assert_tid_str("binding x", lx, "Str")
+}
+
+fn block_src() -> Str {
+    #"
+fn main() {
+    let v = 1
+    let x = {
+        let v = "s"
+        v
+    }
+    let _n = x.len()
+}
+"#
+}
+
+test "a let whose value block names a block-local binds the block-local's type" {
+    typecheck_probe("build/tc_shadow_tail_block.bl", block_src())
+    assert_no_errors("block value tail")
+    let lx = let_named("x")
+    assert(lx >= 0)
+    assert_tid_str("binding x", lx, "Str")
+    assert_tid_str("value block", node_value(lx), "Str")
+}
+
+fn if_src() -> Str {
+    #"
+fn main() {
+    let v = 1
+    let c = true
+    let x = if c {
+        let v = "s"
+        v
+    } else {
+        let v = "t"
+        v
+    }
+    let _n = x.len()
+}
+"#
+}
+
+test "an if branch naming a branch-local gives the if the branch-local's type" {
+    typecheck_probe("build/tc_shadow_tail_if.bl", if_src())
+    assert_no_errors("if branch tail")
+    let lx = let_named("x")
+    assert(lx >= 0)
+    let f = node_value(lx)
+    assert(node_kind(f) == NodeKind.IfExpr)
+    assert_tid_str("if node", f, "Str")
+    assert_tid_str("binding x", lx, "Str")
+}

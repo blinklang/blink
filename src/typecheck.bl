@@ -16777,6 +16777,12 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // declared/inferred type, so `let x = if c { 1 }` fails even when x is unused.
             inferred_tid = tc_infer_value(val)
             tc_construct_hint = saved_hint
+            // What the inference above wrote for the value's tail, read BEFORE the walk below
+            // retypes it in scope. A tail that names a binding the value's own construct
+            // introduces was resolved against the enclosing scope, so a name it SHADOWS
+            // answered with the outer binding's type: confidently, and wrongly, which is why
+            // the recovery below cannot gate on the answer being absent.
+            let pre_val_memo = tc_scoped_value_memo(val, 0)
             // A closure written inside a container literal — `let fs: List[fn(Int) -> Int] =
             // [fn(x: Int) -> Int { x + 1 }]` — is reached by neither walk on its own: tc_check_body
             // descends a call or a struct literal, not a list, and infer_type types the closure's
@@ -16810,6 +16816,23 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     } else {
                         inferred_tid = tc_tid_fill_unknowns(inferred_tid, memo)
                     }
+                }
+            } else {
+                // A CONFIDENT answer can still be an out-of-scope answer. In
+                // `let v = 1` followed by `let x = ...` whose value block re-binds `v` to a
+                // Str and names it as the tail, the tail was typed against the OUTER `v` and
+                // came back Int, so the gate above declines and the binding takes a type the
+                // block does not produce. The proof is the delta: the walk retyped the very
+                // node the earlier answer was read from, so a memo that MOVED is the in-scope
+                // answer replacing an out-of-scope one. An unmoved memo keeps the old path.
+                let post_val_memo = tc_scoped_value_memo(val, 0)
+                if tc_tid_is_no_info(post_val_memo) == 0 && post_val_memo != pre_val_memo {
+                    inferred_tid = post_val_memo
+                    // The value node keeps the out-of-scope answer too, and codegen reads
+                    // node tids, so correcting only the binding would leave the block itself
+                    // lowered at the type the block does not produce. The `with` and `match`
+                    // arms republish their own node; a bare block has no such arm.
+                    tc_publish_node_tid(val, post_val_memo)
                 }
             }
         }
@@ -16998,6 +17021,9 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if is_bool_compat(cond_t) == 0 {
             tc_error_at("if condition must be Bool, got {type_to_str(cond_t)}", node)
         }
+        // The branch tails as the speculative inference left them, read before either branch
+        // scope exists. The recovery below reads them again and takes the delta as its gate.
+        let pre_if_memo = tc_scoped_value_memo(node, 0)
         tc_check_body(node_then_body(node))
         tc_check_body(node_else_body(node))
         // The branch bodies were walked — and memoized — inside their own block scopes, so an
@@ -17011,8 +17037,13 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // if-tail keeps its own publish path, unaffected here.
         if node_else_body(node) != -1 {
             let own_tid = tc_lookup_node_tid(node)
+            let post_if_memo = tc_scoped_value_memo(node, 0)
             if tc_tid_is_no_info(own_tid) != 0 {
-                tc_publish_node_tid(node, tc_scoped_value_memo(node, 0))
+                tc_publish_node_tid(node, post_if_memo)
+            } else if post_if_memo != pre_if_memo {
+                // Same delta gate as the MatchExpr arm: a branch tail that names a
+                // block-local shadowing an outer binding was typed against the outer one.
+                tc_publish_node_tid(node, post_if_memo)
             }
         }
         return
@@ -17084,6 +17115,9 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if kind == NodeKind.MatchExpr {
         tc_check_body(node_scrutinee(node))
         let scrut_tid = infer_type(node_scrutinee(node))
+        // The arm bodies as the speculative inference left them, read before any arm scope
+        // exists. The recovery below reads them again and takes the delta as its gate.
+        let pre_arm_memo = tc_scoped_value_memo(node, 0)
         let arms_sl = node_arms(node)
         if arms_sl != -1 {
             let mut i = 0
@@ -17129,10 +17163,16 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // TYPE_UNKNOWN for the match as a whole. The answers exist now, so read them back here at
             // the match rather than at each consumer: one publish serves every consumer this function
             // reaches. That reach is statement forms only, so a match nested in an expression is not
-            // covered. Recovery only — gated on the node having no answer of its own.
+            // covered. Recovery, not correction: the in-scope answer is taken either when the
+            // node has none of its own, or when the arm memo MOVED across the walk, which is
+            // the proof that the answer it does have was computed before the arm scopes
+            // existed, against whatever binding an arm shadows.
             let own_tid = tc_lookup_node_tid(node)
+            let post_arm_memo = tc_scoped_value_memo(node, 0)
             if tc_tid_is_no_info(own_tid) != 0 {
-                tc_publish_node_tid(node, tc_scoped_value_memo(node, 0))
+                tc_publish_node_tid(node, post_arm_memo)
+            } else if post_arm_memo != pre_arm_memo {
+                tc_publish_node_tid(node, post_arm_memo)
             }
 
             tc_check_match_exhaustive(node, scrut_tid, arms_sl)
@@ -17173,6 +17213,9 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 wi2 = wi2 + 1
             }
         }
+        // The body's tail as the speculative inference left it, read before the body is
+        // walked in this scope. The recovery below takes the delta as its gate.
+        let pre_with_memo = tc_scoped_value_memo(node, 0)
         tc_check_body(node_body(node))
         // Same recovery as the MatchExpr arm, and for the same reason: `with` is an
         // expression whose value is its body's tail (sections/02_syntax.md:1017), and that tail
@@ -17184,14 +17227,21 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // is statement forms only, so a `with` nested in an expression is not covered.
         // A body with no value-bearing last statement is not a miss — the spec gives it `()`
         // (sections/05_memory_compile_errors.md:169), so say so instead of leaving it blank.
-        // Recovery only: gated on the node having no answer of its own.
+        // Recovery, not correction: taken when the node has no answer of its own, or when the
+        // tail memo MOVED across the walk, which is the proof that the answer it does have was
+        // computed before this scope existed, against whatever binding the tail shadows.
         let with_own_tid = tc_lookup_node_tid(node)
+        let post_with_memo = tc_scoped_value_memo(node, 0)
         if tc_tid_is_no_info(with_own_tid) != 0 {
-            let mut with_tail_tid = tc_scoped_value_memo(node, 0)
+            let mut with_tail_tid = post_with_memo
             if tc_tid_is_no_info(with_tail_tid) != 0 && tc_block_tail_stmt(node_body(node)) == -1 {
                 with_tail_tid = TYPE_VOID
             }
             tc_publish_node_tid(node, with_tail_tid)
+        } else if post_with_memo != pre_with_memo {
+            // Same delta gate as the MatchExpr arm: the tail names a block-local that
+            // shadows an outer binding, and the answer above was read before this scope.
+            tc_publish_node_tid(node, post_with_memo)
         }
         nr_pop_scope()
         return
