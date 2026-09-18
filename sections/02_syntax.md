@@ -1414,9 +1414,37 @@ test "rolls back on the expected panic" {
 
 This is the one place in the language where a `panic` unwind runs cleanup. An *unexpected* panic (outside any `assert_panics` body) still terminates the process and bypasses cleanup, exactly as before. See §4.6.3 for the catchable-unwind set and the fence amendment.
 
-**Why a block, not a closure.** A closure (`fn() { ... }`) is a first-class value: a user could bind it (`let g = ...`) and hold a value whose invocation is panic-catchable, leaking panic recovery into ordinary code. A recognized block is never a value, so the panic continuation is observable only by the test runner — which is what keeps `panic: Never` (this section, *`panic()` Function*) sound. It also keeps the surface familiar: like `pytest.raises(...)` / Rust `#[should_panic(expected = "...")]`, you wrap the region and optionally assert the message.
+**Why a block, not a closure.** A closure (`fn() { ... }`) is a first-class value: a user could bind it (`let g = ...`) and hold a value whose invocation is panic-catchable, leaking panic recovery into ordinary code. The only guarantee the compiler enforces is about where a catch frame is **created**: a catch frame can only be created by code written lexically inside a `test { ... }` block (**E0833**). A recognized block is never a value, so no expression in the language has a panic-catching type, and `panic: Never` stays sound in the narrow sense that no signature can promise recovery. A closure written inside a test may still *contain* an `assert_panics` block. Nothing confines the resulting function value after that. It may be passed to ordinary code, stored in module-level mutable state, and invoked later from a plain `fn` with no test on the call stack. The block form also keeps the surface familiar: like `pytest.raises(...)` / Rust `#[should_panic(expected = "...")]`, you wrap the region and optionally assert the message.
 
 **Panel vote: 6-0** (all four questions). Resolved the deferred `assert_panics` question from the std.testing deliberation. See [DECISIONS.md](../DECISIONS.md) and [decisions/assert-panics-semantics.md](../decisions/assert-panics-semantics.md).
+
+**`assert_panics` inside a closure written in a test body.** The `assert_panics` fence is **lexical**: the compiler checks where the construct is *written*, not where it runs. A closure written inside a `test` block may therefore contain `assert_panics`, whether it is passed directly as an argument — the `testing.for_each` shape below — or bound with `let` first. Both forms are accepted, and accepting them is deliberate.
+
+**The closure must not outlive the `test` block that creates it.** Do not assign it to module-level state or store it in a field. Passing it directly as an argument rather than binding it with `let` does not by itself satisfy this: an argument is bound to the callee's parameter, and a parameter's type does not say whether the callee keeps the value. **The compiler does not check this**, so nothing will report it when it is violated. If the assertion inside an escaped closure fails when it is called from outside a running test, the behaviour is undefined.
+
+Recommended shape: write the closure where it is consumed, and let the consumer call it within the test, as `testing.for_each` does.
+
+```blink
+import std.testing
+
+fn nth(xs: List[Int], i: Int) -> Int {
+    xs.get(i).unwrap()
+}
+
+test "nth rejects out-of-range indices" {
+    let xs: List[Int] = [10, 20, 30]
+    testing.for_each([
+        ("negative", -1),
+        ("past end",  3),
+    ], fn(case: Int) {
+        assert_panics {
+            let _ = nth(xs, case)
+        }
+    })
+}
+```
+
+**Panel vote: 5-1** on the paragraph text (Minimalism preferred a shorter rung), **6-0** on striking a non-expressible escape route from the enumeration, **5-1** on scoping the undefined behaviour to the failing assertion (Systems preferred the wider wording). **6-0** that no new language surface is added and the fence stays lexical. See [DECISIONS.md](../DECISIONS.md) and [decisions/assert-panics-closure-fence.md](../decisions/assert-panics-closure-fence.md).
 
 #### Sub-tests and Parameterized Tests
 
@@ -1430,7 +1458,7 @@ test "add handles signs" {
         ("zero",     (0, 0, 0)),
         ("positive", (1, 2, 3)),
         ("negative", (-1, -2, -3)),
-    ], fn(case) {
+    ], fn(case: (Int, Int, Int)) {
         let (a, b, expected) = case
         assert_eq(add(a, b), expected)
     })
