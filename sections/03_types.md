@@ -1266,6 +1266,38 @@ fn main() {
 
 Whether a type parameter is supplied by the signature is decidable from the signature alone — no call site, and no function body, is consulted.
 
+**A generic function named as a value.** A generic function's name may be written wherever a function value is expected, with no arguments and no brackets. The expected type is a source of type information exactly as a parameter type is, and the declaration's binders are solved by unifying its type against it:
+
+```blink
+fn identity[T](x: T) -> T { x }
+
+fn apply(f: fn(Int) -> Int, n: Int) -> Int { f(n) }
+
+fn main() {
+    let r = apply(identity, 3)            // OK -- the parameter type `fn(Int) -> Int` fixes T = Int
+    let g: fn(Str) -> Str = identity      // OK -- the annotation fixes T = Str
+    io.println("{r}")
+    io.println(g("ok"))
+}
+```
+
+No separate rule governs the bare form. A reference whose binders the expected type does not fix is under-determined, and that is `error[CannotInferType]` (E0301) like every other under-determination — reported at the reference, where its repair attaches:
+
+```blink
+fn identity[T](x: T) -> T { x }
+
+fn main() {
+    let f = identity                      // error[CannotInferType] -- intentional-error example
+                                          //   `T` is unbound at this reference and nothing supplies it
+                                          // help: annotate the binding:
+                                          //   `let f: fn(Int) -> Int = identity`
+}
+```
+
+The first `help:` names the **annotation**, not a bracket form. Brackets on a callee supply type arguments to a *call*; this position has no call, so there is nothing for them to attach to.
+
+*Rationale (normative).* The rule this replaces refused `apply(identity, 3)` and accepted `let f = identity` followed by `apply(f, 3)` — the same value, one line apart, separated by where it was written rather than by anything about its type. A rule that distinguishes a term from its own η-expansion is a syntactic filter standing in a typing rule's position, and its prescribed repair — wrapping the name in a closure — lowers to the identical allocation and the identical indirect call. It refused one spelling of a machine-identical program, it was defeated by one `let`, and it has been deleted rather than restated.
+
 **Where the error is reported.** `error[CannotInferType]` (E0301) is reported **where its repair attaches**. For an under-determined *binding* that is the `let` (§3.4 *Under-Determined Types*). For a type parameter with no source it is the call's type-argument position, because that is where the brackets go — including when the call stands alone as a statement and there is no binding to annotate:
 
 ```blink

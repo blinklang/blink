@@ -482,7 +482,13 @@ This is intentional. The auto-decomposition only works on string *literals* at t
 
 #### `Raw(expr)` — The Escape Hatch
 
-For dynamic SQL (table names, column lists, generated clauses), wrapping an interpolated expression in `Raw()` bypasses decomposition for that specific value — folding it into the literal parts instead. `Raw[T]` is a compiler-known marker type — when `Template[C]` coercion encounters `{Raw(expr)}`, it concatenates the value into the adjacent literal segment.
+For dynamic SQL (table names, column lists, generated clauses), wrapping an interpolated expression in `Raw()` bypasses decomposition for that specific value — folding it into the literal parts instead.
+
+`Raw[T]` is a **real marker type**, not a spelling the compiler matches. `Raw(expr)` constructs a `Raw[T]` from a `T`, and the type carries the marker wherever the value goes:
+
+- `Raw[T]` implements **no `Display`**. The only thing that consumes it is a `Template[C]` coercion, which concatenates the wrapped value into the adjacent literal segment.
+- The marker survives a binding. `let t = Raw(table)` has type `Raw[Str]`, and interpolating `t` into a template is the same bypass as writing `Raw(table)` inline — with the same audit obligation.
+- Nothing strips it implicitly. A `Raw[T]` is not a `T`, and there is no coercion from one to the other.
 
 ```blink
 fn dynamic_report(table: Str, id: Int) -> Result[Row, DBError] ! DB.Read {
@@ -497,20 +503,35 @@ fn dynamic_report(table: Str, id: Int) -> Result[Row, DBError] ! DB.Read {
 db.query_one("{Raw(whole_query)}")
 ```
 
-`Raw()` usage emits a compiler warning:
+**The audit warning fires where the bypass happens.** A `Raw[T]` folded into a `Template[C]` is the un-parameterized interpolation, and that coercion — and only that coercion — raises `RawBypassesParam`:
 
 ```
-warning[W0310]: Raw() bypasses parameterization
+warning[RawBypassesParam]: Raw() bypasses parameterization
  --> report.bl:3:42
   |
 3 |     db.query_one("SELECT * FROM {Raw(table)} WHERE id = {id}")
-  |                                  ^^^^^^^^^^ concatenated, not parameterized
+  |                                  ^^^^^^^^^^ concatenated into the query text, not parameterized
   |
-  = help: add @trusted(audit: "AUDIT-ID") to suppress this warning
-  = help: use `blink audit --raw-queries` to review all Raw() usage
+  = help: if `table` comes from user input, parameterize it instead: `{table}`
+  = help: if this value is known-safe, record the review:
+          add @trusted(audit: "AUDIT-ID") to the enclosing function
 ```
 
-The warning is suppressed by `@trusted`, creating an auditable trail — the same mechanism used for FFI.
+The warning does **not** fire on an ordinary interpolated string, because an ordinary string contains no `Raw[T]`. That is what making the marker a type buys: the trigger is the value's type, so it is neither defeated by binding the value to a variable first nor raised by a string that merely mentions the word.
+
+`RawBypassesParam` is an **audit-gated** diagnostic: `@trusted(audit: K)` is its only suppression channel, and naming it in `@allow` or in `[lints]` is refused. The mechanism is stated once, for every diagnostic that uses it, in §9.1 *Audit-Gated Diagnostics*.
+
+**A `Raw[T]` in a position that does not consume it is an error.** Because `Raw[T]` has no `Display`, a misplaced `Raw()` would otherwise fall through to `MissingDisplayImpl` (E0523), whose prescribed repairs — derive `Display`, write an `impl`, call `.debug()` — are all impossible on a compiler-known marker type. It gets its own diagnostic instead, whose first repair compiles:
+
+```blink
+// intentional-error example
+fn log_table(table: Str) ! IO {
+    io.println("scanning {Raw(table)}")   // error[RawOutsideTemplate]: a `Raw[T]` reached a
+                                          //   position that does not consume it -- only a
+                                          //   `Template[C]` coercion does
+                                          // help: drop the wrapper: `"scanning {table}"`
+}
+```
 
 **Why `Raw(expr)` instead of format specs or `Template.raw()`:**
 
@@ -537,22 +558,6 @@ fn search(filter: Template[LDAP]) -> Result[List[Entry], LDAPError]
 ```
 
 Each context defines its own reassembly strategy. The developer writes the same interpolation syntax everywhere — the receiving type ensures safety, and the handler decides how to make it safe.
-
-#### `blink audit` Integration
-
-`blink audit --raw-queries` tracks all `Raw()` usage alongside FFI:
-
-```
-$ blink audit --raw-queries
-
-Raw() usage (bypasses parameterization):
-  db/legacy.bl:42    {Raw(table)} in Template[DB]     UNAUDITED
-  db/migration.bl:8  {Raw(name)} in Template[DB]      audit: MIG-001
-
-1 of 2 raw interpolations unaudited.
-```
-
-CI can enforce `blink audit --no-unaudited-raw` to block merges with unreviewed raw queries.
 
 #### Design Rationale
 

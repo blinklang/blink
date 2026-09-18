@@ -87,13 +87,17 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | UnknownType | E0507 | Reference to undefined type | Name resolution | §6.3 |
 | QuestionMarkResultInNonResult | E0508 | `?` on Result in function not returning Result | Type checking | §3c.2 |
 | QuestionMarkOptionInNonOption | E0509 | `?` on Option in function not returning Option | Type checking | §3c.2 |
-| MissingKeywordArg | E0510 | Required keyword argument not supplied at call site | Name resolution | §2 |
-| InvalidKeywordArg | E0511 | Keyword argument name does not match any parameter | Name resolution | §2 |
+| MissingKeywordArg | E0510 | A keyword parameter received no argument at all — the value is absent (contrast `UnlabeledKeywordArg`, where the value is present but unlabelled) | Name resolution | §2.13 |
+| InvalidKeywordArg | E0511 | A call-site label names no keyword parameter of the callee — including a label written on a positional parameter | Name resolution | §2.13 |
 | QuestionMarkErrorMismatch | E0512 | `?` error type mismatch — inner E1 ≠ function return E2 | Type checking | §3c.2 |
 | CoalesceRequiresOption | E0513 | `??` operator used on non-Option value | Type checking | §3c.2 |
 | AmbiguousMethodCall | E0522 | Unqualified method call resolves to a method defined by two or more implemented traits | Name resolution | §3.6 |
 | MissingDisplayImpl | E0523 | Interpolated `{expr}` type does not implement `Display` | Type checking | §3.6 |
 | NoSuchField | E0525 | Field access names a field the struct, tuple, or opaque handle does not declare | Type checking | §3.2 |
+| PositionalAfterKeyword | E0527 | A positional argument follows a labelled one in the same call | Name resolution | §2.13 |
+| DuplicateKeywordArg | E0528 | The same call-site label appears twice in one call | Name resolution | §2.13 |
+| UnlabeledKeywordArg | E0529 | A keyword parameter received its argument positionally — the value is present and unlabelled | Name resolution | §2.13 |
+| RawOutsideTemplate | E0530 | A `Raw[T]` reached a position that does not consume it — only a `Template[C]` coercion does | Type checking | §3b.5 |
 | CloseableEscapesScope | E0601 | `Closeable` value escapes `with...as` scope | Resources | §5.5 |
 | ArenaValueEscapes | E0700 | Arena-scoped value escapes arena scope | Arena | §5.2 |
 | ArenaTypeContainsCycle | E0701 | Type crossing `with arena { }` boundary contains a cycle | Arena | §5.2 |
@@ -113,7 +117,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | PinnedBytesEscape | E0815 | Pinned Bytes receiver escapes its `with_ptr` closure | FFI | §9.1.1 |
 | WithPtrBodyTooComplex | E0816 | `Bytes.with_ptr` body is not a single inlinable expression | FFI | §9.1.1 |
 | BytesPtrCastForbidden | E0817 | Bytes coerced to `Ptr[U8]` outside `with_ptr` | FFI | §9.1.1 |
-| FfiScopeNotWithResource | E0819 | `ffi.scope()` bound directly instead of via `with ... as` (allocations would never be freed) | FFI | §9.1.1 |
+| FfiScopeNotWithResource | E0819 | An `FfiScope` value occurs somewhere other than as a `with ... as` resource — bound by `let`, passed, returned, stored, or written as a type argument (its libc arena would never be freed) | FFI | §9.1.1 |
 | MissingNativeDep | E0820 | `@ffi` references undeclared native dependency | FFI | §9.2.1 |
 | NativeDepUnavailableCrossTarget | E0821 | Native dependency unavailable for cross-target | FFI | §9.2.1 |
 | FfiOffsetUnknownStride | E0822 | `Ptr.offset` requires `@ffi.struct` element type | FFI | §9.1.1 |
@@ -125,6 +129,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | AssertPanicsOutsideTest | E0833 | `assert_panics` called outside a test | Test runner | §2.20 |
 | AssertPanicsNestedExpectPanic | E0834 | `assert_panics` nested inside another `assert_panics` | Test runner | §2.20 |
 | XfailMissingReason | E0835 | `test.failing(...)` missing or empty `reason:`/`ticket:` | Type checking | §8.10.6 |
+| TrustedRequiresAudit | E0836 | `@trusted` written without a non-empty `audit:` identifier | FFI | §9.1 |
 | TraitContractMissingMethod | E0900 | Trait contract: required method not implemented | Trait contract | §3.6 |
 | TraitContractWrongArity | E0901 | Trait contract: method has wrong argument arity | Trait contract | §3.6 |
 | TraitContractParamMismatch | E0902 | Trait contract: method parameter type mismatch | Trait contract | §3.6 |
@@ -178,7 +183,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 
 | Name | Code | One-line | Category | Spec ref |
 |------|------|----------|----------|----------|
-| RawBypassesParam | W0310 | `Raw()` bypasses query parameterization | Contracts | §3b.5 |
+| RawBypassesParam | W0310 | A `Raw[T]` was folded into a `Template[C]`, bypassing query parameterization. Audit-gated: `@trusted(audit: K)` is its only suppression channel — `@allow` and `[lints]` are refused | Contracts | §3b.5 |
 | UnknownMethod | W0501 | Method name resolves to nothing and the receiver's type is not known at the call | Method resolution | §3c.4 |
 | IncompleteStateRestore | W0550 | Speculative lookahead saves some but not all written bindings | Mutation analysis | §4.16 |
 | UnrestoredMutation | W0551 | Function writes module-level state without restoring it in a speculative context | Mutation analysis | §4.16 |
@@ -191,7 +196,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | ArenaEffectRedundant | W0701 | `! Arena` on a function where every Arena call is already inside `with arena { }` | Arena | §5.2 |
 | BitwisePrecedence | W0702 | Bitwise `&`/`|` mixed with comparison without parentheses | Linting | §6 |
 | OverrideOfDeprecatedDefault | W0731 | `impl` overrides a trait default marked `@deprecate_override` | Trait sealing | §3.6 |
-| UnauditedFfi | W0800 | Unaudited foreign function call | FFI | §9.1 |
+| UnauditedFfi | W0800 | Unaudited foreign function call. Audit-gated: `@trusted(audit: K)` is its only suppression channel — `@allow` and `[lints]` are refused | FFI | §9.1 |
 | MissingCanonicalHeader | W0812 | `@ffi.struct` header not declared in blink.toml | FFI | §9.2.1 |
 | DeprecatedUsage | W2000 | Use of an item annotated `@deprecated` | Linting | §6 |
 
