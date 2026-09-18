@@ -33,6 +33,14 @@ if d.declined {
     diag_ice("LayoutDeclined", why)
 }
 EOF
+  # Two lines lifted from the real files, so the row regexes are proven against
+  # the spellings they exist to count and not against invented text.
+  cat > "$dir/src/cg_call.bl" <<'EOF'
+if method == "connect" { return cc_build_call(node) }
+EOF
+  cat > "$dir/src/typecheck.bl" <<'EOF'
+let mut named_type_map: Map[Str, Int] = Map()
+EOF
   : > "$dir/Taskfile.yml"
 }
 
@@ -65,6 +73,54 @@ check_row() {
 check_row pub_let_mut              codegen.bl   'pub let mut other_global2: Int = 0'
 check_row br_ids_in_source         codegen.bl   '// also see br xyz987'
 check_row layout_decline_unhandled cname.bl     'let swallowed = d.decline_reason'
+
+# The two name-keyed rows. A plain "the script failed" check would pass if some
+# other row rose instead, so these also read back which row carries the UP mark.
+check_named_row() {
+  row="$1"; file="$2"; extra="$3"
+  d="$WORK/named_$row"
+  rm -rf "$d"
+  cp -r "$BASE" "$d"
+  printf '%s\n' "$extra" >> "$d/src/$file"
+  out=$(RATCHET_SRC_DIR="$d" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh 2>&1)
+  if [ $? = 0 ]; then
+    echo "FAIL $row: a +1 on this row did not fail ratchet.sh"
+    fail=1
+  elif ! printf '%s\n' "$out" | rg -q "^$row .*UP\\(baseline\\).*UP\\(head~1\\)"; then
+    echo "FAIL $row: the run failed, but not on the row under test"
+    printf '%s\n' "$out"
+    fail=1
+  else
+    echo "PASS $row: +1 correctly failed ratchet.sh on this row"
+  fi
+}
+
+check_named_row cg_name_string_compares cg_call.bl \
+  'if method == "isatty" { return cc_build_call(node) }'
+
+# A compare in a sibling codegen file must count too: the row is scoped to the
+# whole surface so a ladder moved out of cg_call.bl cannot read as a deletion.
+# cg_expr.bl is absent from the fixture, so the append creates it.
+check_named_row cg_name_string_compares cg_expr.bl \
+  'if name == "read_file" { return c_runtime_helper("read_file") }'
+
+# Not pub, so only this row moves; a pub table would also raise pub_let_mut and
+# the run would fail for two reasons at once.
+check_named_row typecheck_str_keyed_tables typecheck.bl \
+  'let mut tc_new_fact_table: Map[Str, List[Int]] = Map()'
+
+# An indented table is a function local, not a module-scope fact table, so the
+# row must not count it. Without this the regex could be a bare substring match.
+NOLOCAL="$WORK/no_local_table"
+rm -rf "$NOLOCAL"
+cp -r "$BASE" "$NOLOCAL"
+printf '%s\n' '    let mut inside_a_fn: Map[Str, Int] = Map()' >> "$NOLOCAL/src/typecheck.bl"
+if ! RATCHET_SRC_DIR="$NOLOCAL" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > /dev/null 2>&1; then
+  echo "FAIL typecheck_str_keyed_tables-local: an indented (function-local) table was counted as a module-scope one"
+  fail=1
+else
+  echo "PASS typecheck_str_keyed_tables-local: a function-local table is not counted"
+fi
 
 # A decline read whose ICE sits four lines away is unhandled: the window is
 # the same line plus the next three, so this must count.
