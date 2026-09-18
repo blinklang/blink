@@ -81,7 +81,7 @@ trap 'rm -f "$all" "$ex"' EXIT
 # the remaining groups would still report ok. The test runs before the list is
 # built, because an exit inside a pipeline exits the pipeline and not this
 # script.
-patterns='tests/test_cg_*.bl tests/test_layout_*.bl tests/test_cname_*.bl tests/test_ir_*.bl tests/test_mono_*.bl tests/test_diagnostics_*.bl tests/test_unparse_*.bl'
+patterns='tests/test_cg_*.bl tests/test_layout_*.bl tests/test_cname_*.bl tests/test_ir_*.bl tests/test_mono_*.bl tests/test_diagnostics_*.bl tests/test_unparse_*.bl tests/test_ast_*.bl'
 for pat in $patterns; do
     if ! compgen -G "$pat" >/dev/null; then
         echo "rewrite-suite: ERROR no file matches $pat" >&2
