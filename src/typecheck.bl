@@ -51,7 +51,7 @@ import diagnostics.{
     UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE,
     BITWISE_PRECEDENCE, UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
     NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, UNKNOWN_DERIVE_NAME,
-    NO_SUCH_FIELD,
+    NO_SUCH_FIELD, OVERLAPPING_IMPLS,
 }
 
 effect TypeCheck {
@@ -8875,6 +8875,163 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
             }
         }
         ii = ii + 1
+    }
+    tc_check_impl_overlap(impls_sl)
+}
+
+// The bounds an impl puts on its binders, as one string, so two impls can be compared
+// without deciding what a bound means. Equal strings describe the same set of receivers;
+// different strings may or may not, which is why only equal ones are read as overlapping.
+fn tc_impl_bounds_signature(im: Int) -> Str {
+    let wb = node_impl_where_bounds(im)
+    if wb == -1 { return "" }
+    let mut parts: List[Str] = []
+    let mut i = 0
+    while i < sublist_length(wb) {
+        let cons = sublist_get(wb, i)
+        let bounds = node_elements(cons)
+        let mut j = 0
+        while bounds != -1 && j < sublist_length(bounds) {
+            parts.push("{node_name(cons)}:{strip_module_qualifier(node_name(sublist_get(bounds, j)))}")
+            j = j + 1
+        }
+        i = i + 1
+    }
+    parts.join(",")
+}
+
+// The trait a pair of impls must share before either could answer for the other's
+// receiver, written with its type arguments: `Into[Str]` and `Into[Int]` are two traits
+// here, and an impl of one never answers a call on the other.
+fn tc_impl_trait_key(im: Int) -> Str {
+    let args = node_type_params(im)
+    let mut names: List[Str] = []
+    let mut i = 0
+    while args != -1 && i < sublist_length(args) {
+        names.push(node_name(sublist_get(args, i)))
+        i = i + 1
+    }
+    "{node_trait_name(im)}[{names.join(",")}]"
+}
+
+// Does `poly` also answer for the receiver `concrete` writes? The two headers are read
+// against each other rather than through the receiver's type id, because a builtin
+// container carries its arguments as children and not as struct parameters, so the
+// instance walk written for a generic struct answers nothing about a List. Each of the
+// poly impl's receiver arguments must be one of its own binders, which is the shape whose
+// binding is a lookup; any other shape is left undecided. sections/03_types.md:2540 then
+// turns on the bounds: `impl[T] .. where T: Bound` overlaps `impl .. for C[Int]` exactly
+// when Int satisfies the bound.
+fn tc_poly_impl_answers_for(poly: Int, concrete: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    if tc_impl_target_name(poly) != tc_impl_target_name(concrete) { return 0 }
+    let n = tc_impl_recv_arity(poly)
+    if n == 0 || n != tc_impl_recv_arity(concrete) { return 0 }
+    let poly_args = node_recv_type_args(poly)
+    let conc_args = node_recv_type_args(concrete)
+    let binders = node_impl_binders(poly)
+    let mut binds: Map[Str, Int] = Map()
+    let mut decided = 1
+    let saved = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    let mut i = 0
+    while i < n {
+        let pname = node_name(sublist_get(poly_args, i))
+        if impl_binder_declared(binders, pname) == 0 {
+            decided = 0
+        } else {
+            binds.insert(pname, resolve_type_ann(sublist_get(conc_args, i)))
+        }
+        i = i + 1
+    }
+    tc_suppress_ann_validation = saved
+    if decided == 0 { return 0 }
+    tc_bounds_definitely_hold(poly, binds)
+}
+
+// Do every one of the impl's where-bounds definitely hold for these bindings? The reader
+// next door answers the opposite question and fails open, because a bound it can not model
+// must not reject a program. Here an unmodelled bound must not report one either, so only
+// a bound tc_type_satisfies_bound answers 1 for counts, and anything less leaves the pair
+// undecided.
+fn tc_bounds_definitely_hold(im: Int, binds: Map[Str, Int]) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let wb = node_impl_where_bounds(im)
+    if wb == -1 { return 1 }
+    let mut i = 0
+    while i < sublist_length(wb) {
+        let cons = sublist_get(wb, i)
+        let concrete = binds.get(node_name(cons)) ?? -1
+        if concrete < 0 { return 0 }
+        let bounds = node_elements(cons)
+        let mut j = 0
+        while bounds != -1 && j < sublist_length(bounds) {
+            let trait_name = strip_module_qualifier(node_name(sublist_get(bounds, j)))
+            if tc_type_satisfies_bound(concrete, trait_name) != 1 { return 0 }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    1
+}
+
+// Could both impls match one type? Answers only where the question is decidable, because
+// a wrong yes rejects a program the spec allows.
+//   concrete + concrete → the same receiver type.
+//   poly + concrete     → the poly impl answers for the concrete receiver.
+//   poly + poly         → the same container and arity under the same bounds; two
+//                         different bound sets are left alone, as no witness is at hand.
+fn tc_impls_overlap(a: Int, b: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let a_poly = tc_impl_is_poly(a)
+    let b_poly = tc_impl_is_poly(b)
+    if a_poly == 0 && b_poly == 0 {
+        let a_recv = tc_impl_recv_tid(a)
+        let b_recv = tc_impl_recv_tid(b)
+        if a_recv < 0 || b_recv < 0 { return 0 }
+        return if tc_tid_same_type(a_recv, b_recv) { 1 } else { 0 }
+    }
+    if a_poly != 0 && b_poly != 0 {
+        if tc_impl_target_name(a) != tc_impl_target_name(b) { return 0 }
+        if tc_impl_recv_arity(a) != tc_impl_recv_arity(b) { return 0 }
+        return if tc_impl_bounds_signature(a) == tc_impl_bounds_signature(b) { 1 } else { 0 }
+    }
+    let poly = if a_poly != 0 { a } else { b }
+    let concrete = if a_poly != 0 { b } else { a }
+    tc_poly_impl_answers_for(poly, concrete)
+}
+
+fn tc_impl_is_poly(im: Int) -> Int {
+    let binders = node_impl_binders(im)
+    if binders != -1 && sublist_length(binders) > 0 { 1 } else { 0 }
+}
+
+fn tc_impl_recv_arity(im: Int) -> Int {
+    let args = node_recv_type_args(im)
+    if args == -1 { 0 } else { sublist_length(args) }
+}
+
+// sections/03_types.md "No Impl Overlap": if two impls could both match a given type the
+// compiler rejects the program, because there is no specialization to choose between them.
+// Reported on the later impl, which is the one the author can delete.
+fn tc_check_impl_overlap(impls_sl: Int) ! TypeCheck.Resolve, Diag.Report {
+    let n = sublist_length(impls_sl)
+    let mut i = 0
+    while i < n {
+        let later = sublist_get(impls_sl, i)
+        if is_trait_name(node_trait_name(later)) != 0 {
+            let key = tc_impl_trait_key(later)
+            let mut j = 0
+            while j < i {
+                let earlier = sublist_get(impls_sl, j)
+                if tc_impl_trait_key(earlier) == key {
+                    if tc_impls_overlap(earlier, later) != 0 {
+                        let what = tc_impl_target_name(later)
+                        diag_error_at("OverlappingImpls", OVERLAPPING_IMPLS, "impl of '{node_trait_name(later)}' for '{what}' overlaps an earlier impl; Blink does not support specialization", later, "keep one impl, or wrap one receiver in a newtype so the two impls answer for types that share no instance")
+                        break
+                    }
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
     }
 }
 
