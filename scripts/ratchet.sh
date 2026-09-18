@@ -19,6 +19,21 @@
 #   layout_decline_unhandled a layout decline read outside layout.bl that no
 #                            diag_ice within the next three lines turns into
 #                            an ICE (a swallowed decline is a guessed answer)
+#   cg_name_string_compares  dispatch keyed on a spelled-out method or fn name:
+#                            `\b(method|name)\s*==\s*"` anywhere in src/cg_*.bl.
+#                            The rewrite answers these from a tid, so every one
+#                            left is a question asked of a string. Scoped to the
+#                            whole codegen surface rather than to cg_call.bl,
+#                            where all but six of them sit today: a row that
+#                            counts one file pays a ladder moved to a sibling as
+#                            a deletion, and the debt would read as repaid for
+#                            having been relocated
+#   typecheck_str_keyed_tables
+#                            module-scope Map[Str, _] fact tables in
+#                            src/typecheck.bl: `^(pub )?let mut <name>: Map[Str`.
+#                            A fact filed under a spelled name is a fact the tid
+#                            cannot answer, and each table is a second place for
+#                            a type to be described
 #
 # After its own rows, this script runs scripts/lint_codegen.sh, the L1-L11
 # lint over the rewrite's files, and fails if that fails. RATCHET_NO_LINT=1
@@ -103,12 +118,16 @@ decline_unhandled() {
 compute_rows() {
   root="$1"
   allbl="$root/src/*.bl"
+  cgbl="$root/src/cg_*.bl"
+  tcbl="$root/src/typecheck.bl"
   tf="$root/Taskfile.yml"
 
   cat <<ROWS
 br_ids_in_source $(( $(cnt '\bbr [0-9a-z]{6}\b' "$allbl $tf") + $(cnt '\b(g3sba0|qf1vzx|0kpmac)\b' "$allbl $tf") ))
 pub_let_mut $(cnt '^pub let mut' "$allbl")
 layout_decline_unhandled $(decline_unhandled "$root")
+cg_name_string_compares $(cnt '\b(method|name)\s*==\s*"' "$cgbl")
+typecheck_str_keyed_tables $(cnt '^(pub )?let mut [A-Za-z_][A-Za-z_0-9]*: Map\[Str' "$tcbl")
 ROWS
 }
 

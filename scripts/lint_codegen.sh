@@ -184,13 +184,15 @@ compute_rows() {
         done
     done
 
-    # L8: import DAG. The layout/cname edges belong to scripts/lint_import_dag.sh
-    # (and the printer's to scripts/lint_print_imports.sh once it exists);
-    # their violation lines count here. Both need the modules present.
+    # L8: import DAG. The layout/cname/unparse edges belong to
+    # scripts/lint_import_dag.sh (and the printer's to
+    # scripts/lint_print_imports.sh once it exists); their violation lines count
+    # here. That script checks each module it governs on its own and says so when
+    # one is absent, so nothing is gated on a module being present: a guard here
+    # would skip every rule in the file for the want of one of them.
     : > "$det/import_dag.txt"
     for dag in scripts/lint_import_dag.sh scripts/lint_print_imports.sh; do
         [ -x "$dag" ] || continue
-        [ -f "$root/src/layout.bl" ] && [ -f "$root/src/cname.bl" ] || continue
         LINT_SRC_DIR="$root/src" "./$dag" 2>/dev/null | grep -E 'must (not )?import' >> "$det/import_dag.txt" || true
     done
     for f in "$@"; do

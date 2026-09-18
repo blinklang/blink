@@ -1,0 +1,86 @@
+// sections/03_types.md:1184 — an enum is nominally distinct from `Int`, and matching an
+// `Int` scrutinee against enum-variant patterns is the pattern-side dual of that rule and
+// likewise ill-typed. The spec stages enforcement behind "the compiler's internal
+// `kind: Int -> NodeKind` representation migration". node_kind_name was the last site that
+// migration was waiting on: it took a raw `Int` and matched it against `NodeKind.*` arms,
+// so the match was ill-typed by the rule above and, worse, silently non-exhaustive — a
+// kind added without a spelling fell through to the catch-all instead of failing to
+// compile. typecheck.bl's TyKind comment already names this function as the trap.
+//
+// The spelling now lives in nk_name, which takes a NodeKind, so the kind set is enumerated
+// in one place that cannot drift. node_kind_name stays the Int-facing bridge for callers
+// that hold a stored tag: it crosses to NodeKind through nk_of and then asks nk_name.
+//
+// Acceptance is unchanged for every caller. These rows pin that: same answer for every tag
+// in range, same "Unknown" outside it.
+import std.io
+import ast.{NodeKind, NK_ALL, nk_of, nk_tag, nk_name, node_kind_name}
+
+fn fail(label: Str, got: Str, want: Str) {
+    io.println("FAIL: {label}: answered '{got}', want '{want}'")
+}
+
+// The first tag whose two spellings disagree, or -1 when they agree everywhere. Reported as
+// a tag rather than asserted per-row so one drifted kind names itself.
+fn first_disagreeing_tag() -> Int {
+    let mut t = 0
+    while t < NK_ALL.len() {
+        if node_kind_name(t) != nk_name(nk_of(t)) { return t }
+        t = t + 1
+    }
+    -1
+}
+
+// The first kind nk_name leaves unspelled, or -1 when every kind has its own name. An arm
+// that fell through to a shared catch-all would show up here as a repeat.
+fn first_unspelled_tag() -> Int {
+    let mut t = 0
+    while t < NK_ALL.len() {
+        let n = nk_name(nk_of(t))
+        if n == "" || n == "Unknown" { return t }
+        let mut u = 0
+        while u < t {
+            if nk_name(nk_of(u)) == n { return t }
+            u = u + 1
+        }
+        t = t + 1
+    }
+    -1
+}
+
+test "every NodeKind spells its own name, so no kind shares an arm" {
+    let t = first_unspelled_tag()
+    if t >= 0 { fail("tag {t}", nk_name(nk_of(t)), "a name of its own") }
+    assert(t == -1)
+}
+
+test "the Int-facing bridge answers what the kind-facing speller answers" {
+    let t = first_disagreeing_tag()
+    if t >= 0 { fail("tag {t}", node_kind_name(t), nk_name(nk_of(t))) }
+    assert(t == -1)
+}
+
+test "KindCount is spelled, because it is a tag the bridge can be handed" {
+    let got = nk_name(NodeKind.KindCount)
+    if got != "KindCount" { fail("KindCount", got, "KindCount") }
+    assert(got == "KindCount")
+}
+
+// Out of range is not a kind, so the bridge cannot name one. It says so rather than
+// answering a plausible-wrong kind.
+// KindCount's own tag is inside the set the bridge accepts: nk_bridge_gap hands it around
+// as the count of real kinds, so a caller can hold it.
+test "the tag one past the last real kind is still named" {
+    let got = node_kind_name(nk_tag(NodeKind.KindCount))
+    if got != "KindCount" { fail("KindCount tag", got, "KindCount") }
+    assert(got == "KindCount")
+}
+
+test "a tag outside the kind set is not named" {
+    let below = node_kind_name(0 - 1)
+    if below != "Unknown" { fail("tag -1", below, "Unknown") }
+    assert(below == "Unknown")
+    let above = node_kind_name(nk_tag(NodeKind.KindCount) + 1)
+    if above != "Unknown" { fail("tag past the end", above, "Unknown") }
+    assert(above == "Unknown")
+}
