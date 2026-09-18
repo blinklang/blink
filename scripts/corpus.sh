@@ -13,7 +13,7 @@
 #
 # Env:
 #   CORPUS_COMPILER  dir holding blink/blinkc/libblink_std.* (default build/gen1)
-#   CORPUS_JOBS      parallel workers (default: nproc)
+#   CORPUS_JOBS      parallel workers (default: nproc/2, minimum 1)
 #   CORPUS_OUT       output JSON (default build/corpus.json)
 #
 # --only <list file> restricts the run to the files named in the list (one
@@ -33,7 +33,17 @@ while [ $# -gt 0 ]; do
 done
 
 comp="${CORPUS_COMPILER:-build/gen1}"
-jobs="${CORPUS_JOBS:-$(nproc 2>/dev/null || echo 8)}"
+# Half the cores by default: the sweep forks timeout -> blink -> cc per file,
+# so a full-width run saturates the machine and starves everything else.
+default_jobs=$(( $(nproc 2>/dev/null || echo 8) / 2 ))
+[ "$default_jobs" -lt 1 ] && default_jobs=1
+jobs="${CORPUS_JOBS:-$default_jobs}"
+
+# Boehm sizes its marker pool from the machine, not from this worker count, so
+# every worker starts ~one marker per core and the sweep oversubscribes by that
+# factor. Parallel marking also spends about twice the CPU to halve the wall
+# time of one file, which is a loss when the win we want is sweep throughput.
+export GC_MARKERS="${GC_MARKERS:-1}"
 if [ -n "$only" ]; then
     out="${CORPUS_OUT:-build/corpus_subset.json}"
 else
