@@ -751,6 +751,47 @@ transfer(300, to: bob, from: alice)  // valid, same as above
 - Labels are **call-site sugar** — the function type is `fn(Int, Account, Account)` regardless of `--`. Closures, trait impls, and higher-order functions are unaffected. See [3.3](#33-type-inference).
 - The formatter enforces declaration order at call sites for consistency
 
+**Both rules are enforced by `blink check`.** A label written on a positional parameter is rejected, and a keyword parameter supplied without its label is rejected. Neither rule is a style preference, and neither is left to the formatter. The separator exists to make the swap in `transfer(300, bob, alice)` impossible; a rule the checker does not enforce makes nothing impossible, and a normative sentence the compiler does not hold up teaches a calling discipline that does not exist.
+
+**Where a label resolves.** A call-site label resolves in the callee's **keyword-parameter namespace** — the parameters declared after `--`, and nothing else. This rule governs calls to functions and to methods. A label in a variant-payload application or a struct literal names a **field**, not a parameter, and is outside this rule; the rule governing those labels is stated separately.
+
+**Extent of enforcement.** The rule is stated for every call against a declared `fn` signature, **method calls included**. Where the compiler's keyword-argument check is not reachable from a call path, the rule is not yet enforced on that path. That is an implementation gap, not a narrower rule: a rule that held for `f(x: 1)` and not for `b.f(x: 1)` would select two behaviours by the receiver's spelling, and making the check reachable from every call path is a prerequisite for this section to be true as written.
+
+#### Call-Site Diagnostics
+
+Five codes divide the call-site label rules. Each names a distinct mistake, and each has a distinct repair — which is why they are five codes and not one (§3.1 *Diagnostic Discipline*: diagnostics converge on a code when they converge on a repair).
+
+| Code | Fires when | First repair |
+|------|-----------|--------------|
+| `MissingKeywordArg` (E0510) | A keyword parameter received no argument at all | Supply the argument, labelled |
+| `UnlabeledKeywordArg` (E0529) | A keyword parameter received its argument **positionally** | Label the argument already written |
+| `InvalidKeywordArg` (E0511) | A label names no keyword parameter of the callee | Correct the label to one the signature declares |
+| `PositionalAfterKeyword` (E0527) | A positional argument follows a labelled one | Move it before the first label |
+| `DuplicateKeywordArg` (E0528) | The same label appears twice in one call | Delete the repeated argument |
+
+```blink
+fn transfer(amount: Int, -- from: Account, to: Account) -> Int { amount }
+
+// intentional-error examples -- each line is rejected, under the code named
+transfer(300, alice, bob)                       // error[UnlabeledKeywordArg]: `from` and `to` are
+                                                //   keyword parameters
+                                                // help: label the arguments:
+                                                //   `transfer(300, from: alice, to: bob)`
+
+transfer(300, frm: alice, to: bob)              // error[InvalidKeywordArg]: `frm` names no keyword
+                                                //   parameter of `transfer`
+                                                // help: the keyword parameters are `from` and `to`
+
+transfer(300, from: alice, bob)                 // error[PositionalAfterKeyword]
+
+transfer(300, from: alice, from: bob)           // error[DuplicateKeywordArg]
+
+transfer(amount: 300, from: alice, to: bob)     // error[InvalidKeywordArg]: `amount` is positional
+                                                //   help: pass it without a label
+```
+
+`UnlabeledKeywordArg` and `MissingKeywordArg` fire on opposite conditions and must not be confused: the first means *the value is present and unlabelled*, the second means *the value is absent*. `MissingKeywordArg`'s repair inserts an argument; `UnlabeledKeywordArg`'s repair annotates one that is already written, which makes it the only code of the five whose fix is machine-applicable — the parameter names and their positions are both known, and the edit needs nothing from the author's intent.
+
 **Panel vote: `--` separator won 3-1-1** (3 for `--`, 1 for `;`, 1 for `*`). Labels as call-site sugar (not part of type signature): **5-0 unanimous**. See [DECISIONS.md](../DECISIONS.md).
 
 #### Why `--`
