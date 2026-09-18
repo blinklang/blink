@@ -1,0 +1,68 @@
+// A type the runtime defines but no module in this program declares still reaches
+// codegen. `process_run` answers ProcessResult whether or not the file writes
+// `import std.process`, and typecheck mints that tid on the spot. Every reader past
+// typecheck -- layout for the shape, cname for the symbol -- reaches a struct through
+// its declaration node, so a tid minted without one has no C answer and the backend
+// reports an internal error against the call site.
+//
+// The rows walk both states of the same type: minted because nothing declared it, and
+// found because lib/std declared it. The second row is what keeps the fix honest -- a
+// synthesized declaration that also fires where a real one exists would make the name
+// ambiguous and lose the real one.
+
+import typecheck.{check_types, lookup_named_type, tc_tid_decl_node, DECL_NODE_AMBIGUOUS}
+import compiler.{compile_to_program}
+import diagnostics.{diag_reset}
+import cname.{c_mono_type_c_name}
+import std.io
+
+fn compile_only(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    let _rm = process_run("rm", ["-f", path])
+    check_types(program)
+}
+
+fn assert_has_decl(label: Str, tname: Str) {
+    let tid = lookup_named_type(tname)
+    if tid < 0 {
+        io.println("FAIL: {label}: typecheck knows no type named '{tname}'")
+    }
+    assert(tid >= 0)
+    let decl = tc_tid_decl_node(tid)
+    if decl == DECL_NODE_AMBIGUOUS {
+        io.println("FAIL: {label}: '{tname}' resolves to two declarations")
+    }
+    assert(decl != DECL_NODE_AMBIGUOUS)
+    if decl < 0 {
+        io.println("FAIL: {label}: '{tname}' (tid {tid}) has no declaration node")
+    }
+    assert(decl >= 0)
+}
+
+// Which blink_ name cname picks depends on a marking pass layout runs later, so the claim
+// here is only that cname has an answer at all: an identifier, not a refusal segment.
+fn assert_c_name_is_an_identifier(label: Str, tname: Str) {
+    let tid = lookup_named_type(tname)
+    assert(tid >= 0)
+    let got = c_mono_type_c_name(tid)
+    if !got.starts_with("blink_") {
+        io.println("FAIL: {label}: cname refused '{tname}' with {got}")
+    }
+    assert(got.starts_with("blink_"))
+}
+
+test "a runtime-backed type minted for a builtin return carries a declaration" {
+    compile_only("rt_backed_minted", "fn main() \{\n    let r = process_run(\"echo\", [\"hi\"])\n    io.println(\"\{r.exit_code}\")\n}\n")
+    assert_has_decl("process_run return", "ProcessResult")
+    assert_c_name_is_an_identifier("process_run return", "ProcessResult")
+}
+
+test "the declaration lib/std writes still answers alone when the module is imported" {
+    compile_only("rt_backed_declared", "import std.process\n\nfn main() \{\n    let r = process_run(\"echo\", [\"hi\"])\n    io.println(\"\{r.exit_code}\")\n}\n")
+    assert_has_decl("imported ProcessResult", "ProcessResult")
+    assert_c_name_is_an_identifier("imported ProcessResult", "ProcessResult")
+}
