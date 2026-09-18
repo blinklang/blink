@@ -347,6 +347,11 @@ pub let mut diag_source_file: Str = ""
 pub let mut diag_count: Int = 0
 pub let mut diag_warn_count: Int = 0
 pub let mut diag_ice_count: Int = 0
+// How many internal errors were RENDERED, which is what the summary line reports. It
+// differs from diag_ice_count whenever one fault is reported more than once: the count a
+// caller reads to decide whether a result is usable must move on every report, and a
+// reader must still be shown the fault once.
+let mut diag_ice_rendered: Int = 0
 pub let mut diag_module_files: Map[Str, Str] = Map()
 
 pub fn diag_register_file_range(start: Int, end: Int, path: Str) {
@@ -456,6 +461,9 @@ pub fn diag_entry_count() -> Int {
 // Roll back every diagnostic emitted after the first `n` entries. Used by
 // the parser to collapse an error cascade (e.g. an unparseable string
 // interpolation) into a single focused diagnostic.
+// An internal error counts per report and renders once, so rolling back its entry gives
+// back one count and leaves any suppressed repeat counted. The parser collapses parse
+// cascades, which are errors, so nothing rolls back an internal error today.
 pub fn diag_truncate(n: Int) {
     while diag_entries.len() > n {
         let d = diag_entries.pop().unwrap()
@@ -469,6 +477,7 @@ pub fn diag_truncate(n: Int) {
             diag_warn_count = diag_warn_count - 1
         } else if d.severity == "ice" {
             diag_ice_count = diag_ice_count - 1
+            diag_ice_rendered = diag_ice_rendered - 1
         }
     }
 }
@@ -589,6 +598,12 @@ fn diag_emit_range_notes(severity: Str, name: Str, code: Str, message: Str, line
         return
     }
     let dkey = "{effective_severity}|{code}|{diag_source_file}|{line}|{col}|{message}"
+    // An internal error counts every time it is reported, before the repeat is dropped.
+    // A caller reads the count to decide whether what a stage handed back is usable, and
+    // two emits of one program raise the same fault at the same place, so a count of
+    // distinct reports goes flat on the second and the caller accepts a unit with a body
+    // missing. Suppressing the repeat stays a rendering rule: the reader still sees it once.
+    if effective_severity == "ice" { diag_ice_count = diag_ice_count + 1 }
     if diag_seen.contains_key(dkey) != 0 {
         return
     }
@@ -604,9 +619,11 @@ fn diag_emit_range_notes(severity: Str, name: Str, code: Str, message: Str, line
     } else if effective_severity == "warning" {
         diag_warn_count = diag_warn_count + 1
     } else if effective_severity == "ice" {
-        diag_ice_count = diag_ice_count + 1
+        diag_ice_rendered = diag_ice_rendered + 1
     }
 }
+
+pub fn diag_ice_rendered_count() -> Int { diag_ice_rendered }
 
 // ── JSON string escaping ─────────────────────────────────────────────
 
@@ -648,8 +665,11 @@ pub fn diag_flush() ! Diag.Report {
     if diag_format == 1 {
         // no summary in json mode
     } else {
-        if diag_ice_count > 0 {
-            io.eprintln("{diag_ice_count} internal compiler error(s)")
+        // The summary counts what was printed, not what was reported: a repeat is dropped
+        // from the listing above, so counting reports here would name a number the reader
+        // can not find.
+        if diag_ice_rendered > 0 {
+            io.eprintln("{diag_ice_rendered} internal compiler error(s)")
         }
         if diag_count > 0 {
             io.eprintln("{diag_count} error(s) found")
@@ -776,6 +796,7 @@ pub fn diag_reset() {
     diag_count = 0
     diag_warn_count = 0
     diag_ice_count = 0
+    diag_ice_rendered = 0
     diag_module_files.clear()
     file_ranges.clear()
     lint_overrides.clear()
