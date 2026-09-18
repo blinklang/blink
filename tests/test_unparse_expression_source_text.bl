@@ -1,0 +1,137 @@
+// Rebuilding the source text of an expression, which is what a failing assert reports.
+//
+// Every golden here is the text a released build already prints for the same condition,
+// read out of the __blink_assert_fail_intro call it emits. That is the contract: this
+// rebuilder replaces that text, so it has to write the same thing.
+//
+// The parentheses rows carry the weight. The parser keeps no grouping node, so a pair is
+// written back only where precedence would otherwise change the reading -- `1 + (2 * 3)`
+// comes back as `1 + 2 * 3`, and `(1 + 2) * 3` keeps its pair. The idempotency row closes
+// the loop from the other side: text that parses and unparses to itself has neither lost
+// a pair nor invented one.
+
+import compiler.{compile_to_program}
+import parser.{node_count, node_kind, node_name, node_value}
+import ast.{NodeKind, nk_of}
+import unparse.{unparse_expr}
+import diagnostics.{diag_reset, diag_ice_count}
+import std.io
+
+// The node pool grows across probes and every probe binds this same name, so an earlier
+// probe's binding would answer for a later one. The last one written is this probe's.
+fn last_binding_value(name: Str) -> Int {
+    let mut i = node_count() - 1
+    while i >= 0 {
+        if nk_of(node_kind(i)) == NodeKind.LetBinding && node_name(i) == name { return node_value(i) }
+        i = i - 1
+    }
+    -1
+}
+
+fn expr_node(stem: Str, text: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    write_file(path, "fn main() \{\n    let _unparse_subject = {text}\n}\n")
+    let program = compile_to_program(path, 1)
+    let _rm = process_run("rm", ["-f", path])
+    let n = last_binding_value("_unparse_subject")
+    if n < 0 { io.println("FAIL: probe '{text}' bound no subject") }
+    assert(n >= 0)
+    n
+}
+
+fn assert_unparses(stem: Str, written: Str, want: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
+    let got = unparse_expr(expr_node(stem, written))
+    if got != want {
+        io.println("FAIL: '{written}' unparsed to '{got}', want '{want}'")
+    }
+    assert(got == want)
+}
+
+fn assert_round_trips(stem: Str, written: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
+    let once = unparse_expr(expr_node(stem, written))
+    let twice = unparse_expr(expr_node("{stem}_again", once))
+    if once != twice {
+        io.println("FAIL: '{written}' unparsed to '{once}', which unparsed to '{twice}'")
+    }
+    assert(once == twice)
+}
+
+test "a literal reads back as it was written" {
+    assert_unparses("u_int", "42", "42")
+    assert_unparses("u_float", "1.5", "1.5")
+    assert_unparses("u_true", "true", "true")
+    assert_unparses("u_false", "false", "false")
+    assert_unparses("u_char", "'a'", "'a'")
+    assert_unparses("u_str", "\"hi\"", "\"hi\"")
+}
+
+test "an interpolated string keeps its holes" {
+    assert_unparses("u_interp", "\"v\{1 + 2}w\"", "\"v\{1 + 2}w\"")
+}
+
+test "an identifier reads back as its name" {
+    assert_unparses("u_ident", "some_name", "some_name")
+}
+
+test "a binary operator keeps its operands in order" {
+    assert_unparses("u_add", "1 + 2", "1 + 2")
+    assert_unparses("u_cmp", "1 + 2 == 3", "1 + 2 == 3")
+    assert_unparses("u_and", "true && false", "true && false")
+}
+
+test "a unary operator prefixes its operand" {
+    assert_unparses("u_neg", "-x", "-x")
+    assert_unparses("u_not", "!flag", "!flag")
+    assert_unparses("u_bnot", "~n", "~n")
+}
+
+test "a call keeps its callee and its argument list" {
+    assert_unparses("u_call0", "f()", "f()")
+    assert_unparses("u_call2", "g(1, 2)", "g(1, 2)")
+}
+
+test "a method call keeps its receiver" {
+    assert_unparses("u_meth", "s.len()", "s.len()")
+    assert_unparses("u_meth_arg", "s.starts_with(\"h\")", "s.starts_with(\"h\")")
+}
+
+test "a field access keeps its object" {
+    assert_unparses("u_field", "a.b", "a.b")
+    assert_unparses("u_field2", "a.b.c", "a.b.c")
+}
+
+test "an index keeps its subscript" {
+    assert_unparses("u_index", "xs[0]", "xs[0]")
+    assert_unparses("u_index_expr", "xs[i + 1]", "xs[i + 1]")
+}
+
+test "parentheses are written only where precedence needs them" {
+    assert_unparses("u_tight", "1 + 2 * 3", "1 + 2 * 3")
+    assert_unparses("u_redundant", "1 + (2 * 3)", "1 + 2 * 3")
+    assert_unparses("u_needed", "(1 + 2) * 3", "(1 + 2) * 3")
+    assert_unparses("u_assoc_left", "1 - 2 - 3", "1 - 2 - 3")
+    assert_unparses("u_assoc_right", "1 - (2 - 3)", "1 - (2 - 3)")
+    assert_unparses("u_unary_operand", "!(a == b)", "!(a == b)")
+    assert_unparses("u_shift", "1 + 2 << 3", "1 + 2 << 3")
+    assert_unparses("u_postfix_recv", "(a + b).to_str()", "(a + b).to_str()")
+}
+
+test "unparsing is idempotent" {
+    assert_round_trips("r_prec", "1 + (2 * 3) == 7")
+    assert_round_trips("r_group", "(1 + 2) * 3")
+    assert_round_trips("r_assoc", "1 - (2 - 3)")
+    assert_round_trips("r_mixed", "a.b(c[0], !d) == -e")
+}
+
+// A rendering invented for a kind nobody wrote would read, in a failure message, as text
+// the programmer had typed. The refusal is the feature.
+test "an expression kind with no rendering refuses instead of inventing text" {
+    let node = expr_node("u_refuse", "if flag \{ 1 } else \{ 2 }")
+    diag_reset()
+    let _t = unparse_expr(node)
+    if diag_ice_count <= 0 {
+        io.println("FAIL: an unsupported kind produced text instead of an internal error")
+    }
+    assert(diag_ice_count > 0)
+}
