@@ -1,0 +1,187 @@
+// The source text of an expression, rebuilt from its node.
+//
+// A failing assert reports the condition the way the programmer wrote it --
+// `assertion failed: x > 2`. Nothing after the parser keeps that text, so it is rebuilt
+// here. This module reads the node pool and nothing else: no types, no IR, no emitter,
+// because what a program says is a property of what was written, not of what it compiles
+// to.
+//
+// Parentheses are rebuilt from precedence rather than remembered, because the parser
+// keeps no grouping node. A pair the precedence already implies is therefore not written
+// back: `1 + (2 * 3)` reads out as `1 + 2 * 3`, which is what a released build prints.
+//
+// A kind with no rendering refuses. Text invented for a failure message would read as
+// though the programmer had written it, and there is nothing in the message to say
+// otherwise.
+
+import std.str.{str_from_code_point}
+import ast.{NodeKind, nk_of, node_kind_name}
+import parser.{
+    is_literal_string_part, node_args, node_elements, node_index, node_int_val, node_kind,
+    node_left, node_method, node_name, node_obj, node_op, node_right, node_str_val,
+    sublist_get, sublist_length,
+}
+import diagnostics.{diag_ice_at, ICE_SEG_NO_SOURCE_TEXT, NO_SOURCE_TEXT_FOR_EXPR}
+
+// Binding strength, in the order parse_expr descends. Higher binds tighter. An operand
+// whose own strength is below what its position requires gets a pair of parentheses, and
+// that is the whole of the parenthesis rule.
+const PREC_COALESCE = 1
+const PREC_OR = 2
+const PREC_AND = 3
+const PREC_BIT_OR = 4
+const PREC_BIT_XOR = 5
+const PREC_BIT_AND = 6
+const PREC_EQUALITY = 7
+const PREC_COMPARISON = 8
+const PREC_ADDITIVE = 9
+const PREC_SHIFT = 10
+const PREC_MULTIPLICATIVE = 11
+const PREC_UNARY = 12
+const PREC_POSTFIX = 13
+const PREC_ATOM = 14
+
+pub fn unparse_expr(node: Int) -> Str ! Diag.Report {
+    unparse_at(node, 0)
+}
+
+fn unparse_at(node: Int, min_prec: Int) -> Str ! Diag.Report {
+    let text = unparse_bare(node)
+    if prec_of(node) < min_prec { return "({text})" }
+    text
+}
+
+fn binop_prec(op: Str) -> Int {
+    if op == "??" { return PREC_COALESCE }
+    if op == "||" { return PREC_OR }
+    if op == "&&" { return PREC_AND }
+    if op == "|" { return PREC_BIT_OR }
+    if op == "^" { return PREC_BIT_XOR }
+    if op == "&" { return PREC_BIT_AND }
+    if op == "==" || op == "!=" { return PREC_EQUALITY }
+    if op == "<" || op == ">" || op == "<=" || op == ">=" { return PREC_COMPARISON }
+    if op == "+" || op == "-" { return PREC_ADDITIVE }
+    if op == "<<" || op == ">>" { return PREC_SHIFT }
+    if op == "*" || op == "/" || op == "%" { return PREC_MULTIPLICATIVE }
+    // An operator the table does not name is parenthesised rather than run together with
+    // its neighbours, because a wrong grouping reads as a different condition.
+    PREC_COALESCE
+}
+
+fn prec_of(node: Int) -> Int {
+    match nk_of(node_kind(node)) {
+        NodeKind.BinOp => binop_prec(node_op(node))
+        NodeKind.UnaryOp => PREC_UNARY
+        NodeKind.Call => PREC_POSTFIX
+        NodeKind.MethodCall => PREC_POSTFIX
+        NodeKind.FieldAccess => PREC_POSTFIX
+        NodeKind.IndexExpr => PREC_POSTFIX
+        _ => PREC_ATOM
+    }
+}
+
+fn unparse_bare(node: Int) -> Str ! Diag.Report {
+    match nk_of(node_kind(node)) {
+        NodeKind.IntLit => node_str_val(node)
+        NodeKind.FloatLit => node_str_val(node)
+        NodeKind.CharLit => char_text(node)
+        NodeKind.BoolLit => bool_text(node)
+        NodeKind.Ident => node_name(node)
+        NodeKind.InterpString => interp_text(node)
+        NodeKind.BinOp => binop_text(node)
+        NodeKind.UnaryOp => "{node_op(node)}{unparse_at(node_left(node), PREC_UNARY)}"
+        NodeKind.Call => "{unparse_at(node_left(node), PREC_POSTFIX)}({arg_text(node_args(node))})"
+        NodeKind.MethodCall => method_text(node)
+        NodeKind.FieldAccess => "{unparse_at(node_obj(node), PREC_POSTFIX)}.{node_name(node)}"
+        NodeKind.IndexExpr => "{unparse_at(node_obj(node), PREC_POSTFIX)}[{unparse_expr(node_index(node))}]"
+        _ => refuse(node)
+    }
+}
+
+// The lexer keeps a character literal as its code point, so the character itself is put
+// back. The escapes are the ones a reader would otherwise see as whitespace in the middle
+// of a failure message.
+fn char_text(node: Int) -> Str {
+    let code = node_str_val(node).to_int()
+    if code == 92 { return "'\\\\'" }
+    if code == 39 { return "'\\''" }
+    if code == 10 { return "'\\n'" }
+    if code == 9 { return "'\\t'" }
+    if code == 13 { return "'\\r'" }
+    "'{str_from_code_point(code)}'"
+}
+
+fn bool_text(node: Int) -> Str {
+    if node_int_val(node) != 0 { "true" } else { "false" }
+}
+
+// Both operands sit at the operator's own strength on the left and one above it on the
+// right. Every binary level in the parser is left-associative, so that single rule is
+// what keeps `1 - 2 - 3` bare and puts a pair around `1 - (2 - 3)`.
+fn binop_text(node: Int) -> Str ! Diag.Report {
+    let p = binop_prec(node_op(node))
+    let lhs = unparse_at(node_left(node), p)
+    let rhs = unparse_at(node_right(node), p + 1)
+    "{lhs} {node_op(node)} {rhs}"
+}
+
+fn method_text(node: Int) -> Str ! Diag.Report {
+    let recv = unparse_at(node_obj(node), PREC_POSTFIX)
+    "{recv}.{node_method(node)}({arg_text(node_args(node))})"
+}
+
+fn arg_text(args: Int) -> Str ! Diag.Report {
+    if args == -1 { return "" }
+    let mut out = ""
+    let mut i = 0
+    while i < sublist_length(args) {
+        if i > 0 { out = "{out}, " }
+        out = "{out}{unparse_expr(sublist_get(args, i))}"
+        i = i + 1
+    }
+    out
+}
+
+// The lexer hands back a decoded string part, so what it decoded is put back before the
+// text is quoted again. A brace is in that set: an unescaped one would reopen a hole.
+fn interp_text(node: Int) -> Str ! Diag.Report {
+    let parts = node_elements(node)
+    let mut out = "\""
+    if parts != -1 {
+        let mut i = 0
+        while i < sublist_length(parts) {
+            let part = sublist_get(parts, i)
+            if is_literal_string_part(part) != 0 {
+                out = "{out}{escape_string_part(node_str_val(part))}"
+            } else {
+                out = "{out}\{{unparse_expr(part)}}"
+            }
+            i = i + 1
+        }
+    }
+    "{out}\""
+}
+
+fn escape_string_part(s: Str) -> Str {
+    let mut sb = StringBuilder.new()
+    let mut i = 0
+    while i < s.len() {
+        let c = s.byte_at(i)
+        if c == 92 { sb.write("\\\\") }
+        else if c == 34 { sb.write("\\\"") }
+        else if c == 10 { sb.write("\\n") }
+        else if c == 9 { sb.write("\\t") }
+        else if c == 13 { sb.write("\\r") }
+        else if c == 123 { sb.write("\\\{") }
+        else { sb.write(s.substring(i, 1)) }
+        i = i + 1
+    }
+    sb.to_str()
+}
+
+fn refuse(node: Int) -> Str ! Diag.Report {
+    diag_ice_at("NoSourceTextForExpression", NO_SOURCE_TEXT_FOR_EXPR,
+        "a {node_kind_name(node_kind(node))} expression has no source text here", node,
+        "a failing assert reports its condition as written; this kind needs a rendering in unparse.bl")
+    ICE_SEG_NO_SOURCE_TEXT
+}
