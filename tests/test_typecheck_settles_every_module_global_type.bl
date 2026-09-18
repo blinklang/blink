@@ -1,0 +1,102 @@
+// A module-global whose type never settles must be refused here, because the only global
+// seam in the backend asks layout for a spelling and an unsettled tid has none. That refusal
+// is an internal error naming no global, so it blames the compiler for what is a program
+// error. Typecheck therefore has to close every route to it.
+//
+// The rows walk the two ways a global type fails to settle: nothing determines it, and the
+// annotation names something that does not exist, including inside a container where the
+// outer kind is perfectly good. Two settled shapes keep the file from passing vacuously.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn compile_only(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    let _rm = process_run("rm", ["-f", path])
+    check_types(program)
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_reports(label: Str, name: Str) {
+    let mut hits = 0
+    for d in diag_entries {
+        if d.name == name { hits = hits + 1 }
+    }
+    if hits == 0 {
+        io.println("FAIL: {label}: want a {name}, got:")
+        for e in error_messages() { io.println("  {e}") }
+    }
+    assert(hits > 0)
+}
+
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn global_src(decl: Str) -> Str {
+    "{decl}\nfn main() \{ assert(true) }\n"
+}
+
+test "a module-global nothing determines the type of is refused" {
+    compile_only("global_settle_emptylist", global_src("let g = []"))
+    assert_reports("empty list", "CannotInferType")
+
+    compile_only("global_settle_none", global_src("let g = None"))
+    assert_reports("bare None", "CannotInferType")
+
+    compile_only("global_settle_emptymap", global_src("let g = Map()"))
+    assert_reports("empty map", "CannotInferType")
+
+    compile_only("global_settle_generic", global_src("fn zz_ident[T](x: T) -> T \{ x }\nlet g = zz_ident(None)"))
+    assert_reports("unbindable generic call", "CannotInferType")
+}
+
+test "a module-global annotation naming no known type is refused at every depth" {
+    compile_only("global_settle_bare", global_src("let g: Nope = 1"))
+    assert_reports("bare annotation", "UnknownType")
+
+    compile_only("global_settle_list", global_src("let g: List[Nope] = []"))
+    assert_reports("inside a list", "UnknownType")
+
+    compile_only("global_settle_map", global_src("let g: Map[Str, Nope] = Map()"))
+    assert_reports("inside a map", "UnknownType")
+
+    compile_only("global_settle_option", global_src("let g: Option[Nope] = None"))
+    assert_reports("inside an option", "UnknownType")
+
+    compile_only("global_settle_tuple", global_src("let g: (Int, Nope) = (1, 2)"))
+    assert_reports("inside a tuple", "UnknownType")
+}
+
+// A type parameter is a name a function signature binds. Module scope binds none, so an
+// annotation spelling one names nothing, and the global is refused like any other.
+test "a module-global annotated with a type parameter name is refused" {
+    compile_only("global_settle_tparam", global_src("let g: T = 1"))
+    assert_reports("type parameter at module scope", "UnknownType")
+}
+
+test "a module-global whose annotation names real types is accepted" {
+    compile_only("global_settle_ok_list", global_src("let g: List[Int] = []"))
+    assert_no_errors("annotated list")
+
+    compile_only("global_settle_ok_option", global_src("let g: Option[Int] = None"))
+    assert_no_errors("annotated option")
+}

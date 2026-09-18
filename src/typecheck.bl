@@ -10,7 +10,7 @@ import parser.{
     node_start, node_stmts, node_str_val, node_target, node_then_body, node_trait_name,
     node_type_ann, node_type_name, node_type_params, node_value, node_var_name,
     node_impl_binders, node_recv_type_args, node_impl_where_bounds, node_source_module,
-    node_set_module, node_set_name, node_supertraits,
+    node_set_module, node_set_name, node_supertraits, synth_struct_decl,
     node_xfail_reason, node_xfail_ticket, node_value_child_ids,
     sublist_get, sublist_length,
 }
@@ -51,7 +51,7 @@ import diagnostics.{
     UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE,
     BITWISE_PRECEDENCE, UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
     NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, UNKNOWN_DERIVE_NAME,
-    NO_SUCH_FIELD,
+    NO_SUCH_FIELD, OVERLAPPING_IMPLS, DUPLICATE_EFFECT_OP,
 }
 
 effect TypeCheck {
@@ -2528,6 +2528,12 @@ pub fn lookup_named_type(name: Str) -> Int {
 // register_struct_type has already inserted the name (registration precedes inference), and
 // this returns that tid. Fields are registered here too — a fieldless mint would turn a
 // silent erasure into a spurious "no field" error, which is worse.
+// A type the runtime defines, minted on demand for a builtin's return. The declaration
+// comes from lib/std when the program imports it; otherwise there is none to find and one
+// is synthesized here, because layout reads a struct's shape and cname its symbol through
+// a declaration node, and a tid without one has no C answer at all. The early return keeps
+// a real declaration the sole answer for its name -- registering a second would make the
+// name ambiguous and lose the one the program wrote.
 fn ensure_runtime_struct_type(name: Str, fnames: List[Str], ftids: List[Int]) -> Int {
     let existing = lookup_named_type(name)
     if existing != -1 { return existing }
@@ -2535,11 +2541,17 @@ fn ensure_runtime_struct_type(name: Str, fnames: List[Str], ftids: List[Int]) ->
     named_type_names.push(name)
     named_type_ids.push(tid)
     named_type_map.insert(name, tid)
+    let mut ftypes: List[Str] = []
     let mut i = 0
     while i < fnames.len() {
-        sfield_pool.push(TcStructField { struct_id: tid, name: fnames.get(i).unwrap(), type_id: ftids.get(i).unwrap() })
+        let ftid = ftids.get(i).unwrap()
+        sfield_pool.push(TcStructField { struct_id: tid, name: fnames.get(i).unwrap(), type_id: ftid })
+        ftypes.push(tc_tid_name(ftid))
         i = i + 1
     }
+    let td = synth_struct_decl(name, fnames, ftypes)
+    tc_register_type_decl_node(name, name, tid, td)
+    tc_struct_decl_nodes.insert(name, td)
     tid
 }
 
@@ -2635,7 +2647,7 @@ pub fn get_struct_field_tid(struct_tid: Int, fname: Str) -> Int {
 //
 // Returns 0 when the field IS declared, or when the declaration cannot be
 // resolved from the tid. That second case is a real state, not a bug: an
-// inferred list element (jctkac) surfaces as a struct-kind handle tid whose
+// inferred list element surfaces as a struct-kind handle tid whose
 // fields are not findable by tid even though the underlying struct declares
 // them. get_struct_field_tid answering -1 must therefore NOT be read as "no
 // such field"; only a resolvable declaration that omits the field proves
@@ -2644,8 +2656,8 @@ pub fn get_struct_field_tid(struct_tid: Int, fname: Str) -> Int {
 // EXISTENCE. A runtime-minted struct (ProcessResult, Duration, Instant, FsError via
 // ensure_runtime_struct_type) has no AST decl node but registers its full shape here, so
 // absence and existence must agree from this one source or a bad field access on such a
-// type escapes E0525 (zaya28). A base tid with NO sfield entries is an under-resolved
-// handle (a jctkac inferred element), not a known-empty shape — return 0 (cannot prove).
+// type escapes E0525. A base tid with NO sfield entries is an under-resolved
+// handle (an inferred element), not a known-empty shape — return 0 (cannot prove).
 fn tc_sfield_shape_provably_absent(obj_t: Int, fname: Str) -> Int {
     let base = tc_struct_base_tid(obj_t)
     let mut found_any = 0
@@ -8860,7 +8872,7 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
             ati = ati + 1
         }
         if is_poly != 0 && poly_supported == 0 {
-            diag_error_at("PolyImplUnsupported", POLY_IMPL_UNSUPPORTED, "polymorphic impls are not yet compiled", im, "spec §3.6 defines 'impl[T] {trait_name}[T] for Recv[T]', but compiled support is still in progress (project b1bdnh); write a separate impl per concrete type for now")
+            diag_error_at("PolyImplUnsupported", POLY_IMPL_UNSUPPORTED, "polymorphic impls are not yet compiled", im, "spec §3.6 defines 'impl[T] {trait_name}[T] for Recv[T]', but compiled support is still in progress; write a separate impl per concrete type for now")
         }
         let conflict_trait = if trait_name == "BlockHandler" { "Closeable" } else if trait_name == "Closeable" { "BlockHandler" } else { "" }
         if conflict_trait != "" {
@@ -8875,6 +8887,163 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
             }
         }
         ii = ii + 1
+    }
+    tc_check_impl_overlap(impls_sl)
+}
+
+// The bounds an impl puts on its binders, as one string, so two impls can be compared
+// without deciding what a bound means. Equal strings describe the same set of receivers;
+// different strings may or may not, which is why only equal ones are read as overlapping.
+fn tc_impl_bounds_signature(im: Int) -> Str {
+    let wb = node_impl_where_bounds(im)
+    if wb == -1 { return "" }
+    let mut parts: List[Str] = []
+    let mut i = 0
+    while i < sublist_length(wb) {
+        let cons = sublist_get(wb, i)
+        let bounds = node_elements(cons)
+        let mut j = 0
+        while bounds != -1 && j < sublist_length(bounds) {
+            parts.push("{node_name(cons)}:{strip_module_qualifier(node_name(sublist_get(bounds, j)))}")
+            j = j + 1
+        }
+        i = i + 1
+    }
+    parts.join(",")
+}
+
+// The trait a pair of impls must share before either could answer for the other's
+// receiver, written with its type arguments: `Into[Str]` and `Into[Int]` are two traits
+// here, and an impl of one never answers a call on the other.
+fn tc_impl_trait_key(im: Int) -> Str {
+    let args = node_type_params(im)
+    let mut names: List[Str] = []
+    let mut i = 0
+    while args != -1 && i < sublist_length(args) {
+        names.push(node_name(sublist_get(args, i)))
+        i = i + 1
+    }
+    "{node_trait_name(im)}[{names.join(",")}]"
+}
+
+// Does `poly` also answer for the receiver `concrete` writes? The two headers are read
+// against each other rather than through the receiver's type id, because a builtin
+// container carries its arguments as children and not as struct parameters, so the
+// instance walk written for a generic struct answers nothing about a List. Each of the
+// poly impl's receiver arguments must be one of its own binders, which is the shape whose
+// binding is a lookup; any other shape is left undecided. sections/03_types.md:2540 then
+// turns on the bounds: `impl[T] .. where T: Bound` overlaps `impl .. for C[Int]` exactly
+// when Int satisfies the bound.
+fn tc_poly_impl_answers_for(poly: Int, concrete: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    if tc_impl_target_name(poly) != tc_impl_target_name(concrete) { return 0 }
+    let n = tc_impl_recv_arity(poly)
+    if n == 0 || n != tc_impl_recv_arity(concrete) { return 0 }
+    let poly_args = node_recv_type_args(poly)
+    let conc_args = node_recv_type_args(concrete)
+    let binders = node_impl_binders(poly)
+    let mut binds: Map[Str, Int] = Map()
+    let mut decided = 1
+    let saved = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    let mut i = 0
+    while i < n {
+        let pname = node_name(sublist_get(poly_args, i))
+        if impl_binder_declared(binders, pname) == 0 {
+            decided = 0
+        } else {
+            binds.insert(pname, resolve_type_ann(sublist_get(conc_args, i)))
+        }
+        i = i + 1
+    }
+    tc_suppress_ann_validation = saved
+    if decided == 0 { return 0 }
+    tc_bounds_definitely_hold(poly, binds)
+}
+
+// Do every one of the impl's where-bounds definitely hold for these bindings? The reader
+// next door answers the opposite question and fails open, because a bound it can not model
+// must not reject a program. Here an unmodelled bound must not report one either, so only
+// a bound tc_type_satisfies_bound answers 1 for counts, and anything less leaves the pair
+// undecided.
+fn tc_bounds_definitely_hold(im: Int, binds: Map[Str, Int]) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let wb = node_impl_where_bounds(im)
+    if wb == -1 { return 1 }
+    let mut i = 0
+    while i < sublist_length(wb) {
+        let cons = sublist_get(wb, i)
+        let concrete = binds.get(node_name(cons)) ?? -1
+        if concrete < 0 { return 0 }
+        let bounds = node_elements(cons)
+        let mut j = 0
+        while bounds != -1 && j < sublist_length(bounds) {
+            let trait_name = strip_module_qualifier(node_name(sublist_get(bounds, j)))
+            if tc_type_satisfies_bound(concrete, trait_name) != 1 { return 0 }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    1
+}
+
+// Could both impls match one type? Answers only where the question is decidable, because
+// a wrong yes rejects a program the spec allows.
+//   concrete + concrete → the same receiver type.
+//   poly + concrete     → the poly impl answers for the concrete receiver.
+//   poly + poly         → the same container and arity under the same bounds; two
+//                         different bound sets are left alone, as no witness is at hand.
+fn tc_impls_overlap(a: Int, b: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let a_poly = tc_impl_is_poly(a)
+    let b_poly = tc_impl_is_poly(b)
+    if a_poly == 0 && b_poly == 0 {
+        let a_recv = tc_impl_recv_tid(a)
+        let b_recv = tc_impl_recv_tid(b)
+        if a_recv < 0 || b_recv < 0 { return 0 }
+        return if tc_tid_same_type(a_recv, b_recv) { 1 } else { 0 }
+    }
+    if a_poly != 0 && b_poly != 0 {
+        if tc_impl_target_name(a) != tc_impl_target_name(b) { return 0 }
+        if tc_impl_recv_arity(a) != tc_impl_recv_arity(b) { return 0 }
+        return if tc_impl_bounds_signature(a) == tc_impl_bounds_signature(b) { 1 } else { 0 }
+    }
+    let poly = if a_poly != 0 { a } else { b }
+    let concrete = if a_poly != 0 { b } else { a }
+    tc_poly_impl_answers_for(poly, concrete)
+}
+
+fn tc_impl_is_poly(im: Int) -> Int {
+    let binders = node_impl_binders(im)
+    if binders != -1 && sublist_length(binders) > 0 { 1 } else { 0 }
+}
+
+fn tc_impl_recv_arity(im: Int) -> Int {
+    let args = node_recv_type_args(im)
+    if args == -1 { 0 } else { sublist_length(args) }
+}
+
+// sections/03_types.md "No Impl Overlap": if two impls could both match a given type the
+// compiler rejects the program, because there is no specialization to choose between them.
+// Reported on the later impl, which is the one the author can delete.
+fn tc_check_impl_overlap(impls_sl: Int) ! TypeCheck.Resolve, Diag.Report {
+    let n = sublist_length(impls_sl)
+    let mut i = 0
+    while i < n {
+        let later = sublist_get(impls_sl, i)
+        if is_trait_name(node_trait_name(later)) != 0 {
+            let key = tc_impl_trait_key(later)
+            let mut j = 0
+            while j < i {
+                let earlier = sublist_get(impls_sl, j)
+                if tc_impl_trait_key(earlier) == key {
+                    if tc_impls_overlap(earlier, later) != 0 {
+                        let what = tc_impl_target_name(later)
+                        diag_error_at("OverlappingImpls", OVERLAPPING_IMPLS, "impl of '{node_trait_name(later)}' for '{what}' overlaps an earlier impl; Blink does not support specialization", later, "keep one impl, or wrap one receiver in a newtype so the two impls answer for types that share no instance")
+                        break
+                    }
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
     }
 }
 
@@ -9336,6 +9505,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             let eff_name = node_name(ed)
             register_ue_handle(str_to_lower(eff_name))
             register_ue_op_sigs(ed)
+            tc_check_effect_op_names(ed)
             ei = ei + 1
         }
     }
@@ -9489,6 +9659,33 @@ fn publish_ue_op_tids(op: Int) ! TypeCheck.Resolve, Diag.Report {
 }
 
 @allow(UnrestoredMutation)
+// The operations under one root effect share one dispatch table, so a name repeated
+// across its sub-effects has no unique slot to fill.
+fn tc_check_effect_op_names(ed: Int) ! Diag.Report {
+    let children_sl = node_elements(ed)
+    if children_sl == -1 { return }
+    let mut seen: Map[Str, Int] = Map()
+    let mut ci = 0
+    while ci < sublist_length(children_sl) {
+        let child = sublist_get(children_sl, ci)
+        let ops_sl = node_methods(child)
+        if ops_sl != -1 {
+            let mut oi = 0
+            while oi < sublist_length(ops_sl) {
+                let op = sublist_get(ops_sl, oi)
+                let op_name = node_name(op)
+                if seen.contains(op_name) {
+                    diag_error_at("DuplicateEffectOperation", DUPLICATE_EFFECT_OP, "effect '{node_name(ed)}' declares operation '{op_name}' more than once", op, "the operations under one root effect share one dispatch table, so rename this operation or move it under a different root effect")
+                } else {
+                    seen.insert(op_name, 1)
+                }
+                oi = oi + 1
+            }
+        }
+        ci = ci + 1
+    }
+}
+
 fn register_ue_op_sigs(ed: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     let handle = str_to_lower(node_name(ed))
     let children_sl = node_elements(ed)
@@ -9960,6 +10157,16 @@ fn nr_check_ambiguity(name: Str, mod_name: Str, local_names: Map[Str, Int]) ! Di
         }
         None => nr_name_source_module.insert(name, mod_name)
     }
+}
+
+// Whether a QUALIFIED access reaches a private declaration. The question is about the
+// module the qualifier names, not about the reader: a reader that declares its own non-pub
+// namesake still cannot see the other module's.
+fn nr_qualified_private_access(qualifier: Str, name: Str) -> Int {
+    if is_builtin_name(name) != 0 { return 0 }
+    let target = tc_qualifier_to_module_or_self(qualifier)
+    if target == nr_current_module { return 0 }
+    nr_is_private_in(name, target)
 }
 
 fn is_private_access(name: Str) -> Int {
@@ -12299,7 +12506,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 {
                 is_module_qual = 1
                 let mq_method = node_method(node)
-                if is_private_access(mq_method) != 0 {
+                if nr_qualified_private_access(obj_name, mq_method) != 0 {
                     nr_emit_private_access(mq_method, node)
                 } else {
                     tc_mark_symbol_used(mq_method)
@@ -12401,7 +12608,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 if is_import_module_name(fa_obj_name) != 0 && nr_is_defined(fa_obj_name) == 0 {
                     is_mod_fa = 1
                     let fa_field = node_name(node)
-                    if is_private_access(fa_field) != 0 {
+                    if nr_qualified_private_access(fa_obj_name, fa_field) != 0 {
                         nr_emit_private_access(fa_field, node)
                     } else {
                         tc_mark_symbol_used(fa_field)
@@ -13636,7 +13843,7 @@ fn tc_fn_returns_value() -> Bool {
 }
 
 // `pub` FOR THE TEST ONLY — same precedent as make_fn_type. Real code reaches inference through
-// tc_check_body, never this entry directly; the g19dpq test calls it by hand to install the
+// tc_check_body, never this entry directly; a test calls it by hand to install the
 // latent re-inference producer the Closure-arm guard defends against. It MUTATES the tc_node_tid
 // memo, so it must not be called from ordinary compiler code.
 // Every ARGUMENT of a call must carry a type. Several arms answer a call's own type from the
@@ -13728,7 +13935,7 @@ pub fn tc_publish_node_tid(node: Int, tid: Int) {
 // Resolved, because the carrier-argument set site (infer_carrier_arg) stores a raw pool
 // inner and every other reader of this channel resolves before it tests the kind.
 //
-// With no such expectation there is nothing to name, and DECISIONS.md 8vcj2c (6-0) says an
+// With no such expectation there is nothing to name, and DECISIONS.md *Under-determined types* (6-0) says an
 // under-determined type is reported and never defaulted. Void would not be a missing pointee
 // here, it would be a `sizeof(void)` allocation the checker had signed off on, so the repair
 // the report asks for — annotate the slot — is the only way the size can be right.
@@ -14748,7 +14955,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
             // enumerate/zip yield genuine tuples (`sections/03c_protocols.md:98,102` —
             // enumerate -> Iterator[(Int,T)], zip -> Iterator[(T,U)]). Codegen already
-            // materializes them as Tuple2_<a>_<b> structs (44xww4); without an arm here
+            // materializes them as Tuple2_<a>_<b> structs; without an arm here
             // the result memoized as TYPE_UNKNOWN, so a downstream `.get().unwrap()`
             // could not tid-back the tuple carrier and fell to the flat sname. Returning
             // the List[Tuple] shape lets tc_tid_tuple_tag spell the same Tuple2 name the
@@ -16069,7 +16276,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 return ft
             }
             // ft == -1 does NOT prove the field is absent: an under-resolved
-            // handle tid (a jctkac inferred-list element) is struct-kind yet
+            // handle tid (an inferred-list element) is struct-kind yet
             // carries no findable fields. Error only when the declared shape is
             // resolvable and genuinely omits the field (sections/03_types.md:3305);
             // an @ffi.opaque handle is a bodiless struct, so its inertness against

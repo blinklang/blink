@@ -60,6 +60,46 @@ warning[W0800]: unaudited foreign function
   = help: add @trusted(audit: "AUDIT-ID") after review
 ```
 
+#### Audit-Gated Diagnostics — One Channel, Stated Once
+
+A handful of diagnostics exist to force a **record**, not to report a mistake. The program they fire on is legal and may well be correct; what the language asks is that a human looked at it and said so in a place a reviewer can find. `@trusted(audit: K)` is that place, and this subsection states the mechanism once for every diagnostic that uses it. No other section restates it.
+
+**`audit:` is mandatory and non-empty.** `@trusted` without an `audit:` argument, or with an empty one, is rejected. A bare `@trusted` would silence the diagnostic and record nothing, which is the one outcome the annotation exists to prevent.
+
+```blink
+@ffi("sqlite3", "sqlite3_open")
+@effects(IO)
+@trusted(audit: "DB-003")           // OK
+fn sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int
+
+// intentional-error example
+@ffi("sqlite3", "sqlite3_close")
+@effects(IO)
+@trusted                            // error[TrustedRequiresAudit]: `@trusted` requires a non-empty
+                                    //   `audit:` identifier
+                                    // help: `@trusted(audit: "DB-004")`
+fn sqlite3_close(db: Ptr[Void]) -> Int
+```
+
+**`@trusted(audit: K)` is the sole channel.** For the diagnostics listed below, it is the only construct that suppresses them. In particular they are **not** reachable from `@allow(Name)` (§4.16.8) and **not** reachable from `[lints]` in `blink.toml`.
+
+**Naming one of them in another channel is refused, not ignored.** Writing `@allow(RawBypassesParam)`, or `RawBypassesParam = "off"` under `[lints]`, is an error whose message names `@trusted(audit: …)`. A suppression that silently fails to apply and one that silently succeeds are equally bad — in both cases the author cannot tell which happened.
+
+**The list.**
+
+| Diagnostic | What the record is for |
+|------------|------------------------|
+| `UnauditedFfi` (W0800) | A human checked this foreign binding against the C header |
+| `RawBypassesParam` | A human checked this un-parameterized interpolation for injection |
+
+**Membership criterion.** A diagnostic belongs on this list **only when silently suppressing it would destroy a record the language promises exists**. That is the whole gate. A diagnostic an author merely finds noisy does not qualify, however strongly; the list is not a place to park warnings someone wants to be unignorable.
+
+**Unsilenceable means no channel that records nothing** — not no channel at all. `@trusted(audit: K)` stays available for the legitimate case, so the list is a turnstile rather than a wall. A rule with no way through relocates the pressure into source: an indirection or a helper that launders the value past the trigger, leaving no record whatsoever, which is worse than the suppression it refused.
+
+**Every position that can raise one of these can annotate.** `test` blocks are annotatable, so a diagnostic raised inside one has somewhere to attach. An audit-gated diagnostic must never fire in a position from which its own repair cannot be written (§3.1).
+
+**This removes a capability that works today.** `@allow` currently reaches these warnings. Narrowing it is a breaking change, not a clarification, and release notes should say so in those words.
+
 #### Mandatory Safe Wrappers
 
 FFI functions are **not callable from application code directly**. They must be wrapped in a safe Blink function that validates inputs, translates error codes, and presents a Blink-native API.
@@ -304,7 +344,7 @@ with ffi.scope() as scope {
 // scope.close() runs here: frees ptr, cstr, and all scope allocations
 ```
 
-**`ffi.scope()` operations:**
+**`FfiScope` operations** — the receiver in every row is the `FfiScope` value `ffi.scope()` returns (see *The `FfiScope` type*, below):
 
 | Operation | Signature | Description |
 |-----------|-----------|-------------|
@@ -316,6 +356,40 @@ with ffi.scope() as scope {
 - All allocations made through a scope are freed when the `with` block exits (normal return, `?` early return, or any other exit path).
 - `scope.take(ptr)` removes a pointer from the scope's cleanup list. The caller assumes responsibility for the pointer's lifetime — typically by wrapping it in a safe Blink type whose `Closeable.close()` calls the appropriate C cleanup function.
 - Scope-allocated pointers that escape the scope without `.take()` trigger a compile error (reusing E0601 from `Closeable` diagnostics).
+
+**The `FfiScope` type.** `ffi.scope()` returns a value of type `FfiScope`. `FfiScope` is **scope-bound**: a value of this type may occur only as the resource of a `with ... as` block, **and nowhere else**. It may not be bound by a `let`, passed as an argument, returned, stored in a field, or written as a type argument.
+
+```blink
+import blink.ffi
+
+fn read_name() ! IO {
+    with ffi.scope() as scope {          // OK -- the only position an `FfiScope` may occupy
+        let buf = scope.alloc[U8]()
+        raw_gethostname(buf, 256)
+    }
+}
+
+// intentional-error example
+fn leaks() ! IO {
+    let arena = ffi.scope()              // error[FfiScopeNotWithResource]: an `FfiScope` may occur
+                                         //   only as a `with ... as` resource
+                                         // help: bind it as a `with` resource:
+                                         //   `with ffi.scope() as arena { ... }`
+                                         // help: for one plain allocation with GC cleanup, use
+                                         //   `alloc_ptr[T]()` instead of a scope
+    let buf = arena.alloc[U8]()
+}
+```
+
+The rule is stated over the **type**, not over the `ffi.scope()` call, because the hazard belongs to the value. A scope owns a libc `malloc`/`free` arena whose extent must be lexical, and every position the rule excludes is a position from which that arena outlives the block that frees it — however the value arrived there. A rule stated over the call site would test how the call is *written*, so any binding or indirection walks past it while the hazard is unchanged, and it would need a fresh clause for every future function that produces a scope.
+
+**Why this is an error where the `Closeable`-without-scope rule is a warning.** A `Closeable` value used outside `with ... as` is still reclaimed; that warning reports a resource released late and non-deterministically. An `FfiScope` used outside `with ... as` releases **nothing** — its arena is libc memory the collector does not see, so every allocation made through it leaks for the life of the process. The two rules differ in severity because they differ in outcome, not in strictness. (See §5.5, *`Closeable` values and `with ... as`*, named here rather than cited by code number.)
+
+**Message conditions** (normative, per §3.1 *Diagnostic Discipline*):
+- The shown repair carries the **author's own binder**, not a hardcoded `scope`.
+- The `let` → `with ... as` rewrite is **not** machine-applicable, and must not be offered as one: no fixer can decide where the block should end.
+- A second `help:` names `alloc_ptr[T]()`, so a writer who wanted one plain allocation is not taught to wrap a `with` block around the rest of the function.
+- Where `.take()` is named in a repair it is explained in the same breath — it removes a pointer from the scope's cleanup list and transfers that pointer's lifetime to the caller (see *Scope rules*, above).
 
 **Long-lived pointers:** For C handles that must outlive a lexical scope (e.g., a database connection stored in a struct field), use `scope.take()` to transfer ownership, then wrap in a `Closeable` type:
 
@@ -1017,7 +1091,7 @@ let q: Str = "SELECT * FROM users WHERE id = {id}"
 db.query_one(q)  // ERROR: expected Template[DB], got Str
 ```
 
-**Escape hatch:** `Raw(expr)` is a compiler-known marker type that bypasses parameterization for individual interpolated expressions within `Template[C]` strings. It emits a compiler warning and is tracked by `blink audit --raw-queries` alongside FFI.
+**Escape hatch:** `Raw(expr)` constructs a value of the marker type `Raw[T]`, which bypasses parameterization for a single interpolated expression within a `Template[C]` string. Folding a `Raw[T]` into a template raises `RawBypassesParam`, an audit-gated warning: `@trusted(audit: K)` is its only suppression channel (see §9.1, *Audit-Gated Diagnostics*). See §3b.5 for the type rules.
 
 ```blink
 // Auditable escape hatch for dynamic SQL:

@@ -110,7 +110,7 @@ With universal interpolation, `"Hello, {name}!"` just works. When no `{expr}` is
 | `\0` | NUL byte |
 | `\'` | literal `'` |
 
-A char literal must contain exactly one Unicode scalar value; `''` (empty) and `'ab'` (multi-char) are lexer errors. Surrogate codepoints (0xD800–0xDFFF) are rejected. Unicode/hex escapes (`\u{...}`) are deferred (task 19v5gb); use `Char.from_code_point(n)` until then.
+A char literal must contain exactly one Unicode scalar value; `''` (empty) and `'ab'` (multi-char) are lexer errors. Surrogate codepoints (0xD800–0xDFFF) are rejected. Unicode/hex escapes (`\u{...}`) are deferred; use `Char.from_code_point(n)` until then.
 
 **Context-sensitive interpolation.** When an interpolated string literal appears where `Template[C]` is expected (e.g., `db.query_one("SELECT * FROM users WHERE id = {id}")`), the compiler extracts `{expr}` as bound parameters instead of concatenating. The *receiving type* determines behavior: `{id}` in a `Str` context is concatenation, `{id}` in a `Template[DB]` context is parameterization. No new string syntax is needed — the same `"..."` literal does the right thing based on where it appears. See section 3.12 for details.
 
@@ -750,6 +750,47 @@ transfer(300, to: bob, from: alice)  // valid, same as above
 - Default values must be const expressions (see [2.21](#221-const-declarations))
 - Labels are **call-site sugar** — the function type is `fn(Int, Account, Account)` regardless of `--`. Closures, trait impls, and higher-order functions are unaffected. See [3.3](#33-type-inference).
 - The formatter enforces declaration order at call sites for consistency
+
+**Both rules are enforced by `blink check`.** A label written on a positional parameter is rejected, and a keyword parameter supplied without its label is rejected. Neither rule is a style preference, and neither is left to the formatter. The separator exists to make the swap in `transfer(300, bob, alice)` impossible; a rule the checker does not enforce makes nothing impossible, and a normative sentence the compiler does not hold up teaches a calling discipline that does not exist.
+
+**Where a label resolves.** A call-site label resolves in the callee's **keyword-parameter namespace** — the parameters declared after `--`, and nothing else. This rule governs calls to functions and to methods. A label in a variant-payload application or a struct literal names a **field**, not a parameter, and is outside this rule; the rule governing those labels is stated separately.
+
+**Extent of enforcement.** The rule is stated for every call against a declared `fn` signature, **method calls included**. Where the compiler's keyword-argument check is not reachable from a call path, the rule is not yet enforced on that path. That is an implementation gap, not a narrower rule: a rule that held for `f(x: 1)` and not for `b.f(x: 1)` would select two behaviours by the receiver's spelling, and making the check reachable from every call path is a prerequisite for this section to be true as written.
+
+#### Call-Site Diagnostics
+
+Five codes divide the call-site label rules. Each names a distinct mistake, and each has a distinct repair — which is why they are five codes and not one (§3.1 *Diagnostic Discipline*: diagnostics converge on a code when they converge on a repair).
+
+| Code | Fires when | First repair |
+|------|-----------|--------------|
+| `MissingKeywordArg` (E0510) | A keyword parameter received no argument at all | Supply the argument, labelled |
+| `UnlabeledKeywordArg` (E0529) | A keyword parameter received its argument **positionally** | Label the argument already written |
+| `InvalidKeywordArg` (E0511) | A label names no keyword parameter of the callee | Correct the label to one the signature declares |
+| `PositionalAfterKeyword` (E0527) | A positional argument follows a labelled one | Move it before the first label |
+| `DuplicateKeywordArg` (E0528) | The same label appears twice in one call | Delete the repeated argument |
+
+```blink
+fn transfer(amount: Int, -- from: Account, to: Account) -> Int { amount }
+
+// intentional-error examples -- each line is rejected, under the code named
+transfer(300, alice, bob)                       // error[UnlabeledKeywordArg]: `from` and `to` are
+                                                //   keyword parameters
+                                                // help: label the arguments:
+                                                //   `transfer(300, from: alice, to: bob)`
+
+transfer(300, frm: alice, to: bob)              // error[InvalidKeywordArg]: `frm` names no keyword
+                                                //   parameter of `transfer`
+                                                // help: the keyword parameters are `from` and `to`
+
+transfer(300, from: alice, bob)                 // error[PositionalAfterKeyword]
+
+transfer(300, from: alice, from: bob)           // error[DuplicateKeywordArg]
+
+transfer(amount: 300, from: alice, to: bob)     // error[InvalidKeywordArg]: `amount` is positional
+                                                //   help: pass it without a label
+```
+
+`UnlabeledKeywordArg` and `MissingKeywordArg` fire on opposite conditions and must not be confused: the first means *the value is present and unlabelled*, the second means *the value is absent*. `MissingKeywordArg`'s repair inserts an argument; `UnlabeledKeywordArg`'s repair annotates one that is already written, which makes it the only code of the five whose fix is machine-applicable — the parameter names and their positions are both known, and the edit needs nothing from the author's intent.
 
 **Panel vote: `--` separator won 3-1-1** (3 for `--`, 1 for `;`, 1 for `*`). Labels as call-site sugar (not part of type signature): **5-0 unanimous**. See [DECISIONS.md](../DECISIONS.md).
 
@@ -1414,9 +1455,37 @@ test "rolls back on the expected panic" {
 
 This is the one place in the language where a `panic` unwind runs cleanup. An *unexpected* panic (outside any `assert_panics` body) still terminates the process and bypasses cleanup, exactly as before. See §4.6.3 for the catchable-unwind set and the fence amendment.
 
-**Why a block, not a closure.** A closure (`fn() { ... }`) is a first-class value: a user could bind it (`let g = ...`) and hold a value whose invocation is panic-catchable, leaking panic recovery into ordinary code. A recognized block is never a value, so the panic continuation is observable only by the test runner — which is what keeps `panic: Never` (this section, *`panic()` Function*) sound. It also keeps the surface familiar: like `pytest.raises(...)` / Rust `#[should_panic(expected = "...")]`, you wrap the region and optionally assert the message.
+**Why a block, not a closure.** A closure (`fn() { ... }`) is a first-class value: a user could bind it (`let g = ...`) and hold a value whose invocation is panic-catchable, leaking panic recovery into ordinary code. The only guarantee the compiler enforces is about where a catch frame is **created**: a catch frame can only be created by code written lexically inside a `test { ... }` block (**E0833**). A recognized block is never a value, so no expression in the language has a panic-catching type, and `panic: Never` stays sound in the narrow sense that no signature can promise recovery. A closure written inside a test may still *contain* an `assert_panics` block. Nothing confines the resulting function value after that. It may be passed to ordinary code, stored in module-level mutable state, and invoked later from a plain `fn` with no test on the call stack. The block form also keeps the surface familiar: like `pytest.raises(...)` / Rust `#[should_panic(expected = "...")]`, you wrap the region and optionally assert the message.
 
 **Panel vote: 6-0** (all four questions). Resolved the deferred `assert_panics` question from the std.testing deliberation. See [DECISIONS.md](../DECISIONS.md) and [decisions/assert-panics-semantics.md](../decisions/assert-panics-semantics.md).
+
+**`assert_panics` inside a closure written in a test body.** The `assert_panics` fence is **lexical**: the compiler checks where the construct is *written*, not where it runs. A closure written inside a `test` block may therefore contain `assert_panics`, whether it is passed directly as an argument — the `testing.for_each` shape below — or bound with `let` first. Both forms are accepted, and accepting them is deliberate.
+
+**The closure must not outlive the `test` block that creates it.** Do not assign it to module-level state or store it in a field. Passing it directly as an argument rather than binding it with `let` does not by itself satisfy this: an argument is bound to the callee's parameter, and a parameter's type does not say whether the callee keeps the value. **The compiler does not check this**, so nothing will report it when it is violated. If the assertion inside an escaped closure fails when it is called from outside a running test, the behaviour is undefined.
+
+Recommended shape: write the closure where it is consumed, and let the consumer call it within the test, as `testing.for_each` does.
+
+```blink
+import std.testing
+
+fn nth(xs: List[Int], i: Int) -> Int {
+    xs.get(i).unwrap()
+}
+
+test "nth rejects out-of-range indices" {
+    let xs: List[Int] = [10, 20, 30]
+    testing.for_each([
+        ("negative", -1),
+        ("past end",  3),
+    ], fn(case: Int) {
+        assert_panics {
+            let _ = nth(xs, case)
+        }
+    })
+}
+```
+
+**Panel vote: 5-1** on the paragraph text (Minimalism preferred a shorter rung), **6-0** on striking a non-expressible escape route from the enumeration, **5-1** on scoping the undefined behaviour to the failing assertion (Systems preferred the wider wording). **6-0** that no new language surface is added and the fence stays lexical. See [DECISIONS.md](../DECISIONS.md) and [decisions/assert-panics-closure-fence.md](../decisions/assert-panics-closure-fence.md).
 
 #### Sub-tests and Parameterized Tests
 
@@ -1430,7 +1499,7 @@ test "add handles signs" {
         ("zero",     (0, 0, 0)),
         ("positive", (1, 2, 3)),
         ("negative", (-1, -2, -3)),
-    ], fn(case) {
+    ], fn(case: (Int, Int, Int)) {
         let (a, b, expected) = case
         assert_eq(add(a, b), expected)
     })

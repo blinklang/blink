@@ -48,6 +48,7 @@ pub const QM_ERROR_MISMATCH       = "E0512"
 pub const COALESCE_REQUIRES_OPT   = "E0513"
 pub const QM_TEST_DISPLAY_REQUIRED = "E0514"
 pub const TEST_ANNOTATED_RETURN   = "E0515"
+pub const DUPLICATE_EFFECT_OP     = "E0516"
 pub const BARE_GENERIC_FN_AS_VALUE = "E0517"
 pub const NAME_COLLISION          = "E0518"
 pub const AMBIGUOUS_CONSTRUCTION  = "E0519"
@@ -57,6 +58,7 @@ pub const AMBIGUOUS_METHOD_CALL   = "E0522"
 pub const MISSING_DISPLAY_IMPL    = "E0523"
 pub const RESERVED_TYPE_NAME      = "E0524"
 pub const NO_SUCH_FIELD           = "E0525"
+pub const OVERLAPPING_IMPLS       = "E0526"
 
 // E0600+ — closures, scoping
 pub const CLOSEABLE_ESCAPES_SCOPE = "E0601"
@@ -232,6 +234,12 @@ pub const CODEGEN_STAGE_NOT_BUILT = "I0004"
 // would put a node the pool does not hold inside a verified tree, so the seam refuses and
 // blames the caller rather than the stage that stopped first.
 pub const POISONED_IR_AT_SEAM = "I0005"
+// I0006: an expression reached the source-text rebuilder with no rendering for its kind.
+// The assert family reports the condition as the programmer wrote it, and nothing after
+// the parser keeps that text, so it is rebuilt from the node. A kind with no rendering
+// fails closed: inventing text would put words in a failure message that the program
+// never contained, and the reader would trust them.
+pub const NO_SOURCE_TEXT_FOR_EXPR = "I0006"
 
 // ── I0001 mangler sentinels ──────────────────────────────
 //
@@ -286,6 +294,10 @@ pub const ICE_SEG_NO_DECL = "BLINK_I0001_no_decl_for_type"
 // An instance tid names its base by BARE name only; when two modules declared that
 // name the tid cannot say which one it instantiates.
 pub const ICE_SEG_AMBIGUOUS_DECL = "BLINK_I0001_ambiguous_decl_for_type"
+// An expression kind the source-text rebuilder cannot write. Named like the other
+// sentinels so a refusal that escapes a caller is visible in the output rather than
+// reading as text the programmer wrote.
+pub const ICE_SEG_NO_SOURCE_TEXT = "BLINK_I0001_no_source_text_for_expr"
 
 // Whether a spelled type-name segment is one of the I0001 sentinels above — i.e. a
 // speller gave up. The two I0001 chokepoints use this instead of comparing against
@@ -333,7 +345,7 @@ type FileRange {
 pub let mut diag_entries: List[DiagEntry] = []
 let mut file_ranges: List[FileRange] = []
 let mut source_lines_cache: Map[Str, List[Str]] = Map()
-// q21fh2: dedup byte-identical diagnostics. The two full passes over a fn body
+// Dedup byte-identical diagnostics. The two full passes over a fn body
 // (nr + tc) both call infer_type, which emits, so a single erroring node fires
 // twice. Keyed on the full tuple (severity|code|file|line|col|message) so
 // genuinely distinct diagnostics on the same node survive. Reset per compile in
@@ -347,6 +359,11 @@ pub let mut diag_source_file: Str = ""
 pub let mut diag_count: Int = 0
 pub let mut diag_warn_count: Int = 0
 pub let mut diag_ice_count: Int = 0
+// How many internal errors were RENDERED, which is what the summary line reports. It
+// differs from diag_ice_count whenever one fault is reported more than once: the count a
+// caller reads to decide whether a result is usable must move on every report, and a
+// reader must still be shown the fault once.
+let mut diag_ice_rendered: Int = 0
 pub let mut diag_module_files: Map[Str, Str] = Map()
 
 pub fn diag_register_file_range(start: Int, end: Int, path: Str) {
@@ -456,10 +473,13 @@ pub fn diag_entry_count() -> Int {
 // Roll back every diagnostic emitted after the first `n` entries. Used by
 // the parser to collapse an error cascade (e.g. an unparseable string
 // interpolation) into a single focused diagnostic.
+// An internal error counts per report and renders once, so rolling back its entry gives
+// back one count and leaves any suppressed repeat counted. The parser collapses parse
+// cascades, which are errors, so nothing rolls back an internal error today.
 pub fn diag_truncate(n: Int) {
     while diag_entries.len() > n {
         let d = diag_entries.pop().unwrap()
-        // q21fh2: drop the dedup key too, so diag_seen mirrors diag_entries —
+        // Drop the dedup key too, so diag_seen mirrors diag_entries —
         // a popped cascade entry must not suppress a later distinct re-emission.
         let dkey = "{d.severity}|{d.code}|{d.file}|{d.line}|{d.col}|{d.message}"
         diag_seen.remove(dkey)
@@ -469,6 +489,7 @@ pub fn diag_truncate(n: Int) {
             diag_warn_count = diag_warn_count - 1
         } else if d.severity == "ice" {
             diag_ice_count = diag_ice_count - 1
+            diag_ice_rendered = diag_ice_rendered - 1
         }
     }
 }
@@ -589,6 +610,12 @@ fn diag_emit_range_notes(severity: Str, name: Str, code: Str, message: Str, line
         return
     }
     let dkey = "{effective_severity}|{code}|{diag_source_file}|{line}|{col}|{message}"
+    // An internal error counts every time it is reported, before the repeat is dropped.
+    // A caller reads the count to decide whether what a stage handed back is usable, and
+    // two emits of one program raise the same fault at the same place, so a count of
+    // distinct reports goes flat on the second and the caller accepts a unit with a body
+    // missing. Suppressing the repeat stays a rendering rule: the reader still sees it once.
+    if effective_severity == "ice" { diag_ice_count = diag_ice_count + 1 }
     if diag_seen.contains_key(dkey) != 0 {
         return
     }
@@ -604,9 +631,11 @@ fn diag_emit_range_notes(severity: Str, name: Str, code: Str, message: Str, line
     } else if effective_severity == "warning" {
         diag_warn_count = diag_warn_count + 1
     } else if effective_severity == "ice" {
-        diag_ice_count = diag_ice_count + 1
+        diag_ice_rendered = diag_ice_rendered + 1
     }
 }
+
+pub fn diag_ice_rendered_count() -> Int { diag_ice_rendered }
 
 // ── JSON string escaping ─────────────────────────────────────────────
 
@@ -648,8 +677,11 @@ pub fn diag_flush() ! Diag.Report {
     if diag_format == 1 {
         // no summary in json mode
     } else {
-        if diag_ice_count > 0 {
-            io.eprintln("{diag_ice_count} internal compiler error(s)")
+        // The summary counts what was printed, not what was reported: a repeat is dropped
+        // from the listing above, so counting reports here would name a number the reader
+        // can not find.
+        if diag_ice_rendered > 0 {
+            io.eprintln("{diag_ice_rendered} internal compiler error(s)")
         }
         if diag_count > 0 {
             io.eprintln("{diag_count} error(s) found")
@@ -776,6 +808,7 @@ pub fn diag_reset() {
     diag_count = 0
     diag_warn_count = 0
     diag_ice_count = 0
+    diag_ice_rendered = 0
     diag_module_files.clear()
     file_ranges.clear()
     lint_overrides.clear()
@@ -828,6 +861,9 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == POISONED_IR_AT_SEAM {
         return "I0005 -- PoisonedIrAtSeam\n\nAn INTERNAL COMPILER ERROR. One code-generation stage handed\nanother a lowered node that does not exist.\n\nWhen a stage cannot lower something it reports the reason and\nanswers a negative id. A caller that receives one must stop and\npass it on. This fires when a caller instead handed that id to a\nproducer that has to embed it in the tree, so the real failure was\nalready reported above this one -- this second report names the\ncaller that ignored it.\n\nThe compiler stops here rather than building a tree that holds a\nnode the pool does not contain, which the C printer would read as\nif it were real.\n\nThis is a bug in the compiler, not in your program. Fix: please\nreport this, ideally with the smallest program that reproduces it,\nand include the internal error printed just before this one."
+    }
+    if code == NO_SOURCE_TEXT_FOR_EXPR {
+        return "I0006 -- NoSourceTextForExpression\n\nAn INTERNAL COMPILER ERROR. The compiler could not rebuild the\nsource text of an expression.\n\nA failing assert reports its condition the way you wrote it. Nothing\nafter the parser keeps that text, so it is rebuilt from the parsed\nprogram. This fires when an expression kind has no rendering yet.\n\nThe compiler stops rather than inventing text, because invented text\nin a failure message would read as though you had written it.\n\nThis is a bug in the compiler, not in your program. Fix: please\nreport this, ideally with the smallest program that reproduces it."
     }
     if code == UNDECLARED_EFFECT {
         return "E0500 -- UndeclaredEffect\n\nA function calls another function that requires an effect, but the\ncaller does not declare that effect in its signature.\n\nFix: add '! EffectName' to the calling function's signature.\n\n  fn greet() ! IO \{\n      io.println(\"hello\")  // IO effect declared\n  \}\n\n  fn bad() \{\n      io.println(\"hello\")  // E0500: requires IO but bad() has none\n  \}"
@@ -894,6 +930,12 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == NO_SUCH_FIELD {
         return "E0525 -- NoSuchField\n\nA field access named a field the type does not declare. Member access\nis checked against the declared shape: sections/03_types.md:3305 makes\n'pair.2' on a two-element tuple a compile error, and the same rule\napplies to a struct field the declaration never lists. It also covers\nan @ffi.opaque handle, which has no body and therefore no fields\n(§9.1.4).\n\nBefore this check a nonexistent field silently inferred as an unknown\ntype and interpolated as the placeholder '<value>' at runtime.\n\nFix: use a declared field, or add the field to the type.\n\n  type P \{ a: Int }\n  let p = P \{ a: 1 }\n  p.zzz   // E0525 -- P has no field 'zzz'\n  p.a     // OK"
+    }
+    if code == DUPLICATE_EFFECT_OP {
+        return "E0516 -- DuplicateEffectOperation\n\nTwo sub-effects under one root effect declare an operation of the same\nname. The operations of one root effect share a single dispatch table,\nso every operation name under that root must be unique.\n\nFix: rename one of the operations, or move it under a different root\neffect.\n\n  effect Db \{\n      effect Read \{ fn query(sql: Str) -> Str \}\n      effect Write \{ fn exec(sql: Str) \}   // OK -- distinct names\n  \}\n\n  effect Bad \{\n      effect A \{ fn run() \}\n      effect B \{ fn run() \}                 // E0516 -- 'run' repeated\n  \}"
+    }
+    if code == OVERLAPPING_IMPLS {
+        return "E0526 -- OverlappingImpls\n\nTwo impls of one trait could both match the same type. Blink has no\nspecialization: there is no 'more specific impl wins' rule, so a call\non a type both impls answer for has no impl to pick\n(sections/03_types.md \"No Impl Overlap\").\n\nTwo shapes overlap:\n  - The same trait implemented twice for the same type.\n  - A blanket impl and a concrete one over the same container, when\n    the concrete type argument satisfies the blanket impl's bounds.\n    'impl[T] R for List[T] where T: Display' and 'impl R for\n    List[Int]' overlap, because Int implements Display.\n\nFix: keep one impl, or wrap one of the types in a newtype so the two\nimpls answer for types that share no instance.\n\n  impl[T] R for List[T] where T: Display \{ ... }\n  impl R for List[Int] \{ ... }        // E0526 -- List[Int] matches both\n\n  type IntList \{ xs: List[Int] }\n  impl R for IntList \{ ... }          // OK -- a type of its own"
     }
     if code == ARENA_VALUE_ESCAPES {
         return "E0700 -- ArenaValueEscapes\n\nA value allocated inside a 'with arena \{ }' block escapes the\narena's scope. Arena-allocated memory is freed when the arena exits,\nso references that survive the block would dangle.\n\nCommon causes:\n  - Storing an arena value into a long-lived field or global\n  - Capturing an arena value in a closure that outlives the block\n  - Passing an arena value to a function that keeps it\n\nThe diagnostic prints the resolved promotion target — either\n'promoted into: outer arena' (when the escaping site is inside a\nnested 'with arena') or 'promoted into: GC heap' (outermost block) —\nso nested-arena escapes are debuggable without guessing the shape of\nthe enclosing scope.\n\nFix: remove '! Arena' and let the value be GC-managed, or copy the\nvalue explicitly before it leaves the arena scope."
@@ -1067,7 +1109,7 @@ pub fn diag_explain(code: Str) -> Str {
         return "E0834 -- AssertPanicsNestedExpectPanic\n\nAn `assert_panics` block is lexically nested inside another\n`assert_panics` block. Nesting is rejected because the outer block\nwould swallow the inner's mechanism and the semantics of which\npanic counts as \"the\" expected panic become ambiguous.\n\nFix: split the assertions into two separate tests.\n\n  test \"a\" \{ assert_panics \{ foo() } }\n  test \"b\" \{ assert_panics \{ bar() } }     // not nested -- OK\n\n  test \"bad\" \{\n      assert_panics \{\n          assert_panics \{ baz() }          // E0834\n      }\n  }"
     }
     if code == XFAIL_MISSING_REASON {
-        return "E0835 -- XfailMissingReason\n\n`test.failing(...)` requires both `reason:` and `ticket:` to be\nnon-empty string literals. `reason` documents why the test is\nexpected to fail today; `ticket` is a `br` id that the closed-ticket\nlint queries -- an empty or missing value on either breaks that\ncontract silently.\n\nFix: supply both as non-empty strings.\n\n  test.failing(\n      \"trait impl resolves through alias chain\",\n      reason: \"Phase 3 trait elaboration not yet implemented\",\n      ticket: \"btvqbf\",\n  ) \{\n      // ... test body, expected to fail today\n  }"
+        return "E0835 -- XfailMissingReason\n\n`test.failing(...)` requires both `reason:` and `ticket:` to be\nnon-empty string literals. `reason` documents why the test is\nexpected to fail today; `ticket` is a `br` id that the closed-ticket\nlint queries -- an empty or missing value on either breaks that\ncontract silently.\n\nFix: supply both as non-empty strings.\n\n  test.failing(\n      \"trait impl resolves through alias chain\",\n      reason: \"Phase 3 trait elaboration not yet implemented\",\n      ticket: \"a1b2c3\",\n  ) \{\n      // ... test body, expected to fail today\n  }"
     }
     if code == DEPRECATED_USAGE {
         return "W2000 -- DeprecatedUsage\n\nA function or type marked @deprecated was used.\n\nThe @deprecated annotation signals that an API is scheduled for\nremoval. The warning includes the deprecation edition (if known)\nand a suggested replacement.\n\nFix: migrate to the replacement API shown in the help message.\n\n  @deprecated(replacement: \"new_fn\")\n  fn old_fn() \{ \}\n\n  fn main() \{\n      old_fn()   // W2000: use of deprecated function 'old_fn'\n                 // help: use 'new_fn' instead\n  \}"
@@ -1160,7 +1202,7 @@ pub fn diag_explain(code: Str) -> Str {
         return "E0907 -- TraitContractSealedBuiltin\n\nTwo kinds of built-in are sealed and may not be implemented:\n\n1. The method-surface traits -- StrOps, BytesOps, StringBuildOps,\n   Sized, Contains, ListOps, MapOps, SetOps, Joinable -- are part\n   of the prelude. They back the built-in method dispatch on\n   Str/List/Map/Set/Bytes; user code may neither redefine one nor\n   write an `impl` of one.\n\n2. The sealed built-in TYPES -- Str, List, Map, Set, Bytes,\n   StringBuilder, Instant, Duration, Iterator (§3c.4), plus the\n   closed collection carrier Range -- are closed. `Iterator` is\n   opaque and lazy; naming one of these in the trait position of an\n   `impl` is a sealed-type violation, not an undefined trait.\n\nFix: choose a different name for your own trait, or define your own\ntrait with the methods you need and `impl` that instead.\n\n  trait StrOps \{ fn bogus(self) -> Int }   // E0907 -- redefines a sealed builtin\n  impl Contains for MyType \{ ... }          // E0907 -- impl of a sealed builtin trait\n  impl Iterator[Int] for MyType \{ ... }     // E0907 -- impl of a sealed builtin type"
     }
     if code == POLY_IMPL_UNSUPPORTED {
-        return "E0908 -- PolyImplUnsupported\n\nA polymorphic impl header was found: `impl[T] Trait for Recv`,\n`impl Trait for Recv[Args]`, or a combination. Spec §3.6 defines\nthe canonical binding form `impl[T] Trait[T] for Recv[T]`, and the\nparser accepts it, but the compiler cannot yet generate code for\npolymorphic impls (tracked under project b1bdnh). Compilation stops\nbefore codegen so nothing miscompiles.\n\nFix: write a separate impl per concrete type for now.\n\n  impl[T] ListOps[T] for List[T] \{ ... }   // E0908 -- not yet compiled\n  impl Show for Box[Int] \{ ... }            // E0908 -- receiver type args\n  impl Show for IntBox \{ ... }              // OK -- concrete receiver"
+        return "E0908 -- PolyImplUnsupported\n\nA polymorphic impl header was found: `impl[T] Trait for Recv`,\n`impl Trait for Recv[Args]`, or a combination. Spec §3.6 defines\nthe canonical binding form `impl[T] Trait[T] for Recv[T]`, and the\nparser accepts it, but the compiler cannot yet generate code for\npolymorphic impls. Compilation stops before codegen so nothing\nmiscompiles.\n\nFix: write a separate impl per concrete type for now.\n\n  impl[T] ListOps[T] for List[T] \{ ... }   // E0908 -- not yet compiled\n  impl Show for Box[Int] \{ ... }            // E0908 -- receiver type args\n  impl Show for IntBox \{ ... }              // OK -- concrete receiver"
     }
     if code == IMPL_BINDER_UNUSED {
         return "E0909 -- ImplBinderUnused\n\nA type-parameter binder declared after `impl` (e.g. `impl[T]`) is\nnot referenced anywhere in the impl header's type positions -- it\nappears in neither the trait's type arguments nor the receiver's\ntype arguments. An unused binder is unconstrained: no call site\ncould ever determine what type it stands for.\n\nFix: remove the binder, or use it in the header.\n\n  impl[T] Show for IntBox \{ ... }            // E0909 -- T never used\n  impl[T] Convert[T] for IntBox \{ ... }      // OK -- T binds the trait arg\n  impl[T] Show for Box[T] \{ ... }            // OK -- T binds the receiver arg"

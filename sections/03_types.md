@@ -1266,6 +1266,38 @@ fn main() {
 
 Whether a type parameter is supplied by the signature is decidable from the signature alone — no call site, and no function body, is consulted.
 
+**A generic function named as a value.** A generic function's name may be written wherever a function value is expected, with no arguments and no brackets. The expected type is a source of type information exactly as a parameter type is, and the declaration's binders are solved by unifying its type against it:
+
+```blink
+fn identity[T](x: T) -> T { x }
+
+fn apply(f: fn(Int) -> Int, n: Int) -> Int { f(n) }
+
+fn main() {
+    let r = apply(identity, 3)            // OK -- the parameter type `fn(Int) -> Int` fixes T = Int
+    let g: fn(Str) -> Str = identity      // OK -- the annotation fixes T = Str
+    io.println("{r}")
+    io.println(g("ok"))
+}
+```
+
+No separate rule governs the bare form. A reference whose binders the expected type does not fix is under-determined, and that is `error[CannotInferType]` (E0301) like every other under-determination — reported at the reference, where its repair attaches:
+
+```blink
+fn identity[T](x: T) -> T { x }
+
+fn main() {
+    let f = identity                      // error[CannotInferType] -- intentional-error example
+                                          //   `T` is unbound at this reference and nothing supplies it
+                                          // help: annotate the binding:
+                                          //   `let f: fn(Int) -> Int = identity`
+}
+```
+
+The first `help:` names the **annotation**, not a bracket form. Brackets on a callee supply type arguments to a *call*; this position has no call, so there is nothing for them to attach to.
+
+*Rationale (normative).* The rule this replaces refused `apply(identity, 3)` and accepted `let f = identity` followed by `apply(f, 3)` — the same value, one line apart, separated by where it was written rather than by anything about its type. A rule that distinguishes a term from its own η-expansion is a syntactic filter standing in a typing rule's position, and its prescribed repair — wrapping the name in a closure — lowers to the identical allocation and the identical indirect call. It refused one spelling of a machine-identical program, it was defeated by one `let`, and it has been deleted rather than restated.
+
 **Where the error is reported.** `error[CannotInferType]` (E0301) is reported **where its repair attaches**. For an under-determined *binding* that is the `let` (§3.4 *Under-Determined Types*). For a type parameter with no source it is the call's type-argument position, because that is where the brackets go — including when the call stands alone as a statement and there is no binding to annotate:
 
 ```blink
@@ -1455,7 +1487,7 @@ fn f() -> Int {
 
 The `Err(e) => n` arm does not rescue the scrutinee. It binds `e` but discards it without observing its type, so — like `.len()` on a list of undetermined element type — it constrains the container's shape, not the open parameter. A fully-determined variant is unaffected: `match (Some(5), 9)` compiles, because `Some(5)` pins `Option`'s only parameter and leaves nothing open.
 
-**What pins `E`.** The error type of a `Result` is determined by any one of four things: a type annotation on the binding (`let r: Result[Int, Str] = Ok(3)`), a `?` in a context whose error type it must match, a `match` arm that reads the `Err` payload's type, or an enclosing return type that names it. When none is present, `E` is under-determined and the constructor must state it. The repair is an explicit type-argument list on the constructor — `Ok[Int, Str](3)` (§3.4 *Explicit Type Application*) — placed where the open parameter lives. As with every under-determined binding, E0301 is reported where its repair attaches (§3.4, amended by `8w0yj9`): the `let` when a binding dominates the value, otherwise the constructor's type-argument position, with the dual-span blame at the open constructor.
+**What pins `E`.** The error type of a `Result` is determined by any one of four things: a type annotation on the binding (`let r: Result[Int, Str] = Ok(3)`), a `?` in a context whose error type it must match, a `match` arm that reads the `Err` payload's type, or an enclosing return type that names it. When none is present, `E` is under-determined and the constructor must state it. The repair is an explicit type-argument list on the constructor — `Ok[Int, Str](3)` (§3.4 *Explicit Type Application*) — placed where the open parameter lives. As with every under-determined binding, E0301 is reported where its repair attaches (§3.4, as amended): the `let` when a binding dominates the value, otherwise the constructor's type-argument position, with the dual-span blame at the open constructor.
 
 There is no "an Ok-only value proves the error type is uninhabited, so resolve it to a bottom type" rule. Inferring a type the program never wrote — whether the erased unit `Void` or a bottom `Never` — into an unconstrained slot is the same unlicensed substitution the two-state model forbids; a `Never` error type is reached only when a program *writes* `Result[Int, Never]`, never chosen by inference for an open slot. The I0001 backstop that catches a variable reaching monomorphization keys on the variable's *kind*, never on the concrete tag it would have been given, so a genuine `Result[Void, Str]` or an explicitly-written `Result[Int, Never]` is unaffected.
 
@@ -2667,7 +2699,7 @@ the invariant that **`Char.debug()` emits only escapes the lexer already accepts
 (round-trip). The one v1 gap is a non-printable scalar that has no named escape (e.g. `U+0007` BEL):
 it is emitted as its raw byte(s) between the quotes, which is faithful but not always legible and not
 re-readable. A `'\u{N}'` output form for those is deferred to the task that adds `\u{...}` as input
-syntax (tracked in `qvan6m`), so input and output escaping land together.
+syntax (tracked separately), so input and output escaping land together.
 
 | `Char` value | `debug()` | | `Char` value | `debug()` |
 |---|---|---|---|---|
