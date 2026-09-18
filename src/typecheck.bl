@@ -13630,6 +13630,30 @@ fn is_comparison_op(op: Str) -> Int {
 // Infer a carrier argument (Some/Ok/Err) with the construction hint unwrapped to the carried
 // inner type, so a bare struct-style variant inside the carrier resolves against the right enum.
 // Mirrors the pattern-path carrier unwrap. carrier is "Some" | "Ok" | "Err".
+// The slot a one-sided carrier constructor does not name. `Ok(v)` says what the Ok side
+// holds and nothing about the Err side; the expected type at that position does, so read it
+// from there and mint a fresh metavar only when nothing names it.
+//
+// Minting is not free. infer_type re-runs on the same node and overwrites the node's stamp
+// each time, so a metavar minted AFTER the declared type was pinned replaces a solved stamp
+// with an unsolved one and reaches layout as "unbound metavariable". The hint is present at
+// exactly the positions that pin (declared return, annotation, parameter, field), so taking
+// the slot from it makes the first stamp the right one and re-inference idempotent.
+//
+// `slot` is the slot being FILLED: 1 for inner1, 2 for inner2. A hint of a different kind
+// names nothing about this carrier and is ignored, so a mismatch still mints and still
+// reports through the usual compare rather than baking a wrong type.
+fn tc_carrier_slot_from_hint(want: TyKind, slot: Int) -> Int {
+    if tc_construct_hint < 0 { return make_metavar() }
+    let h = resolve_alias_tid(tc_construct_hint)
+    if h < 0 || h >= ty_pool.len() { return make_metavar() }
+    let e = ty_pool.get(h).unwrap()
+    if e.kind != want { return make_metavar() }
+    let other = if slot == 1 { e.inner1 } else { e.inner2 }
+    if other < 0 { return make_metavar() }
+    other
+}
+
 fn infer_carrier_arg(arg_node: Int, carrier: Str) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let saved_hint = tc_construct_hint
     let k = type_kind(tc_construct_hint)
@@ -14069,7 +14093,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     if kind == NodeKind.Ident {
         let name = node_name(node)
         if name == "true" || name == "false" { return TYPE_BOOL }
-        if name == "None" { return make_option_type(make_metavar()) }
+        if name == "None" { return make_option_type(tc_carrier_slot_from_hint(TyKind.Option, 1)) }
         let vt = nr_get_type(name)
         if tc_tid_is_no_info(vt) == 0 { return vt }
         if is_variant_name(name) != 0 {
@@ -14340,7 +14364,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let args_sl = node_args(node)
                     if args_sl != -1 && sublist_length(args_sl) >= 1 {
                         let inner = infer_carrier_arg(sublist_get(args_sl, 0), "Ok")
-                        return make_result_type(inner, make_metavar())
+                        return make_result_type(inner, tc_carrier_slot_from_hint(TyKind.Result, 2))
                     }
                     return make_result_type(make_metavar(), make_metavar())
                 }
@@ -14348,7 +14372,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let args_sl = node_args(node)
                     if args_sl != -1 && sublist_length(args_sl) >= 1 {
                         let inner = infer_carrier_arg(sublist_get(args_sl, 0), "Err")
-                        return make_result_type(make_metavar(), inner)
+                        return make_result_type(tc_carrier_slot_from_hint(TyKind.Result, 1), inner)
                     }
                     return make_result_type(make_metavar(), make_metavar())
                 }
@@ -16503,9 +16527,18 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if elems_sl == -1 { return TYPE_VOID }
         if sublist_length(elems_sl) == 0 { return TYPE_VOID }
         let mut elem_types: List[Int] = []
+        // An ELEMENT's slot is the element type, not the tuple, so the hint is narrowed one
+        // position at a time exactly as a list literal narrows to its element. Unnarrowed, a
+        // one-sided carrier written as an element reads the tuple as its expectation, finds a
+        // kind it is not, and mints an unbound slot the annotation right there would name.
+        let tl_saved_hint = tc_construct_hint
+        let tl_hint = if tc_construct_hint >= 0 { resolve_alias_tid(tc_construct_hint) } else { -1 }
+        let tl_narrow = if tl_hint >= 0 && tc_tid_kind(tl_hint) == TyKind.Tuple && tc_tid_child_count(tl_hint) == sublist_length(elems_sl) { 1 } else { 0 }
         let mut i = 0
         while i < sublist_length(elems_sl) {
+            if tl_narrow != 0 { tc_construct_hint = tc_tid_child(tl_hint, i) }
             elem_types.push(infer_type(sublist_get(elems_sl, i)))
+            tc_construct_hint = tl_saved_hint
             i = i + 1
         }
         return make_tuple_type(elem_types)

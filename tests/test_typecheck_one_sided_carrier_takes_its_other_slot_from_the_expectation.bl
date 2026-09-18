@@ -1,0 +1,123 @@
+// A one-sided carrier constructor names one slot and says nothing about the other. `Ok(v)`
+// says what the Ok side holds; the Err side is named by whatever the expression is expected to
+// be -- the declared return, the annotation, the field, the element position.
+//
+// Minting a fresh metavariable for that slot instead is not merely imprecise. Inference re-runs
+// on the same node and overwrites its stamp each time, so a metavariable minted AFTER the
+// declared type was pinned replaces a solved stamp with an unsolved one, and codegen then asks
+// layout to spell an unbound metavariable.
+//
+// The claim is that at every position that names the other slot, the constructor is stamped
+// with that type and no unsolved slot survives in it.
+import lower_test_helpers.{probe, assert_eq_str}
+import typecheck.{tc_lookup_node_tid, tc_resolve, tc_type_str}
+import parser.{nodes, node_kind, node_name, node_value_child_ids}
+import ast.{NodeKind, nk_of, nk_name}
+import std.io
+
+fn src_carriers() -> Str {
+    #"type Holder {
+    slot: Option[Int]
+}
+
+fn tail_nested() -> Result[Result[Str, Int], Str] {
+    Ok(Ok("hello"))
+}
+
+fn returned_nested() -> Result[Result[Str, Int], Str] {
+    return Ok(Ok("hello"))
+}
+
+fn annotated_let() -> Int {
+    let r: Result[Str, Int] = Ok("hi")
+    0
+}
+
+fn tuple_elem() -> (Result[Str, Int], Int) {
+    (Ok("hi"), 1)
+}
+
+fn field_none() -> Holder {
+    Holder { slot: None }
+}
+
+fn generic_wrap[T](v: T) -> Option[Result[T, Str]] {
+    Some(Ok(v))
+}
+"#
+}
+
+fn probe_fn(name: Str) -> Int {
+    let mut found = -1
+    let mut seen = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.FnDef && node_name(i) == name {
+            found = i
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    if seen != 1 {
+        io.println("FAIL: '{name}' is declared {seen} times, so the test cannot name one")
+        assert(false)
+    }
+    found
+}
+
+fn carrier_name_of(node: Int) -> Str {
+    let k = nk_of(node_kind(node))
+    if k == NodeKind.Ident && node_name(node) == "None" { return "None" }
+    if k != NodeKind.Call { return "" }
+    let kids = node_value_child_ids(node)
+    if kids.len() == 0 { return "" }
+    let callee = kids.get(0).unwrap()
+    if nk_of(node_kind(callee)) != NodeKind.Ident { return "" }
+    let n = node_name(callee)
+    if n == "Ok" || n == "Err" || n == "Some" { return n }
+    ""
+}
+
+// Every carrier constructor under `node`, spelled by the type the memo answers for it, in the
+// order a value-position descent reaches them.
+fn carriers_in(node: Int) -> Str {
+    if node == -1 { return "" }
+    let mut out = ""
+    let name = carrier_name_of(node)
+    if name != "" {
+        let tid = tc_lookup_node_tid(node)
+        out = "{name}={if tid < 0 { "-" } else { tc_type_str(tc_resolve(tid)) }}"
+    }
+    let kids = node_value_child_ids(node)
+    let mut i = 0
+    while i < kids.len() {
+        let sub = carriers_in(kids.get(i).unwrap())
+        if sub != "" {
+            out = if out == "" { sub } else { out.concat(" ").concat(sub) }
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn assert_carriers(fn_name: Str, want: Str) {
+    assert_eq_str("carriers in {fn_name}", carriers_in(probe_fn(fn_name)), want)
+}
+
+test "an implicit tail and an explicit return name the same other slot" {
+    let _p = probe("carrier_slot_tail", src_carriers())
+    assert_carriers("tail_nested", "Ok=Result[Result[Str, Int], Str] Ok=Result[Str, Int]")
+    assert_carriers("returned_nested", "Ok=Result[Result[Str, Int], Str] Ok=Result[Str, Int]")
+}
+
+test "an annotation, a tuple element and a struct field each name the other slot" {
+    let _p = probe("carrier_slot_positions", src_carriers())
+    assert_carriers("annotated_let", "Ok=Result[Str, Int]")
+    assert_carriers("tuple_elem", "Ok=Result[Str, Int]")
+    assert_carriers("field_none", "None=Option[Int]")
+}
+
+test "a type parameter is as good a slot filler as a concrete type" {
+    let _p = probe("carrier_slot_generic", src_carriers())
+    assert_carriers("generic_wrap", "Some=Option[Result[T, Str]] Ok=Result[T, Str]")
+}
