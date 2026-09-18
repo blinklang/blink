@@ -1,0 +1,70 @@
+import std.io
+import ir.{
+    ir_reset, ir_kind, ir_kind_name, ir_c_name, ir_capture_descs, ir_promoter, ir_kid_count,
+    ir_verify, ir_dump, ir_parse,
+    ir_const, ir_var_ref, ir_closure_new,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn cap() -> Int { ir_var_ref(1, 0, "int64_t", "n", SlotForm.InlineWord) }
+
+fn capturing_closure() -> Int {
+    ir_closure_new(9, 0, "blink_closure*", "__closure_0", "__closure_0_descs", "__closure_0_promote", [cap()])
+}
+
+// A closure is promoted into an arena by walking its captures, so it must carry both what
+// each capture is and the function that does the walking. Neither is derivable from the
+// body symbol, so the node names them.
+test "a closure names the descriptor table and the promoter its captures are moved with" {
+    ir_reset()
+    let cl = capturing_closure()
+    assert_eq_str("the body symbol stays in c_name", ir_c_name(cl), "__closure_0")
+    assert_eq_str("descriptors", ir_capture_descs(cl), "__closure_0_descs")
+    assert_eq_str("promoter", ir_promoter(cl), "__closure_0_promote")
+    assert_eq_int("the captures stay the kids", ir_kid_count(cl), 1)
+    assert_eq_int("it verifies", ir_verify(cl).len(), 0)
+}
+
+// A closure that captures nothing has nothing to describe, and one that is never promoted
+// has no promoter, so each slot stands on its own.
+test "a closure can name a promoter and no descriptors" {
+    ir_reset()
+    let cl = ir_closure_new(9, 0, "blink_closure*", "__closure_1", "", "__closure_1_promote", [])
+    assert_eq_str("no descriptors", ir_capture_descs(cl), "")
+    assert_eq_str("promoter", ir_promoter(cl), "__closure_1_promote")
+    let plain = ir_closure_new(9, 0, "blink_closure*", "__closure_2", "", "", [])
+    assert_eq_str("neither", "{ir_capture_descs(plain)}|{ir_promoter(plain)}", "|")
+    assert_eq_int("both verify", ir_verify(cl).len() + ir_verify(plain).len(), 0)
+}
+
+test "the descriptor table and the promoter round-trip through dump and parse" {
+    ir_reset()
+    let text = ir_dump(capturing_closure())
+    let back = ir_parse(text)
+    assert_eq_int("parsed", if back >= 0 { 1 } else { 0 }, 1)
+    assert_eq_str("kind survives", ir_kind_name(ir_kind(back)), "ClosureNew")
+    assert_eq_str("descriptors survive", ir_capture_descs(back), "__closure_0_descs")
+    assert_eq_str("promoter survives", ir_promoter(back), "__closure_0_promote")
+    assert_eq_str("re-dump is stable", ir_dump(back), text)
+}
+
+test "a closure that names neither dumps no slot" {
+    ir_reset()
+    let plain = ir_closure_new(9, 0, "blink_closure*", "__closure_2", "", "", [])
+    assert_eq_str("plain", ir_dump(plain), "(ClosureNew 9 0 InlineWord 0 \"blink_closure*\" \"__closure_2\")")
+    let promoted = ir_closure_new(9, 0, "blink_closure*", "__closure_1", "", "__closure_1_promote", [])
+    assert_eq_str("promoter only", ir_dump(promoted), "(ClosureNew 9 0 InlineWord 0 \"blink_closure*\" \"__closure_1\" promoter=\"__closure_1_promote\")")
+}

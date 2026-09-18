@@ -1,0 +1,77 @@
+import std.io
+import ir.{
+    IrKind, ir_reset, ir_kind, ir_kind_name, ir_kind_from_name, ir_kind_is_value, ir_all_kinds,
+    ir_c_name, ir_c_spelling, ir_kid_count, ir_kid, ir_slot_form, ir_slot_form_name,
+    ir_verify, ir_dump, ir_parse,
+    ir_const, ir_var_ref, ir_sized_alloc,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn scope_var() -> Int { ir_var_ref(14, 0, "blink_list*", "s", SlotForm.PointerBoxed) }
+
+// `scope.alloc()`: room for one cell.
+fn one_cell() -> Int { ir_sized_alloc(15, 0, "int64_t*", "int64_t", scope_var(), ir_const(1, 0, "int64_t", "1")) }
+
+// `scope.alloc_n(n)`: room for as many cells as the count says.
+fn n_cells() -> Int {
+    ir_sized_alloc(15, 0, "blink_Pollfd*", "blink_Pollfd", scope_var(), ir_var_ref(1, 0, "int64_t", "n", SlotForm.InlineWord))
+}
+
+test "a sized allocation is a kind of its own, not a Box" {
+    ir_reset()
+    let a = one_cell()
+    assert_eq_str("kind", ir_kind_name(ir_kind(a)), "SizedAlloc")
+    assert_eq_int("it is a value", if ir_kind_is_value(IrKind.SizedAlloc) { 1 } else { 0 }, 1)
+    assert_eq_int("the name resolves back", match ir_kind_from_name("SizedAlloc") { Some(_k) => 1 None => 0 }, 1)
+    let mut listed = 0
+    for k in ir_all_kinds() {
+        if ir_kind_name(k) == "SizedAlloc" { listed += 1 }
+    }
+    assert_eq_int("listed once in the kind table", listed, 1)
+}
+
+test "a sized allocation names the element it takes room for and the scope that frees it" {
+    ir_reset()
+    let a = one_cell()
+    assert_eq_str("the value is held as a pointer", ir_slot_form_name(ir_slot_form(a)), "PointerBoxed")
+    assert_eq_str("spelled at its own pointer type", ir_c_spelling(a), "int64_t*")
+    assert_eq_str("the element is the sizeof operand", ir_c_name(a), "int64_t")
+    assert_eq_int("scope and count", ir_kid_count(a), 2)
+    assert_eq_str("the scope comes first", ir_c_name(ir_kid(a, 0)), "s")
+    assert_eq_str("the count comes second", ir_c_name(ir_kid(a, 1)), "1")
+    assert_eq_int("it verifies", ir_verify(a).len(), 0)
+}
+
+// One node shape serves both spellings: an array differs from a single cell in the count
+// operand and in nothing else, so nothing downstream has to know which one was written.
+test "an array allocation differs from a single cell only in the count operand" {
+    ir_reset()
+    let many = n_cells()
+    assert_eq_str("same kind", ir_kind_name(ir_kind(many)), "SizedAlloc")
+    assert_eq_int("same kid count", ir_kid_count(many), 2)
+    assert_eq_str("the count is the operand the call gave", ir_c_name(ir_kid(many, 1)), "n")
+    assert_eq_int("it verifies", ir_verify(many).len(), 0)
+}
+
+test "a sized allocation round-trips through dump and parse" {
+    ir_reset()
+    let text = ir_dump(n_cells())
+    let back = ir_parse(text)
+    assert_eq_int("parsed", if back >= 0 { 1 } else { 0 }, 1)
+    assert_eq_str("kind survives", ir_kind_name(ir_kind(back)), "SizedAlloc")
+    assert_eq_str("element survives", ir_c_name(back), "blink_Pollfd")
+    assert_eq_str("re-dump is stable", ir_dump(back), text)
+}

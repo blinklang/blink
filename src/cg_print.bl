@@ -25,7 +25,7 @@ import cg_emit.{
 }
 import ir.{
     IrKind, ir_kind, ir_kind_name, ir_span, ir_c_spelling, ir_c_name, ir_held_by_pointer, ir_must_materialize,
-    ir_kid_count, ir_kid, ir_kids, ir_tag_member, ir_payload_member,
+    ir_kid_count, ir_kid, ir_kids, ir_tag_member, ir_payload_member, ir_kops_table, ir_capture_descs, ir_promoter,
 }
 import diagnostics.{diag_ice, MISPLACED_IR_KIND_AT_PRINT}
 
@@ -110,6 +110,7 @@ fn expr_text(id: Int) -> Str ! Diag.Report {
         IrKind.ContainerSpread => misplaced(id, "ContainerNew kid")
         IrKind.Box => box_text(id)
         IrKind.Unbox => "(*({print_expr(ir_kid(id, 0))}))"
+        IrKind.SizedAlloc => sized_alloc_text(id)
         IrKind.CarrierWrap => carrier_wrap_text(id)
         IrKind.CarrierUnwrap => "{print_expr(ir_kid(id, 0))}{access(ir_kid(id, 0))}{ir_c_name(id)}"
         IrKind.CarrierTag => "{print_expr(ir_kid(id, 0))}{access(ir_kid(id, 0))}{tag_member(id)}"
@@ -210,6 +211,16 @@ fn box_text(id: Int) -> Str ! Diag.Report {
     tmp
 }
 
+// The cells are zeroed and the scope frees them, so the allocation is one expression and
+// binds no temporary. The node names the element; this writes sizeof around it and hands
+// calloc the count, which is a literal 1 for a single cell and the call's operand for an
+// array.
+fn sized_alloc_text(id: Int) -> Str ! Diag.Report {
+    let scope = print_expr(ir_kid(id, 0))
+    let count = print_expr(ir_kid(id, 1))
+    "(({ir_c_spelling(id)})blink_ffi_scope_track({scope}, calloc((size_t)({count}), sizeof({ir_c_name(id)}))))"
+}
+
 // The append symbol and its arity are a runtime convention keyed on the constructor
 // symbol; it is an ABI table, not a type test.
 fn container_append_symbol(ctor: Str) -> Str {
@@ -223,8 +234,9 @@ fn container_append_arity(ctor: Str) -> Int {
     if ctor == "blink_map_new" { 2 } else { 1 }
 }
 
-// blink_map_new and blink_set_new take a key-operations table the IR cannot yet carry, so a
-// map or set literal is reported rather than printed with a call that does not compile.
+// A hashed container is constructed with the key-operations table its node names; a list
+// names none and is constructed with no argument. The table is an object, so the address
+// of it is what the constructor is handed.
 // A ContainerSpread kid stands for every element of its source: it takes the place of one
 // append and calls the copy symbol it names on the container under construction.
 fn container_new_text(id: Int) -> Str ! Diag.Report {
@@ -237,12 +249,14 @@ fn container_new_text(id: Int) -> Str ! Diag.Report {
             "add the constructor to container_append_symbol in cg_print.bl")
         return "BLINK_I0003_unknown_ctor_{ctor}"
     }
-    if ctor != "blink_list_new" {
+    let kops = ir_kops_table(id)
+    if ctor != "blink_list_new" && kops == "" {
         diag_ice("ContainerNewNeedsKops", MISPLACED_IR_KIND_AT_PRINT,
-            "ContainerNew node {id} calls {ctor}, which needs a key-operations table the IR has no slot for",
-            0, 0, "add the kops slot to ir.bl before lowering a map or set literal")
+            "ContainerNew node {id} calls {ctor}, which needs a key-operations table, and names none",
+            0, 0, "pass the key-operations table to ir_container_new when lowering a map or set literal")
         return "BLINK_I0003_missing_kops_{ctor}"
     }
+    let ctor_arg = if kops == "" { "" } else { "&{kops}" }
     let arity = container_append_arity(ctor)
     if n % arity != 0 {
         diag_ice("ContainerNewKidCount", MISPLACED_IR_KIND_AT_PRINT,
@@ -250,8 +264,8 @@ fn container_new_text(id: Int) -> Str ! Diag.Report {
             "run ir_verify on the tree before printing it")
         return "BLINK_I0003_odd_kids_{ctor}"
     }
-    if n == 0 { return "{ctor}()" }
-    let tmp = bind_temp(id, "_c", "{ctor}()")
+    if n == 0 { return "{ctor}({ctor_arg})" }
+    let tmp = bind_temp(id, "_c", "{ctor}({ctor_arg})")
     let mut i = 0
     while i < n {
         let kid = ir_kid(id, i)
@@ -288,12 +302,17 @@ fn is_name(id: Int) -> Bool {
     }
 }
 
-// Captures arrive already boxed to pointers by lowering. The record has no slot yet for
-// capture descriptors or a promoter, so both are NULL.
+fn or_null(symbol: Str) -> Str { if symbol == "" { "NULL" } else { symbol } }
+
+// Captures arrive already boxed to pointers by lowering. The descriptor table and the
+// promoter are the symbols the node names, and a slot that names nothing is NULL: a
+// closure with no captures describes none, and one that is never promoted has no promoter.
 fn closure_new_text(id: Int) -> Str ! Diag.Report {
     let n = ir_kid_count(id)
     let sym = "(void*){ir_c_name(id)}"
-    if n == 0 { return "blink_closure_new_typed({sym}, NULL, NULL, 0, NULL)" }
+    let descs = or_null(ir_capture_descs(id))
+    let promoter = or_null(ir_promoter(id))
+    if n == 0 { return "blink_closure_new_typed({sym}, NULL, {descs}, 0, {promoter})" }
     let caps = em_temp("_caps")
     em_line("void** {caps} = (void**)blink_alloc(sizeof(void*) * {n});")
     let mut i = 0
@@ -301,7 +320,7 @@ fn closure_new_text(id: Int) -> Str ! Diag.Report {
         em_line("{caps}[{i}] = (void*){print_expr(ir_kid(id, i))};")
         i += 1
     }
-    bind_temp(id, "_cl", "blink_closure_new_typed({sym}, {caps}, NULL, {n}, NULL)")
+    bind_temp(id, "_cl", "blink_closure_new_typed({sym}, {caps}, {descs}, {n}, {promoter})")
 }
 
 // ── Statements ───────────────────────────────────────────────────────────────
@@ -337,6 +356,7 @@ pub fn print_stmt(id: Int) ! Diag.Report {
         IrKind.ContainerSpread => stmt_misplaced(id)
         IrKind.Box => stmt_misplaced(id)
         IrKind.Unbox => stmt_misplaced(id)
+        IrKind.SizedAlloc => stmt_misplaced(id)
         IrKind.CarrierWrap => stmt_misplaced(id)
         IrKind.CarrierUnwrap => stmt_misplaced(id)
         IrKind.CarrierTag => stmt_misplaced(id)

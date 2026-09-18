@@ -35,7 +35,7 @@ pub type IrKind {
     Const, VarRef, GlobalRef,
     Unary, Binary, Cast,
     FieldGet, FieldSet, StructNew, TupleNew, EnumNew, ContainerNew, ContainerSpread,
-    Box, Unbox, CarrierWrap, CarrierUnwrap, CarrierTag,
+    Box, Unbox, SizedAlloc, CarrierWrap, CarrierUnwrap, CarrierTag,
     CallDirect, CallIndirect, CallClosure, CallVirtual, CallRuntime,
     ClosureNew, EvidenceVector, EvidenceAddress, EffectPerform, HandlerInstall,
     Let, Assign, ExprStmt, Return, If, Loop, Break, Continue, Block, Switch, WithScope,
@@ -61,6 +61,16 @@ pub type IrNode {
     // no payload union: its payload is a plain field beside the tag.
     tag_member: Str
     payload_member: Str
+    // The key-operations table a hashed container compares and hashes its keys with.
+    // A map or set can not be constructed without one, and it is not derivable from the
+    // constructor symbol, so the node carries the symbol layout resolved; "" on every
+    // other kind and on a list, which compares no keys.
+    kops_table: Str
+    // How a closure is moved into an arena: what each capture holds, and the function that
+    // walks them. Neither is derivable from the body symbol, so a ClosureNew names both;
+    // "" on every other kind, and on a closure that captures nothing or is never promoted.
+    capture_descs: Str
+    promoter: Str
 }
 
 // The arena. A node id is an index into this list, the same shape parser.bl uses for AST
@@ -80,7 +90,8 @@ pub fn ir_new(kind: IrKind, tid: Int, span: Int, c_spelling: Str, c_name: Str, s
     ir_nodes.push(IrNode {
         kind: kind, tid: tid, span: span, c_spelling: c_spelling, c_name: c_name,
         slot_form: slot_form, must_materialize: 0, kids: copy_ids(kids), decl: -1,
-        tag_member: "", payload_member: "",
+        tag_member: "", payload_member: "", kops_table: "",
+        capture_descs: "", promoter: "",
     })
     ir_nodes.len() - 1
 }
@@ -103,6 +114,12 @@ pub fn ir_c_name(id: Int) -> Str { ir_node(id).c_name }
 pub fn ir_tag_member(id: Int) -> Str { ir_node(id).tag_member }
 
 pub fn ir_payload_member(id: Int) -> Str { ir_node(id).payload_member }
+
+pub fn ir_kops_table(id: Int) -> Str { ir_node(id).kops_table }
+
+pub fn ir_capture_descs(id: Int) -> Str { ir_node(id).capture_descs }
+
+pub fn ir_promoter(id: Int) -> Str { ir_node(id).promoter }
 pub fn ir_slot_form(id: Int) -> SlotForm { ir_node(id).slot_form }
 // The printer's one type-shaped question, asked without importing SlotForm.
 pub fn ir_held_by_pointer(id: Int) -> Bool {
@@ -152,7 +169,8 @@ pub fn ir_all_kinds() -> List[IrKind] {
         IrKind.Const, IrKind.VarRef, IrKind.GlobalRef,
         IrKind.Unary, IrKind.Binary, IrKind.Cast,
         IrKind.FieldGet, IrKind.FieldSet, IrKind.StructNew, IrKind.TupleNew, IrKind.EnumNew, IrKind.ContainerNew,
-        IrKind.ContainerSpread, IrKind.Box, IrKind.Unbox, IrKind.CarrierWrap, IrKind.CarrierUnwrap, IrKind.CarrierTag,
+        IrKind.ContainerSpread, IrKind.Box, IrKind.Unbox, IrKind.SizedAlloc,
+        IrKind.CarrierWrap, IrKind.CarrierUnwrap, IrKind.CarrierTag,
         IrKind.CallDirect, IrKind.CallIndirect, IrKind.CallClosure, IrKind.CallVirtual, IrKind.CallRuntime,
         IrKind.ClosureNew, IrKind.EvidenceVector, IrKind.EvidenceAddress, IrKind.EffectPerform,
         IrKind.HandlerInstall,
@@ -179,6 +197,7 @@ pub fn ir_kind_name(kind: IrKind) -> Str {
         IrKind.ContainerSpread => "ContainerSpread"
         IrKind.Box => "Box"
         IrKind.Unbox => "Unbox"
+        IrKind.SizedAlloc => "SizedAlloc"
         IrKind.CarrierWrap => "CarrierWrap"
         IrKind.CarrierUnwrap => "CarrierUnwrap"
         IrKind.CarrierTag => "CarrierTag"
@@ -253,6 +272,7 @@ fn kind_needs_c_name(kind: IrKind) -> Bool {
         IrKind.ContainerNew => true
         IrKind.ContainerSpread => true
         IrKind.Box => true
+        IrKind.SizedAlloc => true
         IrKind.CarrierUnwrap => true
         IrKind.CallDirect => true
         IrKind.CallClosure => true
@@ -279,6 +299,7 @@ fn kind_min_kids(kind: IrKind) -> Int {
         IrKind.ContainerSpread => 1
         IrKind.Box => 1
         IrKind.Unbox => 1
+        IrKind.SizedAlloc => 2
         IrKind.CarrierWrap => 1
         IrKind.CarrierUnwrap => 1
         IrKind.CarrierTag => 1
@@ -312,6 +333,7 @@ fn kind_max_kids(kind: IrKind) -> Int {
         IrKind.ContainerSpread => 1
         IrKind.Box => 1
         IrKind.Unbox => 1
+        IrKind.SizedAlloc => 2
         IrKind.CarrierWrap => 2
         IrKind.CarrierUnwrap => 1
         IrKind.CarrierTag => 1
@@ -408,8 +430,20 @@ fn stamp_tagged_members(id: Int) -> Int {
     id
 }
 
-pub fn ir_container_new(tid: Int, span: Int, c_spelling: Str, ctor_symbol: Str, elems: List[Int]) -> Int {
-    ir_new(IrKind.ContainerNew, tid, span, c_spelling, ctor_symbol, SlotForm.InlineWord, elems)
+// kops_table is the key-operations table a map or set is built with, "" for a list. It is
+// a constructor parameter and not a setter so a lowerer can not forget it and leave a
+// hashed container with no way to compare its keys.
+pub fn ir_container_new(tid: Int, span: Int, c_spelling: Str, ctor_symbol: Str, kops_table: Str, elems: List[Int]) -> Int {
+    set_named_slots(ir_new(IrKind.ContainerNew, tid, span, c_spelling, ctor_symbol, SlotForm.InlineWord, elems), kops_table, "", "")
+}
+
+// The named slots in one place: the dump writes them together and the parser reads them
+// together, so a node is stamped with all three at once.
+fn set_named_slots(id: Int, kops: Str, capture_descs: Str, promoter: Str) -> Int {
+    if kops == "" && capture_descs == "" && promoter == "" { return id }
+    let n = ir_node(id)
+    ir_nodes.set(id, IrNode { kops_table: kops, capture_descs: capture_descs, promoter: promoter, ..n })
+    id
 }
 
 // `[..xs, y]`: the spread copies every element of xs into the container being built. It
@@ -428,6 +462,16 @@ pub fn ir_box(tid: Int, span: Int, c_spelling: Str, pointee_spelling: Str, value
 
 pub fn ir_unbox(tid: Int, span: Int, c_spelling: Str, slot_form: SlotForm, ptr: Int) -> Int {
     ir_new(IrKind.Unbox, tid, span, c_spelling, "", slot_form, [ptr])
+}
+
+// Room for `count` cells of one named type, taken from the scope the first kid names and
+// freed when that scope exits. It is the one node that carries a SIZE: a Box writes a size
+// too, but for a heap COPY of a value it already holds, and an allocation copies nothing,
+// so neither node can stand in for the other. c_spelling is the pointer the value is held
+// at, as on every value node; elem_spelling is the token the printer writes inside sizeof.
+// A single cell and an array differ only in the count, so one shape serves both spellings.
+pub fn ir_sized_alloc(tid: Int, span: Int, c_spelling: Str, elem_spelling: Str, scope: Int, count: Int) -> Int {
+    ir_new(IrKind.SizedAlloc, tid, span, c_spelling, elem_spelling, SlotForm.PointerBoxed, [scope, count])
 }
 
 // member is the carrier field the payload lands in ("value", "ok", "err"); "" for None.
@@ -466,8 +510,12 @@ pub fn ir_call_runtime(tid: Int, span: Int, c_spelling: Str, symbol: Str, slot_f
     ir_new(IrKind.CallRuntime, tid, span, c_spelling, symbol, slot_form, args)
 }
 
-pub fn ir_closure_new(tid: Int, span: Int, c_spelling: Str, fn_symbol: Str, captures: List[Int]) -> Int {
-    ir_new(IrKind.ClosureNew, tid, span, c_spelling, fn_symbol, SlotForm.InlineWord, captures)
+// capture_descs names the table describing what each capture holds and promoter the
+// function that moves them into an arena; each is "" when there is nothing to name. Both
+// are constructor parameters and not setters so a lowerer can not leave a promotable
+// closure with no way to be promoted.
+pub fn ir_closure_new(tid: Int, span: Int, c_spelling: Str, fn_symbol: Str, capture_descs: Str, promoter: Str, captures: List[Int]) -> Int {
+    set_named_slots(ir_new(IrKind.ClosureNew, tid, span, c_spelling, fn_symbol, SlotForm.InlineWord, captures), "", capture_descs, promoter)
 }
 
 // The evidence vector in scope: the `blink_ev*` parameter of an effectful function
@@ -954,6 +1002,21 @@ fn dump_node(sb: StringBuilder, id: Int, depth: Int, refs: List[Int], labels: Li
     sb.write(" ")
     sb.write(quote(n.c_name))
     if n.decl >= 0 { sb.write(" @{n.decl}") }
+    // Named slots sit after the positional fields and before the kids, and only when they
+    // hold something, so a node that uses none dumps exactly the text it dumped before the
+    // slot existed. A kid opens with "(" or "#", so a name can never be read as one.
+    if n.kops_table != "" {
+        sb.write(" kops=")
+        sb.write(quote(n.kops_table))
+    }
+    if n.capture_descs != "" {
+        sb.write(" descs=")
+        sb.write(quote(n.capture_descs))
+    }
+    if n.promoter != "" {
+        sb.write(" promoter=")
+        sb.write(quote(n.promoter))
+    }
     for kid in n.kids {
         sb.write("\n")
         dump_node(sb, kid, depth + 1, refs, labels, next_label)
@@ -1032,6 +1095,27 @@ fn parse_node() -> Int {
     skip_ws()
     let decl = if eat("@") { read_int() } else { -1 }
     if pr_failed { return -1 }
+    let mut kops = ""
+    let mut descs = ""
+    let mut promoter = ""
+    skip_ws()
+    while !peek_is(")") && !peek_is("(") && !peek_is("#") {
+        if pr_pos >= pr_text.len() { return fail() }
+        let field = read_ident()
+        if !eat("=") { return fail() }
+        let text = read_string()
+        if pr_failed { return -1 }
+        if field == "kops" {
+            kops = text
+        } else if field == "descs" {
+            descs = text
+        } else if field == "promoter" {
+            promoter = text
+        } else {
+            return fail()
+        }
+        skip_ws()
+    }
     let mut kids: List[Int] = []
     skip_ws()
     while !peek_is(")") {
@@ -1050,7 +1134,7 @@ fn parse_node() -> Int {
         Some(f) => f
         None => return fail()
     }
-    let id = stamp_tagged_members(ir_new(kind, tid, span, spelling, name, slot, kids))
+    let id = set_named_slots(stamp_tagged_members(ir_new(kind, tid, span, spelling, name, slot, kids)), kops, descs, promoter)
     if mat == 1 { ir_mark_materialize(id) }
     if decl >= 0 { set_decl(id, decl) }
     if label >= 0 { bind_label(label, id) }
