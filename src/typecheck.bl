@@ -37,7 +37,7 @@ import diagnostics.{
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905,
     TRAIT_CONTRACT_906, TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
     POLY_IMPL_UNSUPPORTED, IMPL_BINDER_UNUSED, TRAIT_ARG_ARITY, MISSING_SUPERTRAIT_IMPL, TYPE_ARG_ARITY,
-    CALL_SITE_TYPE_ARGS,
+    CALL_SITE_TYPE_ARGS, ENUM_PATTERN_NON_ENUM,
     CONTRACT_PREDICATE_NOT_DECIDABLE, EFFECTFUL_CALL_IN_PREDICATE,
     IMPURE_CALL_IN_PREDICATE, LOOP_IN_PREDICATE,
     RESULT_OUTSIDE_ENSURES, OLD_OUTSIDE_ENSURES,
@@ -17674,6 +17674,64 @@ fn tc_check_stmt_match_arm(arm: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag
     tc_check_body(node_body(arm))
 }
 
+// Whether a type has no variants at all, so that no in-scope reading of an enum-variant
+// pattern could make an arm over it well typed. Deliberately the builtin scalars only: an
+// enum is already correct, a carrier's variants are Some/Ok/Err, and anything unsolved is
+// not yet decidable.
+fn tc_kind_has_no_variants(tid: Int) -> Int {
+    if tid < 0 { return 0 }
+    match type_kind(tid) {
+        TyKind.Int => 1
+        TyKind.Float => 1
+        TyKind.Bool => 1
+        TyKind.Str => 1
+        TyKind.Char => 1
+        TyKind.I8 => 1
+        TyKind.I16 => 1
+        TyKind.I32 => 1
+        TyKind.U8 => 1
+        TyKind.U16 => 1
+        TyKind.U32 => 1
+        TyKind.U64 => 1
+        _ => 0
+    }
+}
+
+// sections/03_types.md:1209 -- an enum is nominally distinct from Int, so an arm naming one of
+// its variants cannot match a scalar scrutinee. Reported from the statement walk, not from
+// tc_check_pattern_types: that walk runs many times per node and is deliberately
+// diagnostic-free, so an emit there would repeat. Only the arm's TOP-LEVEL pattern is read,
+// because only that one is matched against the scrutinee.
+fn tc_check_enum_pattern_scrutinee(pat: Int, scrut_tid: Int) ! Diag.Report {
+    if pat == -1 { return }
+    let k = node_kind(pat)
+    if k == NodeKind.OrPattern {
+        let alts = node_elements(pat)
+        if alts != -1 {
+            let mut i = 0
+            while i < sublist_length(alts) {
+                tc_check_enum_pattern_scrutinee(sublist_get(alts, i), scrut_tid)
+                i = i + 1
+            }
+        }
+        return
+    }
+    if k != NodeKind.EnumPattern { return }
+    // A qualified `E.V` only: an unqualified variant name resolves against the scrutinee and
+    // draws its own diagnostic when that fails.
+    let variant = node_type_name(pat)
+    if variant == "" { return }
+    let qual = node_name(pat)
+    let qual_tid = named_type_map.get(qual) ?? -1
+    if qual_tid < 0 { return }
+    if type_kind(qual_tid) != TyKind.Enum { return }
+    if tc_kind_has_no_variants(scrut_tid) == 0 { return }
+    diag_error_at("EnumPatternNeedsEnumScrutinee", ENUM_PATTERN_NON_ENUM,
+        "match arm names variant '{qual}.{variant}', but the value being matched has type '{type_to_str(scrut_tid)}' -- a scalar has no variants, so this arm can never be the one that runs",
+        pat,
+        "match the enum itself, or cross the boundary explicitly with {qual}.from_int(...), which answers Option[{qual}]")
+}
+
 fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return }
     let kind = node_kind(node)
@@ -18192,6 +18250,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 tc_pattern_binding_type = scrut_tid
                 tc_check_pattern_types(node_pattern(arm))
                 tc_pattern_binding_type = -1
+                tc_check_enum_pattern_scrutinee(node_pattern(arm), scrut_tid)
                 tc_check_stmt_match_arm(arm)
                 // Resolve the arm's body-value tid through the scoped-value memo, NOT a bare
                 // tc_lookup_node_tid: a braced arm body (`Pat => { ... }`) makes tc_arm_body_value

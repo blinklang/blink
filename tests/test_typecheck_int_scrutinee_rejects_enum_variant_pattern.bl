@@ -1,0 +1,154 @@
+// sections/03_types.md:1209 decided this rule and named what was holding it back:
+//
+//   > Pattern matching an `Int` scrutinee against enum-variant patterns
+//   > (`match someInt { State.Idle => ... }`) is the pattern-side dual of the
+//   > assignability rule and is likewise ill-typed. Enforcement of that case is staged
+//   > behind the compiler's internal `kind: Int -> NodeKind` representation migration;
+//   > the rule itself holds from this decision.
+//
+// That migration is done, so the rule is enforced here. Until now typecheck accepted the
+// construct and codegen ICEd on it, which reads as a compiler bug rather than as the
+// author's type error, and it is the whole UnknownVariant class in the rewrite corpus.
+//
+// The rule is narrow on purpose. It fires when the scrutinee is a builtin scalar, which has
+// no variants at all, so no in-scope reading of the pattern could make it well typed. It
+// does not fire on an enum, a carrier, or anything still unsolved, because those are either
+// correct already or not yet decidable here.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn probe_diag_names(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out = "{out}{d.name} " }
+    }
+    out.trim()
+}
+
+fn int_scrutinee_src() -> Str {
+    #"type Kind { A, B }
+
+fn name_of(k: Int) -> Str {
+    match k {
+        Kind.A => "A"
+        _ => "other"
+    }
+}
+
+fn main() { io.println(name_of(0)) }
+"#
+}
+
+fn sized_int_scrutinee_src() -> Str {
+    #"type Kind { A, B }
+
+fn name_of(k: U8) -> Str {
+    match k {
+        Kind.A => "A"
+        _ => "other"
+    }
+}
+
+fn main() { io.println(name_of(0)) }
+"#
+}
+
+fn str_scrutinee_src() -> Str {
+    #"type Kind { A, B }
+
+fn name_of(k: Str) -> Str {
+    match k {
+        Kind.A => "A"
+        _ => "other"
+    }
+}
+
+fn main() { io.println(name_of("x")) }
+"#
+}
+
+// The construct the rule exists to allow: the scrutinee is the enum the arms name.
+fn enum_scrutinee_src() -> Str {
+    #"type Kind { A, B }
+
+fn name_of(k: Kind) -> Str {
+    match k {
+        Kind.A => "A"
+        Kind.B => "B"
+    }
+}
+
+fn main() { io.println(name_of(Kind.A)) }
+"#
+}
+
+// sections/03_types.md:1202 — comparison between an enum and an Int stays defined, because
+// it reads the shared tag rather than claiming assignability. The compiler's own
+// is_block_bearing is written this way, so a rule that caught this would break the tree.
+fn int_comparison_src() -> Str {
+    #"type Kind { A, B }
+
+fn is_a(k: Int) -> Bool {
+    if k == Kind.A { return true }
+    false
+}
+
+fn main() { io.println("{is_a(0)}") }
+"#
+}
+
+// A carrier scrutinee reaches the same pattern code with a non-enum kind in hand. It is not
+// a scalar, and Some/Ok/Err are its variants, so the rule must leave it alone.
+fn carrier_scrutinee_src() -> Str {
+    #"fn first(xs: List[Int]) -> Int {
+    match xs.get(0) {
+        Some(n) => n
+        None => 0
+    }
+}
+
+fn main() { io.println("{first([7])}") }
+"#
+}
+
+fn assert_names(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: drew '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+test "an Int scrutinee matched against an enum variant is refused" {
+    assert_names("Int scrutinee", probe_diag_names("tc_intscrut_int", int_scrutinee_src()),
+        "EnumPatternNeedsEnumScrutinee")
+}
+
+test "a sized-int scrutinee is refused under the same rule" {
+    assert_names("U8 scrutinee", probe_diag_names("tc_intscrut_u8", sized_int_scrutinee_src()),
+        "EnumPatternNeedsEnumScrutinee")
+}
+
+test "a Str scrutinee is refused under the same rule" {
+    assert_names("Str scrutinee", probe_diag_names("tc_intscrut_str", str_scrutinee_src()),
+        "EnumPatternNeedsEnumScrutinee")
+}
+
+test "an enum scrutinee matched against its own variants is accepted" {
+    assert_names("enum scrutinee", probe_diag_names("tc_intscrut_enum", enum_scrutinee_src()), "")
+}
+
+test "comparing an Int against an enum variant stays legal" {
+    assert_names("comparison", probe_diag_names("tc_intscrut_cmp", int_comparison_src()), "")
+}
+
+test "a carrier scrutinee is not a scalar and is left alone" {
+    assert_names("carrier scrutinee",
+        probe_diag_names("tc_intscrut_carrier", carrier_scrutinee_src()), "")
+}
