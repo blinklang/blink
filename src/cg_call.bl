@@ -29,7 +29,7 @@ import typecheck.{
     TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, lookup_named_type,
     DECL_NODE_AMBIGUOUS,
     is_import_module_name, is_builtin_namespace, is_builtin_fn, is_intrinsic_method, tc_alias_to_original,
-    tc_qualifier_to_module_or_self, tc_get_symbol_module, tc_type_str,
+    tc_type_str,
     tc_enum_variant_slots, tc_evar_name, tc_tid_child_count,
     tc_struct_field_slots, tc_sfield_name,
     tc_names_a_type, tc_is_sealed_list_hof, is_user_effect_handle_name,
@@ -263,6 +263,26 @@ pub fn lower_spread(node: Int, into_tid: Int) -> Int ! Diag.Report {
     -1
 }
 
+// assert/assert_eq/assert_ne/debug_assert are recognised by is_builtin_fn with no
+// declaration and no plain runtime symbol behind them: the runtime only exposes fail-path
+// helpers (__blink_assert_fail, __blink_assert_fail_eq, __blink_debug_assert_fail) that
+// imply a conditional built at the call site -- `if !cond { <fail helper> }` -- with
+// source line/col and, for assert_eq, separate expected/actual rendering. Composing that
+// conditional is a statement-shaped answer this stage's one-value-producing contract
+// cannot give on its own; it is cg_stmt's shape (ir.bl already has IrKind.If and
+// IrKind.Panic). This only tells the four names apart from every other unbuilt free call,
+// so the refusal names the actual gap instead of the generic closure-value one.
+fn cc_is_assert_family(name: Str) -> Bool {
+    name == "assert" || name == "assert_eq" || name == "assert_ne" || name == "debug_assert"
+}
+
+fn cc_assert_not_lowered(node: Int, name: Str) -> Int ! Diag.Report {
+    diag_ice_at("AssertLoweringNotBuilt", CODEGEN_STAGE_NOT_BUILT,
+        "{name} has no lowering", node,
+        "the fail-path runtime call needs an if+panic composition cg_stmt builds; this stage only resolves the free-function name")
+    -1
+}
+
 // One owner for reading an element out of a container: `[i]`, which answers the element
 // type, and `.get(i)`, which answers an Option over it. Only the index is routed here yet;
 // the checked read keeps its arm so that the refusal names the right gap when it is.
@@ -290,7 +310,14 @@ pub fn lower_element_read(node: Int) -> Int ! Diag.Report {
     if obj < 0 { return -1 }
     let index = lower_expr(node_index(node))
     if index < 0 { return -1 }
-    let raw = ir_call_runtime(tid, node, shape.slot.c_spelling, helper, shape.slot.slot_form, [obj, index])
+    // The runtime helper answers the container's own void* cell, whatever the element type
+    // is; that is the one C signature every such helper shares. Labelling this node with the
+    // element's own spelling instead would be latent here, because the casts above are what
+    // print when this expression stays inline, but a statement that hoists this call into a
+    // temp of its own reads this node's own label to declare that temp -- and a void*
+    // returned into a variable declared as the element's type is not a conversion C performs
+    // on its own.
+    let raw = ir_call_runtime(tid, node, container_slot_spelling(), helper, shape.slot.slot_form, [obj, index])
     let read = ir_cast(tid, node, shape.slot.c_spelling, cc_from_slot_word(tid, node, shape.slot, raw))
     if !shape.boxed { return read }
     ir_unbox(tid, node, shape.value.c_spelling, shape.value.slot_form, read)
@@ -494,18 +521,17 @@ fn lower_fn_call(node: Int) -> Int ! Diag.Report {
     // something else reaches the builtin under its own name regardless.
     let name = cc_declared_name(node_name(callee))
     if is_builtin_fn(name) == 1 { return lower_builtin_free_call(node, name) }
-    // typecheck's own call-site table is read first: it is keyed on this call node rather
-    // than on a spelling, so two modules declaring the same name are told apart the way the
-    // caller's own import list already told them apart, with no re-derived search that could
-    // land on the wrong one. Its one known gap is a name that reaches here only through an
-    // import alias binding no OTHER declaration shares (`nr_resolve_bare_decl` reads
-    // `nr_decls_by_name`, which is keyed on declared spellings, so a pure alias with no
-    // declaration of its own is invisible to it) — a call through `merged` where the import
-    // read `map_merge as merged` and nothing else in the program is named `merged` at all.
-    // That shape still falls back to the alias-resolved name search below.
+    // typecheck's own call-site table is the sole answer here: it is keyed on this call
+    // node rather than on a spelling, so two modules declaring the same name are told
+    // apart the way the caller's own import list already told them apart, and a name
+    // reachable only through an import alias is told apart the same way. No re-derived
+    // search of every declaration by spelling backs this up any more: one could still find
+    // a wrongly-shared name a re-export or an alias meant to reach past. A miss here is not
+    // an undeclared name — typecheck already accepted the call — so it names a closure
+    // value or a compiler-provided call form, which cc_no_such_callee already refuses.
     let decl = tc_call_decl_node(node)
     if decl >= 0 { return cc_free_call(node, decl) }
-    cc_free_call(node, cc_fn_anywhere(node, name))
+    cc_no_such_callee(node)
 }
 
 // A bare call to a name the compiler recognises without any Blink declaration standing
@@ -522,6 +548,7 @@ fn lower_builtin_free_call(node: Int, name: Str) -> Int ! Diag.Report {
         if given != want { return cc_free_arity_wrong(node, name, want, given) }
         return cc_build_call(node, symbol, NO_RECEIVER, CallForm.Runtime, false)
     }
+    if cc_is_assert_family(name) { return cc_assert_not_lowered(node, name) }
     let answer = tid_of_node(node)
     if answer < 0 { return -1 }
     let ctor = cc_runtime_ctor_symbol(cc_kind(answer), "new")
@@ -646,19 +673,18 @@ fn cc_call_site_type_arg_call(node: Int) -> Int ! Diag.Report {
 // and the declaration is the one that module declares rather than whichever module
 // happens to spell the name.
 //
-// typecheck's own call-site table is read first and is the answer for every ordinary
-// qualified call, the same table a bare call reads. It has one known gap: a qualifier that
-// only re-exports the member (`nr_resolve_qualified_decl` matches the qualifier's own
-// declarations, not a chain of `pub import`s), so a miss here still falls back to naming
-// the member through the flat symbol table rather than refusing a program the front end
-// accepted. The method name is read exactly as written, never through the alias table: a
-// qualified access is never subject to another file's import alias, which only ever
-// renames a bare name inside the file that bound it.
-fn lower_module_call(node: Int, obj: Int) -> Int ! Diag.Report {
+// typecheck's own call-site table is the sole answer here, for every ordinary qualified
+// call and a re-export chain alike (`nr_resolve_qualified_decl` follows a `pub import`
+// chain to the declaration it forwards). A miss is not an undeclared member — typecheck
+// already accepted the call — so the qualifier reaches something other than a function
+// declaration: a re-exported type, or a value the module holds under that name. The method
+// name is read exactly as written, never through the alias table: a qualified access is
+// never subject to another file's import alias, which only ever renames a bare name inside
+// the file that bound it.
+fn lower_module_call(node: Int) -> Int ! Diag.Report {
     let decl = tc_call_decl_node(node)
     if decl >= 0 { return cc_free_call(node, decl) }
-    let module_key = tc_qualifier_to_module_or_self(node_name(obj))
-    cc_free_call(node, cc_fn_in_module(node, module_key, node_method(node)))
+    cc_no_module_member(node)
 }
 
 // The tail every free-function call shares once its declaration is known. A declaration of
@@ -715,38 +741,6 @@ fn cc_instance_name(node: Int, decl: Int) -> Str ! Diag.Report {
         "the call of generic '{node_name(decl)}' has no monomorphised instance here", node,
         "the pass must record an instance of this declaration for this call site")
     ""
-}
-
-// The function one named module exposes: the one it declares, else the one it re-exports.
-// A qualifier settles the module, so another module's declaration of the same name is a
-// candidate only through a re-export, and the front end has already decided which module
-// each name resolves to.
-fn cc_fn_in_module(node: Int, module_key: Str, name: Str) -> Int ! Diag.Report {
-    let own = cc_fn_declared_in(module_key, name)
-    if own >= 0 { return own }
-    if tc_get_symbol_module(name) == module_key { return cc_fn_anywhere(node, name) }
-    cc_no_module_member(node)
-}
-
-// A module is named twice over: by the path its file was read from, and by the name it
-// announces itself under. A qualifier is the announced name, so the declarations it reaches
-// are the ones filed under that name, not the ones filed under the path.
-fn cc_fn_declared_in(module_key: Str, name: Str) -> Int {
-    for f in cg_reg_fn_decls() {
-        if node_name(f) == name && node_module(f) == module_key { return f }
-    }
-    -1
-}
-
-// The declaration a bare name means. The front end refuses a bare name that a second
-// loaded module also declares, so one declaration is the whole answer here; more than one
-// is an internal error rather than a guess, because the wrong choice is a call to the
-// wrong function.
-fn cc_fn_anywhere(node: Int, name: Str) -> Int ! Diag.Report {
-    let decl = cc_sole_fn_named(node, name)
-    if decl == DECL_REFUSED { return -1 }
-    if decl < 0 { return cc_no_such_callee(node) }
-    decl
 }
 
 // Typecheck accepted the call, so the name is not undeclared: it binds a closure value, or
@@ -810,7 +804,7 @@ fn lower_namespace_call(node: Int, obj: Int) -> Int ! Diag.Report {
     let ns = node_name(obj)
     let method = node_method(node)
     if is_intrinsic_method(ns, method) == 0 && is_import_module_name(ns) == 1 {
-        return lower_module_call(node, obj)
+        return lower_module_call(node)
     }
     if ns == ns_io { return lower_io_call(node, method) }
     if ns == ns_env { return lower_env_call(node, method) }
@@ -1769,7 +1763,7 @@ let conversion_error_target_field = "target_type"
 fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let obj = node_obj(node)
     let role = cc_receiver_role(obj)
-    if role == Receiver.Module { return lower_module_call(node, obj) }
+    if role == Receiver.Module { return lower_module_call(node) }
     if role == Receiver.Namespace { return lower_namespace_call(node, obj) }
     if role == Receiver.TypeOwner { return lower_static_call(node, obj) }
     if role == Receiver.TraitOwner { return lower_trait_qualified_call(node, obj) }

@@ -92,16 +92,29 @@ fn src_closure_arg() -> Str {
 "#
 }
 
-// The tail this slice leaves refused: `assert` is statement-shaped compiler sugar with no
-// value-returning lowering here, and `Set()` names a keyed container whose key operations
-// this stage cannot choose from a call alone. Both must still refuse through the exact
-// mechanism they refused through before this slice touched the free-call path.
+// The tail this slice leaves refused: `Set()` names a keyed container whose key operations
+// this stage cannot choose from a call alone, and must still refuse through the exact
+// mechanism it refused through before this slice touched the free-call path.
 fn src_refused() -> Str {
     #"fn main() {
     let mut seen = Set()
     seen.insert(7)
-    assert(1 == 1)
     let _keep = seen.len()
+}
+"#
+}
+
+// The four assertion builtins are statement-shaped compiler sugar with no value-returning
+// lowering here: each names its own gap now, rather than sharing the generic "closure
+// values and compiler-provided calls" refusal every other unbuilt name still falls into.
+fn src_assert_family() -> Str {
+    #"fn main() {
+    let start = 0
+    assert(1 == 1)
+    assert_eq(1 + 1, 2)
+    assert_ne(1, 2)
+    debug_assert(1 == 1)
+    let _keep = start
 }
 "#
 }
@@ -261,11 +274,34 @@ test "a bare Set() still refuses through the same call this stage does not lower
         "cg_call closure values and compiler-provided calls")
 }
 
-test "assert still refuses as a call this stage does not lower" {
-    probe("cg_call_bf_assert", src_refused())
-    assert_ice_saying("assert", lower_expr(call_after("seen", "assert")),
-        "CodegenStageNotBuilt",
-        "cg_call closure values and compiler-provided calls")
+// Each assertion builtin now names its own gap instead of falling through to the generic
+// refusal every other unbuilt free name still shares. The runtime only exposes fail-path
+// helpers (__blink_assert_fail, __blink_assert_fail_eq, __blink_debug_assert_fail) that
+// imply a conditional built at the call site; composing that conditional is cg_stmt's
+// shape (ir.bl already has IrKind.If and IrKind.Panic), not a plain call this stage's
+// one-value-producing contract can build alone.
+test "assert names its own gap instead of the generic closure-value refusal" {
+    probe("cg_call_bf_assert_family", src_assert_family())
+    assert_ice_saying("assert", lower_expr(call_after("start", "assert")),
+        "AssertLoweringNotBuilt", "assert has no lowering")
+}
+
+test "assert_eq names its own gap instead of the generic closure-value refusal" {
+    probe("cg_call_bf_assert_family", src_assert_family())
+    assert_ice_saying("assert_eq", lower_expr(call_after("start", "assert_eq")),
+        "AssertLoweringNotBuilt", "assert_eq has no lowering")
+}
+
+test "assert_ne names its own gap instead of the generic closure-value refusal" {
+    probe("cg_call_bf_assert_family", src_assert_family())
+    assert_ice_saying("assert_ne", lower_expr(call_after("start", "assert_ne")),
+        "AssertLoweringNotBuilt", "assert_ne has no lowering")
+}
+
+test "debug_assert names its own gap instead of the generic closure-value refusal" {
+    probe("cg_call_bf_assert_family", src_assert_family())
+    assert_ice_saying("debug_assert", lower_expr(call_after("start", "debug_assert")),
+        "AssertLoweringNotBuilt", "debug_assert has no lowering")
 }
 
 test "a wrong-arity plain runtime call refuses rather than emit an uncompilable call" {
