@@ -1,0 +1,66 @@
+import std.io
+import ir.{
+    ir_reset, ir_kind, ir_kind_name, ir_c_name, ir_kops_table, ir_kid_count,
+    ir_verify, ir_dump, ir_parse,
+    ir_const, ir_var_ref, ir_container_new,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn int_const(text: Str) -> Int { ir_const(1, 0, "int64_t", text) }
+
+fn map_literal() -> Int {
+    ir_container_new(12, 0, "blink_map*", "blink_map_new", "blink_kops_int", [int_const("1"), int_const("2")])
+}
+
+// A key-operations table is what a hashed container needs to compare and hash its keys.
+// The node names the table layout resolved; nothing downstream spells the symbol itself.
+test "a map names the key-operations table its keys are compared with" {
+    ir_reset()
+    let m = map_literal()
+    assert_eq_str("the constructor stays in c_name", ir_c_name(m), "blink_map_new")
+    assert_eq_str("the table has a slot of its own", ir_kops_table(m), "blink_kops_int")
+    assert_eq_int("the elements stay the kids", ir_kid_count(m), 2)
+    assert_eq_int("it verifies", ir_verify(m).len(), 0)
+}
+
+test "a set names a table and a list names none" {
+    ir_reset()
+    let st = ir_container_new(13, 0, "blink_set*", "blink_set_new", "blink_kops_str", [])
+    assert_eq_str("set table", ir_kops_table(st), "blink_kops_str")
+    let xs = ir_container_new(4, 0, "blink_list*", "blink_list_new", "", [int_const("7")])
+    assert_eq_str("a list compares no keys, so it names no table", ir_kops_table(xs), "")
+    assert_eq_int("both verify", ir_verify(st).len() + ir_verify(xs).len(), 0)
+}
+
+test "the key-operations table round-trips through dump and parse" {
+    ir_reset()
+    let text = ir_dump(map_literal())
+    let back = ir_parse(text)
+    assert_eq_int("parsed", if back >= 0 { 1 } else { 0 }, 1)
+    assert_eq_str("kind survives", ir_kind_name(ir_kind(back)), "ContainerNew")
+    assert_eq_str("table survives", ir_kops_table(back), "blink_kops_int")
+    assert_eq_str("re-dump is stable", ir_dump(back), text)
+}
+
+// The slot is written only where there is something to write, so a list dumps exactly the
+// text it dumped before the slot existed.
+test "a container that names no table dumps no slot" {
+    ir_reset()
+    let xs = ir_container_new(4, 0, "blink_list*", "blink_list_new", "", [])
+    assert_eq_str("list", ir_dump(xs), "(ContainerNew 4 0 InlineWord 0 \"blink_list*\" \"blink_list_new\")")
+    let m = ir_container_new(12, 0, "blink_map*", "blink_map_new", "blink_kops_int", [])
+    assert_eq_str("map", ir_dump(m), "(ContainerNew 12 0 InlineWord 0 \"blink_map*\" \"blink_map_new\" kops=\"blink_kops_int\")")
+}
