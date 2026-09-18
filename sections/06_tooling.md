@@ -1061,7 +1061,7 @@ test "logger calls audit hook on warn-or-higher" {
 
 Use the inline `handler E { fn op(...) { calls.push(...) } }` pattern at the test site when you need ad-hoc op recording for an effect the stdlib does not (yet) ship a mock for. The pattern is shorter than the corresponding `record_calls` import-and-destructure would be.
 
-**Panel vote (br j21b6c): 5-1** for shipping both `mock_clock` and `mock_env` (Round 2; Round 1 was 4-1-1 — minimalism conceded A2→A3 with the `Env.exit` footgun argument). **5-1** for central `std.testing` placement (sys dissent on binary-size compounding). **5-1 R2** for controller-struct shape on `mock_clock` (Round 2 after aiml's nesting concession; min dissent). **4-2 R2** for controller-struct shape on `mock_env` (Round 2 after web's procedural D2 disambiguation and aiml's internal-consistency concession; devops and min held D1). **6-0** rejecting `record_calls[E]`. See [DECISIONS.md](../DECISIONS.md) and [decisions/mocking-helpers-beyond-io.md](../decisions/mocking-helpers-beyond-io.md).
+**Panel vote: 5-1** for shipping both `mock_clock` and `mock_env` (Round 2; Round 1 was 4-1-1 — minimalism conceded A2→A3 with the `Env.exit` footgun argument). **5-1** for central `std.testing` placement (sys dissent on binary-size compounding). **5-1 R2** for controller-struct shape on `mock_clock` (Round 2 after aiml's nesting concession; min dissent). **4-2 R2** for controller-struct shape on `mock_env` (Round 2 after web's procedural D2 disambiguation and aiml's internal-consistency concession; devops and min held D1). **6-0** rejecting `record_calls[E]`. See [DECISIONS.md](../DECISIONS.md) and [decisions/mocking-helpers-beyond-io.md](../decisions/mocking-helpers-beyond-io.md).
 
 #### 8.10.4 Deterministic randomness: `--seed` and `mock_rand`
 
@@ -1175,13 +1175,13 @@ test "shuffle preserves length" {
 
 **`.reseed(seed)`.** Resets `state` to the given seed and zeroes `draw_count`. Useful for sub-loops in a single test that want fresh streams without constructing a new `MockRand`.
 
-**Why a controller struct, not a free-fn handler factory.** Stateful mocks ship as controller structs in `std.testing` (the j21b6c rule, see [decisions/mocking-helpers-beyond-io.md](../decisions/mocking-helpers-beyond-io.md)) — uniform shape across `mock_clock`, `mock_env`, `mock_rand`. A free-fn `mock_rand(seed) -> Handler[Rand]` would lose the `.draws()` audit hook and break the family pattern for one effect. Authors who only want determinism and do not need draw-count introspection write `with mock_rand(seed).handler() { ... }` as a single line and discard the controller.
+**Why a controller struct, not a free-fn handler factory.** Stateful mocks ship as controller structs in `std.testing` (the mocking-helpers rule, see [decisions/mocking-helpers-beyond-io.md](../decisions/mocking-helpers-beyond-io.md)) — uniform shape across `mock_clock`, `mock_env`, `mock_rand`. A free-fn `mock_rand(seed) -> Handler[Rand]` would lose the `.draws()` audit hook and break the family pattern for one effect. Authors who only want determinism and do not need draw-count introspection write `with mock_rand(seed).handler() { ... }` as a single line and discard the controller.
 
-**Why not `seeded_rng`.** The name `mock_rand` parallels `mock_clock` and `mock_env`; a parallel `seeded_rng` free-fn would split the surface across two names for one primitive without removing anything. The j21b6c rule already established "one controller per mocked effect" as the consistency invariant — `seeded_rng` is rejected on those grounds.
+**Why not `seeded_rng`.** The name `mock_rand` parallels `mock_clock` and `mock_env`; a parallel `seeded_rng` free-fn would split the surface across two names for one primitive without removing anything. The mocking-helpers rule already established "one controller per mocked effect" as the consistency invariant — `seeded_rng` is rejected on those grounds.
 
 ##### PRNG algorithm
 
-`MockRand` and the runner's per-property RNG are **implementation-defined, deterministic given seed**. The current implementation uses `xoshiro256**` initialized from a `U64` seed via SplitMix64 expansion. The choice is intentionally not in the spec surface — if a future `Rand` resolution (currently tracked in br `2jersy`) names a specific generator for the production handler, the testing-side implementation will align without breaking the user-facing API. The reproduce-by-seed contract holds for any single compiler version; the spec does not guarantee bit-identical reproduction across major versions.
+`MockRand` and the runner's per-property RNG are **implementation-defined, deterministic given seed**. The current implementation uses `xoshiro256**` initialized from a `U64` seed via SplitMix64 expansion. The choice is intentionally not in the spec surface — if a future `Rand` resolution names a specific generator for the production handler, the testing-side implementation will align without breaking the user-facing API. The reproduce-by-seed contract holds for any single compiler version; the spec does not guarantee bit-identical reproduction across major versions.
 
 ##### Stated assumption about the `Rand` effect
 
@@ -1215,8 +1215,8 @@ blink test --parked <ticket>
 
 ```json
 { "event": "parked_file",
-  "path": ".tmp/btvqbf/red_question_mark.bl",
-  "ticket": "btvqbf",
+  "path": ".tmp/a1b2c3/red_question_mark.bl",
+  "ticket": "a1b2c3",
   "reason": "needs Phase-2 ? propagation in test bodies",
   "diagnostic": "lex error: unexpected token '?'" }
 ```
@@ -1250,7 +1250,7 @@ A test that **builds and runs** but is *expected* to be red — because the feat
 test.failing(
   "trait impl resolves through alias chain",
   reason: "Phase 3 trait elaboration not yet implemented",
-  ticket: "btvqbf",
+  ticket: "a1b2c3",
 ) {
   // ... test body, expected to fail today
 }
@@ -1273,7 +1273,7 @@ The **expected** (red) case emits `status: "passed"`:
 { "name": "trait impl resolves through alias chain",
   "status": "passed",
   "expected_fail": true,
-  "xfail_reason": "br:btvqbf — Phase 3 trait elaboration not yet implemented" }
+  "xfail_reason": "br:a1b2c3 — Phase 3 trait elaboration not yet implemented" }
 ```
 
 The test ran, failed as expected, and the runner counts that as a success — `status: "passed"` reflects the *suite-level* outcome.
@@ -1286,7 +1286,7 @@ An **unexpected pass** (the test was expected to fail but actually passed) becom
   "cause": "assertion",
   "assertion": "expected failure, got pass",
   "expected_fail": true,
-  "xfail_reason": "br:btvqbf — Phase 3 trait elaboration not yet implemented" }
+  "xfail_reason": "br:a1b2c3 — Phase 3 trait elaboration not yet implemented" }
 ```
 
 The suite-failure rule is mechanical:

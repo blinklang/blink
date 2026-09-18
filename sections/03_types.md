@@ -1455,7 +1455,7 @@ fn f() -> Int {
 
 The `Err(e) => n` arm does not rescue the scrutinee. It binds `e` but discards it without observing its type, so — like `.len()` on a list of undetermined element type — it constrains the container's shape, not the open parameter. A fully-determined variant is unaffected: `match (Some(5), 9)` compiles, because `Some(5)` pins `Option`'s only parameter and leaves nothing open.
 
-**What pins `E`.** The error type of a `Result` is determined by any one of four things: a type annotation on the binding (`let r: Result[Int, Str] = Ok(3)`), a `?` in a context whose error type it must match, a `match` arm that reads the `Err` payload's type, or an enclosing return type that names it. When none is present, `E` is under-determined and the constructor must state it. The repair is an explicit type-argument list on the constructor — `Ok[Int, Str](3)` (§3.4 *Explicit Type Application*) — placed where the open parameter lives. As with every under-determined binding, E0301 is reported where its repair attaches (§3.4, amended by `8w0yj9`): the `let` when a binding dominates the value, otherwise the constructor's type-argument position, with the dual-span blame at the open constructor.
+**What pins `E`.** The error type of a `Result` is determined by any one of four things: a type annotation on the binding (`let r: Result[Int, Str] = Ok(3)`), a `?` in a context whose error type it must match, a `match` arm that reads the `Err` payload's type, or an enclosing return type that names it. When none is present, `E` is under-determined and the constructor must state it. The repair is an explicit type-argument list on the constructor — `Ok[Int, Str](3)` (§3.4 *Explicit Type Application*) — placed where the open parameter lives. As with every under-determined binding, E0301 is reported where its repair attaches (§3.4, as amended): the `let` when a binding dominates the value, otherwise the constructor's type-argument position, with the dual-span blame at the open constructor.
 
 There is no "an Ok-only value proves the error type is uninhabited, so resolve it to a bottom type" rule. Inferring a type the program never wrote — whether the erased unit `Void` or a bottom `Never` — into an unconstrained slot is the same unlicensed substitution the two-state model forbids; a `Never` error type is reached only when a program *writes* `Result[Int, Never]`, never chosen by inference for an open slot. The I0001 backstop that catches a variable reaching monomorphization keys on the variable's *kind*, never on the concrete tag it would have been given, so a genuine `Result[Void, Str]` or an explicitly-written `Result[Int, Never]` is unaffected.
 
@@ -2667,7 +2667,7 @@ the invariant that **`Char.debug()` emits only escapes the lexer already accepts
 (round-trip). The one v1 gap is a non-printable scalar that has no named escape (e.g. `U+0007` BEL):
 it is emitted as its raw byte(s) between the quotes, which is faithful but not always legible and not
 re-readable. A `'\u{N}'` output form for those is deferred to the task that adds `\u{...}` as input
-syntax (tracked in `qvan6m`), so input and output escaping land together.
+syntax (tracked separately), so input and output escaping land together.
 
 | `Char` value | `debug()` | | `Char` value | `debug()` |
 |---|---|---|---|---|
