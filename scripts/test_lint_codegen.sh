@@ -15,6 +15,10 @@ write_clean() {
     rm -rf "$1"
     mkdir -p "$1/src" "$1/tests"
     printf 'fn ok() -> Int { 1 }\n' > "$1/src/cg_a.bl"
+    # scripts/lint_import_dag.sh governs this file, so the fixture has to carry
+    # it or its rule is never exercised. layout.bl and cname.bl are deliberately
+    # absent: an empty stand-in for either would owe every producer L7 names.
+    printf 'import ast.{NodeKind}\nimport parser.{node_kind}\nimport diagnostics.{Diag}\nimport std.str.{str_from_code_point}\n' > "$1/src/unparse.bl"
     : > "$1/tests/test_fixture.bl"
 }
 
@@ -84,6 +88,24 @@ if run_lint "$dir" > "$dir.out" 2>&1 || ! grep -qE '^L8 +import_dag .*OVER' "$di
 else
     echo "ok   import_dag goes red through lint_import_dag.sh"
 fi
+# unparse.bl is held to an allowlist, so both a forbidden edge and an
+# unlisted-but-harmless one must go red. std.io vs std.str proves the check
+# reads the whole dotted path and not just its first segment.
+check_unparse_import() {
+    label="$1"; line="$2"
+    dir="$WORK/case_unparse_$label"
+    write_clean "$dir"
+    printf '%s\n' "$line" >> "$dir/src/unparse.bl"
+    if run_lint "$dir" > "$dir.out" 2>&1 || ! grep -qE '^L8 +import_dag .*OVER' "$dir.out"; then
+        echo "FAIL unparse_import_$label: '$line' was not caught:"; cat "$dir.out"; fail=1
+    else
+        echo "ok   unparse_import_$label goes red"
+    fi
+}
+check_unparse_import emitter 'import cg_expr.{x_lower}'
+check_unparse_import driver  'import typecheck.{tc_tid_name}'
+check_unparse_import stdlib  'import std.io'
+
 long_fn=$(printf 'fn long() -> Int {\n'; for i in $(seq 1 80); do printf '    let v%d = %d\n' "$i" "$i"; done; printf '    1\n}')
 expect_red fn_length           cg_b.bl "$long_fn"
 expect_red br_ids_in_source    cg_b.bl '// tracked as br abc123'
