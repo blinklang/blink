@@ -11,11 +11,11 @@ import std.fs
 import std.io
 import layout.{layout_reset}
 import mono.{run_mono}
-import cname.{cname_reset}
+import cname.{cname_reset, c_module_init_globals_name}
 import cg_test_helpers.{cg_probe_compile, cg_text_occurrences}
-import cg.{CgConfig, generate, generate_archive_header}
+import cg.{CgConfig, generate, generate_archive_header, generate_module_header, generate_module_object}
 import cg_print.{print_reset, print_take}
-import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_reg.{cg_reg_reset, cg_reg_build, cg_reg_global_decls}
 import cg_decl.{cg_decl_reset, cg_decl_emit_globals}
 
 fn build_full_probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
@@ -231,14 +231,22 @@ test "cross-module derived value" {
 // entry module's own declarations last), so a global whose initializer reads an
 // imported module's global proves the order rather than assuming it: if the entry
 // module's assignment ran first, `derived` would read helper_base before it is set.
+//
+// A call-initialized global cannot take its value on the declaration line — the call
+// itself has to run, which only the init function's own body may do — so both finds
+// are scoped to after the init function starts. A looser find_at over the whole text
+// would match an inline `= 0` fallback the same as a genuine deferred assignment.
 test "a deferred initializer runs in module order: an imported module's global before the importing module's own" {
     let helper_path = "src/cg_decl_globals_cross_helper.bl"
     write_file(helper_path, cross_module_helper_src())
     let program = build_full_probe("build/cg_decl_globals_cross_main.bl", cross_module_main_src())
     let _ = fs.delete(helper_path)
     let text = generate(program, full_cfg())
-    let helper_assign = find_at(text, "helper_base = ")
-    let derived_assign = find_at(text, "derived = ")
+    assert_missing(text, "int64_t helper_base = ")
+    let start = find_at(text, "__blink_init_globals")
+    let after_init = text.substring(start, text.len() - start)
+    let helper_assign = find_at(after_init, "helper_base = ")
+    let derived_assign = find_at(after_init, "derived = ")
     assert(helper_assign < derived_assign)
 }
 
@@ -251,7 +259,7 @@ test "an empty inits map yields a bare declaration and no initializer" {
     cg_reg_reset()
     cg_reg_build(program)
     cg_decl_reset()
-    let _ = cg_decl_emit_globals(false, Map())
+    let _ = cg_decl_emit_globals(false, cg_reg_global_decls(), Map())
     let text = print_take()
     let _decl = find_at(text, " answer;")
     assert_missing(text, "answer = ")
@@ -266,4 +274,103 @@ test "read shared" { assert_eq(shared, 7) }
 "#)
     let text = generate(program, full_cfg())
     assert_eq(cg_text_occurrences(text, "shared = 7"), 1)
+}
+
+// ── Per-module generator ──────────────────────────────────────────────────────
+//
+// The per-module mode compiles each module to its own object, so the module that
+// declares a global is the only one allowed to define it: two objects defining the same
+// C symbol is a link error, not a codegen detail. A non-const global's deferred
+// assignment can only run from the module that owns it, so that module needs an init
+// function callable from outside its own translation unit, declared in its own header
+// and called by the entry unit's shim alongside its own.
+
+fn pm_helper_src() -> Str {
+    #"pub let helper_const: Int = 5
+pub let helper_dynamic: Int = compute_helper_dynamic()
+
+fn compute_helper_dynamic() -> Int { 9 }
+"#
+}
+
+fn pm_main_src() -> Str {
+    #"import cg_decl_globals_pm_helper.{helper_const, helper_dynamic}
+
+let main_dynamic: Int = helper_dynamic + helper_const
+
+test "read them" {
+    assert_eq(main_dynamic, 14)
+}
+"#
+}
+
+fn build_pm_probe(entry_path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let helper_path = "src/cg_decl_globals_pm_helper.bl"
+    write_file(helper_path, pm_helper_src())
+    let program = build_full_probe(entry_path, pm_main_src())
+    let _ = fs.delete(helper_path)
+    program
+}
+
+test "per-module: the entry module's object does not redefine a global another module owns" {
+    let program = build_pm_probe("build/cg_decl_globals_pm_main_a.bl")
+    let text = generate_module_object(program, "__main__", "_blink_all.h", full_cfg())
+    assert_missing(text, "helper_const = 5")
+    assert_missing(text, " helper_dynamic;")
+}
+
+test "per-module: a non-entry module's own object still inlines its own const global" {
+    let program = build_pm_probe("build/cg_decl_globals_pm_main_b.bl")
+    let text = generate_module_object(program, "cg_decl_globals_pm_helper", "_blink_all.h", full_cfg())
+    assert_has(text, "helper_const = 5")
+}
+
+test "per-module: a non-entry module's own non-const global stays a bare declaration in its own object" {
+    let program = build_pm_probe("build/cg_decl_globals_pm_main_c.bl")
+    let text = generate_module_object(program, "cg_decl_globals_pm_helper", "_blink_all.h", full_cfg())
+    let _decl = find_at(text, " helper_dynamic;")
+}
+
+test "per-module: a non-entry module's own object defines a non-static init function for its own deferred global" {
+    let program = build_pm_probe("build/cg_decl_globals_pm_main_d.bl")
+    let text = generate_module_object(program, "cg_decl_globals_pm_helper", "_blink_all.h", full_cfg())
+    assert_missing(text, "static void __blink_init_globals_cg_decl_globals_pm_helper")
+    let start = find_at(text, "__blink_init_globals_cg_decl_globals_pm_helper(")
+    let after = text.substring(start, text.len() - start)
+    assert(after.contains("helper_dynamic"))
+}
+
+test "per-module: a non-entry module's own header declares its init function's prototype" {
+    let program = build_pm_probe("build/cg_decl_globals_pm_main_e.bl")
+    let text = generate_module_header(program, "cg_decl_globals_pm_helper", full_cfg())
+    let init_fn = c_module_init_globals_name("cg_decl_globals_pm_helper")
+    assert_has(text, "void {init_fn}();")
+}
+
+test "per-module: the entry module's shim calls the imported module's init function before its own" {
+    let program = build_pm_probe("build/cg_decl_globals_pm_main_f.bl")
+    let text = generate_module_object(program, "__main__", "_blink_all.h", full_cfg())
+    let helper_call = find_at(text, "__blink_init_globals_cg_decl_globals_pm_helper();")
+    let main_call = find_at(text, "__blink_init_globals___main__();")
+    assert(helper_call < main_call)
+}
+
+test "per-module: the shim calls every module's init function before test dispatch" {
+    let program = build_pm_probe("build/cg_decl_globals_pm_main_g.bl")
+    let text = generate_module_object(program, "__main__", "_blink_all.h", full_cfg())
+    let main_call = find_at(text, "__blink_init_globals___main__();")
+    let run_tests = find_at(text, "__blink_run_tests(argc")
+    assert(main_call < run_tests)
+}
+
+test "per-module: no init-fn prototype is declared when every global in that module is a literal" {
+    let program = build_full_probe("build/cg_decl_globals_pm_all_const_h.bl", literal_probe_src())
+    let text = generate_module_header(program, "__main__", full_cfg())
+    assert_missing(text, "__blink_init_globals")
+}
+
+test "per-module: no init-fn call is emitted for a module whose globals are all literals" {
+    let program = build_full_probe("build/cg_decl_globals_pm_all_const_o.bl", literal_probe_src())
+    let text = generate_module_object(program, "__main__", "_blink_all.h", full_cfg())
+    assert_missing(text, "__blink_init_globals")
 }
