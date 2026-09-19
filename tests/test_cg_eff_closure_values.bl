@@ -19,7 +19,7 @@ import cname_test_helpers.{find_decl, assert_eq_str}
 import cg_test_helpers.{cg_probe_compile}
 import ast.{NodeKind}
 import parser.{node_value}
-import layout.{bind_binder, binder_scope_pop, binder_scope_push, current_binder_scope, layout_reset, tid_of_binder}
+import layout.{bind_binder_mut, binder_scope_pop, binder_scope_push, current_binder_scope, layout_reset, tid_of_binder}
 import ir.{IrKind, ir_c_name, ir_kid_count, ir_kind, ir_reset, ir_verify}
 import cg_reg.{cg_reg_build}
 import cg_expr.{cg_expr_reset}
@@ -190,7 +190,7 @@ fn closure_of(let_name: Str) -> Int {
 // enclosing function binds the same spelling, which is what the enclosing frame is for.
 fn lower_under(let_name: Str, names: List[Str]) -> Int ! Diag.Report {
     let outer = binder_scope_push()
-    for nm in names { bind_binder(outer, nm, TYPE_INT) }
+    for nm in names { bind_binder_mut(outer, nm, TYPE_INT, false) }
     let v = cg_eff_lower_closure(closure_of(let_name))
     binder_scope_pop()
     v
@@ -204,6 +204,9 @@ fn assert_no_capture(let_name: Str, names: List[Str]) ! Diag.Report {
     }
     assert(v >= 0)
     assert_eq(ices(), 0)
+    // A capture word is what a capture becomes, so counting the words is what keeps these
+    // rows honest now that a real capture builds instead of being refused.
+    assert_eq(ir_kid_count(v), 0)
 }
 
 test "a closure that captures nothing lowers to a closure record with no capture words" {
@@ -280,7 +283,7 @@ test "a thunk frame is never opened inside another function's frame" {
     setup()
     let _ = cg_eff_lower_closure(closure_of("g_plain"))
     let outer = binder_scope_push()
-    bind_binder(outer, "n", TYPE_INT)
+    bind_binder_mut(outer, "n", TYPE_INT, false)
     let scope = cg_eff_thunk_open(0)
     binder_scope_pop()
     assert_eq(scope, -1)
@@ -389,14 +392,15 @@ test "a closure local that shadows an enclosing name is not a capture" {
     assert_no_capture("g_shadow", ["n"])
 }
 
-test "a closure that reads a local of its enclosing function is not built" {
-    // The capture word is a layout question: a captured Int is punned into it, a Float is
-    // boxed into it, and a pointer passes through. No stage answers that yet, so the
-    // record cannot be spelled and the name is reported instead of dropped.
+test "a closure that reads a local of its enclosing function captures it" {
+    // The control every no-capture row above is measured against. If a read of a genuine
+    // enclosing local did not build a word either, those rows would pass for the wrong
+    // reason and the free-name walk could answer nothing at all.
     setup()
     let v = lower_under("g_cap", ["n"])
-    assert_eq(v, -1)
-    assert(ices_mentioning("'n'") > 0)
+    assert(v >= 0)
+    assert_eq(ir_kid_count(v), 1)
+    assert_eq(ices(), 0)
 }
 
 test "a string chunk spelled like an enclosing local is not a capture" {

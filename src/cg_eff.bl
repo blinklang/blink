@@ -20,16 +20,17 @@ import typecheck.{
     tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tk_name, ty_pool,
 }
 import layout.{
-    LayoutRecord, Position, Slot, SlotForm, bind_binder, binder_scope_pop, binder_scope_push, child_tid,
-    current_binder_scope, layout_of, tid_of_binder, tid_of_node,
+    BinderMut, LayoutRecord, Position, Slot, SlotForm, bind_binder, binder_mutability_of, binder_scope_pop,
+    binder_scope_push, child_tid, closure_self_spelling, container_slot_spelling, current_binder_scope,
+    layout_of, tid_of_binder, tid_of_node,
 }
 import cname.{
     c_builtin_effect_slot, c_ev_field_name, c_ev_global_name, c_ev_type_name, c_field_name, c_local_name,
-    c_mint_local,
+    c_mint_local, c_runtime_helper,
 }
 import ir.{
     ir_assign, ir_block, ir_carrier_wrap, ir_closure_new, ir_const, ir_effect_perform, ir_evidence_address, ir_evidence_vector,
-    ir_field_get, ir_handler_install, ir_if, ir_let, ir_var_ref,
+    ir_call_runtime, ir_cast, ir_field_get, ir_handler_install, ir_if, ir_let, ir_var_ref,
 }
 import cg_print.{print_closure_thunk, print_resource_guard_support}
 import cg_reg.{cg_reg_effect_decls, cg_reg_impl_decls}
@@ -200,6 +201,11 @@ type PendingThunk {
     closure: Int
     symbol: Str
     fn_tid: Int
+    // The captured names in first-read order, and the type each was bound at in the frame
+    // open where the literal was written. The thunk is printed after that frame has closed,
+    // so what the prologue needs is carried here rather than looked up again.
+    cap_names: List[Str]
+    cap_tids: List[Int]
 }
 
 let mut eff_thunks: List[PendingThunk] = []
@@ -215,20 +221,19 @@ pub fn cg_eff_reset() {
 
 // The closure record for one closure literal, or -1 after a recorded internal error.
 //
-// A capture needs a C word that every captured type can be punned into and read back out
-// of, which is a layout question no stage answers yet. A closure that reads a local of its
-// enclosing function is therefore refused by name rather than built with a capture list it
-// cannot spell, and nothing is queued for it: a poisoned unit never reaches the printer.
+// A captured name rides one void* capture word, which is the slot a container element
+// rides, so Position.ContainerSlot already answers what a capture can hold and nothing
+// here decides it a second time. Two shapes are still refused by name rather than built:
+// a value that does not fit the word needs a heap box, and a binding the enclosing
+// function can assign needs a cell both sides share. Neither is allocated yet, and a
+// closure that is refused queues nothing, so a poisoned unit never reaches the printer.
+//
+// The descriptor table and the arena promoter stay empty together. The table has one
+// reader, the promoter that deep-copies captures into an arena, so a closure that is never
+// promoted would carry an array nothing reads.
 pub fn cg_eff_lower_closure(node: Int) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
-    let free = closure_free_names(node)
-    if free.len() > 0 {
-        diag_ice_at("ClosureCaptureNotLowered", CODEGEN_STAGE_NOT_BUILT,
-            "closure reads {join_names(free)} from its enclosing function, and a captured local has no C layout yet",
-            node, "the capture word is a layout question; until layout answers it a closure may read only its own parameters and locals")
-        return -1
-    }
     let rec = layout_of(tid, Position.Local)
     let why = rec.decline_reason
     if why != "" {
@@ -237,9 +242,89 @@ pub fn cg_eff_lower_closure(node: Int) -> Int ! Diag.Report {
             "monomorphisation must resolve every type codegen reads; this is a compiler bug")
         return -1
     }
+    let free = closure_free_names(node)
+    if !captures_are_buildable(node, free) { return -1 }
+    let tids: List[Int] = []
+    let words = capture_words(node, free, tids)
     let symbol = c_mint_local("closure")
-    eff_thunks.push(PendingThunk { closure: node, symbol: symbol, fn_tid: tid })
-    ir_closure_new(tid, node, rec.c_spelling, symbol, "", "", [])
+    eff_thunks.push(PendingThunk {
+        closure: node, symbol: symbol, fn_tid: tid, cap_names: free, cap_tids: tids,
+    })
+    ir_closure_new(tid, node, rec.c_spelling, symbol, "", "", words)
+}
+
+// One capture word per captured name, in first-read order, built in the frame the literal
+// was written in because that is where the name still resolves. The thunk reads each word
+// back by the position it was built at. Every name is known buildable before this runs.
+fn capture_words(node: Int, free: List[Str], tids: List[Int]) -> List[Int] ! Diag.Report {
+    let mut out: List[Int] = []
+    for nm in free {
+        let ntid = tid_of_binder(current_binder_scope(), nm)
+        let slot = layout_of(ntid, Position.ContainerSlot)
+        let loc = layout_of(ntid, Position.Local)
+        let read = ir_var_ref(ntid, node, loc.c_spelling, c_local_name(nm), loc.slot_form)
+        // A pointer already is a word. Everything else goes through the integer bridge
+        // ContainerSlot names, so the value that comes back out is the value that went in.
+        out.push(if slot.slot_word == "" { read } else { ir_cast(ntid, node, slot.slot_word, read) })
+        tids.push(ntid)
+    }
+    out
+}
+
+// Whether every captured name can be held in a capture word, and may be copied into one.
+//
+// The representational question is asked first and per name. Whether a value fits a word
+// is a property of its type alone, so it holds whatever the enclosing frame recorded, and
+// a refusal that names the type is the more useful of the two when both apply.
+//
+// sections/02_syntax.md has a `let mut` binding shared with its closure, not copied: a
+// write on either side is visible on the other, which needs one cell both read through.
+// Copying the value instead compiles, and then answers the pre-write number on one side
+// and drops the closure's writes on the other. A `let` binding carries no such rule, so
+// copying it is what the spec calls observationally equivalent.
+//
+// The answer comes off the binder frame, the same entry the capture's type comes from, so
+// the name is resolved once. A bind site that records nothing answers Unknown and the
+// capture is refused: a binder that cannot be told from a shared one is treated as one.
+fn captures_are_buildable(node: Int, free: List[Str]) -> Bool ! Diag.Report {
+    if free.len() == 0 { return true }
+    let scope = current_binder_scope()
+    for nm in free {
+        let slot = layout_of(tid_of_binder(scope, nm), Position.ContainerSlot)
+        let why = slot.decline_reason
+        if why != "" {
+            diag_ice_at("UnspellableCaptureType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "captured local '{nm}' has no C layout: {why}", node,
+                "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+            return false
+        }
+        if slot.slot_form == SlotForm.PointerBoxed {
+            diag_ice_at("BoxedCaptureNotLowered", CODEGEN_STAGE_NOT_BUILT,
+                "closure captures '{nm}', whose value does not fit a capture word and needs a heap box no stage allocates yet",
+                node, "a capture word is one void*; a value that cannot be punned into one has to live behind a pointer, and nothing allocates that box")
+            return false
+        }
+    }
+    let mut shared: List[Str] = []
+    let mut unrecorded: List[Str] = []
+    for nm in free {
+        let m = binder_mutability_of(scope, nm)
+        if m == BinderMut.Mutable { shared.push(nm) }
+        if m == BinderMut.Unknown { unrecorded.push(nm) }
+    }
+    if shared.len() > 0 {
+        diag_ice_at("SharedMutableCaptureNotLowered", CODEGEN_STAGE_NOT_BUILT,
+            "closure captures {join_names(shared)}, which the enclosing function can assign, and a shared mutable binding has no cell yet",
+            node, "a mutable binding is shared with its closure rather than copied; copying the value would lose a write on each side")
+        return false
+    }
+    if unrecorded.len() > 0 {
+        diag_ice_at("CaptureMutabilityNotRecorded", CODEGEN_STAGE_NOT_BUILT,
+            "closure captures {join_names(unrecorded)}, bound where codegen records no mutability, and a binding that might be shared has no cell yet",
+            node, "parameters and pattern binders do not record mutability yet; until their bind site does, a capture of one cannot be told from a shared binding")
+        return false
+    }
+    true
 }
 
 fn join_names(names: List[Str]) -> Str {
@@ -378,7 +463,48 @@ pub fn cg_eff_print_thunk(i: Int, body: Int) ! Diag.Report {
     let ps = node_params(th.closure)
     let declared = if ps == -1 { 0 } else { sublist_length(ps) }
     if params.len() != declared { return }
-    print_closure_thunk(ret, th.symbol, params, body)
+    let whole = with_capture_prologue(th, body)
+    if whole < 0 { return }
+    print_closure_thunk(ret, th.symbol, params, whole)
+}
+
+// The body with one declaration per captured name in front of it, each read back out of
+// __self at the position its word was built at.
+//
+// The body lowered its captures as plain local reads, because that is what they are inside
+// the thunk, so the prologue is what makes those identifiers exist. __self is the closure
+// itself, which is why it carries the thunk's own Fn type.
+fn with_capture_prologue(th: PendingThunk, body: Int) -> Int ! Diag.Report {
+    if th.cap_names.len() == 0 { return body }
+    let index_rec = perform_layout(TYPE_INT, Position.Local, th.closure)
+    if index_rec.c_spelling == "" { return -1 }
+    let mut stmts: List[Int] = []
+    let mut i = 0
+    while i < th.cap_names.len() {
+        let nm = th.cap_names.get(i).unwrap()
+        let ntid = th.cap_tids.get(i).unwrap()
+        let slot = layout_of(ntid, Position.ContainerSlot)
+        let loc = layout_of(ntid, Position.Local)
+        if slot.decline_reason != "" || loc.decline_reason != "" {
+            diag_ice_at("UnspellableCaptureType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "captured local '{nm}' has no C layout in the thunk that reads it", th.closure,
+                "the same type spelled at the literal's site must spell again where the thunk declares it")
+            return -1
+        }
+        // "__self" is the name cg_emit gives the receiver word in every thunk's parameter
+        // list, so the two have to agree on it.
+        let self_ref = ir_var_ref(th.fn_tid, th.closure, closure_self_spelling(), "__self", SlotForm.InlineWord)
+        let index = ir_const(TYPE_INT, th.closure, index_rec.c_spelling, "{i}")
+        let raw = ir_call_runtime(ntid, th.closure, container_slot_spelling(),
+            c_runtime_helper("closure_get_capture"), SlotForm.InlineWord, [self_ref, index])
+        // The pun the word was built through, undone in the same order.
+        let punned = if slot.slot_word == "" { raw } else { ir_cast(ntid, th.closure, slot.slot_word, raw) }
+        let init = ir_cast(ntid, th.closure, loc.c_spelling, punned)
+        stmts.push(ir_let(ntid, th.closure, loc.c_spelling, c_local_name(nm), loc.slot_form, init))
+        i = i + 1
+    }
+    stmts.push(body)
+    ir_block(th.closure, stmts)
 }
 
 // Opens the thunk's own binder frame with its parameters bound at their types, and answers
@@ -443,6 +569,13 @@ fn bind_thunk_params(th: PendingThunk, scope: Int) -> Bool ! Diag.Report {
         }
         bind_binder(scope, node_name(p), tid)
         k = k + 1
+    }
+    // A capture is a local of the thunk, at the type it was bound at where the literal was
+    // written. Without it the body's reads would find no binder and resolve nowhere.
+    let mut c = 0
+    while c < th.cap_names.len() {
+        bind_binder(scope, th.cap_names.get(c).unwrap(), th.cap_tids.get(c).unwrap())
+        c = c + 1
     }
     true
 }
