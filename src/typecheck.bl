@@ -3413,6 +3413,15 @@ fn tc_generic_fn_value_tid(sig: Int, decl_tid: Int) -> Int {
     substitute_typevar_tid(decl_tid, binds)
 }
 
+// Whether a declaration writes type parameters of its own. -1 is a signature with no
+// declaration node behind it, which declares nothing.
+fn tc_decl_has_own_type_params(decl: Int) -> Int {
+    if decl < 0 { return 0 }
+    let tps = node_type_params(decl)
+    if tps == -1 { return 0 }
+    if sublist_length(tps) > 0 { 1 } else { 0 }
+}
+
 fn build_typevar_binds(sig: Int, args_sl: Int) -> Map[Str, Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     build_typevar_binds_off(sig, args_sl, 0)
 }
@@ -3630,10 +3639,16 @@ fn tc_pin_ok_for_declared(val: Int, declared_tid: Int) -> Int {
 // mechanism, which is what keeps every `-> Box[T]` whose T comes from an argument on
 // exactly its current path.
 fn instantiate_return_type(sig: Int, args_sl: Int, call_node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    instantiate_return_type_off(sig, args_sl, call_node, 0)
+}
+
+// `self_offset` as in build_typevar_binds_off: a method call's first argument aligns with
+// fnsig param 1, because the receiver is param 0.
+fn instantiate_return_type_off(sig: Int, args_sl: Int, call_node: Int, self_offset: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let fs = fnsig_pool.get(sig).unwrap()
     let ret = fs.ret
     if ret < 0 || ret >= ty_pool.len() { return ret }
-    let mut binds = build_typevar_binds(sig, args_sl)
+    let mut binds = build_typevar_binds_off(sig, args_sl, self_offset)
     let mints = tc_ret_only_metavars(sig, call_node)
     let mut pi = 0
     while pi < mints.len() {
@@ -16045,6 +16060,14 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 let mfs = fnsig_pool.get(sig).unwrap()
                 if mfs.type_params_count > 0 {
                     tc_check_bounds_for_binds(sig, build_typevar_binds_off(sig, node_args(node), 1), node)
+                }
+                // A type parameter the METHOD declares is chosen by the call, so the call's
+                // type is the declared return with that choice applied. Gated on the
+                // declaration's own binders and not on the signature's count, because an
+                // impl over a generic type puts the impl's binders in the same count and
+                // those are answered by the receiver, not by the arguments.
+                if tc_decl_has_own_type_params(mfs.decl) != 0 {
+                    return instantiate_return_type_off(sig, node_args(node), node, 1)
                 }
                 return fnsig_pool.get(sig).unwrap().ret
             }
