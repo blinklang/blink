@@ -4,30 +4,43 @@
 // wrong reason: a default is allowed only after the `--` separator, and its value must be a
 // const expression. Neither rule could be tested while nothing parsed.
 //
-// These rows read the parsed node and the reported diagnostics. What a call site does with
-// a default is a separate question and is not settled here.
+// The call-site rows below cover the other half: a default exists so that a caller may omit
+// the argument, and the omitted argument is filled from the declaration's own expression.
 
 import std.fs
+import std.io
 import compiler.{compile_to_program}
-import typecheck.{check_types}
-import parser.{nodes, node_kind, node_name, node_params, node_value, sublist_get, sublist_length}
+import typecheck.{check_types, tc_lookup_node_tid, TYPE_INT}
+import parser.{nodes, node_kind, node_name, node_params, node_value, node_left, node_args, sublist_get, sublist_length}
 import ast.{NodeKind}
-import diagnostics.{diag_entries, diag_reset}
+import diagnostics.{diag_entries, diag_reset, diag_explain, MISSING_KEYWORD_ARG}
 import embedded_stdlib_registry.{init_embedded_stdlib}
 
-fn param_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+fn param_probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
     init_embedded_stdlib()
     write_file(path, src)
     diag_reset()
     let program = compile_to_program(path, 1)
     check_types(program)
     let _ = fs.delete(path)
+    program
 }
 
 fn codes_reported() -> Str {
     let mut out = ""
     for d in diag_entries {
         if d.severity == "error" { out = out.concat(d.code).concat(" ") }
+    }
+    out
+}
+
+// Everything the probe reported that is not a warning, as `name: message` lines. A row that
+// means "this call is accepted" has to read all of them: the fill replaced one refusal, and
+// a fill that leaves the argument untyped is reported under a different name entirely.
+fn problems_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity != "warning" { out = out.concat("{d.name}: {d.message}\n") }
     }
     out
 }
@@ -102,7 +115,7 @@ fn main() {
 }
 
 test "a keyword parameter carries the default value the source wrote" {
-    param_probe("build/kwdefault_ok.bl", keyword_default_src())
+    let _p = param_probe("build/kwdefault_ok.bl", keyword_default_src())
 
     // The whole of the parser gap: before this the slot was empty and the text was gone.
     assert(default_of_param("zzhost") != -1)
@@ -110,7 +123,7 @@ test "a keyword parameter carries the default value the source wrote" {
 }
 
 test "a default on a positional parameter is refused" {
-    param_probe("build/kwdefault_positional.bl", positional_default_src())
+    let _p = param_probe("build/kwdefault_positional.bl", positional_default_src())
 
     assert(codes_reported().contains("E0531"))
 }
@@ -118,7 +131,7 @@ test "a default on a positional parameter is refused" {
 // The default stands in for an argument the caller did not write, and which argument that
 // is must not depend on when the call happens.
 test "a default that is computed at run time is refused" {
-    param_probe("build/kwdefault_computed.bl", computed_default_src())
+    let _p = param_probe("build/kwdefault_computed.bl", computed_default_src())
 
     assert(codes_reported().contains("E0532"))
 }
@@ -126,8 +139,196 @@ test "a default that is computed at run time is refused" {
 // Arithmetic over literals is itself const, so the narrow reading that only a bare literal
 // qualifies would refuse a signature the section calls correct.
 test "arithmetic over literals is accepted as a default" {
-    param_probe("build/kwdefault_arith.bl", arithmetic_default_src())
+    let _p = param_probe("build/kwdefault_arith.bl", arithmetic_default_src())
 
     assert(!codes_reported().contains("E0532"))
     assert(!codes_reported().contains("E0531"))
+}
+
+// ── Call sites ────────────────────────────────────────────────────────────
+
+// Every call to `nm` in the probe, in source order.
+fn calls_to(nm: Str) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.Call {
+            let callee = node_left(i)
+            if callee != -1 && node_kind(callee) == NodeKind.Ident && node_name(callee) == nm {
+                out.push(i)
+            }
+        }
+        i = i + 1
+    }
+    out
+}
+
+// The expression a call passes under the label `label`, or -1 when it passes none.
+fn arg_under_label(call: Int, label: Str) -> Int {
+    let args = node_args(call)
+    if args == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(args) {
+        let a = sublist_get(args, i)
+        if node_kind(a) == NodeKind.NamedArg && node_name(a) == label { return node_value(a) }
+        i = i + 1
+    }
+    -1
+}
+
+fn arg_count(call: Int) -> Int {
+    let args = node_args(call)
+    if args == -1 { return 0 }
+    sublist_length(args)
+}
+
+fn omitting_calls_src() -> Str {
+    #"fn zzserve(zzwhat: Str, -- zzport: Int = 8080) -> Int {
+    zzport
+}
+
+fn main() {
+    let _a = zzserve("a")
+    let _b = zzserve("b")
+    let _c = zzserve("c", zzport: 99)
+}
+"#
+}
+
+fn no_default_src() -> Str {
+    #"fn zzserve(-- zzport: Int) -> Int {
+    zzport
+}
+
+fn main() {
+    let _ = zzserve()
+}
+"#
+}
+
+// The point of a default: the caller may leave the argument out.
+test "a call that omits a defaulted keyword argument is accepted" {
+    let _p = param_probe("build/kwdefault_omit.bl", omitting_calls_src())
+
+    // Not just "no E0510": the filled argument is a node minted after the per-node tables
+    // were sized, and one left outside them reaches the end of inference with no type. That
+    // is an internal error under its own name, which a check for one code would walk past.
+    assert_eq_str("no problems", problems_reported(), "")
+}
+
+fn method_default_src() -> Str {
+    #"type ZzHolder { zzhost: Str }
+
+trait ZzServing {
+    fn zzserve(self, -- zzport: Int = 8080) -> Int
+}
+
+impl ZzServing for ZzHolder {
+    fn zzserve(self, -- zzport: Int = 8080) -> Int {
+        self.zzhost.len() + zzport
+    }
+}
+
+fn main() {
+    let zzh = ZzHolder { zzhost: "h" }
+    let _a = zzh.zzserve()
+    let _b = zzh.zzserve(zzport: 99)
+}
+"#
+}
+
+// Every method belongs to a trait (sections/03c_protocols.md), and a trait method's signature
+// is registered the same way a free function's is, so it carries defaults the same way. The
+// receiver shifts every parameter index by one, which is the part that can be got wrong
+// without any free-function row noticing.
+test "a method call omitting a defaulted keyword argument is accepted" {
+    let _p = param_probe("build/kwdefault_method.bl", method_default_src())
+
+    assert_eq_str("no problems", problems_reported(), "")
+}
+
+// A const expression has no identity, so one node serves every site. This is the same shape
+// a struct field default already uses, and it is what makes the fill free of a per-call copy.
+test "two calls omitting the same default share one expression and one type" {
+    let _p = param_probe("build/kwdefault_share.bl", omitting_calls_src())
+
+    let cs = calls_to("zzserve")
+    assert_eq(cs.len(), 3)
+    let first = arg_under_label(cs.get(0).unwrap(), "zzport")
+    let second = arg_under_label(cs.get(1).unwrap(), "zzport")
+    assert(first != -1)
+    assert_eq(first, second)
+    assert_eq(first, default_of_param("zzport"))
+    assert_eq(tc_lookup_node_tid(first), TYPE_INT)
+    assert_eq(tc_lookup_node_tid(second), TYPE_INT)
+}
+
+// The written argument stands; the fill is only for what is absent.
+test "a call that writes the argument keeps its own expression" {
+    let _p = param_probe("build/kwdefault_written.bl", omitting_calls_src())
+
+    let cs = calls_to("zzserve")
+    let written = arg_under_label(cs.get(2).unwrap(), "zzport")
+    assert(written != -1)
+    assert(written != default_of_param("zzport"))
+    assert_eq(arg_count(cs.get(2).unwrap()), 2)
+}
+
+// The fill appends to the call's own argument list, so a second pass over the same program
+// must find the argument already there rather than append a duplicate.
+test "checking twice does not fill the same default twice" {
+    let program = param_probe("build/kwdefault_twice.bl", omitting_calls_src())
+
+    let cs = calls_to("zzserve")
+    let before = arg_count(cs.get(0).unwrap())
+    assert_eq(before, 2)
+    check_types(program)
+    assert_eq(arg_count(cs.get(0).unwrap()), before)
+}
+
+// A keyword parameter without a default is still required. The fill must not turn every
+// omission into an accepted call.
+test "a keyword parameter with no default still requires an argument" {
+    let _p = param_probe("build/kwdefault_required.bl", no_default_src())
+
+    assert(codes_reported().contains("E0510"))
+}
+
+// The missing-argument rule now has two repairs, and the one a reader reaches for depends on
+// whether the value is the same at most call sites. An explainer that names only the first
+// sends every reader to the wrong one.
+test "the missing keyword argument rule offers a default as the other repair" {
+    let text = diag_explain(MISSING_KEYWORD_ARG)
+
+    assert(text.contains("default"))
+    assert(text.contains("E0531"))
+    assert(text.contains("E0532"))
+}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn closure_default_src() -> Str {
+    #"fn zzq() -> Int {
+    3
+}
+
+fn main() {
+    let zzf = fn(zza: Int = 1, -- zzb: Int = zzq()) -> Int { zza + zzb }
+    let _ = zzf(1, zzb: 2)
+}
+"#
+}
+
+// A closure declares parameters with the same syntax a function does, so it inherits the two
+// rules. Before the parser read a default at all the syntax could not be written here either;
+// leaving the closure out would make the same spelling legal in one place and refused in the
+// other.
+test "both default rules reach a closure parameter" {
+    let _p = param_probe("build/kwdefault_closure.bl", closure_default_src())
+
+    assert(codes_reported().contains("E0531"))
+    assert(codes_reported().contains("E0532"))
 }

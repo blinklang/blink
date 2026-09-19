@@ -11,6 +11,7 @@ import parser.{
     node_type_ann, node_type_name, node_type_params, node_value, node_var_name,
     node_impl_binders, node_recv_type_args, node_impl_where_bounds, node_source_module,
     node_set_module, node_set_name, node_supertraits, synth_struct_decl,
+    synth_named_arg, sublist_append,
     node_xfail_reason, node_xfail_ticket, node_value_child_ids,
     sublist_get, sublist_length,
 }
@@ -309,6 +310,11 @@ let mut fnsig_param_names: List[Str] = []
 // namespaces a call-site label resolves in, and it lives on the Param node, which no
 // consumer of a signature can reach.
 let mut fnsig_param_kw: List[Int] = []
+// Flat side-table PARALLEL to fnsig_param_list (same index, same length): the NODE of that
+// parameter's default value, or -1 when it declares none. A call that omits the argument is
+// filled from this node, and the node lives on the declaration, which a call site cannot
+// reach.
+let mut fnsig_param_default: List[Int] = []
 let mut fnsig_type_param_names: List[Str] = []
 // Flat side-table PARALLEL to fnsig_type_param_names (same index, same length): the NODE
 // that declares that type parameter. A name alone cannot tell two declarations' `T` apart.
@@ -4085,6 +4091,20 @@ fn tc_fnsig_kw_names(param_start: Int, param_count: Int, kw_start: Int) -> Str {
 //
 // One report per call. The five codes divide the mistakes, not the arguments, and a call
 // carrying two of them is one call to repair.
+// The four per-node side-tables are presized to the node pool as it stood when checking
+// started. A keyword argument filled from a default is minted during the walk, so they have
+// to grow to reach it: the memo write in infer_type is guarded by the table's length, and a
+// node past the end is skipped in silence. The boundary check then reports that node as one
+// that reached the end of inference carrying no type.
+fn tc_grow_node_tables() {
+    while tc_node_tid.len() < node_count() {
+        tc_node_tid.push(-1)
+        tc_ret_mint_start.push(-1)
+        tc_mc_obj_is_value.push(0)
+        tc_name_position_is_value.push(0)
+    }
+}
+
 fn tc_check_keyword_args(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int, call_node: Int) -> Int ! Diag.Report {
     let fs = fnsig_pool.get(sig).unwrap()
     let param_start = fs.params_start
@@ -4153,12 +4173,23 @@ fn tc_check_keyword_args(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int,
     // it. Reporting the keyword parameters missing behind it would name the wrong one.
     if positional < declared_positional { return 0 }
 
+    // A keyword parameter the call left out is either filled from the declaration's default
+    // or missing. The fill appends the declaration's own expression node, shared by every
+    // call that omits the argument, which is how a struct field default already reaches a
+    // literal that does not name the field. `seen` is what makes a second pass over the same
+    // program find the argument already there instead of appending it twice.
     let mut k = kw_start
     while k < param_count {
         let nm = fnsig_param_names.get(param_start + k) ?? ""
         if (seen.get(nm) ?? 0) == 0 {
-            diag_error_at("MissingKeywordArg", MISSING_KEYWORD_ARG, "keyword argument '{nm}' is missing from the call to '{fn_name}'", call_node, "add '{nm}: <value>'")
-            return 1
+            let dflt = fnsig_param_default.get(param_start + k) ?? -1
+            if dflt == -1 || args_sl == -1 {
+                diag_error_at("MissingKeywordArg", MISSING_KEYWORD_ARG, "keyword argument '{nm}' is missing from the call to '{fn_name}'", call_node, "add '{nm}: <value>'")
+                return 1
+            }
+            sublist_append(args_sl, synth_named_arg(nm, dflt, node_line(call_node), node_col(call_node)))
+            tc_grow_node_tables()
+            seen.insert(nm, 1)
         }
         k = k + 1
     }
@@ -4550,6 +4581,7 @@ fn register_intrinsic_fn_sig(key: Str, params: List[Int], ret: Int) {
         fnsig_param_list.push(params.get(i).unwrap())
         fnsig_param_names.push("")
         fnsig_param_kw.push(0)
+        fnsig_param_default.push(-1)
         i = i + 1
     }
     fnsig_map.insert(key, fnsig_pool.len())
@@ -7666,6 +7698,7 @@ fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
             fnsig_param_list.push(ptid)
             fnsig_param_names.push(node_name(p))
             fnsig_param_kw.push(node_int_val(p))
+            fnsig_param_default.push(node_value(p))
             count = count + 1
             i = i + 1
         }
@@ -9348,6 +9381,7 @@ fn init_types() ! TypeCheck.Register {
     fnsig_param_list.clear()
     fnsig_param_names.clear()
     fnsig_param_kw.clear()
+    fnsig_param_default.clear()
     tc_raw_part_nodes.clear()
     tc_raw_part_interp.clear()
     tc_raw_part_consumed = Map()
@@ -12998,6 +13032,11 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 
     if kind == NodeKind.Closure {
         nr_push_scope()
+        // A closure writes its parameters with the same syntax a function does, so the two
+        // rules a default has to satisfy are the same ones. The fn-body walk never reaches
+        // here, and without this the identical spelling is refused in a declaration and
+        // accepted in a closure.
+        tc_check_param_defaults(node)
         let params_sl = node_params(node)
         if params_sl != -1 {
             let mut i = 0
@@ -14764,6 +14803,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // The keyword shape first: when it is wrong the arity count is a second
                     // reading of the same mistake, under a code whose repair is a different edit.
                     let kw_bad = tc_check_keyword_args(fn_name, sig, args_sl, 0, node)
+                    // The keyword check fills every argument a default stands in for, so the
+                    // count that answers arity is the one the call carries after the fill.
+                    if args_sl != -1 { arg_count = sublist_length(args_sl) }
                     if kw_bad == 0 && arg_count != fs.params_count {
                         let expected = fs.params_count
                         tc_error_at("function '{fn_name}' expects {expected} argument(s), got {arg_count}", node)
@@ -16336,8 +16378,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         // it — the receiver's own type was already established by the
                         // fnsig key.
                         let qt_kw_bad = tc_check_keyword_args("{obj_name}.{method}", qt_sig, qt_args, 0, node)
-                        if qt_kw_bad == 0 && qt_n != qt_fs.params_count {
-                            tc_error_at("qualified trait call '{obj_name}.{method}' expects {qt_fs.params_count} argument(s) including the receiver, got {qt_n}", node)
+                        let qt_filled = if qt_args != -1 { sublist_length(qt_args) } else { 0 }
+                        if qt_kw_bad == 0 && qt_filled != qt_fs.params_count {
+                            tc_error_at("qualified trait call '{obj_name}.{method}' expects {qt_fs.params_count} argument(s) including the receiver, got {qt_filled}", node)
                         }
                         check_arg_shapes("{obj_name}.{method}", qt_sig, qt_args, 0, node)
                         return qt_fs.ret
