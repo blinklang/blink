@@ -1,0 +1,81 @@
+// `@trusted` is the sole channel that suppresses the audit-gated diagnostics of section 9.1,
+// and the audit identifier is the whole reason the channel exists. A bare `@trusted` silences
+// the diagnostic and records nothing, which is the one outcome the annotation is there to
+// prevent. The spec rejects it; the compiler accepted it.
+//
+// The rule is about the annotation, not about FFI: `@trusted` also suppresses the raw-pointer
+// warning on an ordinary function, and a bare one records nothing there either.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset, diag_explain, TRUSTED_REQUIRES_AUDIT}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn trusted_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Errors that name one of this file's own probe functions. The probes resolve the prelude
+// through the pinned compiler's own lib/std, whose text this worktree cannot change, so a
+// row that reads every reported error would be reading the pinned stdlib's @trusted sites
+// instead of the source under test. Every probe function here is spelled `zz_*`.
+fn errors_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.message.contains("zz_") {
+            out = out.concat("{d.code} {d.name}: {d.message}\n")
+        }
+    }
+    out
+}
+
+test "a bare @trusted on an FFI function is rejected" {
+    let src = "@ffi(\"c\", \"strlen\")\n@trusted\nfn zz_strlen(s: Ptr[U8]) -> Int ! FFI \{ }\nfn main() \{ }\n"
+    trusted_probe("/tmp/zz_trusted_bare_ffi.bl", src)
+    let got = errors_reported()
+    assert(got.contains(TRUSTED_REQUIRES_AUDIT), "expected {TRUSTED_REQUIRES_AUDIT}, got: {got}")
+    assert(got.contains("TrustedRequiresAudit"), "expected the name TrustedRequiresAudit, got: {got}")
+}
+
+test "an audited @trusted on an FFI function is accepted" {
+    let src = "@ffi(\"c\", \"strlen\")\n@trusted(audit: \"ZZ-001\")\nfn zz_strlen(s: Ptr[U8]) -> Int ! FFI \{ }\nfn main() \{ }\n"
+    trusted_probe("/tmp/zz_trusted_audited_ffi.bl", src)
+    let got = errors_reported()
+    assert(!got.contains(TRUSTED_REQUIRES_AUDIT), "an audited @trusted must not be rejected, got: {got}")
+}
+
+test "an empty audit identifier is rejected" {
+    let src = "@ffi(\"c\", \"strlen\")\n@trusted(audit: \"\")\nfn zz_strlen(s: Ptr[U8]) -> Int ! FFI \{ }\nfn main() \{ }\n"
+    trusted_probe("/tmp/zz_trusted_empty_audit.bl", src)
+    let got = errors_reported()
+    assert(got.contains(TRUSTED_REQUIRES_AUDIT), "an empty audit: must be rejected, got: {got}")
+}
+
+// The audit-gated channel is not an FFI-only rule. @trusted suppresses the raw-pointer
+// warning on an ordinary function too, so a bare one there records nothing just the same.
+test "a bare @trusted on a function with no @ffi is rejected" {
+    let src = "@trusted\nfn zz_plain(x: Int) -> Int \{ x }\nfn main() \{ let _ = zz_plain(1) }\n"
+    trusted_probe("/tmp/zz_trusted_bare_plain.bl", src)
+    let got = errors_reported()
+    assert(got.contains(TRUSTED_REQUIRES_AUDIT), "expected {TRUSTED_REQUIRES_AUDIT}, got: {got}")
+}
+
+// A function with no @trusted at all is untouched by the rule.
+test "a function with no @trusted is untouched" {
+    let src = "fn zz_plain(x: Int) -> Int \{ x }\nfn main() \{ let _ = zz_plain(1) }\n"
+    trusted_probe("/tmp/zz_trusted_absent.bl", src)
+    let got = errors_reported()
+    assert(!got.contains(TRUSTED_REQUIRES_AUDIT), "no @trusted means no rule, got: {got}")
+}
+
+test "the explainer names the audit identifier as the repair" {
+    let text = diag_explain(TRUSTED_REQUIRES_AUDIT)
+    assert(text.contains("audit:"), "the explainer must name audit:, got: {text}")
+    assert(text.contains("TrustedRequiresAudit"), "the explainer must name the diagnostic, got: {text}")
+}
