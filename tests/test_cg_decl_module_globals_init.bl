@@ -187,6 +187,58 @@ test "the archive header declares a non-constant global extern with no deferred 
     assert_missing(text, "__blink_init_globals")
 }
 
+// Classification is purely by the lowered IR kind, never by re-inspecting the source
+// shape. A negated literal is not const-folded anywhere in this pipeline (no producer
+// folds a UnaryOp over a literal into a Const), so it takes the same deferred path as a
+// struct literal even though a reader might expect a negative number to be "obviously"
+// constant. Nothing here special-cases "looks like a literal" to force it inline.
+test "a negated literal is not const-folded, so it defers like any other non-const value" {
+    let program = build_full_probe("build/cg_decl_globals_neg.bl", #"const neg: Int = -5
+
+test "read neg" { assert_eq(neg, -5) }
+"#)
+    let text = generate(program, full_cfg())
+    let _decl = find_at(text, " neg;")
+    let start = find_at(text, "__blink_init_globals")
+    let after_init = text.substring(start, text.len() - start)
+    assert(after_init.contains("neg"))
+}
+
+fn cross_module_helper_src() -> Str {
+    #"pub let helper_base: Int = compute_helper_base()
+
+fn compute_helper_base() -> Int { 10 }
+"#
+}
+
+fn cross_module_main_src() -> Str {
+    #"import cg_decl_globals_cross_helper.{helper_base}
+
+let derived: Int = helper_base + 1
+
+test "cross-module derived value" {
+    assert_eq(derived, 11)
+}
+"#
+}
+
+// The deferred-init order is declaration order within a module, and modules in the
+// order enumerate_program_modules yields them (first-seen, never re-sorted). An
+// imported module is merged ahead of the importing module (merge_programs appends the
+// entry module's own declarations last), so a global whose initializer reads an
+// imported module's global proves the order rather than assuming it: if the entry
+// module's assignment ran first, `derived` would read helper_base before it is set.
+test "a deferred initializer runs in module order: an imported module's global before the importing module's own" {
+    let helper_path = "src/cg_decl_globals_cross_helper.bl"
+    write_file(helper_path, cross_module_helper_src())
+    let program = build_full_probe("build/cg_decl_globals_cross_main.bl", cross_module_main_src())
+    let _ = fs.delete(helper_path)
+    let text = generate(program, full_cfg())
+    let helper_assign = find_at(text, "helper_base = ")
+    let derived_assign = find_at(text, "derived = ")
+    assert(helper_assign < derived_assign)
+}
+
 // Each global is registered once (cg_reg_global_decls walks the top-level statement list
 // with no de-duplication of its own), so the fix must not emit its initializer twice.
 test "a global's initializer is emitted exactly once" {
