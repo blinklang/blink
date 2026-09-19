@@ -204,6 +204,7 @@ pub const UNREACHABLE_CODE        = "W0700"
 pub const ARENA_EFFECT_REDUNDANT  = "W0701"
 pub const BITWISE_PRECEDENCE      = "W0702"
 pub const UNAUDITED_FFI           = "W0800"
+pub const AUDIT_GATED_SUPPRESSION = "E0837"
 pub const MISSING_CANONICAL_HEADER = "W0812"
 pub const DEPRECATED_USAGE        = "W2000"
 
@@ -403,11 +404,39 @@ pub fn diag_clear_allows() {
 
 // ── Lint override helpers ────────────────────────────────────────────
 
-pub fn lint_set_override(name: Str, level: Str) {
+// The section 9.1 list. A diagnostic belongs on it only when silently suppressing it
+// would destroy a record the language promises exists, which is why the two channels that
+// record nothing do not reach it. Keyed by name and by code because [lints] accepts either.
+pub fn diag_is_audit_gated(key: Str) -> Int {
+    if key == "RawBypassesParam" { return 1 }
+    if key == RAW_BYPASSES_PARAM { return 1 }
+    // The catalog spells this UnauditedFfi and the emitter UnauditedFFI. An author writes
+    // what they were shown, so both reach the list until the two agree.
+    if key == "UnauditedFfi" { return 1 }
+    if key == "UnauditedFFI" { return 1 }
+    if key == UNAUDITED_FFI { return 1 }
+    0
+}
+
+pub fn diag_audit_gated_help(key: Str) -> Str {
+    "`{key}` records an audit, so it is suppressed only by `@trusted(audit: \"AUDIT-ID\")` on the enclosing function"
+}
+
+pub fn lint_set_override(name: Str, level: Str) ! Diag.Report {
+    if diag_is_audit_gated(name) != 0 {
+        diag_error_no_loc("AuditGatedSuppression", AUDIT_GATED_SUPPRESSION,
+            "`{name}` cannot be set from [lints] in blink.toml",
+            diag_audit_gated_help(name))
+        return
+    }
     lint_overrides.insert(name, level)
 }
 
 fn lint_apply_override(severity: Str, name: Str, code: Str) -> Str {
+    // Neither channel records anything, so neither reaches an audit-gated diagnostic. Both
+    // write sites refuse one outright; this is the second half of the same rule, so a name
+    // that arrives here by some other route still fails to silence it.
+    if diag_is_audit_gated(name) != 0 { return severity }
     if diag_allow_set.contains_key(name) != 0 {
         return "off"
     }
@@ -1257,6 +1286,9 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == RAW_OUTSIDE_TEMPLATE {
         return "E0530 -- RawOutsideTemplate\n\n`Raw[T]` is a marker type, and the only thing that consumes one is a\n`Template[C]` coercion, which folds the wrapped value into the\nadjacent literal segment of a template. A `Raw[T]` that reaches any\nother position is stranded: it implements no Display, nothing strips\nit back to the `T` it wraps, and no code will ever read it.\n\n  fn log_table(table: Str) ! IO \{\n      io.println(\"scanning \{Raw(table)}\")   // E0530\n  \}\n\nThe marker rides a binding, so the mistake is the same one line\nlater: `let t = Raw(table)` has type `Raw[Str]`, and interpolating\n`t` into an ordinary string is this error too.\n\nFix: drop the wrapper and interpolate the value itself.\n\n  io.println(\"scanning \{table}\")\n\nKeep the wrapper only where a `Template[C]` takes the literal -- a\ntemplated query, for instance -- where folding the value into the\nquery text is the point, and where it raises W0310 RawBypassesParam\nso the bypass leaves a record."
+    }
+    if code == AUDIT_GATED_SUPPRESSION {
+        return "E0837 -- AuditGatedSuppression\n\nAn audit-gated diagnostic was named in `@allow(...)` or under `[lints]`\nin blink.toml. Neither channel reaches it, and naming it there is\nrefused rather than ignored.\n\nThese diagnostics exist to force a RECORD, not to report a mistake. The\nprogram they fire on is legal and may well be correct; what the language\nasks is that a human looked at it and said so somewhere a reviewer can\nfind. `@allow` and `[lints]` silence without recording anything, so they\nwould defeat the only thing the diagnostic is for.\n\nThe refusal is an error rather than silence because a suppression that\nquietly fails to apply and one that quietly succeeds are equally bad:\nthe author cannot tell which happened.\n\nFix: write the audit on the enclosing function instead.\n\n  @allow(RawBypassesParam)              // E0837\n  @trusted(audit: \"DB-003\")              // OK -- the record the rule wants\n\nThe audit-gated list is UnauditedFfi (W0800) and RawBypassesParam\n(W0310). A diagnostic joins it only when silently suppressing it would\ndestroy a record the language promises exists."
     }
     if code == RAW_BYPASSES_PARAM {
         return "W0310 -- RawBypassesParam\n\n`Raw(...)` was used to inject text into a templated query, bypassing\nthe parameterization that prevents injection. Raw fragments must come\nfrom trusted sources.\n\nFix: pass user input through a parameter rather than `Raw`. Reserve\n`Raw` for compile-time-fixed fragments such as table or column names\nthat the parameterization machinery cannot represent.\n\n  let q = sql\"select * from \{Raw(table)\} where id = \{user_id\}\"\n\nIf the fragment is genuinely fixed and reviewed, suppress with\n`@trusted(audit: \"AUDIT-ID\")` on the enclosing function. This records\nan auditable trail, the same mechanism used for @ffi (W0800)."

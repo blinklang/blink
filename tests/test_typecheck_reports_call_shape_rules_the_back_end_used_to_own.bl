@@ -10,7 +10,7 @@
 // same refusals, moved to the phase that can make them.
 import compiler.{compile_to_program}
 import typecheck.{check_types}
-import diagnostics.{diag_entries, diag_reset}
+import diagnostics.{diag_entries, diag_reset, lint_set_override}
 import std.io
 
 fn run_probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
@@ -390,6 +390,40 @@ fn raw_interpolation_src() -> Str {
 "#
 }
 
+fn allow_raw_bypasses_param_src() -> Str {
+    #"fn run(_t: Template[IO]) -> Int {
+    1
+}
+
+@allow(RawBypassesParam)
+fn go() -> Int {
+    let table = "items"
+    run("select * from {Raw(table)}")
+}
+
+fn main() {
+    io.println("{go()}")
+}
+"#
+}
+
+fn allow_unaudited_ffi_src() -> Str {
+    #"@allow(UnauditedFFI)
+fn main() {
+    io.println("ok")
+}
+"#
+}
+
+fn allow_ordinary_lint_src() -> Str {
+    #"@allow(UnusedVariable)
+fn main() {
+    let unused = 1
+    io.println("ok")
+}
+"#
+}
+
 fn trusted_raw_interpolation_src() -> Str {
     #"@trusted(audit: "AUDIT-1")
 fn build_query(col: Str) -> Str {
@@ -621,4 +655,72 @@ test "nothing strips a Raw back to the type it wraps" {
 test "a Raw folded into a template inside an audited function does not warn" {
     assert_names("trusted raw",
         probe_warning_names("tc_raw_trusted", template_raw_trusted_src()), "")
+}
+
+// Q4-supp. A diagnostic on the section 7 list exists to force a record, so a channel that
+// records nothing must not reach it -- and must say so rather than fail quietly. A
+// suppression that silently fails to apply and one that silently succeeds are equally bad:
+// the author cannot tell which happened.
+test "naming an audit-gated warning in @allow is refused" {
+    assert_names("allow names W0310",
+        probe_error_names("tc_allow_raw", allow_raw_bypasses_param_src()),
+        "AuditGatedSuppression")
+}
+
+test "the refused @allow does not suppress the warning it named" {
+    let w = probe_warning_names("tc_allow_raw_w", allow_raw_bypasses_param_src())
+    if w.contains("RawBypassesParam") == 0 { io.println("FAIL: warnings were '{w}'") }
+    assert(w.contains("RawBypassesParam") != 0)
+}
+
+test "the refusal for an audit-gated warning names the channel that does reach it" {
+    let h = probe_first_help("tc_allow_raw_help", allow_raw_bypasses_param_src())
+    if h.contains("@trusted(audit:") == 0 { io.println("FAIL: help was '{h}'") }
+    assert(h.contains("@trusted(audit:") != 0)
+}
+
+test "naming the unaudited-ffi warning in @allow is refused" {
+    assert_names("allow names W0800",
+        probe_error_names("tc_allow_ffi", allow_unaudited_ffi_src()),
+        "AuditGatedSuppression")
+}
+
+// The list is a turnstile, not a wall, and it is narrow. An ordinary lint keeps the channel
+// it has always had.
+test "naming an ordinary lint in @allow is still accepted" {
+    assert_names("allow names ordinary lint",
+        probe_error_names("tc_allow_ordinary", allow_ordinary_lint_src()), "")
+}
+
+// The second channel. `[lints] RawBypassesParam = "off"` reaches the same override table a
+// whole project wide, so carving `@allow` alone would bolt a door beside an open window.
+test "naming an audit-gated warning under [lints] is refused" {
+    diag_reset()
+    lint_set_override("RawBypassesParam", "off")
+    let mut names = ""
+    for d in diag_entries {
+        if d.severity == "error" { names = "{names}{d.name} " }
+    }
+    assert_names("lints names W0310", names.trim(), "AuditGatedSuppression")
+}
+
+test "a W-code names the same diagnostic and is refused too" {
+    diag_reset()
+    lint_set_override("W0800", "off")
+    let mut names = ""
+    for d in diag_entries {
+        if d.severity == "error" { names = "{names}{d.name} " }
+    }
+    assert_names("lints names W0800", names.trim(), "AuditGatedSuppression")
+}
+
+test "an ordinary lint is still settable from [lints]" {
+    diag_reset()
+    lint_set_override("UnusedVariable", "off")
+    let mut names = ""
+    for d in diag_entries {
+        if d.severity == "error" { names = "{names}{d.name} " }
+    }
+    assert_names("lints names ordinary", names.trim(), "")
+    diag_reset()
 }
