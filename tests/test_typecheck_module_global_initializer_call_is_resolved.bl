@@ -1,0 +1,156 @@
+// A call in a module-global initializer is a call like any other, and name resolution owes
+// it the same answer: which declaration it reaches. The resolver walks function bodies, impl
+// method bodies, type declarations and test blocks, but a global's initializer is none of
+// those, so the expression was never visited and the call kept no resolved declaration.
+// Later passes read that answer rather than re-deriving a callee, so an unanswered call
+// there is a silent gap, not a missing convenience.
+
+import std.fs
+import layout.{layout_reset}
+import mono.{run_mono}
+import cname.{cname_reset}
+import cg_test_helpers.{cg_probe_compile}
+import cg.{CgConfig, generate}
+import typecheck.{check_types, tc_call_decl_node}
+import compiler.{compile_to_program}
+import parser.{node_stmts, node_value, node_name, sublist_get, sublist_length}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+let PKG = "build/tc_global_init_pkg"
+
+fn src_helper() -> Str {
+    "pub fn compute() -> Int \{ 41 \}\npub type Counter \{ n: Int \}\npub trait Bump \{ fn bump(self) -> Int \}\nimpl Bump for Counter \{ fn bump(self) -> Int \{ self.n + 1 \} \}\n"
+}
+
+fn src_other() -> Str {
+    "pub fn twice(x: Int) -> Int \{ x * 2 \}\n"
+}
+
+fn src_probe() -> Str {
+    let mut s = "import helper.\{compute, Counter, Bump\}\nimport other\n"
+    s = "{s}pub let g_free: Int = compute()\n"
+    s = "{s}pub let g_qualified: Int = other.twice(3)\n"
+    s = "{s}pub let g_method: Int = Counter \{ n: 1 \}.bump()\n"
+    s = "{s}pub let g_literal: Int = 7\n"
+    s = "{s}fn main() \{ assert(g_free + g_qualified + g_method + g_literal == 56) \}\n"
+    s
+}
+
+let mut program_id = -1
+
+fn compile_probe() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _mk = process_run("mkdir", ["-p", "{PKG}/src"])
+    write_file("{PKG}/blink.toml", "[package]\nname = \"tcglobalinit\"\nversion = \"0.1.0\"\n")
+    write_file("{PKG}/src/helper.bl", src_helper())
+    write_file("{PKG}/src/other.bl", src_other())
+    write_file("{PKG}/src/probe.bl", src_probe())
+    diag_reset()
+    program_id = compile_to_program("{PKG}/src/probe.bl", 1)
+    check_types(program_id)
+}
+
+fn cleanup() {
+    let _rm = process_run("rm", ["-rf", PKG])
+}
+
+// The initializer expression of the top-level global named `want`, or -1.
+fn global_init(want: Str) -> Int {
+    let lets_sl = node_stmts(program_id)
+    if lets_sl == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(lets_sl) {
+        let l = sublist_get(lets_sl, i)
+        if node_name(l) == want { return node_value(l) }
+        i = i + 1
+    }
+    -1
+}
+
+fn assert_no_errors(label: Str) {
+    let mut errs: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { errs.push("{d.name}: {d.message}") }
+    }
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn assert_resolved(label: Str, global_name: Str) {
+    let init = global_init(global_name)
+    if init == -1 { io.println("FAIL: {label}: no global named '{global_name}'") }
+    assert(init != -1)
+    let decl = tc_call_decl_node(init)
+    if decl == -1 { io.println("FAIL: {label}: call in '{global_name}' reached no declaration") }
+    assert(decl != -1)
+}
+
+fn test_a_free_function_call_in_a_global_initializer_reaches_its_declaration() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe()
+    assert_no_errors("package compiles")
+    assert_resolved("bare call", "g_free")
+    cleanup()
+}
+
+fn test_a_qualified_module_call_in_a_global_initializer_reaches_its_declaration() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe()
+    assert_resolved("qualified call", "g_qualified")
+    cleanup()
+}
+
+fn test_a_method_call_in_a_global_initializer_reaches_its_declaration() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe()
+    assert_resolved("method call", "g_method")
+    cleanup()
+}
+
+// The control that keeps the rule honest: a global whose initializer calls nothing must
+// still have no entry, or a fix that recorded something for every global would pass too.
+fn test_a_global_initializer_with_no_call_reaches_no_declaration() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe()
+    let init = global_init("g_literal")
+    assert(init != -1)
+    assert(tc_call_decl_node(init) == -1)
+    cleanup()
+}
+
+// What the unanswered call actually costs, in the C the user runs. The lowering asks name
+// resolution which declaration the call reached; with no answer it cannot emit a call at all,
+// so the global collapses to a zero definition and the whole initializer disappears. The
+// program then reads 0 where it should read the computed value, and nothing says so.
+fn emit_c_for(path: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Codegen {
+    let program = cg_probe_compile(path, src)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let out = generate(program, CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0,
+        emit_only_module: "", skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0,
+        archive_build_mode: 0 })
+    let _ = fs.delete(path)
+    out
+}
+
+fn test_the_emitted_c_initializes_a_call_based_global_by_calling_it() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Codegen {
+    let src = "fn compute() -> Int \{ 41 \}\npub let g: Int = compute()\nfn main() \{ assert(g == 41) \}\n"
+    let out = emit_c_for("build/tc_global_init_emit.bl", src)
+    if out.index_of("int64_t g = 0;") >= 0 {
+        io.println("FAIL: the global collapsed to a zero definition, the initializer was dropped")
+    }
+    assert(out.index_of("int64_t g = 0;") < 0)
+    if out.index_of("g = blink_u_compute();") < 0 {
+        io.println("FAIL: no emitted assignment calls the initializer's callee")
+    }
+    assert(out.index_of("g = blink_u_compute();") >= 0)
+}
+
+fn main() {
+    test_a_free_function_call_in_a_global_initializer_reaches_its_declaration()
+    test_a_qualified_module_call_in_a_global_initializer_reaches_its_declaration()
+    test_a_method_call_in_a_global_initializer_reaches_its_declaration()
+    test_a_global_initializer_with_no_call_reaches_no_declaration()
+    test_the_emitted_c_initializes_a_call_based_global_by_calling_it()
+    io.println("module global initializer call resolution: ok")
+}
