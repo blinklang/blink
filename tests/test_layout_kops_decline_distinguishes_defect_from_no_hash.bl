@@ -1,0 +1,74 @@
+import std.fs
+import std.io
+import typecheck.{check_types, lookup_named_type, make_metavar, get_struct_field_tid}
+import layout.{layout_of, layout_reset, lo_kops_decline_of, Position}
+import compiler.{compile_to_program}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.println("FAIL: {label}: got '{got}' want '{want}'")
+    }
+    assert_eq(got, want)
+}
+
+fn probe_src() -> Str {
+    #"@derive(Hash, Eq)
+type Keyed { id: Int }
+type Plain { x: Int }
+type Box[T] { val: T }
+fn main() {
+    let a: Keyed = Keyed { id: 1 }
+    let b: Plain = Plain { x: 1 }
+    let c: Box[Int] = Box { val: 1 }
+    assert(a.id + b.x + c.val == 3)
+}
+"#
+}
+
+fn load() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Write, FS.Delete {
+    let path = "build/layout_kops_decline_probe.bl"
+    let _w = fs.write(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+}
+
+// A key that is not a type yet must never reach a table name, and the reason must say
+// which of the two unrelated refusals happened.
+fn test_a_bare_type_parameter_key_declines_by_naming_the_type_variable() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Write, FS.Delete {
+    load()
+    let tv = get_struct_field_tid(lookup_named_type("Box"), "val")
+    assert_eq_str("typevar decline", lo_kops_decline_of(tv), "free type variable T")
+}
+
+fn test_an_unsolved_metavariable_key_declines_by_naming_the_metavariable() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Write, FS.Delete {
+    load()
+    assert_eq_str("metavar decline", lo_kops_decline_of(make_metavar()), "unbound metavariable")
+}
+
+fn test_a_struct_without_a_hash_derive_declines_for_a_different_reason() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Write, FS.Delete {
+    load()
+    let plain = lookup_named_type("Plain")
+    assert_eq_str("no-Hash decline", lo_kops_decline_of(plain), "no Hash derive on Plain")
+    let tv = get_struct_field_tid(lookup_named_type("Box"), "val")
+    if lo_kops_decline_of(plain) == lo_kops_decline_of(tv) {
+        io.println("FAIL: a missing Hash derive reads the same as a key that is not a type yet")
+    }
+    assert(lo_kops_decline_of(plain) != lo_kops_decline_of(tv))
+}
+
+fn test_a_declining_key_never_carries_a_fabricated_table_name() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Write, FS.Delete {
+    load()
+    let tv = get_struct_field_tid(lookup_named_type("Box"), "val")
+    assert_eq_str("typevar table", layout_of(tv, Position.Local).kops_table, "")
+    assert_eq_str("no-Hash table", layout_of(lookup_named_type("Plain"), Position.Local).kops_table, "")
+}
+
+fn test_a_key_that_has_a_table_does_not_decline() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Write, FS.Delete {
+    load()
+    let i = lookup_named_type("Int")
+    assert_eq_str("Int decline", lo_kops_decline_of(i), "")
+    assert_eq_str("Int table", layout_of(i, Position.Local).kops_table, "blink_kops_i64")
+    assert_eq_str("Keyed decline", lo_kops_decline_of(lookup_named_type("Keyed")), "")
+}

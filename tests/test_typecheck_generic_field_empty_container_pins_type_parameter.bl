@@ -1,0 +1,119 @@
+import std.fs
+import std.io
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
+import layout.{layout_of, layout_reset, Position}
+import parser.{nodes}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries}
+
+// An empty Map()/Set() written straight at a struct-literal field left the literal's own
+// instance argument an unbound metavariable, so the literal had no C layout at all. The
+// same constructor hoisted into an annotated let always worked, which is what says this is
+// a missing pin and not a missing capability.
+//
+// The rows read the decline layout reports, because that is the reading codegen makes: an
+// UNBOUND METAVARIABLE is the defect, while a FREE TYPE VARIABLE is the correct answer
+// inside a generic body and becomes concrete through monomorphisation.
+
+fn probe(name: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/tc_generic_field_pin_{name}.bl"
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    let mut worst = ""
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 {
+            let rec = layout_of(tid, Position.Local)
+            if rec.decline_reason == "unbound metavariable" {
+                if worst == "" { worst = "{tc_type_str(tid)}" }
+            }
+        }
+        idx = idx + 1
+    }
+    worst
+}
+
+fn assert_no_unbound(label: Str, name: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let worst = probe(name, src)
+    if worst != "" {
+        io.println("FAIL: {label}: a node still has no layout, rendered '{worst}'")
+    }
+    assert_eq(worst, "")
+}
+
+test "an empty Map at a generic field pins a type-parameter key" {
+    assert_no_unbound("Map key T", "mapkey", #"
+type Bag[T] { seen: Map[T, Int] }
+fn empty_bag[T]() -> Bag[T] { Bag { seen: Map() } }
+fn main() { let b: Bag[Int] = empty_bag() assert(b.seen.len() == 0) }
+"#)
+}
+
+test "an empty Map at a generic field pins a type-parameter value" {
+    assert_no_unbound("Map value T", "mapval", #"
+type Bag[T] { seen: Map[Int, T] }
+fn empty_bag[T]() -> Bag[T] { Bag { seen: Map() } }
+fn main() { let b: Bag[Int] = empty_bag() assert(b.seen.len() == 0) }
+"#)
+}
+
+test "an empty Set at a generic field pins a type-parameter element" {
+    assert_no_unbound("Set elem T", "setelem", #"
+type Bag[T] { seen: Set[T] }
+fn empty_bag[T]() -> Bag[T] { Bag { seen: Set() } }
+fn main() { let b: Bag[Int] = empty_bag() assert(b.seen.len() == 0) }
+"#)
+}
+
+// The shape that always worked. It is the proof that the pinned tid is one mono can finish,
+// so it must keep working after the pin moves to the field itself.
+test "the same constructor hoisted into an annotated let still pins" {
+    assert_no_unbound("hoisted let", "hoisted", #"
+type Bag[T] { seen: Map[T, Int] }
+fn empty_bag[T]() -> Bag[T] {
+    let s: Map[T, Int] = Map()
+    Bag { seen: s }
+}
+fn main() { let b: Bag[Int] = empty_bag() assert(b.seen.len() == 0) }
+"#)
+}
+
+// A concrete element needs no pin from the field and must not acquire one.
+test "a concrete element at a generic field is untouched" {
+    assert_no_unbound("concrete Set[Int]", "concrete", #"
+type Bag[T] { seen: Set[Int], tag: T }
+fn empty_bag[T](t: T) -> Bag[T] { Bag { seen: Set(), tag: t } }
+fn main() { let b = empty_bag(7) assert(b.seen.len() == 0) }
+"#)
+}
+
+// The excluded case, pinned so the pin above cannot quietly widen onto it. A concrete
+// element that derives no Hash has no key-operations table and never will, and that is a
+// typecheck diagnostic naming the rule. Turning it into a pin would move the report to the
+// C compiler, which is the failure mode the exclusion exists to prevent.
+test "a concrete element that derives no Hash still reports the rule" {
+    let path = "build/tc_generic_field_pin_nohash.bl"
+    write_file(path, #"
+type QB { id: Int }
+type GT { s: Set[QB] }
+fn make() -> GT { GT { s: Set() } }
+fn main() { let g = make() assert(g.s.len() == 0) }
+"#)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    let mut named = 0
+    for d in diag_entries {
+        if d.name == "MapKeyNotHashable" { named = named + 1 }
+    }
+    if named == 0 {
+        io.println("FAIL: a Set element deriving no Hash was accepted with no rule named")
+    }
+    assert(named > 0)
+}
