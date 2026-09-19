@@ -1,0 +1,149 @@
+// Which declaration a bare global read reaches is decided once, by name resolution, using
+// the reading file's own import list. The spelling does not carry the answer: two modules
+// may each declare a private global under one name, and a stage that searches every
+// declaration by the spelling finds both. Picking by table order is a guess, and it reads
+// the wrong module's value with no diagnostic at all.
+//
+// Typecheck records the declaration against the ident node, the way it already does for a
+// call. These rows fix what is recorded for each class of read.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_global_decl_node}
+import parser.{node_count, node_kind, node_name, node_line}
+import ast.{nk_of, NodeKind}
+import diagnostics.{diag_entries, diag_reset, diag_file_for_node}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.io
+
+fn alpha_src() -> Str {
+    #"let ZZG_PIN: Int = 7
+
+pub fn zzg_alpha_read() -> Int { ZZG_PIN }
+"#
+}
+
+fn beta_src() -> Str {
+    #"let ZZG_PIN: Int = 9
+
+pub fn zzg_beta_read() -> Int { ZZG_PIN }
+"#
+}
+
+fn sig_src() -> Str {
+    #"pub let ZZG_HUP: Int = 1
+"#
+}
+
+fn shadow_src() -> Str {
+    #"let ZZG_DIM: Int = 2
+
+pub fn zzg_shadowed() -> Int {
+    let ZZG_DIM = 5
+    ZZG_DIM
+}
+
+pub fn zzg_plain() -> Int {
+    let zzg_only_local = 6
+    zzg_only_local
+}
+"#
+}
+
+fn main_src() -> Str {
+    #"import zzg_alpha.{zzg_alpha_read}
+import zzg_beta.{zzg_beta_read}
+import zzg_sig.{ZZG_HUP}
+import zzg_shadow.{zzg_shadowed, zzg_plain}
+
+let ZZG_PIN: Int = 48
+
+fn main() {
+    let _ = ZZG_PIN + ZZG_HUP + zzg_alpha_read() + zzg_beta_read() + zzg_shadowed() + zzg_plain()
+}
+"#
+}
+
+let ZZG_DIR: Str = "/tmp/zz_global_decl_probe"
+
+fn build_probe() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    shell_exec("rm -rf {ZZG_DIR} && mkdir -p {ZZG_DIR}/src")
+    write_file("{ZZG_DIR}/blink.toml", "[package]\nname = \"zzglobals\"\nversion = \"0.1.0\"\n")
+    write_file("{ZZG_DIR}/src/zzg_alpha.bl", alpha_src())
+    write_file("{ZZG_DIR}/src/zzg_beta.bl", beta_src())
+    write_file("{ZZG_DIR}/src/zzg_sig.bl", sig_src())
+    write_file("{ZZG_DIR}/src/zzg_shadow.bl", shadow_src())
+    write_file("{ZZG_DIR}/src/main.bl", main_src())
+    diag_reset()
+    let program = compile_to_program("{ZZG_DIR}/src/main.bl", 1)
+    check_types(program)
+    assert_no_errors()
+}
+
+fn assert_no_errors() {
+    let mut errs = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { errs = errs.concat("  {d.name}: {d.message}\n") }
+    }
+    assert(errs == "", "probe reported diagnostics:\n{errs}")
+}
+
+fn decl_spelling(d: Int) -> Str {
+    if d < 0 { return "(none)" }
+    "{node_name(d)}@{diag_file_for_node(d)}:{node_line(d)}"
+}
+
+// Every ident in one probe file spelled `name`, in source order.
+fn reads_of(file: Str, name: Str) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut n = 0
+    while n < node_count() {
+        if nk_of(node_kind(n)) == NodeKind.Ident && node_name(n) == name {
+            if diag_file_for_node(n) == "{ZZG_DIR}/src/{file}" { out.push(n) }
+        }
+        n = n + 1
+    }
+    out
+}
+
+fn assert_reads(label: Str, file: Str, name: Str, want: Str) {
+    let reads = reads_of(file, name)
+    if reads.len() == 0 { io.println("FAIL: {label}: no read of '{name}' in {file}") }
+    assert(reads.len() > 0)
+    for r in reads {
+        let got = decl_spelling(tc_global_decl_node(r))
+        if got != want { io.println("FAIL: {label}: read of '{name}' at line {node_line(r)} resolved to {got}, want {want}") }
+        assert(got == want)
+    }
+}
+
+// The case the record exists for. Three modules declare a private `ZZG_PIN` and all three
+// are live in one program. Only each reading file's own module says which one its read
+// means, and a search by the spelling finds all three.
+test "a read of a global resolves to the reader's own module's declaration" {
+    build_probe()
+    assert_reads("main", "main.bl", "ZZG_PIN", "ZZG_PIN@{ZZG_DIR}/src/main.bl:6")
+    assert_reads("alpha", "zzg_alpha.bl", "ZZG_PIN", "ZZG_PIN@{ZZG_DIR}/src/zzg_alpha.bl:1")
+    assert_reads("beta", "zzg_beta.bl", "ZZG_PIN", "ZZG_PIN@{ZZG_DIR}/src/zzg_beta.bl:1")
+}
+
+// A selective import is a resolved binding, not a fallback: the importer named one module
+// and name resolution accepted it, so the read reaches that module's declaration.
+test "a read of a selectively imported global resolves to the declaring module" {
+    build_probe()
+    assert_reads("imported", "main.bl", "ZZG_HUP", "ZZG_HUP@{ZZG_DIR}/src/zzg_sig.bl:1")
+}
+
+// A local binder of the same spelling holds a value, not a declaration. The read is of the
+// local, so nothing is recorded and the reading stage must not reach for the global.
+test "a read of a local that shadows a global records no declaration" {
+    build_probe()
+    assert_reads("shadowed", "zzg_shadow.bl", "ZZG_DIM", "(none)")
+}
+
+// A plain local no global shares a name with records nothing either, so the absence above
+// is about shadowing and not about the module happening to hold a global at all.
+test "a read of a plain local records no declaration" {
+    build_probe()
+    assert_reads("plain local", "zzg_shadow.bl", "zzg_only_local", "(none)")
+}
