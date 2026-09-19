@@ -61,6 +61,41 @@ fn src_plain() -> Str {
 "#
 }
 
+// The process family and `getpid`: plain runtime names exactly like the ones above, whose
+// runtime call already exists (bootstrap/runtime_process.h, runtime_core.h) and whose
+// return type is already known to typecheck (a scalar, TYPE_VOID, or the already-registered
+// runtime-owned ProcessResult struct) -- only the cc_builtin_free_symbol/arity rows are
+// missing, so every one of these still falls into the generic "closure values and
+// compiler-provided calls" refusal until this file's rows are added.
+fn src_process() -> Str {
+    #"fn main() {
+    let cmd = "true"
+    let args: List[Str] = []
+    let pid = getpid()
+    let res = process_run(cmd, args)
+    let res2 = process_run_with_stdin(cmd, args, "in")
+    process_exec(cmd, args)
+    let handle = process_spawn(cmd, args)
+    let waited = process_pid_wait(handle)
+    let killed = process_pid_kill(handle, 9)
+    let signaled = process_pid_send_signal(handle, 9)
+    process_install_signal_forwarding()
+    let _keep = [pid, handle, killed, signaled]
+    let _also = [res.exit_code, res2.exit_code, waited.exit_code]
+}
+"#
+}
+
+// A wrong-arity `process_run` call, exercising the same arity backstop the other plain
+// runtime names already share once process_run has a row of its own.
+fn src_process_arity_wrong() -> Str {
+    #"fn main() {
+    let res = process_run("true")
+    let _keep = res
+}
+"#
+}
+
 // A builtin type's own constructor spelled bare, and a bare `Channel(n)` under the
 // annotation that resolves its element metavar.
 fn src_ctors() -> Str {
@@ -226,6 +261,85 @@ test "exit passes its code to the runtime call" {
     assert_shape("shape", built, "CallRuntime(Const)")
     assert_eq_str("symbol", ir_c_name(built), "blink_exit")
     assert_verifies("exit", built)
+}
+
+test "getpid reaches the runtime call with no argument" {
+    probe("cg_call_bf_getpid", src_process())
+    let built = lower_expr(rhs_of("pid"))
+    assert_shape("shape", built, "CallRuntime")
+    assert_eq_str("symbol", ir_c_name(built), "blink_getpid")
+    assert_verifies("getpid", built)
+}
+
+test "process_run passes its command and argument list to the runtime call" {
+    probe("cg_call_bf_process_run", src_process())
+    let built = lower_expr(rhs_of("res"))
+    assert_shape("shape", built, "CallRuntime(VarRef, VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_process_run")
+    assert_verifies("process_run", built)
+}
+
+test "process_run_with_stdin passes its command, arguments and stdin to the runtime call" {
+    probe("cg_call_bf_process_run_with_stdin", src_process())
+    let built = lower_expr(rhs_of("res2"))
+    assert_shape("shape", built, "CallRuntime(VarRef, VarRef, Const)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_process_run_with_stdin")
+    assert_verifies("process_run_with_stdin", built)
+}
+
+test "process_exec passes its command and argument list to the runtime call" {
+    probe("cg_call_bf_process_exec", src_process())
+    let built = lower_expr(call_after("res2", "process_exec"))
+    assert_shape("shape", built, "CallRuntime(VarRef, VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_process_exec")
+    assert_verifies("process_exec", built)
+}
+
+test "process_spawn passes its command and argument list to the runtime call" {
+    probe("cg_call_bf_process_spawn", src_process())
+    let built = lower_expr(rhs_of("handle"))
+    assert_shape("shape", built, "CallRuntime(VarRef, VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_process_spawn")
+    assert_verifies("process_spawn", built)
+}
+
+test "process_pid_wait passes its handle to the runtime call" {
+    probe("cg_call_bf_process_pid_wait", src_process())
+    let built = lower_expr(rhs_of("waited"))
+    assert_shape("shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_process_pid_wait")
+    assert_verifies("process_pid_wait", built)
+}
+
+test "process_pid_kill passes its handle and signal to the runtime call" {
+    probe("cg_call_bf_process_pid_kill", src_process())
+    let built = lower_expr(rhs_of("killed"))
+    assert_shape("shape", built, "CallRuntime(VarRef, Const)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_process_pid_kill")
+    assert_verifies("process_pid_kill", built)
+}
+
+test "process_pid_send_signal passes its handle and signal to the runtime call" {
+    probe("cg_call_bf_process_pid_send_signal", src_process())
+    let built = lower_expr(rhs_of("signaled"))
+    assert_shape("shape", built, "CallRuntime(VarRef, Const)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_process_pid_send_signal")
+    assert_verifies("process_pid_send_signal", built)
+}
+
+test "process_install_signal_forwarding reaches the runtime call with no argument" {
+    probe("cg_call_bf_process_install_signal_forwarding", src_process())
+    let built = lower_expr(call_after("signaled", "process_install_signal_forwarding"))
+    assert_shape("shape", built, "CallRuntime")
+    assert_eq_str("symbol", ir_c_name(built), "blink_process_install_signal_forwarding")
+    assert_verifies("process_install_signal_forwarding", built)
+}
+
+test "a wrong-arity process_run call refuses rather than emit an uncompilable call" {
+    probe("cg_call_bf_process_run_arity", src_process_arity_wrong())
+    assert_ice_saying("process_run(\"true\")", lower_expr(rhs_of("res")),
+        "RuntimeFreeCallArityWrong",
+        "'process_run' takes 2 argument(s), and this call was given 1")
 }
 
 test "a bare StringBuilder() reaches the same runtime constructor as StringBuilder.new()" {
