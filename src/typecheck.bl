@@ -5032,7 +5032,7 @@ fn tc_fn_tid_ret(fn_tid: Int) -> Int {
 // walk can read it from, so the declared type is published there: infer_type's Closure arm
 // re-mints from the declaration alone (UNKNOWN params, a Void default return) and keeps
 // whichever of the two is more specific, so this seed survives that re-mint.
-fn tc_seed_closure_expected_fn(arg0: Int, expected: Int) {
+fn tc_seed_closure_expected_fn(arg0: Int, expected: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if arg0 == -1 || expected < 0 { return }
     if tc_tid_kind(tc_tid_resolved(expected)) != TyKind.Fn { return }
     // A keyword argument wraps its value; the caller has already paired it with the
@@ -5048,7 +5048,44 @@ fn tc_seed_closure_expected_fn(arg0: Int, expected: Int) {
     // the whole signature would leave `Str` and `Int` here undeclared as well.
     let seed = tc_fn_tid_declared_positions(expected)
     if seed < 0 { return }
+    tc_check_closure_ann_against_declared(a, seed)
     tc_publish_node_tid(a, seed)
+}
+
+// A closure may spell a position the context has already declared. Two types for one position
+// is a contradiction, and the declaration is the half every caller reads, so the closure's
+// annotation is the error rather than a second opinion that silently wins.
+//
+// Only a position BOTH halves name is compared. One the closure leaves unwritten declares
+// nothing, and one the declaration leaves open is how a generic formal reaches here — the
+// caller has already masked those to TYPE_UNKNOWN.
+fn tc_check_closure_ann_against_declared(cls: Int, declared_fn: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let hints = tc_fn_tid_param_hints(declared_fn)
+    let params_sl = node_params(cls)
+    if params_sl != -1 {
+        let n = sublist_length(params_sl)
+        let mut i = 0
+        while i < n {
+            let p = sublist_get(params_sl, i)
+            if node_type_ann(p) != -1 || node_type_name(p) != "" {
+                let want = hints.get(i) ?? TYPE_UNKNOWN
+                let got = resolve_param_type(p)
+                if tc_tid_is_no_info(want) == 0 && tc_tid_is_no_info(got) == 0 && types_compatible(want, got) == 0 {
+                    let ppos = i + 1
+                    tc_error_at("closure parameter {ppos} '{node_name(p)}': declared type {type_to_str(want)} but written {type_to_str(got)}", p)
+                }
+            }
+            i = i + 1
+        }
+    }
+    // An omitted `-> R` is not a contradiction: tc_closure_declared_ret answers Void for it,
+    // which is a default rather than something the program wrote.
+    if node_type_ann(cls) == -1 { return }
+    let want_ret = tc_fn_tid_ret(declared_fn)
+    let got_ret = tc_closure_declared_ret(cls)
+    if tc_tid_is_no_info(want_ret) != 0 || tc_tid_is_no_info(got_ret) != 0 { return }
+    if types_compatible(want_ret, got_ret) != 0 { return }
+    tc_error_at("closure return type: declared type {type_to_str(want_ret)} but written {type_to_str(got_ret)}", cls)
 }
 
 // Carry a declared type along the path the VALUE takes to reach the position that declared
@@ -5063,11 +5100,11 @@ fn tc_seed_closure_expected_fn(arg0: Int, expected: Int) {
 //
 // Descent only: the leaf is still the one publisher, so a position this does not understand
 // behaves exactly as it did before, and a branch holding anything but a closure is untouched.
-fn tc_seed_expected_into_value(val: Int, expected: Int) {
+fn tc_seed_expected_into_value(val: Int, expected: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     tc_seed_expected_into_value_at(val, expected, 0)
 }
 
-fn tc_seed_expected_into_value_at(val: Int, expected: Int, depth: Int) {
+fn tc_seed_expected_into_value_at(val: Int, expected: Int, depth: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     dbg_trace("seedv", "enter val={val} kind={if val >= 0 { node_kind_name(node_kind(val)) } else { "<none>" }} expected={expected} depth={depth}")
     if val == -1 || expected < 0 { return }
     // Nesting this deep is not a shape a declaration can still describe; the cap keeps the
