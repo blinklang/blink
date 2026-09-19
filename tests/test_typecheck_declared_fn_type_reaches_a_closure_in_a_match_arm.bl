@@ -1,0 +1,157 @@
+// A declared function type says what a closure's parameters are, and a `match` used as a value
+// answers from its arms exactly as an `if` answers from its branch tails. The expectation
+// therefore owes every arm the same descent it already gives a branch.
+//
+// Both arm spellings are covered, because they reach the value differently. A braced arm body
+// is a Block, whose tail the descent already understood. A braceless arm body is an ExprStmt
+// wrapping the expression, and that wrapper is what used to stop the descent: it read the
+// wrapper as the value, found no closure there, and published nothing.
+//
+// Both positions are covered too. In value position the declaration is the binding's
+// annotation; in argument position it is the parameter's declared type, which additionally
+// needs the arm walked as a body, or the parameters are left carrying no type at all.
+//
+// The controls are the two things that must not change. An arm that answers with something
+// other than the declared type is still rejected, and a closure in an arm under no declaration
+// at all is still reported as impossible to infer.
+
+import typecheck.{check_types, tc_lookup_node_tid, tc_resolve, tc_type_str}
+import parser.{node_kind, node_name, nodes}
+import ast.{NodeKind, nk_of}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn param_node_of(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.Param && node_name(i) == name { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no parameter '{name}'")
+    assert(false)
+    -1
+}
+
+fn assert_param_type(name: Str, want: Str) {
+    let p = param_node_of(name)
+    let tid = tc_lookup_node_tid(p)
+    if tid < 0 {
+        io.println("FAIL: parameter '{name}' carries no type at all")
+        assert(false)
+        return
+    }
+    let got = tc_type_str(tc_resolve(tid))
+    if got != want { io.println("FAIL: parameter '{name}': got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn messages_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat(d.message).concat("\n") }
+    }
+    out
+}
+
+fn assert_reported(name: Str) {
+    let msgs = messages_reported()
+    if !msgs.contains(name) { io.println("FAIL: '{name}' is not reported; reports were: {msgs}") }
+    assert(msgs.contains(name))
+}
+
+fn assert_unreported(name: Str) {
+    let msgs = messages_reported()
+    if msgs.contains(name) { io.println("FAIL: '{name}' is reported: {msgs}") }
+    assert(!msgs.contains(name))
+}
+
+// One probe holds every shape. Typecheck's named-type map is not reset between compiles in
+// one binary, so a second probe would be measuring the first one's leftovers.
+fn match_src() -> Str {
+    #"fn zm_take(f: fn(Int, Str) -> Int) -> Int {
+    f(1, "s")
+}
+
+fn main() {
+    let zmpick = true
+    let _braced: fn(Int, Str) -> Int = match zmpick {
+        true => { fn(zmba, zmbb) -> Int { zmbb.len() } }
+        false => { fn(zmca, zmcb) -> Int { zmcb.len() } }
+    }
+    let _bare: fn(Int, Str) -> Int = match zmpick {
+        true => fn(zmda, zmdb) -> Int { zmdb.len() }
+        false => fn(zmea, zmeb) -> Int { zmeb.len() }
+    }
+    let _arg = zm_take(match zmpick {
+        true => { fn(zmfa, zmfb) -> Int { zmfb.len() } }
+        false => { fn(zmga, zmgb) -> Int { zmgb.len() } }
+    })
+    let zmwrong: fn(Int, Str) -> Int = match zmpick {
+        true => { 5 }
+        false => { fn(zmha, zmhb) -> Int { zmhb.len() } }
+    }
+    let zmfree = match zmpick {
+        true => { fn(zmua, zmub) -> Int { 4 } }
+        false => { fn(zmuc, zmud) -> Int { 5 } }
+    }
+    let _sink = [_braced, _bare, zmwrong]
+    let _keep = _arg
+    let _held = zmfree
+}
+"#
+}
+
+test "a declared fn type reaches a closure in a braced match arm" {
+    let _program = probe("build/tc_match_arm_closure_src.bl", match_src())
+    assert_param_type("zmba", "Int")
+    assert_param_type("zmbb", "Str")
+    assert_param_type("zmca", "Int")
+    assert_param_type("zmcb", "Str")
+}
+
+test "a declared fn type reaches a closure in a braceless match arm" {
+    let _program = probe("build/tc_match_arm_closure_src.bl", match_src())
+    assert_param_type("zmda", "Int")
+    assert_param_type("zmdb", "Str")
+    assert_param_type("zmea", "Int")
+    assert_param_type("zmeb", "Str")
+}
+
+test "a declared parameter type reaches a closure in a match arm in argument position" {
+    let _program = probe("build/tc_match_arm_closure_src.bl", match_src())
+    assert_param_type("zmfa", "Int")
+    assert_param_type("zmfb", "Str")
+    assert_param_type("zmga", "Int")
+    assert_param_type("zmgb", "Str")
+}
+
+// The descent hands the arms an expectation; it does not make them satisfy it.
+test "a match arm answering with the wrong type is still rejected" {
+    let _program = probe("build/tc_match_arm_closure_src.bl", match_src())
+    assert_reported("zmwrong")
+}
+
+// With no declaration anywhere there is nothing to hand down, and the parameters really are
+// under-determined. The report lands on the binding and on the second arm: one report per
+// inference root, and the first arm's parameters share the binding's root.
+test "a closure in a match arm under no declaration is still under-determined" {
+    let _program = probe("build/tc_match_arm_closure_src.bl", match_src())
+    assert_reported("zmfree")
+    assert_reported("zmuc")
+    assert_unreported("zmba")
+    assert_unreported("zmda")
+    assert_unreported("zmfa")
+}
