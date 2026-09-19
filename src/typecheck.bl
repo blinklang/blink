@@ -37,7 +37,7 @@ import diagnostics.{
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905,
     TRAIT_CONTRACT_906, TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
     POLY_IMPL_UNSUPPORTED, IMPL_BINDER_UNUSED, TRAIT_ARG_ARITY, MISSING_SUPERTRAIT_IMPL, TYPE_ARG_ARITY,
-    CALL_SITE_TYPE_ARGS,
+    CALL_SITE_TYPE_ARGS, ENUM_PATTERN_NON_ENUM,
     CONTRACT_PREDICATE_NOT_DECIDABLE, EFFECTFUL_CALL_IN_PREDICATE,
     IMPURE_CALL_IN_PREDICATE, LOOP_IN_PREDICATE,
     RESULT_OUTSIDE_ENSURES, OLD_OUTSIDE_ENSURES,
@@ -6453,10 +6453,21 @@ fn resolve_alias_type_name(name0: Str) -> Str {
     name
 }
 
+// Whether a written type name is a type parameter bound by the enclosing declaration. A
+// binder shadows a type of the same name, so a signature written `fn f[K, V](m: Map[K, V])`
+// says nothing about a user type that happens to also be called K. The key's Hash
+// obligation belongs at the call site, on whatever the parameter is substituted with.
+fn tc_name_is_tparam_in_scope(name: Str) -> Int {
+    if (tc_active_tparams.get(name) ?? 0) > 0 { return 1 }
+    if (tc_active_tparams.get(strip_module_qualifier(name)) ?? 0) > 0 { return 1 }
+    0
+}
+
 fn validate_map_key(key_ann: Int) ! Diag.Report {
     // Decisions read the base type; every message names what the USER wrote, so a rejected
     // `type Temp = Float` says "Map key type 'Temp'" and explains the Float hazard behind it.
     let decl_name = node_name(key_ann)
+    if tc_name_is_tparam_in_scope(decl_name) != 0 { return }
     let key_name = resolve_alias_type_name(decl_name)
     if key_name == "Float" || key_name == "F32" || key_name == "F64" {
         diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Map key type '{decl_name}' is not hashable — Float/Double values cannot serve as Map keys (NaN-inequality and bit-equality hazards)", key_ann, "round the key to an Int (or another integer width) before inserting")
@@ -6510,6 +6521,7 @@ fn validate_set_elem(elem_ann: Int) ! Diag.Report {
     // Same decl/base split as validate_map_key: verdicts read the base type, messages name what
     // the user wrote.
     let decl_name = node_name(elem_ann)
+    if tc_name_is_tparam_in_scope(decl_name) != 0 { return }
     let elem_name = resolve_alias_type_name(decl_name)
     if elem_name == "Float" || elem_name == "F32" || elem_name == "F64" {
         diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Set element type '{decl_name}' is not hashable — Float/Double values cannot serve as Set elements (NaN-inequality and bit-equality hazards)", elem_ann, "round the value to an Int (or another integer width) before inserting")
@@ -13618,6 +13630,36 @@ fn is_comparison_op(op: Str) -> Int {
 // Infer a carrier argument (Some/Ok/Err) with the construction hint unwrapped to the carried
 // inner type, so a bare struct-style variant inside the carrier resolves against the right enum.
 // Mirrors the pattern-path carrier unwrap. carrier is "Some" | "Ok" | "Err".
+// The slot a one-sided carrier constructor does not name. `Ok(v)` says what the Ok side
+// holds and nothing about the Err side; the expected type at that position does, so read it
+// from there and mint a fresh metavar only when nothing names it.
+//
+// Minting is not free. infer_type re-runs on the same node and overwrites the node's stamp
+// each time, so a metavar minted AFTER the declared type was pinned replaces a solved stamp
+// with an unsolved one and reaches layout as "unbound metavariable". The hint is present at
+// exactly the positions that pin (declared return, annotation, parameter, field), so taking
+// the slot from it makes the first stamp the right one and re-inference idempotent.
+//
+// `slot` is the slot being FILLED: 1 for inner1, 2 for inner2. A hint of a different kind
+// names nothing about this carrier and is ignored, so a mismatch still mints and still
+// reports through the usual compare rather than baking a wrong type.
+fn tc_carrier_slot_from_hint(want: TyKind, slot: Int) -> Int {
+    if tc_construct_hint < 0 { return make_metavar() }
+    let h = resolve_alias_tid(tc_construct_hint)
+    if h < 0 || h >= ty_pool.len() { return make_metavar() }
+    // An expectation that still carries an unsolved slot of its own NAMES nothing here, and
+    // reading one out of it would take away the very thing a later use pins. `let mut x =
+    // Ok(3)` leaves the err slot open on purpose and `x = Err("boom")` closes it; if the Err
+    // side read its ok slot back out of x, the two sides would already agree and nothing would
+    // drive the binding, so the slot stays open to the end and is reported as uninferable.
+    if tc_tid_has_unbound_metavar(h) != 0 { return make_metavar() }
+    let e = ty_pool.get(h).unwrap()
+    if e.kind != want { return make_metavar() }
+    let other = if slot == 1 { e.inner1 } else { e.inner2 }
+    if other < 0 { return make_metavar() }
+    other
+}
+
 fn infer_carrier_arg(arg_node: Int, carrier: Str) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let saved_hint = tc_construct_hint
     let k = type_kind(tc_construct_hint)
@@ -14057,7 +14099,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     if kind == NodeKind.Ident {
         let name = node_name(node)
         if name == "true" || name == "false" { return TYPE_BOOL }
-        if name == "None" { return make_option_type(make_metavar()) }
+        if name == "None" { return make_option_type(tc_carrier_slot_from_hint(TyKind.Option, 1)) }
         let vt = nr_get_type(name)
         if tc_tid_is_no_info(vt) == 0 { return vt }
         if is_variant_name(name) != 0 {
@@ -14328,7 +14370,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let args_sl = node_args(node)
                     if args_sl != -1 && sublist_length(args_sl) >= 1 {
                         let inner = infer_carrier_arg(sublist_get(args_sl, 0), "Ok")
-                        return make_result_type(inner, make_metavar())
+                        return make_result_type(inner, tc_carrier_slot_from_hint(TyKind.Result, 2))
                     }
                     return make_result_type(make_metavar(), make_metavar())
                 }
@@ -14336,7 +14378,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let args_sl = node_args(node)
                     if args_sl != -1 && sublist_length(args_sl) >= 1 {
                         let inner = infer_carrier_arg(sublist_get(args_sl, 0), "Err")
-                        return make_result_type(make_metavar(), inner)
+                        return make_result_type(tc_carrier_slot_from_hint(TyKind.Result, 1), inner)
                     }
                     return make_result_type(make_metavar(), make_metavar())
                 }
@@ -16491,9 +16533,18 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if elems_sl == -1 { return TYPE_VOID }
         if sublist_length(elems_sl) == 0 { return TYPE_VOID }
         let mut elem_types: List[Int] = []
+        // An ELEMENT's slot is the element type, not the tuple, so the hint is narrowed one
+        // position at a time exactly as a list literal narrows to its element. Unnarrowed, a
+        // one-sided carrier written as an element reads the tuple as its expectation, finds a
+        // kind it is not, and mints an unbound slot the annotation right there would name.
+        let tl_saved_hint = tc_construct_hint
+        let tl_hint = if tc_construct_hint >= 0 { resolve_alias_tid(tc_construct_hint) } else { -1 }
+        let tl_narrow = if tl_hint >= 0 && tc_tid_kind(tl_hint) == TyKind.Tuple && tc_tid_child_count(tl_hint) == sublist_length(elems_sl) { 1 } else { 0 }
         let mut i = 0
         while i < sublist_length(elems_sl) {
+            if tl_narrow != 0 { tc_construct_hint = tc_tid_child(tl_hint, i) }
             elem_types.push(infer_type(sublist_get(elems_sl, i)))
+            tc_construct_hint = tl_saved_hint
             i = i + 1
         }
         return make_tuple_type(elem_types)
@@ -17662,6 +17713,64 @@ fn tc_check_stmt_match_arm(arm: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag
     tc_check_body(node_body(arm))
 }
 
+// Whether a type has no variants at all, so that no in-scope reading of an enum-variant
+// pattern could make an arm over it well typed. Deliberately the builtin scalars only: an
+// enum is already correct, a carrier's variants are Some/Ok/Err, and anything unsolved is
+// not yet decidable.
+fn tc_kind_has_no_variants(tid: Int) -> Int {
+    if tid < 0 { return 0 }
+    match type_kind(tid) {
+        TyKind.Int => 1
+        TyKind.Float => 1
+        TyKind.Bool => 1
+        TyKind.Str => 1
+        TyKind.Char => 1
+        TyKind.I8 => 1
+        TyKind.I16 => 1
+        TyKind.I32 => 1
+        TyKind.U8 => 1
+        TyKind.U16 => 1
+        TyKind.U32 => 1
+        TyKind.U64 => 1
+        _ => 0
+    }
+}
+
+// sections/03_types.md:1209 -- an enum is nominally distinct from Int, so an arm naming one of
+// its variants cannot match a scalar scrutinee. Reported from the statement walk, not from
+// tc_check_pattern_types: that walk runs many times per node and is deliberately
+// diagnostic-free, so an emit there would repeat. Only the arm's TOP-LEVEL pattern is read,
+// because only that one is matched against the scrutinee.
+fn tc_check_enum_pattern_scrutinee(pat: Int, scrut_tid: Int) ! Diag.Report {
+    if pat == -1 { return }
+    let k = node_kind(pat)
+    if k == NodeKind.OrPattern {
+        let alts = node_elements(pat)
+        if alts != -1 {
+            let mut i = 0
+            while i < sublist_length(alts) {
+                tc_check_enum_pattern_scrutinee(sublist_get(alts, i), scrut_tid)
+                i = i + 1
+            }
+        }
+        return
+    }
+    if k != NodeKind.EnumPattern { return }
+    // A qualified `E.V` only: an unqualified variant name resolves against the scrutinee and
+    // draws its own diagnostic when that fails.
+    let variant = node_type_name(pat)
+    if variant == "" { return }
+    let qual = node_name(pat)
+    let qual_tid = named_type_map.get(qual) ?? -1
+    if qual_tid < 0 { return }
+    if type_kind(qual_tid) != TyKind.Enum { return }
+    if tc_kind_has_no_variants(scrut_tid) == 0 { return }
+    diag_error_at("EnumPatternNeedsEnumScrutinee", ENUM_PATTERN_NON_ENUM,
+        "match arm names variant '{qual}.{variant}', but the value being matched has type '{type_to_str(scrut_tid)}' -- a scalar has no variants, so this arm can never be the one that runs",
+        pat,
+        "match the enum itself, or cross the boundary explicitly with {qual}.from_int(...), which answers Option[{qual}]")
+}
+
 fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return }
     let kind = node_kind(node)
@@ -18180,6 +18289,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 tc_pattern_binding_type = scrut_tid
                 tc_check_pattern_types(node_pattern(arm))
                 tc_pattern_binding_type = -1
+                tc_check_enum_pattern_scrutinee(node_pattern(arm), scrut_tid)
                 tc_check_stmt_match_arm(arm)
                 // Resolve the arm's body-value tid through the scoped-value memo, NOT a bare
                 // tc_lookup_node_tid: a braced arm body (`Pat => { ... }`) makes tc_arm_body_value
@@ -18579,6 +18689,13 @@ let mut tc_if_value_ctx: Int = 0
 fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
     if node == -1 { return }
     let kind = node_kind(node)
+    // Every pattern MATCHES a value, so every pattern node has a type: the value it is
+    // matched against, which is the binding hint exactly as it arrives here, before any arm
+    // below decomposes it for a child. Published once at the top rather than arm by arm --
+    // the two arms that bind a name did it for themselves, so a wildcard, a literal, a range
+    // and a nested variant pattern were the shapes nothing published for, and codegen asking
+    // one of them for its type found no answer at all.
+    if tc_pattern_binding_type >= 0 { tc_publish_node_tid(node, tc_pattern_binding_type) }
     if kind == NodeKind.IdentPattern {
         let name = node_name(node)
         // A nullary variant (`None`) and `_` bind nothing, but they still MATCH a value, and

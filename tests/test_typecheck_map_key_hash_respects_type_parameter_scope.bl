@@ -1,0 +1,134 @@
+// sections/03_types.md:1229 — a type parameter is a binder, and a binder shadows a type of
+// the same name for the length of its scope. lib/std/map.bl declares every signature as
+// `fn map_has[K, V](m: Map[K, V], ...)`, so inside those signatures K names the parameter.
+//
+// The Map-key Hash check did not see that. It asked named_type_map whether the written key
+// name is a declared user type and, finding one, rejected the annotation. So a program that
+// happens to declare a type called K drew E1400 MapKeyNotHashable on every signature in
+// lib/std/map.bl — stdlib source the author never wrote, for a key type that is not theirs.
+// The obligation belongs at the call site, on the substituted key type, never on the
+// generic declaration; the check's own comment already said generic parameters are deferred
+// to later phases, and this is the scope it was missing.
+//
+// The rule it must not weaken is the one that check exists for: a declared user type
+// without @derive(Hash, Eq) used as a real key is still refused. Both rows below, so a fix
+// that simply stops rejecting cannot pass.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+
+fn probe_diag_names(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out = "{out}{d.name} " }
+    }
+    out.trim()
+}
+
+// A user type whose name is the same letter lib/std/map.bl binds as its key parameter.
+fn shadowing_type_src() -> Str {
+    #"@derive(Eq)
+type K { x: Int }
+
+fn main() {
+    let k = K { x: 1 }
+    io.println("{k.x}")
+}
+"#
+}
+
+// The same name, now used as a real key. The type carries no Hash, so the rule still bites.
+fn real_key_src() -> Str {
+    #"@derive(Eq)
+type K { x: Int }
+
+fn main() {
+    let m: Map[K, Int] = Map()
+    io.println("{m.len()}")
+}
+"#
+}
+
+// A key that does carry the derive is accepted, so the rule is not simply off.
+fn hashable_key_src() -> Str {
+    #"@derive(Hash, Eq)
+type K { x: Int }
+
+fn main() {
+    let m: Map[K, Int] = Map()
+    io.println("{m.len()}")
+}
+"#
+}
+
+// lib/std/set.bl binds T, so a Set carries the same hazard through the same check.
+fn shadowing_set_type_src() -> Str {
+    #"@derive(Eq)
+type T { x: Int }
+
+fn main() {
+    let t = T { x: 1 }
+    io.println("{t.x}")
+}
+"#
+}
+
+fn real_set_elem_src() -> Str {
+    #"@derive(Eq)
+type T { x: Int }
+
+fn main() {
+    let s: Set[T] = Set()
+    io.println("{s.len()}")
+}
+"#
+}
+
+fn assert_names(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: drew '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+// The premise the first row rests on. If lib/std/map.bl stops binding K as a parameter the
+// row proves nothing, so it is read from disk rather than assumed.
+test "lib/std/map.bl binds K as a type parameter" {
+    let text = read_file("lib/std/map.bl")
+    assert(text.contains("map_has[K, V]"))
+}
+
+test "a user type named K does not make lib/std/map.bl's own signatures unhashable" {
+    assert_names("shadowing type", probe_diag_names("tc_mapkey_shadow", shadowing_type_src()), "")
+}
+
+test "a declared type with no Hash derive is still refused as a real key" {
+    assert_names("real key", probe_diag_names("tc_mapkey_real", real_key_src()),
+        "MapKeyNotHashable")
+}
+
+test "lib/std/set.bl binds T as a type parameter" {
+    let text = read_file("lib/std/set.bl")
+    assert(text.contains("set_has[T]"))
+}
+
+test "a user type named T does not make lib/std/set.bl's own signatures unhashable" {
+    assert_names("shadowing set type",
+        probe_diag_names("tc_setelem_shadow", shadowing_set_type_src()), "")
+}
+
+test "a declared type with no Hash derive is still refused as a real Set element" {
+    assert_names("real element", probe_diag_names("tc_setelem_real", real_set_elem_src()),
+        "MapKeyNotHashable")
+}
+
+test "a declared type with the Hash derive is accepted as a key" {
+    assert_names("hashable key", probe_diag_names("tc_mapkey_ok", hashable_key_src()), "")
+}
