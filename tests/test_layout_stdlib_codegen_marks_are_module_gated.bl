@@ -1,0 +1,95 @@
+// Two codegen facts live on declarations in lib/std and nowhere else: Errno lowers to a
+// bare int64_t, and ConversionError and ProcessResult keep the blink_<Name> the runtime
+// header declares. Neither fact is carried by the node or by the tid, so layout marks
+// them on cname once per build.
+//
+// The mark belongs to the DECLARATION, which means the declaring module decides it and
+// the spelling never does. A user type is free to be named Errno or ProcessResult and
+// must keep the ordinary lowering, and the stdlib declaration must keep its fact while
+// that user type exists. Both halves are pinned here together: a gate that only refused
+// the user type could pass by marking nothing at all.
+import std.io
+import ast.{NodeKind}
+import layout.{layout_reset}
+import cname.{cname_is_transparent_newtype, cname_is_runtime_owned}
+import cname_test_helpers.{find_decl, compile_probe}
+
+fn assert_mark(label: Str, got: Bool, want: Bool) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn stdlib_only_src() -> Str {
+    #"import std.errno.{Errno}
+import std.process.{ProcessResult}
+import std.traits.{ConversionError}
+fn main() {
+    let e: Errno = Errno.Errno(1)
+    let _c = e
+}
+"#
+}
+
+// The same three names declared again in the main module, plus Zzcode: a newtype of
+// exactly the shape the Errno mark asks for, under a name lib/std does not use.
+fn shadowing_src() -> Str {
+    #"import std.errno.{Errno}
+import std.process.{ProcessResult}
+import std.traits.{ConversionError}
+type Errno {
+    Errno(code: Int)
+}
+type Zzcode {
+    Zzcode(v: Int)
+}
+type ProcessResult {
+    out: Str
+    code: Int
+}
+type ConversionError {
+    reason: Str
+}
+fn main() {
+    let z = Zzcode.Zzcode(2)
+    let r = ProcessResult { out: "a", code: 0 }
+    let c = ConversionError { reason: "r" }
+    let _u = r.code
+    let _v = c.reason
+    let _w = z
+}
+"#
+}
+
+test "the stdlib declarations carry the two marks" {
+    let _p = compile_probe("layout_marks_stdlib", stdlib_only_src())
+    layout_reset()
+    assert_mark("std.errno Errno transparent", cname_is_transparent_newtype(find_decl(NodeKind.TypeDef, "Errno", "std_errno")), true)
+    assert_mark("std.process ProcessResult runtime-owned", cname_is_runtime_owned(find_decl(NodeKind.TypeDef, "ProcessResult", "std_process")), true)
+    assert_mark("std.traits ConversionError runtime-owned", cname_is_runtime_owned(find_decl(NodeKind.TypeDef, "ConversionError", "std_traits")), true)
+}
+
+test "a user type spelled like a marked stdlib type carries no mark" {
+    let _p = compile_probe("layout_marks_user", shadowing_src())
+    layout_reset()
+    assert_mark("user Errno transparent", cname_is_transparent_newtype(find_decl(NodeKind.TypeDef, "Errno", "")), false)
+    assert_mark("user ProcessResult runtime-owned", cname_is_runtime_owned(find_decl(NodeKind.TypeDef, "ProcessResult", "")), false)
+    assert_mark("user ConversionError runtime-owned", cname_is_runtime_owned(find_decl(NodeKind.TypeDef, "ConversionError", "")), false)
+}
+
+test "the shape the Errno mark asks for earns nothing under another name" {
+    let _p = compile_probe("layout_marks_shape", shadowing_src())
+    layout_reset()
+    assert_mark("user Zzcode transparent", cname_is_transparent_newtype(find_decl(NodeKind.TypeDef, "Zzcode", "")), false)
+}
+
+// The bare-name index keeps only its last writer, so a user namesake can take the entry
+// the stdlib declaration wrote. Reading the index by bare name therefore marks the user
+// type and leaves the stdlib one bare, which mis-lowers BOTH. The mark must reach the
+// declaration the declaring module names.
+test "a user namesake does not take the mark away from the stdlib declaration" {
+    let _p = compile_probe("layout_marks_shadowed", shadowing_src())
+    layout_reset()
+    assert_mark("std.errno Errno transparent under a namesake", cname_is_transparent_newtype(find_decl(NodeKind.TypeDef, "Errno", "std_errno")), true)
+    assert_mark("std.process ProcessResult runtime-owned under a namesake", cname_is_runtime_owned(find_decl(NodeKind.TypeDef, "ProcessResult", "std_process")), true)
+    assert_mark("std.traits ConversionError runtime-owned under a namesake", cname_is_runtime_owned(find_decl(NodeKind.TypeDef, "ConversionError", "std_traits")), true)
+}
