@@ -1,0 +1,321 @@
+import std.fs
+import std.io
+import typecheck.{check_types, TYPE_INT}
+import layout.{layout_reset}
+import mono.{run_mono}
+import ir.{ir_dump, ir_reset, ir_verify}
+import parser.{nodes, node_kind, node_name, node_body}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import cg_stmt.{cg_stmt_reset, cg_stmt_set_debug_mode, lower_fn}
+import cg_test_helpers.{cg_probe_compile}
+import cname.{
+    c_assert_fail_eq_name, c_assert_fail_intro_name, c_assert_fail_name,
+    c_debug_assert_fail_name, cname_reset,
+}
+import cg.{CgConfig, generate}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// The nested compile resolves the prelude from BLINK_ROOT; the harness runs from the
+// repo root, so the cwd is that root.
+fn run_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    env.set_var("BLINK_ROOT", env.cwd())
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    diag_reset()
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+}
+
+fn dump_of(name: Str) -> Str ! Diag.Report {
+    let f = find_fn(name)
+    assert(f >= 0)
+    let root = lower_fn(f)
+    for err in ir_verify(root) { io.println("VERIFY: {err}") }
+    assert_eq(ir_verify(root).len(), 0)
+    ir_dump(root)
+}
+
+fn count_of(text: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut rest = text
+    while rest.contains(needle) {
+        n = n + 1
+        rest = rest.slice(rest.index_of(needle) + needle.len(), rest.len())
+    }
+    n
+}
+
+// How many internal errors carry this diagnostic name.
+fn ice_mentioning(text: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.name == text { n = n + 1 }
+    }
+    n
+}
+
+test "assert on a non-decomposable condition lowers to one guarded fail call" {
+    run_probe("build/cg_stmt_assert_plain.bl", #"fn probe(x: Bool) {
+    assert(x)
+}
+fn main() { probe(true) }
+"#)
+    let text = dump_of("probe")
+    assert_eq(count_of(text, "(If "), 1)
+    assert_eq(count_of(text, "__blink_assert_fail_intro"), 1)
+}
+
+test "assert on a comparison decomposes both sides into bound temps" {
+    run_probe("build/cg_stmt_assert_decompose.bl", #"fn probe(x: Int) {
+    assert(x > 2)
+}
+fn main() { probe(3) }
+"#)
+    let text = dump_of("probe")
+    // Once on the Let that binds the temp, once on the first VarRef that reads it; a
+    // shared node past that first read prints only as a back-reference to the same id.
+    assert_eq(count_of(text, "\"_cg_pa_l"), 2)
+    assert_eq(count_of(text, "\"_cg_pa_r"), 2)
+    assert_eq(count_of(text, "__blink_assert_fail_intro"), 1)
+}
+
+test "assert_eq on integers casts both sides into the shared default bucket" {
+    run_probe("build/cg_stmt_assert_eq_int.bl", #"fn probe(a: Int, b: Int) {
+    assert_eq(a, b)
+}
+fn main() { probe(1, 1) }
+"#)
+    let text = dump_of("probe")
+    // Once on the Let that binds the temp, once on the first VarRef that reads it.
+    assert_eq(count_of(text, "\"_cg_left"), 2)
+    assert_eq(count_of(text, "\"_cg_right"), 2)
+    assert_eq(count_of(text, "__blink_assert_fail_eq"), 1)
+}
+
+test "assert_eq on strings compares with the runtime string equality helper" {
+    run_probe("build/cg_stmt_assert_eq_str.bl", #"fn probe(a: Str, b: Str) {
+    assert_eq(a, b)
+}
+fn main() { probe("a", "b") }
+"#)
+    let text = dump_of("probe")
+    assert_eq(count_of(text, "blink_str_eq"), 1)
+    assert_eq(count_of(text, "__blink_assert_fail_eq"), 1)
+}
+
+test "assert_ne calls the plain fail path with no expected/actual split" {
+    run_probe("build/cg_stmt_assert_ne.bl", #"fn probe(a: Int, b: Int) {
+    assert_ne(a, b)
+}
+fn main() { probe(1, 2) }
+"#)
+    let text = dump_of("probe")
+    assert_eq(count_of(text, "__blink_assert_fail_eq"), 0)
+    assert_eq(count_of(text, "\"__blink_assert_fail\""), 1)
+}
+
+test "assert_eq over a struct refuses by name instead of guessing a comparison" {
+    run_probe("build/cg_stmt_assert_eq_struct.bl", #"type Point { x: Int, y: Int }
+fn probe(a: Point, b: Point) {
+    assert_eq(a, b)
+}
+fn main() { probe(Point { x: 1, y: 2 }, Point { x: 1, y: 2 }) }
+"#)
+    let f = find_fn("probe")
+    assert(f >= 0)
+    let _ = lower_fn(f)
+    assert(ice_mentioning("AssertCompareAggregateNotBuilt") > 0)
+}
+
+test "assert_eq over an enum refuses by name instead of guessing a comparison" {
+    run_probe("build/cg_stmt_assert_eq_enum.bl", #"type Color { Red, Green, Blue }
+fn probe(a: Color, b: Color) {
+    assert_eq(a, b)
+}
+fn main() { probe(Color.Red, Color.Green) }
+"#)
+    let f = find_fn("probe")
+    assert(f >= 0)
+    let _ = lower_fn(f)
+    assert(ice_mentioning("AssertCompareAggregateNotBuilt") > 0)
+}
+
+test "assert_eq over a Result refuses by name instead of guessing a comparison" {
+    run_probe("build/cg_stmt_assert_eq_result.bl", #"fn probe(a: Result[Int, Str], b: Result[Int, Str]) {
+    assert_eq(a, b)
+}
+fn main() { probe(Ok(1), Ok(1)) }
+"#)
+    let f = find_fn("probe")
+    assert(f >= 0)
+    let _ = lower_fn(f)
+    assert(ice_mentioning("AssertCompareAggregateNotBuilt") > 0)
+}
+
+test "assert_eq over an Option refuses by name instead of guessing a comparison" {
+    run_probe("build/cg_stmt_assert_eq_option.bl", #"fn probe(a: Option[Int], b: Option[Int]) {
+    assert_eq(a, b)
+}
+fn main() { probe(Some(1), Some(1)) }
+"#)
+    let f = find_fn("probe")
+    assert(f >= 0)
+    let _ = lower_fn(f)
+    assert(ice_mentioning("AssertCompareAggregateNotBuilt") > 0)
+}
+
+test "assert_ne over a struct refuses by name the same as assert_eq" {
+    run_probe("build/cg_stmt_assert_ne_struct.bl", #"type Point { x: Int, y: Int }
+fn probe(a: Point, b: Point) {
+    assert_ne(a, b)
+}
+fn main() { probe(Point { x: 1, y: 2 }, Point { x: 1, y: 3 }) }
+"#)
+    let f = find_fn("probe")
+    assert(f >= 0)
+    let _ = lower_fn(f)
+    assert(ice_mentioning("AssertCompareAggregateNotBuilt") > 0)
+}
+
+test "debug_assert lowers to nothing when the debug build flag is off" {
+    cg_stmt_set_debug_mode(false)
+    run_probe("build/cg_stmt_debug_assert_off.bl", #"fn probe(x: Int) {
+    debug_assert(x == 1)
+}
+fn main() { probe(1) }
+"#)
+    let text = dump_of("probe")
+    assert_eq(count_of(text, "__blink_debug_assert_fail"), 0)
+}
+
+test "debug_assert lowers to a guarded fail call when the debug build flag is on" {
+    cg_stmt_set_debug_mode(true)
+    run_probe("build/cg_stmt_debug_assert_on.bl", #"fn probe(x: Int) {
+    debug_assert(x == 1)
+}
+fn main() { probe(1) }
+"#)
+    let text = dump_of("probe")
+    cg_stmt_set_debug_mode(false)
+    assert_eq(count_of(text, "__blink_debug_assert_fail"), 1)
+}
+
+// The two tests above flip cg_stmt's own setter directly. Neither one proves the setter
+// is ever reached from a real build: that wiring runs through CgConfig.debug_mode, set by
+// the CLI's --debug flag and read inside generate(). This test goes through that whole
+// path instead, so a break in the cg.bl call site (or a config field that never reaches
+// it) fails here even though the two tests above would still pass.
+fn build_full_probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let program = cg_probe_compile(path, src)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    program
+}
+
+fn full_cfg(debug_mode: Int) -> CgConfig {
+    CgConfig { debug_mode: debug_mode, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+test "a CgConfig with debug_mode on threads through generate into the guarded fail call" {
+    let program = build_full_probe("build/cg_stmt_debug_assert_cfg_on.bl", #"fn probe(x: Int) {
+    debug_assert(x == 1)
+}
+fn main() { probe(1) }
+"#)
+    let text = generate(program, full_cfg(1))
+    cg_stmt_set_debug_mode(false)
+    assert_eq(count_of(text, "__blink_debug_assert_fail"), 1)
+}
+
+test "a CgConfig with debug_mode off drops debug_assert from the real build" {
+    let program = build_full_probe("build/cg_stmt_debug_assert_cfg_off.bl", #"fn probe(x: Int) {
+    debug_assert(x == 1)
+}
+fn main() { probe(1) }
+"#)
+    let text = generate(program, full_cfg(0))
+    cg_stmt_set_debug_mode(false)
+    assert_eq(count_of(text, "__blink_debug_assert_fail"), 0)
+}
+
+// cname.bl's own answers for the assert family's fail-path symbols. The lowering tests
+// above only prove these appear in emitted C; this pins the getters' return values
+// directly, so a spelling changed at the one producer is caught here even if a lowering
+// test's needle string happened to still match.
+test "the assert family's runtime fail-path symbols are cname's fixed spellings" {
+    assert_eq(c_assert_fail_name(), "__blink_assert_fail")
+    assert_eq(c_assert_fail_eq_name(), "__blink_assert_fail_eq")
+    assert_eq(c_assert_fail_intro_name(), "__blink_assert_fail_intro")
+    assert_eq(c_debug_assert_fail_name(), "__blink_debug_assert_fail")
+}
+
+// A quoted needle, the way a string literal prints in the IR dump. Plain
+// "__blink_assert_fail" is a substring of both "__blink_assert_fail_eq" and
+// "__blink_assert_fail_intro", so an unquoted search could pass by matching
+// the wrong symbol; quoting pins the search to the exact literal.
+fn quoted(name: Str) -> Str {
+    "\"{name}\""
+}
+
+// The four tests below tie the emitter directly to cname's getters, so a
+// lowering that starts naming a different symbol than the one cname answers
+// is caught here even if a hardcoded needle string elsewhere still matches.
+
+test "assert's guarded fail call names the symbol c_assert_fail_intro_name answers" {
+    run_probe("build/cg_stmt_assert_symbol_intro.bl", #"fn probe(x: Bool) {
+    assert(x)
+}
+fn main() { probe(true) }
+"#)
+    let text = dump_of("probe")
+    assert_eq(count_of(text, quoted(c_assert_fail_intro_name())), 1)
+}
+
+test "assert_eq's guarded fail call names the symbol c_assert_fail_eq_name answers" {
+    run_probe("build/cg_stmt_assert_symbol_eq.bl", #"fn probe(a: Int, b: Int) {
+    assert_eq(a, b)
+}
+fn main() { probe(1, 1) }
+"#)
+    let text = dump_of("probe")
+    assert_eq(count_of(text, quoted(c_assert_fail_eq_name())), 1)
+}
+
+test "assert_ne's guarded fail call names the symbol c_assert_fail_name answers" {
+    run_probe("build/cg_stmt_assert_symbol_ne.bl", #"fn probe(a: Int, b: Int) {
+    assert_ne(a, b)
+}
+fn main() { probe(1, 2) }
+"#)
+    let text = dump_of("probe")
+    assert_eq(count_of(text, quoted(c_assert_fail_name())), 1)
+}
+
+test "debug_assert's guarded fail call names the symbol c_debug_assert_fail_name answers" {
+    cg_stmt_set_debug_mode(true)
+    run_probe("build/cg_stmt_assert_symbol_debug.bl", #"fn probe(x: Int) {
+    debug_assert(x == 1)
+}
+fn main() { probe(1) }
+"#)
+    let text = dump_of("probe")
+    cg_stmt_set_debug_mode(false)
+    assert_eq(count_of(text, quoted(c_debug_assert_fail_name())), 1)
+}
