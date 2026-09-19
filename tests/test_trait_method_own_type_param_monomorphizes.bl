@@ -1,29 +1,26 @@
 // A trait method that declares its OWN type parameter (independent of the
 // impl's binders) must monomorphize that parameter the same way a free
-// function's generic parameter does. Codegen currently erases it to a bare
-// C `void`, which cc rejects as a named void parameter.
+// function's generic parameter does. This used to erase to a bare C `void`,
+// which cc rejects as a named void parameter -- fixed as part of the
+// tid-native codegen rewrite's per-instance signature/body emission, which
+// now instantiates a method's own type parameters the same way it
+// instantiates a free function's.
 //
-// This mono gap is the reason test_call_site_trait_bound_enforced.bl's accept
-// side only exercises a free-fn generic param, not a method's own bounded
-// type param -- that file documents the gap; this file pins it down directly.
+// test_call_site_trait_bound_enforced.bl's accept side only exercises a
+// free-fn generic param, not a method's own bounded type param, because it
+// predates this fix; that file still documents the split.
 
-import compile_test_helpers.{compile_and_run}
+import compile_test_helpers.{compile_and_run, compile_and_emit_c, poly_impl_fn_names}
 
-test.failing(
-    "a trait method's own generic type parameter monomorphizes instead of erasing to void",
-    reason: "codegen never monomorphizes a trait method's own type parameter (as opposed to the impl's binders), emitting it as a bare unnamed-only C void parameter, which cc rejects; reproduces with an unbounded [U], independent of any trait bound",
-    ticket: "22sytt",
-) {
+test "a trait method's own generic type parameter monomorphizes instead of erasing to void" {
     let src = #"
-import std.io
-
 trait Combiner { fn combine[U](self, a: U, b: U) -> U }
 type Calc { base: Int }
 impl Combiner for Calc {
     fn combine[U](self, a: U, b: U) -> U { a }
 }
 
-fn main() ! IO {
+fn main() {
     let c = Calc { base: 0 }
     io.println("{c.combine(2, 3)}")
 }
@@ -31,4 +28,53 @@ fn main() ! IO {
     let r = compile_and_run(src, "_trait_method_own_type_param_monomorphizes")
     assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
     assert_eq(r.out, "2\n")
+}
+
+// Two calls at two different argument types must each get their own instance: one shared
+// body would have to pick a single C type for `U`, and there is no such type. This is the
+// same one-instance-per-argument-tuple contract a free function's own generic parameter
+// already gets, exercised here for a method's own type parameter instead.
+test "two argument types at the call site each monomorphize their own instance" {
+    let src = #"
+trait Combiner { fn combine[U](self, a: U, b: U) -> U }
+type Calc { base: Int }
+impl Combiner for Calc {
+    fn combine[U](self, a: U, b: U) -> U { a }
+}
+fn main() {
+    let c = Calc { base: 0 }
+    let picked_int = c.combine(2, 3)
+    let picked_str = c.combine("x", "y")
+    let _keep1 = picked_int
+    let _keep2 = picked_str
+}
+"#
+    let c = compile_and_emit_c(src, "_trait_method_own_type_param_two_instances")
+    let names = poly_impl_fn_names(c, "Calc_Combiner_combine")
+    assert_eq(names.len(), 2)
+    assert(names.contains("blink_Calc_1Combiner_1combine_0Int"),
+        "missing the Int instance ({names.len()} found)")
+    assert(names.contains("blink_Calc_1Combiner_1combine_0Str"),
+        "missing the Str instance ({names.len()} found)")
+}
+
+// The return type is substituted the same way the parameters are: an Int-instantiated
+// call answers a C `int64_t`, never the bare `void` a lost substitution would erase it to.
+test "the per-instance signature spells the substituted return type, not void" {
+    let src = #"
+trait Combiner { fn combine[U](self, a: U, b: U) -> U }
+type Calc { base: Int }
+impl Combiner for Calc {
+    fn combine[U](self, a: U, b: U) -> U { a }
+}
+fn main() {
+    let picked = Calc { base: 0 }.combine(2, 3)
+    let _keep = picked
+}
+"#
+    let c = compile_and_emit_c(src, "_trait_method_own_type_param_ret_spelling")
+    assert(c.contains("int64_t blink_Calc_1Combiner_1combine_0Int(blink_Calc self, int64_t a, int64_t b)"),
+        "expected a substituted int64_t signature, got: {c}")
+    assert(!c.contains("void blink_Calc_1Combiner_1combine_0Int"),
+        "return type erased to void: {c}")
 }
