@@ -27,6 +27,8 @@
 # Env:
 #   CORPUS_BUILD_TIMEOUT  seconds per compile (default 900)
 #   CORPUS_RUN_TIMEOUT    seconds per run (default 600)
+#   CORPUS_PRELUDE_LIB    lib/ root the sandbox exposes as the prelude
+#                         (default: the compiler's own lib/)
 set -u
 
 file="$1"
@@ -62,15 +64,23 @@ for f in blink blinkc libblink_std.a libblink_std.h skip_modules.txt runtime.h .
     fi
 done
 # blinkc reads its stdlib from <dir of argv[0]>/lib/std, so the sandbox
-# build/ needs the compiler's lib/ beside the blinkc symlink. A missing one
-# stops the file instead of running it: a test binary that compiles a program
-# in process resolves the prelude through the same path, and with no prelude
-# it compiles nothing and its assertions hold over an empty program.
-if [ ! -d "$comp_dir/lib/std" ]; then
-    echo "corpus_one: no stdlib at $comp_dir/lib/std" >&2
+# build/ needs a lib/ beside the blinkc symlink. A missing one stops the file
+# instead of running it: a test binary that compiles a program in process
+# resolves the prelude through the same path, and with no prelude it compiles
+# nothing and its assertions hold over an empty program.
+#
+# Which lib/ is a choice the caller makes. The default is the compiler's own,
+# which is what a corpus run wants: it measures a compiler against the stdlib
+# that compiler ships. A suite whose probes compile programs in process wants
+# the opposite — the worktree's lib/, because the probe is testing THIS tree's
+# compiler sources and a pinned prelude would make this tree's stdlib changes
+# invisible to it. CORPUS_PRELUDE_LIB names that root.
+prelude_lib="${CORPUS_PRELUDE_LIB:-$comp_dir/lib}"
+if [ ! -d "$prelude_lib/std" ]; then
+    echo "corpus_one: no stdlib at $prelude_lib/std" >&2
     exit 2
 fi
-ln -s "$(readlink -f "$comp_dir/lib")" "$work/build/lib"
+ln -s "$(readlink -f "$prelude_lib")" "$work/build/lib"
 if [ ! -x "$work/build/blink" ]; then
     echo "corpus_one: no blink binary in $comp_dir" >&2
     exit 2
