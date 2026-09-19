@@ -3287,6 +3287,12 @@ fn bind_target_is_concrete(tid: Int) -> Int {
     if r < 0 || r >= ty_pool.len() { return 0 }
     if tc_is_unbound_metavar(r) != 0 { return 0 }
     if ty_pool.get(r).unwrap().kind == TyKind.Typevar { return 0 }
+    // The `?` hole is the third spelling of "nothing to commit to", and it arrives here from
+    // a closure argument whose own seed left the type-parameter position open. Counting it as
+    // concrete let that placeholder claim the type parameter outright, so a later argument
+    // carrying the real type could not overwrite it and the closure's position stayed open —
+    // which made the answer depend on which side of the call the closure was written.
+    if tc_tid_has_unknown(r) != 0 { return 0 }
     1
 }
 
@@ -3689,6 +3695,7 @@ fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, self_offset: Int) ! Ty
     let param_start = fs.params_start
     let param_count = fs.params_count
     let binds = build_typevar_binds(sig, args_sl)
+    tc_seed_closure_args_with_binds(sig, args_sl, self_offset, binds)
     let n = sublist_length(args_sl)
     let mut i = 0
     while i < n {
@@ -3700,6 +3707,39 @@ fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, self_offset: Int) ! Ty
                 let concrete_ptid = substitute_typevar_tid(ptid, binds)
                 let _ = tc_unify(concrete_ptid, arg_t)
             }
+        }
+        i = i + 1
+    }
+}
+
+// Seed every closure argument a second time, from the formal the call's own type-parameter
+// binds have made concrete.
+//
+// The first seed happens argument by argument while the call is read, so a closure written
+// before the argument that binds T sees a formal that still names T. A bare type variable
+// cannot be solved later, so that position is left open, and the position stays open because
+// nothing afterwards revisits it: the closure's body walk reads the stamp on the closure node
+// and by then the stamp is the one the first seed left. Which side of the call the closure was
+// written on then decided whether its parameter had a type — the spec asks for Hindley-Milner
+// with information flowing both ways (sections/03_types.md 3.3) and fixes no order on
+// arguments, so both orders owe the same answer.
+//
+// Runs after the whole argument list has been read and before the body walk, which is the one
+// window where the binds are complete and the stamp is still the thing the walk will read. A
+// type parameter no argument binds substitutes to itself, so the position stays open and its
+// parameter is still reported as under-determined.
+fn tc_seed_closure_args_with_binds(sig: Int, args_sl: Int, self_offset: Int, binds: Map[Str, Int]) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if args_sl == -1 { return }
+    let fs = fnsig_pool.get(sig).unwrap()
+    let param_start = fs.params_start
+    let param_count = fs.params_count
+    let n = sublist_length(args_sl)
+    let mut i = 0
+    while i < n {
+        let pidx = i + self_offset
+        if pidx < param_count {
+            let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
+            tc_seed_closure_expected_fn(sublist_get(args_sl, i), substitute_typevar_tid(ptid, binds))
         }
         i = i + 1
     }
@@ -16166,7 +16206,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // with tc_impl_where_bounds_hold. Additive: the return path is untouched.
                 let mfs = fnsig_pool.get(sig).unwrap()
                 if mfs.type_params_count > 0 {
-                    tc_check_bounds_for_binds(sig, build_typevar_binds_off(sig, node_args(node), 1), node)
+                    let mbinds = build_typevar_binds_off(sig, node_args(node), 1)
+                    tc_check_bounds_for_binds(sig, mbinds, node)
+                    // A method declaring its own type parameter has the same closure-argument
+                    // ordering problem a free function does, and the receiver does not answer it.
+                    tc_seed_closure_args_with_binds(sig, node_args(node), 1, mbinds)
                 }
                 // A type parameter the METHOD declares is chosen by the call, so the call's
                 // type is the declared return with that choice applied. Gated on the
