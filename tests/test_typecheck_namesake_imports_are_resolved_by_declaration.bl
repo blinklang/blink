@@ -1,0 +1,146 @@
+// Two modules may each declare a type with the same bare name, and that alone is legal: each
+// declaration is its own nominal type. What is not legal is a file that pulls BOTH of them
+// into its bare scope, because the bare spelling then names two declarations and the compiler
+// would have to guess. Binding one silently is the wrong answer; the spec calls this an
+// ambiguous import and its worked example is exactly this shape.
+//
+// The same question decides a type alias. An alias is reached through the name a file wrote,
+// so a table keyed by the bare name alone answers with whichever namesake registered last,
+// not with the one the file selected. The declaration has to be part of the key.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+let PKG = "build/tc_namesake_import_pkg"
+
+// alpha and beta are deliberate mirror images: each exports a `Port` alias over a DIFFERENT
+// underlying type, a `Point` struct with a differently-named field, and a tag function that
+// lets a probe pull the module into the program without selecting either namesake.
+fn src_alpha() -> Str {
+    "pub type Port = Int\npub type Point \{ a: Int \}\npub fn tag_a() -> Int \{ 1 \}\n"
+}
+
+fn src_beta() -> Str {
+    "pub type Port = Str\npub type Point \{ b: Int \}\npub fn tag_b() -> Int \{ 2 \}\n"
+}
+
+// A non-entry module that selects both namesakes. Only the row about non-entry modules pulls
+// this in; every other probe leaves it out of the program.
+fn src_mid() -> Str {
+    "import alpha.\{Point\}\nimport beta.\{Point\}\npub fn mid_tag() -> Int \{ 3 \}\n"
+}
+
+fn compile_probe(probe_src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _mk = process_run("mkdir", ["-p", "{PKG}/src"])
+    write_file("{PKG}/blink.toml", "[package]\nname = \"tcnsimport\"\nversion = \"0.1.0\"\n")
+    write_file("{PKG}/src/alpha.bl", src_alpha())
+    write_file("{PKG}/src/beta.bl", src_beta())
+    write_file("{PKG}/src/mid.bl", src_mid())
+    write_file("{PKG}/src/probe.bl", probe_src)
+    diag_reset()
+    let program = compile_to_program("{PKG}/src/probe.bl", 1)
+    check_types(program)
+}
+
+fn cleanup() {
+    let _rm = process_run("rm", ["-rf", PKG])
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn count_named(name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.name == name {
+            if d.severity == "error" || d.severity == "ice" { n = n + 1 }
+        }
+    }
+    n
+}
+
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn assert_named_error(label: Str, name: Str) {
+    let n = count_named(name)
+    if n < 1 {
+        io.println("FAIL: {label}: want at least one {name}, got:")
+        for e in error_messages() { io.println("  {e}") }
+    }
+    assert(n >= 1)
+}
+
+// ── Item 1: a bare name that two selected declarations answer for ──
+
+fn test_two_selective_imports_of_one_type_name_are_ambiguous() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import alpha.\{Point\}\nimport beta.\{Point\}\nfn main() \{ let p = Point \{ a: 1 \} assert(p.a == 1) \}\n")
+    assert_named_error("Point selected from alpha and beta", "AmbiguousImport")
+    cleanup()
+}
+
+// The control that keeps the rule narrow. Two namesake declarations in one program are fine;
+// only selecting both into one file's bare scope is not.
+fn test_one_selective_import_of_a_namesake_is_unambiguous() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import alpha.\{Point\}\nimport beta.\{tag_b\}\nfn main() \{ let p = Point \{ a: 1 \} assert(p.a == 1) assert(tag_b() == 2) \}\n")
+    assert_no_errors("only alpha.Point selected")
+    cleanup()
+}
+
+// Qualified access names its declaration outright, so it never asks the question the bare
+// spelling asks, however many namesakes the program holds.
+fn test_qualified_access_to_both_namesakes_is_unambiguous() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import alpha\nimport beta\nfn main() \{ let p = alpha.Point \{ a: 1 \} let q = beta.Point \{ b: 2 \} assert(p.a + q.b == 3) \}\n")
+    assert_no_errors("both namesakes reached only by qualifier")
+    cleanup()
+}
+
+// The ambiguity belongs to the file that selected both names. Answering it against the entry
+// module only makes the diagnostic depend on what some other file imported.
+fn test_ambiguity_inside_a_non_entry_module_is_reported() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import mid.\{mid_tag\}\nfn main() \{ assert(mid_tag() == 3) \}\n")
+    assert_named_error("mid selects Point from alpha and beta", "AmbiguousImport")
+    cleanup()
+}
+
+// ── Item 3: an alias reaches its underlying type through its own declaration ──
+
+// alpha.Port is Int. beta.Port is Str and is in the program, but this file never selected it,
+// so it has no say. Keyed by the bare name alone, the later registration answers instead and
+// an Int is rejected against a Str the program never asked for.
+fn test_selected_alias_resolves_through_its_own_declaration() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import alpha.\{Port\}\nimport beta.\{tag_b\}\nfn main() \{ let p: Port = 8080 assert(p + 1 == 8081) assert(tag_b() == 2) \}\n")
+    assert_no_errors("alpha.Port is Int")
+    cleanup()
+}
+
+// The mirror of the row above. Selecting beta's Port must still reject an Int, or a fix that
+// simply made the first row pass would have widened every alias instead of keying it.
+fn test_the_other_namesake_alias_still_rejects_the_wrong_type() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import beta.\{Port\}\nimport alpha.\{tag_a\}\nfn main() \{ let p: Port = 8080 assert(tag_a() == 1) \}\n")
+    assert_named_error("beta.Port is Str, not Int", "TypeError")
+    cleanup()
+}
+
+fn main() {
+    test_two_selective_imports_of_one_type_name_are_ambiguous()
+    test_one_selective_import_of_a_namesake_is_unambiguous()
+    test_qualified_access_to_both_namesakes_is_unambiguous()
+    test_ambiguity_inside_a_non_entry_module_is_reported()
+    test_selected_alias_resolves_through_its_own_declaration()
+    test_the_other_namesake_alias_still_rejects_the_wrong_type()
+    io.println("namesake import resolution: ok")
+}
