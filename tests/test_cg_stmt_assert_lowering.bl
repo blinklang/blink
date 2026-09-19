@@ -9,6 +9,9 @@ import ast.{NodeKind}
 import compiler.{compile_to_program}
 import diagnostics.{diag_entries, diag_reset}
 import cg_stmt.{cg_stmt_reset, cg_stmt_set_debug_mode, lower_fn}
+import cg_test_helpers.{cg_probe_compile}
+import cname.{cname_reset}
+import cg.{CgConfig, generate}
 
 fn find_fn(name: Str) -> Int {
     let mut i = 0
@@ -135,6 +138,56 @@ fn main() { probe(Point { x: 1, y: 2 }, Point { x: 1, y: 2 }) }
     assert(ice_mentioning("AssertCompareAggregateNotBuilt") > 0)
 }
 
+test "assert_eq over an enum refuses by name instead of guessing a comparison" {
+    run_probe("build/cg_stmt_assert_eq_enum.bl", #"type Color { Red, Green, Blue }
+fn probe(a: Color, b: Color) {
+    assert_eq(a, b)
+}
+fn main() { probe(Color.Red, Color.Green) }
+"#)
+    let f = find_fn("probe")
+    assert(f >= 0)
+    let _ = lower_fn(f)
+    assert(ice_mentioning("AssertCompareAggregateNotBuilt") > 0)
+}
+
+test "assert_eq over a Result refuses by name instead of guessing a comparison" {
+    run_probe("build/cg_stmt_assert_eq_result.bl", #"fn probe(a: Result[Int, Str], b: Result[Int, Str]) {
+    assert_eq(a, b)
+}
+fn main() { probe(Ok(1), Ok(1)) }
+"#)
+    let f = find_fn("probe")
+    assert(f >= 0)
+    let _ = lower_fn(f)
+    assert(ice_mentioning("AssertCompareAggregateNotBuilt") > 0)
+}
+
+test "assert_eq over an Option refuses by name instead of guessing a comparison" {
+    run_probe("build/cg_stmt_assert_eq_option.bl", #"fn probe(a: Option[Int], b: Option[Int]) {
+    assert_eq(a, b)
+}
+fn main() { probe(Some(1), Some(1)) }
+"#)
+    let f = find_fn("probe")
+    assert(f >= 0)
+    let _ = lower_fn(f)
+    assert(ice_mentioning("AssertCompareAggregateNotBuilt") > 0)
+}
+
+test "assert_ne over a struct refuses by name the same as assert_eq" {
+    run_probe("build/cg_stmt_assert_ne_struct.bl", #"type Point { x: Int, y: Int }
+fn probe(a: Point, b: Point) {
+    assert_ne(a, b)
+}
+fn main() { probe(Point { x: 1, y: 2 }, Point { x: 1, y: 3 }) }
+"#)
+    let f = find_fn("probe")
+    assert(f >= 0)
+    let _ = lower_fn(f)
+    assert(ice_mentioning("AssertCompareAggregateNotBuilt") > 0)
+}
+
 test "debug_assert lowers to nothing when the debug build flag is off" {
     cg_stmt_set_debug_mode(false)
     run_probe("build/cg_stmt_debug_assert_off.bl", #"fn probe(x: Int) {
@@ -156,4 +209,45 @@ fn main() { probe(1) }
     let text = dump_of("probe")
     cg_stmt_set_debug_mode(false)
     assert_eq(count_of(text, "__blink_debug_assert_fail"), 1)
+}
+
+// The two tests above flip cg_stmt's own setter directly. Neither one proves the setter
+// is ever reached from a real build: that wiring runs through CgConfig.debug_mode, set by
+// the CLI's --debug flag and read inside generate(). This test goes through that whole
+// path instead, so a break in the cg.bl call site (or a config field that never reaches
+// it) fails here even though the two tests above would still pass.
+fn build_full_probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let program = cg_probe_compile(path, src)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    program
+}
+
+fn full_cfg(debug_mode: Int) -> CgConfig {
+    CgConfig { debug_mode: debug_mode, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+test "a CgConfig with debug_mode on threads through generate into the guarded fail call" {
+    let program = build_full_probe("build/cg_stmt_debug_assert_cfg_on.bl", #"fn probe(x: Int) {
+    debug_assert(x == 1)
+}
+fn main() { probe(1) }
+"#)
+    let text = generate(program, full_cfg(1))
+    cg_stmt_set_debug_mode(false)
+    assert_eq(count_of(text, "__blink_debug_assert_fail"), 1)
+}
+
+test "a CgConfig with debug_mode off drops debug_assert from the real build" {
+    let program = build_full_probe("build/cg_stmt_debug_assert_cfg_off.bl", #"fn probe(x: Int) {
+    debug_assert(x == 1)
+}
+fn main() { probe(1) }
+"#)
+    let text = generate(program, full_cfg(0))
+    cg_stmt_set_debug_mode(false)
+    assert_eq(count_of(text, "__blink_debug_assert_fail"), 0)
 }
