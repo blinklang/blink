@@ -6501,6 +6501,24 @@ fn tc_field_target_hint(bare: Str, declared: Int) -> Int {
     tc_subst_evfield_from_instance(declared, h)
 }
 
+// The spread source is nominally the same struct, so its type arguments line up with the
+// declaration's parameters one for one. Unifying each against the parameter's own typevar
+// reuses the concrete-wins rule, so a field written beside the spread still takes priority.
+fn tc_bind_tparams_from_spread(bare: Str, src: Int, tparams_sl: Int, binds: Map[Str, Int]) {
+    let r = tc_resolve(src)
+    let k = tc_tid_kind(r)
+    if k != TyKind.Struct && k != TyKind.Enum { return }
+    if strip_module_qualifier(tc_tid_name(r)) != strip_module_qualifier(bare) { return }
+    let n = tc_tid_child_count(r)
+    if n != sublist_length(tparams_sl) { return }
+    let mut i = 0
+    while i < n {
+        let tp = sublist_get(tparams_sl, i)
+        unify_typevar_binds(make_typevar_bound(node_name(tp), tp), tc_tid_child(r, i), binds)
+        i = i + 1
+    }
+}
+
 fn tc_struct_lit_instance_tid(stid: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     tc_check_struct_lit_field_closures(stid, node)
     tc_pin_struct_lit_field_ret_mints(stid, node)
@@ -6528,9 +6546,11 @@ fn tc_struct_lit_instance_tid(stid: Int, node: Int) -> Int ! TypeCheck.Resolve, 
             unify_typevar_binds(declared, ftid, binds)
         } else {
             // A spread entry (`..base()`) has no field name, and so no declared type to unify
-            // against, but the value it spreads is an ordinary expression that must carry a
-            // type — nothing else in this path looked at it.
-            infer_type(node_value(f))
+            // against, but the value it spreads is an instance of this same struct — and when
+            // every type-carrying field arrives through the spread, its arguments are the only
+            // place the literal's own type parameters can come from. Dropping the inferred
+            // type here left the literal on the bare generic head, which has no C layout.
+            tc_bind_tparams_from_spread(bare, infer_type(node_value(f)), tparams_sl, binds)
         }
         fi = fi + 1
     }
@@ -11250,6 +11270,10 @@ fn tc_enum_ctor_instance_tid(enum_tid: Int, decl: Int, vname: Str, args_sl: Int)
     while ci < sublist_length(tparams_sl) {
         let bound = binds.get(node_name(sublist_get(tparams_sl, ci))) ?? -1
         if bound != -1 && type_kind(bound) != TyKind.Typevar && type_kind(bound) != TyKind.Unknown { has_concrete = 1 }
+        // A variant whose payload mentions none of the enum's parameters binds nothing, so
+        // the enclosing annotation is the only place they can come from. Without this the
+        // construction kept the bare head, which names no instance and has no C layout.
+        if bound == -1 && tc_hint_enum_slot(enum_tid, tparams_sl, ci) != -1 { has_concrete = 1 }
         ci = ci + 1
     }
     if has_concrete == 0 { return enum_tid }
@@ -11351,6 +11375,10 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl:
     while ci < sublist_length(tparams_sl) {
         let bound = binds.get(node_name(sublist_get(tparams_sl, ci))) ?? -1
         if bound != -1 && type_kind(bound) != TyKind.Typevar && type_kind(bound) != TyKind.Unknown { has_concrete = 1 }
+        // A variant whose payload mentions none of the enum's parameters binds nothing, so
+        // the enclosing annotation is the only place they can come from. Without this the
+        // construction kept the bare head, which names no instance and has no C layout.
+        if bound == -1 && tc_hint_enum_slot(enum_tid, tparams_sl, ci) != -1 { has_concrete = 1 }
         ci = ci + 1
     }
     if has_concrete == 0 { return enum_tid }
