@@ -3,6 +3,10 @@
 // parameter or a `let` holds a value, and no import list can put it out of scope. Resolving
 // the module member first rejected every read of such a local while still accepting its
 // declaration, so the diagnostic contradicted the program it was reading.
+//
+// What the module exports the name AS does not change the rule. An exported function and an
+// exported module-level value are both declarations the import list did not select, and
+// neither can reach a local spelled the same way.
 
 import typecheck.{check_types}
 import compiler.{compile_to_program}
@@ -14,7 +18,7 @@ let PKG = "build/tc_shadow_unselected_pkg"
 fn compile_probe(probe_src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     let _mk = process_run("mkdir", ["-p", "{PKG}/src"])
     write_file("{PKG}/blink.toml", "[package]\nname = \"tcshadowunsel\"\nversion = \"0.1.0\"\n")
-    write_file("{PKG}/src/tok.bl", "pub fn at(i: Int) -> Int \{ i \}\npub fn other() -> Int \{ 1 \}\n")
+    write_file("{PKG}/src/tok.bl", "pub fn at(i: Int) -> Int \{ i \}\npub fn other() -> Int \{ 1 \}\npub let mut pos: Int = 0\npub fn bump() \{ pos = pos + 1 \}\n")
     write_file("{PKG}/src/probe.bl", probe_src)
     diag_reset()
     let program = compile_to_program("{PKG}/src/probe.bl", 1)
@@ -84,5 +88,47 @@ test "the same name with no local binding is still not selected" {
 test "the qualified spelling resolves whether or not a local shadows it" {
     compile_probe("import tok.\{other}\n\nfn use_at(at: Int) -> Int \{ tok.at(at) + other() \}\n\nfn main() \{ let _n = use_at(1) \}\n")
     assert_clean("qualified")
+    cleanup()
+}
+
+// The same rule for a name the module exports as a VALUE rather than as a function. An
+// exported `pub let mut` is reached through a different lookup than an exported `pub fn`, so
+// it needs its own rows.
+test "a let spelled like an unselected module-level value is in scope" {
+    compile_probe("import tok.\{other}\n\nfn run() -> Int \{ let pos = 3 pos + other() \}\n\nfn main() \{ let _n = run() \}\n")
+    assert_clean("value let")
+    cleanup()
+}
+
+test "a let mut spelled like an unselected module-level value is in scope" {
+    compile_probe("import tok.\{other}\n\nfn run() -> Int \{ let mut pos = 3 pos = pos + 1 pos + other() \}\n\nfn main() \{ let _n = run() \}\n")
+    assert_clean("value let mut")
+    cleanup()
+}
+
+test "a parameter spelled like an unselected module-level value is in scope" {
+    compile_probe("import tok.\{other}\n\nfn use_pos(pos: Int) -> Int \{ pos + other() \}\n\nfn main() \{ let _n = use_pos(1) \}\n")
+    assert_clean("value parameter")
+    cleanup()
+}
+
+// String interpolation reads the name through its own path, and it is the spelling this was
+// first found through, so it is pinned rather than assumed to follow.
+test "a local spelled like an unselected module-level value is in scope inside an interpolation" {
+    compile_probe("import tok.\{other}\n\nfn shown() -> Str \{ let pos = 3 let _o = other() \"at \{pos}\" \}\n\nfn main() \{ let _s = shown() \}\n")
+    assert_clean("value interpolation")
+    cleanup()
+}
+
+// The control for the value case, matching the function case above: with no local binding the
+// import list is the only thing that answers for the name, and it does not list it.
+test "an unselected module-level value with no local binding is still not selected" {
+    compile_probe("import tok.\{other}\n\nfn run() -> Int \{ pos + other() \}\n\nfn main() \{ let _n = run() \}\n")
+    let n = count_named("ImportNotSelected")
+    if n != 1 {
+        io.println("FAIL: unbound value: ImportNotSelected raised {n} time(s), want 1")
+        for e in errors() { io.println("  {e}") }
+    }
+    assert(n == 1)
     cleanup()
 }

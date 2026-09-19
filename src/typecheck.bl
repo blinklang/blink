@@ -1171,6 +1171,20 @@ let mut ffi_opaque_type_set: Map[Str, Int] = Map()
 // Keyed by name (not type id) because type ids are pass-dependent across the dual codegen passes.
 let mut tc_alias_underlying: Map[Str, Int] = Map()
 
+// The underlying tid of the alias that `name` means, or -1. Keyed by the DECLARATION, so a
+// namesake is asked for under the module the reading file selected: the bare key alone
+// answers with whichever of the namesakes registered last, which is not a fact about the
+// file that wrote the name. A name no module declares twice keeps the plain two-step lookup.
+fn tc_alias_underlying_of(name: Str) -> Int {
+    let bare = strip_module_qualifier(name)
+    if tc_is_namesake_type_name(bare) != 0 {
+        return tc_alias_underlying.get(tc_written_type_nominal(name)) ?? -1
+    }
+    let u = tc_alias_underlying.get(name) ?? -1
+    if u != -1 { return u }
+    tc_alias_underlying.get(bare) ?? -1
+}
+
 // ── Import alias maps ──────────────────────────────────────────────
 pub let mut tc_alias_to_original: Map[Str, Str] = Map()
 let mut tc_original_to_alias: Map[Str, Str] = Map()
@@ -6995,9 +7009,7 @@ fn resolve_alias_type_name(name0: Str) -> Str {
     let mut name = name0
     let mut hops = 0
     while hops < 8 {
-        let bare = strip_module_qualifier(name)
-        let mut u = tc_alias_underlying.get(name) ?? -1
-        if u == -1 { u = tc_alias_underlying.get(bare) ?? -1 }
+        let u = tc_alias_underlying_of(name)
         if u == -1 { return name }
         let next = tc_type_name(u)
         if next == "" || next == name { return name }
@@ -9813,7 +9825,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
                 let alias_tparams = node_type_params(atd)
                 nr_current_module = node_module(atd)
                 tc_push_tparam_scope(alias_tparams)
-                tc_alias_underlying.insert(node_name(atd), resolve_type_ann(alias_ann))
+                tc_alias_underlying.insert(tc_nominal_type_name(atd), resolve_type_ann(alias_ann))
                 tc_pop_tparam_scope(alias_tparams)
             }
             j = j + 1
@@ -9904,6 +9916,8 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             i = i + 1
         }
     }
+
+    tc_check_namesake_import_ambiguity()
 
     // Enforce @pure body constraints.
     if fns_sl != -1 {
@@ -10627,6 +10641,43 @@ pub fn tc_call_decl_node(call_node: Int) -> Int {
 fn nr_note_call_decl(call_node: Int, decl_node: Int) {
     if decl_node < 0 { return }
     tc_call_decl.insert(call_node, decl_node)
+}
+
+// A bare type name that two of a file's selective imports both answer for. A file that
+// selects the same name from two declaring modules has written nothing that says which
+// declaration it means, so binding one makes the meaning depend on registration order
+// (spec sections/07_trust_modules_metadata.md, ambiguous import). Reported per READING
+// module, not against the entry file, because the file that selected both owns the choice.
+fn tc_check_namesake_import_ambiguity() ! Diag.Report {
+    if tc_namesake_type_modules.len() == 0 { return }
+    let mut seen_readers: Map[Str, Int] = Map()
+    for key in per_module_imports.keys() {
+        let colon = key.index_of(":")
+        if colon < 0 { continue }
+        let reader = key.slice(0, colon)
+        if seen_readers.contains_key(reader) { continue }
+        seen_readers.insert(reader, 1)
+        for bare in tc_namesake_type_modules.keys() {
+            let mods = tc_namesake_type_modules.get(bare) ?? ""
+            // A module's own declaration wins outright, so it is never asked to choose.
+            if mods.contains("|{reader}|") != 0 { continue }
+            let mut hits = 0
+            let mut first = ""
+            let mut second = ""
+            for source_mod in mods.split("|") {
+                if source_mod == "" { continue }
+                let imp_node = per_module_imports.get("{reader}:{source_mod}") ?? -1
+                if imp_node == -1 { continue }
+                if is_selected_import(bare, imp_node) == 0 { continue }
+                hits = hits + 1
+                if hits == 1 { first = source_mod } else { second = source_mod }
+            }
+            if hits > 1 {
+                let site = if tc_module_key_is_main(reader) != 0 { "" } else { " in module '{reader}'" }
+                diag_error_no_loc("AmbiguousImport", AMBIGUOUS_IMPORT, "type '{bare}' is ambiguous{site} — selected from both '{first}' and '{second}'", "name the declaration you mean, e.g. '{first}.{bare}'")
+            }
+        }
+    }
 }
 
 // The declaration a renaming selective import (`import m.{f as g}`) binds to `name` in
@@ -12587,6 +12638,24 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
         }
     }
 
+    // Walk each module-global initializer. A call written there is a call like any other and
+    // owes the same answer: which declaration it reaches. It sits in no function body, no impl
+    // method and no test block, so without this walk it was never visited, and the later passes
+    // that READ the resolved declaration rather than re-deriving a callee got nothing.
+    let nr_globals_sl = node_stmts(program)
+    if nr_globals_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(nr_globals_sl) {
+            let g = sublist_get(nr_globals_sl, i)
+            let g_init = node_value(g)
+            if g_init != -1 {
+                nr_current_module = node_module(g)
+                nr_check_node(g_init)
+            }
+            i = i + 1
+        }
+    }
+
     // Walk each function body
     if fns_sl != -1 {
         let mut i = 0
@@ -13703,7 +13772,8 @@ pub fn resolve_alias_tid(tid: Int) -> Int {
     if tc_alias_underlying.len() == 0 { return tid }
     if tid < 0 || tid >= ty_pool.len() { return tid }
     let name = ty_pool.get(tid).unwrap().name
-    tc_alias_underlying.get(name) ?? tid
+    let u = tc_alias_underlying_of(name)
+    if u == -1 { tid } else { u }
 }
 
 // Walks a transparent `type Alias = X` chain from a bare (params_count 0) struct/enum
@@ -13726,7 +13796,7 @@ pub fn tc_resolve_transparent_alias_name(name: Str) -> Int {
     let mut result = -1
     let mut hops = 0
     while hops < 8 {
-        let next = tc_alias_underlying.get(cur_name) ?? -1
+        let next = tc_alias_underlying_of(cur_name)
         if next == -1 { return result }
         let nr = tc_resolve(next)
         if nr < 0 || nr >= ty_pool.len() { return result }
