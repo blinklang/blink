@@ -1,0 +1,160 @@
+// A module-scope `let` is a C global, and until now it took the Blink name unchanged.
+// That puts a user name straight into the translation unit's global namespace, where it
+// collides with anything the C preprocessor already owns: `let SIGHUP = 1` lands beside
+// <signal.h>'s own SIGHUP and the unit no longer compiles. Every other module-scope
+// symbol a Blink program emits already carries the module in its C name, and a global is
+// no different, so the same form governs it: `blink_<module>_<name>`, or `blink_u_<name>`
+// for the program's own module.
+//
+// The prefix also makes two modules' same-named private globals two distinct symbols,
+// which is the second thing the bare name could not express.
+
+import std.fs
+import std.io
+import layout.{layout_reset}
+import mono.{run_mono}
+import cname.{cname_reset}
+import cg_test_helpers.{cg_probe_compile, cg_text_occurrences}
+import cg.{CgConfig, generate, generate_archive_header}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build, cg_reg_global_decls}
+import cg_decl.{cg_decl_reset, cg_decl_emit_globals}
+
+// `SIGHUP` is a macro <signal.h> defines, `CH_0` is the name three stdlib modules each
+// declare privately, and `helper_flag` crosses a module boundary under a selective import.
+fn helper_src() -> Str {
+    #"let CH_0: Int = 7
+
+pub let helper_flag: Int = CH_0 + 42
+"#
+}
+
+fn entry_src() -> Str {
+    #"import cg_decl_gname_helper.{helper_flag}
+
+let SIGHUP: Int = 1
+let CH_0: Int = 48
+
+test "read the globals" {
+    assert_eq(SIGHUP, 1)
+    assert_eq(CH_0, 48)
+    assert_eq(helper_flag, 49)
+}
+"#
+}
+
+fn build_probe(entry_path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let helper_path = "src/cg_decl_gname_helper.bl"
+    write_file(helper_path, helper_src())
+    let program = cg_probe_compile(entry_path, entry_src())
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(entry_path)
+    let _ = fs.delete(helper_path)
+    program
+}
+
+fn full_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+fn decl_text(entry_path: Str, is_extern: Bool) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let program = build_probe(entry_path)
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    let _ = cg_decl_emit_globals(is_extern, cg_reg_global_decls(), Map())
+    print_take()
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_missing(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output unexpectedly has '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+fn assert_count(label: Str, text: Str, needle: Str, want: Int) {
+    let got = cg_text_occurrences(text, needle)
+    if got != want {
+        io.println("FAIL: {label}: '{needle}' appears {got} times, want {want}\n--- output ---\n{text}")
+    }
+    assert_eq(got, want)
+}
+
+// The program's own module has no name of its own, so it takes the same `u_` guard a
+// function in it takes.
+test "a global in the program's own module carries the u prefix" {
+    let text = decl_text("build/cg_decl_gname_own.bl", false)
+    assert_has(text, "int64_t blink_u_SIGHUP;")
+    assert_has(text, "int64_t blink_u_CH_0;")
+}
+
+// A named module rides its own name, the same way its functions and its types do.
+test "a global in a named module carries that module's name" {
+    let text = decl_text("build/cg_decl_gname_mod.bl", false)
+    assert_has(text, "int64_t blink_cg_decl_gname_helper_helper_flag;")
+    assert_has(text, "int64_t blink_cg_decl_gname_helper_CH_0;")
+}
+
+// This is the failure the prefix exists to stop: <signal.h> defines SIGHUP, so a global
+// spelled bare is a redeclaration of a macro expansion and the unit will not compile.
+test "a global whose name the C preprocessor owns is never emitted bare" {
+    let text = decl_text("build/cg_decl_gname_macro.bl", false)
+    assert_missing(text, "int64_t SIGHUP;")
+    assert_missing(text, " SIGHUP =")
+}
+
+// The header another unit reads must name the same symbol the owning unit defines, or
+// the reader declares one variable and links against another.
+test "a header declares the global under the same mangled name" {
+    let text = decl_text("build/cg_decl_gname_extern.bl", true)
+    assert_has(text, "extern int64_t blink_u_SIGHUP;")
+    assert_has(text, "extern int64_t blink_cg_decl_gname_helper_helper_flag;")
+    assert_missing(text, "extern int64_t SIGHUP;")
+}
+
+// Two modules each declaring a private global of one name are two variables, and the
+// prefix is what lets the unit hold both. Nothing in the emitted C may spell them alike.
+test "two modules declaring one global name emit two distinct symbols" {
+    let text = decl_text("build/cg_decl_gname_two.bl", false)
+    assert_has(text, "blink_u_CH_0")
+    assert_has(text, "blink_cg_decl_gname_helper_CH_0")
+}
+
+// A reference is the other half of the contract: the reader must spell what the
+// definition declared. The entry module reads its own CH_0, so the name it emits is the
+// entry's, never the helper module's same-named private one.
+test "a read of a global spells the definition in the reader's own module" {
+    let program = build_probe("build/cg_decl_gname_read.bl")
+    let text = generate(program, full_cfg())
+    assert_count("own CH_0 defined and read", text, "blink_u_CH_0", 2)
+    assert_has(text, "blink_u_SIGHUP")
+}
+
+// A read across a module boundary resolves to the module that declares it, which is what
+// keeps a selective import working once the name is no longer global to the program.
+test "a read of an imported global spells the declaring module's name" {
+    let program = build_probe("build/cg_decl_gname_cross.bl")
+    let text = generate(program, full_cfg())
+    assert_has(text, "blink_cg_decl_gname_helper_helper_flag")
+}
+
+// The archive header is the surface every user unit compiles against, so a stdlib global
+// reaching it bare would put the collision in every program, not only the one that
+// declared the name.
+test "the archive header declares globals under the mangled name" {
+    let program = build_probe("build/cg_decl_gname_archive.bl")
+    let text = generate_archive_header(program, full_cfg())
+    assert_missing(text, "extern int64_t SIGHUP;")
+}

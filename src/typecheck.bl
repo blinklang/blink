@@ -10705,6 +10705,27 @@ fn nr_note_call_decl(call_node: Int, decl_node: Int) {
     tc_call_decl.insert(call_node, decl_node)
 }
 
+// ── The declaration a bare global read resolved to ──────────────────
+//
+// The same fact as the call record above, for a read instead of a call. A module-scope
+// `let` is a C global, and the spelling alone does not say which one a read means: two
+// modules may each declare a private global under one name, so a later stage that searches
+// by the spelling finds both and picks by table order — reading the wrong module's value
+// with no diagnostic at all.
+let mut tc_global_decl: Map[Int, Int] = Map()
+
+// The module-scope `let` this ident read resolved to, or -1 when the ident is not a read of
+// a global: a local, a parameter, a function name, a builtin.
+pub fn tc_global_decl_node(ident_node: Int) -> Int {
+    tc_global_decl.get(ident_node) ?? -1
+}
+
+fn nr_note_global_decl(ident_node: Int, decl_node: Int) {
+    if decl_node < 0 { return }
+    if nk_of(node_kind(decl_node)) != NodeKind.LetBinding { return }
+    tc_global_decl.insert(ident_node, decl_node)
+}
+
 // A bare type name that two of a file's selective imports both answer for. A file that
 // selects the same name from two declaring modules has written nothing that says which
 // declaration it means, so binding one makes the meaning depend on registration order
@@ -12392,6 +12413,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     nr_module_decls = Map()
     nr_decls_by_name = Map()
     tc_call_decl = Map()
+    tc_global_decl = Map()
     nr_push_scope()
 
     // Build private import set: imported non-pub fns, types, lets
@@ -13192,6 +13214,11 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 tc_errors.push("cannot access private item '{name}'")
                 diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private item '{name}' from another module", node, "mark the item as 'pub' in its module")
                 return
+            }
+            // A local binder of the same spelling holds a value, not a declaration, so a
+            // read through it names no global.
+            if nr_top_binding_is_global(name) != 0 {
+                nr_note_global_decl(node, nr_resolve_bare_decl(name, nr_current_module))
             }
             tc_mark_symbol_used(name)
             return
