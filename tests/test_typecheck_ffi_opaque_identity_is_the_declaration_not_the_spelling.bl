@@ -1,0 +1,190 @@
+// Whether a type is an @ffi.opaque handle is a question about the DECLARATION, so every
+// spelling of it must get the same answer. The set recording the annotation was written under
+// the declaration's bare name and read back three ways: twice through strip_module_qualifier,
+// once through the name exactly as the annotation wrote it. Stripping reaches the stored key
+// for a qualified spelling by luck; an alias has no qualifier to strip and reaches nothing.
+//
+// Two different failures follow from the one miss. A pointee the gate cannot recognize is
+// rejected, which is a false negative. A construction the gate cannot recognize is ACCEPTED,
+// which mints a handle in ordinary code with no @trusted and no FFI region — forbidden by
+// sections/07_trust_modules_metadata.md section 9.1.4, where a handle is produced only at the
+// FFI boundary and has no user-callable constructor.
+//
+// The refusing rows must stay refusing. Deciding on the declaration must not widen the closed
+// pointee set nor make a handle constructible, so both are checked from the other side too.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+let PKG = "build/tc_ffi_opaque_pkg"
+
+fn src_opmod() -> Str {
+    "@ffi.opaque(name: \"ath\")\npub type Oh \{\}\n"
+}
+
+fn compile_probe_with(mod_src: Str, probe_src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _mk = process_run("mkdir", ["-p", "{PKG}/src"])
+    write_file("{PKG}/blink.toml", "[package]\nname = \"tcffiopq\"\nversion = \"0.1.0\"\n")
+    write_file("{PKG}/src/opmod.bl", mod_src)
+    write_file("{PKG}/src/probe.bl", probe_src)
+    diag_reset()
+    let program = compile_to_program("{PKG}/src/probe.bl", 1)
+    check_types(program)
+}
+
+fn compile_probe(probe_src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe_with(src_opmod(), probe_src)
+}
+
+fn cleanup() {
+    let _rm = process_run("rm", ["-rf", PKG])
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn count_named(name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.name == name {
+            if d.severity == "error" || d.severity == "ice" { n = n + 1 }
+        }
+    }
+    n
+}
+
+fn first_message_named(name: Str) -> Str {
+    for d in diag_entries {
+        if d.name == name {
+            if d.severity == "error" || d.severity == "ice" { return d.message }
+        }
+    }
+    ""
+}
+
+// Failures report on stderr: a failing assert aborts, and an abort drops whatever stdout has
+// buffered, which would leave the reader a bare core-dump line and no reason for it.
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.eprintln("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.eprintln("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn assert_named_error(label: Str, name: Str) {
+    let n = count_named(name)
+    if n < 1 {
+        io.eprintln("FAIL: {label}: want at least one {name}, got:")
+        for e in error_messages() { io.eprintln("  {e}") }
+    }
+    assert(n >= 1)
+}
+
+// ── A handle named any of these ways is the same declaration, so Ptr accepts it ──
+
+fn test_a_qualified_opaque_handle_is_a_valid_pointee() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import opmod\n@trusted(audit: \"probe\")\n@ffi\nfn g() -> Ptr[opmod.Oh] ! FFI \{ Ptr.null() \}\n@trusted(audit: \"probe\")\nfn main() ! FFI \{ let p = g() io.println(\"ok\") \}\n")
+    assert_no_errors("Ptr[opmod.Oh] written qualified")
+    cleanup()
+}
+
+fn test_a_renamed_opaque_handle_is_a_valid_pointee() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import opmod.\{Oh as H\}\n@trusted(audit: \"probe\")\n@ffi\nfn g() -> Ptr[H] ! FFI \{ Ptr.null() \}\n@trusted(audit: \"probe\")\nfn main() ! FFI \{ let p = g() io.println(\"ok\") \}\n")
+    assert_no_errors("Ptr[H] where H renames opmod.Oh")
+    cleanup()
+}
+
+// ── The construction gate must recognize the same declaration under every spelling ──
+
+// A handle is produced only at the FFI boundary. Under a renaming import the gate missed the
+// declaration and the literal was accepted, so ordinary code minted a handle with no @trusted.
+fn test_a_renamed_opaque_handle_cannot_be_constructed_outside_the_ffi_boundary() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import opmod.\{Oh as H\}\nfn main() \{ let h = H \{\} io.println(\"ok\") \}\n")
+    assert_named_error("H \{ \} where H renames opmod.Oh", "TypeError")
+    cleanup()
+}
+
+// ── Controls: spellings that already answered correctly ──
+
+fn test_a_plainly_imported_opaque_handle_is_a_valid_pointee() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import opmod.\{Oh\}\n@trusted(audit: \"probe\")\n@ffi\nfn g() -> Ptr[Oh] ! FFI \{ Ptr.null() \}\n@trusted(audit: \"probe\")\nfn main() ! FFI \{ let p = g() io.println(\"ok\") \}\n")
+    assert_no_errors("Ptr[Oh] selected by its own name")
+    cleanup()
+}
+
+fn test_a_locally_declared_opaque_handle_is_a_valid_pointee() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("@ffi.opaque(name: \"ath\")\ntype Oh \{\}\n@trusted(audit: \"probe\")\n@ffi\nfn g() -> Ptr[Oh] ! FFI \{ Ptr.null() \}\n@trusted(audit: \"probe\")\nfn main() ! FFI \{ let p = g() io.println(\"ok\") \}\n")
+    assert_no_errors("Ptr[Oh] declared in the same file")
+    cleanup()
+}
+
+fn test_a_locally_declared_opaque_handle_cannot_be_constructed() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("@ffi.opaque(name: \"ath\")\ntype Oh \{\}\nfn main() \{ let h = Oh \{\} io.println(\"ok\") \}\n")
+    assert_named_error("Oh \{ \} declared in the same file", "TypeError")
+    cleanup()
+}
+
+fn test_a_qualified_opaque_handle_cannot_be_constructed() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import opmod\nfn main() \{ let h = opmod.Oh \{\} io.println(\"ok\") \}\n")
+    assert_named_error("opmod.Oh \{ \} written qualified", "TypeError")
+    cleanup()
+}
+
+// The derive refusal reads the same set through a third spelling, so both spellings that
+// reach it are pinned here too.
+fn test_a_derive_on_a_locally_declared_opaque_handle_is_still_refused() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("@derive(Debug)\n@ffi.opaque(name: \"ath\")\ntype Oh \{\}\nfn main() \{ io.println(\"ok\") \}\n")
+    assert_named_error("@derive(Debug) on a locally declared handle", "NonDerivableTrait")
+    cleanup()
+}
+
+fn test_a_derive_on_an_imported_opaque_handle_is_still_refused() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe_with("@derive(Debug)\n@ffi.opaque(name: \"ath\")\npub type Oh \{\}\n", "import opmod.\{Oh\}\nfn main() \{ io.println(\"ok\") \}\n")
+    assert_named_error("@derive(Debug) on an imported handle", "NonDerivableTrait")
+    cleanup()
+}
+
+// ── Controls: the closed set must not widen ──
+
+fn test_a_struct_without_an_ffi_annotation_is_still_an_invalid_pointee() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("type Plain \{ a: Int \}\n@trusted(audit: \"probe\")\n@ffi\nfn g() -> Ptr[Plain] ! FFI \{ Ptr.null() \}\n@trusted(audit: \"probe\")\nfn main() ! FFI \{ let p = g() io.println(\"ok\") \}\n")
+    assert_named_error("Ptr[Plain] over an unannotated struct", "InvalidPtrType")
+    cleanup()
+}
+
+// Section 9.1.4 makes Ptr[handle] a legal FFI inner type, so the refusal may not tell the
+// author that only @ffi.struct is allowed. A reader who is fixing a handle needs the arm that
+// applies to them named.
+fn test_the_invalid_pointee_refusal_names_the_opaque_annotation() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("type Plain \{ a: Int \}\n@trusted(audit: \"probe\")\n@ffi\nfn g() -> Ptr[Plain] ! FFI \{ Ptr.null() \}\n@trusted(audit: \"probe\")\nfn main() ! FFI \{ let p = g() io.println(\"ok\") \}\n")
+    let msg = first_message_named("InvalidPtrType")
+    if msg.contains("@ffi.opaque") == false {
+        io.eprintln("FAIL: refusal does not name @ffi.opaque: {msg}")
+    }
+    assert(msg.contains("@ffi.opaque"))
+    cleanup()
+}
+
+fn main() {
+    test_a_qualified_opaque_handle_is_a_valid_pointee()
+    test_a_renamed_opaque_handle_is_a_valid_pointee()
+    test_a_renamed_opaque_handle_cannot_be_constructed_outside_the_ffi_boundary()
+    test_a_plainly_imported_opaque_handle_is_a_valid_pointee()
+    test_a_locally_declared_opaque_handle_is_a_valid_pointee()
+    test_a_locally_declared_opaque_handle_cannot_be_constructed()
+    test_a_qualified_opaque_handle_cannot_be_constructed()
+    test_a_derive_on_a_locally_declared_opaque_handle_is_still_refused()
+    test_a_derive_on_an_imported_opaque_handle_is_still_refused()
+    test_a_struct_without_an_ffi_annotation_is_still_an_invalid_pointee()
+    test_the_invalid_pointee_refusal_names_the_opaque_annotation()
+    io.println("ffi opaque identity by declaration: ok")
+}

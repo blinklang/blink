@@ -1163,10 +1163,12 @@ let mut tc_collision_reported: Map[Str, Int] = Map()
 // happens to match the one the writer chose.
 let mut ffi_struct_type_set: Map[Int, Int] = Map()
 
-// Names of @ffi.opaque handle types. Consulted by is_valid_ptr_inner so an
-// out-param `Ptr[Handle]` (the `<c_name>**` mint shape) is a legal FFI inner
-// type. The handle itself is never a Ptr, so it needs no E0811 carve-out.
-let mut ffi_opaque_type_set: Map[Str, Int] = Map()
+// Tids of @ffi.opaque handle types, keyed the same way as the @ffi.struct set above and for
+// the same reason. Consulted by is_valid_ptr_inner so an out-param `Ptr[Handle]` (the
+// `<c_name>**` mint shape) is a legal FFI inner type, and by the struct-literal head so a
+// handle stays sealed to the FFI boundary. The handle itself is never a Ptr, so it needs no
+// E0811 carve-out.
+let mut ffi_opaque_type_set: Map[Int, Int] = Map()
 
 // Maps a type-alias name (e.g. `type Port = Int`) to its underlying type id.
 // Consulted by types_compatible so refinement aliases stay compatible with their base type.
@@ -2850,14 +2852,18 @@ fn tc_struct_field_provably_absent(obj_t: Int, fname: Str) -> Int {
 // the enum type itself), and an @ffi.opaque handle (sealed to the FFI boundary, has no
 // user-callable constructor — sections/07_trust_modules_metadata.md section 9.1.4) are not
 // constructible. 03_types.md:1084 requires the head to denote a product type.
-fn tc_head_constructible_struct(stid: Int, sname: Str) -> Int {
+fn tc_head_constructible_struct(stid: Int) -> Int {
     if type_kind(stid) != TyKind.Struct { return 0 }
-    if ffi_opaque_type_set.contains_key(strip_module_qualifier(sname)) != 0 { return 0 }
+    if ffi_opaque_type_set.contains_key(tc_resolve(stid)) != 0 { return 0 }
     1
 }
 
-fn tc_report_unconstructible_head(sname: Str, node: Int) ! Diag.Report {
-    if ffi_opaque_type_set.contains_key(strip_module_qualifier(sname)) != 0 {
+// Takes the head's tid beside its spelling, because the spelling alone cannot say whether the
+// head is a handle: a rename introduces a name no declaration carries, and the literal was
+// accepted, minting a handle outside the FFI boundary. A builtin head has no tid, so -1 says
+// "not a handle" and the general refusal below answers.
+fn tc_report_unconstructible_head(stid: Int, sname: Str, node: Int) ! Diag.Report {
+    if stid >= 0 && ffi_opaque_type_set.contains_key(tc_resolve(stid)) != 0 {
         diag_error_at("TypeError", TYPE_ERROR, "cannot construct @ffi.opaque handle '{sname}' outside the FFI boundary", node, "an opaque handle has no user-callable constructor; it is produced only at the FFI boundary (section 9.1.4)")
         return
     }
@@ -7326,7 +7332,7 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
     }
 
     if has_annotation(td, "ffi.opaque") != 0 {
-        ffi_opaque_type_set.insert(name, 1)
+        ffi_opaque_type_set.insert(tid, 1)
     }
 
     if has_annotation(td, "deprecated") != 0 {
@@ -7755,7 +7761,8 @@ fn tc_check_derive_opaque_handle() ! Diag.Report {
     while ti < named_type_names.len() {
         let tname = named_type_names.get(ti).unwrap()
         let td = tc_type_decl_nodes.get(tname) ?? -1
-        if td != -1 && ffi_opaque_type_set.contains_key(strip_module_qualifier(tname)) != 0 {
+        let ttid = named_type_ids.get(ti) ?? -1
+        if td != -1 && ttid >= 0 && ffi_opaque_type_set.contains_key(tc_resolve(ttid)) != 0 {
             for a in tc_decl_derive_args(td) {
                 let tr = node_name(a)
                 diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT,
@@ -8146,14 +8153,17 @@ fn tc_ptr_ffi_struct_pointee(ptr_tid: Int) -> Int {
     0
 }
 
-// Does the pointee written as `name` name an @ffi.struct? Resolved to a tid first, because the
-// annotation's spelling is not the declaration's: a qualified `m.Sv` and an alias introduced by
-// `import m.{Sv as S}` both name the declaration without matching any key it could be filed
-// under. The other reader of the set holds a tid already, so both now ask one question.
-fn tc_name_is_ffi_struct(name: Str) -> Int {
+// Does the pointee written as `name` carry an FFI annotation? Resolved to a tid first, because
+// the annotation's spelling is not the declaration's: a qualified `m.Sv` and an alias introduced
+// by `import m.{Sv as S}` both name the declaration without matching any key it could be filed
+// under. Both sets answer off the one resolution, because at this call site they are one
+// question: section 9.1.3 admits an @ffi.struct pointee and section 9.1.4 an @ffi.opaque one.
+fn tc_name_is_ffi_annotated(name: Str) -> Int {
     let t = lookup_named_type(name)
     if t < 0 { return 0 }
-    if ffi_struct_type_set.contains_key(tc_resolve(t)) != 0 { return 1 }
+    let rt = tc_resolve(t)
+    if ffi_struct_type_set.contains_key(rt) != 0 { return 1 }
+    if ffi_opaque_type_set.contains_key(rt) != 0 { return 1 }
     0
 }
 
@@ -8162,8 +8172,7 @@ fn is_valid_ptr_inner(name: Str) -> Int {
     if name == "U8" || name == "U16" || name == "U32" || name == "U64" { return 1 }
     if name == "I8" || name == "I16" || name == "I32" || name == "I64" { return 1 }
     if name == "Int" || name == "Float" || name == "Ptr" { return 1 }
-    if tc_name_is_ffi_struct(name) != 0 { return 1 }
-    if ffi_opaque_type_set.contains_key(name) != 0 { return 1 }
+    if tc_name_is_ffi_annotated(name) != 0 { return 1 }
     0
 }
 
@@ -8199,7 +8208,7 @@ fn check_ptr_pointee_in_ann(ann_node: Int) ! Diag.Report {
             let inner = sublist_get(elems_sl, 0)
             let inner_name = node_name(inner)
             if is_valid_ptr_inner(inner_name) == 0 {
-                diag_error_at("InvalidPtrType", INVALID_PTR_TYPE, "invalid Ptr type parameter '{inner_name}' — only Void, U8-U64, I8-I64, Int, Float, Ptr, or @ffi.struct types are allowed", inner, "use a valid FFI-compatible type or annotate the type with @ffi.struct")
+                diag_error_at("InvalidPtrType", INVALID_PTR_TYPE, "invalid Ptr type parameter '{inner_name}' — only Void, U8-U64, I8-I64, Int, Float, Ptr, @ffi.struct, or @ffi.opaque types are allowed", inner, "use a valid FFI-compatible type, or annotate the type with @ffi.struct for a known layout or @ffi.opaque for a handle")
             }
         }
         return
@@ -17289,8 +17298,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 let etid = lookup_named_type(sname)
                 if etid != -1 {
                     check_deprecated_type(sname, node)
-                    if tc_head_constructible_struct(etid, sname) == 0 {
-                        tc_report_unconstructible_head(sname, node)
+                    if tc_head_constructible_struct(etid) == 0 {
+                        tc_report_unconstructible_head(etid, sname, node)
                         return tc_error_recovery_tid()
                     }
                     // `mod.Type { .. }` is the same construction as `Type { .. }` and must
@@ -17316,8 +17325,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 let stid = lookup_named_type(sname)
                 if stid != -1 {
                     check_deprecated_type(sname, node)
-                    if tc_head_constructible_struct(stid, sname) == 0 {
-                        tc_report_unconstructible_head(sname, node)
+                    if tc_head_constructible_struct(stid) == 0 {
+                        tc_report_unconstructible_head(stid, sname, node)
                         return tc_error_recovery_tid()
                     }
                     // Reverse-infer the concrete instance tid (Box[Int]) from the
@@ -17332,7 +17341,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // above (user-first), so this fires only for a genuine builtin, which
                 // lookup_named_type (name-map only) never finds.
                 if is_primitive_type(sname) != 0 {
-                    tc_report_unconstructible_head(sname, node)
+                    tc_report_unconstructible_head(-1, sname, node)
                     return tc_error_recovery_tid()
                 }
                 // 3) global-unique variant.
