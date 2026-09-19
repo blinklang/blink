@@ -217,45 +217,43 @@ fn x_dispatch(node: Int) -> Int ! Diag.Report {
 
 // ── Type and layout ───────────────────────────────────────────────────────
 
-// The shape of a value in hand. A decline here means monomorphisation left a type codegen
-// cannot spell, so it is an ICE and the caller stops.
-fn x_local(tid: Int, node: Int) -> LayoutRecord ! Diag.Report {
-    let rec = layout_of(tid, Position.Local)
+// The one reader every decline-to-ICE layout wrapper shares: a caller has already asked
+// layout.bl for a record however its own site does that (a Local lookup, a carrier
+// member, a struct field, a foreign field), and this is the single place that turns a
+// decline into the ICE every one of those sites used to raise on its own. The decline
+// check and the diag_ice_at that answers it stay three lines apart here, and nowhere
+// else reads decline_reason directly any more.
+pub fn x_layout_checked(rec: LayoutRecord, node: Int, ice_name: Str, what: Str, hint: Str) -> LayoutRecord ! Diag.Report {
     if rec.decline_reason != "" {
-        let why = "expression has no C layout: {rec.decline_reason}"
-        diag_ice_at("UnspellableExprType", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
-            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+        diag_ice_at(ice_name, UNSOLVED_TYPEVAR_AT_CODEGEN, "{what}: {rec.decline_reason}", node, hint)
     }
     rec
 }
 
+// A decline here means monomorphisation left a type codegen cannot spell, so it is an
+// ICE and the caller stops.
+fn x_local(tid: Int, node: Int) -> LayoutRecord ! Diag.Report {
+    x_layout_checked(layout_of(tid, Position.Local), node, "UnspellableExprType",
+        "expression has no C layout", "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+}
+
 fn x_member(carrier: Int, slot: Slot, node: Int) -> LayoutRecord ! Diag.Report {
-    let rec = carrier_member_layout(carrier, slot)
-    if rec.decline_reason != "" {
-        let why = "carrier member has no C layout: {rec.decline_reason}"
-        diag_ice_at("UnspellableCarrierMember", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
-            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
-    }
-    rec
+    x_layout_checked(carrier_member_layout(carrier, slot), node, "UnspellableCarrierMember",
+        "carrier member has no C layout", "monomorphisation must resolve every type codegen reads; this is a compiler bug")
 }
 
 // x_local and x_member have already turned a decline into an ICE, so a caller is only
 // asking whether lowering may go on. layout.bl answers every decline with an empty
 // spelling, and no answer it accepts is empty, so that is the question to ask.
-fn x_stopped(rec: LayoutRecord) -> Bool {
+pub fn x_stopped(rec: LayoutRecord) -> Bool {
     rec.c_spelling == ""
 }
 
 // A field read takes the owner's stored form: a field whose type reaches its own owner
 // by value is held as a boxed word, which the field's own Local layout does not say.
 fn x_field(owner_decl: Int, field_tid: Int, node: Int) -> LayoutRecord ! Diag.Report {
-    let rec = field_layout_of(owner_decl, field_tid)
-    if rec.decline_reason != "" {
-        let why = "struct field has no C layout: {rec.decline_reason}"
-        diag_ice_at("UnspellableFieldType", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
-            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
-    }
-    rec
+    x_layout_checked(field_layout_of(owner_decl, field_tid), node, "UnspellableFieldType",
+        "struct field has no C layout", "monomorphisation must resolve every type codegen reads; this is a compiler bug")
 }
 
 fn x_unhandled(node: Int) -> Int ! Diag.Report {
@@ -702,11 +700,23 @@ fn x_payload_of(node: Int, carrier_tid: Int, inner_tid: Int, carrier: Str, slot:
     if x_stopped(mem) { return -1 }
     let obj = x_ref(carrier_tid, node, carrier)
     if obj < 0 { return -1 }
-    let got = ir_carrier_unwrap(inner_tid, node, mem.c_spelling, member, mem.slot_form, obj)
-    if mem.slot_form != SlotForm.PointerBoxed { return got }
+    if mem.slot_form != SlotForm.PointerBoxed { return x_unbox_payload(inner_tid, node, obj, mem, mem, member) }
     let rec = x_local(inner_tid, node)
     if x_stopped(rec) { return -1 }
-    ir_unbox(inner_tid, node, rec.c_spelling, rec.slot_form, got)
+    x_unbox_payload(inner_tid, node, obj, mem, rec, member)
+}
+
+// The one producer for a carrier member read that layout may have boxed: unwrap the member,
+// and when its slot form is PointerBoxed, follow the box to `held` (the payload's own Local
+// layout) rather than handing back the pointer. Every carrier-payload reader shares this
+// tail, so `held` is taken from the caller instead of re-derived here -- a caller already
+// holding one from its own read pass answers it directly, and one that does not looks it up
+// (x_local or its equivalent) before calling in, the same way x_payload_of does above.
+pub fn x_unbox_payload(inner_tid: Int, node: Int, obj: Int, member: LayoutRecord, held: LayoutRecord,
+        arm: Str) -> Int ! Diag.Report {
+    let got = ir_carrier_unwrap(inner_tid, node, member.c_spelling, arm, member.slot_form, obj)
+    if member.slot_form != SlotForm.PointerBoxed { return got }
+    ir_unbox(inner_tid, node, held.c_spelling, held.slot_form, got)
 }
 
 fn x_tag_is(node: Int, carrier_tid: Int, carrier: Str, want: Int) -> Int ! Diag.Report {
