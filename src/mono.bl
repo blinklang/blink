@@ -184,9 +184,9 @@ fn mono_build_decl_maps(program: Int) {
 }
 
 // A method's own type parameters are chosen by the call, so such a method is a template
-// and not a body, exactly like a generic free function. A poly impl is left alone: its
-// element binder and the method's own binders would have to be registered as one argument
-// tuple, and nothing reads that shape yet.
+// and not a body, exactly like a generic free function. A poly impl keeps its own path:
+// there the element binder joins the method's binders in one argument tuple, and the
+// receiver is what chooses the element (register_poly_own_generic_method).
 fn register_own_generic_methods(im: Int) {
     if is_poly_impl(im) { return }
     let methods_sl = node_methods(im)
@@ -548,6 +548,12 @@ fn fn_signature_tid(fn_node: Int, binds: Map[Str, Int]) -> Int {
 // Answers where the instance sits in the table, whether this call minted it or an
 // earlier one did.
 fn register(base_decl_node: Int, binders_sl: Int, arg_tids: List[Int], inst_tid: Int, c_name: Str) -> Int {
+    register_with_binds(base_decl_node, binds_from_binders(binders_sl, arg_tids), arg_tids, inst_tid, c_name)
+}
+
+// The same, for an instance whose binders come from two declarations at once: the binds are
+// already merged, so there is no single binder list to zip against the arguments.
+fn register_with_binds(base_decl_node: Int, binds: Map[Str, Int], arg_tids: List[Int], inst_tid: Int, c_name: Str) -> Int {
     let tuple = make_tuple_type(arg_tids)
     let key = seen_key(base_decl_node, tuple)
     match mono_seen_keys.get(key) {
@@ -558,7 +564,7 @@ fn register(base_decl_node: Int, binders_sl: Int, arg_tids: List[Int], inst_tid:
     mono_seen_keys.insert(key, idx)
     mono_table.push(MonoInstance { base_decl_node: base_decl_node, arg_tids: tuple, inst_tid: inst_tid, c_name: c_name })
     mono_node_tids.push(Map())
-    mono_binds.push(binds_from_binders(binders_sl, arg_tids))
+    mono_binds.push(binds)
     if dbg_channel_on("mono") != 0 {
         dbg_trace("mono", "instance {c_name} args={tc_type_str(tuple)} inst={tc_type_str(inst_tid)}")
     }
@@ -587,6 +593,28 @@ fn register_own_generic_method(m: Int, arg_tids0: List[Int]) -> Int {
     if im < 0 { return -1 }
     let inst_tid = canon_tid(fn_signature_tid(m, binds_from_binders(binders_sl, arg_tids)))
     register(m, binders_sl, arg_tids, inst_tid, c_poly_method_name(im, node_name(m), args_tid))
+}
+
+// A poly-impl method that declares type parameters of its own answers to two declarations:
+// the impl header binds the element, the method binds the rest, and neither is known until
+// the call. They are ONE key and one symbol, because they choose one body between them —
+// keying on the element alone would give every argument type the first call's body, and
+// keying on the method's binders alone would give every element the first receiver's.
+// Element first, in impl-header order, then the method's own binders in declaration order.
+fn register_poly_own_generic_method(m: Int, elem_tid0: Int, own_tids0: List[Int]) -> Int {
+    let im = poly_block_of_method.get(m) ?? -1
+    if im < 0 { return -1 }
+    if own_tids0.len() == 0 { return -1 }
+    let elem_tid = canon_tid(elem_tid0)
+    let own_tids = canon_tids(own_tids0)
+    let mut arg_tids: List[Int] = [elem_tid]
+    for t in own_tids { arg_tids.push(t) }
+    let mut binds = binds_from_binders(node_impl_binders(im), [elem_tid])
+    let own_binds = binds_from_binders(node_type_params(m), own_tids)
+    for k in own_binds.keys() { binds.insert(k, own_binds.get(k) ?? -1) }
+    let args_tid = make_tuple_type(arg_tids)
+    let inst_tid = canon_tid(fn_signature_tid(m, binds))
+    register_with_binds(m, binds, arg_tids, inst_tid, c_poly_method_name(im, node_name(m), args_tid))
 }
 
 fn register_poly_method(m: Int, elem_tid0: Int) -> Int {
@@ -712,11 +740,17 @@ fn discover_poly_impl_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
     }
 }
 
-fn register_poly_recv(ctx: Int, m: Int, recv_node: Int, call_node: Int) {
+fn register_poly_recv(ctx: Int, m: Int, recv_node: Int, call_node: Int) ! Diag.Report {
     let recv_tid = ctx_node_tid(ctx, recv_node)
     if recv_tid < 0 { return }
     let elem_tid = tc_tid_list_elem(recv_tid)
     if elem_tid < 0 || tid_is_open(elem_tid) { return }
+    if has_type_params(m) {
+        let binds = solve_call_binds(ctx, m, call_node, [recv_tid], node_args(call_node))
+        let own = binder_args(ctx, m, call_node, binds)
+        note_call_target(ctx, call_node, register_poly_own_generic_method(m, elem_tid, own))
+        return
+    }
     note_call_target(ctx, call_node, register_poly_method(m, elem_tid))
 }
 

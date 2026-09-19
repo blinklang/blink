@@ -1,0 +1,207 @@
+// A method inside a polymorphic impl may declare type parameters of its own, on top of the
+// binder the impl header carries. Both are chosen before the body can be emitted — the impl
+// binder by the receiver, the method binders by the call — so the instance the pass records
+// has to carry BOTH, as one argument tuple, under the one name producer that names every
+// poly-impl method. Registering only the element binder left the method's own parameters
+// standing as type variables, which is the same erasure a non-poly impl had.
+
+import lower_test_helpers.{probe, assert_eq_str}
+import mono.{run_mono, instances, node_tid_for_inst}
+import typecheck.{tc_type_str}
+import parser.{node_methods, node_name, node_params, node_type_params, sublist_get, sublist_length}
+import std.io
+
+fn src_one_call() -> Str {
+    #"trait Tagger[T] { fn tag[U](self, label: U, extra: T) -> U }
+
+impl[T] Tagger[T] for List[T] {
+    fn tag[U](_self, label: U, _extra: T) -> U { label }
+}
+
+fn main() {
+    let xs: List[Int] = [1, 2]
+    let a = xs.tag("s", 9)
+    let _keep = a
+}
+"#
+}
+
+fn src_two_receivers() -> Str {
+    #"trait Tagger[T] { fn tag[U](self, label: U, extra: T) -> U }
+
+impl[T] Tagger[T] for List[T] {
+    fn tag[U](_self, label: U, _extra: T) -> U { label }
+}
+
+fn main() {
+    let xs: List[Int] = [1, 2]
+    let ys: List[Str] = ["a"]
+    let a = xs.tag("s", 9)
+    let b = ys.tag(7, "z")
+    let _keep = a
+    let _kept = b
+}
+"#
+}
+
+fn src_never_called() -> Str {
+    #"trait Tagger[T] { fn tag[U](self, label: U, extra: T) -> U }
+
+impl[T] Tagger[T] for List[T] {
+    fn tag[U](_self, label: U, _extra: T) -> U { label }
+}
+
+fn main() {
+    let xs: List[Int] = [1, 2]
+    let _keep = xs.len()
+}
+"#
+}
+
+fn src_no_own_binder() -> Str {
+    #"trait Sizer[T] { fn measure(self, extra: T) -> Int }
+
+impl[T] Sizer[T] for List[T] {
+    fn measure(_self, _extra: T) -> Int { 1 }
+}
+
+fn main() {
+    let xs: List[Int] = [1, 2]
+    let n = xs.measure(3)
+    let _keep = n
+}
+"#
+}
+
+fn impl_method(program: Int, mname: Str) -> Int {
+    let impls_sl = node_methods(program)
+    let mut i = 0
+    while i < sublist_length(impls_sl) {
+        let im = sublist_get(impls_sl, i)
+        let ms = node_methods(im)
+        let mut j = 0
+        while j < sublist_length(ms) {
+            let m = sublist_get(ms, j)
+            if node_name(m) == mname { return m }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn param_named(m: Int, pname: Str) -> Int {
+    let ps = node_params(m)
+    let mut i = 0
+    while i < sublist_length(ps) {
+        let p = sublist_get(ps, i)
+        if node_name(p) == pname { return p }
+        i = i + 1
+    }
+    -1
+}
+
+fn arg_tuples_for(decl: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(tc_type_str(inst.arg_tids)) }
+    }
+    out
+}
+
+fn names_for(decl: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(inst.c_name) }
+    }
+    out
+}
+
+fn instance_for(decl: Int, args: Str) -> Int {
+    let mut i = 0
+    for inst in instances() {
+        if inst.base_decl_node == decl && tc_type_str(inst.arg_tids) == args { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn report(label: Str, decl: Int) {
+    io.println("FAIL: {label}: instances for the method declaration:")
+    for a in arg_tuples_for(decl) { io.println("  {a}") }
+}
+
+// The element binder comes first because the impl header binds it first; the method's own
+// binders follow in the order the method declares them.
+test "an element binder and a method's own binder register as one argument tuple" {
+    let program = probe("mono_poly_own_tp_one", src_one_call())
+    run_mono(program)
+    let decl = impl_method(program, "tag")
+    assert(decl != -1)
+    let got = arg_tuples_for(decl)
+    if got.len() != 1 { report("one instance", decl) }
+    assert(got.len() == 1)
+    assert_eq_str("argument tuple", got.get(0).unwrap(), "(Int, Str)")
+}
+
+test "the instance gives the method's own parameter its substituted type" {
+    let program = probe("mono_poly_own_tp_params", src_one_call())
+    run_mono(program)
+    let decl = impl_method(program, "tag")
+    let idx = instance_for(decl, "(Int, Str)")
+    if idx < 0 { report("instance present", decl) }
+    assert(idx >= 0)
+    let inst = instances().get(idx).unwrap()
+    assert_eq_str("param label", tc_type_str(node_tid_for_inst(inst, param_named(decl, "label"))), "Str")
+}
+
+// Two receivers at different elements and different labels are four choices, not two, and
+// every one of them belongs to the key.
+test "two receivers at different elements register two instances" {
+    let program = probe("mono_poly_own_tp_two", src_two_receivers())
+    run_mono(program)
+    let decl = impl_method(program, "tag")
+    let got = arg_tuples_for(decl)
+    if got.len() != 2 { report("two instances", decl) }
+    assert(got.len() == 2)
+    assert(instance_for(decl, "(Int, Str)") >= 0)
+    assert(instance_for(decl, "(Str, Int)") >= 0)
+}
+
+// One producer names every instance, so no two instances of one declaration can share a
+// symbol and the element is part of the name as much as the method's own argument is.
+test "each instance is named once and the names differ" {
+    let program = probe("mono_poly_own_tp_names", src_two_receivers())
+    run_mono(program)
+    let decl = impl_method(program, "tag")
+    let got = names_for(decl)
+    if got.len() != 2 { report("two names", decl) }
+    assert(got.len() == 2)
+    let a = got.get(0).unwrap()
+    let b = got.get(1).unwrap()
+    if a == b { io.println("FAIL: both instances are named '{a}'") }
+    assert(a != b)
+}
+
+// The control against over-correction: a poly-impl method that declares no binders of its
+// own is keyed by the element alone, as it always was.
+test "a poly-impl method with no binders of its own is still keyed by the element alone" {
+    let program = probe("mono_poly_no_own_tp", src_no_own_binder())
+    run_mono(program)
+    let decl = impl_method(program, "measure")
+    assert(decl != -1)
+    let got = arg_tuples_for(decl)
+    if got.len() != 1 { report("one instance", decl) }
+    assert(got.len() == 1)
+    assert_eq_str("argument tuple", got.get(0).unwrap(), "(Int)")
+}
+
+// A template with no call is not a body.
+test "a poly-impl method with its own type parameter and no call registers no instance" {
+    let program = probe("mono_poly_own_tp_none", src_never_called())
+    run_mono(program)
+    let decl = impl_method(program, "tag")
+    let got = arg_tuples_for(decl)
+    if got.len() != 0 { report("no instance", decl) }
+    assert(got.len() == 0)
+}
