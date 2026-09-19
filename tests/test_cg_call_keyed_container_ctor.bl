@@ -1,0 +1,87 @@
+// A bare `Map()`/`Set()` and a qualified `Map.new()`/`Set.new()` are two spellings of the
+// same construction: typecheck already resolves both to the same tid, so codegen builds
+// them the same way, reading the runtime constructor and the key's operations table off
+// that tid rather than off which spelling the call was written with.
+//
+// The table is chosen from the key type alone (layout.lo_kops_of): a table it has is baked
+// into the IR node ContainerNew already carries a slot for, and a key type that has none is
+// refused by name -- not silently, and not by falling through to the generic no-such-callee
+// refusal a container constructor used to reach before this table was read at all.
+import lower_test_helpers.{
+    probe, rhs_of, assert_eq_str, assert_kind, assert_verifies, assert_ice_saying,
+}
+import cg_expr.{lower_expr}
+import ir.{ir_c_name, ir_kops_table, IrKind}
+
+fn src() -> Str {
+    #"fn main() {
+    let bare_map: Map[Str, Int] = Map()
+    let bare_set: Set[Int] = Set()
+    let mut qual_map = Map.new()
+    qual_map.insert("a", 1)
+    let mut qual_set = Set.new()
+    qual_set.insert(7)
+    let _keep = [bare_map.len(), bare_set.len(), qual_map.len(), qual_set.len()]
+}
+"#
+}
+
+test "a bare Map() builds the runtime constructor with the key's operations table" {
+    probe("ctor_kops_bare_map", src())
+    let built = lower_expr(rhs_of("bare_map"))
+    assert_kind("kind", built, IrKind.ContainerNew)
+    assert_eq_str("ctor", ir_c_name(built), "blink_map_new")
+    assert_eq_str("kops", ir_kops_table(built), "blink_kops_str")
+    assert_verifies("bare_map", built)
+}
+
+test "a bare Set() builds the runtime constructor with the element's operations table" {
+    probe("ctor_kops_bare_set", src())
+    let built = lower_expr(rhs_of("bare_set"))
+    assert_kind("kind", built, IrKind.ContainerNew)
+    assert_eq_str("ctor", ir_c_name(built), "blink_set_new")
+    assert_eq_str("kops", ir_kops_table(built), "blink_kops_i64")
+    assert_verifies("bare_set", built)
+}
+
+test "a qualified Map.new() builds the same way a bare Map() does" {
+    probe("ctor_kops_qual_map", src())
+    let built = lower_expr(rhs_of("qual_map"))
+    assert_kind("kind", built, IrKind.ContainerNew)
+    assert_eq_str("ctor", ir_c_name(built), "blink_map_new")
+    assert_eq_str("kops", ir_kops_table(built), "blink_kops_str")
+    assert_verifies("qual_map", built)
+}
+
+test "a qualified Set.new() builds the same way a bare Set() does" {
+    probe("ctor_kops_qual_set", src())
+    let built = lower_expr(rhs_of("qual_set"))
+    assert_kind("kind", built, IrKind.ContainerNew)
+    assert_eq_str("ctor", ir_c_name(built), "blink_set_new")
+    assert_eq_str("kops", ir_kops_table(built), "blink_kops_i64")
+    assert_verifies("qual_set", built)
+}
+
+// A generic function's own type parameter is a free type variable, not yet a concrete
+// type Hash could be derived for or refused on (layout.lo_kops_decline_of declines any
+// TyKind.Typevar by name): probing the un-monomorphised body reaches codegen with a key
+// tid that provably has no table, the same way a bare constructor over any other untabled
+// key must, rather than reaching the generic no-such-callee refusal.
+fn src_declines() -> Str {
+    #"fn f[T]() -> Int {
+    let bad: Map[T, Int] = Map()
+    bad.len()
+}
+
+fn main() {
+    let _keep = 0
+}
+"#
+}
+
+test "a bare Map() with a key type that has no operations table still refuses by name" {
+    probe("ctor_kops_bare_decline", src_declines())
+    assert_ice_saying("bad", lower_expr(rhs_of("bad")),
+        "ContainerCtorNeedsKeyOps",
+        "'Map.new' answers a container whose key operations are chosen from the key type")
+}

@@ -6,8 +6,9 @@ import lower_test_helpers.{
     probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
     assert_ice, assert_ice_saying,
 }
-import ir.{IrKind, ir_c_name, ir_kid}
+import ir.{IrKind, ir_c_name, ir_kid, ir_kops_table}
 import cg_expr.{lower_expr}
+import diagnostics.{diag_entries}
 
 fn src_calls() -> Str {
     #"import std.io
@@ -119,18 +120,28 @@ test "a spread element of a container literal is refused by the stage that owns 
 }
 
 
-// The claim is that the REFUSAL is delegated too: this stage hands the call over and lets
-// the call stage name what it cannot finish, rather than reporting a shape of its own. A
-// closure held in a local now reaches the body a bound closure value calls through, and
-// `assert` now answers its own named refusal instead of the generic one, so neither measures
-// this any more. A bare `Map()` still does: is_builtin_fn knows the name, but the call stage
-// has no runtime-ctor row for it, so the miss is a builtin left unbuilt, not an undeclared
-// name. The marker stops at the stage name on purpose: which shape that stage has left to
-// build is not this test's claim.
-test "a call this stage cannot finish is refused by the call stage, under its own name" {
+// The claim was that the REFUSAL is delegated too: this stage hands the call over and lets
+// the call stage build or name what it cannot finish, rather than reporting a shape of its
+// own. A bare `Map()` used to be the standing example (is_builtin_fn knows the name, but
+// the call stage had no runtime-ctor row for it); it now builds, reading the runtime
+// constructor and the key's operations table off the same tid a qualified `Map.new()`
+// would, so this test instead pins that the BUILD was delegated: the tree this stage's own
+// lower_expr answers for a bare `Map()` is the call stage's ContainerNew, not a shape
+// lower_expr assembled itself.
+test "a call this stage hands over is built by the call stage, not assembled here" {
     probe("cg_expr_delegates", src_calls())
-    assert_ice_saying("free call", lower_expr(rhs_of("bare_map")),
-        "CodegenStageNotBuilt", "cg_call")
+    let built = lower_expr(rhs_of("bare_map"))
+    assert_kind("kind", built, IrKind.ContainerNew)
+    assert_eq_str("ctor", ir_c_name(built), "blink_map_new")
+    assert(ir_kops_table(built) != "")
+    assert_verifies("bare_map", built)
+    let mut refusals = 0
+    for d in diag_entries {
+        let is_stage_gap = d.severity == "ice" && d.name == "CodegenStageNotBuilt"
+        let mentions_this_call = d.message.contains("free call") || d.message.contains("Map()")
+        if is_stage_gap && mentions_this_call { refusals = refusals + 1 }
+    }
+    assert_eq(refusals, 0)
 }
 
 test "a hole typecheck shows structurally, with no impl to call, is refused by this stage" {
