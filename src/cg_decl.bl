@@ -24,7 +24,7 @@ import cname.{
     c_ffi_symbol, c_field_name,
     c_fn_decl_name, cname_ffi_struct_mirror,
     c_global_name, c_vtable_type_name,
-    c_impl_method_name, c_local_name, c_type_decl_name, c_variant_ordinal,
+    c_impl_method_name, c_local_name, c_typedef_name, c_variant_ordinal,
     c_variant_tag_macro,
     cname_is_runtime_owned, td_guard_name, c_enum_tag_member, c_enum_payload_member,
 }
@@ -43,11 +43,12 @@ import ir.{
     ir_assign, ir_block, ir_call_direct, ir_c_name, ir_cast, ir_const, ir_expr_stmt,
     ir_global_ref, ir_kind, ir_return, ir_var_ref, IrKind,
 }
-import mono.{is_poly_impl, poly_impl_is_element_agnostic}
+import mono.{instances, is_poly_impl, poly_impl_is_element_agnostic}
 import typecheck.{
     TyKind, tc_enum_variant_slots, tc_evar_field_slots, tc_evar_name, tc_evfield_name,
     tc_evfield_tid, tc_resolve, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
-    make_handler_type, tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind,
+    make_handler_type, tc_member_tid_at_instance,
+    tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind,
     tc_type_str, tc_void_tid, DECL_NODE_AMBIGUOUS,
 }
 import parser.{
@@ -56,8 +57,10 @@ import parser.{
     sublist_length,
 }
 
-// 1 while a declaration's dependencies are being emitted, 2 once its typedef is written.
-let mut decl_state: Map[Int, Int] = Map()
+// 1 while a type's dependencies are being emitted, 2 once its typedef is written. The key
+// is the C name the typedef will carry, not the declaration: one generic declaration has
+// one typedef per instance, and two type ids that spell the same C name are one C type.
+let mut typedef_state: Map[Str, Int] = Map()
 
 // The prototype this unit wrote for each foreign symbol, as its return and parameter
 // spellings. C takes one declaration per symbol, so two bindings over one symbol either
@@ -65,7 +68,7 @@ let mut decl_state: Map[Int, Int] = Map()
 let mut foreign_decls: Map[Str, Str] = Map()
 
 pub fn cg_decl_reset() {
-    decl_state = Map()
+    typedef_state = Map()
     foreign_decls = Map()
 }
 
@@ -89,7 +92,13 @@ pub fn cg_decl_require_spelling(tid: Int, position: Position) -> Str ! Diag.Repo
 // ── Typedefs ──────────────────────────────────────────────────────────────
 
 pub fn cg_decl_emit_typedefs() ! Diag.Report {
-    for decl in cg_reg_type_decls() { emit_type_decl(decl) }
+    for decl in cg_reg_type_decls() {
+        if is_generic_base(decl) {
+            for inst in instance_tids_of(decl) { emit_typedef_for(decl, inst) }
+            continue
+        }
+        emit_type_decl(decl)
+    }
 }
 
 // A generic declaration is a template. Only its instances have a C spelling, so asking
@@ -100,61 +109,99 @@ fn is_generic_base(decl: Int) -> Bool {
     tps != -1 && sublist_length(tps) > 0
 }
 
-// A declaration whose C typedef this translation unit does not write: a generic base
-// (mono writes one typedef per instance), an alias (it has no storage of its own), an
-// opaque foreign handle (the foreign header declares the pointee) and a type whose
-// typedef lives in runtime.h.
+// The type ids the monomorphization pass registered for one generic declaration. That
+// pass is the only authority on which instances a program has: none of them is written
+// down in the source, and an instance nobody reaches has no C shape to write.
+fn instance_tids_of(decl: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(inst.inst_tid) }
+    }
+    out
+}
+
+// A declaration whose C typedef this translation unit does not write: an alias (it has no
+// storage of its own), an opaque foreign handle (the foreign header declares the pointee)
+// and a type whose typedef lives in runtime.h. A generic base is not on this list: it is
+// not skipped but redirected, because its instances do get typedefs.
 fn skips_typedef(decl: Int) -> Bool {
-    if is_generic_base(decl) { return true }
     if node_fields(decl) == -1 && node_value(decl) != -1 { return true }
     if get_annotation(decl, "ffi.opaque") != -1 { return true }
     cname_is_runtime_owned(decl)
 }
 
+// A monomorphic declaration: its own tid is the type, and it has no instance arguments.
 fn emit_type_decl(decl: Int) ! Diag.Report {
     if decl < 0 { return }
-    // 1 means this declaration is already on the stack: the only way back to it is a
-    // member that reaches its own owner, and such a member is stored boxed, so the
-    // cycle needs no completed typedef and is not followed.
-    if (decl_state.get(decl) ?? 0) != 0 { return }
-    decl_state.insert(decl, 1)
-    let tid = cg_reg_tid_for_decl(decl)
-    if tid < 0 || skips_typedef(decl) {
-        decl_state.insert(decl, 2)
-        return
-    }
-    for mtid in member_tids(tid) {
-        for dep in nominal_deps(mtid) { emit_type_decl(dep) }
-    }
-    decl_state.insert(decl, 2)
-    emit_one(decl, tid)
+    emit_typedef_for(decl, -1)
 }
 
-// The declared member types of a nominal type, in declaration order: a struct's fields,
-// or every field of every enum variant.
-fn member_tids(tid: Int) -> List[Int] {
+// One typedef. `inst_tid` is the instance this typedef describes, or -1 for a declaration
+// that has no type parameters and is therefore its own single type.
+fn emit_typedef_for(decl: Int, inst_tid: Int) ! Diag.Report {
+    if decl < 0 { return }
+    let tid = if inst_tid < 0 { cg_reg_tid_for_decl(decl) } else { inst_tid }
+    if tid < 0 { return }
+    let c_name = c_typedef_name(tid)
+    if diag_is_ice_seg(c_name) { return }
+    // 1 means this type is already on the stack: the only way back to it is a member that
+    // reaches its own owner, and such a member is stored boxed, so the cycle needs no
+    // completed typedef and is not followed.
+    if (typedef_state.get(c_name) ?? 0) != 0 { return }
+    typedef_state.insert(c_name, 1)
+    if skips_typedef(decl) {
+        typedef_state.insert(c_name, 2)
+        return
+    }
+    for mtid in member_tids(decl, inst_tid) {
+        for dep in nominal_deps(mtid) { emit_dep(dep) }
+    }
+    typedef_state.insert(c_name, 2)
+    emit_one(decl, tid, inst_tid, c_name)
+}
+
+// A nominal type one member reaches. Which of the two paths it takes is a fact about its
+// own declaration, not about the member: an instance is emitted at the tid the member
+// carries, and a monomorphic type always at the tid its declaration registered, so a
+// member that names it and the declaration walk that reaches it agree on one typedef.
+fn emit_dep(dep_tid: Int) ! Diag.Report {
+    let decl = tc_tid_decl_node(tc_resolve(dep_tid))
+    if decl < 0 || decl == DECL_NODE_AMBIGUOUS { return }
+    if is_generic_base(decl) {
+        emit_typedef_for(decl, tc_resolve(dep_tid))
+        return
+    }
+    emit_type_decl(decl)
+}
+
+// The member types of a nominal type, in declaration order: a struct's fields, or every
+// field of every enum variant. The slots are registered against the declaration, so a
+// generic type's members are declared over its own binders and each one is read back at
+// the instance's arguments.
+fn member_tids(decl: Int, inst_tid: Int) -> List[Int] {
+    let base = cg_reg_tid_for_decl(decl)
     let mut out: List[Int] = []
-    if tc_tid_kind(tc_resolve(tid)) == TyKind.Enum {
-        for v in tc_enum_variant_slots(tid) {
-            for f in tc_evar_field_slots(v) { out.push(tc_evfield_tid(f)) }
+    if tc_tid_kind(tc_resolve(base)) == TyKind.Enum {
+        for v in tc_enum_variant_slots(base) {
+            for f in tc_evar_field_slots(v) {
+                out.push(tc_member_tid_at_instance(tc_evfield_tid(f), inst_tid))
+            }
         }
         return out
     }
-    for f in tc_struct_field_slots(tid) { out.push(tc_sfield_tid(f)) }
+    for f in tc_struct_field_slots(base) {
+        out.push(tc_member_tid_at_instance(tc_sfield_tid(f), inst_tid))
+    }
     out
 }
 
-// The nominal declarations a member type reaches BY VALUE. A carrier or tuple names its
-// members inside its own typedef, so the walk goes through it; a runtime container is one
-// C type whatever it holds, so the walk stops there.
+// The nominal types a member type reaches BY VALUE. A carrier or tuple names its members
+// inside its own typedef, so the walk goes through it; a runtime container is one C type
+// whatever it holds, so the walk stops there.
 fn nominal_deps(tid: Int) -> List[Int] {
     let r = tc_resolve(tid)
     let k = tc_tid_kind(r)
-    if k == TyKind.Struct || k == TyKind.Enum {
-        let decl = tc_tid_decl_node(r)
-        if decl < 0 { return [] }
-        return [decl]
-    }
+    if k == TyKind.Struct || k == TyKind.Enum { return [r] }
     if k != TyKind.Option && k != TyKind.Result && k != TyKind.Tuple { return [] }
     let mut out: List[Int] = []
     let mut i = 0
@@ -173,20 +220,19 @@ fn flush_member_typedefs(tid: Int) {
     print_typedef_blocks(layout_take_typedefs())
 }
 
-fn emit_one(decl: Int, tid: Int) ! Diag.Report {
-    let c_name = c_type_decl_name(decl)
+fn emit_one(decl: Int, tid: Int, inst_tid: Int, c_name: Str) ! Diag.Report {
     let guard = td_guard_name(c_name)
     if tc_tid_kind(tc_resolve(tid)) == TyKind.Enum {
-        emit_enum(decl, tid, guard, c_name)
+        emit_enum(decl, inst_tid, guard, c_name)
         return
     }
-    emit_struct(decl, tid, guard, c_name)
+    emit_struct(decl, inst_tid, guard, c_name)
 }
 
-fn emit_struct(decl: Int, tid: Int, guard: Str, c_name: Str) ! Diag.Report {
+fn emit_struct(decl: Int, inst_tid: Int, guard: Str, c_name: Str) ! Diag.Report {
     let mut fields: List[Str] = []
-    for slot in tc_struct_field_slots(tid) {
-        let ftid = tc_sfield_tid(slot)
+    for slot in tc_struct_field_slots(cg_reg_tid_for_decl(decl)) {
+        let ftid = tc_member_tid_at_instance(tc_sfield_tid(slot), inst_tid)
         flush_member_typedefs(ftid)
         let fname = tc_sfield_name(slot)
         let spelling = spelling_or_ice(field_layout_of(decl, ftid), "{node_name(decl)}.{fname}")
@@ -204,8 +250,8 @@ fn variant_node(decl: Int, index: Int) -> Int {
     sublist_get(vars, index)
 }
 
-fn emit_enum(decl: Int, tid: Int, guard: Str, c_name: Str) ! Diag.Report {
-    let slots = tc_enum_variant_slots(tid)
+fn emit_enum(decl: Int, inst_tid: Int, guard: Str, c_name: Str) ! Diag.Report {
+    let slots = tc_enum_variant_slots(cg_reg_tid_for_decl(decl))
     let mut names: List[Str] = []
     let mut fields: List[List[Str]] = []
     let mut macros: List[Str] = []
@@ -216,7 +262,7 @@ fn emit_enum(decl: Int, tid: Int, guard: Str, c_name: Str) ! Diag.Report {
         let slot = slots.get(i).unwrap()
         let vnode = variant_node(decl, i)
         if vnode < 0 { return }
-        let decls = variant_field_decls(decl, slot)
+        let decls = variant_field_decls(decl, inst_tid, slot)
         if decls.len() > 0 { carries_data = true }
         names.push(tc_evar_name(slot))
         fields.push(decls)
@@ -232,10 +278,10 @@ fn emit_enum(decl: Int, tid: Int, guard: Str, c_name: Str) ! Diag.Report {
         c_enum_tag_member(), c_enum_payload_member(), names, fields, macros)
 }
 
-fn variant_field_decls(owner: Int, var_slot: Int) -> List[Str] ! Diag.Report {
+fn variant_field_decls(owner: Int, inst_tid: Int, var_slot: Int) -> List[Str] ! Diag.Report {
     let mut out: List[Str] = []
     for f in tc_evar_field_slots(var_slot) {
-        let ftid = tc_evfield_tid(f)
+        let ftid = tc_member_tid_at_instance(tc_evfield_tid(f), inst_tid)
         flush_member_typedefs(ftid)
         let fname = tc_evfield_name(f)
         let spelling = spelling_or_ice(field_layout_of(owner, ftid), "{node_name(owner)}.{tc_evar_name(var_slot)}.{fname}")
