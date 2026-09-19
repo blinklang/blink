@@ -1,0 +1,87 @@
+// Name resolution walks function bodies, parameters and returns, so an undeclared type
+// name in any of those is `error[UnknownType]`. It never walked a type declaration, so the
+// same name in a struct field, an enum-variant payload or a type-alias underlying passed
+// silently and the annotation lowered to a fresh type variable. A program that names a
+// type nothing declares must not compile, whichever position names it.
+//
+// The over-correction this file also guards: a generic binder in scope declares its own
+// name, and a declared type is declared. Neither may report anything.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+
+fn unknown_type_reports(name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.name == "UnknownType" && d.message.contains(name) { n = n + 1 }
+    }
+    n
+}
+
+fn report_names() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        out = out.concat("[{d.severity}] {d.name}: {d.message}\n")
+    }
+    out
+}
+
+fn assert_reported(label: Str, name: Str) {
+    if unknown_type_reports(name) < 1 {
+        io.println("FAIL: {label}: no UnknownType names '{name}'. Reports:\n{report_names()}")
+    }
+    assert(unknown_type_reports(name) >= 1)
+}
+
+fn assert_not_reported(label: Str, name: Str) {
+    if unknown_type_reports(name) != 0 {
+        io.println("FAIL: {label}: UnknownType names '{name}' and must not. Reports:\n{report_names()}")
+    }
+    assert_eq(unknown_type_reports(name), 0)
+}
+
+// One probe, compiled once: the typecheck name tables are process-global and are not reset
+// between compiles, so a second probe would read the first one's declarations.
+fn compile_the_probe() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    env.set_var("BLINK_ROOT", env.cwd())
+    diag_reset()
+    let path = "build/unknown_type_in_decl_probe.bl"
+    write_file(path, "type ZzDeclared \{\n    x: Int\n\}\n\ntype ZzFieldHolder \{\n    f: ZzMissingField\n\}\n\ntype ZzPayloadHolder \{\n    Named(p: ZzMissingPayload)\n    Bare\n\}\n\ntype ZzAlias = ZzMissingAlias\n\ntype ZzGeneric[T] \{\n    g: T\n\}\n\ntype ZzNestedHolder \{\n    n: List[ZzMissingNested]\n\}\n\ntype ZzGoodHolder \{\n    ok: ZzDeclared\n    count: Int\n\}\n\nfn main() \{\n\}\n")
+    let program = compile_to_program(path, 1)
+    let _ = fs.delete(path)
+    check_types(program)
+}
+
+test "an undeclared type in a struct field is reported" {
+    compile_the_probe()
+    assert_reported("struct field", "ZzMissingField")
+}
+
+test "an undeclared type in an enum-variant payload is reported" {
+    compile_the_probe()
+    assert_reported("enum variant payload", "ZzMissingPayload")
+}
+
+test "an undeclared type as a type-alias underlying is reported" {
+    compile_the_probe()
+    assert_reported("type alias underlying", "ZzMissingAlias")
+}
+
+test "an undeclared type inside a container argument of a field is reported" {
+    compile_the_probe()
+    assert_reported("nested container argument", "ZzMissingNested")
+}
+
+test "a generic binder in scope is not an undeclared type" {
+    compile_the_probe()
+    assert_not_reported("generic binder", "'T'")
+}
+
+test "a declared type and a builtin used as fields report nothing" {
+    compile_the_probe()
+    assert_not_reported("declared type field", "ZzDeclared")
+    assert_not_reported("builtin field", "'Int'")
+}
