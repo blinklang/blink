@@ -1,0 +1,189 @@
+// A declared function type says what a closure's parameters are. That answer has to reach
+// the closure wherever the value is written, not only when the closure is the value itself.
+//
+// Two shapes put a node between the declaration and the closure. An `if`/`else` hands the
+// same expectation to both branch tails, and a List literal hands the element type to each
+// element. Both already distribute the expectation that way for every other kind of value;
+// the closure seed was simply not one of the things they handed down, so each closure
+// parameter was reported as impossible to infer even though the annotation spelled it out.
+//
+// The controls are the shapes that still have nothing to say: a closure in a branch under no
+// expectation at all, and a List literal with no annotation. Those parameters are genuinely
+// under-determined and are still reported (E0301).
+
+import typecheck.{check_types, tc_lookup_node_tid, tc_resolve, tc_type_str}
+import parser.{node_kind, node_name, nodes}
+import ast.{NodeKind, nk_of}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn param_node_of(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.Param && node_name(i) == name { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no parameter '{name}'")
+    assert(false)
+    -1
+}
+
+fn assert_param_type(name: Str, want: Str) {
+    let p = param_node_of(name)
+    let tid = tc_lookup_node_tid(p)
+    if tid < 0 {
+        io.println("FAIL: parameter '{name}' carries no type at all")
+        assert(false)
+        return
+    }
+    let got = tc_type_str(tc_resolve(tid))
+    if got != want { io.println("FAIL: parameter '{name}': got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn messages_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat(d.message).concat("\n") }
+    }
+    out
+}
+
+fn assert_unreported(name: Str) {
+    let msgs = messages_reported()
+    if msgs.contains(name) { io.println("FAIL: '{name}' is reported: {msgs}") }
+    assert(!msgs.contains(name))
+}
+
+fn assert_reported(name: Str) {
+    let msgs = messages_reported()
+    if !msgs.contains(name) { io.println("FAIL: '{name}' is not reported; reports were: {msgs}") }
+    assert(msgs.contains(name))
+}
+
+// One probe holds every shape. Typecheck's named-type map is not reset between compiles in
+// one binary, so a second probe would be measuring the first one's leftovers.
+fn nested_src() -> Str {
+    #"fn zz_nest_take(f: fn(Int, Str, Bool) -> Int) -> Int {
+    f(1, "s", true)
+}
+
+fn main() {
+    let zzpick = true
+    let _b: fn(Int, Str, Bool) -> Int = if zzpick {
+        fn(zzea, zzeb, zzec) -> Int { zzeb.len() }
+    } else {
+        fn(zzfa, zzfb, zzfc) -> Int { zzfb.len() }
+    }
+    let _l: List[fn(Int, Str, Bool) -> Int] = [fn(zzda, zzdb, zzdc) -> Int { zzdb.len() }]
+    let _m: List[fn(Int, Str, Bool) -> Int] = [
+        fn(zzga, zzgb, zzgc) -> Int { zzgb.len() },
+        fn(zzha, zzhb, zzhc) -> Int { zzhb.len() },
+    ]
+    let _n: List[fn(Int, Str, Bool) -> Int] = if zzpick {
+        [fn(zzia, zzib, zzic) -> Int { zzib.len() }]
+    } else {
+        []
+    }
+    let _a = zz_nest_take(if zzpick {
+        fn(zzja, zzjb, zzjc) -> Int { zzjb.len() }
+    } else {
+        fn(zzka, zzkb, zzkc) -> Int { zzkb.len() }
+    })
+    let _u = if zzpick {
+        fn(zzua) -> Int { 4 }
+    } else {
+        fn(zzva) -> Int { 5 }
+    }
+    let _w = [fn(zzwa) -> Int { 6 }]
+}
+"#
+}
+
+// MVCE A. Both branch tails are the value the annotation describes, so both closures take
+// every position the annotation names.
+test "an fn-typed annotation reaches a closure in each branch of an if" {
+    let _p = probe("build/closure_nested_if.bl", nested_src())
+
+    assert_param_type("zzea", "Int")
+    assert_param_type("zzeb", "Str")
+    assert_param_type("zzec", "Bool")
+    assert_param_type("zzfa", "Int")
+    assert_param_type("zzfb", "Str")
+    assert_param_type("zzfc", "Bool")
+}
+
+// MVCE B. The element type of the annotation is what each element is measured against.
+test "a List annotation reaches a closure written as an element" {
+    let _p = probe("build/closure_nested_list.bl", nested_src())
+
+    assert_param_type("zzda", "Int")
+    assert_param_type("zzdb", "Str")
+    assert_param_type("zzdc", "Bool")
+}
+
+// Every element, not only the first: the element type belongs to the list, not to a position.
+test "a List annotation reaches every closure element" {
+    let _p = probe("build/closure_nested_list_many.bl", nested_src())
+
+    assert_param_type("zzga", "Int")
+    assert_param_type("zzhb", "Str")
+    assert_param_type("zzhc", "Bool")
+}
+
+// The two shapes compose, because each one hands the expectation down to what it contains.
+test "an expectation reaches a closure inside a List inside a branch" {
+    let _p = probe("build/closure_nested_both.bl", nested_src())
+
+    assert_param_type("zzia", "Int")
+    assert_param_type("zzib", "Str")
+}
+
+// The expectation an argument position carries is the same expectation, so it descends the
+// same way.
+test "a parameter's declared function type reaches a closure in each branch of an argument" {
+    let _p = probe("build/closure_nested_arg.bl", nested_src())
+
+    assert_param_type("zzja", "Int")
+    assert_param_type("zzkb", "Str")
+}
+
+// A parameter the annotation spelled out cannot be reported as one nothing could infer.
+test "a closure parameter a nested expectation names is not reported as under-determined" {
+    let _p = probe("build/closure_nested_quiet.bl", nested_src())
+
+    assert_unreported("zzeb")
+    assert_unreported("zzdb")
+    assert_unreported("zzib")
+    assert_unreported("zzjb")
+}
+
+// The controls. Nothing declares these, so the parameters are genuinely under-determined and
+// the reports must stay.
+test "a closure in a branch under no expectation is still reported as under-determined" {
+    let _p = probe("build/closure_nested_control_if.bl", nested_src())
+
+    // The report lands on the binding and on the second branch: one report per inference
+    // root, and the first branch's parameter shares the binding's root.
+    assert_reported("_u")
+    assert_reported("zzva")
+}
+
+test "a closure in an unannotated List literal is still reported as under-determined" {
+    let _p = probe("build/closure_nested_control_list.bl", nested_src())
+
+    assert_reported("zzwa")
+}
