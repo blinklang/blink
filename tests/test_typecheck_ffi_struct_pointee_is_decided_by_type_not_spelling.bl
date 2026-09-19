@@ -1,0 +1,128 @@
+// Whether `Ptr[T]` has an @ffi.struct pointee is a question about the TYPE, so every spelling
+// of that type must get the same answer. The set recording the annotation was written under
+// the declaration's nominal name and read back two other ways: once through the diagnostic
+// renderer, once through the name exactly as the annotation wrote it. A spelling that reached
+// neither key was rejected as an invalid Ptr parameter even though it named an @ffi.struct.
+//
+// The gate is also the sole thing that types `p.f.read()` and `p.f.write(v)`, so a spelling it
+// misses does not merely lose a diagnostic: the field-access pair stops resolving.
+//
+// The rejecting rows must stay rejecting. Deciding on the type must not widen the closed set
+// of pointees the spec allows, so a plain struct and an unwritten name are checked too.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+let PKG = "build/tc_ffi_pointee_pkg"
+
+fn src_ffimod() -> Str {
+    "@ffi.struct(name: \"atv\")\npub type Sv \{ a: Int \}\n"
+}
+
+fn compile_probe(probe_src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _mk = process_run("mkdir", ["-p", "{PKG}/src"])
+    write_file("{PKG}/blink.toml", "[package]\nname = \"tcffiptr\"\nversion = \"0.1.0\"\n")
+    write_file("{PKG}/src/ffimod.bl", src_ffimod())
+    write_file("{PKG}/src/probe.bl", probe_src)
+    diag_reset()
+    let program = compile_to_program("{PKG}/src/probe.bl", 1)
+    check_types(program)
+}
+
+fn cleanup() {
+    let _rm = process_run("rm", ["-rf", PKG])
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn count_named(name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.name == name {
+            if d.severity == "error" || d.severity == "ice" { n = n + 1 }
+        }
+    }
+    n
+}
+
+// Failures report on stderr: a failing assert aborts, and an abort drops whatever stdout has
+// buffered, which would leave the reader a bare core-dump line and no reason for it.
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.eprintln("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.eprintln("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn assert_named_error(label: Str, name: Str) {
+    let n = count_named(name)
+    if n < 1 {
+        io.eprintln("FAIL: {label}: want at least one {name}, got:")
+        for e in error_messages() { io.eprintln("  {e}") }
+    }
+    assert(n >= 1)
+}
+
+// A pointee spelled any of these ways names the same @ffi.struct declaration.
+
+fn test_a_qualified_ffi_struct_is_a_valid_pointee() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import ffimod\n@trusted(audit: \"probe\")\n@ffi\nfn get() -> Ptr[ffimod.Sv] ! FFI \{ Ptr.null() \}\n@trusted(audit: \"probe\")\nfn main() ! FFI \{ let p = get() io.println(\"\{p.a.read()\}\") \}\n")
+    assert_no_errors("Ptr[ffimod.Sv] written qualified")
+    cleanup()
+}
+
+fn test_a_renamed_ffi_struct_is_a_valid_pointee() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import ffimod.\{Sv as S\}\n@trusted(audit: \"probe\")\n@ffi\nfn get() -> Ptr[S] ! FFI \{ Ptr.null() \}\n@trusted(audit: \"probe\")\nfn main() ! FFI \{ let p = get() io.println(\"\{p.a.read()\}\") \}\n")
+    assert_no_errors("Ptr[S] where S renames ffimod.Sv")
+    cleanup()
+}
+
+// ── Controls: spellings that already worked ──
+
+fn test_a_locally_declared_ffi_struct_is_a_valid_pointee() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("@ffi.struct(name: \"atv\")\ntype Sv \{ a: Int \}\n@trusted(audit: \"probe\")\n@ffi\nfn get() -> Ptr[Sv] ! FFI \{ Ptr.null() \}\n@trusted(audit: \"probe\")\nfn main() ! FFI \{ let p = get() io.println(\"\{p.a.read()\}\") \}\n")
+    assert_no_errors("Ptr[Sv] declared in the same file")
+    cleanup()
+}
+
+fn test_a_selectively_imported_ffi_struct_is_a_valid_pointee() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import ffimod.\{Sv\}\n@trusted(audit: \"probe\")\n@ffi\nfn get() -> Ptr[Sv] ! FFI \{ Ptr.null() \}\n@trusted(audit: \"probe\")\nfn main() ! FFI \{ let p = get() io.println(\"\{p.a.read()\}\") \}\n")
+    assert_no_errors("Ptr[Sv] selected by its own name")
+    cleanup()
+}
+
+// ── Controls: the closed set must not widen ──
+
+// Asking the type instead of the spelling must not admit a pointee the spec excludes. A struct
+// with no @ffi.struct annotation is the nearest thing to one that is allowed.
+fn test_a_struct_without_the_ffi_annotation_is_still_rejected() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("type Plain \{ a: Int \}\n@trusted(audit: \"probe\")\n@ffi\nfn get() -> Ptr[Plain] ! FFI \{ Ptr.null() \}\n@trusted(audit: \"probe\")\nfn main() ! FFI \{ let p = get() io.println(\"\{p.a.read()\}\") \}\n")
+    assert_named_error("Ptr[Plain] over a struct with no @ffi.struct", "InvalidPtrType")
+    cleanup()
+}
+
+fn test_a_name_that_names_no_type_is_still_rejected() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("@trusted(audit: \"probe\")\n@ffi\nfn get() -> Ptr[Nope] ! FFI \{ Ptr.null() \}\n@trusted(audit: \"probe\")\nfn main() ! FFI \{ let p = get() io.println(\"ok\") \}\n")
+    assert_named_error("Ptr[Nope] over an unwritten name", "InvalidPtrType")
+    cleanup()
+}
+
+fn main() {
+    test_a_qualified_ffi_struct_is_a_valid_pointee()
+    test_a_renamed_ffi_struct_is_a_valid_pointee()
+    test_a_locally_declared_ffi_struct_is_a_valid_pointee()
+    test_a_selectively_imported_ffi_struct_is_a_valid_pointee()
+    test_a_struct_without_the_ffi_annotation_is_still_rejected()
+    test_a_name_that_names_no_type_is_still_rejected()
+    io.println("ffi struct pointee by type: ok")
+}

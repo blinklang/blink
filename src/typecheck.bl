@@ -1158,8 +1158,10 @@ let mut tc_variant_enum_decl_nodes: Map[Str, Int] = Map()
 // Dedupe so each colliding name is reported once, not per use site.
 let mut tc_collision_reported: Map[Str, Int] = Map()
 
-// Names of @ffi.struct types (consulted by is_valid_ptr_inner so Ptr[T] is allowed for them).
-let mut ffi_struct_type_set: Map[Str, Int] = Map()
+// Tids of @ffi.struct types, so Ptr[T] is allowed for them. Keyed by tid, not by name: a
+// declaration has one type but many spellings, and a name key answers only the spelling that
+// happens to match the one the writer chose.
+let mut ffi_struct_type_set: Map[Int, Int] = Map()
 
 // Names of @ffi.opaque handle types. Consulted by is_valid_ptr_inner so an
 // out-param `Ptr[Handle]` (the `<c_name>**` mint shape) is a legal FFI inner
@@ -7320,7 +7322,7 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
     named_type_map.insert(name, tid)
     tc_struct_decl_nodes.insert(name, td)
     if has_annotation(td, "ffi.struct") != 0 {
-        ffi_struct_type_set.insert(name, 1)
+        ffi_struct_type_set.insert(tid, 1)
     }
 
     if has_annotation(td, "ffi.opaque") != 0 {
@@ -8140,7 +8142,18 @@ fn tc_ptr_ffi_struct_pointee(ptr_tid: Int) -> Int {
     // `p.f` types while `p.f.read()` rejects on the field's own type.
     let pointee = tc_resolve(ty_pool.get(pt).unwrap().inner1)
     if pointee < 0 { return 0 }
-    if ffi_struct_type_set.contains_key(strip_module_qualifier(type_to_str(pointee))) != 0 { return 1 }
+    if ffi_struct_type_set.contains_key(pointee) != 0 { return 1 }
+    0
+}
+
+// Does the pointee written as `name` name an @ffi.struct? Resolved to a tid first, because the
+// annotation's spelling is not the declaration's: a qualified `m.Sv` and an alias introduced by
+// `import m.{Sv as S}` both name the declaration without matching any key it could be filed
+// under. The other reader of the set holds a tid already, so both now ask one question.
+fn tc_name_is_ffi_struct(name: Str) -> Int {
+    let t = lookup_named_type(name)
+    if t < 0 { return 0 }
+    if ffi_struct_type_set.contains_key(tc_resolve(t)) != 0 { return 1 }
     0
 }
 
@@ -8149,7 +8162,7 @@ fn is_valid_ptr_inner(name: Str) -> Int {
     if name == "U8" || name == "U16" || name == "U32" || name == "U64" { return 1 }
     if name == "I8" || name == "I16" || name == "I32" || name == "I64" { return 1 }
     if name == "Int" || name == "Float" || name == "Ptr" { return 1 }
-    if ffi_struct_type_set.contains_key(name) != 0 { return 1 }
+    if tc_name_is_ffi_struct(name) != 0 { return 1 }
     if ffi_opaque_type_set.contains_key(name) != 0 { return 1 }
     0
 }
