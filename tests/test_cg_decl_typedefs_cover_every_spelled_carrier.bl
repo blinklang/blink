@@ -1,0 +1,93 @@
+// A carrier or tuple that no declaration owns still needs a C typedef, and the only thing
+// that decides it needs one is that some position in the program spells it. Today the
+// typedef walk enumerates declarations, so a carrier reached only through a local
+// annotation, a match scrutinee or a binder is never reached at all.
+//
+// The use sites do ask for it: cg_stmt calls ensure_typedef_for, which builds the block
+// into layout's buffer. Nothing drains that buffer -- print_typedef_blocks has one caller,
+// inside the declaration walk -- so the block is built and thrown away, and the emitted C
+// names a type it never defined. That is the whole "unknown type name" bucket.
+//
+// The rows below name the carriers by their C spelling, because that spelling is what the
+// C compiler looks up and fails to find.
+
+import std.fs
+import std.io
+import layout.{layout_reset}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_decl.{cg_decl_reset, cg_decl_emit_typedefs}
+import cg_test_helpers.{cg_probe_compile}
+
+fn assert_has(text: Str, needle: Str) {
+    let i = text.index_of(needle)
+    if i < 0 { io.println("FAIL: typedef output has no '{needle}'") }
+    assert(i >= 0)
+}
+
+// Every carrier and tuple here is spelled ONLY inside a function body: a local's type
+// annotation, or the scrutinee of a match. None of them is a field of any declaration and
+// none appears in a signature, so the declaration walk cannot reach one.
+fn probe_src() -> Str {
+    #"type Point { x: Int, y: Int }
+
+fn main() {
+    let nested: Result[Result[Int, Str], Str] = Ok(Ok(5))
+    match nested {
+        Ok(inner) => assert(inner.is_ok())
+        Err(e) => assert(e == "")
+    }
+    let pair: (Point, Int) = (Point { x: 1, y: 2 }, 3)
+    match pair {
+        (p, n) => assert(p.x + n == 4)
+    }
+    let maybe: Option[Point] = Some(Point { x: 9, y: 9 })
+    match maybe {
+        Some(p) => assert(p.y == 9)
+        None => assert(false)
+    }
+}
+"#
+}
+
+// The probe is deleted BEFORE any assertion so a red row never leaves the file behind.
+fn typedef_text() -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/cg_decl_spelled_carrier_probe_src.bl"
+    let program = cg_probe_compile(path, probe_src())
+    layout_reset()
+    let _ = fs.delete(path)
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    cg_decl_emit_typedefs()
+    print_take()
+}
+
+// A carrier whose payload is another carrier. The inner one is a runtime type and is
+// already emitted; the outer one exists only because this local spells it.
+test "a carrier over a carrier spelled by a local annotation is emitted" {
+    assert_has(typedef_text(), "} blink_Result_Result_int_str_str;")
+}
+
+// A tuple is structural, so nothing declares it. Its element being a user struct is what
+// makes the missing typedef fatal rather than merely absent.
+test "a tuple over a user struct spelled by a local annotation is emitted" {
+    assert_has(typedef_text(), "} blink_Tuple2_Point_int;")
+}
+
+test "a carrier over a user struct spelled by a local annotation is emitted" {
+    assert_has(typedef_text(), "} blink_Option_Point;")
+}
+
+// The member a structural carrier names must be complete where the carrier names it, the
+// same rule the declaration walk already follows.
+test "the struct a spelled carrier names is emitted before the carrier" {
+    let text = typedef_text()
+    let leaf = text.index_of("} blink_Point;")
+    let outer = text.index_of("} blink_Option_Point;")
+    if leaf < 0 || outer < 0 || leaf >= outer {
+        io.println("FAIL: Point at {leaf} must come before Option_Point at {outer}")
+    }
+    assert(leaf >= 0 && outer >= 0 && leaf < outer)
+}
