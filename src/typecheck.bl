@@ -4,7 +4,7 @@ import parser.{
     ann_str_val, get_annotation, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
     node_effects, node_elements, node_else_body, node_end, node_fields, node_for_binder, node_guard,
-    node_count, node_handlers, node_index, node_int_val, node_is_mut, node_is_pub, node_iterable, node_kind,
+    node_count, node_handlers, node_index, node_int_val, node_is_mut, node_is_const, node_is_pub, node_iterable, node_kind,
     node_left, node_line, node_method, node_methods, node_module, node_name, node_obj,
     node_op, node_params, node_pattern, node_return_type, node_right, node_scrutinee,
     node_start, node_stmts, node_str_val, node_target, node_then_body, node_trait_name,
@@ -17,7 +17,7 @@ import parser.{
 }
 import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_no_loc,
-    diag_push_allows, diag_enter_allows, diag_exit_allows,
+    diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
     diag_warn_at, diag_truncate, diag_entry_count, diag_ice_at, diag_count,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION,
     POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT,
@@ -17574,6 +17574,38 @@ fn tc_check_missing_tail_value(body: Int, declared_ret: Int, owner_name: Str, at
 // forms it can decide on the node alone. A bare identifier is ACCEPTED: deciding whether a
 // name is a `const` needs resolution this pass does not run, and rejecting every name would
 // refuse the `const DEFAULT_PORT` spelling the section names as correct.
+// Whether a NAME is const where it is written. §2.21 admits another `const` by name and
+// refuses a `let`, so the two have to be told apart, and only the declaration can tell them
+// apart: both are LetBinding nodes and the const flag is the difference. A name this scope
+// cannot see is not judged — an enum variant written bare, and an import, both arrive here
+// with no local binding, and refusing what cannot be seen would refuse correct programs.
+fn tc_name_is_const_binding(name: Str) -> Int {
+    if nr_has_binding(name) == 0 { return 1 }
+    let d = nr_binding_node(name)
+    if d == -1 { return 1 }
+    if node_kind(d) != NodeKind.LetBinding { return 1 }
+    node_is_const(d)
+}
+
+fn tc_args_are_const(args_sl: Int) -> Int {
+    if args_sl == -1 { return 1 }
+    let mut i = 0
+    while i < sublist_length(args_sl) {
+        if tc_is_const_expr(sublist_get(args_sl, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    1
+}
+
+// Enum-variant construction is const with const payloads; every other call is not, and the
+// two are written the same way. The variant table answers for a user enum, and the carriers
+// are named because they are variants the language declares rather than the program.
+fn tc_name_is_variant_ctor(name: Str) -> Int {
+    if name == "Some" || name == "Ok" || name == "Err" || name == "None" { return 1 }
+    if tc_variant_enum_decl_nodes.contains_key(name) != 0 { return 1 }
+    0
+}
+
 fn tc_is_const_expr(e: Int) -> Int {
     if e == -1 { return 0 }
     let k = node_kind(e)
@@ -17581,7 +17613,31 @@ fn tc_is_const_expr(e: Int) -> Int {
     if k == NodeKind.FloatLit { return 1 }
     if k == NodeKind.BoolLit { return 1 }
     if k == NodeKind.CharLit { return 1 }
-    if k == NodeKind.Ident { return 1 }
+    if k == NodeKind.Ident { return tc_name_is_const_binding(node_name(e)) }
+    // A call is outside the set unless it is building a variant. `Map()` is refused here and
+    // not by a list of collection names: what rules it out is that it is a call at all.
+    // The callee is the left child, not the node's own name, which a Call leaves empty.
+    if k == NodeKind.Call {
+        let callee = node_left(e)
+        if callee == -1 { return 0 }
+        let ck = node_kind(callee)
+        if ck != NodeKind.Ident && ck != NodeKind.FieldAccess { return 0 }
+        if tc_name_is_variant_ctor(node_name(callee)) == 0 { return 0 }
+        return tc_args_are_const(node_args(e))
+    }
+    // `Level.Info` is a payload-free variant, and `mod.NAME` is a const named through its
+    // module. Both read as a field access, so anything that is not a variant is as const as
+    // the base it reads from.
+    if k == NodeKind.FieldAccess {
+        if tc_name_is_variant_ctor(node_name(e)) != 0 { return 1 }
+        return tc_is_const_expr(node_obj(e))
+    }
+    // `Level.Info(1)` parses as a method call on the type, so a method name that is a variant
+    // is construction and everything else is the method call §2.21 names.
+    if k == NodeKind.MethodCall {
+        if tc_name_is_variant_ctor(node_method(e)) == 0 { return 0 }
+        return tc_args_are_const(node_args(e))
+    }
     if k == NodeKind.UnaryOp { return tc_is_const_expr(node_left(e)) }
     if k == NodeKind.BinOp {
         if tc_is_const_expr(node_left(e)) == 0 { return 0 }
@@ -17599,6 +17655,12 @@ fn tc_is_const_expr(e: Int) -> Int {
         }
         return 1
     }
+    // §2.21 enumerates a closed set and is silent on these three. `#embed` is read by the
+    // compiler and can be nothing else, and a bracket literal of const elements is written in
+    // the tree today, so refusing either would refuse correct code the section never rules out.
+    if k == NodeKind.EmbedExpr { return 1 }
+    if k == NodeKind.ListLit { return tc_args_are_const(node_elements(e)) }
+    if k == NodeKind.TupleLit { return tc_args_are_const(node_elements(e)) }
     if k == NodeKind.StructLit {
         let flds = node_fields(e)
         if flds == -1 { return 1 }
@@ -17610,6 +17672,19 @@ fn tc_is_const_expr(e: Int) -> Int {
         return 1
     }
     0
+}
+
+// §2.21: a const is evaluated while compiling and written in at every use, so a right-hand
+// side the compiler cannot evaluate leaves nothing to write in. Reported against the value
+// rather than the binding, because the value is the part to change.
+fn tc_check_const_decl(node: Int) ! Diag.Report {
+    if node_is_const(node) == 0 { return }
+    let v = node_value(node)
+    if v == -1 { return }
+    if tc_is_const_expr(v) != 0 { return }
+    diag_error_at("NonConstExpr", NON_CONST_EXPR,
+        "the value of const '{node_name(node)}' is not a compile-time constant", v,
+        "const values are literals, arithmetic and boolean operators over them, other consts by name, struct literals with const fields, and enum variants; calls of any kind and `let` bindings are not")
 }
 
 // §2.13 allows a default value only on a parameter declared after `--`, and §2.21 requires
@@ -18386,6 +18461,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let vname = node_name(node)
         let val = node_value(node)
         let is_mut = node_is_mut(node)
+        tc_check_const_decl(node)
 
         let type_str = node_type_name(node)
         let type_ann = node_target(node)
@@ -19829,6 +19905,10 @@ fn tc_infer_global_initializers(lets_sl: Int) ! TypeCheck.Resolve, TypeCheck.Rep
     let mut i = 0
     while i < sublist_length(lets_sl) {
         let l = sublist_get(lets_sl, i)
+        // Here and not in the first pass: the first pass has not registered the function
+        // names yet, so a name this check asks about could not be told apart from an
+        // undefined one.
+        tc_check_const_decl(l)
         let l_val = node_value(l)
         if l_val != -1 {
             if node_target(l) != -1 || node_type_name(l) != "" {
