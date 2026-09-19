@@ -34,7 +34,7 @@ import typecheck.{
     tc_struct_field_slots, tc_sfield_name,
     tc_names_a_type, tc_is_sealed_list_hof, is_user_effect_handle_name,
     tc_lookup_node_tid, tc_unclaimed_call_tid, tc_list_rename_help, tc_tid_iter_elem,
-    tc_call_decl_node,
+    tc_call_decl_node, tc_tid_name,
     TYPE_INT, TYPE_BOOL, TYPE_STR,
 }
 import layout.{
@@ -55,12 +55,15 @@ import cname.{
     c_container_ctor,
 }
 import ir.{
-    ir_call_direct, ir_call_runtime, ir_call_closure, ir_cast, ir_unary, ir_unbox, ir_box,
-    ir_assign, ir_binary, ir_block, ir_carrier_tag, ir_carrier_wrap,
-    ir_const, ir_if, ir_let, ir_panic, ir_struct_new, ir_var_ref, ir_field_get,
+    ir_call_direct, ir_call_runtime, ir_call_closure, ir_call_indirect, ir_cast, ir_unary, ir_unbox, ir_box,
+    ir_assign, ir_binary, ir_block, ir_break, ir_carrier_tag, ir_carrier_wrap,
+    ir_const, ir_global_ref, ir_if, ir_let, ir_loop, ir_panic, ir_struct_new, ir_var_ref, ir_field_get,
     ir_enum_new, ir_container_new,
 }
-import cg_expr.{lower_expr, cg_expr_push_pending, x_unbox_payload, x_layout_checked}
+import cg_expr.{
+    lower_expr, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
+    x_unbox_payload, x_layout_checked,
+}
 import cg_stmt.{lower_block_into}
 import cg_eff.{cg_eff_ev_argument, cg_eff_lower_builtin_perform, cg_eff_lower_user_perform}
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
@@ -2142,15 +2145,179 @@ fn cc_key_address(node: Int, plan: KeyPlan, value: Int) -> Int ! Diag.Report {
     ir_unary(plan.tid, node, address_layout_of(plan.tid, Position.Local).c_spelling, "&", held)
 }
 
+// How a value already in hand travels to reach the runtime, decided by the plan alone. A
+// scan's per-element read shares this with a written key argument: both are a value this
+// stage already holds, and the plan does not know or care which of the two produced it.
+fn cc_key_travel(node: Int, plan: KeyPlan, value: Int) -> Int ! Diag.Report {
+    match plan.travel {
+        KeyTravel.Skipped => value
+        KeyTravel.Value => value
+        KeyTravel.Address => cc_key_address(node, plan, value)
+        KeyTravel.Boxed => ir_box(plan.tid, node, plan.slot.c_spelling, plan.value.c_spelling, value)
+    }
+}
+
 fn cc_key_arg(node: Int, plan: KeyPlan, written: Int) -> Int ! Diag.Report {
     let a = lower_expr(written)
     if a < 0 { return -1 }
-    match plan.travel {
-        KeyTravel.Skipped => a
-        KeyTravel.Value => a
-        KeyTravel.Address => cc_key_address(node, plan, a)
-        KeyTravel.Boxed => ir_box(plan.tid, node, plan.slot.c_spelling, plan.value.c_spelling, a)
+    cc_key_travel(node, plan, a)
+}
+
+// ── Element scans ─────────────────────────────────────────────────────────
+//
+// `List.contains` walks the elements comparing each to the one the call was written with,
+// through the runtime's own table for the element's kind -- the same tables a Map or a Set
+// key already travels through to reach the runtime. The spec permits this scan for exactly
+// the four primitive element kinds a scalar table exists for -- Int, Bool, Str, Float --
+// and refuses every other kind, struct/enum included, whether or not the type happens to
+// carry a table of its own: deriving Hash earns a struct a table for a keyed container's
+// slot, not for this scan, so a struct's own table is never consulted here. An element is
+// also never boxed into a slot and never stored, so of the four ways a key can travel this
+// only ever takes Value (a Str reads its slot's pointer as itself) or Address (Int, Bool
+// and Float read through the address of a local) -- never Skipped or Boxed.
+
+// Every layout question an element raises, asked in one place and before anything is
+// built. The table this answers is deliberately the same KeyPlan a keyed container plans
+// with: the shape of the question -- has the element a type, is that type one this scan is
+// permitted over, does a Str read differently from everything else -- is identical, and
+// only the wording of a refusal is a List's own.
+fn cc_element_plan(node: Int, container: Int) -> KeyPlan ! Diag.Report {
+    let nothing = layout_of(-1, Position.Local)
+    let stopped = KeyPlan { travel: KeyTravel.Skipped, tid: -1, value: nothing, slot: nothing }
+    let elem = child_tid(container, Slot.Inner1)
+    if elem < 0 {
+        cc_element_type_unrecorded(node, TyKind.List)
+        return stopped
     }
+    let k = cc_kind(elem)
+    if k != TyKind.Int && k != TyKind.Bool && k != TyKind.Str && k != TyKind.Float {
+        cc_element_not_primitive(node, elem)
+        return stopped
+    }
+    let value = cc_local(elem, node)
+    if cc_stopped(value) { return stopped }
+    if value.kops_table == "" {
+        cc_element_has_no_ops(node, elem)
+        return stopped
+    }
+    if k == TyKind.Str {
+        return KeyPlan { travel: KeyTravel.Value, tid: elem, value: value, slot: value }
+    }
+    KeyPlan { travel: KeyTravel.Address, tid: elem, value: value, slot: value }
+}
+
+// The element type List.contains does not support at all: anything outside the spec's
+// four primitive kinds (Int, Bool, Str, Float), struct and enum included, whether or not
+// the type happens to carry a table of its own -- deriving Hash earns a struct a table for
+// a keyed container's slot, never for this scan. Typecheck is meant to reject this outright,
+// before this stage ever runs; this refusal exists in case it does not, so a struct or an
+// enum element never silently compiles to a wrong answer.
+fn cc_element_not_primitive(node: Int, elem_tid: Int) -> Int ! Diag.Report {
+    diag_ice_at("ElementNotPrimitive", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "a contains scan compares elements through Int, Bool, Str or Float's table; {tc_tid_name(elem_tid)} is not a primitive element type",
+        node, "typecheck must reject a List.contains element type outside Int, Bool, Str, Float; this is a compiler bug")
+    -1
+}
+
+// The backstop for a kind the spec DOES permit, in the one case the runtime does not, in
+// fact, ship that kind's table -- distinct from cc_element_not_primitive above, which
+// refuses a kind the spec never permitted in the first place. Unreached by anything the
+// standard library ships today, since all four primitive kinds carry a table.
+fn cc_element_has_no_ops(node: Int, elem_tid: Int) -> Int ! Diag.Report {
+    diag_ice_at("ElementOperationsNotAvailable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "a scan over {tc_tid_name(elem_tid)} elements has no table of the operations they are compared by",
+        node, "the runtime does not ship a kops table for this element kind; this is a compiler bug")
+    -1
+}
+
+// The C shape of the two function-pointer fields a kops table declares. Every reader of a
+// table -- the runtime's own scalar tables, and the one @derive(Hash) writes for a struct
+// or an enum -- declares the same `blink_kops`, so one pair of spellings serves every kind
+// of element this reads a table for.
+let kops_table_spelling = "const blink_kops"
+let kops_eq_fn_spelling = "int (*)(const void *, const void *)"
+
+// `xs.contains(x)`: a loop over the elements that reads and compares one per turn through
+// the element's own kops table, stopping the first time the comparison answers true. The
+// receiver, its length and the index are each bound once ahead of the loop, exactly as
+// lower_for_indexed binds them for a for-in over the same container, and for the same
+// reason -- an append inside a comparison the element's Eq performs must not change how
+// many turns run, and a `continue` there (were one ever reachable from an operand) must
+// not skip the step. There is no such operand here, but the shape is kept identical to the
+// loop this mirrors rather than simplified on the strength of that.
+fn cc_element_scan(node: Int, container: Int) -> Int ! Diag.Report {
+    let plan = cc_element_plan(node, container)
+    if cc_key_stopped(plan) { return -1 }
+    let recv_rec = cc_local(container, node)
+    if cc_stopped(recv_rec) { return -1 }
+    let idx_rec = cc_local(TYPE_INT, node)
+    if cc_stopped(idx_rec) { return -1 }
+    let len_rec = cc_local(TYPE_INT, node)
+    if cc_stopped(len_rec) { return -1 }
+    let found_rec = cc_local(TYPE_BOOL, node)
+    if cc_stopped(found_rec) { return -1 }
+    let recv_val = lower_expr(node_obj(node))
+    if recv_val < 0 { return -1 }
+
+    let recv_name = c_mint_local("cs")
+    cg_expr_push_pending(node, ir_let(container, node, recv_rec.c_spelling, recv_name, recv_rec.slot_form, recv_val))
+    let len_name = c_mint_local("cs")
+    cg_expr_push_pending(node, ir_let(TYPE_INT, node, len_rec.c_spelling, len_name, len_rec.slot_form,
+        ir_call_runtime(TYPE_INT, node, len_rec.c_spelling, c_runtime_helper("list_len"), len_rec.slot_form,
+            [cc_temp_ref(node, container, recv_rec, recv_name)])))
+    let idx_name = c_mint_local("cs")
+    cg_expr_push_pending(node, ir_let(TYPE_INT, node, idx_rec.c_spelling, idx_name, idx_rec.slot_form,
+        ir_const(TYPE_INT, node, idx_rec.c_spelling, "-1")))
+    let found_name = c_mint_local("cs")
+    cg_expr_push_pending(node, ir_let(TYPE_BOOL, node, found_rec.c_spelling, found_name, found_rec.slot_form,
+        ir_const(TYPE_BOOL, node, found_rec.c_spelling, "0")))
+
+    // The needle is lowered and, if its type travels by address, bound to a local of its
+    // own -- once, ahead of the loop, exactly as a Map or a Set lookup already binds one.
+    let needle = cc_key_arg(node, plan, sublist_get(node_args(node), 0))
+    if needle < 0 { return -1 }
+
+    let step = ir_assign(node, cc_temp_ref(node, TYPE_INT, idx_rec, idx_name),
+        ir_binary(TYPE_INT, node, idx_rec.c_spelling, "+",
+            cc_temp_ref(node, TYPE_INT, idx_rec, idx_name), ir_const(TYPE_INT, node, idx_rec.c_spelling, "1")))
+    let guard = ir_if(node,
+        ir_binary(TYPE_BOOL, node, idx_rec.c_spelling, ">=",
+            cc_temp_ref(node, TYPE_INT, idx_rec, idx_name), cc_temp_ref(node, TYPE_INT, len_rec, len_name)),
+        ir_block(node, [ir_break(node)]), -1)
+
+    let read = cg_call_element_from_runtime(node, plan.tid, c_runtime_helper("list_get"),
+        [cc_temp_ref(node, container, recv_rec, recv_name), cc_temp_ref(node, TYPE_INT, idx_rec, idx_name)])
+    if read < 0 { return -1 }
+
+    // The element's address (when its type travels by one) has to be the address of a
+    // local bound INSIDE this turn of the loop, not of one bound ahead of it as the
+    // receiver and the needle are: a fresh element is read every turn, so a local bound
+    // once outside the loop would freeze the first turn's address for every comparison
+    // after it. Marking and draining the pending buffer around this one call is what pulls
+    // that local's own Let out of the buffer a statement in front of the loop would
+    // otherwise take it from, and into the block this function is still building.
+    let elem_mark = cg_expr_pending_count()
+    let elem_arg = cc_key_travel(node, plan, read)
+    if elem_arg < 0 { return -1 }
+    let elem_binds = cg_expr_take_pending(elem_mark)
+
+    let eq_fn = ir_field_get(TYPE_INT, node, kops_eq_fn_spelling, "eq", SlotForm.Inline,
+        ir_global_ref(TYPE_INT, node, kops_table_spelling, plan.value.kops_table, SlotForm.Inline))
+    let hit = ir_binary(TYPE_BOOL, node, found_rec.c_spelling, "!=",
+        ir_call_indirect(TYPE_INT, node, "int", SlotForm.Inline, eq_fn, [elem_arg, needle]),
+        ir_const(TYPE_INT, node, "int", "0"))
+    let matched = ir_if(node, hit,
+        ir_block(node, [
+            ir_assign(node, cc_temp_ref(node, TYPE_BOOL, found_rec, found_name),
+                ir_const(TYPE_BOOL, node, found_rec.c_spelling, "1")),
+            ir_break(node),
+        ]), -1)
+
+    let mut body: List[Int] = [step, guard]
+    for bind in elem_binds { body.push(bind) }
+    body.push(matched)
+    cg_expr_push_pending(node, ir_loop(node, ir_block(node, body)))
+    cc_temp_ref(node, TYPE_BOOL, found_rec, found_name)
 }
 
 // What the runtime hands back, and what the call answers with it.
@@ -3154,13 +3321,17 @@ fn cc_pointer_body_not_lowered(node: Int) -> Int ! Diag.Report {
     -1
 }
 
-// The three List methods that are not one call. `get` and `pop` both answer a carrier
-// filled behind a test the runtime cannot make for them, which is the same gap the index
-// read already names. `contains` walks the elements comparing each, which is a loop and a
-// choice of comparison, and the runtime publishes no primitive for it.
+// The two List methods that are not one call, plus the scan. `get` and `pop` both answer
+// a carrier filled behind a test the runtime cannot make for them, which is the same gap
+// the index read already names. `contains` walks the elements comparing each through the
+// element's own table of operations, which cc_element_scan builds as a loop.
 fn cc_list_not_built(node: Int, method: Str) -> Int ! Diag.Report {
     if method == "get" || method == "pop" { return cc_checked_read(node) }
-    if method == "contains" { return cc_element_scan_not_lowered(node) }
+    if method == "contains" {
+        let container = tid_of_node(node_obj(node))
+        if container < 0 { return -1 }
+        return cc_element_scan(node, container)
+    }
     cc_intrinsic_not_built(node, TyKind.List, method)
 }
 
@@ -3211,17 +3382,6 @@ fn cc_list_hof_no_body(node: Int, method: Str) -> Int ! Diag.Report {
 
 let list_hof_prefix = "list_"
 let list_hof_module = "std_list"
-
-
-// A scan over the elements. It is a loop over statements and a comparison chosen per
-// element type, so no one call names it and no layout answer decides it.
-fn cc_element_scan_not_lowered(node: Int) -> Int ! Diag.Report {
-    diag_ice_at("ElementScanNotLowered", CODEGEN_STAGE_NOT_BUILT,
-        "a scan that compares each element has no lowering here", node,
-        "the loop and the comparison it makes are statements cg_expr must hoist")
-    -1
-}
-
 
 // `join` over an element `str_join` cannot read. The call would hand the runtime a slot
 // holding something other than a string pointer, which it would follow anyway.
