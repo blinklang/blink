@@ -1,0 +1,181 @@
+// `List.contains` is a linear scan over element equality, and the language defines element
+// equality only for Int, Bool, Str and Float. On a struct, an enum or a nested collection
+// `==` is pointer identity, not field-wise value equality, so a scan over one answers a
+// question the program did not ask and answers it wrong.
+//
+// The spec says so twice, at sections/03_types.md:339 and :527: those element types are
+// UnresolvedMethod until value equality lands. Typecheck accepted them and typed the call
+// Bool, so the program compiled and the refusal, if it came at all, came from codegen with
+// no source location worth reading.
+//
+// The rows below fix both halves: what is refused, and what must keep working.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    init_embedded_stdlib()
+    let path = "/tmp/zz_lc_{stem}.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out = out.concat("{d.name}: {d.message}\n") }
+    }
+    out
+}
+
+fn assert_refused(stem: Str, src: Str, want_type: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let errs = probe(stem, src)
+    let want = "UnresolvedMethod: unresolved method '.contains' on type {want_type}"
+    if !errs.contains(want) { io.println("FAIL: {stem}: want '{want}', got:\n{errs}") }
+    assert(errs.contains(want))
+}
+
+fn assert_accepted(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let errs = probe(stem, src)
+    if errs != "" { io.println("FAIL: {stem}: unexpected diagnostics:\n{errs}") }
+    assert(errs == "")
+}
+
+fn struct_src() -> Str {
+    #"type Pt { x: Int }
+
+fn main() {
+    let xs: List[Pt] = [Pt { x: 1 }]
+    let hit = xs.contains(Pt { x: 1 })
+    io.println("{hit}")
+}
+"#
+}
+
+fn enum_src() -> Str {
+    #"type Tag {
+    A
+    B
+}
+
+fn main() {
+    let xs: List[Tag] = [Tag.A]
+    let hit = xs.contains(Tag.B)
+    io.println("{hit}")
+}
+"#
+}
+
+fn nested_list_src() -> Str {
+    #"fn main() {
+    let xs: List[List[Int]] = [[1, 2]]
+    let hit = xs.contains([1, 2])
+    io.println("{hit}")
+}
+"#
+}
+
+fn nested_map_src() -> Str {
+    #"fn main() {
+    let m: Map[Str, Int] = Map()
+    let xs: List[Map[Str, Int]] = [m]
+    let hit = xs.contains(m)
+    io.println("{hit}")
+}
+"#
+}
+
+fn nested_set_src() -> Str {
+    #"fn main() {
+    let s: Set[Str] = Set()
+    let xs: List[Set[Str]] = [s]
+    let hit = xs.contains(s)
+    io.println("{hit}")
+}
+"#
+}
+
+fn option_src() -> Str {
+    #"fn main() {
+    let xs: List[Option[Int]] = [Some(1)]
+    let hit = xs.contains(Some(1))
+    io.println("{hit}")
+}
+"#
+}
+
+fn tuple_src() -> Str {
+    #"fn main() {
+    let xs: List[(Int, Int)] = [(1, 2)]
+    let hit = xs.contains((1, 2))
+    io.println("{hit}")
+}
+"#
+}
+
+fn primitives_src() -> Str {
+    #"fn main() {
+    let ints = [1, 2, 3]
+    let bools = [true, false]
+    let strs = ["a", "b"]
+    let floats = [1.5, 2.5]
+    io.println("{ints.contains(2)} {bools.contains(true)} {strs.contains("a")} {floats.contains(1.5)}")
+}
+"#
+}
+
+// The refusal is about List's linear scan over `==`. A Set hashes its elements and a Map
+// looks its key up, so neither is reached by this rule and neither may be broken by it.
+fn other_receivers_src() -> Str {
+    #"type Pt { x: Int }
+
+fn main() {
+    let s: Set[Str] = Set()
+    let m: Map[Str, Int] = Map()
+    let text = "hello"
+    io.println("{s.contains("a")} {m.contains("k")} {text.contains("ell")}")
+}
+"#
+}
+
+test "a list of structs refuses contains" {
+    assert_refused("struct", struct_src(), "List[Pt]")
+}
+
+test "a list of enums refuses contains" {
+    assert_refused("enum", enum_src(), "List[Tag]")
+}
+
+test "a list of lists refuses contains" {
+    assert_refused("nested_list", nested_list_src(), "List[List[Int]]")
+}
+
+test "a list of maps refuses contains" {
+    assert_refused("nested_map", nested_map_src(), "List[Map[Str, Int]]")
+}
+
+test "a list of sets refuses contains" {
+    assert_refused("nested_set", nested_set_src(), "List[Set[Str]]")
+}
+
+test "a list of options refuses contains" {
+    assert_refused("option", option_src(), "List[Option[Int]]")
+}
+
+test "a list of tuples refuses contains" {
+    assert_refused("tuple", tuple_src(), "List[(Int, Int)]")
+}
+
+// The other half of the rule. Refusing one element type must not cost the four the spec
+// names, or the gate is a regression dressed as a fix.
+test "the four primitive element types still answer contains" {
+    assert_accepted("primitives", primitives_src())
+}
+
+test "Set, Map and Str keep their own contains" {
+    assert_accepted("other_receivers", other_receivers_src())
+}
