@@ -1,0 +1,127 @@
+// A generic type declaration is a template with no C shape of its own, so this unit writes
+// no typedef for it. Its instances are the types that have a shape, and each of them needs
+// a typedef of its own before anything names it: a struct member spelled `blink_Box_0Int`
+// is an incomplete type at that point unless the instance's own typedef came first.
+//
+// The instances are not written down anywhere in the source, so the list of them is the
+// monomorphization pass's answer and the order of them is the type graph's answer. Neither
+// one is the order the pass discovered them in, because a member of one instance can be
+// another instance the pass happened to reach later.
+
+import std.fs
+import std.io
+import layout.{layout_reset}
+import mono.{run_mono}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_decl.{cg_decl_reset, cg_decl_emit_typedefs}
+import cg_test_helpers.{cg_probe_compile, cg_text_occurrences}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+// Box is instantiated at two arguments, one of which is the other instance, so no single
+// discovery order puts both in a usable order by luck. Slot embeds an instance the source
+// never names on its own. Uses is monomorphic and embeds all four by value, so every
+// instance typedef has a later use to come before.
+fn probe_src() -> Str {
+    #"type Box[T] { inner: T }
+type Slot[T] { held: Box[T] }
+type Maybe[T] {
+    Nothing
+    Just(v: T)
+}
+type Uses { b: Box[Int], n: Box[Box[Int]], s: Slot[Int], m: Maybe[Int] }
+fn main() {
+    let u = Uses {
+        b: Box { inner: 1 },
+        n: Box { inner: Box { inner: 2 } },
+        s: Slot { held: Box { inner: 3 } },
+        m: Just(4),
+    }
+    assert(u.b.inner == 1)
+}
+"#
+}
+
+// The probe is deleted BEFORE any assertion so a red row never leaves the file behind.
+fn typedef_text() -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/cg_decl_mono_instance_typedefs_probe_src.bl"
+    let program = cg_probe_compile(path, probe_src())
+    let _ = fs.delete(path)
+    run_mono(program)
+    layout_reset()
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    cg_decl_emit_typedefs()
+    print_take()
+}
+
+fn at(text: Str, needle: Str) -> Int {
+    let i = text.index_of(needle)
+    if i < 0 {
+        io.println("FAIL: typedef output has no '{needle}'")
+    }
+    assert(i >= 0)
+    i
+}
+
+fn assert_before(text: Str, first: Str, second: Str) {
+    let a = at(text, first)
+    let b = at(text, second)
+    if a >= b {
+        io.println("FAIL: '{first}' at {a} must come before '{second}' at {b}")
+    }
+    assert(a < b)
+}
+
+test "every instance the mono pass registered gets a typedef" {
+    let text = typedef_text()
+    assert_eq_int("one Box[Int] typedef", cg_text_occurrences(text, "} blink_Box_0Int;"), 1)
+    assert_eq_int("one Box[Box[Int]] typedef", cg_text_occurrences(text, "} blink_Box_0Box_10Int;"), 1)
+    assert_eq_int("one Slot[Int] typedef", cg_text_occurrences(text, "} blink_Slot_0Int;"), 1)
+    assert_eq_int("one Maybe[Int] typedef", cg_text_occurrences(text, "} blink_Maybe_0Int;"), 1)
+}
+
+// A template has no C shape: writing one under the base name would give the members the
+// type of a free type variable, which has no spelling at all.
+test "the generic base itself gets no typedef" {
+    let text = typedef_text()
+    assert_eq_int("no bare Box typedef", cg_text_occurrences(text, "} blink_Box;"), 0)
+    assert_eq_int("no bare Slot typedef", cg_text_occurrences(text, "} blink_Slot;"), 0)
+    assert_eq_int("no bare Maybe typedef", cg_text_occurrences(text, "} blink_Maybe;"), 0)
+}
+
+// A member is named by the instance's own arguments, not by the declaration's binders.
+test "an instance member is spelled at the instance arguments" {
+    let text = typedef_text()
+    let box_int = at(text, "} blink_Box_0Int;")
+    assert(text.slice(0, box_int).index_of("int64_t inner") >= 0)
+    let nested = at(text, "} blink_Box_0Box_10Int;")
+    assert(text.slice(0, nested).index_of("blink_Box_0Int inner") >= 0)
+    let slot = at(text, "} blink_Slot_0Int;")
+    assert(text.slice(0, slot).index_of("blink_Box_0Int held") >= 0)
+}
+
+// The member instance must be complete where the embedding typedef names it, and the
+// embedding one can be discovered first, so the order is read off the type graph.
+test "an instance embedded in another instance is emitted first" {
+    let text = typedef_text()
+    assert_before(text, "} blink_Box_0Int;", "} blink_Box_0Box_10Int;")
+    assert_before(text, "} blink_Box_0Int;", "} blink_Slot_0Int;")
+}
+
+// A monomorphic type that embeds instances by value is the first use of each of them.
+test "every instance is emitted before the monomorphic type that embeds it" {
+    let text = typedef_text()
+    assert_before(text, "} blink_Box_0Int;", "} blink_Uses;")
+    assert_before(text, "} blink_Box_0Box_10Int;", "} blink_Uses;")
+    assert_before(text, "} blink_Slot_0Int;", "} blink_Uses;")
+    assert_before(text, "} blink_Maybe_0Int;", "} blink_Uses;")
+}
