@@ -6,6 +6,7 @@ import parser.{node_kind, node_name, node_source_module, node_trait_name, nodes}
 import compiler.{compile_to_program}
 import ast.{NodeKind, nk_of}
 import cname.{cname_reset}
+import diagnostics.{diag_entries, diag_entry_count}
 import std.io
 
 // A single-file build tags main-module nodes "" and a package build tags them
@@ -96,6 +97,34 @@ fn point_blink_root_at_cwd() {
     env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
 }
 
+// Everything the front end said from entry `before` on, as `name: message` lines, and empty
+// when it said nothing. Warnings are left out: a probe is allowed to warn.
+//
+// ANSWERED rather than asserted, because the harness's own gate has to be testable and a row
+// proving a broken probe is caught cannot be written against a function that aborts.
+pub fn probe_complaint_since(before: Int) -> Str {
+    let mut out = ""
+    let mut i = before
+    while i < diag_entries.len() {
+        let d = diag_entries.get(i).unwrap()
+        if d.severity != "warning" { out = out.concat("{d.name}: {d.message}\n") }
+        i = i + 1
+    }
+    out
+}
+
+// A probe the front end refused still yields a program node, and the harvest then reads that
+// wreckage as though it were the probe's: the types the test names are absent, and every row
+// after it measures the refusal instead of the claim it was written to make. So the compile
+// is the harness's own gate and a refusal stops the test where it happened.
+fn assert_probe_compiled(stem: Str, before: Int) {
+    let said = probe_complaint_since(before)
+    if said == "" { return }
+    io.println("FAIL: probe '{stem}' did not compile:")
+    io.print(said)
+    assert(false)
+}
+
 fn check_and_harvest(program: Int) -> Map[Str, Int] ! Diag.Report, TypeCheck {
     check_types(program)
     cname_reset()
@@ -107,8 +136,10 @@ pub fn compile_probe(stem: Str, src: Str) -> Map[Str, Int] ! Lex.Tokenize, Parse
     point_blink_root_at_cwd()
     let path = "build/{stem}_probe.bl"
     write_file(path, src)
+    let before = diag_entry_count()
     let program = compile_to_program(path, 1)
     let _rm = process_run("rm", ["-f", path])
+    assert_probe_compiled(stem, before)
     check_and_harvest(program)
 }
 
@@ -121,7 +152,9 @@ pub fn compile_pkg_probe(stem: Str, pkg_name: Str, mymod_src: Str, main_src: Str
     write_file("{root}/src/mymod.bl", mymod_src)
     let path = "{root}/src/probe.bl"
     write_file(path, main_src)
+    let before = diag_entry_count()
     let program = compile_to_program(path, 1)
     let _rm = process_run("rm", ["-rf", root])
+    assert_probe_compiled(stem, before)
     check_and_harvest(program)
 }
