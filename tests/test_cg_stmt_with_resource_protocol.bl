@@ -1,0 +1,180 @@
+// A `with <expr> as <name>` item, wired from the protocol cg_eff_resource_cleanup answers
+// into the IR wrap_resource builds.
+//
+// Plain binds the resource and runs nothing on the way out: no cleanup exists to skip, so
+// this is the one protocol wrap_resource has always been able to lower correctly. An FFI
+// scope wraps the bind in a WithScope naming the runtime's own blink_ffi_scope_cleanup,
+// which is the one exit runner this stage now writes. Closeable and BlockHandler still name
+// no exit runner, so they still report the internal error cg_eff_resource_cleanup raises
+// for them and lower as a plain bind underneath it — same as before this stage understood
+// any protocol at all.
+
+import std.fs
+import std.io
+import typecheck.{check_types}
+import layout.{layout_reset}
+import mono.{run_mono}
+import ir.{IrKind, ir_c_name, ir_kid, ir_kid_count, ir_kind, ir_kind_name, ir_reset, ir_verify}
+import parser.{node_kind, node_name, nodes}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import cg_stmt.{cg_stmt_reset, lower_fn}
+import cg_reg.{cg_reg_build}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn probe_src() -> Str {
+    #"import std.traits
+
+type Plainish { v: Int }
+type Logged { n: Int }
+type Guarded { fd: Int }
+
+impl Closeable for Logged {
+    fn close(self) {}
+}
+
+impl BlockHandler for Guarded {
+    type Context = Int
+    fn enter(self) -> Int { self.fd }
+    fn exit(self, _ok: Bool) {}
+}
+
+fn plain_case() {
+    let p = Plainish { v: 1 }
+    with p as plain {
+        io.println("{plain.v}")
+    }
+}
+
+fn ffi_case() {
+    with ffi.scope() as scope {
+        let _ = scope
+    }
+}
+
+fn closeable_case() {
+    let l = Logged { n: 2 }
+    with l as logged {
+    }
+}
+
+fn block_handler_case() {
+    let g = Guarded { fd: 3 }
+    with g as guarded {
+    }
+}
+
+fn main() {
+    plain_case()
+    ffi_case()
+    closeable_case()
+    block_handler_case()
+}
+"#
+}
+
+// The nested compile resolves the prelude from BLINK_ROOT; the harness runs from the
+// repo root. Registry, IR and diagnostics are process globals, so each test rebuilds them
+// from the same probe rather than reading a sibling test's leftovers.
+fn run_probe() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    env.set_var("BLINK_ROOT", env.cwd())
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    diag_reset()
+    let path = "build/cg_stmt_with_resource_probe.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+    cg_reg_build(program)
+}
+
+fn ices() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" { n = n + 1 }
+    }
+    n
+}
+
+fn ices_mentioning(text: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.message.contains(text) { n = n + 1 }
+    }
+    n
+}
+
+// The first node of `kind` in the tree under `id`, depth-first, or -1. A dump keyed on
+// AST node ids shifts whenever the probe gains a line; a search by kind does not.
+fn find_kind(id: Int, kind: IrKind) -> Int {
+    if id < 0 { return -1 }
+    if ir_kind(id) == kind { return id }
+    let mut i = 0
+    while i < ir_kid_count(id) {
+        let found = find_kind(ir_kid(id, i), kind)
+        if found >= 0 { return found }
+        i = i + 1
+    }
+    -1
+}
+
+test "a plain resource still binds with no internal error and no scope guard" {
+    run_probe()
+    diag_reset()
+    let root = lower_fn(find_fn("plain_case"))
+    for err in ir_verify(root) { io.println("VERIFY: {err}") }
+    assert_eq(ir_verify(root).len(), 0)
+    assert(find_kind(root, IrKind.Let) >= 0)
+    assert_eq(find_kind(root, IrKind.WithScope), -1)
+    assert_eq(ices(), 0)
+}
+
+test "an FFI scope resource binds, then wraps the rest of the block in a WithScope naming the runtime cleanup" {
+    run_probe()
+    diag_reset()
+    let root = lower_fn(find_fn("ffi_case"))
+    for err in ir_verify(root) { io.println("VERIFY: {err}") }
+    assert_eq(ir_verify(root).len(), 0)
+    let bind = find_kind(root, IrKind.Let)
+    assert(bind >= 0)
+    let scoped = find_kind(root, IrKind.WithScope)
+    assert(scoped >= 0)
+    assert_eq(ir_c_name(scoped), "blink_ffi_scope_cleanup")
+    // The scope's resource kid reads the very local the bind just declared.
+    assert_eq(ir_kid_count(scoped), 2)
+    assert_eq(ir_kind(ir_kid(scoped, 0)), IrKind.VarRef)
+    assert_eq(ir_c_name(ir_kid(scoped, 0)), ir_c_name(bind))
+    assert_eq(ices(), 0)
+}
+
+test "a Closeable resource still reports the missing exit runner and still binds underneath it" {
+    run_probe()
+    diag_reset()
+    let root = lower_fn(find_fn("closeable_case"))
+    assert(find_kind(root, IrKind.Let) >= 0)
+    assert_eq(find_kind(root, IrKind.WithScope), -1)
+    assert_eq(ices(), 1)
+    assert(ices_mentioning("Closeable") > 0)
+}
+
+test "a BlockHandler resource still reports the missing exit runner and still binds underneath it" {
+    run_probe()
+    diag_reset()
+    let root = lower_fn(find_fn("block_handler_case"))
+    assert(find_kind(root, IrKind.Let) >= 0)
+    assert_eq(find_kind(root, IrKind.WithScope), -1)
+    assert_eq(ices(), 1)
+    assert(ices_mentioning("BlockHandler") > 0)
+}

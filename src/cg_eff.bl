@@ -31,7 +31,7 @@ import ir.{
     ir_assign, ir_block, ir_carrier_wrap, ir_closure_new, ir_const, ir_effect_perform, ir_evidence_address, ir_evidence_vector,
     ir_field_get, ir_handler_install, ir_if, ir_let, ir_var_ref,
 }
-import cg_print.{print_closure_thunk}
+import cg_print.{print_closure_thunk, print_resource_guard_support}
 import cg_reg.{cg_reg_effect_decls, cg_reg_impl_decls}
 import cg_expr.{cg_expr_push_pending, lower_expr}
 import cg_call.{lower_display_call}
@@ -61,6 +61,15 @@ let TRAIT_CLOSEABLE = "Closeable"
 // so a poisoned answer cannot install a cleanup nobody asked for.
 fn plain_binding() -> ResourceCleanup {
     ResourceCleanup { protocol: CleanupProtocol.Plain, impl_block: -1 }
+}
+
+// The FFI scope's exit runner, registered once per translation unit before any function
+// that might use it prints. Its symbol and its resource's spelling are both fixed by the
+// runtime, unlike Closeable's, so one unconditional call covers every unit: an unused
+// runner costs nothing, and printing it only where a WithScope of this exit symbol turns
+// up would need a scan this driver does not otherwise make.
+pub fn cg_eff_register_ffi_scope_guard_support() ! Diag.Report {
+    print_resource_guard_support("blink_ffi_scope_cleanup", "blink_list*", false)
 }
 
 // A kind that names a declaration of its own, so an impl block can be written for it.
@@ -163,8 +172,14 @@ pub fn cg_eff_resource_cleanup(item: Int) -> ResourceCleanup ! Diag.Report {
 // A protocol that is selected but cannot yet be spelled. The guard local's cleanup
 // attribute needs a function taking a pointer to the local's own C type, and no stage
 // emits one, so the protocol travels with an empty symbol and a loud error.
+//
+// FfiScope is the one exception: the runtime already carries a fixed cleanup symbol of
+// its own, blink_ffi_scope_cleanup, so the driver registers guard support for it once per
+// translation unit and this protocol has nothing left to wait for.
 fn needs_exit_runner(protocol: CleanupProtocol, im: Int, what: Str, node: Int) -> ResourceCleanup ! Diag.Report {
-    diag_ice_stage_not_built(what, node)
+    if protocol != CleanupProtocol.FfiScope {
+        diag_ice_stage_not_built(what, node)
+    }
     ResourceCleanup { protocol: protocol, impl_block: im }
 }
 
