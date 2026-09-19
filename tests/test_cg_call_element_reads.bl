@@ -15,10 +15,12 @@ import lower_test_helpers.{
     probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
     assert_ice_saying,
 }
-import ir.{IrKind, ir_c_spelling, ir_kid, ir_kind, ir_kind_name, ir_node_count}
-import cg_expr.{lower_expr}
+import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid, ir_kind, ir_kind_name, ir_node_count}
+import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
 import cg_call.{lower_element_read}
 import layout.{container_slot_spelling}
+import diagnostics.{Diag}
+import std.io
 
 fn src_reads() -> Str {
     #"type Point { x: Int, y: Int }
@@ -147,12 +149,86 @@ test "an index into a container of carriers is a plain read, not a checked one" 
     assert_verifies("verify", id)
 }
 
-// The bounds-checked read is still unbuilt. It is selected by the syntax that was written,
-// so the refusal follows the `.get(i)` node rather than the type of what it answers.
-test "a bounds-checked read is refused, and is selected by the syntax not the answer" {
-    probe("cg_call_element", src_reads())
-    assert_ice_saying("checked read", lower_element_read(rhs_of("checked")),
-        "CheckedElementReadNotLowered", "an element read answering Option has no lowering")
+// `.get(i)` tests the bounds and answers a carrier: the receiver and the index are read
+// once, a guard compares the index against the container's own length, and one of two
+// arms fills the carrier -- Some with the element the plain read would have answered,
+// None with nothing. It is selected by the syntax that was written, the same as the
+// plain read above, not by the type either one answers.
+fn src_checked() -> Str {
+    #"fn main() {
+    let ints = [1, 2, 3]
+    let at = 0
+    let missing = 9
+    let neg = 0 - 1
+    let in_bounds = ints.get(at)
+    let past_end = ints.get(missing)
+    let negative = ints.get(neg)
+}
+"#
+}
+
+// What one checked read hoists: however many statements the guard needs, the last of
+// them is the `if` that fills the carrier, and the value the caller reads back is a
+// VarRef naming it -- exactly the shape lower_element_read's own map-remove sibling
+// already builds for a presence test.
+type CheckedReadLowered { answer: Int  branch: Int }
+
+fn cc_probe_checked(anchor: Str) -> CheckedReadLowered ! Diag.Report {
+    let mark = cg_expr_pending_count()
+    let built = lower_element_read(rhs_of(anchor))
+    let stmts = cg_expr_take_pending(mark)
+    if stmts.len() == 0 {
+        io.println("FAIL: '{anchor}' hoisted no statements")
+        assert(false)
+    }
+    CheckedReadLowered { answer: built, branch: stmts.get(stmts.len() - 1).unwrap() }
+}
+
+fn checked_arm_value(branch: Int, which: Int) -> Int {
+    ir_kid(ir_kid(ir_kid(branch, which), 0), 1)
+}
+
+test "an in-bounds index answers a carrier, and the answer is a plain read of it" {
+    probe("cg_call_checked_read", src_checked())
+    let low = cc_probe_checked("in_bounds")
+    assert_shape("answer", low.answer, "VarRef")
+    assert_verifies("answer", low.answer)
+}
+
+test "the in-bounds arm carries the element as Some" {
+    probe("cg_call_checked_read", src_checked())
+    let low = cc_probe_checked("in_bounds")
+    let some = checked_arm_value(low.branch, 1)
+    assert_eq_str("member", ir_c_name(some), "value")
+    assert_eq_str("tag", ir_c_name(ir_kid(some, 0)), "1")
+}
+
+test "an out-of-bounds index answers the None arm" {
+    probe("cg_call_checked_read", src_checked())
+    let low = cc_probe_checked("past_end")
+    let none = checked_arm_value(low.branch, 2)
+    assert_eq_str("member", ir_c_name(none), "")
+    assert_eq_str("tag", ir_c_name(ir_kid(none, 0)), "0")
+}
+
+// A negative index is never one of the container's own slots, so the guard must be a
+// real range test (an index at least zero and below the length), not a check that only
+// happens to reject the values a runtime error code would use. Reusing the runtime's own
+// blink_list_in_bounds is what keeps this row honest: an index of -1 has to fail that
+// call's own range test, not a sign bit this stage guessed at on its own.
+test "a negative index answers the None arm, through the same range test" {
+    probe("cg_call_checked_read", src_checked())
+    let low = cc_probe_checked("negative")
+    let none = checked_arm_value(low.branch, 2)
+    assert_eq_str("member", ir_c_name(none), "")
+    assert_eq_str("tag", ir_c_name(ir_kid(none, 0)), "0")
+}
+
+test "the whole checked read, with the statements it hoists, is a well-formed tree" {
+    probe("cg_call_checked_read", src_checked())
+    let low = cc_probe_checked("in_bounds")
+    assert_verifies("branch", low.branch)
+    assert_verifies("answer", low.answer)
 }
 
 // The seam is reached from two arms of the caller's dispatch and from nowhere else. A node
