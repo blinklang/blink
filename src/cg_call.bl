@@ -52,12 +52,13 @@ import cname.{
     c_runtime_helper, c_ffi_symbol, c_mint_local, c_string_literal, c_field_name,
     cname_ffi_struct_mirror, c_local_name,
     c_variant_tag_macro, c_mono_variant_tag_macro, c_variant_member_name,
+    c_container_ctor,
 }
 import ir.{
     ir_call_direct, ir_call_runtime, ir_call_closure, ir_cast, ir_unary, ir_unbox, ir_box,
     ir_assign, ir_binary, ir_block, ir_carrier_tag, ir_carrier_wrap,
     ir_const, ir_if, ir_let, ir_panic, ir_struct_new, ir_var_ref, ir_field_get,
-    ir_enum_new,
+    ir_enum_new, ir_container_new,
 }
 import cg_expr.{lower_expr, cg_expr_push_pending, x_unbox_payload, x_layout_checked}
 import cg_stmt.{lower_block_into}
@@ -632,11 +633,14 @@ fn lower_builtin_free_call(node: Int, name: Str) -> Int ! Diag.Report {
     let answer = tid_of_node(node)
     if answer < 0 { return -1 }
     let ctor = cc_runtime_ctor_symbol(cc_kind(answer), "new")
-    if ctor == "" { return cc_no_such_callee(node) }
-    let want = cc_runtime_ctor_arity(cc_kind(answer), "new")
-    let given = sublist_length(node_args(node))
-    if given != want { return cc_ctor_arity_wrong(node, name, "new", want, given) }
-    cc_build_call(node, ctor, NO_RECEIVER, CallForm.Runtime, false)
+    if ctor != "" {
+        let want = cc_runtime_ctor_arity(cc_kind(answer), "new")
+        let given = sublist_length(node_args(node))
+        if given != want { return cc_ctor_arity_wrong(node, name, "new", want, given) }
+        return cc_build_call(node, ctor, NO_RECEIVER, CallForm.Runtime, false)
+    }
+    if cc_is_keyed_container(cc_kind(answer)) { return cc_container_new(node, cc_kind(answer)) }
+    cc_no_such_callee(node)
 }
 
 // The plain runtime free functions this stage lowers, and how many arguments each takes.
@@ -1197,7 +1201,7 @@ fn lower_builtin_static_call(node: Int, owner: Str, method: Str) -> Int ! Diag.R
         return cc_build_call(node, symbol, NO_RECEIVER, CallForm.Runtime, false)
     }
     if method == "new" && cc_is_keyed_container(cc_kind(answer)) {
-        return cc_container_ctor_not_built(node, cc_kind(answer))
+        return cc_container_new(node, cc_kind(answer))
     }
     lower_declared_static_call(node, owner, method)
 }
@@ -1654,15 +1658,32 @@ fn cc_variant_arity_wrong(node: Int, owner: Str, method: Str, want: Int, given: 
     -1
 }
 
-// A container constructor. The value the runtime answers with carries a table of the
-// operations its keys are compared and hashed by, chosen from the key type and passed by
-// address; no written argument supplies it and no node names it, so the call cannot be
-// built from what the program wrote.
+// A container constructor whose key type has no table of the operations its keys are
+// compared and hashed by (layout.layout_of on the key tid answers an empty kops_table): a
+// builtin scalar key and a struct or enum key that derives Hash both have one, so this is
+// reached only by a key type that provably has none, such as an un-monomorphised generic's
+// own free type variable.
 fn cc_container_ctor_not_built(node: Int, answer: TyKind) -> Int ! Diag.Report {
     diag_ice_at("ContainerCtorNeedsKeyOps", CODEGEN_STAGE_NOT_BUILT,
         "'{tk_name(answer)}.new' answers a container whose key operations are chosen from the key type", node,
-        "the IR needs a node that names the key-operations table for a key type")
+        "the key type has no table of the operations its keys are compared and hashed by")
     -1
+}
+
+// A keyed container's runtime constructor, reached the same way whichever spelling wrote
+// it: typecheck resolves a bare Map()/Set() and a qualified Map.new()/Set.new() to the same
+// tid, so codegen answers from that tid alone rather than from how the call was spelled.
+// The key type's own layout carries the operations table Map and Set store their keys
+// through; a key type that has none refuses the call by name instead of building it.
+fn cc_container_new(node: Int, answer: TyKind) -> Int ! Diag.Report {
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    let key_layout = layout_of(child_tid(tid, Slot.Inner1), Position.Local)
+    if key_layout.kops_table == "" { return cc_container_ctor_not_built(node, answer) }
+    let ctor = c_container_ctor(tid)
+    ir_container_new(tid, node, rec.c_spelling, ctor, key_layout.kops_table, [])
 }
 
 // ── Char.from_code_point ──────────────────────────────────────────────────
