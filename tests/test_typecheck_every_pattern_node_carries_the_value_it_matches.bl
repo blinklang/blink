@@ -1,0 +1,148 @@
+// Every pattern MATCHES a value, so every pattern node has a type: the type of the value it
+// is matched against. Codegen reads that type from the same memo it reads every other node
+// from, and a pattern node with nothing in it reached layout as NoTypeForNode -- an internal
+// error, reported against the user's `_`.
+//
+// Four shapes bound no name, so nothing published a type for them: a wildcard `_`, a literal
+// used as a pattern, a range, and a nested variant pattern. The two shapes that DO bind a name
+// published for themselves, which is why the hole was invisible in the patterns tests usually
+// reach for.
+//
+// The claim is exact, not merely present: the type is the value the pattern is matched
+// against, undecomposed. A `_` standing for a Result's Err payload is a Str, not the Result.
+import lower_test_helpers.{probe, assert_eq_str}
+import typecheck.{tc_lookup_node_tid, tc_resolve, tc_type_str}
+import parser.{nodes, node_kind, node_name, node_value_child_ids}
+import ast.{NodeKind, nk_of, nk_name}
+import std.io
+
+fn src_patterns() -> Str {
+    #"type Cmd { Quit, Go }
+
+type Event {
+    KeyPress(key: Cmd)
+    Click(x: Int, y: Int)
+    Quit
+}
+
+fn result_or_zero(r: Result[Int, Str]) -> Int {
+    match r {
+        Ok(n) => n
+        Err(_) => 0
+    }
+}
+
+fn quit_pending(o: Option[Cmd]) -> Int {
+    match o {
+        Some(Cmd.Quit) => 1
+        _ => 0
+    }
+}
+
+fn grade_of(n: Int) -> Int {
+    match n {
+        0 => 10
+        1..5 => 20
+        _ => 30
+    }
+}
+
+fn label_of(s: Str) -> Int {
+    match s {
+        "a" => 1
+        _ => 0
+    }
+}
+
+fn click_sum(e: Event) -> Int {
+    match e {
+        Event.Click(x, y) => x + y
+        Event.KeyPress(key) => 1
+        _ => 0
+    }
+}
+
+fn second_of_pair(t: (Int, Int)) -> Int {
+    match t {
+        (3, y) => y
+        _ => 0
+    }
+}
+"#
+}
+
+// The probe's own declaration of `name`. A walk over every node in the program would also
+// answer for the standard library, whose nodes carry the same unnamed module key as the
+// probe's, so the test descends from a declaration it wrote itself instead of filtering.
+fn probe_fn(name: Str) -> Int {
+    let mut found = -1
+    let mut seen = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.FnDef && node_name(i) == name {
+            found = i
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    if seen != 1 {
+        io.println("FAIL: '{name}' is declared {seen} times, so the test cannot name one")
+        assert(false)
+    }
+    found
+}
+
+// Every node of one kind under `node`, spelled by the type the memo answers for it, in the
+// order a value-position descent reaches them. A `-` means the memo has nothing at all.
+fn stamps_in(node: Int, kind: NodeKind) -> Str {
+    if node == -1 { return "" }
+    let mut out = ""
+    if nk_of(node_kind(node)) == kind {
+        let tid = tc_lookup_node_tid(node)
+        out = if tid < 0 { "-" } else { tc_type_str(tc_resolve(tid)) }
+    }
+    let kids = node_value_child_ids(node)
+    let mut i = 0
+    while i < kids.len() {
+        let sub = stamps_in(kids.get(i).unwrap(), kind)
+        if sub != "" {
+            out = if out == "" { sub } else { out.concat(" ").concat(sub) }
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn assert_stamps(fn_name: Str, kind: NodeKind, want: Str) {
+    assert_eq_str("{nk_name(kind)} in {fn_name}", stamps_in(probe_fn(fn_name), kind), want)
+}
+
+test "a wildcard carries the value it stands for, decomposed no further than it stands" {
+    let _p = probe("pattern_node_tids_wildcard", src_patterns())
+    assert_stamps("result_or_zero", NodeKind.WildcardPattern, "Str")
+    assert_stamps("quit_pending", NodeKind.WildcardPattern, "Option[Cmd]")
+    assert_stamps("click_sum", NodeKind.WildcardPattern, "Event")
+    assert_stamps("second_of_pair", NodeKind.WildcardPattern, "(Int, Int)")
+}
+
+test "a literal or a range used as a pattern carries the scrutinee type" {
+    let _p = probe("pattern_node_tids_literal", src_patterns())
+    assert_stamps("grade_of", NodeKind.IntPattern, "Int")
+    assert_stamps("grade_of", NodeKind.RangePattern, "Int")
+    assert_stamps("label_of", NodeKind.StringPattern, "Str")
+    assert_stamps("second_of_pair", NodeKind.IntPattern, "Int")
+}
+
+test "a variant pattern carries the scrutinee, and a nested one the payload it decomposes" {
+    let _p = probe("pattern_node_tids_variant", src_patterns())
+    assert_stamps("result_or_zero", NodeKind.EnumPattern, "Result[Int, Str] Result[Int, Str]")
+    assert_stamps("quit_pending", NodeKind.EnumPattern, "Option[Cmd] Cmd")
+    assert_stamps("click_sum", NodeKind.EnumPattern, "Event Event")
+}
+
+test "a tuple pattern carries the tuple, and a binder its own decomposed type" {
+    let _p = probe("pattern_node_tids_binder", src_patterns())
+    assert_stamps("second_of_pair", NodeKind.TuplePattern, "(Int, Int)")
+    assert_stamps("result_or_zero", NodeKind.IdentPattern, "Int")
+    assert_stamps("click_sum", NodeKind.IdentPattern, "Int Int Cmd")
+}
