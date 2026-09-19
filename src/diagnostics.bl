@@ -65,6 +65,7 @@ pub const UNLABELED_KEYWORD_ARG   = "E0529"
 pub const RAW_OUTSIDE_TEMPLATE    = "E0530"
 pub const POSITIONAL_PARAM_DEFAULT = "E0531"
 pub const NON_CONST_PARAM_DEFAULT  = "E0532"
+pub const NON_CONST_EXPR           = "E0533"
 
 // E0600+ — closures, scoping
 pub const CLOSEABLE_ESCAPES_SCOPE = "E0601"
@@ -404,6 +405,24 @@ pub fn diag_push_allows(fn_node: Int) {
 
 pub fn diag_clear_allows() {
     diag_allow_set = Map()
+}
+
+// The functions being walked right now, innermost last. An allow set belongs to the function
+// it is written on, so a walk that reaches a nested function has to hand the enclosing one's
+// set back on the way out. Clearing on the way out instead would leave the rest of the outer
+// body unsuppressed, which is why the pairing below rebuilds rather than blanks.
+let mut diag_allow_stack: List[Int] = []
+
+pub fn diag_enter_allows(fn_node: Int) {
+    diag_allow_stack.push(fn_node)
+    diag_push_allows(fn_node)
+}
+
+pub fn diag_exit_allows() {
+    if diag_allow_stack.len() == 0 { return }
+    diag_allow_stack.pop()
+    diag_allow_set = Map()
+    for f in diag_allow_stack { diag_push_allows(f) }
 }
 
 // ── Lint override helpers ────────────────────────────────────────────
@@ -881,6 +900,7 @@ pub fn diag_reset() {
     file_ranges.clear()
     lint_overrides.clear()
     diag_allow_set.clear()
+    diag_allow_stack.clear()
     source_lines_cache.clear()
     diag_seen.clear()
 }
@@ -1313,6 +1333,9 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == POSITIONAL_PARAM_DEFAULT {
         return "E0531 -- PositionalParamDefault\n\nA default value was written on a positional parameter. Only the\nparameters declared after the `--` separator may carry one.\n\nA positional argument is matched by its place in the call, so every\nparameter before it must be supplied for a later one to be reached.\nA default that can never be taken unless the caller writes the value\nanyway states a rule the call site cannot use.\n\nFix: move the parameter after `--`, which also makes it keyword-required.\n\n  fn listen(host: Str = \"0.0.0.0\")        // E0531 -- positional\n  fn listen(-- host: Str = \"0.0.0.0\")     // OK\n\nOr drop the default and let every caller supply the value.\n\n  fn listen(host: Str)                    // OK"
+    }
+    if code == NON_CONST_EXPR {
+        return "E0533 -- NonConstExpr\n\nThe right-hand side of a `const` is not a const expression. A const is\nevaluated by the compiler and its value is written in at every use, so\na right-hand side the compiler cannot evaluate leaves nothing to write.\n\nA const expression is a closed set: scalar literals, arithmetic, boolean\nand comparison operators, other `const` bindings by name, struct literals\nwhose fields are const, and enum variants with const payloads.\n\nOutside it are calls of every kind, and names bound by `let`.\n\n  const MAX = compute_max()          // E0533 -- a function call\n  const LEN = \"hello\".len()          // E0533 -- a method call\n  const BUF = Map()                  // E0533 -- a constructor allocates\n\n  let limit = read_limit()\n  const CAP = limit                  // E0533 -- `limit` is a let\n\nFix: write the value, or name another const.\n\n  const MAX = 64                     // OK\n  const BUFFER = 1024 * MAX          // OK\n\nPurity is not constness. A function with no effects still runs at run\ntime; const evaluation is the narrower question of what the compiler can\ncompute while compiling. See E0532 for the same rule on a parameter\ndefault."
     }
     if code == NON_CONST_PARAM_DEFAULT {
         return "E0532 -- NonConstParamDefault\n\nA parameter default must be a const expression: a literal, a `const`\nbinding, or arithmetic over those. This one is computed at run time.\n\nThe default stands in for an argument the caller did not write, and\nthe value it stands for is fixed by the signature, not by when the\ncall happens. An expression that can answer differently on two calls\nwould make one signature mean two things.\n\nFix: use a literal, or name a `const`.\n\n  fn listen(-- port: Int = now())         // E0532 -- computed\n  fn listen(-- port: Int = 8080)          // OK\n\n  const DEFAULT_PORT = 8080\n  fn listen(-- port: Int = DEFAULT_PORT)  // OK\n\nArithmetic over const operands is itself const.\n\n  fn window(-- ms: Int = 60 * 1000)       // OK"

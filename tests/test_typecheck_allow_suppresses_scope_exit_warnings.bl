@@ -1,0 +1,126 @@
+// @allow(Name) on a function silences that warning inside it (spec 4.16.8). Two warnings are
+// raised on the way OUT of a scope, by the name-resolution walk, and that walk never armed
+// the allow set — it was filled by a later walk, long after these had been written down. So
+// the two warnings a reader is most likely to want silenced were the two @allow could not
+// reach, and the annotation looked broken rather than unimplemented.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn warn_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Every warning of one name raised anywhere in the run, by the variable it names.
+fn warned_vars(name: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "warning" && d.name == name { out.push(d.message) }
+    }
+    out
+}
+
+fn assert_silent(label: Str, name: Str) {
+    let hits = warned_vars(name)
+    if hits.len() != 0 {
+        io.println("FAIL: {label}: {name} was raised {hits.len()} time(s):")
+        for m in hits { io.println("  {m}") }
+    }
+    assert(hits.len() == 0)
+}
+
+fn assert_raised(label: Str, name: Str, want: Int) {
+    let hits = warned_vars(name)
+    if hits.len() != want {
+        io.println("FAIL: {label}: {name} raised {hits.len()} time(s), want {want}")
+        for m in hits { io.println("  {m}") }
+    }
+    assert(hits.len() == want)
+}
+
+fn unused_allowed_src() -> Str {
+    #"
+@allow(UnusedVariable)
+fn zza() -> Int {
+    let leftover = 1
+    2
+}
+fn main() { let _ = zza() }
+"#
+}
+
+test "an allow of UnusedVariable on a function silences it inside that function" {
+    warn_probe("build/tc_allow_unused.bl", unused_allowed_src())
+    assert_silent("allow of UnusedVariable", "UnusedVariable")
+}
+
+fn set_unread_allowed_src() -> Str {
+    #"
+@allow(SetButNotRead)
+fn zzb() -> Int {
+    let mut v = 1
+    let _ = v
+    v = 2
+    3
+}
+fn main() { let _ = zzb() }
+"#
+}
+
+// The other warning raised from the same place. Both have to be covered or the fix is a
+// special case for one name rather than the walk being armed.
+test "an allow of SetButNotRead on a function silences it inside that function" {
+    warn_probe("build/tc_allow_set_unread.bl", set_unread_allowed_src())
+    assert_silent("allow of SetButNotRead", "SetButNotRead")
+}
+
+fn unrelated_allow_src() -> Str {
+    #"
+@allow(SetButNotRead)
+fn zzc() -> Int {
+    let unrelated = 1
+    2
+}
+fn main() { let _ = zzc() }
+"#
+}
+
+// An allow names ONE warning. Arming the set must not turn into silencing whatever the
+// function happens to carry an annotation about.
+test "an allow of a different warning leaves an unused variable reported" {
+    warn_probe("build/tc_allow_unrelated.bl", unrelated_allow_src())
+    assert_raised("allow of an unrelated name", "UnusedVariable", 1)
+}
+
+fn scoped_allow_src() -> Str {
+    #"
+@allow(UnusedVariable)
+fn zzd() -> Int {
+    let silenced = 1
+    2
+}
+fn zze() -> Int {
+    let reported = 1
+    2
+}
+fn main() { let _ = zzd() + zze() }
+"#
+}
+
+// The set is armed per function, so it has to be disarmed per function too. A set left
+// standing would silence every function checked after the annotated one.
+test "an allow on one function does not reach the next function" {
+    warn_probe("build/tc_allow_scoped.bl", scoped_allow_src())
+    assert_raised("allow scoped to its own function", "UnusedVariable", 1)
+    let hits = warned_vars("UnusedVariable")
+    let m = hits.get(0).unwrap()
+    if m.contains("silenced") { io.println("FAIL: the annotated function's variable was the one reported") }
+    assert(m.contains("reported"))
+}

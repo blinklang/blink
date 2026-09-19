@@ -1,0 +1,149 @@
+// Section 2.21 names a closed set of const expressions and three things that are outside it:
+// function calls, method calls, and references to a `let` binding. Nothing in the tree read
+// that rule, so `const X = some_fn()` compiled. A const is substituted at every use site, so
+// a right-hand side the compiler cannot evaluate has no value to substitute.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn const_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn errors_named(name: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" && d.name == name { out.push(d.message) }
+    }
+    out
+}
+
+fn all_errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_refused(label: Str) {
+    let hits = errors_named("NonConstExpr")
+    if hits.len() != 1 {
+        io.println("FAIL: {label}: NonConstExpr raised {hits.len()} time(s), want 1")
+        for m in all_errors() { io.println("  {m}") }
+    }
+    assert(hits.len() == 1)
+}
+
+fn assert_accepted(label: Str) {
+    let hits = all_errors()
+    if hits.len() != 0 {
+        io.println("FAIL: {label}: accepted form drew {hits.len()} error(s):")
+        for m in hits { io.println("  {m}") }
+    }
+    assert(hits.len() == 0)
+}
+
+fn wrap(decl: Str) -> Str {
+    "const ZZ_BASE = 5\nlet zz_runtime = 7\nfn zz_fn() -> Int \{ 3 }\n{decl}\nfn main() \{ let _ = 1 }\n"
+}
+
+test "a function call on the right of a const is refused" {
+    const_probe("build/tc_const_call.bl", wrap("const ZZ_X = zz_fn()"))
+    assert_refused("function call")
+}
+
+// The spec calls this out on its own, because a method reads as a property of a value rather
+// than as the call it is.
+test "a method call on the right of a const is refused" {
+    const_probe("build/tc_const_method.bl", wrap(#"const ZZ_X = "hello".len()"#))
+    assert_refused("method call")
+}
+
+test "naming a let binding on the right of a const is refused" {
+    const_probe("build/tc_const_let_ref.bl", wrap("const ZZ_X = zz_runtime"))
+    assert_refused("reference to a let binding")
+}
+
+// A collection constructor allocates, so it is a call like any other and is named separately
+// in the section only because it does not look like one.
+test "a collection constructor on the right of a const is refused" {
+    const_probe("build/tc_const_collection.bl", wrap("const ZZ_X = Map()"))
+    assert_refused("collection constructor")
+}
+
+test "literals stand as const expressions" {
+    const_probe("build/tc_const_literals.bl", wrap("const ZZ_I = 42\nconst ZZ_F = 3.14\nconst ZZ_S = \"hi\"\nconst ZZ_B = true\nconst ZZ_C = 'x'"))
+    assert_accepted("literals")
+}
+
+test "arithmetic over literals and other consts stands as a const expression" {
+    const_probe("build/tc_const_arith.bl", wrap("const ZZ_X = 1024 * 64\nconst ZZ_Y = ZZ_BASE * 2\nconst ZZ_Z = -ZZ_BASE"))
+    assert_accepted("arithmetic")
+}
+
+test "boolean and comparison operators stand as const expressions" {
+    const_probe("build/tc_const_bool.bl", wrap("const ZZ_X = true && !false\nconst ZZ_Y = ZZ_BASE > 0"))
+    assert_accepted("boolean and comparison")
+}
+
+fn struct_src() -> Str {
+    #"
+const ZZ_BASE = 5
+type ZzConfig {
+    host: Str = "0.0.0.0"
+    port: Int = 8080
+}
+const ZZ_CFG = ZzConfig { host: "localhost", port: 3000 }
+fn main() { let _ = 1 }
+"#
+}
+
+test "a struct literal whose fields are const stands as a const expression" {
+    const_probe("build/tc_const_struct.bl", struct_src())
+    assert_accepted("struct literal")
+}
+
+fn enum_src() -> Str {
+    #"
+type ZzLevel {
+    Debug
+    Info
+}
+const ZZ_LEVEL = ZzLevel.Info
+const ZZ_SOME = Some(42)
+fn main() { let _ = 1 }
+"#
+}
+
+test "an enum variant with const payload stands as a const expression" {
+    const_probe("build/tc_const_enum.bl", enum_src())
+    assert_accepted("enum variant")
+}
+
+fn default_src() -> Str {
+    #"
+let zz_runtime = 7
+fn zzf(-- x: Int = zz_runtime) -> Int { x }
+fn main() { let _ = zzf(x: 1) }
+"#
+}
+
+// The same rule reaches parameter defaults, which is where a const-expression predicate
+// already existed and accepted any bare name because it could not tell a const from a let.
+test "naming a let binding as a keyword parameter default is refused" {
+    const_probe("build/tc_const_default.bl", default_src())
+    let hits = errors_named("NonConstParamDefault")
+    if hits.len() != 1 {
+        io.println("FAIL: parameter default: NonConstParamDefault raised {hits.len()} time(s), want 1")
+        for m in all_errors() { io.println("  {m}") }
+    }
+    assert(hits.len() == 1)
+}
