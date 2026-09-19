@@ -50,7 +50,6 @@ pub const COALESCE_REQUIRES_OPT   = "E0513"
 pub const QM_TEST_DISPLAY_REQUIRED = "E0514"
 pub const TEST_ANNOTATED_RETURN   = "E0515"
 pub const DUPLICATE_EFFECT_OP     = "E0516"
-pub const BARE_GENERIC_FN_AS_VALUE = "E0517"
 pub const NAME_COLLISION          = "E0518"
 pub const AMBIGUOUS_CONSTRUCTION  = "E0519"
 pub const DERIVE_DEBUG_FIELD_NO_DEBUG = "E0520"
@@ -60,6 +59,10 @@ pub const MISSING_DISPLAY_IMPL    = "E0523"
 pub const RESERVED_TYPE_NAME      = "E0524"
 pub const NO_SUCH_FIELD           = "E0525"
 pub const OVERLAPPING_IMPLS       = "E0526"
+pub const POSITIONAL_AFTER_KEYWORD = "E0527"
+pub const DUPLICATE_KEYWORD_ARG   = "E0528"
+pub const UNLABELED_KEYWORD_ARG   = "E0529"
+pub const RAW_OUTSIDE_TEMPLATE    = "E0530"
 
 // E0600+ — closures, scoping
 pub const CLOSEABLE_ESCAPES_SCOPE = "E0601"
@@ -766,6 +769,23 @@ fn int_digit_count(n: Int) -> Int {
     5
 }
 
+// A help carrying newlines is several `help:` lines, not one line with newlines in it. A
+// repair sometimes needs a second, independent suggestion (sections/07 §9.1.1 requires one),
+// and an entry holds a single help field.
+fn diag_print_help(help: Str) ! Diag.Report {
+    let mut seg_start = 0
+    let mut i = 0
+    while i <= help.len() {
+        if i == help.len() || help.byte_at(i) == 10 {
+            if i > seg_start {
+                io.eprintln("  help: {help.substring(seg_start, i - seg_start)}")
+            }
+            seg_start = i + 1
+        }
+        i = i + 1
+    }
+}
+
 fn diag_print_human(idx: Int) ! Diag.Report {
     let d = diag_entries.get(idx).unwrap()
     let display_severity = if d.severity == "ice" { "internal compiler error" } else { d.severity }
@@ -791,11 +811,11 @@ fn diag_print_human(idx: Int) ! Diag.Report {
     }
     if d.severity == "ice" {
         if d.help != "" {
-            io.eprintln("  help: {d.help}")
+            diag_print_help(d.help)
         }
         io.eprintln("  note: This is a compiler bug. Please report it at https://github.com/blinklang/blink/issues")
     } else if d.help != "" {
-        io.eprintln("  help: {d.help}")
+        diag_print_help(d.help)
     }
     if d.fix_action != "" {
         io.eprintln("  fix: {d.fix_action} '{d.fix_text}'")
@@ -907,9 +927,6 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == TEST_ANNOTATED_RETURN {
         return "E0515 -- AnnotatedTestReturnTypeRejected\n\nA test block declared an explicit return type with '->'. Test bodies\ndo not name their return type: if the body uses '?' anywhere, it is\nimplicitly elaborated to Result[Void, TestError]; otherwise the\nimplicit return type is Void. User-supplied return annotations are\nrejected to keep the rule unambiguous.\n\nFix: remove the '-> ...' annotation.\n\n  test \"x\" \{ ... \}                       // OK\n  test \"x\" -> Result[Void, Str] \{ ... \}  // E0515 -- drop the arrow"
-    }
-    if code == BARE_GENERIC_FN_AS_VALUE {
-        return "E0517 -- BareGenericFnAsValue\n\nA generic function 'fn name[T](...)' was passed by bare name as a\nclosure-typed argument. Generic functions are templates and have no\nsingle C-level signature, so codegen cannot synthesize a closure\nshim for a bare reference without picking a specific instantiation.\n\nFix: wrap the call in a closure literal that names the type, which\nlets the type-args flow from context.\n\n  fn identity[T](x: T) -> T \{ x }\n  fn take(f: fn(Int) -> Int) -> Int \{ f(7) }\n\n  take(identity)             // E0517 -- bare generic fn as value\n  take(\{ x => identity(x) }) // OK -- closure literal monomorphizes\n\nNon-generic fns may be passed by bare name; only generics need the\nwrapping closure literal."
     }
     if code == NAME_COLLISION {
         return "E0518 -- NameCollision\n\nA struct type and an enum variant share the same name. Bare\nconstruction (`Name \{ ... }`) would be ambiguous: the compiler\ncould not tell whether you meant the struct or the variant, and\nsilently picking one would be a miscompile hazard.\n\nThis rule is narrow: it ONLY rejects a struct name equal to an enum\nvariant name. Two different enums may freely share a variant name\n(e.g. `Pending` in both `JobState` and `NetState`) — that case is\nlegal and resolved by the expected type at the use site.\n\nFix: rename either the struct or the variant.\n\n  type Status \{ code: Int }       // struct named 'Status'\n  type Job \{ Status \{ at: Int } }  // E0518 -- variant also named 'Status'"
@@ -1080,7 +1097,7 @@ pub fn diag_explain(code: Str) -> Str {
         return "E0817 -- BytesPtrCastForbidden\n\nBytes cannot be cast or coerced to Ptr[U8] outside a with_ptr\nclosure. Bytes is a GC-managed buffer and may be relocated by\nthe garbage collector; raw Ptr[U8] aliases would dangle.\n\nFix: use Bytes.with_ptr to pin the buffer for the duration of\nthe call, and pass the pinned pointer to the FFI:\n\n  b.with_ptr(fn(p) \{ c_read(fd, p, b.len()) })   // OK"
     }
     if code == FFI_SCOPE_NOT_WITH_RESOURCE {
-        return "E0819 -- FfiScopeNotWithResource\n\nffi.scope() was bound directly (e.g. `let s = ffi.scope()`) instead\nof as a `with`-resource. A scope frees its allocations when the\nwith-block exits; outside a `with` there is no block to exit, so\nnothing would ever free the arena and every allocation leaks.\n\nFix: bind the scope with `with ... as`:\n\n  with ffi.scope() as scope \{\n      let p: Ptr[Pollfd] = scope.alloc()\n      // p is freed here, at block exit\n  \}"
+        return "E0819 -- FfiScopeNotWithResource\n\nA value of type `FfiScope` may occur only as the resource of a\n`with ... as` block, and nowhere else. It may not be bound by a\n`let`, passed as an argument, returned, stored in a field, or\nwritten as a type argument.\n\nA scope owns a libc malloc/free arena whose extent must be lexical.\nOutside a `with` there is no block to exit, so nothing frees the\narena and every allocation through it leaks for the life of the\nprocess. The rule is stated over the TYPE, not over the\n`ffi.scope()` call, because the hazard belongs to the value:\nhowever the value reached an excluded position, the arena there\noutlives the block that would free it.\n\n  fn leaks() ! IO \{\n      let arena = ffi.scope()          // E0819 -- let-bound\n  \}\n\n  fn takes(s: FfiScope) \{ }            // E0819 -- parameter\n  type Holder \{ s: FfiScope }          // E0819 -- field\n\nFix: bind the scope as a `with` resource.\n\n  with ffi.scope() as arena \{\n      let p: Ptr[Pollfd] = arena.alloc()\n      // p is freed here, at block exit\n  \}\n\nFor one plain allocation with GC cleanup, use `alloc_ptr[T]()`\ninstead of a scope. For a pointer that must outlive the block, take\nit out of the scope first: `arena.take(p)` removes p from the\nscope's cleanup list and transfers its lifetime to the caller."
     }
     if code == MISSING_NATIVE_DEP {
         return "E0820 -- MissingNativeDep\n\nAn @ffi annotation references a C library that is not declared in\nthe [native-dependencies] section of blink.toml.\n\nFix: add the library to blink.toml:\n\n  [native-dependencies]\n  libname = \{ system = true \}"
@@ -1158,10 +1175,19 @@ pub fn diag_explain(code: Str) -> Str {
         return "E0310 -- TemplateMismatch\n\nA string template parameter type does not match the value supplied\nat the call site. Templates check parameter types like normal\nfunction calls.\n\nFix: convert the value to the expected type, or change the template\nparameter type to match.\n\n  let s = template\"hello \{name: Str\}\"\n  s.fill(name: 42)   // E0310 -- expected Str, got Int"
     }
     if code == MISSING_KEYWORD_ARG {
-        return "E0510 -- MissingKeywordArg\n\nA call site did not supply a required keyword argument. Keyword\nparameters with no default must be passed explicitly.\n\nFix: add the missing argument by name, or give the parameter a\ndefault in the function declaration.\n\n  fn open(path: Str, mode: Str) \{ ... \}\n  open(path: \"f.txt\")           // E0510 -- 'mode' missing\n  open(path: \"f.txt\", mode: \"r\") // OK"
+        return "E0510 -- MissingKeywordArg\n\nA keyword parameter of the callee received no argument at all. Every\nparameter declared after `--` needs an argument, and that argument\ncarries the parameter's label.\n\nContrast E0529 UnlabeledKeywordArg: there the value is present and\nunlabelled, and the repair annotates an argument already written. Here\nthe value is absent, and the repair inserts one.\n\nFix: supply the argument, labelled.\n\n  fn transfer(amount: Int, -- from: Int, to: Int) \{ ... \}\n  transfer(300, from: 1)             // E0510 -- 'to' received nothing\n  transfer(300, from: 1, to: 2)      // OK"
     }
     if code == INVALID_KEYWORD_ARG {
-        return "E0511 -- InvalidKeywordArg\n\nA keyword argument at the call site does not correspond to any\nparameter on the called function. The name is misspelled or the\nfunction does not accept that keyword.\n\nFix: check the parameter list of the called function and correct\nthe argument name.\n\n  fn greet(name: Str) \{ ... \}\n  greet(nmae: \"Skippy\")   // E0511 -- did you mean 'name'?"
+        return "E0511 -- InvalidKeywordArg\n\nA call-site label names no keyword parameter of the callee. A label\nresolves in the keyword-parameter namespace -- the parameters declared\nafter `--` -- and nothing else, so a misspelling and a label written on\na positional parameter are both refused here.\n\nFix: correct the label to one the signature declares, or drop it when\nthe parameter it names is positional.\n\n  fn transfer(amount: Int, -- from: Int, to: Int) \{ ... \}\n  transfer(300, frm: 1, to: 2)       // E0511 -- no keyword parameter 'frm'\n  transfer(amount: 300, from: 1, to: 2) // E0511 -- 'amount' is positional\n  transfer(300, from: 1, to: 2)      // OK"
+    }
+    if code == POSITIONAL_AFTER_KEYWORD {
+        return "E0527 -- PositionalAfterKeyword\n\nA positional argument follows a labelled one. Positional arguments fill\nthe parameters declared before `--`, in order, so one written after a\nlabel has no slot left to take it.\n\nFix: move it before the first label, or give it the label its parameter\ndeclares.\n\n  fn transfer(amount: Int, -- from: Int, to: Int) \{ ... \}\n  transfer(300, from: 1, 2)          // E0527\n  transfer(300, from: 1, to: 2)      // OK"
+    }
+    if code == DUPLICATE_KEYWORD_ARG {
+        return "E0528 -- DuplicateKeywordArg\n\nThe same label appears twice in one call. Keyword arguments are\norder-independent, so two arguments carrying one label hand the\nparameter two values with no rule that picks between them.\n\nFix: delete the repeated argument.\n\n  fn transfer(amount: Int, -- from: Int, to: Int) \{ ... \}\n  transfer(300, from: 1, from: 2)    // E0528\n  transfer(300, from: 1, to: 2)      // OK"
+    }
+    if code == UNLABELED_KEYWORD_ARG {
+        return "E0529 -- UnlabeledKeywordArg\n\nA keyword parameter received its argument positionally. The `--`\nseparator exists to make the swap in `transfer(300, bob, alice)`\nimpossible; an unlabelled value in a keyword slot is that swap, written\nwithout the label that would have caught it.\n\nFix: label the argument already written. Both the parameter names and\ntheir positions are known here, so this is the one call-shape repair a\ntool can apply unaided.\n\n  fn transfer(amount: Int, -- from: Int, to: Int) \{ ... \}\n  transfer(300, 1, 2)                // E0529 -- 'from' and 'to' are keyword parameters\n  transfer(300, from: 1, to: 2)      // OK"
     }
     if code == CLOSEABLE_ESCAPES_SCOPE {
         return "E0601 -- CloseableEscapesScope / PtrEscapesFfiScope\n\nCloseableEscapesScope: a `Closeable` value escapes the `with ... as`\nblock that owns it. Closeable resources are released when the\nwith-block exits, so references that survive would be use-after-close.\n\nFix: keep the value inside the with-block, or copy out only the\ndata you need before the block ends.\n\n  with open(\"f.txt\") as f \{\n      let bytes = f.read_all()  // OK -- bytes is plain data\n      // return f               // E0601 -- f outlives the scope\n  \}\n\nPtrEscapesFfiScope: a `Ptr` allocated inside a `with ffi.scope() as\nscope` block escapes the block. The scope frees its allocations when\nthe block exits, so the escaped Ptr would dangle.\n\nFix: call `scope.take(p)` to detach the Ptr from the scope before it\nleaves the block.\n\n  with ffi.scope() as scope \{\n      let p: Ptr[Pollfd] = scope.alloc()\n      scope.take(p)             // OK -- detached, may now escape\n  \}"
@@ -1228,6 +1254,9 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == MODULE_QUALIFIED_TYPE {
         return "E1007 -- ModuleQualifiedType\n\nA type was referenced via a module-qualified path that does not\nresolve to a public type in that module.\n\nFix: check the module path and the type name, and confirm the\ntype is `pub`.\n\n  let p: pkg.geom.Point = ...   // pkg.geom must export 'Point'"
+    }
+    if code == RAW_OUTSIDE_TEMPLATE {
+        return "E0530 -- RawOutsideTemplate\n\n`Raw[T]` is a marker type, and the only thing that consumes one is a\n`Template[C]` coercion, which folds the wrapped value into the\nadjacent literal segment of a template. A `Raw[T]` that reaches any\nother position is stranded: it implements no Display, nothing strips\nit back to the `T` it wraps, and no code will ever read it.\n\n  fn log_table(table: Str) ! IO \{\n      io.println(\"scanning \{Raw(table)}\")   // E0530\n  \}\n\nThe marker rides a binding, so the mistake is the same one line\nlater: `let t = Raw(table)` has type `Raw[Str]`, and interpolating\n`t` into an ordinary string is this error too.\n\nFix: drop the wrapper and interpolate the value itself.\n\n  io.println(\"scanning \{table}\")\n\nKeep the wrapper only where a `Template[C]` takes the literal -- a\ntemplated query, for instance -- where folding the value into the\nquery text is the point, and where it raises W0310 RawBypassesParam\nso the bypass leaves a record."
     }
     if code == RAW_BYPASSES_PARAM {
         return "W0310 -- RawBypassesParam\n\n`Raw(...)` was used to inject text into a templated query, bypassing\nthe parameterization that prevents injection. Raw fragments must come\nfrom trusted sources.\n\nFix: pass user input through a parameter rather than `Raw`. Reserve\n`Raw` for compile-time-fixed fragments such as table or column names\nthat the parameterization machinery cannot represent.\n\n  let q = sql\"select * from \{Raw(table)\} where id = \{user_id\}\"\n\nIf the fragment is genuinely fixed and reviewed, suppress with\n`@trusted(audit: \"AUDIT-ID\")` on the enclosing function. This records\nan auditable trail, the same mechanism used for @ffi (W0800)."
