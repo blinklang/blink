@@ -45,7 +45,7 @@ import layout.{
     binder_scope_push, binder_scope_pop, bind_binder, pointer_spelling,
 }
 import mono.{instances, instance_for_call}
-import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls, cg_reg_trait_decls}
+import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls, cg_reg_trait_decls, cg_reg_impl_of}
 import cname.{
     c_fn_decl_name, c_impl_method_name, c_impl_method_name_q,
     c_display_dispatch_name, c_derive_method_name,
@@ -1134,16 +1134,34 @@ fn lower_builtin_static_call(node: Int, owner: Str, method: Str) -> Int ! Diag.R
 //
 //   1. a variant of an enum the qualifier names. Typecheck decides this above the whole
 //      static ladder, so a free function spelled `{Enum}_{Variant}` never takes it over.
-//   2. a method written in an impl over the type, under the trait-qualified key.
-//   3. the free function the qualifier and the method name spell.
-//   4. a conversion, which is keyed source-typed and so is read only after 3 misses.
+//   2. a method written in an impl of an ordinary (non-source-typed) trait over the type,
+//      under the trait-qualified key.
+//   3. the free function the qualifier and the method name spell, or a conversion
+//      (from/try_from) impl, whichever typecheck itself read first (its own ladder checks
+//      the bare free function before the source-typed conversion key, so a program that
+//      declares both reaches the free function). Both are read as the exact declaration
+//      typecheck resolved the call to (tc_call_decl_node), not by re-deriving a callee from
+//      a mangled spelling: two modules may each declare a function of that identical
+//      spelling, and only the call's own recorded declaration says which one the call
+//      means. A miss here is a typecheck gap, not an undeclared name — nothing in cg_call
+//      re-guesses what typecheck left unresolved. Typecheck records the SAME kind of decl
+//      node for a conversion impl as for a plain free function, so the two are told apart
+//      by asking what the node itself is (cg_reg_impl_of: is this method node's parent an
+//      impl block?), never by comparing the qualifier or the mangled spelling against a
+//      name again — that would be a second resolver answering a question typecheck already
+//      settled. An impl method routes through the impl-aware call builder instead of the
+//      plain one: a conversion's C symbol carries its source type, which the decl node
+//      alone does not.
 fn lower_declared_static_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
     if cc_names_variant(owner, method) { return cc_enum_variant_call(node, owner, method) }
     let im = cc_trait_qualified_impl(owner, method)
     if im >= 0 { return cc_impl_static_call(node, im, method) }
-    let decl = cc_sole_fn_named(node, cc_assoc_name(owner, method))
-    if decl == DECL_REFUSED { return -1 }
-    if decl >= 0 { return cc_free_call(node, decl) }
+    let decl = tc_call_decl_node(node)
+    if decl >= 0 {
+        let owning_impl = cg_reg_impl_of(decl)
+        if owning_impl >= 0 { return cc_impl_static_call(node, owning_impl, method) }
+        return cc_free_call(node, decl)
+    }
     if cc_is_conversion(method) { return cc_conversion_call(node, owner, method) }
     if cc_impls_declaring(owner, method) > 1 { return cc_static_impl_ambiguous(node, owner, method) }
     diag_ice_stage_not_built("cg_call static call '{owner}.{method}'", node)
@@ -1382,31 +1400,6 @@ fn cc_ctor_arity_wrong(node: Int, owner: Str, method: Str, want: Int, got: Int) 
         "'{owner}.{method}' takes {want} argument(s), and this call was given {got}", node,
         "typecheck must reject this call before codegen reads it; this is a compiler bug")
     -1
-}
-
-// The name an associated function is declared under. The qualifier and the method are
-// joined, which is the key typecheck resolves the call through and therefore the only
-// spelling that can name the same declaration from here.
-fn cc_assoc_name(owner: Str, method: Str) -> Str {
-    "{cc_declared_name(owner)}_{method}"
-}
-
-// The one declaration of this name, or ABSENT when the program declares none. A name two
-// modules both declare is refused rather than guessed, and says so once, so the caller
-// stops instead of refusing a second time under another heading.
-fn cc_sole_fn_named(node: Int, name: Str) -> Int ! Diag.Report {
-    let mut found = -1
-    let mut clashes = 0
-    for f in cg_reg_fn_decls() {
-        if node_name(f) != name { continue }
-        if found >= 0 { clashes = clashes + 1 }
-        found = f
-    }
-    if clashes == 0 { return found }
-    diag_ice_at("CalleeAmbiguous", UNSOLVED_TYPEVAR_AT_CODEGEN,
-        "'{name}' is declared in more than one module and the call names neither", node,
-        "the call needs the declaration typecheck resolved, which it does not record yet")
-    DECL_REFUSED
 }
 
 // ── Variant constructors ──────────────────────────────────────────────────

@@ -31,7 +31,7 @@ import cname.{
 import cg_print.{
     print_effect_default_vtable, print_effect_vtable_typedef,
     print_ev, print_epilogue, print_fn, print_fn_decl, print_foreign_decl, print_global_decl,
-    print_prologue, print_prologue_declares,
+    print_global_init, print_prologue, print_prologue_declares,
     print_simple_enum_typedef, print_struct_typedef, print_tagged_enum_typedef,
     print_typedef_blocks,
 }
@@ -39,7 +39,10 @@ import cg_reg.{
     cg_reg_effect_decls, cg_reg_entry_point, cg_reg_fn_decls, cg_reg_global_decls,
     cg_reg_impl_methods, cg_reg_impl_of, cg_reg_tid_for_decl, cg_reg_type_decls,
 }
-import ir.{ir_block, ir_call_direct, ir_cast, ir_const, ir_expr_stmt, ir_return, ir_var_ref}
+import ir.{
+    ir_assign, ir_block, ir_call_direct, ir_c_name, ir_cast, ir_const, ir_expr_stmt,
+    ir_global_ref, ir_kind, ir_return, ir_var_ref, IrKind,
+}
 import mono.{is_poly_impl, poly_impl_is_element_agnostic}
 import typecheck.{
     TyKind, tc_enum_variant_slots, tc_evar_field_slots, tc_evar_name, tc_evfield_name,
@@ -637,12 +640,36 @@ fn refuse_foreign_shape(site: Int, is_return: Bool, what: Str) -> Bool ! Diag.Re
 // A top-level `let` is a C global under its bare Blink name, in every module. The name
 // is unmangled on purpose: it is the linkage another translation unit refers to.
 
-pub fn cg_decl_emit_globals(is_extern: Bool) ! Diag.Report {
+// `inits` carries each global's initializer, already lowered by the driver, keyed by
+// the global's own node. A value classified IrKind.Const is a literal the front end
+// already resolved, so it prints straight onto the definition line; anything else keeps
+// a bare declaration and is instead handed back as one assignment for the caller to run
+// before the program does anything else, in the order the globals were declared in. An
+// extern declaration never carries an initializer either way, because it names a
+// definition another unit already owns.
+pub fn cg_decl_emit_globals(is_extern: Bool, inits: Map[Int, Int]) -> List[Int] ! Diag.Report {
+    let mut deferred: List[Int] = []
     for g in cg_reg_global_decls() {
-        flush_member_typedefs(tid_of_node(g))
-        let spelling = cg_decl_require_spelling(tid_of_node(g), Position.Local)
-        print_global_decl(spelling, c_global_name(g), is_extern)
+        let tid = tid_of_node(g)
+        flush_member_typedefs(tid)
+        let spelling = cg_decl_require_spelling(tid, Position.Local)
+        let name = c_global_name(g)
+        if is_extern {
+            print_global_decl(spelling, name, true)
+            continue
+        }
+        let value = inits.get(g) ?? -1
+        if value >= 0 && ir_kind(value) == IrKind.Const {
+            print_global_init(spelling, name, ir_c_name(value))
+        } else {
+            print_global_decl(spelling, name, false)
+            if value >= 0 {
+                let rec = layout_of(tid, Position.Local)
+                deferred.push(ir_assign(g, ir_global_ref(tid, g, rec.c_spelling, name, rec.slot_form), value))
+            }
+        }
     }
+    deferred
 }
 
 // ── Prologue and evidence vector ─────────────────────────────────────────────

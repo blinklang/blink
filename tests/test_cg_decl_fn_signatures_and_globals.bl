@@ -2,9 +2,11 @@ import std.fs
 import std.io
 import layout.{layout_reset}
 import cg_print.{print_reset, print_take}
-import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_reg.{cg_reg_reset, cg_reg_build, cg_reg_global_decls}
 import cg_decl.{cg_decl_reset, cg_decl_emit_fn_decls, cg_decl_emit_globals}
+import cg_stmt.{lower_global_init}
 import cg_test_helpers.{cg_probe_compile}
+import parser.{node_value}
 
 // `plain` takes an effect-free signature, `talks` carries one, `main` is the entry point
 // the runtime calls, and the two globals cover a scalar and a container.
@@ -43,13 +45,26 @@ fn fn_decl_text() -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCh
     print_take()
 }
 
+// Mirrors cg.bl's own lower_global_inits: every global with an initializer, lowered
+// through the same expression seam the driver uses, keyed by the global's node.
+fn global_inits() -> Map[Int, Int] ! Diag.Report {
+    let mut out: Map[Int, Int] = Map()
+    for g in cg_reg_global_decls() {
+        let init = node_value(g)
+        if init < 0 { continue }
+        out.insert(g, lower_global_init(init))
+    }
+    out
+}
+
 fn global_text(is_extern: Bool) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
     let program = probe_program()
     print_reset()
     cg_reg_reset()
     cg_reg_build(program)
     cg_decl_reset()
-    cg_decl_emit_globals(is_extern)
+    let inits = if is_extern { Map() } else { global_inits() }
+    let _ = cg_decl_emit_globals(is_extern, inits)
     print_take()
 }
 
@@ -84,7 +99,7 @@ test "the entry point keeps its runtime name" {
 // A top-level let is a C global under its own unmangled Blink name.
 test "a global keeps its bare Blink name" {
     let text = global_text(false)
-    assert_has(text, "int64_t counter;")
+    assert_has(text, "int64_t counter = 0;")
     assert_has(text, "blink_list* names;")
 }
 
