@@ -14,17 +14,17 @@ import cname.{c_archive_header_guard, c_module_header_guard, c_string_literal, c
 import ast.{NodeKind, nk_of}
 import parser.{
     ann_str_val, node_args, node_handlers, node_int_val, node_kind, node_name, node_str_val,
-    node_xfail_reason, node_xfail_ticket, sublist_get, sublist_length,
+    node_value, node_xfail_reason, node_xfail_ticket, sublist_get, sublist_length,
 }
 import layout.{layout_reset, set_current_inst}
 import cg_print.{
-    print_main_shim, print_reset, print_scope_restore_support, print_take, print_test_fn,
-    print_test_table,
+    print_fn, print_main_shim, print_reset, print_scope_restore_support, print_take,
+    print_test_fn, print_test_table,
 }
 import cg_reg.{
-    cg_reg_build, cg_reg_entry_point, cg_reg_fn_decls, cg_reg_has_main, cg_reg_impl_methods,
-    cg_reg_impl_of, cg_reg_modules, cg_reg_module_of, cg_reg_reset, cg_reg_test_decls,
-    cg_reg_type_decls,
+    cg_reg_build, cg_reg_entry_point, cg_reg_fn_decls, cg_reg_global_decls, cg_reg_has_main,
+    cg_reg_impl_methods, cg_reg_impl_of, cg_reg_modules, cg_reg_module_of, cg_reg_reset,
+    cg_reg_test_decls, cg_reg_type_decls,
 }
 import cg_decl.{
     BodySite, cg_decl_body_site, cg_decl_takes_ev, cg_decl_emit_epilogue, cg_decl_emit_ev,
@@ -34,9 +34,13 @@ import cg_decl.{
     cg_decl_emit_prologue, cg_decl_emit_typedefs, cg_decl_reset,
 }
 import cg_derive.{cg_derive_emit_bodies, cg_derive_emit_decls, cg_derive_reset}
+import ir.{ir_block}
 import mono.{instances}
 import typecheck.{TyKind, tc_resolve, tc_tid_kind}
-import cg_stmt.{cg_stmt_reset, cg_stmt_set_debug_mode, lower_block, lower_block_returning, lower_fn}
+import cg_stmt.{
+    cg_stmt_reset, cg_stmt_set_debug_mode, lower_block, lower_block_returning, lower_fn,
+    lower_global_init,
+}
 import cg_expr.{cg_expr_reset, cg_expr_set_return_type, cg_expr_set_test_body}
 import cg_eff.{
     cg_eff_pending_thunks, cg_eff_print_thunk, cg_eff_register_ffi_scope_guard_support,
@@ -177,18 +181,36 @@ fn no_instance_bodies(decl: Int) ! Diag.Report {
     }
 }
 
+// Every module-scope global's initializer, lowered through the same expression seam as
+// any other value and keyed by the global's own node. A global with no initializer
+// (the parser accepts a bare top-level `let` the same as a local one) has nothing to
+// lower and is left out, so a reader of this map never has to ask "was there one."
+fn lower_global_inits() -> Map[Int, Int] ! Diag.Report {
+    let mut out: Map[Int, Int] = Map()
+    for g in cg_reg_global_decls() {
+        let init = node_value(g)
+        if init < 0 { continue }
+        out.insert(g, lower_global_init(init))
+    }
+    out
+}
+
 // The declaration half, in the order C requires: a type must be complete where a later
 // declaration names it, the evidence vector's fields name those types, and a global or a
-// signature names them again.
-fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_ev: Bool, globals_extern: Bool, shared: Bool) ! Diag.Report {
+// signature names them again. Answers the globals that could not take their value on the
+// definition line, in declaration order, for the entry point to assign before anything
+// else runs; a header declares no definition and so never has any to answer.
+fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_ev: Bool, globals_extern: Bool, shared: Bool) -> List[Int] ! Diag.Report {
     let user_tu = cfg.user_tu_mode != 0
     let define_storage = cfg.archive_build_mode != 0
     cg_decl_emit_prologue(user_tu, define_storage, false, header_guard, self_header)
     cg_decl_emit_typedefs()
     if define_ev { cg_decl_emit_ev(ev_storage(cfg)) }
-    cg_decl_emit_globals(globals_extern)
+    let inits = if globals_extern { Map() } else { lower_global_inits() }
+    let deferred = cg_decl_emit_globals(globals_extern, inits)
     emit_root_signatures(fns_in_scope(cfg, "", shared, true), methods_in_scope(cfg, "", shared, true))
     cg_derive_emit_decls(derived_decls_declared_everywhere())
+    deferred
 }
 
 // "" for the unit that owns the vector and is linked against, "extern " for a unit that
@@ -460,11 +482,25 @@ fn tag_arg_is_positional(arg: Int) -> Bool {
 // The entry of a whole program: the test bodies and their table, then the shim that calls
 // the runner. One list answers both what is written and whether the shim calls it, because
 // a shim that calls a runner the unit did not write is a name the linker cannot resolve.
-fn emit_entry(cfg: CgConfig) ! Diag.Report {
+// `deferred` is the declaration half's leftover work: the globals that could not take
+// their value on the definition line, each already an assignment, in declaration order.
+fn emit_entry(cfg: CgConfig, deferred: List[Int]) ! Diag.Report {
     let tests = cg_reg_test_decls()
     emit_test_bodies(tests)
     print_main_shim(cg_reg_has_main(), tests.len() > 0, false,
-        cfg.user_tu_mode != 0, cfg.trace_codegen != 0, cfg.deterministic, [])
+        cfg.user_tu_mode != 0, cfg.trace_codegen != 0, cfg.deterministic, emit_global_init_fn(deferred))
+}
+
+// One function running every deferred global assignment, in the order the globals were
+// declared in, or nothing if every global already took its value on the definition line.
+// The shim runs it before any test or main dispatch, so a global a test reads is never
+// caught unset.
+fn emit_global_init_fn(deferred: List[Int]) -> List[Str] ! Diag.Report {
+    if deferred.len() == 0 { return [] }
+    let name = "__blink_init_globals"
+    let span = cg_reg_global_decls().get(0).unwrap()
+    print_fn(true, "void", name, [], false, ir_block(span, deferred))
+    [name]
 }
 
 fn test_xfail_literal(tb: Int) -> Str {
@@ -476,12 +512,12 @@ fn test_xfail_literal(tb: Int) -> Str {
 pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
     begin_unit(program)
     let shared = cfg.archive_build_mode != 0
-    emit_declarations(cfg, "", "", true, false, shared)
+    let deferred = emit_declarations(cfg, "", "", true, false, shared)
     print_scope_restore_support()
     cg_eff_register_ffi_scope_guard_support()
     cg_stmt_set_debug_mode(cfg.debug_mode != 0)
     emit_definitions(cfg, "", shared)
-    emit_entry(cfg)
+    emit_entry(cfg, deferred)
     print_take()
 }
 
@@ -493,7 +529,7 @@ pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
 // definitions of one C type is an ODR violation.
 pub fn generate_archive_header(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
     begin_unit(program)
-    emit_declarations(cfg, c_archive_header_guard(), "", false, true, true)
+    let _ = emit_declarations(cfg, c_archive_header_guard(), "", false, true, true)
     cg_decl_emit_epilogue(c_archive_header_guard())
     print_take()
 }
@@ -504,7 +540,7 @@ pub fn generate_module_header(program: Int, module_key: Str, cfg: CgConfig) -> S
     let guard = c_module_header_guard(module_key)
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, false, false, guard, "")
     cg_decl_emit_typedefs()
-    cg_decl_emit_globals(true)
+    let _ = cg_decl_emit_globals(true, Map())
     let fns = fns_in_scope(cfg, module_key, false, true)
     let methods = methods_in_scope(cfg, module_key, false, true)
     emit_root_signatures(fns, methods)
@@ -524,12 +560,12 @@ pub fn generate_module_object(program: Int, module_key: Str, self_header: Str, c
     begin_unit(program)
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_build_mode != 0, false, "", self_header)
     cg_decl_emit_ev(ev_storage(cfg))
-    cg_decl_emit_globals(false)
+    let _ = cg_decl_emit_globals(false, Map())
     print_scope_restore_support()
     cg_eff_register_ffi_scope_guard_support()
     cg_stmt_set_debug_mode(cfg.debug_mode != 0)
     emit_definitions(cfg, module_key, cfg.archive_build_mode != 0)
-    if module_key == "__main__" { emit_entry(cfg) }
+    if module_key == "__main__" { emit_entry(cfg, []) }
     print_take()
 }
 

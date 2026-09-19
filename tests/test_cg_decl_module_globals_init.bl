@@ -1,0 +1,199 @@
+// A module-scope global (`let`/`const`/`pub let` at top level) must not sit as a bare C
+// declaration with no initializer: a reader that runs before anything explicitly sets it
+// sees garbage. A value the front end already knows at compile time (an int, bool, char,
+// float, or plain string literal) goes straight on the definition line. Anything else
+// (a struct literal, a call, a container constructor) keeps a bare declaration and is
+// assigned once, in declaration order, by a generated init function the shim runs before
+// any test or main dispatch. An extern (header) declaration never carries an initializer
+// either way.
+
+import std.fs
+import std.io
+import layout.{layout_reset}
+import mono.{run_mono}
+import cname.{cname_reset}
+import cg_test_helpers.{cg_probe_compile, cg_text_occurrences}
+import cg.{CgConfig, generate, generate_archive_header}
+
+fn build_full_probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let program = cg_probe_compile(path, src)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    program
+}
+
+fn full_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_missing(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output unexpectedly has '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+fn find_at(text: Str, needle: Str) -> Int {
+    let i = text.index_of(needle)
+    if i < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(i >= 0)
+    i
+}
+
+fn literal_probe_src() -> Str {
+    #"const answer: Int = 42
+const flag: Bool = true
+const grade: Char = 'A'
+const ratio: Float = 1.5
+const label: Str = "hi"
+
+test "read the literal globals" {
+    assert_eq(answer, 42)
+    assert(flag)
+    assert_eq(grade, 'A')
+    assert_eq(ratio, 1.5)
+    assert_eq(label, "hi")
+}
+"#
+}
+
+test "an int global gets its literal inlined on the definition line" {
+    let program = build_full_probe("build/cg_decl_globals_int.bl", literal_probe_src())
+    let text = generate(program, full_cfg())
+    assert_has(text, "int64_t answer = 42;")
+}
+
+test "a bool global gets its literal inlined on the definition line" {
+    let program = build_full_probe("build/cg_decl_globals_bool.bl", literal_probe_src())
+    let text = generate(program, full_cfg())
+    assert_has(text, "int flag = 1;")
+}
+
+test "a char global gets its literal inlined on the definition line" {
+    let program = build_full_probe("build/cg_decl_globals_char.bl", literal_probe_src())
+    let text = generate(program, full_cfg())
+    assert_has(text, "int32_t grade = 65;")
+}
+
+test "a float global gets its literal inlined on the definition line" {
+    let program = build_full_probe("build/cg_decl_globals_float.bl", literal_probe_src())
+    let text = generate(program, full_cfg())
+    assert_has(text, "double ratio = 1.5;")
+}
+
+test "a string-literal global gets its literal inlined on the definition line" {
+    let program = build_full_probe("build/cg_decl_globals_str.bl", literal_probe_src())
+    let text = generate(program, full_cfg())
+    assert_has(text, #"const char* label = "hi";"#)
+}
+
+fn struct_probe_src() -> Str {
+    #"type Point { x: Int, y: Int }
+
+let origin: Point = Point { x: 1, y: 2 }
+
+test "read the struct global" {
+    assert_eq(origin.x, 1)
+    assert_eq(origin.y, 2)
+}
+"#
+}
+
+// A non-constant initializer (here, a struct literal) cannot sit on the definition line
+// in C, so the definition stays bare and the value is assigned by the deferred init
+// function instead.
+test "a struct-literal global keeps a bare declaration, not an inline initializer" {
+    let program = build_full_probe("build/cg_decl_globals_struct_decl.bl", struct_probe_src())
+    let text = generate(program, full_cfg())
+    // A bare `name;` declaration proves the definition line carries no initializer; if
+    // one had been folded in, the text at this point would read `name = ...;` instead
+    // and this exact needle would not match. The value still has to land somewhere —
+    // the two tests below cover that it does, and in the right place.
+    let _decl = find_at(text, " origin;")
+}
+
+// The deferred value still has to land somewhere: the generated init function's body
+// names the global it assigns.
+test "a struct-literal global is assigned inside the generated init function" {
+    let program = build_full_probe("build/cg_decl_globals_struct_init.bl", struct_probe_src())
+    let text = generate(program, full_cfg())
+    let start = find_at(text, "__blink_init_globals")
+    let after_init = text.substring(start, text.len() - start)
+    assert(after_init.contains("origin"))
+}
+
+// The shim must run the deferred init function before it hands control to a test or to
+// main, or a global a test reads is still unset when the test runs.
+test "the deferred init function runs before test dispatch and before main" {
+    let program = build_full_probe("build/cg_decl_globals_struct_order.bl", struct_probe_src())
+    let text = generate(program, full_cfg())
+    let init_call = find_at(text, "__blink_init_globals();")
+    let run_tests = find_at(text, "__blink_run_tests(argc")
+    assert(init_call < run_tests)
+}
+
+fn main_probe_src() -> Str {
+    #"type Point { x: Int, y: Int }
+
+let origin: Point = Point { x: 1, y: 2 }
+
+fn main() {
+    io.println("{origin.x}")
+}
+"#
+}
+
+test "the deferred init function runs before main when there are no tests" {
+    let program = build_full_probe("build/cg_decl_globals_struct_main_order.bl", main_probe_src())
+    let text = generate(program, full_cfg())
+    let init_call = find_at(text, "__blink_init_globals();")
+    let main_call = find_at(text, "blink_main(&__blink_ev);")
+    assert(init_call < main_call)
+}
+
+// A program with no non-constant global needs no deferred init function at all.
+test "no deferred init function is generated when every global is a literal" {
+    let program = build_full_probe("build/cg_decl_globals_no_deferred.bl", literal_probe_src())
+    let text = generate(program, full_cfg())
+    assert_missing(text, "__blink_init_globals")
+}
+
+// An extern (header) declaration never carries an initializer, constant or not.
+test "the archive header declares every global extern with no initializer" {
+    let program = build_full_probe("build/cg_decl_globals_header.bl", literal_probe_src())
+    let text = generate_archive_header(program, full_cfg())
+    assert_has(text, "extern int64_t answer;")
+    assert_missing(text, "answer = 42")
+    assert_missing(text, "__blink_init_globals")
+}
+
+test "the archive header declares a non-constant global extern with no deferred call" {
+    let program = build_full_probe("build/cg_decl_globals_header_struct.bl", struct_probe_src())
+    let text = generate_archive_header(program, full_cfg())
+    assert_has(text, "extern")
+    assert_missing(text, "origin = ")
+    assert_missing(text, "__blink_init_globals")
+}
+
+// Each global is registered once (cg_reg_global_decls walks the top-level statement list
+// with no de-duplication of its own), so the fix must not emit its initializer twice.
+test "a global's initializer is emitted exactly once" {
+    let program = build_full_probe("build/cg_decl_globals_once.bl", #"pub let shared: Int = 7
+
+test "read shared" { assert_eq(shared, 7) }
+"#)
+    let text = generate(program, full_cfg())
+    assert_eq(cg_text_occurrences(text, "shared = 7"), 1)
+}
