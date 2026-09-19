@@ -1,0 +1,136 @@
+// A selective import may rename what it selects, and the spec puts no condition on what kind
+// of item is renamed: "Imports can be renamed at the import site to resolve ambiguity or
+// improve local clarity" (sections/07_trust_modules_metadata.md, Import Aliases). A renamed
+// function binds today. A renamed type must bind the same way, whether the name it selects is
+// a struct declaration or a type alias.
+//
+// The alias must also reach the declaration the importing file selected and no other. A
+// program may hold two namesake declarations, so an alias answered by bare name alone would
+// resolve to whichever registered last rather than to the one the rename named.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+let PKG = "build/tc_import_rename_pkg"
+
+fn src_alpha() -> Str {
+    "pub type Port = Int\npub type Point \{ a: Int \}\npub fn tag_a() -> Int \{ 1 \}\n"
+}
+
+// beta mirrors alpha with a differently-named field and a different alias target, so an alias
+// that reaches the wrong declaration fails on the field rather than passing by accident.
+fn src_beta() -> Str {
+    "pub type Port = Str\npub type Point \{ b: Int \}\npub fn tag_b() -> Int \{ 2 \}\n"
+}
+
+fn compile_probe(probe_src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _mk = process_run("mkdir", ["-p", "{PKG}/src"])
+    write_file("{PKG}/blink.toml", "[package]\nname = \"tcimprename\"\nversion = \"0.1.0\"\n")
+    write_file("{PKG}/src/alpha.bl", src_alpha())
+    write_file("{PKG}/src/beta.bl", src_beta())
+    write_file("{PKG}/src/probe.bl", probe_src)
+    diag_reset()
+    let program = compile_to_program("{PKG}/src/probe.bl", 1)
+    check_types(program)
+}
+
+fn cleanup() {
+    let _rm = process_run("rm", ["-rf", PKG])
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn count_named(name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.name == name {
+            if d.severity == "error" || d.severity == "ice" { n = n + 1 }
+        }
+    }
+    n
+}
+
+// Failures report on stderr: a failing assert aborts, and an abort drops whatever stdout has
+// buffered, which would leave the reader a bare core-dump line and no reason for it.
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.eprintln("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.eprintln("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn assert_named_error(label: Str, name: Str) {
+    let n = count_named(name)
+    if n < 1 {
+        io.eprintln("FAIL: {label}: want at least one {name}, got:")
+        for e in error_messages() { io.eprintln("  {e}") }
+    }
+    assert(n >= 1)
+}
+
+// ── A renamed type binds under its new name ──
+
+fn test_a_renamed_struct_type_binds_under_its_alias() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import alpha.\{Point as P\}\nfn main() \{ let p = P \{ a: 1 \} assert(p.a == 1) \}\n")
+    assert_no_errors("Point renamed to P")
+    cleanup()
+}
+
+fn test_a_renamed_type_alias_binds_under_its_alias() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import alpha.\{Port as P\}\nfn main() \{ let p: P = 8080 assert(p + 1 == 8081) \}\n")
+    assert_no_errors("Port renamed to P")
+    cleanup()
+}
+
+// The alias must name the declaration the rename selected. beta.Point is in the program and
+// its field is `b`, so an alias resolved by bare name alone fails here on the field.
+fn test_a_renamed_type_resolves_to_the_declaration_it_selected() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import alpha.\{Point as P\}\nimport beta.\{tag_b\}\nfn main() \{ let p = P \{ a: 1 \} assert(p.a == 1) assert(tag_b() == 2) \}\n")
+    assert_no_errors("P names alpha.Point while beta.Point is in the program")
+    cleanup()
+}
+
+// ── Controls ──
+
+// The value half of the same feature, which already binds. If this row goes red the rename
+// path broke generally and the type rows above are not the cause.
+fn test_a_renamed_function_binds_under_its_alias() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import alpha.\{tag_a as ta\}\nfn main() \{ assert(ta() == 1) \}\n")
+    assert_no_errors("tag_a renamed to ta")
+    cleanup()
+}
+
+// Qualified access is a different spelling from a rename and must keep working beside one.
+// The rename here is of a function, so the row stays green while the type rows are red.
+fn test_qualified_type_access_still_works_beside_a_rename() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import alpha\nimport beta.\{tag_b as tb\}\nfn main() \{ let p = alpha.Point \{ a: 1 \} assert(p.a == 1) assert(tb() == 2) \}\n")
+    assert_no_errors("alpha.Point qualified beside a renamed tag_b")
+    cleanup()
+}
+
+// The rule stays narrow: binding an alias must not make every unwritten name resolve.
+fn test_a_name_no_rename_introduced_is_still_unknown() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import alpha.\{Point as P\}\nfn main() \{ let q = Q \{ a: 1 \} assert(q.a == 1) \}\n")
+    assert_named_error("Q was never imported or declared", "UnknownType")
+    cleanup()
+}
+
+fn main() {
+    test_a_renamed_struct_type_binds_under_its_alias()
+    test_a_renamed_type_alias_binds_under_its_alias()
+    test_a_renamed_type_resolves_to_the_declaration_it_selected()
+    test_a_renamed_function_binds_under_its_alias()
+    test_qualified_type_access_still_works_beside_a_rename()
+    test_a_name_no_rename_introduced_is_still_unknown()
+    io.println("import rename binds a type: ok")
+}
