@@ -1,0 +1,133 @@
+// Section 2.13 writes keyword parameters with default values, and the parser stopped after
+// the type annotation. A signature the spec spells out and the compiler cannot read teaches
+// a syntax that does not exist, and it also made two normative rules unbreakable for the
+// wrong reason: a default is allowed only after the `--` separator, and its value must be a
+// const expression. Neither rule could be tested while nothing parsed.
+//
+// These rows read the parsed node and the reported diagnostics. What a call site does with
+// a default is a separate question and is not settled here.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import parser.{nodes, node_kind, node_name, node_params, node_value, sublist_get, sublist_length}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn param_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn codes_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat(d.code).concat(" ") }
+    }
+    out
+}
+
+// The default expression node of the parameter spelled `nm`, or -1. A parameter with no
+// default leaves the slot empty, which is the state this whole file is about.
+fn default_of_param(nm: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef {
+            let ps = node_params(i)
+            if ps != -1 {
+                let mut j = 0
+                while j < sublist_length(ps) {
+                    let p = sublist_get(ps, j)
+                    if node_name(p) == nm { return node_value(p) }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    -2
+}
+
+fn keyword_default_src() -> Str {
+    #"fn zzserve(-- zzhost: Str = "0.0.0.0", zzport: Int = 8080) -> Int {
+    zzport
+}
+
+fn main() {
+    let _ = zzserve(zzhost: "h", zzport: 1)
+}
+"#
+}
+
+fn positional_default_src() -> Str {
+    #"fn zzserve(zzhost: Str = "0.0.0.0") -> Int {
+    zzhost.len()
+}
+
+fn main() {
+    let _ = zzserve("h")
+}
+"#
+}
+
+fn computed_default_src() -> Str {
+    #"fn zzpick() -> Int {
+    7
+}
+
+fn zzserve(-- zzport: Int = zzpick()) -> Int {
+    zzport
+}
+
+fn main() {
+    let _ = zzserve(zzport: 1)
+}
+"#
+}
+
+fn arithmetic_default_src() -> Str {
+    #"fn zzserve(-- zzms: Int = 60 * 1000) -> Int {
+    zzms
+}
+
+fn main() {
+    let _ = zzserve(zzms: 1)
+}
+"#
+}
+
+test "a keyword parameter carries the default value the source wrote" {
+    param_probe("build/kwdefault_ok.bl", keyword_default_src())
+
+    // The whole of the parser gap: before this the slot was empty and the text was gone.
+    assert(default_of_param("zzhost") != -1)
+    assert(default_of_param("zzport") != -1)
+}
+
+test "a default on a positional parameter is refused" {
+    param_probe("build/kwdefault_positional.bl", positional_default_src())
+
+    assert(codes_reported().contains("E0531"))
+}
+
+// The default stands in for an argument the caller did not write, and which argument that
+// is must not depend on when the call happens.
+test "a default that is computed at run time is refused" {
+    param_probe("build/kwdefault_computed.bl", computed_default_src())
+
+    assert(codes_reported().contains("E0532"))
+}
+
+// Arithmetic over literals is itself const, so the narrow reading that only a bare literal
+// qualifies would refuse a signature the section calls correct.
+test "arithmetic over literals is accepted as a default" {
+    param_probe("build/kwdefault_arith.bl", arithmetic_default_src())
+
+    assert(!codes_reported().contains("E0532"))
+    assert(!codes_reported().contains("E0531"))
+}

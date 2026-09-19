@@ -18,6 +18,7 @@ import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_no_loc,
     diag_push_allows, diag_warn_at, diag_truncate, diag_entry_count, diag_ice_at, diag_count,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION,
+    POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
     NON_EXHAUSTIVE_MATCH,
@@ -17465,6 +17466,75 @@ fn tc_check_missing_tail_value(body: Int, declared_ret: Int, owner_name: Str, at
 // `@allow` records nothing, so it does not reach an audit-gated diagnostic. Naming one
 // there is refused rather than dropped: an author who cannot tell a failed suppression
 // from a successful one learns nothing from either.
+// §2.21 defines a const expression as literals and arithmetic over them, plus `const`
+// bindings and struct literals whose fields are const. This answers that question for the
+// forms it can decide on the node alone. A bare identifier is ACCEPTED: deciding whether a
+// name is a `const` needs resolution this pass does not run, and rejecting every name would
+// refuse the `const DEFAULT_PORT` spelling the section names as correct.
+fn tc_is_const_expr(e: Int) -> Int {
+    if e == -1 { return 0 }
+    let k = node_kind(e)
+    if k == NodeKind.IntLit { return 1 }
+    if k == NodeKind.FloatLit { return 1 }
+    if k == NodeKind.BoolLit { return 1 }
+    if k == NodeKind.CharLit { return 1 }
+    if k == NodeKind.Ident { return 1 }
+    if k == NodeKind.UnaryOp { return tc_is_const_expr(node_left(e)) }
+    if k == NodeKind.BinOp {
+        if tc_is_const_expr(node_left(e)) == 0 { return 0 }
+        return tc_is_const_expr(node_right(e))
+    }
+    // A string with no interpolated part is a literal. One with a part is a run-time
+    // concatenation of whatever the part evaluates to, whatever that part looks like.
+    if k == NodeKind.InterpString {
+        let parts = node_elements(e)
+        if parts == -1 { return 1 }
+        let mut i = 0
+        while i < sublist_length(parts) {
+            if is_literal_string_part(sublist_get(parts, i)) == 0 { return 0 }
+            i = i + 1
+        }
+        return 1
+    }
+    if k == NodeKind.StructLit {
+        let flds = node_fields(e)
+        if flds == -1 { return 1 }
+        let mut i = 0
+        while i < sublist_length(flds) {
+            if tc_is_const_expr(node_value(sublist_get(flds, i))) == 0 { return 0 }
+            i = i + 1
+        }
+        return 1
+    }
+    0
+}
+
+// §2.13 allows a default value only on a parameter declared after `--`, and §2.21 requires
+// the value to be const. Both rules are stated as normative and neither could be broken
+// before, because the syntax did not parse.
+fn tc_check_param_defaults(fn_node: Int) ! Diag.Report {
+    let params_sl = node_params(fn_node)
+    if params_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(params_sl) {
+        let pn = sublist_get(params_sl, i)
+        let dflt = node_value(pn)
+        if dflt != -1 {
+            let nm = node_name(pn)
+            if node_int_val(pn) == 0 {
+                diag_error_at("PositionalParamDefault", POSITIONAL_PARAM_DEFAULT,
+                    "'{nm}' is a positional parameter and cannot carry a default value", pn,
+                    "move it after the `--` separator, which also makes it keyword-required")
+            } else if tc_is_const_expr(dflt) == 0 {
+                diag_error_at("NonConstParamDefault", NON_CONST_PARAM_DEFAULT,
+                    "the default for '{nm}' is not a const expression", dflt,
+                    "use a literal, a `const` binding, or arithmetic over those")
+            }
+        }
+        i = i + 1
+    }
+}
+
 fn tc_check_allow_annotation(fn_node: Int) ! Diag.Report {
     let allow_ann = get_annotation(fn_node, "allow")
     if allow_ann == -1 { return }
@@ -17520,6 +17590,7 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
 
     let is_ffi = has_annotation(fn_node, "ffi")
     tc_check_allow_annotation(fn_node)
+    tc_check_param_defaults(fn_node)
     diag_push_allows(fn_node)
 
     let params_sl = node_params(fn_node)

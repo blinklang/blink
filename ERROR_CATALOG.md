@@ -98,6 +98,8 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | DuplicateKeywordArg | E0528 | The same call-site label appears twice in one call | Name resolution | §2.13 |
 | UnlabeledKeywordArg | E0529 | A keyword parameter received its argument positionally — the value is present and unlabelled | Name resolution | §2.13 |
 | RawOutsideTemplate | E0530 | A `Raw[T]` reached a position that does not consume it — only a `Template[C]` coercion does | Type checking | §3b.5 |
+| PositionalParamDefault | E0531 | A default value written on a positional parameter — only parameters declared after `--` may carry one | Type checking | §2.13 |
+| NonConstParamDefault | E0532 | A parameter default that is not a const expression | Type checking | §2.13, §2.21 |
 | CloseableEscapesScope | E0601 | `Closeable` value escapes `with...as` scope | Resources | §5.5 |
 | ArenaValueEscapes | E0700 | Arena-scoped value escapes arena scope | Arena | §5.2 |
 | ArenaTypeContainsCycle | E0701 | Type crossing `with arena { }` boundary contains a cycle | Arena | §5.2 |
