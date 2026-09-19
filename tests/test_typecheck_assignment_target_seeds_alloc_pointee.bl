@@ -8,9 +8,9 @@
 import std.fs
 import compiler.{compile_to_program}
 import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, tc_tid_child, tc_tid_child_count}
-import parser.{nodes, node_kind, node_method}
+import parser.{nodes, node_kind, node_method, node_elements, sublist_length}
 import ast.{NodeKind}
-import diagnostics.{diag_entries, diag_reset}
+import diagnostics.{diag_entries, diag_reset, diag_file_for_node}
 import std.io
 
 fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
@@ -151,4 +151,86 @@ test "seeding the target type still rejects an assignment between unlike pointer
         if n == "TypeError" { hits = hits + 1 }
     }
     assert(hits >= 1)
+}
+
+fn both_positions_src() -> Str {
+    #"
+@trusted(audit: "x")
+fn go() ! FFI {
+    with ffi.scope() as scope {
+        let mut p: Ptr[U8] = scope.alloc_n(2)
+        let mut q: Ptr[U8] = scope.alloc()
+        q = scope.alloc_n(3)
+        p.write(1)
+        q.write(2)
+    }
+}
+fn main() { go() }
+"#
+}
+
+// The claim of the fix is that the two positions are the same channel, not that assignment
+// grew a channel of its own that happens to work. Measured as an equality between the two
+// calls rather than against a written-out type, so the row keeps its meaning if the
+// spelling of the pointee ever changes.
+test "an alloc_n on the right of an assignment carries the same type as one in a let" {
+    typecheck_probe("build/tc_assign_alloc_n_both.bl", both_positions_src())
+    assert_no_errors("alloc_n in both positions")
+    let mut found: List[Int] = []
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.MethodCall && node_method(i) == "alloc_n" {
+            found.push(tc_lookup_node_tid(i))
+        }
+        i = i + 1
+    }
+    assert(found.len() == 2)
+    let in_let = found.get(0).unwrap()
+    let in_assign = found.get(1).unwrap()
+    if in_let != in_assign {
+        io.println("FAIL: let says {tid_str(in_let)}, assignment says {tid_str(in_assign)}")
+    }
+    assert(in_let == in_assign)
+    assert_tid("alloc_n in a let", in_let, "Ptr[U8]")
+}
+
+fn empty_list_src() -> Str {
+    #"
+fn go() {
+    let ys: List[Str] = []
+    let mut xs: List[Int] = [1, 2]
+    xs = []
+    let _ = xs.len()
+    let _ = ys.len()
+}
+fn main() { go() }
+"#
+}
+
+// The arena allocators are not the only reader of the expected type at an assignment's
+// right. A container literal with nothing in it has no element type of its own and can only
+// take the one the target was declared with, so it fails the same way when that channel is
+// missing.
+test "an empty list on the right of an assignment takes the target's element type" {
+    typecheck_probe("build/tc_assign_empty_list.bl", empty_list_src())
+    assert_no_errors("empty list in assignment position")
+    // The pool holds the whole prelude too, and it writes empty lists of its own.
+    let mut found: List[Int] = []
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.ListLit && sublist_length(node_elements(i)) == 0 && diag_file_for_node(i) == "build/tc_assign_empty_list.bl" {
+            found.push(i)
+        }
+        i = i + 1
+    }
+    assert(found.len() == 2)
+    // Written in this order: the let's empty list, then the assignment's. Both are here so
+    // the row says the two positions agree, and the two element types differ so neither can
+    // pass by reading the other's.
+    let in_let = tc_lookup_node_tid(found.get(0).unwrap())
+    let in_assign = tc_lookup_node_tid(found.get(1).unwrap())
+    assert_tid("empty list in a let", in_let, "List[Str]")
+    assert_tid("empty list in an assignment", in_assign, "List[Int]")
+    assert(tc_tid_child_count(in_assign) == 1)
+    assert_tid("element", tc_tid_child(in_assign, 0), "Int")
 }
