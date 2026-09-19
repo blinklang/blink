@@ -27,6 +27,8 @@ import layout.{layout_reset}
 import ir.{ir_c_name, ir_c_spelling, ir_kid, ir_kid_count, ir_kind, ir_reset, IrKind}
 import cg_test_helpers.{cg_probe_compile}
 import cg_stmt.{cg_stmt_reset, lower_block, lower_fn}
+import cg_call.{cg_call_element_from_runtime}
+import typecheck.{TYPE_INT}
 import cg_expr.{cg_expr_reset}
 import lower_test_helpers.{
     assert_eq_str, assert_shape, assert_verifies, ice_count, ice_count_exactly, last_ice,
@@ -353,7 +355,7 @@ test "a tuple binder over a list refuses by its own name, not the iterable's" {
 }
 "#, "run")
     assert_refused(body, "ForInTupleBinderNotLowered",
-        "destructures the element into more than one name")
+        "this for-in destructures the element into more than one name, and no stage binds a destructured element yet")
 }
 
 test "a for-in over a string still refuses by name" {
@@ -393,4 +395,44 @@ test "a for-in over a map still refuses by name" {
 "#, "run")
     assert_refused(body, "UnhandledIterable",
         "for-in over this iterable has no lowering yet")
+}
+
+test "a for-in over a bytes value still refuses by name" {
+    let body = probe_body("cg_stmt_for_in_bytes", #"fn run(b: Bytes) -> Int {
+    let mut n = 0
+    for x in b {
+        n = n + x.to_int()
+    }
+    n
+}
+"#, "run")
+    assert_refused(body, "UnhandledIterable",
+        "for-in over this iterable has no lowering yet")
+}
+
+test "a for-in over a channel still refuses by name" {
+    let body = probe_body("cg_stmt_for_in_channel", #"fn run(c: Channel[Int]) -> Int {
+    let mut n = 0
+    for x in c {
+        n = n + x
+    }
+    n
+}
+"#, "run")
+    assert_refused(body, "UnhandledIterable",
+        "for-in over this iterable has no lowering yet")
+}
+
+// ── The element read, on its own ──────────────────────────────────────────
+
+// The loop does not build its element read; it asks cg_call for one, through the same seam
+// the checked element read goes through, so a read and a store cannot come to disagree
+// about what a container slot holds. Asked on its own, with no loop around it, the seam
+// still answers the two conversions: the runtime hands back one machine word, that word is
+// widened to the slot's width, and the slot is then read at the element's own C type.
+test "the element read seam converts the runtime word without a loop around it" {
+    let f = lowered_program("cg_stmt_for_in_seam", src_list_sum(), "sum")
+    let read = cg_call_element_from_runtime(f, TYPE_INT, "list_get", [])
+    assert(read >= 0)
+    assert_shape("element read", read, "Cast(Cast(CallRuntime))")
 }

@@ -47,7 +47,10 @@ import cg_expr.{
     x_layout_checked, x_stopped,
 }
 import cg_eff.{CleanupProtocol, cg_eff_resource_cleanup}
-import cg_call.{AssertKind, cc_assert_family_kind}
+import cg_call.{
+    AssertKind, ForInIteration, ForInStrategy, cc_assert_family_kind,
+    cg_call_element_from_runtime, for_in_iteration_of,
+}
 import unparse.{unparse_expr}
 
 // A carrier holds its discriminant in `tag`, its Option payload in `value` and its
@@ -1212,17 +1215,90 @@ fn lower_loop(node: Int) -> Int ! Diag.Report {
 // ── For-in ────────────────────────────────────────────────────────────────
 
 // `for i in a..b` is a counted loop, so it lowers with no help from the runtime. Every
-// other iterable needs a runtime symbol, and no producer names those yet, so the shapes
-// below report rather than guess an iteration protocol.
+// other iterable is walked by index, and the two runtime entry points walking needs are
+// named by cg_call's for_in_iteration_of rather than chosen here.
 fn lower_for_in(node: Int) -> Int ! Diag.Report {
     let iter = node_iterable(node)
-    if nk_of(node_kind(iter)) != NodeKind.RangeLit {
-        diag_ice_at("UnhandledIterable", UNHANDLED_ITERABLE_AT_CODEGEN,
-            "for-in over this iterable has no lowering yet", node,
-            "a container or iterator needs a runtime symbol producer; only ranges lower today")
+    if nk_of(node_kind(iter)) == NodeKind.RangeLit { return lower_for_range(node, iter) }
+    let container = tid_of_node(iter)
+    if container < 0 { return ir_block(node, []) }
+    let walk = for_in_iteration_of(container, node)
+    // The producer reports the iterables it has no entry points for, and answers a shape
+    // with no element. Reporting again here would name one gap twice.
+    if walk.element_tid < 0 { return ir_block(node, []) }
+    if !for_in_walkable(node, container, walk) { return ir_block(node, []) }
+    if node_elements(node) != -1 {
+        diag_ice_at("ForInTupleBinderNotLowered", CODEGEN_STAGE_NOT_BUILT,
+            "this for-in destructures the element into more than one name, and no stage binds a destructured element yet",
+            node, "a destructured binder records no mutability at its bind site, so a closure in the body could not tell a capture of one from a binding it shares")
         return ir_block(node, [])
     }
-    lower_for_range(node, iter)
+    lower_for_indexed(node, iter, walk)
+}
+
+// Only a list is walked today. Every other container the producer answers reads its
+// element back at a C type of its own -- blink_bytes_get answers an integer where
+// blink_list_get answers a cell -- and ForInIteration does not yet say which, so a reader
+// built from it here would convert the wrong one with nothing to catch it.
+fn for_in_walkable(node: Int, container: Int, walk: ForInIteration) -> Bool ! Diag.Report {
+    if walk.strategy == ForInStrategy.Indexed && tc_tid_kind(container) == TyKind.List {
+        return true
+    }
+    diag_ice_at("UnhandledIterable", UNHANDLED_ITERABLE_AT_CODEGEN,
+        "for-in over this iterable has no lowering yet", node,
+        "a container needs an entry point whose C answer this stage can convert; only ranges and lists lower today")
+    false
+}
+
+// `for x in xs { b }` becomes
+//   L src = xs; int64_t n = blink_list_len(src); int64_t i = -1;
+//   while (1) { i = i + 1; if (i >= n) break; E x = <element of src at i>; b }
+// The container and its length are each read once, in front of the loop, so a body that
+// appends to the list it walks cannot change how many turns run. The step is at the top,
+// from -1, so a `continue` in the body cannot skip it and spin.
+fn lower_for_indexed(node: Int, iter: Int, walk: ForInIteration) -> Int ! Diag.Report {
+    let _ = open_scope()
+    let binder = node_for_binder(node)
+    let elem = walk.element_tid
+    let rec = layout_at(elem, Position.Local, binder)
+    let src_tid = tid_of_node(iter)
+    if src_tid < 0 {
+        close_scope()
+        return -1
+    }
+    let src_rec = layout_at(src_tid, Position.Local, iter)
+    let src = c_mint_local("iter")
+    let src_let = ir_let(src_tid, node, src_rec.c_spelling, src, src_rec.slot_form, lower_value(iter))
+    let len = c_mint_local("len")
+    let len_let = ir_let(TYPE_INT, node, int_spelling(node), len, int_form(node),
+        ir_call_runtime(TYPE_INT, node, int_spelling(node), walk.len_symbol, int_form(node),
+            [container_ref(node, src_tid, src_rec, src)]))
+    let idx = c_mint_local("idx")
+    let idx_let = ir_let(TYPE_INT, node, int_spelling(node), idx, int_form(node), int_const(node, "-1"))
+    let step = ir_assign(node, flag_ref(node, idx),
+        ir_binary(TYPE_INT, node, int_spelling(node), "+", flag_ref(node, idx), int_const(node, "1")))
+    let cond = ir_binary(TYPE_INT, node, int_spelling(node), ">=", flag_ref(node, idx), flag_ref(node, len))
+    let guard = ir_if(node, cond, ir_block(node, [ir_break(node)]), -1)
+    let read = cg_call_element_from_runtime(node, elem, walk.get_symbol,
+        [container_ref(node, src_tid, src_rec, src), flag_ref(node, idx)])
+    if read < 0 {
+        close_scope()
+        return -1
+    }
+    let bind = ir_let(elem, node, rec.c_spelling, cg_local_c_name(node_name(binder)), rec.slot_form, read)
+    // A for-in binder has no `mut` form to write, so it is immutable as a matter of syntax
+    // rather than of bookkeeping, and a closure in the body may copy it.
+    bind_binder_mut(cur_scope(), node_name(binder), elem, false)
+    let body = lower_block(node_body(node))
+    close_scope()
+    if body < 0 { return -1 }
+    ir_block(node, [src_let, len_let, idx_let, ir_loop(node, ir_block(node, [step, guard, bind, body]))])
+}
+
+// A read of the local the container was copied into. Each read is a node of its own,
+// because the verifier rejects one node reached from two places.
+fn container_ref(span: Int, tid: Int, rec: LayoutRecord, name: Str) -> Int {
+    ir_var_ref(tid, span, rec.c_spelling, name, rec.slot_form)
 }
 
 // `for i in lo..hi { b }` becomes
@@ -1246,7 +1322,8 @@ fn lower_for_range(node: Int, iter: Int) -> Int ! Diag.Report {
     let end_let = ir_let(tid, iter, rec.c_spelling, end_name, rec.slot_form, lower_value(node_end(iter)))
     let first = c_mint_local("first")
     let first_let = ir_let(TYPE_INT, node, int_spelling(node), first, int_form(node), int_const(node, "1"))
-    bind_binder(cur_scope(), node_name(binder), tid)
+    // A for-in binder has no `mut` form to write, so it is immutable as a matter of syntax.
+    bind_binder_mut(cur_scope(), node_name(binder), tid, false)
     let step = ir_if(node, flag_ref(node, first),
         ir_block(node, [ir_assign(node, flag_ref(node, first), int_const(node, "0"))]),
         ir_block(node, [ir_assign(node, ir_var_ref(tid, node, rec.c_spelling, name, rec.slot_form),
@@ -1264,8 +1341,9 @@ fn lower_for_range(node: Int, iter: Int) -> Int ! Diag.Report {
     ir_block(node, [init, end_let, first_let, ir_loop(node, ir_block(node, [step, guard, body]))])
 }
 
-// A read of a compiler-minted integer flag. Each read is a node of its own, because the
-// verifier rejects one node reached from two places.
+// A read of a compiler-minted integer local: a range's first-turn flag, or a walk's index
+// and length. Each read is a node of its own, because the verifier rejects one node
+// reached from two places.
 fn flag_ref(span: Int, name: Str) -> Int ! Diag.Report {
     ir_var_ref(TYPE_INT, span, int_spelling(span), name, int_form(span))
 }
