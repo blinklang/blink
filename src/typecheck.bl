@@ -220,6 +220,17 @@ type EnumVariantEntry {
     has_data: Int
 }
 let mut evar_pool: List[EnumVariantEntry] = []
+// Flat side-table PARALLEL to evar_pool (same index, same length): the AST node that
+// declared each variant. A constructor call resolves to a variant SLOT, so the slot is what
+// carries the declaration back. The enum-level table cannot: it answers with the enum, and
+// is first-declared-wins per bare variant name, so two enums sharing a variant name get one
+// answer between them.
+let mut evar_decl_nodes: List[Int] = []
+
+fn tc_variant_decl_node(var_idx: Int) -> Int {
+    if var_idx < 0 || var_idx >= evar_decl_nodes.len() { return -1 }
+    evar_decl_nodes.get(var_idx).unwrap()
+}
 
 type EnumVariantFieldEntry {
     var_idx: Int
@@ -297,6 +308,13 @@ type FnSigEntry {
     type_params_count: Int
     effects_start: Int
     effects_count: Int
+    // The declaration this signature was built from, or -1 for an intrinsic, which has
+    // none. A call is resolved by finding the signature, so carrying the declaration here
+    // is what lets the call record the SAME declaration the signature answered for. A
+    // second lookup keyed on the spelling would not: one method name may be written in
+    // several impls over one type, and several source-typed `from` impls share both the
+    // type and the method name.
+    decl: Int
 }
 let mut fnsig_pool: List[FnSigEntry] = []
 let mut fnsig_param_list: List[Int] = []
@@ -1135,6 +1153,7 @@ let mut depr_type_nodes: Map[Str, Int] = Map()
 // primary span at the struct decl and a secondary span at the enum decl.
 pub let mut tc_struct_decl_nodes: Map[Str, Int] = Map()
 let mut tc_variant_enum_decl_nodes: Map[Str, Int] = Map()
+
 // Dedupe so each colliding name is reported once, not per use site.
 let mut tc_collision_reported: Map[Str, Int] = Map()
 
@@ -4586,7 +4605,7 @@ fn register_intrinsic_fn_sig(key: Str, params: List[Int], ret: Int) {
         i = i + 1
     }
     fnsig_map.insert(key, fnsig_pool.len())
-    fnsig_pool.push(FnSigEntry { name: key, ret: ret, params_start: start, params_count: params.len(), type_params_start: fnsig_type_param_names.len(), type_params_count: 0, effects_start: fnsig_effect_names.len(), effects_count: 0 })
+    fnsig_pool.push(FnSigEntry { name: key, ret: ret, params_start: start, params_count: params.len(), type_params_start: fnsig_type_param_names.len(), type_params_count: 0, effects_start: fnsig_effect_names.len(), effects_count: 0, decl: -1 })
 }
 
 // The signature of every namespace intrinsic typecheck is allowed to know.
@@ -7101,6 +7120,7 @@ fn resolve_enum_variants(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.
                 }
             }
             evar_pool.push(EnumVariantEntry { enum_id: tid, name: vname, tag: _tag, has_data: _has_data })
+            evar_decl_nodes.push(v)
             if tc_variant_enum_decl_nodes.contains_key(vname) == 0 {
                 tc_variant_enum_decl_nodes.insert(vname, td)
             }
@@ -7733,7 +7753,7 @@ fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
             ei = ei + 1
         }
     }
-    fnsig_pool.push(FnSigEntry { name: name, ret: ret_tid, params_start: start, params_count: count, type_params_start: tp_start, type_params_count: tp_count, effects_start: eff_start, effects_count: eff_count })
+    fnsig_pool.push(FnSigEntry { name: name, ret: ret_tid, params_start: start, params_count: count, type_params_start: tp_start, type_params_count: tp_count, effects_start: eff_start, effects_count: eff_count, decl: fn_node })
 
     if has_annotation(fn_node, "deprecated") != 0 {
         depr_fn_nodes.insert(name, fn_node)
@@ -9400,6 +9420,7 @@ fn init_types() ! TypeCheck.Register {
     sfield_pool.clear()
     nr_callable_field_names.clear()
     evar_pool.clear()
+    evar_decl_nodes.clear()
     evfield_pool.clear()
     fnsig_pool.clear()
     fnsig_map.clear()
@@ -15037,6 +15058,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 if ctor_tid != -1 && type_kind(ctor_tid) == TyKind.Enum {
                     let cvar_idx = get_variant_by_name(ctor_tid, method)
                     if cvar_idx != -1 {
+                        nr_note_call_decl(node, tc_variant_decl_node(cvar_idx))
                         let cargs_sl = node_args(node)
                         // Arity-check the qualified ctor, mirroring the
                         // bare-Ident variant path. The per-arg loop below
@@ -15991,6 +16013,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             let sig = lookup_fnsig(sig_name)
             if sig != -1 {
                 check_arg_shapes("{tname}.{method}", sig, node_args(node), 1, node)
+                // Which declaration this call reached. The signature answers, because the
+                // receiver picked the signature and the receiver is the only thing that
+                // tells two impls of one method name apart.
+                nr_note_call_decl(node, fnsig_pool.get(sig).unwrap().decl)
                 // A method's OWN bounded type param (`fn combine[U: Add](self, ...)`)
                 // registers into the same fnsig with the same parallel name+bound side-
                 // tables, so enforce it at the call the same way (E0306). self_offset=1:
@@ -16470,6 +16496,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 if static_trait != "" && tc_method_trait_count(obj_name, method) == 1 {
                     let q_sig = lookup_fnsig("{obj_name}_{static_trait}_{method}")
                     if q_sig != -1 {
+                        nr_note_call_decl(node, fnsig_pool.get(q_sig).unwrap().decl)
                         // The impl's signature still says `Self`; the call names the type.
                         let q_ret = fnsig_pool.get(q_sig).unwrap().ret
                         let self_tid = lookup_named_type(obj_name)
@@ -16483,6 +16510,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 let static_sig_name = "{obj_name}_{method}"
                 let static_sig = lookup_fnsig(static_sig_name)
                 if static_sig != -1 {
+                    nr_note_call_decl(node, fnsig_pool.get(static_sig).unwrap().decl)
                     return fnsig_pool.get(static_sig).unwrap().ret
                 }
                 // From/TryFrom are the one scheme neither key above can name: tc_mangle_impl_fnsig
@@ -16510,6 +16538,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         let src_t = infer_type(sublist_get(ff_args, 0))
                         let src_sig = lookup_fnsig("{obj_name}_{method}_{tc_type_str(src_t)}")
                         if src_sig != -1 {
+                            nr_note_call_decl(node, fnsig_pool.get(src_sig).unwrap().decl)
                             let ff_ret = fnsig_pool.get(src_sig).unwrap().ret
                             // A `from` impl method is declared `-> Self`, so its fnsig
                             // ret is the Self typevar. The static call `Type.from(x)`
