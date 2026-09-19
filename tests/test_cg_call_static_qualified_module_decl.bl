@@ -1,0 +1,118 @@
+// A static associated-function call (`Type.method(args)`) lowers to the exact declaration
+// typecheck already recorded for the call (typecheck.tc_call_decl_node), not to a fresh
+// search of every declaration in the program for the mangled name `{Type}_{method}`.
+//
+// tests/zzst_calls/src/zzst_left.bl and zzst_right.bl are two independent modules that each
+// declare their own ZzstBox type with its own ZzstBox_make. Neither program below loads both
+// at once, so each just proves the call reaches this file's own declaration.
+//
+// zzst_shared.bl and zzst_extra.bl are a second pair, loaded TOGETHER by
+// main_static_collision.bl: zzst_extra adds a second `ZzstCrate_make` over zzst_shared's own
+// type, so this one program's declaration set genuinely holds two functions of that exact
+// spelling. A codegen stage that re-derived the callee by scanning every declaration for
+// that spelling could not tell the two apart and would refuse a call typecheck already
+// answered.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_call_decl_node}
+import diagnostics.{diag_reset, diag_entries}
+import parser.{node_kind, node_name, node_obj, node_method, node_module, nodes}
+import ast.{NodeKind, nk_of}
+import layout.{layout_reset}
+import ir.{ir_reset, IrKind, ir_kind, ir_kind_name, ir_c_name}
+import cg_expr.{cg_expr_reset}
+import cg_reg.{cg_reg_reset, cg_reg_build, cg_reg_fn_decls}
+import cg_call.{lower_call}
+import mono.{run_mono}
+import cname.{c_fn_decl_name}
+import cg_test_helpers.{cg_probe_begin, cg_probe_front_end_clean}
+import std.io
+
+fn dump_ice() {
+    for d in diag_entries {
+        if d.severity == "ice" || d.severity == "error" { io.println("  [{d.severity}] {d.name}: {d.message}") }
+    }
+}
+
+fn compile_fixture(path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    diag_reset()
+    cg_probe_begin(path)
+    let program = compile_to_program(path, 1)
+    cg_probe_front_end_clean("import resolution")
+    check_types(program)
+    cg_probe_front_end_clean("type checking")
+    layout_reset()
+    ir_reset()
+    cg_expr_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    program
+}
+
+fn qualified_call(qualifier: Str, member: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.MethodCall && node_method(i) == member {
+            let obj = node_obj(i)
+            if obj != -1 && nk_of(node_kind(obj)) == NodeKind.Ident && node_name(obj) == qualifier {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    io.println("FAIL: no qualified call '{qualifier}.{member}' found")
+    assert(false)
+    -1
+}
+
+fn decl_named_in(module_key: Str, name: Str) -> Int {
+    for f in cg_reg_fn_decls() {
+        if node_name(f) == name && node_module(f) == module_key { return f }
+    }
+    io.println("FAIL: no declaration of '{name}' in module '{module_key}'")
+    assert(false)
+    -1
+}
+
+fn assert_calls_symbol(label: Str, id: Int, want_module: Str, want_name: Str) {
+    if id < 0 {
+        io.println("FAIL: {label}: lowering refused instead of answering a call")
+        dump_ice()
+    }
+    assert(id >= 0)
+    if ir_kind(id) != IrKind.CallDirect {
+        io.println("FAIL: {label}: kind is {ir_kind_name(ir_kind(id))}, want CallDirect")
+    }
+    assert_eq(ir_kind(id), IrKind.CallDirect)
+    let want = c_fn_decl_name(decl_named_in(want_module, want_name))
+    if ir_c_name(id) != want {
+        io.println("FAIL: {label}: symbol is '{ir_c_name(id)}', want '{want}'")
+    }
+    assert_eq(ir_c_name(id), want)
+}
+
+test "a static call to an independently-declared namesake reaches this file's own import" {
+    let program = compile_fixture("tests/zzst_calls/src/main_static_left.bl")
+    run_mono(program)
+    assert_calls_symbol("left", lower_call(qualified_call("ZzstBox", "make")), "zzst_left", "ZzstBox_make")
+}
+
+// The same associated-function spelling, an unrelated independent module: proves the answer
+// follows each file's own declaration rather than being a fixed winner of a scan over every
+// declaration named `ZzstBox_make`.
+test "the same associated function name in a second independent module reaches its own declaration" {
+    let program = compile_fixture("tests/zzst_calls/src/main_static_right.bl")
+    run_mono(program)
+    assert_calls_symbol("right", lower_call(qualified_call("ZzstBox", "make")), "zzst_right", "ZzstBox_make")
+}
+
+// The actual regression this retirement fixes: two declarations of the identical mangled
+// name genuinely coexist in one program's declaration set (zzst_shared.ZzstCrate_make and
+// zzst_extra.ZzstCrate_make). A program-wide name scan finds both and cannot tell them
+// apart; the call's own recorded declaration can, and lowering must follow it instead of
+// refusing a call typecheck already resolved.
+test "two declarations of the identical mangled name in one program still lower via the call's own resolved declaration" {
+    let program = compile_fixture("tests/zzst_calls/src/main_static_collision.bl")
+    run_mono(program)
+    assert_calls_symbol("collision", lower_call(qualified_call("ZzstCrate", "make")), "zzst_extra", "ZzstCrate_make")
+}
