@@ -13,24 +13,31 @@ import ast.{NodeKind, nk_of, node_kind_name}
 import parser.{
     node_args, node_arms, node_body, node_col, node_condition, node_elements, node_else_body,
     node_end, node_fields, node_for_binder, node_guard, node_handlers, node_inclusive,
-    node_index, node_int_val, node_iterable, node_kind, node_left, node_name, node_obj,
-    node_op, node_params, node_pattern, node_right, node_scrutinee, node_start, node_stmts,
-    node_str_val, node_target, node_then_body, node_type_name, node_type_ann, node_value,
-    sublist_get, sublist_length,
+    node_index, node_int_val, node_iterable, node_kind, node_left, node_line, node_name,
+    node_obj, node_op, node_params, node_pattern, node_right, node_scrutinee, node_start,
+    node_stmts, node_str_val, node_target, node_then_body, node_type_name, node_type_ann,
+    node_value, sublist_get, sublist_length,
 }
-import typecheck.{TyKind, TYPE_INT, tc_tid_handler_effect, tc_tid_kind}
+import typecheck.{
+    TyKind, TYPE_BOOL, TYPE_CHAR, TYPE_FLOAT, TYPE_INT, TYPE_STR, TYPE_VOID,
+    tc_alias_to_original, tc_tid_handler_effect, tc_tid_kind,
+}
 import layout.{
     Position, Slot, SlotForm, LayoutRecord, bind_binder, binder_scope_pop, binder_scope_push,
-    child_tid, ensure_typedef_for, layout_of, tid_of_binder, tid_of_node,
+    child_tid, ensure_typedef_for, layout_of, tid_of_binder, tid_of_node, varargs_spelling,
 }
-import cname.{c_decl_for_tid, c_enum_payload_member, c_local_name, c_mint_local, c_mono_variant_tag_macro}
+import cname.{
+    c_decl_for_tid, c_enum_payload_member, c_local_name, c_mint_local,
+    c_mono_variant_tag_macro, c_runtime_helper, c_string_literal,
+}
 import ir.{
-    IrKind, ir_assign, ir_binary, ir_block, ir_break, ir_carrier_tag, ir_carrier_unwrap,
-    ir_const, ir_continue, ir_expr_stmt, ir_field_get, ir_if, ir_kind, ir_let, ir_loop,
-    ir_return, ir_span, ir_switch, ir_unreachable, ir_var_ref, ir_with_scope,
+    IrKind, ir_assign, ir_binary, ir_block, ir_break, ir_call_runtime, ir_carrier_tag,
+    ir_carrier_unwrap, ir_cast, ir_const, ir_continue, ir_expr_stmt, ir_field_get, ir_if,
+    ir_kind, ir_let, ir_loop, ir_mark_materialize, ir_return, ir_span, ir_switch, ir_unary,
+    ir_unreachable, ir_var_ref, ir_with_scope,
 }
 import diagnostics.{
-    Diag, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
+    Diag, diag_file_for_node, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
     CODEGEN_STAGE_NOT_BUILT, UNHANDLED_ITERABLE_AT_CODEGEN, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 import cg_expr.{
@@ -39,6 +46,14 @@ import cg_expr.{
     x_layout_checked, x_stopped,
 }
 import cg_eff.{CleanupProtocol, cg_eff_resource_cleanup}
+import unparse.{unparse_expr}
+
+// The four runtime symbols the assert family fails through. Local until cname.bl carries
+// its own getters for them.
+let ASSERT_FAIL_SYMBOL = "__blink_assert_fail"
+let ASSERT_FAIL_EQ_SYMBOL = "__blink_assert_fail_eq"
+let ASSERT_FAIL_INTRO_SYMBOL = "__blink_assert_fail_intro"
+let DEBUG_ASSERT_FAIL_SYMBOL = "__blink_debug_assert_fail"
 
 // A carrier holds its discriminant in `tag`, its Option payload in `value` and its
 // Result arms in `ok` and `err`. These are member names in a struct layout.bl emits,
@@ -75,9 +90,24 @@ let TAIL_ASSIGN = 2
 
 let mut scope_stack: List[Int] = []
 
+// Whether a `debug_assert` lowers to a check or to nothing. Set once from CgConfig for a
+// whole build, so a reset between probes leaves it as the caller set it, the same way a
+// build never changes this flag between the functions it lowers.
+let mut cs_debug_mode: Bool = false
+
+pub fn cg_stmt_set_debug_mode(on: Bool) {
+    cs_debug_mode = on
+}
+
+// The name of the function whose body is lowering, for `debug_assert`'s failure message.
+// Saved and restored around a function's own body, so a nested closure body cannot leak
+// its name into the function around it.
+let mut cs_current_fn_name: Str = ""
+
 pub fn cg_stmt_reset() {
     scope_stack = []
     mv_clean = true
+    cs_current_fn_name = ""
 }
 
 // ── Types, spellings and names ────────────────────────────────────────────
@@ -174,7 +204,10 @@ pub fn lower_fn(fn_node: Int) -> Int ! Diag.Report {
     // and comes back off after, leaving nothing for the next function to read.
     let ann = node_type_ann(fn_node)
     cg_expr_set_return_type(if ann < 0 { -1 } else { stmt_tid(ann) })
+    let saved_fn_name = cs_current_fn_name
+    cs_current_fn_name = node_name(fn_node)
     let block = if bound && body >= 0 { lower_body_block(body, tail, "", -1) } else { -1 }
+    cs_current_fn_name = saved_fn_name
     cg_expr_set_return_type(-1)
     close_scope()
     // A stopped body, a parameter with no type and a declaration with no body all leave
@@ -262,8 +295,27 @@ fn lower_stmt_tail(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag
         NodeKind.LoopExpr => lower_loop(node)
         NodeKind.ForIn => lower_for_in(node)
         NodeKind.WithBlock => lower_with_block(node, tail, dest, dest_tid)
+        NodeKind.Call => lower_call_stmt(node, tail, dest, dest_tid)
         _ => lower_value_stmt(node, tail, dest, dest_tid)
     }
+}
+
+// The assert family is statement-shaped only: the parser fabricates a bare Call it never
+// hands the expression stage a value for. Every other call is a value like any other, so
+// only the assert family's own names are intercepted here; everything else falls through
+// to the same value path a Call reached before this arm existed.
+fn lower_call_stmt(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
+    let callee = node_left(node)
+    if callee < 0 || nk_of(node_kind(callee)) != NodeKind.Ident {
+        return lower_value_stmt(node, tail, dest, dest_tid)
+    }
+    let written = node_name(callee)
+    let name = tc_alias_to_original.get(written) ?? written
+    if name == "assert" { return lower_assert_call(node) }
+    if name == "assert_eq" { return lower_assert_eq_call(node) }
+    if name == "assert_ne" { return lower_assert_ne_call(node) }
+    if name == "debug_assert" { return lower_debug_assert_call(node) }
+    lower_value_stmt(node, tail, dest, dest_tid)
 }
 
 fn lower_value_stmt(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
@@ -279,6 +331,379 @@ fn tail_wrap(node: Int, value: Int, tail: Int, dest: Str, dest_tid: Int) -> Int 
         return ir_assign(node, lvalue, value)
     }
     ir_expr_stmt(node, value)
+}
+
+// ── The assert family ─────────────────────────────────────────────────────
+//
+// Four builtin calls the parser hands here as a bare, statement-shaped Call: assert,
+// assert_eq, assert_ne and debug_assert. None of them produce a value, so each lowers to
+// an `if (!condition) { fail-call }`, composed from IrKind.If, IrKind.ExprStmt and
+// IrKind.CallRuntime, the same three kinds x_test_propagate_arm composes a runtime call
+// from. A stopped operand poisons the whole call, the same as any other statement; see
+// The stop above.
+
+// A value bound into a fresh local, and a read of that local. Every operand this section
+// reads twice (once to compare, once to render) binds once so its side effects run once.
+type Bound {
+    stmt: Int
+    ref: Int
+}
+
+fn bind_temp(stem: Str, tid: Int, span: Int, value: Int) -> Bound ! Diag.Report {
+    let rec = layout_at(tid, Position.Local, span)
+    let holder = c_mint_local(stem)
+    let stmt = ir_let(tid, span, rec.c_spelling, holder, rec.slot_form, value)
+    let ref = ir_var_ref(tid, span, rec.c_spelling, holder, rec.slot_form)
+    // Every Bound is read more than once by design (see the comment above); mark it so
+    // ir_verify accepts the reuse instead of reporting a value reached from two parents.
+    ir_mark_materialize(ref)
+    Bound { stmt: stmt, ref: ref }
+}
+
+fn str_const(span: Int, text: Str) -> Int ! Diag.Report {
+    let rec = layout_at(TYPE_STR, Position.Local, span)
+    ir_const(TYPE_STR, span, rec.c_spelling, c_string_literal(text))
+}
+
+// A void runtime call, in statement position. Position.Return is the shape a call with no
+// value of its own takes, the same position x_test_propagate_arm's own runtime call uses.
+fn call_runtime_void(span: Int, symbol: Str, args: List[Int]) -> Int ! Diag.Report {
+    let rec = layout_of(TYPE_VOID, Position.Return)
+    ir_expr_stmt(span, ir_call_runtime(TYPE_VOID, span, rec.c_spelling, symbol, rec.slot_form, args))
+}
+
+// blink_str_format is a value-returning Str build, not a buffer the caller must size: one
+// call builds every message, expected-side and actual-side string this section needs.
+fn call_str_format(span: Int, fmt: Str, args: List[Int]) -> Int ! Diag.Report {
+    let rec = layout_at(TYPE_STR, Position.Local, span)
+    let mut all_args = [str_const(span, fmt)]
+    let mut i = 0
+    while i < args.len() {
+        all_args.push(args.get(i).unwrap())
+        i = i + 1
+    }
+    ir_call_runtime(TYPE_STR, span, rec.c_spelling, c_runtime_helper("str_format"), rec.slot_form, all_args)
+}
+
+// `%` in a name or a literal spliced into a format string built for blink_str_format would
+// read to printf as the start of a specifier. Doubling it here is not something gen0's own
+// power-assert intro does, and gen0's intro can misrender when an operand's source holds
+// one; this section always escapes it instead of reproducing that gap.
+fn pct_escape(text: Str) -> Str {
+    let mut sb = StringBuilder.new()
+    let mut i = 0
+    while i < text.len() {
+        if text.byte_at(i) == 37 { sb.write("%") }
+        sb.write(text.substring(i, 1))
+        i = i + 1
+    }
+    sb.to_str()
+}
+
+fn assert_args_ok(node: Int, name: Str, args: Int, want: Int) -> Bool ! Diag.Report {
+    if args >= 0 && sublist_length(args) >= want {
+        return true
+    }
+    diag_ice_at("AssertArityWrong", CODEGEN_STAGE_NOT_BUILT,
+        "{name} needs at least {want} argument(s)", node,
+        "typecheck accepts a call's arity before codegen ever sees it; this is a compiler bug")
+    false
+}
+
+fn assert_aggregate_refused(node: Int, form: Str) -> Int ! Diag.Report {
+    diag_ice_at("AssertCompareAggregateNotBuilt", CODEGEN_STAGE_NOT_BUILT,
+        "{form} over a struct, an enum, a Result or an Option has no lowering yet", node,
+        "only Str, Float and the integer, Bool and Char scalars compare and render here so far")
+    -1
+}
+
+// ── assert(cond, msg?): the power-assert decomposition ────────────────────
+
+// What assert's decomposition answers: either the whole condition, unchanged, with no
+// intro text, or a rebuilt Bool condition over two bound operands plus the intro line
+// that names each side's source text and value.
+type PaResult {
+    ok: Bool
+    cond: Int
+    intro: Int
+    pre: List[Int]
+}
+
+fn pa_not_decomposed() -> PaResult ! Diag.Report {
+    PaResult { ok: false, cond: -1, intro: -1, pre: [] }
+}
+
+fn pa_op_renderable(op: Str) -> Bool {
+    op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" ||
+        op == "&&" || op == "||"
+}
+
+// The scalar set assert's intro knows how to render. && and || decompose regardless of
+// their operands' kinds; every comparison needs both sides in this set.
+fn pa_kind_renderable(k: TyKind) -> Bool {
+    k == TyKind.Int || k == TyKind.Bool || k == TyKind.Float || k == TyKind.Char ||
+        k == TyKind.Str || k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 ||
+        k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64
+}
+
+// One level deep: a top-level BinOp whose operator and operand kinds are decomposable.
+// Everything else falls back to the whole condition, rendered with no intro.
+fn pa_decompose(cond_node: Int) -> PaResult ! Diag.Report {
+    if nk_of(node_kind(cond_node)) != NodeKind.BinOp { return pa_not_decomposed() }
+    let op = node_op(cond_node)
+    if !pa_op_renderable(op) { return pa_not_decomposed() }
+    let lhs_node = node_left(cond_node)
+    let rhs_node = node_right(cond_node)
+    let logical = op == "&&" || op == "||"
+    let lhs_tid = stmt_tid(lhs_node)
+    let rhs_tid = stmt_tid(rhs_node)
+    if lhs_tid < 0 || rhs_tid < 0 { return pa_not_decomposed() }
+    if !logical && !(pa_kind_renderable(tc_tid_kind(lhs_tid)) && pa_kind_renderable(tc_tid_kind(rhs_tid))) {
+        return pa_not_decomposed()
+    }
+    let lhs_value = lower_value(lhs_node)
+    let rhs_value = lower_value(rhs_node)
+    if lhs_value < 0 || rhs_value < 0 { return pa_not_decomposed() }
+    let lhs_bound = bind_temp("pa_l", lhs_tid, lhs_node, lhs_value)
+    let rhs_bound = bind_temp("pa_r", rhs_tid, rhs_node, rhs_value)
+    let bool_rec = layout_at(TYPE_BOOL, Position.Local, cond_node)
+    let cond = pa_cond_expr(cond_node, op, lhs_tid, rhs_tid, lhs_bound.ref, rhs_bound.ref, bool_rec)
+    if cond < 0 { return pa_not_decomposed() }
+    let mut pre: List[Int] = [lhs_bound.stmt, rhs_bound.stmt]
+    let lhs_arg = pa_arg_for(lhs_node, lhs_tid, lhs_bound.ref, pre)
+    let rhs_arg = pa_arg_for(rhs_node, rhs_tid, rhs_bound.ref, pre)
+    if lhs_arg < 0 || rhs_arg < 0 { return pa_not_decomposed() }
+    let lhs_src = pct_escape(unparse_expr(lhs_node))
+    let rhs_src = pct_escape(unparse_expr(rhs_node))
+    let fmt = "  {lhs_src} = {pa_spec_for_kind(tc_tid_kind(lhs_tid))}\n  {rhs_src} = {pa_spec_for_kind(tc_tid_kind(rhs_tid))}"
+    let intro = call_str_format(cond_node, fmt, [lhs_arg, rhs_arg])
+    PaResult { ok: true, cond: cond, intro: intro, pre: pre }
+}
+
+// The rebuilt Bool condition over two already-bound operands. A Str comparison goes
+// through the same runtime helpers lower_str_binop uses; every other comparison, and both
+// logical operators, are a plain C operator between the two temps.
+fn pa_cond_expr(cond_node: Int, op: Str, lhs_tid: Int, rhs_tid: Int, lhs_ref: Int, rhs_ref: Int, bool_rec: LayoutRecord) -> Int ! Diag.Report {
+    let both_str = tc_tid_kind(lhs_tid) == TyKind.Str && tc_tid_kind(rhs_tid) == TyKind.Str
+    if both_str && (op == "==" || op == "!=") {
+        let eq = ir_call_runtime(TYPE_BOOL, cond_node, bool_rec.c_spelling,
+            c_runtime_helper("str_eq"), bool_rec.slot_form, [lhs_ref, rhs_ref])
+        if op == "!=" { return ir_unary(TYPE_BOOL, cond_node, bool_rec.c_spelling, "!", eq) }
+        return eq
+    }
+    if both_str && (op == "<" || op == "<=" || op == ">" || op == ">=") {
+        let int_rec = layout_at(TYPE_INT, Position.Local, cond_node)
+        let cmp = ir_call_runtime(TYPE_INT, cond_node, int_rec.c_spelling,
+            c_runtime_helper("str_cmp"), int_rec.slot_form, [lhs_ref, rhs_ref])
+        return ir_binary(TYPE_BOOL, cond_node, bool_rec.c_spelling, op, cmp, int_const(cond_node, "0"))
+    }
+    ir_binary(TYPE_BOOL, cond_node, bool_rec.c_spelling, op, lhs_ref, rhs_ref)
+}
+
+// The printf spec assert's intro renders a kind with. Bool and Char each need their value
+// turned into the spec's own shape first; see pa_arg_for.
+fn pa_spec_for_kind(k: TyKind) -> Str {
+    if k == TyKind.Bool { return "%s" }
+    if k == TyKind.Float { return "%g" }
+    if k == TyKind.Str { return "%s" }
+    if k == TyKind.Char { return "%d" }
+    "%lld"
+}
+
+// The argument pa_spec_for_kind's spec reads. Bool becomes its "true"/"false" spelling,
+// hoisted ahead of the statement that reads it; Float and Str pass through as they are
+// already spelled; Char passes through with no cast, since C's own vararg promotion
+// widens an int32_t to int with no help; everything else is the assert family's one
+// shared default bucket, cast the way lower_interp already casts a varargs integer hole.
+fn pa_arg_for(node: Int, tid: Int, value_ref: Int, pre: List[Int]) -> Int ! Diag.Report {
+    let k = tc_tid_kind(tid)
+    if k == TyKind.Bool { return bool_to_str_ref(node, value_ref, pre) }
+    if k == TyKind.Float { return value_ref }
+    if k == TyKind.Str { return value_ref }
+    if k == TyKind.Char { return value_ref }
+    ir_cast(tid, node, varargs_spelling(TYPE_INT), value_ref)
+}
+
+// A Bool value turned into its "true"/"false" spelling: a Str temp initialised to "false",
+// reassigned to "true" under a hoisted `if`, both pushed onto `pre` ahead of the statement
+// that reads the temp.
+fn bool_to_str_ref(node: Int, cond_ref: Int, pre: List[Int]) -> Int ! Diag.Report {
+    let str_rec = layout_at(TYPE_STR, Position.Local, node)
+    let holder = c_mint_local("pa_b")
+    pre.push(ir_let(TYPE_STR, node, str_rec.c_spelling, holder, str_rec.slot_form, str_const(node, "false")))
+    let target = ir_var_ref(TYPE_STR, node, str_rec.c_spelling, holder, str_rec.slot_form)
+    let assign_true = ir_assign(node, target, str_const(node, "true"))
+    pre.push(ir_if(node, cond_ref, ir_block(node, [assign_true]), -1))
+    ir_var_ref(TYPE_STR, node, str_rec.c_spelling, holder, str_rec.slot_form)
+}
+
+fn lower_assert_call(node: Int) -> Int ! Diag.Report {
+    let args = node_args(node)
+    if !assert_args_ok(node, "assert", args, 1) { return -1 }
+    let cond_node = sublist_get(args, 0)
+    let decomposed = pa_decompose(cond_node)
+    let cond_value = if decomposed.ok { decomposed.cond } else { lower_value(cond_node) }
+    if cond_value < 0 { return -1 }
+    let bool_rec = layout_at(TYPE_BOOL, Position.Local, node)
+    let neg = ir_unary(TYPE_BOOL, node, bool_rec.c_spelling, "!", cond_value)
+    let intro_arg = if decomposed.ok { decomposed.intro } else { str_const(node, "") }
+    let mut user_msg = str_const(node, "")
+    if sublist_length(args) >= 2 {
+        user_msg = lower_value(sublist_get(args, 1))
+        if user_msg < 0 { return -1 }
+    }
+    let assertion = "assert({unparse_expr(cond_node)})"
+    let fail_stmt = call_runtime_void(node, ASSERT_FAIL_INTRO_SYMBOL, [
+        str_const(node, assertion),
+        intro_arg,
+        str_const(node, diag_file_for_node(node)),
+        int_const(node, "{node_line(node)}"),
+        int_const(node, "{node_col(node)}"),
+        user_msg,
+    ])
+    let mut pre = decomposed.pre
+    pre.push(ir_if(node, neg, ir_block(node, [fail_stmt]), -1))
+    ir_block(node, pre)
+}
+
+// ── assert_eq / assert_ne: the per-type comparison buckets ─────────────────
+//
+// gen0 casts every scalar in this bucket to int64_t and renders it %lld, Bool and Char
+// included, regardless of signedness; there is no separate unsigned bucket here. Str
+// compares by blink_str_eq and renders %s; Float compares by != and renders %f, not the
+// %g assert's own intro uses. A struct, an enum, a Result or an Option refuses by name;
+// see assert_aggregate_refused.
+// The cast this bucket renders is built once and read twice (once in the failure
+// message, once as its own exp/act arg), so it must materialise the same as a Bound.
+fn eq_default_arg(tid: Int, span: Int, value_ref: Int) -> Int ! Diag.Report {
+    let cast = ir_cast(tid, span, varargs_spelling(TYPE_INT), value_ref)
+    ir_mark_materialize(cast)
+    cast
+}
+
+fn eq_is_str(tid: Int) -> Bool ! Diag.Report { tc_tid_kind(tid) == TyKind.Str }
+fn eq_is_float(tid: Int) -> Bool ! Diag.Report { tc_tid_kind(tid) == TyKind.Float }
+fn eq_is_aggregate(tid: Int) -> Bool ! Diag.Report {
+    let k = tc_tid_kind(tid)
+    k == TyKind.Struct || k == TyKind.Enum || k == TyKind.Result || k == TyKind.Option
+}
+
+fn lower_assert_eq_call(node: Int) -> Int ! Diag.Report {
+    let args = node_args(node)
+    if !assert_args_ok(node, "assert_eq", args, 2) { return -1 }
+    let left_node = sublist_get(args, 0)
+    let right_node = sublist_get(args, 1)
+    let tid = stmt_tid(left_node)
+    if tid < 0 { return -1 }
+    if eq_is_aggregate(tid) { return assert_aggregate_refused(node, "assert_eq") }
+    let left_value = lower_value(left_node)
+    let right_value = lower_value(right_node)
+    if left_value < 0 || right_value < 0 { return -1 }
+    let left_bound = bind_temp("left", tid, node, left_value)
+    let right_bound = bind_temp("right", tid, node, right_value)
+    let bool_rec = layout_at(TYPE_BOOL, Position.Local, node)
+    let line = int_const(node, "{node_line(node)}")
+    let mut pre: List[Int] = [left_bound.stmt, right_bound.stmt]
+    if eq_is_str(tid) {
+        let eq = ir_call_runtime(TYPE_BOOL, node, bool_rec.c_spelling,
+            c_runtime_helper("str_eq"), bool_rec.slot_form, [left_bound.ref, right_bound.ref])
+        let neq = ir_unary(TYPE_BOOL, node, bool_rec.c_spelling, "!", eq)
+        let msg = call_str_format(node, "ASSERT_EQ FAILED: \"%s\" != \"%s\"", [left_bound.ref, right_bound.ref])
+        let exp = call_str_format(node, "%s", [right_bound.ref])
+        let act = call_str_format(node, "%s", [left_bound.ref])
+        let fail_stmt = call_runtime_void(node, ASSERT_FAIL_EQ_SYMBOL, [msg, exp, act, line])
+        pre.push(ir_if(node, neq, ir_block(node, [fail_stmt]), -1))
+        return ir_block(node, pre)
+    }
+    if eq_is_float(tid) {
+        let neq = ir_binary(TYPE_BOOL, node, bool_rec.c_spelling, "!=", left_bound.ref, right_bound.ref)
+        let msg = call_str_format(node, "ASSERT_EQ FAILED: %f != %f", [left_bound.ref, right_bound.ref])
+        let exp = call_str_format(node, "%f", [right_bound.ref])
+        let act = call_str_format(node, "%f", [left_bound.ref])
+        let fail_stmt = call_runtime_void(node, ASSERT_FAIL_EQ_SYMBOL, [msg, exp, act, line])
+        pre.push(ir_if(node, neq, ir_block(node, [fail_stmt]), -1))
+        return ir_block(node, pre)
+    }
+    let left_arg = eq_default_arg(tid, node, left_bound.ref)
+    let right_arg = eq_default_arg(tid, node, right_bound.ref)
+    let neq = ir_binary(TYPE_BOOL, node, bool_rec.c_spelling, "!=", left_bound.ref, right_bound.ref)
+    let msg = call_str_format(node, "ASSERT_EQ FAILED: %lld != %lld", [left_arg, right_arg])
+    let exp = call_str_format(node, "%lld", [right_arg])
+    let act = call_str_format(node, "%lld", [left_arg])
+    let fail_stmt = call_runtime_void(node, ASSERT_FAIL_EQ_SYMBOL, [msg, exp, act, line])
+    pre.push(ir_if(node, neq, ir_block(node, [fail_stmt]), -1))
+    ir_block(node, pre)
+}
+
+// assert_ne has no Result or Option bucket in gen0 either; a struct still refuses.
+fn lower_assert_ne_call(node: Int) -> Int ! Diag.Report {
+    let args = node_args(node)
+    if !assert_args_ok(node, "assert_ne", args, 2) { return -1 }
+    let left_node = sublist_get(args, 0)
+    let right_node = sublist_get(args, 1)
+    let tid = stmt_tid(left_node)
+    if tid < 0 { return -1 }
+    if eq_is_aggregate(tid) { return assert_aggregate_refused(node, "assert_ne") }
+    let left_value = lower_value(left_node)
+    let right_value = lower_value(right_node)
+    if left_value < 0 || right_value < 0 { return -1 }
+    let left_bound = bind_temp("left", tid, node, left_value)
+    let right_bound = bind_temp("right", tid, node, right_value)
+    let bool_rec = layout_at(TYPE_BOOL, Position.Local, node)
+    let line = int_const(node, "{node_line(node)}")
+    let mut pre: List[Int] = [left_bound.stmt, right_bound.stmt]
+    if eq_is_str(tid) {
+        let eq = ir_call_runtime(TYPE_BOOL, node, bool_rec.c_spelling,
+            c_runtime_helper("str_eq"), bool_rec.slot_form, [left_bound.ref, right_bound.ref])
+        let msg = call_str_format(node, "ASSERT_NE FAILED: \"%s\" == \"%s\"", [left_bound.ref, right_bound.ref])
+        let fail_stmt = call_runtime_void(node, ASSERT_FAIL_SYMBOL, [msg, line])
+        pre.push(ir_if(node, eq, ir_block(node, [fail_stmt]), -1))
+        return ir_block(node, pre)
+    }
+    if eq_is_float(tid) {
+        let eq = ir_binary(TYPE_BOOL, node, bool_rec.c_spelling, "==", left_bound.ref, right_bound.ref)
+        let msg = call_str_format(node, "ASSERT_NE FAILED: %f == %f", [left_bound.ref, right_bound.ref])
+        let fail_stmt = call_runtime_void(node, ASSERT_FAIL_SYMBOL, [msg, line])
+        pre.push(ir_if(node, eq, ir_block(node, [fail_stmt]), -1))
+        return ir_block(node, pre)
+    }
+    let left_arg = eq_default_arg(tid, node, left_bound.ref)
+    let right_arg = eq_default_arg(tid, node, right_bound.ref)
+    let eq = ir_binary(TYPE_BOOL, node, bool_rec.c_spelling, "==", left_bound.ref, right_bound.ref)
+    let msg = call_str_format(node, "ASSERT_NE FAILED: %lld == %lld", [left_arg, right_arg])
+    let fail_stmt = call_runtime_void(node, ASSERT_FAIL_SYMBOL, [msg, line])
+    pre.push(ir_if(node, eq, ir_block(node, [fail_stmt]), -1))
+    ir_block(node, pre)
+}
+
+// ── debug_assert(cond, msg?) ────────────────────────────────────────────────
+//
+// Gated on cs_debug_mode: off answers an empty block, the same as gen0 emitting nothing.
+// On, a single non-decomposed check. gen0's own cond text is the raw C expression it just
+// emitted; nothing here holds that text, so the Blink source of the condition stands in,
+// the same substitution assert's own assertion text already makes.
+fn lower_debug_assert_call(node: Int) -> Int ! Diag.Report {
+    let args = node_args(node)
+    if !assert_args_ok(node, "debug_assert", args, 1) { return -1 }
+    if !cs_debug_mode { return ir_block(node, []) }
+    let cond_node = sublist_get(args, 0)
+    let cond_value = lower_value(cond_node)
+    if cond_value < 0 { return -1 }
+    let bool_rec = layout_at(TYPE_BOOL, Position.Local, node)
+    let neg = ir_unary(TYPE_BOOL, node, bool_rec.c_spelling, "!", cond_value)
+    let mut msg = str_const(node, "debug assertion failed")
+    if sublist_length(args) >= 2 {
+        msg = lower_value(sublist_get(args, 1))
+        if msg < 0 { return -1 }
+    }
+    let fail_stmt = call_runtime_void(node, DEBUG_ASSERT_FAIL_SYMBOL, [
+        str_const(node, diag_file_for_node(node)),
+        int_const(node, "{node_line(node)}"),
+        str_const(node, cs_current_fn_name),
+        str_const(node, unparse_expr(cond_node)),
+        msg,
+    ])
+    ir_block(node, [ir_if(node, neg, ir_block(node, [fail_stmt]), -1)])
 }
 
 // ── Simple statements ─────────────────────────────────────────────────────
