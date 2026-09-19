@@ -1,0 +1,89 @@
+// A selective import says which of a module's exported names this file means by their bare
+// spelling. It says nothing about a local binding that happens to be spelled the same: a
+// parameter or a `let` holds a value, and no import list can put it out of scope. Resolving
+// the module member first rejected every read of such a local while still accepting its
+// declaration, so the diagnostic contradicted the program it was reading.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+let PKG = "build/tc_shadow_unselected_pkg"
+
+fn compile_probe(probe_src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let _mk = process_run("mkdir", ["-p", "{PKG}/src"])
+    write_file("{PKG}/blink.toml", "[package]\nname = \"tcshadowunsel\"\nversion = \"0.1.0\"\n")
+    write_file("{PKG}/src/tok.bl", "pub fn at(i: Int) -> Int \{ i \}\npub fn other() -> Int \{ 1 \}\n")
+    write_file("{PKG}/src/probe.bl", probe_src)
+    diag_reset()
+    let program = compile_to_program("{PKG}/src/probe.bl", 1)
+    check_types(program)
+}
+
+fn cleanup() {
+    let _rm = process_run("rm", ["-rf", PKG])
+}
+
+fn count_named(name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.name == name { n = n + 1 }
+    }
+    n
+}
+
+fn errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_clean(label: Str) {
+    let errs = errors()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+test "a parameter spelled like an unselected module member is in scope" {
+    compile_probe("import tok.\{other}\n\nfn use_at(at: Int) -> Int \{ at + other() \}\n\nfn main() \{ let _n = use_at(1) \}\n")
+    assert_clean("parameter")
+    cleanup()
+}
+
+test "a let spelled like an unselected module member is in scope" {
+    compile_probe("import tok.\{other}\n\nfn run() -> Int \{ let at = 3 at + other() \}\n\nfn main() \{ let _n = run() \}\n")
+    assert_clean("let")
+    cleanup()
+}
+
+test "a let mut spelled like an unselected module member is in scope" {
+    compile_probe("import tok.\{other}\n\nfn run() -> Int \{ let mut at = 3 at = at + 1 at + other() \}\n\nfn main() \{ let _n = run() \}\n")
+    assert_clean("let mut")
+    cleanup()
+}
+
+// The rule is about a local binding, not about the name. With no binding the import list is
+// still the only thing that answers for `at`, and it does not list it.
+test "the same name with no local binding is still not selected" {
+    compile_probe("import tok.\{other}\n\nfn run() -> Int \{ at(3) + other() \}\n\nfn main() \{ let _n = run() \}\n")
+    let n = count_named("ImportNotSelected")
+    if n != 1 {
+        io.println("FAIL: unbound: ImportNotSelected raised {n} time(s), want 1")
+        for e in errors() { io.println("  {e}") }
+    }
+    assert(n == 1)
+    cleanup()
+}
+
+test "the qualified spelling resolves whether or not a local shadows it" {
+    compile_probe("import tok.\{other}\n\nfn use_at(at: Int) -> Int \{ tok.at(at) + other() \}\n\nfn main() \{ let _n = use_at(1) \}\n")
+    assert_clean("qualified")
+    cleanup()
+}

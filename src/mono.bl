@@ -70,6 +70,10 @@ let mut generic_fn_by_name: Map[Str, Int] = Map()
 // and only a generic free function may be discovered through it: a generic type declaration
 // also carries type parameters and is not a callee of this kind.
 let mut generic_fn_nodes: Map[Int, Int] = Map()
+// A method that declares type parameters of its OWN, keyed by its declaration node and
+// holding the impl block it sits in. The impl supplies the symbol stem; the method's own
+// binders supply the instance arguments, so the two never come from the same place.
+let mut own_generic_method_impl: Map[Int, Int] = Map()
 let mut poly_method_by_name: Map[Str, Int] = Map()
 let mut poly_method_by_qualified: Map[Str, Int] = Map()
 let mut poly_block_of_method: Map[Int, Int] = Map()
@@ -144,6 +148,7 @@ fn mono_reset() {
     mono_call_target = Map()
     generic_fn_by_name = Map()
     generic_fn_nodes = Map()
+    own_generic_method_impl = Map()
     poly_method_by_name = Map()
     poly_method_by_qualified = Map()
     poly_block_of_method = Map()
@@ -171,8 +176,25 @@ fn mono_build_decl_maps(program: Int) {
     let impls_sl = node_methods(program)
     let mut ii = 0
     while ii < sl_len(impls_sl) {
-        register_poly_impl(sublist_get(impls_sl, ii))
+        let im = sublist_get(impls_sl, ii)
+        register_poly_impl(im)
+        register_own_generic_methods(im)
         ii = ii + 1
+    }
+}
+
+// A method's own type parameters are chosen by the call, so such a method is a template
+// and not a body, exactly like a generic free function. A poly impl is left alone: its
+// element binder and the method's own binders would have to be registered as one argument
+// tuple, and nothing reads that shape yet.
+fn register_own_generic_methods(im: Int) {
+    if is_poly_impl(im) { return }
+    let methods_sl = node_methods(im)
+    let mut j = 0
+    while j < sl_len(methods_sl) {
+        let m = sublist_get(methods_sl, j)
+        if has_type_params(m) { own_generic_method_impl.insert(m, im) }
+        j = j + 1
     }
 }
 
@@ -273,7 +295,7 @@ fn walk_roots(program: Int) ! Diag.Report {
     let mut ii = 0
     while ii < sl_len(impls_sl) {
         let im = sublist_get(impls_sl, ii)
-        if !is_poly_impl(im) { walk_sl(ROOT_CTX, node_methods(im)) }
+        if !is_poly_impl(im) { walk_impl_root_methods(im) }
         ii = ii + 1
     }
     walk_sl(ROOT_CTX, node_arms(program))
@@ -283,6 +305,19 @@ fn walk_roots(program: Int) ! Diag.Report {
     while ti < sl_len(tests_sl) {
         mono_walk(ROOT_CTX, node_body(sublist_get(tests_sl, ti)))
         ti = ti + 1
+    }
+}
+
+// Every method of the impl except the ones the calls instantiate. A template walked as a
+// root would record its own binders as the types of its parameters, and those are the
+// types the emitted signature reads.
+fn walk_impl_root_methods(im: Int) ! Diag.Report {
+    let methods_sl = node_methods(im)
+    let mut j = 0
+    while j < sl_len(methods_sl) {
+        let m = sublist_get(methods_sl, j)
+        if !own_generic_method_impl.contains_key(m) { mono_walk(ROOT_CTX, m) }
+        j = j + 1
     }
 }
 
@@ -541,6 +576,19 @@ fn register_fn(gfn: Int, arg_tids0: List[Int]) -> Int {
     register(gfn, binders_sl, arg_tids, inst_tid, c_mono_fn_name(gfn, args_tid))
 }
 
+// An instance of a method's own type parameters. The impl block names the symbol, so two
+// impls of one trait method stay apart, and the arguments are the method's binders alone.
+fn register_own_generic_method(m: Int, arg_tids0: List[Int]) -> Int {
+    if arg_tids0.len() == 0 { return -1 }
+    let arg_tids = canon_tids(arg_tids0)
+    let binders_sl = node_type_params(m)
+    let args_tid = make_tuple_type(arg_tids)
+    let im = own_generic_method_impl.get(m) ?? -1
+    if im < 0 { return -1 }
+    let inst_tid = canon_tid(fn_signature_tid(m, binds_from_binders(binders_sl, arg_tids)))
+    register(m, binders_sl, arg_tids, inst_tid, c_poly_method_name(im, node_name(m), args_tid))
+}
+
 fn register_poly_method(m: Int, elem_tid0: Int) -> Int {
     let elem_tid = canon_tid(elem_tid0)
     let im = poly_block_of_method.get(m).unwrap()
@@ -686,6 +734,19 @@ fn discover_list_hof_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
     }
 }
 
+// `recv.m(..)` where `m` declares type parameters of its own. Typecheck already said which
+// declaration the receiver reached, and the receiver is the only thing that tells two impls
+// of one method name apart, so the decl link is the whole resolution.
+fn discover_own_generic_method_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
+    let m = tc_call_decl_node(node)
+    if m < 0 { return }
+    if !own_generic_method_impl.contains_key(m) { return }
+    let recv_tid = ctx_node_tid(ctx, obj)
+    if recv_tid < 0 { return }
+    let binds = solve_call_binds(ctx, m, node, [recv_tid], node_args(node))
+    note_call_target(ctx, node, register_own_generic_method(m, binder_args(ctx, m, node, binds)))
+}
+
 fn discover_method_call(ctx: Int, node: Int) ! Diag.Report {
     let obj = node_obj(node)
     if obj == -1 { return }
@@ -693,6 +754,7 @@ fn discover_method_call(ctx: Int, node: Int) ! Diag.Report {
         discover_module_call(ctx, node)
         return
     }
+    discover_own_generic_method_call(ctx, node, obj)
     discover_poly_impl_call(ctx, node, obj)
     discover_list_hof_call(ctx, node, obj)
 }

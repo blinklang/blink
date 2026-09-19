@@ -3413,6 +3413,15 @@ fn tc_generic_fn_value_tid(sig: Int, decl_tid: Int) -> Int {
     substitute_typevar_tid(decl_tid, binds)
 }
 
+// Whether a declaration writes type parameters of its own. -1 is a signature with no
+// declaration node behind it, which declares nothing.
+fn tc_decl_has_own_type_params(decl: Int) -> Int {
+    if decl < 0 { return 0 }
+    let tps = node_type_params(decl)
+    if tps == -1 { return 0 }
+    if sublist_length(tps) > 0 { 1 } else { 0 }
+}
+
 fn build_typevar_binds(sig: Int, args_sl: Int) -> Map[Str, Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     build_typevar_binds_off(sig, args_sl, 0)
 }
@@ -3630,10 +3639,16 @@ fn tc_pin_ok_for_declared(val: Int, declared_tid: Int) -> Int {
 // mechanism, which is what keeps every `-> Box[T]` whose T comes from an argument on
 // exactly its current path.
 fn instantiate_return_type(sig: Int, args_sl: Int, call_node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    instantiate_return_type_off(sig, args_sl, call_node, 0)
+}
+
+// `self_offset` as in build_typevar_binds_off: a method call's first argument aligns with
+// fnsig param 1, because the receiver is param 0.
+fn instantiate_return_type_off(sig: Int, args_sl: Int, call_node: Int, self_offset: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let fs = fnsig_pool.get(sig).unwrap()
     let ret = fs.ret
     if ret < 0 || ret >= ty_pool.len() { return ret }
-    let mut binds = build_typevar_binds(sig, args_sl)
+    let mut binds = build_typevar_binds_off(sig, args_sl, self_offset)
     let mints = tc_ret_only_metavars(sig, call_node)
     let mut pi = 0
     while pi < mints.len() {
@@ -4234,6 +4249,16 @@ fn tc_raw_note_part(interp: Int, part: Int) {
     tc_raw_part_interp.push(interp)
 }
 
+// The audit identifier recorded on the function the checker is inside, or "" when there is
+// none. A bare `@trusted` reads as "" on purpose: §9.1 makes the RECORD the thing that
+// suppresses, so a channel that records nothing must not silence. -1 is a body with no
+// enclosing user function — a test body, or the top level — where there is nothing to read.
+fn tc_enclosing_audit_id() -> Str {
+    if tc_current_fn_node == -1 { return "" }
+    if has_annotation(tc_current_fn_node, "trusted") == 0 { return "" }
+    trusted_audit_id(get_annotation(tc_current_fn_node, "trusted"))
+}
+
 // The literal `interp` is being coerced to a `Template[C]`, so every Raw in it is folded into
 // the query text rather than parameterized. That is the bypass, and this is the only place it
 // happens. `@trusted(audit: K)` is its one suppression channel (§9.1).
@@ -4246,7 +4271,7 @@ fn tc_raw_consume_template(interp: Int) ! Diag.Report {
                 tc_raw_part_consumed.insert(part, 1)
                 // -1 is a body with no enclosing user function — a test body, or the top
                 // level. No function means no audit to find, so the warning stands.
-                if tc_current_fn_node == -1 || has_annotation(tc_current_fn_node, "trusted") == 0 {
+                if tc_enclosing_audit_id() == "" {
                     diag_warn_at("RawBypassesParam", RAW_BYPASSES_PARAM, "Raw() bypasses query parameterization", part, "add @trusted(audit: \"AUDIT-ID\") to suppress")
                 }
             }
@@ -12358,6 +12383,10 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
 fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // Before the scope, because the warnings this walk raises are raised by CLOSING it.
     diag_enter_allows(fn_node)
+    // This walk raises diagnostics that read the enclosing function's annotations, and it
+    // runs before tc_check_fn, which is the other writer of this.
+    let prev_fn_node = tc_current_fn_node
+    tc_current_fn_node = fn_node
     nr_push_scope()
     // Bind this fn's own type params so a single-letter annotation resolves as a
     // declared type variable rather than an unknown type. Enclosing impl binders
@@ -12397,6 +12426,7 @@ fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
     }
     tc_pop_tparam_scope(fn_tparams)
     nr_pop_scope()
+    tc_current_fn_node = prev_fn_node
     diag_exit_allows()
 }
 
@@ -16030,6 +16060,14 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 let mfs = fnsig_pool.get(sig).unwrap()
                 if mfs.type_params_count > 0 {
                     tc_check_bounds_for_binds(sig, build_typevar_binds_off(sig, node_args(node), 1), node)
+                }
+                // A type parameter the METHOD declares is chosen by the call, so the call's
+                // type is the declared return with that choice applied. Gated on the
+                // declaration's own binders and not on the signature's count, because an
+                // impl over a generic type puts the impl's binders in the same count and
+                // those are answered by the receiver, not by the arguments.
+                if tc_decl_has_own_type_params(mfs.decl) != 0 {
+                    return instantiate_return_type_off(sig, node_args(node), node, 1)
                 }
                 return fnsig_pool.get(sig).unwrap().ret
             }

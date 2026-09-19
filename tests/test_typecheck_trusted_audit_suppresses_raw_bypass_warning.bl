@@ -1,0 +1,62 @@
+// Section 9.1 makes RawBypassesParam audit-gated: `@trusted(audit: K)` on the enclosing
+// function is its only suppression channel, and a channel that records nothing is not one.
+// The gate read the enclosing function, but the walk that raises the warning left that
+// unset, so it saw no function, found no audit, and every audited query still warned.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn raw_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn count_named(name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.name == name { n = n + 1 }
+    }
+    n
+}
+
+fn dump() {
+    for d in diag_entries {
+        io.println("  {d.severity} {d.code} {d.name}: {d.message}")
+    }
+}
+
+fn src_with(attr: Str) -> Str {
+    "import std.db_sqlite.\{sqlite_handler, sqlite_open, sqlite_close}\n{attr}fn main() ! IO \{\n    let h = sqlite_open(\":memory:\")\n    with sqlite_handler(h) \{\n        let table = \"items\"\n        let rows = db.query(\"SELECT * FROM \{Raw(table)}\")\n        io.println(\"\{rows.unwrap().len()}\")\n    }\n    sqlite_close(h)\n}\n"
+}
+
+test "an unaudited Raw fold warns" {
+    raw_probe("build/tc_raw_plain.bl", src_with(""))
+    let n = count_named("RawBypassesParam")
+    if n != 1 { io.println("FAIL: unaudited: W0310 raised {n} time(s), want 1") dump() }
+    assert(n == 1)
+}
+
+test "an audited enclosing function silences the Raw fold warning" {
+    raw_probe("build/tc_raw_audited.bl", src_with("@trusted(audit: \"RAW-001\")\n"))
+    let n = count_named("RawBypassesParam")
+    if n != 0 { io.println("FAIL: audited: W0310 raised {n} time(s), want 0") dump() }
+    assert(n == 0)
+}
+
+// A channel that records nothing is not a channel. A bare `@trusted` is already an error, and
+// it must not also buy the silence the audit identifier is the price of.
+test "a bare trusted is an error and does not silence the Raw fold warning" {
+    raw_probe("build/tc_raw_bare.bl", src_with("@trusted\n"))
+    let e = count_named("TrustedRequiresAudit")
+    let n = count_named("RawBypassesParam")
+    if e != 1 { io.println("FAIL: bare: TrustedRequiresAudit raised {e} time(s), want 1") dump() }
+    if n != 1 { io.println("FAIL: bare: W0310 raised {n} time(s), want 1") dump() }
+    assert(e == 1)
+    assert(n == 1)
+}
