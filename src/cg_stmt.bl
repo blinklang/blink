@@ -38,11 +38,12 @@ import cg_expr.{
     cg_expr_register_value, cg_expr_set_return_type, cg_expr_take_pending, lower_expr,
     x_layout_checked, x_stopped,
 }
+import cg_eff.{CleanupProtocol, cg_eff_resource_cleanup}
 
 // A carrier holds its discriminant in `tag`, its Option payload in `value` and its
 // Result arms in `ok` and `err`. These are member names in a struct layout.bl emits,
 // not type spellings, so they are spelled here rather than asked of a name producer.
-let CARRIER_VALUE = "value"
+let STMT_CARRIER_VALUE = "value"
 let CARRIER_OK = "ok"
 let CARRIER_ERR = "err"
 
@@ -868,8 +869,12 @@ fn as_block(id: Int) -> Int {
 //
 // Which cleanup a resource gets is a question about the traits its type implements:
 // Closeable closes it, BlockHandler hands it the block, an FFI scope frees its arena and
-// a type with none of those is a plain binding. No producer answers that question yet,
-// so nothing here names a cleanup function into existence.
+// a type with none of those is a plain binding. cg_eff_resource_cleanup answers the
+// question; only the plain binding and the FFI scope have a producer that can act on the
+// answer today, since the runtime's own blink_ffi_scope_cleanup is the one exit runner
+// this stage writes support for. Closeable and BlockHandler still name no exit runner, so
+// cg_eff_resource_cleanup itself records the internal error for those two, and the bind
+// underneath it is left exactly as plain as it always was.
 fn wrap_resource(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
     let item = sublist_get(items, i)
     let _ = open_scope()
@@ -883,12 +888,19 @@ fn wrap_resource(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, de
     let name = node_name(item)
     let value = lower_value(node_value(item))
     bind_binder(cur_scope(), name, tid)
-    let bind = ir_let(tid, item, rec.c_spelling, cg_local_c_name(name), rec.slot_form, value)
-    diag_ice_stage_not_built("with-resource cleanup protocol selection", item)
+    let bound_name = cg_local_c_name(name)
+    let bind = ir_let(tid, item, rec.c_spelling, bound_name, rec.slot_form, value)
+    let cleanup = cg_eff_resource_cleanup(item)
     let rest = wrap_with_items(node, items, n, i + 1, tail, dest, dest_tid)
     close_scope()
     if rest < 0 { return -1 }
-    ir_block(item, [bind, as_block(rest)])
+    let rest_block = as_block(rest)
+    if cleanup.protocol == CleanupProtocol.FfiScope {
+        let resource_ref = ir_var_ref(tid, item, rec.c_spelling, bound_name, rec.slot_form)
+        let scoped = ir_with_scope(item, "blink_ffi_scope_cleanup", resource_ref, rest_block)
+        return ir_block(item, [bind, scoped])
+    }
+    ir_block(item, [bind, rest_block])
 }
 
 // A handler replaces one slot of the effect vector for the body. The slot is a C field
@@ -1307,7 +1319,7 @@ fn carrier_payload_bind(ctx: MatchCtx, vname: Str, flds: Int, out: List[Int]) ->
 fn carrier_member(vname: Str) -> Str {
     if vname == VARIANT_OK { return CARRIER_OK }
     if vname == VARIANT_ERR { return CARRIER_ERR }
-    CARRIER_VALUE
+    STMT_CARRIER_VALUE
 }
 
 // A positional payload field is named `_0`, `_1` … by the declaration, so the reader
