@@ -1,0 +1,185 @@
+// A closure written as an argument takes its parameter types from the function type the
+// context declares. Where that declared type belongs to a generic that the call has not
+// substituted yet, only SOME of its positions name a type parameter: `fn(T, Str, Bool)`
+// says nothing about position 0 and says everything about positions 1 and 2.
+//
+// The seed was all-or-nothing, so one type parameter anywhere threw the whole signature
+// away and every position was left open. The closure's parameters then reached the body
+// walk with no type at all, which is an under-determined binding the front end reports,
+// and the reports name parameters the declaration had already spelled out.
+//
+// Every position is independent. A position that names a real type is published; a
+// position that names a type parameter is left open for inference, because a bare type
+// variable is invisible to the metavar machinery and could never be solved later.
+
+import typecheck.{check_types, tc_lookup_node_tid, tc_resolve, tc_type_str}
+import parser.{node_kind, node_name, nodes}
+import ast.{NodeKind, nk_of}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+// The `Param` node the probe spells `name`. Every probe parameter is given a name nothing
+// in the stdlib graph spells, so the first hit is the probe's own line.
+fn param_node_of(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.Param && node_name(i) == name { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no parameter '{name}'")
+    assert(false)
+    -1
+}
+
+fn assert_param_type(name: Str, want: Str) {
+    let p = param_node_of(name)
+    let tid = tc_lookup_node_tid(p)
+    if tid < 0 {
+        io.println("FAIL: parameter '{name}' carries no type at all")
+        assert(false)
+        return
+    }
+    let got = tc_type_str(tc_resolve(tid))
+    if got != want { io.println("FAIL: parameter '{name}': got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+// A position the declaration left as a type parameter is open, not absent: it is bound and
+// stamped, and what it is stamped with is something inference can still settle.
+fn assert_param_stamped(name: Str) {
+    let p = param_node_of(name)
+    let tid = tc_lookup_node_tid(p)
+    if tid < 0 { io.println("FAIL: parameter '{name}' carries no type at all") }
+    assert(tid >= 0)
+}
+
+fn messages_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat(d.message).concat("\n") }
+    }
+    out
+}
+
+fn assert_unreported(name: Str) {
+    let msgs = messages_reported()
+    if msgs.contains(name) { io.println("FAIL: '{name}' is reported: {msgs}") }
+    assert(!msgs.contains(name))
+}
+
+// One probe holds every shape. Typecheck's named-type map is not reset between compiles in
+// one binary, so a second probe would be measuring the first one's leftovers.
+fn closure_src() -> Str {
+    #"fn zz_take_concrete(f: fn(Int, Str, Bool) -> Int) -> Int {
+    f(1, "s", true)
+}
+
+fn zz_take_six(f: fn(Int, Str, Bool, Int, Str, Bool) -> Int) -> Int {
+    f(1, "s", true, 2, "t", false)
+}
+
+fn zz_take_generic[T](f: fn(T, Str, Bool) -> Int, a: T) -> Int {
+    f(a, "s", true)
+}
+
+fn zz_take_generic_six[T](f: fn(T, Str, Bool, Int, Str, Bool) -> Int, a: T) -> Int {
+    f(a, "s", true, 2, "t", false)
+}
+
+fn main() {
+    let _c = zz_take_concrete(fn(zzca, zzcb, zzcc) -> Int { zzcb.len() })
+    let _a = zz_take_concrete(fn(zzaa: Int, zzab: Str, zzac: Bool) -> Int { zzab.len() })
+    let _s = zz_take_six(fn(zzsa, zzsb, zzsc, zzsd, zzse, zzsf) -> Int { zzsb.len() })
+    let _k: fn(Int, Str, Bool) -> Int = fn(zzka, zzkb, zzkc) -> Int { zzkb.len() }
+    let _g = zz_take_generic(fn(zzga, zzgb, zzgc) -> Int { zzgb.len() }, 7)
+    let _x = zz_take_generic_six(fn(zzxa, zzxb, zzxc, zzxd, zzxe, zzxf) -> Int { zzxb.len() }, 7)
+}
+"#
+}
+
+test "a closure argument takes every position of a declared function type" {
+    let _p = probe("build/closure_params_concrete.bl", closure_src())
+
+    assert_param_type("zzca", "Int")
+    assert_param_type("zzcb", "Str")
+    assert_param_type("zzcc", "Bool")
+}
+
+test "a closure that annotates its own parameters keeps those annotations" {
+    let _p = probe("build/closure_params_annotated.bl", closure_src())
+
+    assert_param_type("zzaa", "Int")
+    assert_param_type("zzab", "Str")
+    assert_param_type("zzac", "Bool")
+}
+
+// The old hint ladder read positions 0 and 1 and dropped the rest. Nothing may cap the
+// arity, so a six-parameter closure is stamped to its last position.
+test "no position is out of reach however many parameters a closure has" {
+    let _p = probe("build/closure_params_six.bl", closure_src())
+
+    assert_param_type("zzsa", "Int")
+    assert_param_type("zzsb", "Str")
+    assert_param_type("zzsc", "Bool")
+    assert_param_type("zzsd", "Int")
+    assert_param_type("zzse", "Str")
+    assert_param_type("zzsf", "Bool")
+}
+
+test "a closure under a function-typed let annotation takes every position" {
+    let _p = probe("build/closure_params_let.bl", closure_src())
+
+    assert_param_type("zzka", "Int")
+    assert_param_type("zzkb", "Str")
+    assert_param_type("zzkc", "Bool")
+}
+
+// The defect. `fn(T, Str, Bool)` names a type parameter at position 0 only, so positions 1
+// and 2 are as declared as any other signature's and must be published.
+test "a type parameter at one position does not erase the positions beside it" {
+    let _p = probe("build/closure_params_generic.bl", closure_src())
+
+    assert_param_type("zzgb", "Str")
+    assert_param_type("zzgc", "Bool")
+}
+
+test "the position that names a type parameter is left open rather than unbound" {
+    let _p = probe("build/closure_params_generic_open.bl", closure_src())
+
+    assert_param_stamped("zzga")
+}
+
+// Positions past the type parameter are declared too, so the arity rule and the type
+// parameter rule hold at the same time.
+test "a type parameter does not cap how far a generic signature is read" {
+    let _p = probe("build/closure_params_generic_six.bl", closure_src())
+
+    assert_param_type("zzxb", "Str")
+    assert_param_type("zzxc", "Bool")
+    assert_param_type("zzxd", "Int")
+    assert_param_type("zzxe", "Str")
+    assert_param_type("zzxf", "Bool")
+}
+
+// A parameter whose type the declaration spelled out cannot be reported as one the front
+// end could not infer; the declaration is where the answer was.
+test "no declared position is reported as impossible to infer" {
+    let _p = probe("build/closure_params_no_reports.bl", closure_src())
+
+    assert_unreported("zzgb")
+    assert_unreported("zzgc")
+    assert_unreported("zzxf")
+}
