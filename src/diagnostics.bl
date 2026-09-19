@@ -768,6 +768,23 @@ fn int_digit_count(n: Int) -> Int {
     5
 }
 
+// A help carrying newlines is several `help:` lines, not one line with newlines in it. A
+// repair sometimes needs a second, independent suggestion (sections/07 §9.1.1 requires one),
+// and an entry holds a single help field.
+fn diag_print_help(help: Str) ! Diag.Report {
+    let mut seg_start = 0
+    let mut i = 0
+    while i <= help.len() {
+        if i == help.len() || help.byte_at(i) == 10 {
+            if i > seg_start {
+                io.eprintln("  help: {help.substring(seg_start, i - seg_start)}")
+            }
+            seg_start = i + 1
+        }
+        i = i + 1
+    }
+}
+
 fn diag_print_human(idx: Int) ! Diag.Report {
     let d = diag_entries.get(idx).unwrap()
     let display_severity = if d.severity == "ice" { "internal compiler error" } else { d.severity }
@@ -793,11 +810,11 @@ fn diag_print_human(idx: Int) ! Diag.Report {
     }
     if d.severity == "ice" {
         if d.help != "" {
-            io.eprintln("  help: {d.help}")
+            diag_print_help(d.help)
         }
         io.eprintln("  note: This is a compiler bug. Please report it at https://github.com/blinklang/blink/issues")
     } else if d.help != "" {
-        io.eprintln("  help: {d.help}")
+        diag_print_help(d.help)
     }
     if d.fix_action != "" {
         io.eprintln("  fix: {d.fix_action} '{d.fix_text}'")
@@ -1079,7 +1096,7 @@ pub fn diag_explain(code: Str) -> Str {
         return "E0817 -- BytesPtrCastForbidden\n\nBytes cannot be cast or coerced to Ptr[U8] outside a with_ptr\nclosure. Bytes is a GC-managed buffer and may be relocated by\nthe garbage collector; raw Ptr[U8] aliases would dangle.\n\nFix: use Bytes.with_ptr to pin the buffer for the duration of\nthe call, and pass the pinned pointer to the FFI:\n\n  b.with_ptr(fn(p) \{ c_read(fd, p, b.len()) })   // OK"
     }
     if code == FFI_SCOPE_NOT_WITH_RESOURCE {
-        return "E0819 -- FfiScopeNotWithResource\n\nffi.scope() was bound directly (e.g. `let s = ffi.scope()`) instead\nof as a `with`-resource. A scope frees its allocations when the\nwith-block exits; outside a `with` there is no block to exit, so\nnothing would ever free the arena and every allocation leaks.\n\nFix: bind the scope with `with ... as`:\n\n  with ffi.scope() as scope \{\n      let p: Ptr[Pollfd] = scope.alloc()\n      // p is freed here, at block exit\n  \}"
+        return "E0819 -- FfiScopeNotWithResource\n\nA value of type `FfiScope` may occur only as the resource of a\n`with ... as` block, and nowhere else. It may not be bound by a\n`let`, passed as an argument, returned, stored in a field, or\nwritten as a type argument.\n\nA scope owns a libc malloc/free arena whose extent must be lexical.\nOutside a `with` there is no block to exit, so nothing frees the\narena and every allocation through it leaks for the life of the\nprocess. The rule is stated over the TYPE, not over the\n`ffi.scope()` call, because the hazard belongs to the value:\nhowever the value reached an excluded position, the arena there\noutlives the block that would free it.\n\n  fn leaks() ! IO \{\n      let arena = ffi.scope()          // E0819 -- let-bound\n  \}\n\n  fn takes(s: FfiScope) \{ }            // E0819 -- parameter\n  type Holder \{ s: FfiScope }          // E0819 -- field\n\nFix: bind the scope as a `with` resource.\n\n  with ffi.scope() as arena \{\n      let p: Ptr[Pollfd] = arena.alloc()\n      // p is freed here, at block exit\n  \}\n\nFor one plain allocation with GC cleanup, use `alloc_ptr[T]()`\ninstead of a scope. For a pointer that must outlive the block, take\nit out of the scope first: `arena.take(p)` removes p from the\nscope's cleanup list and transfers its lifetime to the caller."
     }
     if code == MISSING_NATIVE_DEP {
         return "E0820 -- MissingNativeDep\n\nAn @ffi annotation references a C library that is not declared in\nthe [native-dependencies] section of blink.toml.\n\nFix: add the library to blink.toml:\n\n  [native-dependencies]\n  libname = \{ system = true \}"

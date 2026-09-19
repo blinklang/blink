@@ -1071,6 +1071,9 @@ let mut tc_current_fn_ret: Int = -1
 // scope frees its allocations when the block ends, so it is only meaningful in this one
 // position, and this is how the check below tells that position from every other.
 let mut tc_with_resource_node: Int = -1
+// The binder of the `let` whose value is being inferred, so the repair an `FfiScope` misuse
+// shows carries the author's own name rather than a hardcoded one (§9.1.1).
+let mut tc_ffi_scope_binder: Str = ""
 // The function whose body is being walked, for the annotations a rule reads off it.
 let mut tc_current_fn_node: Int = -1
 let mut tc_current_fn_name: Str = ""
@@ -1690,6 +1693,29 @@ pub fn make_template_type(context: Int) -> Int {
 // TyKind.Ptr, and every structural accessor answers "no children" through arms it already has.
 pub fn make_ffi_scope_type() -> Int {
     ty_intern_simple(TyKind.FfiScope, "FFIScope", -1, -1)
+}
+
+// §9.1.1: an `FfiScope` may occur only as the resource of a `with ... as` block. The rule is
+// stated over the TYPE, not over the `ffi.scope()` call, because the hazard belongs to the
+// value: every excluded position is one the libc arena outlives the block that frees it,
+// however the value arrived there. Two reports, one per position the type can appear in.
+fn tc_ffi_scope_alloc_help() -> Str {
+    "for one plain allocation with GC cleanup, use `alloc_ptr[T]()` instead of a scope"
+}
+
+// The `let` -> `with ... as` rewrite is deliberately NOT machine-applicable: no fixer can
+// decide where the block should end.
+fn tc_report_ffi_scope_value(node: Int, binder: Str) ! Diag.Report {
+    let shown = if binder == "" { "<name>" } else { binder }
+    diag_error_at("FfiScopeNotWithResource", FFI_SCOPE_NOT_WITH_RESOURCE,
+        "an `FfiScope` may occur only as a `with ... as` resource", node,
+        "bind it as a `with` resource: `with ffi.scope() as {shown} \{ ... \}`\n{tc_ffi_scope_alloc_help()}")
+}
+
+fn tc_report_ffi_scope_ann(node: Int) ! Diag.Report {
+    diag_error_at("FfiScopeNotWithResource", FFI_SCOPE_NOT_WITH_RESOURCE,
+        "an `FfiScope` may occur only as a `with ... as` resource", node,
+        "drop the annotation: a scope is reachable only inside `with ffi.scope() as <name> \{ ... \}`\n{tc_ffi_scope_alloc_help()}")
 }
 
 // ── Metavariables (Hindley-Milner inference discipline) ─────────────
@@ -5759,6 +5785,13 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     if name == "Bytes" {
         return new_type(TyKind.Bytes, "Bytes")
     }
+    // Written in a type position at all — parameter, return, field, type argument, let
+    // annotation — is already the mistake: the one position the type may occupy is a
+    // `with ... as` resource, whose binder is never annotated.
+    if name == "FfiScope" {
+        if ann_node != -1 { tc_report_ffi_scope_ann(ann_node) }
+        return make_ffi_scope_type()
+    }
     // The three one-inner runtime carriers. Ahead of resolve_type_name for the
     // same reason List/Map/Set are: is_primitive_type already claims these names, so a user
     // type could not have taken them, and falling through to `make_typevar(name)` is what made
@@ -9262,6 +9295,7 @@ fn init_types() ! TypeCheck.Register {
     tc_current_fn_ret = -1
     tc_current_fn_name = ""
     tc_with_resource_node = -1
+    tc_ffi_scope_binder = ""
     tc_current_fn_node = -1
     tc_current_self_tid = -1
     tc_current_method_sig_key = ""
@@ -11484,6 +11518,9 @@ fn is_primitive_type(name: Str) -> Int {
     if name == "Ptr" || name == "U8" || name == "U16" || name == "U32" || name == "U64" { return 1 }
     if name == "I8" || name == "I16" || name == "I32" || name == "I64" { return 1 }
     if name == "Fn" || name == "Self" || name == "Tuple" || name == "Handler" || name == "Template" { return 1 }
+    // A name the language owns, even though every position that can write it is an error:
+    // the report the writer gets must be the scope rule, not "unknown type".
+    if name == "FfiScope" { return 1 }
     0
 }
 
@@ -12464,7 +12501,13 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if val != -1 {
             let vk = node_kind(val)
             if vk == NodeKind.Call || vk == NodeKind.Ident || vk == NodeKind.MethodCall {
+                // This inference is the FIRST to reach the value, so a report it draws is the
+                // one a reader sees; the binder has to be in scope here too, not only at the
+                // body walk below.
+                let saved_nr_binder = tc_ffi_scope_binder
+                tc_ffi_scope_binder = node_name(node)
                 let inferred = infer_type(val)
+                tc_ffi_scope_binder = saved_nr_binder
                 if tc_tid_is_no_info(inferred) == 0 {
                     nr_set_last_type(inferred)
                 }
@@ -16001,8 +16044,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         tc_error_at("function '{obj_name}.{method}' expects {nsi_fs.params_count} argument(s), got {nsi_got}", node)
                     }
                     check_arg_shapes("{obj_name}.{method}", nsi, nsi_args, 0, node)
-                    if obj_name == "ffi" && method == "scope" && node != tc_with_resource_node {
-                        diag_error_at("FfiScopeNotWithResource", FFI_SCOPE_NOT_WITH_RESOURCE, "ffi.scope() is only valid as a `with`-resource — its allocations are freed at block exit", node, "use `with ffi.scope() as scope \{ ... \}`")
+                    if type_kind(nsi_fs.ret) == TyKind.FfiScope && node != tc_with_resource_node {
+                        tc_report_ffi_scope_value(node, tc_ffi_scope_binder)
                     }
                     return nsi_fs.ret
                 }
@@ -18080,7 +18123,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // A let binding is expression context (§2.9): infer in value context so an else-less
             // `if` as its value (no value on the false path) is rejected regardless of the
             // declared/inferred type, so `let x = if c { 1 }` fails even when x is unused.
+            let saved_binder = tc_ffi_scope_binder
+            tc_ffi_scope_binder = vname
             inferred_tid = tc_infer_value(val)
+            tc_ffi_scope_binder = saved_binder
             tc_construct_hint = saved_hint
             // What the inference above wrote for the value's tail, read BEFORE the walk below
             // retypes it in scope. A tail that names a binding the value's own construct
@@ -19808,7 +19854,7 @@ fn type_to_str(tid0: Int) -> Str {
         TyKind.Template => return "Template[{type_to_str(t.inner1)}]"
         // The surface spelling of the type is the expression that makes one: §07:272 has no
         // type name for it, and `ffi.scope()` is the only way to obtain one.
-        TyKind.FfiScope => return "ffi.scope()"
+        TyKind.FfiScope => return "FfiScope"
         TyKind.List => return "List[{type_to_str(t.inner1)}]"
         TyKind.Option => return "Option[{type_to_str(t.inner1)}]"
         TyKind.Result => return "Result[{type_to_str(t.inner1)}, {type_to_str(t.inner2)}]"
