@@ -21,8 +21,8 @@ import typecheck.{TYPE_FLOAT, TYPE_INT, TYPE_STR}
 import cname_test_helpers.{find_decl}
 import cg_test_helpers.{cg_probe_compile}
 import ast.{NodeKind}
-import parser.{node_value}
-import layout.{bind_binder, binder_scope_pop, binder_scope_push, layout_reset}
+import parser.{node_body, node_value}
+import layout.{bind_binder_mut, binder_scope_pop, binder_scope_push, layout_reset}
 import ir.{IrKind, ir_c_name, ir_capture_descs, ir_promoter, ir_kid_count, ir_kid, ir_kind, ir_reset, ir_verify}
 import cg_reg.{cg_reg_build}
 import cg_expr.{cg_expr_reset}
@@ -159,12 +159,21 @@ fn closure_of(let_name: Str) -> Int {
 
 // Lowers one closure with `names` bound at `tid` in an enclosing frame, which is what
 // makes a name a capture rather than a module-level name the thunk reaches on its own.
+// The names bind immutable, because a binder whose mutability is not recorded is refused.
 fn lower_capturing(let_name: Str, names: List[Str], tid: Int) -> Int ! Diag.Report {
     let outer = binder_scope_push()
-    for nm in names { bind_binder(outer, nm, tid) }
+    for nm in names { bind_binder_mut(outer, nm, tid, false) }
     let v = cg_eff_lower_closure(closure_of(let_name))
     binder_scope_pop()
     v
+}
+
+// Lowers a whole function body through the statement stage, which is the only way the
+// binders a capture resolves against are recorded by the code that actually binds them.
+// The trailing call in each probe body is a closure call no stage builds yet, so a body
+// lowered this way reports that; these cases measure the capture, not the total.
+fn lower_body_of(fn_name: Str) -> Int ! Diag.Report {
+    lower_block_returning(node_body(find_decl(NodeKind.FnDef, fn_name, "")))
 }
 
 test "a closure reading an immutable Int local answers a record instead of refusing" {
@@ -244,9 +253,11 @@ test "a pointer-shaped capture rides the slot without an integer pun" {
     assert_eq(ices(), 0)
 }
 
-test "a nested closure captures the outer thunk's own parameter" {
-    // The inner closure is lowered while the outer thunk's frame is open, so its capture
-    // resolves against that frame and not against the enclosing function's.
+test "a capture of a binder whose mutability was never recorded is refused, not copied" {
+    // The inner closure captures the outer thunk's parameter. A parameter binds without a
+    // mutability, because whether a parameter can be assigned is still open, and a binder
+    // that cannot be told from a shared one is treated as one. This is the fail-closed
+    // direction: every bind site not yet switched refuses a capture instead of copying it.
     setup()
     let v = lower_capturing("g_outer", [], TYPE_INT)
     assert(v >= 0)
@@ -254,10 +265,11 @@ test "a nested closure captures the outer thunk's own parameter" {
     assert(cg_eff_thunk_open(0) >= 0)
     let body = lower_block_returning(cg_eff_thunk_body_node(0))
     cg_eff_thunk_close()
-    if body < 0 || ices() != 0 { report_ices("the outer thunk body did not lower") }
     assert(body >= 0)
-    assert_eq(cg_eff_pending_thunks(), 2)
-    assert_eq(ices(), 0)
+    assert(ices_mentioning("'x'") > 0)
+    assert(ices_mentioning("records no mutability") > 0)
+    // The inner closure was refused, so it queued no thunk of its own.
+    assert_eq(cg_eff_pending_thunks(), 1)
 }
 
 test "the queue still drains to zero once a captured closure is printed" {
@@ -293,14 +305,25 @@ test "a capture that needs a heap box is refused by name rather than punned into
     assert_eq(cg_eff_pending_thunks(), 0)
 }
 
-test "a mutable capture is refused, and says the binding is shared rather than copied" {
+test "a let records its own mutability, so a mut capture is refused where a plain one is not" {
     // sections/02_syntax.md:351: a write through either side has to be visible on the
     // other, which needs one shared cell. Copying the value instead compiles and runs and
     // answers the pre-write number.
+    //
+    // Both bodies are lowered through the statement stage rather than bound by hand, so
+    // what is measured is the recorded mutability of a real `let`. The control matters as
+    // much as the refusal: a stage that recorded every binder mutable would refuse the mut
+    // capture for the wrong reason and refuse the plain one too.
     setup()
-    let v = lower_capturing("g_mut", ["c"], TYPE_INT)
-    assert_eq(v, -1)
+    let refused = lower_body_of("a_mutable_capture")
+    assert(refused >= 0)
     assert(ices_mentioning("'c'") > 0)
     assert(ices_mentioning("shared") > 0)
     assert_eq(cg_eff_pending_thunks(), 0)
+
+    setup()
+    let built = lower_body_of("one_int_capture")
+    assert(built >= 0)
+    assert_eq(ices_mentioning("'n'"), 0)
+    assert_eq(cg_eff_pending_thunks(), 1)
 }

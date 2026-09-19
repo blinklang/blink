@@ -35,6 +35,11 @@ pub type Position { Local, Field, Param, Return, ContainerSlot, VtableSlot, Tupl
 // (scalar, pointer, ordinal). PointerBoxed: the slot holds a pointer to a heap copy.
 pub type SlotForm { Inline, PointerBoxed, InlineWord }
 
+// Whether the binder a name resolves to may be assigned. Unknown is what a bind site
+// that does not record mutability leaves behind, so a reader that needs the answer
+// refuses rather than guessing immutable.
+pub type BinderMut { Unknown, Immutable, Mutable }
+
 pub type Slot { Inner1, Inner2, Param(Int), Elem(Int) }
 
 // A record answers a tid in a position. Whether a variant field is boxed because it
@@ -69,6 +74,7 @@ let mut binder_frame_stack: List[Int] = []
 let mut binder_entry_frame: List[Int] = []
 let mut binder_entry_name: List[Str] = []
 let mut binder_entry_tid: List[Int] = []
+let mut binder_entry_mut: List[BinderMut] = []
 
 // check_types rebuilds the type pool, so every cached answer is stale after it. The
 // cname marks are keyed on declaration nodes from the same build, so they are reset
@@ -86,6 +92,7 @@ pub fn layout_reset() {
     binder_entry_frame = []
     binder_entry_name = []
     binder_entry_tid = []
+    binder_entry_mut = []
     lo_current_inst = -1
 }
 
@@ -187,14 +194,17 @@ fn lo_tid_in_current_inst(node: Int) -> Int ! Diag.Report {
 }
 
 pub fn tid_of_binder(scope: Int, name: Str) -> Int {
-    let mut frame = scope
-    while frame >= 0 && frame < binder_frame_parent.len() {
-        if binder_frame_alive.get(frame).unwrap() == 0 { return -1 }
-        let hit = lo_binder_lookup_in_frame(frame, name)
-        if hit >= 0 { return hit }
-        frame = binder_frame_parent.get(frame).unwrap()
-    }
-    -1
+    let entry = lo_binder_entry(scope, name)
+    if entry < 0 { return -1 }
+    binder_entry_tid.get(entry).unwrap()
+}
+
+// Whether the binder this name resolves to may be assigned, read off the same entry the
+// type comes from. One resolution of the name answers both, so the two cannot drift.
+pub fn binder_mutability_of(scope: Int, name: Str) -> BinderMut {
+    let entry = lo_binder_entry(scope, name)
+    if entry < 0 { return BinderMut.Unknown }
+    binder_entry_mut.get(entry).unwrap()
 }
 
 pub fn layout_of(tid: Int, position: Position) -> LayoutRecord {
@@ -433,6 +443,7 @@ pub fn binder_scope_pop() {
         binder_entry_frame.pop()
         binder_entry_name.pop()
         binder_entry_tid.pop()
+        binder_entry_mut.pop()
     }
 }
 
@@ -443,19 +454,42 @@ pub fn current_binder_scope() -> Int {
     binder_frame_stack.get(binder_frame_stack.len() - 1).unwrap()
 }
 
+// A bind site that does not know whether the name may be assigned records Unknown, so
+// every site left unswitched refuses a capture instead of copying a shared binding.
 pub fn bind_binder(scope: Int, name: Str, tid: Int) {
+    lo_bind(scope, name, tid, BinderMut.Unknown)
+}
+
+pub fn bind_binder_mut(scope: Int, name: Str, tid: Int, is_mut: Bool) {
+    lo_bind(scope, name, tid, if is_mut { BinderMut.Mutable } else { BinderMut.Immutable })
+}
+
+fn lo_bind(scope: Int, name: Str, tid: Int, m: BinderMut) {
     if scope < 0 || scope >= binder_frame_alive.len() { return }
     if binder_frame_alive.get(scope).unwrap() == 0 { return }
     binder_entry_frame.push(scope)
     binder_entry_name.push(name)
     binder_entry_tid.push(tid)
+    binder_entry_mut.push(m)
 }
 
-fn lo_binder_lookup_in_frame(frame: Int, name: Str) -> Int {
+// The entry a name resolves to from this scope, or -1.
+fn lo_binder_entry(scope: Int, name: Str) -> Int {
+    let mut frame = scope
+    while frame >= 0 && frame < binder_frame_parent.len() {
+        if binder_frame_alive.get(frame).unwrap() == 0 { return -1 }
+        let hit = lo_binder_index_in_frame(frame, name)
+        if hit >= 0 { return hit }
+        frame = binder_frame_parent.get(frame).unwrap()
+    }
+    -1
+}
+
+fn lo_binder_index_in_frame(frame: Int, name: Str) -> Int {
     let mut i = binder_entry_frame.len() - 1
     while i >= 0 {
         if binder_entry_frame.get(i).unwrap() == frame && binder_entry_name.get(i).unwrap() == name {
-            return binder_entry_tid.get(i).unwrap()
+            return i
         }
         i = i - 1
     }

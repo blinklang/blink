@@ -11,7 +11,7 @@
 import ast.{NodeKind, nk_of}
 import parser.{
     is_literal_string_part, node_args, node_body, node_elements, node_for_binder, node_guard, node_handlers,
-    node_is_mut, node_iterable, node_kind, node_method, node_methods, node_name, node_obj, node_params, node_pattern,
+    node_iterable, node_kind, node_method, node_methods, node_name, node_obj, node_params, node_pattern,
     node_recv_type_args, node_stmts, node_trait_name, node_value, node_value_child_ids, sublist_get,
     sublist_length,
 }
@@ -20,9 +20,9 @@ import typecheck.{
     tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tk_name, ty_pool,
 }
 import layout.{
-    LayoutRecord, Position, Slot, SlotForm, bind_binder, binder_scope_pop, binder_scope_push, child_tid,
-    closure_self_spelling, container_slot_spelling, current_binder_scope, layout_of, tid_of_binder,
-    tid_of_node,
+    BinderMut, LayoutRecord, Position, Slot, SlotForm, bind_binder, binder_mutability_of, binder_scope_pop,
+    binder_scope_push, child_tid, closure_self_spelling, container_slot_spelling, current_binder_scope,
+    layout_of, tid_of_binder, tid_of_node,
 }
 import cname.{
     c_builtin_effect_slot, c_ev_field_name, c_ev_global_name, c_ev_type_name, c_field_name, c_local_name,
@@ -33,7 +33,7 @@ import ir.{
     ir_call_runtime, ir_cast, ir_field_get, ir_handler_install, ir_if, ir_let, ir_var_ref,
 }
 import cg_print.{print_closure_thunk, print_resource_guard_support}
-import cg_reg.{cg_reg_effect_decls, cg_reg_fn_decls, cg_reg_impl_decls, cg_reg_impl_methods, cg_reg_test_decls}
+import cg_reg.{cg_reg_effect_decls, cg_reg_impl_decls}
 import cg_expr.{cg_expr_push_pending, lower_expr}
 import cg_call.{lower_display_call}
 import diagnostics.{
@@ -243,10 +243,9 @@ pub fn cg_eff_lower_closure(node: Int) -> Int ! Diag.Report {
         return -1
     }
     let free = closure_free_names(node)
-    if !captures_are_copyable(node, free) { return -1 }
+    if !captures_are_buildable(node, free) { return -1 }
     let tids: List[Int] = []
     let words = capture_words(node, free, tids)
-    if words.len() != free.len() { return -1 }
     let symbol = c_mint_local("closure")
     eff_thunks.push(PendingThunk {
         closure: node, symbol: symbol, fn_tid: tid, cap_names: free, cap_tids: tids,
@@ -256,28 +255,12 @@ pub fn cg_eff_lower_closure(node: Int) -> Int ! Diag.Report {
 
 // One capture word per captured name, in first-read order, built in the frame the literal
 // was written in because that is where the name still resolves. The thunk reads each word
-// back by the position it was built at.
-//
-// Answers fewer words than names after recording a refusal, which is how the caller tells
-// a refusal from a closure that captures nothing.
+// back by the position it was built at. Every name is known buildable before this runs.
 fn capture_words(node: Int, free: List[Str], tids: List[Int]) -> List[Int] ! Diag.Report {
     let mut out: List[Int] = []
     for nm in free {
         let ntid = tid_of_binder(current_binder_scope(), nm)
         let slot = layout_of(ntid, Position.ContainerSlot)
-        let why = slot.decline_reason
-        if why != "" {
-            diag_ice_at("UnspellableCaptureType", UNSOLVED_TYPEVAR_AT_CODEGEN,
-                "captured local '{nm}' has no C layout: {why}", node,
-                "monomorphisation must resolve every type codegen reads; this is a compiler bug")
-            return out
-        }
-        if slot.slot_form == SlotForm.PointerBoxed {
-            diag_ice_at("BoxedCaptureNotLowered", CODEGEN_STAGE_NOT_BUILT,
-                "closure captures '{nm}', whose value does not fit a capture word and needs a heap box no stage allocates yet",
-                node, "a capture word is one void*; a value that cannot be punned into one has to live behind a pointer, and nothing allocates that box")
-            return out
-        }
         let loc = layout_of(ntid, Position.Local)
         let read = ir_var_ref(ntid, node, loc.c_spelling, c_local_name(nm), loc.slot_form)
         // A pointer already is a word. Everything else goes through the integer bridge
@@ -288,66 +271,60 @@ fn capture_words(node: Int, free: List[Str], tids: List[Int]) -> List[Int] ! Dia
     out
 }
 
-// Whether every captured name may be copied into a capture word.
+// Whether every captured name can be held in a capture word, and may be copied into one.
+//
+// The representational question is asked first and per name. Whether a value fits a word
+// is a property of its type alone, so it holds whatever the enclosing frame recorded, and
+// a refusal that names the type is the more useful of the two when both apply.
 //
 // sections/02_syntax.md has a `let mut` binding shared with its closure, not copied: a
 // write on either side is visible on the other, which needs one cell both read through.
 // Copying the value instead compiles, and then answers the pre-write number on one side
 // and drops the closure's writes on the other. A `let` binding carries no such rule, so
 // copying it is what the spec calls observationally equivalent.
-fn captures_are_copyable(node: Int, free: List[Str]) -> Bool ! Diag.Report {
+//
+// The answer comes off the binder frame, the same entry the capture's type comes from, so
+// the name is resolved once. A bind site that records nothing answers Unknown and the
+// capture is refused: a binder that cannot be told from a shared one is treated as one.
+fn captures_are_buildable(node: Int, free: List[Str]) -> Bool ! Diag.Report {
     if free.len() == 0 { return true }
-    let decl = enclosing_decl_of(node)
-    if decl < 0 {
-        diag_ice("CaptureOutsideRegisteredDecl", POISONED_IR_AT_SEAM,
-            "a closure capturing {join_names(free)} is inside no declaration codegen registered", 0, 0,
-            "mutability is read from the enclosing declaration; without one a shared binding cannot be told from a copyable one")
-        return false
+    let scope = current_binder_scope()
+    for nm in free {
+        let slot = layout_of(tid_of_binder(scope, nm), Position.ContainerSlot)
+        let why = slot.decline_reason
+        if why != "" {
+            diag_ice_at("UnspellableCaptureType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "captured local '{nm}' has no C layout: {why}", node,
+                "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+            return false
+        }
+        if slot.slot_form == SlotForm.PointerBoxed {
+            diag_ice_at("BoxedCaptureNotLowered", CODEGEN_STAGE_NOT_BUILT,
+                "closure captures '{nm}', whose value does not fit a capture word and needs a heap box no stage allocates yet",
+                node, "a capture word is one void*; a value that cannot be punned into one has to live behind a pointer, and nothing allocates that box")
+            return false
+        }
     }
     let mut shared: List[Str] = []
+    let mut unrecorded: List[Str] = []
     for nm in free {
-        if decl_binds_mut(decl, nm) { shared.push(nm) }
+        let m = binder_mutability_of(scope, nm)
+        if m == BinderMut.Mutable { shared.push(nm) }
+        if m == BinderMut.Unknown { unrecorded.push(nm) }
     }
-    if shared.len() == 0 { return true }
-    diag_ice_at("SharedMutableCaptureNotLowered", CODEGEN_STAGE_NOT_BUILT,
-        "closure captures {join_names(shared)}, which the enclosing function can assign, and a shared mutable binding has no cell yet",
-        node, "a mutable binding is shared with its closure rather than copied; copying the value would lose a write on each side")
-    false
-}
-
-// The registered declaration whose body holds this literal, found by containment so the
-// answer is keyed on the closure's identity and not on how anything is spelled.
-fn enclosing_decl_of(closure: Int) -> Int {
-    for d in cg_reg_fn_decls() { if subtree_holds(node_body(d), closure) { return d } }
-    for d in cg_reg_impl_methods() { if subtree_holds(node_body(d), closure) { return d } }
-    for d in cg_reg_test_decls() { if subtree_holds(node_body(d), closure) { return d } }
-    -1
-}
-
-fn subtree_holds(node: Int, target: Int) -> Bool {
-    if node < 0 { return false }
-    if node == target { return true }
-    for kid in node_value_child_ids(node) {
-        if subtree_holds(kid, target) { return true }
+    if shared.len() > 0 {
+        diag_ice_at("SharedMutableCaptureNotLowered", CODEGEN_STAGE_NOT_BUILT,
+            "closure captures {join_names(shared)}, which the enclosing function can assign, and a shared mutable binding has no cell yet",
+            node, "a mutable binding is shared with its closure rather than copied; copying the value would lose a write on each side")
+        return false
     }
-    false
-}
-
-// Whether the declaration binds `name` with `let mut` anywhere inside it.
-//
-// Shadowing is deliberately not resolved: a `let mut n` under one branch and an immutable
-// `n` under another both answer true, which refuses a capture a shared cell would later
-// accept. Over-refusing costs a closure that stays unbuilt for one more slice, while the
-// opposite mistake copies a shared binding and miscompiles in silence.
-fn decl_binds_mut(node: Int, name: Str) -> Bool {
-    if node < 0 { return false }
-    if nk_of(node_kind(node)) == NodeKind.LetBinding {
-        if node_name(node) == name && node_is_mut(node) == 1 { return true }
+    if unrecorded.len() > 0 {
+        diag_ice_at("CaptureMutabilityNotRecorded", CODEGEN_STAGE_NOT_BUILT,
+            "closure captures {join_names(unrecorded)}, bound where codegen records no mutability, and a binding that might be shared has no cell yet",
+            node, "parameters and pattern binders do not record mutability yet; until their bind site does, a capture of one cannot be told from a shared binding")
+        return false
     }
-    for kid in node_value_child_ids(node) {
-        if decl_binds_mut(kid, name) { return true }
-    }
-    false
+    true
 }
 
 fn join_names(names: List[Str]) -> Str {

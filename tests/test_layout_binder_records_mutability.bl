@@ -1,0 +1,100 @@
+// The binder frame's mutability column.
+//
+// A capture reads a name's type off the binder frame. Whether that same name may be
+// assigned is the other half of the same question, so it is a column of the same entry
+// rather than a second table: one resolution of the name answers both, and the two
+// cannot drift apart the way two lookups can.
+//
+// Three states, not two. A bind site that does not know the answer records Unknown, so a
+// reader that needs it refuses rather than reading Unknown as immutable. That is what
+// makes every bind site not yet switched fail closed.
+
+import std.io
+import layout.{
+    BinderMut, bind_binder, bind_binder_mut, binder_mutability_of, binder_scope_pop,
+    binder_scope_push, layout_reset, tid_of_binder,
+}
+import typecheck.{TYPE_INT, TYPE_STR}
+
+fn name_of(m: BinderMut) -> Str {
+    match m {
+        BinderMut.Unknown => "unknown"
+        BinderMut.Immutable => "immutable"
+        BinderMut.Mutable => "mutable"
+    }
+}
+
+fn assert_mut(label: Str, scope: Int, name: Str, want: BinderMut) {
+    let got = binder_mutability_of(scope, name)
+    if got != want {
+        io.println("FAIL: {label}: got {name_of(got)} want {name_of(want)}")
+    }
+    assert(got == want)
+}
+
+test "a binder bound without a mutability reads unknown" {
+    layout_reset()
+    let s = binder_scope_push()
+    bind_binder(s, "n", TYPE_INT)
+    assert_mut("plain bind", s, "n", BinderMut.Unknown)
+    binder_scope_pop()
+}
+
+test "a binder bound immutable reads immutable, and one bound mutable reads mutable" {
+    layout_reset()
+    let s = binder_scope_push()
+    bind_binder_mut(s, "fixed", TYPE_INT, false)
+    bind_binder_mut(s, "movable", TYPE_INT, true)
+    assert_mut("immutable", s, "fixed", BinderMut.Immutable)
+    assert_mut("mutable", s, "movable", BinderMut.Mutable)
+    binder_scope_pop()
+}
+
+test "a name no frame binds reads unknown rather than a neighbour's answer" {
+    // The absent case and the unrecorded case answer the same thing on purpose: a reader
+    // that refuses on Unknown refuses on both, and neither can be mistaken for immutable.
+    layout_reset()
+    let s = binder_scope_push()
+    bind_binder_mut(s, "here", TYPE_INT, true)
+    assert_mut("absent", s, "elsewhere", BinderMut.Unknown)
+    binder_scope_pop()
+}
+
+test "the mutability and the type come off the same entry" {
+    // If the two were resolved separately they could answer for different entries once a
+    // name is bound twice. The later entry owns both answers.
+    layout_reset()
+    let s = binder_scope_push()
+    bind_binder_mut(s, "x", TYPE_INT, true)
+    bind_binder_mut(s, "x", TYPE_STR, false)
+    assert_eq(tid_of_binder(s, "x"), TYPE_STR)
+    assert_mut("rebound", s, "x", BinderMut.Immutable)
+    binder_scope_pop()
+}
+
+test "an inner frame shadows the mutability of the name it shadows" {
+    layout_reset()
+    let outer = binder_scope_push()
+    bind_binder_mut(outer, "n", TYPE_INT, true)
+    let inner = binder_scope_push()
+    bind_binder_mut(inner, "n", TYPE_INT, false)
+    assert_mut("inner", inner, "n", BinderMut.Immutable)
+    binder_scope_pop()
+    assert_mut("outer after pop", outer, "n", BinderMut.Mutable)
+    binder_scope_pop()
+}
+
+test "popping a frame drops its mutability entries with its types" {
+    // The column is popped with the rest of the entry. A column left behind would answer
+    // for a dead frame, and the next name bound at that index would read it.
+    layout_reset()
+    let outer = binder_scope_push()
+    bind_binder_mut(outer, "kept", TYPE_INT, false)
+    let inner = binder_scope_push()
+    bind_binder_mut(inner, "gone", TYPE_INT, true)
+    binder_scope_pop()
+    assert_eq(tid_of_binder(outer, "gone"), -1)
+    assert_mut("dropped", outer, "gone", BinderMut.Unknown)
+    assert_mut("survivor", outer, "kept", BinderMut.Immutable)
+    binder_scope_pop()
+}
