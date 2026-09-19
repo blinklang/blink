@@ -1,0 +1,193 @@
+// A generic call binds its type parameters from the whole argument list, not from the
+// arguments that happen to come first. `zz_sib_generic(closure, 7)` binds T to Int from
+// argument 1, so the closure's parameter at the T position has an answer — it is only
+// written down after the argument the answer comes from has been read.
+//
+// The spec asks for Hindley-Milner with bidirectional flow (sections/03_types.md 3.3) and
+// fixes no order on argument inference, so the same program must typecheck whichever side of
+// the call the closure is written on. Neither order worked: the closure argument claimed the
+// type parameter with the open position it had just been given, which then blocked the real
+// type the other argument carried.
+//
+// The control is the shape that genuinely has no answer: a type parameter no argument
+// binds. That one is still under-determined and is still reported (E0301), because the fix
+// must not settle a variable by inventing a type the program never named.
+
+import typecheck.{check_types, tc_lookup_node_tid, tc_resolve, tc_type_str}
+import parser.{node_kind, node_name, nodes}
+import ast.{NodeKind, nk_of}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn param_node_of(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.Param && node_name(i) == name { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no parameter '{name}'")
+    assert(false)
+    -1
+}
+
+fn assert_param_type(name: Str, want: Str) {
+    let p = param_node_of(name)
+    let tid = tc_lookup_node_tid(p)
+    if tid < 0 {
+        io.println("FAIL: parameter '{name}' carries no type at all")
+        assert(false)
+        return
+    }
+    let got = tc_type_str(tc_resolve(tid))
+    if got != want { io.println("FAIL: parameter '{name}': got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn messages_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat(d.message).concat("\n") }
+    }
+    out
+}
+
+fn assert_unreported(name: Str) {
+    let msgs = messages_reported()
+    if msgs.contains(name) { io.println("FAIL: '{name}' is reported: {msgs}") }
+    assert(!msgs.contains(name))
+}
+
+fn assert_reported(name: Str) {
+    let msgs = messages_reported()
+    if !msgs.contains(name) { io.println("FAIL: '{name}' is not reported; reports were: {msgs}") }
+    assert(msgs.contains(name))
+}
+
+// One probe holds every shape. Typecheck's named-type map is not reset between compiles in
+// one binary, so a second probe would be measuring the first one's leftovers.
+fn sibling_src() -> Str {
+    #"fn zz_sib_generic[T](f: fn(T, Str, Bool) -> Int, a: T) -> Int {
+    f(a, "s", true)
+}
+
+fn zz_sib_reverse[T](a: T, f: fn(T, Str, Bool) -> Int) -> Int {
+    f(a, "s", true)
+}
+
+fn zz_sib_middle[K](a: Str, f: fn(K, Bool) -> Int, b: K) -> Int {
+    f(b, true)
+}
+
+fn zz_sib_nested[T](f: fn(T, Str) -> Int, a: List[T]) -> Int {
+    f(a.get(0).unwrap(), "s")
+}
+
+fn zz_sib_unbound[T](f: fn(T) -> Int) -> Int {
+    9
+}
+
+type ZzSibHolder { n: Int }
+
+trait ZzSibRunner {
+    fn zz_run[T](self, f: fn(T, Str) -> Int, a: T) -> Int
+}
+
+impl ZzSibRunner for ZzSibHolder {
+    fn zz_run[T](self, f: fn(T, Str) -> Int, a: T) -> Int {
+        f(a, "s")
+    }
+}
+
+fn main() {
+    let _g = zz_sib_generic(fn(zzpa, zzpb, zzpc) -> Int { zzpb.len() }, 7)
+    let _r = zz_sib_reverse(7, fn(zzra, zzrb, zzrc) -> Int { zzrb.len() })
+    let _m = zz_sib_middle("x", fn(zzma, zzmb) -> Int { 1 }, true)
+    let _n = zz_sib_nested(fn(zzna, zznb) -> Int { zznb.len() }, ["a"])
+    let _u = zz_sib_unbound(fn(zzua) -> Int { 4 })
+    let zzh = ZzSibHolder { n: 1 }
+    let _q = zzh.zz_run(fn(zzqa, zzqb) -> Int { zzqb.len() }, 7)
+}
+"#
+}
+
+// The defect. T is bound to Int by argument 1, so the closure parameter at the T position
+// is Int and nothing about it is undetermined.
+test "a closure written before the argument that binds the type parameter is still inferred" {
+    let _p = probe("build/closure_sibling_first.bl", sibling_src())
+
+    assert_param_type("zzpa", "Int")
+}
+
+// The order that already worked. It stays working: the fix adds a second chance, it does
+// not move the first one.
+test "a closure written after the argument that binds the type parameter is inferred" {
+    let _p = probe("build/closure_sibling_second.bl", sibling_src())
+
+    assert_param_type("zzra", "Int")
+}
+
+// The binding argument may be on either side of the closure, so the rule cannot be
+// "look at the argument before" or "look at the argument after".
+test "the binding argument may sit past the closure in the list" {
+    let _p = probe("build/closure_sibling_middle.bl", sibling_src())
+
+    assert_param_type("zzma", "Bool")
+}
+
+// The type parameter reaches the later argument through a container. The binds a call
+// collects are structural, so the closure position gets the same answer.
+test "a type parameter bound through a later container argument reaches the closure" {
+    let _p = probe("build/closure_sibling_nested.bl", sibling_src())
+
+    assert_param_type("zzna", "Str")
+}
+
+// The positions the signature spells out are unaffected either way.
+test "the declared positions beside the type parameter keep their declared types" {
+    let _p = probe("build/closure_sibling_declared.bl", sibling_src())
+
+    assert_param_type("zzpb", "Str")
+    assert_param_type("zzpc", "Bool")
+    assert_param_type("zzmb", "Bool")
+}
+
+// A parameter with an answer is not a parameter the front end could not infer.
+test "an inferable closure parameter is not reported as under-determined" {
+    let _p = probe("build/closure_sibling_quiet.bl", sibling_src())
+
+    assert_unreported("zzpa")
+    assert_unreported("zzma")
+    assert_unreported("zzna")
+}
+
+// A method that declares its own type parameter is read the same way. The receiver answers
+// the impl's binders, never the method's, so the closure argument depends on the same
+// whole-list binds a free function's does.
+test "a generic method reads its closure argument from the whole argument list too" {
+    let _p = probe("build/closure_sibling_method.bl", sibling_src())
+
+    assert_param_type("zzqa", "Int")
+    assert_param_type("zzqb", "Str")
+    assert_unreported("zzqa")
+}
+
+// The control. No argument binds T here, so the closure parameter really is
+// under-determined and the fix must leave that report standing.
+test "a closure parameter no argument can bind is still reported as under-determined" {
+    let _p = probe("build/closure_sibling_unbound.bl", sibling_src())
+
+    assert_reported("zzua")
+}

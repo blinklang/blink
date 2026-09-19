@@ -842,24 +842,45 @@ fn lo_opaque_decl(r: Int) -> Int {
     -1
 }
 
-// Two facts about a declaration that neither its node nor its tid carries are marked
-// on cname once per build. Until an annotation or typecheck owns them, this pass is
-// the interim owner, and it is the ONLY place a type is known by its name:
-//  - Errno with exactly one variant carrying exactly one Int is the transparent
-//    newtype that lowers to a bare int64_t;
-//  - ConversionError and ProcessResult are declared in lib/std but defined by
-//    runtime.h, so they keep the bare blink_<Name> the runtime declares.
+// A declaration carries a codegen fact, and the module that declares it is what decides
+// the fact. The spelling never does: a user type is free to be named Errno, and it keeps
+// the ordinary lowering.
+type LoDeclFact {
+    module_name: Str
+    type_name: Str
+    fact: Str
+}
+
+let LO_FACT_TRANSPARENT_NEWTYPE: Str = "transparent_newtype"
+let LO_FACT_RUNTIME_OWNED: Str = "runtime_owned"
+
+// The whole set, in one place. Errno with exactly one variant carrying exactly one Int
+// is the transparent newtype that lowers to a bare int64_t. ConversionError and
+// ProcessResult are declared in lib/std but defined by runtime.h, so they keep the bare
+// blink_<Name> the runtime declares.
+fn lo_decl_fact_table() -> List[LoDeclFact] {
+    [
+        LoDeclFact { module_name: "std_errno", type_name: "Errno", fact: LO_FACT_TRANSPARENT_NEWTYPE },
+        LoDeclFact { module_name: "std_traits", type_name: "ConversionError", fact: LO_FACT_RUNTIME_OWNED },
+        LoDeclFact { module_name: "std_process", type_name: "ProcessResult", fact: LO_FACT_RUNTIME_OWNED },
+    ]
+}
+
+// Neither the node nor the tid carries these facts, so they are marked on cname once per
+// build. Until an annotation or typecheck owns them, this pass is the interim owner.
+//
+// Each row is read through the QUALIFIED key. The bare-name index keeps only its last
+// writer, so reading it by bare name hands a user namesake the stdlib declaration's mark
+// and leaves the stdlib declaration bare, mis-lowering both.
 fn lo_mark_decl_facts() {
-    let names = tc_type_decl_nodes.keys()
-    let mut i = 0
-    while i < names.len() {
-        let name = names.get(i).unwrap()
-        let decl = tc_type_decl_nodes.get(name) ?? -1
-        if decl >= 0 && name == node_name(decl) {
-            if name == "Errno" && lo_decl_is_int_newtype_shape(decl) { cname_mark_transparent_newtype(decl) }
-            if name == "ConversionError" || name == "ProcessResult" { cname_mark_runtime_owned(decl) }
+    for row in lo_decl_fact_table() {
+        let decl = tc_type_decl_nodes.get("{row.module_name}.{row.type_name}") ?? -1
+        if decl >= 0 && node_name(decl) == row.type_name {
+            if row.fact == LO_FACT_TRANSPARENT_NEWTYPE && lo_decl_is_int_newtype_shape(decl) {
+                cname_mark_transparent_newtype(decl)
+            }
+            if row.fact == LO_FACT_RUNTIME_OWNED { cname_mark_runtime_owned(decl) }
         }
-        i = i + 1
     }
 }
 

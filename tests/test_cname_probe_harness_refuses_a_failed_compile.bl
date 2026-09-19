@@ -1,0 +1,69 @@
+// The cname probes compile a source in-process and then harvest the type ids out of the
+// node arena. A probe the front end REFUSES still yields a program node, and the harvest
+// reads that wreckage as though it were the probe's: the types the test names are simply
+// absent. What the reader then sees is `probe has no type 'Foo'` from a row about naming,
+// which sends them to the naming code when the fault is a broken probe source.
+//
+// So the compile is the harness's own gate. This proves the gate's predicate, which is what
+// compile_probe asserts on; the rest of the cname suite is the other half of the proof,
+// since every probe in it now runs through that gate and still passes.
+
+import cname_test_helpers.{probe_complaint_since, assert_eq_str}
+import compiler.{compile_to_program, reset_compiler_state}
+import diagnostics.{diag_entry_count, diag_truncate}
+import std.io
+
+fn bad_import_src() -> Str {
+    #"import std.zznotastdlibmodule
+
+type ZzHarnessBad { a: Int }
+
+fn main() {
+    let _keep = ZzHarnessBad { a: 1 }
+}
+"#
+}
+
+fn good_src() -> Str {
+    #"type ZzHarnessGood { a: Int }
+
+fn main() {
+    let _keep = ZzHarnessGood { a: 1 }
+}
+"#
+}
+
+// The probe is compiled the way compile_probe compiles it, minus the assertion, so the row
+// reads the same predicate the harness gates on. The diagnostics are rolled back afterwards
+// because this binary's later rows share the buffer.
+//
+// A refused compile leaves the parser part-way through recovery, so each probe resets the
+// compiler state first and the row after a refusal measures its own probe, not the leftover.
+fn complaint_for(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    reset_compiler_state()
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    let before = diag_entry_count()
+    let _program = compile_to_program(path, 1)
+    let _rm = process_run("rm", ["-f", path])
+    let said = probe_complaint_since(before)
+    diag_truncate(before)
+    said
+}
+
+test "a probe whose import names no module is caught at the harness" {
+    let said = complaint_for("cname_harness_bad_import", bad_import_src())
+
+    if said == "" { io.println("FAIL: a probe that does not compile left the harness nothing to refuse") }
+    assert(said != "")
+    if !said.contains("ModuleNotFound") { io.println("FAIL: the complaint does not name the fault: {said}") }
+    assert(said.contains("ModuleNotFound"))
+}
+
+// The other direction. A gate that refused everything would take the whole suite with it,
+// so a probe that compiles has to leave the harness with nothing to say.
+test "a probe that compiles leaves the harness nothing to refuse" {
+    let said = complaint_for("cname_harness_good", good_src())
+
+    assert_eq_str("clean probe", said, "")
+}

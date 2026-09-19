@@ -1,0 +1,161 @@
+// A trait method may declare a type parameter of its own, independent of any binder the
+// impl header carries. That parameter is chosen by the call, exactly as a generic free
+// function's is, so the method is a template and not a body: the pass must register one
+// instance per argument type and give the body's nodes the substituted types. Walking such
+// a method as a root instead left its own parameters standing as type variables, which is
+// how the emitted C came out with `void` where the argument type belonged.
+
+import lower_test_helpers.{probe, assert_eq_str}
+import mono.{run_mono, instances, node_tid_for_inst}
+import typecheck.{tc_type_str}
+import parser.{node_methods, node_name, node_params, node_type_params, sublist_get, sublist_length}
+import std.io
+
+fn src_called_at_int() -> Str {
+    #"trait Combiner { fn combine[U](self, a: U, b: U) -> U }
+
+type Calc { base: Int }
+
+impl Combiner for Calc {
+    fn combine[U](self, a: U, b: U) -> U { a }
+}
+
+fn main() {
+    let c = Calc { base: 0 }
+    let picked = c.combine(2, 3)
+    let _keep = picked
+}
+"#
+}
+
+fn src_called_at_two_types() -> Str {
+    #"trait Combiner { fn combine[U](self, a: U, b: U) -> U }
+
+type Calc { base: Int }
+
+impl Combiner for Calc {
+    fn combine[U](self, a: U, b: U) -> U { a }
+}
+
+fn main() {
+    let c = Calc { base: 0 }
+    let n = c.combine(2, 3)
+    let s = c.combine("a", "b")
+    let _keep = [n]
+    let _kept = [s]
+}
+"#
+}
+
+fn src_never_called() -> Str {
+    #"trait Combiner { fn combine[U](self, a: U, b: U) -> U }
+
+type Calc { base: Int }
+
+impl Combiner for Calc {
+    fn combine[U](self, a: U, b: U) -> U { a }
+}
+
+fn main() {
+    let c = Calc { base: 0 }
+    let _keep = c.base
+}
+"#
+}
+
+// The impl method's declaration node, found by the name it is written under. An impl
+// block holds its methods; the trait's own declaration carries no body and is not it.
+fn impl_method(program: Int, mname: Str) -> Int {
+    let impls_sl = node_methods(program)
+    let mut i = 0
+    while i < sublist_length(impls_sl) {
+        let im = sublist_get(impls_sl, i)
+        let ms = node_methods(im)
+        let mut j = 0
+        while j < sublist_length(ms) {
+            let m = sublist_get(ms, j)
+            if node_name(m) == mname && sublist_length(node_type_params(m)) > 0 { return m }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn param_named(m: Int, pname: Str) -> Int {
+    let ps = node_params(m)
+    let mut i = 0
+    while i < sublist_length(ps) {
+        let p = sublist_get(ps, i)
+        if node_name(p) == pname { return p }
+        i = i + 1
+    }
+    -1
+}
+
+fn arg_tuples_for(decl: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(tc_type_str(inst.arg_tids)) }
+    }
+    out
+}
+
+fn instance_for(decl: Int, args: Str) -> Int {
+    let mut i = 0
+    for inst in instances() {
+        if inst.base_decl_node == decl && tc_type_str(inst.arg_tids) == args { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn report(label: Str, decl: Int) {
+    io.println("FAIL: {label}: instances for the method declaration:")
+    for a in arg_tuples_for(decl) { io.println("  {a}") }
+}
+
+test "a call chooses the method's own type parameter and registers one instance" {
+    let program = probe("mono_own_tp_int", src_called_at_int())
+    run_mono(program)
+    let decl = impl_method(program, "combine")
+    assert(decl != -1)
+    let got = arg_tuples_for(decl)
+    if got.len() != 1 { report("one instance", decl) }
+    assert(got.len() == 1)
+    assert_eq_str("argument tuple", got.get(0).unwrap(), "(Int)")
+}
+
+test "the instance gives the method's own parameters their substituted types" {
+    let program = probe("mono_own_tp_params", src_called_at_int())
+    run_mono(program)
+    let decl = impl_method(program, "combine")
+    let idx = instance_for(decl, "(Int)")
+    if idx < 0 { report("instance present", decl) }
+    assert(idx >= 0)
+    let inst = instances().get(idx).unwrap()
+    assert_eq_str("param a", tc_type_str(node_tid_for_inst(inst, param_named(decl, "a"))), "Int")
+    assert_eq_str("param b", tc_type_str(node_tid_for_inst(inst, param_named(decl, "b"))), "Int")
+}
+
+test "two calls at different types register two instances of the one declaration" {
+    let program = probe("mono_own_tp_two", src_called_at_two_types())
+    run_mono(program)
+    let decl = impl_method(program, "combine")
+    let got = arg_tuples_for(decl)
+    if got.len() != 2 { report("two instances", decl) }
+    assert(got.len() == 2)
+    assert(instance_for(decl, "(Int)") >= 0)
+    assert(instance_for(decl, "(Str)") >= 0)
+}
+
+// A template with no call is not a body. Registering one anyway would emit C for an
+// argument type the program never chose.
+test "a method with its own type parameter and no call registers no instance" {
+    let program = probe("mono_own_tp_none", src_never_called())
+    run_mono(program)
+    let decl = impl_method(program, "combine")
+    let got = arg_tuples_for(decl)
+    if got.len() != 0 { report("no instance", decl) }
+    assert(got.len() == 0)
+}
