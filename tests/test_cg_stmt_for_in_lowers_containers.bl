@@ -1,0 +1,396 @@
+// A `for` over a container, lowered to a counted loop that indexes the container.
+//
+// A range needs no runtime help, so it lowered long before this. Every other iterable
+// needs two runtime entry points, one for the length and one for the element at a
+// position, and cg_call's for_in_iteration_of is the single producer that names them. This
+// stage asks that producer and builds the loop; it never picks a symbol of its own.
+//
+// The loop steps at the TOP, from an index that starts at -1, for the same reason the
+// range loop steps at the top: a `continue` in the body must not be able to skip the step
+// and spin forever. The container and its length are each read once, into a local of their
+// own, so a body that pushes to the list it walks cannot change how many turns run.
+//
+// The element comes back from the runtime as one machine word. Turning that word back into
+// a value of the element's own type is cg_call's contract, shared with the checked read and
+// the element store, because a read that converted where a store did not would put a value
+// in a cell that comes back out as a different value.
+//
+// These tests pin the loop's shape, the element type the binder is declared at, and every
+// iterable that still has no lowering, each by the name it refuses under.
+
+import std.io
+import diagnostics.{diag_reset}
+import mono.{run_mono}
+import parser.{nodes, node_body, node_kind, node_name}
+import ast.{NodeKind}
+import layout.{layout_reset}
+import ir.{ir_c_name, ir_c_spelling, ir_kid, ir_kid_count, ir_kind, ir_reset, IrKind}
+import cg_test_helpers.{cg_probe_compile}
+import cg_stmt.{cg_stmt_reset, lower_block, lower_fn}
+import cg_expr.{cg_expr_reset}
+import lower_test_helpers.{
+    assert_eq_str, assert_shape, assert_verifies, ice_count, ice_count_exactly, last_ice,
+    shape,
+}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn lowered_program(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/{stem}_probe.bl"
+    let program = cg_probe_compile(path, src)
+    let _rm = process_run("rm", ["-f", path])
+    run_mono(program)
+    layout_reset()
+    ir_reset()
+    cg_expr_reset()
+    cg_stmt_reset()
+    diag_reset()
+    let f = find_fn(name)
+    assert(f >= 0)
+    f
+}
+
+// The whole function, so a parameter the loop walks is bound.
+fn probe_fn(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    lower_fn(lowered_program(stem, src, name))
+}
+
+// The body alone. lower_fn turns a stopped body into an empty block, so a refusal is only
+// visible through the block seam, which answers -1.
+fn probe_body(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    lower_block(node_body(lowered_program(stem, src, name)))
+}
+
+// Every C name a `let` in this tree declares, in the order the tree declares them.
+fn let_names(id: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    collect_let_names(id, out)
+    out
+}
+
+fn collect_let_names(id: Int, out: List[Str]) {
+    if id < 0 { return }
+    if ir_kind(id) == IrKind.Let { out.push(ir_c_name(id)) }
+    let mut i = 0
+    while i < ir_kid_count(id) {
+        collect_let_names(ir_kid(id, i), out)
+        i = i + 1
+    }
+}
+
+// The C spelling the `let` declaring `name` was given, or "" when no such `let` is here.
+fn spelling_of_let(id: Int, name: Str) -> Str {
+    if id < 0 { return "" }
+    if ir_kind(id) == IrKind.Let && ir_c_name(id) == name { return ir_c_spelling(id) }
+    let mut i = 0
+    while i < ir_kid_count(id) {
+        let hit = spelling_of_let(ir_kid(id, i), name)
+        if hit != "" { return hit }
+        i = i + 1
+    }
+    ""
+}
+
+// Every runtime symbol this tree calls, in call order.
+fn runtime_symbols(id: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    collect_runtime_symbols(id, out)
+    out
+}
+
+fn collect_runtime_symbols(id: Int, out: List[Str]) {
+    if id < 0 { return }
+    if ir_kind(id) == IrKind.CallRuntime { out.push(ir_c_name(id)) }
+    let mut i = 0
+    while i < ir_kid_count(id) {
+        collect_runtime_symbols(ir_kid(id, i), out)
+        i = i + 1
+    }
+}
+
+fn count_kind(id: Int, want: IrKind) -> Int {
+    if id < 0 { return 0 }
+    let mut n = if ir_kind(id) == want { 1 } else { 0 }
+    let mut i = 0
+    while i < ir_kid_count(id) {
+        n = n + count_kind(ir_kid(id, i), want)
+        i = i + 1
+    }
+    n
+}
+
+// A refused for-in records the internal error and leaves an EMPTY block where the loop
+// would have been, so the block seam still answers a node. The refusal is therefore read
+// off the diagnostic record, and the empty block is checked too: a stage that refused and
+// then emitted a loop anyway would run the body on a container it could not index.
+fn assert_refused(body: Int, name: Str, marker: Str) {
+    assert_eq_str("refusal name", last_ice(), name)
+    assert_eq_str("refusals recorded", "{ice_count_exactly(name, marker)}", "1")
+    assert_eq_str("loops emitted", "{count_kind(body, IrKind.Loop)}", "0")
+}
+
+fn src_list_sum() -> Str {
+    #"fn sum(xs: List[Int]) -> Int {
+    let mut total = 0
+    for x in xs {
+        total = total + x
+    }
+    total
+}
+"#
+}
+
+// ── The loop a list gets ──────────────────────────────────────────────────
+
+test "a for-in over a list reads the container and its length once, then indexes per turn" {
+    let body = probe_fn("cg_stmt_for_in_list", src_list_sum(), "sum")
+    assert_shape("loop shape", body,
+        "Block(Let(Const), Block(Let(VarRef), Let(CallRuntime(VarRef)), Let(Const), Loop(Block(Assign(VarRef, Binary(VarRef, Const)), If(Binary(VarRef, VarRef), Block(Break)), Let(Cast(Cast(CallRuntime(VarRef, VarRef)))), Block(Assign(VarRef, Binary(VarRef, VarRef)))))), Return(VarRef))")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}
+
+test "the loop calls the length and element entry points the producer names" {
+    let body = probe_fn("cg_stmt_for_in_symbols", src_list_sum(), "sum")
+    assert_eq_str("runtime calls", runtime_symbols(body).join(", "),
+        "blink_list_len, blink_list_get")
+}
+
+test "the length is read outside the loop so a push in the body cannot add turns" {
+    let body = probe_fn("cg_stmt_for_in_len_hoisted", src_list_sum(), "sum")
+    assert_eq_str("loops", "{count_kind(body, IrKind.Loop)}", "1")
+    assert_eq_str("length calls inside the loop", "{count_inside_loop(body, "blink_list_len")}", "0")
+    assert_eq_str("element calls inside the loop", "{count_inside_loop(body, "blink_list_get")}", "1")
+}
+
+// The runtime calls a loop makes on every turn, as opposed to the ones it makes once in
+// front of the loop.
+fn count_inside_loop(id: Int, symbol: Str) -> Int {
+    if id < 0 { return 0 }
+    if ir_kind(id) == IrKind.Loop { return count_symbol(id, symbol) }
+    let mut n = 0
+    let mut i = 0
+    while i < ir_kid_count(id) {
+        n = n + count_inside_loop(ir_kid(id, i), symbol)
+        i = i + 1
+    }
+    n
+}
+
+fn count_symbol(id: Int, symbol: Str) -> Int {
+    if id < 0 { return 0 }
+    let mut n = if ir_kind(id) == IrKind.CallRuntime && ir_c_name(id) == symbol { 1 } else { 0 }
+    let mut i = 0
+    while i < ir_kid_count(id) {
+        n = n + count_symbol(ir_kid(id, i), symbol)
+        i = i + 1
+    }
+    n
+}
+
+test "an inline list literal is walked the same way as a list a name holds" {
+    let body = probe_fn("cg_stmt_for_in_literal", #"fn run() -> Int {
+    let mut total = 0
+    for x in [1, 2, 3] {
+        total = total + x
+    }
+    total
+}
+"#, "run")
+    assert_verifies("literal loop", body)
+    assert_eq_str("runtime calls", runtime_symbols(body).join(", "),
+        "blink_list_len, blink_list_get")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}
+
+// ── The type the binder is declared at ────────────────────────────────────
+
+// The binder holds an ELEMENT, not the container. A stage that declared it at the
+// container's layout would compile, because both are one machine word, and would then read
+// every element at the wrong width. The witness is a plain `let` of the element's own type
+// in the same function, so this pins the two spellings together without naming either.
+test "the loop variable is declared at the element's type, not the container's" {
+    let body = probe_fn("cg_stmt_for_in_elem_type", #"fn widths(xs: List[Str]) -> Int {
+    let witness = "w"
+    let mut n = 0
+    for x in xs {
+        n = n + x.len()
+    }
+    n
+}
+"#, "widths")
+    let elem = spelling_of_let(body, "witness")
+    assert(elem != "")
+    assert_eq_str("binder spelling", spelling_of_let(body, "x"), elem)
+}
+
+test "a struct element comes back out of its box before the binder holds it" {
+    let body = probe_fn("cg_stmt_for_in_struct_elem", #"type Point { x: Int, y: Int }
+
+fn total(ps: List[Point]) -> Int {
+    let mut n = 0
+    for p in ps {
+        n = n + p.x
+    }
+    n
+}
+"#, "total")
+    assert_eq_str("unbox count", "{count_kind(body, IrKind.Unbox)}", "1")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}
+
+// ── Nesting, and the locals a loop mints ──────────────────────────────────
+
+test "a loop inside a loop mints an index and a length of its own" {
+    let body = probe_fn("cg_stmt_for_in_nested", #"fn total(rows: List[List[Int]]) -> Int {
+    let mut n = 0
+    for row in rows {
+        for cell in row {
+            n = n + cell
+        }
+    }
+    n
+}
+"#, "total")
+    assert_eq_str("loops", "{count_kind(body, IrKind.Loop)}", "2")
+    assert_verifies("nested loops", body)
+    let names = let_names(body)
+    let mut seen: List[Str] = []
+    for nm in names {
+        assert(!seen.contains(nm))
+        seen.push(nm)
+    }
+}
+
+// ── Control flow inside the body ──────────────────────────────────────────
+
+// `continue` jumps to the top of the loop. The step runs at the top, so the index still
+// advances; a step at the bottom would spin here forever.
+test "a continue in the body still advances the index" {
+    let body = probe_fn("cg_stmt_for_in_continue", #"fn odds(xs: List[Int]) -> Int {
+    let mut n = 0
+    for x in xs {
+        if x == 0 {
+            continue
+        }
+        n = n + x
+    }
+    n
+}
+"#, "odds")
+    assert_verifies("continue loop", body)
+    let loop_id = first_loop(body)
+    assert(loop_id >= 0)
+    assert_eq_str("first statement in the loop", shape(ir_kid(ir_kid(loop_id, 0), 0)),
+        "Assign(VarRef, Binary(VarRef, Const))")
+}
+
+fn first_loop(id: Int) -> Int {
+    if id < 0 { return -1 }
+    if ir_kind(id) == IrKind.Loop { return id }
+    let mut i = 0
+    while i < ir_kid_count(id) {
+        let hit = first_loop(ir_kid(id, i))
+        if hit >= 0 { return hit }
+        i = i + 1
+    }
+    -1
+}
+
+test "a break in the body leaves the loop the same way the bounds test does" {
+    let body = probe_fn("cg_stmt_for_in_break", #"fn firstpos(xs: List[Int]) -> Int {
+    let mut found = 0
+    for x in xs {
+        if x > 0 {
+            found = x
+            break
+        }
+    }
+    found
+}
+"#, "firstpos")
+    assert_verifies("break loop", body)
+    assert_eq_str("breaks", "{count_kind(body, IrKind.Break)}", "2")
+}
+
+// ── The range loop, unchanged ─────────────────────────────────────────────
+
+// The one arm that already worked. A range needs no runtime symbol, so it must not start
+// asking for one.
+test "a range still lowers with no runtime call of any kind" {
+    let body = probe_fn("cg_stmt_for_in_range", #"fn count() -> Int {
+    let mut n = 0
+    for i in 0..3 {
+        n = n + i
+    }
+    n
+}
+"#, "count")
+    assert_eq_str("runtime calls", runtime_symbols(body).join(", "), "")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}
+
+// ── What still has no loop ────────────────────────────────────────────────
+
+// A tuple binder destructures the element into two names. The bind site for a destructured
+// element records no mutability yet, so a capture of one cannot be told from a shared
+// binding, and lowering one here would hand that unresolved question to every closure in
+// the body. It refuses by a name of its own rather than under the iterable's name, because
+// the iterable is fine and the binder is not.
+test "a tuple binder over a list refuses by its own name, not the iterable's" {
+    let body = probe_body("cg_stmt_for_in_tuple_binder", #"fn run(pairs: List[(Int, Int)]) -> Int {
+    let mut n = 0
+    for (a, b) in pairs {
+        n = n + a + b
+    }
+    n
+}
+"#, "run")
+    assert_refused(body, "ForInTupleBinderNotLowered",
+        "destructures the element into more than one name")
+}
+
+test "a for-in over a string still refuses by name" {
+    let body = probe_body("cg_stmt_for_in_str", #"fn run(s: Str) -> Int {
+    let mut n = 0
+    for c in s {
+        n = n + c.len()
+    }
+    n
+}
+"#, "run")
+    assert_refused(body, "UnhandledIterable",
+        "for-in over this iterable has no lowering yet")
+}
+
+test "a for-in over a set still refuses by name" {
+    let body = probe_body("cg_stmt_for_in_set", #"fn run(s: Set[Int]) -> Int {
+    let mut n = 0
+    for x in s {
+        n = n + x
+    }
+    n
+}
+"#, "run")
+    assert_refused(body, "UnhandledIterable",
+        "for-in over this iterable has no lowering yet")
+}
+
+test "a for-in over a map still refuses by name" {
+    let body = probe_body("cg_stmt_for_in_map", #"fn run(m: Map[Str, Int]) -> Int {
+    let mut n = 0
+    for (k, v) in m {
+        n = n + k.len() + v
+    }
+    n
+}
+"#, "run")
+    assert_refused(body, "UnhandledIterable",
+        "for-in over this iterable has no lowering yet")
+}
