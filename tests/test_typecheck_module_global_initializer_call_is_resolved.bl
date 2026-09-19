@@ -5,6 +5,12 @@
 // Later passes read that answer rather than re-deriving a callee, so an unanswered call
 // there is a silent gap, not a missing convenience.
 
+import std.fs
+import layout.{layout_reset}
+import mono.{run_mono}
+import cname.{cname_reset}
+import cg_test_helpers.{cg_probe_compile}
+import cg.{CgConfig, generate}
 import typecheck.{check_types, tc_call_decl_node}
 import compiler.{compile_to_program}
 import parser.{node_stmts, node_value, node_name, sublist_get, sublist_length}
@@ -111,10 +117,40 @@ fn test_a_global_initializer_with_no_call_reaches_no_declaration() ! Lex.Tokeniz
     cleanup()
 }
 
+// What the unanswered call actually costs, in the C the user runs. The lowering asks name
+// resolution which declaration the call reached; with no answer it cannot emit a call at all,
+// so the global collapses to a zero definition and the whole initializer disappears. The
+// program then reads 0 where it should read the computed value, and nothing says so.
+fn emit_c_for(path: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Codegen {
+    let program = cg_probe_compile(path, src)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let out = generate(program, CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0,
+        emit_only_module: "", skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0,
+        archive_build_mode: 0 })
+    let _ = fs.delete(path)
+    out
+}
+
+fn test_the_emitted_c_initializes_a_call_based_global_by_calling_it() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Codegen {
+    let src = "fn compute() -> Int \{ 41 \}\npub let g: Int = compute()\nfn main() \{ assert(g == 41) \}\n"
+    let out = emit_c_for("build/tc_global_init_emit.bl", src)
+    if out.index_of("int64_t g = 0;") >= 0 {
+        io.println("FAIL: the global collapsed to a zero definition, the initializer was dropped")
+    }
+    assert(out.index_of("int64_t g = 0;") < 0)
+    if out.index_of("g = blink_u_compute();") < 0 {
+        io.println("FAIL: no emitted assignment calls the initializer's callee")
+    }
+    assert(out.index_of("g = blink_u_compute();") >= 0)
+}
+
 fn main() {
     test_a_free_function_call_in_a_global_initializer_reaches_its_declaration()
     test_a_qualified_module_call_in_a_global_initializer_reaches_its_declaration()
     test_a_method_call_in_a_global_initializer_reaches_its_declaration()
     test_a_global_initializer_with_no_call_reaches_no_declaration()
+    test_the_emitted_c_initializes_a_call_based_global_by_calling_it()
     io.println("module global initializer call resolution: ok")
 }
