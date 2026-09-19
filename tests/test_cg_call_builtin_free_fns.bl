@@ -4,8 +4,8 @@
 // function is looked up, so a program cannot shadow one by declaring a function of the same
 // name. Three shapes reach that list through the ordinary bare-call path (`Ident(args)`):
 // a plain runtime call such as `file_exists`, a builtin type's own constructor spelled bare
-// (`Bytes()`) rather than through its qualified `Type.new()` form, and a name this stage
-// does not lower yet (`assert`, `Set`), which must keep refusing exactly as it did before.
+// (`Bytes()`, `Set()`) rather than through its qualified `Type.new()` form, and a name this
+// stage does not lower yet (`assert`), which must keep refusing exactly as it did before.
 
 import lower_test_helpers.{
     probe, probe_but, rhs_of, let_node_of, assert_kind, assert_eq_str, assert_shape,
@@ -13,8 +13,9 @@ import lower_test_helpers.{
 }
 import parser.{node_kind, node_left, node_name, nodes}
 import ast.{NodeKind, nk_of}
-import ir.{IrKind, ir_c_name}
+import ir.{IrKind, ir_c_name, ir_kops_table}
 import cg_expr.{lower_expr}
+import diagnostics.{diag_entries}
 import std.io
 
 // A call written as a statement binds no name, so it is found by walking forward from a
@@ -127,10 +128,12 @@ fn src_closure_arg() -> Str {
 "#
 }
 
-// The tail this slice leaves refused: `Set()` names a keyed container whose key operations
-// this stage cannot choose from a call alone, and must still refuse through the exact
-// mechanism it refused through before this slice touched the free-call path.
-fn src_refused() -> Str {
+// `Set()` names a keyed container: typecheck resolves it to the same tid a qualified
+// `Set.new()` would, so codegen builds it the same way, reading the runtime constructor
+// and the element's operations table off that tid rather than off which spelling was
+// written. It no longer falls through to the generic "closure values and compiler-provided
+// calls" refusal every other unbuilt free name still shares.
+fn src_set_ctor() -> Str {
     #"fn main() {
     let mut seen = Set()
     seen.insert(7)
@@ -381,11 +384,23 @@ test "an immediately-invoked closure literal is still called through the closure
     assert_verifies("closure via iife", built)
 }
 
-test "a bare Set() still refuses through the same call this stage does not lower" {
-    probe("cg_call_bf_set_bare", src_refused())
-    assert_ice_saying("Set()", lower_expr(rhs_of("seen")),
-        "CodegenStageNotBuilt",
-        "cg_call closure values and compiler-provided calls")
+test "a bare Set() builds the runtime constructor with the element's operations table" {
+    probe("cg_call_bf_set_bare", src_set_ctor())
+    let built = lower_expr(rhs_of("seen"))
+    assert_kind("kind", built, IrKind.ContainerNew)
+    assert_eq_str("ctor", ir_c_name(built), "blink_set_new")
+    if ir_kops_table(built) == "" {
+        io.println("FAIL: Set(): built with an empty kops_table")
+    }
+    assert(ir_kops_table(built) != "")
+    assert_verifies("Set() bare", built)
+    let mut refusals = 0
+    for d in diag_entries {
+        let is_stage_gap = d.severity == "ice" && d.name == "CodegenStageNotBuilt"
+        let mentions_this_call = d.message.contains("free call") || d.message.contains("Set()")
+        if is_stage_gap && mentions_this_call { refusals = refusals + 1 }
+    }
+    assert_eq(refusals, 0)
 }
 
 // Each assertion builtin now names its own gap instead of falling through to the generic
