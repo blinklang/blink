@@ -1,0 +1,152 @@
+// Which declaration a call reached is decided once, by name resolution, using the calling
+// file's own import list. The spelling does not carry the answer: two modules may declare
+// one name, and only the importer says which one it reached. A later stage that re-derives
+// the callee from the spelling is therefore guessing, and it guesses wrong in exactly the
+// case the import list exists to settle -- so it refuses a call the front end accepted.
+//
+// Typecheck records the declaration against the call node. These rows fix what is recorded
+// for each class of callee.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_call_decl_node}
+import parser.{node_count, node_kind, node_left, node_obj, node_method, node_name, node_line}
+import ast.{nk_of, NodeKind}
+import diagnostics.{diag_reset, diag_file_for_node}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn callee_spelling(n: Int) -> Str {
+    let k = nk_of(node_kind(n))
+    if k == NodeKind.MethodCall {
+        let o = node_obj(n)
+        let recv = if o >= 0 && nk_of(node_kind(o)) == NodeKind.Ident { node_name(o) } else { "_" }
+        return "{recv}.{node_method(n)}"
+    }
+    let c = node_left(n)
+    if c >= 0 && nk_of(node_kind(c)) == NodeKind.Ident { return node_name(c) }
+    "_"
+}
+
+fn decl_spelling(d: Int) -> Str {
+    if d < 0 { return "(none)" }
+    "{node_name(d)}@{diag_file_for_node(d)}:{node_line(d)}"
+}
+
+// Every call written in the probe file, with the declaration typecheck resolved it to. The
+// pool also holds the whole prelude, whose calls no row here is about, so this reads the
+// probe's own file and nothing else.
+fn resolutions(path: Str) -> Str {
+    let mut out = ""
+    let mut n = 0
+    while n < node_count() {
+        let k = nk_of(node_kind(n))
+        if k == NodeKind.Call || k == NodeKind.MethodCall {
+            if diag_file_for_node(n) == path {
+                out = out.concat("{callee_spelling(n)} -> {decl_spelling(tc_call_decl_node(n))}\n")
+            }
+        }
+        n = n + 1
+    }
+    out
+}
+
+fn assert_resolved(got: Str, callee: Str, decl: Str) {
+    assert(got.contains("{callee} -> {decl}"), "expected '{callee} -> {decl}', got:\n{got}")
+}
+
+// Already recorded before this change; here so the coverage the later rows add cannot be
+// bought by losing what was covered.
+test "a bare call to a free function records its declaration" {
+    let p = "/tmp/zz_cr_free.bl"
+    probe(p, "fn zz_target(x: Int) -> Int \{ x }\nfn main() \{ let _ = zz_target(1) }\n")
+    assert_resolved(resolutions(p), "zz_target", "zz_target@{p}:1")
+}
+
+// Every impl in Blink is `impl Trait for Type`, so a static call reaches its declaration
+// through the trait-qualified key. The receiver is absent, which is exactly why the
+// spelling alone cannot answer: `Type.method` names a pair, not a declaration.
+test "a static trait method call records the impl's declaration" {
+    let p = "/tmp/zz_cr_static.bl"
+    let src = "type ZzBox \{ v: Int }\ntrait ZzMake \{\n    fn zz_make(n: Int) -> Self\n}\nimpl ZzMake for ZzBox \{\n    fn zz_make(n: Int) -> ZzBox \{ ZzBox \{ v: n } }\n}\nfn main() \{\n    let _ = ZzBox.zz_make(1)\n}\n"
+    probe(p, src)
+    assert_resolved(resolutions(p), "ZzBox.zz_make", "zz_make@{p}:6")
+}
+
+// A conversion is keyed by its SOURCE type, because one target carries several of them:
+// `ZzBox.from` names two declarations here and the argument's type picks one. A record
+// keyed on the type and the method name would answer the same declaration for both calls.
+test "a conversion call records the declaration its source type selects" {
+    let p = "/tmp/zz_cr_from.bl"
+    let src = "type ZzBox \{ v: Int }\nimpl From[Int] for ZzBox \{\n    fn from(x: Int) -> ZzBox \{ ZzBox \{ v: x } }\n}\nimpl From[Bool] for ZzBox \{\n    fn from(b: Bool) -> ZzBox \{ ZzBox \{ v: 0 } }\n}\nfn main() \{\n    let _ = ZzBox.from(1)\n    let _ = ZzBox.from(true)\n}\n"
+    probe(p, src)
+    let got = resolutions(p)
+    assert_resolved(got, "ZzBox.from", "from@{p}:3")
+    assert_resolved(got, "ZzBox.from", "from@{p}:6")
+}
+
+test "a trait method called through its impl records the impl's declaration" {
+    let p = "/tmp/zz_cr_trait.bl"
+    let src = "trait ZzSize \{\n    fn zz_size(self) -> Int\n}\ntype ZzBox \{ v: Int }\nimpl ZzSize for ZzBox \{\n    fn zz_size(self) -> Int \{ self.v }\n}\nfn main() \{\n    let b = ZzBox \{ v: 1 }\n    let _ = b.zz_size()\n}\n"
+    probe(p, src)
+    assert_resolved(resolutions(p), "b.zz_size", "zz_size@{p}:6")
+}
+
+// The declaration is the generic one. Which instance the call reaches is decided later,
+// from the argument types, and is mono's business; recording an instance here would put
+// the same call under two owners.
+test "a call to a generic function records the generic declaration" {
+    let p = "/tmp/zz_cr_generic.bl"
+    let src = "fn zz_id[T](x: T) -> T \{ x }\nfn main() \{\n    let _ = zz_id(1)\n    let _ = zz_id(\"s\")\n}\n"
+    probe(p, src)
+    let got = resolutions(p)
+    assert_resolved(got, "zz_id", "zz_id@{p}:1")
+    // Both calls, one declaration.
+    assert_eq(got.contains("zz_id -> (none)"), false)
+}
+
+// The case the record exists for. Two modules declare one name and both declarations are
+// live in the program; only each calling file's own import list says which one its call
+// reached. A later stage that searches every declaration by the spelling finds both and can
+// only refuse -- so this row fixes the fact that stage is meant to read instead.
+test "two modules declaring one name each answer their own importer" {
+    let dir = "/tmp/zz_cr_sel"
+    shell_exec("rm -rf {dir} && mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"zzsel\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/zza.bl", "pub fn zz_parse(x: Int) -> Int \{ x }\n")
+    write_file("{dir}/src/zzb.bl", "pub fn zz_parse(x: Int) -> Int \{ x + 1 }\n")
+    write_file("{dir}/src/zzc.bl", "import zzb.\{zz_parse}\npub fn zz_use(x: Int) -> Int \{ zz_parse(x) }\n")
+    let main_p = "{dir}/src/main.bl"
+    probe(main_p, "import zza.\{zz_parse}\nimport zzc.\{zz_use}\nfn main() \{ let _ = zz_parse(1)\n    let _ = zz_use(2) }\n")
+
+    assert_resolved(resolutions(main_p), "zz_parse", "zz_parse@{dir}/src/zza.bl:1")
+    assert_resolved(resolutions("{dir}/src/zzc.bl"), "zz_parse", "zz_parse@{dir}/src/zzb.bl:1")
+    shell_exec("rm -rf {dir}")
+}
+
+test "an enum variant constructor records the variant's declaration" {
+    let p = "/tmp/zz_cr_variant.bl"
+    let src = "type ZzTag \{\n    ZzA(Int)\n    ZzB\n}\nfn main() \{\n    let _ = ZzTag.ZzA(1)\n}\n"
+    probe(p, src)
+    assert_resolved(resolutions(p), "ZzTag.ZzA", "ZzA@{p}:2")
+}
+
+// The arm, not the enum. Two enums may declare one variant name, and the record that
+// answers with the enum is first-declared-wins across the whole program -- so it hands both
+// constructors the same answer, which is the confusion a recorded fact exists to end.
+test "two enums sharing a variant name each record their own arm" {
+    let p = "/tmp/zz_cr_variant_shared.bl"
+    let src = "type ZzOne \{\n    ZzShared(Int)\n}\ntype ZzTwo \{\n    ZzShared(Int)\n}\nfn main() \{\n    let _ = ZzOne.ZzShared(1)\n    let _ = ZzTwo.ZzShared(2)\n}\n"
+    probe(p, src)
+    let got = resolutions(p)
+    assert_resolved(got, "ZzOne.ZzShared", "ZzShared@{p}:2")
+    assert_resolved(got, "ZzTwo.ZzShared", "ZzShared@{p}:5")
+}
