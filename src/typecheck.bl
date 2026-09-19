@@ -3739,7 +3739,7 @@ fn tc_seed_closure_args_with_binds(sig: Int, args_sl: Int, self_offset: Int, bin
         let pidx = i + self_offset
         if pidx < param_count {
             let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
-            tc_seed_closure_expected_fn(sublist_get(args_sl, i), substitute_typevar_tid(ptid, binds))
+            tc_seed_expected_into_value(sublist_get(args_sl, i), substitute_typevar_tid(ptid, binds))
         }
         i = i + 1
     }
@@ -4365,7 +4365,7 @@ fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int, call
         if pidx >= 0 && pidx < param_count {
             let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
             if tc_tid_is_no_info(ptid) == 0 {
-                tc_seed_closure_expected_fn(arg_node, ptid)
+                tc_seed_expected_into_value(arg_node, ptid)
                 let saved_hint = tc_construct_hint
                 tc_construct_hint = resolve_alias_tid(ptid)
                 let arg_t = infer_type(arg_node)
@@ -5051,6 +5051,63 @@ fn tc_seed_closure_expected_fn(arg0: Int, expected: Int) {
     tc_publish_node_tid(a, seed)
 }
 
+// Carry a declared type along the path the VALUE takes to reach the position that declared
+// it, and hand it to the closure that finally sits there.
+//
+// A closure is not always written where the declaration is written. An `if` used as a value
+// produces its answer from a branch tail, and a List literal produces its element type from
+// its elements, so `let f: fn(Int) -> Int = if p { fn(a) { .. } } else { .. }` declares the
+// type of each tail, not of the `if`. The expectation stopped at the `if` or at the `[`, the
+// closure one level in had nothing to read, and its parameters were reported as
+// under-determined even though the program spelled them out.
+//
+// Descent only: the leaf is still the one publisher, so a position this does not understand
+// behaves exactly as it did before, and a branch holding anything but a closure is untouched.
+fn tc_seed_expected_into_value(val: Int, expected: Int) {
+    tc_seed_expected_into_value_at(val, expected, 0)
+}
+
+fn tc_seed_expected_into_value_at(val: Int, expected: Int, depth: Int) {
+    if val == -1 || expected < 0 { return }
+    // Nesting this deep is not a shape a declaration can still describe; the cap keeps the
+    // descent finite without depending on the tree being well formed.
+    if depth > 8 { return }
+    let mut v = val
+    if node_kind(v) == NodeKind.NamedArg { v = node_value(v) }
+    if v == -1 { return }
+    let k = node_kind(v)
+    if k == NodeKind.Block {
+        let tail = tc_block_tail_stmt(v)
+        if tail == -1 { return }
+        tc_seed_expected_into_value_at(tc_block_tail_value(tail), expected, depth + 1)
+        return
+    }
+    if k == NodeKind.IfExpr {
+        // Both tails answer to the same declaration, and an `if` used as a statement has no
+        // else branch, which the -1 guard at the top of this function absorbs.
+        tc_seed_expected_into_value_at(node_then_body(v), expected, depth + 1)
+        tc_seed_expected_into_value_at(node_else_body(v), expected, depth + 1)
+        return
+    }
+    if k == NodeKind.ListLit {
+        let r = tc_tid_resolved(expected)
+        if r < 0 || r >= ty_pool.len() { return }
+        if ty_pool.get(r).unwrap().kind != TyKind.List { return }
+        let elem = ty_pool.get(r).unwrap().inner1
+        if elem < 0 { return }
+        let elems_sl = node_elements(v)
+        if elems_sl == -1 { return }
+        let n = sublist_length(elems_sl)
+        let mut i = 0
+        while i < n {
+            tc_seed_expected_into_value_at(sublist_get(elems_sl, i), elem, depth + 1)
+            i = i + 1
+        }
+        return
+    }
+    tc_seed_closure_expected_fn(v, expected)
+}
+
 // `fn_tid` with every position that names a type parameter replaced by TYPE_UNKNOWN, so
 // inference still owns those and the remaining positions are published as declared. -1 when
 // no position survives, which is how "this signature declares nothing usable here" is spelled.
@@ -5378,6 +5435,15 @@ fn tc_walk_nested_hof_bodies(expr: Int) ! TypeCheck.Resolve, TypeCheck.Report, D
                 i = i + 1
             }
         }
+        return
+    }
+    // An `if` used as a value holds its closure in a branch, and a branch body is a Block,
+    // which this walker already routes to the full walk. Without this the closure
+    // in `take(if p { fn(x) { .. } } else { .. })` was never body-walked at all: its parameters
+    // stayed unstamped and its return stayed Void, whatever the parameter declared.
+    if k == NodeKind.IfExpr {
+        tc_walk_nested_hof_bodies(node_then_body(expr))
+        tc_walk_nested_hof_bodies(node_else_body(expr))
         return
     }
 }
@@ -18525,7 +18591,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             let seed_tail = tc_block_tail_stmt(node)
             if seed_tail != -1 {
                 if tc_block_tail_value(seed_tail) != -1 { hint_tail = seed_tail }
-                tc_seed_closure_expected_fn(tc_block_tail_value(seed_tail), tc_current_fn_ret)
+                tc_seed_expected_into_value(tc_block_tail_value(seed_tail), tc_current_fn_ret)
             }
         }
         if stmts_sl != -1 {
@@ -18667,7 +18733,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 
         let mut inferred_tid = TYPE_UNKNOWN
         if val != -1 {
-            tc_seed_closure_expected_fn(val, declared_tid)
+            tc_seed_expected_into_value(val, declared_tid)
             let saved_hint = tc_construct_hint
             if tc_tid_is_no_info(declared_tid) == 0 { tc_construct_hint = resolve_alias_tid(declared_tid) }
             // A let binding is expression context (§2.9): infer in value context so an else-less
@@ -19277,7 +19343,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // inferred and walked, which is where the closure body reads it. Inside a closure
             // body tc_current_fn_ret still names the ENCLOSING fn, so seeding there would
             // publish another function's signature on this closure.
-            if returns_value && tc_in_closure_depth == 0 { tc_seed_closure_expected_fn(val, tc_current_fn_ret) }
+            if returns_value && tc_in_closure_depth == 0 { tc_seed_expected_into_value(val, tc_current_fn_ret) }
             let val_t = if returns_value { tc_infer_value(val) } else { infer_type(val) }
             tc_construct_hint = saved_hint
             // Shared with the implicit tail — see tc_check_returned_value for why each
@@ -20043,7 +20109,7 @@ fn tc_register_module_let_pattern(l: Int, l_tid: Int) {
 // pin — so `let m: Map[Str, Int] = Map()` records `Map[Str, Int]` on the ctor and not `Map[?, ?]`.
 fn tc_stamp_annotated_global_init(l: Int, l_val: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let declared = tc_lookup_node_tid(l)
-    tc_seed_closure_expected_fn(l_val, declared)
+    tc_seed_expected_into_value(l_val, declared)
     let saved_hint = tc_construct_hint
     if tc_tid_is_no_info(declared) == 0 { tc_construct_hint = resolve_alias_tid(declared) }
     let v_tid = tc_infer_value(l_val)
@@ -21136,7 +21202,7 @@ fn tc_stamp_type_field_defaults(td: Int) ! TypeCheck.Resolve, TypeCheck.Report, 
 // it must not leak, the construct hint, is saved and restored.
 @allow(UnrestoredMutation)
 fn tc_stamp_field_default(dflt: Int, ftid: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    tc_seed_closure_expected_fn(dflt, ftid)
+    tc_seed_expected_into_value(dflt, ftid)
     let saved_hint = tc_construct_hint
     if tc_tid_is_no_info(ftid) == 0 { tc_construct_hint = resolve_alias_tid(ftid) }
     let inferred = tc_infer_value(dflt)
