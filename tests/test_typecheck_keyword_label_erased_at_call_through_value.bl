@@ -1,0 +1,186 @@
+// Section 3.3 decides this, 5-0: keyword labels are not part of a function type. A
+// declaration writes `--` and the type that comes out of it is the plain positional one,
+// so the labels and the defaults that live on those parameters reach a call only through
+// the DECLARATION. A call through a value has the type and nothing else.
+//
+// The refusal is therefore correct and must stay. What was wrong is what the refusal said.
+// The label was dropped and the argument matched against parameter 0 by position, so the
+// call was reported twice: once for an arity the erasure explains, and once for a type
+// mismatch that is an artefact of the silent re-matching. Neither report names the rule,
+// and the second sends the reader to correct a type that is not wrong.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn codes_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat(d.code).concat(" ") }
+    }
+    out
+}
+
+fn error_count() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" { n = n + 1 }
+    }
+    n
+}
+
+// Everything that is not a warning, as `name: message` lines, so a row meaning "accepted"
+// reads the internal errors too and not just the absence of one code.
+fn problems_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity != "warning" { out = out.concat("{d.name}: {d.message}\n") }
+    }
+    out
+}
+
+fn messages_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat(d.message).concat("\n") }
+    }
+    out
+}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+// The ticket's own shape: one call by name and one through a binding of that name.
+fn through_value_src() -> Str {
+    #"fn zzserve(-- zzhost: Str = "0.0.0.0", zzport: Int) -> Int {
+    zzhost.len() + zzport
+}
+
+fn main() {
+    let zzf = zzserve
+    let _through = zzf(zzport: 8080)
+}
+"#
+}
+
+fn direct_src() -> Str {
+    #"fn zzserve(-- zzhost: Str = "0.0.0.0", zzport: Int) -> Int {
+    zzhost.len() + zzport
+}
+
+fn main() {
+    let _direct = zzserve(zzport: 8080)
+}
+"#
+}
+
+fn positional_through_value_src() -> Str {
+    #"fn zzserve(-- zzhost: Str = "0.0.0.0", zzport: Int) -> Int {
+    zzhost.len() + zzport
+}
+
+fn main() {
+    let zzf = zzserve
+    let _through = zzf("h", 8080)
+}
+"#
+}
+
+fn omitted_through_value_src() -> Str {
+    #"fn zzserve(-- zzhost: Str = "0.0.0.0", zzport: Int) -> Int {
+    zzhost.len() + zzport
+}
+
+fn main() {
+    let zzf = zzserve
+    let _through = zzf(8080)
+}
+"#
+}
+
+fn closure_label_src() -> Str {
+    #"fn main() {
+    let zzf = fn(-- zza: Int = 1) -> Int { zza }
+    let _ = zzf(zza: 2)
+}
+"#
+}
+
+test "a label at a call through a function value is refused under the label rule" {
+    let _p = probe("build/kwerase_value.bl", through_value_src())
+
+    assert(codes_reported().contains("E0511"))
+}
+
+// The mistake is one mistake. An arity report explains the erasure as a counting error and
+// a per-argument report invents a type problem out of the re-matching, so a call carrying a
+// label must leave exactly one report behind.
+test "the label refusal is the only report the call leaves" {
+    let _p = probe("build/kwerase_once.bl", through_value_src())
+
+    assert_eq(error_count(), 1)
+    let msgs = messages_reported()
+    if msgs.contains("argument(s), got") { io.println("FAIL: arity reported too: {msgs}") }
+    assert(!msgs.contains("argument(s), got"))
+    if msgs.contains("expects Str, got Int") { io.println("FAIL: positional mismatch reported too: {msgs}") }
+    assert(!msgs.contains("expects Str, got Int"))
+}
+
+// The refusal must name the rule rather than the symptom, because the repair is neither
+// correcting the label nor adding an argument of the type the old report named.
+test "the label refusal says a function type carries no labels" {
+    let _p = probe("build/kwerase_help.bl", through_value_src())
+
+    let mut help = ""
+    for d in diag_entries {
+        if d.code == "E0511" { help = d.help }
+    }
+    if !help.contains("positional") { io.println("FAIL: help does not name the repair: '{help}'") }
+    assert(help.contains("positional"))
+}
+
+// The other half of the same rule. Erasure is a property of the value, so the declaration
+// keeps both its labels and its defaults and the direct call is still accepted.
+test "the same label at a direct call is still accepted and the default still fills" {
+    let _p = probe("build/kwerase_direct.bl", direct_src())
+
+    assert_eq_str("no problems", problems_reported(), "")
+}
+
+// Defaults live on keyword parameters, so they are erased with the labels. A value of this
+// type takes two arguments and neither of them may be left out.
+test "a call through a value takes every erased parameter positionally" {
+    let _p = probe("build/kwerase_positional.bl", positional_through_value_src())
+
+    assert_eq_str("no problems", problems_reported(), "")
+}
+
+test "a call through a value may not omit the parameter the declaration defaulted" {
+    let _p = probe("build/kwerase_omitted.bl", omitted_through_value_src())
+
+    assert(error_count() > 0)
+    assert(!codes_reported().contains("E0511"))
+}
+
+// A closure literal bound to a name reaches the call the same way, so the rule cannot be
+// one that only functions written with `fn name` obey.
+test "a closure value refuses a label for the same reason" {
+    let _p = probe("build/kwerase_closure.bl", closure_label_src())
+
+    assert(codes_reported().contains("E0511"))
+}
