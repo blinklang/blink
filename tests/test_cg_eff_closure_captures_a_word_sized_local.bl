@@ -23,7 +23,7 @@ import cg_test_helpers.{cg_probe_compile}
 import ast.{NodeKind}
 import parser.{node_value}
 import layout.{bind_binder, binder_scope_pop, binder_scope_push, layout_reset}
-import ir.{IrKind, ir_c_name, ir_capture_descs, ir_kid_count, ir_kid, ir_kind, ir_reset, ir_verify}
+import ir.{IrKind, ir_c_name, ir_capture_descs, ir_promoter, ir_kid_count, ir_kid, ir_kind, ir_reset, ir_verify}
 import cg_reg.{cg_reg_build}
 import cg_expr.{cg_expr_reset}
 import cg_stmt.{cg_stmt_reset, lower_block_returning}
@@ -142,6 +142,15 @@ fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete
     diag_reset()
 }
 
+// What capture word `i` ultimately reads. A word that needs the integer bridge is a cast
+// over the read, so the name sits on the leaf; a pointer word is the read itself.
+fn word_reads(v: Int, i: Int) -> Str {
+    let word = ir_kid(v, i)
+    if word < 0 { return "" }
+    if ir_kind(word) == IrKind.Cast { return ir_c_name(ir_kid(word, 0)) }
+    ir_c_name(word)
+}
+
 fn closure_of(let_name: Str) -> Int {
     let binding = find_decl(NodeKind.LetBinding, let_name, "")
     assert(binding >= 0)
@@ -172,22 +181,23 @@ test "the record carries one capture word, and the word reads the enclosing loca
     let v = lower_capturing("g_int", ["n"], TYPE_INT)
     assert(v >= 0)
     assert_eq(ir_kid_count(v), 1)
-    let word = ir_kid(v, 0)
-    assert(word >= 0)
     // The word is a read of the enclosing local, not a fresh value: a capture that named
     // something else would compile and hold the wrong number.
-    assert(ir_c_name(word).contains("n"))
+    assert(word_reads(v, 0).contains("n"))
     assert_eq(ir_verify(v).len(), 0)
 }
 
-test "a record with captures names a descriptor table rather than leaving the slot empty" {
-    // cg_print writes NULL for an empty slot, and the runtime walks the table to promote a
-    // closure into an arena. A capture list with no table is a closure that cannot be
-    // promoted.
+test "a capture list with no promoter names no descriptor table" {
+    // The descriptor table exists for one reader: the generated promoter that deep-copies
+    // captures into an arena. bootstrap/runtime_core.h stores the table and never walks it
+    // otherwise, and blink_closure_get_capture does not consult it. So the table and the
+    // promoter stand or fall together, and a closure that is never arena-promoted carries
+    // neither. Emitting a table anyway would put an array in the C that nothing reads.
     setup()
     let v = lower_capturing("g_int", ["n"], TYPE_INT)
     assert(v >= 0)
-    assert(ir_capture_descs(v) != "")
+    assert_eq(ir_capture_descs(v), "")
+    assert_eq(ir_promoter(v), "")
 }
 
 test "the thunk body binds the captured name, so a read inside resolves without the enclosing frame" {
@@ -221,8 +231,8 @@ test "two distinct captured names take two capture words in first-read order" {
     let v = lower_capturing("g_two", ["n", "m"], TYPE_INT)
     assert(v >= 0)
     assert_eq(ir_kid_count(v), 2)
-    assert(ir_c_name(ir_kid(v, 0)).contains("n"))
-    assert(ir_c_name(ir_kid(v, 1)).contains("m"))
+    assert(word_reads(v, 0).contains("n"))
+    assert(word_reads(v, 1).contains("m"))
 }
 
 test "a pointer-shaped capture rides the slot without an integer pun" {
@@ -269,6 +279,7 @@ test "a closure with no captures still answers no capture words and no descripto
     assert(v >= 0)
     assert_eq(ir_kid_count(v), 0)
     assert_eq(ir_capture_descs(v), "")
+    assert_eq(ir_promoter(v), "")
     assert_eq(ices(), 0)
 }
 
