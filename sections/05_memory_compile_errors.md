@@ -317,11 +317,11 @@ warning[CloseableWithoutScope]: `Closeable` value used without `with...as`
 5 |     with fs.open("data.txt")? as file {
 6 |         // use file here
 7 |     }
-  = note: suppress with `@trusted` for manual resource management
+  = note: suppress with `@trusted(audit: "AUDIT-ID")` for manual resource management
   = note: upgrade to error in blink.toml: [lints] W0600 = "error"
 ```
 
-This is a warning by default, upgradeable to a hard error via `blink.toml`. Suppressible with `@trusted` for framework code (connection pools, resource managers) that deliberately manages `Closeable` lifetimes manually.
+This is a warning by default, upgradeable to a hard error via `blink.toml`. Suppressible with `@trusted(audit: K)` for framework code (connection pools, resource managers) that deliberately manages `Closeable` lifetimes manually.
 
 **E0601: closeable escapes scope**
 
