@@ -1,0 +1,81 @@
+// An internal error is the report of last resort: it fires exactly when a stage's own
+// invariants have already failed. The node id it is handed comes from that same broken
+// state, so it is the one argument least able to be trusted. Reading a span from it
+// through the pool's checked accessor turned the report into a process exit, and the
+// report -- the name, the code, the message saying what actually went wrong -- was never
+// written. The reader was left with an out-of-bounds line about the accessor instead.
+//
+// A span is the one part of an internal error that is optional. When the id cannot be
+// read, the report goes out without one.
+
+import std.io
+import parser.{node_count, synth_named_arg}
+import diagnostics.{
+    diag_reset, diag_ice_at, diag_entries, diag_entry_count, diag_ice_count, DiagEntry,
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn last_entry() -> DiagEntry {
+    diag_entries.get(diag_entries.len() - 1).unwrap()
+}
+
+// The row the fault was found on. Before the guard this call did not return.
+test "an internal error on a negative node id is reported, not fatal" {
+    diag_reset()
+    diag_ice_at("CodegenStageNotBuilt", "I0004", "the definition half is not built", -1, "use a released build")
+
+    assert_eq_int("counted", diag_ice_count, 1)
+    assert_eq_int("rendered", diag_entry_count(), 1)
+}
+
+// The id a stale reference carries is far more often past the end of the pool than
+// negative: a node index kept across a reset outlives the pool it indexed.
+test "an internal error on a node id past the end of the pool is reported, not fatal" {
+    diag_reset()
+    let stale = node_count() + 1000
+    diag_ice_at("CodegenStageNotBuilt", "I0004", "the definition half is not built", stale, "use a released build")
+
+    assert_eq_int("counted", diag_ice_count, 1)
+    assert_eq_int("rendered", diag_entry_count(), 1)
+}
+
+// What the report is for. A span that cannot be read costs the reader a source position;
+// losing the name, the code and the message costs them the fault itself.
+test "the report of an unreadable node id still carries the fault it was given" {
+    diag_reset()
+    diag_ice_at("UnsolvedTypevarAtCodegen", "I0002", "the callee resolved to no declaration", -1, "record the declaration at the call")
+
+    let d = last_entry()
+    assert_eq(d.severity, "ice")
+    assert_eq(d.name, "UnsolvedTypevarAtCodegen")
+    assert_eq(d.code, "I0002")
+    assert_eq(d.message, "the callee resolved to no declaration")
+    assert_eq(d.help, "record the declaration at the call")
+}
+
+// No span rather than a guessed one. A line borrowed from whatever the id happened to be
+// near would point the reader at unrelated source.
+test "an unreadable node id yields a report with no span" {
+    diag_reset()
+    diag_ice_at("CodegenStageNotBuilt", "I0004", "the definition half is not built", -1, "use a released build")
+
+    let d = last_entry()
+    assert_eq_int("line", d.line, 0)
+    assert_eq_int("col", d.col, 0)
+}
+
+// The guard is narrow: an id the pool can read still spans what it names. Without this row
+// the rule above is satisfied by dropping every span.
+test "a readable node id still carries its own span" {
+    diag_reset()
+    let n = synth_named_arg("label", -1, 42, 7)
+    diag_ice_at("CodegenStageNotBuilt", "I0004", "the definition half is not built", n, "use a released build")
+
+    let d = last_entry()
+    assert_eq_int("line", d.line, 42)
+    assert_eq_int("col", d.col, 7)
+}
