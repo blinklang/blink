@@ -1,0 +1,295 @@
+// A closure that reads a local of its enclosing function, and the capture words it rides
+// on.
+//
+// sections/02_syntax.md:336 settles what a capture means: every capture is a shared
+// reference to the original binding. For a `let` binding that is observationally
+// equivalent to a by-value copy, because the value never changes, and the spec says the
+// compiler may copy it freely. For a `let mut` binding it is not: a write on either side
+// has to be visible on the other, which needs one heap cell that the enclosing function
+// and the thunk both hold. Nothing allocates that cell yet, so a `mut` capture is refused
+// here rather than copied — a copy would compile, run, and answer the wrong number, which
+// is the one outcome worth a test of its own.
+//
+// The capture array is `void**`, which is the same slot a list element rides in, so the
+// word a capture is punned through is Position.ContainerSlot's answer and not a second
+// one. InlineWord at that position is a capture this stage can build: slot_word names the
+// integer an Int or a Bool rides through, and an empty slot_word means the value is
+// already a pointer. PointerBoxed means the value needs a heap box, which is the next
+// slice, so a Float or a struct capture stays refused.
+
+import typecheck.{TYPE_FLOAT, TYPE_INT, TYPE_STR}
+import cname_test_helpers.{find_decl}
+import cg_test_helpers.{cg_probe_compile}
+import ast.{NodeKind}
+import parser.{node_value}
+import layout.{bind_binder, binder_scope_pop, binder_scope_push, layout_reset}
+import ir.{IrKind, ir_c_name, ir_capture_descs, ir_kid_count, ir_kid, ir_kind, ir_reset, ir_verify}
+import cg_reg.{cg_reg_build}
+import cg_expr.{cg_expr_reset}
+import cg_stmt.{cg_stmt_reset, lower_block_returning}
+import cg_eff.{
+    cg_eff_lower_closure, cg_eff_pending_thunks, cg_eff_print_thunk, cg_eff_reset,
+    cg_eff_thunk_body_node, cg_eff_thunk_close, cg_eff_thunk_open, cg_eff_thunks_drained,
+}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+
+// One closure per case, each bound to a `let` of its own name so a case can name the one
+// it means. The enclosing locals are declared here too, because a capture is only a
+// capture against a frame that binds the name.
+fn probe_src() -> Str {
+    #"import std.io
+
+fn one_int_capture() -> Int {
+    let n = 5
+    let g_int = fn(x: Int) -> Int { x + n }
+    g_int(1)
+}
+
+fn one_name_read_twice() -> Int {
+    let n = 5
+    let g_twice = fn(x: Int) -> Int { x + n + n }
+    g_twice(1)
+}
+
+fn two_names_captured() -> Int {
+    let n = 5
+    let m = 7
+    let g_two = fn(x: Int) -> Int { x + n + m }
+    g_two(1)
+}
+
+fn a_pointer_capture() -> Int {
+    let s = "ab"
+    let g_str = fn(x: Int) -> Int { x + s.len() }
+    g_str(1)
+}
+
+fn a_boxed_capture() -> Float {
+    let f = 1.5
+    let g_float = fn(x: Float) -> Float { x + f }
+    g_float(2.0)
+}
+
+fn a_mutable_capture() -> Int {
+    let mut c = 0
+    let g_mut = fn(x: Int) -> Int { x + c }
+    c = 9
+    g_mut(1)
+}
+
+fn nested_over_outer_param() -> Int {
+    let g_outer = fn(x: Int) -> Int {
+        let inner = fn(y: Int) -> Int { y + x }
+        inner(2)
+    }
+    g_outer(3)
+}
+
+fn no_capture_at_all() -> Int {
+    let g_none = fn(x: Int) -> Int { x + 1 }
+    g_none(1)
+}
+
+fn main() {
+    io.println("{one_int_capture()}")
+    io.println("{one_name_read_twice()}")
+    io.println("{two_names_captured()}")
+    io.println("{a_pointer_capture()}")
+    io.println("{a_boxed_capture()}")
+    io.println("{a_mutable_capture()}")
+    io.println("{nested_over_outer_param()}")
+    io.println("{no_capture_at_all()}")
+}
+"#
+}
+
+fn ices() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" { n = n + 1 }
+    }
+    n
+}
+
+fn ices_mentioning(text: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.message.contains(text) { n = n + 1 }
+    }
+    n
+}
+
+fn report_ices(label: Str) {
+    io.eprintln("  {label}:")
+    for d in diag_entries {
+        if d.severity == "ice" { io.eprintln("    ICE {d.code} {d.message}") }
+    }
+}
+
+fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    diag_reset()
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    cg_expr_reset()
+    cg_eff_reset()
+    let path = "build/cg_eff_closure_captures_probe.bl"
+    let program = cg_probe_compile(path, probe_src())
+    let _ = fs.delete(path)
+    cg_reg_build(program)
+    diag_reset()
+}
+
+fn closure_of(let_name: Str) -> Int {
+    let binding = find_decl(NodeKind.LetBinding, let_name, "")
+    assert(binding >= 0)
+    node_value(binding)
+}
+
+// Lowers one closure with `names` bound at `tid` in an enclosing frame, which is what
+// makes a name a capture rather than a module-level name the thunk reaches on its own.
+fn lower_capturing(let_name: Str, names: List[Str], tid: Int) -> Int ! Diag.Report {
+    let outer = binder_scope_push()
+    for nm in names { bind_binder(outer, nm, tid) }
+    let v = cg_eff_lower_closure(closure_of(let_name))
+    binder_scope_pop()
+    v
+}
+
+test "a closure reading an immutable Int local answers a record instead of refusing" {
+    setup()
+    let v = lower_capturing("g_int", ["n"], TYPE_INT)
+    if v < 0 || ices() != 0 { report_ices("g_int was refused") }
+    assert(v >= 0)
+    assert(ir_kind(v) == IrKind.ClosureNew)
+    assert_eq(ices(), 0)
+}
+
+test "the record carries one capture word, and the word reads the enclosing local" {
+    setup()
+    let v = lower_capturing("g_int", ["n"], TYPE_INT)
+    assert(v >= 0)
+    assert_eq(ir_kid_count(v), 1)
+    let word = ir_kid(v, 0)
+    assert(word >= 0)
+    // The word is a read of the enclosing local, not a fresh value: a capture that named
+    // something else would compile and hold the wrong number.
+    assert(ir_c_name(word).contains("n"))
+    assert_eq(ir_verify(v).len(), 0)
+}
+
+test "a record with captures names a descriptor table rather than leaving the slot empty" {
+    // cg_print writes NULL for an empty slot, and the runtime walks the table to promote a
+    // closure into an arena. A capture list with no table is a closure that cannot be
+    // promoted.
+    setup()
+    let v = lower_capturing("g_int", ["n"], TYPE_INT)
+    assert(v >= 0)
+    assert(ir_capture_descs(v) != "")
+}
+
+test "the thunk body binds the captured name, so a read inside resolves without the enclosing frame" {
+    // The thunk is a separate C function. The enclosing function's local is not in scope
+    // there, so unless the prologue binds the name the body lowers a read of an identifier
+    // the thunk never declares.
+    setup()
+    let v = lower_capturing("g_int", ["n"], TYPE_INT)
+    assert(v >= 0)
+    assert_eq(cg_eff_pending_thunks(), 1)
+    assert(cg_eff_thunk_open(0) >= 0)
+    let body = lower_block_returning(cg_eff_thunk_body_node(0))
+    cg_eff_thunk_close()
+    if body < 0 || ices() != 0 { report_ices("the thunk body did not lower") }
+    assert(body >= 0)
+    assert_eq(ir_verify(body).len(), 0)
+    assert_eq(ices(), 0)
+}
+
+test "two reads of one captured name take one capture word" {
+    setup()
+    let v = lower_capturing("g_twice", ["n"], TYPE_INT)
+    assert(v >= 0)
+    assert_eq(ir_kid_count(v), 1)
+}
+
+test "two distinct captured names take two capture words in first-read order" {
+    // The descriptor table and the thunk prologue both index by position, so the order the
+    // words are built in is the order the thunk reads them back out in.
+    setup()
+    let v = lower_capturing("g_two", ["n", "m"], TYPE_INT)
+    assert(v >= 0)
+    assert_eq(ir_kid_count(v), 2)
+    assert(ir_c_name(ir_kid(v, 0)).contains("n"))
+    assert(ir_c_name(ir_kid(v, 1)).contains("m"))
+}
+
+test "a pointer-shaped capture rides the slot without an integer pun" {
+    setup()
+    let v = lower_capturing("g_str", ["s"], TYPE_STR)
+    if v < 0 || ices() != 0 { report_ices("g_str was refused") }
+    assert(v >= 0)
+    assert_eq(ir_kid_count(v), 1)
+    assert_eq(ices(), 0)
+}
+
+test "a nested closure captures the outer thunk's own parameter" {
+    // The inner closure is lowered while the outer thunk's frame is open, so its capture
+    // resolves against that frame and not against the enclosing function's.
+    setup()
+    let v = lower_capturing("g_outer", [], TYPE_INT)
+    assert(v >= 0)
+    assert_eq(cg_eff_pending_thunks(), 1)
+    assert(cg_eff_thunk_open(0) >= 0)
+    let body = lower_block_returning(cg_eff_thunk_body_node(0))
+    cg_eff_thunk_close()
+    if body < 0 || ices() != 0 { report_ices("the outer thunk body did not lower") }
+    assert(body >= 0)
+    assert_eq(cg_eff_pending_thunks(), 2)
+    assert_eq(ices(), 0)
+}
+
+test "the queue still drains to zero once a captured closure is printed" {
+    setup()
+    let v = lower_capturing("g_int", ["n"], TYPE_INT)
+    assert(v >= 0)
+    assert(cg_eff_thunk_open(0) >= 0)
+    let body = lower_block_returning(cg_eff_thunk_body_node(0))
+    cg_eff_thunk_close()
+    cg_eff_print_thunk(0, body)
+    cg_eff_thunks_drained(1)
+    assert_eq(cg_eff_pending_thunks(), 0)
+    assert_eq(ices(), 0)
+}
+
+test "a closure with no captures still answers no capture words and no descriptor table" {
+    setup()
+    let v = lower_capturing("g_none", [], TYPE_INT)
+    assert(v >= 0)
+    assert_eq(ir_kid_count(v), 0)
+    assert_eq(ir_capture_descs(v), "")
+    assert_eq(ices(), 0)
+}
+
+test "a capture that needs a heap box is refused by name rather than punned into a word" {
+    // A Float must not ride through an integer, so Position.ContainerSlot answers
+    // PointerBoxed for it. Nothing allocates that box yet.
+    setup()
+    let v = lower_capturing("g_float", ["f"], TYPE_FLOAT)
+    assert_eq(v, -1)
+    assert(ices_mentioning("'f'") > 0)
+    assert_eq(cg_eff_pending_thunks(), 0)
+}
+
+test "a mutable capture is refused, and says the binding is shared rather than copied" {
+    // sections/02_syntax.md:351: a write through either side has to be visible on the
+    // other, which needs one shared cell. Copying the value instead compiles and runs and
+    // answers the pre-write number.
+    setup()
+    let v = lower_capturing("g_mut", ["c"], TYPE_INT)
+    assert_eq(v, -1)
+    assert(ices_mentioning("'c'") > 0)
+    assert(ices_mentioning("shared") > 0)
+    assert_eq(cg_eff_pending_thunks(), 0)
+}
