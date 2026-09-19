@@ -187,7 +187,7 @@ fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_
     cg_decl_emit_typedefs()
     if define_ev { cg_decl_emit_ev(ev_storage(cfg)) }
     cg_decl_emit_globals(globals_extern)
-    emit_root_signatures(fns_in_scope(cfg, "", shared), methods_in_scope(cfg, "", shared))
+    emit_root_signatures(fns_in_scope(cfg, "", shared, true), methods_in_scope(cfg, "", shared, true))
     cg_derive_emit_decls(derived_decls_declared_everywhere())
 }
 
@@ -200,12 +200,21 @@ fn ev_storage(cfg: CgConfig) -> Str {
 
 // A module filter of "" means the whole program. The per-module modes pass a key and get
 // only what that module declared.
-fn decls_in_scope(cfg: CgConfig, module_key: Str, decls: List[Int]) -> List[Int] {
+//
+// `declare_only` widens that for a skipped module: this unit still calls a plain
+// function a skipped module owns — the archive compiles its body, not this unit — so
+// leaving it out of the SIGNATURE set the same way its body is left out of the
+// DEFINITION set would emit a call with no prototype in sight. A caller building the
+// declaration half passes true and keeps every skipped-module decl in scope for a
+// prototype; a caller building bodies passes false and keeps today's rule, or a plain
+// function would gain a second definition here on top of the one the archive already
+// carries.
+fn decls_in_scope(cfg: CgConfig, module_key: Str, decls: List[Int], declare_only: Bool) -> List[Int] {
     let mut out: List[Int] = []
     for f in decls {
         if module_key != "" && cg_reg_module_of(f) != module_key { continue }
         if cfg.emit_only_module != "" && cg_reg_module_of(f) != cfg.emit_only_module { continue }
-        if cfg.skip_modules.contains_key(cg_reg_module_of(f)) && !kept_for_user(cfg, f) { continue }
+        if !declare_only && cfg.skip_modules.contains_key(cg_reg_module_of(f)) && !kept_for_user(cfg, f) { continue }
         out.push(f)
     }
     out
@@ -248,9 +257,9 @@ fn kept_for_user(cfg: CgConfig, decl: Int) -> Bool {
 // signature names. Those are compiled into the user's unit instead. A foreign binding
 // carries `! FFI` but is a plain C wrapper that reads no evidence, which is why the
 // signature is asked rather than the effects list.
-fn fns_in_scope(cfg: CgConfig, module_key: Str, shared: Bool) -> List[Int] {
+fn fns_in_scope(cfg: CgConfig, module_key: Str, shared: Bool, declare_only: Bool) -> List[Int] {
     let mut out: List[Int] = []
-    for f in decls_in_scope(cfg, module_key, cg_reg_fn_decls()) {
+    for f in decls_in_scope(cfg, module_key, cg_reg_fn_decls(), declare_only) {
         if shared && is_entry_point(f) { continue }
         if shared && cg_decl_takes_ev(f) { continue }
         out.push(f)
@@ -260,9 +269,9 @@ fn fns_in_scope(cfg: CgConfig, module_key: Str, shared: Bool) -> List[Int] {
 
 // An impl method is in scope on the same terms as a free function, minus the entry
 // point: a method named `main` is a method, not the program's entry.
-fn methods_in_scope(cfg: CgConfig, module_key: Str, shared: Bool) -> List[Int] {
+fn methods_in_scope(cfg: CgConfig, module_key: Str, shared: Bool, declare_only: Bool) -> List[Int] {
     let mut out: List[Int] = []
-    for m in decls_in_scope(cfg, module_key, cg_reg_impl_methods()) {
+    for m in decls_in_scope(cfg, module_key, cg_reg_impl_methods(), declare_only) {
         if shared && cg_decl_takes_ev(m) { continue }
         out.push(m)
     }
@@ -355,8 +364,8 @@ fn lower_thunk_body(n: Int) -> Int ! Diag.Report {
 // The definition half. Test blocks are not here: they are written beside the entry shim,
 // which is a different unit under the per-module mode.
 fn emit_definitions(cfg: CgConfig, module_key: Str, shared: Bool) ! Diag.Report {
-    let fns = fns_in_scope(cfg, module_key, shared)
-    let methods = methods_in_scope(cfg, module_key, shared)
+    let fns = fns_in_scope(cfg, module_key, shared, false)
+    let methods = methods_in_scope(cfg, module_key, shared, false)
     // A unit declares every instance it defines, in its own text, ahead of every body.
     // The declaration half cannot do it: a header is read by units that define nothing,
     // and the archive's header would then offer instances the archive does not have.
@@ -364,7 +373,7 @@ fn emit_definitions(cfg: CgConfig, module_key: Str, shared: Bool) ! Diag.Report 
     emit_instance_signatures(cfg, methods)
     emit_bodies(cfg, fns)
     emit_bodies(cfg, methods)
-    cg_derive_emit_bodies(decls_in_scope(cfg, module_key, cg_reg_type_decls()))
+    cg_derive_emit_bodies(decls_in_scope(cfg, module_key, cg_reg_type_decls(), false))
 }
 
 // ── Test blocks ──────────────────────────────────────────────────────────────
@@ -496,8 +505,8 @@ pub fn generate_module_header(program: Int, module_key: Str, cfg: CgConfig) -> S
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, false, false, guard, "")
     cg_decl_emit_typedefs()
     cg_decl_emit_globals(true)
-    let fns = fns_in_scope(cfg, module_key, false)
-    let methods = methods_in_scope(cfg, module_key, false)
+    let fns = fns_in_scope(cfg, module_key, false, true)
+    let methods = methods_in_scope(cfg, module_key, false, true)
     emit_root_signatures(fns, methods)
     // The one header that does declare instances. Nothing is compiled ahead of this
     // program, so its modules home their own generics' instances, and a module that calls
