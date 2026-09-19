@@ -1,0 +1,148 @@
+// A declared function type is a contract, and a closure written against it may spell its own
+// parameter types. When the two disagree the program says two different things about one
+// position, and only one of them can be true. The declaration wins, because it is what every
+// caller reads, so the closure's annotation is the error.
+//
+// Until this check existed the annotation was accepted in silence: the seed published the
+// declared signature, the closure's own mint spelled something else, and nothing ever compared
+// them. The parameter then carried the written type while every caller passed the declared one.
+//
+// The three positions that can hold the closure are all covered, because the declaration
+// reaches them by three different routes: written straight at the binding, carried into a
+// branch tail, and carried into a match arm.
+//
+// The controls are what must not change. An annotation that agrees reports nothing, and a
+// position the closure leaves unwritten still receives the declared type rather than a
+// complaint — the check is about contradiction, not about silence.
+
+import typecheck.{check_types, tc_lookup_node_tid, tc_resolve, tc_type_str}
+import parser.{node_kind, node_name, nodes}
+import ast.{NodeKind, nk_of}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn param_node_of(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.Param && node_name(i) == name { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no parameter '{name}'")
+    assert(false)
+    -1
+}
+
+fn assert_param_type(name: Str, want: Str) {
+    let p = param_node_of(name)
+    let tid = tc_lookup_node_tid(p)
+    if tid < 0 {
+        io.println("FAIL: parameter '{name}' carries no type at all")
+        assert(false)
+        return
+    }
+    let got = tc_type_str(tc_resolve(tid))
+    if got != want { io.println("FAIL: parameter '{name}': got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+// Warnings name the same binders this test is about, so only errors are read here.
+fn errors_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat(d.message).concat("\n") }
+    }
+    out
+}
+
+fn assert_error_contains(want: Str) {
+    let msgs = errors_reported()
+    if !msgs.contains(want) { io.println("FAIL: no error contains '{want}'; errors were: {msgs}") }
+    assert(msgs.contains(want))
+}
+
+fn assert_no_error_contains(want: Str) {
+    let msgs = errors_reported()
+    if msgs.contains(want) { io.println("FAIL: an error contains '{want}': {msgs}") }
+    assert(!msgs.contains(want))
+}
+
+// One probe holds every shape. Typecheck's named-type map is not reset between compiles in
+// one binary, so a second probe would be measuring the first one's leftovers.
+fn contradiction_src() -> Str {
+    #"fn main() {
+    let ynpick = true
+    let _plain: fn(Int, Str) -> Int = fn(ynpa: Str, ynpb: Str) -> Int { ynpb.len() }
+    let _branch: fn(Int, Str) -> Int = if ynpick {
+        fn(ynia: Str, ynib: Str) -> Int { ynib.len() }
+    } else {
+        fn(ynja, ynjb) -> Int { ynjb.len() }
+    }
+    let _arm: fn(Int, Str) -> Int = match ynpick {
+        true => fn(ynma: Str, ynmb: Str) -> Int { ynmb.len() }
+        false => fn(ynna, ynnb) -> Int { ynnb.len() }
+    }
+    let _ok: fn(Int, Str) -> Int = fn(ynoa: Int, ynob: Str) -> Int { ynob.len() }
+    let _mix: fn(Int, Str) -> Int = fn(ynxa, ynxb: Str) -> Int { ynxb.len() }
+    let _ret: fn(Int, Str) -> Int = fn(ynra: Int, ynrb: Str) -> Str { ynrb }
+    let _sink = [_plain, _branch, _arm, _ok, _mix]
+    let _keep = _ret
+}
+"#
+}
+
+test "a closure parameter annotation contradicting the declared fn type is reported" {
+    let _program = probe("build/tc_closure_param_ann_src.bl", contradiction_src())
+    assert_error_contains("parameter 1 'ynpa': declared type Int but written Str")
+}
+
+test "the contradiction is reported through an if branch" {
+    let _program = probe("build/tc_closure_param_ann_src.bl", contradiction_src())
+    assert_error_contains("parameter 1 'ynia': declared type Int but written Str")
+}
+
+test "the contradiction is reported through a match arm" {
+    let _program = probe("build/tc_closure_param_ann_src.bl", contradiction_src())
+    assert_error_contains("parameter 1 'ynma': declared type Int but written Str")
+}
+
+test "a closure return annotation contradicting the declared fn type is reported" {
+    let _program = probe("build/tc_closure_param_ann_src.bl", contradiction_src())
+    assert_error_contains("return type: declared type Int but written Str")
+}
+
+// An annotation that agrees with the declaration is the ordinary way to write this, and it
+// must stay silent — including the second position, which agrees in every row above too.
+test "a closure parameter annotation agreeing with the declared fn type is accepted" {
+    let _program = probe("build/tc_closure_param_ann_src.bl", contradiction_src())
+    assert_no_error_contains("'ynoa'")
+    assert_no_error_contains("'ynob'")
+    assert_no_error_contains("'ynpb'")
+    assert_param_type("ynoa", "Int")
+    assert_param_type("ynob", "Str")
+}
+
+// Leaving a position unwritten is not a contradiction. Those parameters still take the
+// declared type, which is the behaviour this check must not disturb.
+test "an unwritten closure parameter still receives the declared type" {
+    let _program = probe("build/tc_closure_param_ann_src.bl", contradiction_src())
+    assert_param_type("ynja", "Int")
+    assert_param_type("ynna", "Int")
+    assert_param_type("ynxa", "Int")
+    assert_param_type("ynxb", "Str")
+    assert_no_error_contains("'ynja'")
+    assert_no_error_contains("'ynna'")
+    assert_no_error_contains("'ynxa'")
+}
