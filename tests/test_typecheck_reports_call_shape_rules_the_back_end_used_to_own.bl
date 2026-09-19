@@ -44,6 +44,16 @@ fn probe_warning_names(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.
     out.trim()
 }
 
+// The help of the first error a source draws. A code alone does not say whether the repair
+// it offers is one the author can write down.
+fn probe_first_help(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let _r = run_probe(stem, src)
+    for d in diag_entries {
+        if d.severity == "error" { return d.help }
+    }
+    ""
+}
+
 fn assert_names(label: Str, got: Str, want: Str) {
     if got != want { io.println("FAIL: {label}: drew '{got}', want '{want}'") }
     assert(got == want)
@@ -92,6 +102,26 @@ fn apply(f: fn(Int) -> Int, v: Int) -> Int { f(v) }
 
 fn main() {
     io.println("{apply(identity, 3)}")
+}
+"#
+}
+
+fn generic_fn_annotated_let_src() -> Str {
+    #"fn identity[T](x: T) -> T { x }
+
+fn main() {
+    let g: fn(Str) -> Str = identity
+    io.println(g("ada"))
+}
+"#
+}
+
+fn generic_fn_unpinned_let_src() -> Str {
+    #"fn identity[T](x: T) -> T { x }
+
+fn main() {
+    let f = identity
+    io.println("bound")
 }
 "#
 }
@@ -168,10 +198,34 @@ test "positional arguments followed by keyword arguments are accepted" {
         probe_error_names("tc_kw_ok", keyword_args_in_order_src()), "")
 }
 
-test "a bare generic function passed where a closure is expected is refused" {
+// A generic function's name is a value wherever a function value is expected, and the
+// expected type is what fixes its binders. The refusal this row used to assert distinguished
+// two spellings of one value: `apply(identity, 3)` was refused and `let f = identity;
+// apply(f, 3)` accepted, so one `let` walked past it.
+test "a bare generic function passed where a closure is expected is accepted" {
     assert_names("generic fn value",
-        probe_error_names("tc_generic_fn_value", generic_fn_as_value_src()),
-        "BareGenericFnAsValue")
+        probe_error_names("tc_generic_fn_value", generic_fn_as_value_src()), "")
+}
+
+test "an annotated binding fixes a bare generic function's binders" {
+    assert_names("generic fn annotated let",
+        probe_error_names("tc_generic_fn_ann_let", generic_fn_annotated_let_src()), "")
+}
+
+// The repair has to be a form the author can write. An annotation is the only thing that
+// fixes a binder nothing else fixes, and it has to carry the function's shape to be one.
+test "the inference failure names the annotation that would fix it" {
+    assert_names("generic fn unpinned help",
+        probe_first_help("tc_generic_fn_help", generic_fn_unpinned_let_src()),
+        "add a type annotation, e.g. `let f: fn(T) -> T = ...` (replace the placeholder with the intended element type)")
+}
+
+// The residual the deleted rule used to cover: nothing here says which instantiation the
+// name means, which is a failure of inference and is reported as one.
+test "a bare generic function that nothing fixes is an inference failure" {
+    assert_names("generic fn unpinned let",
+        probe_error_names("tc_generic_fn_unpinned", generic_fn_unpinned_let_src()),
+        "CannotInferType")
 }
 
 test "a bare concrete function passed where a closure is expected is accepted" {

@@ -30,7 +30,7 @@ import diagnostics.{
     ASSERT_PANICS_OUTSIDE_TEST, ASSERT_PANICS_NESTED_EXPECT_PANIC, XFAIL_MISSING_REASON,
     PUB_FFI, FFI_NO_EFFECTS, CONTRACT_ON_FFI, INVALID_PTR_TYPE,
     COALESCE_REQUIRES_OPT, MISSING_KEYWORD_ARG, INVALID_KEYWORD_ARG,
-    BARE_GENERIC_FN_AS_VALUE, FFI_SCOPE_NOT_WITH_RESOURCE, RAW_BYPASSES_PARAM,
+    FFI_SCOPE_NOT_WITH_RESOURCE, RAW_BYPASSES_PARAM,
     PTR_OUTSIDE_FFI, FFI_STRUCT_GC_FIELD, BYTES_GROW_IN_WITH_PTR,
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
@@ -1758,13 +1758,15 @@ fn tc_occurs_in(needle: Int, hay0: Int) -> Int {
         if tc_occurs_in(needle, e.inner1) != 0 { return 1 }
         return tc_occurs_in(needle, e.inner2)
     }
-    if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum {
+    if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum || k == TyKind.Fn {
         let mut i = 0
         while i < e.params_count {
             let c = ty_param_list.get(e.params_start + i).unwrap()
             if tc_occurs_in(needle, c) != 0 { return 1 }
             i = i + 1
         }
+        // A fn's RETURN is inner1, and it is as much a place for α to hide as a parameter.
+        if k == TyKind.Fn { return tc_occurs_in(needle, e.inner1) }
         return 0
     }
     0
@@ -1812,13 +1814,13 @@ fn tc_tid_has_unbound_metavar(tid0: Int) -> Int {
         if tc_tid_has_unbound_metavar(e.inner1) != 0 { return 1 }
         return tc_tid_has_unbound_metavar(e.inner2)
     }
-    if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum {
+    if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum || k == TyKind.Fn {
         let mut i = 0
         while i < e.params_count {
-            let c = ty_param_list.get(e.params_start + i).unwrap()
-            if tc_tid_has_unbound_metavar(c) != 0 { return 1 }
+            if tc_tid_has_unbound_metavar(ty_param_list.get(e.params_start + i).unwrap()) != 0 { return 1 }
             i = i + 1
         }
+        if k == TyKind.Fn { return tc_tid_has_unbound_metavar(e.inner1) }
         return 0
     }
     0
@@ -1970,7 +1972,27 @@ fn tc_infer_annotation_hint(tid0: Int) -> Str {
     if k == TyKind.Struct || k == TyKind.Enum {
         return ": {strip_module_qualifier(e.name)}[...]"
     }
+    // A function value's repair is the annotation that fixes its binders, so the hint keeps the
+    // arity the reference already settled and leaves a placeholder only where nothing is known.
+    if k == TyKind.Fn {
+        let mut ps = ""
+        let mut i = 0
+        while i < e.params_count {
+            if i > 0 { ps = "{ps}, " }
+            ps = "{ps}{tc_hint_slot_str(ty_param_list.get(e.params_start + i).unwrap())}"
+            i = i + 1
+        }
+        return ": fn({ps}) -> {tc_hint_slot_str(e.inner1)}"
+    }
     ": T"
+}
+
+// One slot of an annotation hint: its own spelling when the slot is settled, a placeholder
+// when it is the thing nothing determined.
+fn tc_hint_slot_str(tid: Int) -> Str {
+    if tc_tid_is_no_info(tid) != 0 { return "T" }
+    if tc_tid_has_unbound_metavar(tid) != 0 { return "T" }
+    type_to_str(tid)
 }
 
 // Pin a sealed Ops-trait receiver's element metavar(s) from the call's payload
@@ -2212,7 +2234,7 @@ fn tc_ud_metavar_roots(tid0: Int) -> List[Int] {
         }
         return out
     }
-    if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum {
+    if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum || k == TyKind.Fn {
         let mut i = 0
         while i < e.params_count {
             let rs = tc_ud_metavar_roots(ty_param_list.get(e.params_start + i).unwrap())
@@ -2222,6 +2244,14 @@ fn tc_ud_metavar_roots(tid0: Int) -> List[Int] {
                 j = j + 1
             }
             i = i + 1
+        }
+        if k == TyKind.Fn {
+            let rr = tc_ud_metavar_roots(e.inner1)
+            let mut r = 0
+            while r < rr.len() {
+                out.push(rr.get(r).unwrap())
+                r = r + 1
+            }
         }
     }
     out
@@ -2458,6 +2488,26 @@ pub fn tc_unify(a0: Int, b0: Int) -> Int {
             i = i + 1
         }
         return 1
+    }
+    // A function type unifies component-wise. Without this arm two fn types fell through to
+    // the scalar tail and answered 1 with nothing bound, so an expected `fn(Int) -> Int` could
+    // not fix the binders of the generic function name standing under it.
+    if ka == TyKind.Fn {
+        if ta.params_count != tb.params_count { return 0 }
+        let mut fa: List[Int] = []
+        let mut fb: List[Int] = []
+        let mut i = 0
+        while i < ta.params_count {
+            fa.push(ty_param_list.get(ta.params_start + i).unwrap())
+            fb.push(ty_param_list.get(tb.params_start + i).unwrap())
+            i = i + 1
+        }
+        let mut j = 0
+        while j < fa.len() {
+            if tc_unify(fa.get(j).unwrap(), fb.get(j).unwrap()) == 0 { return 0 }
+            j = j + 1
+        }
+        return tc_unify(ta.inner1, tb.inner1)
     }
     if ka == TyKind.Struct || ka == TyKind.Enum {
         if strip_module_qualifier(ta.name) != strip_module_qualifier(tb.name) { return 0 }
@@ -3276,6 +3326,23 @@ fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
 // unifying each param tid against its argument's inferred tid. Covers both the
 // whole-bare-typevar rule (`x: T`) and typevars nested inside a compound param
 // (`x: List[T]`, `x: (T, Int)`, `x: Map[K, V]`, …) via unify_typevar_binds.
+// The type a generic function's NAME has as a value: its declared type with every binder
+// replaced by a fresh metavar, one set per reference. Two references to the same generic
+// function are two values and may be instantiated differently, so the mint cannot be shared.
+fn tc_generic_fn_value_tid(sig: Int, decl_tid: Int) -> Int {
+    let fs = fnsig_pool.get(sig).unwrap()
+    let mut binds: Map[Str, Int] = Map()
+    let mut i = 0
+    while i < fs.type_params_count {
+        let idx = fs.type_params_start + i
+        let nm = fnsig_type_param_names.get(idx) ?? ""
+        let binder = fnsig_tparam_nodes.get(idx) ?? -1
+        binds.insert(tc_binder_key(binder, nm), make_metavar())
+        i = i + 1
+    }
+    substitute_typevar_tid(decl_tid, binds)
+}
+
 fn build_typevar_binds(sig: Int, args_sl: Int) -> Map[Str, Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     build_typevar_binds_off(sig, args_sl, 0)
 }
@@ -3987,25 +4054,6 @@ fn tc_check_keyword_args(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int,
     }
 }
 
-// A bare function name standing where the parameter asks for a closure. A concrete function
-// has one body and one set of types, so its name is enough to build the value from. A generic
-// one does not: the type arguments would have to come from the parameter, and a parameter
-// typed `fn(Int) -> Int` says nothing about which instantiation the caller meant. The closure
-// literal is where the caller writes that down.
-fn tc_check_bare_fn_arg(arg_node: Int, ptid: Int) ! Diag.Report {
-    if type_kind(resolve_alias_tid(ptid)) != TyKind.Fn { return }
-    if node_kind(arg_node) != NodeKind.Ident { return }
-    let name = node_name(arg_node)
-    // A local of the same name wins: it is a value already, and the function it shadows is
-    // not what the caller wrote. Asks for a TYPE and not for definedness — the resolver holds
-    // every top-level function under its own name too, so definedness cannot tell the two apart.
-    if tc_tid_is_no_info(nr_get_type(name)) == 0 { return }
-    let callee_sig = lookup_fnsig(name)
-    if callee_sig == -1 { return }
-    if fnsig_pool.get(callee_sig).unwrap().type_params_count == 0 { return }
-    diag_error_at("BareGenericFnAsValue", BARE_GENERIC_FN_AS_VALUE, "cannot pass generic fn '{name}' as a closure value", arg_node, "wrap it in a closure literal that names the type, e.g. `\{x => {name}(x)\}`")
-}
-
 // `Raw(x)` written inside an interpolation. Raw is what puts a value into a template without
 // a parameter placeholder, so it is the one part of a template the database sees as text.
 fn tc_is_raw_call(node: Int) -> Int {
@@ -4046,7 +4094,6 @@ fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int) ! Ty
         if pidx >= 0 && pidx < param_count {
             let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
             if tc_tid_is_no_info(ptid) == 0 {
-                tc_check_bare_fn_arg(arg_node, ptid)
                 tc_seed_closure_expected_fn(arg_node, ptid)
                 let saved_hint = tc_construct_hint
                 tc_construct_hint = resolve_alias_tid(ptid)
@@ -14136,7 +14183,19 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 fn_param_types.push(fnsig_param_list.get(fs.params_start + fpi).unwrap())
                 fpi = fpi + 1
             }
-            return make_fn_type(fs.ret, fn_param_types)
+            let decl_tid = make_fn_type(fs.ret, fn_param_types)
+            if fs.type_params_count == 0 { return decl_tid }
+            // A generic function's NAME is a value, and its binders are open at the reference:
+            // `apply(identity, 3)` and `let f = identity` name the same value, and what fixes T
+            // is the type expected where the name stands. Each binder becomes a metavar so the
+            // expectation can solve it, because a bare typevar is invisible to every part of the
+            // solving machinery and would reach codegen unsolved with nothing reported.
+            let val_tid = tc_generic_fn_value_tid(fn_sig, decl_tid)
+            if tc_construct_hint >= 0 {
+                let want = resolve_alias_tid(tc_construct_hint)
+                if type_kind(want) == TyKind.Fn { tc_unify(val_tid, want) }
+            }
+            return val_tid
         }
         // `with arena` names the built-in Arena effect where every other with-item names a
         // handler VALUE. It denotes a handler all the same, so it answers the type its siblings
