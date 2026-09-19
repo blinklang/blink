@@ -30,7 +30,7 @@ import diagnostics.{
     ASSERT_PANICS_OUTSIDE_TEST, ASSERT_PANICS_NESTED_EXPECT_PANIC, XFAIL_MISSING_REASON,
     PUB_FFI, FFI_NO_EFFECTS, CONTRACT_ON_FFI, INVALID_PTR_TYPE,
     COALESCE_REQUIRES_OPT, MISSING_KEYWORD_ARG, INVALID_KEYWORD_ARG,
-    FFI_SCOPE_NOT_WITH_RESOURCE, RAW_BYPASSES_PARAM,
+    FFI_SCOPE_NOT_WITH_RESOURCE, RAW_BYPASSES_PARAM, RAW_OUTSIDE_TEMPLATE,
     PTR_OUTSIDE_FFI, FFI_STRUCT_GC_FIELD, BYTES_GROW_IN_WITH_PTR,
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
@@ -80,7 +80,7 @@ pub type TyKind {
     Int, Float, Bool, Str, Void,
     List, Option, Result, Fn, Struct, Enum,
     Typevar, Unknown, Iterator, Handle, Channel, Ptr, Handler,
-    Tuple, Map, Bytes, Set, StringBuilder, Template, FfiScope,
+    Tuple, Map, Bytes, Set, StringBuilder, Template, FfiScope, Raw,
     I8, I16, I32, U8, U16, U32, U64, Char,
     Never
 }
@@ -114,6 +114,7 @@ pub fn tk_name(k: TyKind) -> Str {
         TyKind.Set => "Set"
         TyKind.StringBuilder => "StringBuilder"
         TyKind.Template => "Template"
+        TyKind.Raw => "Raw"
         TyKind.FfiScope => "FFIScope"
         TyKind.I8 => "I8"
         TyKind.I16 => "I16"
@@ -1693,6 +1694,14 @@ pub fn make_template_type(context: Int) -> Int {
 // TyKind.Ptr, and every structural accessor answers "no children" through arms it already has.
 pub fn make_ffi_scope_type() -> Int {
     ty_intern_simple(TyKind.FfiScope, "FFIScope", -1, -1)
+}
+
+// §3b.5: `Raw[T]` is a real marker type, not a spelling the compiler matches. Carrying the
+// marker in the TYPE is what makes `let t = Raw(table)` the same bypass as the inline
+// wrapper: the trigger reads the value, so a binding no longer launders it past the audit.
+// One inner, the wrapped type, shaped like make_template_type.
+pub fn make_raw_type(inner: Int) -> Int {
+    ty_intern_simple(TyKind.Raw, "Raw", inner, -1)
 }
 
 // §9.1.1: an `FfiScope` may occur only as the resource of a `with ... as` block. The rule is
@@ -4154,18 +4163,57 @@ fn tc_check_keyword_args(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int,
     0
 }
 
-// `Raw(x)` written inside an interpolation. Raw is what puts a value into a template without
-// a parameter placeholder, so it is the one part of a template the database sees as text.
-fn tc_is_raw_call(node: Int) -> Int {
-    if node_kind(node) != NodeKind.Call { return 0 }
-    let left = node_left(node)
-    if left == -1 { return 0 }
-    if node_kind(left) != NodeKind.Ident { return 0 }
-    if node_name(left) != "Raw" { return 0 }
-    let args_sl = node_args(node)
-    if args_sl == -1 { return 0 }
-    if sublist_length(args_sl) != 1 { return 0 }
-    1
+// Interpolation parts whose value is a `Raw[T]`. §3b.5 gives a Raw exactly one consumer —
+// the `Template[C]` coercion at an argument position — and that coercion is decided after
+// the literal it sits in has been inferred. So a part is recorded here when it is seen and
+// judged once its caller is known: the bypass warning where a template takes it, E0530 where
+// nothing does. Keyed on the part node, so the several passes that infer one literal record
+// it once.
+let mut tc_raw_part_nodes: List[Int] = []
+let mut tc_raw_part_interp: List[Int] = []
+let mut tc_raw_part_consumed: Map[Int, Int] = Map()
+
+fn tc_raw_note_part(interp: Int, part: Int) {
+    if tc_raw_part_consumed.contains_key(part) != 0 { return }
+    tc_raw_part_consumed.insert(part, 0)
+    tc_raw_part_nodes.push(part)
+    tc_raw_part_interp.push(interp)
+}
+
+// The literal `interp` is being coerced to a `Template[C]`, so every Raw in it is folded into
+// the query text rather than parameterized. That is the bypass, and this is the only place it
+// happens. `@trusted(audit: K)` is its one suppression channel (§9.1).
+fn tc_raw_consume_template(interp: Int) ! Diag.Report {
+    let mut i = 0
+    while i < tc_raw_part_nodes.len() {
+        if tc_raw_part_interp.get(i).unwrap() == interp {
+            let part = tc_raw_part_nodes.get(i).unwrap()
+            if (tc_raw_part_consumed.get(part) ?? 0) == 0 {
+                tc_raw_part_consumed.insert(part, 1)
+                // -1 is a body with no enclosing user function — a test body, or the top
+                // level. No function means no audit to find, so the warning stands.
+                if tc_current_fn_node == -1 || has_annotation(tc_current_fn_node, "trusted") == 0 {
+                    diag_warn_at("RawBypassesParam", RAW_BYPASSES_PARAM, "Raw() bypasses query parameterization", part, "add @trusted(audit: \"AUDIT-ID\") to suppress")
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Whatever no template took. Reported once the whole program has been checked, because a
+// literal's consumer is a caller that may be checked after the literal itself.
+fn tc_raw_report_unconsumed() ! Diag.Report {
+    let mut i = 0
+    while i < tc_raw_part_nodes.len() {
+        let part = tc_raw_part_nodes.get(i).unwrap()
+        if (tc_raw_part_consumed.get(part) ?? 0) == 0 {
+            diag_error_at("RawOutsideTemplate", RAW_OUTSIDE_TEMPLATE,
+                "a `Raw[T]` reached a position that does not consume it — only a `Template[C]` coercion does",
+                part, "drop the wrapper and interpolate the value itself")
+        }
+        i = i + 1
+    }
 }
 
 // Validate call args against a fnsig's param types (type only, no arity).
@@ -4238,6 +4286,7 @@ fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int, call
                     // The template-literal coercion, on the same footing as the
                     // int-literal one above. See tc_template_arg_ok.
                     if tc_template_arg_ok(ptid, arg_node) != 0 {
+                        tc_raw_consume_template(arg_node)
                         lit_to_int = 1
                     } else if tc_template_launders_str(ptid, arg_t) != 0 {
                         // The laundering case gets the spec's OWN diagnostic
@@ -5791,6 +5840,12 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     if name == "FfiScope" {
         if ann_node != -1 { tc_report_ffi_scope_ann(ann_node) }
         return make_ffi_scope_type()
+    }
+    if name == "Raw" {
+        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+            return make_raw_type(resolve_type_ann(sublist_get(elems_sl, 0)))
+        }
+        return make_raw_type(TYPE_UNKNOWN)
     }
     // The three one-inner runtime carriers. Ahead of resolve_type_name for the
     // same reason List/Map/Set are: is_primitive_type already claims these names, so a user
@@ -9271,6 +9326,9 @@ fn init_types() ! TypeCheck.Register {
     fnsig_param_list.clear()
     fnsig_param_names.clear()
     fnsig_param_kw.clear()
+    tc_raw_part_nodes.clear()
+    tc_raw_part_interp.clear()
+    tc_raw_part_consumed = Map()
     fnsig_type_param_names.clear()
     fnsig_tparam_nodes.clear()
     fnsig_tparam_ret_only.clear()
@@ -9749,6 +9807,10 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     // Phases 4 and 5: recover the types inference determined but never wrote down, then hold
     // every value node to carrying one.
     tc_stamp_program(program)
+
+    // A `Raw[T]` whose literal no `Template[C]` took. Last, because the coercion that
+    // consumes one is a caller, and a caller may be checked after the literal it calls with.
+    tc_raw_report_unconsumed()
 
     if trace_mode != "" { trace("typecheck", "done ({tc_errors.len()} errors)") }
     tc_errors.len()
@@ -11521,6 +11583,7 @@ fn is_primitive_type(name: Str) -> Int {
     // A name the language owns, even though every position that can write it is an error:
     // the report the writer gets must be the scope rule, not "unknown type".
     if name == "FfiScope" { return 1 }
+    if name == "Raw" { return 1 }
     0
 }
 
@@ -14203,13 +14266,6 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             let mut pi = 0
             while pi < sublist_length(parts_sl) {
                 let part = sublist_get(parts_sl, pi)
-                if tc_is_raw_call(part) != 0 {
-                    // -1 is a body with no enclosing user function — a test body, or the top
-                    // level. No function means no audit to find, so the warning stands.
-                    if tc_current_fn_node == -1 || has_annotation(tc_current_fn_node, "trusted") == 0 {
-                        diag_warn_at("RawBypassesParam", RAW_BYPASSES_PARAM, "Raw() bypasses query parameterization", part, "add @trusted(audit: \"AUDIT-ID\") to suppress")
-                    }
-                }
                 if is_interp_literal_part(part) == 0 {
                     let ptid = infer_type(part)
                     // Spec §3.6 (DECISIONS.md:191-192): every interpolated
@@ -14220,7 +14276,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let pk = type_kind(ptid)
                     // Never joins them for a stronger reason: §3.3 makes it a subtype of
                     // every type and it has no values, so Display holds vacuously.
-                    if pk != TyKind.Unknown && pk != TyKind.Typevar && pk != TyKind.Never && tc_type_id_has_display(ptid) == 0 {
+                    // A `Raw[T]` implements no Display and is not meant to: it is waiting for
+                    // the one coercion that consumes it, which the caller decides.
+                    if pk == TyKind.Raw {
+                        tc_raw_note_part(node, part)
+                    } else if pk != TyKind.Unknown && pk != TyKind.Typevar && pk != TyKind.Never && tc_type_id_has_display(ptid) == 0 {
                         tc_errors.push("interpolated value of type '{type_to_str(ptid)}' does not implement Display")
                         diag_error_at("MissingDisplayImpl", MISSING_DISPLAY_IMPL, "type '{type_to_str(ptid)}' does not implement Display", part, "add '@derive(Display)' or implement Display manually; use '.debug()' for structural form")
                     }
@@ -14568,9 +14628,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 if fn_name == "Raw" {
                     let args_sl = node_args(node)
                     if args_sl != -1 && sublist_length(args_sl) >= 1 {
-                        return infer_type(sublist_get(args_sl, 0))
+                        return make_raw_type(infer_type(sublist_get(args_sl, 0)))
                     }
-                    return TYPE_STR
+                    return make_raw_type(make_metavar())
                 }
                 if fn_name == "skip" {
                     tc_fence_test_only_symbol("skip", SKIP_OUTSIDE_TEST, "SkipOutsideTest", node)
@@ -19852,6 +19912,7 @@ fn type_to_str(tid0: Int) -> Str {
         TyKind.Channel => return "Channel[{type_to_str(t.inner1)}]"
         TyKind.Ptr => return "Ptr[{type_to_str(t.inner1)}]"
         TyKind.Template => return "Template[{type_to_str(t.inner1)}]"
+        TyKind.Raw => return "Raw[{type_to_str(t.inner1)}]"
         // The surface spelling of the type is the expression that makes one: §07:272 has no
         // type name for it, and `ffi.scope()` is the only way to obtain one.
         TyKind.FfiScope => return "FfiScope"
@@ -20011,6 +20072,8 @@ pub fn tc_tid_child_count(tid: Int) -> Int {
         TyKind.Ptr => 1
         // The phantom context. Carried, not checked — see make_template_type.
         TyKind.Template => 1
+        // The wrapped type. A `Raw[T]` is not a `T`, but it is made of one.
+        TyKind.Raw => 1
         // A handler's EFFECT is not a type, so it is not a child: it lives in the entry's name
         // slot (make_handler_type) and is read back with tc_tid_handler_effect. This
         // is the one kind whose parameter is deliberately NOT a tid, which is exactly why the
@@ -20074,6 +20137,7 @@ pub fn tc_tid_child(tid: Int, i: Int) -> Int {
         TyKind.Channel => if i == 0 { t.inner1 } else { -1 }
         TyKind.Ptr => if i == 0 { t.inner1 } else { -1 }
         TyKind.Template => if i == 0 { t.inner1 } else { -1 }
+        TyKind.Raw => if i == 0 { t.inner1 } else { -1 }
         // Unreachable, like the leaves above: child_count is 0 because the effect is a NAME,
         // not a tid.
         TyKind.Handler => -1
