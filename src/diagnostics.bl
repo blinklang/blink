@@ -97,7 +97,8 @@ pub const BYTES_PTR_CAST_FORBIDDEN = "E0817"
 pub const FFI_SCOPE_NOT_WITH_RESOURCE = "E0819"
 pub const MISSING_NATIVE_DEP       = "E0820"
 pub const NATIVE_DEP_UNAVAILABLE_CROSS = "E0821"
-pub const FFI_OFFSET_UNKNOWN_STRIDE = "E0822"
+pub const BUF_OUTSIDE_FFI_SURFACE   = "E0822"
+pub const FFI_OFFSET_UNKNOWN_STRIDE = "E0838"
 
 // E0823+ — unwind / cleanup
 pub const CLEANUP_PANICKED_DURING_UNWIND = "E0824"
@@ -1134,8 +1135,11 @@ pub fn diag_explain(code: Str) -> Str {
     if code == NATIVE_DEP_UNAVAILABLE_CROSS {
         return "E0821 -- NativeDepUnavailableCrossTarget\n\nA native dependency declared as system-only cannot be resolved for\na cross-compilation target. Cross-compilation requires vendored\nsource or a static archive.\n\nFix: provide vendored source:\n  libname = \{ path = \"vendor/libname.c\" \}\n\nOr explicitly opt in to dynamic linking on the target:\n  libname = \{ system = true, link = \"dynamic\" \}"
     }
+    if code == BUF_OUTSIDE_FFI_SURFACE {
+        return "E0822 -- BufOutsideFfiSurface\n\n`Buf[T]` is the byte bridge's own type, and it is nameable only on the\nFFI surface: `@ffi.fn` parameter and return types, and `@ffi.struct`\nfield types. An inferred binding may hold one, because the typechecker\ncomputes that type and nobody writes it. Writing the name anywhere else\n-- an annotated binding, a parameter or return type in Blink code, a\nstruct field, a generic bound -- is rejected.\n\nThe buffer and its payload are malloc'd, tied to the enclosing\n`ffi.scope`, and freed when that scope unwinds. Naming the type outside\nthe bridge lets it outlive the scope that frees it, so the restriction\nis what keeps the lifetime purely lexical.\n\nFix: for a byte payload, use the helper that returns `Bytes`.\n\n  let bs = libc.recv_bytes(fd, 4096)     // OK -- also read_bytes,\n                                         //       getentropy_bytes\n\nFix: for a typed scope-tied region, use `scope.alloc_n[T]`.\n\n  let p = scope.alloc_n[Pollfd](8)       // OK\n\nSee `blink doc bytes-bridge` for the whole byte bridge."
+    }
     if code == FFI_OFFSET_UNKNOWN_STRIDE {
-        return "E0822 -- FfiOffsetUnknownStride\n\nPtr.offset(i) requires the pointer's element type to be an\n@ffi.struct typedef so the stride (size in bytes) is known at\ncompile time. Pointers to opaque or non-FFI types cannot be\nadvanced safely.\n\nFix: use Ptr[T] where T is annotated @ffi.struct.\n\n  @ffi.struct(header: \"poll.h\", name: \"pollfd\")\n  pub type Pollfd \{ fd: I32, events: I16, revents: I16 \}\n  let p: Ptr[Pollfd] = scope.alloc_n(8)\n  let q = p.offset(3)   // OK -- stride = sizeof(pollfd)"
+        return "E0838 -- FfiOffsetUnknownStride\n\nPtr.offset(i) requires the pointer's element type to be an\n@ffi.struct typedef so the stride (size in bytes) is known at\ncompile time. Pointers to opaque or non-FFI types cannot be\nadvanced safely.\n\nFix: use Ptr[T] where T is annotated @ffi.struct.\n\n  @ffi.struct(header: \"poll.h\", name: \"pollfd\")\n  pub type Pollfd \{ fd: I32, events: I16, revents: I16 \}\n  let p: Ptr[Pollfd] = scope.alloc_n(8)\n  let q = p.offset(3)   // OK -- stride = sizeof(pollfd)"
     }
     if code == INCOMPATIBLE_STDLIB_ARCHIVE {
         return "E0840 -- IncompatibleStdlibArchive\n\nThe installed stdlib archive (libblink_std.a in\n<prefix>/share/blink/) was built by a different blink toolchain\nthan the one now linking your program. The archive and the freshly\nemitted C disagree on struct layout / runtime ABI; linking them\nwould produce a binary that reads boxed values at the wrong offsets\nand corrupts memory at runtime (dangling reads, SIGSEGV).\n\nThe archive carries a `.archive-id` stamp (runtime.h SHA |\nlibblink_std.h SHA | blinkc SHA | version). The decisive checks are\nthe two header SHAs -- runtime.h and libblink_std.h together define\nevery struct layout the user TU shares with the archive. When the\nlinking compiler's resolved headers do not match the stamp, the\nlink is rejected before a binary is produced. (An installed tree\nships no blinkc, so its SHA is recorded for forensics only.)\n\nFix: reinstall the stdlib so the archive matches the compiler:\n\n  task install\n\nOr rebuild against the current toolchain. If you see this from a\nrelease tarball, the tarball's bin/ and share/blink/ are mismatched\n-- reinstall a consistent release."
