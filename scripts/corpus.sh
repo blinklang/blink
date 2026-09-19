@@ -15,6 +15,8 @@
 #   CORPUS_COMPILER  dir holding blink/blinkc/libblink_std.* (default build/gen1)
 #   CORPUS_JOBS      parallel workers (default: nproc/2, minimum 1)
 #   CORPUS_OUT       output JSON (default build/corpus.json)
+#   CORPUS_PRELUDE_LIB  lib/ root each sandbox exposes as the prelude, passed
+#                    through to corpus_one.sh (default: the compiler's own)
 #
 # --only <list file> restricts the run to the files named in the list (one
 # path per line, blank lines and # comments ignored) and defaults CORPUS_OUT

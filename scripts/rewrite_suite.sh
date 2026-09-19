@@ -63,7 +63,7 @@ if [ "$(readlink -f build/lib 2>/dev/null)" != "$(readlink -f lib)" ]; then
     cp lib/std/*.bl build/lib/std/ || exit 2
     cp lib/pkg/*.bl build/lib/pkg/ || exit 2
 fi
-for root in build/lib "$comp/lib"; do
+for root in lib build/lib "$comp/lib"; do
     if ! ls "$root"/std/*.bl >/dev/null 2>&1; then
         echo "rewrite-suite: ERROR no prelude at $root/std; a probe would compile" >&2
         echo "rewrite-suite:       nothing and its assertions would hold over an empty program" >&2
@@ -118,7 +118,12 @@ fi
 # total empty, `[ "" != "" ]` is false, and the gate reports ok on a run that
 # never happened.
 set -e
-CORPUS_COMPILER="$comp" CORPUS_OUT="$out" ./scripts/corpus.sh --only "$list" --no-lint
+# CORPUS_PRELUDE_LIB: a sandbox exposes the compiler's own lib/ as the prelude by
+# default, and under gen0 that is a PINNED stdlib. These probes compile programs in
+# process through THIS tree's compiler sources, so they must read this tree's stdlib;
+# otherwise a stdlib change here is invisible to all of them and a diagnostic this
+# tree adds fires against a stdlib this tree cannot fix.
+CORPUS_PRELUDE_LIB="$(pwd)/lib" CORPUS_COMPILER="$comp" CORPUS_OUT="$out" ./scripts/corpus.sh --only "$list" --no-lint
 passed=$(jq -r .passed "$out")
 total=$(jq -r .total "$out")
 selected=$(wc -l < "$list" | tr -d ' ')

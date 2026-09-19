@@ -98,6 +98,8 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | DuplicateKeywordArg | E0528 | The same call-site label appears twice in one call | Name resolution | §2.13 |
 | UnlabeledKeywordArg | E0529 | A keyword parameter received its argument positionally — the value is present and unlabelled | Name resolution | §2.13 |
 | RawOutsideTemplate | E0530 | A `Raw[T]` reached a position that does not consume it — only a `Template[C]` coercion does | Type checking | §3b.5 |
+| PositionalParamDefault | E0531 | A default value written on a positional parameter — only parameters declared after `--` may carry one | Type checking | §2.13 |
+| NonConstParamDefault | E0532 | A parameter default that is not a const expression | Type checking | §2.13, §2.21 |
 | CloseableEscapesScope | E0601 | `Closeable` value escapes `with...as` scope | Resources | §5.5 |
 | ArenaValueEscapes | E0700 | Arena-scoped value escapes arena scope | Arena | §5.2 |
 | ArenaTypeContainsCycle | E0701 | Type crossing `with arena { }` boundary contains a cycle | Arena | §5.2 |
@@ -120,7 +122,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | FfiScopeNotWithResource | E0819 | An `FfiScope` value occurs somewhere other than as a `with ... as` resource — bound by `let`, passed, returned, stored, or written as a type argument (its libc arena would never be freed) | FFI | §9.1.1 |
 | MissingNativeDep | E0820 | `@ffi` references undeclared native dependency | FFI | §9.2.1 |
 | NativeDepUnavailableCrossTarget | E0821 | Native dependency unavailable for cross-target | FFI | §9.2.1 |
-| FfiOffsetUnknownStride | E0822 | `Ptr.offset` requires `@ffi.struct` element type | FFI | §9.1.1 |
+| BufOutsideFfiSurface | E0822 | The name `Buf` written outside the `@ffi.fn` / `@ffi.struct` surface — an annotated binding, a parameter or return type, a struct field, or a generic bound | FFI | §9.1.3.2 |
 | CleanupPanickedDuringUnwind | E0824 | `exit(false)`/`close()` panicked during catchable unwind; original panic preserved, cleanup surfaces as warning | Test runner | §4.6.3 |
 | IncompatibleStdlibArchive | E0840 | Installed stdlib archive built by a different toolchain than the linking compiler (ABI/struct-layout mismatch) — rejected at link time | FFI | §9.2.1 |
 | SkipOutsideTest | E0827 | `skip()` called outside a `test { ... }` block | Type checking | §2.20 |
@@ -130,6 +132,8 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | AssertPanicsNestedExpectPanic | E0834 | `assert_panics` nested inside another `assert_panics` | Test runner | §2.20 |
 | XfailMissingReason | E0835 | `test.failing(...)` missing or empty `reason:`/`ticket:` | Type checking | §8.10.6 |
 | TrustedRequiresAudit | E0836 | `@trusted` written without a non-empty `audit:` identifier | FFI | §9.1 |
+| AuditGatedSuppression | E0837 | An audit-gated diagnostic (`UnauditedFfi`, `RawBypassesParam`) named in `@allow(...)` or under `[lints]` — refused, not ignored, because neither channel records anything | FFI | §9.1 |
+| FfiOffsetUnknownStride | E0838 | `Ptr.offset` requires `@ffi.struct` element type | FFI | §9.1.1 |
 | TraitContractMissingMethod | E0900 | Trait contract: required method not implemented | Trait contract | §3.6 |
 | TraitContractWrongArity | E0901 | Trait contract: method has wrong argument arity | Trait contract | §3.6 |
 | TraitContractParamMismatch | E0902 | Trait contract: method parameter type mismatch | Trait contract | §3.6 |

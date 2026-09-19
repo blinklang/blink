@@ -63,6 +63,8 @@ pub const POSITIONAL_AFTER_KEYWORD = "E0527"
 pub const DUPLICATE_KEYWORD_ARG   = "E0528"
 pub const UNLABELED_KEYWORD_ARG   = "E0529"
 pub const RAW_OUTSIDE_TEMPLATE    = "E0530"
+pub const POSITIONAL_PARAM_DEFAULT = "E0531"
+pub const NON_CONST_PARAM_DEFAULT  = "E0532"
 
 // E0600+ — closures, scoping
 pub const CLOSEABLE_ESCAPES_SCOPE = "E0601"
@@ -97,7 +99,8 @@ pub const BYTES_PTR_CAST_FORBIDDEN = "E0817"
 pub const FFI_SCOPE_NOT_WITH_RESOURCE = "E0819"
 pub const MISSING_NATIVE_DEP       = "E0820"
 pub const NATIVE_DEP_UNAVAILABLE_CROSS = "E0821"
-pub const FFI_OFFSET_UNKNOWN_STRIDE = "E0822"
+pub const BUF_OUTSIDE_FFI_SURFACE   = "E0822"
+pub const FFI_OFFSET_UNKNOWN_STRIDE = "E0838"
 
 // E0823+ — unwind / cleanup
 pub const CLEANUP_PANICKED_DURING_UNWIND = "E0824"
@@ -115,6 +118,7 @@ pub const ASSERT_PANICS_MESSAGE_MISMATCH   = "E0832"
 pub const ASSERT_PANICS_OUTSIDE_TEST       = "E0833"
 pub const ASSERT_PANICS_NESTED_EXPECT_PANIC = "E0834"
 pub const XFAIL_MISSING_REASON              = "E0835"
+pub const TRUSTED_REQUIRES_AUDIT            = "E0836"
 
 // E0840+ — toolchain / link integrity
 // Guards the ABI-skew class of bug where a stdlib archive that is stale
@@ -204,6 +208,7 @@ pub const UNREACHABLE_CODE        = "W0700"
 pub const ARENA_EFFECT_REDUNDANT  = "W0701"
 pub const BITWISE_PRECEDENCE      = "W0702"
 pub const UNAUDITED_FFI           = "W0800"
+pub const AUDIT_GATED_SUPPRESSION = "E0837"
 pub const MISSING_CANONICAL_HEADER = "W0812"
 pub const DEPRECATED_USAGE        = "W2000"
 
@@ -403,11 +408,39 @@ pub fn diag_clear_allows() {
 
 // ── Lint override helpers ────────────────────────────────────────────
 
-pub fn lint_set_override(name: Str, level: Str) {
+// The section 9.1 list. A diagnostic belongs on it only when silently suppressing it
+// would destroy a record the language promises exists, which is why the two channels that
+// record nothing do not reach it. Keyed by name and by code because [lints] accepts either.
+pub fn diag_is_audit_gated(key: Str) -> Int {
+    if key == "RawBypassesParam" { return 1 }
+    if key == RAW_BYPASSES_PARAM { return 1 }
+    // The catalog spells this UnauditedFfi and the emitter UnauditedFFI. An author writes
+    // what they were shown, so both reach the list until the two agree.
+    if key == "UnauditedFfi" { return 1 }
+    if key == "UnauditedFFI" { return 1 }
+    if key == UNAUDITED_FFI { return 1 }
+    0
+}
+
+pub fn diag_audit_gated_help(key: Str) -> Str {
+    "`{key}` records an audit, so it is suppressed only by `@trusted(audit: \"AUDIT-ID\")` on the enclosing function"
+}
+
+pub fn lint_set_override(name: Str, level: Str) ! Diag.Report {
+    if diag_is_audit_gated(name) != 0 {
+        diag_error_no_loc("AuditGatedSuppression", AUDIT_GATED_SUPPRESSION,
+            "`{name}` cannot be set from [lints] in blink.toml",
+            diag_audit_gated_help(name))
+        return
+    }
     lint_overrides.insert(name, level)
 }
 
 fn lint_apply_override(severity: Str, name: Str, code: Str) -> Str {
+    // Neither channel records anything, so neither reaches an audit-gated diagnostic. Both
+    // write sites refuse one outright; this is the second half of the same rule, so a name
+    // that arrives here by some other route still fails to silence it.
+    if diag_is_audit_gated(name) != 0 { return severity }
     if diag_allow_set.contains_key(name) != 0 {
         return "off"
     }
@@ -1058,22 +1091,22 @@ pub fn diag_explain(code: Str) -> Str {
         return "W0702 -- BitwisePrecedence\n\nA bitwise operator (& or |) was applied to the result of a\ncomparison without parentheses. Because comparisons bind tighter\nthan bitwise operators in some languages and looser in others, the\ncombination is ambiguous to readers.\n\nFix: wrap the comparison or the bitwise operation in parentheses to\nmake the intent explicit.\n\n  let mask = (a == 0) & (b == 0)   // OK -- explicit grouping"
     }
     if code == UNAUDITED_FFI {
-        return "W0800 -- UnauditedFFI\n\nAn @ffi function is not marked @trusted, meaning it has not been\naudited for safety.\n\nFix: audit the foreign function for memory safety and correctness,\nthen add @trusted to suppress this warning.\n\n  @ffi(\"puts\")\n  @trusted\n  fn c_puts(s: Ptr[U8]) -> Int ! FFI \{ \}"
+        return "W0800 -- UnauditedFFI\n\nAn @ffi function is not marked @trusted, meaning it has not been\naudited for safety.\n\nFix: audit the foreign function for memory safety and correctness,\nthen add @trusted(audit: \"ID\") to suppress this warning. The\naudit identifier is required (E0836).\n\n  @ffi(\"puts\")\n  @trusted(audit: \"AUDIT-001\")\n  fn c_puts(s: Ptr[U8]) -> Int ! FFI \{ \}"
     }
     if code == PUB_FFI {
-        return "E0801 -- PubFFI\n\nAn @ffi function was declared as pub. FFI functions are unsafe and\nshould not be exposed in a module's public API.\n\nFix: remove 'pub' and wrap the FFI call in a safe public function.\n\n  @ffi(\"strlen\")\n  @trusted\n  fn c_strlen(s: Ptr[U8]) -> Int ! FFI \{ \}\n\n  pub fn string_length(s: Str) -> Int ! FFI \{\n      c_strlen(s.as_ptr())\n  \}"
+        return "E0801 -- PubFFI\n\nAn @ffi function was declared as pub. FFI functions are unsafe and\nshould not be exposed in a module's public API.\n\nFix: remove 'pub' and wrap the FFI call in a safe public function.\n\n  @ffi(\"strlen\")\n  @trusted(audit: \"AUDIT-001\")\n  fn c_strlen(s: Ptr[U8]) -> Int ! FFI \{ \}\n\n  pub fn string_length(s: Str) -> Int ! FFI \{\n      c_strlen(s.as_ptr())\n  \}"
     }
     if code == FFI_NO_EFFECTS {
-        return "E0802 -- FFINoEffects\n\nAn @ffi function does not declare any effects. FFI calls are\ninherently side-effectful and must declare their effects.\n\nFix: add '! FFI' or appropriate effects to the function signature.\n\n  @ffi(\"puts\")\n  @trusted\n  fn c_puts(s: Ptr[U8]) -> Int ! FFI \{ \}"
+        return "E0802 -- FFINoEffects\n\nAn @ffi function does not declare any effects. FFI calls are\ninherently side-effectful and must declare their effects.\n\nFix: add '! FFI' or appropriate effects to the function signature.\n\n  @ffi(\"puts\")\n  @trusted(audit: \"AUDIT-001\")\n  fn c_puts(s: Ptr[U8]) -> Int ! FFI \{ \}"
     }
     if code == CONTRACT_ON_FFI {
-        return "E0803 -- ContractOnFFI\n\nA @requires or @ensures annotation was used on an @ffi function.\nContracts cannot verify foreign code behavior.\n\nFix: remove the contract annotation from the FFI function. If you\nneed contracts, add them to a safe wrapper function instead.\n\n  @ffi(\"sqrt\")\n  @trusted\n  fn c_sqrt(x: Float) -> Float ! FFI \{ \}\n\n  @requires(x >= 0.0)\n  pub fn safe_sqrt(x: Float) -> Float ! FFI \{\n      c_sqrt(x)\n  \}"
+        return "E0803 -- ContractOnFFI\n\nA @requires or @ensures annotation was used on an @ffi function.\nContracts cannot verify foreign code behavior.\n\nFix: remove the contract annotation from the FFI function. If you\nneed contracts, add them to a safe wrapper function instead.\n\n  @ffi(\"sqrt\")\n  @trusted(audit: \"AUDIT-001\")\n  fn c_sqrt(x: Float) -> Float ! FFI \{ \}\n\n  @requires(x >= 0.0)\n  pub fn safe_sqrt(x: Float) -> Float ! FFI \{\n      c_sqrt(x)\n  \}"
     }
     if code == INVALID_PTR_TYPE {
         return "E0810 -- InvalidPtrType\n\nPtr[T] was used with an invalid type parameter. Only FFI-compatible\ntypes are allowed inside Ptr.\n\nValid types: Void, U8, U16, U32, U64, I8, I16, I32, I64, Int,\nFloat, Ptr\n\nFix: use one of the valid FFI-compatible types.\n\n  fn good(p: Ptr[U8]) ! FFI \{ \}   // OK\n  fn bad(p: Ptr[Str]) ! FFI \{ \}    // E0810: Str is not valid"
     }
     if code == PTR_OUTSIDE_FFI {
-        return "E0811 -- PtrOutsideFFI\n\nPtr[T] was used in a function that is not marked @ffi. Pointer\ntypes are only valid in FFI contexts.\n\nFix: add @ffi to the function, or use a safe wrapper.\n\n  @ffi(\"malloc\")\n  @trusted\n  fn c_malloc(size: Int) -> Ptr[Void] ! FFI \{ \}"
+        return "E0811 -- PtrOutsideFFI\n\nPtr[T] was used in a function that is not marked @ffi. Pointer\ntypes are only valid in FFI contexts.\n\nFix: add @ffi to the function, or use a safe wrapper.\n\n  @ffi(\"malloc\")\n  @trusted(audit: \"AUDIT-001\")\n  fn c_malloc(size: Int) -> Ptr[Void] ! FFI \{ \}"
     }
     if code == MISSING_CANONICAL_HEADER {
         return "W0812 -- MissingCanonicalHeader\n\nAn @ffi.struct annotation declares a canonical header that is not\nlisted in any [native-dependencies].<dep>.headers entry of\nblink.toml. Without that declaration the build cannot guarantee the\nheader will be available on the target system, so layout asserts\nmay fail to compile out-of-tree.\n\nFix: list the header in blink.toml:\n\n  [native-dependencies]\n  libname = \{ system = true, headers = [\"poll.h\"] \}\n\nUnder --strict-struct-layout the warning is escalated to error."
@@ -1105,8 +1138,11 @@ pub fn diag_explain(code: Str) -> Str {
     if code == NATIVE_DEP_UNAVAILABLE_CROSS {
         return "E0821 -- NativeDepUnavailableCrossTarget\n\nA native dependency declared as system-only cannot be resolved for\na cross-compilation target. Cross-compilation requires vendored\nsource or a static archive.\n\nFix: provide vendored source:\n  libname = \{ path = \"vendor/libname.c\" \}\n\nOr explicitly opt in to dynamic linking on the target:\n  libname = \{ system = true, link = \"dynamic\" \}"
     }
+    if code == BUF_OUTSIDE_FFI_SURFACE {
+        return "E0822 -- BufOutsideFfiSurface\n\n`Buf[T]` is the byte bridge's own type, and it is nameable only on the\nFFI surface: `@ffi.fn` parameter and return types, and `@ffi.struct`\nfield types. An inferred binding may hold one, because the typechecker\ncomputes that type and nobody writes it. Writing the name anywhere else\n-- an annotated binding, a parameter or return type in Blink code, a\nstruct field, a generic bound -- is rejected.\n\nThe buffer and its payload are malloc'd, tied to the enclosing\n`ffi.scope`, and freed when that scope unwinds. Naming the type outside\nthe bridge lets it outlive the scope that frees it, so the restriction\nis what keeps the lifetime purely lexical.\n\nFix: for a byte payload, use the helper that returns `Bytes`.\n\n  let bs = libc.recv_bytes(fd, 4096)     // OK -- also read_bytes,\n                                         //       getentropy_bytes\n\nFix: for a typed scope-tied region, use `scope.alloc_n[T]`.\n\n  let p = scope.alloc_n[Pollfd](8)       // OK\n\nSee `blink doc bytes-bridge` for the whole byte bridge."
+    }
     if code == FFI_OFFSET_UNKNOWN_STRIDE {
-        return "E0822 -- FfiOffsetUnknownStride\n\nPtr.offset(i) requires the pointer's element type to be an\n@ffi.struct typedef so the stride (size in bytes) is known at\ncompile time. Pointers to opaque or non-FFI types cannot be\nadvanced safely.\n\nFix: use Ptr[T] where T is annotated @ffi.struct.\n\n  @ffi.struct(header: \"poll.h\", name: \"pollfd\")\n  pub type Pollfd \{ fd: I32, events: I16, revents: I16 \}\n  let p: Ptr[Pollfd] = scope.alloc_n(8)\n  let q = p.offset(3)   // OK -- stride = sizeof(pollfd)"
+        return "E0838 -- FfiOffsetUnknownStride\n\nPtr.offset(i) requires the pointer's element type to be an\n@ffi.struct typedef so the stride (size in bytes) is known at\ncompile time. Pointers to opaque or non-FFI types cannot be\nadvanced safely.\n\nFix: use Ptr[T] where T is annotated @ffi.struct.\n\n  @ffi.struct(header: \"poll.h\", name: \"pollfd\")\n  pub type Pollfd \{ fd: I32, events: I16, revents: I16 \}\n  let p: Ptr[Pollfd] = scope.alloc_n(8)\n  let q = p.offset(3)   // OK -- stride = sizeof(pollfd)"
     }
     if code == INCOMPATIBLE_STDLIB_ARCHIVE {
         return "E0840 -- IncompatibleStdlibArchive\n\nThe installed stdlib archive (libblink_std.a in\n<prefix>/share/blink/) was built by a different blink toolchain\nthan the one now linking your program. The archive and the freshly\nemitted C disagree on struct layout / runtime ABI; linking them\nwould produce a binary that reads boxed values at the wrong offsets\nand corrupts memory at runtime (dangling reads, SIGSEGV).\n\nThe archive carries a `.archive-id` stamp (runtime.h SHA |\nlibblink_std.h SHA | blinkc SHA | version). The decisive checks are\nthe two header SHAs -- runtime.h and libblink_std.h together define\nevery struct layout the user TU shares with the archive. When the\nlinking compiler's resolved headers do not match the stamp, the\nlink is rejected before a binary is produced. (An installed tree\nships no blinkc, so its SHA is recorded for forensics only.)\n\nFix: reinstall the stdlib so the archive matches the compiler:\n\n  task install\n\nOr rebuild against the current toolchain. If you see this from a\nrelease tarball, the tarball's bin/ and share/blink/ are mismatched\n-- reinstall a consistent release."
@@ -1131,6 +1167,9 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == XFAIL_MISSING_REASON {
         return "E0835 -- XfailMissingReason\n\n`test.failing(...)` requires both `reason:` and `ticket:` to be\nnon-empty string literals. `reason` documents why the test is\nexpected to fail today; `ticket` is a `br` id that the closed-ticket\nlint queries -- an empty or missing value on either breaks that\ncontract silently.\n\nFix: supply both as non-empty strings.\n\n  test.failing(\n      \"trait impl resolves through alias chain\",\n      reason: \"Phase 3 trait elaboration not yet implemented\",\n      ticket: \"a1b2c3\",\n  ) \{\n      // ... test body, expected to fail today\n  }"
+    }
+    if code == TRUSTED_REQUIRES_AUDIT {
+        return "E0836 -- TrustedRequiresAudit\n\n`@trusted` is the sole channel that suppresses the audit-gated\ndiagnostics of section 9.1 (UnauditedFfi, RawBypassesParam). The\n`audit:` identifier is the record the channel exists to create. A\nbare `@trusted`, or one with an empty `audit:`, silences the\ndiagnostic and records nothing -- the one outcome the annotation\nis there to prevent.\n\nFix: give the audit a non-empty identifier.\n\n  @ffi(\"sqlite3\", \"sqlite3_close\")\n  @effects(IO)\n  @trusted(audit: \"DB-004\")\n  fn sqlite3_close(db: Ptr[Void]) -> Int\n\n  @trusted                             // E0836\n  fn other(db: Ptr[Void]) -> Int\n\nThe identifier is free-form: a ticket id, a review id, or a short\nnote on what was audited and why it is safe."
     }
     if code == DEPRECATED_USAGE {
         return "W2000 -- DeprecatedUsage\n\nA function or type marked @deprecated was used.\n\nThe @deprecated annotation signals that an API is scheduled for\nremoval. The warning includes the deprecation edition (if known)\nand a suggested replacement.\n\nFix: migrate to the replacement API shown in the help message.\n\n  @deprecated(replacement: \"new_fn\")\n  fn old_fn() \{ \}\n\n  fn main() \{\n      old_fn()   // W2000: use of deprecated function 'old_fn'\n                 // help: use 'new_fn' instead\n  \}"
@@ -1175,7 +1214,7 @@ pub fn diag_explain(code: Str) -> Str {
         return "E0310 -- TemplateMismatch\n\nA string template parameter type does not match the value supplied\nat the call site. Templates check parameter types like normal\nfunction calls.\n\nFix: convert the value to the expected type, or change the template\nparameter type to match.\n\n  let s = template\"hello \{name: Str\}\"\n  s.fill(name: 42)   // E0310 -- expected Str, got Int"
     }
     if code == MISSING_KEYWORD_ARG {
-        return "E0510 -- MissingKeywordArg\n\nA keyword parameter of the callee received no argument at all. Every\nparameter declared after `--` needs an argument, and that argument\ncarries the parameter's label.\n\nContrast E0529 UnlabeledKeywordArg: there the value is present and\nunlabelled, and the repair annotates an argument already written. Here\nthe value is absent, and the repair inserts one.\n\nFix: supply the argument, labelled.\n\n  fn transfer(amount: Int, -- from: Int, to: Int) \{ ... \}\n  transfer(300, from: 1)             // E0510 -- 'to' received nothing\n  transfer(300, from: 1, to: 2)      // OK"
+        return "E0510 -- MissingKeywordArg\n\nA keyword parameter of the callee received no argument at all. Every\nparameter declared after `--` needs an argument, and that argument\ncarries the parameter's label.\n\nContrast E0529 UnlabeledKeywordArg: there the value is present and\nunlabelled, and the repair annotates an argument already written. Here\nthe value is absent, and the repair inserts one.\n\nFix: supply the argument, labelled.\n\n  fn transfer(amount: Int, -- from: Int, to: Int) \{ ... \}\n  transfer(300, from: 1)             // E0510 -- 'to' received nothing\n  transfer(300, from: 1, to: 2)      // OK\n\nA keyword parameter that declares a default value is never missing: the\ncall is filled from the declaration. Giving the parameter a default is\ntherefore the other repair, and it is the right one when most callers\nwant the same value.\n\n  fn transfer(amount: Int, -- from: Int, to: Int = 0) \{ ... \}\n  transfer(300, from: 1)             // OK -- 'to' is 0\n\nThe default must be a const expression, and only a parameter declared\nafter `--` may carry one. See E0532 and E0531."
     }
     if code == INVALID_KEYWORD_ARG {
         return "E0511 -- InvalidKeywordArg\n\nA call-site label names no keyword parameter of the callee. A label\nresolves in the keyword-parameter namespace -- the parameters declared\nafter `--` -- and nothing else, so a misspelling and a label written on\na positional parameter are both refused here.\n\nFix: correct the label to one the signature declares, or drop it when\nthe parameter it names is positional.\n\n  fn transfer(amount: Int, -- from: Int, to: Int) \{ ... \}\n  transfer(300, frm: 1, to: 2)       // E0511 -- no keyword parameter 'frm'\n  transfer(amount: 300, from: 1, to: 2) // E0511 -- 'amount' is positional\n  transfer(300, from: 1, to: 2)      // OK"
@@ -1257,6 +1296,15 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == RAW_OUTSIDE_TEMPLATE {
         return "E0530 -- RawOutsideTemplate\n\n`Raw[T]` is a marker type, and the only thing that consumes one is a\n`Template[C]` coercion, which folds the wrapped value into the\nadjacent literal segment of a template. A `Raw[T]` that reaches any\nother position is stranded: it implements no Display, nothing strips\nit back to the `T` it wraps, and no code will ever read it.\n\n  fn log_table(table: Str) ! IO \{\n      io.println(\"scanning \{Raw(table)}\")   // E0530\n  \}\n\nThe marker rides a binding, so the mistake is the same one line\nlater: `let t = Raw(table)` has type `Raw[Str]`, and interpolating\n`t` into an ordinary string is this error too.\n\nFix: drop the wrapper and interpolate the value itself.\n\n  io.println(\"scanning \{table}\")\n\nKeep the wrapper only where a `Template[C]` takes the literal -- a\ntemplated query, for instance -- where folding the value into the\nquery text is the point, and where it raises W0310 RawBypassesParam\nso the bypass leaves a record."
+    }
+    if code == POSITIONAL_PARAM_DEFAULT {
+        return "E0531 -- PositionalParamDefault\n\nA default value was written on a positional parameter. Only the\nparameters declared after the `--` separator may carry one.\n\nA positional argument is matched by its place in the call, so every\nparameter before it must be supplied for a later one to be reached.\nA default that can never be taken unless the caller writes the value\nanyway states a rule the call site cannot use.\n\nFix: move the parameter after `--`, which also makes it keyword-required.\n\n  fn listen(host: Str = \"0.0.0.0\")        // E0531 -- positional\n  fn listen(-- host: Str = \"0.0.0.0\")     // OK\n\nOr drop the default and let every caller supply the value.\n\n  fn listen(host: Str)                    // OK"
+    }
+    if code == NON_CONST_PARAM_DEFAULT {
+        return "E0532 -- NonConstParamDefault\n\nA parameter default must be a const expression: a literal, a `const`\nbinding, or arithmetic over those. This one is computed at run time.\n\nThe default stands in for an argument the caller did not write, and\nthe value it stands for is fixed by the signature, not by when the\ncall happens. An expression that can answer differently on two calls\nwould make one signature mean two things.\n\nFix: use a literal, or name a `const`.\n\n  fn listen(-- port: Int = now())         // E0532 -- computed\n  fn listen(-- port: Int = 8080)          // OK\n\n  const DEFAULT_PORT = 8080\n  fn listen(-- port: Int = DEFAULT_PORT)  // OK\n\nArithmetic over const operands is itself const.\n\n  fn window(-- ms: Int = 60 * 1000)       // OK"
+    }
+    if code == AUDIT_GATED_SUPPRESSION {
+        return "E0837 -- AuditGatedSuppression\n\nAn audit-gated diagnostic was named in `@allow(...)` or under `[lints]`\nin blink.toml. Neither channel reaches it, and naming it there is\nrefused rather than ignored.\n\nThese diagnostics exist to force a RECORD, not to report a mistake. The\nprogram they fire on is legal and may well be correct; what the language\nasks is that a human looked at it and said so somewhere a reviewer can\nfind. `@allow` and `[lints]` silence without recording anything, so they\nwould defeat the only thing the diagnostic is for.\n\nThe refusal is an error rather than silence because a suppression that\nquietly fails to apply and one that quietly succeeds are equally bad:\nthe author cannot tell which happened.\n\nFix: write the audit on the enclosing function instead.\n\n  @allow(RawBypassesParam)              // E0837\n  @trusted(audit: \"DB-003\")              // OK -- the record the rule wants\n\nThe audit-gated list is UnauditedFfi (W0800) and RawBypassesParam\n(W0310). A diagnostic joins it only when silently suppressing it would\ndestroy a record the language promises exists."
     }
     if code == RAW_BYPASSES_PARAM {
         return "W0310 -- RawBypassesParam\n\n`Raw(...)` was used to inject text into a templated query, bypassing\nthe parameterization that prevents injection. Raw fragments must come\nfrom trusted sources.\n\nFix: pass user input through a parameter rather than `Raw`. Reserve\n`Raw` for compile-time-fixed fragments such as table or column names\nthat the parameterization machinery cannot represent.\n\n  let q = sql\"select * from \{Raw(table)\} where id = \{user_id\}\"\n\nIf the fragment is genuinely fixed and reviewed, suppress with\n`@trusted(audit: \"AUDIT-ID\")` on the enclosing function. This records\nan auditable trail, the same mechanism used for @ffi (W0800)."

@@ -11,7 +11,7 @@ import std.fs
 import std.io
 import compiler.{compile_to_program}
 import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
-import parser.{nodes, node_kind, node_name, node_obj}
+import parser.{nodes, node_kind, node_name, node_obj, node_type_name}
 import ast.{NodeKind}
 import diagnostics.{diag_entries, diag_reset}
 import embedded_stdlib_registry.{init_embedded_stdlib}
@@ -57,6 +57,22 @@ fn rendered_type_of_call_on(nm: Str) -> Str {
                     hit = i
                 }
             }
+        }
+        i = i + 1
+    }
+    if hit == -1 { return "<absent>" }
+    tc_type_str(tc_lookup_node_tid(hit))
+}
+
+// The rendered type of the one StructLit whose name starts with `nm`. The field-named
+// variant construction is a StructLit, not a MethodCall, so it needs its own reader.
+fn rendered_type_of_structlit(nm: Str) -> Str {
+    let mut hit = -1
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.StructLit && node_type_name(i).starts_with(nm) {
+            if hit != -1 { return "<ambiguous>" }
+            hit = i
         }
         i = i + 1
     }
@@ -133,6 +149,66 @@ fn main() {
 "#
 }
 
+fn untouched_src() -> Str {
+    #"type ZzBox[T] {
+    Full(value: T)
+    Empty(sentinel: Int)
+}
+
+fn zzempty() -> Int {
+    let zzbare: ZzBox[Int] = ZzBox.Empty(0)
+    match zzbare {
+        ZzBox.Full(v) => v
+        ZzBox.Empty(s) => s
+    }
+}
+
+fn main() {
+    let _ = zzempty()
+}
+"#
+}
+
+fn untouched_fieldform_src() -> Str {
+    #"type ZzCrate[T] {
+    Full(value: T)
+    Empty(sentinel: Int)
+}
+
+fn zzempty() -> Int {
+    let zzbare: ZzCrate[Int] = ZzCrate.Empty { sentinel: 0 }
+    match zzbare {
+        ZzCrate.Full(v) => v
+        ZzCrate.Empty(s) => s
+    }
+}
+
+fn main() {
+    let _ = zzempty()
+}
+"#
+}
+
+fn unannotated_src() -> Str {
+    #"type ZzPail[T] {
+    Full(value: T)
+    Empty(sentinel: Int)
+}
+
+fn zzempty() -> Int {
+    let zzbare = ZzPail.Empty(0)
+    match zzbare {
+        ZzPail.Full(_) => 1
+        ZzPail.Empty(s) => s
+    }
+}
+
+fn main() {
+    let _ = zzempty()
+}
+"#
+}
+
 test "a generic enum instance renders its type arguments" {
     enum_probe("build/generic_enum_render.bl", instances_src())
 
@@ -164,4 +240,34 @@ test "an annotation still pins the parameter a variant leaves untouched" {
     // through the rendering, the hint stops matching and this answers ZzSide[Int, R].
     assert_eq(rendered_type_of_call_on("ZzSide"), "ZzSide[Int, Str]")
     assert_eq(rendered_type_of_read("zzpicked"), "ZzSide[Int, Str]")
+}
+
+// The row above pins the parameter a variant leaves untouched while a SIBLING argument
+// binds another one. A variant whose whole payload mentions none of the enum's parameters
+// binds nothing at all, and the annotation is then the only place those parameters can come
+// from. The constructor used to answer the bare head, which names no instance and has no C
+// layout, so a program that builds one could not be lowered.
+test "an annotation pins the parameters when no argument touches any of them" {
+    enum_probe("build/generic_enum_untouched.bl", untouched_src())
+
+    assert_eq(rendered_type_of_call_on("ZzBox"), "ZzBox[Int]")
+    assert_eq(rendered_type_of_read("zzbare"), "ZzBox[Int]")
+}
+
+// The same construction written with field names reaches a different builder, which carried
+// the same bare-head fallback.
+test "the field-named form of that constructor is pinned the same way" {
+    enum_probe("build/generic_enum_untouched_fieldform.bl", untouched_fieldform_src())
+
+    assert_eq(rendered_type_of_structlit("ZzCrate"), "ZzCrate[Int]")
+    assert_eq(rendered_type_of_read("zzbare"), "ZzCrate[Int]")
+}
+
+// With nothing to read the parameter from, the bare head is still the honest answer: the
+// annotation is what pins it, not the construction, so removing the annotation must not
+// leave the fix inventing one.
+test "with no annotation the same constructor stays on the bare head" {
+    enum_probe("build/generic_enum_unannotated.bl", unannotated_src())
+
+    assert_eq(rendered_type_of_call_on("ZzPail"), "ZzPail")
 }
