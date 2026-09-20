@@ -1,0 +1,118 @@
+// A user `impl Display` writes one method, `fmt`, which fills a StringBuilder and answers
+// nothing. Nothing can render a value from that alone, so every renderer calls a second
+// function beside it: one that makes the builder, runs `fmt` and hands back the built Str.
+//
+// That second function has no declaration in the source, so this unit writes it. It is
+// written wherever the `fmt` half is written, which is what keeps the two together in one
+// translation unit: a prelude type's impl is compiled into every unit that uses it, and a
+// unit that emitted the call but not the definition does not link. So the rule is read off
+// the same walk that writes `fmt`, and never off a list of type names.
+//
+// The name is cname's, read here and at the call site from the same producer, so the
+// definition and the caller can not spell it apart.
+
+import std.fs
+import std.io
+import layout.{layout_reset}
+import cg_test_helpers.{cg_probe_compile}
+import cname.{cname_reset, c_display_dispatch_name, c_impl_method_name}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build, cg_reg_impl_methods, cg_reg_impl_of}
+import cg_decl.{cg_decl_reset, cg_decl_emit_impl_method_decls, cg_decl_emit_fn_def}
+import cg_stmt.{lower_fn}
+import parser.{node_name, node_trait_name}
+
+fn assert_has(label: Str, text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: {label}: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn probe_src() -> Str {
+    #"type Temp { degrees: Int }
+
+impl Display for Temp {
+    fn fmt(self, sb: StringBuilder) { sb.write("{self.degrees}C") }
+}
+
+fn main() {
+    let t = Temp { degrees: 21 }
+    assert(t.display() == "21C")
+}
+"#
+}
+
+fn build_probe() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/cg_decl_display_dispatch_probe_src.bl"
+    let program = cg_probe_compile(path, probe_src())
+    let _ = fs.delete(path)
+    layout_reset()
+    cname_reset()
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+}
+
+// Every `fmt` this unit writes, found the way the emitter finds it: through the registry of
+// impl methods, not by walking the source a second time. The probe declares one of its own
+// and the prelude brings others, and the rule is the same for all of them.
+fn fmt_methods() -> List[Int] {
+    let mut out: List[Int] = []
+    for m in cg_reg_impl_methods() {
+        let im = cg_reg_impl_of(m)
+        if im >= 0 && node_trait_name(im) == "Display" && node_name(m) == "fmt" { out.push(m) }
+    }
+    if out.len() == 0 {
+        io.println("FAIL: the probe registered no Display fmt method at all")
+        assert(false)
+    }
+    out
+}
+
+// The probe's own type is named so a reader can see the user half is covered; the count
+// above is what proves the prelude half is covered by the same walk.
+fn owns_temp(methods: List[Int]) -> Bool {
+    for m in methods { if node_name(cg_reg_impl_of(m)) == "Temp" { return true } }
+    false
+}
+
+test "the walk that writes fmt sees the probe's own impl and the prelude's" {
+    build_probe()
+    let methods = fmt_methods()
+    assert(owns_temp(methods))
+    assert(methods.len() >= 2)
+}
+
+test "every Display impl this unit writes declares its dispatcher" {
+    build_probe()
+    let methods = fmt_methods()
+    cg_decl_emit_impl_method_decls()
+    let text = print_take()
+    for m in methods {
+        assert_has("declaration", text, "{c_display_dispatch_name(cg_reg_impl_of(m))}(")
+    }
+}
+
+test "every Display impl this unit writes defines its dispatcher" {
+    build_probe()
+    for m in fmt_methods() {
+        cg_decl_emit_fn_def(m, false, lower_fn(m))
+        assert_has("definition", print_take(), "{c_display_dispatch_name(cg_reg_impl_of(m))}(")
+    }
+}
+
+// The wrapper exists to call `fmt`, and both names come from cname, so the body names the
+// half it wraps under the very spelling that half is defined with.
+test "a dispatcher body calls the fmt half by its own C name" {
+    build_probe()
+    for m in fmt_methods() {
+        let im = cg_reg_impl_of(m)
+        cg_decl_emit_fn_def(m, false, lower_fn(m))
+        let text = print_take()
+        let start = text.index_of("{c_display_dispatch_name(im)}(")
+        assert_has("dispatcher", text, "{c_display_dispatch_name(im)}(")
+        assert_has("wrapped call", text.slice(start, text.len()), "{c_impl_method_name(im, "fmt")}(")
+    }
+}
