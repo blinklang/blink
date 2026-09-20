@@ -1,0 +1,79 @@
+// The one way a value becomes text. An interpolation hole already knows how to render every
+// type this compiler can print, and a print argument needs the same answer, so the print
+// asks this seam rather than growing a second renderer that can drift from the first.
+
+import lower_test_helpers.{probe, rhs_of, assert_kind, assert_eq_str, assert_verifies}
+import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid}
+import cg_expr.{lower_value_as_text}
+
+fn src() -> Str {
+    #"type Row {
+    id: Int
+    label: Str
+}
+
+impl Display for Row {
+    fn fmt(self, sb: StringBuilder) { sb.write(self.label) }
+}
+
+fn main() {
+    let n = 7
+    let f = 1.5
+    let b = true
+    let c = 'q'
+    let s = "x"
+    let r = Row { id: 1, label: "y" }
+    let _keep = [n, f.to_int(), c.to_int()]
+    let _keep2 = [s, r.label]
+    let _keep3 = [b]
+}
+"#
+}
+
+test "a number is rendered by one format call carrying its own conversion" {
+    probe("cg_expr_text", src())
+    let id = lower_value_as_text(rhs_of("n"))
+    assert_kind("kind", id, IrKind.CallRuntime)
+    assert_eq_str("symbol", ir_c_name(id), "blink_str_format")
+    assert_eq_str("format", ir_c_name(ir_kid(id, 0)), #""%lld""#)
+    assert_eq_str("promotion", ir_c_spelling(ir_kid(id, 1)), "long long")
+    assert_verifies("verify", id)
+}
+
+test "a float takes the float conversion, not the integer one" {
+    probe("cg_expr_text", src())
+    let id = lower_value_as_text(rhs_of("f"))
+    assert_kind("kind", id, IrKind.CallRuntime)
+    assert_eq_str("format", ir_c_name(ir_kid(id, 0)), #""%g""#)
+    assert_verifies("verify", id)
+}
+
+// The next three already answer text where they are rendered. Formatting text through a
+// "%s" a second time would copy the string to say nothing about it.
+
+test "a bool is already text, so it is not formatted a second time" {
+    probe("cg_expr_text", src())
+    let id = lower_value_as_text(rhs_of("b"))
+    assert_kind("kind", id, IrKind.VarRef)
+    assert_eq_str("type", ir_c_spelling(id), "const char*")
+}
+
+test "a char is rendered by the runtime and not formatted again" {
+    probe("cg_expr_text", src())
+    let id = lower_value_as_text(rhs_of("c"))
+    assert_kind("kind", id, IrKind.CallRuntime)
+    assert_eq_str("symbol", ir_c_name(id), "blink_char_to_str")
+}
+
+test "a struct renders through its own Display impl and is not formatted again" {
+    probe("cg_expr_text", src())
+    let id = lower_value_as_text(rhs_of("r"))
+    assert_kind("kind", id, IrKind.CallDirect)
+}
+
+test "a string is already the answer and is passed through untouched" {
+    probe("cg_expr_text", src())
+    let id = lower_value_as_text(rhs_of("s"))
+    assert_kind("kind", id, IrKind.Const)
+    assert_eq_str("type", ir_c_spelling(id), "const char*")
+}
