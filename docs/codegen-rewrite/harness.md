@@ -42,6 +42,8 @@ count means anything.
 | `task corpus` | Compiles and runs every `tests/test_*.bl` on its own under gen1. Writes `build/corpus.json`. Then runs the lint. | Never for a test result. Only when the lint fails. |
 | `task corpus-check` | Compares `build/corpus.json` with `scripts/corpus_baseline.json` and with the baseline in the previous commit. A test that now lives in `tests/pinned/` is dropped from both references first. | The pass count drops, or a file that passed no longer passes. |
 | `task corpus-baseline` | Rewrites `scripts/corpus_baseline.json` from `build/corpus.json`. Run it only after a real gain. | Never. |
+| `task ci-fast` | The branch gate: every step of `ci`, with `corpus-sample` in place of `corpus` and `corpus-check`. | Any step fails. |
+| `task corpus-sample` | Compiles and runs the files in `scripts/corpus_sample.txt` under gen1 and holds the pass count to the `# floor:` line in that list. Writes `build/corpus_sample.json`. | Fewer files pass than the floor. It names them. |
 | `task lint` | Runs `scripts/lint_codegen.sh`, the eleven rows below. | A row rises above its limit, or a row in debt rises above the previous commit. |
 | `task test-lint` | Runs `scripts/test_lint_codegen.sh`: each row goes red on a fixture. | A row does not catch its construct. |
 | `task ratchet` | Three debt counts over the whole compiler (see below), then the lint. | A count rises, or a zero-gate row is not zero. |
@@ -150,6 +152,23 @@ jq -r '.files | sort_by(-.seconds) | .[:10][] | "\(.seconds)s \(.file)"' build/c
 To rerun a subset, write the file names to a list and run
 `scripts/corpus.sh --only <list>`. The result goes to
 `build/corpus_subset.json` and does not touch the baseline.
+
+## The corpus sample
+
+The full corpus is too slow for a branch gate, so `ci-fast` runs a fixed
+sample instead: `scripts/corpus_sample.txt`, files that pass on main, grouped
+by the feature each one uses (effects, closures, stdlib imports, generics,
+match, containers, and programs with none of those). The point is coverage of
+producers, not of counts: a slice that breaks a working program loses a whole
+program on its own branch instead of on main.
+
+The list carries its own pass floor on a `# floor: N` line, so the files and
+the number they must reach move in one commit. Every file in it passes on
+main, so the floor is the length of the list.
+
+When a slice makes more of the sample pass, the runner says so and asks for
+the floor to move up. Refresh the list from a green main corpus run, keep the
+groups balanced, and never drop a file to make a branch green.
 
 ## The lint rows
 
