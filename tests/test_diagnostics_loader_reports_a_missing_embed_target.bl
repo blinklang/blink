@@ -1,0 +1,62 @@
+// `blink check` used to answer ok on a program that cannot build. The only reader of an
+// #embed path was the expression lowering stage, which a check never reaches, so a file
+// naming a payload that is not there typechecked clean and failed at build time instead.
+// The loader already opens every source file, so it can answer the question at the point
+// the user asked it.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+
+fn load_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, FS {
+    write_file(path, src)
+    diag_reset()
+    let _program = compile_to_program(path, 1)
+    let _ = fs.delete(path)
+}
+
+// Every error of one name raised by the run, by its message.
+fn errors_named(name: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" && d.name == name { out.push(d.message) }
+    }
+    out
+}
+
+fn report(label: Str) {
+    for d in diag_entries { io.println("  {label}: {d.severity} {d.name}: {d.message}") }
+}
+
+test "loading a file whose embed target is missing reports it by name" {
+    load_probe("probe_embed_absent.bl",
+        "const payload: Str = #embed(\"no_such_payload_here.txt\")\n\nfn main() \{ let _n = payload.len() }\n")
+    let hits = errors_named("FileNotFound")
+    if hits.len() != 1 { report("absent") }
+    assert_eq(hits.len(), 1)
+    assert(hits.get(0).unwrap().contains("no_such_payload_here.txt"))
+}
+
+test "loading a file whose embed target exists reports nothing" {
+    write_file("probe_embed_payload.txt", "hello\n")
+    load_probe("probe_embed_present.bl",
+        "const payload: Str = #embed(\"probe_embed_payload.txt\")\n\nfn main() \{ let _n = payload.len() }\n")
+    let _ = fs.delete("probe_embed_payload.txt")
+    let hits = errors_named("FileNotFound")
+    if hits.len() != 0 { report("present") }
+    assert_eq(hits.len(), 0)
+}
+
+// Moved here from the lowering probes. The loader stops such a program before any
+// lowering runs, so a probe can no longer reach the lowering stage's own check, and this
+// is the only place the report can still be read.
+test "a path that names no file is an author error, not an internal one" {
+    load_probe("probe_embed_not_an_ice.bl",
+        "const payload: Str = #embed(\"no_such_file_here.txt\")\n\nfn main() \{ let _n = payload.len() }\n")
+    let mut ices = 0
+    for d in diag_entries { if d.severity == "ice" { ices = ices + 1 } }
+    if ices != 0 { report("ice") }
+    assert_eq(ices, 0)
+    assert_eq(errors_named("FileNotFound").len(), 1)
+}

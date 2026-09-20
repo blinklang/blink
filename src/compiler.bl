@@ -6,8 +6,10 @@ import diagnostics.{
     Diag, diag_register_file_range, lint_set_override, diag_normalize_path,
     diag_set_last_fix, diag_error_no_loc, diag_warn_at, diag_reset,
     diag_source_file, diag_module_files, embedded_inner_key,
+    diag_error_at, diag_file_for_node,
     CIRCULAR_DEPENDENCY, VERSION_CONFLICT, INVALID_MODULE_ANNOTATION,
     PACKAGE_ENTRY_NOT_FOUND, ORPHAN_FILE, MODULE_NOT_FOUND, UNUSED_IMPORT,
+    FILE_NOT_FOUND,
 }
 import pkg.lockfile.{lockfile_load, lockfile_find_pkg, lockfile_pkg_count, lock_pkg_sources, lock_pkg_names, lock_pkg_versions}
 import pkg.manifest.{manifest_clear, manifest_load, manifest_has_dep, manifest_name, lint_names, lint_levels}
@@ -61,6 +63,25 @@ pub fn check_file_exists(path: Str) {
     }
 }
 
+// Every `#embed` of every file this program loaded, checked once the loading is done.
+// The path is read relative to the file that holds the `#embed`, so each node answers for
+// its own file. The expression stage reads the same path when it lowers, but a `blink
+// check` stops before that stage, so without this a check answered ok on a program no
+// build could produce.
+fn check_embed_targets() ! Diag.Report {
+    let mut id = 0
+    while id < node_count() {
+        if node_kind(id) == NodeKind.EmbedExpr {
+            let path = "{path_dirname(diag_file_for_node(id))}/{node_str_val(id)}"
+            if file_exists(path) != 1 {
+                diag_error_at("FileNotFound", FILE_NOT_FOUND, "#embed file not found: {path}", id,
+                    "the path is read relative to the file that holds the #embed, not the directory the compiler runs in")
+            }
+        }
+        id = id + 1
+    }
+}
+
 pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
     check_file_exists(file_path)
     reset_compiler_state()
@@ -86,6 +107,8 @@ pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokeniz
         inject_prelude(src_root, imported_programs)
     }
     build_reexport_map(imported_programs)
+
+    check_embed_targets()
 
     let cycle_path = detect_package_cycles()
     if cycle_path != "" {
