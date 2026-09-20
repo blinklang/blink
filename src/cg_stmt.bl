@@ -1677,8 +1677,14 @@ fn tid_is_tagged(tid: Int) -> Bool {
     tid_is_carrier(tid) || tc_tid_kind(tid) == TyKind.Enum
 }
 
+// Whether `discriminant` below can actually produce a value for this tid. This must name
+// exactly the same three cases that function does: naming only the type's kind here (as
+// `tid_is_tagged` does) would call a tid switchable that `discriminant` then refuses --
+// a single-variant type with a real payload is an Enum by kind and one undecorated word by
+// shape, so it carries no tag member and is never payload-less either.
 fn tid_is_discriminable(tid: Int) -> Bool {
-    tid_is_ordinal(tid) || tid_is_tagged(tid)
+    tid_is_ordinal(tid) || tid_holds_tag_member(tid) ||
+        (tc_tid_kind(tid) == TyKind.Enum && !tc_enum_has_payload(tid))
 }
 
 fn tid_is_ordinal(tid: Int) -> Bool {
@@ -1784,6 +1790,10 @@ fn pattern_is_irrefutable(pat: Int, tid: Int) -> Bool ! Diag.Report {
         NodeKind.TuplePattern => elements_are_irrefutable(node_elements(pat))
         NodeKind.StructPattern => fields_are_irrefutable(node_fields(pat))
         NodeKind.AsPattern => pattern_is_irrefutable(node_pattern(pat), tid)
+        // A variant pattern refuses only by naming a variant the value might not hold, or
+        // by a payload that itself refuses. A type with one variant has no other tag to
+        // miss, so the variant name never refuses; only its payload still can.
+        NodeKind.EnumPattern => variant_count(tid) == 1 && payload_is_irrefutable(pat)
         _ => false
     }
 }
@@ -1929,8 +1939,20 @@ fn payload_binds(ctx: MatchCtx, pat: Int, out: List[Int]) -> Bool ! Diag.Report 
     if flds == -1 || sublist_length(flds) == 0 { return true }
     let vname = pattern_variant_name(pat)
     if tid_is_carrier(ctx.tid) { return carrier_payload_bind(ctx, vname, flds, out) }
+    if ctx.rec.is_transparent != 0 { return newtype_payload_bind(ctx, flds, out) }
     if node_int_val(pat) == 1 { return field_pattern_binds(ctx, pat, "{c_enum_payload_member()}.{vname}", out) }
     positional_payload_binds(ctx, pat, vname, flds, out)
+}
+
+// A transparent newtype's one field is the whole word the scrutinee already is, so the
+// payload read is that same word cast to the field's own type rather than a member of a
+// `.data` union no transparent newtype's C shape has.
+fn newtype_payload_bind(ctx: MatchCtx, flds: Int, out: List[Int]) -> Bool ! Diag.Report {
+    let sub = sublist_get(flds, 0)
+    let tid = stmt_tid(sub)
+    if tid < 0 { return !sub_pattern_declares(sub) }
+    let rec = layout_at(tid, Position.Local, sub)
+    bind_slot(sub, ir_cast(tid, sub, rec.c_spelling, scrut_ref(ctx, sub)), out)
 }
 
 fn carrier_payload_bind(ctx: MatchCtx, vname: Str, flds: Int, out: List[Int]) -> Bool ! Diag.Report {
