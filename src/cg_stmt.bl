@@ -834,24 +834,29 @@ fn bind_sub_pattern(sub: Int, tid: Int, value: Int, rec: LayoutRecord, out: List
 
 fn lower_assign(node: Int) -> Int ! Diag.Report {
     let target = node_target(node)
-    if !is_local_place(target) {
+    if !is_assignable_place(target) {
         diag_ice_stage_not_built("an assignment to a place that is not a local", node)
         return ir_expr_stmt(node, poison_value(node))
     }
     ir_assign(node, lower_target(target), lower_value(node_value(node)))
 }
 
-// Whether a target is a name this module bound itself. Anything else is a place the
-// expression stage builds, and it has no lvalue producer yet.
-fn is_local_place(node: Int) -> Bool ! Diag.Report {
-    if nk_of(node_kind(node)) != NodeKind.Ident { return false }
-    tid_of_binder(cur_scope(), node_name(node)) >= 0
+// Whether a target is a place this stage can build an lvalue for: a bare local this module
+// bound itself, or a field reached off one. Anything else -- an index expression, a place
+// behind a pointer -- is a place the expression stage builds that has no lvalue producer yet.
+fn is_assignable_place(node: Int) -> Bool ! Diag.Report {
+    let kind = nk_of(node_kind(node))
+    if kind == NodeKind.Ident { return tid_of_binder(cur_scope(), node_name(node)) >= 0 }
+    kind == NodeKind.FieldAccess
 }
 
 // The left side of an assignment must be an lvalue. A bare local is one this module bound
-// itself, so it is read straight from the binder scope; anything else is a place the
-// expression stage builds.
+// itself, so it is read straight from the binder scope. A field access reuses the
+// expression stage's own reader: `lower_expr` already builds a FieldGet for it, and
+// `is_lvalue_kind` in ir.bl already accepts a FieldGet as an Assign target, so this is not
+// a new node shape, only a new place lower_target reaches it from.
 fn lower_target(node: Int) -> Int ! Diag.Report {
+    if nk_of(node_kind(node)) == NodeKind.FieldAccess { return lower_value(node) }
     let name = node_name(node)
     let tid = tid_of_binder(cur_scope(), name)
     if tid < 0 {
@@ -867,7 +872,7 @@ fn lower_target(node: Int) -> Int ! Diag.Report {
 // place inline on its own.
 fn lower_compound_assign(node: Int) -> Int ! Diag.Report {
     let target = node_target(node)
-    if !is_local_place(target) {
+    if !is_assignable_place(target) {
         diag_ice_stage_not_built("an assignment to a place that is not a local", node)
         return ir_expr_stmt(node, poison_value(node))
     }
