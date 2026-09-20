@@ -43,7 +43,7 @@ import diagnostics.{
     CODEGEN_STAGE_NOT_BUILT, UNHANDLED_ITERABLE_AT_CODEGEN, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 import cg_expr.{
-    cg_expr_drain_pending, cg_expr_pending_count, cg_expr_push_pending,
+    cg_expr_drain_pending, cg_expr_is_registered, cg_expr_pending_count, cg_expr_push_pending,
     cg_expr_register_value, cg_expr_set_return_type, cg_expr_take_pending, lower_expr,
     x_layout_checked, x_stopped,
 }
@@ -725,6 +725,21 @@ fn lower_debug_assert_call(node: Int) -> Int ! Diag.Report {
 
 // ── Simple statements ─────────────────────────────────────────────────────
 
+// A unit-typed initialiser carries the one value of `()` but hands back nothing to assign,
+// because a `()`-returning function is emitted as C `void` while storage spells unit as an
+// integer. So the initialiser runs as a statement and the name is given the single value
+// directly. Reading it as an expression instead would assign a void result, which no C
+// compiler accepts.
+fn bind_unit_let(node: Int, tid: Int, init: Int, rec: LayoutRecord, name: Str) -> Int ! Diag.Report {
+    let ran = lower_stmt_tail(init, TAIL_DISCARD, "", -1)
+    if ran < 0 { return -1 }
+    cg_expr_push_pending(node, ran)
+    let unit = int_const(node, "0")
+    if unit < 0 { return -1 }
+    bind_binder_mut(cur_scope(), name, tid, node_is_mut(node) == 1)
+    ir_let(tid, node, rec.c_spelling, cg_local_c_name(name), rec.slot_form, unit)
+}
+
 fn lower_let(node: Int) -> Int ! Diag.Report {
     if node_elements(node) != -1 { return lower_destructuring_let(node) }
     let tid = stmt_tid(node)
@@ -736,6 +751,9 @@ fn lower_let(node: Int) -> Int ! Diag.Report {
     if init < 0 {
         bind_binder_mut(cur_scope(), name, tid, node_is_mut(node) == 1)
         return ir_let(tid, node, rec.c_spelling, cg_local_c_name(name), rec.slot_form, -1)
+    }
+    if tc_tid_kind(tid) == TyKind.Void {
+        if !cg_expr_is_registered(init) { return bind_unit_let(node, tid, init, rec, name) }
     }
     // The initializer is lowered before the name binds, so `let x = x + 1` reads the
     // outer `x` the source names rather than the one this statement is declaring.
