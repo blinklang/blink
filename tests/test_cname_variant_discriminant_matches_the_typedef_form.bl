@@ -1,0 +1,102 @@
+// A variant's discriminant is a C name, and which C name it is depends on two facts the
+// caller does not hold. A payload-less enum is emitted as a plain C enum, so its variants
+// are enumerators and no `_TAG` macro is ever declared beside them; a payload enum is
+// emitted as a tagged union, which declares the macro instead. And a generic enum's tags
+// belong to the instance, because two instances declare two typedefs. Five sites named a
+// discriminant and none of them asked both questions, so each could spell a name the
+// typedef never declared. This pins the one producer that asks both.
+
+import typecheck.{tc_enum_has_payload}
+import parser.{node_fields, node_name, sublist_get, sublist_length}
+import cname.{c_variant_discriminant, c_decl_for_tid}
+import cname_test_helpers.{assert_eq_str, compile_probe, tid_of}
+import std.io
+
+fn probe_src() -> Str {
+    #"type Color {
+    Red
+    Green
+}
+type Shape {
+    Circle(r: Int)
+    Rect(w: Int, h: Int)
+}
+type Status {
+    Idle
+    Busy(n: Int)
+}
+type Tree[T] {
+    Leaf
+    Node(v: T)
+}
+fn depth(t: Tree[Int]) -> Int { 0 }
+fn main() {
+    let c: Color = Color.Green
+    let s: Shape = Shape.Circle(1)
+    let st: Status = Status.Idle
+    let t: Tree[Int] = Tree.Node(1)
+    let _d = depth(t)
+    match c {
+        Color.Red => assert(true)
+        Color.Green => assert(true)
+    }
+}
+"#
+}
+
+fn load() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("cname_variant_discriminant", probe_src())
+}
+
+fn variant_of(tid: Int, name: Str) -> Int {
+    let decl = c_decl_for_tid(tid)
+    let vs = node_fields(decl)
+    if vs != -1 {
+        let mut i = 0
+        while i < sublist_length(vs) {
+            let v = sublist_get(vs, i)
+            if node_name(v) == name { return v }
+            i = i + 1
+        }
+    }
+    io.println("FAIL: probe enum has no variant '{name}'")
+    assert(false)
+    -1
+}
+
+fn discriminant(m: Map[Str, Int], owner: Str, variant: Str) -> Str {
+    let tid = tid_of(m, owner)
+    c_variant_discriminant(tid, variant_of(tid, variant))
+}
+
+test "a payload-less enum's variant is the enumerator its typedef declares" {
+    let m = load()
+    assert_eq_str("Color.Red", discriminant(m, "Color", "Red"), "blink_Color_Red")
+    assert_eq_str("Color.Green", discriminant(m, "Color", "Green"), "blink_Color_Green")
+}
+
+test "a payload enum's variant is the tag macro its typedef declares" {
+    let m = load()
+    assert_eq_str("Shape.Circle", discriminant(m, "Shape", "Circle"), "blink_Shape_Circle_TAG")
+    assert_eq_str("Shape.Rect", discriminant(m, "Shape", "Rect"), "blink_Shape_Rect_TAG")
+}
+
+test "one payload variant makes the whole enum tagged, so its bare variant is tagged too" {
+    let m = load()
+    assert_eq_str("Status.Idle", discriminant(m, "Status", "Idle"), "blink_Status_Idle_TAG")
+    assert_eq_str("Status.Busy", discriminant(m, "Status", "Busy"), "blink_Status_Busy_TAG")
+}
+
+test "a generic enum's variant is named from the instance, not from the declaration" {
+    let m = load()
+    assert_eq_str("Tree[Int].Node", discriminant(m, "Tree[Int]", "Node"), "blink_Tree_0Int_Node_TAG")
+    assert_eq_str("Tree[Int].Leaf", discriminant(m, "Tree[Int]", "Leaf"), "blink_Tree_0Int_Leaf_TAG")
+}
+
+test "the payload question is asked of the enum, not of the variant" {
+    let m = load()
+    assert(!tc_enum_has_payload(tid_of(m, "Color")))
+    assert(tc_enum_has_payload(tid_of(m, "Shape")))
+    assert(tc_enum_has_payload(tid_of(m, "Status")))
+    assert(tc_enum_has_payload(tid_of(m, "Tree[Int]")))
+}
