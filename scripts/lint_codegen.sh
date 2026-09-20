@@ -84,8 +84,7 @@ c_impl_method_name cname
 c_impl_method_name_q cname
 c_display_dispatch_name cname
 c_derive_method_name cname
-c_variant_tag_macro cname
-c_mono_variant_tag_macro cname
+c_variant_discriminant cname
 c_vtable_type_name cname
 c_kops_table_name cname
 td_guard_name cname
