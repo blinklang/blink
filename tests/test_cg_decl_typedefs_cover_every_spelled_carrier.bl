@@ -13,11 +13,13 @@
 
 import std.fs
 import std.io
-import layout.{layout_reset}
+import layout.{layout_reset, ensure_typedef_for, layout_take_typedefs}
 import cg_print.{print_reset, print_take}
 import cg_reg.{cg_reg_reset, cg_reg_build}
 import cg_decl.{cg_decl_reset, cg_decl_emit_typedefs}
 import cg_test_helpers.{cg_probe_compile}
+import typecheck.{TyKind, tc_lookup_node_tid, tc_resolve, tc_tid_kind}
+import parser.{node_count}
 
 fn assert_has(text: Str, needle: Str) {
     let i = text.index_of(needle)
@@ -90,4 +92,42 @@ test "the struct a spelled carrier names is emitted before the carrier" {
         io.println("FAIL: Point at {leaf} must come before Option_Point at {outer}")
     }
     assert(leaf >= 0 && outer >= 0 && leaf < outer)
+}
+
+// cg_stmt asks for a carrier typedef in eight places and nothing drains what those calls
+// build. That is only safe if they build nothing, so the sweep above must have left
+// layout's guard holding every carrier the program spells. Asking a second time for all of
+// them must produce no blocks at all; a block produced here is a block that reaches no
+// output, which is the bug this slice removes rather than a copy of it.
+fn blocks_built_by_a_second_ask() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/cg_decl_spelled_carrier_idem_src.bl"
+    let program = cg_probe_compile(path, probe_src())
+    layout_reset()
+    let _ = fs.delete(path)
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    cg_decl_emit_typedefs()
+    let _ = print_take()
+    let mut n = 0
+    let mut built = 0
+    while n < node_count() {
+        let tid = tc_lookup_node_tid(n)
+        if tid >= 0 {
+            let k = tc_tid_kind(tc_resolve(tid))
+            if k == TyKind.Option || k == TyKind.Result || k == TyKind.Tuple {
+                let _ = ensure_typedef_for(tid)
+                built = built + layout_take_typedefs().len()
+            }
+        }
+        n = n + 1
+    }
+    built
+}
+
+test "asking a second time for every carrier the program spells builds nothing" {
+    let built = blocks_built_by_a_second_ask()
+    if built != 0 { io.println("FAIL: a second ask built {built} blocks that nothing drains") }
+    assert(built == 0)
 }
