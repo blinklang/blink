@@ -318,15 +318,73 @@ fn main() {
 "#
 }
 
-test.failing(
-    "a module-private function is internal to the unit and a pub one is not",
-    reason: "the linkage rule spelled every module-private function static, including the stdlib functions the archive header declares extern, so it was withdrawn until it keys on where the body is emitted",
-    ticket: "cmrx3c",
-) {
+test "a module-private function is internal to the unit and a pub one is not" {
     let program = build_probe(linkage_src(), "cg_def_linkage_probe")
     let text = generate(program, standalone_cfg())
     assert_has(text, "static void blink_u_hidden(void);")
     assert_has(text, "static void blink_u_hidden(void) \{")
     assert_lacks(text, "static void blink_u_shared")
     assert_lacks(text, "static void blink_main")
+}
+
+// A unit linked against the stdlib archive declares the archive's module-private
+// functions and defines none of them. The archive's own header declares those names with
+// external linkage, so a prototype here that spelled one static is a second declaration C
+// rejects outright, and the program stops compiling. The unit's own private functions are
+// unaffected: this unit writes their bodies.
+fn archive_linked_src() -> Str {
+    #"import std.path.{path_join}
+
+fn hidden_here() -> Int {
+    7
+}
+
+fn main() {
+    let p = path_join("a", "b")
+    let n = hidden_here()
+}
+"#
+}
+
+fn archive_linked_cfg() -> CgConfig {
+    let mut skipped: Map[Str, Int] = Map()
+    skipped.insert("std_path", 1)
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: skipped, user_tu_mode: 1, blink_ev_extern_only: 1, archive_build_mode: 0 }
+}
+
+test "a function the archive defines is declared with external linkage" {
+    let program = build_probe(archive_linked_src(), "cg_def_archive_linkage_probe")
+    let text = generate(program, archive_linked_cfg())
+    assert_has(text, "blink_std_path_find_last_slash(")
+    assert_lacks(text, "static int64_t blink_std_path_find_last_slash")
+    assert_has(text, "static int64_t blink_u_hidden_here(void) \{")
+}
+
+
+// An impl method is written twice: a prototype on the declaration walk and the body on
+// the definition walk. Both halves must read the same linkage rule, or C sees a static
+// definition of a name it already declared external and rejects the file. The method here
+// is not pub and the unit is a whole program, so both halves must say static.
+fn impl_method_src() -> Str {
+    #"type Celsius { deg: Int }
+
+impl From[Int] for Celsius {
+    fn from(n: Int) -> Self {
+        Celsius { deg: n }
+    }
+}
+
+fn main() {
+    let c = Celsius.from(20)
+    let d = c.deg
+}
+"#
+}
+
+test "an impl method declares and defines itself with one linkage" {
+    let program = build_probe(impl_method_src(), "cg_def_impl_linkage_probe")
+    let text = generate(program, standalone_cfg())
+    assert_has(text, "static blink_Celsius blink_Celsius_from_Int(")
+    assert_lacks(text, "\nblink_Celsius blink_Celsius_from_Int(")
 }

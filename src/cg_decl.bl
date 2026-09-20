@@ -37,7 +37,8 @@ import cg_print.{
 }
 import cg_reg.{
     cg_reg_effect_decls, cg_reg_entry_point, cg_reg_fn_decls, cg_reg_global_decls,
-    cg_reg_impl_methods, cg_reg_impl_of, cg_reg_tid_for_decl, cg_reg_type_decls,
+    cg_reg_impl_methods, cg_reg_impl_of, cg_reg_module_of, cg_reg_tid_for_decl,
+    cg_reg_type_decls,
 }
 import ir.{
     ir_assign, ir_block, ir_call_direct, ir_call_runtime, ir_c_name, ir_cast, ir_const,
@@ -54,8 +55,8 @@ import typecheck.{
 }
 import parser.{
     get_annotation, node_count, node_effects, node_elements, node_fields, node_impl_binders,
-    node_methods, node_name, node_params, node_trait_name, node_type_ann, node_type_params,
-    node_value, sublist_get, sublist_length,
+    node_is_pub, node_methods, node_name, node_params, node_trait_name, node_type_ann,
+    node_type_params, node_value, sublist_get, sublist_length,
 }
 
 // 1 while a type's dependencies are being emitted, 2 once its typedef is written. The key
@@ -68,9 +69,20 @@ let mut typedef_state: Map[Str, Int] = Map()
 // ask for the same prototype or one of them is wrong.
 let mut foreign_decls: Map[Str, Str] = Map()
 
+// What kind of unit this is, as the prologue was told it. Linkage reads all three: a
+// name another file can see is not this unit's to keep. The values before a prologue are
+// the ones that keep every declaration external, so a caller that emits no prologue
+// cannot make a symbol private by omission.
+let mut unit_declares_for_others: Bool = true
+let mut unit_links_archive: Bool = false
+let mut unit_is_the_archive: Bool = false
+
 pub fn cg_decl_reset() {
     typedef_state = Map()
     foreign_decls = Map()
+    unit_declares_for_others = true
+    unit_links_archive = false
+    unit_is_the_archive = false
 }
 
 // ── The spelling gate ─────────────────────────────────────────────────────
@@ -404,12 +416,49 @@ pub fn cg_decl_c_name(decl: Int) -> Str {
     c_fn_decl_name(decl)
 }
 
+// The module key of the file a program is built from. Nothing imports it, so a name it
+// declares is reachable from no other unit.
+let entry_module = "__main__"
+
+// Whether C should be told this function belongs to this translation unit alone. Only a
+// function this unit both declares and defines, and that nothing outside it can name,
+// qualifies: C reads a prototype and a definition that disagree on linkage as two
+// different functions and rejects the unit, and a name another unit calls but this one
+// keeps private fails at link instead.
+//
+// So four unit shapes answer no whatever the declaration says. A header is read by every
+// unit that includes it, and a unit whose own declarations come from such a header has
+// its prototype in a file this one does not own, so neither may narrow a name. A unit
+// linked against the stdlib archive declares the archive's own private functions and
+// defines none of them, so only the program's own module is this unit's to keep -- that
+// is the shape this rule was withdrawn over once already. And the archive itself is
+// linked against by every program built after it, so nothing compiled into it is private.
+//
+// A pub function is named from outside, the entry point is the program's, and an @ffi
+// binding wraps a name the C library owns, so those three keep external linkage too.
+//
+// One reader, so the prototype and the body cannot answer it apart.
+fn cg_decl_fn_is_internal(fn_node: Int) -> Bool {
+    if unit_declares_for_others || unit_is_the_archive { return false }
+    if unit_links_archive && cg_reg_module_of(fn_node) != entry_module { return false }
+    if node_is_pub(fn_node) == 1 { return false }
+    if fn_node == cg_reg_entry_point() { return false }
+    if c_ffi_symbol(fn_node) != "" { return false }
+    match cg_decl_body_site(fn_node) {
+        BodySite.ThisUnit => true
+        BodySite.PerInstance => false
+        BodySite.ForeignWrapper => false
+        BodySite.Nothing => false
+    }
+}
+
+
 // A carrier type has no declaration of its own, so the only thing that asks for it is
 // the signature that names it. Spelling it records its typedef, which must be written
 // before the declaration that reads it, so the spellings are taken first.
 pub fn cg_decl_emit_fn_decl(fn_node: Int, is_static: Bool) ! Diag.Report {
     if !site_is_declared(cg_decl_body_site(fn_node)) { return }
-    cg_decl_emit_signature_decl(fn_node, cg_decl_c_name(fn_node), is_static)
+    cg_decl_emit_signature_decl(fn_node, cg_decl_c_name(fn_node), is_static || cg_decl_fn_is_internal(fn_node))
 }
 
 // A signature under a name the caller chose. The spellings come from the declaration's
@@ -447,10 +496,12 @@ fn impl_is_generic(im: Int) -> Bool {
     binders != -1 && sublist_length(binders) > 0
 }
 
+// The same linkage rule the body half reads. A method is written twice, once here and
+// once as a definition, and C rejects a file whose two halves disagree.
 pub fn cg_decl_emit_impl_method_decl(method: Int, is_static: Bool) ! Diag.Report {
     if cg_reg_impl_of(method) < 0 { return }
     if !site_is_declared(cg_decl_body_site(method)) { return }
-    cg_decl_emit_signature_decl(method, cg_decl_c_name(method), is_static)
+    cg_decl_emit_signature_decl(method, cg_decl_c_name(method), is_static || cg_decl_fn_is_internal(method))
     emit_display_dispatch_decl(method, is_static)
 }
 
@@ -637,7 +688,7 @@ fn site_is_declared(site: BodySite) -> Bool {
 }
 
 pub fn cg_decl_emit_fn_def(fn_node: Int, is_static: Bool, body: Int) ! Diag.Report {
-    cg_decl_emit_signature_def(fn_node, cg_decl_c_name(fn_node), is_static, body)
+    cg_decl_emit_signature_def(fn_node, cg_decl_c_name(fn_node), is_static || cg_decl_fn_is_internal(fn_node), body)
     emit_display_dispatch_def(fn_node, is_static)
 }
 
@@ -849,6 +900,9 @@ pub fn cg_decl_has_deferred_global(globals: List[Int], inits: Map[Int, Int]) -> 
 // ── Prologue and evidence vector ─────────────────────────────────────────────
 
 pub fn cg_decl_emit_prologue(user_tu: Bool, define_storage: Bool, test_build: Bool, header_guard: Str, self_header: Str) {
+    unit_declares_for_others = header_guard != "" || self_header != ""
+    unit_links_archive = user_tu
+    unit_is_the_archive = define_storage
     print_prologue(user_tu, define_storage, test_build, header_guard, self_header)
 }
 
