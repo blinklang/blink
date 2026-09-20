@@ -1,0 +1,126 @@
+// A consumer that wants a discriminant has two shapes to choose between: read a member, or
+// take the value itself. Which one applies is a fact about the C shape of a tid, so layout
+// answers it. Every stage that chose by kind instead wrote `.tag` against one machine word.
+import std.fs
+import std.io
+import typecheck.{tc_type_str, tc_lookup_node_tid, check_types}
+import layout.{layout_reset, tid_holds_tag_member}
+import parser.{nodes, node_kind, node_name, node_source_module}
+import compiler.{compile_to_program}
+import ast.{NodeKind, nk_of}
+import cname.{cname_mark_transparent_newtype}
+
+fn assert_holds(label: Str, tid: Int, want: Bool) {
+    let got = tid_holds_tag_member(tid)
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+// The transparent-newtype mark is scoped to lib/std, so a probe that declares its own
+// newtype sets the mark by hand to reach the shape under test.
+fn mark_probe_errno() {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.TypeDef && node_name(i) == "Errno" && node_source_module(i) == "__main__" {
+            cname_mark_transparent_newtype(i)
+        }
+        i = i + 1
+    }
+}
+
+fn probe_src() -> Str {
+    #"type Point { x: Int, y: Int }
+type Color { Red, Green }
+type Shape { Circle { r: Int }, Square { w: Int, h: Int } }
+type Errno { Errno(Int) }
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn use_cf(c: Option[CFile]) -> Int { 1 }
+fn main() {
+    let i: Int = 7
+    let s: Str = "s"
+    let l: List[Int] = []
+    let o: Option[Int] = None
+    let op: Option[Point] = None
+    let r: Result[Int, Str] = Ok(1)
+    let t: (Int, Str) = (1, "a")
+    let p: Point = Point { x: 1, y: 2 }
+    let col: Color = Color.Red
+    let sh: Shape = Shape.Circle { r: 1 }
+    let e: Errno = Errno(3)
+    assert(i == 7)
+}
+"#
+}
+
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/layout_tag_member_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    mark_probe_errno()
+    let _ = fs.delete(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 { m.insert(tc_type_str(tid), tid) }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 { io.println("FAIL: harvested map has no tid for rendered type string '{key}'") }
+    assert(tid != -1)
+    tid
+}
+
+// A carrier over a value wider than a word is a struct of a tag beside its payload, so the
+// discriminant is a member read.
+test "a carrier over a boxed or by-value inner holds its discriminant in a member" {
+    let m = harvest_type_tids()
+    assert_holds("Option[Int]", expect_tid(m, "Option[Int]"), true)
+    assert_holds("Option[Point]", expect_tid(m, "Option[Point]"), true)
+    assert_holds("Result[Int, Str]", expect_tid(m, "Result[Int, Str]"), true)
+}
+
+// An enum with a data-carrying variant is a tag beside the union the tag selects.
+test "a data enum holds its discriminant in a member" {
+    let m = harvest_type_tids()
+    assert_holds("Shape", expect_tid(m, "Shape"), true)
+}
+
+// An enum whose every variant carries nothing is one ordinal word. The value IS the
+// discriminant, so a consumer that reads a member reads a member C never declared.
+test "a payload-less enum is its own discriminant and holds no member" {
+    let m = harvest_type_tids()
+    assert_holds("Color", expect_tid(m, "Color"), false)
+}
+
+// A transparent newtype is spelled as the value it wraps. Nothing wraps it at runtime, so
+// there is no tag beside it either.
+test "a transparent newtype holds no discriminant member" {
+    let m = harvest_type_tids()
+    assert_holds("Errno", expect_tid(m, "Errno"), false)
+}
+
+// An Option over an opaque handle is the payload pointer itself, with null standing for
+// None. It is a carrier by kind and one word by shape, and shape decides.
+test "an Option over an opaque handle holds no discriminant member" {
+    let m = harvest_type_tids()
+    assert_holds("Option[CFile]", expect_tid(m, "Option[CFile]"), false)
+}
+
+// Nothing outside a carrier or an enum carries a discriminant at all, whatever its width.
+test "a struct, a tuple, a list and a scalar hold no discriminant member" {
+    let m = harvest_type_tids()
+    assert_holds("Int", expect_tid(m, "Int"), false)
+    assert_holds("Str", expect_tid(m, "Str"), false)
+    assert_holds("Point", expect_tid(m, "Point"), false)
+    assert_holds("(Int, Str)", expect_tid(m, "(Int, Str)"), false)
+    assert_holds("List[Int]", expect_tid(m, "List[Int]"), false)
+}
