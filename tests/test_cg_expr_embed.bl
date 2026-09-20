@@ -1,0 +1,54 @@
+// `#embed` is a compile-time file read. The bytes become one string constant, so nothing
+// about the file survives into the generated program: no array declaration, no runtime
+// read, no name for a later stage to declare.
+//
+// Two things about it are easy to get wrong and are pinned here. The path is written
+// relative to the source file that holds the `#embed`, not to the directory the compiler
+// runs in, because the stdlib registry writes every one of its paths that way. And a path
+// that names no file is the author's mistake, so it is an error the author can act on, not
+// an internal one.
+
+import lower_test_helpers.{probe, rhs_of, assert_kind, assert_eq_str, assert_refused_saying, assert_verifies}
+import ir.{IrKind, ir_c_name, ir_c_spelling}
+import cg_expr.{lower_expr}
+
+let data_path = "../tests/test_embed_data.txt"
+
+fn src() -> Str {
+    "fn main() \{\n    let text = #embed(\"{data_path}\")\n\}\n"
+}
+
+fn sibling_src() -> Str {
+    "fn main() \{\n    let sib = #embed(\"cg_expr_embed_sibling.txt\")\n\}\n"
+}
+
+fn missing_src() -> Str {
+    "fn main() \{\n    let gone = #embed(\"no_such_file_here.txt\")\n\}\n"
+}
+
+test "an embedded file is one string constant holding the file's bytes" {
+    probe("cg_expr_embed", src())
+    let id = lower_expr(rhs_of("text"))
+    assert_kind("kind", id, IrKind.Const)
+    assert_eq_str("type", ir_c_spelling(id), "const char*")
+    assert_eq_str("text", ir_c_name(id), #""Hello from embedded file!\nLine 2 with \"quotes\" and {braces}.\n""#)
+    assert_verifies("verify", id)
+}
+
+test "the path is read relative to the file holding the #embed, not the process directory" {
+    write_file("build/cg_expr_embed_sibling.txt", "sibling\n")
+    probe("cg_expr_embed_sibling", sibling_src())
+    let id = lower_expr(rhs_of("sib"))
+    assert_kind("kind", id, IrKind.Const)
+    assert_eq_str("text", ir_c_name(id), #""sibling\n""#)
+}
+
+test "a path that names no file is an author error, not an internal one" {
+    probe("cg_expr_embed_missing", missing_src())
+    let id = lower_expr(rhs_of("gone"))
+    if id >= 0 {
+        io.println("FAIL: lowering answered {id} for a file that does not exist")
+    }
+    assert(id < 0)
+    assert_refused_saying("error", "no_such_file_here.txt", 1)
+}
