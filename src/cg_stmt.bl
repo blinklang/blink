@@ -28,8 +28,9 @@ import layout.{
 }
 import cname.{
     c_assert_fail_eq_name, c_assert_fail_intro_name, c_assert_fail_name,
-    c_debug_assert_fail_name, c_decl_for_tid, c_enum_payload_member, c_local_name,
-    c_mint_local, c_mono_variant_tag_macro, c_runtime_helper, c_string_literal,
+    c_debug_assert_fail_name, c_decl_for_tid, c_enum_payload_member, c_field_name,
+    c_local_name, c_mint_local, c_mono_variant_tag_macro, c_runtime_helper,
+    c_string_literal,
 }
 import ir.{
     IrKind, ir_assign, ir_binary, ir_block, ir_break, ir_call_runtime, ir_carrier_tag,
@@ -1819,7 +1820,7 @@ fn payload_binds(ctx: MatchCtx, pat: Int, out: List[Int]) -> Bool ! Diag.Report 
     let vname = pattern_variant_name(pat)
     if tid_is_carrier(ctx.tid) { return carrier_payload_bind(ctx, vname, flds, out) }
     if node_int_val(pat) == 1 { return field_pattern_binds(ctx, pat, "{c_enum_payload_member()}.{vname}", out) }
-    positional_payload_binds(ctx, vname, flds, out)
+    positional_payload_binds(ctx, pat, vname, flds, out)
 }
 
 fn carrier_payload_bind(ctx: MatchCtx, vname: Str, flds: Int, out: List[Int]) -> Bool ! Diag.Report {
@@ -1838,9 +1839,15 @@ fn carrier_member(vname: Str) -> Str {
     STMT_CARRIER_VALUE
 }
 
-// A positional payload field is named `_0`, `_1` … by the declaration, so the reader
-// spells the same path the type's emitter laid out.
-fn positional_payload_binds(ctx: MatchCtx, vname: Str, flds: Int, out: List[Int]) -> Bool ! Diag.Report {
+// The member name comes from the declaration's own field node, named or synthesized,
+// because that is what the type's emitter laid out.
+fn positional_payload_binds(ctx: MatchCtx, pat: Int, vname: Str, flds: Int, out: List[Int]) -> Bool ! Diag.Report {
+    let vnode = find_variant(c_decl_for_tid(ctx.tid), vname)
+    if vnode < 0 {
+        let _ = unknown_variant(ctx, pat, vname)
+        return false
+    }
+    let decl_flds = node_fields(vnode)
     let mut i = 0
     while i < sublist_length(flds) {
         let sub = sublist_get(flds, i)
@@ -1848,8 +1855,12 @@ fn positional_payload_binds(ctx: MatchCtx, vname: Str, flds: Int, out: List[Int]
         if tid < 0 {
             if sub_pattern_declares(sub) { return false }
         } else {
+            if decl_flds == -1 || i >= sublist_length(decl_flds) {
+                return payload_field_count_mismatch(sub, ctx.tid, vname)
+            }
+            let member = c_field_name(node_name(sublist_get(decl_flds, i)))
             let rec = layout_at(tid, Position.Local, sub)
-            let path = "{c_enum_payload_member()}.{vname}.{tuple_member(i)}"
+            let path = "{c_enum_payload_member()}.{vname}.{member}"
             let read = ir_field_get(tid, sub, rec.c_spelling, path, rec.slot_form,
                 scrut_ref(ctx, sub))
             if !bind_slot(sub, read, out) { return false }
@@ -1857,6 +1868,15 @@ fn positional_payload_binds(ctx: MatchCtx, vname: Str, flds: Int, out: List[Int]
         i = i + 1
     }
     true
+}
+
+// A pattern names more positional slots than the variant declares fields for. Typecheck
+// checks a pattern's arity against its variant's before codegen runs.
+fn payload_field_count_mismatch(pat: Int, tid: Int, vname: Str) -> Bool ! Diag.Report {
+    diag_ice_at("PayloadFieldCountMismatch", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "variant {vname} of type {tid} has fewer fields than this pattern names", pat,
+        "a pattern's arity is checked against its variant's before codegen runs")
+    false
 }
 
 // Struct-shaped fields, either of a struct pattern (no prefix) or of a struct-shaped
