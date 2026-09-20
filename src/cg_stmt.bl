@@ -998,8 +998,10 @@ fn mv_expr(e: Int) -> Bool ! Diag.Report {
         NodeKind.ListLit => mv_list(node_elements(e))
         NodeKind.RangeLit => mv_pair(node_start(e), node_end(e))
         NodeKind.NamedArg => mv_expr(node_value(e))
-        NodeKind.IfExpr => materialise_value_expr(e, node_condition(e))
-        NodeKind.MatchExpr => materialise_value_expr(e, node_scrutinee(e))
+        NodeKind.IfExpr => materialise_value_expr(e)
+        NodeKind.MatchExpr => materialise_value_expr(e)
+        NodeKind.Block => materialise_value_expr(e)
+        NodeKind.WithBlock => materialise_value_expr(e)
         NodeKind.BinOp => mv_binop(e)
         // `?` returns out of the function on its failure arm, and an operator on a type
         // that carries an impl is a call into it.
@@ -1018,6 +1020,35 @@ fn mv_expr(e: Int) -> Bool ! Diag.Report {
         NodeKind.MethodCall => mv_after(mv_expr(node_obj(e)) && mv_list(node_args(e)))
         _ => mv_moves_work()
     }
+}
+
+// The part of a value-position expression that lowers ahead of the statements that fill
+// the temp: an `if` reads its condition there, a `match` its scrutinee, a `with` the
+// resources it opens. A bare block has none, because every statement it holds stands under
+// the temp already.
+fn mv_head(node: Int) -> Bool ! Diag.Report {
+    match nk_of(node_kind(node)) {
+        NodeKind.IfExpr => mv_expr(node_condition(node))
+        NodeKind.MatchExpr => mv_expr(node_scrutinee(node))
+        NodeKind.WithBlock => mv_with_items(node)
+        _ => true
+    }
+}
+
+// Only a resource item carries an expression. An arena item is a bare name and a handler
+// item is its own shape, and neither holds a value this walk could move.
+fn mv_with_items(node: Int) -> Bool ! Diag.Report {
+    let items = node_handlers(node)
+    if items == -1 { return true }
+    let mut i = 0
+    while i < sublist_length(items) {
+        let item = sublist_get(items, i)
+        if nk_of(node_kind(item)) == NodeKind.WithResource {
+            if !mv_expr(node_value(item)) { return false }
+        }
+        i = i + 1
+    }
+    true
 }
 
 // A part whose own work runs after the parts inside it.
@@ -1050,14 +1081,14 @@ fn mv_binop(e: Int) -> Bool ! Diag.Report {
 // inside the `if` the temp stands under, so it keeps its place ahead of the arms whatever
 // work it holds. Walking it materialises a value-position `if` in a condition or a
 // scrutinee into a temp of its own above this one.
-fn materialise_value_expr(node: Int, head: Int) -> Bool ! Diag.Report {
+fn materialise_value_expr(node: Int) -> Bool ! Diag.Report {
     if !mv_clean {
         diag_ice_at("ValuePositionExprMovesWork", CODEGEN_STAGE_NOT_BUILT,
             "{node_kind_name(node_kind(node))} in value position stands after work its arms would run before", node,
             "materialising this needs the temp declared where the reader is lowered; bind the value in a let above the statement")
         return false
     }
-    if !mv_expr(head) { return false }
+    if !mv_head(node) { return false }
     let tid = stmt_tid(node)
     if tid < 0 { return false }
     if tc_tid_kind(tid) == TyKind.Void {
@@ -1066,9 +1097,9 @@ fn materialise_value_expr(node: Int, head: Int) -> Bool ! Diag.Report {
             "a temp of no type cannot be declared, and the reader wants one; this is a typecheck bug")
         return false
     }
-    if !arms_fill_tail(node) {
+    if !tail_fills(node) {
         diag_ice_at("ValuePositionArmFillsNothing", CODEGEN_STAGE_NOT_BUILT,
-            "an arm of this {node_kind_name(node_kind(node))} in value position neither produces a value nor leaves the block", node,
+            "the tail of this {node_kind_name(node_kind(node))} in value position neither produces a value nor leaves the block", node,
             "every arm must end in a value, a return, a break or a continue; an arm ending in a let or a loop has no lowering yet")
         return false
     }

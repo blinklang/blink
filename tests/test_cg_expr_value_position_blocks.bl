@@ -1,0 +1,153 @@
+// A block and a `with` block written where a value is wanted.
+//
+// Both are statements in C: a block ends in a statement, and a `with` block wraps its body
+// in a scope no C expression can hold. So both reach their reader the same way an `if` in
+// value position does — the statement stage declares a temp, lowers the body's tail into an
+// assignment to it, and names the temp to the expression stage, which answers a read of it.
+//
+// What is pinned here is that one temp carries the value, that the body's own statements
+// stand in front of the reader rather than inside it, and that a body whose tail produces
+// nothing is still one honest report rather than a read of a temp nothing wrote.
+
+import std.io
+import diagnostics.{diag_reset}
+import mono.{run_mono}
+import parser.{nodes, node_body, node_kind, node_name}
+import ast.{NodeKind}
+import layout.{layout_reset}
+import ir.{ir_reset}
+import cg_test_helpers.{cg_probe_compile}
+import cg_stmt.{cg_stmt_reset, lower_block, lower_fn}
+import cg_expr.{cg_expr_reset, cg_expr_pending_count}
+import lower_test_helpers.{assert_eq_str, assert_ice_saying, ice_count, last_ice, shape}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn lowered_program(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/{stem}_probe.bl"
+    let program = cg_probe_compile(path, src)
+    let _rm = process_run("rm", ["-f", path])
+    run_mono(program)
+    layout_reset()
+    ir_reset()
+    cg_expr_reset()
+    cg_stmt_reset()
+    diag_reset()
+    let f = find_fn(name)
+    assert(f >= 0)
+    f
+}
+
+fn probe_fn(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    lower_fn(lowered_program(stem, src, name))
+}
+
+// lower_fn turns a stopped body into an empty block, so a refusal is only visible through
+// the block seam, which answers -1.
+fn probe_body(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    lower_block(node_body(lowered_program(stem, src, name)))
+}
+
+test "a block in value position fills a temp and its reader reads that temp" {
+    let body = probe_fn("cg_expr_value_block", #"fn main() {
+    let n = 1
+    let picked = {
+        let p = 5
+        p + n
+    }
+    let _keep = [picked]
+}
+"#, "main")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let, Block(Let(Const), Assign(VarRef, Binary(VarRef, VarRef))), Let(VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))")
+}
+
+test "the buffer is empty once a block in value position is materialised" {
+    let _body = probe_fn("cg_expr_value_block_empty", #"fn main() {
+    let n = 1
+    let picked = {
+        let p = 5
+        p + n
+    }
+    let _keep = [picked]
+}
+"#, "main")
+    assert_eq_str("statements left", "{cg_expr_pending_count()}", "0")
+}
+
+test "a with-arena block in value position fills a temp from its body's tail" {
+    let body = probe_fn("cg_expr_value_with", #"fn main() {
+    let n = 1
+    let got = with arena {
+        n + 1
+    }
+    let _keep = [got]
+}
+"#, "main")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let, WithScope(Block(Assign(VarRef, Binary(VarRef, Const)))), Let(VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))")
+}
+
+test "a block whose tail produces no value refuses by name" {
+    let body = probe_body("cg_expr_value_block_void", #"fn main() {
+    let picked = {
+        io.println("a")
+    }
+    let _keep = [picked]
+}
+"#, "main")
+    assert_ice_saying("void value block", body, "ValuePositionExprHasNoValue",
+        "in value position produces no value")
+}
+
+// A block's type IS its tail, so a tail that produces nothing gives the block no type at
+// all and the temp cannot be declared. That is the refusal the reader gets, and it arrives
+// before the question of whether the tail fills anything: there is nothing to fill.
+test "a block whose tail binds a name rather than producing a value refuses by name" {
+    let body = probe_body("cg_expr_value_block_unfilled", #"fn main() {
+    let picked = {
+        let p = 5
+    }
+    let _keep = [picked]
+}
+"#, "main")
+    assert_ice_saying("block binds, fills nothing", body, "ValuePositionExprHasNoValue",
+        "in value position produces no value")
+}
+
+// The same for a `with`: its value is its body's tail, so a body that ends in an
+// assignment leaves the binding nothing to hold.
+test "a with block whose body ends in an assignment refuses by name" {
+    let body = probe_body("cg_expr_value_with_void", #"fn main() {
+    let mut acc = 0
+    let got = with arena {
+        acc = acc + 1
+    }
+    let _keep = [got]
+}
+"#, "main")
+    assert_ice_saying("void with", body, "ValuePositionExprHasNoValue",
+        "in value position produces no value")
+}
+
+// A block in the right operand of a short-circuit runs only when the left one decided
+// nothing, so a temp filled in front of the statement would run it every time. The
+// materialiser leaves it, and the expression stage refuses it by name.
+test "a block in the right operand of a short-circuit is left to refuse in the reader" {
+    let body = probe_body("cg_expr_value_block_short_circuit", #"fn main() {
+    let c = 1
+    let held = c > 0 && { let p = 1
+        p > 0 }
+    let _keep = [held]
+}
+"#, "main")
+    assert_eq_str("refusal", last_ice(), "UnmaterialisedValueExpr")
+    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+}
