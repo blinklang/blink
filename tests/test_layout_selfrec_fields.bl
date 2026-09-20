@@ -1,6 +1,6 @@
 import std.fs
 import std.io
-import typecheck.{tc_type_str, tc_lookup_node_tid, check_types, make_enum_instance_type, make_tuple_type, tc_type_decl_nodes}
+import typecheck.{tc_type_str, tc_lookup_node_tid, check_types, make_enum_instance_type, make_struct_instance_type, make_tuple_type}
 import layout.{field_layout_of, layout_of, layout_reset, Position, SlotForm}
 import parser.{nodes}
 import compiler.{compile_to_program}
@@ -20,14 +20,16 @@ fn probe_src() -> Str {
     #"type Tree[T] { Leaf(v: T), Node(l: Tree[T], r: Tree[T]) }
 type Pair[T] { One(v: T), Two(p: (Pair[T], Pair[T])) }
 type LL { Nil, Cons(h: Int, t: LL) }
+type Box[T] { inner: T }
 type Holder { t: Tree[Int], p: Pair[Int], l: LL }
 fn main() {
     let i: Int = 1
     let ll: LL = LL.Nil
     let t: Tree[Int] = Tree.Leaf(1)
     let p: Pair[Int] = Pair.One(2)
+    let bb: Box[Box[Int]] = Box { inner: Box { inner: 7 } }
     let h = Holder { t: t, p: p, l: ll }
-    io.println("{i} {h.t.is_leaf()}")
+    io.println("{i} {h.t.is_leaf()} {bb.inner.inner}")
 }
 "#
 }
@@ -58,14 +60,8 @@ fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
     tid
 }
 
-fn decl_of(name: Str) -> Int {
-    let d = tc_type_decl_nodes.get(name) ?? -1
-    assert(d >= 0)
-    d
-}
-
-fn assert_field(label: Str, owner: Str, field_tid: Int, want_form: SlotForm, want_spelling: Str) {
-    let rec = field_layout_of(decl_of(owner), field_tid)
+fn assert_field(label: Str, owner_tid: Int, field_tid: Int, want_form: SlotForm, want_spelling: Str) {
+    let rec = field_layout_of(owner_tid, field_tid)
     assert_eq_str("{label} decline", rec.decline_reason, "")
     assert_eq_str("{label} form", slot_form_name(rec.slot_form), slot_form_name(want_form))
     assert_eq_str("{label} spelling", rec.c_spelling, want_spelling)
@@ -75,8 +71,8 @@ fn assert_field(label: Str, owner: Str, field_tid: Int, want_form: SlotForm, wan
 test "a self-recursive generic enum field is boxed only inside its own enum" {
     let m = harvest_type_tids()
     let tree_int = make_enum_instance_type("Tree", [expect_tid(m, "Int")])
-    assert_field("Tree.Node.l in Tree", "Tree", tree_int, SlotForm.PointerBoxed, "int64_t")
-    assert_field("Holder.t", "Holder", tree_int, SlotForm.Inline, "blink_Tree_0Int")
+    assert_field("Tree.Node.l in Tree", tree_int, tree_int, SlotForm.PointerBoxed, "int64_t")
+    assert_field("Holder.t", expect_tid(m, "Holder"), tree_int, SlotForm.Inline, "blink_Tree_0Int")
     assert_eq_str("plain Field position is by value", layout_of(tree_int, Position.Field).c_spelling, "blink_Tree_0Int")
 }
 
@@ -84,9 +80,9 @@ test "a self-recursive generic enum field is boxed only inside its own enum" {
 test "a self-recursive non-generic enum field is boxed only inside its own enum" {
     let m = harvest_type_tids()
     let ll = expect_tid(m, "LL")
-    assert_field("LL.Cons.t in LL", "LL", ll, SlotForm.PointerBoxed, "int64_t")
-    assert_field("LL.Cons.h in LL", "LL", expect_tid(m, "Int"), SlotForm.InlineWord, "int64_t")
-    assert_field("Holder.l", "Holder", ll, SlotForm.Inline, "blink_LL")
+    assert_field("LL.Cons.t in LL", ll, ll, SlotForm.PointerBoxed, "int64_t")
+    assert_field("LL.Cons.h in LL", ll, expect_tid(m, "Int"), SlotForm.InlineWord, "int64_t")
+    assert_field("Holder.l", expect_tid(m, "Holder"), ll, SlotForm.Inline, "blink_LL")
 }
 
 // A tuple that reaches the owner at any depth embeds it by value, so it is boxed too.
@@ -95,8 +91,21 @@ test "a tuple field that reaches its own enum is boxed only inside that enum" {
     let pair_int = make_enum_instance_type("Pair", [expect_tid(m, "Int")])
     let tup = make_tuple_type([pair_int, pair_int])
     let nested = make_tuple_type([expect_tid(m, "Int"), tup])
-    assert_field("Pair.Two.p in Pair", "Pair", tup, SlotForm.PointerBoxed, "int64_t")
-    assert_field("nested tuple in Pair", "Pair", nested, SlotForm.PointerBoxed, "int64_t")
-    assert_field("same tuple in Holder", "Holder", tup, SlotForm.Inline, "blink_Tuple2_Pair_0Int_Pair_0Int")
-    assert_field("Pair.One.v in Pair", "Pair", expect_tid(m, "Int"), SlotForm.InlineWord, "int64_t")
+    assert_field("Pair.Two.p in Pair", pair_int, tup, SlotForm.PointerBoxed, "int64_t")
+    assert_field("nested tuple in Pair", pair_int, nested, SlotForm.PointerBoxed, "int64_t")
+    assert_field("same tuple in Holder", expect_tid(m, "Holder"), tup, SlotForm.Inline, "blink_Tuple2_Pair_0Int_Pair_0Int")
+    assert_field("Pair.One.v in Pair", pair_int, expect_tid(m, "Int"), SlotForm.InlineWord, "int64_t")
+}
+
+// Box[Box[Int]] and Box[Int] share one declaration and are two types. The outer one is
+// finite: it holds the inner one, which holds an Int and stops. So the member is held by
+// value, and asking the question of the DECLARATION cannot tell that from real recursion,
+// which is why the owner is named by its own tid.
+test "a member at another instance of the owner's own declaration is held by value" {
+    let m = harvest_type_tids()
+    let box_int = make_struct_instance_type("Box", [expect_tid(m, "Int")])
+    let box_box = make_struct_instance_type("Box", [box_int])
+    assert_field("Box[Box[Int]].inner", box_box, box_int, SlotForm.Inline, "blink_Box_0Int")
+    assert_field("Box[Int].inner", box_int, expect_tid(m, "Int"), SlotForm.InlineWord, "int64_t")
+    assert_field("a box inside itself", box_int, box_int, SlotForm.PointerBoxed, "int64_t")
 }

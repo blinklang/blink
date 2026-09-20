@@ -1,0 +1,99 @@
+// A carrier member holds the payload itself or a pointer to it, and layout is the one
+// place that answers which. A checked read fills such a member from a container slot,
+// which holds its own answer to the same question about the same type, and the two
+// answers are NOT the same question: a slot is one machine word, so a double rides
+// behind a pointer there even though it fits a word everywhere else.
+//
+// So the payload the read builds has to be matched to the MEMBER's form, not to the
+// slot's. A member that wants the pointer takes the slot's handle as it stands; only a
+// member that holds the value by itself has the box opened for it. Matching the slot
+// instead assigns a value to a pointer member, or the other way round.
+
+import std.io
+import lower_test_helpers.{probe, rhs_of, assert_eq_str, assert_shape, assert_verifies}
+import ir.{ir_kid, ir_c_spelling}
+import cg_expr.{cg_expr_pending_count, cg_expr_take_pending}
+import cg_call.{lower_element_read}
+import layout.{Slot, SlotForm, carrier_member_layout, tid_of_node}
+import diagnostics.{Diag}
+
+// One element type per form the two producers can disagree about:
+//   Int   fits the word and the member holds it        slot InlineWord    member InlineWord
+//   Point does not fit the word at all                slot PointerBoxed  member PointerBoxed
+//   Float fits the word but must not be punned        slot PointerBoxed  member InlineWord
+fn src() -> Str {
+    #"type Point { x: Int, y: Int }
+
+fn main() {
+    let at = 0
+    let ints = [1, 2, 3]
+    let of_int = ints.get(at)
+    let points = [Point { x: 1, y: 2 }]
+    let of_point = points.get(at)
+    let reals = [1.5, 2.5]
+    let of_real = reals.get(at)
+    let _keep = [of_int.unwrap(), of_point.unwrap().x, of_real.unwrap().to_int()]
+}
+"#
+}
+
+// The Some arm's payload, out of the `if` the read hoists. The last hoisted statement is
+// that `if`; its first branch's only statement assigns the carrier, and the carrier's
+// second kid is the payload beside the tag.
+fn payload_of(anchor: Str) -> Int ! Diag.Report {
+    let mark = cg_expr_pending_count()
+    let built = lower_element_read(rhs_of(anchor))
+    assert(built >= 0)
+    let stmts = cg_expr_take_pending(mark)
+    if stmts.len() == 0 {
+        io.println("FAIL: '{anchor}' hoisted no statements")
+        assert(false)
+    }
+    let branch = stmts.get(stmts.len() - 1).unwrap()
+    let some = ir_kid(ir_kid(ir_kid(branch, 1), 0), 1)
+    assert_verifies(anchor, branch)
+    ir_kid(some, 1)
+}
+
+fn form_name(f: SlotForm) -> Str {
+    match f {
+        SlotForm.Inline => "Inline"
+        SlotForm.PointerBoxed => "PointerBoxed"
+        SlotForm.InlineWord => "InlineWord"
+    }
+}
+
+fn member_of(anchor: Str) -> Str ! Diag.Report {
+    form_name(carrier_member_layout(tid_of_node(rhs_of(anchor)), Slot.Inner1).slot_form)
+}
+
+test "a carrier member that holds the value by itself has the slot's box opened" {
+    probe("layout_carrier_member_slot", src())
+    assert_eq_str("member form", member_of("of_int"), "InlineWord")
+    // Two casts, not one: an integer rides the void* slot as a pointer-wide integer, so it
+    // is cast out of that width before it is cast home to its own type.
+    assert_shape("payload", payload_of("of_int"), "Cast(Cast(CallRuntime(VarRef, VarRef)))")
+}
+
+test "a carrier member declared as a pointer takes the slot's handle as it stands" {
+    probe("layout_carrier_member_slot", src())
+    assert_eq_str("member form", member_of("of_point"), "PointerBoxed")
+    assert_shape("payload", payload_of("of_point"), "Cast(CallRuntime(VarRef, VarRef))")
+}
+
+// The payload's own spelling is what the member is declared as, so the assignment the
+// printer writes is between two of the same type and not between a value and an address.
+test "the pointer member and the payload entering it are spelled the same" {
+    probe("layout_carrier_member_slot", src())
+    let want = carrier_member_layout(tid_of_node(rhs_of("of_point")), Slot.Inner1).c_spelling
+    assert_eq_str("payload spelling", ir_c_spelling(payload_of("of_point")), want)
+}
+
+// A double is behind a pointer in the slot and held by the member itself, which is the one
+// place the two answers differ. Reading the member's answer is what keeps this row right:
+// following the slot's would leave the box shut and assign an address to a double.
+test "a double is unboxed for a member that holds it even though its slot is a pointer" {
+    probe("layout_carrier_member_slot", src())
+    assert_eq_str("member form", member_of("of_real"), "InlineWord")
+    assert_shape("payload", payload_of("of_real"), "Unbox(Cast(CallRuntime(VarRef, VarRef)))")
+}

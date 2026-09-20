@@ -283,10 +283,8 @@ fn lo_fn_slot_spelling(tid: Int, position: Position, node: Int) -> Str ! Diag.Re
 // (directly, or through a tuple at any depth) is stored boxed: the owner's C typedef is
 // incomplete while its members are declared, so the member is an opaque int64_t word
 // that holds the heap pointer. Any other field is its Field-position layout.
-pub fn field_layout_of(owner_decl: Int, field_tid: Int) -> LayoutRecord {
-    let selfrec = lo_reaches_owner(field_tid, owner_decl)
-    if selfrec < 0 { return lo_declined("field type has an ambiguous declaration; cannot decide self-recursion") }
-    if selfrec == 0 { return layout_of(field_tid, Position.Field) }
+pub fn field_layout_of(owner_tid: Int, field_tid: Int) -> LayoutRecord {
+    if !lo_embeds_owner(field_tid, owner_tid) { return layout_of(field_tid, Position.Field) }
     LayoutRecord {
         c_spelling: "int64_t", slot_form: SlotForm.PointerBoxed, carrier_tag: "",
         is_transparent: 0, kops_table: "", kops_inline_key: false, slot_word: "", decline_reason: "",
@@ -597,26 +595,30 @@ fn lo_slot_word(r: Int, k: TyKind) -> Str {
 // about a tid: the slot word says how a value travels through the cell, this says what it is.
 pub fn container_slot_spelling() -> Str { "void*" }
 
-// Does a field of this type embed its owner by value? 1 when the field is the owner
-// itself (bare or any instance of it) or a tuple that reaches the owner at any depth;
-// -1 when the field's declaration is ambiguous, so no answer is safe.
-fn lo_reaches_owner(field_tid: Int, owner_decl: Int) -> Int {
+// Does a field of this type embed its owner by value -- the owner itself, or a tuple that
+// reaches it at any depth? The owner is named by its own tid and compared as one, not by
+// its declaration: two instances of one declaration are two types, so a field at another
+// instance of the very same declaration is finite and is held by value. A declaration
+// shared by two types answers this correctly for the same reason, so nothing here needs to
+// know whether the name was ambiguous; a tid whose declaration is ambiguous declines on its
+// own in lo_decline_reason_of, where the field's Field-position layout asks.
+fn lo_embeds_owner(field_tid: Int, owner_tid: Int) -> Bool {
+    if owner_tid < 0 { return false }
+    lo_embeds_tid(field_tid, lo_res(owner_tid))
+}
+
+fn lo_embeds_tid(field_tid: Int, owner: Int) -> Bool {
     let r = lo_res(field_tid)
     let k = tc_tid_kind(r)
-    if k == TyKind.Struct || k == TyKind.Enum {
-        let decl = tc_tid_decl_node(r)
-        if decl == DECL_NODE_AMBIGUOUS { return -1 }
-        return if decl >= 0 && decl == owner_decl { 1 } else { 0 }
-    }
-    if k != TyKind.Tuple { return 0 }
+    if k == TyKind.Struct || k == TyKind.Enum { return r == owner }
+    if k != TyKind.Tuple { return false }
     let n = tc_tid_child_count(r)
     let mut i = 0
     while i < n {
-        let hit = lo_reaches_owner(tc_tid_child(r, i), owner_decl)
-        if hit != 0 { return hit }
+        if lo_embeds_tid(tc_tid_child(r, i), owner) { return true }
         i = i + 1
     }
-    0
+    false
 }
 
 // The reasons a tid has no C answer. A pointer container (List, Map, Set, Channel,
