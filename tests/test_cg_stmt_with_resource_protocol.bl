@@ -4,10 +4,12 @@
 // Plain binds the resource and runs nothing on the way out: no cleanup exists to skip, so
 // this is the one protocol wrap_resource has always been able to lower correctly. An FFI
 // scope wraps the bind in a WithScope naming the runtime's own blink_ffi_scope_cleanup,
-// which is the one exit runner this stage now writes. Closeable and BlockHandler still name
-// no exit runner, so they still report the internal error cg_eff_resource_cleanup raises
-// for them and lower as a plain bind underneath it — same as before this stage understood
-// any protocol at all.
+// and a Closeable resource wraps it the same way naming the close method the user wrote.
+// wrap_resource tests for the exit symbol the cleanup record carries rather than for the
+// protocol, so those two go down one path. BlockHandler names no exit runner, because its
+// binder holds the Context that enter() answers rather than the resource, so it still
+// reports the internal error cg_eff_resource_cleanup raises for it and lowers as a plain
+// bind underneath it.
 
 import std.fs
 import std.io
@@ -19,7 +21,9 @@ import parser.{node_kind, node_name, nodes}
 import ast.{NodeKind}
 import compiler.{compile_to_program}
 import diagnostics.{diag_entries, diag_reset}
-import cg_stmt.{cg_stmt_reset, lower_fn}
+import cname.{c_impl_method_name}
+import cname_test_helpers.{find_impl}
+import cg_stmt.{cg_local_c_name, cg_stmt_reset, lower_fn}
 import cg_reg.{cg_reg_build}
 
 fn find_fn(name: Str) -> Int {
@@ -157,14 +161,26 @@ test "an FFI scope resource binds, then wraps the rest of the block in a WithSco
     assert_eq(ices(), 0)
 }
 
-test "a Closeable resource still reports the missing exit runner and still binds underneath it" {
+// The close method the user wrote is the exit runner, so the symbol is built by the
+// producer that spells its definition. A literal here would pass while the definition
+// moved, and the guard would then call a function the unit never defines.
+test "a Closeable resource binds, then wraps the rest of the block in a WithScope naming its own close method" {
     run_probe()
     diag_reset()
     let root = lower_fn(find_fn("closeable_case"))
+    for err in ir_verify(root) { io.println("VERIFY: {err}") }
+    assert_eq(ir_verify(root).len(), 0)
     assert(find_kind(root, IrKind.Let) >= 0)
-    assert_eq(find_kind(root, IrKind.WithScope), -1)
-    assert_eq(ices(), 1)
-    assert(ices_mentioning("Closeable") > 0)
+    let scoped = find_kind(root, IrKind.WithScope)
+    assert(scoped >= 0)
+    assert_eq(ir_c_name(scoped), c_impl_method_name(find_impl("Logged", "Closeable", ""), "close"))
+    // The resource kid must read the binder the `with` declared. This case holds the
+    // resource in an enclosing local first, so the guard closing that local instead would
+    // still be a Let and a VarRef, and only the name tells the two apart.
+    assert_eq(ir_kid_count(scoped), 2)
+    assert_eq(ir_kind(ir_kid(scoped, 0)), IrKind.VarRef)
+    assert_eq(ir_c_name(ir_kid(scoped, 0)), cg_local_c_name("logged"))
+    assert_eq(ices(), 0)
 }
 
 test "a BlockHandler resource still reports the missing exit runner and still binds underneath it" {

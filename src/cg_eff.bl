@@ -25,8 +25,8 @@ import layout.{
     layout_of, tid_of_binder, tid_of_node,
 }
 import cname.{
-    c_builtin_effect_slot, c_ev_field_name, c_ev_global_name, c_ev_type_name, c_field_name, c_local_name,
-    c_mint_local, c_runtime_helper,
+    c_builtin_effect_slot, c_ev_field_name, c_ev_global_name, c_ev_type_name, c_field_name,
+    c_impl_method_name, c_local_name, c_mint_local, c_runtime_helper,
 }
 import ir.{
     ir_assign, ir_block, ir_carrier_wrap, ir_closure_new, ir_const, ir_effect_perform, ir_evidence_address, ir_evidence_vector,
@@ -48,20 +48,28 @@ pub type CleanupProtocol { Plain, Closeable, BlockHandler, FfiScope }
 
 pub type ResourceCleanup {
     protocol: CleanupProtocol
-    // The impl block carrying the protocol's methods, -1 when no trait answers. The C
-    // symbols of those methods are cname's to spell, so no name is carried here.
+    // The impl block carrying the protocol's methods, -1 when no trait answers.
     impl_block: Int
+    // The C function the guard local runs on the way out, already spelled by cname, or ""
+    // when nothing runs. A caller cannot re-derive it: FfiScope's is the runtime's and
+    // Closeable's is an impl method's, and the two are spelled by different producers.
+    exit_symbol: Str
+    // Whether that function takes the block's success flag as a second argument.
+    passes_ok: Bool
 }
 
 // The traits that claim a resource. Held as names because an impl block's trait is a
 // name, and written once each so no comparison against a literal type name is needed.
 let TRAIT_BLOCK_HANDLER = "BlockHandler"
 let TRAIT_CLOSEABLE = "Closeable"
+// The one method Closeable declares, and the runtime's own scope exit.
+let CLOSEABLE_EXIT_METHOD = "close"
+let FFI_SCOPE_EXIT = "blink_ffi_scope_cleanup"
 
 // Nothing runs on the way out. This is also what a recorded internal error hands back,
 // so a poisoned answer cannot install a cleanup nobody asked for.
 fn plain_binding() -> ResourceCleanup {
-    ResourceCleanup { protocol: CleanupProtocol.Plain, impl_block: -1 }
+    ResourceCleanup { protocol: CleanupProtocol.Plain, impl_block: -1, exit_symbol: "", passes_ok: false }
 }
 
 // The FFI scope's exit runner, registered once per translation unit before any function
@@ -73,7 +81,7 @@ fn plain_binding() -> ResourceCleanup {
 // does not otherwise make.
 pub fn cg_eff_register_ffi_scope_guard_support() ! Diag.Report {
     let spelling = layout_of(make_ffi_scope_type(), Position.Local).c_spelling
-    print_resource_guard_support("blink_ffi_scope_cleanup", spelling, false)
+    print_resource_guard_support(FFI_SCOPE_EXIT, spelling, false)
 }
 
 // A kind that names a declaration of its own, so an impl block can be written for it.
@@ -146,8 +154,8 @@ pub fn cg_eff_resource_cleanup(item: Int) -> ResourceCleanup ! Diag.Report {
         return plain_binding()
     }
     if kind == TyKind.FfiScope {
-        return needs_exit_runner(CleanupProtocol.FfiScope, -1,
-            "an FFI scope's cleanup", node)
+        return ResourceCleanup { protocol: CleanupProtocol.FfiScope, impl_block: -1,
+            exit_symbol: FFI_SCOPE_EXIT, passes_ok: false }
     }
     if !kind_can_carry_impl(kind) { return plain_binding() }
     let decl = tc_tid_decl_node(tid)
@@ -166,25 +174,38 @@ pub fn cg_eff_resource_cleanup(item: Int) -> ResourceCleanup ! Diag.Report {
             "a {TRAIT_BLOCK_HANDLER} resource's cleanup", node)
     }
     let cl = impl_of_trait_for_decl(TRAIT_CLOSEABLE, decl, node)
-    if cl >= 0 {
-        return needs_exit_runner(CleanupProtocol.Closeable, cl,
-            "a {TRAIT_CLOSEABLE} resource's cleanup", node)
-    }
+    if cl >= 0 { return closeable_binding(cl, tid, node) }
     plain_binding()
 }
 
 // A protocol that is selected but cannot yet be spelled. The guard local's cleanup
-// attribute needs a function taking a pointer to the local's own C type, and no stage
-// emits one, so the protocol travels with an empty symbol and a loud error.
-//
-// FfiScope is the one exception: the runtime already carries a fixed cleanup symbol of
-// its own, blink_ffi_scope_cleanup, so the driver registers guard support for it once per
-// translation unit and this protocol has nothing left to wait for.
+// attribute needs a function taking the resource by value, and under BlockHandler the
+// binder holds the Context that `enter` answers rather than the resource itself, so no
+// method the user wrote has that shape. The protocol travels with an empty symbol and a
+// loud error rather than degrading to a plain binding, which would leave the exit unrun.
 fn needs_exit_runner(protocol: CleanupProtocol, im: Int, what: Str, node: Int) -> ResourceCleanup ! Diag.Report {
-    if protocol != CleanupProtocol.FfiScope {
-        diag_ice_stage_not_built(what, node)
+    diag_ice_stage_not_built(what, node)
+    ResourceCleanup { protocol: protocol, impl_block: im, exit_symbol: "", passes_ok: false }
+}
+
+// Closeable's exit runner is the close method the user wrote. `fn close(self)` is an
+// ordinary impl method, so the declaration stage already emits a C function taking the
+// resource by value, which is exactly the shape the guard hands its stored resource to.
+// Nothing is synthesised here: the symbol is spelled through the same producer that
+// spells the definition, and a literal repeated here would link against nothing the day
+// the definition moved.
+fn closeable_binding(im: Int, tid: Int, node: Int) -> ResourceCleanup ! Diag.Report {
+    let rec = layout_of(tid, Position.Local)
+    if rec.decline_reason != "" {
+        diag_ice_at("UnspellableResourceType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "a {TRAIT_CLOSEABLE} resource has no C spelling for its guard to store", node,
+            "the spelling the resource has at the with-item must spell again where the guard declares it")
+        return plain_binding()
     }
-    ResourceCleanup { protocol: protocol, impl_block: im }
+    let exit_symbol = c_impl_method_name(im, CLOSEABLE_EXIT_METHOD)
+    print_resource_guard_support(exit_symbol, rec.c_spelling, false)
+    ResourceCleanup { protocol: CleanupProtocol.Closeable, impl_block: im,
+        exit_symbol: exit_symbol, passes_ok: false }
 }
 
 // ── Closures as values ────────────────────────────────────────────────────────────
