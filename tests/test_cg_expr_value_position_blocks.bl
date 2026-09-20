@@ -6,8 +6,9 @@
 // assignment to it, and names the temp to the expression stage, which answers a read of it.
 //
 // What is pinned here is that one temp carries the value, that the body's own statements
-// stand in front of the reader rather than inside it, and that a body whose tail produces
-// nothing is still one honest report rather than a read of a temp nothing wrote.
+// stand in front of the reader rather than inside it, and that a body whose tail is not a
+// value expression still binds: its type is `()`, which carries one value and a
+// representation, so the temp holds that value and the body runs for its effect.
 
 import std.io
 import diagnostics.{diag_reset}
@@ -55,6 +56,10 @@ fn probe_body(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Pars
     lower_block(node_body(lowered_program(stem, src, name)))
 }
 
+let UNIT_CALL_TAIL_SHAPE = "Block(Let(Const), Block(ExprStmt(EffectPerform(FieldGet(EvidenceVector), Const))), Let(VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))"
+let LET_TAIL_SHAPE = "Block(Let(Const), Block(Let(Const)), Let(VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))"
+let UNIT_WITH_SHAPE = "Block(Let(Const), Let(Const), WithScope(Block(Assign(VarRef, Binary(VarRef, Const)))), Let(VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))"
+
 test "a block in value position fills a temp and its reader reads that temp" {
     let body = probe_fn("cg_expr_value_block", #"fn main() {
     let n = 1
@@ -95,37 +100,37 @@ test "a with-arena block in value position fills a temp from its body's tail" {
         "Block(Let(Const), Let, WithScope(Block(Assign(VarRef, Binary(VarRef, Const)))), Let(VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))")
 }
 
-test "a block whose tail produces no value refuses by name" {
-    let body = probe_body("cg_expr_value_block_void", #"fn main() {
+// `()` is an ordinary inhabited type with one value and a representation, so a block whose
+// tail is a call answering `()` binds that one value. The body runs for its effect and the
+// temp holds the unit constant.
+test "a block whose tail answers unit binds the unit value" {
+    let body = probe_fn("cg_expr_value_block_unit", #"fn main() {
     let picked = {
         io.println("a")
     }
     let _keep = [picked]
 }
 "#, "main")
-    assert_ice_saying("void value block", body, "ValuePositionExprHasNoValue",
-        "in value position produces no value")
+    assert_eq_str("block shape", shape(body), UNIT_CALL_TAIL_SHAPE)
 }
 
-// A block's type IS its tail, so a tail that produces nothing gives the block no type at
-// all and the temp cannot be declared. That is the refusal the reader gets, and it arrives
-// before the question of whether the tail fills anything: there is nothing to fill.
-test "a block whose tail binds a name rather than producing a value refuses by name" {
-    let body = probe_body("cg_expr_value_block_unfilled", #"fn main() {
+// A block ending in a `let` produces no value expression, so its type is `()` and the same
+// unit value is bound. The `let` still runs, because the body is lowered as statements.
+test "a block whose tail binds a name binds the unit value" {
+    let body = probe_fn("cg_expr_value_block_let_tail", #"fn main() {
     let picked = {
         let p = 5
     }
     let _keep = [picked]
 }
 "#, "main")
-    assert_ice_saying("block binds, fills nothing", body, "ValuePositionExprHasNoValue",
-        "in value position produces no value")
+    assert_eq_str("block shape", shape(body), LET_TAIL_SHAPE)
 }
 
-// The same for a `with`: its value is its body's tail, so a body that ends in an
-// assignment leaves the binding nothing to hold.
-test "a with block whose body ends in an assignment refuses by name" {
-    let body = probe_body("cg_expr_value_with_void", #"fn main() {
+// A `with` whose body ends in an assignment answers `()` the same way, and the scope it
+// opens still wraps the body.
+test "a with block whose body ends in an assignment binds the unit value" {
+    let body = probe_fn("cg_expr_value_with_unit", #"fn main() {
     let mut acc = 0
     let got = with arena {
         acc = acc + 1
@@ -133,8 +138,27 @@ test "a with block whose body ends in an assignment refuses by name" {
     let _keep = [got]
 }
 "#, "main")
-    assert_ice_saying("void with", body, "ValuePositionExprHasNoValue",
-        "in value position produces no value")
+    assert_eq_str("block shape", shape(body), UNIT_WITH_SHAPE)
+}
+
+// A non-unit construct still has to fill the temp on every path. One arm carries the type
+// and the other leaves the block, so there is a path that writes nothing, and that is the
+// refusal this pins: it is reachable only where a type came from somewhere other than the
+// unfilled arm.
+test "an if whose else arm leaves the block without a value refuses by name" {
+    let body = probe_body("cg_expr_value_if_unfilled", #"fn main() {
+    let c = 1
+    let picked = if c > 0 {
+        10
+    } else {
+        loop {
+        }
+    }
+    let _keep = [picked]
+}
+"#, "main")
+    assert_ice_saying("if fills nothing", body, "ValuePositionArmFillsNothing",
+        "neither produces a value nor leaves the block")
 }
 
 // A block in the right operand of a short-circuit runs only when the left one decided
