@@ -20,7 +20,7 @@ import parser.{
 }
 import typecheck.{
     TyKind, TYPE_BOOL, TYPE_CHAR, TYPE_FLOAT, TYPE_INT, TYPE_STR, TYPE_VOID,
-    tc_alias_to_original, tc_tid_handler_effect, tc_tid_kind,
+    tc_alias_to_original, tc_global_decl_node, tc_tid_handler_effect, tc_tid_kind,
 }
 import layout.{
     Position, Slot, SlotForm, LayoutRecord, bind_binder, bind_binder_mut, binder_scope_pop, binder_scope_push,
@@ -29,14 +29,14 @@ import layout.{
 import cname.{
     c_assert_fail_eq_name, c_assert_fail_intro_name, c_assert_fail_name,
     c_debug_assert_fail_name, c_decl_for_tid, c_enum_payload_member, c_field_name,
-    c_local_name, c_mint_local, c_variant_discriminant, c_runtime_helper,
+    c_global_name, c_local_name, c_mint_local, c_variant_discriminant, c_runtime_helper,
     c_string_literal,
 }
 import ir.{
     IrKind, ir_assign, ir_binary, ir_block, ir_break, ir_call_runtime, ir_carrier_tag,
-    ir_carrier_unwrap, ir_cast, ir_const, ir_continue, ir_expr_stmt, ir_field_get, ir_if,
-    ir_kind, ir_let, ir_loop, ir_mark_materialize, ir_return, ir_span, ir_switch, ir_unary,
-    ir_unreachable, ir_var_ref, ir_with_scope,
+    ir_carrier_unwrap, ir_cast, ir_const, ir_continue, ir_expr_stmt, ir_field_get,
+    ir_global_ref, ir_if, ir_kind, ir_let, ir_loop, ir_mark_materialize, ir_return, ir_span,
+    ir_switch, ir_unary, ir_unreachable, ir_var_ref, ir_with_scope,
 }
 import diagnostics.{
     Diag, diag_file_for_node, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
@@ -842,29 +842,45 @@ fn lower_assign(node: Int) -> Int ! Diag.Report {
 }
 
 // Whether a target is a place this stage can build an lvalue for: a bare local this module
-// bound itself, or a field reached off one. Anything else -- an index expression, a place
-// behind a pointer -- is a place the expression stage builds that has no lvalue producer yet.
+// bound itself, a module-level global name resolution already resolved for this node, or a
+// field reached off one. Anything else -- an index expression, a place behind a pointer --
+// is a place the expression stage builds that has no lvalue producer yet.
 fn is_assignable_place(node: Int) -> Bool ! Diag.Report {
     let kind = nk_of(node_kind(node))
-    if kind == NodeKind.Ident { return tid_of_binder(cur_scope(), node_name(node)) >= 0 }
+    if kind == NodeKind.Ident {
+        if tid_of_binder(cur_scope(), node_name(node)) >= 0 { return true }
+        return tc_global_decl_node(node) >= 0
+    }
     kind == NodeKind.FieldAccess
 }
 
 // The left side of an assignment must be an lvalue. A bare local is one this module bound
-// itself, so it is read straight from the binder scope. A field access reuses the
-// expression stage's own reader: `lower_expr` already builds a FieldGet for it, and
-// `is_lvalue_kind` in ir.bl already accepts a FieldGet as an Assign target, so this is not
-// a new node shape, only a new place lower_target reaches it from.
+// itself, so it is read straight from the binder scope. A module-level `let mut` global is
+// not bound anywhere this module tracks binders, so its declaration is asked of typecheck's
+// own record instead of re-derived here -- name resolution already decided which module's
+// global a name reaches, from the reading file's own import list, and the spelling alone
+// cannot recover that (two modules may each declare a private global under one name). A
+// field access reuses the expression stage's own reader: `lower_expr` already builds a
+// FieldGet for it, and `is_lvalue_kind` in ir.bl already accepts a FieldGet as an Assign
+// target, so this is not a new node shape, only a new place lower_target reaches it from.
 fn lower_target(node: Int) -> Int ! Diag.Report {
     if nk_of(node_kind(node)) == NodeKind.FieldAccess { return lower_value(node) }
     let name = node_name(node)
     let tid = tid_of_binder(cur_scope(), name)
-    if tid < 0 {
-        diag_ice_stage_not_built("an assignment to a place that is not a local", node)
-        return poison_value(node)
+    if tid >= 0 {
+        let rec = layout_at(tid, Position.Local, node)
+        return ir_var_ref(tid, node, rec.c_spelling, cg_local_c_name(name), rec.slot_form)
     }
-    let rec = layout_at(tid, Position.Local, node)
-    ir_var_ref(tid, node, rec.c_spelling, cg_local_c_name(name), rec.slot_form)
+    let decl = tc_global_decl_node(node)
+    if decl >= 0 {
+        let gtid = stmt_tid(node)
+        if gtid >= 0 {
+            let rec = layout_at(gtid, Position.Local, node)
+            return ir_global_ref(gtid, node, rec.c_spelling, c_global_name(decl), rec.slot_form)
+        }
+    }
+    diag_ice_stage_not_built("an assignment to a place that is not a local", node)
+    poison_value(node)
 }
 
 // `x += e` is `x = x + e`. The target is read and written, so it is lowered twice: two
