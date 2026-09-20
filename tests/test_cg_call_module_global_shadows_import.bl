@@ -1,0 +1,89 @@
+// A module-level global whose name equals an imported module's own name is still a value.
+// Nothing about importing a module of that name takes the global out of scope: typecheck
+// already resolves `tok.push(...)` through its own value namespace and accepts it cleanly.
+// Codegen has to answer the identical question -- is `tok` a value or a module -- and it
+// must answer through the same table typecheck stamped, tc_module_let_decl_node, rather
+// than re-deriving receiver kind from the local binder scope alone. The local scope knows
+// nothing about a module-level global, so it reads the name as free, and free plus "spelled
+// like an import" reads as the module -- which then has no `push` or `len` to offer.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_reset, diag_entries}
+import parser.{node_kind, node_name, node_obj, node_method, nodes}
+import ast.{NodeKind, nk_of}
+import layout.{layout_reset}
+import ir.{ir_reset}
+import cg_expr.{cg_expr_reset}
+import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_call.{lower_call}
+import mono.{run_mono}
+import cg_test_helpers.{cg_probe_begin, cg_probe_front_end_clean}
+import std.io
+
+let PKG = "build/cg_shadow_module_global_pkg"
+
+fn compile_probe() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _mk = process_run("mkdir", ["-p", "{PKG}/src"])
+    write_file("{PKG}/blink.toml", "[package]\nname = \"cgshadowmod\"\nversion = \"0.1.0\"\n")
+    write_file("{PKG}/src/tok.bl", "pub fn make() -> Int \{ 1 \}\n")
+    write_file("{PKG}/src/probe.bl",
+        "import tok.\{make}\n\npub let mut tok: List[Int] = []\n\nfn run() \{\n    tok.push(make())\n    let _n = tok.len()\n\}\n\nfn main() \{ run() \}\n")
+    let path = "{PKG}/src/probe.bl"
+    diag_reset()
+    cg_probe_begin(path)
+    let program = compile_to_program(path, 1)
+    cg_probe_front_end_clean("import resolution")
+    check_types(program)
+    cg_probe_front_end_clean("type checking")
+    layout_reset()
+    ir_reset()
+    cg_expr_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    program
+}
+
+fn cleanup() {
+    let _rm = process_run("rm", ["-rf", PKG])
+}
+
+// The `tok.<method>(...)` call in the probe's `run` function. The probe writes exactly one
+// of each, so the first match is the only one.
+fn tok_call(method: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.MethodCall && node_method(i) == method {
+            let obj = node_obj(i)
+            if obj != -1 && nk_of(node_kind(obj)) == NodeKind.Ident && node_name(obj) == "tok" { return i }
+        }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no call 'tok.{method}'")
+    assert(false)
+    -1
+}
+
+fn dump_ice() {
+    for d in diag_entries {
+        if d.severity == "ice" { io.println("  [{d.severity}] {d.name}: {d.message}") }
+    }
+}
+
+test "a module-level global named like an imported module still dispatches its method calls as a value" {
+    let program = compile_probe()
+    run_mono(program)
+    let push_id = lower_call(tok_call("push"))
+    if push_id < 0 {
+        io.println("FAIL: tok.push(...) refused instead of dispatching to List.push")
+        dump_ice()
+    }
+    assert(push_id >= 0)
+    let len_id = lower_call(tok_call("len"))
+    if len_id < 0 {
+        io.println("FAIL: tok.len() refused instead of dispatching to List.len")
+        dump_ice()
+    }
+    assert(len_id >= 0)
+    cleanup()
+}
