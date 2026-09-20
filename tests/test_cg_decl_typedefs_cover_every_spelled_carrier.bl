@@ -1,0 +1,220 @@
+// A carrier or tuple that no declaration owns still needs a C typedef, and the only thing
+// that decides it needs one is that some position in the program spells it. Today the
+// typedef walk enumerates declarations, so a carrier reached only through a local
+// annotation, a match scrutinee or a binder is never reached at all.
+//
+// The use sites do ask for it: cg_stmt calls ensure_typedef_for, which builds the block
+// into layout's buffer. Nothing drains that buffer -- print_typedef_blocks has one caller,
+// inside the declaration walk -- so the block is built and thrown away, and the emitted C
+// names a type it never defined. That is the whole "unknown type name" bucket.
+//
+// The rows below name the carriers by their C spelling, because that spelling is what the
+// C compiler looks up and fails to find.
+
+import std.fs
+import std.io
+import diagnostics.{diag_entries}
+import layout.{layout_reset, ensure_typedef_for, layout_take_typedefs}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_decl.{cg_decl_reset, cg_decl_emit_typedefs}
+import cg_test_helpers.{cg_probe_compile}
+import typecheck.{TyKind, tc_lookup_node_tid, tc_resolve, tc_tid_kind, tc_tid_child, tc_tid_child_count}
+import parser.{node_count}
+
+fn assert_has(text: Str, needle: Str) {
+    let i = text.index_of(needle)
+    if i < 0 { io.println("FAIL: typedef output has no '{needle}'") }
+    assert(i >= 0)
+}
+
+// Every carrier and tuple here is spelled ONLY inside a function body: a local's type
+// annotation, or the scrutinee of a match. None of them is a field of any declaration and
+// none appears in a signature, so the declaration walk cannot reach one.
+fn probe_src() -> Str {
+    #"type Point { x: Int, y: Int }
+
+fn main() {
+    let nested: Result[Result[Int, Str], Str] = Ok(Ok(5))
+    match nested {
+        Ok(inner) => assert(inner.is_ok())
+        Err(e) => assert(e == "")
+    }
+    let pair: (Point, Int) = (Point { x: 1, y: 2 }, 3)
+    match pair {
+        (p, n) => assert(p.x + n == 4)
+    }
+    let maybe: Option[Point] = Some(Point { x: 9, y: 9 })
+    match maybe {
+        Some(p) => assert(p.y == 9)
+        None => assert(false)
+    }
+}
+"#
+}
+
+// A generic function's body spells Option[T] and (T, Int), and main instantiates it at Int.
+// Neither template carrier has a C shape, and the instance carriers do.
+fn generic_src() -> Str {
+    #"fn hold[T](v: T) -> Int {
+    let box: Option[T] = Some(v)
+    let pair: (T, Int) = (v, 1)
+    match box {
+        Some(_) => assert(true)
+        None => assert(false)
+    }
+    match pair {
+        (_, n) => assert(n == 1)
+    }
+    1
+}
+
+fn main() {
+    let r = hold(7)
+    assert(r == 1)
+}
+"#
+}
+
+// The probe is deleted BEFORE any assertion so a red row never leaves the file behind.
+fn typedef_text_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/cg_decl_{stem}_probe_src.bl"
+    let program = cg_probe_compile(path, src)
+    layout_reset()
+    let _ = fs.delete(path)
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    cg_decl_emit_typedefs()
+    print_take()
+}
+
+// The probe is deleted BEFORE any assertion so a red row never leaves the file behind.
+fn typedef_text() -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/cg_decl_spelled_carrier_probe_src.bl"
+    let program = cg_probe_compile(path, probe_src())
+    layout_reset()
+    let _ = fs.delete(path)
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    cg_decl_emit_typedefs()
+    print_take()
+}
+
+// A carrier whose payload is another carrier. The inner one is a runtime type and is
+// already emitted; the outer one exists only because this local spells it.
+test "a carrier over a carrier spelled by a local annotation is emitted" {
+    assert_has(typedef_text(), "} blink_Result_Result_int_str_str;")
+}
+
+// A tuple is structural, so nothing declares it. Its element being a user struct is what
+// makes the missing typedef fatal rather than merely absent.
+test "a tuple over a user struct spelled by a local annotation is emitted" {
+    assert_has(typedef_text(), "} blink_Tuple2_Point_int;")
+}
+
+test "a carrier over a user struct spelled by a local annotation is emitted" {
+    assert_has(typedef_text(), "} blink_Option_Point;")
+}
+
+// The member a structural carrier names must be complete where the carrier names it, the
+// same rule the declaration walk already follows.
+test "the struct a spelled carrier names is emitted before the carrier" {
+    let text = typedef_text()
+    let leaf = text.index_of("} blink_Point;")
+    let outer = text.index_of("} blink_Option_Point;")
+    if leaf < 0 || outer < 0 || leaf >= outer {
+        io.println("FAIL: Point at {leaf} must come before Option_Point at {outer}")
+    }
+    assert(leaf >= 0 && outer >= 0 && leaf < outer)
+}
+
+// cg_stmt asks for a carrier typedef in eight places and nothing drains what those calls
+// build. That is only safe if they build nothing, so the sweep above must have left
+// layout's guard holding every carrier the program spells. Asking a second time for all of
+// them must produce no blocks at all; a block produced here is a block that reaches no
+// output, which is the bug this slice removes rather than a copy of it.
+fn blocks_built_by_a_second_ask() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/cg_decl_spelled_carrier_idem_src.bl"
+    let program = cg_probe_compile(path, probe_src())
+    layout_reset()
+    let _ = fs.delete(path)
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    cg_decl_emit_typedefs()
+    let _ = print_take()
+    let mut n = 0
+    let mut built = 0
+    while n < node_count() {
+        let tid = tc_lookup_node_tid(n)
+        if tid >= 0 {
+            let k = tc_tid_kind(tc_resolve(tid))
+            if k == TyKind.Option || k == TyKind.Result || k == TyKind.Tuple {
+                let _ = ensure_typedef_for(tid)
+                built = built + layout_take_typedefs().len()
+            }
+        }
+        n = n + 1
+    }
+    built
+}
+
+test "asking a second time for every carrier the program spells builds nothing" {
+    let built = blocks_built_by_a_second_ask()
+    if built != 0 { io.println("FAIL: a second ask built {built} blocks that nothing drains") }
+    assert(built == 0)
+}
+
+// Carriers the probe stamped whose child is a bare type parameter. A row that asserts
+// nothing was emitted for a template proves nothing unless a template carrier was stamped.
+fn template_carriers_stamped() -> Int {
+    let mut n = 0
+    let mut found = 0
+    while n < node_count() {
+        let tid = tc_lookup_node_tid(n)
+        if tid >= 0 {
+            let r = tc_resolve(tid)
+            let k = tc_tid_kind(r)
+            if k == TyKind.Option || k == TyKind.Result || k == TyKind.Tuple {
+                let mut i = 0
+                while i < tc_tid_child_count(r) {
+                    if tc_tid_kind(tc_resolve(tc_tid_child(r, i))) == TyKind.Typevar { found = found + 1 }
+                    i = i + 1
+                }
+            }
+        }
+        n = n + 1
+    }
+    found
+}
+
+fn ice_count() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" { n = n + 1 }
+    }
+    n
+}
+
+// A template carrier has no C shape, and the walk must answer that by emitting nothing
+// rather than by guessing a name or by raising. layout already decides this on the child's
+// kind, so the sweep needs no skip of its own and this row is what keeps that true.
+test "a carrier spelled only inside a generic body emits no typedef and does not raise" {
+    let text = typedef_text_of("generic", generic_src())
+    let templates = template_carriers_stamped()
+    if templates == 0 { io.println("FAIL: the probe stamped no carrier over a type parameter") }
+    assert(templates > 0)
+    let ices = ice_count()
+    if ices != 0 { io.println("FAIL: the sweep raised {ices} times over a template carrier") }
+    assert(ices == 0)
+    if text.index_of("Option_T;") >= 0 { io.println("FAIL: a typedef names the type parameter:\n{text}") }
+    assert(text.index_of("Option_T;") < 0)
+    assert(text.index_of("Tuple2_T") < 0)
+    // The walk ran rather than stopping at the template: a carrier with a shape still came out.
+    assert_has(text, "} blink_Option_int;")
+}
