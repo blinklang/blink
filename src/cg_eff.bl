@@ -22,15 +22,16 @@ import typecheck.{
 import layout.{
     BinderMut, LayoutRecord, Position, Slot, SlotForm, bind_binder, binder_mutability_of, binder_scope_pop,
     binder_scope_push, child_tid, closure_self_spelling, container_slot_spelling, current_binder_scope,
-    layout_of, tid_of_binder, tid_of_node,
+    ensure_typedef_for, layout_of, tid_of_binder, tid_of_node,
 }
 import cname.{
     c_builtin_effect_slot, c_ev_field_name, c_ev_global_name, c_ev_type_name, c_field_name,
     c_impl_method_name, c_local_name, c_mint_local, c_runtime_helper,
 }
 import ir.{
-    ir_assign, ir_block, ir_carrier_wrap, ir_closure_new, ir_const, ir_effect_perform, ir_evidence_address, ir_evidence_vector,
-    ir_call_runtime, ir_cast, ir_field_get, ir_handler_install, ir_if, ir_let, ir_var_ref,
+    ir_assign, ir_block, ir_box, ir_carrier_wrap, ir_closure_new, ir_const, ir_effect_perform, ir_evidence_address,
+    ir_evidence_vector, ir_call_runtime, ir_cast, ir_field_get, ir_handler_install, ir_if, ir_let, ir_unbox,
+    ir_var_ref,
 }
 import cg_print.{print_closure_thunk, print_resource_guard_support}
 import cg_reg.{cg_reg_effect_decls, cg_reg_impl_decls}
@@ -283,9 +284,16 @@ fn capture_words(node: Int, free: List[Str], tids: List[Int]) -> List[Int] ! Dia
         let slot = layout_of(ntid, Position.ContainerSlot)
         let loc = layout_of(ntid, Position.Local)
         let read = ir_var_ref(ntid, node, loc.c_spelling, c_local_name(nm), loc.slot_form)
-        // A pointer already is a word. Everything else goes through the integer bridge
-        // ContainerSlot names, so the value that comes back out is the value that went in.
-        out.push(if slot.slot_word == "" { read } else { ir_cast(ntid, node, slot.slot_word, read) })
+        if slot.slot_form == SlotForm.PointerBoxed {
+            // Too wide for the word, so the word holds the address of a heap copy. The
+            // binding is not assignable -- the gate above refused it otherwise -- so the
+            // copy answers what the original answers for as long as the closure lives.
+            out.push(ir_box(ntid, node, slot.c_spelling, loc.c_spelling, read))
+        } else {
+            // A pointer already is a word. Everything else goes through the integer bridge
+            // ContainerSlot names, so the value that comes back out is the value that went in.
+            out.push(if slot.slot_word == "" { read } else { ir_cast(ntid, node, slot.slot_word, read) })
+        }
         tids.push(ntid)
     }
     out
@@ -309,22 +317,6 @@ fn capture_words(node: Int, free: List[Str], tids: List[Int]) -> List[Int] ! Dia
 fn captures_are_buildable(node: Int, free: List[Str]) -> Bool ! Diag.Report {
     if free.len() == 0 { return true }
     let scope = current_binder_scope()
-    for nm in free {
-        let slot = layout_of(tid_of_binder(scope, nm), Position.ContainerSlot)
-        let why = slot.decline_reason
-        if why != "" {
-            diag_ice_at("UnspellableCaptureType", UNSOLVED_TYPEVAR_AT_CODEGEN,
-                "captured local '{nm}' has no C layout: {why}", node,
-                "monomorphisation must resolve every type codegen reads; this is a compiler bug")
-            return false
-        }
-        if slot.slot_form == SlotForm.PointerBoxed {
-            diag_ice_at("BoxedCaptureNotLowered", CODEGEN_STAGE_NOT_BUILT,
-                "closure captures '{nm}', whose value does not fit a capture word and needs a heap box no stage allocates yet",
-                node, "a capture word is one void*; a value that cannot be punned into one has to live behind a pointer, and nothing allocates that box")
-            return false
-        }
-    }
     let mut shared: List[Str] = []
     let mut unrecorded: List[Str] = []
     for nm in free {
@@ -344,7 +336,29 @@ fn captures_are_buildable(node: Int, free: List[Str]) -> Bool ! Diag.Report {
             node, "parameters and pattern binders do not record mutability yet; until their bind site does, a capture of one cannot be told from a shared binding")
         return false
     }
+    for nm in free {
+        let ntid = tid_of_binder(scope, nm)
+        let slot = layout_of(ntid, Position.ContainerSlot)
+        if !capture_layout_spells(node, nm, slot.decline_reason) { return false }
+        if slot.slot_form == SlotForm.PointerBoxed {
+            let value = layout_of(ntid, Position.Local)
+            if !capture_layout_spells(node, nm, value.decline_reason) { return false }
+            // The copy is allocated and read back by the value's own spelling, which for a
+            // carrier names a typedef this unit has to declare before either site reads it.
+            let _ = ensure_typedef_for(ntid)
+        }
+    }
     true
+}
+
+// Whether one capture's layout spelled. A decline is the same report at either position,
+// so both sites read one producer rather than writing the message twice.
+fn capture_layout_spells(node: Int, nm: Str, why: Str) -> Bool ! Diag.Report {
+    if why == "" { return true }
+    diag_ice_at("UnspellableCaptureType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "captured local '{nm}' has no C layout: {why}", node,
+        "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    false
 }
 
 fn join_names(names: List[Str]) -> Str {
@@ -519,7 +533,14 @@ fn with_capture_prologue(th: PendingThunk, body: Int) -> Int ! Diag.Report {
             c_runtime_helper("closure_get_capture"), SlotForm.InlineWord, [self_ref, index])
         // The pun the word was built through, undone in the same order.
         let punned = if slot.slot_word == "" { raw } else { ir_cast(ntid, th.closure, slot.slot_word, raw) }
-        let init = ir_cast(ntid, th.closure, loc.c_spelling, punned)
+        // A boxed capture travels as the address of a heap copy, so the name binds to what
+        // the address holds. Binding the address instead would read a pointer as the value.
+        let init = if slot.slot_form == SlotForm.PointerBoxed {
+            ir_unbox(ntid, th.closure, loc.c_spelling, loc.slot_form,
+                ir_cast(ntid, th.closure, slot.c_spelling, punned))
+        } else {
+            ir_cast(ntid, th.closure, loc.c_spelling, punned)
+        }
         stmts.push(ir_let(ntid, th.closure, loc.c_spelling, c_local_name(nm), loc.slot_form, init))
         i = i + 1
     }
