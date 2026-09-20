@@ -1095,14 +1095,18 @@ fn cc_lower_scope_alloc(node: Int, obj: Int, method: Str, is_alloc_n: Bool) -> I
     ir_sized_alloc(ptr_tid, node, ptr_rec.c_spelling, elem_rec.c_spelling, scope_ir, count_ir)
 }
 
-// The two plain-value Ptr methods: `offset`, arithmetic on the receiver's own type, and
-// `is_null`, a read of whether it holds no address. Both read the receiver and answer a
-// value, which is what tells them apart from `write` below — a store, not a read, and a
-// statement rather than a value wherever this stage is asked for one.
+// The three plain-value Ptr methods: `offset`, arithmetic on the receiver's own type;
+// `is_null`, a read of whether it holds no address; and `deref`, a read of the pointee
+// itself. All three read the receiver and answer a value, which is what tells them apart
+// from `write` below — a store, not a read, and a statement rather than a value wherever
+// this stage is asked for one.
 fn cc_lower_ptr_method(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
-    if method != "offset" && method != "is_null" { return cc_intrinsic_not_built(node, TyKind.Ptr, method) }
-    if method != "is_null" { return cc_lower_ptr_offset(node, obj) }
-    cc_lower_ptr_is_null(node, obj)
+    if method != "offset" && method != "is_null" && method != "deref" {
+        return cc_intrinsic_not_built(node, TyKind.Ptr, method)
+    }
+    if method != "is_null" && method != "deref" { return cc_lower_ptr_offset(node, obj) }
+    if method != "deref" { return cc_lower_ptr_is_null(node, obj) }
+    cc_lower_ptr_deref(node, obj)
 }
 
 // `p.offset(n)` steps the pointer by n of what it points at. C does the stepping and steps
@@ -1141,6 +1145,17 @@ fn cc_lower_ptr_is_null(node: Int, obj: Int) -> Int ! Diag.Report {
     let held = cc_local(recv, node)
     if cc_stopped(held) { return -1 }
     ir_binary(TYPE_BOOL, node, rec.c_spelling, "==", ptr, ir_const(recv, node, held.c_spelling, "0"))
+}
+
+// `p.deref()` reads the pointee: the same dereference `p.f` reads through, with no field
+// after it. The answer's own width is the pointee's, unstarred, whatever the pointee is —
+// unlike `offset`, this needs no known stride, since C is not stepping by it.
+fn cc_lower_ptr_deref(node: Int, obj: Int) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, TyKind.Ptr, "deref", 0, given) }
+    let ptr_tid = tid_of_node(obj)
+    if ptr_tid < 0 { return -1 }
+    cc_deref(node, obj, ptr_tid)
 }
 
 // `p.f.read()` and `p.f.write(v)`. The receiver is the PLACE the field occupies, not a
@@ -1222,12 +1237,13 @@ fn cc_field_store_not_a_value(node: Int) -> Int ! Diag.Report {
     -1
 }
 
-// The struct the pointer addresses. A pointer local is one machine word and reads as a
-// value, so nothing about the pointer itself says the field behind it is reached through
+// The value the pointer addresses. A pointer local is one machine word and reads as a
+// value, so nothing about the pointer itself says what is behind it is reached through
 // it: the dereference is written, and it is written at the pointee's own layout. The
 // pointer is the expression this takes, not a place it derives one from, so the same
-// dereference serves a field place (whose pointer is the field access's own object) and a
-// plain pointer receiver (which is the pointer itself) alike.
+// dereference serves a field place (whose pointer is the field access's own object), a
+// plain pointer receiver read by `deref` (which is the pointer itself), and the store
+// below alike.
 fn cc_deref(node: Int, ptr_expr: Int, ptr_tid: Int) -> Int ! Diag.Report {
     let pointee = child_tid(ptr_tid, Slot.Inner1)
     let held = cc_local(pointee, node)
@@ -1242,7 +1258,7 @@ fn cc_deref(node: Int, ptr_expr: Int, ptr_tid: Int) -> Int ! Diag.Report {
 // `p.write(v)` and `p.f.write(v)` store through a pointer. A store is a statement: the IR
 // has no value-position shape a FieldSet or an Assign fits, so the value slot still refuses
 // both — `p.f.write(v)` under FieldStoreNotAValue above, and the plain `p.write(v)` falls
-// out of the offset/is_null dispatch above as an ordinary "not built" method, since nothing
+// out of the offset/is_null/deref dispatch above as an ordinary "not built" method, since nothing
 // there ever answered for `write`. cg_stmt recognises the statement position instead and
 // calls in here; the value-slot refusals are untouched by this.
 
