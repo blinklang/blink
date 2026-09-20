@@ -30,7 +30,7 @@ import typecheck.{
     DECL_NODE_AMBIGUOUS,
     is_import_module_name, is_builtin_namespace, is_builtin_fn, is_intrinsic_method, tc_alias_to_original,
     tc_type_str,
-    tc_enum_variant_slots, tc_evar_name, tc_tid_child_count,
+    tc_enum_variant_slots, tc_evar_name, tc_tid_child_count, tc_tid_child,
     tc_struct_field_slots, tc_sfield_name,
     tc_names_a_type, tc_is_sealed_list_hof, is_user_effect_handle_name,
     tc_lookup_node_tid, tc_unclaimed_call_tid, tc_list_rename_help, tc_tid_iter_elem,
@@ -58,7 +58,7 @@ import ir.{
     ir_call_direct, ir_call_runtime, ir_call_closure, ir_call_indirect, ir_cast, ir_unary, ir_unbox, ir_box,
     ir_assign, ir_binary, ir_block, ir_break, ir_carrier_tag, ir_carrier_wrap,
     ir_const, ir_global_ref, ir_if, ir_let, ir_loop, ir_panic, ir_struct_new, ir_var_ref, ir_field_get,
-    ir_enum_new, ir_container_new,
+    ir_enum_new, ir_container_new, ir_sized_alloc,
 }
 import cg_expr.{
     lower_expr, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
@@ -1031,7 +1031,8 @@ fn cc_scope_op_arity(op: Str) -> Int {
 }
 
 fn cc_lower_scope_method(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
-    if method == "alloc" || method == "alloc_n" { return cc_allocation_size_not_in_ir(node, method) }
+    if method == "alloc" { return cc_lower_scope_alloc(node, obj, method, false) }
+    if method == "alloc_n" { return cc_lower_scope_alloc(node, obj, method, true) }
     let op = cc_scope_runtime_op(method)
     if op == "" { return cc_intrinsic_not_built(node, TyKind.FfiScope, method) }
     let want = cc_scope_op_arity(op)
@@ -1041,15 +1042,36 @@ fn cc_lower_scope_method(node: Int, obj: Int, method: Str) -> Int ! Diag.Report 
 }
 
 // `scope.alloc()` and `scope.alloc_n(n)` take room for a type, and the room is that type's
-// size in bytes. No IR node carries a size. The one size the printer writes is the heap
-// copy a Box makes, and it writes it from that node's own pointee name; an allocation is
-// not a copy, so nothing here can borrow it. Writing the size into this stage instead
-// would put C text in a producer, which is the one thing no producer here may do.
-fn cc_allocation_size_not_in_ir(node: Int, method: Str) -> Int ! Diag.Report {
-    diag_ice_at("AllocationSizeNotInIr", CODEGEN_STAGE_NOT_BUILT,
-        "'scope.{method}' must say how many bytes its pointee takes, and no IR node carries a size",
-        node, "the IR needs a node the printer writes as the size of a named type")
-    -1
+// size in bytes. Neither call spells its own pointee (the spec's `scope.alloc[T]()` bracket
+// is not a shape the parser accepts on a method call), so the pointee is read back off the
+// call's own tid instead — the type the annotation, parameter or return type expected of it,
+// which typecheck already resolved and published there before codegen ever runs
+// (tc_ffi_alloc_hint_tid). The call's tid is `Ptr[T]`; its first child is `T`, the element
+// `ir_sized_alloc` writes inside `sizeof`. `alloc` takes exactly one cell; `alloc_n` takes as
+// many as its one argument says.
+fn cc_lower_scope_alloc(node: Int, obj: Int, method: Str, is_alloc_n: Bool) -> Int ! Diag.Report {
+    let want = if is_alloc_n { 1 } else { 0 }
+    let given = sublist_length(node_args(node))
+    if given != want { return cc_intrinsic_arity_wrong(node, TyKind.FfiScope, method, want, given) }
+    let ptr_tid = tid_of_node(node)
+    if ptr_tid < 0 { return -1 }
+    let elem_tid = tc_tid_child(ptr_tid, 0)
+    if elem_tid < 0 { return -1 }
+    let ptr_rec = cc_local(ptr_tid, node)
+    if cc_stopped(ptr_rec) { return -1 }
+    let elem_rec = cc_local(elem_tid, node)
+    if cc_stopped(elem_rec) { return -1 }
+    let scope_ir = lower_expr(obj)
+    if scope_ir < 0 { return -1 }
+    let count_ir = if is_alloc_n {
+        lower_expr(sublist_get(node_args(node), 0))
+    } else {
+        let one_rec = cc_local(TYPE_INT, node)
+        if cc_stopped(one_rec) { return -1 }
+        ir_const(TYPE_INT, node, one_rec.c_spelling, "1")
+    }
+    if count_ir < 0 { return -1 }
+    ir_sized_alloc(ptr_tid, node, ptr_rec.c_spelling, elem_rec.c_spelling, scope_ir, count_ir)
 }
 
 // `p.offset(n)` steps the pointer by n of what it points at. C does the stepping and steps

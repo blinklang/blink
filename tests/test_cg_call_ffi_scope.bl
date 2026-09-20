@@ -7,9 +7,11 @@
 // runtime calls over it, pointer arithmetic is arithmetic on the receiver's own pointer
 // type, and a field reached through a pointer is a dereference and then the field.
 //
-// The two allocators are the exception and are pinned here as refusals. A size is what
-// they need and no IR node spells one, so building them would mean writing a `sizeof` into
-// this stage, which is the C text no producer here may write.
+// The two allocators take room for a type they never spell themselves: the pointee comes
+// back off the call's own tid, `Ptr[T]`, which typecheck already resolved from whatever
+// expected the call (a `let` annotation here) before codegen runs. `SizedAlloc` is the one
+// IR node built from that tid rather than the written source, carrying the element as the
+// sizeof operand the printer writes and the scope and count as its two kids.
 import lower_test_helpers.{
     probe, probe_but, rhs_of, let_node_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
     assert_ice, assert_ice_saying, ice_count,
@@ -145,18 +147,29 @@ test "take keeps the pointee its argument had, so its spelling is the argument's
     assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("kept"))), "uint8_t*")
 }
 
-// ── The two allocators, refused for the size they cannot spell ────────────
+// ── The two allocators ──────────────────────────────────────────────────────
 
-test "scope.alloc_n refuses: no IR node carries the size of the type it allocates" {
+test "scope.alloc_n is a sized allocation of as many cells as its argument says" {
     probe_ffi()
-    assert_ice_saying("alloc_n", lower_call(rhs_of("sized")), "AllocationSizeNotInIr",
-        "how many bytes")
+    let id = lower_call(rhs_of("sized"))
+    assert_kind("kind", id, IrKind.SizedAlloc)
+    assert_eq_str("spelled at its own pointer type", ir_c_spelling(id), "blink_Pollfd*")
+    assert_eq_str("element is the sizeof operand", ir_c_name(id), "blink_Pollfd")
+    assert_shape("shape", id, "SizedAlloc(VarRef, Const)")
+    assert_eq_str("scope comes first", ir_c_name(ir_kid(id, 0)), "scope")
+    assert_eq_str("count is the argument", ir_c_name(ir_kid(id, 1)), "2")
+    assert_verifies("verify", id)
 }
 
-test "scope.alloc refuses for the same missing size as the counted form" {
+test "scope.alloc is a sized allocation of exactly one cell" {
     probe_ffi()
-    assert_ice_saying("alloc", lower_call(rhs_of("one")), "AllocationSizeNotInIr",
-        "how many bytes")
+    let id = lower_call(rhs_of("one"))
+    assert_kind("kind", id, IrKind.SizedAlloc)
+    assert_eq_str("spelled at its own pointer type", ir_c_spelling(id), "blink_Pollfd*")
+    assert_eq_str("element is the sizeof operand", ir_c_name(id), "blink_Pollfd")
+    assert_shape("shape", id, "SizedAlloc(VarRef, Const)")
+    assert_eq_str("count is one cell", ir_c_name(ir_kid(id, 1)), "1")
+    assert_verifies("verify", id)
 }
 
 // ── Pointer arithmetic ────────────────────────────────────────────────────
@@ -210,6 +223,8 @@ test "lowering the accepted FFI calls reports no internal error" {
     let _ = lower_call(call_after("anchor", "scope"))
     let _ = lower_call(rhs_of("text"))
     let _ = lower_call(rhs_of("kept"))
+    let _ = lower_call(rhs_of("sized"))
+    let _ = lower_call(rhs_of("one"))
     let _ = lower_call(rhs_of("next"))
     let _ = lower_call(rhs_of("got"))
     assert_eq_str("ice count", "{ice_count()}", "{before}")
@@ -320,12 +335,11 @@ test "scope.alloc[U8]() refuses: a call-site type argument has no lowering here"
 }
 
 // The plain, unbracketed call is a different shape entirely (no IndexExpr callee at all)
-// and must reach its own, unrelated refusal untouched: the bracket guard must never widen
-// past the one shape it exists for.
-test "scope.alloc() with no bracket still reaches its own refusal, untouched" {
+// and must build, untouched: the bracket guard must never widen past the one shape it
+// exists for.
+test "scope.alloc() with no bracket still builds, untouched by the bracket guard" {
     probe_ffi()
-    assert_ice_saying("plain alloc", lower_call(rhs_of("one")), "AllocationSizeNotInIr",
-        "how many bytes")
+    assert_kind("plain alloc", lower_call(rhs_of("one")), IrKind.SizedAlloc)
 }
 
 fn src_wrong_arity_with_ptr() -> Str {
