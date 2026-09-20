@@ -19,11 +19,18 @@ asks it and never builds a name from parts.
 - An instance tid names its base by bare name only. When two modules declared that
   bare name, `tc_tid_decl_node` answers `DECL_NODE_AMBIGUOUS` and cname fails closed
   with `ICE_SEG_AMBIGUOUS_DECL`.
-- Two facts come from neither the node nor the tid. The owner marks the declaration
-  and cname reads the mark:
+- Three facts come from neither the node nor the tid. Two are marks the owner sets
+  on the declaration and cname reads back:
   - `cname_mark_runtime_owned(td)`: the type's C typedef lives in `runtime.h`.
   - `cname_mark_transparent_newtype(td)`: the type lowers to a bare `int64_t`.
-- `cname_reset()` clears both marks.
+- `cname_reset()` clears those two marks, and nothing else.
+- The third is the set of declared user effect handles, which typecheck owns and
+  clears per program. `effect_root_of` asks `is_user_effect_handle_name` whether a
+  Handler tid's root was declared, so `c_vtable_type_name`, `c_ev_field_name` and
+  `c_effect_default_op_name` all answer through it. A root that is neither builtin
+  nor declared is `ICE_SEG_UNHANDLED_KIND`. Because the set lives in typecheck,
+  `cname_reset()` does not clear it: a cname test that wants a user effect must
+  reach a typecheck that declared one.
 
 ## Name forms
 

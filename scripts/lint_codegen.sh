@@ -66,6 +66,11 @@ L11 untested_pub_fns 0
 # defined twice anywhere in src/ is a twin; a name missing while its owner
 # exists is an unported producer.
 #
+# The evidence-vector family (c_ev_*, c_effect_default_op_name,
+# c_builtin_effect_slot) is listed together: the perform half and the handler
+# half each spell the same words, so a name that loses its producer must be
+# named here rather than re-spelled at the second reader.
+#
 # These are cname.bl's own spellings, not the pre-rewrite ones. Three old names
 # have no successor and are gone for a reason: c_fn_name_in and c_type_c_name_in
 # took an explicit mangling module, which cname.bl now derives unconditionally
@@ -86,6 +91,12 @@ c_display_dispatch_name cname
 c_derive_method_name cname
 c_variant_discriminant cname
 c_vtable_type_name cname
+c_ev_type_name cname
+c_ev_global_name cname
+c_ev_param_name cname
+c_ev_field_name cname
+c_effect_default_op_name cname
+c_builtin_effect_slot cname
 c_kops_table_name cname
 td_guard_name cname
 c_mint_local cname
