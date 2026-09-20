@@ -2,9 +2,10 @@
 //
 // These tests split the eight List methods the way the lowering does: by what answers the
 // call. Three reach a function the standard library declares, two reach a runtime
-// primitive, one is a scan built as a loop, and two are refused under their own names. What
-// each test pins is the symbol the call names, the shape of the built node, and for the
-// stores which argument was the element that went into the slot.
+// primitive, one is a scan built as a loop, two -- get and pop -- are length- or
+// bounds-tested reads that hoist their own statements, and one is refused under its own
+// name. What each test pins is the symbol the call names, the shape of the built node, and
+// for the stores which argument was the element that went into the slot.
 import lower_test_helpers.{
     probe, probe_but, rhs_of, let_node_of, assert_eq_str, assert_shape, assert_verifies,
     assert_ice_saying, assert_refused_saying,
@@ -116,8 +117,8 @@ fn main() {
 "#
 }
 
-// The two this stage cannot build. `get` and `pop` both answer an Option, which is a
-// carrier filled by statements.
+// `get` and `pop` both answer an Option, which is a carrier filled by statements a guard
+// hoists ahead of it -- a bounds test for `get`, a length test for `pop`.
 fn src_refused() -> Str {
     #"fn main() {
     let mut xs: List[Int] = [1]
@@ -292,10 +293,24 @@ test "a get answering a carrier is a bounds-tested read, not a refusal" {
     assert_eq_str("some symbol", ir_c_name(ir_kid(ir_kid(payload, 0), 0)), "blink_list_get")
 }
 
-test "a pop answering a carrier is refused by name" {
+// `pop` takes no index, so it hoists one fewer statement than `get`: a length test stands
+// in for the bounds test, and the runtime's own blink_list_pop -- which removes the tail
+// and answers it, and panics on an empty list the same way blink_list_get panics on an
+// out-of-bounds index -- is called only from the Some arm the length test has already
+// guarded.
+test "a pop answering a carrier is a length-tested read, not a refusal" {
     probe("lm_pop", src_refused())
+    let mark = cg_expr_pending_count()
     let built = lower_expr(rhs_of("p"))
-    assert_ice_saying("pop", built, "CheckedElementReadNotLowered", "answering Option")
+    let stmts = cg_expr_take_pending(mark)
+    assert_shape("answer", built, "VarRef")
+    assert_verifies("answer", built)
+    let guard = stmts.get(1).unwrap()
+    assert_eq_str("guard symbol", ir_c_name(ir_kid(guard, 0)), "blink_list_len")
+    let branch = stmts.get(stmts.len() - 1).unwrap()
+    let some = ir_kid(ir_kid(ir_kid(branch, 1), 0), 1)
+    let payload = ir_kid(some, 1)
+    assert_eq_str("some symbol", ir_c_name(ir_kid(ir_kid(payload, 0), 0)), "blink_list_pop")
 }
 
 // The loop `contains` builds hoists every one of its statements ahead of the expression
