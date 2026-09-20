@@ -1,14 +1,14 @@
 // scope.alloc/alloc_n reached through an assignment target (`p = scope.alloc_n(4)`)
 // rather than through a `let` binding. typecheck seeds the assignment target's declared
 // type into the hint that answers the allocation's pointee (tc_infer_assigned_value), so
-// this stage sees the same tid it would see from a `let`. It refuses for the same reason
-// the `let` form does — no IR node carries a size, so nothing here may write one — and it
-// must refuse by the same name, not fall through to a miscompile: this is the shape of the
-// bug the allocator used to have (sizeof(void) from an unseeded size), pinned as a refusal
-// instead of a silent wrong size.
-import lower_test_helpers.{probe, assert_ice_saying}
-import parser.{node_kind, node_target, node_value, nodes}
+// this stage sees the same tid it would see from a `let`, and builds the same SizedAlloc
+// node either way: the assignment writes the node to an existing name, but the node itself
+// does not know or care that it is not the pointer's first value.
+import lower_test_helpers.{probe, assert_kind, assert_eq_str}
+import parser.{node_kind, node_target, node_value, node_name, nodes}
 import ast.{NodeKind, nk_of}
+import layout.{binder_scope_push, bind_binder, tid_of_node}
+import ir.{IrKind, ir_c_name, ir_c_spelling}
 import cg_call.{lower_call}
 import mono.{run_mono}
 
@@ -26,7 +26,16 @@ fn assignment_rhs() -> Int {
     -1
 }
 
-test "scope.alloc_n assigned into an existing pointer refuses the same as a let binding" {
+fn with_resource_of(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.WithResource && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+test "scope.alloc_n assigned into an existing pointer builds the same sized allocation as a let" {
     let program = probe("cg_call_alloc_assign_n", #"
 fn main() {
     with ffi.scope() as scope {
@@ -36,11 +45,14 @@ fn main() {
 }
 "#)
     run_mono(program)
-    assert_ice_saying("alloc_n via assignment", lower_call(assignment_rhs()), "AllocationSizeNotInIr",
-        "no IR node carries a size")
+    bind_binder(binder_scope_push(), "scope", tid_of_node(with_resource_of("scope")))
+    let id = lower_call(assignment_rhs())
+    assert_kind("alloc_n via assignment", id, IrKind.SizedAlloc)
+    assert_eq_str("spelled at its own pointer type", ir_c_spelling(id), "int64_t*")
+    assert_eq_str("element is the sizeof operand", ir_c_name(id), "int64_t")
 }
 
-test "scope.alloc assigned into an existing pointer refuses the same as a let binding" {
+test "scope.alloc assigned into an existing pointer builds the same sized allocation as a let" {
     let program = probe("cg_call_alloc_assign", #"
 fn main() {
     with ffi.scope() as scope {
@@ -50,6 +62,9 @@ fn main() {
 }
 "#)
     run_mono(program)
-    assert_ice_saying("alloc via assignment", lower_call(assignment_rhs()), "AllocationSizeNotInIr",
-        "no IR node carries a size")
+    bind_binder(binder_scope_push(), "scope", tid_of_node(with_resource_of("scope")))
+    let id = lower_call(assignment_rhs())
+    assert_kind("alloc via assignment", id, IrKind.SizedAlloc)
+    assert_eq_str("spelled at its own pointer type", ir_c_spelling(id), "int64_t*")
+    assert_eq_str("element is the sizeof operand", ir_c_name(id), "int64_t")
 }
