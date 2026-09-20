@@ -1,0 +1,76 @@
+// `Colour.Red` written without parentheses. Which C value that is depends on the shape of
+// the enum it names, and the enum's layout record is what says which: an enum whose
+// variants all carry nothing is one ordinal word, so the bare tag macro IS the value; an
+// enum where any variant carries a field is a tagged struct, so the value is a struct
+// holding that tag and no payload. Reading the tag macro as the whole value of a tagged
+// struct assigns an int to a struct, which no C compiler accepts.
+//
+// The call spelling `Colour.Red()` already builds the struct. Both spellings name one
+// value, so both must lower to the same thing.
+
+import std.io
+import diagnostics.{diag_reset}
+import mono.{run_mono}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import layout.{layout_reset}
+import ir.{ir_reset}
+import cg_test_helpers.{cg_probe_compile}
+import cg_stmt.{cg_stmt_reset, lower_fn}
+import cg_expr.{cg_expr_reset}
+import lower_test_helpers.{assert_eq_str, shape}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn probe_fn(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/{stem}_probe.bl"
+    let program = cg_probe_compile(path, src)
+    let _rm = process_run("rm", ["-f", path])
+    run_mono(program)
+    layout_reset()
+    ir_reset()
+    cg_expr_reset()
+    cg_stmt_reset()
+    diag_reset()
+    let f = find_fn(name)
+    assert(f >= 0)
+    lower_fn(f)
+}
+
+// Shade carries a field, so Shade is a tagged struct and every one of its variants is
+// built as one, the payload-less arms included.
+fn tagged_src() -> Str {
+    #"type Shade { Red, Green(name: Str) }
+fn pick() -> Shade {
+    let s: Shade = Shade.Red
+    s
+}
+"#
+}
+
+// Plain carries nothing anywhere, so it stays one ordinal word and the macro is the value.
+fn ordinal_src() -> Str {
+    #"type Plain { Red, Green }
+fn pick() -> Plain {
+    let p: Plain = Plain.Red
+    p
+}
+"#
+}
+
+test "a payload-less variant of a data-carrying enum is built as a tagged struct" {
+    let body = probe_fn("cg_expr_variant_tagged", tagged_src(), "pick")
+    assert_eq_str("block shape", shape(body), "Block(Let(EnumNew(Const)), Return(VarRef))")
+}
+
+test "a variant of an enum that carries nothing anywhere stays the bare ordinal" {
+    let body = probe_fn("cg_expr_variant_ordinal", ordinal_src(), "pick")
+    assert_eq_str("block shape", shape(body), "Block(Let(Const), Return(VarRef))")
+}
