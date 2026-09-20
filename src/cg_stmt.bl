@@ -20,11 +20,12 @@ import parser.{
 }
 import typecheck.{
     TyKind, TYPE_BOOL, TYPE_CHAR, TYPE_FLOAT, TYPE_INT, TYPE_STR, TYPE_VOID,
-    tc_alias_to_original, tc_global_decl_node, tc_tid_handler_effect, tc_tid_kind,
+    tc_alias_to_original, tc_enum_has_payload, tc_global_decl_node, tc_tid_handler_effect, tc_tid_kind,
 }
 import layout.{
     Position, Slot, SlotForm, LayoutRecord, bind_binder, bind_binder_mut, binder_scope_pop, binder_scope_push,
-    child_tid, ensure_typedef_for, layout_of, tid_of_binder, tid_of_node, varargs_spelling,
+    child_tid, ensure_typedef_for, layout_of, tid_holds_tag_member, tid_of_binder, tid_of_node,
+    varargs_spelling,
 }
 import cname.{
     c_assert_fail_eq_name, c_assert_fail_intro_name, c_assert_fail_name,
@@ -1652,14 +1653,24 @@ fn int_const(span: Int, literal: Str) -> Int ! Diag.Report {
 }
 
 // The value an arm label is compared against: an integer scrutinee compares with itself,
-// a carrier or enum compares with its discriminant.
+// a carrier or enum with a tag member compares with that member, and a payload-less enum
+// -- one machine word with no member beside it -- compares with itself the same way an
+// integer does.
 fn discriminant(ctx: MatchCtx, span: Int) -> Int ! Diag.Report {
     if tid_is_ordinal(ctx.tid) { return scrut_ref(ctx, span) }
-    if !tid_is_tagged(ctx.tid) {
-        diag_ice_stage_not_built("a match that compares a value holding no discriminant", span)
-        return int_const(span, "0")
+    if tid_holds_tag_member(ctx.tid) {
+        return ir_carrier_tag(TYPE_INT, span, int_spelling(span), scrut_ref(ctx, span))
     }
-    ir_carrier_tag(TYPE_INT, span, int_spelling(span), scrut_ref(ctx, span))
+    // tid_is_tagged is true for every enum and every carrier, so this is reached by two
+    // other kinds of one-word value too: a transparent newtype (the word is its payload,
+    // never a discriminant -- it has one variant, so it is never matched by tag) and an
+    // Option over an opaque handle (its arm compares by nullness, not by an integer tag).
+    // Both stay refused rather than picking a shape that would read the wrong thing.
+    if tid_is_tagged(ctx.tid) && tc_tid_kind(ctx.tid) == TyKind.Enum && !tc_enum_has_payload(ctx.tid) {
+        return scrut_ref(ctx, span)
+    }
+    diag_ice_stage_not_built("a match that compares a value holding no discriminant", span)
+    int_const(span, "0")
 }
 
 // A value one tag read tells apart: a carrier or a user enum. A struct, a tuple, a string
