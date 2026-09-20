@@ -1,0 +1,77 @@
+// A statement that stops drops the statements its value needed, so the temps those
+// statements declared are never declared in C. The rows naming those temps used to
+// outlive the drop, and a later reader would find a name for a temp nothing declares.
+// The rows roll back to a mark, the same way the statements do.
+
+import lower_test_helpers.{probe, rhs_of}
+import cg_expr.{
+    cg_expr_reset, cg_expr_register_value, cg_expr_is_registered, cg_expr_value_count,
+    cg_expr_drop_values,
+}
+
+fn src() -> Str {
+    #"fn main() {
+    let one = 1
+    let two = 2
+}
+"#
+}
+
+test "a row named past the mark is gone after the rollback" {
+    probe("cg_expr_value_rollback", src())
+    cg_expr_reset()
+    let mark = cg_expr_value_count()
+    cg_expr_register_value(rhs_of("one"), "t_one", 0)
+    assert(cg_expr_is_registered(rhs_of("one")))
+    cg_expr_drop_values(mark)
+    assert(!cg_expr_is_registered(rhs_of("one")))
+}
+
+// The mark is per statement, not per unit: an enclosing statement that already named a
+// temp keeps it when a statement inside it stops.
+test "a row named before the mark survives the rollback" {
+    probe("cg_expr_value_rollback", src())
+    cg_expr_reset()
+    cg_expr_register_value(rhs_of("one"), "t_one", 0)
+    let mark = cg_expr_value_count()
+    cg_expr_register_value(rhs_of("two"), "t_two", 0)
+    cg_expr_drop_values(mark)
+    assert(cg_expr_is_registered(rhs_of("one")))
+    assert(!cg_expr_is_registered(rhs_of("two")))
+}
+
+// The count is what a caller marks with, so it has to move with the rows. A count that
+// stood still would make every mark read zero and every rollback a whole-unit clear.
+test "naming a temp raises the count and the rollback lowers it" {
+    probe("cg_expr_value_rollback", src())
+    cg_expr_reset()
+    let before = cg_expr_value_count()
+    cg_expr_register_value(rhs_of("one"), "t_one", 0)
+    cg_expr_register_value(rhs_of("two"), "t_two", 0)
+    assert_eq(cg_expr_value_count(), before + 2)
+    cg_expr_drop_values(before)
+    assert_eq(cg_expr_value_count(), before)
+}
+
+// A node named twice keeps its row when only the second naming rolls back. The statement
+// stage asks cg_expr_is_registered before it names a node again, so this defends the rule
+// rather than a live caller; a rollback that removed the row would strand the first namer.
+test "a node named on both sides of the mark keeps its row" {
+    probe("cg_expr_value_rollback", src())
+    cg_expr_reset()
+    cg_expr_register_value(rhs_of("one"), "t_one", 0)
+    let mark = cg_expr_value_count()
+    cg_expr_register_value(rhs_of("one"), "t_one_again", 0)
+    cg_expr_drop_values(mark)
+    assert(cg_expr_is_registered(rhs_of("one")))
+}
+
+// The unit-wide clear and the mark-based rollback share the rows, so the clear has to
+// empty both halves. A count left behind would mark the next unit above its own rows.
+test "the reset empties the rows and the count" {
+    probe("cg_expr_value_rollback", src())
+    cg_expr_register_value(rhs_of("one"), "t_one", 0)
+    cg_expr_reset()
+    assert_eq(cg_expr_value_count(), 0)
+    assert(!cg_expr_is_registered(rhs_of("one")))
+}
