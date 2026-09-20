@@ -81,6 +81,8 @@ fn go() ! FFI {
         let stepped_home = home.offset(1)
         let got = next.fd.read()
         next.fd.write(7)
+        let plain: Ptr[Int] = scope.alloc()
+        let plain_write = plain.write(9)
         let _keep = [kept.is_null(), one.is_null(), got.to_int() == 0, next.is_null()]
     }
 }
@@ -227,6 +229,8 @@ test "lowering the accepted FFI calls reports no internal error" {
     let _ = lower_call(rhs_of("one"))
     let _ = lower_call(rhs_of("next"))
     let _ = lower_call(rhs_of("got"))
+    let _ = lower_call(rhs_of("plain"))
+    let _ = lower_call(call_after("kept", "is_null"))
     assert_eq_str("ice count", "{ice_count()}", "{before}")
 }
 
@@ -256,6 +260,34 @@ test "a field written through a pointer refuses: a store is a statement, not a v
     probe_ffi()
     assert_ice_saying("write", lower_call(call_after("got", "write")), "FieldStoreNotAValue",
         "a store is a statement")
+}
+
+// A plain `p.write(v)` reaches the same offset/is_null dispatch as every other Ptr method,
+// and nothing there answers `write` either: the store itself is built in statement position
+// (test_cg_stmt_ptr_write.bl), so a value slot still has no lowering for it, under the
+// ordinary "not built" refusal rather than a name of its own.
+test "a plain pointer written through a value slot refuses: write has no lowering there either" {
+    probe_ffi()
+    assert_ice_saying("plain write", lower_call(call_after("plain", "write")), "CodegenStageNotBuilt",
+        "not built")
+}
+
+// ── Ptr.is_null ────────────────────────────────────────────────────────────
+
+test "Ptr.is_null compares the pointer against the literal zero" {
+    probe_ffi()
+    let id = lower_call(call_after("kept", "is_null"))
+    assert_kind("kind", id, IrKind.Binary)
+    assert_eq_str("operator", ir_c_name(id), "==")
+    assert_shape("shape", id, "Binary(VarRef, Const)")
+    assert_verifies("verify", id)
+}
+
+test "is_null answers Bool regardless of what the pointer points at" {
+    probe_ffi()
+    // Bool's own local spelling is "int" (src/layout.bl:742), not C's `bool` — the same
+    // spelling every other TYPE_BOOL comparison in this codebase carries.
+    assert_eq_str("spelling", ir_c_spelling(lower_call(call_after("kept", "is_null"))), "int")
 }
 
 // ── The one call whose body is inlined, not run through the runtime ───────
