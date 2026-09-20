@@ -1,0 +1,58 @@
+// A plain assignment's target is read the same way a bare read is: nr_check_node's
+// Assignment/CompoundAssign handling only re-walks the target through the Ident branch (the
+// branch that calls nr_note_global_decl) for a CompoundAssign. A plain `=` took a separate
+// path that marked the name used and written but never recorded which declaration it
+// reaches, so tc_global_decl_node answered -1 for a plain assignment's own target even
+// though the exact same fact is already recorded for every read of that name and for a
+// `+=` target. This is the record cg_stmt.bl's lower_target reads to build the target's
+// lvalue, so the gap silently poisoned the target rather than reporting anything here.
+
+import typecheck.{check_types, tc_global_decl_node}
+import compiler.{compile_to_program}
+import parser.{node_count, node_kind, node_target}
+import ast.{nk_of, NodeKind}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn compile_only(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    let _rm = process_run("rm", ["-f", path])
+    check_types(program)
+}
+
+fn assert_no_errors(label: Str) {
+    let mut errs = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { errs = errs.concat("  {d.name}: {d.message}\n") }
+    }
+    if errs != "" { io.println("FAIL: {label}: unexpected diagnostics:\n{errs}") }
+    assert(errs == "")
+}
+
+// The target node of the one Assignment (never CompoundAssign) in the probe.
+fn plain_assign_target() -> Int {
+    let mut n = 0
+    while n < node_count() {
+        if nk_of(node_kind(n)) == NodeKind.Assignment { return node_target(n) }
+        n = n + 1
+    }
+    -1
+}
+
+test "a plain assignment to a module-level global stamps the same declaration a read would" {
+    compile_only("tc_global_assign_target", #"let mut pos: Int = 0
+
+fn advance() {
+    pos = 0
+}
+
+fn main() { advance() }
+"#)
+    assert_no_errors("plain assignment to a module-level global")
+    let target = plain_assign_target()
+    assert(target >= 0)
+    assert(tc_global_decl_node(target) >= 0)
+}
