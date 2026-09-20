@@ -58,7 +58,7 @@ import ir.{
     ir_call_direct, ir_call_runtime, ir_call_closure, ir_call_indirect, ir_cast, ir_unary, ir_unbox, ir_box,
     ir_assign, ir_binary, ir_block, ir_break, ir_carrier_tag, ir_carrier_wrap,
     ir_const, ir_global_ref, ir_if, ir_let, ir_loop, ir_panic, ir_struct_new, ir_var_ref, ir_field_get,
-    ir_field_set, ir_enum_new, ir_container_new, ir_sized_alloc,
+    ir_field_set, ir_enum_new, ir_container_new, ir_sized_alloc, ir_select,
 }
 import cg_expr.{
     lower_expr, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
@@ -2529,14 +2529,66 @@ fn cc_is_map_slot_method(kind: TyKind, method: Str) -> Bool {
     kind == TyKind.Map && method == "get"
 }
 
+// A present test and a value read, chosen between by one Select rather than declared into a
+// carrier by a statement: CarrierWrap already prints as a compound literal, so both arms are
+// expressions and the choice between them is too. The map and the key each appear on both
+// sides of that choice, so each is bound to its own local once, ahead of it, rather than
+// lowered or travelled a second time -- lowering an effectful key expression twice would run
+// it twice, and travelling the same raw value twice only ever declares a second local, never
+// re-reads the source.
 fn cc_map_slot_method(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
     let container = tid_of_node(obj)
     if container < 0 { return -1 }
     if child_tid(container, Slot.Inner2) < 0 { return cc_element_type_unrecorded(node, kind) }
-    diag_ice_at("MapSlotMethodNotLowered", CODEGEN_STAGE_NOT_BUILT,
-        "'Map.{method}' takes a value back out of the slot beside the key, and no node wraps it",
-        node, "the IR needs a keyed read that answers the value in the carrier it was asked for, and a present test the value cannot supply: a stored 0 leaves the slot as the same null the runtime answers for a key it does not hold")
-    -1
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let carrier = cc_local(tid, node)
+    if cc_stopped(carrier) { return -1 }
+    let _td = ensure_typedef_for(tid)
+    let shape = cc_slot_shape(node, container, kind, Slot.Inner2)
+    if cc_shape_stopped(shape) { return -1 }
+    let row = cc_keyed_row(kind, "contains_key")
+    let plan = cc_key_plan(node, container, kind, row)
+    if cc_key_stopped(plan) { return -1 }
+    let found = cc_local(TYPE_INT, node)
+    if cc_stopped(found) { return -1 }
+
+    let recv_rec = cc_local(container, node)
+    if cc_stopped(recv_rec) { return -1 }
+    let recv_val = lower_expr(obj)
+    if recv_val < 0 { return -1 }
+    let recv_name = c_mint_local("mg")
+    cg_expr_push_pending(node, ir_let(container, node, recv_rec.c_spelling, recv_name, recv_rec.slot_form, recv_val))
+    let recv_has = ir_var_ref(container, node, recv_rec.c_spelling, recv_name, recv_rec.slot_form)
+    let recv_get = ir_var_ref(container, node, recv_rec.c_spelling, recv_name, recv_rec.slot_form)
+
+    let key_val = lower_expr(sublist_get(node_args(node), 0))
+    if key_val < 0 { return -1 }
+    let key_name = c_mint_local("mg")
+    cg_expr_push_pending(node, ir_let(plan.tid, node, plan.value.c_spelling, key_name, plan.value.slot_form, key_val))
+    let key_has_raw = ir_var_ref(plan.tid, node, plan.value.c_spelling, key_name, plan.value.slot_form)
+    let key_get_raw = ir_var_ref(plan.tid, node, plan.value.c_spelling, key_name, plan.value.slot_form)
+    let key_has = cc_key_travel(node, plan, key_has_raw)
+    if key_has < 0 { return -1 }
+    let key_get = cc_key_travel(node, plan, key_get_raw)
+    if key_get < 0 { return -1 }
+
+    let has_call = ir_call_runtime(TYPE_INT, node, found.c_spelling, c_runtime_helper(row.op), found.slot_form, [recv_has, key_has])
+    let cond = ir_binary(TYPE_BOOL, node, found.c_spelling, "!=", has_call, ir_const(TYPE_INT, node, found.c_spelling, "0"))
+
+    let get_call = ir_call_runtime(shape.tid, node, container_slot_spelling(), c_runtime_helper("map_get"), SlotForm.InlineWord, [recv_get, key_get])
+    let native = ir_cast(shape.tid, node, shape.slot.c_spelling, cc_from_slot_word(shape.tid, node, shape.slot, get_call))
+    let member = cc_member_layout(node, tid, Slot.Inner1)
+    if cc_stopped(member) { return -1 }
+    let open_box = shape.boxed && member.slot_form != SlotForm.PointerBoxed
+    let payload = if open_box { ir_unbox(shape.tid, node, shape.value.c_spelling, shape.value.slot_form, native) } else { native }
+
+    let some = ir_carrier_wrap(tid, node, carrier.c_spelling, carrier_value_member,
+        ir_const(TYPE_INT, node, found.c_spelling, "{CARRIER_TAG_SOME}"), payload)
+    let none = ir_carrier_wrap(tid, node, carrier.c_spelling, "",
+        ir_const(TYPE_INT, node, found.c_spelling, "{CARRIER_TAG_NONE}"), -1)
+
+    ir_select(tid, node, carrier.c_spelling, carrier.slot_form, cond, some, none)
 }
 
 // What a container holds in one of its slots. A container that recorded no type for that

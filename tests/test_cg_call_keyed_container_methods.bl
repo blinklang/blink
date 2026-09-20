@@ -413,12 +413,58 @@ fn main() {
     assert_verifies("insert", built)
 }
 
-test "a read out of a map refuses on the carrier it has to answer" {
+// A read out of a map has no statement left to fill: the present test and the value read
+// are each one expression, and the choice between them is a third. The map and the key
+// each appear on both sides of that choice, so the two statements this leaves are the two
+// locals that let them, not any part of the carrier.
+type SlotLowered { answer: Int  recv_let: Int  key_let: Int }
+
+fn cc_probe_slot(anchor: Str) -> SlotLowered ! Diag.Report {
+    let mark = cg_expr_pending_count()
+    let built = lower_expr(rhs_of(anchor))
+    let stmts = cg_expr_take_pending(mark)
+    if stmts.len() != 2 {
+        io.println("FAIL: the call left {stmts.len()} statements, want 2")
+        assert(false)
+    }
+    SlotLowered { answer: built, recv_let: stmts.get(0).unwrap(), key_let: stmts.get(1).unwrap() }
+}
+
+// The present test's own call, and the value read's own call, each two kids down a
+// different arm of the Select.
+fn slot_present_call(answer: Int) -> Int { ir_kid(ir_kid(answer, 0), 0) }
+fn slot_value_call(answer: Int) -> Int { ir_kid(ir_kid(ir_kid(answer, 1), 1), 0) }
+
+test "a read out of a map is a Select choosing between a present carrier and an absent one" {
     probe("map_get", #"fn main() {
     let m: Map[Str, Int] = Map.new()
     let v = m.get("k")
 }
 "#)
-    let built = lower_expr(rhs_of("v"))
-    assert_ice_saying("get", built, "MapSlotMethodNotLowered", "takes a value back out of the slot")
+    let low = cc_probe_slot("v")
+    assert_shape("map bound once", low.recv_let, "Let(VarRef)")
+    assert_shape("key bound once", low.key_let, "Let(Const)")
+    assert_shape("answer", low.answer,
+        "Select(Binary(CallRuntime(VarRef, VarRef), Const), CarrierWrap(Const, Cast(Cast(CallRuntime(VarRef, VarRef)))), CarrierWrap(Const))")
+    assert_eq_str("present test reaches the runtime's own has", ir_c_name(slot_present_call(low.answer)), "blink_map_has")
+    assert_eq_str("value read reaches the runtime's own get", ir_c_name(ir_kid(slot_value_call(low.answer), 0)), "blink_map_get")
+    assert_verifies("answer", low.answer)
+}
+
+// A struct value is already a pointer where it sits in the slot, and the carrier holds it
+// the same way, so nothing between the runtime's read and the carrier's payload narrows or
+// widens it: one cast spells the pointer as the value's own type, not the value itself.
+test "a struct value out of a map keeps its own pointer through the carrier" {
+    probe("map_get_struct", #"type Point { x: Int  y: Int }
+
+fn main() {
+    let mut m: Map[Str, Point] = Map.new()
+    m.insert("p", Point { x: 1, y: 2 })
+    let v = m.get("p")
+}
+"#)
+    let low = cc_probe_slot("v")
+    assert_shape("answer", low.answer,
+        "Select(Binary(CallRuntime(VarRef, VarRef), Const), CarrierWrap(Const, Cast(CallRuntime(VarRef, VarRef))), CarrierWrap(Const))")
+    assert_verifies("answer", low.answer)
 }
