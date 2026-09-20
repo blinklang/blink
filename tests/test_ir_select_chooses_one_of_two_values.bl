@@ -1,0 +1,114 @@
+// A read that answers a carrier has to say "absent" with something the value cannot say:
+// a map slot holding 0 is the same null the runtime answers for a key it does not hold.
+// The runtime already separates the two questions, so the read is a probe and a value, and
+// what was missing between them was a conditional. Select is that conditional and nothing
+// more: it names no container, so the same node carries a bounds-checked list read.
+import std.io
+import ir.{
+    IrKind, ir_reset, ir_new, ir_kind, ir_kind_name, ir_kind_from_name, ir_kind_is_value,
+    ir_all_kinds, ir_c_spelling, ir_kid_count, ir_kid, ir_slot_form, ir_slot_form_name,
+    ir_verify, ir_dump, ir_parse, ir_mark_materialize,
+    ir_const, ir_var_ref, ir_select, ir_call_runtime, ir_container_new, ir_expr_stmt,
+}
+import layout.{SlotForm}
+import cg_print.{print_reset, print_expr}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn map_var() -> Int { ir_var_ref(20, 0, "blink_map*", "m", SlotForm.PointerBoxed) }
+fn key_var() -> Int { ir_var_ref(3, 0, "const char*", "k", SlotForm.InlineWord) }
+
+// `blink_map_has(m, k)`: the present test, which the value it guards cannot supply.
+fn slot_probe() -> Int {
+    ir_call_runtime(1, 0, "int64_t", "blink_map_has", SlotForm.InlineWord, [map_var(), key_var()])
+}
+
+// The shape a keyed read lowers to, with the carrier arms stood in for by constants so the
+// row measures the conditional and not the carrier.
+fn keyed_read() -> Int {
+    ir_select(1, 0, "int64_t", SlotForm.InlineWord, slot_probe(), ir_const(1, 0, "int64_t", "1"), ir_const(1, 0, "int64_t", "0"))
+}
+
+test "a conditional between two values is a kind of its own" {
+    ir_reset()
+    let s = keyed_read()
+    assert_eq_str("kind", ir_kind_name(ir_kind(s)), "Select")
+    assert_eq_int("it is a value", if ir_kind_is_value(IrKind.Select) { 1 } else { 0 }, 1)
+    assert_eq_int("the name resolves back", match ir_kind_from_name("Select") { Some(_k) => 1 None => 0 }, 1)
+    let mut listed = 0
+    for k in ir_all_kinds() {
+        if ir_kind_name(k) == "Select" { listed += 1 }
+    }
+    assert_eq_int("listed once in the kind table", listed, 1)
+}
+
+test "a conditional holds its test and its two answers in that order" {
+    ir_reset()
+    let s = keyed_read()
+    assert_eq_int("test and both answers", ir_kid_count(s), 3)
+    assert_eq_str("the test comes first", ir_kind_name(ir_kind(ir_kid(s, 0))), "CallRuntime")
+    assert_eq_str("spelled at the type it answers", ir_c_spelling(s), "int64_t")
+    assert_eq_str("held as the answer is held", ir_slot_form_name(ir_slot_form(s)), "InlineWord")
+    assert_eq_int("it verifies", ir_verify(s).len(), 0)
+}
+
+test "the arity table admits three kids and nothing else" {
+    ir_reset()
+    let two = ir_new(IrKind.Select, 1, 0, "int64_t", "", SlotForm.InlineWord, [slot_probe(), ir_const(1, 0, "int64_t", "1")])
+    let errs = ir_verify(ir_expr_stmt(0, two))
+    let mut hit = 0
+    for e in errs { if e.contains("expects 3 kids") { hit += 1 } }
+    if hit == 0 { io.println("FAIL: a two-kid conditional was accepted; got: {errs.join(" | ")}") }
+    assert_eq_int("a two-kid conditional is rejected", if hit > 0 { 1 } else { 0 }, 1)
+}
+
+test "a conditional prints as a C conditional over its three kids" {
+    ir_reset()
+    print_reset()
+    assert_eq_str("print shape", print_expr(keyed_read()), "(blink_map_has(m, k) ? 1 : 0)")
+}
+
+// C's `?:` skips the answer it does not take, and a statement the printer binds for that
+// answer is written before the operator and runs regardless. This is the rule `&&` and
+// `||` already carry; a conditional reaches one of two answers, so both are guarded.
+test "an answer that binds a statement is rejected because the conditional skips it" {
+    ir_reset()
+    let heavy = ir_container_new(20, 0, "blink_list*", "blink_list_new", "", [ir_const(1, 0, "int64_t", "1")])
+    let taken = ir_select(20, 0, "blink_list*", SlotForm.PointerBoxed, slot_probe(), heavy, ir_var_ref(20, 0, "blink_list*", "e", SlotForm.PointerBoxed))
+    let errs = ir_verify(taken)
+    let mut hit = 0
+    for e in errs { if e.contains("binds a statement the conditional cannot skip") { hit += 1 } }
+    if hit == 0 { io.println("FAIL: an answer binding a statement was accepted; got: {errs.join(" | ")}") }
+    assert_eq_int("the taken answer is guarded", if hit > 0 { 1 } else { 0 }, 1)
+
+    ir_reset()
+    let marked = ir_var_ref(1, 0, "int64_t", "z", SlotForm.InlineWord)
+    ir_mark_materialize(marked)
+    let untaken = ir_select(1, 0, "int64_t", SlotForm.InlineWord, slot_probe(), ir_const(1, 0, "int64_t", "1"), marked)
+    let errs2 = ir_verify(untaken)
+    let mut hit2 = 0
+    for e in errs2 { if e.contains("binds a statement the conditional cannot skip") { hit2 += 1 } }
+    if hit2 == 0 { io.println("FAIL: the untaken answer was left unguarded; got: {errs2.join(" | ")}") }
+    assert_eq_int("the untaken answer is guarded too", if hit2 > 0 { 1 } else { 0 }, 1)
+}
+
+test "a conditional round-trips through dump and parse" {
+    ir_reset()
+    let text = ir_dump(keyed_read())
+    let back = ir_parse(text)
+    assert_eq_int("parsed", if back >= 0 { 1 } else { 0 }, 1)
+    assert_eq_str("kind survives", ir_kind_name(ir_kind(back)), "Select")
+    assert_eq_int("all three kids survive", ir_kid_count(back), 3)
+    assert_eq_str("re-dump is stable", ir_dump(back), text)
+}
