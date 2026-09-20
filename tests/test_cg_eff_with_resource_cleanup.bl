@@ -8,11 +8,15 @@
 // protocol that also feeds the binder. Typecheck rejects that pair, so the order is a
 // guard rather than a live choice, and the case is proved on the illegal probe below.
 //
-// Only the plain binding can be lowered today. The other three need a function whose
-// first parameter is a pointer to the guard local, and no stage emits one yet, so they
-// answer their protocol and record an internal error naming what is missing. A guessed
-// symbol would link against nothing or, worse, read a neighbouring stack slot as a flag.
+// Three of the four carry the symbol the guard local runs on the way out. The FFI scope's
+// is the runtime's own; Closeable's is the close method the user wrote, which is already
+// an ordinary C function taking the resource by value. BlockHandler has no such method,
+// because its binder holds the Context that enter() answers rather than the resource, so
+// it still answers its protocol and records an internal error naming what is missing. A
+// guessed symbol would link against nothing or, worse, read a neighbouring stack slot as
+// a flag.
 
+import cname.{c_impl_method_name}
 import cname_test_helpers.{find_decl, find_impl}
 import cg_test_helpers.{cg_probe_compile, cg_probe_compile_but}
 import ast.{NodeKind}
@@ -194,19 +198,43 @@ test "an FFI scope resource takes the scope protocol, not a plain binding" {
     assert_eq(rc.impl_block, -1)
 }
 
-// Closeable and BlockHandler still need an exit runner no stage emits, so each travels
-// with its impl block and one internal error naming what is missing.
-test "a protocol with no exit runner yet reports exactly one internal error" {
+// BlockHandler still needs an exit runner no stage emits: its binder holds the Context
+// that enter() answers, not the resource, so no method the user wrote takes the shape the
+// guard calls. It travels with its impl block and one internal error naming what is
+// missing, rather than degrading to a plain binding that would never run exit().
+test "a BlockHandler resource reports exactly one internal error, naming what is missing" {
     setup()
-    for binder in ["logged", "latch", "guarded"] {
-        diag_reset()
-        let rc = cg_eff_resource_cleanup(item(binder))
-        assert(rc.protocol != CleanupProtocol.Plain)
-        if ices() != 1 {
-            io.println("FAIL: {binder}: {ices()} internal errors, want 1")
-        }
-        assert_eq(ices(), 1)
+    diag_reset()
+    let rc = cg_eff_resource_cleanup(item("guarded"))
+    assert(rc.protocol == CleanupProtocol.BlockHandler)
+    assert_eq(rc.exit_symbol, "")
+    if ices() != 1 {
+        io.println("FAIL: guarded: {ices()} internal errors, want 1")
     }
+    assert_eq(ices(), 1)
+}
+
+// Closeable has its runner: the close method the user wrote. Both probes are checked,
+// because a struct and an enum reach it by different declaration shapes and a fix that
+// only spelled one would leave the other unclosed. The expected symbol is built by the
+// producer the definition is spelled with, never written out, so a rename moves both.
+test "a Closeable struct names the close symbol as its exit runner and reports nothing" {
+    setup()
+    diag_reset()
+    let rc = cg_eff_resource_cleanup(item("logged"))
+    assert_eq(rc.protocol, CleanupProtocol.Closeable)
+    assert_eq(rc.exit_symbol, c_impl_method_name(find_impl("Logged", "Closeable", ""), "close"))
+    assert_eq(rc.passes_ok, false)
+    assert_eq(ices(), 0)
+}
+
+test "a Closeable enum names the close symbol as its exit runner and reports nothing" {
+    setup()
+    diag_reset()
+    let rc = cg_eff_resource_cleanup(item("latch"))
+    assert_eq(rc.protocol, CleanupProtocol.Closeable)
+    assert_eq(rc.exit_symbol, c_impl_method_name(find_impl("Latch", "Closeable", ""), "close"))
+    assert_eq(ices(), 0)
 }
 
 // FfiScope is the one non-Plain protocol with a runner already: the runtime's own
@@ -216,6 +244,7 @@ test "an FFI scope resource reports no internal error" {
     diag_reset()
     let rc = cg_eff_resource_cleanup(item("scope"))
     assert_eq(rc.protocol, CleanupProtocol.FfiScope)
+    assert_eq(rc.exit_symbol, "blink_ffi_scope_cleanup")
     assert_eq(ices(), 0)
 }
 

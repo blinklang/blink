@@ -1,0 +1,213 @@
+// The exit runner a Closeable resource takes on the way out of a `with` block.
+//
+// A guard local runs one function when its scope ends, and that function takes the
+// resource by value. Closeable declares exactly that shape: `fn close(self)`. The impl
+// writing it is an ordinary impl block, so the declaration stage already emits an
+// ordinary C function for it, and the guard machinery already wraps an arbitrary symbol
+// of that shape in its own state struct and cleanup attribute. Nothing has to be
+// synthesised: the exit runner is the close method the user wrote.
+//
+// So the question this file settles is which symbol the cleanup names, and it reads the
+// answer from the same producer the definition is spelled with. A literal repeated here
+// would pass while the definition moved, and the guard would then link against nothing.
+//
+// BlockHandler is deliberately left refusing. Its binder holds the Context that `enter`
+// answers rather than the resource itself, which is a different shape from the one the
+// guard stores, and the row below pins that it still says so rather than silently taking
+// the Closeable path.
+
+import cname_test_helpers.{find_decl, find_impl}
+import cg_test_helpers.{cg_probe_compile, cg_text_occurrences}
+import ast.{NodeKind}
+import parser.{node_value}
+import typecheck.{TYPE_INT}
+import layout.{
+    Position, bind_binder_mut, binder_scope_pop, binder_scope_push, layout_of, layout_reset,
+    tid_of_node,
+}
+import ir.{ir_reset}
+import cname.{c_impl_method_name, cname_reset}
+import cg_reg.{cg_reg_build}
+import cg_print.{print_reset, print_take}
+import cg_expr.{cg_expr_reset}
+import cg_stmt.{cg_stmt_reset, lower_block_returning}
+import cg_eff.{
+    CleanupProtocol, cg_eff_lower_closure, cg_eff_pending_thunks, cg_eff_print_thunk,
+    cg_eff_reset, cg_eff_resource_cleanup, cg_eff_thunk_body_node, cg_eff_thunk_close,
+    cg_eff_thunk_open, cg_eff_thunk_symbol,
+}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+
+fn probe_src() -> Str {
+    #"import std.traits
+
+type Sock { fd: Int }
+
+impl Closeable for Sock {
+    fn close(self) {}
+}
+
+type Guarded { fd: Int }
+
+impl BlockHandler for Guarded {
+    type Context = Int
+    fn enter(self) -> Int { self.fd }
+    fn exit(self, _ok: Bool) {}
+}
+
+fn capturing() -> Int {
+    let n = 7
+    let g_cap = fn(x: Int) -> Int { x + n }
+    g_cap(1)
+}
+
+fn main() {
+    let h = Sock { fd: 3 }
+    let g = Guarded { fd: 4 }
+    with h as sock { io.println("{sock.fd}") }
+    with g as guarded { io.println("{guarded}") }
+    io.println("{capturing()}")
+}
+"#
+}
+
+fn ices() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" { n = n + 1 }
+    }
+    n
+}
+
+fn ices_saying(marker: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.message.contains(marker) { n = n + 1 }
+    }
+    n
+}
+
+fn report_ices(label: Str) {
+    io.println("FAIL: {label}")
+    for d in diag_entries {
+        if d.severity == "ice" { io.println("  ICE {d.name} {d.message}") }
+    }
+}
+
+// Every stage this file drives keeps process globals, so each test rebuilds the probe
+// rather than reading what the test before it left behind.
+fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    diag_reset()
+    ir_reset()
+    print_reset()
+    layout_reset()
+    cname_reset()
+    cg_stmt_reset()
+    cg_expr_reset()
+    cg_eff_reset()
+    let path = "build/cg_eff_closeable_cleanup_symbol_probe.bl"
+    let program = cg_probe_compile(path, probe_src())
+    let _ = fs.delete(path)
+    cg_reg_build(program)
+    diag_reset()
+}
+
+fn item(binder: Str) -> Int {
+    let n = find_decl(NodeKind.WithResource, binder, "")
+    assert(n >= 0)
+    n
+}
+
+// The C type the guard's state struct has to store the resource in, read the way every
+// other stage reads a tid's C type rather than written out here.
+fn resource_spelling(binder: Str) -> Str ! Diag.Report {
+    layout_of(tid_of_node(node_value(item(binder))), Position.Local).c_spelling
+}
+
+test "a Closeable resource reports no unbuilt stage, because its own close method is the exit runner" {
+    setup()
+    let rc = cg_eff_resource_cleanup(item("sock"))
+    if rc.protocol != CleanupProtocol.Closeable || ices() != 0 {
+        report_ices("a Closeable resource still refuses to name an exit runner")
+    }
+    assert_eq(rc.protocol, CleanupProtocol.Closeable)
+    assert_eq(ices(), 0)
+}
+
+test "the exit runner names the close symbol the impl's own definition is spelled with" {
+    setup()
+    let _ = cg_eff_resource_cleanup(item("sock"))
+    let close = c_impl_method_name(find_impl("Sock", "Closeable", ""), "close")
+    let text = print_take()
+    if cg_text_occurrences(text, close) == 0 {
+        io.println("FAIL: guard support names no '{close}'\n--- output ---\n{text}")
+    }
+    assert(cg_text_occurrences(text, close) > 0)
+}
+
+// The state struct holds the resource by value and hands it to close by value, so a
+// struct spelled one way at the with-item and another way in the guard would not compile.
+test "the guard support stores the resource at the spelling the resource value has" {
+    setup()
+    let spelling = resource_spelling("sock")
+    let _ = cg_eff_resource_cleanup(item("sock"))
+    let text = print_take()
+    if cg_text_occurrences(text, "{spelling} resource;") != 1 {
+        io.println("FAIL: no '{spelling} resource;' in the guard state\n--- output ---\n{text}")
+    }
+    assert_eq(cg_text_occurrences(text, "{spelling} resource;"), 1)
+}
+
+// Two `with` blocks over one Closeable type share one exit runner, and a TU that defined
+// its support twice would not compile, so the support is written once per symbol.
+test "asking twice for one Closeable type writes the guard support once" {
+    setup()
+    let spelling = resource_spelling("sock")
+    let _ = cg_eff_resource_cleanup(item("sock"))
+    let _ = cg_eff_resource_cleanup(item("sock"))
+    let text = print_take()
+    assert_eq(cg_text_occurrences(text, "{spelling} resource;"), 1)
+    assert_eq(ices(), 0)
+}
+
+// The binder of a BlockHandler resource holds what `enter` answers, not the resource, so
+// the guard cannot store it the way it stores a Closeable. This slice does not build it,
+// and a silent Plain answer here would leave a resource whose exit never runs.
+test "a BlockHandler resource still reports the stage that would build it" {
+    setup()
+    let rc = cg_eff_resource_cleanup(item("guarded"))
+    assert_eq(rc.protocol, CleanupProtocol.BlockHandler)
+    assert_eq(ices_saying("BlockHandler"), 1)
+}
+
+// The thunk queue carries closure bodies and nothing else. A capture is read back out of
+// __self by the prologue the printer puts in front of the body, and a cleanup that
+// arrived through this queue would need that prologue suppressed. Nothing arrives through
+// it, so the prologue stays unconditional and this row is what says so.
+test "a captured closure's thunk still prints the prologue that binds its capture" {
+    setup()
+    let binding = find_decl(NodeKind.LetBinding, "g_cap", "")
+    assert(binding >= 0)
+    // A name is a capture only against a frame that binds it, which is the enclosing
+    // function's frame at the literal's site.
+    let outer = binder_scope_push()
+    bind_binder_mut(outer, "n", TYPE_INT, false)
+    let _ = cg_eff_lower_closure(node_value(binding))
+    binder_scope_pop()
+    assert_eq(cg_eff_pending_thunks(), 1)
+    let symbol = cg_eff_thunk_symbol(0)
+    assert(cg_eff_thunk_open(0) >= 0)
+    let body = lower_block_returning(cg_eff_thunk_body_node(0))
+    cg_eff_thunk_close()
+    assert(body >= 0)
+    cg_eff_print_thunk(0, body)
+    let text = print_take()
+    if cg_text_occurrences(text, "closure_get_capture") != 1 {
+        report_ices("the thunk printed no capture prologue")
+        io.println(text)
+    }
+    assert_eq(cg_text_occurrences(text, "{symbol}("), 1)
+    assert_eq(cg_text_occurrences(text, "closure_get_capture"), 1)
+}
