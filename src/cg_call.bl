@@ -476,8 +476,8 @@ fn cc_read_is_checked(node: Int) -> Bool {
 // from reusing a node the guard already owns; a node read twice is a tree that is not one.
 //
 // `.pop()` reaches this same seam (cc_list_not_built) for the same reason -- it, too,
-// answers a carrier behind a test the runtime cannot make for it -- but it takes no index
-// and the runtime has no checked-pop primitive yet, so it still falls through to the ICE.
+// answers a carrier behind a test the runtime cannot make for it -- but it takes no index,
+// so it is built by cc_checked_pop below rather than grown into this one.
 fn cc_checked_read(node: Int) -> Int ! Diag.Report {
     if node_method(node) != method_get { return cc_checked_read_not_built(node) }
     let tid = tid_of_node(node)
@@ -538,6 +538,55 @@ fn cc_checked_read_not_built(node: Int) -> Int ! Diag.Report {
         "an element read answering Option has no lowering here", node,
         "the bounds test and the carrier it fills are statements cg_expr must hoist")
     -1
+}
+
+// `.pop()` on a List: a length test filling an Option, the same shape cc_checked_read
+// builds for `.get(i)` with the index test and the index argument removed. blink_list_pop
+// removes the tail and answers it, and panics on an empty list the same way blink_list_get
+// panics on an out-of-bounds index, so it too is called only from the Some arm the guard
+// has already settled -- never ahead of the length test that decides whether that arm runs.
+fn cc_checked_pop(node: Int) -> Int ! Diag.Report {
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let container = tid_of_node(node_obj(node))
+    if container < 0 { return -1 }
+    if cc_kind(container) != TyKind.List { return cc_checked_read_not_built(node) }
+    let carrier = cc_local(tid, node)
+    if cc_stopped(carrier) { return -1 }
+    let shape = cc_slot_shape(node, container, TyKind.List, Slot.Inner1)
+    if cc_shape_stopped(shape) { return -1 }
+    let recv_rec = cc_local(container, node)
+    if cc_stopped(recv_rec) { return -1 }
+    let found = cc_local(TYPE_INT, node)
+    if cc_stopped(found) { return -1 }
+    let recv_val = lower_expr(node_obj(node))
+    if recv_val < 0 { return -1 }
+    let _td = ensure_typedef_for(tid)
+    let recv_name = c_mint_local("cr")
+    cg_expr_push_pending(node, ir_let(container, node, recv_rec.c_spelling, recv_name, recv_rec.slot_form, recv_val))
+    let said = c_mint_local("cr")
+    cg_expr_push_pending(node, ir_let(TYPE_INT, node, found.c_spelling, said, found.slot_form,
+        ir_call_runtime(TYPE_INT, node, found.c_spelling, c_runtime_helper("list_len"), found.slot_form,
+            [cc_temp_ref(node, container, recv_rec, recv_name)])))
+    let held = c_mint_local("cr")
+    cg_expr_push_pending(node, ir_let(tid, node, carrier.c_spelling, held, carrier.slot_form, -1))
+    let present = ir_binary(TYPE_BOOL, node, found.c_spelling, "!=",
+        cc_temp_ref(node, TYPE_INT, found, said), ir_const(TYPE_INT, node, found.c_spelling, "0"))
+    let raw = ir_call_runtime(shape.tid, node, container_slot_spelling(), c_runtime_helper("list_pop"), shape.slot.slot_form,
+        [cc_temp_ref(node, container, recv_rec, recv_name)])
+    let native = ir_cast(shape.tid, node, shape.slot.c_spelling, cc_from_slot_word(shape.tid, node, shape.slot, raw))
+    let member = cc_member_layout(node, tid, Slot.Inner1)
+    if cc_stopped(member) { return -1 }
+    let open_box = shape.boxed && member.slot_form != SlotForm.PointerBoxed
+    let payload = if open_box { ir_unbox(shape.tid, node, shape.value.c_spelling, shape.value.slot_form, native) } else { native }
+    let some = ir_carrier_wrap(tid, node, carrier.c_spelling, carrier_value_member,
+        ir_const(TYPE_INT, node, found.c_spelling, "{CARRIER_TAG_SOME}"), payload)
+    let none = ir_carrier_wrap(tid, node, carrier.c_spelling, "",
+        ir_const(TYPE_INT, node, found.c_spelling, "{CARRIER_TAG_NONE}"), -1)
+    cg_expr_push_pending(node, ir_if(node, present,
+        ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), some)]),
+        ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), none)])))
+    cc_temp_ref(node, tid, carrier, held)
 }
 
 // Neither syntax. The seam reads an element, so a node that is not one of the two reads
@@ -3531,11 +3580,13 @@ fn cc_pointer_body_not_lowered(node: Int) -> Int ! Diag.Report {
 }
 
 // The two List methods that are not one call, plus the scan. `get` and `pop` both answer
-// a carrier filled behind a test the runtime cannot make for them, which is the same gap
-// the index read already names. `contains` walks the elements comparing each through the
-// element's own table of operations, which cc_element_scan builds as a loop.
+// a carrier filled behind a test the runtime cannot make for them -- a bounds test for
+// `get`, a length test for `pop` -- so each has its own lowering below. `contains` walks
+// the elements comparing each through the element's own table of operations, which
+// cc_element_scan builds as a loop.
 fn cc_list_not_built(node: Int, method: Str) -> Int ! Diag.Report {
-    if method == "get" || method == "pop" { return cc_checked_read(node) }
+    if method == "get" { return cc_checked_read(node) }
+    if method == "pop" { return cc_checked_pop(node) }
     if method == "contains" {
         let container = tid_of_node(node_obj(node))
         if container < 0 { return -1 }
