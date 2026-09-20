@@ -63,6 +63,7 @@ fn say_err() { io.eprintln("e") }
 fn say_log() { io.log("l") }
 fn say_number() { io.println(3) }
 fn say_row() { io.println(Row { id: 1, label: "x" }) }
+fn say_flag() { io.println(true) }
 fn read_home() -> Option[Str] { env.var("HOME") }
 fn where_am_i() -> Str { env.cwd() }
 fn set_it() { env.set_var("A", "b") }
@@ -79,6 +80,7 @@ fn main() {
     say_log()
     say_number()
     say_row()
+    say_flag()
     let _h = read_home()
     let _w = where_am_i()
     set_it()
@@ -209,13 +211,42 @@ test "a print of a struct renders it through its Display impl" {
     assert_verifies(p)
 }
 
-test "a print of a number is refused by name, not rendered by a guess" {
+// The io slot takes text, and a number becomes text the same way a "{n}" hole does: one
+// format call carrying the conversion its own type asks for.
+test "a print of a number renders it through the same seam an interpolation hole uses" {
     setup()
     let p = builtin("say_number", "io", "println")
-    assert_eq(p, -1)
-    assert_eq(cg_probe_ices_named("PrintValueNotText"), 1)
-    assert_eq(ices(), 1)
-    assert_eq(cg_expr_pending_count(), 0)
+    report_ices()
+    assert_eq(ices(), 0)
+    assert(p >= 0)
+    assert_eq(ir_kid_count(p), 2)
+    let text = ir_kid(p, 1)
+    assert(ir_kind(text) == IrKind.CallRuntime)
+    assert_eq(ir_tid(text), TYPE_STR)
+    assert_verifies(p)
+}
+
+// A bool is the one printable value C cannot spell as an expression, so its render is a
+// temp two statements fill. The perform names that temp, and the statements ride the
+// pending buffer to the statement stage that emits them in front of the call. Dropping
+// them would print a variable nothing declared.
+test "a print of a bool names a temp and leaves the statements that fill it pending" {
+    setup()
+    let p = builtin("say_flag", "io", "println")
+    report_ices()
+    assert_eq(ices(), 0)
+    assert(p >= 0)
+    assert_eq(ir_kid_count(p), 2)
+    let text = ir_kid(p, 1)
+    assert(ir_kind(text) == IrKind.VarRef)
+    assert_eq(ir_tid(text), TYPE_STR)
+    let stmts = cg_expr_take_pending(0)
+    assert_eq(stmts.len(), 2)
+    for s in stmts {
+        let problems = ir_verify(s)
+        for q in problems { io.println("  verify: {q}") }
+        assert_eq(problems.len(), 0)
+    }
 }
 
 test "env.var reads the slot into a text temp and answers the Option built from it" {
