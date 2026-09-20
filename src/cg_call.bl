@@ -58,7 +58,7 @@ import ir.{
     ir_call_direct, ir_call_runtime, ir_call_closure, ir_call_indirect, ir_cast, ir_unary, ir_unbox, ir_box,
     ir_assign, ir_binary, ir_block, ir_break, ir_carrier_tag, ir_carrier_wrap,
     ir_const, ir_global_ref, ir_if, ir_let, ir_loop, ir_panic, ir_struct_new, ir_var_ref, ir_field_get,
-    ir_enum_new, ir_container_new, ir_sized_alloc,
+    ir_field_set, ir_enum_new, ir_container_new, ir_sized_alloc,
 }
 import cg_expr.{
     lower_expr, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
@@ -1095,15 +1095,27 @@ fn cc_lower_scope_alloc(node: Int, obj: Int, method: Str, is_alloc_n: Bool) -> I
     ir_sized_alloc(ptr_tid, node, ptr_rec.c_spelling, elem_rec.c_spelling, scope_ir, count_ir)
 }
 
+// The three plain-value Ptr methods: `offset`, arithmetic on the receiver's own type;
+// `is_null`, a read of whether it holds no address; and `deref`, a read of the pointee
+// itself. All three read the receiver and answer a value, which is what tells them apart
+// from `write` below — a store, not a read, and a statement rather than a value wherever
+// this stage is asked for one.
+fn cc_lower_ptr_method(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
+    if method != "offset" && method != "is_null" && method != "deref" {
+        return cc_intrinsic_not_built(node, TyKind.Ptr, method)
+    }
+    if method != "is_null" && method != "deref" { return cc_lower_ptr_offset(node, obj) }
+    if method != "deref" { return cc_lower_ptr_is_null(node, obj) }
+    cc_lower_ptr_deref(node, obj)
+}
+
 // `p.offset(n)` steps the pointer by n of what it points at. C does the stepping and steps
 // by the pointee, so the whole of what makes the answer right is that the pointer is
 // spelled at its own type. The call's tid is that type: typecheck preserves the pointee
 // across an offset, so the result is spelled exactly as the receiver is.
-fn cc_lower_ptr_method(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
-    if method != "offset" && method != "deref" { return cc_intrinsic_not_built(node, TyKind.Ptr, method) }
-    if method != "offset" { return cc_lower_ptr_deref(node, obj) }
+fn cc_lower_ptr_offset(node: Int, obj: Int) -> Int ! Diag.Report {
     let given = sublist_length(node_args(node))
-    if given != 1 { return cc_intrinsic_arity_wrong(node, TyKind.Ptr, method, 1, given) }
+    if given != 1 { return cc_intrinsic_arity_wrong(node, TyKind.Ptr, "offset", 1, given) }
     let recv = tid_of_node(obj)
     if recv < 0 { return -1 }
     if !cc_stride_is_known(recv) { return cc_offset_stride_unknown(node) }
@@ -1116,6 +1128,23 @@ fn cc_lower_ptr_method(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
     let step = lower_expr(sublist_get(node_args(node), 0))
     if step < 0 { return -1 }
     ir_binary(tid, node, rec.c_spelling, "+", base, step)
+}
+
+// `p.is_null()` reads true when the pointer holds no address. C answers that with a plain
+// comparison against the literal zero, the same idiom cc_handle_is uses for a runtime
+// handle; a pointer needs no runtime call of its own to ask.
+fn cc_lower_ptr_is_null(node: Int, obj: Int) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, TyKind.Ptr, "is_null", 0, given) }
+    let recv = tid_of_node(obj)
+    if recv < 0 { return -1 }
+    let rec = cc_local(TYPE_BOOL, node)
+    if cc_stopped(rec) { return -1 }
+    let ptr = lower_expr(obj)
+    if ptr < 0 { return -1 }
+    let held = cc_local(recv, node)
+    if cc_stopped(held) { return -1 }
+    ir_binary(TYPE_BOOL, node, rec.c_spelling, "==", ptr, ir_const(recv, node, held.c_spelling, "0"))
 }
 
 // `p.deref()` reads the pointee: the same dereference `p.f` reads through, with no field
@@ -1196,10 +1225,11 @@ fn cc_lower_ptr_field(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
     ir_field_get(field_tid, node, rec.c_spelling, c_field_name(node_name(obj)), rec.slot_form, place)
 }
 
-// `p.f.write(v)` stores into the field. A store is a statement, and this stage answers with
-// a value: the IR says so itself, because it refuses a statement in every slot that wants a
-// value, and a method call reaches the printer through one of those slots. So the store
-// cannot be built here, under any spelling, without emitting C the printer has to reject.
+// `p.f.write(v)` stores into the field. A store is a statement, and THIS function answers a
+// value slot: the IR says so itself, because it refuses a statement in every slot that
+// wants a value, and a method call reaches the printer through one of those slots here. The
+// store itself is built in cc_lower_ptr_field_write, from the statement position cg_stmt
+// recognises before a call ever reaches this function.
 fn cc_field_store_not_a_value(node: Int) -> Int ! Diag.Report {
     diag_ice_at("FieldStoreNotAValue", CODEGEN_STAGE_NOT_BUILT,
         "'write' through a pointer stores into a field, and a store is a statement this stage cannot answer with",
@@ -1209,7 +1239,11 @@ fn cc_field_store_not_a_value(node: Int) -> Int ! Diag.Report {
 
 // The value the pointer addresses. A pointer local is one machine word and reads as a
 // value, so nothing about the pointer itself says what is behind it is reached through
-// it: the dereference is written, and it is written at the pointee's own layout.
+// it: the dereference is written, and it is written at the pointee's own layout. The
+// pointer is the expression this takes, not a place it derives one from, so the same
+// dereference serves a field place (whose pointer is the field access's own object), a
+// plain pointer receiver read by `deref` (which is the pointer itself), and the store
+// below alike.
 fn cc_deref(node: Int, ptr_expr: Int, ptr_tid: Int) -> Int ! Diag.Report {
     let pointee = child_tid(ptr_tid, Slot.Inner1)
     let held = cc_local(pointee, node)
@@ -1217,6 +1251,70 @@ fn cc_deref(node: Int, ptr_expr: Int, ptr_tid: Int) -> Int ! Diag.Report {
     let ptr = lower_expr(ptr_expr)
     if ptr < 0 { return -1 }
     ir_unbox(pointee, node, held.c_spelling, held.slot_form, ptr)
+}
+
+// ── The store, in statement position ───────────────────────────────────────
+//
+// `p.write(v)` and `p.f.write(v)` store through a pointer. A store is a statement: the IR
+// has no value-position shape a FieldSet or an Assign fits, so the value slot still refuses
+// both — `p.f.write(v)` under FieldStoreNotAValue above, and the plain `p.write(v)` falls
+// out of the offset/is_null/deref dispatch above as an ordinary "not built" method, since nothing
+// there ever answered for `write`. cg_stmt recognises the statement position instead and
+// calls in here; the value-slot refusals are untouched by this.
+
+// The predicate cg_stmt tests before it lowers an ExprStmt as a pointer store. It decides
+// on the receiver's tid kind alone, never on a name: a field place is a Ptr whose FieldAccess
+// wraps it (the same shape cc_is_ptr_field_place resolves the read/write pair on), and a
+// plain receiver is a Ptr itself. Nothing here reads what the pointer is called or what it
+// points at.
+pub fn cc_is_ptr_write_stmt(node: Int) -> Bool ! Diag.Report {
+    if nk_of(node_kind(node)) != NodeKind.MethodCall { return false }
+    let mname = node_method(node)
+    if mname != "write" { return false }
+    let obj = node_obj(node)
+    if cc_is_ptr_field_place(obj, mname) { return true }
+    let recv = tid_of_node(obj)
+    if recv < 0 { return false }
+    cc_kind(recv) == TyKind.Ptr
+}
+
+// The store itself, once cc_is_ptr_write_stmt has already said this node is one. The value
+// is lowered once here, ahead of the branch on shape, so neither branch below has to repeat
+// the argument-count check the two shapes share.
+pub fn cc_lower_ptr_write_stmt(node: Int) -> Int ! Diag.Report {
+    let obj = node_obj(node)
+    let given = sublist_length(node_args(node))
+    if given != 1 { return cc_intrinsic_arity_wrong(node, TyKind.Ptr, "write", 1, given) }
+    let value = lower_expr(sublist_get(node_args(node), 0))
+    if value < 0 { return -1 }
+    if cc_is_ptr_field_place(obj, "write") { return cc_lower_ptr_field_write(node, obj, value) }
+    cc_lower_ptr_plain_write(node, obj, value)
+}
+
+// `p.f.write(v)` stores into the field the place names. The place is the dereferenced
+// pointer, exactly as `p.f.read()` builds it above; this FieldSet is the store the read's
+// own FieldGet has been waiting on since the field-place refusal was written.
+fn cc_lower_ptr_field_write(node: Int, obj: Int, value: Int) -> Int ! Diag.Report {
+    let base = tid_of_node(node_obj(obj))
+    if base < 0 { return -1 }
+    let field_tid = tid_of_node(obj)
+    if field_tid < 0 { return -1 }
+    let decl = tc_tid_decl_node(child_tid(base, Slot.Inner1))
+    let rec = cc_foreign_field(node, decl, field_tid)
+    if cc_stopped(rec) { return -1 }
+    let place = cc_deref(node, node_obj(obj), base)
+    if place < 0 { return -1 }
+    ir_field_set(node, c_field_name(node_name(obj)), place, value)
+}
+
+// `p.write(v)` stores through the pointer itself, at the type it points at. The place is
+// the dereferenced pointer, and the store fills the whole of it rather than one field of it.
+fn cc_lower_ptr_plain_write(node: Int, obj: Int, value: Int) -> Int ! Diag.Report {
+    let ptr_tid = tid_of_node(obj)
+    if ptr_tid < 0 { return -1 }
+    let place = cc_deref(node, obj, ptr_tid)
+    if place < 0 { return -1 }
+    ir_assign(node, place, value)
 }
 
 // A field of a type laid out by a foreign header. Every one of those fields is a sized

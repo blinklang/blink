@@ -1,0 +1,123 @@
+// The store, in statement position: `p.write(v)` and `p.f.write(v)` lower to an Assign or a
+// FieldSet through the pointer's own dereferenced place. cg_call still refuses the same two
+// calls in a value slot (test_cg_call_ffi_scope.bl); this file is the statement side only.
+import lower_test_helpers.{
+    probe, probe_but, let_node_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
+    assert_ice_saying,
+}
+import parser.{node_kind, node_method, node_name, nodes}
+import ast.{NodeKind, nk_of}
+import layout.{binder_scope_push, bind_binder, tid_of_node}
+import ir.{IrKind, ir_c_name, ir_kid}
+import cg_stmt.{lower_stmt}
+import std.io
+
+// The probe source, with the name the `with` binds made visible to the stage, exactly as
+// test_cg_call_ffi_scope.bl's own probe_ffi does for the same reason: a resource binder is
+// bound to the tid the statement stage would give it, not the type its own let carries.
+fn probe_ptr_write() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    probe("cg_stmt_ptr_write", src_ptr_write())
+    bind_binder(binder_scope_push(), "scope", tid_of_node(with_resource_of("scope")))
+}
+
+fn with_resource_of(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.WithResource && node_name(i) == name { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe binds no resource named '{name}'")
+    assert(false)
+    -1
+}
+
+// A call written after `anchor`, named by the method it spells. Mirrors call_after in
+// test_cg_call_ffi_scope.bl: the stdlib graph could spell the same method name elsewhere,
+// but a scan from the probe's own binding cannot land there.
+fn call_after(anchor: Str, method: Str) -> Int {
+    let mut i = let_node_of(anchor)
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.MethodCall && node_method(i) == method { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no call of '{method}' after '{anchor}'")
+    assert(false)
+    -1
+}
+
+fn src_ptr_write() -> Str {
+    #"@ffi.struct(header: "poll.h", name: "pollfd")
+type Pollfd { fd: I32, events: I16, revents: I16 }
+
+@trusted(audit: "cg-stmt-ptr-write-test")
+fn go() ! FFI {
+    with ffi.scope() as scope {
+        let p: Ptr[Int] = scope.alloc()
+        p.write(7)
+        let sized: Ptr[Pollfd] = scope.alloc_n(2)
+        let next = sized.offset(1)
+        next.fd.write(9)
+    }
+}
+
+fn main() { go() }
+"#
+}
+
+// ── A plain pointer store ──────────────────────────────────────────────────
+
+test "p.write(v) in statement position assigns through the dereferenced pointer" {
+    probe_ptr_write()
+    let id = lower_stmt(call_after("p", "write"))
+    assert_kind("kind", id, IrKind.Assign)
+    assert_shape("shape", id, "Assign(Unbox(VarRef), Const)")
+    assert_verifies("verify", id)
+}
+
+// ── A field store through a pointer ────────────────────────────────────────
+
+test "p.f.write(v) in statement position sets the field through the dereferenced pointer" {
+    probe_ptr_write()
+    let id = lower_stmt(call_after("next", "write"))
+    assert_kind("kind", id, IrKind.FieldSet)
+    assert_eq_str("field", ir_c_name(id), "fd")
+    assert_shape("shape", id, "FieldSet(Unbox(VarRef), Const)")
+    assert_verifies("verify", id)
+}
+
+// ── Everything else in statement position still falls through untouched ────
+
+// A statement-position method call that is not `write` must still reach the ordinary value
+// path, wrapped in the same ExprStmt any other bare-expression statement gets: the method
+// name is the one string test cc_is_ptr_write_stmt is allowed, and `offset` is never
+// `write`, so this can never be mistaken for a store.
+test "a non-write method call in statement position still lowers as an ordinary value, not a store" {
+    probe_ptr_write()
+    let id = lower_stmt(call_after("sized", "offset"))
+    assert_kind("kind", id, IrKind.ExprStmt)
+    assert_kind("inner", ir_kid(id, 0), IrKind.Binary)
+    assert_verifies("verify", id)
+}
+
+// ── Arity ───────────────────────────────────────────────────────────────────
+
+fn probe_write_wrong_arity() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    probe_but("cg_stmt_ptr_write_arity", src_write_wrong_arity(), "TypeError")
+    bind_binder(binder_scope_push(), "scope", tid_of_node(with_resource_of("scope")))
+}
+
+fn src_write_wrong_arity() -> Str {
+    #"fn main() ! FFI {
+    with ffi.scope() as scope {
+        let p: Ptr[Int] = scope.alloc()
+        p.write(1, 2)
+    }
+}
+"#
+}
+
+test "p.write with the wrong number of arguments is refused by name, not built silently" {
+    probe_write_wrong_arity()
+    assert_ice_saying("write arity", lower_stmt(call_after("p", "write")), "IntrinsicArityWrong",
+        "takes 1 argument(s)")
+}
