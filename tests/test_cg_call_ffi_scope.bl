@@ -81,6 +81,8 @@ fn go() ! FFI {
         let stepped_home = home.offset(1)
         let got = next.fd.read()
         next.fd.write(7)
+        let whole = next.deref()
+        let byte = kept.deref()
         let _keep = [kept.is_null(), one.is_null(), got.to_int() == 0, next.is_null()]
     }
 }
@@ -201,6 +203,58 @@ test "Ptr.offset refuses when nothing declares the size of what the pointer addr
         "no foreign header lays out")
 }
 
+// ── Reading through the pointer by itself ─────────────────────────────────
+
+// `p.deref()` reads the pointee with no field to read after: the value the call answers
+// with IS the pointee, so it is the same dereference `p.f` reads through, with nothing
+// wrapped around it.
+test "Ptr.deref reads the pointee by dereferencing the pointer" {
+    probe_ffi()
+    let id = lower_call(rhs_of("whole"))
+    assert_kind("kind", id, IrKind.Unbox)
+    assert_shape("shape", id, "Unbox(VarRef)")
+    assert_verifies("verify", id)
+}
+
+// The pointee's own width, not the pointer's: a foreign struct dereferences to its own
+// unstarred spelling, the same one a field read through it already reads at.
+test "a dereferenced foreign struct is spelled at its own type, not the pointer's" {
+    probe_ffi()
+    assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("whole"))), "blink_Pollfd")
+}
+
+// A scalar pointee dereferences the same way: the value answered is the scalar itself,
+// not a pointer to it.
+test "a dereferenced scalar answers the scalar, not a pointer to it" {
+    probe_ffi()
+    assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("byte"))), "uint8_t")
+}
+
+// `deref` takes no argument (its whole answer comes from the receiver's own tid), so a
+// call written with one is refused twice over: typecheck's own arity table rejects it
+// before codegen ever runs, and codegen declines it by name rather than build it wrong if
+// it were ever reached anyway.
+fn probe_deref_wrong_arity() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    probe_but("cg_call_ffi_scope_deref_arity", src_deref_wrong_arity(), "TypeError")
+    bind_binder(binder_scope_push(), "scope", tid_of_node(with_resource_of("scope")))
+}
+
+fn src_deref_wrong_arity() -> Str {
+    #"fn main() ! FFI {
+    with ffi.scope() as scope {
+        let p: Ptr[Int] = scope.alloc()
+        let bad = p.deref(1)
+    }
+}
+"#
+}
+
+test "p.deref with an argument is refused by name, not built silently" {
+    probe_deref_wrong_arity()
+    assert_ice_saying("deref arity", lower_call(rhs_of("bad")), "IntrinsicArityWrong",
+        "takes 0 argument(s)")
+}
+
 // An @ffi.opaque handle names a C type whose LAYOUT the header withholds, which is the
 // point of declaring it opaque. Typecheck tests the @ffi.struct annotation itself, and this
 // stage has to test the same thing: a type C does not lay out has no size the header fixes,
@@ -227,6 +281,8 @@ test "lowering the accepted FFI calls reports no internal error" {
     let _ = lower_call(rhs_of("one"))
     let _ = lower_call(rhs_of("next"))
     let _ = lower_call(rhs_of("got"))
+    let _ = lower_call(rhs_of("whole"))
+    let _ = lower_call(rhs_of("byte"))
     assert_eq_str("ice count", "{ice_count()}", "{before}")
 }
 

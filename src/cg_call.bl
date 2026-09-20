@@ -1100,7 +1100,8 @@ fn cc_lower_scope_alloc(node: Int, obj: Int, method: Str, is_alloc_n: Bool) -> I
 // spelled at its own type. The call's tid is that type: typecheck preserves the pointee
 // across an offset, so the result is spelled exactly as the receiver is.
 fn cc_lower_ptr_method(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
-    if method != "offset" { return cc_intrinsic_not_built(node, TyKind.Ptr, method) }
+    if method != "offset" && method != "deref" { return cc_intrinsic_not_built(node, TyKind.Ptr, method) }
+    if method != "offset" { return cc_lower_ptr_deref(node, obj) }
     let given = sublist_length(node_args(node))
     if given != 1 { return cc_intrinsic_arity_wrong(node, TyKind.Ptr, method, 1, given) }
     let recv = tid_of_node(obj)
@@ -1115,6 +1116,17 @@ fn cc_lower_ptr_method(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
     let step = lower_expr(sublist_get(node_args(node), 0))
     if step < 0 { return -1 }
     ir_binary(tid, node, rec.c_spelling, "+", base, step)
+}
+
+// `p.deref()` reads the pointee: the same dereference `p.f` reads through, with no field
+// after it. The answer's own width is the pointee's, unstarred, whatever the pointee is —
+// unlike `offset`, this needs no known stride, since C is not stepping by it.
+fn cc_lower_ptr_deref(node: Int, obj: Int) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, TyKind.Ptr, "deref", 0, given) }
+    let ptr_tid = tid_of_node(obj)
+    if ptr_tid < 0 { return -1 }
+    cc_deref(node, obj, ptr_tid)
 }
 
 // `p.f.read()` and `p.f.write(v)`. The receiver is the PLACE the field occupies, not a
@@ -1179,7 +1191,7 @@ fn cc_lower_ptr_field(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
     let decl = tc_tid_decl_node(child_tid(base, Slot.Inner1))
     let rec = cc_foreign_field(node, decl, field_tid)
     if cc_stopped(rec) { return -1 }
-    let place = cc_deref(node, obj, base)
+    let place = cc_deref(node, node_obj(obj), base)
     if place < 0 { return -1 }
     ir_field_get(field_tid, node, rec.c_spelling, c_field_name(node_name(obj)), rec.slot_form, place)
 }
@@ -1195,14 +1207,14 @@ fn cc_field_store_not_a_value(node: Int) -> Int ! Diag.Report {
     -1
 }
 
-// The struct the pointer addresses. A pointer local is one machine word and reads as a
-// value, so nothing about the pointer itself says the field behind it is reached through
+// The value the pointer addresses. A pointer local is one machine word and reads as a
+// value, so nothing about the pointer itself says what is behind it is reached through
 // it: the dereference is written, and it is written at the pointee's own layout.
-fn cc_deref(node: Int, obj: Int, ptr_tid: Int) -> Int ! Diag.Report {
+fn cc_deref(node: Int, ptr_expr: Int, ptr_tid: Int) -> Int ! Diag.Report {
     let pointee = child_tid(ptr_tid, Slot.Inner1)
     let held = cc_local(pointee, node)
     if cc_stopped(held) { return -1 }
-    let ptr = lower_expr(node_obj(obj))
+    let ptr = lower_expr(ptr_expr)
     if ptr < 0 { return -1 }
     ir_unbox(pointee, node, held.c_spelling, held.slot_form, ptr)
 }
