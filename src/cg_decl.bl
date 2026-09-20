@@ -24,7 +24,8 @@ import cname.{
     c_ffi_symbol, c_field_name,
     c_fn_decl_name, cname_ffi_struct_mirror,
     c_global_name, c_vtable_type_name,
-    c_impl_method_name, c_local_name, c_typedef_name, c_variant_discriminant,
+    c_impl_method_name, c_display_dispatch_name, c_local_name, c_runtime_helper,
+    c_typedef_name, c_variant_discriminant,
     cname_is_runtime_owned, td_guard_name, c_enum_tag_member, c_enum_payload_member,
 }
 import cg_print.{
@@ -39,8 +40,8 @@ import cg_reg.{
     cg_reg_impl_methods, cg_reg_impl_of, cg_reg_tid_for_decl, cg_reg_type_decls,
 }
 import ir.{
-    ir_assign, ir_block, ir_call_direct, ir_c_name, ir_cast, ir_const, ir_expr_stmt,
-    ir_global_ref, ir_kind, ir_return, ir_var_ref, IrKind,
+    ir_assign, ir_block, ir_call_direct, ir_call_runtime, ir_c_name, ir_cast, ir_const,
+    ir_expr_stmt, ir_global_ref, ir_kind, ir_let, ir_return, ir_var_ref, IrKind,
 }
 import mono.{instances, is_poly_impl, poly_impl_is_element_agnostic}
 import typecheck.{
@@ -49,12 +50,12 @@ import typecheck.{
     tc_evfield_tid, tc_resolve, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
     make_handler_type, tc_member_tid_at_instance,
     tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind,
-    tc_lookup_node_tid, tc_type_str, tc_void_tid, DECL_NODE_AMBIGUOUS,
+    tc_lookup_node_tid, tc_type_str, tc_void_tid, DECL_NODE_AMBIGUOUS, TYPE_STR,
 }
 import parser.{
     get_annotation, node_count, node_effects, node_elements, node_fields, node_impl_binders,
-    node_methods, node_name, node_params, node_type_ann, node_type_params, node_value,
-    sublist_get, sublist_length,
+    node_methods, node_name, node_params, node_trait_name, node_type_ann, node_type_params,
+    node_value, sublist_get, sublist_length,
 }
 
 // 1 while a type's dependencies are being emitted, 2 once its typedef is written. The key
@@ -450,6 +451,84 @@ pub fn cg_decl_emit_impl_method_decl(method: Int, is_static: Bool) ! Diag.Report
     if cg_reg_impl_of(method) < 0 { return }
     if !site_is_declared(cg_decl_body_site(method)) { return }
     cg_decl_emit_signature_decl(method, cg_decl_c_name(method), is_static)
+    emit_display_dispatch_decl(method, is_static)
+}
+
+// ── The Display dispatcher ───────────────────────────────────────────────────
+//
+// `Display.fmt` fills a builder and answers nothing, so nothing can render a value from
+// it alone. Every renderer calls a second function beside it that makes the builder, runs
+// `fmt` and answers the built Str. That function has no declaration in the source, so it
+// is written here, from the same walk that writes `fmt`: a prelude type's impl is
+// compiled into every unit that uses it, and a list of type names would leave those units
+// calling a name nothing defines.
+
+let display_trait = "Display"
+let display_method = "fmt"
+
+// The impl behind a `Display.fmt`, or -1 for anything else. The trait name is the
+// registry's, not a guess from the method name: a user trait may name a method `fmt` too.
+fn display_fmt_impl(decl: Int) -> Int {
+    let im = cg_reg_impl_of(decl)
+    if im < 0 { return -1 }
+    if node_trait_name(im) != display_trait { return -1 }
+    if node_name(decl) != display_method { return -1 }
+    im
+}
+
+// The receiver, declared. `fmt` takes the builder as well, and the dispatcher makes its
+// own, so only the first parameter carries over.
+fn display_self_decl(method: Int) -> List[Str] ! Diag.Report {
+    let all = fn_param_decls(method)
+    if all.len() == 0 { return [] }
+    [all.get(0).unwrap()]
+}
+
+fn display_param(method: Int, which: Int) -> Int {
+    let sl = node_params(method)
+    if sl == -1 || sublist_length(sl) <= which { return -1 }
+    sublist_get(sl, which)
+}
+
+fn emit_display_dispatch_decl(method: Int, is_static: Bool) ! Diag.Report {
+    let im = display_fmt_impl(method)
+    if im < 0 { return }
+    if display_param(method, 1) < 0 { return }
+    print_fn_decl(is_static, c_type_of(TYPE_STR, Position.Return),
+        c_display_dispatch_name(im), display_self_decl(method), false)
+}
+
+fn emit_display_dispatch_def(method: Int, is_static: Bool) ! Diag.Report {
+    let im = display_fmt_impl(method)
+    if im < 0 { return }
+    let recv = display_param(method, 0)
+    let sb = display_param(method, 1)
+    if recv < 0 || sb < 0 { return }
+
+    let sb_tid = tid_of_node(sb)
+    let sb_lay = layout_of(sb_tid, Position.Local)
+    let sb_name = c_local_name(node_name(sb))
+    let str_lay = layout_of(TYPE_STR, Position.Return)
+
+    let made = ir_call_runtime(sb_tid, method, sb_lay.c_spelling,
+        c_runtime_helper("sb_new"), sb_lay.slot_form, [])
+    let hold = ir_let(sb_tid, method, sb_lay.c_spelling, sb_name, sb_lay.slot_form, made)
+
+    let recv_tid = tid_of_node(recv)
+    let recv_lay = layout_of(recv_tid, Position.Param)
+    let void_lay = layout_of(tc_void_tid(), Position.Return)
+    let filled = ir_expr_stmt(method, ir_call_direct(tc_void_tid(), method, void_lay.c_spelling,
+        c_impl_method_name(im, display_method), void_lay.slot_form, [
+            ir_var_ref(recv_tid, method, recv_lay.c_spelling, c_local_name(node_name(recv)), recv_lay.slot_form),
+            ir_var_ref(sb_tid, method, sb_lay.c_spelling, sb_name, sb_lay.slot_form),
+        ]))
+
+    let built = ir_return(method, ir_call_runtime(TYPE_STR, method, str_lay.c_spelling,
+        c_runtime_helper("sb_to_str"), str_lay.slot_form,
+        [ir_var_ref(sb_tid, method, sb_lay.c_spelling, sb_name, sb_lay.slot_form)]))
+
+    print_fn(is_static, str_lay.c_spelling, c_display_dispatch_name(im),
+        display_self_decl(method), false, ir_block(method, [hold, filled, built]))
 }
 
 pub fn cg_decl_emit_impl_method_decls() ! Diag.Report {
@@ -559,6 +638,7 @@ fn site_is_declared(site: BodySite) -> Bool {
 
 pub fn cg_decl_emit_fn_def(fn_node: Int, is_static: Bool, body: Int) ! Diag.Report {
     cg_decl_emit_signature_def(fn_node, cg_decl_c_name(fn_node), is_static, body)
+    emit_display_dispatch_def(fn_node, is_static)
 }
 
 // ── Foreign wrappers ───────────────────────────────────────────────────

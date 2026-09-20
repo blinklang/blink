@@ -1,0 +1,95 @@
+// Removing a key moves the value out of the container's cell and into a carrier member,
+// so the same two answers meet here that meet at a checked read: the cell holds one
+// machine word and answers for a slot, while the member answers for itself. A double
+// rides behind a pointer in the cell and is held by the member, and a struct is behind a
+// pointer in both, so matching the cell's answer instead of the member's opens a box the
+// member wanted shut.
+
+import std.io
+import lower_test_helpers.{probe, rhs_of, assert_eq_str, assert_shape, assert_verifies}
+import ir.{ir_kid, ir_c_spelling}
+import cg_expr.{cg_expr_pending_count, cg_expr_take_pending}
+import cg_call.{lower_call}
+import layout.{Slot, SlotForm, carrier_member_layout, tid_of_node}
+import diagnostics.{Diag}
+
+// One value type per form the cell and the member can disagree about:
+//   Int   fits the word and the member holds it     cell InlineWord    member InlineWord
+//   Point does not fit the word at all              cell PointerBoxed  member PointerBoxed
+//   Float fits the word but must not be punned      cell PointerBoxed  member InlineWord
+fn src() -> Str {
+    #"type Point { x: Int, y: Int }
+
+fn main() {
+    let mut ints: Map[Str, Int] = Map()
+    ints.insert("a", 1)
+    let of_int = ints.remove("a")
+    let mut points: Map[Str, Point] = Map()
+    points.insert("a", Point { x: 1, y: 2 })
+    let of_point = points.remove("a")
+    let mut reals: Map[Str, Float] = Map()
+    reals.insert("a", 1.5)
+    let of_real = reals.remove("a")
+    let _keep = [of_int.unwrap(), of_point.unwrap().x, of_real.unwrap().to_int()]
+}
+"#
+}
+
+// The Some arm's payload, out of the `if` the removal hoists. The last hoisted statement
+// is that `if`; its first branch's only statement assigns the carrier, and the carrier's
+// second kid is the payload beside the tag.
+fn payload_of(anchor: Str) -> Int ! Diag.Report {
+    let mark = cg_expr_pending_count()
+    let built = lower_call(rhs_of(anchor))
+    assert(built >= 0)
+    let stmts = cg_expr_take_pending(mark)
+    if stmts.len() == 0 {
+        io.println("FAIL: '{anchor}' hoisted no statements")
+        assert(false)
+    }
+    let branch = stmts.get(stmts.len() - 1).unwrap()
+    let some = ir_kid(ir_kid(ir_kid(branch, 1), 0), 1)
+    assert_verifies(anchor, branch)
+    ir_kid(some, 1)
+}
+
+fn form_name(f: SlotForm) -> Str {
+    match f {
+        SlotForm.Inline => "Inline"
+        SlotForm.PointerBoxed => "PointerBoxed"
+        SlotForm.InlineWord => "InlineWord"
+    }
+}
+
+fn member_of(anchor: Str) -> Str ! Diag.Report {
+    form_name(carrier_member_layout(tid_of_node(rhs_of(anchor)), Slot.Inner1).slot_form)
+}
+
+test "a removed value goes into a member that holds it with the cell's box opened" {
+    probe("layout_map_remove_member", src())
+    assert_eq_str("member form", member_of("of_int"), "InlineWord")
+    assert_shape("payload", payload_of("of_int"), "Cast(Cast(VarRef))")
+}
+
+test "a removed value goes into a pointer member as the cell holds it" {
+    probe("layout_map_remove_member", src())
+    assert_eq_str("member form", member_of("of_point"), "PointerBoxed")
+    assert_shape("payload", payload_of("of_point"), "Cast(VarRef)")
+}
+
+// The payload's own spelling is what the member is declared as, so the assignment the
+// printer writes is between two of the same type and not between a value and an address.
+test "the pointer member and the removed value entering it are spelled the same" {
+    probe("layout_map_remove_member", src())
+    let want = carrier_member_layout(tid_of_node(rhs_of("of_point")), Slot.Inner1).c_spelling
+    assert_eq_str("payload spelling", ir_c_spelling(payload_of("of_point")), want)
+}
+
+// A double is behind a pointer in the cell and held by the member itself, which is the one
+// place the two answers differ. Reading the member's answer is what keeps this row right:
+// following the cell's would leave the box shut and assign an address to a double.
+test "a removed double is unboxed for a member that holds it" {
+    probe("layout_map_remove_member", src())
+    assert_eq_str("member form", member_of("of_real"), "InlineWord")
+    assert_shape("payload", payload_of("of_real"), "Unbox(Cast(VarRef))")
+}
