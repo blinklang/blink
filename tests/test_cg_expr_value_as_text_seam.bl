@@ -4,7 +4,7 @@
 
 import lower_test_helpers.{probe, rhs_of, assert_kind, assert_eq_str, assert_verifies}
 import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid}
-import cg_expr.{lower_value_as_text}
+import cg_expr.{cg_expr_pending_count, cg_expr_take_pending, lower_value_as_text}
 
 fn src() -> Str {
     #"type Row {
@@ -76,4 +76,34 @@ test "a string is already the answer and is passed through untouched" {
     let id = lower_value_as_text(rhs_of("s"))
     assert_kind("kind", id, IrKind.Const)
     assert_eq_str("type", ir_c_spelling(id), "const char*")
+}
+
+
+// What the caller has to do with the answer. Every render that can name its value outright
+// leaves the buffer as it found it, so a caller holding no buffer of its own can ask.
+test "a render that needs no temp leaves the pending buffer as it found it" {
+    probe("cg_expr_text", src())
+    let _n = lower_value_as_text(rhs_of("n"))
+    let _f = lower_value_as_text(rhs_of("f"))
+    let _c = lower_value_as_text(rhs_of("c"))
+    let _r = lower_value_as_text(rhs_of("r"))
+    let _s = lower_value_as_text(rhs_of("s"))
+    assert_eq(cg_expr_pending_count(), 0)
+}
+
+// A bool is the one render here that cannot be written as an expression: C has no literal
+// that is one of two strings on a condition, so the value is a temp a statement fills. The
+// answer names that temp, which is only a value once the two statements run, so a caller
+// that drops the buffer emits a read of a variable nothing declared.
+test "a bool renders through a temp and leaves the statements that fill it to the caller" {
+    probe("cg_expr_text", src())
+    let id = lower_value_as_text(rhs_of("b"))
+    assert_kind("kind", id, IrKind.VarRef)
+    let stmts = cg_expr_take_pending(0)
+    assert_eq(stmts.len(), 2)
+    assert_kind("declaration", stmts.get(0).unwrap(), IrKind.Let)
+    assert_kind("fill", stmts.get(1).unwrap(), IrKind.If)
+    assert_eq_str("the answer names the temp the declaration binds",
+        ir_c_name(id), ir_c_name(stmts.get(0).unwrap()))
+    for s in stmts { assert_verifies("pending", s) }
 }
