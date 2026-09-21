@@ -369,6 +369,16 @@ fn lower_value_stmt(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Dia
 fn tail_wrap(node: Int, value: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
     if tail == TAIL_RETURN { return ir_return(node, value) }
     if tail == TAIL_ASSIGN {
+        // A genuinely Void-typed tail (a bare call whose C shape is `void`, most often a
+        // diverging builtin like `env.exit`) has nothing to store into dest: dest_tid is
+        // the match's own type, decided by a sibling arm, not this arm's -- checking it
+        // would miss the arm that never reaches the assignment it appears to make. Same
+        // two-signal guard lower_assign's Void arm uses: the call's side effect is kept,
+        // the store is not.
+        let own_tid = stmt_tid(node)
+        if own_tid >= 0 && cs_is_void_like(own_tid) && !cg_expr_is_registered(node) {
+            return ir_expr_stmt(node, value)
+        }
         let rec = layout_at(dest_tid, Position.Local, node)
         let lvalue = ir_var_ref(dest_tid, node, rec.c_spelling, dest, rec.slot_form)
         return ir_assign(node, lvalue, value)
@@ -760,6 +770,15 @@ fn lower_debug_assert_call(node: Int) -> Int ! Diag.Report {
 // in a heap cell, which is that binding's storage for its whole life, and both frames read
 // and write through it; sections/02_syntax.md:336 is what makes the two sides one binding.
 // A binding nothing shares keeps the plain local it has today.
+// Void has exactly one value and Never has none, so both alike leave nothing to store: a
+// C expression at either type is `void`. The pairing mirrors x_is_void_like (cg_expr.bl)
+// and lo_is_void_like (layout.bl); those are private to their own modules, so this is its
+// own copy rather than a shared import.
+fn cs_is_void_like(tid: Int) -> Bool {
+    let k = tc_tid_kind(tid)
+    k == TyKind.Void || k == TyKind.Never
+}
+
 fn bind_and_declare_let(node: Int, tid: Int, rec: LayoutRecord, name: Str, value: Int) -> Int ! Diag.Report {
     let is_mut = node_is_mut(node) == 1
     if is_mut && cg_eff_binder_is_shared(name) {
@@ -869,7 +888,18 @@ fn lower_assign(node: Int) -> Int ! Diag.Report {
         diag_ice_stage_not_built("an assignment to a place that is not a local", node)
         return ir_expr_stmt(node, poison_value(node))
     }
-    ir_assign(node, lower_target(target), lower_value(node_value(node)))
+    let rhs = node_value(node)
+    let tid = stmt_tid(target)
+    // `m = nothing()` reassigns a genuine Void-typed local: the RHS is a `void`-valued C
+    // call, and the target already holds the placeholder int its own `let` gave it, so
+    // there is nothing to write back -- only the call's side effect needs to run. The
+    // same two-signal guard lower_let's Void arm uses: registered means some earlier
+    // seam already turned this node into a real value (a materialised temp), not a bare
+    // void call, so the ordinary assignment path is still the right one for it.
+    if tid >= 0 && cs_is_void_like(tid) && !cg_expr_is_registered(rhs) {
+        return lower_stmt_tail(rhs, TAIL_DISCARD, "", -1)
+    }
+    ir_assign(node, lower_target(target), lower_value(rhs))
 }
 
 // Whether a target is a place this stage can build an lvalue for: a bare local this module
