@@ -6,9 +6,10 @@
 // equivalent to a by-value copy, because the value never changes, and the spec says the
 // compiler may copy it freely. For a `let mut` binding it is not: a write on either side
 // has to be visible on the other, which needs one heap cell that the enclosing function
-// and the thunk both hold. Nothing allocates that cell yet, so a `mut` capture is refused
-// here rather than copied — a copy would compile, run, and answer the wrong number, which
-// is the one outcome worth a test of its own.
+// and the thunk both hold — a copy would compile, run, and answer the wrong number, which
+// is the one outcome worth a test of its own. tests/test_cg_eff_shared_mutable_capture_cell.bl
+// is where that cell itself is pinned; the two mutable cases below only check that the
+// statement stage routes a shared `let mut` through it instead of refusing the capture.
 //
 // The capture array is `void**`, which is the same slot a list element rides in, so the
 // word a capture is punned through is Position.ContainerSlot's answer and not a second
@@ -16,8 +17,9 @@
 // integer an Int or a Bool rides through, and an empty slot_word means the value is
 // already a pointer. PointerBoxed means the value does not fit the word, so it travels as
 // a heap copy and the word holds the address, which is what a container element wider
-// than its slot already does. A copy is only sound for a binding nothing assigns, so the
-// mutability question is asked first and an oversized `let mut` is still refused.
+// than its slot already does. A copy is only sound for a binding nothing assigns; a
+// shared `let mut` rides its cell instead, which is already pointer-wide, so an oversized
+// one needs no box either.
 
 import typecheck.{TYPE_FLOAT, TYPE_INT, TYPE_STR}
 import cname_test_helpers.{find_decl}
@@ -32,7 +34,8 @@ import cg_print.{print_reset, print_take}
 import cg_stmt.{cg_stmt_reset, lower_block_returning}
 import cg_eff.{
     cg_eff_lower_closure, cg_eff_pending_thunks, cg_eff_print_thunk, cg_eff_reset,
-    cg_eff_thunk_body_node, cg_eff_thunk_close, cg_eff_thunk_open, cg_eff_thunks_drained,
+    cg_eff_scan_shared_binders, cg_eff_thunk_body_node, cg_eff_thunk_close, cg_eff_thunk_open,
+    cg_eff_thunks_drained,
 }
 import diagnostics.{diag_entries, diag_reset}
 import std.fs
@@ -184,7 +187,9 @@ fn lower_capturing(let_name: Str, names: List[Str], tid: Int) -> Int ! Diag.Repo
 // The trailing call in each probe body is a closure call no stage builds yet, so a body
 // lowered this way reports that; these cases measure the capture, not the total.
 fn lower_body_of(fn_name: Str) -> Int ! Diag.Report {
-    lower_block_returning(node_body(find_decl(NodeKind.FnDef, fn_name, "")))
+    let f = find_decl(NodeKind.FnDef, fn_name, "")
+    cg_eff_scan_shared_binders(f)
+    lower_block_returning(node_body(f))
 }
 
 test "a closure reading an immutable Int local answers a record instead of refusing" {
@@ -340,36 +345,40 @@ test "the thunk reads a boxed capture back through the pointer, not as the point
     assert(cg_text_occurrences(text, "double f = (*(") == 1)
 }
 
-test "an oversized binding the enclosing function can assign is refused, not copied" {
-    // The size question and the sharing question both apply to a `let mut` Float. Copying
-    // it would compile and then drop the write, so the sharing answer has to win.
+test "an oversized binding the enclosing function can assign builds through its cell, not a box" {
+    // The size question and the sharing question both apply to a `let mut` Float. The
+    // cell it now shares with the closure is already pointer-wide, so the box the
+    // immutable oversized case takes never comes up here.
     setup()
-    let refused = lower_body_of("a_mutable_boxed_capture")
-    assert(refused >= 0)
-    assert(ices_mentioning("'fm'") > 0)
-    assert(ices_mentioning("shared") > 0)
-    assert_eq(cg_eff_pending_thunks(), 0)
+    let built = lower_body_of("a_mutable_boxed_capture")
+    if built < 0 || ices() != 0 { report_ices("a_mutable_boxed_capture was refused") }
+    assert(built >= 0)
+    assert_eq(ices_mentioning("'fm'"), 0)
+    assert_eq(ices_mentioning("shared"), 0)
+    assert_eq(cg_eff_pending_thunks(), 1)
 }
 
-test "a let records its own mutability, so a mut capture is refused where a plain one is not" {
-    // sections/02_syntax.md:351: a write through either side has to be visible on the
-    // other, which needs one shared cell. Copying the value instead compiles and runs and
-    // answers the pre-write number.
+test "a let records its own mutability, so a mut capture builds through a cell just like a plain one" {
+    // sections/02_syntax.md:336: a write through either side has to be visible on the
+    // other, which needs one shared cell. The mutable case is the one that gets a cell;
+    // the plain one still rides a copy.
     //
     // Both bodies are lowered through the statement stage rather than bound by hand, so
     // what is measured is the recorded mutability of a real `let`. The control matters as
-    // much as the refusal: a stage that recorded every binder mutable would refuse the mut
-    // capture for the wrong reason and refuse the plain one too.
+    // much as the mutable case: a stage that recorded every binder mutable would cell the
+    // plain capture too, and a stage that recorded none would leave the mutable one
+    // uncelled.
     setup()
-    let refused = lower_body_of("a_mutable_capture")
-    assert(refused >= 0)
-    assert(ices_mentioning("'c'") > 0)
-    assert(ices_mentioning("shared") > 0)
-    assert_eq(cg_eff_pending_thunks(), 0)
+    let built = lower_body_of("a_mutable_capture")
+    if built < 0 || ices() != 0 { report_ices("a_mutable_capture was refused") }
+    assert(built >= 0)
+    assert_eq(ices_mentioning("'c'"), 0)
+    assert_eq(ices_mentioning("shared"), 0)
+    assert_eq(cg_eff_pending_thunks(), 1)
 
     setup()
-    let built = lower_body_of("one_int_capture")
-    assert(built >= 0)
+    let built2 = lower_body_of("one_int_capture")
+    assert(built2 >= 0)
     assert_eq(ices_mentioning("'n'"), 0)
     assert_eq(cg_eff_pending_thunks(), 1)
 }

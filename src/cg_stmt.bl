@@ -24,8 +24,9 @@ import typecheck.{
     tc_tid_decl_node, tc_tid_kind,
 }
 import layout.{
-    Position, Slot, SlotForm, LayoutRecord, bind_binder, bind_binder_mut, binder_scope_pop, binder_scope_push,
-    carrier_member_layout, child_tid, ensure_typedef_for, layout_of, tid_holds_tag_member, tid_of_binder,
+    Position, Slot, SlotForm, LayoutRecord, bind_binder, bind_binder_cell, bind_binder_mut, binder_is_celled,
+    binder_scope_pop, binder_scope_push, carrier_member_layout, child_tid, ensure_typedef_for, layout_of,
+    tid_holds_tag_member, tid_of_binder,
     tid_of_node, varargs_spelling,
 }
 import cname.{
@@ -36,7 +37,7 @@ import cname.{
 }
 import ir.{
     IrKind, ir_assign, ir_binary, ir_block, ir_break, ir_call_runtime, ir_carrier_tag,
-    ir_cast, ir_const, ir_continue, ir_expr_stmt, ir_field_get,
+    ir_cast, ir_cell_let, ir_cell_ref, ir_const, ir_continue, ir_expr_stmt, ir_field_get,
     ir_global_ref, ir_if, ir_kind, ir_let, ir_loop, ir_mark_materialize, ir_return, ir_span,
     ir_switch, ir_unary, ir_unreachable, ir_var_ref, ir_with_scope,
 }
@@ -50,7 +51,10 @@ import cg_expr.{
     cg_expr_take_pending, cg_expr_value_count, lower_expr,
     x_layout_checked, x_stopped, x_unbox_payload,
 }
-import cg_eff.{cg_eff_lower_handler_install, cg_eff_resource_cleanup}
+import cg_eff.{
+    cg_eff_binder_is_shared, cg_eff_lower_handler_install, cg_eff_resource_cleanup,
+    cg_eff_scan_shared_binders,
+}
 import cg_call.{
     AssertKind, ForInIteration, ForInStrategy, cc_assert_family_kind, cc_is_ptr_write_stmt,
     cc_lower_ptr_write_stmt, cg_call_element_from_runtime, for_in_iteration_of,
@@ -212,6 +216,10 @@ fn poison_value(node: Int) -> Int ! Diag.Report {
 // declared type, and the body's tail value becomes the function's return.
 pub fn lower_fn(fn_node: Int) -> Int ! Diag.Report {
     let scope = open_scope()
+    // A binding a closure of this body shares is stored in one heap cell, and the cell is
+    // allocated where the binding is declared. So which names are shared has to be settled
+    // before the first statement lowers: a declaration cannot ask a closure below it.
+    cg_eff_scan_shared_binders(fn_node)
     let bound = bind_params(fn_node, scope)
     let tail = if fn_returns_value(fn_node) { TAIL_RETURN } else { TAIL_DISCARD }
     let body = node_body(fn_node)
@@ -748,14 +756,27 @@ fn lower_debug_assert_call(node: Int) -> Int ! Diag.Report {
 // integer. So the initialiser runs as a statement and the name is given the single value
 // directly. Reading it as an expression instead would assign a void result, which no C
 // compiler accepts.
+// The declaration of one named `let`. A `let mut` a closure of this body shares is stored
+// in a heap cell, which is that binding's storage for its whole life, and both frames read
+// and write through it; sections/02_syntax.md:336 is what makes the two sides one binding.
+// A binding nothing shares keeps the plain local it has today.
+fn bind_and_declare_let(node: Int, tid: Int, rec: LayoutRecord, name: Str, value: Int) -> Int ! Diag.Report {
+    let is_mut = node_is_mut(node) == 1
+    if is_mut && cg_eff_binder_is_shared(name) {
+        bind_binder_cell(cur_scope(), name, tid)
+        return ir_cell_let(tid, node, rec.c_spelling, name, rec.slot_form, value)
+    }
+    bind_binder_mut(cur_scope(), name, tid, is_mut)
+    ir_let(tid, node, rec.c_spelling, cg_local_c_name(name), rec.slot_form, value)
+}
+
 fn bind_unit_let(node: Int, tid: Int, init: Int, rec: LayoutRecord, name: Str) -> Int ! Diag.Report {
     let ran = lower_stmt_tail(init, TAIL_DISCARD, "", -1)
     if ran < 0 { return -1 }
     cg_expr_push_pending(node, ran)
     let unit = int_const(node, "0")
     if unit < 0 { return -1 }
-    bind_binder_mut(cur_scope(), name, tid, node_is_mut(node) == 1)
-    ir_let(tid, node, rec.c_spelling, cg_local_c_name(name), rec.slot_form, unit)
+    bind_and_declare_let(node, tid, rec, name, unit)
 }
 
 fn lower_let(node: Int) -> Int ! Diag.Report {
@@ -767,8 +788,7 @@ fn lower_let(node: Int) -> Int ! Diag.Report {
     let name = node_name(node)
     let init = node_value(node)
     if init < 0 {
-        bind_binder_mut(cur_scope(), name, tid, node_is_mut(node) == 1)
-        return ir_let(tid, node, rec.c_spelling, cg_local_c_name(name), rec.slot_form, -1)
+        return bind_and_declare_let(node, tid, rec, name, -1)
     }
     if tc_tid_kind(tid) == TyKind.Void {
         if !cg_expr_is_registered(init) { return bind_unit_let(node, tid, init, rec, name) }
@@ -776,8 +796,7 @@ fn lower_let(node: Int) -> Int ! Diag.Report {
     // The initializer is lowered before the name binds, so `let x = x + 1` reads the
     // outer `x` the source names rather than the one this statement is declaring.
     let value = lower_value(init)
-    bind_binder_mut(cur_scope(), name, tid, node_is_mut(node) == 1)
-    ir_let(tid, node, rec.c_spelling, cg_local_c_name(name), rec.slot_form, value)
+    bind_and_declare_let(node, tid, rec, name, value)
 }
 
 // `let (a, b) = e`. The tuple binds once so the initializer runs once, and each element
@@ -881,6 +900,11 @@ fn lower_target(node: Int) -> Int ! Diag.Report {
     let tid = tid_of_binder(cur_scope(), name)
     if tid >= 0 {
         let rec = layout_at(tid, Position.Local, node)
+        // The place a shared binding names is its cell's value. A write to a local of the
+        // same spelling would land in storage the closure sharing it never reads.
+        if binder_is_celled(cur_scope(), name) {
+            return ir_cell_ref(tid, node, rec.c_spelling, name, rec.slot_form)
+        }
         return ir_var_ref(tid, node, rec.c_spelling, cg_local_c_name(name), rec.slot_form)
     }
     let decl = tc_global_decl_node(node)
