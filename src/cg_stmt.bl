@@ -25,8 +25,8 @@ import typecheck.{
 }
 import layout.{
     Position, Slot, SlotForm, LayoutRecord, bind_binder, bind_binder_cell, bind_binder_mut, binder_is_celled,
-    binder_scope_pop, binder_scope_push, carrier_member_layout, child_tid, ensure_typedef_for, layout_of,
-    tid_holds_tag_member, tid_of_binder,
+    binder_scope_pop, binder_scope_push, carrier_member_layout, child_tid, ensure_typedef_for, field_layout_of,
+    layout_of, pointer_spelling, tid_holds_tag_member, tid_of_binder,
     tid_of_node, varargs_spelling,
 }
 import cname.{
@@ -39,7 +39,7 @@ import ir.{
     IrKind, ir_assign, ir_binary, ir_block, ir_break, ir_call_runtime, ir_carrier_tag,
     ir_cast, ir_cell_let, ir_cell_ref, ir_const, ir_continue, ir_expr_stmt, ir_field_get,
     ir_global_ref, ir_if, ir_kind, ir_let, ir_loop, ir_mark_materialize, ir_return, ir_span,
-    ir_switch, ir_unary, ir_unreachable, ir_var_ref, ir_with_scope,
+    ir_switch, ir_unary, ir_unbox, ir_unreachable, ir_var_ref, ir_with_scope,
 }
 import diagnostics.{
     Diag, diag_file_for_node, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
@@ -2220,15 +2220,32 @@ fn positional_payload_binds(ctx: MatchCtx, pat: Int, vname: Str, flds: Int, out:
                 return payload_field_count_mismatch(sub, ctx.tid, vname)
             }
             let member = c_field_name(node_name(sublist_get(decl_flds, i)))
-            let rec = layout_at(tid, Position.Local, sub)
+            let held = layout_at(tid, Position.Local, sub)
             let path = "{c_enum_payload_member()}.{vname}.{member}"
-            let read = ir_field_get(tid, sub, rec.c_spelling, path, rec.slot_form,
-                scrut_ref(ctx, sub))
+            let read = variant_field_read(ctx, sub, tid, path, held)
             if !bind_slot(sub, read, out) { return false }
         }
         i = i + 1
     }
     true
+}
+
+// A field's own C shape (`held`, what its `Let` declares) and what the field's owner
+// actually stores for it (`field_layout_of`) agree unless the field reaches its own
+// owner by value -- a self-recursive field -- in which case the owner boxes it, the
+// same way a carrier's boxed payload does. The read must then deref through that box,
+// the shared reconciliation x_unbox_payload makes for a carrier, built here for
+// ir_field_get's dotted-path reads instead of a carrier's named arm.
+fn variant_field_read(ctx: MatchCtx, node: Int, tid: Int, path: Str, held: LayoutRecord) -> Int ! Diag.Report {
+    let member = field_layout_of(ctx.tid, tid)
+    let read = ir_field_get(tid, node, member.c_spelling, path, member.slot_form, scrut_ref(ctx, node))
+    if member.slot_form != SlotForm.PointerBoxed { return read }
+    // The owner stores this field as a bare word (its C spelling is the scalar, not a
+    // pointer type), the same way a container slot stores a boxed element: the box is
+    // read back by casting the word to a pointer before the deref, not by the word's own
+    // declared type, which names what is pointed at rather than the pointer itself.
+    let ptr = ir_cast(tid, node, pointer_spelling(held.c_spelling), read)
+    ir_unbox(tid, node, held.c_spelling, held.slot_form, ptr)
 }
 
 // A pattern names more positional slots than the variant declares fields for. Typecheck
@@ -2256,12 +2273,11 @@ fn field_pattern_binds(ctx: MatchCtx, pat: Int, prefix: Str, out: List[Int]) -> 
         if tid < 0 {
             if sub < 0 || sub_pattern_declares(sub) { return false }
         } else {
-            let rec = layout_at(tid, Position.Local, holder)
+            let held = layout_at(tid, Position.Local, holder)
             let path = if prefix == "" { node_name(f) } else { "{prefix}.{node_name(f)}" }
-            let read = ir_field_get(tid, holder, rec.c_spelling, path, rec.slot_form,
-                scrut_ref(ctx, holder))
+            let read = variant_field_read(ctx, holder, tid, path, held)
             if sub < 0 {
-                bind_named(holder, node_name(f), tid, rec, read, out)
+                bind_named(holder, node_name(f), tid, held, read, out)
             } else {
                 if !bind_slot(sub, read, out) { return false }
             }
