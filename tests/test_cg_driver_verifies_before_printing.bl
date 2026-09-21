@@ -1,0 +1,96 @@
+import std.io
+import ir.{
+    IrKind, ir_reset, ir_new, ir_node_count, ir_block, ir_const, ir_let, ir_return,
+    ir_var_ref, ir_expr_stmt,
+}
+import layout.{SlotForm}
+import diagnostics.{diag_reset, diag_ice_count, UNVERIFIED_IR_AT_PRINT}
+import lower_test_helpers.{assert_eq_str, last_ice, last_ice_code, last_ice_message}
+import cg.{verify_lowered_unit}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn int_const(text: Str) -> Int { ir_const(1, 0, "int64_t", text) }
+
+// A body the verifier accepts: one binding and a return that reads it.
+fn good_unit() -> Int {
+    let l = ir_let(1, 0, "int64_t", "x", SlotForm.InlineWord, int_const("1"))
+    ir_block(0, [l, ir_return(0, ir_var_ref(1, 0, "int64_t", "x", SlotForm.InlineWord))])
+}
+
+test "a unit the verifier accepts passes through and raises nothing" {
+    diag_reset()
+    ir_reset()
+    let unit = good_unit()
+    assert_eq_int("the driver answers the tree it was given", verify_lowered_unit(unit, -1), unit)
+    assert_eq_int("raises nothing", diag_ice_count, 0)
+}
+
+// The printer reads a tree by position, so a defect it is handed becomes C that nothing
+// later can tell is wrong. The driver has to refuse the unit before the printer reads it.
+test "a unit with a defect is refused before the printer reads it" {
+    diag_reset()
+    ir_reset()
+    let short = ir_new(IrKind.Binary, 1, 0, "int64_t", "+", SlotForm.InlineWord, [int_const("1")])
+    let unit = ir_block(0, [ir_expr_stmt(0, short)])
+    let _ = verify_lowered_unit(unit, -1)
+    assert_eq_int("raises one internal error", diag_ice_count, 1)
+    assert_eq_str("under the unverified-IR name", last_ice(), "UnverifiedIrAtPrint")
+    assert_eq_str("under the unverified-IR code", last_ice_code(), UNVERIFIED_IR_AT_PRINT)
+    assert(last_ice_message().contains("expects 2 kids"), "the report names the defect: {last_ice_message()}")
+}
+
+// A tree that contains itself is the one defect a reader of the tree cannot survive, so
+// the refusal has to come from the verifier rather than from the printer's own walk.
+test "a cyclic unit is refused" {
+    diag_reset()
+    ir_reset()
+    let unit = ir_new(IrKind.Block, 0, 0, "", "", SlotForm.Inline, [ir_node_count()])
+    let _ = verify_lowered_unit(unit, -1)
+    assert_eq_int("raises one internal error", diag_ice_count, 1)
+    assert(last_ice_message().contains("cycle"), "the report names the cycle: {last_ice_message()}")
+}
+
+// The message names ONE defect. A tree that lost its shape has many, and a report that
+// listed them all would bury the first, which is the one lowering got wrong.
+test "the report names the first defect and no other" {
+    diag_reset()
+    ir_reset()
+    let bad_a = ir_new(IrKind.Const, 1, 0, "int64_t", "1", SlotForm.InlineWord, [int_const("2")])
+    let bad_b = ir_new(IrKind.Binary, 1, 0, "", "", SlotForm.InlineWord, [int_const("3"), int_const("4")])
+    let unit = ir_block(0, [ir_expr_stmt(0, bad_a), ir_expr_stmt(0, bad_b)])
+    let _ = verify_lowered_unit(unit, -1)
+    assert_eq_int("raises one internal error", diag_ice_count, 1)
+    assert(last_ice_message().contains("expects 0 kids"), "names the first defect: {last_ice_message()}")
+    assert(!last_ice_message().contains("empty c_spelling"), "and not the second: {last_ice_message()}")
+}
+
+// A stage that already reported gave up partway, so the tree it left behind is expected to
+// be short of what the shape rules ask for. A second report would bury the first.
+test "a unit lowered after an internal error is not reported a second time" {
+    diag_reset()
+    ir_reset()
+    let first = ir_new(IrKind.Binary, 1, 0, "int64_t", "+", SlotForm.InlineWord, [int_const("1")])
+    let _ = verify_lowered_unit(ir_block(0, [ir_expr_stmt(0, first)]), -1)
+    assert_eq_int("the first defect is reported", diag_ice_count, 1)
+    let second = ir_new(IrKind.Binary, 1, 0, "int64_t", "+", SlotForm.InlineWord, [int_const("2")])
+    let unit = ir_block(0, [ir_expr_stmt(0, second)])
+    assert_eq_int("the tree still passes through", verify_lowered_unit(unit, -1), unit)
+    assert_eq_int("and raises nothing further", diag_ice_count, 1)
+}
+
+// A body that could not be lowered at all is a negative id. Nothing reported it here, so
+// the driver names it rather than handing the printer a node the pool does not hold.
+test "a unit that never lowered is refused" {
+    diag_reset()
+    ir_reset()
+    let _ = verify_lowered_unit(-1, -1)
+    assert_eq_int("raises one internal error", diag_ice_count, 1)
+    assert(last_ice_message().contains("out of range"), "names the missing root: {last_ice_message()}")
+}
