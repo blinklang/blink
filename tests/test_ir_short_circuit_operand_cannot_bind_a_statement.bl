@@ -1,11 +1,13 @@
 // C's && and || skip their right operand, but a node the printer binds to a temporary
-// (a Box, a filled ContainerNew or ClosureNew, or a node marked to materialise) writes
-// its statements before the operator, so they run whether or not the test passes. A
+// (a Box, a filled ContainerNew or ClosureNew, or anything but a name marked to
+// materialise) writes its statements before the operator, so they run whether or not the
+// test passes. A
 // lowering that meets one on the right of a short-circuit operator must guard it with a
 // temp and an `if`; a Binary that still holds one is a tree the printer cannot order.
 import ir.{
-    ir_reset, ir_verify, ir_const, ir_var_ref, ir_binary, ir_box, ir_container_new,
+    IrKind, ir_reset, ir_verify, ir_const, ir_var_ref, ir_binary, ir_box, ir_container_new,
     ir_closure_new, ir_call_runtime, ir_mark_materialize, ir_binds_statement, ir_node_count,
+    ir_kind, ir_kind_is_name,
 }
 import layout.{SlotForm}
 import compiler.{compile_to_program}
@@ -58,6 +60,22 @@ test "a node marked to materialise binds" {
     assert(ir_binds_statement(call))
 }
 
+// A name is already produced, so the temporary the printer takes for it copies a name and
+// runs the same on either side of the operator. The mark is there to tell the verifier the
+// tree reads the node twice, which a lowering that binds an operand once and then reads it
+// both to test and to report has to say.
+test "a mark on a name binds nothing, and the operator still takes it on the right" {
+    ir_reset()
+    let name = bool_var("pa_r")
+    ir_mark_materialize(name)
+    assert(!ir_binds_statement(name))
+    assert_verifies("marked name on the right of ||", ir_binary(2, 0, "int", "||", bool_var("pa_l"), name))
+    let call = ir_call_runtime(2, 0, "int", "blink_ready", SlotForm.InlineWord, [])
+    ir_mark_materialize(call)
+    assert_rejected("marked call on the right of ||", ir_binary(2, 0, "int", "||", bool_var("pa_l"), call),
+        "right operand of '||' binds a statement the operator cannot skip")
+}
+
 test "a short-circuit operator whose right operand binds a statement is rejected" {
     ir_reset()
     let rhs = ir_binary(2, 0, "int", "==", boxed_int(), int_const("0"))
@@ -87,4 +105,16 @@ test "a cyclic right operand is reported as a cycle, the walk does not recurse w
     assert(cyclic == self_id)
     assert(!ir_binds_statement(cyclic))
     assert_rejected("cycle under &&", ir_binary(2, 0, "int", "&&", bool_var("a"), cyclic), "cycle")
+}
+
+// The name exception has one answer for the three stages that ask it: this rule, the
+// printer before it binds a value it reads twice, and the operator seam before it binds an
+// operand a guard must also read.
+test "a name is the two kinds that print as one, and nothing else" {
+    ir_reset()
+    assert(ir_kind_is_name(ir_kind(bool_var("nm_a"))))
+    assert(ir_kind_is_name(IrKind.GlobalRef))
+    assert(!ir_kind_is_name(ir_kind(int_const("7"))))
+    assert(!ir_kind_is_name(ir_kind(boxed_int())))
+    assert(!ir_kind_is_name(IrKind.Binary))
 }

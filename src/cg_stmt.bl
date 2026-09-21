@@ -20,7 +20,8 @@ import parser.{
 }
 import typecheck.{
     TyKind, TYPE_BOOL, TYPE_CHAR, TYPE_FLOAT, TYPE_INT, TYPE_STR, TYPE_VOID,
-    tc_alias_to_original, tc_enum_has_payload, tc_global_decl_node, tc_tid_kind,
+    tc_alias_to_original, tc_enum_has_payload, tc_global_decl_node, tc_lookup_node_tid,
+    tc_tid_decl_node, tc_tid_kind,
 }
 import layout.{
     Position, Slot, SlotForm, LayoutRecord, bind_binder, bind_binder_mut, binder_scope_pop, binder_scope_push,
@@ -30,7 +31,7 @@ import layout.{
 import cname.{
     c_assert_fail_eq_name, c_assert_fail_intro_name, c_assert_fail_name,
     c_debug_assert_fail_name, c_decl_for_tid, c_enum_payload_member, c_field_name,
-    c_global_name, c_local_name, c_mint_local, c_variant_discriminant, c_runtime_helper,
+    c_global_name, c_local_name, c_mint_local, c_tuple_member, c_variant_discriminant, c_runtime_helper,
     c_string_literal,
 }
 import ir.{
@@ -107,7 +108,8 @@ let mut cs_current_fn_name: Str = ""
 
 pub fn cg_stmt_reset() {
     scope_stack = []
-    mv_clean = true
+    mv_work = []
+    mv_in_target = false
     cs_current_fn_name = ""
 }
 
@@ -790,7 +792,15 @@ fn lower_destructuring_let(node: Int) -> Int ! Diag.Report {
     let value = if init < 0 { poison_value(node) } else { lower_value(init) }
     let mut out: List[Int] = [ir_let(tid, node, rec.c_spelling, holder, rec.slot_form, value)]
     if !bind_tuple_pattern(node_elements(node), tid, holder, rec.c_spelling, rec.slot_form, out) { return -1 }
-    ir_block(node, out)
+    // Every binding but the last drains unscoped into the enclosing block, the same path
+    // bind_unit_let takes -- a `Block` here would give the destructured names a C scope of
+    // their own that ends before the next statement can read them.
+    let mut i = 0
+    while i < out.len() - 1 {
+        cg_expr_push_pending(node, out.get(i).unwrap())
+        i = i + 1
+    }
+    out.get(out.len() - 1).unwrap()
 }
 
 // Binds every name a tuple pattern holds against `holder`, appending one Let each.
@@ -981,15 +991,16 @@ fn lower_tail_block_into(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int 
 // Answers false when a shape was refused, so the statement stops on the one named report
 // rather than lowering into a read of a temp nothing declared; see The stop above.
 fn materialise_stmt_values(s: Int) -> Bool ! Diag.Report {
-    mv_clean = true
+    mv_work = []
+    mv_in_target = false
     mv_stmt(s)
 }
 
 fn mv_stmt(s: Int) -> Bool ! Diag.Report {
     match nk_of(node_kind(s)) {
         NodeKind.LetBinding => mv_expr(node_value(s))
-        NodeKind.Assignment => mv_pair(node_target(s), node_value(s))
-        NodeKind.CompoundAssign => mv_pair(node_target(s), node_value(s))
+        NodeKind.Assignment => mv_assign_pair(node_target(s), node_value(s))
+        NodeKind.CompoundAssign => mv_assign_pair(node_target(s), node_value(s))
         NodeKind.ExprStmt => mv_stmt(node_value(s))
         NodeKind.Return => mv_expr(node_value(s))
         NodeKind.IfExpr => mv_expr(node_condition(s))
@@ -1007,29 +1018,58 @@ fn mv_stmt(s: Int) -> Bool ! Diag.Report {
     }
 }
 
-// False once the walk has passed a part of the statement that an arm may not run before.
-//
-// The arms of a materialised `if` run in front of the whole statement, not where the
-// source wrote them. So every part the walk passed first must be a part that runs the same
-// whether it goes before the arms or after them. Only a value that reads nothing, writes
-// nothing, cannot trap and calls nothing qualifies: a number, a character and a boolean,
-// and the tuples, lists and ranges built out of those.
+// A part of the statement the walk passed that an if/match/block's arms may not simply run
+// before, unless it is moved there too: a number, a character and a boolean, and the
+// tuples, lists and ranges built out of those, are the only parts that read nothing, write
+// nothing, cannot trap and call nothing, so only those are left out of this record.
 //
 // Everything else is work: it reads a cell an arm can write, it traps, or it calls a
-// function. Past any of it the `if` is left to the expression stage, which refuses it by
-// name. Each arm below gives the reason for its kind.
-let mut mv_clean: Bool = true
+// function. Recorded here in the order the walk passed it, so a value-position construct
+// reached afterward can hoist each one into a temp of its own standing in front of it,
+// in that same order, rather than being refused outright. `hoistable` is false for a value
+// with no type of its own, and for anything read while computing an assignment's target --
+// hoisting a target would read a place that is about to be written instead of reaching the
+// place itself, so nothing found there is ever safe to move. Whether a node has a type of
+// its own is answered by tc_lookup_node_tid, never by stmt_tid: a bare name resolved
+// structurally -- a type, a trait, a module, an effect handle -- carries no type of its
+// own by design, and stmt_tid's tid_of_node reports that as the ICE it is everywhere else,
+// which is the wrong report for a plain hoistability probe.
+type MvWork { node: Int, hoistable: Bool }
 
-// Work the walk may not move an arm above. Whatever follows in the same statement is left
-// to the expression stage.
-fn mv_moves_work() -> Bool {
-    mv_clean = false
+let mut mv_work: List[MvWork] = []
+
+// True while the walk is inside an assignment's target.
+let mut mv_in_target: Bool = false
+
+// Work the walk may not move an arm above unless it hoists it first. Whatever follows in
+// the same statement asks the record built here before it decides.
+fn mv_moves_work(node: Int) -> Bool ! Diag.Report {
+    // A spread copies its source into the container being built; the walk knows nothing
+    // about when that copy runs relative to the container's other elements, so it is never
+    // safe to hoist even when typecheck gave it a type.
+    if nk_of(node_kind(node)) == NodeKind.SpreadExpr {
+        mv_work.push(MvWork { node: node, hoistable: false })
+        return true
+    }
+    mv_work.push(MvWork { node: node, hoistable: !mv_in_target && tc_lookup_node_tid(node) >= 0 })
     true
 }
 
 fn mv_pair(a: Int, b: Int) -> Bool ! Diag.Report {
     if !mv_expr(a) { return false }
     mv_expr(b)
+}
+
+// An assignment's target and its value, in that order. The target is never a value to
+// hoist a copy of, so everything the walk finds while it is being computed is marked
+// unhoistable for as long as that computation lasts, whatever came before it.
+fn mv_assign_pair(target: Int, value: Int) -> Bool ! Diag.Report {
+    let was_in_target = mv_in_target
+    mv_in_target = true
+    let ok = mv_expr(target)
+    mv_in_target = was_in_target
+    if !ok { return false }
+    mv_expr(value)
 }
 
 fn mv_list(sl: Int) -> Bool ! Diag.Report {
@@ -1063,21 +1103,66 @@ fn mv_expr(e: Int) -> Bool ! Diag.Report {
         NodeKind.BinOp => mv_binop(e)
         // `?` returns out of the function on its failure arm, and an operator on a type
         // that carries an impl is a call into it.
-        NodeKind.UnaryOp => mv_after(mv_expr(node_left(e)))
+        NodeKind.UnaryOp => mv_after(mv_expr(node_left(e)), e)
         // A name and a field read a cell an arm can write.
-        NodeKind.Ident => mv_moves_work()
-        NodeKind.FieldAccess => mv_after(mv_expr(node_obj(e)))
-        // A hole calls the formatter, and a field the literal left out can carry a default
-        // that runs between the fields the literal did write.
-        NodeKind.InterpString => mv_moves_work()
-        NodeKind.StructLit => mv_moves_work()
+        NodeKind.Ident => mv_moves_work(e)
+        NodeKind.FieldAccess => mv_after(mv_expr(node_obj(e)), e)
+        // A hole calls the formatter.
+        NodeKind.InterpString => mv_moves_work(e)
+        NodeKind.StructLit => mv_struct_lit(e)
         // A read through an index is checked, and the check is a statement of its own.
-        NodeKind.IndexExpr => mv_after(mv_pair(node_obj(e), node_index(e)))
+        NodeKind.IndexExpr => mv_after(mv_pair(node_obj(e), node_index(e)), e)
         // A call's left is the callee, which runs before its arguments.
-        NodeKind.Call => mv_after(mv_expr(node_left(e)) && mv_list(node_args(e)))
-        NodeKind.MethodCall => mv_after(mv_expr(node_obj(e)) && mv_list(node_args(e)))
-        _ => mv_moves_work()
+        NodeKind.Call => mv_after(mv_call_head(node_left(e)) && mv_list(node_args(e)), e)
+        NodeKind.MethodCall => mv_after(mv_call_head(node_obj(e)) && mv_list(node_args(e)), e)
+        _ => mv_moves_work(e)
     }
+}
+
+// codegen fills a struct literal one declared field at a time, by name, not in the order
+// the literal spelled them — so a field the literal left out runs its default exactly where
+// the type declares that field, which can stand between two fields the literal did write.
+// Only when the literal names every field is nothing synthesized between them; walking the
+// given fields in declaration order is then exactly the order they run in, and this is no
+// different from walking a tuple or a list. A spread or an omitted field leaves a value the
+// walk has not looked at to stand at an unknown point among the rest, so either refuses the
+// whole literal the way an incomplete read of it always has.
+fn mv_struct_lit(e: Int) -> Bool ! Diag.Report {
+    let tid = tid_of_node(e)
+    if tid < 0 { return mv_moves_work(e) }
+    let decl = tc_tid_decl_node(tid)
+    if decl < 0 { return mv_moves_work(e) }
+    let given = node_fields(e)
+    if mv_struct_lit_has_spread(given) { return mv_moves_work(e) }
+    let decls = node_fields(decl)
+    let mut i = 0
+    while i < sublist_length(decls) {
+        let fd = sublist_get(decls, i)
+        let g = mv_struct_lit_find(given, node_name(fd))
+        if g < 0 { return mv_moves_work(e) }
+        if !mv_expr(node_value(g)) { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn mv_struct_lit_has_spread(given: Int) -> Bool {
+    let mut i = 0
+    while i < sublist_length(given) {
+        if nk_of(node_kind(sublist_get(given, i))) == NodeKind.SpreadExpr { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn mv_struct_lit_find(given: Int, name: Str) -> Int {
+    let mut i = 0
+    while i < sublist_length(given) {
+        let g = sublist_get(given, i)
+        if node_name(g) == name { return g }
+        i = i + 1
+    }
+    -1
 }
 
 // The part of a value-position expression that lowers ahead of the statements that fill
@@ -1110,9 +1195,24 @@ fn mv_with_items(node: Int) -> Bool ! Diag.Report {
 }
 
 // A part whose own work runs after the parts inside it.
-fn mv_after(walked: Bool) -> Bool {
+fn mv_after(walked: Bool, node: Int) -> Bool ! Diag.Report {
     if !walked { return false }
-    mv_moves_work()
+    mv_moves_work(node)
+}
+
+// A callee or a method receiver spelled as a bare name that owns no local binder and
+// names no module-level global is a namespace, a module, a type, a trait, an effect
+// handle or a plain function: lower_fn_call and cc_receiver_role resolve every one of
+// those by the spelling alone and never read a value for it, so tid_of_node has nothing
+// to answer and this walk must not ask either -- asking anyway reports the wrong bug, the
+// same hazard cc_receiver_role's own note names. Nothing runs here at all, so it is not
+// recorded as work. A bound local, a resolved global, or an expression more than a bare
+// name is a real read in this position and is walked the ordinary way.
+fn mv_call_head(node: Int) -> Bool ! Diag.Report {
+    if nk_of(node_kind(node)) != NodeKind.Ident { return mv_expr(node) }
+    if tid_of_binder(cur_scope(), node_name(node)) >= 0 { return mv_expr(node) }
+    if tc_global_decl_node(node) >= 0 { return mv_expr(node) }
+    true
 }
 
 fn mv_binop(e: Int) -> Bool ! Diag.Report {
@@ -1122,23 +1222,56 @@ fn mv_binop(e: Int) -> Bool ! Diag.Report {
     // nothing, and the expression stage builds each as an `if`. A temp filled in front of
     // the statement would run it every time, which both changes what the program does and
     // can run work the left operand was guarding.
-    if op == "&&" { return mv_moves_work() }
-    if op == "||" { return mv_moves_work() }
-    if op == "??" { return mv_moves_work() }
+    if op == "&&" { return mv_moves_work(e) }
+    if op == "||" { return mv_moves_work(e) }
+    if op == "??" { return mv_moves_work(e) }
     if !mv_expr(node_right(e)) { return false }
     // A divide traps on a zero right operand, and an operator on a type that carries an
     // impl is a call into it.
-    mv_moves_work()
+    mv_moves_work(e)
+}
+
+// Every work item the walk passed before this node, hoisted into a temp of its own, in the
+// order the walk found them, so this node's own temp can stand after all of them without
+// moving anything the source put ahead of it. Answers false, leaving the record untouched,
+// the moment one item cannot be hoisted, so the caller reports the same refusal a walk
+// with no hoisting at all would have given.
+fn mv_hoist_pending() -> Bool ! Diag.Report {
+    let mut i = 0
+    while i < mv_work.len() {
+        if !mv_work.get(i).unwrap().hoistable { return false }
+        i = i + 1
+    }
+    i = 0
+    while i < mv_work.len() {
+        mv_hoist_one(mv_work.get(i).unwrap())
+        i = i + 1
+    }
+    mv_work = []
+    true
+}
+
+// One work item, lowered into a temp exactly the way any other value would be, and named
+// to the expression stage the same way a value-position construct's own temp is: a later
+// read of this same node substitutes a read of the temp instead of lowering it again.
+fn mv_hoist_one(w: MvWork) ! Diag.Report {
+    let tid = stmt_tid(w.node)
+    let rec = layout_at(tid, Position.Local, w.node)
+    let _ = ensure_typedef_for(tid)
+    let name = c_mint_local("hoist")
+    let value = lower_value(w.node)
+    cg_expr_push_pending(w.node, ir_let(tid, w.node, rec.c_spelling, name, rec.slot_form, value))
+    cg_expr_register_value(w.node, name, tid)
 }
 
 // The temp for one value-position `if` or `match`: declared unset, filled by the arms,
 // and named to the expression stage before the statement that reads it lowers.
 //
 // What the walk passed before it reached this node decides whether the temp is safe, so
-// the test comes before anything else this does. The head is not part of that: it lowers
-// inside the `if` the temp stands under, so it keeps its place ahead of the arms whatever
-// work it holds. Walking it materialises a value-position `if` in a condition or a
-// scrutinee into a temp of its own above this one.
+// hoisting that work comes before anything else this does. The head is not part of that:
+// it lowers inside the `if` the temp stands under, so it keeps its place ahead of the arms
+// whatever work it holds. Walking it materialises a value-position `if` in a condition or
+// a scrutinee into a temp of its own above this one.
 // A construct whose tail is not a value expression has type `()`, which is an ordinary
 // inhabited type carrying one value and a representation, so the binding gets that one
 // value rather than a report. The temp is declared at the unit spelling and initialised to
@@ -1156,12 +1289,12 @@ fn materialise_unit_value(node: Int, tid: Int) -> Bool ! Diag.Report {
     if ran < 0 { return false }
     cg_expr_push_pending(node, ran)
     cg_expr_register_value(node, name, tid)
-    mv_clean = true
+    mv_work = []
     true
 }
 
 fn materialise_value_expr(node: Int) -> Bool ! Diag.Report {
-    if !mv_clean {
+    if !mv_hoist_pending() {
         diag_ice_at("ValuePositionExprMovesWork", CODEGEN_STAGE_NOT_BUILT,
             "{node_kind_name(node_kind(node))} in value position stands after work its arms would run before", node,
             "materialising this needs the temp declared where the reader is lowered; bind the value in a let above the statement")
@@ -1188,8 +1321,8 @@ fn materialise_value_expr(node: Int) -> Bool ! Diag.Report {
     // The head and the arms both stand under this temp, and a temp minted later stands
     // under this one. So nothing they hold is work a later part of the same statement has
     // to move above. Lowering the arms ran this same walk over each arm statement, which
-    // left the flag holding the last of them; this is what puts it back.
-    mv_clean = true
+    // left the record holding whatever the last of them passed; this is what clears it.
+    mv_work = []
     true
 }
 
@@ -1730,7 +1863,7 @@ fn is_variant_name(tid: Int, name: Str) -> Bool {
 
 // A tuple's members are positional: element i is the member the type's emitter laid out
 // under that position. One spelling, so the three readers below cannot drift apart.
-fn tuple_member(i: Int) -> Str { "_{i}" }
+fn tuple_member(i: Int) -> Str { c_tuple_member(i) }
 
 fn find_variant(td: Int, name: Str) -> Int {
     if td < 0 { return -1 }

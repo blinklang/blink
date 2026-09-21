@@ -1,0 +1,342 @@
+// A handler literal lowered as a value, and the operation definitions it leaves behind.
+//
+// `handler E { fn op(..) {..} }` is two things at once, the same way a closure literal is:
+// a value at its own site and a set of function definitions somewhere else. The value is a
+// vtable for E — a copy of the vtable installed for E's root when the literal runs, with
+// one slot replaced per operation the literal writes — so an operation the literal omits
+// still answers, through the handler the copy was taken from. The definitions ride the
+// same queue a closure thunk rides, because they are functions like any other.
+//
+// An operation body runs OUTSIDE the handler it belongs to. That is what makes a handler
+// for an effect the body itself performs terminate: `handler IO { fn print(m) {
+// io.println(m) } }` reaches the enclosing handler, not itself. So a perform of the root
+// the operation handles reads the copied-from handler, and a perform of any other root
+// reads the effect vector as everywhere else.
+//
+// A capture is refused rather than built: an operation's captures would have to ride the
+// vtable's per-operation userdata word, which nothing allocates yet, and a handler that
+// silently dropped them would answer a value the program never produced.
+
+import cname_test_helpers.{find_decl, assert_eq_str}
+import cg_emit.{em_reset, em_take}
+import cg_test_helpers.{cg_probe_compile, cg_text_occurrences}
+import ast.{NodeKind, nk_of}
+import parser.{node_body, node_kind, node_value_child_ids}
+import layout.{bind_binder_mut, binder_scope_pop, binder_scope_push, layout_reset}
+import typecheck.{TYPE_STR, tc_resolve, tc_tid_handler_effect}
+import ir.{IrKind, ir_c_name, ir_kid, ir_kid_count, ir_kind, ir_reset, ir_verify, ir_block, ir_tid}
+import cg_reg.{cg_reg_build}
+import cg_expr.{cg_expr_reset, lower_expr}
+import cg_stmt.{cg_stmt_reset, lower_block_returning}
+import cg_eff.{
+    cg_eff_lower_handler_expr, cg_eff_lower_handler_install, cg_eff_pending_thunks, cg_eff_reset,
+    cg_eff_thunk_body_node, cg_eff_thunk_close, cg_eff_thunk_open, cg_eff_thunk_params,
+    cg_eff_thunk_ret, cg_eff_thunk_symbol,
+}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+
+// One handler literal per function, so a case names the literal it means by the function
+// around it. `metrics_two` carries two operations and a value-returning one; `io_none`
+// writes no operation at all, which is a complete handler that delegates everything.
+fn probe_src() -> Str {
+    #"import std.io
+
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str)
+        fn total() -> Int
+    }
+}
+
+fn io_one() -> Handler[IO] {
+    handler IO {
+        fn print(msg: Str) {
+            io.println("[H] {msg}")
+        }
+    }
+}
+
+fn io_none() -> Handler[IO] {
+    handler IO {
+    }
+}
+
+fn metrics_two() -> Handler[Metrics] {
+    handler Metrics {
+        fn counter(name: Str) {
+            io.println("[M] {name}")
+        }
+        fn total() -> Int {
+            7
+        }
+    }
+}
+
+fn io_log() -> Handler[IO] {
+    handler IO {
+        fn log(msg: Str) {
+            io.println("[L] {msg}")
+        }
+    }
+}
+
+fn io_capturing() -> Handler[IO] {
+    let tag = "T"
+    handler IO {
+        fn print(msg: Str) {
+            io.println("{tag} {msg}")
+        }
+    }
+}
+
+fn main() {
+    with io_one() {
+        io.println("a")
+    }
+    with io_none() {
+        io.println("b")
+    }
+    with metrics_two() {
+        metrics.counter("c")
+    }
+    with io_capturing() {
+        io.println("d")
+    }
+    with io_log() {
+        io.println("e")
+    }
+}
+"#
+}
+
+fn ices() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" { n = n + 1 }
+    }
+    n
+}
+
+fn ices_named(name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.name == name { n = n + 1 }
+    }
+    n
+}
+
+fn report_ices() {
+    for d in diag_entries {
+        if d.severity == "ice" { io.println("  ICE {d.code} {d.message}") }
+    }
+}
+
+// The registry, the IR table and the diagnostics list are process globals, so each test
+// compiles the probe for itself.
+fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    diag_reset()
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    cg_expr_reset()
+    cg_eff_reset()
+    let path = "build/cg_eff_handler_literal_probe.bl"
+    let program = cg_probe_compile(path, probe_src())
+    let _ = fs.delete(path)
+    cg_reg_build(program)
+    diag_reset()
+}
+
+// The handler literal written inside the named function.
+fn handler_in(fn_name: Str) -> Int {
+    let f = find_decl(NodeKind.FnDef, fn_name, "")
+    assert(f >= 0)
+    let h = find_handler(node_body(f))
+    if h < 0 { io.println("FAIL: no handler literal in {fn_name}") }
+    assert(h >= 0)
+    h
+}
+
+fn find_handler(node: Int) -> Int {
+    if node < 0 { return -1 }
+    if nk_of(node_kind(node)) == NodeKind.HandlerExpr { return node }
+    for kid in node_value_child_ids(node) {
+        let hit = find_handler(kid)
+        if hit >= 0 { return hit }
+    }
+    -1
+}
+
+// The first perform in a lowered tree, in printing order, so a row can ask what its
+// receiver reads.
+fn find_perform(id: Int) -> Int {
+    if id < 0 { return -1 }
+    if ir_kind(id) == IrKind.EffectPerform { return id }
+    let mut i = 0
+    while i < ir_kid_count(id) {
+        let hit = find_perform(ir_kid(id, i))
+        if hit >= 0 { return hit }
+        i = i + 1
+    }
+    -1
+}
+
+// One operation's body lowered inside the operation's own frame, which is where a perform
+// in it decides what to read.
+fn lower_op_body(i: Int) -> Int ! Diag.Report {
+    let scope = cg_eff_thunk_open(i)
+    if scope < 0 { return -1 }
+    let body = lower_block_returning(cg_eff_thunk_body_node(i))
+    cg_eff_thunk_close()
+    body
+}
+
+test "a handler literal lowers to a value at the handler's own type" {
+    setup()
+    let node = handler_in("io_one")
+    let v = cg_eff_lower_handler_expr(node)
+    report_ices()
+    assert_eq(ices(), 0)
+    assert(v >= 0)
+    assert_eq_str("effect", tc_tid_handler_effect(tc_resolve(ir_tid(v))), "IO")
+}
+
+test "the expression stage answers a handler literal with that value" {
+    setup()
+    let node = handler_in("io_one")
+    let v = lower_expr(node)
+    report_ices()
+    assert_eq(ices(), 0)
+    assert(v >= 0)
+    assert_eq_str("effect", tc_tid_handler_effect(tc_resolve(ir_tid(v))), "IO")
+}
+
+test "the value a handler literal lowers to is what the install takes" {
+    setup()
+    let node = handler_in("metrics_two")
+    let v = cg_eff_lower_handler_expr(node)
+    assert(v >= 0)
+    let inst = cg_eff_lower_handler_install(node, v, ir_block(node, []))
+    report_ices()
+    assert_eq(ices(), 0)
+    assert(inst >= 0)
+    assert(ir_kind(inst) == IrKind.HandlerInstall)
+    assert_eq_str("field", ir_c_name(inst), "ue_metrics")
+}
+
+// The builder writes one vtable member per operation the literal carries. A builtin
+// root's vtable is a hand-written runtime struct, so the member is spelled as that struct
+// declares it. `log` is a C library name, and escaping it to `_blink_log` names a member
+// blink_io_vtable does not have, which C rejects at the assignment.
+test "the builder writes the member name the runtime's vtable declares" {
+    setup()
+    em_reset()
+    let v = cg_eff_lower_handler_expr(handler_in("io_log"))
+    report_ices()
+    assert_eq(ices(), 0)
+    assert(v >= 0)
+    let text = em_take()
+    if cg_text_occurrences(text, "__h->log = ") != 1 { io.println("FAIL: builder wrote\n{text}") }
+    assert_eq(cg_text_occurrences(text, "__h->log = "), 1)
+    assert_eq(cg_text_occurrences(text, "_blink_log"), 0)
+}
+
+test "a handler literal that writes no operation still lowers to a value" {
+    // A partial handler is a complete handler: the omitted operations answer through the
+    // handler this one was copied from. A literal with nothing written is the limit case,
+    // and refusing it would make "write one operation" a rule the language does not have.
+    setup()
+    let v = cg_eff_lower_handler_expr(handler_in("io_none"))
+    report_ices()
+    assert_eq(ices(), 0)
+    assert(v >= 0)
+    assert_eq(cg_eff_pending_thunks(), 0)
+}
+
+test "the lowered handler value is a well-formed value in a block" {
+    setup()
+    let node = handler_in("io_one")
+    let v = cg_eff_lower_handler_expr(node)
+    assert(v >= 0)
+    let problems = ir_verify(ir_block(node, [cg_eff_lower_handler_install(node, v, ir_block(node, []))]))
+    for p in problems { io.println("  verify: {p}") }
+    assert_eq(problems.len(), 0)
+}
+
+test "each operation of a handler literal is queued under its own symbol" {
+    setup()
+    let v = cg_eff_lower_handler_expr(handler_in("metrics_two"))
+    assert(v >= 0)
+    assert_eq(cg_eff_pending_thunks(), 2)
+    assert(cg_eff_thunk_symbol(0) != "")
+    assert(cg_eff_thunk_symbol(0) != cg_eff_thunk_symbol(1))
+}
+
+test "a queued operation carries the operation's own body" {
+    setup()
+    let node = handler_in("io_one")
+    let v = cg_eff_lower_handler_expr(node)
+    assert(v >= 0)
+    assert_eq(cg_eff_pending_thunks(), 1)
+    let body = cg_eff_thunk_body_node(0)
+    assert(body >= 0)
+    assert(body != node)
+}
+
+test "an operation's signature is spelled from its own declaration" {
+    setup()
+    let v = cg_eff_lower_handler_expr(handler_in("metrics_two"))
+    assert(v >= 0)
+    assert_eq_str("counter result", cg_eff_thunk_ret(0), "void")
+    assert_eq(cg_eff_thunk_params(0).len(), 1)
+    assert_eq_str("total result", cg_eff_thunk_ret(1), "int64_t")
+    assert_eq(cg_eff_thunk_params(1).len(), 0)
+}
+
+// An operation body runs outside the handler that holds it, so a perform of the root that
+// handler covers must reach the handler the copy was taken from. Reading the effect vector
+// there would reach this very operation, and the program would recurse until the stack ran
+// out — silently, because the C is well-formed.
+test "a perform of the handled root inside an operation does not read the effect vector" {
+    setup()
+    let v = cg_eff_lower_handler_expr(handler_in("io_one"))
+    assert(v >= 0)
+    let body = lower_op_body(0)
+    report_ices()
+    assert_eq(ices(), 0)
+    assert(body >= 0)
+    let perform = find_perform(body)
+    assert(perform >= 0)
+    assert(ir_kind(ir_kid(perform, 0)) != IrKind.FieldGet)
+}
+
+// The other half of the row above: an operation that performs a DIFFERENT root reads the
+// vector like every other perform, or a handler installed around this one would be missed.
+test "a perform of another root inside an operation reads the effect vector" {
+    setup()
+    let v = cg_eff_lower_handler_expr(handler_in("metrics_two"))
+    assert(v >= 0)
+    let body = lower_op_body(0)
+    report_ices()
+    assert_eq(ices(), 0)
+    assert(body >= 0)
+    let perform = find_perform(body)
+    assert(perform >= 0)
+    assert(ir_kind(ir_kid(perform, 0)) == IrKind.FieldGet)
+}
+
+// A capture would have to ride the vtable's per-operation userdata word. Nothing allocates
+// that word yet, so the handler is refused by name rather than built with the capture
+// dropped, which would answer a value the program never wrote.
+test "an operation that reads a local of the enclosing function is refused by name" {
+    setup()
+    let outer = binder_scope_push()
+    bind_binder_mut(outer, "tag", TYPE_STR, false)
+    let v = cg_eff_lower_handler_expr(handler_in("io_capturing"))
+    binder_scope_pop()
+    assert_eq(v, -1)
+    assert_eq(ices_named("HandlerCaptureNotLowered"), 1)
+    assert_eq(cg_eff_pending_thunks(), 0)
+}

@@ -12,12 +12,12 @@ import ast.{NodeKind, nk_of}
 import parser.{
     is_literal_string_part, node_args, node_body, node_elements, node_for_binder, node_guard, node_handlers,
     node_iterable, node_kind, node_method, node_methods, node_name, node_obj, node_params, node_pattern,
-    node_recv_type_args, node_stmts, node_trait_name, node_value, node_value_child_ids, sublist_get,
+    node_recv_type_args, node_stmts, node_trait_name, node_type_ann, node_value, node_value_child_ids, sublist_get,
     sublist_length,
 }
 import typecheck.{
     TyKind, TYPE_INT, TYPE_STR, lookup_named_type, make_ffi_scope_type, make_handler_type, tc_resolve,
-    tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tk_name, ty_pool,
+    tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tc_void_tid, tk_name, ty_pool,
 }
 import layout.{
     BinderMut, LayoutRecord, Position, Slot, SlotForm, bind_binder, binder_mutability_of, binder_scope_pop,
@@ -25,15 +25,16 @@ import layout.{
     ensure_typedef_for, layout_of, tid_of_binder, tid_of_node,
 }
 import cname.{
-    c_builtin_effect_slot, c_ev_field_name, c_ev_global_name, c_ev_type_name, c_field_name,
+    c_builtin_effect_slot, c_effect_vtable_slot_name, c_ev_field_name, c_ev_global_name,
+    c_ev_type_name, c_field_name,
     c_impl_method_name, c_local_name, c_mint_local, c_runtime_helper,
 }
 import ir.{
-    ir_assign, ir_block, ir_box, ir_carrier_wrap, ir_closure_new, ir_const, ir_effect_perform, ir_evidence_address,
-    ir_evidence_vector, ir_call_runtime, ir_cast, ir_field_get, ir_handler_install, ir_if, ir_let, ir_unbox,
-    ir_var_ref,
+    ir_assign, ir_block, ir_box, ir_call_direct, ir_call_runtime, ir_carrier_wrap, ir_cast,
+    ir_closure_new, ir_const, ir_effect_perform, ir_evidence_address, ir_evidence_vector,
+    ir_field_get, ir_global_ref, ir_handler_install, ir_if, ir_let, ir_unbox, ir_var_ref,
 }
-import cg_print.{print_closure_thunk, print_resource_guard_support}
+import cg_print.{print_closure_thunk, print_fn, print_fn_decl, print_handler_builder, print_resource_guard_support}
 import cg_reg.{cg_reg_effect_decls, cg_reg_impl_decls}
 import cg_expr.{cg_expr_push_pending, lower_expr, lower_value_as_text}
 import diagnostics.{
@@ -227,6 +228,12 @@ type PendingThunk {
     // so what the prologue needs is carried here rather than looked up again.
     cap_names: List[Str]
     cap_tids: List[Int]
+    // -1 for a closure thunk. A handler literal's tid for one of its operations, which is
+    // what makes the operation take its signature from its own declaration rather than from
+    // a Fn type, and its performs of that root reach outer_name rather than the vector.
+    handler_tid: Int
+    // The static the handler literal's builder wrote the copied-from handler into, or "".
+    outer_name: Str
 }
 
 let mut eff_thunks: List[PendingThunk] = []
@@ -235,9 +242,17 @@ let mut eff_thunks: List[PendingThunk] = []
 // cannot pop a frame that belongs to someone else.
 let mut eff_thunk_scope: Int = -1
 
+// While a handler operation's body lowers: the static its literal recorded the copied-from
+// handler in, and the evidence field of the root that operation handles. Both empty outside
+// one, which is what a perform reads to decide whether it is performing its own operation.
+let mut eff_op_outer_name: Str = ""
+let mut eff_op_field: Str = ""
+
 pub fn cg_eff_reset() {
     eff_thunks = []
     eff_thunk_scope = -1
+    eff_op_outer_name = ""
+    eff_op_field = ""
 }
 
 // The closure record for one closure literal, or -1 after a recorded internal error.
@@ -270,6 +285,7 @@ pub fn cg_eff_lower_closure(node: Int) -> Int ! Diag.Report {
     let symbol = c_mint_local("closure")
     eff_thunks.push(PendingThunk {
         closure: node, symbol: symbol, fn_tid: tid, cap_names: free, cap_tids: tids,
+        handler_tid: -1, outer_name: "",
     })
     ir_closure_new(tid, node, rec.c_spelling, symbol, "", "", words)
 }
@@ -374,6 +390,148 @@ fn join_names(names: List[Str]) -> Str {
     out
 }
 
+// ── Handler literals ─────────────────────────────────────────────
+
+// The handler record for one `handler E { ... }` literal, or -1 after a recorded internal
+// error.
+//
+// A handler literal is two things at once, the way a closure literal is: a value where it is
+// written and a set of function definitions somewhere else. The value is a vtable for E, a
+// copy of the vtable installed for E's root when the literal runs with one slot replaced per
+// operation the literal writes. Copying is what makes a partial handler complete: an
+// operation the literal omits keeps the body the copied-from handler gave it, and a literal
+// that writes no operation at all delegates everything.
+//
+// The copy is built by a function of its own because the value stands where C has no
+// statement. That function also records the copied-from handler, which is what this
+// literal's operations perform their own root through.
+//
+// The operations ride the thunk queue the closure thunks ride, so the driver drains both the
+// same way, and each is forward-declared here because the builder names it before the drain
+// defines it.
+pub fn cg_eff_lower_handler_expr(node: Int) -> Int ! Diag.Report {
+    let tid = tc_resolve(tid_of_node(node))
+    if tid < 0 { return -1 }
+    if tc_tid_handler_effect(tid) == "" {
+        diag_ice_at("HandlerLiteralNotAHandler", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "handler literal type {tid} is not a handler of a named effect", node,
+            "typecheck stamps every handler literal as Handler[E]; this is a compiler bug")
+        return -1
+    }
+    let field = ev_field_of(tid, node)
+    if field == "" { return -1 }
+    let rec = layout_or_ice(tid, Position.Local, node, "UnspellableHandlerType", "handler literal")
+    if rec.c_spelling == "" { return -1 }
+    let ops = handler_ops(node)
+    if !handler_ops_are_capture_free(node, ops) { return -1 }
+    // Every signature is spelled before anything is queued, so a literal this stage cannot
+    // spell leaves the queue as it found it rather than a thunk nothing defines.
+    let mut slots: List[Str] = []
+    let mut symbols: List[Str] = []
+    let mut rets: List[Str] = []
+    let mut params: List[List[Str]] = []
+    for op in ops {
+        let ret = handler_op_ret(op)
+        let ps = handler_op_params(op)
+        if ret == "" || ps.len() != declared_param_count(op) { return -1 }
+        let slot = c_effect_vtable_slot_name(tid, node_name(op))
+        if diag_is_ice_seg(slot) {
+            diag_ice_at("HandlerOpNotNameable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "no vtable member for operation '{node_name(op)}' of this handler", op,
+                "a handler literal installs into its root's vtable; a root with no vtable should have been refused before codegen")
+            return -1
+        }
+        slots.push(slot)
+        rets.push(ret)
+        params.push(ps)
+        symbols.push(c_mint_local("handler_op"))
+    }
+    let outer = c_mint_local("handler_outer")
+    let mut i = 0
+    while i < ops.len() {
+        eff_thunks.push(PendingThunk {
+            closure: ops.get(i).unwrap(), symbol: symbols.get(i).unwrap(), fn_tid: -1,
+            cap_names: [], cap_tids: [], handler_tid: tid, outer_name: outer,
+        })
+        print_fn_decl(true, rets.get(i).unwrap(), symbols.get(i).unwrap(), params.get(i).unwrap(), false)
+        i = i + 1
+    }
+    let symbol = c_mint_local("handler")
+    print_handler_builder(rec.c_spelling, symbol, outer, c_ev_global_name(), field, slots, symbols)
+    ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, [])
+}
+
+// The operations one literal writes, in the order written, which is the order their slots are
+// assigned in. A literal writes them flat, unlike a declaration, where they live under the
+// sub-effects of a root.
+fn handler_ops(node: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    let sl = node_methods(node)
+    if sl == -1 { return out }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        out.push(sublist_get(sl, i))
+        i = i + 1
+    }
+    out
+}
+
+fn declared_param_count(fn_like: Int) -> Int {
+    let ps = node_params(fn_like)
+    if ps == -1 { return 0 }
+    sublist_length(ps)
+}
+
+// An operation declares its own result, and a declaration with no annotation answers nothing.
+fn handler_op_ret_tid(op: Int) -> Int ! Diag.Report {
+    let ann = node_type_ann(op)
+    if ann == -1 { return tc_void_tid() }
+    tid_of_node(ann)
+}
+
+fn handler_op_ret(op: Int) -> Str ! Diag.Report {
+    thunk_spelling(handler_op_ret_tid(op), Position.VtableSlot, op)
+}
+
+// One `<spelling> <name>` per parameter. The names are the literal's own, because the body
+// reads them, and the types come off the parameter nodes typecheck stamped when it walked the
+// operation against the effect it implements.
+fn handler_op_params(op: Int) -> List[Str] ! Diag.Report {
+    let mut out: List[Str] = []
+    let ps = node_params(op)
+    if ps == -1 { return out }
+    let mut k = 0
+    while k < sublist_length(ps) {
+        let p = sublist_get(ps, k)
+        let spelling = thunk_spelling(tid_of_node(p), Position.Param, p)
+        if spelling == "" { return [] }
+        out.push("{spelling} {c_local_name(node_name(p))}")
+        k = k + 1
+    }
+    out
+}
+
+// Whether no operation of the literal reads a local of the enclosing function.
+//
+// A captured name would have to ride the vtable's per-operation userdata word. Nothing fills
+// that word yet, so a literal that needs one is refused by name rather than built with the
+// capture dropped, which would answer a value the program never wrote. The whole literal is
+// refused together, because its operations share one vtable and a half-built one would
+// install slots the program did not ask for.
+fn handler_ops_are_capture_free(node: Int, ops: List[Int]) -> Bool ! Diag.Report {
+    let mut captured: List[Str] = []
+    for op in ops {
+        for nm in closure_free_names(op) {
+            if !captured.contains(nm) { captured.push(nm) }
+        }
+    }
+    if captured.len() == 0 { return true }
+    diag_ice_at("HandlerCaptureNotLowered", CODEGEN_STAGE_NOT_BUILT,
+        "a handler operation reads {join_names(captured)} from the enclosing function, and an operation's captures have no word allocated yet",
+        node, "each operation owns one userdata word of its effect's vtable; nothing fills it, and dropping the capture would answer a value the program never wrote")
+    false
+}
+
 // ── The thunk queue ───────────────────────────────────────────────────────────────
 
 pub fn cg_eff_pending_thunks() -> Int { eff_thunks.len() }
@@ -423,6 +581,10 @@ pub fn cg_eff_thunk_ret(i: Int) -> Str ! Diag.Report {
     let t = thunk_at(i)
     if t < 0 { return "" }
     let th = eff_thunks.get(t).unwrap()
+    // A handler operation is assigned into a vtable slot, and every handler of one effect is
+    // assigned into the same one, so the erasure that gives them a single signature is
+    // attached to that position rather than to the plain return.
+    if th.handler_tid >= 0 { return handler_op_ret(th.closure) }
     thunk_spelling(cg_eff_thunk_ret_tid(i), Position.Return, th.closure)
 }
 
@@ -437,7 +599,9 @@ pub fn cg_eff_thunk_ret(i: Int) -> Str ! Diag.Report {
 pub fn cg_eff_thunk_ret_tid(i: Int) -> Int ! Diag.Report {
     let t = thunk_at(i)
     if t < 0 { return -1 }
-    child_tid(eff_thunks.get(t).unwrap().fn_tid, Slot.Inner1)
+    let th = eff_thunks.get(t).unwrap()
+    if th.handler_tid >= 0 { return handler_op_ret_tid(th.closure) }
+    child_tid(th.fn_tid, Slot.Inner1)
 }
 
 // One `<spelling> <name>` per parameter, in declaration order. The name is the local's
@@ -448,6 +612,7 @@ pub fn cg_eff_thunk_params(i: Int) -> List[Str] ! Diag.Report {
     let t = thunk_at(i)
     if t < 0 { return out }
     let th = eff_thunks.get(t).unwrap()
+    if th.handler_tid >= 0 { return handler_op_params(th.closure) }
     let ps = node_params(th.closure)
     if ps == -1 { return out }
     let mut k = 0
@@ -496,9 +661,13 @@ pub fn cg_eff_print_thunk(i: Int, body: Int) ! Diag.Report {
     let ret = cg_eff_thunk_ret(i)
     if ret == "" { return }
     let params = cg_eff_thunk_params(i)
-    let ps = node_params(th.closure)
-    let declared = if ps == -1 { 0 } else { sublist_length(ps) }
-    if params.len() != declared { return }
+    if params.len() != declared_param_count(th.closure) { return }
+    // A handler operation is reached through a vtable slot, which passes the operation's own
+    // parameters and nothing else, so it takes no receiver word in front of them.
+    if th.handler_tid >= 0 {
+        print_fn(true, ret, th.symbol, params, false, body)
+        return
+    }
     let whole = with_capture_prologue(th, body)
     if whole < 0 { return }
     print_closure_thunk(ret, th.symbol, params, whole)
@@ -568,6 +737,10 @@ pub fn cg_eff_thunk_open(i: Int) -> Int ! Diag.Report {
     }
     let scope = binder_scope_push()
     eff_thunk_scope = scope
+    if th.handler_tid >= 0 {
+        eff_op_outer_name = th.outer_name
+        eff_op_field = ev_field_of(th.handler_tid, th.closure)
+    }
     if !bind_thunk_params(th, scope) {
         cg_eff_thunk_close()
         return -1
@@ -592,6 +765,8 @@ pub fn cg_eff_thunk_close() ! Diag.Report {
     }
     binder_scope_pop()
     eff_thunk_scope = -1
+    eff_op_outer_name = ""
+    eff_op_field = ""
 }
 
 // The parameter types come from the Fn tid, the same source the signature is spelled
@@ -603,11 +778,11 @@ fn bind_thunk_params(th: PendingThunk, scope: Int) -> Bool ! Diag.Report {
     let mut k = 0
     while k < sublist_length(ps) {
         let p = sublist_get(ps, k)
-        let tid = child_tid(th.fn_tid, Slot.Param(k))
+        let tid = if th.handler_tid >= 0 { tid_of_node(p) } else { child_tid(th.fn_tid, Slot.Param(k)) }
         if tid < 0 {
             diag_ice_at("ClosureParamHasNoType", UNSOLVED_TYPEVAR_AT_CODEGEN,
-                "closure parameter '{node_name(p)}' has no type in the closure's Fn type", p,
-                "typecheck stamps a closure with one type per parameter; this is a compiler bug")
+                "parameter '{node_name(p)}' has no type where the thunk's signature reads it", p,
+                "typecheck stamps one type per parameter of a closure and of a handler operation; this is a compiler bug")
             return false
         }
         bind_binder(scope, node_name(p), tid)
@@ -838,6 +1013,17 @@ fn slot_read(node: Int, handler_tid: Int) -> Int ! Diag.Report {
     if field == "" { return -1 }
     let rec = perform_layout(handler_tid, Position.Local, node)
     if rec.c_spelling == "" { return -1 }
+    // Inside a handler operation, a perform of the root that operation handles reaches the
+    // handler this one was copied from. The vector holds this very operation, so reading it
+    // here would call the operation from its own body and recurse until the stack ran out,
+    // silently, because the C is well formed. Every other root reads the vector, or a handler
+    // installed around this one would be missed. Two handler tids of one root own one field,
+    // so the field is the comparison the vtable identity rule already makes.
+    if eff_op_outer_name != "" && eff_op_field == field {
+        // A GlobalRef, not a VarRef: the handler builder writes that name as a file-static,
+        // and the operation body is a function of its own that declares nothing of the kind.
+        return ir_global_ref(handler_tid, node, rec.c_spelling, eff_op_outer_name, SlotForm.PointerBoxed)
+    }
     ir_field_get(handler_tid, node, rec.c_spelling, field, SlotForm.PointerBoxed, ev_read(node))
 }
 
