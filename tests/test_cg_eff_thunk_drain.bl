@@ -8,7 +8,10 @@
 // program that is no longer current can never be printed into the next unit.
 
 import cname_test_helpers.{find_decl}
-import cg_test_helpers.{cg_probe_compile, cg_text_occurrences}
+import cg_test_helpers.{
+    cg_ice_count, cg_ices_named, cg_ices_saying, cg_probe_compile, cg_report_ices,
+    cg_text_occurrences,
+}
 import ast.{NodeKind}
 import parser.{node_value}
 import layout.{layout_reset}
@@ -24,7 +27,7 @@ import cg_eff.{
     cg_eff_thunk_body_node, cg_eff_thunk_close, cg_eff_thunk_open, cg_eff_thunk_symbol,
     cg_eff_thunks_drained,
 }
-import diagnostics.{diag_entries, diag_reset}
+import diagnostics.{diag_reset}
 import std.fs
 import std.io
 
@@ -43,38 +46,6 @@ fn plain_src() -> Str {
     #"fn plain(a: Int) -> Int { a }
 fn main() { let x = 1 }
 "#
-}
-
-fn ices() -> Int {
-    let mut n = 0
-    for d in diag_entries {
-        if d.severity == "ice" { n = n + 1 }
-    }
-    n
-}
-
-// The queue's own reports carry no position, so the probe-owned counters in
-// cg_test_helpers, which read a report's file, cannot see them.
-fn ices_saying(name: Str, marker: Str) -> Int {
-    let mut n = 0
-    for d in diag_entries {
-        if d.severity == "ice" && d.name == name && d.message.contains(marker) { n = n + 1 }
-    }
-    n
-}
-
-fn ices_named(name: Str) -> Int {
-    let mut n = 0
-    for d in diag_entries {
-        if d.severity == "ice" && d.name == name { n = n + 1 }
-    }
-    n
-}
-
-fn report_ices() {
-    for d in diag_entries {
-        if d.severity == "ice" { io.println("  ICE {d.name} {d.message}") }
-    }
 }
 
 fn reset_stages() {
@@ -102,6 +73,12 @@ fn setup_closure_program() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     program
 }
 
+// The closure literal a `let` of this name is initialized with. Every closure probe reads
+// its subject this way, out of a binding the probe source really wrote, rather than out of
+// a node the test built for itself. It is not in cg_test_helpers because that harness would
+// then import cname_test_helpers for find_decl, and a name reachable through an import of
+// an import counts as in scope, which makes assert_eq_str ambiguous in every suite file
+// that also imports lower_test_helpers.
 fn closure_of(let_name: Str) -> Int {
     let binding = find_decl(NodeKind.LetBinding, let_name, "")
     assert(binding >= 0)
@@ -130,16 +107,16 @@ test "one non-capturing closure prints exactly one thunk definition and the drai
     let symbol = cg_eff_thunk_symbol(0)
     drain_one(0)
     let text = print_take()
-    if cg_text_occurrences(text, "{symbol}(") != 1 || ices() != 0 {
+    if cg_text_occurrences(text, "{symbol}(") != 1 || cg_ice_count() != 0 {
         io.println("FAIL: expected one definition of {symbol}:")
-        report_ices()
+        cg_report_ices("the drain reported")
         io.println(text)
     }
     assert_eq(cg_text_occurrences(text, "{symbol}("), 1)
     assert_eq(cg_text_occurrences(text, "{symbol}(const blink_closure* __self, int64_t"), 1)
     cg_eff_thunks_drained(1)
     assert_eq(cg_eff_pending_thunks(), 0)
-    assert_eq(ices(), 0)
+    assert_eq(cg_ice_count(), 0)
 }
 
 test "two emits in one process start the second with an empty queue" {
@@ -152,23 +129,23 @@ test "two emits in one process start the second with an empty queue" {
     let text = generate(plain, standalone_cfg())
     if cg_eff_pending_thunks() != 0 || text.index_of(stale) >= 0 {
         io.println("FAIL: the stale thunk {stale} survived into the next unit:")
-        report_ices()
+        cg_report_ices("the second unit reported")
     }
     assert_eq(cg_eff_pending_thunks(), 0)
     assert(text.index_of(stale) < 0)
-    assert_eq(ices_named("ThunkQueueNotDrained"), 0)
-    assert_eq(ices_named("NoSuchThunk"), 0)
-    assert_eq(ices_named("ThunkFrameNested"), 0)
-    assert_eq(ices_named("UnspellableThunkSlot"), 0)
-    assert_eq(ices_named("ClosureTypeHasNoSlot"), 0)
+    assert_eq(cg_ices_named("ThunkQueueNotDrained"), 0)
+    assert_eq(cg_ices_named("NoSuchThunk"), 0)
+    assert_eq(cg_ices_named("ThunkFrameNested"), 0)
+    assert_eq(cg_ices_named("UnspellableThunkSlot"), 0)
+    assert_eq(cg_ices_named("ClosureTypeHasNoSlot"), 0)
 }
 
 test "a drain count that does not match the queue is an internal error and keeps the queue" {
     let _ = setup_closure_program()
     let _ = cg_eff_lower_closure(closure_of("g_plain"))
     cg_eff_thunks_drained(0)
-    assert_eq(ices_saying("ThunkQueueNotDrained", "the driver printed 0 thunks but 1 are queued"), 1)
-    assert_eq(ices(), 1)
+    assert_eq(cg_ices_saying("ThunkQueueNotDrained", "the driver printed 0 thunks but 1 are queued"), 1)
+    assert_eq(cg_ice_count(), 1)
     assert_eq(cg_eff_pending_thunks(), 1)
 }
 
@@ -178,7 +155,7 @@ test "printing a thunk the queue does not hold is an internal error and prints n
     drain_one(0)
     let _ = print_take()
     cg_eff_print_thunk(1, 0)
-    assert_eq(ices_saying("NoSuchThunk", "thunk 1 is not in the queue of 1"), 1)
-    assert_eq(ices(), 1)
+    assert_eq(cg_ices_saying("NoSuchThunk", "thunk 1 is not in the queue of 1"), 1)
+    assert_eq(cg_ice_count(), 1)
     assert_eq(cg_text_occurrences(print_take(), "closure"), 0)
 }
