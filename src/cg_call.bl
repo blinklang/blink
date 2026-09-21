@@ -36,6 +36,7 @@ import typecheck.{
     tc_lookup_node_tid, tc_unclaimed_call_tid, tc_list_rename_help, tc_tid_iter_elem,
     tc_call_decl_node, tc_tid_name, tc_mc_obj_is_value,
     TYPE_INT, TYPE_BOOL, TYPE_STR,
+    type_bit_width, TYPE_U8, TYPE_U16, TYPE_U32, TYPE_U64,
 }
 import layout.{
     LayoutRecord, Position, SlotForm, Slot, layout_of, carrier_member_layout, tid_of_node,
@@ -2187,6 +2188,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if keyed.op != "" { return cc_lower_keyed_method(node, obj, kind, mname, keyed) }
     if cc_is_map_slot_method(kind, mname) { return cc_map_slot_method(node, obj, kind, mname) }
     if cc_is_scalar_cast(kind, mname) { return cc_scalar_cast(node, obj, kind, mname) }
+    if cc_is_wrapping_arith(kind, mname) { return cc_wrapping_arith(node, obj, recv_tid, kind, mname) }
     if cc_is_char_text(kind, mname) { return cc_char_text(node, obj, kind, mname) }
     if cc_is_str_as_cstr(kind, mname) { return cc_str_as_cstr(node, obj, kind, mname) }
     if cc_is_bytes_with_ptr(kind, mname) { return cc_bytes_with_ptr(node, obj, kind, mname) }
@@ -2910,6 +2912,57 @@ fn cc_scalar_cast(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.
     let recv = lower_expr(obj)
     if recv < 0 { return -1 }
     ir_cast(tid, node, answer.c_spelling, recv)
+}
+
+// ── Wrapping arithmetic ─────────────────────────────────────────────────
+//
+// Signed overflow is undefined behavior in C, so `wrapping_add`/`sub`/`mul` cast both
+// operands up to the unsigned C type at the receiver's own width, where wraparound is
+// well defined, and cast the sum back down to the receiver's own (possibly signed) type.
+
+// The C operator an intrinsic wrapping-arithmetic method lowers to, or "" for a method
+// that is not one of the three (src/typecheck.bl:16458 is the authority list). A table,
+// so cc_is_wrapping_arith and cc_wrapping_arith ask it once per call site instead of
+// comparing the method name by hand.
+fn wrapping_op_for_method(method: Str) -> Str {
+    let mut table: Map[Str, Str] = Map()
+    table.insert("wrapping_add", "+")
+    table.insert("wrapping_sub", "-")
+    table.insert("wrapping_mul", "*")
+    table.get(method) ?? ""
+}
+
+fn cc_is_wrapping_arith(kind: TyKind, method: Str) -> Bool {
+    // Typecheck types these three only for a sized-int receiver (src/typecheck.bl:16452,
+    // gated on is_sized_int); Int has no wrapping arithmetic of its own.
+    if !cc_is_sized_int(kind) { return false }
+    wrapping_op_for_method(method) != ""
+}
+
+fn cc_wrapping_unsigned_tid(recv_tid: Int) -> Int {
+    let width = type_bit_width(recv_tid)
+    if width == 8 { return TYPE_U8 }
+    if width == 16 { return TYPE_U16 }
+    if width == 32 { return TYPE_U32 }
+    TYPE_U64
+}
+
+fn cc_wrapping_arith(node: Int, obj: Int, recv_tid: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 1 { return cc_intrinsic_arity_wrong(node, kind, method, 1, given) }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    let rhs = lower_expr(sublist_get(node_args(node), 0))
+    if rhs < 0 { return -1 }
+    let unsigned_tid = cc_wrapping_unsigned_tid(recv_tid)
+    let unsigned_answer = cc_local(unsigned_tid, node)
+    if cc_stopped(unsigned_answer) { return -1 }
+    let recv_answer = cc_local(recv_tid, node)
+    if cc_stopped(recv_answer) { return -1 }
+    let lhs_cast = ir_cast(unsigned_tid, node, unsigned_answer.c_spelling, recv)
+    let rhs_cast = ir_cast(unsigned_tid, node, unsigned_answer.c_spelling, rhs)
+    let wrapped = ir_binary(unsigned_tid, node, unsigned_answer.c_spelling, wrapping_op_for_method(method), lhs_cast, rhs_cast)
+    ir_cast(recv_tid, node, recv_answer.c_spelling, wrapped)
 }
 
 fn cc_is_char_text(kind: TyKind, method: Str) -> Bool {
