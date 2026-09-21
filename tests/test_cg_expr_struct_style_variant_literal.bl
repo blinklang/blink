@@ -1,0 +1,241 @@
+// `Shape.Rect { width: 3, height: 4 }` names an enum variant, not a struct.
+//
+// The two spellings of a payload-carrying variant, `Shape.Rect(3, 4)` and
+// `Shape.Rect { width: 3, height: 4 }`, name one value, so both must lower to one
+// construct: the enum's tagged struct, with the tag of that variant and the payload
+// written in the order the variant DECLARES its fields.
+//
+// What makes this worth a test of its own is where the field order comes from. A struct
+// literal takes it from the declaration the literal's tid points at. For a struct-style
+// variant that tid is the ENUM, and an enum declaration's fields are its VARIANTS, so a
+// stage that reads the order the same way for both walks Rect and Point as though they
+// were fields of a struct and asks the literal for a value for each. Neither is a field
+// and neither has a default, so the answer is one refusal per variant.
+//
+// The order rows matter for the same reason they matter on a struct: C fills a compound
+// literal positionally, so a literal that writes its fields in another order than the
+// declaration would otherwise put each value in the wrong member.
+
+
+import mono.{run_mono}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import layout.{layout_reset}
+import ir.{ir_reset}
+import cg_test_helpers.{cg_ice_count, cg_probe_compile, cg_report_ices, cg_text_occurrences}
+import cg_reg.{cg_reg_build}
+import diagnostics.{diag_reset}
+import std.io
+import cg_stmt.{cg_stmt_reset, lower_fn}
+import cg_expr.{cg_expr_reset}
+import cg_print.{print_reset, print_take, print_block_body}
+import lower_test_helpers.{assert_eq_str, shape}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn probe_fn(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/{stem}_probe.bl"
+    let program = cg_probe_compile(path, src)
+    let _rm = process_run("rm", ["-f", path])
+    run_mono(program)
+    cg_reg_build(program)
+    layout_reset()
+    ir_reset()
+    cg_expr_reset()
+    cg_stmt_reset()
+    print_reset()
+    diag_reset()
+    let f = find_fn(name)
+    assert(f >= 0)
+    lower_fn(f)
+}
+
+// Point carries nothing, so the enum is a tagged struct and Rect's payload rides in it.
+fn declared_order_src() -> Str {
+    #"type Shape {
+    Rect { width: Int, height: Int }
+    Point
+}
+fn make() -> Shape {
+    let s: Shape = Shape.Rect { width: 3, height: 4 }
+    s
+}
+"#
+}
+
+// The same variant, written in the other order. The construct must not change.
+fn written_order_src() -> Str {
+    #"type Shape {
+    Rect { width: Int, height: Int }
+    Point
+}
+fn make() -> Shape {
+    let s: Shape = Shape.Rect { height: 4, width: 3 }
+    s
+}
+"#
+}
+
+// The control. A declared struct is still a struct literal, and its own field order still
+// comes from its declaration.
+fn plain_struct_src() -> Str {
+    #"type Box {
+    w: Int
+    h: Int
+}
+fn make() -> Box {
+    let b: Box = Box { w: 3, h: 4 }
+    b
+}
+"#
+}
+
+// The bare spelling of the same variant. The annotation is what names the enum, so the
+// literal's own head carries the variant name alone and nothing before a dot.
+fn bare_order_src() -> Str {
+    #"type Shape {
+    Rect { width: Int, height: Int }
+    Point
+}
+fn make() -> Shape {
+    let s: Shape = Rect { width: 3, height: 4 }
+    s
+}
+"#
+}
+
+// A generic enum. The literal's tid is the INSTANCE, which carries none of the variant
+// entries, so the arm can only be read from the enum's declaration. Nil is there to keep
+// a tag beside the payload: a lone one-field variant would be a transparent newtype and
+// would lower to the wrapped value instead of to an arm.
+fn generic_variant_src() -> Str {
+    #"type Tree[T] {
+    Leaf { value: T }
+    Nil
+}
+fn make() -> Tree[Int] {
+    let t: Tree[Int] = Tree.Leaf { value: 7 }
+    t
+}
+"#
+}
+
+// The call spelling of the very same arm. 03_types.md:1036 requires the two spellings to
+// emit identical code, and this one lowers today, so it is the standard the brace spelling
+// is held to rather than a shape written out by hand here.
+fn call_spelling_src() -> Str {
+    #"type Shape {
+    Rect { width: Int, height: Int }
+    Point
+}
+fn make() -> Shape {
+    let s: Shape = Shape.Rect(3, 4)
+    s
+}
+"#
+}
+
+fn generic_call_spelling_src() -> Str {
+    #"type Tree[T] {
+    Leaf { value: T }
+    Nil
+}
+fn make() -> Tree[Int] {
+    let t: Tree[Int] = Tree.Leaf(7)
+    t
+}
+"#
+}
+
+test "a struct-style variant literal builds the enum, not a struct of the enum's variants" {
+    let body = probe_fn("cg_expr_ssv_declared", declared_order_src(), "make")
+    if cg_ice_count() != 0 { cg_report_ices("the literal was refused") }
+    assert_eq(cg_ice_count(), 0)
+    assert(body >= 0)
+    assert_eq_str("block shape", shape(body), "Block(Let(EnumNew(Const, Const, Const)), Return(VarRef))")
+}
+
+test "the payload is written in declared order, whatever order the literal names it in" {
+    let declared = probe_fn("cg_expr_ssv_a", declared_order_src(), "make")
+    assert(declared >= 0)
+    print_reset()
+    print_block_body(declared)
+    let a = print_take()
+    let written = probe_fn("cg_expr_ssv_b", written_order_src(), "make")
+    assert(written >= 0)
+    print_reset()
+    print_block_body(written)
+    let b = print_take()
+    assert_eq_str("either order lowers to the same C", a, b)
+    // Both halves would also agree on a lowering that dropped the payload, so the values
+    // themselves are named: each is written exactly once, and width's comes first.
+    assert(cg_text_occurrences(a, "3") == 1)
+    assert(cg_text_occurrences(a, "4") == 1)
+    assert(a.index_of("3") < a.index_of("4"))
+}
+
+test "the bare spelling of a struct-style variant builds the same arm as the qualified one" {
+    let qualified = probe_fn("cg_expr_ssv_q", declared_order_src(), "make")
+    assert(qualified >= 0)
+    print_reset()
+    print_block_body(qualified)
+    let q = print_take()
+    let bare = probe_fn("cg_expr_ssv_bare", bare_order_src(), "make")
+    if cg_ice_count() != 0 { cg_report_ices("the bare literal was refused") }
+    assert_eq(cg_ice_count(), 0)
+    assert(bare >= 0)
+    print_reset()
+    print_block_body(bare)
+    assert_eq_str("both spellings lower to the same C", print_take(), q)
+}
+
+test "a generic enum's struct-style variant builds the arm of its instance" {
+    let body = probe_fn("cg_expr_ssv_generic", generic_variant_src(), "make")
+    if cg_ice_count() != 0 { cg_report_ices("the generic literal was refused") }
+    assert_eq(cg_ice_count(), 0)
+    assert(body >= 0)
+    assert_eq_str("block shape", shape(body), "Block(Let(EnumNew(Const, Const)), Return(VarRef))")
+}
+
+test "the brace spelling and the call spelling of one arm lower to the same C" {
+    let called = probe_fn("cg_expr_ssv_call", call_spelling_src(), "make")
+    assert(called >= 0)
+    print_reset()
+    print_block_body(called)
+    let c = print_take()
+    let braced = probe_fn("cg_expr_ssv_brace", declared_order_src(), "make")
+    if cg_ice_count() != 0 { cg_report_ices("the brace spelling was refused") }
+    assert_eq(cg_ice_count(), 0)
+    assert(braced >= 0)
+    print_reset()
+    print_block_body(braced)
+    assert_eq_str("brace spelling matches the call spelling", print_take(), c)
+}
+
+test "the two spellings of a generic enum's arm lower to the same C" {
+    let called = probe_fn("cg_expr_ssv_gcall", generic_call_spelling_src(), "make")
+    assert(called >= 0)
+    print_reset()
+    print_block_body(called)
+    let c = print_take()
+    let braced = probe_fn("cg_expr_ssv_gbrace", generic_variant_src(), "make")
+    if cg_ice_count() != 0 { cg_report_ices("the generic brace spelling was refused") }
+    assert_eq(cg_ice_count(), 0)
+    assert(braced >= 0)
+    print_reset()
+    print_block_body(braced)
+    assert_eq_str("brace spelling matches the call spelling", print_take(), c)
+}
+
+test "a declared struct is still lowered as a struct literal" {
+    let body = probe_fn("cg_expr_ssv_control", plain_struct_src(), "make")
+    assert(body >= 0)
+    assert_eq_str("block shape", shape(body), "Block(Let(StructNew(Const, Const)), Return(VarRef))")
+}

@@ -18,14 +18,14 @@
 import parser.{
     node_kind, node_name, node_op, node_left, node_right, node_value, node_obj,
     node_str_val, node_int_val, node_elements, node_fields, node_args, node_condition,
-    node_line, node_col,
+    node_line, node_col, node_type_name,
     sublist_get, sublist_length, interp_part_is_literal,
 }
 import ast.{NodeKind, nk_of, node_kind_name}
 import typecheck.{
     TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, is_integer_type, type_bit_width,
     lookup_named_type, tc_field_tid_at_instance, is_import_module_name,
-    tc_qualifier_to_module_or_self, tc_tid_struct, tc_global_decl_node,
+    tc_qualifier_to_module_or_self, tc_tid_struct, tc_global_decl_node, tc_type_str,
     TYPE_INT, TYPE_BOOL, TYPE_STR, TYPE_VOID,
 }
 import layout.{
@@ -48,7 +48,7 @@ import ir.{
 }
 import cg_call.{
     lower_call, lower_operator_method, lower_display_call, lower_display_of_value,
-    lower_spread, lower_element_read, lower_element_store,
+    lower_spread, lower_element_read, lower_element_store, cc_enum_variant_construct,
 }
 import cg_eff.{cg_eff_lower_closure, cg_eff_lower_handler_expr}
 import diagnostics.{
@@ -1142,9 +1142,16 @@ fn lower_list_lit(node: Int) -> Int ! Diag.Report {
 
 // A struct literal writes its fields in declaration order, whatever order the source
 // names them, because C fills a compound literal positionally.
+//
+// A struct-style variant literal is not a struct literal at all. `Shape.Rect { width: 3,
+// height: 4 }` builds one arm of an enum, so the node's tid is the enum, and the spelling
+// is the other surface syntax for `Shape.Rect(3, 4)`; 03_types.md:1036 requires the two to
+// emit identical code. Only where the written values sit differs between them, so the tid
+// is asked first and a variant construction goes to its one producer.
 fn lower_struct_lit(node: Int) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
+    if x_kind(tid) == TyKind.Enum { return x_variant_lit(node, tid) }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
     let decl = tc_tid_decl_node(tid)
@@ -1200,6 +1207,94 @@ fn x_struct_field_value(node: Int, fd: Int, given: Int, base: SpreadBase) -> Int
         "the literal gives no value for field '{want}' and the field has no default", node,
         "typecheck must reject an incomplete struct literal before codegen")
     -1
+}
+
+// ── Struct-style variant literals ─────────────────────────────────────────
+
+// The arm a struct-style literal builds, from the values it writes for the variant's
+// declared fields. Everything physical about the arm belongs to the variant constructor
+// that the call spelling already goes through, so nothing about a tag, a union member or a
+// boxed self-recursive field is decided here.
+fn x_variant_lit(node: Int, tid: Int) -> Int ! Diag.Report {
+    let spelled = node_type_name(node)
+    let dot = spelled.index_of(".")
+    let vname = if dot < 0 { spelled } else { spelled.slice(dot + 1, spelled.len()) }
+    let owner = if dot < 0 { tc_type_str(tid) } else { spelled.slice(0, dot) }
+    let decl = tc_tid_decl_node(tid)
+    if decl < 0 {
+        diag_ice_at("VariantLiteralWithoutDecl", CODEGEN_STAGE_NOT_BUILT,
+            "the literal builds a variant of '{owner}', whose tid has no type declaration", node,
+            "a variant is read from its enum's declaration; an enum tid without one is a typecheck bug")
+        return -1
+    }
+    let vnode = x_variant_decl(decl, vname)
+    if vnode < 0 {
+        diag_ice_at("VariantLiteralNotDeclared", CODEGEN_STAGE_NOT_BUILT,
+            "enum '{owner}' declares no variant named '{vname}' for this literal to build", node,
+            "typecheck resolves the variant a struct-style literal names before codegen builds it")
+        return -1
+    }
+    // A spread fills the fields of a struct from another value of the same struct. A variant
+    // is not a type of its own, so there is no value to spread from and no such form.
+    if x_spread_node(node) >= 0 {
+        diag_ice_at("VariantLiteralSpread", CODEGEN_STAGE_NOT_BUILT,
+            "the literal spreads a value into variant '{owner}.{vname}', which has no spread form", node,
+            "typecheck must reject a spread on a struct-style variant literal before codegen")
+        return -1
+    }
+    let values = x_variant_lit_values(node, vnode, owner, vname)
+    if values.len() != x_variant_arity(vnode) { return -1 }
+    cc_enum_variant_construct(node, tid, vnode, owner, vname, values)
+}
+
+// The value the literal writes for each declared field of the variant, in DECLARED order,
+// which is the order the arm's fields are written in. A field is filled by NAME, because a
+// struct-style literal names every value it writes; a field the literal leaves out takes
+// the field's own default, the rule a struct literal's omitted field already follows.
+//
+// The nodes are unlowered. The arm's builder lays each field out before it lowers that
+// field's operand, so lowering here would put the operands ahead of that check.
+//
+// A refusal answers an empty list, which the caller reads as short: a complete list is the
+// only other answer this can give.
+fn x_variant_lit_values(node: Int, vnode: Int, owner: Str, vname: Str) -> List[Int] ! Diag.Report {
+    let refused: List[Int] = []
+    let decls = node_fields(vnode)
+    let mut out: List[Int] = []
+    if decls == -1 { return out }
+    let mut i = 0
+    while i < sublist_length(decls) {
+        let fd = sublist_get(decls, i)
+        let want = node_name(fd)
+        let mut found = x_variant_lit_field_value(node, want)
+        if found < 0 { found = node_condition(fd) }
+        if found < 0 {
+            diag_ice_at("VariantLiteralFieldMissing", CODEGEN_STAGE_NOT_BUILT,
+                "the literal gives no value for field '{want}' of variant '{owner}.{vname}' and the field has no default", node,
+                "typecheck must reject an incomplete struct-style variant literal before codegen")
+            return refused
+        }
+        out.push(found)
+        i = i + 1
+    }
+    out
+}
+
+fn x_variant_lit_field_value(node: Int, want: Str) -> Int {
+    let given = node_fields(node)
+    if given == -1 { return -1 }
+    let mut j = 0
+    while j < sublist_length(given) {
+        let g = sublist_get(given, j)
+        if node_name(g) == want { return node_value(g) }
+        j = j + 1
+    }
+    -1
+}
+
+fn x_variant_arity(vnode: Int) -> Int {
+    let fields = node_fields(vnode)
+    if fields == -1 { 0 } else { sublist_length(fields) }
 }
 
 // The spread entry of a struct literal, or -1 when the literal names every field itself.
