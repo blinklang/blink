@@ -14,18 +14,21 @@
 // word a capture is punned through is Position.ContainerSlot's answer and not a second
 // one. InlineWord at that position is a capture this stage can build: slot_word names the
 // integer an Int or a Bool rides through, and an empty slot_word means the value is
-// already a pointer. PointerBoxed means the value needs a heap box, which is the next
-// slice, so a Float or a struct capture stays refused.
+// already a pointer. PointerBoxed means the value does not fit the word, so it travels as
+// a heap copy and the word holds the address, which is what a container element wider
+// than its slot already does. A copy is only sound for a binding nothing assigns, so the
+// mutability question is asked first and an oversized `let mut` is still refused.
 
 import typecheck.{TYPE_FLOAT, TYPE_INT, TYPE_STR}
 import cname_test_helpers.{find_decl}
-import cg_test_helpers.{cg_probe_compile}
+import cg_test_helpers.{cg_probe_compile, cg_text_occurrences}
 import ast.{NodeKind}
 import parser.{node_body, node_value}
 import layout.{bind_binder_mut, binder_scope_pop, binder_scope_push, layout_reset}
 import ir.{IrKind, ir_c_name, ir_capture_descs, ir_promoter, ir_kid_count, ir_kid, ir_kind, ir_reset, ir_verify}
 import cg_reg.{cg_reg_build}
 import cg_expr.{cg_expr_reset}
+import cg_print.{print_reset, print_take}
 import cg_stmt.{cg_stmt_reset, lower_block_returning}
 import cg_eff.{
     cg_eff_lower_closure, cg_eff_pending_thunks, cg_eff_print_thunk, cg_eff_reset,
@@ -79,6 +82,13 @@ fn a_mutable_capture() -> Int {
     g_mut(1)
 }
 
+fn a_mutable_boxed_capture() -> Float {
+    let mut fm = 1.5
+    let g_mut_float = fn(x: Float) -> Float { x + fm }
+    fm = 2.5
+    g_mut_float(2.0)
+}
+
 fn nested_over_outer_param() -> Int {
     let g_outer = fn(x: Int) -> Int {
         let inner = fn(y: Int) -> Int { y + x }
@@ -99,6 +109,7 @@ fn main() {
     io.println("{a_pointer_capture()}")
     io.println("{a_boxed_capture()}")
     io.println("{a_mutable_capture()}")
+    io.println("{a_mutable_boxed_capture()}")
     io.println("{nested_over_outer_param()}")
     io.println("{no_capture_at_all()}")
 }
@@ -295,13 +306,48 @@ test "a closure with no captures still answers no capture words and no descripto
     assert_eq(ices(), 0)
 }
 
-test "a capture that needs a heap box is refused by name rather than punned into a word" {
+test "a capture that does not fit the word rides a heap copy of the value" {
     // A Float must not ride through an integer, so Position.ContainerSlot answers
-    // PointerBoxed for it. Nothing allocates that box yet.
+    // PointerBoxed for it. The word then holds the address of a heap copy, the same route
+    // a container element wider than its slot takes.
     setup()
     let v = lower_capturing("g_float", ["f"], TYPE_FLOAT)
-    assert_eq(v, -1)
-    assert(ices_mentioning("'f'") > 0)
+    if v < 0 || ices() != 0 { report_ices("g_float was refused") }
+    assert(v >= 0)
+    assert_eq(ir_kid_count(v), 1)
+    assert(ir_kind(ir_kid(v, 0)) == IrKind.Box)
+    // The copy is of the enclosing local, not of some other value.
+    assert(ir_c_name(ir_kid(ir_kid(v, 0), 0)).contains("f"))
+    assert_eq(ices(), 0)
+    assert_eq(cg_eff_pending_thunks(), 1)
+}
+
+test "the thunk reads a boxed capture back through the pointer, not as the pointer" {
+    // The prologue binds the captured name at the value's own type. A prologue that bound
+    // the address instead would compile and then read a pointer as a Float.
+    setup()
+    print_reset()
+    let v = lower_capturing("g_float", ["f"], TYPE_FLOAT)
+    assert(v >= 0)
+    assert(cg_eff_thunk_open(0) >= 0)
+    let body = lower_block_returning(cg_eff_thunk_body_node(0))
+    cg_eff_thunk_close()
+    assert(body >= 0)
+    cg_eff_print_thunk(0, body)
+    let text = print_take()
+    if ices() != 0 { report_ices("the boxed thunk did not print") }
+    assert_eq(ices(), 0)
+    assert(cg_text_occurrences(text, "double f = (*(") == 1)
+}
+
+test "an oversized binding the enclosing function can assign is refused, not copied" {
+    // The size question and the sharing question both apply to a `let mut` Float. Copying
+    // it would compile and then drop the write, so the sharing answer has to win.
+    setup()
+    let refused = lower_body_of("a_mutable_boxed_capture")
+    assert(refused >= 0)
+    assert(ices_mentioning("'fm'") > 0)
+    assert(ices_mentioning("shared") > 0)
     assert_eq(cg_eff_pending_thunks(), 0)
 }
 
