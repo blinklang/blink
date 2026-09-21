@@ -1,0 +1,105 @@
+import std.fs
+import std.io
+import typecheck.{check_types, tc_type_str}
+import mono.{run_mono, instances, MonoInstance}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+
+// A mono instance IS its C name: the name is what the unit defines the instance under, so
+// two instances of one declaration that mangle to one name are one definition emitted
+// twice. A container's element types do not survive mangling -- every Map erases to the
+// same bare `map` -- so two calls whose only difference is the element type reach the same
+// name and must reach the same instance. The pass must key on the name it will emit, not
+// on the argument list it was registered with.
+
+fn wrap_probe_src() -> Str {
+    #"fn pwrap[T](x: T) -> (T, Int) { (x, 1) }
+fn main() {
+    let mut pw_ms: Map[Str, Int] = Map()
+    pw_ms.insert("a", 1)
+    let mut pw_mib: Map[Int, Bool] = Map()
+    pw_mib.insert(1, true)
+    let ts = pwrap(pw_ms)
+    let tib = pwrap(pw_mib)
+    assert(ts.1 + tib.1 == 2)
+}
+"#
+}
+
+fn tuple_probe_src() -> Str {
+    #"fn ptake[T](t: (T, Int)) -> Int { t.1 }
+fn main() {
+    let mut pt_ms: Map[Str, Int] = Map()
+    pt_ms.insert("a", 1)
+    let mut pt_mib: Map[Int, Bool] = Map()
+    pt_mib.insert(1, true)
+    assert(ptake((pt_ms, 1)) + ptake((pt_mib, 2)) == 3)
+}
+"#
+}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn instances_of(decl: Int) -> List[MonoInstance] {
+    let mut out: List[MonoInstance] = []
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(inst) }
+    }
+    out
+}
+
+// The count of instances that share their C name with an earlier one. Zero is the
+// invariant; anything else is a redefinition in the emitted unit.
+fn duplicate_name_count(insts: List[MonoInstance]) -> Int {
+    let mut seen: List[Str] = []
+    let mut dups = 0
+    for inst in insts {
+        let mut hit = 0
+        for s in seen {
+            if s == inst.c_name { hit = 1 }
+        }
+        if hit == 1 { dups = dups + 1 }
+        seen.push(inst.c_name)
+    }
+    dups
+}
+
+test "two element types that mangle to one name reach one instance" {
+    let path = "build/mono_name_dedup_wrap_probe.bl"
+    write_file(path, wrap_probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+    let decl = find_fn("pwrap")
+    assert(decl >= 0)
+    let insts = instances_of(decl)
+    for inst in insts {
+        io.println("instance {inst.c_name} args={tc_type_str(inst.arg_tids)}")
+    }
+    assert_eq(duplicate_name_count(insts), 0)
+}
+
+test "a container inside a tuple argument does not split one name in two" {
+    let path = "build/mono_name_dedup_tuple_probe.bl"
+    write_file(path, tuple_probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+    let decl = find_fn("ptake")
+    assert(decl >= 0)
+    let insts = instances_of(decl)
+    for inst in insts {
+        io.println("instance {inst.c_name} args={tc_type_str(inst.arg_tids)}")
+    }
+    assert_eq(duplicate_name_count(insts), 0)
+}

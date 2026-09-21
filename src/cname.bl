@@ -16,7 +16,7 @@
 // diag_is_ice_seg can still detect it.
 
 import typecheck.{
-    TAGPOS_INNER, TAGPOS_TOP, TyKind, TypePoolEntry, tc_resolve,
+    TAGPOS_INNER, TAGPOS_SYMBOL, TAGPOS_TOP, TyKind, TypePoolEntry, tc_resolve,
     tc_resolve_transparent_alias_name, tc_tid_decl_node, DECL_NODE_AMBIGUOUS, ty_param_list, ty_pool,
     tc_tid_handler_effect, tc_handler_effect_root, is_user_effect_handle_name,
     sanitize_test_name, tc_enum_has_payload,
@@ -199,12 +199,15 @@ pub fn c_poly_method_name(im: Int, mname: Str, args_tid: Int) -> Str {
     impl_symbol(im, stem)
 }
 
+// The stem of a mono FUNCTION symbol. Its arguments are spelled at the symbol position:
+// the name has to name one definition, and the argument list is the only thing that tells
+// two instances of one declaration apart.
 fn tuple_stem(base: Str, args_tid: Int) -> Str {
     let tid = tc_resolve(args_tid)
     if tid < 0 || tid >= ty_pool.len() { return ICE_SEG_TID_OUT_OF_RANGE }
     let t = ty_pool.get(tid).unwrap()
     if t.kind != TyKind.Tuple { return ICE_SEG_UNHANDLED_KIND }
-    mono_stem(base, t.params_start, t.params_count)
+    mono_stem(base, t.params_start, t.params_count, TAGPOS_SYMBOL)
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────────
@@ -334,11 +337,11 @@ pub fn c_display_dispatch_name(im: Int) -> Str {
 // THE mono-name producer: escaped base, then `_0` + escaped TOP segment per slot.
 // Both a fn instance (slots in a tuple tid) and a struct/enum instance (slots in the
 // instance tid) read their arguments from ty_param_list, so both come here.
-fn mono_stem(base: Str, args_start: Int, args_count: Int) -> Str {
+fn mono_stem(base: Str, args_start: Int, args_count: Int, tagpos: Int) -> Str {
     let mut result = mono_escape(base)
     let mut i = 0
     while i < args_count {
-        let seg = spellable(seg_at(ty_param_list.get(args_start + i).unwrap(), TAGPOS_TOP))
+        let seg = spellable(seg_at(ty_param_list.get(args_start + i).unwrap(), tagpos))
         if diag_is_ice_seg(seg) { return seg }
         result = result.concat("_0").concat(mono_escape(seg))
         i = i + 1
@@ -347,16 +350,16 @@ fn mono_stem(base: Str, args_start: Int, args_count: Int) -> Str {
 }
 
 // The mono stem of a struct/enum INSTANCE tid, or "" for a bare (non-instance) type.
-fn struct_instance_stem(t: TypePoolEntry, tid: Int) -> Str {
+fn struct_instance_stem(t: TypePoolEntry, tid: Int, tagpos: Int) -> Str {
     if t.params_count == 0 { return "" }
     let td = tc_tid_decl_node(tid)
     if td == DECL_NODE_AMBIGUOUS { return ICE_SEG_AMBIGUOUS_DECL }
     if td < 0 { return ICE_SEG_NO_DECL }
-    mono_stem(c_type_decl_tag(td), t.params_start, t.params_count)
+    mono_stem(c_type_decl_tag(td), t.params_start, t.params_count, tagpos)
 }
 
 fn struct_c_name(t: TypePoolEntry, tid: Int) -> Str {
-    let stem = struct_instance_stem(t, tid)
+    let stem = struct_instance_stem(t, tid, TAGPOS_TOP)
     if diag_is_ice_seg(stem) { return stem }
     if stem != "" { return "blink_{stem}" }
     let td = tc_tid_decl_node(tid)
@@ -412,33 +415,58 @@ fn seg_at(tid0: Int, tagpos: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return ICE_SEG_TID_OUT_OF_RANGE }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
+    let sub = child_pos(tagpos)
     if k == TyKind.Struct || k == TyKind.Enum { return struct_seg(t, tid, tagpos) }
     if k == TyKind.Option {
-        let inner = seg_at(t.inner1, TAGPOS_INNER)
+        let inner = seg_at(t.inner1, sub)
         if diag_is_ice_seg(inner) { return inner }
         return "Option_{inner}"
     }
     if k == TyKind.Result {
-        let ok = seg_at(t.inner1, TAGPOS_INNER)
+        let ok = seg_at(t.inner1, sub)
         if diag_is_ice_seg(ok) { return ok }
-        let err = seg_at(t.inner2, TAGPOS_INNER)
+        let err = seg_at(t.inner2, sub)
         if diag_is_ice_seg(err) { return err }
         return "Result_{ok}_{err}"
     }
-    if k == TyKind.Tuple { return tuple_tag(t) }
+    if k == TyKind.Tuple { return tuple_tag(t, tagpos) }
     if k == TyKind.Typevar { return "<tv>" }
     // One blink_map* serves every key/value pair, so K and V do not ride the name. They
     // are still walked so an unsolved slot fails closed instead of spelling "map".
     if k == TyKind.Map {
         if tagpos == TAGPOS_TOP { return "Map" }
-        let key = seg_at(t.inner1, TAGPOS_INNER)
+        let key = seg_at(t.inner1, sub)
         if diag_is_ice_seg(key) { return key }
-        let val = seg_at(t.inner2, TAGPOS_INNER)
+        let val = seg_at(t.inner2, sub)
         if diag_is_ice_seg(val) { return val }
+        if tagpos == TAGPOS_SYMBOL { return "map_{key}_{val}" }
         return "map"
     }
+    if tagpos == TAGPOS_SYMBOL { return container_symbol_seg(t, k, sub) }
     if tagpos == TAGPOS_TOP { return scalar_top(k) }
     scalar_inner(k)
+}
+
+// The position a compound's children are spelled at. A symbol stays a symbol all the way
+// down: a Map nested inside a List is exactly the pair of instances the outer erasure
+// would merge, so the rule cannot stop at depth one. Every other position keeps its
+// existing asymmetry, where TOP is the outermost tag and everything under it is INNER.
+fn child_pos(tagpos: Int) -> Int {
+    if tagpos == TAGPOS_SYMBOL { return TAGPOS_SYMBOL }
+    TAGPOS_INNER
+}
+
+// A single-element erased container at the symbol position. The base tag is the same
+// lowercase word the C type uses, so the symbol reads as the erased carrier it is, with
+// the element it was instantiated at appended. A kind with no element falls through to
+// the shared scalar spelling, which is already injective for it.
+fn container_symbol_seg(t: TypePoolEntry, k: TyKind, sub: Int) -> Str {
+    if k != TyKind.List && k != TyKind.Set && k != TyKind.Iterator && k != TyKind.Channel {
+        if k != TyKind.Handle && k != TyKind.Ptr { return scalar_inner(k) }
+    }
+    let elem = seg_at(t.inner1, sub)
+    if diag_is_ice_seg(elem) { return elem }
+    "{scalar_inner(k)}_{elem}"
 }
 
 // A bare struct spells its full tag, and an instance its mono stem, at BOTH positions.
@@ -446,7 +474,7 @@ fn seg_at(tid0: Int, tagpos: Int) -> Str {
 // so a struct that drops its module at TOP and keeps it inside a carrier gives two answers
 // to one question and lets two modules' namesakes share a symbol.
 fn struct_seg(t: TypePoolEntry, tid: Int, tagpos: Int) -> Str {
-    let stem = struct_instance_stem(t, tid)
+    let stem = struct_instance_stem(t, tid, tagpos)
     if stem != "" { return stem }
     let underlying = tc_resolve_transparent_alias_name(t.name)
     if underlying != -1 { return seg_at(underlying, tagpos) }
@@ -458,12 +486,12 @@ fn struct_seg(t: TypePoolEntry, tid: Int, tagpos: Int) -> Str {
 
 // A transparent newtype element lowers to a bare int64_t, so the tuple names it
 // `int`. Result and Option keep its nominal tag, so this stays tuple-only.
-fn tuple_tag(t: TypePoolEntry) -> Str {
+fn tuple_tag(t: TypePoolEntry, tagpos: Int) -> Str {
     let mut tag = "Tuple{t.params_count}"
     let mut i = 0
     while i < t.params_count {
         let elem_tid = ty_param_list.get(t.params_start + i).unwrap()
-        let raw = seg_at(elem_tid, TAGPOS_INNER)
+        let raw = seg_at(elem_tid, child_pos(tagpos))
         if diag_is_ice_seg(raw) { return raw }
         let elem = if elem_is_transparent(elem_tid) { "int" } else { raw }
         tag = tag.concat("_").concat(elem)
