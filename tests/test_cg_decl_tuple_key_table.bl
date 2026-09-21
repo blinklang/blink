@@ -1,0 +1,84 @@
+import std.fs
+import std.io
+import layout.{layout_reset}
+import cname.{cname_reset}
+import cg_test_helpers.{cg_probe_compile, cg_probe_errors, cg_ice_count}
+import cg.{CgConfig, generate}
+import mono.{run_mono}
+
+// A Map or Set binds a key-operations table at construction, and the table is named
+// from the key type. Every other key kind has a declaration to hang that table on: a
+// struct or an enum carries @derive(Hash), and the derive walk reaches it because the
+// driver hands it the declarations of the unit. A TUPLE has no declaration. It is a
+// structural type, so nothing in the source owns it, and the derive walk cannot reach
+// it -- while layout still answers with the table's name, because per section 3.8 a
+// tuple's Hash and Eq are derived whenever its elements have them.
+//
+// So the name is spelled and the definition is never written, and the unit fails at the
+// C compiler on an undeclared identifier. These rows pin the missing half: the table,
+// and the two adapters it points at, must be in the emitted unit.
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn standalone_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    let program = cg_probe_compile(path, src)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    program
+}
+
+fn map_tuple_key_src() -> Str {
+    #"fn main() {
+    let mut m: Map[(Str, Int), Int] = Map()
+    let k = ("a", 1)
+    m.insert(k, 7)
+    assert(m.get(k).unwrap() == 7)
+}
+"#
+}
+
+fn set_tuple_elem_src() -> Str {
+    #"fn main() {
+    let mut s: Set[(Str, Int)] = Set()
+    let e = ("a", 1)
+    s.insert(e)
+    assert(s.contains(e) != 0)
+}
+"#
+}
+
+test "a tuple used as a Map key has its key-operations table in the unit" {
+    let program = build_probe(map_tuple_key_src(), "cg_decl_tuple_map_key_probe")
+    let text = generate(program, standalone_cfg())
+    assert_eq_int("the probe itself reports nothing", cg_probe_errors(), 0)
+    assert_eq_int("and raises no internal error", cg_ice_count(), 0)
+    assert_has(text, "hash_kops_blink_Tuple2_str_int")
+    assert_has(text, "eq_kops_blink_Tuple2_str_int")
+    assert_has(text, "blink_kops kops_blink_Tuple2_str_int = \{")
+}
+
+test "a tuple used as a Set element has its key-operations table in the unit" {
+    let program = build_probe(set_tuple_elem_src(), "cg_decl_tuple_set_elem_probe")
+    let text = generate(program, standalone_cfg())
+    assert_eq_int("the probe itself reports nothing", cg_probe_errors(), 0)
+    assert_eq_int("and raises no internal error", cg_ice_count(), 0)
+    assert_has(text, "blink_kops kops_blink_Tuple2_str_int = \{")
+}
