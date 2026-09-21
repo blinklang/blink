@@ -64,6 +64,13 @@ import parser.{
 // one typedef per instance, and two type ids that spell the same C name are one C type.
 let mut typedef_state: Map[Str, Int] = Map()
 
+// What this unit has written for each root effect's vtable typedef, keyed by the C name the
+// typedef carries: 1 once a name this stage cannot spell has stopped it and reported that,
+// 2 once the typedef is written. A struct field of handler type reaches an effect from the
+// type graph and the evidence vector reaches the same effect from the declarations, so both
+// read this rather than writing one typedef twice or reporting one gap twice.
+let mut vtable_state: Map[Str, Int] = Map()
+
 // The prototype this unit wrote for each foreign symbol, as its return and parameter
 // spellings. C takes one declaration per symbol, so two bindings over one symbol either
 // ask for the same prototype or one of them is wrong.
@@ -79,6 +86,7 @@ let mut unit_is_the_archive: Bool = false
 
 pub fn cg_decl_reset() {
     typedef_state = Map()
+    vtable_state = Map()
     foreign_decls = Map()
     unit_declares_for_others = true
     unit_links_archive = false
@@ -124,7 +132,10 @@ fn emit_spelled_carrier_typedefs() ! Diag.Report {
     let mut n = 0
     while n < node_count() {
         let tid = tc_lookup_node_tid(n)
-        if tid >= 0 && is_carrier_kind(tc_tid_kind(tc_resolve(tid))) { flush_member_typedefs(tid) }
+        if tid >= 0 && is_carrier_kind(tc_tid_kind(tc_resolve(tid))) {
+            for h in handler_deps(tid) { emit_handler_dep(h) }
+            flush_member_typedefs(tid)
+        }
         n = n + 1
     }
 }
@@ -187,6 +198,7 @@ fn emit_typedef_for(decl: Int, inst_tid: Int) ! Diag.Report {
     }
     for mtid in member_tids(decl, inst_tid) {
         for dep in nominal_deps(mtid) { emit_dep(dep) }
+        for h in handler_deps(mtid) { emit_handler_dep(h) }
     }
     typedef_state.insert(c_name, 2)
     emit_one(decl, tid, inst_tid, c_name)
@@ -242,6 +254,55 @@ fn nominal_deps(tid: Int) -> List[Int] {
         i = i + 1
     }
     out
+}
+
+// The root effect vtables a member type names BY POINTER, as Handler tids. A handler field
+// holds a pointer to the vtable, so the typedef has to be read where the field names it,
+// exactly as a nominal member's does; the walk goes through a carrier or a tuple for the same
+// reason nominal_deps does, because those name their members inside their own typedef.
+fn handler_deps(tid: Int) -> List[Int] {
+    let r = tc_resolve(tid)
+    let k = tc_tid_kind(r)
+    if k == TyKind.Handler { return [r] }
+    if k != TyKind.Option && k != TyKind.Result && k != TyKind.Tuple { return [] }
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < tc_tid_child_count(r) {
+        for d in handler_deps(tc_tid_child(r, i)) { out.push(d) }
+        i = i + 1
+    }
+    out
+}
+
+// One effect's vtable typedef, reached from a member rather than from the declaration walk
+// that writes the evidence vector. The vector comes after every typedef, which is too late
+// for a struct that names the vtable in a field.
+//
+// A builtin root has no declaration here and no typedef to write: runtime.h owns both, which
+// is why a Handler[IO] field has always worked.
+fn emit_handler_dep(handler_tid: Int) ! Diag.Report {
+    let vtable = c_vtable_type_name(handler_tid)
+    if diag_is_ice_seg(vtable) { return }
+    if (vtable_state.get(vtable) ?? 0) != 0 { return }
+    let decl = effect_decl_for_vtable(vtable)
+    if decl < 0 { return }
+    let sig = vtable_sig(decl, make_handler_type(node_name(decl)))
+    if !sig.ok {
+        vtable_state.insert(vtable, 1)
+        return
+    }
+    emit_vtable_typedef(vtable, sig)
+}
+
+// The declaration that owns the root vtable of this C name, or -1 when no declaration in
+// this program does. The compare is on the name the namer answers rather than on the effect
+// name, because a handler of a sub-effect names its root's vtable and the namer is the one
+// layer that knows which root that is.
+fn effect_decl_for_vtable(vtable: Str) -> Int {
+    for e in cg_reg_effect_decls() {
+        if c_vtable_type_name(make_handler_type(node_name(e))) == vtable { return e }
+    }
+    -1
 }
 
 // layout.bl builds a member's Option, Result and Tuple typedefs children-first as
@@ -981,12 +1042,53 @@ fn effect_ops(effect_decl: Int) -> List[Int] {
 // Answers 0 when it wrote nothing, so the caller leaves the effect out of the vector rather
 // than pointing a field at an instance that is not there.
 fn emit_effect_vtable(effect_decl: Int, slot_tid: Int, vtable: Str) -> Int ! Diag.Report {
+    // A gap this vtable already reported is not reported again: the type graph may have
+    // reached the same effect from a handler field, and one gap is one report.
+    if (vtable_state.get(vtable) ?? 0) == 1 { return 0 }
+    let sig = vtable_sig(effect_decl, slot_tid)
+    if !sig.ok {
+        vtable_state.insert(vtable, 1)
+        return 0
+    }
+    emit_vtable_typedef(vtable, sig)
     let ops = effect_ops(effect_decl)
+    let mut i = 0
+    while i < ops.len() {
+        print_fn(true, sig.rets.get(i).unwrap(), sig.defaults.get(i).unwrap(), sig.params.get(i).unwrap(), false,
+            default_op_body(ops.get(i).unwrap(), sig.rets.get(i).unwrap()))
+        i = i + 1
+    }
+    print_effect_default_vtable(vtable, sig.defaults)
+    1
+}
+
+// The typedef alone, written once per unit. Both readers of `vtable_state` come through
+// here, so whichever reaches the effect first writes it and the other one does not.
+fn emit_vtable_typedef(vtable: Str, sig: VtableSig) ! Diag.Report {
+    if (vtable_state.get(vtable) ?? 0) == 2 { return }
+    vtable_state.insert(vtable, 2)
+    print_effect_vtable_typedef(td_guard_name(vtable), vtable, sig.slots, sig.rets, sig.params)
+}
+
+// One root effect's vtable, as the slot name, return spelling, parameter list and default
+// body symbol of each operation, in the order the sub-effects and their operations are
+// written. `ok` is false when a name this stage cannot spell stopped it, and the caller must
+// then write nothing at all: a unit carrying a vtable type whose instance nothing defines is
+// worse than a unit that reported the gap.
+type VtableSig {
+    slots: List[Str]
+    rets: List[Str]
+    params: List[List[Str]]
+    defaults: List[Str]
+    ok: Bool
+}
+
+fn vtable_sig(effect_decl: Int, slot_tid: Int) -> VtableSig ! Diag.Report {
     let mut slots: List[Str] = []
     let mut rets: List[Str] = []
     let mut params: List[List[Str]] = []
     let mut defaults: List[Str] = []
-    for op in ops {
+    for op in effect_ops(effect_decl) {
         // The slot is a struct member, so it takes the member-name producer. The perform site
         // reads the slot by name and must ask the same producer, or an operation whose name C
         // owns is written one way here and read another way there.
@@ -998,29 +1100,37 @@ fn emit_effect_vtable(effect_decl: Int, slot_tid: Int, vtable: Str) -> Int ! Dia
             diag_ice_at("EffectOperationNameRepeated", UNSOLVED_TYPEVAR_AT_CODEGEN,
                 "effect '{node_name(effect_decl)}' declares operation '{node_name(op)}' more than once", op,
                 "the operations under one root effect share a vtable, so their names must differ; the declaration should have been rejected before codegen")
-            return 0
+            return VtableSig { slots: slots, rets: rets, params: params, defaults: defaults, ok: false }
         }
         let symbol = c_effect_default_op_name(slot_tid, node_name(op))
         if diag_is_ice_seg(symbol) {
             diag_ice_at("EffectDefaultBodyNotNameable", UNSOLVED_TYPEVAR_AT_CODEGEN,
                 "no default body name for operation '{node_name(op)}' of effect '{node_name(effect_decl)}'", op,
                 "a declared effect that is not builtin names a default body per operation; this is a compiler bug")
-            return 0
+            return VtableSig { slots: slots, rets: rets, params: params, defaults: defaults, ok: false }
         }
+        emit_signature_deps(op)
         slots.push(slot)
         rets.push(op_ret_spelling(op))
         params.push(fn_param_decls(op))
         defaults.push(symbol)
     }
-    print_effect_vtable_typedef(td_guard_name(vtable), vtable, slots, rets, params)
+    VtableSig { slots: slots, rets: rets, params: params, defaults: defaults, ok: true }
+}
+
+// The nominal types one signature names by value, emitted before the declaration that
+// spells them. The vtable typedef names an operation's by-value parameter inside itself, and
+// the type graph can reach that typedef from a handler field before the declaration walk has
+// reached the parameter's own type.
+fn emit_signature_deps(fn_node: Int) ! Diag.Report {
+    for dep in nominal_deps(fn_ret_tid(fn_node)) { emit_dep(dep) }
+    let sl = node_params(fn_node)
+    if sl == -1 { return }
     let mut i = 0
-    while i < ops.len() {
-        print_fn(true, rets.get(i).unwrap(), defaults.get(i).unwrap(), params.get(i).unwrap(), false,
-            default_op_body(ops.get(i).unwrap(), rets.get(i).unwrap()))
+    while i < sublist_length(sl) {
+        for dep in nominal_deps(tid_of_node(sublist_get(sl, i))) { emit_dep(dep) }
         i = i + 1
     }
-    print_effect_default_vtable(vtable, defaults)
-    1
 }
 
 // The C type a vtable slot answers with. It is a return position, so it takes the slot
