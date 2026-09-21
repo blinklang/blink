@@ -42,7 +42,8 @@ import layout.{
     child_tid, ensure_typedef_for, format_spec_of, varargs_spelling,
     tid_of_binder, current_binder_scope, current_inst, decl_has_derive,
     container_slot_spelling, field_layout_of, address_layout_of, fn_pointer_spelling_of,
-    binder_scope_push, binder_scope_pop, bind_binder, pointer_spelling, tid_holds_tag_member,
+    binder_scope_push, binder_scope_pop, bind_binder, pointer_spelling, handle_pointee_spelling,
+    tid_holds_tag_member,
 }
 import mono.{instances, instance_for_call}
 import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls, cg_reg_trait_decls, cg_reg_impl_of}
@@ -2909,8 +2910,18 @@ fn cc_bytes_with_ptr(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Di
     if cc_stopped(precord) { return -1 }
     let recv = lower_expr(obj)
     if recv < 0 { return -1 }
-    let ptr_init = ir_call_runtime(ptid, node, precord.c_spelling,
-        c_runtime_helper("bytes_ptr"), precord.slot_form, [recv])
+    // blink_bytes_ptr is just `return b->data;` (bootstrap/runtime_core.h), added to the
+    // runtime after gen0 was pinned, so gen1 building against gen0's runtime.h has no
+    // declaration for it. Read the field straight off the receiver instead of calling out.
+    // The receiver's own C type is already the pointer (blink_bytes*): FieldGet picks '.'
+    // or '->' from the object node's own slot_form, which for a Bytes local says Inline
+    // (the pointer value sits directly in the slot, nothing boxes it further), so an
+    // unwrapped FieldGet would print '.' where C needs '->'. Deref first so the field read
+    // goes through a value node and prints '.', same as the runtime helper's `b->data`.
+    let bytes_tid = tid_of_node(obj)
+    if bytes_tid < 0 { return -1 }
+    let deref = ir_unbox(bytes_tid, node, handle_pointee_spelling(bytes_tid), SlotForm.Inline, recv)
+    let ptr_init = ir_field_get(ptid, node, precord.c_spelling, "data", precord.slot_form, deref)
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = cc_local(tid, node)
