@@ -1719,14 +1719,9 @@ fn cc_enum_variant_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     if cc_kind(tid) != TyKind.Enum { return cc_variant_answer_not_enum(node, owner, method, tid) }
-    let rec = cc_local(tid, node)
-    if cc_stopped(rec) { return -1 }
-    let _td = ensure_typedef_for(tid)
     let decl = tc_tid_decl_node(tid)
     let vnode = cc_variant_node(decl, method)
     if vnode < 0 { return cc_variant_not_declared(node, owner, method) }
-    let macro = c_variant_discriminant(tid, vnode)
-    if diag_is_ice_seg(macro) { return cc_variant_tag_unspellable(node, owner, method, macro) }
     let arity = cc_variant_arity(vnode)
     let args = node_args(node)
     let given = if args == -1 { 0 } else { sublist_length(args) }
@@ -1735,7 +1730,39 @@ fn cc_enum_variant_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report
     // because the payload is built by walking the declaration: a count that disagrees would
     // otherwise read past the written arguments.
     if given != arity { return cc_variant_arity_wrong(node, owner, method, arity, given) }
-    let payload = cc_variant_payload(node, tid, vnode, owner, method, arity)
+    let fields = node_fields(vnode)
+    let mut values: List[Int] = []
+    let mut i = 0
+    while i < arity {
+        let fd = sublist_get(fields, i)
+        let arg = cc_variant_arg_for_field(args, fd, i)
+        if arg < 0 { return cc_variant_field_unfilled(node, owner, method, node_name(fd)) }
+        values.push(arg)
+        i = i + 1
+    }
+    cc_enum_variant_construct(node, tid, vnode, owner, method, values)
+}
+
+// One arm of a tagged enum, built from the payload's expression nodes in DECLARED order.
+//
+// Both surface spellings of a variant construction end here. `Shape.Rect(3, 4)` and
+// `Shape.Rect { width: 3, height: 4 }` differ only in where the written values sit, so the
+// tag, the union member, the boxing of a self-recursive field and the transparent-newtype
+// spelling are decided once whatever the syntax was. Resolving the written values to
+// declared order belongs to the caller, which is the only half the two spellings disagree
+// on; nothing below reads the node's arguments.
+//
+// The values arrive unlowered, so a field's layout is still answered before its operand is
+// lowered. That is what keeps a field with no C form from refusing after the statements
+// lowering an operand can hoist.
+pub fn cc_enum_variant_construct(node: Int, tid: Int, vnode: Int, owner: Str, method: Str, values: List[Int]) -> Int ! Diag.Report {
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    let _td = ensure_typedef_for(tid)
+    let macro = c_variant_discriminant(tid, vnode)
+    if diag_is_ice_seg(macro) { return cc_variant_tag_unspellable(node, owner, method, macro) }
+    let arity = values.len()
+    let payload = cc_variant_payload(node, tid, values)
     if payload.len() != arity { return -1 }
     // A transparent newtype is spelled as the value it wraps: one variant, one field, and
     // no tag beside it in its C shape (tid_holds_tag_member answers false for it the same
@@ -1750,32 +1777,27 @@ fn cc_enum_variant_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report
 }
 
 // The payload in DECLARED order, each element in the physical form its member was declared
-// with. The order is the declaration's because that is the order the arm's struct fields are
-// written in, and a payload may be written by field name: `Crate.Box(h: 4, w: 3)` fills the
-// same two fields as `Crate.Box(3, 4)`. So the walk is over the declared fields and each one
-// asks which written argument fills it, rather than over the written arguments in the order
-// they appear.
+// with. The order is the caller's, because the caller is what resolved each declared field
+// to the value written for it: a payload may be written by field name, so
+// `Crate.Box(h: 4, w: 3)` fills the same two fields as `Crate.Box(3, 4)`.
 //
 // A field that reaches its own enum is stored by pointer, because the enum's typedef is
 // still incomplete where the member is declared, so a value for such a member is boxed here
 // rather than written into a word it does not fit.
 //
-// The type each element is laid out at is the type typecheck gave the written argument.
+// The type each element is laid out at is the type typecheck gave the written value.
 // A generic enum's fields are declared at its type parameters, which have no C layout at
-// all; the argument carries the substituted type, so it is the only reading of the field
+// all; the value carries the substituted type, so it is the only reading of the field
 // that answers for an instance as well as for a bare enum.
 //
 // A refusal returns an empty list, which the caller reads as short. The count is already
 // known to match, so a complete list is the only other answer this can give.
-fn cc_variant_payload(node: Int, owner_tid: Int, vnode: Int, owner: Str, method: Str, arity: Int) -> List[Int] ! Diag.Report {
-    let args = node_args(node)
-    let fields = node_fields(vnode)
+fn cc_variant_payload(node: Int, owner_tid: Int, values: List[Int]) -> List[Int] ! Diag.Report {
     let refused: List[Int] = []
     let mut out: List[Int] = []
     let mut i = 0
-    while i < arity {
-        let arg = cc_variant_arg_for_field(args, sublist_get(fields, i), i)
-        if arg < 0 { return cc_variant_field_unfilled(node, owner, method, node_name(sublist_get(fields, i))) }
+    while i < values.len() {
+        let arg = values.get(i).unwrap()
         let ftid = tid_of_node(arg)
         if ftid < 0 { return refused }
         // The layout is answered before the operand is lowered, so that a field with no C
@@ -1814,11 +1836,11 @@ fn cc_variant_arg_for_field(args: Int, field: Int, slot: Int) -> Int {
     -1
 }
 
-fn cc_variant_field_unfilled(node: Int, owner: Str, method: Str, field: Str) -> List[Int] ! Diag.Report {
+fn cc_variant_field_unfilled(node: Int, owner: Str, method: Str, field: Str) -> Int ! Diag.Report {
     diag_ice_at("VariantFieldUnfilled", UNSOLVED_TYPEVAR_AT_CODEGEN,
         "'{owner}.{method}' declares a field '{field}' that this call fills with nothing", node,
         "typecheck matches every payload field to an argument before codegen builds it; this is a compiler bug")
-    []
+    -1
 }
 
 fn cc_variant_field_layout(node: Int, owner_tid: Int, ftid: Int) -> LayoutRecord ! Diag.Report {
