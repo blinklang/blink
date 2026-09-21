@@ -1,0 +1,160 @@
+// A keyed container's constructor chooses its key operations from the key type, so an empty
+// `Map()` has to learn its key from the declaration standing over it. Slices one and two
+// covered the two positions where the declaration is the value's immediate neighbour: an
+// annotated let, and a struct literal's field. The rows here are the positions where the
+// declaration is one hop further out -- a list element, a variant payload, a field default,
+// a closure's declared return, a coalesce fallback -- and every one of them reaches the
+// constructor with a key that answers no operations table.
+//
+// Each row reads the key the way the constructor reads it: the constructor node's own tid,
+// then one slot down, then the key operations table on that slot's layout. A slot with no
+// table renders as its own type in angle brackets, which tells an unsolved slot apart from a
+// concrete type that declines a table for a reason of its own.
+//
+// Every local and function name is distinct across the rows on purpose: the node table is
+// process-wide, so two rows sharing a name would both read the first row's node.
+
+import lower_test_helpers.{assert_eq_str, fn_decl_of, probe, rhs_of}
+import layout.{
+    Position, Slot, child_tid, layout_of, layout_reset, set_current_inst, tid_of_node,
+}
+import mono.{run_mono}
+import ast.{NodeKind, nk_of}
+import parser.{
+    node_args, node_body, node_condition, node_elements, node_kind, node_name, node_right,
+    node_stmts, node_value, nodes, sublist_get, sublist_length,
+}
+import typecheck.{tc_type_str}
+
+// The key operations table the container constructor at `ctor` would read.
+fn key_table(ctor: Int, slot: Slot) -> Str ! Diag.Report {
+    let key = child_tid(tid_of_node(ctor), slot)
+    let table = layout_of(key, Position.Local).kops_table
+    if table == "" { return "<{tc_type_str(key)}>" }
+    table
+}
+
+// The value a block answers with: its last statement, unwrapped when that statement is an
+// expression wrapper. A declared return reaches the tail through this and nothing else.
+fn block_tail_value(blk: Int) -> Int {
+    if blk == -1 { return -1 }
+    let stmts = node_stmts(blk)
+    if stmts == -1 { return -1 }
+    let n = sublist_length(stmts)
+    if n == 0 { return -1 }
+    let last = sublist_get(stmts, n - 1)
+    if nk_of(node_kind(last)) == NodeKind.ExprStmt { return node_value(last) }
+    last
+}
+
+// The default expression of one declared field, by field name, or -1.
+fn field_default_of(field: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.TypeField && node_name(i) == field {
+            return node_condition(i)
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn nth_arg(call: Int, i: Int) -> Int {
+    let args = node_args(call)
+    if args == -1 { return -1 }
+    if sublist_length(args) <= i { return -1 }
+    sublist_get(args, i)
+}
+
+fn nth_element(lit: Int, i: Int) -> Int {
+    let elems = node_elements(lit)
+    if elems == -1 { return -1 }
+    if sublist_length(elems) <= i { return -1 }
+    sublist_get(elems, i)
+}
+
+test "a list element carries the key its declared element type names" {
+    let program = probe("layout_nestpos_list", #"fn main() {
+    let probe_listnest: List[Map[Str, Int]] = [Map()]
+    let _n = probe_listnest.len()
+}
+"#)
+    run_mono(program)
+    layout_reset()
+    set_current_inst(-1)
+    assert_eq_str("List[Map[Str, Int]] element key",
+        key_table(nth_element(rhs_of("probe_listnest"), 0), Slot.Inner1), "blink_kops_str")
+}
+
+test "a variant payload carries the key the declared return names" {
+    let program = probe("layout_nestpos_payload", #"fn nestpos_ret_some() -> Option[Map[Int, Int]] {
+    Some(Map())
+}
+fn main() {
+    let _o = nestpos_ret_some()
+}
+"#)
+    run_mono(program)
+    layout_reset()
+    set_current_inst(-1)
+    let tail = block_tail_value(node_body(fn_decl_of("nestpos_ret_some")))
+    assert_eq_str("Some(Map()) payload key", key_table(nth_arg(tail, 0), Slot.Inner1),
+        "blink_kops_i64")
+}
+
+test "a field default carries the key its declared field type names" {
+    let program = probe("layout_nestpos_default", #"type NestPosD { v: Int, nestpos_mdef: Map[Int, Int] = Map() }
+fn main() {
+    let probe_dflt = NestPosD { v: 1 }
+    let _n = probe_dflt.nestpos_mdef.len()
+}
+"#)
+    run_mono(program)
+    layout_reset()
+    set_current_inst(-1)
+    assert_eq_str("NestPosD.nestpos_mdef default key",
+        key_table(field_default_of("nestpos_mdef"), Slot.Inner1), "blink_kops_i64")
+}
+
+test "a closure tail carries the key the closure's declared return names" {
+    let program = probe("layout_nestpos_closure", #"fn main() {
+    let probe_clo = fn() -> Map[Int, Str] { Map() }
+    let _m = probe_clo()
+}
+"#)
+    run_mono(program)
+    layout_reset()
+    set_current_inst(-1)
+    let tail = block_tail_value(node_body(rhs_of("probe_clo")))
+    assert_eq_str("closure return key", key_table(tail, Slot.Inner1), "blink_kops_i64")
+}
+
+test "a coalesce fallback carries the key the left side's inner type names" {
+    let program = probe("layout_nestpos_coalesce", #"fn nestpos_none_map() -> Option[Map[Str, Int]] { None }
+fn main() {
+    let mut probe_coal = nestpos_none_map() ?? Map()
+    probe_coal.insert("a", 1)
+}
+"#)
+    run_mono(program)
+    layout_reset()
+    set_current_inst(-1)
+    assert_eq_str("?? fallback key", key_table(node_right(rhs_of("probe_coal")), Slot.Inner1),
+        "blink_kops_str")
+}
+
+// The control: the same constructor standing directly under its declaration already carries
+// its key, so a row above failing while this one passes says the defect is the distance
+// between the declaration and the constructor and nothing else.
+test "the same constructor directly under its declaration still carries its key" {
+    let program = probe("layout_nestpos_control", #"fn main() {
+    let mut probe_nestctl: Map[Str, Int] = Map()
+    probe_nestctl.insert("a", 1)
+}
+"#)
+    run_mono(program)
+    layout_reset()
+    set_current_inst(-1)
+    assert_eq_str("annotated let key", key_table(rhs_of("probe_nestctl"), Slot.Inner1),
+        "blink_kops_str")
+}
