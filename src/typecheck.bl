@@ -23,7 +23,7 @@ import diagnostics.{
     POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
-    NON_EXHAUSTIVE_MATCH,
+    NON_EXHAUSTIVE_MATCH, DUPLICATE_MODULE_BINDING,
     UNSOLVED_TYPEVAR_AT_CODEGEN,
     TYPE_ERROR, TEMPLATE_MISMATCH, MISSING_RETURN, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
@@ -155,12 +155,12 @@ let mut tc_node_tid: List[Int] = []
 // not a qualified trait call. Captured during infer_type while scope is live;
 // resident through generate(). Monotonic (only ever set to 1) so a later
 // re-inference with scope torn down cannot un-mark it.
-let mut tc_mc_obj_is_value: List[Int] = []
+let mut tc_mc_obj_value_marks: List[Int] = []
 
 // Ident node id → 1 when that Ident, standing in a callee or qualifier position,
 // resolved to a live VALUE binding. Written only while nr scope is live, which is
 // the only time the question can be asked; read by tc_stamp_name_child long after
-// the scope is gone. Monotonic, like tc_mc_obj_is_value and for the same reason: a
+// the scope is gone. Monotonic, like tc_mc_obj_value_marks and for the same reason: a
 // later re-inference with the scope torn down must not un-mark what it can no
 // longer see.
 let mut tc_name_position_is_value: List[Int] = []
@@ -4247,7 +4247,7 @@ fn tc_grow_node_tables() {
     while tc_node_tid.len() < node_count() {
         tc_node_tid.push(-1)
         tc_ret_mint_start.push(-1)
-        tc_mc_obj_is_value.push(0)
+        tc_mc_obj_value_marks.push(0)
         tc_name_position_is_value.push(0)
     }
 }
@@ -9751,13 +9751,13 @@ fn init_types() ! TypeCheck.Register {
     ty_intern.clear()
     tc_node_tid.clear()
     tc_ret_mint_start.clear()
-    tc_mc_obj_is_value.clear()
+    tc_mc_obj_value_marks.clear()
     tc_name_position_is_value.clear()
     let mut nti = 0
     while nti < node_count() {
         tc_node_tid.push(-1)
         tc_ret_mint_start.push(-1)
-        tc_mc_obj_is_value.push(0)
+        tc_mc_obj_value_marks.push(0)
         tc_name_position_is_value.push(0)
         nti = nti + 1
     }
@@ -12603,6 +12603,17 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             let l = sublist_get(lets_sl_priv, i)
             let l_name = node_name(l)
             let mod_name = node_module(l)
+            // A module-level binding and a function of one name. Module scope is flat, so
+            // neither declaration is inner to the other and a bare read of the name has no
+            // rule that picks between them. They also need one C symbol between them, so
+            // whichever loses it cannot be spelled at all. Functions register before
+            // bindings in this pass, so the function is already on record here.
+            let prior = nr_module_decls.get("{mod_name}|{l_name}") ?? -1
+            if prior >= 0 && nk_of(node_kind(prior)) == NodeKind.FnDef {
+                diag_error_at("DuplicateModuleBinding", DUPLICATE_MODULE_BINDING,
+                    "module-level binding '{l_name}' has the name of a function this module declares", l,
+                    "rename one of them; module scope is one flat namespace, so one name cannot be both")
+            }
             nr_record_decl(l_name, mod_name, l)
             if mod_name != "" && node_is_pub(l) == 0 && nr_pub_names.contains_key(l_name) == 0 {
                 nr_register_private(l_name, mod_name)
@@ -14837,8 +14848,8 @@ pub fn tc_lookup_node_tid(node: Int) -> Int {
 
 pub fn tc_mc_obj_is_value(node: Int) -> Int {
     if node == -1 { return 0 }
-    if node >= tc_mc_obj_is_value.len() { return 0 }
-    tc_mc_obj_is_value.get(node).unwrap()
+    if node >= tc_mc_obj_value_marks.len() { return 0 }
+    tc_mc_obj_value_marks.get(node).unwrap()
 }
 
 // Publish a tid for a node that is a DECLARATION rather than an expression, so codegen can read
@@ -15505,7 +15516,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // nr scope is torn down. Monotonic, so a later scope-torn-down re-inference
         // never un-marks it.
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident && nr_has_binding(node_name(obj_node)) != 0 {
-            tc_mc_obj_is_value.set(node, 1)
+            tc_mc_obj_value_marks.set(node, 1)
         }
 
         // `p.zzf.read()` and `p.zzf.write(v)` — the typed field access the spec documents for a
