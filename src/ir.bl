@@ -26,7 +26,7 @@
 // that ordering: it walks the tree and reports a cycle.
 
 import layout.{SlotForm, pointer_spelling}
-import cname.{c_enum_tag_member, c_enum_payload_member}
+import cname.{c_enum_tag_member, c_enum_payload_member, c_cell_name}
 import typecheck.{TyKind, tc_tid_kind, tc_tid_decl_node}
 import parser.{node_name, node_fields, sublist_length, sublist_get, node_count}
 
@@ -35,10 +35,10 @@ pub type IrKind {
     Const, VarRef, GlobalRef,
     Unary, Binary, Cast, Select,
     FieldGet, FieldSet, StructNew, TupleNew, EnumNew, ContainerNew, ContainerSpread,
-    Box, Unbox, SizedAlloc, CarrierWrap, CarrierUnwrap, CarrierTag,
+    Box, Unbox, SizedAlloc, CarrierWrap, CarrierUnwrap, CarrierTag, CellRef,
     CallDirect, CallIndirect, CallClosure, CallVirtual, CallRuntime,
     ClosureNew, EvidenceVector, EvidenceAddress, EffectPerform, HandlerInstall,
-    Let, Assign, ExprStmt, Return, If, Loop, Break, Continue, Block, Switch, WithScope,
+    Let, CellLet, Assign, ExprStmt, Return, If, Loop, Break, Continue, Block, Switch, WithScope,
     Panic, Unreachable,
 }
 
@@ -183,11 +183,11 @@ pub fn ir_all_kinds() -> List[IrKind] {
         IrKind.Unary, IrKind.Binary, IrKind.Cast, IrKind.Select,
         IrKind.FieldGet, IrKind.FieldSet, IrKind.StructNew, IrKind.TupleNew, IrKind.EnumNew, IrKind.ContainerNew,
         IrKind.ContainerSpread, IrKind.Box, IrKind.Unbox, IrKind.SizedAlloc,
-        IrKind.CarrierWrap, IrKind.CarrierUnwrap, IrKind.CarrierTag,
+        IrKind.CarrierWrap, IrKind.CarrierUnwrap, IrKind.CarrierTag, IrKind.CellRef,
         IrKind.CallDirect, IrKind.CallIndirect, IrKind.CallClosure, IrKind.CallVirtual, IrKind.CallRuntime,
         IrKind.ClosureNew, IrKind.EvidenceVector, IrKind.EvidenceAddress, IrKind.EffectPerform,
         IrKind.HandlerInstall,
-        IrKind.Let, IrKind.Assign, IrKind.ExprStmt, IrKind.Return, IrKind.If, IrKind.Loop,
+        IrKind.Let, IrKind.CellLet, IrKind.Assign, IrKind.ExprStmt, IrKind.Return, IrKind.If, IrKind.Loop,
         IrKind.Break, IrKind.Continue, IrKind.Block, IrKind.Switch, IrKind.WithScope,
         IrKind.Panic, IrKind.Unreachable,
     ]
@@ -215,6 +215,7 @@ pub fn ir_kind_name(kind: IrKind) -> Str {
         IrKind.CarrierWrap => "CarrierWrap"
         IrKind.CarrierUnwrap => "CarrierUnwrap"
         IrKind.CarrierTag => "CarrierTag"
+        IrKind.CellRef => "CellRef"
         IrKind.CallDirect => "CallDirect"
         IrKind.CallIndirect => "CallIndirect"
         IrKind.CallClosure => "CallClosure"
@@ -226,6 +227,7 @@ pub fn ir_kind_name(kind: IrKind) -> Str {
         IrKind.EffectPerform => "EffectPerform"
         IrKind.HandlerInstall => "HandlerInstall"
         IrKind.Let => "Let"
+        IrKind.CellLet => "CellLet"
         IrKind.Assign => "Assign"
         IrKind.ExprStmt => "ExprStmt"
         IrKind.Return => "Return"
@@ -254,6 +256,7 @@ pub fn ir_kind_is_value(kind: IrKind) -> Bool {
         IrKind.FieldSet => false
         IrKind.HandlerInstall => false
         IrKind.Let => false
+        IrKind.CellLet => false
         IrKind.Assign => false
         IrKind.ExprStmt => false
         IrKind.Return => false
@@ -288,6 +291,8 @@ fn kind_needs_c_name(kind: IrKind) -> Bool {
         IrKind.Box => true
         IrKind.SizedAlloc => true
         IrKind.CarrierUnwrap => true
+        IrKind.CellRef => true
+        IrKind.CellLet => true
         IrKind.CallDirect => true
         IrKind.CallClosure => true
         IrKind.CallVirtual => true
@@ -304,6 +309,8 @@ fn kind_needs_c_name(kind: IrKind) -> Bool {
 // Kid arity per kind: (min, max), max -1 for unbounded.
 fn kind_min_kids(kind: IrKind) -> Int {
     match kind {
+        IrKind.CellRef => 0
+        IrKind.CellLet => 0
         IrKind.Unary => 1
         IrKind.Binary => 2
         IrKind.Cast => 1
@@ -337,6 +344,8 @@ fn kind_min_kids(kind: IrKind) -> Int {
 
 fn kind_max_kids(kind: IrKind) -> Int {
     match kind {
+        IrKind.CellRef => 0
+        IrKind.CellLet => 1
         IrKind.Const => 0
         IrKind.VarRef => 0
         IrKind.GlobalRef => 0
@@ -585,6 +594,21 @@ pub fn ir_let(tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: Slot
     ir_new(IrKind.Let, tid, span, c_spelling, c_name, slot_form, kids)
 }
 
+// A binding whose storage is a heap cell: the declaration allocates the cell and writes
+// the initialiser into it, so the value is in the cell from the first statement that can
+// read it. The node carries the pointer's spelling and the cell's name, which is all the
+// printer needs -- the size comes off the pointer itself.
+pub fn ir_cell_let(tid: Int, span: Int, value_spelling: Str, name: Str, slot_form: SlotForm, init: Int) -> Int {
+    let kids: List[Int] = if init < 0 { [] } else { [init] }
+    ir_new(IrKind.CellLet, tid, span, pointer_spelling(value_spelling), c_cell_name(name), slot_form, kids)
+}
+
+// The value inside a cell. It is a place, so one node serves a read and the target of an
+// assignment, which is what keeps the two from spelling the same binding differently.
+pub fn ir_cell_ref(tid: Int, span: Int, value_spelling: Str, name: Str, slot_form: SlotForm) -> Int {
+    ir_new(IrKind.CellRef, tid, span, value_spelling, c_cell_name(name), slot_form, [])
+}
+
 pub fn ir_assign(span: Int, target: Int, value: Int) -> Int {
     ir_new(IrKind.Assign, -1, span, "", "", SlotForm.Inline, [target, value])
 }
@@ -710,7 +734,7 @@ fn verify_node(id: Int, seen: List[Int], on_stack: List[Int], first_block: List[
     first_block.set(id, block)
     on_stack.set(id, 1)
     verify_fields(id, kind, label, errs)
-    if scoped && kind == IrKind.VarRef && !in_scope(ir_c_name(id), scope, declared) {
+    if scoped && reads_a_name(kind) && !in_scope(ir_c_name(id), scope, declared) {
         errs.push("{label}: reads '{ir_c_name(id)}', {VARREF_UNDECLARED}")
     }
     let kids = ir_kids(id)
@@ -736,8 +760,15 @@ fn verify_node(id: Int, seen: List[Int], on_stack: List[Int], first_block: List[
     if kind == IrKind.Block { drop_to(scope, block_mark) }
     // A Let declares its name only after its own initialiser is verified, so `let b = b`
     // reads a name that is not in scope yet, exactly as the C it prints would.
-    if scoped && kind == IrKind.Let { scope.push(ir_c_name(id)) }
+    if scoped && (kind == IrKind.Let || kind == IrKind.CellLet) { scope.push(ir_c_name(id)) }
     on_stack.set(id, 0)
+}
+
+// The kinds whose c_name is a local the frame must have declared. A CellRef is one: it
+// names the cell pointer, and the value it reaches is inside that pointer, so a CellRef
+// the frame never declared a cell for reads an identifier that is not there.
+fn reads_a_name(kind: IrKind) -> Bool {
+    kind == IrKind.VarRef || kind == IrKind.CellRef
 }
 
 fn in_scope(name: Str, scope: List[Str], declared: List[Str]) -> Bool {
@@ -762,7 +793,7 @@ fn verify_fields(id: Int, kind: IrKind, label: Str, errs: List[Str]) {
     } else if ir_kind_is_value(kind) && ir_tid(id) < 0 {
         errs.push("{label}: value node without a tid")
     }
-    if (ir_kind_is_value(kind) || kind == IrKind.Let) && ir_c_spelling(id) == "" {
+    if (ir_kind_is_value(kind) || kind == IrKind.Let || kind == IrKind.CellLet) && ir_c_spelling(id) == "" {
         errs.push("{label}: empty c_spelling")
     }
     let wrap_with_payload = kind == IrKind.CarrierWrap && ir_kid_count(id) == 2
@@ -973,6 +1004,7 @@ fn is_lvalue_kind(kind: IrKind) -> Bool {
         IrKind.GlobalRef => true
         IrKind.FieldGet => true
         IrKind.Unbox => true
+        IrKind.CellRef => true
         IrKind.CarrierUnwrap => true
         _ => false
     }

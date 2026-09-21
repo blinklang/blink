@@ -1,0 +1,326 @@
+// A `let mut` shared with a closure, and the one heap cell both frames read and write.
+//
+// sections/02_syntax.md:336 settles what a capture means: every capture is a shared
+// reference to the original binding. For a plain `let` a copy is observationally the
+// same, because the value never changes, and the spec lets the compiler copy it. For a
+// `let mut` it is not: a write on either side has to be visible on the other. One cell,
+// which both frames hold the address of, is what makes that true. A copy would compile,
+// run, and answer the number from before the write, which is the one outcome worth a
+// test of its own.
+//
+// The cell is allocated where the binding is declared, not where the closure is built,
+// because the cell is that binding's storage for the whole life of the binding. A cell
+// allocated at the closure instead is reallocated and reseeded on every turn of an
+// enclosing loop, which drops every write made through the cell of the turn before.
+//
+// A captured cell needs no box either. A capture word is pointer-wide and a cell already
+// is a pointer, so a `let mut` Float rides the same word a `let mut` Int does, and the
+// size question that refuses a boxed copy never comes up.
+//
+// Four rows below are registered as expected failures. They are the two frame-side
+// claims, the declaration and the write through the cell, and both halves resolve in
+// the statement stage, which does not choose a cell yet. They go back to `test` in the
+// commit that teaches it to, because an expected failure that passes fails the suite.
+
+import typecheck.{TYPE_FLOAT, TYPE_INT}
+import cname_test_helpers.{find_decl}
+import cg_test_helpers.{cg_probe_compile, cg_text_occurrences}
+import ast.{NodeKind}
+import parser.{node_body, node_value}
+import cname.{c_cell_name}
+import layout.{
+    bind_binder_cell, bind_binder_mut, binder_is_celled, binder_scope_pop, binder_scope_push,
+    layout_reset,
+}
+import ir.{IrKind, ir_c_name, ir_kid, ir_kid_count, ir_kind, ir_reset, ir_verify}
+import cg_reg.{cg_reg_build}
+import cg_expr.{cg_expr_reset}
+import cg_print.{print_block_body, print_reset, print_take}
+import cg_stmt.{cg_stmt_reset, lower_block_returning}
+import cg_eff.{
+    cg_eff_binder_is_shared, cg_eff_lower_closure, cg_eff_pending_thunks, cg_eff_print_thunk,
+    cg_eff_reset, cg_eff_scan_shared_binders, cg_eff_thunk_body_node, cg_eff_thunk_close,
+    cg_eff_thunk_open,
+}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+
+// Each body declares a `let mut`, builds a closure that assigns it, and then assigns it
+// from the enclosing frame as well. Both sides of the sharing rule are therefore in one
+// body: a write the thunk makes and a write the frame makes.
+fn probe_src() -> Str {
+    #"import std.io
+
+fn shared_int() -> Int {
+    let mut total = 0
+    let bump_int = fn(n: Int) -> Int {
+        total = total + n
+        total
+    }
+    total = total + 1
+    bump_int(5)
+}
+
+fn shared_float() -> Float {
+    let mut acc = 1.5
+    let bump_float = fn(x: Float) -> Float {
+        acc = acc + x
+        acc
+    }
+    bump_float(2.0)
+}
+
+fn plain_mut_nobody_captures() -> Int {
+    let mut lone = 0
+    lone = lone + 1
+    lone
+}
+
+fn plain_let_a_closure_reads() -> Int {
+    let fixed = 7
+    let read_only = fn(x: Int) -> Int { x + fixed }
+    read_only(1)
+}
+
+fn main() {
+    io.println("{shared_int()}")
+    io.println("{shared_float()}")
+    io.println("{plain_mut_nobody_captures()}")
+    io.println("{plain_let_a_closure_reads()}")
+}
+"#
+}
+
+fn ices() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" { n = n + 1 }
+    }
+    n
+}
+
+fn ices_mentioning(text: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.message.contains(text) { n = n + 1 }
+    }
+    n
+}
+
+fn report_ices(label: Str) {
+    io.eprintln("  {label}:")
+    for d in diag_entries {
+        if d.severity == "ice" { io.eprintln("    ICE {d.code} {d.message}") }
+    }
+}
+
+fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    diag_reset()
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    cg_expr_reset()
+    cg_eff_reset()
+    print_reset()
+    let path = "build/cg_eff_shared_mutable_capture_probe.bl"
+    let program = cg_probe_compile(path, probe_src())
+    let _ = fs.delete(path)
+    cg_reg_build(program)
+    diag_reset()
+}
+
+fn fn_node_of(fn_name: Str) -> Int {
+    find_decl(NodeKind.FnDef, fn_name, "")
+}
+
+fn closure_of(let_name: Str) -> Int {
+    let binding = find_decl(NodeKind.LetBinding, let_name, "")
+    assert(binding >= 0)
+    node_value(binding)
+}
+
+// A whole function body, lowered the way the driver lowers one: the body is scanned for
+// the names its closures share before any statement in it lowers, because the cell has
+// to exist at the declaration and a declaration lowers before the closure below it does.
+fn lower_body_of(fn_name: Str) -> Int ! Diag.Report {
+    let f = fn_node_of(fn_name)
+    cg_eff_scan_shared_binders(f)
+    lower_block_returning(node_body(f))
+}
+
+// The C a lowered body prints. The frame's own declaration and its own writes are what
+// this measures, so the statements are printed rather than read off the IR: the deref is
+// a spelling, and a spelling is only true once it is printed.
+fn body_text(fn_name: Str) -> Str ! Diag.Report {
+    let body = lower_body_of(fn_name)
+    assert(body >= 0)
+    print_reset()
+    print_block_body(body)
+    print_take()
+}
+
+// One closure lowered against a frame that already holds the shared binding in a cell,
+// which is the state the statement stage leaves behind for it.
+fn lower_capturing_cell(let_name: Str, name: Str, tid: Int) -> Int ! Diag.Report {
+    let outer = binder_scope_push()
+    bind_binder_cell(outer, name, tid)
+    let v = cg_eff_lower_closure(closure_of(let_name))
+    binder_scope_pop()
+    v
+}
+
+test "the scan names the mut bindings a closure in the body shares, and no others" {
+    // The scan is the only thing that tells a shared binding from a private one, and it
+    // has to answer before the declaration lowers. A scan that named every `let mut`
+    // would give a private binding heap storage nothing reads through.
+    setup()
+    cg_eff_scan_shared_binders(fn_node_of("shared_int"))
+    assert(cg_eff_binder_is_shared("total"))
+    // The closure's own parameter is not a binding of this frame.
+    assert(!cg_eff_binder_is_shared("n"))
+
+    setup()
+    cg_eff_scan_shared_binders(fn_node_of("plain_mut_nobody_captures"))
+    assert(!cg_eff_binder_is_shared("lone"))
+
+    // A plain `let` a closure reads is copied, so it is not shared and needs no cell.
+    setup()
+    cg_eff_scan_shared_binders(fn_node_of("plain_let_a_closure_reads"))
+    assert(!cg_eff_binder_is_shared("fixed"))
+}
+
+test "a shared mut binding binds as celled, and a private one does not" {
+    setup()
+    let scope = binder_scope_push()
+    bind_binder_cell(scope, "total", TYPE_INT)
+    bind_binder_mut(scope, "lone", TYPE_INT, true)
+    assert(binder_is_celled(scope, "total"))
+    assert(!binder_is_celled(scope, "lone"))
+    binder_scope_pop()
+}
+
+test.failing(
+    "a let mut a closure shares is lowered, not refused",
+    reason: "the let site still declares a plain local: the celled declaration and the celled assignment target are lowered by the statement stage, which does not choose a cell yet. The capture side of the same binding is built",
+    ticket: "9va9y5",
+) {
+    setup()
+    let body = lower_body_of("shared_int")
+    if body < 0 || ices_mentioning("shared") > 0 { report_ices("shared_int was refused") }
+    assert(body >= 0)
+    assert_eq(ices_mentioning("shared"), 0)
+    assert_eq(ices_mentioning("'total'"), 0)
+    assert_eq(cg_eff_pending_thunks(), 1)
+}
+
+test.failing(
+    "the frame declares the shared binding as a cell and seeds it from the initialiser",
+    reason: "the let site still declares a plain local: the celled declaration and the celled assignment target are lowered by the statement stage, which does not choose a cell yet. The capture side of the same binding is built",
+    ticket: "9va9y5",
+) {
+    // The cell is the storage, so the declaration is the allocation, and the initialiser
+    // is written through the cell rather than into a local the closure cannot see.
+    setup()
+    let text = body_text("shared_int")
+    if ices_mentioning("shared") > 0 { report_ices("shared_int did not print") }
+    assert(cg_text_occurrences(text, "int64_t* {c_cell_name("total")} =") == 1)
+    assert(cg_text_occurrences(text, "sizeof(*{c_cell_name("total")})") == 1)
+    assert(cg_text_occurrences(text, "*{c_cell_name("total")} = 0;") == 1)
+}
+
+test.failing(
+    "a write in the enclosing frame goes through the cell",
+    reason: "the let site still declares a plain local: the celled declaration and the celled assignment target are lowered by the statement stage, which does not choose a cell yet. The capture side of the same binding is built",
+    ticket: "9va9y5",
+) {
+    // This is the half a copy gets wrong in the other direction: the thunk holds the cell,
+    // so a frame that kept writing a private local would hide its own write from the
+    // closure.
+    setup()
+    let text = body_text("shared_int")
+    assert(cg_text_occurrences(text, "(*{c_cell_name("total")}) =") >= 1)
+    // No plain declaration of the name survives beside the cell.
+    assert_eq(cg_text_occurrences(text, "int64_t total ="), 0)
+}
+
+test "a mut binding nobody shares keeps its plain local declaration" {
+    // The control. A stage that celled every `let mut` would pass every other row here
+    // and put a heap allocation in front of every mutable local in the language.
+    setup()
+    let text = body_text("plain_mut_nobody_captures")
+    assert(cg_text_occurrences(text, "int64_t lone =") == 1)
+    assert_eq(cg_text_occurrences(text, c_cell_name("lone")), 0)
+}
+
+test "the capture word is the cell pointer itself, not a copy of the value" {
+    // A capture word is pointer-wide, and the cell is a pointer, so the word is the read
+    // of the pointer with no integer pun and no heap copy over it.
+    setup()
+    let v = lower_capturing_cell("bump_int", "total", TYPE_INT)
+    if v < 0 || ices() != 0 { report_ices("bump_int was refused") }
+    assert(v >= 0)
+    assert_eq(ices(), 0)
+    assert_eq(ir_kid_count(v), 1)
+    let word = ir_kid(v, 0)
+    assert(ir_kind(word) != IrKind.Box)
+    assert(ir_c_name(word).contains(c_cell_name("total")))
+    assert_eq(ir_verify(v).len(), 0)
+}
+
+test "a shared Float rides the same word, because a cell is already pointer-wide" {
+    // sections/02_syntax.md:336 again: the size of the value decides whether a copy fits
+    // a word, and a shared binding is never copied, so the size question does not reach
+    // it. A boxed copy here would be a second cell nobody writes through.
+    setup()
+    let v = lower_capturing_cell("bump_float", "acc", TYPE_FLOAT)
+    if v < 0 || ices() != 0 { report_ices("bump_float was refused") }
+    assert(v >= 0)
+    assert_eq(ices(), 0)
+    assert_eq(ir_kid_count(v), 1)
+    assert(ir_kind(ir_kid(v, 0)) != IrKind.Box)
+    assert(ir_c_name(ir_kid(v, 0)).contains(c_cell_name("acc")))
+}
+
+test.failing(
+    "the thunk holds the same cell and writes through it",
+    reason: "the assignment target in a thunk body resolves through the same statement-stage lvalue path as a frame write, and that path does not spell a cell yet. The prologue half of this row holds",
+    ticket: "9va9y5",
+) {
+    // The thunk is its own C function, so the prologue is the only place the name can
+    // reach the cell. A prologue that bound a copy of the value would compile and drop
+    // every write the closure makes.
+    setup()
+    let v = lower_capturing_cell("bump_int", "total", TYPE_INT)
+    assert(v >= 0)
+    assert(cg_eff_thunk_open(0) >= 0)
+    let body = lower_block_returning(cg_eff_thunk_body_node(0))
+    cg_eff_thunk_close()
+    if body < 0 || ices() != 0 { report_ices("the thunk body did not lower") }
+    assert(body >= 0)
+    print_reset()
+    cg_eff_print_thunk(0, body)
+    let text = print_take()
+    assert_eq(ices(), 0)
+    assert(cg_text_occurrences(text, "int64_t* {c_cell_name("total")} =") == 1)
+    assert(cg_text_occurrences(text, "(*{c_cell_name("total")}) =") >= 1)
+    assert_eq(ir_verify(body).len(), 0)
+}
+
+test "the thunk reads the cell out of the capture word it was given" {
+    // The word and the prologue index the same position, so the pointer the prologue
+    // binds is the pointer the frame put in word 0 and not a fresh allocation.
+    setup()
+    let v = lower_capturing_cell("bump_int", "total", TYPE_INT)
+    assert(v >= 0)
+    assert(cg_eff_thunk_open(0) >= 0)
+    let body = lower_block_returning(cg_eff_thunk_body_node(0))
+    cg_eff_thunk_close()
+    print_reset()
+    cg_eff_print_thunk(0, body)
+    let text = print_take()
+    assert(cg_text_occurrences(text, "blink_closure_get_capture") == 1)
+    // The prologue takes the pointer as it stands. An unboxing read here would spell a
+    // deref of the word, read the cell's first bytes as the value, and write a copy.
+    assert_eq(cg_text_occurrences(text, "= (*("), 0)
+}

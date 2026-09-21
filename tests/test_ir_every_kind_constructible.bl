@@ -8,7 +8,7 @@ import ir.{
     ir_carrier_unwrap, ir_carrier_tag, ir_call_direct, ir_call_indirect, ir_call_closure,
     ir_call_virtual, ir_call_runtime, ir_closure_new, ir_sized_alloc, ir_effect_perform, ir_evidence_vector, ir_evidence_address,
     ir_handler_install,
-    ir_let, ir_assign, ir_expr_stmt, ir_return, ir_if, ir_loop, ir_break, ir_continue, ir_block,
+    ir_let, ir_cell_let, ir_cell_ref, ir_assign, ir_expr_stmt, ir_return, ir_if, ir_loop, ir_break, ir_continue, ir_block,
     ir_switch, ir_with_scope, ir_panic, ir_unreachable,
 }
 import layout.{SlotForm}
@@ -41,9 +41,9 @@ fn int_const(text: Str) -> Int { ir_const(1, 0, "int64_t", text) }
 fn int_var(name: Str) -> Int { ir_var_ref(1, 0, "int64_t", name, SlotForm.InlineWord) }
 
 
-test "the kind set is exactly the 43 kinds of the schema, each with a unique name" {
+test "the kind set is exactly the 45 kinds of the schema, each with a unique name" {
     let kinds = ir_all_kinds()
-    assert_eq_int("kind count", kinds.len(), 43)
+    assert_eq_int("kind count", kinds.len(), 45)
     let mut seen: Map[Str, Int] = Map()
     for k in kinds {
         let name = ir_kind_name(k)
@@ -57,14 +57,14 @@ test "the kind set is exactly the 43 kinds of the schema, each with a unique nam
     assert_eq_int("unknown name", match ir_kind_from_name("Nope") { Some(_k) => 1 None => 0 }, 0)
 }
 
-test "values and statements partition the kinds 28 to 15" {
+test "values and statements partition the kinds 29 to 16" {
     let mut values = 0
     let mut stmts = 0
     for k in ir_all_kinds() {
         if ir_kind_is_value(k) { values += 1 } else { stmts += 1 }
     }
-    assert_eq_int("values", values, 28)
-    assert_eq_int("statements", stmts, 15)
+    assert_eq_int("values", values, 29)
+    assert_eq_int("statements", stmts, 16)
     assert_eq_int("Const is a value", if ir_kind_is_value(IrKind.Const) { 1 } else { 0 }, 1)
     assert_eq_int("Block is a statement", if ir_kind_is_value(IrKind.Block) { 1 } else { 0 }, 0)
     assert_eq_int("Switch is a statement", if ir_kind_is_value(IrKind.Switch) { 1 } else { 0 }, 0)
@@ -78,6 +78,12 @@ test "every value kind is constructible with the documented kids and verifies" {
     assert_eq_int("Const tid", ir_tid(c), 1)
     let v = int_var("x")
     assert_kind(v, IrKind.VarRef, 0)
+    // A read of a shared mutable binding. It names the cell, not the source name, because
+    // the name the reader wrote spells the value and the cell is where the value lives.
+    let cref = ir_cell_ref(1, 0, "int64_t", "x", SlotForm.InlineWord)
+    assert_kind(cref, IrKind.CellRef, 0)
+    assert_eq_str("CellRef names the cell", ir_c_name(cref), "_cg_cell_x")
+    assert_eq_str("CellRef carries the value spelling", ir_c_spelling(cref), "int64_t")
     let g = ir_global_ref(1, 0, "int64_t", "counter", SlotForm.InlineWord)
     assert_kind(g, IrKind.GlobalRef, 0)
     let u = ir_unary(1, 0, "int64_t", "-", int_const("2"))
@@ -158,7 +164,15 @@ test "every statement kind is constructible with the documented kids and verifie
     assert_kind(l, IrKind.Let, 1)
     let l0 = ir_let(1, 0, "int64_t", "y", SlotForm.InlineWord, -1)
     assert_kind(l0, IrKind.Let, 0)
-    let a = ir_assign(0, int_var("x"), int_const("2"))
+    let clet = ir_cell_let(1, 0, "int64_t", "x", SlotForm.InlineWord, int_const("1"))
+    assert_kind(clet, IrKind.CellLet, 1)
+    // The declaration is the allocation, so the node is the pointer while its one kid is
+    // the value the cell is seeded with.
+    assert_eq_str("CellLet declares a pointer", ir_c_spelling(clet), "int64_t*")
+    assert_eq_str("CellLet names the cell", ir_c_name(clet), "_cg_cell_x")
+    let clet0 = ir_cell_let(1, 0, "int64_t", "y", SlotForm.InlineWord, -1)
+    assert_kind(clet0, IrKind.CellLet, 0)
+    let a = ir_assign(0, ir_cell_ref(1, 0, "int64_t", "x", SlotForm.InlineWord), int_const("2"))
     assert_kind(a, IrKind.Assign, 2)
     let obj = ir_var_ref(5, 0, "blink_Point*", "p", SlotForm.PointerBoxed)
     let fs = ir_field_set(0, "x", obj, int_const("3"))
@@ -195,8 +209,8 @@ test "every statement kind is constructible with the documented kids and verifie
     assert_kind(un, IrKind.Unreachable, 0)
     let hi = ir_handler_install(0, "metrics", ir_var_ref(11, 0, "blink_Metrics_vtable*", "h", SlotForm.InlineWord), ir_block(0, [r0]))
     assert_kind(hi, IrKind.HandlerInstall, 2)
-    let body = ir_block(0, [l, l0, lp, sw, sw0, ws, ws2, hi, pn, un, r])
-    assert_kind(body, IrKind.Block, 11)
+    let body = ir_block(0, [l, l0, clet, clet0, lp, sw, sw0, ws, ws2, hi, pn, un, r])
+    assert_kind(body, IrKind.Block, 13)
     assert_valid("statement tree", body)
 }
 
