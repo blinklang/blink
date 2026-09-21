@@ -1,0 +1,79 @@
+// A tuple has no declaration to carry @derive(Hash), so the key-table decision for a
+// tuple is made from its elements. Section 3.8 derives a tuple's Hash and its Eq from
+// them, which means a tuple keys a Map only when every element can be hashed: a List, a
+// Float and a struct that derives no Hash all leave the pair with no hash to derive.
+//
+// Layout is where that refusal belongs, because layout is what promises the table name.
+// A promise made for every spellable tuple has to be checked again by every reader, and
+// a reader that trusts it emits a reference to a table no stage can write.
+
+import lower_test_helpers.{probe, rhs_of, assert_eq_str}
+import layout.{Position, layout_of, lo_kops_decline_of, tid_of_node}
+
+// The decline reason for the tuple a `let` binds, read the way a keyed container reads
+// it: through the node's own recorded tid.
+fn decline_of_binder(name: Str) -> Str ! Diag.Report {
+    lo_kops_decline_of(tid_of_node(rhs_of(name)))
+}
+
+fn table_of_binder(name: Str) -> Str ! Diag.Report {
+    layout_of(tid_of_node(rhs_of(name)), Position.Param).kops_table
+}
+
+fn tuple_src() -> Str {
+    #"@derive(Hash, Eq)
+type TkKeyed { id: Int }
+
+type TkPlain { x: Int }
+
+fn main() {
+    let scalars = (1, "two")
+    let holds_list = (1, [2])
+    let holds_float = (1, 2.5)
+    let holds_plain = (1, TkPlain { x: 2 })
+    let holds_keyed = (1, TkKeyed { id: 2 })
+    let nested_bad = (1, (2, [3]))
+    let nested_ok = (1, (2, "three"))
+    assert(scalars.0 + holds_list.0 + holds_float.0 == 3)
+    assert(holds_plain.0 + holds_keyed.0 + nested_bad.0 + nested_ok.0 == 4)
+}
+"#
+}
+
+test "a tuple holding a List declines a key table and says which element refused" {
+    let _p = probe("layout_tuple_kops_list", tuple_src())
+    assert_eq_str("List element", decline_of_binder("holds_list"),
+        "tuple element 1: no key operations for kind List")
+    assert_eq_str("List element table", table_of_binder("holds_list"), "")
+}
+
+test "a tuple holding a Float declines a key table" {
+    let _p = probe("layout_tuple_kops_float", tuple_src())
+    assert_eq_str("Float element", decline_of_binder("holds_float"),
+        "tuple element 1: no key operations for kind Float")
+    assert_eq_str("Float element table", table_of_binder("holds_float"), "")
+}
+
+test "a tuple holding a struct that derives no Hash declines with that struct's reason" {
+    let _p = probe("layout_tuple_kops_plain", tuple_src())
+    assert_eq_str("no-Hash element", decline_of_binder("holds_plain"),
+        "tuple element 1: no Hash derive on TkPlain")
+    assert_eq_str("no-Hash element table", table_of_binder("holds_plain"), "")
+}
+
+test "an unhashable element inside a nested tuple declines the outer tuple too" {
+    let _p = probe("layout_tuple_kops_nested", tuple_src())
+    assert_eq_str("nested element", decline_of_binder("nested_bad"),
+        "tuple element 1: tuple element 1: no key operations for kind List")
+    assert_eq_str("nested element table", table_of_binder("nested_bad"), "")
+}
+
+test "a tuple whose elements can all be hashed keeps its key table" {
+    let _p = probe("layout_tuple_kops_ok", tuple_src())
+    assert_eq_str("scalars decline", decline_of_binder("scalars"), "")
+    assert(table_of_binder("scalars") != "")
+    assert_eq_str("keyed struct element decline", decline_of_binder("holds_keyed"), "")
+    assert(table_of_binder("holds_keyed") != "")
+    assert_eq_str("nested ok decline", decline_of_binder("nested_ok"), "")
+    assert(table_of_binder("nested_ok") != "")
+}
