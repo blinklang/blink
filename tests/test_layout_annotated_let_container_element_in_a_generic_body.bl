@@ -1,0 +1,115 @@
+// A keyed container's constructor chooses its key operations from the key type, so the
+// constructor node's own tid has to carry the key the program actually builds. Inside a
+// generic body the annotation is the only thing that says what the container holds:
+//
+//     fn fresh[K, V]() -> Map[K, V] {
+//         let mut r: Map[K, V] = Map()
+//         r
+//     }
+//
+// The rows read the key slot the way the constructor reads it -- through the instance's own
+// tid, then one slot down, then the key operations table on that slot's layout. A key that
+// answers no table is a key the constructor cannot build, whatever the source says.
+
+import lower_test_helpers.{probe, rhs_of, fn_decl_of, assert_eq_str}
+import layout.{
+    Position, Slot, child_tid, layout_of, layout_reset, set_current_inst, tid_of_node,
+}
+import mono.{instances, run_mono}
+import typecheck.{tc_type_str}
+
+// The instance numbers of one declaration, in table order. The stdlib graph instantiates
+// generic code of its own, so the table is filtered by the declaration itself.
+fn insts_of(decl: Int) -> List[Int] {
+    let table = instances()
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < table.len() {
+        if table.get(i).unwrap().base_decl_node == decl { out.push(i) }
+        i = i + 1
+    }
+    out
+}
+
+// The key operations table the container constructor at `let <binder> = ...` would read in
+// every instance of `fn_name`, joined so one row names each instance it saw. A slot with no
+// table renders as the slot's own type inside angle brackets, which is what a reader needs
+// to tell an un-substituted slot from a type that declines a table for a reason.
+fn key_tables(fn_name: Str, binder: Str, slot: Slot) -> Str ! Diag.Report {
+    let ctor = rhs_of(binder)
+    let mut out = ""
+    for row in insts_of(fn_decl_of(fn_name)) {
+        set_current_inst(row)
+        let key = child_tid(tid_of_node(ctor), slot)
+        let table = layout_of(key, Position.Local).kops_table
+        let said = if table == "" { "<{tc_type_str(key)}>" } else { table }
+        out = if out == "" { said } else { "{out} {said}" }
+        set_current_inst(-1)
+    }
+    out
+}
+
+test "a Map annotated with two type parameters carries its instance key" {
+    let program = probe("layout_generic_let_mapkv", #"fn fresh[K, V]() -> Map[K, V] {
+    let mut probe_kv: Map[K, V] = Map()
+    probe_kv
+}
+fn main() {
+    let _s: Map[Str, Int] = fresh()
+    let _i: Map[Int, Str] = fresh()
+}
+"#)
+    run_mono(program)
+    layout_reset()
+    assert_eq_str("Map[K, V] key per instance", key_tables("fresh", "probe_kv", Slot.Inner1),
+        "blink_kops_str blink_kops_i64")
+}
+
+test "a Map annotated with a concrete key and a type-parameter value keeps the key" {
+    let program = probe("layout_generic_let_mapintv", #"fn fresh[V]() -> Map[Int, V] {
+    let mut probe_intv: Map[Int, V] = Map()
+    probe_intv
+}
+fn main() {
+    let _s: Map[Int, Str] = fresh()
+}
+"#)
+    run_mono(program)
+    layout_reset()
+    assert_eq_str("Map[Int, V] key", key_tables("fresh", "probe_intv", Slot.Inner1),
+        "blink_kops_i64")
+}
+
+test "a Set annotated with a type parameter carries its instance element" {
+    let program = probe("layout_generic_let_sett", #"fn grow[T](x: T) -> Set[T] {
+    let mut probe_set: Set[T] = Set()
+    probe_set.insert(x)
+    probe_set
+}
+fn main() {
+    let _i = grow(1)
+    let _s = grow("s")
+}
+"#)
+    run_mono(program)
+    layout_reset()
+    assert_eq_str("Set[T] element per instance", key_tables("grow", "probe_set", Slot.Inner1),
+        "blink_kops_i64 blink_kops_str")
+}
+
+// The control: a concrete annotation in a monomorphic body already carried its key, so a
+// row above failing while this one passes says the defect is the type parameter in the
+// declared type and nothing else. A monomorphic body is its own single walk, which the
+// helper reads as the root rather than as an instance.
+test "a concrete Map in a monomorphic body carries its key" {
+    let program = probe("layout_concrete_let_map", #"fn main() {
+    let mut probe_concrete: Map[Str, Int] = Map()
+    probe_concrete.insert("a", 1)
+}
+"#)
+    run_mono(program)
+    layout_reset()
+    set_current_inst(-1)
+    let key = child_tid(tid_of_node(rhs_of("probe_concrete")), Slot.Inner1)
+    assert_eq_str("Map[Str, Int] key", layout_of(key, Position.Local).kops_table, "blink_kops_str")
+}

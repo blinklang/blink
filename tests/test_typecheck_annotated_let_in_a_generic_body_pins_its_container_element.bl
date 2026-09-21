@@ -1,0 +1,168 @@
+import std.fs
+import std.io
+import typecheck.{check_types, tc_lookup_node_tid, tc_tid_child, tc_tid_child_count, tc_type_str}
+import layout.{layout_of, layout_reset, Position}
+import parser.{nodes}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries}
+
+// An annotated let whose declared type names a type parameter -- `let mut r: Map[K, V] =
+// Map()` inside `fn f[K, V]()` -- left the constructor's own element slots unbound
+// metavariables. The declared type sat right there and the annotation is the only thing
+// that says what the container holds, so nothing else could ever fill them: the
+// metavariables reach codegen unbound, and a container constructor chooses its key
+// operations from the key type.
+//
+// The rows read the decline layout reports, because that is the reading codegen makes: an
+// UNBOUND METAVARIABLE is the defect, while a FREE TYPE VARIABLE is the correct answer
+// inside a generic body and becomes concrete through monomorphisation.
+//
+// A container's own layout is one pointer whatever it holds, so the defect never shows on
+// the constructor node's own type -- it shows one slot down, which is where the constructor
+// reads the key operations from. The walk therefore descends every slot of every typed
+// node rather than reading the node's own answer alone.
+
+// The worst decline anywhere in `tid` or under it, or "" when every slot has a layout.
+fn decline_under(tid: Int, depth: Int) -> Str {
+    if tid < 0 || depth > 8 { return "" }
+    if layout_of(tid, Position.Local).decline_reason == "unbound metavariable" {
+        return tc_type_str(tid)
+    }
+    let n = tc_tid_child_count(tid)
+    let mut i = 0
+    while i < n {
+        let under = decline_under(tc_tid_child(tid, i), depth + 1)
+        if under != "" { return under }
+        i = i + 1
+    }
+    ""
+}
+
+fn probe(name: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/tc_generic_let_pin_{name}.bl"
+    write_file(path, src)
+    // `nodes` is a whole-process table, so one probe's nodes stay behind for the next one.
+    // The rows below each answer about their own source, which is the nodes this call adds.
+    let first = nodes.len()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    let mut worst = ""
+    let mut idx = first
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 {
+            let under = decline_under(tid, 0)
+            if under != "" {
+                if worst == "" { worst = "{tc_type_str(tid)} (slot {under})" }
+            }
+        }
+        idx = idx + 1
+    }
+    worst
+}
+
+fn assert_no_unbound(label: Str, name: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let worst = probe(name, src)
+    if worst != "" {
+        io.println("FAIL: {label}: a node still has no layout, rendered '{worst}'")
+    }
+    assert_eq(worst, "")
+}
+
+test "an annotated let pins a type-parameter Map key inside a generic body" {
+    assert_no_unbound("Map[K, V]", "mapkv", #"
+fn fresh[K, V]() -> Map[K, V] {
+    let mut r: Map[K, V] = Map()
+    r
+}
+fn main() { let m: Map[Str, Int] = fresh() assert(m.len() == 0) }
+"#)
+}
+
+test "an annotated let pins a type-parameter Map value inside a generic body" {
+    assert_no_unbound("Map[Int, V]", "mapval", #"
+fn fresh[V]() -> Map[Int, V] {
+    let mut r: Map[Int, V] = Map()
+    r
+}
+fn main() { let m: Map[Int, Str] = fresh() assert(m.len() == 0) }
+"#)
+}
+
+test "an annotated let pins a type-parameter Set element inside a generic body" {
+    assert_no_unbound("Set[T]", "setelem", #"
+fn grow[T](x: T) -> Set[T] {
+    let mut s: Set[T] = Set()
+    s.insert(x)
+    s
+}
+fn main() { assert(grow(3).len() == 1) }
+"#)
+}
+
+// The type parameter reached through a container the annotation also names, so the pin has
+// to descend the declared type rather than match its head alone.
+test "an annotated let pins a type parameter nested under the declared element" {
+    assert_no_unbound("Map[Str, List[T]]", "nested", #"
+fn fresh[T]() -> Map[Str, List[T]] {
+    let mut r: Map[Str, List[T]] = Map()
+    r
+}
+fn main() { let m: Map[Str, List[Int]] = fresh() assert(m.len() == 0) }
+"#)
+}
+
+// A carrier annotation names one slot and the value fills the other. Inside a generic body
+// the named slot is a type parameter, which is the same shape as the containers above.
+test "an annotated let pins a type-parameter Option payload inside a generic body" {
+    assert_no_unbound("Option[T]", "optpayload", #"
+fn nothing[T]() -> Option[T] {
+    let o: Option[T] = None
+    o
+}
+fn main() { let x: Option[Int] = nothing() assert(x.is_none()) }
+"#)
+}
+
+// The shape that always worked, kept as the control: a fully concrete annotation pins the
+// same constructor, so a row above failing while this one passes says the defect is the
+// type parameter in the declared type and nothing else.
+test "a concrete annotated let still pins its container element" {
+    assert_no_unbound("Map[Str, Int]", "concrete", #"
+fn main() {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    assert(m.len() == 1)
+}
+"#)
+}
+
+// The excluded case, pinned so the widened pin cannot quietly reach it. A concrete element
+// that derives no Hash has no key-operations table and never will, and that is a typecheck
+// diagnostic naming the rule. Turning it into a pin would move the report to the C
+// compiler, which is the failure mode the exclusion exists to prevent.
+test "a concrete element that derives no Hash still reports the rule" {
+    let path = "build/tc_generic_let_pin_nohash.bl"
+    write_file(path, #"
+type QB { id: Int }
+fn main() {
+    let s: Set[QB] = Set()
+    assert(s.len() == 0)
+}
+"#)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    let mut named = 0
+    for d in diag_entries {
+        if d.name == "MapKeyNotHashable" { named = named + 1 }
+    }
+    if named == 0 {
+        io.println("FAIL: a Set element deriving no Hash was accepted with no rule named")
+    }
+    assert(named > 0)
+}

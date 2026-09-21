@@ -2541,6 +2541,28 @@ fn tc_report_under_determined_at(scrut: Int, scrut_tid: Int) ! Diag.Report {
 // only fresh per-binding metavars from make_metavar ever get pinned.
 // pub so the fail-closed range guards below can be driven directly; no surface program
 // reaches them, the same reason type_merge is pub.
+// Set only while a declared annotation is being pinned onto an under-determined value
+// (tc_pin_tail_ret_generic). It licenses ONE extra bind in tc_unify: a bare type parameter
+// of the enclosing declaration standing against the value's metavariable. Everywhere else a
+// typevar still unifies vacuously.
+let mut tc_pin_tparam_binds: Int = 0
+
+// Whether this typevar is a type parameter the DECLARATION NOW BEING CHECKED binds, by
+// binder node and not by spelling. That is what makes `a := T` a determination rather than
+// a loss: the monomorphisation pass substitutes this declaration's own parameters once per
+// instance of its body, so a slot holding T becomes concrete in every body that is lowered,
+// while a body no instance reaches is never lowered at all. A same-spelled parameter of
+// another declaration is a different type and is substituted by nothing here, so it answers
+// 0 and keeps the vacuous unify.
+fn tc_typevar_binds_here(tid0: Int) -> Int {
+    let tid = tc_resolve(tid0)
+    if tid < 0 || tid >= ty_pool.len() { return 0 }
+    let e = ty_pool.get(tid).unwrap()
+    if e.kind != TyKind.Typevar { return 0 }
+    if tc_active_binder_node(e.name) != e.inner1 { return 0 }
+    1
+}
+
 pub fn tc_unify(a0: Int, b0: Int) -> Int {
     let a = tc_resolve(a0)
     let b = tc_resolve(b0)
@@ -2557,7 +2579,16 @@ pub fn tc_unify(a0: Int, b0: Int) -> Int {
     if a == TYPE_UNKNOWN || b == TYPE_UNKNOWN { return 1 }
     let ka0 = ty_pool.get(a).unwrap().kind
     let kb0 = ty_pool.get(b).unwrap().kind
-    if ka0 == TyKind.Typevar || kb0 == TyKind.Typevar { return 1 }
+    if ka0 == TyKind.Typevar || kb0 == TyKind.Typevar {
+        if tc_pin_tparam_binds == 0 { return 1 }
+        if ka0 == TyKind.Typevar && tc_typevar_binds_here(a) != 0 && tc_is_unbound_metavar(b) != 0 {
+            return bind_metavar(b, a)
+        }
+        if kb0 == TyKind.Typevar && tc_typevar_binds_here(b) != 0 && tc_is_unbound_metavar(a) != 0 {
+            return bind_metavar(a, b)
+        }
+        return 1
+    }
     // Unbound metavar on either side: pin it to the other side.
     if tc_is_unbound_metavar(a) != 0 { return bind_metavar(a, b) }
     if tc_is_unbound_metavar(b) != 0 { return bind_metavar(b, a) }
@@ -3142,7 +3173,12 @@ fn lookup_fnsig(name: Str) -> Int {
 // carries concrete elements. A kind with no embedded typevar — or an unbound
 // typevar — is returned unchanged; a new pool entry is allocated only when a
 // child actually changes (avoids ty_pool churn).
-pub fn substitute_typevar_tid(t: Int, binds: Map[Str, Int]) -> Int {
+pub fn substitute_typevar_tid(t0: Int, binds: Map[Str, Int]) -> Int {
+    // A metavariable inference already bound IS the type it was bound to, so it is resolved
+    // before the kind is read. A slot holding a metavar bound to a type parameter is a slot
+    // this substitution must replace; reading the metavar's own kind instead leaves the
+    // parameter standing in the instance type, and the instance is the one place it cannot.
+    let t = tc_resolve(t0)
     if t < 0 || t >= ty_pool.len() { return t }
     let e = ty_pool.get(t).unwrap()
     let k = e.kind
@@ -3688,7 +3724,7 @@ fn tc_pin_ok_for_declared(val: Int, declared_tid: Int) -> Int {
     if tc_node_has_ret_mint(val) != 0 { return 1 }
     let dk = type_kind(resolve_alias_tid(declared_tid))
     if dk == TyKind.Map || dk == TyKind.Set || dk == TyKind.Option || dk == TyKind.Result {
-        if tc_tid_has_bare_typevar(declared_tid) == 0 { return 1 }
+        return 1
     }
     0
 }
@@ -3892,7 +3928,12 @@ fn tc_pin_tail_ret_generic(declared_ret: Int, inferred_ret: Int) {
     if dbg_channel_on("retpin") != 0 {
         dbg_trace("retpin", "pin declared={type_to_str(d)} inferred={type_to_str(inferred_ret)}")
     }
+    // The declared type is written in the body being checked, so a type parameter in it is
+    // one this body's own instances substitute. Nothing else in typecheck may bind a
+    // metavariable to a typevar, which is why the licence is held for this call alone.
+    tc_pin_tparam_binds = 1
     let _ = tc_unify(d, inferred_ret)
+    tc_pin_tparam_binds = 0
 }
 
 // The value node an if/match ARM BODY reduces to: a Block yields its tail value, a
@@ -19288,11 +19329,16 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 //     BLINK_COMPILER_BUG_kops. That program's hazard is real and pre-existing
                 //     (the annotation-only hashability validators); revealing it here would
                 //     report it as a C compile error instead of a diagnostic.
-                //   • No bare typevar. `let m: Map[K, V] = Map()` inside `fn f[K, V]()` must
-                //     not be pinned: `α := K` trades a hole monomorphization can still fill
-                //     for one nothing can (tc_tid_has_bare_typevar), and it emitted
-                //     BLINK_COMPILER_BUG_kops_unsupported_K_ct23_ — the kops selector had been
-                //     recovering the concrete key from the instantiation.
+                //   • A bare type parameter of THIS declaration is pinned too. `let m: Map[K, V]
+                //     = Map()` inside `fn f[K, V]()` gets `α := K`, which is not the loss it
+                //     reads as: monomorphization substitutes f's own parameters once per
+                //     instance of f's body, and a body no instance reaches is never lowered.
+                //     Refusing the pin left the ctor at `Map[α, β]` with both metavars
+                //     unbound, which is the one hole nothing downstream can fill -- the key
+                //     type chooses the container's key operations, and an unbound key answers
+                //     no table. tc_unify holds the licence for this one call and keys it on the
+                //     binder node, so a same-spelled parameter of another declaration still
+                //     unifies vacuously.
                 //
                 // An alias key needs no gate: resolve_type_parts now peels a transparent
                 // `type Port = Int` at the tid leaf, so `Map[Port, Int]` already carries Int
