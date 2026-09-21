@@ -9,7 +9,10 @@
 // empty string. Every caller must therefore read diag_ice_count before it uses the
 // result, or an unbuilt stage looks like a program that legitimately emits nothing.
 
-import diagnostics.{Diag, diag_ice_at, diag_ice_stage_not_built, UNSOLVED_TYPEVAR_AT_CODEGEN}
+import diagnostics.{
+    Diag, diag_ice_at, diag_ice_count, diag_ice_stage_not_built, UNSOLVED_TYPEVAR_AT_CODEGEN,
+    UNVERIFIED_IR_AT_PRINT,
+}
 import cname.{
     c_archive_header_guard, c_module_header_guard, c_module_init_globals_name,
     c_string_literal, c_test_fn_name,
@@ -37,7 +40,7 @@ import cg_decl.{
     cg_decl_emit_prologue, cg_decl_emit_typedefs, cg_decl_has_deferred_global, cg_decl_reset,
 }
 import cg_derive.{cg_derive_emit_bodies, cg_derive_emit_decls, cg_derive_reset}
-import ir.{ir_block}
+import ir.{ir_block, ir_verify}
 import mono.{instances}
 import typecheck.{TYPE_VOID, TyKind, tc_resolve, tc_tid_kind}
 import cg_stmt.{
@@ -196,7 +199,7 @@ fn lower_global_inits(globals: List[Int]) -> Map[Int, Int] ! Diag.Report {
     for g in globals {
         let init = node_value(g)
         if init < 0 { continue }
-        out.insert(g, lower_global_init(init))
+        out.insert(g, verify_lowered_unit(lower_global_init(init), g))
     }
     out
 }
@@ -335,6 +338,32 @@ fn emit_bodies(cfg: CgConfig, decls: List[Int]) ! Diag.Report {
     }
 }
 
+// One lowered unit, checked before the printer reads it. The printer reads a tree by
+// position: it takes each part to be what its place says it is and writes the C for it,
+// so a defect lowering left behind becomes C that neither the C compiler nor a reader of
+// the output can tell is wrong. Every tree this driver hands to the printer comes through
+// here, and the answer is the tree itself so a caller cannot take the shortcut of
+// printing the tree it already has.
+//
+// The shape form, not the frame form: a body reads its parameters and the globals of
+// every module it imports, and this stage enumerates neither, so the scope rule would
+// report a name that is in fact declared.
+//
+// Nothing is checked once a stage has reported. A stage that stopped answered a tree it
+// never finished, and that tree failing the shape rules is the consequence of the failure
+// already named rather than a second fault -- which is the same count every caller of
+// this driver reads before it uses the output at all.
+pub fn verify_lowered_unit(root: Int, at_node: Int) -> Int ! Diag.Report {
+    if diag_ice_count > 0 { return root }
+    let problems = ir_verify(root)
+    if problems.len() > 0 {
+        diag_ice_at("UnverifiedIrAtPrint", UNVERIFIED_IR_AT_PRINT,
+            "lowering produced a tree the verifier refuses: {problems.get(0).unwrap()}", at_node,
+            "every tree the printer reads must verify; this is a compiler bug")
+    }
+    root
+}
+
 // One body, with every closure it queued defined ahead of it. The thunks print before the
 // body that names them because C reads a name only after its definition, and they print
 // under the same mono instance the body was lowered under, because a thunk's types are
@@ -361,7 +390,7 @@ fn lower_body(decl: Int) -> Int ! Diag.Report {
         cg_eff_print_thunk(k, bodies.get(k).unwrap())
     }
     cg_eff_thunks_drained(bodies.len())
-    body
+    verify_lowered_unit(body, decl)
 }
 
 // One thunk's body, lowered against the closure's own result, which decides two things a
@@ -395,7 +424,7 @@ fn lower_thunk_body(n: Int) -> Int ! Diag.Report {
         lower_block_returning(body_node)
     }
     cg_expr_set_return_type(-1)
-    body
+    verify_lowered_unit(body, body_node)
 }
 
 // The definition half. Test blocks are not here: they are written beside the entry shim,
@@ -516,7 +545,7 @@ fn emit_global_init_fn(deferred: List[Int]) -> List[Str] ! Diag.Report {
     if deferred.len() == 0 { return [] }
     let name = "__blink_init_globals"
     let span = cg_reg_global_decls().get(0).unwrap()
-    print_test_fn(name, ir_block(span, deferred))
+    print_test_fn(name, verify_lowered_unit(ir_block(span, deferred), span))
     [name]
 }
 
@@ -596,7 +625,8 @@ pub fn generate_module_object(program: Int, module_key: Str, self_header: Str, c
     let deferred = cg_decl_emit_globals(false, own_globals, inits)
     if deferred.len() > 0 {
         let span = own_globals.get(0).unwrap()
-        print_fn(false, layout_of(TYPE_VOID, Position.Return).c_spelling, c_module_init_globals_name(module_key), [], false, ir_block(span, deferred))
+        let init_body = verify_lowered_unit(ir_block(span, deferred), span)
+        print_fn(false, layout_of(TYPE_VOID, Position.Return).c_spelling, c_module_init_globals_name(module_key), [], false, init_body)
     }
     print_scope_restore_support()
     cg_eff_register_ffi_scope_guard_support()
