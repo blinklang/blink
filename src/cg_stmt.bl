@@ -25,8 +25,8 @@ import typecheck.{
 }
 import layout.{
     Position, Slot, SlotForm, LayoutRecord, bind_binder, bind_binder_mut, binder_scope_pop, binder_scope_push,
-    child_tid, ensure_typedef_for, layout_of, tid_holds_tag_member, tid_of_binder, tid_of_node,
-    varargs_spelling,
+    carrier_member_layout, child_tid, ensure_typedef_for, layout_of, tid_holds_tag_member, tid_of_binder,
+    tid_of_node, varargs_spelling,
 }
 import cname.{
     c_assert_fail_eq_name, c_assert_fail_intro_name, c_assert_fail_name,
@@ -36,7 +36,7 @@ import cname.{
 }
 import ir.{
     IrKind, ir_assign, ir_binary, ir_block, ir_break, ir_call_runtime, ir_carrier_tag,
-    ir_carrier_unwrap, ir_cast, ir_const, ir_continue, ir_expr_stmt, ir_field_get,
+    ir_cast, ir_const, ir_continue, ir_expr_stmt, ir_field_get,
     ir_global_ref, ir_if, ir_kind, ir_let, ir_loop, ir_mark_materialize, ir_return, ir_span,
     ir_switch, ir_unary, ir_unreachable, ir_var_ref, ir_with_scope,
 }
@@ -48,7 +48,7 @@ import cg_expr.{
     cg_expr_drain_pending, cg_expr_drop_values, cg_expr_is_registered, cg_expr_pending_count,
     cg_expr_push_pending, cg_expr_register_value, cg_expr_set_return_type,
     cg_expr_take_pending, cg_expr_value_count, lower_expr,
-    x_layout_checked, x_stopped,
+    x_layout_checked, x_stopped, x_unbox_payload,
 }
 import cg_eff.{cg_eff_lower_handler_install, cg_eff_resource_cleanup}
 import cg_call.{
@@ -2088,20 +2088,37 @@ fn newtype_payload_bind(ctx: MatchCtx, flds: Int, out: List[Int]) -> Bool ! Diag
     bind_slot(sub, ir_cast(tid, sub, rec.c_spelling, scrut_ref(ctx, sub)), out)
 }
 
+// The binder's own Local layout (`held`) says what the `Let` declares; the carrier's
+// member layout (`member`) says what the carrier actually stores there. They agree
+// whenever the payload is word-sized, and disagree whenever layout boxed the member --
+// x_unbox_payload is the shared tail every other carrier reader uses to reconcile the two,
+// unwrapping through the pointer when `member.slot_form` says PointerBoxed.
 fn carrier_payload_bind(ctx: MatchCtx, vname: Str, flds: Int, out: List[Int]) -> Bool ! Diag.Report {
     let sub = sublist_get(flds, 0)
     let tid = stmt_tid(sub)
     if tid < 0 { return !sub_pattern_declares(sub) }
-    let rec = layout_at(tid, Position.Local, sub)
-    let member = carrier_member(vname)
-    bind_slot(sub, ir_carrier_unwrap(tid, sub, rec.c_spelling, member, rec.slot_form,
-        scrut_ref(ctx, sub)), out)
+    let held = layout_at(tid, Position.Local, sub)
+    let member = carrier_member_layout_at(ctx.tid, carrier_slot(vname), sub)
+    bind_slot(sub, x_unbox_payload(tid, sub, scrut_ref(ctx, sub), member, held,
+        carrier_member(vname)), out)
 }
 
 fn carrier_member(vname: Str) -> Str {
     if vname == VARIANT_OK { return CARRIER_OK }
     if vname == VARIANT_ERR { return CARRIER_ERR }
     STMT_CARRIER_VALUE
+}
+
+// Option has one payload slot; a Result's Ok arm shares that same slot and its Err arm
+// takes the other, the same split cg_call.bl's cc_read_slot makes for a carrier read.
+fn carrier_slot(vname: Str) -> Slot {
+    if vname == VARIANT_ERR { return Slot.Inner2 }
+    Slot.Inner1
+}
+
+fn carrier_member_layout_at(carrier_tid: Int, slot: Slot, node: Int) -> LayoutRecord ! Diag.Report {
+    x_layout_checked(carrier_member_layout(carrier_tid, slot), node, "LayoutDeclined",
+        "carrier {carrier_tid} has no such member", "layout answers every carrier member codegen reads; this is a compiler bug")
 }
 
 // The member name comes from the declaration's own field node, named or synthesized,
