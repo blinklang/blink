@@ -16,7 +16,7 @@
 // diag_is_ice_seg can still detect it.
 
 import typecheck.{
-    TAGPOS_INNER, TAGPOS_SYMBOL, TAGPOS_TOP, TyKind, TypePoolEntry, tc_resolve,
+    TAGPOS_INNER, TAGPOS_SYMBOL, TAGPOS_SYMBOL_INNER, TAGPOS_TOP, TyKind, TypePoolEntry, tc_resolve,
     tc_resolve_transparent_alias_name, tc_tid_decl_node, DECL_NODE_AMBIGUOUS, ty_param_list, ty_pool,
     tc_tid_handler_effect, tc_handler_effect_root, is_user_effect_handle_name,
     sanitize_test_name, tc_enum_has_payload,
@@ -434,39 +434,70 @@ fn seg_at(tid0: Int, tagpos: Int) -> Str {
     // One blink_map* serves every key/value pair, so K and V do not ride the name. They
     // are still walked so an unsolved slot fails closed instead of spelling "map".
     if k == TyKind.Map {
-        if tagpos == TAGPOS_TOP { return "Map" }
+        if !keeps_elements(tagpos) {
+            if tagpos == TAGPOS_TOP { return "Map" }
+            return "map"
+        }
         let key = seg_at(t.inner1, sub)
         if diag_is_ice_seg(key) { return key }
         let val = seg_at(t.inner2, sub)
         if diag_is_ice_seg(val) { return val }
-        if tagpos == TAGPOS_SYMBOL { return "map_{key}_{val}" }
-        return "map"
+        return "{map_base(tagpos)}_{key}_{val}"
     }
-    if tagpos == TAGPOS_SYMBOL { return container_symbol_seg(t, k, sub) }
-    if tagpos == TAGPOS_TOP { return scalar_top(k) }
-    scalar_inner(k)
+    let base = if top_cased(tagpos) { scalar_top(k) } else { scalar_inner(k) }
+    if diag_is_ice_seg(base) { return base }
+    if !keeps_elements(tagpos) || !erases_its_element(k) { return base }
+    let elem = seg_at(t.inner1, sub)
+    if diag_is_ice_seg(elem) { return elem }
+    "{base}_{elem}"
 }
 
-// The position a compound's children are spelled at. A symbol stays a symbol all the way
-// down: a Map nested inside a List is exactly the pair of instances the outer erasure
-// would merge, so the rule cannot stop at depth one. Every other position keeps its
-// existing asymmetry, where TOP is the outermost tag and everything under it is INNER.
+// The position a compound's children are spelled at. The two existing positions keep
+// their asymmetry, where TOP is the outermost tag and everything under it is INNER. A
+// symbol keeps its width all the way down, because a Map nested inside a List is exactly
+// the pair of instances the outer erasure would merge, so the rule cannot stop at depth
+// one -- but it drops to the inner CASE at depth one, the same as TOP does.
 fn child_pos(tagpos: Int) -> Int {
-    if tagpos == TAGPOS_SYMBOL { return TAGPOS_SYMBOL }
+    if keeps_elements(tagpos) { return TAGPOS_SYMBOL_INNER }
     TAGPOS_INNER
 }
 
-// A single-element erased container at the symbol position. The base tag is the same
-// lowercase word the C type uses, so the symbol reads as the erased carrier it is, with
-// the element it was instantiated at appended. A kind with no element falls through to
-// the shared scalar spelling, which is already injective for it.
-fn container_symbol_seg(t: TypePoolEntry, k: TyKind, sub: Int) -> Str {
-    if k != TyKind.List && k != TyKind.Set && k != TyKind.Iterator && k != TyKind.Channel {
-        if k != TyKind.Handle && k != TyKind.Ptr { return scalar_inner(k) }
-    }
-    let elem = seg_at(t.inner1, sub)
-    if diag_is_ice_seg(elem) { return elem }
-    "{scalar_inner(k)}_{elem}"
+// Whether this position spells the element an erased container loses in its C type. Only
+// a symbol does. One blink_list* serves every element, which is a saving a TYPE name is
+// entitled to and a symbol is not: the symbol IS the definition, so two instances that
+// spell one name are one function defined twice and the unit stops compiling.
+fn keeps_elements(tagpos: Int) -> Bool {
+    tagpos == TAGPOS_SYMBOL || tagpos == TAGPOS_SYMBOL_INNER
+}
+
+// Whether this position spells a scalar capitalised. Case belongs to the DEPTH, not to
+// what the name is being built for, so the two symbol positions borrow it from the two
+// they mirror. This is what keeps every name that already exists spelled as it is.
+fn top_cased(tagpos: Int) -> Bool {
+    tagpos == TAGPOS_TOP || tagpos == TAGPOS_SYMBOL
+}
+
+fn map_base(tagpos: Int) -> Str {
+    if top_cased(tagpos) { return "Map" }
+    "map"
+}
+
+// The kinds that hold one element type and lose it in the C type. Each is one C shape
+// for every element, which is what TOP is entitled to drop and a symbol is not.
+fn erases_its_element(k: TyKind) -> Bool {
+    if k == TyKind.List || k == TyKind.Set || k == TyKind.Iterator { return true }
+    k == TyKind.Channel || k == TyKind.Handle || k == TyKind.Ptr
+}
+
+// The position a nominal instance spells its own mono arguments at. That stem has always
+// been built at TOP -- `Box[Int]` is `Box_0Int` wherever the tag appears -- so the
+// position the tag itself sits in must not reach the arguments. A symbol is the one
+// exception, and it reaches them at full width whatever depth the tag sits at, because a
+// `Holder[Map[Str, Int]]` argument is the same collision one level in and the stem is the
+// only place the instance can be told apart.
+fn mono_pos(tagpos: Int) -> Int {
+    if keeps_elements(tagpos) { return TAGPOS_SYMBOL }
+    TAGPOS_TOP
 }
 
 // A bare struct spells its full tag, and an instance its mono stem, at BOTH positions.
@@ -474,7 +505,7 @@ fn container_symbol_seg(t: TypePoolEntry, k: TyKind, sub: Int) -> Str {
 // so a struct that drops its module at TOP and keeps it inside a carrier gives two answers
 // to one question and lets two modules' namesakes share a symbol.
 fn struct_seg(t: TypePoolEntry, tid: Int, tagpos: Int) -> Str {
-    let stem = struct_instance_stem(t, tid, tagpos)
+    let stem = struct_instance_stem(t, tid, mono_pos(tagpos))
     if stem != "" { return stem }
     let underlying = tc_resolve_transparent_alias_name(t.name)
     if underlying != -1 { return seg_at(underlying, tagpos) }
