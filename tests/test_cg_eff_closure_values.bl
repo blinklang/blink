@@ -16,7 +16,9 @@
 
 import typecheck.{TYPE_INT}
 import cname_test_helpers.{find_decl, assert_eq_str}
-import cg_test_helpers.{cg_probe_compile}
+import cg_test_helpers.{
+    cg_ice_count, cg_ices_mentioning, cg_probe_compile, cg_report_ices,
+}
 import ast.{NodeKind}
 import parser.{node_value}
 import layout.{bind_binder_mut, binder_scope_pop, binder_scope_push, current_binder_scope, layout_reset, tid_of_binder}
@@ -29,7 +31,7 @@ import cg_eff.{
     cg_eff_thunk_close, cg_eff_thunk_open, cg_eff_thunk_params, cg_eff_thunk_ret,
     cg_eff_thunk_symbol, cg_eff_thunks_drained,
 }
-import diagnostics.{diag_entries, diag_reset}
+import diagnostics.{diag_reset}
 import std.fs
 import std.io
 
@@ -139,28 +141,6 @@ fn main() {
 "#
 }
 
-fn ices() -> Int {
-    let mut n = 0
-    for d in diag_entries {
-        if d.severity == "ice" { n = n + 1 }
-    }
-    n
-}
-
-fn ices_mentioning(text: Str) -> Int {
-    let mut n = 0
-    for d in diag_entries {
-        if d.severity == "ice" && d.message.contains(text) { n = n + 1 }
-    }
-    n
-}
-
-fn report_ices() {
-    for d in diag_entries {
-        if d.severity == "ice" { io.println("  ICE {d.code} {d.message}") }
-    }
-}
-
 // The probe is compiled once per test: the registry, the binder frames and the
 // diagnostics list are process globals, so a test reading another test's leftovers would
 // not be reading its own.
@@ -178,7 +158,12 @@ fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete
     diag_reset()
 }
 
-// The closure literal a `let` of this name is initialized with.
+// The closure literal a `let` of this name is initialized with. Every closure probe reads
+// its subject this way, out of a binding the probe source really wrote, rather than out of
+// a node the test built for itself. It is not in cg_test_helpers because that harness would
+// then import cname_test_helpers for find_decl, and a name reachable through an import of
+// an import counts as in scope, which makes assert_eq_str ambiguous in every suite file
+// that also imports lower_test_helpers.
 fn closure_of(let_name: Str) -> Int {
     let binding = find_decl(NodeKind.LetBinding, let_name, "")
     assert(binding >= 0)
@@ -198,12 +183,12 @@ fn lower_under(let_name: Str, names: List[Str]) -> Int ! Diag.Report {
 
 fn assert_no_capture(let_name: Str, names: List[Str]) ! Diag.Report {
     let v = lower_under(let_name, names)
-    if v < 0 || ices() != 0 {
+    if v < 0 || cg_ice_count() != 0 {
         io.println("FAIL: {let_name} reported a capture it does not have:")
-        report_ices()
+        cg_report_ices("the closure reported")
     }
     assert(v >= 0)
-    assert_eq(ices(), 0)
+    assert_eq(cg_ice_count(), 0)
     // A capture word is what a capture becomes, so counting the words is what keeps these
     // rows honest now that a real capture builds instead of being refused.
     assert_eq(ir_kid_count(v), 0)
@@ -215,7 +200,7 @@ test "a closure that captures nothing lowers to a closure record with no capture
     assert(v >= 0)
     assert(ir_kind(v) == IrKind.ClosureNew)
     assert_eq(ir_kid_count(v), 0)
-    assert_eq(ices(), 0)
+    assert_eq(cg_ice_count(), 0)
 }
 
 test "each closure literal is queued as a thunk under its own symbol" {
@@ -252,7 +237,7 @@ test "a queue is not drained until every queued thunk was printed" {
     let _ = cg_eff_lower_closure(closure_of("g_local"))
     cg_eff_thunks_drained(1)
     assert_eq(cg_eff_pending_thunks(), 2)
-    assert(ices_mentioning("queued") > 0)
+    assert(cg_ices_mentioning("queued") > 0)
 }
 
 test "the queued thunk carries the closure's own body" {
@@ -287,7 +272,7 @@ test "a thunk frame is never opened inside another function's frame" {
     let scope = cg_eff_thunk_open(0)
     binder_scope_pop()
     assert_eq(scope, -1)
-    assert(ices_mentioning("frame") > 0)
+    assert(cg_ices_mentioning("frame") > 0)
 }
 
 test "the thunk body lowers with its parameters in scope" {
@@ -297,13 +282,13 @@ test "the thunk body lowers with its parameters in scope" {
     assert(scope >= 0)
     let body = lower_block_returning(cg_eff_thunk_body_node(0))
     cg_eff_thunk_close()
-    if body < 0 || ices() != 0 {
+    if body < 0 || cg_ice_count() != 0 {
         io.println("FAIL: the thunk body did not lower:")
-        report_ices()
+        cg_report_ices("the thunk body reported")
     }
     assert(body >= 0)
     assert_eq(ir_verify(body).len(), 0)
-    assert_eq(ices(), 0)
+    assert_eq(cg_ice_count(), 0)
 }
 
 test "a thunk body that binds its own local lowers inside the thunk frame" {
@@ -312,20 +297,20 @@ test "a thunk body that binds its own local lowers inside the thunk frame" {
     assert(cg_eff_thunk_open(0) >= 0)
     let body = lower_block_returning(cg_eff_thunk_body_node(0))
     cg_eff_thunk_close()
-    if body < 0 || ices() != 0 {
+    if body < 0 || cg_ice_count() != 0 {
         io.println("FAIL: the thunk body did not lower:")
-        report_ices()
+        cg_report_ices("the thunk body reported")
     }
     assert(body >= 0)
     assert_eq(ir_verify(body).len(), 0)
-    assert_eq(ices(), 0)
+    assert_eq(cg_ice_count(), 0)
     assert_eq(current_binder_scope(), -1)
 }
 
 test "closing a thunk that is not open is a driver error" {
     setup()
     cg_eff_thunk_close()
-    assert(ices_mentioning("none is open") > 0)
+    assert(cg_ices_mentioning("none is open") > 0)
 }
 
 test "closing a thunk under a frame its body left open is a driver error" {
@@ -335,7 +320,7 @@ test "closing a thunk under a frame its body left open is a driver error" {
     assert(scope >= 0)
     let inner = binder_scope_push()
     cg_eff_thunk_close()
-    assert(ices_mentioning("still open") > 0)
+    assert(cg_ices_mentioning("still open") > 0)
     // The thunk's frame was not taken: the inner frame is still the top.
     assert_eq(current_binder_scope(), inner)
     binder_scope_pop()
@@ -400,7 +385,7 @@ test "a closure that reads a local of its enclosing function captures it" {
     let v = lower_under("g_cap", ["n"])
     assert(v >= 0)
     assert_eq(ir_kid_count(v), 1)
-    assert_eq(ices(), 0)
+    assert_eq(cg_ice_count(), 0)
 }
 
 test "a string chunk spelled like an enclosing local is not a capture" {
