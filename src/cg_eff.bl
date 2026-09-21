@@ -11,7 +11,7 @@
 import ast.{NodeKind, nk_of}
 import parser.{
     is_literal_string_part, node_args, node_body, node_elements, node_for_binder, node_guard, node_handlers,
-    node_iterable, node_kind, node_method, node_methods, node_name, node_obj, node_params, node_pattern,
+    node_is_mut, node_iterable, node_kind, node_method, node_methods, node_name, node_obj, node_params, node_pattern,
     node_recv_type_args, node_stmts, node_trait_name, node_type_ann, node_value, node_value_child_ids, sublist_get,
     sublist_length,
 }
@@ -20,12 +20,13 @@ import typecheck.{
     tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tc_void_tid, tk_name, ty_pool,
 }
 import layout.{
-    BinderMut, LayoutRecord, Position, Slot, SlotForm, bind_binder, binder_mutability_of, binder_scope_pop,
-    binder_scope_push, child_tid, closure_self_spelling, container_slot_spelling, current_binder_scope,
-    ensure_typedef_for, layout_of, tid_of_binder, tid_of_node,
+    BinderMut, LayoutRecord, Position, Slot, SlotForm, bind_binder, bind_binder_cell, binder_is_celled,
+    binder_mutability_of, binder_scope_pop, binder_scope_push, child_tid, closure_self_spelling,
+    container_slot_spelling, current_binder_scope, ensure_typedef_for, layout_of, pointer_spelling,
+    tid_of_binder, tid_of_node,
 }
 import cname.{
-    c_builtin_effect_slot, c_effect_vtable_slot_name, c_ev_field_name, c_ev_global_name,
+    c_builtin_effect_slot, c_cell_name, c_effect_vtable_slot_name, c_ev_field_name, c_ev_global_name,
     c_ev_type_name, c_field_name,
     c_impl_method_name, c_local_name, c_mint_local, c_runtime_helper,
 }
@@ -228,6 +229,10 @@ type PendingThunk {
     // so what the prologue needs is carried here rather than looked up again.
     cap_names: List[Str]
     cap_tids: List[Int]
+    // 1 where that name is a shared mutable binding, so its word is the address of its cell
+    // rather than a copy of its value. The frame that built the word has closed by the time
+    // the prologue reads it back, so which of the two shapes it was built in travels here.
+    cap_celled: List[Int]
     // -1 for a closure thunk. A handler literal's tid for one of its operations, which is
     // what makes the operation take its signature from its own declaration rather than from
     // a Fn type, and its performs of that root reach outer_name rather than the vector.
@@ -250,6 +255,7 @@ let mut eff_op_field: Str = ""
 
 pub fn cg_eff_reset() {
     eff_thunks = []
+    eff_shared_names = []
     eff_thunk_scope = -1
     eff_op_outer_name = ""
     eff_op_field = ""
@@ -259,10 +265,11 @@ pub fn cg_eff_reset() {
 //
 // A captured name rides one void* capture word, which is the slot a container element
 // rides, so Position.ContainerSlot already answers what a capture can hold and nothing
-// here decides it a second time. Two shapes are still refused by name rather than built:
-// a value that does not fit the word needs a heap box, and a binding the enclosing
-// function can assign needs a cell both sides share. Neither is allocated yet, and a
-// closure that is refused queues nothing, so a poisoned unit never reaches the printer.
+// here decides it a second time. A shared mutable binding rides the address of its cell,
+// which the declaration allocated, so its own size never reaches the word. One shape is
+// still refused by name rather than built: a value that does not fit the word needs a heap
+// box, which is not allocated yet, and a closure that is refused queues nothing, so a
+// poisoned unit never reaches the printer.
 //
 // The descriptor table and the arena promoter stay empty together. The table has one
 // reader, the promoter that deep-copies captures into an arena, so a closure that is never
@@ -281,11 +288,12 @@ pub fn cg_eff_lower_closure(node: Int) -> Int ! Diag.Report {
     let free = closure_free_names(node)
     if !captures_are_buildable(node, free) { return -1 }
     let tids: List[Int] = []
-    let words = capture_words(node, free, tids)
+    let celled: List[Int] = []
+    let words = capture_words(node, free, tids, celled)
     let symbol = c_mint_local("closure")
     eff_thunks.push(PendingThunk {
         closure: node, symbol: symbol, fn_tid: tid, cap_names: free, cap_tids: tids,
-        handler_tid: -1, outer_name: "",
+        cap_celled: celled, handler_tid: -1, outer_name: "",
     })
     ir_closure_new(tid, node, rec.c_spelling, symbol, "", "", words)
 }
@@ -293,10 +301,22 @@ pub fn cg_eff_lower_closure(node: Int) -> Int ! Diag.Report {
 // One capture word per captured name, in first-read order, built in the frame the literal
 // was written in because that is where the name still resolves. The thunk reads each word
 // back by the position it was built at. Every name is known buildable before this runs.
-fn capture_words(node: Int, free: List[Str], tids: List[Int]) -> List[Int] ! Diag.Report {
+fn capture_words(node: Int, free: List[Str], tids: List[Int], celled: List[Int]) -> List[Int] ! Diag.Report {
     let mut out: List[Int] = []
     for nm in free {
         let ntid = tid_of_binder(current_binder_scope(), nm)
+        let is_cell = binder_is_celled(current_binder_scope(), nm)
+        celled.push(if is_cell { 1 } else { 0 })
+        tids.push(ntid)
+        if is_cell {
+            // The binding's storage is one heap cell and the word is its address, which is
+            // already a word. A copy here, boxed or punned, would be a second storage the
+            // frame never writes to, and every write on either side would go unseen.
+            let cell = layout_of(ntid, Position.Local)
+            out.push(ir_var_ref(ntid, node, pointer_spelling(cell.c_spelling), c_cell_name(nm),
+                SlotForm.InlineWord))
+            continue
+        }
         let slot = layout_of(ntid, Position.ContainerSlot)
         let loc = layout_of(ntid, Position.Local)
         let read = ir_var_ref(ntid, node, loc.c_spelling, c_local_name(nm), loc.slot_form)
@@ -310,7 +330,6 @@ fn capture_words(node: Int, free: List[Str], tids: List[Int]) -> List[Int] ! Dia
             // ContainerSlot names, so the value that comes back out is the value that went in.
             out.push(if slot.slot_word == "" { read } else { ir_cast(ntid, node, slot.slot_word, read) })
         }
-        tids.push(ntid)
     }
     out
 }
@@ -327,9 +346,10 @@ fn capture_words(node: Int, free: List[Str], tids: List[Int]) -> List[Int] ! Dia
 // and drops the closure's writes on the other. A `let` binding carries no such rule, so
 // copying it is what the spec calls observationally equivalent.
 //
-// The answer comes off the binder frame, the same entry the capture's type comes from, so
-// the name is resolved once. A bind site that records nothing answers Unknown and the
-// capture is refused: a binder that cannot be told from a shared one is treated as one.
+// So a mutable binding is buildable exactly when its declaration gave it that cell. The
+// answer comes off the binder frame, the same entry the capture's type comes from, so the
+// name is resolved once. A bind site that records nothing answers Unknown and the capture
+// is refused: a binder that cannot be told from a shared one is treated as one.
 fn captures_are_buildable(node: Int, free: List[Str]) -> Bool ! Diag.Report {
     if free.len() == 0 { return true }
     let scope = current_binder_scope()
@@ -337,7 +357,7 @@ fn captures_are_buildable(node: Int, free: List[Str]) -> Bool ! Diag.Report {
     let mut unrecorded: List[Str] = []
     for nm in free {
         let m = binder_mutability_of(scope, nm)
-        if m == BinderMut.Mutable { shared.push(nm) }
+        if m == BinderMut.Mutable && !binder_is_celled(scope, nm) { shared.push(nm) }
         if m == BinderMut.Unknown { unrecorded.push(nm) }
     }
     if shared.len() > 0 {
@@ -354,6 +374,19 @@ fn captures_are_buildable(node: Int, free: List[Str]) -> Bool ! Diag.Report {
     }
     for nm in free {
         let ntid = tid_of_binder(scope, nm)
+        if binder_is_celled(scope, nm) {
+            // The word holds the cell's address, so the value's width never comes up. What
+            // has to spell is the pointee, which the frame and the prologue both name.
+            let cell = layout_of(ntid, Position.Local)
+            let cell_why = cell.decline_reason
+            if cell_why != "" {
+                diag_ice_at("UnspellableCaptureType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                    "captured local '{nm}' has no C layout: {cell_why}", node,
+                    "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+                return false
+            }
+            continue
+        }
         let slot = layout_of(ntid, Position.ContainerSlot)
         let why = slot.decline_reason
         if why != "" {
@@ -451,7 +484,7 @@ pub fn cg_eff_lower_handler_expr(node: Int) -> Int ! Diag.Report {
     while i < ops.len() {
         eff_thunks.push(PendingThunk {
             closure: ops.get(i).unwrap(), symbol: symbols.get(i).unwrap(), fn_tid: -1,
-            cap_names: [], cap_tids: [], handler_tid: tid, outer_name: outer,
+            cap_names: [], cap_tids: [], cap_celled: [], handler_tid: tid, outer_name: outer,
         })
         print_fn_decl(true, rets.get(i).unwrap(), symbols.get(i).unwrap(), params.get(i).unwrap(), false)
         i = i + 1
@@ -688,9 +721,10 @@ fn with_capture_prologue(th: PendingThunk, body: Int) -> Int ! Diag.Report {
     while i < th.cap_names.len() {
         let nm = th.cap_names.get(i).unwrap()
         let ntid = th.cap_tids.get(i).unwrap()
+        let is_cell = th.cap_celled.get(i).unwrap() == 1
         let slot = layout_of(ntid, Position.ContainerSlot)
         let loc = layout_of(ntid, Position.Local)
-        if slot.decline_reason != "" || loc.decline_reason != "" {
+        if loc.decline_reason != "" || (!is_cell && slot.decline_reason != "") {
             diag_ice_at("UnspellableCaptureType", UNSOLVED_TYPEVAR_AT_CODEGEN,
                 "captured local '{nm}' has no C layout in the thunk that reads it", th.closure,
                 "the same type spelled at the literal's site must spell again where the thunk declares it")
@@ -702,6 +736,16 @@ fn with_capture_prologue(th: PendingThunk, body: Int) -> Int ! Diag.Report {
         let index = ir_const(TYPE_INT, th.closure, index_rec.c_spelling, "{i}")
         let raw = ir_call_runtime(ntid, th.closure, container_slot_spelling(),
             c_runtime_helper("closure_get_capture"), SlotForm.InlineWord, [self_ref, index])
+        if is_cell {
+            // The word is the cell's address and the name is the cell, so the pointer is
+            // taken as it stands. Reading through it here would bind a copy of the value,
+            // which compiles and then drops every write the thunk makes.
+            let cell_spelling = pointer_spelling(loc.c_spelling)
+            stmts.push(ir_let(ntid, th.closure, cell_spelling, c_cell_name(nm), SlotForm.InlineWord,
+                ir_cast(ntid, th.closure, cell_spelling, raw)))
+            i = i + 1
+            continue
+        }
         // The pun the word was built through, undone in the same order.
         let punned = if slot.slot_word == "" { raw } else { ir_cast(ntid, th.closure, slot.slot_word, raw) }
         // A boxed capture travels as the address of a heap copy, so the name binds to what
@@ -737,6 +781,9 @@ pub fn cg_eff_thunk_open(i: Int) -> Int ! Diag.Report {
     }
     let scope = binder_scope_push()
     eff_thunk_scope = scope
+    // The thunk's body is its own frame, so the bindings its own closures share are its
+    // own. The enclosing frame's answer closed with that frame.
+    cg_eff_scan_shared_binders(th.closure)
     if th.handler_tid >= 0 {
         eff_op_outer_name = th.outer_name
         eff_op_field = ev_field_of(th.handler_tid, th.closure)
@@ -765,6 +812,7 @@ pub fn cg_eff_thunk_close() ! Diag.Report {
     }
     binder_scope_pop()
     eff_thunk_scope = -1
+    eff_shared_names = []
     eff_op_outer_name = ""
     eff_op_field = ""
 }
@@ -792,7 +840,15 @@ fn bind_thunk_params(th: PendingThunk, scope: Int) -> Bool ! Diag.Report {
     // written. Without it the body's reads would find no binder and resolve nowhere.
     let mut c = 0
     while c < th.cap_names.len() {
-        bind_binder(scope, th.cap_names.get(c).unwrap(), th.cap_tids.get(c).unwrap())
+        let nm = th.cap_names.get(c).unwrap()
+        let ctid = th.cap_tids.get(c).unwrap()
+        // A shared binding is shared inside the thunk too, so the body reads and writes it
+        // through the cell the prologue declares rather than through a local of its own.
+        if th.cap_celled.get(c).unwrap() == 1 {
+            bind_binder_cell(scope, nm, ctid)
+        } else {
+            bind_binder(scope, nm, ctid)
+        }
         c = c + 1
     }
     true
@@ -806,10 +862,27 @@ fn bind_thunk_params(th: PendingThunk, scope: Int) -> Bool ! Diag.Report {
 // enclosing function binds the same spelling. A name bound nowhere is a module-level name
 // or a namespace, which a thunk reaches without help.
 fn closure_free_names(closure: Int) -> List[Str] {
+    frame_locals_among(closure_read_names(closure))
+}
+
+// Every name the closure body reads that the closure does not bind itself, in first-read
+// order. A syntactic answer: it does not ask which frame binds the name, so it holds for a
+// body whose own bindings are not bound yet, which is what the prescan below needs.
+fn closure_read_names(closure: Int) -> List[Str] {
     let mut out: List[Str] = []
     let mut bound: List[Str] = []
     push_param_names(closure, bound)
     scan_free(node_body(closure), bound, out)
+    out
+}
+
+// Of those names, the ones the frame open right now binds. A name bound nowhere in it is a
+// module-level name or a namespace, which a thunk reaches without a capture word.
+fn frame_locals_among(names: List[Str]) -> List[Str] {
+    let mut out: List[Str] = []
+    for nm in names {
+        if tid_of_binder(current_binder_scope(), nm) >= 0 { out.push(nm) }
+    }
     out
 }
 
@@ -840,7 +913,7 @@ fn note_ident(node: Int, bound: List[Str], out: List[Str]) {
 
 fn note_free(name: Str, bound: List[Str], out: List[Str]) {
     if bound.contains(name) || out.contains(name) { return }
-    if tid_of_binder(current_binder_scope(), name) >= 0 { out.push(name) }
+    out.push(name)
 }
 
 // A block's `let` binds from the statement after it, and its initializer is read before
@@ -932,6 +1005,69 @@ fn pattern_names(pat: Int, bound: List[Str]) {
 }
 
 // Lists are references, so a scope that adds names works on a copy of its parent's.
+// ── Shared mutable bindings ───────────────────────────────────────────────────────
+
+// The `let mut` bindings of the frame now lowering that a closure written in it shares.
+let mut eff_shared_names: List[Str] = []
+
+// Records which of one body's `let mut` bindings its closures share, before the body's
+// first statement lowers. The cell is the binding's storage from its declaration on, and a
+// declaration lowers before the closure below it does, so the declaration cannot ask a
+// closure it has not reached yet.
+//
+// `fn_like` is the FnDef or Closure whose frame is about to lower, and the answer covers
+// that frame alone. A binding declared inside a nested closure belongs to the nested frame,
+// which is scanned again when its thunk opens.
+pub fn cg_eff_scan_shared_binders(fn_like: Int) {
+    eff_shared_names = []
+    let body = node_body(fn_like)
+    if body < 0 { return }
+    let mut read: List[Str] = []
+    collect_captured_names(body, read)
+    if read.len() == 0 { return }
+    let mut found: List[Str] = []
+    collect_shared_muts(body, read, found)
+    eff_shared_names = found
+}
+
+// Whether the binding of this name in the frame now lowering is shared with a closure, and
+// so is declared as a cell rather than as a local.
+pub fn cg_eff_binder_is_shared(name: Str) -> Bool {
+    eff_shared_names.contains(name)
+}
+
+// Every name read by a closure written anywhere in this body. A nested literal's own free
+// names arrive with the outer one's, because the outer walk binds the nested parameters and
+// keeps what is still free.
+fn collect_captured_names(node: Int, out: List[Str]) {
+    if node < 0 { return }
+    let k = nk_of(node_kind(node))
+    if k == NodeKind.Closure {
+        for nm in closure_read_names(node) {
+            if !out.contains(nm) { out.push(nm) }
+        }
+        return
+    }
+    // A nested `fn` opens its own frame and captures nothing, so a closure inside it shares
+    // that frame's bindings and none of this one's.
+    if k == NodeKind.FnDef { return }
+    for kid in node_value_child_ids(node) { collect_captured_names(kid, out) }
+}
+
+// The `let mut` declarations of this body whose name one of those closures reads. The
+// intersection is what makes a private mutable local stay a local: celling every `let mut`
+// would put a heap allocation in front of every mutable binding in the language.
+fn collect_shared_muts(node: Int, read: List[Str], out: List[Str]) {
+    if node < 0 { return }
+    let k = nk_of(node_kind(node))
+    if k == NodeKind.Closure || k == NodeKind.FnDef { return }
+    if k == NodeKind.LetBinding && node_is_mut(node) == 1 {
+        let nm = node_name(node)
+        if nm != "" && read.contains(nm) && !out.contains(nm) { out.push(nm) }
+    }
+    for kid in node_value_child_ids(node) { collect_shared_muts(kid, read, out) }
+}
+
 fn copy_names(names: List[Str]) -> List[Str] {
     let mut out: List[Str] = []
     for n in names { out.push(n) }

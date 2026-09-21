@@ -75,6 +75,10 @@ let mut binder_entry_frame: List[Int] = []
 let mut binder_entry_name: List[Str] = []
 let mut binder_entry_tid: List[Int] = []
 let mut binder_entry_mut: List[BinderMut] = []
+// Whether the binding's storage is a heap cell both this frame and a closure hold the
+// address of. 1 only for a `let mut` a closure in the same function shares: the cell is
+// the whole point of the sharing rule, and every other binding keeps its own local.
+let mut binder_entry_cell: List[Int] = []
 
 // check_types rebuilds the type pool, so every cached answer is stale after it. The
 // cname marks are keyed on declaration nodes from the same build, so they are reset
@@ -93,6 +97,7 @@ pub fn layout_reset() {
     binder_entry_name = []
     binder_entry_tid = []
     binder_entry_mut = []
+    binder_entry_cell = []
     lo_current_inst = -1
 }
 
@@ -205,6 +210,14 @@ pub fn binder_mutability_of(scope: Int, name: Str) -> BinderMut {
     let entry = lo_binder_entry(scope, name)
     if entry < 0 { return BinderMut.Unknown }
     binder_entry_mut.get(entry).unwrap()
+}
+
+// Whether this name's storage is a cell, read off the same entry the type and the
+// mutability come from, so one resolution of the name answers all three.
+pub fn binder_is_celled(scope: Int, name: Str) -> Bool {
+    let entry = lo_binder_entry(scope, name)
+    if entry < 0 { return false }
+    binder_entry_cell.get(entry).unwrap() == 1
 }
 
 pub fn layout_of(tid: Int, position: Position) -> LayoutRecord {
@@ -462,6 +475,7 @@ pub fn binder_scope_pop() {
         binder_entry_name.pop()
         binder_entry_tid.pop()
         binder_entry_mut.pop()
+        binder_entry_cell.pop()
     }
 }
 
@@ -475,20 +489,29 @@ pub fn current_binder_scope() -> Int {
 // A bind site that does not know whether the name may be assigned records Unknown, so
 // every site left unswitched refuses a capture instead of copying a shared binding.
 pub fn bind_binder(scope: Int, name: Str, tid: Int) {
-    lo_bind(scope, name, tid, BinderMut.Unknown)
+    lo_bind(scope, name, tid, BinderMut.Unknown, 0)
 }
 
 pub fn bind_binder_mut(scope: Int, name: Str, tid: Int, is_mut: Bool) {
-    lo_bind(scope, name, tid, if is_mut { BinderMut.Mutable } else { BinderMut.Immutable })
+    lo_bind(scope, name, tid, if is_mut { BinderMut.Mutable } else { BinderMut.Immutable }, 0)
 }
 
-fn lo_bind(scope: Int, name: Str, tid: Int, m: BinderMut) {
+// A `let mut` a closure in the same function shares. Its storage is one heap cell, so
+// every read and every write of the name goes through the cell instead of a local, in
+// this frame and in the thunk alike. Both sides bind through here, which is what makes
+// them agree: the frame's declaration and the thunk's prologue name the same cell.
+pub fn bind_binder_cell(scope: Int, name: Str, tid: Int) {
+    lo_bind(scope, name, tid, BinderMut.Mutable, 1)
+}
+
+fn lo_bind(scope: Int, name: Str, tid: Int, m: BinderMut, cell: Int) {
     if scope < 0 || scope >= binder_frame_alive.len() { return }
     if binder_frame_alive.get(scope).unwrap() == 0 { return }
     binder_entry_frame.push(scope)
     binder_entry_name.push(name)
     binder_entry_tid.push(tid)
     binder_entry_mut.push(m)
+    binder_entry_cell.push(cell)
 }
 
 // The entry a name resolves to from this scope, or -1.
