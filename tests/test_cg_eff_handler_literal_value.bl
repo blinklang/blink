@@ -18,7 +18,8 @@
 // silently dropped them would answer a value the program never produced.
 
 import cname_test_helpers.{find_decl, assert_eq_str}
-import cg_test_helpers.{cg_probe_compile}
+import cg_emit.{em_reset, em_take}
+import cg_test_helpers.{cg_probe_compile, cg_text_occurrences}
 import ast.{NodeKind, nk_of}
 import parser.{node_body, node_kind, node_value_child_ids}
 import layout.{bind_binder_mut, binder_scope_pop, binder_scope_push, layout_reset}
@@ -73,6 +74,14 @@ fn metrics_two() -> Handler[Metrics] {
     }
 }
 
+fn io_log() -> Handler[IO] {
+    handler IO {
+        fn log(msg: Str) {
+            io.println("[L] {msg}")
+        }
+    }
+}
+
 fn io_capturing() -> Handler[IO] {
     let tag = "T"
     handler IO {
@@ -94,6 +103,9 @@ fn main() {
     }
     with io_capturing() {
         io.println("d")
+    }
+    with io_log() {
+        io.println("e")
     }
 }
 "#
@@ -212,6 +224,23 @@ test "the value a handler literal lowers to is what the install takes" {
     assert(inst >= 0)
     assert(ir_kind(inst) == IrKind.HandlerInstall)
     assert_eq_str("field", ir_c_name(inst), "ue_metrics")
+}
+
+// The builder writes one vtable member per operation the literal carries. A builtin
+// root's vtable is a hand-written runtime struct, so the member is spelled as that struct
+// declares it. `log` is a C library name, and escaping it to `_blink_log` names a member
+// blink_io_vtable does not have, which C rejects at the assignment.
+test "the builder writes the member name the runtime's vtable declares" {
+    setup()
+    em_reset()
+    let v = cg_eff_lower_handler_expr(handler_in("io_log"))
+    report_ices()
+    assert_eq(ices(), 0)
+    assert(v >= 0)
+    let text = em_take()
+    if cg_text_occurrences(text, "__h->log = ") != 1 { io.println("FAIL: builder wrote\n{text}") }
+    assert_eq(cg_text_occurrences(text, "__h->log = "), 1)
+    assert_eq(cg_text_occurrences(text, "_blink_log"), 0)
 }
 
 test "a handler literal that writes no operation still lowers to a value" {
