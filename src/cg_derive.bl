@@ -13,11 +13,12 @@ import diagnostics.{
     Diag, diag_ice_at, diag_ice_stage_not_built, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 import layout.{
-    LayoutRecord, Position, SlotForm, decl_derive_args, field_layout_of, format_spec_of,
-    layout_of, tid_is_opaque_handle, varargs_spelling, enum_tag_tid,
+    LayoutRecord, Position, SlotForm, decl_derive_args, ensure_typedef_for, field_layout_of,
+    format_spec_of, layout_of, tid_is_opaque_handle, varargs_spelling, enum_tag_tid,
 }
 import cname.{
     c_derive_method_name, c_field_name, c_mint_local, c_runtime_helper, c_string_literal,
+    c_tid_derive_method_name, c_tuple_member,
     c_variant_discriminant, c_enum_tag_member, c_enum_payload_member,
 }
 import cg_print.{print_fn, print_fn_decl, print_kops_table, print_kops_table_decl}
@@ -30,10 +31,14 @@ import typecheck.{
     DECL_NODE_AMBIGUOUS, TYPE_BOOL, TYPE_CHAR, TYPE_INT, TYPE_STR, TYPE_U64, TyKind, lookup_named_type,
     tc_decl_derives, tc_enum_variant_slots,
     tc_evar_field_slots, tc_evar_name, tc_evfield_name, tc_evfield_tid, tc_resolve,
-    tc_sfield_name, tc_sfield_tid, tc_struct_field_slots, tc_tid_decl_node, tc_tid_kind,
-    tk_name,
+    tc_lookup_node_tid, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
+    tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind, tc_tid_resolved,
+    tc_type_str, tk_name,
 }
-import parser.{node_name, node_fields, node_type_params, sublist_get, sublist_length}
+import parser.{
+    node_count, node_name, node_fields, node_source_module, node_type_params, sublist_get,
+    sublist_length,
+}
 
 // The two members a tagged enum's typedef declares. Member names, not type spellings;
 // the typedef emitter writes the same two names.
@@ -56,8 +61,15 @@ let bool_false = "false"
 // two declarations that collided on one symbol would lose a body.
 let mut written: Map[Str, Int] = Map()
 
+// The same record for the methods a structural key needs, keyed on the symbol because a
+// tuple has no declaration to key on. Held apart from `written` so a symbol can never
+// answer for a declaration's derive, and holding 1 for a pair this pass wrote and 0 for a
+// pair it refused: an element's refusal must reach the table that would have named it.
+let mut tuple_methods_done: Map[Str, Int] = Map()
+
 pub fn cg_derive_reset() {
     written = Map()
+    tuple_methods_done = Map()
 }
 
 fn already_written(decl: Int, name: Str) -> Bool {
@@ -78,14 +90,17 @@ fn already_written(decl: Int, name: Str) -> Bool {
 // would otherwise be called before the C compiler has seen its definition.
 pub fn cg_derive_emit_decls(decls: List[Int]) ! Diag.Report {
     derive_walk(decls, false)
+    key_table_decls()
 }
 
 pub fn cg_derive_emit_bodies(decls: List[Int]) ! Diag.Report {
     derive_walk(decls, true)
+    cg_derive_emit_key_tables(cg_derive_key_table_nodes())
 }
 
 fn derive_walk(decls: List[Int], bodies: Bool) ! Diag.Report {
     written = Map()
+    tuple_methods_done = Map()
     for decl in decls {
         for arg in decl_derive_args(decl) { derive_one(decl, arg, bodies) }
     }
@@ -403,6 +418,11 @@ fn eq_differs(owner_tid: Int, ftid: Int, path: Str, span: Int) -> Int ! Diag.Rep
     if k == TyKind.Struct || k == TyKind.Enum {
         return eq_nested_differs(ftid, lhs, rhs, bools, path, span)
     }
+    // A tuple element is compared by the element tuple's own method, which this stage
+    // writes from the type rather than from a declaration the tuple does not have.
+    if k == TyKind.Tuple {
+        return eq_call_differs(c_tid_derive_method_name(tc_resolve(ftid), "eq"), lhs, rhs, bools, span)
+    }
     not_built(span, "@derive(Eq) on the {tk_name(k)} field '{path}'")
     -1
 }
@@ -424,9 +444,13 @@ fn eq_nested_differs(ftid: Int, lhs: Int, rhs: Int, bools: Str, path: Str, span:
         not_built(span, "{refusal}, which the field '{path}' would have to call")
         return -1
     }
+    eq_call_differs(c_derive_method_name(fdecl, "eq"), lhs, rhs, bools, span)
+}
+
+// Whether two values differ, when a derived method answers whether they are equal.
+fn eq_call_differs(symbol: Str, lhs: Int, rhs: Int, bools: Str, span: Int) -> Int ! Diag.Report {
     ir_unary(TYPE_BOOL, span, bools, "!",
-        ir_call_direct(TYPE_BOOL, span, bools, c_derive_method_name(fdecl, "eq"),
-            SlotForm.InlineWord, [lhs, rhs]))
+        ir_call_direct(TYPE_BOOL, span, bools, symbol, SlotForm.InlineWord, [lhs, rhs]))
 }
 
 // Whether a declaration's derives write it an eq. Ord and Hash both have Eq for a
@@ -1136,6 +1160,172 @@ fn kops_table_decl(rec: LayoutRecord) {
     print_kops_table_decl(rec.kops_table)
 }
 
+// ── Key tables a declaration cannot carry ─────────────────────────────────
+//
+// Every key above reaches its table through the declaration that carries @derive(Hash). A
+// tuple has no declaration. Section 3.8 derives a tuple's Hash and its Eq from its
+// elements, so `Map[(Str, Int), Int]` is a legal keyed map with nothing for the walk above
+// to hang a table on, while layout still answers with the table's name — lo_kops_decline_of
+// checks the derive for a struct and an enum only. The reference is then emitted where the
+// map is created and the unit stops linking on a name no stage wrote.
+//
+// The table is declared in every unit and defined where the bodies are written, the rule
+// every derived method already follows. A nominal key is placed by the module that declared
+// it; a structural key belongs to no module, so the driver's scope rule places it instead,
+// which is the only reader that knows which units a program is cut into. The hash and the
+// equality are static: the adapters the table holds are the only callers, and they are
+// written beside it.
+pub fn cg_derive_emit_key_tables(key_nodes: List[Int]) ! Diag.Report {
+    for n in key_nodes { tuple_key_table(n) }
+}
+
+// Declared in every unit and defined in one, the rule every derived method already
+// follows. A unit that creates the map holds the reference and may not be the unit that
+// holds the table, and the reference is emitted inside a function body, so a declaration
+// that arrived with the bodies would arrive after its own first use.
+fn key_table_decls() ! Diag.Report {
+    for n in cg_derive_key_table_nodes() {
+        let key = tuple_key_of(n)
+        if key >= 0 {
+            // The key's C shape has to exist wherever its table does. A Map is not a
+            // carrier, so the typedef walk does not reach the tuple through the map, and a
+            // program that spells the pair nowhere else would declare a table over a type
+            // the unit has never seen.
+            let _ = ensure_typedef_for(key)
+            kops_table_decl(layout_of(key, Position.Param))
+        }
+    }
+}
+
+// The keys the program USES, not the keys it names. Layout promises a table to every tuple
+// whose typedef is spellable, whether or not anything keys on it, so walking the promise
+// would build a hash body for a tuple holding a List and refuse a program that only ever
+// held the pair.
+//
+// A node rather than a type id: it carries the source position every producer below needs,
+// and a structural type has none of its own. The first node that spells each table is
+// enough, because the table is named from the type and two nodes spelling one type ask for
+// one table.
+pub fn cg_derive_key_table_nodes() -> List[Int] {
+    let mut seen: Map[Str, Int] = Map()
+    let mut out: List[Int] = []
+    let mut n = 0
+    while n < node_count() {
+        let key = tuple_key_of(n)
+        if key >= 0 {
+            let table = layout_of(key, Position.Param).kops_table
+            if table != "" && seen.contains_key(table) == 0 {
+                seen.insert(table, 1)
+                out.push(n)
+            }
+        }
+        n = n + 1
+    }
+    out
+}
+
+// The tuple a keyed container at this node keys on, or -1. Map and Set are the two kinds
+// with a key, and child 0 is that key for both.
+fn tuple_key_of(n: Int) -> Int {
+    let tid = tc_tid_resolved(tc_lookup_node_tid(n))
+    if tid < 0 { return -1 }
+    let k = tc_tid_kind(tid)
+    if k != TyKind.Map && k != TyKind.Set { return -1 }
+    let key = tc_tid_resolved(tc_tid_child(tid, 0))
+    if key < 0 { return -1 }
+    if tc_tid_kind(key) != TyKind.Tuple { return -1 }
+    key
+}
+
+// One structural key's table, over the methods the key and its elements need. The two
+// symbols are spelled from the typedef name, which is the name the table is spelled from,
+// so a non-empty table means both are spellable and neither needs a second check here.
+fn tuple_key_table(n: Int) ! Diag.Report {
+    let tid = tuple_key_of(n)
+    if tid < 0 { return }
+    let rec = layout_of(tid, Position.Param)
+    if rec.kops_table == "" { return }
+    if !tuple_methods(tid, n) { return }
+    let key_spelling = spelling_or_ice(rec, tc_type_str(tid), n)
+    if key_spelling == "" { return }
+    print_kops_table(rec.kops_table, key_spelling, c_tid_derive_method_name(tid, "hash"),
+        c_tid_derive_method_name(tid, "eq"), rec.kops_inline_key)
+}
+
+// One tuple's hash and equality, and every tuple inside it first. An element that is itself
+// a tuple is compared by that tuple's own method, and C reads a static function only after
+// its definition, so the inner pair is written before the outer one. Both bodies are built
+// before either is printed: a refusal in the hash must not leave an equality behind that
+// nothing calls. Answers whether the pair now exists, so a refusal deep in an element stops
+// the table that would have named it.
+fn tuple_methods(tid: Int, span: Int) -> Bool ! Diag.Report {
+    let eq_symbol = c_tid_derive_method_name(tid, "eq")
+    if tuple_methods_done.contains_key(eq_symbol) != 0 {
+        return tuple_methods_done.get(eq_symbol).unwrap() == 1
+    }
+    tuple_methods_done.insert(eq_symbol, 0)
+    let mut i = 0
+    while i < tc_tid_child_count(tid) {
+        let etid = tc_tid_resolved(tc_tid_child(tid, i))
+        if etid >= 0 && tc_tid_kind(etid) == TyKind.Tuple {
+            if !tuple_methods(etid, span) { return false }
+        }
+        i = i + 1
+    }
+    let key_spelling = spelling_or_ice(layout_of(tid, Position.Param), tc_type_str(tid), span)
+    let hashed = u64_spelling(span)
+    let compared = bool_spelling(span)
+    if key_spelling == "" || hashed == "" || compared == "" { return false }
+    let equality = tuple_eq_body(tid, span)
+    if equality < 0 { return false }
+    let hash = tuple_hash_body(tid, span)
+    if hash < 0 { return false }
+    print_fn(true, compared, eq_symbol, ["{key_spelling} self", "{key_spelling} other"], false, equality)
+    print_fn(true, hashed, c_tid_derive_method_name(tid, "hash"), ["{key_spelling} self"], false, hash)
+    tuple_methods_done.insert(eq_symbol, 1)
+    true
+}
+
+// A tuple's elements fold exactly as a struct's fields do: the reads differ, because a
+// struct reaches a member through a field slot and a tuple through a child, and everything
+// after the read is shared. The mixing, the short-circuit and every refusal an element can
+// raise stay in one place rather than being written a second way here.
+fn tuple_hash_body(tid: Int, span: Int) -> Int ! Diag.Report {
+    let u64s = u64_spelling(span)
+    let init = hash_init_const(span)
+    if u64s == "" || init < 0 { return -1 }
+    let acc = c_mint_local("h")
+    let mut stmts = [ir_let(TYPE_U64, span, u64s, acc, u64_form(), init)]
+    let mut i = 0
+    while i < tc_tid_child_count(tid) {
+        let etid = tc_tid_child(tid, i)
+        let path = c_tuple_member(i)
+        let value = field_value(tid, etid, path, "self", derive_hash, span)
+        if value < 0 { return -1 }
+        let folded = hash_fold(acc, etid, value, path, span)
+        if folded < 0 { return -1 }
+        stmts.push(folded)
+        i = i + 1
+    }
+    stmts.push(ir_return(span, ir_var_ref(TYPE_U64, span, u64s, acc, u64_form())))
+    ir_block(span, stmts)
+}
+
+fn tuple_eq_body(tid: Int, span: Int) -> Int ! Diag.Report {
+    let mut stmts: List[Int] = []
+    let mut i = 0
+    while i < tc_tid_child_count(tid) {
+        let guard = eq_guard(tid, tc_tid_child(tid, i), c_tuple_member(i), span)
+        if guard < 0 { return -1 }
+        stmts.push(guard)
+        i = i + 1
+    }
+    let agreed = eq_answer(span, "1")
+    if agreed < 0 { return -1 }
+    stmts.push(agreed)
+    ir_block(span, stmts)
+}
+
 // A value layout gives as one word is its own hash input, but which input depends on
 // what the word holds: an ordinal enum is its tag, and a transparent newtype is the
 // field it stands for, which may be a string rather than a number.
@@ -1297,6 +1487,10 @@ fn hash_contribution(ftid: Int, value: Int, path: Str, span: Int) -> Int ! Diag.
         return ir_call_runtime(TYPE_U64, span, u64s, c_runtime_helper("map_hash"), u64_form(), [value])
     }
     if k == TyKind.Struct || k == TyKind.Enum { return hash_nested(ftid, value, path, span) }
+    if k == TyKind.Tuple {
+        return ir_call_direct(TYPE_U64, span, u64s,
+            c_tid_derive_method_name(tc_resolve(ftid), "hash"), u64_form(), [value])
+    }
     if !hash_is_integral(k) {
         not_built(span, "@derive(Hash) on the {tk_name(k)} field '{path}'")
         return -1
