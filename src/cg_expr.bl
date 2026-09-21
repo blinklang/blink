@@ -23,7 +23,7 @@ import parser.{
 }
 import ast.{NodeKind, nk_of, node_kind_name}
 import typecheck.{
-    TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node,
+    TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, is_integer_type, type_bit_width,
     lookup_named_type, tc_field_tid_at_instance, is_import_module_name,
     tc_qualifier_to_module_or_self, tc_tid_struct, tc_global_decl_node,
     TYPE_INT, TYPE_BOOL, TYPE_STR, TYPE_VOID,
@@ -40,7 +40,7 @@ import cname.{
     c_test_propagate_name,
 }
 import ir.{
-    IrKind, ir_kind, ir_kid, ir_kid_count,
+    IrKind, ir_kind, ir_kind_is_name, ir_kid, ir_kid_count, ir_c_name, ir_panic,
     ir_const, ir_var_ref, ir_global_ref, ir_unary, ir_binary, ir_cast, ir_field_get,
     ir_struct_new, ir_tuple_new, ir_container_new, ir_box, ir_unbox, ir_carrier_wrap,
     ir_carrier_unwrap, ir_carrier_tag, ir_call_runtime, ir_let, ir_assign, ir_return,
@@ -637,7 +637,95 @@ fn lower_binop(node: Int) -> Int ! Diag.Report {
     let rhs = lower_expr(node_right(node))
     if lhs < 0 { return -1 }
     if rhs < 0 { return -1 }
+    if x_operator_needs_guard(op, lhs_tid, rhs) { return x_guarded_binary(node, op, tid, rec, lhs_tid, lhs, rhs) }
     ir_binary(tid, node, rec.c_spelling, op, lhs, rhs)
+}
+
+// Three integer operations C leaves undefined where Blink promises a panic: a division or a
+// remainder by zero, and a shift by the left operand's own width or more. On x86 the first
+// two fault and the third quietly masks the amount, so the promise cannot come from the C
+// operator and the seam that lowers the operator emits the test instead.
+//
+// A literal the front end has already judged needs nothing. It refuses a shift whose amount
+// is an integer literal out of range, and a division by a literal that is not zero cannot
+// fault, so those sites keep printing as the bare operator. Anything else is guarded,
+// including a literal this stage cannot read as a number: guessing there would trade a
+// panic for a fault.
+fn x_operator_needs_guard(op: Str, lhs_tid: Int, rhs: Int) -> Bool {
+    if is_integer_type(lhs_tid) == 0 { return false }
+    if op == "/" || op == "%" { return !x_is_nonzero_literal(rhs) }
+    if op == "<<" || op == ">>" { return ir_kind(rhs) != IrKind.Const }
+    false
+}
+
+fn x_is_nonzero_literal(id: Int) -> Bool {
+    if ir_kind(id) != IrKind.Const { return false }
+    let text = ir_c_name(id)
+    let mut i = 0
+    while i < text.len() {
+        let c = text.byte_at(i)
+        if c != 48 && c != 43 && c != 45 { return true }
+        i = i + 1
+    }
+    false
+}
+
+// The test reads the same value the operator reads, so an operand that is not already a
+// name becomes a temp: testing it where it stands would run it twice, and leaving the left
+// operand inline would run it after a panic that must come later than its own effects.
+fn x_guarded_binary(node: Int, op: Str, tid: Int, rec: LayoutRecord, lhs_tid: Int, lhs: Int,
+        rhs: Int) -> Int ! Diag.Report {
+    let rhs_tid = tid_of_node(node_right(node))
+    if rhs_tid < 0 { return -1 }
+    let left = x_hold(lhs_tid, node_left(node), lhs)
+    let divisor_name = x_hold_name(rhs_tid, node_right(node), rhs)
+    if left < 0 || divisor_name == "" { return -1 }
+    let divisor = x_ref(rhs_tid, node_right(node), divisor_name)
+    let tripped = x_operand_test(node, op, lhs_tid, rhs_tid, divisor_name)
+    let said = x_guard_message(node, op, lhs_tid)
+    if divisor < 0 || tripped < 0 || said < 0 { return -1 }
+    x_hoist(ir_if(node, tripped, ir_block(node, [ir_panic(node, said)]), -1))
+    ir_binary(tid, node, rec.c_spelling, op, left, divisor)
+}
+
+// An operand the guard needs to read twice, as a value: already a name, or a fresh temp.
+fn x_hold(tid: Int, node: Int, value: Int) -> Int ! Diag.Report {
+    if ir_kind_is_name(ir_kind(value)) { return value }
+    let name = x_bind(tid, node, value)
+    if name == "" { return -1 }
+    x_ref(tid, node, name)
+}
+
+// The same operand, as the name the test and the operator both spell.
+fn x_hold_name(tid: Int, node: Int, value: Int) -> Str ! Diag.Report {
+    if ir_kind_is_name(ir_kind(value)) { return ir_c_name(value) }
+    x_bind(tid, node, value)
+}
+
+fn x_operand_test(node: Int, op: Str, lhs_tid: Int, rhs_tid: Int, name: Str) -> Int ! Diag.Report {
+    let bool_rec = x_local(TYPE_BOOL, node)
+    let rhs_rec = x_local(rhs_tid, node)
+    if x_stopped(bool_rec) || x_stopped(rhs_rec) { return -1 }
+    let operand = x_ref(rhs_tid, node, name)
+    if operand < 0 { return -1 }
+    if op == "/" || op == "%" {
+        return ir_binary(TYPE_BOOL, node, bool_rec.c_spelling, "==", operand,
+            ir_const(rhs_tid, node, rhs_rec.c_spelling, "0"))
+    }
+    ir_binary(TYPE_BOOL, node, bool_rec.c_spelling, ">=", operand,
+        ir_const(rhs_tid, node, rhs_rec.c_spelling, "{type_bit_width(lhs_tid)}"))
+}
+
+// The message a reader sees at the panic. It names the operation and, for a shift, the
+// bound that was passed, because the amount itself is not known until the program runs.
+fn x_guard_message(node: Int, op: Str, lhs_tid: Int) -> Int ! Diag.Report {
+    let rec = x_local(TYPE_STR, node)
+    if x_stopped(rec) { return -1 }
+    let mut text = "division by zero"
+    if op == "<<" || op == ">>" {
+        text = "shift amount out of range for {tk_name(x_kind(lhs_tid))} (must be 0..{type_bit_width(lhs_tid) - 1})"
+    }
+    ir_const(TYPE_STR, node, rec.c_spelling, c_string_literal(text))
 }
 
 // Kinds C's own operators compare and arithmetic correctly: the scalars and the ordinal
