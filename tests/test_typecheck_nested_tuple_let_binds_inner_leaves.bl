@@ -1,0 +1,154 @@
+// `let ((x, y), label) = ...` is an irrefutable pattern a `let` accepts (§3.5 lists
+// "Nested irrefutable: let ((x, y), label)" among the patterns a binding may use), but
+// name resolution only walked the top row of the pattern. A leaf inside a nested
+// sub-pattern was never defined, so every read of it reported UndefinedVariable and the
+// program could not be written at all. The type-inference pass had the same flat shape:
+// it decomposed the top row into per-leaf types and left anything nested untyped.
+//
+// These rows read the leaf through two independent answers: the probe is clean, which is
+// name resolution's answer, and the leaf's own pattern node carries a type, which is
+// inference's. A fix to one pass alone leaves the other row red.
+
+import lower_test_helpers.{probe, probe_but, assert_eq_str, ice_count}
+import typecheck.{tc_lookup_node_tid, tc_resolve, tc_type_str}
+import parser.{node_kind, node_name, nodes}
+import ast.{NodeKind, nk_of}
+import std.io
+
+// The IdentPattern leaf a destructuring `let` binds. Every probe below picks leaf names
+// nothing in the stdlib graph spells, so the first hit is the probe's own line.
+fn leaf_pattern_of(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.IdentPattern && node_name(i) == name { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no pattern leaf '{name}'")
+    assert(false)
+    -1
+}
+
+fn assert_leaf_type(name: Str, want: Str) {
+    let leaf = leaf_pattern_of(name)
+    let tid = tc_lookup_node_tid(leaf)
+    if tid < 0 { io.println("FAIL: leaf '{name}' (node {leaf}) carries no type") }
+    assert(tid >= 0)
+    assert_eq_str("leaf '{name}'", tc_type_str(tc_resolve(tid)), want)
+}
+
+fn src_flat() -> Str {
+    #"fn flat() -> (Int, Str) {
+    (3, "p")
+}
+
+fn main() {
+    let (flat_n, flat_label) = flat()
+    let _keep = flat_n + flat_label.len()
+}
+"#
+}
+
+fn src_nested() -> Str {
+    #"fn labeled() -> ((Int, Int), Str) {
+    ((3, 4), "p")
+}
+
+fn main() {
+    let ((tup_x, tup_y), tup_label) = labeled()
+    let _keep = tup_x + tup_y + tup_label.len()
+}
+"#
+}
+
+fn src_deep() -> Str {
+    #"fn deep() -> ((Int, (Int, Str)), Int) {
+    ((1, (2, "q")), 3)
+}
+
+fn main() {
+    let ((deep_a, (deep_b, deep_c)), deep_d) = deep()
+    let _keep = deep_a + deep_b + deep_c.len() + deep_d
+}
+"#
+}
+
+fn src_nested_mut() -> Str {
+    #"fn labeled() -> ((Int, Int), Str) {
+    ((3, 4), "p")
+}
+
+fn main() {
+    let mut ((mut_x, mut_y), mut_label) = labeled()
+    mut_x = 9
+    let _keep = mut_x + mut_y + mut_label.len()
+}
+"#
+}
+
+fn src_nested_wildcard() -> Str {
+    #"fn labeled() -> ((Int, Int), Str) {
+    ((3, 4), "p")
+}
+
+fn main() {
+    let ((wild_x, _), wild_label) = labeled()
+    let _keep = wild_x + wild_label.len()
+}
+"#
+}
+
+test "a flat destructuring let binds and types its leaves" {
+    let _p = probe("nested_tuple_let_flat", src_flat())
+    assert_leaf_type("flat_n", "Int")
+    assert_leaf_type("flat_label", "Str")
+}
+
+test "a nested tuple let binds and types the leaves of the inner pattern" {
+    let _p = probe("nested_tuple_let_nested", src_nested())
+    assert_leaf_type("tup_x", "Int")
+    assert_leaf_type("tup_y", "Int")
+    assert_leaf_type("tup_label", "Str")
+}
+
+test "a leaf two levels deep is bound and carries its own element type" {
+    let _p = probe("nested_tuple_let_deep", src_deep())
+    assert_leaf_type("deep_a", "Int")
+    assert_leaf_type("deep_b", "Int")
+    assert_leaf_type("deep_c", "Str")
+    assert_leaf_type("deep_d", "Int")
+}
+
+test "mut on a destructuring let reaches a leaf inside a nested pattern" {
+    let _p = probe("nested_tuple_let_mut", src_nested_mut())
+    assert_leaf_type("mut_x", "Int")
+    assert_leaf_type("mut_y", "Int")
+}
+
+test "a wildcard beside a named leaf in a nested pattern binds only the named one" {
+    let _p = probe("nested_tuple_let_wildcard", src_nested_wildcard())
+    assert_leaf_type("wild_x", "Int")
+    assert_leaf_type("wild_label", "Str")
+}
+
+fn src_refutable_leaf() -> Str {
+    #"fn pair() -> (Int, Option[Int]) {
+    (1, Some(2))
+}
+
+fn main() {
+    let (ref_a, Some(ref_x)) = pair()
+    let _keep = ref_a + ref_x
+}
+"#
+}
+
+// A refutable sub-pattern is outside what a `let` accepts, and no pass refuses it yet.
+// Until one does, the two walks have to agree on which names exist: a walk that binds the
+// payload leaf without the walk beside it typing that leaf ends inference with a bound,
+// typeless binder, which is an internal error where an undefined name is a diagnostic the
+// author can act on.
+test "a refutable leaf in a let reports an undefined name and not an internal error" {
+    let _p = probe_but("nested_tuple_let_refutable", src_refutable_leaf(), "UndefinedVariable")
+    if ice_count() != 0 { io.println("FAIL: refutable leaf raised {ice_count()} internal errors") }
+    assert(ice_count() == 0)
+}

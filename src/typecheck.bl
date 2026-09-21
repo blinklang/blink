@@ -13224,15 +13224,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         }
         let let_pat_sl = node_elements(node)
         if let_pat_sl != -1 {
-            let let_elems_sl = node_elements(let_pat_sl)
-            if let_elems_sl != -1 {
-                let mut pi = 0
-                while pi < sublist_length(let_elems_sl) {
-                    let sp = sublist_get(let_elems_sl, pi)
-                    nr_define_mut_at(node_name(sp), let_is_mut, sp)
-                    pi = pi + 1
-                }
-            }
+            nr_define_let_pattern(let_pat_sl, let_is_mut)
         }
         return
     }
@@ -13814,6 +13806,94 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     }
 
     let _skip = 0
+}
+
+// Types every leaf of a destructuring `let` from the tuple it destructures.
+//
+// Decomposes the tuple into per-leaf types, the way the TuplePattern arm of
+// tc_check_pattern_types already does for `for-in` and `match`. Without this,
+// `let (m, n) = t` leaves each leaf as TYPE_UNKNOWN, so a method call on a leaf answers
+// "on type ?" and codegen's binder has nothing to read. Recursive for the same reason
+// nr_define_let_pattern is: a leaf of `let ((x, y), label) = ...` is itself a pattern,
+// and the type it needs is a child of a child.
+//
+// Not delegated to tc_check_pattern_types: its IdentPattern arm hard-codes
+// `nr_define_typed(name, 0, ...)`, which would take `mut` away from every destructured
+// binder.
+fn tc_type_let_pattern(pat: Int, tid: Int, is_mut: Int) {
+    if pat == -1 { return }
+    let kind = node_kind(pat)
+
+    if kind == NodeKind.TuplePattern {
+        let elems_sl = node_elements(pat)
+        if elems_sl == -1 { return }
+        // The pattern node itself carries the tuple it takes apart, so a later pass reads
+        // the type it projects through rather than re-deriving it from the leaves.
+        tc_publish_node_tid(pat, tid)
+        let tup = tc_tid_resolved(tid)
+        let mut arity = -1
+        if tc_tid_kind(tup) == TyKind.Tuple {
+            arity = tc_tid_child_count(tup)
+        }
+        let mut i = 0
+        while i < sublist_length(elems_sl) {
+            // A leaf past the tuple's arity stays unknown instead of borrowing a
+            // neighbour's type. Wrong-arity destructuring is diagnosed elsewhere;
+            // shifting types into it would turn that error into a miscompile.
+            let mut elem_tid = TYPE_UNKNOWN
+            if i < arity {
+                elem_tid = tc_tid_child(tup, i)
+                if elem_tid < 0 { elem_tid = TYPE_UNKNOWN }
+            }
+            tc_type_let_pattern(sublist_get(elems_sl, i), elem_tid, is_mut)
+            i = i + 1
+        }
+        return
+    }
+
+    if kind == NodeKind.WildcardPattern { return }
+
+    nr_define_typed(node_name(pat), is_mut, tid, pat)
+    tc_publish_node_tid(pat, tid)
+}
+
+// Binds every leaf of a destructuring `let`. A leaf may itself be a pattern:
+// `let ((x, y), label) = ...` is irrefutable and §3.5 lists it among the patterns a
+// binding accepts, so walking only the top row leaves the inner names undefined and
+// every read of them reports UndefinedVariable.
+//
+// Separate from nr_check_pattern, which walks the same shapes for a match arm, because
+// that one binds through nr_define_at and a `let mut` has to carry its mutability down
+// to the leaf that a later assignment names.
+fn nr_define_let_pattern(pat: Int, is_mut: Int) ! Diag.Report {
+    if pat == -1 { return }
+    let kind = node_kind(pat)
+
+    if kind == NodeKind.TuplePattern {
+        let elems_sl = node_elements(pat)
+        if elems_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(elems_sl) {
+                nr_define_let_pattern(sublist_get(elems_sl, i), is_mut)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    // `_` names nothing, so it needs no entry. The flat walk this replaced pushed one
+    // under the empty name, which no source line can read.
+    if kind == NodeKind.WildcardPattern { return }
+
+    // A named leaf binds its name. Any other kind is outside the irrefutable subset a
+    // `let` accepts and binds its own name too, which is what the flat walk did: for
+    // `Some(x)` that is a binding called `Some` and no binding for the payload. Reaching
+    // into the payload here instead would bind a leaf the type walk beside this one does
+    // not descend into, and a bound but untyped binder ends inference as an internal
+    // error where an undefined name is a diagnostic the author can act on. Refusing a
+    // refutable pattern in a `let` is specified and unimplemented; until some pass does
+    // it, both walks have to agree on which names exist.
+    nr_define_mut_at(node_name(pat), is_mut, pat)
 }
 
 fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
@@ -19196,37 +19276,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         }
         let tc_let_pat_sl = node_elements(node)
         if tc_let_pat_sl != -1 {
-            let tc_let_elems_sl = node_elements(tc_let_pat_sl)
-            if tc_let_elems_sl != -1 {
-                // Decompose the tuple into per-leaf types, the way the TuplePattern arm of
-                // tc_check_pattern_types already does for `for-in` and `match`. Without this,
-                // `let (m, n) = t` leaves each leaf as TYPE_UNKNOWN, so a method call on a
-                // leaf answers "on type ?" and codegen's binder has nothing to read.
-                //
-                // Not delegated to tc_check_pattern_types: its IdentPattern arm hard-codes
-                // `nr_define_typed(name, 0, ...)`, which would take `mut` away from every
-                // destructured binder.
-                let tc_let_tup = tc_tid_resolved(final_tid)
-                let mut tc_let_arity = -1
-                if tc_tid_kind(tc_let_tup) == TyKind.Tuple {
-                    tc_let_arity = tc_tid_child_count(tc_let_tup)
-                }
-                let mut tpi = 0
-                while tpi < sublist_length(tc_let_elems_sl) {
-                    let tsp = sublist_get(tc_let_elems_sl, tpi)
-                    // A leaf past the tuple's arity stays unknown instead of borrowing a
-                    // neighbour's type. Wrong-arity destructuring is diagnosed elsewhere;
-                    // shifting types into it would turn that error into a miscompile.
-                    let mut tc_let_elem_tid = TYPE_UNKNOWN
-                    if tpi < tc_let_arity {
-                        tc_let_elem_tid = tc_tid_child(tc_let_tup, tpi)
-                        if tc_let_elem_tid < 0 { tc_let_elem_tid = TYPE_UNKNOWN }
-                    }
-                    nr_define_typed(node_name(tsp), is_mut, tc_let_elem_tid, tsp)
-                    tc_publish_node_tid(tsp, tc_let_elem_tid)
-                    tpi = tpi + 1
-                }
-            }
+            tc_type_let_pattern(tc_let_pat_sl, final_tid, is_mut)
         }
         return
     }
