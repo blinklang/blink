@@ -1,0 +1,159 @@
+// The arithmetic traits (Add, Sub, Mul, Div, Rem, Neg) are SEALED to the built-in numeric
+// types (sections/03_types.md:576,711). Void is not one of them: it is an ordinary
+// inhabited type whose one value carries no number, so `+` over it desugars to an Add that
+// no implementation answers.
+//
+// Typecheck accepted it anyway. The numeric-operand check failed OPEN on Void, because an
+// under-inferred value used to type as Void and rejecting it would have refused programs
+// that the compiler had already accepted. Metavar inference ended that: an
+// under-determined type is now its own error (E0301 CannotInferType), so a Void operand
+// is no longer a stand-in for "not yet known" -- it is a value of type Void, and the
+// sealed rule applies to it like any other non-numeric type.
+//
+// Until now the refusal came from the C compiler instead, as "invalid use of void
+// expression" against generated code the reader never wrote. A rule the language states
+// is enforced where the language is checked.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+// The diagnostic names a source draws, joined, so a row states the whole answer instead of
+// asserting that one entry is present somewhere among others.
+fn probe_diag_names(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out = "{out}{d.name} " }
+    }
+    out.trim()
+}
+
+fn assert_names(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: drew '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+// `()` is the one value of Void, written literally, so neither operand is inferred from
+// anything. Each operand is answered on its own, as every other non-numeric operand is.
+fn void_literal_plus_src() -> Str {
+    #"fn main() {
+    let y = () + ()
+    assert(true)
+}
+"#
+}
+
+// The value a function producing no value returns. Only the left operand is Void here, so
+// this row also fixes that the right one is not blamed with it.
+fn void_call_operand_src() -> Str {
+    #"fn nothing() { }
+
+fn main() {
+    let y = nothing() + 1
+    assert(true)
+}
+"#
+}
+
+// `+=` is the same Add over the same two operands, so the compound form answers the same.
+fn void_compound_assign_src() -> Str {
+    #"fn nothing() { }
+
+fn main() {
+    let mut m = nothing()
+    m += nothing()
+    io.println("done")
+}
+"#
+}
+
+// Negation is Neg, sealed with the rest of the family.
+fn void_negation_src() -> Str {
+    #"fn nothing() { }
+
+fn main() {
+    let y = -nothing()
+    assert(true)
+}
+"#
+}
+
+// A Void-typed field is a value like any other, and reading one does not make it numeric.
+fn void_field_operand_src() -> Str {
+    #"type Holder { v: Void }
+
+fn main() {
+    let h = Holder { v: () }
+    let y = h.v * 2
+    assert(true)
+}
+"#
+}
+
+// The shape the fail-open was opened for: a closure whose RETURN type is not written, then
+// used as an arithmetic operand. Inference solves that return from the body, so it is Int
+// and not Void -- the row that proves this check is not paid for with the shape the
+// fail-open existed to admit.
+fn inferred_closure_return_src() -> Str {
+    #"fn main() {
+    let twice = fn(x: Int) { x * 2 }
+    let y = twice(21) + 1
+    io.println("{y}")
+}
+"#
+}
+
+// Arithmetic over the numerics is untouched, in both the operator and the compound form.
+fn numeric_arith_src() -> Str {
+    #"fn main() {
+    let mut total = 0
+    total += 2 * 3
+    let ratio = 7.5 / 2.5
+    io.println("{total} {ratio}")
+}
+"#
+}
+
+// One entry, not two: both operands draw the identical message at the same node, and
+// equal diagnostics at one node are one diagnostic.
+test "'+' on the Void literal is refused" {
+    assert_names("void literal", probe_diag_names("tc_void_add", void_literal_plus_src()),
+        "TypeError")
+}
+
+// Two entries: the sealed-trait refusal of the Void operand, and the separate refusal of
+// Void against Int as the two sides of one '+'.
+test "a Void-returning call is refused as an arithmetic operand" {
+    assert_names("void call", probe_diag_names("tc_void_call", void_call_operand_src()),
+        "TypeError TypeError")
+}
+
+test "a compound assignment over Void is refused" {
+    assert_names("void compound", probe_diag_names("tc_void_compound", void_compound_assign_src()),
+        "TypeError")
+}
+
+test "negating Void is refused" {
+    assert_names("void negation", probe_diag_names("tc_void_neg", void_negation_src()),
+        "TypeError")
+}
+
+test "a Void-typed field read is refused as an arithmetic operand" {
+    assert_names("void field", probe_diag_names("tc_void_field", void_field_operand_src()),
+        "TypeError TypeError")
+}
+
+test "arithmetic on a closure whose return type is inferred is still accepted" {
+    assert_names("inferred closure", probe_diag_names("tc_void_closure", inferred_closure_return_src()),
+        "")
+}
+
+test "arithmetic on the built-in numerics is still accepted" {
+    assert_names("numeric", probe_diag_names("tc_void_numeric", numeric_arith_src()), "")
+}
