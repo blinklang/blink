@@ -1,0 +1,71 @@
+// `let (a, b) = t` must bind `a` and `b` as ordinary locals of the enclosing block, not of
+// a block of their own: a name a nested block declares is invisible once that block ends,
+// and the statement after this one reads the names by their plain C spelling with no block
+// of its own in between. See lower_destructuring_let in cg_stmt.bl.
+//
+// The tuple holder and every destructured name still bind in the same relative order the
+// source wrote them in, one `Let` per name (or per nested holder), all flat in the same
+// list lower_stmt_hoisted is already building -- the same unscoped path bind_unit_let and
+// the value-position hoist take, not a block of their own.
+
+import std.io
+import mono.{run_mono}
+import parser.{nodes, node_body, node_kind, node_name}
+import ast.{NodeKind}
+import layout.{layout_reset}
+import ir.{ir_reset}
+import cg_test_helpers.{cg_probe_compile}
+import cg_stmt.{cg_stmt_reset, lower_fn}
+import cg_expr.{cg_expr_reset, cg_expr_pending_count}
+import lower_test_helpers.{shape, assert_eq_str}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn probe_fn(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/{stem}_probe.bl"
+    let program = cg_probe_compile(path, src)
+    let _rm = process_run("rm", ["-f", path])
+    run_mono(program)
+    layout_reset()
+    ir_reset()
+    cg_expr_reset()
+    cg_stmt_reset()
+    let f = find_fn(name)
+    assert(f >= 0)
+    lower_fn(f)
+}
+
+fn src_flat_tuple_destructure() -> Str {
+    #"fn main() {
+    let t: (Int, Int) = (1, 2)
+    let (a, b) = t
+    let _keep = [a + b]
+}
+"#
+}
+
+// The regression this pins: the destructured names must not be wrapped in their own
+// `Block`, since a `Block` is exactly the C scope the next statement's read of `a`/`b`
+// would then fall outside of.
+test "a tuple-destructuring let's bindings are flat in the enclosing block, not a nested one" {
+    let body = probe_fn("cg_stmt_tuple_destructure_flat", src_flat_tuple_destructure(), "main")
+    assert_eq_str("no nested block wraps the destructure", "{shape(body).contains(\"Block(Let(VarRef)\")}", "false")
+}
+
+// A nested tuple pattern (`let (a, (b, c)) = t`) is out of scope here: nr_check_node's
+// LetBinding arm does not recurse name resolution into a nested TuplePattern sub-element,
+// so `b`/`c` never get defined regardless of what codegen does with the C-block scope.
+// That gap is filed as its own bug, separate from the destructuring-let scope fix this
+// file pins.
+
+test "the buffer is empty once a destructuring let is lowered" {
+    let _body = probe_fn("cg_stmt_tuple_destructure_drain", src_flat_tuple_destructure(), "main")
+    assert_eq_str("statements left", "{cg_expr_pending_count()}", "0")
+}
