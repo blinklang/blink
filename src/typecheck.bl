@@ -11781,8 +11781,21 @@ fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "null_ptr" { return make_ptr_type(make_metavar()) }
     if name == "Bytes" { return new_type(TyKind.Bytes, "Bytes") }
     if name == "StringBuilder" { return type_stringbuilder() }
-    if name == "Map" { return make_map_type(make_metavar(), make_metavar()) }
-    if name == "Set" { return make_set_type(make_metavar()) }
+    // An empty `Map()`/`Set()` names nothing about its own elements, so the context that
+    // receives it is the only source of them, exactly as it is for an empty carrier. Read from
+    // the hint rather than left to a bare metavar for a keyed container specifically: its
+    // constructor chooses the operations its keys are compared and hashed by FROM THE KEY TYPE,
+    // so a key the context knows and the mint does not is a container that cannot be built.
+    // Every position that receives one already narrows the hint to the slot the value flows
+    // into -- an annotation, a parameter, a list element, a carrier payload, a field default, a
+    // declared return -- and a hint of any other kind still mints, so a context that names
+    // nothing is unchanged.
+    if name == "Map" {
+        return make_map_type(tc_carrier_slot_from_hint(TyKind.Map, 1), tc_carrier_slot_from_hint(TyKind.Map, 2))
+    }
+    if name == "Set" { return make_set_type(tc_carrier_slot_from_hint(TyKind.Set, 1)) }
+    // Channel stays a bare mint: `channel.new[T](..)` writes its element down at the
+    // construction site, so the ChannelNew arm answers before this one is reached.
     if name == "Channel" { return make_channel_type(make_metavar()) }
     TYPE_UNKNOWN
 }
@@ -14757,6 +14770,38 @@ fn tc_carrier_slot_from_hint(want: TyKind, slot: Int) -> Int {
     other
 }
 
+// `a ?? b` puts b in the Option's ELEMENT slot, so the element is the hint b is built under
+// -- the same narrowing a list element and a carrier payload already get. Without it an empty
+// `Map()` fallback minted its own key and the container's key operations are chosen from a type
+// nothing ever solves. The narrowing runs BEFORE the right operand is inferred, so the first
+// stamp on the constructor is the right one and a later re-inference reads the same hint instead
+// of replacing a solved slot with a fresh metavariable.
+//
+// The unify at the end is the OTHER direction and still needed: `None ?? 99` learns its element
+// from the default, and there the hint has nothing to narrow to.
+// @allow: the construct hint is saved and restored around the single descent below, and the
+// types that descent publishes ARE this function's effect.
+@allow(UnrestoredMutation)
+fn tc_infer_coalesce(node: Int, lt: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let left_k = type_kind(lt)
+    if left_k != TyKind.Option && left_k != TyKind.Unknown {
+        tc_error_at_code("'??' operator requires Option value, got {type_to_str(lt)}", node,
+            "CoalesceRequiresOption", COALESCE_REQUIRES_OPT,
+            "use '??' only on an Option; for a Result use 'match' or '?'")
+    }
+    if left_k != TyKind.Option { return infer_type(node_right(node)) }
+    let opt = tc_resolve(lt)
+    let inner = ty_pool.get(opt).unwrap().inner1
+    let saved_hint = tc_construct_hint
+    if inner >= 0 && tc_tid_is_no_info(inner) == 0 && tc_tid_has_unbound_metavar(inner) == 0 {
+        tc_construct_hint = resolve_alias_tid(inner)
+    }
+    let rt = infer_type(node_right(node))
+    tc_construct_hint = saved_hint
+    if tc_tid_has_unbound_metavar(inner) != 0 { let _ = tc_unify(inner, rt) }
+    tc_resolve(inner)
+}
+
 fn infer_carrier_arg(arg_node: Int, carrier: Str) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let saved_hint = tc_construct_hint
     let k = type_kind(tc_construct_hint)
@@ -15257,6 +15302,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     if kind == NodeKind.BinOp {
         let op = node_op(node)
         let lt = infer_type(node_left(node))
+        // Answered before the shared right-operand inference below: the fallback's hint is the
+        // left side's element type, and it has to be in hand the FIRST time the fallback is
+        // typed, not after.
+        if op == "??" { return tc_infer_coalesce(node, lt) }
         let rt = infer_type(node_right(node))
 
         if is_comparison_op(op) {
@@ -15361,24 +15410,6 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
             if tc_tid_is_no_info(lt) == 0 { return lt }
             return TYPE_INT
-        }
-        if op == "??" {
-            let left_k = type_kind(lt)
-            if left_k != TyKind.Option && left_k != TyKind.Unknown {
-                tc_error_at_code("'??' operator requires Option value, got {type_to_str(lt)}", node,
-                    "CoalesceRequiresOption", COALESCE_REQUIRES_OPT,
-                    "use '??' only on an Option; for a Result use 'match' or '?'")
-            }
-            if left_k == TyKind.Option {
-                // `y ?? default` is a constraining use: the default's type
-                // pins the Option's element α (`None ?? 99` infers y : Int?). Unify
-                // the (possibly-metavar) inner with the default type.
-                let opt = tc_resolve(lt)
-                let inner = ty_pool.get(opt).unwrap().inner1
-                if tc_tid_has_unbound_metavar(inner) != 0 { let _ = tc_unify(inner, rt) }
-                return tc_resolve(inner)
-            }
-            return rt
         }
         if tc_tid_is_no_info(lt) == 0 { return lt }
         return rt
