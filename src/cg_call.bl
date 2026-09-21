@@ -988,15 +988,47 @@ fn lower_namespace_call(node: Int, obj: Int) -> Int ! Diag.Report {
 //
 // `fs.read`, `fs.write`, `fs.list_dir` and `fs.delete` are typecheck's intrinsic-gated
 // spelling of that same signed surface (is_intrinsic_method admits them, so line 914's
-// module-call branch above never sees them); they still have no lowering here. Each one
-// is meant to redirect to the matching fs_do_* declared function fs_ops.bl exports, but
-// building that call needs a declaration node for a function named by module and name
-// alone, not the alias table a written qualifier resolves through, and codegen has no
-// such lookup — only tc_module_let_decl_node exists, for globals. They stay refused
-// until that lookup exists.
+// module-call branch above never sees them). Each one redirects to the matching fs_do_*
+// declared function fs_ops.bl exports: `cc_module_fn_decl` below finds that declaration
+// by module and name alone, the same fact tc_module_let_decl_node already keeps for a
+// top-level `let`, and once it is found the redirect is an ordinary declared call —
+// `cc_free_call` reads the declaration's own row for its symbol, its evidence and its
+// arguments, exactly as it would for a call written `std_fs_ops.fs_do_delete(path)` by
+// hand. `fs.read`, `fs.write` and `fs.list_dir` still have no arm here and stay refused.
 fn lower_fs_call(node: Int, method: Str) -> Int ! Diag.Report {
-    if method != "errno" { return cc_ns_not_built(node, ns_fs, method) }
-    cc_build_call(node, c_runtime_helper("fs_errno_get"), NO_RECEIVER, CallForm.Runtime, false)
+    if method == "errno" {
+        return cc_build_call(node, c_runtime_helper("fs_errno_get"), NO_RECEIVER, CallForm.Runtime, false)
+    }
+    if method == "delete" { return cc_fs_redirect(node, "fs_do_delete") }
+    cc_ns_not_built(node, ns_fs, method)
+}
+
+// `fs_ops.bl` declares no `@module` of its own, so it mangles under the dotted path every
+// loader reaches it by: `std.fs_ops`, the line `std.fs.bl` writes as `pub import
+// std.fs_ops`, underscored the way every module segment is.
+let fs_ops_module = "std_fs_ops"
+
+fn cc_fs_redirect(node: Int, redirect_fn: Str) -> Int ! Diag.Report {
+    let decl = cc_module_fn_decl(fs_ops_module, redirect_fn)
+    if decl < 0 { return cc_ns_not_built(node, ns_fs, node_method(node)) }
+    cc_free_call(node, decl)
+}
+
+// The declaration node of a module-level `fn` named by its module and its own name alone,
+// or -1 when no such function is registered. `cg_reg_fn_decls` already lists every fn
+// declaration the whole program reaches, prelude and every import alike, so this walks
+// that list rather than re-deriving it: a second index would drift from the one cg_reg
+// already builds. A linear scan is enough — this is asked once per intrinsic redirect
+// call site, not once per name the program spells.
+fn cc_module_fn_decl(module: Str, name: Str) -> Int {
+    let decls = cg_reg_fn_decls()
+    let mut i = 0
+    while i < decls.len() {
+        let d = decls.get(i).unwrap()
+        if node_source_module(d) == module && node_name(d) == name { return d }
+        i = i + 1
+    }
+    -1
 }
 
 // The one net method the runtime publishes a call for. The rest of the intrinsic surface

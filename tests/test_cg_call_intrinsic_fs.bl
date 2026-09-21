@@ -3,13 +3,14 @@
 // `fs` is also the name of a real stdlib module (std.fs), so most of what a program
 // writes through it — fs.read, fs.write, fs.list_dir, fs.delete — is the declared,
 // signed Result[T, FsError] surface lib/std/fs_ops.bl exports, not a call this stage
-// builds itself. `fs.errno` is different: it is plumbing, not a Result-returning op.
-// It answers the last raw fs syscall's errno (0 on success) so fs_ops.bl's own wrappers
-// can turn a nonzero code into Err(FsError{...}), the same way a caller who dropped to
-// the raw layer directly (read_file/write_file/list_dir/fs_remove) would check it. The
-// runtime records that value in a thread-local (bootstrap/runtime_core.h) and publishes
-// one call to read it back, so this is a plain zero-argument runtime call, the same
-// shape as io.read_line.
+// builds itself; `fs.delete` redirects there, to fs_ops.fs_do_delete, the same way a
+// call written `std_fs_ops.fs_do_delete(path)` by hand would be built. `fs.errno` is
+// different: it is plumbing, not a Result-returning op. It answers the last raw fs
+// syscall's errno (0 on success) so fs_ops.bl's own wrappers can turn a nonzero code
+// into Err(FsError{...}), the same way a caller who dropped to the raw layer directly
+// (read_file/write_file/list_dir/fs_remove) would check it. The runtime records that
+// value in a thread-local (bootstrap/runtime_core.h) and publishes one call to read it
+// back, so this is a plain zero-argument runtime call, the same shape as io.read_line.
 import lower_test_helpers.{
     probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
 }
@@ -31,4 +32,22 @@ test "fs.errno reaches the runtime errno reader with no argument" {
     assert_shape("fs.errno shape", built, "CallRuntime")
     assert_eq_str("fs.errno symbol", ir_c_name(built), "blink_fs_errno_get")
     assert_verifies("fs.errno", built)
+}
+
+fn src_delete() -> Str {
+    #"import std.fs
+fn main() {
+    let deleted = fs.delete("build/cg_call_fs_probe_target")
+    let _keep = deleted
+}
+"#
+}
+
+test "fs.delete redirects to fs_ops.fs_do_delete with the written path argument" {
+    probe("cg_call_fs_delete", src_delete())
+    let built = lower_expr(rhs_of("deleted"))
+    assert_kind("fs.delete kind", built, IrKind.CallDirect)
+    assert_shape("fs.delete shape", built, "CallDirect(Const, EvidenceAddress(EvidenceVector))")
+    assert_eq_str("fs.delete symbol", ir_c_name(built), "blink_std_fs_ops_fs_do_delete")
+    assert_verifies("fs.delete", built)
 }
