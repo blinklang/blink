@@ -48,9 +48,12 @@ fn count_of(text: Str, needle: Str) -> Int {
     n
 }
 
-// Two wildcard lets in one scope must not both mint a Let under the same C name: C would
-// reject the second as a redefinition of the first.
-test "two wildcard lets in one scope lower to zero Let nodes" {
+// A discarding binder must be told apart from a real tuple pattern before the elements-slot
+// dispatch, or it falls into lower_destructuring_let and mints its holder under the "tup"
+// stem instead of the discard path's own "_cg__N" name -- and a second discard in the same
+// scope would then redeclare the same holder under a colliding name, since the tuple path
+// does not consult the mint counter per discard the way bind_and_declare_let does.
+test "two wildcard lets in one scope go through the discard mint path, not tuple destructuring" {
     run_probe("build/cg_stmt_wildcard_discard.bl", #"fn side_effect(x: Int) -> Int {
     x + 1
 }
@@ -61,13 +64,16 @@ fn probe() {
 fn main() { probe() }
 "#)
     let d = dump_of("probe")
-    assert_eq(count_of(d, "(Let "), 0)
+    assert_eq(count_of(d, "(Let "), 2)
     assert_eq(count_of(d, "(CallDirect "), 2)
+    assert(!d.contains("_cg_tup"))
 }
 
-// A wildcard let over a Void-returning call is discarded the same way as one over a
-// value-returning call: neither mints a placeholder local.
-test "a wildcard let over a Void call lowers to zero Let nodes" {
+// A wildcard let over a Void-returning call must not bind the call's (nonexistent) value
+// straight into a holder the way the tuple-destructuring path does for a value-typed
+// discard -- that mints `int64_t _cg_tupN = void_call();`, which cc rejects. The discard
+// path instead runs the call as its own statement and binds a placeholder unit constant.
+test "a wildcard let over a Void call runs the call as its own statement" {
     run_probe("build/cg_stmt_wildcard_void.bl", #"fn nothing() {
 }
 fn probe() {
@@ -77,5 +83,8 @@ fn probe() {
 fn main() { probe() }
 "#)
     let d = dump_of("probe")
-    assert_eq(count_of(d, "(Let "), 0)
+    assert_eq(count_of(d, "(ExprStmt "), 2)
+    assert_eq(count_of(d, "(Let "), 2)
+    assert_eq(count_of(d, "(Const "), 2)
+    assert(!d.contains("_cg_tup"))
 }
