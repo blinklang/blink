@@ -20,6 +20,7 @@ import layout.{layout_reset}
 import ir.{ir_reset}
 import cg_test_helpers.{cg_probe_compile}
 import cg_stmt.{cg_stmt_reset, lower_block, lower_fn}
+import cg_reg.{cg_reg_reset, cg_reg_build}
 import cg_expr.{cg_expr_reset, cg_expr_pending_count}
 import lower_test_helpers.{
     assert_eq_str, assert_ice_saying, ice_count, ice_count_exactly, last_ice, shape,
@@ -43,6 +44,12 @@ fn lowered_program(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse,
     ir_reset()
     cg_expr_reset()
     cg_stmt_reset()
+    // The intrinsic method table (cg_call.bl) resolves a builtin method's callee by
+    // reading this program's own registry of top-level fn decls, the same registry the
+    // driver builds before lowering. A probe that skips this call leaves the registry
+    // empty, so any real method call this file lowers reports its callee as undeclared.
+    cg_reg_reset()
+    cg_reg_build(program)
     diag_reset()
     let f = find_fn(name)
     assert(f >= 0)
@@ -211,21 +218,28 @@ test "an if in a match guard is left to refuse in the reader" {
 
 // A temp stands at the top of the block, so an arm moved into it runs before everything
 // the source wrote after the point the arm came from. That is only safe when nothing
-// earlier in the statement can decide the arm never runs.
+// earlier in the statement can decide the arm never runs -- so a construct the walk finds
+// in a place it cannot reorder (the three sections above) still refuses by name. Nothing
+// else that precedes a value-position construct in straight-line code decides whether it
+// runs, so the walk hoists each such part into a temp of its own, ahead of the construct's
+// temp, in the order the source wrote them, rather than refusing.
 
-test "an if standing after a question mark refuses by name" {
+test "an if standing after a question mark is hoisted into its own temp" {
     let body = probe_fn("cg_stmt_value_after_try", #"fn pick(h: Option[Int], d: Int) -> Option[Int] {
     let x = h? + (if d == 0 { 1 } else { 2 })
     Some(x)
 }
 "#, "pick")
-    assert_eq_str("block shape", shape(body), "Block")
-    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
-    assert_eq_str("refusals recorded",
-        "{ice_count_exactly("ValuePositionExprMovesWork", "IfExpr in value position stands after work its arms would run before")}", "1")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(VarRef), Let(VarRef), If(Binary(CarrierTag(VarRef), Const), Block(Return(CarrierWrap(Const)))), Let(CarrierUnwrap(VarRef)), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(Binary(VarRef, VarRef)), Return(CarrierWrap(Const, VarRef)))")
 }
 
-test "an if standing after a call refuses by name" {
+// A callee spelled as a bare name is not a read at all -- `g` in `g(1)` never reaches
+// tid_of_node, the same way a namespace or a module qualifier never does, because
+// lower_fn_call resolves it by the declaration the name reaches, not by a value. Only the
+// call itself, `g(1)`, is a real piece of work, and it hoists as one unit.
+test "an if standing after a call is hoisted into its own temp" {
     let body = probe_fn("cg_stmt_value_after_call", #"fn g(n: Int) -> Int { n }
 fn main() {
     let c = 1
@@ -233,9 +247,9 @@ fn main() {
     let _keep = [pair]
 }
 "#, "main")
-    assert_eq_str("block shape", shape(body), "Block")
-    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
-    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let(CallDirect(Const)), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(TupleNew(VarRef, VarRef)), Let(ContainerNew(Box(VarRef))))")
 }
 
 test "an if standing after a literal is materialised" {
@@ -341,7 +355,7 @@ test "a second if materialises after one whose arms hold work" {
         "Block(Let(Const), Let(ContainerNew(Cast(Cast(Const)), Cast(Cast(Const)))), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Cast(Cast(CallRuntime(VarRef, Const))))), Block(Assign(VarRef, Cast(Cast(CallRuntime(VarRef, Const)))))), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(TupleNew(VarRef, VarRef)), Let(ContainerNew(Box(VarRef))))")
 }
 
-test "an if standing after a name read refuses by name" {
+test "an if standing after a name read is hoisted into its own temp" {
     let body = probe_fn("cg_stmt_value_after_read", #"fn main() {
     let c = 1
     let a = 5
@@ -349,67 +363,84 @@ test "an if standing after a name read refuses by name" {
     let _keep = [x]
 }
 "#, "main")
-    assert_eq_str("block shape", shape(body), "Block")
-    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
-    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let(Const), Let(VarRef), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(ContainerNew(Cast(Cast(VarRef)), Cast(Cast(VarRef)))), Let(ContainerNew(Cast(VarRef))))")
 }
 
-test "an if standing after an operator refuses by name" {
+// A name read ahead of a value-position if is real work, but real work a user writes all
+// the time: `xs.push(if c { a } else { b })` reads `xs` before the argument the walk would
+// otherwise refuse. Hoisting the read into its own temp, in the order it was written, keeps
+// the read where the source put it, ahead of the if, so nothing after the if has to move
+// before anything the read could see. Only a read the walk cannot mint a temp for, or an
+// assignment target, still has no lowering.
+test "an if standing after a name read is hoisted into its own temp instead of refused" {
+    let body = probe_fn("cg_stmt_value_hoist_after_read", #"fn main() {
+    let mut out: List[Int] = []
+    let c = 1
+    out.push(if c > 0 { 1 } else { 2 })
+}
+"#, "main")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}
+
+test "an if standing after an operator is hoisted into its own temp" {
     let body = probe_fn("cg_stmt_value_after_binop", #"fn main() {
     let c = 1
     let x = [1 / 2, if c > 0 { 1 } else { 2 }]
     let _keep = [x]
 }
 "#, "main")
-    assert_eq_str("block shape", shape(body), "Block")
-    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
-    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let(Binary(Const, Const)), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(ContainerNew(Cast(Cast(VarRef)), Cast(Cast(VarRef)))), Let(ContainerNew(Cast(VarRef))))")
 }
 
-test "an if standing after a string with a hole refuses by name" {
+test "an if standing after a string with a hole is hoisted into its own temp" {
     let body = probe_fn("cg_stmt_value_after_interp", #"fn main() {
     let c = 1
     let x = ("{c}", if c > 0 { 1 } else { 2 })
     let _keep = [x]
 }
 "#, "main")
-    assert_eq_str("block shape", shape(body), "Block")
-    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
-    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let(CallRuntime(Const, Cast(VarRef))), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(TupleNew(VarRef, VarRef)), Let(ContainerNew(Box(VarRef))))")
 }
 
-test "an if standing after a method call refuses by name" {
+test "an if standing after a method call is hoisted into its own temp" {
     let body = probe_fn("cg_stmt_value_after_method", #"fn main() {
     let c = 1
-    let x = (1.to_str(), if c > 0 { 1 } else { 2 })
+    let text = "abc"
+    let x = (text.index_of("b"), if c > 0 { 1 } else { 2 })
     let _keep = [x]
 }
 "#, "main")
-    assert_eq_str("block shape", shape(body), "Block")
-    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
-    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let(Const), Let(VarRef), Let(Const), Let(CallDirect(VarRef, VarRef)), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(TupleNew(VarRef, VarRef)), Let(ContainerNew(Box(VarRef))))")
 }
 
-test "an if standing after a checked read refuses by name" {
+test "an if standing after a checked read is hoisted into its own temp" {
     let body = probe_fn("cg_stmt_value_after_index", #"fn main() {
     let c = 1
     let x = ([1, 2][0], if c > 0 { 1 } else { 2 })
     let _keep = [x]
 }
 "#, "main")
-    assert_eq_str("block shape", shape(body), "Block")
-    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
-    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let(Cast(Cast(CallRuntime(ContainerNew(Cast(Cast(Const)), Cast(Cast(Const))), Const)))), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(TupleNew(VarRef, VarRef)), Let(ContainerNew(Box(VarRef))))")
 }
 
-test "an if standing after a unary operator refuses by name" {
+test "an if standing after a unary operator is hoisted into its own temp" {
     let body = probe_fn("cg_stmt_value_after_unary", #"fn main() {
     let c = 1
     let x = (-1, if c > 0 { 1 } else { 2 })
     let _keep = [x]
 }
 "#, "main")
-    assert_eq_str("block shape", shape(body), "Block")
-    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
-    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let(Unary(Const)), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(TupleNew(VarRef, VarRef)), Let(ContainerNew(Box(VarRef))))")
 }
