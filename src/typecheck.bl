@@ -6934,6 +6934,20 @@ fn tc_field_target_hint(bare: Str, declared: Int) -> Int {
     tc_subst_evfield_from_instance(declared, h)
 }
 
+// Whether the declared field type is the thing that says what this field value holds,
+// answered WITHOUT inferring the value. A call that mints a return-only type parameter is
+// one way in. A declared container head is the other: an empty `Map()`/`Set()` mints its own
+// element metavariables and names nothing that could ever solve them. A field outside both
+// keeps its own inferred type, so a concrete field still beats the declaration.
+fn tc_pin_field_carries_value_type(v: Int, declared: Int) -> Int {
+    if tc_call_mints_ret_only(v) != 0 { return 1 }
+    let dk = type_kind(resolve_alias_tid(declared))
+    if dk == TyKind.Map || dk == TyKind.Set || dk == TyKind.Option || dk == TyKind.Result {
+        return 1
+    }
+    0
+}
+
 // The source is nominally the same struct, so its type arguments line up with the
 // declaration's parameters one for one. Unifying each against the parameter's own typevar
 // reuses the concrete-wins rule, so a field written beside it still takes priority.
@@ -6971,11 +6985,13 @@ fn tc_struct_lit_instance_tid(stid: Int, node: Int) -> Int ! TypeCheck.Resolve, 
     let mut binds: Map[Str, Int] = Map()
     // Seed from the construction hint before reading any field. A hint naming this same
     // struct already spells the instance's type arguments, and for an empty `Map()`/`Set()`
-    // field it is the ONLY source of them: the field's own value mints a fresh metavar, and
-    // tc_unify refuses to pin a metavar to a typevar, so the enclosing generic's parameter
-    // could never reach the bind map through the field. Left unseeded the literal bound its
-    // parameter to an unsolved metavar and the instance lost its C layout. The concrete-wins
-    // rule keeps precedence intact: a hint's bare typevar still yields to a concrete field.
+    // field it is the ONLY source of them: the field's own value mints fresh metavars and
+    // names nothing that could solve them, so the enclosing generic's parameter could never
+    // reach the bind map through the field. Left unseeded the literal bound its parameter to
+    // an unsolved metavar and the instance lost its C layout. The concrete-wins rule keeps
+    // precedence intact: a hint's bare typevar still yields to a concrete field. The loop
+    // below then reads each field type AT the instance these binds describe, which is what
+    // lets the pin reach the field's own value.
     if tc_construct_hint >= 0 {
         tc_bind_tparams_from_instance(bare, resolve_alias_tid(tc_construct_hint), tparams_sl, binds)
     }
@@ -6985,7 +7001,18 @@ fn tc_struct_lit_instance_tid(stid: Int, node: Int) -> Int ! TypeCheck.Resolve, 
         let fname = node_name(f)
         let declared = get_struct_field_tid(stid, fname)
         if declared != -1 {
-            let ftid = tc_infer_field_value_under(tc_field_target_hint(bare, declared), node_value(f))
+            // The field type read AT THIS INSTANCE, which is also the field value's expected
+            // type. An empty `Map()`/`Set()` field has no other source for its element types:
+            // the value mints its own metavariables and names nothing that could ever solve
+            // them, and a keyed container chooses its key operations from the key type, so an
+            // unbound key answers no table. The bind map still reads the UNSUBSTITUTED
+            // declared type, which is the one carrying the parameters a sibling field or a
+            // spread may yet determine.
+            let at_inst = tc_field_target_hint(bare, declared)
+            let ftid = tc_infer_field_value_under(at_inst, node_value(f))
+            if tc_pin_field_carries_value_type(node_value(f), at_inst) != 0 {
+                tc_pin_tail_ret_generic(at_inst, ftid)
+            }
             unify_typevar_binds(declared, ftid, binds)
         } else {
             // A spread entry (`..base()`) has no field name, and so no declared type to unify
