@@ -1965,7 +1965,7 @@ fn pattern_is_irrefutable(pat: Int, tid: Int) -> Bool ! Diag.Report {
         NodeKind.WildcardPattern => true
         NodeKind.IdentPattern => !is_variant_name(tid, node_name(pat))
         NodeKind.TuplePattern => elements_are_irrefutable(node_elements(pat))
-        NodeKind.StructPattern => fields_are_irrefutable(node_fields(pat))
+        NodeKind.StructPattern => struct_pattern_is_irrefutable(pat, tid)
         NodeKind.AsPattern => pattern_is_irrefutable(node_pattern(pat), tid)
         // A variant pattern refuses only by naming a variant the value might not hold, or
         // by a payload that itself refuses. A type with one variant has no other tag to
@@ -1973,6 +1973,20 @@ fn pattern_is_irrefutable(pat: Int, tid: Int) -> Bool ! Diag.Report {
         NodeKind.EnumPattern => variant_count(tid) == 1 && payload_is_irrefutable(pat)
         _ => false
     }
+}
+
+// A StructPattern node is StructPattern-shaped whether it names a real struct or a bare
+// (unqualified) variant of the scrutinee's enum (see struct_pattern_binds above); only
+// type information at codegen time tells the two apart. When it names a variant it
+// refuses on the same terms as the qualified EnumPattern form above: a type with one
+// variant has no other tag to miss, so only its own field sub-patterns can still refuse.
+// A genuine struct pattern always matches once its own field sub-patterns do.
+fn struct_pattern_is_irrefutable(pat: Int, tid: Int) -> Bool ! Diag.Report {
+    let sname = node_type_name(pat)
+    if is_variant_name(tid, sname) {
+        return variant_count(tid) == 1 && fields_are_irrefutable(node_fields(pat))
+    }
+    fields_are_irrefutable(node_fields(pat))
 }
 
 // A part of a pattern decides on its own recorded type, because whether a bare name
@@ -2018,6 +2032,11 @@ fn pattern_is_labelled(raw: Int, tid: Int) -> Bool ! Diag.Report {
         NodeKind.IntPattern => tid_is_ordinal(tid)
         NodeKind.EnumPattern => payload_is_irrefutable(pat)
         NodeKind.IdentPattern => is_variant_name(tid, node_name(pat))
+        // A bare struct-style variant pattern reduces to one tag comparison exactly when
+        // the qualified spelling would: it names a variant, and its own field
+        // sub-patterns never refuse (any that could, made the whole arm need more than a
+        // label, and fall through to the `if` chain below instead).
+        NodeKind.StructPattern => is_variant_name(tid, node_type_name(pat)) && fields_are_irrefutable(node_fields(pat))
         _ => false
     }
 }
@@ -2060,9 +2079,25 @@ fn pattern_binds(ctx: MatchCtx, pat: Int, out: List[Int]) -> Bool ! Diag.Report 
         }
         NodeKind.EnumPattern => payload_binds(ctx, pat, out)
         NodeKind.TuplePattern => tuple_pattern_binds(ctx, pat, out)
-        NodeKind.StructPattern => field_pattern_binds(ctx, pat, "", out)
+        NodeKind.StructPattern => struct_pattern_binds(ctx, pat, out)
         _ => true
     }
+}
+
+// A StructPattern's own type_name may in fact be a bare (unqualified) variant name: the
+// parser cannot tell `NotFound { msg }` from a real struct pattern without type
+// information, so both share this node kind — only the qualified `Type.Variant { .. }`
+// form parses as EnumPattern (see the struct-style arm of payload_binds below). When it
+// does name a variant of the scrutinee, its fields still read through that variant's own
+// union member, the same prefix payload_binds' struct-style arm builds for the qualified
+// spelling; a plain struct has no such member and reads its fields off the scrutinee
+// itself.
+fn struct_pattern_binds(ctx: MatchCtx, pat: Int, out: List[Int]) -> Bool ! Diag.Report {
+    let sname = node_type_name(pat)
+    if is_variant_name(ctx.tid, sname) {
+        return field_pattern_binds(ctx, pat, "{c_enum_payload_member()}.{sname}", out)
+    }
+    field_pattern_binds(ctx, pat, "", out)
 }
 
 fn bind_whole(ctx: MatchCtx, pat: Int, out: List[Int]) ! Diag.Report {
