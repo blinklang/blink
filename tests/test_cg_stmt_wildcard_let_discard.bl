@@ -1,0 +1,81 @@
+import std.fs
+import typecheck.{check_types}
+import layout.{layout_reset}
+import mono.{run_mono}
+import ir.{ir_dump, ir_reset, ir_verify}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+import diagnostics.{diag_reset}
+import cg_stmt.{cg_stmt_reset, lower_fn}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn run_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    diag_reset()
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+}
+
+fn dump_of(name: Str) -> Str ! Diag.Report {
+    let f = find_fn(name)
+    assert(f >= 0)
+    let root = lower_fn(f)
+    assert_eq(ir_verify(root).len(), 0)
+    ir_dump(root)
+}
+
+fn count_of(text: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut rest = text
+    while rest.contains(needle) {
+        n = n + 1
+        rest = rest.slice(rest.index_of(needle) + needle.len(), rest.len())
+    }
+    n
+}
+
+// Two wildcard lets in one scope must not both mint a Let under the same C name: C would
+// reject the second as a redefinition of the first.
+test "two wildcard lets in one scope lower to zero Let nodes" {
+    run_probe("build/cg_stmt_wildcard_discard.bl", #"fn side_effect(x: Int) -> Int {
+    x + 1
+}
+fn probe() {
+    let _ = side_effect(1)
+    let _ = side_effect(2)
+}
+fn main() { probe() }
+"#)
+    let d = dump_of("probe")
+    assert_eq(count_of(d, "(Let "), 0)
+    assert_eq(count_of(d, "(CallDirect "), 2)
+}
+
+// A wildcard let over a Void-returning call is discarded the same way as one over a
+// value-returning call: neither mints a placeholder local.
+test "a wildcard let over a Void call lowers to zero Let nodes" {
+    run_probe("build/cg_stmt_wildcard_void.bl", #"fn nothing() {
+}
+fn probe() {
+    let _ = nothing()
+    let _ = nothing()
+}
+fn main() { probe() }
+"#)
+    let d = dump_of("probe")
+    assert_eq(count_of(d, "(Let "), 0)
+}
