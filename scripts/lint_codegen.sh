@@ -100,6 +100,7 @@ c_builtin_effect_slot cname
 c_kops_table_name cname
 td_guard_name cname
 c_mint_local cname
+c_tuple_member cname
 c_type_of layout
 carrier_tag_of layout
 ensure_typedef_for layout
