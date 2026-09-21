@@ -3,7 +3,7 @@ import std.io
 import layout.{layout_reset}
 import cg_print.{print_reset, print_take}
 import cg_reg.{cg_reg_reset, cg_reg_build}
-import cg_decl.{cg_decl_reset, cg_decl_emit_typedefs}
+import cg_decl.{cg_decl_reset, cg_decl_emit_typedefs, cg_decl_emit_ev}
 import cg_test_helpers.{cg_probe_compile}
 
 fn assert_eq_int(label: Str, got: Int, want: Int) {
@@ -32,10 +32,44 @@ fn main() {
 "#
 }
 
+// A handler field holds a pointer to its root effect's vtable, so that typedef is a
+// dependency of the embedding struct exactly as a nominal member is. The operation takes a
+// struct by value, which makes the graph run through the effect in both directions: Point
+// must be complete where the vtable names it, and the vtable must be complete where Env
+// names it.
+fn handler_field_src() -> Str {
+    #"type Point {
+    x: Int
+    y: Int
+}
+effect Metrics {
+    effect Emit {
+        fn at(p: Point)
+    }
+}
+type Env {
+    m: Handler[Metrics]
+}
+fn mk() -> Handler[Metrics] {
+    handler Metrics {
+        fn at(p: Point) {
+            io.println("{p.x},{p.y}")
+        }
+    }
+}
+fn main() {
+    let e: Env = Env { m: mk() }
+    with e.m {
+        metrics.at(Point { x: 1, y: 2 })
+    }
+}
+"#
+}
+
 // The probe is deleted BEFORE any assertion so a red row never leaves the file behind.
-fn typedef_text() -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
-    let path = "build/cg_decl_typedef_order_probe_src.bl"
-    let program = cg_probe_compile(path, probe_src())
+fn typedefs_of(name: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    let program = cg_probe_compile(path, src)
     layout_reset()
     let _ = fs.delete(path)
     print_reset()
@@ -44,6 +78,27 @@ fn typedef_text() -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCh
     cg_decl_reset()
     cg_decl_emit_typedefs()
     print_take()
+}
+
+// The whole declaration half in the order `emit_declarations` writes it: the typedefs, then
+// the evidence vector the effect declarations feed. A unit is what a C compiler reads, so a
+// typedef written once by the graph walk and once again by the vector is measured here.
+fn declaration_half_of(name: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    let program = cg_probe_compile(path, src)
+    layout_reset()
+    let _ = fs.delete(path)
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    cg_decl_emit_typedefs()
+    cg_decl_emit_ev("")
+    print_take()
+}
+
+fn typedef_text() -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    typedefs_of("cg_decl_typedef_order_probe_src", probe_src())
 }
 
 fn at(text: Str, needle: Str) -> Int {
@@ -101,3 +156,29 @@ test "a shared member type is emitted once under one guard" {
     assert_eq_int("one Holder typedef", count_of(text, "} blink_Holder;"), 1)
 }
 
+
+// A struct field of handler type names the root effect's vtable by pointer, and C must have
+// read that typedef where the field names it. The vtable is written by the effect
+// declarations, so the graph walk has to reach it from the member the same way it reaches a
+// nominal struct.
+test "a struct with a handler field emits the effect vtable typedef first" {
+    let text = typedefs_of("cg_decl_handler_field_probe_src", handler_field_src())
+    assert_before(text, "} blink_ue_metrics_vtable;", "} blink_Env;")
+}
+
+// The dependency runs the other way through the operation's signature: a parameter taken by
+// value is named inside the vtable typedef, so its own typedef comes first.
+test "an operation parameter taken by value is complete where the vtable names it" {
+    let text = typedefs_of("cg_decl_handler_param_probe_src", handler_field_src())
+    assert_before(text, "} blink_Point;", "} blink_ue_metrics_vtable;")
+}
+
+// One vtable typedef per unit, whichever half of the declaration pass reaches the effect
+// first. The evidence vector names the same type, and a second typedef of it would be a
+// redefinition in the unit that carries both.
+test "the declaration half writes one vtable typedef however it is reached" {
+    let text = declaration_half_of("cg_decl_handler_unit_probe_src", handler_field_src())
+    assert_eq_int("one vtable typedef", count_of(text, "} blink_ue_metrics_vtable;"), 1)
+    assert_eq_int("one vtable guard", count_of(text, "#ifndef BLINK_TD_blink_ue_metrics_vtable\n"), 1)
+    assert_before(text, "} blink_ue_metrics_vtable;", "} blink_Env;")
+}
