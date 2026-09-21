@@ -38,6 +38,7 @@ import diagnostics.{
     FFI_SCOPE_NOT_WITH_RESOURCE, RAW_BYPASSES_PARAM, RAW_OUTSIDE_TEMPLATE,
     PTR_OUTSIDE_FFI, FFI_STRUCT_GC_FIELD, BYTES_GROW_IN_WITH_PTR,
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
+    FFI_OFFSET_ON_SINGLETON, FFI_OFFSET_UNKNOWN_STRIDE,
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905,
     TRAIT_CONTRACT_906, TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
@@ -8179,6 +8180,51 @@ fn tc_ptr_ffi_struct_pointee(ptr_tid: Int) -> Int {
     if pointee < 0 { return 0 }
     if ffi_struct_type_set.contains_key(pointee) != 0 { return 1 }
     0
+}
+
+// Does this node denote an `FfiScope`? Read out of the memo, and out of the scope for a name
+// the memo has not reached, because the question is asked in the middle of the walk that
+// fills the memo and re-inferring here would re-report whatever the node already reported.
+fn tc_node_is_ffi_scope_value(n: Int) -> Int {
+    if n == -1 { return 0 }
+    let mut t = tc_lookup_node_tid(n)
+    if tc_tid_is_no_info(t) != 0 {
+        if node_kind(n) == NodeKind.Ident { t = nr_get_type(node_name(n)) }
+    }
+    if tc_tid_is_no_info(t) != 0 { return 0 }
+    if type_kind(tc_resolve(t)) == TyKind.FfiScope { return 1 }
+    0
+}
+
+// Was this pointer allocated as ONE cell (`scope.alloc()`) rather than as an array
+// (`scope.alloc_n(n)`)? sections/07_trust_modules_metadata.md:655 rejects `offset` on the
+// singleton-cell result, because every address past cell 0 is outside the allocation.
+//
+// The same sentence PERMITS `offset` only on an `alloc_n` result or on another `offset`,
+// which is stricter than what is rejected here: a `Ptr` from a C function, a field or a
+// parameter reaches this test and is allowed through. Naming one of those E0813 would be
+// false — it is not a singleton allocation — and the spec defines no code for a pointer whose
+// allocation is simply unknown, so the stricter reading needs a decision before it can be
+// reported at all.
+//
+// The allocator comes from the DECLARATION the name reads, through the scope that resolved
+// it, not from a table keyed by the name: two functions may each bind `p`, one to a cell and
+// one to an array, and a name-keyed answer would let the first reject the second.
+//
+// A receiver that is not a plain name answers 0. `p.offset(1).offset(1)` steps a value no
+// `let` declares, and the honest answer there is that the allocation is unknown, not that it
+// is a singleton — a rule that guessed would reject the stepping the spec allows.
+fn tc_ptr_reads_singleton_alloc(obj_node: Int) -> Int {
+    if obj_node == -1 { return 0 }
+    if node_kind(obj_node) != NodeKind.Ident { return 0 }
+    let decl = nr_binding_node(node_name(obj_node))
+    if decl == -1 { return 0 }
+    if node_kind(decl) != NodeKind.LetBinding { return 0 }
+    let init = node_value(decl)
+    if init == -1 { return 0 }
+    if node_kind(init) != NodeKind.MethodCall { return 0 }
+    if node_method(init) != "alloc" { return 0 }
+    tc_node_is_ffi_scope_value(node_obj(init))
 }
 
 // Does the pointee written as `name` carry an FFI annotation? Resolved to a tid first, because
@@ -16492,6 +16538,23 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // load-bearing at lib/std/libc.bl:52,:68.
             if method == "offset" {
                 check_builtin_arg(method, 0, TYPE_INT, args_sl, "Ptr")
+                // The step is `sizeof` the pointee's C typedef, and only an `@ffi.struct`
+                // pointee has one. Both rules are reported HERE, at the site that types the
+                // method: codegen reported the stride rule as an ICE, which named a program
+                // the user wrote wrong an internal compiler error.
+                if tc_ptr_ffi_struct_pointee(obj_t) == 0 {
+                    diag_error_at("FfiOffsetUnknownStride", FFI_OFFSET_UNKNOWN_STRIDE,
+                        "`offset` needs a pointee whose size is known at compile time, and {type_to_str(obj_t)} does not point at an `@ffi.struct`",
+                        node,
+                        "annotate the pointee type `@ffi.struct`, or walk the bytes through a `Bytes` value")
+                } else if tc_ptr_reads_singleton_alloc(obj_node) != 0 {
+                    // Only once the stride is known: a pointee with no stride is the more
+                    // basic error, and two reports for one call name one fault twice.
+                    diag_error_at("FfiOffsetOnSingleton", FFI_OFFSET_ON_SINGLETON,
+                        "`offset` on a pointer from `scope.alloc()`, which allocates a single cell",
+                        node,
+                        "allocate an array with `scope.alloc_n(n)` when the pointer is stepped")
+                }
                 return obj_t
             }
             if method == "to_str" { return make_option_type(TYPE_STR) }

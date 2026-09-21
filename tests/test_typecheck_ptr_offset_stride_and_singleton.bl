@@ -1,0 +1,139 @@
+// `Ptr.offset(i)` steps by the pointee, so it is legal only when the compiler knows the
+// stride and the allocation has more than one cell. Two diagnostics say so —
+// `E0838 FfiOffsetUnknownStride` and `E0813 FfiOffsetOnSingleton` — and both were defined,
+// explained and cited as this method's defining errors while no pass emitted either. The
+// stride half was left to codegen, which reported it as an ICE: an internal-compiler-error
+// name for a program the user wrote wrong.
+//
+// Both are questions about types and about the declaration a name reads, so both are
+// answered here, at the call site that types the method.
+//
+// The singleton half reads the ALLOCATOR out of the receiver's own declaration, not out of a
+// table keyed by name: two functions may each bind `p`, one to a single cell and one to an
+// array, and a name-keyed answer would let the first poison the second.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+let PROBE = "build/tc_ptr_offset_probe.bl"
+
+let POLLFD = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\ntype Pollfd \{ fd: I32, events: I16, revents: I16 }\n"
+
+fn compile_probe(src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    write_file(PROBE, src)
+    diag_reset()
+    let program = compile_to_program(PROBE, 0)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", PROBE])
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name} {d.code}: {d.message}") }
+    }
+    out
+}
+
+fn count_named(name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.name == name {
+            if d.severity == "error" || d.severity == "ice" { n = n + 1 }
+        }
+    }
+    n
+}
+
+// Failures report on stderr: a failing assert aborts, and an abort drops whatever stdout has
+// buffered, which would leave the reader a bare core-dump line and no reason for it.
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.eprintln("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.eprintln("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn assert_named_error(label: Str, name: Str) {
+    let n = count_named(name)
+    if n < 1 {
+        io.eprintln("FAIL: {label}: want at least one {name}, got:")
+        for e in error_messages() { io.eprintln("  {e}") }
+    }
+    assert(n >= 1)
+}
+
+fn assert_not_named(label: Str, name: Str) {
+    let n = count_named(name)
+    if n != 0 {
+        io.eprintln("FAIL: {label}: want no {name}, got:")
+        for e in error_messages() { io.eprintln("  {e}") }
+    }
+    assert(n == 0)
+}
+
+// ── The stride rule ──────────────────────────────────────────────────────────────────
+
+// An @ffi.struct pointee has a C typedef, so the stride is `sizeof` that typedef.
+fn test_offset_over_an_ffi_struct_pointee_is_allowed() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("{POLLFD}@trusted(audit: \"probe\")\nfn main() ! FFI \{ with ffi.scope() as scope \{\n let p: Ptr[Pollfd] = scope.alloc_n(3)\n let c = p.offset(1)\n c.fd.write(0)\n } }\n")
+    assert_no_errors("offset over Ptr[Pollfd] from alloc_n")
+}
+
+// A scalar pointee is a valid `Ptr` target but carries no @ffi.struct typedef, so there is no
+// C type whose `sizeof` is the step. Reported, not guessed: a guessed stride is a wrong
+// address. The spec's operations table (07:273) writes `offset` only over an `alloc_n` region
+// of an annotated struct and defines no stride for anything else.
+fn test_offset_over_a_scalar_pointee_is_rejected() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("@trusted(audit: \"probe\")\nfn main() ! FFI \{ with ffi.scope() as scope \{\n let p: Ptr[Int] = scope.alloc_n(3)\n let _c = p.offset(1)\n } }\n")
+    assert_named_error("offset over Ptr[Int]", "FfiOffsetUnknownStride")
+    assert_not_named("offset over Ptr[Int]", "FfiOffsetOnSingleton")
+}
+
+// The closure-parameter shape. A `Bytes.with_ptr` closure receives a `Ptr[U8]`: a pointer
+// with no declaration to consult and no annotation to carry a stride. A reader that located
+// the pointer by C kind alone would find a pointer either way and borrow a stride the type
+// never had.
+fn test_offset_on_a_byte_pointer_parameter_is_rejected() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("@trusted(audit: \"probe\")\nfn go() ! FFI \{ let b = Bytes.new()\n b.push(1)\n let _r = b.with_ptr(fn(p) \{ p.offset(1) })\n }\nfn main() \{ }\n")
+    assert_named_error("offset on a with_ptr closure's Ptr[U8]", "FfiOffsetUnknownStride")
+}
+
+// ── The singleton rule ───────────────────────────────────────────────────────────────
+
+// `scope.alloc()` allocates one cell, so every address past cell 0 is outside the
+// allocation (07:655, 07:273, 07:926).
+fn test_offset_on_a_singleton_allocation_is_rejected() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("{POLLFD}@trusted(audit: \"probe\")\nfn main() ! FFI \{ with ffi.scope() as scope \{\n let p: Ptr[Pollfd] = scope.alloc()\n let _c = p.offset(1)\n } }\n")
+    assert_named_error("offset on scope.alloc()", "FfiOffsetOnSingleton")
+    assert_not_named("offset on scope.alloc()", "FfiOffsetUnknownStride")
+}
+
+// ── Controls: the two rules must not misfire ─────────────────────────────────────────
+
+// The receiver of the second step is the first step's result, which no `let` declares as an
+// allocation. An answer that fell back to the nearest allocator it could find would reject it.
+fn test_offset_on_the_result_of_an_offset_is_allowed() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("{POLLFD}@trusted(audit: \"probe\")\nfn main() ! FFI \{ with ffi.scope() as scope \{\n let p: Ptr[Pollfd] = scope.alloc_n(4)\n let c = p.offset(1).offset(1)\n c.fd.write(0)\n } }\n")
+    assert_no_errors("offset on the result of an offset")
+}
+
+// Two functions, one name. The singleton is declared FIRST, so a table keyed by the name
+// alone would still hold it when the array binding of the same name is offset.
+fn test_a_singleton_in_another_function_does_not_reject_this_ones_array() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("{POLLFD}@trusted(audit: \"probe\")\nfn one() ! FFI \{ with ffi.scope() as scope \{\n let p: Ptr[Pollfd] = scope.alloc()\n p.fd.write(0)\n } }\n@trusted(audit: \"probe\")\nfn many() ! FFI \{ with ffi.scope() as scope \{\n let p: Ptr[Pollfd] = scope.alloc_n(2)\n let c = p.offset(1)\n c.fd.write(0)\n } }\n@trusted(audit: \"probe\")\nfn main() ! FFI \{ one() many() }\n")
+    assert_no_errors("an array `p` after a singleton `p` in another function")
+}
+
+fn main() {
+    test_offset_over_an_ffi_struct_pointee_is_allowed()
+    test_offset_over_a_scalar_pointee_is_rejected()
+    test_offset_on_a_byte_pointer_parameter_is_rejected()
+    test_offset_on_a_singleton_allocation_is_rejected()
+    test_offset_on_the_result_of_an_offset_is_allowed()
+    test_a_singleton_in_another_function_does_not_reject_this_ones_array()
+    io.println("Ptr.offset stride and singleton rules: ok")
+}
