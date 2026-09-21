@@ -1,0 +1,121 @@
+// A keyed container's constructor chooses its key operations from the key type, so the
+// constructor node's own tid has to carry the key the program builds. A struct literal's
+// declared FIELD type is the only thing that says what an empty container field holds:
+//
+//     type Holder { m: Map[Str, Int] }
+//     let h = Holder { m: Map() }
+//
+// The rows read the key slot the way the constructor reads it -- through the field value's
+// own tid, then one slot down, then the key operations table on that slot's layout. A key
+// that answers no table is a key the constructor cannot build, whatever the source says.
+//
+// Every row names its instance, because an ALL-TYPEVAR annotation (`let r: SLRG[T] = SLRG {
+// s: Set() }` inside `fn fresh[T]()`) resolves to the bare struct head by design -- a generic
+// head carries no argument slot for the field type to be read at, so that shape reaches this
+// position with no instance at all and is a defect of its own, upstream of this one.
+
+import lower_test_helpers.{probe, rhs_of, assert_eq_str}
+import layout.{
+    Position, Slot, child_tid, layout_of, layout_reset, set_current_inst, tid_of_node,
+}
+import mono.{run_mono}
+import parser.{node_fields, node_name, node_value, sublist_get, sublist_length}
+import typecheck.{tc_type_str}
+
+// The value node of one named field of a struct literal, or -1. The rows name their field,
+// so a literal that gained a field still answers about the one the row means.
+fn field_value_of(lit: Int, field: Str) -> Int {
+    let flds = node_fields(lit)
+    if flds == -1 { return -1 }
+    let n = sublist_length(flds)
+    let mut i = 0
+    while i < n {
+        let f = sublist_get(flds, i)
+        if node_name(f) == field { return node_value(f) }
+        i = i + 1
+    }
+    -1
+}
+
+// The key operations table the field's container constructor would read, rendered so a slot
+// with no table shows the slot's own type inside angle brackets. That tells an unsolved slot
+// apart from a type that declines a table for a reason.
+fn key_table(ctor: Int, slot: Slot) -> Str ! Diag.Report {
+    let key = child_tid(tid_of_node(ctor), slot)
+    let table = layout_of(key, Position.Local).kops_table
+    if table == "" { return "<{tc_type_str(key)}>" }
+    table
+}
+
+test "a concrete Map field of a monomorphic struct carries its key" {
+    let program = probe("layout_slfield_mono", #"type SLHolder { m: Map[Str, Int] }
+fn main() {
+    let probe_h = SLHolder { m: Map() }
+    let _n = probe_h.m.len()
+}
+"#)
+    run_mono(program)
+    layout_reset()
+    set_current_inst(-1)
+    assert_eq_str("SLHolder.m key", key_table(field_value_of(rhs_of("probe_h"), "m"), Slot.Inner1),
+        "blink_kops_str")
+}
+
+test "a Map field declared over two type parameters carries the instance key" {
+    let program = probe("layout_slfield_kv", #"type SLKV[K, V] { m: Map[K, V] }
+fn main() {
+    let probe_kv: SLKV[Int, Str] = SLKV { m: Map() }
+    let _n = probe_kv.m.len()
+}
+"#)
+    run_mono(program)
+    layout_reset()
+    set_current_inst(-1)
+    assert_eq_str("SLKV[Int, Str].m key", key_table(field_value_of(rhs_of("probe_kv"), "m"), Slot.Inner1),
+        "blink_kops_i64")
+}
+
+test "a field whose declared type is the type parameter itself carries its element" {
+    let program = probe("layout_slfield_box", #"type SLBox[T] { v: T }
+fn main() {
+    let probe_box: SLBox[Set[Int]] = SLBox { v: Set() }
+    let _n = probe_box.v.len()
+}
+"#)
+    run_mono(program)
+    layout_reset()
+    set_current_inst(-1)
+    assert_eq_str("SLBox[Set[Int]].v element", key_table(field_value_of(rhs_of("probe_box"), "v"), Slot.Inner1),
+        "blink_kops_i64")
+}
+
+test "a nested struct literal reads its own field type through the outer field" {
+    let program = probe("layout_slfield_nested", #"type SLInner[T] { s: Set[T] }
+type SLOuter { g: SLInner[Int] }
+fn main() {
+    let probe_outer = SLOuter { g: SLInner { s: Set() } }
+    let _n = probe_outer.g.s.len()
+}
+"#)
+    run_mono(program)
+    layout_reset()
+    set_current_inst(-1)
+    let inner = field_value_of(rhs_of("probe_outer"), "g")
+    assert_eq_str("SLOuter.g.s element", key_table(field_value_of(inner, "s"), Slot.Inner1),
+        "blink_kops_i64")
+}
+
+// The control: the same constructor written as the whole initializer of an annotated let
+// already carries its key, so a row above failing while this one passes says the defect is
+// the struct-literal field position and nothing else.
+test "the same constructor in an annotated let still carries its key" {
+    let program = probe("layout_slfield_control", #"fn main() {
+    let mut probe_direct: Map[Str, Int] = Map()
+    probe_direct.insert("a", 1)
+}
+"#)
+    run_mono(program)
+    layout_reset()
+    set_current_inst(-1)
+    assert_eq_str("annotated let key", key_table(rhs_of("probe_direct"), Slot.Inner1), "blink_kops_str")
+}
