@@ -189,6 +189,50 @@ pub fn closure_thunk_params(params: List[Str]) -> List[Str] {
     ps
 }
 
+// ── Spawn ────────────────────────────────────────────────────────────────────
+//
+// A spawned closure's task wrapper is the one function the pool thread calls: it unpacks
+// the pair the submit site allocated, calls the closure through its own fn_ptr the way an
+// inline call would, and stashes the answer in the handle. Every wrapper shares one pair
+// shape -- two pointers, neither depending on the closure's own return type -- so one
+// typedef serves every spawn site in the unit, printed once and reused.
+pub fn em_spawn_pair_typedef(pair_spelling: Str) {
+    em_line("typedef struct \{ const blink_closure* closure; blink_handle* handle; } {pair_spelling};")
+}
+
+// `boxed` and `slot_word` are the same two facts Position.ContainerSlot answers for a
+// container element, read at the closure's own return type: boxed means the value is
+// wider than a pointer and travels as the address of a heap copy, and a non-empty
+// slot_word is the pointer-wide integer a narrower value is punned through. Neither set
+// names a pointer already the cell's own width, which needs no conversion at all.
+//
+// A closure returning nothing has no answer to box, slot, or pun -- Position.ContainerSlot
+// has no inline form for a void-like kind, so `boxed`/`slot_word` are never consulted for
+// it -- and the call is made for effect only, with the handle's result set to NULL so an
+// awaiter still has something to unblock on. The caller reads the closure's own return
+// tid to tell this case apart, not the spelling: cg_emit prints text, it does not compare
+// against one.
+pub fn em_spawn_task_wrapper(pair_spelling: Str, ret_spelling: Str, task_symbol: Str, is_void: Bool, boxed: Bool, slot_word: Str) {
+    em_open_brace("static void {task_symbol}(void* __arg)")
+    em_line("{pair_spelling}* __p = ({pair_spelling}*)__arg;")
+    if is_void {
+        em_line("(({ret_spelling}(*)(const blink_closure*))__p->closure->fn_ptr)(__p->closure);")
+        em_line("blink_handle_set_result(__p->handle, (void*)0);")
+    } else {
+        em_line("{ret_spelling} __r = (({ret_spelling}(*)(const blink_closure*))__p->closure->fn_ptr)(__p->closure);")
+        if boxed {
+            em_line("{ret_spelling}* __box = ({ret_spelling}*)blink_alloc(sizeof({ret_spelling}));")
+            em_line("*__box = __r;")
+            em_line("blink_handle_set_result(__p->handle, (void*)__box);")
+        } else if slot_word != "" {
+            em_line("blink_handle_set_result(__p->handle, (void*)({slot_word})__r);")
+        } else {
+            em_line("blink_handle_set_result(__p->handle, (void*)__r);")
+        }
+    }
+    em_close_brace("")
+}
+
 pub fn em_global_decl(spelling: Str, name: Str, is_extern: Bool) {
     let prefix = if is_extern { "extern " } else { "" }
     em_line("{prefix}{spelling} {name};")
