@@ -20,8 +20,10 @@ import parser.{
 }
 import typecheck.{
     TyKind, TYPE_BOOL, TYPE_CHAR, TYPE_FLOAT, TYPE_INT, TYPE_STR, TYPE_VOID,
-    tc_alias_to_original, tc_enum_has_payload, tc_global_decl_node, tc_let_binder_is_discard,
-    tc_lookup_node_tid, tc_tid_decl_node, tc_tid_kind, make_list_type,
+    tc_alias_to_original, tc_enum_has_payload, tc_enum_variant_slots, tc_evar_field_slots,
+    tc_evar_name, tc_evfield_name, tc_evfield_tid, tc_global_decl_node, tc_let_binder_is_discard,
+    tc_lookup_node_tid, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots, tc_tid_decl_node,
+    tc_tid_kind, tk_name, make_list_type,
 }
 import layout.{
     Position, Slot, SlotForm, LayoutRecord, bind_binder, bind_binder_cell, bind_binder_mut, binder_is_celled,
@@ -58,9 +60,9 @@ import cg_eff.{
     cg_eff_scan_shared_binders,
 }
 import cg_call.{
-    AssertKind, ForInIteration, ForInStrategy, cc_assert_family_kind, cc_is_ptr_write_stmt,
-    cc_lower_ptr_write_stmt, cg_call_element_from_runtime, cg_call_element_from_slot,
-    for_in_iteration_of,
+    AssertKind, ForInIteration, ForInStrategy, cc_assert_family_kind, cc_display_or_placeholder,
+    cc_is_ptr_write_stmt, cc_lower_ptr_write_stmt, cg_call_element_from_runtime,
+    cg_call_element_from_slot, for_in_iteration_of,
 }
 import unparse.{unparse_expr}
 
@@ -466,13 +468,6 @@ fn assert_args_ok(node: Int, name: Str, args: Int, want: Int) -> Bool ! Diag.Rep
     false
 }
 
-fn assert_aggregate_refused(node: Int, form: Str) -> Int ! Diag.Report {
-    diag_ice_at("AssertCompareAggregateNotBuilt", CODEGEN_STAGE_NOT_BUILT,
-        "{form} over a struct, an enum, a Result or an Option has no lowering yet", node,
-        "only Str, Float and the integer, Bool and Char scalars compare and render here so far")
-    -1
-}
-
 // ── assert(cond, msg?): the power-assert decomposition ────────────────────
 
 // What assert's decomposition answers: either the whole condition, unchanged, with no
@@ -632,8 +627,8 @@ fn lower_assert_call(node: Int) -> Int ! Diag.Report {
 // gen0 casts every scalar in this bucket to int64_t and renders it %lld, Bool and Char
 // included, regardless of signedness; there is no separate unsigned bucket here. Str
 // compares by blink_str_eq and renders %s; Float compares by != and renders %f, not the
-// %g assert's own intro uses. A struct, an enum, a Result or an Option refuses by name;
-// see assert_aggregate_refused.
+// %g assert's own intro uses. A struct, an enum, a Result or an Option walks its fields
+// or its tagged arm instead; see agg_cmp below.
 // The cast this bucket renders is built once and read twice (once in the failure
 // message, once as its own exp/act arg), so it must materialise the same as a Bound.
 fn eq_default_arg(tid: Int, span: Int, value_ref: Int) -> Int ! Diag.Report {
@@ -649,6 +644,337 @@ fn eq_is_aggregate(tid: Int) -> Bool ! Diag.Report {
     k == TyKind.Struct || k == TyKind.Enum || k == TyKind.Result || k == TyKind.Option
 }
 
+// ── assert_eq / assert_ne over a struct, an enum, a Result or an Option ───
+//
+// No @derive(Eq) is asked for here: gen0's own assert_eq walked a struct's fields with
+// no trait bound at all, and this keeps that. A struct compares field by field; an enum,
+// a Result and an Option compare their tag first and only the active arm's fields after,
+// the same order gen0 used for Result and Option and the order a payload read always
+// needs, since reading a union member through the wrong tag is undefined. Every walk is
+// keyed on TyKind and reads a field through child_tid or field_layout_of, never by name.
+//
+// A tag-guarded arm needs a runtime switch, which a single Bool expression cannot hold,
+// so a walk answers in two parts: `pre`, the statements a switch needs hoisted ahead of
+// the read, and `differs`, the Bool value those statements leave ready. A struct needs no
+// switch, so its `pre` is empty and its `differs` is one OR-chain built straight from its
+// fields.
+
+type AggCmp {
+    pre: List[Int]
+    differs: Int
+}
+
+fn agg_bool_spelling(span: Int) -> Str ! Diag.Report {
+    layout_at(TYPE_BOOL, Position.Local, span).c_spelling
+}
+
+// The kinds whose C inequality is the language's, the same set @derive(Eq) compares by
+// !=. Float is absent: the language equates NaN with NaN and C's != does not.
+fn agg_is_scalar_kind(k: TyKind) -> Bool {
+    if k == TyKind.Int || k == TyKind.Bool || k == TyKind.Char { return true }
+    if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return true }
+    if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return true }
+    false
+}
+
+// Whether two values differ, when a runtime helper answers whether they are equal.
+fn agg_helper_differs(helper: Str, lhs: Int, rhs: Int, bools: Str, span: Int) -> Int ! Diag.Report {
+    ir_unary(TYPE_BOOL, span, bools, "!",
+        ir_call_runtime(TYPE_BOOL, span, bools, c_runtime_helper(helper), SlotForm.InlineWord, [lhs, rhs]))
+}
+
+// One field or one tagged arm's comparison, dispatched on the value's own tid. `lhs` and
+// `rhs` must already be safe to read more than once (bind_temp's own ref, or a field or
+// payload read this walk has marked materialize itself), since a struct or an enum reads
+// its operand once per field and a carrier reads its operand once for the tag and again
+// for the active arm.
+fn agg_cmp(tid: Int, lhs: Int, rhs: Int, span: Int) -> AggCmp ! Diag.Report {
+    let bools = agg_bool_spelling(span)
+    let k = tc_tid_kind(tid)
+    if k == TyKind.Str {
+        return AggCmp { pre: [], differs: agg_helper_differs("str_eq", lhs, rhs, bools, span) }
+    }
+    if k == TyKind.Float {
+        return AggCmp { pre: [], differs: agg_helper_differs("float_eq", lhs, rhs, bools, span) }
+    }
+    if agg_is_scalar_kind(k) {
+        return AggCmp { pre: [], differs: ir_binary(TYPE_BOOL, span, bools, "!=", lhs, rhs) }
+    }
+    if k == TyKind.Struct { return agg_struct_cmp(tid, lhs, rhs, span, bools) }
+    if k == TyKind.Enum { return agg_enum_cmp(tid, lhs, rhs, span, bools) }
+    if k == TyKind.Option { return agg_carrier_cmp(tid, lhs, rhs, span, bools, true) }
+    if k == TyKind.Result { return agg_carrier_cmp(tid, lhs, rhs, span, bools, false) }
+    diag_ice_stage_not_built("assert_eq/assert_ne over a {tk_name(k)} value", span)
+    AggCmp { pre: [], differs: -1 }
+}
+
+// A field this walk cannot read is an internal error, never a skipped field: skipping one
+// would answer two unequal values as equal, a wrong answer that compiles cleanly.
+fn agg_field_refused(frec: LayoutRecord, path: Str, span: Int) -> Bool ! Diag.Report {
+    let reason = frec.decline_reason
+    if reason != "" {
+        diag_ice_at("AssertCompareFieldNotBuildable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "no C spelling for field '{path}': {reason}", span,
+            "every type that reaches code generation must be concrete and nameable; this is a compiler bug")
+        return true
+    }
+    if frec.slot_form == SlotForm.PointerBoxed {
+        diag_ice_stage_not_built("assert_eq/assert_ne over the boxed field '{path}'", span)
+        return true
+    }
+    false
+}
+
+// A field's own `differs` bound to a fresh Bool local before it joins the OR-chain, so
+// every operand that chain ever holds is a bare name. C's || skips whichever side answers
+// first, and the verifier refuses a skippable side that still has a statement to run for
+// it (see agg_field_refused's neighbor `ir_binds_statement`, ir.bl); a struct or an enum
+// nested inside a field reads its own container more than once, which only a materialized
+// read can do, and a materialized read is exactly the kind of statement a bare comparison
+// never binds. Binding every leaf the same way, scalar or not, keeps one rule instead of
+// two.
+fn agg_bind_bool(pre: List[Int], sub: AggCmp, span: Int) -> Int ! Diag.Report {
+    for s in sub.pre { pre.push(s) }
+    let rec = layout_at(TYPE_BOOL, Position.Local, span)
+    let holder = c_mint_local("agg_f")
+    pre.push(ir_let(TYPE_BOOL, span, rec.c_spelling, holder, rec.slot_form, sub.differs))
+    ir_var_ref(TYPE_BOOL, span, rec.c_spelling, holder, rec.slot_form)
+}
+
+// A struct's own fields disagree in field order; the first field this walk builds is the
+// first one a reader would blame, the same order gen0's field-wise walk read them in. The
+// struct's own value is read once per field, so it is materialized here the same way an
+// enum or a carrier materializes its own value before agg_cmp ever reads a field of it.
+fn agg_struct_cmp(tid: Int, lhs: Int, rhs: Int, span: Int, bools: Str) -> AggCmp ! Diag.Report {
+    ir_mark_materialize(lhs)
+    ir_mark_materialize(rhs)
+    let mut pre: List[Int] = []
+    let mut differs = ir_const(TYPE_BOOL, span, bools, "0")
+    let mut first = true
+    for slot in tc_struct_field_slots(tid) {
+        let ftid = tc_sfield_tid(slot)
+        let frec = field_layout_of(tid, ftid)
+        let path = c_field_name(tc_sfield_name(slot))
+        if agg_field_refused(frec, path, span) { return AggCmp { pre: [], differs: -1 } }
+        let field_lhs = ir_field_get(ftid, span, frec.c_spelling, path, frec.slot_form, lhs)
+        let field_rhs = ir_field_get(ftid, span, frec.c_spelling, path, frec.slot_form, rhs)
+        let sub = agg_cmp(ftid, field_lhs, field_rhs, span)
+        if sub.differs < 0 { return AggCmp { pre: [], differs: -1 } }
+        let leaf = agg_bind_bool(pre, sub, span)
+        differs = if first { leaf } else { ir_binary(TYPE_BOOL, span, bools, "||", differs, leaf) }
+        first = false
+    }
+    AggCmp { pre: pre, differs: differs }
+}
+
+// The value that tells two values of this enum's variant apart, read the same way the
+// match lowering's own `discriminant` reads it (tid_holds_tag_member below is that same
+// function's own test): a tag member for an enum whose variants carry fields, and the
+// value itself for a payload-less enum, which is already one bare word with no member
+// beside it.
+fn agg_enum_tag(tid: Int, base: Int, span: Int, ints: Str) -> Int ! Diag.Report {
+    if tid_holds_tag_member(tid) { return ir_carrier_tag(TYPE_INT, span, ints, base) }
+    if !tc_enum_has_payload(tid) { return base }
+    diag_ice_stage_not_built("assert_eq/assert_ne over an enum holding no discriminant", span)
+    -1
+}
+
+// An enum agrees on its tag before it reads its payload: a mismatched tag already answers
+// differs=true, and only a matching tag switches into the one variant it is safe to read.
+fn agg_enum_cmp(tid: Int, lhs: Int, rhs: Int, span: Int, bools: Str) -> AggCmp ! Diag.Report {
+    let slots = tc_enum_variant_slots(tid)
+    if slots.len() == 0 {
+        diag_ice_stage_not_built("assert_eq/assert_ne over an enum with no variants", span)
+        return AggCmp { pre: [], differs: -1 }
+    }
+    ir_mark_materialize(lhs)
+    ir_mark_materialize(rhs)
+    let ints = int_spelling(span)
+    let tag_lhs = agg_enum_tag(tid, lhs, span, ints)
+    let tag_rhs = agg_enum_tag(tid, rhs, span, ints)
+    let tag_differs = ir_binary(TYPE_BOOL, span, bools, "!=", tag_lhs, tag_rhs)
+    let holder_rec = layout_at(TYPE_BOOL, Position.Local, span)
+    let holder = c_mint_local("agg_d")
+    let decl = ir_let(TYPE_BOOL, span, holder_rec.c_spelling, holder, holder_rec.slot_form, tag_differs)
+    let decl_node = c_decl_for_tid(tid)
+    let mut cases: List[Int] = []
+    for slot in slots {
+        let vname = tc_evar_name(slot)
+        let vnode = find_variant(decl_node, vname)
+        if vnode < 0 {
+            diag_ice_at("AssertCompareVariantNotFound", CODEGEN_STAGE_NOT_BUILT,
+                "variant '{vname}' of an enum compared by assert_eq/assert_ne has no declaration", span,
+                "typecheck registers every variant of a type it accepts; this is a compiler bug")
+            return AggCmp { pre: [], differs: -1 }
+        }
+        let body = agg_variant_case_body(tid, slot, vname, lhs, rhs, holder_rec, holder, span, bools)
+        if body < 0 { return AggCmp { pre: [], differs: -1 } }
+        cases.push(int_const(span, c_variant_discriminant(tid, vnode)))
+        cases.push(body)
+    }
+    let tag_switch = agg_enum_tag(tid, lhs, span, ints)
+    let target_read = ir_var_ref(TYPE_BOOL, span, holder_rec.c_spelling, holder, holder_rec.slot_form)
+    let not_yet = ir_unary(TYPE_BOOL, span, bools, "!", target_read)
+    let guard = ir_if(span, not_yet, ir_block(span, [ir_switch(span, tag_switch, cases, ir_block(span, []))]), -1)
+    let final_read = ir_var_ref(TYPE_BOOL, span, holder_rec.c_spelling, holder, holder_rec.slot_form)
+    AggCmp { pre: [decl, guard], differs: final_read }
+}
+
+// The block one variant's case runs once the tag has already matched: a unit variant has
+// nothing left to disagree on, so its case is empty and `target` keeps the false the tag
+// check already left it at; a variant with fields OR-chains them the same way a struct's
+// fields are OR-chained, then assigns the answer into `target`.
+fn agg_variant_case_body(tid: Int, slot: Int, vname: Str, lhs: Int, rhs: Int, holder_rec: LayoutRecord, holder: Str, span: Int, bools: Str) -> Int ! Diag.Report {
+    let fields = tc_evar_field_slots(slot)
+    if fields.len() == 0 { return ir_block(span, []) }
+    let mut stmts: List[Int] = []
+    let mut differs = ir_const(TYPE_BOOL, span, bools, "0")
+    let mut first = true
+    for f in fields {
+        let ftid = tc_evfield_tid(f)
+        let path = "{c_enum_payload_member()}.{vname}.{c_field_name(tc_evfield_name(f))}"
+        let frec = field_layout_of(tid, ftid)
+        if agg_field_refused(frec, path, span) { return -1 }
+        let field_lhs = ir_field_get(ftid, span, frec.c_spelling, path, frec.slot_form, lhs)
+        let field_rhs = ir_field_get(ftid, span, frec.c_spelling, path, frec.slot_form, rhs)
+        let sub = agg_cmp(ftid, field_lhs, field_rhs, span)
+        if sub.differs < 0 { return -1 }
+        let leaf = agg_bind_bool(stmts, sub, span)
+        differs = if first { leaf } else { ir_binary(TYPE_BOOL, span, bools, "||", differs, leaf) }
+        first = false
+    }
+    let target = ir_var_ref(TYPE_BOOL, span, holder_rec.c_spelling, holder, holder_rec.slot_form)
+    stmts.push(ir_assign(span, target, differs))
+    ir_block(span, stmts)
+}
+
+// Option and Result share one shape: a tag, and one payload slot per arm. Option's one
+// arm is Slot.Inner1 under the "value" member; Result's two arms split Slot.Inner1 ("ok")
+// and Slot.Inner2 ("err"). is_option picks which pair of tags and which arm names apply;
+// everything past that reads exactly like agg_enum_cmp's tag-then-payload guard.
+fn agg_carrier_cmp(tid: Int, lhs: Int, rhs: Int, span: Int, bools: Str, is_option: Bool) -> AggCmp ! Diag.Report {
+    ir_mark_materialize(lhs)
+    ir_mark_materialize(rhs)
+    let ints = int_spelling(span)
+    let tag_lhs = ir_carrier_tag(TYPE_INT, span, ints, lhs)
+    let tag_rhs = ir_carrier_tag(TYPE_INT, span, ints, rhs)
+    let tag_differs = ir_binary(TYPE_BOOL, span, bools, "!=", tag_lhs, tag_rhs)
+    let holder_rec = layout_at(TYPE_BOOL, Position.Local, span)
+    let holder = c_mint_local("agg_d")
+    let decl = ir_let(TYPE_BOOL, span, holder_rec.c_spelling, holder, holder_rec.slot_form, tag_differs)
+    let mut cases: List[Int] = []
+    if is_option {
+        let some_body = agg_carrier_arm_body(tid, Slot.Inner1, STMT_CARRIER_VALUE, lhs, rhs, holder_rec, holder, span)
+        if some_body < 0 { return AggCmp { pre: [], differs: -1 } }
+        cases.push(int_const(span, "{TAG_SOME}"))
+        cases.push(some_body)
+        cases.push(int_const(span, "{TAG_NONE}"))
+        cases.push(ir_block(span, []))
+    } else {
+        let ok_body = agg_carrier_arm_body(tid, Slot.Inner1, CARRIER_OK, lhs, rhs, holder_rec, holder, span)
+        if ok_body < 0 { return AggCmp { pre: [], differs: -1 } }
+        let err_body = agg_carrier_arm_body(tid, Slot.Inner2, CARRIER_ERR, lhs, rhs, holder_rec, holder, span)
+        if err_body < 0 { return AggCmp { pre: [], differs: -1 } }
+        cases.push(int_const(span, "{TAG_OK}"))
+        cases.push(ok_body)
+        cases.push(int_const(span, "{TAG_ERR}"))
+        cases.push(err_body)
+    }
+    let tag_switch = ir_carrier_tag(TYPE_INT, span, ints, lhs)
+    let target_read = ir_var_ref(TYPE_BOOL, span, holder_rec.c_spelling, holder, holder_rec.slot_form)
+    let not_yet = ir_unary(TYPE_BOOL, span, bools, "!", target_read)
+    let guard = ir_if(span, not_yet, ir_block(span, [ir_switch(span, tag_switch, cases, ir_block(span, []))]), -1)
+    let final_read = ir_var_ref(TYPE_BOOL, span, holder_rec.c_spelling, holder, holder_rec.slot_form)
+    AggCmp { pre: [decl, guard], differs: final_read }
+}
+
+// One carrier arm's payload, unboxed the same way a match arm's own binder unboxes it
+// (x_unbox_payload, shared with the pattern-match lowering above), then compared the same
+// as any other field.
+fn agg_carrier_arm_body(tid: Int, slot: Slot, arm: Str, lhs: Int, rhs: Int, holder_rec: LayoutRecord, holder: Str, span: Int) -> Int ! Diag.Report {
+    let inner_tid = child_tid(tid, slot)
+    let member = carrier_member_layout_at(tid, slot, span)
+    let held = layout_at(inner_tid, Position.Local, span)
+    let payload_lhs = x_unbox_payload(inner_tid, span, lhs, member, held, arm)
+    let payload_rhs = x_unbox_payload(inner_tid, span, rhs, member, held, arm)
+    ir_mark_materialize(payload_lhs)
+    ir_mark_materialize(payload_rhs)
+    let sub = agg_cmp(inner_tid, payload_lhs, payload_rhs, span)
+    if sub.differs < 0 { return -1 }
+    let target = ir_var_ref(TYPE_BOOL, span, holder_rec.c_spelling, holder, holder_rec.slot_form)
+    let mut stmts: List[Int] = sub.pre
+    stmts.push(ir_assign(span, target, sub.differs))
+    ir_block(span, stmts)
+}
+
+// The failure message's rendering of one side. A struct or an enum renders through
+// Display when the type has one and a "<TypeName>" placeholder when it does not, the
+// same placeholder gen0's own defensive renderer used for a value with no Display: unlike
+// an interpolation hole, assert_eq's operand has no typecheck gate guaranteeing Display
+// exists. A Result or an Option has no Display of its own in this compiler, so it renders
+// by which arm it holds instead.
+fn agg_render_side(node: Int, tid: Int, value_ref: Int, pre: List[Int]) -> Int ! Diag.Report {
+    let k = tc_tid_kind(tid)
+    if k == TyKind.Struct || k == TyKind.Enum { return cc_display_or_placeholder(node, tid, value_ref) }
+    agg_tag_label(node, tid, value_ref, pre)
+}
+
+// A carrier's active arm, named rather than shown: "Some(..)"/"None" or "Ok(..)"/"Err(..)".
+// The label is read from a fresh Str local the same way bool_to_str_ref above builds one,
+// hoisted into `pre` ahead of the statement that reads it.
+fn agg_tag_label(node: Int, tid: Int, value_ref: Int, pre: List[Int]) -> Int ! Diag.Report {
+    let k = tc_tid_kind(tid)
+    let default_label = if k == TyKind.Option { "None" } else { "Err(..)" }
+    let other_label = if k == TyKind.Option { "Some(..)" } else { "Ok(..)" }
+    let want_tag = if k == TyKind.Option { TAG_SOME } else { TAG_OK }
+    let str_rec = layout_at(TYPE_STR, Position.Local, node)
+    let holder = c_mint_local("agg_lbl")
+    pre.push(ir_let(TYPE_STR, node, str_rec.c_spelling, holder, str_rec.slot_form, str_const(node, default_label)))
+    let ints = int_spelling(node)
+    let tag = ir_carrier_tag(TYPE_INT, node, ints, value_ref)
+    let is_other = ir_binary(TYPE_BOOL, node, agg_bool_spelling(node), "==", tag, int_const(node, "{want_tag}"))
+    let target = ir_var_ref(TYPE_STR, node, str_rec.c_spelling, holder, str_rec.slot_form)
+    pre.push(ir_if(node, is_other, ir_block(node, [ir_assign(node, target, str_const(node, other_label))]), -1))
+    ir_var_ref(TYPE_STR, node, str_rec.c_spelling, holder, str_rec.slot_form)
+}
+
+// assert_eq and assert_ne share the same comparison and the same two rendered sides; only
+// the failing condition and the message wording differ, the same split the scalar buckets
+// above make between an EQ and an NE failure.
+fn lower_assert_aggregate(node: Int, tid: Int, left_node: Int, right_node: Int, is_eq: Bool) -> Int ! Diag.Report {
+    let left_value = lower_value(left_node)
+    let right_value = lower_value(right_node)
+    if left_value < 0 || right_value < 0 { return -1 }
+    let left_bound = bind_temp("left", tid, node, left_value)
+    let right_bound = bind_temp("right", tid, node, right_value)
+    let bools = agg_bool_spelling(node)
+    let line = int_const(node, "{node_line(node)}")
+    let mut pre: List[Int] = [left_bound.stmt, right_bound.stmt]
+    let cmp = agg_cmp(tid, left_bound.ref, right_bound.ref, node)
+    if cmp.differs < 0 { return -1 }
+    for s in cmp.pre { pre.push(s) }
+    let left_str = agg_render_side(node, tid, left_bound.ref, pre)
+    let right_str = agg_render_side(node, tid, right_bound.ref, pre)
+    if left_str < 0 || right_str < 0 { return -1 }
+    // Each rendered side is read twice below (once in the mismatch message, once in the
+    // expected/actual value), so mark it the same way bind_temp marks a repeated read.
+    ir_mark_materialize(left_str)
+    ir_mark_materialize(right_str)
+    if is_eq {
+        let msg = call_str_format(node, "ASSERT_EQ FAILED: %s != %s", [left_str, right_str])
+        let exp = call_str_format(node, "%s", [right_str])
+        let act = call_str_format(node, "%s", [left_str])
+        let fail_stmt = call_runtime_void(node, c_assert_fail_eq_name(), [msg, exp, act, line])
+        pre.push(ir_if(node, cmp.differs, ir_block(node, [fail_stmt]), -1))
+        return ir_block(node, pre)
+    }
+    let msg = call_str_format(node, "ASSERT_NE FAILED: %s == %s", [left_str, right_str])
+    let fail_stmt = call_runtime_void(node, c_assert_fail_name(), [msg, line])
+    let eq = ir_unary(TYPE_BOOL, node, bools, "!", cmp.differs)
+    pre.push(ir_if(node, eq, ir_block(node, [fail_stmt]), -1))
+    ir_block(node, pre)
+}
+
 fn lower_assert_eq_call(node: Int) -> Int ! Diag.Report {
     let args = node_args(node)
     if !assert_args_ok(node, "assert_eq", args, 2) { return -1 }
@@ -656,7 +982,7 @@ fn lower_assert_eq_call(node: Int) -> Int ! Diag.Report {
     let right_node = sublist_get(args, 1)
     let tid = stmt_tid(left_node)
     if tid < 0 { return -1 }
-    if eq_is_aggregate(tid) { return assert_aggregate_refused(node, "assert_eq") }
+    if eq_is_aggregate(tid) { return lower_assert_aggregate(node, tid, left_node, right_node, true) }
     let left_value = lower_value(left_node)
     let right_value = lower_value(right_node)
     if left_value < 0 || right_value < 0 { return -1 }
@@ -696,7 +1022,6 @@ fn lower_assert_eq_call(node: Int) -> Int ! Diag.Report {
     ir_block(node, pre)
 }
 
-// assert_ne has no Result or Option bucket in gen0 either; a struct still refuses.
 fn lower_assert_ne_call(node: Int) -> Int ! Diag.Report {
     let args = node_args(node)
     if !assert_args_ok(node, "assert_ne", args, 2) { return -1 }
@@ -704,7 +1029,7 @@ fn lower_assert_ne_call(node: Int) -> Int ! Diag.Report {
     let right_node = sublist_get(args, 1)
     let tid = stmt_tid(left_node)
     if tid < 0 { return -1 }
-    if eq_is_aggregate(tid) { return assert_aggregate_refused(node, "assert_ne") }
+    if eq_is_aggregate(tid) { return lower_assert_aggregate(node, tid, left_node, right_node, false) }
     let left_value = lower_value(left_node)
     let right_value = lower_value(right_node)
     if left_value < 0 || right_value < 0 { return -1 }
