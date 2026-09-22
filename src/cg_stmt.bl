@@ -1768,6 +1768,10 @@ type MatchCtx {
     tail: Int
     dest: Str
     dest_tid: Int
+    // -1 for the bound scrutinee, read through `holder`; >= 0 for a nested nested-pattern
+    // test, which reads this already-built value directly instead -- minting a Let for it
+    // would run before the outer test that alone makes reading it safe.
+    value: Int
 }
 
 fn lower_match(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
@@ -1777,7 +1781,7 @@ fn lower_match(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Rep
     let rec = layout_at(stid, Position.Local, scrut)
     let _ = ensure_typedef_for(stid)
     let holder = c_mint_local("scrut")
-    let ctx = MatchCtx { tid: stid, holder: holder, rec: rec, tail: tail, dest: dest, dest_tid: dest_tid }
+    let ctx = MatchCtx { tid: stid, holder: holder, rec: rec, tail: tail, dest: dest, dest_tid: dest_tid, value: -1 }
     let arms = node_arms(node)
     let n = if arms == -1 { 0 } else { sublist_length(arms) }
     let mut out: List[Int] = [ir_let(stid, scrut, rec.c_spelling, holder, rec.slot_form, lower_value(scrut))]
@@ -1799,45 +1803,209 @@ fn lower_match(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Rep
 
 // Whether one arm is guaranteed to run. An unguarded arm that matches anything covers the
 // match; short of that, the unguarded arms must name every variant the scrutinee has.
-// The names are collected rather than counted, so a variant written twice counts once and
-// this does not rest on another pass having rejected the repeat. Nothing else is provable
-// here, so nothing else is claimed.
 fn arms_cover(arms: Int, n: Int, ctx: MatchCtx) -> Bool ! Diag.Report {
-    let mut named: Map[Str, Int] = Map()
+    let mut pats: List[Int] = []
     let mut i = 0
     while i < n {
         let arm = sublist_get(arms, i)
-        if node_guard(arm) < 0 {
-            let pat = node_pattern(arm)
-            if pattern_is_irrefutable(pat, ctx.tid) { return true }
-            collect_labels(ctx, pat, named)
-        }
+        if node_guard(arm) < 0 { pats.push(node_pattern(arm)) }
         i = i + 1
     }
-    let total = variant_count(ctx.tid)
-    total > 0 && named.len() >= total
+    patterns_cover(pats, ctx.tid)
 }
 
-// Every variant one arm names. An or-pattern names one per alternative, so an arm written
-// `A | B` covers two.
-fn collect_labels(ctx: MatchCtx, raw: Int, named: Map[Str, Int]) ! Diag.Report {
+// The proof arms_cover makes, generalised to a bare list of patterns against one tid so
+// it can be asked again one level down, of the sub-patterns bucketed under one variant
+// name (bucket_covers) or found at one shared refuting position across arms
+// (projected_patterns_cover). The names are collected rather than counted, so a variant
+// written twice counts once and this does not rest on another pass having rejected the
+// repeat.
+fn patterns_cover(pats: List[Int], tid: Int) -> Bool ! Diag.Report {
+    let mut named: Map[Str, Int] = Map()
+    let mut i = 0
+    while i < pats.len() {
+        let pat = pats.get(i).unwrap()
+        if pattern_is_irrefutable(pat, tid) { return true }
+        collect_labels(tid, pat, named)
+        i = i + 1
+    }
+    let total = variant_count(tid)
+    if total > 0 && named.len() >= total { return true }
+    if bucket_covers(pats, tid, named) { return true }
+    projected_patterns_cover(pats, tid)
+}
+
+// Every variant one arm names, when that arm reduces to nothing more than the tag
+// comparison itself. An or-pattern names one per alternative, so an arm written `A | B`
+// covers two. A variant multiple arms share by splitting its payload (`Ok(Some(x))` and
+// `Ok(None)`) does not reduce this way and is left for bucket_covers, one level below.
+fn collect_labels(tid: Int, raw: Int, named: Map[Str, Int]) ! Diag.Report {
     let pat = pattern_core(raw)
     if nk_of(node_kind(pat)) == NodeKind.OrPattern {
         let elems = node_elements(pat)
         if elems == -1 { return }
         let mut i = 0
         while i < sublist_length(elems) {
-            collect_labels(ctx, sublist_get(elems, i), named)
+            collect_labels(tid, sublist_get(elems, i), named)
             i = i + 1
         }
         return
     }
-    if !pattern_is_labelled(pat, ctx.tid) { return }
+    if !pattern_is_labelled(pat, tid) { return }
     if nk_of(node_kind(pat)) == NodeKind.IntPattern {
         named.insert(node_str_val(pat), 1)
         return
     }
     named.insert(pattern_variant_name(pat), 1)
+}
+
+// The variant name at the very top of a pattern, independent of whether its own payload
+// still refuses -- unlike collect_labels/pattern_is_labelled, which only name a variant
+// whose arm is nothing more than the tag comparison. "" when the pattern names none.
+fn arm_top_variant(raw: Int, tid: Int) -> Str {
+    let pat = pattern_core(raw)
+    match nk_of(node_kind(pat)) {
+        NodeKind.EnumPattern => pattern_variant_name(pat)
+        NodeKind.IdentPattern => if is_variant_name(tid, node_name(pat)) { node_name(pat) } else { "" }
+        NodeKind.StructPattern => if is_variant_name(tid, node_type_name(pat)) { node_type_name(pat) } else { "" }
+        _ => ""
+    }
+}
+
+// The one sub-pattern inside a variant pattern's payload, when it has exactly one payload
+// slot (a carrier's, a transparent newtype's, or a user variant with one field) -- the
+// same single slot payload_binds/payload_test read through. -1 for any other shape:
+// nothing here decides how several fields would jointly bucket.
+fn one_payload_sub(pat: Int) -> Int {
+    let flds = node_fields(pat)
+    if flds == -1 || sublist_length(flds) != 1 { return -1 }
+    let f = sublist_get(flds, 0)
+    if node_int_val(pat) == 1 { return node_pattern(f) }
+    f
+}
+
+// A variant name several arms share by splitting its own payload (`Ok(Some(x))` and
+// `Ok(None)`) is covered when those arms' own payload sub-patterns, taken together, cover
+// the payload's type -- patterns_cover asked again, one level down. Only a single-slot
+// payload is decomposed this way; a variant sharing a multi-field payload, or one whose
+// slot carries no recorded type, proves nothing here.
+fn bucket_covers(pats: List[Int], tid: Int, named: Map[Str, Int]) -> Bool ! Diag.Report {
+    let total = variant_count(tid)
+    if total <= 0 { return false }
+    let mut seen: Map[Str, Int] = Map()
+    let mut i = 0
+    while i < pats.len() {
+        let vname = arm_top_variant(pats.get(i).unwrap(), tid)
+        if vname != "" && !named.contains_key(vname) { seen.insert(vname, 1) }
+        i = i + 1
+    }
+    let vnames = seen.keys()
+    let mut j = 0
+    while j < vnames.len() {
+        let vname = vnames.get(j).unwrap()
+        let mut subs: List[Int] = []
+        let mut sub_tid = -1
+        let mut k = 0
+        while k < pats.len() {
+            let pat = pattern_core(pats.get(k).unwrap())
+            if arm_top_variant(pat, tid) == vname {
+                let sub = one_payload_sub(pat)
+                if sub < 0 { return false }
+                let stid = stmt_tid(sub)
+                if stid < 0 || (sub_tid >= 0 && sub_tid != stid) { return false }
+                sub_tid = stid
+                subs.push(sub)
+            }
+            k = k + 1
+        }
+        if subs.len() == 0 || !patterns_cover(subs, sub_tid) { return false }
+        named.insert(vname, 1)
+        j = j + 1
+    }
+    named.len() >= total
+}
+
+// A pattern may refuse in exactly one nested place while matching anything everywhere
+// else -- `(Ok(x), _)` refuses only at element 0. Two such arms can jointly exhaust a
+// scrutinee no single arm covers alone: when every arm refuses at the same place and the
+// labels named there exhaust that place's own variant count, the match is covered the
+// same way a flat label set covers it above. An arm that refuses in more than one place,
+// in different places from another arm, or in a place codegen cannot label, proves
+// nothing here and the match is reported unbuilt rather than guessed at.
+fn projected_patterns_cover(pats: List[Int], tid: Int) -> Bool ! Diag.Report {
+    let mut shared_path = ""
+    let mut shared_tid = -1
+    let mut have_shared = false
+    let mut named: Map[Str, Int] = Map()
+    let mut i = 0
+    while i < pats.len() {
+        let mut positions: List[Str] = []
+        let mut tids: List[Int] = []
+        let mut leaves: List[Int] = []
+        if !refuting_positions(tid, "", pats.get(i).unwrap(), positions, tids, leaves) { return false }
+        if positions.len() != 1 { return false }
+        let path = positions.get(0).unwrap()
+        let ptid = tids.get(0).unwrap()
+        let leaf = leaves.get(0).unwrap()
+        if have_shared {
+            if path != shared_path { return false }
+        } else {
+            shared_path = path
+            shared_tid = ptid
+            have_shared = true
+        }
+        if !pattern_is_labelled(leaf, ptid) { return false }
+        collect_labels(ptid, leaf, named)
+        i = i + 1
+    }
+    if !have_shared { return false }
+    let total = variant_count(shared_tid)
+    total > 0 && named.len() >= total
+}
+
+// Every position one arm's pattern refuses at, named by a '.'-joined path of element
+// indices and field names from the arm's own top-level pattern. A plain tuple or a
+// plain (non-variant) struct is decomposed position by position; a variant pattern,
+// bare or struct-style, is one leaf position and is not decomposed further -- exhausting
+// its own payload is a separate question from exhausting the position it sits in.
+// False only when a part has no recorded type.
+fn refuting_positions(tid: Int, path: Str, raw: Int, paths: List[Str], tids: List[Int], leaves: List[Int]) -> Bool ! Diag.Report {
+    let pat = pattern_core(raw)
+    if pattern_is_irrefutable(pat, tid) { return true }
+    let kind = nk_of(node_kind(pat))
+    if kind == NodeKind.TuplePattern {
+        let elems = node_elements(pat)
+        if elems == -1 { return true }
+        let mut i = 0
+        while i < sublist_length(elems) {
+            let sub = sublist_get(elems, i)
+            let stid = stmt_tid(sub)
+            if stid < 0 { return false }
+            if !refuting_positions(stid, "{path}.{i}", sub, paths, tids, leaves) { return false }
+            i = i + 1
+        }
+        return true
+    }
+    if kind == NodeKind.StructPattern && !is_variant_name(tid, node_type_name(pat)) {
+        let flds = node_fields(pat)
+        if flds == -1 { return true }
+        let mut i = 0
+        while i < sublist_length(flds) {
+            let f = sublist_get(flds, i)
+            let sub = node_pattern(f)
+            if sub >= 0 {
+                let stid = stmt_tid(sub)
+                if stid < 0 { return false }
+                if !refuting_positions(stid, "{path}.{node_name(f)}", sub, paths, tids, leaves) { return false }
+            }
+            i = i + 1
+        }
+        return true
+    }
+    paths.push(path)
+    tids.push(tid)
+    leaves.push(pat)
+    true
 }
 
 // How many variants the scrutinee's type has, or 0 when naming variants cannot exhaust
@@ -1861,6 +2029,7 @@ fn variant_count(tid: Int) -> Int {
 }
 
 fn scrut_ref(ctx: MatchCtx, span: Int) -> Int {
+    if ctx.value >= 0 { return ctx.value }
     ir_var_ref(ctx.tid, span, ctx.rec.c_spelling, ctx.holder, ctx.rec.slot_form)
 }
 
@@ -2162,24 +2331,29 @@ fn sub_pattern_declares(sub: Int) -> Bool {
     nk_of(node_kind(sub)) == NodeKind.IdentPattern
 }
 
-// One payload slot of a variant, bound from the value the reader hands back. A shape with
-// no lowering yet is reported and left out, because the names around it still bind to the
-// types they were given; a slot with no type at all stops the arm instead.
-fn bind_slot(sub: Int, value: Int, out: List[Int]) -> Bool ! Diag.Report {
+// One payload slot of a variant, bound from the value the reader hands back. A plain
+// name binds directly, the same as ever; a compound sub-pattern (itself a nested variant,
+// tuple, or struct) first mints a local to hold this slot's own value, then binds the
+// rest of it by recursing into pattern_binds the same way the top-level scrutinee is
+// bound, so every existing binder for every pattern shape works one level deeper too. A
+// slot with no type at all stops the arm instead.
+fn bind_slot(ctx: MatchCtx, sub: Int, value: Int, out: List[Int]) -> Bool ! Diag.Report {
     let kind = nk_of(node_kind(sub))
     if kind == NodeKind.WildcardPattern { return true }
-    if kind != NodeKind.IdentPattern {
-        diag_ice_stage_not_built("a nested pattern inside a variant payload", sub)
-        return true
-    }
     let tid = stmt_tid(sub)
     if tid < 0 { return false }
-    if is_variant_name(tid, node_name(sub)) {
-        diag_ice_stage_not_built("a variant named inside a variant payload", sub)
+    if kind == NodeKind.IdentPattern {
+        // A bare variant name in binder position (`Ok(None)`'s inner `None`) names
+        // nothing to bind.
+        if is_variant_name(tid, node_name(sub)) { return true }
+        bind_named(sub, node_name(sub), tid, layout_at(tid, Position.Local, sub), value, out)
         return true
     }
-    bind_named(sub, node_name(sub), tid, layout_at(tid, Position.Local, sub), value, out)
-    true
+    let rec = layout_at(tid, Position.Local, sub)
+    let name = c_mint_local("nest")
+    out.push(ir_let(tid, sub, rec.c_spelling, name, rec.slot_form, value))
+    let nested = MatchCtx { tid: tid, holder: name, rec: rec, tail: ctx.tail, dest: ctx.dest, dest_tid: ctx.dest_tid, value: -1 }
+    pattern_binds(nested, sub, out)
 }
 
 // One name, declared and bound to a value read out of the scrutinee.
@@ -2209,7 +2383,7 @@ fn newtype_payload_bind(ctx: MatchCtx, flds: Int, out: List[Int]) -> Bool ! Diag
     let tid = stmt_tid(sub)
     if tid < 0 { return !sub_pattern_declares(sub) }
     let rec = layout_at(tid, Position.Local, sub)
-    bind_slot(sub, ir_cast(tid, sub, rec.c_spelling, scrut_ref(ctx, sub)), out)
+    bind_slot(ctx, sub, ir_cast(tid, sub, rec.c_spelling, scrut_ref(ctx, sub)), out)
 }
 
 // The binder's own Local layout (`held`) says what the `Let` declares; the carrier's
@@ -2223,7 +2397,7 @@ fn carrier_payload_bind(ctx: MatchCtx, vname: Str, flds: Int, out: List[Int]) ->
     if tid < 0 { return !sub_pattern_declares(sub) }
     let held = layout_at(tid, Position.Local, sub)
     let member = carrier_member_layout_at(ctx.tid, carrier_slot(vname), sub)
-    bind_slot(sub, x_unbox_payload(tid, sub, scrut_ref(ctx, sub), member, held,
+    bind_slot(ctx, sub, x_unbox_payload(tid, sub, scrut_ref(ctx, sub), member, held,
         carrier_member(vname)), out)
 }
 
@@ -2268,7 +2442,7 @@ fn positional_payload_binds(ctx: MatchCtx, pat: Int, vname: Str, flds: Int, out:
             let held = layout_at(tid, Position.Local, sub)
             let path = "{c_enum_payload_member()}.{vname}.{member}"
             let read = variant_field_read(ctx, sub, tid, path, held)
-            if !bind_slot(sub, read, out) { return false }
+            if !bind_slot(ctx, sub, read, out) { return false }
         }
         i = i + 1
     }
@@ -2324,7 +2498,7 @@ fn field_pattern_binds(ctx: MatchCtx, pat: Int, prefix: Str, out: List[Int]) -> 
             if sub < 0 {
                 bind_named(holder, node_name(f), tid, held, read, out)
             } else {
-                if !bind_slot(sub, read, out) { return false }
+                if !bind_slot(ctx, sub, read, out) { return false }
             }
         }
         i = i + 1
@@ -2345,7 +2519,7 @@ fn tuple_pattern_binds(ctx: MatchCtx, pat: Int, out: List[Int]) -> Bool ! Diag.R
             let rec = layout_at(tid, Position.Local, sub)
             let read = ir_field_get(tid, sub, rec.c_spelling, tuple_member(i), rec.slot_form,
                 scrut_ref(ctx, sub))
-            if !bind_slot(sub, read, out) { return false }
+            if !bind_slot(ctx, sub, read, out) { return false }
         }
         i = i + 1
     }
@@ -2367,6 +2541,13 @@ fn pattern_test(ctx: MatchCtx, pat: Int) -> Int ! Diag.Report {
     if kind == NodeKind.RangePattern { return range_test(ctx, pat) }
     if kind == NodeKind.OrPattern { return or_test(ctx, pat) }
     if kind == NodeKind.StringPattern { return string_pattern_test(ctx, pat) }
+    // Not irrefutable and not labelled means some part still refuses beyond a single tag
+    // comparison -- either this shape's own parts (a tuple or plain struct), or a payload
+    // one level inside a variant (pattern_is_labelled already answered false for those).
+    if kind == NodeKind.AsPattern { return pattern_test(ctx, node_pattern(pat)) }
+    if kind == NodeKind.EnumPattern { return enum_pattern_test(ctx, pat) }
+    if kind == NodeKind.TuplePattern { return tuple_pattern_test(ctx, pat) }
+    if kind == NodeKind.StructPattern { return struct_pattern_test(ctx, pat) }
     diag_ice_stage_not_built("a match on this pattern shape", pat)
     int_const(pat, "0")
 }
@@ -2415,6 +2596,147 @@ fn or_test(ctx: MatchCtx, pat: Int) -> Int ! Diag.Report {
         i = i + 1
     }
     acc
+}
+
+// EnumPattern, not reducible to a single label test because some part of its own payload
+// still refuses. Tests the tag the same way the label branch in pattern_test would, then
+// ANDs in the payload's own test -- the tag runs first, so a boxed payload read the
+// payload test needs is only ever reached once the tag has proven it safe.
+fn enum_pattern_test(ctx: MatchCtx, pat: Int) -> Int ! Diag.Report {
+    let vname = pattern_variant_name(pat)
+    let tag_test = ir_binary(TYPE_INT, pat, int_spelling(pat), "==",
+        discriminant(ctx, pat), variant_label(ctx, pat, vname))
+    and_test(pat, tag_test, payload_test(ctx, pat, vname))
+}
+
+// A variant's payload test, mirroring payload_binds one for one: a carrier keeps its
+// payload in a named member, a transparent newtype's is the scrutinee word itself, and a
+// user enum's is either the struct-style union arm or the positional one. -1 (this walk's
+// "always true", the same meaning pattern_test gives it for an irrefutable pattern) when
+// the payload names no fields to test.
+fn payload_test(ctx: MatchCtx, pat: Int, vname: Str) -> Int ! Diag.Report {
+    let flds = node_fields(pat)
+    if flds == -1 || sublist_length(flds) == 0 { return -1 }
+    if tid_is_carrier(ctx.tid) { return carrier_payload_test(ctx, vname, flds) }
+    if ctx.rec.is_transparent != 0 { return newtype_payload_test(ctx, flds) }
+    if node_int_val(pat) == 1 { return field_pattern_test(ctx, pat, "{c_enum_payload_member()}.{vname}") }
+    positional_payload_test(ctx, pat, vname, flds)
+}
+
+fn newtype_payload_test(ctx: MatchCtx, flds: Int) -> Int ! Diag.Report {
+    let sub = sublist_get(flds, 0)
+    let tid = stmt_tid(sub)
+    if tid < 0 { return -1 }
+    let rec = layout_at(tid, Position.Local, sub)
+    slot_test(ctx, sub, tid, rec, ir_cast(tid, sub, rec.c_spelling, scrut_ref(ctx, sub)))
+}
+
+fn carrier_payload_test(ctx: MatchCtx, vname: Str, flds: Int) -> Int ! Diag.Report {
+    let sub = sublist_get(flds, 0)
+    let tid = stmt_tid(sub)
+    if tid < 0 { return -1 }
+    let held = layout_at(tid, Position.Local, sub)
+    let member = carrier_member_layout_at(ctx.tid, carrier_slot(vname), sub)
+    slot_test(ctx, sub, tid, held, x_unbox_payload(tid, sub, scrut_ref(ctx, sub), member, held,
+        carrier_member(vname)))
+}
+
+fn positional_payload_test(ctx: MatchCtx, pat: Int, vname: Str, flds: Int) -> Int ! Diag.Report {
+    let vnode = find_variant(c_decl_for_tid(ctx.tid), vname)
+    if vnode < 0 { return -1 }
+    let decl_flds = node_fields(vnode)
+    let mut acc = -1
+    let mut i = 0
+    while i < sublist_length(flds) {
+        let sub = sublist_get(flds, i)
+        let tid = stmt_tid(sub)
+        if tid >= 0 && !(decl_flds == -1 || i >= sublist_length(decl_flds)) {
+            let member = c_field_name(node_name(sublist_get(decl_flds, i)))
+            let held = layout_at(tid, Position.Local, sub)
+            let path = "{c_enum_payload_member()}.{vname}.{member}"
+            let read = variant_field_read(ctx, sub, tid, path, held)
+            acc = and_test(sub, acc, slot_test(ctx, sub, tid, held, read))
+        }
+        i = i + 1
+    }
+    acc
+}
+
+// Struct-shaped fields, either of a struct pattern (no prefix) or of a struct-shaped
+// variant payload (the union arm is the prefix) -- the test-side twin of
+// field_pattern_binds.
+fn field_pattern_test(ctx: MatchCtx, pat: Int, prefix: Str) -> Int ! Diag.Report {
+    let flds = node_fields(pat)
+    if flds == -1 { return -1 }
+    let mut acc = -1
+    let mut i = 0
+    while i < sublist_length(flds) {
+        let f = sublist_get(flds, i)
+        let sub = node_pattern(f)
+        if sub >= 0 {
+            let tid = stmt_tid(sub)
+            if tid >= 0 {
+                let held = layout_at(tid, Position.Local, sub)
+                let path = if prefix == "" { node_name(f) } else { "{prefix}.{node_name(f)}" }
+                let read = variant_field_read(ctx, sub, tid, path, held)
+                acc = and_test(sub, acc, slot_test(ctx, sub, tid, held, read))
+            }
+        }
+        i = i + 1
+    }
+    acc
+}
+
+fn tuple_pattern_test(ctx: MatchCtx, pat: Int) -> Int ! Diag.Report {
+    let elems = node_elements(pat)
+    if elems == -1 { return -1 }
+    let mut acc = -1
+    let mut i = 0
+    while i < sublist_length(elems) {
+        let sub = sublist_get(elems, i)
+        let tid = stmt_tid(sub)
+        if tid >= 0 {
+            let rec = layout_at(tid, Position.Local, sub)
+            let read = ir_field_get(tid, sub, rec.c_spelling, tuple_member(i), rec.slot_form,
+                scrut_ref(ctx, sub))
+            acc = and_test(sub, acc, slot_test(ctx, sub, tid, rec, read))
+        }
+        i = i + 1
+    }
+    acc
+}
+
+// A StructPattern node that may in fact name a variant (see struct_pattern_binds above):
+// when it does, its own tag needs testing the same way an EnumPattern's does before its
+// fields are read; a genuine struct pattern has no tag of its own, only its fields.
+fn struct_pattern_test(ctx: MatchCtx, pat: Int) -> Int ! Diag.Report {
+    let sname = node_type_name(pat)
+    if is_variant_name(ctx.tid, sname) {
+        let tag_test = ir_binary(TYPE_INT, pat, int_spelling(pat), "==",
+            discriminant(ctx, pat), variant_label(ctx, pat, sname))
+        return and_test(pat, tag_test, field_pattern_test(ctx, pat, "{c_enum_payload_member()}.{sname}"))
+    }
+    field_pattern_test(ctx, pat, "")
+}
+
+// Combines two tests where -1 stands for "always true": either side missing leaves the
+// other, both present join with a left-to-right '&&' so the side that makes a later boxed
+// read safe always runs first, the same order every existing '&&'-built test in this file
+// already relies on.
+fn and_test(span: Int, a: Int, b: Int) -> Int ! Diag.Report {
+    if a < 0 { return b }
+    if b < 0 { return a }
+    ir_binary(TYPE_INT, span, int_spelling(span), "&&", a, b)
+}
+
+// One payload slot's own test, nested one level deeper than ctx: nothing for a plain
+// binder (a name or wildcard matches whatever it is given), and the sub-pattern's own
+// test otherwise -- reusing pattern_test itself so every shape it already knows how to
+// test works one level down too, the same way bind_slot reuses pattern_binds to bind one
+// level down.
+fn slot_test(ctx: MatchCtx, sub: Int, tid: Int, rec: LayoutRecord, value: Int) -> Int ! Diag.Report {
+    let nested = MatchCtx { tid: tid, holder: "", rec: rec, tail: ctx.tail, dest: ctx.dest, dest_tid: ctx.dest_tid, value: value }
+    pattern_test(nested, sub)
 }
 
 // ── Arms ──────────────────────────────────────────────────────────────────
