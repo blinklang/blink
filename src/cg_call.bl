@@ -21,7 +21,7 @@ import parser.{
     node_kind, node_name, node_left, node_right, node_obj, node_index, node_method, node_args,
     node_line, node_body,
     node_methods, node_trait_name, node_impl_binders, node_type_params,
-    node_module, node_source_module, node_params, node_fields, node_value,
+    node_module, node_source_module, node_params, node_fields, node_value, node_str_val,
     sublist_get, sublist_length,
 }
 import ast.{NodeKind, nk_of, node_kind_name}
@@ -60,7 +60,7 @@ import ir.{
     ir_call_direct, ir_call_runtime, ir_call_closure, ir_call_indirect, ir_cast, ir_unary, ir_unbox, ir_box,
     ir_assign, ir_binary, ir_block, ir_break, ir_carrier_tag, ir_carrier_wrap,
     ir_const, ir_global_ref, ir_if, ir_let, ir_loop, ir_panic, ir_struct_new, ir_var_ref, ir_field_get,
-    ir_field_set, ir_enum_new, ir_container_new, ir_sized_alloc, ir_select,
+    ir_field_set, ir_enum_new, ir_container_new, ir_sized_alloc, ir_select, ir_switch,
 }
 import cg_expr.{
     lower_expr, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
@@ -1255,12 +1255,77 @@ fn cc_lower_scope_alloc(node: Int, obj: Int, method: Str, is_alloc_n: Bool) -> I
 // from `write` below — a store, not a read, and a statement rather than a value wherever
 // this stage is asked for one.
 fn cc_lower_ptr_method(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
+    let extra = cc_ptr_extra_op(method)
+    if extra == "addr" { return cc_lower_ptr_addr(node, obj) }
+    if extra == "to_str" { return cc_lower_ptr_to_str(node, obj) }
     if method != "offset" && method != "is_null" && method != "deref" {
         return cc_intrinsic_not_built(node, TyKind.Ptr, method)
     }
     if method != "is_null" && method != "deref" { return cc_lower_ptr_offset(node, obj) }
     if method != "deref" { return cc_lower_ptr_is_null(node, obj) }
     cc_lower_ptr_deref(node, obj)
+}
+
+// A method name mapped to itself when it needs its own lowering, and to "" otherwise --
+// the map is the single source the dispatch above reads, so a new pointer method is added
+// here once rather than as a further `==` arm on `method` itself.
+fn cc_ptr_extra_op(method: Str) -> Str {
+    let mut table: Map[Str, Str] = Map()
+    table.insert("addr", "addr")
+    table.insert("to_str", "to_str")
+    table.get(method) ?? ""
+}
+
+// `p.addr()` reads the pointer's own bits as a number -- reinterpreting, not stepping by
+// anything, so it is the same plain cast `cc_scalar_cast` gives a numeric `.into()`.
+fn cc_lower_ptr_addr(node: Int, obj: Int) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, TyKind.Ptr, "addr", 0, given) }
+    let rec = cc_local(TYPE_INT, node)
+    if cc_stopped(rec) { return -1 }
+    let ptr = lower_expr(obj)
+    if ptr < 0 { return -1 }
+    ir_cast(TYPE_INT, node, rec.c_spelling, ptr)
+}
+
+// `p.to_str()` reinterprets the pointer's own bits as a Str -- `Ptr[U8]` and `Str` share
+// one C representation, so the payload needs no runtime call, only the same null test
+// `is_null` already makes. A null pointer answers None; anything else answers Some of the
+// reinterpreted bits, built the way `cc_checked_read` builds an Option carrier.
+fn cc_lower_ptr_to_str(node: Int, obj: Int) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, TyKind.Ptr, "to_str", 0, given) }
+    let ptr_tid = tid_of_node(obj)
+    if ptr_tid < 0 { return -1 }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let carrier = cc_local(tid, node)
+    if cc_stopped(carrier) { return -1 }
+    let value_mem = cc_member_layout(node, tid, Slot.Inner1)
+    if cc_stopped(value_mem) { return -1 }
+    let ptr_rec = cc_local(ptr_tid, node)
+    if cc_stopped(ptr_rec) { return -1 }
+    let present_rec = cc_local(TYPE_BOOL, node)
+    if cc_stopped(present_rec) { return -1 }
+    let ptr_val = lower_expr(obj)
+    if ptr_val < 0 { return -1 }
+    let _td = ensure_typedef_for(tid)
+    let ptr_name = c_mint_local("pz")
+    cg_expr_push_pending(node, ir_let(ptr_tid, node, ptr_rec.c_spelling, ptr_name, ptr_rec.slot_form, ptr_val))
+    let held = c_mint_local("pz")
+    cg_expr_push_pending(node, ir_let(tid, node, carrier.c_spelling, held, carrier.slot_form, -1))
+    let present = ir_binary(TYPE_BOOL, node, present_rec.c_spelling, "!=",
+        cc_temp_ref(node, ptr_tid, ptr_rec, ptr_name), ir_const(ptr_tid, node, ptr_rec.c_spelling, "0"))
+    let str_tid = child_tid(tid, Slot.Inner1)
+    let payload = ir_cast(str_tid, node, value_mem.c_spelling, cc_temp_ref(node, ptr_tid, ptr_rec, ptr_name))
+    let some = ir_carrier_wrap(tid, node, carrier.c_spelling, carrier_value_member,
+        ir_const(TYPE_INT, node, carrier.c_spelling, "{CARRIER_TAG_SOME}"), payload)
+    let none = ir_carrier_wrap(tid, node, carrier.c_spelling, "",
+        ir_const(TYPE_INT, node, carrier.c_spelling, "{CARRIER_TAG_NONE}"), -1)
+    cg_expr_push_pending(node, ir_if(node, present,
+        ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), some)]),
+        ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), none)])))
+    cc_temp_ref(node, tid, carrier, held)
 }
 
 // `p.offset(n)` steps the pointer by n of what it points at. C does the stepping and steps
@@ -1310,6 +1375,76 @@ fn cc_lower_ptr_deref(node: Int, obj: Int) -> Int ! Diag.Report {
     let ptr_tid = tid_of_node(obj)
     if ptr_tid < 0 { return -1 }
     cc_deref(node, obj, ptr_tid)
+}
+
+fn cc_is_enum_to_str(method: Str) -> Bool {
+    let mut table: Map[Str, Bool] = Map()
+    table.insert("to_str", true)
+    table.get(method) ?? false
+}
+
+// A str-backed enum -- every variant assigned a plain string literal (`Open = "open"`).
+// Typecheck answers the same question at src/typecheck.bl:4887 and duplicates the test
+// rather than exporting it, for the reason its own comment gives: codegen imports
+// typecheck, not the other way round. The two must keep testing the same shape, because a
+// call typed there and refused here (or the reverse) is the failure both exist to exclude.
+fn cc_is_str_backed_enum_decl(td: Int) -> Bool {
+    let flds = node_fields(td)
+    if flds == -1 { return false }
+    let n = sublist_length(flds)
+    if n == 0 { return false }
+    let mut i = 0
+    while i < n {
+        let v = sublist_get(flds, i)
+        if nk_of(node_kind(v)) != NodeKind.TypeVariant { return false }
+        if node_str_val(v) == "" { return false }
+        i = i + 1
+    }
+    true
+}
+
+// `e.to_str()` on a str-backed enum answers the string each variant was assigned, not a
+// rendering of the variant's own name -- the same distinction a data enum's tag keeps from
+// its payload. A plain enum (no assigned strings) never reaches here: typecheck answers
+// `to_str` only for the str-backed shape, so a plain enum's call is refused before this
+// runs (this file does not own that refusal; it is read here only as a guard).
+//
+// A payload-less enum compares with its own value the same way `variant_label` compares a
+// match scrutinee against a variant's tag (src/cg_stmt.bl:2356), so the call is one switch
+// over the receiver, each arm answering the string its own variant was assigned.
+fn cc_lower_enum_to_str(node: Int, obj: Int) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, TyKind.Enum, "to_str", 0, given) }
+    let enum_tid = tid_of_node(obj)
+    if enum_tid < 0 { return -1 }
+    let td = tc_tid_decl_node(enum_tid)
+    if td < 0 || !cc_is_str_backed_enum_decl(td) {
+        return cc_method_not_built(node, TyKind.Enum, "to_str")
+    }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let carrier = cc_local(tid, node)
+    if cc_stopped(carrier) { return -1 }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    let held = c_mint_local("ez")
+    cg_expr_push_pending(node, ir_let(tid, node, carrier.c_spelling, held, carrier.slot_form, -1))
+    let flds = node_fields(td)
+    let n = sublist_length(flds)
+    let mut cases: List[Int] = []
+    let mut i = 0
+    while i < n {
+        let v = sublist_get(flds, i)
+        let label = ir_const(TYPE_INT, node, carrier.c_spelling, c_variant_discriminant(enum_tid, v))
+        let text = ir_const(tid, node, carrier.c_spelling, c_string_literal(node_str_val(v)))
+        cases.push(label)
+        cases.push(ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), text)]))
+        i = i + 1
+    }
+    // Every variant names its own case, so no fallthrough arm is reachable -- the same
+    // reasoning lower_match_switch gives for leaving a fully-named match's default at -1.
+    cg_expr_push_pending(node, ir_switch(node, recv, cases, -1))
+    cc_temp_ref(node, tid, carrier, held)
 }
 
 // `p.f.read()` and `p.f.write(v)`. The receiver is the PLACE the field occupies, not a
@@ -2228,20 +2363,29 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     // List higher-order surface is a builtin method, so it wins over a same-named user impl
     // exactly as typecheck resolves it.
     if kind == TyKind.List && cc_names_list_hof(mname) { return cc_list_hof_call(node, obj, mname) }
+    if kind == TyKind.List && cc_is_list_take(mname) { return cc_list_take(node, obj) }
     let primitive = cc_runtime_method(kind, mname)
     if primitive != "" { return cc_lower_runtime_method(node, obj, kind, mname, primitive) }
     let keyed = cc_keyed_row(kind, mname)
     if keyed.op != "" { return cc_lower_keyed_method(node, obj, kind, mname, keyed) }
     if cc_is_map_slot_method(kind, mname) { return cc_map_slot_method(node, obj, kind, mname) }
     if cc_is_scalar_cast(kind, mname) { return cc_scalar_cast(node, obj, kind, mname) }
+    if kind == TyKind.Int {
+        let dest_tid = tid_of_node(node)
+        if dest_tid >= 0 && cc_is_into_target(mname, cc_kind(dest_tid)) {
+            return cc_scalar_cast(node, obj, kind, mname)
+        }
+    }
     if cc_is_wrapping_arith(kind, mname) { return cc_wrapping_arith(node, obj, recv_tid, kind, mname) }
     if cc_is_char_text(kind, mname) { return cc_char_text(node, obj, kind, mname) }
+    if cc_is_sb_write_char(kind, mname) { return cc_sb_write_char(node, obj) }
     if cc_is_str_as_cstr(kind, mname) { return cc_str_as_cstr(node, obj, kind, mname) }
     if cc_is_bytes_with_ptr(kind, mname) { return cc_bytes_with_ptr(node, obj, kind, mname) }
     if cc_is_carrier_test(kind, mname) { return cc_carrier_test(node, obj, kind, mname) }
     if cc_is_carrier_read(kind, mname) { return cc_carrier_read(node, obj, kind, mname) }
     if kind == TyKind.FfiScope { return cc_lower_scope_method(node, obj, mname) }
     if kind == TyKind.Ptr { return cc_lower_ptr_method(node, obj, mname) }
+    if kind == TyKind.Enum && cc_is_enum_to_str(mname) { return cc_lower_enum_to_str(node, obj) }
     let im = cc_impl_with_method(node, recv_tid, mname)
     if im == IMPL_REFUSED { return -1 }
     if im < 0 {
@@ -2357,19 +2501,31 @@ fn cc_store_args(node: Int, receiver: Int, count: Int, shape: ElementShape) -> L
 // Which runtime primitive a receiver's method reaches, for the methods no Blink
 // declaration answers. Kept apart from the declaration table because the two answer
 // different things: that one names a function to call, this one names an ABI symbol.
+// One table per kind, the same shape as net_runtime_op/term_runtime_op: no two kinds
+// share a method name here, so a lookup misrouted across kinds cannot yet answer wrong.
 fn cc_runtime_method(kind: TyKind, method: Str) -> Str {
-    if kind != TyKind.List { return "" }
-    if method == "push" { return "list_push" }
-    if method == "set" { return "list_set" }
+    if kind == TyKind.List {
+        let mut table: Map[Str, Str] = Map()
+        table.insert("push", "list_push")
+        table.insert("set", "list_set")
+        return table.get(method) ?? ""
+    }
+    if kind == TyKind.Channel {
+        let mut table: Map[Str, Str] = Map()
+        table.insert("send", "channel_send")
+        return table.get(method) ?? ""
+    }
     ""
 }
 
 // How many arguments each of those takes. A primitive with no row here is refused by name
 // rather than built from the sentinel, which would report a call as taking -1 arguments.
 fn cc_runtime_method_arity(op: Str) -> Int {
-    if op == "list_push" { return 1 }
-    if op == "list_set" { return 2 }
-    NO_ARITY
+    let mut table: Map[Str, Int] = Map()
+    table.insert("list_push", 1)
+    table.insert("list_set", 2)
+    table.insert("channel_send", 1)
+    table.get(op) ?? NO_ARITY
 }
 
 // ── Keyed containers ──────────────────────────────────────────────────────
@@ -2918,6 +3074,20 @@ fn cc_is_scalar_cast(kind: TyKind, method: Str) -> Bool {
     if kind == TyKind.Int && method == "to_float" { return true }
     if kind != TyKind.Int && !cc_is_sized_int(kind) { return false }
     cc_names_int_width(method)
+}
+
+// `.into()` on an Int receiver reaching another scalar is the same bit reinterpretation
+// cc_scalar_cast already builds for the named conversions (to_int, to_i8, ...) -- the
+// method name `into` carries no destination of its own, so the destination comes from the
+// call's own tid instead, read once by the caller (lower_method_call already resolves
+// every other node's tid the same way) and handed in here as a plain TyKind so this stays
+// a pure lookup. A destination that is not one of these falls through to the ordinary impl
+// path, so a real `impl From<Int> for SomeStruct` still dispatches there, unmodified.
+fn cc_is_into_target(method: Str, dest: TyKind) -> Bool {
+    let mut table: Map[Str, Bool] = Map()
+    table.insert("into", true)
+    if !(table.get(method) ?? false) { return false }
+    dest == TyKind.Float || dest == TyKind.Char || dest == TyKind.Int || cc_is_sized_int(dest)
 }
 
 fn cc_is_sized_int(kind: TyKind) -> Bool {
@@ -3564,10 +3734,23 @@ fn cc_intrinsic_callee(node: Int, kind: TyKind, method: Str) -> Str ! Diag.Repor
 // `to_str` is absent although typecheck answers Str for it on an Int receiver. The spec
 // gives `to_str` to Char and to Ptr[U8], not to Int, so answering it here would build a
 // surface no section declares. It stays refused until typecheck and the spec agree.
+//
+// `display` on Int is the builtin scalar Display arm (typecheck.bl:16016) and renders the
+// same decimal text `to_string` does, so it answers through the same callee. Float/Bool/
+// Str/Char also type-check `display`, but nothing here answers them yet: each needs its
+// own callee, out of scope until asked for.
 fn cc_num_intrinsic(kind: TyKind, method: Str) -> Str {
-    if method != "to_string" { return "" }
-    if kind == TyKind.Int { return "std_num:int_to_str" }
-    if kind == TyKind.Float { return "std_num:float_to_str" }
+    if kind == TyKind.Int {
+        let mut table: Map[Str, Str] = Map()
+        table.insert("to_string", "std_num:int_to_str")
+        table.insert("display", "std_num:int_to_str")
+        return table.get(method) ?? ""
+    }
+    if kind == TyKind.Float {
+        let mut table: Map[Str, Str] = Map()
+        table.insert("to_string", "std_num:float_to_str")
+        return table.get(method) ?? ""
+    }
     ""
 }
 
@@ -3576,11 +3759,64 @@ fn cc_num_intrinsic(kind: TyKind, method: Str) -> Str {
 // cc_runtime_method instead. `get`, `pop` and `contains` are absent because none of the
 // three is one call: the first two fill a carrier behind a bounds or emptiness test, and
 // the last is a scan. Each is refused under its own name in cc_list_not_built.
+//
+// `count` answers the same declaration `len` does -- Sized's `.len()` and the List surface's
+// `.count()` name the same length, so both rows point at list_len. `chain` appends its
+// argument list the same way `append` does, so both point at list_concat; nothing here
+// distinguishes "append mutates its receiver, chain does not" -- that split already lives
+// in lib/std/list.bl's own two declarations, both redirected to the one runtime call.
+// `join` is the one row whose callee is not a static string: its target depends on the
+// list's own element type, so the table holds a sentinel for it and cc_list_join_callee is
+// asked only once that sentinel comes back.
 fn cc_list_intrinsic(node: Int, method: Str) -> Str ! Diag.Report {
-    if method == "append" { return "std_list:list_concat" }
-    if method == "slice" { return "std_list:list_slice" }
-    if method == "join" { return cc_list_join_callee(node) }
-    ""
+    let mut table: Map[Str, Str] = Map()
+    table.insert("append", "std_list:list_concat")
+    table.insert("slice", "std_list:list_slice")
+    table.insert("count", "std_list:list_len")
+    table.insert("chain", "std_list:list_concat")
+    table.insert("join", "__join__")
+    let row = table.get(method) ?? ""
+    if row == "__join__" { return cc_list_join_callee(node) }
+    row
+}
+
+fn cc_is_list_take(method: Str) -> Bool {
+    let mut table: Map[Str, Bool] = Map()
+    table.insert("take", true)
+    table.get(method) ?? false
+}
+
+// `take(n)` is the first n elements, which `list_slice` already answers given a start of
+// 0 -- but the method writes one argument where the declaration takes two, so this cannot
+// go through the plain redirect that hands a callee the call's own written arguments
+// unchanged. The 0 is injected here, in the same position a written `.slice(0, n)` would
+// put it, so both calls reach `list_slice` doing the same thing.
+fn cc_list_take(node: Int, obj: Int) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 1 { return cc_intrinsic_arity_wrong(node, TyKind.List, "take", 1, given) }
+    let decl = cc_stdlib_fn_named(node, "std_list", "list_slice")
+    if decl == DECL_REFUSED { return -1 }
+    if decl < 0 { return cc_intrinsic_undeclared(node, TyKind.List, "take", "std_list", "list_slice") }
+    let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
+    if symbol == "" { return -1 }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    let takes_ev = cg_decl_takes_ev(decl)
+    let mut ev = -1
+    if takes_ev {
+        ev = cg_eff_ev_argument(node)
+        if ev < 0 { return -1 }
+    }
+    let receiver = lower_expr(obj)
+    if receiver < 0 { return -1 }
+    let start = ir_const(TYPE_INT, node, rec.c_spelling, "0")
+    let end = lower_expr(sublist_get(node_args(node), 0))
+    if end < 0 { return -1 }
+    let mut args: List[Int] = [receiver, start, end]
+    if takes_ev { args.push(ev) }
+    ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, args)
 }
 
 // `str_join` reads every slot as a string, so it answers `join` only over Str elements.
@@ -3673,15 +3909,55 @@ fn cc_bytes_set_method(method: Str) -> Bool {
     false
 }
 
-// `write_char` is absent: its binding takes a Str where the method takes a Char, so the
-// call needs a conversion between the two and is not one plain call. `len` and `is_empty`
-// are answered by a real impl, as they are for Str.
+// `write_char` is absent from this table: its binding takes a Str where the method takes
+// a Char, so the call needs a conversion between the two and is not one plain redirect --
+// `cc_sb_write_char` builds it by hand instead. `len` and `is_empty` are answered by a
+// real impl, as they are for Str.
 fn cc_sb_intrinsic(node: Int, method: Str) -> Str ! Diag.Report {
     if method == "write" { return cc_sb_write_callee(node) }
     if method == "to_str" { return "std_sb:sb_to_str" }
     if method == "capacity" { return "std_sb:sb_capacity" }
     if method == "clear" { return "std_sb:sb_clear" }
     ""
+}
+
+fn cc_is_sb_write_char(kind: TyKind, method: Str) -> Bool {
+    if kind != TyKind.StringBuilder { return false }
+    let mut table: Map[Str, Bool] = Map()
+    table.insert("write_char", true)
+    table.get(method) ?? false
+}
+
+// The one Char-taking write: converted to text through the same runtime helper Char
+// interpolation reaches, then handed to `sb_write` as the Str it now is. Built by hand,
+// not through `lower_intrinsic_method`, because that path lowers the written argument
+// exactly as the call spells it and this call's argument is not the type the callee wants.
+fn cc_sb_write_char(node: Int, obj: Int) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 1 { return cc_intrinsic_arity_wrong(node, TyKind.StringBuilder, "write_char", 1, given) }
+    let decl = cc_stdlib_fn_named(node, "std_sb", "sb_write")
+    if decl == DECL_REFUSED { return -1 }
+    if decl < 0 { return cc_intrinsic_undeclared(node, TyKind.StringBuilder, "write_char", "std_sb", "sb_write") }
+    let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
+    if symbol == "" { return -1 }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    let takes_ev = cg_decl_takes_ev(decl)
+    let mut ev = -1
+    if takes_ev {
+        ev = cg_eff_ev_argument(node)
+        if ev < 0 { return -1 }
+    }
+    let receiver = lower_expr(obj)
+    if receiver < 0 { return -1 }
+    let ch = lower_expr(sublist_get(node_args(node), 0))
+    if ch < 0 { return -1 }
+    let text = cc_char_text_of_value(node, rec.c_spelling, rec.slot_form, ch)
+    let mut args: List[Int] = [receiver, text]
+    if takes_ev { args.push(ev) }
+    ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, args)
 }
 
 // Which of the four write bindings a `write` means. Typecheck leaves the argument of this
