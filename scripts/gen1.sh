@@ -8,19 +8,20 @@
 #   build/gen1/bin/{blinkc,blink}
 #   build/gen1/lib -> <repo>/lib        stdlib SOURCES of the current tree
 #   build/gen1/bin/lib -> ../lib        blinkc reads <dir of argv[0]>/lib/std
-#   build/gen1/share/blink/*            -> gen0's archive, header and sidecars
+#   build/gen1/share/blink/*            gen1's own archive, header and sidecars
+#                                        (runtime.h flattened fresh; native/ still
+#                                        gen0's, since that's a C sidecar, not
+#                                        codegen output)
 #   build/gen1/{blinkc,blink,libblink_std.a,libblink_std.h,skip_modules.txt}
 #
 # The installed layout is not cosmetic: `blink` resolves its install root
 # two directories up from realpath(argv[0]), so a flat build/gen1/blink
 # would resolve to build/ and link whatever archive sits there.
 #
-# The archive is codegen OUTPUT, so gen1 should build its own. It cannot
-# until the tid-native emitters return, so share/blink/ points at gen0's.
-# Every gen1 compile therefore mixes a gen0-built archive with gen1-emitted
-# user C. While the emitters raise I0004 nothing is emitted to mix, so the
-# corpus reads 0 passed either way. This link must be cut before a corpus
-# pass count means anything: see docs/codegen-rewrite/harness.md.
+# The archive is codegen OUTPUT: once gen1's own blinkc/blink binaries link,
+# they build gen1's own archive from the current lib/std, so every corpus
+# compile mixes a gen1-emitted user C with a gen1-built archive. This link to
+# gen0's archive is cut; see docs/codegen-rewrite/harness.md.
 #
 # blinkc exits 0 even when it reports errors, so a run passes only when the
 # exit code is 0 AND no `error[` line appears in its output.
@@ -96,3 +97,49 @@ for f in libblink_std.a libblink_std.h skip_modules.txt; do
     [ -e "$out/share/blink/$f" ] && ln -s "share/blink/$f" "$out/$f"
 done
 echo "gen1: built $out/bin/blinkc and $out/bin/blink"
+
+# The two binaries above are still linked against gen0's archive (fine — that
+# link step builds the compiler itself, not a user program). From here on,
+# gen1 builds its own archive with its own blink, from the current lib/std.
+#
+# resolve_runtime_h() walks $BLINK_ROOT, then the install root two
+# directories up from argv[0] (build/gen1 here), to share/blink/runtime.h.
+# Cut gen0's symlink there first and drop in a fresh flat header built from
+# this tree's bootstrap/runtime_*.h, or the archive build below would
+# silently pick up gen0's frozen copy through that same lookup (it predates
+# the 3-arg blink_map_remove, among other drift).
+rm -f "$out/share/blink/runtime.h"
+./scripts/flatten_runtime.sh "$out/share/blink/runtime.h" || exit 1
+
+archive_log="$out/archive-build.log"
+if ! BLINK_FORCE_STDLIB_REBUILD=1 "$out/bin/blink" __build-stdlib-archive > "$archive_log" 2>&1; then
+    echo "gen1: FAIL gen1's own compiler could not build the stdlib archive; see $archive_log" >&2
+    tail -20 "$archive_log" >&2
+    exit 1
+fi
+
+# build_stdlib_archive's relink_archive writes build/{libblink_std.a,libblink_std.h,
+# skip_modules.txt,.archive-id} as symlinks into build/std-cache/<hash>/, relative
+# to the cwd it ran under ($root, since this script cd's there up top) — not into
+# build/gen1/. That is the one place this leaves a side effect outside build/gen1
+# and build/std-cache; nothing task ci/ci-fast reads depends on it (fmt-semantic,
+# the one gate that reads build/libblink_std.a, runs with FMT_SEMANTIC=0 in both),
+# so leaving those top-level links pointed at gen1's cache is harmless.
+cache_link="$root/build/libblink_std.a"
+if [ ! -L "$cache_link" ]; then
+    echo "gen1: FAIL stdlib archive build did not produce $cache_link" >&2
+    exit 1
+fi
+cache_dir="$root/build/$(dirname "$(readlink "$cache_link")")"
+if [ ! -f "$cache_dir/libblink_std.a" ]; then
+    echo "gen1: FAIL resolved cache dir $cache_dir has no libblink_std.a" >&2
+    exit 1
+fi
+# runtime.h stays the flattened file dropped in above; native/ stays gen0's (C
+# sidecars, not codegen output). Only the archive itself and its direct sidecars
+# move to gen1's own build.
+for f in libblink_std.a libblink_std.h skip_modules.txt .archive-id; do
+    rm -f "$out/share/blink/$f"
+    ln -s "$cache_dir/$f" "$out/share/blink/$f"
+done
+echo "gen1: built its own stdlib archive at $cache_dir"

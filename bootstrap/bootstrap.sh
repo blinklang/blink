@@ -14,18 +14,7 @@ mkdir -p "$BUILD_DIR"
 cp "$SCRIPT_DIR"/runtime_*.h "$BUILD_DIR/"
 # Build a flat runtime.h in build/ that user .c files #include directly.
 # (Flat so nested #includes inside the split headers are pre-resolved.)
-cat "$SCRIPT_DIR/runtime_core.h" \
-    "$SCRIPT_DIR/runtime_errno.h" \
-    "$SCRIPT_DIR/runtime_tcp.h" \
-    "$SCRIPT_DIR/runtime_unix_socket.h" \
-    "$SCRIPT_DIR/runtime_thread.h" \
-    "$SCRIPT_DIR/runtime_process.h" \
-    "$SCRIPT_DIR/runtime_test.h" \
-    "$SCRIPT_DIR/runtime_sqlite.h" \
-    "$SCRIPT_DIR/runtime_stdio.h" \
-    "$SCRIPT_DIR/runtime_term.h" \
-    "$SCRIPT_DIR/runtime_trace.h" \
-    > "$BUILD_DIR/runtime.h"
+"$ROOT_DIR/scripts/flatten_runtime.sh" "$BUILD_DIR/runtime.h"
 # Build gc_unity.c — inline all ../*.c includes from gc/extra/gc.c into a
 # single translation unit so the embedded version has no relative .c deps.
 GC_EXTRA="$SCRIPT_DIR/vendor/gc/extra"

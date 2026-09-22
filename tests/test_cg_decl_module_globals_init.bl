@@ -250,6 +250,53 @@ test "a deferred initializer runs in module order: an imported module's global b
     assert(helper_assign < derived_assign)
 }
 
+// A unit linked against the stdlib archive declares a skipped module's globals nowhere:
+// the archive header already promises every one of them extern, so a second declaration
+// here is at best redundant and at worst (a non-const global) a second definition the
+// linker rejects. The importing module's own global is unaffected — the fix is scoped to
+// the skipped module's own declarations, not to every global the unit can see.
+fn user_tu_skip_cfg(skip: Map[Str, Int]) -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: skip, user_tu_mode: 1, blink_ev_extern_only: 1, archive_build_mode: 0 }
+}
+
+test "a unit linked against the archive defines no global from a skipped module" {
+    let helper_path = "src/cg_decl_globals_cross_helper.bl"
+    write_file(helper_path, cross_module_helper_src())
+    let program = build_full_probe("build/cg_decl_globals_skip_main.bl", cross_module_main_src())
+    let _ = fs.delete(helper_path)
+    let mut skip: Map[Str, Int] = Map()
+    skip.insert("cg_decl_globals_cross_helper", 1)
+    let text = generate(program, user_tu_skip_cfg(skip))
+    // Neither a bare declaration nor a defined value for the skipped module's global. The
+    // importing module's own deferred assignment still names it by symbol — that is a
+    // reference to the archive's extern definition, not a second declaration of it — so
+    // the needle here is the declaration/definition forms, not the bare identifier.
+    assert_missing(text, " blink_cg_decl_globals_cross_helper_helper_base;")
+    assert_missing(text, "blink_cg_decl_globals_cross_helper_helper_base = ")
+    let start = find_at(text, "__blink_init_globals")
+    let after_init = text.substring(start, text.len() - start)
+    // No assignment TO the skipped global — it still appears on the right-hand side of
+    // `derived`'s own assignment, which is a reference to the archive's copy, not a
+    // second assignment to a global this unit does not own.
+    assert_missing(after_init, "helper_base = ")
+    // The importing module's own global is untouched by the filter.
+    assert(after_init.contains("derived = "))
+}
+
+test "a unit with an empty skip list still defines every global, unaffected by user_tu_mode alone" {
+    let helper_path = "src/cg_decl_globals_cross_helper.bl"
+    write_file(helper_path, cross_module_helper_src())
+    let program = build_full_probe("build/cg_decl_globals_noskip_main.bl", cross_module_main_src())
+    let _ = fs.delete(helper_path)
+    let text = generate(program, user_tu_skip_cfg(Map()))
+    let start = find_at(text, "__blink_init_globals")
+    let after_init = text.substring(start, text.len() - start)
+    let helper_assign = find_at(after_init, "helper_base = ")
+    let derived_assign = find_at(after_init, "derived = ")
+    assert(helper_assign < derived_assign)
+}
+
 // An empty inits map answers no IrKind.Const for any global, so cg_decl_emit_globals
 // must fall back to a bare declaration and no initializer at all, never a type-based
 // zero default. This pins the invariant a scalar-zero fallback would otherwise mask.
