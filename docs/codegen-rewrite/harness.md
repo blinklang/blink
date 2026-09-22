@@ -25,13 +25,13 @@ sits there.
 Do not export `BLINK_ROOT` when you run these binaries by hand. Each one
 finds its stdlib and archive from its own path.
 
-`build/gen1/share/blink/` points at gen0's archive, header and native
-sidecars. The archive is codegen output, so gen1 should build its own,
-and it cannot until the tid-native emitters return. Every gen1 compile
-therefore mixes a gen0-built archive with gen1-emitted user C. While the
-emitters raise I0004 nothing is emitted to mix, so the corpus reads 0
-passed either way; the link must be cut before a nonzero corpus pass
-count means anything.
+`build/gen1/share/blink/` holds gen1's own archive and header: `gen1.sh`
+flattens this tree's `bootstrap/runtime_*.h` into `runtime.h`, then runs
+gen1's own `blink __build-stdlib-archive` against the current `lib/std`
+and repoints `libblink_std.{a,h}`, `skip_modules.txt` and `.archive-id`
+at the result. `native/` sidecars still come from gen0 — those are C,
+not codegen output. Every gen1 compile therefore mixes gen1-emitted
+user C with a gen1-built archive; the link to gen0's archive is cut.
 
 ## The tasks
 
