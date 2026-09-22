@@ -1,0 +1,176 @@
+// `let _ = e` discards the value. The parser stored that as an ordinary binder whose NAME
+// is the one-character string "_", so every later pass had to recognise the discard by
+// spelling it. A pass that forgets the compare defines a variable called "_" and a pass
+// that makes it reads a name no source line can name.
+//
+// A match pattern already had the structural answer: `_` inside a pattern mints a
+// NodeKind.WildcardPattern node and carries no name at all. The let form now does the
+// same. The binder node goes in the slot a destructuring `let` already uses for its
+// pattern, and the name slot is empty, so a pass asks the node what it is instead of
+// asking how it is spelled.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_reset, diag_entries}
+import parser.{node_kind, node_name, node_elements, node_value, node_left, nodes}
+import ast.{NodeKind, nk_of}
+import std.io
+
+fn probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    program
+}
+
+// Every error and ice the probe drew, joined, so a row states the whole answer.
+fn probe_diag_names() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out = "{out}{d.name} " }
+    }
+    out.trim()
+}
+
+// The `let` whose initializer calls `callee`. The stdlib the prelude pulls in has
+// discarding lets of its own, so a row finds ITS let by the call it binds, never by being
+// the only one of its kind in the program.
+fn let_binding_calling(callee: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.LetBinding {
+            let val = node_value(i)
+            if val != -1 && nk_of(node_kind(val)) == NodeKind.Call {
+                let target = node_left(val)
+                if target != -1 && nk_of(node_kind(target)) == NodeKind.Ident && node_name(target) == callee {
+                    return i
+                }
+            }
+        }
+        i = i + 1
+    }
+    io.println("FAIL: no let binding whose initializer calls '{callee}'")
+    assert(false)
+    -1
+}
+
+fn single_discard_src() -> Str {
+    #"fn zzwl_one() -> Int { 7 }
+
+fn main() {
+    let _ = zzwl_one()
+    assert(true)
+}
+"#
+}
+
+fn two_discards_src() -> Str {
+    #"fn zzwl_first() -> Int { 1 }
+
+fn zzwl_second() -> Int { 2 }
+
+fn main() {
+    let _ = zzwl_first()
+    let _ = zzwl_second()
+    assert(true)
+}
+"#
+}
+
+fn annotated_discard_src() -> Str {
+    #"fn zzwl_annotated() -> Int { 3 }
+
+fn main() {
+    let _: Int = zzwl_annotated()
+    assert(true)
+}
+"#
+}
+
+// A discard between a binder and a later use of that binder. The name-resolution walk
+// records the initializer's type on the scope entry the `let` just defined, and a discard
+// defines none -- so the entry on top belongs to the binder BEFORE it, and a walk that
+// wrote there anyway retyped `h` as the discarded report and lost its method.
+fn discard_between_uses_src() -> Str {
+    #"type ZzwlHandle { id: Int }
+
+type ZzwlReport { code: Int }
+
+trait ZzwlOps {
+    fn stop(self) -> Int
+}
+
+impl ZzwlOps for ZzwlHandle {
+    fn stop(self) -> Int { self.id }
+}
+
+fn zzwl_report(h: ZzwlHandle) -> ZzwlReport { ZzwlReport { code: h.id } }
+
+fn main() {
+    let h = ZzwlHandle { id: 5 }
+    let _ = zzwl_report(h)
+    let rc = h.stop()
+    assert(rc == 5)
+}
+"#
+}
+
+fn named_binder_src() -> Str {
+    #"fn zzwl_named() -> Int { 4 }
+
+fn main() {
+    let kept = zzwl_named()
+    assert(kept == 4)
+}
+"#
+}
+
+test "a discarding let carries a wildcard binder node and no name" {
+    let _p = probe("tc_wildcard_let_one", single_discard_src())
+    assert_eq(probe_diag_names(), "")
+    let nd = let_binding_calling("zzwl_one")
+    assert_eq(node_name(nd), "")
+    let binder = node_elements(nd)
+    assert(binder != -1, "the discarding let carries no binder node")
+    assert_eq(nk_of(node_kind(binder)), NodeKind.WildcardPattern)
+    assert_eq(node_name(binder), "")
+}
+
+// Two discards in one scope. A binder that still took a name would define the same name
+// twice here, and the second would report a redefinition.
+test "two discarding lets in one scope both typecheck" {
+    let _p = probe("tc_wildcard_let_two", two_discards_src())
+    assert_eq(probe_diag_names(), "")
+    let first = let_binding_calling("zzwl_first")
+    let second = let_binding_calling("zzwl_second")
+    assert(first != second, "both discards resolved to one node")
+    assert_eq(nk_of(node_kind(node_elements(first))), NodeKind.WildcardPattern)
+    assert_eq(nk_of(node_kind(node_elements(second))), NodeKind.WildcardPattern)
+}
+
+// The type annotation is read after the binder, so a row pins that the annotated form
+// reaches the same binder node and is still checked against the initializer.
+test "a discarding let with a type annotation carries the same binder node" {
+    let _p = probe("tc_wildcard_let_ann", annotated_discard_src())
+    assert_eq(probe_diag_names(), "")
+    let nd = let_binding_calling("zzwl_annotated")
+    assert_eq(node_name(nd), "")
+    assert_eq(nk_of(node_kind(node_elements(nd))), NodeKind.WildcardPattern)
+}
+
+test "a discard does not retype the binder that came before it" {
+    let _p = probe("tc_wildcard_let_between", discard_between_uses_src())
+    assert_eq(probe_diag_names(), "")
+}
+
+// The control: an ordinary binder keeps its name in the name slot and mints no pattern
+// node, so the discard's structure does not leak into every other let.
+test "a named let keeps its name and carries no binder node" {
+    let _p = probe("tc_wildcard_let_named", named_binder_src())
+    assert_eq(probe_diag_names(), "")
+    let nd = let_binding_calling("zzwl_named")
+    assert_eq(node_name(nd), "kept")
+    assert_eq(node_elements(nd), -1)
+}

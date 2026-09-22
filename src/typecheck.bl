@@ -13359,7 +13359,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             nr_check_type_ann_visibility(let_type_ann)
         }
         let let_is_mut = node_is_mut(node)
-        nr_define_mut_at(node_name(node), let_is_mut, node)
+        let let_binds = tc_let_binder_is_discard(node) == 0
+        if let_binds {
+            nr_define_mut_at(node_name(node), let_is_mut, node)
+        }
         if val != -1 {
             let vk = node_kind(val)
             if vk == NodeKind.Call || vk == NodeKind.Ident || vk == NodeKind.MethodCall {
@@ -13370,7 +13373,11 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 tc_ffi_scope_binder = node_name(node)
                 let inferred = infer_type(val)
                 tc_ffi_scope_binder = saved_nr_binder
-                if tc_tid_is_no_info(inferred) == 0 {
+                // The recorded type goes on the entry THIS let just defined, which is the
+                // top one. A discard defines no entry, so the top one belongs to whatever
+                // binder came before it, and writing there retypes a binder the discard
+                // has nothing to do with.
+                if let_binds && tc_tid_is_no_info(inferred) == 0 {
                     nr_set_last_type(inferred)
                 }
             }
@@ -13976,6 +13983,18 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 // Not delegated to tc_check_pattern_types: its IdentPattern arm hard-codes
 // `nr_define_typed(name, 0, ...)`, which would take `mut` away from every destructured
 // binder.
+// A `let` whose binder is the discard `_`. The binder is a NODE, not a spelling: the
+// parser mints a WildcardPattern in the pattern slot and leaves the name empty, so every
+// pass reads the kind here instead of comparing a name against "_". A destructuring `let`
+// fills the same slot with a TuplePattern, which is why this asks for the kind and not
+// merely whether the slot is filled.
+fn tc_let_binder_is_discard(node: Int) -> Int {
+    let binder = node_elements(node)
+    if binder == -1 { return 0 }
+    if nk_of(node_kind(binder)) == NodeKind.WildcardPattern { return 1 }
+    0
+}
+
 fn tc_type_let_pattern(pat: Int, tid: Int, is_mut: Int) {
     if pat == -1 { return }
     let kind = node_kind(pat)
@@ -19484,9 +19503,11 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // Record the decl node so the E0301 region-boundary check has a span. Node is
         // used only for that diagnostic in this pass — unused-var warnings are off
         // during inference (nr_warn_unused == 0).
-        nr_define_typed(vname, is_mut, final_tid, node)
-        if type_ann == -1 && type_str == "" && tc_tid_is_no_info(final_tid) == 0 {
-            tc_hints.push(HintEntry { line: node_line(node), col: node_col(node), name: vname, type_str: type_to_str(final_tid), module: nr_current_module })
+        if tc_let_binder_is_discard(node) == 0 {
+            nr_define_typed(vname, is_mut, final_tid, node)
+            if type_ann == -1 && type_str == "" && tc_tid_is_no_info(final_tid) == 0 {
+                tc_hints.push(HintEntry { line: node_line(node), col: node_col(node), name: vname, type_str: type_to_str(final_tid), module: nr_current_module })
+            }
         }
         let tc_let_pat_sl = node_elements(node)
         if tc_let_pat_sl != -1 {
