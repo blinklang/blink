@@ -1,0 +1,114 @@
+// A pattern nested inside a variant payload -- `Ok(Some(x))`, `Ok(None)`, and a
+// struct-style sub-pattern inside a payload -- must test and bind through the payload
+// slot's own tid and layout, recursively, the same as a top-level scrutinee, rather
+// than hitting the "a match on this pattern shape" fallback. These are probes over the
+// lowered IR: build/gen0, the frozen pre-rewrite compiler that runs the rewrite suite,
+// cannot itself emit C for this shape (that is the old carrier-unbox bug this lowering
+// replaces), so a run-it test under a test_cg_* name would fail the suite glob for a
+// reason unrelated to whether cg_stmt.bl lowers it correctly. The run-it, end-to-end
+// version of these shapes lives in tests/test_nested_variant_payload_patterns_run.bl,
+// which the corpus picks up but the rewrite-suite glob does not.
+
+import std.fs
+import std.io
+import typecheck.{check_types}
+import layout.{layout_reset}
+import mono.{run_mono}
+import ir.{ir_dump, ir_reset, ir_verify}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import cg_stmt.{cg_stmt_reset, lower_fn}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn run_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    diag_reset()
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+}
+
+fn dump_of(name: Str) -> Str ! Diag.Report {
+    let f = find_fn(name)
+    assert(f >= 0)
+    let root = lower_fn(f)
+    for err in ir_verify(root) { io.println("VERIFY: {err}") }
+    assert_eq(ir_verify(root).len(), 0)
+    ir_dump(root)
+}
+
+fn count_of(text: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut rest = text
+    while rest.contains(needle) {
+        n = n + 1
+        rest = rest.slice(rest.index_of(needle) + needle.len(), rest.len())
+    }
+    n
+}
+
+fn ice_mentioning(text: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.message.contains(text) { n = n + 1 }
+    }
+    n
+}
+
+test "Ok(Some(x)) tests the outer carrier tag and the inner carrier tag, then unboxes both payloads" {
+    run_probe("build/cg_stmt_nested_payload_some.bl", #"fn probe(r: Result[Option[Int], Str]) -> Int {
+    match r {
+        Ok(Some(x)) => x
+        Ok(None) => 0
+        Err(e) => 0
+    }
+}
+fn main() { assert(probe(Ok(Some(7))) == 7) }
+"#)
+    let d = dump_of("probe")
+    assert_eq(ice_mentioning("a match on this pattern shape"), 0)
+    assert_eq(ice_mentioning("guaranteed to run"), 0)
+    // Ok's tag combined with Option's tag via && -- a bare Ok tag test alone would take
+    // the Some(x) arm for Ok(None) too.
+    assert(d.contains("\"&&\""))
+    // Each arm unwraps its own carrier member on the test side, the bind side, or both,
+    // and Ok(Some(x)) unwraps twice on each side -- once for Ok, once more for the nested
+    // Some -- so the total across all three arms is more than one per arm. A flat count of
+    // 3 (one unwrap per arm, no recursion into the nested Some/Option) would mean the
+    // inner recursion never ran.
+    assert(count_of(d, "(CarrierUnwrap ") > 3)
+}
+
+test "a struct-style sub-pattern inside a payload reads through the variant's own member" {
+    run_probe("build/cg_stmt_nested_payload_struct.bl", #"type Point { x: Int, y: Int }
+fn probe(r: Result[Point, Str]) -> Int {
+    match r {
+        Ok(Point { x, y }) => x + y
+        Err(e) => 0
+    }
+}
+fn main() { assert(probe(Ok(Point { x: 1, y: 2 })) == 3) }
+"#)
+    let d = dump_of("probe")
+    assert_eq(ice_mentioning("a match on this pattern shape"), 0)
+    assert_eq(ice_mentioning("guaranteed to run"), 0)
+    // The struct payload is bound through the carrier's own member (a CarrierUnwrap to the
+    // Point, then a FieldGet for each of x and y), not through the Result's own fields --
+    // Result has no x/y fields, so reading them off the wrong holder fails C compilation.
+    assert(count_of(d, "(CarrierUnwrap ") >= 1)
+    assert_eq(count_of(d, "(FieldGet "), 2)
+}
