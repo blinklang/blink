@@ -23,7 +23,7 @@ import layout.{
     BinderMut, LayoutRecord, Position, Slot, SlotForm, bind_binder, bind_binder_cell, binder_is_celled,
     binder_mutability_of, binder_scope_pop, binder_scope_push, child_tid, closure_self_spelling,
     container_slot_spelling, current_binder_scope, ensure_typedef_for, layout_of, pointer_spelling,
-    tid_of_binder, tid_of_node,
+    tid_of_binder, tid_of_node, spawn_pair_spelling,
 }
 import cname.{
     c_builtin_effect_slot, c_cell_name, c_effect_vtable_slot_name, c_ev_field_name, c_ev_global_name,
@@ -251,9 +251,9 @@ type PendingThunk {
 let mut eff_thunks: List[PendingThunk] = []
 
 // Whether any thunk queued so far is a spawn's, which is what the driver's main shim reads
-// to decide whether the program's one TU owning main needs to start the pool. Never reset
-// by cg_eff_reset: a module boundary is not a program boundary, and the shim reads this
-// once, after every module's closures have queued theirs.
+// to decide whether the program's one TU owning main needs to start the pool. Reset by
+// cg_eff_program_reset, not cg_eff_reset: a module boundary is not a program boundary, and
+// the shim reads this once, after every module's closures have queued theirs.
 let mut eff_uses_async: Bool = false
 
 // Whether the one pair struct every spawn's task wrapper reads its argument through has
@@ -277,6 +277,15 @@ pub fn cg_eff_reset() {
     eff_thunk_scope = -1
     eff_op_outer_name = ""
     eff_op_field = ""
+    eff_spawn_pair_printed = false
+}
+
+// The program-wide counterpart to cg_eff_reset: run once, before the per-module loop, for
+// state that a module boundary must not clear. eff_uses_async is read once by the main
+// shim after every module's closures have queued theirs, so it has to survive every
+// per-unit cg_eff_reset in between and start false only at the program's own start.
+pub fn cg_eff_program_reset() {
+    eff_uses_async = false
 }
 
 // The closure record for one closure literal, or -1 after a recorded internal error.
@@ -762,13 +771,13 @@ pub fn cg_eff_print_thunk(i: Int, body: Int) ! Diag.Report {
 // void* cell an element rides through, and a handle's result cell is exactly one more.
 fn print_spawn_task_wrapper_for(i: Int, th: PendingThunk, ret: Str) ! Diag.Report {
     if !eff_spawn_pair_printed {
-        print_spawn_pair_typedef()
+        print_spawn_pair_typedef(spawn_pair_spelling())
         eff_spawn_pair_printed = true
     }
     let ret_tid = cg_eff_thunk_ret_tid(i)
     let slot = layout_of(ret_tid, Position.ContainerSlot)
     let boxed = slot.slot_form == SlotForm.PointerBoxed
-    print_spawn_task_wrapper(ret, th.task_symbol, boxed, slot.slot_word)
+    print_spawn_task_wrapper(spawn_pair_spelling(), ret, th.task_symbol, boxed, slot.slot_word)
 }
 
 // The body with one declaration per captured name in front of it, each read back out of
