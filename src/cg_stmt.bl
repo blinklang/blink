@@ -1639,6 +1639,57 @@ fn lower_for_indexed(node: Int, iter: Int, walk: ForInIteration) -> Int ! Diag.R
     ir_block(node, [src_let, len_let, idx_let, ir_loop(node, ir_block(node, turn))])
 }
 
+// The pieces lower_for_materialized reads by position once the source is materialized: the
+// keys list (always) and, for a Map, the parallel values list at the same positions, plus
+// the index/length step and guard that walk both. Split out of lower_for_materialized so
+// that function stays about the one turn's read, not this setup.
+type MaterializedRead {
+    pre: List[Int],
+    keys_tid: Int,
+    keys_rec: LayoutRecord,
+    keys: Str,
+    vals_tid: Int,
+    vals_rec: LayoutRecord,
+    vals: Str,
+    idx: Str,
+    step: Int,
+    guard: Int,
+}
+
+fn lower_for_materialized_sources(node: Int, walk: ForInIteration, has_pair: Bool, key_tid: Int,
+        val_tid: Int, src_tid: Int, src_rec: LayoutRecord, src: Str) -> MaterializedRead ! Diag.Report {
+    let keys_tid = make_list_type(key_tid)
+    let keys_rec = layout_at(keys_tid, Position.Local, node)
+    let keys = c_mint_local("keys")
+    let keys_let = ir_let(keys_tid, node, keys_rec.c_spelling, keys, keys_rec.slot_form,
+        ir_call_runtime(keys_tid, node, keys_rec.c_spelling, walk.materialize_symbol, keys_rec.slot_form,
+            [container_ref(node, src_tid, src_rec, src)]))
+    let mut pre: List[Int] = [keys_let]
+    let mut vals_tid = -1
+    let mut vals = ""
+    let mut vals_rec = keys_rec
+    if has_pair {
+        vals_tid = make_list_type(val_tid)
+        vals_rec = layout_at(vals_tid, Position.Local, node)
+        vals = c_mint_local("vals")
+        pre.push(ir_let(vals_tid, node, vals_rec.c_spelling, vals, vals_rec.slot_form,
+            ir_call_runtime(vals_tid, node, vals_rec.c_spelling, walk.pair_symbol, vals_rec.slot_form,
+                [container_ref(node, src_tid, src_rec, src)])))
+    }
+    let len = c_mint_local("len")
+    pre.push(ir_let(TYPE_INT, node, int_spelling(node), len, int_form(node),
+        ir_call_runtime(TYPE_INT, node, int_spelling(node), walk.len_symbol, int_form(node),
+            [container_ref(node, keys_tid, keys_rec, keys)])))
+    let idx = c_mint_local("idx")
+    pre.push(ir_let(TYPE_INT, node, int_spelling(node), idx, int_form(node), int_const(node, "-1")))
+    let step = ir_assign(node, flag_ref(node, idx),
+        ir_binary(TYPE_INT, node, int_spelling(node), "+", flag_ref(node, idx), int_const(node, "1")))
+    let cond = ir_binary(TYPE_INT, node, int_spelling(node), ">=", flag_ref(node, idx), flag_ref(node, len))
+    let guard = ir_if(node, cond, ir_block(node, [ir_break(node)]), -1)
+    MaterializedRead { pre: pre, keys_tid: keys_tid, keys_rec: keys_rec, keys: keys,
+        vals_tid: vals_tid, vals_rec: vals_rec, vals: vals, idx: idx, step: step, guard: guard }
+}
+
 // `for x in s { b }` / `for (k, v) in m { b }`: a Set or a Map has no by-position read of
 // its own storage, so this reads it into one List first -- a Set's own elements at
 // materialize_symbol, or a Map's keys there and its values at pair_symbol, at the same
@@ -1668,36 +1719,9 @@ fn lower_for_materialized(node: Int, iter: Int, walk: ForInIteration) -> Int ! D
     let src_rec = layout_at(src_tid, Position.Local, iter)
     let src = c_mint_local("iter")
     let src_let = ir_let(src_tid, node, src_rec.c_spelling, src, src_rec.slot_form, lower_value(iter))
-    let keys_tid = make_list_type(key_tid)
-    let keys_rec = layout_at(keys_tid, Position.Local, node)
-    let keys = c_mint_local("keys")
-    let keys_let = ir_let(keys_tid, node, keys_rec.c_spelling, keys, keys_rec.slot_form,
-        ir_call_runtime(keys_tid, node, keys_rec.c_spelling, walk.materialize_symbol, keys_rec.slot_form,
-            [container_ref(node, src_tid, src_rec, src)]))
-    let mut pre: List[Int] = [src_let, keys_let]
-    let mut vals_tid = -1
-    let mut vals = ""
-    let mut vals_rec = keys_rec
-    if has_pair {
-        vals_tid = make_list_type(val_tid)
-        vals_rec = layout_at(vals_tid, Position.Local, node)
-        vals = c_mint_local("vals")
-        pre.push(ir_let(vals_tid, node, vals_rec.c_spelling, vals, vals_rec.slot_form,
-            ir_call_runtime(vals_tid, node, vals_rec.c_spelling, walk.pair_symbol, vals_rec.slot_form,
-                [container_ref(node, src_tid, src_rec, src)])))
-    }
-    let len = c_mint_local("len")
-    pre.push(ir_let(TYPE_INT, node, int_spelling(node), len, int_form(node),
-        ir_call_runtime(TYPE_INT, node, int_spelling(node), walk.len_symbol, int_form(node),
-            [container_ref(node, keys_tid, keys_rec, keys)])))
-    let idx = c_mint_local("idx")
-    pre.push(ir_let(TYPE_INT, node, int_spelling(node), idx, int_form(node), int_const(node, "-1")))
-    let step = ir_assign(node, flag_ref(node, idx),
-        ir_binary(TYPE_INT, node, int_spelling(node), "+", flag_ref(node, idx), int_const(node, "1")))
-    let cond = ir_binary(TYPE_INT, node, int_spelling(node), ">=", flag_ref(node, idx), flag_ref(node, len))
-    let guard = ir_if(node, cond, ir_block(node, [ir_break(node)]), -1)
+    let m = lower_for_materialized_sources(node, walk, has_pair, key_tid, val_tid, src_tid, src_rec, src)
     let key_read = cg_call_element_from_runtime(node, key_tid, walk.get_symbol,
-        [container_ref(node, keys_tid, keys_rec, keys), flag_ref(node, idx)])
+        [container_ref(node, m.keys_tid, m.keys_rec, m.keys), flag_ref(node, m.idx)])
     if key_read < 0 {
         close_scope()
         return -1
@@ -1705,7 +1729,7 @@ fn lower_for_materialized(node: Int, iter: Int, walk: ForInIteration) -> Int ! D
     let mut value = key_read
     if has_pair {
         let val_read = cg_call_element_from_runtime(node, val_tid, walk.get_symbol,
-            [container_ref(node, vals_tid, vals_rec, vals), flag_ref(node, idx)])
+            [container_ref(node, m.vals_tid, m.vals_rec, m.vals), flag_ref(node, m.idx)])
         if val_read < 0 {
             close_scope()
             return -1
@@ -1723,13 +1747,19 @@ fn lower_for_materialized(node: Int, iter: Int, walk: ForInIteration) -> Int ! D
     let body = lower_block(node_body(node))
     close_scope()
     if body < 0 { return -1 }
-    let mut turn: List[Int] = [step, guard]
+    let mut turn: List[Int] = [m.step, m.guard]
     let mut i = 0
     while i < binds.len() {
         turn.push(binds.get(i).unwrap())
         i = i + 1
     }
     turn.push(body)
+    let mut pre: List[Int] = [src_let]
+    let mut j = 0
+    while j < m.pre.len() {
+        pre.push(m.pre.get(j).unwrap())
+        j = j + 1
+    }
     pre.push(ir_loop(node, ir_block(node, turn)))
     ir_block(node, pre)
 }
