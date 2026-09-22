@@ -35,7 +35,10 @@ import ir.{
     ir_closure_new, ir_const, ir_effect_perform, ir_evidence_address, ir_evidence_vector,
     ir_field_get, ir_global_ref, ir_handler_install, ir_if, ir_let, ir_unbox, ir_var_ref,
 }
-import cg_print.{print_closure_thunk, print_fn, print_fn_decl, print_handler_builder, print_resource_guard_support}
+import cg_print.{
+    print_closure_thunk, print_fn, print_fn_decl, print_handler_builder, print_resource_guard_support,
+    print_spawn_pair_typedef, print_spawn_task_wrapper,
+}
 import cg_reg.{cg_reg_effect_decls, cg_reg_impl_decls}
 import cg_expr.{cg_expr_push_pending, lower_expr, lower_value_as_text}
 import diagnostics.{
@@ -239,9 +242,24 @@ type PendingThunk {
     handler_tid: Int
     // The static the handler literal's builder wrote the copied-from handler into, or "".
     outer_name: Str
+    // "" for a plain closure thunk. For a spawned one, the symbol of the task wrapper that
+    // runs on the pool thread and stashes the closure's result into the handle spawn
+    // answered — minted beside the closure's own symbol so both exist before either prints.
+    task_symbol: Str
 }
 
 let mut eff_thunks: List[PendingThunk] = []
+
+// Whether any thunk queued so far is a spawn's, which is what the driver's main shim reads
+// to decide whether the program's one TU owning main needs to start the pool. Never reset
+// by cg_eff_reset: a module boundary is not a program boundary, and the shim reads this
+// once, after every module's closures have queued theirs.
+let mut eff_uses_async: Bool = false
+
+// Whether the one pair struct every spawn's task wrapper reads its argument through has
+// been printed yet. Set the first time a queued thunk carries a task_symbol; every wrapper
+// after the first reuses the same typedef rather than printing its own copy.
+let mut eff_spawn_pair_printed: Bool = false
 
 // The frame cg_eff_thunk_open pushed, or -1 between thunks, so a close with nothing open
 // cannot pop a frame that belongs to someone else.
@@ -275,6 +293,20 @@ pub fn cg_eff_reset() {
 // reader, the promoter that deep-copies captures into an arena, so a closure that is never
 // promoted would carry an array nothing reads.
 pub fn cg_eff_lower_closure(node: Int) -> Int ! Diag.Report {
+    lower_closure_thunk(node, "")
+}
+
+// `async.spawn(f)` queues the same closure thunk plus a second symbol: the task wrapper
+// that runs on the pool thread, minted here so it exists the instant the closure does and
+// cg_call can read it straight back off the thunk this returns into. The queue is the
+// single owner of both symbols together, which is what keeps a wrapper from ever being
+// printed for a closure that was refused, or the reverse.
+pub fn cg_eff_lower_spawn_closure(node: Int) -> Int ! Diag.Report {
+    eff_uses_async = true
+    lower_closure_thunk(node, c_mint_local("spawn_task"))
+}
+
+fn lower_closure_thunk(node: Int, task_symbol: Str) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = layout_of(tid, Position.Local)
@@ -293,7 +325,7 @@ pub fn cg_eff_lower_closure(node: Int) -> Int ! Diag.Report {
     let symbol = c_mint_local("closure")
     eff_thunks.push(PendingThunk {
         closure: node, symbol: symbol, fn_tid: tid, cap_names: free, cap_tids: tids,
-        cap_celled: celled, handler_tid: -1, outer_name: "",
+        cap_celled: celled, handler_tid: -1, outer_name: "", task_symbol: task_symbol,
     })
     ir_closure_new(tid, node, rec.c_spelling, symbol, "", "", words)
 }
@@ -485,6 +517,7 @@ pub fn cg_eff_lower_handler_expr(node: Int) -> Int ! Diag.Report {
         eff_thunks.push(PendingThunk {
             closure: ops.get(i).unwrap(), symbol: symbols.get(i).unwrap(), fn_tid: -1,
             cap_names: [], cap_tids: [], cap_celled: [], handler_tid: tid, outer_name: outer,
+            task_symbol: "",
         })
         print_fn_decl(true, rets.get(i).unwrap(), symbols.get(i).unwrap(), params.get(i).unwrap(), false)
         i = i + 1
@@ -600,6 +633,21 @@ pub fn cg_eff_thunk_symbol(i: Int) -> Str ! Diag.Report {
     eff_thunks.get(t).unwrap().symbol
 }
 
+// The task wrapper symbol cg_eff_lower_spawn_closure minted for this thunk, for cg_call to
+// pass to blink_threadpool_submit -- the one fact about the queued thunk that lowering the
+// closure alone does not return, because the closure value spawn answers with is the
+// runtime closure, not the wrapper the pool calls.
+pub fn cg_eff_thunk_task_symbol(i: Int) -> Str ! Diag.Report {
+    let t = thunk_at(i)
+    if t < 0 { return "" }
+    eff_thunks.get(t).unwrap().task_symbol
+}
+
+// Whether any closure lowered so far was a spawn's. The driver's main shim reads this once,
+// after the whole program's closures have queued theirs, to decide whether main starts the
+// pool at all.
+pub fn cg_eff_program_uses_async() -> Bool { eff_uses_async }
+
 // The block the thunk's body lowers from, in the same shape lower_block_returning takes.
 pub fn cg_eff_thunk_body_node(i: Int) -> Int ! Diag.Report {
     let t = thunk_at(i)
@@ -704,6 +752,23 @@ pub fn cg_eff_print_thunk(i: Int, body: Int) ! Diag.Report {
     let whole = with_capture_prologue(th, body)
     if whole < 0 { return }
     print_closure_thunk(ret, th.symbol, params, whole)
+    if th.task_symbol != "" { print_spawn_task_wrapper_for(i, th, ret) }
+}
+
+// The wrapper a spawned thunk's task symbol names: unpacks the {closure, handle} pair the
+// pool thread was handed, calls the thunk through the closure the way call_closure_text
+// does inline, and stashes the answer in the handle at the same width a container slot
+// takes a value at -- Position.ContainerSlot already answers word-vs-boxed for every other
+// void* cell an element rides through, and a handle's result cell is exactly one more.
+fn print_spawn_task_wrapper_for(i: Int, th: PendingThunk, ret: Str) ! Diag.Report {
+    if !eff_spawn_pair_printed {
+        print_spawn_pair_typedef()
+        eff_spawn_pair_printed = true
+    }
+    let ret_tid = cg_eff_thunk_ret_tid(i)
+    let slot = layout_of(ret_tid, Position.ContainerSlot)
+    let boxed = slot.slot_form == SlotForm.PointerBoxed
+    print_spawn_task_wrapper(ret, th.task_symbol, boxed, slot.slot_word)
 }
 
 // The body with one declaration per captured name in front of it, each read back out of

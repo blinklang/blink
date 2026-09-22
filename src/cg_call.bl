@@ -35,7 +35,7 @@ import typecheck.{
     tc_names_a_type, tc_is_sealed_list_hof, is_user_effect_handle_name,
     tc_lookup_node_tid, tc_unclaimed_call_tid, tc_list_rename_help, tc_tid_iter_elem,
     tc_call_decl_node, tc_tid_name, tc_mc_obj_is_value,
-    TYPE_INT, TYPE_BOOL, TYPE_STR,
+    TYPE_INT, TYPE_BOOL, TYPE_STR, TYPE_VOID,
     type_bit_width, TYPE_U8, TYPE_U16, TYPE_U32, TYPE_U64,
 }
 import layout.{
@@ -60,14 +60,17 @@ import ir.{
     ir_call_direct, ir_call_runtime, ir_call_closure, ir_call_indirect, ir_cast, ir_unary, ir_unbox, ir_box,
     ir_assign, ir_binary, ir_block, ir_break, ir_carrier_tag, ir_carrier_wrap,
     ir_const, ir_global_ref, ir_if, ir_let, ir_loop, ir_panic, ir_struct_new, ir_var_ref, ir_field_get,
-    ir_field_set, ir_enum_new, ir_container_new, ir_sized_alloc, ir_select, ir_switch,
+    ir_field_set, ir_enum_new, ir_container_new, ir_sized_alloc, ir_select, ir_switch, ir_expr_stmt,
 }
 import cg_expr.{
     lower_expr, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
     x_unbox_payload, x_layout_checked,
 }
 import cg_stmt.{lower_block_into}
-import cg_eff.{cg_eff_ev_argument, cg_eff_lower_builtin_perform, cg_eff_lower_user_perform}
+import cg_eff.{
+    cg_eff_ev_argument, cg_eff_lower_builtin_perform, cg_eff_lower_user_perform,
+    cg_eff_lower_spawn_closure, cg_eff_pending_thunks, cg_eff_thunk_task_symbol,
+}
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
 import diagnostics.{
     Diag, diag_ice_at, diag_ice_stage_not_built, diag_error_at, diag_file_for_node, diag_source_file,
@@ -983,6 +986,7 @@ let ns_ffi = "ffi"
 let ns_net = "net"
 let ns_term = "term"
 let ns_fs = "fs"
+let ns_async = "async"
 
 // The io names a handler can replace, and the env names it can. Both lists are written
 // under the names a caller writes, not under the vtable slots they reach, because the
@@ -1006,7 +1010,80 @@ fn lower_namespace_call(node: Int, obj: Int) -> Int ! Diag.Report {
     if ns == ns_net { return lower_net_call(node, method) }
     if ns == ns_term { return lower_term_call(node, method) }
     if ns == ns_fs { return lower_fs_call(node, method) }
+    if ns == ns_async { return lower_async_call(node, method) }
     cc_ns_not_built(node, ns, method)
+}
+
+// `async.spawn(f)` runs f on the pool thread and hands the caller a Handle right away. A
+// submission is one pair -- the closure and the runtime handle -- heap-allocated because
+// the pool thread reads it after this call returns; the task wrapper that actually calls f
+// and stores its answer is minted alongside the closure by cg_eff_lower_spawn_closure, so
+// this site only has to build the pair and submit it. The pair's own C shape (the struct
+// the wrapper reads its argument through) belongs to cg_emit, not here -- L6 forbids C
+// spellings outside cg_eff/cg_emit's own text-writing layer, so this call site only ever
+// names the struct's already-defined C name, never spells its members.
+fn lower_async_call(node: Int, method: Str) -> Int ! Diag.Report {
+    if method != "spawn" { return cc_ns_not_built(node, ns_async, method) }
+    let given = sublist_length(node_args(node))
+    if given != 1 {
+        diag_ice_at("AsyncSpawnArityWrong", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "'async.spawn' takes 1 argument, and this call was given {given}", node,
+            "typecheck must reject this call before codegen reads it; this is a compiler bug")
+        return -1
+    }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let handle_rec = layout_of(tid, Position.Local)
+    // The reason is read into the message before the test, so that every read of a decline
+    // sits next to the internal error that reports it and none can be left to be swallowed.
+    let why = "'async.spawn' result has no C layout: {handle_rec.decline_reason}"
+    if handle_rec.decline_reason != "" {
+        diag_ice_at("UnspellableHandleType", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
+            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+        return -1
+    }
+
+    // The index this thunk will land at is read before it is queued, because the queue is
+    // the only place the task wrapper's own symbol lives once cg_eff_lower_spawn_closure
+    // returns -- the closure value it hands back is the runtime closure, not the wrapper.
+    let idx = cg_eff_pending_thunks()
+    let closure_val = cg_eff_lower_spawn_closure(sublist_get(node_args(node), 0))
+    if closure_val < 0 { return -1 }
+    let task_symbol = cg_eff_thunk_task_symbol(idx)
+
+    let handle_name = c_mint_local("spawn")
+    cg_expr_push_pending(node, ir_let(tid, node, handle_rec.c_spelling, handle_name, handle_rec.slot_form,
+        ir_call_runtime(tid, node, handle_rec.c_spelling, "blink_handle_new", handle_rec.slot_form, [])))
+
+    let pair = ir_box(TYPE_INT, node, "blink_spawn_pair*", "blink_spawn_pair",
+        ir_struct_new(TYPE_INT, node, "blink_spawn_pair",
+            [closure_val, ir_var_ref(tid, node, handle_rec.c_spelling, handle_name, handle_rec.slot_form)]))
+
+    let void_rec = layout_of(TYPE_VOID, Position.Return)
+    cg_expr_push_pending(node, ir_expr_stmt(node, ir_call_runtime(TYPE_VOID, node, void_rec.c_spelling,
+        "blink_threadpool_submit", void_rec.slot_form,
+        [
+            ir_global_ref(TYPE_INT, node, "blink_threadpool*", "__blink_pool", SlotForm.Inline),
+            ir_global_ref(TYPE_INT, node, "void(*)(void*)", task_symbol, SlotForm.Inline),
+            pair,
+        ])))
+
+    ir_var_ref(tid, node, handle_rec.c_spelling, handle_name, handle_rec.slot_form)
+}
+
+// `h.await` blocks for the pool thread's answer and reads it back at h's own element type.
+// blink_handle_await hands back the same void* slot a container element travels through,
+// so the general element-shape round trip already built for `List.get`/`Map.get` decodes
+// it: word-cast for a value that rides a pointer-wide word, ir_unbox for one wide enough
+// that the task wrapper heap-copied it. AwaitExpr is its own NodeKind (parser.bl), not a
+// MethodCall, so cg_expr's central dispatch reaches this directly rather than through
+// lower_method_call.
+pub fn lower_await_expr(node: Int) -> Int ! Diag.Report {
+    let handle_val = lower_expr(node_obj(node))
+    if handle_val < 0 { return -1 }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    cg_call_element_from_runtime(node, tid, c_runtime_helper("handle_await"), [handle_val])
 }
 
 // `fs.errno` is plumbing, not the signed surface: the last raw fs syscall's errno (0 on
