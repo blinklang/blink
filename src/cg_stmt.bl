@@ -20,8 +20,8 @@ import parser.{
 }
 import typecheck.{
     TyKind, TYPE_BOOL, TYPE_CHAR, TYPE_FLOAT, TYPE_INT, TYPE_STR, TYPE_VOID,
-    tc_alias_to_original, tc_enum_has_payload, tc_global_decl_node, tc_lookup_node_tid,
-    tc_tid_decl_node, tc_tid_kind,
+    tc_alias_to_original, tc_enum_has_payload, tc_global_decl_node, tc_let_binder_is_discard,
+    tc_lookup_node_tid, tc_tid_decl_node, tc_tid_kind,
 }
 import layout.{
     Position, Slot, SlotForm, LayoutRecord, bind_binder, bind_binder_cell, bind_binder_mut, binder_is_celled,
@@ -784,7 +784,13 @@ fn cs_is_void_like(tid: Int) -> Bool {
     k == TyKind.Void || k == TyKind.Never
 }
 
-fn bind_and_declare_let(node: Int, tid: Int, rec: LayoutRecord, name: Str, value: Int) -> Int ! Diag.Report {
+fn bind_and_declare_let(node: Int, tid: Int, rec: LayoutRecord, name: Str, value: Int, discard: Bool) -> Int ! Diag.Report {
+    // A discard binder has no source name to bind or escape, so mint a fresh local instead
+    // of routing it through the ordinary name-escaping path. This is decided structurally
+    // by the caller (tc_let_binder_is_discard), never by comparing the name itself.
+    if discard {
+        return ir_let(tid, node, rec.c_spelling, c_mint_local("_"), rec.slot_form, value)
+    }
     let is_mut = node_is_mut(node) == 1
     if is_mut && cg_eff_binder_is_shared(name) {
         bind_binder_cell(cur_scope(), name, tid)
@@ -794,33 +800,37 @@ fn bind_and_declare_let(node: Int, tid: Int, rec: LayoutRecord, name: Str, value
     ir_let(tid, node, rec.c_spelling, cg_local_c_name(name), rec.slot_form, value)
 }
 
-fn bind_unit_let(node: Int, tid: Int, init: Int, rec: LayoutRecord, name: Str) -> Int ! Diag.Report {
+fn bind_unit_let(node: Int, tid: Int, init: Int, rec: LayoutRecord, name: Str, discard: Bool) -> Int ! Diag.Report {
     let ran = lower_stmt_tail(init, TAIL_DISCARD, "", -1)
     if ran < 0 { return -1 }
     cg_expr_push_pending(node, ran)
     let unit = int_const(node, "0")
     if unit < 0 { return -1 }
-    bind_and_declare_let(node, tid, rec, name, unit)
+    bind_and_declare_let(node, tid, rec, name, unit, discard)
 }
 
 fn lower_let(node: Int) -> Int ! Diag.Report {
-    if node_elements(node) != -1 { return lower_destructuring_let(node) }
+    // A discarding binder mints its own WildcardPattern node into the elements slot, so it
+    // must be told apart from a real tuple pattern before the elements-slot dispatch below,
+    // or `let _ = e` would wrongly fall into tuple destructuring.
+    let discard = tc_let_binder_is_discard(node) == 1
+    if !discard && node_elements(node) != -1 { return lower_destructuring_let(node) }
     let tid = stmt_tid(node)
     if tid < 0 { return -1 }
     let rec = layout_at(tid, Position.Local, node)
     let _ = ensure_typedef_for(tid)
-    let name = node_name(node)
+    let name = if discard { "" } else { node_name(node) }
     let init = node_value(node)
     if init < 0 {
-        return bind_and_declare_let(node, tid, rec, name, -1)
+        return bind_and_declare_let(node, tid, rec, name, -1, discard)
     }
     if tc_tid_kind(tid) == TyKind.Void {
-        if !cg_expr_is_registered(init) { return bind_unit_let(node, tid, init, rec, name) }
+        if !cg_expr_is_registered(init) { return bind_unit_let(node, tid, init, rec, name, discard) }
     }
     // The initializer is lowered before the name binds, so `let x = x + 1` reads the
     // outer `x` the source names rather than the one this statement is declaring.
     let value = lower_value(init)
-    bind_and_declare_let(node, tid, rec, name, value)
+    bind_and_declare_let(node, tid, rec, name, value, discard)
 }
 
 // `let (a, b) = e`. The tuple binds once so the initializer runs once, and each element

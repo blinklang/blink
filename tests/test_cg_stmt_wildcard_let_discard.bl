@@ -1,0 +1,90 @@
+import std.fs
+import typecheck.{check_types}
+import layout.{layout_reset}
+import mono.{run_mono}
+import ir.{ir_dump, ir_reset, ir_verify}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+import diagnostics.{diag_reset}
+import cg_stmt.{cg_stmt_reset, lower_fn}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn run_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    diag_reset()
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+}
+
+fn dump_of(name: Str) -> Str ! Diag.Report {
+    let f = find_fn(name)
+    assert(f >= 0)
+    let root = lower_fn(f)
+    assert_eq(ir_verify(root).len(), 0)
+    ir_dump(root)
+}
+
+fn count_of(text: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut rest = text
+    while rest.contains(needle) {
+        n = n + 1
+        rest = rest.slice(rest.index_of(needle) + needle.len(), rest.len())
+    }
+    n
+}
+
+// A discarding binder must be told apart from a real tuple pattern before the elements-slot
+// dispatch, or it falls into lower_destructuring_let and mints its holder under the "tup"
+// stem instead of the discard path's own "_cg__N" name -- and a second discard in the same
+// scope would then redeclare the same holder under a colliding name, since the tuple path
+// does not consult the mint counter per discard the way bind_and_declare_let does.
+test "two wildcard lets in one scope go through the discard mint path, not tuple destructuring" {
+    run_probe("build/cg_stmt_wildcard_discard.bl", #"fn side_effect(x: Int) -> Int {
+    x + 1
+}
+fn probe() {
+    let _ = side_effect(1)
+    let _ = side_effect(2)
+}
+fn main() { probe() }
+"#)
+    let d = dump_of("probe")
+    assert_eq(count_of(d, "(Let "), 2)
+    assert_eq(count_of(d, "(CallDirect "), 2)
+    assert(!d.contains("_cg_tup"))
+}
+
+// A wildcard let over a Void-returning call must not bind the call's (nonexistent) value
+// straight into a holder the way the tuple-destructuring path does for a value-typed
+// discard -- that mints `int64_t _cg_tupN = void_call();`, which cc rejects. The discard
+// path instead runs the call as its own statement and binds a placeholder unit constant.
+test "a wildcard let over a Void call runs the call as its own statement" {
+    run_probe("build/cg_stmt_wildcard_void.bl", #"fn nothing() {
+}
+fn probe() {
+    let _ = nothing()
+    let _ = nothing()
+}
+fn main() { probe() }
+"#)
+    let d = dump_of("probe")
+    assert_eq(count_of(d, "(ExprStmt "), 2)
+    assert_eq(count_of(d, "(Let "), 2)
+    assert_eq(count_of(d, "(Const "), 2)
+    assert(!d.contains("_cg_tup"))
+}
