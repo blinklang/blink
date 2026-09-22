@@ -235,9 +235,10 @@ fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_
 }
 
 // "" for the unit that owns the vector and is linked against, "extern " for a unit that
-// only refers to it. Exactly one unit of a program may own it.
+// only refers to it. Exactly one unit of a program may own it — an archive serves many
+// programs, so it never owns the vector even when nothing else asked it to extern it.
 fn ev_storage(cfg: CgConfig) -> Str {
-    if cfg.blink_ev_extern_only != 0 { return "extern " }
+    if cfg.archive_build_mode != 0 || cfg.blink_ev_extern_only != 0 { return "extern " }
     ""
 }
 
@@ -543,15 +544,26 @@ fn emit_entry(cfg: CgConfig, init_fns: List[Str]) ! Diag.Report {
         cfg.user_tu_mode != 0, cfg.trace_codegen != 0, cfg.deterministic, init_fns)
 }
 
+fn archive_init_globals_name() -> Str { "__blink_init_stdlib_globals" }
+
 // One function running every deferred global assignment, in the order the globals were
 // declared in, or nothing if every global already took its value on the definition line.
 // The shim runs it before any test or main dispatch, so a global a test reads is never
-// caught unset.
-fn emit_global_init_fn(deferred: List[Int]) -> List[Str] ! Diag.Report {
-    if deferred.len() == 0 { return [] }
-    let name = "__blink_init_globals"
-    let span = cg_reg_global_decls().get(0).unwrap()
-    print_test_fn(name, verify_lowered_unit(ir_block(span, deferred), span))
+// caught unset. An archive monolith emits this unconditionally, empty body when there is
+// nothing to run, since its header declares the extern to every linking user TU regardless.
+fn emit_global_init_fn(cfg: CgConfig, program: Int, deferred: List[Int]) -> List[Str] ! Diag.Report {
+    let is_archive = cfg.archive_build_mode != 0
+    if deferred.len() == 0 && !is_archive { return [] }
+    let decls = cg_reg_global_decls()
+    let span = if decls.len() > 0 { decls.get(0).unwrap() } else { program }
+    let body = verify_lowered_unit(ir_block(span, deferred), span)
+    let mut name = "__blink_init_globals"
+    if is_archive {
+        name = archive_init_globals_name()
+        print_fn(false, layout_of(TYPE_VOID, Position.Return).c_spelling, name, [], false, body)
+    } else {
+        print_test_fn(name, body)
+    }
     [name]
 }
 
@@ -571,7 +583,7 @@ pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
     emit_definitions(cfg, "", shared)
     // An archive monolith has no entry point: the user TU that links against it owns
     // main(), so neither the test-body table nor the main shim belongs here.
-    let init_fns = emit_global_init_fn(deferred)
+    let init_fns = emit_global_init_fn(cfg, program, deferred)
     if cfg.archive_build_mode == 0 { emit_entry(cfg, init_fns) }
     print_take()
 }
@@ -585,6 +597,7 @@ pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
 pub fn generate_archive_header(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
     begin_unit(program)
     let _ = emit_declarations(cfg, c_archive_header_guard(), "", false, true, true)
+    print_fn_decl(false, layout_of(TYPE_VOID, Position.Return).c_spelling, archive_init_globals_name(), [], false)
     cg_decl_emit_epilogue(c_archive_header_guard())
     print_take()
 }
