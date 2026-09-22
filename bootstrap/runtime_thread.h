@@ -131,6 +131,20 @@ BLINK_RT_FN void blink_threadpool_shutdown(blink_threadpool* pool) {
 }
 #endif
 
+/* ── Program's one thread pool ──────────────────────────────────────────
+   The pool async.spawn submits through. One instance per process: the main
+   shim starts it before the program runs and shuts it down after, and
+   every spawn site and task wrapper reads this same symbol. */
+#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
+  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
+    blink_threadpool* __blink_pool = NULL;
+  #else
+    extern blink_threadpool* __blink_pool;
+  #endif
+#else
+BLINK_UNUSED static blink_threadpool* __blink_pool = NULL;
+#endif
+
 /* ── Handle operations ──────────────────────────────────────────────── */
 
 BLINK_RT_FN blink_handle* blink_handle_new(void);
