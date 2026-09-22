@@ -1,18 +1,75 @@
 // A variant sub-pattern nested inside a tuple element -- `(Ok(inner), _)` -- must bind
 // and test through that element's own tid, and the match's coverage proof must accept
-// two arms that jointly exhaust the scrutinee by refusing at the same tuple position
-// even though no single arm's pattern is one flat label. This proves itself by compiling
-// and running: an unbuilt coverage proof is a diagnostic, not a wrong value, but a wrong
-// bind or test is.
+// two arms that jointly exhaust the scrutinee by refuting at the same tuple position
+// even though no single arm's pattern is one flat label. Probe over the lowered IR, for
+// the same reason as tests/test_cg_stmt_nested_variant_payload_pattern.bl: build/gen0
+// cannot itself compile this shape to C yet. The run-it, end-to-end version lives in
+// tests/test_nested_variant_payload_patterns_run.bl.
 
-fn classify(pair: (Result[Int, Str], Int)) -> Str {
-    match pair {
-        (Ok(inner), tag) => "ok {inner} {tag}"
-        (Err(e), tag) => "err {e} {tag}"
+import std.fs
+import std.io
+import typecheck.{check_types}
+import layout.{layout_reset}
+import mono.{run_mono}
+import ir.{ir_dump, ir_reset, ir_verify}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import cg_stmt.{cg_stmt_reset, lower_fn}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
     }
+    -1
 }
 
-test "variant sub-pattern nested in a tuple element binds and covers" {
-    assert_eq(classify((Ok(9), 1)), "ok 9 1")
-    assert_eq(classify((Err("boom"), 2)), "err boom 2")
+fn run_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    diag_reset()
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+}
+
+fn dump_of(name: Str) -> Str ! Diag.Report {
+    let f = find_fn(name)
+    assert(f >= 0)
+    let root = lower_fn(f)
+    for err in ir_verify(root) { io.println("VERIFY: {err}") }
+    assert_eq(ir_verify(root).len(), 0)
+    ir_dump(root)
+}
+
+fn ice_mentioning(text: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.message.contains(text) { n = n + 1 }
+    }
+    n
+}
+
+test "a variant sub-pattern nested in a tuple element binds and the match is proven exhaustive" {
+    run_probe("build/cg_stmt_tuple_wrapped_nested.bl", #"fn probe(pair: (Result[Int, Str], Int)) -> Int {
+    match pair {
+        (Ok(inner), tag) => inner + tag
+        (Err(e), tag) => tag
+    }
+}
+fn main() { assert(probe((Ok(9), 1)) == 10) }
+"#)
+    let d = dump_of("probe")
+    assert_eq(ice_mentioning("a match on this pattern shape"), 0)
+    // Neither arm alone names every Result variant, so a coverage proof that only looks
+    // at one arm at a time would wrongly call this non-exhaustive and add an unreachable
+    // default that could run.
+    assert_eq(ice_mentioning("guaranteed to run"), 0)
+    assert(d.contains("\"&&\""))
 }

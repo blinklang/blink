@@ -1,0 +1,113 @@
+// End-to-end runs of patterns nested inside a variant payload, at depth two and three.
+// These are the run-it counterparts of the IR probes in
+// tests/test_cg_stmt_nested_variant_payload_pattern.bl and
+// tests/test_cg_stmt_tuple_wrapped_nested_variant_pattern.bl: build/gen0, the frozen
+// pre-rewrite compiler that runs the rewrite suite, cannot itself emit C for this shape,
+// so these run-it cases live here, where the corpus picks them up but the suite glob
+// (tests/test_cg_*.bl) does not.
+
+fn depth_two(r: Result[Option[Int], Str]) -> Int {
+    match r {
+        Ok(Some(x)) => x
+        Ok(None) => 0
+        Err(_e) => -1
+    }
+}
+
+test "Ok(Some(x)), Ok(None), and Err(e) each bind and run correctly" {
+    assert(depth_two(Ok(Some(7))) == 7)
+    assert(depth_two(Ok(None)) == 0)
+    assert(depth_two(Err("boom")) == -1)
+}
+
+type Point { x: Int, y: Int }
+
+fn struct_payload(r: Result[Point, Str]) -> Int {
+    match r {
+        Ok(Point { x, y }) => x + y
+        Err(_e) => -1
+    }
+}
+
+test "a struct-style sub-pattern inside a payload binds through the variant's own member" {
+    let p = Point { x: 1, y: 2 }
+    assert_eq(struct_payload(Ok(p)), 3)
+    assert_eq(struct_payload(Err("nope")), -1)
+}
+
+fn tuple_wrapped(pair: (Result[Int, Str], Int)) -> Int {
+    match pair {
+        (Ok(inner), tag) => inner + tag
+        (Err(_e), tag) => tag
+    }
+}
+
+test "a variant sub-pattern nested in a tuple element binds and the match runs exhaustively" {
+    let ok_pair = (Ok(9), 1)
+    let err_pair = (Err("x"), 5)
+    assert_eq(tuple_wrapped(ok_pair), 10)
+    assert_eq(tuple_wrapped(err_pair), 5)
+}
+
+// Depth three: a struct sub-pattern nested inside two levels of carrier.
+fn depth_three_struct(r: Result[Option[Point], Str]) -> Int {
+    match r {
+        Ok(Some(Point { x, y })) => x + y
+        Ok(None) => 0
+        Err(_e) => -1
+    }
+}
+
+test "Ok(Some(Point \{ x, y \})) binds through two carrier levels and a struct" {
+    let p = Point { x: 3, y: 4 }
+    assert_eq(depth_three_struct(Ok(Some(p))), 7)
+    assert_eq(depth_three_struct(Ok(None)), 0)
+    assert_eq(depth_three_struct(Err("no")), -1)
+}
+
+// Depth three: a literal at the innermost slot of a single-variant-per-level chain,
+// against a binder catching everything else -- proves the literal test and the binder
+// both recurse a third level down, not just the pattern shapes that happen to appear
+// at the top.
+type C { C(Int) }
+type B { B(C) }
+type A { A(B) }
+
+fn describe(a: A) -> Str {
+    match a {
+        A(B(C(0))) => "zero"
+        A(B(C(n))) => "n={n}"
+    }
+}
+
+test "a literal nested three levels deep is tested against, not just bound" {
+    assert_eq(describe(A(B(C(0)))), "zero")
+    assert_eq(describe(A(B(C(5)))), "n=5")
+    assert_eq(describe(A(B(C(-3)))), "n=-3")
+}
+
+// Depth three, genuine exhaustiveness: every level below the top has more than one
+// variant, so no single arm's pattern is irrefutable on its own -- the coverage proof
+// must jointly bucket the arms by their shared prefix and recurse into the payload two
+// levels down to see that the arms exhaust it, the same way it must one level down.
+type Leaf { LZero, LPos(Int), LNeg(Int) }
+type Mid { MHas(Leaf), MEmpty }
+type Top { TWrap(Mid), TEmpty }
+
+fn classify(t: Top) -> Str {
+    match t {
+        TWrap(MHas(LZero)) => "wrap-has-zero"
+        TWrap(MHas(LPos(n))) => "wrap-has-pos:{n}"
+        TWrap(MHas(LNeg(n))) => "wrap-has-neg:{n}"
+        TWrap(MEmpty) => "wrap-empty"
+        TEmpty => "empty"
+    }
+}
+
+test "five arms jointly exhaust a three-level chain with multiple variants at every level" {
+    assert_eq(classify(Top.TWrap(Mid.MHas(Leaf.LZero))), "wrap-has-zero")
+    assert_eq(classify(Top.TWrap(Mid.MHas(Leaf.LPos(2)))), "wrap-has-pos:2")
+    assert_eq(classify(Top.TWrap(Mid.MHas(Leaf.LNeg(9)))), "wrap-has-neg:9")
+    assert_eq(classify(Top.TWrap(Mid.MEmpty)), "wrap-empty")
+    assert_eq(classify(Top.TEmpty), "empty")
+}

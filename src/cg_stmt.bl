@@ -37,9 +37,10 @@ import cname.{
 }
 import ir.{
     IrKind, ir_assign, ir_binary, ir_block, ir_break, ir_call_runtime, ir_carrier_tag,
-    ir_cast, ir_cell_let, ir_cell_ref, ir_const, ir_continue, ir_expr_stmt, ir_field_get,
-    ir_global_ref, ir_if, ir_kind, ir_let, ir_loop, ir_mark_materialize, ir_return, ir_span,
-    ir_switch, ir_unary, ir_unbox, ir_unreachable, ir_var_ref, ir_with_scope,
+    ir_cast, ir_cell_let, ir_cell_ref, ir_c_name, ir_c_spelling, ir_const, ir_continue,
+    ir_expr_stmt, ir_field_get, ir_global_ref, ir_if, ir_kid, ir_kid_count, ir_kind, ir_let,
+    ir_loop, ir_mark_materialize, ir_new, ir_return, ir_slot_form, ir_span, ir_switch, ir_tid,
+    ir_unary, ir_unbox, ir_unreachable, ir_var_ref, ir_with_scope,
 }
 import diagnostics.{
     Diag, diag_file_for_node, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
@@ -2028,8 +2029,31 @@ fn variant_count(tid: Int) -> Int {
     n
 }
 
+// A value scrut_ref hands out is read from more than one place once a nested test goes
+// deep enough: a refutable enum payload reads it once for its own tag and again for its
+// own payload, and a struct or tuple payload reads it once per field or element. Every
+// one of these is a pure read with no effect of its own beyond the kids it is built
+// from, so the fix is to hand each caller its own copy rather than the same node twice
+// -- a copy is exactly the same value, and unlike the original it has only the one
+// parent the verifier already expects a plain read to have.
+fn dup_readable(kind: IrKind) -> Bool {
+    kind == IrKind.VarRef || kind == IrKind.GlobalRef || kind == IrKind.FieldGet ||
+        kind == IrKind.Cast || kind == IrKind.CarrierUnwrap || kind == IrKind.Unbox
+}
+
+fn dup_value(id: Int) -> Int {
+    if !dup_readable(ir_kind(id)) { return id }
+    let mut kids: List[Int] = []
+    let mut i = 0
+    while i < ir_kid_count(id) {
+        kids.push(dup_value(ir_kid(id, i)))
+        i = i + 1
+    }
+    ir_new(ir_kind(id), ir_tid(id), ir_span(id), ir_c_spelling(id), ir_c_name(id), ir_slot_form(id), kids)
+}
+
 fn scrut_ref(ctx: MatchCtx, span: Int) -> Int {
-    if ctx.value >= 0 { return ctx.value }
+    if ctx.value >= 0 { return dup_value(ctx.value) }
     ir_var_ref(ctx.tid, span, ctx.rec.c_spelling, ctx.holder, ctx.rec.slot_form)
 }
 
@@ -2729,11 +2753,17 @@ fn and_test(span: Int, a: Int, b: Int) -> Int ! Diag.Report {
     ir_binary(TYPE_INT, span, int_spelling(span), "&&", a, b)
 }
 
-// One payload slot's own test, nested one level deeper than ctx: nothing for a plain
-// binder (a name or wildcard matches whatever it is given), and the sub-pattern's own
-// test otherwise -- reusing pattern_test itself so every shape it already knows how to
-// test works one level down too, the same way bind_slot reuses pattern_binds to bind one
-// level down.
+// One payload slot's own test, nested inside ctx: nothing for a plain binder (a name or
+// wildcard matches whatever it is given), and the sub-pattern's own test otherwise --
+// reusing pattern_test itself so every shape it already knows how to test works nested
+// too, as many levels deep as the pattern goes, the same way bind_slot reuses
+// pattern_binds to bind at any depth.
+//
+// The nested test may read `value` more than once: a refutable enum payload reads it
+// once for its own tag and again for its own payload, and a struct or tuple payload
+// reads it once per field or element. scrut_ref hands out a fresh copy on every read
+// (see dup_value), so passing the same `value` down here again is safe no matter how
+// many times the nested test reads it or how deep it recurses further.
 fn slot_test(ctx: MatchCtx, sub: Int, tid: Int, rec: LayoutRecord, value: Int) -> Int ! Diag.Report {
     let nested = MatchCtx { tid: tid, holder: "", rec: rec, tail: ctx.tail, dest: ctx.dest, dest_tid: ctx.dest_tid, value: value }
     pattern_test(nested, sub)
