@@ -21,11 +21,12 @@ import parser.{
 import typecheck.{
     TyKind, TYPE_BOOL, TYPE_CHAR, TYPE_FLOAT, TYPE_INT, TYPE_STR, TYPE_VOID,
     tc_alias_to_original, tc_enum_has_payload, tc_global_decl_node, tc_let_binder_is_discard,
-    tc_lookup_node_tid, tc_tid_decl_node, tc_tid_kind,
+    tc_lookup_node_tid, tc_tid_decl_node, tc_tid_kind, make_list_type,
 }
 import layout.{
     Position, Slot, SlotForm, LayoutRecord, bind_binder, bind_binder_cell, bind_binder_mut, binder_is_celled,
-    binder_scope_pop, binder_scope_push, carrier_member_layout, child_tid, ensure_typedef_for, field_layout_of,
+    binder_scope_pop, binder_scope_push, carrier_member_layout, child_tid, container_slot_spelling,
+    ensure_typedef_for, field_layout_of,
     layout_of, pointer_spelling, tid_holds_tag_member, tid_of_binder,
     tid_of_node, varargs_spelling,
 }
@@ -40,11 +41,11 @@ import ir.{
     ir_cast, ir_cell_let, ir_cell_ref, ir_c_name, ir_c_spelling, ir_const, ir_continue,
     ir_expr_stmt, ir_field_get, ir_global_ref, ir_if, ir_kid, ir_kid_count, ir_kind, ir_let,
     ir_loop, ir_mark_materialize, ir_new, ir_return, ir_slot_form, ir_span, ir_switch, ir_tid,
-    ir_unary, ir_unbox, ir_unreachable, ir_var_ref, ir_with_scope,
+    ir_tuple_new, ir_unary, ir_unbox, ir_unreachable, ir_var_ref, ir_with_scope,
 }
 import diagnostics.{
     Diag, diag_file_for_node, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
-    CODEGEN_STAGE_NOT_BUILT, UNHANDLED_ITERABLE_AT_CODEGEN, UNSOLVED_TYPEVAR_AT_CODEGEN,
+    CODEGEN_STAGE_NOT_BUILT, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 import cg_expr.{
     cg_expr_drain_pending, cg_expr_drop_values, cg_expr_is_registered, cg_expr_pending_count,
@@ -58,7 +59,8 @@ import cg_eff.{
 }
 import cg_call.{
     AssertKind, ForInIteration, ForInStrategy, cc_assert_family_kind, cc_is_ptr_write_stmt,
-    cc_lower_ptr_write_stmt, cg_call_element_from_runtime, for_in_iteration_of,
+    cc_lower_ptr_write_stmt, cg_call_element_from_runtime, cg_call_element_from_slot,
+    for_in_iteration_of,
 }
 import unparse.{unparse_expr}
 
@@ -1544,8 +1546,11 @@ fn lower_loop(node: Int) -> Int ! Diag.Report {
 // ── For-in ────────────────────────────────────────────────────────────────
 
 // `for i in a..b` is a counted loop, so it lowers with no help from the runtime. Every
-// other iterable is walked by index, and the two runtime entry points walking needs are
-// named by cg_call's for_in_iteration_of rather than chosen here.
+// other iterable walks through the strategy cg_call's for_in_iteration_of answers --
+// Indexed reads a container by position, Materialized reads one first into a List (or,
+// for a Map, a pair of them) and then walks that by position, and Drained has no
+// position at all. The match is exhaustive, so a strategy added to ForInStrategy without
+// an arm here fails to compile rather than falling through to a silent wrong walk.
 fn lower_for_in(node: Int) -> Int ! Diag.Report {
     let iter = node_iterable(node)
     if nk_of(node_kind(iter)) == NodeKind.RangeLit { return lower_for_range(node, iter) }
@@ -1555,28 +1560,31 @@ fn lower_for_in(node: Int) -> Int ! Diag.Report {
     // The producer reports the iterables it has no entry points for, and answers a shape
     // with no element. Reporting again here would name one gap twice.
     if walk.element_tid < 0 { return ir_block(node, []) }
-    if !for_in_walkable(node, container, walk) { return ir_block(node, []) }
-    if node_elements(node) != -1 {
-        diag_ice_at("ForInTupleBinderNotLowered", CODEGEN_STAGE_NOT_BUILT,
-            "this for-in destructures the element into more than one name, and no stage binds a destructured element yet",
-            node, "a destructured binder records no mutability at its bind site, so a closure in the body could not tell a capture of one from a binding it shares")
-        return ir_block(node, [])
+    match walk.strategy {
+        ForInStrategy.Indexed => lower_for_indexed(node, iter, walk)
+        ForInStrategy.Materialized => lower_for_materialized(node, iter, walk)
+        ForInStrategy.Drained => lower_for_drained(node, iter, walk)
     }
-    lower_for_indexed(node, iter, walk)
 }
 
-// Only a list is walked today. Every other container the producer answers reads its
-// element back at a C type of its own -- blink_bytes_get answers an integer where
-// blink_list_get answers a cell -- and ForInIteration does not yet say which, so a reader
-// built from it here would convert the wrong one with nothing to catch it.
-fn for_in_walkable(node: Int, container: Int, walk: ForInIteration) -> Bool ! Diag.Report {
-    if walk.strategy == ForInStrategy.Indexed && tc_tid_kind(container) == TyKind.List {
+// Binds the loop variable(s) for one turn of a for-in, into `out` in loop-body order. A
+// plain binder (`for x in xs`) binds `value` straight to its own name, the same one Let
+// this built before every strategy shared this helper. A destructured binder
+// (`for (k, v) in m`) binds `value` to a holder local first and reads each name off it
+// through bind_tuple_pattern -- the same tuple-field-read machinery `let (a, b) = e`
+// already binds through, so a for-in tuple binder is not a second way to destructure.
+fn bind_for_element(node: Int, elem: Int, rec: LayoutRecord, value: Int, out: List[Int]) -> Bool ! Diag.Report {
+    if node_elements(node) == -1 {
+        let binder = node_for_binder(node)
+        out.push(ir_let(elem, node, rec.c_spelling, cg_local_c_name(node_name(binder)), rec.slot_form, value))
+        // A for-in binder has no `mut` form to write, so it is immutable as a matter of
+        // syntax rather than of bookkeeping, and a closure in the body may copy it.
+        bind_binder_mut(cur_scope(), node_name(binder), elem, false)
         return true
     }
-    diag_ice_at("UnhandledIterable", UNHANDLED_ITERABLE_AT_CODEGEN,
-        "for-in over this iterable has no lowering yet", node,
-        "a container needs an entry point whose C answer this stage can convert; only ranges and lists lower today")
-    false
+    let holder = c_mint_local("elem")
+    out.push(ir_let(elem, node, rec.c_spelling, holder, rec.slot_form, value))
+    bind_tuple_pattern(node_elements(node), elem, holder, rec.c_spelling, rec.slot_form, out)
 }
 
 // `for x in xs { b }` becomes
@@ -1587,9 +1595,8 @@ fn for_in_walkable(node: Int, container: Int, walk: ForInIteration) -> Bool ! Di
 // from -1, so a `continue` in the body cannot skip it and spin.
 fn lower_for_indexed(node: Int, iter: Int, walk: ForInIteration) -> Int ! Diag.Report {
     let _ = open_scope()
-    let binder = node_for_binder(node)
     let elem = walk.element_tid
-    let rec = layout_at(elem, Position.Local, binder)
+    let rec = layout_at(elem, Position.Local, node)
     let src_tid = tid_of_node(iter)
     if src_tid < 0 {
         close_scope()
@@ -1614,14 +1621,168 @@ fn lower_for_indexed(node: Int, iter: Int, walk: ForInIteration) -> Int ! Diag.R
         close_scope()
         return -1
     }
-    let bind = ir_let(elem, node, rec.c_spelling, cg_local_c_name(node_name(binder)), rec.slot_form, read)
-    // A for-in binder has no `mut` form to write, so it is immutable as a matter of syntax
-    // rather than of bookkeeping, and a closure in the body may copy it.
-    bind_binder_mut(cur_scope(), node_name(binder), elem, false)
+    let mut binds: List[Int] = []
+    if !bind_for_element(node, elem, rec, read, binds) {
+        close_scope()
+        return -1
+    }
     let body = lower_block(node_body(node))
     close_scope()
     if body < 0 { return -1 }
-    ir_block(node, [src_let, len_let, idx_let, ir_loop(node, ir_block(node, [step, guard, bind, body]))])
+    let mut turn: List[Int] = [step, guard]
+    let mut i = 0
+    while i < binds.len() {
+        turn.push(binds.get(i).unwrap())
+        i = i + 1
+    }
+    turn.push(body)
+    ir_block(node, [src_let, len_let, idx_let, ir_loop(node, ir_block(node, turn))])
+}
+
+// `for x in s { b }` / `for (k, v) in m { b }`: a Set or a Map has no by-position read of
+// its own storage, so this reads it into one List first -- a Set's own elements at
+// materialize_symbol, or a Map's keys there and its values at pair_symbol, at the same
+// positions -- and then walks that/those exactly like lower_for_indexed walks a List,
+// since list_len/list_get are what for_in_iteration_of already answers for a
+// Materialized walk. A Map's element_tid is always the (K, V) pair tuple
+// tc_tid_iter_elem gives it, so the pair is rebuilt at each turn from one read of each
+// list before this hands the turn's value to bind_for_element.
+fn lower_for_materialized(node: Int, iter: Int, walk: ForInIteration) -> Int ! Diag.Report {
+    let _ = open_scope()
+    let elem = walk.element_tid
+    let has_pair = walk.pair_symbol != ""
+    let key_tid = if has_pair { child_tid(elem, Slot.Elem(0)) } else { elem }
+    let val_tid = if has_pair { child_tid(elem, Slot.Elem(1)) } else { -1 }
+    if has_pair && (key_tid < 0 || val_tid < 0) {
+        diag_ice_at("ForInPairElementMissing", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "this for-in's element tid has no (K, V) pair to read", node,
+            "for_in_iteration_of only sets pair_symbol for a Map, whose element tid is always a two-element tuple")
+        close_scope()
+        return -1
+    }
+    let src_tid = tid_of_node(iter)
+    if src_tid < 0 {
+        close_scope()
+        return -1
+    }
+    let src_rec = layout_at(src_tid, Position.Local, iter)
+    let src = c_mint_local("iter")
+    let src_let = ir_let(src_tid, node, src_rec.c_spelling, src, src_rec.slot_form, lower_value(iter))
+    let keys_tid = make_list_type(key_tid)
+    let keys_rec = layout_at(keys_tid, Position.Local, node)
+    let keys = c_mint_local("keys")
+    let keys_let = ir_let(keys_tid, node, keys_rec.c_spelling, keys, keys_rec.slot_form,
+        ir_call_runtime(keys_tid, node, keys_rec.c_spelling, walk.materialize_symbol, keys_rec.slot_form,
+            [container_ref(node, src_tid, src_rec, src)]))
+    let mut pre: List[Int] = [src_let, keys_let]
+    let mut vals_tid = -1
+    let mut vals = ""
+    let mut vals_rec = keys_rec
+    if has_pair {
+        vals_tid = make_list_type(val_tid)
+        vals_rec = layout_at(vals_tid, Position.Local, node)
+        vals = c_mint_local("vals")
+        pre.push(ir_let(vals_tid, node, vals_rec.c_spelling, vals, vals_rec.slot_form,
+            ir_call_runtime(vals_tid, node, vals_rec.c_spelling, walk.pair_symbol, vals_rec.slot_form,
+                [container_ref(node, src_tid, src_rec, src)])))
+    }
+    let len = c_mint_local("len")
+    pre.push(ir_let(TYPE_INT, node, int_spelling(node), len, int_form(node),
+        ir_call_runtime(TYPE_INT, node, int_spelling(node), walk.len_symbol, int_form(node),
+            [container_ref(node, keys_tid, keys_rec, keys)])))
+    let idx = c_mint_local("idx")
+    pre.push(ir_let(TYPE_INT, node, int_spelling(node), idx, int_form(node), int_const(node, "-1")))
+    let step = ir_assign(node, flag_ref(node, idx),
+        ir_binary(TYPE_INT, node, int_spelling(node), "+", flag_ref(node, idx), int_const(node, "1")))
+    let cond = ir_binary(TYPE_INT, node, int_spelling(node), ">=", flag_ref(node, idx), flag_ref(node, len))
+    let guard = ir_if(node, cond, ir_block(node, [ir_break(node)]), -1)
+    let key_read = cg_call_element_from_runtime(node, key_tid, walk.get_symbol,
+        [container_ref(node, keys_tid, keys_rec, keys), flag_ref(node, idx)])
+    if key_read < 0 {
+        close_scope()
+        return -1
+    }
+    let mut value = key_read
+    if has_pair {
+        let val_read = cg_call_element_from_runtime(node, val_tid, walk.get_symbol,
+            [container_ref(node, vals_tid, vals_rec, vals), flag_ref(node, idx)])
+        if val_read < 0 {
+            close_scope()
+            return -1
+        }
+        let pair_rec = layout_at(elem, Position.Local, node)
+        ensure_typedef_for(elem)
+        value = ir_tuple_new(elem, node, pair_rec.c_spelling, [key_read, val_read])
+    }
+    let rec = layout_at(elem, Position.Local, node)
+    let mut binds: List[Int] = []
+    if !bind_for_element(node, elem, rec, value, binds) {
+        close_scope()
+        return -1
+    }
+    let body = lower_block(node_body(node))
+    close_scope()
+    if body < 0 { return -1 }
+    let mut turn: List[Int] = [step, guard]
+    let mut i = 0
+    while i < binds.len() {
+        turn.push(binds.get(i).unwrap())
+        i = i + 1
+    }
+    turn.push(body)
+    pre.push(ir_loop(node, ir_block(node, turn)))
+    ir_block(node, pre)
+}
+
+// `for x in ch { b }`: a Channel has no length to ask for up front, so each turn calls
+// recv_symbol once and stops the moment it answers NULL -- bootstrap/runtime_thread.h's
+// own contract for blink_channel_recv: it blocks until a value is sent or the channel is
+// both empty and closed, and only the latter ever answers the null pointer no sent value
+// can be. The raw answer is read into a local of its own because it is checked before it
+// is decoded: cg_call_element_from_slot's cast chain would turn a null pointer into
+// whatever bit pattern the element's own type reads a zero word as, not into "closed".
+fn lower_for_drained(node: Int, iter: Int, walk: ForInIteration) -> Int ! Diag.Report {
+    let _ = open_scope()
+    let elem = walk.element_tid
+    let rec = layout_at(elem, Position.Local, node)
+    let src_tid = tid_of_node(iter)
+    if src_tid < 0 {
+        close_scope()
+        return -1
+    }
+    let src_rec = layout_at(src_tid, Position.Local, iter)
+    let src = c_mint_local("iter")
+    let src_let = ir_let(src_tid, node, src_rec.c_spelling, src, src_rec.slot_form, lower_value(iter))
+    let cell = container_slot_spelling()
+    let raw = c_mint_local("recv")
+    let raw_let = ir_let(elem, node, cell, raw, SlotForm.InlineWord,
+        ir_call_runtime(elem, node, cell, walk.recv_symbol, SlotForm.InlineWord,
+            [container_ref(node, src_tid, src_rec, src)]))
+    let bool_rec = layout_at(TYPE_BOOL, Position.Local, node)
+    let closed = ir_binary(TYPE_BOOL, node, bool_rec.c_spelling, "==",
+        ir_var_ref(elem, node, cell, raw, SlotForm.InlineWord), ir_const(TYPE_INT, node, cell, "0"))
+    let guard = ir_if(node, closed, ir_block(node, [ir_break(node)]), -1)
+    let read = cg_call_element_from_slot(node, elem, ir_var_ref(elem, node, cell, raw, SlotForm.InlineWord))
+    if read < 0 {
+        close_scope()
+        return -1
+    }
+    let mut binds: List[Int] = []
+    if !bind_for_element(node, elem, rec, read, binds) {
+        close_scope()
+        return -1
+    }
+    let body = lower_block(node_body(node))
+    close_scope()
+    if body < 0 { return -1 }
+    let mut turn: List[Int] = [raw_let, guard]
+    let mut i = 0
+    while i < binds.len() {
+        turn.push(binds.get(i).unwrap())
+        i = i + 1
+    }
+    turn.push(body)
+    ir_block(node, [src_let, ir_loop(node, ir_block(node, turn))])
 }
 
 // A read of the local the container was copied into. Each read is a node of its own,

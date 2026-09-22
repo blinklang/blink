@@ -340,24 +340,6 @@ test "a range still lowers with no runtime call of any kind" {
 
 // ── What still has no loop ────────────────────────────────────────────────
 
-// A tuple binder destructures the element into two names. The bind site for a destructured
-// element records no mutability yet, so a capture of one cannot be told from a shared
-// binding, and lowering one here would hand that unresolved question to every closure in
-// the body. It refuses by a name of its own rather than under the iterable's name, because
-// the iterable is fine and the binder is not.
-test "a tuple binder over a list refuses by its own name, not the iterable's" {
-    let body = probe_body("cg_stmt_for_in_tuple_binder", #"fn run(pairs: List[(Int, Int)]) -> Int {
-    let mut n = 0
-    for (a, b) in pairs {
-        n = n + a + b
-    }
-    n
-}
-"#, "run")
-    assert_refused(body, "ForInTupleBinderNotLowered",
-        "this for-in destructures the element into more than one name, and no stage binds a destructured element yet")
-}
-
 test "a for-in over a string still refuses by name" {
     let body = probe_body("cg_stmt_for_in_str", #"fn run(s: Str) -> Int {
     let mut n = 0
@@ -371,8 +353,31 @@ test "a for-in over a string still refuses by name" {
         "for-in over this iterable has no lowering yet")
 }
 
-test "a for-in over a set still refuses by name" {
-    let body = probe_body("cg_stmt_for_in_set", #"fn run(s: Set[Int]) -> Int {
+// ── The other iterables, each walked the shape its own strategy gives it ──
+
+// A tuple binder destructures the element into two names, through the same tuple-field-read
+// machinery a `let (a, b) = e` destructures through. Both names come out declared, and the
+// loop is otherwise the same by-position walk a plain List binder gets.
+test "a tuple binder over a list destructures the element into both names" {
+    let body = probe_fn("cg_stmt_for_in_tuple_binder", #"fn run(pairs: List[(Int, Int)]) -> Int {
+    let mut n = 0
+    for (a, b) in pairs {
+        n = n + a + b
+    }
+    n
+}
+"#, "run")
+    assert_verifies("tuple binder loop", body)
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    let a_spelling = spelling_of_let(body, "a")
+    assert(a_spelling != "")
+    assert_eq_str("second binder spelling", spelling_of_let(body, "b"), a_spelling)
+}
+
+// A Set has no by-position read of its own storage, so it materializes to a List first and
+// then walks that exactly like a List does.
+test "a for-in over a set materializes to a list, then reads that by position" {
+    let body = probe_fn("cg_stmt_for_in_set", #"fn run(s: Set[Int]) -> Int {
     let mut n = 0
     for x in s {
         n = n + x
@@ -380,25 +385,34 @@ test "a for-in over a set still refuses by name" {
     n
 }
 "#, "run")
-    assert_refused(body, "UnhandledIterable",
-        "for-in over this iterable has no lowering yet")
+    assert_verifies("set loop", body)
+    assert_eq_str("runtime calls", runtime_symbols(body).join(", "),
+        "blink_set_to_list, blink_list_len, blink_list_get")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
 }
 
-test "a for-in over a map still refuses by name" {
-    let body = probe_body("cg_stmt_for_in_map", #"fn run(m: Map[Str, Int]) -> Int {
+// A Map materializes keys and values as two parallel Lists and reads both at the same
+// position each turn, rebuilding the (K, V) pair the tuple binder then destructures.
+test "a for-in over a map materializes keys and values, paired by position" {
+    let body = probe_fn("cg_stmt_for_in_map", #"fn run(m: Map[Str, Int]) -> Int {
     let mut n = 0
     for (k, v) in m {
-        n = n + k.len() + v
+        let _keep = k
+        n = n + v
     }
     n
 }
 "#, "run")
-    assert_refused(body, "UnhandledIterable",
-        "for-in over this iterable has no lowering yet")
+    assert_verifies("map loop", body)
+    assert_eq_str("runtime calls", runtime_symbols(body).join(", "),
+        "blink_map_keys, blink_map_values, blink_list_len, blink_list_get, blink_list_get")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
 }
 
-test "a for-in over a bytes value still refuses by name" {
-    let body = probe_body("cg_stmt_for_in_bytes", #"fn run(b: Bytes) -> Int {
+// Bytes reads by position through the runtime's own len and get, the same shape a List
+// gets, just narrower.
+test "a for-in over a bytes value reads by position through bytes_len/bytes_get" {
+    let body = probe_fn("cg_stmt_for_in_bytes", #"fn run(b: Bytes) -> Int {
     let mut n = 0
     for x in b {
         n = n + x.to_int()
@@ -406,12 +420,16 @@ test "a for-in over a bytes value still refuses by name" {
     n
 }
 "#, "run")
-    assert_refused(body, "UnhandledIterable",
-        "for-in over this iterable has no lowering yet")
+    assert_verifies("bytes loop", body)
+    assert_eq_str("runtime calls", runtime_symbols(body).join(", "),
+        "blink_bytes_len, blink_bytes_get")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
 }
 
-test "a for-in over a channel still refuses by name" {
-    let body = probe_body("cg_stmt_for_in_channel", #"fn run(c: Channel[Int]) -> Int {
+// A Channel has no length to ask for up front, so it drains by receive alone -- no len call
+// at all, unlike every other strategy here.
+test "a for-in over a channel drains by receive, with no length call at all" {
+    let body = probe_fn("cg_stmt_for_in_channel", #"fn run(c: Channel[Int]) -> Int {
     let mut n = 0
     for x in c {
         n = n + x
@@ -419,8 +437,28 @@ test "a for-in over a channel still refuses by name" {
     n
 }
 "#, "run")
-    assert_refused(body, "UnhandledIterable",
-        "for-in over this iterable has no lowering yet")
+    assert_verifies("channel loop", body)
+    assert_eq_str("runtime calls", runtime_symbols(body).join(", "), "blink_channel_recv")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}
+
+// A Channel's raw receive is checked against the close sentinel BEFORE it is decoded to the
+// element's own type -- a struct element still comes back out of its box afterward, the
+// same as it does for every other strategy.
+test "a channel of a boxed struct element unboxes it before the binder holds it" {
+    let body = probe_fn("cg_stmt_for_in_channel_struct", #"type Point { x: Int, y: Int }
+
+fn total(c: Channel[Point]) -> Int {
+    let mut n = 0
+    for p in c {
+        n = n + p.x
+    }
+    n
+}
+"#, "total")
+    assert_verifies("channel struct loop", body)
+    assert_eq_str("unbox count", "{count_kind(body, IrKind.Unbox)}", "1")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
 }
 
 // ── The element read, on its own ──────────────────────────────────────────
