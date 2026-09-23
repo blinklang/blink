@@ -1,0 +1,67 @@
+import std.fs
+import std.io
+import typecheck.{check_types}
+import layout.{layout_reset}
+import mono.{run_mono}
+import ir.{ir_dump, ir_reset, ir_verify}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+import diagnostics.{diag_reset}
+import cg_stmt.{cg_stmt_reset, lower_fn}
+
+fn find_test(label: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.TestBlock && node_name(i) == label { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn run_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    diag_reset()
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+}
+
+fn dump_of_test(label: Str) -> Str ! Diag.Report {
+    let t = find_test(label)
+    assert(t >= 0)
+    let root = lower_fn(t)
+    for err in ir_verify(root) { io.println("VERIFY: {err}") }
+    assert_eq(ir_verify(root).len(), 0)
+    ir_dump(root)
+}
+
+fn count_of(text: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut rest = text
+    while rest.contains(needle) {
+        n = n + 1
+        rest = rest.slice(rest.index_of(needle) + needle.len(), rest.len())
+    }
+    n
+}
+
+// `skip` is the assert family's own statement shape: a runtime call plus a plain
+// return, not a value. Any WithScope the return exits already cleans up through its
+// own C attribute, so no separate unwind step belongs here.
+test "skip in a test body sets the runtime flag and returns" {
+    run_probe("build/cg_stmt_skip_plain.bl", #"import std.testing.{skip}
+test "probe" {
+    let start = 0
+    skip("not ready")
+}
+fn main() {}
+"#)
+    let text = dump_of_test("probe")
+    assert_eq(count_of(text, "__blink_test_set_skipped"), 1)
+    assert_eq(count_of(text, "(Return"), 1)
+}
