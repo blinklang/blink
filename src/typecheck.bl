@@ -10833,6 +10833,14 @@ pub fn tc_call_decl_node(call_node: Int) -> Int {
     tc_call_decl.get(call_node) ?? -1
 }
 
+// Whether this call resolved to an ordinary fn declaration, the one shape a builtin's
+// spelling must yield to (sections/07_trust_modules_metadata.md, "Shadowing Rules"). A
+// bare variant or builtin-type call resolves too, but to a TypeVariant, not a FnDef.
+pub fn tc_call_decl_is_fn(call_node: Int) -> Bool {
+    let decl = tc_call_decl_node(call_node)
+    decl >= 0 && nk_of(node_kind(decl)) == NodeKind.FnDef
+}
+
 fn nr_note_call_decl(call_node: Int, decl_node: Int) {
     if decl_node < 0 { return }
     tc_call_decl.insert(call_node, decl_node)
@@ -11443,6 +11451,20 @@ fn tc_fence_test_only_symbol(name: Str, code: Str, short_name: Str, node: Int) !
             "{name}() can only be called inside a test body",
             node, "move the call into a 'test \{ ... }' block")
     }
+}
+
+// Whether a call node is the std.testing skip intrinsic. Sole source of truth for this
+// question; cg_call and cg_stmt call this directly rather than keeping their own copy.
+// The intrinsic needs no import, so an unresolved callee still counts; a resolved callee
+// counts only when it names lib/std/testing.bl's skip.
+pub fn tc_call_is_skip_intrinsic(node: Int) -> Bool {
+    let callee = node_left(node)
+    if callee < 0 || nk_of(node_kind(callee)) != NodeKind.Ident { return false }
+    let name = tc_alias_to_original.get(node_name(callee)) ?? node_name(callee)
+    if name != "skip" { return false }
+    let decl = tc_call_decl_node(node)
+    if decl < 0 { return true }
+    node_source_module(decl) == "std_testing" && node_name(decl) == "skip"
 }
 
 // pub so codegen resolves a CALL callee in the same order this file does: builtin
@@ -15589,7 +15611,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     }
                     return make_raw_type(make_metavar())
                 }
-                if fn_name == "skip" {
+                let skip_is_intrinsic = fn_name != "skip" || tc_call_is_skip_intrinsic(node)
+                if fn_name == "skip" && skip_is_intrinsic {
                     tc_fence_test_only_symbol("skip", SKIP_OUTSIDE_TEST, "SkipOutsideTest", node)
                     let args_sl = node_args(node)
                     let arg_count = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
@@ -15603,7 +15626,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     }
                     return TYPE_VOID
                 }
-                if is_builtin_fn(fn_name) != 0 {
+                // A resolved fn declaration always wins over a builtin's spelling: see
+                // tc_call_decl_is_fn. Skipping the builtin branch here lets this call fall
+                // through to lookup_fnsig below, which types it against the user's own
+                // signature instead of the builtin's.
+                if is_builtin_fn(fn_name) != 0 && skip_is_intrinsic && !tc_call_decl_is_fn(node) {
                     // Infer args so nested expressions (e.g. a method call passed
                     // to println) are type-checked — variadic builtins otherwise
                     // skip arg inference, hiding errors like E0522.
