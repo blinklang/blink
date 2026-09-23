@@ -31,7 +31,7 @@ import typecheck.{
     is_import_module_name, is_builtin_namespace, is_builtin_fn, is_intrinsic_method, tc_alias_to_original,
     tc_type_str,
     tc_enum_variant_slots, tc_evar_name, tc_tid_child_count, tc_tid_child,
-    tc_struct_field_slots, tc_sfield_name,
+    tc_struct_field_slots, tc_sfield_name, get_struct_field_tid,
     tc_names_a_type, tc_is_sealed_list_hof, is_user_effect_handle_name,
     tc_lookup_node_tid, tc_unclaimed_call_tid, tc_list_rename_help, tc_tid_iter_elem,
     tc_call_decl_node, tc_tid_name, tc_mc_obj_is_value,
@@ -88,6 +88,7 @@ let trait_eq = "Eq"
 let trait_ord = "Ord"
 let method_eq = "eq"
 let method_get = "get"
+let trait_from = "From"
 
 // What the impl selector answers when more than one impl is written over the receiver and
 // the refusal is already recorded. It has to stay apart from the -1 that means no impl is
@@ -260,6 +261,105 @@ fn cc_display_call(node: Int, im: Int, value: Int) -> Int ! Diag.Report {
     let rec = cc_local(TYPE_STR, node)
     if cc_stopped(rec) { return -1 }
     ir_call_direct(TYPE_STR, node, rec.c_spelling, c_display_dispatch_name(im), rec.slot_form, [value])
+}
+
+// The five kinds typecheck's builtin Display block covers on top of Struct/Enum
+// (src/typecheck.bl:16016): a scalar has no impl block, so `.display()`/`.fmt(sb)` on one
+// never reaches `cc_impl_with_method` and must be answered here instead.
+fn cc_is_scalar_display_kind(kind: TyKind) -> Bool {
+    kind == TyKind.Int || kind == TyKind.Float || kind == TyKind.Bool || kind == TyKind.Str || kind == TyKind.Char
+}
+
+// Builtin scalar `.display()`. Int is answered earlier, through the intrinsic table's own
+// row (cc_num_intrinsic), so this is read for the other four kinds only; the Int arm below
+// is a defensive mirror of that row, kept so this function answers every kind it claims to.
+// Str already is the text its own Display renders, so the receiver is the whole answer.
+// Char reaches the same runtime helper an unprintable interpolation hole calls. Bool has
+// no runtime helper at all: mirrors cg_expr.bl's `x_bool_text` (C has no conditional IR
+// node, so the two words are written by an `if` into a hoisted temp).
+fn cc_scalar_display(node: Int, obj: Int, kind: TyKind) -> Int ! Diag.Report {
+    if kind == TyKind.Str { return lower_expr(obj) }
+    if kind == TyKind.Char {
+        let rec = cc_local(TYPE_STR, node)
+        if cc_stopped(rec) { return -1 }
+        let value = lower_expr(obj)
+        if value < 0 { return -1 }
+        return cc_char_text_of_value(node, rec.c_spelling, rec.slot_form, value)
+    }
+    if kind == TyKind.Bool { return cc_bool_display(node, obj) }
+    if kind == TyKind.Int { return cc_scalar_display_via_stdlib(node, obj, "int_to_str", kind) }
+    cc_scalar_display_via_stdlib(node, obj, "float_to_str", kind)
+}
+
+fn cc_scalar_display_via_stdlib(node: Int, obj: Int, name: Str, kind: TyKind) -> Int ! Diag.Report {
+    let decl = cc_stdlib_fn_named(node, "std_num", name)
+    if decl == DECL_REFUSED { return -1 }
+    if decl < 0 { return cc_intrinsic_undeclared(node, kind, "display", "std_num", name) }
+    let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
+    if symbol == "" { return -1 }
+    cc_build_call(node, symbol, obj, CallForm.Declared, cg_decl_takes_ev(decl))
+}
+
+// A Bool hole becomes a Str temp an `if` fills, the same way `cg_expr.bl`'s own interpolation
+// path renders one: C has no conditional expression IR node and the runtime has no
+// bool-to-text helper.
+fn cc_bool_display(node: Int, obj: Int) -> Int ! Diag.Report {
+    let cond = lower_expr(obj)
+    if cond < 0 { return -1 }
+    let rec = cc_local(TYPE_STR, node)
+    if cc_stopped(rec) { return -1 }
+    let held = c_mint_local("bd")
+    cg_expr_push_pending(node, ir_let(TYPE_STR, node, rec.c_spelling, held, rec.slot_form, -1))
+    let no = ir_const(TYPE_STR, node, rec.c_spelling, c_string_literal("false"))
+    let yes = ir_const(TYPE_STR, node, rec.c_spelling, c_string_literal("true"))
+    cg_expr_push_pending(node, ir_if(node, cond,
+        ir_block(node, [ir_assign(node, cc_temp_ref(node, TYPE_STR, rec, held), yes)]),
+        ir_block(node, [ir_assign(node, cc_temp_ref(node, TYPE_STR, rec, held), no)])))
+    cc_temp_ref(node, TYPE_STR, rec, held)
+}
+
+// Which `std_sb` write binds a builtin scalar's `.fmt(sb)`, mirroring `cc_sb_write_callee`'s
+// own binding-by-argument-type table (Str and Char share the plain `sb_write`, Char having
+// been converted to text first).
+fn cc_scalar_sb_write_name(kind: TyKind) -> Str {
+    if kind == TyKind.Int { return "sb_write_int" }
+    if kind == TyKind.Float { return "sb_write_float" }
+    if kind == TyKind.Bool { return "sb_write_bool" }
+    "sb_write"
+}
+
+// `fmt(sb)` on a builtin scalar writes straight into the caller's StringBuilder, so it
+// cannot reuse `cc_build_call`: that helper always lowers the receiver into the call's
+// FIRST argument, but every `sb_write_*` declares the StringBuilder first and the scalar
+// second. Built by hand instead, the same way `.write_char` is (`cc_sb_write_char` above).
+fn cc_scalar_fmt(node: Int, obj: Int, kind: TyKind) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 1 { return cc_intrinsic_arity_wrong(node, kind, "fmt", 1, given) }
+    let name = cc_scalar_sb_write_name(kind)
+    let decl = cc_stdlib_fn_named(node, "std_sb", name)
+    if decl == DECL_REFUSED { return -1 }
+    if decl < 0 { return cc_intrinsic_undeclared(node, kind, "fmt", "std_sb", name) }
+    let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
+    if symbol == "" { return -1 }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    let takes_ev = cg_decl_takes_ev(decl)
+    let mut ev = -1
+    if takes_ev {
+        ev = cg_eff_ev_argument(node)
+        if ev < 0 { return -1 }
+    }
+    let sb_arg = lower_expr(sublist_get(node_args(node), 0))
+    if sb_arg < 0 { return -1 }
+    let recv_value = lower_expr(obj)
+    if recv_value < 0 { return -1 }
+    let value = if kind == TyKind.Char { cc_char_text_of_value(node, rec.c_spelling, rec.slot_form, recv_value) } else { recv_value }
+    if value < 0 { return -1 }
+    let mut args: List[Int] = [sb_arg, value]
+    if takes_ev { args.push(ev) }
+    ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, args)
 }
 
 // A rendering with no typecheck gate behind it: assert_eq and assert_ne name any struct
@@ -2481,8 +2581,25 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let im = cc_impl_with_method(node, recv_tid, mname)
     if im == IMPL_REFUSED { return -1 }
     if im < 0 {
+        // A hand-written impl method (above) always wins. Below that, in the same order
+        // typecheck resolves a struct/enum method call (src/typecheck.bl:16863-16988): the
+        // sealed Display synthesis, a derive-synthesized method, a nominal free function
+        // named by convention after its receiver's declared type, and last a closure-typed
+        // struct field invoked like a method.
+        if mname == "display" && (kind == TyKind.Struct || kind == TyKind.Enum) { return lower_display_call(obj) }
+        if mname == "display" && cc_is_scalar_display_kind(kind) { return cc_scalar_display(node, obj, kind) }
+        if mname == "fmt" && cc_is_scalar_display_kind(kind) { return cc_scalar_fmt(node, obj, kind) }
+        if mname == "into" {
+            let symbol = cc_into_symbol(node, recv_tid)
+            if symbol == "" { return -1 }
+            return cc_build_call(node, symbol, obj, CallForm.Declared, false)
+        }
         let derived = cc_derived_method_symbol(recv_tid, mname)
         if derived != "" { return cc_build_call(node, derived, obj, CallForm.Declared, false) }
+        let nominal = cc_nominal_method_decl(node, recv_tid, mname)
+        if nominal == DECL_REFUSED { return -1 }
+        if nominal >= 0 { return cc_call_nominal_decl(node, obj, kind, mname, nominal) }
+        if cc_is_closure_field(recv_tid, mname) { return cc_field_closure_call(node, obj, recv_tid, mname) }
         return cc_method_not_built(node, kind, mname)
     }
     let method = cc_method_of(im, node_method(node))
@@ -2494,16 +2611,123 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
 
 // A method call with no declared impl to answer it may still be one a derive answers: a
 // derive writes its C body straight from the type decl (src/cg_derive.bl), under its own
-// symbol, and registers no impl block for cc_impl_with_method to have found. Clone is the
-// only derived method reachable through a plain `.method()` call today — eq and cmp are
-// reached only through the `==`/`!=`/ordering operator desugar (cc_equality_symbol), and
-// debug has its own dispatch — so this checks only Clone, and answers "" for every other
-// name so the ordinary "not built" refusal still fires for a receiver with no such method.
+// symbol, and registers no impl block for cc_impl_with_method to have found. Clone, Debug
+// and Eq are the derived methods reachable through a plain `.method()` call; cmp is reached
+// only through an ordering operator today, and Eq is also reached through the `==`/`!=`
+// desugar (cc_equality_symbol), which answers the same symbol this does. "" is answered for
+// every other name so the ordinary "not built" refusal still fires for a receiver with no
+// such method.
 fn cc_derived_method_symbol(recv_tid: Int, mname: Str) -> Str {
-    if mname != "clone" { return "" }
     let decl = tc_tid_decl_node(recv_tid)
-    if decl < 0 || !decl_has_derive(decl, "Clone") { return "" }
-    c_derive_method_name(decl, "clone")
+    if decl < 0 { return "" }
+    if mname == "clone" {
+        if !decl_has_derive(decl, "Clone") { return "" }
+        return c_derive_method_name(decl, "clone")
+    }
+    if mname == "debug" {
+        if !decl_has_derive(decl, "Debug") { return "" }
+        return c_derive_method_name(decl, "debug")
+    }
+    if mname == "eq" {
+        if !cc_derives_equality(decl) { return "" }
+        return c_derive_method_name(decl, "eq")
+    }
+    ""
+}
+
+// A free function named by convention after its receiver's declared type: `{Type}_{method}`.
+// A few builtin structs (Duration, Instant) declare their methods this way, as plain
+// top-level functions taking the receiver as their first parameter, rather than inside an
+// impl block — so a receiver whose declaration has no matching impl still answers a nominal
+// method through the name its declaration spells. Typecheck resolves the same call through
+// the same bare name (src/typecheck.bl:4911-4916, register_derive_method_sig's sibling
+// path for an ordinary function), with no module in the key, so the lookup here carries
+// none either. DECL_REFUSED is answered after an internal error is recorded; -1 means no
+// such function is declared at all, which is not this stage's error to raise.
+fn cc_nominal_method_decl(node: Int, recv_tid: Int, mname: Str) -> Int ! Diag.Report {
+    let decl = tc_tid_decl_node(recv_tid)
+    if decl < 0 { return -1 }
+    let want = "{node_name(decl)}_{mname}"
+    let mut found = -1
+    let mut clashes = 0
+    for f in cg_reg_fn_decls() {
+        if node_name(f) != want { continue }
+        if found >= 0 { clashes = clashes + 1 }
+        found = f
+    }
+    if clashes == 0 { return found }
+    diag_ice_at("NominalMethodCalleeAmbiguous", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{want}' is declared more than once, so the nominal method call names neither", node,
+        "a nominal method name is a program-wide key; two declarations of it must not both reach codegen")
+    DECL_REFUSED
+}
+
+// The receiver is the declaration's first parameter, exactly as an intrinsic's is
+// (lower_intrinsic_method), so the same arity and call-building rule applies: the method
+// takes one fewer argument than the function does, checked here because typecheck does not
+// check the arity of every one of these.
+fn cc_call_nominal_decl(node: Int, obj: Int, kind: TyKind, mname: Str, decl: Int) -> Int ! Diag.Report {
+    let want = sublist_length(node_params(decl)) - 1
+    let given = sublist_length(node_args(node))
+    if want != given { return cc_intrinsic_arity_wrong(node, kind, mname, want, given) }
+    let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
+    if symbol == "" { return -1 }
+    cc_build_call(node, symbol, obj, CallForm.Declared, cg_decl_takes_ev(decl))
+}
+
+// `route.callback(req)`, `srv.error_handler.on_error(req, msg)`: a struct field whose
+// declared type is `fn(...) -> T`, invoked like a method. The shape is recognised the same
+// way typecheck recognises it (src/typecheck.bl:16958-16988): a struct field of that exact
+// name whose own tid is TyKind.Fn. Guarded on TyKind.Struct because an enum has variants,
+// not fields.
+fn cc_is_closure_field(recv_tid: Int, mname: Str) -> Bool {
+    if cc_kind(recv_tid) != TyKind.Struct { return false }
+    let fld_tid = get_struct_field_tid(recv_tid, mname)
+    fld_tid != -1 && cc_kind(fld_tid) == TyKind.Fn
+}
+
+// The field is read as a place (cc_field, the same layout rule lower_struct_field in
+// cg_expr.bl reads a value field by), then called through the C function-pointer type its
+// Fn tid spells, the same way cc_closure_call reaches a closure named by an expression:
+// this call has no such expression, only a receiver and a field name, so the field read is
+// built here instead of handed to it.
+fn cc_field_closure_call(node: Int, obj: Int, recv_tid: Int, mname: Str) -> Int ! Diag.Report {
+    let field_tid = get_struct_field_tid(recv_tid, mname)
+    if field_tid < 0 { return cc_method_not_built(node, TyKind.Struct, mname) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    let fn_type = fn_pointer_spelling_of(field_tid, node)
+    if fn_type == "" { return -1 }
+    let frec = cc_field(recv_tid, field_tid, node)
+    if cc_stopped(frec) { return -1 }
+    let target = lower_expr(obj)
+    if target < 0 { return -1 }
+    let closure = ir_field_get(field_tid, node, frec.c_spelling, c_field_name(mname), frec.slot_form, target)
+    let mut args: List[Int] = []
+    let written = node_args(node)
+    let mut i = 0
+    while i < sublist_length(written) {
+        let a = lower_expr(sublist_get(written, i))
+        if a < 0 { return -1 }
+        args.push(a)
+        i = i + 1
+    }
+    ir_call_closure(tid, node, rec.c_spelling, fn_type, rec.slot_form, closure, args)
+}
+
+// A field read takes the owner's stored form: a field whose type reaches its own owner by
+// value is held as a boxed word, which the field's own Local layout does not say. Mirrors
+// cg_expr.bl's x_field, which this stage cannot call (it is private to that file).
+fn cc_field(owner_tid: Int, field_tid: Int, node: Int) -> LayoutRecord ! Diag.Report {
+    let rec = field_layout_of(owner_tid, field_tid)
+    let why = "struct field has no C layout: {rec.decline_reason}"
+    if rec.decline_reason != "" {
+        diag_ice_at("UnspellableFieldType", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
+            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    }
+    rec
 }
 
 // ── Intrinsic methods ─────────────────────────────────────────────────────
@@ -4384,6 +4608,46 @@ fn cc_impl_for(node: Int, recv_tid: Int, trait_name: Str) -> Int ! Diag.Report {
     }
     if clashes == 0 { return found }
     cc_impl_ambiguous(node, recv_tid, "the trait '{trait_name}'")
+}
+
+// `c.into()` reads its target from the call node's own type, not from the receiver: the
+// impl it needs is `impl From[Source] for Target`, which is written owned by TARGET with
+// SOURCE as its one type parameter (cname.bl's impl_stem mangles the symbol the same way).
+// So this answers the symbol directly rather than an impl node: cc_impl_for's owner search
+// alone would look for an impl over the receiver's own declaration, which a From impl never
+// is. "" is answered after an internal error is recorded.
+fn cc_into_symbol(node: Int, recv_tid: Int) -> Str ! Diag.Report {
+    let target_tid = tid_of_node(node)
+    if target_tid < 0 { return "" }
+    let im = cc_impl_from_for(node, recv_tid, target_tid)
+    if im == IMPL_REFUSED { return "" }
+    if im >= 0 { return c_impl_method_name(im, "from") }
+    diag_ice_at("IntoImplNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'.into()' has no 'impl From[{tc_tid_name(recv_tid)}] for {tc_tid_name(target_tid)}' to call", node,
+        "typecheck must reject an into() with no matching From impl; this is a compiler bug")
+    ""
+}
+
+// The impl block of `From[source] for target`, found by the target it is written over and
+// the source type its one type parameter names.
+fn cc_impl_from_for(node: Int, source_tid: Int, target_tid: Int) -> Int ! Diag.Report {
+    let want = tc_tid_decl_node(target_tid)
+    let builtin = cc_builtin_owner_name(target_tid)
+    if want < 0 && builtin == "" { return -1 }
+    let source_name = tc_tid_name(source_tid)
+    let mut found = -1
+    let mut clashes = 0
+    for im in cg_reg_impl_decls() {
+        if node_trait_name(im) != trait_from { continue }
+        if !cc_impl_answers_for(im, want, builtin) { continue }
+        let tps = node_type_params(im)
+        if tps == -1 || sublist_length(tps) < 1 { continue }
+        if node_name(sublist_get(tps, 0)) != source_name { continue }
+        if found >= 0 { clashes = clashes + 1 }
+        found = im
+    }
+    if clashes == 0 { return found }
+    cc_impl_ambiguous(node, target_tid, "the trait 'From[{source_name}]'")
 }
 
 fn cc_method_index(im: Int, mname: Str) -> Int {
