@@ -1200,19 +1200,13 @@ fn ev_field_of(handler_tid: Int, node: Int) -> Str ! Diag.Report {
 // is the innermost handler wherever the perform sits, inside a function that also holds a
 // vector parameter or not.
 
-// The builtin namespaces whose operations the runtime dispatches through a vtable, the
-// one operation whose slot answers a nullable text where the call answers an Option, and
-// the runtime's own struct names for time's two operations -- the vtable slots take and
-// return `blink_instant_struct`/`blink_duration_struct` (bootstrap/runtime_core.h), never
-// the tid-native Instant/Duration a Blink program declares, for the same reason the
-// runtime keeps them apart everywhere else: the runtime header is compiled once, before
-// any user program's tid-native struct names exist.
+// The builtin namespaces whose operations the runtime dispatches through a vtable, and
+// the one operation whose slot answers a nullable text where the call answers an Option.
 let NS_IO = "io"
 let NS_ENV = "env"
 let NS_TIME = "time"
 let ENV_VAR = "var"
 let TIME_READ = "read"
-let RUNTIME_NANOS_FIELD = "nanos"
 
 // The carrier member an Option payload lands in; the printer designates it by this name.
 let CARRIER_VALUE = "value"
@@ -1312,11 +1306,14 @@ pub fn cg_eff_lower_builtin_perform(node: Int, ns: Str, method: Str) -> Int ! Di
 }
 
 // time.read and time.sleep, reached through the same vtable-slot road as
-// cg_eff_lower_builtin_perform, but not through it: the Time vtable's two slots are
-// declared over the runtime's own blink_instant_struct/blink_duration_struct (see the
-// NS_TIME comment above), never the tid-native Instant/Duration a Blink program declares,
-// so a perform here needs a field copy on the way in and the way out instead of a plain
-// argument/return pass-through.
+// cg_eff_lower_builtin_perform, but not through it: cg_call.bl's lower_time_call checks
+// time.sleep's argument count before calling here (typecheck's time.sleep arm types the
+// call as Void without the generic namespace-intrinsic arity check every other namespace
+// intrinsic gets), so this function can assume the argument list it is handed is already
+// right-sized. Instant and Duration are runtime-owned (LO_FACT_RUNTIME_OWNED,
+// src/layout.bl), so their own tid-native C spelling already matches the vtable's
+// read/sleep signatures, and both operations pass their value straight through with no
+// field copy on the way in or out.
 pub fn cg_eff_lower_time_perform(node: Int, method: Str) -> Int ! Diag.Report {
     let slot = c_builtin_effect_slot(NS_TIME, method)
     if diag_is_ice_seg(slot) {
@@ -1327,41 +1324,23 @@ pub fn cg_eff_lower_time_perform(node: Int, method: Str) -> Int ! Diag.Report {
     }
     let handler_tid = builtin_handler_tid(NS_TIME, node)
     if handler_tid < 0 { return -1 }
-    let int_rec = perform_layout(TYPE_INT, Position.Local, node)
-    if int_rec.c_spelling == "" { return -1 }
+    let read = slot_read(node, handler_tid)
+    if read < 0 { return -1 }
 
     if method == TIME_READ {
-        let read = slot_read(node, handler_tid)
-        if read < 0 { return -1 }
-        let perform = ir_effect_perform(TYPE_INT, node, c_runtime_helper("instant_struct"), slot, SlotForm.Inline, read, [])
         let instant_tid = tid_of_node(node)
         if instant_tid < 0 { return -1 }
         let instant_rec = perform_layout(instant_tid, Position.Local, node)
         if instant_rec.c_spelling == "" { return -1 }
-        let nanos = ir_field_get(TYPE_INT, node, int_rec.c_spelling, c_field_name(RUNTIME_NANOS_FIELD), int_rec.slot_form, perform)
-        return ir_struct_new(instant_tid, node, instant_rec.c_spelling, [nanos])
+        return ir_effect_perform(instant_tid, node, instant_rec.c_spelling, slot, instant_rec.slot_form, read, [])
     }
 
-    // sleep: typecheck's time.sleep arm (typecheck.bl) types the call as Void without
-    // running the generic namespace-intrinsic arity check the way every other namespace
-    // intrinsic does, so a wrong argument count reaches here instead of being rejected
-    // earlier. Refuse it here rather than indexing a missing argument node.
     let written = node_args(node)
-    let got = if written == -1 { 0 } else { sublist_length(written) }
-    if got != 1 {
-        diag_ice_at("TimeSleepArityNotChecked", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "time.sleep reached codegen with {got} argument(s), not 1", node,
-            "typecheck's time.sleep arm does not check argument count; this is a compiler bug")
-        return -1
-    }
     let dur_arg = lower_expr(sublist_get(written, 0))
     if dur_arg < 0 { return -1 }
-    let dur_nanos = ir_field_get(TYPE_INT, node, int_rec.c_spelling, c_field_name(RUNTIME_NANOS_FIELD), int_rec.slot_form, dur_arg)
-    let dur_arg_runtime = ir_struct_new(TYPE_INT, node, c_runtime_helper("duration_struct"), [dur_nanos])
     let void_rec = perform_layout(tc_void_tid(), Position.Local, node)
-    let read = slot_read(node, handler_tid)
-    if read < 0 { return -1 }
-    ir_effect_perform(tc_void_tid(), node, void_rec.c_spelling, slot, SlotForm.Inline, read, [dur_arg_runtime])
+    if void_rec.c_spelling == "" { return -1 }
+    ir_effect_perform(tc_void_tid(), node, void_rec.c_spelling, slot, SlotForm.Inline, read, [dur_arg])
 }
 
 // Every io argument rendered to text. The kinds are read before any argument is lowered,

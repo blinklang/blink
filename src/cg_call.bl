@@ -1112,8 +1112,10 @@ let env_effect_ops: List[Str] = ["var", "cwd", "set_var", "remove_var", "exit"]
 // directly and raise no trace.
 let io_raw_ops: List[Str] = ["print_raw", "eprint_raw"]
 
-// The two time names dispatched through the Time vtable's slots.
+// The two time names dispatched through the Time vtable's slots, and the one of the two
+// whose arity typecheck does not check (see lower_time_call).
 let time_vtable_ops: List[Str] = ["read", "sleep"]
+let time_op_sleep = "sleep"
 
 fn lower_namespace_call(node: Int, obj: Int) -> Int ! Diag.Report {
     let ns = node_name(obj)
@@ -1344,11 +1346,31 @@ fn lower_env_call(node: Int, method: Str) -> Int ! Diag.Report {
     cc_ns_not_built(node, ns_env, method)
 }
 
-// time.read and time.sleep are both slots of the Time vtable, but the runtime declares
-// them over its own instant/duration structs rather than the tid-native Instant/Duration
-// a Blink program declares, so they need the field-copy dance cg_eff_lower_time_perform
-// does instead of the plain builtin-perform road io and env take.
+// time.sleep types as Void without the generic namespace-intrinsic arity check every
+// other namespace intrinsic gets (typecheck.bl's time.sleep arm), so a wrong argument
+// count would otherwise reach the vtable perform and build a call the C compiler cannot
+// compile, with no Blink span on the error. I0008 lives in this file rather than in
+// diagnostics.bl's central table because it names a codegen-only duplicate of a check
+// typecheck itself should run, and nothing else raises it.
+let TIME_SLEEP_ARITY_NOT_CHECKED = "I0008"
+
+fn cc_time_sleep_arity_wrong(node: Int, got: Int) -> Int ! Diag.Report {
+    diag_ice_at("TimeSleepArityNotChecked", TIME_SLEEP_ARITY_NOT_CHECKED,
+        "time.sleep reached codegen with {got} argument(s), not 1", node,
+        "typecheck's time.sleep arm does not check argument count; this is a compiler bug")
+    -1
+}
+
+// time.read and time.sleep are both slots of the Time vtable. Instant and Duration are
+// runtime-owned (LO_FACT_RUNTIME_OWNED, src/layout.bl), so their tid-native C spelling
+// already matches the vtable's read/sleep signatures, and cg_eff_lower_time_perform passes
+// them straight through with no field-copy repacking.
 fn lower_time_call(node: Int, method: Str) -> Int ! Diag.Report {
+    if method == time_op_sleep {
+        let written = node_args(node)
+        let got = if written == -1 { 0 } else { sublist_length(written) }
+        if got != 1 { return cc_time_sleep_arity_wrong(node, got) }
+    }
     if time_vtable_ops.contains(method) { return cg_eff_lower_time_perform(node, method) }
     cc_ns_not_built(node, ns_time, method)
 }
@@ -2705,35 +2727,27 @@ fn cc_is_instant_runtime_method(recv_tid: Int, mname: Str) -> Bool {
 }
 
 // The runtime declares blink_Instant_elapsed / blink_Instant_to_rfc3339 taking and
-// returning blink_instant_struct / blink_duration_struct (bootstrap/runtime_core.h) --
-// C types kept deliberately distinct from Instant/Duration's own tid-native shape so the
-// two typedefs don't collide in one translation unit, even though both are a bare `nanos`
-// field. Crossing that boundary means reading the receiver's nanos by hand, rebuilding it
-// as the runtime's own struct, calling the runtime function, and for elapsed, unwrapping
-// its result the same way in reverse.
+// returning blink_Instant / blink_Duration (bootstrap/runtime_core.h) directly: Instant
+// and Duration are LO_FACT_RUNTIME_OWNED (src/layout.bl), so their own tid-native C
+// spelling already IS the runtime's struct, with no separate codegen typedef to collide
+// with it. The receiver and the result cross this call by their real tid, with no
+// field-copy repacking on either side.
 fn cc_instant_runtime_method(node: Int, obj: Int, mname: Str) -> Int ! Diag.Report {
     let receiver = lower_expr(obj)
     if receiver < 0 { return -1 }
-    let int_rec = cc_local(TYPE_INT, node)
-    if cc_stopped(int_rec) { return -1 }
-    let nanos = ir_field_get(TYPE_INT, node, int_rec.c_spelling, c_field_name("nanos"), int_rec.slot_form, receiver)
-    let instant_arg = ir_struct_new(TYPE_INT, node, c_runtime_helper("instant_struct"), [nanos])
 
     if mname == "to_rfc3339" {
         let str_rec = cc_local(TYPE_STR, node)
         if cc_stopped(str_rec) { return -1 }
         return ir_call_runtime(TYPE_STR, node, str_rec.c_spelling, c_runtime_helper("Instant_to_rfc3339"),
-            str_rec.slot_form, [instant_arg])
+            str_rec.slot_form, [receiver])
     }
 
     let dur_tid = tid_of_node(node)
     if dur_tid < 0 { return -1 }
     let dur_rec = cc_local(dur_tid, node)
     if cc_stopped(dur_rec) { return -1 }
-    let raw = ir_call_runtime(TYPE_INT, node, c_runtime_helper("duration_struct"), c_runtime_helper("Instant_elapsed"),
-        SlotForm.Inline, [instant_arg])
-    let raw_nanos = ir_field_get(TYPE_INT, node, int_rec.c_spelling, c_field_name("nanos"), int_rec.slot_form, raw)
-    ir_struct_new(dur_tid, node, dur_rec.c_spelling, [raw_nanos])
+    ir_call_runtime(dur_tid, node, dur_rec.c_spelling, c_runtime_helper("Instant_elapsed"), dur_rec.slot_form, [receiver])
 }
 
 // `route.callback(req)`, `srv.error_handler.on_error(req, msg)`: a struct field whose

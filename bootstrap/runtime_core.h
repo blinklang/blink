@@ -2782,15 +2782,16 @@ BLINK_UNUSED static blink_rand_vtable blink_rand_vtable_default = {
 };
 
 /* ── Duration / Instant runtime helpers ─────────────────────────────── */
-/* blink_Duration / blink_Instant are defined by Blink (lib/std/time.bl).
-   runtime_core.h uses _struct variants to avoid duplicate typedef conflicts. */
+/* blink_Duration / blink_Instant are declared by Blink (lib/std/time.bl) as
+   runtime-owned types (LO_FACT_RUNTIME_OWNED in src/layout.bl): codegen skips
+   emitting its own typedef for them and relies on the ones below. */
 
-typedef struct { int64_t nanos; } blink_duration_struct;
-typedef struct { int64_t nanos; } blink_instant_struct;
+typedef struct { int64_t nanos; } blink_Duration;
+typedef struct { int64_t nanos; } blink_Instant;
 
-BLINK_RT_FN const char* blink_Instant_to_rfc3339(blink_instant_struct i);
+BLINK_RT_FN const char* blink_Instant_to_rfc3339(blink_Instant i);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN const char* blink_Instant_to_rfc3339(blink_instant_struct i) {
+BLINK_RT_FN const char* blink_Instant_to_rfc3339(blink_Instant i) {
     time_t epoch_secs = (time_t)(i.nanos / 1000000000LL);
     struct tm utc;
     gmtime_r(&epoch_secs, &utc);
@@ -2802,37 +2803,37 @@ BLINK_RT_FN const char* blink_Instant_to_rfc3339(blink_instant_struct i) {
 }
 #endif
 
-BLINK_RT_FN blink_duration_struct blink_Instant_elapsed(blink_instant_struct then);
+BLINK_RT_FN blink_Duration blink_Instant_elapsed(blink_Instant then);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_duration_struct blink_Instant_elapsed(blink_instant_struct then) {
+BLINK_RT_FN blink_Duration blink_Instant_elapsed(blink_Instant then) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     int64_t now_nanos = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
-    return (blink_duration_struct){.nanos = now_nanos - then.nanos};
+    return (blink_Duration){.nanos = now_nanos - then.nanos};
 }
 #endif
 
 /* ── Time ───────────────────────────────────────────────────────────── */
 typedef struct {
-    blink_instant_struct (*read)(void);
-    void                (*sleep)(blink_duration_struct d);
+    blink_Instant (*read)(void);
+    void                (*sleep)(blink_Duration d);
     /* per-op handler captures — see blink_io_vtable */
     void* __userdata_read;
     void* __userdata_sleep;
 } blink_time_vtable;
 
-BLINK_RT_FN blink_instant_struct blink_time_default_read(void);
+BLINK_RT_FN blink_Instant blink_time_default_read(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_instant_struct blink_time_default_read(void) {
+BLINK_RT_FN blink_Instant blink_time_default_read(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    return (blink_instant_struct){.nanos = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec};
+    return (blink_Instant){.nanos = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec};
 }
 #endif
 
-BLINK_RT_FN void blink_time_default_sleep(blink_duration_struct d);
+BLINK_RT_FN void blink_time_default_sleep(blink_Duration d);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_time_default_sleep(blink_duration_struct d) {
+BLINK_RT_FN void blink_time_default_sleep(blink_Duration d) {
     int64_t ns = d.nanos;
     struct timespec ts;
     ts.tv_sec  = (time_t)(ns / 1000000000LL);
