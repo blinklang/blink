@@ -2599,6 +2599,9 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
         let nominal = cc_nominal_method_decl(node, recv_tid, mname)
         if nominal == DECL_REFUSED { return -1 }
         if nominal >= 0 { return cc_call_nominal_decl(node, obj, kind, mname, nominal) }
+        if kind == TyKind.Struct && cc_is_instant_runtime_method(recv_tid, mname) {
+            return cc_instant_runtime_method(node, obj, mname)
+        }
         if cc_is_closure_field(recv_tid, mname) { return cc_field_closure_call(node, obj, recv_tid, mname) }
         return cc_method_not_built(node, kind, mname)
     }
@@ -2673,6 +2676,50 @@ fn cc_call_nominal_decl(node: Int, obj: Int, kind: TyKind, mname: Str, decl: Int
     let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
     if symbol == "" { return -1 }
     cc_build_call(node, symbol, obj, CallForm.Declared, cg_decl_takes_ev(decl))
+}
+
+// Instant.elapsed and Instant.to_rfc3339 are the two Instant/Duration methods with no
+// Blink-level declaration at all: every other one (since, add, to_unix_secs, Duration's
+// to_ms/to_seconds/to_nanos, ...) is a plain function in lib/std/time.bl and is already
+// found above by cc_nominal_method_decl. These two can only be answered by the runtime,
+// which reads the wall clock (elapsed) or formats a timestamp (to_rfc3339) in C.
+fn cc_is_instant_runtime_method(recv_tid: Int, mname: Str) -> Bool {
+    if mname != "elapsed" && mname != "to_rfc3339" { return false }
+    let decl = tc_tid_decl_node(recv_tid)
+    if decl < 0 { return false }
+    node_name(decl) == "Instant"
+}
+
+// The runtime declares blink_Instant_elapsed / blink_Instant_to_rfc3339 taking and
+// returning blink_instant_struct / blink_duration_struct (bootstrap/runtime_core.h) --
+// C types kept deliberately distinct from Instant/Duration's own tid-native shape so the
+// two typedefs don't collide in one translation unit, even though both are a bare `nanos`
+// field. Crossing that boundary means reading the receiver's nanos by hand, rebuilding it
+// as the runtime's own struct, calling the runtime function, and for elapsed, unwrapping
+// its result the same way in reverse.
+fn cc_instant_runtime_method(node: Int, obj: Int, mname: Str) -> Int ! Diag.Report {
+    let receiver = lower_expr(obj)
+    if receiver < 0 { return -1 }
+    let int_rec = cc_local(TYPE_INT, node)
+    if cc_stopped(int_rec) { return -1 }
+    let nanos = ir_field_get(TYPE_INT, node, int_rec.c_spelling, c_field_name("nanos"), int_rec.slot_form, receiver)
+    let instant_arg = ir_struct_new(TYPE_INT, node, c_runtime_helper("instant_struct"), [nanos])
+
+    if mname == "to_rfc3339" {
+        let str_rec = cc_local(TYPE_STR, node)
+        if cc_stopped(str_rec) { return -1 }
+        return ir_call_runtime(TYPE_STR, node, str_rec.c_spelling, c_runtime_helper("Instant_to_rfc3339"),
+            str_rec.slot_form, [instant_arg])
+    }
+
+    let dur_tid = tid_of_node(node)
+    if dur_tid < 0 { return -1 }
+    let dur_rec = cc_local(dur_tid, node)
+    if cc_stopped(dur_rec) { return -1 }
+    let raw = ir_call_runtime(TYPE_INT, node, c_runtime_helper("duration_struct"), c_runtime_helper("Instant_elapsed"),
+        SlotForm.Inline, [instant_arg])
+    let raw_nanos = ir_field_get(TYPE_INT, node, int_rec.c_spelling, c_field_name("nanos"), int_rec.slot_form, raw)
+    ir_struct_new(dur_tid, node, dur_rec.c_spelling, [raw_nanos])
 }
 
 // `route.callback(req)`, `srv.error_handler.on_error(req, msg)`: a struct field whose
