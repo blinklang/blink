@@ -68,7 +68,7 @@ import cg_expr.{
 }
 import cg_stmt.{lower_block_into}
 import cg_eff.{
-    cg_eff_ev_argument, cg_eff_lower_builtin_perform, cg_eff_lower_user_perform,
+    cg_eff_ev_argument, cg_eff_lower_builtin_perform, cg_eff_lower_time_perform, cg_eff_lower_user_perform,
     cg_eff_lower_spawn_closure, cg_eff_pending_thunks, cg_eff_thunk_task_symbol,
 }
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
@@ -1095,6 +1095,7 @@ fn cc_no_module_member(node: Int) -> Int ! Diag.Report {
 
 let ns_io = "io"
 let ns_env = "env"
+let ns_time = "time"
 let ns_ffi = "ffi"
 let ns_net = "net"
 let ns_term = "term"
@@ -1111,6 +1112,11 @@ let env_effect_ops: List[Str] = ["var", "cwd", "set_var", "remove_var", "exit"]
 // directly and raise no trace.
 let io_raw_ops: List[Str] = ["print_raw", "eprint_raw"]
 
+// The two time names dispatched through the Time vtable's slots, and the one of the two
+// whose arity typecheck does not check (see lower_time_call).
+let time_vtable_ops: List[Str] = ["read", "sleep"]
+let time_op_sleep = "sleep"
+
 fn lower_namespace_call(node: Int, obj: Int) -> Int ! Diag.Report {
     let ns = node_name(obj)
     let method = node_method(node)
@@ -1119,6 +1125,7 @@ fn lower_namespace_call(node: Int, obj: Int) -> Int ! Diag.Report {
     }
     if ns == ns_io { return lower_io_call(node, method) }
     if ns == ns_env { return lower_env_call(node, method) }
+    if ns == ns_time { return lower_time_call(node, method) }
     if ns == ns_ffi { return lower_ffi_call(node, method) }
     if ns == ns_net { return lower_net_call(node, method) }
     if ns == ns_term { return lower_term_call(node, method) }
@@ -1337,6 +1344,35 @@ fn lower_env_call(node: Int, method: Str) -> Int ! Diag.Report {
     if env_effect_ops.contains(method) { return cg_eff_lower_builtin_perform(node, ns_env, method) }
     if method == "args" { return cc_env_args(node) }
     cc_ns_not_built(node, ns_env, method)
+}
+
+// time.sleep types as Void without the generic namespace-intrinsic arity check every
+// other namespace intrinsic gets (typecheck.bl's time.sleep arm), so a wrong argument
+// count would otherwise reach the vtable perform and build a call the C compiler cannot
+// compile, with no Blink span on the error. I0008 lives in this file rather than in
+// diagnostics.bl's central table because it names a codegen-only duplicate of a check
+// typecheck itself should run, and nothing else raises it.
+let TIME_SLEEP_ARITY_NOT_CHECKED = "I0008"
+
+fn cc_time_sleep_arity_wrong(node: Int, got: Int) -> Int ! Diag.Report {
+    diag_ice_at("TimeSleepArityNotChecked", TIME_SLEEP_ARITY_NOT_CHECKED,
+        "time.sleep reached codegen with {got} argument(s), not 1", node,
+        "typecheck's time.sleep arm does not check argument count; this is a compiler bug")
+    -1
+}
+
+// time.read and time.sleep are both slots of the Time vtable. Instant and Duration are
+// runtime-owned (LO_FACT_RUNTIME_OWNED, src/layout.bl), so their tid-native C spelling
+// already matches the vtable's read/sleep signatures, and cg_eff_lower_time_perform passes
+// them straight through with no field-copy repacking.
+fn lower_time_call(node: Int, method: Str) -> Int ! Diag.Report {
+    if method == time_op_sleep {
+        let written = node_args(node)
+        let got = if written == -1 { 0 } else { sublist_length(written) }
+        if got != 1 { return cc_time_sleep_arity_wrong(node, got) }
+    }
+    if time_vtable_ops.contains(method) { return cg_eff_lower_time_perform(node, method) }
+    cc_ns_not_built(node, ns_time, method)
 }
 
 // A raw write. It takes any value the Display trait renders, and the runtime publishes no
@@ -2599,6 +2635,9 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
         let nominal = cc_nominal_method_decl(node, recv_tid, mname)
         if nominal == DECL_REFUSED { return -1 }
         if nominal >= 0 { return cc_call_nominal_decl(node, obj, kind, mname, nominal) }
+        if kind == TyKind.Struct && cc_is_instant_runtime_method(recv_tid, mname) {
+            return cc_instant_runtime_method(node, obj, mname)
+        }
         if cc_is_closure_field(recv_tid, mname) { return cc_field_closure_call(node, obj, recv_tid, mname) }
         return cc_method_not_built(node, kind, mname)
     }
@@ -2673,6 +2712,42 @@ fn cc_call_nominal_decl(node: Int, obj: Int, kind: TyKind, mname: Str, decl: Int
     let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
     if symbol == "" { return -1 }
     cc_build_call(node, symbol, obj, CallForm.Declared, cg_decl_takes_ev(decl))
+}
+
+// Instant.elapsed and Instant.to_rfc3339 are the two Instant/Duration methods with no
+// Blink-level declaration at all: every other one (since, add, to_unix_secs, Duration's
+// to_ms/to_seconds/to_nanos, ...) is a plain function in lib/std/time.bl and is already
+// found above by cc_nominal_method_decl. These two can only be answered by the runtime,
+// which reads the wall clock (elapsed) or formats a timestamp (to_rfc3339) in C. The
+// receiver is identified by its tid against the program's one Instant declaration, not by
+// its spelling, the same way a generic dispatch reads a type's identity everywhere else.
+fn cc_is_instant_runtime_method(recv_tid: Int, mname: Str) -> Bool {
+    if mname != "elapsed" && mname != "to_rfc3339" { return false }
+    recv_tid == lookup_named_type("Instant")
+}
+
+// The runtime declares blink_Instant_elapsed / blink_Instant_to_rfc3339 taking and
+// returning blink_Instant / blink_Duration (bootstrap/runtime_core.h) directly: Instant
+// and Duration are LO_FACT_RUNTIME_OWNED (src/layout.bl), so their own tid-native C
+// spelling already IS the runtime's struct, with no separate codegen typedef to collide
+// with it. The receiver and the result cross this call by their real tid, with no
+// field-copy repacking on either side.
+fn cc_instant_runtime_method(node: Int, obj: Int, mname: Str) -> Int ! Diag.Report {
+    let receiver = lower_expr(obj)
+    if receiver < 0 { return -1 }
+
+    if mname == "to_rfc3339" {
+        let str_rec = cc_local(TYPE_STR, node)
+        if cc_stopped(str_rec) { return -1 }
+        return ir_call_runtime(TYPE_STR, node, str_rec.c_spelling, c_runtime_helper("Instant_to_rfc3339"),
+            str_rec.slot_form, [receiver])
+    }
+
+    let dur_tid = tid_of_node(node)
+    if dur_tid < 0 { return -1 }
+    let dur_rec = cc_local(dur_tid, node)
+    if cc_stopped(dur_rec) { return -1 }
+    ir_call_runtime(dur_tid, node, dur_rec.c_spelling, c_runtime_helper("Instant_elapsed"), dur_rec.slot_form, [receiver])
 }
 
 // `route.callback(req)`, `srv.error_handler.on_error(req, msg)`: a struct field whose

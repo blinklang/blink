@@ -33,7 +33,7 @@ import cname.{
 import ir.{
     ir_assign, ir_block, ir_box, ir_call_direct, ir_call_runtime, ir_carrier_wrap, ir_cast,
     ir_closure_new, ir_const, ir_effect_perform, ir_evidence_address, ir_evidence_vector,
-    ir_field_get, ir_global_ref, ir_handler_install, ir_if, ir_let, ir_unbox, ir_var_ref,
+    ir_field_get, ir_global_ref, ir_handler_install, ir_if, ir_let, ir_struct_new, ir_unbox, ir_var_ref,
 }
 import cg_print.{
     print_closure_thunk, print_fn, print_fn_decl, print_handler_builder, print_resource_guard_support,
@@ -1200,11 +1200,13 @@ fn ev_field_of(handler_tid: Int, node: Int) -> Str ! Diag.Report {
 // is the innermost handler wherever the perform sits, inside a function that also holds a
 // vector parameter or not.
 
-// The two builtin namespaces whose operations the runtime dispatches through a vtable, and
+// The builtin namespaces whose operations the runtime dispatches through a vtable, and
 // the one operation whose slot answers a nullable text where the call answers an Option.
 let NS_IO = "io"
 let NS_ENV = "env"
+let NS_TIME = "time"
 let ENV_VAR = "var"
+let TIME_READ = "read"
 
 // The carrier member an Option payload lands in; the printer designates it by this name.
 let CARRIER_VALUE = "value"
@@ -1242,12 +1244,12 @@ fn slot_read(node: Int, handler_tid: Int) -> Int ! Diag.Report {
 // producer, so the namespace a caller writes and the field the vector holds cannot drift
 // apart without a report.
 fn builtin_handler_tid(ns: Str, node: Int) -> Int ! Diag.Report {
-    let root = if ns == NS_IO { "IO" } else if ns == NS_ENV { "Env" } else { "" }
+    let root = if ns == NS_IO { "IO" } else if ns == NS_ENV { "Env" } else if ns == NS_TIME { "Time" } else { "" }
     let tid = if root == "" { -1 } else { make_handler_type(root) }
     if tid < 0 || c_ev_field_name(tid) != ns {
         diag_ice_at("BuiltinNamespaceNotAnEffect", UNSOLVED_TYPEVAR_AT_CODEGEN,
             "namespace '{ns}' owns no field of the evidence vector", node,
-            "only the io and env namespaces perform through the vector; this is a compiler bug")
+            "only the io, env and time namespaces perform through the vector; this is a compiler bug")
         return -1
     }
     tid
@@ -1301,6 +1303,44 @@ pub fn cg_eff_lower_builtin_perform(node: Int, ns: Str, method: Str) -> Int ! Di
             perform
         }
     }
+}
+
+// time.read and time.sleep, reached through the same vtable-slot road as
+// cg_eff_lower_builtin_perform, but not through it: cg_call.bl's lower_time_call checks
+// time.sleep's argument count before calling here (typecheck's time.sleep arm types the
+// call as Void without the generic namespace-intrinsic arity check every other namespace
+// intrinsic gets), so this function can assume the argument list it is handed is already
+// right-sized. Instant and Duration are runtime-owned (LO_FACT_RUNTIME_OWNED,
+// src/layout.bl), so their own tid-native C spelling already matches the vtable's
+// read/sleep signatures, and both operations pass their value straight through with no
+// field copy on the way in or out.
+pub fn cg_eff_lower_time_perform(node: Int, method: Str) -> Int ! Diag.Report {
+    let slot = c_builtin_effect_slot(NS_TIME, method)
+    if diag_is_ice_seg(slot) {
+        diag_ice_at("BuiltinEffectOpNotASlot", CODEGEN_STAGE_NOT_BUILT,
+            "'{NS_TIME}.{method}' is no slot of the runtime's {NS_TIME} vtable", node,
+            "the runtime dispatches time.read and time.sleep through a vtable; nothing else performs here")
+        return -1
+    }
+    let handler_tid = builtin_handler_tid(NS_TIME, node)
+    if handler_tid < 0 { return -1 }
+    let read = slot_read(node, handler_tid)
+    if read < 0 { return -1 }
+
+    if method == TIME_READ {
+        let instant_tid = tid_of_node(node)
+        if instant_tid < 0 { return -1 }
+        let instant_rec = perform_layout(instant_tid, Position.Local, node)
+        if instant_rec.c_spelling == "" { return -1 }
+        return ir_effect_perform(instant_tid, node, instant_rec.c_spelling, slot, instant_rec.slot_form, read, [])
+    }
+
+    let written = node_args(node)
+    let dur_arg = lower_expr(sublist_get(written, 0))
+    if dur_arg < 0 { return -1 }
+    let void_rec = perform_layout(tc_void_tid(), Position.Local, node)
+    if void_rec.c_spelling == "" { return -1 }
+    ir_effect_perform(tc_void_tid(), node, void_rec.c_spelling, slot, SlotForm.Inline, read, [dur_arg])
 }
 
 // Every io argument rendered to text. The kinds are read before any argument is lowered,
