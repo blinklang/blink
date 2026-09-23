@@ -417,6 +417,48 @@ fn cc_assert_not_lowered(node: Int, name: Str) -> Int ! Diag.Report {
     -1
 }
 
+// `alloc_ptr[T]()` and `null_ptr[T]()` name themselves in `is_builtin_fn`, but typecheck
+// stamps both calls `Ptr[metavar]` and never binds the metavar: `infer_type_uncached`
+// returns `make_ptr_type(make_metavar())` unconditionally for these two names, unlike the
+// FfiScope arm right next to it, which reads the very same call site's expected type back
+// through `tc_ffi_alloc_hint_tid` for `scope.alloc`/`scope.alloc_n`. So even the call shape
+// the compiler's own CallSiteTypeArgs error recommends ("annotate the binding, as in
+// `let p: Ptr[Int] = scope.alloc()`") leaves alloc_ptr/null_ptr's own tid an unbound
+// metavar by the time this stage reads it, and `layout_of` declines every one of them with
+// "unbound metavariable" — a codegen-side lowering cannot repair a type nothing ever
+// bound. That gap is typecheck's, not this file's: it needs a fix in
+// `infer_type_uncached`'s alloc_ptr/null_ptr arms, mirroring the FfiScope arm's hint read,
+// before either constructor has anything for `tid_of_node` to hand this stage. Once it
+// does, the lowering itself is the same shape as `cc_lower_scope_alloc` just above:
+// `tc_resolve(tid_of_node(node))` for the resolved `Ptr[T]`, `tc_tid_child` for `T`,
+// `cc_local` for both layouts, `ir_const(..., "NULL")` for null_ptr, and
+// `ir_call_runtime(..., c_runtime_helper("alloc"), [sizeof-literal])` for alloc_ptr —
+// never a placeholder tid, never a C type spelled through `c_runtime_helper`.
+fn cc_is_ptr_ctor(name: Str) -> Bool {
+    name == "alloc_ptr" || name == "null_ptr"
+}
+
+fn cc_ptr_ctor_not_lowered(node: Int, name: Str) -> Int ! Diag.Report {
+    diag_ice_at("PtrCtorLoweringNotBuilt", CODEGEN_STAGE_NOT_BUILT,
+        "{name} has no lowering", node,
+        "typecheck stamps this call's pointee an unbound metavar; it needs the same context hint scope.alloc already reads before this stage can spell a type for it")
+    -1
+}
+
+// `skip(reason)` is not a value-producing call at all: gen0 lowered it as an early return
+// out of the enclosing test body plus an arena-unwind, with the runtime call
+// (`__blink_test_set_skipped`) riding along as one step inside that composition. That
+// composition is a statement-position form cg_stmt builds, not a call this stage's
+// value-producing machinery can express — the same gap `cc_assert_not_lowered` names for
+// the assert family, so `skip` gets the same named refusal rather than a workaround forced
+// through this file's call table.
+fn cc_skip_not_lowered(node: Int) -> Int ! Diag.Report {
+    diag_ice_at("SkipLoweringNotBuilt", CODEGEN_STAGE_NOT_BUILT,
+        "skip has no lowering", node,
+        "skip is an early-return-plus-arena-unwind composition cg_stmt builds; this stage only resolves the free-function name")
+    -1
+}
+
 // One owner for reading an element out of a container: `[i]`, which answers the element
 // type, and `.get(i)`, which answers an Option over it. Only the index is routed here yet;
 // the checked read keeps its arm so that the refusal names the right gap when it is.
@@ -848,6 +890,8 @@ fn lower_builtin_free_call(node: Int, name: Str) -> Int ! Diag.Report {
         return cc_build_call(node, symbol, NO_RECEIVER, CallForm.Runtime, false)
     }
     if cc_is_assert_family(name) { return cc_assert_not_lowered(node, name) }
+    if cc_is_ptr_ctor(name) { return cc_ptr_ctor_not_lowered(node, name) }
+    if name == "skip" { return cc_skip_not_lowered(node) }
     let answer = tid_of_node(node)
     if answer < 0 { return -1 }
     let ctor = cc_runtime_ctor_symbol(cc_kind(answer), "new")

@@ -1,0 +1,80 @@
+// `alloc_ptr()`, `null_ptr()` and `skip(...)` are three of the names `is_builtin_fn` (in
+// typecheck.bl) recognises with no Blink declaration behind them. Before this file, all
+// three fell through cg_call's generic "cg_call closure values and compiler-provided calls
+// is not built" refusal — the same one a genuinely undeclared name reaches — which does not
+// say which of the many still-unbuilt free names a given failure means.
+//
+// None of the three can become a plain `cc_builtin_free_table` row:
+//   - `alloc_ptr`/`null_ptr` are generic over their pointee, and typecheck stamps both
+//     calls `Ptr[metavar]` without ever binding the metavar from the call site's context
+//     (unlike `scope.alloc`/`scope.alloc_n`, which read the same context back through
+//     `tc_ffi_alloc_hint_tid`). A codegen-side lowering cannot spell a C type for a
+//     metavar nothing ever bound, so both still ICE here — but each now names the real
+//     gap (typecheck's missing hint) instead of the borrowed, misleading one.
+//   - `skip` is not a value-producing call at all: it is an early-return-plus-arena-unwind
+//     statement composition, the same shape cg_stmt already owns for the assert family.
+//
+// These tests pin that each of the three now names its own gap by its own diagnostic code,
+// the same way the assert family already does one test suite over (test_cg_call_builtin_
+// free_fns.bl), so a future fix to either gap has a red test turning green to prove it by.
+
+import lower_test_helpers.{probe, rhs_of, let_node_of, assert_ice_saying}
+import parser.{node_kind, node_left, node_name, nodes}
+import ast.{NodeKind, nk_of}
+import cg_expr.{lower_expr}
+import std.io
+
+// A call written as a statement binds no name, so it is found by walking forward from a
+// binding the probe does name, exactly as the assert-family probe in
+// test_cg_call_builtin_free_fns.bl finds `assert(...)`.
+fn call_after(anchor: Str, name: Str) -> Int {
+    let mut i = let_node_of(anchor)
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.Call {
+            let callee = node_left(i)
+            if callee >= 0 && nk_of(node_kind(callee)) == NodeKind.Ident && node_name(callee) == name {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no call of '{name}' after '{anchor}'")
+    assert(false)
+    -1
+}
+
+fn src_ptr_ctors() -> Str {
+    #"fn main() {
+    let p: Ptr[Int] = alloc_ptr()
+    let n: Ptr[Int] = null_ptr()
+    let _keep = [p.is_null(), n.is_null()]
+}
+"#
+}
+
+fn src_skip() -> Str {
+    #"test "probe" {
+    let start = 0
+    skip("not ready")
+    let _keep = start
+}
+"#
+}
+
+test "alloc_ptr names its own gap instead of the generic closure-value refusal" {
+    probe("ptr_ctor_skip_alloc_ptr", src_ptr_ctors())
+    assert_ice_saying("alloc_ptr", lower_expr(rhs_of("p")),
+        "PtrCtorLoweringNotBuilt", "alloc_ptr has no lowering")
+}
+
+test "null_ptr names its own gap instead of the generic closure-value refusal" {
+    probe("ptr_ctor_skip_null_ptr", src_ptr_ctors())
+    assert_ice_saying("null_ptr", lower_expr(rhs_of("n")),
+        "PtrCtorLoweringNotBuilt", "null_ptr has no lowering")
+}
+
+test "skip names its own gap instead of the generic closure-value refusal" {
+    probe("ptr_ctor_skip_skip", src_skip())
+    assert_ice_saying("skip", lower_expr(call_after("start", "skip")),
+        "SkipLoweringNotBuilt", "skip has no lowering")
+}
