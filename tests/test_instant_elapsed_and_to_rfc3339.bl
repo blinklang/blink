@@ -8,8 +8,17 @@
 // dispatches through the ordinary nominal-method path; these two do not, and need cg_call
 // to cross the C-type boundary by hand.
 //
-// This file builds every receiver through Instant.from_epoch_secs so it proves the fix
-// with no dependency on the time.read intrinsic, which is a separate slice.
+// The first three tests build every receiver through Instant.from_epoch_secs, so they
+// prove the elapsed/to_rfc3339 fix with no dependency on the time.read/time.sleep
+// intrinsics below.
+//
+// time.read and time.sleep cross the same C-type boundary from the other side: the
+// runtime's Time vtable slots are declared `blink_instant_struct (*read)(void)` and
+// `void (*sleep)(blink_duration_struct d)` (bootstrap/runtime_core.h) -- the same two
+// runtime-owned structs, not the tid-native Instant/Duration -- so a perform through
+// them needs the identical field-copy dance in the opposite direction: read's raw
+// result is unpacked into a tid-native Instant, and sleep's tid-native Duration
+// argument is packed into a raw blink_duration_struct before the call.
 
 test "Instant.to_rfc3339 formats a fixed instant" {
     let fixed = Instant.from_epoch_secs(1735689600)
@@ -28,4 +37,25 @@ test "Instant.elapsed on a struct field receiver" {
     let holder = Instant.from_epoch_secs(1000)
     let el = holder.elapsed()
     assert(el.to_nanos() >= 0)
+}
+
+test "time.read returns a real Instant usable through the ordinary methods" {
+    let now = time.read()
+    assert(now.to_unix_secs() > 1600000000)
+    assert(now.elapsed().to_nanos() >= 0)
+}
+
+// A loose lower bound, not an exact one: the runtime rounds and the scheduler can run
+// late, but it can never run the sleep call as a no-op and still clear this bar.
+test "time.sleep pauses for roughly the requested duration" {
+    let before = time.read()
+    time.sleep(Duration.ms(20))
+    let after = time.read()
+    assert(after.since(before).to_ms() >= 15)
+}
+
+test "time.sleep returns Void and composes with time.read after it" {
+    time.sleep(Duration.ms(1))
+    let now = time.read()
+    assert(now.elapsed().to_nanos() >= 0)
 }
