@@ -7,7 +7,7 @@ import ir.{ir_dump, ir_reset, ir_verify}
 import parser.{nodes, node_kind, node_name, node_left}
 import ast.{NodeKind}
 import compiler.{compile_to_program}
-import diagnostics.{diag_reset}
+import diagnostics.{diag_reset, diag_count}
 import cg_stmt.{cg_stmt_reset, lower_fn}
 import cg_call.{cc_is_skip_call}
 
@@ -20,18 +20,22 @@ fn find_test(label: Str) -> Int {
     -1
 }
 
-// The lone `skip(...)` call node in the compiled program, or -1. Probes in this file
-// each compile exactly one such call.
-fn find_skip_call() -> Int {
+// The lone call to `name(...)` in the compiled program, or -1. Probes in this file each
+// compile exactly one such call.
+fn find_call_named(name: Str) -> Int {
     let mut i = 0
     while i < nodes.len() {
         if node_kind(i) == NodeKind.Call {
             let callee = node_left(i)
-            if callee >= 0 && node_kind(callee) == NodeKind.Ident && node_name(callee) == "skip" { return i }
+            if callee >= 0 && node_kind(callee) == NodeKind.Ident && node_name(callee) == name { return i }
         }
         i = i + 1
     }
     -1
+}
+
+fn find_skip_call() -> Int {
+    find_call_named("skip")
 }
 
 fn run_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
@@ -44,6 +48,17 @@ fn run_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     check_types(program)
     run_mono(program)
     let _ = fs.delete(path)
+}
+
+// Stops after typecheck, before mono/codegen ever runs — a mistyped shadowing call must
+// not reach either of those on a wrong answer neither of them is built to recover from.
+fn typecheck_probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    diag_reset()
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    diag_count
 }
 
 fn dump_of_test(label: Str) -> Str ! Diag.Report {
@@ -82,10 +97,9 @@ fn main() {}
     assert_eq(count_of(text, "(Return"), 1)
 }
 
-// A test file's own `fn skip` shadows the stdlib one, so a call to it must not be
-// intercepted as the test-skip intrinsic: neither the runtime skip-flag call nor the
-// early return the real intrinsic composes may appear. (It still lowers as a placeholder
-// rather than a real CallDirect, a separate, known, out-of-scope gap.)
+// A user's own fn shadowing a builtin's name is an ordinary declared call: it must lower
+// to a real CallDirect, never the runtime skip-flag call, the early return, or a Const 0
+// placeholder standing in for a call codegen dropped.
 test "a user's own fn named skip is an ordinary call, not the test intrinsic" {
     run_probe("build/cg_stmt_skip_user.bl", #"fn skip(reason: Str) {
     let _ = reason
@@ -99,4 +113,36 @@ fn main() {}
     let text = dump_of_test("probe")
     assert_eq(count_of(text, "__blink_test_set_skipped"), 0)
     assert_eq(count_of(text, "(Return"), 0)
+    assert_eq(count_of(text, "(CallDirect"), 1)
+    assert_eq(count_of(text, "(Const 0"), 0)
+}
+
+test "a user's own fn named getpid is an ordinary call, not the builtin" {
+    run_probe("build/cg_stmt_getpid_user.bl", #"fn getpid() -> Int {
+    7
+}
+test "probe" {
+    let _ = getpid()
+}
+fn main() {}
+"#)
+    let text = dump_of_test("probe")
+    assert_eq(count_of(text, "(CallDirect"), 1)
+    assert_eq(count_of(text, "(Const 0"), 0)
+}
+
+// typecheck's own dispatch (infer_type_uncached) must type a shadowing call against the
+// user's declared signature, not the builtin's: read_file's builtin answers Str, so a call
+// typed against the builtin here would mismatch the Int annotation and fail this probe.
+test "a user's own fn named read_file types against its own signature, not the builtin's" {
+    let errs = typecheck_probe("build/cg_stmt_read_file_user.bl", #"fn read_file(path: Str) -> Int {
+    7
+}
+test "probe" {
+    let n: Int = read_file("x")
+    let _ = n
+}
+fn main() {}
+"#)
+    assert_eq(errs, 0)
 }
