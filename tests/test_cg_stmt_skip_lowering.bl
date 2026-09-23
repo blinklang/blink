@@ -4,16 +4,31 @@ import typecheck.{check_types}
 import layout.{layout_reset}
 import mono.{run_mono}
 import ir.{ir_dump, ir_reset, ir_verify}
-import parser.{nodes, node_kind, node_name}
+import parser.{nodes, node_kind, node_name, node_left}
 import ast.{NodeKind}
 import compiler.{compile_to_program}
 import diagnostics.{diag_reset}
 import cg_stmt.{cg_stmt_reset, lower_fn}
+import cg_call.{cc_is_skip_call}
 
 fn find_test(label: Str) -> Int {
     let mut i = 0
     while i < nodes.len() {
         if node_kind(i) == NodeKind.TestBlock && node_name(i) == label { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// The lone `skip(...)` call node in the compiled program, or -1. Probes in this file
+// each compile exactly one such call.
+fn find_skip_call() -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.Call {
+            let callee = node_left(i)
+            if callee >= 0 && node_kind(callee) == NodeKind.Ident && node_name(callee) == "skip" { return i }
+        }
         i = i + 1
     }
     -1
@@ -61,7 +76,31 @@ test "probe" {
 }
 fn main() {}
 "#)
+    assert(cc_is_skip_call(find_skip_call()))
     let text = dump_of_test("probe")
     assert_eq(count_of(text, "__blink_test_set_skipped"), 1)
     assert_eq(count_of(text, "(Return"), 1)
+}
+
+// Identity is the resolved declaration, not the spelling: a test file's own `fn skip`
+// shadows the stdlib one, so a call to it must not be intercepted as the test-skip
+// intrinsic. That is what cg_call/cg_stmt owe here — neither the runtime skip-flag call
+// nor the early return the real intrinsic composes may appear. (Typecheck still resolves
+// this call's own type by the bare spelling "skip", ahead of any declaration lookup, so
+// the call's argument is not checked against the user fn's real signature and the call
+// itself does not yet lower as a normal CallDirect — a typecheck-side gap, not this
+// stage's; it does not reintroduce the silent-pass failure this test guards against.)
+test "a user's own fn named skip is an ordinary call, not the test intrinsic" {
+    run_probe("build/cg_stmt_skip_user.bl", #"fn skip(reason: Str) {
+    let _ = reason
+}
+test "probe" {
+    skip("not the intrinsic")
+}
+fn main() {}
+"#)
+    assert(!cc_is_skip_call(find_skip_call()))
+    let text = dump_of_test("probe")
+    assert_eq(count_of(text, "__blink_test_set_skipped"), 0)
+    assert_eq(count_of(text, "(Return"), 0)
 }
