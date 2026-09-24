@@ -1,0 +1,90 @@
+// assert_eq/assert_ne must hint a bare Ok/Err/None argument from its sibling
+// argument's type, the way check_arg_shapes hints a call argument from its
+// sibling parameter type.
+
+import compile_test_helpers.{compile_and_run}
+
+fn divide(a: Int, b: Int) -> Result[Int, Str] {
+    if b == 0 {
+        Err("division by zero")
+    } else {
+        Ok(a / b)
+    }
+}
+
+test "assert_eq binds a bare Ok's Err slot from its sibling Result argument" {
+    assert_eq(divide(10, 2), Ok(5))
+}
+
+test "assert_eq binds a bare Err's Ok slot from its sibling Result argument" {
+    assert_eq(divide(10, 0), Err("division by zero"))
+}
+
+fn find(x: Int) -> Option[Int] {
+    if x > 0 { Some(x) } else { None }
+}
+
+test "assert_eq binds a bare None's Some slot from its sibling Option argument" {
+    assert_eq(find(-1), None)
+}
+
+test "assert_ne binds a bare Ok's Err slot from its sibling Result argument" {
+    assert_ne(divide(10, 2), Err("nope"))
+}
+
+// A poly-impl method over List[T] must hint a bare-literal argument from the
+// receiver's own concrete element type, not the impl's raw unsubstituted type
+// parameter.
+
+trait KeepOne3[T] {
+    fn keep_one(self, x: T) -> T
+}
+
+impl[T] KeepOne3[T] for List[T] {
+    fn keep_one(self, x: T) -> T {
+        let y = x
+        y
+    }
+}
+
+test "poly-impl keep_one over Result[Int,Str] hints a bare Ok's Err slot from the receiver element" {
+    let xs: List[Result[Int, Str]] = [Ok(1)]
+    let w = xs.keep_one(Ok(7))
+    match w {
+        Ok(v) => { assert_eq(v, 7) }
+        Err(_e) => { assert(false) }
+    }
+}
+
+test "poly-impl keep_one over Result[Int,Str] hints a bare Err's Ok slot from the receiver element" {
+    let xs: List[Result[Int, Str]] = [Ok(1)]
+    let w = xs.keep_one(Err("boom"))
+    match w {
+        Ok(_v) => { assert(false) }
+        Err(e) => { assert_eq(e, "boom") }
+    }
+}
+
+// A free generic call's bookkeeping re-infers the same argument each pass, and
+// infer_type is not read-cached, so a nested bare Map() mints a fresh metavar
+// and ICEs at codegen; the reproducer runs as a separate compiled program.
+
+test.failing(
+    "free generic call reuses one inference of a struct-literal Map() argument",
+    reason: "check_arg_shapes, build_typevar_binds and tc_pin_generic_args_from_binds each independently call infer_type on the same call's arguments; infer_type is not read-cached, so the bare Map() nested in the struct-literal argument mints a fresh, unrelated metavar on every pass and only the last pass's generation survives in the node's memo",
+    ticket: "5y7k4f",
+) {
+    let src = #"
+type PayloadBox3[T] { value: T }
+fn unbox3[T](b: PayloadBox3[T]) -> T {
+    b.value
+}
+fn main() {
+    let mut m: Map[Int, Str] = unbox3(PayloadBox3 { value: Map() })
+    m.insert(256, "a")
+    assert(m.get(256).unwrap() == "a")
+}
+"#
+    let r = compile_and_run(src, "_question_op_binds_payload_type")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+}
