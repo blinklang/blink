@@ -503,6 +503,14 @@ pub fn cg_call_element_from_slot(node: Int, elem_tid: Int, raw: Int) -> Int ! Di
     cg_call_decode_element(node, elem_tid, shape, raw)
 }
 
+// One element entering a container slot, for a caller that holds the value rather than an
+// expression node. It asks the same shape the read above asks, so the two stay in step.
+pub fn cg_call_element_to_slot(node: Int, elem_tid: Int, value: Int) -> Int ! Diag.Report {
+    let shape = cc_element_shape(node, elem_tid)
+    if cc_shape_stopped(shape) { return -1 }
+    cc_into_slot(node, shape, value)
+}
+
 // ── Element shape ─────────────────────────────────────────────────────────
 
 // What one element IS once it sits in a container slot. A slot is one machine word, so a
@@ -1953,6 +1961,8 @@ fn lower_declared_static_call(node: Int, owner: Str, method: Str) -> Int ! Diag.
         if owning_impl >= 0 { return cc_impl_static_call(node, owning_impl, method) }
         return cc_free_call(node, decl)
     }
+    let derived = cc_derived_static_symbol(owner, method)
+    if derived != "" { return cc_build_call(node, derived, NO_RECEIVER, CallForm.Declared, false) }
     if cc_is_conversion(method) { return cc_conversion_call(node, owner, method) }
     if cc_impls_declaring(owner, method) > 1 { return cc_static_impl_ambiguous(node, owner, method) }
     diag_ice_stage_not_built("cg_call static call '{owner}.{method}'", node)
@@ -2697,7 +2707,22 @@ fn cc_derived_method_symbol(recv_tid: Int, mname: Str) -> Str {
         if !cc_derives_equality(decl) { return "" }
         return c_derive_method_name(decl, "eq")
     }
+    if mname == "to_json" {
+        if !decl_has_derive(decl, "Serialize") { return "" }
+        return c_derive_method_name(decl, "to_json")
+    }
     ""
+}
+
+// The static twin of cc_derived_method_symbol: a derived from_json is called on the type,
+// not on a value, and has no impl block for the static rungs above to find.
+fn cc_derived_static_symbol(owner: Str, method: Str) -> Str {
+    if method != "from_json" { return "" }
+    let tid = lookup_named_type(owner)
+    if tid < 0 { return "" }
+    let decl = tc_tid_decl_node(tid)
+    if decl < 0 || !decl_has_derive(decl, "Deserialize") { return "" }
+    c_derive_method_name(decl, "from_json")
 }
 
 // A free function named by convention after its receiver's declared type: `{Type}_{method}`.
@@ -4419,6 +4444,29 @@ fn cc_stdlib_fn_named(node: Int, module: Str, name: Str) -> Int ! Diag.Report {
         "module '{module}' declares '{name}' more than once, so the intrinsic names neither", node,
         "an intrinsic must name one declaration; a module has to keep its own names apart")
     DECL_REFUSED
+}
+
+// Whether a module declares a function at all. A derive whose body calls a module the
+// program never imported asks this first, so it can name the missing import.
+pub fn cg_call_stdlib_declares(module: Str, name: Str) -> Bool {
+    for f in cg_reg_fn_decls() {
+        if node_name(f) == name && node_source_module(f) == module { return true }
+    }
+    false
+}
+
+// The C symbol of a concrete stdlib function a derived body calls, or "" after an internal
+// error. The body has no evidence vector to pass, so a callee that takes one is refused.
+pub fn cg_call_stdlib_symbol(node: Int, module: Str, name: Str) -> Str ! Diag.Report {
+    let decl = cc_stdlib_fn_named(node, module, name)
+    if decl == DECL_REFUSED { return "" }
+    if decl < 0 || cg_decl_takes_ev(decl) {
+        diag_ice_at("DerivedStdlibCalleeUnusable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "module '{module}' has no plain function '{name}' for a derived body to call", node,
+            "the derive and the standard library have to name the same function")
+        return ""
+    }
+    cc_call_symbol(node, decl, c_fn_decl_name(decl))
 }
 
 // A row that does not spell a module and a name. Every row is written in this file, so

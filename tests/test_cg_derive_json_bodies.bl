@@ -1,0 +1,270 @@
+// The C a @derive(Serialize) or @derive(Deserialize) type gets. A product type writes a
+// JSON object keyed by its field names, a payload-less enum writes its variant name (or
+// its backing string) as a JSON string, and a data-carrying variant writes an object whose
+// "type" key names the variant.
+//
+// Reading JSON back never guesses: a field that is missing or holds the wrong JSON type is
+// an Err, never a zero value.
+
+import std.io
+import layout.{layout_reset}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build, cg_reg_type_decls}
+import cg_derive.{cg_derive_reset, cg_derive_emit_decls, cg_derive_emit_bodies}
+import cg_call.{cg_call_element_to_slot}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_saying}
+import diagnostics.{CODEGEN_STAGE_NOT_BUILT_NAME}
+import typecheck.{TYPE_INT, TYPE_STR}
+import ir.{ir_const}
+import lower_test_helpers.{assert_shape}
+
+// User is the four scalars, Address and Person nest a type and hold a list, Color rides
+// its tag alone, Priority is backed by strings, and Shape carries a payload beside a unit
+// variant.
+fn json_src() -> Str {
+    #"import std.json
+@derive(Serialize, Deserialize)
+type User { name: Str, age: Int, score: Float, active: Bool }
+@derive(Serialize, Deserialize)
+type Address { city: Str, zip: Str }
+@derive(Serialize, Deserialize)
+type Person { name: Str, address: Address, tags: List[Str], counts: List[Int] }
+@derive(Serialize, Deserialize)
+type Color { Red, Green, Blue }
+@derive(Serialize, Deserialize)
+type Priority {
+    Low = "low"
+    High = "high"
+}
+@derive(Serialize, Deserialize)
+type Shape {
+    Circle(radius: Float)
+    Point
+}
+fn main() { }
+"#
+}
+
+// Compiling resets the diagnostic counters, so a test that counts what this stage
+// records must read the counters after the probe is built, never before it.
+fn program_of(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let program = cg_probe_compile("build/{stem}_probe_src.bl", src)
+    layout_reset()
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_derive_reset()
+    program
+}
+
+fn bodies_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _p = program_of(stem, src)
+    cg_derive_emit_bodies(cg_reg_type_decls())
+    print_take()
+}
+
+fn decls_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _p = program_of(stem, src)
+    cg_derive_emit_decls(cg_reg_type_decls())
+    print_take()
+}
+
+fn refusals_saying(stem: Str, src: Str, name: Str, marker: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _p = program_of(stem, src)
+    cg_derive_emit_bodies(cg_reg_type_decls())
+    cg_probe_ices_saying(name, marker)
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output still has '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+// The C of one function, from its opening line to the brace that closes it in column
+// zero. A needle checked against the whole unit would match another function's body.
+fn one_fn(text: Str, head: Str) -> Str {
+    let start = text.index_of(head)
+    if start < 0 { io.println("FAIL: output has no '{head}'\n--- output ---\n{text}") }
+    assert(start >= 0)
+    let rest = text.substring(start, text.len() - start)
+    let end = rest.index_of("\n}")
+    assert(end >= 0)
+    rest.substring(0, end)
+}
+
+// ── Serialize ────────────────────────────────────────────────────────────
+
+test "a derived to_json takes one value of its own type and answers a string" {
+    assert_has(bodies_of("cg_derive_json", json_src()), #"const char* blink_User_to_json(blink_User self) {"#)
+}
+
+// One formatter call writes the whole object. A string goes through the one JSON escaper
+// the stdlib owns, and a Float through the language's own Float text.
+test "a product type writes one JSON object keyed by its field names" {
+    let text = one_fn(bodies_of("cg_derive_json", json_src()), "const char* blink_User_to_json")
+    assert_has(text, #"blink_str_format("{\"name\":%s,\"age\":%lld,\"score\":%s,\"active\":%s}""#)
+    assert_has(text, "json_escape_str(self.name)")
+    assert_has(text, "((long long)(self.age))")
+    assert_has(text, "float_to_str(self.score)")
+    assert_has(text, #" = "false";"#)
+    assert_has(text, #"if (self.active) {"#)
+}
+
+test "a nested derived field is written by calling the nested to_json" {
+    let text = one_fn(bodies_of("cg_derive_json", json_src()), "const char* blink_Person_to_json")
+    assert_has(text, #"\"address\":%s"#)
+    assert_has(text, "blink_Address_to_json(self.address)")
+}
+
+// A list is written element by element into a JSON array, with a comma before every
+// element but the first.
+test "a list field is written as a JSON array one element at a time" {
+    let text = one_fn(bodies_of("cg_derive_json", json_src()), "const char* blink_Person_to_json")
+    assert_has(text, "blink_list_len(")
+    assert_has(text, "blink_list_get(")
+    assert_has(text, "blink_str_concat(")
+    assert_has(text, #""[""#)
+    assert_has(text, #""]""#)
+    assert_has(text, #"",""#)
+}
+
+test "a payload-less enum writes its variant name as a JSON string" {
+    let text = one_fn(bodies_of("cg_derive_json", json_src()), "const char* blink_Color_to_json")
+    assert_has(text, "blink_Color_Green")
+    assert_has(text, #"json_escape_str("Green")"#)
+    assert_lacks(text, "blink_str_format")
+}
+
+test "a string-backed enum writes its backing string rather than its variant name" {
+    let text = one_fn(bodies_of("cg_derive_json", json_src()), "const char* blink_Priority_to_json")
+    assert_has(text, #"json_escape_str("low")"#)
+    assert_lacks(text, #"json_escape_str("Low")"#)
+}
+
+test "a data-carrying variant writes an object whose type key names the variant" {
+    let text = one_fn(bodies_of("cg_derive_json", json_src()), "const char* blink_Shape_to_json")
+    assert_has(text, #"{\"type\":\"Circle\",\"radius\":%s}"#)
+    assert_has(text, "float_to_str(self.data.Circle.radius)")
+    assert_has(text, #"return "{\"type\":\"Point\"}";"#)
+}
+
+test "an enum whose tag matches no variant panics instead of writing a fallback" {
+    let text = one_fn(bodies_of("cg_derive_json", json_src()), "const char* blink_Shape_to_json")
+    assert_has(text, "@derive(Serialize) on Shape met a tag no variant declares")
+    assert_lacks(text, "null")
+}
+
+// ── Deserialize ──────────────────────────────────────────────────────────
+
+// from_json parses once and hands the root to a per-type node reader, so a nested type
+// reads its own subtree instead of parsing its text again.
+test "from_json parses its input and reads the root through the node reader" {
+    let text = one_fn(bodies_of("cg_derive_json", json_src()), #" blink_User_from_json(const char* input) {"#)
+    assert_has(text, "json_clear(")
+    assert_has(text, "json_parse(input)")
+    assert_has(text, #""JSON parse error""#)
+    assert_has(text, "blink_User_from_json_node(")
+}
+
+test "a field that is missing or holds the wrong JSON type is an error, not a zero" {
+    let text = one_fn(bodies_of("cg_derive_json", json_src()), #" blink_User_from_json_node(int64_t idx) {"#)
+    assert_has(text, #"json_get(idx, "name")"#)
+    assert_has(text, "json_type(")
+    assert_has(text, #"field 'age' is missing or holds the wrong JSON type"#)
+    assert_has(text, "json_as_str(")
+    assert_has(text, "json_as_int(")
+    assert_has(text, "json_as_bool(")
+    assert_lacks(text, "memset")
+}
+
+test "a nested field is read through the nested type's own node reader" {
+    let text = one_fn(bodies_of("cg_derive_json", json_src()), #" blink_Person_from_json_node(int64_t idx) {"#)
+    assert_has(text, "blink_Address_from_json_node(")
+    assert_lacks(text, "memset")
+}
+
+test "a list field is read from a JSON array one element at a time" {
+    let text = one_fn(bodies_of("cg_derive_json", json_src()), #" blink_Person_from_json_node(int64_t idx) {"#)
+    assert_has(text, "blink_list_new()")
+    assert_has(text, "json_len(")
+    assert_has(text, "json_at(")
+    assert_has(text, "blink_list_push(")
+}
+
+test "a payload-less enum reads its variant name and refuses any other string" {
+    let text = one_fn(bodies_of("cg_derive_json", json_src()), #" blink_Color_from_json_node(int64_t idx) {"#)
+    assert_has(text, "blink_str_eq(")
+    assert_has(text, #""Green""#)
+    assert_has(text, "blink_Color_Green")
+    assert_has(text, #""unknown enum variant""#)
+}
+
+test "a string-backed enum reads its backing string" {
+    let text = one_fn(bodies_of("cg_derive_json", json_src()), #" blink_Priority_from_json_node(int64_t idx) {"#)
+    assert_has(text, #""low""#)
+    assert_lacks(text, #""Low""#)
+}
+
+test "a data-carrying enum reads its type key before any payload" {
+    let text = one_fn(bodies_of("cg_derive_json", json_src()), #" blink_Shape_from_json_node(int64_t idx) {"#)
+    assert_has(text, #"json_get(idx, "type")"#)
+    assert_has(text, #""missing type discriminator""#)
+    assert_has(text, #"json_get(idx, "radius")"#)
+    assert_has(text, "blink_Shape_Circle_TAG")
+}
+
+// The declaration pass writes signatures only, and the Result a from_json answers is
+// spelled only by that signature, so its typedef has to come out ahead of it.
+test "the declaration pass writes every json signature and no body" {
+    let text = decls_of("cg_derive_json_decls", json_src())
+    assert_has(text, "const char* blink_User_to_json(blink_User self);")
+    assert_has(text, " blink_User_from_json(const char* input);")
+    assert_has(text, " blink_User_from_json_node(int64_t idx);")
+    let head = text.index_of(" blink_User_from_json(const char* input);")
+    let typedef = text.index_of("typedef struct")
+    assert(typedef >= 0 && typedef < head)
+    assert_lacks(text, "blink_str_format")
+}
+
+// The node reader calls std.json, and a program that does not import it has no such
+// functions to call. The refusal names the import rather than writing a call nothing
+// defines.
+test "a Deserialize with no std.json import is refused and names the import" {
+    let src = #"@derive(Deserialize)
+type Tag { name: Str }
+fn main() { }
+"#
+    assert(refusals_saying("cg_derive_json_noimport", src, CODEGEN_STAGE_NOT_BUILT_NAME, "import std.json") >= 1)
+}
+
+// A generic type has one body per instance, which this stage does not write yet.
+test "a generic Serialize type is still refused rather than written once" {
+    let src = #"@derive(Serialize)
+type Box[T] { v: T }
+fn main() { }
+"#
+    assert(refusals_saying("cg_derive_json_generic", src, CODEGEN_STAGE_NOT_BUILT_NAME, "@derive(Serialize) on the generic type 'Box'") == 1)
+}
+
+// ── The element store seam ───────────────────────────────────────────────
+
+// A list read back from JSON stores each element through the same shape the element read
+// uses, so a store and a read cannot disagree about what a slot holds.
+test "the element store seam converts a word element to the slot type" {
+    let p = program_of("cg_derive_json_store", json_src())
+    let word = cg_call_element_to_slot(p, TYPE_INT, ir_const(TYPE_INT, p, "int64_t", "7"))
+    assert(word >= 0)
+    assert_shape("int element", word, "Cast(Cast(Const))")
+    let text = cg_call_element_to_slot(p, TYPE_STR, ir_const(TYPE_STR, p, "const char*", "\"a\""))
+    assert(text >= 0)
+    assert_shape("str element", text, "Cast(Const)")
+}
