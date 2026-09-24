@@ -19,8 +19,9 @@ import cname.{
 }
 import ast.{NodeKind, nk_of}
 import parser.{
-    ann_str_val, node_args, node_handlers, node_int_val, node_kind, node_name, node_str_val,
-    node_value, node_xfail_reason, node_xfail_ticket, sublist_get, sublist_length,
+    ann_str_val, node_args, node_body, node_handlers, node_int_val, node_kind, node_name,
+    node_str_val, node_value, node_value_child_ids, node_xfail_reason, node_xfail_ticket,
+    sublist_get, sublist_length,
 }
 import layout.{Position, layout_of, layout_reset, set_current_inst}
 import cg_print.{
@@ -329,6 +330,38 @@ fn methods_in_scope(cfg: CgConfig, module_key: Str, shared: Bool, declare_only: 
     out
 }
 
+// Whether `id`'s own subtree holds a node of `kind`, walked through node_value_child_ids —
+// every child a pass must not miss, per its own doc comment in ast.bl — so a scope buried
+// inside a closure, an if, or a match arm is still found.
+fn subtree_has_kind(id: Int, kind: NodeKind) -> Bool {
+    if id < 0 { return false }
+    if nk_of(node_kind(id)) == kind { return true }
+    for child in node_value_child_ids(id) {
+        if subtree_has_kind(child, kind) { return true }
+    }
+    false
+}
+
+// Whether this unit will lower an AsyncScope, answered ahead of emit_definitions rather
+// than by the lowering itself: emit_definitions fuses lowering with printing one body at a
+// time, and print_with_scope checks the guard support is already registered the moment it
+// prints a scope's guard, so the driver cannot wait for lowering to reach the first one.
+// Tests are scanned only for the unit that will also call emit_entry — see its callers.
+fn unit_uses_async_scope(fns: List[Int], methods: List[Int], include_tests: Bool) -> Bool {
+    for f in fns {
+        if subtree_has_kind(node_body(f), NodeKind.AsyncScope) { return true }
+    }
+    for m in methods {
+        if subtree_has_kind(node_body(m), NodeKind.AsyncScope) { return true }
+    }
+    if include_tests {
+        for t in cg_reg_test_decls() {
+            if subtree_has_kind(node_body(t), NodeKind.AsyncScope) { return true }
+        }
+    }
+    false
+}
+
 // One declaration's body, or the report that names the stage which would write it. A
 // unit that leaves a body out links as an undefined symbol at best, so every gap is
 // named here rather than discovered by the linker. A binding that needs no wrapper is the
@@ -586,7 +619,15 @@ pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
     let deferred = emit_declarations(cfg, "", "", true, false, shared)
     print_scope_restore_support()
     cg_eff_register_ffi_scope_guard_support()
-    cg_eff_register_async_scope_guard_support()
+    // An archive monolith has no entry point, so it never reaches emit_entry, which is
+    // where a test body would lower; a single-unit program always does. See
+    // cg_eff_register_async_scope_guard_support for why this must be answered before
+    // emit_definitions rather than by the lowering itself.
+    let fns = fns_in_scope(cfg, "", shared, false)
+    let methods = methods_in_scope(cfg, "", shared, false)
+    if unit_uses_async_scope(fns, methods, !shared) {
+        cg_eff_register_async_scope_guard_support()
+    }
     cg_stmt_set_debug_mode(cfg.debug_mode != 0)
     emit_definitions(cfg, "", shared)
     // An archive monolith has no entry point: the user TU that links against it owns
@@ -660,7 +701,15 @@ pub fn generate_module_object(program: Int, module_key: Str, self_header: Str, c
     }
     print_scope_restore_support()
     cg_eff_register_ffi_scope_guard_support()
-    cg_eff_register_async_scope_guard_support()
+    // Only the entry module reaches emit_entry, where a test body would lower; scanning
+    // every other module's tests too would ask gen0 to declare a symbol that module's own
+    // TU never ends up printing a call to.
+    let shared = cfg.archive_build_mode != 0
+    let fns = fns_in_scope(cfg, module_key, shared, false)
+    let methods = methods_in_scope(cfg, module_key, shared, false)
+    if unit_uses_async_scope(fns, methods, module_key == "__main__") {
+        cg_eff_register_async_scope_guard_support()
+    }
     cg_stmt_set_debug_mode(cfg.debug_mode != 0)
     emit_definitions(cfg, module_key, cfg.archive_build_mode != 0)
     if module_key == "__main__" { emit_entry(cfg, module_init_fn_names(cfg, module_key, deferred)) }

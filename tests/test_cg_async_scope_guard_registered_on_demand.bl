@@ -1,0 +1,95 @@
+// The async.scope guard support (the drain runner cg_eff_register_async_scope_guard_support
+// prints) names blink_async_scope_drain, a runtime function added during the codegen
+// rewrite. The pinned gen0 this tree bootstraps with predates it, so a unit that prints the
+// guard unconditionally hands gen0's cc an implicit declaration the moment that unit has no
+// other reason to declare it. cg_eff_uses_async_scope answers whether lower_async_scope
+// actually ran for this unit, and the driver registers the guard only when it did.
+//
+// A program with no async.scope must therefore never mention blink_async_scope_drain at
+// all; one that does use async.scope must still get the guard, standing ahead of the
+// definition that relies on it.
+import std.fs
+import std.io
+import layout.{layout_reset}
+import cname.{cname_reset}
+import cg_test_helpers.{cg_probe_compile}
+import cg.{CgConfig, generate}
+import mono.{run_mono}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output must not have '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output must have '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    let program = cg_probe_compile(path, src)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    program
+}
+
+fn plain_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+fn no_scope_src() -> Str {
+    #"fn add(a: Int, b: Int) -> Int { a + b }
+
+fn main() {
+    let x = add(1, 2)
+    io.println("{x}")
+}
+"#
+}
+
+fn with_scope_src() -> Str {
+    #"fn compute() -> Int {
+    async.scope {
+        let h = async.spawn(fn() { 41 })
+        h.await + 1
+    }
+}
+
+fn main() {
+    let x = compute()
+    io.println("{x}")
+}
+"#
+}
+
+test "a unit with no async.scope never mentions the drain runner gen0 cannot declare" {
+    let program = build_probe(no_scope_src(), "cg_async_scope_guard_absent_probe")
+    let text = generate(program, plain_cfg())
+    assert_lacks(text, "blink_async_scope_drain")
+}
+
+test "a unit that uses async.scope gets the drain runner, and the C it prints still compiles" {
+    let program = build_probe(with_scope_src(), "cg_async_scope_guard_present_probe")
+    let text = generate(program, plain_cfg())
+    assert_has(text, "blink_async_scope_drain")
+
+    let c_path = "build/cg_async_scope_guard_present_probe.c"
+    write_file(c_path, text)
+    let log = "build/cg_async_scope_guard_present_probe.log"
+    let rc = shell_exec("cc -std=c11 -fsyntax-only -Ibootstrap {c_path} > {log} 2>&1")
+    if rc != 0 {
+        io.println("FAIL: the C compiler rejected the unit:")
+        io.println(read_file(log))
+    }
+    assert_eq(rc, 0)
+    let _ = fs.delete(c_path)
+    let _ = fs.delete(log)
+}
