@@ -450,6 +450,12 @@ fn lower_ident(node: Int) -> Int ! Diag.Report {
     if decl >= 0 {
         return ir_global_ref(tid, node, rec.c_spelling, c_global_name(decl), rec.slot_form)
     }
+    // A bare unit variant (`LZero`, or `Map` shadowing the builtin ctor) is neither a
+    // binder nor a global; typecheck settled which enum it means by writing the enum's
+    // tid onto this node, so read the variant off that tid the same way a qualified
+    // `Type.Variant` reads it off the type name.
+    let bare_vd = x_bare_variant_decl(tid, name)
+    if bare_vd >= 0 { return x_variant_from_decl(node, bare_vd) }
     // Typecheck already refused an undefined name, so a name with no binder and no resolved
     // global is a binder the statement stage never recorded, or one it recorded with no
     // type. Spelling it as a local would emit a C identifier no declaration introduces, and
@@ -1400,11 +1406,17 @@ fn x_variant_of(node: Int, obj: Int) -> Int {
 }
 
 fn x_variant_const(node: Int, obj: Int) -> Int ! Diag.Report {
+    x_variant_from_decl(node, x_variant_of(node, obj))
+}
+
+// Builds a payload-less variant value from its declaration node. `Colour.Red` and a bare
+// `Red` (no qualifier, resolved by typecheck to the same enum) are the same value and must
+// emit identical code, so both callers land here.
+fn x_variant_from_decl(node: Int, vd: Int) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
-    let vd = x_variant_of(node, obj)
     let macro = c_variant_discriminant(tid, vd)
     if diag_is_ice_seg(macro) { return x_unhandled(node) }
     // An enum whose every variant carries nothing is one ordinal word, so the tag macro is
@@ -1416,6 +1428,17 @@ fn x_variant_const(node: Int, obj: Int) -> Int ! Diag.Report {
     if x_stopped(tag_rec) { return -1 }
     ir_enum_new(tid, node, rec.c_spelling, vd, "",
         ir_const(TYPE_INT, node, tag_rec.c_spelling, macro), [])
+}
+
+// A bare unit variant used as a value (`let l = LZero`) carries no qualifier and no `obj`
+// node for x_variant_of to read, but typecheck already settled which enum it means: the
+// node's own tid. Read the variant off that tid instead of the type-name lookup the
+// qualified path uses.
+fn x_bare_variant_decl(tid: Int, name: Str) -> Int {
+    if x_kind(tid) != TyKind.Enum { return -1 }
+    let decl = tc_tid_decl_node(tid)
+    if decl < 0 { return -1 }
+    x_variant_decl(decl, name)
 }
 
 fn x_variant_decl(decl: Int, name: Str) -> Int {
