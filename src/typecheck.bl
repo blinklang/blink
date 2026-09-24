@@ -4456,6 +4456,21 @@ fn tc_raw_report_unconsumed() ! Diag.Report {
 // writes cumulative inference state that is intended to persist, not roll back.
 @allow(UnrestoredMutation)
 fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int, call_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let no_binds: Map[Str, Int] = Map()
+    check_arg_shapes_with_binds(fn_name, sig, args_sl, self_offset, call_node, no_binds)
+}
+
+// Same as check_arg_shapes, but substitutes each param tid through `binds` before
+// seeding tc_construct_hint.
+//
+// A poly-impl method on List[T] has to hint a bare Ok/Err/None/Map()/Set() argument
+// from the RECEIVER's concrete element type, not from the impl's own unsubstituted
+// Typevar(T) -- tc_carrier_slot_from_hint correctly declines a typevar hint (wrong
+// kind), so without this the argument mints an unbound metavar nothing ever binds.
+// An empty `binds` makes this byte-identical to plain check_arg_shapes
+// (substitute_typevar_tid is a no-op when nothing in `binds` names the typevar).
+@allow(UnrestoredMutation)
+fn check_arg_shapes_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int, call_node: Int, binds: Map[Str, Int]) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // Every call against a declared signature reaches here, which is what makes the keyword
     // rules hold for `b.f(x: 1)` and not only for `f(x: 1)`. Before the args_sl == -1 return:
     // a call with no arguments at all still owes a signature its keyword arguments.
@@ -4476,7 +4491,7 @@ fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int, call
             pidx = tc_fnsig_param_index_by_name(param_start, param_count, self_offset, node_name(arg_node))
         }
         if pidx >= 0 && pidx < param_count {
-            let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
+            let ptid = substitute_typevar_tid(fnsig_param_list.get(param_start + pidx).unwrap(), binds)
             if tc_tid_is_no_info(ptid) == 0 {
                 tc_seed_expected_into_value(arg_node, ptid)
                 let saved_hint = tc_construct_hint
@@ -14887,6 +14902,27 @@ fn tc_container_slot_from_hint(want: TyKind, slot: Int) -> Int {
     s
 }
 
+// assert_eq(a, b) / assert_ne(a, b) are builtins, checked by a plain per-argument
+// loop with no cross-argument relationship at all -- unlike an ordinary call,
+// where check_arg_shapes hints one argument from its sibling PARAMETER type. A
+// bare Ok/Err/None/Map()/Set() argument here mints a fresh metavariable for the
+// slot it does not itself spell, and nothing ever told it what that slot is.
+//
+// Unifying both inferred types against each other after inferring them, rather
+// than seeding tc_construct_hint before either descent, is symmetric: either
+// argument may be the bare literal (`assert_eq(r, Ok(5))` or `assert_eq(Ok(5),
+// r)`), and tc_unify already walks a Result/Option/Map/Set structurally and
+// binds whichever side still carries an unbound metavar from the other,
+// concrete side.
+fn tc_infer_assert_eq_args(args_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let arg0 = sublist_get(args_sl, 0)
+    let arg1 = sublist_get(args_sl, 1)
+    let t0 = infer_type(arg0)
+    let t1 = infer_type(arg1)
+    if tc_tid_has_unbound_metavar(t0) != 0 { let _ = tc_unify(t0, t1) }
+    if tc_tid_has_unbound_metavar(t1) != 0 { let _ = tc_unify(t1, t0) }
+}
+
 fn infer_carrier_arg(arg_node: Int, carrier: Str) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let saved_hint = tc_construct_hint
     let k = type_kind(tc_construct_hint)
@@ -15636,10 +15672,14 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // skip arg inference, hiding errors like E0522.
                     let bf_args = node_args(node)
                     if bf_args != -1 {
-                        let mut bai = 0
-                        while bai < sublist_length(bf_args) {
-                            infer_type(sublist_get(bf_args, bai))
-                            bai = bai + 1
+                        if (fn_name == "assert_eq" || fn_name == "assert_ne") && sublist_length(bf_args) == 2 {
+                            tc_infer_assert_eq_args(bf_args)
+                        } else {
+                            let mut bai = 0
+                            while bai < sublist_length(bf_args) {
+                                infer_type(sublist_get(bf_args, bai))
+                                bai = bai + 1
+                            }
                         }
                     }
                     return get_builtin_fn_ret(fn_name)
@@ -16396,12 +16436,15 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let im_binders = if im != -1 { node_impl_binders(im) } else { -1 }
                     if im != -1 && im_binders != -1 && sublist_length(im_binders) == 1 {
                         let elem = ty_pool.get(obj_t).unwrap().inner1
-                        check_arg_shapes("List.{method}", sig, node_args(node), 1, node)
                         let binder_node = sublist_get(im_binders, 0)
                         let binder = node_name(binder_node)
                         let mut binds: Map[Str, Int] = Map()
                         binds.insert(binder, elem)
                         binds.insert(tc_binder_key(binder_node, binder), elem)
+                        // binds must exist before this call: a bare-literal argument whose
+                        // static param type is the impl's own Typevar(T) needs the RECEIVER's
+                        // concrete element type as its hint, not the raw unsubstituted binder.
+                        check_arg_shapes_with_binds("List.{method}", sig, node_args(node), 1, node, binds)
                         let raw_ret = fnsig_pool.get(sig).unwrap().ret
                         return substitute_typevar_tid(raw_ret, binds)
                     }
