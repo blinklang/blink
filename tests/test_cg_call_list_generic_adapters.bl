@@ -1,0 +1,57 @@
+// The eager List adapters `.skip/.enumerate/.zip/.find/.flat_map` (§3c). Typecheck types
+// these straight on TyKind.List, not through the sealed HOF table test_cg_call_list_hof_call.bl
+// covers, but their bodies are ordinary generics in lib/std/list.bl all the same, so each
+// call reaches list_<m> the same way a sealed HOF call reaches list_map/list_filter/etc.
+//
+// A probe stops at typecheck, and a call of a generic names the instance registered for it,
+// so each of these runs the monomorphisation pass over the probe's own program first. That
+// is the pass the symbol comes from: without it the call has no instance to name and the
+// row would measure the harness rather than the route.
+import lower_test_helpers.{ probe, rhs_of, assert_eq_str }
+import cg_expr.{lower_expr}
+import ir.{ir_c_name, ir_kid, ir_kind, ir_kind_name}
+import mono.{run_mono}
+
+fn src_adapters() -> Str {
+    #"fn main() {
+    let xs = [1, 2, 3]
+    let ys = ["a", "b"]
+    let sk = xs.skip(1)
+    let en = xs.enumerate()
+    let zp = xs.zip(ys)
+    let fd = xs.find(fn(fv: Int) -> Bool { fv > 1 })
+    let fm = xs.flat_map(fn(mv: Int) -> List[Int] { [mv, mv] })
+    let _keep = [sk.len(), en.len(), zp.len(), fm.len()]
+    let _also = fd ?? -1
+}
+"#
+}
+
+// Every member of the family reaches its own generic, not just the one read first. A
+// member left out would fall through to the generic "not built" report.
+test "the whole generic-adapter family reaches its own generic" {
+    run_mono(probe("adapt_f", src_adapters()))
+    assert_eq_str("skip", ir_c_name(lower_expr(rhs_of("sk"))), "blink_std_1list_1list_1skip_0Int")
+    assert_eq_str("enumerate", ir_c_name(lower_expr(rhs_of("en"))), "blink_std_1list_1list_1enumerate_0Int")
+    assert_eq_str("zip", ir_c_name(lower_expr(rhs_of("zp"))), "blink_std_1list_1list_1zip_0Int_0Str")
+    assert_eq_str("find", ir_c_name(lower_expr(rhs_of("fd"))), "blink_std_1list_1list_1find_0Int")
+    assert_eq_str("flat_map", ir_c_name(lower_expr(rhs_of("fm"))), "blink_std_1list_1list_1flat_1map_0Int_0Int")
+}
+
+// The receiver travels ahead of the written arguments, exactly as it does for a sealed HOF
+// call: `xs.skip(1)` and `list_skip(xs, 1)` are one call written two ways.
+test "the receiver travels ahead of the written arguments" {
+    run_mono(probe("adapt_r", src_adapters()))
+    let built = lower_expr(rhs_of("sk"))
+    assert_eq_str("receiver", ir_c_name(ir_kid(built, 0)), "xs")
+    assert_eq_str("then the written argument", ir_kind_name(ir_kind(ir_kid(built, 1))), "Const")
+}
+
+// find's closure argument is a second parameter, positioned after the receiver exactly as
+// a HOF's closure is.
+test "find carries its receiver then its closure in that order" {
+    run_mono(probe("adapt_d", src_adapters()))
+    let built = lower_expr(rhs_of("fd"))
+    assert_eq_str("receiver", ir_c_name(ir_kid(built, 0)), "xs")
+    assert_eq_str("then the closure", ir_kind_name(ir_kind(ir_kid(built, 1))), "ClosureNew")
+}
