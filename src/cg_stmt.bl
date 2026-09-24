@@ -26,7 +26,7 @@ import typecheck.{
     tc_tid_kind, tk_name, make_list_type,
 }
 import layout.{
-    Position, Slot, SlotForm, LayoutRecord, async_scope_handles_spelling, bind_binder, bind_binder_cell,
+    Position, Slot, SlotForm, LayoutRecord, async_scope_handles_spelling, bind_binder_cell,
     bind_binder_mut, binder_is_celled,
     binder_scope_pop, binder_scope_push, carrier_member_layout, child_tid, container_slot_spelling,
     ensure_typedef_for, field_layout_of,
@@ -277,7 +277,10 @@ fn bind_params(fn_node: Int, scope: Int) -> Bool ! Diag.Report {
         let p = sublist_get(params, i)
         let tid = stmt_tid(p)
         if tid < 0 { return false }
-        bind_binder(scope, node_name(p), tid)
+        // Reads the parsed `mut` keyword, not a hardcoded false: name resolution does not
+        // honor it yet, but codegen must not bake that gap in and silently copy a param
+        // that becomes reassignable the day it does.
+        bind_binder_mut(scope, node_name(p), tid, node_is_mut(p) == 1)
         i = i + 1
     }
     true
@@ -1189,7 +1192,10 @@ fn lower_destructuring_let(node: Int) -> Int ! Diag.Report {
     let init = node_value(node)
     let value = if init < 0 { poison_value(node) } else { lower_value(init) }
     let mut out: List[Int] = [ir_let(tid, node, rec.c_spelling, holder, rec.slot_form, value)]
-    if !bind_tuple_pattern(node_elements(node), tid, holder, rec.c_spelling, rec.slot_form, out) { return -1 }
+    let is_mut = node_is_mut(node) == 1
+    if !bind_tuple_pattern(node_elements(node), tid, holder, rec.c_spelling, rec.slot_form, out, is_mut) {
+        return -1
+    }
     // Every binding but the last drains unscoped into the enclosing block, the same path
     // bind_unit_let takes -- a `Block` here would give the destructured names a C scope of
     // their own that ends before the next statement can read them.
@@ -1203,7 +1209,10 @@ fn lower_destructuring_let(node: Int) -> Int ! Diag.Report {
 
 // Binds every name a tuple pattern holds against `holder`, appending one Let each.
 // Answers false when an element has no type, so no name of this pattern binds at all.
-fn bind_tuple_pattern(pat: Int, tid: Int, holder: Str, spell: Str, form: SlotForm, out: List[Int]) -> Bool ! Diag.Report {
+// `is_mut` is the enclosing `let`'s own mutability: `let mut (a, b) = t` spells it once
+// on the LetBinding, not per leaf, so it threads down the same way typecheck's
+// nr_define_let_pattern already does.
+fn bind_tuple_pattern(pat: Int, tid: Int, holder: Str, spell: Str, form: SlotForm, out: List[Int], is_mut: Bool) -> Bool ! Diag.Report {
     let elems = node_elements(pat)
     if elems == -1 { return true }
     let mut i = 0
@@ -1220,7 +1229,7 @@ fn bind_tuple_pattern(pat: Int, tid: Int, holder: Str, spell: Str, form: SlotFor
         let _ = ensure_typedef_for(elem_tid)
         let obj = ir_var_ref(tid, sub, spell, holder, form)
         let get = ir_field_get(elem_tid, sub, rec.c_spelling, tuple_member(i), rec.slot_form, obj)
-        if !bind_sub_pattern(sub, elem_tid, get, rec, out) { return false }
+        if !bind_sub_pattern(sub, elem_tid, get, rec, out, is_mut) { return false }
         i = i + 1
     }
     true
@@ -1228,16 +1237,24 @@ fn bind_tuple_pattern(pat: Int, tid: Int, holder: Str, spell: Str, form: SlotFor
 
 // One element of a destructuring pattern: a name binds, a nested tuple binds through a
 // local of its own, and a wildcard drops the element.
-fn bind_sub_pattern(sub: Int, tid: Int, value: Int, rec: LayoutRecord, out: List[Int]) -> Bool ! Diag.Report {
+fn bind_sub_pattern(sub: Int, tid: Int, value: Int, rec: LayoutRecord, out: List[Int], is_mut: Bool) -> Bool ! Diag.Report {
     let kind = nk_of(node_kind(sub))
     if kind == NodeKind.WildcardPattern { return true }
     if kind == NodeKind.TuplePattern {
         let inner = c_mint_local("tup")
         out.push(ir_let(tid, sub, rec.c_spelling, inner, rec.slot_form, value))
-        return bind_tuple_pattern(sub, tid, inner, rec.c_spelling, rec.slot_form, out)
+        return bind_tuple_pattern(sub, tid, inner, rec.c_spelling, rec.slot_form, out, is_mut)
     }
     let name = node_name(sub)
-    bind_binder(cur_scope(), name, tid)
+    // A leaf has no `mut` form of its own; only `let mut (a, b) = t` can make one
+    // reassignable, and that mutability is the caller's `is_mut` argument. A mutable
+    // leaf a closure shares needs the same cell a plain `let mut` capture needs.
+    if is_mut && cg_eff_binder_is_shared(name) {
+        bind_binder_cell(cur_scope(), name, tid)
+        out.push(ir_cell_let(tid, sub, rec.c_spelling, name, rec.slot_form, value))
+        return true
+    }
+    bind_binder_mut(cur_scope(), name, tid, is_mut)
     out.push(ir_let(tid, sub, rec.c_spelling, cg_local_c_name(name), rec.slot_form, value))
     true
 }
@@ -1929,7 +1946,8 @@ fn bind_for_element(node: Int, elem: Int, rec: LayoutRecord, value: Int, out: Li
     }
     let holder = c_mint_local("elem")
     out.push(ir_let(elem, node, rec.c_spelling, holder, rec.slot_form, value))
-    bind_tuple_pattern(node_elements(node), elem, holder, rec.c_spelling, rec.slot_form, out)
+    // A for-in binder has no `mut` form to write, tuple or otherwise.
+    bind_tuple_pattern(node_elements(node), elem, holder, rec.c_spelling, rec.slot_form, out, false)
 }
 
 // `for x in xs { b }` becomes
@@ -2269,7 +2287,9 @@ fn wrap_resource(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, de
     let _ = ensure_typedef_for(tid)
     let name = node_name(item)
     let value = lower_value(node_value(item))
-    bind_binder(cur_scope(), name, tid)
+    // A with-resource binder has no `mut` form to write, so it is immutable as a
+    // matter of syntax, and a closure capturing one may copy it.
+    bind_binder_mut(cur_scope(), name, tid, false)
     let bound_name = cg_local_c_name(name)
     let bind = ir_let(tid, item, rec.c_spelling, bound_name, rec.slot_form, value)
     let cleanup = cg_eff_resource_cleanup(item)
@@ -2895,7 +2915,9 @@ fn struct_pattern_binds(ctx: MatchCtx, pat: Int, out: List[Int]) -> Bool ! Diag.
 fn bind_whole(ctx: MatchCtx, pat: Int, out: List[Int]) ! Diag.Report {
     let name = node_name(pat)
     if name == "" || is_variant_name(ctx.tid, name) { return }
-    bind_binder(cur_scope(), name, ctx.tid)
+    // A match binder has no `mut` form to write, so it is immutable as a matter of
+    // syntax, and a closure capturing one may copy it.
+    bind_binder_mut(cur_scope(), name, ctx.tid, false)
     out.push(ir_let(ctx.tid, pat, ctx.rec.c_spelling, cg_local_c_name(name), ctx.rec.slot_form,
         scrut_ref(ctx, pat)))
 }
@@ -2937,7 +2959,9 @@ fn bind_slot(ctx: MatchCtx, sub: Int, value: Int, out: List[Int]) -> Bool ! Diag
 // One name, declared and bound to a value read out of the scrutinee.
 fn bind_named(span: Int, name: Str, tid: Int, rec: LayoutRecord, value: Int, out: List[Int]) ! Diag.Report {
     let _ = ensure_typedef_for(tid)
-    bind_binder(cur_scope(), name, tid)
+    // A payload/field binder has no `mut` form to write, so it is immutable as a
+    // matter of syntax, and a closure capturing one may copy it.
+    bind_binder_mut(cur_scope(), name, tid, false)
     out.push(ir_let(tid, span, rec.c_spelling, cg_local_c_name(name), rec.slot_form, value))
 }
 

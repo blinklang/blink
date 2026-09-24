@@ -31,7 +31,7 @@ import ir.{IrKind, ir_c_name, ir_capture_descs, ir_promoter, ir_kid_count, ir_ki
 import cg_reg.{cg_reg_build}
 import cg_expr.{cg_expr_reset}
 import cg_print.{print_reset, print_take}
-import cg_stmt.{cg_stmt_reset, lower_block_returning}
+import cg_stmt.{cg_stmt_reset, lower_block_returning, lower_fn}
 import cg_eff.{
     cg_eff_lower_closure, cg_eff_pending_thunks, cg_eff_print_thunk, cg_eff_reset,
     cg_eff_scan_shared_binders, cg_eff_thunk_body_node, cg_eff_thunk_close, cg_eff_thunk_open,
@@ -105,6 +105,23 @@ fn no_capture_at_all() -> Int {
     g_none(1)
 }
 
+// `mut` on a param parses, though name resolution does not honor it yet -- see
+// bind_params in src/cg_stmt.bl. The capture must still refuse this the way a shared
+// `let mut` does, not copy it, because copying would go stale the day reassignment works.
+fn capture_mut_param(mut p: Int) -> Int {
+    let g_mut_param = fn(x: Int) -> Int { x + p }
+    g_mut_param(1)
+}
+
+// `let mut (a, b) = t` spells its mutability once, on the LetBinding, not per leaf. A
+// closure sharing a leaf needs the same cell a plain `let mut` capture needs.
+fn a_mutable_tuple_destructure_capture() -> Int {
+    let mut (a, b) = (1, 2)
+    let g_mut_tuple = fn(x: Int) -> Int { x + a + b }
+    a = 9
+    g_mut_tuple(1)
+}
+
 fn main() {
     io.println("{one_int_capture()}")
     io.println("{one_name_read_twice()}")
@@ -115,6 +132,8 @@ fn main() {
     io.println("{a_mutable_boxed_capture()}")
     io.println("{nested_over_outer_param()}")
     io.println("{no_capture_at_all()}")
+    io.println("{capture_mut_param(1)}")
+    io.println("{a_mutable_tuple_destructure_capture()}")
 }
 "#
 }
@@ -190,6 +209,15 @@ fn lower_body_of(fn_name: Str) -> Int ! Diag.Report {
     let f = find_decl(NodeKind.FnDef, fn_name, "")
     cg_eff_scan_shared_binders(f)
     lower_block_returning(node_body(f))
+}
+
+// Lowers a whole function through the driver's own lower_fn, which binds the function's
+// own parameters before the body lowers. lower_body_of skips straight to the body, which
+// is fine for the no-param probes above but leaves a parameter of the function itself
+// unbound -- this is the path a capture of one actually resolves against.
+fn lower_whole_fn(fn_name: Str) -> Int ! Diag.Report {
+    let f = find_decl(NodeKind.FnDef, fn_name, "")
+    lower_fn(f)
 }
 
 test "a closure reading an immutable Int local answers a record instead of refusing" {
@@ -269,11 +297,10 @@ test "a pointer-shaped capture rides the slot without an integer pun" {
     assert_eq(ices(), 0)
 }
 
-test "a capture of a binder whose mutability was never recorded is refused, not copied" {
-    // The inner closure captures the outer thunk's parameter. A parameter binds without a
-    // mutability, because whether a parameter can be assigned is still open, and a binder
-    // that cannot be told from a shared one is treated as one. This is the fail-closed
-    // direction: every bind site not yet switched refuses a capture instead of copying it.
+test "a capture of an outer closure's own parameter builds a copy, not a refusal" {
+    // The inner closure captures the outer thunk's parameter. A parameter cannot be
+    // reassigned, so bind_params records it immutable at the bind site, and the capture
+    // is an ordinary one: it builds and reads a copy, the same as any other capture.
     setup()
     let v = lower_capturing("g_outer", [], TYPE_INT)
     assert(v >= 0)
@@ -281,11 +308,21 @@ test "a capture of a binder whose mutability was never recorded is refused, not 
     assert(cg_eff_thunk_open(0) >= 0)
     let body = lower_block_returning(cg_eff_thunk_body_node(0))
     cg_eff_thunk_close()
+    if body < 0 || ices() != 0 { report_ices("g_outer's body did not lower") }
     assert(body >= 0)
-    assert(ices_mentioning("'x'") > 0)
-    assert(ices_mentioning("records no mutability") > 0)
-    // The inner closure was refused, so it queued no thunk of its own.
-    assert_eq(cg_eff_pending_thunks(), 1)
+    assert_eq(ices(), 0)
+    // The inner closure's own capture of `x` queued a second thunk.
+    assert_eq(cg_eff_pending_thunks(), 2)
+    print_reset()
+    assert(cg_eff_thunk_open(1) >= 0)
+    let inner_body = lower_block_returning(cg_eff_thunk_body_node(1))
+    cg_eff_thunk_close()
+    assert(inner_body >= 0)
+    cg_eff_print_thunk(1, inner_body)
+    let text = print_take()
+    if ices() != 0 { report_ices("inner's thunk did not print") }
+    assert_eq(ices(), 0)
+    assert(cg_text_occurrences(text, "blink_closure_get_capture") == 1)
 }
 
 test "the queue still drains to zero once a captured closure is printed" {
@@ -380,5 +417,29 @@ test "a let records its own mutability, so a mut capture builds through a cell j
     let built2 = lower_body_of("one_int_capture")
     assert(built2 >= 0)
     assert_eq(ices_mentioning("'n'"), 0)
+    assert_eq(cg_eff_pending_thunks(), 1)
+}
+
+test "a mut param records mutable and refuses the capture, not a silent copy" {
+    // Name resolution does not honor `mut` on a param yet, but bind_params records the
+    // parsed flag anyway. A mutable, non-celled binder hits the same refusal a shared
+    // `let mut` hits before its cell lands -- capturing it must not silently copy a
+    // value the day reassignment starts working. lower_fn swallows a stopped body into
+    // an empty block rather than a negative id, so the refusal is read off the ICE, not
+    // off lower_whole_fn's return.
+    setup()
+    lower_whole_fn("capture_mut_param")
+    assert(ices_mentioning("'p'") > 0)
+    assert(ices_mentioning("has no cell yet") > 0)
+    assert_eq(cg_eff_pending_thunks(), 0)
+}
+
+test "a mutable tuple-destructure leaf builds through a cell just like a plain mut local" {
+    setup()
+    let built = lower_whole_fn("a_mutable_tuple_destructure_capture")
+    if ices() != 0 { report_ices("a_mutable_tuple_destructure_capture was refused") }
+    assert(built >= 0)
+    assert_eq(ices_mentioning("'a'"), 0)
+    assert_eq(ices_mentioning("shared"), 0)
     assert_eq(cg_eff_pending_thunks(), 1)
 }
