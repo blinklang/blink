@@ -184,6 +184,25 @@ BLINK_RT_FN void* blink_handle_await(blink_handle* h) {
 }
 #endif
 
+/* ── async.scope exit ───────────────────────────────────────────────── */
+
+/* An async.scope's own handle list, awaited and freed at scope exit: every handle still
+ * BLINK_HANDLE_RUNNING is joined, so no spawned task outlives its scope. Handles already
+ * done are read straight through by their own .await; awaiting them again is harmless. */
+BLINK_RT_FN void blink_async_scope_drain(blink_list* handles);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_async_scope_drain(blink_list* handles) {
+    int64_t n = blink_list_len(handles);
+    for (int64_t i = 0; i < n; i++) {
+        blink_handle* h = (blink_handle*)blink_list_get(handles, i);
+        if (h->status == BLINK_HANDLE_RUNNING) {
+            blink_handle_await(h);
+        }
+    }
+    blink_list_free(handles);
+}
+#endif
+
 /* ── Channel operations ─────────────────────────────────────────────── */
 
 BLINK_RT_FN blink_channel* blink_channel_new(int64_t capacity);

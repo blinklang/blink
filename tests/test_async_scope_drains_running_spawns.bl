@@ -1,0 +1,96 @@
+// async.scope's own lowering, proven by timing rather than by message delivery: a channel
+// recv blocks regardless of whether the scope drains anything, so it cannot tell a joined
+// scope from a leaked one. Elapsed wall time can.
+
+fn spawn_then_return_early() -> Int {
+    async.scope {
+        let _h = async.spawn(fn() {
+            time.sleep(Duration.ms(30))
+        })
+        return 7
+    }
+    99
+}
+
+fn scope_wait_then_return[T](v: T) -> T {
+    async.scope {
+        let _h = async.spawn(fn() {
+            time.sleep(Duration.ms(30))
+        })
+    }
+    v
+}
+
+test "the scope's value is its body's tail expression" {
+    let scoped = async.scope {
+        let x = 5
+        x * 10
+    }
+    assert_eq(scoped, 50)
+}
+
+test "a sleeping spawn left un-awaited is complete once the scope ends" {
+    let start = time.read()
+    async.scope {
+        let _h = async.spawn(fn() {
+            time.sleep(Duration.ms(30))
+        })
+    }
+    let elapsed = start.elapsed()
+    assert(elapsed.to_ms() >= 25)
+}
+
+test "an early return out of the scope's body still drains a still-running spawn" {
+    let start = time.read()
+    let r = spawn_then_return_early()
+    let elapsed = start.elapsed()
+    assert_eq(r, 7)
+    assert(elapsed.to_ms() >= 25)
+}
+
+test "a nested scope drains its own spawn at its own exit, not the outer scope's" {
+    let start = time.read()
+    let mut after_inner_ms = 0
+    async.scope {
+        let _outer_h = async.spawn(fn() {
+            time.sleep(Duration.ms(300))
+        })
+        async.scope {
+            let _inner_h = async.spawn(fn() {
+                time.sleep(Duration.ms(30))
+            })
+        }
+        after_inner_ms = start.elapsed().to_ms()
+    }
+    let after_outer_ms = start.elapsed().to_ms()
+    assert(after_inner_ms >= 25)
+    assert(after_inner_ms < 250)
+    assert(after_outer_ms >= 290)
+}
+
+test "a generic fn's async.scope drains at each of its own mono instances" {
+    let start_int = time.read()
+    let a = scope_wait_then_return(1)
+    assert_eq(a, 1)
+    assert(start_int.elapsed().to_ms() >= 25)
+
+    let start_str = time.read()
+    let b = scope_wait_then_return("x")
+    assert_eq(b, "x")
+    assert(start_str.elapsed().to_ms() >= 25)
+}
+
+test "async.scope inside a closure body drains before the closure returns" {
+    let start = time.read()
+    let f = fn() {
+        async.scope {
+            let _h = async.spawn(fn() {
+                time.sleep(Duration.ms(30))
+            })
+        }
+        7
+    }
+    let r = f()
+    assert_eq(r, 7)
+    assert(start.elapsed().to_ms() >= 25)
+}

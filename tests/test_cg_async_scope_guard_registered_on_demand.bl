@@ -1,0 +1,101 @@
+// The async.scope guard support (the drain runner cg_eff_register_async_scope_guard_support
+// prints) names blink_async_scope_drain, a runtime function added during the codegen
+// rewrite. The pinned gen0 this tree bootstraps with predates it, so a unit that prints the
+// guard unconditionally hands gen0's cc an implicit declaration the moment that unit has no
+// other reason to declare it. The driver now pre-scans a unit's own bodies and registers
+// the guard only when one of them holds an AsyncScope.
+//
+// A program with no async.scope must therefore never mention the drain runner at all; one
+// that does use async.scope must get it, printed before the first body that relies on it,
+// with no internal error along the way.
+import std.fs
+import std.io
+import layout.{layout_reset}
+import cname.{cname_reset}
+import cg_test_helpers.{cg_probe_compile, cg_probe_module_of}
+import cg.{CgConfig, generate}
+import cg_eff.{cg_eff_async_scope_exit_symbol}
+import cg_reg.{cg_reg_reset, cg_reg_build, cg_reg_fn_decls}
+import mono.{run_mono}
+import diagnostics.{diag_reset, diag_ice_count}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output must not have '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    let program = cg_probe_compile(path, src)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    program
+}
+
+fn cfg_for_module(module_key: Str) -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: module_key,
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+fn no_scope_src() -> Str {
+    #"fn add(a: Int, b: Int) -> Int { a + b }
+
+fn main() {
+    let x = add(1, 2)
+    io.println("{x}")
+}
+"#
+}
+
+fn with_scope_src() -> Str {
+    #"fn compute() -> Int {
+    async.scope {
+        let h = async.spawn(fn() { 41 })
+        h.await + 1
+    }
+}
+
+fn main() {
+    let x = compute()
+    io.println("{x}")
+}
+"#
+}
+
+test "a unit with no async.scope never mentions the drain runner gen0 cannot declare" {
+    let program = build_probe(no_scope_src(), "cg_async_scope_guard_absent_probe")
+    diag_reset()
+    let text = generate(program, cfg_for_module(""))
+    assert_lacks(text, cg_eff_async_scope_exit_symbol())
+    assert_eq(diag_ice_count, 0)
+}
+
+// The support (typedef, runner, cleanup fn) is printed once, ahead of every body, by the
+// pre-scan in cg.bl; a body's own use of it is the cleanup attribute on its guard variable.
+// Checking both needles' positions, not just their presence, proves the ordering the pre-scan
+// exists for: guard_is_printable would ICE if a body printed first.
+test "a unit that uses async.scope gets the drain runner ahead of the body that needs it" {
+    let program = build_probe(with_scope_src(), "cg_async_scope_guard_present_probe")
+    cg_reg_reset()
+    cg_reg_build(program)
+    let probe_module = cg_probe_module_of(cg_reg_fn_decls(), "compute")
+    diag_reset()
+    let text = generate(program, cfg_for_module(probe_module))
+    assert_eq(diag_ice_count, 0)
+
+    let exit_symbol = cg_eff_async_scope_exit_symbol()
+    let support = "__blink_rs_run_{exit_symbol}(void* p, int ok)"
+    let use = "__attribute__((cleanup(__blink_rs_cleanup_{exit_symbol})))"
+    let support_at = text.index_of(support)
+    let use_at = text.index_of(use)
+    if support_at < 0 || use_at < 0 || support_at >= use_at {
+        io.println("FAIL: support at {support_at}, use at {use_at}\n--- output ---\n{text}")
+    }
+    assert(support_at >= 0)
+    assert(use_at >= 0)
+    assert(support_at < use_at)
+}
