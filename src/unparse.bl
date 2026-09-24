@@ -17,9 +17,10 @@
 import std.str.{str_from_code_point}
 import ast.{NodeKind, nk_of, node_kind_name}
 import parser.{
-    is_literal_string_part, node_args, node_elements, node_index, node_int_val, node_kind,
-    node_left, node_method, node_name, node_obj, node_op, node_right, node_str_val,
-    sublist_get, sublist_length,
+    is_literal_string_part, node_args, node_body, node_elements, node_fields, node_index,
+    node_int_val, node_is_mut, node_kind, node_left, node_method, node_name, node_obj,
+    node_op, node_params, node_return_type, node_right, node_stmts, node_str_val,
+    node_type_name, node_value, sublist_get, sublist_length,
 }
 import diagnostics.{diag_ice_at, ICE_SEG_NO_SOURCE_TEXT, NO_SOURCE_TEXT_FOR_EXPR}
 
@@ -94,6 +95,12 @@ fn unparse_bare(node: Int) -> Str ! Diag.Report {
         NodeKind.MethodCall => method_text(node)
         NodeKind.FieldAccess => "{unparse_at(node_obj(node), PREC_POSTFIX)}.{node_name(node)}"
         NodeKind.IndexExpr => "{unparse_at(node_obj(node), PREC_POSTFIX)}[{unparse_expr(node_index(node))}]"
+        NodeKind.TupleLit => tuple_text(node)
+        NodeKind.ListLit => "[{arg_text(node_elements(node))}]"
+        NodeKind.StructLit => struct_text(node)
+        NodeKind.Closure => closure_text(node)
+        NodeKind.SpreadExpr => "..{unparse_expr(node_value(node))}"
+        NodeKind.NamedArg => "{node_name(node)}: {unparse_expr(node_value(node))}"
         _ => refuse(node)
     }
 }
@@ -140,6 +147,86 @@ fn arg_text(args: Int) -> Str ! Diag.Report {
         i = i + 1
     }
     out
+}
+
+// A one-element tuple keeps its trailing comma: without it, `(x,)` would read back as
+// the parenthesised expression `x` instead of a tuple.
+fn tuple_text(node: Int) -> Str ! Diag.Report {
+    let elems = node_elements(node)
+    if elems == -1 { return "()" }
+    if sublist_length(elems) == 1 {
+        return "({unparse_expr(sublist_get(elems, 0))},)"
+    }
+    "({arg_text(elems)})"
+}
+
+fn struct_text(node: Int) -> Str ! Diag.Report {
+    let tname = node_type_name(node)
+    let flds = node_fields(node)
+    let mut out = "{tname} \{ "
+    if flds != -1 {
+        let mut i = 0
+        while i < sublist_length(flds) {
+            if i > 0 { out = "{out}, " }
+            let fld = sublist_get(flds, i)
+            if nk_of(node_kind(fld)) == NodeKind.SpreadExpr {
+                out = "{out}{unparse_expr(fld)}"
+            } else {
+                out = "{out}{node_name(fld)}: {unparse_expr(node_value(fld))}"
+            }
+            i = i + 1
+        }
+    }
+    "{out} }"
+}
+
+fn closure_text(node: Int) -> Str ! Diag.Report {
+    let params = node_params(node)
+    let mut out = "fn("
+    if params != -1 {
+        let mut i = 0
+        while i < sublist_length(params) {
+            if i > 0 { out = "{out}, " }
+            out = "{out}{param_text(sublist_get(params, i))}"
+            i = i + 1
+        }
+    }
+    out = "{out})"
+    let ret = node_return_type(node)
+    if ret != "" { out = "{out} -> {ret}" }
+    "{out} {closure_body_text(node, node_body(node))}"
+}
+
+fn param_text(node: Int) -> Str ! Diag.Report {
+    let mut out = ""
+    if node_is_mut(node) != 0 { out = "mut " }
+    out = "{out}{node_name(node)}"
+    let tname = node_type_name(node)
+    if tname != "" { out = "{out}: {tname}" }
+    let dflt = node_value(node)
+    if dflt != -1 { out = "{out} = {unparse_expr(dflt)}" }
+    out
+}
+
+// Only a single-statement body is rebuilt: a bare tail expression or an explicit
+// return, the two shapes a one-line closure actually has. Anything more refuses
+// rather than inventing a multi-line rendering the closure was never written as.
+fn closure_body_text(closure: Int, body: Int) -> Str ! Diag.Report {
+    let stmts = node_stmts(body)
+    if stmts == -1 || sublist_length(stmts) == 0 { return "\{}" }
+    if sublist_length(stmts) == 1 {
+        let stmt = sublist_get(stmts, 0)
+        let sk = nk_of(node_kind(stmt))
+        if sk == NodeKind.ExprStmt {
+            return "\{ {unparse_expr(node_value(stmt))} }"
+        }
+        if sk == NodeKind.Return {
+            let val = node_value(stmt)
+            if val != -1 { return "\{ return {unparse_expr(val)} }" }
+            return "\{ return }"
+        }
+    }
+    refuse(closure)
 }
 
 // The lexer hands back a decoded string part, so what it decoded is put back before the

@@ -1,0 +1,67 @@
+// unparse.bl refused to rebuild the source text of a struct literal, a tuple literal, a
+// list literal, or a closure, so an assert whose condition (or message) held one of those
+// hit an internal compiler error instead of printing the condition it was given.
+//
+// This mirrors the probe technique in test_unparse_expression_source_text.bl: parse an
+// expression, pull its node out of the pool, and check what unparse_expr rebuilds from it.
+
+import compiler.{compile_to_program}
+import parser.{node_count, node_kind, node_name, node_value}
+import ast.{NodeKind, nk_of}
+import unparse.{unparse_expr}
+import std.io
+
+// The node pool grows across probes and every probe binds this same name, so an earlier
+// probe's binding would answer for a later one. The last one written is this probe's.
+fn last_binding_value(name: Str) -> Int {
+    let mut i = node_count() - 1
+    while i >= 0 {
+        if nk_of(node_kind(i)) == NodeKind.LetBinding && node_name(i) == name { return node_value(i) }
+        i = i - 1
+    }
+    -1
+}
+
+fn expr_node(stem: Str, text: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
+    let path = "build/{stem}_probe.bl"
+    write_file(path, "type Point \{ x: Int, y: Int }\nfn main() \{\n    let _unparse_subject = {text}\n}\n")
+    let program = compile_to_program(path, 1)
+    let _rm = process_run("rm", ["-f", path])
+    let n = last_binding_value("_unparse_subject")
+    if n < 0 { io.println("FAIL: probe '{text}' bound no subject") }
+    assert(n >= 0)
+    n
+}
+
+fn assert_unparses(stem: Str, written: Str, want: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
+    let got = unparse_expr(expr_node(stem, written))
+    if got != want {
+        io.println("FAIL: '{written}' unparsed to '{got}', want '{want}'")
+    }
+    assert(got == want)
+}
+
+test "a struct literal reads back with its field values" {
+    assert_unparses("u_struct", "Point \{ x: 1, y: 2 }", "Point \{ x: 1, y: 2 }")
+    assert_unparses("u_struct_field", "Point \{ x: 1, y: 2 }.x", "Point \{ x: 1, y: 2 }.x")
+}
+
+test "a tuple literal reads back with its elements" {
+    assert_unparses("u_tuple0", "()", "()")
+    assert_unparses("u_tuple2", "(1, 2)", "(1, 2)")
+    assert_unparses("u_tuple3", "(1, 2, 3)", "(1, 2, 3)")
+}
+
+test "a single-element tuple keeps the trailing comma that makes it a tuple" {
+    assert_unparses("u_tuple1", "(1,)", "(1,)")
+}
+
+test "a list literal reads back with its elements" {
+    assert_unparses("u_list_empty", "[]", "[]")
+    assert_unparses("u_list", "[1, 2, 3]", "[1, 2, 3]")
+}
+
+test "a closure reads back with its params, return type, and body" {
+    assert_unparses("u_closure", "fn(x: Int) -> Int \{ x + 1 }", "fn(x: Int) -> Int \{ x + 1 }")
+    assert_unparses("u_closure_field", "fn(p: Point) -> Bool \{ p.x > 5 }", "fn(p: Point) -> Bool \{ p.x > 5 }")
+}
