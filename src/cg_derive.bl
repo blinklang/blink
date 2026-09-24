@@ -15,20 +15,29 @@ import diagnostics.{
 import layout.{
     LayoutRecord, Position, SlotForm, decl_derive_args, ensure_typedef_for, field_layout_of,
     format_spec_of, layout_of, tid_is_opaque_handle, varargs_spelling, enum_tag_tid,
+    Slot, child_tid, carrier_member_layout, layout_take_typedefs,
 }
 import cname.{
     c_derive_method_name, c_field_name, c_mint_local, c_runtime_helper, c_string_literal,
     c_tid_derive_method_name, c_tuple_member,
     c_variant_discriminant, c_enum_tag_member, c_enum_payload_member,
+    c_global_name, c_variant_member_name,
 }
-import cg_print.{print_fn, print_fn_decl, print_kops_table, print_kops_table_decl}
-import cg_reg.{cg_reg_tid_for_decl}
+import cg_print.{print_fn, print_fn_decl, print_kops_table, print_kops_table_decl, print_typedef_blocks}
+import cg_reg.{cg_reg_tid_for_decl, cg_reg_global_decls, cg_reg_module_of}
+import cg_call.{
+    cg_call_element_from_runtime, cg_call_element_to_slot, cg_call_stdlib_declares,
+    cg_call_stdlib_symbol,
+}
 import ir.{
     ir_assign, ir_binary, ir_block, ir_call_direct, ir_call_runtime, ir_cast, ir_const,
     ir_field_get, ir_if, ir_let, ir_panic, ir_return, ir_switch, ir_unary, ir_var_ref,
+    ir_loop, ir_break, ir_expr_stmt, ir_struct_new, ir_enum_new, ir_carrier_wrap,
+    ir_carrier_unwrap, ir_carrier_tag, ir_global_ref, ir_select,
 }
 import typecheck.{
     DECL_NODE_AMBIGUOUS, TYPE_BOOL, TYPE_CHAR, TYPE_INT, TYPE_STR, TYPE_U64, TyKind, lookup_named_type,
+    TYPE_FLOAT, TYPE_VOID, make_result_type,
     tc_decl_derives, tc_enum_variant_slots,
     tc_evar_field_slots, tc_evar_name, tc_evfield_name, tc_evfield_tid, tc_resolve,
     tc_lookup_node_tid, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
@@ -37,6 +46,7 @@ import typecheck.{
 }
 import parser.{
     node_count, node_name, node_fields, node_source_module, node_type_params, sublist_get,
+    node_str_val,
     sublist_length,
 }
 
@@ -49,6 +59,8 @@ let derive_ord = "Ord"
 let derive_debug = "Debug"
 let derive_hash = "Hash"
 let derive_clone = "Clone"
+let derive_serialize = "Serialize"
+let derive_deserialize = "Deserialize"
 
 // The two words a Bool renders as. They are the Display of a Bool, not C text, and the
 // runtime holds the same pair in blink_sb_write_bool.
@@ -115,6 +127,8 @@ fn derive_one(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
     if name == derive_debug { return debug_method(decl, arg, bodies) }
     if name == derive_hash { return hash_method(decl, arg, bodies) }
     if name == derive_clone { return clone_method(decl, arg, bodies) }
+    if name == derive_serialize { return ser_method(decl, arg, bodies) }
+    if name == derive_deserialize { return de_method(decl, arg, bodies) }
     not_built(arg, "@derive({name})")
 }
 
@@ -258,6 +272,7 @@ fn variant_block(decl: Int, tid: Int, slot: Int, derive: Str, acc: Str, span: In
     if derive == derive_ord { return cmp_variant_block(decl, tid, slot, span) }
     if derive == derive_debug { return debug_variant_block(decl, tid, slot, span) }
     if derive == derive_hash { return hash_variant_block(decl, tid, slot, acc, span) }
+    if derive == derive_serialize { return ser_variant_block(decl, tid, slot, span) }
     derive_ice(span, "no per-variant block for @derive({derive})")
     -1
 }
@@ -1079,6 +1094,12 @@ fn debug_bool_part(value: Int, span: Int) -> DebugPart ! Diag.Report {
 // A nested type is rendered by its own derived method, so the rendering stays one call
 // deep however far the nesting goes.
 fn debug_nested_part(ftid: Int, value: Int, path: Str, span: Int) -> DebugPart ! Diag.Report {
+    derived_call_part(ftid, value, path, derive_debug, "debug", span)
+}
+
+// One field rendered by calling the method its own type derives. Debug and Serialize both
+// render a nested type this way, so both refuse a hand-written or unwritable method alike.
+fn derived_call_part(ftid: Int, value: Int, path: Str, derive: Str, method: Str, span: Int) -> DebugPart ! Diag.Report {
     let rec = layout_of(TYPE_STR, Position.Local)
     let spelling = spelling_or_ice(rec, "Str", span)
     let spec = format_spec_of(TYPE_STR)
@@ -1088,16 +1109,16 @@ fn debug_nested_part(ftid: Int, value: Int, path: Str, span: Int) -> DebugPart !
         derive_ice(span, "field type {ftid} has no unambiguous declaration to render through")
         return debug_refused()
     }
-    if !has_str(derive_names(fdecl), derive_debug) {
-        not_built(span, "@derive(Debug) on a field whose type '{node_name(fdecl)}' implements Debug by hand")
+    if !has_str(derive_names(fdecl), derive) {
+        not_built(span, "@derive({derive}) on a field whose type '{node_name(fdecl)}' implements {derive} by hand")
         return debug_refused()
     }
-    let refusal = shape_refusal(fdecl, ftid, derive_debug)
+    let refusal = shape_refusal(fdecl, ftid, derive)
     if refusal != "" {
         not_built(span, "{refusal}, which the field '{path}' would have to call")
         return debug_refused()
     }
-    let arg = ir_call_direct(TYPE_STR, span, spelling, c_derive_method_name(fdecl, "debug"),
+    let arg = ir_call_direct(TYPE_STR, span, spelling, c_derive_method_name(fdecl, method),
         rec.slot_form, [value])
     DebugPart { spec: spec, arg: arg, pre: [], ok: true }
 }
@@ -1566,4 +1587,720 @@ fn clone_body(tid: Int, span: Int) -> Int ! Diag.Report {
     let value = value_ref(tid, "self", Position.Param, span)
     if value < 0 { return -1 }
     ir_block(span, [ir_return(span, value)])
+}
+
+// ── Serialize ────────────────────────────────────────────────────────────
+
+// The stdlib modules a derived JSON body calls into. Serialize needs only the prelude's
+// string and number modules; Deserialize also needs std.json, which a program imports.
+let ser_str_module = "std_str"
+let ser_num_module = "std_num"
+let de_json_module = "std_json"
+
+// to_json answers the value as JSON text. A product type is one object, a payload-less
+// enum is one string, and a data-carrying variant is an object whose "type" key names it.
+fn ser_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
+    let tid = derive_tid(decl, arg)
+    if tid < 0 { return }
+    if refused(shape_refusal(decl, tid, derive_serialize), arg) { return }
+    let self_spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), arg)
+    let ret = str_spelling(arg)
+    if self_spelling == "" || ret == "" { return }
+    let symbol = c_derive_method_name(decl, "to_json")
+    let params = ["{self_spelling} self"]
+    if !bodies { return print_fn_decl(false, ret, symbol, params, false) }
+    let body = ser_body(decl, tid, arg)
+    if body < 0 { return }
+    print_fn(false, ret, symbol, params, false, body)
+}
+
+// A transparent newtype has no JSON form the spec names: written as its payload it could
+// not be told apart from that payload, and written as a variant it would not be its word.
+fn ser_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let rec = layout_of(tid, Position.Param)
+    if rec.slot_form == SlotForm.InlineWord {
+        if rec.is_transparent != 0 {
+            not_built(span, "@derive(Serialize) on the transparent newtype '{node_name(decl)}'")
+            return -1
+        }
+        return ser_ordinal_body(decl, tid, span)
+    }
+    let k = tc_tid_kind(tc_resolve(tid))
+    if k == TyKind.Struct { return ser_struct_body(decl, tid, span) }
+    if k == TyKind.Enum { return ser_tagged_body(decl, tid, span) }
+    not_built(span, "@derive(Serialize) on a {tk_name(k)} type")
+    -1
+}
+
+// A variant backed by a string is written as that string, so reading it back meets the
+// same text the program itself compares against.
+fn json_variant_name(vnode: Int) -> Str {
+    let backing = node_str_val(vnode)
+    if backing != "" { return backing }
+    node_name(vnode)
+}
+
+fn ser_ordinal_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let slots = tc_enum_variant_slots(tid)
+    if slots.len() == 0 {
+        derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
+        return -1
+    }
+    let spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), span)
+    let scrutinee = value_ref(tid, "self", Position.Param, span)
+    let unknown = corrupt_tag_block(decl, derive_serialize, span)
+    let strs = str_spelling(span)
+    if spelling == "" || strs == "" || scrutinee < 0 || unknown < 0 { return -1 }
+    let mut cases: List[Int] = []
+    let mut i = 0
+    while i < slots.len() {
+        let vnode = variant_decl_node(decl, slots.get(i).unwrap(), i, span)
+        if vnode < 0 { return -1 }
+        let text = ser_call_part(ser_str_module, "json_escape_str",
+            ir_const(TYPE_STR, span, strs, c_string_literal(json_variant_name(vnode))), span)
+        if !text.ok { return -1 }
+        cases.push(ir_const(tid, span, spelling, c_variant_discriminant(tid, vnode)))
+        cases.push(ir_block(span, [ir_return(span, text.arg)]))
+        i = i + 1
+    }
+    ir_block(span, [ir_switch(span, scrutinee, cases, unknown)])
+}
+
+fn ser_struct_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let mut parts: List[DebugPart] = []
+    let mut labels: List[Str] = []
+    for slot in tc_struct_field_slots(tid) {
+        let ftid = tc_sfield_tid(slot)
+        let name = tc_sfield_name(slot)
+        let value = field_value(tid, ftid, c_field_name(name), "self", derive_serialize, span)
+        if value < 0 { return -1 }
+        let part = ser_part(ftid, value, name, span)
+        if !part.ok { return -1 }
+        parts.push(part)
+        labels.push(name)
+    }
+    if parts.len() == 0 {
+        let answer = debug_constant("\{\}", span)
+        if answer < 0 { return -1 }
+        return ir_block(span, [answer])
+    }
+    let stmts = debug_stmts("\{{ser_members(labels, parts)}\}", parts, span)
+    if stmts.len() == 0 { return -1 }
+    ir_block(span, stmts)
+}
+
+// The members of one JSON object, each a quoted key and the conversion its value needs.
+// A field name is an identifier, so it needs no escaping and holds no `%`.
+fn ser_members(labels: List[Str], parts: List[DebugPart]) -> Str {
+    let mut inner: List[Str] = []
+    let mut i = 0
+    while i < parts.len() {
+        inner.push("\"{labels.get(i).unwrap()}\":{parts.get(i).unwrap().spec}")
+        i = i + 1
+    }
+    inner.join(",")
+}
+
+fn ser_tagged_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
+    let slots = tc_enum_variant_slots(tid)
+    if slots.len() == 0 {
+        derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
+        return -1
+    }
+    let ints = int_spelling(span)
+    if ints == "" { return -1 }
+    let scrutinee = tag_ref(tid, "self", Position.Param, ints, span)
+    let unknown = corrupt_tag_block(decl, derive_serialize, span)
+    if scrutinee < 0 || unknown < 0 { return -1 }
+    let cases = variant_cases(decl, tid, slots, ints, derive_serialize, "", span)
+    if cases.len() == 0 { return -1 }
+    ir_block(span, [ir_switch(span, scrutinee, cases, unknown)])
+}
+
+fn ser_variant_block(decl: Int, tid: Int, slot: Int, span: Int) -> Int ! Diag.Report {
+    let vname = tc_evar_name(slot)
+    let head = "\{\"type\":\"{vname}\""
+    let mut parts: List[DebugPart] = []
+    let mut labels: List[Str] = []
+    for f in tc_evar_field_slots(slot) {
+        let ftid = tc_evfield_tid(f)
+        let fname = tc_evfield_name(f)
+        let path = "{c_enum_payload_member()}.{vname}.{c_field_name(fname)}"
+        let value = field_value(tid, ftid, path, "self", derive_serialize, span)
+        if value < 0 { return -1 }
+        let part = ser_part(ftid, value, "{vname}.{fname}", span)
+        if !part.ok { return -1 }
+        parts.push(part)
+        labels.push(fname)
+    }
+    if parts.len() == 0 {
+        let answer = debug_constant("{head}\}", span)
+        if answer < 0 { return -1 }
+        return ir_block(span, [answer])
+    }
+    let stmts = debug_stmts("{head},{ser_members(labels, parts)}\}", parts, span)
+    if stmts.len() == 0 { return -1 }
+    ir_block(span, stmts)
+}
+
+// ── One field's JSON ─────────────────────────────────────────────────────
+
+// The field types typecheck admits for Serialize, each written as its JSON leaf. Any other
+// kind reaching here is refused rather than written as a placeholder that parses as JSON
+// but no longer holds the value.
+fn ser_part(ftid: Int, value: Int, path: Str, span: Int) -> DebugPart ! Diag.Report {
+    let k = tc_tid_kind(tc_resolve(ftid))
+    if k == TyKind.Bool { return debug_bool_part(value, span) }
+    if k == TyKind.Str { return ser_call_part(ser_str_module, "json_escape_str", value, span) }
+    if k == TyKind.Float { return ser_call_part(ser_num_module, "float_to_str", value, span) }
+    if k == TyKind.Struct || k == TyKind.Enum {
+        return derived_call_part(ftid, value, path, derive_serialize, "to_json", span)
+    }
+    if k == TyKind.List { return ser_list_part(ftid, value, path, span) }
+    let spec = format_spec_of(ftid)
+    if k != TyKind.Int || spec == "" {
+        not_built(span, "@derive(Serialize) on the {tk_name(k)} field '{path}'")
+        return debug_refused()
+    }
+    let promoted = varargs_spelling(ftid)
+    let arg = if promoted == "" { value } else { ir_cast(ftid, span, promoted, value) }
+    DebugPart { spec: spec, arg: arg, pre: [], ok: true }
+}
+
+// A leaf whose JSON text a stdlib function answers. The escaper is the stdlib's own, so a
+// derived body and a hand-written one quote a string the same way.
+fn ser_call_part(module: Str, name: Str, value: Int, span: Int) -> DebugPart ! Diag.Report {
+    let rec = layout_of(TYPE_STR, Position.Local)
+    let spelling = spelling_or_ice(rec, "Str", span)
+    let spec = format_spec_of(TYPE_STR)
+    if spelling == "" || spec == "" { return debug_refused() }
+    let symbol = cg_call_stdlib_symbol(span, module, name)
+    if symbol == "" { return debug_refused() }
+    let arg = ir_call_direct(TYPE_STR, span, spelling, symbol, rec.slot_form, [value])
+    DebugPart { spec: spec, arg: arg, pre: [], ok: true }
+}
+
+// A list is joined into one JSON array before the object is formatted, so the formatter
+// sees one string argument however many elements the list holds.
+fn ser_list_part(ftid: Int, value: Int, path: Str, span: Int) -> DebugPart ! Diag.Report {
+    let etid = child_tid(ftid, Slot.Inner1)
+    if etid < 0 {
+        derive_ice(span, "the list field '{path}' has no element type")
+        return debug_refused()
+    }
+    let lrec = layout_of(ftid, Position.Local)
+    let lspelling = spelling_or_ice(lrec, "the list field '{path}'", span)
+    let strs = str_spelling(span)
+    let ints = int_spelling(span)
+    if lspelling == "" || strs == "" || ints == "" { return debug_refused() }
+    let names = ListWalk { list: c_mint_local("j"), carry: c_mint_local("j"), index: c_mint_local("j"),
+        lspelling: lspelling, lform: lrec.slot_form, strs: strs, ints: ints }
+    let step = ser_list_step(names, ftid, etid, path, span)
+    if step < 0 { return debug_refused() }
+    let mut pre: List[Int] = []
+    pre.push(ir_let(ftid, span, lspelling, names.list, lrec.slot_form, value))
+    pre.push(ir_let(TYPE_STR, span, strs, names.carry, str_form(), ser_text(names, "[", span)))
+    pre.push(ir_let(TYPE_INT, span, ints, names.index, int_form(), ir_const(TYPE_INT, span, ints, "0")))
+    pre.push(ir_loop(span, step))
+    pre.push(ser_append(names, ser_text(names, "]", span), span))
+    DebugPart { spec: format_spec_of(TYPE_STR), arg: ser_acc(names, span), pre: pre, ok: true }
+}
+
+// The locals one walk over a list names, minted once so every read names the same C
+// local. `carry` is the text a join builds, or the element count a build runs to.
+type ListWalk {
+    list: Str
+    carry: Str
+    index: Str
+    lspelling: Str
+    lform: SlotForm
+    strs: Str
+    ints: Str
+}
+
+fn str_form() -> SlotForm {
+    layout_of(TYPE_STR, Position.Local).slot_form
+}
+
+fn ser_text(names: ListWalk, text: Str, span: Int) -> Int {
+    ir_const(TYPE_STR, span, names.strs, c_string_literal(text))
+}
+
+fn ser_acc(names: ListWalk, span: Int) -> Int {
+    ir_var_ref(TYPE_STR, span, names.strs, names.carry, str_form())
+}
+
+fn ser_index(names: ListWalk, span: Int) -> Int {
+    ir_var_ref(TYPE_INT, span, names.ints, names.index, int_form())
+}
+
+fn ser_append(names: ListWalk, piece: Int, span: Int) -> Int {
+    let joined = ir_call_runtime(TYPE_STR, span, names.strs, c_runtime_helper("str_concat"),
+        str_form(), [ser_acc(names, span), piece])
+    ir_assign(span, ser_acc(names, span), joined)
+}
+
+// One pass of the join: stop at the end, put a comma before every element but the first,
+// then append the element's own JSON.
+fn ser_list_step(names: ListWalk, ftid: Int, etid: Int, path: Str, span: Int) -> Int ! Diag.Report {
+    let bools = bool_spelling(span)
+    if bools == "" { return -1 }
+    let list = ir_var_ref(ftid, span, names.lspelling, names.list, names.lform)
+    let len = ir_call_runtime(TYPE_INT, span, names.ints, c_runtime_helper("list_len"), int_form(), [list])
+    let more = ir_binary(TYPE_BOOL, span, bools, "<", ser_index(names, span), len)
+    let stop = ir_if(span, ir_unary(TYPE_BOOL, span, bools, "!", more), ir_block(span, [ir_break(span)]), -1)
+    let later = ir_binary(TYPE_BOOL, span, bools, ">", ser_index(names, span), ir_const(TYPE_INT, span, names.ints, "0"))
+    let comma = ir_if(span, later, ir_block(span, [ser_append(names, ser_text(names, ",", span), span)]), -1)
+    let again = ir_var_ref(ftid, span, names.lspelling, names.list, names.lform)
+    let elem = cg_call_element_from_runtime(span, etid, c_runtime_helper("list_get"), [again, ser_index(names, span)])
+    if elem < 0 { return -1 }
+    let part = ser_part(etid, elem, "an element of {path}", span)
+    if !part.ok { return -1 }
+    let mut stmts = [stop, comma]
+    for s in part.pre { stmts.push(s) }
+    stmts.push(ser_append(names, ser_piece(names, part, span), span))
+    let next = ir_binary(TYPE_INT, span, names.ints, "+", ser_index(names, span), ir_const(TYPE_INT, span, names.ints, "1"))
+    stmts.push(ir_assign(span, ser_index(names, span), next))
+    ir_block(span, stmts)
+}
+
+// A part that is already a string is appended as it is. Any other part is a number that
+// needs its conversion applied before it can be joined.
+fn ser_piece(names: ListWalk, part: DebugPart, span: Int) -> Int {
+    if part.spec == format_spec_of(TYPE_STR) { return part.arg }
+    let fmt = ir_const(TYPE_STR, span, names.strs, c_string_literal(part.spec))
+    ir_call_runtime(TYPE_STR, span, names.strs, c_runtime_helper("str_format"), str_form(), [fmt, part.arg])
+}
+
+// ── Deserialize ──────────────────────────────────────────────────────────
+
+// The member names and tag numbers a Result is written with. A stage that builds a
+// Result and a stage that matches one spell the same pairs, so these match cg_call's.
+let de_ok_member = "ok"
+let de_err_member = "err"
+let de_tag_ok = "0"
+let de_tag_err = "1"
+
+// What every statement of one reader needs to answer: the Result it returns, and the
+// spellings its comparisons and locals are written with. `ok` is false after a refusal.
+type DeReader {
+    result: Int
+    carrier: LayoutRecord
+    strs: Str
+    ints: Str
+    bools: Str
+    ok: Bool
+}
+
+// One value read out of a JSON node: the statements that check and read it, and the
+// expression that holds it afterwards. `ok` is false after a refusal.
+type DeRead {
+    pre: List[Int]
+    value: Int
+    ok: Bool
+}
+
+fn de_refused() -> DeRead {
+    DeRead { pre: [], value: -1, ok: false }
+}
+
+// from_json parses the text once and hands the root to from_json_node, which reads one
+// node of the parsed tree. A nested type is read through its own node reader, so its
+// subtree is never written back out and parsed a second time.
+fn de_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
+    let tid = derive_tid(decl, arg)
+    if tid < 0 { return }
+    if refused(shape_refusal(decl, tid, derive_deserialize), arg) { return }
+    if !cg_call_stdlib_declares(de_json_module, "json_parse") {
+        return not_built(arg, "@derive(Deserialize) on '{node_name(decl)}' without `import std.json`, whose parser from_json calls")
+    }
+    let r = de_reader_of(tid, arg)
+    if !r.ok { return }
+    let ret = r.carrier.c_spelling
+    let entry = c_derive_method_name(decl, "from_json")
+    let reader = c_derive_method_name(decl, "from_json_node")
+    let entry_params = ["{r.strs} input"]
+    let reader_params = ["{r.ints} idx"]
+    if !bodies {
+        // The Result is spelled first by these signatures, so its typedef has to come out
+        // ahead of them.
+        let _td = ensure_typedef_for(r.result)
+        print_typedef_blocks(layout_take_typedefs())
+        print_fn_decl(false, ret, reader, reader_params, false)
+        return print_fn_decl(false, ret, entry, entry_params, false)
+    }
+    let rbody = de_reader_body(decl, tid, r, arg)
+    if rbody < 0 { return }
+    let ebody = de_entry_body(r, reader, arg)
+    if ebody < 0 { return }
+    print_fn(false, ret, reader, reader_params, false, rbody)
+    print_fn(false, ret, entry, entry_params, false, ebody)
+}
+
+// An err member layout would box is a struct, and a Str never is, so a boxed answer
+// means the Result is not the one typecheck gave from_json.
+fn de_reader_of(tid: Int, span: Int) -> DeReader ! Diag.Report {
+    let result = make_result_type(tid, TYPE_STR)
+    let carrier = layout_of(result, Position.Return)
+    let spelling = spelling_or_ice(carrier, "the Result from_json answers", span)
+    let err = carrier_member_layout(result, Slot.Inner2)
+    let strs = str_spelling(span)
+    let ints = int_spelling(span)
+    let bools = bool_spelling(span)
+    let refused_reader = DeReader { result: -1, carrier: carrier, strs: "", ints: "", bools: "", ok: false }
+    if spelling == "" || strs == "" || ints == "" || bools == "" { return refused_reader }
+    if err.decline_reason != "" || err.slot_form == SlotForm.PointerBoxed {
+        derive_ice(span, "the err arm of the Result from_json answers is not a Str word")
+        return refused_reader
+    }
+    DeReader { result: result, carrier: carrier, strs: strs, ints: ints, bools: bools, ok: true }
+}
+
+fn de_entry_body(r: DeReader, reader: Str, span: Int) -> Int ! Diag.Report {
+    let clear = cg_call_stdlib_symbol(span, de_json_module, "json_clear")
+    let parse = cg_call_stdlib_symbol(span, de_json_module, "json_parse")
+    let void_rec = layout_of(TYPE_VOID, Position.Return)
+    if clear == "" || parse == "" { return -1 }
+    let root = c_mint_local("jroot")
+    let input = ir_var_ref(TYPE_STR, span, r.strs, "input", str_form())
+    let parsed = ir_call_direct(TYPE_INT, span, r.ints, parse, int_form(), [input])
+    let failed = ir_binary(TYPE_BOOL, span, r.bools, "<", de_int_local(r, root, span), ir_const(TYPE_INT, span, r.ints, "0"))
+    let answer = ir_call_direct(r.result, span, r.carrier.c_spelling, reader, r.carrier.slot_form,
+        [de_int_local(r, root, span)])
+    ir_block(span, [
+        ir_expr_stmt(span, ir_call_direct(TYPE_VOID, span, void_rec.c_spelling, clear, void_rec.slot_form, [])),
+        ir_let(TYPE_INT, span, r.ints, root, int_form(), parsed),
+        ir_if(span, failed, de_fail(r, "JSON parse error", span), -1),
+        ir_return(span, answer),
+    ])
+}
+
+fn de_int_local(r: DeReader, name: Str, span: Int) -> Int {
+    ir_var_ref(TYPE_INT, span, r.ints, name, int_form())
+}
+
+fn de_str_const(r: DeReader, text: Str, span: Int) -> Int {
+    ir_const(TYPE_STR, span, r.strs, c_string_literal(text))
+}
+
+fn de_err(r: DeReader, message: Int, span: Int) -> Int {
+    ir_return(span, ir_carrier_wrap(r.result, span, r.carrier.c_spelling, de_err_member,
+        ir_const(TYPE_INT, span, r.ints, de_tag_err), message))
+}
+
+fn de_fail(r: DeReader, text: Str, span: Int) -> Int {
+    ir_block(span, [de_err(r, de_str_const(r, text, span), span)])
+}
+
+fn de_ok(r: DeReader, value: Int, span: Int) -> Int {
+    ir_return(span, ir_carrier_wrap(r.result, span, r.carrier.c_spelling, de_ok_member,
+        ir_const(TYPE_INT, span, r.ints, de_tag_ok), value))
+}
+
+// A call into std.json that answers a word: a node index, a count, a JSON type or a flag.
+fn de_json_call(r: DeReader, name: Str, args: List[Int], span: Int) -> Int ! Diag.Report {
+    let symbol = cg_call_stdlib_symbol(span, de_json_module, name)
+    if symbol == "" { return -1 }
+    ir_call_direct(TYPE_INT, span, r.ints, symbol, int_form(), args)
+}
+
+// A JSON type tag, read from std.json's own constant so the reader and the parser agree on
+// the numbering.
+fn de_json_tag(r: DeReader, name: Str, span: Int) -> Int ! Diag.Report {
+    for decl in cg_reg_global_decls() {
+        if node_name(decl) == name && cg_reg_module_of(decl) == de_json_module {
+            return ir_global_ref(TYPE_INT, span, r.ints, c_global_name(decl), int_form())
+        }
+    }
+    derive_ice(span, "std.json declares no '{name}' for a derived reader to compare against")
+    -1
+}
+
+// The guard a node passes before it is read: its JSON type is one of `tags`. A missing
+// key reads as node -1, whose type is -1, so this one check also refuses a missing field.
+fn de_guard(r: DeReader, node: Str, tags: List[Str], what: Str, span: Int) -> Int ! Diag.Report {
+    let mut cond = -1
+    for tag in tags {
+        let t = de_json_call(r, "json_type", [de_int_local(r, node, span)], span)
+        let want = de_json_tag(r, tag, span)
+        if t < 0 || want < 0 { return -1 }
+        let differs = ir_binary(TYPE_BOOL, span, r.bools, "!=", t, want)
+        cond = if cond < 0 { differs } else { ir_binary(TYPE_BOOL, span, r.bools, "&&", cond, differs) }
+    }
+    ir_if(span, cond, de_fail(r, "{what} is missing or holds the wrong JSON type", span), -1)
+}
+
+// ── One value read back ──────────────────────────────────────────────────
+
+// Each kind Serialize writes, read back from the node the local `node` names. A kind with
+// no reader is refused rather than given a zero, which would parse and then lie.
+fn de_read(r: DeReader, ftid: Int, node: Str, what: Str, span: Int) -> DeRead ! Diag.Report {
+    let k = tc_tid_kind(tc_resolve(ftid))
+    if k == TyKind.Str { return de_read_leaf(r, "JSON_STRING", "json_as_str", TYPE_STR, r.strs, node, what, span) }
+    if k == TyKind.Int { return de_read_leaf(r, "JSON_INT", "json_as_int", TYPE_INT, r.ints, node, what, span) }
+    if k == TyKind.Bool { return de_read_bool(r, node, what, span) }
+    if k == TyKind.Float { return de_read_float(r, node, what, span) }
+    if k == TyKind.Struct || k == TyKind.Enum { return de_read_nested(r, ftid, node, what, span) }
+    if k == TyKind.List { return de_read_list(r, ftid, node, what, span) }
+    not_built(span, "@derive(Deserialize) on {what} of kind {tk_name(k)}")
+    de_refused()
+}
+
+fn de_read_leaf(r: DeReader, tag: Str, reader: Str, tid: Int, spelling: Str, node: Str, what: Str, span: Int) -> DeRead ! Diag.Report {
+    let guard = de_guard(r, node, [tag], what, span)
+    let symbol = cg_call_stdlib_symbol(span, de_json_module, reader)
+    if guard < 0 || symbol == "" { return de_refused() }
+    let form = layout_of(tid, Position.Local).slot_form
+    let value = ir_call_direct(tid, span, spelling, symbol, form, [de_int_local(r, node, span)])
+    DeRead { pre: [guard], value: value, ok: true }
+}
+
+// std.json answers a Bool as a word, so the reader turns it into the language's Bool.
+fn de_read_bool(r: DeReader, node: Str, what: Str, span: Int) -> DeRead ! Diag.Report {
+    let guard = de_guard(r, node, ["JSON_BOOL"], what, span)
+    let flag = de_json_call(r, "json_as_bool", [de_int_local(r, node, span)], span)
+    if guard < 0 || flag < 0 { return de_refused() }
+    let value = ir_binary(TYPE_BOOL, span, r.bools, "!=", flag, ir_const(TYPE_INT, span, r.ints, "0"))
+    DeRead { pre: [guard], value: value, ok: true }
+}
+
+// JSON has one number type, so a Float field accepts a whole number too. std.json keeps a
+// whole number as an Int node and answers 0.0 for it as a Float, so that node is read as
+// an Int and widened.
+fn de_read_float(r: DeReader, node: Str, what: Str, span: Int) -> DeRead ! Diag.Report {
+    let guard = de_guard(r, node, ["JSON_FLOAT", "JSON_INT"], what, span)
+    let as_float = cg_call_stdlib_symbol(span, de_json_module, "json_as_float")
+    let t = de_json_call(r, "json_type", [de_int_local(r, node, span)], span)
+    let whole_tag = de_json_tag(r, "JSON_INT", span)
+    let whole = de_json_call(r, "json_as_int", [de_int_local(r, node, span)], span)
+    let frec = layout_of(TYPE_FLOAT, Position.Local)
+    let fs = spelling_or_ice(frec, "Float", span)
+    if guard < 0 || as_float == "" || t < 0 || whole_tag < 0 || whole < 0 || fs == "" { return de_refused() }
+    let is_whole = ir_binary(TYPE_BOOL, span, r.bools, "==", t, whole_tag)
+    let fraction = ir_call_direct(TYPE_FLOAT, span, fs, as_float, frec.slot_form, [de_int_local(r, node, span)])
+    let value = ir_select(TYPE_FLOAT, span, fs, frec.slot_form, is_whole, ir_cast(TYPE_FLOAT, span, fs, whole), fraction)
+    DeRead { pre: [guard], value: value, ok: true }
+}
+
+// A nested type is read by its own node reader, and its error is passed up unchanged so
+// the message still names the field that failed.
+fn de_read_nested(r: DeReader, ftid: Int, node: Str, what: Str, span: Int) -> DeRead ! Diag.Report {
+    let fdecl = tc_tid_decl_node(ftid)
+    if fdecl < 0 || fdecl == DECL_NODE_AMBIGUOUS {
+        derive_ice(span, "{what} has a type with no unambiguous declaration to read through")
+        return de_refused()
+    }
+    if !has_str(derive_names(fdecl), derive_deserialize) {
+        not_built(span, "@derive(Deserialize) on {what}, whose type '{node_name(fdecl)}' implements Deserialize by hand")
+        return de_refused()
+    }
+    let refusal = shape_refusal(fdecl, ftid, derive_deserialize)
+    if refusal != "" {
+        not_built(span, "{refusal}, which {what} would have to call")
+        return de_refused()
+    }
+    let inner = de_reader_of(ftid, span)
+    let okm = carrier_member_layout(inner.result, Slot.Inner1)
+    let errm = carrier_member_layout(inner.result, Slot.Inner2)
+    if !inner.ok || okm.decline_reason != "" { return de_refused() }
+    let got = c_mint_local("jn")
+    let call = ir_call_direct(inner.result, span, inner.carrier.c_spelling, c_derive_method_name(fdecl, "from_json_node"),
+        inner.carrier.slot_form, [de_int_local(r, node, span)])
+    let bind = ir_let(inner.result, span, inner.carrier.c_spelling, got, inner.carrier.slot_form, call)
+    let held = ir_var_ref(inner.result, span, inner.carrier.c_spelling, got, inner.carrier.slot_form)
+    let failed = ir_binary(TYPE_BOOL, span, r.bools, "!=", ir_carrier_tag(TYPE_INT, span, r.ints, held),
+        ir_const(TYPE_INT, span, r.ints, de_tag_ok))
+    let again = ir_var_ref(inner.result, span, inner.carrier.c_spelling, got, inner.carrier.slot_form)
+    let message = ir_carrier_unwrap(TYPE_STR, span, errm.c_spelling, de_err_member, errm.slot_form, again)
+    let pass_up = ir_if(span, failed, ir_block(span, [de_err(r, message, span)]), -1)
+    let last = ir_var_ref(inner.result, span, inner.carrier.c_spelling, got, inner.carrier.slot_form)
+    let value = ir_carrier_unwrap(ftid, span, okm.c_spelling, de_ok_member, okm.slot_form, last)
+    DeRead { pre: [bind, pass_up], value: value, ok: true }
+}
+
+// A list is built from a JSON array one element at a time. Each element is stored through
+// the same slot shape a list read uses, so the list reads back what was stored.
+fn de_read_list(r: DeReader, ftid: Int, node: Str, what: Str, span: Int) -> DeRead ! Diag.Report {
+    let etid = child_tid(ftid, Slot.Inner1)
+    if etid < 0 {
+        derive_ice(span, "{what} is a list with no element type")
+        return de_refused()
+    }
+    let lrec = layout_of(ftid, Position.Local)
+    let ls = spelling_or_ice(lrec, what, span)
+    let guard = de_guard(r, node, ["JSON_ARRAY"], what, span)
+    let count = de_json_call(r, "json_len", [de_int_local(r, node, span)], span)
+    if ls == "" || guard < 0 || count < 0 { return de_refused() }
+    let names = ListWalk { list: c_mint_local("jl"), carry: c_mint_local("jl"), index: c_mint_local("jl"),
+        lspelling: ls, lform: lrec.slot_form, strs: r.strs, ints: r.ints }
+    let step = de_list_step(r, names, ftid, etid, node, what, span)
+    if step < 0 { return de_refused() }
+    let fresh = ir_call_runtime(ftid, span, ls, c_runtime_helper("list_new"), lrec.slot_form, [])
+    let pre = [
+        guard,
+        ir_let(ftid, span, ls, names.list, lrec.slot_form, fresh),
+        ir_let(TYPE_INT, span, r.ints, names.carry, int_form(), count),
+        ir_let(TYPE_INT, span, r.ints, names.index, int_form(), ir_const(TYPE_INT, span, r.ints, "0")),
+        ir_loop(span, step),
+    ]
+    DeRead { pre: pre, value: ir_var_ref(ftid, span, ls, names.list, lrec.slot_form), ok: true }
+}
+
+// One pass of the build: stop at the count, read the element node, store what it holds.
+fn de_list_step(r: DeReader, names: ListWalk, ftid: Int, etid: Int, node: Str, what: Str, span: Int) -> Int ! Diag.Report {
+    let more = ir_binary(TYPE_BOOL, span, r.bools, "<", ser_index(names, span), de_int_local(r, names.carry, span))
+    let stop = ir_if(span, ir_unary(TYPE_BOOL, span, r.bools, "!", more), ir_block(span, [ir_break(span)]), -1)
+    let el = c_mint_local("je")
+    let elem_node = de_json_call(r, "json_at", [de_int_local(r, node, span), ser_index(names, span)], span)
+    if elem_node < 0 { return -1 }
+    let read = de_read(r, etid, el, "an element of {what}", span)
+    if !read.ok { return -1 }
+    let slot = cg_call_element_to_slot(span, etid, read.value)
+    let void_rec = layout_of(TYPE_VOID, Position.Return)
+    if slot < 0 { return -1 }
+    let mut stmts = [stop, ir_let(TYPE_INT, span, r.ints, el, int_form(), elem_node)]
+    for s in read.pre { stmts.push(s) }
+    let list = ir_var_ref(ftid, span, names.lspelling, names.list, names.lform)
+    stmts.push(ir_expr_stmt(span, ir_call_runtime(TYPE_VOID, span, void_rec.c_spelling,
+        c_runtime_helper("list_push"), void_rec.slot_form, [list, slot])))
+    let next = ir_binary(TYPE_INT, span, r.ints, "+", ser_index(names, span), ir_const(TYPE_INT, span, r.ints, "1"))
+    stmts.push(ir_assign(span, ser_index(names, span), next))
+    ir_block(span, stmts)
+}
+
+// ── The three reader shapes ──────────────────────────────────────────────
+
+fn de_reader_body(decl: Int, tid: Int, r: DeReader, span: Int) -> Int ! Diag.Report {
+    let rec = layout_of(tid, Position.Param)
+    if rec.slot_form == SlotForm.InlineWord {
+        if rec.is_transparent != 0 {
+            not_built(span, "@derive(Deserialize) on the transparent newtype '{node_name(decl)}'")
+            return -1
+        }
+        return de_ordinal_body(decl, tid, r, span)
+    }
+    let k = tc_tid_kind(tc_resolve(tid))
+    if k == TyKind.Struct { return de_struct_body(tid, r, span) }
+    if k == TyKind.Enum { return de_tagged_body(decl, tid, r, span) }
+    not_built(span, "@derive(Deserialize) on a {tk_name(k)} type")
+    -1
+}
+
+// One named member of the object node `idx`, read into its own local. The local is what
+// the value is built from, so each member is read exactly once.
+fn de_member(r: DeReader, owner_tid: Int, ftid: Int, name: Str, span: Int) -> DeRead ! Diag.Report {
+    let frec = field_layout_of(owner_tid, ftid)
+    if field_refused(frec, name, derive_deserialize, span) { return de_refused() }
+    let vrec = layout_of(ftid, Position.Local)
+    let vs = spelling_or_ice(vrec, "field '{name}'", span)
+    let found = de_json_call(r, "json_get", [de_int_local(r, "idx", span), de_str_const(r, name, span)], span)
+    if vs == "" || found < 0 { return de_refused() }
+    let node = c_mint_local("jf")
+    let read = de_read(r, ftid, node, "field '{name}'", span)
+    if !read.ok { return de_refused() }
+    let held = c_mint_local("jv")
+    let mut pre = [ir_let(TYPE_INT, span, r.ints, node, int_form(), found)]
+    for s in read.pre { pre.push(s) }
+    pre.push(ir_let(ftid, span, vs, held, vrec.slot_form, read.value))
+    DeRead { pre: pre, value: ir_var_ref(ftid, span, vs, held, vrec.slot_form), ok: true }
+}
+
+fn de_struct_body(tid: Int, r: DeReader, span: Int) -> Int ! Diag.Report {
+    let spelling = spelling_or_ice(layout_of(tid, Position.Local), "the value from_json builds", span)
+    if spelling == "" { return -1 }
+    let mut stmts: List[Int] = []
+    let mut values: List[Int] = []
+    for slot in tc_struct_field_slots(tid) {
+        let m = de_member(r, tid, tc_sfield_tid(slot), tc_sfield_name(slot), span)
+        if !m.ok { return -1 }
+        for s in m.pre { stmts.push(s) }
+        values.push(m.value)
+    }
+    stmts.push(de_ok(r, ir_struct_new(tid, span, spelling, values), span))
+    ir_block(span, stmts)
+}
+
+// A payload-less enum is one JSON string, compared against each variant's JSON name.
+fn de_ordinal_body(decl: Int, tid: Int, r: DeReader, span: Int) -> Int ! Diag.Report {
+    let slots = tc_enum_variant_slots(tid)
+    let spelling = spelling_or_ice(layout_of(tid, Position.Local), node_name(decl), span)
+    let guard = de_guard(r, "idx", ["JSON_STRING"], "the enum '{node_name(decl)}'", span)
+    let text = de_json_str(r, "idx", span)
+    if spelling == "" || guard < 0 || text < 0 { return -1 }
+    let name = c_mint_local("js")
+    let mut stmts = [guard, ir_let(TYPE_STR, span, r.strs, name, str_form(), text)]
+    let mut i = 0
+    while i < slots.len() {
+        let vnode = variant_decl_node(decl, slots.get(i).unwrap(), i, span)
+        if vnode < 0 { return -1 }
+        let value = ir_const(tid, span, spelling, c_variant_discriminant(tid, vnode))
+        stmts.push(ir_if(span, de_names(r, name, json_variant_name(vnode), span),
+            ir_block(span, [de_ok(r, value, span)]), -1))
+        i = i + 1
+    }
+    stmts.push(ir_block(span, [de_err(r, de_str_const(r, "unknown enum variant", span), span)]))
+    ir_block(span, stmts)
+}
+
+fn de_json_str(r: DeReader, node: Str, span: Int) -> Int ! Diag.Report {
+    let symbol = cg_call_stdlib_symbol(span, de_json_module, "json_as_str")
+    if symbol == "" { return -1 }
+    ir_call_direct(TYPE_STR, span, r.strs, symbol, str_form(), [de_int_local(r, node, span)])
+}
+
+fn de_names(r: DeReader, local: Str, text: Str, span: Int) -> Int {
+    let held = ir_var_ref(TYPE_STR, span, r.strs, local, str_form())
+    ir_call_runtime(TYPE_BOOL, span, r.bools, c_runtime_helper("str_eq"), SlotForm.InlineWord,
+        [held, de_str_const(r, text, span)])
+}
+
+// A data-carrying enum reads its "type" key first: which payload fields exist depends on
+// the variant, so no payload can be read before the variant is known.
+fn de_tagged_body(decl: Int, tid: Int, r: DeReader, span: Int) -> Int ! Diag.Report {
+    let slots = tc_enum_variant_slots(tid)
+    let found = de_json_call(r, "json_get", [de_int_local(r, "idx", span), de_str_const(r, "type", span)], span)
+    if found < 0 { return -1 }
+    let node = c_mint_local("jt")
+    let name = c_mint_local("js")
+    let guard = de_type_key_guard(r, node, span)
+    let text = de_json_str(r, node, span)
+    if guard < 0 || text < 0 { return -1 }
+    let mut stmts = [ir_let(TYPE_INT, span, r.ints, node, int_form(), found), guard,
+        ir_let(TYPE_STR, span, r.strs, name, str_form(), text)]
+    let mut i = 0
+    while i < slots.len() {
+        let slot = slots.get(i).unwrap()
+        let vnode = variant_decl_node(decl, slot, i, span)
+        if vnode < 0 { return -1 }
+        let arm = de_variant_block(tid, slot, vnode, r, span)
+        if arm < 0 { return -1 }
+        stmts.push(ir_if(span, de_names(r, name, node_name(vnode), span), arm, -1))
+        i = i + 1
+    }
+    stmts.push(ir_block(span, [de_err(r, de_str_const(r, "unknown enum variant", span), span)]))
+    ir_block(span, stmts)
+}
+
+fn de_type_key_guard(r: DeReader, node: Str, span: Int) -> Int ! Diag.Report {
+    let t = de_json_call(r, "json_type", [de_int_local(r, node, span)], span)
+    let want = de_json_tag(r, "JSON_STRING", span)
+    if t < 0 || want < 0 { return -1 }
+    ir_if(span, ir_binary(TYPE_BOOL, span, r.bools, "!=", t, want), de_fail(r, "missing type discriminator", span), -1)
+}
+
+fn de_variant_block(tid: Int, slot: Int, vnode: Int, r: DeReader, span: Int) -> Int ! Diag.Report {
+    let spelling = spelling_or_ice(layout_of(tid, Position.Local), node_name(vnode), span)
+    if spelling == "" { return -1 }
+    let mut stmts: List[Int] = []
+    let mut payload: List[Int] = []
+    for f in tc_evar_field_slots(slot) {
+        let m = de_member(r, tid, tc_evfield_tid(f), tc_evfield_name(f), span)
+        if !m.ok { return -1 }
+        for s in m.pre { stmts.push(s) }
+        payload.push(m.value)
+    }
+    let member = if payload.len() == 0 { "" } else { c_variant_member_name(vnode) }
+    let tag = ir_const(TYPE_INT, span, r.ints, c_variant_discriminant(tid, vnode))
+    stmts.push(de_ok(r, ir_enum_new(tid, span, spelling, vnode, member, tag, payload), span))
+    ir_block(span, stmts)
 }
