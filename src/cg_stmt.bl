@@ -26,7 +26,8 @@ import typecheck.{
     tc_tid_kind, tk_name, make_list_type,
 }
 import layout.{
-    Position, Slot, SlotForm, LayoutRecord, bind_binder, bind_binder_cell, bind_binder_mut, binder_is_celled,
+    Position, Slot, SlotForm, LayoutRecord, async_scope_handles_spelling, bind_binder, bind_binder_cell,
+    bind_binder_mut, binder_is_celled,
     binder_scope_pop, binder_scope_push, carrier_member_layout, child_tid, container_slot_spelling,
     ensure_typedef_for, field_layout_of,
     layout_of, pointer_spelling, tid_holds_tag_member, tid_of_binder,
@@ -50,13 +51,15 @@ import diagnostics.{
     CODEGEN_STAGE_NOT_BUILT, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 import cg_expr.{
-    cg_expr_drain_pending, cg_expr_drop_values, cg_expr_is_registered, cg_expr_pending_count,
+    cg_expr_async_scope_close, cg_expr_async_scope_open, cg_expr_drain_pending, cg_expr_drop_values,
+    cg_expr_is_registered, cg_expr_pending_count,
     cg_expr_push_pending, cg_expr_register_value, cg_expr_set_return_type,
     cg_expr_take_pending, cg_expr_value_count, lower_expr,
     x_layout_checked, x_stopped, x_unbox_payload,
 }
 import cg_eff.{
-    cg_eff_binder_is_shared, cg_eff_lower_handler_install, cg_eff_resource_cleanup,
+    cg_eff_async_scope_exit_symbol, cg_eff_binder_is_shared, cg_eff_lower_handler_install,
+    cg_eff_resource_cleanup,
     cg_eff_scan_shared_binders,
 }
 import cg_call.{
@@ -325,6 +328,7 @@ fn lower_stmt_tail(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag
         NodeKind.LoopExpr => lower_loop(node)
         NodeKind.ForIn => lower_for_in(node)
         NodeKind.WithBlock => lower_with_block(node, tail, dest, dest_tid)
+        NodeKind.AsyncScope => lower_async_scope(node, tail, dest, dest_tid)
         NodeKind.Call => lower_call_stmt(node, tail, dest, dest_tid)
         NodeKind.MethodCall => lower_method_call_stmt(node, tail, dest, dest_tid)
         _ => lower_value_stmt(node, tail, dest, dest_tid)
@@ -1422,6 +1426,7 @@ fn mv_stmt(s: Int) -> Bool ! Diag.Report {
         NodeKind.WhileLoop => true
         NodeKind.LoopExpr => true
         NodeKind.WithBlock => true
+        NodeKind.AsyncScope => true
         NodeKind.Break => true
         NodeKind.Continue => true
         _ => mv_expr(s)
@@ -1535,6 +1540,7 @@ fn mv_expr(e: Int) -> Bool ! Diag.Report {
         NodeKind.MatchExpr => materialise_value_expr(e)
         NodeKind.Block => materialise_value_expr(e)
         NodeKind.WithBlock => materialise_value_expr(e)
+        NodeKind.AsyncScope => materialise_value_expr(e)
         NodeKind.BinOp => mv_binop(e)
         // `?` returns out of the function on its failure arm, and an operator on a type
         // that carries an impl is a call into it.
@@ -1814,6 +1820,7 @@ fn tail_fills(s: Int) -> Bool ! Diag.Report {
         NodeKind.IfExpr => arms_fill_tail(s)
         NodeKind.MatchExpr => match_arms_fill(s)
         NodeKind.WithBlock => body_fills(node_body(s))
+        NodeKind.AsyncScope => body_fills(node_body(s))
         _ => true
     }
 }
@@ -2284,6 +2291,24 @@ fn wrap_resource(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, de
 // part is lowering the item to the value that goes in the slot.
 fn wrap_handler(item: Int, inner: Int) -> Int ! Diag.Report {
     cg_eff_lower_handler_install(item, lower_value(item), inner)
+}
+
+// `async.scope { body }` opens a handle list before the body and drains it on every exit
+// from the body, normal, early return, or panic, through the same resource guard a `with`
+// resource gets. The open/close pair lets a nested `async.spawn` find its enclosing scope
+// by name through cg_expr_async_scope_current.
+fn lower_async_scope(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
+    let spelling = async_scope_handles_spelling()
+    let list_name = c_mint_local("ascope")
+    let bind = ir_let(TYPE_INT, node, spelling, list_name, SlotForm.InlineWord,
+        ir_call_runtime(TYPE_INT, node, spelling, c_runtime_helper("list_new"), SlotForm.InlineWord, []))
+    cg_expr_async_scope_open(list_name)
+    let body = lower_body_block(node_body(node), tail, dest, dest_tid)
+    cg_expr_async_scope_close()
+    if body < 0 { return -1 }
+    let resource = ir_var_ref(TYPE_INT, node, spelling, list_name, SlotForm.InlineWord)
+    let scoped = ir_with_scope(node, cg_eff_async_scope_exit_symbol(), resource, as_block(body))
+    ir_block(node, [bind, scoped])
 }
 
 // ── Match ─────────────────────────────────────────────────────────────────
