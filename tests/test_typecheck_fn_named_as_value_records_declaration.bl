@@ -1,0 +1,90 @@
+// A function named as a value, not called, is a read of the function's declaration. Codegen
+// builds the value from that declaration, so typecheck records the one the name resolved to,
+// through the same import rules a bare call follows.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_fn_value_decl_node, tc_global_decl_node}
+import parser.{node_kind, node_name, node_value, node_module, node_count}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn probe(path: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+// The ident a `let f = <name>` binding reads.
+fn value_read_of_f() -> Int {
+    let mut i = 0
+    while i < node_count() {
+        if node_kind(i) == NodeKind.LetBinding && node_name(i) == "f" {
+            let v = node_value(i)
+            if v != -1 && node_kind(v) == NodeKind.Ident { return v }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn assert_fn_decl_is(label: Str, read: Int, want_mod: Str, want_name: Str) {
+    if read < 0 {
+        io.println("FAIL: {label}: no value read found")
+    }
+    assert(read >= 0)
+    let decl = tc_fn_value_decl_node(read)
+    if decl < 0 {
+        io.println("FAIL: {label}: the read records no function declaration")
+    }
+    assert(decl >= 0)
+    assert(node_kind(decl) == NodeKind.FnDef)
+    let got_mod = node_module(decl)
+    let got_name = node_name(decl)
+    if got_mod != want_mod || got_name != want_name {
+        io.println("FAIL: {label}: read resolved to '{got_mod}.{got_name}', want '{want_mod}.{want_name}'")
+    }
+    assert(got_mod == want_mod)
+    assert(got_name == want_name)
+    // The global-let record means a C global; a function is not one.
+    assert(tc_global_decl_node(read) == -1)
+}
+
+test "a function of the same module named as a value records its declaration" {
+    probe("tests/zzcd_calls/src/main_fn_value_local.bl")
+    assert_no_errors("same module")
+    assert_fn_decl_is("same module", value_read_of_f(), "__main__", "zzcd_offset")
+}
+
+// Two re-exports sit between the reader and the declaration, and neither facade declares
+// the name, so the record has to name the module that wrote it.
+test "a function named as a value through two chained facades records the declaring module" {
+    probe("tests/zzcd_calls/src/main_fn_value_two_hop.bl")
+    assert_no_errors("two facades")
+    assert_fn_decl_is("two facades", value_read_of_f(), "zzcd_tagger", "zzcd_tag")
+}
+
+test "a local that shadows a function records no function declaration" {
+    probe("tests/zzcd_calls/src/main_fn_value_shadowed.bl")
+    assert_no_errors("shadowed")
+    let read = value_read_of_f()
+    assert(read >= 0)
+    assert(tc_fn_value_decl_node(read) == -1)
+}
