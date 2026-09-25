@@ -2030,24 +2030,35 @@ fn tc_tid_fill_unknowns(base0: Int, src0: Int) -> Int {
 // returns 1 WITHOUT binding, so a bare typevar is invisible to the whole metavar machinery.
 // That makes `α := T` a strictly lossy pin — it converts a solvable hole into an unsolvable
 // one — which is why the pin caller below refuses a declared type containing one.
-pub fn tc_tid_has_bare_typevar(tid0: Int) -> Int {
+pub fn tc_tid_has_bare_typevar(tid0: Int) -> Int { tc_tid_has_typevar_among(tid0, 0) }
+
+// A typevar the declaration being checked does not bind: the formal of some OTHER
+// declaration, such as a callee's parameter read off its signature. No substitution
+// ever reaches such a slot at this site, so it can never become concrete here.
+fn tc_tid_has_foreign_typevar(tid0: Int) -> Int { tc_tid_has_typevar_among(tid0, 1) }
+
+// foreign_only = 1 skips the typevars the declaration being checked binds.
+fn tc_tid_has_typevar_among(tid0: Int, foreign_only: Int) -> Int {
     let tid = tc_resolve(tid0)
     if tid < 0 || tid >= ty_pool.len() { return 0 }
     let e = ty_pool.get(tid).unwrap()
     let k = e.kind
-    if k == TyKind.Typevar { return 1 }
+    if k == TyKind.Typevar {
+        if foreign_only != 0 && tc_typevar_binds_here(tid) != 0 { return 0 }
+        return 1
+    }
     if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel {
-        return tc_tid_has_bare_typevar(e.inner1)
+        return tc_tid_has_typevar_among(e.inner1, foreign_only)
     }
     if k == TyKind.Result || k == TyKind.Map {
-        if tc_tid_has_bare_typevar(e.inner1) != 0 { return 1 }
-        return tc_tid_has_bare_typevar(e.inner2)
+        if tc_tid_has_typevar_among(e.inner1, foreign_only) != 0 { return 1 }
+        return tc_tid_has_typevar_among(e.inner2, foreign_only)
     }
     if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum {
         let mut i = 0
         while i < e.params_count {
             let c = ty_param_list.get(e.params_start + i).unwrap()
-            if tc_tid_has_bare_typevar(c) != 0 { return 1 }
+            if tc_tid_has_typevar_among(c, foreign_only) != 0 { return 1 }
             i = i + 1
         }
         return 0
@@ -3548,31 +3559,52 @@ fn tc_decl_has_own_type_params(decl: Int) -> Int {
     if sublist_length(tps) > 0 { 1 } else { 0 }
 }
 
-fn build_typevar_binds(sig: Int, args_sl: Int) -> Map[Str, Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    build_typevar_binds_off(sig, args_sl, 0)
-}
-
 // `self_offset` shifts which fnsig param each call argument aligns with. Free-fn calls
 // pass 0 (arg `pi` ↔ param `pi`). A method call passes 1: the receiver supplies param 0
 // (self), so call argument `pi` ↔ fnsig param `1 + pi`. This binds only the callee's own
 // declared params, never self — matching check_arg_shapes' own self_offset discipline.
-fn build_typevar_binds_off(sig: Int, args_sl: Int, self_offset: Int) -> Map[Str, Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+// `arg_tids` is what check_arg_shapes read for each argument, so every step of one call
+// binds against the same metavariables.
+fn build_typevar_binds(sig: Int, arg_tids: List[Int], self_offset: Int) -> Map[Str, Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let fs = fnsig_pool.get(sig).unwrap()
     let param_start = fs.params_start
     let param_count = fs.params_count
     let mut binds: Map[Str, Int] = Map()
-    if args_sl == -1 { return binds }
-    let n = sublist_length(args_sl)
     let mut i = 0
-    while i < n {
+    while i < arg_tids.len() {
         let pidx = i + self_offset
-        if pidx < param_count {
+        let arg_t = arg_tids.get(i).unwrap()
+        if pidx < param_count && arg_t >= 0 {
             let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
-            unify_typevar_binds(ptid, infer_type(sublist_get(args_sl, i)), binds)
+            unify_typevar_binds(ptid, arg_t, binds)
         }
         i = i + 1
     }
     binds
+}
+
+// The argument tids for a call no signature check reads, each argument inferred once.
+fn tc_infer_arg_tids(args_sl: Int) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let mut tids: List[Int] = []
+    if args_sl == -1 { return tids }
+    let mut i = 0
+    while i < sublist_length(args_sl) {
+        tids.push(tc_infer_unhinted(sublist_get(args_sl, i)))
+        i = i + 1
+    }
+    tids
+}
+
+// An argument's slot is its parameter, so what the call itself is expected to be says
+// nothing about it. Inferring under that hint would type the argument from the call's
+// context, and the call's return pin would never see the argument's own metavariables.
+@allow(UnrestoredMutation)
+fn tc_infer_unhinted(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let saved_hint = tc_construct_hint
+    tc_construct_hint = -1
+    let t = infer_type(node)
+    tc_construct_hint = saved_hint
+    t
 }
 
 // Enforce a call's type-param bounds against the concrete types discovered for it
@@ -3728,14 +3760,14 @@ fn tc_node_has_ret_mint(n: Int) -> Int {
 // The shared pin_ok gate for a declared-type pin, used by the LetBinding and
 // Assignment arms so both spell it once. The value minted a return-only group (the
 // generic-call path), OR the declared head is a container/carrier whose element
-// slots a concrete annotation determines: Map/Set/Option/Result carry their slots on
-// inner1/inner2, so a fully-concrete declared head (no bare typevar) can pin an
+// slots a concrete annotation determines: List/Map/Set/Option/Result carry their slots
+// on inner1/inner2, so a fully-concrete declared head (no bare typevar) can pin an
 // under-determined initializer without the struct-literal-field-metavar ambiguity
 // that keeps Struct/Enum heads on the mint path above.
 fn tc_pin_ok_for_declared(val: Int, declared_tid: Int) -> Int {
     if tc_node_has_ret_mint(val) != 0 { return 1 }
     let dk = type_kind(resolve_alias_tid(declared_tid))
-    if dk == TyKind.Map || dk == TyKind.Set || dk == TyKind.Option || dk == TyKind.Result {
+    if dk == TyKind.List || dk == TyKind.Map || dk == TyKind.Set || dk == TyKind.Option || dk == TyKind.Result {
         return 1
     }
     0
@@ -3758,23 +3790,14 @@ fn tc_pin_ok_for_declared(val: Int, declared_tid: Int) -> Int {
 // bind α with no new inference code, and a genuinely unconstrained α is reported as
 // E0301 at its binding boundary instead of reaching codegen.
 //
-// Minting HERE and not in build_typevar_binds: that function runs twice per call site
-// (once for the return type, once for tc_pin_generic_args_from_binds), so it would
-// produce two unrelated α for one slot and only one of them could ever be bound.
-// substitute_typevar_tid stays byte-identical — inserting α into `binds` is the whole
-// mechanism, which is what keeps every `-> Box[T]` whose T comes from an argument on
-// exactly its current path.
-fn instantiate_return_type(sig: Int, args_sl: Int, call_node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    instantiate_return_type_off(sig, args_sl, call_node, 0)
-}
-
-// `self_offset` as in build_typevar_binds_off: a method call's first argument aligns with
-// fnsig param 1, because the receiver is param 0.
-fn instantiate_return_type_off(sig: Int, args_sl: Int, call_node: Int, self_offset: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+// Minting HERE and not in build_typevar_binds: that function runs more than once per
+// call site (bounds, return type, pin), so it would produce unrelated α for one slot and
+// only one of them could ever be bound. `self_offset` as in build_typevar_binds.
+fn instantiate_return_type(sig: Int, arg_tids: List[Int], call_node: Int, self_offset: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let fs = fnsig_pool.get(sig).unwrap()
     let ret = fs.ret
     if ret < 0 || ret >= ty_pool.len() { return ret }
-    let mut binds = build_typevar_binds_off(sig, args_sl, self_offset)
+    let mut binds = build_typevar_binds(sig, arg_tids, self_offset)
     let mints = tc_ret_only_metavars(sig, call_node)
     let mut pi = 0
     while pi < mints.len() {
@@ -3809,24 +3832,21 @@ fn instantiate_return_type_off(sig: Int, args_sl: Int, call_node: Int, self_offs
 // supplies it), substitution leaves it a typevar, unify leaves the arg's α unbound,
 // and E0301 fires at the arg's own binding boundary. Runs only for metavar-carrying
 // args — concrete args and the no-generic path are untouched.
-fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, self_offset: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, arg_tids: List[Int], self_offset: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if args_sl == -1 { return }
     let fs = fnsig_pool.get(sig).unwrap()
     let param_start = fs.params_start
     let param_count = fs.params_count
-    let binds = build_typevar_binds(sig, args_sl)
-    tc_seed_closure_args_with_binds(sig, args_sl, self_offset, binds)
-    let n = sublist_length(args_sl)
+    let binds = build_typevar_binds(sig, arg_tids, self_offset)
+    let tids = tc_seed_closure_args_with_binds(sig, args_sl, arg_tids, self_offset, binds)
     let mut i = 0
-    while i < n {
+    while i < tids.len() {
         let pidx = i + self_offset
-        if pidx < param_count {
-            let arg_t = infer_type(sublist_get(args_sl, i))
-            if tc_tid_has_unbound_metavar(arg_t) != 0 {
-                let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
-                let concrete_ptid = substitute_typevar_tid(ptid, binds)
-                let _ = tc_unify(concrete_ptid, arg_t)
-            }
+        let arg_t = tids.get(i).unwrap()
+        if pidx < param_count && arg_t >= 0 && tc_tid_has_unbound_metavar(arg_t) != 0 {
+            let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
+            let concrete_ptid = substitute_typevar_tid(ptid, binds)
+            let _ = tc_unify(concrete_ptid, arg_t)
         }
         i = i + 1
     }
@@ -3848,21 +3868,39 @@ fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, self_offset: Int) ! Ty
 // window where the binds are complete and the stamp is still the thing the walk will read. A
 // type parameter no argument binds substitutes to itself, so the position stays open and its
 // parameter is still reported as under-determined.
-fn tc_seed_closure_args_with_binds(sig: Int, args_sl: Int, self_offset: Int, binds: Map[Str, Int]) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if args_sl == -1 { return }
+// Answers the argument tids with every seeded argument read again, since its closure's
+// type is now the seeded one.
+fn tc_seed_closure_args_with_binds(sig: Int, args_sl: Int, arg_tids: List[Int], self_offset: Int, binds: Map[Str, Int]) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let mut tids = arg_tids
+    if args_sl == -1 { return tids }
     let fs = fnsig_pool.get(sig).unwrap()
     let param_start = fs.params_start
     let param_count = fs.params_count
     let n = sublist_length(args_sl)
     let mut i = 0
-    while i < n {
+    while i < n && i < tids.len() {
         let pidx = i + self_offset
         if pidx < param_count {
-            let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
-            tc_seed_expected_into_value(sublist_get(args_sl, i), substitute_typevar_tid(ptid, binds))
+            let arg = sublist_get(args_sl, i)
+            let formal = substitute_typevar_tid(fnsig_param_list.get(param_start + pidx).unwrap(), binds)
+            tc_seed_expected_into_value(arg, formal)
+            if tc_formal_reaches_closure(formal) != 0 { tids.set(i, infer_type(arg)) }
         }
         i = i + 1
     }
+    tids
+}
+
+// Whether tc_seed_expected_into_value can reach a closure under this formal: a function
+// type, or a List whose elements can. Only those arguments change type when seeded, and
+// reading any other again would mint fresh metavariables the call's binds never see.
+fn tc_formal_reaches_closure(formal: Int) -> Int {
+    let r = tc_tid_resolved(formal)
+    if r < 0 || r >= ty_pool.len() { return 0 }
+    let t = ty_pool.get(r).unwrap()
+    if t.kind == TyKind.Fn { return 1 }
+    if t.kind == TyKind.List && t.inner1 >= 0 { return tc_formal_reaches_closure(t.inner1) }
+    0
 }
 
 // A function's declared return type is an expected-type source
@@ -3891,8 +3929,9 @@ fn tc_seed_closure_args_with_binds(sig: Int, args_sl: Int, self_offset: Int, bin
 //                        than fall into the params_count check below. Admitting the
 //                        two carriers back-pins a tail-`None` / tail-`Ok`/`Err` whose
 //                        other slot a declared return or annotation determines.
-//   TyKind.Struct/TyKind.Enum  — excludes List/tuple/Handler returns, which keeps
-//                        every existing tail-`[]` / tail-tuple return byte-identical.
+//   TyKind.List        — its element slot is inner1, as a Set's is, so `id([])` under
+//                        a declared List[Int] pins the α its `[]` argument minted.
+//   TyKind.Struct/TyKind.Enum  — excludes tuple/Handler returns.
 //   params_count > 0   — a monomorphic struct has nothing to pin.
 // The caller additionally requires an unbound metavar in the inferred value, which
 // excludes a bare TyKind.Typevar, so a generic fn's `-> Box[T]` keeps its existing
@@ -3921,7 +3960,7 @@ fn tc_pin_admits_declared(d: Int) -> Int {
     // ty_param_list, so a declared Result[Int,Str] / Option[Int] must pin an
     // under-determined tail-bound carrier the same way — the Struct/Enum params_count
     // path below never sees them.
-    if dt.kind == TyKind.Option || dt.kind == TyKind.Result { return 1 }
+    if dt.kind == TyKind.Option || dt.kind == TyKind.Result || dt.kind == TyKind.List { return 1 }
     if dt.kind != TyKind.Struct && dt.kind != TyKind.Enum { return 0 }
     if dt.params_count == 0 { return 0 }
     1
@@ -4467,7 +4506,7 @@ fn tc_raw_report_unconsumed() ! Diag.Report {
 // Genuinely saves/restores tc_construct_hint around infer_type; infer_type also
 // writes cumulative inference state that is intended to persist, not roll back.
 @allow(UnrestoredMutation)
-fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int, call_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int, call_node: Int) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let no_binds: Map[Str, Int] = Map()
     check_arg_shapes_with_binds(fn_name, sig, args_sl, self_offset, call_node, no_binds)
 }
@@ -4475,13 +4514,18 @@ fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int, call
 // Same as check_arg_shapes, but substitutes each param tid through `binds` first.
 // A poly-impl method on List[T] must hint a bare literal from the receiver's
 // concrete element type, not the impl's own unsubstituted Typevar(T).
+//
+// Answers one tid per argument, -1 where no parameter lines up. This is the one place
+// a call reads its arguments: a second infer_type would mint fresh metavariables for a
+// nested `Map()`, and the binds, return type and pin would each hold a different one.
 @allow(UnrestoredMutation)
-fn check_arg_shapes_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int, call_node: Int, binds: Map[Str, Int]) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn check_arg_shapes_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int, call_node: Int, binds: Map[Str, Int]) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // Every call against a declared signature reaches here, which is what makes the keyword
     // rules hold for `b.f(x: 1)` and not only for `f(x: 1)`. Before the args_sl == -1 return:
     // a call with no arguments at all still owes a signature its keyword arguments.
     let _kw = tc_check_keyword_args(fn_name, sig, args_sl, self_offset, call_node)
-    if args_sl == -1 { return }
+    let mut tids: List[Int] = []
+    if args_sl == -1 { return tids }
     let fs = fnsig_pool.get(sig).unwrap()
     let param_start = fs.params_start
     let param_count = fs.params_count
@@ -4496,72 +4540,76 @@ fn check_arg_shapes_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offset
             // codegen reports as InvalidKeywordArg; skipping leaves that one error standing.
             pidx = tc_fnsig_param_index_by_name(param_start, param_count, self_offset, node_name(arg_node))
         }
+        let mut arg_t = -1
         if pidx >= 0 && pidx < param_count {
             let ptid = substitute_typevar_tid(fnsig_param_list.get(param_start + pidx).unwrap(), binds)
-            if tc_tid_is_no_info(ptid) == 0 {
-                tc_seed_expected_into_value(arg_node, ptid)
-                let saved_hint = tc_construct_hint
-                tc_construct_hint = resolve_alias_tid(ptid)
-                let arg_t = infer_type(arg_node)
-                tc_construct_hint = saved_hint
-                // An argument whose own type nothing has determined cannot be judged against
-                // the parameter. Skipping keeps the mistake that made it undetermined as the
-                // single report, instead of adding a mismatch against a type nobody claimed.
-                // "Carries a hole" and not "is a hole": the name-resolution pass walks a body
-                // before the typecheck pass has settled its locals, so `[a]` reads there as
-                // `List[<hole>]` — a real List tid with an undetermined element. Comparing it
-                // reports against a type nobody claimed; the compare that matters runs again on
-                // the typecheck pass, with the element settled.
-                //
-                // Skips THIS argument, not the rest of the call. Every argument is seeded
-                // above, and a keyword-argument closure gets its parameter types from that
-                // seed, so abandoning the loop leaves the later closures unseeded and they
-                // report E0301 for a program that infers fine.
-                if tc_tid_is_no_info(arg_t) != 0 || tc_tid_has_unknown(arg_t) != 0 {
-                    i = i + 1
-                    continue
-                }
-                // Metavar path: passing an as-yet-unpinned empty container
-                // to a concretely-typed param is a constraining use — UNIFY so the
-                // param type PINS the argument's α (`let xs = []; takes_ints(xs)`
-                // infers List[Int]). tc_unify returns 0 on a hard mismatch (real
-                // arg-type error). Only when a metavar is actually present, so the
-                // fully-concrete path keeps its existing types_compatible semantics.
-                if tc_tid_has_unbound_metavar(arg_t) != 0 {
-                    if tc_unify(ptid, arg_t) == 0 {
-                        tc_error_at("argument {i + 1} of '{fn_name}' expects {type_to_str(ptid)}, got {type_to_str(arg_t)}", arg_node)
-                    }
-                } else {
-                    let mut lit_to_int = 0
-                    if is_int_literal_node(arg_node) != 0 && is_integer_type(resolve_alias_tid(ptid)) != 0 {
-                        lit_to_int = 1
-                    }
-                    // The template-literal coercion, on the same footing as the
-                    // int-literal one above. See tc_template_arg_ok.
-                    if tc_template_arg_ok(ptid, arg_node) != 0 {
-                        tc_raw_consume_template(arg_node)
-                        lit_to_int = 1
-                    } else if tc_template_launders_str(ptid, arg_t) != 0 {
-                        // The laundering case gets the spec's OWN diagnostic
-                        // (sections/03b_contracts.md:470) rather than the generic mismatch
-                        // below: E0310 with the hint that names the two ways out. This is the
-                        // error the whole feature exists to produce, and it used to come from
-                        // codegen (codegen_methods.bl:3151) — which meant it only fired on the
-                        // effect-op path and only after typecheck had let the program through.
-                        // Reporting it here covers every call shape and stops at the phase that
-                        // knows the param's type. Setting the flag suppresses the generic report,
-                        // so one mistake stays one error.
-                        diag_error_at("TemplateMismatch", TEMPLATE_MISMATCH, "expected {type_to_str(ptid)}, found {type_to_str(arg_t)} — string variables cannot be implicitly converted to Template", arg_node, "pass the string literal directly, or wrap values in Raw() for dynamic SQL")
-                        lit_to_int = 1
-                    }
-                    if lit_to_int == 0 && types_compatible(arg_t, ptid) == 0 {
-                        tc_error_at("argument {i + 1} of '{fn_name}' expects {type_to_str(ptid)}, got {type_to_str(arg_t)}", arg_node)
-                    }
-                }
-            }
+            if tc_tid_is_no_info(ptid) == 0 { arg_t = check_one_arg_shape(fn_name, i, arg_node, ptid) }
         }
+        // build_typevar_binds aligns by position, so a position with a parameter needs a
+        // tid even where the check above had no parameter type to hint it from.
+        if arg_t < 0 && i + self_offset < param_count { arg_t = tc_infer_unhinted(arg_node) }
+        tids.push(arg_t)
         i = i + 1
     }
+    tids
+}
+
+// One argument against its parameter type `ptid`, answering the argument's type.
+// Saves and restores tc_construct_hint around infer_type.
+@allow(UnrestoredMutation)
+fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    tc_seed_expected_into_value(arg_node, ptid)
+    let saved_hint = tc_construct_hint
+    tc_construct_hint = resolve_alias_tid(ptid)
+    let arg_t = infer_type(arg_node)
+    tc_construct_hint = saved_hint
+    // An argument whose own type nothing has determined cannot be judged against
+    // the parameter. Skipping keeps the mistake that made it undetermined as the
+    // single report, instead of adding a mismatch against a type nobody claimed.
+    // "Carries a hole" and not "is a hole": the name-resolution pass walks a body
+    // before the typecheck pass has settled its locals, so `[a]` reads there as
+    // `List[<hole>]` — a real List tid with an undetermined element. Comparing it
+    // reports against a type nobody claimed; the compare that matters runs again on
+    // the typecheck pass, with the element settled.
+    if tc_tid_is_no_info(arg_t) != 0 || tc_tid_has_unknown(arg_t) != 0 { return arg_t }
+    // Metavar path: passing an as-yet-unpinned empty container
+    // to a concretely-typed param is a constraining use — UNIFY so the
+    // param type PINS the argument's α (`let xs = []; takes_ints(xs)`
+    // infers List[Int]). tc_unify returns 0 on a hard mismatch (real
+    // arg-type error). Only when a metavar is actually present, so the
+    // fully-concrete path keeps its existing types_compatible semantics.
+    if tc_tid_has_unbound_metavar(arg_t) != 0 {
+        if tc_unify(ptid, arg_t) == 0 {
+            tc_error_at("argument {idx + 1} of '{fn_name}' expects {type_to_str(ptid)}, got {type_to_str(arg_t)}", arg_node)
+        }
+    } else {
+        let mut lit_to_int = 0
+        if is_int_literal_node(arg_node) != 0 && is_integer_type(resolve_alias_tid(ptid)) != 0 {
+            lit_to_int = 1
+        }
+        // The template-literal coercion, on the same footing as the
+        // int-literal one above. See tc_template_arg_ok.
+        if tc_template_arg_ok(ptid, arg_node) != 0 {
+            tc_raw_consume_template(arg_node)
+            lit_to_int = 1
+        } else if tc_template_launders_str(ptid, arg_t) != 0 {
+            // The laundering case gets the spec's OWN diagnostic
+            // (sections/03b_contracts.md:470) rather than the generic mismatch
+            // below: E0310 with the hint that names the two ways out. This is the
+            // error the whole feature exists to produce, and it used to come from
+            // codegen (codegen_methods.bl:3151) — which meant it only fired on the
+            // effect-op path and only after typecheck had let the program through.
+            // Reporting it here covers every call shape and stops at the phase that
+            // knows the param's type. Setting the flag suppresses the generic report,
+            // so one mistake stays one error.
+            diag_error_at("TemplateMismatch", TEMPLATE_MISMATCH, "expected {type_to_str(ptid)}, found {type_to_str(arg_t)} — string variables cannot be implicitly converted to Template", arg_node, "pass the string literal directly, or wrap values in Raw() for dynamic SQL")
+            lit_to_int = 1
+        }
+        if lit_to_int == 0 && types_compatible(arg_t, ptid) == 0 {
+            tc_error_at("argument {idx + 1} of '{fn_name}' expects {type_to_str(ptid)}, got {type_to_str(arg_t)}", arg_node)
+        }
+    }
+    arg_t
 }
 
 // Validate a single already-unwrapped argument value against an expected type,
@@ -14948,6 +14996,9 @@ fn tc_carrier_slot_from_hint(want: TyKind, slot: Int) -> Int {
     if e.kind != want { return make_metavar() }
     let other = if slot == 1 { e.inner1 } else { e.inner2 }
     if other < 0 { return make_metavar() }
+    // A callee's own parameter (`None` against `o: Option[T]`) names nothing at this site,
+    // and a slot holding it can never be pinned, so the slot is minted for the call to solve.
+    if tc_tid_has_foreign_typevar(other) != 0 { return make_metavar() }
     other
 }
 
@@ -15047,14 +15098,14 @@ fn tc_list_elem_contribution(elem: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Re
         // the hint as its own target: unnarrowed, `[x.into()]` under `List[Float]` converts to
         // List[Float] and an arena allocation sizes itself against the list. A spread is the
         // exception below — its source really is a whole list, so its slot is the hint as given.
+        // A hint that is not a List names no element slot, so the element gets none.
         let saved_hint = tc_construct_hint
+        let mut elem_hint = -1
         if tc_construct_hint >= 0 {
             let h = resolve_alias_tid(tc_construct_hint)
-            if type_kind(h) == TyKind.List {
-                let e = tc_tid_child(h, 0)
-                if e >= 0 { tc_construct_hint = e }
-            }
+            if type_kind(h) == TyKind.List { elem_hint = tc_tid_child(h, 0) }
         }
+        tc_construct_hint = elem_hint
         let t = infer_type(elem)
         tc_construct_hint = saved_hint
         return t
@@ -15866,28 +15917,20 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         let expected = fs.params_count
                         tc_error_at("function '{fn_name}' expects {expected} argument(s), got {arg_count}", node)
                     }
-                    check_arg_shapes(fn_name, sig, args_sl, 0, node)
+                    let arg_tids = check_arg_shapes(fn_name, sig, args_sl, 0, node)
                     if fs.type_params_count > 0 {
                         // Enforce each type param's declared bound against the concrete
-                        // type inferred for it (E0306). Read-only — bind the args, check,
-                        // diagnose — so it runs BEFORE the return/pin memo dance below and
-                        // preserves its "compute return FIRST, pin LAST" discipline.
-                        tc_check_bounds_for_binds(sig, build_typevar_binds(sig, args_sl), node)
+                        // type inferred for it (E0306). Read-only: bind the args, check,
+                        // diagnose.
+                        tc_check_bounds_for_binds(sig, build_typevar_binds(sig, arg_tids, 0), node)
                         // Pin any metavar-carrying arg from the call's resolved
                         // typevar binds, so `fill(Map(), 256, "x")` (K→Int, V→Str from
                         // the sibling args) codegens the Map() with the right kops
                         // instead of an erased default. If a
                         // typevar is genuinely unbound (no arg pins it), the arg's α
                         // stays unbound and E0301 fires at its own binding/boundary.
-                        // instantiate_return_type re-infers every arg via
-                        // build_typevar_binds, which re-mints a fresh (unbound)
-                        // Map[α,α]/Set[α] for a bare ctor arg and CLOBBERS the
-                        // node's memoized tid. So compute the return type FIRST,
-                        // then pin LAST — the pin's own final infer_type per arg
-                        // leaves the bound metavars in the node memo for codegen
-                        // to read.
-                        let ret_t = instantiate_return_type(sig, args_sl, node)
-                        tc_pin_generic_args_from_binds(sig, args_sl, 0)
+                        let ret_t = instantiate_return_type(sig, arg_tids, node, 0)
+                        tc_pin_generic_args_from_binds(sig, args_sl, arg_tids, 0)
                         return ret_t
                     }
                     return fs.ret
@@ -16545,7 +16588,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         // binds must exist before this call: a bare-literal argument whose
                         // static param type is the impl's own Typevar(T) needs the RECEIVER's
                         // concrete element type as its hint, not the raw unsubstituted binder.
-                        check_arg_shapes_with_binds("List.{method}", sig, node_args(node), 1, node, binds)
+                        let _ = check_arg_shapes_with_binds("List.{method}", sig, node_args(node), 1, node, binds)
                         let raw_ret = fnsig_pool.get(sig).unwrap().ret
                         return substitute_typevar_tid(raw_ret, binds)
                     }
@@ -17015,7 +17058,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 if btrait != "" {
                     let bsig = lookup_fnsig("{bname}_{btrait}_{method}")
                     if bsig != -1 {
-                        check_arg_shapes("{bname}.{method}", bsig, node_args(node), 1, node)
+                        let _ = check_arg_shapes("{bname}.{method}", bsig, node_args(node), 1, node)
                         // Which declaration this call reached. Phase 1 could not say: it has
                         // no receiver type, and the receiver is the only thing that tells two
                         // impls of one method name apart.
@@ -17043,7 +17086,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             let sig_name = if sole_trait != "" { "{tname}_{sole_trait}_{method}" } else { "{tname}_{method}" }
             let sig = lookup_fnsig(sig_name)
             if sig != -1 {
-                check_arg_shapes("{tname}.{method}", sig, node_args(node), 1, node)
+                let mut mtids = check_arg_shapes("{tname}.{method}", sig, node_args(node), 1, node)
                 // Which declaration this call reached. The signature answers, because the
                 // receiver picked the signature and the receiver is the only thing that
                 // tells two impls of one method name apart.
@@ -17056,11 +17099,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // with tc_impl_where_bounds_hold. Additive: the return path is untouched.
                 let mfs = fnsig_pool.get(sig).unwrap()
                 if mfs.type_params_count > 0 {
-                    let mbinds = build_typevar_binds_off(sig, node_args(node), 1)
+                    let mbinds = build_typevar_binds(sig, mtids, 1)
                     tc_check_bounds_for_binds(sig, mbinds, node)
                     // A method declaring its own type parameter has the same closure-argument
                     // ordering problem a free function does, and the receiver does not answer it.
-                    tc_seed_closure_args_with_binds(sig, node_args(node), 1, mbinds)
+                    mtids = tc_seed_closure_args_with_binds(sig, node_args(node), mtids, 1, mbinds)
                 }
                 // A type parameter the METHOD declares is chosen by the call, so the call's
                 // type is the declared return with that choice applied. Gated on the
@@ -17068,7 +17111,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // impl over a generic type puts the impl's binders in the same count and
                 // those are answered by the receiver, not by the arguments.
                 if tc_decl_has_own_type_params(mfs.decl) != 0 {
-                    return instantiate_return_type_off(sig, node_args(node), node, 1)
+                    return instantiate_return_type(sig, mtids, node, 1)
                 }
                 // A return declared over the receiver type's own binders, as a derived clone
                 // is, stands for the receiver's instance. A no-op for a monomorphic receiver.
@@ -17232,7 +17275,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if nr_is_defined(obj_name) == 0 && is_user_effect_handle_name(obj_name) != 0 {
                 let ue_sig = lookup_fnsig("{obj_name}.{method}")
                 if ue_sig != -1 {
-                    check_arg_shapes("{obj_name}.{method}", ue_sig, node_args(node), 0, node)
+                    let _ = check_arg_shapes("{obj_name}.{method}", ue_sig, node_args(node), 0, node)
                     return fnsig_pool.get(ue_sig).unwrap().ret
                 }
             }
@@ -17271,7 +17314,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     if nsi_kw_bad == 0 && nsi_got != nsi_fs.params_count {
                         tc_error_at("function '{obj_name}.{method}' expects {nsi_fs.params_count} argument(s), got {nsi_got}", node)
                     }
-                    check_arg_shapes("{obj_name}.{method}", nsi, nsi_args, 0, node)
+                    let _ = check_arg_shapes("{obj_name}.{method}", nsi, nsi_args, 0, node)
                     if type_kind(nsi_fs.ret) == TyKind.FfiScope && node != tc_with_resource_node {
                         tc_report_ffi_scope_value(node, tc_ffi_scope_binder)
                     }
@@ -17326,12 +17369,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // Int tid the tid path can spell. The scalar-return
                     // path (`-> T`, cmg_identity) already resolved correctly; this
                     // additionally fixes the generic-struct-instance return.
-                    // instantiate_return_type infers each arg (build_typevar_binds)
-                    // as a side effect, so the generic path also populates the
-                    // node→tid memo the tid-driven mono lowering (tc_mono_tids_core) reads.
+                    // tc_infer_arg_tids infers each arg, so the generic path also populates
+                    // the node→tid memo the tid-driven mono lowering (tc_mono_tids_core) reads.
                     let mq_fs = fnsig_pool.get(sig).unwrap()
                     if mq_fs.type_params_count > 0 {
-                        return instantiate_return_type(sig, mq_gen_args, node)
+                        return instantiate_return_type(sig, tc_infer_arg_tids(mq_gen_args), node, 0)
                     }
                     // Non-generic module-qualified call: no substitution, but still
                     // infer the args so their node→tid memo is populated (the
@@ -17478,7 +17520,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         if qt_kw_bad == 0 && qt_filled != qt_fs.params_count {
                             tc_error_at("qualified trait call '{obj_name}.{method}' expects {qt_fs.params_count} argument(s) including the receiver, got {qt_filled}", node)
                         }
-                        check_arg_shapes("{obj_name}.{method}", qt_sig, qt_args, 0, node)
+                        let _ = check_arg_shapes("{obj_name}.{method}", qt_sig, qt_args, 0, node)
                         return qt_fs.ret
                     }
                     // The synthesized sealed `Display.display` has no user fnsig anywhere
