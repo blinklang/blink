@@ -1,0 +1,81 @@
+// An Iterator method call, and `into_iter` on a List or Set, stands for a private generic
+// of std.iter. Mono must register the instance of that generic, found by module and name,
+// so a program's own fn of the same name never takes the route over.
+import std.fs
+import typecheck.{check_types, tc_type_str, TyKind}
+import mono.{run_mono, instances, MonoInstance, iterator_route_name, iterator_route_module}
+import parser.{nodes, node_kind, node_name, node_source_module}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+
+fn find_decl_in(module: Str, name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name && node_source_module(i) == module { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn instances_of(decl: Int) -> List[MonoInstance] {
+    let mut out: List[MonoInstance] = []
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(inst) }
+    }
+    out
+}
+
+fn run_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+}
+
+test "each receiver kind names its std.iter generic, or nothing" {
+    assert_eq(iterator_route_module(), "std_iter")
+    assert_eq(iterator_route_name(TyKind.Iterator, "map"), "iter_map")
+    assert_eq(iterator_route_name(TyKind.Iterator, "collect"), "iter_collect")
+    assert_eq(iterator_route_name(TyKind.List, "into_iter"), "iter_from_list")
+    assert_eq(iterator_route_name(TyKind.Set, "into_iter"), "iter_from_set")
+    assert_eq(iterator_route_name(TyKind.Iterator, "into_iter"), "")
+    assert_eq(iterator_route_name(TyKind.List, "map"), "")
+    assert_eq(iterator_route_name(TyKind.Iterator, "push"), "")
+}
+
+test "a chain registers one instance of each routed generic" {
+    run_probe("build/mono_iter_route_chain.bl", #"fn main() {
+    let xs = [1, 2, 3]
+    let _n = xs.into_iter().map(fn(v: Int) -> Str { "{v}" }).collect().len()
+}
+"#)
+    let src = instances_of(find_decl_in(iterator_route_module(), "iter_from_list"))
+    assert_eq(src.len(), 1)
+    assert_eq(tc_type_str(src.get(0).unwrap().arg_tids), "(Int)")
+    let map = instances_of(find_decl_in(iterator_route_module(), "iter_map"))
+    assert_eq(map.len(), 1)
+    assert_eq(tc_type_str(map.get(0).unwrap().arg_tids), "(Int, Str)")
+    let out = instances_of(find_decl_in(iterator_route_module(), "iter_collect"))
+    assert_eq(out.len(), 1)
+    assert_eq(tc_type_str(out.get(0).unwrap().arg_tids), "(Str)")
+}
+
+test "a user fn spelled like a routed generic does not take the route" {
+    run_probe("build/mono_iter_route_user_twin.bl", #"fn iter_count[T](xs: List[T]) -> Int { xs.len() + 100 }
+fn main() {
+    let xs = [1, 2]
+    let _n = xs.into_iter().count()
+}
+"#)
+    let routed = instances_of(find_decl_in(iterator_route_module(), "iter_count"))
+    assert_eq(routed.len(), 1)
+    let mut twin = -1
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == "iter_count" && node_source_module(i) != iterator_route_module() { twin = i }
+        i = i + 1
+    }
+    assert(twin >= 0)
+    assert_eq(instances_of(twin).len(), 0)
+}

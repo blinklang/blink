@@ -491,6 +491,15 @@ pub fn tc_is_list_generic_adapter(method: Str) -> Int {
     0
 }
 
+// The Iterator methods codegen routes to std.iter's `iter_<method>` generics, matching the
+// Iterator dispatch block below. mono and cg_call both read this row so neither can drift.
+pub fn tc_is_iterator_method(method: Str) -> Int {
+    if method == "map" || method == "filter" || method == "take" || method == "skip" || method == "chain" { return 1 }
+    if method == "enumerate" || method == "zip" || method == "flat_map" || method == "collect" || method == "count" { return 1 }
+    if method == "for_each" || method == "any" || method == "all" || method == "find" || method == "fold" { return 1 }
+    0
+}
+
 // Typecheck-side mirror of codegen's mangle_impl_method: the fnsig key for an
 // impl method. Must match the codegen C symbol exactly so arg-shape/return-type
 // lookups resolve. From/TryFrom keep `{type}_{method}_{src}`; all other traits
@@ -1852,7 +1861,7 @@ fn tc_occurs_in(needle: Int, hay0: Int) -> Int {
     if hay == needle { return 1 }
     let e = ty_pool.get(hay).unwrap()
     let k = e.kind
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel {
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator {
         return tc_occurs_in(needle, e.inner1)
     }
     if k == TyKind.Result || k == TyKind.Map {
@@ -1908,7 +1917,7 @@ fn tc_tid_has_unbound_metavar(tid0: Int) -> Int {
     // (decisions/under-determined-types.md). A bare Channel in a TYPE position is E0303,
     // not E0301, but that spelling lowers to TYPE_UNKNOWN — not a metavar — so it
     // does not reach this arm.
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel {
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator {
         return tc_tid_has_unbound_metavar(e.inner1)
     }
     if k == TyKind.Result || k == TyKind.Map {
@@ -1945,7 +1954,7 @@ pub fn tc_tid_has_unknown(tid0: Int) -> Int {
     if tc_tid_is_no_info(tid) != 0 { return 1 }
     let e = ty_pool.get(tid).unwrap()
     let k = e.kind
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel {
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator {
         return tc_tid_has_unknown(e.inner1)
     }
     if k == TyKind.Result || k == TyKind.Map {
@@ -1999,6 +2008,7 @@ fn tc_tid_fill_unknowns(base0: Int, src0: Int) -> Int {
     if eb.kind == TyKind.Option { return make_option_type(tc_tid_fill_unknowns(eb.inner1, es.inner1)) }
     if eb.kind == TyKind.Set { return make_set_type(tc_tid_fill_unknowns(eb.inner1, es.inner1)) }
     if eb.kind == TyKind.Channel { return make_channel_type(tc_tid_fill_unknowns(eb.inner1, es.inner1)) }
+    if eb.kind == TyKind.Iterator { return make_iterator_type(tc_tid_fill_unknowns(eb.inner1, es.inner1)) }
     if eb.kind == TyKind.Result {
         return make_result_type(tc_tid_fill_unknowns(eb.inner1, es.inner1), tc_tid_fill_unknowns(eb.inner2, es.inner2))
     }
@@ -2047,7 +2057,7 @@ fn tc_tid_has_typevar_among(tid0: Int, foreign_only: Int) -> Int {
         if foreign_only != 0 && tc_typevar_binds_here(tid) != 0 { return 0 }
         return 1
     }
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel {
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator {
         return tc_tid_has_typevar_among(e.inner1, foreign_only)
     }
     if k == TyKind.Result || k == TyKind.Map {
@@ -2339,7 +2349,7 @@ fn tc_ud_metavar_roots(tid0: Int) -> List[Int] {
     }
     let e = ty_pool.get(tid).unwrap()
     let k = e.kind
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel {
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator {
         return tc_ud_metavar_roots(e.inner1)
     }
     if k == TyKind.Result || k == TyKind.Map {
@@ -2620,7 +2630,7 @@ pub fn tc_unify(a0: Int, b0: Int) -> Int {
     let ka = ta.kind
     let kb = tb.kind
     if ka != kb { return 0 }
-    if ka == TyKind.List || ka == TyKind.Option || ka == TyKind.Set || ka == TyKind.Channel {
+    if ka == TyKind.List || ka == TyKind.Option || ka == TyKind.Set || ka == TyKind.Channel || ka == TyKind.Iterator {
         return tc_unify(ta.inner1, tb.inner1)
     }
     if ka == TyKind.Result || ka == TyKind.Map {
@@ -3244,6 +3254,11 @@ pub fn substitute_typevar_tid(t0: Int, binds: Map[Str, Int]) -> Int {
         if inner == e.inner1 { return t }
         return make_channel_type(inner)
     }
+    if k == TyKind.Iterator {
+        let inner = substitute_typevar_tid(e.inner1, binds)
+        if inner == e.inner1 { return t }
+        return make_iterator_type(inner)
+    }
     if k == TyKind.Ptr {
         let inner = substitute_typevar_tid(e.inner1, binds)
         if inner == e.inner1 { return t }
@@ -3461,9 +3476,8 @@ fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
     // Every one-child kind, per tc_tid_child_count — the layout authority. A kind left out
     // here is not a missed optimization: a typevar reachable only through it has no other way
     // to be inferred and reaches monomorphization unsolved (I0001 UnsolvedTypeVarAtCodegen),
-    // which is what the Fn arm below was added to stop one kind over. TyKind.Iterator is
-    // excluded because it reports 0 children there and is never constructed.
-    if pk == TyKind.List || pk == TyKind.Option || pk == TyKind.Set || pk == TyKind.Handle {
+    // which is what the Fn arm below was added to stop one kind over.
+    if pk == TyKind.List || pk == TyKind.Option || pk == TyKind.Set || pk == TyKind.Handle || pk == TyKind.Iterator {
         unify_typevar_binds(pe.inner1, ae.inner1, binds)
         return
     }
