@@ -10,11 +10,10 @@
 //
 // Three of the four carry the symbol the guard local runs on the way out. The FFI scope's
 // is the runtime's own; Closeable's is the close method the user wrote, which is already
-// an ordinary C function taking the resource by value. BlockHandler has no such method,
-// because its binder holds the Context that enter() answers rather than the resource, so
-// it still answers its protocol and records an internal error naming what is missing. A
-// guessed symbol would link against nothing or, worse, read a neighbouring stack slot as
-// a flag.
+// an ordinary C function taking the resource by value. A BlockHandler must also call
+// enter(), which no resource does, so the with stage lowers it through
+// cg_eff_block_handler_calls and never asks this seam. Asked anyway, the seam answers the
+// protocol with no symbol and one internal error, never a guessed symbol.
 
 import cname.{c_impl_method_name}
 import cname_test_helpers.{find_decl, find_impl}
@@ -23,7 +22,10 @@ import cg_test_helpers.{
 }
 import ast.{NodeKind}
 import cg_reg.{cg_reg_build}
-import cg_eff.{CleanupProtocol, cg_eff_resource_cleanup}
+import cg_eff.{CleanupProtocol, cg_eff_block_handler_calls, cg_eff_block_handler_impl, cg_eff_resource_cleanup}
+import layout.{tid_of_node}
+import parser.{node_value}
+import typecheck.{TYPE_INT}
 import diagnostics.{diag_reset}
 import std.fs
 import std.io
@@ -176,6 +178,30 @@ test "a BlockHandler resource takes the enter and exit protocol, not its Context
     assert_eq(rc.impl_block, find_impl("Guarded", "BlockHandler", ""))
 }
 
+// The with stage asks this of every item's expression before choosing a path, so a
+// Closeable or plain resource answering an impl here would lose its own cleanup.
+test "a BlockHandler item's expression answers its impl, and a resource's answers none" {
+    setup()
+    diag_reset()
+    let bh = find_impl("Guarded", "BlockHandler", "")
+    assert_eq(cg_eff_block_handler_impl(node_value(item("guarded"))), bh)
+    assert_eq(cg_eff_block_handler_impl(node_value(item("logged"))), -1)
+    assert_eq(cg_eff_block_handler_impl(node_value(item("plain"))), -1)
+    assert_eq(cg_ice_count(), 0)
+}
+
+test "a BlockHandler's calls name its exit method and type its Context from enter" {
+    setup()
+    diag_reset()
+    let bh = find_impl("Guarded", "BlockHandler", "")
+    let expr = node_value(item("guarded"))
+    let calls = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("guarded"))
+    assert_eq(calls.impl_block, bh)
+    assert_eq(calls.exit_symbol, c_impl_method_name(bh, "exit"))
+    assert_eq(calls.context_tid, TYPE_INT)
+    assert_eq(cg_ice_count(), 0)
+}
+
 test "an FFI scope resource takes the scope protocol, not a plain binding" {
     setup()
     diag_reset()
@@ -184,10 +210,9 @@ test "an FFI scope resource takes the scope protocol, not a plain binding" {
     assert_eq(rc.impl_block, -1)
 }
 
-// BlockHandler still needs an exit runner no stage emits: its binder holds the Context
-// that enter() answers, not the resource, so no method the user wrote takes the shape the
-// guard calls. It travels with its impl block and one internal error naming what is
-// missing, rather than degrading to a plain binding that would never run exit().
+// A BlockHandler reaching this seam means the with stage failed to route it. It travels
+// with its impl block and one internal error, rather than degrading to a plain binding
+// that would never run exit().
 test "a BlockHandler resource reports exactly one internal error, naming what is missing" {
     setup()
     diag_reset()

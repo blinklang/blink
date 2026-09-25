@@ -61,7 +61,8 @@ import cg_expr.{
     x_layout_checked, x_stopped, x_unbox_payload,
 }
 import cg_eff.{
-    cg_eff_async_scope_exit_symbol, cg_eff_binder_is_shared, cg_eff_frame_written, cg_eff_lower_handler_install,
+    cg_eff_async_scope_exit_symbol, cg_eff_binder_is_shared, cg_eff_block_handler_calls,
+    cg_eff_block_handler_enter, cg_eff_block_handler_impl, cg_eff_frame_written, cg_eff_lower_handler_install,
     cg_eff_resource_cleanup,
     cg_eff_scan_shared_binders,
 }
@@ -2308,9 +2309,10 @@ fn flag_ref(span: Int, name: Str) -> Int ! Diag.Report {
 
 // ── With blocks ───────────────────────────────────────────────────────────
 
-// A `with` binds one or more items around a body: `arena` for a fresh allocation arena,
-// `name = expr` for a resource whose cleanup runs on every exit, and anything else for an
-// effect handler. The items nest outside in, so the first item written is the outermost.
+// A `with` binds one or more items around a body: `arena` for a fresh allocation arena, a
+// block handler for enter and exit around the body, `expr as name` for a resource whose
+// cleanup runs on every exit, and anything else for an effect handler. The items nest
+// outside in, so the first item written is the outermost.
 fn lower_with_block(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
     let items = node_handlers(node)
     let n = if items == -1 { 0 } else { sublist_length(items) }
@@ -2321,6 +2323,11 @@ fn wrap_with_items(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, 
     if i >= n { return lower_body_block(node_body(node), tail, dest, dest_tid) }
     let item = sublist_get(items, i)
     let kind = nk_of(node_kind(item))
+    // A block handler is one with or without `as`, so the question is asked of the item's
+    // expression before the binder decides between a resource and an effect handler.
+    let expr = if kind == NodeKind.WithResource { node_value(item) } else { item }
+    let bh = cg_eff_block_handler_impl(expr)
+    if bh >= 0 { return wrap_block_handler(node, items, n, i, bh, tail, dest, dest_tid) }
     if kind == NodeKind.WithResource { return wrap_resource(node, items, n, i, tail, dest, dest_tid) }
     let rest = wrap_with_items(node, items, n, i + 1, tail, dest, dest_tid)
     if rest < 0 { return -1 }
@@ -2378,6 +2385,56 @@ fn wrap_resource(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, de
         return ir_block(item, [bind, scoped])
     }
     ir_block(item, [bind, rest_block])
+}
+
+// The handler is held in a hidden local, so enter and the guard's exit(ok) both read the
+// one value the item built. The guard is armed only after enter returns, so an enter that
+// never returns has no exit run for it.
+fn wrap_block_handler(node: Int, items: Int, n: Int, i: Int, bh: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
+    let item = sublist_get(items, i)
+    let binds = nk_of(node_kind(item)) == NodeKind.WithResource
+    let expr = if binds { node_value(item) } else { item }
+    let tid = stmt_tid(expr)
+    if tid < 0 { return -1 }
+    let calls = cg_eff_block_handler_calls(bh, tid, item)
+    if calls.impl_block < 0 { return -1 }
+    let _ = ensure_typedef_for(tid)
+    let value = lower_value(expr)
+    if value < 0 { return -1 }
+    let held = bind_temp("bh", tid, item, value)
+    let enter = cg_eff_block_handler_enter(calls, held.ref, item)
+    if enter < 0 { return -1 }
+    // An enter returning Void gives an `as` binder nothing, and typecheck then types the
+    // binder as the handler itself, so that is what it holds.
+    let void_enter = tc_tid_kind(calls.context_tid) == TyKind.Void
+    let mut stmts: List[Int] = [held.stmt]
+    if !binds || void_enter { stmts.push(ir_expr_stmt(item, enter)) }
+    let _ = open_scope()
+    let bind = if !binds { 0 } else if void_enter { bind_context(item, held.ref) } else { bind_context(item, enter) }
+    let rest = if bind < 0 { -1 } else { wrap_with_items(node, items, n, i + 1, tail, dest, dest_tid) }
+    close_scope()
+    if rest < 0 { return -1 }
+    if binds { stmts.push(bind) }
+    stmts.push(ir_with_scope(item, calls.exit_symbol, held.ref, as_block(rest)))
+    ir_block(item, stmts)
+}
+
+// The binder's type is typecheck's answer and the value's is the handler's own, so a
+// disagreement between them is reported rather than spelled one way or the other.
+fn bind_context(item: Int, init: Int) -> Int ! Diag.Report {
+    let tid = stmt_tid(item)
+    if tid < 0 { return -1 }
+    if tid != ir_tid(init) {
+        diag_ice_at("BlockHandlerBinderType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "the `as` binder is typed {tid} but the block handler gives it type {ir_tid(init)}", item,
+            "typecheck types the binder as the Context enter returns; the two must agree")
+        return -1
+    }
+    let rec = layout_at(tid, Position.Local, item)
+    let _ = ensure_typedef_for(tid)
+    let name = node_name(item)
+    bind_binder_mut(cur_scope(), name, tid, false)
+    ir_let(tid, item, rec.c_spelling, cg_local_c_name(name), rec.slot_form, init)
 }
 
 // A handler replaces one slot of the effect vector for the body. Which slot is a fact
