@@ -1,0 +1,93 @@
+// assert_panics frame exits and runtime nesting (spec §2.20). Any exit that
+// leaves the body without a panic is E0831, like a `?` exit. A frame opened
+// while another is armed (a closure written in the test, run from the outer
+// body or from a cleanup the outer unwind runs) catches its own panic and hands
+// the outer frame back its own catch point and message.
+
+import compile_test_helpers.{compile_and_run_test_json}
+
+fn boom(n: Int) -> Int {
+    let r: Result[Int, Str] = if n > 0 { Err("boom {n}") } else { Ok(n) }
+    r.unwrap()
+}
+
+type Hook { run: fn() }
+
+impl Closeable for Hook {
+    fn close(self) {
+        let f = self.run
+        f()
+    }
+}
+
+test "return out of the body is E0831" {
+    let src = "test \"t\" \{\n    assert_panics \{\n        return\n    }\n}\n"
+    let r = compile_and_run_test_json(src, "_ap_exit_return")
+    assert(r.out.contains("\"status\":\"failed\""))
+    assert(r.out.contains("returned normally"))
+}
+
+test "break out of a loop enclosing the block is E0831" {
+    let src = "test \"t\" \{\n    for _i in [1, 2] \{\n        assert_panics \{\n            break\n        }\n    }\n}\n"
+    let r = compile_and_run_test_json(src, "_ap_exit_break")
+    assert(r.out.contains("\"status\":\"failed\""))
+    assert(r.out.contains("returned normally"))
+}
+
+test "continue of a loop enclosing the block is E0831" {
+    let src = "test \"t\" \{\n    for _i in [1, 2] \{\n        assert_panics \{\n            continue\n        }\n    }\n}\n"
+    let r = compile_and_run_test_json(src, "_ap_exit_continue")
+    assert(r.out.contains("\"status\":\"failed\""))
+    assert(r.out.contains("returned normally"))
+}
+
+test "skip inside the body reports the test skipped, not failed" {
+    let src = "test \"t\" \{\n    assert_panics \{\n        skip(\"not here\")\n    }\n}\n"
+    let r = compile_and_run_test_json(src, "_ap_exit_skip")
+    assert(r.out.contains("\"status\":\"skipped\""))
+    assert(r.out.contains("\"reason\":\"not here\""))
+    assert(!r.out.contains("\"status\":\"failed\""))
+    assert(!r.out.contains("returned normally"))
+}
+
+test "break of a loop inside the body stays in the frame and the later panic is caught" {
+    assert_panics(matching: "boom 4") {
+        for i in [1, 2, 3] {
+            if i == 2 { break }
+        }
+        let _ = boom(4)
+    }
+}
+
+test "a frame run from the outer body leaves the outer frame its own catch point and message" {
+    let inner = fn() {
+        assert_panics(matching: "boom 1") {
+            let _ = boom(1)
+        }
+    }
+    assert_panics(matching: "boom 2") {
+        inner()
+        let _ = boom(2)
+    }
+}
+
+test "a frame run by a cleanup during the outer unwind catches its own panic" {
+    let inner = fn() {
+        assert_panics(matching: "boom 5") {
+            let _ = boom(5)
+        }
+    }
+    assert_panics(matching: "boom 6") {
+        with Hook { run: inner } as _h {
+            let _ = boom(6)
+        }
+    }
+}
+
+test "after a nested frame the test's next panic is still caught by a fresh frame" {
+    let inner = fn() {
+        assert_panics { let _ = boom(7) }
+    }
+    inner()
+    assert_panics(matching: "boom 8") { let _ = boom(8) }
+}

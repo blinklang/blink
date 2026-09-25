@@ -44,7 +44,7 @@ import ir.{
     ir_const, ir_var_ref, ir_cell_ref, ir_global_ref, ir_unary, ir_binary, ir_cast, ir_field_get,
     ir_struct_new, ir_tuple_new, ir_container_new, ir_box, ir_unbox, ir_carrier_wrap,
     ir_carrier_unwrap, ir_carrier_tag, ir_call_runtime, ir_let, ir_assign, ir_return,
-    ir_expr_stmt, ir_if, ir_block, ir_enum_new, ir_unreachable,
+    ir_expr_stmt, ir_if, ir_block, ir_enum_new, ir_unreachable, ir_panic_catch_exit,
 }
 import cg_call.{
     lower_call, lower_operator_method, lower_display_call, lower_display_of_value,
@@ -104,6 +104,11 @@ let mut cx_test_body: Bool = false
 // cg_stmt pushes on scope entry and pops on exit; cg_call reads the top so a spawn inside
 // the scope's body registers its handle there, and a spawn outside every scope sees none.
 let mut cx_async_scope_stack: List[Str] = []
+// The innermost-last stack of open assert_panics frames, named by their frame record, and
+// beside each the count of loops opened inside it. A break or continue with that count at
+// zero leaves the frame, so it is lowered as the frame's exit.
+let mut cx_frames: List[Str] = []
+let mut cx_frame_loops: List[Int] = []
 
 // ── Seam ──────────────────────────────────────────────────────────────────
 
@@ -114,6 +119,8 @@ pub fn cg_expr_reset() {
     cx_return_type = -1
     cx_test_body = false
     cx_async_scope_stack = []
+    cx_frames = []
+    cx_frame_loops = []
 }
 
 // Opens a new innermost async.scope, named by the C variable holding its handle list.
@@ -132,6 +139,52 @@ pub fn cg_expr_async_scope_close() {
 pub fn cg_expr_async_scope_current() -> Str {
     if cx_async_scope_stack.len() == 0 { return "" }
     cx_async_scope_stack.get(cx_async_scope_stack.len() - 1).unwrap()
+}
+
+// Opens a new innermost assert_panics frame. cg_stmt closes it in the same lowering.
+pub fn cg_expr_frame_open(c_name: Str) {
+    cx_frames.push(c_name)
+    cx_frame_loops.push(0)
+}
+
+pub fn cg_expr_frame_close() {
+    let _ = cx_frames.pop()
+    let _ = cx_frame_loops.pop()
+}
+
+// A closure body is its own function, so a frame open where the closure is written does
+// not enclose it. The driver clears the stack before it lowers a thunk body.
+pub fn cg_expr_frame_clear() {
+    cx_frames = []
+    cx_frame_loops = []
+}
+
+// Called around each loop body, so a break or continue knows whether its loop is inside
+// the innermost frame.
+pub fn cg_expr_frame_loop_enter() {
+    if cx_frames.len() == 0 { return }
+    let n = cx_frame_loops.pop() ?? 0
+    cx_frame_loops.push(n + 1)
+}
+
+pub fn cg_expr_frame_loop_exit() {
+    if cx_frames.len() == 0 { return }
+    let n = cx_frame_loops.pop() ?? 1
+    cx_frame_loops.push(n - 1)
+}
+
+// The frame a return or a `?` leaves, or "" when none is open.
+pub fn cg_expr_frame_current() -> Str {
+    if cx_frames.len() == 0 { return "" }
+    cx_frames.get(cx_frames.len() - 1).unwrap()
+}
+
+// The frame a break or continue leaves: the innermost one, when no loop opened inside it
+// encloses the jump. "" means the jump stays inside the frame, or no frame is open.
+pub fn cg_expr_frame_left_by_jump() -> Str {
+    if cx_frames.len() == 0 { return "" }
+    if cx_frame_loops.get(cx_frame_loops.len() - 1).unwrap() > 0 { return "" }
+    cg_expr_frame_current()
 }
 
 // The carrier `?` returns on the error path.
@@ -967,7 +1020,10 @@ fn lower_try_arms(node: Int, carrier_tid: Int, k: TyKind, carrier: Str) -> Int !
     let fail_tag = if k == TyKind.Option { 0 } else { 1 }
     let cond = x_tag_is(node, carrier_tid, carrier, fail_tag)
     if cond < 0 { return -1 }
-    let arm = if cx_test_body {
+    let frame = cg_expr_frame_current()
+    let arm = if frame != "" {
+        ir_block(node, [ir_panic_catch_exit(node, frame)])
+    } else if cx_test_body {
         x_test_propagate_arm(node, carrier_tid, k, carrier)
     } else {
         x_carrier_return_arm(node, carrier_tid, k, carrier)

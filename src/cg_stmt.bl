@@ -45,6 +45,7 @@ import ir.{
     ir_expr_stmt, ir_field_get, ir_global_ref, ir_if, ir_kid, ir_kid_count, ir_kind, ir_let,
     ir_loop, ir_mark_materialize, ir_new, ir_return, ir_slot_form, ir_span, ir_switch, ir_tid,
     ir_tuple_new, ir_unary, ir_unbox, ir_unreachable, ir_var_ref, ir_with_scope,
+    ir_panic_catch, ir_panic_catch_exit,
 }
 import diagnostics.{
     Diag, diag_file_for_node, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
@@ -52,6 +53,8 @@ import diagnostics.{
 }
 import cg_expr.{
     cg_expr_async_scope_close, cg_expr_async_scope_open, cg_expr_drain_pending, cg_expr_drop_values,
+    cg_expr_frame_close, cg_expr_frame_current, cg_expr_frame_left_by_jump, cg_expr_frame_loop_enter,
+    cg_expr_frame_loop_exit, cg_expr_frame_open,
     cg_expr_is_registered, cg_expr_pending_count,
     cg_expr_push_pending, cg_expr_register_value, cg_expr_set_return_type,
     cg_expr_take_pending, cg_expr_value_count, lower_expr,
@@ -322,8 +325,8 @@ fn lower_stmt_tail(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag
         NodeKind.CompoundAssign => lower_compound_assign(node)
         NodeKind.ExprStmt => lower_stmt_tail(node_value(node), tail, dest, dest_tid)
         NodeKind.Return => lower_return(node)
-        NodeKind.Break => ir_break(node)
-        NodeKind.Continue => ir_continue(node)
+        NodeKind.Break => lower_jump(node, ir_break(node))
+        NodeKind.Continue => lower_jump(node, ir_continue(node))
         NodeKind.Block => lower_tail_block_into(node, tail, dest, dest_tid)
         NodeKind.IfExpr => lower_if(node, tail, dest, dest_tid)
         NodeKind.MatchExpr => lower_match(node, tail, dest, dest_tid)
@@ -332,6 +335,7 @@ fn lower_stmt_tail(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag
         NodeKind.ForIn => lower_for_in(node)
         NodeKind.WithBlock => lower_with_block(node, tail, dest, dest_tid)
         NodeKind.AsyncScope => lower_async_scope(node, tail, dest, dest_tid)
+        NodeKind.AssertPanics => lower_assert_panics(node)
         NodeKind.Call => lower_call_stmt(node, tail, dest, dest_tid)
         NodeKind.MethodCall => lower_method_call_stmt(node, tail, dest, dest_tid)
         _ => lower_value_stmt(node, tail, dest, dest_tid)
@@ -387,7 +391,21 @@ fn lower_skip_call(node: Int) -> Int ! Diag.Report {
     let reason = lower_value(sublist_get(args, 0))
     if reason < 0 { return -1 }
     let set_skipped = call_runtime_void(node, "__blink_test_set_skipped", [reason])
-    ir_block(node, [set_skipped, ir_return(node, -1)])
+    ir_block(node, [set_skipped, frame_exit_or(node, ir_return(node, -1))])
+}
+
+// Every way out of an assert_panics body but a panic is the failure that the body
+// returned, and it must disarm the frame on the way out. `exit` is the jump the same
+// statement takes outside every frame.
+fn frame_exit_or(node: Int, exit: Int) -> Int {
+    let frame = cg_expr_frame_current()
+    if frame == "" { exit } else { ir_panic_catch_exit(node, frame) }
+}
+
+// A break or continue leaves the frame only when its loop is outside it.
+fn lower_jump(node: Int, jump: Int) -> Int {
+    let frame = cg_expr_frame_left_by_jump()
+    if frame == "" { jump } else { ir_panic_catch_exit(node, frame) }
 }
 
 // How a produced value leaves the block that produced it.
@@ -1346,6 +1364,14 @@ fn lower_compound_assign(node: Int) -> Int ! Diag.Report {
 
 fn lower_return(node: Int) -> Int ! Diag.Report {
     let v = node_value(node)
+    let frame = cg_expr_frame_current()
+    if frame != "" {
+        // A test body returns no value, so the one a return carries runs for its effects.
+        if v < 0 { return ir_panic_catch_exit(node, frame) }
+        let value = lower_value(v)
+        if value < 0 { return -1 }
+        return ir_block(node, [ir_expr_stmt(node, value), ir_panic_catch_exit(node, frame)])
+    }
     if v < 0 { return ir_return(node, -1) }
     ir_return(node, lower_value(v))
 }
@@ -1878,6 +1904,14 @@ fn lower_body_block(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Dia
 
 // ── Loops ─────────────────────────────────────────────────────────────────
 
+// A loop opened inside an assert_panics frame owns the break and continue in its body.
+fn lower_loop_body(node: Int) -> Int ! Diag.Report {
+    cg_expr_frame_loop_enter()
+    let body = lower_block(node_body(node))
+    cg_expr_frame_loop_exit()
+    body
+}
+
 // `while c { b }` is `while (1) { if (!c) break; b }`. One loop form in the IR means the
 // printer never has to decide where a continue lands.
 fn lower_while(node: Int) -> Int ! Diag.Report {
@@ -1895,7 +1929,7 @@ fn lower_while(node: Int) -> Int ! Diag.Report {
     let cond = ir_binary(tid, cond_node, rec.c_spelling, "==",
         tested, ir_const(tid, cond_node, rec.c_spelling, "0"))
     let guard = ir_if(cond_node, cond, ir_block(cond_node, [ir_break(cond_node)]), -1)
-    let body = lower_block(node_body(node))
+    let body = lower_loop_body(node)
     if body < 0 { return -1 }
     let mut turn: List[Int] = hoisted
     turn.push(guard)
@@ -1905,7 +1939,7 @@ fn lower_while(node: Int) -> Int ! Diag.Report {
 
 // `loop { b }` is the bare form: the IR loop node with no guard of its own.
 fn lower_loop(node: Int) -> Int ! Diag.Report {
-    let body = lower_block(node_body(node))
+    let body = lower_loop_body(node)
     if body < 0 { return -1 }
     ir_loop(node, body)
 }
@@ -1994,7 +2028,7 @@ fn lower_for_indexed(node: Int, iter: Int, walk: ForInIteration) -> Int ! Diag.R
         close_scope()
         return -1
     }
-    let body = lower_block(node_body(node))
+    let body = lower_loop_body(node)
     close_scope()
     if body < 0 { return -1 }
     let mut turn: List[Int] = [step, guard]
@@ -2112,7 +2146,7 @@ fn lower_for_materialized(node: Int, iter: Int, walk: ForInIteration) -> Int ! D
         close_scope()
         return -1
     }
-    let body = lower_block(node_body(node))
+    let body = lower_loop_body(node)
     close_scope()
     if body < 0 { return -1 }
     let mut turn: List[Int] = [m.step, m.guard]
@@ -2159,7 +2193,7 @@ fn lower_for_drained(node: Int, iter: Int, walk: ForInIteration) -> Int ! Diag.R
         close_scope()
         return -1
     }
-    let body = lower_block(node_body(node))
+    let body = lower_loop_body(node)
     close_scope()
     if body < 0 { return -1 }
     let mut turn: List[Int] = [t.take, guard]
@@ -2212,7 +2246,7 @@ fn lower_for_range(node: Int, iter: Int) -> Int ! Diag.Report {
         ir_var_ref(tid, iter, rec.c_spelling, name, rec.slot_form),
         ir_var_ref(tid, iter, rec.c_spelling, end_name, rec.slot_form))
     let guard = ir_if(iter, cond, ir_block(iter, [ir_break(iter)]), -1)
-    let body = lower_block(node_body(node))
+    let body = lower_loop_body(node)
     close_scope()
     if body < 0 { return -1 }
     ir_block(node, [init, end_let, first_let, ir_loop(node, ir_block(node, [step, guard, body]))])
@@ -2305,6 +2339,40 @@ fn wrap_resource(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, de
 // part is lowering the item to the value that goes in the slot.
 fn wrap_handler(item: Int, inner: Int) -> Int ! Diag.Report {
     cg_eff_lower_handler_install(item, lower_value(item), inner)
+}
+
+// `assert_panics(matching: m) { body }` runs the body under a catch frame. The matcher
+// is bound ahead of the frame, so a panic in it is not the one the frame waits for and
+// the printer reads it twice without running it twice. The body's value is discarded.
+fn lower_assert_panics(node: Int) -> Int ! Diag.Report {
+    if node_line(node) <= 0 || node_col(node) <= 0 {
+        diag_ice_at("AssertPanicsHasNoPosition", CODEGEN_STAGE_NOT_BUILT,
+            "assert_panics has no source position to report its failure at", node,
+            "the runtime records a line and a column as numbers; a synthesized assert_panics must copy a position")
+        return -1
+    }
+    let str_rec = layout_at(TYPE_STR, Position.Local, node)
+    let int_rec = layout_at(TYPE_INT, Position.Local, node)
+    let mut out: List[Int] = []
+    let mut matcher = -1
+    let m = node_value(node)
+    if m >= 0 {
+        let value = lower_value(m)
+        if value < 0 { return -1 }
+        let name = c_mint_local("apm")
+        out.push(ir_let(TYPE_STR, node, str_rec.c_spelling, name, str_rec.slot_form, value))
+        matcher = ir_var_ref(TYPE_STR, node, str_rec.c_spelling, name, str_rec.slot_form)
+    }
+    let frame = c_mint_local("ap")
+    cg_expr_frame_open(frame)
+    let body = lower_body_block(node_body(node), TAIL_DISCARD, "", -1)
+    cg_expr_frame_close()
+    if body < 0 { return -1 }
+    let file = ir_const(TYPE_STR, node, str_rec.c_spelling, c_string_literal(diag_file_for_node(node)))
+    let line = ir_const(TYPE_INT, node, int_rec.c_spelling, "{node_line(node)}")
+    let col = ir_const(TYPE_INT, node, int_rec.c_spelling, "{node_col(node)}")
+    out.push(ir_panic_catch(node, frame, file, line, col, matcher, as_block(body)))
+    ir_block(node, out)
 }
 
 // `async.scope { body }` opens a handle list before the body and drains it on every exit

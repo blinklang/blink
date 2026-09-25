@@ -39,7 +39,7 @@ pub type IrKind {
     CallDirect, CallIndirect, CallClosure, CallVirtual, CallRuntime,
     ClosureNew, EvidenceVector, EvidenceAddress, EffectPerform, HandlerInstall,
     Let, CellLet, Assign, ExprStmt, Return, If, Loop, Break, Continue, Block, Switch, WithScope,
-    Panic, Unreachable,
+    Panic, Unreachable, PanicCatch, PanicCatchExit,
 }
 
 pub type IrNode {
@@ -189,7 +189,7 @@ pub fn ir_all_kinds() -> List[IrKind] {
         IrKind.HandlerInstall,
         IrKind.Let, IrKind.CellLet, IrKind.Assign, IrKind.ExprStmt, IrKind.Return, IrKind.If, IrKind.Loop,
         IrKind.Break, IrKind.Continue, IrKind.Block, IrKind.Switch, IrKind.WithScope,
-        IrKind.Panic, IrKind.Unreachable,
+        IrKind.Panic, IrKind.Unreachable, IrKind.PanicCatch, IrKind.PanicCatchExit,
     ]
 }
 
@@ -241,6 +241,8 @@ pub fn ir_kind_name(kind: IrKind) -> Str {
         IrKind.WithScope => "WithScope"
         IrKind.Panic => "Panic"
         IrKind.Unreachable => "Unreachable"
+        IrKind.PanicCatch => "PanicCatch"
+        IrKind.PanicCatchExit => "PanicCatchExit"
     }
 }
 
@@ -270,6 +272,8 @@ pub fn ir_kind_is_value(kind: IrKind) -> Bool {
         IrKind.WithScope => false
         IrKind.Panic => false
         IrKind.Unreachable => false
+        IrKind.PanicCatch => false
+        IrKind.PanicCatchExit => false
         _ => true
     }
 }
@@ -304,6 +308,8 @@ fn kind_needs_c_name(kind: IrKind) -> Bool {
         IrKind.EffectPerform => true
         IrKind.HandlerInstall => true
         IrKind.Let => true
+        IrKind.PanicCatch => true
+        IrKind.PanicCatchExit => true
         _ => false
     }
 }
@@ -340,6 +346,7 @@ fn kind_min_kids(kind: IrKind) -> Int {
         IrKind.Switch => 1
         IrKind.WithScope => 1
         IrKind.Panic => 1
+        IrKind.PanicCatch => 4
         _ => 0
     }
 }
@@ -379,6 +386,8 @@ fn kind_max_kids(kind: IrKind) -> Int {
         IrKind.WithScope => 2
         IrKind.Panic => 1
         IrKind.Unreachable => 0
+        IrKind.PanicCatch => 5
+        IrKind.PanicCatchExit => 0
         _ => -1
     }
 }
@@ -668,6 +677,20 @@ pub fn ir_panic(span: Int, message: Int) -> Int {
 
 pub fn ir_unreachable(span: Int) -> Int { ir_new(IrKind.Unreachable, -1, span, "", "", SlotForm.Inline, []) }
 
+// An assert_panics frame. `frame` is the C name of the frame record, and the file, line and
+// column are the Consts its two failures report. matcher < 0 is a frame that accepts any
+// message. The body is the last kid, so the matcher is evaluated before the frame arms.
+pub fn ir_panic_catch(span: Int, frame: Str, file: Int, line: Int, col: Int, matcher: Int, body: Int) -> Int {
+    let kids: List[Int] = if matcher < 0 { [file, line, col, body] } else { [file, line, col, matcher, body] }
+    ir_new(IrKind.PanicCatch, -1, span, "", frame, SlotForm.Inline, kids)
+}
+
+// Leaves the named frame's body without a panic, which is the failure that the body
+// returned. It names its frame so the verifier can hold it to one that encloses it.
+pub fn ir_panic_catch_exit(span: Int, frame: Str) -> Int {
+    ir_new(IrKind.PanicCatchExit, -1, span, "", frame, SlotForm.Inline, [])
+}
+
 // ── Verifier ──────────────────────────────────────────────────────────────
 
 // Empty means valid. Each string names the node, its kind and one defect. This form
@@ -713,7 +736,27 @@ fn verify_root(root: Int, declared: List[Str], scoped: Bool) -> List[Str] {
     let mut blocks: List[Int] = [-1]
     let mut scope: List[Str] = []
     verify_node(root, seen, on_stack, first_block, blocks, errs, scope, declared, scoped)
+    // Both forms run it, as the driver verifies whole units through ir_verify. The walk
+    // needs a tree without cycles, which the pass above proved.
+    if errs.len() == 0 { verify_frame_exits(root, "", 0, errs) }
     errs
+}
+
+// setjmp catches only while its frame is live, so the body of a PanicCatch may leave it
+// only through a PanicCatchExit, which disarms the frame first. A Return, or a Break or
+// Continue of a Loop outside the frame, would leave it armed with a dead catch point.
+// `frame` is the innermost enclosing frame's name, and `loops` counts the Loops inside it.
+fn verify_frame_exits(id: Int, frame: Str, loops: Int, errs: List[Str]) {
+    let kind = ir_kind(id)
+    let crosses = frame != "" && (kind == IrKind.Return || ((kind == IrKind.Break || kind == IrKind.Continue) && loops == 0))
+    if crosses { errs.push("node {id} ({ir_kind_name(kind)}): leaves PanicCatch frame '{frame}' without a PanicCatchExit") }
+    if kind == IrKind.PanicCatchExit && ir_c_name(id) != frame {
+        let inner = if frame == "" { "no frame encloses it" } else { "the innermost frame is '{frame}'" }
+        errs.push("node {id} (PanicCatchExit): exits frame '{ir_c_name(id)}' but {inner}")
+    }
+    let inner_frame = if kind == IrKind.PanicCatch { ir_c_name(id) } else { frame }
+    let inner_loops = if kind == IrKind.PanicCatch { 0 } else if kind == IrKind.Loop { loops + 1 } else { loops }
+    for kid in ir_kids(id) { verify_frame_exits(kid, inner_frame, inner_loops, errs) }
 }
 
 let SPREAD_MISPLACED: Str = "ContainerSpread outside a ContainerNew, it extends only the container that holds it"
@@ -988,6 +1031,7 @@ fn kid_slot(kind: IrKind, i: Int, n: Int) -> KidSlot {
         IrKind.Loop => KidSlot.BlockOnly
         IrKind.HandlerInstall => if i == 0 { KidSlot.Value } else { KidSlot.BlockOnly }
         IrKind.WithScope => if i == n - 1 { KidSlot.BlockOnly } else { KidSlot.Value }
+        IrKind.PanicCatch => if i == n - 1 { KidSlot.BlockOnly } else { KidSlot.Value }
         IrKind.Switch => switch_kid_slot(i, n)
         IrKind.CarrierWrap => if i == 0 { KidSlot.ConstTag } else { KidSlot.Value }
         IrKind.EnumNew => if i == 0 { KidSlot.ConstTag } else { KidSlot.Value }

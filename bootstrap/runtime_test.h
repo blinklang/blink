@@ -423,11 +423,10 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
         __blink_test_fail_error_message[0] = '\0';
         __blink_test_skipped = 0;
         __blink_test_skip_reason[0] = '\0';
-        /* Defensive reset of the assert_panics catch state (spec §2.20): a body
-         * that exits via `return`/`break`/`continue` (rather than panicking or
-         * falling through) bypasses the block's own armed-- / mark restore, so
-         * re-zero here to bound the blast radius to a single test rather than
-         * poisoning every subsequent test on this thread. */
+        /* Reset of the assert_panics catch state (spec §2.20): an E0832 message
+         * mismatch fails the test from inside its frame and unwinds straight to
+         * the per-test frame, skipping the frame's leave, so the armed count and
+         * cleanup mark it set are cleared here before the next test runs. */
         __blink_panic_armed = 0;
         __blink_panic_cleanup_top = 0;
         __blink_panic_cleanup_mark = 0;

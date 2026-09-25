@@ -1,0 +1,101 @@
+// assert_panics as a catch frame (spec §2.20): the armed panic unwinds to the
+// block, the test resumes after it, and the state the body left behind is the
+// state the code after the block reads.
+
+import compile_test_helpers.{compile_and_run_test_json}
+
+let mut frame_log: List[Str] = []
+// Module state, not locals: C leaves a local changed between the catch point and the
+// panic indeterminate after the jump unless it is volatile, and these rows test the
+// catch, not that rule.
+let mut frame_seen = 0
+let mut frame_count = 0
+
+fn frame_log_has(needle: Str) -> Bool {
+    let mut i = 0
+    while i < frame_log.len() {
+        if frame_log.get(i).unwrap() == needle { return true }
+        i = i + 1
+    }
+    false
+}
+
+type FrameRes { id: Int }
+
+impl Closeable for FrameRes {
+    fn close(self) { frame_log.push("closed:{self.id}") }
+}
+
+fn boom(n: Int) -> Int {
+    let r: Result[Int, Str] = if n > 0 { Err("boom {n}") } else { Ok(n) }
+    r.unwrap()
+}
+
+test "an explicit panic is caught and the test resumes after the block" {
+    let mut reached = 0
+    assert_panics {
+        let _ = boom(1)
+    }
+    reached = 1
+    assert_eq(reached, 1)
+}
+
+test "the matching substring is found in the caught message" {
+    assert_panics(matching: "boom 7") {
+        let _ = boom(7)
+    }
+}
+
+test "module state the body assigned before the panic keeps that value after the catch" {
+    assert_panics(matching: "boom") {
+        frame_seen = 41
+        frame_seen = frame_seen + 1
+        let _ = boom(frame_seen)
+    }
+    assert_eq(frame_seen, 42)
+}
+
+test "a Closeable opened in the body is closed before the test resumes" {
+    assert_panics(matching: "boom 3") {
+        with FrameRes { id: 3 } as _r {
+            frame_log.push("inside:3")
+            let _ = boom(3)
+            frame_log.push("after-panic:3")
+        }
+    }
+    assert(frame_log_has("inside:3"))
+    assert(frame_log_has("closed:3"))
+    assert(!frame_log_has("after-panic:3"))
+}
+
+test "a block nested in a loop in the body is caught on a later iteration" {
+    assert_panics(matching: "boom 2") {
+        for i in [0, 1, 2] {
+            frame_count = frame_count + 1
+            let _ = boom(i * 2 - 2)
+        }
+    }
+    assert_eq(frame_count, 3)
+}
+
+test "assert_panics written in a closure inside a test catches when called" {
+    let run = fn() {
+        assert_panics(matching: "boom 5") {
+            let _ = boom(5)
+        }
+    }
+    run()
+}
+
+test "a ? exit from inside a loop in the body is E0831 and still closes the resource" {
+    let src = "import std.io\ntype R \{ id: Int }\nimpl Closeable for R \{\n    fn close(self) \{ io.println(\"closed-by-qm\") }\n}\nfn fails() -> Result[Int, Str] \{ Err(\"no\") }\ntest \"t\" \{\n    assert_panics \{\n        with R \{ id: 1 } as _r \{\n            for _i in [1, 2] \{\n                let _ = fails()?\n            }\n        }\n    }\n}\n"
+    let r = compile_and_run_test_json(src, "_ap_frame_qm_exit")
+    assert(r.out.contains("\"status\":\"failed\""))
+    assert(r.out.contains("returned normally"))
+    assert(r.out.contains("closed-by-qm"))
+}
+
+test "a second armed block in the same test catches independently" {
+    assert_panics(matching: "boom 8") { let _ = boom(8) }
+    assert_panics(matching: "boom 9") { let _ = boom(9) }
+}
