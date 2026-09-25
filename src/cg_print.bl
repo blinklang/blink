@@ -144,6 +144,8 @@ fn expr_text(id: Int) -> Str ! Diag.Report {
         IrKind.WithScope => misplaced(id, "value")
         IrKind.Panic => misplaced(id, "value")
         IrKind.Unreachable => misplaced(id, "value")
+        IrKind.PanicCatch => misplaced(id, "value")
+        IrKind.PanicCatchExit => misplaced(id, "value")
     }
 }
 
@@ -352,6 +354,8 @@ pub fn print_stmt(id: Int) ! Diag.Report {
         IrKind.WithScope => print_with_scope(id)
         IrKind.Panic => print_panic(id)
         IrKind.Unreachable => em_line("__builtin_unreachable();")
+        IrKind.PanicCatch => print_panic_catch(id)
+        IrKind.PanicCatchExit => em_line("goto {ir_c_name(id)}_returned;")
         IrKind.Const => stmt_misplaced(id)
         IrKind.VarRef => stmt_misplaced(id)
         IrKind.GlobalRef => stmt_misplaced(id)
@@ -567,6 +571,37 @@ fn print_handler_install(id: Int) ! Diag.Report {
 }
 
 // The dispatcher never returns; the unreachable marker lets the C compiler see that.
+// The frame record saves the outer frame's catch state, so a frame run from inside
+// another one hands it back on both paths. The body is braced so the exit label sits
+// outside the scope of every guard in it; the message is matched before leave restores it.
+fn print_panic_catch(id: Int) ! Diag.Report {
+    let n = ir_kid_count(id)
+    let frame = ir_c_name(id)
+    let at = "{print_expr(ir_kid(id, 0))}, {print_expr(ir_kid(id, 1))}, {print_expr(ir_kid(id, 2))}"
+    let matcher = if n == 5 { print_expr(ir_kid(id, 3)) } else { "" }
+    em_line("\{")
+    em_indent_push()
+    em_line("__blink_panic_frame {frame};")
+    em_line("__blink_panic_frame_enter(&{frame});")
+    em_line("if (setjmp(__blink_panic_jmp) == 0) \{")
+    em_indent_push()
+    print_braced("", ir_kid(id, n - 1))
+    em_line("{frame}_returned: __attribute__((unused));")
+    em_line("__blink_panic_frame_leave(&{frame});")
+    em_line("__blink_assert_panics_returned({at});")
+    em_indent_pop()
+    em_line("} else \{")
+    em_indent_push()
+    if matcher != "" {
+        em_line("if (!strstr(__blink_panic_msg, {matcher})) \{ __blink_assert_panics_mismatch({matcher}, __blink_panic_msg, {at}); }")
+    }
+    em_line("__blink_panic_frame_leave(&{frame});")
+    em_indent_pop()
+    em_line("}")
+    em_indent_pop()
+    em_line("}")
+}
+
 fn print_panic(id: Int) ! Diag.Report {
     em_line("__blink_panic_dispatch({print_expr(ir_kid(id, 0))});")
     em_line("__builtin_unreachable();")

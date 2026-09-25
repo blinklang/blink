@@ -155,6 +155,48 @@ BLINK_RT_FN size_t __blink_cleanup_depth(void);
 BLINK_RT_FN size_t __blink_cleanup_depth(void) { return __blink_panic_cleanup_top; }
 #endif
 
+/* One assert_panics frame's save of the thread's catch state. A frame can open
+ * while another is armed: a closure written in a test may hold assert_panics
+ * and run from an armed body, or from a cleanup that an armed unwind drains.
+ * The inner frame must catch its own panic and then give the outer frame back
+ * its catch point, cleanup mark, drain flag and message, or the outer panic
+ * longjmps into a dead frame or matches the inner message. */
+typedef struct {
+    jmp_buf prev_jmp;
+    size_t prev_mark;
+    int prev_drain;
+    char prev_msg[BLINK_PANIC_MSG_SIZE];
+} __blink_panic_frame;
+
+/* Called before the frame's own setjmp, which C only allows inline. Clears the
+ * drain flag so a panic inside this frame reaches this frame, even when the
+ * frame runs inside a cleanup thunk. */
+BLINK_RT_FN void __blink_panic_frame_enter(__blink_panic_frame* f);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_panic_frame_enter(__blink_panic_frame* f) {
+    memcpy(f->prev_jmp, __blink_panic_jmp, sizeof(jmp_buf));
+    f->prev_mark = __blink_panic_cleanup_mark;
+    f->prev_drain = __blink_in_cleanup_drain;
+    memcpy(f->prev_msg, __blink_panic_msg, BLINK_PANIC_MSG_SIZE);
+    __blink_panic_cleanup_mark = __blink_panic_cleanup_top;
+    __blink_in_cleanup_drain = 0;
+    __blink_panic_armed++;
+}
+#endif
+
+/* Called on every path out of the frame before it reports: after the body
+ * returned, and after the caught message was matched. */
+BLINK_RT_FN void __blink_panic_frame_leave(__blink_panic_frame* f);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_panic_frame_leave(__blink_panic_frame* f) {
+    __blink_panic_armed--;
+    memcpy(__blink_panic_jmp, f->prev_jmp, sizeof(jmp_buf));
+    __blink_panic_cleanup_mark = f->prev_mark;
+    __blink_in_cleanup_drain = f->prev_drain;
+    memcpy(__blink_panic_msg, f->prev_msg, BLINK_PANIC_MSG_SIZE);
+}
+#endif
+
 /* Push a cleanup entry. Only called from emitted with/Closeable setup when
  * __blink_panic_armed is nonzero. Silently drops past the cap (the cap is far
  * beyond any real test's nesting; overflow would only under-clean on a
@@ -245,9 +287,9 @@ BLINK_RT_FN void __blink_cleanup_warn_push(const char* msg) {
  * __blink_cleanup_run_to — NOT a bare return. The longjmp abandons the
  * panicking exit/close frame (so its unsafe post-panic fall-through never
  * runs), and the drain loop then continues to the next handler (continue-drain).
- * `assert_panics` can only appear directly in a `test {}` body, so a cleanup
- * thunk can never open a nested armed frame — the drain branch never steals a
- * panic that an inner assert_panics should have caught. Else if armed: capture
+ * A frame opened inside a cleanup thunk clears the drain flag for its body
+ * (__blink_panic_frame_enter), so the drain branch never steals a panic that
+ * the inner assert_panics should catch. Else if armed: capture
  * the message, run in-body cleanup down to the armed frame's mark, then longjmp
  * into assert_panics. Else if a test-hook is installed (zs3w3y): the test
  * runner registered it to record the failure and longjmp back to its per-test
