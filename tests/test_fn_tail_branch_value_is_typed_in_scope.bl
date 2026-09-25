@@ -1,0 +1,167 @@
+import compile_test_helpers
+
+// The tail of a value-returning fn is a value position (§2.9), and a branch of a tail
+// `if`/`match` may name a binding that only its own block declares. The tail must be typed
+// inside those block scopes, where the binding exists, or its carrier loses the type it carries.
+
+fn doubled_if(n: Int) -> Option[Int] {
+    if n > 0 {
+        let m = n * 2
+        Some(m)
+    } else {
+        None
+    }
+}
+
+fn doubled_match(n: Int) -> Result[Int, Str] {
+    match n {
+        0 => Err("zero")
+        _ => {
+            let m = n * 2
+            Ok(m)
+        }
+    }
+}
+
+fn sign_name(n: Int) -> Option[Str] {
+    if n > 0 {
+        let s = "pos"
+        Some(s)
+    } else if n < 0 {
+        let s = "neg"
+        Some(s)
+    } else {
+        None
+    }
+}
+
+fn nested_err(n: Int) -> Result[Int, Str] {
+    match n {
+        0 => Ok(0)
+        _ => {
+            if n > 10 {
+                let e = "big"
+                Err(e)
+            } else {
+                let m = n + 1
+                Ok(m)
+            }
+        }
+    }
+}
+
+fn first_or_empty(c: Bool) -> List[Int] {
+    if c {
+        []
+    } else {
+        let a = 1
+        [a]
+    }
+}
+
+fn maybe_name(c: Bool) -> Option[Str] {
+    if c {
+        None
+    } else {
+        let s = "x"
+        Some(s)
+    }
+}
+
+fn early_none(n: Int) -> Option[Int] {
+    if n == 0 {
+        return None
+    } else {
+        let m = n + 5
+        Some(m)
+    }
+}
+
+fn ok_or(r: Result[Int, Str], d: Int) -> Int {
+    match r {
+        Ok(v) => v
+        Err(_) => d
+    }
+}
+
+test "a fn-tail if whose branch wraps its own local in Some" {
+    assert_eq(doubled_if(3) ?? -1, 6)
+    assert_eq(doubled_if(0) ?? -1, -1)
+}
+
+test "a fn-tail match arm block that wraps its own local in Ok" {
+    assert_eq(ok_or(doubled_match(4), -1), 8)
+    assert_eq(ok_or(doubled_match(0), -1), -1)
+}
+
+test "a fn-tail else-if chain whose branches wrap their own locals" {
+    assert_eq(sign_name(1) ?? "", "pos")
+    assert_eq(sign_name(-1) ?? "", "neg")
+    assert_eq(sign_name(0) ?? "none", "none")
+}
+
+test "a fn-tail if nested in a match arm wraps its own locals in Err and Ok" {
+    assert_eq(ok_or(nested_err(3), -1), 4)
+    assert_eq(ok_or(nested_err(20), -1), -1)
+}
+
+test "a target-directed fn-tail branch takes its type from the declared return" {
+    assert_eq(first_or_empty(true).len(), 0)
+    assert_eq(first_or_empty(false).len(), 1)
+    assert_eq(maybe_name(false) ?? "", "x")
+}
+
+test "a diverging branch leaves the other branch to type the fn tail" {
+    assert_eq(early_none(2) ?? -1, 7)
+    assert_eq(early_none(0) ?? -1, -1)
+}
+
+fn count_of(hay: Str, needle: Str) -> Int {
+    let parts = hay.split(needle)
+    parts.len() - 1
+}
+
+test "fn-tail if branches of different types are rejected" {
+    let src = "fn f(c: Bool) -> Int \{ if c \{ 1 } else \{ \"s\" } }\nfn main() \{ let _ = f(true) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "fntail_mismatch")
+    compile_test_helpers.expect_contains(out, "if branches have incompatible types", "flat branches")
+}
+
+test "fn-tail if branches of different types are rejected when a branch declares its value" {
+    let src = "fn f(c: Bool) -> Int \{ if c \{ let a = 1\n a } else \{ \"s\" } }\nfn main() \{ let _ = f(true) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "fntail_mismatch_decl")
+    compile_test_helpers.expect_contains(out, "if branches have incompatible types", "declaring branch")
+}
+
+test "a nested fn-tail if with branches of different types is rejected" {
+    let src = "fn f(a: Bool, b: Bool) -> Int \{ if a \{ if b \{ 1 } else \{ \"s\" } } else \{ 2 } }\nfn main() \{ let _ = f(true, true) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "fntail_mismatch_nested")
+    compile_test_helpers.expect_contains(out, "if branches have incompatible types", "nested if")
+}
+
+test "a fn-tail else-if chain that ends without else is rejected" {
+    let src = "fn f(n: Int) -> Int \{ if n > 0 \{ 1 } else if n < 0 \{ 2 } }\nfn main() \{ let _ = f(1) }\n"
+    compile_test_helpers.expect_compile_error(src, "fntail_elseif_noelse", "E0304")
+}
+
+test "a fn-tail match arm block ending in an else-less if is rejected" {
+    let src = "fn f(n: Int, c: Bool) -> Int \{ match n \{\n 0 => 0\n _ => \{ let m = n\n if c \{ m } }\n } }\nfn main() \{ let _ = f(1, true) }\n"
+    compile_test_helpers.expect_compile_error(src, "fntail_arm_noelse", "E0304")
+}
+
+test "an else-less fn-tail if is reported once" {
+    let src = "fn f(c: Bool) -> Int \{ if c \{ let m = 1\n m } }\nfn main() \{ let _ = f(true) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "fntail_noelse_once")
+    compile_test_helpers.expect_error(out, "E0304", "else-less tail")
+    assert_eq(count_of(out, "E0304"), 1)
+}
+
+test "an else-less if as a statement of a value fn is accepted" {
+    let src = "fn f(c: Bool) -> Int \{ if c \{ io.println(\"x\") }\n 1 }\nfn main() \{ let _ = f(true) }\n"
+    compile_test_helpers.expect_no_error(src, "fntail_stmt_noelse", "E0304")
+}
+
+test "an else-less if as the tail of a Void fn is accepted" {
+    let src = "fn f(c: Bool) \{ if c \{ io.println(\"x\") } }\nfn main() \{ f(true) }\n"
+    compile_test_helpers.expect_no_error(src, "fntail_void_noelse", "E0304")
+}

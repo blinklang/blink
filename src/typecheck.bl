@@ -1151,6 +1151,11 @@ let mut tc_in_closure_depth: Int = 0
 // position in the checker (22 sites today) and the bit is true at exactly one.
 let mut tc_fn_body_block: Int = 0
 
+// One-shot marker for tc_check_body: the node it is about to walk produces a consumed value
+// (§2.9), from the tail of a value-returning fn down through block, `if`, `match` and `with`
+// tails. The walk is the one pass that sees branch scopes, so it owns the value-context checks.
+let mut tc_walk_value_tail: Int = 0
+
 let mut tc_errors: List[Str] = []
 
 // ── Deprecation tracking ───────────────────────────────────────────
@@ -18349,6 +18354,15 @@ fn tc_block_tail_value(stmt: Int) -> Int {
     stmt
 }
 
+// The statement that produces a block's value when the block is itself a consumed value, or
+// -1. A `return` tail is left out: its own arm already checks the value it returns.
+fn tc_value_tail_stmt(block: Int, consumed: Bool) -> Int {
+    if !consumed { return -1 }
+    let tail = tc_block_tail_stmt(block)
+    if tail == -1 || node_kind(tail) == NodeKind.Return { return -1 }
+    tail
+}
+
 // The tid the IN-SCOPE walk recorded for a value produced inside a scope the speculative
 // infer could not see, or -1.
 //
@@ -18385,12 +18399,21 @@ fn tc_scoped_value_memo(node: Int, depth: Int) -> Int {
     if node == -1 { return -1 }
     if depth >= 8 { return -1 }
     let k = node_kind(node)
+    // The structural answers infer_type gives (§3.3, §2.11) are given here too, because the
+    // fn tail reads its type from this memo alone: a diverging form is Never, and a loop or
+    // a block with no tail value is ().
+    if k == NodeKind.Return || k == NodeKind.Break || k == NodeKind.Continue { return TYPE_NEVER }
+    if k == NodeKind.WhileLoop || k == NodeKind.ForIn || k == NodeKind.LoopExpr {
+        if k == NodeKind.LoopExpr && tc_loop_diverges(node) != 0 { return TYPE_NEVER }
+        return TYPE_VOID
+    }
     if k == NodeKind.WithBlock || k == NodeKind.AsyncScope {
         return tc_scoped_value_memo(node_body(node), depth + 1)
     }
     if k == NodeKind.Block {
+        if tc_block_exits(node) != 0 { return TYPE_NEVER }
         let tail = tc_block_tail_stmt(node)
-        if tail == -1 { return -1 }
+        if tail == -1 { return TYPE_VOID }
         return tc_scoped_value_memo(tc_block_tail_value(tail), depth + 1)
     }
     // An `if` tail is the `match` tail's twin: both branch bodies are Blocks the walk
@@ -18413,14 +18436,18 @@ fn tc_scoped_value_memo(node: Int, depth: Int) -> Int {
         let arms_sl = node_arms(node)
         if arms_sl == -1 { return -1 }
         let mut merged = -1
+        let mut completes = 0
         let mut i = 0
         while i < sublist_length(arms_sl) {
             let arm_t = tc_scoped_value_memo(tc_arm_body_value(sublist_get(arms_sl, i)), depth + 1)
             if tc_tid_is_no_info(arm_t) == 0 {
+                if tc_resolve(arm_t) == TYPE_VOID { completes = 1 }
                 if merged < 0 { merged = arm_t } else { merged = type_merge(merged, arm_t) }
             }
             i = i + 1
         }
+        // §3.3: one arm that completes with no value makes the whole match (), as infer_type says.
+        if completes != 0 { return TYPE_VOID }
         return merged
     }
     // A CALLBACK'S BODY is a scope the speculative infer could not see either, and
@@ -18477,12 +18504,28 @@ fn tc_index_is_type_application(idx: Int) -> Int {
 // value is used decides whether a difference between the branches is an error at all — an
 // `if` in statement position discards it, and an else-if chain whose arms end in calls of
 // unrelated types is ordinary code. The walk cannot see which it is; the consumer can, because
-// it is the thing doing the consuming.
+// it is the thing doing the consuming. The value-context walk is that consumer's proxy: its
+// marker says the value is consumed, so it checks the `if` itself (tc_check_if_value).
 fn tc_report_deferred_if_mismatch(node: Int) ! Diag.Report, TypeCheck.Report {
     if node == -1 { return }
     if node_kind(node) != NodeKind.IfExpr { return }
     if node_else_body(node) == -1 { return }
     if tc_if_declaring_branch(node) == 0 { return }
+    tc_report_if_branch_mismatch(node)
+}
+
+// A consumed `if` the value-context walk reached, checked once both branches were walked in
+// their own scopes. infer_type never types this node, so both of its reports are made here,
+// for every branch shape and not only the declaring ones.
+fn tc_check_if_value(node: Int) ! Diag.Report, TypeCheck.Report {
+    if node_else_body(node) == -1 {
+        tc_report_missing_else(node)
+        return
+    }
+    tc_report_if_branch_mismatch(node)
+}
+
+fn tc_report_if_branch_mismatch(node: Int) ! Diag.Report, TypeCheck.Report {
     let then_t = tc_scoped_value_memo(node_then_body(node), 0)
     let else_t = tc_scoped_value_memo(node_else_body(node), 0)
     if tc_tid_is_no_info(then_t) != 0 || tc_tid_is_no_info(else_t) != 0 { return }
@@ -18524,27 +18567,6 @@ fn tc_if_declaring_branch(node: Int) -> Int {
     if tc_block_tail_reads_own_local(node_then_body(node)) != 0 { return 1 }
     if tc_block_tail_reads_own_local(node_else_body(node)) != 0 { return 1 }
     0
-}
-
-// Put `tid` back on every node tc_scoped_value_memo read through to reach it, undoing an
-// out-of-scope re-inference that overwrote the walk's answer on the way down. Only the
-// single-valued links are followed — a `with`/`async` wrapper, and a block's tail — because
-// an `if`/`match` merge is the type of no one branch, so stamping the merge down a branch
-// would claim more than the walk proved.
-fn tc_republish_value_spine(node: Int, tid: Int, depth: Int) {
-    if node == -1 { return }
-    if depth >= 8 { return }
-    tc_publish_node_tid(node, tid)
-    let k = node_kind(node)
-    if k == NodeKind.WithBlock || k == NodeKind.AsyncScope {
-        tc_republish_value_spine(node_body(node), tid, depth + 1)
-        return
-    }
-    if k == NodeKind.Block {
-        let tail = tc_block_tail_stmt(node)
-        if tail == -1 { return }
-        tc_republish_value_spine(tc_block_tail_value(tail), tid, depth + 1)
-    }
 }
 
 // The value node of a match arm body, or -1 when the body diverges and therefore contributes
@@ -19266,8 +19288,9 @@ fn tc_infer_assigned_value(target_t: Int, val: Int) -> Int ! TypeCheck.Resolve, 
 // One arm of a statement-position match: its guard, then its body.
 // @allow: as tc_walk_stmt_value.
 @allow(UnrestoredMutation)
-fn tc_check_stmt_match_arm(arm: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_check_stmt_match_arm(arm: Int, in_value: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     tc_check_arm_guard(arm)
+    tc_walk_value_tail = in_value
     tc_check_body(node_body(arm))
 }
 
@@ -19330,6 +19353,9 @@ fn tc_check_enum_pattern_scrutinee(pat: Int, scrut_tid: Int) ! Diag.Report {
 }
 
 fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    // Read-then-zero before anything can recurse, so a nested walk never inherits it.
+    let in_value = tc_walk_value_tail
+    tc_walk_value_tail = 0
     if node == -1 { return }
     let kind = node_kind(node)
 
@@ -19343,13 +19369,15 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // takes its signature from the declared return. The tail compare below runs AFTER the
         // walk; the seed has to be in hand BEFORE it, because the walk is what checks the body.
         let mut hint_tail = -1
-        if is_fn_body != 0 && tc_fn_returns_value() {
+        let value_fn_body = is_fn_body != 0 && tc_fn_returns_value()
+        if value_fn_body {
             let seed_tail = tc_block_tail_stmt(node)
             if seed_tail != -1 {
                 if tc_block_tail_value(seed_tail) != -1 { hint_tail = seed_tail }
                 tc_seed_expected_into_value(tc_block_tail_value(seed_tail), tc_current_fn_ret)
             }
         }
+        let value_tail = tc_value_tail_stmt(node, value_fn_body || in_value != 0)
         if stmts_sl != -1 {
             let mut i = 0
             let mut _found_terminal = 0
@@ -19366,6 +19394,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 // what the walk already decided.
                 let saved_tail_hint = tc_construct_hint
                 if stmt == hint_tail { tc_construct_hint = resolve_alias_tid(tc_current_fn_ret) }
+                if stmt == value_tail { tc_walk_value_tail = 1 }
                 tc_check_body(stmt)
                 tc_construct_hint = saved_tail_hint
                 let sk = node_kind(stmt)
@@ -19385,81 +19414,18 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // NodeKind.Return is excluded because its own arm already ran this check on the
         // same value during the statement walk above; including it is the double-report.
         //
-        // The declared-return gate is hoisted OUT of tc_check_returned_value and
-        // repeated here, and that placement is load-bearing: infer_type REPORTS as a
-        // side effect (its IfExpr arm emits "if branches have incompatible types"), so
-        // inferring a tail the old code never inferred invents diagnostics. The old
-        // post-pop site was gated on `sig != -1 && declared_ret not Void/Unknown` and so
-        // never ran on a Void-returning fn — `fn f() { if c { a() } else { b() } }` with
-        // arms of different types was, and stays, silent. `tc_current_fn_ret >= 0` is
-        // the `sig != -1` half: tc_check_fn installs a return type only when
-        // lookup_fnsig hits, and it is called from two non-reentrant top-level loops,
-        // so a miss leaves the -1 that init_types/the prior restore put there. (Which
-        // is why this check does not reach impl methods — see tc_check_returned_value.)
-        if is_fn_body != 0 && tc_fn_returns_value() {
+        // Gated on a value-returning fn, like the value-tail marker above: a Void fn's tail
+        // is a discarded statement, so `fn f() { if c { a() } else { b() } }` with arms of
+        // different types stays silent.
+        if value_fn_body {
             let tail = tc_block_tail_stmt(node)
             if tail != -1 && node_kind(tail) != NodeKind.Return {
                 let tail_val = tc_block_tail_value(tail)
                 if tail_val != -1 {
-                    // The tail is walked (and memoized) above, in scope, before this runs. infer_type
-                    // re-types it out of scope, so a tail whose value names a block-local — an `if`
-                    // built from per-branch `let`s — reads UNKNOWN and the declared-return compare
-                    // goes silent. Recover the in-scope answer the same way the LetBinding arm does,
-                    // and for the same reason the IfExpr walk publishes it: an `if`/`match` in a
-                    // block-`let` was already covered, the fn tail was the one consumer that was not.
-                    // Implicit tail of a value-returning fn is expression context (§2.9):
-                    // infer in value context so an else-less `if` tail (no value on the false
-                    // path) is rejected.
-                    // Read the memo BEFORE the re-inference, not after. infer_type publishes
-                    // every node it walks, so the out-of-scope pass overwrites the in-scope
-                    // answer this recovery exists to read, and reading afterwards returns its
-                    // own damage. `Ok(out)` as a `with` tail is the shape that shows it: in
-                    // scope it is Result[List[Int], ?], re-typed out of scope the carried type
-                    // is gone, and the recovery used to "recover" the erased tid onto itself.
-                    let memo = tc_scoped_value_memo(tail_val, 0)
-                    // Same hint the walk used above. This re-inference republishes every node it
-                    // touches, so without it a target-directed tail loses the type the walk gave it.
-                    let saved_cmp_hint = tc_construct_hint
-                    tc_construct_hint = resolve_alias_tid(tc_current_fn_ret)
-                    let mut tail_t = tc_infer_value(tail_val)
-                    tc_construct_hint = saved_cmp_hint
-                    if tc_tid_is_no_info(tail_t) != 0 || tc_tid_has_unknown(tail_t) != 0 {
-                        if tc_tid_is_no_info(memo) == 0 {
-                            tail_t = if tc_tid_is_no_info(tail_t) != 0 { memo } else { tc_tid_fill_unknowns(tail_t, memo) }
-                        }
-                    } else if tc_tid_is_no_info(memo) == 0 && tc_tid_has_unknown(memo) == 0 && tc_scoped_value_memo(tail_val, 0) != memo {
-                        // A CONFIDENT answer from out of scope needs recovering too, and neither
-                        // guard above sees it: a tail that names a binding its own construct
-                        // introduces resolves to whatever the enclosing scope calls that name, so
-                        // the erasure is a different real type rather than an unknown. The memo
-                        // MOVING across the re-inference is the proof, since the walk above wrote
-                        // it in scope and only this re-inference could have changed it.
-                        //
-                        // A memo with unknowns in it does NOT win, even though it moved: the
-                        // re-inference above runs under the declared return as its hint, so for an
-                        // open tail like `[]` it is the BETTER answer and the walk's is the
-                        // incomplete one. Only a fully concrete memo can outrank it.
-                        //
-                        // The spine is repaired, not just the local compare: the re-inference
-                        // published its answer on every node it walked, and codegen reads those.
-                        tail_t = memo
-                    }
-                    // Both recoveries above fixed only the LOCAL answer the compare below
-                    // reads. The re-inference published its own, erased answer on every node
-                    // it walked, so leaving it there hands the rest of the pipeline a carrier
-                    // whose head is right and whose carried type is gone — the one outcome
-                    // worse than no answer at all, because nothing downstream can tell that
-                    // it needs to look elsewhere.
-                    //
-                    // A slot still open after that is left ALONE, and deliberately: an open
-                    // slot here is a metavar, tc_check_returned_value below pins it in place,
-                    // and a scope entry for a local holds the very same metavar. Filling it
-                    // from the declared return would put a concrete type where the pin
-                    // expects its own variable, leaving the entry that shares it unsolved.
-                    // The pin is also what fills those slots, so there is nothing to gain.
-                    if tc_tid_is_no_info(tail_t) == 0 && tail_t != tc_lookup_node_tid(tail_val) {
-                        tc_republish_value_spine(tail_val, tail_t, 0)
-                    }
+                    // The walk above typed the tail in value context with every branch scope
+                    // live, so its answer is read back rather than inferred again out of scope,
+                    // where a branch-local binding would resolve to nothing.
+                    let tail_t = tc_scoped_value_memo(tail_val, 0)
                     tc_check_returned_value(tail_t, tail_val)
                 }
             }
@@ -19725,8 +19691,11 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // The branch tails as the speculative inference left them, read before either branch
         // scope exists. The recovery below reads them again and takes the delta as its gate.
         let pre_if_memo = tc_scoped_value_memo(node, 0)
+        tc_walk_value_tail = in_value
         tc_check_body(node_then_body(node))
+        tc_walk_value_tail = in_value
         tc_check_body(node_else_body(node))
+        if in_value != 0 { tc_check_if_value(node) }
         // The branch bodies were walked — and memoized — inside their own block scopes, so an
         // `if` whose branch tail names a block-local `let` memoized TYPE_UNKNOWN for the `if` as
         // a whole. The answers exist now; read them back here at the `if`, exactly as the
@@ -19829,7 +19798,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 tc_check_pattern_types(node_pattern(arm))
                 tc_pattern_binding_type = -1
                 tc_check_enum_pattern_scrutinee(node_pattern(arm), scrut_tid)
-                tc_check_stmt_match_arm(arm)
+                tc_check_stmt_match_arm(arm, in_value)
                 // Resolve the arm's body-value tid through the scoped-value memo, NOT a bare
                 // tc_lookup_node_tid: a braced arm body (`Pat => { ... }`) makes tc_arm_body_value
                 // return the Block node, whose own tid is unwritten in statement position — the
@@ -19918,6 +19887,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // The body's tail as the speculative inference left it, read before the body is
         // walked in this scope. The recovery below takes the delta as its gate.
         let pre_with_memo = tc_scoped_value_memo(node, 0)
+        tc_walk_value_tail = in_value
         tc_check_body(node_body(node))
         // Same recovery as the MatchExpr arm, and for the same reason: `with` is an
         // expression whose value is its body's tail (sections/02_syntax.md:1017), and that tail
@@ -20023,7 +19993,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if kind == NodeKind.ExprStmt {
         let val = node_value(node)
         if val != -1 {
-            infer_type(val)
+            if in_value != 0 { tc_infer_value(val) } else { infer_type(val) }
             // Statement-position HOFs (l.for_each(fn(x){...})) need the MethodCall
             // branch to walk the closure body. Binding-position calls already
             // get this via tc_check_body(val) in the LetBinding handler. Scoped to the
