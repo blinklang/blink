@@ -68,7 +68,7 @@ The comparison is on declaration nodes through `tc_tid_decl_node`, never on a na
 | `Local`, `Param`, `Field`, `TupleElem` | The value is held by value. Aggregates are `Inline`; words are `InlineWord`. |
 | `Return` | Same as `Local`, except `Void` and `Never` spell `void`. |
 | `ContainerSlot` | A List, Map, Set or Channel element. The slot is a `void*`. A word stays `InlineWord` with its own spelling, except `Float`: a `double` is not punned through the word. `Float` and every aggregate become `PointerBoxed` and spell the pointer type (`double*`, `blink_Point*`) the reader casts the slot to and dereferences. |
-| `VtableSlot` | A handler vtable entry. An Option over a boxed nominal payload spells `blink_Option_ptr`, because every handler of one effect shares one C signature. |
+| `VtableSlot` | A handler vtable entry. It spells an operation's declared answer as a return does, so a perform reads the slot with no conversion. An effect operation takes no type parameters, so every handler of one operation already answers the same C type. |
 
 A word is a scalar, a runtime pointer type, an ordinal enum, a transparent newtype,
 an opaque handle or an Option over an opaque handle.
