@@ -1,0 +1,124 @@
+// The two bare pointer constructors, `alloc_ptr[T]()` and `null_ptr[T]()`. Neither spells
+// its pointee in the call the probe writes: typecheck gives both the type `Ptr[?]` and the
+// annotation settles the element, so codegen reads it back off the call's own tid.
+//
+// `alloc_ptr` takes one zeroed cell the collector reclaims (sections/07, Pointer Operations
+// and Standalone alloc_ptr), which is the GC heap, not a scope. `null_ptr` is the pointer
+// type's own zero, cast so the C side sees a pointer and not an int.
+
+import lower_test_helpers.{
+    probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies, assert_ice_saying,
+}
+import ir.{IrKind, ir_c_name, ir_c_spelling}
+import cg_expr.{lower_expr}
+import cg_print.{print_expr}
+
+fn src_ptrs() -> Str {
+    #"@ffi.struct
+type Pair {
+    a: Int
+    b: Int
+}
+
+fn main() {
+    let cell: Ptr[Int] = alloc_ptr()
+    let pair: Ptr[Pair] = alloc_ptr()
+    let byte: Ptr[U8] = alloc_ptr()
+    let none: Ptr[Int] = null_ptr()
+    let _keep = [cell.addr(), pair.addr(), byte.addr(), none.addr()]
+}
+"#
+}
+
+// No annotation: only the later argument to `take_int` says the pointee is Int.
+fn src_pinned_later() -> Str {
+    #"@ffi("labs")
+@trusted(audit: "TEST-ALLOC-PTR")
+fn take_int(p: Ptr[Int]) -> Int ! FFI { }
+
+fn main() {
+    let later = alloc_ptr()
+    let _keep = take_int(later)
+}
+"#
+}
+
+fn src_alloc_arity_wrong() -> Str {
+    #"fn main() {
+    let cell: Ptr[Int] = alloc_ptr(4)
+    let _keep = cell.addr()
+}
+"#
+}
+
+fn src_null_arity_wrong() -> Str {
+    #"fn main() {
+    let none: Ptr[Int] = null_ptr(0)
+    let _keep = none.addr()
+}
+"#
+}
+
+test "alloc_ptr takes one zeroed collected cell of the annotated element" {
+    probe("cg_call_alloc_ptr_int", src_ptrs())
+    let built = lower_expr(rhs_of("cell"))
+    assert_kind("kind", built, IrKind.HeapAlloc)
+    assert_shape("shape", built, "HeapAlloc")
+    assert_eq_str("spelled at its own pointer type", ir_c_spelling(built), "int64_t*")
+    assert_eq_str("element is the sizeof operand", ir_c_name(built), "int64_t")
+    assert_verifies("alloc_ptr Int", built)
+    assert_eq_str("printed", print_expr(built), "((int64_t*)blink_alloc(sizeof(int64_t)))")
+}
+
+test "alloc_ptr of a struct sizes the struct, not a word" {
+    probe("cg_call_alloc_ptr_struct", src_ptrs())
+    let built = lower_expr(rhs_of("pair"))
+    assert_kind("kind", built, IrKind.HeapAlloc)
+    assert_eq_str("pointer to the struct", ir_c_spelling(built), "{ir_c_name(built)}*")
+    assert(ir_c_name(built).contains("Pair"))
+    assert_verifies("alloc_ptr Pair", built)
+}
+
+test "alloc_ptr of a narrow element sizes that element" {
+    probe("cg_call_alloc_ptr_bracket", src_ptrs())
+    let built = lower_expr(rhs_of("byte"))
+    assert_kind("kind", built, IrKind.HeapAlloc)
+    assert_eq_str("element", ir_c_name(built), "uint8_t")
+    assert_eq_str("pointer", ir_c_spelling(built), "uint8_t*")
+    assert_verifies("alloc_ptr U8", built)
+}
+
+test "null_ptr is the pointer type's zero, cast to that pointer type" {
+    probe("cg_call_null_ptr", src_ptrs())
+    let built = lower_expr(rhs_of("none"))
+    assert_kind("kind", built, IrKind.Cast)
+    assert_shape("shape", built, "Cast(Const)")
+    assert_eq_str("spelling", ir_c_spelling(built), "int64_t*")
+    assert_verifies("null_ptr", built)
+    assert_eq_str("printed", print_expr(built), "((int64_t*)(0))")
+}
+
+test.failing(
+    "alloc_ptr whose pointee a later use pins sizes the pinned type",
+    reason: "typecheck neither pins a Ptr metavar from a later argument nor reports it as under-determined, so the call reaches codegen as Ptr[?] and stops at the PointeeUnsolved backstop",
+    ticket: "0028xr",
+) {
+    probe("cg_call_alloc_ptr_pinned", src_pinned_later())
+    let built = lower_expr(rhs_of("later"))
+    assert_kind("kind", built, IrKind.HeapAlloc)
+    assert_eq_str("element", ir_c_name(built), "int64_t")
+    assert_eq_str("pointer", ir_c_spelling(built), "int64_t*")
+    assert_verifies("alloc_ptr pinned later", built)
+}
+
+test "a wrong-arity alloc_ptr call refuses rather than emit an uncompilable call" {
+    probe("cg_call_alloc_ptr_arity", src_alloc_arity_wrong())
+    assert_ice_saying("alloc_ptr(4)", lower_expr(rhs_of("cell")), "RuntimeFreeCallArityWrong",
+        "'alloc_ptr' takes 0 argument(s), and this call was given 1")
+}
+
+test "a wrong-arity null_ptr call refuses rather than emit an uncompilable call" {
+    probe("cg_call_null_ptr_arity", src_null_arity_wrong())
+    assert_ice_saying("null_ptr(0)", lower_expr(rhs_of("none")), "RuntimeFreeCallArityWrong",
+        "'null_ptr' takes 0 argument(s), and this call was given 1")
+}
