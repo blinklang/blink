@@ -16,7 +16,7 @@ import parser.{
     sublist_length,
 }
 import typecheck.{
-    TyKind, TYPE_INT, TYPE_STR, lookup_named_type, make_ffi_scope_type, make_handler_type, tc_resolve,
+    TyKind, TYPE_INT, TYPE_STR, lookup_named_type, make_ffi_scope_type, make_fn_type, make_handler_type, tc_resolve,
     tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tc_void_tid, tk_name, ty_pool,
 }
 import layout.{
@@ -33,12 +33,12 @@ import cname.{
 import ir.{
     ir_assign, ir_block, ir_box, ir_call_direct, ir_call_runtime, ir_carrier_wrap, ir_cast,
     ir_closure_new, ir_const, ir_effect_perform, ir_evidence_address, ir_evidence_vector,
-    ir_field_get, ir_global_ref, ir_handler_install, ir_if, ir_let, ir_struct_new, ir_unbox, ir_var_ref,
+    ir_field_get, ir_handler_install, ir_if, ir_let, ir_struct_new, ir_unbox, ir_var_ref,
     ir_expr_stmt, ir_return,
 }
 import cg_print.{
-    print_closure_thunk, print_fn, print_fn_decl, print_handler_builder, print_resource_guard_support,
-    print_spawn_pair_typedef, print_spawn_task_wrapper,
+    print_closure_thunk, print_handler_builder, print_resource_guard_support, print_spawn_pair_typedef,
+    print_spawn_task_wrapper, print_vtable_slot_fn, print_vtable_slot_fn_decl, vtable_slot_self_spelling,
 }
 import cg_reg.{cg_reg_effect_decls, cg_reg_impl_decls}
 import cg_decl.{cg_decl_ret_tid, cg_decl_takes_ev}
@@ -334,9 +334,10 @@ type PendingThunk {
     cap_celled: List[Int]
     // -1 for a closure thunk. A handler literal's tid for one of its operations, which is
     // what makes the operation take its signature from its own declaration rather than from
-    // a Fn type, and its performs of that root reach outer_name rather than the vector.
+    // its Fn type, and its performs of that root reach outer_name rather than the vector.
     handler_tid: Int
-    // The static the handler literal's builder wrote the copied-from handler into, or "".
+    // The local an operation's prologue binds the copied-from handler to, out of capture word
+    // 0, or "". Each operation's own words carry it, so each handler value keeps its own.
     outer_name: Str
     // "" for a plain closure thunk. For a spawned one, the symbol of the task wrapper that
     // runs on the pool thread and stashes the closure's result into the handle spawn
@@ -368,8 +369,8 @@ let mut eff_spawn_pair_printed: Bool = false
 // cannot pop a frame that belongs to someone else.
 let mut eff_thunk_scope: Int = -1
 
-// While a handler operation's body lowers: the static its literal recorded the copied-from
-// handler in, and the evidence field of the root that operation handles. Both empty outside
+// While a handler operation's body lowers: the local its prologue binds the copied-from
+// handler to, and the evidence field of the root that operation handles. Both empty outside
 // one, which is what a perform reads to decide whether it is performing its own operation.
 let mut eff_op_outer_name: Str = ""
 let mut eff_op_field: Str = ""
@@ -593,23 +594,18 @@ fn join_names(names: List[Str]) -> Str {
 
 // ── Handler literals ─────────────────────────────────────────────
 
-// The handler record for one `handler E { ... }` literal, or -1 after a recorded internal
-// error.
-//
-// A handler literal is two things at once, the way a closure literal is: a value where it is
-// written and a set of function definitions somewhere else. The value is a vtable for E, a
-// copy of the vtable installed for E's root when the literal runs with one slot replaced per
+// A handler literal `handler E { ... }` is a value at its own site, like a closure literal,
+// and a set of function definitions somewhere else. The value is a vtable for E, a copy of
+// the vtable installed for E's root when the literal runs, with one slot replaced per
 // operation the literal writes. Copying is what makes a partial handler complete: an
-// operation the literal omits keeps the body the copied-from handler gave it, and a literal
-// that writes no operation at all delegates everything.
+// operation the literal omits keeps the body and userdata word the copied-from handler gave
+// it, and a literal that writes no operation at all delegates everything.
 //
-// The copy is built by a function of its own because the value stands where C has no
-// statement. That function also records the copied-from handler, which is what this
-// literal's operations perform their own root through.
-//
-// The operations ride the thunk queue the closure thunks ride, so the driver drains both the
-// same way, and each is forward-declared here because the builder names it before the drain
-// defines it.
+// Each operation is a closure object built here, stored in its slot's userdata word: word 0
+// is the copied-from handler, read now, and the words after it are the locals the operation
+// reads. The copy is built by a function of its own because the value stands where C has no
+// statement. The operations ride the thunk queue the closure thunks ride, and each is
+// forward-declared here because the builder names it before the drain defines it.
 pub fn cg_eff_lower_handler_expr(node: Int) -> Int ! Diag.Report {
     let tid = tc_resolve(tid_of_node(node))
     if tid < 0 { return -1 }
@@ -624,43 +620,93 @@ pub fn cg_eff_lower_handler_expr(node: Int) -> Int ! Diag.Report {
     let rec = layout_or_ice(tid, Position.Local, node, "UnspellableHandlerType", "handler literal")
     if rec.c_spelling == "" { return -1 }
     let ops = handler_ops(node)
-    if !handler_ops_are_capture_free(node, ops) { return -1 }
-    // Every signature is spelled before anything is queued, so a literal this stage cannot
-    // spell leaves the queue as it found it rather than a thunk nothing defines.
-    let mut slots: List[Str] = []
-    let mut symbols: List[Str] = []
-    let mut rets: List[Str] = []
-    let mut params: List[List[Str]] = []
+    // Every signature and capture is checked before anything is queued, so a literal this
+    // stage cannot build leaves the queue as it found it rather than a thunk nothing defines.
+    let mut sigs: List[HandlerOpSig] = []
     for op in ops {
-        let ret = handler_op_ret(op)
-        let ps = handler_op_params(op)
-        if ret == "" || ps.len() != declared_param_count(op) { return -1 }
-        let slot = c_effect_vtable_slot_name(tid, node_name(op))
-        if diag_is_ice_seg(slot) {
-            diag_ice_at("HandlerOpNotNameable", UNSOLVED_TYPEVAR_AT_CODEGEN,
-                "no vtable member for operation '{node_name(op)}' of this handler", op,
-                "a handler literal installs into its root's vtable; a root with no vtable should have been refused before codegen")
-            return -1
-        }
-        slots.push(slot)
-        rets.push(ret)
-        params.push(ps)
-        symbols.push(c_mint_local("handler_op"))
+        let sig = handler_op_sig(tid, op)
+        if sig.slot == "" { return -1 }
+        sigs.push(sig)
     }
     let outer = c_mint_local("handler_outer")
-    let mut i = 0
-    while i < ops.len() {
+    let mut slots: List[Str] = []
+    let mut symbols: List[Str] = []
+    let mut words: List[Int] = []
+    for sig in sigs {
+        let symbol = c_mint_local("handler_op")
+        let captured = ir_field_get(tid, node, rec.c_spelling, field, SlotForm.PointerBoxed, ev_read(node))
+        let tids: List[Int] = []
+        let celled: List[Int] = []
+        let mut kids: List[Int] = [captured]
+        for w in capture_words(sig.op, sig.free, tids, celled) { kids.push(w) }
         eff_thunks.push(PendingThunk {
-            closure: ops.get(i).unwrap(), symbol: symbols.get(i).unwrap(), fn_tid: -1,
-            cap_names: [], cap_tids: [], cap_celled: [], handler_tid: tid, outer_name: outer,
-            task_symbol: "", forward_to: -1, forward_symbol: "", forward_ev: false,
+            closure: sig.op, symbol: symbol, fn_tid: sig.fn_tid, cap_names: sig.free, cap_tids: tids,
+            cap_celled: celled, handler_tid: tid, outer_name: outer, task_symbol: "", forward_to: -1,
+            forward_symbol: "", forward_ev: false,
         })
-        print_fn_decl(true, rets.get(i).unwrap(), symbols.get(i).unwrap(), params.get(i).unwrap(), false)
-        i = i + 1
+        print_vtable_slot_fn_decl(sig.ret, symbol, sig.params)
+        words.push(ir_closure_new(sig.fn_tid, sig.op, sig.closure_spelling, symbol, "", "", kids))
+        slots.push(sig.slot)
+        symbols.push(symbol)
     }
     let symbol = c_mint_local("handler")
-    print_handler_builder(rec.c_spelling, symbol, outer, c_ev_global_name(), field, slots, symbols)
-    ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, [])
+    print_handler_builder(rec.c_spelling, symbol, c_ev_global_name(), field, slots, symbols)
+    ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, words)
+}
+
+// One operation of a literal as the builder and its thunk need it. slot is "" when a part
+// did not spell or a capture cannot be built, and that part has recorded its own report.
+type HandlerOpSig {
+    op: Int
+    slot: Str
+    ret: Str
+    params: List[Str]
+    fn_tid: Int
+    closure_spelling: Str
+    free: List[Str]
+}
+
+fn handler_op_sig(tid: Int, op: Int) -> HandlerOpSig ! Diag.Report {
+    let none = HandlerOpSig { op: op, slot: "", ret: "", params: [], fn_tid: -1, closure_spelling: "", free: [] }
+    let ret = handler_op_ret(op)
+    let ps = handler_op_params(op)
+    if ret == "" || ps.len() != declared_param_count(op) { return none }
+    let slot = c_effect_vtable_slot_name(tid, node_name(op))
+    if diag_is_ice_seg(slot) {
+        diag_ice_at("HandlerOpNotNameable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "no vtable member for operation '{node_name(op)}' of this handler", op,
+            "a handler literal installs into its root's vtable; a root with no vtable should have been refused before codegen")
+        return none
+    }
+    let fn_tid = handler_op_fn_tid(op)
+    if fn_tid < 0 { return none }
+    let closure = closure_layout(fn_tid, op)
+    if closure.c_spelling == "" { return none }
+    let free = closure_free_names(op)
+    if !captures_are_buildable(op, free) { return none }
+    HandlerOpSig {
+        op: op, slot: slot, ret: ret, params: ps, fn_tid: fn_tid, closure_spelling: closure.c_spelling,
+        free: free,
+    }
+}
+
+// The Fn type an operation's closure object carries, from the same result and parameter
+// types its signature is spelled from.
+fn handler_op_fn_tid(op: Int) -> Int ! Diag.Report {
+    let ret = handler_op_ret_tid(op)
+    if ret < 0 { return -1 }
+    let mut ps: List[Int] = []
+    let sl = node_params(op)
+    if sl != -1 {
+        let mut k = 0
+        while k < sublist_length(sl) {
+            let t = tid_of_node(sublist_get(sl, k))
+            if t < 0 { return -1 }
+            ps.push(t)
+            k = k + 1
+        }
+    }
+    make_fn_type(ret, ps)
 }
 
 // The operations one literal writes, in the order written, which is the order their slots are
@@ -711,27 +757,6 @@ fn handler_op_params(op: Int) -> List[Str] ! Diag.Report {
         k = k + 1
     }
     out
-}
-
-// Whether no operation of the literal reads a local of the enclosing function.
-//
-// A captured name would have to ride the vtable's per-operation userdata word. Nothing fills
-// that word yet, so a literal that needs one is refused by name rather than built with the
-// capture dropped, which would answer a value the program never wrote. The whole literal is
-// refused together, because its operations share one vtable and a half-built one would
-// install slots the program did not ask for.
-fn handler_ops_are_capture_free(node: Int, ops: List[Int]) -> Bool ! Diag.Report {
-    let mut captured: List[Str] = []
-    for op in ops {
-        for nm in closure_free_names(op) {
-            if !captured.contains(nm) { captured.push(nm) }
-        }
-    }
-    if captured.len() == 0 { return true }
-    diag_ice_at("HandlerCaptureNotLowered", CODEGEN_STAGE_NOT_BUILT,
-        "a handler operation reads {join_names(captured)} from the enclosing function, and an operation's captures have no word allocated yet",
-        node, "each operation owns one userdata word of its effect's vtable; nothing fills it, and dropping the capture would answer a value the program never wrote")
-    false
 }
 
 // ── The thunk queue ───────────────────────────────────────────────────────────────
@@ -917,14 +942,14 @@ pub fn cg_eff_print_thunk(i: Int, body: Int) ! Diag.Report {
     if ret == "" { return }
     let params = cg_eff_thunk_params(i)
     if params.len() != declared_param_count(thunk_sig_node(th)) { return }
-    // A handler operation is reached through a vtable slot, which passes the operation's own
-    // parameters and nothing else, so it takes no receiver word in front of them.
-    if th.handler_tid >= 0 {
-        print_fn(true, ret, th.symbol, params, false, body)
-        return
-    }
     let whole = with_capture_prologue(th, body)
     if whole < 0 { return }
+    // A handler operation is reached through a vtable slot, which passes the slot's userdata
+    // word in front of the operation's parameters: the operation's own closure object.
+    if th.handler_tid >= 0 {
+        print_vtable_slot_fn(ret, th.symbol, params, whole)
+        return
+    }
     print_closure_thunk(ret, th.symbol, params, whole)
     if th.task_symbol != "" { print_spawn_task_wrapper_for(i, th, ret) }
 }
@@ -947,60 +972,80 @@ fn print_spawn_task_wrapper_for(i: Int, th: PendingThunk, ret: Str) ! Diag.Repor
 }
 
 // The body with one declaration per captured name in front of it, each read back out of
-// __self at the position its word was built at.
+// __self at the position its word was built at. A handler operation's word 0 is the
+// copied-from handler, so its captures start at 1.
 //
 // The body lowered its captures as plain local reads, because that is what they are inside
 // the thunk, so the prologue is what makes those identifiers exist. __self is the closure
 // itself, which is why it carries the thunk's own Fn type.
 fn with_capture_prologue(th: PendingThunk, body: Int) -> Int ! Diag.Report {
-    if th.cap_names.len() == 0 { return body }
+    let is_op = th.handler_tid >= 0
+    if th.cap_names.len() == 0 && !is_op { return body }
     let index_rec = perform_layout(TYPE_INT, Position.Local, th.closure)
     if index_rec.c_spelling == "" { return -1 }
     let mut stmts: List[Int] = []
+    if is_op {
+        let rec = perform_layout(th.handler_tid, Position.Local, th.closure)
+        if rec.c_spelling == "" { return -1 }
+        let raw = capture_read(th, th.handler_tid, 0, index_rec.c_spelling)
+        stmts.push(ir_let(th.handler_tid, th.closure, rec.c_spelling, th.outer_name, rec.slot_form,
+            ir_cast(th.handler_tid, th.closure, rec.c_spelling, raw)))
+    }
+    let base = if is_op { 1 } else { 0 }
     let mut i = 0
     while i < th.cap_names.len() {
-        let nm = th.cap_names.get(i).unwrap()
-        let ntid = th.cap_tids.get(i).unwrap()
-        let is_cell = th.cap_celled.get(i).unwrap() == 1
-        let slot = layout_of(ntid, Position.ContainerSlot)
-        let loc = layout_of(ntid, Position.Local)
-        if loc.decline_reason != "" || (!is_cell && slot.decline_reason != "") {
-            diag_ice_at("UnspellableCaptureType", UNSOLVED_TYPEVAR_AT_CODEGEN,
-                "captured local '{nm}' has no C layout in the thunk that reads it", th.closure,
-                "the same type spelled at the literal's site must spell again where the thunk declares it")
-            return -1
-        }
-        // "__self" is the name cg_emit gives the receiver word in every thunk's parameter
-        // list, so the two have to agree on it.
-        let self_ref = ir_var_ref(th.fn_tid, th.closure, closure_self_spelling(), "__self", SlotForm.InlineWord)
-        let index = ir_const(TYPE_INT, th.closure, index_rec.c_spelling, "{i}")
-        let raw = ir_call_runtime(ntid, th.closure, container_slot_spelling(),
-            c_runtime_helper("closure_get_capture"), SlotForm.InlineWord, [self_ref, index])
-        if is_cell {
-            // The word is the cell's address and the name is the cell, so the pointer is
-            // taken as it stands. Reading through it here would bind a copy of the value,
-            // which compiles and then drops every write the thunk makes.
-            let cell_spelling = pointer_spelling(loc.c_spelling)
-            stmts.push(ir_let(ntid, th.closure, cell_spelling, c_cell_name(nm), SlotForm.InlineWord,
-                ir_cast(ntid, th.closure, cell_spelling, raw)))
-            i = i + 1
-            continue
-        }
-        // The pun the word was built through, undone in the same order.
-        let punned = if slot.slot_word == "" { raw } else { ir_cast(ntid, th.closure, slot.slot_word, raw) }
-        // A boxed capture travels as the address of a heap copy, so the name binds to what
-        // the address holds. Binding the address instead would read a pointer as the value.
-        let init = if slot.slot_form == SlotForm.PointerBoxed {
-            ir_unbox(ntid, th.closure, loc.c_spelling, loc.slot_form,
-                ir_cast(ntid, th.closure, slot.c_spelling, punned))
-        } else {
-            ir_cast(ntid, th.closure, loc.c_spelling, punned)
-        }
-        stmts.push(ir_let(ntid, th.closure, loc.c_spelling, c_local_name(nm), loc.slot_form, init))
+        let s = capture_let(th, i, base + i, index_rec.c_spelling)
+        if s < 0 { return -1 }
+        stmts.push(s)
         i = i + 1
     }
     stmts.push(body)
     ir_block(th.closure, stmts)
+}
+
+// "__self" is the name cg_emit gives the receiver word in every thunk's parameter list, so
+// the two have to agree on it. A handler operation's receiver is a vtable slot's word.
+fn capture_read(th: PendingThunk, tid: Int, index: Int, index_spelling: Str) -> Int {
+    let self_spelling = if th.handler_tid >= 0 { vtable_slot_self_spelling() } else { closure_self_spelling() }
+    let self_ref = ir_var_ref(th.fn_tid, th.closure, self_spelling, "__self", SlotForm.InlineWord)
+    let at = ir_const(TYPE_INT, th.closure, index_spelling, "{index}")
+    ir_call_runtime(tid, th.closure, container_slot_spelling(),
+        c_runtime_helper("closure_get_capture"), SlotForm.InlineWord, [self_ref, at])
+}
+
+// The declaration of capture i, read from the word at index.
+fn capture_let(th: PendingThunk, i: Int, index: Int, index_spelling: Str) -> Int ! Diag.Report {
+    let nm = th.cap_names.get(i).unwrap()
+    let ntid = th.cap_tids.get(i).unwrap()
+    let is_cell = th.cap_celled.get(i).unwrap() == 1
+    let slot = layout_of(ntid, Position.ContainerSlot)
+    let loc = layout_of(ntid, Position.Local)
+    if loc.decline_reason != "" || (!is_cell && slot.decline_reason != "") {
+        diag_ice_at("UnspellableCaptureType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "captured local '{nm}' has no C layout in the thunk that reads it", th.closure,
+            "the same type spelled at the literal's site must spell again where the thunk declares it")
+        return -1
+    }
+    let raw = capture_read(th, ntid, index, index_spelling)
+    if is_cell {
+        // The word is the cell's address and the name is the cell, so the pointer is
+        // taken as it stands. Reading through it here would bind a copy of the value,
+        // which compiles and then drops every write the thunk makes.
+        let cell_spelling = pointer_spelling(loc.c_spelling)
+        return ir_let(ntid, th.closure, cell_spelling, c_cell_name(nm), SlotForm.InlineWord,
+            ir_cast(ntid, th.closure, cell_spelling, raw))
+    }
+    // The pun the word was built through, undone in the same order.
+    let punned = if slot.slot_word == "" { raw } else { ir_cast(ntid, th.closure, slot.slot_word, raw) }
+    // A boxed capture travels as the address of a heap copy, so the name binds to what
+    // the address holds. Binding the address instead would read a pointer as the value.
+    let init = if slot.slot_form == SlotForm.PointerBoxed {
+        ir_unbox(ntid, th.closure, loc.c_spelling, loc.slot_form,
+            ir_cast(ntid, th.closure, slot.c_spelling, punned))
+    } else {
+        ir_cast(ntid, th.closure, loc.c_spelling, punned)
+    }
+    ir_let(ntid, th.closure, loc.c_spelling, c_local_name(nm), loc.slot_form, init)
 }
 
 // Opens the thunk's own binder frame with its parameters bound at their types, and answers
@@ -1515,9 +1560,8 @@ fn slot_read(node: Int, handler_tid: Int) -> Int ! Diag.Report {
     // installed around this one would be missed. Two handler tids of one root own one field,
     // so the field is the comparison the vtable identity rule already makes.
     if eff_op_outer_name != "" && eff_op_field == field {
-        // A GlobalRef, not a VarRef: the handler builder writes that name as a file-static,
-        // and the operation body is a function of its own that declares nothing of the kind.
-        return ir_global_ref(handler_tid, node, rec.c_spelling, eff_op_outer_name, SlotForm.PointerBoxed)
+        // The operation's prologue binds this local out of the operation's own word 0.
+        return ir_var_ref(handler_tid, node, rec.c_spelling, eff_op_outer_name, SlotForm.PointerBoxed)
     }
     ir_field_get(handler_tid, node, rec.c_spelling, field, SlotForm.PointerBoxed, ev_read(node))
 }
