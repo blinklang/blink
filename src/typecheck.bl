@@ -7093,35 +7093,10 @@ fn tc_bind_tparams_from_instance(bare: Str, src: Int, tparams_sl: Int, binds: Ma
     }
 }
 
-fn tc_struct_lit_instance_tid(stid: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    tc_check_struct_lit_field_closures(stid, node)
-    tc_pin_struct_lit_field_ret_mints(stid, node)
-    let bare = tc_instance_base_name(stid)
-    let decl = tc_struct_decl_nodes.get(bare) ?? -1
-    if decl == -1 {
-        tc_infer_struct_lit_field_values(stid, node)
-        return stid
-    }
-    let tparams_sl = node_type_params(decl)
-    if tparams_sl == -1 || sublist_length(tparams_sl) == 0 {
-        tc_infer_struct_lit_field_values(stid, node)
-        return stid
-    }
-    let flds_sl = node_fields(node)
-    if flds_sl == -1 { return stid }
-    let mut binds: Map[Str, Int] = Map()
-    // Seed from the construction hint before reading any field. A hint naming this same
-    // struct already spells the instance's type arguments, and for an empty `Map()`/`Set()`
-    // field it is the ONLY source of them: the field's own value mints fresh metavars and
-    // names nothing that could solve them, so the enclosing generic's parameter could never
-    // reach the bind map through the field. Left unseeded the literal bound its parameter to
-    // an unsolved metavar and the instance lost its C layout. The concrete-wins rule keeps
-    // precedence intact: a hint's bare typevar still yields to a concrete field. The loop
-    // below then reads each field type AT the instance these binds describe, which is what
-    // lets the pin reach the field's own value.
-    if tc_construct_hint >= 0 {
-        tc_bind_tparams_from_instance(bare, resolve_alias_tid(tc_construct_hint), tparams_sl, binds)
-    }
+// Binds each type parameter from the fields and spread entries alone. Each field value
+// is still inferred under its type at the expected instance, which is how an empty
+// `Map()`/`Set()` field learns its element types.
+fn tc_bind_struct_lit_fields(stid: Int, bare: Str, flds_sl: Int, tparams_sl: Int, binds: Map[Str, Int]) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let mut fi = 0
     while fi < sublist_length(flds_sl) {
         let f = sublist_get(flds_sl, fi)
@@ -7150,6 +7125,44 @@ fn tc_struct_lit_instance_tid(stid: Int, node: Int) -> Int ! TypeCheck.Resolve, 
             tc_bind_tparams_from_instance(bare, infer_type(node_value(f)), tparams_sl, binds)
         }
         fi = fi + 1
+    }
+}
+
+// The expected instance is the only source for a parameter reached through an empty
+// `Map()`/`Set()` field, whose value names nothing that could solve it. It fills only the
+// parameters no field fixed: a field that fixes one keeps it, so the literal keeps its own
+// type and the let, argument or return comparison reports a mismatch.
+fn tc_fill_binds_from_hint(bare: Str, hint: Int, tparams_sl: Int, binds: Map[Str, Int]) {
+    let mut hbinds: Map[Str, Int] = Map()
+    tc_bind_tparams_from_instance(bare, hint, tparams_sl, hbinds)
+    for key in hbinds.keys() {
+        let prev = binds.get(key) ?? -1
+        if prev == -1 || bind_target_is_concrete(prev) == 0 || tc_tid_has_unbound_metavar(prev) != 0 {
+            binds.insert(key, hbinds.get(key) ?? -1)
+        }
+    }
+}
+
+fn tc_struct_lit_instance_tid(stid: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    tc_check_struct_lit_field_closures(stid, node)
+    tc_pin_struct_lit_field_ret_mints(stid, node)
+    let bare = tc_instance_base_name(stid)
+    let decl = tc_struct_decl_nodes.get(bare) ?? -1
+    if decl == -1 {
+        tc_infer_struct_lit_field_values(stid, node)
+        return stid
+    }
+    let tparams_sl = node_type_params(decl)
+    if tparams_sl == -1 || sublist_length(tparams_sl) == 0 {
+        tc_infer_struct_lit_field_values(stid, node)
+        return stid
+    }
+    let flds_sl = node_fields(node)
+    if flds_sl == -1 { return stid }
+    let mut binds: Map[Str, Int] = Map()
+    tc_bind_struct_lit_fields(stid, bare, flds_sl, tparams_sl, binds)
+    if tc_construct_hint >= 0 {
+        tc_fill_binds_from_hint(bare, resolve_alias_tid(tc_construct_hint), tparams_sl, binds)
     }
     // Decide whether any type-param bound to a concrete type BEFORE building the
     // arg list, so the no-concrete fallback does not mint throwaway pool entries on
