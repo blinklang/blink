@@ -4,6 +4,7 @@ import ir.{
     ir_const, ir_var_ref, ir_binary, ir_field_get, ir_carrier_wrap, ir_call_direct,
     ir_let, ir_assign, ir_expr_stmt, ir_return, ir_if, ir_loop, ir_break, ir_block, ir_switch,
     ir_with_scope, ir_handler_install, ir_unreachable, ir_continue, ir_panic_catch, ir_panic_catch_exit,
+    ir_volatile_let, ir_cell_let, ir_cell_ref, ir_unary,
 }
 import layout.{SlotForm}
 // lexer and parser read the trace globals that compiler.bl owns, so a test that imports
@@ -204,4 +205,50 @@ test "a PanicCatchExit must name the innermost frame that encloses it" {
     assert_rejects("exit of an outer frame",
         frame("ap_o", [frame("ap_n", [ir_panic_catch_exit(0, "ap_o")])]), "the innermost frame is 'ap_n'")
     assert_rejects("exit of another frame", frame("ap_a", [ir_panic_catch_exit(0, "ap_b")]), "the innermost frame is 'ap_a'")
+}
+
+// The catch returns through longjmp, which leaves a changed local that is not volatile
+// indeterminate, so a binding written inside a frame it was declared outside must be one.
+test "a plain Let declared outside a PanicCatch and assigned inside its body is rejected" {
+    ir_reset()
+    assert_rejects("assign across the frame",
+        ir_block(0, [ir_let(1, 0, "int64_t", "x", SlotForm.InlineWord, int_const("1")),
+            frame("ap_w", [ir_assign(0, int_var("x"), int_const("2"))])]),
+        "writes 'x' inside a PanicCatch body")
+    let p = ir_var_ref(5, 0, "blink_P", "p", SlotForm.Inline)
+    assert_rejects("field write across the frame",
+        ir_block(0, [ir_let(5, 0, "blink_P", "p", SlotForm.Inline, -1),
+            frame("ap_f", [ir_assign(0, ir_field_get(1, 0, "int64_t", "n", SlotForm.InlineWord, p), int_const("2"))])]),
+        "writes 'p' inside a PanicCatch body")
+    assert_rejects("assign across a nested frame",
+        frame("ap_o", [ir_let(1, 0, "int64_t", "y", SlotForm.InlineWord, int_const("1")),
+            frame("ap_n", [ir_assign(0, int_var("y"), int_const("2"))])]),
+        "writes 'y' inside a PanicCatch body")
+}
+
+test "a VolatileLet, a CellLet or a Let of the frame's own body may be assigned inside it" {
+    ir_reset()
+    assert_valid("volatile across the frame",
+        ir_block(0, [ir_volatile_let(1, 0, "int64_t", "x", SlotForm.InlineWord, int_const("1")),
+            frame("ap_v", [ir_assign(0, int_var("x"), int_const("2"))])]))
+    assert_valid("cell across the frame",
+        ir_block(0, [ir_cell_let(1, 0, "int64_t", "c", SlotForm.InlineWord, int_const("1")),
+            frame("ap_c", [ir_assign(0, ir_cell_ref(1, 0, "int64_t", "c", SlotForm.InlineWord), int_const("2"))])]))
+    assert_valid("let inside the frame",
+        frame("ap_i", [ir_let(1, 0, "int64_t", "z", SlotForm.InlineWord, int_const("1")),
+            ir_assign(0, int_var("z"), int_const("2"))]))
+    assert_valid("an outer let shadowed by a let of the frame body",
+        ir_block(0, [ir_let(1, 0, "int64_t", "s", SlotForm.InlineWord, int_const("1")),
+            frame("ap_s", [ir_let(1, 0, "int64_t", "s", SlotForm.InlineWord, int_const("1")),
+                ir_assign(0, int_var("s"), int_const("2"))])]))
+}
+
+// A pointer to a volatile object is not a pointer any callee parameter is spelled to take,
+// so the address of one would have to be cast, and the cast drops the qualifier.
+test "the address of a VolatileLet is rejected" {
+    ir_reset()
+    assert_rejects("address of a volatile local",
+        ir_block(0, [ir_volatile_let(1, 0, "int64_t", "v", SlotForm.InlineWord, int_const("1")),
+            ir_expr_stmt(0, ir_unary(9, 0, "int64_t*", "&", int_var("v")))]),
+        "takes the address of VolatileLet 'v'")
 }
