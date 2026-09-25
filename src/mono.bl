@@ -22,7 +22,7 @@ import parser.{
     node_args, node_body, node_condition, node_else_body, node_elements, node_end, node_fields,
     node_for_binder, node_guard, node_handlers, node_impl_binders, node_impl_where_bounds,
     node_index, node_iterable, node_kind, node_left, node_method, node_methods, node_name,
-    node_obj, node_params, node_pattern, node_recv_type_args, node_right, node_scrutinee,
+    node_obj, node_params, node_pattern, node_recv_type_args, node_right, node_scrutinee, node_source_module,
     node_start, node_stmts, node_target, node_then_body, node_trait_name, node_type_ann,
     node_type_params, node_value, node_captures, node_arms, node_assoc_types, get_annotation,
     sublist_get, sublist_length,
@@ -34,7 +34,7 @@ import typecheck.{
     make_tuple_type,
     substitute_typevar_tid, tc_binder_key, tc_tid_typevar_key,
     tc_alias_to_original, tc_call_decl_node, tc_field_tid_at_instance,
-    tc_lookup_node_tid, tc_mc_obj_is_value, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_resolve,
+    tc_lookup_node_tid, tc_mc_obj_is_value, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_is_iterator_method, tc_resolve,
     tc_ret_mint_at, tc_tid_child, tc_tid_child_count,
     tc_tid_decl_node, tc_tid_kind,
     tc_tid_is_no_info, tc_tid_list_elem, tc_tid_name, tc_tid_resolved, tc_tid_struct, tc_type_str,
@@ -66,6 +66,9 @@ let mut mono_call_target: Map[Int, Int] = Map()
 // Declaration lookups the walk resolves a call through. Names here are how source
 // spells a callee; instance identity never depends on them.
 let mut generic_fn_by_name: Map[Str, Int] = Map()
+// Keyed "module:name", for routes that must reach one module's generic whatever else
+// the program declares under the same name.
+let mut generic_fn_by_module_name: Map[Str, Int] = Map()
 // The same declarations as a set of nodes. A call resolved by typecheck arrives as a node,
 // and only a generic free function may be discovered through it: a generic type declaration
 // also carries type parameters and is not a callee of this kind.
@@ -147,6 +150,7 @@ fn mono_reset() {
     type_insts_done = Map()
     mono_call_target = Map()
     generic_fn_by_name = Map()
+    generic_fn_by_module_name = Map()
     generic_fn_nodes = Map()
     own_generic_method_impl = Map()
     poly_method_by_name = Map()
@@ -169,6 +173,7 @@ fn mono_build_decl_maps(program: Int) {
         // An FFI-bridged generic is one type-erased C symbol, never an instance.
         if has_type_params(fn_node) && get_annotation(fn_node, "ffi") == -1 {
             generic_fn_by_name.insert(node_name(fn_node), fn_node)
+            generic_fn_by_module_name.insert("{node_source_module(fn_node)}:{node_name(fn_node)}", fn_node)
             generic_fn_nodes.insert(fn_node, 1)
         }
         i = i + 1
@@ -781,6 +786,32 @@ fn discover_list_generic_adapter_call(ctx: Int, node: Int, obj: Int) ! Diag.Repo
     }
 }
 
+// The std.iter generic a method call on this receiver kind stands for, or "". An Iterator
+// method is `iter_<method>`; `into_iter` on a List or Set builds the recipe over it, and on
+// an Iterator it is the receiver itself, so it names nothing.
+pub fn iterator_route_name(kind: TyKind, method: Str) -> Str {
+    if kind == TyKind.Iterator && tc_is_iterator_method(method) == 1 { return "iter_{method}" }
+    if method != "into_iter" { return "" }
+    if kind == TyKind.List { return "iter_from_list" }
+    if kind == TyKind.Set { return "iter_from_set" }
+    ""
+}
+
+pub fn iterator_route_module() -> Str { "std_iter" }
+
+// The routed generic is looked up in std.iter alone, so a program's own fn spelled like one
+// of these cannot take the route over.
+fn discover_iterator_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
+    let recv_tid = ctx_node_tid(ctx, obj)
+    if recv_tid < 0 { return }
+    let name = iterator_route_name(tc_tid_kind(recv_tid), node_method(node))
+    if name == "" { return }
+    match generic_fn_by_module_name.get("{iterator_route_module()}:{name}") {
+        Some(gfn) => discover_generic_call(ctx, gfn, node, [recv_tid], node_args(node))
+        None => {}
+    }
+}
+
 // `recv.m(..)` where `m` declares type parameters of its own. Typecheck already said which
 // declaration the receiver reached, and the receiver is the only thing that tells two impls
 // of one method name apart, so the decl link is the whole resolution.
@@ -805,6 +836,7 @@ fn discover_method_call(ctx: Int, node: Int) ! Diag.Report {
     discover_poly_impl_call(ctx, node, obj)
     discover_list_hof_call(ctx, node, obj)
     discover_list_generic_adapter_call(ctx, node, obj)
+    discover_iterator_call(ctx, node, obj)
 }
 
 // ── The walk ───────────────────────────────────────────────────────────────────

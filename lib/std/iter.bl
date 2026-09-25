@@ -1,0 +1,258 @@
+// Iterator[T] is a recipe: calling it starts a fresh cursor, and each cursor call yields
+// the next element or None. A copy of an Iterator shares the recipe, never a position,
+// so every consumer starts over (sections/03c_protocols.md).
+//
+// Nothing here is pub. The compiler routes each Iterator method to the generic named
+// `iter_<method>`, the way it routes the sealed List methods to `list_<method>`.
+
+// The two views between the sealed carrier and the recipe it holds. Both are one closure
+// pointer in C, so the compiler lowers each call to its argument and emits no symbol.
+@ffi("blink_iter_recipe")
+@trusted(audit: "STD-ITER")
+fn iter_recipe[T](it: Iterator[T]) -> fn() -> fn() -> Option[T] ! FFI {}
+
+@ffi("blink_iter_of")
+@trusted(audit: "STD-ITER")
+fn iter_of[T](r: fn() -> fn() -> Option[T]) -> Iterator[T] ! FFI {}
+
+// The list is read at each pull, not copied, so a consumer sees the list as it is then.
+fn iter_from_list[T](xs: List[T]) -> Iterator[T] {
+    iter_of(fn() -> fn() -> Option[T] {
+        let mut i = 0
+        fn() -> Option[T] {
+            if i >= xs.len() { return None }
+            let v = xs.get(i)
+            i = i + 1
+            v
+        }
+    })
+}
+
+// A Set has no position to read at, so each cursor takes its own snapshot on start.
+fn iter_from_set[T](s: Set[T]) -> Iterator[T] {
+    iter_of(fn() -> fn() -> Option[T] {
+        let mut xs: List[T] = []
+        for x in s {
+            xs.push(x)
+        }
+        let mut i = 0
+        fn() -> Option[T] {
+            if i >= xs.len() { return None }
+            let v = xs.get(i)
+            i = i + 1
+            v
+        }
+    })
+}
+
+fn iter_map[T, U](it: Iterator[T], f: fn(T) -> U) -> Iterator[U] {
+    let src = iter_recipe(it)
+    iter_of(fn() -> fn() -> Option[U] {
+        let next = src()
+        fn() -> Option[U] {
+            match next() {
+                Some(v) => Some(f(v))
+                None => None
+            }
+        }
+    })
+}
+
+fn iter_filter[T](it: Iterator[T], f: fn(T) -> Bool) -> Iterator[T] {
+    let src = iter_recipe(it)
+    iter_of(fn() -> fn() -> Option[T] {
+        let next = src()
+        fn() -> Option[T] {
+            loop {
+                match next() {
+                    Some(v) => { if f(v) { return Some(v) } }
+                    None => { return None }
+                }
+            }
+            None
+        }
+    })
+}
+
+fn iter_take[T](it: Iterator[T], n: Int) -> Iterator[T] {
+    let src = iter_recipe(it)
+    iter_of(fn() -> fn() -> Option[T] {
+        let next = src()
+        let mut left = n
+        fn() -> Option[T] {
+            if left <= 0 { return None }
+            left = left - 1
+            next()
+        }
+    })
+}
+
+fn iter_skip[T](it: Iterator[T], n: Int) -> Iterator[T] {
+    let src = iter_recipe(it)
+    iter_of(fn() -> fn() -> Option[T] {
+        let next = src()
+        let mut owed = n
+        fn() -> Option[T] {
+            while owed > 0 {
+                owed = owed - 1
+                if next().is_none() { return None }
+            }
+            next()
+        }
+    })
+}
+
+fn iter_chain[T](it: Iterator[T], other: Iterator[T]) -> Iterator[T] {
+    let first = iter_recipe(it)
+    let second = iter_recipe(other)
+    iter_of(fn() -> fn() -> Option[T] {
+        let a = first()
+        let b = second()
+        let mut on_b = false
+        fn() -> Option[T] {
+            if !on_b {
+                match a() {
+                    Some(v) => { return Some(v) }
+                    None => { on_b = true }
+                }
+            }
+            b()
+        }
+    })
+}
+
+fn iter_enumerate[T](it: Iterator[T]) -> Iterator[(Int, T)] {
+    let src = iter_recipe(it)
+    iter_of(fn() -> fn() -> Option[(Int, T)] {
+        let next = src()
+        let mut i = 0
+        fn() -> Option[(Int, T)] {
+            match next() {
+                Some(v) => {
+                    let at = i
+                    i = i + 1
+                    Some((at, v))
+                }
+                None => None
+            }
+        }
+    })
+}
+
+fn iter_zip[T, U](it: Iterator[T], other: Iterator[U]) -> Iterator[(T, U)] {
+    let left = iter_recipe(it)
+    let right = iter_recipe(other)
+    iter_of(fn() -> fn() -> Option[(T, U)] {
+        let a = left()
+        let b = right()
+        fn() -> Option[(T, U)] {
+            match a() {
+                Some(x) => {
+                    match b() {
+                        Some(y) => Some((x, y))
+                        None => None
+                    }
+                }
+                None => None
+            }
+        }
+    })
+}
+
+fn iter_flat_map[T, U](it: Iterator[T], f: fn(T) -> Iterator[U]) -> Iterator[U] {
+    let src = iter_recipe(it)
+    iter_of(fn() -> fn() -> Option[U] {
+        let outer = src()
+        let mut inner: fn() -> Option[U] = fn() -> Option[U] { None }
+        fn() -> Option[U] {
+            loop {
+                match inner() {
+                    Some(v) => { return Some(v) }
+                    None => {
+                        match outer() {
+                            Some(x) => { inner = iter_recipe(f(x))() }
+                            None => { return None }
+                        }
+                    }
+                }
+            }
+            None
+        }
+    })
+}
+
+fn iter_collect[T](it: Iterator[T]) -> List[T] {
+    let next = iter_recipe(it)()
+    let mut out: List[T] = []
+    loop {
+        match next() {
+            Some(v) => out.push(v)
+            None => { return out }
+        }
+    }
+    out
+}
+
+fn iter_count[T](it: Iterator[T]) -> Int {
+    let next = iter_recipe(it)()
+    let mut n = 0
+    while next().is_some() {
+        n = n + 1
+    }
+    n
+}
+
+fn iter_for_each[T](it: Iterator[T], f: fn(T) -> Void) {
+    let next = iter_recipe(it)()
+    loop {
+        match next() {
+            Some(v) => f(v)
+            None => { return }
+        }
+    }
+}
+
+fn iter_any[T](it: Iterator[T], f: fn(T) -> Bool) -> Bool {
+    let next = iter_recipe(it)()
+    loop {
+        match next() {
+            Some(v) => { if f(v) { return true } }
+            None => { return false }
+        }
+    }
+    false
+}
+
+fn iter_all[T](it: Iterator[T], f: fn(T) -> Bool) -> Bool {
+    let next = iter_recipe(it)()
+    loop {
+        match next() {
+            Some(v) => { if !f(v) { return false } }
+            None => { return true }
+        }
+    }
+    true
+}
+
+fn iter_find[T](it: Iterator[T], f: fn(T) -> Bool) -> Option[T] {
+    let next = iter_recipe(it)()
+    loop {
+        match next() {
+            Some(v) => { if f(v) { return Some(v) } }
+            None => { return None }
+        }
+    }
+    None
+}
+
+fn iter_fold[T, A](it: Iterator[T], init: A, f: fn(A, T) -> A) -> A {
+    let next = iter_recipe(it)()
+    let mut acc = init
+    loop {
+        match next() {
+            Some(v) => { acc = f(acc, v) }
+            None => { return acc }
+        }
+    }
+    acc
+}

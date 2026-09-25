@@ -35,7 +35,7 @@ import typecheck.{
     tc_names_a_type, tc_is_sealed_list_hof, tc_is_list_generic_adapter, is_user_effect_handle_name,
     tc_lookup_node_tid, tc_unclaimed_call_tid, tc_list_rename_help, tc_tid_iter_elem,
     tc_call_decl_node, tc_call_decl_is_fn, tc_call_is_skip_intrinsic, tc_tid_name, tc_mc_obj_is_value,
-    tc_tid_same_type,
+    tc_tid_same_type, make_option_type, make_fn_type,
     TYPE_INT, TYPE_BOOL, TYPE_STR, TYPE_VOID,
     type_bit_width, TYPE_U8, TYPE_U16, TYPE_U32, TYPE_U64,
 }
@@ -48,7 +48,7 @@ import layout.{
     tid_holds_tag_member, spawn_pair_spelling, task_entry_spelling, pool_spelling,
     async_scope_handles_spelling,
 }
-import mono.{instances, instance_for_call}
+import mono.{instances, instance_for_call, iterator_route_name, iterator_route_module}
 import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls, cg_reg_trait_decls, cg_reg_impl_of}
 import cname.{
     c_fn_decl_name, c_impl_method_name, c_impl_method_name_q,
@@ -615,6 +615,64 @@ fn cc_channel_take(node: Int, shape: ElementShape, channel: Int) -> ChannelTake 
         ir_var_ref(shape.tid, node, cell, word, SlotForm.InlineWord), ir_const(TYPE_INT, node, cell, "0"))
     let element = cg_call_decode_element(node, shape.tid, shape,
         ir_var_ref(shape.tid, node, cell, word, SlotForm.InlineWord))
+    if element < 0 { return refused }
+    ChannelTake { take: take, closed: closed, element: element }
+}
+
+// One walk over an Iterator: the statement that starts a cursor from the recipe, then per
+// turn the statement that pulls the next Option, the test that it is None, and the element
+// read out of it. The recipe is called once per walk, so every walk starts from the first.
+pub type CursorWalk {
+    start: Int
+    take: Int
+    closed: Int
+    element: Int
+}
+
+pub fn cg_call_cursor_walk(node: Int, elem: Int, iterator: Int) -> CursorWalk ! Diag.Report {
+    let refused = CursorWalk { start: -1, take: -1, closed: -1, element: -1 }
+    let opt = make_option_type(elem)
+    let cursor = make_fn_type(opt, [])
+    let recipe = make_fn_type(cursor, [])
+    let cur_rec = cc_local(cursor, node)
+    if cc_stopped(cur_rec) { return refused }
+    let recipe_rec = cc_local(recipe, node)
+    if cc_stopped(recipe_rec) { return refused }
+    let recipe_fn = fn_pointer_spelling_of(recipe, node)
+    if recipe_fn == "" { return refused }
+    let cur = c_mint_local("cur")
+    let held = ir_cast(recipe, node, recipe_rec.c_spelling, iterator)
+    let started = ir_call_closure(cursor, node, cur_rec.c_spelling, recipe_fn, cur_rec.slot_form, held, [])
+    let start = ir_let(cursor, node, cur_rec.c_spelling, cur, cur_rec.slot_form, started)
+    let turn = cc_cursor_turn(node, elem, opt, cursor, cc_temp_ref(node, cursor, cur_rec, cur))
+    if turn.element < 0 { return refused }
+    CursorWalk { start: start, take: turn.take, closed: turn.closed, element: turn.element }
+}
+
+// One pull from a started cursor. The Option is bound before it is read, because the test
+// and the element read both name it and the pull must run once.
+fn cc_cursor_turn(node: Int, elem: Int, opt: Int, cursor_tid: Int, cursor: Int) -> ChannelTake ! Diag.Report {
+    let refused = ChannelTake { take: -1, closed: -1, element: -1 }
+    let c = cc_carrier_held(node, opt, cc_local(opt, node))
+    if cc_carrier_missing(c) { return refused }
+    let cursor_fn = fn_pointer_spelling_of(cursor_tid, node)
+    if cursor_fn == "" { return refused }
+    let value = cc_local(elem, node)
+    if cc_stopped(value) { return refused }
+    let _td = ensure_typedef_for(opt)
+    let next = c_mint_local("next")
+    let pulled = ir_call_closure(opt, node, c.held.c_spelling, cursor_fn, c.held.slot_form, cursor, [])
+    let take = ir_let(opt, node, c.held.c_spelling, next, c.held.slot_form, pulled)
+    if c.held.slot_form == SlotForm.InlineWord {
+        let closed = cc_handle_is(node, c, cc_carrier_ref(node, c, next), false)
+        let element = ir_cast(elem, node, value.c_spelling, cc_carrier_ref(node, c, next))
+        return ChannelTake { take: take, closed: closed, element: element }
+    }
+    let member = cc_member_layout(node, opt, Slot.Inner1)
+    if cc_stopped(member) { return refused }
+    let tag = ir_carrier_tag(TYPE_INT, node, c.g.tag, cc_carrier_ref(node, c, next))
+    let closed = cc_tag_equals(node, tag, CARRIER_TAG_NONE, c)
+    let element = x_unbox_payload(elem, node, cc_carrier_ref(node, c, next), member, value, carrier_value_member)
     if element < 0 { return refused }
     ChannelTake { take: take, closed: closed, element: element }
 }
@@ -1198,7 +1256,28 @@ fn lower_module_call(node: Int) -> Int ! Diag.Report {
 // The tail every free-function call shares once its declaration is known. A declaration of
 // -1 is a refusal the resolver already reported.
 fn cc_free_call(node: Int, decl: Int) -> Int ! Diag.Report {
+    if cc_is_iterator_view(decl) { return cc_iterator_view(node, decl) }
     cc_declared_call(node, decl, NO_RECEIVER)
+}
+
+// std.iter's two views between an Iterator and the recipe it holds. Both are one closure
+// pointer in C, so a call of either is its argument under the result's spelling.
+fn cc_is_iterator_view(decl: Int) -> Bool {
+    if decl < 0 { return false }
+    if node_source_module(decl) != iterator_route_module() { return false }
+    node_name(decl) == "iter_recipe" || node_name(decl) == "iter_of"
+}
+
+fn cc_iterator_view(node: Int, decl: Int) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 1 { return cc_free_arity_wrong(node, node_name(decl), 1, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    let arg = lower_expr(sublist_get(node_args(node), 0))
+    if arg < 0 { return -1 }
+    ir_cast(tid, node, rec.c_spelling, arg)
 }
 
 // A call of one declaration, with the receiver it was written on if it was written on one.
@@ -2890,9 +2969,11 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let declared = cc_intrinsic_callee(node, kind, mname)
     if declared == ROW_REFUSED { return -1 }
     if declared != "" { return lower_intrinsic_method(node, obj, kind, mname, declared) }
-    // Read beside the intrinsic table and above the impls, for the same reason: the sealed
-    // List higher-order surface is a builtin method, so it wins over a same-named user impl
-    // exactly as typecheck resolves it.
+    // The sealed List higher-order surface and the Iterator surface are builtin methods too,
+    // so they are read here, above the impls, for the same reason as the intrinsic table.
+    if kind == TyKind.Iterator && mname == "into_iter" { return lower_expr(obj) }
+    let routed = iterator_route_name(kind, mname)
+    if routed != "" { return cc_iterator_call(node, obj, routed) }
     if kind == TyKind.List && (cc_names_list_hof(mname) || cc_names_list_generic_adapter(mname)) { return cc_list_hof_call(node, obj, mname) }
     if kind == TyKind.List && cc_is_list_take(mname) { return cc_list_take(node, obj) }
     let primitive = cc_runtime_method(kind, mname)
@@ -4383,6 +4464,10 @@ type CarrierRef { tid: Int  held: LayoutRecord  g: GuardSpellings }
 fn cc_carrier_of(node: Int, obj: Int) -> CarrierRef ! Diag.Report {
     let tid = tid_of_node(obj)
     let held = if tid < 0 { layout_of(tid, Position.Local) } else { cc_local(tid, node) }
+    cc_carrier_held(node, tid, held)
+}
+
+fn cc_carrier_held(node: Int, tid: Int, held: LayoutRecord) -> CarrierRef ! Diag.Report {
     let g = cc_guard_spellings(node)
     let spells = !cc_stopped(held) && !cc_guard_stopped(g)
     CarrierRef { tid: if spells { tid } else { -1 }, held: held, g: g }
@@ -4882,6 +4967,33 @@ fn cc_list_hof_no_body(node: Int, method: Str) -> Int ! Diag.Report {
     -1
 }
 
+// A method on an Iterator, or `into_iter` on a List or Set, is the std.iter generic mono
+// named for it, with the receiver as its first parameter, as for the List methods above.
+fn cc_iterator_call(node: Int, obj: Int, name: Str) -> Int ! Diag.Report {
+    let decl = cc_stdlib_fn_named(node, iterator_route_module(), name)
+    if decl == DECL_REFUSED { return -1 }
+    if decl < 0 { return cc_iterator_no_body(node, name) }
+    let want = sublist_length(node_params(decl)) - 1
+    let given = sublist_length(node_args(node))
+    if want != given { return cc_iterator_arity_wrong(node, name, want, given) }
+    cc_declared_call(node, decl, obj)
+}
+
+fn cc_iterator_arity_wrong(node: Int, name: Str, want: Int, given: Int) -> Int ! Diag.Report {
+    diag_ice_at("IteratorMethodArityWrong", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{name}' takes {want} argument(s) after its receiver, and this call gives {given}", node,
+        "typecheck checks a call's argument count before codegen builds it; this is a compiler bug")
+    -1
+}
+
+// std.iter is a prelude module, so a missing body is a broken build, as for the List ones.
+fn cc_iterator_no_body(node: Int, name: Str) -> Int ! Diag.Report {
+    diag_ice_at("IteratorMethodBodyNotDeclared", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "this method stands for '{name}', which no loaded module declares", node,
+        "lib/std/iter.bl declares the generic every Iterator method means")
+    -1
+}
+
 let list_hof_prefix = "list_"
 let list_hof_module = "std_list"
 
@@ -5226,7 +5338,9 @@ fn cc_unhandled(node: Int) -> Int ! Diag.Report {
 // Drained: a Channel has no position at all -- sections/04_effects.md's own `for value in
 // ch` reads it by calling recv_symbol once per iteration and stopping the loop the moment
 // it answers "closed and empty", so there is no length to ask for up front.
-pub type ForInStrategy { Indexed, Materialized, Drained }
+// Cursor: an Iterator holds a recipe, so a loop calls it once for a fresh cursor and then
+// calls the cursor each turn until it answers None.
+pub type ForInStrategy { Indexed, Materialized, Drained, Cursor }
 
 pub type ForInIteration {
     strategy: ForInStrategy
@@ -5267,13 +5381,17 @@ fn cc_for_in_drained(recv_op: Str, elem: Int) -> ForInIteration {
         element_tid: elem }
 }
 
+fn cc_for_in_cursor(elem: Int) -> ForInIteration {
+    ForInIteration { strategy: ForInStrategy.Cursor, len_symbol: "", get_symbol: "",
+        materialize_symbol: "", pair_symbol: "", recv_symbol: "", element_tid: elem }
+}
+
 // A kind tc_tid_iter_elem already answers an element for, but that this producer has no
 // runtime symbol for yet. Str's element is a one-character Str (tc_tid_iter_elem's own
 // words), and the only runtime reader at a position -- blink_str_char_at -- is byte
 // indexed with no way to say how many bytes the character at that position took, so a
 // len/get pair built from blink_str_len/blink_str_char_at would walk multi-byte text
-// wrong; Iterator has no runtime representation at all, only an opaque placeholder. Both
-// refuse the same way cg_stmt's own lower_for_in refuses every non-range iterable today:
+// wrong. It refuses the same way cg_stmt's own lower_for_in refuses every non-range iterable today:
 // an internal error, never a user-facing one, because typecheck's NotIterable has already
 // turned away anything that is not a legal iterable before codegen ever sees the node.
 fn cc_for_in_not_built(node: Int) -> ForInIteration ! Diag.Report {
@@ -5306,5 +5424,6 @@ pub fn for_in_iteration_of(iterable_tid: Int, node: Int) -> ForInIteration ! Dia
     if kind == TyKind.Set { return cc_for_in_materialized("set_to_list", "", elem) }
     if kind == TyKind.Map { return cc_for_in_materialized("map_keys", "map_values", elem) }
     if kind == TyKind.Channel { return cc_for_in_drained(channel_recv_op, elem) }
+    if kind == TyKind.Iterator { return cc_for_in_cursor(elem) }
     cc_for_in_not_built(node)
 }
