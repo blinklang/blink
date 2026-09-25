@@ -1,0 +1,89 @@
+// A bare call to a name selected from a `pub import` facade reaches a declaration the facade
+// does not hold. The caller's import list names the facade, not the declaring module, so the
+// recorded declaration has to follow the re-export to the module that wrote it.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_call_decl_node}
+import parser.{node_kind, node_name, node_left, node_module, node_count}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn probe(path: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn assert_no_errors(label: Str) {
+    let errs = error_messages()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: unexpected diagnostics:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+// The first Call node in the root file whose callee is the bare name `name`.
+fn bare_call(name: Str) -> Int {
+    let mut i = 0
+    while i < node_count() {
+        if node_kind(i) == NodeKind.Call {
+            let callee = node_left(i)
+            if callee != -1 && node_kind(callee) == NodeKind.Ident && node_name(callee) == name {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn assert_decl_is(label: Str, call: Int, want_mod: Str, want_name: Str) {
+    if call < 0 {
+        io.println("FAIL: {label}: no call node found")
+    }
+    assert(call >= 0)
+    let decl = tc_call_decl_node(call)
+    if decl < 0 {
+        io.println("FAIL: {label}: call records no declaration")
+    }
+    assert(decl >= 0)
+    let got_mod = node_module(decl)
+    let got_name = node_name(decl)
+    if got_mod != want_mod || got_name != want_name {
+        io.println("FAIL: {label}: call resolved to '{got_mod}.{got_name}', want '{want_mod}.{want_name}'")
+    }
+    assert(got_mod == want_mod)
+    assert(got_name == want_name)
+}
+
+// The facade re-exports every name of zzcd_tagger.
+test "a bare call selected from a whole-module facade records the declaring module" {
+    probe("tests/zzcd_calls/src/main_facade_bare.bl")
+    assert_no_errors("whole-module facade")
+    assert_decl_is("whole-module facade", bare_call("zzcd_tag"), "zzcd_tagger", "zzcd_tag")
+}
+
+// The facade re-exports only the one name, by selection.
+test "a bare call selected from a selective facade records the declaring module" {
+    probe("tests/zzcd_calls/src/main_facade_selective_bare.bl")
+    assert_no_errors("selective facade")
+    assert_decl_is("selective facade", bare_call("zzcd_tag"), "zzcd_tagger", "zzcd_tag")
+}
+
+// Two re-exports sit between the caller and the declaration. The middle facade declares
+// nothing, so stopping there would record no declaration at all.
+test "a bare call through two chained facades records the declaring module" {
+    probe("tests/zzcd_calls/src/main_facade_two_hop.bl")
+    assert_no_errors("two facades")
+    assert_decl_is("two facades", bare_call("zzcd_tag"), "zzcd_tagger", "zzcd_tag")
+}
