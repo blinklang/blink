@@ -5583,7 +5583,7 @@ fn tc_walk_nested_hof_bodies(expr: Int) ! TypeCheck.Resolve, TypeCheck.Report, D
     // wrong width. tc_check_body walks every statement in its own scope, which is the same full walk
     // a fn-body block gets; routing here closes the one nesting position it was never reached from.
     if k == NodeKind.Block {
-        tc_check_body(expr)
+        tc_walk_nested_under_own_type(expr)
         return
     }
     // A closure, a handler, or a struct literal written DIRECTLY in a nested value position —
@@ -5648,13 +5648,39 @@ fn tc_walk_nested_hof_bodies(expr: Int) ! TypeCheck.Resolve, TypeCheck.Report, D
         }
         return
     }
+    if k == NodeKind.IfExpr || k == NodeKind.MatchExpr {
+        tc_walk_nested_under_own_type(expr)
+    }
+}
+
+// A block or branching value nested in a larger one (a tuple or list element, an argument)
+// was inferred under its slot's expectation, which is its own published type. Its body is
+// walked under that type rather than the enclosing value's, so a branch's bare `None` keeps it.
+// @allow: the construct hint is saved and restored around the one walk below.
+@allow(UnrestoredMutation)
+fn tc_walk_nested_under_own_type(expr: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let saved_hint = tc_construct_hint
+    let own = tc_lookup_node_tid(expr)
+    if tc_tid_is_no_info(own) == 0 && tc_tid_has_unbound_metavar(own) == 0 {
+        tc_construct_hint = resolve_alias_tid(own)
+    }
+    tc_walk_nested_value_body(expr)
+    tc_construct_hint = saved_hint
+}
+
+fn tc_walk_nested_value_body(expr: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let k = node_kind(expr)
+    if k == NodeKind.Block {
+        tc_check_body(expr)
+        return
+    }
     // An `if` used as a value holds its closure in a branch, and a branch body is a Block,
-    // which this walker already routes to the full walk. Without this the closure
+    // which gets the full walk under the `if`'s own type. Without this the closure
     // in `take(if p { fn(x) { .. } } else { .. })` was never body-walked at all: its parameters
     // stayed unstamped and its return stayed Void, whatever the parameter declared.
     if k == NodeKind.IfExpr {
-        tc_walk_nested_hof_bodies(node_then_body(expr))
-        tc_walk_nested_hof_bodies(node_else_body(expr))
+        tc_check_body(node_then_body(expr))
+        tc_check_body(node_else_body(expr))
         return
     }
     // A `match` used as a value holds its closure in an arm, for the same reason and with the
@@ -5668,7 +5694,7 @@ fn tc_walk_nested_hof_bodies(expr: Int) ! TypeCheck.Resolve, TypeCheck.Report, D
                 let b = node_body(sublist_get(arms_sl, i))
                 if b != -1 {
                     let inner = if node_kind(b) == NodeKind.ExprStmt { node_value(b) } else { b }
-                    tc_walk_nested_hof_bodies(inner)
+                    if node_kind(inner) == NodeKind.Block { tc_check_body(inner) } else { tc_walk_nested_hof_bodies(inner) }
                 }
                 i = i + 1
             }
