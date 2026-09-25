@@ -1,0 +1,161 @@
+// The C a @derive(Debug) type gets for a List, Map or Option field. The spec fixes the
+// text: a list is "[e1, e2]", a map is "{k1: v1}", and an option is "Some(v)" or "None",
+// each element rendered by its own debug form however deep the nesting goes.
+
+import std.io
+import layout.{layout_reset}
+import mono.{run_mono}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build, cg_reg_type_decls}
+import cg_derive.{cg_derive_reset, cg_derive_emit_bodies}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_naming}
+
+// The instance table is the monomorphization pass's answer, and a generic type's field
+// is a container only at an instance, so every probe here runs it.
+fn program_of(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let program = cg_probe_compile("build/{stem}_probe_src.bl", src)
+    run_mono(program)
+    layout_reset()
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_derive_reset()
+    program
+}
+
+fn bodies_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _p = program_of(stem, src)
+    cg_derive_emit_bodies(cg_reg_type_decls())
+    print_take()
+}
+
+// Every refusal the body pass records for the probe, of any name: a container rendered
+// in part is as wrong as one refused whole.
+fn refusals_of(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _p = program_of(stem, src)
+    cg_derive_emit_bodies(cg_reg_type_decls())
+    cg_probe_ices_naming("cg_derive")
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output still has '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+fn one_fn(text: Str, head: Str) -> Str {
+    let start = text.index_of(head)
+    if start < 0 { io.println("FAIL: output has no '{head}'\n--- output ---\n{text}") }
+    assert(start >= 0)
+    let rest = text.substring(start, text.len() - start)
+    let end = rest.index_of("\n}")
+    assert(end >= 0)
+    rest.substring(0, end)
+}
+
+fn list_src() -> Str {
+    #"@derive(Debug)
+type Bag { items: List[Int] }
+fn main() { }
+"#
+}
+
+test "a list field is walked into brackets with a comma and space between elements" {
+    assert_eq(refusals_of("cg_debug_list", list_src()), 0)
+    let text = one_fn(bodies_of("cg_debug_list", list_src()), "const char* blink_Bag_debug")
+    assert_has(text, "blink_list_len(")
+    assert_has(text, "blink_list_get(")
+    assert_has(text, #""[""#)
+    assert_has(text, #"", ""#)
+    assert_has(text, #""]""#)
+    assert_lacks(text, "<?>")
+}
+
+fn map_src() -> Str {
+    #"@derive(Debug)
+type Tally { counts: Map[Str, Int] }
+fn main() { }
+"#
+}
+
+test "a map field is walked key by key into braces with a colon before each value" {
+    assert_eq(refusals_of("cg_debug_map", map_src()), 0)
+    let text = one_fn(bodies_of("cg_debug_map", map_src()), "const char* blink_Tally_debug")
+    assert_has(text, "blink_map_keys(")
+    assert_has(text, "blink_map_values(")
+    assert_has(text, "blink_str_debug(")
+    assert_has(text, #"": ""#)
+    assert_has(text, #""{""#)
+    assert_has(text, #""}""#)
+}
+
+fn option_src() -> Str {
+    #"@derive(Debug)
+type Maybe { v: Option[Int] }
+fn main() { }
+"#
+}
+
+test "an option field renders its payload inside Some or the bare word None" {
+    assert_eq(refusals_of("cg_debug_option", option_src()), 0)
+    let text = one_fn(bodies_of("cg_debug_option", option_src()), "const char* blink_Maybe_debug")
+    assert_has(text, #""None""#)
+    assert_has(text, #""Some(%lld)""#)
+}
+
+fn nested_src() -> Str {
+    #"@derive(Debug)
+type Deep { xs: List[Option[Map[Str, List[Int]]]] }
+fn main() { }
+"#
+}
+
+test "containers nested in containers are each walked by their own rendering" {
+    assert_eq(refusals_of("cg_debug_nested", nested_src()), 0)
+    let text = one_fn(bodies_of("cg_debug_nested", nested_src()), "const char* blink_Deep_debug")
+    assert_has(text, "blink_map_keys(")
+    assert_has(text, #""Some(%s)""#)
+}
+
+// A data-carrying enum is boxed in a list slot, so the element read follows the box
+// before the enum's own derived method renders it.
+fn enum_elem_src() -> Str {
+    #"@derive(Debug)
+type Shape { Circle(Int), Rect(Int, Int) }
+@derive(Debug)
+type Color { Red, Green }
+@derive(Debug)
+type Drawing { shapes: List[Shape], tints: Map[Str, Color] }
+fn main() { }
+"#
+}
+
+test "an enum element renders through its own derived method" {
+    assert_eq(refusals_of("cg_debug_enum_elem", enum_elem_src()), 0)
+    let text = one_fn(bodies_of("cg_debug_enum_elem", enum_elem_src()), "const char* blink_Drawing_debug")
+    assert_has(text, "blink_Shape_debug(")
+    assert_has(text, "blink_Color_debug(")
+}
+
+fn generic_src() -> Str {
+    #"@derive(Debug)
+type Wrapper[T] { items: List[T] }
+fn main() {
+    let _s = Wrapper { items: [1, 2] }.debug()
+}
+"#
+}
+
+test "a generic type's container field is walked at each instance's element type" {
+    assert_eq(refusals_of("cg_debug_generic", generic_src()), 0)
+    let text = one_fn(bodies_of("cg_debug_generic", generic_src()), "const char* blink_Wrapper_0Int_debug")
+    assert_has(text, "blink_list_len(")
+}

@@ -34,11 +34,11 @@ import ir.{
     ir_assign, ir_binary, ir_block, ir_call_direct, ir_call_runtime, ir_cast, ir_const,
     ir_field_get, ir_if, ir_let, ir_panic, ir_return, ir_switch, ir_unary, ir_var_ref,
     ir_loop, ir_break, ir_expr_stmt, ir_struct_new, ir_enum_new, ir_carrier_wrap,
-    ir_carrier_unwrap, ir_carrier_tag, ir_global_ref, ir_select,
+    ir_carrier_unwrap, ir_carrier_tag, ir_global_ref, ir_select, ir_unbox,
 }
 import typecheck.{
     DECL_NODE_AMBIGUOUS, TYPE_BOOL, TYPE_CHAR, TYPE_INT, TYPE_STR, TYPE_U64, TyKind, lookup_named_type,
-    TYPE_FLOAT, TYPE_VOID, make_result_type,
+    TYPE_FLOAT, TYPE_VOID, make_result_type, make_list_type,
     tc_decl_derives, tc_enum_variant_slots,
     tc_evar_field_slots, tc_evar_name, tc_evfield_name, tc_evfield_tid, tc_resolve,
     tc_lookup_node_tid, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
@@ -1078,6 +1078,9 @@ fn debug_part(ftid: Int, value: Int, path: Str, span: Int) -> DebugPart ! Diag.R
     if k == TyKind.Char { return debug_helper_part(TYPE_CHAR, "char_debug", value, span) }
     if k == TyKind.Str { return debug_helper_part(TYPE_STR, "str_debug", value, span) }
     if k == TyKind.Struct || k == TyKind.Enum { return debug_nested_part(ftid, value, path, span) }
+    if k == TyKind.List { return list_join_part(ftid, value, path, true, span) }
+    if k == TyKind.Map { return debug_map_part(ftid, value, path, span) }
+    if k == TyKind.Option { return debug_option_part(ftid, value, path, span) }
     let spec = format_spec_of(ftid)
     if spec == "" {
         not_built(span, "@derive(Debug) on the {tk_name(k)} field '{path}'")
@@ -1148,6 +1151,117 @@ fn derived_call_part(ftid: Int, value: Int, path: Str, derive: Str, method: Str,
     let arg = ir_call_direct(TYPE_STR, span, spelling, c_derived_method_symbol(ftid, method),
         rec.slot_form, [value])
     DebugPart { spec: spec, arg: arg, pre: [], ok: true }
+}
+
+// A map has no by-position read of its own storage, so its keys and its values are each
+// read into a list, at the same positions, and the two lists are walked together.
+fn debug_map_part(ftid: Int, value: Int, path: Str, span: Int) -> DebugPart ! Diag.Report {
+    let ktid = child_tid(ftid, Slot.Inner1)
+    let vtid = child_tid(ftid, Slot.Inner2)
+    if ktid < 0 || vtid < 0 {
+        derive_ice(span, "the map field '{path}' has no key or value type")
+        return debug_refused()
+    }
+    let mrec = layout_of(ftid, Position.Local)
+    let keys_tid = make_list_type(ktid)
+    let vals_tid = make_list_type(vtid)
+    let krec = layout_of(keys_tid, Position.Local)
+    let vrec = layout_of(vals_tid, Position.Local)
+    let mspelling = spelling_or_ice(mrec, "the map field '{path}'", span)
+    let kspelling = spelling_or_ice(krec, "the keys of the map field '{path}'", span)
+    let vspelling = spelling_or_ice(vrec, "the values of the map field '{path}'", span)
+    let strs = str_spelling(span)
+    let ints = int_spelling(span)
+    if mspelling == "" || kspelling == "" || vspelling == "" || strs == "" || ints == "" { return debug_refused() }
+    let keys = ListWalk { list: c_mint_local("j"), carry: c_mint_local("j"), index: c_mint_local("j"),
+        lspelling: kspelling, lform: krec.slot_form, strs: strs, ints: ints }
+    let vals = ListWalk { list: c_mint_local("j"), carry: keys.carry, index: keys.index,
+        lspelling: vspelling, lform: vrec.slot_form, strs: strs, ints: ints }
+    let step = debug_map_step(keys, vals, MapTids { keys: keys_tid, key: ktid, vals: vals_tid, value: vtid }, path, span)
+    if step < 0 { return debug_refused() }
+    let m = c_mint_local("j")
+    let mut pre = [ir_let(ftid, span, mspelling, m, mrec.slot_form, value)]
+    pre.push(ir_let(keys_tid, span, kspelling, keys.list, krec.slot_form, ir_call_runtime(keys_tid, span, kspelling,
+        c_runtime_helper("map_keys"), krec.slot_form, [ir_var_ref(ftid, span, mspelling, m, mrec.slot_form)])))
+    pre.push(ir_let(vals_tid, span, vspelling, vals.list, vrec.slot_form, ir_call_runtime(vals_tid, span, vspelling,
+        c_runtime_helper("map_values"), vrec.slot_form, [ir_var_ref(ftid, span, mspelling, m, mrec.slot_form)])))
+    pre.push(ir_let(TYPE_STR, span, strs, keys.carry, str_form(), ser_text(keys, "\{", span)))
+    pre.push(ir_let(TYPE_INT, span, ints, keys.index, int_form(), ir_const(TYPE_INT, span, ints, "0")))
+    pre.push(ir_loop(span, step))
+    pre.push(ser_append(keys, ser_text(keys, "\}", span), span))
+    DebugPart { spec: format_spec_of(TYPE_STR), arg: ser_acc(keys, span), pre: pre, ok: true }
+}
+
+// The four types one map walk reads through: the two lists and what each one holds.
+type MapTids {
+    keys: Int
+    key: Int
+    vals: Int
+    value: Int
+}
+
+fn debug_map_step(keys: ListWalk, vals: ListWalk, t: MapTids, path: Str, span: Int) -> Int ! Diag.Report {
+    let head = join_head(keys, t.keys, join_sep(true), span)
+    let key = join_elem(keys, t.keys, t.key, span)
+    let val = join_elem(vals, t.vals, t.value, span)
+    if head.len() == 0 || key < 0 || val < 0 { return -1 }
+    let kpart = debug_part(t.key, key, "a key of {path}", span)
+    if !kpart.ok { return -1 }
+    let vpart = debug_part(t.value, val, "a value of {path}", span)
+    if !vpart.ok { return -1 }
+    let mut stmts = head
+    for s in kpart.pre { stmts.push(s) }
+    stmts.push(ser_append(keys, ser_piece(keys, kpart, span), span))
+    stmts.push(ser_append(keys, ser_text(keys, ": ", span), span))
+    for s in vpart.pre { stmts.push(s) }
+    stmts.push(ser_append(keys, ser_piece(keys, vpart, span), span))
+    stmts.push(join_next(keys, span))
+    ir_block(span, stmts)
+}
+
+// The member an Option's payload is stored in and the tag that says it is present. The
+// carrier typedef and cg_call's reads spell the same two.
+let opt_value_member = "value"
+let opt_tag_some = "1"
+
+// An option is a string temp that starts as None and is overwritten when the tag says a
+// payload is present: the payload is read only under that tag.
+fn debug_option_part(ftid: Int, value: Int, path: Str, span: Int) -> DebugPart ! Diag.Report {
+    let inner = child_tid(ftid, Slot.Inner1)
+    if inner < 0 {
+        derive_ice(span, "the option field '{path}' has no payload type")
+        return debug_refused()
+    }
+    let crec = layout_of(ftid, Position.Local)
+    let member = carrier_member_layout(ftid, Slot.Inner1)
+    let held = layout_of(inner, Position.Local)
+    let cspelling = spelling_or_ice(crec, "the option field '{path}'", span)
+    let mspelling = spelling_or_ice(member, "the payload of the option field '{path}'", span)
+    let hspelling = spelling_or_ice(held, "the payload of the option field '{path}'", span)
+    let strs = str_spelling(span)
+    let ints = int_spelling(span)
+    let bools = bool_spelling(span)
+    if cspelling == "" || mspelling == "" || hspelling == "" || strs == "" || ints == "" || bools == "" {
+        return debug_refused()
+    }
+    let o = c_mint_local("d")
+    let d = c_mint_local("d")
+    let mut payload = ir_carrier_unwrap(inner, span, mspelling, opt_value_member, member.slot_form,
+        ir_var_ref(ftid, span, cspelling, o, crec.slot_form))
+    if member.slot_form == SlotForm.PointerBoxed { payload = ir_unbox(inner, span, hspelling, held.slot_form, payload) }
+    let part = debug_part(inner, payload, "the payload of {path}", span)
+    if !part.ok { return debug_refused() }
+    let target = ir_var_ref(TYPE_STR, span, strs, d, str_form())
+    let fmt = ir_const(TYPE_STR, span, strs, c_string_literal("Some({part.spec})"))
+    let mut fill = part.pre
+    fill.push(ir_assign(span, target, ir_call_runtime(TYPE_STR, span, strs, c_runtime_helper("str_format"),
+        str_form(), [fmt, part.arg])))
+    let tag = ir_carrier_tag(TYPE_INT, span, ints, ir_var_ref(ftid, span, cspelling, o, crec.slot_form))
+    let some = ir_binary(TYPE_BOOL, span, bools, "==", tag, ir_const(TYPE_INT, span, ints, opt_tag_some))
+    let pre = [ir_let(ftid, span, cspelling, o, crec.slot_form, value),
+        ir_let(TYPE_STR, span, strs, d, str_form(), ir_const(TYPE_STR, span, strs, c_string_literal("None"))),
+        ir_if(span, some, ir_block(span, fill), -1)]
+    DebugPart { spec: format_spec_of(TYPE_STR), arg: ir_var_ref(TYPE_STR, span, strs, d, str_form()), pre: pre, ok: true }
 }
 
 // ── Hash ─────────────────────────────────────────────────────────────────
@@ -1777,7 +1891,7 @@ fn ser_part(ftid: Int, value: Int, path: Str, span: Int) -> DebugPart ! Diag.Rep
     if k == TyKind.Struct || k == TyKind.Enum {
         return derived_call_part(ftid, value, path, derive_serialize, "to_json", span)
     }
-    if k == TyKind.List { return ser_list_part(ftid, value, path, span) }
+    if k == TyKind.List { return list_join_part(ftid, value, path, false, span) }
     let spec = format_spec_of(ftid)
     if k != TyKind.Int || spec == "" {
         not_built(span, "@derive(Serialize) on the {tk_name(k)} field '{path}'")
@@ -1801,9 +1915,10 @@ fn ser_call_part(module: Str, name: Str, value: Int, span: Int) -> DebugPart ! D
     DebugPart { spec: spec, arg: arg, pre: [], ok: true }
 }
 
-// A list is joined into one JSON array before the object is formatted, so the formatter
-// sees one string argument however many elements the list holds.
-fn ser_list_part(ftid: Int, value: Int, path: Str, span: Int) -> DebugPart ! Diag.Report {
+// A list is joined into one string before the value is formatted, so the formatter sees
+// one argument however many elements the list holds. Debug and Serialize differ only in
+// the separator and in how each element renders.
+fn list_join_part(ftid: Int, value: Int, path: Str, debug: Bool, span: Int) -> DebugPart ! Diag.Report {
     let etid = child_tid(ftid, Slot.Inner1)
     if etid < 0 {
         derive_ice(span, "the list field '{path}' has no element type")
@@ -1816,13 +1931,20 @@ fn ser_list_part(ftid: Int, value: Int, path: Str, span: Int) -> DebugPart ! Dia
     if lspelling == "" || strs == "" || ints == "" { return debug_refused() }
     let names = ListWalk { list: c_mint_local("j"), carry: c_mint_local("j"), index: c_mint_local("j"),
         lspelling: lspelling, lform: lrec.slot_form, strs: strs, ints: ints }
-    let step = ser_list_step(names, ftid, etid, path, span)
-    if step < 0 { return debug_refused() }
+    let head = join_head(names, ftid, join_sep(debug), span)
+    let elem = join_elem(names, ftid, etid, span)
+    if head.len() == 0 || elem < 0 { return debug_refused() }
+    let part = walk_part(debug, etid, elem, "an element of {path}", span)
+    if !part.ok { return debug_refused() }
+    let mut stmts = head
+    for s in part.pre { stmts.push(s) }
+    stmts.push(ser_append(names, ser_piece(names, part, span), span))
+    stmts.push(join_next(names, span))
     let mut pre: List[Int] = []
     pre.push(ir_let(ftid, span, lspelling, names.list, lrec.slot_form, value))
     pre.push(ir_let(TYPE_STR, span, strs, names.carry, str_form(), ser_text(names, "[", span)))
     pre.push(ir_let(TYPE_INT, span, ints, names.index, int_form(), ir_const(TYPE_INT, span, ints, "0")))
-    pre.push(ir_loop(span, step))
+    pre.push(ir_loop(span, ir_block(span, stmts)))
     pre.push(ser_append(names, ser_text(names, "]", span), span))
     DebugPart { spec: format_spec_of(TYPE_STR), arg: ser_acc(names, span), pre: pre, ok: true }
 }
@@ -1861,28 +1983,39 @@ fn ser_append(names: ListWalk, piece: Int, span: Int) -> Int {
     ir_assign(span, ser_acc(names, span), joined)
 }
 
-// One pass of the join: stop at the end, put a comma before every element but the first,
-// then append the element's own JSON.
-fn ser_list_step(names: ListWalk, ftid: Int, etid: Int, path: Str, span: Int) -> Int ! Diag.Report {
+// JSON is compact and a debug string is read by a person, so only the latter spaces its
+// separators.
+fn join_sep(debug: Bool) -> Str {
+    if debug { return ", " }
+    ","
+}
+
+fn walk_part(debug: Bool, etid: Int, value: Int, path: Str, span: Int) -> DebugPart ! Diag.Report {
+    if debug { return debug_part(etid, value, path, span) }
+    ser_part(etid, value, path, span)
+}
+
+// The start of one pass of a join: stop at the end, and put the separator before every
+// element but the first. Empty after a refusal.
+fn join_head(names: ListWalk, ltid: Int, sep: Str, span: Int) -> List[Int] ! Diag.Report {
     let bools = bool_spelling(span)
-    if bools == "" { return -1 }
-    let list = ir_var_ref(ftid, span, names.lspelling, names.list, names.lform)
+    if bools == "" { return [] }
+    let list = ir_var_ref(ltid, span, names.lspelling, names.list, names.lform)
     let len = ir_call_runtime(TYPE_INT, span, names.ints, c_runtime_helper("list_len"), int_form(), [list])
     let more = ir_binary(TYPE_BOOL, span, bools, "<", ser_index(names, span), len)
     let stop = ir_if(span, ir_unary(TYPE_BOOL, span, bools, "!", more), ir_block(span, [ir_break(span)]), -1)
     let later = ir_binary(TYPE_BOOL, span, bools, ">", ser_index(names, span), ir_const(TYPE_INT, span, names.ints, "0"))
-    let comma = ir_if(span, later, ir_block(span, [ser_append(names, ser_text(names, ",", span), span)]), -1)
-    let again = ir_var_ref(ftid, span, names.lspelling, names.list, names.lform)
-    let elem = cg_call_element_from_runtime(span, etid, c_runtime_helper("list_get"), [again, ser_index(names, span)])
-    if elem < 0 { return -1 }
-    let part = ser_part(etid, elem, "an element of {path}", span)
-    if !part.ok { return -1 }
-    let mut stmts = [stop, comma]
-    for s in part.pre { stmts.push(s) }
-    stmts.push(ser_append(names, ser_piece(names, part, span), span))
+    [stop, ir_if(span, later, ir_block(span, [ser_append(names, ser_text(names, sep, span), span)]), -1)]
+}
+
+fn join_elem(names: ListWalk, ltid: Int, etid: Int, span: Int) -> Int ! Diag.Report {
+    let list = ir_var_ref(ltid, span, names.lspelling, names.list, names.lform)
+    cg_call_element_from_runtime(span, etid, c_runtime_helper("list_get"), [list, ser_index(names, span)])
+}
+
+fn join_next(names: ListWalk, span: Int) -> Int {
     let next = ir_binary(TYPE_INT, span, names.ints, "+", ser_index(names, span), ir_const(TYPE_INT, span, names.ints, "1"))
-    stmts.push(ir_assign(span, ser_index(names, span), next))
-    ir_block(span, stmts)
+    ir_assign(span, ser_index(names, span), next)
 }
 
 // A part that is already a string is appended as it is. Any other part is a number that
