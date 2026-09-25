@@ -34,6 +34,7 @@ import ir.{
     ir_assign, ir_block, ir_box, ir_call_direct, ir_call_runtime, ir_carrier_wrap, ir_cast,
     ir_closure_new, ir_const, ir_effect_perform, ir_evidence_address, ir_evidence_vector,
     ir_field_get, ir_global_ref, ir_handler_install, ir_if, ir_let, ir_struct_new, ir_unbox, ir_var_ref,
+    ir_expr_stmt, ir_return,
 }
 import cg_print.{
     print_closure_thunk, print_fn, print_fn_decl, print_handler_builder, print_resource_guard_support,
@@ -258,6 +259,13 @@ type PendingThunk {
     // runs on the pool thread and stashes the closure's result into the handle spawn
     // answered — minted beside the closure's own symbol so both exist before either prints.
     task_symbol: Str
+    // -1 for a thunk with a written body. For a top-level function named as a value, that
+    // function's declaration: the thunk's parameters are its parameters, and its body is one
+    // call to forward_symbol, passing the evidence vector when forward_ev says the function
+    // takes one.
+    forward_to: Int
+    forward_symbol: Str
+    forward_ev: Bool
 }
 
 let mut eff_thunks: List[PendingThunk] = []
@@ -330,14 +338,8 @@ pub fn cg_eff_lower_spawn_closure(node: Int) -> Int ! Diag.Report {
 fn lower_closure_thunk(node: Int, task_symbol: Str) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
-    let rec = layout_of(tid, Position.Local)
-    let why = rec.decline_reason
-    if why != "" {
-        diag_ice_at("UnspellableClosureType", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "closure has no C layout: {why}", node,
-            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
-        return -1
-    }
+    let rec = closure_layout(tid, node)
+    if rec.c_spelling == "" { return -1 }
     let free = closure_free_names(node)
     if !captures_are_buildable(node, free) { return -1 }
     let tids: List[Int] = []
@@ -347,8 +349,37 @@ fn lower_closure_thunk(node: Int, task_symbol: Str) -> Int ! Diag.Report {
     eff_thunks.push(PendingThunk {
         closure: node, symbol: symbol, fn_tid: tid, cap_names: free, cap_tids: tids,
         cap_celled: celled, handler_tid: -1, outer_name: "", task_symbol: task_symbol,
+        forward_to: -1, forward_symbol: "", forward_ev: false,
     })
     ir_closure_new(tid, node, rec.c_spelling, symbol, "", "", words)
+}
+
+fn closure_layout(tid: Int, node: Int) -> LayoutRecord ! Diag.Report {
+    let rec = layout_of(tid, Position.Local)
+    let why = rec.decline_reason
+    if why != "" {
+        diag_ice_at("UnspellableClosureType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "closure has no C layout: {why}", node,
+            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    }
+    rec
+}
+
+// A top-level function named as a value. A closure is called with its own record in front
+// of the arguments and a plain function takes no record, so the value is a thunk that
+// forwards to the function rather than the function's own symbol. It captures nothing.
+pub fn cg_eff_lower_fn_value(node: Int, decl: Int, symbol: Str, takes_ev: Bool) -> Int ! Diag.Report {
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = closure_layout(tid, node)
+    if rec.c_spelling == "" { return -1 }
+    let thunk = c_mint_local("fn_value")
+    eff_thunks.push(PendingThunk {
+        closure: node, symbol: thunk, fn_tid: tid, cap_names: [], cap_tids: [], cap_celled: [],
+        handler_tid: -1, outer_name: "", task_symbol: "", forward_to: decl, forward_symbol: symbol,
+        forward_ev: takes_ev,
+    })
+    ir_closure_new(tid, node, rec.c_spelling, thunk, "", "", [])
 }
 
 // One capture word per captured name, in first-read order, built in the frame the literal
@@ -538,7 +569,7 @@ pub fn cg_eff_lower_handler_expr(node: Int) -> Int ! Diag.Report {
         eff_thunks.push(PendingThunk {
             closure: ops.get(i).unwrap(), symbol: symbols.get(i).unwrap(), fn_tid: -1,
             cap_names: [], cap_tids: [], cap_celled: [], handler_tid: tid, outer_name: outer,
-            task_symbol: "",
+            task_symbol: "", forward_to: -1, forward_symbol: "", forward_ev: false,
         })
         print_fn_decl(true, rets.get(i).unwrap(), symbols.get(i).unwrap(), params.get(i).unwrap(), false)
         i = i + 1
@@ -715,7 +746,7 @@ pub fn cg_eff_thunk_params(i: Int) -> List[Str] ! Diag.Report {
     if t < 0 { return out }
     let th = eff_thunks.get(t).unwrap()
     if th.handler_tid >= 0 { return handler_op_params(th.closure) }
-    let ps = node_params(th.closure)
+    let ps = node_params(thunk_sig_node(th))
     if ps == -1 { return out }
     let mut k = 0
     while k < sublist_length(ps) {
@@ -726,6 +757,44 @@ pub fn cg_eff_thunk_params(i: Int) -> List[Str] ! Diag.Report {
         k = k + 1
     }
     out
+}
+
+// The node whose parameters the thunk takes: the forwarded-to function's for a function
+// named as a value, else the literal's own.
+fn thunk_sig_node(th: PendingThunk) -> Int {
+    if th.forward_to >= 0 { th.forward_to } else { th.closure }
+}
+
+// The body of a thunk that forwards to a function, built here because no written body
+// exists to lower: one call passing each parameter through, returned unless the result is
+// void. None for a thunk with a written body, which the driver lowers itself.
+pub fn cg_eff_forwarding_body(i: Int) -> Option[Int] ! Diag.Report {
+    let t = thunk_at(i)
+    if t < 0 { return Some(-1) }
+    let th = eff_thunks.get(t).unwrap()
+    if th.forward_to < 0 { return None }
+    let span = th.closure
+    let mut args: List[Int] = []
+    let ps = node_params(th.forward_to)
+    let mut k = 0
+    while ps != -1 && k < sublist_length(ps) {
+        let p = sublist_get(ps, k)
+        let ptid = child_tid(th.fn_tid, Slot.Param(k))
+        if ptid < 0 { return Some(-1) }
+        let rec = layout_or_ice(ptid, Position.Local, span, "UnspellableThunkSlot", "forwarded parameter")
+        if rec.c_spelling == "" { return Some(-1) }
+        args.push(ir_var_ref(ptid, span, rec.c_spelling, c_local_name(node_name(p)), rec.slot_form))
+        k = k + 1
+    }
+    if th.forward_ev { args.push(cg_eff_ev_argument(span)) }
+    let ret_tid = cg_eff_thunk_ret_tid(i)
+    if ret_tid < 0 { return Some(-1) }
+    let ret = layout_or_ice(ret_tid, Position.Local, span, "UnspellableThunkSlot", "forwarded result")
+    if ret.c_spelling == "" { return Some(-1) }
+    let call = ir_call_direct(ret_tid, span, ret.c_spelling, th.forward_symbol, ret.slot_form, args)
+    let k_ret = tc_tid_kind(tc_resolve(ret_tid))
+    let stmt = if k_ret == TyKind.Void || k_ret == TyKind.Never { ir_expr_stmt(span, call) } else { ir_return(span, call) }
+    Some(ir_block(span, [stmt]))
 }
 
 // A layout decline is an ICE and an empty spelling, so a caller can stop on "".
@@ -763,7 +832,7 @@ pub fn cg_eff_print_thunk(i: Int, body: Int) ! Diag.Report {
     let ret = cg_eff_thunk_ret(i)
     if ret == "" { return }
     let params = cg_eff_thunk_params(i)
-    if params.len() != declared_param_count(th.closure) { return }
+    if params.len() != declared_param_count(thunk_sig_node(th)) { return }
     // A handler operation is reached through a vtable slot, which passes the operation's own
     // parameters and nothing else, so it takes no receiver word in front of them.
     if th.handler_tid >= 0 {
@@ -908,7 +977,7 @@ pub fn cg_eff_thunk_close() ! Diag.Report {
 // from, so a binder and its declaration cannot disagree. Answers false when a slot has no
 // type: a parameter left unbound would resolve to an outer name instead.
 fn bind_thunk_params(th: PendingThunk, scope: Int) -> Bool ! Diag.Report {
-    let ps = node_params(th.closure)
+    let ps = node_params(thunk_sig_node(th))
     if ps == -1 { return true }
     let mut k = 0
     while k < sublist_length(ps) {
