@@ -9,7 +9,8 @@
 // This is the same shape cc_equality_symbol already closes for `==`; a `.clone()` call
 // needs the matching fallback in the general method-dispatch path.
 
-import lower_test_helpers.{probe, rhs_of, assert_kind, assert_shape, assert_eq_str, assert_verifies, assert_ice}
+import lower_test_helpers.{probe, rhs_of, assert_kind, assert_shape, assert_eq_str, assert_verifies, assert_ice, shape, ice_count}
+import cg_expr.{cg_expr_pending_count, cg_expr_take_pending}
 import parser.{node_kind, node_name, nodes}
 import ast.{NodeKind, nk_of}
 import ir.{IrKind, ir_c_name}
@@ -75,4 +76,84 @@ test "a derived from_json static call reaches the symbol the derive emits" {
     assert_kind("kind", id, IrKind.CallDirect)
     assert_verifies("verify", id)
     assert_eq_str("symbol", ir_c_name(id), c_derive_method_name(type_decl_of("Point"), "from_json"))
+}
+
+fn src_generic_debug() -> Str {
+    #"@derive(Debug)
+type Box[T] { v: T }
+
+fn main() {
+    let b = Box { v: 3 }
+    let text = b.debug()
+    let _keep = [text]
+}
+"#
+}
+
+// A generic type's derive writes one body per instance, named from the instance's typedef,
+// so the call names that instance and never the declaration, which has no body.
+test "a derived method on a generic instance reaches the instance's own symbol" {
+    probe("cg_call_derived_generic_debug", src_generic_debug())
+    let id = lower_call(rhs_of("text"))
+    assert_kind("kind", id, IrKind.CallDirect)
+    assert_verifies("verify", id)
+    assert_eq_str("symbol", ir_c_name(id), "blink_Box_0Int_debug")
+}
+
+fn src_derived_cmp_hash() -> Str {
+    #"@derive(Ord, Hash)
+type Box[T] { v: T }
+
+fn main() {
+    let b = Box { v: 3 }
+    let c = Box { v: 4 }
+    let order = b.cmp(c)
+    let digest = b.hash()
+    let _keep = [order == Ordering.Less]
+    let _keep2 = [digest]
+}
+"#
+}
+
+// cmp and hash are derived methods a program may call by name as well as through an
+// operator or a key table, and a call reaches the same per-instance body.
+test "a derived cmp or hash call reaches the instance's own symbol" {
+    probe("cg_call_derived_cmp_hash", src_derived_cmp_hash())
+    let order = lower_call(rhs_of("order"))
+    assert_kind("kind", order, IrKind.CallDirect)
+    assert_verifies("verify", order)
+    assert_eq_str("symbol", ir_c_name(order), "blink_Box_0Int_cmp")
+    let digest = lower_call(rhs_of("digest"))
+    assert_kind("kind", digest, IrKind.CallDirect)
+    assert_verifies("verify", digest)
+    assert_eq_str("symbol", ir_c_name(digest), "blink_Box_0Int_hash")
+}
+
+fn src_str_backed_from_str() -> Str {
+    #"type Status {
+    Open = "open"
+    Done = "done"
+}
+
+fn main() {
+    let got = Status.from_str("open")
+    let _keep = [got.is_some()]
+}
+"#
+}
+
+// A str-backed enum's from_str has no body anywhere: its answer is one string test per
+// variant filling an Option that starts at None, so the call is a temp those tests fill.
+test "a str-backed enum's from_str tests each variant's assigned string" {
+    probe("cg_call_str_backed_from_str", src_str_backed_from_str())
+    let mark = cg_expr_pending_count()
+    let id = lower_call(rhs_of("got"))
+    assert_eq(ice_count(), 0)
+    assert_kind("kind", id, IrKind.VarRef)
+    let stmts = cg_expr_take_pending(mark)
+    let mut tests = 0
+    for st in stmts {
+        if shape(st).starts_with("If(CallRuntime(VarRef, Const)") { tests = tests + 1 }
+    }
+    assert_eq(tests, 2)
 }

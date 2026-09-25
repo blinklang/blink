@@ -4955,6 +4955,23 @@ fn register_derive_method_sig(tname: Str, method: Str, params: List[Int], ret: I
 //
 // `Ordering` comes from lib/std/traits.bl, so a program that never pulls it in has no tid for
 // it; `cmp` is then left unregistered.
+// A generic declaration's derived methods are declared over its own parameters, so the
+// self type they answer with is the declaration applied to its binders. A call reads that
+// at the receiver's instance, the same way a field of the declaration is read.
+fn derive_self_tid(td: Int, ttid: Int) -> Int {
+    let tps = node_type_params(td)
+    if tps == -1 || sublist_length(tps) == 0 { return ttid }
+    let mut args: List[Int] = []
+    let mut i = 0
+    while i < sublist_length(tps) {
+        let tp = sublist_get(tps, i)
+        args.push(make_typevar_bound(node_name(tp), tp))
+        i = i + 1
+    }
+    if type_kind(ttid) == TyKind.Enum { return make_enum_instance_type(tc_instance_base_name(ttid), args) }
+    make_struct_instance_type(tc_instance_base_name(ttid), args)
+}
+
 fn register_derive_method_sigs(program: Int) {
     let types_sl = node_fields(program)
     if types_sl == -1 { return }
@@ -4965,14 +4982,15 @@ fn register_derive_method_sigs(program: Int) {
         let tname = node_name(td)
         let ttid = lookup_named_type(tname)
         if ttid != -1 {
+            let self_t = derive_self_tid(td, ttid)
             if tc_decl_derives(td, "Serialize") != 0 {
                 register_derive_method_sig(tname, "to_json", [ttid], TYPE_STR)
             }
             if tc_decl_derives(td, "Deserialize") != 0 {
-                register_derive_method_sig(tname, "from_json", [TYPE_STR], make_result_type(ttid, TYPE_STR))
+                register_derive_method_sig(tname, "from_json", [TYPE_STR], make_result_type(self_t, TYPE_STR))
             }
             if tc_decl_derives(td, "Clone") != 0 {
-                register_derive_method_sig(tname, "clone", [ttid], ttid)
+                register_derive_method_sig(tname, "clone", [ttid], self_t)
             }
             if tc_decl_derives(td, "Debug") != 0 {
                 register_derive_method_sig(tname, "debug", [ttid], TYPE_STR)
@@ -4988,7 +5006,7 @@ fn register_derive_method_sigs(program: Int) {
             }
             if tc_is_str_backed_enum_decl(td) != 0 {
                 register_derive_method_sig(tname, "to_str", [ttid], TYPE_STR)
-                register_derive_method_sig(tname, "from_str", [TYPE_STR], make_option_type(ttid))
+                register_derive_method_sig(tname, "from_str", [TYPE_STR], make_option_type(self_t))
             }
         }
         i = i + 1
@@ -16965,7 +16983,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 if tc_decl_has_own_type_params(mfs.decl) != 0 {
                     return instantiate_return_type_off(sig, node_args(node), node, 1)
                 }
-                return fnsig_pool.get(sig).unwrap().ret
+                // A return declared over the receiver type's own binders, as a derived clone
+                // is, stands for the receiver's instance. A no-op for a monomorphic receiver.
+                return tc_member_tid_at_instance(mfs.ret, obj_t)
             }
             // Instant's two CODEGEN-ONLY methods. Four of its six are declared in
             // lib/std/time.bl:16-19 and so resolve through the fnsig lookup just above;

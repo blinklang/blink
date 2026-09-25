@@ -1,0 +1,163 @@
+// The C a @derive on a generic type gets. A generic declaration is a template with no C
+// shape, so each instance the monomorphization pass registered gets its own body, named
+// from that instance's typedef. A call site names the same symbol from the type it holds.
+
+import std.io
+import layout.{layout_reset}
+import mono.{run_mono}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build, cg_reg_type_decls}
+import cg_derive.{cg_derive_reset, cg_derive_emit_decls, cg_derive_emit_bodies}
+import cname.{c_derived_method_symbol}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_saying, cg_probe_ices_named, cg_text_occurrences}
+import diagnostics.{CODEGEN_STAGE_NOT_BUILT_NAME}
+import typecheck.{TYPE_INT, lookup_named_type, make_struct_instance_type}
+
+// Box is reached at two instances, Pair at none, and Holder is a monomorphic type that
+// holds one instance of Box as a field.
+fn generic_src() -> Str {
+    #"import std.json
+@derive(Debug, Hash, Eq, Ord, Clone, Serialize)
+type Box[T] { v: T }
+@derive(Debug)
+type Pair[A, B] { a: A, b: B }
+@derive(Debug, Hash, Eq, Ord, Clone, Serialize)
+type Holder { b: Box[Int], n: Int }
+fn main() {
+    let x = Box { v: 1 }
+    let y = Box { v: "s" }
+    let h = Holder { b: x, n: 2 }
+    let _keep = [y.v, h.b.v.to_str()]
+}
+"#
+}
+
+// The instance table is the monomorphization pass's answer, so every probe here runs it.
+// Compiling resets the diagnostic counters, so counts are read after this returns.
+fn program_of(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let program = cg_probe_compile("build/{stem}_probe_src.bl", src)
+    run_mono(program)
+    layout_reset()
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_derive_reset()
+    program
+}
+
+fn bodies_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _p = program_of(stem, src)
+    cg_derive_emit_bodies(cg_reg_type_decls())
+    print_take()
+}
+
+fn decls_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _p = program_of(stem, src)
+    cg_derive_emit_decls(cg_reg_type_decls())
+    print_take()
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output still has '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+// The C of one function, from its opening line to the brace that closes it in column
+// zero. A needle checked against the whole unit would match another function's body.
+fn one_fn(text: Str, head: Str) -> Str {
+    let start = text.index_of(head)
+    if start < 0 { io.println("FAIL: output has no '{head}'\n--- output ---\n{text}") }
+    assert(start >= 0)
+    let rest = text.substring(start, text.len() - start)
+    let end = rest.index_of("\n}")
+    assert(end >= 0)
+    rest.substring(0, end)
+}
+
+test "each instance of a generic type gets its own body over its own typedef" {
+    let text = bodies_of("cg_derive_generic", generic_src())
+    assert_has(text, "const char* blink_Box_0Int_debug(blink_Box_0Int self) \{")
+    assert_has(text, "const char* blink_Box_0Str_debug(blink_Box_0Str self) \{")
+    assert_lacks(text, "blink_Box_debug(")
+}
+
+// A field declared over a type parameter is read at the instance's argument, so the Int
+// instance formats a number and the Str instance quotes a string.
+test "a field declared over a type parameter is rendered at the instance's argument" {
+    let text = bodies_of("cg_derive_generic", generic_src())
+    let ints = one_fn(text, "const char* blink_Box_0Int_debug")
+    assert_has(ints, "%lld")
+    let strs = one_fn(text, "const char* blink_Box_0Str_debug")
+    assert_has(strs, "str_debug(")
+}
+
+test "every derive a generic type names is written once per instance" {
+    let text = bodies_of("cg_derive_generic", generic_src())
+    for method in ["debug", "hash", "eq", "cmp", "clone", "to_json"] {
+        assert_eq(cg_text_occurrences(text, " blink_Box_0Int_{method}(blink_Box_0Int self"), 1)
+        assert_eq(cg_text_occurrences(text, " blink_Box_0Str_{method}(blink_Box_0Str self"), 1)
+    }
+}
+
+// A generic type no code reaches has no instance, so there is nothing to write and nothing
+// to refuse.
+test "a generic type with no instance gets no body and no refusal" {
+    let text = bodies_of("cg_derive_generic_none", generic_src())
+    assert_lacks(text, "blink_Pair")
+    assert_eq(cg_probe_ices_named(CODEGEN_STAGE_NOT_BUILT_NAME), 0)
+}
+
+test "a field holding a generic instance calls that instance's own method" {
+    let text = bodies_of("cg_derive_generic_field", generic_src())
+    assert_has(one_fn(text, "const char* blink_Holder_debug"), "blink_Box_0Int_debug(self.b)")
+    assert_has(one_fn(text, " blink_Holder_eq("), "blink_Box_0Int_eq(self.b, other.b)")
+    assert_has(one_fn(text, " blink_Holder_hash("), "blink_Box_0Int_hash(self.b)")
+    assert_has(one_fn(text, "const char* blink_Holder_to_json"), "blink_Box_0Int_to_json(self.b)")
+}
+
+// A hashed instance is a legal Map or Set key, and the table the map binds is named from
+// the instance's typedef, so each instance defines its own.
+test "each hashed instance defines its own key table" {
+    let text = bodies_of("cg_derive_generic_kops", generic_src())
+    assert_has(text, "kops_blink_Box_0Int")
+    assert_has(text, "kops_blink_Box_0Str")
+}
+
+test "the declaration pass writes each instance's signatures and no body" {
+    let text = decls_of("cg_derive_generic_decls", generic_src())
+    assert_has(text, "const char* blink_Box_0Int_debug(blink_Box_0Int self);")
+    assert_has(text, "const char* blink_Box_0Str_to_json(blink_Box_0Str self);")
+    assert_lacks(text, "blink_str_format")
+}
+
+// from_json is called on the type and not on a value, so the instance it reads is not
+// named by any receiver. The refusal is recorded once for the declaration.
+test "a generic Deserialize type is still refused once for its declaration" {
+    let src = #"import std.json
+@derive(Deserialize)
+type Box[T] { v: T }
+fn main() {
+    let _b = Box { v: 1 }
+}
+"#
+    let _t = bodies_of("cg_derive_generic_de", src)
+    assert_eq(cg_probe_ices_saying(CODEGEN_STAGE_NOT_BUILT_NAME, "@derive(Deserialize) on the generic type 'Box'"), 1)
+}
+
+// The symbol a derive writes and the symbol a call names come from one producer, so a
+// monomorphic type keeps its declaration's name and an instance takes its typedef's.
+test "the derived method symbol is spelled from the instance for a generic type" {
+    let _p = program_of("cg_derive_generic_symbol", generic_src())
+    let boxed = make_struct_instance_type("Box", [TYPE_INT])
+    assert_eq(c_derived_method_symbol(boxed, "debug"), "blink_Box_0Int_debug")
+    assert_eq(c_derived_method_symbol(lookup_named_type("Holder"), "debug"), "blink_Holder_debug")
+}

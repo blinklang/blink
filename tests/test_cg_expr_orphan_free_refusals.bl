@@ -10,13 +10,13 @@
 // Each test pins a count as well as the refusal, because a refusal that reports correctly
 // and still leaves something behind is identical from the answer alone.
 
-import lower_test_helpers.{probe, probe_but, rhs_of, assert_ice_saying, assert_eq_str}
-import ir.{ir_node_count}
+import lower_test_helpers.{probe, probe_but, rhs_of, assert_ice_saying, assert_eq_str, assert_kind, ice_count}
+import ir.{IrKind, ir_node_count}
 import cg_expr.{lower_expr, cg_expr_pending_count}
 
-// An ordering operator over a struct. `@derive(Ord)` is what makes this a program:
-// typecheck accepts `<` on the pair, and the operator seam then has no ordering lowering
-// to give. Both operands are in reach at that point, which is what makes the count a test.
+// An ordering operator over a struct. `@derive(Ord)` is what makes this a program, and
+// the operator seam lowers it to the derived cmp. Kept beside the refusals because the
+// equality refusal below is the one operator refusal typecheck still lets reach this seam.
 fn src_ordering() -> Str {
     #"@derive(Ord)
 type Point { x: Int, y: Int }
@@ -94,12 +94,11 @@ fn main() {
 "#
 }
 
-test "a refused ordering operator leaves neither of its operands in the unit" {
+test "an ordering over a derived Ord struct lowers to its cmp" {
     probe("cg_expr_orphan_ordering", src_ordering())
-    let before = ir_node_count()
-    assert_ice_saying("ordering", lower_expr(rhs_of("ranked")),
-        "OrderingMethodNotLowered", "has no ordering method lowering here")
-    assert_eq_str("nodes built", "{ir_node_count() - before}", "0")
+    let id = lower_expr(rhs_of("ranked"))
+    assert_eq(ice_count(), 0)
+    assert_kind("ordering", id, IrKind.Binary)
 }
 
 // Typecheck rejects a comparison over a type that carries no equality, so no accepted
@@ -130,17 +129,16 @@ test "a refused interpolation leaves no statement its earlier holes hoisted" {
 
 // A short-circuit whose left operand hoists and whose right operand then refuses. The coalesce
 // on the left lowers cleanly and leaves a carrier temp, a result temp and an `if` behind. The
-// comparison on the right refuses, so the whole operator answers nothing and all three have to
+// equality on the right refuses, so the whole operator answers nothing and all three have to
 // come back out.
 fn src_short_circuit_hoist_then_refusal() -> Str {
-    #"@derive(Ord)
-type Point { x: Int, y: Int }
+    #"type Point { x: Int, y: Int }
 
 fn main() {
     let opt: Option[Bool] = None
     let p = Point { x: 1, y: 2 }
     let q = Point { x: 1, y: 3 }
-    let joined = (opt ?? true) && (p < q)
+    let joined = (opt ?? true) && (p == q)
     let _keep = [joined]
 }
 "#
@@ -150,33 +148,32 @@ fn main() {
 // before it lowers that fallback, so four statements stand in the buffer when the innermost
 // comparison refuses. The refusal has to travel out through both frames.
 fn src_coalesce_hoist_then_refusal() -> Str {
-    #"@derive(Ord)
-type Point { x: Int, y: Int }
+    #"type Point { x: Int, y: Int }
 
 fn main() {
     let maybe: Option[Bool] = None
     let opt: Option[Bool] = None
     let p = Point { x: 1, y: 2 }
     let q = Point { x: 1, y: 3 }
-    let chosen = maybe ?? (opt ?? (p < q))
+    let chosen = maybe ?? (opt ?? (p == q))
     let _keep = [chosen]
 }
 "#
 }
 
 test "a refused short-circuit operand leaves no statement the other operand hoisted" {
-    probe("cg_expr_orphan_short_circuit", src_short_circuit_hoist_then_refusal())
+    probe_but("cg_expr_orphan_short_circuit", src_short_circuit_hoist_then_refusal(), "TypeError")
     let before = cg_expr_pending_count()
-    assert_ice_saying("ordering", lower_expr(rhs_of("joined")),
-        "OrderingMethodNotLowered", "has no ordering method lowering here")
+    assert_ice_saying("equality", lower_expr(rhs_of("joined")),
+        "EqualityMethodNotFound", "'Point' has neither")
     assert_eq_str("statements hoisted", "{cg_expr_pending_count() - before}", "0")
 }
 
 test "a refused coalesce fallback leaves no statement it hoisted" {
-    probe("cg_expr_orphan_coalesce", src_coalesce_hoist_then_refusal())
+    probe_but("cg_expr_orphan_coalesce", src_coalesce_hoist_then_refusal(), "TypeError")
     let before = cg_expr_pending_count()
-    assert_ice_saying("ordering", lower_expr(rhs_of("chosen")),
-        "OrderingMethodNotLowered", "has no ordering method lowering here")
+    assert_ice_saying("equality", lower_expr(rhs_of("chosen")),
+        "EqualityMethodNotFound", "'Point' has neither")
     assert_eq_str("statements hoisted", "{cg_expr_pending_count() - before}", "0")
 }
 
@@ -185,23 +182,22 @@ test "a refused coalesce fallback leaves no statement it hoisted" {
 // seam takes them back, which is why the rule belongs at the expression seam all of them
 // reach rather than in each seam that hoists.
 fn src_tuple_element_hoist_then_refusal() -> Str {
-    #"@derive(Ord)
-type Point { x: Int, y: Int }
+    #"type Point { x: Int, y: Int }
 
 fn main() {
     let opt: Option[Bool] = None
     let p = Point { x: 1, y: 2 }
     let q = Point { x: 1, y: 3 }
-    let pair = (opt ?? true, p < q)
+    let pair = (opt ?? true, p == q)
     let _keep = [pair]
 }
 "#
 }
 
 test "a refused tuple element leaves no statement an earlier element hoisted" {
-    probe("cg_expr_orphan_tuple", src_tuple_element_hoist_then_refusal())
+    probe_but("cg_expr_orphan_tuple", src_tuple_element_hoist_then_refusal(), "TypeError")
     let before = cg_expr_pending_count()
-    assert_ice_saying("ordering", lower_expr(rhs_of("pair")),
-        "OrderingMethodNotLowered", "has no ordering method lowering here")
+    assert_ice_saying("equality", lower_expr(rhs_of("pair")),
+        "EqualityMethodNotFound", "'Point' has neither")
     assert_eq_str("statements hoisted", "{cg_expr_pending_count() - before}", "0")
 }
