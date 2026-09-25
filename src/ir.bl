@@ -38,7 +38,7 @@ pub type IrKind {
     Box, Unbox, SizedAlloc, HeapAlloc, CarrierWrap, CarrierUnwrap, CarrierTag, CellRef,
     CallDirect, CallIndirect, CallClosure, CallVirtual, CallRuntime,
     ClosureNew, EvidenceVector, EvidenceAddress, EffectPerform, HandlerInstall,
-    Let, CellLet, Assign, ExprStmt, Return, If, Loop, Break, Continue, Block, Switch, WithScope,
+    Let, CellLet, VolatileLet, Assign, ExprStmt, Return, If, Loop, Break, Continue, Block, Switch, WithScope,
     Panic, Unreachable, PanicCatch, PanicCatchExit,
 }
 
@@ -187,7 +187,7 @@ pub fn ir_all_kinds() -> List[IrKind] {
         IrKind.CallDirect, IrKind.CallIndirect, IrKind.CallClosure, IrKind.CallVirtual, IrKind.CallRuntime,
         IrKind.ClosureNew, IrKind.EvidenceVector, IrKind.EvidenceAddress, IrKind.EffectPerform,
         IrKind.HandlerInstall,
-        IrKind.Let, IrKind.CellLet, IrKind.Assign, IrKind.ExprStmt, IrKind.Return, IrKind.If, IrKind.Loop,
+        IrKind.Let, IrKind.CellLet, IrKind.VolatileLet, IrKind.Assign, IrKind.ExprStmt, IrKind.Return, IrKind.If, IrKind.Loop,
         IrKind.Break, IrKind.Continue, IrKind.Block, IrKind.Switch, IrKind.WithScope,
         IrKind.Panic, IrKind.Unreachable, IrKind.PanicCatch, IrKind.PanicCatchExit,
     ]
@@ -229,6 +229,7 @@ pub fn ir_kind_name(kind: IrKind) -> Str {
         IrKind.HandlerInstall => "HandlerInstall"
         IrKind.Let => "Let"
         IrKind.CellLet => "CellLet"
+        IrKind.VolatileLet => "VolatileLet"
         IrKind.Assign => "Assign"
         IrKind.ExprStmt => "ExprStmt"
         IrKind.Return => "Return"
@@ -260,6 +261,7 @@ pub fn ir_kind_is_value(kind: IrKind) -> Bool {
         IrKind.HandlerInstall => false
         IrKind.Let => false
         IrKind.CellLet => false
+        IrKind.VolatileLet => false
         IrKind.Assign => false
         IrKind.ExprStmt => false
         IrKind.Return => false
@@ -308,6 +310,7 @@ fn kind_needs_c_name(kind: IrKind) -> Bool {
         IrKind.EffectPerform => true
         IrKind.HandlerInstall => true
         IrKind.Let => true
+        IrKind.VolatileLet => true
         IrKind.PanicCatch => true
         IrKind.PanicCatchExit => true
         _ => false
@@ -376,6 +379,7 @@ fn kind_max_kids(kind: IrKind) -> Int {
         IrKind.EvidenceAddress => 1
         IrKind.HandlerInstall => 2
         IrKind.Let => 1
+        IrKind.VolatileLet => 1
         IrKind.Assign => 2
         IrKind.ExprStmt => 1
         IrKind.Return => 1
@@ -612,6 +616,14 @@ pub fn ir_let(tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: Slot
     ir_new(IrKind.Let, tid, span, c_spelling, c_name, slot_form, kids)
 }
 
+// A binding declared outside a PanicCatch and assigned inside its body. The catch comes back
+// through longjmp, which leaves a changed local that is not volatile indeterminate (C11
+// 7.13.2.1p3), so the printer qualifies the declared object itself.
+pub fn ir_volatile_let(tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm, init: Int) -> Int {
+    let kids: List[Int] = if init < 0 { [] } else { [init] }
+    ir_new(IrKind.VolatileLet, tid, span, c_spelling, c_name, slot_form, kids)
+}
+
 // A binding whose storage is a heap cell: the declaration allocates the cell and writes
 // the initialiser into it, so the value is in the cell from the first statement that can
 // read it. The node carries the pointer's spelling and the cell's name, which is all the
@@ -738,8 +750,73 @@ fn verify_root(root: Int, declared: List[Str], scoped: Bool) -> List[Str] {
     verify_node(root, seen, on_stack, first_block, blocks, errs, scope, declared, scoped)
     // Both forms run it, as the driver verifies whole units through ir_verify. The walk
     // needs a tree without cycles, which the pass above proved.
-    if errs.len() == 0 { verify_frame_exits(root, "", 0, errs) }
+    if errs.len() == 0 {
+        verify_frame_exits(root, "", 0, errs)
+        let mut decls: List[FrameDecl] = []
+        verify_frame_writes(root, decls, 0, errs)
+    }
     errs
+}
+
+// A local in scope during verify_frame_writes: its C name, its kind, and how many PanicCatch
+// bodies enclosed its declaration.
+type FrameDecl {
+    name: Str
+    kind: IrKind
+    depth: Int
+}
+
+// A plain Let declared outside a PanicCatch and assigned inside its body reads back its value
+// from before the setjmp once the catch returns, so such a binding must be a VolatileLet. The
+// address of a VolatileLet is a pointer to volatile, which no callee parameter is spelled to take.
+fn verify_frame_writes(id: Int, decls: List[FrameDecl], depth: Int, errs: List[Str]) {
+    let kind = ir_kind(id)
+    let kids = ir_kids(id)
+    let mark = decls.len()
+    let mut i = 0
+    while i < kids.len() {
+        let is_body = kind == IrKind.PanicCatch && i == kids.len() - 1
+        verify_frame_writes(kids.get(i).unwrap(), decls, if is_body { depth + 1 } else { depth }, errs)
+        i += 1
+    }
+    if kind == IrKind.Block { drop_decls_to(decls, mark) }
+    if declares_a_name(kind) { decls.push(FrameDecl { name: ir_c_name(id), kind: kind, depth: depth }) }
+    if kind == IrKind.Assign {
+        let d = innermost_decl(decls, lvalue_root_name(ir_kid(id, 0)))
+        if d.kind == IrKind.Let && d.depth < depth {
+            errs.push("node {id} (Assign): writes '{d.name}' inside a PanicCatch body, but its Let is outside the frame and not a VolatileLet")
+        }
+    }
+    if kind == IrKind.Unary && ir_c_name(id) == "&" {
+        let d = innermost_decl(decls, lvalue_root_name(ir_kid(id, 0)))
+        if d.kind == IrKind.VolatileLet {
+            errs.push("node {id} (Unary): takes the address of VolatileLet '{d.name}', which drops the qualifier")
+        }
+    }
+}
+
+// The local an lvalue writes into: the VarRef under any field accesses. Anything else, such as
+// a cell, a global or an unboxed pointer, is not a local the setjmp rule reaches.
+fn lvalue_root_name(id: Int) -> Str {
+    let kind = ir_kind(id)
+    if kind == IrKind.FieldGet { return lvalue_root_name(ir_kid(id, 0)) }
+    if kind == IrKind.VarRef { ir_c_name(id) } else { "" }
+}
+
+fn innermost_decl(decls: List[FrameDecl], name: Str) -> FrameDecl {
+    let mut i = decls.len() - 1
+    while i >= 0 {
+        let d = decls.get(i).unwrap()
+        if name != "" && d.name == name { return d }
+        i -= 1
+    }
+    FrameDecl { name: name, kind: IrKind.Block, depth: 0 }
+}
+
+fn drop_decls_to(decls: List[FrameDecl], mark: Int) {
+    while decls.len() > mark {
+        let _ = decls.pop()
+    }
 }
 
 // setjmp catches only while its frame is live, so the body of a PanicCatch may leave it
@@ -812,8 +889,12 @@ fn verify_node(id: Int, seen: List[Int], on_stack: List[Int], first_block: List[
     if kind == IrKind.Block { drop_to(scope, block_mark) }
     // A Let declares its name only after its own initialiser is verified, so `let b = b`
     // reads a name that is not in scope yet, exactly as the C it prints would.
-    if scoped && (kind == IrKind.Let || kind == IrKind.CellLet) { scope.push(ir_c_name(id)) }
+    if scoped && declares_a_name(kind) { scope.push(ir_c_name(id)) }
     on_stack.set(id, 0)
+}
+
+fn declares_a_name(kind: IrKind) -> Bool {
+    kind == IrKind.Let || kind == IrKind.CellLet || kind == IrKind.VolatileLet
 }
 
 // The kinds whose c_name is a local the frame must have declared. A CellRef is one: it
@@ -845,7 +926,7 @@ fn verify_fields(id: Int, kind: IrKind, label: Str, errs: List[Str]) {
     } else if ir_kind_is_value(kind) && ir_tid(id) < 0 {
         errs.push("{label}: value node without a tid")
     }
-    if (ir_kind_is_value(kind) || kind == IrKind.Let || kind == IrKind.CellLet) && ir_c_spelling(id) == "" {
+    if (ir_kind_is_value(kind) || declares_a_name(kind)) && ir_c_spelling(id) == "" {
         errs.push("{label}: empty c_spelling")
     }
     let wrap_with_payload = kind == IrKind.CarrierWrap && ir_kid_count(id) == 2

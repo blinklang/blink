@@ -12,7 +12,7 @@ import ast.{NodeKind, nk_of}
 import parser.{
     is_literal_string_part, node_args, node_body, node_elements, node_for_binder, node_guard, node_handlers,
     node_is_mut, node_iterable, node_kind, node_method, node_methods, node_name, node_obj, node_params, node_pattern,
-    node_recv_type_args, node_stmts, node_trait_name, node_type_ann, node_value, node_value_child_ids, sublist_get,
+    node_recv_type_args, node_stmts, node_target, node_trait_name, node_type_ann, node_value, node_value_child_ids, sublist_get,
     sublist_length,
 }
 import typecheck.{
@@ -294,6 +294,7 @@ let mut eff_op_field: Str = ""
 pub fn cg_eff_reset() {
     eff_thunks = []
     eff_shared_names = []
+    eff_frame_written = []
     eff_thunk_scope = -1
     eff_op_outer_name = ""
     eff_op_field = ""
@@ -969,6 +970,7 @@ pub fn cg_eff_thunk_close() ! Diag.Report {
     binder_scope_pop()
     eff_thunk_scope = -1
     eff_shared_names = []
+    eff_frame_written = []
     eff_op_outer_name = ""
     eff_op_field = ""
 }
@@ -1175,15 +1177,21 @@ let mut eff_shared_names: List[Str] = []
 // Records which of one body's `let mut` bindings its closures share, before the body's
 // first statement lowers. The cell is the binding's storage from its declaration on, and a
 // declaration lowers before the closure below it does, so the declaration cannot ask a
-// closure it has not reached yet.
+// closure it has not reached yet. The bindings an assert_panics body writes across its
+// frame are settled here for the same reason.
 //
 // `fn_like` is the FnDef or Closure whose frame is about to lower, and the answer covers
 // that frame alone. A binding declared inside a nested closure belongs to the nested frame,
 // which is scanned again when its thunk opens.
 pub fn cg_eff_scan_shared_binders(fn_like: Int) {
     eff_shared_names = []
+    eff_frame_written = []
     let body = node_body(fn_like)
     if body < 0 { return }
+    let mut env: List[FrameBinder] = []
+    let mut written: List[Int] = []
+    scan_frame_writes(body, env, 0, written)
+    eff_frame_written = written
     let mut read: List[Str] = []
     collect_captured_names(body, read)
     if read.len() == 0 { return }
@@ -1196,6 +1204,102 @@ pub fn cg_eff_scan_shared_binders(fn_like: Int) {
 // so is declared as a cell rather than as a local.
 pub fn cg_eff_binder_is_shared(name: Str) -> Bool {
     eff_shared_names.contains(name)
+}
+
+// ── Locals written across a panic frame ───────────────────────────────────────────
+
+// The `let` nodes of the frame now lowering, and the leaves of its destructuring patterns,
+// that an assert_panics body nested inside their scope assigns.
+let mut eff_frame_written: List[Int] = []
+
+// A `let` binder in lexical scope during scan_frame_writes, with the count of assert_panics
+// bodies around its declaration.
+type FrameBinder {
+    name: Str
+    decl: Int
+    depth: Int
+}
+
+// Whether this `let`, or this leaf of a destructuring `let`, is assigned inside an
+// assert_panics body its declaration stands outside. The catch comes back through longjmp,
+// and a changed local that is not volatile is indeterminate after it (C11 7.13.2.1p3).
+pub fn cg_eff_frame_written(decl: Int) -> Bool {
+    eff_frame_written.contains(decl)
+}
+
+// Resolves each assignment to the innermost binder of its name, so a shadowing `let` in a
+// nested block takes the write and the outer binder keeps its plain local. A closure or a
+// nested `fn` is a frame of its own, scanned when its own body lowers.
+fn scan_frame_writes(node: Int, env: List[FrameBinder], depth: Int, out: List[Int]) {
+    if node < 0 { return }
+    let k = nk_of(node_kind(node))
+    if k == NodeKind.Closure || k == NodeKind.FnDef { return }
+    if k == NodeKind.AssertPanics {
+        scan_frame_writes(node_value(node), env, depth, out)
+        scan_frame_writes(node_body(node), env, depth + 1, out)
+        return
+    }
+    // The initializer reads the outer binding of the name, so it is walked first.
+    if k == NodeKind.LetBinding {
+        scan_frame_writes(node_value(node), env, depth, out)
+        enter_let_binders(node, env, depth)
+        return
+    }
+    if k == NodeKind.Assignment || k == NodeKind.CompoundAssign {
+        let b = innermost_frame_binder(env, assigned_root_name(node_target(node)))
+        if b.decl >= 0 && b.depth < depth && !out.contains(b.decl) { out.push(b.decl) }
+    }
+    let mark = env.len()
+    for kid in node_value_child_ids(node) { scan_frame_writes(kid, env, depth, out) }
+    if k == NodeKind.Block {
+        while env.len() > mark {
+            let _ = env.pop()
+        }
+    }
+}
+
+// The decl node is the one the let lowering declares from: the LetBinding for a single
+// name, the leaf itself for a destructuring pattern.
+fn enter_let_binders(node: Int, env: List[FrameBinder], depth: Int) {
+    let pat = node_elements(node)
+    if pat == -1 {
+        env.push(FrameBinder { name: node_name(node), decl: node, depth: depth })
+        return
+    }
+    enter_pattern_leaves(pat, env, depth)
+}
+
+fn enter_pattern_leaves(pat: Int, env: List[FrameBinder], depth: Int) {
+    let kind = nk_of(node_kind(pat))
+    if kind == NodeKind.WildcardPattern { return }
+    if kind == NodeKind.TuplePattern {
+        let elems = node_elements(pat)
+        if elems == -1 { return }
+        let mut i = 0
+        while i < sublist_length(elems) {
+            enter_pattern_leaves(sublist_get(elems, i), env, depth)
+            i += 1
+        }
+        return
+    }
+    env.push(FrameBinder { name: node_name(pat), decl: pat, depth: depth })
+}
+
+// A write to a field lands in the local the field access starts from.
+fn assigned_root_name(target: Int) -> Str {
+    let k = nk_of(node_kind(target))
+    if k == NodeKind.FieldAccess { return assigned_root_name(node_obj(target)) }
+    if k == NodeKind.Ident { node_name(target) } else { "" }
+}
+
+fn innermost_frame_binder(env: List[FrameBinder], name: Str) -> FrameBinder {
+    let mut i = env.len() - 1
+    while i >= 0 {
+        let b = env.get(i).unwrap()
+        if name != "" && b.name == name { return b }
+        i -= 1
+    }
+    FrameBinder { name: name, decl: -1, depth: 0 }
 }
 
 // Every name read by a closure written anywhere in this body. A nested literal's own free

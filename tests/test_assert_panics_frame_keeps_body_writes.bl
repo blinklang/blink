@@ -1,0 +1,147 @@
+// A local declared before an assert_panics frame and changed inside its body keeps the
+// new value after the catch (spec §2.20). The catch is a longjmp back to a setjmp, and
+// C11 7.13.2.1p3 leaves a changed non-volatile automatic object indeterminate there, so
+// each child is built at -O2, where the old value comes back out of a register.
+
+import compile_test_helpers.{compile_and_run_test_json_opt, compile_and_emit_c}
+
+fn prelude() -> Str {
+    #"fn boom() -> Int {
+    let r: Result[Int, Str] = Err("b")
+    r.unwrap()
+}
+
+type P {
+    n: Int
+}
+
+"#
+}
+
+fn passes_at_o2(body: Str, tag: Str) {
+    let r = compile_and_run_test_json_opt(prelude().concat(body), tag, "-O2")
+    assert(r.out.contains("\"status\":\"passed\""))
+    assert(!r.out.contains("\"status\":\"failed\""))
+}
+
+test "an assignment in the body is seen after the catch" {
+    passes_at_o2(#"test "t" {
+    let mut x = 0
+    assert_panics {
+        x = 1
+        let _ = boom()
+    }
+    assert_eq(x, 1)
+}
+"#, "_ap_keep_assign")
+}
+
+test "a compound assignment in the body is seen after the catch" {
+    passes_at_o2(#"test "t" {
+    let mut x = 10
+    assert_panics {
+        x += 5
+        let _ = boom()
+    }
+    assert_eq(x, 15)
+}
+"#, "_ap_keep_compound")
+}
+
+test "a field write to a local struct in the body is seen after the catch" {
+    passes_at_o2(#"test "t" {
+    let mut p = P { n: 0 }
+    assert_panics {
+        p.n = 7
+        let _ = boom()
+    }
+    assert_eq(p.n, 7)
+}
+"#, "_ap_keep_field")
+}
+
+test "a pointer-typed local reassigned in the body keeps the new pointer after the catch" {
+    passes_at_o2(#"test "t" {
+    let mut xs: List[Int] = [1]
+    assert_panics {
+        xs = [1, 2, 3]
+        let _ = boom()
+    }
+    assert_eq(xs.len(), 3)
+}
+"#, "_ap_keep_pointer")
+    // The qualifier has to bind to the pointer, not to the list it points at.
+    let c = compile_and_emit_c(prelude().concat(#"test "t" {
+    let mut xs: List[Int] = [1]
+    assert_panics {
+        xs = [1, 2, 3]
+        let _ = boom()
+    }
+    assert_eq(xs.len(), 3)
+}
+"#), "_ap_keep_pointer_c")
+    assert(c.contains("blink_list* volatile xs"))
+}
+
+test "a leaf of a mutable destructure written in the body is seen after the catch" {
+    passes_at_o2(#"test "t" {
+    let mut (a, b) = (0, 0)
+    assert_panics {
+        a = 3
+        b = 4
+        let _ = boom()
+    }
+    assert_eq(a + b, 7)
+}
+"#, "_ap_keep_destructure")
+}
+
+test "a frame in a closure body keeps the closure's own local" {
+    passes_at_o2(#"test "t" {
+    let check = fn() {
+        let mut y = 0
+        assert_panics {
+            y = 2
+            let _ = boom()
+        }
+        assert_eq(y, 2)
+    }
+    check()
+}
+"#, "_ap_keep_closure")
+}
+
+test "a local declared in a loop body before the frame keeps each pass's write" {
+    passes_at_o2(#"test "t" {
+    let mut total = 0
+    for i in 0..3 {
+        let mut seen = 0
+        assert_panics {
+            seen = i + 1
+            let _ = boom()
+        }
+        total += seen
+    }
+    assert_eq(total, 6)
+}
+"#, "_ap_keep_loop")
+}
+
+test "only a local declared outside the frame and written inside it is volatile" {
+    let c = compile_and_emit_c(prelude().concat(#"test "t" {
+    let mut outside_only = 0
+    outside_only = 2
+    let mut written = 0
+    assert_panics {
+        let mut inner = 0
+        inner = 1
+        written = inner
+        let _ = boom()
+    }
+    assert_eq(written + outside_only, 3)
+}
+"#), "_ap_keep_narrow")
+    assert(c.contains("int64_t volatile written"))
+    assert(!c.contains("volatile outside_only"))
+    assert(!c.contains("volatile inner"))
+}
