@@ -1,0 +1,73 @@
+// A struct literal that spreads another value binds that source to a temp before it
+// writes a single field, then fills each declared field from the literal's own value or
+// from the temp. So an `if` among the written fields runs after the source and before the
+// fields the declaration puts behind it, and the statement stage can hoist it there.
+
+import std.io
+import diagnostics.{diag_reset}
+import mono.{run_mono}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import layout.{layout_reset}
+import ir.{ir_reset}
+import cg_test_helpers.{cg_probe_compile}
+import cg_stmt.{cg_stmt_reset, lower_fn}
+import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_expr.{cg_expr_reset}
+import lower_test_helpers.{assert_eq_str, ice_count, shape}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn probe_fn(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/{stem}_probe.bl"
+    let program = cg_probe_compile(path, src)
+    let _rm = process_run("rm", ["-f", path])
+    run_mono(program)
+    layout_reset()
+    ir_reset()
+    cg_expr_reset()
+    cg_stmt_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    diag_reset()
+    let f = find_fn(name)
+    assert(f >= 0)
+    lower_fn(f)
+}
+
+test "an if in a written field of a spread literal is materialised" {
+    let body = probe_fn("cg_stmt_if_in_spread", #"type Cfg { a: Int = 7, b: Int = 8 }
+fn main() {
+    let m = 1
+    let base = Cfg { a: 1, b: 2 }
+    let made = Cfg { a: if m > 0 { 1 } else { 0 }, ..base }
+    let _keep = [made]
+}
+"#, "main")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let(StructNew(Const, Const)), Let(VarRef), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(VarRef), Let(StructNew(VarRef, FieldGet(VarRef))), Let(ContainerNew(Box(VarRef))))")
+}
+
+// The source is read before the `if` runs, so it is hoisted ahead of the arms: an arm
+// that writes the source's binding cannot change the value the literal copies from.
+test "a spread source that reads a cell is hoisted ahead of the if" {
+    let body = probe_fn("cg_stmt_if_in_spread_src", #"type Cfg { a: Int = 7, b: Int = 8 }
+fn main() {
+    let mut base = Cfg { a: 1, b: 2 }
+    let made = Cfg { a: if base.b > 0 { base = Cfg { a: 3, b: 4 }
+        1 } else { 0 }, ..base }
+    let _keep = [made]
+}
+"#, "main")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(StructNew(Const, Const)), Let(VarRef), Let, If(Binary(FieldGet(VarRef), Const), Block(Assign(VarRef, StructNew(Const, Const)), Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(VarRef), Let(StructNew(VarRef, FieldGet(VarRef))), Let(ContainerNew(Box(VarRef))))")
+}
