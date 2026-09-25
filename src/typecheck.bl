@@ -12151,6 +12151,26 @@ fn tc_hint_enum_slot(enum_tid: Int, tparams_sl: Int, ti: Int) -> Int {
     tc_tid_struct_arg_tid(tc_construct_hint, ti)
 }
 
+// A payload-less variant of a generic enum has no argument to infer its binders from, so
+// each comes from the expected type or is a fresh metavariable a later use pins, as `None`
+// does. Left bare, the head names no instance and has no C layout.
+fn tc_nullary_variant_tid(enum_tid: Int, decl: Int, var_idx: Int) -> Int {
+    if decl == -1 || var_idx == -1 { return enum_tid }
+    if variant_field_count(var_idx) != 0 { return enum_tid }
+    let tparams_sl = node_type_params(decl)
+    if tparams_sl == -1 || sublist_length(tparams_sl) == 0 { return enum_tid }
+    // An expectation with an open slot of its own names nothing, as for `None`.
+    let open_hint = tc_construct_hint >= 0 && tc_tid_has_unbound_metavar(tc_construct_hint) != 0
+    let mut arg_tids: List[Int] = []
+    let mut ti = 0
+    while ti < sublist_length(tparams_sl) {
+        let h = if open_hint { -1 } else { tc_hint_enum_slot(enum_tid, tparams_sl, ti) }
+        arg_tids.push(if h != -1 { h } else { make_metavar() })
+        ti = ti + 1
+    }
+    make_enum_instance_type(tc_instance_base_name(enum_tid), arg_tids)
+}
+
 // Index of the first variant named `name` in evar_pool. This index is the
 // `var_idx` key used by evfield_pool (registration stores var_idx =
 // evar_pool.len() just before pushing the variant), so it lets variant_field_count
@@ -15411,7 +15431,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         let vt = nr_get_type(name)
         if tc_tid_is_no_info(vt) == 0 { return vt }
         if is_variant_name(name) != 0 {
-            return get_variant_enum_tid(name)
+            let vdecl = tc_variant_enum_decl_nodes.get(name) ?? -1
+            return tc_nullary_variant_tid(get_variant_enum_tid(name), vdecl, get_variant_var_idx(name))
         }
         // A named function used as a VALUE (`take_fn(m, bump)`) denotes its own signature. No
         // binding carries it — the name lives in the function table, not in a scope — so the
@@ -17593,7 +17614,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             let obj_name = node_name(obj_node)
             let tid = lookup_named_type(obj_name)
             if tid != -1 && type_kind(tid) == TyKind.Enum {
-                return tid
+                let edecl = tc_type_decl_nodes.get(tc_written_type_nominal(obj_name)) ?? -1
+                return tc_nullary_variant_tid(tid, edecl, get_variant_by_name(tid, fname))
             }
             // A MODULE qualifier. This arm covers an enum type qualifier, a struct
             // field, a tuple index, and this fourth case for `module.name` — without
