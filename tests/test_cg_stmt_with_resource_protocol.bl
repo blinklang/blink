@@ -6,10 +6,9 @@
 // scope wraps the bind in a WithScope naming the runtime's own blink_ffi_scope_cleanup,
 // and a Closeable resource wraps it the same way naming the close method the user wrote.
 // wrap_resource tests for the exit symbol the cleanup record carries rather than for the
-// protocol, so those two go down one path. BlockHandler names no exit runner, because its
-// binder holds the Context that enter() answers rather than the resource, so it still
-// reports the internal error cg_eff_resource_cleanup raises for it and lowers as a plain
-// bind underneath it.
+// protocol, so those two go down one path. A BlockHandler never reaches wrap_resource: its
+// binder holds the Context that enter() answers, so the with stage lowers it on a path of
+// its own that calls enter and guards the rest with the exit method the user wrote.
 
 import std.fs
 import std.io
@@ -183,12 +182,21 @@ test "a Closeable resource binds, then wraps the rest of the block in a WithScop
     assert_eq(ices(), 0)
 }
 
-test "a BlockHandler resource still reports the missing exit runner and still binds underneath it" {
+// The handler sits in a hidden local that enter and the guard both read, and the binder
+// holds enter's Context, so the guard's resource is that hidden local, not the binder.
+test "a BlockHandler resource binds its Context, then wraps the rest of the block in a WithScope naming its own exit method" {
     run_probe()
     diag_reset()
     let root = lower_fn(find_fn("block_handler_case"))
+    for err in ir_verify(root) { io.println("VERIFY: {err}") }
+    assert_eq(ir_verify(root).len(), 0)
     assert(find_kind(root, IrKind.Let) >= 0)
-    assert_eq(find_kind(root, IrKind.WithScope), -1)
-    assert_eq(ices(), 1)
-    assert(ices_mentioning("BlockHandler") > 0)
+    let scoped = find_kind(root, IrKind.WithScope)
+    assert(scoped >= 0)
+    assert_eq(ir_c_name(scoped), c_impl_method_name(find_impl("Guarded", "BlockHandler", ""), "exit"))
+    assert_eq(ir_kid_count(scoped), 2)
+    assert_eq(ir_kind(ir_kid(scoped, 0)), IrKind.VarRef)
+    assert(ir_c_name(ir_kid(scoped, 0)) != cg_local_c_name("guarded"))
+    assert_eq(ices(), 0)
+    assert_eq(ices_mentioning("BlockHandler"), 0)
 }

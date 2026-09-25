@@ -41,6 +41,7 @@ import cg_print.{
     print_spawn_pair_typedef, print_spawn_task_wrapper,
 }
 import cg_reg.{cg_reg_effect_decls, cg_reg_impl_decls}
+import cg_decl.{cg_decl_ret_tid, cg_decl_takes_ev}
 import cg_expr.{cg_expr_push_pending, lower_expr, lower_value_as_text}
 import diagnostics.{
     Diag, diag_ice, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg, CODEGEN_STAGE_NOT_BUILT,
@@ -183,27 +184,19 @@ pub fn cg_eff_resource_cleanup(item: Int) -> ResourceCleanup ! Diag.Report {
             "a nominal type reaching codegen must carry one declaration node; a bare name two modules both declare carries none")
         return plain_binding()
     }
-    // BlockHandler is tried first: a type that implements both also feeds the block's
-    // binder its context, and only the BlockHandler protocol does that. Typecheck
-    // rejects the pair outright, so this order is a guard rather than a live choice.
+    // A block handler calls enter before its body, which no resource does, so the with
+    // stage routes it away before asking this. Reaching here means that routing missed it.
     let bh = impl_of_trait_for_decl(TRAIT_BLOCK_HANDLER, decl, node)
     if bh >= 0 {
-        return needs_exit_runner(CleanupProtocol.BlockHandler, bh,
-            "a {TRAIT_BLOCK_HANDLER} resource's cleanup", node)
+        diag_ice_at("BlockHandlerOnResourcePath", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "a {TRAIT_BLOCK_HANDLER} reached the resource cleanup path", node,
+            "the with stage lowers every block handler through cg_eff_block_handler_calls")
+        return ResourceCleanup { protocol: CleanupProtocol.BlockHandler, impl_block: bh,
+            exit_symbol: "", passes_ok: false }
     }
     let cl = impl_of_trait_for_decl(TRAIT_CLOSEABLE, decl, node)
     if cl >= 0 { return closeable_binding(cl, tid, node) }
     plain_binding()
-}
-
-// A protocol that is selected but cannot yet be spelled. The guard local's cleanup
-// attribute needs a function taking the resource by value, and under BlockHandler the
-// binder holds the Context that `enter` answers rather than the resource itself, so no
-// method the user wrote has that shape. The protocol travels with an empty symbol and a
-// loud error rather than degrading to a plain binding, which would leave the exit unrun.
-fn needs_exit_runner(protocol: CleanupProtocol, im: Int, what: Str, node: Int) -> ResourceCleanup ! Diag.Report {
-    diag_ice_stage_not_built(what, node)
-    ResourceCleanup { protocol: protocol, impl_block: im, exit_symbol: "", passes_ok: false }
 }
 
 // Closeable's exit runner is the close method the user wrote. `fn close(self)` is an
@@ -224,6 +217,96 @@ fn closeable_binding(im: Int, tid: Int, node: Int) -> ResourceCleanup ! Diag.Rep
     print_resource_guard_support(exit_symbol, rec.c_spelling, false)
     ResourceCleanup { protocol: CleanupProtocol.Closeable, impl_block: im,
         exit_symbol: exit_symbol, passes_ok: false }
+}
+
+// ── Block handlers ────────────────────────────────────────────────────────────────
+
+// The BlockHandler methods one with-item calls, all spelled from one impl block.
+pub type BlockHandlerCalls {
+    impl_block: Int
+    enter_method: Int
+    // What enter returns: the Context the `as` binder holds.
+    context_tid: Int
+    exit_symbol: Str
+}
+
+let BLOCK_HANDLER_ENTER_METHOD = "enter"
+let BLOCK_HANDLER_EXIT_METHOD = "exit"
+
+// The BlockHandler impl of a with-item expression's type, or -1. The same question
+// decides both `with` forms: without `as` an item is a block handler or an effect handler,
+// and with it a block handler or a resource.
+pub fn cg_eff_block_handler_impl(expr: Int) -> Int ! Diag.Report {
+    if expr < 0 { return -1 }
+    let tid = tc_resolve(tid_of_node(expr))
+    if tid < 0 || tid >= ty_pool.len() { return -1 }
+    if !kind_can_carry_impl(tc_tid_kind(tid)) { return -1 }
+    let decl = tc_tid_decl_node(tid)
+    if decl < 0 { return -1 }
+    impl_of_trait_for_decl(TRAIT_BLOCK_HANDLER, decl, expr)
+}
+
+// exit runs from the guard with the ok flag the guard recorded. The guard runner passes no
+// effect vector, so an exit that performs effects has no lowering yet and says so loudly
+// rather than calling a function with one argument missing.
+pub fn cg_eff_block_handler_calls(im: Int, tid: Int, node: Int) -> BlockHandlerCalls ! Diag.Report {
+    let none = BlockHandlerCalls { impl_block: -1, enter_method: -1, context_tid: -1, exit_symbol: "" }
+    let enter = impl_method_named(im, BLOCK_HANDLER_ENTER_METHOD, node)
+    let exit = impl_method_named(im, BLOCK_HANDLER_EXIT_METHOD, node)
+    if enter < 0 || exit < 0 { return none }
+    if cg_decl_takes_ev(exit) {
+        diag_ice_stage_not_built("a {TRAIT_BLOCK_HANDLER} exit that performs effects", node)
+        return none
+    }
+    let rec = layout_of(tid, Position.Local)
+    if rec.decline_reason != "" {
+        diag_ice_at("UnspellableBlockHandlerType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "a {TRAIT_BLOCK_HANDLER} has no C spelling for its guard to store", node,
+            "the spelling the handler has at the with-item must spell again where the guard declares it")
+        return none
+    }
+    let context_tid = cg_decl_ret_tid(enter)
+    if context_tid < 0 { return none }
+    let exit_symbol = c_impl_method_name(im, BLOCK_HANDLER_EXIT_METHOD)
+    print_resource_guard_support(exit_symbol, rec.c_spelling, true)
+    BlockHandlerCalls { impl_block: im, enter_method: enter, context_tid: context_tid, exit_symbol: exit_symbol }
+}
+
+// `handler.enter()`, built by hand because no call node exists in the source. The handler
+// arrives as a value the caller already bound, so the call reads it without running it.
+pub fn cg_eff_block_handler_enter(calls: BlockHandlerCalls, held: Int, node: Int) -> Int ! Diag.Report {
+    let ret = calls.context_tid
+    let rec = layout_of(ret, Position.Local)
+    if rec.decline_reason != "" {
+        diag_ice_at("UnspellableBlockHandlerContext", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "a {TRAIT_BLOCK_HANDLER} enter returns a type with no C spelling", node,
+            "typecheck resolves the Context type of every block handler; this is a compiler bug")
+        return -1
+    }
+    let mut args: List[Int] = [held]
+    if cg_decl_takes_ev(calls.enter_method) {
+        let ev = cg_eff_ev_argument(node)
+        if ev < 0 { return -1 }
+        args.push(ev)
+    }
+    let symbol = c_impl_method_name(calls.impl_block, BLOCK_HANDLER_ENTER_METHOD)
+    ir_call_direct(ret, node, rec.c_spelling, symbol, rec.slot_form, args)
+}
+
+// Typecheck checks an impl against its trait, so a missing method here is a compiler bug.
+fn impl_method_named(im: Int, name: Str, node: Int) -> Int ! Diag.Report {
+    let ms = node_methods(im)
+    let n = if ms == -1 { 0 } else { sublist_length(ms) }
+    let mut i = 0
+    while i < n {
+        let m = sublist_get(ms, i)
+        if node_name(m) == name { return m }
+        i = i + 1
+    }
+    diag_ice_at("BlockHandlerMethodMissing", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "the {TRAIT_BLOCK_HANDLER} impl declares no method '{name}'", node,
+        "typecheck checks every impl against its trait; this is a compiler bug")
+    -1
 }
 
 // ── Closures as values ────────────────────────────────────────────────────────────
@@ -1350,7 +1433,7 @@ fn copy_names(names: List[Str]) -> List[Str] {
 
 // ── Handler installs ──────────────────────────────────────────────────────────────
 
-// A `with` item that is not a resource and not `arena` installs a handler: one field of the
+// A `with` item that is not a resource, a block handler or `arena` installs a handler: one field of the
 // effect vector holds the handler for the length of the body. Which field is a fact about
 // the handler's type, read off the tid typecheck stamped on the item, so an inline
 // `handler E { }`, a local of type Handler[E] and a call answering one all land in the
@@ -1366,7 +1449,7 @@ pub fn cg_eff_lower_handler_install(item: Int, handler_value: Int, body: Int) ->
     if effect_name == "" {
         diag_ice_at("WithItemNotAHandler", UNSOLVED_TYPEVAR_AT_CODEGEN,
             "with-item type {tid} is not a handler of a named effect", item,
-            "typecheck stamps every non-resource with-item as Handler[E]; this is a compiler bug")
+            "a with-item without `as` must be a Handler[E] or a BlockHandler, and typecheck does not yet refuse the rest")
         return -1
     }
     let field = ev_field_of(tid, item)
