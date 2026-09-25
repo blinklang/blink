@@ -2526,21 +2526,19 @@ BLINK_RT_FN void* blink_closure_get_capture(const blink_closure* c, int64_t inde
 
 /* ── IO ─────────────────────────────────────────────────────────────── */
 typedef struct {
-    void  (*print)(const char* msg);
-    void  (*print_no_nl)(const char* msg);
-    void  (*log)(const char* msg);
-    void  (*eprint)(const char* msg);
-    void  (*eprint_no_nl)(const char* msg);
-    /* Handler captures, ONE slot per op. A handler expression allocates its own
-     * copy of this vtable and stores its captured bindings in the slot of each
-     * op it defines — one value directly in the word, several boxed into an
-     * emitted caps struct. Per-op (not one shared word) so that an inner partial
-     * handler, which copies this vtable and overwrites only its own ops' slots,
-     * leaves an inherited op reading the OUTER handler's captures (saf1hh). The
-     * slots are LAST so the positional `_default` initializers below stay aligned
-     * and leave them NULL. The user-effect vtables codegen emits (`codegen.bl`)
-     * carry the same per-op slots; a builtin effect without any is why br wxxg4f
-     * could not capture at all. */
+    void  (*print)(void* __self, const char* msg);
+    void  (*print_no_nl)(void* __self, const char* msg);
+    void  (*log)(void* __self, const char* msg);
+    void  (*eprint)(void* __self, const char* msg);
+    void  (*eprint_no_nl)(void* __self, const char* msg);
+    /* One userdata word per op, passed back as the op's first argument. A
+     * handler expression stores in it the closure object of each op it
+     * defines: the handler it was copied from, then the op's captures. Per
+     * op so that an inner partial handler, which copies this vtable and
+     * overwrites only its own ops, leaves an inherited op reading the outer
+     * handler's word. The words are LAST so the positional `_default`
+     * initializers below stay aligned and leave them NULL, which the default
+     * bodies never read. User-effect vtables carry the same words. */
     void* __userdata_print;
     void* __userdata_print_no_nl;
     void* __userdata_log;
@@ -2548,37 +2546,37 @@ typedef struct {
     void* __userdata_eprint_no_nl;
 } blink_io_vtable;
 
-BLINK_RT_FN void blink_io_default_print(const char* msg);
+BLINK_RT_FN void blink_io_default_print(void* __self, const char* msg);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_io_default_print(const char* msg) {
+BLINK_RT_FN void blink_io_default_print(void* __self, const char* msg) {
     printf("%s\n", msg);
 }
 #endif
 
-BLINK_RT_FN void blink_io_default_print_no_nl(const char* msg);
+BLINK_RT_FN void blink_io_default_print_no_nl(void* __self, const char* msg);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_io_default_print_no_nl(const char* msg) {
+BLINK_RT_FN void blink_io_default_print_no_nl(void* __self, const char* msg) {
     printf("%s", msg);
 }
 #endif
 
-BLINK_RT_FN void blink_io_default_log(const char* msg);
+BLINK_RT_FN void blink_io_default_log(void* __self, const char* msg);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_io_default_log(const char* msg) {
+BLINK_RT_FN void blink_io_default_log(void* __self, const char* msg) {
     fprintf(stderr, "[LOG] %s\n", msg);
 }
 #endif
 
-BLINK_RT_FN void blink_io_default_eprint(const char* msg);
+BLINK_RT_FN void blink_io_default_eprint(void* __self, const char* msg);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_io_default_eprint(const char* msg) {
+BLINK_RT_FN void blink_io_default_eprint(void* __self, const char* msg) {
     fprintf(stderr, "%s\n", msg);
 }
 #endif
 
-BLINK_RT_FN void blink_io_default_eprint_no_nl(const char* msg);
+BLINK_RT_FN void blink_io_default_eprint_no_nl(void* __self, const char* msg);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_io_default_eprint_no_nl(const char* msg) {
+BLINK_RT_FN void blink_io_default_eprint_no_nl(void* __self, const char* msg) {
     fprintf(stderr, "%s", msg);
 }
 #endif
@@ -2598,10 +2596,10 @@ BLINK_UNUSED static blink_io_vtable blink_io_vtable_default = {
 
 /* ── FS ─────────────────────────────────────────────────────────────── */
 typedef struct {
-    const char* (*read)(const char* path);
-    int         (*write)(const char* path, const char* content);
-    int         (*delete_file)(const char* path);
-    int         (*watch)(const char* path, void (*callback)(const char*));
+    const char* (*read)(void* __self, const char* path);
+    int         (*write)(void* __self, const char* path, const char* content);
+    int         (*delete_file)(void* __self, const char* path);
+    int         (*watch)(void* __self, const char* path, void (*callback)(const char*));
     /* per-op handler captures — see blink_io_vtable */
     void* __userdata_read;
     void* __userdata_write;
@@ -2609,24 +2607,24 @@ typedef struct {
     void* __userdata_watch;
 } blink_fs_vtable;
 
-BLINK_RT_FN const char* blink_fs_default_read(const char* path);
+BLINK_RT_FN const char* blink_fs_default_read(void* __self, const char* path);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN const char* blink_fs_default_read(const char* path) {
+BLINK_RT_FN const char* blink_fs_default_read(void* __self, const char* path) {
     return blink_read_file(path);
 }
 #endif
 
-BLINK_RT_FN int blink_fs_default_write(const char* path, const char* content);
+BLINK_RT_FN int blink_fs_default_write(void* __self, const char* path, const char* content);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int blink_fs_default_write(const char* path, const char* content) {
+BLINK_RT_FN int blink_fs_default_write(void* __self, const char* path, const char* content) {
     blink_write_file(path, content);
     return 0;
 }
 #endif
 
-BLINK_RT_FN int blink_fs_default_delete(const char* path);
+BLINK_RT_FN int blink_fs_default_delete(void* __self, const char* path);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int blink_fs_default_delete(const char* path) {
+BLINK_RT_FN int blink_fs_default_delete(void* __self, const char* path) {
     return remove(path);
 }
 #endif
@@ -2642,9 +2640,9 @@ BLINK_RT_FN void blink_fs_remove(const char* path) {
 }
 #endif
 
-BLINK_RT_FN int blink_fs_default_watch(const char* path, void (*callback)(const char*));
+BLINK_RT_FN int blink_fs_default_watch(void* __self, const char* path, void (*callback)(const char*));
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int blink_fs_default_watch(const char* path, void (*callback)(const char*)) {
+BLINK_RT_FN int blink_fs_default_watch(void* __self, const char* path, void (*callback)(const char*)) {
     (void)path; (void)callback;
     fprintf(stderr, "blink: fs.watch not implemented\n");
     return -1;
@@ -2660,36 +2658,36 @@ BLINK_UNUSED static blink_fs_vtable blink_fs_vtable_default = {
 
 /* ── Net ────────────────────────────────────────────────────────────── */
 typedef struct {
-    int (*connect)(const char* url);
-    int (*listen)(const char* addr, int port);
-    const char* (*dns)(const char* hostname);
+    int (*connect)(void* __self, const char* url);
+    int (*listen)(void* __self, const char* addr, int port);
+    const char* (*dns)(void* __self, const char* hostname);
     /* per-op handler captures — see blink_io_vtable */
     void* __userdata_connect;
     void* __userdata_listen;
     void* __userdata_dns;
 } blink_net_vtable;
 
-BLINK_RT_FN int blink_net_default_connect(const char* url);
+BLINK_RT_FN int blink_net_default_connect(void* __self, const char* url);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int blink_net_default_connect(const char* url) {
+BLINK_RT_FN int blink_net_default_connect(void* __self, const char* url) {
     (void)url;
     fprintf(stderr, "blink: net.connect not implemented\n");
     return -1;
 }
 #endif
 
-BLINK_RT_FN int blink_net_default_listen(const char* addr, int port);
+BLINK_RT_FN int blink_net_default_listen(void* __self, const char* addr, int port);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int blink_net_default_listen(const char* addr, int port) {
+BLINK_RT_FN int blink_net_default_listen(void* __self, const char* addr, int port) {
     (void)addr; (void)port;
     fprintf(stderr, "blink: net.listen not implemented\n");
     return -1;
 }
 #endif
 
-BLINK_RT_FN const char* blink_net_default_dns(const char* hostname);
+BLINK_RT_FN const char* blink_net_default_dns(void* __self, const char* hostname);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN const char* blink_net_default_dns(const char* hostname) {
+BLINK_RT_FN const char* blink_net_default_dns(void* __self, const char* hostname) {
     (void)hostname;
     fprintf(stderr, "blink: net.dns not implemented\n");
     return NULL;
@@ -2704,10 +2702,10 @@ BLINK_UNUSED static blink_net_vtable blink_net_vtable_default = {
 
 /* ── Crypto ─────────────────────────────────────────────────────────── */
 typedef struct {
-    const char* (*hash)(const char* data);
-    const char* (*sign)(const char* data, const char* key);
-    const char* (*encrypt)(const char* data, const char* key);
-    const char* (*decrypt)(const char* data, const char* key);
+    const char* (*hash)(void* __self, const char* data);
+    const char* (*sign)(void* __self, const char* data, const char* key);
+    const char* (*encrypt)(void* __self, const char* data, const char* key);
+    const char* (*decrypt)(void* __self, const char* data, const char* key);
     /* per-op handler captures — see blink_io_vtable */
     void* __userdata_hash;
     void* __userdata_sign;
@@ -2715,36 +2713,36 @@ typedef struct {
     void* __userdata_decrypt;
 } blink_crypto_vtable;
 
-BLINK_RT_FN const char* blink_crypto_default_hash(const char* data);
+BLINK_RT_FN const char* blink_crypto_default_hash(void* __self, const char* data);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN const char* blink_crypto_default_hash(const char* data) {
+BLINK_RT_FN const char* blink_crypto_default_hash(void* __self, const char* data) {
     (void)data;
     fprintf(stderr, "blink: crypto.hash not implemented\n");
     return NULL;
 }
 #endif
 
-BLINK_RT_FN const char* blink_crypto_default_sign(const char* data, const char* key);
+BLINK_RT_FN const char* blink_crypto_default_sign(void* __self, const char* data, const char* key);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN const char* blink_crypto_default_sign(const char* data, const char* key) {
+BLINK_RT_FN const char* blink_crypto_default_sign(void* __self, const char* data, const char* key) {
     (void)data; (void)key;
     fprintf(stderr, "blink: crypto.sign not implemented\n");
     return NULL;
 }
 #endif
 
-BLINK_RT_FN const char* blink_crypto_default_encrypt(const char* data, const char* key);
+BLINK_RT_FN const char* blink_crypto_default_encrypt(void* __self, const char* data, const char* key);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN const char* blink_crypto_default_encrypt(const char* data, const char* key) {
+BLINK_RT_FN const char* blink_crypto_default_encrypt(void* __self, const char* data, const char* key) {
     (void)data; (void)key;
     fprintf(stderr, "blink: crypto.encrypt not implemented\n");
     return NULL;
 }
 #endif
 
-BLINK_RT_FN const char* blink_crypto_default_decrypt(const char* data, const char* key);
+BLINK_RT_FN const char* blink_crypto_default_decrypt(void* __self, const char* data, const char* key);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN const char* blink_crypto_default_decrypt(const char* data, const char* key) {
+BLINK_RT_FN const char* blink_crypto_default_decrypt(void* __self, const char* data, const char* key) {
     (void)data; (void)key;
     fprintf(stderr, "blink: crypto.decrypt not implemented\n");
     return NULL;
@@ -2760,9 +2758,9 @@ BLINK_UNUSED static blink_crypto_vtable blink_crypto_vtable_default = {
 
 /* ── Rand ───────────────────────────────────────────────────────────── */
 typedef struct {
-    int64_t (*rand_int)(int64_t min, int64_t max);
-    double  (*rand_float)(void);
-    void    (*rand_bytes)(void* buf, int64_t len);
+    int64_t (*rand_int)(void* __self, int64_t min, int64_t max);
+    double  (*rand_float)(void* __self);
+    void    (*rand_bytes)(void* __self, void* buf, int64_t len);
     /* per-op handler captures — see blink_io_vtable */
     void* __userdata_rand_int;
     void* __userdata_rand_float;
@@ -2789,26 +2787,26 @@ BLINK_RT_FN void blink_rand_ensure_seed(void) {
 }
 #endif
 
-BLINK_RT_FN int64_t blink_rand_default_int(int64_t min, int64_t max);
+BLINK_RT_FN int64_t blink_rand_default_int(void* __self, int64_t min, int64_t max);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_rand_default_int(int64_t min, int64_t max) {
+BLINK_RT_FN int64_t blink_rand_default_int(void* __self, int64_t min, int64_t max) {
     blink_rand_ensure_seed();
     if (min >= max) return min;
     return min + (int64_t)(rand() % (int)(max - min));
 }
 #endif
 
-BLINK_RT_FN double blink_rand_default_float(void);
+BLINK_RT_FN double blink_rand_default_float(void* __self);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN double blink_rand_default_float(void) {
+BLINK_RT_FN double blink_rand_default_float(void* __self) {
     blink_rand_ensure_seed();
     return (double)rand() / (double)RAND_MAX;
 }
 #endif
 
-BLINK_RT_FN void blink_rand_default_bytes(void* buf, int64_t len);
+BLINK_RT_FN void blink_rand_default_bytes(void* __self, void* buf, int64_t len);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_rand_default_bytes(void* buf, int64_t len) {
+BLINK_RT_FN void blink_rand_default_bytes(void* __self, void* buf, int64_t len) {
     blink_rand_ensure_seed();
     unsigned char* p = (unsigned char*)buf;
     for (int64_t i = 0; i < len; i++) {
@@ -2857,25 +2855,25 @@ BLINK_RT_FN blink_Duration blink_Instant_elapsed(blink_Instant then) {
 
 /* ── Time ───────────────────────────────────────────────────────────── */
 typedef struct {
-    blink_Instant (*read)(void);
-    void                (*sleep)(blink_Duration d);
+    blink_Instant (*read)(void* __self);
+    void                (*sleep)(void* __self, blink_Duration d);
     /* per-op handler captures — see blink_io_vtable */
     void* __userdata_read;
     void* __userdata_sleep;
 } blink_time_vtable;
 
-BLINK_RT_FN blink_Instant blink_time_default_read(void);
+BLINK_RT_FN blink_Instant blink_time_default_read(void* __self);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_Instant blink_time_default_read(void) {
+BLINK_RT_FN blink_Instant blink_time_default_read(void* __self) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (blink_Instant){.nanos = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec};
 }
 #endif
 
-BLINK_RT_FN void blink_time_default_sleep(blink_Duration d);
+BLINK_RT_FN void blink_time_default_sleep(void* __self, blink_Duration d);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_time_default_sleep(blink_Duration d) {
+BLINK_RT_FN void blink_time_default_sleep(void* __self, blink_Duration d) {
     int64_t ns = d.nanos;
     struct timespec ts;
     ts.tv_sec  = (time_t)(ns / 1000000000LL);
@@ -2900,11 +2898,11 @@ BLINK_RT_FN int64_t blink_time_ms(void) {
 
 /* ── Env ────────────────────────────────────────────────────────────── */
 typedef struct {
-    const char* (*read)(const char* name);
-    int         (*write)(const char* name, const char* value);
-    int         (*remove)(const char* name);
-    const char* (*cwd)(void);
-    void        (*exit_fn)(int code);
+    const char* (*read)(void* __self, const char* name);
+    int         (*write)(void* __self, const char* name, const char* value);
+    int         (*remove)(void* __self, const char* name);
+    const char* (*cwd)(void* __self);
+    void        (*exit_fn)(void* __self, int code);
     /* per-op handler captures — see blink_io_vtable */
     void* __userdata_read;
     void* __userdata_write;
@@ -2913,31 +2911,31 @@ typedef struct {
     void* __userdata_exit_fn;
 } blink_env_vtable;
 
-BLINK_RT_FN const char* blink_env_default_read(const char* name);
+BLINK_RT_FN const char* blink_env_default_read(void* __self, const char* name);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN const char* blink_env_default_read(const char* name) {
+BLINK_RT_FN const char* blink_env_default_read(void* __self, const char* name) {
     const char* v = getenv(name);
     return v ? blink_strdup(v) : NULL;
 }
 #endif
 
-BLINK_RT_FN int blink_env_default_write(const char* name, const char* value);
+BLINK_RT_FN int blink_env_default_write(void* __self, const char* name, const char* value);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int blink_env_default_write(const char* name, const char* value) {
+BLINK_RT_FN int blink_env_default_write(void* __self, const char* name, const char* value) {
     return setenv(name, value, 1);
 }
 #endif
 
-BLINK_RT_FN int blink_env_default_remove(const char* name);
+BLINK_RT_FN int blink_env_default_remove(void* __self, const char* name);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int blink_env_default_remove(const char* name) {
+BLINK_RT_FN int blink_env_default_remove(void* __self, const char* name) {
     return unsetenv(name);
 }
 #endif
 
-BLINK_RT_FN const char* blink_env_default_cwd(void);
+BLINK_RT_FN const char* blink_env_default_cwd(void* __self);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN const char* blink_env_default_cwd(void) {
+BLINK_RT_FN const char* blink_env_default_cwd(void* __self) {
     char buf[4096];
     char* r = getcwd(buf, sizeof(buf));
     if (!r) { fprintf(stderr, "blink: getcwd failed, falling back to \".\"\n"); }
@@ -2945,9 +2943,9 @@ BLINK_RT_FN const char* blink_env_default_cwd(void) {
 }
 #endif
 
-BLINK_RT_FN void blink_env_default_exit(int code);
+BLINK_RT_FN void blink_env_default_exit(void* __self, int code);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_env_default_exit(int code) {
+BLINK_RT_FN void blink_env_default_exit(void* __self, int code) {
     exit(code);
 }
 #endif
@@ -2962,25 +2960,25 @@ BLINK_UNUSED static blink_env_vtable blink_env_vtable_default = {
 
 /* ── Process ────────────────────────────────────────────────────────── */
 typedef struct {
-    int64_t (*spawn)(const char* command);
-    int     (*signal)(int64_t pid, int sig);
+    int64_t (*spawn)(void* __self, const char* command);
+    int     (*signal)(void* __self, int64_t pid, int sig);
     /* per-op handler captures — see blink_io_vtable */
     void* __userdata_spawn;
     void* __userdata_signal;
 } blink_process_vtable;
 
-BLINK_RT_FN int64_t blink_process_default_spawn(const char* command);
+BLINK_RT_FN int64_t blink_process_default_spawn(void* __self, const char* command);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_process_default_spawn(const char* command) {
+BLINK_RT_FN int64_t blink_process_default_spawn(void* __self, const char* command) {
     (void)command;
     fprintf(stderr, "blink: process.spawn not implemented\n");
     return -1;
 }
 #endif
 
-BLINK_RT_FN int blink_process_default_signal(int64_t pid, int sig);
+BLINK_RT_FN int blink_process_default_signal(void* __self, int64_t pid, int sig);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int blink_process_default_signal(int64_t pid, int sig) {
+BLINK_RT_FN int blink_process_default_signal(void* __self, int64_t pid, int sig) {
     (void)pid; (void)sig;
     fprintf(stderr, "blink: process.signal not implemented\n");
     return -1;

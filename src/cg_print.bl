@@ -127,7 +127,7 @@ fn expr_text(id: Int) -> Str ! Diag.Report {
         IrKind.ClosureNew => closure_new_text(id)
         IrKind.EvidenceVector => ir_c_name(id)
         IrKind.EvidenceAddress => "(&{print_expr(ir_kid(id, 0))})"
-        IrKind.EffectPerform => call_virtual_text(id)
+        IrKind.EffectPerform => perform_text(id)
         IrKind.FieldSet => misplaced(id, "value")
         IrKind.HandlerInstall => misplaced(id, "value")
         IrKind.Let => misplaced(id, "value")
@@ -178,6 +178,18 @@ fn call_virtual_text(id: Int) -> Str ! Diag.Report {
     let recv_text = print_expr(recv)
     let args = args_text(id, 1)
     "({recv_text}){access(recv)}{ir_c_name(id)}({args})"
+}
+
+// The slot is passed its own userdata word first, read off the same handler, which is why the
+// verifier admits only receivers that name a place: the text is printed twice.
+fn perform_text(id: Int) -> Str ! Diag.Report {
+    let recv = ir_kid(id, 0)
+    let recv_text = print_expr(recv)
+    let slot = ir_c_name(id)
+    let ud = "({recv_text}){access(recv)}__userdata_{slot}"
+    let args = args_text(id, 1)
+    let all = if args == "" { ud } else { "{ud}, {args}" }
+    "({recv_text}){access(recv)}{slot}({all})"
 }
 
 fn misplaced(id: Int, wanted: Str) -> Str ! Diag.Report {
@@ -663,6 +675,24 @@ pub fn print_test_fn(symbol: Str, body: Int) ! Diag.Report {
     print_fn(true, "void", symbol, [], false, body)
 }
 
+// A vtable slot's function takes its userdata word first: a handler operation's closure
+// object, or NULL where a builtin default body is called directly.
+pub fn vtable_slot_self_spelling() -> Str { "void*" }
+
+fn vtable_slot_params(params: List[Str]) -> List[Str] {
+    let mut ps: List[Str] = ["{vtable_slot_self_spelling()} __self"]
+    for p in params { ps.push(p) }
+    ps
+}
+
+pub fn print_vtable_slot_fn_decl(ret: Str, symbol: Str, params: List[Str]) {
+    em_fn_decl(true, ret, symbol, vtable_slot_params(params), false)
+}
+
+pub fn print_vtable_slot_fn(ret: Str, symbol: Str, params: List[Str], body: Int) ! Diag.Report {
+    print_fn(true, ret, symbol, vtable_slot_params(params), false, body)
+}
+
 pub fn print_closure_thunk_decl(ret: Str, symbol: Str, params: List[Str]) {
     em_fn_decl(true, ret, symbol, closure_thunk_params(params), false)
 }
@@ -739,7 +769,7 @@ pub fn print_effect_vtable_typedef(guard: Str, vtable_c_name: Str, slots: List[S
     if !same_len("{vtable_c_name}_rets", slots.len(), slot_rets.len()) { return }
     if !same_len("{vtable_c_name}_params", slots.len(), slot_params.len()) { return }
     let mut ps: List[List[Str]] = []
-    for p in slot_params { ps.push(params_or_void(p, false)) }
+    for p in slot_params { ps.push(vtable_slot_params(p)) }
     em_td_guard_open(guard)
     em_effect_vtable_typedef_body(vtable_c_name, slots, slot_rets, ps)
     em_td_guard_close(guard)
@@ -749,27 +779,31 @@ pub fn print_effect_default_vtable(vtable_c_name: Str, default_fn_symbols: List[
     em_effect_default_vtable(vtable_c_name, default_fn_symbols)
 }
 
-// The function that builds one handler literal's value, and the static that remembers the
-// handler it was built from.
+// The function that builds one handler literal's value from the words built at its site.
 //
 // handler_spelling is the handler's own C type, a pointer to the root effect's vtable. The
-// copy is of the whole struct, so an operation the literal does not write keeps the body the
-// copied-from handler gave it, and a literal that writes nothing delegates everything.
-//
-// outer_name is written before the copy and read by this literal's operations. An operation
-// body runs outside the handler that holds it, so a perform of the root that operation
-// handles reaches this static rather than the vector, which is that very operation.
-pub fn print_handler_builder(handler_spelling: Str, symbol: Str, outer_name: Str, ev_global: Str, ev_field: Str, slots: List[Str], op_symbols: List[Str]) ! Diag.Report {
+// copy is of the whole struct, so an operation the literal does not write keeps the body and
+// userdata word the copied-from handler gave it, and a literal that writes nothing delegates
+// everything. Word i is operation i's closure object, stored beside its slot.
+pub fn print_handler_builder(handler_spelling: Str, symbol: Str, ev_global: Str, ev_field: Str, slots: List[Str], op_symbols: List[Str]) ! Diag.Report {
     if !same_len("{symbol}_slots", slots.len(), op_symbols.len()) { return }
-    em_line("static {handler_spelling} {outer_name} = NULL;")
-    em_line("static {handler_spelling} {symbol}(void) \{")
-    em_indent_push()
-    em_line("{outer_name} = {ev_global}.{ev_field};")
-    em_line("{handler_spelling} __h = ({handler_spelling})blink_alloc(sizeof(*{outer_name}));")
-    em_line("*__h = *{outer_name};")
+    let mut params: List[Str] = []
     let mut i = 0
     while i < slots.len() {
-        em_line("__h->{slots.get(i).unwrap()} = {op_symbols.get(i).unwrap()};")
+        params.push("void* __ud_{i}")
+        i += 1
+    }
+    let plist = params_or_void(params, false).join(", ")
+    em_line("static {handler_spelling} {symbol}({plist}) \{")
+    em_indent_push()
+    em_line("{handler_spelling} __outer = {ev_global}.{ev_field};")
+    em_line("{handler_spelling} __h = ({handler_spelling})blink_alloc(sizeof(*__outer));")
+    em_line("*__h = *__outer;")
+    i = 0
+    while i < slots.len() {
+        let slot = slots.get(i).unwrap()
+        em_line("__h->{slot} = {op_symbols.get(i).unwrap()};")
+        em_line("__h->__userdata_{slot} = __ud_{i};")
         i += 1
     }
     em_line("return __h;")

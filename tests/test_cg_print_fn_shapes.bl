@@ -13,7 +13,8 @@ import layout.{SlotForm}
 import cg_print.{
     print_reset, print_take, print_prologue, print_ev, print_fn_decl, print_fn, print_closure_thunk_decl,
     print_closure_thunk, print_struct_typedef, print_typedef_blocks, print_effect_vtable_typedef,
-    print_effect_default_vtable, print_scope_restore_support, print_main_shim,
+    print_effect_default_vtable, print_scope_restore_support, print_main_shim, print_vtable_slot_fn_decl,
+    print_vtable_slot_fn,
 }
 // lexer and parser read the trace globals that compiler.bl owns, so a test that imports
 // typecheck through layout must load compiler as well.
@@ -93,12 +94,15 @@ fn closure_body() -> Int {
 }
 
 // The handler for Log.log writes through the io slot of the global vector, which a plain
-// vtable function reaches as a global receiver.
+// vtable function reaches as a global receiver. A virtual call passes every argument the
+// slot takes, so the slot's userdata word is written out as the first one.
 fn handler_body() -> Int {
     let recv = ir_global_ref(10, 0, "blink_io_vtable*", "__blink_ev.io", SlotForm.PointerBoxed)
+    let ud_recv = ir_global_ref(10, 0, "blink_io_vtable*", "__blink_ev.io", SlotForm.PointerBoxed)
+    let ud = ir_field_get(3, 0, "void*", "__userdata_print", SlotForm.InlineWord, ud_recv)
     let msg = ir_call_runtime(2, 0, "const char*", "blink_str_format", SlotForm.InlineWord,
         [str_const("[log] %s"), ir_var_ref(2, 0, "const char*", "msg", SlotForm.InlineWord)])
-    ir_block(0, [ir_expr_stmt(0, ir_call_virtual(0, 0, "void", "print", SlotForm.Inline, recv, [msg]))])
+    ir_block(0, [ir_expr_stmt(0, ir_call_virtual(0, 0, "void", "print", SlotForm.Inline, recv, [ud, msg]))])
 }
 
 fn main_body() -> Int {
@@ -138,17 +142,17 @@ fn print_program() -> Str ! Diag.Report {
     print_struct_typedef("BLINK_TD_blink_Point", "blink_Point", ["int64_t x", "int64_t y"])
     print_typedef_blocks(["#ifndef BLINK_TD_blink_Option_int\n#define BLINK_TD_blink_Option_int\ntypedef struct \{ int tag; int64_t value; } blink_Option_int;\n#endif"])
     print_effect_vtable_typedef("BLINK_TD_blink_ue_log_vtable", "blink_ue_log_vtable", ["log"], ["void"], [["const char* msg"]])
-    print_fn(true, "void", "blink_ue_log_default_log", ["const char* msg"], false, ir_block(0, []))
+    print_vtable_slot_fn("void", "blink_ue_log_default_log", ["const char* msg"], ir_block(0, []))
     print_effect_default_vtable("blink_ue_log_vtable", ["blink_ue_log_default_log"])
     print_ev("BLINK_TD_blink_ev", ["blink_ue_log_vtable"], ["ue_log"], "")
     print_scope_restore_support()
     print_fn_decl(true, "blink_Option_int", "first_pos", ["blink_list* xs"], true)
     print_closure_thunk_decl("int64_t", "__closure_0", ["int64_t a"])
-    print_fn_decl(true, "void", "handler_log", ["const char* msg"], false)
+    print_vtable_slot_fn_decl("void", "handler_log", ["const char* msg"])
     print_fn_decl(false, "void", "blink_main", [], true)
     print_fn(true, "blink_Option_int", "first_pos", ["blink_list* xs"], true, first_pos_body())
     print_closure_thunk("int64_t", "__closure_0", ["int64_t a"], closure_body())
-    print_fn(true, "void", "handler_log", ["const char* msg"], false, handler_body())
+    print_vtable_slot_fn("void", "handler_log", ["const char* msg"], handler_body())
     print_fn(false, "void", "blink_main", [], true, main_body())
     print_main_shim(true, false, false, true, false, 0, [])
     print_take()
@@ -168,9 +172,9 @@ test "a program with Option, List, struct, closure and effect handler compiles a
     assert(c_text.contains(" = (blink_Point*)blink_alloc(sizeof(blink_Point));"))
     assert(c_text.contains("blink_closure_new_typed((void*)__closure_0, _caps"))
     assert(c_text.contains("((int64_t(*)(const blink_closure*, int64_t))add->fn_ptr)(add, 4);"))
-    assert(c_text.contains("(__blink_ev.io)->print(blink_str_format(\"[log] %s\", msg));"))
+    assert(c_text.contains("(__blink_ev.io)->print(__blink_ev.io->__userdata_print, blink_str_format(\"[log] %s\", msg));"))
     assert(c_text.contains("__blink_ev.ue_log = (&hv);"))
-    assert(c_text.contains("(__ev->ue_log)->log(\"from handler\");"))
+    assert(c_text.contains("(__ev->ue_log)->log((__ev->ue_log)->__userdata_log, \"from handler\");"))
     assert(c_text.contains("__attribute__((cleanup(__blink_arena_restore)))"))
 
     let r = cc_and_run("cg_print_fn_shapes", c_text)
