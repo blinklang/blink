@@ -1,0 +1,99 @@
+// An effect operation that answers an Option over a struct or data enum hands the caller
+// that Option as declared. Each row reads the payload back by value, so an answer that
+// crossed the handler boundary in some other carrier reads a wrong value or fails to build.
+
+
+type OaItem { name: Str, count: Int }
+
+type OaShape {
+    OaCircle(Int)
+    OaSquare(Int)
+}
+
+effect OaStore {
+    effect Lookup {
+        fn find(name: Str) -> Option[OaItem]
+        fn shape(n: Int) -> Option[OaShape]
+        fn nested(n: Int) -> Option[Option[OaItem]]
+    }
+}
+
+fn oa_find(name: Str) -> Option[OaItem] ! OaStore.Lookup { oastore.find(name) }
+
+fn oa_shape(n: Int) -> Option[OaShape] ! OaStore.Lookup { oastore.shape(n) }
+
+fn oa_nested(n: Int) -> Option[Option[OaItem]] ! OaStore.Lookup { oastore.nested(n) }
+
+fn oa_count_of(name: Str) -> Int ! OaStore.Lookup {
+    match oastore.find(name) {
+        Some(it) => { return it.count }
+        None => { return -1 }
+    }
+}
+
+fn oa_store() -> Handler[OaStore] {
+    handler OaStore {
+        fn find(name: Str) -> Option[OaItem] {
+            if name == "none" { return None }
+            Some(OaItem { name: name, count: name.len() })
+        }
+        fn shape(n: Int) -> Option[OaShape] {
+            if n < 0 { return None }
+            if n % 2 == 0 { Some(OaCircle(n)) } else { Some(OaSquare(n)) }
+        }
+        fn nested(n: Int) -> Option[Option[OaItem]] {
+            if n == 0 { return None }
+            if n == 1 { return Some(None) }
+            Some(Some(OaItem { name: "deep", count: n }))
+        }
+    }
+}
+
+test "a perform answering Option[Struct] holds the struct the handler built" {
+    with oa_store() {
+        let it = oa_find("apple").unwrap()
+        assert_eq(it.name, "apple")
+        assert_eq(it.count, 5)
+        assert(oa_find("none").is_none())
+    }
+}
+
+test "a perform answering Option[Enum] holds the variant and its payload" {
+    with oa_store() {
+        let s = oa_shape(4).unwrap()
+        let text = match s {
+            OaCircle(n) => "circle {n}"
+            OaSquare(n) => "square {n}"
+        }
+        assert_eq(text, "circle 4")
+        assert(oa_shape(-1).is_none())
+    }
+}
+
+test "a perform answer is matched in place at the call" {
+    with oa_store() {
+        assert_eq(oa_count_of("pear"), 4)
+        assert_eq(oa_count_of("none"), -1)
+    }
+}
+
+test "a perform answering a nested Option keeps both levels" {
+    with oa_store() {
+        assert(oa_nested(0).is_none())
+        assert(oa_nested(1).unwrap().is_none())
+        assert_eq(oa_nested(7).unwrap().unwrap().count, 7)
+    }
+}
+
+test "two handlers of one effect answer through the same slot type" {
+    with oa_store() {
+        assert_eq(oa_find("ab").unwrap().count, 2)
+    }
+    with handler OaStore {
+        fn find(name: Str) -> Option[OaItem] { Some(OaItem { name: name, count: 20 }) }
+        fn shape(_n: Int) -> Option[OaShape] { None }
+        fn nested(_n: Int) -> Option[Option[OaItem]] { None }
+    } {
+        assert_eq(oa_find("ab").unwrap().count, 20)
+    }
+}
