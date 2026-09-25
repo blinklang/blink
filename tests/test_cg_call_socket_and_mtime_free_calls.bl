@@ -1,0 +1,145 @@
+// Bare calls to the unix-socket family and `file_mtime`: compiler-provided names whose
+// runtime call already exists (bootstrap/runtime_unix_socket.h, runtime_core.h) and whose
+// return type typecheck already knows. The compiler's own daemon and file watcher call
+// them, so each needs a row in the free-call table and the arity backstop that row brings.
+
+import lower_test_helpers.{
+    probe, rhs_of, let_node_of, assert_kind, assert_eq_str, assert_shape,
+    assert_verifies, assert_ice_saying,
+}
+import parser.{node_kind, node_left, node_name, nodes}
+import ast.{NodeKind, nk_of}
+import ir.{IrKind, ir_c_name}
+import cg_expr.{lower_expr}
+import std.io
+
+// A statement call binds no name, so it is found by walking forward from a binding the
+// probe does name: a statement parses after the binding above it, so its node id is higher.
+fn call_after(anchor: Str, name: Str) -> Int {
+    let mut i = let_node_of(anchor)
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.Call {
+            let callee = node_left(i)
+            if callee >= 0 && nk_of(node_kind(callee)) == NodeKind.Ident && node_name(callee) == name {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no call of '{name}' after '{anchor}'")
+    assert(false)
+    -1
+}
+
+// One call per name, each with the arity its runtime call takes. `unix_socket_close` and
+// `socket_write` answer nothing, so they sit as statements.
+fn src_sockets() -> Str {
+    #"fn main() {
+    let path = "/tmp/blink.sock"
+    let listener = unix_socket_listen(path)
+    let client = unix_socket_connect(path)
+    let conn = unix_socket_accept(listener)
+    let timed = unix_socket_accept_timeout(listener, 50)
+    let line = socket_read_line(conn)
+    socket_write(client, line)
+    unix_socket_close(client)
+    let stamp = file_mtime(path)
+    let _keep = [timed, stamp]
+}
+"#
+}
+
+fn src_accept_timeout_arity_wrong() -> Str {
+    #"fn main() {
+    let timed = unix_socket_accept_timeout(3)
+    let _keep = timed
+}
+"#
+}
+
+fn src_file_mtime_arity_wrong() -> Str {
+    #"fn main() {
+    let stamp = file_mtime("a", "b")
+    let _keep = stamp
+}
+"#
+}
+
+test "unix_socket_listen passes its path to the runtime call" {
+    probe("cg_call_sock_listen", src_sockets())
+    let built = lower_expr(rhs_of("listener"))
+    assert_kind("kind", built, IrKind.CallRuntime)
+    assert_shape("shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_unix_socket_listen")
+    assert_verifies("unix_socket_listen", built)
+}
+
+test "unix_socket_connect passes its path to the runtime call" {
+    probe("cg_call_sock_connect", src_sockets())
+    let built = lower_expr(rhs_of("client"))
+    assert_shape("shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_unix_socket_connect")
+    assert_verifies("unix_socket_connect", built)
+}
+
+test "unix_socket_accept passes its listener to the runtime call" {
+    probe("cg_call_sock_accept", src_sockets())
+    let built = lower_expr(rhs_of("conn"))
+    assert_shape("shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_unix_socket_accept")
+    assert_verifies("unix_socket_accept", built)
+}
+
+test "unix_socket_accept_timeout passes its listener and timeout to the runtime call" {
+    probe("cg_call_sock_accept_timeout", src_sockets())
+    let built = lower_expr(rhs_of("timed"))
+    assert_shape("shape", built, "CallRuntime(VarRef, Const)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_unix_socket_accept_timeout")
+    assert_verifies("unix_socket_accept_timeout", built)
+}
+
+test "socket_read_line passes its connection to the runtime call" {
+    probe("cg_call_sock_read_line", src_sockets())
+    let built = lower_expr(rhs_of("line"))
+    assert_shape("shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_socket_read_line")
+    assert_verifies("socket_read_line", built)
+}
+
+test "socket_write passes its connection and text to the runtime call" {
+    probe("cg_call_sock_write", src_sockets())
+    let built = lower_expr(call_after("line", "socket_write"))
+    assert_shape("shape", built, "CallRuntime(VarRef, VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_socket_write")
+    assert_verifies("socket_write", built)
+}
+
+test "unix_socket_close passes its handle to the runtime call" {
+    probe("cg_call_sock_close", src_sockets())
+    let built = lower_expr(call_after("line", "unix_socket_close"))
+    assert_shape("shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_unix_socket_close")
+    assert_verifies("unix_socket_close", built)
+}
+
+test "file_mtime passes its path to the runtime call" {
+    probe("cg_call_file_mtime", src_sockets())
+    let built = lower_expr(rhs_of("stamp"))
+    assert_shape("shape", built, "CallRuntime(VarRef)")
+    assert_eq_str("symbol", ir_c_name(built), "blink_file_mtime")
+    assert_verifies("file_mtime", built)
+}
+
+test "a wrong-arity unix_socket_accept_timeout call refuses rather than emit an uncompilable call" {
+    probe("cg_call_sock_accept_timeout_arity", src_accept_timeout_arity_wrong())
+    assert_ice_saying("unix_socket_accept_timeout(3)", lower_expr(rhs_of("timed")),
+        "RuntimeFreeCallArityWrong",
+        "'unix_socket_accept_timeout' takes 2 argument(s), and this call was given 1")
+}
+
+test "a wrong-arity file_mtime call refuses rather than emit an uncompilable call" {
+    probe("cg_call_file_mtime_arity", src_file_mtime_arity_wrong())
+    assert_ice_saying("file_mtime(\"a\", \"b\")", lower_expr(rhs_of("stamp")),
+        "RuntimeFreeCallArityWrong",
+        "'file_mtime' takes 1 argument(s), and this call was given 2")
+}
