@@ -44,7 +44,7 @@ import ir.{
     ir_const, ir_var_ref, ir_cell_ref, ir_global_ref, ir_unary, ir_binary, ir_cast, ir_field_get,
     ir_struct_new, ir_tuple_new, ir_container_new, ir_box, ir_unbox, ir_carrier_wrap,
     ir_carrier_unwrap, ir_carrier_tag, ir_call_runtime, ir_let, ir_assign, ir_return,
-    ir_expr_stmt, ir_if, ir_block, ir_enum_new,
+    ir_expr_stmt, ir_if, ir_block, ir_enum_new, ir_unreachable,
 }
 import cg_call.{
     lower_call, lower_operator_method, lower_display_call, lower_display_of_value,
@@ -1597,11 +1597,26 @@ fn lower_interp_call(node: Int, tid: Int, rec: LayoutRecord, parts: Int) -> Int 
 fn x_interp_hole(part: Int) -> InterpHole ! Diag.Report {
     let tid = tid_of_node(part)
     if tid < 0 { return InterpHole {} }
+    if x_kind(tid) == TyKind.Never { return x_never_hole(part) }
     let spec = format_spec_of(tid)
     if spec == "" { return x_unprintable_hole(part, tid) }
     let arg = x_interp_arg(part, tid)
     if arg < 0 { return InterpHole {} }
     InterpHole { spec: spec, arg: arg }
+}
+
+// A Never hole is the thing that diverges, so it is lowered once for its effect and the
+// marker after it tells C that control stops there. The format call that follows is dead
+// but must still compile, so it reads a fresh Int-word zero rather than the hoisted value.
+fn x_never_hole(part: Int) -> InterpHole ! Diag.Report {
+    let value = lower_expr(part)
+    if value < 0 { return InterpHole {} }
+    if x_has_effect(value) { x_hoist(ir_expr_stmt(part, value)) }
+    x_hoist(ir_unreachable(part))
+    let word = x_local(TYPE_INT, part)
+    if x_stopped(word) { return InterpHole {} }
+    let zero = ir_const(TYPE_INT, part, word.c_spelling, "0")
+    InterpHole { spec: format_spec_of(TYPE_INT), arg: ir_cast(TYPE_INT, part, word.c_spelling, zero) }
 }
 
 // A hole no printf conversion prints. Only a struct or an enum declares a type that can
