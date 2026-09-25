@@ -568,14 +568,34 @@ fn cg_call_decode_element(node: Int, elem_tid: Int, shape: ElementShape, raw: In
     ir_unbox(elem_tid, node, shape.value.c_spelling, shape.value.slot_form, read)
 }
 
-// cg_call_decode_element with the shape resolved from elem_tid, for a caller (cg_stmt's
-// Channel-drained loop) that holds a raw slot word and the element tid but has no shape of
-// its own -- this is the one seam that would otherwise ask a caller in the other file to
-// import cc_element_shape and ElementShape both to do what this already does in one call.
-pub fn cg_call_element_from_slot(node: Int, elem_tid: Int, raw: Int) -> Int ! Diag.Report {
-    let shape = cc_element_shape(node, elem_tid)
-    if cc_shape_stopped(shape) { return -1 }
-    cg_call_decode_element(node, elem_tid, shape, raw)
+// One receive from a channel: the statement that takes the slot word into a local, the
+// test that is true when the runtime answered NULL, and the element decoded from the word.
+// The word is tested before it is decoded, so a NULL is never followed as a box.
+pub type ChannelTake {
+    take: Int
+    closed: Int
+    element: Int
+}
+
+pub fn cg_call_channel_take(node: Int, elem_tid: Int, channel: Int) -> ChannelTake ! Diag.Report {
+    cc_channel_take(node, cc_channel_shape(node, elem_tid), channel)
+}
+
+fn cc_channel_take(node: Int, shape: ElementShape, channel: Int) -> ChannelTake ! Diag.Report {
+    let refused = ChannelTake { take: -1, closed: -1, element: -1 }
+    if cc_shape_stopped(shape) { return refused }
+    let answer = cc_local(TYPE_BOOL, node)
+    if cc_stopped(answer) { return refused }
+    let cell = container_slot_spelling()
+    let word = c_mint_local("recv")
+    let call = ir_call_runtime(shape.tid, node, cell, c_runtime_helper(channel_recv_op), SlotForm.InlineWord, [channel])
+    let take = ir_let(shape.tid, node, cell, word, SlotForm.InlineWord, call)
+    let closed = ir_binary(TYPE_BOOL, node, answer.c_spelling, "==",
+        ir_var_ref(shape.tid, node, cell, word, SlotForm.InlineWord), ir_const(TYPE_INT, node, cell, "0"))
+    let element = cg_call_decode_element(node, shape.tid, shape,
+        ir_var_ref(shape.tid, node, cell, word, SlotForm.InlineWord))
+    if element < 0 { return refused }
+    ChannelTake { take: take, closed: closed, element: element }
 }
 
 // One element entering a container slot, for a caller that holds the value rather than an
@@ -623,6 +643,18 @@ fn cc_element_shape(node: Int, elem_tid: Int) -> ElementShape ! Diag.Report {
 }
 
 fn cc_shape_stopped(shape: ElementShape) -> Bool { cc_stopped(shape.slot) }
+
+// The runtime reads a NULL slot as "closed and empty", so a Channel slot always holds a
+// box, even for an element that fits the word: an Int 0 or a false sent as the word itself
+// would end every reader. Send, recv and the for-in drain all take their shape from here.
+fn cc_channel_shape(node: Int, elem_tid: Int) -> ElementShape ! Diag.Report {
+    let value = cc_element_layout(node, elem_tid, Position.Local)
+    if cc_stopped(value) { return ElementShape { tid: -1, slot: value, value: value, boxed: false } }
+    let slot = cc_element_checked(node, address_layout_of(elem_tid, Position.Local))
+    if cc_stopped(slot) { return ElementShape { tid: -1, slot: slot, value: slot, boxed: false } }
+    ensure_typedef_for(elem_tid)
+    ElementShape { tid: elem_tid, slot: slot, value: value, boxed: true }
+}
 
 // The shape of a call that stores nothing. It reads as stopped, and reports nothing on its
 // way there: no layout was asked for, so none declined. A caller that reached for it by
@@ -864,7 +896,10 @@ fn cc_element_helper(node: Int, container_tid: Int) -> Str ! Diag.Report {
 // The element's C shape. A container slot answers the word itself or a pointer to the
 // element, and the same element at Position.Local answers the type that pointer points at.
 fn cc_element_layout(node: Int, elem_tid: Int, position: Position) -> LayoutRecord ! Diag.Report {
-    let rec = layout_of(elem_tid, position)
+    cc_element_checked(node, layout_of(elem_tid, position))
+}
+
+fn cc_element_checked(node: Int, rec: LayoutRecord) -> LayoutRecord ! Diag.Report {
     // The reason is read into the message before the test, so that every read of a decline
     // sits next to the internal error that reports it and none can be left to be swallowed.
     let why = "container element has no C layout: {rec.decline_reason}"
@@ -2825,16 +2860,12 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if kind == TyKind.List && cc_is_list_take(mname) { return cc_list_take(node, obj) }
     let primitive = cc_runtime_method(kind, mname)
     if primitive != "" { return cc_lower_runtime_method(node, obj, kind, mname, primitive) }
+    if kind == TyKind.Channel && cc_is_channel_recv(mname) { return cc_channel_recv(node, obj) }
     let keyed = cc_keyed_row(kind, mname)
     if keyed.op != "" { return cc_lower_keyed_method(node, obj, kind, mname, keyed) }
     if cc_is_map_slot_method(kind, mname) { return cc_map_slot_method(node, obj, kind, mname) }
     if cc_is_scalar_cast(kind, mname) { return cc_scalar_cast(node, obj, kind, mname) }
-    if kind == TyKind.Int {
-        let dest_tid = tid_of_node(node)
-        if dest_tid >= 0 && cc_is_into_target(mname, cc_kind(dest_tid)) {
-            return cc_scalar_cast(node, obj, kind, mname)
-        }
-    }
+    if kind == TyKind.Int && cc_is_int_into(node, mname) { return cc_scalar_cast(node, obj, kind, mname) }
     if cc_is_wrapping_arith(kind, mname) { return cc_wrapping_arith(node, obj, recv_tid, kind, mname) }
     if cc_is_char_text(kind, mname) { return cc_char_text(node, obj, kind, mname) }
     if cc_is_sb_write_char(kind, mname) { return cc_sb_write_char(node, obj) }
@@ -2877,6 +2908,13 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let symbol = cc_call_symbol(node, method, c_impl_method_name(im, node_method(node)))
     if symbol == "" { return -1 }
     cc_build_call(node, symbol, obj, CallForm.Declared, cg_decl_takes_ev(method))
+}
+
+// An Int's `into` casts only when the type it is converted to is one the cast reaches, and
+// that type is the call's own.
+fn cc_is_int_into(node: Int, mname: Str) -> Bool ! Diag.Report {
+    let dest_tid = tid_of_node(node)
+    dest_tid >= 0 && cc_is_into_target(mname, cc_kind(dest_tid))
 }
 
 // A method call with no declared impl to answer it may still be one a derive answers: a
@@ -3173,6 +3211,38 @@ fn cc_runtime_method_arity(op: Str) -> Int {
     table.insert("channel_send", 1)
     table.insert("channel_close", 0)
     table.get(op) ?? NO_ARITY
+}
+
+// The one entry point every receive calls, a direct `ch.recv()` and a for-in drain alike.
+let channel_recv_op = "channel_recv"
+let channel_recv_closed = "recv on a closed, empty channel"
+
+fn cc_is_channel_recv(method: Str) -> Bool {
+    let mut table: Map[Str, Bool] = Map()
+    table.insert("recv", true)
+    table.get(method) ?? false
+}
+
+// `ch.recv()` answers the element itself, not an Option, so a channel that is closed and
+// empty has no value to give and panics. A zero value would read the same as a sent zero.
+fn cc_channel_recv(node: Int, obj: Int) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, TyKind.Channel, "recv", 0, given) }
+    let container = tid_of_node(obj)
+    if container < 0 { return -1 }
+    let shape = cc_slot_shape(node, container, TyKind.Channel, Slot.Inner1)
+    if cc_shape_stopped(shape) { return -1 }
+    let said = cc_local(TYPE_STR, node)
+    if cc_stopped(said) { return -1 }
+    let receiver = lower_expr(obj)
+    if receiver < 0 { return -1 }
+    let t = cc_channel_take(node, shape, receiver)
+    if t.element < 0 { return -1 }
+    cg_expr_push_pending(node, t.take)
+    let message = ir_const(TYPE_STR, node, said.c_spelling,
+        c_string_literal(cc_panic_message(node, channel_recv_closed)))
+    cg_expr_push_pending(node, ir_if(node, t.closed, ir_block(node, [ir_panic(node, message)]), -1))
+    t.element
 }
 
 // ── Keyed containers ──────────────────────────────────────────────────────
@@ -3585,6 +3655,7 @@ fn cc_slot_shape(node: Int, container: Int, kind: TyKind, slot: Slot) -> Element
         cc_element_type_unrecorded(node, kind)
         return cc_absent_shape()
     }
+    if kind == TyKind.Channel { return cc_channel_shape(node, held) }
     cc_element_shape(node, held)
 }
 
@@ -5211,6 +5282,6 @@ pub fn for_in_iteration_of(iterable_tid: Int, node: Int) -> ForInIteration ! Dia
     if kind == TyKind.Bytes { return cc_for_in_indexed("bytes_len", "bytes_get", elem) }
     if kind == TyKind.Set { return cc_for_in_materialized("set_to_list", "", elem) }
     if kind == TyKind.Map { return cc_for_in_materialized("map_keys", "map_values", elem) }
-    if kind == TyKind.Channel { return cc_for_in_drained("channel_recv", elem) }
+    if kind == TyKind.Channel { return cc_for_in_drained(channel_recv_op, elem) }
     cc_for_in_not_built(node)
 }

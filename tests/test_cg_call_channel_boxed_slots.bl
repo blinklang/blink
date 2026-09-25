@@ -1,0 +1,62 @@
+// The runtime reads a NULL Channel slot as "closed and empty", so every slot holds a box,
+// even for an element that fits the word. Send stores through that shape, and recv and the
+// for-in drain read through it, so the three can never disagree about what a slot holds.
+
+import lower_test_helpers.{probe, let_node_of, assert_kind, assert_eq_str, assert_shape, assert_verifies, ice_count}
+import parser.{node_kind, node_method, node_value, nodes}
+import ast.{NodeKind, nk_of}
+import ir.{IrKind, ir_c_name}
+import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
+import cg_call.{cg_call_channel_take}
+import typecheck.{TYPE_INT}
+import std.io
+
+fn call_after(anchor: Str, method: Str) -> Int {
+    let mut i = let_node_of(anchor)
+    while i < nodes.len() {
+        if nk_of(node_kind(i)) == NodeKind.MethodCall && node_method(i) == method { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no call of '{method}' after '{anchor}'")
+    assert(false)
+    -1
+}
+
+fn src_chan() -> Str {
+    #"fn main() {
+    let ch: Channel[Int] = Channel(4)
+    ch.send(0)
+    let got = ch.recv()
+    let _keep = [got]
+}
+"#
+}
+
+test "a send boxes a word-sized element so a zero never reaches the slot as NULL" {
+    probe("cg_call_chan_send_box", src_chan())
+    let built = lower_expr(call_after("ch", "send"))
+    assert_eq_str("symbol", ir_c_name(built), "blink_channel_send")
+    assert_shape("shape", built, "CallRuntime(VarRef, Box(Const))")
+    assert_verifies("send", built)
+}
+
+test "recv takes the word, panics when it is NULL, then unboxes the element" {
+    probe("cg_call_chan_recv", src_chan())
+    let mark = cg_expr_pending_count()
+    let built = lower_expr(node_value(let_node_of("got")))
+    let pending = cg_expr_take_pending(mark)
+    assert_eq_str("refusals", "{ice_count()}", "0")
+    assert_eq_str("pending", "{pending.len()}", "2")
+    assert_shape("take", pending.get(0).unwrap(), "Let(CallRuntime(VarRef))")
+    assert_shape("guard", pending.get(1).unwrap(), "If(Binary(VarRef, Const), Block(Panic(Const)))")
+    assert_shape("element", built, "Unbox(Cast(VarRef))")
+}
+
+test "the channel take tests the word before it decodes it" {
+    probe("cg_call_chan_take", src_chan())
+    let ch = lower_expr(node_value(let_node_of("ch")))
+    let t = cg_call_channel_take(let_node_of("got"), TYPE_INT, ch)
+    assert_kind("closed", t.closed, IrKind.Binary)
+    assert_shape("closed", t.closed, "Binary(VarRef, Const)")
+    assert_shape("element", t.element, "Unbox(Cast(VarRef))")
+}

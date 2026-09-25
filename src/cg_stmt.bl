@@ -28,7 +28,7 @@ import typecheck.{
 import layout.{
     Position, Slot, SlotForm, LayoutRecord, async_scope_handles_spelling, bind_binder_cell,
     bind_binder_mut, binder_is_celled,
-    binder_scope_pop, binder_scope_push, carrier_member_layout, child_tid, container_slot_spelling,
+    binder_scope_pop, binder_scope_push, carrier_member_layout, child_tid,
     ensure_typedef_for, field_layout_of,
     layout_of, pointer_spelling, tid_holds_tag_member, tid_of_binder,
     tid_of_node, varargs_spelling,
@@ -65,7 +65,7 @@ import cg_eff.{
 import cg_call.{
     AssertKind, ForInIteration, ForInStrategy, cc_assert_family_kind, cc_display_or_placeholder,
     cc_is_ptr_write_stmt, cc_is_skip_call, cc_lower_ptr_write_stmt, cg_call_element_from_runtime,
-    cg_call_element_from_slot, for_in_iteration_of,
+    cg_call_channel_take, for_in_iteration_of,
 }
 import unparse.{unparse_expr}
 
@@ -2132,13 +2132,10 @@ fn lower_for_materialized(node: Int, iter: Int, walk: ForInIteration) -> Int ! D
     ir_block(node, pre)
 }
 
-// `for x in ch { b }`: a Channel has no length to ask for up front, so each turn calls
-// recv_symbol once and stops the moment it answers NULL -- bootstrap/runtime_thread.h's
-// own contract for blink_channel_recv: it blocks until a value is sent or the channel is
-// both empty and closed, and only the latter ever answers the null pointer no sent value
-// can be. The raw answer is read into a local of its own because it is checked before it
-// is decoded: cg_call_element_from_slot's cast chain would turn a null pointer into
-// whatever bit pattern the element's own type reads a zero word as, not into "closed".
+// `for x in ch { b }`: a Channel has no length to ask for up front, so each turn takes one
+// word and stops the moment it is NULL, the runtime's answer for closed and empty. The take,
+// the test and the decode all come from cg_call, where send stores the slot, so the loop
+// never reads a slot in a shape the store did not write.
 fn lower_for_drained(node: Int, iter: Int, walk: ForInIteration) -> Int ! Diag.Report {
     let _ = open_scope()
     let elem = walk.element_tid
@@ -2151,29 +2148,21 @@ fn lower_for_drained(node: Int, iter: Int, walk: ForInIteration) -> Int ! Diag.R
     let src_rec = layout_at(src_tid, Position.Local, iter)
     let src = c_mint_local("iter")
     let src_let = ir_let(src_tid, node, src_rec.c_spelling, src, src_rec.slot_form, lower_value(iter))
-    let cell = container_slot_spelling()
-    let raw = c_mint_local("recv")
-    let raw_let = ir_let(elem, node, cell, raw, SlotForm.InlineWord,
-        ir_call_runtime(elem, node, cell, walk.recv_symbol, SlotForm.InlineWord,
-            [container_ref(node, src_tid, src_rec, src)]))
-    let bool_rec = layout_at(TYPE_BOOL, Position.Local, node)
-    let closed = ir_binary(TYPE_BOOL, node, bool_rec.c_spelling, "==",
-        ir_var_ref(elem, node, cell, raw, SlotForm.InlineWord), ir_const(TYPE_INT, node, cell, "0"))
-    let guard = ir_if(node, closed, ir_block(node, [ir_break(node)]), -1)
-    let read = cg_call_element_from_slot(node, elem, ir_var_ref(elem, node, cell, raw, SlotForm.InlineWord))
-    if read < 0 {
+    let t = cg_call_channel_take(node, elem, container_ref(node, src_tid, src_rec, src))
+    if t.element < 0 {
         close_scope()
         return -1
     }
+    let guard = ir_if(node, t.closed, ir_block(node, [ir_break(node)]), -1)
     let mut binds: List[Int] = []
-    if !bind_for_element(node, elem, rec, read, binds) {
+    if !bind_for_element(node, elem, rec, t.element, binds) {
         close_scope()
         return -1
     }
     let body = lower_block(node_body(node))
     close_scope()
     if body < 0 { return -1 }
-    let mut turn: List[Int] = [raw_let, guard]
+    let mut turn: List[Int] = [t.take, guard]
     let mut i = 0
     while i < binds.len() {
         turn.push(binds.get(i).unwrap())
