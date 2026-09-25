@@ -35,6 +35,7 @@ import typecheck.{
     tc_names_a_type, tc_is_sealed_list_hof, tc_is_list_generic_adapter, is_user_effect_handle_name,
     tc_lookup_node_tid, tc_unclaimed_call_tid, tc_list_rename_help, tc_tid_iter_elem,
     tc_call_decl_node, tc_call_decl_is_fn, tc_call_is_skip_intrinsic, tc_tid_name, tc_mc_obj_is_value,
+    tc_tid_same_type,
     TYPE_INT, TYPE_BOOL, TYPE_STR, TYPE_VOID,
     type_bit_width, TYPE_U8, TYPE_U16, TYPE_U32, TYPE_U64,
 }
@@ -61,7 +62,7 @@ import ir.{
     ir_call_direct, ir_call_runtime, ir_call_closure, ir_call_indirect, ir_cast, ir_unary, ir_unbox, ir_box,
     ir_assign, ir_binary, ir_block, ir_break, ir_carrier_tag, ir_carrier_wrap,
     ir_const, ir_global_ref, ir_if, ir_let, ir_loop, ir_panic, ir_struct_new, ir_var_ref, ir_field_get,
-    ir_field_set, ir_enum_new, ir_container_new, ir_sized_alloc, ir_heap_alloc, ir_select, ir_switch, ir_expr_stmt,
+    ir_field_set, ir_enum_new, ir_container_new, ir_container_spread, ir_sized_alloc, ir_heap_alloc, ir_select, ir_switch, ir_expr_stmt,
 }
 import cg_expr.{
     lower_expr, cg_expr_async_scope_current, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
@@ -451,14 +452,34 @@ pub fn cc_display_or_placeholder(node: Int, tid: Int, value: Int) -> Int ! Diag.
     ir_const(TYPE_STR, node, rec.c_spelling, c_string_literal("<{tc_tid_name(tid)}>"))
 }
 
-// `[..xs, y]` copies every element of `xs` into the container being built. The copy is a
-// runtime call that takes the destination, which no IR node names yet: a ContainerNew
-// kid is written as one appended element, so the destination is not in hand here.
+// `[..xs, y]` copies every element of `xs` into the list being built. The copy moves cells
+// word for word, which is sound only when both lists hold the same element type: then the
+// source cells are already in the form a push would write. Typecheck owns that rule, so a
+// mismatch here is its bug and is reported, not converted.
 pub fn lower_spread(node: Int, into_tid: Int) -> Int ! Diag.Report {
-    diag_ice_at("SpreadCopyNotLowered", CODEGEN_STAGE_NOT_BUILT,
-        "a spread into a {tk_name(cc_kind(into_tid))} has no lowering", node,
-        "the container copy needs an IR node that names the destination it extends")
-    -1
+    let kind = cc_kind(into_tid)
+    if kind != TyKind.List {
+        diag_ice_at("SpreadIntoNonList", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "a spread reached a {tk_name(kind)} literal", node,
+            "only a list literal takes a spread (sections/02_syntax.md 2.16); typecheck should have refused this one")
+        return -1
+    }
+    let shape = cc_slot_shape(node, into_tid, kind, Slot.Inner1)
+    if cc_shape_stopped(shape) { return -1 }
+    let src = node_value(node)
+    let src_tid = tid_of_node(src)
+    if src_tid < 0 { return -1 }
+    if cc_kind(src_tid) != TyKind.List || !tc_tid_same_type(child_tid(src_tid, Slot.Inner1), child_tid(into_tid, Slot.Inner1)) {
+        diag_ice_at("SpreadSourceTypeMismatch", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "a spread source of type {tc_type_str(src_tid)} reached a list of {tc_type_str(into_tid)}", node,
+            "typecheck requires a spread source to be a List of the same element type; this is a compiler bug")
+        return -1
+    }
+    let rec = cc_local(src_tid, node)
+    if cc_stopped(rec) { return -1 }
+    let source = lower_expr(src)
+    if source < 0 { return -1 }
+    ir_container_spread(src_tid, node, rec.c_spelling, c_runtime_helper("list_extend"), source)
 }
 
 // assert/assert_eq/assert_ne/debug_assert are recognised by is_builtin_fn with no
