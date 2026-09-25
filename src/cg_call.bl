@@ -51,7 +51,7 @@ import mono.{instances, instance_for_call}
 import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls, cg_reg_trait_decls, cg_reg_impl_of}
 import cname.{
     c_fn_decl_name, c_impl_method_name, c_impl_method_name_q,
-    c_display_dispatch_name, c_derive_method_name,
+    c_display_dispatch_name, c_derive_method_name, c_derived_method_symbol,
     c_runtime_helper, c_ffi_symbol, c_mint_local, c_string_literal, c_field_name,
     cname_ffi_struct_mirror, c_local_name,
     c_variant_discriminant, c_variant_member_name,
@@ -88,6 +88,10 @@ let trait_display = "Display"
 let trait_eq = "Eq"
 let trait_ord = "Ord"
 let method_eq = "eq"
+let method_cmp = "cmp"
+let ordering_type = "Ordering"
+let ordering_less = "Less"
+let ordering_greater = "Greater"
 let method_get = "get"
 let trait_from = "From"
 
@@ -174,12 +178,7 @@ pub fn lower_operator_method(node: Int, op: Str) -> Int ! Diag.Report {
     if tid < 0 { return -1 }
     let rec = cc_local(tid, node)
     if cc_stopped(rec) { return -1 }
-    if op != "==" && op != "!=" {
-        diag_ice_at("OrderingMethodNotLowered", CODEGEN_STAGE_NOT_BUILT,
-            "operator '{op}' has no ordering method lowering here", node,
-            "an ordering operator desugars to Ord.cmp against an Ordering variant")
-        return -1
-    }
+    if op != "==" && op != "!=" { return cc_ordering_operator(node, op, tid, rec) }
     // The operand's own type, not the Bool the comparison answers: the method belongs to
     // what is being compared.
     let operand = tid_of_node(node_left(node))
@@ -211,11 +210,87 @@ fn cc_equality_symbol(node: Int, decl: Int, recv_tid: Int) -> Str ! Diag.Report 
     let im = cc_impl_for(node, recv_tid, trait_eq)
     if im == IMPL_REFUSED { return "" }
     if im >= 0 { return c_impl_method_name(im, method_eq) }
-    if cc_derives_equality(decl) { return c_derive_method_name(decl, method_eq) }
+    if cc_derives_equality(decl) { return c_derived_method_symbol(recv_tid, method_eq) }
     diag_ice_at("EqualityMethodNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
         "'{node_name(decl)}' has neither a derived nor a written {trait_eq} method", node,
         "typecheck must reject a comparison whose operand carries no equality; this is a compiler bug")
     ""
+}
+
+// `a < b` asks cmp and tests its Ordering against one variant. A non-strict operator holds
+// whenever the strict opposite does not, so it tests that the answer is not that one.
+fn cc_ordering_operator(node: Int, op: Str, tid: Int, rec: LayoutRecord) -> Int ! Diag.Report {
+    let answer = cc_ordering_answer(op)
+    if answer == "" {
+        diag_ice_at("OrderingMethodNotLowered", CODEGEN_STAGE_NOT_BUILT,
+            "operator '{op}' has no ordering method lowering here", node,
+            "an ordering operator desugars to Ord.cmp against an Ordering variant")
+        return -1
+    }
+    let operand = tid_of_node(node_left(node))
+    if operand < 0 { return -1 }
+    let symbol = cc_ordering_symbol(node, operand)
+    if symbol == "" { return -1 }
+    let otid = cc_ordering_tid(node)
+    if otid < 0 { return -1 }
+    let orec = cc_local(otid, node)
+    if cc_stopped(orec) { return -1 }
+    let variant = cc_ordering_variant(node, otid, orec.c_spelling, answer)
+    if variant < 0 { return -1 }
+    let lhs = lower_expr(node_left(node))
+    if lhs < 0 { return -1 }
+    let rhs = lower_expr(node_right(node))
+    if rhs < 0 { return -1 }
+    let cmp = ir_call_direct(otid, node, orec.c_spelling, symbol, orec.slot_form, [lhs, rhs])
+    let test_op = if op == "<=" || op == ">=" { "!=" } else { "==" }
+    ir_binary(tid, node, rec.c_spelling, test_op, cmp, variant)
+}
+
+// The variant a strict operator wants and a non-strict one rules out. "" is an operator
+// that is not an ordering.
+fn cc_ordering_answer(op: Str) -> Str {
+    if op == "<" || op == ">=" { return ordering_less }
+    if op == ">" || op == "<=" { return ordering_greater }
+    ""
+}
+
+// The C function an ordering operator reaches, chosen the way an equality is: a written
+// impl is what the program said, and a derive is the other way to carry one. "" is
+// answered after an internal error is recorded.
+fn cc_ordering_symbol(node: Int, operand: Int) -> Str ! Diag.Report {
+    let decl = tc_tid_decl_node(operand)
+    if decl < 0 {
+        diag_ice_at("OrderingMethodNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "a {tk_name(cc_kind(operand))} operand has no {trait_ord} method", node,
+            "only a declared struct or enum carries Ord; another operand needs its own lowering")
+        return ""
+    }
+    let im = cc_impl_for(node, operand, trait_ord)
+    if im == IMPL_REFUSED { return "" }
+    if im >= 0 { return c_impl_method_name(im, method_cmp) }
+    if decl_has_derive(decl, trait_ord) { return c_derived_method_symbol(operand, method_cmp) }
+    diag_ice_at("OrderingMethodNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "'{node_name(decl)}' has neither a derived nor a written {trait_ord} method", node,
+        "typecheck must reject an ordering whose operand carries no Ord; this is a compiler bug")
+    ""
+}
+
+fn cc_ordering_tid(node: Int) -> Int ! Diag.Report {
+    let tid = lookup_named_type(ordering_type)
+    if tid < 0 {
+        diag_ice_at("OrderingMethodNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "the '{ordering_type}' type an ordering operator tests is not declared", node,
+            "the prelude declares Ordering beside Ord; this is a compiler bug")
+    }
+    tid
+}
+
+fn cc_ordering_variant(node: Int, otid: Int, spelling: Str, name: Str) -> Int ! Diag.Report {
+    let vnode = cc_variant_node(tc_tid_decl_node(otid), name)
+    if vnode < 0 { return cc_variant_not_declared(node, ordering_type, name) }
+    let macro = c_variant_discriminant(otid, vnode)
+    if diag_is_ice_seg(macro) { return cc_variant_tag_unspellable(node, ordering_type, name, macro) }
+    ir_const(otid, node, spelling, macro)
 }
 
 // Ord is the second name that builds an equality method, because an ordering answers
@@ -1709,6 +1784,65 @@ fn cc_lower_enum_to_str(node: Int, obj: Int) -> Int ! Diag.Report {
     cc_temp_ref(node, tid, carrier, held)
 }
 
+fn cc_is_enum_from_str(method: Str) -> Bool {
+    let mut table: Map[Str, Bool] = Map()
+    table.insert("from_str", true)
+    table.get(method) ?? false
+}
+
+// The enum a `from_str` call answers, read off the Option its call is typed as, when that
+// enum is str-backed; otherwise -1. Typecheck types the call only for that shape.
+fn cc_str_backed_from_str_enum(node: Int) -> Int ! Diag.Report {
+    let tid = tid_of_node(node)
+    if tid < 0 || cc_kind(tid) != TyKind.Option { return -1 }
+    let enum_tid = child_tid(tid, Slot.Inner1)
+    if cc_kind(enum_tid) != TyKind.Enum { return -1 }
+    let td = tc_tid_decl_node(enum_tid)
+    if td < 0 || !cc_is_str_backed_enum_decl(td) { return -1 }
+    enum_tid
+}
+
+// `E.from_str(s)` is the inverse of cc_lower_enum_to_str: one string test per variant
+// against the string it was assigned. No test matching leaves the carrier at None.
+fn cc_lower_enum_from_str(node: Int) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 1 { return cc_intrinsic_arity_wrong(node, TyKind.Enum, "from_str", 1, given) }
+    let tid = tid_of_node(node)
+    let enum_tid = cc_str_backed_from_str_enum(node)
+    let carrier = cc_local(tid, node)
+    if cc_stopped(carrier) { return -1 }
+    let member = cc_member_layout(node, tid, Slot.Inner1)
+    if cc_stopped(member) { return -1 }
+    let text_rec = cc_local(TYPE_STR, node)
+    if cc_stopped(text_rec) { return -1 }
+    let bools = cc_local(TYPE_BOOL, node)
+    if cc_stopped(bools) { return -1 }
+    let arg = lower_expr(sublist_get(node_args(node), 0))
+    if arg < 0 { return -1 }
+    let _td = ensure_typedef_for(tid)
+    let text = c_mint_local("ez")
+    cg_expr_push_pending(node, ir_let(TYPE_STR, node, text_rec.c_spelling, text, text_rec.slot_form, arg))
+    let held = c_mint_local("ez")
+    let none = ir_carrier_wrap(tid, node, carrier.c_spelling, "",
+        ir_const(TYPE_INT, node, carrier.c_spelling, "{CARRIER_TAG_NONE}"), -1)
+    cg_expr_push_pending(node, ir_let(tid, node, carrier.c_spelling, held, carrier.slot_form, none))
+    let flds = node_fields(tc_tid_decl_node(enum_tid))
+    let mut i = 0
+    while i < sublist_length(flds) {
+        let v = sublist_get(flds, i)
+        let label = c_variant_discriminant(enum_tid, v)
+        if diag_is_ice_seg(label) { return -1 }
+        let same = ir_call_runtime(TYPE_BOOL, node, bools.c_spelling, c_runtime_helper("str_eq"), bools.slot_form,
+            [cc_temp_ref(node, TYPE_STR, text_rec, text), ir_const(TYPE_STR, node, text_rec.c_spelling, c_string_literal(node_str_val(v)))])
+        let some = ir_carrier_wrap(tid, node, carrier.c_spelling, carrier_value_member,
+            ir_const(TYPE_INT, node, carrier.c_spelling, "{CARRIER_TAG_SOME}"), ir_const(enum_tid, node, member.c_spelling, label))
+        cg_expr_push_pending(node, ir_if(node, same,
+            ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), some)]), -1))
+        i = i + 1
+    }
+    cc_temp_ref(node, tid, carrier, held)
+}
+
 // `p.f.read()` and `p.f.write(v)`. The receiver is the PLACE the field occupies, not a
 // value of the field's type, so the pair is recognised by the SHAPE of the receiver — a
 // field access whose own object points at a declared type — and by no type at all.
@@ -1961,6 +2095,7 @@ fn lower_declared_static_call(node: Int, owner: Str, method: Str) -> Int ! Diag.
         if owning_impl >= 0 { return cc_impl_static_call(node, owning_impl, method) }
         return cc_free_call(node, decl)
     }
+    if cc_is_enum_from_str(method) && cc_str_backed_from_str_enum(node) >= 0 { return cc_lower_enum_from_str(node) }
     let derived = cc_derived_static_symbol(owner, method)
     if derived != "" { return cc_build_call(node, derived, NO_RECEIVER, CallForm.Declared, false) }
     if cc_is_conversion(method) { return cc_conversion_call(node, owner, method) }
@@ -2697,19 +2832,27 @@ fn cc_derived_method_symbol(recv_tid: Int, mname: Str) -> Str {
     if decl < 0 { return "" }
     if mname == "clone" {
         if !decl_has_derive(decl, "Clone") { return "" }
-        return c_derive_method_name(decl, "clone")
+        return c_derived_method_symbol(recv_tid, "clone")
     }
     if mname == "debug" {
         if !decl_has_derive(decl, "Debug") { return "" }
-        return c_derive_method_name(decl, "debug")
+        return c_derived_method_symbol(recv_tid, "debug")
     }
     if mname == "eq" {
         if !cc_derives_equality(decl) { return "" }
-        return c_derive_method_name(decl, "eq")
+        return c_derived_method_symbol(recv_tid, "eq")
     }
     if mname == "to_json" {
         if !decl_has_derive(decl, "Serialize") { return "" }
-        return c_derive_method_name(decl, "to_json")
+        return c_derived_method_symbol(recv_tid, "to_json")
+    }
+    if mname == method_cmp {
+        if !decl_has_derive(decl, trait_ord) { return "" }
+        return c_derived_method_symbol(recv_tid, method_cmp)
+    }
+    if mname == "hash" {
+        if !decl_has_derive(decl, "Hash") { return "" }
+        return c_derived_method_symbol(recv_tid, "hash")
     }
     ""
 }

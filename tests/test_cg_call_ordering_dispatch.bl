@@ -1,0 +1,99 @@
+// Which ordering method `<`, `>`, `<=` and `>=` reach on a struct or enum operand, and
+// what they compare its answer against. C's own operators do not order an aggregate, so the
+// comparison asks the type's cmp and tests the Ordering it answers against one variant.
+
+import std.io
+import lower_test_helpers.{probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies, assert_ice}
+import ir.{IrKind, ir_c_name, ir_kid}
+import cg_call.{lower_operator_method}
+import cg_test_helpers.{cg_probe_begin, cg_probe_front_end_clean}
+
+fn src_ordering() -> Str {
+    #"@derive(Ord)
+type Ranked { x: Int }
+
+@derive(Ord)
+type Box[T] { v: T }
+
+fn main() {
+    let r1 = Ranked { x: 1 }
+    let r2 = Ranked { x: 2 }
+    let lt = r1 < r2
+    let gt = r1 > r2
+    let le = r1 <= r2
+    let ge = r1 >= r2
+    let b1 = Box { v: 1 }
+    let b2 = Box { v: 2 }
+    let boxed_lt = b1 < b2
+    let _keep = [lt, gt, le, ge, boxed_lt]
+}
+"#
+}
+
+fn clean_probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    cg_probe_begin("build/{stem}_probe.bl")
+    let program = probe(stem, src)
+    cg_probe_front_end_clean("the probe source")
+    program
+}
+
+// The comparison bound to `name`, lowered as the expression stage hands it over, checked
+// to test the cmp call against the variant `answer` with the C operator `op`.
+fn assert_ordering(name: Str, op: Str, test_op: Str, answer: Str) ! Diag.Report {
+    let id = lower_operator_method(rhs_of(name), op)
+    assert_kind("kind", id, IrKind.Binary)
+    assert_shape("shape", id, "Binary(CallDirect(VarRef, VarRef), Const)")
+    assert_eq_str("test", ir_c_name(id), test_op)
+    assert_eq_str("symbol", ir_c_name(ir_kid(id, 0)), "blink_Ranked_cmp")
+    // The Ordering declaration's own module prefixes the name, so only its tail is pinned.
+    let got = ir_c_name(ir_kid(id, 1))
+    if !got.ends_with("_Ordering_{answer}") { io.println("FAIL: answer: got '{got}', want Ordering.{answer}") }
+    assert(got.ends_with("_Ordering_{answer}"))
+    assert_verifies("verify", id)
+}
+
+test "a less-than asks the derived cmp whether the answer is Less" {
+    clean_probe("cg_call_ordering", src_ordering())
+    assert_ordering("lt", "<", "==", "Less")
+}
+
+test "a greater-than asks the derived cmp whether the answer is Greater" {
+    clean_probe("cg_call_ordering", src_ordering())
+    assert_ordering("gt", ">", "==", "Greater")
+}
+
+// A non-strict comparison holds whenever the strict opposite does not, so it tests that the
+// answer is not the one variant that would make it false.
+test "a less-or-equal asks the derived cmp whether the answer is anything but Greater" {
+    clean_probe("cg_call_ordering", src_ordering())
+    assert_ordering("le", "<=", "!=", "Greater")
+}
+
+test "a greater-or-equal asks the derived cmp whether the answer is anything but Less" {
+    clean_probe("cg_call_ordering", src_ordering())
+    assert_ordering("ge", ">=", "!=", "Less")
+}
+
+test "an ordering on a generic instance calls that instance's own cmp" {
+    clean_probe("cg_call_ordering", src_ordering())
+    let id = lower_operator_method(rhs_of("boxed_lt"), "<")
+    assert_kind("kind", id, IrKind.Binary)
+    assert_eq_str("symbol", ir_c_name(ir_kid(id, 0)), "blink_Box_0Int_cmp")
+    assert_verifies("verify", id)
+}
+
+// Typecheck refuses an ordering over a type with no cmp, so the lowering is put the question
+// directly: it reports the missing method rather than calling a symbol nothing defines.
+test "an ordering over an operand with no cmp is an internal error, not a call" {
+    clean_probe("cg_call_ordering_none", #"@derive(Eq)
+type Plain { x: Int }
+
+fn main() {
+    let p1 = Plain { x: 1 }
+    let p2 = Plain { x: 2 }
+    let same = p1 == p2
+    let _keep = [same]
+}
+"#)
+    assert_ice("ord", lower_operator_method(rhs_of("same"), "<"), "OrderingMethodNotFound")
+}

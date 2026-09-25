@@ -18,13 +18,14 @@ import layout.{
     Slot, child_tid, carrier_member_layout, layout_take_typedefs,
 }
 import cname.{
-    c_derive_method_name, c_field_name, c_mint_local, c_runtime_helper, c_string_literal,
-    c_tid_derive_method_name, c_tuple_member,
+    c_field_name, c_mint_local, c_runtime_helper, c_string_literal,
+    c_tid_derive_method_name, c_tuple_member, c_derived_method_symbol,
     c_variant_discriminant, c_enum_tag_member, c_enum_payload_member,
     c_global_name, c_variant_member_name,
 }
 import cg_print.{print_fn, print_fn_decl, print_kops_table, print_kops_table_decl, print_typedef_blocks}
 import cg_reg.{cg_reg_tid_for_decl, cg_reg_global_decls, cg_reg_module_of}
+import mono.{instances}
 import cg_call.{
     cg_call_element_from_runtime, cg_call_element_to_slot, cg_call_stdlib_declares,
     cg_call_stdlib_symbol,
@@ -42,7 +43,7 @@ import typecheck.{
     tc_evar_field_slots, tc_evar_name, tc_evfield_name, tc_evfield_tid, tc_resolve,
     tc_lookup_node_tid, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
     tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind, tc_tid_resolved,
-    tc_type_str, tk_name,
+    tc_type_str, tk_name, tc_member_tid_at_instance,
 }
 import parser.{
     node_count, node_name, node_fields, node_source_module, node_type_params, sublist_get,
@@ -84,8 +85,8 @@ pub fn cg_derive_reset() {
     tuple_methods_done = Map()
 }
 
-fn already_written(decl: Int, name: Str) -> Bool {
-    let key = "{decl}|{name}"
+fn already_written(decl: Int, tid: Int, name: Str) -> Bool {
+    let key = "{decl}|{tid}|{name}"
     if written.contains_key(key) != 0 { return true }
     written.insert(key, 1)
     false
@@ -119,17 +120,50 @@ fn derive_walk(decls: List[Int], bodies: Bool) ! Diag.Report {
 
 fn derive_one(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
     let name = node_name(arg)
+    for tid in derive_tids(decl, name, arg) {
+        if !already_written(decl, tid, name) { derive_at(decl, tid, arg, name, bodies) }
+    }
+}
+
+fn derive_at(decl: Int, tid: Int, arg: Int, name: Str, bodies: Bool) ! Diag.Report {
     // Whether the name is one @derive accepts is typecheck's answer, given before any
     // stage of codegen runs. What is left here is the name this stage has not built.
-    if already_written(decl, name) { return }
-    if name == derive_eq { return eq_method(decl, arg, bodies) }
-    if name == derive_ord { return ord_method(decl, arg, bodies) }
-    if name == derive_debug { return debug_method(decl, arg, bodies) }
-    if name == derive_hash { return hash_method(decl, arg, bodies) }
-    if name == derive_clone { return clone_method(decl, arg, bodies) }
-    if name == derive_serialize { return ser_method(decl, arg, bodies) }
-    if name == derive_deserialize { return de_method(decl, arg, bodies) }
+    if name == derive_eq { return eq_method(decl, tid, arg, bodies) }
+    if name == derive_ord { return ord_method(decl, tid, arg, bodies) }
+    if name == derive_debug { return debug_method(decl, tid, arg, bodies) }
+    if name == derive_hash { return hash_method(decl, tid, arg, bodies) }
+    if name == derive_clone { return clone_method(decl, tid, arg, bodies) }
+    if name == derive_serialize { return ser_method(decl, tid, arg, bodies) }
+    if name == derive_deserialize { return de_method(decl, tid, arg, bodies) }
     not_built(arg, "@derive({name})")
+}
+
+// The types one derive writes a body for. A generic declaration is a template with no C
+// shape, so each instance the monomorphization pass registered gets its own body, and an
+// instance nothing reaches gets none. A derived from_json is called on the type, where no
+// receiver names the instance, so a generic Deserialize is handed its declaration to refuse.
+fn derive_tids(decl: Int, name: Str, arg: Int) -> List[Int] ! Diag.Report {
+    if is_generic_decl(decl) && name != derive_deserialize {
+        let mut out: List[Int] = []
+        for inst in instances() {
+            if inst.base_decl_node == decl { out.push(inst.inst_tid) }
+        }
+        return out
+    }
+    let tid = derive_tid(decl, arg)
+    if tid < 0 { return [] }
+    [tid]
+}
+
+fn is_generic_decl(decl: Int) -> Bool {
+    let tparams = node_type_params(decl)
+    tparams != -1 && sublist_length(tparams) > 0
+}
+
+// The variant table is registered against the declaration, so an instance reads the
+// same slots its declaration does and each payload field is read back at the instance.
+fn variant_slots(decl: Int) -> List[Int] {
+    tc_enum_variant_slots(cg_reg_tid_for_decl(decl))
 }
 
 fn has_str(names: List[Str], want: Str) -> Bool {
@@ -200,14 +234,13 @@ fn int_form() -> SlotForm {
 // reader and the method writer ask, because a field is rendered or compared by calling
 // the type's own method, and a call to a method nobody writes is an undefined symbol at
 // link time. The two refusals are facts about the declaration, so every derive shares
-// them: an opaque handle exposes no fields at all, and a generic type has one body per
-// instance rather than one body.
+// them: an opaque handle exposes no fields at all, and a generic Deserialize has no
+// receiver to name the instance its from_json would read.
 fn shape_refusal(decl: Int, tid: Int, derive: Str) -> Str {
     if tid_is_opaque_handle(tid) {
         return "@derive({derive}) on the opaque handle '{node_name(decl)}', which exposes no fields"
     }
-    let tparams = node_type_params(decl)
-    if tparams != -1 && sublist_length(tparams) > 0 {
+    if derive == derive_deserialize && is_generic_decl(decl) {
         return "@derive({derive}) on the generic type '{node_name(decl)}'"
     }
     ""
@@ -294,14 +327,12 @@ fn variant_decl_node(decl: Int, slot: Int, index: Int, span: Int) -> Int ! Diag.
     vnode
 }
 
-fn eq_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
-    let tid = derive_tid(decl, arg)
-    if tid < 0 { return }
+fn eq_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
     if refused(shape_refusal(decl, tid, derive_eq), arg) { return }
     let self_spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), arg)
     let ret = bool_spelling(arg)
     if self_spelling == "" || ret == "" { return }
-    let symbol = c_derive_method_name(decl, "eq")
+    let symbol = c_derived_method_symbol(tid, "eq")
     let params = ["{self_spelling} self", "{self_spelling} other"]
     if !bodies { return print_fn_decl(false, ret, symbol, params, false) }
     let body = eq_body(decl, tid, arg)
@@ -327,7 +358,7 @@ fn eq_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
 fn eq_struct_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
     let mut stmts: List[Int] = []
     for slot in tc_struct_field_slots(tid) {
-        let guard = eq_guard(tid, tc_sfield_tid(slot), c_field_name(tc_sfield_name(slot)), span)
+        let guard = eq_guard(tid, tc_member_tid_at_instance(tc_sfield_tid(slot), tid), c_field_name(tc_sfield_name(slot)), span)
         if guard < 0 { return -1 }
         stmts.push(guard)
     }
@@ -340,7 +371,7 @@ fn eq_struct_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
 // An enum with a payload must agree on the tag before it reads the union: reading a
 // payload through the wrong variant is undefined.
 fn eq_enum_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
-    let slots = tc_enum_variant_slots(tid)
+    let slots = variant_slots(decl)
     if slots.len() == 0 {
         derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
         return -1
@@ -374,7 +405,7 @@ fn eq_variant_block(decl: Int, tid: Int, slot: Int, span: Int) -> Int ! Diag.Rep
     let mut stmts: List[Int] = []
     for f in tc_evar_field_slots(slot) {
         let path = "{c_enum_payload_member()}.{vname}.{c_field_name(tc_evfield_name(f))}"
-        let guard = eq_guard(tid, tc_evfield_tid(f), path, span)
+        let guard = eq_guard(tid, tc_member_tid_at_instance(tc_evfield_tid(f), tid), path, span)
         if guard < 0 { return -1 }
         stmts.push(guard)
     }
@@ -458,7 +489,7 @@ fn eq_nested_differs(ftid: Int, lhs: Int, rhs: Int, bools: Str, path: Str, span:
         not_built(span, "{refusal}, which the field '{path}' would have to call")
         return -1
     }
-    eq_call_differs(c_derive_method_name(fdecl, "eq"), lhs, rhs, bools, span)
+    eq_call_differs(c_derived_method_symbol(ftid, "eq"), lhs, rhs, bools, span)
 }
 
 // Whether two values differ, when a derived method answers whether they are equal.
@@ -585,11 +616,9 @@ fn variant_named(decl: Int, name: Str) -> Int {
 // for it, so one annotation writes both methods. Without the eq an Ord-only type answers
 // `a < b` through cmp and has no `a == b` to call at all. The record of what this pass has
 // written keeps @derive(Eq, Ord) to one eq, in either order.
-fn ord_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
-    let tid = derive_tid(decl, arg)
-    if tid < 0 { return }
+fn ord_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
     if refused(shape_refusal(decl, tid, derive_ord), arg) { return }
-    if !already_written(decl, derive_eq) { eq_method(decl, arg, bodies) }
+    if !already_written(decl, tid, derive_eq) { eq_method(decl, tid, arg, bodies) }
     cmp_method(decl, tid, arg, bodies)
 }
 
@@ -599,7 +628,7 @@ fn cmp_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
     let self_spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), arg)
     let ret = ordering_spelling(otid, arg)
     if self_spelling == "" || ret == "" { return }
-    let symbol = c_derive_method_name(decl, "cmp")
+    let symbol = c_derived_method_symbol(tid, "cmp")
     let params = ["{self_spelling} self", "{self_spelling} other"]
     if !bodies { return print_fn_decl(false, ret, symbol, params, false) }
     let body = cmp_body(decl, tid, arg)
@@ -649,7 +678,7 @@ fn cmp_word_guard(tid: Int, op: Str, answer: Str, span: Int) -> Int ! Diag.Repor
 fn cmp_struct_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
     let mut stmts: List[Int] = []
     for slot in tc_struct_field_slots(tid) {
-        let part = cmp_field(tid, tc_sfield_tid(slot), c_field_name(tc_sfield_name(slot)), span)
+        let part = cmp_field(tid, tc_member_tid_at_instance(tc_sfield_tid(slot), tid), c_field_name(tc_sfield_name(slot)), span)
         if part.len() == 0 { return -1 }
         for s in part { stmts.push(s) }
     }
@@ -663,7 +692,7 @@ fn cmp_struct_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
 // union may be read at all, so comparing payloads across two variants would read one of
 // them through the wrong variant.
 fn cmp_tagged_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
-    let slots = tc_enum_variant_slots(tid)
+    let slots = variant_slots(decl)
     if slots.len() == 0 {
         derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
         return -1
@@ -696,7 +725,7 @@ fn cmp_variant_block(decl: Int, tid: Int, slot: Int, span: Int) -> Int ! Diag.Re
     let mut stmts: List[Int] = []
     for f in tc_evar_field_slots(slot) {
         let path = "{c_enum_payload_member()}.{vname}.{c_field_name(tc_evfield_name(f))}"
-        let part = cmp_field(tid, tc_evfield_tid(f), path, span)
+        let part = cmp_field(tid, tc_member_tid_at_instance(tc_evfield_tid(f), tid), path, span)
         if part.len() == 0 { return -1 }
         for s in part { stmts.push(s) }
     }
@@ -793,7 +822,7 @@ fn cmp_nested_field(owner_tid: Int, ftid: Int, frec: LayoutRecord, path: Str, sp
     if ospelling == "" || bools == "" || equal < 0 || lhs < 0 || rhs < 0 { return [] }
     let form = layout_of(otid, Position.Return).slot_form
     let name = c_mint_local("ord")
-    let call = ir_call_direct(otid, span, ospelling, c_derive_method_name(fdecl, "cmp"), form, [lhs, rhs])
+    let call = ir_call_direct(otid, span, ospelling, c_derived_method_symbol(ftid, "cmp"), form, [lhs, rhs])
     let differs = ir_binary(TYPE_BOOL, span, bools, "!=",
         ir_var_ref(otid, span, ospelling, name, form), equal)
     let answer = ir_return(span, ir_var_ref(otid, span, ospelling, name, form))
@@ -834,14 +863,12 @@ fn str_spelling(node: Int) -> Str ! Diag.Report {
     spelling_or_ice(layout_of(TYPE_STR, Position.Return), "Str", node)
 }
 
-fn debug_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
-    let tid = derive_tid(decl, arg)
-    if tid < 0 { return }
+fn debug_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
     if refused(shape_refusal(decl, tid, derive_debug), arg) { return }
     let self_spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), arg)
     let ret = str_spelling(arg)
     if self_spelling == "" || ret == "" { return }
-    let symbol = c_derive_method_name(decl, "debug")
+    let symbol = c_derived_method_symbol(tid, "debug")
     let params = ["{self_spelling} self"]
     if !bodies { return print_fn_decl(false, ret, symbol, params, false) }
     let body = debug_body(decl, tid, arg)
@@ -927,7 +954,7 @@ fn debug_struct_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
     let mut parts: List[DebugPart] = []
     let mut labels: List[Str] = []
     for slot in tc_struct_field_slots(tid) {
-        let ftid = tc_sfield_tid(slot)
+        let ftid = tc_member_tid_at_instance(tc_sfield_tid(slot), tid)
         let name = tc_sfield_name(slot)
         let value = field_value(tid, ftid, c_field_name(name), "self", derive_debug, span)
         if value < 0 { return -1 }
@@ -944,7 +971,7 @@ fn debug_struct_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
 // An enum with a payload reads its union through the tag, so the tag chooses the variant
 // before any payload is read: reading a payload through the wrong variant is undefined.
 fn debug_tagged_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
-    let slots = tc_enum_variant_slots(tid)
+    let slots = variant_slots(decl)
     if slots.len() == 0 {
         derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
         return -1
@@ -963,7 +990,7 @@ fn debug_variant_block(decl: Int, tid: Int, slot: Int, span: Int) -> Int ! Diag.
     let vname = tc_evar_name(slot)
     let mut parts: List[DebugPart] = []
     for f in tc_evar_field_slots(slot) {
-        let ftid = tc_evfield_tid(f)
+        let ftid = tc_member_tid_at_instance(tc_evfield_tid(f), tid)
         let fname = tc_evfield_name(f)
         let path = "{c_enum_payload_member()}.{vname}.{c_field_name(fname)}"
         let value = field_value(tid, ftid, path, "self", derive_debug, span)
@@ -987,7 +1014,7 @@ fn debug_variant_block(decl: Int, tid: Int, slot: Int, span: Int) -> Int ! Diag.
 // A payload-less enum is a C enum, so its variants are enumerators rather than tag
 // macros and the whole value is the tag.
 fn debug_ordinal_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
-    let slots = tc_enum_variant_slots(tid)
+    let slots = variant_slots(decl)
     if slots.len() == 0 {
         derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
         return -1
@@ -1020,7 +1047,7 @@ fn debug_ordinal_cases(decl: Int, slots: List[Int], spelling: Str, tid: Int, spa
 // A transparent newtype is the bare word its one field holds, so the parameter itself is
 // that field's value and there is no union to read.
 fn debug_newtype_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
-    let slots = tc_enum_variant_slots(tid)
+    let slots = variant_slots(decl)
     if slots.len() != 1 {
         derive_ice(span, "transparent newtype '{node_name(decl)}' has {slots.len()} variants, not one")
         return -1
@@ -1033,7 +1060,7 @@ fn debug_newtype_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
     }
     let value = value_ref(tid, "self", Position.Param, span)
     if value < 0 { return -1 }
-    let part = debug_part(tc_evfield_tid(fields.get(0).unwrap()), value, node_name(decl), span)
+    let part = debug_part(tc_member_tid_at_instance(tc_evfield_tid(fields.get(0).unwrap()), tid), value, node_name(decl), span)
     if !part.ok { return -1 }
     let stmts = debug_stmts(variant_fmt(tc_evar_name(slot), [part]), [part], span)
     if stmts.len() == 0 { return -1 }
@@ -1118,7 +1145,7 @@ fn derived_call_part(ftid: Int, value: Int, path: Str, derive: Str, method: Str,
         not_built(span, "{refusal}, which the field '{path}' would have to call")
         return debug_refused()
     }
-    let arg = ir_call_direct(TYPE_STR, span, spelling, c_derive_method_name(fdecl, method),
+    let arg = ir_call_direct(TYPE_STR, span, spelling, c_derived_method_symbol(ftid, method),
         rec.slot_form, [value])
     DebugPart { spec: spec, arg: arg, pre: [], ok: true }
 }
@@ -1141,16 +1168,14 @@ fn u64_form() -> SlotForm {
     layout_of(TYPE_U64, Position.Return).slot_form
 }
 
-fn hash_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
-    let tid = derive_tid(decl, arg)
-    if tid < 0 { return }
+fn hash_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
     if refused(hash_refusal(decl, tid), arg) { return }
-    if !already_written(decl, derive_eq) { eq_method(decl, arg, bodies) }
+    if !already_written(decl, tid, derive_eq) { eq_method(decl, tid, arg, bodies) }
     let rec = layout_of(tid, Position.Param)
     let self_spelling = spelling_or_ice(rec, node_name(decl), arg)
     let ret = u64_spelling(arg)
     if self_spelling == "" || ret == "" { return }
-    let symbol = c_derive_method_name(decl, "hash")
+    let symbol = c_derived_method_symbol(tid, "hash")
     let params = ["{self_spelling} self"]
     if !bodies {
         print_fn_decl(false, ret, symbol, params, false)
@@ -1159,17 +1184,17 @@ fn hash_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
     let body = hash_body(decl, tid, arg)
     if body < 0 { return }
     print_fn(false, ret, symbol, params, false, body)
-    kops_table(decl, rec, self_spelling)
+    kops_table(tid, rec, self_spelling)
 }
 
 // The adapters take the key by value, so the size and the spelling must be the ones
 // layout gives a parameter, not the ones it gives a container slot. Whether the runtime
 // keeps the key's own bytes in the slot is layout's answer too, never this stage's guess:
 // a guess from the slot form gets a one-field struct wrong and mis-reads every key.
-fn kops_table(decl: Int, rec: LayoutRecord, key_spelling: Str) {
+fn kops_table(tid: Int, rec: LayoutRecord, key_spelling: Str) {
     if rec.kops_table == "" { return }
-    print_kops_table(rec.kops_table, key_spelling, c_derive_method_name(decl, "hash"),
-        c_derive_method_name(decl, "eq"), rec.kops_inline_key)
+    print_kops_table(rec.kops_table, key_spelling, c_derived_method_symbol(tid, "hash"),
+        c_derived_method_symbol(tid, "eq"), rec.kops_inline_key)
 }
 
 // A unit that binds the table needs the symbol, and it may not be the unit that defines
@@ -1394,7 +1419,7 @@ fn hash_struct_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
     let acc = c_mint_local("h")
     let mut stmts = [ir_let(TYPE_U64, span, u64s, acc, u64_form(), init)]
     for slot in tc_struct_field_slots(tid) {
-        let ftid = tc_sfield_tid(slot)
+        let ftid = tc_member_tid_at_instance(tc_sfield_tid(slot), tid)
         let name = tc_sfield_name(slot)
         let value = field_value(tid, ftid, c_field_name(name), "self", derive_hash, span)
         if value < 0 { return -1 }
@@ -1420,7 +1445,7 @@ fn hash_fold(acc: Str, ftid: Int, value: Int, path: Str, span: Int) -> Int ! Dia
 // The tag is folded first, so two variants that carry the same payload still hash
 // differently. Then the tag chooses which payload may be read at all.
 fn hash_tagged_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
-    let slots = tc_enum_variant_slots(tid)
+    let slots = variant_slots(decl)
     if slots.len() == 0 {
         derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
         return -1
@@ -1450,7 +1475,7 @@ fn hash_variant_block(decl: Int, tid: Int, slot: Int, acc: Str, span: Int) -> In
     let vname = tc_evar_name(slot)
     let mut stmts: List[Int] = []
     for f in tc_evar_field_slots(slot) {
-        let ftid = tc_evfield_tid(f)
+        let ftid = tc_member_tid_at_instance(tc_evfield_tid(f), tid)
         let fname = tc_evfield_name(f)
         let path = "{c_enum_payload_member()}.{vname}.{c_field_name(fname)}"
         let value = field_value(tid, ftid, path, "self", derive_hash, span)
@@ -1467,7 +1492,7 @@ fn hash_ordinal_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
     let u64s = u64_spelling(span)
     let value = value_ref(tid, "self", Position.Param, span)
     if u64s == "" || value < 0 { return -1 }
-    if tc_enum_variant_slots(tid).len() == 0 {
+    if variant_slots(decl).len() == 0 {
         derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
         return -1
     }
@@ -1478,7 +1503,7 @@ fn hash_ordinal_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
 // is that field's value. Which hash that word needs is still the field's question: a
 // newtype over a string holds a pointer, and hashing the pointer is not hashing the key.
 fn hash_newtype_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
-    let slots = tc_enum_variant_slots(tid)
+    let slots = variant_slots(decl)
     if slots.len() != 1 {
         derive_ice(span, "transparent newtype '{node_name(decl)}' has {slots.len()} variants, not one")
         return -1
@@ -1490,7 +1515,7 @@ fn hash_newtype_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
     }
     let value = value_ref(tid, "self", Position.Param, span)
     if value < 0 { return -1 }
-    let contribution = hash_contribution(tc_evfield_tid(fields.get(0).unwrap()), value, node_name(decl), span)
+    let contribution = hash_contribution(tc_member_tid_at_instance(tc_evfield_tid(fields.get(0).unwrap()), tid), value, node_name(decl), span)
     if contribution < 0 { return -1 }
     hash_single(contribution, span)
 }
@@ -1552,7 +1577,7 @@ fn hash_nested(ftid: Int, value: Int, path: Str, span: Int) -> Int ! Diag.Report
         not_built(span, "{refusal}, which the field '{path}' would have to call")
         return -1
     }
-    ir_call_direct(TYPE_U64, span, u64s, c_derive_method_name(fdecl, "hash"), u64_form(), [value])
+    ir_call_direct(TYPE_U64, span, u64s, c_derived_method_symbol(ftid, "hash"), u64_form(), [value])
 }
 
 // ── Clone ────────────────────────────────────────────────────────────────
@@ -1565,15 +1590,13 @@ fn hash_nested(ftid: Int, value: Int, path: Str, span: Int) -> Int ! Diag.Report
 // So this is the one derive that reads no field and calls no field type's own derived
 // method. To recurse would deep-copy what the language says two values share, and no test
 // of the copy's contents would show it.
-fn clone_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
-    let tid = derive_tid(decl, arg)
-    if tid < 0 { return }
+fn clone_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
     if refused(shape_refusal(decl, tid, derive_clone), arg) { return }
     let self_spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), arg)
     if self_spelling == "" { return }
     let ret = spelling_or_ice(layout_of(tid, Position.Return), node_name(decl), arg)
     if ret == "" { return }
-    let symbol = c_derive_method_name(decl, "clone")
+    let symbol = c_derived_method_symbol(tid, "clone")
     let params = ["{self_spelling} self"]
     if !bodies { return print_fn_decl(false, ret, symbol, params, false) }
     let body = clone_body(tid, arg)
@@ -1599,14 +1622,12 @@ let de_json_module = "std_json"
 
 // to_json answers the value as JSON text. A product type is one object, a payload-less
 // enum is one string, and a data-carrying variant is an object whose "type" key names it.
-fn ser_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
-    let tid = derive_tid(decl, arg)
-    if tid < 0 { return }
+fn ser_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
     if refused(shape_refusal(decl, tid, derive_serialize), arg) { return }
     let self_spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), arg)
     let ret = str_spelling(arg)
     if self_spelling == "" || ret == "" { return }
-    let symbol = c_derive_method_name(decl, "to_json")
+    let symbol = c_derived_method_symbol(tid, "to_json")
     let params = ["{self_spelling} self"]
     if !bodies { return print_fn_decl(false, ret, symbol, params, false) }
     let body = ser_body(decl, tid, arg)
@@ -1641,7 +1662,7 @@ fn json_variant_name(vnode: Int) -> Str {
 }
 
 fn ser_ordinal_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
-    let slots = tc_enum_variant_slots(tid)
+    let slots = variant_slots(decl)
     if slots.len() == 0 {
         derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
         return -1
@@ -1670,7 +1691,7 @@ fn ser_struct_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
     let mut parts: List[DebugPart] = []
     let mut labels: List[Str] = []
     for slot in tc_struct_field_slots(tid) {
-        let ftid = tc_sfield_tid(slot)
+        let ftid = tc_member_tid_at_instance(tc_sfield_tid(slot), tid)
         let name = tc_sfield_name(slot)
         let value = field_value(tid, ftid, c_field_name(name), "self", derive_serialize, span)
         if value < 0 { return -1 }
@@ -1702,7 +1723,7 @@ fn ser_members(labels: List[Str], parts: List[DebugPart]) -> Str {
 }
 
 fn ser_tagged_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
-    let slots = tc_enum_variant_slots(tid)
+    let slots = variant_slots(decl)
     if slots.len() == 0 {
         derive_ice(span, "enum '{node_name(decl)}' reached cg_derive with no variants")
         return -1
@@ -1723,7 +1744,7 @@ fn ser_variant_block(decl: Int, tid: Int, slot: Int, span: Int) -> Int ! Diag.Re
     let mut parts: List[DebugPart] = []
     let mut labels: List[Str] = []
     for f in tc_evar_field_slots(slot) {
-        let ftid = tc_evfield_tid(f)
+        let ftid = tc_member_tid_at_instance(tc_evfield_tid(f), tid)
         let fname = tc_evfield_name(f)
         let path = "{c_enum_payload_member()}.{vname}.{c_field_name(fname)}"
         let value = field_value(tid, ftid, path, "self", derive_serialize, span)
@@ -1907,9 +1928,7 @@ fn de_refused() -> DeRead {
 // from_json parses the text once and hands the root to from_json_node, which reads one
 // node of the parsed tree. A nested type is read through its own node reader, so its
 // subtree is never written back out and parsed a second time.
-fn de_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
-    let tid = derive_tid(decl, arg)
-    if tid < 0 { return }
+fn de_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
     if refused(shape_refusal(decl, tid, derive_deserialize), arg) { return }
     if !cg_call_stdlib_declares(de_json_module, "json_parse") {
         return not_built(arg, "@derive(Deserialize) on '{node_name(decl)}' without `import std.json`, whose parser from_json calls")
@@ -1917,8 +1936,8 @@ fn de_method(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
     let r = de_reader_of(tid, arg)
     if !r.ok { return }
     let ret = r.carrier.c_spelling
-    let entry = c_derive_method_name(decl, "from_json")
-    let reader = c_derive_method_name(decl, "from_json_node")
+    let entry = c_derived_method_symbol(tid, "from_json")
+    let reader = c_derived_method_symbol(tid, "from_json_node")
     let entry_params = ["{r.strs} input"]
     let reader_params = ["{r.ints} idx"]
     if !bodies {
@@ -2106,7 +2125,7 @@ fn de_read_nested(r: DeReader, ftid: Int, node: Str, what: Str, span: Int) -> De
     if !inner.ok { return de_refused() }
     if spelling_or_ice(okm, "the ok arm of the Result from_json answers", span) == "" { return de_refused() }
     let got = c_mint_local("jn")
-    let call = ir_call_direct(inner.result, span, inner.carrier.c_spelling, c_derive_method_name(fdecl, "from_json_node"),
+    let call = ir_call_direct(inner.result, span, inner.carrier.c_spelling, c_derived_method_symbol(ftid, "from_json_node"),
         inner.carrier.slot_form, [de_int_local(r, node, span)])
     let bind = ir_let(inner.result, span, inner.carrier.c_spelling, got, inner.carrier.slot_form, call)
     let held = ir_var_ref(inner.result, span, inner.carrier.c_spelling, got, inner.carrier.slot_form)
@@ -2213,7 +2232,7 @@ fn de_struct_body(tid: Int, r: DeReader, span: Int) -> Int ! Diag.Report {
     let mut stmts: List[Int] = []
     let mut values: List[Int] = []
     for slot in tc_struct_field_slots(tid) {
-        let m = de_member(r, tid, tc_sfield_tid(slot), tc_sfield_name(slot), span)
+        let m = de_member(r, tid, tc_member_tid_at_instance(tc_sfield_tid(slot), tid), tc_sfield_name(slot), span)
         if !m.ok { return -1 }
         for s in m.pre { stmts.push(s) }
         values.push(m.value)
@@ -2224,7 +2243,7 @@ fn de_struct_body(tid: Int, r: DeReader, span: Int) -> Int ! Diag.Report {
 
 // A payload-less enum is one JSON string, compared against each variant's JSON name.
 fn de_ordinal_body(decl: Int, tid: Int, r: DeReader, span: Int) -> Int ! Diag.Report {
-    let slots = tc_enum_variant_slots(tid)
+    let slots = variant_slots(decl)
     let spelling = spelling_or_ice(layout_of(tid, Position.Local), node_name(decl), span)
     let guard = de_guard(r, "idx", ["JSON_STRING"], "the enum '{node_name(decl)}'", span)
     let text = de_json_str(r, "idx", span)
@@ -2259,7 +2278,7 @@ fn de_names(r: DeReader, local: Str, text: Str, span: Int) -> Int {
 // A data-carrying enum reads its "type" key first: which payload fields exist depends on
 // the variant, so no payload can be read before the variant is known.
 fn de_tagged_body(decl: Int, tid: Int, r: DeReader, span: Int) -> Int ! Diag.Report {
-    let slots = tc_enum_variant_slots(tid)
+    let slots = variant_slots(decl)
     let found = de_json_call(r, "json_get", [de_int_local(r, "idx", span), de_str_const(r, "type", span)], span)
     if found < 0 { return -1 }
     let node = c_mint_local("jt")
@@ -2296,7 +2315,7 @@ fn de_variant_block(tid: Int, slot: Int, vnode: Int, r: DeReader, span: Int) -> 
     let mut stmts: List[Int] = []
     let mut payload: List[Int] = []
     for f in tc_evar_field_slots(slot) {
-        let m = de_member(r, tid, tc_evfield_tid(f), tc_evfield_name(f), span)
+        let m = de_member(r, tid, tc_member_tid_at_instance(tc_evfield_tid(f), tid), tc_evfield_name(f), span)
         if !m.ok { return -1 }
         for s in m.pre { stmts.push(s) }
         payload.push(m.value)
