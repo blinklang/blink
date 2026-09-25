@@ -2604,9 +2604,12 @@ fn variant_count(tid: Int) -> Int {
 // from, so the fix is to hand each caller its own copy rather than the same node twice
 // -- a copy is exactly the same value, and unlike the original it has only the one
 // parent the verifier already expects a plain read to have.
+// A runtime call reaches here only as a list pattern's element read: a pure read of one
+// slot at a constant index, so copying it and its index is as safe as copying a field read.
 fn dup_readable(kind: IrKind) -> Bool {
     kind == IrKind.VarRef || kind == IrKind.GlobalRef || kind == IrKind.FieldGet ||
-        kind == IrKind.Cast || kind == IrKind.CarrierUnwrap || kind == IrKind.Unbox
+        kind == IrKind.Cast || kind == IrKind.CarrierUnwrap || kind == IrKind.Unbox ||
+        kind == IrKind.CallRuntime || kind == IrKind.Const
 }
 
 fn dup_value(id: Int) -> Int {
@@ -2886,6 +2889,7 @@ fn pattern_binds(ctx: MatchCtx, pat: Int, out: List[Int]) -> Bool ! Diag.Report 
         NodeKind.EnumPattern => payload_binds(ctx, pat, out)
         NodeKind.TuplePattern => tuple_pattern_binds(ctx, pat, out)
         NodeKind.StructPattern => struct_pattern_binds(ctx, pat, out)
+        NodeKind.ListPattern => list_pattern_binds(ctx, pat, out)
         _ => true
     }
 }
@@ -3122,6 +3126,32 @@ fn tuple_pattern_binds(ctx: MatchCtx, pat: Int, out: List[Int]) -> Bool ! Diag.R
     true
 }
 
+// A list keeps its elements in runtime slots, so each position is read and decoded the
+// same way an index expression reads one; cg_call owns whether the slot holds a box.
+fn list_pattern_binds(ctx: MatchCtx, pat: Int, out: List[Int]) -> Bool ! Diag.Report {
+    let elems = node_elements(pat)
+    if elems == -1 { return true }
+    let mut i = 0
+    while i < sublist_length(elems) {
+        let sub = sublist_get(elems, i)
+        let tid = stmt_tid(sub)
+        if tid < 0 {
+            if sub_pattern_declares(sub) { return false }
+        } else {
+            let read = list_element_read(ctx, sub, tid, i)
+            if read < 0 { return false }
+            if !bind_slot(ctx, sub, read, out) { return false }
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn list_element_read(ctx: MatchCtx, sub: Int, tid: Int, i: Int) -> Int ! Diag.Report {
+    cg_call_element_from_runtime(sub, tid, c_runtime_helper("list_get"),
+        [scrut_ref(ctx, sub), int_const(sub, "{i}")])
+}
+
 // ── Patterns: tests ───────────────────────────────────────────────────────
 
 // The condition under which an arm runs, or -1 when the arm always runs. Binders are not
@@ -3144,6 +3174,7 @@ fn pattern_test(ctx: MatchCtx, pat: Int) -> Int ! Diag.Report {
     if kind == NodeKind.EnumPattern { return enum_pattern_test(ctx, pat) }
     if kind == NodeKind.TuplePattern { return tuple_pattern_test(ctx, pat) }
     if kind == NodeKind.StructPattern { return struct_pattern_test(ctx, pat) }
+    if kind == NodeKind.ListPattern { return list_pattern_test(ctx, pat) }
     diag_ice_stage_not_built("a match on this pattern shape", pat)
     int_const(pat, "0")
 }
@@ -3277,6 +3308,29 @@ fn field_pattern_test(ctx: MatchCtx, pat: Int, prefix: Str) -> Int ! Diag.Report
                 let read = variant_field_read(ctx, sub, tid, path, held)
                 acc = and_test(sub, acc, slot_test(ctx, sub, tid, held, read))
             }
+        }
+        i = i + 1
+    }
+    acc
+}
+
+// The length test is the left operand, so no element read runs past the end of a
+// shorter list. A trailing `..` accepts any longer list.
+fn list_pattern_test(ctx: MatchCtx, pat: Int) -> Int ! Diag.Report {
+    let elems = node_elements(pat)
+    let n = if elems == -1 { 0 } else { sublist_length(elems) }
+    let op = if node_inclusive(pat) == 1 { ">=" } else { "==" }
+    let len = ir_call_runtime(TYPE_INT, pat, int_spelling(pat), c_runtime_helper("list_len"),
+        int_form(pat), [scrut_ref(ctx, pat)])
+    let mut acc = ir_binary(TYPE_INT, pat, int_spelling(pat), op, len, int_const(pat, "{n}"))
+    let mut i = 0
+    while i < n {
+        let sub = sublist_get(elems, i)
+        let tid = stmt_tid(sub)
+        if tid >= 0 {
+            let read = list_element_read(ctx, sub, tid, i)
+            if read < 0 { return int_const(pat, "0") }
+            acc = and_test(sub, acc, slot_test(ctx, sub, tid, layout_at(tid, Position.Local, sub), read))
         }
         i = i + 1
     }
