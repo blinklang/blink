@@ -1,0 +1,302 @@
+// A handler operation carries its captures in its vtable's userdata word.
+//
+// Each operation the literal writes is built at the literal's site as a closure object: word
+// 0 is the handler the literal was copied from, read when the literal runs, and the words
+// after it are the locals the operation reads. The builder stores that object in the
+// operation's `__userdata_<slot>` member, and a perform passes the member back as the
+// operation's first argument, so the operation reads its captures the way a closure does.
+//
+// Reading the copied-from handler out of the operation's own word, not out of a file-static,
+// is what makes each handler value keep the handler it was built over.
+
+import cname_test_helpers.{find_decl}
+import cg_test_helpers.{cg_probe_compile, cg_text_occurrences}
+import ast.{NodeKind, nk_of}
+import parser.{node_body, node_kind, node_value_child_ids}
+import layout.{SlotForm, bind_binder_mut, binder_scope_pop, binder_scope_push, layout_reset}
+import typecheck.{TYPE_INT, TYPE_STR}
+import ir.{IrKind, ir_const, ir_effect_perform, ir_evidence_vector, ir_field_get, ir_kid, ir_kid_count, ir_kind, ir_reset}
+import cg_reg.{cg_reg_build}
+import cg_expr.{cg_expr_reset}
+import cg_print.{print_effect_vtable_typedef, print_expr, print_reset, print_take}
+import cg_stmt.{cg_stmt_reset, lower_block_returning}
+import cg_eff.{
+    cg_eff_lower_handler_expr, cg_eff_pending_thunks, cg_eff_print_thunk, cg_eff_reset,
+    cg_eff_thunk_body_node, cg_eff_thunk_close, cg_eff_thunk_open,
+}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+
+fn probe_src() -> Str {
+    #"import std.io
+
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str)
+        fn total() -> Int
+    }
+}
+
+fn io_one() -> Handler[IO] {
+    handler IO {
+        fn print(msg: Str) {
+            io.println("[H] {msg}")
+        }
+    }
+}
+
+fn io_capturing() -> Handler[IO] {
+    let tag = "T"
+    handler IO {
+        fn print(msg: Str) {
+            io.println("{tag} {msg}")
+        }
+    }
+}
+
+fn metrics_capturing() -> Handler[Metrics] {
+    let n = 7
+    handler Metrics {
+        fn counter(name: Str) {
+            io.println("[M] {name}")
+        }
+        fn total() -> Int {
+            n
+        }
+    }
+}
+
+fn main() {
+    with io_one() {
+        io.println("a")
+    }
+    with io_capturing() {
+        io.println("b")
+    }
+    with metrics_capturing() {
+        metrics.counter("c")
+    }
+}
+"#
+}
+
+fn ices() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" { n = n + 1 }
+    }
+    n
+}
+
+fn report_ices() {
+    for d in diag_entries {
+        if d.severity == "ice" { io.println("  ICE {d.code} {d.name} {d.message}") }
+    }
+}
+
+fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    diag_reset()
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    cg_expr_reset()
+    cg_eff_reset()
+    print_reset()
+    let path = "build/cg_eff_handler_op_userdata_probe.bl"
+    let program = cg_probe_compile(path, probe_src())
+    let _ = fs.delete(path)
+    cg_reg_build(program)
+    diag_reset()
+}
+
+fn handler_in(fn_name: Str) -> Int {
+    let f = find_decl(NodeKind.FnDef, fn_name, "")
+    assert(f >= 0)
+    let h = find_handler(node_body(f))
+    if h < 0 { io.println("FAIL: no handler literal in {fn_name}") }
+    assert(h >= 0)
+    h
+}
+
+fn find_handler(node: Int) -> Int {
+    if node < 0 { return -1 }
+    if nk_of(node_kind(node)) == NodeKind.HandlerExpr { return node }
+    for kid in node_value_child_ids(node) {
+        let hit = find_handler(kid)
+        if hit >= 0 { return hit }
+    }
+    -1
+}
+
+fn find_perform(id: Int) -> Int {
+    if id < 0 { return -1 }
+    if ir_kind(id) == IrKind.EffectPerform { return id }
+    let mut i = 0
+    while i < ir_kid_count(id) {
+        let hit = find_perform(ir_kid(id, i))
+        if hit >= 0 { return hit }
+        i = i + 1
+    }
+    -1
+}
+
+// The literal lowered inside a frame that binds the locals the enclosing function declares,
+// which is what makes them captures rather than module names.
+fn lower_in_frame(fn_name: Str, names: List[Str], tids: List[Int]) -> Int ! Diag.Report {
+    let outer = binder_scope_push()
+    let mut i = 0
+    while i < names.len() {
+        bind_binder_mut(outer, names.get(i).unwrap(), tids.get(i).unwrap(), false)
+        i = i + 1
+    }
+    let v = cg_eff_lower_handler_expr(handler_in(fn_name))
+    binder_scope_pop()
+    v
+}
+
+fn lower_op_body(i: Int) -> Int ! Diag.Report {
+    let scope = cg_eff_thunk_open(i)
+    if scope < 0 { return -1 }
+    let body = lower_block_returning(cg_eff_thunk_body_node(i))
+    cg_eff_thunk_close()
+    body
+}
+
+// The C text of operation i's definition.
+fn printed_op(i: Int) -> Str ! Diag.Report {
+    let body = lower_op_body(i)
+    assert(body >= 0)
+    print_reset()
+    cg_eff_print_thunk(i, body)
+    print_take()
+}
+
+// Lines that declare a variable at file scope: `static` with no parameter list.
+fn file_scope_variables(text: Str) -> Int {
+    let mut n = 0
+    for line in text.split("\n") {
+        if line.starts_with("static ") && !line.contains("(") { n = n + 1 }
+    }
+    n
+}
+
+test "an operation that reads a local of the enclosing function lowers to a handler value" {
+    setup()
+    let v = lower_in_frame("io_capturing", ["tag"], [TYPE_STR])
+    report_ices()
+    assert_eq(ices(), 0)
+    assert(v >= 0)
+    assert_eq(cg_eff_pending_thunks(), 1)
+}
+
+test "each operation the literal writes is built at the literal's site as a closure object" {
+    setup()
+    let v = lower_in_frame("metrics_capturing", ["n"], [TYPE_INT])
+    report_ices()
+    assert(v >= 0)
+    assert_eq(ir_kid_count(v), 2)
+    assert(ir_kind(ir_kid(v, 0)) == IrKind.ClosureNew)
+    assert(ir_kind(ir_kid(v, 1)) == IrKind.ClosureNew)
+}
+
+test "the builder stores each operation's object in that operation's userdata member" {
+    setup()
+    let v = lower_in_frame("io_capturing", ["tag"], [TYPE_STR])
+    assert(v >= 0)
+    let text = print_take()
+    if cg_text_occurrences(text, "__h->__userdata_print = ") != 1 { io.println("FAIL: builder wrote\n{text}") }
+    assert_eq(cg_text_occurrences(text, "__h->__userdata_print = "), 1)
+    assert_eq(cg_text_occurrences(text, "__h->print = "), 1)
+}
+
+// A file-scope variable holds one handler for every value the literal ever builds, so the
+// second build over another handler redirects the first value's delegation.
+test "the literal's site declares no variable at file scope" {
+    setup()
+    let v = lower_in_frame("io_one", [], [])
+    assert(v >= 0)
+    let text = print_take()
+    if file_scope_variables(text) != 0 { io.println("FAIL: literal site wrote\n{text}") }
+    assert_eq(file_scope_variables(text), 0)
+}
+
+test "an operation takes its userdata word in front of its own parameters" {
+    setup()
+    let v = lower_in_frame("io_one", [], [])
+    assert(v >= 0)
+    let decl = print_take()
+    if cg_text_occurrences(decl, "(void* __self, ") != 1 { io.println("FAIL: declaration\n{decl}") }
+    assert_eq(cg_text_occurrences(decl, "(void* __self, "), 1)
+    let def = printed_op(0)
+    report_ices()
+    if cg_text_occurrences(def, "(void* __self, ") != 1 { io.println("FAIL: definition\n{def}") }
+    assert_eq(cg_text_occurrences(def, "(void* __self, "), 1)
+}
+
+test "an operation with no parameters still takes its userdata word" {
+    setup()
+    let v = lower_in_frame("metrics_capturing", ["n"], [TYPE_INT])
+    assert(v >= 0)
+    let def = printed_op(1)
+    report_ices()
+    assert_eq(ices(), 0)
+    if cg_text_occurrences(def, "(void* __self)") != 1 { io.println("FAIL: definition\n{def}") }
+    assert_eq(cg_text_occurrences(def, "(void* __self)"), 1)
+}
+
+// The handler a perform of the handled root reaches is read out of the operation's own word
+// into a local, so each handler value answers through the handler it was built over.
+test "a perform of the handled root reads the copied-from handler from a local" {
+    setup()
+    let v = lower_in_frame("io_one", [], [])
+    assert(v >= 0)
+    let body = lower_op_body(0)
+    report_ices()
+    assert_eq(ices(), 0)
+    let perform = find_perform(body)
+    assert(perform >= 0)
+    assert(ir_kind(ir_kid(perform, 0)) == IrKind.VarRef)
+}
+
+test "a captured local is read back from the operation's own word, after the handler" {
+    setup()
+    let plain = lower_in_frame("io_one", [], [])
+    assert(plain >= 0)
+    let plain_def = printed_op(0)
+    setup()
+    let v = lower_in_frame("io_capturing", ["tag"], [TYPE_STR])
+    assert(v >= 0)
+    let def = printed_op(0)
+    report_ices()
+    assert_eq(ices(), 0)
+    let reads = cg_text_occurrences(def, "blink_closure_get_capture")
+    if reads != cg_text_occurrences(plain_def, "blink_closure_get_capture") + 1 {
+        io.println("FAIL: capturing operation\n{def}\nplain operation\n{plain_def}")
+    }
+    assert_eq(reads, cg_text_occurrences(plain_def, "blink_closure_get_capture") + 1)
+}
+
+test "a perform passes the handler's userdata word for that slot as its first argument" {
+    ir_reset()
+    print_reset()
+    let ev = ir_evidence_vector(0, "blink_ev*", "__ev", SlotForm.PointerBoxed)
+    let slot = ir_field_get(30, 0, "blink_io_vtable*", "io", SlotForm.PointerBoxed, ev)
+    let msg = ir_const(2, 0, "const char*", "\"hi\"")
+    let say = ir_effect_perform(0, 0, "void", "print", SlotForm.Inline, slot, [msg])
+    assert_eq(print_expr(say), "(__ev->io)->print((__ev->io)->__userdata_print, \"hi\")")
+    let ev2 = ir_evidence_vector(0, "blink_ev*", "__ev", SlotForm.PointerBoxed)
+    let slot2 = ir_field_get(30, 0, "blink_io_vtable*", "io", SlotForm.PointerBoxed, ev2)
+    let bare = ir_effect_perform(0, 0, "const char*", "cwd", SlotForm.InlineWord, slot2, [])
+    assert_eq(print_expr(bare), "(__ev->io)->cwd((__ev->io)->__userdata_cwd)")
+}
+
+test "a vtable slot takes the userdata word in front of the operation's parameters" {
+    print_reset()
+    print_effect_vtable_typedef("", "blink_ue_x_vtable", ["get", "put"], ["int64_t", "void"], [["int64_t a"], []])
+    let c = print_take()
+    if !c.contains("    int64_t (*get)(void* __self, int64_t a);\n    void (*put)(void* __self);") {
+        io.println("FAIL: typedef\n{c}")
+    }
+    assert(c.contains("    int64_t (*get)(void* __self, int64_t a);\n    void (*put)(void* __self);"))
+}

@@ -1,0 +1,73 @@
+// A perform prints its handler twice: once to reach the slot and once to pass the slot's
+// userdata word. So the handler must be a read with no effect of its own, or the C would
+// run it twice. A read off the vector, a global and a local are such reads; a call is not.
+//
+// A local is how an operation body reaches the handler it was copied from, which it reads
+// out of its own userdata word into a local before the body runs.
+
+import std.io
+import ir.{
+    ir_reset, ir_verify, ir_const, ir_var_ref, ir_field_get, ir_effect_perform, ir_evidence_vector,
+    ir_expr_stmt, ir_call_runtime, ir_call_direct,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn assert_valid(label: Str, root: Int) {
+    let errs = ir_verify(root)
+    if errs.len() > 0 { io.println("FAIL: {label}: {errs.join(" | ")}") }
+    assert_eq(errs.len(), 0)
+}
+
+fn assert_rejects(label: Str, root: Int, needle: Str) {
+    let errs = ir_verify(root)
+    let mut hit = 0
+    for e in errs {
+        if e.contains(needle) { hit = 1 }
+    }
+    if hit == 0 { io.println("FAIL: {label}: no message contains '{needle}': {errs.join(" | ")}") }
+    assert_eq(hit, 1)
+}
+
+fn msg() -> Int { ir_const(2, 0, "const char*", "\"hi\"") }
+
+fn perform_through(handler: Int) -> Int {
+    ir_expr_stmt(0, ir_effect_perform(0, 0, "void", "print", SlotForm.Inline, handler, [msg()]))
+}
+
+test "a perform through a local handler verifies" {
+    ir_reset()
+    let outer = ir_var_ref(30, 0, "blink_io_vtable*", "outer", SlotForm.PointerBoxed)
+    assert_valid("handler in a local", perform_through(outer))
+}
+
+test "a local handler must still be held by pointer" {
+    ir_reset()
+    let flat = ir_var_ref(30, 0, "blink_io_vtable", "outer", SlotForm.Inline)
+    assert_rejects("local handler held by value", perform_through(flat), "handler slot must be held by pointer")
+}
+
+test "a perform through a handler a call answers is refused" {
+    ir_reset()
+    let made = ir_call_runtime(30, 0, "blink_io_vtable*", "blink_io_handler", SlotForm.PointerBoxed, [])
+    assert_rejects("handler from a runtime call", perform_through(made), "kid 0")
+    ir_reset()
+    let direct = ir_call_direct(30, 0, "blink_io_vtable*", "main_make", SlotForm.PointerBoxed, [])
+    assert_rejects("handler from a direct call", perform_through(direct), "kid 0")
+}
+
+test "a slot read off a vector a call answers is refused" {
+    ir_reset()
+    let ev = ir_call_runtime(31, 0, "blink_ev*", "blink_ev_current", SlotForm.PointerBoxed, [])
+    let slot = ir_field_get(30, 0, "blink_io_vtable*", "io", SlotForm.PointerBoxed, ev)
+    assert_rejects("vector from a call", perform_through(slot), "kid 0")
+}
+
+test "a slot read off the vector still verifies" {
+    ir_reset()
+    let ev = ir_evidence_vector(0, "blink_ev*", "__ev", SlotForm.PointerBoxed)
+    let slot = ir_field_get(30, 0, "blink_io_vtable*", "io", SlotForm.PointerBoxed, ev)
+    assert_valid("slot of the vector", perform_through(slot))
+}
