@@ -65,7 +65,7 @@ import ir.{
 }
 import cg_expr.{
     lower_expr, cg_expr_async_scope_current, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
-    x_unbox_payload, x_layout_checked,
+    x_unbox_payload, x_layout_checked, lower_value_as_text,
 }
 import cg_stmt.{lower_block_into}
 import cg_eff.{
@@ -1251,9 +1251,6 @@ let ns_async = "async"
 let io_handler_ops: List[Str] = ["println", "print", "eprintln", "eprint", "log"]
 let env_effect_ops: List[Str] = ["var", "cwd", "set_var", "remove_var", "exit"]
 
-// The two io names the spec holds outside the handler system: they write the stream
-// directly and raise no trace.
-let io_raw_ops: List[Str] = ["print_raw", "eprint_raw"]
 
 // The two time names dispatched through the Time vtable's slots, and the one of the two
 // whose arity typecheck does not check (see lower_time_call).
@@ -1479,7 +1476,8 @@ fn lower_ffi_call(node: Int, method: Str) -> Int ! Diag.Report {
 
 fn lower_io_call(node: Int, method: Str) -> Int ! Diag.Report {
     if io_handler_ops.contains(method) { return cg_eff_lower_builtin_perform(node, ns_io, method) }
-    if io_raw_ops.contains(method) { return cc_raw_print(node, method) }
+    let raw_writer = io_raw_writer(method)
+    if raw_writer != "" { return cc_raw_print(node, method, raw_writer) }
     let helper = io_stream_helper(method)
     if helper == "" { return cc_ns_not_built(node, ns_io, method) }
     cc_build_call(node, helper, NO_RECEIVER, CallForm.Runtime, false)
@@ -1531,14 +1529,29 @@ fn lower_time_call(node: Int, method: Str) -> Int ! Diag.Report {
     cc_ns_not_built(node, ns_time, method)
 }
 
-// A raw write. It takes any value the Display trait renders, and the runtime publishes no
-// call that accepts one: the four stream calls above take text or bytes already, and the
-// step that turns a value into text belongs to the seam that lowers an interpolation.
-fn cc_raw_print(node: Int, method: Str) -> Int ! Diag.Report {
-    diag_ice_at("RawPrintNotInRuntime", CODEGEN_STAGE_NOT_BUILT,
-        "'io.{method}' writes a rendered value raw, and the runtime publishes no such call", node,
-        "a raw write needs a runtime call taking text, and the value rendered into it first")
-    -1
+// The two io names the spec holds outside the handler system. Each reaches the runtime's
+// default writer directly, never the vtable slot, so no handler sees it and no trace
+// records it.
+fn io_raw_writer(method: Str) -> Str {
+    let mut table: Map[Str, Str] = Map()
+    table.insert("print_raw", "io_default_print_no_nl")
+    table.insert("eprint_raw", "io_default_eprint_no_nl")
+    table.get(method) ?? ""
+}
+
+// The writer takes text, so the value is rendered first by the seam an interpolation
+// hole uses, and a raw write and a "{x}" of the same value print alike.
+fn cc_raw_print(node: Int, method: Str, writer: Str) -> Int ! Diag.Report {
+    let written = node_args(node)
+    let given = if written == -1 { 0 } else { sublist_length(written) }
+    if given != 1 { return cc_free_arity_wrong(node, "io.{method}", 1, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    let text = lower_value_as_text(sublist_get(written, 0))
+    if text < 0 { return -1 }
+    ir_call_runtime(tid, node, rec.c_spelling, c_runtime_helper(writer), rec.slot_form, [text])
 }
 
 // The runtime exposes the argument count and one reader per index, and no call that

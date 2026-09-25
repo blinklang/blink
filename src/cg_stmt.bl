@@ -1578,39 +1578,44 @@ fn mv_expr(e: Int) -> Bool ! Diag.Report {
 }
 
 // codegen fills a struct literal one declared field at a time, by name, not in the order
-// the literal spelled them — so a field the literal left out runs its default exactly where
-// the type declares that field, which can stand between two fields the literal did write.
-// Only when the literal names every field is nothing synthesized between them; walking the
-// given fields in declaration order is then exactly the order they run in, and this is no
-// different from walking a tuple or a list. A spread or an omitted field leaves a value the
-// walk has not looked at to stand at an unknown point among the rest, so either refuses the
-// whole literal the way an incomplete read of it always has.
+// the literal spelled them. A field the literal omits runs its default at the place the
+// type declares it, so the walk cannot put it among the others and refuses the literal. A
+// spread is bound to a temp before any field is written, and an omitted field then reads
+// that temp, which nothing can write. So the walk takes the source first, then the written
+// fields in declaration order, the order lower_struct_lit runs them in.
 fn mv_struct_lit(e: Int) -> Bool ! Diag.Report {
     let tid = tid_of_node(e)
     if tid < 0 { return mv_moves_work(e) }
     let decl = tc_tid_decl_node(tid)
     if decl < 0 { return mv_moves_work(e) }
     let given = node_fields(e)
-    if mv_struct_lit_has_spread(given) { return mv_moves_work(e) }
+    let sp = mv_struct_lit_spread(given)
+    if sp >= 0 {
+        if !mv_expr(node_value(sp)) { return false }
+    }
     let decls = node_fields(decl)
     let mut i = 0
     while i < sublist_length(decls) {
         let fd = sublist_get(decls, i)
         let g = mv_struct_lit_find(given, node_name(fd))
-        if g < 0 { return mv_moves_work(e) }
-        if !mv_expr(node_value(g)) { return false }
+        if g >= 0 {
+            if !mv_expr(node_value(g)) { return false }
+        } else if sp < 0 {
+            return mv_moves_work(e)
+        }
         i = i + 1
     }
     true
 }
 
-fn mv_struct_lit_has_spread(given: Int) -> Bool {
+fn mv_struct_lit_spread(given: Int) -> Int {
     let mut i = 0
     while i < sublist_length(given) {
-        if nk_of(node_kind(sublist_get(given, i))) == NodeKind.SpreadExpr { return true }
+        let g = sublist_get(given, i)
+        if nk_of(node_kind(g)) == NodeKind.SpreadExpr { return g }
         i = i + 1
     }
-    false
+    -1
 }
 
 fn mv_struct_lit_find(given: Int, name: Str) -> Int {
