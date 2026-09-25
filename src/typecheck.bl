@@ -3578,10 +3578,22 @@ fn tc_infer_arg_tids(args_sl: Int) -> List[Int] ! TypeCheck.Resolve, TypeCheck.R
     if args_sl == -1 { return tids }
     let mut i = 0
     while i < sublist_length(args_sl) {
-        tids.push(infer_type(sublist_get(args_sl, i)))
+        tids.push(tc_infer_unhinted(sublist_get(args_sl, i)))
         i = i + 1
     }
     tids
+}
+
+// An argument's slot is its parameter, so what the call itself is expected to be says
+// nothing about it. Inferring under that hint would type the argument from the call's
+// context, and the call's return pin would never see the argument's own metavariables.
+@allow(UnrestoredMutation)
+fn tc_infer_unhinted(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let saved_hint = tc_construct_hint
+    tc_construct_hint = -1
+    let t = infer_type(node)
+    tc_construct_hint = saved_hint
+    t
 }
 
 // Enforce a call's type-param bounds against the concrete types discovered for it
@@ -4524,7 +4536,7 @@ fn check_arg_shapes_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offset
         }
         // build_typevar_binds aligns by position, so a position with a parameter needs a
         // tid even where the check above had no parameter type to hint it from.
-        if arg_t < 0 && i + self_offset < param_count { arg_t = infer_type(arg_node) }
+        if arg_t < 0 && i + self_offset < param_count { arg_t = tc_infer_unhinted(arg_node) }
         tids.push(arg_t)
         i = i + 1
     }
@@ -15072,14 +15084,14 @@ fn tc_list_elem_contribution(elem: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Re
         // the hint as its own target: unnarrowed, `[x.into()]` under `List[Float]` converts to
         // List[Float] and an arena allocation sizes itself against the list. A spread is the
         // exception below — its source really is a whole list, so its slot is the hint as given.
+        // A hint that is not a List names no element slot, so the element gets none.
         let saved_hint = tc_construct_hint
+        let mut elem_hint = -1
         if tc_construct_hint >= 0 {
             let h = resolve_alias_tid(tc_construct_hint)
-            if type_kind(h) == TyKind.List {
-                let e = tc_tid_child(h, 0)
-                if e >= 0 { tc_construct_hint = e }
-            }
+            if type_kind(h) == TyKind.List { elem_hint = tc_tid_child(h, 0) }
         }
+        tc_construct_hint = elem_hint
         let t = infer_type(elem)
         tc_construct_hint = saved_hint
         return t
