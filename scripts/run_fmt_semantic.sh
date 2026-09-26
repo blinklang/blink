@@ -23,12 +23,20 @@ archive_h="build/libblink_std.h"
 use_archive=0
 [ -f "$archive_a" ] && [ -f "$archive_h" ] && use_archive=1
 
+# blinkc_ok <source> <c output>
 if [ "$use_archive" = 1 ]; then
-  blinkc_ok() { "$blinkc" --link-archive "$archive_h" "$fmt_src" "$fmt_c" 2>/dev/null; }
+  blinkc_ok() { "$blinkc" --link-archive "$archive_h" "$1" "$2" >/dev/null 2>&1; }
 else
-  blinkc_ok() { "$blinkc" "$fmt_src" "$fmt_c" 2>/dev/null; }
+  blinkc_ok() { "$blinkc" "$1" "$2" >/dev/null 2>&1; }
 fi
-if ! blinkc_ok; then
+# A formatted file that no longer compiles is a formatter bug only when the
+# original compiles; otherwise the compiler cannot build this program yet.
+if ! blinkc_ok "$fmt_src" "$fmt_c"; then
+  if blinkc_ok "$f" "$fmt_c"; then
+    rm -f "$fmt_src" "$fmt_c" "$fmt_bin"
+    echo "FAIL (fmt breaks compile) ${name}"
+    exit 1
+  fi
   rm -f "$fmt_src" "$fmt_c" "$fmt_bin"
   echo "SKIP sem_${name}"
   exit 0
