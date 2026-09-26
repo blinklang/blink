@@ -2979,6 +2979,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if routed != "" { return cc_iterator_call(node, obj, routed) }
     if kind == TyKind.List && (cc_names_list_hof(mname) || cc_names_list_generic_adapter(mname)) { return cc_list_hof_call(node, obj, mname) }
     if kind == TyKind.List && cc_is_list_take(mname) { return cc_list_take(node, obj) }
+    if kind == TyKind.Template { return cc_template_method(node, obj, mname) }
     let primitive = cc_runtime_method(kind, mname)
     if primitive != "" { return cc_lower_runtime_method(node, obj, kind, mname, primitive) }
     if kind == TyKind.Channel && cc_is_channel_recv(mname) { return cc_channel_recv(node, obj) }
@@ -3000,11 +3001,10 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let im = cc_impl_with_method(node, recv_tid, mname)
     if im == IMPL_REFUSED { return -1 }
     if im < 0 {
-        // A hand-written impl method (above) always wins. Below that, in the same order
-        // typecheck resolves a struct/enum method call (src/typecheck.bl:16863-16988): the
-        // sealed Display synthesis, a derive-synthesized method, a nominal free function
-        // named by convention after its receiver's declared type, and last a closure-typed
-        // struct field invoked like a method.
+        // A hand-written impl method (above) always wins. Below that, in the same order typecheck
+        // resolves a struct/enum method call (src/typecheck.bl:16863-16988): the sealed Display
+        // synthesis, a derive-synthesized method, a nominal free function named by convention
+        // after its receiver's declared type, and last a closure-typed struct field called as a method.
         if mname == "display" && (kind == TyKind.Struct || kind == TyKind.Enum) { return lower_display_call(obj) }
         if mname == "display" && cc_is_scalar_display_kind(kind) { return cc_scalar_display(node, obj, kind) }
         if mname == "fmt" && cc_is_scalar_display_kind(kind) { return cc_scalar_fmt(node, obj, kind) }
@@ -3332,6 +3332,49 @@ fn cc_runtime_method_arity(op: Str) -> Int {
     table.insert("channel_send", 1)
     table.insert("channel_close", 0)
     table.get(op) ?? NO_ARITY
+}
+
+// What a handler reads a template by. Each result is what typecheck stamped on the call,
+// so layout spells its C type; the runtime entry points take the receiver, then the index.
+fn cc_template_op(method: Str) -> Str {
+    let mut table: Map[Str, Str] = Map()
+    table.insert("parts", "template_parts")
+    table.insert("count", "template_count")
+    table.insert("type_tag", "template_type_tag")
+    table.insert("get_int", "template_get_int")
+    table.insert("get_float", "template_get_float")
+    table.insert("get_bool", "template_get_bool")
+    table.insert("get_str", "template_get_str")
+    table.get(method) ?? ""
+}
+
+fn cc_template_method_arity(op: Str) -> Int {
+    let mut table: Map[Str, Int] = Map()
+    table.insert("template_parts", 0)
+    table.insert("template_count", 0)
+    table.get(op) ?? 1
+}
+
+fn cc_template_method(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
+    let op = cc_template_op(method)
+    if op == "" { return cc_method_not_built(node, TyKind.Template, method) }
+    let want = cc_template_method_arity(op)
+    let written = node_args(node)
+    let given = sublist_length(written)
+    if want != given { return cc_intrinsic_arity_wrong(node, TyKind.Template, method, want, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let result = cc_local(tid, node)
+    if cc_stopped(result) { return -1 }
+    let receiver = lower_expr(obj)
+    if receiver < 0 { return -1 }
+    let mut args = [receiver]
+    if want == 1 {
+        let index = lower_expr(sublist_get(written, 0))
+        if index < 0 { return -1 }
+        args.push(index)
+    }
+    ir_call_runtime(tid, node, result.c_spelling, c_runtime_helper(op), result.slot_form, args)
 }
 
 // The one entry point every receive calls, a direct `ch.recv()` and a for-in drain alike.

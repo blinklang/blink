@@ -667,6 +667,85 @@ BLINK_RT_FN blink_template* blink_template_new(int64_t num_values) {
 }
 #endif
 
+/* Builders: each appends to the template and answers it, so a literal's parts and values
+ * build as one expression. A value keeps its own word; a double is copied bit for bit. */
+BLINK_RT_FN void blink_template_push_value(blink_template* t, void* word, int64_t tag);
+BLINK_RT_FN void* blink_template_value_of(const blink_template* t, int64_t i, int64_t tag, const char* kind);
+BLINK_RT_FN blink_template* blink_template_push_part(blink_template* t, const char* s);
+BLINK_RT_FN blink_template* blink_template_push_int(blink_template* t, int64_t v);
+BLINK_RT_FN blink_template* blink_template_push_float(blink_template* t, double v);
+BLINK_RT_FN blink_template* blink_template_push_bool(blink_template* t, int v);
+BLINK_RT_FN blink_template* blink_template_push_str(blink_template* t, const char* v);
+BLINK_RT_FN blink_list* blink_template_parts(const blink_template* t);
+BLINK_RT_FN int64_t blink_template_count(const blink_template* t);
+BLINK_RT_FN int64_t blink_template_type_tag(const blink_template* t, int64_t i);
+BLINK_RT_FN int64_t blink_template_get_int(const blink_template* t, int64_t i);
+BLINK_RT_FN double blink_template_get_float(const blink_template* t, int64_t i);
+BLINK_RT_FN int blink_template_get_bool(const blink_template* t, int64_t i);
+BLINK_RT_FN const char* blink_template_get_str(const blink_template* t, int64_t i);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_template_push_value(blink_template* t, void* word, int64_t tag) {
+    blink_list_push(t->values, word);
+    blink_list_push(t->types, (void*)(intptr_t)tag);
+}
+BLINK_RT_FN blink_template* blink_template_push_part(blink_template* t, const char* s) {
+    blink_list_push(t->parts, (void*)s);
+    return t;
+}
+BLINK_RT_FN blink_template* blink_template_push_int(blink_template* t, int64_t v) {
+    blink_template_push_value(t, (void*)(intptr_t)v, BLINK_TPL_INT);
+    return t;
+}
+BLINK_RT_FN blink_template* blink_template_push_float(blink_template* t, double v) {
+    void* word = NULL;
+    memcpy(&word, &v, sizeof(double));
+    blink_template_push_value(t, word, BLINK_TPL_FLOAT);
+    return t;
+}
+BLINK_RT_FN blink_template* blink_template_push_bool(blink_template* t, int v) {
+    blink_template_push_value(t, (void*)(intptr_t)(v != 0), BLINK_TPL_BOOL);
+    return t;
+}
+BLINK_RT_FN blink_template* blink_template_push_str(blink_template* t, const char* v) {
+    blink_template_push_value(t, (void*)v, BLINK_TPL_STR);
+    return t;
+}
+BLINK_RT_FN blink_list* blink_template_parts(const blink_template* t) {
+    return t->parts;
+}
+BLINK_RT_FN int64_t blink_template_count(const blink_template* t) {
+    return t->count;
+}
+BLINK_RT_FN int64_t blink_template_type_tag(const blink_template* t, int64_t i) {
+    if (i < 0 || i >= t->count) {
+        __blink_panic_dispatchf("blink: template value index out of bounds: idx=%lld count=%lld", (long long)i, (long long)t->count);
+    }
+    return (int64_t)(intptr_t)blink_list_get(t->types, i);
+}
+/* A getter of the wrong kind would reinterpret the word, so it panics instead. */
+BLINK_RT_FN void* blink_template_value_of(const blink_template* t, int64_t i, int64_t tag, const char* kind) {
+    if (blink_template_type_tag(t, i) != tag) {
+        __blink_panic_dispatchf("blink: template value %lld is not %s", (long long)i, kind);
+    }
+    return blink_list_get(t->values, i);
+}
+BLINK_RT_FN int64_t blink_template_get_int(const blink_template* t, int64_t i) {
+    return (int64_t)(intptr_t)blink_template_value_of(t, i, BLINK_TPL_INT, "an Int");
+}
+BLINK_RT_FN double blink_template_get_float(const blink_template* t, int64_t i) {
+    void* word = blink_template_value_of(t, i, BLINK_TPL_FLOAT, "a Float");
+    double v;
+    memcpy(&v, &word, sizeof(double));
+    return v;
+}
+BLINK_RT_FN int blink_template_get_bool(const blink_template* t, int64_t i) {
+    return (int)(intptr_t)blink_template_value_of(t, i, BLINK_TPL_BOOL, "a Bool");
+}
+BLINK_RT_FN const char* blink_template_get_str(const blink_template* t, int64_t i) {
+    return (const char*)blink_template_value_of(t, i, BLINK_TPL_STR, "a Str");
+}
+#endif
+
 /* ── Hash map (string-keyed) ────────────────────────────────────────── */
 
 BLINK_RT_FN int blink_str_eq(const char* a, const char* b);

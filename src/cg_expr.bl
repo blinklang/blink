@@ -1618,6 +1618,7 @@ fn lower_interp(node: Int) -> Int ! Diag.Report {
     if tid < 0 { return -1 }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
+    if x_kind(tid) == TyKind.Template { return lower_template(node, tid, rec) }
     let parts = node_elements(node)
     if x_all_literal(parts) { return ir_const(tid, node, rec.c_spelling, c_string_literal(x_joined(parts))) }
     lower_interp_call(node, tid, rec, parts)
@@ -1646,6 +1647,147 @@ fn lower_interp_call(node: Int, tid: Int, rec: LayoutRecord, parts: Int) -> Int 
         j = j + 1
     }
     ir_call_runtime(tid, node, rec.c_spelling, c_runtime_helper("str_format"), rec.slot_form, args)
+}
+
+// A literal a Template parameter took. The text between value holes goes to parts and each
+// value keeps its own type, so a handler binds it instead of splicing it. Every builder
+// answers the template, which makes the whole literal one expression.
+fn lower_template(node: Int, tid: Int, rec: LayoutRecord) -> Int ! Diag.Report {
+    let parts = node_elements(node)
+    let n = if parts < 0 { 0 } else { sublist_length(parts) }
+    let word = x_local(TYPE_INT, node)
+    if x_stopped(word) { return -1 }
+    let count = ir_const(TYPE_INT, node, word.c_spelling, "{x_template_value_count(parts, n)}")
+    let mut t = ir_call_runtime(tid, node, rec.c_spelling, c_runtime_helper("template_new"), rec.slot_form, [count])
+    let mut from = 0
+    let mut i = 0
+    while i <= n {
+        if i == n || x_template_takes_value(sublist_get(parts, i)) {
+            let text = x_template_segment(node, parts, from, i)
+            if text < 0 { return -1 }
+            t = x_template_push(node, tid, rec, "template_push_part", t, text)
+            if i < n {
+                let value = x_template_value(sublist_get(parts, i))
+                if value.op == "" { return -1 }
+                t = x_template_push(node, tid, rec, value.op, t, value.arg)
+            }
+            from = i + 1
+        }
+        i = i + 1
+    }
+    t
+}
+
+type TemplateValue {
+    op: Str = ""
+    arg: Int = -1
+}
+
+fn x_template_push(node: Int, tid: Int, rec: LayoutRecord, op: Str, t: Int, arg: Int) -> Int {
+    ir_call_runtime(tid, node, rec.c_spelling, c_runtime_helper(op), rec.slot_form, [t, arg])
+}
+
+// Raw() is not a value: it folds into the text around it, which is the bypass it asks for.
+// A part with no type has already reported; it counts as a value so its lowering stops.
+fn x_template_takes_value(part: Int) -> Bool ! Diag.Report {
+    if interp_part_is_literal(part) { return false }
+    let tid = tid_of_node(part)
+    if tid < 0 { return true }
+    x_kind(tid) != TyKind.Raw
+}
+
+fn x_template_value_count(parts: Int, n: Int) -> Int ! Diag.Report {
+    let mut count = 0
+    let mut i = 0
+    while i < n {
+        if x_template_takes_value(sublist_get(parts, i)) { count = count + 1 }
+        i = i + 1
+    }
+    count
+}
+
+// The text of parts [from, to): literal chunks, and the rendered value of each Raw(x) among
+// them. With no Raw it is a constant; otherwise it is formatted like any interpolation.
+fn x_template_segment(node: Int, parts: Int, from: Int, to: Int) -> Int ! Diag.Report {
+    let text = x_local(TYPE_STR, node)
+    if x_stopped(text) { return -1 }
+    let mut raw = ""
+    let mut fmt = ""
+    let mut args: List[Int] = []
+    let mut i = from
+    while i < to {
+        let part = sublist_get(parts, i)
+        if interp_part_is_literal(part) {
+            raw = raw.concat(node_str_val(part))
+            fmt = fmt.concat(x_pct_escape(node_str_val(part)))
+        } else {
+            let inner = x_raw_inner(part)
+            if inner < 0 { return -1 }
+            let hole = x_interp_hole(inner)
+            if hole.spec == "" { return -1 }
+            fmt = fmt.concat(hole.spec)
+            args.push(hole.arg)
+        }
+        i = i + 1
+    }
+    if args.len() == 0 { return ir_const(TYPE_STR, node, text.c_spelling, c_string_literal(raw)) }
+    let mut call_args = [ir_const(TYPE_STR, node, text.c_spelling, c_string_literal(fmt))]
+    let mut j = 0
+    while j < args.len() {
+        call_args.push(args.get(j).unwrap())
+        j = j + 1
+    }
+    ir_call_runtime(TYPE_STR, node, text.c_spelling, c_runtime_helper("str_format"), text.slot_form, call_args)
+}
+
+// A Raw[T] has no C layout, so only the call written in the literal can fold: its argument
+// is the value. A Raw held in a binding reaches here as a name, which this stage cannot read.
+fn x_raw_inner(part: Int) -> Int ! Diag.Report {
+    let args = if nk_of(node_kind(part)) == NodeKind.Call { node_args(part) } else { -1 }
+    if args >= 0 && sublist_length(args) == 1 { return sublist_get(args, 0) }
+    diag_ice_at("RawBindingNotFolded", CODEGEN_STAGE_NOT_BUILT,
+        "a Raw value held in a binding has no C layout, so this stage cannot fold it into a template", part,
+        "write Raw(value) inside the literal itself")
+    -1
+}
+
+// The runtime carries four value tags. A narrower integer widens to Int, which holds every
+// value it can take; any other kind has no tag, so it stops here rather than read garbage.
+fn x_template_value(part: Int) -> TemplateValue ! Diag.Report {
+    let tid = tid_of_node(part)
+    if tid < 0 { return TemplateValue {} }
+    let k = x_kind(tid)
+    let op = x_template_push_op(k)
+    if op == "" {
+        diag_ice_at("TemplateHoleKindNotBuilt", CODEGEN_STAGE_NOT_BUILT,
+            "a {tk_name(k)} hole has no template value tag", part,
+            "a template carries Int, the narrower integers, Float, Bool and Str values")
+        return TemplateValue {}
+    }
+    let value = lower_expr(part)
+    if value < 0 { return TemplateValue {} }
+    if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Str {
+        return TemplateValue { op: op, arg: value }
+    }
+    let word = x_local(TYPE_INT, part)
+    if x_stopped(word) { return TemplateValue {} }
+    TemplateValue { op: op, arg: ir_cast(TYPE_INT, part, word.c_spelling, value) }
+}
+
+fn x_template_push_op(k: TyKind) -> Str {
+    match k {
+        TyKind.Int => "template_push_int"
+        TyKind.I8 => "template_push_int"
+        TyKind.I16 => "template_push_int"
+        TyKind.I32 => "template_push_int"
+        TyKind.U8 => "template_push_int"
+        TyKind.U16 => "template_push_int"
+        TyKind.U32 => "template_push_int"
+        TyKind.Float => "template_push_float"
+        TyKind.Bool => "template_push_bool"
+        TyKind.Str => "template_push_str"
+        _ => ""
+    }
 }
 
 // Lowers one hole to the conversion the format string needs and the argument that feeds
