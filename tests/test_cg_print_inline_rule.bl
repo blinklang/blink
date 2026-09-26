@@ -1,7 +1,7 @@
 import std.io
 import ir.{
     ir_reset, ir_verify, ir_mark_materialize,
-    ir_const, ir_var_ref, ir_binary, ir_call_direct, ir_let, ir_expr_stmt, ir_return, ir_if, ir_block,
+    ir_const, ir_var_ref, ir_unary, ir_binary, ir_call_direct, ir_let, ir_expr_stmt, ir_return, ir_if, ir_block,
     ir_assign, ir_field_set, ir_field_get,
 }
 import layout.{SlotForm}
@@ -71,7 +71,7 @@ test "temporaries land in the block that consumes them, before the consuming sta
     let c = print_body(ir_block(0, [ir_if(0, cond, inner, -1)]))
     let ls = lines_of(c)
     assert_eq(ls.len(), 4)
-    assert_eq(ls.get(0).unwrap(), "if ((a > 0)) \{")
+    assert_eq(ls.get(0).unwrap(), "if (a > 0) \{")
     assert_eq(ls.get(1).unwrap(), "    int64_t _t0 = main_f();")
     assert_eq(ls.get(2).unwrap(), "    return (_t0 - 1);")
     assert_eq(ls.get(3).unwrap(), "}")
@@ -167,4 +167,40 @@ test "a shared flagged void call runs once across two expression statements" {
     let ls = lines_of(c)
     assert_eq(ls.len(), 1)
     assert_eq(ls.get(0).unwrap(), "main_g();")
+}
+
+fn empty_then() -> Int { ir_block(0, [ir_return(0, int_const("1"))]) }
+
+// clang's -Wparentheses-equality flags `if ((a == b))` as a likely `=` typo, so the if
+// prints its condition's own operator form and adds no second pair.
+test "an if over a comparison prints one paren pair" {
+    ir_reset()
+    let cond = ir_binary(5, 0, "int", "==", int_var("a"), int_const("0"))
+    let ls = lines_of(print_body(ir_block(0, [ir_if(0, cond, empty_then(), -1)])))
+    assert_eq(ls.get(0).unwrap(), "if (a == 0) \{")
+}
+
+test "an if over a negation prints one paren pair" {
+    ir_reset()
+    let cond = ir_unary(5, 0, "int", "!", int_var("a"))
+    let ls = lines_of(print_body(ir_block(0, [ir_if(0, cond, empty_then(), -1)])))
+    assert_eq(ls.get(0).unwrap(), "if (!a) \{")
+}
+
+test "an if over a logical and keeps the parens of its operands" {
+    ir_reset()
+    let l = ir_binary(5, 0, "int", ">", int_var("a"), int_const("0"))
+    let r = ir_binary(5, 0, "int", "<", int_var("b"), int_const("9"))
+    let cond = ir_binary(5, 0, "int", "&&", l, r)
+    let ls = lines_of(print_body(ir_block(0, [ir_if(0, cond, empty_then(), -1)])))
+    assert_eq(ls.get(0).unwrap(), "if ((a > 0) && (b < 9)) \{")
+}
+
+test "an if over a flagged comparison reads its temporary" {
+    ir_reset()
+    let cond = ir_binary(5, 0, "int", "==", int_var("a"), int_const("0"))
+    ir_mark_materialize(cond)
+    let ls = lines_of(print_body(ir_block(0, [ir_if(0, cond, empty_then(), -1)])))
+    assert_eq(ls.get(0).unwrap(), "int _t0 = (a == 0);")
+    assert_eq(ls.get(1).unwrap(), "if (_t0) \{")
 }
