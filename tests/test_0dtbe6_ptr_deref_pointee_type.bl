@@ -1,4 +1,4 @@
-import compile_test_helpers.{compile_and_run}
+import compile_test_helpers.{compile_and_run, expect_compile_error}
 
 // br 0dtbe6 — a pointer's POINTEE travelled through one channel only: the `let` annotation.
 //
@@ -6,8 +6,8 @@ import compile_test_helpers.{compile_and_run}
 //
 //   1. the DECLARATION. `resolve_ptr_inner_c` (codegen_types.bl) reads `cg_let_target_ann`
 //      and nothing else, and maps the name through `ptr_inner_c_type`, whose fallback arm is
-//      `_ => "void"`. So a pointee the map does not list — `Bool` is one — declares as
-//      `void*`, and then even `p.write(true)` is *invalid use of void expression*.
+//      `_ => "void"`. So a pointee the map does not list declares as `void*`, and then even
+//      `p.write(v)` is *invalid use of void expression*.
 //   2. the DEREFERENCE. `Ptr.deref()` in codegen_methods hard-coded `expr_result_type =
 //      CT_INT`, so the RESULT of `*(p)` was an `int64_t` whatever the pointer pointed at.
 //
@@ -69,6 +69,14 @@ test "sized-int pointees still round-trip" {
     }
 }
 
+test "a U16 pointee declares at its own width, not as void" {
+    with ffi.scope() as scope {
+        let p: Ptr[U16] = scope.alloc()
+        p.write(65000)
+        assert_eq("{p.deref()}", "65000")
+    }
+}
+
 test "addr and is_null are unaffected" {
     with ffi.scope() as scope {
         let p: Ptr[Int] = scope.alloc()
@@ -78,16 +86,17 @@ test "addr and is_null are unaffected" {
     }
 }
 
-// ── The two cc escapes ───────────────────────────────────────────────────────────────
+// ── Rows written as sources ─────────────────────────────────────────────────────────────
 //
 // Written as sources rather than as corpus rows because a `void*` declaration makes the whole
 // FILE uncompilable, which would take the rows above down with it.
 
-test "a Bool pointee declares as a bool, not as void" {
+// Bool is not a pointee at all: spec §9 (sections/07_trust_modules_metadata.md:239) lists the
+// FFI-compatible types a Ptr accepts, and Bool is not among them, so typecheck stops it
+// before any declaration is spelled.
+test "a Bool pointee is rejected, because spec §9 lists no Bool pointee" {
     let src = "@trusted(audit: \"0dtbe6-test\")\nfn go() ! FFI \{\n    with ffi.scope() as scope \{\n        let b: Ptr[Bool] = scope.alloc()\n        b.write(true)\n        io.println(\"bool=\{b.deref()}\")\n    }\n}\nfn main() \{ go() }\n"
-    let r = compile_and_run(src, "0dtbe6_bool_pointee")
-    assert_eq(r.exit_code, 0)
-    assert(r.out.contains("bool=true"))
+    expect_compile_error(src, "0dtbe6_bool_pointee", "InvalidPtrType")
 }
 
 test "a struct pointee derefs as the struct, not as an Int" {
