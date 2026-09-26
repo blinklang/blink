@@ -18,7 +18,7 @@ import parser.{
 import typecheck.{
     TyKind, TYPE_INT, TYPE_STR, lookup_named_type, make_ffi_scope_type, make_fn_type, make_handler_type, tc_resolve,
     tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tc_void_tid, tk_name, ty_pool,
-    tc_call_decl_node, tc_call_user_effect,
+    tc_call_decl_node, tc_call_user_effect, tc_decl_ret_tid,
 }
 import layout.{
     BinderMut, LayoutRecord, Position, Slot, SlotForm, async_scope_handles_spelling,
@@ -42,7 +42,7 @@ import cg_print.{
     print_spawn_task_wrapper, print_vtable_slot_fn, print_vtable_slot_fn_decl, vtable_slot_self_spelling,
 }
 import cg_reg.{cg_reg_impl_decls}
-import cg_decl.{cg_decl_ret_tid, cg_decl_takes_ev}
+import cg_decl.{cg_decl_takes_ev}
 import cg_expr.{cg_expr_push_pending, lower_expr, lower_value_as_text}
 import diagnostics.{
     Diag, diag_ice, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg, CODEGEN_STAGE_NOT_BUILT,
@@ -266,7 +266,7 @@ pub fn cg_eff_block_handler_calls(im: Int, tid: Int, node: Int) -> BlockHandlerC
             "the spelling the handler has at the with-item must spell again where the guard declares it")
         return none
     }
-    let context_tid = cg_decl_ret_tid(enter)
+    let context_tid = callee_answer(enter, node)
     if context_tid < 0 { return none }
     let exit_symbol = c_impl_method_name(im, BLOCK_HANDLER_EXIT_METHOD)
     print_resource_guard_support(exit_symbol, rec.c_spelling, true)
@@ -1737,7 +1737,7 @@ pub fn cg_eff_lower_user_perform(node: Int) -> Int ! Diag.Report {
     if rec.c_spelling == "" { return -1 }
     let k = tc_tid_kind(tc_resolve(tid))
     if k != TyKind.Void && k != TyKind.Never {
-        let slot_rec = perform_layout(handler_op_ret_tid(tc_call_decl_node(node)), Position.VtableSlot, node)
+        let slot_rec = perform_layout(callee_answer(tc_call_decl_node(node), node), Position.VtableSlot, node)
         if slot_rec.c_spelling == "" { return -1 }
         if slot_rec.c_spelling != rec.c_spelling {
             diag_ice_at("PerformAnswerDiffersFromSlot", UNSOLVED_TYPEVAR_AT_CODEGEN,
@@ -1771,4 +1771,16 @@ pub fn cg_eff_lower_user_perform(node: Int) -> Int ! Diag.Report {
 // and reaches it before lowering anything; nothing in this body raises.
 pub fn cg_eff_ev_argument(node: Int) -> Int ! Diag.Report {
     ir_evidence_address(node, ev_read(node))
+}
+
+// What a callee declared outside the body being lowered answers, read from its signature.
+// Inside a generic instance the callee's annotation node has no type, because it belongs
+// to no instance.
+fn callee_answer(decl: Int, node: Int) -> Int ! Diag.Report {
+    let tid = tc_decl_ret_tid(decl)
+    if tid >= 0 { return tid }
+    diag_ice_at("CalleeWithoutSignature", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "the callee this call reaches registered no signature", node,
+        "typecheck registers a signature for every declaration a call can reach; this is a compiler bug")
+    -1
 }
