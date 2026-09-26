@@ -6683,7 +6683,9 @@ fn tc_record_impl_recv_tid(im: Int) ! TypeCheck.Resolve, Diag.Report {
     let binders_sl = node_impl_binders(im)
     // The module-resolved name: a namesake type is keyed under its module, not its bare name.
     let name = tc_impl_target_name(im)
-    if impl_binder_declared(binders_sl, written) == 0 && is_primitive_type(written) == 0 && lookup_named_type(name) == -1 {
+    let unbound = impl_binder_declared(binders_sl, written) == 0
+    let reserved = if unbound { tc_report_reserved_unbuilt(written, im) } else { 0 }
+    if reserved == 0 && unbound && is_primitive_type(written) == 0 && lookup_named_type(name) == -1 {
         diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type '{written}' in receiver of impl '{node_trait_name(im)}'", im, "the receiver must be a declared type, a builtin type, or a name declared in 'impl[...]' binders")
     }
     tc_push_tparam_scope(binders_sl)
@@ -9380,6 +9382,10 @@ fn tc_trait_sig_name_declared(name: Str, m: Int) -> Int {
 fn tc_check_trait_sig_ann(ann: Int, trait_name: Str, mname: Str, m: Int) ! Diag.Report {
     if ann == -1 { return }
     let name = node_name(ann)
+    if tc_report_reserved_unbuilt(name, ann) != 0 {
+        tc_trait_sig_poisoned.insert(trait_name, 1)
+        return
+    }
     if name != "" && tc_trait_sig_name_declared(name, m) == 0 {
         tc_trait_sig_poisoned.insert(trait_name, 1)
         diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type '{name}' in method '{mname}' of trait '{trait_name}'", ann,
@@ -9647,7 +9653,9 @@ fn check_impl_type_arg_names(args_sl: Int, binders_sl: Int, trait_name: Str, whe
     let mut i = 0
     while i < sublist_length(args_sl) {
         let arg_name = node_name(sublist_get(args_sl, i))
-        if arg_name != "" && impl_binder_declared(binders_sl, arg_name) == 0 && is_known_type(arg_name) == 0 && is_trait_name(arg_name) == 0 {
+        let unbound = impl_binder_declared(binders_sl, arg_name) == 0
+        let reserved = if unbound { tc_report_reserved_unbuilt(arg_name, im) } else { 0 }
+        if reserved == 0 && arg_name != "" && unbound && is_known_type(arg_name) == 0 && is_trait_name(arg_name) == 0 {
             if where == "receiver" {
                 diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type '{arg_name}' in receiver of impl '{trait_name}'", im, "receiver type arguments must be concrete types or names declared in 'impl[...]' binders")
             } else {
@@ -13405,7 +13413,7 @@ fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
             if ptype_ann != -1 {
                 nr_check_type_ann_visibility(ptype_ann)
             } else {
-                nr_check_type_ref(node_type_name(p))
+                nr_check_type_ref(node_type_name(p), p)
             }
             // A LetBinding below eagerly infers its value's type, and a Call there
             // needs a typed local to see a closure param shadowing a same-named
@@ -13420,7 +13428,7 @@ fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
     } else {
         let ret_str = node_return_type(fn_node)
         if ret_str != "" {
-            nr_check_type_ref(ret_str)
+            nr_check_type_ref(ret_str, fn_node)
         }
     }
     if nr_is_ffi == 0 {
@@ -13438,7 +13446,7 @@ fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
 fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report {
     if ann_node == -1 { return }
     let name = node_name(ann_node)
-    nr_check_type_ref(name)
+    nr_check_type_ref(name, ann_node)
     if name == "Handler" || name == "Template" {
         let elems_sl = node_elements(ann_node)
         if elems_sl != -1 {
@@ -13462,35 +13470,55 @@ fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report 
     }
 }
 
-fn nr_check_type_ref(name: Str) ! TypeCheck.Resolve, Diag.Report {
+// `at` is the node the report points at, or -1 when the caller has none.
+fn nr_check_type_ref(name: Str, at: Int) ! TypeCheck.Resolve, Diag.Report {
     if name == "" { return }
     // A name is a type variable exactly where a generic binder in scope declares it. The
     // spelling carries nothing, so the length of the name is not part of the test.
     // Undeclared, the name is no type at all — fall through to the unknown-type check
     // below instead of passing it unchecked.
     if (tc_active_tparams.get(name) ?? 0) > 0 { return }
+    if tc_report_reserved_unbuilt(name, at) != 0 { return }
     if is_known_type(name) != 0 {
-        if nr_check_selective_access(name, -1) != 0 { return }
+        if nr_check_selective_access(name, at) != 0 { return }
         if is_private_access(name) != 0 {
             tc_errors.push("cannot access private type '{name}'")
-            diag_error_no_loc("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private type '{name}' from another module", "mark the type as 'pub' in its module")
+            nr_error("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private type '{name}' from another module", at, "mark the type as 'pub' in its module")
             return
         }
         tc_mark_symbol_used(name)
         return
     }
     if is_trait_name(name) != 0 {
-        if nr_check_selective_access(name, -1) != 0 { return }
+        if nr_check_selective_access(name, at) != 0 { return }
         if is_private_access(name) != 0 {
             tc_errors.push("cannot access private trait '{name}'")
-            diag_error_no_loc("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private trait '{name}' from another module", "mark the trait as 'pub' in its module")
+            nr_error("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private trait '{name}' from another module", at, "mark the trait as 'pub' in its module")
             return
         }
         tc_mark_symbol_used(name)
         return
     }
     tc_errors.push("unknown type '{name}'")
-    diag_error_no_loc("UnknownType", UNKNOWN_TYPE, "unknown type '{name}'", "")
+    nr_error("UnknownType", UNKNOWN_TYPE, "unknown type '{name}'", at, "")
+}
+
+fn nr_error(name: Str, code: Str, message: Str, at: Int, help: Str) ! Diag.Report {
+    if at == -1 {
+        diag_error_no_loc(name, code, message, help)
+    } else {
+        diag_error_at(name, code, message, at, help)
+    }
+}
+
+// F32 is a built-in the spec names and the compiler does not build yet; F64 is claimed with no
+// spec entry. Both stay reserved, so a user type cannot take them, and the report says so
+// instead of calling them unknown. Lowering has no type for either and would mint a typevar.
+fn tc_report_reserved_unbuilt(name: Str, at: Int) -> Int ! Diag.Report {
+    if name != "F32" && name != "F64" { return 0 }
+    tc_errors.push("reserved type '{name}' is not yet supported")
+    nr_error("UnknownType", UNKNOWN_TYPE, "type '{name}' is reserved but not yet supported", at, "use Float")
+    1
 }
 
 fn is_bytes_growth_method(name: Str) -> Int {
@@ -14144,9 +14172,13 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             while i < sublist_length(params_sl) {
                 let cp = sublist_get(params_sl, i)
                 nr_define_at(node_name(cp), cp)
+                // A closure annotation is a type position like a function's, and a name nothing
+                // declares would otherwise lower to a free type variable.
+                nr_check_type_ann_visibility(node_type_ann(cp))
                 i = i + 1
             }
         }
+        nr_check_type_ann_visibility(node_type_ann(node))
         // Spec §3c.2: a closure body does not inherit the surrounding
         // test-body elaboration. `?` inside the closure must be gated
         // against the closure's own (or enclosing fn's) return type.
@@ -14172,7 +14204,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     tc_mark_qualifier_used(prefix)
                 } else {
                     // Enum.Variant struct-style construction: check the enum type only
-                    nr_check_type_ref(prefix)
+                    nr_check_type_ref(prefix, node)
                 }
             } else {
                 if is_variant_name(type_name) != 0 {
@@ -14185,10 +14217,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                         if suggestion != "" {
                             diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type '{type_name}'", node, "did you mean {suggestion}? construct as {suggestion} \{ ... }")
                         } else {
-                            nr_check_type_ref(type_name)
+                            nr_check_type_ref(type_name, node)
                         }
                     } else {
-                        nr_check_type_ref(type_name)
+                        nr_check_type_ref(type_name, node)
                     }
                 }
             }
@@ -21190,7 +21222,7 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
             if l_ann != -1 {
                 nr_check_type_ann_visibility(l_ann)
             } else if l_type_str != "" {
-                nr_check_type_ref(l_type_str)
+                nr_check_type_ref(l_type_str, l)
             }
             let mut l_tid = TYPE_UNKNOWN
             if l_ann != -1 {
