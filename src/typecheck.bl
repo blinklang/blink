@@ -11,7 +11,7 @@ import parser.{
     node_type_ann, node_type_name, node_type_params, node_value, node_var_name,
     node_impl_binders, node_recv_type_args, node_impl_where_bounds, node_source_module,
     node_set_module, node_set_name, node_supertraits, synth_struct_decl,
-    synth_named_arg, sublist_append,
+    synth_named_arg, sublist_append, sublist_of, node_set_obj, node_set_args,
     node_xfail_reason, node_xfail_ticket, node_value_child_ids,
     sublist_get, sublist_length,
 }
@@ -24,7 +24,7 @@ import diagnostics.{
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
     NON_EXHAUSTIVE_MATCH, DUPLICATE_MODULE_BINDING,
-    UNSOLVED_TYPEVAR_AT_CODEGEN,
+    UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT,
     TYPE_ERROR, TEMPLATE_MISMATCH, MISSING_RETURN, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
     MUTATION_REQUIRES_MUT,
@@ -165,6 +165,16 @@ let mut tc_mc_obj_value_marks: List[Int] = []
 // later re-inference with the scope torn down must not un-mark what it can no
 // longer see.
 let mut tc_name_position_is_value: List[Int] = []
+
+// MethodCall node id -> 1 when inference typed it as a sealed ops trait's qualified call,
+// `StrOps.len(s)`. The build rewrites exactly these into method form, so no later stage
+// reads the qualifier. Presized and monotonic like tc_mc_obj_value_marks.
+let mut tc_sealed_ops_call_marks: List[Int] = []
+
+// The program the rewrite ran on, -1 before it runs, and the calls it rewrote. Both reset
+// with the per-node tables, so a new check starts with no rewrite done.
+let mut tc_sealed_ops_rewrite_program: Int = -1
+let mut tc_sealed_ops_rewritten: Map[Int, Int] = Map()
 
 // Call node → the metavars minted for that call's RETURN-ONLY type params.
 // Presized to node_count() with -1 in init_types, exactly like tc_node_tid, so a
@@ -4401,6 +4411,7 @@ fn tc_grow_node_tables() {
         tc_ret_mint_start.push(-1)
         tc_mc_obj_value_marks.push(0)
         tc_name_position_is_value.push(0)
+        tc_sealed_ops_call_marks.push(0)
     }
 }
 
@@ -10100,12 +10111,16 @@ fn init_types() ! TypeCheck.Register {
     tc_ret_mint_start.clear()
     tc_mc_obj_value_marks.clear()
     tc_name_position_is_value.clear()
+    tc_sealed_ops_call_marks.clear()
+    tc_sealed_ops_rewrite_program = -1
+    tc_sealed_ops_rewritten.clear()
     let mut nti = 0
     while nti < node_count() {
         tc_node_tid.push(-1)
         tc_ret_mint_start.push(-1)
         tc_mc_obj_value_marks.push(0)
         tc_name_position_is_value.push(0)
+        tc_sealed_ops_call_marks.push(0)
         nti = nti + 1
     }
     tc_ret_mint_tids.clear()
@@ -15526,6 +15541,75 @@ pub fn tc_mc_obj_is_value(node: Int) -> Int {
     tc_mc_obj_value_marks.get(node).unwrap()
 }
 
+// Rewrite each sealed ops qualified call into the method call it means: `StrOps.len(s)`
+// becomes `s.len()`, so mono and codegen see one shape. Only the build runs this, after
+// typecheck and before mono; check, fmt, doc and query keep the program as written.
+pub fn desugar_sealed_ops_calls(program: Int) ! Diag.Report {
+    if tc_sealed_ops_rewrite_program != -1 {
+        diag_ice_at("SealedOpsRewriteRepeated", SEALED_OPS_REWRITE_INVARIANT,
+            "the sealed ops call rewrite ran a second time on one program", program,
+            "each build runs the rewrite once, between typecheck and mono; a second run would take the next argument as the receiver")
+        return
+    }
+    tc_sealed_ops_rewrite_program = program
+    let mut n = 0
+    while n < tc_sealed_ops_call_marks.len() {
+        if tc_sealed_ops_call_marks.get(n).unwrap() != 0 { tc_rewrite_sealed_ops_call(n) }
+        n = n + 1
+    }
+}
+
+// The node keeps its id and span, so its tid stamp and every diagnostic keyed on it stay
+// valid. The receiver was already typed as argument 0; the marks tell later readers that
+// the object slot now holds a value, not an item name.
+fn tc_rewrite_sealed_ops_call(node: Int) ! Diag.Report {
+    if tc_sealed_ops_rewritten.contains_key(node) {
+        diag_ice_at("SealedOpsCallRewrittenTwice", SEALED_OPS_REWRITE_INVARIANT,
+            "a sealed ops call was rewritten a second time", node,
+            "a second rewrite would take the next argument as the receiver")
+        return
+    }
+    // A recorded declaration would be the trait's, and mono and codegen would read it as
+    // the callee of the method call this becomes.
+    if tc_call_decl_node(node) != -1 {
+        diag_ice_at("SealedOpsCallHasDeclaration", SEALED_OPS_REWRITE_INVARIANT,
+            "a sealed ops call has a recorded declaration", node,
+            "a sealed ops trait has no source impl, so its qualified call resolves to no declaration")
+        return
+    }
+    let args = node_args(node)
+    let recv = sublist_get(args, 0)
+    let mut rest: List[Int] = []
+    let mut i = 1
+    while i < sublist_length(args) {
+        rest.push(sublist_get(args, i))
+        i = i + 1
+    }
+    node_set_obj(node, recv)
+    node_set_args(node, sublist_of(rest))
+    tc_mc_obj_value_marks.set(node, 1)
+    if node_kind(recv) == NodeKind.Ident && recv < tc_name_position_is_value.len() {
+        tc_name_position_is_value.set(recv, 1)
+    }
+    tc_sealed_ops_rewritten.insert(node, 1)
+}
+
+// Mono reads a qualified call as a trait call, so one that reaches it unrewritten means a
+// build path skipped the rewrite. Asked at mono's entry, which every build path reaches.
+pub fn require_sealed_ops_rewritten(program: Int) ! Diag.Report {
+    if tc_sealed_ops_rewrite_program != -1 { return }
+    let mut n = 0
+    while n < tc_sealed_ops_call_marks.len() {
+        if tc_sealed_ops_call_marks.get(n).unwrap() != 0 {
+            diag_ice_at("SealedOpsCallNotRewritten", SEALED_OPS_REWRITE_INVARIANT,
+                "a sealed ops qualified call reached mono without the rewrite to method form", n,
+                "every build path runs desugar_sealed_ops_calls between typecheck and mono")
+            return
+        }
+        n = n + 1
+    }
+}
+
 // Publish a tid for a node that is a DECLARATION rather than an expression, so codegen can read
 // it from the same memo it reads every inferred type from.
 //
@@ -17429,7 +17513,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // remaining arguments are swept by infer_type once this answer returns.
                     let ops_recv = tc_resolve(infer_type(sublist_get(ops_args, 0)))
                     let ops_ret = tc_ops_trait_qualified_ret(method, ops_recv, node)
-                    if ops_ret != -1 { return ops_ret }
+                    if ops_ret != -1 {
+                        if node < tc_sealed_ops_call_marks.len() { tc_sealed_ops_call_marks.set(node, 1) }
+                        return ops_ret
+                    }
                     let ops_refused = tc_ops_trait_qualified_unresolved(method, ops_recv, node)
                     if ops_refused != -1 { return ops_refused }
                 }
