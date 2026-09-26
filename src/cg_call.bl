@@ -376,7 +376,7 @@ fn cc_scalar_display_via_stdlib(node: Int, obj: Int, name: Str, kind: TyKind) ->
     if decl < 0 { return cc_intrinsic_undeclared(node, kind, "display", "std_num", name) }
     let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
     if symbol == "" { return -1 }
-    cc_build_call(node, symbol, obj, CallForm.Declared, cg_decl_takes_ev(decl))
+    cc_build_declared_call(node, symbol, obj, decl)
 }
 
 // A Bool hole becomes a Str temp an `if` fills, the same way `cg_expr.bl`'s own interpolation
@@ -1289,7 +1289,83 @@ fn cc_declared_call(node: Int, decl: Int, recv: Int) -> Int ! Diag.Report {
     if decl < 0 { return -1 }
     let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
     if symbol == "" { return -1 }
-    cc_build_call(node, symbol, recv, CallForm.Declared, cg_decl_takes_ev(decl))
+    cc_build_declared_call(node, symbol, recv, decl)
+}
+
+// A call of a declaration a Blink source wrote, so its keyword arguments bind by label to
+// the parameters `decl` declares rather than by where the call writes them.
+fn cc_build_declared_call(node: Int, symbol: Str, recv: Int, decl: Int) -> Int ! Diag.Report {
+    let lead = if recv == NO_RECEIVER { 0 } else { 1 }
+    match cc_args_in_param_order(node, decl, lead) {
+        Some(operands) => cc_build_call_of(node, symbol, recv, CallForm.Declared, cg_decl_takes_ev(decl), operands)
+        None => -1
+    }
+}
+
+fn cc_written_args(node: Int) -> List[Int] {
+    let written = node_args(node)
+    let mut out: List[Int] = []
+    if written == -1 { return out }
+    let mut i = 0
+    while i < sublist_length(written) {
+        out.push(sublist_get(written, i))
+        i = i + 1
+    }
+    out
+}
+
+// Typecheck has checked every label and appended a default for each keyword parameter the
+// call left out, so each parameter after the `lead` receiver slots takes exactly one
+// argument.
+fn cc_args_in_param_order(node: Int, decl: Int, lead: Int) -> Option[List[Int]] ! Diag.Report {
+    let written = cc_written_args(node)
+    let params = node_params(decl)
+    let mut slots: List[Int] = []
+    let mut p = lead
+    while p < sublist_length(params) {
+        slots.push(-1)
+        p = p + 1
+    }
+    let mut i = 0
+    while i < written.len() {
+        let arg = written.get(i).unwrap()
+        let mut slot = i
+        let mut value = arg
+        if nk_of(node_kind(arg)) == NodeKind.NamedArg {
+            slot = cc_param_slot_named(params, lead, node_name(arg))
+            value = node_value(arg)
+        }
+        if slot < 0 || slot >= slots.len() || slots.get(slot).unwrap() != -1 {
+            cc_keyword_arg_unbound(node_name(decl), arg)
+            return None
+        }
+        slots.set(slot, value)
+        i = i + 1
+    }
+    let mut k = 0
+    while k < slots.len() {
+        if slots.get(k).unwrap() == -1 {
+            let _ = cc_free_arity_wrong(node, node_name(decl), slots.len(), written.len())
+            return None
+        }
+        k = k + 1
+    }
+    Some(slots)
+}
+
+fn cc_param_slot_named(params: Int, lead: Int, name: Str) -> Int {
+    let mut p = lead
+    while p < sublist_length(params) {
+        if node_name(sublist_get(params, p)) == name { return p - lead }
+        p = p + 1
+    }
+    -1
+}
+
+fn cc_keyword_arg_unbound(callee: Str, arg: Int) ! Diag.Report {
+    diag_ice_at("KeywordArgUnbound", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "an argument of this call to '{callee}' fills no parameter, or one another argument already fills", arg,
+        "typecheck binds every argument to one parameter before codegen reads it; this is a compiler bug")
 }
 
 // The name the declaration was written under. An import may rename what it brings in, and
@@ -2492,7 +2568,7 @@ fn cc_impl_static_call(node: Int, im: Int, method: Str) -> Int ! Diag.Report {
     if decl < 0 { return -1 }
     let symbol = cc_call_symbol(node, decl, c_impl_method_name(im, method))
     if symbol == "" { return -1 }
-    cc_build_call(node, symbol, NO_RECEIVER, CallForm.Declared, cg_decl_takes_ev(decl))
+    cc_build_declared_call(node, symbol, NO_RECEIVER, decl)
 }
 
 // The runtime call a builtin type's constructor reaches. An empty answer means the pair
@@ -3029,7 +3105,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if method < 0 { return -1 }
     let symbol = cc_call_symbol(node, method, c_impl_method_name(im, node_method(node)))
     if symbol == "" { return -1 }
-    cc_build_call(node, symbol, obj, CallForm.Declared, cg_decl_takes_ev(method))
+    cc_build_declared_call(node, symbol, obj, method)
 }
 
 // An Int's `into` casts only when the type it is converted to is one the cast reaches, and
@@ -3125,7 +3201,7 @@ fn cc_call_nominal_decl(node: Int, obj: Int, kind: TyKind, mname: Str, decl: Int
     if want != given { return cc_intrinsic_arity_wrong(node, kind, mname, want, given) }
     let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
     if symbol == "" { return -1 }
-    cc_build_call(node, symbol, obj, CallForm.Declared, cg_decl_takes_ev(decl))
+    cc_build_declared_call(node, symbol, obj, decl)
 }
 
 // Instant.elapsed and Instant.to_rfc3339 are the two Instant/Duration methods with no
@@ -3250,7 +3326,7 @@ fn lower_intrinsic_method(node: Int, obj: Int, kind: TyKind, method: Str, row: S
     if want != given { return cc_intrinsic_arity_wrong(node, kind, method, want, given) }
     let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
     if symbol == "" { return -1 }
-    cc_build_call(node, symbol, obj, CallForm.Declared, cg_decl_takes_ev(decl))
+    cc_build_declared_call(node, symbol, obj, decl)
 }
 
 // ── Element stores ────────────────────────────────────────────────────────
@@ -5297,6 +5373,12 @@ fn cc_method_of(im: Int, mname: Str) -> Int ! Diag.Report {
 // it resolved. A runtime helper is a C function no Blink source declares a row for and
 // never takes the vector.
 fn cc_build_call(node: Int, symbol: Str, recv: Int, form: CallForm, takes_ev: Bool) -> Int ! Diag.Report {
+    cc_build_call_of(node, symbol, recv, form, takes_ev, cc_written_args(node))
+}
+
+// `operands` are the argument nodes after the receiver, in the order the callee declares
+// its parameters, which is the order C passes them in.
+fn cc_build_call_of(node: Int, symbol: Str, recv: Int, form: CallForm, takes_ev: Bool, operands: List[Int]) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = cc_local(tid, node)
@@ -5315,10 +5397,9 @@ fn cc_build_call(node: Int, symbol: Str, recv: Int, form: CallForm, takes_ev: Bo
         if receiver < 0 { return -1 }
         args.push(receiver)
     }
-    let written = node_args(node)
     let mut i = 0
-    while i < sublist_length(written) {
-        let a = lower_expr(sublist_get(written, i))
+    while i < operands.len() {
+        let a = lower_expr(operands.get(i).unwrap())
         if a < 0 { return -1 }
         args.push(a)
         i = i + 1
