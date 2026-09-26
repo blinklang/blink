@@ -2459,6 +2459,17 @@ BLINK_RT_FN const char* blink_get_arg(int64_t index) {
 }
 #endif
 
+BLINK_RT_FN blink_list* blink_env_args(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_list* blink_env_args(void) {
+    blink_list* args = blink_list_new();
+    for (int i = 0; i < blink_g_argc; i++) {
+        blink_list_push(args, (void*)blink_g_argv[i]);
+    }
+    return args;
+}
+#endif
+
 BLINK_RT_FN int64_t blink_file_exists(const char* path);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_file_exists(const char* path) {
