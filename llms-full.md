@@ -665,7 +665,7 @@ let first_two = names
 | `StringBuilder.new()` | StringBuilder | Create empty builder |
 | `StringBuilder.with_capacity(n)` | StringBuilder | Create with pre-allocated capacity |
 | `.write(s)` | Void | Append string |
-| `.write_char(ch)` | Void | Append single character (`ch` may be a `Str` or a `Char`) |
+| `.write_char(ch)` | Void | Append one `Char` |
 | `.write_int(n)` | Void | Append integer as string |
 | `.write_float(f)` | Void | Append float as string |
 | `.write_bool(b)` | Void | Append bool as string |

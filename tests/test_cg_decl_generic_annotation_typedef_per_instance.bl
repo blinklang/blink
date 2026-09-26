@@ -1,0 +1,64 @@
+// A let annotated `Box[T]` inside a generic function carries the type parameter itself,
+// so its tid is an instance whose argument is still open. Only the instances the function
+// is called at have a C shape: the open one must never reach a typedef, and neither may
+// the bare template. Called at Int and Str, the unit has exactly those two Box typedefs.
+
+import std.fs
+import std.io
+import layout.{layout_reset}
+import mono.{run_mono}
+import cname.{cname_reset}
+import cg_print.{print_reset}
+import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_decl.{cg_decl_reset}
+import cg.{CgConfig, generate}
+import cg_test_helpers.{cg_probe_compile, cg_ice_count, cg_report_ices, cg_text_occurrences}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+fn probe_src() -> Str {
+    #"type Box[T] { value: T }
+fn keep[T](v: T) -> T {
+    let b: Box[T] = Box { value: v }
+    b.value
+}
+fn main() {
+    assert(keep(3) == 3)
+    assert(keep("s") == "s")
+}
+"#
+}
+
+fn standalone_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+// The probe is deleted BEFORE any assertion so a red row never leaves the file behind.
+fn unit_text() -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Codegen {
+    let path = "build/cg_decl_generic_annotation_typedef_probe.bl"
+    let program = cg_probe_compile(path, probe_src())
+    let _ = fs.delete(path)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    generate(program, standalone_cfg())
+}
+
+test "a typevar annotation in a generic body types each instance and no open one" {
+    let text = unit_text()
+    cg_report_ices("generate")
+    assert_eq_int("ICEs while generating the unit", cg_ice_count(), 0)
+    assert_eq_int("one Box[Int] typedef", cg_text_occurrences(text, "} blink_Box_0Int;"), 1)
+    assert_eq_int("one Box[Str] typedef", cg_text_occurrences(text, "} blink_Box_0Str;"), 1)
+    assert_eq_int("Box typedefs of any spelling", cg_text_occurrences(text, "} blink_Box"), 2)
+}
