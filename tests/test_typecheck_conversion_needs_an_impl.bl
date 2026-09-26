@@ -1,0 +1,112 @@
+// Section 3c.2 makes From the one conversion trait: `.into()` and `T.from(x)` need an
+// `impl From[S] for T`, and `T.try_from(x)` needs `impl TryFrom[S] for T`. Typecheck took
+// any source there, so a missing impl reached codegen as an internal error. It is E0312
+// now. The impl is found by the source type, so an alias source finds the impl written
+// over it, and every type converts to itself.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn messages_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.code} {d.message}\n") }
+    }
+    out
+}
+
+fn reported_for(name: Str, decls: Str, body: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let src = "{decls}\nfn main() \{\n{body}\n}\n"
+    let _ = probe("build/tc_conversion_{name}.bl", src)
+    let got = messages_reported()
+    io.println("{name}: {got}")
+    got
+}
+
+fn refusal(trait_name: Str, source: Str, target: Str) -> Str {
+    "E0312 {source} does not convert to {target}: there is no `impl {trait_name}[{source}] for {target}`\n"
+}
+
+let celsius_decls = "type MCel \{\n    deg: Int\n}\n\nimpl From[Int] for MCel \{\n    fn from(v: Int) -> MCel \{ MCel \{ deg: v } }\n}\n"
+
+let alias_decls = "type Meters = Int\n\ntype Bag \{\n    n: Int\n}\n\nimpl From[Meters] for Bag \{\n    fn from(m: Meters) -> Bag \{ Bag \{ n: m } }\n}\n"
+
+test "into from Float to Int is refused" {
+    let body = "    let a: Float = 3.5\n    let b: Int = a.into()\n    io.println(\"\{b}\")"
+    assert_eq(reported_for("float_int", "", body), refusal("From", "Float", "Int"))
+}
+
+test "into from Int to Str is refused" {
+    let body = "    let a: Int = 1\n    let s: Str = a.into()\n    io.println(s)"
+    assert_eq(reported_for("int_str", "", body), refusal("From", "Int", "Str"))
+}
+
+test "into from Int to a narrower int is refused" {
+    let body = "    let a: Int = 200\n    let b: U8 = a.into()\n    io.println(\"\{b}\")"
+    assert_eq(reported_for("int_u8", "", body), refusal("From", "Int", "U8"))
+}
+
+test "into from Int to Char is refused" {
+    let body = "    let a: Int = 97\n    let c: Char = a.into()\n    io.println(\"\{c}\")"
+    assert_eq(reported_for("int_char", "", body), refusal("From", "Int", "Char"))
+}
+
+test "into a struct with no From impl is refused" {
+    let decls = "type Plain \{\n    n: Int\n}\n"
+    let body = "    let a: Int = 1\n    let p: Plain = a.into()\n    io.println(\"\{p.n}\")"
+    assert_eq(reported_for("int_plain", decls, body), refusal("From", "Int", "Plain"))
+}
+
+test "a static from with no impl is refused" {
+    let body = "    let s: Str = Str.from(5)\n    io.println(s)"
+    assert_eq(reported_for("static_from", "", body), refusal("From", "Int", "Str"))
+}
+
+test "a static try_from with no impl is refused" {
+    let body = "    let r = I8.try_from(2.5)\n    io.println(\"\{r.is_ok()}\")"
+    assert_eq(reported_for("static_try_from", "", body), refusal("TryFrom", "Float", "I8"))
+}
+
+test "into and from Int to Float are accepted" {
+    let body = "    let a: Int = 7\n    let f: Float = a.into()\n    let g: Float = Float.from(a)\n    io.println(\"\{f} \{g}\")"
+    assert_eq(reported_for("int_float", "", body), "")
+}
+
+test "into from a sized int to Int is accepted" {
+    let body = "    let a: U8 = 200.to_u8()\n    let n: Int = a.into()\n    io.println(\"\{n}\")"
+    assert_eq(reported_for("u8_int", "", body), "")
+}
+
+test "a user From impl is accepted through into and from" {
+    let body = "    let a: MCel = 7.into()\n    let b: MCel = MCel.from(8)\n    io.println(\"\{a.deg} \{b.deg}\")"
+    assert_eq(reported_for("user_from", celsius_decls, body), "")
+}
+
+test "a From impl over an alias source is found through into and from" {
+    let body = "    let m: Meters = 3\n    let b: Bag = m.into()\n    let c: Bag = Bag.from(m)\n    io.println(\"\{b.n} \{c.n}\")"
+    assert_eq(reported_for("alias_source", alias_decls, body), "")
+}
+
+test "a type converts to itself through into and from" {
+    let body = "    let s: Str = \"a\"\n    let t: Str = s.into()\n    let u: Str = Str.from(s)\n    io.println(t.concat(u))"
+    assert_eq(reported_for("reflexive", "", body), "")
+}
+
+test "a static try_from with an impl is accepted" {
+    let body = "    let r = I8.try_from(300)\n    io.println(\"\{r.is_ok()}\")"
+    assert_eq(reported_for("try_from_ok", "", body), "")
+}

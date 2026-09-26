@@ -35,7 +35,7 @@ import typecheck.{
     tc_names_a_type, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_call_user_effect,
     tc_lookup_node_tid, tc_unclaimed_call_tid, tc_list_rename_help, tc_tid_iter_elem,
     tc_call_decl_node, tc_call_decl_is_fn, tc_call_is_skip_intrinsic, tc_tid_name, tc_mc_obj_is_value,
-    tc_impl_is_poly_user, tc_poly_user_impl_decl,
+    tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_conversion_impl_for, tc_conversion_trait_of, CONVERSION_IS_IDENTITY,
     tc_tid_same_type, make_option_type, make_fn_type,
     TYPE_INT, TYPE_BOOL, TYPE_STR, TYPE_VOID,
     type_bit_width, TYPE_U8, TYPE_U16, TYPE_U32, TYPE_U64,
@@ -2479,26 +2479,23 @@ fn cc_trait_qualified_impl(owner: Str, method: Str) -> Int {
     -1
 }
 
-// A conversion. One target can carry a conversion from several sources, so these are keyed
-// `{Target}_{method}_{Source}` and the argument's own type is the third of the key. That is
-// why they are read below the free function rather than beside the other impl methods.
+// A conversion typecheck recorded no declaration for: a From of a type to itself, which has
+// none, or one in a generic body whose types only this instance settles. The impl is the one
+// typecheck's own rule picks from the tids, so the two ends cannot choose differently.
 fn cc_conversion_call(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
     let args = node_args(node)
     let given = if args == -1 { 0 } else { sublist_length(args) }
     if given != 1 { return cc_ctor_arity_wrong(node, owner, method, 1, given) }
-    let src_tid = tid_of_node(sublist_get(args, 0))
-    if src_tid < 0 { return -1 }
-    let src = tc_type_str(src_tid)
-    let mut found = -1
-    let mut matches = 0
-    for im in cc_impls_over(owner, method) {
-        if cc_impl_source_name(im) != src { continue }
-        matches = matches + 1
-        found = im
-    }
-    if matches == 1 { return cc_impl_static_call(node, found, method) }
-    if matches == 0 { return cc_conversion_not_declared(node, owner, method, src) }
-    cc_static_impl_ambiguous(node, owner, method)
+    let arg = sublist_get(args, 0)
+    let src_tid = tid_of_node(arg)
+    let answer = tid_of_node(node)
+    if src_tid < 0 || answer < 0 { return -1 }
+    let trait_name = tc_conversion_trait_of(method)
+    let target = if trait_name == trait_from { answer } else { child_tid(answer, Slot.Inner1) }
+    let im = tc_conversion_impl_for(trait_name, src_tid, target)
+    if im == CONVERSION_IS_IDENTITY { return lower_expr(arg) }
+    if im >= 0 { return cc_impl_static_call(node, im, method) }
+    cc_conversion_not_declared(node, owner, method, tc_type_str(src_tid))
 }
 
 // A conversion no impl declares. Ambiguity and absence are different faults, and the one
@@ -2548,10 +2545,10 @@ fn cc_owner_key(owner: Str) -> OwnerKey {
     OwnerKey { decl: decl, builtin: cc_builtin_owner_name(owner_tid) }
 }
 
-// The two methods Blink keys source-typed. Typecheck gates its own source-typed rung on
-// these same two names, so the rung is entered from both ends on one rule.
+// The two methods Blink keys source-typed, read from typecheck's own rule so the rung is
+// entered from both ends on one set of names.
 fn cc_is_conversion(method: Str) -> Bool {
-    method == "from" || method == "try_from"
+    tc_conversion_trait_of(method) != ""
 }
 
 // Whether cname keys this impl's method by the source it converts from rather than by the
@@ -2559,15 +2556,6 @@ fn cc_is_conversion(method: Str) -> Bool {
 // written out a second time: the two spellings agree exactly when the key carries no source.
 fn cc_is_source_typed(im: Int, method: Str) -> Bool {
     c_impl_method_name(im, method) != c_impl_method_name_q(im, node_trait_name(im), method)
-}
-
-// The source type an impl converts from: the first type argument of the trait it writes,
-// which is the same slot cname spells the symbol from and typecheck registers the key
-// under, so the selection and the symbol cannot disagree.
-fn cc_impl_source_name(im: Int) -> Str {
-    let tps = node_type_params(im)
-    if tps == -1 || sublist_length(tps) == 0 { return "" }
-    node_name(sublist_get(tps, 0))
 }
 
 fn cc_static_impl_ambiguous(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
@@ -3081,7 +3069,6 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if keyed.op != "" { return cc_lower_keyed_method(node, obj, kind, mname, keyed) }
     if cc_is_map_slot_method(kind, mname) { return cc_map_slot_method(node, obj, kind, mname) }
     if cc_is_scalar_cast(kind, mname) { return cc_scalar_cast(node, obj, kind, mname) }
-    if kind == TyKind.Int && cc_is_int_into(node, mname) { return cc_scalar_cast(node, obj, kind, mname) }
     if cc_is_wrapping_arith(kind, mname) { return cc_wrapping_arith(node, obj, recv_tid, kind, mname) }
     if cc_is_char_text(kind, mname) { return cc_char_text(node, obj, kind, mname) }
     if cc_is_sb_write_char(kind, mname) { return cc_sb_write_char(node, obj) }
@@ -3102,11 +3089,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
         if mname == "display" && (kind == TyKind.Struct || kind == TyKind.Enum) { return lower_display_call(obj) }
         if mname == "display" && cc_is_scalar_display_kind(kind) { return cc_scalar_display(node, obj, kind) }
         if mname == "fmt" && cc_is_scalar_display_kind(kind) { return cc_scalar_fmt(node, obj, kind) }
-        if mname == "into" {
-            let symbol = cc_into_symbol(node, recv_tid)
-            if symbol == "" { return -1 }
-            return cc_build_call(node, symbol, obj, CallForm.Declared, false)
-        }
+        if mname == "into" { return cc_into_call(node, obj, recv_tid) }
         let derived = cc_derived_method_symbol(recv_tid, mname)
         if derived != "" { return cc_build_call(node, derived, obj, CallForm.Declared, false) }
         let nominal = cc_nominal_method_decl(node, recv_tid, mname)
@@ -3123,13 +3106,6 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let symbol = cc_call_symbol(node, method, c_impl_method_name(im, node_method(node)))
     if symbol == "" { return -1 }
     cc_build_declared_call(node, symbol, obj, method)
-}
-
-// An Int's `into` casts only when the type it is converted to is one the cast reaches, and
-// that type is the call's own.
-fn cc_is_int_into(node: Int, mname: Str) -> Bool ! Diag.Report {
-    let dest_tid = tid_of_node(node)
-    dest_tid >= 0 && cc_is_into_target(mname, cc_kind(dest_tid))
 }
 
 // A method call with no declared impl to answer it may still be one a derive answers: a
@@ -4050,20 +4026,6 @@ fn cc_is_scalar_cast(kind: TyKind, method: Str) -> Bool {
     if kind == TyKind.Int && method == "to_float" { return true }
     if kind != TyKind.Int && !cc_is_sized_int(kind) { return false }
     cc_names_int_width(method)
-}
-
-// `.into()` on an Int receiver reaching another scalar is the same bit reinterpretation
-// cc_scalar_cast already builds for the named conversions (to_int, to_i8, ...) -- the
-// method name `into` carries no destination of its own, so the destination comes from the
-// call's own tid instead, read once by the caller (lower_method_call already resolves
-// every other node's tid the same way) and handed in here as a plain TyKind so this stays
-// a pure lookup. A destination that is not one of these falls through to the ordinary impl
-// path, so a real `impl From<Int> for SomeStruct` still dispatches there, unmodified.
-fn cc_is_into_target(method: Str, dest: TyKind) -> Bool {
-    let mut table: Map[Str, Bool] = Map()
-    table.insert("into", true)
-    if !(table.get(method) ?? false) { return false }
-    dest == TyKind.Float || dest == TyKind.Char || dest == TyKind.Int || cc_is_sized_int(dest)
 }
 
 fn cc_is_sized_int(kind: TyKind) -> Bool {
@@ -5317,43 +5279,18 @@ fn cc_impl_for(node: Int, recv_tid: Int, trait_name: Str) -> Int ! Diag.Report {
 }
 
 // `c.into()` reads its target from the call node's own type, not from the receiver: the
-// impl it needs is `impl From[Source] for Target`, which is written owned by TARGET with
-// SOURCE as its one type parameter (cname.bl's impl_stem mangles the symbol the same way).
-// So this answers the symbol directly rather than an impl node: cc_impl_for's owner search
-// alone would look for an impl over the receiver's own declaration, which a From impl never
-// is. "" is answered after an internal error is recorded.
-fn cc_into_symbol(node: Int, recv_tid: Int) -> Str ! Diag.Report {
+// impl it runs is `impl From[Source] for Target`, owned by TARGET, which an owner search over
+// the receiver never finds. A type converts to itself with no impl, so that is the value.
+fn cc_into_call(node: Int, obj: Int, recv_tid: Int) -> Int ! Diag.Report {
     let target_tid = tid_of_node(node)
-    if target_tid < 0 { return "" }
-    let im = cc_impl_from_for(node, recv_tid, target_tid)
-    if im == IMPL_REFUSED { return "" }
-    if im >= 0 { return c_impl_method_name(im, "from") }
+    if target_tid < 0 { return -1 }
+    let im = tc_conversion_impl_for(trait_from, recv_tid, target_tid)
+    if im == CONVERSION_IS_IDENTITY { return lower_expr(obj) }
+    if im >= 0 { return cc_build_call(node, c_impl_method_name(im, "from"), obj, CallForm.Declared, false) }
     diag_ice_at("IntoImplNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
-        "'.into()' has no 'impl From[{tc_tid_name(recv_tid)}] for {tc_tid_name(target_tid)}' to call", node,
+        "'.into()' has no 'impl From[{tc_type_str(recv_tid)}] for {tc_type_str(target_tid)}' to call", node,
         "typecheck must reject an into() with no matching From impl; this is a compiler bug")
-    ""
-}
-
-// The impl block of `From[source] for target`, found by the target it is written over and
-// the source type its one type parameter names.
-fn cc_impl_from_for(node: Int, source_tid: Int, target_tid: Int) -> Int ! Diag.Report {
-    let want = tc_tid_decl_node(target_tid)
-    let builtin = cc_builtin_owner_name(target_tid)
-    if want < 0 && builtin == "" { return -1 }
-    let source_name = tc_tid_name(source_tid)
-    let mut found = -1
-    let mut clashes = 0
-    for im in cg_reg_impl_decls() {
-        if node_trait_name(im) != trait_from { continue }
-        if !cc_impl_answers_for(im, want, builtin) { continue }
-        let tps = node_type_params(im)
-        if tps == -1 || sublist_length(tps) < 1 { continue }
-        if node_name(sublist_get(tps, 0)) != source_name { continue }
-        if found >= 0 { clashes = clashes + 1 }
-        found = im
-    }
-    if clashes == 0 { return found }
-    cc_impl_ambiguous(node, target_tid, "the trait 'From[{source_name}]'")
+    -1
 }
 
 fn cc_method_index(im: Int, mname: Str) -> Int {

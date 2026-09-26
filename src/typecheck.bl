@@ -25,7 +25,7 @@ import diagnostics.{
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
     NON_EXHAUSTIVE_MATCH, DUPLICATE_MODULE_BINDING,
     UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT,
-    TYPE_ERROR, TEMPLATE_MISMATCH, MISSING_RETURN, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
+    TYPE_ERROR, TEMPLATE_MISMATCH, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
     MUTATION_REQUIRES_MUT,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
@@ -513,19 +513,68 @@ pub fn tc_is_iterator_method(method: Str) -> Int {
     0
 }
 
-// Typecheck-side mirror of codegen's mangle_impl_method: the fnsig key for an
-// impl method. Must match the codegen C symbol exactly so arg-shape/return-type
-// lookups resolve. From/TryFrom keep `{type}_{method}_{src}`; all other traits
-// use the trait-qualified `{type}_{trait}_{method}`.
-fn tc_mangle_impl_fnsig(impl_type: Str, trait_name: Str, mname: Str, im: Int) -> Str {
-    if trait_name == "From" || trait_name == "TryFrom" {
-        let tparams = node_type_params(im)
-        if tparams != -1 && sublist_length(tparams) > 0 {
-            let src = node_name(sublist_get(tparams, 0))
-            return "{impl_type}_{mname}_{src}"
-        }
+// The fnsig key for an impl method. From/TryFrom key `{type}_{method}_{src}`, spelled from
+// the resolved source type so an alias source keys under its target; all other traits use the
+// trait-qualified `{type}_{trait}_{method}`.
+fn tc_mangle_impl_fnsig(impl_type: Str, trait_name: Str, mname: Str, im: Int) -> Str ! TypeCheck.Resolve, Diag.Report {
+    if tc_is_conversion_trait(trait_name) {
+        let src = tc_impl_conv_source_tid(im)
+        if src >= 0 { return "{impl_type}_{mname}_{tc_type_str(src)}" }
     }
     "{impl_type}_{trait_name}_{mname}"
+}
+
+fn tc_is_conversion_trait(trait_name: Str) -> Bool {
+    trait_name == "From" || trait_name == "TryFrom"
+}
+
+// The trait a static conversion method belongs to, or "" for any other method. Typecheck and
+// codegen both enter the source-typed rung through this, so the two ends name one set.
+pub fn tc_conversion_trait_of(method: Str) -> Str {
+    if method == "from" { return "From" }
+    if method == "try_from" { return "TryFrom" }
+    ""
+}
+
+// Resolved once per impl and on demand, because the fnsig registration loop needs it before
+// validate_trait_impls records any receiver. The binders are pushed so `impl[T] From[T]`
+// reads its own T; validation is off since the impl header was already checked.
+@allow(UnrestoredMutation)
+fn tc_impl_conv_source_tid(im: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    match tc_conv_source_tids.get(im) {
+        Some(t) => return t
+        None => {}
+    }
+    let tparams = node_type_params(im)
+    if tparams == -1 || sublist_length(tparams) == 0 { return -1 }
+    let binders_sl = node_impl_binders(im)
+    tc_push_tparam_scope(binders_sl)
+    let saved_suppress = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    let t = resolve_type_ann(sublist_get(tparams, 0))
+    tc_suppress_ann_validation = saved_suppress
+    tc_pop_tparam_scope(binders_sl)
+    tc_conv_source_tids.insert(im, t)
+    t
+}
+
+// What tc_conversion_impl_for answers for a From of a type to itself (section 3c.2): no impl
+// is written for it, and the conversion is the value itself.
+pub let CONVERSION_IS_IDENTITY: Int = -2
+
+// The impl a conversion from `source` to `target` runs, CONVERSION_IS_IDENTITY, or -1 when
+// none is declared. Matched on tids and never on spellings, so an alias converts as the type
+// it names. Pure, so codegen reads the answer typecheck checked.
+pub fn tc_conversion_impl_for(trait_name: Str, source: Int, target: Int) -> Int {
+    if trait_name == "From" && tc_tid_same_type(source, target) { return CONVERSION_IS_IDENTITY }
+    let mut found = -1
+    for im in tc_conv_source_tids.keys() {
+        if node_trait_name(im) != trait_name { continue }
+        if !tc_tid_same_type(tc_conv_source_tids.get(im) ?? -1, source) { continue }
+        if !tc_tid_same_type(tc_impl_recv_tids.get(im) ?? -1, target) { continue }
+        if found < 0 || im < found { found = im }
+    }
+    found
 }
 
 // Bare type names declared by more than one module, each with the modules that declare it
@@ -1154,6 +1203,9 @@ let mut tc_current_self_tid: Int = -1
 // The receiver tid of every impl block that has a `for` clause, keyed by impl node. Written
 // once, while validate_trait_impls checks the header; read through tc_impl_recv_tid.
 let mut tc_impl_recv_tids: Map[Int, Int] = Map()
+// The source tid of every From/TryFrom impl, keyed by impl node. Written through
+// tc_impl_conv_source_tid while the impl's methods register.
+let mut tc_conv_source_tids: Map[Int, Int] = Map()
 // The impls over a user generic type that are checked and emitted per instance: impl node to
 // the receiver type's declaration. Written beside the receiver tid; read through
 // tc_poly_user_impl_decl.
@@ -10168,6 +10220,7 @@ fn init_types() ! TypeCheck.Register {
     tc_type_decl_ambiguous_names = Map()
     tc_namesake_type_modules = Map()
     tc_impl_recv_tids = Map()
+    tc_conv_source_tids = Map()
     tc_poly_user_impls = Map()
     tc_impl_of_method = Map()
     tc_active_tparams.clear()
@@ -17536,8 +17589,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // the target is the value's own slot; a list element or a carrier argument narrows it
         // elsewhere and is not this arm's to widen.
         if method == "into" {
-            if tc_construct_hint >= 0 { return tc_construct_hint }
-            return -1
+            if tc_construct_hint < 0 { return -1 }
+            tc_check_conversion(node, "From", obj_t, tc_construct_hint)
+            return tc_construct_hint
         }
 
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident {
@@ -17917,44 +17971,17 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     nr_note_call_decl(node, fnsig_pool.get(static_sig).unwrap().decl)
                     return fnsig_pool.get(static_sig).unwrap().ret
                 }
-                // From/TryFrom are the one scheme neither key above can name: tc_mangle_impl_fnsig
-                // keys them SOURCE-TYPED, `{Type}_{method}_{Src}`,
-                // because one target can carry several source impls — lib/std/int_conv.bl
-                // declares try_from on I8 from Int, from I32 and from I16, all three named
-                // `try_from` on `I8`. So the source has to come from the argument, exactly
-                // as codegen already does it (codegen_methods.bl's static From/TryFrom
-                // dispatch spells `src` from the argument's own type, then goes through
-                // find_from_impl/find_tryfrom_impl + mangle_from_method).
+                // From/TryFrom key SOURCE-TYPED (tc_mangle_impl_fnsig), because one target
+                // carries several: lib/std/int_conv.bl declares try_from on I8 from Int, I32
+                // and I16. So the impl is chosen by the argument's own type.
                 //
-                // Gated on the method NAME rather than on static_trait, to mirror codegen
-                // and to stay independent of the count == 1 guard above: a target with
-                // several distinct traits owning `try_from` still has exactly one
-                // source-typed key per argument type.
-                //
-                // A miss returns Unknown here instead of falling through, because the
-                // shared fall-through below re-infers every argument and infer_type REPORTS
-                // as a side effect (see the note at the IfExpr arm) — falling through would
-                // double-report a bad argument. Nothing past this point could answer for a
-                // static call anyway.
-                if method == "from" || method == "try_from" {
+                // Gated on the method NAME rather than on static_trait, to stay independent of
+                // the count == 1 guard above. A miss does not fall through, because the shared
+                // fall-through below re-infers every argument and would report a bad one twice.
+                if tc_conversion_trait_of(method) != "" {
                     let ff_args = node_args(node)
                     if ff_args != -1 && sublist_length(ff_args) == 1 {
-                        let src_t = infer_type(sublist_get(ff_args, 0))
-                        let src_sig = lookup_fnsig("{obj_name}_{method}_{tc_type_str(src_t)}")
-                        if src_sig != -1 {
-                            nr_note_call_decl(node, fnsig_pool.get(src_sig).unwrap().decl)
-                            let ff_ret = fnsig_pool.get(src_sig).unwrap().ret
-                            // A `from` impl method is declared `-> Self`, so its fnsig
-                            // ret is the Self typevar. The static call `Type.from(x)`
-                            // produces the concrete target, so resolve Self to the
-                            // target rather than leaking the typevar tid downstream.
-                            if tc_tid_name(ff_ret) == "Self" {
-                                let tgt = lookup_named_type(obj_name)
-                                if tgt != -1 { return tgt }
-                            }
-                            return ff_ret
-                        }
-                        return -1
+                        return tc_static_conversion(node, obj_name, method, infer_type(sublist_get(ff_args, 0)))
                     }
                 }
             }
@@ -18575,6 +18602,45 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
 // solvable metavar — a dedicated error type, not this one-line helper.
 fn tc_error_recovery_tid() -> Int {
     TYPE_UNKNOWN
+}
+
+// Only a conversion between two settled types can be refused: a generic body's `T` and a type
+// inference has not finished are decided again per instance, or reported by the checks that
+// own them.
+fn tc_conversion_side_settled(t: Int) -> Bool {
+    tc_tid_is_concrete(t) != 0 && tc_tid_has_unknown(t) == 0 && tc_tid_has_bare_typevar(t) == 0
+}
+
+// The impl a settled conversion runs, CONVERSION_IS_IDENTITY, or -1 once E0312 is reported.
+// An unsettled one answers -1 and reports nothing.
+fn tc_check_conversion(node: Int, trait_name: Str, source: Int, target: Int) -> Int ! Diag.Report {
+    if !tc_conversion_side_settled(source) || !tc_conversion_side_settled(target) { return -1 }
+    let im = tc_conversion_impl_for(trait_name, source, target)
+    if im != -1 { return im }
+    let s = tc_type_str(source)
+    let t = tc_type_str(target)
+    diag_error_at("NoConversionImpl", NO_CONVERSION_IMPL,
+        "{s} does not convert to {t}: there is no `impl {trait_name}[{s}] for {t}`", node,
+        "declare the impl, or name the conversion: `.to_float()` widens, `.truncate()` drops a fraction, `.to_int_checked()` checks the range, `{t}.try_from(x)` can fail, `.to_string()` renders text")
+    -1
+}
+
+// `Type.from(x)` / `Type.try_from(x)`. The target is the type the qualifier names; a
+// declared impl answers with its method's return, Self read as that target.
+fn tc_static_conversion(node: Int, obj_name: Str, method: Str, src_t: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let target = resolve_type_name(obj_name)
+    if target < 0 { return -1 }
+    let trait_name = tc_conversion_trait_of(method)
+    let im = tc_check_conversion(node, trait_name, src_t, target)
+    if im == CONVERSION_IS_IDENTITY { return target }
+    if im < 0 { return -1 }
+    let sig = lookup_fnsig(tc_mangle_impl_fnsig(tc_impl_target_name(im), trait_name, method, im))
+    if sig == -1 { return -1 }
+    nr_note_call_decl(node, fnsig_pool.get(sig).unwrap().decl)
+    let mut self_bind: Map[Str, Int] = Map()
+    self_bind.insert("Self", target)
+    self_bind.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), target)
+    substitute_typevar_tid(fnsig_pool.get(sig).unwrap().ret, self_bind)
 }
 
 // The io.* methods that print and answer `()`. Kept separate from the
