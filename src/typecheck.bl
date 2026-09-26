@@ -2592,7 +2592,32 @@ fn tc_typevar_binds_here(tid0: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return 0 }
     let e = ty_pool.get(tid).unwrap()
     if e.kind != TyKind.Typevar { return 0 }
-    if tc_active_binder_node(e.name) != e.inner1 { return 0 }
+    tc_binder_is_active(e.inner1)
+}
+
+// Any active frame counts, not only the innermost of a spelling: an impl's `T` shadowed
+// by a method's own `T` is still substituted once per instance of the method body.
+fn tc_binder_is_active(binder: Int) -> Int {
+    if binder == NO_BINDER_NODE { return 0 }
+    for b in tc_tp_binder_nodes {
+        if b == binder { return 1 }
+    }
+    0
+}
+
+// Inside a body its own type parameters are rigid: `T` stands for every type at once, so
+// it matches only itself (§3 Parametricity). A parameter of another declaration, such as
+// a callee formal read off its signature, is still open to anything at this site.
+fn tc_typevar_pair_compatible(a: Int, b: Int) -> Int {
+    if tc_current_fn_node == -1 { return 1 }
+    if tc_typevar_is_open(a) != 0 || tc_typevar_is_open(b) != 0 { return 1 }
+    0
+}
+
+fn tc_typevar_is_open(tid: Int) -> Int {
+    let e = ty_pool.get(tid).unwrap()
+    if e.kind != TyKind.Typevar { return 0 }
+    if tc_typevar_binds_here(tid) != 0 { return 0 }
     1
 }
 
@@ -5984,7 +6009,24 @@ fn tc_push_arith_frames(sl: Int) {
     }
 }
 
-// Remove the frames a matching tc_push_arith_frames(sl) added.
+// A `where T: Bound` frame adds bounds to a parameter an outer frame already binds, so it
+// carries that parameter's binder. With the constraint node instead, a `T` written in the
+// body would mint a second type distinct from the `T` of the method's own signature.
+fn tc_push_where_frames(sl: Int) {
+    if sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        let wc = sublist_get(sl, i)
+        let binder = tc_active_binder_node(node_name(wc))
+        tc_tp_arith_names.push(node_name(wc))
+        tc_tp_binder_nodes.push(if binder == NO_BINDER_NODE { wc } else { binder })
+        tc_tp_bound_traits.push(tparam_node_bound_traits(wc))
+        tc_tp_bound_methods.push("|")
+        i = i + 1
+    }
+}
+
+// Remove the frames a matching tc_push_arith_frames(sl) or tc_push_where_frames(sl) added.
 fn tc_pop_arith_frames(sl: Int) {
     if sl == -1 { return }
     let mut i = 0
@@ -14484,7 +14526,7 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
     // An unbound metavar that survived resolution (kind TyKind.Unknown, not the
     // singleton) is still "compatible with anything" pending the boundary check.
     if ka == TyKind.Unknown || kb == TyKind.Unknown { return 1 }
-    if ka == TyKind.Typevar || kb == TyKind.Typevar { return 1 }
+    if ka == TyKind.Typevar || kb == TyKind.Typevar { return tc_typevar_pair_compatible(a, b) }
     // Int and Bool are interchangeable in Blink (C-style truthiness)
     if (ka == TyKind.Int || ka == TyKind.Bool) && (kb == TyKind.Int || kb == TyKind.Bool) { return 1 }
     // Sized integer kinds are compatible only with themselves (no implicit promotion)
@@ -21123,7 +21165,7 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
             // for the span of the method bodies. Pushed after the binder frames so
             // the bounded `where T` frame shadows the unbounded binder `T` frame.
             let impl_where_sl = node_impl_where_bounds(im)
-            tc_push_arith_frames(impl_where_sl)
+            tc_push_where_frames(impl_where_sl)
             tc_current_self_tid = tc_impl_recv_tid(im)
             let methods_sl = node_methods(im)
             if methods_sl != -1 {

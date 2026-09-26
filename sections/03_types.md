@@ -2523,7 +2523,7 @@ This is the mirror image of the W0604 gate (§3.4 *Explicit Type Application*), 
 
 **No runtime type information.** Blink exposes no `size_of[T]`, `is_pointer_kind[T]`, `TypeRepr[T]`, `align_of[T]`, or `TypeId[T]` forms — neither to user code nor as `@compiler_internal` primitives. The compiler decides layout and dispatch entirely at codegen time. Stdlib needs that require a layout query at the C level route through `@ffi` to a runtime C helper, not through a Blink intrinsic.
 
-**Parametricity (normative).** A polymorphic impl body must be **parametric in its type parameters**. The body may not:
+**Parametricity (normative).** Any generic body (a generic function, a polymorphic impl, or a trait default body) must be **parametric in its type parameters**. The body may not:
 
 - **Dispatch on `T`'s identity.** `if T == Int { ... }`, `match T { ... }`, and equivalent constructs are compile errors.
 - **Inspect `T`'s runtime layout, size, alignment, or pointer-kind.** No `sizeof`-like form exists in the source language for type parameters.

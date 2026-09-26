@@ -1,0 +1,164 @@
+import compile_test_helpers
+
+// Inside its own generic body a type parameter stands for every type at once, so it
+// is equal only to itself. A body that uses T where a concrete type is wanted is a
+// type error at the definition, whatever the body is later instantiated at.
+
+test "a bare T bound to an Int let is E0300" {
+    let out = compile_test_helpers.compile_and_capture(#"
+fn f[T](x: T) -> Int {
+    let y: Int = x
+    y
+}
+fn main() { let _ = f(1) }
+"#, "rigid_let")
+    compile_test_helpers.expect_error(out, "E0300", "T bound to an Int let")
+}
+
+test "a Box[T] bound to a Box[Int] let is E0300" {
+    let out = compile_test_helpers.compile_and_capture(#"
+type Box[T] { value: T }
+fn f[T](x: Box[T]) -> Int {
+    let b: Box[Int] = x
+    b.value
+}
+fn main() { let _ = f(Box { value: 1 }) }
+"#, "rigid_box_let")
+    compile_test_helpers.expect_error(out, "E0300", "Box[T] bound to a Box[Int] let")
+}
+
+test "a struct literal field of type T in a Box[Int] let is E0300" {
+    let out = compile_test_helpers.compile_and_capture(#"
+type Box[T] { value: T }
+fn f[T](x: T) -> Int {
+    let b: Box[Int] = Box { value: x }
+    b.value
+}
+fn main() { let _ = f(1) }
+"#, "rigid_lit")
+    compile_test_helpers.expect_error(out, "E0300", "Box literal with a T field in a Box[Int] let")
+}
+
+test "a T returned as Int is E0300" {
+    let out = compile_test_helpers.compile_and_capture(#"
+fn f[T](x: T) -> Int { x }
+fn main() { let _ = f(1) }
+"#, "rigid_ret")
+    compile_test_helpers.expect_error(out, "E0300", "T returned as Int")
+}
+
+test "a T passed to an Int parameter is E0300" {
+    let out = compile_test_helpers.compile_and_capture(#"
+fn want(n: Int) -> Int { n }
+fn f[T](x: T) -> Int { want(x) }
+fn main() { let _ = f(1) }
+"#, "rigid_arg")
+    compile_test_helpers.expect_error(out, "E0300", "T passed to an Int parameter")
+}
+
+test "a generic body that is never called is still E0300" {
+    let out = compile_test_helpers.compile_and_capture(#"
+fn f[T](x: T) -> Int {
+    let y: Int = x
+    y
+}
+fn main() { io.println("never calls f") }
+"#, "rigid_uncalled")
+    compile_test_helpers.expect_error(out, "E0300", "uncalled generic body binds T to Int")
+}
+
+test "a polymorphic impl method that returns its T element as Int is E0300" {
+    let out = compile_test_helpers.compile_and_capture(#"
+trait AsInt {
+    fn as_int(self) -> Int
+}
+impl[T] AsInt for List[T] {
+    fn as_int(self) -> Int { self.get(0).unwrap() }
+}
+fn main() {
+    let xs = [1, 2]
+    let _ = xs.as_int()
+}
+"#, "rigid_impl")
+    compile_test_helpers.expect_error(out, "E0300", "impl[T] method returns its T element as Int")
+}
+
+test "a T returned as a sibling parameter U is E0300" {
+    let out = compile_test_helpers.compile_and_capture(#"
+fn f[T, U](x: T) -> U { x }
+fn main() { io.println("never calls f") }
+"#, "rigid_sibling")
+    compile_test_helpers.expect_error(out, "E0300", "T returned as its sibling U")
+}
+
+test "an impl[T] method with a where bound that returns its T element as Int is E0300" {
+    let out = compile_test_helpers.compile_and_capture(#"
+trait AsInt {
+    fn as_int(self) -> Int
+}
+impl[T] AsInt for List[T] where T: Display {
+    fn as_int(self) -> Int { self.get(0).unwrap() }
+}
+fn main() {
+    let xs = [1, 2]
+    let _ = xs.as_int()
+}
+"#, "rigid_impl_where")
+    compile_test_helpers.expect_error(out, "E0300", "impl[T] where T: Display method returns its T element as Int")
+}
+
+test "a trait default body that returns self as Int is E0300" {
+    let out = compile_test_helpers.compile_and_capture(#"
+trait Num {
+    fn raw(self) -> Int { self }
+}
+fn main() { io.println("no impl") }
+"#, "rigid_default_self")
+    compile_test_helpers.expect_error(out, "E0300", "default body returns Self as Int")
+}
+
+test "an impl[T] method with a where bound keeps a body-written T equal to its element" {
+    let out = compile_test_helpers.compile_and_capture(#"
+trait Head[T] {
+    fn head(self) -> T
+}
+impl[T] Head[T] for List[T] where T: Display {
+    fn head(self) -> T {
+        let v: T = self.get(0).unwrap()
+        v
+    }
+}
+fn main() {
+    let xs = [1, 2]
+    assert(xs.head() == 1)
+}
+"#, "rigid_impl_where_ok")
+    compile_test_helpers.expect_compiles_clean(out, "a T written in a where-bounded impl body is the T of its element")
+}
+
+test "a T passed on as T and returned as T compiles" {
+    let out = compile_test_helpers.compile_and_capture(#"
+type Box[T] { value: T }
+fn id[U](u: U) -> U { u }
+fn f[T](x: T) -> Box[T] {
+    let y: T = id(x)
+    Box { value: y }
+}
+fn main() {
+    let n: Int = f(1).value
+    assert(n == 1)
+}
+"#, "rigid_ok")
+    compile_test_helpers.expect_compiles_clean(out, "T kept as T through a generic call and a literal")
+}
+
+test "a bounded T reaches a concrete type only through its bound" {
+    let out = compile_test_helpers.compile_and_capture(#"
+fn show[T: Display](x: T) -> Str {
+    let s: Str = x.display()
+    s
+}
+fn main() { assert(show(3) == "3") }
+"#, "rigid_bound_ok")
+    compile_test_helpers.expect_compiles_clean(out, "T: Display turned into Str by its bound")
+}
