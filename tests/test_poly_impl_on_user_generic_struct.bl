@@ -1,6 +1,15 @@
 // A polymorphic impl over a user generic struct binds T to the receiver's type argument
 // (spec §3.6), so each instantiation of Box gets its own copy of the method bodies.
+import compile_test_helpers
+
 type Box[T] { value: T }
+
+type Pair[A, B] { first: A, second: B }
+
+type Maybe[T] {
+    Just(value: T)
+    Nothing
+}
 
 trait Tagged {
     fn tag(self) -> Int
@@ -34,6 +43,27 @@ impl[T] Describe for Box[T] where T: Describe {
     fn describe(self) -> Str { "box of {self.value.describe()}" }
 }
 
+trait Swap[A, B] {
+    fn swap(self) -> Pair[B, A]
+}
+
+impl[A, B] Swap[A, B] for Pair[A, B] {
+    fn swap(self) -> Pair[B, A] { Pair { first: self.second, second: self.first } }
+}
+
+trait OrElse[T] {
+    fn or_else(self, d: T) -> T
+}
+
+impl[T] OrElse[T] for Maybe[T] {
+    fn or_else(self, d: T) -> T {
+        match self {
+            Just(v) => v
+            Nothing => d
+        }
+    }
+}
+
 test "a method that does not mention T is callable on two instances" {
     assert_eq(Box { value: 1 }.tag(), 7)
     assert_eq(Box { value: "a" }.tag(), 7)
@@ -54,4 +84,107 @@ test "a where-bounded binder calls its bound's method on the field" {
 test "a bounded impl nests over its own instance" {
     let inner = Box { value: 4 }
     assert_eq(Box { value: inner }.describe(), "box of box of int 4")
+}
+
+test "a two-binder impl binds each binder to its own receiver argument" {
+    let p = Pair { first: 1, second: "a" }.swap()
+    assert_eq(p.first, "a")
+    assert_eq(p.second, 1)
+}
+
+test "an impl over a generic enum matches on its receiver" {
+    let j: Maybe[Int] = Just(3)
+    assert_eq(j.or_else(9), 3)
+    let n: Maybe[Str] = Nothing
+    assert_eq(n.or_else("d"), "d")
+}
+
+test "receivers that differ only inside an erased argument get two instances" {
+    let src = #"type Box[T] { value: T }
+
+trait Unwrap[T] {
+    fn get(self) -> T
+}
+
+impl[T] Unwrap[T] for Box[T] {
+    fn get(self) -> T { self.value }
+}
+
+fn main() {
+    let mut a: Set[Int] = Set()
+    a.insert(1)
+    let mut b: Set[Str] = Set()
+    b.insert("s")
+    let x = Box { value: a }.get()
+    let y = Box { value: b }.get()
+    io.println("{x.len()} {y.len()}")
+}
+"#
+    let c = compile_test_helpers.compile_and_emit_c(src, "poly_user_generic_erased_arg")
+    assert_eq(compile_test_helpers.poly_impl_fn_names(c, "Box_Unwrap_get").len(), 2)
+}
+
+fn expect_poly_unsupported(tag: Str, label: Str, src: Str) {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_error(out, "E0908", label)
+}
+
+test "a binder that is not a receiver argument stays unsupported" {
+    expect_poly_unsupported("poly_user_generic_binder_off_receiver", "impl[T] Tr[T] for Holder", #"type Holder { v: Int }
+
+trait Tr[T] {
+    fn op(self, x: T) -> Int
+}
+
+impl[T] Tr[T] for Holder {
+    fn op(self, _x: T) -> Int { self.v }
+}
+
+fn main() {}
+"#)
+}
+
+test "a receiver with arguments and no binders stays unsupported" {
+    expect_poly_unsupported("poly_user_generic_no_binders", "impl Tr for Boxed[Int]", #"type Boxed[T] { v: T }
+
+trait Tr {
+    fn op(self) -> Int
+}
+
+impl Tr for Boxed[Int] {
+    fn op(self) -> Int { self.v }
+}
+
+fn main() {}
+"#)
+}
+
+test "a binder nested inside a receiver argument stays unsupported" {
+    expect_poly_unsupported("poly_user_generic_nested_binder", "impl[T] Tr for Box[List[T]]", #"type Box[T] { value: T }
+
+trait Tr {
+    fn op(self) -> Int
+}
+
+impl[T] Tr for Box[List[T]] {
+    fn op(self) -> Int { self.value.len() }
+}
+
+fn main() {}
+"#)
+}
+
+test "a binder repeated across receiver arguments stays unsupported" {
+    expect_poly_unsupported("poly_user_generic_repeated_binder", "impl[T] Tr for Pair[T, T]", #"type Pair[A, B] { first: A, second: B }
+
+trait Tr {
+    fn op(self) -> Int
+}
+
+impl[T] Tr for Pair[T, T] {
+    fn op(self) -> Int { 0 }
+}
+
+fn main() {}
+"#)
 }
