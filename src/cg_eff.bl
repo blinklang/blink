@@ -18,6 +18,7 @@ import parser.{
 import typecheck.{
     TyKind, TYPE_INT, TYPE_STR, lookup_named_type, make_ffi_scope_type, make_fn_type, make_handler_type, tc_resolve,
     tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tc_void_tid, tk_name, ty_pool,
+    tc_call_decl_node, tc_call_user_effect, tc_decl_ret_tid,
 }
 import layout.{
     BinderMut, LayoutRecord, Position, Slot, SlotForm, async_scope_handles_spelling,
@@ -40,8 +41,8 @@ import cg_print.{
     print_closure_thunk, print_handler_builder, print_resource_guard_support, print_spawn_pair_typedef,
     print_spawn_task_wrapper, print_vtable_slot_fn, print_vtable_slot_fn_decl, vtable_slot_self_spelling,
 }
-import cg_reg.{cg_reg_effect_decls, cg_reg_impl_decls}
-import cg_decl.{cg_decl_ret_tid, cg_decl_takes_ev}
+import cg_reg.{cg_reg_impl_decls}
+import cg_decl.{cg_decl_takes_ev}
 import cg_expr.{cg_expr_push_pending, lower_expr, lower_value_as_text}
 import diagnostics.{
     Diag, diag_ice, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg, CODEGEN_STAGE_NOT_BUILT,
@@ -265,7 +266,7 @@ pub fn cg_eff_block_handler_calls(im: Int, tid: Int, node: Int) -> BlockHandlerC
             "the spelling the handler has at the with-item must spell again where the guard declares it")
         return none
     }
-    let context_tid = cg_decl_ret_tid(enter)
+    let context_tid = callee_answer(enter, node)
     if context_tid < 0 { return none }
     let exit_symbol = c_impl_method_name(im, BLOCK_HANDLER_EXIT_METHOD)
     print_resource_guard_support(exit_symbol, rec.c_spelling, true)
@@ -1713,7 +1714,8 @@ fn wrap_nullable_text(node: Int, opt_tid: Int, perform: Int) -> Int ! Diag.Repor
 }
 
 // An operation of a user effect, written `handle.op(args)` on the lowered handle name of
-// its root effect. The slot is the operation's member of the root's vtable, spelled by the
+// its root effect. The operation and its root come from the declaration typecheck recorded
+// for the call. The slot is the operation's member of the root's vtable, spelled by the
 // same producer the declaration used.
 //
 // The call reads the slot's answer with no conversion, so its own type must spell as the
@@ -1722,15 +1724,20 @@ fn wrap_nullable_text(node: Int, opt_tid: Int, perform: Int) -> Int ! Diag.Repor
 pub fn cg_eff_lower_user_perform(node: Int) -> Int ! Diag.Report {
     let handle = node_name(node_obj(node))
     let op = node_method(node)
-    let decl = user_effect_decl(handle, op, node)
-    if decl < 0 { return -1 }
+    let decl = tc_call_user_effect(node)
+    if decl < 0 {
+        diag_ice_at("PerformWithoutOperation", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "'{handle}.{op}' was lowered as a perform but resolved to no effect operation", node,
+            "codegen reads a perform only from the operation typecheck recorded; this is a compiler bug")
+        return -1
+    }
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = perform_layout(tid, Position.Local, node)
     if rec.c_spelling == "" { return -1 }
     let k = tc_tid_kind(tc_resolve(tid))
     if k != TyKind.Void && k != TyKind.Never {
-        let slot_rec = perform_layout(handler_op_ret_tid(declared_op(decl, op)), Position.VtableSlot, node)
+        let slot_rec = perform_layout(callee_answer(tc_call_decl_node(node), node), Position.VtableSlot, node)
         if slot_rec.c_spelling == "" { return -1 }
         if slot_rec.c_spelling != rec.c_spelling {
             diag_ice_at("PerformAnswerDiffersFromSlot", UNSOLVED_TYPEVAR_AT_CODEGEN,
@@ -1766,38 +1773,14 @@ pub fn cg_eff_ev_argument(node: Int) -> Int ! Diag.Report {
     ir_evidence_address(node, ev_read(node))
 }
 
-// The root effect declaration a handle names, checked to declare the operation. The
-// handle typecheck registers is the lowered root name, so the same lowering finds it.
-fn user_effect_decl(handle: Str, op: Str, node: Int) -> Int ! Diag.Report {
-    for e in cg_reg_effect_decls() {
-        if node_name(e).to_lower() != handle { continue }
-        if declared_op(e, op) >= 0 { return e }
-        diag_ice_at("UserEffectOpUnknown", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "effect '{node_name(e)}' declares no operation '{op}'", node,
-            "typecheck resolves every perform against the effect's operations; this is a compiler bug")
-        return -1
-    }
-    diag_ice_at("UserEffectHandleUnknown", UNSOLVED_TYPEVAR_AT_CODEGEN,
-        "'{handle}' is the handle of no declared effect", node,
-        "typecheck registers one handle per root effect; this is a compiler bug")
-    -1
-}
-
-// The operation's declaration, or -1 when the root declares none of that name. Operations live
-// under the sub-effects of a root, never on the root itself.
-fn declared_op(effect_decl: Int, op: Str) -> Int {
-    let children = node_elements(effect_decl)
-    if children == -1 { return -1 }
-    let mut ci = 0
-    while ci < sublist_length(children) {
-        let ops = node_methods(sublist_get(children, ci))
-        let mut oi = 0
-        while ops != -1 && oi < sublist_length(ops) {
-            let o = sublist_get(ops, oi)
-            if node_name(o) == op { return o }
-            oi = oi + 1
-        }
-        ci = ci + 1
-    }
+// What a callee declared outside the body being lowered answers, read from its signature.
+// Inside a generic instance the callee's annotation node has no type, because it belongs
+// to no instance.
+fn callee_answer(decl: Int, node: Int) -> Int ! Diag.Report {
+    let tid = tc_decl_ret_tid(decl)
+    if tid >= 0 { return tid }
+    diag_ice_at("CalleeWithoutSignature", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "the callee this call reaches registered no signature", node,
+        "typecheck registers a signature for every declaration a call can reach; this is a compiler bug")
     -1
 }

@@ -319,6 +319,9 @@ type FnSigEntry {
     decl: Int
 }
 let mut fnsig_pool: List[FnSigEntry] = []
+// The signature each declaration registered, so a reader holding the declaration gets its
+// types without a second lookup by spelling or a read of the declaration's own nodes.
+let mut fnsig_by_decl: Map[Int, Int] = Map()
 let mut fnsig_param_list: List[Int] = []
 // Flat side-table PARALLEL to fnsig_param_list (same index, same length): each parameter's
 // declared NAME, or "" for an intrinsic. A keyword argument names its parameter, so without
@@ -8384,6 +8387,7 @@ fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
 
     let sig_idx = fnsig_pool.len()
     fnsig_map.insert(name, sig_idx)
+    fnsig_by_decl.insert(fn_node, sig_idx)
     let fn_mod = node_module(fn_node)
     if fn_mod != "" {
         fnsig_map.insert("{fn_mod}:{name}", sig_idx)
@@ -10188,6 +10192,7 @@ fn init_types() ! TypeCheck.Register {
     evar_decl_nodes.clear()
     evfield_pool.clear()
     fnsig_pool.clear()
+    fnsig_by_decl.clear()
     fnsig_map.clear()
     fnsig_param_list.clear()
     fnsig_param_names.clear()
@@ -10599,6 +10604,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     // warning; without the signatures `db.query(..)` has no return type and its
     // arguments are compared against nothing.
     tc_ue_handles = []
+    tc_ue_op_root = Map()
     let effects_decl_sl = node_args(program)
     if effects_decl_sl != -1 {
         let mut ei = 0
@@ -10705,6 +10711,11 @@ fn tc_flush_unresolved_method_warnings() ! Diag.Report {
 
 let mut tc_ue_handles: List[Str] = []
 
+// Effect operation declaration node -> the root effect declaring it. An operation is a
+// bodiless FnDef like any other, so this is what tells a call recorded against one apart
+// from a call of a function.
+let mut tc_ue_op_root: Map[Int, Int] = Map()
+
 fn register_ue_handle(name: Str) {
     tc_ue_handles.push(name)
 }
@@ -10807,6 +10818,7 @@ fn register_ue_op_sigs(ed: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
                 let op = sublist_get(ops_sl, oi)
                 let op_name = node_name(op)
                 node_set_name(op, "{handle}.{op_name}")
+                tc_ue_op_root.insert(op, ed)
                 register_fn_sig(op)
                 publish_ue_op_tids(op)
                 node_set_name(op, op_name)
@@ -10816,6 +10828,15 @@ fn register_ue_op_sigs(ed: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
         ci = ci + 1
     }
     tc_suppress_ann_validation = saved_suppress
+}
+
+// The root effect whose operation this call performs, or -1. The call's recorded
+// declaration decides it, so a handle spelled like an imported module still performs
+// wherever typecheck typed the call as the operation.
+pub fn tc_call_user_effect(call_node: Int) -> Int {
+    let decl = tc_call_decl_node(call_node)
+    if decl < 0 { return -1 }
+    tc_ue_op_root.get(decl) ?? -1
 }
 
 pub fn is_user_effect_handle_name(name: Str) -> Int {
@@ -11123,6 +11144,16 @@ let mut tc_call_decl: Map[Int, Int] = Map()
 // a closure value, a builtin, an intrinsic.
 pub fn tc_call_decl_node(call_node: Int) -> Int {
     tc_call_decl.get(call_node) ?? -1
+}
+
+// The return type a declaration's signature carries, or -1 for a node that registered none.
+// A call site inside a generic instance reads a callee's answer here: the callee's own
+// annotation node belongs to no instance, so no instance holds a type for it.
+pub fn tc_decl_ret_tid(decl: Int) -> Int {
+    match fnsig_by_decl.get(decl) {
+        Some(idx) => fnsig_pool.get(idx).unwrap().ret
+        None => -1
+    }
 }
 
 // Whether this call resolved to an ordinary fn declaration, the one shape a builtin's
@@ -17481,6 +17512,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if nr_is_defined(obj_name) == 0 && is_user_effect_handle_name(obj_name) != 0 {
                 let ue_sig = lookup_fnsig("{obj_name}.{method}")
                 if ue_sig != -1 {
+                    nr_note_call_decl(node, fnsig_pool.get(ue_sig).unwrap().decl)
                     let _ = check_arg_shapes("{obj_name}.{method}", ue_sig, node_args(node), 0, node)
                     return fnsig_pool.get(ue_sig).unwrap().ret
                 }
