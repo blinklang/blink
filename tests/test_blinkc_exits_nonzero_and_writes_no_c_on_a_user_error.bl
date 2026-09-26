@@ -1,0 +1,87 @@
+// blinkc is the low-level driver behind `blinkc in.bl out.c && cc out.c`. When it
+// reports a user error it must exit non-zero, as `blink build` and `blinkc --emit blink`
+// already do, or the `&&` goes on to compile a stale or missing out.c and the
+// diagnostics are lost behind cc's own error.
+
+fn type_error_src() -> Str {
+    "fn main() \{\n    let x: Int = \"s\"\n\}\n"
+}
+
+fn stage(tag: Str, src: Str) -> Str {
+    let bl_path = ".tmp/_blinkc_exit_{tag}.bl"
+    write_file(bl_path, src)
+    shell_exec("rm -f .tmp/_blinkc_exit_{tag}.c")
+    bl_path
+}
+
+fn c_path(tag: Str) -> Str {
+    ".tmp/_blinkc_exit_{tag}.c"
+}
+
+fn cleanup(tag: Str) {
+    shell_exec("rm -f .tmp/_blinkc_exit_{tag}.bl .tmp/_blinkc_exit_{tag}.c")
+}
+
+test "a type error exits 1 and writes no C" {
+    let bl = stage("type", type_error_src())
+    let r = process_run("build/blinkc", [bl, c_path("type")])
+    assert(r.err_out.contains("TypeError"))
+    assert_eq(r.exit_code, 1)
+    assert_eq(file_exists(c_path("type")), 0)
+    cleanup("type")
+}
+
+test "a type error exits 1 in the archive-linked mode the test helpers use" {
+    let bl = stage("archive", type_error_src())
+    let r = process_run("build/blinkc", ["--link-archive", "build/libblink_std.h", bl, c_path("archive")])
+    assert(r.err_out.contains("TypeError"))
+    assert_eq(r.exit_code, 1)
+    assert_eq(file_exists(c_path("archive")), 0)
+    cleanup("archive")
+}
+
+test "a type error exits 1 under --format json" {
+    let bl = stage("json", type_error_src())
+    let r = process_run("build/blinkc", [bl, "/dev/null", "--format", "json"])
+    let output = "{r.out}{r.err_out}"
+    assert(output.contains("\"severity\":\"error\""))
+    assert_eq(r.exit_code, 1)
+    cleanup("json")
+}
+
+test "a type error exits 1 under --check-only" {
+    let bl = stage("check", type_error_src())
+    let r = process_run("build/blinkc", ["--check-only", bl])
+    assert(r.err_out.contains("TypeError"))
+    assert_eq(r.exit_code, 1)
+    cleanup("check")
+}
+
+test "a parse error exits 1 and writes no C" {
+    let bl = stage("parse", "fn main() \{\n    let = 3\n\}\n")
+    let r = process_run("build/blinkc", [bl, c_path("parse")])
+    assert(r.err_out.contains("UnexpectedToken"))
+    assert_eq(r.exit_code, 1)
+    assert_eq(file_exists(c_path("parse")), 0)
+    cleanup("parse")
+}
+
+// The two controls keep the fix from over-reaching: a warning is not an error, so a
+// program that only draws warnings must still compile to C and exit 0.
+test "a clean program exits 0 and writes C" {
+    let bl = stage("clean", "fn main() \{\n    io.println(\"hi\")\n\}\n")
+    let r = process_run("build/blinkc", [bl, c_path("clean")])
+    assert_eq(r.exit_code, 0)
+    assert_eq(file_exists(c_path("clean")), 1)
+    cleanup("clean")
+}
+
+test "a program with only warnings exits 0 and writes C" {
+    let src = "import std.path.\{path_join\}\nfn main() \{\n    io.println(\"hi\")\n\}\n"
+    let bl = stage("warn", src)
+    let r = process_run("build/blinkc", [bl, c_path("warn")])
+    assert(r.err_out.contains("UnusedImport"))
+    assert_eq(r.exit_code, 0)
+    assert_eq(file_exists(c_path("warn")), 1)
+    cleanup("warn")
+}
