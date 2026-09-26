@@ -1,0 +1,102 @@
+import compile_test_helpers
+
+// An Option over an @ffi.opaque handle is one pointer word: the null handle is None and any
+// other handle is Some (spec sections/07_trust_modules_metadata.md:896). It has no tag, so a
+// match, a single-arm match with a wildcard, and `??` must all decide by testing the handle
+// against null. fopen gives both shapes with no library beyond libc: a real path yields a
+// handle, a missing one yields null.
+
+fn prelude() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type Handle
+
+@ffi("c", "fopen")
+@trusted(audit: "TEST-MATCH-OPTION-OPAQUE-BY-NULL")
+fn c_open(path: Ptr[U8], mode: Ptr[U8]) -> Option[Handle] ! FFI { }
+
+@ffi("c", "fopen")
+@trusted(audit: "TEST-MATCH-OPTION-OPAQUE-BY-NULL")
+fn c_open_bare(path: Ptr[U8], mode: Ptr[U8]) -> Handle ! FFI { }
+
+@ffi("c", "fclose")
+@trusted(audit: "TEST-MATCH-OPTION-OPAQUE-BY-NULL")
+fn c_close(h: Handle) -> I32 ! FFI { }
+
+@ffi("c", "fileno")
+@trusted(audit: "TEST-MATCH-OPTION-OPAQUE-BY-NULL")
+fn c_fileno(h: Handle) -> I32 ! FFI { }
+
+"#
+}
+
+fn expect_output(label: Str, body: Str, tag: Str, want: Str) {
+    let r = compile_test_helpers.compile_and_run(prelude().concat(body), tag)
+    if r.exit_code != 0 || !r.out.contains(want) {
+        io.println("FAIL: {label}: exit {r.exit_code}, want '{want}'\n{r.out}\n{r.err_out}")
+    }
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains(want))
+}
+
+test "a match on a non-null handle takes the Some arm and binds the handle" {
+    let body = #"fn main() {
+    with ffi.scope() as scope {
+        match c_open(scope.cstr("/dev/null"), scope.cstr("r")) {
+            Some(h) => io.println("some rc {c_close(h)}")
+            None => io.println("none")
+        }
+    }
+}
+"#
+    expect_output("Some arm", body, "_optopaque_match_some", "some rc 0")
+}
+
+test "a match on a null handle takes the None arm" {
+    let body = #"fn main() {
+    with ffi.scope() as scope {
+        match c_open(scope.cstr("/nonexistent-blink-dir/none"), scope.cstr("r")) {
+            Some(h) => io.println("some rc {c_close(h)}")
+            None => io.println("none from null")
+        }
+    }
+}
+"#
+    expect_output("None arm", body, "_optopaque_match_none", "none from null")
+}
+
+test "a value-position match with a wildcard arm tells a null handle from a live one" {
+    let body = #"fn present(o: Option[Handle]) -> Int {
+    match o {
+        Some(h) => {
+            let _ = c_close(h)
+            1
+        }
+        _ => 0
+    }
+}
+
+fn main() {
+    with ffi.scope() as scope {
+        let live = present(c_open(scope.cstr("/dev/null"), scope.cstr("r")))
+        let dead = present(c_open(scope.cstr("/nonexistent-blink-dir/none"), scope.cstr("r")))
+        io.println("live {live} dead {dead}")
+    }
+}
+"#
+    expect_output("wildcard match", body, "_optopaque_match_wild", "live 1 dead 0")
+}
+
+test "?? on a null handle falls back and on a live handle keeps it" {
+    let body = #"fn main() {
+    with ffi.scope() as scope {
+        let fallback = c_open_bare(scope.cstr("/dev/null"), scope.cstr("r"))
+        let from_null = c_open(scope.cstr("/nonexistent-blink-dir/none"), scope.cstr("r")) ?? fallback
+        let from_live = c_open(scope.cstr("/dev/null"), scope.cstr("r")) ?? fallback
+        let same = if c_fileno(from_null) == c_fileno(fallback) { 1 } else { 0 }
+        let other = if c_fileno(from_live) == c_fileno(fallback) { 0 } else { 1 }
+        io.println("null keeps fallback {same} live keeps its own {other} rc {c_close(from_live)} {c_close(fallback)}")
+    }
+}
+"#
+    expect_output("??", body, "_optopaque_coalesce", "null keeps fallback 1 live keeps its own 1 rc 0 0")
+}
