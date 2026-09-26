@@ -1066,6 +1066,16 @@ fn tc_impl_binds_for_instance(im: Int, tid: Int) -> Map[Str, Int] ! TypeCheck.Re
     binds
 }
 
+// The impl's binders as this receiver instance answers them. Empty unless the method belongs
+// to a per-instance impl over a user generic type: any other impl's binders are not read off
+// the receiver's arguments.
+fn tc_impl_binds_at_call(sig: Int, recv: Int) -> Map[Str, Int] ! TypeCheck.Resolve, Diag.Report {
+    let none: Map[Str, Int] = Map()
+    let im = tc_impl_of_method.get(fnsig_pool.get(sig).unwrap().decl) ?? -1
+    if im == -1 || !tc_impl_is_poly_user(im) { return none }
+    tc_impl_binds_for_instance(im, recv)
+}
+
 // Evaluate the impl's `where`-bounds against the discovered binds. Tri-state
 // combine: any definitely-unmet bound (-1) rejects the whole impl; an unbound
 // param or an unmodeled bound is skipped (fail open). Returns -1 (reject) or 1.
@@ -1131,6 +1141,13 @@ let mut tc_current_self_tid: Int = -1
 // The receiver tid of every impl block that has a `for` clause, keyed by impl node. Written
 // once, while validate_trait_impls checks the header; read through tc_impl_recv_tid.
 let mut tc_impl_recv_tids: Map[Int, Int] = Map()
+// The impls over a user generic type that are checked and emitted per instance: impl node to
+// the receiver type's declaration. Written beside the receiver tid; read through
+// tc_poly_user_impl_decl.
+let mut tc_poly_user_impls: Map[Int, Int] = Map()
+// The impl block of every impl method, keyed by method node. A call knows its method's
+// declaration, and only the impl says what the method's type variables stand for.
+let mut tc_impl_of_method: Map[Int, Int] = Map()
 // The fnsig KEY of the impl method being checked, or "" outside one. An impl method registers its
 // signature under the trait-mangled spelling (tc_mangle_impl_fnsig) but is checked under
 // "{impl_type}_{method}", so without this key, tc_check_fn's `lookup_fnsig(fn_name)` misses and
@@ -6672,10 +6689,60 @@ fn tc_record_impl_recv_tid(im: Int) ! TypeCheck.Resolve, Diag.Report {
     tc_push_tparam_scope(binders_sl)
     let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
-    let t = resolve_type_parts(name, node_recv_type_args(im), -1)
+    let t = tc_impl_recv_structural(resolve_type_parts(name, node_recv_type_args(im), -1), node_recv_type_args(im))
     tc_suppress_ann_validation = saved_suppress
     tc_pop_tparam_scope(binders_sl)
     tc_impl_recv_tids.insert(im, t)
+    tc_record_poly_user_impl(im, t)
+}
+
+// An all-typevar receiver (`for Box[T]`) resolves to the bare base, which has no slot for
+// the impl's T. `self` needs the slots, so a field read answers the impl's binder and not
+// the declaration's. Called with the binders in scope.
+@allow(UnrestoredMutation)
+fn tc_impl_recv_structural(t: Int, args_sl: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    if args_sl == -1 || sublist_length(args_sl) == 0 { return t }
+    let k = type_kind(t)
+    if k != TyKind.Struct && k != TyKind.Enum { return t }
+    if ty_pool.get(t).unwrap().params_count != 0 { return t }
+    let mut arg_tids: List[Int] = []
+    let mut i = 0
+    while i < sublist_length(args_sl) {
+        arg_tids.push(resolve_type_ann(sublist_get(args_sl, i)))
+        i = i + 1
+    }
+    let base = tc_instance_base_name(t)
+    if k == TyKind.Struct { return make_struct_instance_type(base, arg_tids) }
+    make_enum_instance_type(base, arg_tids)
+}
+
+// A user generic type's impl is per instance when its receiver arguments are its binders,
+// each once and in order: every instance then names every binder, so the binds read
+// straight off the receiver.
+fn tc_record_poly_user_impl(im: Int, recv: Int) {
+    let binders_sl = node_impl_binders(im)
+    if binders_sl == -1 { return }
+    let n = sublist_length(binders_sl)
+    if n == 0 || tc_tid_struct_arg_count(recv) != n { return }
+    let decl = tc_tid_decl_node(recv)
+    if decl < 0 { return }
+    let mut i = 0
+    while i < n {
+        let a = tc_tid_struct_arg_tid(recv, i)
+        if type_kind(a) != TyKind.Typevar || tc_tid_binder(a) != sublist_get(binders_sl, i) { return }
+        i = i + 1
+    }
+    tc_poly_user_impls.insert(im, decl)
+}
+
+// Pure, so mono and codegen read the one decision typecheck made.
+pub fn tc_impl_is_poly_user(im: Int) -> Bool {
+    tc_poly_user_impls.contains_key(im)
+}
+
+// The receiver type's declaration of a per-instance user impl, or -1 for any other impl.
+pub fn tc_poly_user_impl_decl(im: Int) -> Int {
+    tc_poly_user_impls.get(im) ?? -1
 }
 
 // The receiver tid typecheck recorded for the impl block `im`; pure, so lowering can read it.
@@ -9672,11 +9739,14 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
         //     path. A TYPE-DEPENDENT Set/Map poly impl (a binder in a method
         //     signature) would need per-element monomorphization that is not
         //     built yet, so it must still trip E0908.
+        //  3. A user generic struct or enum whose receiver arguments are the
+        //     binders in order (`impl[T] X for Box[T]`, `impl[A, B] X for
+        //     Pair[A, B]`): monomorphized per receiver instance.
         // Any other shape stays unsupported: multi-binder List impls (mis-map
         // both binders to the element), binders without a receiver type-arg
         // (Holder), receiver args without binders (Box[Int]), concrete
-        // `List[Int]`, and user generic structs (Box[T]).
-        let mut poly_supported = 0
+        // `List[Int]`, a nested binder (Box[List[T]]) and a repeated one.
+        let mut poly_supported = if tc_impl_is_poly_user(im) { 1 } else { 0 }
         if binders_sl != -1 && recv_args_sl != -1 {
             let nb = sublist_length(binders_sl)
             let nr = sublist_length(recv_args_sl)
@@ -10096,6 +10166,8 @@ fn init_types() ! TypeCheck.Register {
     tc_type_decl_ambiguous_names = Map()
     tc_namesake_type_modules = Map()
     tc_impl_recv_tids = Map()
+    tc_poly_user_impls = Map()
+    tc_impl_of_method = Map()
     tc_active_tparams.clear()
     tc_call_site_type_args.clear()
     tc_tp_arith_names.clear()
@@ -10491,6 +10563,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
                     // so two traits sharing a method name don't overwrite.
                     let mangled = tc_mangle_impl_fnsig(impl_type, trait_name, orig_name, im)
                     tc_record_method_trait(impl_type, orig_name, trait_name)
+                    tc_impl_of_method.insert(m, im)
                     node_set_name(m, mangled)
                     register_fn_sig(m)
                     node_set_name(m, orig_name)
@@ -17184,7 +17257,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             let sig_name = if sole_trait != "" { "{tname}_{sole_trait}_{method}" } else { "{tname}_{method}" }
             let sig = lookup_fnsig(sig_name)
             if sig != -1 {
-                let mut mtids = check_arg_shapes("{tname}.{method}", sig, node_args(node), 1, node)
+                // Before the argument check: an argument typed by an impl binder takes the
+                // receiver's type argument as its hint, as a List poly-impl argument does.
+                let ibinds = tc_impl_binds_at_call(sig, obj_t)
+                let mut mtids = check_arg_shapes_with_binds("{tname}.{method}", sig, node_args(node), 1, node, ibinds)
                 // Which declaration this call reached. The signature answers, because the
                 // receiver picked the signature and the receiver is the only thing that
                 // tells two impls of one method name apart.
@@ -17209,11 +17285,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // impl over a generic type puts the impl's binders in the same count and
                 // those are answered by the receiver, not by the arguments.
                 if tc_decl_has_own_type_params(mfs.decl) != 0 {
-                    return instantiate_return_type(sig, mtids, node, 1)
+                    return substitute_typevar_tid(instantiate_return_type(sig, mtids, node, 1), ibinds)
                 }
                 // A return declared over the receiver type's own binders, as a derived clone
                 // is, stands for the receiver's instance. A no-op for a monomorphic receiver.
-                return tc_member_tid_at_instance(mfs.ret, obj_t)
+                return substitute_typevar_tid(tc_member_tid_at_instance(mfs.ret, obj_t), ibinds)
             }
             // Instant's two CODEGEN-ONLY methods. Four of its six are declared in
             // lib/std/time.bl:16-19 and so resolve through the fnsig lookup just above;

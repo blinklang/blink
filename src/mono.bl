@@ -36,7 +36,7 @@ import typecheck.{
     tc_alias_to_original, tc_call_decl_node, tc_field_tid_at_instance,
     tc_lookup_node_tid, tc_mc_obj_is_value, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_is_iterator_method, tc_resolve,
     tc_ret_mint_at, tc_tid_child, tc_tid_child_count,
-    tc_tid_decl_node, tc_tid_kind,
+    tc_tid_decl_node, tc_tid_kind, tc_impl_is_poly_user, tc_poly_user_impl_decl,
     tc_tid_is_no_info, tc_tid_list_elem, tc_tid_name, tc_tid_resolved, tc_tid_struct, tc_type_str,
     tc_void_tid,
 }
@@ -80,6 +80,10 @@ let mut own_generic_method_impl: Map[Int, Int] = Map()
 let mut poly_method_by_name: Map[Str, Int] = Map()
 let mut poly_method_by_qualified: Map[Str, Int] = Map()
 let mut poly_block_of_method: Map[Int, Int] = Map()
+// A user generic type's per-instance impl methods, keyed by the receiver's declaration and
+// the method name. A call reaches one through its receiver, which inside a bounded body is
+// known only once the instance substitutes it.
+let mut poly_user_method_by_recv: Map[Str, Int] = Map()
 
 // A root walk has no instance; it reads types straight from typecheck.
 let ROOT_BINDS: Map[Str, Int] = Map()
@@ -156,6 +160,7 @@ fn mono_reset() {
     poly_method_by_name = Map()
     poly_method_by_qualified = Map()
     poly_block_of_method = Map()
+    poly_user_method_by_recv = Map()
 }
 
 // ── Declaration maps ───────────────────────────────────────────────────────────
@@ -203,10 +208,13 @@ fn register_own_generic_methods(im: Int) {
     }
 }
 
-// `impl[T] Trait[T] for List[T]` is the one impl shape that is per-element: exactly one
-// binder, a List receiver whose single type argument is that binder, and a body that
-// can see the element. An element-agnostic impl is one shared symbol instead.
+// Two impl shapes are per instance. `impl[T] Trait[T] for List[T]`: exactly one binder, a
+// List receiver whose single type argument is that binder, and a body that can see the
+// element; an element-agnostic one is one shared symbol instead. And an impl over a user
+// generic type whose receiver arguments are its binders, which typecheck decides: each
+// instance of that type has its own C layout, so no such body is ever shared.
 pub fn is_poly_impl(im: Int) -> Bool {
+    if tc_impl_is_poly_user(im) { return true }
     if node_name(im) != "List" { return false }
     let binders_sl = node_impl_binders(im)
     let recv_args_sl = node_recv_type_args(im)
@@ -262,17 +270,28 @@ fn ann_mentions_binder(ann: Int, binders_sl: Int) -> Bool {
     false
 }
 
+// A user impl stays out of the by-name maps: they serve List receivers, and a List impl
+// of the same method name must not reach a user type's body.
 fn register_poly_impl(im: Int) {
     if !is_poly_impl(im) { return }
+    let user_decl = tc_poly_user_impl_decl(im)
     let methods_sl = node_methods(im)
     let mut j = 0
     while j < sl_len(methods_sl) {
         let m = sublist_get(methods_sl, j)
-        poly_method_by_name.insert(node_name(m), m)
-        poly_method_by_qualified.insert("{node_trait_name(im)}.{node_name(m)}", m)
+        if user_decl >= 0 {
+            poly_user_method_by_recv.insert(poly_user_key(user_decl, node_name(m)), m)
+        } else {
+            poly_method_by_name.insert(node_name(m), m)
+            poly_method_by_qualified.insert("{node_trait_name(im)}.{node_name(m)}", m)
+        }
         poly_block_of_method.insert(m, im)
         j = j + 1
     }
+}
+
+fn poly_user_key(decl: Int, method: Str) -> Str {
+    "{decl}|{method}"
 }
 
 // ── Roots ──────────────────────────────────────────────────────────────────────
@@ -605,16 +624,18 @@ fn register_own_generic_method(m: Int, arg_tids0: List[Int]) -> Int {
 // the call. They are ONE key and one symbol, because they choose one body between them —
 // keying on the element alone would give every argument type the first call's body, and
 // keying on the method's binders alone would give every element the first receiver's.
-// Element first, in impl-header order, then the method's own binders in declaration order.
-fn register_poly_own_generic_method(m: Int, elem_tid0: Int, own_tids0: List[Int]) -> Int {
+// The impl's binders first, in impl-header order, then the method's own binders in
+// declaration order.
+fn register_poly_own_generic_method(m: Int, impl_tids0: List[Int], own_tids0: List[Int]) -> Int {
     let im = poly_block_of_method.get(m) ?? -1
     if im < 0 { return -1 }
     if own_tids0.len() == 0 { return -1 }
-    let elem_tid = canon_tid(elem_tid0)
+    let impl_tids = canon_tids(impl_tids0)
     let own_tids = canon_tids(own_tids0)
-    let mut arg_tids: List[Int] = [elem_tid]
+    let mut arg_tids: List[Int] = []
+    for t in impl_tids { arg_tids.push(t) }
     for t in own_tids { arg_tids.push(t) }
-    let mut binds = binds_from_binders(node_impl_binders(im), [elem_tid])
+    let mut binds = binds_from_binders(node_impl_binders(im), impl_tids)
     let own_binds = binds_from_binders(node_type_params(m), own_tids)
     for k in own_binds.keys() { binds.insert(k, own_binds.get(k) ?? -1) }
     let args_tid = make_tuple_type(arg_tids)
@@ -622,13 +643,15 @@ fn register_poly_own_generic_method(m: Int, elem_tid0: Int, own_tids0: List[Int]
     register_with_binds(m, binds, arg_tids, inst_tid, c_poly_method_name(im, node_name(m), args_tid))
 }
 
-fn register_poly_method(m: Int, elem_tid0: Int) -> Int {
-    let elem_tid = canon_tid(elem_tid0)
+// Keyed on the impl binders' tids, so two receivers that differ only inside an argument the
+// C layout erases are still two instances.
+fn register_poly_method(m: Int, impl_tids0: List[Int]) -> Int {
+    let impl_tids = canon_tids(impl_tids0)
     let im = poly_block_of_method.get(m).unwrap()
     let binders_sl = node_impl_binders(im)
-    let inst_tid = canon_tid(fn_signature_tid(m, binds_from_binders(binders_sl, [elem_tid])))
-    let c_name = c_poly_method_name(im, node_name(m), make_tuple_type([elem_tid]))
-    register(m, binders_sl, [elem_tid], inst_tid, c_name)
+    let inst_tid = canon_tid(fn_signature_tid(m, binds_from_binders(binders_sl, impl_tids)))
+    let c_name = c_poly_method_name(im, node_name(m), make_tuple_type(impl_tids))
+    register(m, binders_sl, impl_tids, inst_tid, c_name)
 }
 
 fn note_call_target(ctx: Int, call_node: Int, inst_index: Int) {
@@ -739,24 +762,62 @@ fn discover_poly_impl_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
         }
         return
     }
+    if discover_poly_user_call(ctx, node, obj) { return }
     match poly_method_by_name.get(method) {
         Some(m) => register_poly_recv(ctx, m, obj, node)
         None => {}
     }
 }
 
+// The receiver's declaration picks the impl: inside a bounded body (`self.value.show()`)
+// the receiver is a type parameter to typecheck, and only the instance says which type it is.
+fn discover_poly_user_call(ctx: Int, node: Int, obj: Int) -> Bool ! Diag.Report {
+    let recv_tid = ctx_node_tid(ctx, obj)
+    if recv_tid < 0 { return false }
+    let decl = tc_tid_decl_node(recv_tid)
+    if decl < 0 { return false }
+    match poly_user_method_by_recv.get(poly_user_key(decl, node_method(node))) {
+        Some(m) => {
+            register_poly_instance(ctx, m, recv_tid, recv_args(recv_tid), node)
+            true
+        }
+        None => false
+    }
+}
+
+fn recv_args(recv_tid: Int) -> List[Int] {
+    let ct = canon_tid(recv_tid)
+    let mut args: List[Int] = []
+    let mut i = 0
+    while i < tc_tid_child_count(ct) {
+        args.push(tc_tid_child(ct, i))
+        i = i + 1
+    }
+    args
+}
+
 fn register_poly_recv(ctx: Int, m: Int, recv_node: Int, call_node: Int) ! Diag.Report {
     let recv_tid = ctx_node_tid(ctx, recv_node)
     if recv_tid < 0 { return }
     let elem_tid = tc_tid_list_elem(recv_tid)
-    if elem_tid < 0 || tid_is_open(elem_tid) { return }
+    if elem_tid < 0 { return }
+    register_poly_instance(ctx, m, recv_tid, [elem_tid], call_node)
+}
+
+// `impl_tids` answers the impl's binders in header order. An open one is a call inside a
+// generic body, which is registered once that body's instance substitutes it.
+fn register_poly_instance(ctx: Int, m: Int, recv_tid: Int, impl_tids: List[Int], call_node: Int) ! Diag.Report {
+    if impl_tids.len() == 0 { return }
+    for t in impl_tids {
+        if tid_is_open(t) { return }
+    }
     if has_type_params(m) {
         let binds = solve_call_binds(ctx, m, call_node, [recv_tid], node_args(call_node))
         let own = binder_args(ctx, m, call_node, binds)
-        note_call_target(ctx, call_node, register_poly_own_generic_method(m, elem_tid, own))
+        note_call_target(ctx, call_node, register_poly_own_generic_method(m, impl_tids, own))
         return
     }
-    note_call_target(ctx, call_node, register_poly_method(m, elem_tid))
+    note_call_target(ctx, call_node, register_poly_method(m, impl_tids))
 }
 
 // A sealed List HOF method (`.map/.filter/.fold/.for_each/.any/.all`) calls the
