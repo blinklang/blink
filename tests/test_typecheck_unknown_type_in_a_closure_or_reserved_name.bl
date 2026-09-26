@@ -1,0 +1,123 @@
+// A type name nothing declares is `error[UnknownType]` in every position that writes a type.
+// Name resolution walked function signatures, bodies and type declarations, but not a
+// closure's own parameter and return annotations, so the same undeclared name was refused in
+// a declaration and lowered to a free type variable in a closure, where it unifies with
+// anything.
+//
+// A reserved builtin name that the type lowering cannot place is the same hole from the other
+// side: name resolution accepted it as known, lowering made it a free type variable, and a
+// `Str` passed to an `F32` parameter type checked. Whatever such a name turns out to be, a
+// `Str` argument to it must be refused.
+//
+// The report also names the line of the annotation, so the writer can find it.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+
+fn unknown_type_reports(name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.name == "UnknownType" && d.message.contains(name) { n = n + 1 }
+    }
+    n
+}
+
+fn unknown_type_line(name: Str) -> Int {
+    for d in diag_entries {
+        if d.severity == "error" && d.name == "UnknownType" && d.message.contains(name) { return d.line }
+    }
+    -1
+}
+
+fn errors_naming(text: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.message.contains(text) { n = n + 1 }
+    }
+    n
+}
+
+fn report_names() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        out = out.concat("[{d.severity}] {d.name} at {d.line}: {d.message}\n")
+    }
+    out
+}
+
+fn assert_reported(label: Str, name: Str) {
+    if unknown_type_reports(name) < 1 {
+        io.println("FAIL: {label}: no UnknownType names '{name}'. Reports:\n{report_names()}")
+    }
+    assert(unknown_type_reports(name) >= 1)
+}
+
+fn assert_not_reported(label: Str, name: Str) {
+    if unknown_type_reports(name) != 0 {
+        io.println("FAIL: {label}: UnknownType names '{name}' and must not. Reports:\n{report_names()}")
+    }
+    assert_eq(unknown_type_reports(name), 0)
+}
+
+fn assert_line(label: Str, name: Str, line: Int) {
+    if unknown_type_line(name) != line {
+        io.println("FAIL: {label}: UnknownType for '{name}' is not on line {line}. Reports:\n{report_names()}")
+    }
+    assert_eq(unknown_type_line(name), line)
+}
+
+fn assert_refused(label: Str, text: Str) {
+    if errors_naming(text) < 1 {
+        io.println("FAIL: {label}: no error names '{text}'. Reports:\n{report_names()}")
+    }
+    assert(errors_naming(text) >= 1)
+}
+
+// One probe, compiled once: the typecheck name tables are process-global and are not reset
+// between compiles, so a second probe would read the first one's declarations. The line
+// numbers the rows below assert are the probe's own: line 1 is the signature, line 16 the
+// first closure.
+fn compile_the_probe() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    diag_reset()
+    let path = "build/unknown_type_in_closure_probe.bl"
+    let src = "fn zq_located(p: ZqMissingParam) -> Int \{ 1 \}\n\ntype ZqDeclared \{\n    x: Int\n\}\n\nfn zq_takes_f32(x: F32) -> F32 \{ x \}\nfn zq_takes_f64(x: F64) -> F64 \{ x \}\n\nfn zq_generic[T](v: T) -> T \{\n    let k = fn(y: T) -> T \{ y \}\n    k(v)\n\}\n\nfn main() \{\n    let a = fn(x: ZqMissingClosureParam) -> Int \{ 1 \}\n    let b = fn(x: Int) -> ZqMissingClosureRet \{ x \}\n    let c = fn(d: ZqDeclared) -> Int \{ d.x \}\n    let _f = zq_takes_f32(\"s\")\n    let _g = zq_takes_f64(\"s\")\n    let _h = zq_generic(1)\n    let _n = a(1) + c(ZqDeclared \{ x: 2 \})\n    let _m = b(3)\n\}\n"
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    let _ = fs.delete(path)
+    check_types(program)
+}
+
+test "an undeclared type in a closure parameter annotation is reported" {
+    compile_the_probe()
+    assert_reported("closure parameter", "ZqMissingClosureParam")
+}
+
+test "an undeclared type in a closure return annotation is reported" {
+    compile_the_probe()
+    assert_reported("closure return", "ZqMissingClosureRet")
+}
+
+test "an undeclared type is reported on the line of its annotation" {
+    compile_the_probe()
+    assert_line("fn parameter", "ZqMissingParam", 1)
+    assert_line("closure parameter", "ZqMissingClosureParam", 16)
+}
+
+test "a Str argument to an F32 parameter is refused" {
+    compile_the_probe()
+    assert_refused("F32 parameter", "F32")
+}
+
+test "a Str argument to an F64 parameter is refused" {
+    compile_the_probe()
+    assert_refused("F64 parameter", "F64")
+}
+
+test "a declared type and an enclosing binder in a closure are not undeclared" {
+    compile_the_probe()
+    assert_not_reported("declared type in closure", "ZqDeclared")
+    assert_not_reported("enclosing binder in closure", "'T'")
+}
