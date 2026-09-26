@@ -1,0 +1,84 @@
+// Section 4 gives a with-item that has no `as` two readings: a Handler[E] installs an
+// effect handler and a BlockHandler wraps the block. Typecheck took any type there, so an
+// Int reached codegen and stopped as an internal error. Any other type is now E0839.
+// A with-item bound by `as` is not checked here.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn messages_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.code} {d.message}\n") }
+    }
+    out
+}
+
+fn reported_for(name: Str, decls: Str, item: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let src = "{decls}\nfn main() \{\n    with {item} \{\n        io.println(\"in\")\n    }\n}\n"
+    let _ = probe("build/tc_with_item_{name}.bl", src)
+    let got = messages_reported()
+    io.println("with {item}: {got}")
+    got
+}
+
+fn refusal(type_name: Str) -> Str {
+    "E0839 a with-item without `as` must be a Handler[E] or a BlockHandler, got {type_name}\n"
+}
+
+let block_handler_decls = "type Mark \{\n    tag: Str\n}\n\nimpl BlockHandler for Mark \{\n    type Context = Void\n\n    fn enter(self) \{\n    }\n\n    fn exit(self, ok: Bool) \{\n    }\n}\n\nfn make_mark() -> Mark \{ Mark \{ tag: \"m\" } }\n"
+
+let handler_decls = "fn make_io_handler() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.eprintln(msg)\n        }\n    }\n}\n"
+
+test "an Int with-item is refused" {
+    assert_eq(reported_for("int", "fn setup() -> Int \{ 0 }\n", "setup()"), refusal("Int"))
+}
+
+test "a Str with-item is refused" {
+    assert_eq(reported_for("str", "", "\"handler\""), refusal("Str"))
+}
+
+test "a List with-item is refused" {
+    assert_eq(reported_for("list", "", "[1, 2]"), refusal("List[Int]"))
+}
+
+test "a struct with no BlockHandler impl is refused" {
+    let decls = "type Plain \{\n    n: Int\n}\n\nfn make_plain() -> Plain \{ Plain \{ n: 1 } }\n"
+    assert_eq(reported_for("plain_struct", decls, "make_plain()"), refusal("Plain"))
+}
+
+test "a Handler value is accepted" {
+    assert_eq(reported_for("handler", handler_decls, "make_io_handler()"), "")
+}
+
+test "arena is accepted" {
+    assert_eq(reported_for("arena", "", "arena"), "")
+}
+
+test "a BlockHandler is accepted" {
+    assert_eq(reported_for("block_handler", block_handler_decls, "make_mark()"), "")
+}
+
+test "an Int bound by as is not checked" {
+    let _ = probe("build/tc_with_item_int_as.bl",
+        "fn open() -> Int \{ 42 }\nfn main() \{\n    with open() as x \{\n        io.println(\"\{x}\")\n    }\n}\n")
+    assert_eq(messages_reported(), "")
+}
+
+test "an undefined with-item reports only the undefined name" {
+    assert_eq(reported_for("undefined", "", "nope"), "E0506 undefined variable 'nope'\n")
+}

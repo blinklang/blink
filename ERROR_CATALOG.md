@@ -135,6 +135,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | TrustedRequiresAudit | E0836 | `@trusted` written without a non-empty `audit:` identifier | FFI | §9.1 |
 | AuditGatedSuppression | E0837 | An audit-gated diagnostic (`UnauditedFfi`, `RawBypassesParam`) named in `@allow(...)` or under `[lints]` — refused, not ignored, because neither channel records anything | FFI | §9.1 |
 | FfiOffsetUnknownStride | E0838 | `Ptr.offset` requires `@ffi.struct` element type | FFI | §9.1.1 |
+| NonHandlerWithItem | E0839 | A `with` item without `as` is neither a `Handler[E]` nor a `BlockHandler` | Effects | §4.7 |
 | TraitContractMissingMethod | E0900 | Trait contract: required method not implemented | Trait contract | §3.6 |
 | TraitContractWrongArity | E0901 | Trait contract: method has wrong argument arity | Trait contract | §3.6 |
 | TraitContractParamMismatch | E0902 | Trait contract: method parameter type mismatch | Trait contract | §3.6 |
