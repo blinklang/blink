@@ -2528,6 +2528,7 @@ This is the mirror image of the W0604 gate (§3.4 *Explicit Type Application*), 
 - **Dispatch on `T`'s identity.** `if T == Int { ... }`, `match T { ... }`, and equivalent constructs are compile errors.
 - **Inspect `T`'s runtime layout, size, alignment, or pointer-kind.** No `sizeof`-like form exists in the source language for type parameters.
 - **Call any function that exposes `T`'s runtime shape.** This rules out reading `T` from any reflective API.
+- **Read or write a field of `T`.** A type parameter declares no fields, and a bound adds only methods: `error[NoSuchField]` (E0525).
 
 The **only legal way** for a polymorphic impl body to vary behavior based on `T` is to introduce a trait bound and call a method on that bound. `(x: T).display()` is permitted when `T: Display` — it is dispatched at monomorphization time and resolves to the bound type's `Display` impl, not to a runtime type check.
 
