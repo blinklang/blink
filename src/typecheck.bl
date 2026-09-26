@@ -22573,18 +22573,52 @@ fn tc_stamp_assert(order: List[Int], owner: Map[Int, Int], stood: Map[Int, Int])
     }
 }
 
+// A call no arm claimed is a name error once its receiver names a type or a module
+// (section 6.3.3), and 6.3.5 wants it reported before codegen, which would otherwise lay
+// out the value the call never had. A type parameter's methods are decided per instance.
+fn tc_report_unclaimed_calls() ! Diag.Report {
+    for uc in tc_unclaimed_call_nodes() {
+        let obj = node_obj(uc)
+        let mname = node_method(uc)
+        let recv = tc_lookup_node_tid(obj)
+        if tc_unclaimed_receiver_is_named(recv) != 0 {
+            let tname = tc_type_str(recv)
+            diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method '.{mname}' on type {tname}",
+                uc, tc_unresolved_method_help(type_kind(recv), tname, mname))
+        } else if node_kind(obj) == NodeKind.Ident {
+            let q = node_name(obj)
+            if is_builtin_namespace(q) == 1 || is_import_module_name(q) == 1 {
+                let near = suggest_module_member(tc_qualifier_to_module_or_self(q), mname)
+                let help = if near != "" { "did you mean '{q}.{near}'?" } else { "" }
+                diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "no member '{mname}' on module '{q}'", uc, help)
+            }
+        }
+    }
+}
+
+// A value receiver's type, determined all the way down. A local shadowing a module name
+// lands here too, so it is named by its type and not as the module.
+fn tc_unclaimed_receiver_is_named(tid: Int) -> Int {
+    if tc_tid_is_concrete(tid) == 0 { return 0 }
+    let r = tc_tid_resolved(tid)
+    if tc_tid_has_unbound_metavar(r) != 0 || tc_tid_has_unknown(r) != 0 { return 0 }
+    if tc_tid_has_bare_typevar(r) != 0 { return 0 }
+    1
+}
+
 // Phases 4 and 5 over one program. Separate from check_types so `blink check` and the test
 // harness reach the same pass by the same name.
 pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let mut owner: Map[Int, Int] = Map()
     let order = tc_stamp_walk(program, owner)
+    tc_report_unclaimed_calls()
     // A program that already has an error has nodes inference deliberately never typed: the
     // arm that would have typed them reported instead and returned. Asserting there turns
     // every ordinary type error into an internal-compiler-error cascade, so the total-stamp
     // claim only holds for a program that type checks.
     if diag_count > 0 { return }
-    // The same precondition, for an error typecheck cannot report YET. A call no arm claimed
-    // is codegen's to report, and until it does the absence spreads: the let it initializes
+    // The same precondition, for a call left unclaimed on a receiver with no named type, which
+    // tc_report_unclaimed_calls cannot report. The absence spreads: the let it initializes
     // carries nothing, and so does every read of that binding. Nothing here can tell those
     // apart from a real hole — inside the BODY that holds the call. Every other body keeps its
     // claim, so one unclaimed call buys silence for itself and not for the program.
