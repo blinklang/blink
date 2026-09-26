@@ -14,7 +14,7 @@
 import std.io
 import layout.{layout_reset}
 import cname.{cname_reset, c_impl_method_name}
-import cg_test_helpers.{cg_probe_compile, cg_probe_compile_but, cg_probe_ices_naming}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_naming}
 import cg.{CgConfig, generate}
 import cg_reg.{cg_reg_impl_methods, cg_reg_impl_of}
 import mono.{run_mono, instances, is_poly_impl, poly_impl_is_element_agnostic}
@@ -31,16 +31,6 @@ fn standalone_cfg() -> CgConfig {
 
 fn probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     let program = cg_probe_compile("build/{stem}.bl", src)
-    run_mono(program)
-    layout_reset()
-    cname_reset()
-    program
-}
-
-// The same, for a probe naming a construct the front end declines. The body stage is
-// still asked to write the program, which is what a test of that stage needs.
-fn probe_but(stem: Str, src: Str, expected: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
-    let program = cg_probe_compile_but("build/{stem}.bl", src, expected)
     run_mono(program)
     layout_reset()
     cname_reset()
@@ -203,11 +193,10 @@ fn main() {
 
 // A generic user type is a different C struct per argument and has no spelling at all
 // until one is chosen. So an impl over one has no single body either, however little its
-// methods say about the binder, and the stage must report it rather than write a body
-// naming a struct that does not exist.
-test "a generic user type receiver is reported however agnostic its methods are" {
+// methods say about the binder: each instance a call reaches gets its own body.
+test "a generic user type receiver gets one body per instance however agnostic its methods are" {
     let stem = "cg_pim_user_generic_recv"
-    let program = probe_but(stem, #"type Box[T] {
+    let program = probe(stem, #"type Box[T] {
     v: T
 }
 
@@ -220,10 +209,27 @@ impl[T] Sz for Box[T] {
 }
 
 fn main() {
-    assert(true)
+    assert(Box { v: 1 }.sz() == 1)
+    assert(Box { v: "a" }.sz() == 1)
 }
-"#, "PolyImplUnsupported")
-    let _text = generate(program, standalone_cfg())
+"#)
+    let text = generate(program, standalone_cfg())
     assert(poly_impl_is_element_agnostic(impl_of("sz")))
-    assert_eq(cg_probe_ices_naming(BODY_GAP), 1)
+    assert(is_poly_impl(impl_of("sz")))
+    assert_eq(cg_probe_ices_naming(BODY_GAP), 0)
+    let symbols = instance_symbols("sz")
+    assert_eq(symbols.len(), 2)
+    for s in symbols { assert_eq(definitions_of(text, s), 1) }
+}
+
+// Every symbol the mono pass chose for an impl method's instances.
+fn instance_symbols(mname: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for m in cg_reg_impl_methods() {
+        if node_name(m) != mname { continue }
+        for mi in instances() {
+            if mi.base_decl_node == m { out.push(mi.c_name) }
+        }
+    }
+    out
 }
