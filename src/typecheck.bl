@@ -1345,19 +1345,6 @@ let mut tc_inc_filter: Map[Str, Int] = Map()
 // is resolved with the flag clear and still reports as before.
 let mut tc_suppress_ann_validation: Int = 0
 
-// Raised around tc_produce_struct_instance_tid's own arg-resolution loop:
-// while resolving Box[Box[T]]'s outer arg list, the inner Box[T] element
-// is itself re-resolved through resolve_type_ann's struct branch, which recurses
-// back into tc_produce_struct_instance_tid for "Box[T]". That inner call's own
-// all-typevar skip would otherwise erase T and return -1, collapsing the slot to
-// the bare Box tid — the outer instance then carries no way to substitute T later.
-// This flag tells an inner call "you were reached while your caller was itself
-// producing a struct instance", so it mints the all-typevar instance anyway. It
-// does NOT widen the skip's exemption to the general hot path (a plain `Box[T]`
-// resolved directly off a Map/List/... branch still returns -1, unchanged) —
-// only a struct instance nested inside another struct instance's arg list opts in.
-pub let mut tc_structural_nested_instances: Int = 0
-
 // ── Type creation ───────────────────────────────────────────────────
 
 fn new_type(kind: TyKind, name: Str) -> Int {
@@ -6608,7 +6595,7 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
 
     let resolved = resolve_type_name(name)
     if resolved != -1 {
-        // A user struct named with concrete type-args (`Box[Int]`) resolves to the
+        // A user struct named with type-args (`Box[Int]`, `Box[T]`) resolves to the
         // structured instance tid on the LIVE path: the
         // annotation side must carry the specialization so a concrete param/let
         // type (Box[Int]) compares by name+params against a reverse-inferred
@@ -6616,8 +6603,7 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
         // a struct tid back to its declaration (fields, derives) normalize
         // instance→base by name, so the fresh instance entry is safe. The instance
         // is still memoized onto the annotation node's tc_node_tid slot for the
-        // tc_tid_struct_arg_* accessors. Falls back to the bare tid when no concrete
-        // arg is present (all-typevar `Box[T]`).
+        // tc_tid_struct_arg_* accessors.
         // The struct/enum branches are the only ones that never visited their own args on the
         // live path, so a Map key or Set element reached through one escaped validation
         // entirely. Gated on the same flag as the Map/Set branches above so the
@@ -6626,16 +6612,13 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
             tc_validate_type_arg_hashability(elems_sl)
         }
         if type_kind(resolved) == TyKind.Struct && elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-            let inst = tc_produce_struct_instance_tid(ann_node, tc_instance_base_name(resolved), elems_sl)
-            if inst != -1 { return inst }
+            return tc_produce_struct_instance_tid(ann_node, tc_instance_base_name(resolved), elems_sl)
         }
         // A generic-enum instance annotation (`t: Tree[Int]`) likewise memoizes its
         // structured instance tid onto the annotation node so codegen's param_c_type
         // can lower it to the mono carrier (blink_Tree_Int), not the erased bare enum.
-        // Same all-typevar skip as the struct producer.
         if type_kind(resolved) == TyKind.Enum && elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-            let inst = tc_produce_enum_instance_tid(ann_node, tc_instance_base_name(resolved), elems_sl)
-            if inst != -1 { return inst }
+            return tc_produce_enum_instance_tid(ann_node, tc_instance_base_name(resolved), elems_sl)
         }
         return resolved
     }
@@ -6770,16 +6753,15 @@ pub fn tc_impl_recv_tid(im: Int) -> Int ! Diag.Report {
 }
 
 // OFF-PATH monomorphized-struct-instance producer. Called only
-// when resolve_type_ann sees a user struct named with concrete type-args
-// (`Box[Int]`). resolve_type_ann's live return stays the bare generic tid; this
+// when resolve_type_ann sees a user struct named with type-args
+// (`Box[Int]`, `Box[T]`). resolve_type_ann's live return stays the bare generic tid; this
 // builds the structured instance tid and memoizes it onto the annotation node's
 // tc_node_tid slot for the tc_tid_struct_arg_* accessors to read. Byte-identical:
 // annotation nodes never reach infer_type, so this slot is otherwise -1, and no
 // emit/typecheck reader consumes an annotation-node tid (the mono CSV path reads
-// ARG-EXPRESSION node tids only). Skipped when every arg is a typevar (a generic
-// `Box[T]`): inference variables must not be interned
-// (compiler-type-representation.md:47), and an all-typevar instance carries no
-// more information than the bare tid.
+// ARG-EXPRESSION node tids only). An all-typevar `Box[T]` in a generic body mints
+// too: a declared typevar is not an inference variable, and the bare head has no
+// slot for mono to substitute, so layout declines it.
 //
 // tc_suppress_ann_validation is raised over the arg re-resolution: this recursion
 // is net-new work the live struct path never did, and resolve_type_ann's Map/Set
@@ -6790,66 +6772,46 @@ pub fn tc_impl_recv_tid(im: Int) -> Int ! Diag.Report {
 fn tc_produce_struct_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
-    let saved_nested = tc_structural_nested_instances
-    tc_structural_nested_instances = 1
     let mut arg_tids: List[Int] = []
-    let mut has_concrete = 0
     let mut ai = 0
     while ai < sublist_length(elems_sl) {
-        let arg_t = resolve_type_ann(sublist_get(elems_sl, ai))
-        if type_kind(arg_t) != TyKind.Typevar { has_concrete = 1 }
-        arg_tids.push(arg_t)
+        arg_tids.push(resolve_type_ann(sublist_get(elems_sl, ai)))
         ai = ai + 1
     }
     tc_suppress_ann_validation = saved_suppress
-    tc_structural_nested_instances = saved_nested
-    if has_concrete != 0 || saved_nested != 0 {
-        let inst = make_struct_instance_type(name, arg_tids)
-        if ann_node >= 0 && ann_node < tc_node_tid.len() {
-            tc_node_tid.set(ann_node, inst)
-        }
-        return inst
+    let inst = make_struct_instance_type(name, arg_tids)
+    if ann_node >= 0 && ann_node < tc_node_tid.len() {
+        tc_node_tid.set(ann_node, inst)
     }
-    -1
+    inst
 }
 
 // The enum analogue of tc_produce_struct_instance_tid: mint+memoize a
 // generic-enum instance tid (`Tree[Int]`) onto the annotation node so codegen's
-// param_c_type reads the full mono stem. Same all-typevar skip and suppression.
+// param_c_type reads the full mono stem. Same suppression.
 @allow(UnrestoredMutation)
 fn tc_produce_enum_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
     let mut arg_tids: List[Int] = []
-    let mut has_concrete = 0
     let mut ai = 0
     while ai < sublist_length(elems_sl) {
-        let arg_t = resolve_type_ann(sublist_get(elems_sl, ai))
-        if type_kind(arg_t) != TyKind.Typevar { has_concrete = 1 }
-        arg_tids.push(arg_t)
+        arg_tids.push(resolve_type_ann(sublist_get(elems_sl, ai)))
         ai = ai + 1
     }
     tc_suppress_ann_validation = saved_suppress
-    if has_concrete != 0 {
-        let inst = make_enum_instance_type(name, arg_tids)
-        if ann_node >= 0 && ann_node < tc_node_tid.len() {
-            tc_node_tid.set(ann_node, inst)
-        }
-        return inst
+    let inst = make_enum_instance_type(name, arg_tids)
+    if ann_node >= 0 && ann_node < tc_node_tid.len() {
+        tc_node_tid.set(ann_node, inst)
     }
-    -1
+    inst
 }
 
 // A generic FN PARAM annotation (`b: Box[T]`) must intern as a STRUCTURAL instance
 // tid carrying its type-arg slots — even when every slot is a typevar — so
 // unify_typevar_binds' TyKind.Struct arm (which walks param/arg slots in lockstep) can
-// discover T from a `Box[Box[Int]]` argument. This is the deliberate
-// EXCEPTION to tc_produce_struct_instance_tid's all-typevar skip: that skip guards
-// the annotation/inference HOT path (an all-typevar instance there carries no more
-// info than the bare tid and would only churn the pool). A fn-param annotation is
-// resolved ONCE at register_fn_sig — not hot — and the typevar slots are exactly
-// what the binder needs. Without the slots the fnsig param collapses to the bare
-// `Box` (params_count 0), the arity check in unify_typevar_binds fails, and a
+// discover T from a `Box[Box[Int]]` argument. Without the slots the fnsig param
+// collapses to the bare `Box` (params_count 0), the arity check in unify_typevar_binds fails, and a
 // bare-typevar return `-> T` bound to a struct instance stays unsubstituted →
 // codegen types the result `void`.
 //
@@ -6865,8 +6827,8 @@ fn tc_produce_enum_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> Int 
 fn tc_fnsig_param_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     let bk = type_kind(bare_tid)
     // A CONTAINER param/return (`Map[Str, Box[T]]`, `List[Box[T]]`, …) whose element
-    // is a generic user-struct: resolve_type_ann erased that element to its bare base
-    // on the value path (the all-typevar skip), so at the call site
+    // is a generic user-struct: resolve_type_ann once erased that element to its bare
+    // base on the value path, so at the call site
     // substitute_typevar_tid meets a params_count-0 base in the slot and has no `[T]`
     // to rebind — the container comes back with the value erased (blink_Box, not
     // blink_Box_0Int). Recurse into each element annotation, re-intern it structurally,
@@ -6874,23 +6836,15 @@ fn tc_fnsig_param_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.
     // substitute_typevar_tid's own container arms and tc_evfield_structural_tid's tuple
     // recursion; returns -1 (caller keeps the bare tid) when no element needed interning.
     //
-    // A generic-ENUM element (`Map[Str, Wrap[T]]`) rides the same recursion, but its
-    // all-typevar instance is still skipped by tc_produce_enum_instance_tid AND its
-    // mono ctor is not yet emitted inside a generic body, so it stays erased for now.
+    // A generic-ENUM element (`Map[Str, Wrap[T]]`) rides the same recursion.
     if bk == TyKind.Map || bk == TyKind.List || bk == TyKind.Option || bk == TyKind.Result || bk == TyKind.Set {
         let need = if bk == TyKind.Map || bk == TyKind.Result { 2 } else { 1 }
         let celems_sl = node_elements(ann_node)
         if celems_sl == -1 || sublist_length(celems_sl) < need { return -1 }
         // The already-erased element tids the value path stored on the container.
         let ce = ty_pool.get(bare_tid).unwrap()
-        // Re-resolve each element with the nested-structural exception raised, exactly
-        // as tc_produce_struct_instance_tid's own nested-arg path does (the D2 fix):
-        // this mints a full `Box[T]` / `Box[Box[T]]` instance for a generic-struct
-        // element instead of the bare base, at any nesting depth.
         let saved_suppress = tc_suppress_ann_validation
-        let saved_nested = tc_structural_nested_instances
         tc_suppress_ann_validation = 1
-        tc_structural_nested_instances = 1
         let mut parts: List[Int] = []
         let mut ci = 0
         while ci < need {
@@ -6898,7 +6852,6 @@ fn tc_fnsig_param_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.
             ci = ci + 1
         }
         tc_suppress_ann_validation = saved_suppress
-        tc_structural_nested_instances = saved_nested
         let structural_key_or_only = parts.get(0).unwrap()
         // Nothing changed if every slot resolves to the tid already stored: keep the
         // caller on its bare tid so an all-scalar container is untouched.
@@ -6939,9 +6892,7 @@ fn tc_fnsig_param_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.
 // as a STRUCTURAL enum instance carrying its type-arg slots — even all-typevar ones
 // — so unify_typevar_binds' TyKind.Enum arm can walk the recursive-field param against a
 // concrete `Tree[Int]` construction arg and bind T. The enum analogue of
-// tc_fnsig_param_instance_tid; same deliberate exception to the all-typevar skip
-// (a field decl is resolved once at register_enum_type, not on the hot path).
-// Returns -1 (caller keeps the bare resolved tid) unless the annotation is a
+// tc_fnsig_param_instance_tid. Returns -1 (caller keeps the bare resolved tid) unless the annotation is a
 // generic user-enum with type-args.
 @allow(UnrestoredMutation)
 fn tc_evfield_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
@@ -6962,9 +6913,7 @@ fn tc_evfield_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.Reso
 
 // The tuple-aware extension of tc_evfield_instance_tid. A self-recursive tuple
 // field (`Pair(p: (Box[T], Box[T]))`) resolves through the bare-tuple path, whose
-// elements resolve_type_ann erases to the argless base (`(Box, Box)`) — the same
-// all-typevar skip tc_evfield_instance_tid exists to bypass for a DIRECT enum
-// field. Recurse the annotation: at a tuple, re-intern each element structurally
+// elements resolve_type_ann once erased to the argless base (`(Box, Box)`). Recurse the annotation: at a tuple, re-intern each element structurally
 // and rebuild the tuple so a SELF-type element keeps its `[T]` slots; otherwise
 // defer to tc_evfield_instance_tid. That preserved typevar is what lets a match
 // binder substitute T→Int from the scrutinee instance (tc_subst_evfield_from_instance)
@@ -7737,15 +7686,7 @@ fn resolve_struct_fields(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.
             let f = sublist_get(flds_sl, i)
             let fname = node_name(f)
             let ftype_ann = node_value(f)
-            // Preserve a nested generic-instance's type-arg slots (a carrier-wrapped
-            // `Option[Inner[T]]` or a direct `Inner[T]` field) so a later T->Int
-            // substitution rebuilds the mono instance from the field tid alone. The
-            // flag threads through the carrier branches of resolve_type_parts; the
-            // struct twin of the enum variant-field path at resolve_enum_variants.
-            let saved_nested = tc_structural_nested_instances
-            tc_structural_nested_instances = 1
             let ftype_id = resolve_type_ann(ftype_ann)
-            tc_structural_nested_instances = saved_nested
             sfield_pool.push(TcStructField { struct_id: tid, name: fname, type_id: ftype_id })
             let ftype_ann_name = node_name(ftype_ann)
             if ftype_ann_name == "Fn" {
@@ -8367,9 +8308,8 @@ fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
 
     if ret_ann != -1 {
         ret_tid = resolve_type_ann(ret_ann)
-        // A generic user-struct RETURN (`-> LocBox[T]`) resolves to the BARE base
-        // tid (resolve_type_ann's all-typevar instance is skipped for the hot path).
-        // Re-intern it as a structural instance carrying the typevar slots — exactly
+        // A generic user-struct RETURN (`-> LocBox[T]`) once resolved to the BARE base
+        // tid. Re-intern it as a structural instance carrying the typevar slots — exactly
         // as the param path does — so instantiate_return_type's
         // substitute_typevar_tid has a T slot to rewrite; otherwise a call
         // `make_box(11)` returns the bare `LocBox` tid, and a downstream bare-typevar
@@ -10232,7 +10172,6 @@ fn init_types() ! TypeCheck.Register {
     tc_in_closure_depth = 0
     tc_fn_body_block = 0
     tc_suppress_ann_validation = 0
-    tc_structural_nested_instances = 0
     tc_boundary_check_active = 0
     tc_ud_pending_names = []
     tc_ud_pending_tids = []
