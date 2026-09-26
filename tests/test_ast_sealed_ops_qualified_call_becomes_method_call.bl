@@ -1,0 +1,120 @@
+// The build rewrites a sealed ops trait's qualified call, `StrOps.len(s)`, into the method
+// call it means, `s.len()`, so every later stage sees one shape. The node keeps its id and
+// its position: tid stamps and diagnostics are keyed on both. A second rewrite would take
+// the next argument as the receiver, so the pass runs once per program and refuses a repeat.
+
+import std.fs
+import std.io
+import typecheck.{check_types, desugar_sealed_ops_calls, tc_mc_obj_is_value}
+import diagnostics.{diag_ice_count, diag_entries}
+import parser.{nodes, node_kind, node_name, node_method, node_obj, node_args, node_line, node_col, sublist_get, sublist_length}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+import mono.{run_mono}
+
+fn probe_src() -> Str {
+    #"import std.traits.{StrOps, ListOps}
+
+fn main() {
+    let zzs = "hello"
+    let n = StrOps.len(zzs)
+    let xs: List[Int] = []
+    ListOps.push(xs, n)
+    let m = zzs.len()
+    assert(n == m)
+}
+"#
+}
+
+fn method_call_on(qualifier: Str, method: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.MethodCall && node_method(i) == method {
+            let obj = node_obj(i)
+            if obj != -1 && node_kind(obj) == NodeKind.Ident && node_name(obj) == qualifier { return i }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn compile_and_check(path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    let _ = fs.delete(path)
+    let errors = check_types(program)
+    if errors != 0 {
+        for d in diag_entries { io.println("[{d.severity}] {d.name}: {d.message}") }
+    }
+    assert_eq(errors, 0)
+    program
+}
+
+test "the qualified call takes its first argument as the receiver and keeps its position" {
+    let program = compile_and_check("build/sealed_ops_rewrite_shape_probe.bl")
+    let call = method_call_on("StrOps", "len")
+    assert(call >= 0)
+    let line = node_line(call)
+    let col = node_col(call)
+    let recv = sublist_get(node_args(call), 0)
+    let ices = diag_ice_count
+    desugar_sealed_ops_calls(program)
+    assert_eq(diag_ice_count, ices)
+    assert_eq(node_obj(call), recv)
+    assert_eq(sublist_length(node_args(call)), 0)
+    assert_eq(node_line(call), line)
+    assert_eq(node_col(call), col)
+    assert_eq(tc_mc_obj_is_value(call), 1)
+}
+
+test "a qualified call with more arguments keeps the rest in order" {
+    let program = compile_and_check("build/sealed_ops_rewrite_rest_probe.bl")
+    let call = method_call_on("ListOps", "push")
+    assert(call >= 0)
+    let recv = sublist_get(node_args(call), 0)
+    let value = sublist_get(node_args(call), 1)
+    desugar_sealed_ops_calls(program)
+    assert_eq(node_obj(call), recv)
+    assert_eq(sublist_length(node_args(call)), 1)
+    assert_eq(sublist_get(node_args(call), 0), value)
+}
+
+test "a method call already in method form is left alone" {
+    let program = compile_and_check("build/sealed_ops_rewrite_plain_probe.bl")
+    let call = method_call_on("zzs", "len")
+    assert(call >= 0)
+    let obj = node_obj(call)
+    desugar_sealed_ops_calls(program)
+    assert_eq(node_obj(call), obj)
+    assert_eq(sublist_length(node_args(call)), 0)
+}
+
+test "running the rewrite a second time is an ICE and changes nothing" {
+    let program = compile_and_check("build/sealed_ops_rewrite_twice_probe.bl")
+    let call = method_call_on("ListOps", "push")
+    assert(call >= 0)
+    desugar_sealed_ops_calls(program)
+    let obj = node_obj(call)
+    let args = node_args(call)
+    let ices = diag_ice_count
+    desugar_sealed_ops_calls(program)
+    assert_eq(diag_ice_count, ices + 1)
+    assert_eq(node_obj(call), obj)
+    assert_eq(node_args(call), args)
+    assert_eq(sublist_length(node_args(call)), 1)
+}
+
+test "a qualified call that reaches mono without the rewrite is an ICE" {
+    let program = compile_and_check("build/sealed_ops_rewrite_skipped_probe.bl")
+    let ices = diag_ice_count
+    run_mono(program)
+    assert_eq(diag_ice_count, ices + 1)
+}
+
+test "mono after the rewrite reports nothing" {
+    let program = compile_and_check("build/sealed_ops_rewrite_then_mono_probe.bl")
+    let ices = diag_ice_count
+    desugar_sealed_ops_calls(program)
+    run_mono(program)
+    assert_eq(diag_ice_count, ices)
+}
