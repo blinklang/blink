@@ -66,6 +66,33 @@ fn main() {
 "#
 }
 
+// Each enum reaches itself through a tuple payload, directly, nested one tuple deeper, and
+// at a generic instance. The field is boxed, but its tuple carrier holds the enum by
+// value, so that carrier can only follow the enum's own typedef.
+fn selfrec_tuple_src() -> Str {
+    #"type Box { Pair(p: (Box, Box)), Leaf(v: Int) }
+type Nest { Node(p: (Int, (Nest, Nest))), End(v: Int) }
+type Gen[T] { Two(p: (Gen[T], Gen[T])), One(v: T) }
+fn main() {
+    let b: Box = Box.Pair((Box.Leaf(1), Box.Leaf(2)))
+    let n: Nest = Nest.Node((9, (Nest.End(3), Nest.End(4))))
+    let g: Gen[Int] = Gen.Two((Gen.One(5), Gen.One(6)))
+    match b {
+        Box.Pair(p) => assert(true)
+        Box.Leaf(v) => assert(v == 0)
+    }
+    match n {
+        Nest.Node(p) => assert(p.0 == 9)
+        Nest.End(v) => assert(v == 0)
+    }
+    match g {
+        Gen.Two(p) => assert(true)
+        Gen.One(v) => assert(v == 0)
+    }
+}
+"#
+}
+
 // The probe is deleted BEFORE any assertion so a red row never leaves the file behind.
 fn typedefs_of(name: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
     let path = "build/{name}.bl"
@@ -181,4 +208,26 @@ test "the declaration half writes one vtable typedef however it is reached" {
     assert_eq_int("one vtable typedef", count_of(text, "} blink_ue_metrics_vtable;"), 1)
     assert_eq_int("one vtable guard", count_of(text, "#ifndef BLINK_TD_blink_ue_metrics_vtable\n"), 1)
     assert_before(text, "} blink_ue_metrics_vtable;", "} blink_Env;")
+}
+
+// A payload field that reaches its own enum is stored boxed, so the enum typedef needs no
+// complete carrier. The carrier holds the enum by value, so it is the one that waits.
+test "a tuple payload that reaches its own enum follows the enum typedef" {
+    let text = typedefs_of("cg_decl_selfrec_tuple_probe_src", selfrec_tuple_src())
+    assert_before(text, "} blink_Box;", "} blink_Tuple2_Box_Box;")
+}
+
+// The inner tuple embeds the enum by value and the outer tuple embeds the inner one, so
+// both carriers wait for the enum.
+test "a nested tuple payload that reaches its own enum follows the enum typedef" {
+    let text = typedefs_of("cg_decl_selfrec_nested_probe_src", selfrec_tuple_src())
+    assert_before(text, "} blink_Nest;", "} blink_Tuple2_Nest_Nest;")
+    assert_before(text, "} blink_Tuple2_Nest_Nest;", "} blink_Tuple2_int_Tuple2_Nest_Nest;")
+}
+
+// A generic instance follows the same rule at its own tid.
+test "a tuple payload that reaches its own generic instance follows that instance" {
+    let text = typedefs_of("cg_decl_selfrec_generic_probe_src", selfrec_tuple_src())
+    assert_before(text, "} blink_Gen_0Int;", "} blink_Tuple2_Gen_0Int_Gen_0Int;")
+    assert_eq_int("one carrier typedef", count_of(text, "} blink_Tuple2_Gen_0Int_Gen_0Int;"), 1)
 }
