@@ -2822,11 +2822,14 @@ fn discriminant(ctx: MatchCtx, span: Int) -> Int ! Diag.Report {
     if tid_holds_tag_member(ctx.tid) {
         return ir_carrier_tag(TYPE_INT, span, int_spelling(span), scrut_ref(ctx, span))
     }
-    // tid_is_tagged is true for every enum and every carrier, so this is reached by two
-    // other kinds of one-word value too: a transparent newtype (the word is its payload,
-    // never a discriminant -- it has one variant, so it is never matched by tag) and an
-    // Option over an opaque handle (its arm compares by nullness, not by an integer tag).
-    // Both stay refused rather than picking a shape that would read the wrong thing.
+    // The Option over an opaque handle is the handle itself, NULL for None, so its
+    // nullness is its discriminant: 1 for Some and 0 for None, as a real tag would be.
+    if is_handle_option(ctx) {
+        return ir_binary(TYPE_INT, span, int_spelling(span), "!=", scrut_ref(ctx, span),
+            ir_const(ctx.tid, span, ctx.rec.c_spelling, "0"))
+    }
+    // A transparent newtype is one word too, but the word is its payload and it has one
+    // variant, so it is never matched by tag and stays refused here.
     if tid_is_tagged(ctx.tid) && tc_tid_kind(ctx.tid) == TyKind.Enum && !tc_enum_has_payload(ctx.tid) {
         return scrut_ref(ctx, span)
     }
@@ -2840,13 +2843,14 @@ fn tid_is_tagged(tid: Int) -> Bool {
     tid_is_carrier(tid) || tc_tid_kind(tid) == TyKind.Enum
 }
 
-// Whether `discriminant` below can actually produce a value for this tid. This must name
-// exactly the same three cases that function does: naming only the type's kind here (as
+// Whether `discriminant` below can actually produce a value for this scrutinee. This must name
+// exactly the same four cases that function does: naming only the type's kind here (as
 // `tid_is_tagged` does) would call a tid switchable that `discriminant` then refuses --
 // a single-variant type with a real payload is an Enum by kind and one undecorated word by
 // shape, so it carries no tag member and is never payload-less either.
-fn tid_is_discriminable(tid: Int) -> Bool {
-    tid_is_ordinal(tid) || tid_holds_tag_member(tid) ||
+fn is_discriminable(ctx: MatchCtx) -> Bool {
+    let tid = ctx.tid
+    tid_is_ordinal(tid) || tid_holds_tag_member(tid) || is_handle_option(ctx) ||
         (tc_tid_kind(tid) == TyKind.Enum && !tc_enum_has_payload(tid))
 }
 
@@ -2869,6 +2873,13 @@ fn tid_is_ordinal(tid: Int) -> Bool {
 fn tid_is_carrier(tid: Int) -> Bool {
     let k = tc_tid_kind(tid)
     k == TyKind.Option || k == TyKind.Result
+}
+
+// A carrier layout makes one word only of the Option over an opaque handle: the handle
+// itself, NULL for None, with no tag or value member. ctx.rec is the scrutinee's checked
+// Local layout, so this asks layout the same question cg_expr's carrier readers ask.
+fn is_handle_option(ctx: MatchCtx) -> Bool {
+    tid_is_carrier(ctx.tid) && ctx.rec.slot_form == SlotForm.InlineWord
 }
 
 // ── Patterns: names and labels ────────────────────────────────────────────
@@ -3173,9 +3184,15 @@ fn carrier_payload_bind(ctx: MatchCtx, vname: Str, flds: Int, out: List[Int]) ->
     let tid = stmt_tid(sub)
     if tid < 0 { return !sub_pattern_declares(sub) }
     let held = layout_at(tid, Position.Local, sub)
+    bind_slot(ctx, sub, carrier_payload_value(ctx, vname, sub, tid, held), out)
+}
+
+// The payload an arm reads out of its carrier. The handle Option's Some payload is the
+// scrutinee word itself, the same way a transparent newtype's is.
+fn carrier_payload_value(ctx: MatchCtx, vname: Str, sub: Int, tid: Int, held: LayoutRecord) -> Int ! Diag.Report {
+    if is_handle_option(ctx) { return ir_cast(tid, sub, held.c_spelling, scrut_ref(ctx, sub)) }
     let member = carrier_member_layout_at(ctx.tid, carrier_slot(vname), sub)
-    bind_slot(ctx, sub, x_unbox_payload(tid, sub, scrut_ref(ctx, sub), member, held,
-        carrier_member(vname)), out)
+    x_unbox_payload(tid, sub, scrut_ref(ctx, sub), member, held, carrier_member(vname))
 }
 
 fn carrier_member(vname: Str) -> Str {
@@ -3440,9 +3457,7 @@ fn carrier_payload_test(ctx: MatchCtx, vname: Str, flds: Int) -> Int ! Diag.Repo
     let tid = stmt_tid(sub)
     if tid < 0 { return -1 }
     let held = layout_at(tid, Position.Local, sub)
-    let member = carrier_member_layout_at(ctx.tid, carrier_slot(vname), sub)
-    slot_test(ctx, sub, tid, held, x_unbox_payload(tid, sub, scrut_ref(ctx, sub), member, held,
-        carrier_member(vname)))
+    slot_test(ctx, sub, tid, held, carrier_payload_value(ctx, vname, sub, tid, held))
 }
 
 fn positional_payload_test(ctx: MatchCtx, pat: Int, vname: Str, flds: Int) -> Int ! Diag.Report {
@@ -3643,7 +3658,7 @@ fn guarded_arm_block(ctx: MatchCtx, arm: Int, guard: Int, extra: List[Int]) -> I
 // catch-all last. That shape is a switch; anything else needs the chain below.
 fn arms_are_switchable(arms: Int, n: Int, ctx: MatchCtx) -> Bool ! Diag.Report {
     if n == 0 { return false }
-    if !tid_is_discriminable(ctx.tid) { return false }
+    if !is_discriminable(ctx) { return false }
     let mut i = 0
     while i < n {
         let arm = sublist_get(arms, i)
