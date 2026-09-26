@@ -16,7 +16,7 @@ import diagnostics.{
     CODEGEN_STAGE_NOT_BUILT, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 import layout.{
-    LayoutRecord, Position, SlotForm, layout_of, field_layout_of, ensure_typedef_for, c_type_of, enum_tag_tid,
+    LayoutRecord, Position, SlotForm, layout_of, field_layout_of, field_embeds_owner, ensure_typedef_for, c_type_of, enum_tag_tid,
     layout_take_typedefs, tid_of_node,
 }
 import cname.{
@@ -320,9 +320,20 @@ fn emit_one(decl: Int, tid: Int, inst_tid: Int, c_name: Str) ! Diag.Report {
     let guard = td_guard_name(c_name)
     if tc_tid_kind(tc_resolve(tid)) == TyKind.Enum {
         emit_enum(decl, inst_tid, guard, c_name)
-        return
+    } else {
+        emit_struct(decl, inst_tid, guard, c_name)
     }
-    emit_struct(decl, inst_tid, guard, c_name)
+    let owner_tid = cg_owner_tid(decl, inst_tid)
+    for ftid in member_tids(decl, inst_tid) {
+        if field_embeds_owner(owner_tid, ftid) { flush_member_typedefs(ftid) }
+    }
+}
+
+// A member that embeds its owner is held boxed, so the owner typedef needs none of its
+// carriers. Those carriers name the owner by value, so they wait until emit_one has
+// written it.
+fn flush_unless_embeds_owner(owner_tid: Int, ftid: Int) {
+    if !field_embeds_owner(owner_tid, ftid) { flush_member_typedefs(ftid) }
 }
 
 fn emit_struct(decl: Int, inst_tid: Int, guard: Str, c_name: Str) ! Diag.Report {
@@ -330,7 +341,7 @@ fn emit_struct(decl: Int, inst_tid: Int, guard: Str, c_name: Str) ! Diag.Report 
     let mut fields: List[Str] = []
     for slot in tc_struct_field_slots(cg_reg_tid_for_decl(decl)) {
         let ftid = tc_member_tid_at_instance(tc_sfield_tid(slot), inst_tid)
-        flush_member_typedefs(ftid)
+        flush_unless_embeds_owner(owner_tid, ftid)
         let fname = tc_sfield_name(slot)
         let spelling = spelling_or_ice(field_layout_of(owner_tid, ftid), "{node_name(decl)}.{fname}")
         if spelling == "" { return }
@@ -384,7 +395,7 @@ fn variant_field_decls(owner: Int, inst_tid: Int, var_slot: Int) -> List[Str] ! 
     let mut out: List[Str] = []
     for f in tc_evar_field_slots(var_slot) {
         let ftid = tc_member_tid_at_instance(tc_evfield_tid(f), inst_tid)
-        flush_member_typedefs(ftid)
+        flush_unless_embeds_owner(owner_tid, ftid)
         let fname = tc_evfield_name(f)
         let spelling = spelling_or_ice(field_layout_of(owner_tid, ftid), "{node_name(owner)}.{tc_evar_name(var_slot)}.{fname}")
         if spelling == "" { return out }
