@@ -85,6 +85,46 @@ test "a header opens and closes its include guard" {
     assert_has(text, "#endif")
 }
 
+fn sqlite_src() -> Str {
+    #"import std.db_sqlite.{sqlite_open, sqlite_close}
+fn main() {
+    let h = sqlite_open(":memory:")
+    let _ = sqlite_close(h)
+}
+"#
+}
+
+// runtime_sqlite.h declares the sqlite shims and includes <sqlite3.h> only under the
+// gate, and the link line pulls in the vendored sqlite only when the unit defines it. The
+// runtime header reads it, so it must come before the include.
+test "a program that uses std.db_sqlite defines the sqlite gate before the runtime include" {
+    let _ = build_probe(sqlite_src(), "cg_decl_prologue_sqlite_probe")
+    cg_decl_emit_prologue(false, false, false, "", "")
+    let text = print_take()
+    let gate = text.index_of("#define BLINK_USE_SQLITE 1\n")
+    assert_has(text, "#define BLINK_USE_SQLITE 1\n")
+    assert(gate < text.index_of("#include \"runtime.h\""))
+}
+
+// Every unit of a program carries every typedef, and a sqlite handle is spelled `sqlite3*`
+// in them, so a header and a module object need the gate as much as the entry unit does.
+test "a header and a unit linked against the archive both define the sqlite gate" {
+    let _ = build_probe(sqlite_src(), "cg_decl_prologue_sqlite_header_probe")
+    cg_decl_emit_prologue(false, false, false, "BLINK_MOD_H", "")
+    let header = print_take()
+    assert(header.index_of("#define BLINK_USE_SQLITE 1\n") > header.index_of("#define BLINK_MOD_H"))
+    cg_decl_emit_prologue(true, false, false, "", "")
+    let user = print_take()
+    assert(user.index_of("#define BLINK_USE_SQLITE 1\n") >= 0)
+    assert(user.index_of("#define BLINK_USE_SQLITE 1\n") < user.index_of("#include \"libblink_std.h\""))
+}
+
+test "a program that does not use sqlite defines no sqlite gate" {
+    let _ = build_probe(plain_src(), "cg_decl_prologue_no_sqlite_probe")
+    cg_decl_emit_prologue(false, false, false, "", "")
+    assert_lacks(print_take(), "BLINK_USE_SQLITE")
+}
+
 // The archive is compiled against a shorter evidence vector than a user unit sees, so the
 // builtin fields must stay first and in this order forever.
 test "the evidence vector keeps the builtin fields first and in order" {
