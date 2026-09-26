@@ -1,0 +1,139 @@
+import std.fs
+import std.io
+import typecheck.{check_types, tc_lookup_node_tid, tc_tid_child, tc_tid_child_count, tc_type_str}
+import layout.{layout_of, layout_reset, Position}
+import parser.{nodes, node_kind}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+
+// An annotation that names a generic struct or enum with a type parameter, such as
+// `let b: Box[T] = ...` inside `fn mk[T]`, typed the let as the bare `Box`. A bare head
+// has no slot for monomorphisation to fill, so layout declines it and codegen stops. The
+// same literal with no annotation already keeps its `[T]`, and so must the annotation.
+//
+// The rows read every let's type and each slot under it, because the bare head also hides
+// one level down, as the element of `List[Box[T]]` or the value of `Map[Str, Box[T]]`.
+
+fn bare_under(tid: Int, depth: Int) -> Str {
+    if tid < 0 || depth > 8 { return "" }
+    if layout_of(tid, Position.Local).decline_reason.contains("un-monomorphised generic") {
+        return tc_type_str(tid)
+    }
+    let n = tc_tid_child_count(tid)
+    let mut i = 0
+    while i < n {
+        let under = bare_under(tc_tid_child(tid, i), depth + 1)
+        if under != "" { return under }
+        i = i + 1
+    }
+    ""
+}
+
+fn probe(name: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/tc_generic_ann_{name}.bl"
+    write_file(path, src)
+    // `nodes` is a whole-process table, so each probe reads only the nodes it adds.
+    let first = nodes.len()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    let mut idx = first
+    let n = nodes.len()
+    while idx < n {
+        if node_kind(idx) == NodeKind.LetBinding {
+            let tid = tc_lookup_node_tid(idx)
+            let under = bare_under(tid, 0)
+            if under != "" { return "{tc_type_str(tid)} (slot {under})" }
+        }
+        idx = idx + 1
+    }
+    ""
+}
+
+fn assert_keeps_args(label: Str, name: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let bare = probe(name, src)
+    if bare != "" {
+        io.println("FAIL: {label}: a let is typed with a bare generic head, rendered '{bare}'")
+    }
+    assert_eq(bare, "")
+}
+
+test "a generic struct annotation keeps its type parameter" {
+    assert_keeps_args("Box[T]", "box", #"
+type Box[T] { value: T }
+fn mk[T](v: T) -> Box[T] {
+    let b: Box[T] = Box { value: v }
+    b
+}
+fn main() { assert(mk(3).value == 3) }
+"#)
+}
+
+test "a generic enum annotation keeps its type parameter" {
+    assert_keeps_args("Tree[T]", "tree", #"
+type Tree[T] { Leaf(T), Empty }
+fn leaf[T](v: T) -> Tree[T] {
+    let t: Tree[T] = Tree.Leaf(v)
+    t
+}
+fn main() { let _ = leaf(4) }
+"#)
+}
+
+test "a generic struct element of a list annotation keeps its type parameter" {
+    assert_keeps_args("List[Box[T]]", "listbox", #"
+type Box[T] { value: T }
+fn wrap[T](v: T) -> List[Box[T]] {
+    let xs: List[Box[T]] = [Box { value: v }]
+    xs
+}
+fn main() { assert(wrap(1).len() == 1) }
+"#)
+}
+
+test "a generic struct value of a map annotation keeps its type parameter" {
+    assert_keeps_args("Map[Str, Box[T]]", "mapbox", #"
+type Box[T] { value: T }
+fn wrap[T](v: T) -> Map[Str, Box[T]] {
+    let mut m: Map[Str, Box[T]] = Map()
+    m.insert("k", Box { value: v })
+    m
+}
+fn main() { assert(wrap(7).len() == 1) }
+"#)
+}
+
+test "a generic struct payload of an option annotation keeps its type parameter" {
+    assert_keeps_args("Option[Box[T]]", "optbox", #"
+type Box[T] { value: T }
+fn some_box[T](v: T) -> Option[Box[T]] {
+    let o: Option[Box[T]] = Some(Box { value: v })
+    o
+}
+fn main() { assert(some_box(2).is_some()) }
+"#)
+}
+
+test "a generic struct nested in a generic struct annotation keeps its type parameter" {
+    assert_keeps_args("Box[Box[T]]", "boxbox", #"
+type Box[T] { value: T }
+fn twice[T](v: T) -> Box[Box[T]] {
+    let b: Box[Box[T]] = Box { value: Box { value: v } }
+    b
+}
+fn main() { assert(twice(5).value.value == 5) }
+"#)
+}
+
+// The control: a concrete annotation always kept its arguments, so a row above failing
+// while this passes says the defect is the type parameter in the annotation.
+test "a concrete generic struct annotation keeps its type argument" {
+    assert_keeps_args("Box[Int]", "concrete", #"
+type Box[T] { value: T }
+fn main() {
+    let b: Box[Int] = Box { value: 3 }
+    assert(b.value == 3)
+}
+"#)
+}
