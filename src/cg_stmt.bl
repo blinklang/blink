@@ -2573,6 +2573,7 @@ fn patterns_cover(pats: List[Int], tid: Int) -> Bool ! Diag.Report {
     let total = variant_count(tid)
     if total > 0 && named.len() >= total { return true }
     if bucket_covers(pats, tid, named) { return true }
+    if list_lengths_cover(pats, tid) { return true }
     projected_patterns_cover(pats, tid)
 }
 
@@ -2666,42 +2667,81 @@ fn bucket_covers(pats: List[Int], tid: Int, named: Map[Str, Int]) -> Bool ! Diag
     named.len() >= total
 }
 
-// A pattern may refuse in exactly one nested place while matching anything everywhere
-// else -- `(Ok(x), _)` refuses only at element 0. Two such arms can jointly exhaust a
-// scrutinee no single arm covers alone: when every arm refuses at the same place and the
-// labels named there exhaust that place's own variant count, the match is covered the
-// same way a flat label set covers it above. An arm that refuses in more than one place,
-// in different places from another arm, or in a place codegen cannot label, proves
-// nothing here and the match is reported unbuilt rather than guessed at.
+// Arms that refuse at one labelled place, such as `(Ok(x), _)` at element 0, cover the
+// match when their labels at one place reach its variant count. Other arms are left out:
+// they still run in order, and leaving arms out never makes an uncovered match look covered.
 fn projected_patterns_cover(pats: List[Int], tid: Int) -> Bool ! Diag.Report {
-    let mut shared_path = ""
-    let mut shared_tid = -1
-    let mut have_shared = false
-    let mut named: Map[Str, Int] = Map()
+    let mut at_paths: List[Str] = []
+    let mut at_tids: List[Int] = []
+    let mut at_leaves: List[Int] = []
     let mut i = 0
     while i < pats.len() {
         let mut positions: List[Str] = []
         let mut tids: List[Int] = []
         let mut leaves: List[Int] = []
-        if !refuting_positions(tid, "", pats.get(i).unwrap(), positions, tids, leaves) { return false }
-        if positions.len() != 1 { return false }
-        let path = positions.get(0).unwrap()
-        let ptid = tids.get(0).unwrap()
-        let leaf = leaves.get(0).unwrap()
-        if have_shared {
-            if path != shared_path { return false }
-        } else {
-            shared_path = path
-            shared_tid = ptid
-            have_shared = true
+        let typed = refuting_positions(tid, "", pats.get(i).unwrap(), positions, tids, leaves)
+        if typed && positions.len() == 1 {
+            let ptid = tids.get(0).unwrap()
+            let leaf = leaves.get(0).unwrap()
+            if pattern_is_labelled(leaf, ptid) {
+                at_paths.push(positions.get(0).unwrap())
+                at_tids.push(ptid)
+                at_leaves.push(leaf)
+            }
         }
-        if !pattern_is_labelled(leaf, ptid) { return false }
-        collect_labels(ptid, leaf, named)
         i = i + 1
     }
-    if !have_shared { return false }
-    let total = variant_count(shared_tid)
+    let mut j = 0
+    while j < at_paths.len() {
+        if path_labels_cover(at_paths, at_tids, at_leaves, j) { return true }
+        j = j + 1
+    }
+    false
+}
+
+// Whether the labels every kept arm names at the place entry `first` refuses at reach
+// that place's variant count.
+fn path_labels_cover(paths: List[Str], tids: List[Int], leaves: List[Int], first: Int) -> Bool ! Diag.Report {
+    let path = paths.get(first).unwrap()
+    let ptid = tids.get(first).unwrap()
+    let mut named: Map[Str, Int] = Map()
+    let mut k = 0
+    while k < paths.len() {
+        if paths.get(k).unwrap() == path { collect_labels(ptid, leaves.get(k).unwrap(), named) }
+        k = k + 1
+    }
+    let total = variant_count(ptid)
     total > 0 && named.len() >= total
+}
+
+// A list arm whose elements all match anything tests only the length: exactly n without
+// a rest, n or more with one. The arms cover every list when each length below the
+// shortest rest arm has an exact arm. An arm with an element that can refuse is left out.
+fn list_lengths_cover(pats: List[Int], tid: Int) -> Bool ! Diag.Report {
+    if tc_tid_kind(tid) != TyKind.List { return false }
+    let mut exact: List[Int] = []
+    let mut least_rest = -1
+    let mut i = 0
+    while i < pats.len() {
+        let pat = pattern_core(pats.get(i).unwrap())
+        let elems = node_elements(pat)
+        if nk_of(node_kind(pat)) == NodeKind.ListPattern && elements_are_irrefutable(elems) {
+            let n = if elems == -1 { 0 } else { sublist_length(elems) }
+            if node_inclusive(pat) != 1 {
+                exact.push(n)
+            } else if least_rest < 0 || n < least_rest {
+                least_rest = n
+            }
+        }
+        i = i + 1
+    }
+    if least_rest < 0 { return false }
+    let mut len = 0
+    while len < least_rest {
+        if !exact.contains(len) { return false }
+        len = len + 1
+    }
+    true
 }
 
 // Every position one arm's pattern refuses at, named by a '.'-joined path of element
