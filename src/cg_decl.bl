@@ -20,7 +20,7 @@ import layout.{
     layout_take_typedefs, tid_of_node,
 }
 import cname.{
-    c_effect_default_op_name, c_ev_field_name, c_ev_type_name, c_ffi_struct_ptr_name,
+    c_effect_default_op_name, c_ev_field_name, c_ev_type_name, c_ffi_struct_original, c_ffi_struct_ptr_name,
     c_ffi_symbol, c_field_name,
     c_fn_decl_name, cname_ffi_struct_mirror,
     c_global_name, c_vtable_type_name,
@@ -31,7 +31,7 @@ import cname.{
 import cg_print.{
     print_effect_default_vtable, print_effect_vtable_typedef,
     print_ev, print_epilogue, print_fn, print_fn_decl, print_vtable_slot_fn, print_foreign_decl, print_global_decl,
-    print_global_init, print_prologue, print_prologue_declares,
+    print_global_init, print_prologue, print_prologue_declares, print_foreign_includes, print_ffi_layout_asserts,
     print_simple_enum_typedef, print_struct_typedef, print_tagged_enum_typedef,
     print_typedef_blocks,
 }
@@ -54,7 +54,7 @@ import typecheck.{
     tc_lookup_node_tid, tc_type_str, tc_void_tid, DECL_NODE_AMBIGUOUS, TYPE_STR,
 }
 import parser.{
-    get_annotation, node_count, node_effects, node_elements, node_fields, node_impl_binders,
+    get_annotation, get_str_named_arg, node_count, node_effects, node_elements, node_fields, node_impl_binders,
     node_is_pub, node_methods, node_name, node_params, node_trait_name, node_type_ann,
     node_type_params, node_value, sublist_get, sublist_length,
 }
@@ -348,6 +348,22 @@ fn emit_struct(decl: Int, inst_tid: Int, guard: Str, c_name: Str) ! Diag.Report 
         fields.push("{spelling} {c_field_name(fname)}")
     }
     print_struct_typedef(guard, c_name, fields)
+    emit_ffi_layout_asserts(decl, c_name)
+}
+
+// C is the only authority on a foreign layout, so a mirror of a named C struct asks the C
+// compiler to refuse it once it drifts from the header. A mirror with no name has nothing
+// to compare against.
+fn emit_ffi_layout_asserts(decl: Int, c_name: Str) ! Diag.Report {
+    let original = c_ffi_struct_original(decl)
+    if original == "" { return }
+    let mut fields: List[Str] = []
+    let mut c_fields: List[Str] = []
+    for slot in tc_struct_field_slots(cg_reg_tid_for_decl(decl)) {
+        fields.push(c_field_name(tc_sfield_name(slot)))
+        c_fields.push(tc_sfield_name(slot))
+    }
+    print_ffi_layout_asserts(c_name, original, fields, c_fields)
 }
 
 // A variant's declaration node, needed for the tag macro cname spells. The variant
@@ -972,6 +988,49 @@ pub fn cg_decl_emit_prologue(user_tu: Bool, define_storage: Bool, test_build: Bo
     unit_links_archive = user_tu
     unit_is_the_archive = define_storage
     print_prologue(user_tu, define_storage, test_build, header_guard, self_header, program_native_gates())
+    let includes = program_foreign_includes()
+    print_foreign_includes(includes.headers, includes.gates)
+}
+
+type ForeignIncludes { headers: List[Str], gates: List[Str] }
+
+// Every unit carries every typedef, so every unit reads every header a foreign type names.
+// A header named by a native dependency's own module goes under that dependency's gate, the
+// way the runtime reads it; named from anywhere else, it is read unconditionally.
+fn program_foreign_includes() -> ForeignIncludes {
+    let mut headers: List[Str] = []
+    let mut gates: List[Str] = []
+    // offsetof is a stddef.h macro, and the runtime header does not promise it.
+    for decl in cg_reg_type_decls() {
+        if c_ffi_struct_original(decl) != "" && headers.is_empty() {
+            headers.push("stddef.h")
+            gates.push("")
+        }
+    }
+    let mut at: Map[Str, Int] = Map()
+    for decl in cg_reg_type_decls() {
+        let header = foreign_header_of(decl)
+        if header == "" || header == "stddef.h" { continue }
+        let dep = stdlib_native_dep_owned_by_source_module(cg_reg_module_of(decl))
+        let gate = if dep == "" { "" } else { stdlib_native_dep_gate_macro(dep) }
+        let i = at.get(header) ?? -1
+        if i < 0 {
+            at.insert(header, headers.len())
+            headers.push(header)
+            gates.push(gate)
+        } else if (gates.get(i) ?? "") != gate {
+            gates.set(i, "")
+        }
+    }
+    ForeignIncludes { headers: headers, gates: gates }
+}
+
+fn foreign_header_of(decl: Int) -> Str {
+    let mirror = get_annotation(decl, "ffi.struct")
+    if mirror != -1 { return get_str_named_arg(mirror, "header") }
+    let opaque = get_annotation(decl, "ffi.opaque")
+    if opaque != -1 { return get_str_named_arg(opaque, "header") }
+    ""
 }
 
 // A unit spells a native dependency's C types in the typedefs it carries, and every unit
