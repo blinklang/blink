@@ -1,0 +1,158 @@
+// The match coverage proof over two shapes it used to give up on: list patterns whose
+// lengths jointly cover every list, and tuple arms where some arms refute at more than
+// one position while the rest cover one shared position. Each negative row is a shape
+// that really leaves a value unmatched, so it must keep the internal error.
+
+import std.fs
+import std.io
+import typecheck.{check_types}
+import layout.{layout_reset}
+import mono.{run_mono}
+import ir.{ir_dump, ir_reset, ir_verify}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import cg_stmt.{cg_stmt_reset, lower_fn}
+
+fn find_fn(name: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn run_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
+    diag_reset()
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+}
+
+fn dump_of(name: Str) -> Str ! Diag.Report {
+    let f = find_fn(name)
+    assert(f >= 0)
+    let root = lower_fn(f)
+    for err in ir_verify(root) { io.println("VERIFY: {err}") }
+    assert_eq(ir_verify(root).len(), 0)
+    ir_dump(root)
+}
+
+fn ice_mentioning(text: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.message.contains(text) { n = n + 1 }
+    }
+    n
+}
+
+// Lowers `probe` from a program whose only function besides main is `body`, and answers
+// how many "guaranteed to run" errors the match raised.
+fn coverage_ices(path: Str, body: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    run_probe(path, "{body}\nfn main() \{ \}\n")
+    let _ = dump_of("probe")
+    ice_mentioning("guaranteed to run")
+}
+
+test "an empty arm and a rest arm of one element cover every list" {
+    assert_eq(coverage_ices("build/cg_cov_list_empty_rest.bl", #"fn probe(xs: List[Int]) -> Int {
+    match xs {
+        [] => 0
+        [first, ...] => first
+    }
+}"#), 0)
+}
+
+test "exact arms for every length below the shortest rest arm cover every list" {
+    assert_eq(coverage_ices("build/cg_cov_list_exact_then_rest.bl", #"fn probe(xs: List[Int]) -> Int {
+    match xs {
+        [] => 0
+        [a] => a
+        [a, b, ...] => a + b
+    }
+}"#), 0)
+}
+
+test "a binder named with as inside a rest arm still counts toward the lengths" {
+    assert_eq(coverage_ices("build/cg_cov_list_as_binder.bl", #"fn probe(xs: List[Int]) -> Int {
+    match xs {
+        [] => 0
+        [a as whole, ...] => whole
+    }
+}"#), 0)
+}
+
+test "a list match with no arm for the empty list keeps the internal error" {
+    assert(coverage_ices("build/cg_cov_list_no_empty.bl", #"fn probe(xs: List[Int]) -> Int {
+    match xs {
+        [x] => x
+        [x, y, ...] => x + y
+    }
+}"#) > 0)
+}
+
+test "a list match with no arm for length one keeps the internal error" {
+    assert(coverage_ices("build/cg_cov_list_no_one.bl", #"fn probe(xs: List[Int]) -> Int {
+    match xs {
+        [] => 0
+        [x, y, ...] => x + y
+    }
+}"#) > 0)
+}
+
+test "a rest arm whose element can refuse proves nothing about lengths" {
+    assert(coverage_ices("build/cg_cov_list_refuting_int.bl", #"fn probe(xs: List[Int]) -> Int {
+    match xs {
+        [] => 0
+        [1, ...] => 1
+    }
+}"#) > 0)
+    assert(coverage_ices("build/cg_cov_list_refuting_str.bl", #"fn probe(xs: List[Str]) -> Int {
+    match xs {
+        [] => 0
+        ["a", ...] => 1
+    }
+}"#) > 0)
+}
+
+test "arms that refute at one shared position cover it even beside an arm that refutes at two" {
+    assert_eq(coverage_ices("build/cg_cov_tuple_option_shared.bl", #"fn probe(t: (Option[Int], Int)) -> Int {
+    match t {
+        (Some(v), 1) => v
+        (Some(v), _) => v + 1
+        (None, _) => 0
+    }
+}"#), 0)
+    assert_eq(coverage_ices("build/cg_cov_tuple_result_shared.bl", #"fn probe(t: (Result[Int, Str], Int)) -> Int {
+    match t {
+        (Ok(x), 0) => x
+        (Ok(x), _) => x + 1
+        (Err(e), _) => 0
+    }
+}"#), 0)
+}
+
+test "an arm that refutes at two positions does not help cover the shared one" {
+    assert(coverage_ices("build/cg_cov_tuple_two_refutes.bl", #"fn probe(t: (Option[Int], Int)) -> Int {
+    match t {
+        (Some(v), 1) => v
+        (None, _) => 0
+    }
+}"#) > 0)
+}
+
+test "a variant whose payload can refuse does not name the variant as covered" {
+    assert(coverage_ices("build/cg_cov_tuple_refuting_payload.bl", #"fn probe(t: (Option[Int], Int)) -> Int {
+    match t {
+        (Some(1), _) => 1
+        (None, _) => 0
+    }
+}"#) > 0)
+}
