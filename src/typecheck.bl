@@ -38,7 +38,7 @@ import diagnostics.{
     FFI_SCOPE_NOT_WITH_RESOURCE, RAW_BYPASSES_PARAM, RAW_OUTSIDE_TEMPLATE,
     PTR_OUTSIDE_FFI, FFI_STRUCT_GC_FIELD, BYTES_GROW_IN_WITH_PTR,
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
-    FFI_OFFSET_ON_SINGLETON, FFI_OFFSET_UNKNOWN_STRIDE,
+    FFI_OFFSET_ON_SINGLETON, FFI_OFFSET_UNKNOWN_STRIDE, WITH_ITEM_NOT_A_HANDLER,
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905,
     TRAIT_CONTRACT_906, TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
@@ -19510,6 +19510,34 @@ fn tc_with_binder_tid(res_tid: Int) -> Int ! TypeCheck.Resolve {
     ctx_tid
 }
 
+// A with-item without `as` either installs a Handler[E] or wraps the block in a
+// BlockHandler (sections/04_effects.md, Disambiguation rules). Nothing else has a meaning
+// there. A type typecheck could not settle is left alone, so one mistake reads as one error.
+fn tc_check_with_handler_item(item: Int, tid0: Int) ! Diag.Report {
+    let tid = tc_resolve(tid0)
+    if tc_tid_is_no_info(tid) != 0 { return }
+    let k = tc_tid_kind(tid)
+    if k == TyKind.Unknown || k == TyKind.Typevar || k == TyKind.Handler { return }
+    if tc_tid_has_block_handler(tid) != 0 { return }
+    diag_error_at("NonHandlerWithItem", WITH_ITEM_NOT_A_HANDLER,
+        "a with-item without `as` must be a Handler[E] or a BlockHandler, got {type_to_str(tid)}", item,
+        "install a handler here, or bind a resource with `with <expr> as <name>`")
+}
+
+// The receiver is matched by its declaration node, which every instance of a generic
+// type shares. An impl written for one instance cannot be told from another here, so it
+// answers yes rather than refuse a program codegen may accept.
+fn tc_tid_has_block_handler(tid: Int) -> Int ! Diag.Report {
+    let decl = tc_tid_decl_node(tid)
+    if decl < 0 { return 0 }
+    for im in tc_impl_recv_tids.keys() {
+        if node_trait_name(im) == "BlockHandler" && tc_tid_decl_node(tc_impl_recv_tid(im)) == decl {
+            return 1
+        }
+    }
+    0
+}
+
 fn tc_bind_with_resource(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let res_expr = node_value(item)
     let prev_res = tc_with_resource_node
@@ -20267,7 +20295,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // the HandlerExpr arm that walks the method bodies, which infer_type does not
                     // do. The two are complements, and the order keeps handler-body diagnostics
                     // reported before any type error on the operand itself.
-                    let _memoized = infer_type(wh_item2)
+                    tc_check_with_handler_item(wh_item2, infer_type(wh_item2))
                 }
                 wi2 = wi2 + 1
             }
