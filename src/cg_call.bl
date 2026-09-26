@@ -67,7 +67,7 @@ import ir.{
 }
 import cg_expr.{
     lower_expr, cg_expr_async_scope_current, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
-    x_unbox_payload, x_layout_checked, lower_value_as_text,
+    x_unbox_payload, x_layout_checked, lower_value_as_text, cg_expr_option_some, cg_expr_option_none,
 }
 import cg_stmt.{lower_block_into}
 import cg_eff.{
@@ -870,10 +870,10 @@ fn cc_checked_read(node: Int) -> Int ! Diag.Report {
     if cc_stopped(member) { return -1 }
     let open_box = shape.boxed && member.slot_form != SlotForm.PointerBoxed
     let payload = if open_box { ir_unbox(shape.tid, node, shape.value.c_spelling, shape.value.slot_form, native) } else { native }
-    let some = ir_carrier_wrap(tid, node, carrier.c_spelling, carrier_value_member,
-        ir_const(TYPE_INT, node, found.c_spelling, "{CARRIER_TAG_SOME}"), payload)
-    let none = ir_carrier_wrap(tid, node, carrier.c_spelling, "",
-        ir_const(TYPE_INT, node, found.c_spelling, "{CARRIER_TAG_NONE}"), -1)
+    let some = cg_expr_option_some(tid, node, carrier, payload)
+    if some < 0 { return -1 }
+    let none = cg_expr_option_none(tid, node, carrier)
+    if none < 0 { return -1 }
     cg_expr_push_pending(node, ir_if(node, present,
         ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), some)]),
         ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), none)])))
@@ -926,10 +926,10 @@ fn cc_checked_pop(node: Int) -> Int ! Diag.Report {
     if cc_stopped(member) { return -1 }
     let open_box = shape.boxed && member.slot_form != SlotForm.PointerBoxed
     let payload = if open_box { ir_unbox(shape.tid, node, shape.value.c_spelling, shape.value.slot_form, native) } else { native }
-    let some = ir_carrier_wrap(tid, node, carrier.c_spelling, carrier_value_member,
-        ir_const(TYPE_INT, node, found.c_spelling, "{CARRIER_TAG_SOME}"), payload)
-    let none = ir_carrier_wrap(tid, node, carrier.c_spelling, "",
-        ir_const(TYPE_INT, node, found.c_spelling, "{CARRIER_TAG_NONE}"), -1)
+    let some = cg_expr_option_some(tid, node, carrier, payload)
+    if some < 0 { return -1 }
+    let none = cg_expr_option_none(tid, node, carrier)
+    if none < 0 { return -1 }
     cg_expr_push_pending(node, ir_if(node, present,
         ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), some)]),
         ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), none)])))
@@ -1942,10 +1942,10 @@ fn cc_lower_ptr_to_str(node: Int, obj: Int) -> Int ! Diag.Report {
         cc_temp_ref(node, ptr_tid, ptr_rec, ptr_name), ir_const(ptr_tid, node, ptr_rec.c_spelling, "0"))
     let str_tid = child_tid(tid, Slot.Inner1)
     let payload = ir_cast(str_tid, node, value_mem.c_spelling, cc_temp_ref(node, ptr_tid, ptr_rec, ptr_name))
-    let some = ir_carrier_wrap(tid, node, carrier.c_spelling, carrier_value_member,
-        ir_const(TYPE_INT, node, carrier.c_spelling, "{CARRIER_TAG_SOME}"), payload)
-    let none = ir_carrier_wrap(tid, node, carrier.c_spelling, "",
-        ir_const(TYPE_INT, node, carrier.c_spelling, "{CARRIER_TAG_NONE}"), -1)
+    let some = cg_expr_option_some(tid, node, carrier, payload)
+    if some < 0 { return -1 }
+    let none = cg_expr_option_none(tid, node, carrier)
+    if none < 0 { return -1 }
     cg_expr_push_pending(node, ir_if(node, present,
         ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), some)]),
         ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), none)])))
@@ -2110,8 +2110,8 @@ fn cc_lower_enum_from_str(node: Int) -> Int ! Diag.Report {
     let text = c_mint_local("ez")
     cg_expr_push_pending(node, ir_let(TYPE_STR, node, text_rec.c_spelling, text, text_rec.slot_form, arg))
     let held = c_mint_local("ez")
-    let none = ir_carrier_wrap(tid, node, carrier.c_spelling, "",
-        ir_const(TYPE_INT, node, carrier.c_spelling, "{CARRIER_TAG_NONE}"), -1)
+    let none = cg_expr_option_none(tid, node, carrier)
+    if none < 0 { return -1 }
     cg_expr_push_pending(node, ir_let(tid, node, carrier.c_spelling, held, carrier.slot_form, none))
     let flds = node_fields(tc_tid_decl_node(enum_tid))
     let mut i = 0
@@ -2121,8 +2121,8 @@ fn cc_lower_enum_from_str(node: Int) -> Int ! Diag.Report {
         if diag_is_ice_seg(label) { return -1 }
         let same = ir_call_runtime(TYPE_BOOL, node, bools.c_spelling, c_runtime_helper("str_eq"), bools.slot_form,
             [cc_temp_ref(node, TYPE_STR, text_rec, text), ir_const(TYPE_STR, node, text_rec.c_spelling, c_string_literal(node_str_val(v)))])
-        let some = ir_carrier_wrap(tid, node, carrier.c_spelling, carrier_value_member,
-            ir_const(TYPE_INT, node, carrier.c_spelling, "{CARRIER_TAG_SOME}"), ir_const(enum_tid, node, member.c_spelling, label))
+        let some = cg_expr_option_some(tid, node, carrier, ir_const(enum_tid, node, member.c_spelling, label))
+        if some < 0 { return -1 }
         cg_expr_push_pending(node, ir_if(node, same,
             ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), some)]), -1))
         i = i + 1
@@ -3868,10 +3868,10 @@ fn cc_map_slot_method(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! D
     let open_box = shape.boxed && member.slot_form != SlotForm.PointerBoxed
     let payload = if open_box { ir_unbox(shape.tid, node, shape.value.c_spelling, shape.value.slot_form, native) } else { native }
 
-    let some = ir_carrier_wrap(tid, node, carrier.c_spelling, carrier_value_member,
-        ir_const(TYPE_INT, node, found.c_spelling, "{CARRIER_TAG_SOME}"), payload)
-    let none = ir_carrier_wrap(tid, node, carrier.c_spelling, "",
-        ir_const(TYPE_INT, node, found.c_spelling, "{CARRIER_TAG_NONE}"), -1)
+    let some = cg_expr_option_some(tid, node, carrier, payload)
+    if some < 0 { return -1 }
+    let none = cg_expr_option_none(tid, node, carrier)
+    if none < 0 { return -1 }
 
     ir_select(tid, node, carrier.c_spelling, carrier.slot_form, cond, some, none)
 }
@@ -3996,10 +3996,10 @@ fn cc_map_remove_carrier(node: Int, obj: Int, kind: TyKind, tid: Int, container:
     let open_box = shape.boxed && member.slot_form != SlotForm.PointerBoxed
     let payload = if open_box { ir_unbox(shape.tid, node, shape.value.c_spelling, shape.value.slot_form, native) } else { native }
 
-    let some = ir_carrier_wrap(tid, node, carrier.c_spelling, carrier_value_member,
-        ir_const(TYPE_INT, node, found.c_spelling, "{CARRIER_TAG_SOME}"), payload)
-    let none = ir_carrier_wrap(tid, node, carrier.c_spelling, "",
-        ir_const(TYPE_INT, node, found.c_spelling, "{CARRIER_TAG_NONE}"), -1)
+    let some = cg_expr_option_some(tid, node, carrier, payload)
+    if some < 0 { return -1 }
+    let none = cg_expr_option_none(tid, node, carrier)
+    if none < 0 { return -1 }
 
     cg_expr_push_pending(node, ir_if(node, present,
         ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), some)]),

@@ -1,0 +1,89 @@
+// A checked read out of a container answers an Option over the element. Over an opaque
+// handle that Option is the handle pointer itself, with NULL for None, so it has no tag and
+// no member. Every read that fills the carrier in two arms must build both arms that way.
+
+import lower_test_helpers.{probe, rhs_of, assert_kind, assert_eq_str, assert_verifies}
+import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid}
+import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
+import diagnostics.{Diag}
+import std.io
+
+fn src_opaque_reads() -> Str {
+    #"@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+fn reads(xs: List[CFile], m: Map[Str, CFile]) {
+    let mut ys = xs
+    let mut n = m
+    let at = 0
+    let got = xs.get(at)
+    let popped = ys.pop()
+    let looked = n.get("k")
+    let gone = n.remove("k")
+    let _keep = [got.is_none(), popped.is_none(), looked.is_none(), gone.is_none()]
+}
+
+fn main() {}
+"#
+}
+
+type OpaqueRead { answer: Int  last: Int }
+
+fn cc_probe_opaque(anchor: Str) -> OpaqueRead ! Diag.Report {
+    probe("cg_call_opaque_read", src_opaque_reads())
+    let mark = cg_expr_pending_count()
+    let built = lower_expr(rhs_of(anchor))
+    let stmts = cg_expr_take_pending(mark)
+    if stmts.len() == 0 {
+        io.println("FAIL: '{anchor}' hoisted no statements")
+        assert(false)
+    }
+    OpaqueRead { answer: built, last: stmts.get(stmts.len() - 1).unwrap() }
+}
+
+// The value one arm of the filling `if` assigns: the arm's block, its one assignment, and
+// the assignment's right side.
+fn filled_arm(branch: Int, which: Int) -> Int {
+    ir_kid(ir_kid(ir_kid(branch, which), 0), 1)
+}
+
+fn assert_some_is_the_handle(label: Str, some: Int) {
+    assert_kind("{label} Some kind", some, IrKind.Cast)
+    assert_eq_str("{label} Some spelling", ir_c_spelling(some), "FILE*")
+}
+
+fn assert_none_is_null(label: Str, none: Int) {
+    assert_kind("{label} None kind", none, IrKind.Const)
+    assert_eq_str("{label} None value", ir_c_name(none), "0")
+    assert_eq_str("{label} None spelling", ir_c_spelling(none), "FILE*")
+}
+
+test "a checked list read over an opaque handle fills the carrier with the handle or NULL" {
+    let low = cc_probe_opaque("got")
+    assert_some_is_the_handle("get", filled_arm(low.last, 1))
+    assert_none_is_null("get", filled_arm(low.last, 2))
+    assert_verifies("get branch", low.last)
+    assert_verifies("get answer", low.answer)
+}
+
+test "a list pop over an opaque handle fills the carrier with the handle or NULL" {
+    let low = cc_probe_opaque("popped")
+    assert_some_is_the_handle("pop", filled_arm(low.last, 1))
+    assert_none_is_null("pop", filled_arm(low.last, 2))
+    assert_verifies("pop branch", low.last)
+}
+
+test "a map read over an opaque handle selects between the handle and NULL" {
+    let low = cc_probe_opaque("looked")
+    assert_kind("map get kind", low.answer, IrKind.Select)
+    assert_some_is_the_handle("map get", ir_kid(low.answer, 1))
+    assert_none_is_null("map get", ir_kid(low.answer, 2))
+    assert_verifies("map get answer", low.answer)
+}
+
+test "a map removal over an opaque handle fills the carrier with the handle or NULL" {
+    let low = cc_probe_opaque("gone")
+    assert_some_is_the_handle("remove", filled_arm(low.last, 1))
+    assert_none_is_null("remove", filled_arm(low.last, 2))
+    assert_verifies("remove branch", low.last)
+}

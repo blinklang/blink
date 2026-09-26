@@ -603,8 +603,29 @@ fn x_tag(node: Int, value: Int) -> Int ! Diag.Report {
     ir_const(TYPE_INT, node, rec.c_spelling, "{value}")
 }
 
-// An Option over an opaque handle is the bare handle pointer, with NULL for None, so it
-// has no tag to write. layout says which shape applies by answering a word slot form.
+// Every carrier arm is built here, so the opaque-handle Option has one rule: it is the bare
+// handle pointer, with NULL for None, and has no tag to write. layout says which shape
+// applies by answering a word slot form. A payload of -1 is an arm that carries nothing.
+fn x_carrier_arm(tid: Int, node: Int, rec: LayoutRecord, member: Str, tag_value: Int, payload: Int) -> Int ! Diag.Report {
+    if rec.slot_form == SlotForm.InlineWord {
+        if payload < 0 { return ir_const(tid, node, rec.c_spelling, "0") }
+        return ir_cast(tid, node, rec.c_spelling, payload)
+    }
+    let tag = x_tag(node, tag_value)
+    if tag < 0 { return -1 }
+    ir_carrier_wrap(tid, node, rec.c_spelling, member, tag, payload)
+}
+
+// The two Option arms for a caller that fills a carrier itself, such as a checked read
+// choosing between them by a runtime test. `rec` is the carrier's own layout.
+pub fn cg_expr_option_some(tid: Int, node: Int, rec: LayoutRecord, payload: Int) -> Int ! Diag.Report {
+    x_carrier_arm(tid, node, rec, member_value, 1, payload)
+}
+
+pub fn cg_expr_option_none(tid: Int, node: Int, rec: LayoutRecord) -> Int ! Diag.Report {
+    x_carrier_arm(tid, node, rec, "", 0, -1)
+}
+
 fn lower_none(node: Int, tid: Int) -> Int ! Diag.Report {
     if x_kind(tid) != TyKind.Option {
         diag_ice_at("NoneOutsideOption", UNSOLVED_TYPEVAR_AT_CODEGEN,
@@ -615,10 +636,7 @@ fn lower_none(node: Int, tid: Int) -> Int ! Diag.Report {
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
     let _td = ensure_typedef_for(tid)
-    if rec.slot_form == SlotForm.InlineWord { return ir_const(tid, node, rec.c_spelling, "0") }
-    let tag = x_tag(node, 0)
-    if tag < 0 { return -1 }
-    ir_carrier_wrap(tid, node, rec.c_spelling, "", tag, -1)
+    cg_expr_option_none(tid, node, rec)
 }
 
 // Some, Ok and Err all write one tag and one member. Which member and which tag is the
@@ -669,16 +687,13 @@ fn x_wrap_value(node: Int, tid: Int, slot: Slot, member: Str, tag_value: Int, pa
     let _td = ensure_typedef_for(tid)
     let mem = x_member(tid, slot, node)
     if x_stopped(mem) { return -1 }
-    // The opaque-handle Option is the payload pointer itself: no tag, no member.
-    if rec.slot_form == SlotForm.InlineWord { return ir_cast(tid, node, rec.c_spelling, payload) }
+    // The opaque-handle Option holds the handle itself, so there is no member to box into.
     let mut value = payload
-    if mem.slot_form == SlotForm.PointerBoxed {
+    if rec.slot_form != SlotForm.InlineWord && mem.slot_form == SlotForm.PointerBoxed {
         value = x_box(node, child_tid(tid, slot), payload, mem.c_spelling)
         if value < 0 { return -1 }
     }
-    let tag = x_tag(node, tag_value)
-    if tag < 0 { return -1 }
-    ir_carrier_wrap(tid, node, rec.c_spelling, member, tag, value)
+    x_carrier_arm(tid, node, rec, member, tag_value, value)
 }
 
 // The unit carries no value, but the argument that produced it is an ordinary expression
@@ -689,9 +704,7 @@ fn lower_wrap_unit(node: Int, tid: Int, member: Str, tag_value: Int, rec: Layout
         if produced < 0 { return -1 }
         if x_has_effect(produced) { x_hoist(ir_expr_stmt(node, produced)) }
     }
-    let tag = x_tag(node, tag_value)
-    if tag < 0 { return -1 }
-    ir_carrier_wrap(tid, node, rec.c_spelling, member, tag, ir_const(TYPE_INT, node, mem.c_spelling, "0"))
+    x_carrier_arm(tid, node, rec, member, tag_value, ir_const(TYPE_INT, node, mem.c_spelling, "0"))
 }
 
 fn x_is_void_like(tid: Int) -> Bool {
