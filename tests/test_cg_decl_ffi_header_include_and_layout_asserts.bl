@@ -1,0 +1,155 @@
+// A foreign type is declared by the header its annotation names, so the unit has to read
+// that header before any typedef or assert spells the type. An @ffi.struct mirror also
+// claims a layout, and C is the only authority on that layout: one sizeof and one offsetof
+// assert per field let the C compiler refuse a mirror that has drifted from its header.
+
+import std.fs
+import std.io
+import layout.{layout_reset}
+import cg_test_helpers.{cg_probe_compile}
+import cg_print.{print_reset, print_take}
+import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_decl.{cg_decl_reset, cg_decl_emit_prologue, cg_decl_emit_typedefs}
+
+fn assert_has(text: Str, needle: Str) {
+    if text.index_of(needle) < 0 {
+        io.println("FAIL: output has no '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) >= 0)
+}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.index_of(needle) >= 0 {
+        io.println("FAIL: output must not have '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.index_of(needle) < 0)
+}
+
+fn count_of(text: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut rest = text
+    while true {
+        let i = rest.index_of(needle)
+        if i < 0 { break }
+        n = n + 1
+        rest = rest.slice(i + needle.len(), rest.len())
+    }
+    n
+}
+
+// The prologue and the typedefs in the order the driver writes them. The probe is deleted
+// BEFORE any assertion so a red row never leaves the file behind.
+fn unit_head_of(name: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    let program = cg_probe_compile(path, src)
+    layout_reset()
+    let _ = fs.delete(path)
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    cg_decl_emit_prologue(false, false, false, "", "")
+    cg_decl_emit_typedefs()
+    print_take()
+}
+
+fn pollfd_src() -> Str {
+    #"@ffi.struct(header: "poll.h", name: "pollfd")
+pub type Pollfd { fd: I32, events: I16, revents: I16 }
+fn main() { }
+"#
+}
+
+// Two mirrors from one header, and an opaque handle from another.
+fn two_headers_src() -> Str {
+    #"@ffi.struct(header: "poll.h", name: "pollfd")
+pub type Pollfd { fd: I32, events: I16, revents: I16 }
+@ffi.struct(header: "poll.h", name: "pollfd")
+pub type PollfdAgain { fd: I32, events: I16, revents: I16 }
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+fn hold(f: CFile) -> CFile { f }
+fn main() { }
+"#
+}
+
+// The runtime header sets the feature-test macros, and a system header read before it
+// fixes its declarations without them, so the foreign include follows the runtime one.
+test "an @ffi.struct header is included after the runtime header" {
+    let text = unit_head_of("cg_decl_ffi_struct_include_probe", pollfd_src())
+    assert_has(text, "#include <poll.h>\n")
+    assert(text.index_of("#include \"runtime.h\"") < text.index_of("#include <poll.h>"))
+}
+
+test "an @ffi.opaque header is included" {
+    let text = unit_head_of("cg_decl_ffi_opaque_include_probe", two_headers_src())
+    assert_has(text, "#include <stdio.h>\n")
+}
+
+// A header is a fact about the unit, not about one type, so it is read once however many
+// declarations name it.
+test "a header named by two declarations is included once" {
+    let text = unit_head_of("cg_decl_ffi_include_once_probe", two_headers_src())
+    assert(count_of(text, "#include <poll.h>\n") == 1)
+}
+
+// Each foreign type has to be complete where its assert names it, so the includes come
+// before every typedef.
+test "the foreign includes come before the first typedef" {
+    let text = unit_head_of("cg_decl_ffi_include_before_typedef_probe", pollfd_src())
+    assert(text.index_of("#include <poll.h>") < text.index_of("} blink_Pollfd;"))
+}
+
+// The spec places the asserts right after the mirror's typedef, where the mirror is
+// complete, and before anything else can spell it.
+test "an @ffi.struct asserts its size against the C struct right after its typedef" {
+    let text = unit_head_of("cg_decl_ffi_struct_sizeof_probe", pollfd_src())
+    let size = "_Static_assert(sizeof(blink_Pollfd) == sizeof(struct pollfd)"
+    assert_has(text, size)
+    assert(text.index_of("} blink_Pollfd;") < text.index_of(size))
+}
+
+test "an @ffi.struct asserts one offset per field against the C struct" {
+    let text = unit_head_of("cg_decl_ffi_struct_offsetof_probe", pollfd_src())
+    assert_has(text, "offsetof(blink_Pollfd, fd) == offsetof(struct pollfd, fd)")
+    assert_has(text, "offsetof(blink_Pollfd, events) == offsetof(struct pollfd, events)")
+    assert_has(text, "offsetof(blink_Pollfd, revents) == offsetof(struct pollfd, revents)")
+}
+
+// offsetof is a stddef.h macro and the runtime header does not promise it.
+test "a unit with an @ffi.struct includes stddef.h for offsetof" {
+    let text = unit_head_of("cg_decl_ffi_struct_stddef_probe", pollfd_src())
+    assert_has(text, "#include <stddef.h>\n")
+}
+
+// An opaque pointee is incomplete by design, so there is no size to assert.
+test "an @ffi.opaque handle asserts no size or offset" {
+    let text = unit_head_of("cg_decl_ffi_opaque_no_assert_probe", two_headers_src())
+    assert_lacks(text, "sizeof(FILE)")
+    assert_lacks(text, "offsetof(struct FILE")
+}
+
+// A program with no foreign type reads no foreign header.
+test "a program with no foreign type includes no foreign header" {
+    let text = unit_head_of("cg_decl_ffi_no_include_probe", "fn main() \{ }\n")
+    assert_lacks(text, "#include <")
+}
+
+fn sqlite_src() -> Str {
+    #"import std.db_sqlite.{sqlite_open, sqlite_close}
+fn main() {
+    let h = sqlite_open(":memory:")
+    let _ = sqlite_close(h)
+}
+"#
+}
+
+// A native dependency ships its header with it and the runtime reads that header only
+// under the dependency's gate, so a header its own module names is read under the same
+// gate. Unconditional, it would reach every unit that includes the archive header.
+test "a header named by a native dependency's module is read under that dependency's gate" {
+    let text = unit_head_of("cg_decl_ffi_sqlite_gate_probe", sqlite_src())
+    let gated = "#ifdef BLINK_USE_SQLITE\n#include <sqlite3.h>\n#endif\n"
+    assert_has(text, gated)
+    assert(count_of(text, "#include <sqlite3.h>") == 1)
+}
