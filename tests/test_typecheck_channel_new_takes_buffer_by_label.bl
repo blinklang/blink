@@ -1,0 +1,75 @@
+// Section 4 writes the channel constructor one way: `channel.new[T](buffer: N)`. Typecheck
+// read only the type argument, so a capacity with no label, the wrong label or the wrong
+// type passed the front end, and a name the capacity used was never resolved. Each of those
+// is now the keyword-argument error a declared call reports.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn messages_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.code} {d.message}\n") }
+    }
+    out
+}
+
+fn chan_src(args: Str) -> Str {
+    "fn main() \{\n    let ch = channel.new[Int]({args})\n    ch.close()\n}\n"
+}
+
+fn reported_for(name: Str, args: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let _ = probe("build/tc_channel_new_{name}.bl", chan_src(args))
+    let got = messages_reported()
+    io.println("channel.new[Int]({args}): {got}")
+    got
+}
+
+test "a labelled buffer builds a channel with no error" {
+    assert_eq(reported_for("labelled", "buffer: 4"), "")
+}
+
+test "a labelled buffer takes an Int variable" {
+    let _ = probe("build/tc_channel_new_var.bl",
+        "fn main() \{\n    let n = 3\n    let ch = channel.new[Str](buffer: n)\n    ch.close()\n}\n")
+    assert_eq(messages_reported(), "")
+}
+
+test "an unlabelled buffer is refused" {
+    let want = "E0529 'buffer' of 'channel.new' is a keyword parameter and takes its argument by label\n"
+    assert_eq(reported_for("unlabelled", "4"), want)
+}
+
+test "a missing buffer is refused" {
+    assert_eq(reported_for("missing", ""), "E0510 keyword argument 'buffer' is missing from the call to 'channel.new'\n")
+}
+
+test "a label other than buffer is refused" {
+    assert_eq(reported_for("wrong_label", "size: 4"), "E0511 'size' names no keyword parameter of 'channel.new'\n")
+}
+
+test "a repeated buffer label is refused" {
+    assert_eq(reported_for("repeated", "buffer: 1, buffer: 2"), "E0528 'buffer' is given twice in this call to 'channel.new'\n")
+}
+
+test "a buffer that is not an Int is refused" {
+    assert_eq(reported_for("str_buffer", "buffer: \"x\""), "E0300 argument 1 of 'channel.new' expects Int, got Str\n")
+}
+
+test "a name the buffer uses is resolved" {
+    assert_eq(reported_for("undefined", "buffer: nope"), "E0506 undefined variable 'nope'\n")
+}

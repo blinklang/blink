@@ -4744,6 +4744,41 @@ fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) !
     }
 }
 
+// `channel.new[T]` has one keyword parameter, `buffer: Int` (sections/04_effects.md), and
+// no fnsig for tc_check_keyword_args to read, so its rules are applied here to that one
+// parameter. One report per call, as there.
+fn tc_check_channel_new_args(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let fn_name = "channel.new"
+    let args_sl = node_args(node)
+    let mut argc = 0
+    if args_sl != -1 { argc = sublist_length(args_sl) }
+    let mut value = -1
+    let mut i = 0
+    while i < argc {
+        let arg = sublist_get(args_sl, i)
+        if node_kind(arg) != NodeKind.NamedArg {
+            diag_error_at("UnlabeledKeywordArg", UNLABELED_KEYWORD_ARG, "'buffer' of '{fn_name}' is a keyword parameter and takes its argument by label", arg, "label the argument already written: 'buffer: ...'")
+            return
+        }
+        let label = node_name(arg)
+        if label != "buffer" {
+            diag_error_at("InvalidKeywordArg", INVALID_KEYWORD_ARG, "'{label}' names no keyword parameter of '{fn_name}'", arg, "the keyword parameter of '{fn_name}' is 'buffer'")
+            return
+        }
+        if value != -1 {
+            diag_error_at("DuplicateKeywordArg", DUPLICATE_KEYWORD_ARG, "'{label}' is given twice in this call to '{fn_name}'", arg, "delete the repeated argument")
+            return
+        }
+        value = node_value(arg)
+        i = i + 1
+    }
+    if value == -1 {
+        diag_error_at("MissingKeywordArg", MISSING_KEYWORD_ARG, "keyword argument 'buffer' is missing from the call to '{fn_name}'", node, "add 'buffer: <value>'")
+        return
+    }
+    check_arg_value(fn_name, 0, TYPE_INT, value)
+}
+
 // Validate a single argument to a built-in intrinsic method (List/Set/Str/Map).
 // These methods are pure codegen intrinsics with no fnsig backing, so we cannot
 // reuse check_arg_shapes; we validate inline against the container's elem/key type.
@@ -14325,6 +14360,14 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     }
 
     if kind == NodeKind.ChannelNew {
+        let cn_args = node_args(node)
+        if cn_args == -1 { return }
+        let mut i = 0
+        while i < sublist_length(cn_args) {
+            let arg = sublist_get(cn_args, i)
+            if node_kind(arg) == NodeKind.NamedArg { nr_check_node(node_value(arg)) } else { nr_check_node(arg) }
+            i = i + 1
+        }
         return
     }
 
@@ -15485,8 +15528,8 @@ fn tc_fn_returns_value() -> Bool {
 fn tc_infer_unclaimed_args(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return }
     let k = node_kind(node)
-    // ChannelNew joins the two call kinds: `channel.new[Int](10)` answers from its type argument
-    // and never looked at the capacity.
+    // ChannelNew joins the two call kinds: `channel.new[Int](buffer: 10)` answers from its type
+    // argument, and a call its argument check refused leaves the capacity untyped.
     if k != NodeKind.MethodCall && k != NodeKind.Call && k != NodeKind.ChannelNew { return }
     let a_sl = node_args(node)
     if a_sl == -1 { return }
@@ -15740,6 +15783,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     // `[T: Ord]`'s bound as an element. That also means a nested argument
     // (`channel.new[List[Int]]`) is a parse limitation upstream, not a hole here.
     if kind == NodeKind.ChannelNew {
+        tc_check_channel_new_args(node)
         let cn_tps = node_type_params(node)
         if cn_tps != -1 && sublist_length(cn_tps) >= 1 {
             let cn_tp = sublist_get(cn_tps, 0)

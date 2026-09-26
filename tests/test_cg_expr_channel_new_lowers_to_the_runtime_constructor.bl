@@ -1,0 +1,58 @@
+// `channel.new[T](buffer: n)` parses to its own node, not a Call, and no expression arm
+// lowered it. It is the runtime channel constructor with the buffer as its one argument,
+// so each construction in the unit is one call to that constructor.
+
+import std.fs
+import std.io
+import layout.{layout_reset}
+import mono.{run_mono}
+import cname.{cname_reset}
+import cg_print.{print_reset}
+import cg_reg.{cg_reg_reset, cg_reg_build}
+import cg_decl.{cg_decl_reset}
+import cg.{CgConfig, generate}
+import cg_test_helpers.{cg_probe_compile, cg_ice_count, cg_report_ices, cg_text_occurrences}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+fn probe_src() -> Str {
+    #"fn main() {
+    let ch = channel.new[Int](buffer: 4)
+    let n = 2
+    let names = channel.new[Str](buffer: n)
+}
+"#
+}
+
+fn standalone_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0 }
+}
+
+// The probe is deleted BEFORE any assertion so a red row never leaves the file behind.
+fn unit_text() -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Codegen {
+    let path = "build/cg_expr_channel_new_probe.bl"
+    let program = cg_probe_compile(path, probe_src())
+    let _ = fs.delete(path)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    print_reset()
+    cg_reg_reset()
+    cg_reg_build(program)
+    cg_decl_reset()
+    generate(program, standalone_cfg())
+}
+
+test "each channel construction is one call to the runtime constructor" {
+    let text = unit_text()
+    cg_report_ices("generate")
+    assert_eq_int("ICEs while generating the unit", cg_ice_count(), 0)
+    assert_eq_int("runtime constructor calls", cg_text_occurrences(text, "blink_channel_new(4)"), 1)
+    assert_eq_int("constructor calls of any argument", cg_text_occurrences(text, "blink_channel_new("), 2)
+}
