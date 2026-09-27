@@ -374,6 +374,17 @@ fn slot_walks(etid: Int) -> Bool {
 
 // ── Promoting one value ───────────────────────────────────────────────────
 
+// Every type that reaches code generation is concrete and nameable, so a type with no C
+// layout at an arena boundary is a compiler bug, not a type the arena cannot copy.
+fn layout_declined(rec: LayoutRecord, tid: Int, span: Int) -> Bool ! Diag.Report {
+    let reason = rec.decline_reason
+    if reason == "" { return false }
+    diag_ice_at("PromoteTypeUnspellable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "no C layout for {tc_type_str(tc_resolve(tid))} at an arena boundary: {reason}", span,
+        "every type that reaches code generation must be concrete and nameable; this is a compiler bug")
+    true
+}
+
 // The value copied into the target of `ctx`, or the value itself when nothing in its type
 // can be arena memory. -1 after a refusal.
 pub fn cg_promote_value(tid: Int, value: Int, ctx: Int, span: Int) -> Int ! Diag.Report {
@@ -381,13 +392,7 @@ pub fn cg_promote_value(tid: Int, value: Int, ctx: Int, span: Int) -> Int ! Diag
     if !cg_promote_needs_walk(tid) { return value }
     if ea_refuse_recursive_crossing(span, tid) { return -1 }
     let rec = layout_of(tid, Position.Return)
-    let reason = rec.decline_reason
-    if reason != "" {
-        diag_ice_at("PromoteTypeUnspellable", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "no C layout for {tc_type_str(tc_resolve(tid))} at an arena boundary: {reason}", span,
-            "every type that reaches code generation must be concrete and nameable; this is a compiler bug")
-        return -1
-    }
+    if layout_declined(rec, tid, span) { return -1 }
     match walk_class(tid) {
         WalkClass.Text => ir_call_runtime(tid, span, rec.c_spelling, c_runtime_helper("promote_str"),
             rec.slot_form, [ctx, value])
@@ -780,14 +785,16 @@ pub fn cg_promote_capture_table(closure_symbol: Str, names: List[Str], tids: Lis
         let tid = tids.get(i).unwrap()
         let is_cell = celled.get(i).unwrap() == 1
         t.name_lits.push(c_string_literal(names.get(i).unwrap()))
-        if !walker_buildable(tid) && ea_closure_is_promoted(span) {
+        let buildable = walker_buildable(tid, span)
+        if buildable == BUILD_REPORTED { return "" }
+        if buildable == BUILD_NO && ea_closure_is_promoted(span) {
             let name = names.get(i).unwrap()
             if !ea_refuse_recursive_crossing(span, tid) && !ea_refuse_unwalkable_capture(span, name, tid) {
                 invariant(span, "a promoted closure captures `{name}` of {tc_type_str(tc_resolve(tid))}, which has no walker, and no check refused it")
             }
             return ""
         }
-        if !walker_buildable(tid) {
+        if buildable == BUILD_NO {
             t.sizes.push("BLINK_CAPTURE_REFUSED")
             t.walks.push("NULL")
             t.fills.push("NULL")
@@ -818,76 +825,90 @@ pub fn cg_promote_capture_table(closure_symbol: Str, names: List[Str], tids: Lis
     t.symbol
 }
 
-// Whether the walker for a value of this type builds with no report. It asks what
-// walk_fixes and cg_promote_value would refuse, and reports nothing itself: a closure that
-// never crosses an arena must compile whatever it captures.
-fn walker_buildable(tid: Int) -> Bool {
-    if tid < 0 { return false }
+// Whether the walker for a value of this type builds. It asks what walk_fixes and
+// cg_promote_value would refuse, and reports no refusal itself: a closure that never
+// crosses an arena must compile whatever it captures. A type with no layout is reported,
+// because no closure can capture it. The answers order so that a type answers the lowest
+// of its members.
+const BUILD_REPORTED = -1
+const BUILD_NO = 0
+const BUILD_YES = 1
+
+fn walker_buildable(tid: Int, span: Int) -> Int ! Diag.Report {
+    if tid < 0 { return BUILD_NO }
     let r = tc_resolve(tid)
     match buildable_memo.get(r) {
-        Some(v) => return v == 1
+        Some(v) => return v
         None => {}
     }
-    buildable_memo.insert(r, 2)
-    let yes = buildable_uncached(r)
-    buildable_memo.insert(r, if yes { 1 } else { 0 })
-    yes
+    // A member still being answered is a recursive type, which reaches_itself refuses.
+    buildable_memo.insert(r, BUILD_NO)
+    let v = buildable_uncached(r, span)
+    buildable_memo.insert(r, v)
+    v
 }
 
-fn buildable_uncached(r: Int) -> Bool {
-    if layout_of(r, Position.Return).decline_reason != "" { return false }
-    if !cg_promote_needs_walk(r) { return true }
-    if tc_tid_reaches_itself(r) >= 0 { return false }
+fn buildable_uncached(r: Int, span: Int) -> Int ! Diag.Report {
+    if layout_declined(layout_of(r, Position.Return), r, span) { return BUILD_REPORTED }
+    if !cg_promote_needs_walk(r) { return BUILD_YES }
+    if tc_tid_reaches_itself(r) >= 0 { return BUILD_NO }
     let c = walk_class(r)
-    if c == WalkClass.Text { return true }
+    if c == WalkClass.Text { return BUILD_YES }
     let symbol = if c == WalkClass.Closure { c_promote_closure_walker_name(r) } else { c_promote_walker_name(r) }
-    if diag_is_ice_seg(symbol) { return false }
+    if diag_is_ice_seg(symbol) { return BUILD_NO }
     match c {
-        WalkClass.Closure => true
-        WalkClass.FlatShell => true
-        WalkClass.ListShell => child_buildable(child_tid(r, Slot.Inner1))
-        WalkClass.SetShell => child_buildable(child_tid(r, Slot.Inner1))
-        WalkClass.MapShell => child_buildable(child_tid(r, Slot.Inner1)) && child_buildable(child_tid(r, Slot.Inner2))
-        WalkClass.Record => fields_buildable(r)
-        WalkClass.Tagged => payloads_buildable(r)
-        WalkClass.Carrier => child_buildable(child_tid(r, Slot.Inner1)) && (tc_tid_kind(r) != TyKind.Result || child_buildable(child_tid(r, Slot.Inner2)))
-        WalkClass.Tuple => elems_buildable(r)
-        _ => false
+        WalkClass.Closure => BUILD_YES
+        WalkClass.FlatShell => BUILD_YES
+        WalkClass.ListShell => child_buildable(child_tid(r, Slot.Inner1), span)
+        WalkClass.SetShell => child_buildable(child_tid(r, Slot.Inner1), span)
+        WalkClass.MapShell => lower(child_buildable(child_tid(r, Slot.Inner1), span), child_buildable(child_tid(r, Slot.Inner2), span))
+        WalkClass.Record => fields_buildable(r, span)
+        WalkClass.Tagged => payloads_buildable(r, span)
+        WalkClass.Carrier => {
+            let ok = child_buildable(child_tid(r, Slot.Inner1), span)
+            if tc_tid_kind(r) != TyKind.Result { ok } else { lower(ok, child_buildable(child_tid(r, Slot.Inner2), span)) }
+        }
+        WalkClass.Tuple => elems_buildable(r, span)
+        _ => BUILD_NO
     }
 }
 
-// A member that is absent (an Option's second slot) or holds no arena memory builds; a
-// member still being answered is a recursive type, which reaches_itself refuses above.
-fn child_buildable(tid: Int) -> Bool {
-    if tid < 0 { return true }
-    walker_buildable(tid)
+fn lower(a: Int, b: Int) -> Int { if a < b { a } else { b } }
+
+// A member that is absent (an Option's second slot) or holds no arena memory builds.
+fn child_buildable(tid: Int, span: Int) -> Int ! Diag.Report {
+    if tid < 0 { return BUILD_YES }
+    walker_buildable(tid, span)
 }
 
-fn fields_buildable(r: Int) -> Bool {
+fn fields_buildable(r: Int, span: Int) -> Int ! Diag.Report {
+    let mut v = BUILD_YES
     for slot in tc_struct_field_slots(r) {
-        if !child_buildable(tc_member_tid_at_instance(tc_sfield_tid(slot), r)) { return false }
+        v = lower(v, child_buildable(tc_member_tid_at_instance(tc_sfield_tid(slot), r), span))
     }
-    true
+    v
 }
 
-fn payloads_buildable(r: Int) -> Bool {
+fn payloads_buildable(r: Int, span: Int) -> Int ! Diag.Report {
     let decl = tc_tid_decl_node(r)
-    if decl < 0 { return false }
-    for v in tc_enum_variant_slots(cg_reg_tid_for_decl(decl)) {
-        for f in tc_evar_field_slots(v) {
-            if !child_buildable(tc_member_tid_at_instance(tc_evfield_tid(f), r)) { return false }
+    if decl < 0 { return BUILD_NO }
+    let mut v = BUILD_YES
+    for vs in tc_enum_variant_slots(cg_reg_tid_for_decl(decl)) {
+        for f in tc_evar_field_slots(vs) {
+            v = lower(v, child_buildable(tc_member_tid_at_instance(tc_evfield_tid(f), r), span))
         }
     }
-    true
+    v
 }
 
-fn elems_buildable(r: Int) -> Bool {
+fn elems_buildable(r: Int, span: Int) -> Int ! Diag.Report {
+    let mut v = BUILD_YES
     let mut i = 0
     while i < tc_tid_child_count(r) {
-        if !child_buildable(child_tid(r, Slot.Elem(i))) { return false }
+        v = lower(v, child_buildable(child_tid(r, Slot.Elem(i)), span))
         i = i + 1
     }
-    true
+    v
 }
 
 // A word walker `void* blink_capture_word_<T>(void* word, ctx)` decodes the capture word
