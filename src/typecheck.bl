@@ -12,7 +12,7 @@ import parser.{
     node_impl_binders, node_recv_type_args, node_impl_where_bounds, node_source_module,
     node_set_module, node_set_name, node_supertraits, synth_struct_decl,
     synth_named_arg, sublist_append, sublist_of, node_set_obj, node_set_args,
-    node_xfail_reason, node_xfail_ticket, node_value_child_ids,
+    node_xfail_reason, node_xfail_ticket, node_value_child_ids, node_spell_child_ids,
     sublist_get, sublist_length,
 }
 import diagnostics.{
@@ -280,6 +280,16 @@ let mut tc_type_decl_ambiguous_names: Map[Str, Int] = Map()
 // type or builtin (`fn f[Channel](x: Channel)`) is not mis-read as that constructor
 // and E0303 does not fire on it (sections/03_types.md §3.4:1259).
 let mut tc_active_tparams: Map[Str, Int] = Map()
+// Which type parameters of a generic declaration reach a Map key or Set element position,
+// one byte per parameter: `.` none, `S` a Set element, `M` a Map key. Hash is a property of
+// the substituted type (sections/03_types.md:1940), so the check waits for the use that
+// substitutes it. Types are keyed by pool name; fns by declaration node.
+let mut tc_hash_oblig: Map[Str, Str] = Map()
+let mut tc_hash_oblig_fn: Map[Int, Str] = Map()
+// The declaration under scan: its parameter names and the marks found so far.
+let mut tc_ho_names: List[Str] = []
+let mut tc_ho_marks: List[Str] = []
+let mut tc_ho_changed: Int = 0
 // A stack of active type-parameter bindings, one frame per binder brought into
 // scope, recording the parameter name. A frame per binder — not a per-name count —
 // so an inner binder that reuses an outer name shadows it: the innermost frame for
@@ -3898,6 +3908,7 @@ fn tc_check_bounds_for_binds(sig: Int, binds: Map[Str, Int], node: Int) ! TypeCh
         }
         ti = ti + 1
     }
+    tc_check_hash_obligations_for_binds(sig, binds, node)
 }
 
 // One type param's declared-bound set vs. its concrete type. Iterating the known modeled
@@ -6844,6 +6855,10 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     // while the annotation/param path lowered it to Int (two spellings of one
     // type), and an alias-keyed map inside a compound carrier emitted a void key
     // temp. The annotation node still names what the user wrote for diagnostics.
+    // A generic alias applied to arguments owes the same Hash checks as the type it names.
+    if tc_suppress_ann_validation == 0 && elems_sl != -1 && tc_alias_underlying_of(name) != -1 {
+        tc_validate_type_arg_hashability(tc_hash_oblig_of(name), elems_sl)
+    }
     let alias_name_tid = tc_resolve_transparent_alias_name(name)
     if alias_name_tid != -1 { return tc_resolve(alias_name_tid) }
 
@@ -6863,7 +6878,7 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
         // entirely. Gated on the same flag as the Map/Set branches above so the
         // off-path re-resolution below still cannot double-report.
         if tc_suppress_ann_validation == 0 && (type_kind(resolved) == TyKind.Struct || type_kind(resolved) == TyKind.Enum) {
-            tc_validate_type_arg_hashability(elems_sl)
+            tc_validate_type_arg_hashability(tc_hash_oblig.get(tc_instance_base_name(resolved)) ?? "", elems_sl)
         }
         if type_kind(resolved) == TyKind.Struct && elems_sl != -1 && sublist_length(elems_sl) >= 1 {
             return tc_produce_struct_instance_tid(ann_node, tc_instance_base_name(resolved), elems_sl)
@@ -7777,13 +7792,23 @@ fn validate_set_elem(elem_ann: Int) ! Diag.Report {
 // unknown arg name matches neither "Map" nor "Set" and has no elements, so it costs one
 // comparison and terminates — the deferral validate_map_key documents for type params stays
 // intact — being over-eager here would itself be a defect.
-fn tc_validate_type_arg_hashability(elems_sl: Int) ! Diag.Report {
+//
+// `owner_oblig` is the owner's tc_hash_oblig entry: an argument substituted for a parameter
+// that the declaration uses as a Set element or Map key is judged here as one, so
+// `Holder[Point]` over `type Holder[T] { items: Set[T] }` is rejected like `Set[Point]`.
+fn tc_validate_type_arg_hashability(owner_oblig: Str, elems_sl: Int) ! Diag.Report {
     if elems_sl == -1 { return }
     let mut i = 0
     while i < sublist_length(elems_sl) {
         let arg = sublist_get(elems_sl, i)
         let arg_name = node_name(arg)
         let arg_elems = node_elements(arg)
+        let mark = tc_hash_oblig_mark(owner_oblig, i)
+        if mark == "S" {
+            validate_set_elem(arg)
+        } else if mark == "M" {
+            validate_map_key(arg)
+        }
         if arg_name == "Map" {
             if arg_elems != -1 && sublist_length(arg_elems) >= 1 {
                 validate_map_key(sublist_get(arg_elems, 0))
@@ -7793,7 +7818,221 @@ fn tc_validate_type_arg_hashability(elems_sl: Int) ! Diag.Report {
                 validate_set_elem(sublist_get(arg_elems, 0))
             }
         }
-        tc_validate_type_arg_hashability(arg_elems)
+        tc_validate_type_arg_hashability(tc_hash_oblig_of(arg_name), arg_elems)
+        i = i + 1
+    }
+}
+
+// The mark for parameter `i` in an obligation string, or "" when it carries none.
+fn tc_hash_oblig_mark(oblig: Str, i: Int) -> Str {
+    if i >= oblig.len() { return "" }
+    let b = oblig.byte_at(i)
+    if b == 83 { return "S" }
+    if b == 77 { return "M" }
+    ""
+}
+
+// The obligation string of a generic type as written in the module under check, or "".
+fn tc_hash_oblig_of(name: Str) -> Str {
+    if name == "" { return "" }
+    let direct = tc_hash_oblig.get(tc_written_type_nominal(name)) ?? ""
+    if direct != "" { return direct }
+    tc_hash_oblig.get(strip_module_qualifier(name)) ?? ""
+}
+
+// Marks each parameter of the declaration under scan (tc_ho_names) that `ann` places in a
+// Set element or Map key position: directly, inside a tuple in that position, or through
+// another generic type's obliged parameter. `key_kind` is the mark `ann` itself would give.
+fn tc_hash_oblig_walk(ann: Int, key_kind: Str) {
+    if ann == -1 { return }
+    let name = node_name(ann)
+    let elems = node_elements(ann)
+    if key_kind != "" {
+        if elems == -1 {
+            let mut p = 0
+            while p < tc_ho_names.len() {
+                if tc_ho_names.get(p).unwrap() == name {
+                    if tc_ho_marks.get(p).unwrap() == "." {
+                        tc_ho_marks.set(p, key_kind)
+                        tc_ho_changed = 1
+                    }
+                    return
+                }
+                p = p + 1
+            }
+        }
+        if name == "Tuple" && elems != -1 {
+            let mut t = 0
+            while t < sublist_length(elems) {
+                tc_hash_oblig_walk(sublist_get(elems, t), key_kind)
+                t = t + 1
+            }
+            return
+        }
+    }
+    if name == "Fn" { tc_hash_oblig_walk(node_type_ann(ann), "") }
+    if elems == -1 { return }
+    let owner = if name == "Map" { "M." } else if name == "Set" { "S" } else { tc_hash_oblig_of(name) }
+    let mut i = 0
+    while i < sublist_length(elems) {
+        tc_hash_oblig_walk(sublist_get(elems, i), tc_hash_oblig_mark(owner, i))
+        i = i + 1
+    }
+}
+
+// Starts a scan over a declaration whose parameters are `names`, from its marks so far.
+fn tc_ho_begin(names: List[Str], prior: Str) {
+    tc_ho_names = names
+    tc_ho_marks = []
+    let mut i = 0
+    while i < names.len() {
+        let m = tc_hash_oblig_mark(prior, i)
+        tc_ho_marks.push(if m == "" { "." } else { m })
+        i = i + 1
+    }
+}
+
+fn tc_ho_joined() -> Str {
+    let mut out = ""
+    for m in tc_ho_marks { out = "{out}{m}" }
+    out
+}
+
+// Fills tc_hash_oblig for every generic struct, enum and alias. A parameter can be obliged
+// through another declaration's obliged parameter, so this repeats until no mark changes;
+// marks are only ever added, so it stops.
+fn tc_compute_type_hash_obligations(types_sl: Int) {
+    let saved_module = nr_current_module
+    let mut changed = 1
+    while changed != 0 {
+        changed = 0
+        let mut i = 0
+        while i < sublist_length(types_sl) {
+            let td = sublist_get(types_sl, i)
+            let tps = node_type_params(td)
+            if tps != -1 && sublist_length(tps) > 0 {
+                nr_current_module = node_module(td)
+                let key = tc_nominal_type_name(td)
+                let mut names: List[Str] = []
+                let mut p = 0
+                while p < sublist_length(tps) {
+                    names.push(node_name(sublist_get(tps, p)))
+                    p = p + 1
+                }
+                tc_ho_begin(names, tc_hash_oblig.get(key) ?? "")
+                tc_ho_changed = 0
+                tc_hash_oblig_walk(node_value(td), "")
+                let flds = node_fields(td)
+                let mut f = 0
+                while flds != -1 && f < sublist_length(flds) {
+                    let fd = sublist_get(flds, f)
+                    if node_kind(fd) == NodeKind.TypeVariant {
+                        let vflds = node_fields(fd)
+                        let mut v = 0
+                        while vflds != -1 && v < sublist_length(vflds) {
+                            tc_hash_oblig_walk(node_value(sublist_get(vflds, v)), "")
+                            v = v + 1
+                        }
+                    } else {
+                        tc_hash_oblig_walk(node_value(fd), "")
+                    }
+                    f = f + 1
+                }
+                if tc_ho_changed != 0 {
+                    tc_hash_oblig.insert(key, tc_ho_joined())
+                    changed = 1
+                }
+            }
+            i = i + 1
+        }
+    }
+    nr_current_module = saved_module
+}
+
+// The obligation string of the generic fn behind `sig`, over its type parameters in
+// signature order: every annotation in its signature and body is scanned, so a
+// `let s: Set[T]` in the body obliges T as surely as a `Set[T]` parameter does.
+fn tc_fn_hash_obligations(sig: Int) -> Str {
+    let fs = fnsig_pool.get(sig).unwrap()
+    if fs.decl < 0 || fs.type_params_count == 0 { return "" }
+    match tc_hash_oblig_fn.get(fs.decl) {
+        Some(o) => { return o }
+        None => {}
+    }
+    let mut names: List[Str] = []
+    let mut i = 0
+    while i < fs.type_params_count {
+        let idx = fs.type_params_start + i
+        names.push(if idx < fnsig_type_param_names.len() { fnsig_type_param_names.get(idx).unwrap() } else { "" })
+        i = i + 1
+    }
+    let saved_module = nr_current_module
+    nr_current_module = node_module(fs.decl)
+    tc_ho_begin(names, "")
+    tc_ho_walk_tree(fs.decl)
+    nr_current_module = saved_module
+    let out = tc_ho_joined()
+    tc_hash_oblig_fn.insert(fs.decl, out)
+    out
+}
+
+fn tc_ho_walk_tree(id: Int) {
+    for sp in node_spell_child_ids(id) { tc_hash_oblig_walk(sp, "") }
+    for c in node_value_child_ids(id) { tc_ho_walk_tree(c) }
+}
+
+// Tri-state Hash verdict on a concrete type, by the spec's closed list
+// (sections/03_types.md:1940): 1 hashable, -1 not, 0 unknown (never rejects).
+fn tc_tid_hash_fact(tid0: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let tid = tc_resolve(tid0)
+    let k = type_kind(tid)
+    if k == TyKind.Unknown || k == TyKind.Typevar { return 0 }
+    if k == TyKind.Float { return -1 }
+    if k == TyKind.Int || k == TyKind.Bool || k == TyKind.Char || k == TyKind.Str || is_sized_int(k) != 0 { return 1 }
+    if k == TyKind.Tuple {
+        let te = ty_pool.get(tid).unwrap()
+        let mut verdict = 1
+        let mut i = 0
+        while i < te.params_count {
+            let f = tc_tid_hash_fact(ty_param_list.get(te.params_start + i).unwrap())
+            if f == -1 { return -1 }
+            if f == 0 { verdict = 0 }
+            i = i + 1
+        }
+        return verdict
+    }
+    if k == TyKind.Struct || k == TyKind.Enum {
+        // A type with no declaration node is compiler-provided; its Hash is not ours to judge.
+        let td = tc_type_decl_node_by_tid.get(tid) ?? -1
+        if td == -1 && tc_decl_node_for_type(tc_tid_name(tid)) == -1 { return 0 }
+        return tc_tid_derive_fact(tid, "Hash")
+    }
+    if k == TyKind.List || k == TyKind.Map || k == TyKind.Set || k == TyKind.Option || k == TyKind.Result || k == TyKind.Bytes || k == TyKind.StringBuilder || k == TyKind.Fn {
+        return -1
+    }
+    0
+}
+
+// E1400 at a call whose type argument is used by the callee as a Set element or Map key
+// and is provably not hashable. Only a -1 verdict reports.
+fn tc_check_hash_obligations_for_binds(sig: Int, binds: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
+    let oblig = tc_fn_hash_obligations(sig)
+    if oblig == "" { return }
+    let fs = fnsig_pool.get(sig).unwrap()
+    let mut i = 0
+    while i < fs.type_params_count {
+        let mark = tc_hash_oblig_mark(oblig, i)
+        let idx = fs.type_params_start + i
+        if mark != "" && idx < fnsig_type_param_names.len() {
+            let name = fnsig_type_param_names.get(idx).unwrap()
+            let bound = binds.get(name) ?? -1
+            if bound != -1 && tc_tid_hash_fact(bound) == -1 {
+                let role = if mark == "S" { "Set element" } else { "Map key" }
+                diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE,
+                    "`{type_to_str(tc_resolve(bound))}` does not implement Hash — `{fs.name}` uses its type parameter {name} as a {role}", node,
+                    "use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a @derive(Hash, Eq) struct/enum for {name}")
+            }
+        }
         i = i + 1
     }
 }
@@ -10362,6 +10601,10 @@ fn init_types() ! TypeCheck.Register {
     tc_poly_user_impls = Map()
     tc_impl_of_method = Map()
     tc_active_tparams.clear()
+    tc_hash_oblig = Map()
+    tc_hash_oblig_fn = Map()
+    tc_ho_names = []
+    tc_ho_marks = []
     tc_call_site_type_args.clear()
     tc_type_args_claimed.clear()
     tc_type_args_unresolved.clear()
@@ -10490,6 +10733,9 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             }
             i = i + 1
         }
+        // Before any annotation resolves, so an alias underlying or a field that applies a
+        // generic type already sees which of its parameters must be hashable.
+        tc_compute_type_hash_obligations(types_sl)
         // Second pass: resolve each alias's underlying type now that every type
         // name is interned, so a target declared textually after the alias
         // resolves to its real instance tid instead of an orphan typevar.
