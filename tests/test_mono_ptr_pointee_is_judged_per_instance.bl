@@ -1,0 +1,199 @@
+// A `Ptr[T]` over a type parameter is a legal declaration: whether its pointee is one the
+// spec allows depends on what T stands for, and typecheck leaves it to the instance. Mono is
+// where an instance's T is known, so the pointee rule (E0810) is judged there, once per
+// instance, naming the substituted type.
+//
+// The legal instances must stay legal: judging per instance must not refuse the declaration.
+
+import std.fs
+import std.io
+import typecheck.{check_types}
+import mono.{run_mono}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+
+let PATH = "build/mono_ptr_pointee_probe.bl"
+
+fn probe(src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    diag_reset()
+    write_file(PATH, src)
+    let program = compile_to_program(PATH, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(PATH)
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn count_named(name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.name == name {
+            if d.severity == "error" || d.severity == "ice" { n = n + 1 }
+        }
+    }
+    n
+}
+
+// Failures report on stderr: a failing assert aborts and drops buffered stdout.
+fn assert_errors_exactly(label: Str, name: Str, want: Int) {
+    let errs = error_messages()
+    let n = count_named(name)
+    if n != want || errs.len() != want {
+        io.eprintln("FAIL: {label}: want exactly {want} {name} and nothing else, got:")
+        for e in errs { io.eprintln("  {e}") }
+    }
+    assert(n == want)
+    assert(errs.len() == want)
+}
+
+fn assert_message_names(label: Str, name: Str, needle: Str) {
+    let mut found = false
+    for d in diag_entries {
+        if d.name == name && d.message.contains(needle) { found = true }
+    }
+    if !found {
+        io.eprintln("FAIL: {label}: want a {name} that names '{needle}', got:")
+        for e in error_messages() { io.eprintln("  {e}") }
+    }
+    assert(found)
+}
+
+fn src_enum_payload_at_plain_struct() -> Str {
+    #"type Zs { zf: Int }
+type GE[T] { V { p: Ptr[T] } Nil }
+fn main() {
+    let e: GE[Zs] = GE.Nil
+    match e {
+        GE.V { p } => io.println("v")
+        GE.Nil => io.println("nil")
+    }
+}
+"#
+}
+
+fn src_let_at_plain_struct() -> Str {
+    #"type Zs { zf: Int }
+@trusted(audit: "p")
+fn hold[T](x: T) ! FFI {
+    with ffi.scope() as scope {
+        let p: Ptr[T] = scope.alloc()
+        io.println("{p.is_null()}")
+    }
+}
+fn main() ! FFI { hold(Zs { zf: 1 }) }
+"#
+}
+
+fn src_let_at_u8() -> Str {
+    #"@trusted(audit: "p")
+fn cell[T](x: T) ! FFI {
+    with ffi.scope() as scope {
+        let p: Ptr[T] = scope.alloc()
+        io.println("{p.is_null()}")
+    }
+}
+fn main() ! FFI {
+    let b: U8 = 1
+    cell(b)
+    cell(7)
+}
+"#
+}
+
+fn src_enum_payload_at_int() -> Str {
+    #"type GE[T] { V { p: Ptr[T] } Nil }
+fn main() {
+    let e: GE[Int] = GE.Nil
+    match e {
+        GE.V { p } => io.println("v")
+        GE.Nil => io.println("nil")
+    }
+}
+"#
+}
+
+fn src_one_good_one_bad_instance() -> Str {
+    #"type Zs { zf: Int }
+@trusted(audit: "p")
+fn hold[T](x: T) ! FFI {
+    with ffi.scope() as scope {
+        let p: Ptr[T] = scope.alloc()
+        io.println("{p.is_null()}")
+    }
+}
+fn main() ! FFI {
+    hold(7)
+    hold(Zs { zf: 1 })
+}
+"#
+}
+
+fn src_nested_ptr_at_plain_struct() -> Str {
+    #"type Zs { zf: Int }
+type Deep[T] { V { p: Ptr[Ptr[T]] } Nil }
+fn main() {
+    let e: Deep[Zs] = Deep.Nil
+    match e {
+        Deep.V { p } => io.println("v")
+        Deep.Nil => io.println("nil")
+    }
+}
+"#
+}
+
+// ── The regression: a plain struct reaches Ptr through T ──
+
+fn test_an_enum_payload_ptr_at_a_plain_struct_is_rejected() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    probe(src_enum_payload_at_plain_struct())
+    assert_errors_exactly("GE[Zs] payload Ptr[T]", "InvalidPtrType", 1)
+    assert_message_names("GE[Zs] payload Ptr[T]", "InvalidPtrType", "Zs")
+}
+
+fn test_a_let_ptr_at_a_plain_struct_is_rejected() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    probe(src_let_at_plain_struct())
+    assert_errors_exactly("hold[Zs] let Ptr[T]", "InvalidPtrType", 1)
+    assert_message_names("hold[Zs] let Ptr[T]", "InvalidPtrType", "Zs")
+}
+
+// Only the instance that substitutes a refused pointee reports, and it reports once.
+fn test_only_the_bad_instance_reports() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    probe(src_one_good_one_bad_instance())
+    assert_errors_exactly("hold[Int] and hold[Zs]", "InvalidPtrType", 1)
+    assert_message_names("hold[Int] and hold[Zs]", "InvalidPtrType", "Zs")
+}
+
+// A Ptr pointee is always valid, so the refused type sits one level down.
+fn test_a_nested_ptr_at_a_plain_struct_is_rejected() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    probe(src_nested_ptr_at_plain_struct())
+    assert_errors_exactly("Deep[Zs] payload Ptr[Ptr[T]]", "InvalidPtrType", 1)
+    assert_message_names("Deep[Zs] payload Ptr[Ptr[T]]", "InvalidPtrType", "Zs")
+}
+
+// ── Controls: legal instances stay legal ──
+
+fn test_a_let_ptr_at_sized_ints_is_accepted() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    probe(src_let_at_u8())
+    assert_errors_exactly("cell[U8] and cell[Int]", "InvalidPtrType", 0)
+}
+
+fn test_an_enum_payload_ptr_at_int_is_accepted() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    probe(src_enum_payload_at_int())
+    assert_errors_exactly("GE[Int] payload Ptr[T]", "InvalidPtrType", 0)
+}
+
+fn main() {
+    test_an_enum_payload_ptr_at_a_plain_struct_is_rejected()
+    test_a_let_ptr_at_a_plain_struct_is_rejected()
+    test_only_the_bad_instance_reports()
+    test_a_nested_ptr_at_a_plain_struct_is_rejected()
+    test_a_let_ptr_at_sized_ints_is_accepted()
+    test_an_enum_payload_ptr_at_int_is_accepted()
+    io.println("ptr pointee per instance: ok")
+}
