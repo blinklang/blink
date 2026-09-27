@@ -281,15 +281,12 @@ let mut tc_type_decl_ambiguous_names: Map[Str, Int] = Map()
 // and E0303 does not fire on it (sections/03_types.md §3.4:1259).
 let mut tc_active_tparams: Map[Str, Int] = Map()
 // Which type parameters of a generic declaration reach a Map key or Set element position,
-// one byte per parameter: `.` none, `S` a Set element, `M` a Map key. Hash is a property of
-// the substituted type (sections/03_types.md:1940), so the check waits for the use that
-// substitutes it. Types are keyed by pool name; fns by declaration node.
-let mut tc_hash_oblig: Map[Str, Str] = Map()
-let mut tc_hash_oblig_fn: Map[Int, Str] = Map()
-// The declaration under scan: its parameter names and the marks found so far.
-let mut tc_ho_names: List[Str] = []
-let mut tc_ho_marks: List[Str] = []
-let mut tc_ho_changed: Int = 0
+// one role per parameter. Hash is a property of the substituted type
+// (sections/03_types.md:1940), so the check waits for the use that substitutes it. Types
+// are keyed by pool name; fns by declaration node.
+type HashRole { Free, SetElement, MapKey }
+let mut tc_hash_oblig: Map[Str, List[HashRole]] = Map()
+let mut tc_hash_oblig_fn: Map[Int, List[HashRole]] = Map()
 // A stack of active type-parameter bindings, one frame per binder brought into
 // scope, recording the parameter name. A frame per binder — not a per-name count —
 // so an inner binder that reuses an outer name shadows it: the innermost frame for
@@ -6920,7 +6917,7 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
         // entirely. Gated on the same flag as the Map/Set branches above so the
         // off-path re-resolution below still cannot double-report.
         if tc_suppress_ann_validation == 0 && (type_kind(resolved) == TyKind.Struct || type_kind(resolved) == TyKind.Enum) {
-            tc_validate_type_arg_hashability(tc_hash_oblig.get(tc_instance_base_name(resolved)) ?? "", elems_sl)
+            tc_validate_type_arg_hashability(tc_hash_oblig_at(tc_instance_base_name(resolved)), elems_sl)
         }
         if type_kind(resolved) == TyKind.Struct && elems_sl != -1 && sublist_length(elems_sl) >= 1 {
             return tc_produce_struct_instance_tid(ann_node, tc_instance_base_name(resolved), elems_sl)
@@ -7838,18 +7835,17 @@ fn validate_set_elem(elem_ann: Int) ! Diag.Report {
 // `owner_oblig` is the owner's tc_hash_oblig entry: an argument substituted for a parameter
 // that the declaration uses as a Set element or Map key is judged here as one, so
 // `Holder[Point]` over `type Holder[T] { items: Set[T] }` is rejected like `Set[Point]`.
-fn tc_validate_type_arg_hashability(owner_oblig: Str, elems_sl: Int) ! Diag.Report {
+fn tc_validate_type_arg_hashability(owner_oblig: List[HashRole], elems_sl: Int) ! Diag.Report {
     if elems_sl == -1 { return }
     let mut i = 0
     while i < sublist_length(elems_sl) {
         let arg = sublist_get(elems_sl, i)
         let arg_name = node_name(arg)
         let arg_elems = node_elements(arg)
-        let mark = tc_hash_oblig_mark(owner_oblig, i)
-        if mark == "S" {
-            validate_set_elem(arg)
-        } else if mark == "M" {
-            validate_map_key(arg)
+        match tc_hash_oblig_mark(owner_oblig, i) {
+            HashRole.SetElement => validate_set_elem(arg)
+            HashRole.MapKey => validate_map_key(arg)
+            HashRole.Free => {}
         }
         if arg_name == "Map" {
             if arg_elems != -1 && sublist_length(arg_elems) >= 1 {
@@ -7865,40 +7861,52 @@ fn tc_validate_type_arg_hashability(owner_oblig: Str, elems_sl: Int) ! Diag.Repo
     }
 }
 
-// The mark for parameter `i` in an obligation string, or "" when it carries none.
-fn tc_hash_oblig_mark(oblig: Str, i: Int) -> Str {
-    if i >= oblig.len() { return "" }
-    let b = oblig.byte_at(i)
-    if b == 83 { return "S" }
-    if b == 77 { return "M" }
-    ""
+// The role of parameter `i`; Free past the end.
+fn tc_hash_oblig_mark(oblig: List[HashRole], i: Int) -> HashRole {
+    oblig.get(i) ?? HashRole.Free
 }
 
-// The obligation string of a generic type as written in the module under check, or "".
-fn tc_hash_oblig_of(name: Str) -> Str {
-    if name == "" { return "" }
-    let direct = tc_hash_oblig.get(tc_written_type_nominal(name)) ?? ""
-    if direct != "" { return direct }
-    tc_hash_oblig.get(strip_module_qualifier(name)) ?? ""
+fn tc_hash_role_is_free(r: HashRole) -> Int {
+    match r {
+        HashRole.Free => 1
+        _ => 0
+    }
 }
 
-// Marks each parameter of the declaration under scan (tc_ho_names) that `ann` places in a
-// Set element or Map key position: directly, inside a tuple in that position, or through
-// another generic type's obliged parameter. `key_kind` is the mark `ann` itself would give.
-fn tc_hash_oblig_walk(ann: Int, key_kind: Str) {
-    if ann == -1 { return }
+// The roles stored under a pool name; empty when it has none.
+fn tc_hash_oblig_at(key: Str) -> List[HashRole] {
+    let none: List[HashRole] = []
+    tc_hash_oblig.get(key) ?? none
+}
+
+// The roles of a generic type as written in the module under check; empty when it has none.
+fn tc_hash_oblig_of(name: Str) -> List[HashRole] {
+    let none: List[HashRole] = []
+    if name == "" { return none }
+    let direct = tc_hash_oblig_at(tc_written_type_nominal(name))
+    if direct.len() != 0 { return direct }
+    tc_hash_oblig_at(strip_module_qualifier(name))
+}
+
+// Gives each parameter in `names` that `ann` places in a Set element or Map key position its
+// role in `roles`: directly, inside a tuple in that position, or through another generic
+// type's role for its parameter. `key_role` is the role `ann` itself is in. Returns 1 when a
+// role changed.
+fn tc_hash_oblig_walk(ann: Int, key_role: HashRole, names: List[Str], roles: List[HashRole]) -> Int {
+    if ann == -1 { return 0 }
     let name = node_name(ann)
     let elems = node_elements(ann)
-    if key_kind != "" {
+    let mut changed = 0
+    if tc_hash_role_is_free(key_role) == 0 {
         if elems == -1 {
             let mut p = 0
-            while p < tc_ho_names.len() {
-                if tc_ho_names.get(p).unwrap() == name {
-                    if tc_ho_marks.get(p).unwrap() == "." {
-                        tc_ho_marks.set(p, key_kind)
-                        tc_ho_changed = 1
+            while p < names.len() {
+                if names.get(p).unwrap() == name {
+                    if tc_hash_role_is_free(roles.get(p).unwrap()) != 0 {
+                        roles.set(p, key_role)
+                        return 1
                     }
-                    return
+                    return 0
                 }
                 p = p + 1
             }
@@ -7906,38 +7914,34 @@ fn tc_hash_oblig_walk(ann: Int, key_kind: Str) {
         if name == "Tuple" && elems != -1 {
             let mut t = 0
             while t < sublist_length(elems) {
-                tc_hash_oblig_walk(sublist_get(elems, t), key_kind)
+                if tc_hash_oblig_walk(sublist_get(elems, t), key_role, names, roles) != 0 { changed = 1 }
                 t = t + 1
             }
-            return
+            return changed
         }
     }
-    if name == "Fn" { tc_hash_oblig_walk(node_type_ann(ann), "") }
-    if elems == -1 { return }
-    let owner = if name == "Map" { "M." } else if name == "Set" { "S" } else { tc_hash_oblig_of(name) }
+    if name == "Fn" {
+        if tc_hash_oblig_walk(node_type_ann(ann), HashRole.Free, names, roles) != 0 { changed = 1 }
+    }
+    if elems == -1 { return changed }
+    let owner = if name == "Map" { [HashRole.MapKey] } else if name == "Set" { [HashRole.SetElement] } else { tc_hash_oblig_of(name) }
     let mut i = 0
     while i < sublist_length(elems) {
-        tc_hash_oblig_walk(sublist_get(elems, i), tc_hash_oblig_mark(owner, i))
+        if tc_hash_oblig_walk(sublist_get(elems, i), tc_hash_oblig_mark(owner, i), names, roles) != 0 { changed = 1 }
         i = i + 1
     }
+    changed
 }
 
-// Starts a scan over a declaration whose parameters are `names`, from its marks so far.
-fn tc_ho_begin(names: List[Str], prior: Str) {
-    tc_ho_names = names
-    tc_ho_marks = []
+// One role per name, from the roles found so far.
+fn tc_hash_roles_from(names: List[Str], prior: List[HashRole]) -> List[HashRole] {
+    let mut roles: List[HashRole] = []
     let mut i = 0
     while i < names.len() {
-        let m = tc_hash_oblig_mark(prior, i)
-        tc_ho_marks.push(if m == "" { "." } else { m })
+        roles.push(tc_hash_oblig_mark(prior, i))
         i = i + 1
     }
-}
-
-fn tc_ho_joined() -> Str {
-    let mut out = ""
-    for m in tc_ho_marks { out = "{out}{m}" }
-    out
+    roles
 }
 
 // Fills tc_hash_oblig for every generic struct, enum and alias. A parameter can be obliged
@@ -7961,9 +7965,8 @@ fn tc_compute_type_hash_obligations(types_sl: Int) {
                     names.push(node_name(sublist_get(tps, p)))
                     p = p + 1
                 }
-                tc_ho_begin(names, tc_hash_oblig.get(key) ?? "")
-                tc_ho_changed = 0
-                tc_hash_oblig_walk(node_value(td), "")
+                let roles = tc_hash_roles_from(names, tc_hash_oblig_at(key))
+                let mut grew = tc_hash_oblig_walk(node_value(td), HashRole.Free, names, roles)
                 let flds = node_fields(td)
                 let mut f = 0
                 while flds != -1 && f < sublist_length(flds) {
@@ -7972,16 +7975,16 @@ fn tc_compute_type_hash_obligations(types_sl: Int) {
                         let vflds = node_fields(fd)
                         let mut v = 0
                         while vflds != -1 && v < sublist_length(vflds) {
-                            tc_hash_oblig_walk(node_value(sublist_get(vflds, v)), "")
+                            if tc_hash_oblig_walk(node_value(sublist_get(vflds, v)), HashRole.Free, names, roles) != 0 { grew = 1 }
                             v = v + 1
                         }
                     } else {
-                        tc_hash_oblig_walk(node_value(fd), "")
+                        if tc_hash_oblig_walk(node_value(fd), HashRole.Free, names, roles) != 0 { grew = 1 }
                     }
                     f = f + 1
                 }
-                if tc_ho_changed != 0 {
-                    tc_hash_oblig.insert(key, tc_ho_joined())
+                if grew != 0 {
+                    tc_hash_oblig.insert(key, roles)
                     changed = 1
                 }
             }
@@ -7991,12 +7994,13 @@ fn tc_compute_type_hash_obligations(types_sl: Int) {
     nr_current_module = saved_module
 }
 
-// The obligation string of the generic fn behind `sig`, over its type parameters in
+// The roles of the generic fn behind `sig`, over its type parameters in
 // signature order: every annotation in its signature and body is scanned, so a
 // `let s: Set[T]` in the body obliges T as surely as a `Set[T]` parameter does.
-fn tc_fn_hash_obligations(sig: Int) -> Str {
+fn tc_fn_hash_obligations(sig: Int) -> List[HashRole] {
     let fs = fnsig_pool.get(sig).unwrap()
-    if fs.decl < 0 || fs.type_params_count == 0 { return "" }
+    let none: List[HashRole] = []
+    if fs.decl < 0 || fs.type_params_count == 0 { return none }
     match tc_hash_oblig_fn.get(fs.decl) {
         Some(o) => { return o }
         None => {}
@@ -8010,17 +8014,16 @@ fn tc_fn_hash_obligations(sig: Int) -> Str {
     }
     let saved_module = nr_current_module
     nr_current_module = node_module(fs.decl)
-    tc_ho_begin(names, "")
-    tc_ho_walk_tree(fs.decl)
+    let roles = tc_hash_roles_from(names, none)
+    tc_hash_oblig_walk_tree(fs.decl, names, roles)
     nr_current_module = saved_module
-    let out = tc_ho_joined()
-    tc_hash_oblig_fn.insert(fs.decl, out)
-    out
+    tc_hash_oblig_fn.insert(fs.decl, roles)
+    roles
 }
 
-fn tc_ho_walk_tree(id: Int) {
-    for sp in node_spell_child_ids(id) { tc_hash_oblig_walk(sp, "") }
-    for c in node_value_child_ids(id) { tc_ho_walk_tree(c) }
+fn tc_hash_oblig_walk_tree(id: Int, names: List[Str], roles: List[HashRole]) {
+    for sp in node_spell_child_ids(id) { tc_hash_oblig_walk(sp, HashRole.Free, names, roles) }
+    for c in node_value_child_ids(id) { tc_hash_oblig_walk_tree(c, names, roles) }
 }
 
 // Tri-state Hash verdict on a concrete type, by the spec's closed list
@@ -8059,17 +8062,20 @@ fn tc_tid_hash_fact(tid0: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
 // and is provably not hashable. Only a -1 verdict reports.
 fn tc_check_hash_obligations_for_binds(sig: Int, binds: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
     let oblig = tc_fn_hash_obligations(sig)
-    if oblig == "" { return }
+    if oblig.len() == 0 { return }
     let fs = fnsig_pool.get(sig).unwrap()
     let mut i = 0
     while i < fs.type_params_count {
-        let mark = tc_hash_oblig_mark(oblig, i)
+        let role = match tc_hash_oblig_mark(oblig, i) {
+            HashRole.SetElement => "Set element"
+            HashRole.MapKey => "Map key"
+            HashRole.Free => ""
+        }
         let idx = fs.type_params_start + i
-        if mark != "" && idx < fnsig_type_param_names.len() {
+        if role != "" && idx < fnsig_type_param_names.len() {
             let name = fnsig_type_param_names.get(idx).unwrap()
             let bound = binds.get(name) ?? -1
             if bound != -1 && tc_tid_hash_fact(bound) == -1 {
-                let role = if mark == "S" { "Set element" } else { "Map key" }
                 diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE,
                     "`{type_to_str(tc_resolve(bound))}` does not implement Hash — `{fs.name}` uses its type parameter {name} as a {role}", node,
                     "use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a @derive(Hash, Eq) struct/enum for {name}")
@@ -10645,8 +10651,6 @@ fn init_types() ! TypeCheck.Register {
     tc_active_tparams.clear()
     tc_hash_oblig = Map()
     tc_hash_oblig_fn = Map()
-    tc_ho_names = []
-    tc_ho_marks = []
     tc_call_site_type_args.clear()
     tc_type_args_claimed.clear()
     tc_type_args_unresolved.clear()
