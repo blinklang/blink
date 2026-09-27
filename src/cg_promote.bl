@@ -6,7 +6,9 @@
 // every arena-held part of the value into the target. The target is the arena the block
 // was entered from, or the GC heap when that is NULL. A walker is written only for a type
 // that crosses a boundary, once per unit and static, so every unit that crosses with a type
-// holds its own copy and no two units define one symbol.
+// holds its own copy and no two units define one symbol. Every allocation in a walker names
+// the target, and none goes through the current arena: the walk changes no thread state, so a
+// panic inside it leaves the current arena as the block's exit restores it.
 //
 // A recursive type at a boundary is E0701: the escape pass refuses it in the source, and
 // cg_promote_value refuses it again in each instance of a generic body, where the type
@@ -29,9 +31,9 @@ import cname.{
 import cg_print.{print_fn}
 import escape.{ea_refuse_recursive_crossing}
 import cg_reg.{cg_reg_tid_for_decl}
-import cg_call.{cg_call_element_from_runtime, cg_call_element_to_slot}
+import cg_call.{cg_call_element_from_runtime, cg_call_element_to_slot_in}
 import ir.{
-    ir_arena_target, ir_assign, ir_binary, ir_block, ir_box, ir_break, ir_c_spelling,
+    ir_arena_target, ir_assign, ir_binary, ir_block, ir_box_into, ir_break, ir_c_spelling,
     ir_call_direct, ir_call_runtime, ir_carrier_tag, ir_const, ir_expr_stmt, ir_field_get,
     ir_if, ir_let, ir_loop, ir_return, ir_switch, ir_unary, ir_unbox, ir_var_ref,
     ir_verify_in_frame,
@@ -436,14 +438,8 @@ fn build_walker(tid: Int, symbol: Str, span: Int) -> Bool ! Diag.Report {
         target: "target", rec: rec }
     let fixes = walk_fixes(w)
     if fixes.len() == 1 && fixes.get(0).unwrap() < 0 { return false }
-    let voids = layout_of(TYPE_VOID, Position.Return)
-    let enter = ir_call_runtime(TYPE_VOID, span, voids.c_spelling, c_runtime_helper("promote_enter"),
-        voids.slot_form, [walk_target(w)])
-    let leave = ir_call_runtime(TYPE_VOID, span, voids.c_spelling, c_runtime_helper("promote_leave"),
-        voids.slot_form, [])
-    let mut stmts: List[Int] = [ir_expr_stmt(span, enter)]
+    let mut stmts: List[Int] = []
     for f in fixes { stmts.push(f) }
-    stmts.push(ir_expr_stmt(span, leave))
     stmts.push(ir_return(span, walk_out(w)))
     let body = ir_block(span, stmts)
     let problems = ir_verify_in_frame(body, [w.value, w.target])
@@ -499,7 +495,7 @@ fn invariant(span: Int, message: Str) ! Diag.Report {
 // `out` declared as a fresh shell of `value`, allocated in the target.
 fn shell_copy(w: Walk, helper: Str) -> Int {
     let copy = ir_call_runtime(w.tid, w.span, w.rec.c_spelling, c_runtime_helper(helper),
-        w.rec.slot_form, [walk_value(w)])
+        w.rec.slot_form, [walk_target(w), walk_value(w)])
     ir_let(w.tid, w.span, w.rec.c_spelling, w.out, w.rec.slot_form, copy)
 }
 
@@ -534,7 +530,7 @@ fn slot_fix(w: Walk, etid: Int, get_helper: Str, set_helper: Str, i: Str) -> Int
     let read = cg_call_element_from_runtime(span, etid, c_runtime_helper(get_helper), [walk_out(w), int_ref(span, i)])
     let moved = cg_promote_value(etid, read, walk_target(w), span)
     if moved < 0 { return -1 }
-    let word = cg_call_element_to_slot(span, etid, moved)
+    let word = cg_call_element_to_slot_in(span, etid, moved, walk_target(w))
     if word < 0 { return -1 }
     let voids = layout_of(TYPE_VOID, Position.Return)
     ir_expr_stmt(span, ir_call_runtime(TYPE_VOID, span, voids.c_spelling, c_runtime_helper(set_helper),
@@ -723,6 +719,6 @@ fn boxed_member_fix(w: Walk, inner: Int, mrec: LayoutRecord, member: Str) -> Int
     let read = ir_unbox(inner, span, vrec.c_spelling, vrec.slot_form, ptr)
     let moved = cg_promote_value(inner, read, walk_target(w), span)
     if moved < 0 { return -1 }
-    let boxed = ir_box(inner, span, mrec.c_spelling, vrec.c_spelling, moved)
+    let boxed = ir_box_into(inner, span, mrec.c_spelling, vrec.c_spelling, moved, walk_target(w))
     ir_assign(span, ir_field_get(inner, span, mrec.c_spelling, member, mrec.slot_form, walk_out(w)), boxed)
 }

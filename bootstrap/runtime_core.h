@@ -69,19 +69,13 @@ typedef struct blink_arena_t {
 #ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
   #ifdef BLINK_RUNTIME_STORAGE_DEFINE
     __thread blink_arena_t* __blink_current_arena = NULL;
-    __thread blink_arena_t* __blink_promote_saved = NULL;
-    __thread int64_t __blink_promote_depth = 0;
     uint64_t blink_map_seed = 0;
   #else
     extern __thread blink_arena_t* __blink_current_arena;
-    extern __thread blink_arena_t* __blink_promote_saved;
-    extern __thread int64_t __blink_promote_depth;
     extern uint64_t blink_map_seed;
   #endif
 #else
 static __thread blink_arena_t* __blink_current_arena = NULL;
-static __thread blink_arena_t* __blink_promote_saved = NULL;
-static __thread int64_t __blink_promote_depth = 0;
 static uint64_t blink_map_seed = 0;
 #endif
 
@@ -2626,54 +2620,37 @@ BLINK_RT_FN void* blink_closure_get_capture(const blink_closure* c, int64_t inde
 /* ── Arena promotion (§5.2.1) ────────────────────────────────────────
  *
  * A generated walker blink_promote_<Type>(value, target) copies a value out
- * of a dying arena. It installs the target as the current arena for its
- * whole walk, so every blink_alloc below (shells, boxes, nested copies) lands
- * in the target: the outer arena, or the GC heap when the target is NULL.
+ * of a dying arena. Every allocation it makes names the target: the outer
+ * arena, or the GC heap when the target is NULL. It never touches
+ * __blink_current_arena, so a walk that panics leaves no state behind.
  * Shell copies keep cap, slot order and kops, so a map or set needs no rehash.
  */
 
-/* Walkers nest, and every walker of one promotion shares its target, so only the
-   outermost enter saves the arena to restore. */
-BLINK_RT_FN void blink_promote_enter(blink_arena_t* target);
+BLINK_RT_FN blink_list* blink_list_copy_shell(blink_arena_t* target, const blink_list* l);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_promote_enter(blink_arena_t* target) {
-    if (__blink_promote_depth++ == 0) __blink_promote_saved = __blink_current_arena;
-    __blink_current_arena = target;
-}
-#endif
-
-BLINK_RT_FN void blink_promote_leave(void);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_promote_leave(void) {
-    if (--__blink_promote_depth == 0) __blink_current_arena = __blink_promote_saved;
-}
-#endif
-
-BLINK_RT_FN blink_list* blink_list_copy_shell(const blink_list* l);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_list* blink_list_copy_shell(const blink_list* l) {
+BLINK_RT_FN blink_list* blink_list_copy_shell(blink_arena_t* target, const blink_list* l) {
     if (!l) return NULL;
-    blink_list* out = (blink_list*)blink_alloc(sizeof(blink_list));
+    blink_list* out = (blink_list*)blink_promote_alloc(target, sizeof(blink_list));
     out->len = l->len;
     out->cap = l->cap;
-    out->items = (void**)blink_alloc(sizeof(void*) * (size_t)(l->cap > 0 ? l->cap : 1));
+    out->items = (void**)blink_promote_alloc(target, (int64_t)(sizeof(void*) * (size_t)(l->cap > 0 ? l->cap : 1)));
     if (l->len > 0) memcpy(out->items, l->items, sizeof(void*) * (size_t)l->len);
     return out;
 }
 #endif
 
-BLINK_RT_FN blink_map* blink_map_copy_shell(const blink_map* m);
+BLINK_RT_FN blink_map* blink_map_copy_shell(blink_arena_t* target, const blink_map* m);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_map* blink_map_copy_shell(const blink_map* m) {
+BLINK_RT_FN blink_map* blink_map_copy_shell(blink_arena_t* target, const blink_map* m) {
     if (!m) return NULL;
-    blink_map* out = (blink_map*)blink_alloc(sizeof(blink_map));
+    blink_map* out = (blink_map*)blink_promote_alloc(target, sizeof(blink_map));
     size_t stride = blink_kops_stride(m->kops);
     out->len = m->len;
     out->cap = m->cap;
     out->kops = m->kops;
-    out->keys = blink_alloc((int64_t)(stride * (size_t)m->cap));
-    out->values = (void**)blink_alloc(sizeof(void*) * (size_t)m->cap);
-    out->states = (uint8_t*)blink_alloc(sizeof(uint8_t) * (size_t)m->cap);
+    out->keys = blink_promote_alloc(target, (int64_t)(stride * (size_t)m->cap));
+    out->values = (void**)blink_promote_alloc(target, (int64_t)(sizeof(void*) * (size_t)m->cap));
+    out->states = (uint8_t*)blink_promote_alloc_atomic(target, (int64_t)(sizeof(uint8_t) * (size_t)m->cap));
     memcpy(out->keys, m->keys, stride * (size_t)m->cap);
     memcpy(out->values, m->values, sizeof(void*) * (size_t)m->cap);
     memcpy(out->states, m->states, (size_t)m->cap);
@@ -2732,17 +2709,17 @@ BLINK_RT_FN void* blink_map_slot_key_addr(blink_map* m, int64_t i) {
 }
 #endif
 
-BLINK_RT_FN blink_set* blink_set_copy_shell(const blink_set* s);
+BLINK_RT_FN blink_set* blink_set_copy_shell(blink_arena_t* target, const blink_set* s);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_set* blink_set_copy_shell(const blink_set* s) {
+BLINK_RT_FN blink_set* blink_set_copy_shell(blink_arena_t* target, const blink_set* s) {
     if (!s) return NULL;
-    blink_set* out = (blink_set*)blink_alloc(sizeof(blink_set));
+    blink_set* out = (blink_set*)blink_promote_alloc(target, sizeof(blink_set));
     size_t stride = blink_kops_stride(s->kops);
     out->len = s->len;
     out->cap = s->cap;
     out->kops = s->kops;
-    out->items = blink_alloc((int64_t)(stride * (size_t)s->cap));
-    out->states = (uint8_t*)blink_alloc(sizeof(uint8_t) * (size_t)s->cap);
+    out->items = blink_promote_alloc(target, (int64_t)(stride * (size_t)s->cap));
+    out->states = (uint8_t*)blink_promote_alloc_atomic(target, (int64_t)(sizeof(uint8_t) * (size_t)s->cap));
     memcpy(out->items, s->items, stride * (size_t)s->cap);
     memcpy(out->states, s->states, (size_t)s->cap);
     return out;
@@ -2784,27 +2761,27 @@ BLINK_RT_FN void* blink_set_slot_item_addr(blink_set* s, int64_t i) {
 }
 #endif
 
-BLINK_RT_FN blink_bytes* blink_bytes_copy_shell(const blink_bytes* b);
+BLINK_RT_FN blink_bytes* blink_bytes_copy_shell(blink_arena_t* target, const blink_bytes* b);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_bytes* blink_bytes_copy_shell(const blink_bytes* b) {
+BLINK_RT_FN blink_bytes* blink_bytes_copy_shell(blink_arena_t* target, const blink_bytes* b) {
     if (!b) return NULL;
-    blink_bytes* out = (blink_bytes*)blink_alloc(sizeof(blink_bytes));
+    blink_bytes* out = (blink_bytes*)blink_promote_alloc(target, sizeof(blink_bytes));
     out->len = b->len;
     out->cap = b->cap;
-    out->data = (uint8_t*)blink_alloc((int64_t)(b->cap > 0 ? b->cap : 1));
+    out->data = (uint8_t*)blink_promote_alloc_atomic(target, (int64_t)(b->cap > 0 ? b->cap : 1));
     if (b->len > 0) memcpy(out->data, b->data, (size_t)b->len);
     return out;
 }
 #endif
 
-BLINK_RT_FN blink_sb* blink_sb_copy_shell(const blink_sb* sb);
+BLINK_RT_FN blink_sb* blink_sb_copy_shell(blink_arena_t* target, const blink_sb* sb);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_sb* blink_sb_copy_shell(const blink_sb* sb) {
+BLINK_RT_FN blink_sb* blink_sb_copy_shell(blink_arena_t* target, const blink_sb* sb) {
     if (!sb) return NULL;
-    blink_sb* out = (blink_sb*)blink_alloc(sizeof(blink_sb));
+    blink_sb* out = (blink_sb*)blink_promote_alloc(target, sizeof(blink_sb));
     out->len = sb->len;
     out->cap = sb->cap;
-    out->data = (char*)blink_alloc((int64_t)(sb->cap > 0 ? sb->cap : 1));
+    out->data = (char*)blink_promote_alloc_atomic(target, (int64_t)(sb->cap > 0 ? sb->cap : 1));
     memcpy(out->data, sb->data, (size_t)sb->len + 1);
     return out;
 }
