@@ -363,6 +363,10 @@ let mut fnsig_tparam_nodes: List[Int] = []
 // list needs no new bookkeeping and no struct-shape change to a type the whole file
 // destructures.
 let mut fnsig_tparam_ret_only: List[Int] = []
+// Parallel as above: 1 iff a parameter or the return annotation names that type param.
+// A 0 slot is one no call can infer, so only written type arguments supply it
+// (sections/03_types.md 3.4).
+let mut fnsig_tparam_sourced: List[Int] = []
 // Flat side-table PARALLEL to fnsig_type_param_names (same index, same length): the
 // pipe-framed declared-bound set for that type param (e.g. `|Add|`, `|Ord|Eq|`), as
 // produced by tparam_node_bound_traits. register_fn_sig discards the bound annotations
@@ -2404,6 +2408,13 @@ let mut tc_ud_pending_nodes: List[Int] = []
 // IS its own identity (tc_is_unbound_metavar: kind Unknown with no solution), so two
 // bindings that share one share the same under-determination.
 let mut tc_ud_blamed: Map[Int, Int] = Map()
+// Each unbracketed generic call's own binder tids, judged once inference is done: a
+// binder a later statement pins is solved by then. A call is walked again after a
+// speculative walk, so the last record of a node is the one that counts.
+let mut tc_call_open_calls: List[Int] = []
+let mut tc_call_open_group: Map[Int, Int] = Map()
+let mut tc_call_open_tids: List[Int] = []
+let mut tc_call_reported: Map[Int, Int] = Map()
 
 // Every unbound metavar reachable from `tid`, by pool id. Structural walk in lockstep
 // with tc_tid_has_unbound_metavar — that one answers WHETHER a tid is open, this one
@@ -2518,6 +2529,127 @@ fn tc_ud_flush_pending() ! Diag.Report {
     tc_ud_pending_names = []
     tc_ud_pending_tids = []
     tc_ud_pending_nodes = []
+}
+
+// `names` as the code spans a diagnostic lists: `K`, `V`.
+fn tc_ticked_names(names: List[Str]) -> Str {
+    let mut out = ""
+    let mut i = 0
+    while i < names.len() {
+        if i > 0 { out = out.concat(", ") }
+        out = out.concat("`{names.get(i).unwrap()}`")
+        i = i + 1
+    }
+    out
+}
+
+// The repair for a call no inference can complete: written type arguments. The help
+// lists every own binder, since a bracket list must supply all of them.
+fn tc_call_type_args_help(sig: Int, self_offset: Int) -> Str {
+    let fs = fnsig_pool.get(sig).unwrap()
+    let mut all: List[Str] = []
+    let mut pi = 0
+    while pi < fs.type_params_count {
+        all.push(fnsig_type_param_names.get(fs.type_params_start + pi).unwrap())
+        pi = pi + 1
+    }
+    let callee = node_name(fs.decl)
+    let args = if fs.params_count - self_offset > 0 { "..." } else { "" }
+    "write the type arguments at this call, as in `{callee}[{all.join(", ")}]({args})` (replace each placeholder with the intended type)"
+}
+
+// A binder no parameter and no return type names can get its type only from written
+// type arguments (sections/03_types.md 3.4), so an unbracketed call is an error at
+// once, whatever the rest of the program does.
+fn tc_report_unsourced_binders(sig: Int, call_node: Int, self_offset: Int) ! Diag.Report {
+    if tc_boundary_check_active == 0 || call_node < 0 { return }
+    if tc_call_reported.contains_key(call_node) { return }
+    let fs = fnsig_pool.get(sig).unwrap()
+    let mut names: List[Str] = []
+    let mut pi = 0
+    while pi < fs.type_params_count {
+        let nidx = fs.type_params_start + pi
+        if nidx < fnsig_tparam_sourced.len() && fnsig_tparam_sourced.get(nidx).unwrap() == 0 {
+            names.push(fnsig_type_param_names.get(nidx).unwrap())
+        }
+        pi = pi + 1
+    }
+    if names.len() == 0 { return }
+    tc_call_reported.insert(call_node, 1)
+    let callee = node_name(fs.decl)
+    let mut msg = "type parameter {tc_ticked_names(names)} of `{callee}` has no source -- it is bound by the declaration but supplied by neither a parameter nor the return type"
+    if names.len() > 1 {
+        msg = "type parameters {tc_ticked_names(names)} of `{callee}` have no source -- they are bound by the declaration but supplied by neither a parameter nor the return type"
+    }
+    diag_error_at("CannotInferType", CANNOT_INFER_TYPE, msg, call_node, tc_call_type_args_help(sig, self_offset))
+}
+
+// Record an unbracketed generic call's own binder tids for tc_ud_flush_calls. Group
+// layout in tc_call_open_tids: [sig, self_offset, n, tid...], -1 for a slot with no bind.
+fn tc_note_generic_call(sig: Int, call_node: Int, self_offset: Int, binds: Map[Str, Int]) {
+    if tc_boundary_check_active == 0 || call_node < 0 { return }
+    let fs = fnsig_pool.get(sig).unwrap()
+    if fs.type_params_count == 0 { return }
+    if tc_call_open_group.contains_key(call_node) == 0 { tc_call_open_calls.push(call_node) }
+    tc_call_open_group.insert(call_node, tc_call_open_tids.len())
+    tc_call_open_tids.push(sig)
+    tc_call_open_tids.push(self_offset)
+    tc_call_open_tids.push(fs.type_params_count)
+    let mut pi = 0
+    while pi < fs.type_params_count {
+        let nidx = fs.type_params_start + pi
+        let tpn = fnsig_type_param_names.get(nidx).unwrap()
+        let mut tid = -1
+        if nidx < fnsig_tparam_nodes.len() {
+            let key = tc_binder_key(fnsig_tparam_nodes.get(nidx).unwrap(), tpn)
+            if binds.contains_key(key) { tid = binds.get(key).unwrap() }
+        }
+        if tid == -1 && binds.contains_key(tpn) { tid = binds.get(tpn).unwrap() }
+        tc_call_open_tids.push(tid)
+        pi = pi + 1
+    }
+}
+
+// Report the recorded calls a binder of which is still unbound once inference is done
+// and no binding or scrutinee has already answered for it.
+fn tc_ud_flush_calls() ! Diag.Report {
+    let mut ci = 0
+    while ci < tc_call_open_calls.len() {
+        let call_node = tc_call_open_calls.get(ci).unwrap()
+        ci = ci + 1
+        if tc_call_reported.contains_key(call_node) { continue }
+        let g = tc_call_open_group.get(call_node).unwrap()
+        let sig = tc_call_open_tids.get(g).unwrap()
+        let n = tc_call_open_tids.get(g + 2).unwrap()
+        let fs = fnsig_pool.get(sig).unwrap()
+        let mut names: List[Str] = []
+        let mut tids: List[Int] = []
+        let mut pi = 0
+        while pi < n {
+            let tid = tc_call_open_tids.get(g + 3 + pi).unwrap()
+            if tid >= 0 && tc_tid_has_unbound_metavar(tid) != 0 && tc_ud_already_blamed(tid) == 0 {
+                names.push(fnsig_type_param_names.get(fs.type_params_start + pi).unwrap())
+                tids.push(tid)
+            }
+            pi = pi + 1
+        }
+        if names.len() == 0 { continue }
+        tc_call_reported.insert(call_node, 1)
+        let callee = node_name(fs.decl)
+        let mut msg = "type parameter {tc_ticked_names(names)} of `{callee}` is unbound at this call and nothing supplies it"
+        if names.len() > 1 {
+            msg = "type parameters {tc_ticked_names(names)} of `{callee}` are unbound at this call and nothing supplies them"
+        }
+        diag_error_at("CannotInferType", CANNOT_INFER_TYPE, msg, call_node, tc_call_type_args_help(sig, tc_call_open_tids.get(g + 1).unwrap()))
+        let mut ti = 0
+        while ti < tids.len() {
+            tc_ud_mark_blamed(tids.get(ti).unwrap())
+            ti = ti + 1
+        }
+    }
+    tc_call_open_calls = []
+    tc_call_open_group.clear()
+    tc_call_open_tids = []
 }
 
 // Report a binding whose type is under-determined — HM finished the region with a
@@ -3935,6 +4067,7 @@ fn instantiate_return_type(sig: Int, arg_tids: List[Int], call_node: Int, self_o
     let fs = fnsig_pool.get(sig).unwrap()
     let ret = fs.ret
     if ret < 0 || ret >= ty_pool.len() { return ret }
+    tc_report_unsourced_binders(sig, call_node, self_offset)
     let mut binds = build_typevar_binds(sig, arg_tids, self_offset)
     let mints = tc_ret_only_metavars(sig, call_node)
     let mut pi = 0
@@ -3958,6 +4091,7 @@ fn instantiate_return_type(sig: Int, arg_tids: List[Int], call_node: Int, self_o
         }
         pi = pi + 1
     }
+    tc_note_generic_call(sig, call_node, self_offset, binds)
     substitute_typevar_tid(ret, binds)
 }
 
@@ -8390,17 +8524,23 @@ fn tc_check_name_collisions() ! TypeCheck.Register, Diag.Report {
 // — §3.4 *Explicit Type Application*), never from unifying against an argument or a
 // binding annotation. So minting an inference metavar for it is the wrong instrument,
 // not a deferred solution. Requiring the return annotation to name it keeps the mint at
-// exactly the shape inference CAN reach, which is what "return-only" means.
-//
-// What happens to a phantom binder TODAY is a known defect, not the design: the bare
-// call `f()` raises I0001 at the fn-mono chokepoint in emit_generic_fn_call_tail, where
-// §3.4 says it must be error[CannotInferType] at the type-argument position; and the
-// bracketed call `f[Int]()` is not rejected anywhere — it emits the literal Blink source
-// text `const void a = f[Int]();` and `blink check` reports ok. Neither behaviour is the
-// rule, and neither is evidence about what a call site can supply.
+// exactly the shape inference CAN reach, which is what "return-only" means. A phantom
+// binder is reported at an unbracketed call (tc_report_unsourced_binders).
 fn tc_tparam_is_ret_only(tp_name: Str, ret_ann: Int, params_sl: Int) -> Int {
     if ret_ann == -1 { return 0 }
     if !tc_ann_names_tparam(ret_ann, tp_name) { return 0 }
+    if tc_params_name_tparam(tp_name, params_sl) != 0 { return 0 }
+    1
+}
+
+// Supplied by the signature: a parameter or the return annotation names it. Decided from
+// the signature alone, as sections/03_types.md 3.4 requires.
+fn tc_tparam_is_sourced(tp_name: Str, ret_ann: Int, params_sl: Int) -> Int {
+    if ret_ann != -1 && tc_ann_names_tparam(ret_ann, tp_name) { return 1 }
+    tc_params_name_tparam(tp_name, params_sl)
+}
+
+fn tc_params_name_tparam(tp_name: Str, params_sl: Int) -> Int {
     if params_sl != -1 {
         let mut i = 0
         while i < sublist_length(params_sl) {
@@ -8408,14 +8548,13 @@ fn tc_tparam_is_ret_only(tp_name: Str, ret_ann: Int, params_sl: Int) -> Int {
             // node_type_name as well as the walk: parse_param sets both from the same
             // annotation, but register_fn_sig itself falls back to the flat type_name
             // when a param carries no ann node (:2617), so a synthesized param must
-            // not be able to hide a mention. Costs nothing and can only ever make
-            // FEWER params look return-only — the safe direction.
-            if node_type_name(p) == tp_name { return 0 }
-            if tc_ann_names_tparam(node_type_ann(p), tp_name) { return 0 }
+            // not be able to hide a mention.
+            if node_type_name(p) == tp_name { return 1 }
+            if tc_ann_names_tparam(node_type_ann(p), tp_name) { return 1 }
             i = i + 1
         }
     }
-    1
+    0
 }
 
 fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
@@ -8496,6 +8635,7 @@ fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
             fnsig_type_param_names.push(tp_name)
             fnsig_tparam_nodes.push(tp)
             fnsig_tparam_ret_only.push(tc_tparam_is_ret_only(tp_name, ret_ann, params_sl))
+            fnsig_tparam_sourced.push(tc_tparam_is_sourced(tp_name, ret_ann, params_sl))
             fnsig_tparam_bounds.push(tparam_node_bound_traits(tp))
             tp_count = tp_count + 1
             ti = ti + 1
@@ -10248,6 +10388,7 @@ fn init_types() ! TypeCheck.Register {
     fnsig_type_param_names.clear()
     fnsig_tparam_nodes.clear()
     fnsig_tparam_ret_only.clear()
+    fnsig_tparam_sourced.clear()
     fnsig_tparam_bounds.clear()
     fnsig_effect_names.clear()
     tc_trait_names.clear()
@@ -10281,6 +10422,10 @@ fn init_types() ! TypeCheck.Register {
     tc_ud_pending_tids = []
     tc_ud_pending_nodes = []
     tc_ud_blamed.clear()
+    tc_call_open_calls = []
+    tc_call_open_group.clear()
+    tc_call_open_tids = []
+    tc_call_reported.clear()
     tc_errors.clear()
     depr_fn_nodes.clear()
     depr_type_nodes.clear()
@@ -21857,6 +22002,7 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
     // Last: every constraining use in the program has now run, so a deferred alias blame
     // whose metavar is still unbound is genuinely under-determined.
     tc_ud_flush_pending()
+    tc_ud_flush_calls()
     tc_flush_untyped_type_args()
     tc_boundary_check_active = prev_boundary
 }
