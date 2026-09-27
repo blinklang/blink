@@ -14012,7 +14012,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                         // list unresolved keeps the arity check off the same mistake.
                         tc_type_args_unresolved.insert(node, 1)
                         tc_errors.push("undefined function `List`")
-                        diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `List`", node, "`List` has no constructor call; build an empty list with `[]` and an annotation, as in `let l: List[Int] = []`")
+                        diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `List`", node, "`List` has no constructor call; build an empty list with `List.new()`, or with `[]` and an annotation, as in `let l: List[Int] = []`")
                     } else if nr_is_defined(fn_name) == 0 && is_builtin_fn(fn_name) == 0 && is_variant_name(fn_name) == 0 && is_known_type(fn_name) == 0 && is_trait_name(fn_name) == 0 {
                         tc_errors.push("undefined function `{fn_name}`")
                         diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `{fn_name}`", node, "")
@@ -16233,8 +16233,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         if node_type_params(node) != -1 { return tc_ptr_from_type_arg(node, fn_name) }
                         return tc_ptr_ctor_tid()
                     }
+                    if (fn_name == "Map" || fn_name == "Set") && tc_empty_ctor_arity(fn_name, node) == 0 {
+                        return tc_error_recovery_tid()
+                    }
                     if (fn_name == "Map" || fn_name == "Set") && node_type_params(node) != -1 {
-                        return tc_keyed_ctor_from_type_args(node, fn_name)
+                        return tc_container_ctor_from_type_args(node, fn_name)
                     }
                     return get_builtin_fn_ret(fn_name)
                 }
@@ -17995,9 +17998,16 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // through to the fnsig lookups below, which is strictly more than the old gate
             // did: it returned get_builtin_fn_ret's answer for `new` even when that was
             // Unknown, ending resolution there.
+            // List is a type and not a builtin fn, so its one constructor needs its own arm.
+            // It sits above every declaration rung, as the builtin constructors below do, so a
+            // program that declares `List_new` cannot type this call as its own function.
+            if obj_name == "List" && obj_is_value == 0 && method == "new" { return tc_list_new_ctor(node) }
             if is_builtin_fn(obj_name) != 0 && obj_is_value == 0 {
+                if (obj_name == "Map" || obj_name == "Set") && method == "new" && tc_empty_ctor_arity("{obj_name}.new", node) == 0 {
+                    return tc_error_recovery_tid()
+                }
                 if (obj_name == "Map" || obj_name == "Set") && method == "new" && node_type_params(node) != -1 {
-                    return tc_keyed_ctor_from_type_args(node, obj_name)
+                    return tc_container_ctor_from_type_args(node, obj_name)
                 }
                 let bs_ret = tc_builtin_static_ret(obj_name, method)
                 if bs_ret >= 0 { return bs_ret }
@@ -19127,20 +19137,43 @@ fn tc_ptr_from_type_arg(call_node: Int, callee: Str) -> Int ! TypeCheck.Resolve,
     make_ptr_type(resolve_type_ann(sublist_get(node_type_params(call_node), 0)))
 }
 
-// A keyed container given its element types in brackets, as `Map[Str, Int]()`. The written
+// A container given its element types in brackets, as `Map[Str, Int]()`. The written
 // types are the answer, ahead of any expectation, so the constructor knows its key type.
-fn tc_keyed_ctor_from_type_args(call_node: Int, name: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
+fn tc_container_ctor_from_type_args(call_node: Int, name: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
     let mut declared = 1
     let mut help = "`Set` takes one type argument, the element, as in `Set[Int]()`"
     if name == "Map" {
         declared = 2
         help = "`Map` takes two type arguments, the key and the value, as in `Map[Str, Int]()`"
+    } else if name == "List.new" {
+        help = "`List.new` takes one type argument, the element, as in `List.new[Int]()`"
     }
     if tc_claim_type_args(call_node, declared, name, help) == 0 { return tc_error_recovery_tid() }
     let targs = node_type_params(call_node)
     let first = resolve_type_ann(sublist_get(targs, 0))
+    if name == "List.new" { return make_list_type(first) }
     if declared == 1 { return make_set_type(first) }
     make_map_type(first, resolve_type_ann(sublist_get(targs, 1)))
+}
+
+// The runtime constructor of an empty container takes no operand, and codegen builds it
+// from the tid alone, so a written argument would be dropped with no report. Marking the
+// type-argument list unresolved keeps its count check off the same call.
+fn tc_empty_ctor_arity(label: Str, node: Int) -> Int ! TypeCheck.Report, Diag.Report {
+    let args = node_args(node)
+    if args == -1 || sublist_length(args) == 0 { return 1 }
+    tc_type_args_unresolved.insert(node, 1)
+    tc_error_at_code("`{label}` builds an empty container and takes no arguments, got {sublist_length(args)}", node,
+        "TypeError", TYPE_ERROR, "remove the arguments, and add the elements after the container is built")
+    0
+}
+
+// `List.new()` is the empty list (03_types.md:306), so without brackets it takes its element
+// the way an empty `[]` does: from the context, or from a metavariable a later use pins.
+fn tc_list_new_ctor(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_empty_ctor_arity("List.new", node) == 0 { return tc_error_recovery_tid() }
+    if node_type_params(node) != -1 { return tc_container_ctor_from_type_args(node, "List.new") }
+    make_list_type(tc_carrier_slot_from_hint(TyKind.List, 1))
 }
 
 // A call whose list no typing arm read has nothing the list could bind: a variant, a
