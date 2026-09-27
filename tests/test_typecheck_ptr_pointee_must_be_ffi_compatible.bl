@@ -107,3 +107,141 @@ test "a plain struct pointee nested inside a let annotation is refused" {
     let program = probe_but("tc_ptr_pointee_plain_nested", plain_pointee_nested_let_src(), "InvalidPtrType")
     assert(program >= 0)
 }
+
+// Every place a type can be written resolves its annotation the same way, so the pointee rule
+// holds at each of them, and not only where a declaration happened to ask for it.
+fn plain_decl_src(decl: Str) -> Str {
+    "type Zs \{ zf: Int }\n\n".concat(decl).concat("\nfn main() \{ }\n")
+}
+
+fn ffi_decl_src(decl: Str) -> Str {
+    let ffi = #"@ffi.struct(header: "poll.h", name: "pollfd")
+type Zs { fd: I32, events: I16, revents: I16 }
+"#
+    ffi.concat("\n").concat(decl).concat("\nfn main() \{ }\n")
+}
+
+// The declaration comes after its uses, so the check cannot rely on source order.
+fn ffi_decl_after_src(decl: Str) -> Str {
+    let ffi = #"@ffi.struct(header: "poll.h", name: "pollfd")
+type Zs { fd: I32, events: I16, revents: I16 }
+"#
+    decl.concat("\n").concat(ffi).concat("\nfn main() \{ }\n")
+}
+
+fn alias_decl() -> Str { "type ZP = Ptr[Zs]\n" }
+fn field_decl() -> Str { "type W \{ p: Ptr[Zs] }\n" }
+fn named_payload_decl() -> Str { "type E \{ A(p: Ptr[Zs]), B }\n" }
+fn payload_decl() -> Str { "type E \{ A(Ptr[Zs]), B }\n" }
+fn global_decl() -> Str { "let zg: List[Ptr[Zs]] = []\n" }
+fn trait_sig_decl() -> Str { "trait Zt \{\n    fn peek(self, p: Ptr[Zs]) -> Int\n}\n" }
+
+fn closure_param_decl() -> Str {
+    #"@trusted(audit: "ptr-pointee-test")
+fn go() ! FFI {
+    let f = fn(p: Ptr[Zs]) -> Bool { p.is_null() }
+    io.println("x")
+}
+"#
+}
+
+fn closure_return_decl() -> Str {
+    #"@trusted(audit: "ptr-pointee-test")
+fn go() ! FFI {
+    let f = fn(q: Ptr[Zs]) -> Ptr[Zs] { q }
+    io.println("x")
+}
+"#
+}
+
+fn impl_method_decl() -> Str {
+    #"type Hz { n: Int }
+trait Zt {
+    fn put(self, q: Ptr[Zs]) -> Int
+}
+impl Zt for Hz {
+    fn put(self, q: Ptr[Zs]) -> Int { self.n }
+}
+"#
+}
+
+fn effect_op_decl() -> Str {
+    #"effect Zeff {
+    effect Op {
+        fn put(p: Ptr[Zs])
+    }
+}
+"#
+}
+
+fn effect_op_ret_decl() -> Str {
+    #"effect Zeff {
+    effect Op {
+        fn get() -> Ptr[Zs]
+    }
+}
+"#
+}
+
+fn nested_let_decl() -> Str {
+    #"@trusted(audit: "ptr-pointee-test")
+fn go() ! FFI {
+    with ffi.scope() as scope {
+        let zp: Ptr[Ptr[Zs]] = scope.alloc()
+        io.println("{zp.is_null()}")
+    }
+}
+"#
+}
+
+fn nested_param_decl() -> Str {
+    #"@ffi("zs_pp")
+@trusted(audit: "ptr-pointee-test")
+fn zs_pp(p: Ptr[Ptr[Zs]]) -> Int ! FFI { }
+"#
+}
+
+test "a type alias whose pointee is a plain struct is refused" {
+    assert(probe_but("tc_ptr_pointee_alias", plain_decl_src(alias_decl()), "InvalidPtrType") >= 0)
+}
+
+test "a struct field whose pointee is a plain struct is refused" {
+    assert(probe_but("tc_ptr_pointee_field", plain_decl_src(field_decl()), "InvalidPtrType") >= 0)
+}
+
+test "an enum payload whose pointee is a plain struct is refused, named or positional" {
+    assert(probe_but("tc_ptr_pointee_named_payload", plain_decl_src(named_payload_decl()), "InvalidPtrType") >= 0)
+    assert(probe_but("tc_ptr_pointee_payload", plain_decl_src(payload_decl()), "InvalidPtrType") >= 0)
+}
+
+test "a closure parameter or return whose pointee is a plain struct is refused" {
+    assert(probe_but("tc_ptr_pointee_closure_param", plain_decl_src(closure_param_decl()), "InvalidPtrType") >= 0)
+    assert(probe_but("tc_ptr_pointee_closure_ret", plain_decl_src(closure_return_decl()), "InvalidPtrType") >= 0)
+}
+
+test "a trait or impl method signature whose pointee is a plain struct is refused" {
+    assert(probe_but("tc_ptr_pointee_trait_sig", plain_decl_src(trait_sig_decl()), "InvalidPtrType") >= 0)
+    assert(probe_but("tc_ptr_pointee_impl_sig", plain_decl_src(impl_method_decl()), "InvalidPtrType") >= 0)
+}
+
+test "an effect operation whose pointee is a plain struct is refused" {
+    assert(probe_but("tc_ptr_pointee_effect_param", plain_decl_src(effect_op_decl()), "InvalidPtrType") >= 0)
+    assert(probe_but("tc_ptr_pointee_effect_ret", plain_decl_src(effect_op_ret_decl()), "InvalidPtrType") >= 0)
+}
+
+test "a top-level let whose pointee is a plain struct is refused" {
+    assert(probe_but("tc_ptr_pointee_global", plain_decl_src(global_decl()), "InvalidPtrType") >= 0)
+}
+
+// A pointer to a pointer is legal, and the rule applies again to what the inner one points at.
+test "a plain struct behind a pointer to a pointer is refused" {
+    assert(probe_but("tc_ptr_pointee_nested_ptr_let", plain_decl_src(nested_let_decl()), "InvalidPtrType") >= 0)
+    assert(probe_but("tc_ptr_pointee_nested_ptr_param", plain_decl_src(nested_param_decl()), "InvalidPtrType") >= 0)
+}
+
+test "an ffi.struct pointee is accepted in declarations, before or after its own declaration" {
+    for decl in [alias_decl(), field_decl(), named_payload_decl(), payload_decl(), nested_param_decl()] {
+        assert(probe("tc_ptr_pointee_ffi_decl", ffi_decl_src(decl)) >= 0)
+        assert(probe("tc_ptr_pointee_ffi_decl_after", ffi_decl_after_src(decl)) >= 0)
+    }
+}
