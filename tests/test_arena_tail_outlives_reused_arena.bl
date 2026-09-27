@@ -1,0 +1,273 @@
+// §5.2.1: a `with arena { }` tail is deep-copied into the target at the
+// closing `}`. The inner arena's chunks go back to the GC free list, and the
+// next arena of the same chunk size takes them. So each row reads the tail
+// only after `clobber` has filled a fresh arena with -7: a tail that was
+// not promoted reads -7 or garbage there, not its own values.
+
+import std.arena.{bytes_used}
+import compile_test_helpers
+
+type Bag {
+    name: Str
+    items: List[Int]
+}
+
+type Cell {
+    id: Int
+    tags: List[Str]
+}
+
+type Shape {
+    Dot
+    Poly(pts: List[Int])
+}
+
+fn clobber() {
+    let mut n = 0
+    with arena {
+        let mut t: List[Int] = []
+        let mut i = 0
+        while i < 4000 {
+            t.push(-7)
+            i = i + 1
+        }
+        n = t.len()
+    }
+    assert_eq(n, 4000)
+}
+
+fn build(n: Int) -> List[Int] {
+    let mut t: List[Int] = []
+    let mut i = 0
+    while i < n {
+        t.push(i * 10)
+        i = i + 1
+    }
+    t
+}
+
+fn sum(xs: List[Int]) -> Int {
+    let mut s = 0
+    for x in xs {
+        s = s + x
+    }
+    s
+}
+
+fn early_list(stop: Int) -> List[Int] {
+    with arena {
+        let t = build(6)
+        if stop > 0 {
+            return build(stop)
+        }
+        t
+    }
+}
+
+fn failing(x: Int) -> Result[Int, List[Int]] {
+    if x < 0 {
+        return Err(build(4))
+    }
+    Ok(x)
+}
+
+fn lookup(xs: List[Int]) -> fn(Int) -> Int {
+    fn(i: Int) -> Int { xs.get(i).unwrap() }
+}
+
+fn try_in_arena(x: Int) -> Result[Int, List[Int]] {
+    let mut d = 0
+    with arena {
+        d = failing(x)?
+    }
+    Ok(d)
+}
+
+test "List[Int] tail keeps its elements after a later arena reuses the memory" {
+    let xs = with arena { build(5) }
+    clobber()
+    assert_eq(xs.len(), 5)
+    assert_eq(sum(xs), 100)
+    assert_eq(xs.get(4).unwrap(), 40)
+}
+
+test "struct tail with Str and List fields survives arena reuse" {
+    let b = with arena {
+        Bag { name: "bag_{7}", items: build(3) }
+    }
+    clobber()
+    assert_eq(b.name, "bag_7")
+    assert_eq(b.items.len(), 3)
+    assert_eq(sum(b.items), 30)
+}
+
+test "List of structs tail promotes every element and its fields" {
+    let cells = with arena {
+        let mut out: List[Cell] = []
+        let mut i = 0
+        while i < 3 {
+            out.push(Cell { id: i, tags: ["t{i}", "u{i}"] })
+            i = i + 1
+        }
+        out
+    }
+    clobber()
+    assert_eq(cells.len(), 3)
+    assert_eq(cells.get(2).unwrap().id, 2)
+    assert_eq(cells.get(2).unwrap().tags.len(), 2)
+    assert_eq(cells.get(1).unwrap().tags.get(1).unwrap(), "u1")
+}
+
+test "Map[Str, List[Int]] tail promotes keys and value lists" {
+    let m = with arena {
+        let mut acc: Map[Str, List[Int]] = Map()
+        acc.insert("a", build(2))
+        acc.insert("b", build(4))
+        acc
+    }
+    clobber()
+    assert_eq(m.len(), 2)
+    assert_eq(sum(m.get("a").unwrap()), 10)
+    assert_eq(sum(m.get("b").unwrap()), 60)
+}
+
+test "Option[List[Int]] tail promotes its payload" {
+    let o: Option[List[Int]] = with arena { Some(build(4)) }
+    clobber()
+    match o {
+        Some(xs) => assert_eq(sum(xs), 60)
+        None => assert_eq(0, 1)
+    }
+}
+
+test "Result[List[Int], Str] tail promotes its Ok payload" {
+    let r: Result[List[Int], Str] = with arena { Ok(build(3)) }
+    clobber()
+    match r {
+        Ok(xs) => assert_eq(sum(xs), 30)
+        Err(_) => assert_eq(0, 1)
+    }
+}
+
+test "tail through if and match arms is promoted on every arm" {
+    let pick = 2
+    let a = with arena {
+        if pick > 1 { build(3) } else { build(1) }
+    }
+    let b = with arena {
+        match pick {
+            1 => build(1)
+            _ => build(4)
+        }
+    }
+    clobber()
+    assert_eq(sum(a), 30)
+    assert_eq(sum(b), 60)
+}
+
+test "nested arena promotes the inner tail into the outer arena" {
+    let mut grew = false
+    let total = with arena {
+        let before = bytes_used()
+        let inner = with arena { build(50) }
+        grew = bytes_used() > before
+        clobber()
+        sum(inner)
+    }
+    assert_eq(grew, true)
+    assert_eq(total, 12250)
+}
+
+test "nested arena tail survives both arenas" {
+    let xs = with arena {
+        let inner = with arena { build(5) }
+        clobber()
+        inner
+    }
+    clobber()
+    assert_eq(sum(xs), 100)
+}
+
+test "early return from inside with arena promotes the returned value" {
+    let xs = early_list(3)
+    clobber()
+    assert_eq(xs.len(), 3)
+    assert_eq(sum(xs), 30)
+    let ys = early_list(0)
+    clobber()
+    assert_eq(ys.len(), 6)
+    assert_eq(sum(ys), 150)
+}
+
+test "? inside with arena promotes the Err payload before the arena dies" {
+    let r = try_in_arena(-1)
+    clobber()
+    match r {
+        Ok(_) => assert_eq(0, 1)
+        Err(xs) => assert_eq(sum(xs), 60)
+    }
+    assert_eq(try_in_arena(9).unwrap(), 9)
+}
+
+test "closure tail capturing a block-local list survives arena reuse" {
+    let g = with arena {
+        let xs = build(4)
+        fn(i: Int) -> Int { xs.get(i).unwrap() }
+    }
+    clobber()
+    assert_eq(g(3), 30)
+    assert_eq(g(0), 0)
+}
+
+test "Set[Int] tail keeps its members after arena reuse" {
+    let s = with arena {
+        let mut acc: Set[Int] = Set()
+        for x in build(5) {
+            acc.insert(x)
+        }
+        acc
+    }
+    clobber()
+    assert_eq(s.len(), 5)
+    assert_eq(s.contains(40), true)
+    assert_eq(s.contains(-7), false)
+}
+
+test "Bytes tail keeps its contents after arena reuse" {
+    let b = with arena { Bytes.from_str("tail_{42}") }
+    clobber()
+    assert_eq(b.len(), 7)
+    match b.to_str() {
+        Ok(s) => assert_eq(s, "tail_42")
+        Err(_) => assert_eq(0, 1)
+    }
+}
+
+test "payload enum tail promotes the list inside its variant" {
+    let sh = with arena { Shape.Poly(build(4)) }
+    clobber()
+    match sh {
+        Shape.Poly(pts) => assert_eq(sum(pts), 60)
+        Shape.Dot => assert_eq(0, 1)
+    }
+}
+
+test "a type that reaches itself through a List is E0701 when it crosses an arena" {
+    let src = "type Tree \{\n    kids: List[Tree]\n    v: Int\n}\nfn main() \{\n    let t = with arena \{\n        Tree \{ kids: [], v: 1 }\n    }\n    let _ = t.v\n}\n"
+    compile_test_helpers.expect_compile_error(src, "arena_cycle_through_list", "E0701")
+}
+
+test "a type that reaches itself through an Option is E0701 when it crosses an arena" {
+    let src = "type Node \{\n    next: Option[Node]\n    v: Int\n}\nfn main() \{\n    let n = with arena \{\n        Node \{ next: None, v: 1 }\n    }\n    let _ = n.v\n}\n"
+    compile_test_helpers.expect_compile_error(src, "arena_cycle_through_option", "E0701")
+}
+
+test "closure tail capturing a closure built by a callee promotes the inner captures" {
+    let g = with arena {
+        let inner = lookup(build(4))
+        fn(i: Int) -> Int { inner(i) + 1 }
+    }
+    clobber()
+    assert_eq(g(3), 31)
+    assert_eq(g(1), 11)
+}
