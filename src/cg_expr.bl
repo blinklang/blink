@@ -40,7 +40,8 @@ import cname.{
     c_overflow_builtin, c_int_min_macro, c_test_propagate_name,
 }
 import ir.{
-    IrKind, ir_kind, ir_kind_is_name, ir_kid, ir_kid_count, ir_c_name, ir_panic,
+    IrKind, ir_kind, ir_kind_is_name, ir_kid, ir_kid_count, ir_c_name, ir_panic, ir_tid, ir_span,
+    ir_c_spelling, ir_slot_form,
     ir_const, ir_var_ref, ir_cell_ref, ir_global_ref, ir_unary, ir_binary, ir_cast, ir_field_get,
     ir_struct_new, ir_tuple_new, ir_container_new, ir_box, ir_unbox, ir_carrier_wrap,
     ir_carrier_unwrap, ir_carrier_tag, ir_call_runtime, ir_let, ir_assign, ir_return,
@@ -832,30 +833,30 @@ fn x_guarded_binary(site: ArithSite, rec: LayoutRecord, lhs_tid: Int, lhs: Int, 
     if rhs_tid < 0 { return -1 }
     let zero_test = x_operator_needs_guard(site.op, lhs_tid, rhs)
     let min_test = x_needs_min_guard(site.op, lhs_tid, rhs)
-    let left_name = x_hold_name(lhs_tid, site.lhs_node, lhs)
-    let right_name = x_hold_name(rhs_tid, site.rhs_node, rhs)
-    if left_name == "" || right_name == "" { return -1 }
+    let left_held = x_hold(lhs_tid, site.lhs_node, lhs)
+    let right_held = x_hold(rhs_tid, site.rhs_node, rhs)
+    if left_held < 0 || right_held < 0 { return -1 }
     if zero_test {
-        let tripped = x_operand_test(site.node, site.op, lhs_tid, rhs_tid, right_name)
+        let tripped = x_operand_test(site.node, site.op, lhs_tid, rhs_tid, right_held)
         let said = x_guard_message(site.node, site.op, lhs_tid)
         if tripped < 0 || said < 0 { return -1 }
         x_hoist(ir_if(site.node, tripped, ir_block(site.node, [ir_panic(site.node, said)]), -1))
     }
-    if min_test && !x_hoist_min_guard(site, lhs_tid, rhs_tid, left_name, right_name) { return -1 }
-    let left = x_ref(lhs_tid, site.lhs_node, left_name)
-    let divisor = x_ref(rhs_tid, site.rhs_node, right_name)
+    if min_test && !x_hoist_min_guard(site, lhs_tid, rhs_tid, left_held, right_held) { return -1 }
+    let left = x_reread(left_held)
+    let divisor = x_reread(right_held)
     if left < 0 || divisor < 0 { return -1 }
     ir_binary(site.tid, site.node, rec.c_spelling, site.op, left, divisor)
 }
 
 // `left == MIN && right == -1`, and the panic it guards.
-fn x_hoist_min_guard(site: ArithSite, lhs_tid: Int, rhs_tid: Int, left: Str, right: Str) -> Bool ! Diag.Report {
+fn x_hoist_min_guard(site: ArithSite, lhs_tid: Int, rhs_tid: Int, left: Int, right: Int) -> Bool ! Diag.Report {
     let bool_rec = x_local(TYPE_BOOL, site.node)
     let lhs_rec = x_local(lhs_tid, site.node)
     let rhs_rec = x_local(rhs_tid, site.node)
     if x_stopped(bool_rec) || x_stopped(lhs_rec) || x_stopped(rhs_rec) { return false }
-    let l = x_ref(lhs_tid, site.lhs_node, left)
-    let r = x_ref(rhs_tid, site.rhs_node, right)
+    let l = x_reread(left)
+    let r = x_reread(right)
     if l < 0 || r < 0 { return false }
     let at_min = ir_binary(TYPE_BOOL, site.node, bool_rec.c_spelling, "==", l,
         ir_const(lhs_tid, site.node, lhs_rec.c_spelling, c_int_min_macro(x_kind(lhs_tid))))
@@ -876,17 +877,21 @@ fn x_hold(tid: Int, node: Int, value: Int) -> Int ! Diag.Report {
     x_ref(tid, node, bound)
 }
 
-// The same operand, as the name the test and the operator both spell.
-fn x_hold_name(tid: Int, node: Int, value: Int) -> Str ! Diag.Report {
-    if ir_kind_is_name(ir_kind(value)) { return ir_c_name(value) }
-    x_bind(tid, node, value)
+// A held operand read once more. A module global stays a GlobalRef, so no read of it
+// names the global as if it were a local.
+fn x_reread(held: Int) -> Int {
+    if held < 0 { return -1 }
+    if ir_kind(held) == IrKind.GlobalRef {
+        return ir_global_ref(ir_tid(held), ir_span(held), ir_c_spelling(held), ir_c_name(held), ir_slot_form(held))
+    }
+    ir_var_ref(ir_tid(held), ir_span(held), ir_c_spelling(held), ir_c_name(held), ir_slot_form(held))
 }
 
-fn x_operand_test(node: Int, op: Str, lhs_tid: Int, rhs_tid: Int, name: Str) -> Int ! Diag.Report {
+fn x_operand_test(node: Int, op: Str, lhs_tid: Int, rhs_tid: Int, held: Int) -> Int ! Diag.Report {
     let bool_rec = x_local(TYPE_BOOL, node)
     let rhs_rec = x_local(rhs_tid, node)
     if x_stopped(bool_rec) || x_stopped(rhs_rec) { return -1 }
-    let operand = x_ref(rhs_tid, node, name)
+    let operand = x_reread(held)
     if operand < 0 { return -1 }
     if op == "/" || op == "%" {
         return ir_binary(TYPE_BOOL, node, bool_rec.c_spelling, "==", operand,
@@ -921,11 +926,11 @@ fn x_operator_can_overflow(op: Str, tid: Int) -> Bool {
 fn x_checked_arith(site: ArithSite, rec: LayoutRecord, lhs_tid: Int, lhs: Int, rhs: Int) -> Int ! Diag.Report {
     let rhs_tid = tid_of_node(site.rhs_node)
     if rhs_tid < 0 { return -1 }
-    let left = x_hold_name(lhs_tid, site.lhs_node, lhs)
-    let right = x_hold_name(rhs_tid, site.rhs_node, rhs)
-    if left == "" || right == "" { return -1 }
-    let l = x_ref(lhs_tid, site.lhs_node, left)
-    let r = x_ref(rhs_tid, site.rhs_node, right)
+    let left = x_hold(lhs_tid, site.lhs_node, lhs)
+    let right = x_hold(rhs_tid, site.rhs_node, rhs)
+    if left < 0 || right < 0 { return -1 }
+    let l = x_reread(left)
+    let r = x_reread(right)
     let said = x_operands_message(site, lhs_tid, rhs_tid, left, right)
     x_checked_into(site.node, site.op, site.tid, rec, l, r, said)
 }
@@ -951,12 +956,12 @@ fn x_checked_into(node: Int, op: Str, tid: Int, rec: LayoutRecord, l: Int, r: In
 // "U8 overflow in addition (255 + 1)", the form sections/03_types.md:785 shows. The
 // operands are values only the run knows, so the message is formatted, and it is built
 // inside the check, so the formatting runs only on the path that panics.
-fn x_operands_message(site: ArithSite, lhs_tid: Int, rhs_tid: Int, left: Str, right: Str) -> Int ! Diag.Report {
+fn x_operands_message(site: ArithSite, lhs_tid: Int, rhs_tid: Int, left: Int, right: Int) -> Int ! Diag.Report {
     let lspec = x_operand_spec(lhs_tid, site.lhs_node)
     let rspec = x_operand_spec(rhs_tid, site.rhs_node)
     if lspec == "" || rspec == "" { return -1 }
-    let l = x_ref(lhs_tid, site.lhs_node, left)
-    let r = x_ref(rhs_tid, site.rhs_node, right)
+    let l = x_reread(left)
+    let r = x_reread(right)
     if l < 0 || r < 0 { return -1 }
     let what = "{tk_name(x_kind(site.tid))} overflow in {x_operation_word(site.op)} ({lspec} {site.op} {rspec})"
     x_panic_message(site.node, what, [
@@ -1204,15 +1209,15 @@ fn x_negative_literal(node: Int, tid: Int, rec: LayoutRecord) -> Int ! Diag.Repo
 // negation in its own type.
 fn x_checked_negation(node: Int, tid: Int, rec: LayoutRecord, operand: Int) -> Int ! Diag.Report {
     let src = node_left(node)
-    let name = x_hold_name(tid, src, operand)
-    if name == "" { return -1 }
+    let held = x_hold(tid, src, operand)
+    if held < 0 { return -1 }
     let spec = x_operand_spec(tid, src)
-    let shown = x_ref(tid, src, name)
+    let shown = x_reread(held)
     if spec == "" || shown < 0 { return -1 }
     let said = x_panic_message(node, "{tk_name(x_kind(tid))} overflow in negation (-({spec}))",
         [x_promote_for_varargs(src, tid, shown)])
     let zero = ir_const(tid, node, rec.c_spelling, "0")
-    x_checked_into(node, "-", tid, rec, zero, x_ref(tid, src, name), said)
+    x_checked_into(node, "-", tid, rec, zero, x_reread(held), said)
 }
 
 // `x?` reads the carrier twice, so the carrier is bound first. The failure arm returns
