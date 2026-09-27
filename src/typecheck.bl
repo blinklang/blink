@@ -14007,6 +14007,12 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     } else if nr_is_unimported_prelude_free_fn(fn_name) != 0 {
                         tc_errors.push("undefined function `{fn_name}`")
                         diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `{fn_name}`", node, "this stdlib function is not in the prelude — add an explicit import, e.g. import {tc_qualifier_for_module(tc_get_symbol_module(fn_name))}.\{{fn_name}}")
+                    } else if fn_name == "List" && nr_is_defined(fn_name) == 0 && is_variant_name(fn_name) == 0 {
+                        // List is a type with no call form, unlike Map and Set. Marking the
+                        // list unresolved keeps the arity check off the same mistake.
+                        tc_type_args_unresolved.insert(node, 1)
+                        tc_errors.push("undefined function `List`")
+                        diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `List`", node, "`List` has no constructor call; build an empty list with `[]` and an annotation, as in `let l: List[Int] = []`")
                     } else if nr_is_defined(fn_name) == 0 && is_builtin_fn(fn_name) == 0 && is_variant_name(fn_name) == 0 && is_known_type(fn_name) == 0 && is_trait_name(fn_name) == 0 {
                         tc_errors.push("undefined function `{fn_name}`")
                         diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `{fn_name}`", node, "")
@@ -16227,6 +16233,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         if node_type_params(node) != -1 { return tc_ptr_from_type_arg(node, fn_name) }
                         return tc_ptr_ctor_tid()
                     }
+                    if (fn_name == "Map" || fn_name == "Set") && node_type_params(node) != -1 {
+                        return tc_keyed_ctor_from_type_args(node, fn_name)
+                    }
                     return get_builtin_fn_ret(fn_name)
                 }
                 if is_variant_name(fn_name) != 0 {
@@ -17987,6 +17996,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // did: it returned get_builtin_fn_ret's answer for `new` even when that was
             // Unknown, ending resolution there.
             if is_builtin_fn(obj_name) != 0 && obj_is_value == 0 {
+                if (obj_name == "Map" || obj_name == "Set") && method == "new" && node_type_params(node) != -1 {
+                    return tc_keyed_ctor_from_type_args(node, obj_name)
+                }
                 let bs_ret = tc_builtin_static_ret(obj_name, method)
                 if bs_ret >= 0 { return bs_ret }
             }
@@ -19113,6 +19125,22 @@ fn tc_ptr_from_type_arg(call_node: Int, callee: Str) -> Int ! TypeCheck.Resolve,
     let help = "`{callee}` takes one type argument, the pointee, as in `{callee}[U8]()`"
     if tc_claim_type_args(call_node, 1, callee, help) == 0 { return tc_error_recovery_tid() }
     make_ptr_type(resolve_type_ann(sublist_get(node_type_params(call_node), 0)))
+}
+
+// A keyed container given its element types in brackets, as `Map[Str, Int]()`. The written
+// types are the answer, ahead of any expectation, so the constructor knows its key type.
+fn tc_keyed_ctor_from_type_args(call_node: Int, name: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let mut declared = 1
+    let mut help = "`Set` takes one type argument, the element, as in `Set[Int]()`"
+    if name == "Map" {
+        declared = 2
+        help = "`Map` takes two type arguments, the key and the value, as in `Map[Str, Int]()`"
+    }
+    if tc_claim_type_args(call_node, declared, name, help) == 0 { return tc_error_recovery_tid() }
+    let targs = node_type_params(call_node)
+    let first = resolve_type_ann(sublist_get(targs, 0))
+    if declared == 1 { return make_set_type(first) }
+    make_map_type(first, resolve_type_ann(sublist_get(targs, 1)))
 }
 
 // A call whose list no typing arm read has nothing the list could bind: a variant, a
