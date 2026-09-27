@@ -141,13 +141,13 @@ test "GT[(Int, Int)] monomorphizes to Tuple2_int_int and round-trips" {
     assert_eq(r.exit_code, 0)
 }
 
-test "GT[(Int, List[Str])] monomorphizes to Tuple2_int_list and round-trips" {
+// A tuple is hashable only when every element is (sections/03_types.md:1940), and a List
+// has no Hash. GT uses its type arg as a Set element, so this instance is refused with E1400.
+test "GT[(Int, List[Str])] is rejected with E1400 because a List element is not hashable" {
     let src = gt_src("(Int, List[Str])", "(256, [\"a\"])", "(1, [\"b\"])")
-    let c = compile_test_helpers.compile_and_emit_c(src, "fqthkv_m_intlist_c")
-    assert_mono_slots(c, "GT", ["Tuple2", "int", "list"], "GT[(Int,List[Str])] mono name")
-    assert_no_erasure(c, "GT[(Int,List[Str])]")
-    let r = compile_test_helpers.compile_and_run(src, "fqthkv_m_intlist_run")
-    assert_eq(r.exit_code, 0)
+    let out = compile_test_helpers.compile_and_capture(src, "fqthkv_m_intlist_c")
+    compile_test_helpers.expect_error(out, "E1400", "GT[(Int,List[Str])] / E1400")
+    compile_test_helpers.expect_contains(out, "`List`", "GT[(Int,List[Str])] / names List")
 }
 
 test "GT[((Int, Int), Str)] monomorphizes to Tuple2_Tuple2_int_int_str and round-trips" {
@@ -159,49 +159,30 @@ test "GT[((Int, Int), Str)] monomorphizes to Tuple2_Tuple2_int_int_str and round
     assert_eq(r.exit_code, 0)
 }
 
-// THE DIVERGENCE ROW. An Option tuple element is the one shape that can spell
-// differently between the tid path (tc_tid_inner_tag -> "Option_str") and the
-// annotation path (resolve_tuple_ann -> compound_name_from_ann). Do not widen the
-// faithfulness gate without this row: if it diverges, narrow the gate from THIS
-// evidence rather than a priori.
-test "GT[(Int, Option[Str])] monomorphizes to Tuple2_int_Option_str and round-trips" {
+// An Option has no Hash, so neither does a tuple holding one (sections/03_types.md:1940).
+// This row once pinned how the tid and annotation paths spell an Option tuple element; the
+// spec refuses the type first, so it now pins that refusal.
+test "GT[(Int, Option[Str])] is rejected with E1400 because an Option element is not hashable" {
     let src = gt_src("(Int, Option[Str])", "(256, Some(\"a\"))", "(1, Some(\"b\"))")
-    let c = compile_test_helpers.compile_and_emit_c(src, "fqthkv_m_intopt_c")
-    assert_mono_slots(c, "GT", ["Tuple2", "int", "Option", "str"], "GT[(Int,Option[Str])] mono name")
-    assert_no_erasure(c, "GT[(Int,Option[Str])]")
-    let r = compile_test_helpers.compile_and_run(src, "fqthkv_m_intopt_run")
-    assert_eq(r.exit_code, 0)
+    let out = compile_test_helpers.compile_and_capture(src, "fqthkv_m_intopt_c")
+    compile_test_helpers.expect_error(out, "E1400", "GT[(Int,Option[Str])] / E1400")
+    compile_test_helpers.expect_contains(out, "`Option`", "GT[(Int,Option[Str])] / names Option")
 }
 
-// The GATE (tc_tid_tuple_elem_faithful) admits a Map element, so the mono namer spells this
-// instance — which means the ctor's carrier registration must spell it too. Declining there
-// instead leaves the carrier unregistered and kops_table_name emits a
-// BLINK_COMPILER_BUG_kops_unsupported sentinel, a raw cc error with no span for a type whose
-// annotation-spelled twin (`let s: Set[(Int, Map[Str,Int])] = Set()`) compiles today. Gate,
-// mono namer and carrier registration are one seam: whatever one admits, all three must — and
-// Map being an ERASED carrier, all three now spell the flat "map" (K/V drop from the tag,
-// recovered per-use from the tid), not the old structural Map_str_int.
-// Not gt_src: a BARE `Map()` as a tuple-element literal is a separate value-path concern
-// (emit_tuple_lit) with its own kops story, so bind the element to an annotated Map first,
-// keeping this row on the carrier-registration question it exists to answer.
-test "GT[(Int, Map[Str, Int])] monomorphizes to Tuple2_int_map and round-trips" {
+// A Map has no Hash, so neither does a tuple holding one (sections/03_types.md:1940), and
+// GT uses its type arg as a Set element. The direct spelling `Set[(Int, Map[Str, Int])]` is
+// refused the same way; reaching it through GT must not let it past type-check to codegen.
+test "GT[(Int, Map[Str, Int])] is rejected with E1400 because a Map element is not hashable" {
     let mut src = "type GT[T] \{ s: Set[T] }\n"
     src = src.concat("fn main() \{\n")
     src = src.concat("    let e: GT[(Int, Map[Str, Int])] = GT \{ s: Set() }\n")
     src = src.concat("    let m1: Map[Str, Int] = Map()\n")
-    src = src.concat("    let m2: Map[Str, Int] = Map()\n")
     src = src.concat("    e.s.insert((256, m1))\n")
-    src = src.concat("    e.s.insert((1, m2))\n")
-    src = src.concat("    assert_eq(e.s.len(), 2)\n")
-    src = src.concat("    assert(e.s.contains((256, m1)))\n")
-    src = src.concat("    assert(e.s.contains((1, m2)))\n")
+    src = src.concat("    assert_eq(e.s.len(), 1)\n")
     src = src.concat("}\n")
-    let c = compile_test_helpers.compile_and_emit_c(src, "fqthkv_m_intmap_c")
-    assert_mono_slots(c, "GT", ["Tuple2", "int", "map"], "GT[(Int,Map[Str,Int])] mono name")
-    assert_lacks(c, "BLINK_COMPILER_BUG_kops_unsupported", "GT[(Int,Map)] kops sentinel")
-    assert_no_erasure(c, "GT[(Int,Map[Str,Int])]")
-    let r = compile_test_helpers.compile_and_run(src, "fqthkv_m_intmap_run")
-    assert_eq(r.exit_code, 0)
+    let out = compile_test_helpers.compile_and_capture(src, "fqthkv_m_intmap_c")
+    compile_test_helpers.expect_error(out, "E1400", "GT[(Int,Map[Str,Int])] / E1400")
+    compile_test_helpers.expect_contains(out, "`Map`", "GT[(Int,Map[Str,Int])] / names Map")
 }
 
 test "GT[(Pt, Int)] monomorphizes to Tuple2_Pt_int and round-trips" {
