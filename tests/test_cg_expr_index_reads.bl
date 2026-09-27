@@ -9,7 +9,7 @@ import lower_test_helpers.{
     assert_ice_saying, assert_refused_saying,
 }
 import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid, ir_node_count}
-import cg_expr.{lower_expr}
+import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
 
 fn src_reads() -> Str {
     #"fn main() {
@@ -48,11 +48,23 @@ test "a named index lowers its operand like any other expression" {
     assert_verifies("verify", id)
 }
 
+// The add is checked (sections/03_types.md:781), so it runs once ahead of the read: the
+// Const held once, the result temp, one overflow test, and the reader reads that temp.
 test "a compound index is lowered whole, not folded or re-read" {
     probe("cg_expr_index", src_reads())
+    let mark = cg_expr_pending_count()
     let id = lower_expr(rhs_of("compound_read"))
-    assert_shape("shape", id, "Cast(Cast(CallRuntime(VarRef, Binary(VarRef, Const))))")
+    let pre = cg_expr_take_pending(mark)
+    assert_shape("shape", id, "Cast(Cast(CallRuntime(VarRef, VarRef)))")
     assert_verifies("verify", id)
+    assert_eq(pre.len(), 3)
+    assert_shape("const held once", pre.get(0).unwrap(), "Let(Const)")
+    assert_shape("result temp", pre.get(1).unwrap(), "Let")
+    assert_shape("one checked add", pre.get(2).unwrap(),
+        "If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)))))")
+    assert_eq_str("add", ir_c_name(ir_kid(pre.get(2).unwrap(), 0)), "__builtin_add_overflow")
+    let index = ir_kid(ir_kid(ir_kid(id, 0), 0), 1)
+    assert_eq_str("reads the result", ir_c_name(index), ir_c_name(pre.get(1).unwrap()))
 }
 
 // Nothing here knows the container's length, and a constant index is not a promise about
