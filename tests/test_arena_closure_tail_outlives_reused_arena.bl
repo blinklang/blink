@@ -49,3 +49,89 @@ test "closure tail capturing a closure built by a callee promotes the inner capt
     assert_eq(g(3), 31)
     assert_eq(g(1), 11)
 }
+
+fn counter() -> fn() -> Int {
+    let mut c = 0
+    fn() -> Int {
+        c = c + 1
+        c
+    }
+}
+
+fn add_one(x: Int) -> Int { x + 1 }
+
+test "closure tail with no captures survives arena reuse" {
+    let g = with arena {
+        fn(i: Int) -> Int { i * 3 }
+    }
+    clobber()
+    assert_eq(g(4), 12)
+}
+
+test "two closures in one tail keep sharing their block-local cell" {
+    let pair = with arena {
+        let mut n = 0
+        let inc = fn() -> Int {
+            n = n + 1
+            n
+        }
+        let get = fn() -> Int { n }
+        (inc, get)
+    }
+    clobber()
+    let (inc, get) = pair
+    assert_eq(inc(), 1)
+    assert_eq(inc(), 2)
+    assert_eq(get(), 2)
+}
+
+test "a tail closure and the closure it captures keep sharing a block-local cell" {
+    let g = with arena {
+        let mut n = 0
+        let bump = fn() -> Int {
+            n = n + 1
+            n
+        }
+        fn() -> Int { bump() + n * 100 }
+    }
+    clobber()
+    assert_eq(g(), 101)
+    assert_eq(g(), 202)
+}
+
+test "a closure that reaches itself through a block-local cell is promoted" {
+    let g = with arena {
+        let mut fact = fn(n: Int) -> Int { n }
+        fact = fn(n: Int) -> Int { if n <= 1 { 1 } else { n * fact(n - 1) } }
+        fn(n: Int) -> Int { fact(n) }
+    }
+    clobber()
+    assert_eq(g(5), 120)
+}
+
+test "a callee-built closure's own cell is copied while an outside cell stays shared" {
+    let mut outside = 0
+    let g = with arena {
+        let k = counter()
+        fn() -> Int {
+            outside = outside + 10
+            k() + outside
+        }
+    }
+    clobber()
+    assert_eq(g(), 11)
+    assert_eq(g(), 22)
+    assert_eq(outside, 20)
+    outside = 100
+    assert_eq(g(), 113)
+}
+
+test "a closure bound outside the block and a named fn pass through an arena tail" {
+    let base = build(3)
+    let outer = fn(i: Int) -> Int { base.get(i).unwrap() + 2 }
+    let g = with arena { outer }
+    let h = with arena { add_one }
+    clobber()
+    assert_eq(g(2), 22)
+    assert_eq(h(1), 2)
+}
