@@ -5,7 +5,7 @@ import lower_test_helpers.{
     assert_ice,
 }
 import ir.{IrKind, ir_c_name, ir_c_spelling, ir_tid, ir_kid}
-import cg_expr.{lower_expr, cg_expr_pending_count}
+import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
 import layout.{tid_of_node, binder_scope_push, binder_scope_pop, bind_binder}
 import cg_reg.{cg_reg_reset}
 
@@ -97,18 +97,31 @@ fn main() {
 "#
 }
 
+// `NAME + 0` is checked (sections/03_types.md:781), so its value is the result temp and
+// the name is read once, as the first operand of the overflow test.
+fn read_in_check(label: Str, node: Int) -> Int ! Diag.Report {
+    let mark = cg_expr_pending_count()
+    let id = lower_expr(node)
+    let pre = cg_expr_take_pending(mark)
+    assert_kind("{label}: value", id, IrKind.VarRef)
+    assert_eq(pre.len(), 3)
+    let check = pre.get(2).unwrap()
+    assert_kind("{label}: check", check, IrKind.If)
+    ir_kid(check, 0)
+}
+
 test "a module global is read by its own symbol where no local shadows it" {
     probe("cg_expr_names", src_names())
-    assert_shape("global", lower_expr(rhs_of("read")), "Binary(GlobalRef, Const)")
+    assert_shape("global", read_in_check("global", rhs_of("read")), "CallRuntime(GlobalRef, VarRef, Unary(VarRef))")
 }
 
 test "a local outranks a module global of the same name, and only inside its scope" {
     probe("cg_expr_names", src_names())
     let scope = binder_scope_push()
     bind_binder(scope, "COUNT", tid_of_node(rhs_of("read")))
-    assert_shape("shadowed", lower_expr(rhs_of("read")), "Binary(VarRef, Const)")
+    assert_shape("shadowed", read_in_check("shadowed", rhs_of("read")), "CallRuntime(VarRef, VarRef, Unary(VarRef))")
     binder_scope_pop()
-    assert_shape("scope closed", lower_expr(rhs_of("read")), "Binary(GlobalRef, Const)")
+    assert_shape("scope closed", read_in_check("scope closed", rhs_of("read")), "CallRuntime(GlobalRef, VarRef, Unary(VarRef))")
 }
 
 test "a module-qualified name reads the other module's global" {
@@ -146,7 +159,7 @@ fn main() {
 // under the same spelling.
 test "a global whose name other modules also declare privately reads the reader's own" {
     probe("cg_expr_collide", src_colliding_global())
-    let id = lower_expr(rhs_of("read"))
-    assert_shape("collision", id, "Binary(GlobalRef, Const)")
+    let id = read_in_check("collision", rhs_of("read"))
+    assert_shape("collision", id, "CallRuntime(GlobalRef, VarRef, Unary(VarRef))")
     assert_eq_str("symbol", ir_c_name(ir_kid(id, 0)), "blink_u_CH_0")
 }
