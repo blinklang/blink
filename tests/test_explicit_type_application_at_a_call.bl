@@ -1,0 +1,165 @@
+// A call may supply its type arguments in brackets (03_types.md:1297): `probe[Int]()`. The
+// list binds the callee's type parameters in order, so it pins a type that nothing else in
+// the call could fix, and each distinct list is its own instance.
+
+import compile_test_helpers
+import std.io
+
+fn expect_runs_printing(src: Str, tag: Str, want: Str) {
+    let r = compile_test_helpers.compile_and_run(src, tag)
+    if r.exit_code != 0 || r.out.trim() != want {
+        io.println("FAIL: {tag} exit={r.exit_code} out={r.out} err={r.err_out}")
+    }
+    assert(r.exit_code == 0)
+    assert(r.out.trim() == want)
+}
+
+// A rejected program must stop at a front-end code, never at an ICE from a later stage.
+fn expect_rejected(src: Str, tag: Str, code: Str) {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_error(out, "\"code\":\"{code}\"", tag)
+    assert(!out.contains("\"severity\":\"ice\""))
+}
+
+test "a type argument that no value argument carries is bound from the brackets" {
+    expect_runs_printing(#"fn probe[T]() -> Int { 1 }
+fn main() {
+    io.println("{probe[Int]()}")
+}
+"#, "_explicit_targ_phantom", "1")
+}
+
+test "two bracketed lists give two instances" {
+    let c = compile_test_helpers.compile_and_emit_c(#"fn twoinst[T]() -> Int { 1 }
+fn main() {
+    io.println("{twoinst[Int]() + twoinst[Str]()}")
+}
+"#, "_explicit_targ_two_instances")
+    let names = compile_test_helpers.mono_fn_names(c, "twoinst")
+    if names.len() != 2 { io.println("FAIL: twoinst has {names.len()} instances") }
+    assert(names.len() == 2)
+}
+
+test "the bracketed list pins a return type that the call leaves open" {
+    expect_runs_printing(#"fn empty[T]() -> List[T] { [] }
+fn main() {
+    let xs = empty[Int]()
+    io.println("{xs.len()}")
+}
+"#, "_explicit_targ_pins_return", "0")
+}
+
+test "two type arguments bind in order" {
+    expect_runs_printing(#"fn pair[A, B]() -> Int { 2 }
+fn main() {
+    io.println("{pair[Int, Str]()}")
+}
+"#, "_explicit_targ_two_args", "2")
+}
+
+test "a type argument may itself be generic" {
+    expect_runs_printing(#"fn f[T]() -> Int { 3 }
+fn main() {
+    io.println("{f[List[Int]]() + f[Map[Str, Int]]()}")
+}
+"#, "_explicit_targ_nested", "6")
+}
+
+test "a function type and a tuple type are type arguments too" {
+    expect_runs_printing(#"fn f[T]() -> Int { 4 }
+fn main() {
+    io.println("{f[fn(Int) -> Int]() + f[(Int, Str)]()}")
+}
+"#, "_explicit_targ_fn_and_tuple", "8")
+}
+
+test "a method call takes a bracketed list after the method name" {
+    expect_runs_printing(#"type Bx { n: Int }
+trait Pr { fn probe[T](self) -> Int }
+impl Pr for Bx { fn probe[T](self) -> Int { self.n } }
+fn main() {
+    let b = Bx { n: 5 }
+    io.println("{b.probe[Int]()}")
+}
+"#, "_explicit_targ_method", "5")
+}
+
+test "a module-qualified call takes a bracketed list" {
+    let r = compile_test_helpers.run_xmod(#"import mq.tam
+fn main() {
+    io.println("{tam.probe[Int]()}")
+}
+"#, "mq", "tam", "pub fn probe[T]() -> Int \{ 1 \}\n", "explicit_targ_modq")
+    if r.exit_code != 0 { io.println("FAIL: modq exit={r.exit_code} err={r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.trim() == "1")
+}
+
+test "alloc_ptr takes its pointee from the brackets" {
+    expect_runs_printing(#"@trusted(audit: "explicit-targ-test")
+fn go() ! FFI {
+    let p = alloc_ptr[U8]()
+    let q: Ptr[U8] = p
+    io.println("null={q.is_null()}")
+}
+fn main() { go() }
+"#, "_explicit_targ_alloc_ptr", "null=false")
+}
+
+test "a value argument is checked against the bracketed type" {
+    expect_rejected(#"fn id[T](x: T) -> T { x }
+fn main() {
+    let v = id[Int]("s")
+    let _ = v
+}
+"#, "_explicit_targ_arg_mismatch", "E0300")
+}
+
+test "a bracketed list that agrees with the value argument is accepted" {
+    let out = compile_test_helpers.compile_and_capture(#"fn id[T](x: T) -> T { x }
+fn main() {
+    let v = id[Int](1)
+    let _ = v
+}
+"#, "_explicit_targ_arg_agrees")
+    compile_test_helpers.expect_compiles_clean(out, "id[Int](1)")
+}
+
+test "a bracketed type argument must satisfy the parameter's bound" {
+    expect_rejected(#"type NoDisplay { n: Int }
+fn show[T: Display]() -> Int { 0 }
+fn main() {
+    let v = show[NoDisplay]()
+    let _ = v
+}
+"#, "_explicit_targ_bound", "E0306")
+}
+
+test "a list of the wrong length is rejected before code generation" {
+    expect_rejected(#"fn pair[A, B]() -> Int { 2 }
+fn main() {
+    let v = pair[Int]()
+    let _ = v
+}
+"#, "_explicit_targ_arity", "E0307")
+}
+
+test "a bracketed list with no call after it is rejected" {
+    expect_rejected(#"fn probe[T]() -> Int { 1 }
+fn main() {
+    let g = probe[Int]
+    let _ = g
+}
+"#, "_explicit_targ_no_call", "E0307")
+}
+
+test "a value name inside the brackets is an unknown type" {
+    expect_rejected(#"fn a() -> Int { 1 }
+fn main() {
+    let fns: List[fn() -> Int] = [a]
+    let i = 0
+    let v = fns[i]()
+    let _ = v
+}
+"#, "_explicit_targ_value_in_brackets", "E0507")
+}
