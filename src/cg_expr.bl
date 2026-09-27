@@ -767,7 +767,13 @@ pub fn lower_arith_operator(site: ArithSite, lhs: Int, rhs: Int) -> Int ! Diag.R
     let rec = x_local(site.tid, site.node)
     if x_stopped(rec) { return -1 }
     let lhs_tid = tid_of_node(site.lhs_node)
-    if lhs_tid < 0 { return -1 }
+    let rhs_tid = tid_of_node(site.rhs_node)
+    if lhs_tid < 0 || rhs_tid < 0 { return -1 }
+    // An operand that never produces a value leaves the operator unreachable, so there is
+    // nothing to check and no value to print in a message.
+    if x_is_void_like(lhs_tid) || x_is_void_like(rhs_tid) {
+        return ir_binary(site.tid, site.node, rec.c_spelling, site.op, lhs, rhs)
+    }
     if x_operator_needs_guard(site.op, lhs_tid, rhs) || x_needs_min_guard(site.op, lhs_tid, rhs) {
         return x_guarded_binary(site, rec, lhs_tid, lhs, rhs)
     }
@@ -946,8 +952,8 @@ fn x_checked_into(node: Int, op: Str, tid: Int, rec: LayoutRecord, l: Int, r: In
 // operands are values only the run knows, so the message is formatted, and it is built
 // inside the check, so the formatting runs only on the path that panics.
 fn x_operands_message(site: ArithSite, lhs_tid: Int, rhs_tid: Int, left: Str, right: Str) -> Int ! Diag.Report {
-    let lspec = format_spec_of(lhs_tid)
-    let rspec = format_spec_of(rhs_tid)
+    let lspec = x_operand_spec(lhs_tid, site.lhs_node)
+    let rspec = x_operand_spec(rhs_tid, site.rhs_node)
     if lspec == "" || rspec == "" { return -1 }
     let l = x_ref(lhs_tid, site.lhs_node, left)
     let r = x_ref(rhs_tid, site.rhs_node, right)
@@ -957,6 +963,19 @@ fn x_operands_message(site: ArithSite, lhs_tid: Int, rhs_tid: Int, left: Str, ri
         x_promote_for_varargs(site.lhs_node, lhs_tid, l),
         x_promote_for_varargs(site.rhs_node, rhs_tid, r),
     ])
+}
+
+// Every operand an overflow check can reach is an integer, and every integer prints. An
+// operand with no printed form is a gap in this stage, reported, so that a check never
+// drops its statement without a word.
+fn x_operand_spec(tid: Int, node: Int) -> Str ! Diag.Report {
+    let spec = format_spec_of(tid)
+    if spec == "" {
+        diag_ice_at("OverflowOperandNotPrintable", CODEGEN_STAGE_NOT_BUILT,
+            "an overflow message cannot print a {tk_name(x_kind(tid))} operand", node,
+            "the checked operators print integer operands; this operand type needs a format")
+    }
+    spec
 }
 
 fn x_operation_word(op: Str) -> Str {
@@ -1187,7 +1206,7 @@ fn x_checked_negation(node: Int, tid: Int, rec: LayoutRecord, operand: Int) -> I
     let src = node_left(node)
     let name = x_hold_name(tid, src, operand)
     if name == "" { return -1 }
-    let spec = format_spec_of(tid)
+    let spec = x_operand_spec(tid, src)
     let shown = x_ref(tid, src, name)
     if spec == "" || shown < 0 { return -1 }
     let said = x_panic_message(node, "{tk_name(x_kind(tid))} overflow in negation (-({spec}))",
