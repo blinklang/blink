@@ -43,7 +43,7 @@ import diagnostics.{
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905,
     TRAIT_CONTRACT_906, TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
     POLY_IMPL_UNSUPPORTED, IMPL_BINDER_UNUSED, TRAIT_ARG_ARITY, MISSING_SUPERTRAIT_IMPL, TYPE_ARG_ARITY,
-    CALL_SITE_TYPE_ARGS, ENUM_PATTERN_NON_ENUM,
+    CALL_SITE_TYPE_ARGS, ELEMENT_ACCESS_HELP, ENUM_PATTERN_NON_ENUM,
     CONTRACT_PREDICATE_NOT_DECIDABLE, EFFECTFUL_CALL_IN_PREDICATE,
     IMPURE_CALL_IN_PREDICATE, LOOP_IN_PREDICATE,
     RESULT_OUTSIDE_ENSURES, OLD_OUTSIDE_ENSURES,
@@ -10223,6 +10223,9 @@ fn init_types() ! TypeCheck.Register {
     tc_impl_of_method = Map()
     tc_active_tparams.clear()
     tc_call_site_type_args.clear()
+    tc_type_args_claimed.clear()
+    tc_type_args_unresolved.clear()
+    tc_type_args_untyped = []
     tc_tp_arith_names.clear()
     tc_tp_bound_traits.clear()
     tc_tp_bound_methods.clear()
@@ -13541,6 +13544,34 @@ fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report 
     }
 }
 
+// A call's bracketed type arguments. A name there that is no type but is a value in scope
+// was written by someone who meant to index, so its report names element access, and the
+// call's own count check stays quiet about a list that already has its report.
+fn nr_check_call_type_args(call_node: Int) ! TypeCheck.Resolve, Diag.Report {
+    let sl = node_type_params(call_node)
+    if sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        let ann = sublist_get(sl, i)
+        let name = node_name(ann)
+        if nr_names_a_type(name) == 0 && nr_has_binding(name) != 0 {
+            tc_type_args_unresolved.insert(call_node, 1)
+            tc_errors.push("unknown type `{name}`")
+            nr_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`", ann, ELEMENT_ACCESS_HELP)
+        } else {
+            nr_check_type_ann_visibility(ann)
+        }
+        i = i + 1
+    }
+}
+
+// Whether a name in a type position names something nr_check_type_ref accepts.
+fn nr_names_a_type(name: Str) -> Int {
+    if (tc_active_tparams.get(name) ?? 0) > 0 { return 1 }
+    if is_known_type(name) != 0 || is_trait_name(name) != 0 { return 1 }
+    0
+}
+
 // `at` is the node the report points at, or -1 when the caller has none.
 fn nr_check_type_ref(name: Str, at: Int) ! TypeCheck.Resolve, Diag.Report {
     if name == "" { return }
@@ -13963,13 +13994,8 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let callee = node_left(node)
         if callee != -1 {
             let callee_kind = node_kind(callee)
-            if callee_kind == NodeKind.IndexExpr && tc_index_is_type_application(callee) != 0 {
-                let ty_name = node_name(node_index(callee))
-                tc_call_site_type_args.insert(callee, 1)
-                tc_errors.push("type arguments at a call site are not accepted")
-                diag_error_at("CallSiteTypeArgs", CALL_SITE_TYPE_ARGS, "type argument `[{ty_name}]` is written at the call site, which the compiler does not accept", callee, "let the type argument come from context — annotate the binding, or the parameter the result flows into, as in `let p: Ptr[{ty_name}] = scope.alloc()`")
-                nr_check_node(node_obj(callee))
-            } else if callee_kind == NodeKind.Ident {
+            nr_check_call_type_args(node)
+            if callee_kind == NodeKind.Ident {
                 let fn_name = node_name(callee)
                 if nr_check_selective_access(fn_name, node) == 0 {
                     if nr_is_defined(fn_name) != 0 && nr_top_binding_is_global(fn_name) != 0 && is_private_access(fn_name) != 0 {
@@ -13981,6 +14007,12 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     } else if nr_is_unimported_prelude_free_fn(fn_name) != 0 {
                         tc_errors.push("undefined function `{fn_name}`")
                         diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `{fn_name}`", node, "this stdlib function is not in the prelude — add an explicit import, e.g. import {tc_qualifier_for_module(tc_get_symbol_module(fn_name))}.\{{fn_name}}")
+                    } else if fn_name == "List" && nr_is_defined(fn_name) == 0 && is_variant_name(fn_name) == 0 {
+                        // List is a type with no call form, unlike Map and Set. Marking the
+                        // list unresolved keeps the arity check off the same mistake.
+                        tc_type_args_unresolved.insert(node, 1)
+                        tc_errors.push("undefined function `List`")
+                        diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `List`", node, "`List` has no constructor call; build an empty list with `[]` and an annotation, as in `let l: List[Int] = []`")
                     } else if nr_is_defined(fn_name) == 0 && is_builtin_fn(fn_name) == 0 && is_variant_name(fn_name) == 0 && is_known_type(fn_name) == 0 && is_trait_name(fn_name) == 0 {
                         tc_errors.push("undefined function `{fn_name}`")
                         diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `{fn_name}`", node, "")
@@ -14010,6 +14042,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 
     if kind == NodeKind.MethodCall {
         let obj = node_obj(node)
+        nr_check_call_type_args(node)
         let mut is_module_qual = 0
         if obj != -1 && node_kind(obj) == NodeKind.Ident {
             let obj_name = node_name(obj)
@@ -14151,6 +14184,16 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     }
 
     if kind == NodeKind.IndexExpr {
+        if tc_index_is_type_application(node) != 0 {
+            let ty_name = node_name(node_index(node))
+            let obj = node_obj(node)
+            let fn_text = if node_kind(obj) == NodeKind.Ident { node_name(obj) } else { "f" }
+            tc_call_site_type_args.insert(node, 1)
+            tc_errors.push("type arguments with no call")
+            diag_error_at("CallSiteTypeArgs", CALL_SITE_TYPE_ARGS, "type argument `[{ty_name}]` has no call to apply to", node, "type arguments belong to a call, as in `{fn_text}[{ty_name}]()`; to keep the function as a value, annotate the binding with its function type")
+            nr_check_node(obj)
+            return
+        }
         nr_check_node(node_obj(node))
         nr_check_node(node_index(node))
         return
@@ -15601,6 +15644,7 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     let tid = infer_type_uncached(node)
     tc_if_value_ctx = saved_ctx
     tc_infer_unclaimed_args(node)
+    tc_check_type_args_claimed(node, tid)
     if node != -1 && node < tc_node_tid.len() {
         // The memo answers a TYPE or nothing, and -1 is the "nobody has typed this"
         // sentinel (TYPE_INT is 0, so -1 cannot collide with a real tid). TYPE_UNKNOWN
@@ -16185,7 +16229,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                             }
                         }
                     }
-                    if fn_name == "alloc_ptr" || fn_name == "null_ptr" { return tc_ptr_ctor_tid() }
+                    if fn_name == "alloc_ptr" || fn_name == "null_ptr" {
+                        if node_type_params(node) != -1 { return tc_ptr_from_type_arg(node, fn_name) }
+                        return tc_ptr_ctor_tid()
+                    }
+                    if (fn_name == "Map" || fn_name == "Set") && node_type_params(node) != -1 {
+                        return tc_keyed_ctor_from_type_args(node, fn_name)
+                    }
                     return get_builtin_fn_ret(fn_name)
                 }
                 if is_variant_name(fn_name) != 0 {
@@ -16232,6 +16282,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // item, so it is a value child like any other and carries its own type.
                     tc_publish_node_tid(callee, local_tid)
                     let call_args_sl = node_args(node)
+                    if node_type_params(node) != -1 {
+                        // A value declares no type parameters, so brackets after it were
+                        // meant as an index.
+                        let _ = tc_claim_type_args(node, 0, fn_name, ELEMENT_ACCESS_HELP)
+                        let _ = tc_infer_arg_tids(call_args_sl)
+                        return tc_error_recovery_tid()
+                    }
                     if type_kind(local_tid) == TyKind.Fn {
                         return tc_check_call_against_fn_tid(local_tid, call_args_sl, "function `{fn_name}`", node)
                     }
@@ -16268,6 +16325,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     if kw_bad == 0 && arg_count != fs.params_count {
                         let expected = fs.params_count
                         tc_error_at("function `{fn_name}` expects {expected} argument(s), got {arg_count}", node)
+                    }
+                    if node_type_params(node) != -1 {
+                        let no_outer: Map[Str, Int] = Map()
+                        return tc_call_with_type_args(fn_name, sig, node, 0, no_outer)
                     }
                     let arg_tids = check_arg_shapes(fn_name, sig, args_sl, 0, node)
                     if fs.type_params_count > 0 {
@@ -17377,9 +17438,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
             if method == "alloc_n" {
                 check_builtin_arg(method, 0, TYPE_INT, args_sl, "scope")
+                if node_type_params(node) != -1 { return tc_ptr_from_type_arg(node, "scope.alloc_n") }
                 return tc_ffi_alloc_hint_tid(node)
             }
-            if method == "alloc" { return tc_ffi_alloc_hint_tid(node) }
+            if method == "alloc" {
+                if node_type_params(node) != -1 { return tc_ptr_from_type_arg(node, "scope.alloc") }
+                return tc_ffi_alloc_hint_tid(node)
+            }
         }
 
         // A method call on a BOUNDED type parameter (`fn show[T: Display](x: T) { x.fmt(sb) }`).
@@ -17447,6 +17512,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // Before the argument check: an argument typed by an impl binder takes the
                 // receiver's type argument as its hint, as a List poly-impl argument does.
                 let ibinds = tc_impl_binds_at_call(sig, obj_t)
+                if node_type_params(node) != -1 {
+                    nr_note_call_decl(node, fnsig_pool.get(sig).unwrap().decl)
+                    return tc_call_with_type_args("{tname}.{method}", sig, node, 1, ibinds)
+                }
                 let mut mtids = check_arg_shapes_with_binds("{tname}.{method}", sig, node_args(node), 1, node, ibinds)
                 // Which declaration this call reached. The signature answers, because the
                 // receiver picked the signature and the receiver is the only thing that
@@ -17738,6 +17807,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // tc_infer_arg_tids infers each arg, so the generic path also populates
                     // the node→tid memo the tid-driven mono lowering (tc_mono_tids_core) reads.
                     let mq_fs = fnsig_pool.get(sig).unwrap()
+                    if node_type_params(node) != -1 {
+                        let no_outer: Map[Str, Int] = Map()
+                        return tc_call_with_type_args("{obj_name}.{method}", sig, node, 0, no_outer)
+                    }
                     if mq_fs.type_params_count > 0 {
                         return instantiate_return_type(sig, tc_infer_arg_tids(mq_gen_args), node, 0)
                     }
@@ -17923,6 +17996,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // did: it returned get_builtin_fn_ret's answer for `new` even when that was
             // Unknown, ending resolution there.
             if is_builtin_fn(obj_name) != 0 && obj_is_value == 0 {
+                if (obj_name == "Map" || obj_name == "Set") && method == "new" && node_type_params(node) != -1 {
+                    return tc_keyed_ctor_from_type_args(node, obj_name)
+                }
                 let bs_ret = tc_builtin_static_ret(obj_name, method)
                 if bs_ret >= 0 { return bs_ret }
             }
@@ -18929,16 +19005,27 @@ fn tc_scoped_value_memo(node: Int, depth: Int) -> Int {
     tc_lookup_node_tid(node)
 }
 
-// Calls whose callee is a bracketed type application, recorded when name resolution reports
+// Bracketed type arguments with no call after them, recorded when name resolution reports
 // them. The index-typing arm reads this to stay quiet: the construct already has its
 // diagnostic, and "cannot index a value of type Fn() -> Int" describes a reading of the
 // brackets that the program did not intend.
 let mut tc_call_site_type_args: Map[Int, Int] = Map()
 
-// Whether an index expression is a type applied in brackets rather than a position read.
-// The brackets hold a NAME, that name names a type or a type parameter in scope, and no
-// value of that name is in scope to be indexed by. `fns[0]` fails the Ident test and
-// `fns[Slot]` with a local `Slot` fails the binding test, so both stay index reads.
+// Calls whose bracketed type-argument list a typing arm read. A list no arm read binds
+// nothing, and tc_check_type_args_claimed reports it once the call is typed.
+let mut tc_type_args_claimed: Map[Int, Int] = Map()
+
+// Calls whose type-argument list holds a value name, reported by name resolution. The
+// count checks stay quiet on these, so one mistake gets one report.
+let mut tc_type_args_unresolved: Map[Int, Int] = Map()
+
+// Calls with an unread type-argument list that had no type yet when the check reached them.
+// A later walk may still claim the list; whatever is left at the end of the program is reported.
+let mut tc_type_args_untyped: List[Int] = []
+
+// Whether an index expression with no call after it is a type applied in brackets rather
+// than a position read. The brackets hold a NAME, that name names a type or a type
+// parameter in scope, and no value of that name is in scope to be indexed by.
 fn tc_index_is_type_application(idx: Int) -> Int {
     if idx == -1 { return 0 }
     if node_kind(idx) != NodeKind.IndexExpr { return 0 }
@@ -18951,6 +19038,148 @@ fn tc_index_is_type_application(idx: Int) -> Int {
     if (tc_active_tparams.get(nm) ?? 0) > 0 { return 1 }
     if tc_names_a_type(nm) { return 1 }
     0
+}
+
+// Marks the type-argument list at `call_node` as read, and reports it when the callee
+// declares a different count. Returns 1 when the list can bind.
+fn tc_claim_type_args(call_node: Int, declared: Int, callee: Str, help: Str) -> Int ! Diag.Report {
+    tc_type_args_claimed.insert(call_node, 1)
+    if (tc_type_args_unresolved.get(call_node) ?? 0) != 0 { return 0 }
+    let given = sublist_length(node_type_params(call_node))
+    if given == declared { return 1 }
+    tc_errors.push("type argument count")
+    diag_error_at("CallSiteTypeArgs", CALL_SITE_TYPE_ARGS, "`{callee}` expects {declared} type argument(s), {given} given", call_node, help)
+    0
+}
+
+// The repair for a wrong count at a callee that is a declaration.
+fn tc_type_arity_help(callee: Str, declared: Int) -> Str {
+    if declared == 0 { return "`{callee}` declares no type parameters; remove the brackets" }
+    "write one type argument for each of the {declared} type parameters `{callee}` declares, or remove the brackets and let the arguments decide them"
+}
+
+// The binders a declaration writes itself, which are the ones a call's list may bind.
+fn tc_own_type_param_count(decl: Int) -> Int {
+    if decl < 0 { return 0 }
+    let tps = node_type_params(decl)
+    if tps == -1 { return 0 }
+    sublist_length(tps)
+}
+
+// The binds a call's written type arguments give the declaration's own binders, in order.
+// The same tids seed the call's mint group, which is where mono reads a binder that no
+// argument reaches, so `probe[Int]()` names its instance.
+fn tc_explicit_type_binds(decl: Int, call_node: Int) -> Map[Str, Int] ! TypeCheck.Resolve, Diag.Report {
+    let mut binds: Map[Str, Int] = Map()
+    let binders = node_type_params(decl)
+    let targs = node_type_params(call_node)
+    let mut tids: List[Int] = []
+    let mut i = 0
+    while i < sublist_length(binders) {
+        let b = sublist_get(binders, i)
+        let t = resolve_type_ann(sublist_get(targs, i))
+        binds.insert(node_name(b), t)
+        binds.insert(tc_binder_key(b, node_name(b)), t)
+        tids.push(t)
+        i = i + 1
+    }
+    tc_seed_mint_group(call_node, tids)
+    binds
+}
+
+// Writes a full group for `call_node` in the layout tc_ret_only_metavars reads, once. A
+// later walk of the same call reads the group back rather than minting over it.
+fn tc_seed_mint_group(call_node: Int, tids: List[Int]) {
+    if call_node < 0 || call_node >= tc_ret_mint_start.len() { return }
+    if tc_ret_mint_start.get(call_node).unwrap() >= 0 { return }
+    let start = tc_ret_mint_tids.len()
+    tc_ret_mint_tids.push(tids.len())
+    for t in tids { tc_ret_mint_tids.push(t) }
+    tc_ret_mint_start.set(call_node, start)
+}
+
+// A call that writes its type arguments. The list binds the declaration's own binders before
+// the arguments are checked, so each argument is checked against the written type. `outer`
+// holds the binds the receiver already answers.
+fn tc_call_with_type_args(callee: Str, sig: Int, call_node: Int, self_offset: Int, outer: Map[Str, Int]) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let fs = fnsig_pool.get(sig).unwrap()
+    let args_sl = node_args(call_node)
+    let declared = tc_own_type_param_count(fs.decl)
+    if tc_claim_type_args(call_node, declared, callee, tc_type_arity_help(callee, declared)) == 0 {
+        let _ = check_arg_shapes_with_binds(callee, sig, args_sl, self_offset, call_node, outer)
+        return tc_error_recovery_tid()
+    }
+    let mut binds = tc_explicit_type_binds(fs.decl, call_node)
+    for (k, v) in outer {
+        if binds.contains_key(k) == 0 { binds.insert(k, v) }
+    }
+    let arg_tids = check_arg_shapes_with_binds(callee, sig, args_sl, self_offset, call_node, binds)
+    tc_check_bounds_for_binds(sig, binds, call_node)
+    let _ = tc_seed_closure_args_with_binds(sig, args_sl, arg_tids, self_offset, binds)
+    substitute_typevar_tid(fs.ret, binds)
+}
+
+// A pointer allocator given its pointee in brackets, as `alloc_ptr[U8]()` or
+// `scope.alloc[U8]()`. The written type is the answer, ahead of any expectation.
+fn tc_ptr_from_type_arg(call_node: Int, callee: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let help = "`{callee}` takes one type argument, the pointee, as in `{callee}[U8]()`"
+    if tc_claim_type_args(call_node, 1, callee, help) == 0 { return tc_error_recovery_tid() }
+    make_ptr_type(resolve_type_ann(sublist_get(node_type_params(call_node), 0)))
+}
+
+// A keyed container given its element types in brackets, as `Map[Str, Int]()`. The written
+// types are the answer, ahead of any expectation, so the constructor knows its key type.
+fn tc_keyed_ctor_from_type_args(call_node: Int, name: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let mut declared = 1
+    let mut help = "`Set` takes one type argument, the element, as in `Set[Int]()`"
+    if name == "Map" {
+        declared = 2
+        help = "`Map` takes two type arguments, the key and the value, as in `Map[Str, Int]()`"
+    }
+    if tc_claim_type_args(call_node, declared, name, help) == 0 { return tc_error_recovery_tid() }
+    let targs = node_type_params(call_node)
+    let first = resolve_type_ann(sublist_get(targs, 0))
+    if declared == 1 { return make_set_type(first) }
+    make_map_type(first, resolve_type_ann(sublist_get(targs, 1)))
+}
+
+// A call whose list no typing arm read has nothing the list could bind: a variant, a
+// builtin, or a method with no declaration behind it. Judged on the inference pass once the
+// call has a type, so a receiver an earlier walk could not resolve is not misjudged.
+fn tc_check_type_args_claimed(node: Int, tid: Int) ! Diag.Report {
+    if node == -1 || tc_boundary_check_active == 0 { return }
+    let k = node_kind(node)
+    if k != NodeKind.Call && k != NodeKind.MethodCall { return }
+    let targs = node_type_params(node)
+    if targs == -1 { return }
+    if (tc_type_args_claimed.get(node) ?? 0) != 0 { return }
+    if (tc_type_args_unresolved.get(node) ?? 0) != 0 { return }
+    if tc_tid_is_no_info(tid) != 0 {
+        tc_type_args_untyped.push(node)
+        return
+    }
+    tc_report_unclaimed_type_args(node)
+}
+
+// Reports what tc_check_type_args_claimed deferred and no later walk claimed, so a list that
+// binds nothing never reaches codegen without a report.
+fn tc_flush_untyped_type_args() ! Diag.Report {
+    for node in tc_type_args_untyped {
+        if (tc_type_args_claimed.get(node) ?? 0) == 0 { tc_report_unclaimed_type_args(node) }
+    }
+    tc_type_args_untyped = []
+}
+
+fn tc_report_unclaimed_type_args(node: Int) ! Diag.Report {
+    let k = node_kind(node)
+    tc_type_args_claimed.insert(node, 1)
+    let given = sublist_length(node_type_params(node))
+    tc_errors.push("type arguments nothing reads")
+    if k == NodeKind.Call && node_kind(node_left(node)) != NodeKind.Ident {
+        diag_error_at("CallSiteTypeArgs", CALL_SITE_TYPE_ARGS, "a function value expects 0 type argument(s), {given} given", node, ELEMENT_ACCESS_HELP)
+        return
+    }
+    diag_error_at("CallSiteTypeArgs", CALL_SITE_TYPE_ARGS, "this call expects 0 type argument(s), {given} given", node, "remove the brackets; this call's types come from its arguments and from where its result goes")
 }
 
 // The branch compare infer_type declined to make, made once both branches have been walked
@@ -21595,6 +21824,7 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
     // Last: every constraining use in the program has now run, so a deferred alias blame
     // whose metavar is still unbound is genuinely under-determined.
     tc_ud_flush_pending()
+    tc_flush_untyped_type_args()
     tc_boundary_check_active = prev_boundary
 }
 

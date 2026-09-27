@@ -1,16 +1,11 @@
-// A call may not carry its type arguments in brackets. `scope.alloc[U8]()` parses as a call
-// whose callee is an index expression, and nothing downstream reads that shape as a type
-// application, so the compiler used to accept the program and hand the bracketed source text
-// to the C compiler verbatim. A Blink diagnostic has to come first.
-//
-// The same bracket syntax over a VALUE is a real index — `fns[0]()` calls the closure at
-// index 0 and must keep checking clean. What separates the two is what the brackets hold: a
-// name that names a type and binds no value, versus anything else.
+// Brackets after a callee are its type-argument list (03_types.md:1297), so a call that
+// writes them checks clean. What the brackets hold is always read as a type: a value there is
+// an unknown type, and a list the callee has no parameters for is rejected before codegen.
 
 import std.fs
 import compiler.{compile_to_program}
 import typecheck.{check_types}
-import diagnostics.{diag_entries, diag_reset}
+import diagnostics.{diag_entries, diag_reset, diag_explain, CALL_SITE_TYPE_ARGS}
 import std.io
 
 fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
@@ -39,6 +34,15 @@ fn count_named(name: Str) -> Int {
     n
 }
 
+// Someone who wrote brackets after a value meant indexing, so each of these diagnostics must
+// name the repair that exists for that: element access through `.get(...)`.
+fn help_of(name: Str) -> Str {
+    for d in diag_entries {
+        if d.name == name { return d.help }
+    }
+    ""
+}
+
 fn report(label: Str) {
     let errs = error_messages()
     if errs.len() != 0 {
@@ -47,7 +51,7 @@ fn report(label: Str) {
     }
 }
 
-test "a method call carrying bracketed type arguments is reported" {
+test "a method call carrying bracketed type arguments is accepted" {
     typecheck_probe("build/tc_cs_targs_method.bl", #"import blink.ffi
 fn main() {
     with ffi.scope() as scope {
@@ -57,10 +61,10 @@ fn main() {
 }
 "#)
     report("method")
-    assert(count_named("CallSiteTypeArgs") == 1)
+    assert(error_messages().len() == 0)
 }
 
-test "a free function call carrying bracketed type arguments is reported" {
+test "a free function call carrying bracketed type arguments is accepted" {
     typecheck_probe("build/tc_cs_targs_free.bl", #"fn make[T]() -> Int { 0 }
 fn main() {
     let v = make[Int]()
@@ -68,7 +72,7 @@ fn main() {
 }
 "#)
     report("free fn")
-    assert(count_named("CallSiteTypeArgs") == 1)
+    assert(error_messages().len() == 0)
 }
 
 test "the same call typed from its annotation instead is accepted" {
@@ -85,7 +89,7 @@ fn main() {
     assert(error_messages().len() == 0)
 }
 
-test "calling the closure at an index is not a type application" {
+test "a literal in call brackets is a parse error that points at element access" {
     typecheck_probe("build/tc_cs_targs_index.bl", #"fn a() -> Int { 1 }
 fn b() -> Int { 2 }
 fn main() {
@@ -95,11 +99,13 @@ fn main() {
 }
 "#)
     report("index call")
+    assert(count_named("UnexpectedToken") == 1)
+    assert(count_named("UnknownType") == 0)
     assert(count_named("CallSiteTypeArgs") == 0)
-    assert(error_messages().len() == 0)
+    assert(help_of("UnexpectedToken").contains("`.get("))
 }
 
-test "a local shadowing a type name is still indexed as a value" {
+test "a type name in call brackets names the type even when a local shadows it" {
     typecheck_probe("build/tc_cs_targs_shadow.bl", #"type Slot { n: Int }
 fn a() -> Int { 1 }
 fn main() {
@@ -110,5 +116,15 @@ fn main() {
 }
 "#)
     report("shadowed type name")
-    assert(count_named("CallSiteTypeArgs") == 0)
+    assert(count_named("CallSiteTypeArgs") == 1)
+    assert(count_named("UnknownType") == 0)
+    assert(help_of("CallSiteTypeArgs").contains("`.get("))
+}
+
+test "the explanation describes the two forms the code still rejects" {
+    let text = diag_explain(CALL_SITE_TYPE_ARGS)
+    assert(text.contains("pair[Int]()"))
+    assert(text.contains("let g = probe[Int]"))
+    assert(!text.contains("open question"))
+    assert(!text.contains("fns[0]()"))
 }
