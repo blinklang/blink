@@ -1,0 +1,243 @@
+// sections/03_types.md:781, for Int and the sized integer types alike: "Arithmetic
+// overflow is checked by default. An operation that exceeds the type's range panics at
+// runtime with a descriptive message." The wrapping methods are the opt-in escape, and they are method calls, so they
+// never reach the operator seam at all.
+//
+// C gives no answer here. Signed overflow is undefined and unsigned overflow wraps
+// silently, so neither one panics on its own. The seam that lowers the operator declares
+// the result, asks the compiler's own checked builtin to compute it, and panics when the
+// builtin reports that the value did not fit.
+//
+// The result is declared rather than assigned because the builtin writes it through a
+// pointer. That is also why the check reads the declared name and the operator's value is
+// a read of it: the operator itself no longer appears.
+//
+// The range the builtin checks is the range of what it writes into, so one shape serves
+// every width. A narrow result declares a narrow type and is checked against it.
+
+import std.io
+import lower_test_helpers.{probe, rhs_of, shape, assert_kind, assert_eq_str, assert_shape, assert_verifies}
+import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid, ir_kind}
+import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
+import compiler.{compile_to_program}
+
+fn src() -> Str {
+    #"fn main() {
+    let a = 10
+    let b = 20
+    let plus = a + b
+    let minus = a - b
+    let times = a * b
+    let f = 1.5
+    let g = 2.5
+    let fadd = f + g
+    let byte: U8 = 200
+    let other: U8 = 3
+    let narrow_add = byte + other
+    let quot = a / b
+    let quot_one = a / -1
+    let neg = -a
+    let lo: I8 = -128
+    let unarrow = byte / other
+    let _keep = [plus, minus, times, quot, quot_one, neg]
+    let _keepl = [lo]
+    let _keepu = [unarrow]
+    let _keepn = [narrow_add]
+    let _keepf = [fadd]
+}
+"#
+}
+
+// The two statements a checked operator over two names hoists: the declaration of the
+// result, then the check that writes it.
+fn check_of(name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    probe("cg_expr_overflow", src())
+    let mark = cg_expr_pending_count()
+    let id = lower_expr(rhs_of(name))
+    let pre = cg_expr_take_pending(mark)
+    if pre.len() != 2 {
+        io.println("FAIL: {name}: hoisted {pre.len()} statements, want 2")
+    }
+    assert_eq(pre.len(), 2)
+    assert_eq_str("{name}: the result is declared and not initialised", shape(pre.get(0).unwrap()), "Let")
+    assert_shape("{name}: the operator's value is a read of the result", id, "VarRef")
+    let check = pre.get(1).unwrap()
+    assert_kind("{name}: check", check, IrKind.If)
+    assert_eq_str("{name}: check", shape(check),
+        "If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)))))")
+    assert_verifies("{name}: check verifies", check)
+    check
+}
+
+// The C type the check writes through. An IR id does not outlive its own probe, so the
+// answer is the spelling and not the node.
+fn decl_spelling_of(name: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    probe("cg_expr_overflow", src())
+    let mark = cg_expr_pending_count()
+    let _ = lower_expr(rhs_of(name))
+    let pre = cg_expr_take_pending(mark)
+    assert_eq(pre.len(), 2)
+    ir_c_spelling(pre.get(0).unwrap())
+}
+
+// The builtin the check calls.
+fn builtin_of(check: Int) -> Str {
+    ir_c_name(ir_kid(check, 0))
+}
+
+// What the panic says, before its arguments are substituted.
+fn said_of(check: Int) -> Str {
+    ir_c_name(ir_kid(ir_kid(ir_kid(ir_kid(check, 1), 0), 0), 0))
+}
+
+test "an addition declares its result, checks it, and reads it back" {
+    let check = check_of("plus")
+    assert_eq_str("the result is written through a pointer", shape(ir_kid(ir_kid(check, 0), 2)),
+        "Unary(VarRef)")
+    assert_eq_str("by address", ir_c_name(ir_kid(ir_kid(check, 0), 2)), "&")
+}
+
+test "the builtin the check calls names the operator it checks" {
+    let plus = builtin_of(check_of("plus"))
+    let minus = builtin_of(check_of("minus"))
+    let times = builtin_of(check_of("times"))
+    if !plus.contains("add") { io.println("FAIL: addition calls '{plus}'") }
+    assert(plus.contains("add"))
+    if !minus.contains("sub") { io.println("FAIL: subtraction calls '{minus}'") }
+    assert(minus.contains("sub"))
+    if !times.contains("mul") { io.println("FAIL: multiplication calls '{times}'") }
+    assert(times.contains("mul"))
+    assert(plus != minus)
+    assert(minus != times)
+}
+
+test "the third argument is the address of the very name the check declares" {
+    probe("cg_expr_overflow", src())
+    let mark = cg_expr_pending_count()
+    let _ = lower_expr(rhs_of("plus"))
+    let pre = cg_expr_take_pending(mark)
+    assert_eq(pre.len(), 2)
+    let decl = pre.get(0).unwrap()
+    let check = pre.get(1).unwrap()
+    let written = ir_kid(ir_kid(ir_kid(check, 0), 2), 0)
+    assert_eq_str("the check writes the name the declaration binds", ir_c_name(written), ir_c_name(decl))
+}
+
+test "the range checked is the range of the declared result, so a narrow type is narrow" {
+    let wide = decl_spelling_of("plus")
+    let narrow = decl_spelling_of("narrow_add")
+    assert(wide != narrow)
+    assert_eq_str("the wide result is declared as the operands are", wide, "int64_t")
+    assert_eq_str("the narrow result is declared narrow", narrow, "uint8_t")
+}
+
+test "the panic names the type, the operation and both operands" {
+    let said = said_of(check_of("plus"))
+    if !said.starts_with("\"panic: ") { io.println("FAIL: panic says '{said}'") }
+    assert(said.starts_with("\"panic: "))
+    if !said.contains(".bl:4") { io.println("FAIL: panic names no line: '{said}'") }
+    assert(said.contains(".bl:4"))
+    if !said.contains("Int") { io.println("FAIL: panic says '{said}'") }
+    assert(said.contains("Int"))
+    if !said.contains("overflow") { io.println("FAIL: panic says '{said}'") }
+    assert(said.contains("overflow"))
+    if !said.contains("addition") { io.println("FAIL: panic says '{said}'") }
+    assert(said.contains("addition"))
+    if !said.contains("%lld") { io.println("FAIL: panic says '{said}'") }
+    assert(said.contains("%lld"))
+    let narrow_said = said_of(check_of("narrow_add"))
+    if !narrow_said.contains("U8") { io.println("FAIL: narrow panic says '{narrow_said}'") }
+    assert(narrow_said.contains("U8"))
+    if !narrow_said.contains("%llu") { io.println("FAIL: narrow panic says '{narrow_said}'") }
+    assert(narrow_said.contains("%llu"))
+}
+
+test "a float addition has no range to exceed, so it carries no check" {
+    probe("cg_expr_overflow", src())
+    let mark = cg_expr_pending_count()
+    let fadd = lower_expr(rhs_of("fadd"))
+    assert_eq(cg_expr_pending_count(), mark)
+    assert_shape("float addition prints as the operator", fadd, "Binary(VarRef, VarRef)")
+}
+
+// A signed quotient leaves its range at one point only, the minimum over -1. The divisor
+// is tested for zero first, then the pair is tested for that point.
+test "a signed division tests the divisor for zero and then the minimum over -1" {
+    probe("cg_expr_overflow", src())
+    let mark = cg_expr_pending_count()
+    let quot = lower_expr(rhs_of("quot"))
+    let pre = cg_expr_take_pending(mark)
+    if pre.len() != 2 { io.println("FAIL: signed division hoisted {pre.len()} statements, want 2") }
+    assert_eq(pre.len(), 2)
+    assert_eq_str("the divisor is tested for zero", shape(pre.get(0).unwrap()),
+        "If(Binary(VarRef, Const), Block(Panic(CallRuntime(Const))))")
+    let pair = pre.get(1).unwrap()
+    assert_eq_str("the pair is tested for the minimum over -1", shape(pair),
+        "If(Binary(Binary(VarRef, Const), Binary(VarRef, Const)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)))))")
+    assert_eq_str("the minimum is the type's own", ir_c_name(ir_kid(ir_kid(ir_kid(pair, 0), 0), 1)), "INT64_MIN")
+    assert_eq_str("the divisor", ir_c_name(ir_kid(ir_kid(ir_kid(pair, 0), 1), 1)), "-1")
+    let said = said_of(pair)
+    if !said.contains("Int overflow in division") { io.println("FAIL: pair panic says '{said}'") }
+    assert(said.contains("Int overflow in division"))
+    assert_verifies("the pair verifies", pair)
+    assert_shape("the operator still divides", quot, "Binary(VarRef, VarRef)")
+    assert_kind("no call replaces it", quot, IrKind.Binary)
+}
+
+test "a division by a literal -1 needs only the minimum test" {
+    probe("cg_expr_overflow", src())
+    let mark = cg_expr_pending_count()
+    let quot = lower_expr(rhs_of("quot_one"))
+    let pre = cg_expr_take_pending(mark)
+    if pre.len() != 2 { io.println("FAIL: division by -1 hoisted {pre.len()} statements, want 2") }
+    assert_eq(pre.len(), 2)
+    assert_eq_str("the literal is held once", shape(pre.get(0).unwrap()), "Let(Const)")
+    assert_eq_str("only the pair is tested", shape(pre.get(1).unwrap()),
+        "If(Binary(Binary(VarRef, Const), Binary(VarRef, Const)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)))))")
+    assert_shape("the operator still divides", quot, "Binary(VarRef, VarRef)")
+}
+
+test "an unsigned division has no minimum to pass, so only the divisor is tested" {
+    probe("cg_expr_overflow", src())
+    let mark = cg_expr_pending_count()
+    let quot = lower_expr(rhs_of("unarrow"))
+    let pre = cg_expr_take_pending(mark)
+    assert_eq(pre.len(), 1)
+    assert_eq_str("the divisor is tested for zero", shape(pre.get(0).unwrap()),
+        "If(Binary(VarRef, Const), Block(Panic(CallRuntime(Const))))")
+    let said = said_of(pre.get(0).unwrap())
+    if !said.contains("U8 division by zero") { io.println("FAIL: division panic says '{said}'") }
+    assert(said.contains("U8 division by zero"))
+    assert_shape("the operator still divides", quot, "Binary(VarRef, VarRef)")
+}
+
+test "a negation checks zero minus the operand into a declared result" {
+    probe("cg_expr_overflow", src())
+    let mark = cg_expr_pending_count()
+    let neg = lower_expr(rhs_of("neg"))
+    let pre = cg_expr_take_pending(mark)
+    assert_eq(pre.len(), 2)
+    assert_eq_str("the result is declared", shape(pre.get(0).unwrap()), "Let")
+    let check = pre.get(1).unwrap()
+    assert_eq_str("the check", shape(check),
+        "If(CallRuntime(Const, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef)))))")
+    assert_eq_str("subtraction from zero", builtin_of(check), "__builtin_sub_overflow")
+    let said = said_of(check)
+    if !said.contains("Int overflow in negation") { io.println("FAIL: negation panic says '{said}'") }
+    assert(said.contains("Int overflow in negation"))
+    assert_verifies("the check verifies", check)
+    assert_shape("the value is a read of the result", neg, "VarRef")
+}
+
+test "a negative literal is one constant, so a minimum is a value and not a negation" {
+    probe("cg_expr_overflow", src())
+    let mark = cg_expr_pending_count()
+    let lo = lower_expr(rhs_of("lo"))
+    assert_eq(cg_expr_pending_count(), mark)
+    assert_kind("a constant", lo, IrKind.Const)
+    assert_eq_str("spelled as the negative number", ir_c_name(lo), "-128")
+}
+
+fn main() {
+    io.println("cg_expr overflow guards")
+}

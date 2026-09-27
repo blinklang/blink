@@ -12,6 +12,10 @@
 // A literal the front end has already judged carries no guard: it refuses a shift whose
 // amount is an integer literal out of range, and a division by a non-zero literal cannot
 // fault.
+//
+// Integer addition is checked too (sections/03_types.md:781), so the row for an operation
+// with no guard adds two Floats. A signed division also tests the minimum over -1, after
+// the zero test.
 
 import std.io
 import lower_test_helpers.{probe, rhs_of, shape, assert_kind, assert_eq_str, assert_shape, assert_verifies}
@@ -27,7 +31,9 @@ fn main() {
     let b = zero()
     let q = a / b
     let r = a % b
-    let sum = a + b
+    let fa = 1.5
+    let fb = 2.5
+    let sum = fa + fb
     let by_three = a / 3
     let from_call = a / zero()
     let amt = amount(70)
@@ -38,29 +44,45 @@ fn main() {
     let step: U8 = 3
     let narrow = byte / step
     let narrow_shift = byte << amt
-    let _keep = [q, r, sum, by_three, from_call, left, right, inline_shift]
+    let _keep = [q, r, by_three, from_call, left, right, inline_shift]
     let _keep2 = [narrow, narrow_shift]
+    let _keep3 = [sum]
 }
 "#
 }
 
-// The one statement a guarded operator over two names hoists.
-fn guard_of(name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+fn min_guard_shape() -> Str {
+    "If(Binary(Binary(VarRef, Const), Binary(VarRef, Const)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)))))"
+}
+
+// The statements a guarded operator over two names hoists, `want` of them: the operand
+// test first, then for a signed division the minimum over -1. The first is answered.
+fn guard_of(name: Str, want: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     probe("cg_expr_arith", src())
     let mark = cg_expr_pending_count()
     let id = lower_expr(rhs_of(name))
     let pre = cg_expr_take_pending(mark)
     assert_eq_str("{name}: operator reads two names", shape(id), "Binary(VarRef, VarRef)")
     assert_verifies("{name}: operator verifies", id)
-    if pre.len() != 1 {
-        io.println("FAIL: {name}: hoisted {pre.len()} statements, want 1")
+    if pre.len() != want {
+        io.println("FAIL: {name}: hoisted {pre.len()} statements, want {want}")
     }
-    assert_eq(pre.len(), 1)
+    assert_eq(pre.len(), want)
     let guard = pre.get(0).unwrap()
     assert_kind("{name}: guard", guard, IrKind.If)
-    assert_eq_str("{name}: guard", shape(guard), "If(Binary(VarRef, Const), Block(Panic(Const)))")
+    assert_eq_str("{name}: guard", shape(guard), "If(Binary(VarRef, Const), Block(Panic(CallRuntime(Const))))")
     assert_verifies("{name}: guard verifies", guard)
+    if want == 2 { assert_min_guard(name, pre.get(1).unwrap()) }
     guard
+}
+
+// The second test of a signed division: `left == MIN && right == -1`, and its panic.
+fn assert_min_guard(name: Str, pair: Int) {
+    assert_eq_str("{name}: minimum guard", shape(pair), min_guard_shape())
+    assert_verifies("{name}: minimum guard verifies", pair)
+    let said = said_of(pair)
+    if !said.contains("Int overflow in division") { io.println("FAIL: {name}: minimum panic says '{said}'") }
+    assert(said.contains("Int overflow in division"))
 }
 
 // The literal the guard's test compares the operand against.
@@ -68,45 +90,49 @@ fn bound_of(guard: Int) -> Str {
     ir_c_name(ir_kid(ir_kid(guard, 0), 1))
 }
 
-// What the panic says.
+// What the panic says: the format the panic's message call is given.
 fn said_of(guard: Int) -> Str {
-    ir_c_name(ir_kid(ir_kid(ir_kid(guard, 1), 0), 0))
+    ir_c_name(ir_kid(ir_kid(ir_kid(ir_kid(guard, 1), 0), 0), 0))
 }
 
 test "a division by a value tests the divisor before dividing" {
-    let guard = guard_of("q")
+    let guard = guard_of("q", 2)
     assert_eq_str("compared for equality", ir_c_name(ir_kid(guard, 0)), "==")
     assert_eq_str("against zero", bound_of(guard), "0")
 }
 
 test "a remainder by a value tests the divisor too" {
-    let guard = guard_of("r")
+    let guard = guard_of("r", 1)
     assert_eq_str("compared for equality", ir_c_name(ir_kid(guard, 0)), "==")
     assert_eq_str("against zero", bound_of(guard), "0")
 }
 
 test "a shift tests the amount against the width of the left operand" {
-    let left = guard_of("left")
+    let left = guard_of("left", 1)
     assert_eq_str("compared for reach", ir_c_name(ir_kid(left, 0)), ">=")
     assert_eq_str("against the width of Int", bound_of(left), "64")
-    let right = guard_of("right")
+    let right = guard_of("right", 1)
     assert_eq_str("against the width of Int", bound_of(right), "64")
 }
 
 test "the width in a shift test is the left operand's own, not always 64" {
-    assert_eq_str("U8 shift bounded by 8", bound_of(guard_of("narrow_shift")), "8")
-    assert_eq_str("U8 division still compared to zero", bound_of(guard_of("narrow")), "0")
+    assert_eq_str("U8 shift bounded by 8", bound_of(guard_of("narrow_shift", 1)), "8")
+    assert_eq_str("U8 division still compared to zero", bound_of(guard_of("narrow", 1)), "0")
 }
 
 test "the panic names the operation, so the message is not a bare abort" {
-    let said = said_of(guard_of("q"))
-    if !said.contains("division by zero") { io.println("FAIL: divide panic says '{said}'") }
-    assert(said.contains("division by zero"))
-    let shift_said = said_of(guard_of("left"))
+    let said = said_of(guard_of("q", 2))
+    if !said.contains("Int division by zero at ") { io.println("FAIL: divide panic says '{said}'") }
+    assert(said.contains("Int division by zero at "))
+    if !said.contains(".bl:6") { io.println("FAIL: divide panic names no line: '{said}'") }
+    assert(said.contains(".bl:6"))
+    let shift_said = said_of(guard_of("left", 1))
     if !shift_said.contains("shift amount") { io.println("FAIL: shift panic says '{shift_said}'") }
     assert(shift_said.contains("shift amount"))
     if !shift_said.contains("0..63") { io.println("FAIL: shift panic says '{shift_said}'") }
     assert(shift_said.contains("0..63"))
+    if !shift_said.contains(".bl:14") { io.println("FAIL: shift panic names no line: '{shift_said}'") }
+    assert(shift_said.contains(".bl:14"))
 }
 
 test "an operand that is not a name is bound before the guard runs" {
@@ -114,11 +140,13 @@ test "an operand that is not a name is bound before the guard runs" {
     let mark = cg_expr_pending_count()
     let id = lower_expr(rhs_of("from_call"))
     let pre = cg_expr_take_pending(mark)
-    assert_eq(pre.len(), 2)
+    assert_eq(pre.len(), 3)
     assert_eq_str("the call is bound first", shape(pre.get(0).unwrap()), "Let(CallDirect)")
     assert_kind("then the guard", pre.get(1).unwrap(), IrKind.If)
+    assert_eq_str("the zero test comes first", bound_of(pre.get(1).unwrap()), "0")
     assert_eq_str("the operator reads the temp", shape(id), "Binary(VarRef, VarRef)")
     assert_verifies("guard verifies", pre.get(1).unwrap())
+    assert_min_guard("from_call", pre.get(2).unwrap())
 }
 
 test "an operation C cannot fault on carries no guard and no temps" {
@@ -126,7 +154,7 @@ test "an operation C cannot fault on carries no guard and no temps" {
     let mark = cg_expr_pending_count()
     let sum = lower_expr(rhs_of("sum"))
     assert_eq(cg_expr_pending_count(), mark)
-    assert_shape("addition prints inline", sum, "Binary(VarRef, VarRef)")
+    assert_shape("a float addition prints inline", sum, "Binary(VarRef, VarRef)")
     let by_three = lower_expr(rhs_of("by_three"))
     assert_eq(cg_expr_pending_count(), mark)
     assert_shape("division by a non-zero literal prints inline", by_three, "Binary(VarRef, Const)")

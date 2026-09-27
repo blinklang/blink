@@ -58,7 +58,7 @@ import cg_expr.{
     cg_expr_is_registered, cg_expr_pending_count,
     cg_expr_push_pending, cg_expr_register_value, cg_expr_set_return_type,
     cg_expr_take_pending, cg_expr_value_count, lower_expr,
-    x_layout_checked, x_stopped, x_unbox_payload,
+    x_layout_checked, x_stopped, x_unbox_payload, ArithSite, lower_arith_operator,
 }
 import cg_eff.{
     cg_eff_async_scope_exit_symbol, cg_eff_binder_is_shared, cg_eff_block_handler_calls,
@@ -191,14 +191,30 @@ fn lower_value(node: Int) -> Int ! Diag.Report {
 // scope it opens and closes is never bound into, because a global reads no local binder,
 // but every other entry point pushes and pops one and this keeps the stack symmetric with
 // them.
-pub fn lower_global_init(node: Int) -> Int ! Diag.Report {
+pub fn lower_global_init(g: Int) -> Int ! Diag.Report {
     let _ = open_scope()
     let saved_fn_name = cs_current_fn_name
     cs_current_fn_name = "<module init>"
-    let value = lower_value(node)
+    let mark = cg_expr_pending_count()
+    let value = lower_value(node_value(g))
+    let hoisted = cg_expr_take_pending(mark)
     cs_current_fn_name = saved_fn_name
     close_scope()
-    value
+    if hoisted.len() == 0 { return value }
+    lower_global_assign(g, hoisted, value)
+}
+
+// A checked initializer needs statements ahead of its value, and a C global's own
+// definition line has no room for them. They run in the init function instead, with the
+// assignment they feed, so the global is set in declaration order like any other.
+fn lower_global_assign(g: Int, hoisted: List[Int], value: Int) -> Int ! Diag.Report {
+    let tid = stmt_tid(g)
+    if tid < 0 { return -1 }
+    let rec = layout_at(tid, Position.Local, g)
+    let target = ir_global_ref(tid, g, rec.c_spelling, c_global_name(g), rec.slot_form)
+    let mut stmts = hoisted
+    stmts.push(ir_assign(g, target, value))
+    ir_block(g, stmts)
 }
 
 // ── The stop ──────────────────────────────────────────────────────────────
@@ -1372,10 +1388,12 @@ fn lower_compound_assign(node: Int) -> Int ! Diag.Report {
     }
     let tid = stmt_tid(target)
     if tid < 0 { return -1 }
-    let rec = layout_at(tid, Position.Local, node)
     let lhs = lower_target(target)
     let read = lower_target(target)
-    let sum = ir_binary(tid, node, rec.c_spelling, node_op(node), read, lower_value(node_value(node)))
+    // The same seam as the operator, so `x += 1` is checked wherever `x + 1` is.
+    let site = ArithSite { node: node, op: node_op(node), tid: tid, lhs_node: target, rhs_node: node_value(node) }
+    let sum = lower_arith_operator(site, read, lower_value(node_value(node)))
+    if sum < 0 { return -1 }
     ir_assign(node, lhs, sum)
 }
 
@@ -3680,21 +3698,16 @@ fn guarded_arm_block(ctx: MatchCtx, arm: Int, guard: Int, extra: List[Int]) -> I
         return -1
     }
     inner.push(body)
-    // The guard is read only once this arm's pattern matched. A statement the guard needed
-    // has no place in this arm's block either: the block is reached after the pattern test,
-    // but the statements would have to stand above the guard's own `if`, and the enclosing
-    // block is what takes them, which puts them above the whole match. There they run for
-    // arms that never match, and the guard of one arm would read a temp another arm filled.
+    // A statement the guard needs runs in this arm's block, after the binders and ahead of
+    // the guard's `if`. Left to the enclosing block it would run above the whole match, for
+    // arms that never match, before the binders it reads exist.
     let mark = cg_expr_pending_count()
     let tested = lower_value(guard)
     let hoisted = cg_expr_take_pending(mark)
-    if hoisted.len() > 0 {
-        close_scope()
-        diag_ice_at("HoistOutOfMatchGuard", CODEGEN_STAGE_NOT_BUILT,
-            "this match guard needs a statement run before it, and there it would run for arms that never match",
-            guard,
-            "a guard that needs a temp has no lowering yet; bind the value in a let above the match and test that")
-        return -1
+    let mut h = 0
+    while h < hoisted.len() {
+        out.push(hoisted.get(h).unwrap())
+        h = h + 1
     }
     out.push(ir_if(arm, tested, ir_block(arm, inner), -1))
     close_scope()

@@ -21,10 +21,10 @@
 import std.io
 import diagnostics.{diag_reset}
 import mono.{run_mono}
-import parser.{nodes, node_body, node_kind, node_name}
+import parser.{nodes, node_body, node_kind, node_name, node_op, node_value_child_ids}
 import ast.{NodeKind}
 import layout.{layout_reset}
-import ir.{ir_c_name, ir_c_spelling, ir_kid, ir_kid_count, ir_kind, ir_reset, IrKind}
+import ir.{ir_c_name, ir_c_spelling, ir_kid, ir_kid_count, ir_kind, ir_reset, ir_span, IrKind}
 import cg_test_helpers.{cg_probe_compile}
 import cg_stmt.{cg_stmt_reset, lower_block, lower_fn}
 import cg_call.{cg_call_element_from_runtime}
@@ -100,19 +100,36 @@ fn spelling_of_let(id: Int, name: Str) -> Str {
     ""
 }
 
-// Every runtime symbol this tree calls, in call order.
-fn runtime_symbols(id: Int) -> List[Str] {
+// Every runtime symbol the walk calls, in call order. The body's own `+` is checked per
+// sections/03_types.md:781, so its overflow test is left out, found by that operator's
+// node and no other: a walk call can never hide behind it, and each check must be there.
+fn runtime_symbols(id: Int, fn_name: Str) -> List[Str] {
+    let operators: List[Int] = []
+    collect_adds(find_fn(fn_name), operators)
+    assert(operators.len() > 0)
+    let skipped: List[Int] = []
     let mut out: List[Str] = []
-    collect_runtime_symbols(id, out)
+    collect_runtime_symbols(id, operators, skipped, out)
+    assert_eq_str("checks left out", "{skipped.len()}", "{operators.len()}")
     out
 }
 
-fn collect_runtime_symbols(id: Int, out: List[Str]) {
+fn collect_adds(node: Int, out: List[Int]) {
+    if node < 0 { return }
+    if node_kind(node) == NodeKind.BinOp && node_op(node) == "+" { out.push(node) }
+    for kid in node_value_child_ids(node) { collect_adds(kid, out) }
+}
+
+fn collect_runtime_symbols(id: Int, operators: List[Int], skipped: List[Int], out: List[Str]) {
     if id < 0 { return }
+    if ir_kind(id) == IrKind.If && operators.contains(ir_span(id)) {
+        skipped.push(id)
+        return
+    }
     if ir_kind(id) == IrKind.CallRuntime { out.push(ir_c_name(id)) }
     let mut i = 0
     while i < ir_kid_count(id) {
-        collect_runtime_symbols(ir_kid(id, i), out)
+        collect_runtime_symbols(ir_kid(id, i), operators, skipped, out)
         i = i + 1
     }
 }
@@ -154,13 +171,13 @@ fn src_list_sum() -> Str {
 test "a for-in over a list reads the container and its length once, then indexes per turn" {
     let body = probe_fn("cg_stmt_for_in_list", src_list_sum(), "sum")
     assert_shape("loop shape", body,
-        "Block(Let(Const), Block(Let(VarRef), Let(CallRuntime(VarRef)), Let(Const), Loop(Block(Assign(VarRef, Binary(VarRef, Const)), If(Binary(VarRef, VarRef), Block(Break)), Let(Cast(Cast(CallRuntime(VarRef, VarRef)))), Block(Assign(VarRef, Binary(VarRef, VarRef)))))), Return(VarRef))")
+        "Block(Let(Const), Block(Let(VarRef), Let(CallRuntime(VarRef)), Let(Const), Loop(Block(Assign(VarRef, Binary(VarRef, Const)), If(Binary(VarRef, VarRef), Block(Break)), Let(Cast(Cast(CallRuntime(VarRef, VarRef)))), Block(Let, If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef))))), Assign(VarRef, VarRef))))), Return(VarRef))")
     assert_eq_str("refusals recorded", "{ice_count()}", "0")
 }
 
 test "the loop calls the length and element entry points the producer names" {
     let body = probe_fn("cg_stmt_for_in_symbols", src_list_sum(), "sum")
-    assert_eq_str("runtime calls", runtime_symbols(body).join(", "),
+    assert_eq_str("runtime calls", runtime_symbols(body, "sum").join(", "),
         "blink_list_len, blink_list_get")
 }
 
@@ -206,7 +223,7 @@ test "an inline list literal is walked the same way as a list a name holds" {
 }
 "#, "run")
     assert_verifies("literal loop", body)
-    assert_eq_str("runtime calls", runtime_symbols(body).join(", "),
+    assert_eq_str("runtime calls", runtime_symbols(body, "run").join(", "),
         "blink_list_len, blink_list_get")
     assert_eq_str("refusals recorded", "{ice_count()}", "0")
 }
@@ -334,7 +351,7 @@ test "a range still lowers with no runtime call of any kind" {
     n
 }
 "#, "count")
-    assert_eq_str("runtime calls", runtime_symbols(body).join(", "), "")
+    assert_eq_str("runtime calls", runtime_symbols(body, "count").join(", "), "")
     assert_eq_str("refusals recorded", "{ice_count()}", "0")
 }
 
@@ -386,7 +403,7 @@ test "a for-in over a set materializes to a list, then reads that by position" {
 }
 "#, "run")
     assert_verifies("set loop", body)
-    assert_eq_str("runtime calls", runtime_symbols(body).join(", "),
+    assert_eq_str("runtime calls", runtime_symbols(body, "run").join(", "),
         "blink_set_to_list, blink_list_len, blink_list_get")
     assert_eq_str("refusals recorded", "{ice_count()}", "0")
 }
@@ -404,7 +421,7 @@ test "a for-in over a map materializes keys and values, paired by position" {
 }
 "#, "run")
     assert_verifies("map loop", body)
-    assert_eq_str("runtime calls", runtime_symbols(body).join(", "),
+    assert_eq_str("runtime calls", runtime_symbols(body, "run").join(", "),
         "blink_map_keys, blink_map_values, blink_list_len, blink_list_get, blink_list_get")
     assert_eq_str("refusals recorded", "{ice_count()}", "0")
 }
@@ -421,7 +438,7 @@ test "a for-in over a bytes value reads by position through bytes_len/bytes_get"
 }
 "#, "run")
     assert_verifies("bytes loop", body)
-    assert_eq_str("runtime calls", runtime_symbols(body).join(", "),
+    assert_eq_str("runtime calls", runtime_symbols(body, "run").join(", "),
         "blink_bytes_len, blink_bytes_get")
     assert_eq_str("refusals recorded", "{ice_count()}", "0")
 }
@@ -438,7 +455,7 @@ test "a for-in over a channel drains by receive, with no length call at all" {
 }
 "#, "run")
     assert_verifies("channel loop", body)
-    assert_eq_str("runtime calls", runtime_symbols(body).join(", "), "blink_channel_recv")
+    assert_eq_str("runtime calls", runtime_symbols(body, "run").join(", "), "blink_channel_recv")
     assert_eq_str("refusals recorded", "{ice_count()}", "0")
 }
 

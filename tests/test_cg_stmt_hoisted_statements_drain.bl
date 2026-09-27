@@ -22,7 +22,7 @@ import ir.{ir_reset}
 import cg_test_helpers.{cg_probe_compile}
 import cg_stmt.{cg_stmt_reset, lower_block, lower_fn}
 import cg_expr.{cg_expr_reset, cg_expr_pending_count}
-import lower_test_helpers.{shape, assert_eq_str, assert_ice_saying}
+import lower_test_helpers.{shape, assert_eq_str}
 
 fn find_fn(name: Str) -> Int {
     let mut i = 0
@@ -91,14 +91,12 @@ fn src_try_in_carrier_fn() -> Str {
 
 test "a `?` lowers because the statement stage handed over the return type" {
     let body = probe_fn("cg_stmt_try_return_type", src_try_in_carrier_fn(), "pick")
-    let want = "Block(Let(VarRef), If(Binary(CarrierTag(VarRef), Const), Block(Return(CarrierWrap(Const)))), Let(CarrierUnwrap(VarRef)), Return(CarrierWrap(Const, Binary(VarRef, Const))))"
+    let want = "Block(Let(VarRef), If(Binary(CarrierTag(VarRef), Const), Block(Return(CarrierWrap(Const)))), Let(CarrierUnwrap(VarRef)), Let(Const), Let, If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef))))), Return(CarrierWrap(Const, VarRef)))"
     assert_eq_str("try shape", shape(body), want)
 }
 
-// Two places read a value more than once, or read it only on one path, so a statement the
-// value needed cannot stand in the enclosing block. Each refuses by name until it gets a
-// lowering of its own. The body block is lowered directly here because lower_fn answers an
-// empty block on a stop, which would hide the refusal these tests are about.
+// The body block is lowered directly here because lower_fn answers an empty block on a
+// stop, which would hide a refusal behind a shape mismatch.
 fn probe_body(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     let path = "build/{stem}_probe.bl"
     let program = cg_probe_compile(path, src)
@@ -168,11 +166,14 @@ test "the statements a braceless arm body hoisted land in that arm's own block" 
 // that reads them, so every turn refills the temp before the guard tests it.
 test "a loop test that needs a statement hoists into the loop body ahead of the guard" {
     let body = probe_fn("cg_stmt_loop_test_hoisted", src_hoisting_loop_test(), "main")
-    let want = "Block(Let(CarrierWrap(Const)), Let(Const), Loop(Block(Let(VarRef), Let, If(Binary(CarrierTag(VarRef), Const), Block(Assign(VarRef, CarrierUnwrap(VarRef))), Block(Assign(VarRef, Const))), If(Binary(VarRef, Const), Block(Break)), Block(Assign(VarRef, Binary(VarRef, Const))))), Let(ContainerNew(Cast(Cast(VarRef)))))"
+    let want = "Block(Let(CarrierWrap(Const)), Let(Const), Loop(Block(Let(VarRef), Let, If(Binary(CarrierTag(VarRef), Const), Block(Assign(VarRef, CarrierUnwrap(VarRef))), Block(Assign(VarRef, Const))), If(Binary(VarRef, Const), Block(Break)), Block(Let(Const), Let, If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef))))), Assign(VarRef, VarRef)))), Let(ContainerNew(Cast(Cast(VarRef)))))"
     assert_eq_str("block shape", shape(body), want)
 }
 
-test "a match guard that needs a statement refuses instead of hoisting above the match" {
-    let got = probe_body("cg_stmt_match_guard_hoist", src_hoisting_match_guard(), "main")
-    assert_ice_saying("match guard", got, "HoistOutOfMatchGuard", "run for arms that never match")
+// The guard reads the arm's binders and must not run for arms that never match, so the
+// statements it needs land in the arm's block after the binders, ahead of the guard's `if`.
+test "a match guard that needs a statement hoists into its arm ahead of the guard" {
+    let body = probe_body("cg_stmt_match_guard_hoist", src_hoisting_match_guard(), "main")
+    let want = "Block(Let(CarrierWrap(Const)), Let(CarrierWrap(Const, Const)), Let(Const), Block(Let(VarRef), Let(Const), If(Binary(Binary(VarRef, Const), Binary(CarrierTag(VarRef), Const)), Block(Let(CarrierUnwrap(VarRef)), Let(VarRef), Let, If(Binary(CarrierTag(VarRef), Const), Block(Assign(VarRef, CarrierUnwrap(VarRef))), Block(Assign(VarRef, Const))), If(VarRef, Block(Assign(VarRef, Const), Block(Assign(VarRef, VarRef)))))), If(Binary(VarRef, Const), Block(Assign(VarRef, Const), Block(Assign(VarRef, Const)))), If(Binary(VarRef, Const), Block(Unreachable))), Let(ContainerNew(Cast(Cast(VarRef)))))"
+    assert_eq_str("guard shape", shape(body), want)
 }
