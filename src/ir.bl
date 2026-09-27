@@ -37,7 +37,7 @@ pub type IrKind {
     FieldGet, FieldSet, StructNew, TupleNew, EnumNew, ContainerNew, ContainerSpread,
     Box, Unbox, SizedAlloc, HeapAlloc, CarrierWrap, CarrierUnwrap, CarrierTag, CellRef,
     CallDirect, CallIndirect, CallClosure, CallVirtual, CallRuntime,
-    ClosureNew, EvidenceVector, EvidenceAddress, ArenaTarget, EffectPerform, HandlerInstall,
+    ClosureNew, EvidenceVector, EvidenceAddress, ArenaTarget, PromoteCtx, EffectPerform, HandlerInstall,
     Let, CellLet, VolatileLet, Assign, ExprStmt, Return, If, Loop, Break, Continue, Block, Switch, WithScope,
     Panic, Unreachable, PanicCatch, PanicCatchExit,
 }
@@ -185,8 +185,8 @@ pub fn ir_all_kinds() -> List[IrKind] {
         IrKind.ContainerSpread, IrKind.Box, IrKind.Unbox, IrKind.SizedAlloc, IrKind.HeapAlloc,
         IrKind.CarrierWrap, IrKind.CarrierUnwrap, IrKind.CarrierTag, IrKind.CellRef,
         IrKind.CallDirect, IrKind.CallIndirect, IrKind.CallClosure, IrKind.CallVirtual, IrKind.CallRuntime,
-        IrKind.ClosureNew, IrKind.EvidenceVector, IrKind.EvidenceAddress, IrKind.ArenaTarget, IrKind.EffectPerform,
-        IrKind.HandlerInstall,
+        IrKind.ClosureNew, IrKind.EvidenceVector, IrKind.EvidenceAddress, IrKind.ArenaTarget, IrKind.PromoteCtx,
+        IrKind.EffectPerform, IrKind.HandlerInstall,
         IrKind.Let, IrKind.CellLet, IrKind.VolatileLet, IrKind.Assign, IrKind.ExprStmt, IrKind.Return, IrKind.If, IrKind.Loop,
         IrKind.Break, IrKind.Continue, IrKind.Block, IrKind.Switch, IrKind.WithScope,
         IrKind.Panic, IrKind.Unreachable, IrKind.PanicCatch, IrKind.PanicCatchExit,
@@ -226,6 +226,7 @@ pub fn ir_kind_name(kind: IrKind) -> Str {
         IrKind.EvidenceVector => "EvidenceVector"
         IrKind.EvidenceAddress => "EvidenceAddress"
         IrKind.ArenaTarget => "ArenaTarget"
+        IrKind.PromoteCtx => "PromoteCtx"
         IrKind.EffectPerform => "EffectPerform"
         IrKind.HandlerInstall => "HandlerInstall"
         IrKind.Let => "Let"
@@ -380,6 +381,7 @@ fn kind_max_kids(kind: IrKind) -> Int {
         IrKind.EvidenceVector => 0
         IrKind.EvidenceAddress => 1
         IrKind.ArenaTarget => 0
+        IrKind.PromoteCtx => 1
         IrKind.HandlerInstall => 2
         IrKind.Let => 1
         IrKind.VolatileLet => 1
@@ -513,10 +515,11 @@ pub fn ir_box(tid: Int, span: Int, c_spelling: Str, pointee_spelling: Str, value
     ir_new(IrKind.Box, tid, span, c_spelling, pointee_spelling, SlotForm.PointerBoxed, [value])
 }
 
-// A box allocated in the arena `target` names (the GC heap when it is NULL) instead of the
-// current arena: a promotion walker's copies must not land in the arena that is dying.
-pub fn ir_box_into(tid: Int, span: Int, c_spelling: Str, pointee_spelling: Str, value: Int, target: Int) -> Int {
-    ir_new(IrKind.Box, tid, span, c_spelling, pointee_spelling, SlotForm.PointerBoxed, [value, target])
+// A box allocated in the target of the promotion `ctx` names (the GC heap when it is NULL)
+// instead of the current arena: a promotion walker's copies must not land in the arena that
+// is dying.
+pub fn ir_box_into(tid: Int, span: Int, c_spelling: Str, pointee_spelling: Str, value: Int, ctx: Int) -> Int {
+    ir_new(IrKind.Box, tid, span, c_spelling, pointee_spelling, SlotForm.PointerBoxed, [value, ctx])
 }
 
 pub fn ir_unbox(tid: Int, span: Int, c_spelling: Str, slot_form: SlotForm, ptr: Int) -> Int {
@@ -588,6 +591,18 @@ pub fn ir_closure_new(tid: Int, span: Int, c_spelling: Str, fn_symbol: Str, capt
 // type, so like the evidence vector its tid is -1. NULL at run time means the GC heap.
 pub fn ir_arena_target(span: Int, c_name: Str) -> Int {
     ir_new(IrKind.ArenaTarget, -1, span, "blink_arena_t*", c_name, SlotForm.InlineWord, [])
+}
+
+// One promotion: where its copies go, which arenas are closing, and the records it has
+// already copied, so a cell or closure two captures share is copied once. A boundary makes
+// one from the ArenaTarget it copies into; a walker reads the one it was handed, its
+// parameter c_name. Like the ArenaTarget it has no Blink type.
+pub fn ir_promote_ctx(span: Int, target: Int) -> Int {
+    ir_new(IrKind.PromoteCtx, -1, span, "blink_promote_ctx*", "", SlotForm.InlineWord, [target])
+}
+
+pub fn ir_promote_ctx_param(span: Int, c_name: Str) -> Int {
+    ir_new(IrKind.PromoteCtx, -1, span, "blink_promote_ctx*", c_name, SlotForm.InlineWord, [])
 }
 
 // The evidence vector in scope: the `blink_ev*` parameter of an effectful function
@@ -947,6 +962,9 @@ fn verify_fields(id: Int, kind: IrKind, label: Str, errs: List[Str]) {
         }
     } else if kind == IrKind.ArenaTarget {
         if ir_tid(id) >= 0 { errs.push("{label}: carries tid {ir_tid(id)}, an arena pointer has no Blink type") }
+    } else if kind == IrKind.PromoteCtx {
+        if ir_tid(id) >= 0 { errs.push("{label}: carries tid {ir_tid(id)}, a promotion context has no Blink type") }
+        if ir_kid_count(id) == 0 && ir_c_name(id) == "" { errs.push("{label}: a context with no target names no parameter") }
     } else if ir_kind_is_value(kind) && ir_tid(id) < 0 {
         errs.push("{label}: value node without a tid")
     }

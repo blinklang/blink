@@ -61,9 +61,13 @@ typedef struct blink_arena_chunk {
     int64_t used;
 } blink_arena_chunk;
 
+/* parent is the arena that was current when this one was made: the arena a
+   `with arena` block was entered from. Promotion walks it to tell whether a
+   pointer lives in an arena that is closing. */
 typedef struct blink_arena_t {
     blink_arena_chunk* head;
     int64_t default_chunk_size;
+    struct blink_arena_t* parent;
 } blink_arena_t;
 
 #ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
@@ -358,6 +362,7 @@ BLINK_RT_FN blink_arena_t* blink_arena_create(int64_t chunk_size) {
     if (!a) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
     a->default_chunk_size = chunk_size > 0 ? chunk_size : BLINK_ARENA_DEFAULT_CHUNK_SIZE;
     a->head = blink_arena_chunk_new(a->default_chunk_size);
+    a->parent = __blink_current_arena;
     return a;
 }
 #endif
@@ -524,14 +529,129 @@ BLINK_RT_FN void* blink_promote_alloc_atomic(blink_arena_t* target, int64_t size
 }
 #endif
 
-BLINK_RT_FN const char* blink_promote_str(blink_arena_t* target, const char* s);
+/* One promotion: the value crossing one boundary and everything it reaches.
+   target is where copies go (NULL: the GC heap). dying is the innermost arena
+   open at the boundary; it and its parents up to target all close there, so a
+   pointer into any of them must be copied and a pointer anywhere else is kept.
+   fwd maps each closure record and mutable cell already copied to its copy, so
+   two closures sharing a cell share the copy, and a closure that reaches
+   itself through a cell ends. It lives on the stack of the boundary, never in
+   thread state. */
+typedef struct blink_promote_ctx {
+    blink_arena_t* target;
+    blink_arena_t* dying;
+    void** fwd;
+    int64_t fwd_len;
+    int64_t fwd_cap;
+} blink_promote_ctx;
+
+#define BLINK_PROMOTE_CTX(target) (&(blink_promote_ctx){ (target), __blink_current_arena, NULL, 0, 0 })
+
+BLINK_RT_FN void* blink_promote_ctx_alloc(blink_promote_ctx* ctx, int64_t size);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN const char* blink_promote_str(blink_arena_t* target, const char* s) {
+BLINK_RT_FN void* blink_promote_ctx_alloc(blink_promote_ctx* ctx, int64_t size) {
+    return blink_promote_alloc(ctx->target, size);
+}
+#endif
+
+BLINK_RT_FN void* blink_promote_ctx_alloc_atomic(blink_promote_ctx* ctx, int64_t size);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_promote_ctx_alloc_atomic(blink_promote_ctx* ctx, int64_t size) {
+    return blink_promote_alloc_atomic(ctx->target, size);
+}
+#endif
+
+BLINK_RT_FN const char* blink_promote_str(blink_promote_ctx* ctx, const char* s);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_promote_str(blink_promote_ctx* ctx, const char* s) {
     if (!s) return NULL;
     size_t len = strlen(s) + 1;
-    char* p = (char*)blink_promote_alloc_atomic(target, (int64_t)len);
+    char* p = (char*)blink_promote_ctx_alloc_atomic(ctx, (int64_t)len);
     memcpy(p, s, len);
     return p;
+}
+#endif
+
+BLINK_RT_FN int blink_promote_is_dying(const blink_promote_ctx* ctx, const void* p);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_promote_is_dying(const blink_promote_ctx* ctx, const void* p) {
+    const char* q = (const char*)p;
+    for (blink_arena_t* a = ctx->dying; a != NULL && a != ctx->target; a = a->parent) {
+        for (blink_arena_chunk* c = a->head; c != NULL; c = c->next) {
+            if (q >= c->data && q < c->data + c->capacity) return 1;
+        }
+    }
+    return 0;
+}
+#endif
+
+/* fwd is an open-addressed table of (original, copy) pairs, kept at most half
+   full. It is scratch for one promotion, so it lives on the GC heap and is
+   dropped with the ctx. */
+static inline size_t blink_promote_fwd_slot(const void* p, int64_t cap) {
+    uintptr_t h = (uintptr_t)p;
+    h ^= h >> 33;
+    h *= (uintptr_t)0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    return (size_t)(h & (uintptr_t)(cap - 1));
+}
+
+BLINK_RT_FN void* blink_promote_fwd_find(const blink_promote_ctx* ctx, const void* p);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_promote_fwd_find(const blink_promote_ctx* ctx, const void* p) {
+    if (ctx->fwd_cap == 0) return NULL;
+    size_t i = blink_promote_fwd_slot(p, ctx->fwd_cap);
+    while (ctx->fwd[2 * i] != NULL) {
+        if (ctx->fwd[2 * i] == p) return ctx->fwd[2 * i + 1];
+        i = (i + 1) & (size_t)(ctx->fwd_cap - 1);
+    }
+    return NULL;
+}
+#endif
+
+BLINK_RT_FN void blink_promote_fwd_add(blink_promote_ctx* ctx, void* p, void* copy);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_promote_fwd_add(blink_promote_ctx* ctx, void* p, void* copy) {
+    if (2 * (ctx->fwd_len + 1) > ctx->fwd_cap) {
+        void** old = ctx->fwd;
+        int64_t old_cap = ctx->fwd_cap;
+        ctx->fwd_cap = old_cap == 0 ? 16 : old_cap * 2;
+        ctx->fwd = (void**)GC_MALLOC(sizeof(void*) * 2 * (size_t)ctx->fwd_cap);
+        if (!ctx->fwd) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+        for (int64_t j = 0; j < old_cap; j++) {
+            if (old[2 * j] == NULL) continue;
+            size_t k = blink_promote_fwd_slot(old[2 * j], ctx->fwd_cap);
+            while (ctx->fwd[2 * k] != NULL) k = (k + 1) & (size_t)(ctx->fwd_cap - 1);
+            ctx->fwd[2 * k] = old[2 * j];
+            ctx->fwd[2 * k + 1] = old[2 * j + 1];
+        }
+    }
+    size_t i = blink_promote_fwd_slot(p, ctx->fwd_cap);
+    while (ctx->fwd[2 * i] != NULL) i = (i + 1) & (size_t)(ctx->fwd_cap - 1);
+    ctx->fwd[2 * i] = p;
+    ctx->fwd[2 * i + 1] = copy;
+    ctx->fwd_len++;
+}
+#endif
+
+/* The cell a `let mut` capture rides. A cell outside the closing arenas is
+   shared with the frame that declared it and stays; one inside is copied once,
+   registered before its contents are walked so a walk that comes back to it
+   finds the copy. fill writes the promoted contents; NULL copies the bytes,
+   for a type that holds no arena memory. */
+typedef void (*blink_capture_fill_fn)(void* dst, const void* src, blink_promote_ctx* ctx);
+
+BLINK_RT_FN void* blink_promote_cell(blink_promote_ctx* ctx, void* cell, int64_t size, blink_capture_fill_fn fill);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_promote_cell(blink_promote_ctx* ctx, void* cell, int64_t size, blink_capture_fill_fn fill) {
+    if (cell == NULL || !blink_promote_is_dying(ctx, cell)) return cell;
+    void* done = blink_promote_fwd_find(ctx, cell);
+    if (done != NULL) return done;
+    void* out = blink_promote_ctx_alloc(ctx, size);
+    blink_promote_fwd_add(ctx, cell, out);
+    if (fill != NULL) fill(out, cell, ctx);
+    else memcpy(out, cell, (size_t)size);
+    return out;
 }
 #endif
 
@@ -2576,19 +2696,34 @@ typedef struct {
 
 struct blink_closure_;
 typedef struct blink_closure_ blink_closure;
-typedef blink_closure* (*blink_closure_promoter_fn)(blink_arena_t*, blink_closure*);
+struct blink_promote_ctx;
+typedef blink_closure* (*blink_closure_promoter_fn)(struct blink_promote_ctx*, blink_closure*);
+
+/* How arena promotion moves one capture word. cell_size > 0: the word is the
+   address of a `let mut` cell of that size, and fill (or a byte copy when
+   NULL) writes its promoted contents. cell_size == 0: the word is the value
+   or its box, and walk answers the promoted word (the word itself when NULL,
+   for a kind that holds no arena memory). BLINK_CAPTURE_REFUSED: no walker
+   exists for the capture's type, and promoting it is a panic that names it. */
+#define BLINK_CAPTURE_REFUSED ((int64_t)-1)
+typedef struct {
+    const char* name;
+    int64_t cell_size;
+    void* (*walk)(void* word, struct blink_promote_ctx* ctx);
+    void (*fill)(void* dst, const void* src, struct blink_promote_ctx* ctx);
+} blink_capture_desc;
 
 struct blink_closure_ {
     void* fn_ptr;
     void** captures;
     int64_t capture_count;
-    const char** capture_descs;
+    const blink_capture_desc* capture_descs;
     blink_closure_promoter_fn promoter;
 };
 
-BLINK_RT_FN blink_closure* blink_closure_new_typed(void* fn_ptr, void** captures, const char** capture_descs, int64_t capture_count, blink_closure_promoter_fn promoter);
+BLINK_RT_FN blink_closure* blink_closure_new_typed(void* fn_ptr, void** captures, const blink_capture_desc* capture_descs, int64_t capture_count, blink_closure_promoter_fn promoter);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_closure* blink_closure_new_typed(void* fn_ptr, void** captures, const char** capture_descs, int64_t capture_count, blink_closure_promoter_fn promoter) {
+BLINK_RT_FN blink_closure* blink_closure_new_typed(void* fn_ptr, void** captures, const blink_capture_desc* capture_descs, int64_t capture_count, blink_closure_promoter_fn promoter) {
     blink_closure* c = (blink_closure*)blink_alloc(sizeof(blink_closure));
     c->fn_ptr = fn_ptr;
     c->captures = captures;
@@ -2619,38 +2754,38 @@ BLINK_RT_FN void* blink_closure_get_capture(const blink_closure* c, int64_t inde
 
 /* ── Arena promotion (§5.2.1) ────────────────────────────────────────
  *
- * A generated walker blink_promote_<Type>(value, target) copies a value out
- * of a dying arena. Every allocation it makes names the target: the outer
+ * A generated walker blink_promote_<Type>(value, ctx) copies a value out
+ * of a dying arena. Every allocation it makes names ctx->target: the outer
  * arena, or the GC heap when the target is NULL. It never touches
  * __blink_current_arena, so a walk that panics leaves no state behind.
  * Shell copies keep cap, slot order and kops, so a map or set needs no rehash.
  */
 
-BLINK_RT_FN blink_list* blink_list_copy_shell(blink_arena_t* target, const blink_list* l);
+BLINK_RT_FN blink_list* blink_list_copy_shell(blink_promote_ctx* ctx, const blink_list* l);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_list* blink_list_copy_shell(blink_arena_t* target, const blink_list* l) {
+BLINK_RT_FN blink_list* blink_list_copy_shell(blink_promote_ctx* ctx, const blink_list* l) {
     if (!l) return NULL;
-    blink_list* out = (blink_list*)blink_promote_alloc(target, sizeof(blink_list));
+    blink_list* out = (blink_list*)blink_promote_ctx_alloc(ctx, sizeof(blink_list));
     out->len = l->len;
     out->cap = l->cap;
-    out->items = (void**)blink_promote_alloc(target, (int64_t)(sizeof(void*) * (size_t)(l->cap > 0 ? l->cap : 1)));
+    out->items = (void**)blink_promote_ctx_alloc(ctx, (int64_t)(sizeof(void*) * (size_t)(l->cap > 0 ? l->cap : 1)));
     if (l->len > 0) memcpy(out->items, l->items, sizeof(void*) * (size_t)l->len);
     return out;
 }
 #endif
 
-BLINK_RT_FN blink_map* blink_map_copy_shell(blink_arena_t* target, const blink_map* m);
+BLINK_RT_FN blink_map* blink_map_copy_shell(blink_promote_ctx* ctx, const blink_map* m);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_map* blink_map_copy_shell(blink_arena_t* target, const blink_map* m) {
+BLINK_RT_FN blink_map* blink_map_copy_shell(blink_promote_ctx* ctx, const blink_map* m) {
     if (!m) return NULL;
-    blink_map* out = (blink_map*)blink_promote_alloc(target, sizeof(blink_map));
+    blink_map* out = (blink_map*)blink_promote_ctx_alloc(ctx, sizeof(blink_map));
     size_t stride = blink_kops_stride(m->kops);
     out->len = m->len;
     out->cap = m->cap;
     out->kops = m->kops;
-    out->keys = blink_promote_alloc(target, (int64_t)(stride * (size_t)m->cap));
-    out->values = (void**)blink_promote_alloc(target, (int64_t)(sizeof(void*) * (size_t)m->cap));
-    out->states = (uint8_t*)blink_promote_alloc_atomic(target, (int64_t)(sizeof(uint8_t) * (size_t)m->cap));
+    out->keys = blink_promote_ctx_alloc(ctx, (int64_t)(stride * (size_t)m->cap));
+    out->values = (void**)blink_promote_ctx_alloc(ctx, (int64_t)(sizeof(void*) * (size_t)m->cap));
+    out->states = (uint8_t*)blink_promote_ctx_alloc_atomic(ctx, (int64_t)(sizeof(uint8_t) * (size_t)m->cap));
     memcpy(out->keys, m->keys, stride * (size_t)m->cap);
     memcpy(out->values, m->values, sizeof(void*) * (size_t)m->cap);
     memcpy(out->states, m->states, (size_t)m->cap);
@@ -2709,17 +2844,17 @@ BLINK_RT_FN void* blink_map_slot_key_addr(blink_map* m, int64_t i) {
 }
 #endif
 
-BLINK_RT_FN blink_set* blink_set_copy_shell(blink_arena_t* target, const blink_set* s);
+BLINK_RT_FN blink_set* blink_set_copy_shell(blink_promote_ctx* ctx, const blink_set* s);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_set* blink_set_copy_shell(blink_arena_t* target, const blink_set* s) {
+BLINK_RT_FN blink_set* blink_set_copy_shell(blink_promote_ctx* ctx, const blink_set* s) {
     if (!s) return NULL;
-    blink_set* out = (blink_set*)blink_promote_alloc(target, sizeof(blink_set));
+    blink_set* out = (blink_set*)blink_promote_ctx_alloc(ctx, sizeof(blink_set));
     size_t stride = blink_kops_stride(s->kops);
     out->len = s->len;
     out->cap = s->cap;
     out->kops = s->kops;
-    out->items = blink_promote_alloc(target, (int64_t)(stride * (size_t)s->cap));
-    out->states = (uint8_t*)blink_promote_alloc_atomic(target, (int64_t)(sizeof(uint8_t) * (size_t)s->cap));
+    out->items = blink_promote_ctx_alloc(ctx, (int64_t)(stride * (size_t)s->cap));
+    out->states = (uint8_t*)blink_promote_ctx_alloc_atomic(ctx, (int64_t)(sizeof(uint8_t) * (size_t)s->cap));
     memcpy(out->items, s->items, stride * (size_t)s->cap);
     memcpy(out->states, s->states, (size_t)s->cap);
     return out;
@@ -2761,38 +2896,61 @@ BLINK_RT_FN void* blink_set_slot_item_addr(blink_set* s, int64_t i) {
 }
 #endif
 
-BLINK_RT_FN blink_bytes* blink_bytes_copy_shell(blink_arena_t* target, const blink_bytes* b);
+BLINK_RT_FN blink_bytes* blink_bytes_copy_shell(blink_promote_ctx* ctx, const blink_bytes* b);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_bytes* blink_bytes_copy_shell(blink_arena_t* target, const blink_bytes* b) {
+BLINK_RT_FN blink_bytes* blink_bytes_copy_shell(blink_promote_ctx* ctx, const blink_bytes* b) {
     if (!b) return NULL;
-    blink_bytes* out = (blink_bytes*)blink_promote_alloc(target, sizeof(blink_bytes));
+    blink_bytes* out = (blink_bytes*)blink_promote_ctx_alloc(ctx, sizeof(blink_bytes));
     out->len = b->len;
     out->cap = b->cap;
-    out->data = (uint8_t*)blink_promote_alloc_atomic(target, (int64_t)(b->cap > 0 ? b->cap : 1));
+    out->data = (uint8_t*)blink_promote_ctx_alloc_atomic(ctx, (int64_t)(b->cap > 0 ? b->cap : 1));
     if (b->len > 0) memcpy(out->data, b->data, (size_t)b->len);
     return out;
 }
 #endif
 
-BLINK_RT_FN blink_sb* blink_sb_copy_shell(blink_arena_t* target, const blink_sb* sb);
+BLINK_RT_FN blink_sb* blink_sb_copy_shell(blink_promote_ctx* ctx, const blink_sb* sb);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_sb* blink_sb_copy_shell(blink_arena_t* target, const blink_sb* sb) {
+BLINK_RT_FN blink_sb* blink_sb_copy_shell(blink_promote_ctx* ctx, const blink_sb* sb) {
     if (!sb) return NULL;
-    blink_sb* out = (blink_sb*)blink_promote_alloc(target, sizeof(blink_sb));
+    blink_sb* out = (blink_sb*)blink_promote_ctx_alloc(ctx, sizeof(blink_sb));
     out->len = sb->len;
     out->cap = sb->cap;
-    out->data = (char*)blink_promote_alloc_atomic(target, (int64_t)(sb->cap > 0 ? sb->cap : 1));
+    out->data = (char*)blink_promote_ctx_alloc_atomic(ctx, (int64_t)(sb->cap > 0 ? sb->cap : 1));
     memcpy(out->data, sb->data, (size_t)sb->len + 1);
     return out;
 }
 #endif
 
-/* A closure without a promoter captures nothing that lives in the arena. */
-BLINK_RT_FN blink_closure* blink_closure_promote(blink_arena_t* target, blink_closure* c);
+/* A closure record made outside the closing arenas is kept, with whatever it
+   captured: those captures were made where it was. One made inside is copied
+   once, with its capture array, and each capture moves as its descriptor
+   says. The record is registered before its captures are walked, so a closure
+   that reaches itself through a cell gets its own copy back. */
+BLINK_RT_FN blink_closure* blink_closure_promote(blink_promote_ctx* ctx, blink_closure* c);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_closure* blink_closure_promote(blink_arena_t* target, blink_closure* c) {
-    if (c && c->promoter) return c->promoter(target, c);
-    return c;
+BLINK_RT_FN blink_closure* blink_closure_promote(blink_promote_ctx* ctx, blink_closure* c) {
+    if (c == NULL || !blink_promote_is_dying(ctx, c)) return c;
+    blink_closure* done = (blink_closure*)blink_promote_fwd_find(ctx, c);
+    if (done != NULL) return done;
+    blink_closure* out = (blink_closure*)blink_promote_ctx_alloc(ctx, sizeof(blink_closure));
+    *out = *c;
+    blink_promote_fwd_add(ctx, c, out);
+    if (c->capture_count == 0) return out;
+    if (c->capture_descs == NULL) {
+        __blink_panic_dispatch("internal error: arena promotion reached a capturing closure with no capture descriptors");
+    }
+    out->captures = (void**)blink_promote_ctx_alloc(ctx, (int64_t)(sizeof(void*) * (size_t)c->capture_count));
+    for (int64_t i = 0; i < c->capture_count; i++) {
+        const blink_capture_desc* d = &c->capture_descs[i];
+        void* w = c->captures[i];
+        if (d->cell_size == BLINK_CAPTURE_REFUSED) {
+            __blink_panic_dispatchf("arena promotion cannot copy capture `%s` of a closure leaving `with arena`: no promotion exists for its type", d->name);
+        }
+        if (d->cell_size > 0) out->captures[i] = blink_promote_cell(ctx, w, d->cell_size, d->fill);
+        else out->captures[i] = d->walk != NULL ? d->walk(w, ctx) : w;
+    }
+    return out;
 }
 #endif
 

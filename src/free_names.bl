@@ -1,0 +1,159 @@
+// What a closure body reads from outside itself, answered from syntax alone. Code
+// generation asks which of these names are captures, and escape analysis asks which
+// capture words a promoted closure carries; both need the same answer, so one scan
+// gives it.
+
+import ast.{NodeKind, nk_of}
+import parser.{
+    is_literal_string_part, node_body, node_elements, node_for_binder, node_guard, node_handlers,
+    node_iterable, node_kind, node_name, node_params, node_pattern, node_stmts, node_value,
+    node_value_child_ids, sublist_get, sublist_length,
+}
+
+// Every name the closure body reads that the closure does not bind itself, in first-read
+// order. A syntactic answer: it does not ask which frame binds the name, so it holds for a
+// body whose own bindings are not bound yet.
+pub fn closure_read_names(closure: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    let mut nodes: List[Int] = []
+    scan_closure(closure, out, nodes)
+    out
+}
+
+// The first Ident that reads each of those names, in the same order. The node carries the
+// type the name has where the closure reads it.
+pub fn closure_read_idents(closure: Int) -> List[Int] {
+    let mut out: List[Str] = []
+    let mut nodes: List[Int] = []
+    scan_closure(closure, out, nodes)
+    nodes
+}
+
+fn scan_closure(closure: Int, out: List[Str], nodes: List[Int]) {
+    let mut bound: List[Str] = []
+    push_param_names(closure, bound)
+    scan_free(node_body(closure), bound, out, nodes)
+}
+
+fn scan_free(node: Int, bound: List[Str], out: List[Str], nodes: List[Int]) {
+    if node < 0 { return }
+    match nk_of(node_kind(node)) {
+        NodeKind.Ident => note_ident(node, bound, out, nodes)
+        NodeKind.Block => scan_block(node, bound, out, nodes)
+        NodeKind.ForIn => scan_for(node, bound, out, nodes)
+        NodeKind.MatchArm => scan_arm(node, bound, out, nodes)
+        NodeKind.WithBlock => scan_with(node, bound, out, nodes)
+        NodeKind.Closure => scan_fn_like(node, bound, out, nodes)
+        NodeKind.FnDef => scan_fn_like(node, bound, out, nodes)
+        _ => scan_kids(node, bound, out, nodes)
+    }
+}
+
+fn scan_kids(node: Int, bound: List[Str], out: List[Str], nodes: List[Int]) {
+    for kid in node_value_child_ids(node) { scan_free(kid, bound, out, nodes) }
+}
+
+// The parser stores each literal chunk of an interpolated string as an Ident whose name
+// is the chunk's text, so a chunk spelled like an enclosing local is not a read of it.
+fn note_ident(node: Int, bound: List[Str], out: List[Str], nodes: List[Int]) {
+    if is_literal_string_part(node) == 1 { return }
+    let name = node_name(node)
+    if bound.contains(name) || out.contains(name) { return }
+    out.push(name)
+    nodes.push(node)
+}
+
+// A block's `let` binds from the statement after it, and its initializer is read before
+// the name binds, so `let n = n + 1` reads the outer `n` the source names.
+fn scan_block(node: Int, bound: List[Str], out: List[Str], nodes: List[Int]) {
+    let sl = node_stmts(node)
+    if sl == -1 { return }
+    let mut inner = copy_names(bound)
+    let mut i = 0
+    while i < sublist_length(sl) {
+        let s = sublist_get(sl, i)
+        if nk_of(node_kind(s)) == NodeKind.LetBinding {
+            scan_free(node_value(s), inner, out, nodes)
+            if node_name(s) != "" { inner.push(node_name(s)) }
+            pattern_names(node_elements(s), inner)
+        } else {
+            scan_free(s, inner, out, nodes)
+        }
+        i = i + 1
+    }
+}
+
+fn scan_for(node: Int, bound: List[Str], out: List[Str], nodes: List[Int]) {
+    scan_free(node_iterable(node), bound, out, nodes)
+    let inner = copy_names(bound)
+    pattern_names(node_for_binder(node), inner)
+    pattern_names(node_elements(node), inner)
+    scan_free(node_body(node), inner, out, nodes)
+}
+
+fn scan_arm(node: Int, bound: List[Str], out: List[Str], nodes: List[Int]) {
+    let inner = copy_names(bound)
+    pattern_names(node_pattern(node), inner)
+    scan_free(node_guard(node), inner, out, nodes)
+    scan_free(node_body(node), inner, out, nodes)
+}
+
+// A later `with` item can read an earlier item's binder, so the items bind in order.
+fn scan_with(node: Int, bound: List[Str], out: List[Str], nodes: List[Int]) {
+    let mut inner = copy_names(bound)
+    let hs = node_handlers(node)
+    if hs != -1 {
+        let mut i = 0
+        while i < sublist_length(hs) {
+            let h = sublist_get(hs, i)
+            scan_kids(h, inner, out, nodes)
+            if nk_of(node_kind(h)) == NodeKind.WithResource && node_name(h) != "" { inner.push(node_name(h)) }
+            i = i + 1
+        }
+    }
+    scan_free(node_body(node), inner, out, nodes)
+}
+
+// A nested closure, or a handler method written inside the body: its parameters are its
+// own, and what its body reads from outside is what the outer closure reads.
+fn scan_fn_like(node: Int, bound: List[Str], out: List[Str], nodes: List[Int]) {
+    let inner = copy_names(bound)
+    push_param_names(node, inner)
+    scan_free(node_body(node), inner, out, nodes)
+}
+
+pub fn push_param_names(fn_like: Int, bound: List[Str]) {
+    let ps = node_params(fn_like)
+    if ps == -1 { return }
+    let mut i = 0
+    while i < sublist_length(ps) {
+        bound.push(node_name(sublist_get(ps, i)))
+        i = i + 1
+    }
+}
+
+// Every name a pattern introduces. A variant name written as a pattern lands here too,
+// which is harmless: a pattern never reads a local, so nothing it names can be a capture.
+pub fn pattern_names(pat: Int, bound: List[Str]) {
+    if pat < 0 { return }
+    match nk_of(node_kind(pat)) {
+        NodeKind.Ident => bound.push(node_name(pat))
+        NodeKind.IdentPattern => bound.push(node_name(pat))
+        NodeKind.AsPattern => {
+            bound.push(node_name(pat))
+            pattern_names(node_pattern(pat), bound)
+        }
+        // `Point { x }` binds the field's own name; `Point { x: p }` binds through p.
+        NodeKind.StructLitField => {
+            if node_pattern(pat) >= 0 { pattern_names(node_pattern(pat), bound) } else { bound.push(node_name(pat)) }
+        }
+        _ => { for kid in node_value_child_ids(pat) { pattern_names(kid, bound) } }
+    }
+}
+
+// Lists are references, so a scope that adds names works on a copy of its parent's.
+fn copy_names(names: List[Str]) -> List[Str] {
+    let mut out: List[Str] = []
+    for n in names { out.push(n) }
+    out
+}
