@@ -37,16 +37,16 @@
 //
 // TWO ROWS BELOW WERE FLIPPED BY br 6cvvh8, which taught the TID tier to classify a
 // tuple-over-typevar slot (by substituting the mono context) and a struct-INSTANCE slot.
-// They used to pin `GT[(T, Int)]` inside `fn wrap[T]` and `GT[QB[Int]]` as loud I0001;
-// they now assert correct monomorphization. struct_concrete_args_from_target still bails
+// They used to pin `GT[(T, Int)]` inside `fn wrap[T]` and `GT[QB[Int]]` as loud I0001.
+// The first now asserts correct monomorphization; the second is rejected with E1400,
+// since QB is not hashable and GT uses its type arg as a Set element. struct_concrete_args_from_target still bails
 // on every compound arg and deliberately was NOT taught otherwise — see
 // tests/test_6cvvh8_struct_mono_target_seams.bl for why a string-tier fix would have
 // produced a correct NAME over a wrong kops VTABLE.
 //
 // WHAT REMAINS OUT OF SCOPE, still pinned here as the boundary:
-//   - inserting a struct INSTANCE into a Set/Map: derive_hash_types holds only BASE
-//     names, so `Set[QB[Int]]` has no kops table on any path. `GT[QB[Int]]` may be
-//     NAMED, never keyed.
+//   - a struct INSTANCE without @derive(Hash, Eq) as a Set element: `GT[QB[Int]]` is
+//     rejected with E1400 (sections/03_types.md:1940), so it never reaches codegen.
 //   - ENUM-instance type args: struct_concrete_args_from_target bails on every
 //     compound arg (line 41 above) regardless of kind, so a generic-enum instance
 //     as a type arg is not admitted either — same boundary as the struct case, not
@@ -336,26 +336,17 @@ test "a by-value tuple field gets the right mono name and the typedef order is c
     assert_eq(r.exit_code, 0)
 }
 
-// FLIPPED by br 6cvvh8, which added a TK_STRUCT admission to the tid tier's slot loop.
-// The instance is NAMED and never keyed: GT's field is `Set[T]`, which lowers to the
-// erased `blink_set*`, so nothing in blink_GT_QB_Int's typedef mentions QB_Int. The
-// sentinel needle pins that naming the type arg did not also register QB[Int] as a mono
-// instance — that would flip kops_elem_is_concrete("QB_Int") true and drive
-// kops_table_name down its fail-closed branch, since derive_hash_types holds only base
-// names. Inserting a struct instance into a Set remains out of scope entirely.
-test "a generic-struct-instance type arg in a Set element monomorphizes to its nested segment" {
+// GT's field is `Set[T]`, so its type arg is a Set element and must be hashable
+// (sections/03_types.md:1940). QB carries no @derive(Hash, Eq), so `GT[QB[Int]]` is refused
+// at the annotation with E1400, before any mono name is spelled or any kops table chosen.
+test "a generic-struct-instance type arg in a Set element without the Hash derive is rejected with E1400" {
     let mut s = gt_decl()
     s = s.concat("type QB[T] \{ v: T }\n")
     s = s.concat("fn main() \{\n")
     s = s.concat("    let e: GT[QB[Int]] = GT \{ s: Set() }\n")
     s = s.concat("    assert(e.s.len() == 0)\n")
     s = s.concat("}\n")
-    let c = compile_test_helpers.compile_and_emit_c(s, "23tfxg_struct_elem")
-    assert_one_gt_typedef(c, ["QB", "Int"], "struct Set element")
-    assert_lacks(c, "} blink_GT_QB;", "struct Set element / bare-head nested typedef")
-    assert_lacks(c, "BLINK_COMPILER_BUG_kops", "struct Set element / kops sentinel")
-    assert_no_erasure(c, "struct Set element")
-    let r = compile_test_helpers.compile_and_run(s, "23tfxg_struct_elem_run")
-    if r.exit_code != 0 { io.println("FAIL: struct Set element — exit {r.exit_code}: {r.err_out}") }
-    assert_eq(r.exit_code, 0)
+    let out = compile_test_helpers.compile_and_capture(s, "23tfxg_struct_elem")
+    compile_test_helpers.expect_error(out, "E1400", "struct Set element / E1400")
+    compile_test_helpers.expect_contains(out, "`QB`", "struct Set element / names QB")
 }

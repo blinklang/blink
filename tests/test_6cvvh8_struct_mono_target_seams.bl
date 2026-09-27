@@ -33,14 +33,9 @@
 // THE ANTI-REGRESSION FOR THE WHOLE TICKET is therefore the exhibit-A kops row below,
 // not the name row: a name-only fix passes every name assertion and fails that one.
 //
-// STILL OUT OF SCOPE (deliberately, see the pinned rows in
-// tests/test_23tfxg_tuple_arg_mono_name.bl): inserting a struct INSTANCE into a
-// Set/Map — derive_hash_types holds only BASE names, so `Set[QB[Int]]` has no kops
-// table on any path. Exhibit B therefore names its type arg and never inserts, and
-// asserts the fail-closed BLINK_COMPILER_BUG_kops sentinel is absent — naming
-// QB_Int must not register it as a mono instance, which would flip
-// kops_elem_is_concrete("QB_Int") true and drive kops_table_name down the sentinel
-// branch.
+// EXHIBIT B IS NOW REJECTED: QB carries no @derive(Hash, Eq), and GT uses its type arg as a
+// Set element, so `GT[QB[Int]]` is E1400 at type-check (sections/03_types.md:1940). Its
+// rows assert the refusal.
 //
 // ALSO OUT OF SCOPE, and NOT deliberately so when this file was written — br 3aa3je: a
 // struct instance of the SAME name nested inside a TUPLE type arg
@@ -206,35 +201,30 @@ test "inserting a tuple key from inside the monomorphized body round-trips" {
 }
 
 // ── exhibit B: generic-struct instance as the type arg ────────────────────────
+// GT's field is `Set[T]`, so its type arg is a Set element and must be hashable
+// (sections/03_types.md:1940). QB carries no @derive(Hash, Eq), so exhibit B is not a
+// program: type-check refuses `GT[QB[Int]]` with E1400 at the annotation. Each row below
+// keeps its old concern and checks that the refusal covers it.
 
-test "a generic-struct-instance type arg monomorphizes to its nested mono segment" {
-    let c = compile_test_helpers.compile_and_emit_c(src_b(), "6cvvh8_b_c")
-    let names = compile_test_helpers.mono_typedef_names(c, "GT")
-    if names.len() != 1 { io.println("FAIL: exhibit B — want exactly 1 GT typedef, got {names.len()}") }
-    assert(names.len() == 1)
-    // The nested segment must reach the name: QB, then its own Int argument.
-    let n = names.get(0).unwrap()
-    let qb_at = n.index_of("QB")
-    assert(qb_at >= 0)
-    assert(n.index_of("Int") > qb_at)
-    assert_lacks(c, "_Void", "exhibit B / string-producer erasure")
-    assert_lacks(c, "blink_GT_QB;", "exhibit B / bare-head nested typedef")
+test "a generic-struct-instance type arg without the Hash derive is rejected with E1400 as a Set element" {
+    let out = compile_test_helpers.compile_and_capture(src_b(), "6cvvh8_b_c")
+    compile_test_helpers.expect_error(out, "E1400", "exhibit B / E1400")
+    compile_test_helpers.expect_contains(out, "`QB`", "exhibit B / names QB")
 }
 
-// Naming the type arg must NOT register QB[Int] as a mono instance: that would insert
-// QB_Int into struct_reg_set, flip kops_elem_is_concrete("QB_Int") true, and drive
-// kops_table_name down its fail-closed branch — derive_hash_types only ever holds BASE
-// names, so there is no table to emit. The sentinel is the compiler telling the truth;
-// this row pins that we never make it reachable.
-test "naming a struct-instance type arg does not emit the kops sentinel" {
-    let c = compile_test_helpers.compile_and_emit_c(src_b(), "6cvvh8_b_kops")
-    assert_lacks(c, "BLINK_COMPILER_BUG_kops", "exhibit B / kops sentinel")
+// The refusal comes before codegen, so the kops sentinel this row once pinned absent has no
+// path left to it: the diagnostic names the missing derive instead.
+test "naming a struct-instance type arg is refused before codegen reaches the kops sentinel" {
+    let out = compile_test_helpers.compile_and_capture(src_b(), "6cvvh8_b_kops")
+    compile_test_helpers.expect_error(out, "E1400", "exhibit B kops / E1400")
+    compile_test_helpers.expect_contains(out, "@derive(Hash, Eq)", "exhibit B kops / names the derive")
 }
 
-test "exhibit B compiles and runs" {
+test "exhibit B does not compile and names E1400" {
     let r = compile_test_helpers.compile_and_run(src_b(), "6cvvh8_b_run")
-    if r.exit_code != 0 { io.println("FAIL: exhibit B runtime — exit {r.exit_code}: {r.err_out}") }
-    assert_eq(r.exit_code, 0)
+    if r.exit_code == 0 { io.println("FAIL: exhibit B runtime — compiled and ran, want E1400") }
+    assert(r.exit_code != 0)
+    compile_test_helpers.expect_contains(r.err_out, "MapKeyNotHashable", "exhibit B run / E1400")
 }
 
 // ── the nested-literal anti-regression row ────────────────────────────────────
