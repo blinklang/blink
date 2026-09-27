@@ -1,0 +1,119 @@
+// sections/03_types.md:1940 — only builtin scalars, all-hashable tuples and user types that
+// carry @derive(Hash, Eq) may be a Set element or a Map key; anything else is E1400
+// MapKeyNotHashable at type-check.
+//
+// The obligation sits on the substituted type, not on the generic declaration: Holder[T]
+// with a Set[T] field is a legal declaration, and Holder[Point] is where the rule applies.
+// A check that reads only a written Set[X] never sees Point there, so the program passed
+// type-check and codegen stopped on an internal error. Each refused row has a control that
+// is accepted, so a fix that rejects every generic Set field cannot pass.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+
+fn probe_diag_names(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out = "{out}{d.name} " }
+    }
+    out.trim()
+}
+
+fn assert_names(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: drew '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+fn holder_src(arg: Str) -> Str {
+    let mut s = "type Holder[T] \{ items: Set[T] }\n"
+    s = s.concat("type Point \{ x: Int }\n")
+    s = s.concat("@derive(Hash, Eq)\ntype HPoint \{ x: Int }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let h: Holder[{arg}] = Holder \{ items: Set() }\n")
+    s = s.concat("    io.println(\"\{h.items.len()}\")\n")
+    s.concat("}\n")
+}
+
+fn index_src(key: Str) -> Str {
+    let mut s = "type Index[K, V] \{ m: Map[K, V] }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let i: Index[{key}, Str] = Index \{ m: Map() }\n")
+    s = s.concat("    io.println(\"\{i.m.len()}\")\n")
+    s.concat("}\n")
+}
+
+fn count_one_src(arg: Str) -> Str {
+    let mut s = "fn count_one[T](x: T) -> Int \{\n"
+    s = s.concat("    let mut s: Set[T] = Set()\n")
+    s = s.concat("    s.insert(x)\n")
+    s = s.concat("    s.len()\n")
+    s = s.concat("}\n")
+    s = s.concat("type Point \{ x: Int }\n")
+    s = s.concat("@derive(Hash, Eq)\ntype HPoint \{ x: Int }\n")
+    s = s.concat("fn main() \{ io.println(\"\{count_one({arg})}\") }\n")
+    s
+}
+
+fn param_src(arg: Str) -> Str {
+    let mut s = "type Holder[T] \{ items: Set[T] }\n"
+    s = s.concat("type Point \{ x: Int }\n")
+    s = s.concat("@derive(Hash, Eq)\ntype HPoint \{ x: Int }\n")
+    s = s.concat("fn size(h: Holder[{arg}]) -> Int \{ h.items.len() }\n")
+    s = s.concat("fn main() \{ io.println(\"ok\") }\n")
+    s
+}
+
+test "a struct without the Hash derive is refused as a Set element reached through a field type arg" {
+    assert_names("Holder[Point]", probe_diag_names("tc_hasharg_struct", holder_src("Point")),
+        "MapKeyNotHashable")
+}
+
+test "a struct with the Hash derive is accepted as a Set element reached through a field type arg" {
+    assert_names("Holder[HPoint]", probe_diag_names("tc_hasharg_struct_ok", holder_src("HPoint")), "")
+}
+
+test "a tuple with a non-hashable element is refused through a field type arg" {
+    assert_names("Holder[(Int, Option[Str])]",
+        probe_diag_names("tc_hasharg_tuple", holder_src("(Int, Option[Str])")), "MapKeyNotHashable")
+}
+
+test "a tuple of hashable elements is accepted through a field type arg" {
+    assert_names("Holder[(Int, Str)]",
+        probe_diag_names("tc_hasharg_tuple_ok", holder_src("(Int, Str)")), "")
+}
+
+test "a container is refused as a Map key reached through a field type arg" {
+    assert_names("Index[List[Int], Str]",
+        probe_diag_names("tc_hasharg_mapkey", index_src("List[Int]")), "MapKeyNotHashable")
+}
+
+test "a scalar is accepted as a Map key reached through a field type arg" {
+    assert_names("Index[Str, Str]", probe_diag_names("tc_hasharg_mapkey_ok", index_src("Str")), "")
+}
+
+test "a struct without the Hash derive is refused as the Set element of a generic fn body" {
+    assert_names("count_one(Point)",
+        probe_diag_names("tc_hasharg_fn", count_one_src("Point \{ x: 1 }")), "MapKeyNotHashable")
+}
+
+test "a struct with the Hash derive is accepted as the Set element of a generic fn body" {
+    assert_names("count_one(HPoint)",
+        probe_diag_names("tc_hasharg_fn_ok", count_one_src("HPoint \{ x: 1 }")), "")
+}
+
+test "a type written only in a signature is refused when its type arg is not hashable" {
+    assert_names("size(Holder[Point])", probe_diag_names("tc_hasharg_sig", param_src("Point")),
+        "MapKeyNotHashable")
+}
+
+test "a type written only in a signature is accepted when its type arg is hashable" {
+    assert_names("size(Holder[HPoint])", probe_diag_names("tc_hasharg_sig_ok", param_src("HPoint")), "")
+}
