@@ -127,6 +127,7 @@ fn expr_text(id: Int) -> Str ! Diag.Report {
         IrKind.ClosureNew => closure_new_text(id)
         IrKind.EvidenceVector => ir_c_name(id)
         IrKind.EvidenceAddress => "(&{print_expr(ir_kid(id, 0))})"
+        IrKind.ArenaTarget => ir_c_name(id)
         IrKind.EffectPerform => perform_text(id)
         IrKind.FieldSet => misplaced(id, "value")
         IrKind.HandlerInstall => misplaced(id, "value")
@@ -251,7 +252,9 @@ fn enum_new_text(id: Int) -> Str ! Diag.Report {
 // A heap copy needs two statements, so a Box always binds its pointer.
 fn box_text(id: Int) -> Str ! Diag.Report {
     let value = print_expr(ir_kid(id, 0))
-    let tmp = bind_temp(id, "_box", "({ir_c_spelling(id)})blink_alloc(sizeof({ir_c_name(id)}))")
+    let size = "sizeof({ir_c_name(id)})"
+    let alloc = if ir_kid_count(id) == 2 { "blink_promote_alloc({print_expr(ir_kid(id, 1))}, {size})" } else { "blink_alloc({size})" }
+    let tmp = bind_temp(id, "_box", "({ir_c_spelling(id)}){alloc}")
     em_line("*{tmp} = {value};")
     tmp
 }
@@ -414,6 +417,7 @@ pub fn print_stmt(id: Int) ! Diag.Report {
         IrKind.ClosureNew => stmt_misplaced(id)
         IrKind.EvidenceVector => stmt_misplaced(id)
         IrKind.EvidenceAddress => stmt_misplaced(id)
+        IrKind.ArenaTarget => stmt_misplaced(id)
         IrKind.EffectPerform => stmt_misplaced(id)
     }
 }
@@ -533,7 +537,8 @@ fn print_switch(id: Int) ! Diag.Report {
 
 // With a resource: the value is copied into a guard whose attribute cleanup runs the exit
 // symbol the node names (see em_resource_guard_support) on every exit. Without one: a
-// fresh arena for the block.
+// fresh arena for the block, and when the node names a target local, that local holds the
+// arena the block was entered from, which is where a promotion out of the block copies to.
 //
 // The ok mark sits after the body, so the body must fall off its end on normal completion:
 // a tail value the scope yields is assigned to a destination inside the body and returned
@@ -546,6 +551,7 @@ fn print_with_scope(id: Int) ! Diag.Report {
         em_line("blink_arena_t* {ar} = blink_arena_create(BLINK_ARENA_DEFAULT_CHUNK_SIZE);")
         em_line("__blink_arena_restore_t {ar}_st __attribute__((cleanup(__blink_arena_restore))) = \{ .prev = __blink_current_arena, .arena = {ar} };")
         em_line("__blink_current_arena = {ar};")
+        if ir_c_name(id) != "" { em_line("blink_arena_t* {ir_c_name(id)} = {ar}_st.prev;") }
         print_block_body(ir_kid(id, 0))
     } else {
         let res = ir_kid(id, 0)

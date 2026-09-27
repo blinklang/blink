@@ -451,6 +451,21 @@ BLINK_RT_FN void* blink_alloc(int64_t size) {
 }
 #endif
 
+/* A thread pool, task, handle or channel is shared with other threads and read after
+   the arena it was made in closes, and arena promotion passes its pointer through
+   unchanged. So it always lives on the GC heap, even inside `with arena`. */
+BLINK_RT_FN void* blink_alloc_shared(int64_t size);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_alloc_shared(int64_t size) {
+    void* p = GC_MALLOC((size_t)size);
+    if (!p) {
+        fprintf(stderr, "blink: out of memory\n");
+        exit(1);
+    }
+    return p;
+}
+#endif
+
 /* Arena-aware realloc. When a `with arena` block is active, GC_REALLOC on
    an interior pointer into a GC_MALLOC_ATOMIC arena chunk will free the
    whole chunk out from under us and crash on arena destroy. Allocate fresh
@@ -2599,6 +2614,185 @@ BLINK_RT_FN void* blink_closure_get_capture(const blink_closure* c, int64_t inde
         exit(1);
     }
     return c->captures[index];
+}
+#endif
+
+/* ── Arena promotion (§5.2.1) ────────────────────────────────────────
+ *
+ * A generated walker blink_promote_<Type>(value, target) copies a value out
+ * of a dying arena. Every allocation it makes names the target: the outer
+ * arena, or the GC heap when the target is NULL. It never touches
+ * __blink_current_arena, so a walk that panics leaves no state behind.
+ * Shell copies keep cap, slot order and kops, so a map or set needs no rehash.
+ */
+
+BLINK_RT_FN blink_list* blink_list_copy_shell(blink_arena_t* target, const blink_list* l);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_list* blink_list_copy_shell(blink_arena_t* target, const blink_list* l) {
+    if (!l) return NULL;
+    blink_list* out = (blink_list*)blink_promote_alloc(target, sizeof(blink_list));
+    out->len = l->len;
+    out->cap = l->cap;
+    out->items = (void**)blink_promote_alloc(target, (int64_t)(sizeof(void*) * (size_t)(l->cap > 0 ? l->cap : 1)));
+    if (l->len > 0) memcpy(out->items, l->items, sizeof(void*) * (size_t)l->len);
+    return out;
+}
+#endif
+
+BLINK_RT_FN blink_map* blink_map_copy_shell(blink_arena_t* target, const blink_map* m);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_map* blink_map_copy_shell(blink_arena_t* target, const blink_map* m) {
+    if (!m) return NULL;
+    blink_map* out = (blink_map*)blink_promote_alloc(target, sizeof(blink_map));
+    size_t stride = blink_kops_stride(m->kops);
+    out->len = m->len;
+    out->cap = m->cap;
+    out->kops = m->kops;
+    out->keys = blink_promote_alloc(target, (int64_t)(stride * (size_t)m->cap));
+    out->values = (void**)blink_promote_alloc(target, (int64_t)(sizeof(void*) * (size_t)m->cap));
+    out->states = (uint8_t*)blink_promote_alloc_atomic(target, (int64_t)(sizeof(uint8_t) * (size_t)m->cap));
+    memcpy(out->keys, m->keys, stride * (size_t)m->cap);
+    memcpy(out->values, m->values, sizeof(void*) * (size_t)m->cap);
+    memcpy(out->states, m->states, (size_t)m->cap);
+    return out;
+}
+#endif
+
+BLINK_RT_FN int64_t blink_map_slot_count(const blink_map* m);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_map_slot_count(const blink_map* m) {
+    return m ? m->cap : 0;
+}
+#endif
+
+BLINK_RT_FN int64_t blink_map_slot_live(const blink_map* m, int64_t i);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_map_slot_live(const blink_map* m, int64_t i) {
+    return m->states[i] == 1;
+}
+#endif
+
+BLINK_RT_FN void* blink_map_slot_value(const blink_map* m, int64_t i);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_map_slot_value(const blink_map* m, int64_t i) {
+    return m->values[i];
+}
+#endif
+
+BLINK_RT_FN void blink_map_slot_set_value(blink_map* m, int64_t i, void* v);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_map_slot_set_value(blink_map* m, int64_t i, void* v) {
+    m->values[i] = v;
+}
+#endif
+
+/* A pointer-slot key: the word stored in the slot (a Str, or a boxed K). */
+BLINK_RT_FN void* blink_map_slot_key_word(const blink_map* m, int64_t i);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_map_slot_key_word(const blink_map* m, int64_t i) {
+    return ((void**)m->keys)[i];
+}
+#endif
+
+BLINK_RT_FN void blink_map_slot_set_key_word(blink_map* m, int64_t i, void* w);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_map_slot_set_key_word(blink_map* m, int64_t i, void* w) {
+    ((void**)m->keys)[i] = w;
+}
+#endif
+
+/* An inline key: the address of the key bytes in the slot. */
+BLINK_RT_FN void* blink_map_slot_key_addr(blink_map* m, int64_t i);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_map_slot_key_addr(blink_map* m, int64_t i) {
+    return (void*)((char*)m->keys + (size_t)i * m->kops->key_size);
+}
+#endif
+
+BLINK_RT_FN blink_set* blink_set_copy_shell(blink_arena_t* target, const blink_set* s);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_set* blink_set_copy_shell(blink_arena_t* target, const blink_set* s) {
+    if (!s) return NULL;
+    blink_set* out = (blink_set*)blink_promote_alloc(target, sizeof(blink_set));
+    size_t stride = blink_kops_stride(s->kops);
+    out->len = s->len;
+    out->cap = s->cap;
+    out->kops = s->kops;
+    out->items = blink_promote_alloc(target, (int64_t)(stride * (size_t)s->cap));
+    out->states = (uint8_t*)blink_promote_alloc_atomic(target, (int64_t)(sizeof(uint8_t) * (size_t)s->cap));
+    memcpy(out->items, s->items, stride * (size_t)s->cap);
+    memcpy(out->states, s->states, (size_t)s->cap);
+    return out;
+}
+#endif
+
+BLINK_RT_FN int64_t blink_set_slot_count(const blink_set* s);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_set_slot_count(const blink_set* s) {
+    return s ? s->cap : 0;
+}
+#endif
+
+BLINK_RT_FN int64_t blink_set_slot_live(const blink_set* s, int64_t i);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_set_slot_live(const blink_set* s, int64_t i) {
+    return s->states[i] == 1;
+}
+#endif
+
+BLINK_RT_FN void* blink_set_slot_item_word(const blink_set* s, int64_t i);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_set_slot_item_word(const blink_set* s, int64_t i) {
+    return ((void**)s->items)[i];
+}
+#endif
+
+BLINK_RT_FN void blink_set_slot_set_item_word(blink_set* s, int64_t i, void* w);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_set_slot_set_item_word(blink_set* s, int64_t i, void* w) {
+    ((void**)s->items)[i] = w;
+}
+#endif
+
+BLINK_RT_FN void* blink_set_slot_item_addr(blink_set* s, int64_t i);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_set_slot_item_addr(blink_set* s, int64_t i) {
+    return (void*)((char*)s->items + (size_t)i * s->kops->key_size);
+}
+#endif
+
+BLINK_RT_FN blink_bytes* blink_bytes_copy_shell(blink_arena_t* target, const blink_bytes* b);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_bytes* blink_bytes_copy_shell(blink_arena_t* target, const blink_bytes* b) {
+    if (!b) return NULL;
+    blink_bytes* out = (blink_bytes*)blink_promote_alloc(target, sizeof(blink_bytes));
+    out->len = b->len;
+    out->cap = b->cap;
+    out->data = (uint8_t*)blink_promote_alloc_atomic(target, (int64_t)(b->cap > 0 ? b->cap : 1));
+    if (b->len > 0) memcpy(out->data, b->data, (size_t)b->len);
+    return out;
+}
+#endif
+
+BLINK_RT_FN blink_sb* blink_sb_copy_shell(blink_arena_t* target, const blink_sb* sb);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_sb* blink_sb_copy_shell(blink_arena_t* target, const blink_sb* sb) {
+    if (!sb) return NULL;
+    blink_sb* out = (blink_sb*)blink_promote_alloc(target, sizeof(blink_sb));
+    out->len = sb->len;
+    out->cap = sb->cap;
+    out->data = (char*)blink_promote_alloc_atomic(target, (int64_t)(sb->cap > 0 ? sb->cap : 1));
+    memcpy(out->data, sb->data, (size_t)sb->len + 1);
+    return out;
+}
+#endif
+
+/* A closure without a promoter captures nothing that lives in the arena. */
+BLINK_RT_FN blink_closure* blink_closure_promote(blink_arena_t* target, blink_closure* c);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_closure* blink_closure_promote(blink_arena_t* target, blink_closure* c) {
+    if (c && c->promoter) return c->promoter(target, c);
+    return c;
 }
 #endif
 

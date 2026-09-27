@@ -51,6 +51,10 @@ import cg_stmt.{
     cg_stmt_reset, cg_stmt_set_debug_mode, lower_block, lower_block_returning, lower_fn,
     lower_global_init,
 }
+import cg_promote.{
+    cg_promote_body_enter, cg_promote_body_exit, cg_promote_has_pending, cg_promote_print_walkers,
+    cg_promote_reset, cg_promote_set_trace,
+}
 import cg_expr.{cg_expr_frame_clear, cg_expr_reset, cg_expr_set_return_type, cg_expr_set_test_body}
 import cg_eff.{
     cg_eff_forwarding_body, cg_eff_pending_thunks, cg_eff_print_thunk, cg_eff_register_async_scope_guard_support,
@@ -105,6 +109,7 @@ fn begin_unit(program: Int) ! Diag.Report {
     cg_reg_build(program)
     cg_decl_reset()
     cg_derive_reset()
+    cg_promote_reset()
     cg_stmt_reset()
     cg_expr_reset()
     cg_eff_reset()
@@ -405,6 +410,13 @@ pub fn verify_lowered_unit(root: Int, at_node: Int) -> Int ! Diag.Report {
     root
 }
 
+// A global initializer that crosses an arena calls a walker no body has printed yet.
+fn flush_walkers() ! Diag.Report {
+    if !cg_promote_has_pending() { return }
+    print_typedef_blocks(layout_take_typedefs())
+    cg_promote_print_walkers()
+}
+
 // One body, with every closure it queued defined ahead of it. The thunks print before the
 // body that names them because C reads a name only after its definition, and they print
 // under the same mono instance the body was lowered under, because a thunk's types are
@@ -426,6 +438,8 @@ fn lower_body(decl: Int) -> Int ! Diag.Report {
     // A carrier first spelled while lowering this body or its thunks prints ahead of the
     // thunks too. The signature drains what is left, but the thunks come out before it.
     print_typedef_blocks(layout_take_typedefs())
+    // The arena walkers this body and its thunks call, after the typedefs they spell.
+    cg_promote_print_walkers()
     // A nested closure is queued after the thunk whose body names it, so the later thunk
     // prints first.
     let mut k = bodies.len()
@@ -467,11 +481,13 @@ fn lower_thunk_body(n: Int) -> Int ! Diag.Report {
     cg_expr_set_test_body(false)
     cg_expr_frame_clear()
     let k = tc_tid_kind(tc_resolve(ret))
+    cg_promote_body_enter()
     let body = if k == TyKind.Void || k == TyKind.Never {
         lower_block(body_node)
     } else {
         lower_block_returning(body_node)
     }
+    cg_promote_body_exit()
     cg_expr_set_return_type(-1)
     verify_lowered_unit(body, body_node)
 }
@@ -602,6 +618,7 @@ fn emit_global_init_fn(cfg: CgConfig, program: Int, deferred: List[Int]) -> List
     let decls = cg_reg_global_decls()
     let span = if decls.len() > 0 { decls.get(0).unwrap() } else { program }
     let body = verify_lowered_unit(ir_block(span, deferred), span)
+    flush_walkers()
     let mut name = "__blink_init_globals"
     if is_archive {
         name = archive_init_globals_name()
@@ -620,6 +637,7 @@ fn test_xfail_literal(tb: Int) -> Str {
 // The whole program as one translation unit.
 pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
     begin_unit(program)
+    cg_promote_set_trace(cfg.trace_codegen != 0)
     let shared = cfg.archive_build_mode != 0
     let deferred = emit_declarations(cfg, "", "", true, false, shared)
     print_scope_restore_support()
@@ -692,6 +710,7 @@ pub fn generate_module_header(program: Int, module_key: Str, cfg: CgConfig) -> S
 // registries are already loaded by `begin_unit` above regardless of whose object this is.
 pub fn generate_module_object(program: Int, module_key: Str, self_header: Str, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
     begin_unit(program)
+    cg_promote_set_trace(cfg.trace_codegen != 0)
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_build_mode != 0, false, "", self_header)
     cg_decl_emit_ev(ev_storage(cfg))
     let own_globals = globals_in_scope(cfg, module_key, false)
@@ -700,6 +719,7 @@ pub fn generate_module_object(program: Int, module_key: Str, self_header: Str, c
     if deferred.len() > 0 {
         let span = own_globals.get(0).unwrap()
         let init_body = verify_lowered_unit(ir_block(span, deferred), span)
+        flush_walkers()
         print_fn(false, layout_of(TYPE_VOID, Position.Return).c_spelling, c_module_init_globals_name(module_key), [], false, init_body)
     }
     print_scope_restore_support()
