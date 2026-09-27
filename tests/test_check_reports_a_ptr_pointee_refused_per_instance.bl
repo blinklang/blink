@@ -1,0 +1,78 @@
+// Every typing rule must be visible to `blink check` (sections/03_types.md:25). The pointee
+// rule for a Ptr over a type parameter is judged per instance, in mono, so a check that stops
+// before mono says clean on a program that build refuses.
+//
+// Rows run the compiler in a SUBPROCESS: the refused program is a compile error.
+
+import std.process.{ProcessResult}
+
+fn refused_src() -> Str {
+    #"type Zs { zf: Int }
+@trusted(audit: "p")
+fn hold[T](x: T) ! FFI {
+    with ffi.scope() as scope {
+        let p: Ptr[T] = scope.alloc()
+        io.println("{p.is_null()}")
+    }
+}
+fn main() ! FFI { hold(Zs { zf: 1 }) }
+"#
+}
+
+fn accepted_src() -> Str {
+    #"@trusted(audit: "p")
+fn hold[T](x: T) ! FFI {
+    with ffi.scope() as scope {
+        let p: Ptr[T] = scope.alloc()
+        io.println("{p.is_null()}")
+    }
+}
+fn main() ! FFI {
+    let b: U8 = 1
+    hold(b)
+}
+"#
+}
+
+fn run_on(tag: Str, src: Str, bin: Str, args: List[Str]) -> ProcessResult {
+    let bl_path = "build/_check_ptr_pointee_{tag}.bl"
+    write_file(bl_path, src)
+    let mut full: List[Str] = []
+    for a in args { full.push(a) }
+    full.push(bl_path)
+    let r = process_run(bin, full)
+    shell_exec("rm -f {bl_path}")
+    r
+}
+
+fn expect_refused(tag: Str, r: ProcessResult) {
+    let out = "{r.out}{r.err_out}"
+    if r.exit_code != 1 || !out.contains("InvalidPtrType") || !out.contains("hold[Zs]") {
+        io.eprintln("FAIL[{tag}] want exit 1 with InvalidPtrType naming hold[Zs], got exit {r.exit_code}: {out}")
+    }
+    assert_eq(r.exit_code, 1)
+    assert(out.contains("InvalidPtrType"))
+    assert(out.contains("hold[Zs]"))
+}
+
+fn expect_clean(tag: Str, r: ProcessResult) {
+    let out = "{r.out}{r.err_out}"
+    if r.exit_code != 0 { io.eprintln("FAIL[{tag}] want exit 0, got exit {r.exit_code}: {out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+test "blink check refuses a Ptr instance over a plain struct" {
+    expect_refused("check", run_on("check", refused_src(), "build/blink", ["check"]))
+}
+
+test "blinkc --check-only refuses a Ptr instance over a plain struct" {
+    expect_refused("check_only", run_on("check_only", refused_src(), "build/blinkc", ["--check-only"]))
+}
+
+test "blink check accepts a Ptr instance over U8" {
+    expect_clean("check_ok", run_on("check_ok", accepted_src(), "build/blink", ["check"]))
+}
+
+test "blinkc --check-only accepts a Ptr instance over U8" {
+    expect_clean("check_only_ok", run_on("check_only_ok", accepted_src(), "build/blinkc", ["--check-only"]))
+}
