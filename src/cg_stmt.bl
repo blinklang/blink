@@ -45,7 +45,7 @@ import ir.{
     ir_expr_stmt, ir_field_get, ir_global_ref, ir_if, ir_kid, ir_kid_count, ir_kind, ir_let,
     ir_loop, ir_mark_materialize, ir_new, ir_return, ir_slot_form, ir_span, ir_switch, ir_tid,
     ir_tuple_new, ir_unary, ir_unbox, ir_unreachable, ir_var_ref, ir_with_scope,
-    ir_panic, ir_panic_catch, ir_panic_catch_exit, ir_volatile_let,
+    ir_panic, ir_panic_catch, ir_panic_catch_exit, ir_volatile_let, ir_arena_scope,
 }
 import diagnostics.{
     Diag, diag_file_for_node, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
@@ -56,7 +56,7 @@ import cg_expr.{
     cg_expr_frame_close, cg_expr_frame_current, cg_expr_frame_left_by_jump, cg_expr_frame_loop_enter,
     cg_expr_frame_loop_exit, cg_expr_frame_open,
     cg_expr_is_registered, cg_expr_pending_count,
-    cg_expr_push_pending, cg_expr_register_value, cg_expr_set_return_type,
+    cg_expr_push_pending, cg_expr_register_value, cg_expr_set_return_type, cg_expr_return_type,
     cg_expr_take_pending, cg_expr_value_count, lower_expr,
     x_layout_checked, x_panic_message, x_stopped, x_unbox_payload, ArithSite, lower_arith_operator,
 }
@@ -72,6 +72,11 @@ import cg_call.{
     cg_call_channel_take, cg_call_cursor_walk, for_in_iteration_of,
 }
 import unparse.{unparse_expr}
+import cg_promote.{
+    cg_promote_arena_enter, cg_promote_arena_exit, cg_promote_body_enter, cg_promote_body_exit,
+    cg_promote_innermost_target, cg_promote_needs_walk, cg_promote_on_exit, cg_promote_trace_begin,
+    cg_promote_trace_end, cg_promote_value,
+}
 
 // A carrier holds its discriminant in `tag`, its Option payload in `value` and its
 // Result arms in `ok` and `err`. These are member names in a struct layout.bl emits,
@@ -259,7 +264,9 @@ pub fn lower_fn(fn_node: Int) -> Int ! Diag.Report {
     cg_expr_set_return_type(if ann < 0 { -1 } else { stmt_tid(ann) })
     let saved_fn_name = cs_current_fn_name
     cs_current_fn_name = node_name(fn_node)
+    cg_promote_body_enter()
     let block = if bound && body >= 0 { lower_body_block(body, tail, "", -1) } else { -1 }
+    cg_promote_body_exit()
     cs_current_fn_name = saved_fn_name
     cg_expr_set_return_type(-1)
     close_scope()
@@ -427,7 +434,7 @@ fn lower_jump(node: Int, jump: Int) -> Int {
 
 // How a produced value leaves the block that produced it.
 fn tail_wrap(node: Int, value: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
-    if tail == TAIL_RETURN { return ir_return(node, value) }
+    if tail == TAIL_RETURN { return ir_return(node, cg_promote_on_exit(cg_expr_return_type(), value, node)) }
     if tail == TAIL_ASSIGN {
         // A genuinely Void-typed tail (a bare call whose C shape is `void`, most often a
         // diverging builtin like `env.exit`) has nothing to store into dest: dest_tid is
@@ -1408,7 +1415,9 @@ fn lower_return(node: Int) -> Int ! Diag.Report {
         return ir_block(node, [ir_expr_stmt(node, value), ir_panic_catch_exit(node, frame)])
     }
     if v < 0 { return ir_return(node, -1) }
-    ir_return(node, lower_value(v))
+    let value = lower_value(v)
+    if value < 0 { return -1 }
+    ir_return(node, cg_promote_on_exit(cg_expr_return_type(), value, node))
 }
 
 // ── Blocks in value position ──────────────────────────────────────────────
@@ -2356,13 +2365,42 @@ fn wrap_with_items(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, 
     let bh = cg_eff_block_handler_impl(expr)
     if bh >= 0 { return wrap_block_handler(node, items, n, i, bh, tail, dest, dest_tid) }
     if kind == NodeKind.WithResource { return wrap_resource(node, items, n, i, tail, dest, dest_tid) }
+    if kind == NodeKind.Ident && node_name(item) == ARENA_ITEM {
+        return wrap_arena(node, items, n, i, tail, dest, dest_tid)
+    }
     let rest = wrap_with_items(node, items, n, i + 1, tail, dest, dest_tid)
     if rest < 0 { return -1 }
-    let inner = as_block(rest)
-    if kind == NodeKind.Ident && node_name(item) == ARENA_ITEM {
-        return ir_with_scope(item, "", -1, inner)
+    wrap_handler(item, as_block(rest))
+}
+
+// An arena frees its cells as the block closes, so a tail stored past the block is copied
+// out first, inside the scope, while the arena is still live. A tail the function returns
+// is copied where it returns (tail_wrap), and a discarded tail leaves nothing to copy.
+fn wrap_arena(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
+    let item = sublist_get(items, i)
+    cg_promote_arena_enter()
+    let rest = wrap_with_items(node, items, n, i + 1, tail, dest, dest_tid)
+    let mut stmts: List[Int] = [if rest < 0 { -1 } else { as_block(rest) }]
+    let valued = rest >= 0 && tail == TAIL_ASSIGN && dest_tid >= 0
+    if valued {
+        let begin = cg_promote_trace_begin(cs_current_fn_name, item)
+        if begin != -2 { stmts.push(begin) }
     }
-    wrap_handler(item, inner)
+    if valued && cg_promote_needs_walk(dest_tid) {
+        let rec = layout_at(dest_tid, Position.Local, item)
+        let held = ir_var_ref(dest_tid, item, rec.c_spelling, dest, rec.slot_form)
+        let moved = cg_promote_value(dest_tid, held, cg_promote_innermost_target(item), item)
+        stmts.push(if moved < 0 { -1 } else {
+            ir_assign(item, ir_var_ref(dest_tid, item, rec.c_spelling, dest, rec.slot_form), moved)
+        })
+    }
+    let target = cg_promote_arena_exit()
+    for s in stmts { if s < 0 { return -1 } }
+    let scope = ir_arena_scope(item, target, ir_block(item, stmts))
+    let end = if valued { cg_promote_trace_end(cs_current_fn_name, dest_tid, item) } else { -2 }
+    if end == -2 { return scope }
+    if end < 0 { return -1 }
+    ir_block(item, [scope, end])
 }
 
 // A scope and a handler each carry their body as a block, so an item that wraps another

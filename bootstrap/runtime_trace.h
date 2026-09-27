@@ -381,4 +381,24 @@ BLINK_RT_FN void blink_trace_arena_promote(const char* fn, const char* module, i
 }
 #endif
 
+/* The two ends of one promotion, as codegen calls them. "begin" runs inside the block,
+   where `target` is the arena it was entered from. "end" runs after the block closed,
+   where that arena is current again. */
+BLINK_RT_FN void blink_trace_arena_promote_begin(const char* fn, const char* module,
+    blink_arena_t* target, const char* file, int64_t line, int64_t col);
+BLINK_RT_FN void blink_trace_arena_promote_end(const char* fn, const char* module,
+    const char* desc, const char* file, int64_t line, int64_t col);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_arena_promote_begin(const char* fn, const char* module,
+    blink_arena_t* target, const char* file, int64_t line, int64_t col) {
+    blink_trace_arena_promote(fn, module, __blink_trace.depth, "begin",
+        target ? "outer arena" : "GC heap", "", file, (int)line, (int)col);
+}
+BLINK_RT_FN void blink_trace_arena_promote_end(const char* fn, const char* module,
+    const char* desc, const char* file, int64_t line, int64_t col) {
+    blink_trace_arena_promote(fn, module, __blink_trace.depth, "end",
+        __blink_current_arena ? "outer arena" : "GC heap", desc, file, (int)line, (int)col);
+}
+#endif
+
 #endif /* BLINK_RUNTIME_TRACE_H */

@@ -1,0 +1,729 @@
+// cg_promote.bl: copying a value out of an arena as the arena closes (§5.2.1).
+//
+// A `with arena { }` block frees every cell it allocated when it ends. A value that leaves
+// the block, by its tail, a `return` or a `?`, may still point into it, so the value is
+// copied by a walker generated for its type: `blink_promote_<Type>(value, target)` copies
+// every arena-held part of the value into the target. The target is the arena the block
+// was entered from, or the GC heap when that is NULL. A walker is written only for a type
+// that crosses a boundary, once per unit and static, so every unit that crosses with a type
+// holds its own copy and no two units define one symbol.
+//
+// A recursive type at a boundary is E0701: the escape pass refuses it in the source, and
+// cg_promote_value refuses it again in each instance of a generic body, where the type
+// first becomes known. So a walker never meets its own type below itself. Meeting it here is an internal error, never a loop and never a
+// shallow copy: a shallow copy compiles, and then reads freed memory.
+
+import diagnostics.{
+    Diag, diag_file_for_node, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
+    ARENA_PROMOTION_INVARIANT,
+    UNSOLVED_TYPEVAR_AT_CODEGEN,
+}
+import layout.{
+    LayoutRecord, Position, SlotForm, Slot, child_tid, carrier_member_layout, enum_tag_tid,
+    field_layout_of, layout_of, tid_is_opaque_handle, ensure_typedef_for,
+}
+import cname.{
+    c_field_name, c_mint_local, c_runtime_helper, c_tuple_member, c_variant_discriminant,
+    c_enum_tag_member, c_enum_payload_member, c_promote_walker_name, c_string_literal,
+}
+import cg_print.{print_fn}
+import escape.{ea_refuse_recursive_crossing}
+import cg_reg.{cg_reg_tid_for_decl}
+import cg_call.{cg_call_element_from_runtime, cg_call_element_to_slot}
+import ir.{
+    ir_arena_target, ir_assign, ir_binary, ir_block, ir_box, ir_break, ir_c_spelling,
+    ir_call_direct, ir_call_runtime, ir_carrier_tag, ir_const, ir_expr_stmt, ir_field_get,
+    ir_if, ir_let, ir_loop, ir_return, ir_switch, ir_unary, ir_unbox, ir_var_ref,
+    ir_verify_in_frame,
+}
+import typecheck.{
+    TYPE_BOOL, TYPE_INT, TYPE_STR, TYPE_VOID, TyKind, tc_enum_variant_slots, tc_evar_field_slots,
+    tc_evar_name, tc_evfield_name, tc_evfield_tid, tc_member_tid_at_instance, tc_resolve,
+    tc_sfield_name, tc_sfield_tid, tc_struct_field_slots, tc_tid_child_count,
+    tc_tid_decl_node, tc_tid_kind, tc_type_str,
+}
+import parser.{
+    node_col, node_fields, node_line, node_name, node_source_module, sublist_get, sublist_length,
+}
+
+// The tag numbers and member names a carrier is laid out with. cg_call and cg_stmt build
+// and match carriers with the same pairs.
+let PROMOTE_TAG_SOME = "1"
+let PROMOTE_TAG_OK = "0"
+let PROMOTE_TAG_ERR = "1"
+let PROMOTE_SOME_MEMBER = "value"
+let PROMOTE_OK_MEMBER = "ok"
+let PROMOTE_ERR_MEMBER = "err"
+
+// ── Arena frames ──────────────────────────────────────────────────────────
+
+// One `with arena` the lowering is inside, innermost last. `target` is the local the scope
+// binds to the arena it was entered from; `used` says whether anything read it, so a
+// scope nothing promotes out of binds nothing.
+type ArenaFrame {
+    target: Str
+    used: Bool
+}
+
+let mut promote_frames: List[ArenaFrame] = []
+
+pub fn cg_promote_arena_enter() {
+    promote_frames.push(ArenaFrame { target: c_mint_local("arena_prev"), used: false })
+}
+
+// The name the closing scope binds, or "" when nothing read it.
+pub fn cg_promote_arena_exit() -> Str {
+    match promote_frames.pop() {
+        Some(f) => if f.used { f.target } else { "" }
+        None => ""
+    }
+}
+
+pub fn cg_promote_in_arena() -> Bool { promote_frames.len() > 0 }
+
+// A block's tail lands in the arena the block was entered from.
+pub fn cg_promote_innermost_target(span: Int) -> Int {
+    frame_target(promote_frames.len() - 1, span)
+}
+
+// A return or a `?` leaves every arena of the function, so its value lands in the arena
+// the outermost one was entered from: the nearest arena that outlives the call.
+pub fn cg_promote_outermost_target(span: Int) -> Int {
+    frame_target(0, span)
+}
+
+fn frame_target(i: Int, span: Int) -> Int {
+    let f = promote_frames.get(i).unwrap()
+    promote_frames.set(i, ArenaFrame { target: f.target, used: true })
+    ir_arena_target(span, f.target)
+}
+
+// A function body starts outside every arena, whatever body was lowering when it began.
+let mut promote_saved: List[List[ArenaFrame]] = []
+
+pub fn cg_promote_body_enter() {
+    promote_saved.push(promote_frames)
+    promote_frames = []
+}
+
+pub fn cg_promote_body_exit() {
+    match promote_saved.pop() {
+        Some(frames) => promote_frames = frames
+        None => promote_frames = []
+    }
+}
+
+// ── Trace ─────────────────────────────────────────────────────────────────
+
+// A program built with runtime tracing reports each `with arena { expr }` promotion as a
+// begin event inside the block and an end event after it closes.
+let mut promote_trace = false
+
+pub fn cg_promote_set_trace(on: Bool) { promote_trace = on }
+
+// The begin event, which reads the target the scope binds. -2 when tracing is off.
+pub fn cg_promote_trace_begin(fn_name: Str, span: Int) -> Int ! Diag.Report {
+    if !promote_trace { return -2 }
+    trace_call(span, "trace_arena_promote_begin", fn_name, [cg_promote_innermost_target(span)])
+}
+
+// The end event, after the scope has made the target current again. -2 when tracing is off.
+pub fn cg_promote_trace_end(fn_name: Str, tid: Int, span: Int) -> Int ! Diag.Report {
+    if !promote_trace { return -2 }
+    let desc = if tid < 0 { "" } else { tc_type_str(tc_resolve(tid)) }
+    trace_call(span, "trace_arena_promote_end", fn_name, [text_arg(span, desc)])
+}
+
+fn trace_call(span: Int, helper: Str, fn_name: Str, middle: List[Int]) -> Int ! Diag.Report {
+    let mut args = [text_arg(span, fn_name), text_arg(span, node_source_module(span))]
+    for m in middle { args.push(m) }
+    args.push(text_arg(span, diag_file_for_node(span)))
+    args.push(int_arg(span, node_line(span)))
+    args.push(int_arg(span, node_col(span)))
+    let void_rec = layout_of(TYPE_VOID, Position.Return)
+    ir_expr_stmt(span, ir_call_runtime(TYPE_VOID, span, void_rec.c_spelling, c_runtime_helper(helper),
+        void_rec.slot_form, args))
+}
+
+fn text_arg(span: Int, text: Str) -> Int {
+    ir_const(TYPE_STR, span, layout_of(TYPE_STR, Position.Local).c_spelling, c_string_literal(text))
+}
+
+fn int_arg(span: Int, n: Int) -> Int {
+    ir_const(TYPE_INT, span, layout_of(TYPE_INT, Position.Local).c_spelling, "{n}")
+}
+
+// ── Unit state ────────────────────────────────────────────────────────────
+
+// needs_walk answers, keyed on the resolved tid: 0 no, 1 yes, 2 being answered.
+let mut walk_memo: Map[Int, Int] = Map()
+// Walker symbols this unit has written or is writing: 1 written, 2 being built.
+let mut walker_names: Map[Str, Int] = Map()
+
+type PendingWalker {
+    symbol: Str
+    ret: Str
+    params: List[Str]
+    body: Int
+}
+
+let mut pending_walkers: List[PendingWalker] = []
+
+pub fn cg_promote_reset() {
+    promote_trace = false
+    promote_frames = []
+    promote_saved = []
+    walk_memo = Map()
+    walker_names = Map()
+    pending_walkers = []
+}
+
+pub fn cg_promote_has_pending() -> Bool { pending_walkers.len() > 0 }
+
+// The walkers built since the last print, children first, so each one's callees are
+// defined above it. The caller prints them after the typedefs they spell and before the
+// body that calls them.
+pub fn cg_promote_print_walkers() ! Diag.Report {
+    let ws = pending_walkers
+    pending_walkers = []
+    for w in ws { print_fn(true, w.ret, w.symbol, w.params, false, w.body) }
+}
+
+// ── What a type holds ─────────────────────────────────────────────────────
+
+// How a value of one kind is copied out. Shared kinds are identity objects the runtime
+// never allocates in an arena, so their word is the value. Every kind is named here, so
+// a kind added without a rule fails to compile rather than passing through uncopied.
+type WalkClass {
+    Leaf, Shared, Text, Closure, ListShell, MapShell, SetShell, FlatShell,
+    Record, Tagged, Carrier, Tuple, Unbuilt, Unsolved
+}
+
+fn kind_class(k: TyKind) -> WalkClass {
+    match k {
+        TyKind.Int => WalkClass.Leaf
+        TyKind.Float => WalkClass.Leaf
+        TyKind.Bool => WalkClass.Leaf
+        TyKind.Void => WalkClass.Leaf
+        TyKind.Never => WalkClass.Leaf
+        TyKind.Char => WalkClass.Leaf
+        TyKind.I8 => WalkClass.Leaf
+        TyKind.I16 => WalkClass.Leaf
+        TyKind.I32 => WalkClass.Leaf
+        TyKind.U8 => WalkClass.Leaf
+        TyKind.U16 => WalkClass.Leaf
+        TyKind.U32 => WalkClass.Leaf
+        TyKind.U64 => WalkClass.Leaf
+        TyKind.Handle => WalkClass.Shared
+        TyKind.Channel => WalkClass.Shared
+        // A raw pointer names memory the program manages itself; copying it would change
+        // what it points at.
+        TyKind.Ptr => WalkClass.Shared
+        TyKind.Str => WalkClass.Text
+        TyKind.Fn => WalkClass.Closure
+        TyKind.Iterator => WalkClass.Closure
+        TyKind.List => WalkClass.ListShell
+        TyKind.Map => WalkClass.MapShell
+        TyKind.Set => WalkClass.SetShell
+        TyKind.Bytes => WalkClass.FlatShell
+        TyKind.StringBuilder => WalkClass.FlatShell
+        TyKind.Struct => WalkClass.Record
+        TyKind.Enum => WalkClass.Tagged
+        TyKind.Option => WalkClass.Carrier
+        TyKind.Result => WalkClass.Carrier
+        TyKind.Tuple => WalkClass.Tuple
+        TyKind.Handler => WalkClass.Unbuilt
+        TyKind.Template => WalkClass.Unbuilt
+        TyKind.Raw => WalkClass.Unbuilt
+        TyKind.FfiScope => WalkClass.Unbuilt
+        TyKind.Typevar => WalkClass.Unsolved
+        TyKind.Unknown => WalkClass.Unsolved
+    }
+}
+
+// A struct, enum or carrier that layout holds in one word is a transparent newtype, an
+// opaque handle, a payload-less enum or an Option over a handle: nothing in it is arena
+// memory the walk could reach.
+fn walk_class(tid: Int) -> WalkClass {
+    let r = tc_resolve(tid)
+    let c = kind_class(tc_tid_kind(r))
+    if c == WalkClass.Record || c == WalkClass.Tagged || c == WalkClass.Carrier {
+        if tid_is_opaque_handle(r) { return WalkClass.Leaf }
+        if layout_of(r, Position.Local).slot_form == SlotForm.InlineWord { return WalkClass.Leaf }
+    }
+    c
+}
+
+// Whether a value of this type can hold arena memory. A type still being answered is a
+// recursive one, which the walker refuses when it meets it, so it answers yes here.
+pub fn cg_promote_needs_walk(tid: Int) -> Bool {
+    let r = tc_resolve(tid)
+    match walk_memo.get(r) {
+        Some(v) => return v != 0
+        None => {}
+    }
+    walk_memo.insert(r, 2)
+    let yes = needs_walk_uncached(r)
+    walk_memo.insert(r, if yes { 1 } else { 0 })
+    yes
+}
+
+fn needs_walk_uncached(r: Int) -> Bool {
+    match walk_class(r) {
+        WalkClass.Leaf => false
+        WalkClass.Shared => false
+        WalkClass.Record => any_field_walks(r)
+        WalkClass.Tagged => any_payload_walks(r)
+        WalkClass.Carrier => carrier_walks(r)
+        WalkClass.Tuple => any_elem_walks(r)
+        _ => true
+    }
+}
+
+fn any_field_walks(r: Int) -> Bool {
+    for slot in tc_struct_field_slots(r) {
+        if member_walks(r, tc_member_tid_at_instance(tc_sfield_tid(slot), r)) { return true }
+    }
+    false
+}
+
+fn any_payload_walks(r: Int) -> Bool {
+    let decl = tc_tid_decl_node(r)
+    if decl < 0 { return true }
+    for v in tc_enum_variant_slots(cg_reg_tid_for_decl(decl)) {
+        for f in tc_evar_field_slots(v) {
+            if member_walks(r, tc_member_tid_at_instance(tc_evfield_tid(f), r)) { return true }
+        }
+    }
+    false
+}
+
+// A field boxed because it embeds its owner is a recursive type: yes, and the walker
+// refuses it.
+fn member_walks(owner: Int, ftid: Int) -> Bool {
+    if field_layout_of(owner, ftid).slot_form == SlotForm.PointerBoxed { return true }
+    cg_promote_needs_walk(ftid)
+}
+
+fn carrier_walks(r: Int) -> Bool {
+    if carrier_slot_walks(r, Slot.Inner1) { return true }
+    tc_tid_kind(r) == TyKind.Result && carrier_slot_walks(r, Slot.Inner2)
+}
+
+// A boxed member's box was allocated where the carrier was built, so it walks even when
+// the value inside it does not.
+fn carrier_slot_walks(r: Int, slot: Slot) -> Bool {
+    let inner = child_tid(r, slot)
+    if inner < 0 { return false }
+    if carrier_member_layout(r, slot).slot_form == SlotForm.PointerBoxed { return true }
+    cg_promote_needs_walk(inner)
+}
+
+fn any_elem_walks(r: Int) -> Bool {
+    let mut i = 0
+    while i < tc_tid_child_count(r) {
+        if cg_promote_needs_walk(child_tid(r, Slot.Elem(i))) { return true }
+        i = i + 1
+    }
+    false
+}
+
+// A container slot holds either the element's own word or a box of it, and the box lives
+// where the element was stored.
+fn slot_walks(etid: Int) -> Bool {
+    if layout_of(etid, Position.ContainerSlot).slot_form == SlotForm.PointerBoxed { return true }
+    cg_promote_needs_walk(etid)
+}
+
+// ── Promoting one value ───────────────────────────────────────────────────
+
+// The value copied into `target`, or the value itself when nothing in its type can be
+// arena memory. -1 after a refusal.
+pub fn cg_promote_value(tid: Int, value: Int, target: Int, span: Int) -> Int ! Diag.Report {
+    if value < 0 { return -1 }
+    if !cg_promote_needs_walk(tid) { return value }
+    if ea_refuse_recursive_crossing(span, tid) { return -1 }
+    let rec = layout_of(tid, Position.Return)
+    if rec.decline_reason != "" { return declined(rec, tid, span) }
+    match walk_class(tid) {
+        WalkClass.Text => ir_call_runtime(tid, span, rec.c_spelling, c_runtime_helper("promote_str"),
+            rec.slot_form, [target, value])
+        WalkClass.Closure => ir_call_runtime(tid, span, rec.c_spelling, c_runtime_helper("closure_promote"),
+            rec.slot_form, [target, value])
+        _ => {
+            let symbol = walker_for(tid, span)
+            if symbol == "" { return -1 }
+            ir_call_direct(tid, span, rec.c_spelling, symbol, rec.slot_form, [value, target])
+        }
+    }
+}
+
+// A value leaving the function by `return` or `?` while an arena of the function is open.
+// Outside every arena it leaves as it is.
+pub fn cg_promote_on_exit(ret_tid: Int, value: Int, span: Int) -> Int ! Diag.Report {
+    if value < 0 || !cg_promote_in_arena() || ret_tid < 0 { return value }
+    if !cg_promote_needs_walk(ret_tid) { return value }
+    cg_promote_value(ret_tid, value, cg_promote_outermost_target(span), span)
+}
+
+// ── Walkers ───────────────────────────────────────────────────────────────
+
+// What one walker body reads: the value handed in, the copy it builds, and the target.
+type Walk {
+    tid: Int
+    span: Int
+    value: Str
+    out: Str
+    target: Str
+    rec: LayoutRecord
+}
+
+fn walk_value(w: Walk) -> Int {
+    ir_var_ref(w.tid, w.span, w.rec.c_spelling, w.value, w.rec.slot_form)
+}
+
+fn walk_out(w: Walk) -> Int {
+    ir_var_ref(w.tid, w.span, w.rec.c_spelling, w.out, w.rec.slot_form)
+}
+
+fn walk_target(w: Walk) -> Int { ir_arena_target(w.span, w.target) }
+
+fn ints() -> LayoutRecord { layout_of(TYPE_INT, Position.Local) }
+
+fn int_const(span: Int, text: Str) -> Int {
+    let r = ints()
+    ir_const(TYPE_INT, span, r.c_spelling, text)
+}
+
+fn int_ref(span: Int, name: Str) -> Int {
+    let r = ints()
+    ir_var_ref(TYPE_INT, span, r.c_spelling, name, r.slot_form)
+}
+
+// The walker's symbol, built on first use. "" after a refusal.
+fn walker_for(tid: Int, span: Int) -> Str ! Diag.Report {
+    let symbol = c_promote_walker_name(tid)
+    if diag_is_ice_seg(symbol) {
+        diag_ice_at("PromoteWalkerUnnamed", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "no walker name for {tc_type_str(tc_resolve(tid))}: {symbol}", span,
+            "every type that crosses an arena boundary must be concrete and nameable; this is a compiler bug")
+        return ""
+    }
+    match walker_names.get(symbol) {
+        Some(state) => {
+            if state == 1 { return symbol }
+            invariant(span, "the arena walker for {tc_type_str(tc_resolve(tid))} reached its own type, and a recursive type is refused before any walker is built")
+            return ""
+        }
+        None => {}
+    }
+    walker_names.insert(symbol, 2)
+    let ok = build_walker(tid, symbol, span)
+    walker_names.insert(symbol, 1)
+    if ok { symbol } else { "" }
+}
+
+fn build_walker(tid: Int, symbol: Str, span: Int) -> Bool ! Diag.Report {
+    let _ = ensure_typedef_for(tid)
+    let rec = layout_of(tid, Position.Local)
+    let w = Walk { tid: tid, span: span, value: "value", out: c_mint_local("out"),
+        target: "target", rec: rec }
+    let fixes = walk_fixes(w)
+    if fixes.len() == 1 && fixes.get(0).unwrap() < 0 { return false }
+    let voids = layout_of(TYPE_VOID, Position.Return)
+    let enter = ir_call_runtime(TYPE_VOID, span, voids.c_spelling, c_runtime_helper("promote_enter"),
+        voids.slot_form, [walk_target(w)])
+    let leave = ir_call_runtime(TYPE_VOID, span, voids.c_spelling, c_runtime_helper("promote_leave"),
+        voids.slot_form, [])
+    let mut stmts: List[Int] = [ir_expr_stmt(span, enter)]
+    for f in fixes { stmts.push(f) }
+    stmts.push(ir_expr_stmt(span, leave))
+    stmts.push(ir_return(span, walk_out(w)))
+    let body = ir_block(span, stmts)
+    let problems = ir_verify_in_frame(body, [w.value, w.target])
+    if problems.len() > 0 {
+        invariant(span, "the arena walker {symbol} does not verify: {problems.get(0).unwrap()}")
+        return false
+    }
+    let params = ["{layout_of(tid, Position.Param).c_spelling} {w.value}",
+        "{ir_c_spelling(walk_target(w))} {w.target}"]
+    pending_walkers.push(PendingWalker { symbol: symbol, ret: layout_of(tid, Position.Return).c_spelling,
+        params: params, body: body })
+    true
+}
+
+// The statements that build the copy into `out`: a declaration first, then the fixes.
+// A one-element list holding -1 is a refusal.
+fn walk_fixes(w: Walk) -> List[Int] ! Diag.Report {
+    match walk_class(w.tid) {
+        WalkClass.ListShell => list_fixes(w)
+        WalkClass.MapShell => keyed_fixes(w, true)
+        WalkClass.SetShell => keyed_fixes(w, false)
+        WalkClass.FlatShell => [shell_copy(w, if tc_tid_kind(tc_resolve(w.tid)) == TyKind.Bytes { "bytes_copy_shell" } else { "sb_copy_shell" })]
+        WalkClass.Record => record_fixes(w)
+        WalkClass.Tagged => tagged_fixes(w)
+        WalkClass.Carrier => carrier_fixes(w)
+        WalkClass.Tuple => tuple_fixes(w)
+        WalkClass.Unbuilt => refuse_unbuilt(w)
+        WalkClass.Unsolved => refuse_unsolved(w)
+        _ => {
+            invariant(w.span, "a {tc_type_str(tc_resolve(w.tid))} reached the walker builder, which copies no such kind")
+            [-1]
+        }
+    }
+}
+
+fn refuse_unbuilt(w: Walk) -> List[Int] ! Diag.Report {
+    diag_ice_stage_not_built("arena promotion of a {tc_type_str(tc_resolve(w.tid))}", w.span)
+    [-1]
+}
+
+fn refuse_unsolved(w: Walk) -> List[Int] ! Diag.Report {
+    diag_ice_at("PromoteTypeUnsolved", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "a value of unsolved type {tc_type_str(tc_resolve(w.tid))} crosses an arena boundary", w.span,
+        "every type that reaches code generation must be concrete; this is a compiler bug")
+    [-1]
+}
+
+fn invariant(span: Int, message: Str) ! Diag.Report {
+    diag_ice_at("ArenaPromotionInvariant", ARENA_PROMOTION_INVARIANT, message, span,
+        "this is a compiler bug")
+}
+
+fn declined(rec: LayoutRecord, tid: Int, span: Int) -> Int ! Diag.Report {
+    diag_ice_at("PromoteTypeUnspellable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "no C layout for {tc_type_str(tc_resolve(tid))} at an arena boundary: {rec.decline_reason}", span,
+        "every type that reaches code generation must be concrete and nameable; this is a compiler bug")
+    -1
+}
+
+// `out` declared as a fresh shell of `value`, allocated in the target.
+fn shell_copy(w: Walk, helper: Str) -> Int {
+    let copy = ir_call_runtime(w.tid, w.span, w.rec.c_spelling, c_runtime_helper(helper),
+        w.rec.slot_form, [walk_value(w)])
+    ir_let(w.tid, w.span, w.rec.c_spelling, w.out, w.rec.slot_form, copy)
+}
+
+// `out` declared as a copy of `value`, for a value held by value.
+fn value_copy(w: Walk) -> Int {
+    ir_let(w.tid, w.span, w.rec.c_spelling, w.out, w.rec.slot_form, walk_value(w))
+}
+
+// `for i in 0..count { body(i) }`, over a count read from `out`.
+fn index_loop(w: Walk, count_helper: Str, body: List[Int], i: Str) -> List[Int] {
+    let span = w.span
+    let n = c_mint_local("n")
+    let bools = layout_of(TYPE_BOOL, Position.Local).c_spelling
+    let r = ints()
+    let count = ir_call_runtime(TYPE_INT, span, r.c_spelling, c_runtime_helper(count_helper),
+        r.slot_form, [walk_out(w)])
+    let done = ir_binary(TYPE_BOOL, span, bools, ">=", int_ref(span, i), int_ref(span, n))
+    let mut turn: List[Int] = [ir_if(span, done, ir_block(span, [ir_break(span)]), -1)]
+    for s in body { turn.push(s) }
+    turn.push(ir_assign(span, int_ref(span, i),
+        ir_binary(TYPE_INT, span, r.c_spelling, "+", int_ref(span, i), int_const(span, "1"))))
+    [ir_let(TYPE_INT, span, r.c_spelling, i, r.slot_form, int_const(span, "0")),
+        ir_let(TYPE_INT, span, r.c_spelling, n, r.slot_form, count),
+        ir_loop(span, ir_block(span, turn))]
+}
+
+// A slot word read by `get_helper`, promoted, and written back by `set_helper`. Decoding
+// and encoding the word again also gives a boxed element a fresh box in the target. -1
+// after a refusal.
+fn slot_fix(w: Walk, etid: Int, get_helper: Str, set_helper: Str, i: Str) -> Int ! Diag.Report {
+    let span = w.span
+    let read = cg_call_element_from_runtime(span, etid, c_runtime_helper(get_helper), [walk_out(w), int_ref(span, i)])
+    let moved = cg_promote_value(etid, read, walk_target(w), span)
+    if moved < 0 { return -1 }
+    let word = cg_call_element_to_slot(span, etid, moved)
+    if word < 0 { return -1 }
+    let voids = layout_of(TYPE_VOID, Position.Return)
+    ir_expr_stmt(span, ir_call_runtime(TYPE_VOID, span, voids.c_spelling, c_runtime_helper(set_helper),
+        voids.slot_form, [walk_out(w), int_ref(span, i), word]))
+}
+
+fn list_fixes(w: Walk) -> List[Int] ! Diag.Report {
+    let etid = child_tid(tc_resolve(w.tid), Slot.Inner1)
+    let mut out: List[Int] = [shell_copy(w, "list_copy_shell")]
+    if !slot_walks(etid) { return out }
+    let i = c_mint_local("i")
+    let fix = slot_fix(w, etid, "list_get", "list_set", i)
+    if fix < 0 { return [-1] }
+    for s in index_loop(w, "list_len", [fix], i) { out.push(s) }
+    out
+}
+
+// A map's keys and values, or a set's items. The shell copy keeps the slot order and the
+// key-operations table, so a promoted key hashes where it sat and nothing rehashes.
+fn keyed_fixes(w: Walk, is_map: Bool) -> List[Int] ! Diag.Report {
+    let r = tc_resolve(w.tid)
+    let prefix = if is_map { "map" } else { "set" }
+    let key = child_tid(r, Slot.Inner1)
+    let mut out: List[Int] = [shell_copy(w, "{prefix}_copy_shell")]
+    let i = c_mint_local("i")
+    let mut fixes: List[Int] = []
+    // An inline key fits one word and is no Str, so it holds no arena memory.
+    let inline_key = layout_of(key, Position.Local).kops_inline_key
+    if inline_key && cg_promote_needs_walk(key) {
+        invariant(w.span, "a {tc_type_str(key)} key is held inline in its slot but can hold arena memory")
+        return [-1]
+    }
+    if !inline_key && slot_walks(key) {
+        let kget = if is_map { "map_slot_key_word" } else { "set_slot_item_word" }
+        let kset = if is_map { "map_slot_set_key_word" } else { "set_slot_set_item_word" }
+        let kfix = slot_fix(w, key, kget, kset, i)
+        if kfix < 0 { return [-1] }
+        fixes.push(kfix)
+    }
+    if is_map {
+        let value = child_tid(r, Slot.Inner2)
+        if slot_walks(value) {
+            let vfix = slot_fix(w, value, "map_slot_value", "map_slot_set_value", i)
+            if vfix < 0 { return [-1] }
+            fixes.push(vfix)
+        }
+    }
+    if fixes.len() == 0 { return out }
+    let bools = layout_of(TYPE_BOOL, Position.Local)
+    let r_int = ints()
+    let live = ir_call_runtime(TYPE_INT, w.span, r_int.c_spelling, c_runtime_helper("{prefix}_slot_live"),
+        r_int.slot_form, [walk_out(w), int_ref(w.span, i)])
+    let is_live = ir_binary(TYPE_BOOL, w.span, bools.c_spelling, "!=", live, int_const(w.span, "0"))
+    let guarded = ir_if(w.span, is_live, ir_block(w.span, fixes), -1)
+    for s in index_loop(w, "{prefix}_slot_count", [guarded], i) { out.push(s) }
+    out
+}
+
+// `out.path = promote(value.path)` for one member held by value. -1 after a refusal.
+fn member_fix(w: Walk, mtid: Int, mrec: LayoutRecord, path: Str) -> Int ! Diag.Report {
+    let span = w.span
+    let read = ir_field_get(mtid, span, mrec.c_spelling, path, mrec.slot_form, walk_value(w))
+    let moved = cg_promote_value(mtid, read, walk_target(w), span)
+    if moved < 0 { return -1 }
+    ir_assign(span, ir_field_get(mtid, span, mrec.c_spelling, path, mrec.slot_form, walk_out(w)), moved)
+}
+
+// A member boxed because it embeds its owner is a recursive type, which E0701 refuses.
+fn owned_member_fix(w: Walk, mtid: Int, path: Str) -> Int ! Diag.Report {
+    let frec = field_layout_of(tc_resolve(w.tid), mtid)
+    if frec.slot_form == SlotForm.PointerBoxed {
+        invariant(w.span, "field `{path}` of {tc_type_str(tc_resolve(w.tid))} embeds its owner, and a recursive type is refused before any walker is built")
+        return -1
+    }
+    if !cg_promote_needs_walk(mtid) { return -2 }
+    member_fix(w, mtid, frec, path)
+}
+
+fn record_fixes(w: Walk) -> List[Int] ! Diag.Report {
+    let r = tc_resolve(w.tid)
+    let mut out: List[Int] = [value_copy(w)]
+    for slot in tc_struct_field_slots(r) {
+        let ftid = tc_member_tid_at_instance(tc_sfield_tid(slot), r)
+        let fix = owned_member_fix(w, ftid, c_field_name(tc_sfield_name(slot)))
+        if fix == -1 { return [-1] }
+        if fix >= 0 { out.push(fix) }
+    }
+    out
+}
+
+fn tuple_fixes(w: Walk) -> List[Int] ! Diag.Report {
+    let r = tc_resolve(w.tid)
+    let mut out: List[Int] = [value_copy(w)]
+    let mut i = 0
+    while i < tc_tid_child_count(r) {
+        let etid = child_tid(r, Slot.Elem(i))
+        if cg_promote_needs_walk(etid) {
+            let fix = member_fix(w, etid, layout_of(etid, Position.TupleElem), c_tuple_member(i))
+            if fix < 0 { return [-1] }
+            out.push(fix)
+        }
+        i = i + 1
+    }
+    out
+}
+
+// One case per variant whose payload holds arena memory; every other variant is its own
+// copy already.
+fn tagged_fixes(w: Walk) -> List[Int] ! Diag.Report {
+    let r = tc_resolve(w.tid)
+    let decl = tc_tid_decl_node(r)
+    if decl < 0 {
+        invariant(w.span, "enum {tc_type_str(r)} reached the walker with no declaration")
+        return [-1]
+    }
+    let slots = tc_enum_variant_slots(cg_reg_tid_for_decl(decl))
+    let vars = node_fields(decl)
+    let r_int = ints()
+    let mut cases: List[Int] = []
+    let mut i = 0
+    while i < slots.len() {
+        let slot = slots.get(i).unwrap()
+        let vnode = if vars == -1 || i >= sublist_length(vars) { -1 } else { sublist_get(vars, i) }
+        if vnode < 0 || node_name(vnode) != tc_evar_name(slot) {
+            invariant(w.span, "variant {i} of {tc_type_str(r)} is registered and declared differently")
+            return [-1]
+        }
+        let mut fixes: List[Int] = []
+        for f in tc_evar_field_slots(slot) {
+            let ftid = tc_member_tid_at_instance(tc_evfield_tid(f), r)
+            let path = "{c_enum_payload_member()}.{tc_evar_name(slot)}.{c_field_name(tc_evfield_name(f))}"
+            let fix = owned_member_fix(w, ftid, path)
+            if fix == -1 { return [-1] }
+            if fix >= 0 { fixes.push(fix) }
+        }
+        if fixes.len() > 0 {
+            cases.push(ir_const(TYPE_INT, w.span, r_int.c_spelling, c_variant_discriminant(r, vnode)))
+            cases.push(ir_block(w.span, fixes))
+        }
+        i = i + 1
+    }
+    let tag = ir_field_get(enum_tag_tid(), w.span, layout_of(enum_tag_tid(), Position.Field).c_spelling,
+        c_enum_tag_member(), SlotForm.InlineWord, walk_value(w))
+    [value_copy(w), ir_switch(w.span, tag, cases, ir_block(w.span, []))]
+}
+
+fn carrier_fixes(w: Walk) -> List[Int] ! Diag.Report {
+    let r = tc_resolve(w.tid)
+    let mut out: List[Int] = [value_copy(w)]
+    let is_option = tc_tid_kind(r) == TyKind.Option
+    let tag = if is_option { PROMOTE_TAG_SOME } else { PROMOTE_TAG_OK }
+    let member = if is_option { PROMOTE_SOME_MEMBER } else { PROMOTE_OK_MEMBER }
+    let first = arm_fix(w, Slot.Inner1, tag, member)
+    if first == -1 { return [-1] }
+    if first >= 0 { out.push(first) }
+    if !is_option {
+        let second = arm_fix(w, Slot.Inner2, PROMOTE_TAG_ERR, PROMOTE_ERR_MEMBER)
+        if second == -1 { return [-1] }
+        if second >= 0 { out.push(second) }
+    }
+    out
+}
+
+// `if (value.tag == T) out.member = promote(value.member)`, where a boxed member gets a
+// fresh box around its promoted value. -2 when the arm needs nothing.
+fn arm_fix(w: Walk, slot: Slot, tag_text: Str, member: Str) -> Int ! Diag.Report {
+    let span = w.span
+    let inner = child_tid(tc_resolve(w.tid), slot)
+    if inner < 0 { return -2 }
+    let mrec = carrier_member_layout(tc_resolve(w.tid), slot)
+    let boxed = mrec.slot_form == SlotForm.PointerBoxed
+    if !boxed && !cg_promote_needs_walk(inner) { return -2 }
+    let fix = if boxed { boxed_member_fix(w, inner, mrec, member) } else { member_fix(w, inner, mrec, member) }
+    if fix < 0 { return -1 }
+    let r_int = ints()
+    let bools = layout_of(TYPE_BOOL, Position.Local)
+    let tag = ir_carrier_tag(TYPE_INT, span, r_int.c_spelling, walk_value(w))
+    let hit = ir_binary(TYPE_BOOL, span, bools.c_spelling, "==", tag, int_const(span, tag_text))
+    ir_if(span, hit, ir_block(span, [fix]), -1)
+}
+
+fn boxed_member_fix(w: Walk, inner: Int, mrec: LayoutRecord, member: Str) -> Int ! Diag.Report {
+    let span = w.span
+    let vrec = layout_of(inner, Position.Local)
+    let ptr = ir_field_get(inner, span, mrec.c_spelling, member, mrec.slot_form, walk_value(w))
+    let read = ir_unbox(inner, span, vrec.c_spelling, vrec.slot_form, ptr)
+    let moved = cg_promote_value(inner, read, walk_target(w), span)
+    if moved < 0 { return -1 }
+    let boxed = ir_box(inner, span, mrec.c_spelling, vrec.c_spelling, moved)
+    ir_assign(span, ir_field_get(inner, span, mrec.c_spelling, member, mrec.slot_form, walk_out(w)), boxed)
+}

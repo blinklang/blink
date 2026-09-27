@@ -80,14 +80,14 @@ BLINK_RT_FN blink_threadpool* blink_threadpool_init(int thread_count) {
     if (thread_count <= 0) {
         thread_count = 4;
     }
-    blink_threadpool* pool = (blink_threadpool*)blink_alloc(sizeof(blink_threadpool));
+    blink_threadpool* pool = (blink_threadpool*)blink_alloc_shared(sizeof(blink_threadpool));
     pool->thread_count = thread_count;
     pool->queue_head = NULL;
     pool->queue_tail = NULL;
     pool->shutdown = 0;
     pthread_mutex_init(&pool->mutex, NULL);
     pthread_cond_init(&pool->cond, NULL);
-    pool->threads = (pthread_t*)blink_alloc(sizeof(pthread_t) * thread_count);
+    pool->threads = (pthread_t*)blink_alloc_shared(sizeof(pthread_t) * thread_count);
     for (int i = 0; i < thread_count; i++) {
         pthread_create(&pool->threads[i], NULL, blink_threadpool_worker, pool);
     }
@@ -98,7 +98,7 @@ BLINK_RT_FN blink_threadpool* blink_threadpool_init(int thread_count) {
 BLINK_RT_FN void blink_threadpool_submit(blink_threadpool* pool, void (*fn)(void*), void* arg);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_threadpool_submit(blink_threadpool* pool, void (*fn)(void*), void* arg) {
-    blink_task* task = (blink_task*)blink_alloc(sizeof(blink_task));
+    blink_task* task = (blink_task*)blink_alloc_shared(sizeof(blink_task));
     task->fn = fn;
     task->arg = arg;
     task->next = NULL;
@@ -150,7 +150,7 @@ BLINK_UNUSED static blink_threadpool* __blink_pool = NULL;
 BLINK_RT_FN blink_handle* blink_handle_new(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_handle* blink_handle_new(void) {
-    blink_handle* h = (blink_handle*)blink_alloc(sizeof(blink_handle));
+    blink_handle* h = (blink_handle*)blink_alloc_shared(sizeof(blink_handle));
     memset(&h->thread, 0, sizeof(pthread_t));
     h->result = NULL;
     h->status = BLINK_HANDLE_RUNNING;
@@ -209,8 +209,8 @@ BLINK_RT_FN blink_channel* blink_channel_new(int64_t capacity);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_channel* blink_channel_new(int64_t capacity) {
     if (capacity <= 0) capacity = 16;
-    blink_channel* ch = (blink_channel*)blink_alloc(sizeof(blink_channel));
-    ch->buffer = (void**)blink_alloc(sizeof(void*) * (size_t)capacity);
+    blink_channel* ch = (blink_channel*)blink_alloc_shared(sizeof(blink_channel));
+    ch->buffer = (void**)blink_alloc_shared(sizeof(void*) * (size_t)capacity);
     ch->capacity = capacity;
     ch->head = 0;
     ch->tail = 0;

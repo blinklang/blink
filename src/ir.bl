@@ -37,7 +37,7 @@ pub type IrKind {
     FieldGet, FieldSet, StructNew, TupleNew, EnumNew, ContainerNew, ContainerSpread,
     Box, Unbox, SizedAlloc, HeapAlloc, CarrierWrap, CarrierUnwrap, CarrierTag, CellRef,
     CallDirect, CallIndirect, CallClosure, CallVirtual, CallRuntime,
-    ClosureNew, EvidenceVector, EvidenceAddress, EffectPerform, HandlerInstall,
+    ClosureNew, EvidenceVector, EvidenceAddress, ArenaTarget, EffectPerform, HandlerInstall,
     Let, CellLet, VolatileLet, Assign, ExprStmt, Return, If, Loop, Break, Continue, Block, Switch, WithScope,
     Panic, Unreachable, PanicCatch, PanicCatchExit,
 }
@@ -185,7 +185,7 @@ pub fn ir_all_kinds() -> List[IrKind] {
         IrKind.ContainerSpread, IrKind.Box, IrKind.Unbox, IrKind.SizedAlloc, IrKind.HeapAlloc,
         IrKind.CarrierWrap, IrKind.CarrierUnwrap, IrKind.CarrierTag, IrKind.CellRef,
         IrKind.CallDirect, IrKind.CallIndirect, IrKind.CallClosure, IrKind.CallVirtual, IrKind.CallRuntime,
-        IrKind.ClosureNew, IrKind.EvidenceVector, IrKind.EvidenceAddress, IrKind.EffectPerform,
+        IrKind.ClosureNew, IrKind.EvidenceVector, IrKind.EvidenceAddress, IrKind.ArenaTarget, IrKind.EffectPerform,
         IrKind.HandlerInstall,
         IrKind.Let, IrKind.CellLet, IrKind.VolatileLet, IrKind.Assign, IrKind.ExprStmt, IrKind.Return, IrKind.If, IrKind.Loop,
         IrKind.Break, IrKind.Continue, IrKind.Block, IrKind.Switch, IrKind.WithScope,
@@ -225,6 +225,7 @@ pub fn ir_kind_name(kind: IrKind) -> Str {
         IrKind.ClosureNew => "ClosureNew"
         IrKind.EvidenceVector => "EvidenceVector"
         IrKind.EvidenceAddress => "EvidenceAddress"
+        IrKind.ArenaTarget => "ArenaTarget"
         IrKind.EffectPerform => "EffectPerform"
         IrKind.HandlerInstall => "HandlerInstall"
         IrKind.Let => "Let"
@@ -307,6 +308,7 @@ fn kind_needs_c_name(kind: IrKind) -> Bool {
         IrKind.CallRuntime => true
         IrKind.ClosureNew => true
         IrKind.EvidenceVector => true
+        IrKind.ArenaTarget => true
         IrKind.EffectPerform => true
         IrKind.HandlerInstall => true
         IrKind.Let => true
@@ -377,6 +379,7 @@ fn kind_max_kids(kind: IrKind) -> Int {
         IrKind.CarrierTag => 1
         IrKind.EvidenceVector => 0
         IrKind.EvidenceAddress => 1
+        IrKind.ArenaTarget => 0
         IrKind.HandlerInstall => 2
         IrKind.Let => 1
         IrKind.VolatileLet => 1
@@ -574,6 +577,13 @@ pub fn ir_closure_new(tid: Int, span: Int, c_spelling: Str, fn_symbol: Str, capt
     set_named_slots(ir_new(IrKind.ClosureNew, tid, span, c_spelling, fn_symbol, SlotForm.InlineWord, captures), "", capture_descs, promoter)
 }
 
+// The arena a promotion copies into: a walker's target parameter, or the local a `with arena`
+// scope binds to the arena that was current when the scope was entered. It has no Blink
+// type, so like the evidence vector its tid is -1. NULL at run time means the GC heap.
+pub fn ir_arena_target(span: Int, c_name: Str) -> Int {
+    ir_new(IrKind.ArenaTarget, -1, span, "blink_arena_t*", c_name, SlotForm.InlineWord, [])
+}
+
 // The evidence vector in scope: the `blink_ev*` parameter of an effectful function
 // (PointerBoxed) or the program's global vector (Inline). It has no Blink type, so it is
 // the one value node whose tid is -1; c_name comes from cname's two vector producers.
@@ -681,6 +691,12 @@ pub fn ir_switch(span: Int, scrutinee: Int, cases: List[Int], default_block: Int
 pub fn ir_with_scope(span: Int, cleanup_symbol: Str, resource: Int, body: Int) -> Int {
     let kids: List[Int] = if resource < 0 { [body] } else { [resource, body] }
     ir_new(IrKind.WithScope, -1, span, "", cleanup_symbol, SlotForm.Inline, kids)
+}
+
+// An arena block. target_name is the local the scope binds to the arena it was entered
+// from, for an ArenaTarget in the body to read; "" when nothing in the body promotes.
+pub fn ir_arena_scope(span: Int, target_name: Str, body: Int) -> Int {
+    ir_new(IrKind.WithScope, -1, span, "", target_name, SlotForm.Inline, [body])
 }
 
 pub fn ir_panic(span: Int, message: Int) -> Int {
@@ -923,6 +939,8 @@ fn verify_fields(id: Int, kind: IrKind, label: Str, errs: List[Str]) {
         if ir_tid(id) >= 0 {
             errs.push("{label}: carries tid {ir_tid(id)}, the address of the vector has no Blink type")
         }
+    } else if kind == IrKind.ArenaTarget {
+        if ir_tid(id) >= 0 { errs.push("{label}: carries tid {ir_tid(id)}, an arena pointer has no Blink type") }
     } else if ir_kind_is_value(kind) && ir_tid(id) < 0 {
         errs.push("{label}: value node without a tid")
     }
