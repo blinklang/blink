@@ -1268,7 +1268,7 @@ let mut tc_collision_reported: Map[Str, Int] = Map()
 let mut ffi_struct_type_set: Map[Int, Int] = Map()
 
 // Tids of @ffi.opaque handle types, keyed the same way as the @ffi.struct set above and for
-// the same reason. Consulted by is_valid_ptr_inner so an out-param `Ptr[Handle]` (the
+// the same reason. Consulted by tc_ptr_pointee_is_valid so an out-param `Ptr[Handle]` (the
 // `<c_name>**` mint shape) is a legal FFI inner type, and by the struct-literal head so a
 // handle stays sealed to the FFI boundary. The handle itself is never a Ptr, so it needs no
 // E0811 carve-out.
@@ -1791,7 +1791,7 @@ pub fn tc_handler_effect_root(effect_name: Str) -> Str {
 
 // The fifth case of the audit above, and the worst of them: TyKind.Ptr did not
 // merely go unconstructed, it did not EXIST. Typecheck only ever checked `Ptr[T]` syntactically
-// (PtrOutsideFFI, InvalidPtrType, is_valid_ptr_inner), so resolve_type_ann fell through to a
+// (PtrOutsideFFI, InvalidPtrType), so resolve_type_ann fell through to a
 // typevar named "Ptr" — as permissive as TYPE_UNKNOWN, and permissive at the RECEIVER, which is
 // why no method arm could have helped. Assigning a Ptr[Pollfd] to a declared Ptr[Int] therefore
 // passed typecheck and failed as a raw cc error inside build/, with no span.
@@ -6604,13 +6604,14 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     // compiler as `int64_t* r = buf` — a cc error with no Blink span.
     //
     // The pointee recurses through resolve_type_ann rather than being read as a name, so
-    // `Ptr[Ptr[Void]]` nests properly. Nothing here re-validates the pointee: the legal set is
-    // enforced separately and syntactically by check_ptr_in_type_ann / is_valid_ptr_inner
-    // (:3734), which walks the annotation tree on its own and must keep doing so — it is the
-    // only thing that sees a `Ptr` in a position that never reaches this function.
+    // `Ptr[Ptr[Void]]` nests properly. The pointee rule (E0810) is checked here, on the
+    // resolved tid, because every position a type can be written in resolves through here.
     if name == "Ptr" {
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-            return make_ptr_type(resolve_type_ann(sublist_get(elems_sl, 0)))
+            let inner = sublist_get(elems_sl, 0)
+            let pointee = resolve_type_ann(inner)
+            tc_check_ptr_pointee(pointee, inner)
+            return make_ptr_type(pointee)
         }
         return make_ptr_type(TYPE_UNKNOWN)
     }
@@ -8617,29 +8618,6 @@ fn tc_ptr_reads_singleton_alloc(obj_node: Int) -> Int {
     tc_node_is_ffi_scope_value(node_obj(init))
 }
 
-// Does the pointee written as `name` carry an FFI annotation? Resolved to a tid first, because
-// the annotation's spelling is not the declaration's: a qualified `m.Sv` and an alias introduced
-// by `import m.{Sv as S}` both name the declaration without matching any key it could be filed
-// under. Both sets answer off the one resolution, because at this call site they are one
-// question: section 9.1.3 admits an @ffi.struct pointee and section 9.1.4 an @ffi.opaque one.
-fn tc_name_is_ffi_annotated(name: Str) -> Int {
-    let t = lookup_named_type(name)
-    if t < 0 { return 0 }
-    let rt = tc_resolve(t)
-    if ffi_struct_type_set.contains_key(rt) != 0 { return 1 }
-    if ffi_opaque_type_set.contains_key(rt) != 0 { return 1 }
-    0
-}
-
-fn is_valid_ptr_inner(name: Str) -> Int {
-    if name == "Void" { return 1 }
-    if name == "U8" || name == "U16" || name == "U32" || name == "U64" { return 1 }
-    if name == "I8" || name == "I16" || name == "I32" || name == "I64" { return 1 }
-    if name == "Int" || name == "Float" || name == "Ptr" { return 1 }
-    if tc_name_is_ffi_annotated(name) != 0 { return 1 }
-    0
-}
-
 fn check_ptr_in_type_ann(ann_node: Int, has_ffi: Int) ! Diag.Report {
     if ann_node == -1 { return }
     let name = node_name(ann_node)
@@ -8659,30 +8637,28 @@ fn check_ptr_in_type_ann(ann_node: Int, has_ffi: Int) ! Diag.Report {
     }
 }
 
-// The pointee half of the §9.1.3 Ptr rule, split from the context half above because the
-// two answer different questions: a pointee outside the closed set is wrong wherever it is
-// named, while PtrOutsideFFI is a property of the enclosing function. Only a parameter and
-// a return type ever asked the first question, so a `let` named any pointee at all and a
-// plain record behind a pointer typed its fields at their own types.
-fn check_ptr_pointee_in_ann(ann_node: Int) ! Diag.Report {
-    if ann_node == -1 { return }
-    let elems_sl = node_elements(ann_node)
-    if node_name(ann_node) == "Ptr" {
-        if elems_sl != -1 && sublist_length(elems_sl) > 0 {
-            let inner = sublist_get(elems_sl, 0)
-            let inner_name = node_name(inner)
-            if is_valid_ptr_inner(inner_name) == 0 {
-                diag_error_at("InvalidPtrType", INVALID_PTR_TYPE, "invalid Ptr type parameter '{inner_name}' — only Void, U8-U64, I8-I64, Int, Float, Ptr, @ffi.struct, or @ffi.opaque types are allowed", inner, "use a valid FFI-compatible type, or annotate the type with @ffi.struct for a known layout or @ffi.opaque for a handle")
-            }
-        }
-        return
-    }
-    if elems_sl == -1 { return }
-    let mut i = 0
-    while i < sublist_length(elems_sl) {
-        check_ptr_pointee_in_ann(sublist_get(elems_sl, i))
-        i = i + 1
-    }
+// The pointee half of the §9.1.3 Ptr rule. It runs where every annotation resolves, so a
+// pointee is judged the same in a let, a field, an alias, a payload or a signature. A
+// PtrOutsideFFI check stays per function: it is a property of the enclosing context.
+fn tc_check_ptr_pointee(pointee: Int, inner: Int) ! Diag.Report {
+    if tc_ptr_pointee_is_valid(pointee) != 0 { return }
+    let inner_name = node_name(inner)
+    diag_error_at("InvalidPtrType", INVALID_PTR_TYPE, "invalid Ptr type parameter '{inner_name}' — only Void, U8-U64, I8-I64, Int, Float, Ptr, @ffi.struct, or @ffi.opaque types are allowed", inner, "use a valid FFI-compatible type, or annotate the type with @ffi.struct for a known layout or @ffi.opaque for a handle")
+}
+
+// A type not yet known is not judged: whatever left it unknown reports on its own.
+fn tc_ptr_pointee_is_valid(pointee: Int) -> Int {
+    let t = tc_resolve(pointee)
+    if t < 0 || t >= ty_pool.len() { return 1 }
+    if tc_tid_has_unbound_metavar(t) != 0 { return 1 }
+    let k = type_kind(t)
+    if k == TyKind.Unknown || k == TyKind.Void || k == TyKind.Ptr { return 1 }
+    if k == TyKind.Int || k == TyKind.Float { return 1 }
+    if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return 1 }
+    if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return 1 }
+    if ffi_struct_type_set.contains_key(t) != 0 { return 1 }
+    if ffi_opaque_type_set.contains_key(t) != 0 { return 1 }
+    0
 }
 
 fn check_ptr_in_type_name(type_name: Str, node: Int, has_ffi: Int) ! Diag.Report {
@@ -9264,7 +9240,6 @@ fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
             let ptype_ann = node_type_ann(p)
             if ptype_ann != -1 {
                 check_ptr_in_type_ann(ptype_ann, has_ffi)
-                check_ptr_pointee_in_ann(ptype_ann)
             } else {
                 check_ptr_in_type_name(node_type_name(p), p, has_ffi)
             }
@@ -9276,7 +9251,6 @@ fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
     let ret_ann = node_type_ann(fn_node)
     if ret_ann != -1 {
         check_ptr_in_type_ann(ret_ann, has_ffi)
-        check_ptr_pointee_in_ann(ret_ann)
     } else {
         let ret_str = node_return_type(fn_node)
         if ret_str == "Ptr" && has_ffi == 0 {
@@ -19930,7 +19904,6 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let type_ann = node_target(node)
         let mut declared_tid = TYPE_UNKNOWN
         if type_ann != -1 {
-            check_ptr_pointee_in_ann(type_ann)
             declared_tid = resolve_type_ann(type_ann)
         } else if type_str != "" {
             let rt = resolve_type_name(type_str)
