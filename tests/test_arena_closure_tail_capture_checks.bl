@@ -1,0 +1,60 @@
+// Spec 05 §5.2.1: a closure tail of `with arena { }` is promoted through its capture
+// descriptors, so each capture must have a walker (E0701 when its type holds itself,
+// E0702d when its kind has none), the closure must be a literal bound in the block
+// (E0702a otherwise), and a block-local value a promoted closure captures is promoted
+// with it rather than reported as an escape (E0700).
+
+import compile_test_helpers
+
+// Escape analysis runs over fn bodies, so the run rows put the arena block in `main`.
+// `clobber` fills a fresh arena with -7 over the memory the promoted block freed.
+fn run_after_clobber(body: Str, tag: Str) -> compile_test_helpers.RunResult {
+    let src = "import std.io\nfn clobber() \{\n    with arena \{\n        let mut t: List[Int] = []\n        let mut i = 0\n        while i < 4000 \{\n            t.push(-7)\n            i = i + 1\n        }\n    }\n}\nfn main() ! IO \{\n{body}\n}\n"
+    compile_test_helpers.compile_and_run(src, tag)
+}
+
+test "a tail closure capturing a recursive type reports E0701" {
+    let src = "type Tree \{ Leaf, Node(l: Tree, v: Int, r: Tree) }\nfn main() \{\n    let t = Node(Leaf, 4, Leaf)\n    let g = with arena \{ fn() -> Int \{ match t \{ Leaf => 0\n Node(_, v, _) => v } } }\n    let _ = g\n}\n"
+    compile_test_helpers.expect_compile_error(src, "arena_tail_capture_recursive", "E0701")
+}
+
+test "a tail closure capturing a Template reports E0702d" {
+    let src = "fn keep(t: Template[Str]) -> fn() -> Int \{\n    with arena \{ fn() -> Int \{ t.count() } }\n}\nfn main() \{\n    let n = 1\n    let g = keep(\"n=\{n}\")\n    let _ = g\n}\n"
+    compile_test_helpers.expect_compile_error(src, "arena_tail_capture_template", "E0702d")
+}
+
+test "a tail closure capturing a handler reports E0702d" {
+    let src = "fn main() \{\n    let h = handler IO \{ fn print(_m: Str) \{} }\n    let g = with arena \{ fn() -> Int \{\n        let _k = h\n        1\n    } }\n    let _ = g\n}\n"
+    compile_test_helpers.expect_compile_error(src, "arena_tail_capture_handler", "E0702d")
+}
+
+test "a closure made by a call leaving the arena through ? reports E0702a" {
+    let src = "fn mk() -> Result[Int, fn() -> Int] \{ Err(fn() -> Int \{ 1 }) }\nfn pick() -> Result[Int, fn() -> Int] \{\n    with arena \{\n        let v = mk()?\n        Ok(v)\n    }\n}\nfn main() \{\n    let _ = pick()\n}\n"
+    compile_test_helpers.expect_compile_error(src, "arena_tail_question_call_origin", "E0702a")
+}
+
+test "a call result reaching the tail through two let aliases reports E0702a" {
+    let src = "fn make() -> fn(Int) -> Int \{ fn(x: Int) -> Int \{ x + 1 } }\nfn main() \{\n    let g = with arena \{\n        let a = make()\n        let b = a\n        b\n    }\n    let _ = g\n}\n"
+    compile_test_helpers.expect_compile_error(src, "arena_tail_alias_chain_call_origin", "E0702a")
+}
+
+test "a closure literal reaching the tail through two let aliases is promoted" {
+    let body = "    let g = with arena \{\n        let xs = [1, 2, 3]\n        let a = fn(i: Int) -> Int \{ xs.get(i).unwrap() * 10 }\n        let b = a\n        b\n    }\n    clobber()\n    io.println(\"\{g(2)}\")"
+    let r = run_after_clobber(body, "arena_tail_alias_chain_literal")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "30\n")
+}
+
+test "a closure the tail captures may capture a block-local list literal" {
+    let body = "    let g = with arena \{\n        let xs = [1, 2, 3]\n        let h = fn() -> Int \{ xs.len() }\n        fn(i: Int) -> Int \{ h() + i }\n    }\n    clobber()\n    io.println(\"\{g(10)}\")"
+    let r = run_after_clobber(body, "arena_tail_captured_closure_captures_literal")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "13\n")
+}
+
+test "a tuple tail of closures capturing a block-local list literal is promoted" {
+    let body = "    let pair = with arena \{\n        let xs = [4, 5, 6]\n        (fn() -> Int \{ xs.len() }, fn(i: Int) -> Int \{ xs.get(i).unwrap() })\n    }\n    clobber()\n    let (len, at) = pair\n    io.println(\"\{len()} \{at(1)}\")"
+    let r = run_after_clobber(body, "arena_tail_tuple_of_closures_literal")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "3 5\n")
+}
