@@ -38,10 +38,11 @@ import typecheck.{
     tc_ret_mint_at, tc_tid_child, tc_tid_child_count,
     tc_tid_decl_node, tc_tid_kind, tc_impl_is_poly_user, tc_poly_user_impl_decl,
     tc_tid_is_no_info, tc_tid_list_elem, tc_tid_name, tc_tid_resolved, tc_tid_struct, tc_type_str,
+    tc_declared_field_tids, tc_ptr_pointee_is_valid,
     tc_void_tid,
 }
 import cname.{c_mono_fn_name, c_mono_type_c_name, c_poly_method_name}
-import diagnostics.{diag_ice_at, UNSOLVED_TYPEVAR_AT_CODEGEN}
+import diagnostics.{diag_error_at, diag_ice_at, INVALID_PTR_TYPE, UNSOLVED_TYPEVAR_AT_CODEGEN}
 
 pub type MonoInstance {
     base_decl_node: Int,
@@ -62,6 +63,9 @@ let mut type_insts_done: Map[Int, Int] = Map()
 // node. The body is part of the key because one call node inside a generic body reaches a
 // different instance for every instance of that body.
 let mut mono_call_target: Map[Int, Int] = Map()
+// Raw tids already searched for a Ptr over a type parameter, keyed by instance and tid. Every
+// node that carries the same type shares one search, so a refused pointee reports once.
+let mut ptr_tids_judged: Map[Int, Int] = Map()
 
 // Declaration lookups the walk resolves a call through. Names here are how source
 // spells a callee; instance identity never depends on them.
@@ -154,6 +158,7 @@ fn mono_reset() {
     mono_binds = []
     type_insts_done = Map()
     mono_call_target = Map()
+    ptr_tids_judged = Map()
     generic_fn_by_name = Map()
     generic_fn_by_module_name = Map()
     generic_fn_nodes = Map()
@@ -916,6 +921,58 @@ fn mono_record(ctx: Int, node: Int) ! Diag.Report {
     if tid < 0 { return }
     if ctx >= 0 { mono_node_tids.get(ctx).unwrap().insert(node, tid) }
     register_type_instances_in(tid)
+    if ctx >= 0 { judge_ptr_pointees_in(ctx, node, tc_lookup_node_tid(node)) }
+}
+
+// The pointee rule (E0810) for a Ptr whose pointee typecheck could not judge: one that
+// mentions a type parameter. The raw tid says which pointees those are; a pointee that was
+// already concrete, or a whole Ptr bound to T at the caller, was judged where it was written.
+fn judge_ptr_pointees_in(ctx: Int, node: Int, raw0: Int) ! Diag.Report {
+    if raw0 < 0 { return }
+    let raw = tc_resolve(raw0)
+    let key = (ctx + 1) * 4294967296 + raw
+    if ptr_tids_judged.contains_key(key) { return }
+    ptr_tids_judged.insert(key, 1)
+    if tc_tid_kind(raw) == TyKind.Ptr {
+        let pointee = tc_tid_child(raw, 0)
+        if tid_is_open(pointee) { judge_ptr_pointee(ctx, node, pointee) }
+    }
+    let n = tc_tid_child_count(raw)
+    let mut i = 0
+    while i < n {
+        judge_ptr_pointees_in(ctx, node, tc_tid_child(raw, i))
+        i = i + 1
+    }
+}
+
+fn judge_ptr_pointee(ctx: Int, node: Int, pointee: Int) ! Diag.Report {
+    let sub = canon_tid(substitute_typevar_tid(pointee, ctx_binds(ctx)))
+    if tc_ptr_pointee_is_valid(sub) != 0 { return }
+    let shown = tc_type_str(sub)
+    diag_error_at("InvalidPtrType", INVALID_PTR_TYPE,
+        "invalid Ptr type parameter '{shown}' in {instance_label(ctx)}: only Void, U8-U64, I8-I64, Int, Float, Ptr, @ffi.struct, or @ffi.opaque types are allowed", node,
+        "instantiate with a valid FFI-compatible type, or annotate '{shown}' with @ffi.struct for a known layout or @ffi.opaque for a handle")
+}
+
+// A type instance's field types come from the declared shape, the one authority for them;
+// the node walk does not reach a field's declared type.
+fn judge_declared_field_ptrs(ctx: Int, td: Int) ! Diag.Report {
+    for ftid in tc_declared_field_tids(mono_table.get(ctx).unwrap().inst_tid) {
+        judge_ptr_pointees_in(ctx, td, ftid)
+    }
+}
+
+// How source would spell the instance: the declaration's name over its type arguments.
+fn instance_label(ctx: Int) -> Str {
+    let inst = mono_table.get(ctx).unwrap()
+    let n = tc_tid_child_count(inst.arg_tids)
+    let mut args: List[Str] = []
+    let mut i = 0
+    while i < n {
+        args.push(tc_type_str(tc_tid_child(inst.arg_tids, i)))
+        i = i + 1
+    }
+    "{node_name(inst.base_decl_node)}[{args.join(", ")}]"
 }
 
 fn walk_sl(ctx: Int, sl: Int) ! Diag.Report {
@@ -996,6 +1053,7 @@ fn walk_for_in(ctx: Int, node: Int) ! Diag.Report {
 }
 
 fn walk_type_def(ctx: Int, node: Int) ! Diag.Report {
+    if ctx >= 0 { judge_declared_field_ptrs(ctx, node) }
     walk_sl(ctx, node_fields(node))
     walk_sl(ctx, node_handlers(node))
     walk2(ctx, node_condition(node), node_value(node))
