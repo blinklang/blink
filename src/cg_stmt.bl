@@ -45,7 +45,7 @@ import ir.{
     ir_expr_stmt, ir_field_get, ir_global_ref, ir_if, ir_kid, ir_kid_count, ir_kind, ir_let,
     ir_loop, ir_mark_materialize, ir_new, ir_return, ir_slot_form, ir_span, ir_switch, ir_tid,
     ir_tuple_new, ir_unary, ir_unbox, ir_unreachable, ir_var_ref, ir_with_scope,
-    ir_panic_catch, ir_panic_catch_exit, ir_volatile_let,
+    ir_panic, ir_panic_catch, ir_panic_catch_exit, ir_volatile_let,
 }
 import diagnostics.{
     Diag, diag_file_for_node, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
@@ -58,7 +58,7 @@ import cg_expr.{
     cg_expr_is_registered, cg_expr_pending_count,
     cg_expr_push_pending, cg_expr_register_value, cg_expr_set_return_type,
     cg_expr_take_pending, cg_expr_value_count, lower_expr,
-    x_layout_checked, x_stopped, x_unbox_payload, ArithSite, lower_arith_operator,
+    x_layout_checked, x_panic_message, x_stopped, x_unbox_payload, ArithSite, lower_arith_operator,
 }
 import cg_eff.{
     cg_eff_async_scope_exit_symbol, cg_eff_binder_is_shared, cg_eff_block_handler_calls,
@@ -2553,14 +2553,11 @@ fn lower_match(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Rep
     let arms = node_arms(node)
     let n = if arms == -1 { 0 } else { sublist_length(arms) }
     let mut out: List[Int] = [ir_let(stid, scrut, rec.c_spelling, holder, rec.slot_form, lower_value(scrut))]
+    // The front end accepts some matches that are not exhaustive, and this proof is weaker
+    // than a full one, so a match it cannot prove covered panics when no arm runs.
     let covered = arms_cover(arms, n, ctx)
-    if !covered {
-        // Nothing below may claim the match cannot fall through: a C `switch` that runs
-        // no arm is well defined, and an unreachable marker on one that can is not.
-        diag_ice_stage_not_built("a match with no arm that is guaranteed to run", node)
-    }
     if arms_are_switchable(arms, n, ctx) {
-        let sw = lower_match_switch(node, arms, n, ctx)
+        let sw = lower_match_switch(node, arms, n, ctx, covered)
         if sw < 0 { return -1 }
         out.push(sw)
     } else {
@@ -2649,7 +2646,11 @@ fn one_payload_sub(pat: Int) -> Int {
     let flds = node_fields(pat)
     if flds == -1 || sublist_length(flds) != 1 { return -1 }
     let f = sublist_get(flds, 0)
-    if node_int_val(pat) == 1 { return node_pattern(f) }
+    // A bare struct-style pattern holds its fields the way the qualified one does.
+    if node_int_val(pat) == 1 || nk_of(node_kind(pat)) == NodeKind.StructPattern {
+        let sub = node_pattern(f)
+        if sub >= 0 { return sub }
+    }
     f
 }
 
@@ -3736,7 +3737,7 @@ fn arms_are_switchable(arms: Int, n: Int, ctx: MatchCtx) -> Bool ! Diag.Report {
     true
 }
 
-fn lower_match_switch(node: Int, arms: Int, n: Int, ctx: MatchCtx) -> Int ! Diag.Report {
+fn lower_match_switch(node: Int, arms: Int, n: Int, ctx: MatchCtx, covered: Bool) -> Int ! Diag.Report {
     let mut cases: List[Int] = []
     let mut default_block = -1
     let none: List[Int] = []
@@ -3757,14 +3758,18 @@ fn lower_match_switch(node: Int, arms: Int, n: Int, ctx: MatchCtx) -> Int ! Diag
         }
         i = i + 1
     }
-    // No default arm when none was written: the arms already name every variant, so a
-    // fallthrough branch would be dead code the printer would still have to place.
+    // With no default arm written, a covered switch needs none; an uncovered one panics.
+    if default_block < 0 && !covered {
+        default_block = no_arm_ran(node)
+        if default_block < 0 { return -1 }
+    }
     ir_switch(node, discriminant(ctx, node), cases, default_block)
 }
 
 // The general shape: one `if` per arm, each gated on a flag that later arms read, so a
 // guard that fails falls through to the next arm without the rest of the chain being
-// built twice. A match none of whose arms ran is unreachable by construction.
+// built twice. A covered match none of whose arms ran is unreachable by construction; an
+// uncovered one panics.
 fn lower_match_chain(node: Int, arms: Int, n: Int, ctx: MatchCtx, covered: Bool, out: List[Int]) -> Bool ! Diag.Report {
     let flag = c_mint_local("taken")
     out.push(ir_let(TYPE_INT, node, int_spelling(node), flag, int_form(node),
@@ -3780,8 +3785,16 @@ fn lower_match_chain(node: Int, arms: Int, n: Int, ctx: MatchCtx, covered: Bool,
         out.push(ir_if(arm, chain_condition(arm, flag, cond), block, -1))
         i = i + 1
     }
-    if covered { out.push(ir_if(node, not_taken(node, flag), ir_block(node, [ir_unreachable(node)]), -1)) }
+    let tail = if covered { ir_block(node, [ir_unreachable(node)]) } else { no_arm_ran(node) }
+    if tail < 0 { return false }
+    out.push(ir_if(node, not_taken(node, flag), tail, -1))
     true
+}
+
+fn no_arm_ran(node: Int) -> Int ! Diag.Report {
+    let said = x_panic_message(node, "non-exhaustive match", [])
+    if said < 0 { return -1 }
+    ir_block(node, [ir_panic(node, said)])
 }
 
 fn not_taken(span: Int, flag: Str) -> Int ! Diag.Report {
