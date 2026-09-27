@@ -5,19 +5,21 @@ import parser.{
     node_target, node_iterable, node_obj, node_method, node_params, node_args,
     node_stmts, node_arms, node_fields, node_elements, node_handlers,
     node_type_name, node_effects, node_str_val, node_op, node_type_ann,
-    sublist_get, sublist_length,
+    node_pattern, node_for_binder, sublist_get, sublist_length,
 }
 import diagnostics.{
     Diag, diag_error_at, diag_warn_at, diag_set_last_fix,
     diag_source_file, diag_file_for_node,
     diag_push_allows, diag_clear_allows,
     ARENA_VALUE_ESCAPES, ARENA_TYPE_CONTAINS_CYCLE, ARENA_EFFECT_REDUNDANT,
-    CLOSEABLE_ESCAPES_SCOPE,
+    ARENA_CLOSURE_TAIL_NONLITERAL, ARENA_CLOSURE_UNSUPPORTED_CAP, CLOSEABLE_ESCAPES_SCOPE,
 }
 import typecheck.{
-    tc_fn_has_effect, tc_lookup_node_tid, tc_resolve, tc_tid_child, tc_tid_decl_node,
+    TyKind, tc_call_decl_is_fn, tc_call_decl_node, tc_declared_field_tids, tc_fn_has_effect, tc_lookup_node_tid, tc_member_tid_at_instance,
+    tc_resolve, tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind,
     tc_tid_reaches_itself, tc_type_str,
 }
+import free_names.{closure_read_idents, pattern_names, push_param_names}
 
 // Arena escape analysis: classifies allocations inside `with arena { }` as
 // promoted (tail-position return) or escaped (emits E0700).
@@ -132,6 +134,386 @@ fn init_safe_intrinsics() {
 
 // W0701 ArenaEffectRedundant state. `declares_arena` gates the hot-path
 // effect lookup in walk_call so we only pay for fns that could raise W0701.
+// ── Closure tails (§5.2.1 clause 7) ──────────────────────────────────────
+//
+// A closure that crosses an arena is copied out through its capture descriptors, so each
+// capture needs a walker, and the closure must be a literal written in the block: a
+// closure a call made carries captures this pass cannot see. A binder records the node
+// its value came from, so `let b = a` leads back to the literal `a` names.
+
+let mut ea_bind_names: List[Str] = []
+let mut ea_bind_values: List[Int] = []
+let mut ea_bind_depths: List[Int] = []
+let mut ea_bind_marks: List[Int] = []
+
+// The names assigned inside each open arena frame, parallel to ea_frames. A closing frame
+// hands its names to its parent: an assignment in a nested arena is one in the outer too.
+let mut ea_assigned: List[List[Str]] = []
+
+// The first arena frame, counted from 1, that a tail at this point crosses; 0 for none.
+let mut ea_tail_floor: Int = 0
+
+let mut ea_promoted_closures: Map[Int, Int] = Map()
+let mut ea_closure_parent: Map[Int, Int] = Map()
+let mut ea_closure_stack: List[Int] = []
+
+// A closure that captures a value allocated in the arena lets it escape unless the closure
+// is promoted, which is known only once the tail is seen, so the report waits for the
+// frame to close.
+let mut ea_cc_owner: Int = -1
+let mut ea_pending_idents: List[Int] = []
+let mut ea_pending_owners: List[Int] = []
+let mut ea_pending_depths: List[Int] = []
+
+fn ea_reset_closure_state() {
+    ea_bind_names = []
+    ea_bind_values = []
+    ea_bind_depths = []
+    ea_bind_marks = []
+    ea_assigned = []
+    ea_tail_floor = 0
+    ea_closure_stack = []
+    ea_cc_owner = -1
+    ea_pending_idents = []
+    ea_pending_owners = []
+    ea_pending_depths = []
+}
+
+fn ea_push_binds() {
+    ea_bind_marks.push(ea_bind_names.len())
+}
+
+fn ea_pop_binds() {
+    let mark = ea_bind_marks.pop() ?? 0
+    while ea_bind_names.len() > mark {
+        let _ = ea_bind_names.pop()
+        let _ = ea_bind_values.pop()
+        let _ = ea_bind_depths.pop()
+    }
+}
+
+// `value` is the node the binder's value came from, or -1 for a parameter or a pattern.
+fn ea_bind(name: Str, value: Int) {
+    if name == "" { return }
+    ea_bind_names.push(name)
+    ea_bind_values.push(value)
+    ea_bind_depths.push(ea_frames.len())
+}
+
+fn ea_bind_all(names: List[Str]) {
+    for n in names { ea_bind(n, -1) }
+}
+
+fn ea_bind_pattern(pat: Int) {
+    let mut names: List[Str] = []
+    pattern_names(pat, names)
+    ea_bind_all(names)
+}
+
+// The innermost binder of `name`, or -1 for a global, a function or a module.
+fn ea_lookup_bind(name: Str) -> Int {
+    let mut i = ea_bind_names.len() - 1
+    while i >= 0 {
+        if ea_bind_names.get(i).unwrap() == name { return i }
+        i = i - 1
+    }
+    -1
+}
+
+fn ea_note_assigned(name: Str) {
+    if ea_assigned.len() == 0 { return }
+    let mut top = ea_assigned.get(ea_assigned.len() - 1).unwrap()
+    if !top.contains(name) { top.push(name) }
+}
+
+fn ea_pop_assigned() {
+    let names = ea_assigned.pop() ?? []
+    if ea_assigned.len() == 0 { return }
+    let mut parent = ea_assigned.get(ea_assigned.len() - 1).unwrap()
+    for n in names {
+        if !parent.contains(n) { parent.push(n) }
+    }
+}
+
+fn ea_assigned_since(name: Str, floor: Int) -> Bool {
+    let mut f = floor - 1
+    while f < ea_assigned.len() {
+        if f >= 0 && ea_assigned.get(f).unwrap().contains(name) { return true }
+        f = f + 1
+    }
+    false
+}
+
+fn ea_tail_crosses() -> Bool {
+    ea_tail_floor > 0 && ea_frames.len() >= ea_tail_floor
+}
+
+fn is_fn_typed(node: Int) -> Bool {
+    let tid = tc_lookup_node_tid(node)
+    if tid < 0 { return false }
+    tc_tid_kind(tc_resolve(tid)) == TyKind.Fn
+}
+
+// Whether escape analysis promotes this closure literal out of an arena. Code generation
+// asks when a capture of it has no walker, which this pass reports first.
+pub fn ea_closure_is_promoted(closure: Int) -> Bool {
+    ea_promoted_closures.contains_key(closure)
+}
+
+fn ea_closure_or_ancestor_promoted(closure: Int) -> Bool {
+    let mut c = closure
+    while c >= 0 {
+        if ea_promoted_closures.contains_key(c) { return true }
+        c = ea_closure_parent.get(c) ?? -1
+    }
+    false
+}
+
+// A tail that crosses the arena: a closure in it must be a literal bound in the block, and
+// every literal the crossing value holds is promoted.
+fn classify_tail(node: Int) ! Diag.Report {
+    let k = node_kind(node)
+    if k == NodeKind.TupleLit || k == NodeKind.ListLit {
+        let sl = node_elements(node)
+        let mut i = 0
+        while sl != -1 && i < sublist_length(sl) {
+            let _ = fn_origin_is_call(sublist_get(sl, i), ea_tail_floor)
+            i = i + 1
+        }
+        return
+    }
+    if k == NodeKind.StructLit {
+        let sl = node_fields(node)
+        let mut i = 0
+        while sl != -1 && i < sublist_length(sl) {
+            let _ = fn_origin_is_call(node_value(sublist_get(sl, i)), ea_tail_floor)
+            i = i + 1
+        }
+        return
+    }
+    if call_builds_variant(node) {
+        let _ = variant_args_from_call(node, ea_tail_floor)
+        return
+    }
+    let leaf = k == NodeKind.Closure || k == NodeKind.Ident || k == NodeKind.Call || k == NodeKind.MethodCall || k == NodeKind.FieldAccess || k == NodeKind.IndexExpr
+    if !leaf || !is_fn_typed(node) { return }
+    if fn_origin_is_call(node, ea_tail_floor) { emit_closure_tail_nonliteral(node) }
+}
+
+// Whether the value of `node` may be a closure a call made inside the crossed frames. A
+// closure literal it reaches is promoted on the way. A binder from outside the block
+// names a closure that was never arena memory, and a parameter or pattern binder inside
+// names a value built elsewhere, so neither is a call's result here.
+fn fn_origin_is_call(node: Int, floor: Int) -> Bool ! Diag.Report {
+    if node == -1 { return false }
+    let k = node_kind(node)
+    if k == NodeKind.Closure {
+        promote_closure_literal(node, floor)
+        return false
+    }
+    if call_builds_variant(node) { return variant_args_from_call(node, floor) }
+    if k == NodeKind.Call || k == NodeKind.MethodCall { return true }
+    if k == NodeKind.Ident {
+        let b = ea_lookup_bind(node_name(node))
+        if b < 0 { return false }
+        if ea_assigned_since(node_name(node), floor) { return true }
+        if ea_bind_depths.get(b).unwrap() < floor { return false }
+        return fn_origin_is_call(ea_bind_values.get(b).unwrap(), floor)
+    }
+    if k == NodeKind.FieldAccess || k == NodeKind.IndexExpr { return fn_origin_is_call(node_obj(node), floor) }
+    if k == NodeKind.UnaryOp { return fn_origin_is_call(node_left(node), floor) }
+    if k == NodeKind.ExprStmt { return fn_origin_is_call(node_value(node), floor) }
+    if k == NodeKind.Block { return fn_origin_is_call(block_tail_node(node), floor) }
+    if k == NodeKind.IfExpr {
+        let a = fn_origin_is_call(node_then_body(node), floor)
+        let b = fn_origin_is_call(node_else_body(node), floor)
+        return a || b
+    }
+    if k == NodeKind.MatchExpr {
+        let arms_sl = node_arms(node)
+        let mut hit = false
+        let mut i = 0
+        while arms_sl != -1 && i < sublist_length(arms_sl) {
+            if fn_origin_is_call(node_body(sublist_get(arms_sl, i)), floor) { hit = true }
+            i = i + 1
+        }
+        return hit
+    }
+    false
+}
+
+// `Some(f)`, `Err(f)` and `Shape.Circle(f)` build their value from the arguments written
+// here, so what they hold came from those arguments, not from a function body.
+fn call_builds_variant(node: Int) -> Bool {
+    let k = node_kind(node)
+    if k == NodeKind.Call {
+        let callee = node_left(node)
+        if callee == -1 || node_kind(callee) != NodeKind.Ident { return false }
+        if tc_call_decl_is_fn(node) { return false }
+        let name = node_name(callee)
+        if ea_lookup_bind(name) >= 0 { return false }
+        if name == "Some" || name == "Ok" || name == "Err" { return true }
+        let decl = tc_call_decl_node(node)
+        if decl >= 0 && node_kind(decl) == NodeKind.TypeVariant { return true }
+        return result_enum_declares(node, name)
+    }
+    if k == NodeKind.MethodCall {
+        let obj = node_obj(node)
+        if obj == -1 || node_kind(obj) != NodeKind.Ident { return false }
+        if ea_lookup_bind(node_name(obj)) >= 0 { return false }
+        return result_enum_declares(node, node_method(node))
+    }
+    false
+}
+
+fn result_enum_declares(node: Int, variant: Str) -> Bool {
+    let tid = tc_lookup_node_tid(node)
+    if tid < 0 { return false }
+    let r = tc_resolve(tid)
+    if tc_tid_kind(r) != TyKind.Enum { return false }
+    let decl = tc_tid_decl_node(r)
+    if decl < 0 { return false }
+    let vars = node_fields(decl)
+    let mut i = 0
+    while vars != -1 && i < sublist_length(vars) {
+        let v = sublist_get(vars, i)
+        if node_kind(v) == NodeKind.TypeVariant && node_name(v) == variant { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn variant_args_from_call(node: Int, floor: Int) -> Bool ! Diag.Report {
+    let args = node_args(node)
+    let mut hit = false
+    let mut i = 0
+    while args != -1 && i < sublist_length(args) {
+        if fn_origin_is_call(sublist_get(args, i), floor) { hit = true }
+        i = i + 1
+    }
+    hit
+}
+
+// `x?` returns the Err of a Result from the body, across every arena of the body still
+// open, so a closure there must be a literal bound in the block as a tail's must.
+fn check_question_err_closure(node: Int) ! Diag.Report {
+    let n = ea_body_frame_base.len()
+    if n == 0 { return }
+    let base = ea_body_frame_base.get(n - 1).unwrap()
+    if ea_frames.len() <= base { return }
+    let operand = node_left(node)
+    let tid = tc_lookup_node_tid(operand)
+    if tid < 0 { return }
+    let r = tc_resolve(tid)
+    if tc_tid_kind(r) != TyKind.Result { return }
+    let err = tc_tid_child(r, 1)
+    if err < 0 || tc_tid_kind(tc_resolve(err)) != TyKind.Fn { return }
+    if fn_origin_is_call(operand, base + 1) { emit_closure_tail_nonliteral(node) }
+}
+
+// A promoted literal's captures are copied by walkers: each must have one. A capture that
+// is itself a literal bound in the block is promoted with it.
+fn promote_closure_literal(closure: Int, floor: Int) ! Diag.Report {
+    if ea_promoted_closures.contains_key(closure) { return }
+    ea_promoted_closures.insert(closure, 1)
+    for ident in closure_read_idents(closure) {
+        let b = ea_lookup_bind(node_name(ident))
+        if b >= 0 {
+            let tid = tc_lookup_node_tid(ident)
+            if !ea_refuse_recursive_crossing(ident, tid) { let _ = ea_refuse_unwalkable_capture(ident, node_name(ident), tid) }
+            if is_fn_typed(ident) && ea_bind_depths.get(b).unwrap() >= floor {
+                let _ = fn_origin_is_call(ea_bind_values.get(b).unwrap(), floor)
+            }
+        }
+    }
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn emit_closure_tail_nonliteral(node: Int) ! Diag.Report {
+    let saved = diag_source_file
+    diag_source_file = diag_file_for_node(node)
+    diag_error_at(
+        "ArenaClosureTailNonLiteral", ARENA_CLOSURE_TAIL_NONLITERAL,
+        "the closure leaving `with arena \{ }` may be one a call made in the block; only a closure literal bound in the block can be promoted",
+        node,
+        "build the closure outside the `with arena \{ }` block, or bind it with `let f = fn(...) \{ ... }` inside the block"
+    )
+    diag_source_file = saved
+}
+
+// Whether a value of `tid` holds a handler, a template or a raw template, whose memory an
+// arena can hold and no walker copies, reporting E0702d at `node` when it does. A closure
+// inside it is promoted through its own descriptors, and a pointer, handle, channel or
+// ffi scope is copied as a word, so the search stops at those. Code generation asks too,
+// for a capture whose type this pass saw only as a type parameter.
+@allow(UnrestoredMutation, IncompleteStateRestore)
+pub fn ea_refuse_unwalkable_capture(node: Int, name: Str, tid: Int) -> Bool ! Diag.Report {
+    if tid < 0 { return false }
+    let mut done: Map[Int, Int] = Map()
+    let hit = unwalkable_reach(tc_resolve(tid), done)
+    if hit < 0 { return false }
+    let saved = diag_source_file
+    diag_source_file = diag_file_for_node(node)
+    diag_error_at(
+        "ArenaClosureUnsupportedCapture", ARENA_CLOSURE_UNSUPPORTED_CAP,
+        "a closure leaving `with arena \{ }` captures `{name}` of type `{tc_type_str(tc_resolve(tid))}`, and arena promotion cannot copy a `{tc_type_str(hit)}`",
+        node,
+        "build the closure outside the `with arena \{ }` block"
+    )
+    diag_source_file = saved
+    true
+}
+
+fn unwalkable_reach(r: Int, done: Map[Int, Int]) -> Int {
+    if r < 0 || done.contains_key(r) { return -1 }
+    done.insert(r, 1)
+    let k = tc_tid_kind(r)
+    if k == TyKind.Handler || k == TyKind.Template || k == TyKind.Raw { return r }
+    if k == TyKind.Fn || k == TyKind.Iterator || k == TyKind.Ptr || k == TyKind.Handle || k == TyKind.Channel || k == TyKind.FfiScope {
+        return -1
+    }
+    if k == TyKind.Struct || k == TyKind.Enum {
+        for f in tc_declared_field_tids(r) {
+            let hit = unwalkable_reach(tc_resolve(tc_member_tid_at_instance(f, r)), done)
+            if hit >= 0 { return hit }
+        }
+        return -1
+    }
+    let mut i = 0
+    while i < tc_tid_child_count(r) {
+        let hit = unwalkable_reach(tc_resolve(tc_tid_child(r, i)), done)
+        if hit >= 0 { return hit }
+        i = i + 1
+    }
+    -1
+}
+
+// Reports the closure-capture escapes recorded in the frame about to close, leaving out
+// those a promoted closure carries out.
+fn flush_capture_escapes() ! Diag.Report {
+    let depth = ea_frames.len()
+    let mut idents: List[Int] = []
+    let mut owners: List[Int] = []
+    let mut depths: List[Int] = []
+    let mut i = 0
+    while i < ea_pending_idents.len() {
+        let ident = ea_pending_idents.get(i).unwrap()
+        let owner = ea_pending_owners.get(i).unwrap()
+        let d = ea_pending_depths.get(i).unwrap()
+        if d != depth {
+            idents.push(ident)
+            owners.push(owner)
+            depths.push(d)
+        } else if !ea_closure_or_ancestor_promoted(owner) {
+            emit_escape(ident, "closure capture")
+        }
+        i = i + 1
+    }
+    ea_pending_idents = idents
+    ea_pending_owners = owners
+    ea_pending_depths = depths
+}
+
 let mut ea_fn_declares_arena: Int = 0
 let mut ea_fn_arena_any_call: Int = 0
 let mut ea_fn_arena_bare_call: Int = 0
@@ -540,6 +922,7 @@ fn walk_elements(sl: Int) ! Diag.Report {
 fn walk_assignment(node: Int) ! Diag.Report {
     let target = node_target(node)
     let val = node_value(node)
+    if target != -1 && node_kind(target) == NodeKind.Ident { ea_note_assigned(node_name(target)) }
     if ea_in_arena() != 0 {
         if val != -1 {
             let rhs_arena = expr_is_arena_value(val)
@@ -685,6 +1068,7 @@ fn walk_block_stmts_ffi(block_node: Int, tail_flag: Int, owning_scopes: List[Str
     // shadows the outer scope and is dropped at block exit (mirrors codegen's
     // scope_vars stack). Pushed before walking statements, popped after.
     ea_push_origin_frame()
+    ea_push_binds()
     let mut i = 0
     while i < n {
         let stmt = sublist_get(stmts_sl, i)
@@ -696,6 +1080,7 @@ fn walk_block_stmts_ffi(block_node: Int, tail_flag: Int, owning_scopes: List[Str
     if owning_scopes.len() != 0 {
         check_ffi_ptr_tail_escape(block_tail_node(block_node), owning_scopes)
     }
+    ea_pop_binds()
     ea_pop_origin_frame()
 }
 
@@ -756,9 +1141,15 @@ fn walk_with_block(node: Int, outer_tail: Int) ! Diag.Report {
     if is_arena != 0 {
         check_promote_cycle(node, tc_lookup_node_tid(node))
         ea_push_frame()
+        ea_assigned.push([])
         ea_push_closeable_scope()
+        let saved_floor = ea_tail_floor
+        ea_tail_floor = ea_frames.len()
         walk_expr(body, 1)
+        ea_tail_floor = saved_floor
+        flush_capture_escapes()
         ea_pop_closeable_scope()
+        ea_pop_assigned()
         ea_pop_frame()
     } else {
         // Non-arena `with`: if we're inside an arena frame and any handler is a
@@ -796,11 +1187,21 @@ fn walk_with_block(node: Int, outer_tail: Int) ! Diag.Report {
         // For an ffi.scope body, walk the statements directly so the with-expr
         // tail escape is checked while the body's Ptr-origin frame is still live
         // (block_tail_node's origin lives in that frame). Otherwise walk normally.
+        ea_push_binds()
+        if handlers_sl != -1 {
+            let mut hi3 = 0
+            while hi3 < sublist_length(handlers_sl) {
+                let item3 = sublist_get(handlers_sl, hi3)
+                if node_kind(item3) == NodeKind.WithResource { ea_bind(node_name(item3), -1) }
+                hi3 = hi3 + 1
+            }
+        }
         if pushed_ffi != 0 && node_kind(body) == NodeKind.Block {
             walk_block_stmts_ffi(body, outer_tail, ea_current_block_scopes())
         } else {
             walk_expr(body, outer_tail)
         }
+        ea_pop_binds()
         if pushed_ffi != 0 {
             ea_pop_ffi_scope_block()
         }
@@ -813,6 +1214,7 @@ fn walk_with_block(node: Int, outer_tail: Int) ! Diag.Report {
 fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
     if node == -1 { return }
     let kind = node_kind(node)
+    if tail_flag != 0 && ea_tail_crosses() { classify_tail(node) }
 
     if ea_in_arena() != 0 {
         if node_is_alloc_expr(node) != 0 {
@@ -839,12 +1241,20 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
         return
     }
     if kind == NodeKind.Closure {
+        ea_closure_parent.insert(node, if ea_closure_stack.len() > 0 { ea_closure_stack.get(ea_closure_stack.len() - 1).unwrap() } else { -1 })
         if ea_in_arena() != 0 {
             check_closure_captures(node)
         }
         let fn_tid = tc_lookup_node_tid(node)
         ea_push_body(if fn_tid < 0 { -1 } else { tc_tid_child(tc_resolve(fn_tid), 0) })
+        ea_closure_stack.push(node)
+        ea_push_binds()
+        let mut params: List[Str] = []
+        push_param_names(node, params)
+        ea_bind_all(params)
         walk_expr(node_body(node), 0)
+        ea_pop_binds()
+        let _ = ea_closure_stack.pop()
         ea_pop_body()
         return
     }
@@ -854,7 +1264,10 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
         return
     }
     if kind == NodeKind.UnaryOp {
-        if node_op(node) == "?" { check_promote_cycle(node, ea_exit_crossing_tid()) }
+        if node_op(node) == "?" {
+            check_promote_cycle(node, ea_exit_crossing_tid())
+            check_question_err_closure(node)
+        }
         walk_expr(node_left(node), 0)
         return
     }
@@ -871,8 +1284,11 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
             let mut ai = 0
             while ai < sublist_length(arms_sl) {
                 let arm = sublist_get(arms_sl, ai)
+                ea_push_binds()
+                ea_bind_pattern(node_pattern(arm))
                 walk_expr(node_guard(arm), 0)
                 walk_expr(node_body(arm), tail_flag)
+                ea_pop_binds()
                 ai = ai + 1
             }
         }
@@ -893,6 +1309,8 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
                 }
             }
         }
+        ea_bind(node_name(node), val)
+        ea_bind_pattern(node_elements(node))
         let bname = node_name(node)
         if bname != "" {
             // Record unconditionally (including "") so a rebind — e.g.
@@ -909,13 +1327,20 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
     if kind == NodeKind.Return {
         let rv = node_value(node)
         if rv != -1 { check_promote_cycle(node, ea_exit_crossing_tid()) }
+        let saved_floor = ea_tail_floor
+        ea_tail_floor = ea_body_frame_base.get(ea_body_frame_base.len() - 1).unwrap() + 1
         walk_expr(rv, 1)
+        ea_tail_floor = saved_floor
         check_ffi_ptr_return_escape(rv)
         return
     }
     if kind == NodeKind.ForIn {
         walk_expr(node_iterable(node), 0)
+        ea_push_binds()
+        ea_bind_pattern(node_for_binder(node))
+        ea_bind_pattern(node_elements(node))
         walk_expr(node_body(node), 0)
+        ea_pop_binds()
         return
     }
     if kind == NodeKind.WhileLoop {
@@ -1128,7 +1553,9 @@ fn cc_scan(node: Int, locals: List[Str]) ! Diag.Report {
         let n = node_name(node)
         if !locals.contains(n) {
             if ea_is_local_anywhere(n) != 0 {
-                emit_escape(node, "closure capture")
+                ea_pending_idents.push(node)
+                ea_pending_owners.push(ea_cc_owner)
+                ea_pending_depths.push(ea_frames.len())
             }
         }
         return
@@ -1156,6 +1583,7 @@ fn cc_scan(node: Int, locals: List[Str]) ! Diag.Report {
 fn check_closure_captures(closure_node: Int) ! Diag.Report {
     let body = node_body(closure_node)
     if body == -1 { return }
+    ea_cc_owner = closure_node
     let mut pnames: List[Str] = []
     let params_sl = node_params(closure_node)
     if params_sl != -1 {
@@ -1184,6 +1612,11 @@ fn analyze_fn(fn_node: Int) ! Diag.Report {
     ea_fn_arena_bare_call = 0
     ea_body_ret_tids = []
     ea_body_frame_base = []
+    ea_reset_closure_state()
+    ea_push_binds()
+    let mut params: List[Str] = []
+    push_param_names(fn_node, params)
+    ea_bind_all(params)
     let ann = node_type_ann(fn_node)
     ea_push_body(if ann == -1 { -1 } else { tc_lookup_node_tid(ann) })
     let body = node_body(fn_node)
@@ -1234,6 +1667,8 @@ pub fn analyze_escapes(program: Int) ! Diag.Report {
     ea_ffi_scope_blocks = []
     ea_ptr_origin_frames = []
     ea_cycle_reported = Map()
+    ea_promoted_closures = Map()
+    ea_closure_parent = Map()
 
     let fns_sl = node_params(program)
     if fns_sl == -1 { return }

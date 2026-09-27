@@ -340,18 +340,20 @@ BLINK_RT_FN void blink_trace_effect(const char* fn, const char* module, int dept
 }
 #endif
 
-BLINK_RT_FN void blink_trace_arena_event(const char* fn, const char* module, int depth,
-    const char* op, int64_t slot, const char* desc, int line, int col);
+// Emitted by the runtime for each capture of a closure promoted out of `with arena`,
+// between the begin and end events of that promotion, which carry the fn and span.
+// `op` says how the capture moved: "cell" (a `let mut` cell copied), "walk" (the value
+// copied by its walker), "word" (kept as is) or "refused" (no walker; a panic follows).
+BLINK_RT_FN void blink_trace_arena_capture(const char* op, int64_t slot, const char* name);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_trace_arena_event(const char* fn, const char* module, int depth,
-    const char* op, int64_t slot, const char* desc, int line, int col) {
+BLINK_RT_FN void blink_trace_arena_capture(const char* op, int64_t slot, const char* name) {
     if (!__blink_trace.active) return;
     if (__blink_trace.event_limit > 0 && __blink_trace.event_count >= __blink_trace.event_limit) return;
     __blink_trace.event_count++;
     int64_t ts = blink_trace_ts_us();
-    fprintf(stderr, "{\"ts_us\":%lld,\"event\":\"arena.promote.capture\",\"fn\":\"%s\",\"module\":\"%s\",\"depth\":%d,"
-        "\"op\":\"%s\",\"slot\":%lld,\"desc\":\"%s\",\"span\":{\"line\":%d,\"col\":%d}}\n",
-        (long long)ts, fn, module, depth, op, (long long)slot, desc ? desc : "", line, col);
+    fprintf(stderr, "{\"ts_us\":%lld,\"event\":\"arena.promote.capture\",\"depth\":%d,"
+        "\"op\":\"%s\",\"slot\":%lld,\"capture\":\"%s\"}\n",
+        (long long)ts, __blink_trace.depth, op, (long long)slot, name ? name : "");
     fflush(stderr);
 }
 #endif

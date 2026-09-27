@@ -282,6 +282,31 @@ pub fn c_promote_walker_name(tid: Int) -> Str {
     "blink_promote_{s}"
 }
 
+// A closure's walker is per signature (§5.2.1 clause 7): every closure of one type is
+// copied by the same walk over its own capture descriptors.
+pub fn c_promote_closure_walker_name(tid: Int) -> Str {
+    let s = spellable(seg_at(tid, TAGPOS_SYMBOL))
+    if diag_is_ice_seg(s) { return s }
+    "blink_promote_closure_{s}"
+}
+
+// The two per-type entries a capture descriptor names: one moves a capture word that holds
+// the value or its box, the other fills a copied `let mut` cell.
+pub fn c_capture_word_walker_name(tid: Int) -> Str {
+    let s = spellable(seg_at(tid, TAGPOS_SYMBOL))
+    if diag_is_ice_seg(s) { return s }
+    "blink_capture_word_{s}"
+}
+
+pub fn c_capture_cell_fill_name(tid: Int) -> Str {
+    let s = spellable(seg_at(tid, TAGPOS_SYMBOL))
+    if diag_is_ice_seg(s) { return s }
+    "blink_capture_cell_{s}"
+}
+
+// One closure literal's capture descriptor table, named after the thunk it describes.
+pub fn c_capture_table_name(closure_symbol: Str) -> Str { "{closure_symbol}_descs" }
+
 // A generic declaration has one body per instance, so its derived methods take the
 // instance's typedef name. The derive writer and every call site ask here, so the symbol
 // a body defines and the symbol a call names cannot drift apart.
@@ -467,6 +492,7 @@ fn seg_at(tid0: Int, tagpos: Int) -> Str {
         return "Result_{ok}_{err}"
     }
     if k == TyKind.Tuple { return tuple_tag(t, tagpos) }
+    if k == TyKind.Fn && tagpos == TAGPOS_SYMBOL { return fn_tag(t, tagpos) }
     if k == TyKind.Typevar { return "<tv>" }
     // One blink_map* serves every key/value pair, so K and V do not ride the name. They
     // are still walked so an unsolved slot fails closed instead of spelling "map".
@@ -568,6 +594,31 @@ fn tuple_tag(t: TypePoolEntry, tagpos: Int) -> Str {
     tag
 }
 
+// A closure walker is per signature (§5.2.1 clause 7). A fn-typed parameter or return
+// keeps its own signature too, where the inner position would spell every closure
+// `closure` and let two signatures share one walker name.
+fn fn_tag(t: TypePoolEntry, tagpos: Int) -> Str {
+    let mut tag = "Fn{t.params_count}"
+    let mut i = 0
+    while i < t.params_count {
+        let p = fn_child_seg(ty_param_list.get(t.params_start + i).unwrap(), tagpos)
+        if diag_is_ice_seg(p) { return p }
+        tag = tag.concat("_").concat(p)
+        i = i + 1
+    }
+    let ret = fn_child_seg(t.inner1, tagpos)
+    if diag_is_ice_seg(ret) { return ret }
+    tag.concat("_").concat(ret)
+}
+
+fn fn_child_seg(tid0: Int, tagpos: Int) -> Str {
+    let tid = tc_resolve(tid0)
+    if tid < 0 || tid >= ty_pool.len() { return ICE_SEG_TID_OUT_OF_RANGE }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind == TyKind.Fn { return fn_tag(t, tagpos) }
+    seg_at(tid, child_pos(tagpos))
+}
+
 fn elem_is_transparent(tid: Int) -> Bool {
     let td = tc_tid_decl_node(tid)
     if td < 0 { return false }
@@ -604,7 +655,8 @@ fn scalar_top(k: TyKind) -> Str {
         TyKind.Void => "Void"
         TyKind.Unknown => ICE_SEG_UNSOLVED_TYPEVAR
         // A fn type at TOP would drop its signature and merge two instances into
-        // one symbol, so it is refused here and accepted only inside a carrier.
+        // one symbol, so it is refused here. seg_at spells it at SYMBOL with its
+        // signature, and inside a carrier as one closure member.
         TyKind.Fn => ICE_SEG_UNHANDLED_KIND
         TyKind.Never => ICE_SEG_UNHANDLED_KIND
         TyKind.Template => ICE_SEG_UNHANDLED_KIND

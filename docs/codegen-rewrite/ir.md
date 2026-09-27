@@ -88,7 +88,7 @@ a value node; *stmt* any statement; *Block* the `Block` kind; *Const* the
 | `TupleNew` | `ir_tuple_new(tid, span, c_spelling, elems)` | `[elem_0 .. : value]` | empty | `Inline` |
 | `ContainerNew` | `ir_container_new(tid, span, c_spelling, ctor_symbol, elems)` | `[elem_0 .. : value]` (Map: key, value, key, value ...); an element may be a `ContainerSpread` | the runtime constructor symbol | `InlineWord` |
 | `ContainerSpread` | `ir_container_spread(tid, span, c_spelling, extend_symbol, source)` | `[source: value]` | the runtime copy symbol (`blink_list_extend`) | `InlineWord` |
-| `Box` | `ir_box(tid, span, c_spelling, pointee_spelling, value)` | `[value: value]` | the pointee C type, the `sizeof` operand | `PointerBoxed` |
+| `Box` | `ir_box(tid, span, c_spelling, pointee_spelling, value)` or `ir_box_into(..., value, ctx)` | `[value: value]`, plus `[ctx: PromoteCtx]` in a walker, whose box lands in the target | the pointee C type, the `sizeof` operand | `PointerBoxed` |
 | `Unbox` | `ir_unbox(tid, span, c_spelling, slot_form, ptr)` | `[ptr: value]` | empty | caller |
 | `CarrierWrap` | `ir_carrier_wrap(tid, span, c_spelling, member, tag, payload)` | `[tag: Const]` or `[tag: Const, payload: value]` | the payload member: `value`, `ok`, `err`; empty for None | `Inline` |
 | `CarrierUnwrap` | `ir_carrier_unwrap(tid, span, c_spelling, member, slot_form, carrier)` | `[carrier: value]` | the member read | caller |
@@ -98,9 +98,10 @@ a value node; *stmt* any statement; *Block* the `Block` kind; *Const* the
 | `CallClosure` | `ir_call_closure(tid, span, c_spelling, fn_type, slot_form, closure, args)` | `[closure: value, arg_0 .. : value]` | the C function-pointer type the `fn_ptr` is cast to | caller |
 | `CallVirtual` | `ir_call_virtual(tid, span, c_spelling, slot, slot_form, receiver, args)` | `[receiver: value, arg_0 .. : value]` | the vtable slot name | caller |
 | `CallRuntime` | `ir_call_runtime(tid, span, c_spelling, symbol, slot_form, args)` | `[arg_0 .. : value]` | a `blink_*` runtime symbol | caller |
-| `ClosureNew` | `ir_closure_new(tid, span, c_spelling, fn_symbol, captures)` | `[capture_0 .. : value]` | the lifted function's C symbol | `InlineWord` |
+| `ClosureNew` | `ir_closure_new(tid, span, c_spelling, fn_symbol, capture_descs, promoter, captures)` | `[capture_0 .. : value]` | the lifted function's C symbol; the descriptor table and promoter are two more slots, empty when absent | `InlineWord` |
 | `EvidenceVector` | `ir_evidence_vector(span, c_spelling, c_name, slot_form)` | none | `__ev` (PointerBoxed param) or `__blink_ev` (Inline global) | caller |
 | `EvidenceAddress` | `ir_evidence_address(span, vector)` | `[vector: EvidenceVector held inline]` | empty; the vector owns the name | `InlineWord` |
+| `PromoteCtx` | `ir_promote_ctx(span, target)` or `ir_promote_ctx_param(span, c_name)` | `[target: ArenaTarget]` for a boundary, none for a walker's parameter | empty at a boundary; the parameter name in a walker | `InlineWord` |
 | `EffectPerform` | `ir_effect_perform(tid, span, c_spelling, slot, slot_form, slot_read, args)` | `[slot_read: FieldGet over an EvidenceVector, held by pointer; arg_0 .. : value]` | the handler vtable slot | caller |
 
 `ContainerSpread` is `[..xs, y]`: it copies every element of its source into the
@@ -246,9 +247,6 @@ Kind helpers: `ir_all_kinds()`, `ir_kind_name`, `ir_kind_from_name`,
 
 ## Open notes
 
-- `ClosureNew` has no slot for a capture descriptor or promoter symbol beyond
-  `fn_symbol`. If the closure ABI needs per-capture promotion the lowering
-  must emit it as `CallRuntime` kids first.
 - `c_name` carries a different C token per kind (literal, operator, field,
   member, symbol, slot, cast type). The table above is the contract; the
   printer switches on `kind`, never on the string.

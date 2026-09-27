@@ -118,12 +118,15 @@ row names the helper in `cg_emit.bl` or the kind in `cg_print.bl` that writes it
 A match prints as an if chain, not a C `switch`. A `Break` or `Continue` inside an
 arm must reach the enclosing loop, and a C `switch` would capture it.
 
-Two forms carry less than the old codegen did, because the IR has no slot for the
-data yet: `ClosureNew` passes `NULL` for the capture descriptors and the promoter, and
-`ContainerNew` for a map or set has no key-operations table to pass to the
-constructor (the table itself is printable through `em_kops_table`; the ctor slot is
-what is missing), so the printer reports it as an `I0003` and writes a marker instead of a
-call that does not compile. Both gaps have tickets against `ir.bl`.
+`ContainerNew` for a map or set carries less than the old codegen did: the IR has no
+slot for the key-operations table to pass to the constructor (the table itself is
+printable through `em_kops_table`; the ctor slot is what is missing), so the printer
+reports it as an `I0003` and writes a marker instead of a call that does not compile.
+The gap has a ticket against `ir.bl`.
+
+`ClosureNew` passes its descriptor table and promoter, or `NULL` for an empty slot.
+`PromoteCtx` at an arena boundary prints `BLINK_PROMOTE_CTX(target)`, a stack context
+for one promotion; in a walker it prints the parameter it names.
 
 `StructNew` prints a positional compound literal, because the IR carries no field
 names. The driver must pass the kids in declaration order.
