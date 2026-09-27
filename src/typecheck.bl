@@ -3887,6 +3887,48 @@ fn tc_infer_unhinted(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Di
     t
 }
 
+// A field access is expected to be the FIELD's type, never the receiver's. A generic literal
+// whose field is declared as a bare type parameter learns that parameter from it, so the
+// receiver is inferred at that instance with fresh metavariables for the other parameters.
+// Any other receiver has nothing to learn from the field's expected type.
+@allow(UnrestoredMutation)
+fn tc_infer_field_receiver(obj_node: Int, fname: Str) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let saved_hint = tc_construct_hint
+    tc_construct_hint = tc_field_receiver_hint(obj_node, fname, saved_hint)
+    let t = infer_type(obj_node)
+    tc_construct_hint = saved_hint
+    t
+}
+
+fn tc_field_receiver_hint(obj_node: Int, fname: Str, field_hint: Int) -> Int {
+    if field_hint < 0 { return -1 }
+    if node_kind(obj_node) != NodeKind.StructLit { return -1 }
+    let stid = lookup_named_type(node_type_name(obj_node))
+    if stid == -1 || type_kind(stid) != TyKind.Struct { return -1 }
+    let bare = tc_instance_base_name(stid)
+    let decl = tc_struct_decl_nodes.get(bare) ?? -1
+    if decl == -1 { return -1 }
+    let tparams_sl = node_type_params(decl)
+    if tparams_sl == -1 || sublist_length(tparams_sl) == 0 { return -1 }
+    let declared = get_struct_field_tid(stid, fname)
+    if declared == -1 || tc_tid_kind(declared) != TyKind.Typevar { return -1 }
+    let tvname = tc_tid_name(declared)
+    let mut args: List[Int] = []
+    let mut found = 0
+    let mut i = 0
+    while i < sublist_length(tparams_sl) {
+        if node_name(sublist_get(tparams_sl, i)) == tvname {
+            args.push(field_hint)
+            found = 1
+        } else {
+            args.push(make_metavar())
+        }
+        i = i + 1
+    }
+    if found == 0 { return -1 }
+    make_struct_instance_type(bare, args)
+}
+
 // Enforce a call's type-param bounds against the concrete types discovered for it
 // (E0306 TraitBoundNotSatisfied, spec 03_types.md:1193). Reads the sig's parallel
 // name+bound side-tables. Emits ONLY on a provably-unmet bound (tc_type_satisfies_bound
@@ -18532,7 +18574,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
 
         // tc_resolve, so the arms below read the struct itself and not the bound metavar an
         // inferred value carries — type_kind resolves, but the pool reads here do not.
-        let obj_t = tc_resolve(infer_type(obj_node))
+        let obj_t = tc_resolve(tc_infer_field_receiver(obj_node, fname))
         if type_kind(obj_t) == TyKind.Struct {
             let ft = get_struct_field_tid(obj_t, fname)
             if ft != -1 {
