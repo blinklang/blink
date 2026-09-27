@@ -2927,6 +2927,7 @@ BLINK_RT_FN blink_sb* blink_sb_copy_shell(blink_promote_ctx* ctx, const blink_sb
    once, with its capture array, and each capture moves as its descriptor
    says. The record is registered before its captures are walked, so a closure
    that reaches itself through a cell gets its own copy back. */
+BLINK_RT_FN void blink_trace_arena_capture(const char* op, int64_t slot, const char* name);
 BLINK_RT_FN blink_closure* blink_closure_promote(blink_promote_ctx* ctx, blink_closure* c);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_closure* blink_closure_promote(blink_promote_ctx* ctx, blink_closure* c) {
@@ -2945,8 +2946,10 @@ BLINK_RT_FN blink_closure* blink_closure_promote(blink_promote_ctx* ctx, blink_c
         const blink_capture_desc* d = &c->capture_descs[i];
         void* w = c->captures[i];
         if (d->cell_size == BLINK_CAPTURE_REFUSED) {
+            blink_trace_arena_capture("refused", i, d->name);
             __blink_panic_dispatchf("arena promotion cannot copy capture `%s` of a closure leaving `with arena`: no promotion exists for its type", d->name);
         }
+        blink_trace_arena_capture(d->cell_size > 0 ? "cell" : d->walk != NULL ? "walk" : "word", i, d->name);
         if (d->cell_size > 0) out->captures[i] = blink_promote_cell(ctx, w, d->cell_size, d->fill);
         else out->captures[i] = d->walk != NULL ? d->walk(w, ctx) : w;
     }

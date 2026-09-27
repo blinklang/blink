@@ -39,7 +39,7 @@ import cname.{
     c_capture_table_name,
 }
 import cg_print.{print_fn, print_capture_desc_table}
-import escape.{ea_refuse_recursive_crossing}
+import escape.{ea_closure_is_promoted, ea_refuse_recursive_crossing, ea_refuse_unwalkable_capture}
 import cg_reg.{cg_reg_tid_for_decl}
 import cg_call.{cg_call_element_from_runtime, cg_call_element_from_word, cg_call_element_to_slot_in}
 import ir.{
@@ -272,7 +272,7 @@ fn kind_class(k: TyKind) -> WalkClass {
         TyKind.Handler => WalkClass.Unbuilt
         TyKind.Template => WalkClass.Unbuilt
         TyKind.Raw => WalkClass.Unbuilt
-        TyKind.FfiScope => WalkClass.Unbuilt
+        TyKind.FfiScope => WalkClass.Shared
         TyKind.Typevar => WalkClass.Unsolved
         TyKind.Unknown => WalkClass.Unsolved
     }
@@ -767,9 +767,10 @@ fn boxed_member_fix(w: Walk, inner: Int, mrec: LayoutRecord, member: Str) -> Int
 // The descriptor table for one closure literal's captures, queued to print with the
 // walkers its rows name, or "" when it captures nothing. `celled` holds 1 where the capture
 // word is the address of a `let mut` cell. A capture whose type has no walker gets a
-// refused row, which panics naming the capture if the closure is ever promoted: it cannot
-// be refused here, because most closures never cross an arena, and escape.bl refuses the
-// crossings it can see (E0702d). "" after a report.
+// refused row, which panics naming the capture if the closure is ever promoted: most
+// closures never cross an arena, so only a closure escape.bl promotes is refused here,
+// and escape.bl has refused its captures already unless it saw their type only as a type
+// parameter. "" after a report.
 pub fn cg_promote_capture_table(closure_symbol: Str, names: List[Str], tids: List[Int], celled: List[Int], span: Int) -> Str ! Diag.Report {
     if names.len() == 0 { return "" }
     let mut t = PendingTable { symbol: c_capture_table_name(closure_symbol), name_lits: [], sizes: [],
@@ -779,6 +780,13 @@ pub fn cg_promote_capture_table(closure_symbol: Str, names: List[Str], tids: Lis
         let tid = tids.get(i).unwrap()
         let is_cell = celled.get(i).unwrap() == 1
         t.name_lits.push(c_string_literal(names.get(i).unwrap()))
+        if !walker_buildable(tid) && ea_closure_is_promoted(span) {
+            let name = names.get(i).unwrap()
+            if !ea_refuse_recursive_crossing(span, tid) && !ea_refuse_unwalkable_capture(span, name, tid) {
+                invariant(span, "a promoted closure captures `{name}` of {tc_type_str(tc_resolve(tid))}, which has no walker, and no check refused it")
+            }
+            return ""
+        }
         if !walker_buildable(tid) {
             t.sizes.push("BLINK_CAPTURE_REFUSED")
             t.walks.push("NULL")
