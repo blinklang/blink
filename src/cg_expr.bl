@@ -31,13 +31,13 @@ import typecheck.{
 import layout.{
     LayoutRecord, Position, Slot, SlotForm, layout_of, binder_is_celled, carrier_member_layout,
     child_tid, current_binder_scope, field_layout_of, tid_of_binder, tid_of_node, ensure_typedef_for,
-    format_spec_of, varargs_spelling,
+    format_spec_of, varargs_spelling, pointer_spelling,
 }
 import cg_reg.{cg_reg_global_decls, cg_reg_module_of}
 import cname.{
     c_local_name, c_field_name, c_global_name, c_string_literal, c_container_ctor,
     c_runtime_helper, c_tuple_member, c_variant_discriminant, c_mint_local,
-    c_test_propagate_name,
+    c_overflow_builtin, c_int_min_macro, c_test_propagate_name,
 }
 import ir.{
     IrKind, ir_kind, ir_kind_is_name, ir_kid, ir_kid_count, ir_c_name, ir_panic,
@@ -744,25 +744,66 @@ fn lower_binop(node: Int) -> Int ! Diag.Report {
     let rhs = lower_expr(node_right(node))
     if lhs < 0 { return -1 }
     if rhs < 0 { return -1 }
-    if x_operator_needs_guard(op, lhs_tid, rhs) { return x_guarded_binary(node, op, tid, rec, lhs_tid, lhs, rhs) }
-    ir_binary(tid, node, rec.c_spelling, op, lhs, rhs)
+    lower_arith_operator(ArithSite { node: node, op: op, tid: tid, lhs_node: node_left(node),
+        rhs_node: node_right(node) }, lhs, rhs)
 }
 
-// Three integer operations C leaves undefined where Blink promises a panic: a division or a
-// remainder by zero, and a shift by the left operand's own width or more. On x86 the first
-// two fault and the third quietly masks the amount, so the promise cannot come from the C
-// operator and the seam that lowers the operator emits the test instead.
+// One operator over two C scalars: where it stands, what it does, its result type, and
+// the source nodes of its operands. A compound assignment has no left and right children,
+// so the operands' nodes travel here instead of being read off `node`.
+pub type ArithSite {
+    node: Int
+    op: Str
+    tid: Int
+    lhs_node: Int
+    rhs_node: Int
+}
+
+// Every operator over two C scalars lowers here, from an expression or from a compound
+// assignment, so that neither can reach C without the checks the spec promises. The
+// operands arrive already lowered, in the order the program wrote them.
+pub fn lower_arith_operator(site: ArithSite, lhs: Int, rhs: Int) -> Int ! Diag.Report {
+    if lhs < 0 || rhs < 0 { return -1 }
+    let rec = x_local(site.tid, site.node)
+    if x_stopped(rec) { return -1 }
+    let lhs_tid = tid_of_node(site.lhs_node)
+    if lhs_tid < 0 { return -1 }
+    if x_operator_needs_guard(site.op, lhs_tid, rhs) || x_needs_min_guard(site.op, lhs_tid, rhs) {
+        return x_guarded_binary(site, rec, lhs_tid, lhs, rhs)
+    }
+    if x_operator_can_overflow(site.op, site.tid) { return x_checked_arith(site, rec, lhs_tid, lhs, rhs) }
+    ir_binary(site.tid, site.node, rec.c_spelling, site.op, lhs, rhs)
+}
+
+// Three integer operations C leaves undefined where Blink promises a panic: a division or
+// a remainder by zero, and a shift by the left operand's own width or more. On x86 the
+// first two fault and the third quietly masks the amount, so the promise cannot come from
+// the C operator and the seam that lowers the operator emits the test instead.
 //
-// A literal the front end has already judged needs nothing. It refuses a shift whose amount
-// is an integer literal out of range, and a division by a literal that is not zero cannot
-// fault, so those sites keep printing as the bare operator. Anything else is guarded,
-// including a literal this stage cannot read as a number: guessing there would trade a
-// panic for a fault.
+// A literal the front end has already judged needs nothing. It refuses a shift whose
+// amount is an integer literal out of range, and a division by a literal that is not zero
+// cannot fault, so those sites keep printing as the bare operator. Anything else is
+// guarded, including a literal this stage cannot read as a number: guessing there would
+// trade a panic for a fault.
 fn x_operator_needs_guard(op: Str, lhs_tid: Int, rhs: Int) -> Bool {
     if is_integer_type(lhs_tid) == 0 { return false }
     if op == "/" || op == "%" { return !x_is_nonzero_literal(rhs) }
     if op == "<<" || op == ">>" { return ir_kind(rhs) != IrKind.Const }
     false
+}
+
+// A signed quotient leaves its range at one point only, the minimum over -1, which C
+// leaves undefined and x86 faults on. A literal divisor that is not negative can never be
+// -1, so only that divisor skips the test.
+fn x_needs_min_guard(op: Str, lhs_tid: Int, rhs: Int) -> Bool {
+    if op != "/" || !x_is_signed_int(lhs_tid) { return false }
+    if ir_kind(rhs) != IrKind.Const { return true }
+    ir_c_name(rhs).starts_with("-")
+}
+
+fn x_is_signed_int(tid: Int) -> Bool {
+    if is_integer_type(tid) == 0 { return false }
+    !diag_is_ice_seg(c_int_min_macro(x_kind(tid)))
 }
 
 fn x_is_nonzero_literal(id: Int) -> Bool {
@@ -777,22 +818,48 @@ fn x_is_nonzero_literal(id: Int) -> Bool {
     false
 }
 
-// The test reads the same value the operator reads, so an operand that is not already a
+// The tests read the same values the operator reads, so an operand that is not already a
 // name becomes a temp: testing it where it stands would run it twice, and leaving the left
 // operand inline would run it after a panic that must come later than its own effects.
-fn x_guarded_binary(node: Int, op: Str, tid: Int, rec: LayoutRecord, lhs_tid: Int, lhs: Int,
-        rhs: Int) -> Int ! Diag.Report {
-    let rhs_tid = tid_of_node(node_right(node))
+fn x_guarded_binary(site: ArithSite, rec: LayoutRecord, lhs_tid: Int, lhs: Int, rhs: Int) -> Int ! Diag.Report {
+    let rhs_tid = tid_of_node(site.rhs_node)
     if rhs_tid < 0 { return -1 }
-    let left = x_hold(lhs_tid, node_left(node), lhs)
-    let divisor_name = x_hold_name(rhs_tid, node_right(node), rhs)
-    if left < 0 || divisor_name == "" { return -1 }
-    let divisor = x_ref(rhs_tid, node_right(node), divisor_name)
-    let tripped = x_operand_test(node, op, lhs_tid, rhs_tid, divisor_name)
-    let said = x_guard_message(node, op, lhs_tid)
-    if divisor < 0 || tripped < 0 || said < 0 { return -1 }
-    x_hoist(ir_if(node, tripped, ir_block(node, [ir_panic(node, said)]), -1))
-    ir_binary(tid, node, rec.c_spelling, op, left, divisor)
+    let zero_test = x_operator_needs_guard(site.op, lhs_tid, rhs)
+    let min_test = x_needs_min_guard(site.op, lhs_tid, rhs)
+    let left_name = x_hold_name(lhs_tid, site.lhs_node, lhs)
+    let right_name = x_hold_name(rhs_tid, site.rhs_node, rhs)
+    if left_name == "" || right_name == "" { return -1 }
+    if zero_test {
+        let tripped = x_operand_test(site.node, site.op, lhs_tid, rhs_tid, right_name)
+        let said = x_guard_message(site.node, site.op, lhs_tid)
+        if tripped < 0 || said < 0 { return -1 }
+        x_hoist(ir_if(site.node, tripped, ir_block(site.node, [ir_panic(site.node, said)]), -1))
+    }
+    if min_test && !x_hoist_min_guard(site, lhs_tid, rhs_tid, left_name, right_name) { return -1 }
+    let left = x_ref(lhs_tid, site.lhs_node, left_name)
+    let divisor = x_ref(rhs_tid, site.rhs_node, right_name)
+    if left < 0 || divisor < 0 { return -1 }
+    ir_binary(site.tid, site.node, rec.c_spelling, site.op, left, divisor)
+}
+
+// `left == MIN && right == -1`, and the panic it guards.
+fn x_hoist_min_guard(site: ArithSite, lhs_tid: Int, rhs_tid: Int, left: Str, right: Str) -> Bool ! Diag.Report {
+    let bool_rec = x_local(TYPE_BOOL, site.node)
+    let lhs_rec = x_local(lhs_tid, site.node)
+    let rhs_rec = x_local(rhs_tid, site.node)
+    if x_stopped(bool_rec) || x_stopped(lhs_rec) || x_stopped(rhs_rec) { return false }
+    let l = x_ref(lhs_tid, site.lhs_node, left)
+    let r = x_ref(rhs_tid, site.rhs_node, right)
+    if l < 0 || r < 0 { return false }
+    let at_min = ir_binary(TYPE_BOOL, site.node, bool_rec.c_spelling, "==", l,
+        ir_const(lhs_tid, site.node, lhs_rec.c_spelling, c_int_min_macro(x_kind(lhs_tid))))
+    let by_minus_one = ir_binary(TYPE_BOOL, site.node, bool_rec.c_spelling, "==", r,
+        ir_const(rhs_tid, site.node, rhs_rec.c_spelling, "-1"))
+    let tripped = ir_binary(TYPE_BOOL, site.node, bool_rec.c_spelling, "&&", at_min, by_minus_one)
+    let said = x_operands_message(site, lhs_tid, rhs_tid, left, right)
+    if said < 0 { return false }
+    x_hoist(ir_if(site.node, tripped, ir_block(site.node, [ir_panic(site.node, said)]), -1))
+    true
 }
 
 // An operand the guard needs to read twice, as a value: already a name, or a fresh temp.
@@ -833,6 +900,84 @@ fn x_guard_message(node: Int, op: Str, lhs_tid: Int) -> Int ! Diag.Report {
         text = "shift amount out of range for {tk_name(x_kind(lhs_tid))} (must be 0..{type_bit_width(lhs_tid) - 1})"
     }
     ir_const(TYPE_STR, node, rec.c_spelling, c_string_literal(text))
+}
+
+// Addition, subtraction and multiplication can leave the range of their own operands.
+// C answers neither half of the promise: signed overflow is undefined and unsigned
+// overflow wraps without a word. The wrapping methods are the opt-in escape, and they are
+// method calls, so they never arrive here.
+fn x_operator_can_overflow(op: Str, tid: Int) -> Bool {
+    if is_integer_type(tid) == 0 { return false }
+    op == "+" || op == "-" || op == "*"
+}
+
+// Both operands are held as names first: the check reads each one and the message reads
+// it again, and an operand evaluated twice would run its effects twice.
+fn x_checked_arith(site: ArithSite, rec: LayoutRecord, lhs_tid: Int, lhs: Int, rhs: Int) -> Int ! Diag.Report {
+    let rhs_tid = tid_of_node(site.rhs_node)
+    if rhs_tid < 0 { return -1 }
+    let left = x_hold_name(lhs_tid, site.lhs_node, lhs)
+    let right = x_hold_name(rhs_tid, site.rhs_node, rhs)
+    if left == "" || right == "" { return -1 }
+    let l = x_ref(lhs_tid, site.lhs_node, left)
+    let r = x_ref(rhs_tid, site.rhs_node, right)
+    let said = x_operands_message(site, lhs_tid, rhs_tid, left, right)
+    x_checked_into(site.node, site.op, site.tid, rec, l, r, said)
+}
+
+// The operator becomes a declaration, a check and a read. The checked builtin computes
+// into the declaration and answers whether the value fitted it, so the range it tests is
+// the range of the result and one shape serves every width.
+fn x_checked_into(node: Int, op: Str, tid: Int, rec: LayoutRecord, l: Int, r: Int, said: Int) -> Int ! Diag.Report {
+    if l < 0 || r < 0 || said < 0 { return -1 }
+    let bool_rec = x_local(TYPE_BOOL, node)
+    if x_stopped(bool_rec) { return -1 }
+    let out = x_bind(tid, node, -1)
+    if out == "" { return -1 }
+    let target = x_ref(tid, node, out)
+    if target < 0 { return -1 }
+    let into = ir_unary(tid, node, pointer_spelling(rec.c_spelling), "&", target)
+    let overflowed = ir_call_runtime(TYPE_BOOL, node, bool_rec.c_spelling, c_overflow_builtin(op),
+        bool_rec.slot_form, [l, r, into])
+    x_hoist(ir_if(node, overflowed, ir_block(node, [ir_panic(node, said)]), -1))
+    x_ref(tid, node, out)
+}
+
+// "U8 overflow in addition (255 + 1)", the form sections/03_types.md:785 shows. The
+// operands are values only the run knows, so the message is formatted, and it is built
+// inside the check, so the formatting runs only on the path that panics.
+fn x_operands_message(site: ArithSite, lhs_tid: Int, rhs_tid: Int, left: Str, right: Str) -> Int ! Diag.Report {
+    let lspec = format_spec_of(lhs_tid)
+    let rspec = format_spec_of(rhs_tid)
+    if lspec == "" || rspec == "" { return -1 }
+    let l = x_ref(lhs_tid, site.lhs_node, left)
+    let r = x_ref(rhs_tid, site.rhs_node, right)
+    if l < 0 || r < 0 { return -1 }
+    let what = "{tk_name(x_kind(site.tid))} overflow in {x_operation_word(site.op)} ({lspec} {site.op} {rspec})"
+    x_panic_message(site.node, what, [
+        x_promote_for_varargs(site.lhs_node, lhs_tid, l),
+        x_promote_for_varargs(site.rhs_node, rhs_tid, r),
+    ])
+}
+
+fn x_operation_word(op: Str) -> Str {
+    match op {
+        "+" => "addition"
+        "-" => "subtraction"
+        "*" => "multiplication"
+        "/" => "division"
+        _ => op
+    }
+}
+
+// A panic sentence formatted when the program panics. `what` is a format: every value
+// the run supplies is one of its conversions, in the order of `args`.
+fn x_panic_message(node: Int, what: Str, args: List[Int]) -> Int ! Diag.Report {
+    let rec = x_local(TYPE_STR, node)
+    if x_stopped(rec) { return -1 }
+    let mut parts = [ir_const(TYPE_STR, node, rec.c_spelling, c_string_literal(what))]
+    for a in args { parts.push(a) }
+    ir_call_runtime(TYPE_STR, node, rec.c_spelling, c_runtime_helper("str_format"), rec.slot_form, parts)
 }
 
 // Kinds C's own operators compare and arithmetic correctly: the scalars and the ordinal
@@ -1012,9 +1157,39 @@ fn lower_unary(node: Int) -> Int ! Diag.Report {
     if tid < 0 { return -1 }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
+    if op == "-" && node_kind(node_left(node)) == NodeKind.IntLit { return x_negative_literal(node, tid, rec) }
     let operand = lower_expr(node_left(node))
     if operand < 0 { return -1 }
+    if op == "-" && is_integer_type(tid) != 0 { return x_checked_negation(node, tid, rec, operand) }
     ir_unary(tid, node, rec.c_spelling, op, operand)
+}
+
+// A minus written on an integer literal is one negative constant, not a negation to
+// check, so a type's own minimum stays a value and a global set to one stays a C
+// constant. The 64-bit minimum has no decimal C spelling, so it takes the macro.
+fn x_negative_literal(node: Int, tid: Int, rec: LayoutRecord) -> Int ! Diag.Report {
+    let lit = node_left(node)
+    let s = node_str_val(lit)
+    let text = if s == "" { "{node_int_val(lit)}" } else { s }
+    if text == "9223372036854775808" && x_is_signed_int(tid) {
+        return ir_const(tid, node, rec.c_spelling, c_int_min_macro(TyKind.Int))
+    }
+    ir_const(tid, node, rec.c_spelling, "-{text}")
+}
+
+// Zero minus the operand, checked like any subtraction: only a signed minimum has no
+// negation in its own type.
+fn x_checked_negation(node: Int, tid: Int, rec: LayoutRecord, operand: Int) -> Int ! Diag.Report {
+    let src = node_left(node)
+    let name = x_hold_name(tid, src, operand)
+    if name == "" { return -1 }
+    let spec = format_spec_of(tid)
+    let shown = x_ref(tid, src, name)
+    if spec == "" || shown < 0 { return -1 }
+    let said = x_panic_message(node, "{tk_name(x_kind(tid))} overflow in negation (-({spec}))",
+        [x_promote_for_varargs(src, tid, shown)])
+    let zero = ir_const(tid, node, rec.c_spelling, "0")
+    x_checked_into(node, "-", tid, rec, zero, x_ref(tid, src, name), said)
 }
 
 // `x?` reads the carrier twice, so the carrier is bound first. The failure arm returns
