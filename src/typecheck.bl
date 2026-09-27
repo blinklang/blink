@@ -10225,6 +10225,7 @@ fn init_types() ! TypeCheck.Register {
     tc_call_site_type_args.clear()
     tc_type_args_claimed.clear()
     tc_type_args_unresolved.clear()
+    tc_type_args_untyped = []
     tc_tp_arith_names.clear()
     tc_tp_bound_traits.clear()
     tc_tp_bound_methods.clear()
@@ -19006,6 +19007,10 @@ let mut tc_type_args_claimed: Map[Int, Int] = Map()
 // count checks stay quiet on these, so one mistake gets one report.
 let mut tc_type_args_unresolved: Map[Int, Int] = Map()
 
+// Calls with an unread type-argument list that had no type yet when the check reached them.
+// A later walk may still claim the list; whatever is left at the end of the program is reported.
+let mut tc_type_args_untyped: List[Int] = []
+
 // Whether an index expression with no call after it is a type applied in brackets rather
 // than a position read. The brackets hold a NAME, that name names a type or a type
 // parameter in scope, and no value of that name is in scope to be indexed by.
@@ -19121,9 +19126,26 @@ fn tc_check_type_args_claimed(node: Int, tid: Int) ! Diag.Report {
     if targs == -1 { return }
     if (tc_type_args_claimed.get(node) ?? 0) != 0 { return }
     if (tc_type_args_unresolved.get(node) ?? 0) != 0 { return }
-    if tc_tid_is_no_info(tid) != 0 { return }
+    if tc_tid_is_no_info(tid) != 0 {
+        tc_type_args_untyped.push(node)
+        return
+    }
+    tc_report_unclaimed_type_args(node)
+}
+
+// Reports what tc_check_type_args_claimed deferred and no later walk claimed, so a list that
+// binds nothing never reaches codegen without a report.
+fn tc_flush_untyped_type_args() ! Diag.Report {
+    for node in tc_type_args_untyped {
+        if (tc_type_args_claimed.get(node) ?? 0) == 0 { tc_report_unclaimed_type_args(node) }
+    }
+    tc_type_args_untyped = []
+}
+
+fn tc_report_unclaimed_type_args(node: Int) ! Diag.Report {
+    let k = node_kind(node)
     tc_type_args_claimed.insert(node, 1)
-    let given = sublist_length(targs)
+    let given = sublist_length(node_type_params(node))
     tc_errors.push("type arguments nothing reads")
     if k == NodeKind.Call && node_kind(node_left(node)) != NodeKind.Ident {
         diag_error_at("CallSiteTypeArgs", CALL_SITE_TYPE_ARGS, "a function value expects 0 type argument(s), {given} given", node, ELEMENT_ACCESS_HELP)
@@ -21774,6 +21796,7 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
     // Last: every constraining use in the program has now run, so a deferred alias blame
     // whose metavar is still unbound is genuinely under-determined.
     tc_ud_flush_pending()
+    tc_flush_untyped_type_args()
     tc_boundary_check_active = prev_boundary
 }
 
