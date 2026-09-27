@@ -8,7 +8,7 @@ import diagnostics.{
     UNEXPECTED_TOKEN_STRING, UNEXPECTED_TOKEN_PATTERN, KEYWORD_AS_IDENTIFIER,
     EMPTY_BRACE_EXPR, UNKNOWN_INTRINSIC, MUT_FIELD_NOT_SUPPORTED,
     INVALID_STRING_BACKED_ENUM, INTERP_PARSE_FAILURE,
-    TEST_ANNOTATED_RETURN,
+    TEST_ANNOTATED_RETURN, ELEMENT_ACCESS_HELP,
 }
 
 effect Parse {
@@ -3032,25 +3032,17 @@ fn parse_postfix() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                 nodes.push(AstNode { kind: NodeKind.ChannelNew, type_params: tparams, args: cn_args, line: node_line(node), col: node_col(node) })
                 node = nd
             } else if at(TokenKind.LParen) {
-                advance()
-                let args = new_sublist()
-                if !at(TokenKind.RParen) {
-                    skip_newlines()
-                    sublist_push(args, parse_maybe_named_arg())
-                    while at(TokenKind.Comma) {
-                        advance()
-                        skip_newlines()
-                        if at(TokenKind.RParen) {
-                            break
-                        }
-                        sublist_push(args, parse_maybe_named_arg())
-                    }
-                    skip_newlines()
-                }
-                expect(TokenKind.RParen)
-                finalize_sublist(args)
+                let args = parse_call_args()
                 let nd = node_count()
                 nodes.push(AstNode { kind: NodeKind.MethodCall, obj: node, method: member, args: args, line: node_line(node), col: node_col(node) })
+                node = nd
+            } else if at(TokenKind.LBracket) && brackets_then_call() && is_type_start(peek_kind_at(first_token_in_brackets())) {
+                advance()
+                skip_newlines()
+                let targs = parse_type_arg_list()
+                let args = parse_call_args()
+                let nd = node_count()
+                nodes.push(AstNode { kind: NodeKind.MethodCall, obj: node, method: member, args: args, type_params: targs, line: node_line(node), col: node_col(node) })
                 node = nd
             } else {
                 let nd = node_count()
@@ -3068,35 +3060,12 @@ fn parse_postfix() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                 }
             }
         } else if at(TokenKind.LParen) {
-            advance()
-            let args = new_sublist()
-            if !at(TokenKind.RParen) {
-                skip_newlines()
-                sublist_push(args, parse_maybe_named_arg())
-                while at(TokenKind.Comma) {
-                    advance()
-                    skip_newlines()
-                    if at(TokenKind.RParen) {
-                        break
-                    }
-                    sublist_push(args, parse_maybe_named_arg())
-                }
-                skip_newlines()
-            }
-            expect(TokenKind.RParen)
-            finalize_sublist(args)
+            let args = parse_call_args()
             let nd = node_count()
             nodes.push(AstNode { kind: NodeKind.Call, left: node, args: args, line: node_line(node), col: node_col(node) })
             node = nd
         } else if at(TokenKind.LBracket) {
-            advance()
-            skip_newlines()
-            let idx = parse_expr()
-            skip_newlines()
-            expect(TokenKind.RBracket)
-            let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.IndexExpr, obj: node, index: idx, line: node_line(node), col: node_col(node) })
-            node = nd
+            node = parse_bracket_suffix(node)
         } else if at(TokenKind.Question) {
             advance()
             let nd = node_count()
@@ -3117,6 +3086,122 @@ fn parse_postfix() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         }
     }
     node
+}
+
+// A parenthesized argument list, from `(` through `)`.
+fn parse_call_args() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    expect(TokenKind.LParen)
+    let args = new_sublist()
+    if !at(TokenKind.RParen) {
+        skip_newlines()
+        sublist_push(args, parse_maybe_named_arg())
+        while at(TokenKind.Comma) {
+            advance()
+            skip_newlines()
+            if at(TokenKind.RParen) {
+                break
+            }
+            sublist_push(args, parse_maybe_named_arg())
+        }
+        skip_newlines()
+    }
+    expect(TokenKind.RParen)
+    finalize_sublist(args)
+    args
+}
+
+// Brackets after an expression are a type-argument list when a call follows the closing
+// bracket (03_types.md:1297); only a bracket with no call is an index read. The scan from
+// the `[` at pos to its match is what tells the two apart before either is parsed.
+fn brackets_then_call() -> Bool {
+    let mut p = pos
+    let mut depth = 0
+    while p < tokens.len() {
+        let k = peek_kind_at(p)
+        if k == TokenKind.LBracket {
+            depth = depth + 1
+        } else if k == TokenKind.RBracket {
+            depth = depth - 1
+            if depth == 0 { return peek_kind_at(p + 1) == TokenKind.LParen }
+        }
+        p = p + 1
+    }
+    false
+}
+
+// The first token inside the `[` at pos, past any line breaks.
+fn first_token_in_brackets() -> Int {
+    let mut p = pos + 1
+    while peek_kind_at(p) == TokenKind.Newline { p = p + 1 }
+    p
+}
+
+// The tokens parse_type_annotation can start with.
+fn is_type_start(k: TokenKind) -> Bool {
+    k == TokenKind.Ident || k == TokenKind.LBracket || k == TokenKind.LParen || k == TokenKind.Fn || k == TokenKind.Handler
+}
+
+// A value where a type argument belongs: whoever wrote it meant to index, so the report names
+// element access.
+fn report_value_in_type_args() ! Diag.Report {
+    diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "expected a type argument, got {token_kind_name(peek_kind())}", peek_line(), peek_col(), peek_end_col(), ELEMENT_ACCESS_HELP)
+}
+
+// Past the rest of a reported type-argument list, up to its closing bracket.
+fn skip_to_close_bracket() ! Parse.Advance {
+    let mut depth = 1
+    while pos < tokens.len() {
+        if at(TokenKind.LBracket) { depth = depth + 1 }
+        if at(TokenKind.RBracket) {
+            depth = depth - 1
+            if depth == 0 { return }
+        }
+        advance()
+    }
+}
+
+// The types between `[` and `]` of a call's type-argument list, with pos just past the `[`.
+fn parse_type_arg_list() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let sl = new_sublist()
+    sublist_push(sl, parse_type_annotation())
+    skip_newlines()
+    while at(TokenKind.Comma) {
+        advance()
+        skip_newlines()
+        if !is_type_start(peek_kind()) { break }
+        sublist_push(sl, parse_type_annotation())
+        skip_newlines()
+    }
+    if !at(TokenKind.RBracket) {
+        report_value_in_type_args()
+        skip_to_close_bracket()
+    }
+    expect(TokenKind.RBracket)
+    finalize_sublist(sl)
+    sl
+}
+
+// `[` after an expression: a call's type arguments when a call follows, else an index read.
+// A value opening a list that a call follows is reported and then read as the index it was
+// meant to be, so the checker adds nothing to the one report.
+fn parse_bracket_suffix(obj: Int) -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let then_call = brackets_then_call()
+    advance()
+    skip_newlines()
+    if then_call && is_type_start(peek_kind()) {
+        let targs = parse_type_arg_list()
+        let args = parse_call_args()
+        let nd = node_count()
+        nodes.push(AstNode { kind: NodeKind.Call, left: obj, args: args, type_params: targs, line: node_line(obj), col: node_col(obj) })
+        return nd
+    }
+    if then_call { report_value_in_type_args() }
+    let idx = parse_expr()
+    skip_newlines()
+    expect(TokenKind.RBracket)
+    let nd = node_count()
+    nodes.push(AstNode { kind: NodeKind.IndexExpr, obj: obj, index: idx, line: node_line(obj), col: node_col(obj) })
+    nd
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
