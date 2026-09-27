@@ -1268,7 +1268,7 @@ let mut tc_collision_reported: Map[Str, Int] = Map()
 let mut ffi_struct_type_set: Map[Int, Int] = Map()
 
 // Tids of @ffi.opaque handle types, keyed the same way as the @ffi.struct set above and for
-// the same reason. Consulted by is_valid_ptr_inner so an out-param `Ptr[Handle]` (the
+// the same reason. Consulted by tc_ptr_pointee_is_valid so an out-param `Ptr[Handle]` (the
 // `<c_name>**` mint shape) is a legal FFI inner type, and by the struct-literal head so a
 // handle stays sealed to the FFI boundary. The handle itself is never a Ptr, so it needs no
 // E0811 carve-out.
@@ -1791,7 +1791,7 @@ pub fn tc_handler_effect_root(effect_name: Str) -> Str {
 
 // The fifth case of the audit above, and the worst of them: TyKind.Ptr did not
 // merely go unconstructed, it did not EXIST. Typecheck only ever checked `Ptr[T]` syntactically
-// (PtrOutsideFFI, InvalidPtrType, is_valid_ptr_inner), so resolve_type_ann fell through to a
+// (PtrOutsideFFI, InvalidPtrType), so resolve_type_ann fell through to a
 // typevar named "Ptr" — as permissive as TYPE_UNKNOWN, and permissive at the RECEIVER, which is
 // why no method arm could have helped. Assigning a Ptr[Pollfd] to a declared Ptr[Int] therefore
 // passed typecheck and failed as a raw cc error inside build/, with no span.
@@ -5217,6 +5217,10 @@ fn register_derive_method_sigs(program: Int) {
             if tc_decl_derives(td, "Hash") != 0 {
                 register_derive_method_sig(tname, "hash", [ttid], TYPE_U64)
             }
+            // Every enum crosses to Int by its tag (section 3), whatever its variants carry.
+            if type_kind(ttid) == TyKind.Enum {
+                register_derive_method_sig(tname, "to_int", [ttid], TYPE_INT)
+            }
             if tc_is_str_backed_enum_decl(td) != 0 {
                 register_derive_method_sig(tname, "to_str", [ttid], TYPE_STR)
                 register_derive_method_sig(tname, "from_str", [TYPE_STR], make_option_type(self_t))
@@ -6604,13 +6608,14 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     // compiler as `int64_t* r = buf` — a cc error with no Blink span.
     //
     // The pointee recurses through resolve_type_ann rather than being read as a name, so
-    // `Ptr[Ptr[Void]]` nests properly. Nothing here re-validates the pointee: the legal set is
-    // enforced separately and syntactically by check_ptr_in_type_ann / is_valid_ptr_inner
-    // (:3734), which walks the annotation tree on its own and must keep doing so — it is the
-    // only thing that sees a `Ptr` in a position that never reaches this function.
+    // `Ptr[Ptr[Void]]` nests properly. The pointee rule (E0810) is checked here, on the
+    // resolved tid, because every position a type can be written in resolves through here.
     if name == "Ptr" {
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-            return make_ptr_type(resolve_type_ann(sublist_get(elems_sl, 0)))
+            let inner = sublist_get(elems_sl, 0)
+            let pointee = resolve_type_ann(inner)
+            tc_check_ptr_pointee(pointee, inner)
+            return make_ptr_type(pointee)
         }
         return make_ptr_type(TYPE_UNKNOWN)
     }
@@ -8617,29 +8622,6 @@ fn tc_ptr_reads_singleton_alloc(obj_node: Int) -> Int {
     tc_node_is_ffi_scope_value(node_obj(init))
 }
 
-// Does the pointee written as `name` carry an FFI annotation? Resolved to a tid first, because
-// the annotation's spelling is not the declaration's: a qualified `m.Sv` and an alias introduced
-// by `import m.{Sv as S}` both name the declaration without matching any key it could be filed
-// under. Both sets answer off the one resolution, because at this call site they are one
-// question: section 9.1.3 admits an @ffi.struct pointee and section 9.1.4 an @ffi.opaque one.
-fn tc_name_is_ffi_annotated(name: Str) -> Int {
-    let t = lookup_named_type(name)
-    if t < 0 { return 0 }
-    let rt = tc_resolve(t)
-    if ffi_struct_type_set.contains_key(rt) != 0 { return 1 }
-    if ffi_opaque_type_set.contains_key(rt) != 0 { return 1 }
-    0
-}
-
-fn is_valid_ptr_inner(name: Str) -> Int {
-    if name == "Void" { return 1 }
-    if name == "U8" || name == "U16" || name == "U32" || name == "U64" { return 1 }
-    if name == "I8" || name == "I16" || name == "I32" || name == "I64" { return 1 }
-    if name == "Int" || name == "Float" || name == "Ptr" { return 1 }
-    if tc_name_is_ffi_annotated(name) != 0 { return 1 }
-    0
-}
-
 fn check_ptr_in_type_ann(ann_node: Int, has_ffi: Int) ! Diag.Report {
     if ann_node == -1 { return }
     let name = node_name(ann_node)
@@ -8659,30 +8641,30 @@ fn check_ptr_in_type_ann(ann_node: Int, has_ffi: Int) ! Diag.Report {
     }
 }
 
-// The pointee half of the §9.1.3 Ptr rule, split from the context half above because the
-// two answer different questions: a pointee outside the closed set is wrong wherever it is
-// named, while PtrOutsideFFI is a property of the enclosing function. Only a parameter and
-// a return type ever asked the first question, so a `let` named any pointee at all and a
-// plain record behind a pointer typed its fields at their own types.
-fn check_ptr_pointee_in_ann(ann_node: Int) ! Diag.Report {
-    if ann_node == -1 { return }
-    let elems_sl = node_elements(ann_node)
-    if node_name(ann_node) == "Ptr" {
-        if elems_sl != -1 && sublist_length(elems_sl) > 0 {
-            let inner = sublist_get(elems_sl, 0)
-            let inner_name = node_name(inner)
-            if is_valid_ptr_inner(inner_name) == 0 {
-                diag_error_at("InvalidPtrType", INVALID_PTR_TYPE, "invalid Ptr type parameter '{inner_name}' — only Void, U8-U64, I8-I64, Int, Float, Ptr, @ffi.struct, or @ffi.opaque types are allowed", inner, "use a valid FFI-compatible type, or annotate the type with @ffi.struct for a known layout or @ffi.opaque for a handle")
-            }
-        }
-        return
-    }
-    if elems_sl == -1 { return }
-    let mut i = 0
-    while i < sublist_length(elems_sl) {
-        check_ptr_pointee_in_ann(sublist_get(elems_sl, i))
-        i = i + 1
-    }
+// The pointee half of the §9.1.3 Ptr rule. It runs where every annotation resolves, so a
+// pointee is judged the same in a let, a field, an alias, a payload or a signature. A
+// PtrOutsideFFI check stays per function: it is a property of the enclosing context.
+fn tc_check_ptr_pointee(pointee: Int, inner: Int) ! Diag.Report {
+    if tc_ptr_pointee_is_valid(pointee) != 0 { return }
+    let inner_name = node_name(inner)
+    diag_error_at("InvalidPtrType", INVALID_PTR_TYPE, "invalid Ptr type parameter '{inner_name}' — only Void, U8-U64, I8-I64, Int, Float, Ptr, @ffi.struct, or @ffi.opaque types are allowed", inner, "use a valid FFI-compatible type, or annotate the type with @ffi.struct for a known layout or @ffi.opaque for a handle")
+}
+
+// A type not yet known is not judged: whatever left it unknown reports on its own. A type
+// parameter is not judged either, since what it stands for is known only per instantiation.
+fn tc_ptr_pointee_is_valid(pointee: Int) -> Int {
+    let t = tc_resolve(pointee)
+    if t < 0 || t >= ty_pool.len() { return 1 }
+    if tc_tid_has_unbound_metavar(t) != 0 { return 1 }
+    let k = type_kind(t)
+    if k == TyKind.Unknown || k == TyKind.Typevar { return 1 }
+    if k == TyKind.Void || k == TyKind.Ptr { return 1 }
+    if k == TyKind.Int || k == TyKind.Float { return 1 }
+    if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return 1 }
+    if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return 1 }
+    if ffi_struct_type_set.contains_key(t) != 0 { return 1 }
+    if ffi_opaque_type_set.contains_key(t) != 0 { return 1 }
+    0
 }
 
 fn check_ptr_in_type_name(type_name: Str, node: Int, has_ffi: Int) ! Diag.Report {
@@ -9264,7 +9246,6 @@ fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
             let ptype_ann = node_type_ann(p)
             if ptype_ann != -1 {
                 check_ptr_in_type_ann(ptype_ann, has_ffi)
-                check_ptr_pointee_in_ann(ptype_ann)
             } else {
                 check_ptr_in_type_name(node_type_name(p), p, has_ffi)
             }
@@ -9276,7 +9257,6 @@ fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
     let ret_ann = node_type_ann(fn_node)
     if ret_ann != -1 {
         check_ptr_in_type_ann(ret_ann, has_ffi)
-        check_ptr_pointee_in_ann(ret_ann)
     } else {
         let ret_str = node_return_type(fn_node)
         if ret_str == "Ptr" && has_ffi == 0 {
@@ -18155,9 +18135,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // which is exactly what codegen emits for it and what `.read()` hands back.
         if type_kind(obj_t) == TyKind.Ptr {
             let pointee = tc_resolve(ty_pool.get(obj_t).unwrap().inner1)
-            if type_kind(pointee) == TyKind.Struct {
+            if tc_ptr_ffi_struct_pointee(obj_t) != 0 {
                 let pf = get_struct_field_tid(pointee, fname)
                 if pf != -1 { return pf }
+            } else if type_kind(pointee) == TyKind.Struct && ffi_opaque_type_set.contains_key(pointee) == 0 {
+                // E0810 refused this pointee. The pair arm asks the same question, so a field
+                // typed here would leave `.read()` and `.write(v)` unclaimed on the field type.
+                return tc_error_recovery_tid()
             }
         }
         if tc_typevar_is_rigid(obj_t) != 0 {
@@ -19926,7 +19910,6 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let type_ann = node_target(node)
         let mut declared_tid = TYPE_UNKNOWN
         if type_ann != -1 {
-            check_ptr_pointee_in_ann(type_ann)
             declared_tid = resolve_type_ann(type_ann)
         } else if type_str != "" {
             let rt = resolve_type_name(type_str)
@@ -22573,18 +22556,52 @@ fn tc_stamp_assert(order: List[Int], owner: Map[Int, Int], stood: Map[Int, Int])
     }
 }
 
+// A call no arm claimed is a name error once its receiver names a type or a module
+// (section 6.3.3), and 6.3.5 wants it reported before codegen, which would otherwise lay
+// out the value the call never had. A type parameter's methods are decided per instance.
+fn tc_report_unclaimed_calls() ! Diag.Report {
+    for uc in tc_unclaimed_call_nodes() {
+        let obj = node_obj(uc)
+        let mname = node_method(uc)
+        let recv = tc_lookup_node_tid(obj)
+        if tc_unclaimed_receiver_is_named(recv) != 0 {
+            let tname = tc_type_str(recv)
+            diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method '.{mname}' on type {tname}",
+                uc, tc_unresolved_method_help(type_kind(recv), tname, mname))
+        } else if node_kind(obj) == NodeKind.Ident {
+            let q = node_name(obj)
+            if is_builtin_namespace(q) == 1 || is_import_module_name(q) == 1 {
+                let near = suggest_module_member(tc_qualifier_to_module_or_self(q), mname)
+                let help = if near != "" { "did you mean '{q}.{near}'?" } else { "" }
+                diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "no member '{mname}' on module '{q}'", uc, help)
+            }
+        }
+    }
+}
+
+// A value receiver's type, determined all the way down. A local shadowing a module name
+// lands here too, so it is named by its type and not as the module.
+fn tc_unclaimed_receiver_is_named(tid: Int) -> Int {
+    if tc_tid_is_concrete(tid) == 0 { return 0 }
+    let r = tc_tid_resolved(tid)
+    if tc_tid_has_unbound_metavar(r) != 0 || tc_tid_has_unknown(r) != 0 { return 0 }
+    if tc_tid_has_bare_typevar(r) != 0 { return 0 }
+    1
+}
+
 // Phases 4 and 5 over one program. Separate from check_types so `blink check` and the test
 // harness reach the same pass by the same name.
 pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let mut owner: Map[Int, Int] = Map()
     let order = tc_stamp_walk(program, owner)
+    tc_report_unclaimed_calls()
     // A program that already has an error has nodes inference deliberately never typed: the
     // arm that would have typed them reported instead and returned. Asserting there turns
     // every ordinary type error into an internal-compiler-error cascade, so the total-stamp
     // claim only holds for a program that type checks.
     if diag_count > 0 { return }
-    // The same precondition, for an error typecheck cannot report YET. A call no arm claimed
-    // is codegen's to report, and until it does the absence spreads: the let it initializes
+    // The same precondition, for a call left unclaimed on a receiver with no named type, which
+    // tc_report_unclaimed_calls cannot report. The absence spreads: the let it initializes
     // carries nothing, and so does every read of that binding. Nothing here can tell those
     // apart from a real hole — inside the BODY that holds the call. Every other body keeps its
     // claim, so one unclaimed call buys silence for itself and not for the program.

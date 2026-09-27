@@ -69,7 +69,7 @@ import cg_expr.{
     lower_expr, cg_expr_async_scope_current, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
     x_unbox_payload, x_layout_checked, lower_value_as_text, cg_expr_option_some, cg_expr_option_none,
 }
-import cg_stmt.{lower_block_into}
+import cg_stmt.{enum_tag_word, lower_block_into}
 import cg_eff.{
     cg_eff_ev_argument, cg_eff_lower_builtin_perform, cg_eff_lower_time_perform, cg_eff_lower_user_perform,
     cg_eff_lower_spawn_closure, cg_eff_pending_thunks, cg_eff_thunk_task_symbol, cg_eff_lower_fn_value,
@@ -92,6 +92,7 @@ let trait_eq = "Eq"
 let trait_ord = "Ord"
 let method_eq = "eq"
 let method_cmp = "cmp"
+let method_to_int = "to_int"
 let ordering_type = "Ordering"
 let ordering_less = "Less"
 let ordering_greater = "Greater"
@@ -2007,6 +2008,25 @@ fn cc_is_enum_to_str(method: Str) -> Bool {
     table.get(method) ?? false
 }
 
+// An enum's tag as an Int (section 3). Typecheck gives every enum this method unless the
+// program declares its own, so it is read here only after the impls, as typecheck reads it.
+// A one-variant newtype keeps no tag: its only variant is the first, so the answer is 0,
+// and the receiver still runs for whatever it does.
+fn cc_enum_to_int(node: Int, obj: Int, recv_tid: Int) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, TyKind.Enum, method_to_int, 0, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let answer = cc_local(tid, node)
+    if cc_stopped(answer) { return -1 }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    let tag = enum_tag_word(recv_tid, recv, node, answer.c_spelling)
+    if tag >= 0 { return ir_cast(tid, node, answer.c_spelling, tag) }
+    cg_expr_push_pending(node, ir_expr_stmt(node, recv))
+    ir_const(tid, node, answer.c_spelling, "0")
+}
+
 // A str-backed enum -- every variant assigned a plain string literal (`Open = "open"`).
 // Typecheck answers the same question at src/typecheck.bl:4887 and duplicates the test
 // rather than exporting it, for the reason its own comment gives: codegen imports
@@ -3086,6 +3106,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
         if mname == "display" && cc_is_scalar_display_kind(kind) { return cc_scalar_display(node, obj, kind) }
         if mname == "fmt" && cc_is_scalar_display_kind(kind) { return cc_scalar_fmt(node, obj, kind) }
         if mname == "into" { return cc_into_call(node, obj, recv_tid) }
+        if kind == TyKind.Enum && mname == method_to_int { return cc_enum_to_int(node, obj, recv_tid) }
         let derived = cc_derived_method_symbol(recv_tid, mname)
         if derived != "" { return cc_build_call(node, derived, obj, CallForm.Declared, false) }
         let nominal = cc_nominal_method_decl(node, recv_tid, mname)
