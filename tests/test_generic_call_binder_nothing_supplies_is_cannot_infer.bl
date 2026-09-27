@@ -1,0 +1,140 @@
+// A generic call whose own type parameter nothing supplies is error[CannotInferType] (E0301)
+// at the call (sections/03_types.md 3.4, Explicit Type Application). Before this, typecheck
+// passed such a call and mono stopped at an internal error.
+
+import compile_test_helpers
+import std.io
+
+fn count_of(s: Str, needle: Str) -> Int {
+    let nlen = needle.len()
+    if nlen == 0 { return 0 }
+    let mut n = 0
+    let mut i = 0
+    while i + nlen <= s.len() {
+        if s.substring(i, nlen) == needle {
+            n = n + 1
+            i = i + nlen
+        } else {
+            i = i + 1
+        }
+    }
+    n
+}
+
+fn expect_call_e0301(src: Str, tag: Str, label: Str) -> Str {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_error(out, "E0301", "{label} / E0301")
+    if out.contains("I0001") || out.contains("MonoUnsolved") { io.println("FAIL: {label} / internal error") }
+    assert(!out.contains("I0001"))
+    assert(!out.contains("MonoUnsolved"))
+    out
+}
+
+fn assert_runs(src: Str, tag: Str, want: Str) {
+    let r = compile_test_helpers.compile_and_run(src, tag)
+    if r.exit_code != 0 { io.println("FAIL: {tag} exit {r.exit_code}: {r.out}{r.err_out}") }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, want)
+}
+
+fn probe_decl() -> Str { "fn probe[T]() -> Int \{ 1 }\n" }
+
+fn mk_decl() -> Str { "fn mk[T]() -> List[T] \{ [] }\nfn take[T](xs: List[T]) -> Int \{ xs.len() }\n" }
+
+// ── a type parameter no parameter and no return type names ────────────────────
+
+test "a phantom binder called with no type arguments is E0301 with the no-source message" {
+    let src = probe_decl().concat("fn main() \{ let _n = probe() }\n")
+    let out = expect_call_e0301(src, "gcb_ph_let", "phantom let")
+    let want = "type parameter `T` of `probe` has no source -- it is bound by the declaration but supplied by neither a parameter nor the return type"
+    compile_test_helpers.expect_contains(out, want, "phantom message")
+    compile_test_helpers.expect_contains(out, "probe[", "phantom help names the brackets")
+}
+
+test "a phantom call as a bare statement is reported at the call" {
+    expect_call_e0301(probe_decl().concat("fn main() \{ probe() }\n"), "gcb_ph_stmt", "phantom stmt")
+}
+
+test "an annotated binding does not supply a phantom binder" {
+    let src = probe_decl().concat("fn main() \{ let _n: Int = probe() }\n")
+    expect_call_e0301(src, "gcb_ph_annot", "phantom annotated")
+}
+
+test "a method's own phantom binder is E0301 at the call" {
+    let src = #"
+type Box { v: Int }
+trait Pr { fn pr[T](self) -> Int }
+impl Pr for Box { fn pr[T](self) -> Int { self.v } }
+fn main() {
+    let b = Box { v: 3 }
+    let _n = b.pr()
+}
+"#
+    expect_call_e0301(src, "gcb_ph_method", "phantom method")
+}
+
+test "a module-qualified phantom call is E0301 at the call" {
+    let helper = "pub fn probe[T]() -> Int \{ 1 }\n"
+    let entry = "import ph_mod\nfn main() \{ let _n = ph_mod.probe() }\n"
+    let out = compile_test_helpers.compile_xmod_capture(entry, "ph_mod", helper, "gcb_ph_xmod")
+    compile_test_helpers.expect_error(out, "E0301", "phantom qualified")
+    assert(!out.contains("MonoUnsolved"))
+}
+
+test "two phantom binders on one call give one diagnostic" {
+    let src = "fn a[K, V]() -> Int \{ 1 }\nfn main() \{ let _x = a() }\n"
+    let out = expect_call_e0301(src, "gcb_ph_two", "two phantom binders")
+    assert_eq(count_of(out, "E0301"), 1)
+    compile_test_helpers.expect_contains(out, "`K`", "names K")
+    compile_test_helpers.expect_contains(out, "`V`", "names V")
+    compile_test_helpers.expect_contains(out, "a[K, V]()", "help shows the whole list")
+}
+
+// ── a sourced binder that inference leaves open ───────────────────────────────
+
+test "a return-only call as a bare statement is E0301 at the call" {
+    let out = expect_call_e0301(mk_decl().concat("fn main() \{ mk() }\n"), "gcb_ro_stmt", "return-only stmt")
+    let want = "type parameter `T` of `mk` is unbound at this call and nothing supplies it"
+    compile_test_helpers.expect_contains(out, want, "open-binder message")
+    compile_test_helpers.expect_contains(out, "mk[T]()", "open-binder help shows the brackets")
+}
+
+test "a return-only call used as a receiver is E0301" {
+    let src = mk_decl().concat("fn main() \{ io.println(\"\{mk().len()}\") }\n")
+    expect_call_e0301("import std.io\n".concat(src), "gcb_ro_chain", "return-only receiver")
+}
+
+test "an open binder passed through a second generic call is reported once" {
+    let src = mk_decl().concat("fn main() \{ let _n = take(mk()) }\n")
+    let out = expect_call_e0301(src, "gcb_ro_arg", "return-only as arg")
+    assert_eq(count_of(out, "E0301"), 1)
+}
+
+test "an empty list argument that nothing pins is E0301 at the call" {
+    let src = mk_decl().concat("fn main() \{ let _n = take([]) }\n")
+    expect_call_e0301(src, "gcb_arg_empty", "empty list arg")
+}
+
+test "a return-only call bound by a let is still reported once, at the let" {
+    let src = mk_decl().concat("fn main() \{ let xs = mk()\n let _n = xs.len() }\n")
+    let out = expect_call_e0301(src, "gcb_ro_let", "return-only let")
+    assert_eq(count_of(out, "E0301"), 1)
+}
+
+// ── the calls the check must leave alone ──────────────────────────────────────
+
+test "bracketed phantom calls keep distinct instances and run" {
+    let mut s = "import std.io\n".concat(probe_decl())
+    s = s.concat("fn main() \{\n    let a = probe[Int]()\n    let b = probe[Str]()\n")
+    s = s.concat("    io.println(\"\{a + b}\")\n}\n")
+    assert_runs(s, "gcb_ok_brackets", "2\n")
+}
+
+test "a binder pinned by an annotation, brackets or a generic body runs" {
+    let mut s = "import std.io\n".concat(mk_decl())
+    s = s.concat("fn g[T](xs: List[T]) -> Int \{ take(xs) }\n")
+    s = s.concat("fn main() \{\n    let xs: List[Int] = mk()\n")
+    s = s.concat("    let n = take(mk[Int]())\n")
+    s = s.concat("    io.println(\"\{xs.len() + n + g([1])}\")\n}\n")
+    assert_runs(s, "gcb_ok_pinned", "1\n")
+}

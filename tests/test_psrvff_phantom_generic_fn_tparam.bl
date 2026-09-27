@@ -15,31 +15,11 @@
 // I0001 on a Void segment (tests/test_i0001_unsolved_typevar_at_codegen.bl). The generic
 // FN path had no equivalent. This file pins it.
 //
-// WHY I0001 AND NOT E0301 — AS OF WHEN THIS WAS WRITTEN, AND NO LONGER THE RULE.
-// The original reasoning was that E0301 CannotInferType is BINDING-scoped: it reports an
-// under-determined *binding* out of nr_pop_scope via tc_report_under_determined, and here
-// `_x : Int` is fully concrete, so there is no under-determined binding to report and no α
-// to latch onto. That much still describes the machinery. What it got WRONG was the
-// conclusion drawn from it — that T "literally cannot be named" because Blink has no
-// turbofish. §3.4 *Explicit Type Application* now defines bracketed type application, so
-// `f[Int]()` supplies T, and `f[Int]` / `f[Str]` are distinct instantiations that must not
-// share a symbol.
-//
-// THE RESOLVED RULE (§3.4, 6-0) is therefore NOT the declaration-site error this file
-// originally predicted. It is:
-//   - error[CannotInferType] E0301 at the CALL's type-argument position — E0301 is reported
-//     where its repair attaches, which for a binder the signature does not supply is the
-//     brackets, not the binding. That amends the binding-scoped reading above.
-//   - W0604 UnusedTypeParamBinder, a WARNING, at the declaration. A declaration is rejected
-//     outright only when no use site could ever repair it, and `f[Int]()` repairs this one.
-//
-// So the assertions below pin INTERIM behaviour: failing closed is still strictly better
-// than mangling `blink_f_Void`, and it stays correct until the E0301 report site lands. When
-// it does, the first two rows flip from I0001 to E0301 and the "no C output" belt survives
-// unchanged. Do not read this file's I0001 as the intended user-facing diagnostic, and do
-// not read the bare call's behaviour as evidence about what a call site can supply — the
-// BRACKETED call is not rejected here at all today, it emits the literal Blink source text
-// `const void _x = f[Int]();` and `blink check` reports ok.
+// THE RULE (sections/03_types.md 3.4, Explicit Type Application): a type parameter the
+// signature does not supply is error[CannotInferType] E0301 at the CALL, where the
+// brackets go, and `f[Int]` / `f[Str]` are distinct instantiations. Typecheck reports it,
+// so the first two rows expect E0301 and still no C output. The mono chokepoint below
+// stays as the backstop for a call typecheck ever lets through.
 //
 // THE GATE reuses mono_args_has_void_seg, the same predicate the struct chokepoint uses.
 // It is generic over (csv, tparams_sublist), not struct-specific, and it rejects the
@@ -72,10 +52,11 @@ fn phantom_src() -> Str {
     s
 }
 
-// ── the chokepoint fires ──────────────────────────────────────────────────────
+// ── the call is rejected ──────────────────────────────────────────────────────
 
-test "a phantom generic-fn type param raises I0001 instead of mangling Void" {
-    compile_test_helpers.expect_compile_error(phantom_src(), "psrvff_phantom", "I0001")
+test "a phantom generic-fn type param without type arguments is E0301 at the call" {
+    compile_test_helpers.expect_compile_error(phantom_src(), "psrvff_phantom", "E0301")
+    compile_test_helpers.expect_no_error(phantom_src(), "psrvff_phantom_noice", "I0001")
 }
 
 // The BELT to the row above's braces. `expect_compile_error` only proves a diagnostic was
@@ -84,7 +65,7 @@ test "a phantom generic-fn type param raises I0001 instead of mangling Void" {
 // would satisfy the row above while leaving the miscompile in place.
 //
 // Asserting NO C FILE EXISTS is the strongest available form of that check, and stronger
-// than grepping emitted C for the erased name: `ice` severity makes blinkc exit before
+// than grepping emitted C for the erased name: a front-end error makes blinkc exit before
 // writing any output at all, so the erased symbol cannot appear under EITHER spelling —
 // including the bare-binder `blink_f_T`, which the `_Void` grep structurally cannot see.
 // Driving blinkc directly rather than through compile_and_emit_c because that helper
@@ -97,7 +78,7 @@ test "a rejected mono name produces no C output at all" {
     assert(r.exit_code != 0)
     // The human renderer spells the NAME, not the code (the code is what the JSON
     // format the row above goes through carries), so match on the name here.
-    assert(r.err_out.contains("UnsolvedTypeVarAtCodegen"))
+    assert(r.err_out.contains("CannotInferType"))
     let names: List[Str] = fs.list_dir(".tmp").unwrap()
     assert(!names.contains("psrvff_belt.c"))
     let _ = fs.delete(bl_path)
