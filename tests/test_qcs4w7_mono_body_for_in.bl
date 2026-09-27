@@ -22,6 +22,10 @@
 // to fail identically. A from-0 flag test (`pre == 0`) would be wrong for a SECOND mono
 // fn in the same compile unit reusing the range iterator; a delta test (`pre == 0 && now
 // != 0`) is required, matching the test-block flush's own shape at codegen.bl:2135-2138.
+//
+// The current codegen lowers a for-in to an index or counter loop with no iterator type at
+// all, so the emit rows read the mono body itself: the loop must be lowered there, at the
+// instance's element type.
 
 import compile_test_helpers
 import std.io
@@ -29,6 +33,29 @@ import std.io
 fn assert_has(c: Str, needle: Str, label: Str) {
     if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
     assert(c.contains(needle))
+}
+
+// The definition of the one mono instance of `base`, from its head line to its closing brace.
+// The base names carry an underscore, which only the escape-aware scanner matches.
+fn mono_body(c: Str, base: Str) -> Str {
+    let names = compile_test_helpers.poly_impl_fn_names(c, base)
+    if names.len() != 1 { io.println("FAIL: {base} mono instances — want 1, got {names.len()}") }
+    assert(names.len() == 1)
+    let name = names.get(0).unwrap()
+    let lines = c.lines()
+    let mut out = ""
+    let mut inside = 0
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines.get(i).unwrap()
+        if inside == 0 && line.contains("{name}(") && line.trim().ends_with(") \{") { inside = 1 }
+        if inside == 1 {
+            out = "{out}{line}\n"
+            if line == "}" { return out }
+        }
+        i = i + 1
+    }
+    out
 }
 
 fn src_list_for() -> Str {
@@ -63,9 +90,12 @@ fn inner_for[T](xs: List[T]) -> Int {
 }
 fn outer_for[U](ys: List[U]) -> Int { inner_for(ys) }
 
-test "a mono-body for-in over List[T] gets its iterator typedef emitted" {
+test "a mono-body for-in over List[T] lowers its loop in the mono body" {
     let c = compile_test_helpers.compile_and_emit_c(src_list_for(), "qcs4w7_list_c")
-    assert_has(c, "blink_ListIterator_int_next", "mono body list-iter / typedef")
+    let body = mono_body(c, "sum_list")
+    assert_has(body, "blink_list_len(", "mono body list for-in reads the length")
+    assert_has(body, "blink_list_get(", "mono body list for-in reads each element")
+    assert_has(body, "int64_t x = ", "mono body list for-in binds the element at T = Int")
 }
 
 test "the mono-body for-in over List[T] compiles and runs" {
@@ -74,9 +104,11 @@ test "the mono-body for-in over List[T] compiles and runs" {
     assert_eq(r.exit_code, 0)
 }
 
-test "a mono-body for-in over a range gets its RangeIterator typedef emitted" {
+test "a mono-body for-in over a range lowers its loop in the mono body" {
     let c = compile_test_helpers.compile_and_emit_c(src_range_for(), "qcs4w7_range_c")
-    assert_has(c, "blink_RangeIterator_next", "mono body range-iter / typedef")
+    let body = mono_body(c, "sum_range")
+    assert_has(body, "int64_t i = 0;", "mono body range for-in starts its counter")
+    assert_has(body, "i = (i + 1);", "mono body range for-in steps its counter")
 }
 
 test "the mono-body for-in over a range compiles and runs" {
