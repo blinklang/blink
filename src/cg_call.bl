@@ -2314,8 +2314,26 @@ fn lower_static_call(node: Int, obj: Int) -> Int ! Diag.Report {
     if owner == char_type_name && method == from_code_point_method {
         return cc_char_from_code_point(node)
     }
+    // List is a type and not a builtin fn, and typecheck keys its constructor arm on this
+    // spelling above every declaration rung; reading it here in the same place keeps a
+    // declared `List_new` from being built for a call typed as the empty list.
+    if owner == list_type_name && method == list_new_method { return cc_list_new(node) }
     if is_builtin_fn(owner) == 1 { return lower_builtin_static_call(node, owner, method) }
     lower_declared_static_call(node, owner, method)
+}
+
+let list_type_name = "List"
+let list_new_method = "new"
+
+// The empty list, built as an empty `[]` is. Typecheck has refused any argument, and the
+// count is checked again because the runtime constructor takes none.
+fn cc_list_new(node: Int) -> Int ! Diag.Report {
+    let answer = tid_of_node(node)
+    if answer < 0 { return -1 }
+    if cc_kind(answer) != TyKind.List { return cc_no_such_callee(node) }
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_ctor_arity_wrong(node, list_type_name, list_new_method, 0, given) }
+    cc_container_new(node, TyKind.List)
 }
 
 // A constructor of a type the compiler provides. Read BEFORE any declaration, because that
@@ -2836,16 +2854,18 @@ fn cc_container_ctor_not_built(node: Int, answer: TyKind) -> Int ! Diag.Report {
     -1
 }
 
-// A keyed container's runtime constructor, reached the same way whichever spelling wrote
-// it: typecheck resolves a bare Map()/Set() and a qualified Map.new()/Set.new() to the same
+// A container's runtime constructor, reached the same way whichever spelling wrote it:
+// typecheck resolves a bare Map()/Set() and a qualified Map.new()/Set.new() to the same
 // tid, so codegen answers from that tid alone rather than from how the call was spelled.
 // The key type's own layout carries the operations table Map and Set store their keys
 // through; a key type that has none refuses the call by name instead of building it.
+// A list compares nothing, so it is built with no table.
 fn cc_container_new(node: Int, answer: TyKind) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = cc_local(tid, node)
     if cc_stopped(rec) { return -1 }
+    if answer == TyKind.List { return ir_container_new(tid, node, rec.c_spelling, c_container_ctor(tid), "", []) }
     let key_layout = layout_of(child_tid(tid, Slot.Inner1), Position.Local)
     if key_layout.kops_table == "" { return cc_container_ctor_not_built(node, answer) }
     let ctor = c_container_ctor(tid)
