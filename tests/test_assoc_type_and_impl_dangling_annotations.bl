@@ -1,0 +1,57 @@
+// An annotation in a trait or impl body belongs to the method that follows it. An associated
+// type takes no annotation, so one written before `type` is E1110 rather than carried on to
+// the next method. One left before the closing brace has no method to attach to and is also
+// E1110 rather than a silent drop.
+
+import compile_test_helpers
+
+fn count_of(output: Str, needle: Str) -> Int {
+    output.split(needle).len() - 1
+}
+
+// Exactly one diagnostic is an error, it is E1110, and it points at `line`.
+fn expect_one_e1110_at(output: Str, line: Int) {
+    assert_eq(count_of(output, "\"severity\":\"error\""), 1, "got: {output}")
+    assert_eq(count_of(output, "\"code\":\"E1110\""), 1, "got: {output}")
+    assert(output.contains("\"line\":{line},"), "got: {output}")
+}
+
+test "an annotation before an associated type in an impl is E1110" {
+    let src = "trait Measure \{\n    type Out\n    fn size(self) -> Int\n}\ntype A \{ v: Int }\nimpl Measure for A \{\n    @requires(self.v > 0)\n    type Out = Int\n    fn size(self) -> Int \{ self.v }\n}\nfn main() \{}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_ata_impl_assoc")
+    expect_one_e1110_at(out, 7)
+}
+
+test "an annotation before an associated type in an impl does not reach the next method" {
+    let src = "trait Measure \{\n    type Out\n    fn size(self) -> Int\n}\ntype A \{ v: Int }\nimpl Measure for A \{\n    @requires(self.v > 0)\n    type Out = Int\n    @verify(fallback: \"runtime\")\n    fn size(self) -> Int \{ self.v }\n}\nfn main() \{\n    io.println(\"\{A \{ v: 0 }.size()}\")\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_ata_impl_next")
+    expect_one_e1110_at(out, 7)
+}
+
+test "a contract before an associated type in a trait is reported against the associated type" {
+    let src = "trait Measure \{\n    @requires(x > 0)\n    type Out\n    fn size(self, x: Int) -> Int\n}\nfn main() \{}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_ata_trait_contract")
+    expect_one_e1110_at(out, 2)
+    assert(out.contains("associated type"), "got: {out}")
+}
+
+test "any annotation before an associated type in a trait is E1110" {
+    let src = "trait Measure \{\n    @deprecated\n    type Out\n    fn size(self, x: Int) -> Int\n}\nfn main() \{}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_ata_trait_any")
+    expect_one_e1110_at(out, 2)
+}
+
+// `q` exists nowhere, so an annotation that leaked onto `top` would also fail name
+// resolution there.
+test "an annotation left after the last impl method is E1110, not dropped or moved on" {
+    let src = "trait Measure \{\n    fn size(self) -> Int\n}\ntype A \{ v: Int }\nimpl Measure for A \{\n    fn size(self) -> Int \{ self.v }\n    @requires(q > 0)\n}\n@requires(x > 0)\n@verify(fallback: \"runtime\")\nfn top(x: Int) -> Int \{ x }\nfn main() \{\n    io.println(\"\{top(1)}\")\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_ata_impl_dangling")
+    expect_one_e1110_at(out, 7)
+}
+
+test "a contract on an impl method after an associated type is still checked at runtime" {
+    let src = "trait Measure \{\n    type Out\n    fn size(self) -> Int\n}\ntype A \{ v: Int }\nimpl Measure for A \{\n    type Out = Int\n    @requires(self.v > 0)\n    @verify(fallback: \"runtime\")\n    fn size(self) -> Int \{ self.v }\n}\nfn main() \{\n    io.println(\"\{A \{ v: 0 }.size()}\")\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "_ata_impl_runs")
+    assert(r.exit_code != 0, "got: {r.out}{r.err_out}")
+    assert(r.err_out.contains("precondition failed"), "got: {r.err_out}")
+}
