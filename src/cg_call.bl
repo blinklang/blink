@@ -68,6 +68,7 @@ import ir.{
 import cg_expr.{
     lower_expr, cg_expr_async_scope_current, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
     x_unbox_payload, x_layout_checked, lower_value_as_text, cg_expr_option_some, cg_expr_option_none,
+    x_is_c_comparable,
 }
 import cg_stmt.{enum_tag_word, lower_block_into}
 import cg_eff.{
@@ -183,26 +184,110 @@ pub fn lower_operator_method(node: Int, op: Str) -> Int ! Diag.Report {
     let rec = cc_local(tid, node)
     if cc_stopped(rec) { return -1 }
     if op != "==" && op != "!=" { return cc_ordering_operator(node, op, tid, rec) }
-    // The operand's own type, not the Bool the comparison answers: the method belongs to
+    // The operand's own type, not the Bool the comparison answers: the equality belongs to
     // what is being compared.
     let operand = tid_of_node(node_left(node))
     if operand < 0 { return -1 }
-    let decl = tc_tid_decl_node(operand)
-    if decl < 0 {
-        diag_ice_at("EqualityOperandNotDerived", CODEGEN_STAGE_NOT_BUILT,
-            "a {tk_name(cc_kind(operand))} operand has no derived equality method", node,
-            "only a declared struct or enum derives Eq; another operand needs its own lowering")
-        return -1
-    }
-    let symbol = cc_equality_symbol(node, decl, operand)
-    if symbol == "" { return -1 }
     let lhs = lower_expr(node_left(node))
     if lhs < 0 { return -1 }
     let rhs = lower_expr(node_right(node))
     if rhs < 0 { return -1 }
-    let eq = ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, [lhs, rhs])
+    let eq = cc_values_equal(node, operand, lhs, rhs)
+    if eq < 0 { return -1 }
     if op == "==" { return eq }
     ir_unary(tid, node, rec.c_spelling, "!", eq)
+}
+
+// Whether two lowered values of type `tid` are equal, by that type's own `==`. A carrier
+// payload is compared through here as well, so `Some(x) == Some(y)` means what `x == y`
+// means.
+fn cc_values_equal(node: Int, tid: Int, lhs: Int, rhs: Int) -> Int ! Diag.Report {
+    let bools = cc_local(TYPE_BOOL, node)
+    if cc_stopped(bools) { return -1 }
+    let k = cc_kind(tid)
+    // C compares a Str or a Bytes by address, and C's == answers false for two NaNs.
+    if k == TyKind.Str { return cc_helper_equal(node, bools, "str_eq", lhs, rhs) }
+    if k == TyKind.Bytes { return cc_helper_equal(node, bools, "bytes_eq", lhs, rhs) }
+    if k == TyKind.Float { return cc_helper_equal(node, bools, "float_eq", lhs, rhs) }
+    if k == TyKind.Option || k == TyKind.Result { return cc_carrier_equal(node, tid, bools, lhs, rhs) }
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    if x_is_c_comparable(tid, rec) { return ir_binary(TYPE_BOOL, node, bools.c_spelling, "==", lhs, rhs) }
+    let decl = tc_tid_decl_node(tid)
+    if decl < 0 {
+        diag_ice_at("EqualityOperandNotDerived", CODEGEN_STAGE_NOT_BUILT,
+            "a {tk_name(k)} operand has no derived equality method", node,
+            "only a declared struct or enum derives Eq; another operand needs its own lowering")
+        return -1
+    }
+    let symbol = cc_equality_symbol(node, decl, tid)
+    if symbol == "" { return -1 }
+    ir_call_direct(TYPE_BOOL, node, bools.c_spelling, symbol, bools.slot_form, [lhs, rhs])
+}
+
+fn cc_helper_equal(node: Int, bools: LayoutRecord, helper: Str, lhs: Int, rhs: Int) -> Int {
+    ir_call_runtime(TYPE_BOOL, node, bools.c_spelling, c_runtime_helper(helper), bools.slot_form, [lhs, rhs])
+}
+
+// Tags first: the payload member of an arm the value is not in holds whatever was there
+// before, so it is read only once both tags name the same arm. Both sides are bound, since
+// the tag and the payload each read them.
+fn cc_carrier_equal(node: Int, tid: Int, bools: LayoutRecord, lhs: Int, rhs: Int) -> Int ! Diag.Report {
+    let c = cc_carrier_held(node, tid, cc_local(tid, node))
+    if cc_carrier_missing(c) { return -1 }
+    if cc_guard_stopped(c.g) { return -1 }
+    if c.held.slot_form == SlotForm.InlineWord {
+        diag_ice_at("HandleOptionEqualityNotBuilt", CODEGEN_STAGE_NOT_BUILT,
+            "`==` on an Option over an opaque handle is not built", node,
+            "the handle Option holds no tag; its equality needs its own lowering")
+        return -1
+    }
+    let _td = ensure_typedef_for(tid)
+    let left = c_mint_local("eq")
+    let right = c_mint_local("eq")
+    let same = c_mint_local("eq")
+    cg_expr_push_pending(node, ir_let(tid, node, c.held.c_spelling, left, c.held.slot_form, lhs))
+    cg_expr_push_pending(node, ir_let(tid, node, c.held.c_spelling, right, c.held.slot_form, rhs))
+    let tags_equal = ir_binary(TYPE_BOOL, node, bools.c_spelling, "==",
+        ir_carrier_tag(TYPE_INT, node, c.g.tag, cc_carrier_ref(node, c, left)),
+        ir_carrier_tag(TYPE_INT, node, c.g.tag, cc_carrier_ref(node, c, right)))
+    cg_expr_push_pending(node, ir_let(TYPE_BOOL, node, bools.c_spelling, same, bools.slot_form, tags_equal))
+    let mut cases: List[Int] = []
+    let first_tag = if cc_kind(tid) == TyKind.Option { CARRIER_TAG_SOME } else { CARRIER_TAG_OK }
+    if !cc_carrier_arm_into(node, c, bools, left, right, same, Slot.Inner1, first_tag, cases) { return -1 }
+    if cc_kind(tid) == TyKind.Result {
+        if !cc_carrier_arm_into(node, c, bools, left, right, same, Slot.Inner2, CARRIER_TAG_ERR, cases) { return -1 }
+    }
+    if cases.len() > 0 {
+        let tag = ir_carrier_tag(TYPE_INT, node, c.g.tag, cc_carrier_ref(node, c, left))
+        let pick = ir_switch(node, tag, cases, ir_block(node, []))
+        cg_expr_push_pending(node, ir_if(node, cc_temp_ref(node, TYPE_BOOL, bools, same), ir_block(node, [pick]), -1))
+    }
+    cc_temp_ref(node, TYPE_BOOL, bools, same)
+}
+
+// One arm's case: the two payloads compared, the answer stored. A payload with no value
+// adds no case, since equal tags already settle it. False is a stop already reported.
+fn cc_carrier_arm_into(node: Int, c: CarrierRef, bools: LayoutRecord, left: Str, right: Str, same: Str,
+        slot: Slot, tag: Int, cases: List[Int]) -> Bool ! Diag.Report {
+    let inner = child_tid(c.tid, slot)
+    if cc_kind(inner) == TyKind.Void { return true }
+    let member = cc_member_layout(node, c.tid, slot)
+    if cc_stopped(member) { return false }
+    let held = cc_local(inner, node)
+    if cc_stopped(held) { return false }
+    let arm = cc_arm_member(cc_kind(c.tid), slot)
+    let mark = cg_expr_pending_count()
+    let l = x_unbox_payload(inner, node, cc_carrier_ref(node, c, left), member, held, arm)
+    let r = x_unbox_payload(inner, node, cc_carrier_ref(node, c, right), member, held, arm)
+    if l < 0 || r < 0 { return false }
+    let eq = cc_values_equal(node, inner, l, r)
+    if eq < 0 { return false }
+    let mut body = cg_expr_take_pending(mark)
+    body.push(ir_assign(node, cc_temp_ref(node, TYPE_BOOL, bools, same), eq))
+    cases.push(ir_const(TYPE_INT, node, c.g.tag, "{tag}"))
+    cases.push(ir_block(node, body))
+    true
 }
 
 // The C function an equality operator reaches. A type carries equality by writing the impl
