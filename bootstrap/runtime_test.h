@@ -86,6 +86,35 @@ BLINK_UNUSED static int __blink_test_skipped;
 #endif
 BLINK_UNUSED static char __blink_test_skip_reason[256];
 
+/* Spec §2.20: an assertion failure panics. Outside a test run there is no
+ * per-test frame to longjmp to, so the failure is an uncaught panic. The
+ * runner's panic hook is the marker for a test run. Renders the recorded
+ * failure the way the runner's human output does. */
+BLINK_UNUSED static void __blink_assert_fail_uncaught(void) {
+    char buf[BLINK_PA_INTRO_BUF_SIZE + 2048];
+    size_t n = 0;
+    if (__blink_test_fail_assertion[0]) {
+        n += snprintf(buf + n, sizeof(buf) - n, "assertion failed: %s", __blink_test_fail_assertion);
+        if (__blink_test_fail_user_msg[0] && n < sizeof(buf)) {
+            n += snprintf(buf + n, sizeof(buf) - n, "\n    message: %s", __blink_test_fail_user_msg);
+        }
+        if (__blink_test_fail_intro[0] && n < sizeof(buf)) {
+            n += snprintf(buf + n, sizeof(buf) - n, "\n%s", __blink_test_fail_intro);
+        }
+        if (n < sizeof(buf)) {
+            if (__blink_test_fail_file[0]) {
+                snprintf(buf + n, sizeof(buf) - n, "\n  --> %s:%d:%d", __blink_test_fail_file,
+                         __blink_test_fail_line, __blink_test_fail_col);
+            } else {
+                snprintf(buf + n, sizeof(buf) - n, "\n  (line %d)", __blink_test_fail_line);
+            }
+        }
+    } else {
+        snprintf(buf, sizeof(buf), "%s (line %d)", __blink_test_fail_msg, __blink_test_fail_line);
+    }
+    __blink_panic_dispatch(buf);
+}
+
 BLINK_UNUSED static void __blink_assert_fail(const char* msg, int line) {
     __blink_test_failed = 1;
     if (msg) {
@@ -102,6 +131,7 @@ BLINK_UNUSED static void __blink_assert_fail(const char* msg, int line) {
     __blink_test_fail_user_msg[0] = '\0';
     __blink_test_fail_expected[0] = '\0';
     __blink_test_fail_actual[0] = '\0';
+    if (__blink_panic_test_hook == NULL) __blink_assert_fail_uncaught();
     longjmp(__blink_test_jmp, 1);
 }
 
@@ -145,6 +175,7 @@ BLINK_UNUSED static void __blink_assert_fail_eq(const char* msg,
     __blink_test_fail_user_msg[0] = '\0';
     BLINK_COPY_OR_EMPTY(__blink_test_fail_expected, expected);
     BLINK_COPY_OR_EMPTY(__blink_test_fail_actual, actual);
+    if (__blink_panic_test_hook == NULL) __blink_assert_fail_uncaught();
     longjmp(__blink_test_jmp, 1);
 }
 
@@ -169,6 +200,7 @@ BLINK_UNUSED static void __blink_assert_fail_intro(const char* assertion,
     BLINK_COPY_OR_EMPTY(__blink_test_fail_user_msg, user_msg);
     __blink_test_fail_expected[0] = '\0';
     __blink_test_fail_actual[0] = '\0';
+    if (__blink_panic_test_hook == NULL) __blink_assert_fail_uncaught();
     longjmp(__blink_test_jmp, 1);
 }
 
