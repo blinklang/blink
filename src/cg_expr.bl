@@ -47,7 +47,7 @@ import ir.{
     ir_carrier_unwrap, ir_carrier_tag, ir_call_runtime, ir_let, ir_assign, ir_return,
     ir_expr_stmt, ir_if, ir_block, ir_enum_new, ir_unreachable, ir_panic_catch_exit,
 }
-import cg_promote.{cg_promote_on_exit}
+import cg_stmt.{cg_stmt_return_value}
 import cg_call.{
     lower_call, lower_operator_method, lower_display_call, lower_display_of_value,
     lower_spread, lower_element_read, lower_element_store, cc_enum_variant_construct,
@@ -101,6 +101,9 @@ let mut cx_value: Map[Str, MaterialisedValue] = Map()
 // cannot say which of its rows are newer than a mark, so the order lives beside it.
 let mut cx_value_keys: List[Str] = []
 let mut cx_return_type: Int = -1
+// The local each `old(e)` of the function being lowered was copied into on entry, keyed by
+// the `old` call node.
+let mut cx_old_snapshots: Map[Int, Str] = Map()
 let mut cx_test_body: Bool = false
 // The innermost-last stack of open async.scope handle lists, named by their C variable.
 // cg_stmt pushes on scope entry and pops on exit; cg_call reads the top so a spawn inside
@@ -119,10 +122,19 @@ pub fn cg_expr_reset() {
     cx_value = Map()
     cx_value_keys = []
     cx_return_type = -1
+    cx_old_snapshots = Map()
     cx_test_body = false
     cx_async_scope_stack = []
     cx_frames = []
     cx_frame_loops = []
+}
+
+pub fn cg_expr_set_old_snapshot(node: Int, c_name: Str) {
+    cx_old_snapshots.insert(node, c_name)
+}
+
+pub fn cg_expr_clear_old_snapshots() {
+    cx_old_snapshots = Map()
 }
 
 // Opens a new innermost async.scope, named by the C variable holding its handle list.
@@ -1277,9 +1289,9 @@ fn lower_try_arms(node: Int, carrier_tid: Int, k: TyKind, carrier: Str) -> Int !
 fn x_carrier_return_arm(node: Int, carrier_tid: Int, k: TyKind, carrier: Str) -> Int ! Diag.Report {
     let propagated = lower_try_propagate(node, carrier_tid, k, carrier)
     if propagated < 0 { return -1 }
-    let out = cg_promote_on_exit(cx_return_type, propagated, node)
+    let out = cg_stmt_return_value(node, propagated)
     if out < 0 { return -1 }
-    ir_block(node, [ir_return(node, out)])
+    ir_block(node, [out])
 }
 
 // The failure arm of a test body. The body has no result, so it cannot return a carrier.
@@ -1806,6 +1818,10 @@ fn lower_index(node: Int) -> Int ! Diag.Report {
 // Only the carrier constructors are lowered here: they build a value out of layout's
 // answer and need no dispatch. Every other call, free or method, is cg_call's.
 fn lower_call_expr(node: Int) -> Int ! Diag.Report {
+    match cx_old_snapshots.get(node) {
+        Some(snap) => return x_old_snapshot_read(node, snap)
+        None => {}
+    }
     let callee = node_left(node)
     if callee >= 0 {
         if nk_of(node_kind(callee)) == NodeKind.Ident {
@@ -1821,6 +1837,14 @@ fn lower_call_expr(node: Int) -> Int ! Diag.Report {
         }
     }
     lower_call(node)
+}
+
+fn x_old_snapshot_read(node: Int, snap: Str) -> Int ! Diag.Report {
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = x_local(tid, node)
+    if x_stopped(rec) { return -1 }
+    ir_var_ref(tid, node, rec.c_spelling, snap, rec.slot_form)
 }
 
 // ── Interpolation ─────────────────────────────────────────────────────────
