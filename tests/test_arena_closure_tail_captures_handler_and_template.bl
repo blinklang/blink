@@ -1,0 +1,152 @@
+import std.template.{TPL_INT, TPL_STR}
+
+// §5.2.1 clause 7: a closure tail of `with arena { }` is promoted by walking its captures,
+// and a Template or a handler it captures is walked like any other value. A template
+// keeps its parts and its Str values; a handler keeps the captures of each operation.
+// Each row calls the closure only after `clobber` has filled a fresh arena with -7 in the
+// freed memory. The arena blocks sit in fns, where escape analysis checks them.
+
+pub effect Rd {
+    effect Read {
+        fn read(t: Template[Rd]) -> Str
+    }
+}
+
+effect Cnt {
+    effect Get {
+        fn get(i: Int) -> Int
+    }
+}
+
+fn clobber() {
+    let mut n = 0
+    with arena {
+        let mut t: List[Int] = []
+        let mut i = 0
+        while i < 4000 {
+            t.push(-7)
+            i = i + 1
+        }
+        n = t.len()
+    }
+    assert_eq(n, 4000)
+}
+
+fn build(n: Int) -> List[Int] {
+    let mut t: List[Int] = []
+    let mut i = 0
+    while i < n {
+        t.push(i * 10)
+        i = i + 1
+    }
+    t
+}
+
+// A Str built at run time, so it lives in the arena that is open when it is built.
+fn spell(stem: Str, n: Int) -> Str {
+    "{stem}{n}"
+}
+
+// `! Arena` makes the parameter arena-transparent (§5.2), so a literal built inside the
+// block may pass through it.
+fn tpl(t: Template[Rd]) -> Template[Rd] ! Arena {
+    t
+}
+
+fn show(t: Template[Rd]) -> Str {
+    let mut out = t.parts().join("|")
+    let mut i = 0
+    while i < t.count() {
+        let tag = t.type_tag(i)
+        if tag == TPL_INT {
+            out = "{out};i:{t.get_int(i)}"
+        } else if tag == TPL_STR {
+            out = "{out};s:{t.get_str(i)}"
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn template_direct() -> fn() -> Str {
+    with arena {
+        let who = spell("user", 7)
+        let t = tpl("id={who} n={3}")
+        fn() -> Str { show(t) }
+    }
+}
+
+// The callee builds the template from its own locals, and a Raw() table name folds into
+// a part, so a part is arena memory too.
+@trusted(audit: "TEST-ARENA-TEMPLATE-RAW")
+fn made_template(n: Int) -> Template[Rd] ! Arena {
+    let table = spell("tbl", n)
+    let who = spell("user", n)
+    tpl("SELECT * FROM {Raw(table)} WHERE who = {who}")
+}
+
+fn template_from_callee() -> fn() -> Str {
+    with arena {
+        let t = made_template(5)
+        fn() -> Str { show(t) }
+    }
+}
+
+fn read_through(h: Handler[Cnt], i: Int) -> Int {
+    with h {
+        cnt.get(i)
+    }
+}
+
+fn handler_direct() -> fn(Int) -> Int {
+    with arena {
+        let xs = build(4)
+        let h = handler Cnt {
+            fn get(i: Int) -> Int {
+                xs.get(i).unwrap()
+            }
+        }
+        fn(i: Int) -> Int { read_through(h, i) }
+    }
+}
+
+fn made_handler(xs: List[Int]) -> Handler[Cnt] {
+    handler Cnt {
+        fn get(i: Int) -> Int {
+            xs.get(i).unwrap() + 1
+        }
+    }
+}
+
+fn handler_from_callee() -> fn(Int) -> Int {
+    with arena {
+        let h = made_handler(build(4))
+        fn(i: Int) -> Int { read_through(h, i) }
+    }
+}
+
+test "a closure tail capturing a template keeps its parts and values after arena reuse" {
+    let g = template_direct()
+    clobber()
+    assert_eq(g(), "id=| n=|;s:user7;i:3")
+}
+
+test "a closure tail capturing a template a callee built keeps its runtime parts" {
+    let g = template_from_callee()
+    clobber()
+    assert_eq(g(), "SELECT * FROM tbl5 WHERE who = |;s:user5")
+}
+
+test "a closure tail capturing a handler keeps what its operation captured" {
+    let g = handler_direct()
+    clobber()
+    assert_eq(g(3), 30)
+    assert_eq(g(1), 10)
+}
+
+test "a closure tail capturing a handler a callee built keeps what its operation captured" {
+    let g = handler_from_callee()
+    clobber()
+    assert_eq(g(3), 31)
+    assert_eq(g(0), 1)
+}

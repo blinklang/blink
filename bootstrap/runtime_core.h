@@ -2922,6 +2922,30 @@ BLINK_RT_FN blink_sb* blink_sb_copy_shell(blink_promote_ctx* ctx, const blink_sb
 }
 #endif
 
+/* A template's parts and its Str values are strings that may have been built in
+   the dying arena: Raw() folds a runtime Str into a part. The tag list says which
+   value words are strings; the others are the value itself. */
+BLINK_RT_FN blink_template* blink_template_promote(blink_promote_ctx* ctx, const blink_template* t);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_template* blink_template_promote(blink_promote_ctx* ctx, const blink_template* t) {
+    if (!t) return NULL;
+    blink_template* out = (blink_template*)blink_promote_ctx_alloc(ctx, sizeof(blink_template));
+    out->count = t->count;
+    out->parts = blink_list_copy_shell(ctx, t->parts);
+    for (int64_t i = 0; out->parts && i < out->parts->len; i++) {
+        out->parts->items[i] = (void*)blink_promote_str(ctx, (const char*)out->parts->items[i]);
+    }
+    out->values = blink_list_copy_shell(ctx, t->values);
+    out->types = blink_list_copy_shell(ctx, t->types);
+    for (int64_t i = 0; out->values && i < out->values->len; i++) {
+        if ((int64_t)(intptr_t)out->types->items[i] == BLINK_TPL_STR) {
+            out->values->items[i] = (void*)blink_promote_str(ctx, (const char*)out->values->items[i]);
+        }
+    }
+    return out;
+}
+#endif
+
 /* A closure record made outside the closing arenas is kept, with whatever it
    captured: those captures were made where it was. One made inside is copied
    once, with its capture array, and each capture moves as its descriptor
