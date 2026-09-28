@@ -1,0 +1,143 @@
+// A struct-style variant of a generic enum binds each payload field at the scrutinee's
+// instance type, not at the declared bare type parameter. The single-field Int case has its
+// own test; these rows cover the payload shapes where a binder typed from the declaration
+// instead of the instance would fail: a compound argument, a generic enum nested in itself,
+// and a variant over two parameters whose fields are bound by name in either order.
+//
+// Every row runs the program and reads the bound value back, so a binder with the wrong
+// type shows as a compile failure or as the wrong output.
+
+import compile_test_helpers
+import std.io
+
+fn run_ok(src: Str, tag: Str) -> Str {
+    let r = compile_test_helpers.compile_and_run(src, tag)
+    if r.exit_code != 0 { io.println("FAIL: {tag} — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+    r.out.trim()
+}
+
+fn tree_decl() -> Str {
+    #"type Tree[T] {
+    Leaf { value: T }
+    Empty
+}
+"#
+}
+
+fn pair_decl() -> Str {
+    #"type Pair[A, B] {
+    Both { left: A, right: B, tag: Str }
+    Neither
+}
+"#
+}
+
+// The outer binder is a Tree[Int] and the inner match reads it as one, so both levels
+// have to carry their own instance.
+test "a generic enum nested in itself binds each level at its own instance" {
+    let src = tree_decl().concat(#"
+fn show(t: Tree[Tree[Int]]) -> Str {
+    match t {
+        Tree.Leaf { value } => {
+            match value {
+                Tree.Leaf { value: inner } => "inner:{inner + 1}"
+                Tree.Empty => "inner-empty"
+            }
+        }
+        Tree.Empty => "empty"
+    }
+}
+fn main() {
+    io.println(show(Tree.Leaf { value: Tree.Leaf { value: 9 } }))
+    io.println(show(Tree.Leaf { value: Tree.Empty }))
+    io.println(show(Tree.Empty))
+}
+"#)
+    assert_eq(run_ok(src, "sv_payload_nested"), "inner:10\ninner-empty\nempty")
+}
+
+test "a List payload binds as the List instance and its elements read back" {
+    let src = tree_decl().concat(#"
+fn show(t: Tree[List[Int]]) -> Str {
+    match t {
+        Tree.Leaf { value } => {
+            let mut total = 0
+            for x in value { total = total + x }
+            "len:{value.len()} first:{value.get(0).unwrap()} total:{total}"
+        }
+        Tree.Empty => "empty"
+    }
+}
+fn main() {
+    io.println(show(Tree.Leaf { value: [7, 8, 10] }))
+}
+"#)
+    assert_eq(run_ok(src, "sv_payload_list"), "len:3 first:7 total:25")
+}
+
+test "an Option payload binds as the Option instance for both Some and None" {
+    let src = tree_decl().concat(#"
+fn show(t: Tree[Option[Str]]) -> Str {
+    match t {
+        Leaf { value } => {
+            let v = value ?? "none"
+            "opt:{v}:{v.len()}"
+        }
+        Empty => "empty"
+    }
+}
+fn main() {
+    io.println(show(Leaf { value: Some("hi") }))
+    io.println(show(Leaf { value: None }))
+}
+"#)
+    assert_eq(run_ok(src, "sv_payload_option"), "opt:hi:2\nopt:none:4")
+}
+
+test "a two-parameter variant binds every field at its own type argument" {
+    let src = pair_decl().concat(#"
+fn show(p: Pair[Int, Str]) -> Str {
+    match p {
+        Pair.Both { left, right, tag } => "{tag}:{left + 1}:{right.len()}"
+        Pair.Neither => "neither"
+    }
+}
+fn main() {
+    io.println(show(Pair.Both { left: 3, right: "xyz", tag: "t" }))
+    io.println(show(Pair.Neither))
+}
+"#)
+    assert_eq(run_ok(src, "sv_payload_pair_all"), "t:4:3\nneither")
+}
+
+// Int and Str differ, so a binder that took the other field's type argument does not compile.
+test "a rest pattern binds the named fields in declaration order" {
+    let src = pair_decl().concat(#"
+fn show(p: Pair[Int, Str]) -> Str {
+    match p {
+        Pair.Both { left, right, .. } => "{left * 2}/{right.len()}"
+        Pair.Neither => "neither"
+    }
+}
+fn main() {
+    io.println(show(Pair.Both { left: 21, right: "ab", tag: "unused" }))
+}
+"#)
+    assert_eq(run_ok(src, "sv_payload_pair_rest_decl"), "42/2")
+}
+
+test "a rest pattern binds the named fields in reverse order" {
+    let src = pair_decl().concat(#"
+fn show(p: Pair[Int, Str]) -> Str {
+    match p {
+        Both { right, left, .. } => "{right.len()}/{left * 2}"
+        Neither => "neither"
+    }
+}
+fn main() {
+    io.println(show(Both { left: 21, right: "abc", tag: "unused" }))
+}
+"#)
+    assert_eq(run_ok(src, "sv_payload_pair_rest_rev"), "3/42")
+}
