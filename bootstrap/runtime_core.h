@@ -2417,16 +2417,13 @@ BLINK_RT_FN int blink_str_cmp(const char* a, const char* b) {
 
 /* Float equality and order as sections/03_types.md "Float Total Ordering" defines them:
    NaN equals NaN, NaN sorts greater than every other value, and -0.0 equals 0.0. IEEE 754
-   answers the first two differently, so a derived Eq or Ord on a Float field calls these
-   rather than C's own operators. The two agree: blink_float_cmp answers 0 for exactly the
-   pairs blink_float_eq answers 1 for.
+   answers the first two differently, so every Float comparison the compiler emits (the
+   operators, a derived Eq or Ord, assert_eq, List.contains) calls these rather than C's
+   own operators. The two agree: blink_float_cmp answers 0 for exactly the pairs
+   blink_float_eq answers 1 for. Only `ieee_eq`, the IEEE 754 escape, is C's own `==`.
    `x != x` is the NaN test, which needs no math.h. It holds only while the compiler emits
    C without -ffast-math, which makes that test false and gives both helpers the IEEE
-   answers again.
-   The spec gives a bare Float the same total order. The expression path still emits a C
-   operator for one, so today a Float field gets the spec order and a bare Float operand
-   does not. Closing that half needs the stdlib IEEE escape hatch first, because
-   std.float.is_nan is written as `x != x`. */
+   answers again. */
 BLINK_RT_FN int blink_float_eq(double a, double b);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int blink_float_eq(double a, double b) {
