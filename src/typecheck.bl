@@ -10788,6 +10788,10 @@ fn init_types() ! TypeCheck.Register {
     tc_fn_node_by_name.clear()
     pv_in_old_depth = 0
     pv_rejected_preds.clear()
+    tc_ann_alias_decl.clear()
+    tc_fn_requires.clear()
+    tc_fn_ensures.clear()
+    tc_old_calls.clear()
     tc_build_import_map()
 
     TYPE_INT = new_type(TyKind.Int, "Int")
@@ -16693,6 +16697,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 if fn_name == "old" && tc_in_ensures_predicate != 0 {
                     let args_sl = node_args(node)
                     if args_sl != -1 && sublist_length(args_sl) == 1 {
+                        tc_old_calls.insert(node, 1)
                         return infer_type(sublist_get(args_sl, 0))
                     }
                 }
@@ -20042,6 +20047,7 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
             // the guard makes this an exact structural mirror and never hands a -1 node to
             // node_elements (which node_or_die-crashes on -1).
             let ann = node_type_ann(p)
+            tc_record_alias_ann(ann)
             let mut ptid_final = ptid
             if ann != -1 {
                 let inst = tc_fnsig_param_instance_tid(ann, ptid)
@@ -20102,6 +20108,7 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
         if ret_inst != -1 { ret_tid = ret_inst }
         tc_publish_node_tid(ret_ann, ret_tid)
         fn_ret_tid = ret_tid
+        tc_record_alias_ann(ret_ann)
     }
 
     // An @ffi fn binds no params, and its contracts are refused (ContractOnFFI).
@@ -20144,6 +20151,25 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
 // a call.
 let mut tc_in_ensures_predicate: Int = 0
 
+// The typed contract predicates of each fn, keyed by the fn node, and the `old(e)` nodes
+// among them. Codegen lowers exactly these, so a predicate the validator refused is never
+// lowered, and a call to a user fn named `old` is never read as a snapshot.
+let mut tc_fn_requires: Map[Int, List[Int]] = Map()
+let mut tc_fn_ensures: Map[Int, List[Int]] = Map()
+let mut tc_old_calls: Map[Int, Int] = Map()
+
+pub fn tc_requires_preds_of(fn_node: Int) -> List[Int] {
+    tc_fn_requires.get(fn_node) ?? []
+}
+
+pub fn tc_ensures_preds_of(fn_node: Int) -> List[Int] {
+    tc_fn_ensures.get(fn_node) ?? []
+}
+
+pub fn tc_is_old_snapshot(node: Int) -> Bool {
+    tc_old_calls.contains_key(node)
+}
+
 // The @requires and @ensures predicates, typed in the fn's own scope so their runtime checks
 // lower from tids like any other expression. @ensures also sees `result`, the returned value.
 // @allow: publishing types IS this function's effect; the ensures flag is reset on the way out.
@@ -20151,6 +20177,8 @@ let mut tc_in_ensures_predicate: Int = 0
 fn tc_type_contract_predicates(fn_node: Int, ret_tid: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let anns_sl = node_handlers(fn_node)
     if anns_sl == -1 { return }
+    let mut requires: List[Int] = []
+    let mut ensures: List[Int] = []
     let mut i = 0
     while i < sublist_length(anns_sl) {
         let ann = sublist_get(anns_sl, i)
@@ -20169,11 +20197,16 @@ fn tc_type_contract_predicates(fn_node: Int, ret_tid: Int) ! TypeCheck.Resolve, 
                 if is_ens {
                     tc_in_ensures_predicate = 0
                     nr_pop_scope()
+                    ensures.push(pred)
+                } else {
+                    requires.push(pred)
                 }
             }
         }
         i = i + 1
     }
+    tc_fn_requires.insert(fn_node, requires)
+    tc_fn_ensures.insert(fn_node, ensures)
 }
 
 fn tc_type_predicate(pred: Int, what: Str) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
@@ -20189,6 +20222,12 @@ fn tc_type_predicate(pred: Int, what: Str) ! TypeCheck.Resolve, TypeCheck.Report
 // @allow: the module and tparam scope are restored; publishing types is the point.
 @allow(UnrestoredMutation)
 fn tc_stamp_where_predicate(td: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if node_value(td) != -1 {
+        let saved = nr_current_module
+        nr_current_module = node_module(td)
+        tc_record_alias_ann(node_value(td))
+        nr_current_module = saved
+    }
     let pred = node_condition(td)
     if pred == -1 { return }
     if pv_rejected_preds.contains_key(pred) { return }
@@ -20205,6 +20244,24 @@ fn tc_stamp_where_predicate(td: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag
     // As with a field default, the walk recovered this subtree before it was typed.
     let mut pred_owner: Map[Int, Int] = Map()
     let _ = tc_stamp_walk(pred, pred_owner)
+}
+
+// The alias declaration an annotation names, keyed by the annotation node. An alias is
+// transparent, so the tid at a boundary is the base type and cannot say which @where
+// applies; codegen reads the declaration from here instead.
+let mut tc_ann_alias_decl: Map[Int, Int] = Map()
+
+fn tc_record_alias_ann(ann: Int) {
+    if ann == -1 { return }
+    let td = tc_decl_node_for_type(tc_written_type_nominal(node_name(ann)))
+    if td < 0 { return }
+    if node_value(td) == -1 { return }
+    tc_ann_alias_decl.insert(ann, td)
+}
+
+// The alias TypeDef the annotation `ann` names, or -1.
+pub fn tc_alias_decl_of_ann(ann: Int) -> Int {
+    tc_ann_alias_decl.get(ann) ?? -1
 }
 
 // ── Match exhaustiveness (E0004) ─────────────────────────────────────

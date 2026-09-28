@@ -17,6 +17,7 @@ import parser.{
     node_obj, node_op, node_params, node_pattern, node_right, node_scrutinee, node_start,
     node_stmts, node_str_val, node_target, node_then_body, node_type_name, node_type_ann,
     node_value, sublist_get, sublist_length, interp_part_is_literal,
+    get_annotation, get_str_named_arg, node_value_child_ids, node_type_params,
 }
 import typecheck.{
     TyKind, TYPE_BOOL, TYPE_CHAR, TYPE_FLOAT, TYPE_INT, TYPE_STR, TYPE_VOID,
@@ -24,6 +25,7 @@ import typecheck.{
     tc_evar_name, tc_evfield_name, tc_evfield_tid, tc_global_decl_node, tc_let_binder_is_discard,
     tc_lookup_node_tid, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots, tc_tid_decl_node,
     tc_tid_kind, tk_name, make_list_type,
+    tc_alias_decl_of_ann, tc_ensures_preds_of, tc_is_old_snapshot, tc_requires_preds_of,
 }
 import layout.{
     Position, Slot, SlotForm, LayoutRecord, async_scope_handles_spelling, bind_binder_cell,
@@ -36,7 +38,7 @@ import layout.{
 import cname.{
     c_assert_fail_eq_name, c_assert_fail_intro_name, c_assert_fail_name,
     c_debug_assert_fail_name, c_decl_for_tid, c_enum_payload_member, c_field_name,
-    c_global_name, c_local_name, c_mint_local, c_tuple_member, c_variant_discriminant, c_runtime_helper,
+    c_global_name, c_local_name, c_mint_local, c_ensures_result_name, c_old_snapshot_name, c_tuple_member, c_variant_discriminant, c_runtime_helper,
     c_string_literal,
 }
 import ir.{
@@ -58,6 +60,7 @@ import cg_expr.{
     cg_expr_is_registered, cg_expr_pending_count,
     cg_expr_push_pending, cg_expr_register_value, cg_expr_set_return_type, cg_expr_return_type,
     cg_expr_take_pending, cg_expr_value_count, lower_expr,
+    cg_expr_clear_old_snapshots, cg_expr_set_old_snapshot,
     x_layout_checked, x_panic_message, x_stopped, x_unbox_payload, ArithSite, lower_arith_operator,
 }
 import cg_eff.{
@@ -72,6 +75,7 @@ import cg_call.{
     cg_call_channel_take, cg_call_cursor_walk, for_in_iteration_of,
 }
 import unparse.{unparse_expr}
+import cg_reg.{cg_reg_impl_of}
 import cg_promote.{
     cg_promote_arena_enter, cg_promote_arena_exit, cg_promote_body_enter, cg_promote_body_exit,
     cg_promote_innermost_ctx, cg_promote_needs_walk, cg_promote_on_exit, cg_promote_trace_begin,
@@ -127,11 +131,19 @@ pub fn cg_stmt_set_debug_mode(on: Bool) {
 // its name into the function around it.
 let mut cs_current_fn_name: Str = ""
 
+// What every value exit of the function being lowered checks: the @ensures predicates of a
+// runtime-fallback contract, and the alias declarations whose @where the returned value must
+// meet. Saved and restored around a function's own body, the same as its name.
+let mut cs_exit_ensures: List[Int] = []
+let mut cs_exit_where: List[Int] = []
+
 pub fn cg_stmt_reset() {
     scope_stack = []
     mv_work = []
     mv_in_target = false
     cs_current_fn_name = ""
+    cs_exit_ensures = []
+    cs_exit_where = []
 }
 
 // ── Types, spellings and names ────────────────────────────────────────────
@@ -264,16 +276,195 @@ pub fn lower_fn(fn_node: Int) -> Int ! Diag.Report {
     cg_expr_set_return_type(if ann < 0 { -1 } else { stmt_tid(ann) })
     let saved_fn_name = cs_current_fn_name
     cs_current_fn_name = node_name(fn_node)
+    let saved_ensures = cs_exit_ensures
+    let saved_where = cs_exit_where
     cg_promote_body_enter()
+    let mut stmts = if bound && body >= 0 { contract_entry(fn_node, tail == TAIL_RETURN) } else { [] }
     let block = if bound && body >= 0 { lower_body_block(body, tail, "", -1) } else { -1 }
+    // A function with no result falls off the end of its body, which is an exit too.
+    let falls_off = if block >= 0 && tail != TAIL_RETURN { contract_void_exit() } else { [] }
     cg_promote_body_exit()
+    cs_exit_ensures = saved_ensures
+    cs_exit_where = saved_where
+    cg_expr_clear_old_snapshots()
     cs_current_fn_name = saved_fn_name
     cg_expr_set_return_type(-1)
     close_scope()
     // A stopped body, a parameter with no type and a declaration with no body all leave
     // nothing worth printing, and the seam still answers a node.
     if block < 0 { return ir_block(fn_node, []) }
-    block
+    if stmts.len() == 0 && falls_off.len() == 0 { return block }
+    stmts.push(block)
+    for check in falls_off { stmts.push(check) }
+    ir_block(fn_node, stmts)
+}
+
+// ── Contracts ─────────────────────────────────────────────────────────────
+//
+// Spec 3b.4: with no solver every contract is Unknown, and `@verify(fallback: "runtime")`
+// turns it into a check that panics when it fails. 3b.1: a @where is checked at every
+// boundary the solver cannot prove, which today is every parameter and every return.
+
+// The checks a function runs on entry, before its body: @where on each parameter, then the
+// @requires, then the `old(e)` snapshots its @ensures reads. Also arms the exit checks.
+fn contract_entry(fn_node: Int, returns_value: Bool) -> List[Int] ! Diag.Report {
+    let mut stmts: List[Int] = []
+    let params = node_params(fn_node)
+    let mut i = 0
+    while params != -1 && i < sublist_length(params) {
+        let p = sublist_get(params, i)
+        let source = c_local_name(node_name(p))
+        for td in where_decls_of(node_type_ann(p)) {
+            stmts.push(contract_check(node_condition(td), where_failure(td), "self", stmt_tid(p), source))
+        }
+        i = i + 1
+    }
+    cs_exit_ensures = []
+    cs_exit_where = if returns_value { where_decls_of(node_type_ann(fn_node)) } else { [] }
+    if !contract_runtime(fn_node) { return stmts }
+    for pred in tc_requires_preds_of(fn_node) {
+        stmts.push(contract_check(pred, "precondition failed: @requires in {node_name(fn_node)}", "", -1, ""))
+    }
+    let ensures = tc_ensures_preds_of(fn_node)
+    for pred in ensures { snapshot_olds(pred, stmts) }
+    cs_exit_ensures = ensures
+    stmts
+}
+
+// Whether the contract lowers to checks. A fallback of trust checks nothing, and a bad
+// fallback is already an error.
+fn contract_runtime(fn_node: Int) -> Bool {
+    // An impl method's predicates are not validated yet, so its contract lowers no check.
+    if cg_reg_impl_of(fn_node) >= 0 { return false }
+    let verify = get_annotation(fn_node, "verify")
+    // Spec 3b.4 makes a contract with no @verify a compile error. That error comes in a
+    // later step; until then such a contract lowers no check rather than guess a fallback.
+    if verify < 0 { return false }
+    get_str_named_arg(verify, "fallback") == "runtime"
+}
+
+// The alias declarations with a @where that a value written as `ann` must meet, innermost
+// first. An alias of an alias meets both.
+fn where_decls_of(ann: Int) -> List[Int] ! Diag.Report {
+    let mut chain: List[Int] = []
+    if ann < 0 { return chain }
+    let mut td = tc_alias_decl_of_ann(ann)
+    while td >= 0 && !chain.contains(td) {
+        chain.push(td)
+        td = tc_alias_decl_of_ann(node_value(td))
+    }
+    let mut out: List[Int] = []
+    let mut k = chain.len()
+    while k > 0 {
+        k = k - 1
+        let decl = chain.get(k).unwrap()
+        if node_condition(decl) != -1 {
+            // A generic alias binds its type parameters per use, and the predicate would
+            // lower under the function's instance instead of the alias's.
+            if node_type_params(decl) != -1 {
+                diag_ice_stage_not_built("a @where on a generic type alias", decl)
+            } else {
+                out.push(decl)
+            }
+        }
+    }
+    out
+}
+
+fn where_failure(td: Int) -> Str {
+    "refinement violated: @where on {node_name(td)}"
+}
+
+// `old(e)` is e's value on entry. Each one is copied into its own local before the body
+// runs, and the @ensures check reads that local in its place.
+fn snapshot_olds(node: Int, out: List[Int]) ! Diag.Report {
+    if tc_is_old_snapshot(node) {
+        let tid = stmt_tid(node)
+        if tid < 0 { return }
+        let mark = cg_expr_pending_count()
+        let value = lower_value(sublist_get(node_args(node), 0))
+        cg_expr_drain_pending(mark, out)
+        let rec = layout_at(tid, Position.Local, node)
+        let name = c_old_snapshot_name()
+        out.push(ir_let(tid, node, rec.c_spelling, name, rec.slot_form, value))
+        cg_expr_set_old_snapshot(node, name)
+        return
+    }
+    for kid in node_value_child_ids(node) { snapshot_olds(kid, out) }
+}
+
+// `if (!pred) panic`, with `binder` bound to the C local `source` of type `tid` while the
+// predicate lowers. A tid below zero binds nothing. The predicate is one AST lowered at
+// every exit, so the temps it names are forgotten once its check is built.
+fn contract_check(pred: Int, what: Str, binder: Str, tid: Int, source: Str) -> Int ! Diag.Report {
+    let scope = open_scope()
+    let mut stmts: List[Int] = []
+    if tid >= 0 {
+        bind_binder_mut(scope, binder, tid, false)
+        let rec = layout_at(tid, Position.Local, pred)
+        let read = ir_var_ref(tid, pred, rec.c_spelling, source, rec.slot_form)
+        stmts.push(ir_let(tid, pred, rec.c_spelling, c_local_name(binder), rec.slot_form, read))
+    }
+    let values = cg_expr_value_count()
+    let mark = cg_expr_pending_count()
+    let cond = lower_value(pred)
+    cg_expr_drain_pending(mark, stmts)
+    cg_expr_drop_values(values)
+    close_scope()
+    let said = x_panic_message(pred, pct_escape(what), [])
+    // The layout stop is already reported, and an empty block keeps the tree well formed.
+    if said < 0 { return ir_block(pred, []) }
+    let bool_rec = layout_at(TYPE_BOOL, Position.Local, pred)
+    let failed = ir_unary(TYPE_BOOL, pred, bool_rec.c_spelling, "!", cond)
+    stmts.push(ir_if(pred, failed, ir_block(pred, [ir_panic(pred, said)]), -1))
+    ir_block(pred, stmts)
+}
+
+// The @ensures checks at an exit with no value. `result` is not bound: there is none.
+fn contract_void_exit() -> List[Int] ! Diag.Report {
+    let mut out: List[Int] = []
+    for pred in cs_exit_ensures {
+        out.push(contract_check(pred, ensures_failure(), "", -1, ""))
+    }
+    out
+}
+
+fn ensures_failure() -> Str {
+    "postcondition failed: @ensures in {cs_current_fn_name}"
+}
+
+// A value leaving the function: every return, tail and `?` failure arm comes through here,
+// so an exit cannot skip the checks. The value is bound once, checked as `result` by each
+// @ensures and as `self` by each @where on the return type, then returned.
+pub fn cg_stmt_return_value(node: Int, value: Int) -> Int ! Diag.Report {
+    let rt = cg_expr_return_type()
+    if cs_exit_ensures.len() == 0 && cs_exit_where.len() == 0 {
+        let out = cg_promote_on_exit(rt, value, node)
+        if out < 0 { return -1 }
+        return ir_return(node, out)
+    }
+    let rec = layout_at(rt, Position.Local, node)
+    let rv = c_ensures_result_name()
+    let mut stmts = [ir_let(rt, node, rec.c_spelling, rv, rec.slot_form, value)]
+    for pred in cs_exit_ensures {
+        stmts.push(contract_check(pred, ensures_failure(), "result", rt, rv))
+    }
+    for td in cs_exit_where {
+        stmts.push(contract_check(node_condition(td), where_failure(td), "self", rt, rv))
+    }
+    let out = cg_promote_on_exit(rt, ir_var_ref(rt, node, rec.c_spelling, rv, rec.slot_form), node)
+    if out < 0 { return -1 }
+    stmts.push(ir_return(node, out))
+    ir_block(node, stmts)
+}
+
+// A return with no value.
+fn return_void(node: Int) -> Int ! Diag.Report {
+    let checks = contract_void_exit()
+    if checks.len() == 0 { return ir_return(node, -1) }
+    let mut stmts = checks
+    stmts.push(ir_return(node, -1))
+    ir_block(node, stmts)
 }
 
 // Whether the tail expression of the body is the function's result. A function that
@@ -434,7 +625,7 @@ fn lower_jump(node: Int, jump: Int) -> Int {
 
 // How a produced value leaves the block that produced it.
 fn tail_wrap(node: Int, value: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
-    if tail == TAIL_RETURN { return ir_return(node, cg_promote_on_exit(cg_expr_return_type(), value, node)) }
+    if tail == TAIL_RETURN { return cg_stmt_return_value(node, value) }
     if tail == TAIL_ASSIGN {
         // A genuinely Void-typed tail (a bare call whose C shape is `void`, most often a
         // diverging builtin like `env.exit`) has nothing to store into dest: dest_tid is
@@ -1414,10 +1605,10 @@ fn lower_return(node: Int) -> Int ! Diag.Report {
         if value < 0 { return -1 }
         return ir_block(node, [ir_expr_stmt(node, value), ir_panic_catch_exit(node, frame)])
     }
-    if v < 0 { return ir_return(node, -1) }
+    if v < 0 { return return_void(node) }
     let value = lower_value(v)
     if value < 0 { return -1 }
-    ir_return(node, cg_promote_on_exit(cg_expr_return_type(), value, node))
+    cg_stmt_return_value(node, value)
 }
 
 // ── Blocks in value position ──────────────────────────────────────────────

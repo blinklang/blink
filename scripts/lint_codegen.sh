@@ -102,6 +102,8 @@ c_vtable_userdata_member cname
 c_vtable_promoter_name cname
 td_guard_name cname
 c_mint_local cname
+c_ensures_result_name cname
+c_old_snapshot_name cname
 c_tuple_member cname
 c_type_of layout
 carrier_tag_of layout
