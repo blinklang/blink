@@ -1,0 +1,120 @@
+// sections/03b_contracts.md 3b.4: with no SMT solver every contract is Unknown, and
+// `@verify(fallback: "runtime")` turns an Unknown contract into a runtime check.
+// `@verify(fallback: "trust")` accepts it with no check. A @where refinement needs no
+// @verify: 3b.1 checks it at every boundary the solver cannot, which today is every boundary.
+
+import compile_test_helpers
+
+// ── @requires ─────────────────────────────────────────────────────────
+
+test "a runtime-fallback @requires aborts on a violating argument" {
+    let src = "@requires(x > 0)\n@verify(fallback: \"runtime\")\nfn rq_pos(x: Int) -> Int \{ x }\nfn main() \{ rq_pos(0) }\n"
+    let r = compile_test_helpers.compile_and_run(src, "_crf_req_bad")
+    assert(r.exit_code != 0)
+    assert(r.err_out.contains("precondition failed"))
+}
+
+test "a runtime-fallback @requires lets a satisfying argument through" {
+    let src = "@requires(x > 0)\n@verify(fallback: \"runtime\")\nfn rq_pos(x: Int) -> Int \{ x }\nfn main() \{\n    assert(rq_pos(4) == 4)\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "_crf_req_ok")
+    assert(r.exit_code == 0)
+}
+
+// ── @ensures on every exit ────────────────────────────────────────────
+
+test "a runtime-fallback @ensures aborts when the tail value violates it" {
+    let src = "@ensures(result > 100)\n@verify(fallback: \"runtime\")\nfn en_tail(x: Int) -> Int \{ x }\nfn main() \{ en_tail(1) }\n"
+    let r = compile_test_helpers.compile_and_run(src, "_crf_ens_tail")
+    assert(r.exit_code != 0)
+    assert(r.err_out.contains("postcondition failed"))
+}
+
+test "a runtime-fallback @ensures aborts when an early return violates it" {
+    let src = "@ensures(result >= 0)\n@verify(fallback: \"runtime\")\nfn en_early(x: Int) -> Int \{\n    if x < 0 \{ return x }\n    x\n}\nfn main() \{ en_early(0 - 3) }\n"
+    let r = compile_test_helpers.compile_and_run(src, "_crf_ens_early")
+    assert(r.exit_code != 0)
+    assert(r.err_out.contains("postcondition failed"))
+}
+
+test "a runtime-fallback @ensures holds on an early return that satisfies it" {
+    let src = "@ensures(result >= 0)\n@verify(fallback: \"runtime\")\nfn en_clamp(x: Int) -> Int \{\n    if x < 0 \{ return 0 }\n    x\n}\nfn main() \{\n    assert(en_clamp(0 - 3) == 0)\n    assert(en_clamp(5) == 5)\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "_crf_ens_early_ok")
+    assert(r.exit_code == 0)
+}
+
+test "a runtime-fallback @ensures aborts when the failure arm of ? violates it" {
+    let src = "fn en_fail(x: Int) -> Result[Int, Str] \{\n    if x < 0 \{ return Err(\"neg\") }\n    Ok(x)\n}\n@ensures(result.is_ok())\n@verify(fallback: \"runtime\")\nfn en_try(x: Int) -> Result[Int, Str] \{\n    let v = en_fail(x)?\n    Ok(v + 1)\n}\nfn main() \{\n    let _ = en_try(0 - 1)\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "_crf_ens_try")
+    assert(r.exit_code != 0)
+    assert(r.err_out.contains("postcondition failed"))
+}
+
+test "an old() snapshot of a Float keeps the Float's C type" {
+    let src = "@ensures(result >= old(x))\n@verify(fallback: \"runtime\")\nfn en_up(x: Float) -> Float \{ x + 0.5 }\nfn main() \{\n    assert(en_up(1.25) == 1.75)\n}\n"
+    let c = compile_test_helpers.compile_and_emit_c(src, "_crf_old_float_c")
+    assert(c.contains("double __old_"))
+    let r = compile_test_helpers.compile_and_run(src, "_crf_old_float_run")
+    assert(r.exit_code == 0)
+}
+
+test "an old() snapshot is taken at entry, before the body changes what it reads" {
+    let src = "type Ctr \{ n: Int }\n@ensures(result == old(c.n) + 1)\n@verify(fallback: \"runtime\")\nfn en_bump(c: Ctr) -> Int \{\n    let mut d = c\n    d.n = d.n + 1\n    d.n\n}\nfn main() \{\n    assert(en_bump(Ctr \{ n: 4 }) == 5)\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "_crf_old_entry")
+    assert(r.exit_code == 0)
+}
+
+// ── trust, bad values, and no @verify ─────────────────────────────────
+
+test "a trust-fallback contract emits no check and lets a violating call run" {
+    let src = "@requires(x > 0)\n@ensures(result > 100)\n@verify(fallback: \"trust\")\nfn tr_any(x: Int) -> Int \{ x }\nfn main() \{ tr_any(0) }\n"
+    let c = compile_test_helpers.compile_and_emit_c(src, "_crf_trust_c")
+    assert(!c.contains("precondition failed"))
+    assert(!c.contains("postcondition failed"))
+    let r = compile_test_helpers.compile_and_run(src, "_crf_trust_run")
+    assert(r.exit_code == 0)
+}
+
+test "a fallback other than runtime or trust is refused" {
+    let src = "@requires(x > 0)\n@verify(fallback: \"sometimes\")\nfn bad_fb(x: Int) -> Int \{ x }\nfn main() \{ bad_fb(1) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_crf_bad_fallback")
+    assert(out.contains("E1110"))
+}
+
+test "@verify on a function with no contract is accepted" {
+    let src = "@verify(fallback: \"runtime\")\nfn no_ct(x: Int) -> Int \{ x }\nfn main() \{\n    assert(no_ct(2) == 2)\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "_crf_verify_alone")
+    assert(r.exit_code == 0)
+}
+
+// Spec 3b.4 makes this a compile error, and a later step emits it. Until then an
+// unannotated contract compiles and emits no check.
+test "a contract with no @verify compiles and emits no check" {
+    let src = "@requires(x > 0)\nfn un_req(x: Int) -> Int \{ x }\nfn main() \{ un_req(0) }\n"
+    let c = compile_test_helpers.compile_and_emit_c(src, "_crf_unannotated_c")
+    assert(!c.contains("precondition failed"))
+    let r = compile_test_helpers.compile_and_run(src, "_crf_unannotated_run")
+    assert(r.exit_code == 0)
+}
+
+// ── @where at the param and return boundaries ─────────────────────────
+
+test "a @where refinement aborts when a parameter violates it" {
+    let src = "type Pct = Int @where(self >= 0 && self <= 100)\nfn use_pct(p: Pct) -> Int \{ p }\nfn main() \{ use_pct(101) }\n"
+    let r = compile_test_helpers.compile_and_run(src, "_crf_where_param")
+    assert(r.exit_code != 0)
+    assert(r.err_out.contains("refinement violated"))
+}
+
+test "a @where refinement aborts when a returned value violates it" {
+    let src = "type Pct = Int @where(self >= 0 && self <= 100)\nfn mk_pct(x: Int) -> Pct \{ x }\nfn main() \{ mk_pct(0 - 1) }\n"
+    let r = compile_test_helpers.compile_and_run(src, "_crf_where_ret")
+    assert(r.exit_code != 0)
+    assert(r.err_out.contains("refinement violated"))
+}
+
+test "a @where refinement over a Str checks through a method call" {
+    let src = "type Name = Str @where(self.len() > 0)\nfn greet(n: Name) -> Int \{ n.len() }\nfn main() \{\n    assert(greet(\"ab\") == 2)\n    greet(\"\")\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "_crf_where_str")
+    assert(r.exit_code != 0)
+    assert(r.err_out.contains("refinement violated"))
+}
