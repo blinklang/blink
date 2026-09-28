@@ -23,7 +23,7 @@ import cname.{
     c_effect_default_op_name, c_ev_field_name, c_ev_type_name, c_ffi_struct_original, c_ffi_struct_ptr_name,
     c_ffi_symbol, c_field_name,
     c_fn_decl_name, cname_ffi_struct_mirror,
-    c_global_name, c_vtable_type_name,
+    c_global_name, c_vtable_type_name, c_vtable_userdata_member,
     c_impl_method_name, c_display_dispatch_name, c_local_name, c_runtime_helper,
     c_typedef_name, c_variant_discriminant,
     cname_is_runtime_owned, td_guard_name, c_enum_tag_member, c_enum_payload_member,
@@ -36,7 +36,7 @@ import cg_print.{
     print_typedef_blocks,
 }
 import cg_reg.{
-    cg_reg_effect_decls, cg_reg_entry_point, cg_reg_fn_decls, cg_reg_global_decls,
+    cg_reg_effect_decls, cg_reg_effect_ops, cg_reg_entry_point, cg_reg_fn_decls, cg_reg_global_decls,
     cg_reg_impl_methods, cg_reg_impl_of, cg_reg_module_of, cg_reg_modules, cg_reg_tid_for_decl,
     cg_reg_type_decls,
 }
@@ -1092,29 +1092,6 @@ pub fn cg_decl_emit_ev(ev_storage: Str) ! Diag.Report {
     print_ev(td_guard_name(c_ev_type_name()), vtables, fields, ev_storage)
 }
 
-// The operations a root effect owns, in the order the sub-effects and their operations are
-// written. That order is the vtable's layout: a perform site reads a slot by name, but a
-// handler install copies the whole struct, so every unit that spells this vtable has to walk
-// the declaration the same way.
-fn effect_ops(effect_decl: Int) -> List[Int] {
-    let mut out: List[Int] = []
-    let children = node_elements(effect_decl)
-    if children == -1 { return out }
-    let mut ci = 0
-    while ci < sublist_length(children) {
-        let ops = node_methods(sublist_get(children, ci))
-        if ops != -1 {
-            let mut oi = 0
-            while oi < sublist_length(ops) {
-                out.push(sublist_get(ops, oi))
-                oi = oi + 1
-            }
-        }
-        ci = ci + 1
-    }
-    out
-}
-
 // One root effect's vtable struct, a default body per operation, and the default instance the
 // evidence vector takes the address of.
 //
@@ -1140,7 +1117,7 @@ fn emit_effect_vtable(effect_decl: Int, slot_tid: Int, vtable: Str) -> Int ! Dia
         return 0
     }
     emit_vtable_typedef(vtable, sig)
-    let ops = effect_ops(effect_decl)
+    let ops = cg_reg_effect_ops(effect_decl)
     let mut i = 0
     while i < ops.len() {
         print_vtable_slot_fn(sig.rets.get(i).unwrap(), sig.defaults.get(i).unwrap(), sig.params.get(i).unwrap(),
@@ -1156,7 +1133,9 @@ fn emit_effect_vtable(effect_decl: Int, slot_tid: Int, vtable: Str) -> Int ! Dia
 fn emit_vtable_typedef(vtable: Str, sig: VtableSig) ! Diag.Report {
     if (vtable_state.get(vtable) ?? 0) == 2 { return }
     vtable_state.insert(vtable, 2)
-    print_effect_vtable_typedef(td_guard_name(vtable), vtable, sig.slots, sig.rets, sig.params)
+    let mut userdata: List[Str] = []
+    for slot in sig.slots { userdata.push(c_vtable_userdata_member(slot)) }
+    print_effect_vtable_typedef(td_guard_name(vtable), vtable, sig.slots, userdata, sig.rets, sig.params)
 }
 
 // One root effect's vtable, as the slot name, return spelling, parameter list and default
@@ -1177,7 +1156,7 @@ fn vtable_sig(effect_decl: Int, slot_tid: Int) -> VtableSig ! Diag.Report {
     let mut rets: List[Str] = []
     let mut params: List[List[Str]] = []
     let mut defaults: List[Str] = []
-    for op in effect_ops(effect_decl) {
+    for op in cg_reg_effect_ops(effect_decl) {
         // The slot is a struct member, so it takes the member-name producer. The perform site
         // reads the slot by name and must ask the same producer, or an operation whose name C
         // owns is written one way here and read another way there.

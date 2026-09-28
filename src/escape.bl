@@ -12,11 +12,11 @@ import diagnostics.{
     diag_source_file, diag_file_for_node,
     diag_push_allows, diag_clear_allows,
     ARENA_VALUE_ESCAPES, ARENA_TYPE_CONTAINS_CYCLE, ARENA_EFFECT_REDUNDANT,
-    ARENA_CLOSURE_TAIL_NONLITERAL, ARENA_CLOSURE_UNSUPPORTED_CAP, CLOSEABLE_ESCAPES_SCOPE,
+    ARENA_CLOSURE_TAIL_NONLITERAL, CLOSEABLE_ESCAPES_SCOPE,
 }
 import typecheck.{
-    TyKind, tc_call_decl_is_fn, tc_call_decl_node, tc_declared_field_tids, tc_fn_has_effect, tc_lookup_node_tid, tc_member_tid_at_instance,
-    tc_resolve, tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind,
+    TyKind, tc_call_decl_is_fn, tc_call_decl_node, tc_fn_has_effect, tc_lookup_node_tid,
+    tc_resolve, tc_tid_child, tc_tid_decl_node, tc_tid_kind,
     tc_tid_reaches_itself, tc_type_str,
 }
 import free_names.{closure_read_idents, pattern_names, push_param_names}
@@ -411,8 +411,9 @@ fn check_question_err_closure(node: Int) ! Diag.Report {
     if fn_origin_is_call(operand, base + 1) { emit_closure_tail_nonliteral(node) }
 }
 
-// A promoted literal's captures are copied by walkers: each must have one. A capture that
-// is itself a literal bound in the block is promoted with it.
+// A promoted literal's captures are copied by walkers. Every kind has one, but a walker
+// can not copy a type that holds itself, so that capture is refused. A capture that is
+// itself a literal bound in the block is promoted with it.
 fn promote_closure_literal(closure: Int, floor: Int) ! Diag.Report {
     if ea_promoted_closures.contains_key(closure) { return }
     ea_promoted_closures.insert(closure, 1)
@@ -420,7 +421,7 @@ fn promote_closure_literal(closure: Int, floor: Int) ! Diag.Report {
         let b = ea_lookup_bind(node_name(ident))
         if b >= 0 {
             let tid = tc_lookup_node_tid(ident)
-            if !ea_refuse_recursive_crossing(ident, tid) { let _ = ea_refuse_unwalkable_capture(ident, node_name(ident), tid) }
+            let _ = ea_refuse_recursive_crossing(ident, tid)
             if is_fn_typed(ident) && ea_bind_depths.get(b).unwrap() >= floor {
                 let _ = fn_origin_is_call(ea_bind_values.get(b).unwrap(), floor)
             }
@@ -439,53 +440,6 @@ fn emit_closure_tail_nonliteral(node: Int) ! Diag.Report {
         "build the closure outside the `with arena \{ }` block, or bind it with `let f = fn(...) \{ ... }` inside the block"
     )
     diag_source_file = saved
-}
-
-// Whether a value of `tid` holds a handler, a template or a raw template, whose memory an
-// arena can hold and no walker copies, reporting E0702d at `node` when it does. A closure
-// inside it is promoted through its own descriptors, and a pointer, handle, channel or
-// ffi scope is copied as a word, so the search stops at those. Code generation asks too,
-// for a capture whose type this pass saw only as a type parameter.
-@allow(UnrestoredMutation, IncompleteStateRestore)
-pub fn ea_refuse_unwalkable_capture(node: Int, name: Str, tid: Int) -> Bool ! Diag.Report {
-    if tid < 0 { return false }
-    let mut done: Map[Int, Int] = Map()
-    let hit = unwalkable_reach(tc_resolve(tid), done)
-    if hit < 0 { return false }
-    let saved = diag_source_file
-    diag_source_file = diag_file_for_node(node)
-    diag_error_at(
-        "ArenaClosureUnsupportedCapture", ARENA_CLOSURE_UNSUPPORTED_CAP,
-        "a closure leaving `with arena \{ }` captures `{name}` of type `{tc_type_str(tc_resolve(tid))}`, and arena promotion cannot copy a `{tc_type_str(hit)}`",
-        node,
-        "build the closure outside the `with arena \{ }` block"
-    )
-    diag_source_file = saved
-    true
-}
-
-fn unwalkable_reach(r: Int, done: Map[Int, Int]) -> Int {
-    if r < 0 || done.contains_key(r) { return -1 }
-    done.insert(r, 1)
-    let k = tc_tid_kind(r)
-    if k == TyKind.Handler || k == TyKind.Template || k == TyKind.Raw { return r }
-    if k == TyKind.Fn || k == TyKind.Iterator || k == TyKind.Ptr || k == TyKind.Handle || k == TyKind.Channel || k == TyKind.FfiScope {
-        return -1
-    }
-    if k == TyKind.Struct || k == TyKind.Enum {
-        for f in tc_declared_field_tids(r) {
-            let hit = unwalkable_reach(tc_resolve(tc_member_tid_at_instance(f, r)), done)
-            if hit >= 0 { return hit }
-        }
-        return -1
-    }
-    let mut i = 0
-    while i < tc_tid_child_count(r) {
-        let hit = unwalkable_reach(tc_resolve(tc_tid_child(r, i)), done)
-        if hit >= 0 { return hit }
-        i = i + 1
-    }
-    -1
 }
 
 // Reports the closure-capture escapes recorded in the frame about to close, leaving out

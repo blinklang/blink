@@ -493,6 +493,8 @@ fn seg_at(tid0: Int, tagpos: Int) -> Str {
     }
     if k == TyKind.Tuple { return tuple_tag(t, tagpos) }
     if k == TyKind.Fn && tagpos == TAGPOS_SYMBOL { return fn_tag(t, tagpos) }
+    if k == TyKind.Handler && keeps_elements(tagpos) { return handler_tag(t, tid, tagpos) }
+    if k == TyKind.Template && keeps_elements(tagpos) { return template_tag(t, tagpos) }
     if k == TyKind.Typevar { return "<tv>" }
     // One blink_map* serves every key/value pair, so K and V do not ride the name. They
     // are still walked so an unsolved slot fails closed instead of spelling "map".
@@ -609,6 +611,40 @@ fn fn_tag(t: TypePoolEntry, tagpos: Int) -> Str {
     let ret = fn_child_seg(t.inner1, tagpos)
     if diag_is_ice_seg(ret) { return ret }
     tag.concat("_").concat(ret)
+}
+
+// Each effect's handler is its own C vtable type, so a symbol keeps the effect. The whole
+// name rides it, not the root: Handler[IO.Log] and Handler[IO.Print] are two tids, so two
+// mono instances, and one root would name both. Each dotted part is escaped before the
+// join, so an effect spelled `A_B` and a sub-effect `A.B` stay apart.
+fn handler_tag(t: TypePoolEntry, tid: Int, tagpos: Int) -> Str {
+    let root = effect_root_of(tid)
+    if diag_is_ice_seg(root) { return root }
+    let base = if top_cased(tagpos) { "Handler" } else { "handler" }
+    "{base}_{effect_path_seg(t.name)}"
+}
+
+fn effect_path_seg(name: Str) -> Str {
+    let mut seg = ""
+    for part in name.split(".") {
+        let esc = mono_escape(part)
+        seg = if seg == "" { esc } else { "{seg}_{esc}" }
+    }
+    seg
+}
+
+// One blink_template* serves every context, but Template[DB] and Template[Shell] are two
+// tids, so two mono instances, and a symbol must tell them apart. The spec's contexts are
+// effect names, which resolve to a typevar of that name, so the name is what rides.
+fn template_tag(t: TypePoolEntry, tagpos: Int) -> Str {
+    let base = if top_cased(tagpos) { "Template" } else { "template" }
+    let ctx = tc_resolve(t.inner1)
+    if ctx < 0 || ctx >= ty_pool.len() { return ICE_SEG_TID_OUT_OF_RANGE }
+    let c = ty_pool.get(ctx).unwrap()
+    if c.kind == TyKind.Typevar && c.name != "" { return "{base}_{effect_path_seg(c.name)}" }
+    let inner = seg_at(ctx, child_pos(tagpos))
+    if diag_is_ice_seg(inner) { return inner }
+    "{base}_{inner}"
 }
 
 fn fn_child_seg(tid0: Int, tagpos: Int) -> Str {
@@ -769,6 +805,16 @@ pub fn c_vtable_type_name(handler_tid: Int) -> Str {
     "blink_ue_{root.to_lower()}_vtable"
 }
 
+// The runtime function that promotes a builtin root's vtable. The runtime declares that
+// struct, so it owns the walker too, under the struct. A user root's vtable is emitted by
+// this compiler, which builds its walker instead, so it has no runtime promoter.
+pub fn c_vtable_promoter_name(handler_tid: Int) -> Str {
+    let root = effect_root_of(handler_tid)
+    if diag_is_ice_seg(root) { return root }
+    if !is_builtin_effect_root(root) { return ICE_SEG_UNHANDLED_KIND }
+    "{c_vtable_type_name(handler_tid)}_promote"
+}
+
 // The blink_ev field a handler install writes for a Handler tid. A builtin effect names
 // its own root; a user effect sits behind `ue_`, which is what stops an effect spelled
 // `Io` from taking the builtin `io` slot. Two USER effects whose names differ only in
@@ -812,6 +858,13 @@ pub fn c_effect_vtable_slot_name(handler_tid: Int, op: Str) -> Str {
     if diag_is_ice_seg(root) { return root }
     if is_builtin_effect_root(root) { return op }
     c_field_name(op)
+}
+
+// The vtable member beside a slot that holds the operation's closure, the word its body
+// reads its captures from. The runtime header spells the builtin vtables' members the
+// same way, so this takes the slot as C spells it and adds no escaping of its own.
+pub fn c_vtable_userdata_member(slot: Str) -> Str {
+    "__userdata_{slot}"
 }
 
 // The key-operations table a Map or Set keyed on this tid binds at construction. A
