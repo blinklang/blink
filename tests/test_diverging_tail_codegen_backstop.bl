@@ -1,8 +1,8 @@
 import compile_test_helpers
 
 // decisions/loop-tail-fallthrough.md Q4 (6-0): after a tail the checker accepted as
-// diverging, release codegen emits __builtin_unreachable() and a debug build emits a
-// loud ICE instead. Never a release runtime panic — that would resurrect the rejected
+// diverging, release codegen emits __builtin_unreachable() and a debug build first
+// fails with a loud, labelled ICE. Never a release runtime panic — that would resurrect the rejected
 // accept-and-fabricate answer through the back door. The panel's standing concern is
 // that the debug backstop be real and exercised, not nominal, because
 // __builtin_unreachable() turns an analysis bug into undefined behaviour in release.
@@ -11,14 +11,58 @@ fn diverging_tail_src() -> Str {
     "fn serve(stop_at: Int) -> Int \{\n    let mut n = 0\n    loop \{\n        n = n + 1\n        if n == stop_at \{ return n }\n    }\n}\nfn main() \{ io.println(\"\{serve(4)}\") }\n"
 }
 
+// The statement lines of `name`'s C definition. The whole file is no witness: an overflow
+// guard anywhere, this function's own included, is followed by the same marker. A line at
+// the body's own indent is a statement of the body, not of a block nested in it.
+fn fn_body_lines(c: Str, name: Str) -> List[Str] {
+    let head = "blink_u_{name}("
+    let mut out: List[Str] = []
+    let mut inside = false
+    for line in c.split("\n") {
+        if inside {
+            if line == "}" { return out }
+            out.push(line)
+        } else if line.contains(head) && line.ends_with(") \{") {
+            inside = true
+        }
+    }
+    out
+}
+
+fn body_statements(c: Str, name: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in fn_body_lines(c, name) {
+        if line.starts_with("    ") && !line.starts_with("     ") && !line.starts_with("    }") { out.push(line) }
+    }
+    out
+}
+
+// The last `n` statements of the body, joined, so a row reads the tail in order.
+fn tail_statements(c: Str, name: Str, n: Int) -> Str {
+    let stmts = body_statements(c, name)
+    let from = if stmts.len() > n { stmts.len() - n } else { 0 }
+    let mut out = ""
+    let mut i = from
+    while i < stmts.len() {
+        out = "{out}{stmts.get(i).unwrap().trim()}\n"
+        i = i + 1
+    }
+    out
+}
+
+fn marks_body(c: Str, name: Str) -> Bool {
+    body_statements(c, name).contains("    __builtin_unreachable();")
+}
+
 test "release codegen marks an accepted diverging tail unreachable" {
     let c = compile_test_helpers.compile_and_emit_c(diverging_tail_src(), "divtail_release_c")
-    compile_test_helpers.expect_contains(c, "__builtin_unreachable()", "release emits the unreachable marker")
+    assert_eq(tail_statements(c, "serve", 1), "__builtin_unreachable();\n")
 }
 
 test "release codegen does not turn a diverging tail into a runtime panic" {
     let c = compile_test_helpers.compile_and_emit_c(diverging_tail_src(), "divtail_no_panic_c")
-    let has_ice = c.contains("BLINK_ICE_DIVERGING_TAIL")
+    assert_eq(fn_body_lines(c, "serve").len() > 0, true)
+    let has_ice = fn_body_lines(c, "serve").join("\n").contains("BLINK_ICE_DIVERGING_TAIL")
     assert_eq(has_ice, false)
 }
 
@@ -27,14 +71,16 @@ test "release codegen does not turn a diverging tail into a runtime panic" {
 test "a Void fn with a while tail gets no unreachable marker" {
     let src = "fn f(n: Int) -> Void \{\n    let mut i = n\n    while i > 0 \{ i = i - 1 }\n}\nfn main() \{ f(2) }\n"
     let c = compile_test_helpers.compile_and_emit_c(src, "divtail_void_while_c")
-    let marked = c.contains("__builtin_unreachable()")
+    assert_eq(fn_body_lines(c, "f").len() > 0, true)
+    let marked = marks_body(c, "f")
     assert_eq(marked, false)
 }
 
 test "a Void fn with a for tail gets no unreachable marker" {
     let src = "fn f(xs: List[Int]) -> Void \{\n    for x in xs \{ io.println(\"\{x}\") }\n}\nfn main() \{ f([1]) }\n"
     let c = compile_test_helpers.compile_and_emit_c(src, "divtail_void_for_c")
-    let marked = c.contains("__builtin_unreachable()")
+    assert_eq(fn_body_lines(c, "f").len() > 0, true)
+    let marked = marks_body(c, "f")
     assert_eq(marked, false)
 }
 
@@ -44,11 +90,14 @@ test "a diverging tail still runs correctly in a release build" {
     compile_test_helpers.expect_contains(r.out, "4", "release build returns the value the loop returned")
 }
 
-test "a debug build emits the ICE backstop instead of the unreachable marker" {
+// The runtime's failure call is not declared noreturn, so the marker still follows it: a
+// value fn must not fall off its end in C.
+test "a debug build emits the ICE backstop before the unreachable marker" {
     let c = compile_test_helpers.emit_c_via_cli(diverging_tail_src(), "divtail_debug_c", "--debug")
-    compile_test_helpers.expect_contains(c, "BLINK_ICE_DIVERGING_TAIL", "debug emits the labelled ICE")
-    let bare = c.contains("__builtin_unreachable()")
-    assert_eq(bare, false)
+    let tail = tail_statements(c, "serve", 2)
+    compile_test_helpers.expect_contains(tail, "\"BLINK_ICE_DIVERGING_TAIL\"", "debug emits the labelled ICE")
+    compile_test_helpers.expect_contains(tail, "__blink_debug_assert_fail(", "the label reaches the runtime's failure call")
+    assert_eq(tail.ends_with(");\n__builtin_unreachable();\n"), true)
 }
 
 test "a diverging tail still runs correctly in a debug build" {
@@ -64,11 +113,11 @@ test "a diverging tail still runs correctly in a debug build" {
 test "an if whose arms all return also gets the unreachable marker" {
     let src = "fn f(n: Int) -> Int \{\n    if n > 0 \{ return 1 } else \{ return 2 }\n}\nfn main() \{ io.println(\"\{f(1)}\") }\n"
     let c = compile_test_helpers.compile_and_emit_c(src, "divtail_if_arms_c")
-    compile_test_helpers.expect_contains(c, "__builtin_unreachable()", "an all-diverging if tail is marked unreachable")
+    assert_eq(tail_statements(c, "f", 1), "__builtin_unreachable();\n")
 }
 
 test "a match whose arms all return also gets the unreachable marker" {
     let src = "fn f(n: Int) -> Int \{\n    match n \{\n        0 => \{ return 10 }\n        _ => \{ return 20 }\n    }\n}\nfn main() \{ io.println(\"\{f(0)}\") }\n"
     let c = compile_test_helpers.compile_and_emit_c(src, "divtail_match_arms_c")
-    compile_test_helpers.expect_contains(c, "__builtin_unreachable()", "an all-diverging match tail is marked unreachable")
+    assert_eq(tail_statements(c, "f", 1), "__builtin_unreachable();\n")
 }
