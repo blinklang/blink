@@ -4,6 +4,7 @@
 // @verify: 3b.1 checks it at every boundary the solver cannot, which today is every boundary.
 
 import compile_test_helpers
+import diagnostics.{diag_explain, CONTRACT_UNVERIFIABLE}
 
 // ── @requires ─────────────────────────────────────────────────────────
 
@@ -63,7 +64,7 @@ test "an old() snapshot is taken at entry, before the body changes what it reads
     assert(r.exit_code == 0)
 }
 
-// ── trust, bad values, and no @verify ─────────────────────────────────
+// ── trust and bad values ──────────────────────────────────────────────
 
 test "a trust-fallback contract emits no check and lets a violating call run" {
     let src = "@requires(x > 0)\n@ensures(result > 100)\n@verify(fallback: \"trust\")\nfn tr_any(x: Int) -> Int \{ x }\nfn main() \{ tr_any(0) }\n"
@@ -86,14 +87,71 @@ test "@verify on a function with no contract is accepted" {
     assert(r.exit_code == 0)
 }
 
-// Spec 3b.4 makes this a compile error, and a later step emits it. Until then an
-// unannotated contract compiles and emits no check.
-test "a contract with no @verify compiles and emits no check" {
+// ── no @verify: V0003 ─────────────────────────────────────────────────
+
+test "a contract with no @verify is refused with V0003" {
     let src = "@requires(x > 0)\nfn un_req(x: Int) -> Int \{ x }\nfn main() \{ un_req(0) }\n"
-    let c = compile_test_helpers.compile_and_emit_c(src, "_crf_unannotated_c")
+    let out = compile_test_helpers.compile_and_capture(src, "_crf_unannotated")
+    assert(out.contains("V0003"), "got: {out}")
+    assert(out.contains("ContractUnverifiable"), "got: {out}")
+    assert(out.contains("Simplify the contract predicate"), "got: {out}")
+    assert(out.contains("to insert a runtime check"), "got: {out}")
+    assert(out.contains("to accept without verification"), "got: {out}")
+}
+
+test "an @ensures with no @verify is refused with V0003" {
+    let src = "@ensures(result >= 0)\nfn un_ens(x: Int) -> Int \{ x }\nfn main() \{ un_ens(1) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_crf_unannotated_ens")
+    assert(out.contains("V0003"), "got: {out}")
+}
+
+test "each contract with no @verify gets its own V0003" {
+    let src = "@requires(x > 0)\n@ensures(result > 0)\nfn un_two(x: Int) -> Int \{ x }\nfn main() \{ un_two(1) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_crf_unannotated_two")
+    assert_eq(out.split("V0003").len() - 1, 2)
+}
+
+test "a predicate already refused as undecidable gets no V0003" {
+    let src = "@requires(result > 0)\nfn un_bad(x: Int) -> Int \{ x }\nfn main() \{ un_bad(1) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_crf_unannotated_rejected")
+    assert(out.contains("E1304"), "got: {out}")
+    assert(!out.contains("V0003"), "got: {out}")
+}
+
+test "a contract on an @ffi fn gets E0803 and no V0003" {
+    let src = "@ffi(\"strlen\")\n@trusted(audit: \"TEST-CONTRACT-RUNTIME-FALLBACK\")\n@requires(true)\nfn c_strlen(s: Ptr[U8]) -> Int ! FFI \{ }\nfn main() \{ }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_crf_unannotated_ffi")
+    assert(out.contains("E0803"), "got: {out}")
+    assert(!out.contains("V0003"), "got: {out}")
+}
+
+test "the V0003 explainer names both fallbacks" {
+    let text = diag_explain(CONTRACT_UNVERIFIABLE)
+    assert(text.contains("ContractUnverifiable"), "got: {text}")
+    assert(text.contains("@verify(fallback: \"runtime\")"), "got: {text}")
+    assert(text.contains("@verify(fallback: \"trust\")"), "got: {text}")
+}
+
+// ── impl methods ──────────────────────────────────────────────────────
+
+test "an impl method contract with no @verify is refused with V0003" {
+    let src = "type Ctr \{ n: Int }\nimpl Ctr \{\n    @requires(x > 0)\n    fn bump(self, x: Int) -> Int \{ self.n + x }\n}\nfn main() \{ let _ = Ctr \{ n: 1 }.bump(1) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_crf_impl_unannotated")
+    assert(out.contains("V0003"), "got: {out}")
+}
+
+test "an impl method with a trust fallback compiles and emits no check" {
+    let src = "type Ctr \{ n: Int }\nimpl Ctr \{\n    @requires(x > 0)\n    @verify(fallback: \"trust\")\n    fn bump(self, x: Int) -> Int \{ self.n + x }\n}\nfn main() \{\n    assert(Ctr \{ n: 1 }.bump(0) == 1)\n}\n"
+    let c = compile_test_helpers.compile_and_emit_c(src, "_crf_impl_trust_c")
     assert(!c.contains("precondition failed"))
-    let r = compile_test_helpers.compile_and_run(src, "_crf_unannotated_run")
-    assert(r.exit_code == 0)
+    let r = compile_test_helpers.compile_and_run(src, "_crf_impl_trust_run")
+    assert(r.exit_code == 0, "got: {r.out}{r.err_out}")
+}
+
+test "a runtime fallback on an impl method reports its stage is not built" {
+    let src = "type Ctr \{ n: Int }\nimpl Ctr \{\n    @requires(x > 0)\n    @verify(fallback: \"runtime\")\n    fn bump(self, x: Int) -> Int \{ self.n + x }\n}\nfn main() \{ let _ = Ctr \{ n: 1 }.bump(1) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_crf_impl_runtime")
+    assert(out.contains("I0004"), "got: {out}")
 }
 
 // ── @where at the param and return boundaries ─────────────────────────

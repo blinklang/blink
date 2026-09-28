@@ -48,7 +48,7 @@ import diagnostics.{
     IMPURE_CALL_IN_PREDICATE, LOOP_IN_PREDICATE,
     RESULT_OUTSIDE_ENSURES, OLD_OUTSIDE_ENSURES,
     ASSIGNMENT_IN_PREDICATE, IMPURE_BODY_FOR_PURE_ANNOTATION,
-    MODIFIES_ARG_NOT_SIMPLE_PATH,
+    MODIFIES_ARG_NOT_SIMPLE_PATH, CONTRACT_UNVERIFIABLE,
     MAP_KEY_NOT_HASHABLE,
     NON_DERIVABLE_TRAIT,
     DERIVE_DEBUG_FIELD_NO_DEBUG, STR_PLUS_UNSUPPORTED,
@@ -9702,6 +9702,30 @@ fn validate_verify_fallback(fn_node: Int) ! Diag.Report {
     diag_error_at("UnexpectedAnnotation", UNEXPECTED_ANNOTATION, "@verify fallback must be \"runtime\" or \"trust\", got \"{fb}\"", ann, "write @verify(fallback: \"runtime\") to check the contract at runtime, or @verify(fallback: \"trust\") to accept it unchecked")
 }
 
+// sections/03b_contracts.md 3b.4: a contract the solver can neither prove nor disprove does not
+// compile without a @verify fallback. With no solver every contract is in that state. Each
+// contract has its own outcome, so each gets its own error.
+fn tc_check_contract_verifiable(fn_node: Int) ! Diag.Report {
+    if has_annotation(fn_node, "verify") != 0 { return }
+    // E0803 already asks for the contract to go, and a @verify would not help.
+    if has_annotation(fn_node, "ffi") != 0 { return }
+    let anns_sl = node_handlers(fn_node)
+    if anns_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(anns_sl) {
+        let ann = sublist_get(anns_sl, i)
+        let nm = node_name(ann)
+        let args_sl = if nm == "requires" || nm == "ensures" { node_args(ann) } else { -1 }
+        // A predicate outside the decidable subset already has its own error and repair.
+        if args_sl != -1 && sublist_length(args_sl) > 0 && !pv_rejected_preds.contains_key(sublist_get(args_sl, 0)) {
+            diag_error_at_notes("ContractUnverifiable", CONTRACT_UNVERIFIABLE, "contract unverifiable", ann,
+                "options:\n1. Simplify the contract predicate\n2. Add @verify(fallback: \"runtime\") to insert a runtime check\n3. Add @verify(fallback: \"trust\") to accept without verification",
+                ["the SMT solver could not prove or disprove this contract"])
+        }
+        i = i + 1
+    }
+}
+
 fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
     let name = node_name(fn_node)
     let ffi_node = get_annotation(fn_node, "ffi")
@@ -10939,6 +10963,21 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
         let mut i = 0
         while i < sublist_length(fns_sl) {
             pv_validate_fn_contracts(sublist_get(fns_sl, i))
+            tc_check_contract_verifiable(sublist_get(fns_sl, i))
+            i = i + 1
+        }
+    }
+    let contract_impls_sl = node_methods(program)
+    if contract_impls_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(contract_impls_sl) {
+            let methods_sl = node_methods(sublist_get(contract_impls_sl, i))
+            let mut j = 0
+            while methods_sl != -1 && j < sublist_length(methods_sl) {
+                validate_verify_fallback(sublist_get(methods_sl, j))
+                tc_check_contract_verifiable(sublist_get(methods_sl, j))
+                j = j + 1
+            }
             i = i + 1
         }
     }

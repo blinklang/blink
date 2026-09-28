@@ -23,7 +23,7 @@ error[NonExhaustiveMatch]: non-exhaustive match
 ## Conventions
 
 - **Names** are PascalCase, stable API. Once published, a name is frozen — never renamed, never reassigned.
-- **Codes** are secondary comblink identifiers (E/W + 4 digits). Codes are never reused after retirement.
+- **Codes** are secondary comblink identifiers (E/W/V + 4 digits). Codes are never reused after retirement.
 - **Suppression** uses names: `@allow(NonExhaustiveMatch)`.
 - **`blink explain <name>`** prints a detailed explanation (future — not yet implemented).
 - **Every entry in this catalog is bound by the three rules in §3.1 *Diagnostic Discipline*:** a diagnostic never prescribes a repair that does not exist, no rule is enforced only at codegen, and diagnostics firing at one program point must converge on a repair the first `help:` names.
@@ -46,6 +46,7 @@ error[NonExhaustiveMatch]: non-exhaustive match
 | E10xx | Module resolution / imports |
 | E13xx | Refinement contracts (predicate sublanguage) |
 | E14xx | Generic collections / Hash + Eq bounds |
+| V00xx | Contract verification outcomes |
 | I00xx | Internal compiler errors (ICE) |
 
 ---
@@ -183,6 +184,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | ModifiesArgNotSimplePath | E1308 | `@modifies` argument is not a simple path | Refinement contracts | §3b |
 | MapKeyNotHashable | E1400 | `Map` key / `Set` element type does not implement `Hash` (Float, container, `Bytes`/`StringBuilder`, `fn`, or non-derived user type) | Generic collections | §3.6 |
 | NonDerivableTrait | E1401 | A `@derive(Hash/Eq/Ord)` field's type does not implement the derived trait | Generic collections | §3.6 |
+| ContractUnverifiable | V0003 | The solver can neither prove nor disprove a `@requires`/`@ensures`, and the fn has no `@verify(fallback: ...)` | Contract verification | §3b.4 |
 
 ---
 
@@ -231,5 +233,6 @@ The self-hosting compiler (`src/codegen_types.bl`, `src/codegen_expr.bl`) curren
 | E0507 | UnknownType | `typecheck.bl` — name resolution |
 | W0501 | UnknownMethod | `typecheck.bl` — name resolution records the call, inference reports it (soft class only: the receiver's type is a bare typevar or unresolved at the call; a KNOWN receiver type is E0505 instead) |
 | E1004 | VersionConflict | `compiler.bl` — lockfile version conflict validation in `ensure_lockfile_loaded()` |
+| V0003 | ContractUnverifiable | `typecheck.bl` — `tc_check_contract_verifiable`, one error per contract. With no solver, every contract without `@verify` gets it |
 | E1008 | InvalidModuleAnnotation | `compiler.bl` — @module annotation validation in `load_module()` |
 | E1052 | PackageNotDeclared | `compiler.bl` — Tier 2 stdlib import without blink.toml dependency |

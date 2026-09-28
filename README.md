@@ -136,6 +136,7 @@ No exceptions. No null. `Result[T, E]` for errors, `Option[T]` for absence.
 ```blink
 @requires(amount > 0)
 @ensures(result.is_ok() => result.unwrap().balance == old(acct.balance) + amount)
+@verify(fallback: "runtime")
 pub fn deposit(acct: Account, amount: Int) -> Result[Account, AccountError] {
     if amount <= 0 {
         return Err(AccountError.InvalidAmount)
@@ -144,7 +145,7 @@ pub fn deposit(acct: Account, amount: Int) -> Result[Account, AccountError] {
 }
 ```
 
-`@requires` is a precondition. `@ensures` is a postcondition. The compiler attempts to prove them via SMT solver — proven means zero cost, disproven means compile error with counterexample, unknown means a runtime check is inserted.
+`@requires` is a precondition. `@ensures` is a postcondition. The compiler attempts to prove them via SMT solver — proven means zero cost, disproven means compile error with counterexample. Unknown is error `V0003` unless the function has `@verify(fallback: "runtime")` (insert a runtime check) or `@verify(fallback: "trust")` (accept without a check). No solver ships yet, so today every contract is unknown.
 
 ### Traits
 
@@ -221,6 +222,7 @@ First-class. No test framework to import. Just `test "name" { ... }`.
 /// Move money from one account to another atomically
 @src(req: "BANK-004")
 @requires(amount > 0)
+@verify(fallback: "runtime")
 pub fn transfer(amount: Int, -- from: Account, to: Account) -> Result[(Account, Account), AccountError] {
     let updated_from = withdraw(from, amount)?
     let updated_to = deposit(to, amount)?
