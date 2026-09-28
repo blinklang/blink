@@ -1,0 +1,77 @@
+// A trait or impl body holds only methods, associated types and annotations. Any other token
+// there is E1100 rather than skipped, so text the parser does not understand never compiles
+// as if it were not written. sections/03_types.md 3.6 makes `final` a modifier on trait
+// default methods only: in a trait it is valid but not built yet, so it gets its own message;
+// in an impl it is an ordinary stray token.
+
+import compile_test_helpers
+
+fn count_of(output: Str, needle: Str) -> Int {
+    output.split(needle).len() - 1
+}
+
+// Exactly one diagnostic is an error, it is E1100, and it points at `line`:`col`.
+fn expect_one_e1100_at(output: Str, line: Int, col: Int) {
+    assert_eq(count_of(output, "\"severity\":\"error\""), 1, "got: {output}")
+    assert_eq(count_of(output, "\"code\":\"E1100\""), 1, "got: {output}")
+    assert(output.contains("\"line\":{line},\"col\":{col}"), "got: {output}")
+}
+
+test "stray words in a trait body are E1100" {
+    let src = "trait Grow \{\n    this is complete garbage 42\n    fn grow(self) -> Int\n}\nfn main() \{}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_bst_trait_words")
+    expect_one_e1100_at(out, 2, 5)
+    assert(out.contains("in trait `Grow`"), "got: {out}")
+}
+
+test "stray words in an impl body are E1100" {
+    let src = "trait Measure \{\n    fn size(self) -> Int\n}\ntype A \{ v: Int }\nimpl Measure for A \{\n    this is garbage 42\n    fn size(self) -> Int \{ self.v }\n}\nfn main() \{\n    io.println(\"\{A \{ v: 3 }.size()}\")\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_bst_impl_words")
+    expect_one_e1100_at(out, 6, 5)
+    assert(out.contains("in impl `Measure for A`"), "got: {out}")
+}
+
+// The method after the bad line must still register, or the impl would also get E0900.
+test "a let in a trait body is E1100 and the next method still registers" {
+    let src = "trait Grow \{\n    let x = 1\n    fn grow(self) -> Int\n}\ntype A \{ v: Int }\nimpl Grow for A \{\n    fn grow(self) -> Int \{ self.v }\n}\nfn main() \{\n    io.println(\"\{A \{ v: 3 }.grow()}\")\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_bst_trait_let")
+    expect_one_e1100_at(out, 2, 5)
+}
+
+test "pub before a trait method is E1100" {
+    let src = "trait Grow \{\n    pub fn grow(self) -> Int\n}\nfn main() \{}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_bst_trait_pub")
+    expect_one_e1100_at(out, 2, 5)
+    assert(out.contains("unexpected `pub`"), "got: {out}")
+}
+
+test "final on a trait default method is reported as not implemented" {
+    let src = "trait Same \{\n    fn same(self, other: Self) -> Bool\n    final fn differ(self, other: Self) -> Bool \{\n        !self.same(other)\n    }\n}\nfn main() \{}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_bst_trait_final")
+    expect_one_e1100_at(out, 3, 5)
+    assert(out.contains("`final` is not implemented yet"), "got: {out}")
+}
+
+test "final in an impl body is an ordinary stray token" {
+    let src = "trait Measure \{\n    fn size(self) -> Int\n}\ntype A \{ v: Int }\nimpl Measure for A \{\n    final fn size(self) -> Int \{ self.v }\n}\nfn main() \{\n    io.println(\"\{A \{ v: 3 }.size()}\")\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_bst_impl_final")
+    expect_one_e1100_at(out, 6, 5)
+    assert(out.contains("in impl `Measure for A`"), "got: {out}")
+    assert(!out.contains("not implemented"), "got: {out}")
+}
+
+test "each bad line in a trait body is one error and parsing continues after them" {
+    let src = "trait Grow \{\n    junk one\n    junk two 2\n    fn grow(self) -> Int\n}\ntype A \{ v: Int }\nimpl Grow for A \{\n    fn grow(self) -> Int \{ self.v }\n}\nfn main() \{\n    io.println(\"\{A \{ v: 3 }.grow()}\")\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_bst_trait_two_lines")
+    assert_eq(count_of(out, "\"severity\":\"error\""), 2, "got: {out}")
+    assert_eq(count_of(out, "\"code\":\"E1100\""), 2, "got: {out}")
+    assert(out.contains("\"line\":2,\"col\":5"), "got: {out}")
+    assert(out.contains("\"line\":3,\"col\":5"), "got: {out}")
+}
+
+test "a trait and impl with methods, an associated type and annotations still compile and run" {
+    let src = "trait Measure \{\n    type Out\n    fn size(self) -> Int\n}\ntype A \{ v: Int }\nimpl Measure for A \{\n    type Out = Int\n    @requires(self.v > 0)\n    @verify(fallback: \"runtime\")\n    fn size(self) -> Int \{ self.v }\n}\nfn main() \{\n    io.println(\"\{A \{ v: 3 }.size()}\")\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "_bst_clean")
+    assert(r.exit_code == 0, "got: {r.out}{r.err_out}")
+    assert(r.out.contains("3"), "got: {r.out}")
+}
