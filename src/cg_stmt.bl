@@ -626,6 +626,10 @@ fn lower_jump(node: Int, jump: Int) -> Int {
 
 // How a produced value leaves the block that produced it.
 fn tail_wrap(node: Int, value: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
+    // A Never tail has no value to return or store: its C shape is a `void` call.
+    if tail != TAIL_DISCARD && leaves_by_type(node) && !cg_expr_is_registered(node) {
+        return left_block(node, ir_expr_stmt(node, value))
+    }
     if tail == TAIL_RETURN { return cg_stmt_return_value(node, value) }
     if tail == TAIL_ASSIGN {
         // A genuinely Void-typed tail (a bare call whose C shape is `void`, most often a
@@ -1409,6 +1413,15 @@ fn bind_unit_let(node: Int, tid: Int, init: Int, rec: LayoutRecord, name: Str, d
     bind_and_declare_let(node, tid, rec, name, unit, discard)
 }
 
+// The initializer leaves the block before the binding holds anything, so the name is
+// declared with no value. It is still declared, because code after it must compile.
+fn bind_never_let(node: Int, tid: Int, init: Int, rec: LayoutRecord, name: Str, discard: Bool) -> Int ! Diag.Report {
+    let ran = lower_stmt_tail(init, TAIL_DISCARD, "", -1)
+    if ran < 0 { return -1 }
+    cg_expr_push_pending(node, left_block(init, ran))
+    bind_and_declare_let(node, tid, rec, name, -1, discard)
+}
+
 fn lower_let(node: Int) -> Int ! Diag.Report {
     // A discarding binder mints its own WildcardPattern node into the elements slot, so it
     // must be told apart from a real tuple pattern before the elements-slot dispatch below,
@@ -1424,8 +1437,9 @@ fn lower_let(node: Int) -> Int ! Diag.Report {
     if init < 0 {
         return bind_and_declare_let(node, tid, rec, name, -1, discard)
     }
-    if tc_tid_kind(tid) == TyKind.Void {
-        if !cg_expr_is_registered(init) { return bind_unit_let(node, tid, init, rec, name, discard) }
+    if !cg_expr_is_registered(init) {
+        if leaves_by_type(init) { return bind_never_let(node, tid, init, rec, name, discard) }
+        if tc_tid_kind(tid) == TyKind.Void { return bind_unit_let(node, tid, init, rec, name, discard) }
     }
     // The initializer is lowered before the name binds, so `let x = x + 1` reads the
     // outer `x` the source names rather than the one this statement is declaring.
@@ -2038,7 +2052,7 @@ fn materialise_value_expr(node: Int) -> Bool ! Diag.Report {
     if !tail_fills(node) {
         diag_ice_at("ValuePositionArmFillsNothing", CODEGEN_STAGE_NOT_BUILT,
             "the tail of this {node_kind_name(node_kind(node))} in value position neither produces a value nor leaves the block", node,
-            "every arm must end in a value, a return, a break or a continue; an arm ending in a let or a loop has no lowering yet")
+            "every arm must end in a value or leave the block; an arm of type Never leaves it, and typecheck refuses any other arm with no value")
         return false
     }
     let rec = layout_at(tid, Position.Local, node)
@@ -2093,15 +2107,16 @@ fn body_fills(body: Int) -> Bool ! Diag.Report {
 
 // Whether the last statement of an arm hands its value to the tail mode. The arms answer
 // the same question lower_stmt_tail does: the shapes that reach tail_wrap produce a value,
-// the shapes that jump leave the block, and the rest fall off the end writing nothing.
+// the shapes that jump leave the block, and a statement of type Never leaves it too. The
+// rest fall off the end writing nothing.
 fn tail_fills(s: Int) -> Bool ! Diag.Report {
     match nk_of(node_kind(s)) {
-        NodeKind.LetBinding => false
-        NodeKind.Assignment => false
-        NodeKind.CompoundAssign => false
-        NodeKind.WhileLoop => false
-        NodeKind.LoopExpr => false
-        NodeKind.ForIn => false
+        NodeKind.LetBinding => leaves_by_type(s)
+        NodeKind.Assignment => leaves_by_type(s)
+        NodeKind.CompoundAssign => leaves_by_type(s)
+        NodeKind.WhileLoop => leaves_by_type(s)
+        NodeKind.LoopExpr => leaves_by_type(s)
+        NodeKind.ForIn => leaves_by_type(s)
         NodeKind.Return => true
         NodeKind.Break => true
         NodeKind.Continue => true
@@ -2113,6 +2128,19 @@ fn tail_fills(s: Int) -> Bool ! Diag.Report {
         NodeKind.AsyncScope => body_fills(node_body(s))
         _ => true
     }
+}
+
+// Never has no value, so a node of that type never finishes: whatever it is, control
+// leaves the block through it.
+fn leaves_by_type(node: Int) -> Bool ! Diag.Report {
+    let tid = stmt_tid(node)
+    tid >= 0 && tc_tid_kind(tid) == TyKind.Never
+}
+
+// A statement that leaves the block, followed by the marker that tells C control stops
+// there. Every seam that drops a Never value's slot shares this one spelling of it.
+fn left_block(node: Int, ran: Int) -> Int {
+    ir_block(node, [ran, ir_unreachable(node)])
 }
 
 // ── If ────────────────────────────────────────────────────────────────────
