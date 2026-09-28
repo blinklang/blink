@@ -108,6 +108,8 @@ Three annotation forms:
 - `@ensures(predicate)` -- postcondition: what must be true after the function returns
 - `@invariant(predicate)` -- type invariant: what must always be true about a type's state
 
+Contracts attach to functions and to methods in `impl` blocks. A `@requires`, `@ensures` or `@verify` on a trait method declaration is a compile error (E1110); contracts on trait methods are not yet specified.
+
 #### Preconditions with `@requires`
 
 ```blink

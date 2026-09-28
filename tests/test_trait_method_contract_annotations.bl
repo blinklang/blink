@@ -1,0 +1,63 @@
+// sections/03b_contracts.md 3b.2: contracts attach to functions and to methods in impl
+// blocks. The spec does not yet define a contract on a trait method declaration, so
+// @requires, @ensures or @verify there is E1110, one error per annotation. The parser must
+// keep these annotations: a dropped one would compile as if it were never written.
+
+import compile_test_helpers
+
+fn count_of(output: Str, needle: Str) -> Int {
+    output.split(needle).len() - 1
+}
+
+// Exactly one diagnostic is an error, it is E1110, and it points at `line`.
+fn expect_one_e1110_at(output: Str, line: Int) {
+    assert_eq(count_of(output, "\"severity\":\"error\""), 1, "got: {output}")
+    assert_eq(count_of(output, "\"code\":\"E1110\""), 1, "got: {output}")
+    assert(output.contains("\"line\":{line},"), "got: {output}")
+}
+
+test "@requires on a required trait method is E1110" {
+    let src = "trait Grow \{\n    @requires(x > 0)\n    fn grow(self, x: Int) -> Int\n}\nfn main() \{}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_tmc_requires")
+    expect_one_e1110_at(out, 2)
+}
+
+test "@ensures naming result on a trait method is E1110 and nothing else" {
+    let src = "trait Grow \{\n    @ensures(result > 0)\n    fn grow(self, x: Int) -> Int\n}\nfn main() \{}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_tmc_ensures")
+    expect_one_e1110_at(out, 2)
+}
+
+test "@verify alone on a trait method is E1110" {
+    let src = "trait Grow \{\n    @verify(fallback: \"runtime\")\n    fn grow(self, x: Int) -> Int\n}\nfn main() \{}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_tmc_verify")
+    expect_one_e1110_at(out, 2)
+}
+
+test "each contract annotation on a trait default method is its own E1110" {
+    let src = "trait Grow \{\n    @requires(x > 0)\n    @verify(fallback: \"runtime\")\n    fn grow(self, x: Int) -> Int \{ x }\n}\nfn main() \{}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_tmc_default")
+    assert_eq(count_of(out, "\"severity\":\"error\""), 2, "got: {out}")
+    assert_eq(count_of(out, "\"code\":\"E1110\""), 2, "got: {out}")
+}
+
+test "a contract on the impl method is still checked at runtime" {
+    let src = "trait Grow \{\n    fn grow(self, x: Int) -> Int\n}\ntype Ctr \{ n: Int }\nimpl Grow for Ctr \{\n    @requires(x > 0)\n    @verify(fallback: \"runtime\")\n    fn grow(self, x: Int) -> Int \{ self.n + x }\n}\nfn main() \{\n    let c = Ctr \{ n: 1 }\n    io.println(\"\{c.grow(0)}\")\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "_tmc_impl_runs")
+    assert(r.exit_code != 0, "got: {r.out}{r.err_out}")
+    assert(r.err_out.contains("precondition failed"), "got: {r.err_out}")
+}
+
+test "an annotation on one trait method does not reach the next" {
+    let src = "trait Grow \{\n    @requires(x > 0)\n    fn grow(self, x: Int) -> Int\n    fn shrink(self, x: Int) -> Int\n}\nfn main() \{}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_tmc_next_method")
+    expect_one_e1110_at(out, 2)
+}
+
+// `q` exists only in the trait method, so an annotation that leaked onto `top` would also
+// fail name resolution there.
+test "an annotation left after the last trait method is E1110, not dropped or moved on" {
+    let src = "trait Grow \{\n    fn grow(self, q: Int) -> Int\n    @ensures(q > 0)\n}\n@requires(x > 0)\n@verify(fallback: \"runtime\")\nfn top(x: Int) -> Int \{ x }\nfn main() \{\n    io.println(\"\{top(1)}\")\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_tmc_dangling")
+    expect_one_e1110_at(out, 3)
+}
