@@ -1,0 +1,72 @@
+// sections/03b_contracts.md: an impl method is a function, so its own @requires and @ensures
+// are held to the same decidable subset (3b.2) and lower to the same runtime checks under
+// `@verify(fallback: "runtime")` (3b.4) as a top-level function's.
+
+import compile_test_helpers
+import diagnostics.{OLD_OUTSIDE_ENSURES, RESULT_OUTSIDE_ENSURES}
+
+fn bump_src(anns: Str, body: Str, main_body: Str) -> Str {
+    "type Ctr \{ n: Int }\ntrait Bump \{\n    fn bump(self, x: Int) -> Int\n}\nimpl Bump for Ctr \{\n{anns}    fn bump(self, x: Int) -> Int \{ {body} }\n}\nfn main() \{\n{main_body}\n}\n"
+}
+
+// ── runtime checks ────────────────────────────────────────────────────
+
+test "a runtime-fallback @requires on an impl method aborts on a violating argument" {
+    let src = bump_src("    @requires(x > 0)\n    @verify(fallback: \"runtime\")\n", "self.n + x", "    let _ = Ctr \{ n: 1 }.bump(0)")
+    let r = compile_test_helpers.compile_and_run(src, "_imc_req_bad")
+    assert(r.exit_code != 0, "got: {r.out}{r.err_out}")
+    assert(r.err_out.contains("precondition failed"), "got: {r.err_out}")
+}
+
+test "a runtime-fallback @requires on an impl method lets a satisfying argument through" {
+    let src = bump_src("    @requires(x > 0)\n    @verify(fallback: \"runtime\")\n", "self.n + x", "    assert(Ctr \{ n: 1 }.bump(2) == 3)")
+    let r = compile_test_helpers.compile_and_run(src, "_imc_req_ok")
+    assert(r.exit_code == 0, "got: {r.out}{r.err_out}")
+}
+
+test "a runtime-fallback @ensures on an impl method reads result and self" {
+    let src = bump_src("    @ensures(result > self.n)\n    @verify(fallback: \"runtime\")\n", "self.n + x", "    assert(Ctr \{ n: 1 }.bump(1) == 2)\n    let _ = Ctr \{ n: 1 }.bump(0)")
+    let r = compile_test_helpers.compile_and_run(src, "_imc_ens")
+    assert(r.exit_code != 0, "got: {r.out}{r.err_out}")
+    assert(r.err_out.contains("postcondition failed"), "got: {r.err_out}")
+}
+
+test "an old() snapshot of a self field works in an impl method's @ensures" {
+    let src = bump_src("    @ensures(result == old(self.n) + x)\n    @verify(fallback: \"runtime\")\n", "self.n + x", "    assert(Ctr \{ n: 4 }.bump(3) == 7)")
+    let r = compile_test_helpers.compile_and_run(src, "_imc_old")
+    assert(r.exit_code == 0, "got: {r.out}{r.err_out}")
+}
+
+test "a runtime-fallback @requires on a generic impl method is checked in every instance" {
+    let src = "type Box[T] \{ v: T, n: Int }\ntrait Bump \{\n    fn bump(self, x: Int) -> Int\n}\nimpl[T] Bump for Box[T] \{\n    @requires(x > 0)\n    @verify(fallback: \"runtime\")\n    fn bump(self, x: Int) -> Int \{ self.n + x }\n}\nfn main() \{\n    assert(Box \{ v: \"s\", n: 0 }.bump(1) == 1)\n    let _ = Box \{ v: 5, n: 0 }.bump(0)\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "_imc_generic")
+    assert(r.exit_code != 0, "got: {r.out}{r.err_out}")
+    assert(r.err_out.contains("precondition failed"), "got: {r.err_out}")
+}
+
+test "the check runs when the impl method is called through a trait bound" {
+    let src = "type Ctr \{ n: Int }\ntrait Bump \{\n    fn bump(self, x: Int) -> Int\n}\nimpl Bump for Ctr \{\n    @requires(x > 0)\n    @verify(fallback: \"runtime\")\n    fn bump(self, x: Int) -> Int \{ self.n + x }\n}\nfn go[T: Bump](t: T, x: Int) -> Int \{ t.bump(x) }\nfn main() \{\n    assert(go(Ctr \{ n: 1 }, 1) == 2)\n    let _ = go(Ctr \{ n: 1 }, 0)\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "_imc_bound")
+    assert(r.exit_code != 0, "got: {r.out}{r.err_out}")
+    assert(r.err_out.contains("precondition failed"), "got: {r.err_out}")
+}
+
+test "a trust fallback on an impl method emits no check" {
+    let src = bump_src("    @requires(x > 0)\n    @verify(fallback: \"trust\")\n", "self.n + x", "    assert(Ctr \{ n: 1 }.bump(0) == 1)")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_imc_trust_c")
+    assert(!c.contains("precondition failed"))
+    let r = compile_test_helpers.compile_and_run(src, "_imc_trust_run")
+    assert(r.exit_code == 0, "got: {r.out}{r.err_out}")
+}
+
+// ── the decidable subset ──────────────────────────────────────────────
+
+test "old() inside an impl method's @requires is rejected as on a top-level function" {
+    let src = bump_src("    @requires(old(x) > 0)\n    @verify(fallback: \"trust\")\n", "self.n + x", "    let _ = Ctr \{ n: 1 }.bump(1)")
+    compile_test_helpers.expect_compile_error(src, "_imc_old_req", OLD_OUTSIDE_ENSURES)
+}
+
+test "result inside an impl method's @requires is rejected" {
+    let src = bump_src("    @requires(result > 0)\n    @verify(fallback: \"trust\")\n", "self.n + x", "    let _ = Ctr \{ n: 1 }.bump(1)")
+    compile_test_helpers.expect_compile_error(src, "_imc_result", RESULT_OUTSIDE_ENSURES)
+}
