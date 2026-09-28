@@ -1,7 +1,7 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on, nk_of, nk_is_typed, trace, trace_mode}
 import std.str.{str_to_lower}
 import parser.{
-    ann_str_val, get_annotation, has_annotation, is_literal_string_part,
+    ann_str_val, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
     node_effects, node_elements, node_else_body, node_end, node_fields, node_for_binder, node_guard,
     node_count, node_handlers, node_index, node_int_val, node_is_mut, node_is_const, node_is_pub, node_iterable, node_kind,
@@ -25,7 +25,7 @@ import diagnostics.{
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
     NON_EXHAUSTIVE_MATCH, DUPLICATE_MODULE_BINDING,
     UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT,
-    TYPE_ERROR, TEMPLATE_MISMATCH, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
+    TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
     MUTATION_REQUIRES_MUT,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
@@ -9389,7 +9389,17 @@ fn pv_validate_annotation(ann: Int, in_ensures: Int) ! Diag.Report {
     if sublist_length(args_sl) == 0 { return }
     let pred = sublist_get(args_sl, 0)
     pv_in_old_depth = 0
+    pv_walk_recording(pred, in_ensures)
+}
+
+// Predicates this validator refused. Inference skips them: a misplaced `result` or `old(_)`
+// has already been reported, and typing it again would add an undefined-name error on top.
+let mut pv_rejected_preds: Map[Int, Int] = Map()
+
+fn pv_walk_recording(pred: Int, in_ensures: Int) ! Diag.Report {
+    let before = diag_count
     pv_walk(pred, in_ensures)
+    if diag_count > before { pv_rejected_preds.insert(pred, 1) }
 }
 
 fn pv_validate_fn_contracts(fn_node: Int) ! Diag.Report {
@@ -9431,7 +9441,7 @@ fn pv_validate_modifies(ann: Int) ! Diag.Report {
 fn pv_validate_type_alias(td: Int) ! Diag.Report {
     let where_pred = node_condition(td)
     if where_pred == -1 { return }
-    pv_walk(where_pred, 0)
+    pv_walk_recording(where_pred, 0)
 }
 
 // ── @pure annotation + minimal purity check ─────────────────────────
@@ -9680,6 +9690,16 @@ fn trusted_audit_id(ann: Int) -> Str {
         i = i + 1
     }
     ""
+}
+
+// sections/03b_contracts.md 3b.4 names two fallbacks for a contract the solver cannot decide.
+// Any other value would leave the contract with no defined meaning.
+fn validate_verify_fallback(fn_node: Int) ! Diag.Report {
+    let ann = get_annotation(fn_node, "verify")
+    if ann == -1 { return }
+    let fb = get_str_named_arg(ann, "fallback")
+    if fb == "runtime" || fb == "trust" { return }
+    diag_error_at("UnexpectedAnnotation", UNEXPECTED_ANNOTATION, "@verify fallback must be \"runtime\" or \"trust\", got \"{fb}\"", ann, "write @verify(fallback: \"runtime\") to check the contract at runtime, or @verify(fallback: \"trust\") to accept it unchecked")
 }
 
 fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
@@ -10767,6 +10787,7 @@ fn init_types() ! TypeCheck.Register {
     tc_pure_fns.clear()
     tc_fn_node_by_name.clear()
     pv_in_old_depth = 0
+    pv_rejected_preds.clear()
     tc_build_import_map()
 
     TYPE_INT = new_type(TyKind.Int, "Int")
@@ -10896,6 +10917,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
         let mut i = 0
         while i < sublist_length(fns_sl) {
             validate_ffi_fn(sublist_get(fns_sl, i))
+            validate_verify_fallback(sublist_get(fns_sl, i))
             i = i + 1
         }
     }
@@ -16667,6 +16689,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     }
                     return make_raw_type(make_metavar())
                 }
+                // old(e) in an @ensures predicate is e's value at entry, so it has e's type.
+                if fn_name == "old" && tc_in_ensures_predicate != 0 {
+                    let args_sl = node_args(node)
+                    if args_sl != -1 && sublist_length(args_sl) == 1 {
+                        return infer_type(sublist_get(args_sl, 0))
+                    }
+                }
                 let skip_is_intrinsic = fn_name != "skip" || tc_call_is_skip_intrinsic(node)
                 if fn_name == "skip" && skip_is_intrinsic {
                     tc_fence_test_only_symbol("skip", SKIP_OUTSIDE_TEST, "SkipOutsideTest", node)
@@ -20066,12 +20095,17 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
     // RetType stops declining to the pool fallback. The FFI extern signature C is unaffected —
     // ffi_c_ret_type reads the flat annotation, not this memo.
     let ret_ann = node_type_ann(fn_node)
+    let mut fn_ret_tid = TYPE_VOID
     if ret_ann != -1 {
         let mut ret_tid = resolve_type_ann(ret_ann)
         let ret_inst = tc_fnsig_param_instance_tid(ret_ann, ret_tid)
         if ret_inst != -1 { ret_tid = ret_inst }
         tc_publish_node_tid(ret_ann, ret_tid)
+        fn_ret_tid = ret_tid
     }
+
+    // An @ffi fn binds no params, and its contracts are refused (ContractOnFFI).
+    if is_ffi == 0 { tc_type_contract_predicates(fn_node, fn_ret_tid) }
 
     let body = node_body(fn_node)
     if body != -1 && is_ffi == 0 {
@@ -20104,6 +20138,73 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
     tc_current_fn_ret = prev_fn_ret
     nr_pop_scope()
     tc_boundary_check_active = prev_boundary
+}
+
+// 1 while an @ensures predicate is inferred, where `old(e)` is the entry snapshot of e and not
+// a call.
+let mut tc_in_ensures_predicate: Int = 0
+
+// The @requires and @ensures predicates, typed in the fn's own scope so their runtime checks
+// lower from tids like any other expression. @ensures also sees `result`, the returned value.
+// @allow: publishing types IS this function's effect; the ensures flag is reset on the way out.
+@allow(UnrestoredMutation)
+fn tc_type_contract_predicates(fn_node: Int, ret_tid: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let anns_sl = node_handlers(fn_node)
+    if anns_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(anns_sl) {
+        let ann = sublist_get(anns_sl, i)
+        let nm = node_name(ann)
+        let args_sl = if nm == "requires" || nm == "ensures" { node_args(ann) } else { -1 }
+        if args_sl != -1 && sublist_length(args_sl) > 0 {
+            let pred = sublist_get(args_sl, 0)
+            if pv_rejected_preds.contains_key(pred) == false {
+                let is_ens = nm == "ensures"
+                if is_ens {
+                    nr_push_scope()
+                    nr_define_typed("result", 0, ret_tid, -1)
+                    tc_in_ensures_predicate = 1
+                }
+                tc_type_predicate(pred, "@{nm}")
+                if is_ens {
+                    tc_in_ensures_predicate = 0
+                    nr_pop_scope()
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn tc_type_predicate(pred: Int, what: Str) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let t = tc_infer_value(pred)
+    tc_walk_stmt_value(pred)
+    if is_bool_compat(t) == 0 {
+        tc_error_at("{what} predicate must be Bool, got {type_to_str(t)}", pred)
+    }
+}
+
+// A @where predicate is an expression over `self`, the value of the alias's base type. It is
+// reached here, from the declaration, for the reason field defaults are: no body holds it.
+// @allow: the module and tparam scope are restored; publishing types is the point.
+@allow(UnrestoredMutation)
+fn tc_stamp_where_predicate(td: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let pred = node_condition(td)
+    if pred == -1 { return }
+    if pv_rejected_preds.contains_key(pred) { return }
+    let tparams = node_type_params(td)
+    tc_push_tparam_scope(tparams)
+    let saved_module = nr_current_module
+    nr_current_module = node_module(td)
+    nr_push_scope()
+    nr_define_typed("self", 0, resolve_type_ann(node_value(td)), -1)
+    tc_type_predicate(pred, "@where")
+    nr_pop_scope()
+    nr_current_module = saved_module
+    tc_pop_tparam_scope(tparams)
+    // As with a field default, the walk recovered this subtree before it was typed.
+    let mut pred_owner: Map[Int, Int] = Map()
+    let _ = tc_stamp_walk(pred, pred_owner)
 }
 
 // ── Match exhaustiveness (E0004) ─────────────────────────────────────
@@ -23047,6 +23148,7 @@ fn tc_stamp_recover_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     let k = node_kind(node)
     if k == NodeKind.TypeDef {
         tc_stamp_type_field_defaults(node)
+        tc_stamp_where_predicate(node)
         return
     }
     // §3.3: control transfer produces no value, and the rule belongs on the statement node
