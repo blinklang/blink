@@ -496,7 +496,7 @@ fn dynamic_report(table: Str, id: Int) -> Result[Row, DBError] ! DB.Read {
     db.query_one("SELECT * FROM {Raw(table)} WHERE id = {id}")
     // Compiler produces:
     // Template[DB] { parts: ["SELECT * FROM users WHERE id = ", ""], values: [id] }
-    // where "users" was concatenated from table into parts[0]
+    // where "users" was concatenated from table into the first element of parts
 }
 
 // Fully dynamic (all raw) — still works, just verbose

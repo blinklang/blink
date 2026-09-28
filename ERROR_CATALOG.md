@@ -74,11 +74,13 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | NonExhaustiveMatch | E0004 | A `match` leaves an enum variant unhandled. Guarded arms do not contribute to coverage; a `_` or plain-binding arm makes the match exhaustive | Pattern matching | §3.9 |
 | TypeError | E0300 | Type mismatch detected during type checking | Type checking | §3 |
 | CannotInferType | E0301 | Inference left a type variable unbound — annotate the binding, or supply the type argument at the call when the callee's signature does not supply it. Reported where the repair attaches | Type checking | §3.4 |
-| TypeArgArity | E0303 | A type constructor in a type position was applied to the wrong number of type arguments — including none (a bare `Channel`/`List`). Under- and over-application are one code. Decided at name resolution, before inference | Name resolution | §3.4 |
+| TypeArgArity | E0303 | A type-argument list has the wrong count for the declaration it applies to. In a type position that includes none (a bare `Channel`/`List`). At a callee or a struct-literal head, a written list of the wrong count (`decode[A, B](s)`, `plain[Int](3)`); an absent list there is left to inference. A non-generic declaration or a local value binds zero. Under- and over-application are one code. A rejected list supplies nothing: no E0301 or E0306 for that call's binders. Decided when the head resolves: at name resolution for a type or a path, once the receiver's type is known for a method | Name resolution | §3.4 |
 | TraitBoundNotSatisfied | E0306 | A call's type argument (inferred or explicit) does not satisfy the type parameter's declared bound — checked against the arguments as written, before code generation | Type checking | §3.6 |
 | TemplateMismatch | E0310 | String template parameter type does not match argument | Type checking | §3 |
 | MissingReturn | E0311 | Control can reach the end of a block that must produce a value of type `R` along a path that yields `()` — a value-returning function whose tail can complete normally (a `while`/`for` tail, an `if` without `else`). The tail kind is carried as diagnostic data, not a separate code. Repair: add a trailing `return <value>`, or change the return type to `Option[R]`. A diverging tail (`panic`, or a `loop` no `break` targets) is accepted | Type checking | §3.3 |
 | NoConversionImpl | E0312 | A conversion has no impl: `x.into()` and `T.from(x)` need `impl From[S] for T`, `T.try_from(x)` needs `impl TryFrom[S] for T`, with S the source's type (an alias is the type it names). Every type converts to itself. Repair: declare the impl, or use the named conversion (`.to_float()`, `.truncate()`, `.to_int_checked()`, `try_from`, `.to_string()`) | Type checking | §3c |
+| NoIndexOperator | E0313 | A postfix `[...]` holds a value (`xs[1]`, `m["k"]`, `fns[0](x)`). Blink has no index operator. Decided by the bracket contents at name resolution, whether or not a call follows. Repair: `.get()` (returns `Option`), or `.0` for a tuple; no machine fix when a call follows | Name resolution | §3.4 |
+| TypeArgsWithoutCall | E0314 | A well-formed type-argument list with no call `(` or literal `{` after it (`let f = identity[Int]`). First help: remove the brackets when an expected type fixes the same arguments; annotate the binding when there is no expected type; no machine fix when they conflict | Type checking | §3.4 |
 | UndeclaredEffect | E0500 | Callee requires effect not declared by caller | Effects | §4.5 |
 | CapabilityBudgetExceeded | E0501 | Function effect exceeds module `@capabilities` budget | Effects | §4.8 |
 | QuestionMarkInvalidOperand | E0502 | `?` operator used on non-Result, non-Option type | Type checking | §3c.2 |
@@ -206,6 +208,16 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | UnauditedFfi | W0800 | Unaudited foreign function call. Audit-gated: `@trusted(audit: K)` is its only suppression channel — `@allow` and `[lints]` are refused | FFI | §9.1 |
 | MissingCanonicalHeader | W0812 | `@ffi.struct` header not declared in blink.toml | FFI | §9.2.1 |
 | DeprecatedUsage | W2000 | Use of an item annotated `@deprecated` | Linting | §6 |
+
+---
+
+## Retired Codes
+
+A retired code and its name are never reused (see *Conventions*). `blink explain` on a retired name or code says it is retired and names the codes that replace it.
+
+| Name | Code | Retired because | Replaced by |
+|------|------|-----------------|-------------|
+| CallSiteTypeArgs | E0307 | It refused explicit type application at a call, which §3.4 *Explicit Type Application* makes legal | TypeArgArity (E0303), NoIndexOperator (E0313), TypeArgsWithoutCall (E0314) |
 
 ---
 

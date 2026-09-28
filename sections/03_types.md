@@ -1294,7 +1294,7 @@ fn main() {
 }
 ```
 
-The first `help:` names the **annotation**, not a bracket form. Brackets on a callee supply type arguments to a *call*; this position has no call, so there is nothing for them to attach to.
+The first `help:` names the **annotation**, not a bracket form. Brackets on a callee supply type arguments to a *call*; this position has no call, so there is nothing for them to attach to. Writing them anyway — `let f = identity[Int]` — is `error[TypeArgsWithoutCall]` (E0314, §3.4 *Postfix Brackets That Are Not a Type Application*).
 
 *Rationale (normative).* The rule this replaces refused `apply(identity, 3)` and accepted `let f = identity` followed by `apply(f, 3)` — the same value, one line apart, separated by where it was written rather than by anything about its type. A rule that distinguishes a term from its own η-expansion is a syntactic filter standing in a typing rule's position, and its prescribed repair — wrapping the name in a closure — lowers to the identical allocation and the identical indirect call. It refused one spelling of a machine-identical program, it was defeated by one `let`, and it has been deleted rather than restated.
 
@@ -1317,7 +1317,7 @@ let r = Registry[User] { entries: [] }      // OK -- brackets on a struct-litera
 ```
 
 - **All or none.** A type-argument list supplies every one of the declaration's type parameters or none of them. There is no partial application and no placeholder for "infer this one."
-- **Arity is exact.** Supplying the wrong count is an error, not a prompt to infer the remainder.
+- **Arity is exact.** Supplying the wrong count is `error[TypeArgArity]` (E0303) in every position — at a callee exactly as in a type position (§3.4 *Kind-Correctness*) — not a prompt to infer the remainder.
 - **Bounds are checked against the arguments as written.** An explicit type argument satisfies the binder's bounds or the call is rejected; explicitness never bypasses a bound.
 
 **A redundant type-argument list is permitted and carries no diagnostic.** When inference would have reached the same answer, writing the arguments anyway is neither an error nor a warning nor a lint — exactly as `let x: Int = 1` is permitted where `let x = 1` would do. A diagnostic here would be non-monotonic: adding an annotation elsewhere in the program could make an untouched line retroactively noisy.
@@ -1353,7 +1353,7 @@ W0604 is a warning and not an error: a binder nothing supplies is still callable
 
 #### Kind-Correctness of Type Expressions
 
-Every type expression written in a **type position** — a parameter type, a return type, a field type, a binding annotation, a nested type argument, or a struct-literal head — must denote a complete type. A type constructor of arity *n* denotes a complete type only when it is applied to exactly *n* type arguments. Writing a constructor with the wrong number of arguments — including **none** — does not denote a type; it is `error[TypeArgArity]` (E0303).
+Every type expression written in a **type position** — a parameter type, a return type, a field type, a binding annotation, or a nested type argument — must denote a complete type. A type constructor of arity *n* denotes a complete type only when it is applied to exactly *n* type arguments. Writing a constructor with the wrong number of arguments — including **none** — does not denote a type; it is `error[TypeArgArity]` (E0303).
 
 ```blink
 fn relay(src: Channel, dst: Channel) { }   // error[TypeArgArity]: `Channel` takes 1 type argument, 0 were given
@@ -1378,7 +1378,31 @@ type Registry[T] {
 fn lookup(r: Registry) { }      // error[TypeArgArity]: `Registry` takes 1 type argument, 0 were given
 ```
 
-**E0303 is decided at name resolution, before inference runs.** A constructor's arity is a property of its declaration alone, so the mismatch is known the moment the annotation is read — no call site, and no inference, is consulted. This is what distinguishes E0303 from `error[CannotInferType]` (E0301, §3.4 *Under-Determined Types*): E0301 fires when inference *terminates* with a type variable no use ever fixed; E0303 fires when a type expression was never well-formed to begin with. A bare `Channel` annotation is not an unsolved variable that a later use might constrain — it names a slot the program neglected to fill, and no downstream use can fill an argument the annotation did not open. The two never co-fire on the same type expression: a well-formed constructor application may leave a variable under-determined (E0301), but an ill-formed one is rejected first (E0303).
+**A callee and a struct-literal head are term positions, and the rule covers every list written there.** In a type position an absent list counts as zero arguments. In a term position an absent list is not an application: inference supplies the binders, and a binder it cannot fix is `error[CannotInferType]` (E0301, §3.4 *Explicit Type Application*). That is why `Pair { first: "hi", second: 1 }` and `probe()` are judged by inference and not by this rule. A list that *is* written in a term position must supply exactly as many arguments as the declaration binds, and the wrong count is `error[TypeArgArity]` (E0303) — the same code as in a type position, because it is the same failure:
+
+- At a callee, the count is the called declaration's **own** binders. The binders of an impl come from the receiver, since impl selection admits no type-argument list (§3.6).
+- A non-generic declaration binds zero, and so does a local value. A list on either is always the wrong count.
+
+```blink
+fn decode[T](s: Str) -> T { ... }
+fn plain(n: Int) -> Int { n }
+
+type Registry[T] {
+    entries: List[T]
+}
+
+fn main() {
+    let a = decode[Forecast, Str](body)          // error[TypeArgArity]: `decode` takes 1 type argument, 2 were given
+    let b = plain[Int](3)                        // error[TypeArgArity]: `plain` takes 0 type arguments, 1 was given
+                                                 // help: delete the list: `plain(3)`
+    let r = Registry[User, Int] { entries: [] }  // error[TypeArgArity]: `Registry` takes 1 type argument, 2 were given
+    let p = Pair { first: "hi", second: 1 }      // OK -- term position, no list, inference supplies the binders
+}
+```
+
+**A rejected list supplies nothing.** When E0303 fires on a list, the list binds none of the declaration's type parameters. Neither `error[CannotInferType]` (E0301) nor `error[TraitBoundNotSatisfied]` (E0306) is reported for the binders of that call: an ill-arity list has no argument *i* for binder *i*, so "unbound" and "bound not met" have no meaning there. Fixing the count is the converging repair (§3.1 rule 3).
+
+**E0303 is decided when the head resolves, from the declaration's binder count and the written list alone.** For a type expression or a path callee, that is at name resolution, before inference runs. For a method callee (`x.decode[A, B]()`), the receiver's type selects the method, so the count is checked once that type is known. In neither case is inference of the call's own arguments consulted. A constructor's arity is a property of its declaration alone, so the mismatch is known the moment the head is resolved. This is what distinguishes E0303 from `error[CannotInferType]` (E0301, §3.4 *Under-Determined Types*): E0301 fires when inference *terminates* with a type variable no use ever fixed; E0303 fires when a type expression was never well-formed to begin with. A bare `Channel` annotation is not an unsolved variable that a later use might constrain — it names a slot the program neglected to fill, and no downstream use can fill an argument the annotation did not open. The two never co-fire on the same type expression: a well-formed constructor application may leave a variable under-determined (E0301), but an ill-formed one is rejected first (E0303).
 
 **The repair depends on the case, and the first `help:` offered is normative** (§3.4 *Explicit Type Application*):
 
@@ -1388,8 +1412,12 @@ fn lookup(r: Registry) { }      // error[TypeArgArity]: `Registry` takes 1 type 
 | Bare constructor, no type parameter is in scope | `fn relay(src: Channel)` | declare a binder on the enclosing declaration and apply it — `fn relay[T](src: Channel[T], dst: Channel[T])` |
 | Under-applied (some, too few) | `Map[Str]` | supply the missing argument — `Map[Str, V]` |
 | Over-applied (too many) | `List[Int, Str]` | remove the extra argument — `List[Int]` |
+| Term position, and inference fixes every binder once the list is gone | `pair[Int, Str, Bool](1, "a")` | delete the list — `pair(1, "a")` |
+| Term position, and inference does not fix every binder | `probe[Int, Str]()` | write the list with the exact count, naming the binders — `probe[T]()` |
 
 The binder-declaring repair is offered **only** when the constructor is bare *and* no type parameter already in scope can fill the slot. Where a parameter is in scope, applying it is the whole repair; suggesting a fresh binder there would shadow an available one.
+
+In a term position, deleting the list is offered first whenever inference then fixes every binder. That edit always compiles, because a redundant list is never required (§3.4 *Explicit Type Application*), and it needs no guess about which of the written arguments the author meant. The exact-count list is offered only when deletion would leave a binder with no source.
 
 **Trait references are not type expressions and are outside this rule.** A trait name in a bound (`T: Ord`) or an impl header does not occupy a type position — it constrains a type parameter rather than denoting a type (§3.6). Its arguments are governed by `error[TraitArgArity]` (E0910), the impl-header specialization of the same arity principle. So a generic signature that mentions a trait only in a bound is well-formed under E0303:
 
@@ -1398,7 +1426,51 @@ fn sort[T: Ord](xs: List[T]) -> List[T] { xs }   // OK -- `Ord` is a bound, not 
                                                   //       `List[T]` is a complete type
 ```
 
-One principle — a constructor is applied to its exact arity — surfaces as E0303 in type positions and E0910 in trait positions, because the repair and the surrounding grammar differ between the two.
+One principle — a constructor is applied to its exact arity — surfaces as E0303 in type and term positions and E0910 in trait positions, because the repair and the surrounding grammar differ between the two.
+
+#### Postfix Brackets That Are Not a Type Application
+
+Blink has no index operator (§2.6). A postfix `[...]` after an expression is legal only as a type-argument list written directly before `(` (a call) or `{` (a struct-literal head). Every other bracket suffix is an error. The **contents of the brackets** decide which error, checked in this order:
+
+1. **Any item is a value:** `error[NoIndexOperator]` (E0313), whether or not a call follows.
+2. **Every item is a type:** the brackets are a type-argument list, and their count is checked against the head (§3.4 *Kind-Correctness*). The wrong count is `error[TypeArgArity]` (E0303). A value head, or a non-generic declaration, binds zero.
+3. **The list is well-formed, and no `(` or `{` follows:** `error[TypeArgsWithoutCall]` (E0314).
+
+An item is a **type** when it parses as a type expression and every name in it resolves to a type or a type parameter. Every other item is a **value**: a literal, a local, a constant, or any other expression. Name resolution decides this in every case, so the code never depends on the receiver's type. `xs[i]` and `self.items[i]` get the same code at the same stage.
+
+E0303 is checked before E0314 because deleting the list discharges both. A value head with type contents, such as `xs[Int]`, is therefore E0303 (`xs` takes 0 type arguments), and its repair, deleting the list, exists.
+
+**NoIndexOperator (E0313).** Element access is a method call. The first `help:` depends on the receiver's type: `.get()` where the type has it, and a field access for a tuple:
+
+```blink
+fn main() {
+    let xs = [10, 20, 30]
+    let pair = (1, "a")
+    let mut ages: Map[Str, Int] = Map()
+    ages.insert("bob", 41)
+
+    let x = xs[1]          // error[NoIndexOperator]: Blink has no index operator
+                           // help: `xs.get(1)` returns `Option[Int]`
+    let t = pair[0]        // error[NoIndexOperator]: Blink has no index operator
+                           // help: a tuple field is `pair.0`
+    let a = ages["bob"]    // error[NoIndexOperator]: Blink has no index operator
+                           // help: `ages.get("bob")` returns `Option[Int]`
+}
+```
+
+When a call follows the brackets, as in `handlers[0](req)`, the element is an `Option` that must be unwrapped before the call. No single edit is correct in every enclosing function: `?` compiles only in a function that returns `Option`, and `.unwrap()` panics when the element is missing. So the diagnostic carries a `note:` saying that `handlers.get(0)` returns an `Option` to `match` on before calling, and it offers no machine-applicable fix. A receiver whose type has neither `.get()` nor tuple fields also gets no machine-applicable fix (§3.1 rule 1).
+
+**TypeArgsWithoutCall (E0314).** A type-argument list supplies type arguments to a call or a literal. With neither after it, nothing uses it. E0301 does not apply, because the brackets bind the type parameters. The first `help:` depends on the context:
+
+| Context | Example | First `help:` |
+| --- | --- | --- |
+| An expected type fixes the same type arguments that were written | `apply(identity[Int], 3)` | remove the brackets — `apply(identity, 3)` |
+| A binding, and no expected type | `let f = identity[Int]` | annotate and remove the brackets, as one edit — `let f: fn(Int) -> Int = identity` |
+| An expected type fixes different type arguments | `apply(identity[Str], 3)` | none that can be applied by machine; the diagnostic names both types |
+
+Removing the brackets is offered first only when the expected type gives the same arguments that were written. Where they differ, removing the brackets would still compile, but it would silently change the instantiation the program asked for. That is a change of meaning, not a repair. The conflict between the written and the expected type is the real defect, and only the author can say which one is correct.
+
+A binding whose initializer is E0313 or E0314 gets no further E0300 or E0301 from that initializer (§3.1 rule 3).
 
 #### Under-Determined Types
 
@@ -2971,8 +3043,8 @@ between a map key and its value; there is no inner padding.
 @derive(Debug)
 type Inventory { items: List[Str], count: Option[Int], tags: Map[Str, Int] }
 
-let tags: Map[Str, Int] = Map()
-tags["rare"] = 1
+let mut tags: Map[Str, Int] = Map()
+tags.insert("rare", 1)
 let inv = Inventory { items: ["sword", "shield"], count: Some(2), tags: tags }
 inv.debug()
 // => "Inventory { items: [\"sword\", \"shield\"], count: Some(2), tags: {\"rare\": 1} }"

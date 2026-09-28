@@ -604,7 +604,7 @@ test "validation collects violations" {
     with mock_validation, mock_db_with_users([]) {
         let resp = handle_get_user(Request.new("GET", "/users/-1"))
         assert_eq(violations.len(), 1)
-        assert_eq(violations[0].param, "id")
+        assert_eq(violations.get(0).unwrap().param, "id")
     }
 }
 ```
@@ -1003,7 +1003,7 @@ test "process_order creates receipt for valid order" {
     }
 
     assert_eq(log_messages.len(), 1)
-    assert(log_messages[0].contains("Processing order 42"))
+    assert(log_messages.get(0).unwrap().contains("Processing order 42"))
 }
 ```
 
