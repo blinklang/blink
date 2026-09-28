@@ -847,14 +847,15 @@ Selective imports (`import mod.{a, b}`) restrict which *unqualified* items are v
 | `@capabilities(...)` | module | Effect ceiling |
 | `@derive(...)` | type | Auto-generate traits. Accepted names: `Serialize`, `Deserialize`, `Eq`, `Ord`, `Clone`, `Hash`, `Debug`. `Ord` synthesizes a lexicographic `.cmp(other) -> Ordering` and auto-includes `Eq` (`Ord: Eq`); enables `<`/`>`/`<=`/`>=`. Unknown names rejected as `E1112 UnknownDerive`. |
 | `@src(req)` | fn | Requirement traceability |
-| `@requires(expr)` | fn | Precondition |
-| `@ensures(expr)` | fn | Postcondition runtime-checked at every return (`result` = return value). Inside the predicate, `old(arg)` snapshots an argument's value at fn entry. |
+| `@requires(expr)` | fn | Precondition. Needs `@verify(fallback: ...)` on the fn, or it is `V0003 ContractUnverifiable` |
+| `@ensures(expr)` | fn | Postcondition (`result` = return value). Needs `@verify(fallback: ...)` on the fn, or it is `V0003 ContractUnverifiable`; with `"runtime"` it is checked at every return. Inside the predicate, `old(arg)` snapshots an argument's value at fn entry. |
 | `@where(expr)` | fn, type | Type constraint; on a fn, runtime-checked at param/return coercion |
 | `@invariant(expr)` | type | Type invariant |
 | `@pure` | fn | No effects, no mutation, no FFI; may only call other `@pure` fns. Recursion allowed. |
 | `@modifies(...)` | fn | Reserves syntax for the future SMT backend (parses-and-validates only) |
 | `@ffi("lib", "sym")` | fn | FFI binding — link to C function |
 | `@trusted` | fn | FFI audit marker — function reviewed for safety |
+| `@verify(fallback: "runtime" \| "trust")` | fn | What to do with a `@requires`/`@ensures` the compiler cannot prove (today: every one). `"runtime"` checks it and panics on violation; `"trust"` accepts it unchecked |
 | `@allow(W0600)` | fn, type | Suppress specific diagnostic warning |
 | `@deprecated(msg)` | fn, type | Deprecation warning. Optional: `since`, `removal`, `replacement`, `fix` fields |
 
