@@ -3015,6 +3015,26 @@ typedef struct {
     void* __userdata_eprint_no_nl;
 } blink_io_vtable;
 
+/* A handler value is a heap copy of its root's vtable, so a closure tail of
+   `with arena` that captures one carries it out. The struct is copied once
+   and each operation's closure is promoted in place. A vtable outside the
+   closing arenas comes back as itself, and may be a static default other
+   threads read, so it is left unwritten. A new op added to one of these
+   structs must be added to its promoter too, or its captures stay behind. */
+BLINK_RT_FN blink_io_vtable* blink_io_vtable_promote(blink_promote_ctx* ctx, blink_io_vtable* v);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_io_vtable* blink_io_vtable_promote(blink_promote_ctx* ctx, blink_io_vtable* v) {
+    blink_io_vtable* out = (blink_io_vtable*)blink_promote_cell(ctx, v, sizeof(*v), NULL);
+    if (out == v) return out;
+    out->__userdata_print = blink_closure_promote(ctx, (blink_closure*)out->__userdata_print);
+    out->__userdata_print_no_nl = blink_closure_promote(ctx, (blink_closure*)out->__userdata_print_no_nl);
+    out->__userdata_log = blink_closure_promote(ctx, (blink_closure*)out->__userdata_log);
+    out->__userdata_eprint = blink_closure_promote(ctx, (blink_closure*)out->__userdata_eprint);
+    out->__userdata_eprint_no_nl = blink_closure_promote(ctx, (blink_closure*)out->__userdata_eprint_no_nl);
+    return out;
+}
+#endif
+
 BLINK_RT_FN void blink_io_default_print(void* __self, const char* msg);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_io_default_print(void* __self, const char* msg) {
@@ -3076,6 +3096,19 @@ typedef struct {
     void* __userdata_watch;
 } blink_fs_vtable;
 
+BLINK_RT_FN blink_fs_vtable* blink_fs_vtable_promote(blink_promote_ctx* ctx, blink_fs_vtable* v);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_fs_vtable* blink_fs_vtable_promote(blink_promote_ctx* ctx, blink_fs_vtable* v) {
+    blink_fs_vtable* out = (blink_fs_vtable*)blink_promote_cell(ctx, v, sizeof(*v), NULL);
+    if (out == v) return out;
+    out->__userdata_read = blink_closure_promote(ctx, (blink_closure*)out->__userdata_read);
+    out->__userdata_write = blink_closure_promote(ctx, (blink_closure*)out->__userdata_write);
+    out->__userdata_delete_file = blink_closure_promote(ctx, (blink_closure*)out->__userdata_delete_file);
+    out->__userdata_watch = blink_closure_promote(ctx, (blink_closure*)out->__userdata_watch);
+    return out;
+}
+#endif
+
 BLINK_RT_FN const char* blink_fs_default_read(void* __self, const char* path);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_fs_default_read(void* __self, const char* path) {
@@ -3136,6 +3169,18 @@ typedef struct {
     void* __userdata_dns;
 } blink_net_vtable;
 
+BLINK_RT_FN blink_net_vtable* blink_net_vtable_promote(blink_promote_ctx* ctx, blink_net_vtable* v);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_net_vtable* blink_net_vtable_promote(blink_promote_ctx* ctx, blink_net_vtable* v) {
+    blink_net_vtable* out = (blink_net_vtable*)blink_promote_cell(ctx, v, sizeof(*v), NULL);
+    if (out == v) return out;
+    out->__userdata_connect = blink_closure_promote(ctx, (blink_closure*)out->__userdata_connect);
+    out->__userdata_listen = blink_closure_promote(ctx, (blink_closure*)out->__userdata_listen);
+    out->__userdata_dns = blink_closure_promote(ctx, (blink_closure*)out->__userdata_dns);
+    return out;
+}
+#endif
+
 BLINK_RT_FN int blink_net_default_connect(void* __self, const char* url);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int blink_net_default_connect(void* __self, const char* url) {
@@ -3181,6 +3226,19 @@ typedef struct {
     void* __userdata_encrypt;
     void* __userdata_decrypt;
 } blink_crypto_vtable;
+
+BLINK_RT_FN blink_crypto_vtable* blink_crypto_vtable_promote(blink_promote_ctx* ctx, blink_crypto_vtable* v);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_crypto_vtable* blink_crypto_vtable_promote(blink_promote_ctx* ctx, blink_crypto_vtable* v) {
+    blink_crypto_vtable* out = (blink_crypto_vtable*)blink_promote_cell(ctx, v, sizeof(*v), NULL);
+    if (out == v) return out;
+    out->__userdata_hash = blink_closure_promote(ctx, (blink_closure*)out->__userdata_hash);
+    out->__userdata_sign = blink_closure_promote(ctx, (blink_closure*)out->__userdata_sign);
+    out->__userdata_encrypt = blink_closure_promote(ctx, (blink_closure*)out->__userdata_encrypt);
+    out->__userdata_decrypt = blink_closure_promote(ctx, (blink_closure*)out->__userdata_decrypt);
+    return out;
+}
+#endif
 
 BLINK_RT_FN const char* blink_crypto_default_hash(void* __self, const char* data);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
@@ -3235,6 +3293,18 @@ typedef struct {
     void* __userdata_rand_float;
     void* __userdata_rand_bytes;
 } blink_rand_vtable;
+
+BLINK_RT_FN blink_rand_vtable* blink_rand_vtable_promote(blink_promote_ctx* ctx, blink_rand_vtable* v);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_rand_vtable* blink_rand_vtable_promote(blink_promote_ctx* ctx, blink_rand_vtable* v) {
+    blink_rand_vtable* out = (blink_rand_vtable*)blink_promote_cell(ctx, v, sizeof(*v), NULL);
+    if (out == v) return out;
+    out->__userdata_rand_int = blink_closure_promote(ctx, (blink_closure*)out->__userdata_rand_int);
+    out->__userdata_rand_float = blink_closure_promote(ctx, (blink_closure*)out->__userdata_rand_float);
+    out->__userdata_rand_bytes = blink_closure_promote(ctx, (blink_closure*)out->__userdata_rand_bytes);
+    return out;
+}
+#endif
 
 #ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
   #ifdef BLINK_RUNTIME_STORAGE_DEFINE
@@ -3331,6 +3401,17 @@ typedef struct {
     void* __userdata_sleep;
 } blink_time_vtable;
 
+BLINK_RT_FN blink_time_vtable* blink_time_vtable_promote(blink_promote_ctx* ctx, blink_time_vtable* v);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_time_vtable* blink_time_vtable_promote(blink_promote_ctx* ctx, blink_time_vtable* v) {
+    blink_time_vtable* out = (blink_time_vtable*)blink_promote_cell(ctx, v, sizeof(*v), NULL);
+    if (out == v) return out;
+    out->__userdata_read = blink_closure_promote(ctx, (blink_closure*)out->__userdata_read);
+    out->__userdata_sleep = blink_closure_promote(ctx, (blink_closure*)out->__userdata_sleep);
+    return out;
+}
+#endif
+
 BLINK_RT_FN blink_Instant blink_time_default_read(void* __self);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_Instant blink_time_default_read(void* __self) {
@@ -3379,6 +3460,20 @@ typedef struct {
     void* __userdata_cwd;
     void* __userdata_exit_fn;
 } blink_env_vtable;
+
+BLINK_RT_FN blink_env_vtable* blink_env_vtable_promote(blink_promote_ctx* ctx, blink_env_vtable* v);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_env_vtable* blink_env_vtable_promote(blink_promote_ctx* ctx, blink_env_vtable* v) {
+    blink_env_vtable* out = (blink_env_vtable*)blink_promote_cell(ctx, v, sizeof(*v), NULL);
+    if (out == v) return out;
+    out->__userdata_read = blink_closure_promote(ctx, (blink_closure*)out->__userdata_read);
+    out->__userdata_write = blink_closure_promote(ctx, (blink_closure*)out->__userdata_write);
+    out->__userdata_remove = blink_closure_promote(ctx, (blink_closure*)out->__userdata_remove);
+    out->__userdata_cwd = blink_closure_promote(ctx, (blink_closure*)out->__userdata_cwd);
+    out->__userdata_exit_fn = blink_closure_promote(ctx, (blink_closure*)out->__userdata_exit_fn);
+    return out;
+}
+#endif
 
 BLINK_RT_FN const char* blink_env_default_read(void* __self, const char* name);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
@@ -3435,6 +3530,17 @@ typedef struct {
     void* __userdata_spawn;
     void* __userdata_signal;
 } blink_process_vtable;
+
+BLINK_RT_FN blink_process_vtable* blink_process_vtable_promote(blink_promote_ctx* ctx, blink_process_vtable* v);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_process_vtable* blink_process_vtable_promote(blink_promote_ctx* ctx, blink_process_vtable* v) {
+    blink_process_vtable* out = (blink_process_vtable*)blink_promote_cell(ctx, v, sizeof(*v), NULL);
+    if (out == v) return out;
+    out->__userdata_spawn = blink_closure_promote(ctx, (blink_closure*)out->__userdata_spawn);
+    out->__userdata_signal = blink_closure_promote(ctx, (blink_closure*)out->__userdata_signal);
+    return out;
+}
+#endif
 
 BLINK_RT_FN int64_t blink_process_default_spawn(void* __self, const char* command);
 #ifndef BLINK_RUNTIME_DECLS_ONLY

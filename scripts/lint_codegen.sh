@@ -99,6 +99,7 @@ c_effect_default_op_name cname
 c_builtin_effect_slot cname
 c_kops_table_name cname
 c_vtable_userdata_member cname
+c_vtable_promoter_name cname
 td_guard_name cname
 c_mint_local cname
 c_tuple_member cname
