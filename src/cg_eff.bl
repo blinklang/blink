@@ -27,6 +27,7 @@ import layout.{
 }
 import cname.{
     c_builtin_effect_slot, c_cell_name, c_effect_vtable_slot_name, c_ev_field_name, c_ev_global_name,
+    c_vtable_userdata_member,
     c_ev_type_name, c_field_name,
     c_impl_method_name, c_local_name, c_mint_local, c_runtime_helper,
 }
@@ -632,29 +633,62 @@ pub fn cg_eff_lower_handler_expr(node: Int) -> Int ! Diag.Report {
         sigs.push(sig)
     }
     let outer = c_mint_local("handler_outer")
+    let mut built: List[HandlerOpBuild] = []
+    for sig in sigs {
+        let b = handler_op_build(tid, node, rec.c_spelling, field, sig)
+        if b.descs == "" { return -1 }
+        built.push(b)
+    }
     let mut slots: List[Str] = []
+    let mut userdata: List[Str] = []
     let mut symbols: List[Str] = []
     let mut words: List[Int] = []
-    for sig in sigs {
-        let symbol = c_mint_local("handler_op")
-        let captured = ir_field_get(tid, node, rec.c_spelling, field, SlotForm.PointerBoxed, ev_read(node))
-        let tids: List[Int] = []
-        let celled: List[Int] = []
-        let mut kids: List[Int] = [captured]
-        for w in capture_words(sig.op, sig.free, tids, celled) { kids.push(w) }
+    for b in built {
+        let sig = b.sig
         eff_thunks.push(PendingThunk {
-            closure: sig.op, symbol: symbol, fn_tid: sig.fn_tid, cap_names: sig.free, cap_tids: tids,
-            cap_celled: celled, handler_tid: tid, outer_name: outer, task_symbol: "", forward_to: -1,
+            closure: sig.op, symbol: b.symbol, fn_tid: sig.fn_tid, cap_names: sig.free, cap_tids: b.tids,
+            cap_celled: b.celled, handler_tid: tid, outer_name: outer, task_symbol: "", forward_to: -1,
             forward_symbol: "", forward_ev: false,
         })
-        print_vtable_slot_fn_decl(sig.ret, symbol, sig.params)
-        words.push(ir_closure_new(sig.fn_tid, sig.op, sig.closure_spelling, symbol, "", "", kids))
+        print_vtable_slot_fn_decl(sig.ret, b.symbol, sig.params)
+        words.push(ir_closure_new(sig.fn_tid, sig.op, sig.closure_spelling, b.symbol, b.descs, "", b.kids))
         slots.push(sig.slot)
-        symbols.push(symbol)
+        userdata.push(c_vtable_userdata_member(sig.slot))
+        symbols.push(b.symbol)
     }
     let symbol = c_mint_local("handler")
-    print_handler_builder(rec.c_spelling, symbol, c_ev_global_name(), field, slots, symbols)
+    print_handler_builder(rec.c_spelling, symbol, c_ev_global_name(), field, slots, userdata, symbols)
     ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, words)
+}
+
+// One operation's closure before anything is queued: its symbol, its capture words and the
+// descriptor table arena promotion copies them by. Word 0 is the handler the literal copies
+// from, so it is described as a capture of the handler's own type. descs is "" after a
+// refusal that has recorded its own report.
+type HandlerOpBuild {
+    sig: HandlerOpSig
+    symbol: Str
+    kids: List[Int]
+    tids: List[Int]
+    celled: List[Int]
+    descs: Str
+}
+
+fn handler_op_build(tid: Int, node: Int, spelling: Str, field: Str, sig: HandlerOpSig) -> HandlerOpBuild ! Diag.Report {
+    let symbol = c_mint_local("handler_op")
+    let captured = ir_field_get(tid, node, spelling, field, SlotForm.PointerBoxed, ev_read(node))
+    let tids: List[Int] = []
+    let celled: List[Int] = []
+    let mut kids: List[Int] = [captured]
+    for w in capture_words(sig.op, sig.free, tids, celled) { kids.push(w) }
+    let mut names: List[Str] = ["handler"]
+    let mut all_tids: List[Int] = [tid]
+    let mut all_celled: List[Int] = [0]
+    for n in sig.free { names.push(n) }
+    for t in tids { all_tids.push(t) }
+    for c in celled { all_celled.push(c) }
+    let descs = cg_promote_capture_table(symbol, names, all_tids, all_celled, sig.op)
+    HandlerOpBuild { sig: sig, symbol: symbol, kids: kids, tids: tids, celled: celled, descs: descs }
 }
 
 // One operation of a literal as the builder and its thunk need it. slot is "" when a part

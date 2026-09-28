@@ -36,11 +36,11 @@ import cname.{
     c_field_name, c_mint_local, c_runtime_helper, c_tuple_member, c_variant_discriminant,
     c_enum_tag_member, c_enum_payload_member, c_promote_walker_name, c_string_literal,
     c_promote_closure_walker_name, c_capture_word_walker_name, c_capture_cell_fill_name,
-    c_capture_table_name,
+    c_capture_table_name, c_effect_vtable_slot_name, c_vtable_userdata_member,
 }
 import cg_print.{print_fn, print_capture_desc_table}
 import escape.{ea_closure_is_promoted, ea_refuse_recursive_crossing, ea_refuse_unwalkable_capture}
-import cg_reg.{cg_reg_tid_for_decl}
+import cg_reg.{cg_reg_effect_ops, cg_reg_effect_root_decl, cg_reg_tid_for_decl}
 import cg_call.{cg_call_element_from_runtime, cg_call_element_from_word, cg_call_element_to_slot_in}
 import ir.{
     ir_arena_target, ir_assign, ir_binary, ir_block, ir_box_into, ir_break, ir_c_spelling,
@@ -52,7 +52,7 @@ import typecheck.{
     TYPE_BOOL, TYPE_INT, TYPE_STR, TYPE_VOID, TyKind, tc_enum_variant_slots, tc_evar_field_slots,
     tc_evar_name, tc_evfield_name, tc_evfield_tid, tc_member_tid_at_instance, tc_resolve,
     tc_sfield_name, tc_sfield_tid, tc_struct_field_slots, tc_tid_child_count,
-    tc_tid_decl_node, tc_tid_kind, tc_tid_reaches_itself, tc_type_str,
+    tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tc_tid_reaches_itself, tc_type_str,
 }
 import parser.{
     node_col, node_fields, node_line, node_name, node_source_module, sublist_get, sublist_length,
@@ -231,10 +231,11 @@ pub fn cg_promote_print_walkers() ! Diag.Report {
 // How a value of one kind is copied out. Shared kinds are identity objects the runtime
 // never allocates in an arena, so their word is the value. Every kind is named here, so
 // a kind added without a rule fails to compile rather than passing through uncopied.
-// A template's values carry their own runtime tags, so the runtime copies it whole.
+// A template's values carry their own runtime tags, so the runtime copies it whole. A
+// handler is a vtable of its root effect whose capture words are closures.
 type WalkClass {
     Leaf, Shared, Text, Closure, ListShell, MapShell, SetShell, FlatShell, TemplateCopy,
-    Record, Tagged, Carrier, Tuple, Unbuilt, Unsolved
+    Vtable, Record, Tagged, Carrier, Tuple, Unbuilt, Unsolved
 }
 
 fn kind_class(k: TyKind) -> WalkClass {
@@ -270,7 +271,7 @@ fn kind_class(k: TyKind) -> WalkClass {
         TyKind.Option => WalkClass.Carrier
         TyKind.Result => WalkClass.Carrier
         TyKind.Tuple => WalkClass.Tuple
-        TyKind.Handler => WalkClass.Unbuilt
+        TyKind.Handler => WalkClass.Vtable
         TyKind.Template => WalkClass.TemplateCopy
         TyKind.Raw => WalkClass.Unbuilt
         TyKind.FfiScope => WalkClass.Shared
@@ -511,6 +512,7 @@ fn walk_fixes(w: Walk) -> List[Int] ! Diag.Report {
         WalkClass.Tuple => tuple_fixes(w)
         WalkClass.Closure => [shell_copy(w, "closure_promote")]
         WalkClass.TemplateCopy => [shell_copy(w, "template_promote")]
+        WalkClass.Vtable => vtable_fixes(w)
         WalkClass.Unbuilt => refuse_unbuilt(w)
         WalkClass.Unsolved => refuse_unsolved(w)
         _ => {
@@ -663,6 +665,54 @@ fn record_fixes(w: Walk) -> List[Int] ! Diag.Report {
         let fix = owned_member_fix(w, ftid, c_field_name(tc_sfield_name(slot)))
         if fix == -1 { return [-1] }
         if fix >= 0 { out.push(fix) }
+    }
+    out
+}
+
+// The vtable copied once into the target, as a shared cell is, then each operation's closure
+// promoted in place. Every capture word of the root is walked, not only the handled
+// sub-effect's: the literal copied the rest from the handler it was built over.
+fn vtable_fixes(w: Walk) -> List[Int] ! Diag.Report {
+    let span = w.span
+    let members = vtable_capture_members(tc_resolve(w.tid))
+    if members.len() == 0 {
+        invariant(span, "{tc_type_str(tc_resolve(w.tid))} reached the walker builder with no declared operations")
+        return [-1]
+    }
+    let slot = container_slot_spelling()
+    let size = int_const(span, "sizeof(*{w.value})")
+    let none = ir_const(TYPE_VOID, span, slot, "NULL")
+    let cell = ir_call_runtime(w.tid, span, slot, c_runtime_helper("promote_cell"), SlotForm.InlineWord,
+        [walk_ctx(w), walk_value(w), size, none])
+    let mut fixes: List[Int] = []
+    for m in members {
+        let word = ir_field_get(w.tid, span, slot, m, SlotForm.InlineWord, held_out(w))
+        let moved = ir_call_runtime(w.tid, span, slot, c_runtime_helper("closure_promote"), SlotForm.InlineWord,
+            [walk_ctx(w), word])
+        fixes.push(ir_assign(span, ir_field_get(w.tid, span, slot, m, SlotForm.InlineWord, held_out(w)), moved))
+    }
+    // A vtable outside the closing arenas comes back as itself, and may be a static default
+    // other threads read, so it is left unwritten.
+    let copied = ir_binary(TYPE_BOOL, span, layout_of(TYPE_BOOL, Position.Local).c_spelling, "!=", walk_out(w), walk_value(w))
+    [ir_let(w.tid, span, w.rec.c_spelling, w.out, w.rec.slot_form, ir_cast(w.tid, span, w.rec.c_spelling, cell)),
+        ir_if(span, copied, ir_block(span, fixes), -1)]
+}
+
+// `out` read as the pointer it is, so a member of it prints through `->`.
+fn held_out(w: Walk) -> Int {
+    ir_var_ref(w.tid, w.span, w.rec.c_spelling, w.out, SlotForm.PointerBoxed)
+}
+
+// The capture word of each operation the handler's root effect declares, or none for a root
+// the program does not declare.
+fn vtable_capture_members(r: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    let decl = cg_reg_effect_root_decl(tc_tid_handler_effect(r))
+    if decl < 0 { return out }
+    for op in cg_reg_effect_ops(decl) {
+        let slot = c_effect_vtable_slot_name(r, node_name(op))
+        if diag_is_ice_seg(slot) { return [] }
+        out.push(c_vtable_userdata_member(slot))
     }
     out
 }
@@ -862,6 +912,7 @@ fn buildable_uncached(r: Int, span: Int) -> Int ! Diag.Report {
         WalkClass.Closure => BUILD_YES
         WalkClass.FlatShell => BUILD_YES
         WalkClass.TemplateCopy => BUILD_YES
+        WalkClass.Vtable => if vtable_capture_members(r).len() > 0 { BUILD_YES } else { BUILD_NO }
         WalkClass.ListShell => child_buildable(child_tid(r, Slot.Inner1), span)
         WalkClass.SetShell => child_buildable(child_tid(r, Slot.Inner1), span)
         WalkClass.MapShell => lower(child_buildable(child_tid(r, Slot.Inner1), span), child_buildable(child_tid(r, Slot.Inner2), span))
