@@ -23,7 +23,7 @@ import cg_stmt.{cg_stmt_reset, lower_block, lower_fn}
 import cg_reg.{cg_reg_reset, cg_reg_build}
 import cg_expr.{cg_expr_reset, cg_expr_pending_count}
 import lower_test_helpers.{
-    assert_eq_str, assert_ice_saying, ice_count, ice_count_exactly, last_ice, shape,
+    assert_eq_str, ice_count, ice_count_exactly, last_ice, shape,
 }
 
 fn find_fn(name: Str) -> Int {
@@ -159,15 +159,18 @@ test "an if whose arms produce no value binds the unit value" {
         "Block(Let(Const), Let(Const), If(Binary(VarRef, Const), Block(ExprStmt(EffectPerform(FieldGet(EvidenceVector), Const))), Block(ExprStmt(EffectPerform(FieldGet(EvidenceVector), Const)))), Let(VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))")
 }
 
-test "an arm that neither produces a value nor leaves the block refuses by name" {
+// A loop no break leaves has type Never, so the arm it ends leaves the block without reaching
+// the read, exactly as a return does. The arm is judged by its type, not by its node kind.
+test "an arm ending in a loop no break leaves counts as leaving the block" {
     let body = probe_body("cg_stmt_value_unfilled", #"fn main() {
     let c = 1
     let picked = if c > 0 { 10 } else { loop { } }
     let _keep = [picked]
 }
 "#, "main")
-    assert_ice_saying("arm fills nothing", body, "ValuePositionArmFillsNothing",
-        "neither produces a value nor leaves the block")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Loop(Block))), Let(VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))")
 }
 
 // The three places the materialiser will not put a temp, because a temp filled in front of
@@ -477,4 +480,59 @@ test "an if assigned into an existing local materialises without refusing on the
     assert_eq_str("refusals recorded", "{ice_count()}", "0")
     assert_eq_str("block shape", shape(body),
         "Block(Let(Const), Let(Const), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Assign(VarRef, VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))")
+}
+
+// A call of type Never leaves the function, so a tail that is one has no value to return.
+// C cannot return a `void` call, so the call runs as a statement and the marker after it
+// tells C that control stops there.
+test "a Never call in a return tail runs as a statement before the unreachable marker" {
+    let body = probe_fn("cg_stmt_never_return_tail", #"fn h(n: Int) -> Int {
+    if n > 0 { return 1 }
+    env.exit(2)
+}
+"#, "h")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(If(Binary(VarRef, Const), Block(Return(Const))), Block(ExprStmt(EffectPerform(FieldGet(EvidenceVector), Const)), Unreachable))")
+}
+
+// The initializer leaves the block before the binding could hold anything, so the binding
+// is declared with no value and the marker stands between the call and the declaration.
+test "a Never call as a let initializer runs as a statement before the unreachable marker" {
+    let body = probe_body("cg_stmt_never_let_init", #"fn main() {
+    let _x = env.exit(3)
+}
+"#, "main")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Block(ExprStmt(EffectPerform(FieldGet(EvidenceVector), Const)), Unreachable), Let)")
+}
+
+// The declared type does not change what the initializer does: it still leaves the block.
+test "a Never call as the initializer of a let with a declared type leaves the block" {
+    let body = probe_body("cg_stmt_never_let_declared", #"fn main() {
+    let x: Int = env.exit(4)
+    let _keep = [x]
+}
+"#, "main")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Block(ExprStmt(EffectPerform(FieldGet(EvidenceVector), Const)), Unreachable), Let, Let(ContainerNew(Cast(Cast(VarRef)))))")
+}
+
+// An arm whose tail is a Never call assigns nothing. It gets the same marker a return tail
+// and a let initializer get.
+test "a Never call ending a match arm in value position is followed by the unreachable marker" {
+    let body = probe_body("cg_stmt_never_assign_arm", #"fn main() {
+    let c = 1
+    let picked = match c {
+        1 => 10
+        _ => env.exit(9)
+    }
+    let _keep = [picked]
+}
+"#, "main")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let, Block(Let(VarRef), Switch(VarRef, Const, Block(Block(Assign(VarRef, Const))), Block(Block(Block(ExprStmt(EffectPerform(FieldGet(EvidenceVector), Const)), Unreachable))))), Let(VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))")
 }
