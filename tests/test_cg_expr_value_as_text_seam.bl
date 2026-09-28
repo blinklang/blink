@@ -2,8 +2,8 @@
 // type this compiler can print, and a print argument needs the same answer, so the print
 // asks this seam rather than growing a second renderer that can drift from the first.
 
-import lower_test_helpers.{probe, rhs_of, assert_kind, assert_eq_str, assert_verifies}
-import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid}
+import lower_test_helpers.{probe, probe_but, rhs_of, assert_kind, assert_eq_str, assert_verifies, assert_ice_saying}
+import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid, ir_node_count}
 import cg_expr.{cg_expr_pending_count, cg_expr_take_pending, lower_value_as_text}
 
 fn src() -> Str {
@@ -26,6 +26,10 @@ fn main() {
     let _keep = [n, f.to_int(), c.to_int()]
     let _keep2 = [s, r.label]
     let _keep3 = [b]
+    let pair = (n, s)
+    let nest = (n, (b, c))
+    let shown = (r, f)
+    let _keep4 = [pair.0, nest.0, shown.0.id]
 }
 "#
 }
@@ -106,4 +110,76 @@ test "a bool renders through a temp and leaves the statements that fill it to th
     assert_eq_str("the answer names the temp the declaration binds",
         ir_c_name(id), ir_c_name(stmts.get(0).unwrap()))
     for s in stmts { assert_verifies("pending", s) }
+}
+
+// A tuple has no Display impl of its own: it shows its elements, each the way a hole of
+// that element's type shows, between parentheses and joined by a comma. The value is read
+// once into a temp, since each element is a read of it and the expression may have effects.
+test "a tuple renders its elements through one format call" {
+    probe("cg_expr_text", src())
+    let id = lower_value_as_text(rhs_of("pair"))
+    assert_kind("kind", id, IrKind.CallRuntime)
+    assert_eq_str("symbol", ir_c_name(id), "blink_str_format")
+    assert_eq_str("format", ir_c_name(ir_kid(id, 0)), #""(%lld, %s)""#)
+    assert_eq_str("promotion", ir_c_spelling(ir_kid(id, 1)), "long long")
+    assert_kind("element read", ir_kid(id, 2), IrKind.FieldGet)
+    let stmts = cg_expr_take_pending(0)
+    assert_eq(stmts.len(), 1)
+    assert_kind("the tuple is bound once", stmts.get(0).unwrap(), IrKind.Let)
+    assert_verifies("verify", id)
+    for st in stmts { assert_verifies("pending", st) }
+}
+
+test "a nested tuple renders through the same element renderer" {
+    probe("cg_expr_text", src())
+    let id = lower_value_as_text(rhs_of("nest"))
+    assert_kind("kind", id, IrKind.CallRuntime)
+    assert_eq_str("format", ir_c_name(ir_kid(id, 0)), #""(%lld, %s)""#)
+    let inner = ir_kid(id, 2)
+    assert_kind("inner kind", inner, IrKind.CallRuntime)
+    assert_eq_str("inner symbol", ir_c_name(inner), "blink_str_format")
+    assert_eq_str("inner format", ir_c_name(ir_kid(inner, 0)), #""(%s, %s)""#)
+    assert_kind("a bool element is the temp its if fills", ir_kid(inner, 1), IrKind.VarRef)
+    assert_eq_str("a char element is rendered by the runtime", ir_c_name(ir_kid(inner, 2)), "blink_char_to_str")
+    assert_verifies("verify", id)
+    for st in cg_expr_take_pending(0) { assert_verifies("pending", st) }
+}
+
+test "a struct element renders through its own Display impl" {
+    probe("cg_expr_text", src())
+    let id = lower_value_as_text(rhs_of("shown"))
+    assert_kind("kind", id, IrKind.CallRuntime)
+    assert_eq_str("format", ir_c_name(ir_kid(id, 0)), #""(%s, %g)""#)
+    assert_kind("struct element", ir_kid(id, 1), IrKind.CallDirect)
+    assert_verifies("verify", id)
+}
+
+fn src_ambiguous_element() -> Str {
+    #"type Wrapped { n: Int }
+
+impl Display for Wrapped {
+    fn fmt(self, sb: StringBuilder) { sb.write("a") }
+}
+
+impl Display for Wrapped {
+    fn fmt(_self, sb2: StringBuilder) { sb2.write("b") }
+}
+
+fn main() {
+    let w = Wrapped { n: 1 }
+    let paired = (1, w)
+    let _keep = [paired.0]
+}
+"#
+}
+
+// An element that cannot be shown refuses the whole tuple before any of it is built, so
+// neither the tuple temp nor the elements read ahead of it are left in the unit.
+test "a tuple whose element cannot be shown is refused before anything is built" {
+    probe_but("cg_expr_text_refused_element", src_ambiguous_element(), "OverlappingImpls")
+    let before = ir_node_count()
+    assert_ice_saying("ambiguous element", lower_value_as_text(rhs_of("paired")),
+        "ImplAmbiguous", "declares the trait `Display`")
+    assert_eq_str("nodes built", "{ir_node_count() - before}", "0")
+    assert_eq(cg_expr_pending_count(), 0)
 }

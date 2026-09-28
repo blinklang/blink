@@ -23,7 +23,7 @@ import parser.{
 }
 import ast.{NodeKind, nk_of, node_kind_name}
 import typecheck.{
-    TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, is_integer_type, type_bit_width,
+    TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, tc_tid_child_count, is_integer_type, type_bit_width,
     lookup_named_type, tc_field_tid_at_instance, is_import_module_name,
     tc_qualifier_to_module_or_self, tc_tid_struct, tc_global_decl_node, tc_fn_value_decl_node, tc_type_str,
     TYPE_INT, TYPE_BOOL, TYPE_STR, TYPE_VOID,
@@ -49,7 +49,7 @@ import ir.{
 }
 import cg_stmt.{cg_stmt_return_value}
 import cg_call.{
-    lower_call, lower_operator_method, lower_display_call, lower_display_of_value,
+    lower_call, lower_operator_method, lower_display_of_value, cg_call_display_resolves,
     lower_spread, lower_element_read, lower_element_store, cc_enum_variant_construct,
     lower_await_expr, lower_fn_value, lower_channel_new,
 }
@@ -2085,11 +2085,33 @@ fn x_interp_hole(part: Int) -> InterpHole ! Diag.Report {
     let tid = tid_of_node(part)
     if tid < 0 { return InterpHole {} }
     if x_kind(tid) == TyKind.Never { return x_never_hole(part) }
-    let spec = format_spec_of(tid)
-    if spec == "" { return x_unprintable_hole(part, tid) }
-    let arg = x_interp_arg(part, tid)
-    if arg < 0 { return InterpHole {} }
-    InterpHole { spec: spec, arg: arg }
+    if !x_renderable(part, tid) { return InterpHole {} }
+    let value = lower_expr(part)
+    if value < 0 { return InterpHole {} }
+    x_render_value(part, tid, value)
+}
+
+// Every refusal a render can meet, asked before the value is lowered, so a refused hole
+// leaves no node and no hoisted statement behind. A tuple asks it of each element.
+fn x_renderable(node: Int, tid: Int) -> Bool ! Diag.Report {
+    if format_spec_of(tid) != "" { return true }
+    let k = x_kind(tid)
+    if k == TyKind.Struct || k == TyKind.Enum { return cg_call_display_resolves(node, tid) }
+    if k != TyKind.Tuple {
+        diag_ice_at("StructuralHoleNotRendered", CODEGEN_STAGE_NOT_BUILT,
+            "a {tk_name(k)} value has no rendering this stage builds", node,
+            "a struct or an enum shows through its Display impl and a tuple through its elements; typecheck must reject any other type")
+        return false
+    }
+    if x_stopped(x_local(tid, node)) { return false }
+    let n = tc_tid_child_count(tc_resolve(tid))
+    let mut i = 0
+    while i < n {
+        if x_stopped(x_member(tid, Slot.Elem(i), node)) { return false }
+        if !x_renderable(node, child_tid(tid, Slot.Elem(i))) { return false }
+        i = i + 1
+    }
+    true
 }
 
 // A Never hole is the thing that diverges, so it is lowered once for its effect and the
@@ -2106,32 +2128,75 @@ fn x_never_hole(part: Int) -> InterpHole ! Diag.Report {
     InterpHole { spec: format_spec_of(TYPE_INT), arg: ir_cast(TYPE_INT, part, word.c_spelling, zero) }
 }
 
-// A hole no printf conversion prints. Only a struct or an enum declares a type that can
-// carry `impl Display`, so only those two call that impl. Typecheck also shows a tuple, and
-// it shows one from its elements, which this stage does not render yet.
-//
-// The call answers a string, so the formatter takes the conversion a string takes. Layout
-// answers what that is, because this file spells no conversion of its own.
-fn x_unprintable_hole(part: Int, tid: Int) -> InterpHole ! Diag.Report {
+// The one way a value of a printable type becomes a conversion and its argument. A hole
+// and a tuple element both come here, so the two cannot show one type two ways. The
+// caller has asked x_renderable first.
+fn x_render_value(node: Int, tid: Int, value: Int) -> InterpHole ! Diag.Report {
+    let spec = format_spec_of(tid)
+    if spec == "" { return x_unprintable_hole(node, tid, value) }
+    let arg = x_text_arg(node, tid, value)
+    if arg < 0 { return InterpHole {} }
+    InterpHole { spec: spec, arg: arg }
+}
+
+fn x_text_arg(node: Int, tid: Int, value: Int) -> Int ! Diag.Report {
     let k = x_kind(tid)
-    if k != TyKind.Struct && k != TyKind.Enum {
-        diag_ice_at("StructuralHoleNotRendered", CODEGEN_STAGE_NOT_BUILT,
-            "a {tk_name(k)} hole renders from its parts, and this stage does not build that", part,
-            "only a struct or an enum can carry the Display impl this stage calls")
-        return InterpHole {}
-    }
-    let shown = lower_display_call(part)
+    if k == TyKind.Bool { return x_bool_text(node, value) }
+    if k == TyKind.Char { return x_char_text(node, value) }
+    x_promote_for_varargs(node, tid, value)
+}
+
+// A value no printf conversion prints. Only a struct or an enum declares a type that can
+// carry `impl Display`, so only those two call that impl. Typecheck also shows a tuple, and
+// it shows one from its elements.
+//
+// Each answers a string, so the formatter takes the conversion a string takes. Layout
+// answers what that is, because this file spells no conversion of its own.
+fn x_unprintable_hole(node: Int, tid: Int, value: Int) -> InterpHole ! Diag.Report {
+    if x_kind(tid) == TyKind.Tuple { return x_tuple_text(node, tid, value) }
+    let shown = lower_display_of_value(node, tid, value)
     if shown < 0 { return InterpHole {} }
     InterpHole { spec: format_spec_of(TYPE_STR), arg: shown }
 }
 
-fn x_interp_arg(part: Int, tid: Int) -> Int ! Diag.Report {
-    let k = x_kind(tid)
-    if k == TyKind.Bool { return x_bool_text(part, tid) }
-    let value = lower_expr(part)
-    if value < 0 { return -1 }
-    if k == TyKind.Char { return x_char_text(part, value) }
-    x_promote_for_varargs(part, tid, value)
+// A tuple shows its elements between parentheses, joined by a comma, all through one format
+// call. Every element is a read of the tuple and the expression that made it may have an
+// effect, so the value is bound once and each element reads the binding.
+fn x_tuple_text(node: Int, tid: Int, value: Int) -> InterpHole ! Diag.Report {
+    let text = x_local(TYPE_STR, node)
+    if x_stopped(text) { return InterpHole {} }
+    let whole = x_local(tid, node)
+    if x_stopped(whole) { return InterpHole {} }
+    let name = c_mint_local("x")
+    x_hoist(ir_let(tid, node, whole.c_spelling, name, whole.slot_form, value))
+    let n = tc_tid_child_count(tc_resolve(tid))
+    let mut fmt = "("
+    let mut args: List[Int] = []
+    let mut i = 0
+    while i < n {
+        let mem = x_member(tid, Slot.Elem(i), node)
+        if x_stopped(mem) { return InterpHole {} }
+        let target = ir_var_ref(tid, node, whole.c_spelling, name, whole.slot_form)
+        let elem_tid = child_tid(tid, Slot.Elem(i))
+        let elem = x_tuple_element(node, elem_tid,
+            ir_field_get(elem_tid, node, mem.c_spelling, c_tuple_member(i), mem.slot_form, target))
+        if elem.spec == "" { return InterpHole {} }
+        if i > 0 { fmt = fmt.concat(", ") }
+        fmt = fmt.concat(elem.spec)
+        args.push(elem.arg)
+        i = i + 1
+    }
+    fmt = fmt.concat(")")
+    let mut call_args = [ir_const(TYPE_STR, node, text.c_spelling, c_string_literal(fmt))]
+    for a in args { call_args.push(a) }
+    let shown = ir_call_runtime(TYPE_STR, node, text.c_spelling, c_runtime_helper("str_format"), text.slot_form, call_args)
+    InterpHole { spec: format_spec_of(TYPE_STR), arg: shown }
+}
+
+// An element shows as a hole of its own type does, so a Str element is not quoted. The
+// spec has not settled that form, and this is the one function a change to it touches.
+fn x_tuple_element(node: Int, tid: Int, value: Int) -> InterpHole ! Diag.Report {
+    x_render_value(node, tid, value)
 }
 
 // C promotes a narrow integer across `...`, and the cast must name the promoted width or
@@ -2142,26 +2207,24 @@ fn x_promote_for_varargs(part: Int, tid: Int, value: Int) -> Int ! Diag.Report {
     ir_cast(tid, part, promoted, value)
 }
 
-fn x_char_text(part: Int, value: Int) -> Int ! Diag.Report {
-    let rec = x_local(TYPE_STR, part)
+fn x_char_text(node: Int, value: Int) -> Int ! Diag.Report {
+    let rec = x_local(TYPE_STR, node)
     if x_stopped(rec) { return -1 }
-    ir_call_runtime(TYPE_STR, part, rec.c_spelling, c_runtime_helper("char_to_str"), rec.slot_form, [value])
+    ir_call_runtime(TYPE_STR, node, rec.c_spelling, c_runtime_helper("char_to_str"), rec.slot_form, [value])
 }
 
-// C has no conditional IR node and the runtime has no bool-to-text helper, so a Bool hole
+// C has no conditional IR node and the runtime has no bool-to-text helper, so a Bool value
 // becomes a Str temp an `if` fills. The two words are the Display of a Bool, not C text.
-fn x_bool_text(part: Int, _tid: Int) -> Int ! Diag.Report {
-    let cond = lower_expr(part)
-    if cond < 0 { return -1 }
-    let rec = x_local(TYPE_STR, part)
+fn x_bool_text(node: Int, cond: Int) -> Int ! Diag.Report {
+    let rec = x_local(TYPE_STR, node)
     if x_stopped(rec) { return -1 }
-    let name = x_bind(TYPE_STR, part, ir_const(TYPE_STR, part, rec.c_spelling, c_string_literal(bool_false)))
-    if name == "" { return -1 }
-    let target = x_ref(TYPE_STR, part, name)
-    if target < 0 { return -1 }
-    let yes = ir_const(TYPE_STR, part, rec.c_spelling, c_string_literal(bool_true))
-    x_hoist(ir_if(part, cond, ir_block(part, [ir_assign(part, target, yes)]), -1))
-    x_ref(TYPE_STR, part, name)
+    let name = c_mint_local("x")
+    let no = ir_const(TYPE_STR, node, rec.c_spelling, c_string_literal(bool_false))
+    x_hoist(ir_let(TYPE_STR, node, rec.c_spelling, name, rec.slot_form, no))
+    let target = ir_var_ref(TYPE_STR, node, rec.c_spelling, name, rec.slot_form)
+    let yes = ir_const(TYPE_STR, node, rec.c_spelling, c_string_literal(bool_true))
+    x_hoist(ir_if(node, cond, ir_block(node, [ir_assign(node, target, yes)]), -1))
+    ir_var_ref(TYPE_STR, node, rec.c_spelling, name, rec.slot_form)
 }
 
 fn x_all_literal(parts: Int) -> Bool {
