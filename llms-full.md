@@ -737,6 +737,7 @@ result.exit_code    // Int — exit code
 | `.sub(other)` | Duration | Subtract durations |
 | `.scale(n)` | Duration | Multiply by integer |
 | `.is_zero()` | Bool | Zero duration? |
+| `.to_iso8601()` | Str | ISO 8601 duration (`PT1H2M3.5S`) |
 
 ## Instant Methods
 
@@ -754,6 +755,7 @@ let start = time.read()
 // ... work ...
 let elapsed = time.read().since(start)
 io.println("Took {elapsed.to_ms()} ms")
+io.println("Took {elapsed}")          // Display: "1.234s"
 
 let d = Duration.seconds(5)
 time.sleep(d)
