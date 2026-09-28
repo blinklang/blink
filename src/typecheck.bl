@@ -3008,8 +3008,9 @@ pub fn lookup_named_type(name: Str) -> Int {
 // is synthesized here, because layout reads a struct's shape and cname its symbol through
 // a declaration node, and a tid without one has no C answer at all. The early return keeps
 // a real declaration the sole answer for its name -- registering a second would make the
-// name ambiguous and lose the one the program wrote.
-fn ensure_runtime_struct_type(name: Str, fnames: List[Str], ftids: List[Int]) -> Int {
+// name ambiguous and lose the one the program wrote. `derives` must match that lib/std
+// declaration's @derive, or the type's traits would depend on whether it was loaded.
+fn ensure_runtime_struct_type(name: Str, fnames: List[Str], ftids: List[Int], derives: List[Str]) -> Int {
     let existing = lookup_named_type(name)
     if existing != -1 { return existing }
     let tid = new_type(TyKind.Struct, name)
@@ -3024,14 +3025,14 @@ fn ensure_runtime_struct_type(name: Str, fnames: List[Str], ftids: List[Int]) ->
         ftypes.push(tc_tid_name(ftid))
         i = i + 1
     }
-    let td = synth_struct_decl(name, fnames, ftypes)
+    let td = synth_struct_decl(name, fnames, ftypes, derives)
     tc_register_type_decl_node(name, name, tid, td)
     tc_struct_decl_nodes.insert(name, td)
     tid
 }
 
 fn runtime_process_result_tid() -> Int {
-    ensure_runtime_struct_type("ProcessResult", ["out", "err_out", "exit_code"], [TYPE_STR, TYPE_STR, TYPE_INT])
+    ensure_runtime_struct_type("ProcessResult", ["out", "err_out", "exit_code"], [TYPE_STR, TYPE_STR, TYPE_INT], [])
 }
 
 // The err type of the public fs.* surface. When std.fs is imported its `struct FsError`
@@ -15703,19 +15704,6 @@ fn cmp_is_enum_int_pair(lt: Int, rt: Int) -> Int {
     0
 }
 
-// Builtin types that implement Eq+Ord per spec §3.6 (03_types.md:1822)
-// but are represented as plain structs/kinds in the type pool (no @derive, no
-// user impl). Instant/Duration are `{ nanos: Int }` structs; Bytes is TyKind.Bytes.
-fn is_builtin_eq_ord_type(tid: Int) -> Int {
-    let k = type_kind(tid)
-    if k == TyKind.Bytes { return 1 }
-    if k == TyKind.Struct {
-        let n = tc_type_name(tid)
-        if n == "Instant" || n == "Duration" { return 1 }
-    }
-    0
-}
-
 // Are `lt`/`rt` valid comparison operands? `relational` distinguishes
 // `<`/`>`/`<=`/`>=` (needs Ord) from `==`/`!=` (needs Eq). Callers handle the
 // enum-vs-Int exception and int-literal coercion BEFORE calling this.
@@ -15779,11 +15767,9 @@ fn cmp_operands_ok(lt: Int, rt: Int, relational: Int) -> Int {
         return 1
     }
 
-    // Builtin Eq+Ord types (Instant/Duration/Bytes): same type, any comparison.
-    if is_builtin_eq_ord_type(a) != 0 && ka == kb {
-        if ka == TyKind.Struct && tc_type_name(a) != tc_type_name(b) { return 0 }
-        return 1
-    }
+    // Bytes is a kind, not a declaration, so no derive or impl can give it Eq
+    // (03_types.md:659).
+    if ka == TyKind.Bytes && kb == TyKind.Bytes { return 1 }
 
     // User struct: must be the SAME nominal type and carry the right impl
     // (equality needs Eq, relational needs Ord) — structs have no intrinsic
@@ -18128,7 +18114,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // lookup runs first inside ensure_runtime_struct_type, so the declared tid wins
                 // and `.to_ms()` on the result still resolves through `Duration_to_ms`. Same
                 // idempotent-mint reasoning as the Instant tid at the time.read() arm.
-                return ensure_runtime_struct_type("Duration", ["nanos"], [TYPE_INT])
+                return ensure_runtime_struct_type("Duration", ["nanos"], [TYPE_INT], ["Eq", "Ord", "Clone", "Debug"])
             }
             // The synthesized sealed Display.display() has no user-written fnsig; it
             // always returns Str.
@@ -18242,7 +18228,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // would intern Result[Char, -1], a -1 escaping as the carrier's err
                     // arm. Mint-or-return through ensure_runtime_struct_type so the err
                     // arm is a concrete Struct tid by construction.
-                    return make_result_type(TYPE_CHAR, ensure_runtime_struct_type("ConversionError", ["message", "source_type", "target_type"], [TYPE_STR, TYPE_STR, TYPE_STR]))
+                    return make_result_type(TYPE_CHAR, ensure_runtime_struct_type("ConversionError", ["message", "source_type", "target_type"], [TYPE_STR, TYPE_STR, TYPE_STR], []))
                 }
             }
             // A user-effect operation call — `db.query(..)`, `storage.get_names()`. The
@@ -18273,7 +18259,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // is normally present — but a silent fall-through when it is not would
                     // be the same fail-open erasure as the process builtins had. Mint it,
                     // so the type is right whether or not std.time is in scope.
-                    return ensure_runtime_struct_type("Instant", ["nanos"], [TYPE_INT])
+                    return ensure_runtime_struct_type("Instant", ["nanos"], [TYPE_INT], ["Eq", "Ord", "Hash", "Clone", "Debug"])
                 }
                 if obj_name == "time" && method == "sleep" { return TYPE_VOID }
             }
