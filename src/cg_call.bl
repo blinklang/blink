@@ -188,6 +188,8 @@ pub fn lower_operator_method(node: Int, op: Str) -> Int ! Diag.Report {
     // what is being compared.
     let operand = tid_of_node(node_left(node))
     if operand < 0 { return -1 }
+    // Resolved before the operands are lowered, so a refusal leaves no node behind.
+    if !cc_equality_resolves(node, operand) { return -1 }
     let lhs = lower_expr(node_left(node))
     if lhs < 0 { return -1 }
     let rhs = lower_expr(node_right(node))
@@ -213,16 +215,48 @@ fn cc_values_equal(node: Int, tid: Int, lhs: Int, rhs: Int) -> Int ! Diag.Report
     let rec = cc_local(tid, node)
     if cc_stopped(rec) { return -1 }
     if x_is_c_comparable(tid, rec) { return ir_binary(TYPE_BOOL, node, bools.c_spelling, "==", lhs, rhs) }
+    let symbol = cc_declared_equality(node, tid)
+    if symbol == "" { return -1 }
+    ir_call_direct(TYPE_BOOL, node, bools.c_spelling, symbol, bools.slot_form, [lhs, rhs])
+}
+
+// Whether cc_values_equal can lower `tid` without refusing, asked with no node built. A
+// carrier is asked of each payload it holds, since its compare reaches each one.
+fn cc_equality_resolves(node: Int, tid: Int) -> Bool ! Diag.Report {
+    let k = cc_kind(tid)
+    if k == TyKind.Str || k == TyKind.Bytes || k == TyKind.Float { return true }
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return false }
+    if k == TyKind.Option || k == TyKind.Result {
+        if rec.slot_form == SlotForm.InlineWord {
+            diag_ice_at("HandleOptionEqualityNotBuilt", CODEGEN_STAGE_NOT_BUILT,
+                "`==` on an Option over an opaque handle is not built", node,
+                "the handle Option holds no tag; its equality needs its own lowering")
+            return false
+        }
+        if !cc_payload_equality_resolves(node, child_tid(tid, Slot.Inner1)) { return false }
+        if k == TyKind.Result { return cc_payload_equality_resolves(node, child_tid(tid, Slot.Inner2)) }
+        return true
+    }
+    if x_is_c_comparable(tid, rec) { return true }
+    cc_declared_equality(node, tid) != ""
+}
+
+fn cc_payload_equality_resolves(node: Int, inner: Int) -> Bool ! Diag.Report {
+    if cc_kind(inner) == TyKind.Void { return true }
+    cc_equality_resolves(node, inner)
+}
+
+// The method a declared type's `==` calls. "" is answered after an internal error is recorded.
+fn cc_declared_equality(node: Int, tid: Int) -> Str ! Diag.Report {
     let decl = tc_tid_decl_node(tid)
     if decl < 0 {
         diag_ice_at("EqualityOperandNotDerived", CODEGEN_STAGE_NOT_BUILT,
-            "a {tk_name(k)} operand has no derived equality method", node,
+            "a {tk_name(cc_kind(tid))} operand has no derived equality method", node,
             "only a declared struct or enum derives Eq; another operand needs its own lowering")
-        return -1
+        return ""
     }
-    let symbol = cc_equality_symbol(node, decl, tid)
-    if symbol == "" { return -1 }
-    ir_call_direct(TYPE_BOOL, node, bools.c_spelling, symbol, bools.slot_form, [lhs, rhs])
+    cc_equality_symbol(node, decl, tid)
 }
 
 fn cc_helper_equal(node: Int, bools: LayoutRecord, helper: Str, lhs: Int, rhs: Int) -> Int {
@@ -231,17 +265,12 @@ fn cc_helper_equal(node: Int, bools: LayoutRecord, helper: Str, lhs: Int, rhs: I
 
 // Tags first: the payload member of an arm the value is not in holds whatever was there
 // before, so it is read only once both tags name the same arm. Both sides are bound, since
-// the tag and the payload each read them.
+// the tag and the payload each read them. cc_equality_resolves has already refused the
+// handle Option, which holds no tag.
 fn cc_carrier_equal(node: Int, tid: Int, bools: LayoutRecord, lhs: Int, rhs: Int) -> Int ! Diag.Report {
     let c = cc_carrier_held(node, tid, cc_local(tid, node))
     if cc_carrier_missing(c) { return -1 }
     if cc_guard_stopped(c.g) { return -1 }
-    if c.held.slot_form == SlotForm.InlineWord {
-        diag_ice_at("HandleOptionEqualityNotBuilt", CODEGEN_STAGE_NOT_BUILT,
-            "`==` on an Option over an opaque handle is not built", node,
-            "the handle Option holds no tag; its equality needs its own lowering")
-        return -1
-    }
     let _td = ensure_typedef_for(tid)
     let left = c_mint_local("eq")
     let right = c_mint_local("eq")
