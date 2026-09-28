@@ -262,7 +262,7 @@ let map: Map[Str, List[Int]] = build_index()
 fn first[T](items: List[T]) -> T? { items.get(0) }
 ```
 
-`List[Str]` can never be confused with indexing (Blink uses `.get()` for element access) or comparison. This directly serves the compiler-as-service goal: a simpler parser means faster incremental compilation, better error recovery, and easier tooling.
+`List[Str]` can never be confused with indexing (Blink uses `.get()` for element access) or comparison. A bracket suffix that holds a value, such as `xs[1]`, is `error[NoIndexOperator]` (E0313, §3.4 *Postfix Brackets That Are Not a Type Application*). This directly serves the compiler-as-service goal: a simpler parser means faster incremental compilation, better error recovery, and easier tooling.
 
 ### 2.7 Multi-line Continuation
 

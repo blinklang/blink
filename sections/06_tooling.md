@@ -710,7 +710,7 @@ test "process_order logs the order ID" {
     }
 
     assert_eq(log_messages.len(), 1)
-    assert(log_messages[0].contains("Processing order 42"))
+    assert(log_messages.get(0).unwrap().contains("Processing order 42"))
 }
 ```
 
@@ -736,7 +736,7 @@ with capture_log(msgs) {
     do_work()
 }
 assert_eq(msgs.len(), 2)
-assert(msgs[0].contains("started"))
+assert(msgs.get(0).unwrap().contains("started"))
 
 // Compose with other handlers
 with mock_db(data), capture_log(msgs) {
@@ -748,7 +748,7 @@ with mock_db(data), capture_log(msgs) {
 
 ```blink
 assert_eq(msgs.len(), 3)                          // exact count
-assert(msgs[0].contains("order 42"))              // substring match
+assert(msgs.get(0).unwrap().contains("order 42"))              // substring match
 assert_eq(msgs, ["started", "processing", "done"]) // exact match
 assert(msgs.any(fn(m) { m.contains("error") }))  // any-match
 ```
@@ -935,9 +935,9 @@ test "retry backoff sleeps with increasing delay" {
         retry_with_backoff(fn() { Err("transient") })
     }
     assert_eq(mc.elapsed().len(), 3)
-    assert_eq(mc.elapsed()[0], Duration.ms(100))
-    assert_eq(mc.elapsed()[1], Duration.ms(200))
-    assert_eq(mc.elapsed()[2], Duration.ms(400))
+    assert_eq(mc.elapsed().get(0).unwrap(), Duration.ms(100))
+    assert_eq(mc.elapsed().get(1).unwrap(), Duration.ms(200))
+    assert_eq(mc.elapsed().get(2).unwrap(), Duration.ms(400))
 }
 
 test "timeout fires after configured interval" {
@@ -1037,7 +1037,7 @@ test "scheduled job logs progress with mocked clock and env" {
         run_scheduled_job()
     }
     assert_eq(logs.len(), 2)
-    assert(logs[0].contains("batch_size=100"))
+    assert(logs.get(0).unwrap().contains("batch_size=100"))
 }
 ```
 
