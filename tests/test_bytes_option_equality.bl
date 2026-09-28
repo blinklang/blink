@@ -1,0 +1,173 @@
+// Bytes implements Eq and not Ord (sections/03_types.md:659), so `==` compares content,
+// not the handle, and `<` is rejected. Option `==` compares tags first and then the
+// payloads by the payload type's own `==`, so a struct payload goes through its Eq method
+// and a Str field in it is compared by text.
+//
+// Rejection rows run through the compiler in a SUBPROCESS: they are compile errors, so an
+// in-file row could not be red without failing to compile the whole test file.
+
+import std.process.{ProcessResult}
+
+@derive(Eq)
+type Keyed { key: Int  note: Str }
+
+fn built(text: Str) -> Str {
+    let sb = StringBuilder.new()
+    sb.write(text)
+    sb.to_str()
+}
+
+test "Bytes == compares content, not the handle" {
+    let a = Bytes.from_str("abc")
+    let b = Bytes.from_str("abc")
+    assert(a == b)
+    assert(!(a != b))
+}
+
+test "Bytes != sees a different byte and a different length" {
+    let a = Bytes.from_str("abc")
+    assert(a != Bytes.from_str("abd"))
+    assert(a != Bytes.from_str("ab"))
+    assert(Bytes.from_str("ab") != a)
+    assert(!(a == Bytes.from_str("abd")))
+}
+
+test "empty Bytes are equal" {
+    assert(Bytes.new() == Bytes.from_str(""))
+}
+
+test "Option[Int] compares tag first, then the payload" {
+    let none_a: Option[Int] = None
+    let none_b: Option[Int] = None
+    let one: Option[Int] = Some(1)
+    let two: Option[Int] = Some(2)
+    assert(none_a == none_b)
+    assert(one == Some(1))
+    assert(one != none_a)
+    assert(none_a != one)
+    assert(one != two)
+    assert(!(one == two))
+}
+
+test "Option[Str] compares the text, not the pointer" {
+    let a: Option[Str] = Some(built("hello"))
+    let b: Option[Str] = Some(built("hello"))
+    let c: Option[Str] = Some(built("world"))
+    assert(a == b)
+    assert(a != c)
+}
+
+test "nested Option compares each level" {
+    let deep_one: Option[Option[Int]] = Some(Some(1))
+    let deep_two: Option[Option[Int]] = Some(Some(2))
+    let deep_none: Option[Option[Int]] = Some(None)
+    let top_none: Option[Option[Int]] = None
+    let inner_none: Option[Int] = None
+    assert(deep_one == Some(Some(1)))
+    assert(deep_one != deep_two)
+    assert(deep_one != deep_none)
+    assert(deep_none != top_none)
+    assert(deep_none == Some(inner_none))
+}
+
+// Result alone has no `==` at typecheck, but an Option payload does reach it, so its
+// two arms are compared tag first as well.
+test "Option of a Result compares tag first, then the arm's payload" {
+    let ok_one: Option[Result[Int, Str]] = Some(Ok(1))
+    let ok_one_again: Option[Result[Int, Str]] = Some(Ok(1))
+    let ok_two: Option[Result[Int, Str]] = Some(Ok(2))
+    let err_a: Option[Result[Int, Str]] = Some(Err(built("a")))
+    let err_a_again: Option[Result[Int, Str]] = Some(Err(built("a")))
+    let err_b: Option[Result[Int, Str]] = Some(Err(built("b")))
+    assert(ok_one == ok_one_again)
+    assert(ok_one != ok_two)
+    assert(ok_one != err_a)
+    assert(err_a == err_a_again)
+    assert(err_a != err_b)
+}
+
+test "Option[Bytes] compares the content" {
+    let a: Option[Bytes] = Some(Bytes.from_str("xy"))
+    let b: Option[Bytes] = Some(Bytes.from_str("xy"))
+    let c: Option[Bytes] = Some(Bytes.from_str("xz"))
+    assert(a == b)
+    assert(a != c)
+}
+
+test "Option of a struct compares through its Eq method" {
+    let a: Option[Keyed] = Some(Keyed { key: 1, note: built("first") })
+    let b: Option[Keyed] = Some(Keyed { key: 1, note: built("first") })
+    let c: Option[Keyed] = Some(Keyed { key: 1, note: built("other") })
+    let d: Option[Keyed] = Some(Keyed { key: 2, note: built("first") })
+    assert(a == b)
+    assert(a != c)
+    assert(a != d)
+}
+
+fn check_src(tag: Str, src: Str) -> ProcessResult {
+    let bl_path = ".tmp/_bytes_option_eq_{tag}.bl"
+    write_file(bl_path, src)
+    let r = process_run("build/blink", ["check", bl_path, "--format", "json"])
+    shell_exec("rm -f {bl_path}")
+    r
+}
+
+fn expect_rejected(tag: Str, src: Str, code: Str, words: Str) {
+    let r = check_src(tag, src)
+    let out = "{r.out}{r.err_out}"
+    if r.exit_code == 0 { io.println("FAIL[{tag}] accepted, expected rejection") }
+    assert(r.exit_code != 0)
+    if !out.contains(code) { io.println("FAIL[{tag}] want {code}, got: {out}") }
+    assert(out.contains(code))
+    if !out.contains(words) { io.println("FAIL[{tag}] want '{words}', got: {out}") }
+    assert(out.contains(words))
+}
+
+test "Bytes == typechecks" {
+    let r = check_src("bytes_eq", #"fn main() {
+    let a = Bytes.from_str("a")
+    let b = Bytes.from_str("b")
+    io.println("{a == b} {a != b}")
+}
+"#)
+    if r.exit_code != 0 { io.println("FAIL[bytes_eq] {r.out}{r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+test "Bytes < is rejected: Bytes has no Ord" {
+    expect_rejected("bytes_lt", #"fn main() {
+    let a = Bytes.from_str("a")
+    let b = Bytes.from_str("b")
+    io.println("{a < b}")
+}
+"#, "E0300", "binary `<` needs Ord, and Bytes does not implement Ord")
+}
+
+test "Option >= is rejected: Option has no Ord" {
+    expect_rejected("option_ge", #"fn main() {
+    let a: Option[Int] = Some(1)
+    let b: Option[Int] = None
+    io.println("{a >= b}")
+}
+"#, "E0300", "binary `>=` needs Ord, and Option[Int] does not implement Ord")
+}
+
+test "Int < Bool names the Bool as the side without Ord" {
+    expect_rejected("int_lt_bool", #"fn main() {
+    let n = 1
+    let flag = true
+    io.println("{n < flag}")
+}
+"#, "E0300", "binary `<` needs Ord, and Bool does not implement Ord")
+}
+
+test "a struct with Eq and no Ord is rejected by <" {
+    expect_rejected("eq_only_lt", #"@derive(Eq)
+type P { x: Int }
+fn main() {
+    let a = P { x: 1 }
+    let b = P { x: 2 }
+    io.println("{a < b}")
+}
+"#, "E0300", "binary `<` needs Ord, and P does not implement Ord")
+}
