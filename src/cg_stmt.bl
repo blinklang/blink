@@ -44,7 +44,7 @@ import cname.{
 import ir.{
     IrKind, ir_assign, ir_binary, ir_block, ir_break, ir_call_runtime, ir_carrier_tag,
     ir_cast, ir_cell_let, ir_cell_ref, ir_c_name, ir_c_spelling, ir_const, ir_continue,
-    ir_expr_stmt, ir_field_get, ir_global_ref, ir_if, ir_kid, ir_kid_count, ir_kind, ir_let,
+    ir_expr_stmt, ir_field_get, ir_global_ref, ir_if, ir_kid, ir_kid_count, ir_kids, ir_kind, ir_let,
     ir_loop, ir_mark_materialize, ir_new, ir_return, ir_slot_form, ir_span, ir_switch, ir_tid,
     ir_tuple_new, ir_unary, ir_unbox, ir_unreachable, ir_var_ref, ir_with_scope,
     ir_panic, ir_panic_catch, ir_panic_catch_exit, ir_volatile_let, ir_arena_scope,
@@ -279,7 +279,7 @@ pub fn lower_fn(fn_node: Int) -> Int ! Diag.Report {
     let saved_where = cs_exit_where
     cg_promote_body_enter()
     let mut stmts = if bound && body >= 0 { contract_entry(fn_node, tail == TAIL_RETURN) } else { [] }
-    let block = if bound && body >= 0 { lower_body_block(body, tail, "", -1) } else { -1 }
+    let block = if !bound || body < 0 { -1 } else if tail == TAIL_RETURN { lower_block_returning(body) } else { lower_block(body) }
     // A function with no result falls off the end of its body, which is an exit too.
     let falls_off = if block >= 0 && tail != TAIL_RETURN { contract_void_exit() } else { [] }
     cg_promote_body_exit()
@@ -513,7 +513,56 @@ pub fn lower_block(node: Int) -> Int ! Diag.Report {
 
 // A block whose tail value is the enclosing function's result. Answers -1 on a stop.
 pub fn lower_block_returning(node: Int) -> Int ! Diag.Report {
-    lower_body_block(node, TAIL_RETURN, "", -1)
+    let block = lower_body_block(node, TAIL_RETURN, "", -1)
+    let tail = body_tail_stmt(node)
+    if block < 0 || !tail_diverges_by_analysis(tail) { return block }
+    let mut stmts = ir_kids(block)
+    for s in diverging_tail_backstop(tail) { stmts.push(s) }
+    ir_block(node, stmts)
+}
+
+fn body_tail_stmt(body: Int) -> Int ! Diag.Report {
+    if body < 0 || nk_of(node_kind(body)) != NodeKind.Block { return body }
+    let stmts = node_stmts(body)
+    let n = if stmts == -1 { 0 } else { sublist_length(stmts) }
+    if n == 0 { return -1 }
+    let last = sublist_get(stmts, n - 1)
+    if nk_of(node_kind(last)) == NodeKind.ExprStmt { return node_value(last) }
+    last
+}
+
+// A tail typecheck calls Never because no path through it completes: a loop no break
+// leaves, or a block, `if` or `match` every path of which leaves. cc cannot see that, so
+// to cc the function falls off its end. A jump or a Never call carries its own exit.
+fn tail_diverges_by_analysis(s: Int) -> Bool ! Diag.Report {
+    if s < 0 || !leaves_by_type(s) { return false }
+    match nk_of(node_kind(s)) {
+        NodeKind.WhileLoop => true
+        NodeKind.LoopExpr => true
+        NodeKind.ForIn => true
+        NodeKind.Block => true
+        NodeKind.IfExpr => true
+        NodeKind.MatchExpr => true
+        NodeKind.WithBlock => true
+        NodeKind.AsyncScope => true
+        _ => false
+    }
+}
+
+// decisions/loop-tail-fallthrough.md Q4: release marks the tail unreachable, and a debug
+// build first fails loudly, so a divergence analysis bug is a labelled ICE rather than
+// undefined behaviour. The runtime's failure call is not declared noreturn, so the marker
+// follows it in debug too.
+fn diverging_tail_backstop(tail: Int) -> List[Int] ! Diag.Report {
+    if !cs_debug_mode { return [ir_unreachable(tail)] }
+    let fail = call_runtime_void(tail, c_debug_assert_fail_name(), [
+        str_const(tail, diag_file_for_node(tail)),
+        int_const(tail, "{node_line(tail)}"),
+        str_const(tail, cs_current_fn_name),
+        str_const(tail, "BLINK_ICE_DIVERGING_TAIL"),
+        str_const(tail, "internal compiler error: a tail typecheck accepted as diverging fell through"),
+    ])
+    [fail, ir_unreachable(tail)]
 }
 
 // A block whose tail value is stored into an already declared local of type `dest_tid`.
@@ -1416,9 +1465,9 @@ fn bind_unit_let(node: Int, tid: Int, init: Int, rec: LayoutRecord, name: Str, d
 // The initializer leaves the block before the binding holds anything, so the name is
 // declared with no value. It is still declared, because code after it must compile.
 fn bind_never_let(node: Int, tid: Int, init: Int, rec: LayoutRecord, name: Str, discard: Bool) -> Int ! Diag.Report {
-    let ran = lower_stmt_tail(init, TAIL_DISCARD, "", -1)
-    if ran < 0 { return -1 }
-    cg_expr_push_pending(node, left_block(init, ran))
+    let left = leave_through(init, init)
+    if left < 0 { return -1 }
+    cg_expr_push_pending(node, left)
     bind_and_declare_let(node, tid, rec, name, -1, discard)
 }
 
@@ -1536,6 +1585,8 @@ fn lower_assign(node: Int) -> Int ! Diag.Report {
         return ir_expr_stmt(node, poison_value(node))
     }
     let rhs = node_value(node)
+    // The right side leaves the block before it has a value, so nothing is stored.
+    if leaves_by_type(rhs) && !cg_expr_is_registered(rhs) { return leave_through(node, rhs) }
     let tid = stmt_tid(target)
     // `m = nothing()` reassigns a genuine Void-typed local: the RHS is a `void`-valued C
     // call, and the target already holds the placeholder int its own `let` gave it, so
@@ -1605,6 +1656,8 @@ fn lower_compound_assign(node: Int) -> Int ! Diag.Report {
         diag_ice_stage_not_built("an assignment to a place that is not a local", node)
         return ir_expr_stmt(node, poison_value(node))
     }
+    let rhs = node_value(node)
+    if leaves_by_type(rhs) && !cg_expr_is_registered(rhs) { return leave_through(node, rhs) }
     let tid = stmt_tid(target)
     if tid < 0 { return -1 }
     let lhs = lower_target(target)
@@ -1627,6 +1680,8 @@ fn lower_return(node: Int) -> Int ! Diag.Report {
         return ir_block(node, [ir_expr_stmt(node, value), ir_panic_catch_exit(node, frame)])
     }
     if v < 0 { return return_void(node) }
+    // A Never value has nothing to return, and C cannot return a `void` call.
+    if leaves_by_type(v) && !cg_expr_is_registered(v) { return leave_through(node, v) }
     let value = lower_value(v)
     if value < 0 { return -1 }
     cg_stmt_return_value(node, value)
@@ -2112,8 +2167,8 @@ fn body_fills(body: Int) -> Bool ! Diag.Report {
 fn tail_fills(s: Int) -> Bool ! Diag.Report {
     match nk_of(node_kind(s)) {
         NodeKind.LetBinding => leaves_by_type(s)
-        NodeKind.Assignment => leaves_by_type(s)
-        NodeKind.CompoundAssign => leaves_by_type(s)
+        NodeKind.Assignment => leaves_by_type(node_value(s))
+        NodeKind.CompoundAssign => leaves_by_type(node_value(s))
         NodeKind.WhileLoop => leaves_by_type(s)
         NodeKind.LoopExpr => leaves_by_type(s)
         NodeKind.ForIn => leaves_by_type(s)
@@ -2141,6 +2196,13 @@ fn leaves_by_type(node: Int) -> Bool ! Diag.Report {
 // there. Every seam that drops a Never value's slot shares this one spelling of it.
 fn left_block(node: Int, ran: Int) -> Int {
     ir_block(node, [ran, ir_unreachable(node)])
+}
+
+// A Never value run as a statement, followed by the marker.
+fn leave_through(node: Int, value: Int) -> Int ! Diag.Report {
+    let ran = lower_stmt_tail(value, TAIL_DISCARD, "", -1)
+    if ran < 0 { return -1 }
+    left_block(node, ran)
 }
 
 // ── If ────────────────────────────────────────────────────────────────────
