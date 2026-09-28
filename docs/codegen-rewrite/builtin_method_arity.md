@@ -103,6 +103,7 @@ method name and never the arm:
 | `Int.min`, `Int.max` | 1 | none |
 | sized `wrapping_add`, `wrapping_sub`, `wrapping_mul`, `wrapping_div`, `wrapping_rem` | 1 | none |
 | `Int.to_str`, `Int.to_string`, `Int.to_float`, `Int.abs`, `Int.to_i8` … `Int.to_u64` | 0 | none |
+| `Float.ieee_eq` | 1 | typed |
 | `Float.to_string`, `Float.to_int` | 0 | none |
 | `Char.to_int`, `Char.to_str` | 0 | none |
 | sized `to_int`, `to_i8` … `to_u64`, `wrapping_neg` | 0 | none |

@@ -1046,7 +1046,7 @@ show(42)          // "42"
 | `std.args` | CLI argument parsing (flags, options, commands) | `import std.args` |
 | `std.arena` | Arena introspection: `bytes_used()` returns live bytes in the innermost active `with arena { }` block | `import std.arena` |
 | `std.db` | SQLite database with effect-based API (`DB.Read`, `DB.Write`), `Template[DB]` parameterization, `Row`, `Stmt`, `DBError`, transactions | `import std.db` |
-| `std.float` | Float helpers: `fabs(x)` and `is_nan(x)` are `@pure`; `close_to(x, y, tol)` carries an `@ensures` clause. Methods: `x.fabs()`, `x.is_nan()`, `x.close_to(y, t)` | `import std.float` |
+| `std.float` | Float helpers: `fabs(x)` and `is_nan(x)` are `@pure`; `close_to(x, y, tol)` carries an `@ensures` clause. Methods: `x.fabs()`, `x.is_nan()`, `x.close_to(y, t)`. Float's `==` and `<` are a total order (NaN == NaN, NaN sorts above every other value, -0.0 == 0.0); the built-in `x.ieee_eq(y)` is the IEEE 754 escape, where NaN is unequal to everything | `import std.float` |
 | `std.http` | HTTP client and server | `import std.http` |
 | `std.io` | Derived I/O combinators. `read_fully(fd: Int, n: Int) -> Result[Bytes, Errno] ! IO` loops `libc.read_bytes` until exactly `n` bytes are read or EOF (a short read keeps looping; fewer than `n` is returned only at EOF, still `Ok`) | `import std.io` |
 | `std.errno` | `Errno` — transparent zero-cost newtype over `Int` (`pub type Errno { Errno(Int) }`), the error arm of the `*_bytes` syscall wrappers. Match `Errno(rc)` to read the code | `import std.errno` |

@@ -3210,6 +3210,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if cc_is_map_slot_method(kind, mname) { return cc_map_slot_method(node, obj, kind, mname) }
     if cc_is_scalar_cast(kind, mname) { return cc_scalar_cast(node, obj, kind, mname) }
     if cc_is_wrapping_arith(kind, mname) { return cc_wrapping_arith(node, obj, recv_tid, kind, mname) }
+    if cc_is_ieee_compare(kind, mname) { return cc_ieee_compare(node, obj, kind, mname) }
     if cc_is_char_text(kind, mname) { return cc_char_text(node, obj, kind, mname) }
     if cc_is_sb_write_char(kind, mname) { return cc_sb_write_char(node, obj) }
     if cc_is_str_as_cstr(kind, mname) { return cc_str_as_cstr(node, obj, kind, mname) }
@@ -3748,13 +3749,16 @@ fn cc_key_arg(node: Int, plan: KeyPlan, written: Int) -> Int ! Diag.Report {
 // `List.contains` walks the elements comparing each to the one the call was written with,
 // through the runtime's own table for the element's kind -- the same tables a Map or a Set
 // key already travels through to reach the runtime. The spec permits this scan for exactly
-// the four primitive element kinds a scalar table exists for -- Int, Bool, Str, Float --
-// and refuses every other kind, struct/enum included, whether or not the type happens to
-// carry a table of its own: deriving Hash earns a struct a table for a keyed container's
-// slot, not for this scan, so a struct's own table is never consulted here. An element is
-// also never boxed into a slot and never stored, so of the four ways a key can travel this
-// only ever takes Value (a Str reads its slot's pointer as itself) or Address (Int, Bool
-// and Float read through the address of a local) -- never Skipped or Boxed.
+// the four primitive element kinds -- Int, Bool, Str, Float -- and refuses every other
+// kind, struct/enum included, whether or not the type happens to carry a table of its own:
+// deriving Hash earns a struct a table for a keyed container's slot, not for this scan, so
+// a struct's own table is never consulted here. Float is the one kind with no table: a
+// table carries a hash, and Float has none (a hash cannot agree with -0.0 == 0.0), so a
+// Float element is compared by the runtime's own total-order equality directly. An element
+// is also never boxed into a slot and never stored, so of the four ways a key can travel
+// this only ever takes Value (a Str reads its slot's pointer as itself, and a Float is
+// handed over as a double) or Address (Int and Bool read through the address of a local)
+// -- never Skipped or Boxed.
 
 // Every layout question an element raises, asked in one place and before anything is
 // built. The table this answers is deliberately the same KeyPlan a keyed container plans
@@ -3776,6 +3780,9 @@ fn cc_element_plan(node: Int, container: Int) -> KeyPlan ! Diag.Report {
     }
     let value = cc_local(elem, node)
     if cc_stopped(value) { return stopped }
+    if k == TyKind.Float {
+        return KeyPlan { travel: KeyTravel.Value, tid: elem, value: value, slot: value }
+    }
     if value.kops_table == "" {
         cc_element_has_no_ops(node, elem)
         return stopped
@@ -3802,7 +3809,7 @@ fn cc_element_not_primitive(node: Int, elem_tid: Int) -> Int ! Diag.Report {
 // The backstop for a kind the spec DOES permit, in the one case the runtime does not, in
 // fact, ship that kind's table -- distinct from cc_element_not_primitive above, which
 // refuses a kind the spec never permitted in the first place. Unreached by anything the
-// standard library ships today, since all four primitive kinds carry a table.
+// standard library ships today, since Int, Bool and Str all carry a table.
 fn cc_element_has_no_ops(node: Int, elem_tid: Int) -> Int ! Diag.Report {
     diag_ice_at("ElementOperationsNotAvailable", UNSOLVED_TYPEVAR_AT_CODEGEN,
         "a scan over {tc_tid_name(elem_tid)} elements has no table of the operations they are compared by",
@@ -3881,11 +3888,7 @@ fn cc_element_scan(node: Int, container: Int) -> Int ! Diag.Report {
     if elem_arg < 0 { return -1 }
     let elem_binds = cg_expr_take_pending(elem_mark)
 
-    let eq_fn = ir_field_get(TYPE_INT, node, kops_eq_fn_spelling, "eq", SlotForm.Inline,
-        ir_global_ref(TYPE_INT, node, kops_table_spelling, plan.value.kops_table, SlotForm.Inline))
-    let hit = ir_binary(TYPE_BOOL, node, found_rec.c_spelling, "!=",
-        ir_call_indirect(TYPE_INT, node, "int", SlotForm.Inline, eq_fn, [elem_arg, needle]),
-        ir_const(TYPE_INT, node, "int", "0"))
+    let hit = cc_element_equal(node, plan, found_rec, elem_arg, needle)
     let matched = ir_if(node, hit,
         ir_block(node, [
             ir_assign(node, cc_temp_ref(node, TYPE_BOOL, found_rec, found_name),
@@ -3898,6 +3901,19 @@ fn cc_element_scan(node: Int, container: Int) -> Int ! Diag.Report {
     body.push(matched)
     cg_expr_push_pending(node, ir_loop(node, ir_block(node, body)))
     cc_temp_ref(node, TYPE_BOOL, found_rec, found_name)
+}
+
+// A Float element has no kops table (see the section header), so it calls the helper.
+fn cc_element_equal(node: Int, plan: KeyPlan, found_rec: LayoutRecord, elem_arg: Int, needle: Int) -> Int ! Diag.Report {
+    if cc_kind(plan.tid) == TyKind.Float {
+        return ir_call_runtime(TYPE_BOOL, node, found_rec.c_spelling, c_runtime_helper("float_eq"),
+            found_rec.slot_form, [elem_arg, needle])
+    }
+    let eq_fn = ir_field_get(TYPE_INT, node, kops_eq_fn_spelling, "eq", SlotForm.Inline,
+        ir_global_ref(TYPE_INT, node, kops_table_spelling, plan.value.kops_table, SlotForm.Inline))
+    ir_binary(TYPE_BOOL, node, found_rec.c_spelling, "!=",
+        ir_call_indirect(TYPE_INT, node, "int", SlotForm.Inline, eq_fn, [elem_arg, needle]),
+        ir_const(TYPE_INT, node, "int", "0"))
 }
 
 // What the runtime hands back, and what the call answers with it.
@@ -4258,6 +4274,35 @@ fn cc_wrapping_arith(node: Int, obj: Int, recv_tid: Int, kind: TyKind, method: S
     let rhs_cast = ir_cast(unsigned_tid, node, unsigned_answer.c_spelling, rhs)
     let wrapped = ir_binary(unsigned_tid, node, unsigned_answer.c_spelling, wrapping_op_for_method(method), lhs_cast, rhs_cast)
     ir_cast(recv_tid, node, recv_answer.c_spelling, wrapped)
+}
+
+// ── IEEE 754 comparison ─────────────────────────────────────────────────
+//
+// Float's operators follow the spec's total order through the runtime helpers. `ieee_eq`
+// is the one way back to IEEE 754 equality, so it alone is C's own `==`: NaN is unequal to
+// everything, itself included.
+
+fn ieee_op_for_method(method: Str) -> Str {
+    let mut table: Map[Str, Str] = Map()
+    table.insert("ieee_eq", "==")
+    table.get(method) ?? ""
+}
+
+fn cc_is_ieee_compare(kind: TyKind, method: Str) -> Bool {
+    if kind != TyKind.Float { return false }
+    ieee_op_for_method(method) != ""
+}
+
+fn cc_ieee_compare(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 1 { return cc_intrinsic_arity_wrong(node, kind, method, 1, given) }
+    let answer = cc_local(TYPE_BOOL, node)
+    if cc_stopped(answer) { return -1 }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    let rhs = lower_expr(sublist_get(node_args(node), 0))
+    if rhs < 0 { return -1 }
+    ir_binary(TYPE_BOOL, node, answer.c_spelling, ieee_op_for_method(method), recv, rhs)
 }
 
 fn cc_is_char_text(kind: TyKind, method: Str) -> Bool {

@@ -790,24 +790,27 @@ fn pa_decompose(cond_node: Int) -> PaResult ! Diag.Report {
 }
 
 // The rebuilt Bool condition over two already-bound operands. Only a comparison operator
-// reaches here (see pa_op_renderable). A Str comparison goes through the same runtime
-// helpers lower_str_binop uses; every other comparison is a plain C operator between the
-// two temps.
+// reaches here (see pa_op_renderable). A Str or a Float comparison goes through the same
+// runtime helpers lower_str_binop and lower_float_compare use; every other comparison is a
+// plain C operator between the two temps.
 fn pa_cond_expr(cond_node: Int, op: Str, lhs_tid: Int, rhs_tid: Int, lhs_ref: Int, rhs_ref: Int, bool_rec: LayoutRecord) -> Int ! Diag.Report {
     let both_str = tc_tid_kind(lhs_tid) == TyKind.Str && tc_tid_kind(rhs_tid) == TyKind.Str
-    if both_str && (op == "==" || op == "!=") {
+    let both_float = tc_tid_kind(lhs_tid) == TyKind.Float && tc_tid_kind(rhs_tid) == TyKind.Float
+    if !both_str && !both_float {
+        return ir_binary(TYPE_BOOL, cond_node, bool_rec.c_spelling, op, lhs_ref, rhs_ref)
+    }
+    let eq_helper = if both_str { "str_eq" } else { "float_eq" }
+    let cmp_helper = if both_str { "str_cmp" } else { "float_cmp" }
+    if op == "==" || op == "!=" {
         let eq = ir_call_runtime(TYPE_BOOL, cond_node, bool_rec.c_spelling,
-            c_runtime_helper("str_eq"), bool_rec.slot_form, [lhs_ref, rhs_ref])
+            c_runtime_helper(eq_helper), bool_rec.slot_form, [lhs_ref, rhs_ref])
         if op == "!=" { return ir_unary(TYPE_BOOL, cond_node, bool_rec.c_spelling, "!", eq) }
         return eq
     }
-    if both_str && (op == "<" || op == "<=" || op == ">" || op == ">=") {
-        let int_rec = layout_at(TYPE_INT, Position.Local, cond_node)
-        let cmp = ir_call_runtime(TYPE_INT, cond_node, int_rec.c_spelling,
-            c_runtime_helper("str_cmp"), int_rec.slot_form, [lhs_ref, rhs_ref])
-        return ir_binary(TYPE_BOOL, cond_node, bool_rec.c_spelling, op, cmp, int_const(cond_node, "0"))
-    }
-    ir_binary(TYPE_BOOL, cond_node, bool_rec.c_spelling, op, lhs_ref, rhs_ref)
+    let int_rec = layout_at(TYPE_INT, Position.Local, cond_node)
+    let cmp = ir_call_runtime(TYPE_INT, cond_node, int_rec.c_spelling,
+        c_runtime_helper(cmp_helper), int_rec.slot_form, [lhs_ref, rhs_ref])
+    ir_binary(TYPE_BOOL, cond_node, bool_rec.c_spelling, op, cmp, int_const(cond_node, "0"))
 }
 
 // The printf spec assert's intro renders a kind with. Bool and Char each need their value
@@ -1266,7 +1269,9 @@ fn lower_assert_eq_call(node: Int) -> Int ! Diag.Report {
         return ir_block(node, pre)
     }
     if eq_is_float(tid) {
-        let neq = ir_binary(TYPE_BOOL, node, bool_rec.c_spelling, "!=", left_bound.ref, right_bound.ref)
+        let eq = ir_call_runtime(TYPE_BOOL, node, bool_rec.c_spelling,
+            c_runtime_helper("float_eq"), bool_rec.slot_form, [left_bound.ref, right_bound.ref])
+        let neq = ir_unary(TYPE_BOOL, node, bool_rec.c_spelling, "!", eq)
         let msg = call_str_format(node, "ASSERT_EQ FAILED: %f != %f", [left_bound.ref, right_bound.ref])
         let exp = call_str_format(node, "%f", [right_bound.ref])
         let act = call_str_format(node, "%f", [left_bound.ref])
@@ -1310,7 +1315,8 @@ fn lower_assert_ne_call(node: Int) -> Int ! Diag.Report {
         return ir_block(node, pre)
     }
     if eq_is_float(tid) {
-        let eq = ir_binary(TYPE_BOOL, node, bool_rec.c_spelling, "==", left_bound.ref, right_bound.ref)
+        let eq = ir_call_runtime(TYPE_BOOL, node, bool_rec.c_spelling,
+            c_runtime_helper("float_eq"), bool_rec.slot_form, [left_bound.ref, right_bound.ref])
         let msg = call_str_format(node, "ASSERT_NE FAILED: %f == %f", [left_bound.ref, right_bound.ref])
         let fail_stmt = call_runtime_void(node, c_assert_fail_name(), [msg, line])
         pre.push(ir_if(node, eq, ir_block(node, [fail_stmt]), -1))
