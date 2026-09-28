@@ -209,6 +209,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | OverrideOfDeprecatedDefault | W0731 | `impl` overrides a trait default marked `@deprecate_override` | Trait sealing | §3.6 |
 | UnauditedFfi | W0800 | Unaudited foreign function call. Audit-gated: `@trusted(audit: K)` is its only suppression channel — `@allow` and `[lints]` are refused | FFI | §9.1 |
 | MissingCanonicalHeader | W0812 | `@ffi.struct` header not declared in blink.toml | FFI | §9.2.1 |
+| ShadowedPreludeName | W1010 | Module-level trait has the name of a prelude trait; it shadows the prelude one in its module | Modules | §10.6 |
 | DeprecatedUsage | W2000 | Use of an item annotated `@deprecated` | Linting | §6 |
 
 ---
