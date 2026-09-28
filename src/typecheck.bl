@@ -54,7 +54,7 @@ import diagnostics.{
     DERIVE_DEBUG_FIELD_NO_DEBUG, STR_PLUS_UNSUPPORTED,
     PRIVATE_ITEM_ACCESS, AMBIGUOUS_IMPORT, IMPORT_NOT_SELECTED,
     MODULE_QUALIFIED_TYPE,
-    UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE,
+    UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE, SHADOWED_PRELUDE_NAME,
     BITWISE_PRECEDENCE, UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
     NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, UNKNOWN_DERIVE_NAME,
     NO_SUCH_FIELD, OVERLAPPING_IMPLS, DUPLICATE_EFFECT_OP,
@@ -9956,6 +9956,32 @@ fn tc_check_trait_sig_ann(ann: Int, trait_name: Str, mname: Str, m: Int) ! Diag.
     if name == "Fn" { tc_check_trait_sig_ann(node_type_ann(ann), trait_name, mname, m) }
 }
 
+fn tc_prelude_trait_names(traits_sl: Int) -> List[Str] {
+    let mut names: List[Str] = []
+    let mut i = 0
+    while i < sublist_length(traits_sl) {
+        let tr = sublist_get(traits_sl, i)
+        if tc_prelude_modules.contains_key(node_module(tr)) { names.push(node_name(tr)) }
+        i = i + 1
+    }
+    names
+}
+
+// The prelude trait names some declaration outside the prelude modules also declares.
+fn tc_shadowed_prelude_traits(traits_sl: Int, prelude_traits: List[Str]) -> List[Str] {
+    let mut names: List[Str] = []
+    let mut i = 0
+    while i < sublist_length(traits_sl) {
+        let tr = sublist_get(traits_sl, i)
+        let name = node_name(tr)
+        if !tc_prelude_modules.contains_key(node_module(tr)) && prelude_traits.contains(name) && is_sealed_builtin_trait(name) == 0 {
+            names.push(name)
+        }
+        i = i + 1
+    }
+    names
+}
+
 fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     let name = node_name(tr_node)
     tc_trait_names.push(name)
@@ -10347,17 +10373,19 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
             trait_arg_arity_ok = 0
             diag_error_at("TraitContract", TRAIT_ARG_ARITY, "impl of trait `{trait_name}` supplies {supplied_trait_args} type argument(s) but `{trait_name}` declares {trait_tparam_count}", im, "supply one type argument per trait type parameter: `impl {trait_name}[...] for {impl_type}`")
         }
-        // Display.display is a synthesized sealed method: the compiler derives it
-        // from the impl's `fmt`, so a user impl may not define it. The remaining
-        // contract checks below still run (a missing `fmt` also reports E0900).
-        if trait_name == "Display" {
-            let disp_methods_sl = node_methods(im)
-            if disp_methods_sl != -1 {
+        // Display.display and Eq.ne are synthesized sealed methods: the compiler derives
+        // them from the impl's `fmt` and `eq`, so a user impl may not define them. The
+        // remaining contract checks below still run (a missing `fmt` also reports E0900).
+        if trait_name == "Display" || trait_name == "Eq" {
+            let sealed = if trait_name == "Display" { "display" } else { "ne" }
+            let source = if trait_name == "Display" { "fmt" } else { "eq" }
+            let sealed_methods_sl = node_methods(im)
+            if sealed_methods_sl != -1 {
                 let mut dmi = 0
-                while dmi < sublist_length(disp_methods_sl) {
-                    let dm = sublist_get(disp_methods_sl, dmi)
-                    if node_name(dm) == "display" {
-                        diag_error_at("SealedMethodOverride", SEALED_METHOD_OVERRIDE, "method `display` of trait `Display` is sealed and cannot be overridden — it is synthesized from `fmt`", dm, "implement `fn fmt(self, sb: StringBuilder)` and remove `display`; `display()` is generated from `fmt`")
+                while dmi < sublist_length(sealed_methods_sl) {
+                    let dm = sublist_get(sealed_methods_sl, dmi)
+                    if node_name(dm) == sealed {
+                        diag_error_at("SealedMethodOverride", SEALED_METHOD_OVERRIDE, "method `{sealed}` of trait `{trait_name}` is sealed and cannot be overridden — it is synthesized from `{source}`", dm, "implement `{source}` and remove `{sealed}`; `{sealed}()` is generated from `{source}`")
                     }
                     dmi = dmi + 1
                 }
@@ -11065,13 +11093,22 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     // Register traits
     let traits_sl = node_arms(program)
     if traits_sl != -1 {
+        let prelude_traits = tc_prelude_trait_names(traits_sl)
+        let shadowed = tc_shadowed_prelude_traits(traits_sl, prelude_traits)
         let mut i = 0
         while i < sublist_length(traits_sl) {
             let tr = sublist_get(traits_sl, i)
+            let in_prelude = tc_prelude_modules.contains_key(node_module(tr))
             if is_sealed_builtin_trait(node_name(tr)) != 0 && is_user_sourced(tr) != 0 {
                 diag_error_at("TraitContract", TRAIT_CONTRACT_907, "trait `{node_name(tr)}` is a sealed built-in trait and cannot be redefined", tr, "rename your trait, or define your own trait with the methods you need")
+            } else if !in_prelude && prelude_traits.contains(node_name(tr)) {
+                diag_warn_at("ShadowedPreludeName", SHADOWED_PRELUDE_NAME, "trait `{node_name(tr)}` shadows prelude trait `{node_name(tr)}`", tr, "consider a different name to avoid confusion")
             }
-            register_trait(tr)
+            // The shadowing declaration wins (section 10.6), so the prelude one registers
+            // nothing an impl could be checked against.
+            if !(in_prelude && shadowed.contains(node_name(tr))) {
+                register_trait(tr)
+            }
             i = i + 1
         }
     }

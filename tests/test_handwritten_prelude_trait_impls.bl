@@ -1,0 +1,175 @@
+// Eq, Ord, Hash, Clone and Debug are prelude traits (sections/03_types.md:1958), so a type
+// may write their impls out instead of deriving them, and the operators then call the
+// written methods. A module-level trait with a prelude trait's name shadows it with
+// warning W1010 (sections/07_trust_modules_metadata.md, section 10.6).
+//
+// Rejection and warning rows run through the compiler in a SUBPROCESS: a compile error
+// in an in-file row would fail to compile the whole test file.
+
+import std.process.{ProcessResult}
+
+// Equal by key alone, so a row can tell the written eq from a field-by-field one.
+type Keyed { key: Int  note: Str }
+
+impl Eq for Keyed {
+    fn eq(self, other: Keyed) -> Bool { self.key == other.key }
+}
+
+impl Ord for Keyed {
+    fn cmp(self, other: Keyed) -> Ordering {
+        if self.key < other.key { Less } else if self.key > other.key { Greater } else { Equal }
+    }
+}
+
+impl Hash for Keyed {
+    fn hash(self) -> U64 { self.key.to_u64() }
+}
+
+impl Clone for Keyed {
+    fn clone(self) -> Keyed { Keyed { key: self.key, note: "cloned" } }
+}
+
+impl Debug for Keyed {
+    fn debug(self) -> Str { "Keyed({self.key})" }
+}
+
+fn same[T: Eq](a: T, b: T) -> Bool { a == b }
+
+fn least[T: Ord](a: T, b: T) -> T { if a < b { a } else { b } }
+
+test "== and != call the written eq" {
+    let a = Keyed { key: 1, note: "a" }
+    let b = Keyed { key: 1, note: "b" }
+    let c = Keyed { key: 2, note: "a" }
+    assert(a == b)
+    assert(!(a != b))
+    assert(a != c)
+    assert(!(a == c))
+}
+
+test "the ordering operators call the written cmp" {
+    let a = Keyed { key: 1, note: "z" }
+    let b = Keyed { key: 1, note: "a" }
+    let c = Keyed { key: 2, note: "a" }
+    assert(a < c)
+    assert(c > a)
+    assert(a <= b)
+    assert(a >= b)
+    assert(!(a < b))
+    assert(!(c <= a))
+}
+
+test "a written impl satisfies Eq and Ord bounds" {
+    let a = Keyed { key: 1, note: "a" }
+    let b = Keyed { key: 1, note: "b" }
+    let c = Keyed { key: 0, note: "c" }
+    assert(same(a, b))
+    assert_eq(least(a, c).note, "c")
+}
+
+test "an Option payload compares through the written eq" {
+    let o: Option[Keyed] = Some(Keyed { key: 3, note: "a" })
+    let p: Option[Keyed] = Some(Keyed { key: 3, note: "b" })
+    assert(o == p)
+}
+
+test "clone, hash and debug run the written bodies" {
+    let a = Keyed { key: 7, note: "a" }
+    assert_eq(a.clone().note, "cloned")
+    assert_eq(a.hash(), (7).to_u64())
+    assert_eq(a.debug(), "Keyed(7)")
+}
+
+fn check_src(tag: Str, src: Str) -> ProcessResult {
+    let bl_path = ".tmp/_handwritten_prelude_{tag}.bl"
+    write_file(bl_path, src)
+    let r = process_run("build/blink", ["check", bl_path, "--format", "json"])
+    shell_exec("rm -f {bl_path}")
+    r
+}
+
+fn count_of(text: Str, piece: Str) -> Int {
+    text.split(piece).len() - 1
+}
+
+// Exactly one error, and it is `code` saying `words`: a second report of the same
+// fault, or another error beside it, fails the row.
+fn expect_one_error(tag: Str, src: Str, code: Str, words: Str) {
+    let r = check_src(tag, src)
+    let out = "{r.out}{r.err_out}"
+    if r.exit_code == 0 { io.println("FAIL[{tag}] accepted, expected rejection") }
+    assert(r.exit_code != 0)
+    let errors = count_of(out, "\"severity\":\"error\"")
+    if errors != 1 { io.println("FAIL[{tag}] want 1 error, got {errors}: {out}") }
+    assert_eq(errors, 1)
+    if !out.contains("\"code\":\"{code}\"") { io.println("FAIL[{tag}] want {code}, got: {out}") }
+    assert(out.contains("\"code\":\"{code}\""))
+    if !out.contains(words) { io.println("FAIL[{tag}] want '{words}', got: {out}") }
+    assert(out.contains(words))
+}
+
+test "impl Ord with no Eq is one E0911" {
+    expect_one_error("ord_no_eq", #"type O { x: Int }
+impl Ord for O {
+    fn cmp(self, other: O) -> Ordering { if self.x < other.x { Less } else { Equal } }
+}
+fn main() {}
+"#, "E0911", "impl Ord for O requires O to also implement supertrait `Eq`")
+}
+
+test "a written ne is rejected: Eq.ne is sealed" {
+    expect_one_error("written_ne", #"type N { x: Int }
+impl Eq for N {
+    fn eq(self, other: N) -> Bool { self.x == other.x }
+    fn ne(self, other: N) -> Bool { self.x != other.x }
+}
+fn main() {}
+"#, "E0731", "method `ne` of trait `Eq` is sealed")
+}
+
+test "an eq with the wrong parameter type is E0902" {
+    expect_one_error("eq_param", #"type N { x: Int }
+impl Eq for N {
+    fn eq(self, other: Int) -> Bool { self.x == other }
+}
+fn main() {}
+"#, "E0902", "method `eq` param has type `Int`, expected `N`")
+}
+
+test "an impl Eq with no eq is E0900" {
+    expect_one_error("eq_missing", #"type N { x: Int }
+impl Eq for N {
+}
+fn main() {}
+"#, "E0900", "impl Eq for N is missing method `eq`")
+}
+
+test "a trait named like a prelude trait warns W1010 once" {
+    let r = check_src("shadow_warns", #"trait Eq {
+    fn same(self, other: Int) -> Bool
+}
+fn main() {}
+"#)
+    let out = "{r.out}{r.err_out}"
+    let warned = count_of(out, "\"code\":\"W1010\"")
+    if warned != 1 { io.println("FAIL[shadow_warns] want 1 W1010, got {warned}: {out}") }
+    assert_eq(warned, 1)
+    assert(out.contains("trait `Eq` shadows prelude trait `Eq`"))
+}
+
+test "a program that shadows a prelude trait still compiles, against its own trait" {
+    let r = check_src("shadow_compiles", #"trait Eq {
+    fn same(self, other: Int) -> Bool
+}
+type W { x: Int }
+impl Eq for W {
+    fn same(self, other: Int) -> Bool { self.x == other }
+}
+fn main() {
+    let w = W { x: 1 }
+    assert(w.same(1))
+}
+"#)
+    if r.exit_code != 0 { io.println("FAIL[shadow_compiles] {r.out}{r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
