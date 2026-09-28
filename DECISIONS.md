@@ -240,6 +240,8 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | Net.Listen: @requires auto-400 | Validation effect: compiler generates `validation.contract_violation()`. Default handler returns 400 JSON. Swappable via `with` | 4-1 (Sys/Web/PLT/DevOps for B; AI for A: implicit route marker) |
 | Time value type (Instant) | Stdlib opaque `Instant` struct in `std.time` Tier 2. Nanosecond precision. Methods not operators | 5-0 |
 | Duration type | Stdlib `Duration` struct in `std.time` Tier 2. Named constructors (`Duration.seconds(5)`). Methods not operators | 5-0 |
+| Instant/Duration Display text | Instant: RFC 9557 in UTC with `Z`, fraction left out when zero, else no trailing zeros (`2026-02-14T12:00:00.5Z`). `to_rfc3339` does not change. Duration: Go's `time.Duration.String` exactly (`1h2m3.5s`, `500ms`, `1.5µs` with U+00B5, `0s`, `1h0m0s`, `-1.5s`). New `Duration.to_iso8601() -> Str` (`PT1H2M3.5S`) | User ruling |
+| Duration.to_iso8601 edge cases | A negative duration is `-PT1.5S`. No `D` unit: 48 hours is `PT48H` | Lead default, open to BDFL review |
 | Bytes type | Stdlib `Bytes` in `std.bytes` Tier 1. Contiguous buffer, not `List[U8]` | 5-0 |
 | Numeric extensions | F32 built-in (sized numeric family), Decimal in `std.decimal` Tier 2, BigInt in `std.math` Tier 2. Sealed arithmetic not extended | 5-0 |
 | UUID type | Stdlib `UUID` in `std.uuid` Tier 2. 128-bit nominal type, not Str. `UUID.random() ! Rand` | 5-0 |

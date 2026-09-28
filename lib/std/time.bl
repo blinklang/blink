@@ -12,6 +12,23 @@ pub fn Duration_sub(a: Duration, b: Duration) -> Duration { Duration { nanos: a.
 pub fn Duration_scale(d: Duration, factor: Int) -> Duration { Duration { nanos: d.nanos * factor } }
 pub fn Duration_is_zero(d: Duration) -> Int { if d.nanos == 0 { 1 } else { 0 } }
 
+// ISO 8601 has no sign, so a negative duration takes the common "-PT" extension. Hours
+// stay whole with no D unit, since a day is not always 24 hours.
+pub fn Duration_to_iso8601(d: Duration) -> Str {
+    let secs = time_abs(d.nanos / 1000000000)
+    let frac = time_abs(d.nanos % 1000000000)
+    let h = secs / 3600
+    let m = secs / 60 % 60
+    let s = secs % 60
+    let sb = StringBuilder.new()
+    if d.nanos < 0 { sb.write("-") }
+    sb.write("PT")
+    if h > 0 { sb.write("{h}H") }
+    if m > 0 { sb.write("{m}M") }
+    if s > 0 || frac > 0 || secs == 0 { sb.write("{s}{time_frac(frac, 9)}S") }
+    sb.to_str()
+}
+
 pub fn Instant_from_epoch_secs(s: Int) -> Instant { Instant { nanos: s * 1000000000 } }
 pub fn Instant_add(i: Instant, d: Duration) -> Instant { Instant { nanos: i.nanos + d.nanos } }
 pub fn Instant_since(later: Instant, earlier: Instant) -> Duration { Duration { nanos: later.nanos - earlier.nanos } }
@@ -28,4 +45,90 @@ pub type Duration {
 @derive(Eq, Ord, Hash, Clone, Debug)
 pub type Instant {
     nanos: Int
+}
+
+// The same text as Go's time.Duration.String.
+impl Display for Duration {
+    fn fmt(self, sb: StringBuilder) {
+        let n = self.nanos
+        if n < 0 { sb.write("-") }
+        if n == 0 {
+            sb.write("0s")
+        } else if n > -1000000000 && n < 1000000000 {
+            let u = time_abs(n)
+            if u < 1000 {
+                sb.write("{u}ns")
+            } else if u < 1000000 {
+                sb.write("{u / 1000}{time_frac(u % 1000, 3)}µs")
+            } else {
+                sb.write("{u / 1000000}{time_frac(u % 1000000, 6)}ms")
+            }
+        } else {
+            // Split before the sign is dropped: negating Int's minimum overflows.
+            let secs = time_abs(n / 1000000000)
+            let frac = time_abs(n % 1000000000)
+            let h = secs / 3600
+            let m = secs / 60 % 60
+            if h > 0 {
+                sb.write("{h}h{m}m")
+            } else if m > 0 {
+                sb.write("{m}m")
+            }
+            sb.write("{secs % 60}{time_frac(frac, 9)}s")
+        }
+    }
+}
+
+// RFC 9557 in UTC with a Z offset.
+impl Display for Instant {
+    fn fmt(self, sb: StringBuilder) {
+        let mut secs = self.nanos / 1000000000
+        let mut frac = self.nanos % 1000000000
+        if frac < 0 {
+            frac = frac + 1000000000
+            secs = secs - 1
+        }
+        let mut days = secs / 86400
+        let mut sod = secs % 86400
+        if sod < 0 {
+            sod = sod + 86400
+            days = days - 1
+        }
+        // Howard Hinnant's civil_from_days, on 400-year eras that start on March 1.
+        let z = days + 719468
+        let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 }
+        let doe = z - era * 146097
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+        let mp = (5 * doy + 2) / 153
+        let day = doy - (153 * mp + 2) / 5 + 1
+        let month = if mp < 10 { mp + 3 } else { mp - 9 }
+        let year = if month <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 }
+        sb.write("{time_pad(year, 4)}-{time_pad(month, 2)}-{time_pad(day, 2)}")
+        sb.write("T{time_pad(sod / 3600, 2)}:{time_pad(sod / 60 % 60, 2)}:{time_pad(sod % 60, 2)}")
+        sb.write("{time_frac(frac, 9)}Z")
+    }
+}
+
+fn time_abs(n: Int) -> Int {
+    if n < 0 { 0 - n } else { n }
+}
+
+fn time_pad(n: Int, width: Int) -> Str {
+    let mut s = "{n}"
+    while s.len() < width {
+        s = "0{s}"
+    }
+    s
+}
+
+// v written with prec digits after a ".", less its trailing zeros; "" when v is 0.
+fn time_frac(v: Int, prec: Int) -> Str {
+    if v == 0 { return "" }
+    let digits = time_pad(v, prec)
+    let mut end = digits.len()
+    while digits.byte_at(end - 1) == 48 {
+        end = end - 1
+    }
+    ".{digits.slice(0, end)}"
 }

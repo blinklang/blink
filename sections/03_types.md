@@ -569,11 +569,13 @@ fn format_log() -> Str ! Time.Read {
 | `elapsed` | `fn(self) -> Duration ! Time.Read` | Time since this instant |
 | `since` | `fn(self, other: Instant) -> Duration` | Duration between two instants |
 | `add` | `fn(self, d: Duration) -> Instant` | Point in the future |
-| `to_rfc3339` | `fn(self) -> Str` | ISO 8601 string |
+| `to_rfc3339` | `fn(self) -> Str` | RFC 3339 string in UTC, whole seconds only |
 | `to_unix_ms` | `fn(self) -> Int` | Milliseconds since epoch |
 | `to_unix_secs` | `fn(self) -> Int` | Seconds since epoch |
 
 Instant implements: `Eq`, `Ord`, `Hash`, `Display`, `Clone`, `Debug`. Does NOT implement arithmetic traits (sealed to built-in numerics). Use `.since()` and `.add()` named methods.
+
+Instant's `Display` writes RFC 9557 in UTC with a `Z` offset: `2026-02-14T12:00:00Z`. A zero fraction of a second is left out. Any other fraction is written without trailing zeros: `2026-02-14T12:00:00.5Z`, `2026-02-14T12:00:00.000000001Z`. An instant before the epoch rounds down to the earlier second: 500 ms before the epoch is `1969-12-31T23:59:59.5Z`. `to_rfc3339` does not change: it always drops the fraction.
 
 **Duration** is a typed time span. Internal representation: `int64_t` nanoseconds. Named constructors enforce units at construction — no ambiguity between seconds and milliseconds.
 
@@ -594,8 +596,13 @@ Instant implements: `Eq`, `Ord`, `Hash`, `Display`, `Clone`, `Debug`. Does NOT i
 | `sub` | `fn(self, Duration) -> Duration` | Difference |
 | `scale` | `fn(self, Int) -> Duration` | Multiply by scalar |
 | `is_zero` | `fn(self) -> Bool` | Zero-length check |
+| `to_iso8601` | `fn(self) -> Str` | ISO 8601 duration: `PT1H2M3.5S` |
 
 Duration implements: `Eq`, `Ord`, `Display`, `Clone`, `Debug`. Arithmetic via named methods (`.add()`, `.scale()`), not operators.
+
+Duration's `Display` writes the same text as Go's `time.Duration.String`. A duration of one second or more uses `h`, `m` and `s`, with a fraction of a second on `s`: `1h2m3.5s`, `1m30s`, `1m0s`, `1h0m0s`. Once a larger unit is written, each smaller unit is written too, as `0` if needed. A shorter duration uses the largest of `ms`, `µs` (U+00B5) and `ns` that fits: `500ms`, `1.5µs`, `1ns`. Zero is `0s`. A negative duration starts with `-`: `-1.5s`. A fraction never has trailing zeros.
+
+`to_iso8601` writes `PT`, then each of `H`, `M` and `S` that is not zero: `PT1H2M3.5S`, `PT1M`, `PT0.5S`. Zero is `PT0S`. It never writes a `D` unit, so 48 hours is `PT48H`. A negative duration starts with `-`: `-PT1.5S`.
 
 **Why Instant/Duration instead of raw Int.** Time points form an affine space over durations: `Instant - Instant → Duration`, `Instant + Duration → Instant`, but `Instant + Instant` is nonsensical. Raw `Int` allows all three operations — a type error that the type system should catch. Duration carries dimensional information; `Int` is dimensionless. `time.sleep(port_number)` type-checks with raw Int but is a bug. `time.sleep(Duration.seconds(5))` makes units explicit at every call site. (Panel vote: 5-0.)
 
