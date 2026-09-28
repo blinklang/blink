@@ -49,7 +49,7 @@ import ir.{
 }
 import cg_stmt.{cg_stmt_return_value}
 import cg_call.{
-    lower_call, lower_operator_method, lower_display_of_value,
+    lower_call, lower_operator_method, lower_display_of_value, cg_call_display_resolves,
     lower_spread, lower_element_read, lower_element_store, cc_enum_variant_construct,
     lower_await_expr, lower_fn_value, lower_channel_new,
 }
@@ -2085,9 +2085,33 @@ fn x_interp_hole(part: Int) -> InterpHole ! Diag.Report {
     let tid = tid_of_node(part)
     if tid < 0 { return InterpHole {} }
     if x_kind(tid) == TyKind.Never { return x_never_hole(part) }
+    if !x_renderable(part, tid) { return InterpHole {} }
     let value = lower_expr(part)
     if value < 0 { return InterpHole {} }
     x_render_value(part, tid, value)
+}
+
+// Every refusal a render can meet, asked before the value is lowered, so a refused hole
+// leaves no node and no hoisted statement behind. A tuple asks it of each element.
+fn x_renderable(node: Int, tid: Int) -> Bool ! Diag.Report {
+    if format_spec_of(tid) != "" { return true }
+    let k = x_kind(tid)
+    if k == TyKind.Struct || k == TyKind.Enum { return cg_call_display_resolves(node, tid) }
+    if k != TyKind.Tuple {
+        diag_ice_at("StructuralHoleNotRendered", CODEGEN_STAGE_NOT_BUILT,
+            "a {tk_name(k)} value has no rendering this stage builds", node,
+            "a struct or an enum shows through its Display impl and a tuple through its elements; typecheck must reject any other type")
+        return false
+    }
+    if x_stopped(x_local(tid, node)) { return false }
+    let n = tc_tid_child_count(tc_resolve(tid))
+    let mut i = 0
+    while i < n {
+        if x_stopped(x_member(tid, Slot.Elem(i), node)) { return false }
+        if !x_renderable(node, child_tid(tid, Slot.Elem(i))) { return false }
+        i = i + 1
+    }
+    true
 }
 
 // A Never hole is the thing that diverges, so it is lowered once for its effect and the
@@ -2105,7 +2129,8 @@ fn x_never_hole(part: Int) -> InterpHole ! Diag.Report {
 }
 
 // The one way a value of a printable type becomes a conversion and its argument. A hole
-// and a tuple element both come here, so the two cannot show one type two ways.
+// and a tuple element both come here, so the two cannot show one type two ways. The
+// caller has asked x_renderable first.
 fn x_render_value(node: Int, tid: Int, value: Int) -> InterpHole ! Diag.Report {
     let spec = format_spec_of(tid)
     if spec == "" { return x_unprintable_hole(node, tid, value) }
@@ -2128,14 +2153,7 @@ fn x_text_arg(node: Int, tid: Int, value: Int) -> Int ! Diag.Report {
 // Each answers a string, so the formatter takes the conversion a string takes. Layout
 // answers what that is, because this file spells no conversion of its own.
 fn x_unprintable_hole(node: Int, tid: Int, value: Int) -> InterpHole ! Diag.Report {
-    let k = x_kind(tid)
-    if k == TyKind.Tuple { return x_tuple_text(node, tid, value) }
-    if k != TyKind.Struct && k != TyKind.Enum {
-        diag_ice_at("StructuralHoleNotRendered", CODEGEN_STAGE_NOT_BUILT,
-            "a {tk_name(k)} value has no rendering this stage builds", node,
-            "a struct or an enum shows through its Display impl and a tuple through its elements; typecheck must reject any other type")
-        return InterpHole {}
-    }
+    if x_kind(tid) == TyKind.Tuple { return x_tuple_text(node, tid, value) }
     let shown = lower_display_of_value(node, tid, value)
     if shown < 0 { return InterpHole {} }
     InterpHole { spec: format_spec_of(TYPE_STR), arg: shown }
