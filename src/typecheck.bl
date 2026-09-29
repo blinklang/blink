@@ -568,6 +568,13 @@ fn tc_impl_conv_source_tid(im: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     t
 }
 
+// The source type a From/TryFrom impl converts from, or -1 for any other impl. Pure, so
+// cname spells the impl's symbol from the type typecheck resolved and not from the head
+// the header wrote: From[List[Int]] and From[List[Str]] are two symbols.
+pub fn tc_impl_conv_source(im: Int) -> Int {
+    tc_conv_source_tids.get(im) ?? -1
+}
+
 // What tc_conversion_impl_for answers for a From of a type to itself (section 3c.2): no impl
 // is written for it, and the conversion is the value itself.
 pub let CONVERSION_IS_IDENTITY: Int = -2
@@ -1940,7 +1947,11 @@ fn tc_occurs_in(needle: Int, hay0: Int) -> Int {
     if hay == needle { return 1 }
     let e = ty_pool.get(hay).unwrap()
     let k = e.kind
+    // Every kind tc_unify descends, or a bind through one of them could close a cycle.
     if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator {
+        return tc_occurs_in(needle, e.inner1)
+    }
+    if k == TyKind.Ptr || k == TyKind.Handle || k == TyKind.Template {
         return tc_occurs_in(needle, e.inner1)
     }
     if k == TyKind.Result || k == TyKind.Map {
@@ -2876,6 +2887,11 @@ pub fn tc_unify(a0: Int, b0: Int) -> Int {
     let kb = tb.kind
     if ka != kb { return 0 }
     if ka == TyKind.List || ka == TyKind.Option || ka == TyKind.Set || ka == TyKind.Channel || ka == TyKind.Iterator {
+        return tc_unify(ta.inner1, tb.inner1)
+    }
+    // Ptr, Handle and Template keep their one child in inner1 too. Without these arms they
+    // fell through to the scalar tail, so Ptr[Int] and Ptr[Float] unified by kind alone.
+    if ka == TyKind.Ptr || ka == TyKind.Handle || ka == TyKind.Template {
         return tc_unify(ta.inner1, tb.inner1)
     }
     if ka == TyKind.Result || ka == TyKind.Map {
@@ -10582,133 +10598,142 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
     tc_check_impl_overlap(impls_sl)
 }
 
-// The bounds an impl puts on its binders, as one string, so two impls can be compared
-// without deciding what a bound means. Equal strings describe the same set of receivers;
-// different strings may or may not, which is why only equal ones are read as overlapping.
-fn tc_impl_bounds_signature(im: Int) -> Str {
-    let wb = node_impl_where_bounds(im)
-    if wb == -1 { return "" }
-    let mut parts: List[Str] = []
-    let mut i = 0
-    while i < sublist_length(wb) {
-        let cons = sublist_get(wb, i)
-        let bounds = node_elements(cons)
-        let mut j = 0
-        while bounds != -1 && j < sublist_length(bounds) {
-            parts.push("{node_name(cons)}:{strip_module_qualifier(node_name(sublist_get(bounds, j)))}")
-            j = j + 1
-        }
-        i = i + 1
-    }
-    parts.join(",")
-}
-
 // The trait a pair of impls must share before either could answer for the other's
-// receiver, written with its type arguments: `Into[Str]` and `Into[Int]` are two traits
-// here, and an impl of one never answers a call on the other.
+// receiver: its name and how many arguments it takes. The arguments themselves are part
+// of the head, which tc_impls_overlap unifies, so From[List[Int]] and From[List[Str]]
+// are compared rather than keyed apart or together by their spelling.
 fn tc_impl_trait_key(im: Int) -> Str {
     let args = node_type_params(im)
-    let mut names: List[Str] = []
-    let mut i = 0
-    while args != -1 && i < sublist_length(args) {
-        names.push(node_name(sublist_get(args, i)))
-        i = i + 1
-    }
-    "{node_trait_name(im)}[{names.join(",")}]"
+    let n = if args == -1 { 0 } else { sublist_length(args) }
+    "{node_trait_name(im)}/{n}"
 }
 
-// Does `poly` also answer for the receiver `concrete` writes? The two headers are read
-// against each other rather than through the receiver's type id, because a builtin
-// container carries its arguments as children and not as struct parameters, so the
-// instance walk written for a generic struct answers nothing about a List. Each of the
-// poly impl's receiver arguments must be one of its own binders, which is the shape whose
-// binding is a lookup; any other shape is left undecided. sections/03_types.md:2540 then
-// turns on the bounds: `impl[T] .. where T: Bound` overlaps `impl .. for C[Int]` exactly
-// when Int satisfies the bound.
-fn tc_poly_impl_answers_for(poly: Int, concrete: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
-    if tc_impl_target_name(poly) != tc_impl_target_name(concrete) { return 0 }
-    let n = tc_impl_recv_arity(poly)
-    if n == 0 || n != tc_impl_recv_arity(concrete) { return 0 }
-    let poly_args = node_recv_type_args(poly)
-    let conc_args = node_recv_type_args(concrete)
-    let binders = node_impl_binders(poly)
-    let mut binds: Map[Str, Int] = Map()
-    let mut decided = 1
-    let saved = tc_suppress_ann_validation
+// The types an impl's trait arguments name, resolved under its own binders so that
+// `impl[T] From[List[T]]` reads its own T. Validation is off, as the header was checked.
+@allow(UnrestoredMutation)
+fn tc_impl_trait_arg_tids(im: Int) -> List[Int] ! TypeCheck.Resolve, Diag.Report {
+    let mut out: List[Int] = []
+    let args = node_type_params(im)
+    if args == -1 { return out }
+    let binders_sl = node_impl_binders(im)
+    tc_push_tparam_scope(binders_sl)
+    let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
     let mut i = 0
-    while i < n {
-        let pname = node_name(sublist_get(poly_args, i))
-        if impl_binder_declared(binders, pname) == 0 {
-            decided = 0
-        } else {
-            binds.insert(pname, resolve_type_ann(sublist_get(conc_args, i)))
-        }
+    while i < sublist_length(args) {
+        out.push(resolve_type_ann(sublist_get(args, i)))
         i = i + 1
     }
-    tc_suppress_ann_validation = saved
-    if decided == 0 { return 0 }
-    tc_bounds_definitely_hold(poly, binds)
+    tc_suppress_ann_validation = saved_suppress
+    tc_pop_tparam_scope(binders_sl)
+    out
 }
 
-// Do every one of the impl's where-bounds definitely hold for these bindings? The reader
-// next door answers the opposite question and fails open, because a bound it can not model
-// must not reject a program. Here an unmodelled bound must not report one either, so only
-// a bound tc_type_satisfies_bound answers 1 for counts, and anything less leaves the pair
-// undecided.
-fn tc_bounds_definitely_hold(im: Int, binds: Map[Str, Int]) -> Int ! TypeCheck.Resolve, Diag.Report {
-    let wb = node_impl_where_bounds(im)
-    if wb == -1 { return 1 }
-    let mut i = 0
-    while i < sublist_length(wb) {
-        let cons = sublist_get(wb, i)
-        let concrete = binds.get(node_name(cons)) ?? -1
-        if concrete < 0 { return 0 }
-        let bounds = node_elements(cons)
-        let mut j = 0
-        while bounds != -1 && j < sublist_length(bounds) {
-            let trait_name = strip_module_qualifier(node_name(sublist_get(bounds, j)))
-            if tc_type_satisfies_bound(concrete, trait_name) != 1 { return 0 }
-            j = j + 1
-        }
-        i = i + 1
-    }
-    1
+// An impl's head: its receiver, then each trait argument. Empty for a header with no
+// receiver, which answers for no type.
+fn tc_impl_head(im: Int) -> List[Int] ! TypeCheck.Resolve, Diag.Report {
+    let mut head: List[Int] = []
+    let recv = tc_impl_recv_tid(im)
+    if recv < 0 { return head }
+    head.push(recv)
+    for t in tc_impl_trait_arg_tids(im) { head.push(t) }
+    head
 }
 
-// Could both impls match one type? Answers only where the question is decidable, because
-// a wrong yes rejects a program the spec allows.
-//   concrete + concrete → the same receiver type.
-//   poly + concrete     → the poly impl answers for the concrete receiver.
-//   poly + poly         → the same container and arity under the same bounds; two
-//                         different bound sets are left alone, as no witness is at hand.
-fn tc_impls_overlap(a: Int, b: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
-    let a_poly = tc_impl_is_poly(a)
-    let b_poly = tc_impl_is_poly(b)
-    if a_poly == 0 && b_poly == 0 {
-        let a_recv = tc_impl_recv_tid(a)
-        let b_recv = tc_impl_recv_tid(b)
-        if a_recv < 0 || b_recv < 0 { return 0 }
-        return if tc_tid_same_type(a_recv, b_recv) { 1 } else { 0 }
-    }
-    if a_poly != 0 && b_poly != 0 {
-        if tc_impl_target_name(a) != tc_impl_target_name(b) { return 0 }
-        if tc_impl_recv_arity(a) != tc_impl_recv_arity(b) { return 0 }
-        return if tc_impl_bounds_signature(a) == tc_impl_bounds_signature(b) { 1 } else { 0 }
-    }
-    let poly = if a_poly != 0 { a } else { b }
-    let concrete = if a_poly != 0 { b } else { a }
-    tc_poly_impl_answers_for(poly, concrete)
-}
-
-fn tc_impl_is_poly(im: Int) -> Int {
+// A fresh metavariable for each of the impl's binders, keyed as substitute_typevar_tid
+// looks them up. Fresh per comparison, so the two impls of a pair never share a variable
+// even when both spell their binder `T`, and a binding made for one pair is never read
+// by another.
+fn tc_impl_fresh_binders(im: Int) -> Map[Str, Int] {
+    let mut fresh: Map[Str, Int] = Map()
     let binders = node_impl_binders(im)
-    if binders != -1 && sublist_length(binders) > 0 { 1 } else { 0 }
+    if binders == -1 { return fresh }
+    let mut i = 0
+    while i < sublist_length(binders) {
+        let tp = sublist_get(binders, i)
+        fresh.insert(tc_binder_key(tp, node_name(tp)), make_metavar())
+        i = i + 1
+    }
+    fresh
 }
 
-fn tc_impl_recv_arity(im: Int) -> Int {
-    let args = node_recv_type_args(im)
-    if args == -1 { 0 } else { sublist_length(args) }
+// The heads are read from impl headers, which hold no inference variable. One that does
+// would take a binding from this comparison and carry it out, so it is a compiler defect.
+fn tc_impl_head_is_closed(im: Int, head: List[Int]) -> Bool ! Diag.Report {
+    for t in head {
+        if tc_tid_has_unbound_metavar(t) != 0 {
+            diag_ice_at("ImplHeadCarriesMetavar", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "the head of impl {im} carries an inference variable", im,
+                "an impl header resolves to types and its own binders only; this is a compiler defect, not a program error")
+            return false
+        }
+    }
+    true
+}
+
+// Does one of the impl's bounds definitely fail for what unification bound its binders
+// to? Only a definite no rules the pair out. A binder left unbound could still take a
+// type that meets every bound on both sides, and a bound tc_type_satisfies_bound can not
+// decide might hold, so both keep the overlap: the spec rejects impls that COULD both
+// match.
+fn tc_impl_bounds_rule_out(im: Int, fresh: Map[Str, Int]) -> Bool ! TypeCheck.Resolve, Diag.Report {
+    let binders = node_impl_binders(im)
+    if binders == -1 { return false }
+    let wb = node_impl_where_bounds(im)
+    let mut i = 0
+    while i < sublist_length(binders) {
+        let tp = sublist_get(binders, i)
+        let name = node_name(tp)
+        let bound_to = tc_resolve(fresh.get(tc_binder_key(tp, name)) ?? -1)
+        if bound_to >= 0 && tc_is_unbound_metavar(bound_to) == 0 {
+            let mut traits: List[Str] = []
+            let inline = node_elements(tp)
+            let mut j = 0
+            while inline != -1 && j < sublist_length(inline) {
+                traits.push(strip_module_qualifier(node_name(sublist_get(inline, j))))
+                j = j + 1
+            }
+            let mut w = 0
+            while wb != -1 && w < sublist_length(wb) {
+                let cons = sublist_get(wb, w)
+                let bounds = node_elements(cons)
+                let mut k = 0
+                while node_name(cons) == name && bounds != -1 && k < sublist_length(bounds) {
+                    traits.push(strip_module_qualifier(node_name(sublist_get(bounds, k))))
+                    k = k + 1
+                }
+                w = w + 1
+            }
+            for tr in traits {
+                if tc_type_satisfies_bound(bound_to, tr) == -1 { return true }
+            }
+        }
+        i = i + 1
+    }
+    false
+}
+
+// Could both impls match one type (sections/03_types.md "No Impl Overlap")? They can
+// exactly when their heads unify once each impl's binders are renamed apart, and no
+// bound definitely fails for what the binders were bound to. So `impl[T] From[(T, T)]`
+// stays apart from `impl From[(Int, Str)]`, and `impl[T] R for List[T] where T: Display`
+// meets `impl R for List[Int]` because Int is Display.
+fn tc_impls_overlap(a: Int, b: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let ha = tc_impl_head(a)
+    let hb = tc_impl_head(b)
+    if ha.len() == 0 || ha.len() != hb.len() { return 0 }
+    if !tc_impl_head_is_closed(a, ha) || !tc_impl_head_is_closed(b, hb) { return 0 }
+    let fa = tc_impl_fresh_binders(a)
+    let fb = tc_impl_fresh_binders(b)
+    let mut i = 0
+    while i < ha.len() {
+        let ta = substitute_typevar_tid(ha.get(i).unwrap(), fa)
+        let tb = substitute_typevar_tid(hb.get(i).unwrap(), fb)
+        if tc_unify(ta, tb) == 0 { return 0 }
+        i = i + 1
+    }
+    if tc_impl_bounds_rule_out(a, fa) || tc_impl_bounds_rule_out(b, fb) { return 0 }
+    1
 }
 
 // sections/03_types.md "No Impl Overlap": if two impls could both match a given type the

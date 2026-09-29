@@ -2,7 +2,14 @@
 // compiler rejects the program, and there is no specialization. :2540 settles the mixed
 // case: `impl[T] Trait for C[T] where T: Bound` and `impl Trait for C[Int]` overlap when
 // Int satisfies the bound. Impls over types that share no instance are left alone.
+// :2486 makes the trait's own arguments part of the head, so two conversion impls overlap
+// only when their whole heads unify.
 import lower_test_helpers.{probe, probe_but}
+import cg_test_helpers.{cg_probe_begin, cg_probe_errors_named}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries}
+import std.io
 
 fn duplicate_src() -> Str {
     #"type Wrapped { n: Int }
@@ -65,5 +72,161 @@ test "two impls of one trait for types that share no instance do not overlap" {
 
 test "two blanket impls over one container overlap" {
     let program = probe_but("typecheck_overlap_blanket", two_blanket_src(), "OverlappingImpls")
+    assert(program >= 0)
+}
+
+// A poly impl over a receiver that is not generic also draws PolyImplUnsupported, which
+// the strict probes refuse. The overlap check must still see such an impl, so these rows
+// count OverlappingImpls by name and fail on any error beyond the two they expect.
+fn overlaps_in(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    cg_probe_begin(path)
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut others = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.name != "OverlappingImpls" && d.name != "PolyImplUnsupported" {
+            io.println("FAIL: {stem} recorded an error the row does not expect: {d.name}: {d.message}")
+            others = others + 1
+        }
+    }
+    assert_eq(others, 0)
+    cg_probe_errors_named("OverlappingImpls")
+}
+
+fn nested_list_sources_src() -> Str {
+    #"type Count { n: Int }
+impl[T] From[List[T]] for Count {
+    fn from(v: List[T]) -> Count { Count { n: v.len() } }
+}
+impl[T] From[List[List[T]]] for Count {
+    fn from(v: List[List[T]]) -> Count { Count { n: 0 - v.len() } }
+}
+fn main() {
+    assert(true)
+}
+"#
+}
+
+fn nested_list_sources_tied_src() -> Str {
+    #"type Box[T] { n: Int }
+impl[T] From[List[T]] for Box[T] {
+    fn from(v: List[T]) -> Box[T] { Box { n: v.len() } }
+}
+impl[T] From[List[List[T]]] for Box[T] {
+    fn from(w: List[List[T]]) -> Box[T] { Box { n: 0 - w.len() } }
+}
+fn main() {
+    assert(true)
+}
+"#
+}
+
+fn poly_and_concrete_source_src() -> Str {
+    #"type Count { n: Int }
+impl[T] From[List[T]] for Count {
+    fn from(v: List[T]) -> Count { Count { n: v.len() } }
+}
+impl From[List[Int]] for Count {
+    fn from(v: List[Int]) -> Count { Count { n: 0 - v.len() } }
+}
+fn main() {
+    assert(true)
+}
+"#
+}
+
+fn poly_and_concrete_source_generic_src() -> Str {
+    #"type Box[T] { n: Int }
+impl[T] From[List[T]] for Box[T] {
+    fn from(v: List[T]) -> Box[T] { Box { n: v.len() } }
+}
+impl From[List[Int]] for Box[Int] {
+    fn from(v: List[Int]) -> Box[Int] { Box { n: 0 - v.len() } }
+}
+fn main() {
+    assert(true)
+}
+"#
+}
+
+fn repeated_binder_src() -> Str {
+    #"type Pair { n: Int }
+impl[T] From[(T, T)] for Pair {
+    fn from(v: (T, T)) -> Pair { Pair { n: 2 } }
+}
+impl From[(Int, Str)] for Pair {
+    fn from(v: (Int, Str)) -> Pair { Pair { n: v.0 } }
+}
+fn main() {
+    assert(true)
+}
+"#
+}
+
+fn repeated_binder_generic_src() -> Str {
+    #"type Box[T] { n: Int }
+impl[T] From[(T, T)] for Box[T] {
+    fn from(v: (T, T)) -> Box[T] { Box { n: 2 } }
+}
+impl From[(Int, Str)] for Box[Int] {
+    fn from(v: (Int, Str)) -> Box[Int] { Box { n: v.0 } }
+}
+fn main() {
+    assert(true)
+}
+"#
+}
+
+fn two_list_sources_src() -> Str {
+    #"type Count { n: Int }
+impl From[List[Int]] for Count {
+    fn from(v: List[Int]) -> Count { Count { n: v.len() } }
+}
+impl From[List[Str]] for Count {
+    fn from(w: List[Str]) -> Count { Count { n: 0 - w.len() } }
+}
+fn main() {
+    let a = Count.from([1, 2])
+    let b = Count.from(["a"])
+    assert(a.n != b.n)
+}
+"#
+}
+
+// List[T] unifies with List[List[U]] at T = List[U], so both impls answer for one source.
+test "conversion impls whose sources unify under their binders overlap" {
+    assert_eq(overlaps_in("typecheck_overlap_nested_source", nested_list_sources_src()), 1)
+}
+
+// The receiver ties each source to the one binder, so a match needs T = List[T], which no
+// type is: the two impls share no instance.
+test "conversion impls whose receiver ties the sources to one binder do not overlap" {
+    let program = probe("typecheck_overlap_nested_source_tied", nested_list_sources_tied_src())
+    assert(program >= 0)
+}
+
+test "a poly conversion impl overlaps a concrete one its source covers" {
+    assert_eq(overlaps_in("typecheck_overlap_poly_concrete", poly_and_concrete_source_src()), 1)
+}
+
+test "a poly conversion impl on a generic receiver overlaps a concrete one it covers" {
+    assert_eq(overlaps_in("typecheck_overlap_poly_concrete_generic", poly_and_concrete_source_generic_src()), 1)
+}
+
+// (T, T) cannot take Int and Str at once, so the two sources share no instance.
+test "a repeated binder keeps a poly source apart from a mixed tuple" {
+    assert_eq(overlaps_in("typecheck_overlap_repeated_binder", repeated_binder_src()), 0)
+}
+
+test "a repeated binder keeps a poly source apart from a mixed tuple on a generic receiver" {
+    assert_eq(overlaps_in("typecheck_overlap_repeated_binder_generic", repeated_binder_generic_src()), 0)
+}
+
+test "conversion impls from two instances of one generic do not overlap" {
+    let program = probe("typecheck_overlap_two_list_sources", two_list_sources_src())
     assert(program >= 0)
 }

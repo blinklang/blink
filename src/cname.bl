@@ -19,7 +19,7 @@ import typecheck.{
     TAGPOS_INNER, TAGPOS_SYMBOL, TAGPOS_SYMBOL_INNER, TAGPOS_TOP, TyKind, TypePoolEntry, tc_resolve,
     tc_resolve_transparent_alias_name, tc_tid_decl_node, DECL_NODE_AMBIGUOUS, ty_param_list, ty_pool,
     tc_tid_handler_effect, tc_handler_effect_root, is_user_effect_handle_name,
-    sanitize_test_name, tc_enum_has_payload,
+    sanitize_test_name, tc_enum_has_payload, tc_impl_conv_source,
 }
 import parser.{
     get_annotation, get_str_named_arg, node_args, node_name, node_source_module,
@@ -194,9 +194,10 @@ pub fn c_mono_fn_name(fn_node: Int, args_tid: Int) -> Str {
 }
 
 // A mono instance of a poly-impl method (`impl[T] Tr for List[T]`): the impl's own
-// stem is the base, and the element slots follow like any other instance.
+// stem is the base, and the element slots follow like any other instance. A poly
+// conversion impl has no dispatch path yet, so its source does not ride the stem.
 pub fn c_poly_method_name(im: Int, mname: Str, args_tid: Int) -> Str {
-    let stem = tuple_stem(impl_stem(im, node_trait_name(im), mname), args_tid)
+    let stem = tuple_stem(impl_stem(im, node_trait_name(im), mname, -1), args_tid)
     if diag_is_ice_seg(stem) { return stem }
     impl_symbol(im, stem)
 }
@@ -362,14 +363,14 @@ pub fn c_decl_for_tid(tid: Int) -> Int {
 // ── Impl methods ─────────────────────────────────────────────────────────────────
 
 // From/TryFrom are one trait with many source-typed impls, so the source type, not
-// the trait, keeps their symbols apart.
-fn impl_stem(im: Int, trait_name: Str, mname: Str) -> Str {
+// the trait, keeps their symbols apart. The source is spelled whole, as a mono slot is:
+// its head alone names List[Int] and List[Str] alike.
+fn impl_stem(im: Int, trait_name: Str, mname: Str, source_tid: Int) -> Str {
     let impl_type = node_name(im)
-    if trait_name == "From" || trait_name == "TryFrom" {
-        let tps = node_type_params(im)
-        if tps != -1 && sublist_length(tps) > 0 {
-            return "{impl_type}_{mname}_{node_name(sublist_get(tps, 0))}"
-        }
+    if (trait_name == "From" || trait_name == "TryFrom") && source_tid >= 0 {
+        let seg = spellable(seg_at(source_tid, TAGPOS_SYMBOL))
+        if diag_is_ice_seg(seg) { return seg }
+        return "{impl_type}_{mname}_{mono_escape(seg)}"
     }
     "{impl_type}_{trait_name}_{mname}"
 }
@@ -383,7 +384,9 @@ fn impl_symbol(im: Int, stem: Str) -> Str {
 }
 
 pub fn c_impl_method_name(im: Int, mname: Str) -> Str {
-    impl_symbol(im, impl_stem(im, node_trait_name(im), mname))
+    let stem = impl_stem(im, node_trait_name(im), mname, tc_impl_conv_source(im))
+    if diag_is_ice_seg(stem) { return stem }
+    impl_symbol(im, stem)
 }
 
 // The trait-qualified form for a caller that already resolved the trait.
