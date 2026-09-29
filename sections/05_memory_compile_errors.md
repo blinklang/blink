@@ -303,10 +303,14 @@ Cleanup is LIFO — `b.close()` runs before `a.close()`. If `expr2` fails (via `
 
 #### Compiler diagnostics
 
-**W0600: `Closeable` value used outside `with...as`**
+**ScopedValueWithoutWith: scoped value that does not go into a `with`**
+
+The lint applies to every **scoped value**: a value whose type implements `Closeable` or `BlockHandler` (§4.6.3). It fires when such a value reaches anything other than a `with` item. The check follows the value, not its construction: `let tx = db.transaction()` followed by `with tx { }` does not warn. A scoped value returned from a function is not reported in that function.
+
+The numeric code for this lint is not assigned yet. The diagnostic catalog gives W0600 to `UnusedVariable`, and the catalog fixes the code for this lint when it resolves that clash.
 
 ```
-warning[CloseableWithoutScope]: `Closeable` value used without `with...as`
+warning[ScopedValueWithoutWith]: `Closeable` value used without `with...as`
  --> data.bl:5:9
   |
 5 |     let file = fs.open("data.txt")?
@@ -318,10 +322,26 @@ warning[CloseableWithoutScope]: `Closeable` value used without `with...as`
 6 |         // use file here
 7 |     }
   = note: suppress with `@trusted(audit: "AUDIT-ID")` for manual resource management
-  = note: upgrade to error in blink.toml: [lints] W0600 = "error"
+  = note: upgrade to error in blink.toml `[lints]`
 ```
 
-This is a warning by default, upgradeable to a hard error via `blink.toml`. Suppressible with `@trusted(audit: K)` for framework code (connection pools, resource managers) that deliberately manages `Closeable` lifetimes manually.
+For a `BlockHandler`, the help names the `with` form that the type takes:
+
+```
+warning[ScopedValueWithoutWith]: `BlockHandler` value used without `with`
+ --> app.bl:3:9
+  |
+3 |     let conn = db.connect("app.db")?
+  |         ^^^^ `Connection` implements `BlockHandler`, but `conn` never goes into a `with`
+  |
+  = help: use it as a `with` item so that `exit()` runs:
+  |
+3 |     with db.connect("app.db")? {
+4 |         // db.* calls here use this connection
+5 |     }
+```
+
+This is a warning by default, upgradeable to a hard error via `blink.toml`. Suppressible with `@trusted(audit: K)` for framework code (connection pools, resource managers) that deliberately manages scoped-value lifetimes manually.
 
 **E0601: closeable escapes scope**
 
@@ -361,7 +381,7 @@ error[CloseableStoredInCollection]: `Closeable` value stored in collection
 12|         results.push(cursor.next()?)
 ```
 
-These three diagnostics form a closed net: W0600 catches forgotten `with...as`, E0601 catches escape via return or assignment, E0602 catches escape via collections. Together they ensure `Closeable` values are always scoped and always cleaned up.
+These three diagnostics form a closed net: ScopedValueWithoutWith catches forgotten `with...as`, E0601 catches escape via return or assignment, E0602 catches escape via collections. Together they ensure `Closeable` values are always scoped and always cleaned up.
 
 ### 5.6 Future: Compiler Optimization Improvements
 

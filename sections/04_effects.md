@@ -1172,11 +1172,16 @@ The outer `with mock_db(fixtures), temp_fs()` installs effect handlers (no `as`)
 | Syntax | `as` present? | Type check | Meaning |
 |--------|--------------|------------|---------|
 | `with expr { }` | No | `expr: Handler[E]` | Effect handler |
+| `with expr { }` | No | `expr: T where T: BlockHandler, T.Context == Handler[E]` | Scoped effect handler: `enter()`, install the returned handler for `E`, body, uninstall, `exit(ok)` |
 | `with expr { }` | No | `expr: T where T: BlockHandler, T.Context == ()` | Block handler (no binding) |
 | `with expr as name { }` | Yes | `expr: T where T: Closeable` | Scoped resource |
-| `with expr as name { }` | Yes | `expr: T where T: BlockHandler` | Block handler (with binding) |
+| `with expr as name { }` | Yes | `expr: T where T: BlockHandler` | Block handler (with binding); if `T.Context == Handler[E]`, also a scoped effect handler |
 
-When `as` is absent, the compiler checks `Handler[E]` first, then `BlockHandler`. When `as` is present, the compiler checks `Closeable` first, then `BlockHandler`. A type implementing both `Closeable` and `BlockHandler` is a compile error (ambiguity).
+When `as` is absent, the compiler checks `Handler[E]` first, then a `BlockHandler` whose `Context` is `Handler[E]`, then a `BlockHandler` whose `Context` is `()`. Any other `Context` without `as` is an error (E0839). When `as` is present, the compiler checks `Closeable` first, then `BlockHandler`. A type implementing both `Closeable` and `BlockHandler` is a compile error (ambiguity).
+
+`as` never changes what a `with` item does. For a scoped effect handler, `with expr as name { }` installs the handler exactly as `with expr { }` does, and also binds `name` to the same `Handler[E]` value. The typing rule and evaluation order are in §4.6.3, *Scoped effect handlers*.
+
+**Comma-separated items nest from left to right.** `with a, b { body }` means `with a { with b { body } }`. The compiler evaluates and type-checks item *i* after items *0..i-1* are entered and their handlers installed, so a later item can use an effect that an earlier item installs. Teardown is LIFO. If item *i* fails through `?`, the `?` fires before item *i* is entered, and the normal unwind of items *0..i-1* runs their `exit(false)` or `close()` (§4.6.3, *Catchable unwind*; §5.5, *Multiple resources*).
 
 All forms can appear in the same comma-separated `with`:
 
@@ -1187,6 +1192,10 @@ with mock_db(fixtures), fs.open("x.txt")? as f {
 
 with mock_db(fixtures), db.transaction() {
     // mock_db provides DB handler, transaction is a BlockHandler
+}
+
+with db.connect("app.db")?, db.transaction() {
+    // db.connect installs the DB handler; db.transaction() uses it
 }
 ```
 
@@ -1232,7 +1241,7 @@ trait BlockHandler {
 }
 ```
 
-**`enter()`** is called before the block body executes. Its return value is bound via `as` (or discarded if `as` is absent). **`exit(ok)`** is called after the block body completes — `ok` is `true` for normal completion, `false` for any **catchable unwind** (see below).
+**`enter()`** is called before the block body executes. Its return value is bound via `as` (or discarded if `as` is absent). If `Context` is `Handler[E]`, the return value is also installed as the handler for `E` (see *Scoped effect handlers* below). **`exit(ok)`** is called after the block body completes — `ok` is `true` for normal completion, `false` for any **catchable unwind** (see below).
 
 #### Catchable unwind
 
@@ -1320,6 +1329,66 @@ with Timer { label: "db_query", start: time.now() } {
 }
 ```
 
+#### Scoped effect handlers
+
+A `BlockHandler` whose `Context` is `Handler[E]` is a **scoped effect handler**. The `with` block installs the handler that `enter()` returns, for the block body only. This joins an effect handler and a cleanup in one `with` item. In this example, `sqlite_open` returns `Result[Sqlite3, DBError]`, with `Err(ConnectionError(..))` when the open fails:
+
+```blink
+pub type Connection {
+    handle: Sqlite3
+}
+
+impl BlockHandler for Connection {
+    type Context = Handler[DB]
+
+    fn enter(self) -> Handler[DB] {
+        sqlite_handler(self.handle)
+    }
+
+    fn exit(self, ok: Bool) {
+        sqlite_close(self.handle)
+    }
+}
+
+pub fn connect(path: Str) -> Result[Connection, DBError] {
+    let handle = sqlite_open(path)?
+    Ok(Connection { handle: handle })
+}
+
+// Usage
+with db.connect(":memory:")? {
+    db.exec("CREATE TABLE users (name TEXT)")?
+}
+```
+
+**Order.** For `with expr { body }`:
+
+1. Evaluate `expr`
+2. Call `enter()`
+3. Install the returned `Handler[E]`
+4. Run `body`
+5. Uninstall the handler
+6. Call `exit(ok)`
+
+Steps 5 and 6 run on every catchable unwind, as for every `BlockHandler`. `exit()` runs after the uninstall, with the outer handlers in place. A `db.*` call inside `exit()` therefore goes to the outer `DB` handler, not to the one this item installed. Use `self` in `exit()`.
+
+**Typing rule.** The item discharges `E` from the effect row of the body. `enter()` and `exit()` are checked against the outer effect row:
+
+```
+Γ ⊢ e : T    T : BlockHandler    T.Context ≡ Handler[E]
+Γ ⊢ body : U ! ρ ∪ {E}
+───────────────────────────────────────────────
+Γ ⊢ with e { body } : U ! ρ ∪ eff(enter) ∪ eff(exit)
+```
+
+The rule applies only when `T.Context` normalizes to `Handler[E]` with a concrete `E` at the `with` site. In generic code such as `fn run[T: BlockHandler](t: T) { with t { } }`, `Context` is abstract: the item installs no handler and discharges no effect. It must then meet the `Context == ()` row. An abstract `Context` does not meet it, so the compiler reports E0839 and names the abstract `Context` as the cause. There are no effect-kinded generics in v1 (§4.7.1), so `E` is always concrete where the rule applies.
+
+**Binding.** `with expr as name { }` installs the handler and binds `name` to the same `Handler[E]` value. `name` follows the scoping rules in *Interaction with async* below.
+
+**Acquire before the block.** `self` is passed by value, so `enter()` cannot hand new state to `exit()`. A scoped effect handler therefore holds its resource from construction, like a `Closeable`. Entering the same value in two `with` blocks runs `exit()` twice. The scope lint (§5.5) warns about a scoped value that does not go into a `with`.
+
+A failed acquisition uses `?` on the item: `with db.connect(p)? { }`. The `?` fires before the scope is entered, so a failed open needs no cleanup.
+
 #### `exit()` constraints
 
 `exit()` is a finalizer, not a control flow mechanism. It **cannot**:
@@ -1334,7 +1403,7 @@ Because `exit(false)` cannot observe *which* path triggered the unwind, handler 
 
 #### Interaction with async
 
-`BlockHandler` bindings follow the same scoping rules as `Closeable` bindings. A `BlockHandler` binding cannot be sent to a spawned task:
+`BlockHandler` bindings follow the same scoping rules as `Closeable` bindings (E0601, E0602). This includes the `Handler[E]` that `as` binds for a scoped effect handler: that handler uses a resource that `exit()` releases. A `BlockHandler` binding cannot be sent to a spawned task:
 
 ```blink
 fn bad_example() ! DB, Async {

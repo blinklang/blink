@@ -2701,7 +2701,7 @@ impl Closeable for FileHandle {
 }
 ```
 
-The compiler uses `Closeable` to power lint W0600 (warn when a `Closeable` value is used outside a `with...as` block) and errors E0601/E0602 (closeable escapes scope). See section 5.5 for the full mechanism.
+The compiler uses `Closeable` to power the ScopedValueWithoutWith lint (warn when a `Closeable` or `BlockHandler` value does not go into a `with`) and errors E0601/E0602 (closeable escapes scope). See section 5.5 for the full mechanism.
 
 #### §3.6.1 Derive Mechanics
 
