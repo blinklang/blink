@@ -1,0 +1,174 @@
+// sections/07_trust_modules_metadata.md §9.1.3: an `@ffi.struct` field may be a sized scalar,
+// `Bool`, `Ptr[T]` or another `@ffi.struct`. A `Buf` field is E0822, not E0812: a `Buf` is a
+// `blink_buf_t*`, not the C pointer the field declares, and the size check cannot see it. A
+// struct that holds a `Ptr`, directly or through a nested `@ffi.struct`, is confined to FFI
+// regions as `Ptr[T]` is (E0811), and the error names the field, since nothing in the
+// struct's name says why it is confined.
+import cg_test_helpers.{cg_probe_begin}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_ice_count, diag_explain}
+import std.io
+
+// Checks `src` and answers every error as `Name@line`, one per line, in emit order.
+fn errors_in(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    cg_probe_begin(path)
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    assert_eq(diag_ice_count, 0)
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = "{out}{d.name}@{d.line}\n" }
+    }
+    io.println("{stem}: {out}")
+    out
+}
+
+// The message of the first error named `name`, or "" when there is none.
+fn message_of(name: Str) -> Str {
+    for d in diag_entries {
+        if d.severity == "error" && d.name == name { return d.message }
+    }
+    ""
+}
+
+let IOVEC = #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+pub type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+"#
+
+test "a Ptr field in an @ffi.struct is legal" {
+    assert_eq(errors_in("ffs_ptr_field", "{IOVEC}fn main() \{ }\n"), "")
+}
+
+test "an @ffi.struct field of another @ffi.struct is legal, declared before or after" {
+    assert_eq(errors_in("ffs_nested", #"@ffi.struct(header: "x.h", name: "outer")
+pub type Outer {
+    pfd: Pollfd,
+    n: I32,
+}
+@ffi.struct(header: "poll.h", name: "pollfd")
+pub type Pollfd {
+    fd: I32,
+    events: I16,
+    revents: I16,
+}
+fn main() { }
+"#), "")
+}
+
+test "a Buf field in an @ffi.struct is E0822 and nothing else" {
+    assert_eq(errors_in("ffs_buf_field", #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+pub type IoVec {
+    iov_base: Buf[U8],
+    iov_len: U64,
+}
+fn main() { }
+"#), "BufOutsideFfiSurface@3\n")
+}
+
+test "a Str field and a plain struct field in an @ffi.struct stay E0812" {
+    assert_eq(errors_in("ffs_gc_fields", #"type Plain {
+    a: I32,
+}
+@ffi.struct(header: "x.h", name: "bad")
+pub type Bad {
+    name: Str,
+    inner: Plain,
+}
+fn main() { }
+"#), "FfiStructGcField@6\nFfiStructGcField@7\n")
+}
+
+test "a Ptr field with a GC pointee is E0810 on the pointee, not E0812 on the field" {
+    assert_eq(errors_in("ffs_ptr_gc_pointee", #"@ffi.struct(header: "x.h", name: "bad")
+pub type Bad {
+    p: Ptr[Str],
+}
+fn main() { }
+"#), "InvalidPtrType@3\n")
+}
+
+test "a Ptr-bearing @ffi.struct parameter outside an FFI region is E0811 naming the field" {
+    assert_eq(errors_in("ffs_param", "{IOVEC}fn len_of(v: IoVec) -> U64 \{\n    v.iov_len\n}\nfn main() \{ }\n"), "PtrOutsideFFI@6\n")
+    assert(message_of("PtrOutsideFFI").contains("`IoVec` holds `Ptr` in field `iov_base` (line 3), so it may appear only in an FFI region"))
+}
+
+test "a Ptr-bearing @ffi.struct return type outside an FFI region is E0811" {
+    assert_eq(errors_in("ffs_return", "{IOVEC}fn mk() -> IoVec \{\n    mk()\n}\nfn main() \{ }\n"), "PtrOutsideFFI@6\n")
+}
+
+test "a Ptr-bearing @ffi.struct inside a generic argument of a signature is E0811" {
+    assert_eq(errors_in("ffs_generic", "{IOVEC}fn mk() -> List[IoVec] \{\n    []\n}\nfn main() \{ }\n"), "PtrOutsideFFI@6\n")
+}
+
+test "a struct that holds a Ptr through a nested @ffi.struct is E0811 naming the path" {
+    assert_eq(errors_in("ffs_transitive", "{IOVEC}@ffi.struct(header: \"x.h\", name: \"msg\")\npub type Msg \{\n    iov: IoVec,\n    n: I32,\n}\nfn count(m: Msg) -> I32 \{\n    m.n\n}\nfn main() \{ }\n"), "PtrOutsideFFI@11\n")
+    assert(message_of("PtrOutsideFFI").contains("`Msg` holds `Ptr` in field `iov.iov_base` (line 3)"))
+}
+
+// The reported line is the Ptr field's own line in the struct that declares it, not the
+// line of the field that reaches it, so the user is sent to the pointer itself.
+test "a transitive E0811 reports the line of the Ptr field in the struct that declares it" {
+    assert_eq(errors_in("ffs_transitive_far", #"@ffi.struct(header: "x.h", name: "msg")
+pub type Msg {
+    iov: IoVec,
+    n: I32,
+}
+fn count(m: Msg) -> I32 {
+    m.n
+}
+fn main() { }
+fn filler_a() -> Int { 1 }
+fn filler_b() -> Int { 2 }
+fn filler_c() -> Int { 3 }
+@ffi.struct(header: "sys/uio.h", name: "iovec")
+pub type IoVec {
+    iov_len: U64,
+    iov_base: Ptr[U8],
+}
+"#), "PtrOutsideFFI@6\n")
+    assert(message_of("PtrOutsideFFI").contains("`Msg` holds `Ptr` in field `iov.iov_base` (line 16)"))
+}
+
+test "an alias to a Ptr-bearing @ffi.struct in a signature is E0811 naming the struct's field" {
+    assert_eq(errors_in("ffs_alias", "{IOVEC}type Vec = IoVec\nfn len_of(v: Vec) -> U64 \{\n    v.iov_len\n}\nfn main() \{ }\n"), "PtrOutsideFFI@7\n")
+    assert(message_of("PtrOutsideFFI").contains("`IoVec` holds `Ptr` in field `iov_base` (line 3)"))
+}
+
+test "a Ptr-bearing @ffi.struct in an @ffi signature is legal" {
+    assert_eq(errors_in("ffs_ffi_sig", "{IOVEC}@ffi(\"f\")\n@trusted(audit: \"A-1\")\nfn c_f(v: IoVec) -> I32 ! FFI\n\nfn main() \{ }\n"), "")
+}
+
+test "an @ffi.struct with no Ptr field is not confined" {
+    assert_eq(errors_in("ffs_scalar_only", #"@ffi.struct(header: "poll.h", name: "pollfd")
+pub type Pollfd {
+    fd: I32,
+    events: I16,
+    revents: I16,
+}
+fn fd_of(p: Pollfd) -> I32 {
+    p.fd
+}
+fn main() { }
+"#), "")
+}
+
+test "the E0812 explain text lists Ptr and @ffi.struct fields as legal and sends Buf to E0822" {
+    let text = diag_explain("E0812")
+    assert(text.contains("Ptr[T]"))
+    assert(text.contains("E0822"))
+    assert(!text.contains("(in future) other @ffi.struct types"))
+}
+
+test "the E0822 explain text no longer says a Buf may name an @ffi.struct field" {
+    let text = diag_explain("E0822")
+    assert(!text.contains("and `@ffi.struct`\nfield types"))
+    assert(text.contains("@ffi.struct"))
+}
