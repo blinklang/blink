@@ -1,0 +1,195 @@
+// A type parameter stands for one type per call. When two arguments sit at T, the first
+// fixes T and the second is checked against it, the rule a list literal's elements follow.
+// Without the check `pick(1, "a")` passes and the C compiler meets a Str where the Int
+// instance wants an int64_t.
+import cg_test_helpers.{cg_probe_begin, cg_probe_errors_named}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries}
+import std.io
+
+fn prelude() -> Str {
+    #"fn pick[T](a: T, b: T) -> T {
+    let pair = (a, b)
+    pair.0
+}
+trait Both { fn both[U](self, a: U, b: U) -> U }
+type W { n: Int }
+impl Both for W {
+    fn both[U](self, a: U, b: U) -> U {
+        let pair = (a, b)
+        pair.1
+    }
+}
+"#
+}
+
+// Checks `main_src` after the prelude and answers the TypeError count. Any other error fails
+// the row, CannotInferType included: an argument that fixes T must not leave it open.
+fn type_errors_in(stem: Str, main_src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    cg_probe_begin(path)
+    write_file(path, "{prelude()}{main_src}")
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut others = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.name != "TypeError" {
+            io.println("FAIL: {stem} recorded an error the row does not expect: {d.name}: {d.message}")
+            others = others + 1
+        }
+    }
+    assert_eq(others, 0)
+    cg_probe_errors_named("TypeError")
+}
+
+fn reported_at_second_argument(callee: Str) -> Bool {
+    for d in diag_entries {
+        if d.severity == "error" && d.name == "TypeError" && d.message.contains("argument 2 of `{callee}`") { return true }
+    }
+    false
+}
+
+fn int_str_src() -> Str {
+    #"fn main() {
+    let r = pick(1, "a")
+    io.println("{r}")
+}
+"#
+}
+
+fn str_int_src() -> Str {
+    #"fn main() {
+    let r = pick("a", 1)
+    io.println("{r}")
+}
+"#
+}
+
+fn list_literals_src() -> Str {
+    #"fn main() {
+    let r = pick([1], [1.5])
+    io.println("{r.len()}")
+}
+"#
+}
+
+fn list_locals_src() -> Str {
+    #"fn main() {
+    let a: List[Int] = [1]
+    let b: List[Float] = [1.5]
+    let r = pick(a, b)
+    io.println("{r.len()}")
+}
+"#
+}
+
+fn pointers_src() -> Str {
+    #"fn main() {
+    with ffi.scope() as scope {
+        let p: Ptr[Int] = scope.alloc()
+        let q: Ptr[Float] = scope.alloc()
+        let r = pick(p, q)
+        io.println("{r == p}")
+    }
+}
+"#
+}
+
+fn options_src() -> Str {
+    #"fn main() {
+    let r = pick(Some(1), Some("a"))
+    io.println("{r.is_some()}")
+}
+"#
+}
+
+fn method_src() -> Str {
+    #"fn main() {
+    let w = W { n: 1 }
+    let r = w.both(1, "a")
+    io.println("{r}")
+}
+"#
+}
+
+fn two_ints_src() -> Str {
+    #"fn main() {
+    let r = pick(1, 2)
+    io.println("{r}")
+}
+"#
+}
+
+fn literal_after_i8_src() -> Str {
+    #"fn main() {
+    let x: I8 = 3
+    let r = pick(x, 1)
+    io.println("{r}")
+}
+"#
+}
+
+fn empty_list_first_src() -> Str {
+    #"fn main() {
+    let r = pick([], [1])
+    io.println("{r.len()}")
+}
+"#
+}
+
+fn none_first_src() -> Str {
+    #"fn main() {
+    let r = pick(None, Some(1))
+    io.println("{r ?? 0}")
+}
+"#
+}
+
+test "an Int and a Str cannot both be T" {
+    assert_eq(type_errors_in("typecheck_generic_args_int_str", int_str_src()), 1)
+    assert(reported_at_second_argument("pick"))
+}
+
+test "a Str and an Int cannot both be T" {
+    assert_eq(type_errors_in("typecheck_generic_args_str_int", str_int_src()), 1)
+}
+
+test "two list literals of different elements cannot both be T" {
+    assert_eq(type_errors_in("typecheck_generic_args_list_literals", list_literals_src()), 1)
+}
+
+test "two list locals of different elements cannot both be T" {
+    assert_eq(type_errors_in("typecheck_generic_args_list_locals", list_locals_src()), 1)
+}
+
+test "two pointers to different types cannot both be T" {
+    assert_eq(type_errors_in("typecheck_generic_args_pointers", pointers_src()), 1)
+}
+
+test "two options of different payloads cannot both be T" {
+    assert_eq(type_errors_in("typecheck_generic_args_options", options_src()), 1)
+}
+
+test "a method's own type parameter takes one type per call too" {
+    assert_eq(type_errors_in("typecheck_generic_args_method", method_src()), 1)
+    assert(reported_at_second_argument("W.both"))
+}
+
+test "two Ints are one T" {
+    assert_eq(type_errors_in("typecheck_generic_args_two_ints", two_ints_src()), 0)
+}
+
+test "an integer literal after a sized integer takes that integer's type" {
+    assert_eq(type_errors_in("typecheck_generic_args_literal_after_i8", literal_after_i8_src()), 0)
+}
+
+test "a later list argument pins the element an empty list left open" {
+    assert_eq(type_errors_in("typecheck_generic_args_empty_list_first", empty_list_first_src()), 0)
+}
+
+test "a later option argument pins the payload a bare None left open" {
+    assert_eq(type_errors_in("typecheck_generic_args_none_first", none_first_src()), 0)
+}
