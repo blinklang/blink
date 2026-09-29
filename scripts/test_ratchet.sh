@@ -70,7 +70,7 @@ check_row() {
   fi
 }
 
-check_row pub_let_mut              codegen.bl   'pub let mut other_global2: Int = 0'
+check_row module_let_mut           codegen.bl   'pub let mut other_global2: Int = 0'
 check_row br_ids_in_source         codegen.bl   '// also see br xyz987'
 check_row layout_decline_unhandled cname.bl     'let swallowed = d.decline_reason'
 
@@ -104,10 +104,47 @@ check_named_row cg_name_string_compares cg_call.bl \
 check_named_row cg_name_string_compares cg_expr.bl \
   'if name == "read_file" { return c_runtime_helper("read_file") }'
 
-# Not pub, so only this row moves; a pub table would also raise pub_let_mut and
-# the run would fail for two reasons at once.
+# A new table is also a new module global, so the let-mut rows rise with it;
+# check_named_row reads back that this row carries the mark as well.
 check_named_row typecheck_str_keyed_tables typecheck.bl \
   'let mut tc_new_fact_table: Map[Str, List[Int]] = Map()'
+
+# A module global need not be pub to be shared state.
+check_named_row module_let_mut codegen.bl 'let mut em_scratch: Int = 0'
+check_named_row typecheck_module_let_mut typecheck.bl 'let mut tc_walk_depth: Int = 0'
+
+# The name row counts every spelling of the same question: a name-like binding
+# other than `method`/`name`, a name read through a call, a compare with a named
+# constant, a `!=`, and a compare in a codegen file outside the cg_*.bl glob.
+check_named_row cg_name_string_compares cg_call.bl \
+  'if mname == "len" { return cc_list_len(node) }'
+check_named_row cg_name_string_compares cg_reg.bl \
+  'if node_name(f) == "main" { has_main = true }'
+check_named_row cg_name_string_compares cg_call.bl \
+  'if mname == method_display && cc_is_scalar_display_kind(kind) { return 1 }'
+check_named_row cg_name_string_compares mono.bl \
+  'if trait_name != "Eq" { continue }'
+check_named_row cg_name_string_compares cg.bl \
+  'if method == "main" { return 1 }'
+
+# The fallback idiom counts anywhere in src/, a field path included.
+check_named_row fallback_idiom escape.bl \
+  'let key = if decl >= 0 { decl } else { hit }'
+check_named_row fallback_idiom cg_eff.bl \
+  'let fwd = if th.forward_to >= 0 { th.forward_to } else { 0 }'
+
+# A branch on one value that answers with another is not the idiom: the row
+# needs the same name on both sides, or it counts every signed compare.
+NOFALLBACK="$WORK/no_fallback"
+rm -rf "$NOFALLBACK"
+cp -r "$BASE" "$NOFALLBACK"
+printf '%s\n' 'let v = if a >= 0 { b } else { c }' >> "$NOFALLBACK/src/escape.bl"
+if ! RATCHET_SRC_DIR="$NOFALLBACK" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > /dev/null 2>&1; then
+  echo "FAIL fallback_idiom-distinct: a branch that answers with another value was counted"
+  fail=1
+else
+  echo "PASS fallback_idiom-distinct: a branch that answers with another value is not counted"
+fi
 
 # An indented table is a function local, not a module-scope fact table, so the
 # row must not count it. Without this the regex could be a bare substring match.
@@ -309,7 +346,7 @@ echo 'pub let mut a: Int = 0' > "$WALKWORK/src/codegen.bl"
     printf '%s\n' "$walk_out"
     exit 1
   fi
-  if ! printf '%s\n' "$walk_out" | rg -q 'raise a row: pub_let_mut 1 -> 2$'; then
+  if ! printf '%s\n' "$walk_out" | rg -q 'raise a row: module_let_mut 1 -> 2$'; then
     echo "FAIL git-walk-paid-back: the run failed, but did not name the commit and row that rose"
     printf '%s\n' "$walk_out"
     exit 1

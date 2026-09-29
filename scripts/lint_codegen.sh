@@ -57,7 +57,7 @@ esac
 ROWS="
 L1 ct_or_string_types 0
 L2 sentinel_answers 0
-L3 pub_let_mut_new 8
+L3 module_let_mut 8
 L3 pub_let_mut_unlisted 0
 L4 typename_compares 0
 L5 no_infer 0
@@ -151,21 +151,21 @@ compute_rows() {
     scan '\bCT_[A-Z_]+\b|\btype_from_name(_tag)?\(|\btp_[a-z][a-z_0-9]*\(|\bsv_tp\(|\.(ctype|sname)\b' "$@" > "$det/ct_or_string_types.txt"
 
     # L2: a guessed answer where an ICE belongs: TYPE_UNKNOWN, the flat
-    # fallback idiom, and a tid coalesced onto a default.
-    scan '\bTYPE_UNKNOWN\b|if [a-z_]+ >= 0 \{ [a-z_]+ \} else|\b[a-z_0-9]*tid[a-z_0-9]*\s*\?\?\s' "$@" > "$det/sentinel_answers.txt"
+    # fallback idiom (a field path too), and a tid coalesced onto a default.
+    scan '\bTYPE_UNKNOWN\b|if ([a-z_][a-z_0-9.]*) >= 0 \{ \1 \} else|\b[a-z_0-9]*tid[a-z_0-9]*\s*\?\?\s' "$@" > "$det/sentinel_answers.txt"
 
-    # L3: mutable module globals. Count, and names outside the allowlist.
-    scan '^pub let mut [a-z_][a-z_0-9]*' "$@" > "$det/pub_let_mut_new.txt"
+    # L3: mutable module globals, pub or not: a global need not be pub to be
+    # shared state. The allowlist names the pub ones, which other modules
+    # reach; the count row holds the rest.
+    scan '^(pub )?let mut [a-z_][a-z_0-9]*' "$@" > "$det/module_let_mut.txt"
     : > "$det/pub_let_mut_unlisted.txt"
-    if [ -s "$det/pub_let_mut_new.txt" ]; then
-        allowed=$(grep -vE '^[[:space:]]*(#|$)' "$allowlist" 2>/dev/null | awk '{print $1}')
-        while IFS= read -r line; do
-            name=$(printf '%s' "$line" | sed -E 's/^.*pub let mut ([a-z_][a-z_0-9]*).*$/\1/')
-            if ! printf '%s\n' "$allowed" | grep -qx -- "$name"; then
-                echo "$line" >> "$det/pub_let_mut_unlisted.txt"
-            fi
-        done < "$det/pub_let_mut_new.txt"
-    fi
+    allowed=$(grep -vE '^[[:space:]]*(#|$)' "$allowlist" 2>/dev/null | awk '{print $1}')
+    grep -P '^[^:]*:[0-9]+:pub let mut ' "$det/module_let_mut.txt" | while IFS= read -r line; do
+        name=$(printf '%s' "$line" | sed -E 's/^.*pub let mut ([a-z_][a-z_0-9]*).*$/\1/')
+        if ! printf '%s\n' "$allowed" | grep -qx -- "$name"; then
+            echo "$line" >> "$det/pub_let_mut_unlisted.txt"
+        fi
+    done
 
     # L4: dispatch on a type's NAME as a string.
     scan '[=!]= "[A-Z][A-Za-z_0-9]*"|\btk_name\([^)]*\)\s*[=!]=|\.(starts_with|ends_with)\("(Option|Result|List|Map|Set|Tuple|Fn|Str|Int|Float|Bool|Bytes|Char)\b' "$@" > "$det/typename_compares.txt"

@@ -184,9 +184,9 @@ yet counts as empty. Tests and docs are never scanned.
 | Row | Name | Limit | Catches |
 | --- | --- | --- | --- |
 | L1 | `ct_or_string_types` | 0 | `CT_*`, `type_from_name`, the `tp_*` pool, `sv_tp`, `.ctype`, `.sname` |
-| L2 | `sentinel_answers` | 0 | `TYPE_UNKNOWN`, the `if x >= 0 { x } else` fallback, a tid coalesced with `??` |
-| L3 | `pub_let_mut_new` | 8 | Mutable module globals in the scanned files |
-| L3 | `pub_let_mut_unlisted` | 0 | A mutable global whose name is not in `scripts/lint_pub_let_mut_allow.txt` |
+| L2 | `sentinel_answers` | 0 | `TYPE_UNKNOWN`, the `if x >= 0 { x } else` fallback (`x` may be a field path), a tid coalesced with `??` |
+| L3 | `module_let_mut` | 8 | Mutable module globals in the scanned files, pub or not |
+| L3 | `pub_let_mut_unlisted` | 0 | A pub mutable global whose name is not in `scripts/lint_pub_let_mut_allow.txt` |
 | L4 | `typename_compares` | 0 | A type name compared as a string |
 | L5 | `no_infer` | 0 | A call to any `infer_*` function |
 | L6 | `layout_outside_layer` | 0 | A C type spelled outside `layout.bl`, `cname.bl` and `cg_print.bl`; a `TyKind` test inside `cg_print.bl` |
@@ -208,19 +208,28 @@ how `mono.bl`, which exists today with violations, can be gated without
 being rewritten first. `OVER` and `UP` mean the run failed; the matching
 lines print under the table.
 
-The ratchet keeps three rows over the whole compiler in
-`scripts/ratchet.sh`: `br_ids_in_source` (zero gate), `pub_let_mut` over
-every file in `src/`, and `layout_decline_unhandled` (zero gate: a
-`decline_reason` read outside `layout.bl` with no `diag_ice` within the
-next three lines).
+The ratchet keeps these rows over the whole compiler in
+`scripts/ratchet.sh`:
 
-The `pub_let_mut` row scans all of `src/` on purpose. It used to name the
+- `br_ids_in_source`: zero gate.
+- `module_let_mut`: every column-0 `let mut`, pub or not, in `src/`.
+- `typecheck_module_let_mut`: the same count in `typecheck.bl` alone.
+- `layout_decline_unhandled`: zero gate. A `decline_reason` read outside
+  `layout.bl` with no `diag_ice` within the next three lines.
+- `cg_name_string_compares`: a method, trait or fn name compared with a
+  string or with a named constant, on the codegen surface the lint scans.
+- `fallback_idiom`: `if x >= 0 { x } else` in `src/`.
+- `typecheck_str_keyed_tables`: module-scope `Map[Str, _]` tables in
+  `typecheck.bl`.
+
+The `module_let_mut` row scans all of `src/` on purpose. It used to name the
 old codegen files, so deleting them would have driven it to 0 by
 construction and it would then have gated nothing. Over the whole surface
 it is a real non-increasing cap: the baseline is the honest current count,
-and a new mutable module global anywhere in `src/` fails the row. The
-codegen-surface half of the rule stays in lint rows L3, which hold
-`src/cg*.bl` to an allowlist plus an absolute zero for unlisted names.
+and a new mutable module global anywhere in `src/` fails the row. It
+counts globals that are not pub, because a global need not be pub to be
+shared state. The codegen-surface half of the rule stays in lint rows L3,
+which cap the count and hold pub globals to an allowlist.
 
 ## How to add a lint row
 
@@ -237,9 +246,9 @@ codegen-surface half of the rule stays in lint rows L3, which hold
    commit.
 5. Add the row to the table above.
 
-To allow a new mutable global, add a line to
-`scripts/lint_pub_let_mut_allow.txt`: the name, then its role. The cap
-stays 8. The list names globals that EXIST: a stage that has not landed
+To allow a new pub mutable global, add a line to
+`scripts/lint_pub_let_mut_allow.txt`: the name, then its role. The count
+row still holds every global, pub or not, and its cap stays 8. The list names globals that EXIST: a stage that has not landed
 adds its line in the commit that adds the global, so the file can never
 pre-approve a name nobody has had to justify yet.
 
