@@ -1846,6 +1846,59 @@ fn producer_consumer() ! Async {
 }
 ```
 
+**Channel operations:**
+
+| Method | Behavior |
+|--------|----------|
+| `ch.send(value: T)` | Blocks while the buffer is full, then adds `value`. **Panics if `ch` is closed.** |
+| `ch.recv() -> Option[T]` | Blocks until a value is ready or `ch` is closed. Returns `Some(value)` for the next value. Returns `None` only when `ch` is closed **and** every buffered value is received. |
+| `ch.close()` | Marks `ch` closed. Values already in the buffer stay receivable. A second `close()` does nothing. |
+
+`recv()` is the only blocking receive. There is no `try_recv` and no `is_closed()`: a check before a receive races with other consumers, and `recv()` already gives the answer in one step.
+
+**The delivery guarantee.** A drain of the channel receives every sent value, in the order sent. A sent value never ends the stream. Closed is a state of the channel, never a value of `T`. `0`, `""`, `false` and — on a `Channel[Option[T]]` — `None` all arrive as `Some(...)`:
+
+```blink
+let ch = channel.new[Option[Int]](buffer: 2)
+ch.send(None)
+ch.close()
+assert_eq(ch.recv(), Some(None))   // the sent value
+assert_eq(ch.recv(), None)         // closed and drained
+```
+
+**Who closes.** One owner closes a channel, after every producer has finished sending. With several producers, the owner joins them first, then closes. A `send` after `close()` is a bug in the program, so it panics and does not drop the value.
+
+**Receiving.** `for value in ch` is the common form: it receives until the channel is closed and drained, then stops (see §3c.1 for the desugaring). When a single receive must deal with a closed channel, use the same tools as for any other `Option`:
+
+```blink
+// Fan-in: stop when every producer is done and the channel is closed
+let mut total = 0
+loop {
+    match results.recv() {
+        Some(n) => total += n
+        None => break
+    }
+}
+
+// A default when the channel is closed
+let first = results.recv() ?? 0
+
+// Propagate "closed" to an Option-returning caller
+fn recv_pair(ch: Channel[Int]) -> Option[(Int, Int)] ! Async {
+    let a = ch.recv()?
+    let b = ch.recv()?
+    Some((a, b))
+}
+```
+
+Discarding the result of `recv()` is legal. Code that must not go on after the channel closes says so with `.unwrap()`, which panics at the `recv()` call:
+
+```blink
+sem.recv().unwrap()   // wait for a permit; a closed semaphore is a bug
+```
+
+**Panel vote: 6-0** on every question. See [decisions/channel-recv-closed-empty.md](../decisions/channel-recv-closed-empty.md).
+
 **Effects on `main` — implicit `Async`:**
 
 `main` has implicit effects (see section 4.6), which includes `Async`. This means `main` can use `async.scope` directly without declaring `! Async`:

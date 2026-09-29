@@ -520,7 +520,7 @@ These are the **built-in method-surface traits** — the traits that host the me
 | `ListOps[T]` | List | 13 methods | Yes |
 | `MapOps[K, V]` | Map | 9 methods | Yes |
 | `SetOps[T]` | Set | 3 methods | Yes |
-| `IntoIterator[T]` | List, Map, Set, Str, Range | `into_iter` | Yes (§3c.1) |
+| `IntoIterator[T]` | List, Map, Set, Str, Range, Channel | `into_iter` | Yes (§3c.1) |
 | `Joinable` | List[Str] | `join` | Yes (§3.2.1) |
 | `StringBuildOps` | StringBuilder | `write`, `write_char`, `to_str`, `len`, `capacity`, `clear` | Yes |
 
