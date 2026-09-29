@@ -36,7 +36,7 @@ import diagnostics.{
     PUB_FFI, FFI_NO_EFFECTS, CONTRACT_ON_FFI, INVALID_PTR_TYPE,
     COALESCE_REQUIRES_OPT, MISSING_KEYWORD_ARG, INVALID_KEYWORD_ARG,
     FFI_SCOPE_NOT_WITH_RESOURCE, RAW_BYPASSES_PARAM, RAW_OUTSIDE_TEMPLATE,
-    PTR_OUTSIDE_FFI, FFI_STRUCT_GC_FIELD, BYTES_GROW_IN_WITH_PTR,
+    PTR_OUTSIDE_FFI, FFI_STRUCT_GC_FIELD, BUF_OUTSIDE_FFI_SURFACE, BYTES_GROW_IN_WITH_PTR,
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
     FFI_OFFSET_ON_SINGLETON, FFI_OFFSET_UNKNOWN_STRIDE, WITH_ITEM_NOT_A_HANDLER,
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
@@ -7733,6 +7733,17 @@ fn is_ffi_struct_field_type(ann_name: Str) -> Int {
     0
 }
 
+// A `Ptr` or `@ffi.struct` field is judged by the type it resolves to, not its spelling, so
+// an alias or a qualified name is accepted as the type it names.
+fn ffi_struct_field_type_ok(ann_name: Str, ftid: Int) -> Int {
+    if is_ffi_struct_field_type(ann_name) != 0 { return 1 }
+    let t = tc_resolve(ftid)
+    if t < 0 || t >= ty_pool.len() { return 0 }
+    if type_kind(t) == TyKind.Ptr { return 1 }
+    if ffi_struct_type_set.contains_key(t) { return 1 }
+    0
+}
+
 fn is_builtin_hashable(name: Str) -> Int {
     if name == "Str" || name == "Int" || name == "Bool" || name == "Char" { return 1 }
     // The annotation `()` is named Void. It is the 0-tuple, hashable because it has no
@@ -8334,17 +8345,21 @@ fn resolve_struct_fields(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.
             let f = sublist_get(flds_sl, i)
             let fname = node_name(f)
             let ftype_ann = node_value(f)
-            let ftype_id = resolve_type_ann(ftype_ann)
-            sfield_pool.push(TcStructField { struct_id: tid, name: fname, type_id: ftype_id })
             let ftype_ann_name = node_name(ftype_ann)
+            // `Buf` has no type to resolve to yet; E0822 is the whole answer for the field.
+            let is_buf_field = is_ffi_struct != 0 && ftype_ann_name == "Buf"
+            let ftype_id = if is_buf_field { TYPE_UNKNOWN } else { resolve_type_ann(ftype_ann) }
+            sfield_pool.push(TcStructField { struct_id: tid, name: fname, type_id: ftype_id })
             if ftype_ann_name == "Fn" {
                 if is_callable_field_name(fname) == 0 {
                     nr_callable_field_names.push(fname)
                 }
             }
-            if is_ffi_struct != 0 {
-                if is_ffi_struct_field_type(ftype_ann_name) == 0 {
-                    diag_error_at("FfiStructGcField", FFI_STRUCT_GC_FIELD, "@ffi.struct field `{fname}` uses non-FFI type `{ftype_ann_name}` — only sized FFI-compatible types (I8/I16/I32/I64, U8/U16/U32/U64, Int, Float, F32, F64, Bool) and other @ffi.struct types are allowed", f, "use a sized integer/float/bool type or another @ffi.struct type")
+            if is_buf_field {
+                diag_error_at("BufOutsideFfiSurface", BUF_OUTSIDE_FFI_SURFACE, "@ffi.struct field `{fname}` names `Buf` — a `Buf` is a `blink_buf_t*`, not the C pointer the field declares", f, "use `Ptr[T]` for a C pointer field")
+            } else if is_ffi_struct != 0 {
+                if ffi_struct_field_type_ok(ftype_ann_name, ftype_id) == 0 {
+                    diag_error_at("FfiStructGcField", FFI_STRUCT_GC_FIELD, "@ffi.struct field `{fname}` uses non-FFI type `{ftype_ann_name}` — only sized FFI-compatible types (I8/I16/I32/I64, U8/U16/U32/U64, Int, Float, F32, F64, Bool), `Ptr[T]` and other @ffi.struct types are allowed", f, "use a sized integer/float/bool type, a `Ptr[T]`, or another @ffi.struct type")
                 }
             }
             i = i + 1
@@ -9225,6 +9240,90 @@ fn check_ptr_in_type_name(type_name: Str, node: Int, has_ffi: Int) ! Diag.Report
     }
 }
 
+// An @ffi.struct that holds a Ptr, directly or through a nested @ffi.struct, is confined as
+// Ptr[T] is (§9.1.3), so it is checked at the same signature sites. The type is looked up,
+// not matched by spelling, so an alias to such a struct is caught too. Nothing in the
+// struct's name says why it is confined, so the error names the field that holds the Ptr.
+fn check_ptr_bearing_struct_in_type_ann(ann_node: Int, has_ffi: Int) ! Diag.Report {
+    if ann_node == -1 || has_ffi != 0 { return }
+    let name = node_name(ann_node)
+    // An alias's own name is also registered as a type, so the alias chain is asked first.
+    let mut tid = tc_resolve_transparent_alias_name(name)
+    if tid == -1 { tid = lookup_named_type(name) }
+    let mut seen: Map[Int, Int] = Map()
+    let st = ptr_bearing_ffi_struct_in(tc_resolve(tid), seen)
+    if st != -1 {
+        let path = ffi_struct_ptr_field_path(st, Map())
+        let td = tc_tid_decl_node(st)
+        let sname = node_name(td)
+        let mut names: List[Str] = []
+        for fnode in path { names.push(node_name(fnode)) }
+        let fpath = names.join(".")
+        let line = node_line(path.get(path.len() - 1).unwrap())
+        diag_error_at("PtrOutsideFFI", PTR_OUTSIDE_FFI, "`{sname}` holds `Ptr` in field `{fpath}` (line {line}), so it may appear only in an FFI region", ann_node, "add @ffi annotation to the function or wrap usage in @trusted")
+        return
+    }
+    let elems_sl = node_elements(ann_node)
+    if elems_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(elems_sl) {
+            check_ptr_bearing_struct_in_type_ann(sublist_get(elems_sl, i), has_ffi)
+            i = i + 1
+        }
+    }
+}
+
+// The first @ffi.struct that holds a Ptr, found in `t` or its type arguments, or -1. The
+// fields of a struct that is not @ffi.struct are not searched: a Ptr there is a separate gap.
+fn ptr_bearing_ffi_struct_in(t: Int, seen: Map[Int, Int]) -> Int {
+    if t < 0 || t >= ty_pool.len() { return -1 }
+    if seen.contains_key(t) { return -1 }
+    seen.insert(t, 1)
+    if ffi_struct_type_set.contains_key(t) && ffi_struct_ptr_field_path(t, Map()).len() > 0 { return t }
+    let mut i = 0
+    while i < tc_tid_child_count(t) {
+        let hit = ptr_bearing_ffi_struct_in(tc_resolve(tc_tid_child(t, i)), seen)
+        if hit != -1 { return hit }
+        i = i + 1
+    }
+    -1
+}
+
+// The field declarations from @ffi.struct `st` down to the first Ptr field, through nested
+// @ffi.struct fields, or empty when it holds none.
+fn ffi_struct_ptr_field_path(st: Int, seen: Map[Int, Int]) -> List[Int] {
+    let none: List[Int] = []
+    if seen.contains_key(st) { return none }
+    seen.insert(st, 1)
+    let td = tc_tid_decl_node(st)
+    if td < 0 { return none }
+    let flds_sl = node_fields(td)
+    if flds_sl == -1 { return none }
+    let slots = tc_struct_field_slots(st)
+    let mut i = 0
+    while i < sublist_length(flds_sl) {
+        let f = sublist_get(flds_sl, i)
+        for slot in slots {
+            if tc_sfield_name(slot) == node_name(f) {
+                let ft = tc_resolve(tc_sfield_tid(slot))
+                if ft >= 0 && ft < ty_pool.len() {
+                    if type_kind(ft) == TyKind.Ptr { return [f] }
+                    if ffi_struct_type_set.contains_key(ft) {
+                        let sub = ffi_struct_ptr_field_path(ft, seen)
+                        if sub.len() > 0 {
+                            let mut out: List[Int] = [f]
+                            for n in sub { out.push(n) }
+                            return out
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    none
+}
+
 // ── Phase 0: Contract predicate validator ─────────────────────────────
 //
 // Predicates inside @requires / @ensures / @where must lie in an
@@ -9865,6 +9964,7 @@ fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
             let ptype_ann = node_type_ann(p)
             if ptype_ann != -1 {
                 check_ptr_in_type_ann(ptype_ann, has_ffi)
+                check_ptr_bearing_struct_in_type_ann(ptype_ann, has_ffi)
             } else {
                 check_ptr_in_type_name(node_type_name(p), p, has_ffi)
             }
@@ -9876,6 +9976,7 @@ fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
     let ret_ann = node_type_ann(fn_node)
     if ret_ann != -1 {
         check_ptr_in_type_ann(ret_ann, has_ffi)
+        check_ptr_bearing_struct_in_type_ann(ret_ann, has_ffi)
     } else {
         let ret_str = node_return_type(fn_node)
         if ret_str == "Ptr" && has_ffi == 0 {
@@ -14171,6 +14272,7 @@ fn nr_check_type_decl(td: Int) ! TypeCheck.Resolve, Diag.Report {
     if alias_ann != -1 {
         nr_check_type_ann_visibility(alias_ann)
     }
+    let is_ffi_struct = has_annotation(td, "ffi.struct")
     let flds = node_fields(td)
     if flds != -1 {
         let mut i = 0
@@ -14185,7 +14287,8 @@ fn nr_check_type_decl(td: Int) ! TypeCheck.Resolve, Diag.Report {
                         j = j + 1
                     }
                 }
-            } else {
+            } else if is_ffi_struct == 0 || node_name(node_value(f)) != "Buf" {
+                // A Buf field of an @ffi.struct is reported as E0822 alone, in resolve_struct_fields.
                 nr_check_type_ann_visibility(node_value(f))
             }
             i = i + 1
