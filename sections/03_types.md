@@ -1213,6 +1213,66 @@ if s == State.Running { }   // OK — comparison, not assignment
 
 > Pattern matching an `Int` scrutinee against enum-variant patterns (`match someInt { State.Idle => ... }`) is the pattern-side dual of the assignability rule and is likewise ill-typed. Enforcement of that case is staged behind the compiler's internal `kind: Int → NodeKind` representation migration; the rule itself holds from this decision.
 
+#### `Bool` Is Distinct from `Int`
+
+`Bool` and `Int` are different types. A `Bool` is not assignable to an `Int` target, and an `Int` is not assignable to a `Bool` target. This holds at let-bindings, assignments, function arguments, function returns, struct fields and collection elements, and in both directions:
+
+```blink
+fn takes_bool(b: Bool) -> Bool { b }
+
+fn main() {
+    let a: Bool = 1           // error[TypeError]: declared type Bool but got Int
+    let n: Int = true         // error[TypeError]: declared type Int but got Bool
+    let r = takes_bool(7)     // error[TypeError]: argument 1 expects Bool, got Int
+}
+```
+
+**Conditions take only `Bool`.** The condition of `if` and `while`, a match guard, and each operand of `&&`, `||` and `!` must have type `Bool`. An `Int` is never a condition, and an integer literal is no exception: `if n { }`, `while 1 { }` and `!n` on an `Int` are compile errors (§2.19 *No Truthiness*).
+
+**`Bool` does not compare with `Int`.** `==` and `!=` between a `Bool` and an `Int` are compile errors. This differs from enums, which compare with `Int` through their tag. An enum has a documented numeric identity (`Enum.to_int()`), and a `Bool` has none: `==` is `Eq.eq(self, other: Self)`, and a `Bool` never reads as 0 or 1 (§3.6 *Arithmetic Traits*). Write the test directly:
+
+| Rejected | Write |
+|---|---|
+| `flag != 0`, `flag == 1` | `flag` |
+| `flag == 0`, `flag != 1` | `!flag` |
+| `if n { }` where `n: Int` | `if n != 0 { }` |
+| `let b: Bool = 1` / `0` | `true` / `false` |
+| `let n: Int = flag` | `let n = if flag { 1 } else { 0 }` |
+
+A function that answers a yes/no question returns `Bool`, not `Int`: `fn is_digit(c: Int) -> Bool`, never `-> Int` with 0 and 1.
+
+**Patterns follow the same rule.** A literal pattern must have the scrutinee's type. An integer pattern against a `Bool` scrutinee, or a `true`/`false` pattern against an `Int` scrutinee, is a compile error:
+
+```blink
+fn main() {
+    let b = true
+    let s = match b {
+        1 => "one"        // error[TypeError]: pattern of type Int cannot match a value of type Bool
+        _ => "other"
+    }
+}
+```
+
+An exhaustive `match` on a `Bool` needs only `true` and `false` arms (§3.5 *Exhaustiveness*). This is sound because every `Bool` value is `true` or `false`.
+
+**No conversion methods.** `Bool` has no `to_int()`, and `Int` has no `to_bool()`; there is no `Bool.from_int`. The conversions are one expression each: `if b { 1 } else { 0 }` for `Bool` to `Int`, and `n != 0` for `Int` to `Bool`. There is no cast operator.
+
+**Every `Bool` is `true` or `false`.** No program can make a `Bool` hold any other value. The type rules above close the paths inside Blink, and values that come in from C are made canonical at the FFI boundary (§9.1.3 *`Bool` at the FFI boundary*).
+
+**Diagnostics.** Each rejected form reports `error[TypeError]` (E0300) with the caret under the offending operand, the fixed note `Blink has no truthiness`, and a machine-applicable `help:` that gives the rewrite from the table above:
+
+```
+error[TypeError]: if condition must be Bool, got Int
+  --> a.bl:3:8
+  |
+3 |     if n { io.println("x") }
+  |        ^ Int
+  note: Blink has no truthiness
+  help: compare explicitly: `n != 0`
+```
+
+A call to `.to_int()` on a `Bool` reports the missing method, with a `help:` line that gives `if b { 1 } else { 0 }`.
+
 #### Generic Types
 
 Type parameters use square brackets:
@@ -2348,7 +2408,7 @@ error[SealedTraitImpl]: sealed trait
   = help: define a named method instead: `fn add(self, other: Vector2) -> Vector2`
 ```
 
-`Bool` is not a numeric type, so `+ - * / %` reject a `Bool` operand -- the same rule the bitwise operators follow. Blink has no truthiness, so a `Bool` never reads as 0 or 1. Count with an explicit conditional:
+`Bool` is not a numeric type, so `+ - * / %` reject a `Bool` operand -- the same rule the bitwise operators follow. Blink has no truthiness, so a `Bool` never reads as 0 or 1 (§3.4 *`Bool` Is Distinct from `Int`*). Count with an explicit conditional:
 
 ```blink
 let hits = (if a { 1 } else { 0 }) + (if b { 1 } else { 0 })

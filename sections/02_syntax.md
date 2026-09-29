@@ -1164,6 +1164,8 @@ if items.len() > 0 { }    // correct: explicit Bool expression
 if name.is_empty() { }    // correct: method returns Bool
 ```
 
+The rule covers every place that takes a condition: `if`, `while`, match guards, and the operands of `&&`, `||` and `!`. An `Int` is never a condition, so `while 1 { }`, `!n` and `ready && n` (with `n: Int`) are compile errors; write `n != 0`. `Bool` and `Int` are different types in every other position too, including `==` between them (§3.4 *`Bool` Is Distinct from `Int`*).
+
 Every language defines truthiness differently — Python, JS, and Ruby all disagree on what's falsy. LLMs cross-contaminate these rules at high rates. Requiring explicit `Bool` eliminates the bug class. (Vote: 5-0)
 
 #### Assignment Operators
