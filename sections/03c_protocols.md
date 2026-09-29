@@ -124,7 +124,7 @@ for n in names { io.println(n) }   // second pass — new fresh iterator
 
 Writing `.into_iter()` explicitly (the door of §3c.1) and letting `for` desugar to it are the same operation — `for n in names` and `for n in names.into_iter()` are equivalent, because `names.into_iter()` already yields an `Iterator[T]` and `Iterator`'s own `into_iter()` is the identity.
 
-**`IntoIterator` is sealed in v1.** Only the built-in collections (and `Iterator` itself, reflexively) implement it. A user type cannot yet implement `IntoIterator` directly — that extension point is deferred to v2 (see below). The built-in implementations:
+**`IntoIterator` is sealed in v1.** Only the built-in collections, `Channel[T]`, and `Iterator` itself (reflexively) implement it. A user type cannot yet implement `IntoIterator` directly — that extension point is deferred to v2 (see below). The built-in implementations:
 
 | Type | `into_iter()` yields | Notes |
 |------|---------------------|-------|
@@ -133,7 +133,10 @@ Writing `.into_iter()` explicitly (the door of §3c.1) and letting `for` desugar
 | `Map[K, V]` | `(K, V)` | Key-value pairs, unspecified order |
 | `Range[T]` | `T` | Lazy; `0..1000000` allocates nothing |
 | `Str` | `Char` | Unicode scalar values |
+| `Channel[T]` | `T` | Receives until the channel is closed and empty, then stops. Consumes what it receives, so a second loop sees only later values |
 | `Iterator[T]` | `T` | Identity (returns self) |
+
+The `Channel[T]` row is normative as a desugaring: `for v in ch { ... }` is exactly `for v in iter.from_fn(fn() { ch.recv() }) { ... }` — one `recv()` per iteration, and the loop ends on the first `None` (see §4.13 *Channel operations*).
 
 #### Custom Iteration: `iter.from_fn`
 
