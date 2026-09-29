@@ -920,9 +920,9 @@ Decided by panel deliberation [`libc-bytes-wrapper-coverage`](../decisions/libc-
 
 ```blink
 fn read_bytes(fd: Int, max: Int) -> Result[Bytes, Errno] ! IO
-fn recv_bytes(fd: Int, max: Int) -> Result[Bytes, Errno] ! IO
+fn recv_bytes(fd: Int, max: Int, -- flags: MsgFlags = MsgFlags.NONE) -> Result[Bytes, Errno] ! IO
 fn write_bytes(fd: Int, data: Bytes) -> Result[Int, Errno] ! IO
-fn send_bytes(fd: Int, data: Bytes) -> Result[Int, Errno] ! IO
+fn send_bytes(fd: Int, data: Bytes, -- flags: MsgFlags = MsgFlags.NONE) -> Result[Int, Errno] ! IO
 fn getentropy_bytes(n: Int) -> Result[Bytes, Errno] ! IO
 ```
 
@@ -933,15 +933,15 @@ Each member ships at v1; the set **blocks the v1 release**.
 - **Bytes-out** (`read_bytes`, `recv_bytes`, `getentropy_bytes`) → `Result[Bytes, Errno]`, where the returned `Bytes.len()` *is* the syscall's reported count (`slice(0, got)`). A short read is success with a shorter `Bytes`; only a `-1`/errno return is `Err`. `getentropy_bytes` is all-or-nothing (`.len() == n` on success, no truncation arm).
 - **Bytes-in** (`write_bytes`, `send_bytes`) → `Result[Int, Errno]`, where the `Int` is the count actually written. Short writes are normal and surfaced as `Ok(n < data.len())` — the caller must loop; collapsing this to `Result[(), Errno]` would be unsound for the partial-write contract.
 
-**`recv_bytes` / `send_bytes` take no `flags` argument in v1** — they pass `flags = 0` internally, matching the examples above. A flagged variant ships post-v1 alongside the UDP/socket-semantics work.
+**`recv_bytes` / `send_bytes` take `flags` as a trailing keyword argument** of type `MsgFlags` (§9.1.3.4), with the default `MsgFlags.NONE`. A call that omits `flags` behaves as `flags = 0`, so the examples above do not change. The keyword is part of the v1 signature: labels are call-site sugar, so adding the parameter after v1 would change the function-value type. No separate flagged name (such as `recv_flags_bytes`) exists or will be added.
 
 **Error type.** Every member returns `Result[_, Errno]`, where `Errno` is a thin, transparent, zero-cost newtype over the OS errno `Int` (no boxing, no tag, monomorphizes to a bare int). It carries a name/projection (`.code() -> Int`, named errno constants) so callers match on errno meaningfully rather than on a bare `Int`, and so a `write`'s two return arms (count-written vs errno) are nominally distinct. A rich variant `IoError` hierarchy is **not** part of this gate — it is a separate post-v1 task, layered additively on `Errno` (e.g. `.kind()`) without changing any wrapper signature. `Errno` is domain-neutral; a file read's `ENOSPC` is *not* typed as a network error.
 
 **Naming law (normative).** Every `libc` byte-moving syscall wrapper conforms to a fixed shape, so the family is name-predictable and post-v1 additions are mechanical rather than designed:
 
 - **Name** = `libc.<posix_syscall_name>_bytes` (e.g. `recvfrom` → `recvfrom_bytes`, never `recv_from_bytes`).
-- **Arguments** = POSIX C argument order with the `(void* buf, size_t len)` pair replaced by a trailing `max: Int` (reads) or a `data: Bytes` argument (writes; length is `data.len()`, never passed explicitly).
-- **Return** = `Result[Bytes, Errno]` (Bytes-out) or `Result[Int, Errno]` (Bytes-in), bound to direction — a write may not be typed `Result[Bytes, Errno]`.
+- **Arguments** = POSIX C argument order. The `(void* buf, size_t len)` pair is replaced in place by `max: Int` (reads) or `data: Bytes` (writes; length is `data.len()`, never passed explicitly). `flags` is always the trailing keyword `-- flags: MsgFlags = MsgFlags.NONE`, exempt from C order.
+- **Return** = `Result[Bytes, Errno]` (Bytes-out) or `Result[Int, Errno]` (Bytes-in), bound to direction — a write may not be typed `Result[Bytes, Errno]`. A non-buffer out-parameter moves into the success value as a tuple after the `Bytes` or count, in C order. A pointer-typed out-parameter that may be empty is `Option` (e.g. `recvfrom_bytes` → `Result[(Bytes, Option[SockAddr]), Errno]`).
 - **Effect** = `! IO`.
 - **Mechanism** = `Bytes.with_ptr`, never the byte-bridge primitives.
 
@@ -949,7 +949,7 @@ The law governs only the *shape* of a wrapper; it is not a license to auto-add w
 
 **Deferred, with the reason recorded** (so the line is defensible, not arbitrary):
 
-- `recvfrom_bytes` / `sendto_bytes` — require a `SockAddr` peer-address type that does not yet exist, and have no v1 caller (no datagram socket type ships in v1). They ship together with `SockAddr` as one post-v1 UDP gate.
+- ~~`recvfrom_bytes` / `sendto_bytes`~~ — **resolved** by the UDP gate (§9.1.3.4), which adds `SockAddr` and a `std.net` datagram caller.
 - `pread_bytes` / `pwrite_bytes` — positional variants add only an `off_t` argument over `read`/`write` (same buffer-fill shape, no new crossing) and have no demonstrated v1 caller. They ship under the demonstrated-demand gate.
 - `readv_bytes` / `writev_bytes` — vectored I/O needs an `iovec[]` bridge that has not been designed and is excluded by the naming law.
 
@@ -1002,6 +1002,41 @@ The `bytes-bridge` doc page (`blink doc bytes-bridge`) is the single canonical e
 
 3. **`W0816` firing set + help text** — the at-the-caret surface for the binding author.
 
+##### 9.1.3.4 The UDP gate: `recvfrom_bytes`, `sendto_bytes`, and `MsgFlags`
+
+Decided by panel deliberation [`udp-gate-sockaddr-flags`](../decisions/udp-gate-sockaddr-flags.md). Resolves the UDP gate that §9.1.3.3 deferred. The `std.net` caller and the `SockAddr` type are specified in §4.4.6.
+
+```blink
+fn recvfrom_bytes(fd: Int, max: Int, -- flags: MsgFlags = MsgFlags.NONE) -> Result[(Bytes, Option[SockAddr]), Errno] ! IO
+fn sendto_bytes(fd: Int, data: Bytes, dest: SockAddr, -- flags: MsgFlags = MsgFlags.NONE) -> Result[Int, Errno] ! IO
+```
+
+Both follow the naming law of §9.1.3.3: the peer address is a non-buffer out-parameter, so it follows the `Bytes` in the success tuple, and it is `Option` because the kernel may return no address.
+
+**`MsgFlags` (normative).** `MsgFlags` is the type of the `flags` argument of `recv_bytes`, `send_bytes`, `recvfrom_bytes` and `sendto_bytes`. It is an opaque type: it has no public constructor and no public field. Its C representation is one `int64_t`, so it costs nothing at run time.
+
+- The only values are the named constants. This gate ratifies two: `MsgFlags.NONE` (no flags) and `MsgFlags.PEEK` (read a datagram without removing it from the queue). Each is a const expression (§2.21), so it is legal as a keyword default.
+- The bits inside `MsgFlags` use **Blink's** numbering, not the platform's. The runtime translates each Blink bit to the native `MSG_*` value from the C headers. A named constant has the same meaning on every platform.
+- The wrapper checks the bits before the syscall. A bit that is not a ratified constant returns `Err(Errno(ERR_INVAL))` on every platform, and the syscall does not run. A native value never reaches the kernel as a native flag.
+- `MsgFlags` has no `|` operator yet. The bit-or implementation ships with the second ratified constant that can combine with `PEEK`.
+- New constants (for example `DONTWAIT`, `WAITALL`) are added under the growth gate of §9.1.3.3. Each addition is one constant plus one row in the runtime translation table, and it does not change the meaning of any existing call.
+- User code cannot write `MsgFlags(n)` or `MsgFlags { bits: n }`; either is a compile error. A general rule for fields that are private to their module does not exist yet. Until it does, `MsgFlags` is opaque by compiler knowledge, in the same way as `Instant` (§3).
+
+```blink
+let head = libc.recv_bytes(fd, 16, flags: MsgFlags.PEEK)?   // peek at the header
+let (pkt, peer) = libc.recvfrom_bytes(fd, 1500)?            // peer: Option[SockAddr]
+libc.recv_bytes(fd, 16, flags: 0x40)                        // error: expected MsgFlags, found Int
+```
+
+**Datagram semantics (normative).**
+
+- The returned `Bytes.len()` is `min(rc, max)`, where `rc` is the count the syscall returned. This also holds when a platform reports the full datagram length (Linux `MSG_TRUNC`).
+- A 0-length result from `recvfrom_bytes` is an empty datagram, not end-of-file.
+- A datagram larger than `max` is truncated without an error. Code that must detect truncation uses a larger `max`; `recvmsg` stays out of the scope of the naming law.
+- The peer is `None` when the kernel returns no address, or returns an address of a family that `SockAddr` does not model (for example `AF_UNIX`). `None` is not an error.
+- `sendto_bytes` encodes `dest` into a C `sockaddr_in` or `sockaddr_in6` inside the runtime. `SockAddr` never crosses as a C struct.
+- These wrappers have the effect `! IO`, the same as every `libc.*_bytes` member. They are not subject to `Net` attenuation (§4.3). The `byte-pin` audit category reports them.
+
 #### Static layout assertions
 
 For every `@ffi.struct` declaration, the codegen emits, into the generated C immediately after the corresponding `typedef`:
@@ -1032,7 +1067,7 @@ When `[native-dependencies].headers` is missing, the compiler emits `W0812: @ffi
 User code should reach for stdlib first:
 
 - `std.libc.poll(fds: List[Pollfd], timeout_ms: Int) -> Result[List[Pollfd], Str] ! IO`
-- `std.libc.connect(sock: I32, addr: SockAddr) -> Result[(), Str] ! Net`
+- `std.libc.recvfrom_bytes(fd: Int, max: Int, -- flags: MsgFlags = MsgFlags.NONE) -> Result[(Bytes, Option[SockAddr]), Errno] ! IO`
 - `std.libc.sigaction(...)` — etc.
 
 `@ffi.struct` is the implementation primitive used inside `std.libc.*`. User-defined `@ffi.struct` outside stdlib is **discouraged but not banned**. `blink audit` reports a `user-defined @ffi.struct count` metric per project. If, within 12 months of v1 ship, the registry shows >50 distinct user-defined `@ffi.struct` types across third-party projects (or 5+ projects vendoring functionally-equivalent `@ffi.struct` declarations for the same syscall family), the panel reconvenes to consider stdlib expansion of `std.libc.*` to absorb them.

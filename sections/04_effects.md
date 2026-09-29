@@ -371,8 +371,17 @@ type NetError {
     DnsFailure(msg: Str)
     TlsError(msg: Str)
     InvalidUrl(msg: Str)
+    BindError(msg: Str)
+    ProtocolError(msg: Str)
+    IoError(msg: Str)
+    Os(op: Str, code: Errno)
+    InvalidAddr(input: Str)
 }
 ```
+
+- `Os(op, code)` reports an OS error from a socket call. `op` names the call (for example `"recvfrom"`), and `code` is the `Errno` (§9.1.3.3), so a caller can match on the errno value. `IoError` is not used for errno failures.
+- `InvalidAddr(input)` reports a string that `SockAddr.parse` (§4.4.6) cannot read. `input` is the string as given.
+- An `EAGAIN` or `EWOULDBLOCK` after a socket timeout (`set_timeout`) is `Timeout`, not `Os`.
 
 HTTP error status codes (4xx, 5xx) are **not** `NetError` variants — they are successful responses with non-2xx status codes. The application decides what constitutes an error via pattern matching on `response.status`.
 
@@ -865,6 +874,63 @@ fn read_cache(cache_path: Str) -> Result[Option[Str], FsError] ! FS.Read {
 `FsError` and `FsOp` live in `std.fs` and are named with `import std.fs` — the same way `net.request`'s `NetError` is named with `import std.net`. The `fs` operation handle needs no import (it comes from the `! FS` effect on the signature), but the error *type* a caller matches on does.
 
 **No file handles in v1.** The `fs` surface is exactly the four path-taking operations above. There is no `fs.open`, no `fs.create`, and no handle-taking read — a read is `fs.read(path)`, never `fs.read(handle)`. Streaming and incremental access are a post-v1 addition and will arrive as *methods on a file handle* (`file.read_line()`, `file.write_line(...)`), not as overloads of `fs.read` — Blink has no function overloading. Examples in §4.7 (*Scoped resources: `with...as`*) that open a `Closeable` file handle with `with ... as` illustrate the scoped-resource mechanism against that planned handle API; they are marked there as post-v1.
+
+#### 4.4.6 Datagram Sockets (UDP)
+
+Decided by panel deliberation [`udp-gate-sockaddr-flags`](../decisions/udp-gate-sockaddr-flags.md). `std.net` gives UDP a socket type built on `libc.recvfrom_bytes` and `libc.sendto_bytes` (§9.1.3.4).
+
+**Addresses.** `SockAddr` is a plain Blink enum. It is not an `@ffi.struct`. The runtime converts it to and from the C `sockaddr_storage`.
+
+```blink
+pub type Ipv4Addr { bits: Int }             // 32-bit address, host order
+pub type Ipv6Addr { hi: Int, lo: Int }      // 128-bit address as two 64-bit halves
+
+@derive(Eq, Hash)
+pub type SockAddr {
+    V4(ip: Ipv4Addr, port: Int)
+    V6(ip: Ipv6Addr, port: Int, scope_id: Int)
+}
+```
+
+- `SockAddr` derives `Eq` and `Hash`, so it can be a `Map` key for per-peer state.
+- `Display` prints `10.0.0.1:53`, `[::1]:53`, and `[fe80::1%2]:53` (`%` followed by the numeric `scope_id` when it is not 0).
+- `SockAddr.parse(s: Str) -> Result[SockAddr, NetError]` reads a numeric address in the same forms. It does no DNS lookup. A string it cannot read gives `NetError.InvalidAddr(input: s)`.
+- IPv6 `flowinfo` is not modelled; the runtime sends 0.
+- An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) stays a `V6` value. `SockAddr` has no conversion to `V4` in this gate. Code that compares peers from a dual-stack socket must allow for the mapped form.
+
+**Sockets.**
+
+```blink
+pub fn udp_bind(addr: SockAddr) -> Result[UdpSocket, NetError]            // ! Net.Listen
+pub fn resolve(host: Str, port: Int) -> Result[List[SockAddr], NetError]  // ! Net.DNS
+
+pub trait UdpSocketOps {
+    fn recv_from(self, -- max: Int = 65535) -> Result[(Bytes, SockAddr), NetError]
+    fn send_to(self, data: Bytes, dest: SockAddr) -> Result[(), NetError]   // ! Net.Connect
+    fn local_addr(self) -> Result[SockAddr, NetError]
+    fn set_timeout(self, ms: Int)
+    fn close(self)
+}
+```
+
+- `udp_bind` creates the socket and binds it in one runtime call. `std.libc` has no `socket` or `bind` wrapper. Bind to port 0 to get a free port, then read it with `local_addr`.
+- `recv_from` returns one datagram and its sender. The semantics of §9.1.3.4 apply: a 0-length datagram is `Ok` with empty `Bytes`, and a datagram larger than `max` is truncated without an error. The default `max` of 65535 holds any UDP datagram. Code on a hot path with small datagrams passes a smaller `max`, because each call allocates `max` bytes.
+- `send_to` sends the whole datagram or returns an error. If the kernel sends fewer bytes than `data.len()`, `send_to` returns an `Err`, so no count is returned.
+- `resolve` returns every address that the name resolves to, in resolver order. It uses the same resolver as `net.request`.
+- `UdpSocket` has no `connect`, no unbound constructor, and no `recv` or `send` without an address in this gate.
+
+```blink
+import std.net.{SockAddr, NetError, udp_bind}
+
+fn echo_once() -> Result[(), NetError] ! Net.Listen, Net.Connect {
+    let addr = SockAddr.parse("127.0.0.1:0")?
+    let sock = udp_bind(addr)?
+    let (data, peer) = sock.recv_from(max: 512)?
+    sock.send_to(data, peer)?
+    sock.close()
+    Ok(())
+}
+```
 
 ---
 
