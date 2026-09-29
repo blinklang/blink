@@ -21,6 +21,13 @@
 # --only <list file> restricts the run to the files named in the list (one
 # path per line, blank lines and # comments ignored) and defaults CORPUS_OUT
 # to build/corpus_subset.json. The typecheck suite uses this.
+#
+# Exit: 2 when the run itself cannot be trusted (no compiler, malformed JSON).
+# Under --only, 1 when any listed file fails: a bucket names files that must
+# pass, so its exit code must say whether they did. A full run exits 0 with
+# failing files, because its judge is corpus-check against the baseline, not
+# an all-pass rule. A caller that holds a subset to its own floor (the suites,
+# corpus-sample) accepts 1 and reads the JSON.
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
@@ -136,5 +143,8 @@ fi
 
 if [ "$run_lint" -eq 1 ] && [ -z "$only" ]; then
     ./scripts/lint_codegen.sh || exit 1
+fi
+if [ -n "$only" ] && [ "$passed" -ne "$total" ]; then
+    exit 1
 fi
 exit 0

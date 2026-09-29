@@ -63,6 +63,7 @@ expect_red() {
 
 expect_red ct_or_string_types  cg_b.bl 'fn k() -> Int { CT_INT }'
 expect_red sentinel_answers    cg_b.bl 'let t = TYPE_UNKNOWN'
+expect_red sentinel_answers    cg_b.bl 'let fwd = if th.forward_to >= 0 { th.forward_to } else { 0 }'
 expect_red pub_let_mut_unlisted cg_b.bl 'pub let mut stray: Int = 0'
 expect_red typename_compares   cg_b.bl 'if name == "Option" { 1 }'
 expect_red no_infer            cg_b.bl 'fn infer_kind(x: Int) -> Int { x }'
@@ -111,22 +112,42 @@ expect_red fn_length           cg_b.bl "$long_fn"
 expect_red br_ids_in_source    cg_b.bl '// tracked as br abc123'
 expect_red untested_pub_fns    mono.bl 'pub fn mono_orphan() -> Int { 1 }'
 
-# pub_let_mut_new: eight allowlisted globals pass, a ninth is over the cap.
+# module_let_mut: eight allowlisted globals pass, a ninth is over the cap.
 dir="$WORK/case_cap"
 write_clean "$dir"
 : > "$ALLOW"
 for i in 1 2 3 4 5 6 7 8 9; do echo "g$i" >> "$ALLOW"; done
 for i in 1 2 3 4 5 6 7 8; do echo "pub let mut g$i: Int = 0" >> "$dir/src/cg_b.bl"; done
 if run_lint "$dir" > "$dir.out" 2>&1; then
-    echo "ok   pub_let_mut_new: eight allowlisted globals pass"
+    echo "ok   module_let_mut: eight allowlisted globals pass"
 else
-    echo "FAIL pub_let_mut_new: eight allowlisted globals rejected:"; cat "$dir.out"; fail=1
+    echo "FAIL module_let_mut: eight allowlisted globals rejected:"; cat "$dir.out"; fail=1
 fi
+cp "$dir/src/cg_b.bl" "$WORK/eight_globals.bl"
 echo "pub let mut g9: Int = 0" >> "$dir/src/cg_b.bl"
-if run_lint "$dir" > "$dir.out" 2>&1 || ! grep -qE '^L3 +pub_let_mut_new .*OVER' "$dir.out"; then
-    echo "FAIL pub_let_mut_new: ninth global not caught:"; cat "$dir.out"; fail=1
+if run_lint "$dir" > "$dir.out" 2>&1 || ! grep -qE '^L3 +module_let_mut .*OVER' "$dir.out"; then
+    echo "FAIL module_let_mut: ninth global not caught:"; cat "$dir.out"; fail=1
 else
-    echo "ok   pub_let_mut_new goes red at nine"
+    echo "ok   module_let_mut goes red at nine"
+fi
+# A global need not be pub to be shared state, so a ninth that is not pub
+# counts the same.
+cp "$WORK/eight_globals.bl" "$dir/src/cg_b.bl"
+echo "let mut g9: Int = 0" >> "$dir/src/cg_b.bl"
+if run_lint "$dir" > "$dir.out" 2>&1 || ! grep -qE '^L3 +module_let_mut .*OVER' "$dir.out"; then
+    echo "FAIL module_let_mut: a ninth global that is not pub not caught:"; cat "$dir.out"; fail=1
+else
+    echo "ok   module_let_mut counts a global that is not pub"
+fi
+# The allowlist names pub globals only; one that is not pub is held by the
+# count row and never owes a line there.
+dir="$WORK/case_unlisted_private"
+write_clean "$dir"
+echo "let mut private_state: Int = 0" >> "$dir/src/cg_b.bl"
+if run_lint "$dir" > "$dir.out" 2>&1 && grep -qE '^L3 +pub_let_mut_unlisted +0 +0 +0 +0$' "$dir.out"; then
+    echo "ok   pub_let_mut_unlisted ignores a global that is not pub"
+else
+    echo "FAIL pub_let_mut_unlisted counted a global that is not pub:"; cat "$dir.out"; fail=1
 fi
 printf 'cg_out\n' > "$ALLOW"
 
@@ -200,6 +221,46 @@ if (cd "$GITWORK" && ./scripts/lint_codegen.sh > "$WORK/git3.out" 2>&1) && grep 
     echo "ok   git: a row new in this commit is exempt from the previous-commit rule"
 else
     echo "FAIL git: new-row exemption:"; cat "$WORK/git3.out"; fail=1
+fi
+
+# The branch walk: every commit in main..HEAD against its parents. The tip
+# compare alone cannot see a rise that a later commit on the branch paid back.
+WALKWORK="$WORK/walkrepo"
+mkdir -p "$WALKWORK/scripts" "$WALKWORK/src" "$WALKWORK/tests"
+cp ./scripts/lint_codegen.sh "$WALKWORK/scripts/lint_codegen.sh"
+cp ./scripts/lint_pub_let_mut_allow.txt "$WALKWORK/scripts/lint_pub_let_mut_allow.txt"
+: > "$WALKWORK/tests/test_fixture.bl"
+printf '// br abc123\n' > "$WALKWORK/src/cg_a.bl"
+(
+    cd "$WALKWORK" || exit 1
+    git init -q -b main .
+    git config user.email t@example.com
+    git config user.name t
+    ./scripts/lint_codegen.sh --update > /dev/null
+    git add -A && git commit -qm base
+    git checkout -q -b paid_back
+    printf '// br def456\n' >> src/cg_a.bl
+    git commit -qam "raise a debt row"
+    printf '// br abc123\n' > src/cg_a.bl
+    git commit -qam "pay it back"
+)
+if (cd "$WALKWORK" && ./scripts/lint_codegen.sh > "$WORK/walk1.out" 2>&1) || ! grep -qE 'raise a debt row: br_ids_in_source 1 -> 2$' "$WORK/walk1.out"; then
+    echo "FAIL git: a mid-branch rise paid back by a later commit not caught:"; cat "$WORK/walk1.out"; fail=1
+else
+    echo "ok   git: a mid-branch rise in a debt row fails although the tip paid it back"
+fi
+# A row under its threshold may grow up to it on any commit.
+(
+    cd "$WALKWORK" || exit 1
+    git checkout -q main
+    git checkout -q -b under_threshold
+    printf 'pub let mut em_indent: Int = 0\n' > src/cg_emit.bl
+    git add -A && git commit -qm "grow a row under its threshold"
+)
+if (cd "$WALKWORK" && ./scripts/lint_codegen.sh > "$WORK/walk2.out" 2>&1) && grep -qE '^L3 +module_let_mut +8 +0 +0 +1$' "$WORK/walk2.out"; then
+    echo "ok   git: a branch commit may grow a row up to its threshold"
+else
+    echo "FAIL git: growth under the threshold was failed by the branch walk:"; cat "$WORK/walk2.out"; fail=1
 fi
 
 if [ "$fail" -ne 0 ]; then

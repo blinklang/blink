@@ -37,16 +37,18 @@ user C with a gen1-built archive; the link to gen0's archive is cut.
 
 | Task | What it does | Fails when |
 | --- | --- | --- |
-| `task ci` | The rewrite gate: `gen1`, `ratchet`, `test-ratchet`, `test-lint`, `corpus`, `corpus-check`, formatter goldens and idempotency with gen1, `typecheck-suite`, `rewrite-suite`. | Any step fails. |
+| `task ci` | The rewrite gate: `gen1`, `ratchet`, `test-ratchet`, `test-lint`, `test-corpus`, `commit-messages`, `test-commit-messages`, `corpus`, `corpus-check`, formatter goldens and idempotency with gen1, `typecheck-suite`, `rewrite-suite`. | Any step fails. |
 | `task gen1` | gen0 compiles `src/blinkc_main.bl` and `src/cli.bl`, then links `build/gen1/bin/blinkc` and `build/gen1/bin/blink`. | Nonzero exit, an `error[` line, or a link error. |
 | `task corpus` | Compiles and runs every `tests/test_*.bl` on its own under gen1. Writes `build/corpus.json`. Then runs the lint. | Never for a test result. Only when the lint fails. |
 | `task corpus-check` | Compares `build/corpus.json` with `scripts/corpus_baseline.json` and with the baseline in the previous commit. A test that now lives in `tests/pinned/` is dropped from both references first. | The pass count drops, or a file that passed no longer passes. |
 | `task corpus-baseline` | Rewrites `scripts/corpus_baseline.json` from `build/corpus.json`. Run it only after a real gain. | Never. |
 | `task ci-fast` | The branch gate: every step of `ci`, with `corpus-sample` in place of `corpus` and `corpus-check`. | Any step fails. |
 | `task corpus-sample` | Compiles and runs the files in `scripts/corpus_sample.txt` under gen1 and holds the pass count to the `# floor:` line in that list. Writes `build/corpus_sample.json`. | Fewer files pass than the floor. It names them. |
-| `task lint` | Runs `scripts/lint_codegen.sh`, the eleven rows below. | A row rises above its limit, or a row in debt rises above the previous commit. |
+| `task lint` | Runs `scripts/lint_codegen.sh`, the eleven rows below. | A row rises above its limit, or a row in debt rises above the previous commit or on any commit of the branch. |
+| `task commit-messages` | Runs `scripts/lint_commit_messages.sh` over `main..HEAD`, or over `HEAD^..HEAD` when HEAD is on main, so the main gate checks a merge message and every commit it brought. It matches every token that `br` lists as a ticket or project id. Without `br` it checks only the forms `br <id>`, `ticket: <id>` and `#<id>`, and says so. | A message names a br id. |
+| `task xfail-tickets` | Local only, in no gate. Runs `scripts/xfail_tickets.sh`: every `test.failing` row in `tests/` must name a ticket that `br` lists as open. Without `br` it skips. | A row names no ticket, an unknown one, or a closed one. |
 | `task test-lint` | Runs `scripts/test_lint_codegen.sh`: each row goes red on a fixture. | A row does not catch its construct. |
-| `task ratchet` | Three debt counts over the whole compiler (see below), then the lint. | A count rises, or a zero-gate row is not zero. |
+| `task ratchet` | Debt counts over the whole compiler (see below), then the lint. | A count rises, on the tip or on any commit of the branch, or a zero-gate row is not zero. |
 | `task typecheck-suite` | Runs the files in `scripts/typecheck_suite.txt` under gen0. They assert typechecker behaviour by RUNNING, so they need a compiler that can emit; under gen0 the suite measures gen0's typechecker, not this tree's. | Any file does not pass. |
 | `task rewrite-suite` | Runs every rewrite unit-test file under gen0: `tests/test_cg_*.bl`, `test_layout_*.bl`, `test_cname_*.bl`, `test_ir_*.bl`, minus `scripts/rewrite_suite_exclude.txt`. Writes `build/rewrite_suite.json`. | Any file does not pass, a prelude root is missing, one of the four prefixes matches no file, the exclude file is gone, or an exclude line names a file that does not exist or that the glob does not select. |
 | `task ci-release` | The old full gate: self-host regen, `blink test`, per-module invariants, installed smoke. `mono-diff` and `node-tid-diff` are parked: still tasks, no longer in any gate. | Any step fails. |
@@ -151,7 +153,10 @@ jq -r '.files | sort_by(-.seconds) | .[:10][] | "\(.seconds)s \(.file)"' build/c
 
 To rerun a subset, write the file names to a list and run
 `scripts/corpus.sh --only <list>`. The result goes to
-`build/corpus_subset.json` and does not touch the baseline.
+`build/corpus_subset.json` and does not touch the baseline. A subset run
+exits 1 when any listed file fails and 2 when the run itself failed. A full
+run exits 0 with failing files, because corpus-check judges it against the
+baseline. `scripts/test_corpus.sh` proves these exit codes.
 
 ## The corpus sample
 
@@ -181,9 +186,9 @@ yet counts as empty. Tests and docs are never scanned.
 | Row | Name | Limit | Catches |
 | --- | --- | --- | --- |
 | L1 | `ct_or_string_types` | 0 | `CT_*`, `type_from_name`, the `tp_*` pool, `sv_tp`, `.ctype`, `.sname` |
-| L2 | `sentinel_answers` | 0 | `TYPE_UNKNOWN`, the `if x >= 0 { x } else` fallback, a tid coalesced with `??` |
-| L3 | `pub_let_mut_new` | 8 | Mutable module globals in the scanned files |
-| L3 | `pub_let_mut_unlisted` | 0 | A mutable global whose name is not in `scripts/lint_pub_let_mut_allow.txt` |
+| L2 | `sentinel_answers` | 0 | `TYPE_UNKNOWN`, the `if x >= 0 { x } else` fallback (`x` may be a field path), a tid coalesced with `??` |
+| L3 | `module_let_mut` | 8 | Mutable module globals in the scanned files, pub or not |
+| L3 | `pub_let_mut_unlisted` | 0 | A pub mutable global whose name is not in `scripts/lint_pub_let_mut_allow.txt` |
 | L4 | `typename_compares` | 0 | A type name compared as a string |
 | L5 | `no_infer` | 0 | A call to any `infer_*` function |
 | L6 | `layout_outside_layer` | 0 | A C type spelled outside `layout.bl`, `cname.bl` and `cg_print.bl`; a `TyKind` test inside `cg_print.bl` |
@@ -197,24 +202,36 @@ Each row has a threshold, a stored baseline (`scripts/lint_codegen_baseline.txt`
 and a previous-commit count. The gate is: `now` must not be above
 `max(threshold, baseline)`, and a row above its threshold must not be
 above the previous commit. A row under its threshold may grow up to the
-threshold. A row above its threshold but not rising shows `DEBT`. This is
+threshold. The previous-commit rule also holds for every commit on the
+branch (`main..HEAD`), each against its parents, so a rise that a later
+commit pays back still fails. `scripts/ratchet.sh` walks the branch the same
+way. A row above its threshold but not rising shows `DEBT`. This is
 how `mono.bl`, which exists today with violations, can be gated without
 being rewritten first. `OVER` and `UP` mean the run failed; the matching
 lines print under the table.
 
-The ratchet keeps three rows over the whole compiler in
-`scripts/ratchet.sh`: `br_ids_in_source` (zero gate), `pub_let_mut` over
-every file in `src/`, and `layout_decline_unhandled` (zero gate: a
-`decline_reason` read outside `layout.bl` with no `diag_ice` within the
-next three lines).
+The ratchet keeps these rows over the whole compiler in
+`scripts/ratchet.sh`:
 
-The `pub_let_mut` row scans all of `src/` on purpose. It used to name the
+- `br_ids_in_source`: zero gate.
+- `module_let_mut`: every column-0 `let mut`, pub or not, in `src/`.
+- `typecheck_module_let_mut`: the same count in `typecheck.bl` alone.
+- `layout_decline_unhandled`: zero gate. A `decline_reason` read outside
+  `layout.bl` with no `diag_ice` within the next three lines.
+- `cg_name_string_compares`: a method, trait or fn name compared with a
+  string or with a named constant, on the codegen surface the lint scans.
+- `fallback_idiom`: `if x >= 0 { x } else` in `src/`.
+- `typecheck_str_keyed_tables`: module-scope `Map[Str, _]` tables in
+  `typecheck.bl`.
+
+The `module_let_mut` row scans all of `src/` on purpose. It used to name the
 old codegen files, so deleting them would have driven it to 0 by
 construction and it would then have gated nothing. Over the whole surface
 it is a real non-increasing cap: the baseline is the honest current count,
-and a new mutable module global anywhere in `src/` fails the row. The
-codegen-surface half of the rule stays in lint rows L3, which hold
-`src/cg*.bl` to an allowlist plus an absolute zero for unlisted names.
+and a new mutable module global anywhere in `src/` fails the row. It
+counts globals that are not pub, because a global need not be pub to be
+shared state. The codegen-surface half of the rule stays in lint rows L3,
+which cap the count and hold pub globals to an allowlist.
 
 ## How to add a lint row
 
@@ -231,9 +248,9 @@ codegen-surface half of the rule stays in lint rows L3, which hold
    commit.
 5. Add the row to the table above.
 
-To allow a new mutable global, add a line to
-`scripts/lint_pub_let_mut_allow.txt`: the name, then its role. The cap
-stays 8. The list names globals that EXIST: a stage that has not landed
+To allow a new pub mutable global, add a line to
+`scripts/lint_pub_let_mut_allow.txt`: the name, then its role. The count
+row still holds every global, pub or not, and its cap stays 8. The list names globals that EXIST: a stage that has not landed
 adds its line in the commit that adds the global, so the file can never
 pre-approve a name nobody has had to justify yet.
 

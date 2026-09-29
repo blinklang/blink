@@ -27,12 +27,19 @@
 # uncommitted changes (the run precedes the commit that lands them), else
 # HEAD~1. Override with LINT_HEAD1_REF.
 #
+# Every commit on the branch is also held to the previous-commit rule against
+# its parents: in LINT_BASE_REF..HEAD (default main), no commit may raise a row
+# in debt. A tip-only compare lets a mid-branch rise through when a later
+# commit pays it back. A merge commit rises only when it passes every parent.
+#
 # Env overrides (used by scripts/test_lint_codegen.sh):
 #   LINT_SRC_DIR    root standing in for the repo (has src/ and tests/). Default: .
 #   LINT_BASELINE   baseline file. Default: scripts/lint_codegen_baseline.txt
 #   LINT_ALLOWLIST  pub let mut allowlist. Default: scripts/lint_pub_let_mut_allow.txt
 #   LINT_HEAD1_DIR  root standing in for the previous commit (bypasses git)
 #   LINT_HEAD1_REF  git ref to materialize when LINT_HEAD1_DIR is unset
+#   LINT_BASE_REF   the ref the branch walk starts from. Default: main. The walk
+#                   is skipped when LINT_HEAD1_DIR is set
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
@@ -50,7 +57,7 @@ esac
 ROWS="
 L1 ct_or_string_types 0
 L2 sentinel_answers 0
-L3 pub_let_mut_new 8
+L3 module_let_mut 8
 L3 pub_let_mut_unlisted 0
 L4 typename_compares 0
 L5 no_infer 0
@@ -144,21 +151,21 @@ compute_rows() {
     scan '\bCT_[A-Z_]+\b|\btype_from_name(_tag)?\(|\btp_[a-z][a-z_0-9]*\(|\bsv_tp\(|\.(ctype|sname)\b' "$@" > "$det/ct_or_string_types.txt"
 
     # L2: a guessed answer where an ICE belongs: TYPE_UNKNOWN, the flat
-    # fallback idiom, and a tid coalesced onto a default.
-    scan '\bTYPE_UNKNOWN\b|if [a-z_]+ >= 0 \{ [a-z_]+ \} else|\b[a-z_0-9]*tid[a-z_0-9]*\s*\?\?\s' "$@" > "$det/sentinel_answers.txt"
+    # fallback idiom (a field path too), and a tid coalesced onto a default.
+    scan '\bTYPE_UNKNOWN\b|if ([a-z_][a-z_0-9.]*) >= 0 \{ \1 \} else|\b[a-z_0-9]*tid[a-z_0-9]*\s*\?\?\s' "$@" > "$det/sentinel_answers.txt"
 
-    # L3: mutable module globals. Count, and names outside the allowlist.
-    scan '^pub let mut [a-z_][a-z_0-9]*' "$@" > "$det/pub_let_mut_new.txt"
+    # L3: mutable module globals, pub or not: a global need not be pub to be
+    # shared state. The allowlist names the pub ones, which other modules
+    # reach; the count row holds the rest.
+    scan '^(pub )?let mut [a-z_][a-z_0-9]*' "$@" > "$det/module_let_mut.txt"
     : > "$det/pub_let_mut_unlisted.txt"
-    if [ -s "$det/pub_let_mut_new.txt" ]; then
-        allowed=$(grep -vE '^[[:space:]]*(#|$)' "$allowlist" 2>/dev/null | awk '{print $1}')
-        while IFS= read -r line; do
-            name=$(printf '%s' "$line" | sed -E 's/^.*pub let mut ([a-z_][a-z_0-9]*).*$/\1/')
-            if ! printf '%s\n' "$allowed" | grep -qx -- "$name"; then
-                echo "$line" >> "$det/pub_let_mut_unlisted.txt"
-            fi
-        done < "$det/pub_let_mut_new.txt"
-    fi
+    allowed=$(grep -vE '^[[:space:]]*(#|$)' "$allowlist" 2>/dev/null | awk '{print $1}')
+    grep -P '^[^:]*:[0-9]+:pub let mut ' "$det/module_let_mut.txt" | while IFS= read -r line; do
+        name=$(printf '%s' "$line" | sed -E 's/^.*pub let mut ([a-z_][a-z_0-9]*).*$/\1/')
+        if ! printf '%s\n' "$allowed" | grep -qx -- "$name"; then
+            echo "$line" >> "$det/pub_let_mut_unlisted.txt"
+        fi
+    done
 
     # L4: dispatch on a type's NAME as a string.
     scan '[=!]= "[A-Z][A-Za-z_0-9]*"|\btk_name\([^)]*\)\s*[=!]=|\.(starts_with|ends_with)\("(Option|Result|List|Map|Set|Tuple|Fn|Str|Int|Float|Bool|Bytes|Char)\b' "$@" > "$det/typename_compares.txt"
@@ -264,6 +271,50 @@ materialize_ref() {
     git archive "$1" src tests scripts 2>/dev/null | tar -x -C "$2"
 }
 
+# Row names the lint_codegen.sh at $1 defined, space-separated, or a lone
+# space when that commit had no lint script (every row new).
+tracked_rows_at() {
+    if script=$(git show "$1:scripts/lint_codegen.sh" 2>/dev/null); then
+        printf ' %s' $(printf '%s\n' "$script" | sed -n 's/^L[0-9]* \([a-z_][a-z_0-9]*\) [0-9]*$/\1/p')
+    else
+        echo " "
+    fi
+}
+
+# Prints one line per debt row a commit in $1..HEAD raised above its parents.
+walk_branch() {
+    walk="$work/walk"
+    mkdir -p "$walk"
+    git rev-list --reverse --parents "$1..HEAD" | while read -r c parents; do
+        [ -n "$parents" ] || continue
+        for r in $c $parents; do
+            if [ ! -f "$walk/$r.rows" ]; then
+                materialize_ref "$r" "$walk/$r"
+                compute_rows "$walk/$r" "$walk/$r.det" > "$walk/$r.rows"
+                rm -rf "$walk/$r" "$walk/$r.det"
+            fi
+        done
+        tracked=""
+        for p in $parents; do tracked="$tracked$(tracked_rows_at "$p")"; done
+        subject=$(git log -1 --format='%h %s' "$c")
+        while read -r _id name thr; do
+            [ -z "$name" ] && continue
+            case " $tracked " in *" $name "*) ;; *) continue ;; esac
+            n=$(awk -v n="$name" '$1==n{print $2}' "$walk/$c.rows")
+            before=0
+            for p in $parents; do
+                v=$(awk -v n="$name" '$1==n{print $2}' "$walk/$p.rows")
+                [ "${v:-0}" -gt "$before" ] && before="$v"
+            done
+            if [ "${n:-0}" -gt "$thr" ] && [ "${n:-0}" -gt "$before" ]; then
+                echo "$subject: $name $before -> $n"
+            fi
+        done <<ROWLIST
+$ROWS
+ROWLIST
+    done
+}
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -335,6 +386,20 @@ while read -r id name thr; do
 done <<EOF
 $ROWS
 EOF
+
+base_ref="${LINT_BASE_REF:-main}"
+if [ -z "${LINT_HEAD1_DIR:-}" ]; then
+    if git rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null 2>&1; then
+        raised=$(walk_branch "$base_ref")
+        if [ -n "$raised" ]; then
+            echo "lint_codegen: a commit on this branch raised a row in debt above its parent, even if a later commit paid it back:"
+            printf '%s\n' "$raised" | sed 's/^/       /'
+            fail=1
+        fi
+    else
+        echo "lint_codegen: warning: '$base_ref' does not resolve; skipping the branch walk" >&2
+    fi
+fi
 
 if [ "$fail" -ne 0 ]; then
     echo "lint_codegen: FAIL. A row rose above its limit or above the previous commit. Remove the construct; the lint never gets an exception."

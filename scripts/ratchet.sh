@@ -10,24 +10,37 @@
 # Rows:
 #   br_ids_in_source         a br ticket id anywhere in src/ or Taskfile.yml;
 #                            absolute zero gate (br is local-only)
-#   pub_let_mut              mutable module globals anywhere in src/. Scoped to the
-#                            whole surface on purpose: a row named after the files it
-#                            exists to empty reads 0 by construction once they are
-#                            deleted, and then gates nothing. The codegen-surface half
-#                            of this rule lives in lint_codegen.sh rows L3, which hold
-#                            src/cg*.bl to an allowlist and an absolute zero
+#   module_let_mut           mutable module globals anywhere in src/: every
+#                            column-0 `let mut`, pub or not. A global need not be
+#                            pub to be shared state. Scoped to the whole surface on
+#                            purpose: a row named after the files it exists to empty
+#                            reads 0 by construction once they are deleted, and then
+#                            gates nothing. The codegen-surface half of this rule
+#                            lives in lint_codegen.sh rows L3
+#   typecheck_module_let_mut the same count in src/typecheck.bl alone, where most
+#                            of them live, so growth there shows on its own row
 #   layout_decline_unhandled a layout decline read outside layout.bl that no
 #                            diag_ice within the next three lines turns into
 #                            an ICE (a swallowed decline is a guessed answer)
-#   cg_name_string_compares  dispatch keyed on a spelled-out method or fn name:
-#                            `\b(method|name)\s*==\s*"` anywhere in src/cg_*.bl.
-#                            The rewrite answers these from a tid, so every one
-#                            left is a question asked of a string. Scoped to the
-#                            whole codegen surface rather than to cg_call.bl,
-#                            where all but six of them sit today: a row that
-#                            counts one file pays a ladder moved to a sibling as
-#                            a deletion, and the debt would read as repaid for
-#                            having been relocated
+#   cg_name_string_compares  dispatch keyed on a spelled-out method, trait or fn
+#                            name, anywhere on the codegen surface (the files
+#                            lint_codegen.sh scans). Two spellings count: a
+#                            name-like binding or call (`mname`, `trait_name`,
+#                            `node_name(f)`) compared with a string literal, and
+#                            any compare with a named constant (`== method_display`),
+#                            which is the same string under another name. The
+#                            rewrite answers these from a tid, so every one left
+#                            is a question asked of a string. A call with nested
+#                            parentheses on the left is not seen, so the count is
+#                            a lower bound. Scoped to the whole surface rather than
+#                            to cg_call.bl: a row that counts one file pays a ladder
+#                            moved to a sibling as a deletion. Not all of src/:
+#                            the typechecker resolves identifiers by name, which
+#                            no tid answers
+#   fallback_idiom           `if x >= 0 { x } else { ... }` anywhere in src/: a
+#                            missing answer turned into a default instead of an
+#                            error. lint_codegen.sh row L2 holds the codegen
+#                            surface to zero; this row keeps the rest from growing
 #   typecheck_str_keyed_tables
 #                            module-scope Map[Str, _] fact tables in
 #                            src/typecheck.bl: `^(pub )?let mut <name>: Map[Str`.
@@ -47,9 +60,13 @@
 # parent). Override with RATCHET_HEAD1_REF to pin one or the other. If the
 # resolved ref does not exist (shallow clone, or a repo with too few commits
 # for HEAD~1), the previous-commit comparison is skipped for that run instead
-# of failing every row against an empty tree. Known gap: on a clean tree with
-# several unpushed local commits, only the tip is checked against its
-# immediate parent.
+# of failing every row against an empty tree.
+#
+# Every commit on the branch is also checked against its parent: each commit
+# in RATCHET_BASE_REF..HEAD (default main) must not raise a tracked row. A
+# tip-only compare lets a mid-branch rise through when a later commit pays it
+# back. A merge commit rises only when it passes every parent. When the base
+# ref does not resolve, or HEAD is on it, there is nothing to walk.
 #
 # Env overrides (used by scripts/test_ratchet.sh; normal runs need none):
 #   RATCHET_SRC_DIR   root dir standing in for the repo root when computing
@@ -59,6 +76,8 @@
 #                     bypassing git entirely. Default: unset (materialize
 #                     RATCHET_HEAD1_REF via git into .tmp/ratchet_head1).
 #   RATCHET_HEAD1_REF git ref to materialize when RATCHET_HEAD1_DIR is unset.
+#   RATCHET_BASE_REF  the ref the branch walk starts from. Default: main. The
+#                     walk is skipped when RATCHET_HEAD1_DIR is set.
 #   RATCHET_NO_LINT   1 to skip scripts/lint_codegen.sh.
 set -u
 cd "$(dirname "$0")/.."
@@ -74,6 +93,8 @@ fi
 head1_ref="${RATCHET_HEAD1_REF:-$default_head1_ref}"
 
 cnt() { rg -o "$1" $2 2>/dev/null | wc -l | tr -d ' '; }
+# PCRE, for a pattern that needs a backreference.
+pcnt() { rg -oP "$1" $2 2>/dev/null | wc -l | tr -d ' '; }
 
 # cnt() relies on unquoted word-splitting to pass multiple files to rg, so a
 # root containing a space would silently undercount instead of erroring. This
@@ -118,15 +139,17 @@ decline_unhandled() {
 compute_rows() {
   root="$1"
   allbl="$root/src/*.bl"
-  cgbl="$root/src/cg_*.bl"
+  cgbl="$root/src/cg_*.bl $root/src/cg.bl $root/src/layout.bl $root/src/cname.bl $root/src/mono.bl $root/src/ir.bl"
   tcbl="$root/src/typecheck.bl"
   tf="$root/Taskfile.yml"
 
   cat <<ROWS
 br_ids_in_source $(( $(cnt '\bbr [0-9a-z]{6}\b' "$allbl $tf") + $(cnt '\b(g3sba0|qf1vzx|0kpmac)\b' "$allbl $tf") ))
-pub_let_mut $(cnt '^pub let mut' "$allbl")
+module_let_mut $(cnt '^(pub )?let mut ' "$allbl")
+typecheck_module_let_mut $(cnt '^(pub )?let mut ' "$tcbl")
 layout_decline_unhandled $(decline_unhandled "$root")
-cg_name_string_compares $(cnt '\b(method|name)\s*==\s*"' "$cgbl")
+cg_name_string_compares $(cnt '\b[a-z_0-9]*(method|name|trait)[a-z_0-9]*(\([^()]*\))?\s*[!=]=\s*"|[!=]=\s*(method|trait)_[a-z_0-9]+\b' "$cgbl")
+fallback_idiom $(pcnt 'if ([a-z_][a-z_0-9.]*) >= 0 \{ \1 \} else' "$allbl")
 typecheck_str_keyed_tables $(cnt '^(pub )?let mut [A-Za-z_][A-Za-z_0-9]*: Map\[Str' "$tcbl")
 ROWS
 }
@@ -147,6 +170,36 @@ materialize_ref() {
     mkdir -p "$outdir/$(dirname "$path")"
     git show "$ref:$path" > "$outdir/$path" 2>/dev/null
   done
+}
+
+# Row names the ratchet.sh at $1 defined. A row it lacked has no count there.
+tracked_rows_at() {
+  git show "$1:scripts/ratchet.sh" 2>/dev/null |
+    sed -n 's/^\([a-z_][a-z_0-9]*\) \$.*/\1/p' | tr '\n' ' '
+}
+
+# Prints one line per row a commit in $1..HEAD raised above its parents.
+walk_branch() {
+  base_ref="$1"
+  walk=$(mktemp -d)
+  git rev-list --reverse --parents "${base_ref}..HEAD" | while read -r c parents; do
+    [ -n "$parents" ] || continue
+    [ -d "$walk/$c" ] || materialize_ref "$c" "$walk/$c"
+    rows_c=$(compute_rows "$walk/$c")
+    for p in $parents; do
+      [ -d "$walk/$p" ] || materialize_ref "$p" "$walk/$p"
+      compute_rows "$walk/$p" | sed "s/^/$p /"
+    done > "$walk/parents.txt"
+    tracked=""
+    for p in $parents; do tracked="$tracked $(tracked_rows_at "$p")"; done
+    subject=$(git log -1 --format='%h %s' "$c")
+    printf '%s\n' "$rows_c" | while read -r name n; do
+      case " $tracked " in *" $name "*) ;; *) continue ;; esac
+      before=$(awk -v n="$name" '$2==n && $3>m {m=$3} END {print m+0}' "$walk/parents.txt")
+      [ "$n" -gt "$before" ] && echo "$subject: $name $before -> $n"
+    done
+  done
+  rm -rf "$walk"
 }
 
 check_root "$now_root"
@@ -174,8 +227,7 @@ elif git rev-parse --verify --quiet "${head1_ref}^{commit}" >/dev/null 2>&1; the
   # computing it over the older files answers 0 for a metric nobody tracked,
   # which would fail the new row for the fact of existing. Its baseline,
   # written in the same commit, is its first reference.
-  head1_tracked=$(git show "${head1_ref}:scripts/ratchet.sh" 2>/dev/null |
-    sed -n 's/^\([a-z_][a-z_0-9]*\) \$.*/\1/p' | tr '\n' ' ')
+  head1_tracked=$(tracked_rows_at "$head1_ref")
 else
   echo "ratchet: warning: '$head1_ref' does not resolve; skipping the previous-commit comparison for this run" >&2
   rows_head1="$rows_now"
@@ -208,6 +260,20 @@ printf '%s\n' "$rows_now" | while read -r name now; do
   printf '%-26s %8s %8s %8s%s\n' "$name" "$base" "$h1" "$now" "$mark"
   [ -n "$mark" ] && printf x >> "$failmark"
 done
+
+base_ref="${RATCHET_BASE_REF:-main}"
+if [ -z "${RATCHET_HEAD1_DIR:-}" ]; then
+  if git rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null 2>&1; then
+    raised=$(walk_branch "$base_ref")
+    if [ -n "$raised" ]; then
+      echo "ratchet: a commit on this branch raised a row above its parent, even if a later commit paid it back:"
+      printf '%s\n' "$raised" | sed 's/^/  /'
+      printf x >> "$failmark"
+    fi
+  else
+    echo "ratchet: warning: '$base_ref' does not resolve; skipping the branch walk for this run" >&2
+  fi
+fi
 
 if [ -s "$failmark" ]; then
   echo "ratchet: a tracked count went up against the baseline or the previous commit. Remove the new use, or lower another row."

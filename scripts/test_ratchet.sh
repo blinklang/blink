@@ -70,7 +70,7 @@ check_row() {
   fi
 }
 
-check_row pub_let_mut              codegen.bl   'pub let mut other_global2: Int = 0'
+check_row module_let_mut           codegen.bl   'pub let mut other_global2: Int = 0'
 check_row br_ids_in_source         codegen.bl   '// also see br xyz987'
 check_row layout_decline_unhandled cname.bl     'let swallowed = d.decline_reason'
 
@@ -104,10 +104,47 @@ check_named_row cg_name_string_compares cg_call.bl \
 check_named_row cg_name_string_compares cg_expr.bl \
   'if name == "read_file" { return c_runtime_helper("read_file") }'
 
-# Not pub, so only this row moves; a pub table would also raise pub_let_mut and
-# the run would fail for two reasons at once.
+# A new table is also a new module global, so the let-mut rows rise with it;
+# check_named_row reads back that this row carries the mark as well.
 check_named_row typecheck_str_keyed_tables typecheck.bl \
   'let mut tc_new_fact_table: Map[Str, List[Int]] = Map()'
+
+# A module global need not be pub to be shared state.
+check_named_row module_let_mut codegen.bl 'let mut em_scratch: Int = 0'
+check_named_row typecheck_module_let_mut typecheck.bl 'let mut tc_walk_depth: Int = 0'
+
+# The name row counts every spelling of the same question: a name-like binding
+# other than `method`/`name`, a name read through a call, a compare with a named
+# constant, a `!=`, and a compare in a codegen file outside the cg_*.bl glob.
+check_named_row cg_name_string_compares cg_call.bl \
+  'if mname == "len" { return cc_list_len(node) }'
+check_named_row cg_name_string_compares cg_reg.bl \
+  'if node_name(f) == "main" { has_main = true }'
+check_named_row cg_name_string_compares cg_call.bl \
+  'if mname == method_display && cc_is_scalar_display_kind(kind) { return 1 }'
+check_named_row cg_name_string_compares mono.bl \
+  'if trait_name != "Eq" { continue }'
+check_named_row cg_name_string_compares cg.bl \
+  'if method == "main" { return 1 }'
+
+# The fallback idiom counts anywhere in src/, a field path included.
+check_named_row fallback_idiom escape.bl \
+  'let key = if decl >= 0 { decl } else { hit }'
+check_named_row fallback_idiom cg_eff.bl \
+  'let fwd = if th.forward_to >= 0 { th.forward_to } else { 0 }'
+
+# A branch on one value that answers with another is not the idiom: the row
+# needs the same name on both sides, or it counts every signed compare.
+NOFALLBACK="$WORK/no_fallback"
+rm -rf "$NOFALLBACK"
+cp -r "$BASE" "$NOFALLBACK"
+printf '%s\n' 'let v = if a >= 0 { b } else { c }' >> "$NOFALLBACK/src/escape.bl"
+if ! RATCHET_SRC_DIR="$NOFALLBACK" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > /dev/null 2>&1; then
+  echo "FAIL fallback_idiom-distinct: a branch that answers with another value was counted"
+  fail=1
+else
+  echo "PASS fallback_idiom-distinct: a branch that answers with another value is not counted"
+fi
 
 # An indented table is a function local, not a module-scope fact table, so the
 # row must not count it. Without this the regex could be a bare substring match.
@@ -268,6 +305,70 @@ echo 'pub let mut a: Int = 0' > "$GITWORK/src/codegen.bl"
     exit 1
   fi
   echo "PASS git-new-row-then-checked: once the reference commit tracks the row, a rise fails"
+)
+if [ $? != 0 ]; then fail=1; fi
+
+# The branch walk: every commit in main..HEAD against its parents. The tip
+# compare alone cannot see a rise that a later commit on the branch paid back.
+WALKWORK="$WORK/walkrepo"
+mkdir -p "$WALKWORK/scripts" "$WALKWORK/src"
+cp ./scripts/ratchet.sh "$WALKWORK/scripts/ratchet.sh"
+chmod +x "$WALKWORK/scripts/ratchet.sh"
+echo 'pub let mut a: Int = 0' > "$WALKWORK/src/codegen.bl"
+: > "$WALKWORK/Taskfile.yml"
+(
+  cd "$WALKWORK" || exit 1
+  git init -q -b main .
+  git config user.email t@example.com
+  git config user.name t
+  ./scripts/ratchet.sh --update > /dev/null
+  git add -A
+  git commit -q -m base
+
+  git checkout -q -b neutral
+  echo '// no count change' >> src/codegen.bl
+  git commit -q -am "neutral edit"
+  if ! ./scripts/ratchet.sh > /dev/null 2>&1; then
+    echo "FAIL git-walk-neutral: a branch whose commits raise nothing must pass"
+    exit 1
+  fi
+  echo "PASS git-walk-neutral: a branch whose commits raise nothing passes"
+
+  git checkout -q main
+  git checkout -q -b paid_back
+  echo 'pub let mut b: Int = 0' >> src/codegen.bl
+  git commit -q -am "raise a row"
+  sed -i '/pub let mut b/d' src/codegen.bl
+  git commit -q -am "pay it back"
+  walk_out=$(./scripts/ratchet.sh 2>&1)
+  if [ $? = 0 ]; then
+    echo "FAIL git-walk-paid-back: a mid-branch rise paid back by a later commit must fail"
+    printf '%s\n' "$walk_out"
+    exit 1
+  fi
+  if ! printf '%s\n' "$walk_out" | rg -q 'raise a row: module_let_mut 1 -> 2$'; then
+    echo "FAIL git-walk-paid-back: the run failed, but did not name the commit and row that rose"
+    printf '%s\n' "$walk_out"
+    exit 1
+  fi
+  echo "PASS git-walk-paid-back: a mid-branch rise is caught although the tip paid it back"
+
+  # A merge of main brings main's own counts. The merge rises only when it
+  # passes every parent, so a row main raised is not charged to the branch.
+  git checkout -q main
+  echo 'pub let mut m: Int = 0' > src/main_only.bl
+  git add -A
+  git commit -q -m "main raises a row"
+  git checkout -q neutral
+  git merge -q --no-edit main > /dev/null 2>&1 || { echo "FAIL git-walk-merge: fixture merge conflicted"; exit 1; }
+  ./scripts/ratchet.sh --update > /dev/null
+  git commit -q -am "rebaseline" > /dev/null 2>&1 || true
+  if ! RATCHET_HEAD1_REF=HEAD ./scripts/ratchet.sh > /dev/null 2>&1; then
+    echo "FAIL git-walk-merge: a merge of main was charged with a row main raised"
+    RATCHET_HEAD1_REF=HEAD ./scripts/ratchet.sh 2>&1 | sed 's/^/    /'
+    exit 1
+  fi
+  echo "PASS git-walk-merge: a merge rises only when it passes every parent"
 )
 if [ $? != 0 ]; then fail=1; fi
 
