@@ -99,6 +99,16 @@ expect "sample-at-floor" 0 $?
 { echo '# floor: 2'; cat "$WORK/run_fail.txt"; } > "$WORK/sample_below_floor.txt"
 (cd "$R" && CORPUS_COMPILER=fakec CORPUS_JOBS=2 ./scripts/corpus_sample.sh "$WORK/sample_below_floor.txt") > "$WORK/out.log" 2>&1
 expect "sample-below-floor" 1 $?
+# Callers accept exit 1 alone; a runner error (exit 2) must still fail them.
+(cd "$R" && CORPUS_COMPILER=missing ./scripts/corpus_sample.sh "$WORK/sample_at_floor.txt") > "$WORK/out.log" 2>&1
+got=$?
+if [ "$got" -eq 0 ]; then
+    echo "FAIL sample-runner-error: corpus_sample.sh passed on a runner error"
+    sed 's/^/    /' "$WORK/out.log"
+    fail=1
+else
+    echo "PASS sample-runner-error: exit $got"
+fi
 
 if [ "$fail" -ne 0 ]; then
     echo "test_corpus: FAILED"
