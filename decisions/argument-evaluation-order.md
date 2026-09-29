@@ -1,5 +1,7 @@
 [< All Decisions](../DECISIONS.md)
 
+**Superseded in part:** the index places in Q3 and Q5 (`xs[i] = v`, `xs[next()] += 1`) are not part of Blink. An index is not an assignment place. See [index-assignment-place.md](index-assignment-place.md).
+
 # Argument Evaluation Order — Design Rationale
 
 **Gap:** the spec did not say in what order a call evaluates its arguments, or in what order binary operands, interpolation holes, literal elements and assignment targets evaluate. Codegen passed arguments as C call arguments, and C leaves their order unspecified. Measured with gen1 on 2026-09-27: `f(b: tick(2), a: tick(1))` bound in parameter order, `"{g2()} {g2()}"` printed "202 101", and `bump() + n * 100` read `n` before `bump()` ran. §2.13 also said "The formatter enforces declaration order at call sites for consistency", which the formatter never did, and §2.19 defined `x += rhs` as a purely syntactic rewrite, which evaluates `xs[next()]` twice.

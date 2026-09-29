@@ -375,7 +375,7 @@ The full `List[T]` method surface (13 methods from `ListOps` + 2 from `Sized` + 
 | `index_of` | `fn(self, T) -> Option[Int]` | no | First occurrence |
 | `push` | `fn(self, T)` | yes | Append to end |
 | `pop` | `fn(self) -> Option[T]` | yes | Remove from end |
-| `set` | `fn(self, Int, T)` | yes | Replace at index |
+| `set` | `fn(self, Int, T)` | yes | Replace at index; panics when the index is out of bounds |
 | `insert` | `fn(self, Int, T)` | yes | Insert at index, shift right |
 | `remove` | `fn(self, Int) -> T` | yes | Remove at index, shift left |
 | `clear` | `fn(self)` | yes | Reset to empty, retains capacity |
@@ -404,7 +404,7 @@ items.last()                         // Some(5)
 items.clear()                        // items is now [], capacity retained
 ```
 
-**Why `.get()` returns `Option[T]`.** Out-of-bounds access is a runtime error in most languages. Returning `Option[T]` forces the caller to handle the absence case — no index-out-of-bounds panics, no null pointer exceptions. Use `??` for default values: `list.get(i) ?? 0`.
+**Why `.get()` returns `Option[T]`.** Out-of-bounds access is a runtime error in most languages. Returning `Option[T]` forces the caller to handle the absence case — a read never panics on an index that is out of bounds, and there are no null pointer exceptions. A write through `set` panics on an index that is out of bounds. Use `??` for default values: `list.get(i) ?? 0`.
 
 **Why 13 methods (vote: 3-2).** Systems and PLT argued for 8, excluding `insert`, `remove`, `index_of`, and `last` as O(n) operations better served by iterator methods. Web/Scripting, DevOps, and AI/ML argued these are bread-and-butter operations in every major language (Python `list`, JS `Array`, Java `ArrayList`), and their absence would cause every user to write the same helpers on day one. The expanded surface won on developer experience grounds — performance characteristics should be documented, not hidden.
 
@@ -1522,6 +1522,25 @@ fn main() {
 ```
 
 When a call follows the brackets, as in `handlers[0](req)`, the element is an `Option` that must be unwrapped before the call. No single edit is correct in every enclosing function: `?` compiles only in a function that returns `Option`, and `.unwrap()` panics when the element is missing. So the diagnostic carries a `note:` saying that `handlers.get(0)` returns an `Option` to `match` on before calling, and it offers no machine-applicable fix. A receiver whose type has neither `.get()` nor tuple fields also gets no machine-applicable fix (§3.1 rule 1).
+
+**A store through brackets.** An index is not an assignment place (§2.22 *Assignment places*), so `xs[i] = v` and `xs[i] op= v` are E0313 by the same rule. The first `help:` names one write method, chosen from the receiver's type: `.set(i, v)` for a `List` or `Bytes`, and `.insert(k, v)` for a `Map`. It never names `.insert` for a `List`. `List.insert` compiles, but it shifts the elements and changes the length, so it changes the meaning of the program. When the receiver's type is not known, the help names both methods, each with its receiver type, and offers no machine-applicable fix.
+
+For `xs[i] op= v` on a `List` or `Bytes`, the machine-applicable fix is `xs.set(i, xs.get(i).unwrap() op v)`. The fix writes `i` twice, so it keeps the meaning only when `i` is a literal, a local binding or a `const`, as name resolution sees it. A module-level `let mut` or a call does not qualify. The help says that the fix panics when `i` is out of bounds, because `set` does. For any other index, for a `Map` receiver, and for a nested place, the diagnostic carries a `note:` to bind the index with `let` first, and offers no machine-applicable fix.
+
+```blink
+fn main() {
+    let mut xs = [10, 20, 30]
+    let mut ages: Map[Str, Int] = Map()
+    let i = 1
+
+    xs[0] = 5              // error[NoIndexOperator]: Blink has no index operator
+                           // help: `xs.set(0, 5)`
+    ages["bob"] = 41       // error[NoIndexOperator]: Blink has no index operator
+                           // help: `ages.insert("bob", 41)`
+    xs[i] += 1             // error[NoIndexOperator]: Blink has no index operator
+                           // help: `xs.set(i, xs.get(i).unwrap() + 1)` (panics when `i` is out of bounds)
+}
+```
 
 **TypeArgsWithoutCall (E0314).** A type-argument list supplies type arguments to a call or a literal. With neither after it, nothing uses it. E0301 does not apply, because the brackets bind the type parameters. The first `help:` depends on the context:
 
