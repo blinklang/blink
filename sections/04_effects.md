@@ -186,17 +186,39 @@ fn example() ! IO.Print, FS.Read, DB.Read, Net.Connect, Crypto.Hash {
 
 **IO operations by dispatch mode:**
 
-| Operation | Behavior | Vtable-dispatched | Handler-interceptable | Trace |
-|---|---|---|---|---|
-| `io.print(x)` | stdout, no newline | Yes (`IO.Print`) | Yes | Yes |
-| `io.println(x)` | stdout, with newline | Yes (`IO.Print`) | Yes | Yes |
-| `io.log(x)` | stderr, `[LOG]` prefix + newline | Yes (`IO.Log`) | Yes | Yes |
-| `io.eprintln(x)` | stderr, with newline | No | No | Yes |
-| `io.eprint(x)` | stderr, no newline | No | No | Yes |
-| `io.print_raw(x)` | raw stdout, no newline | No | No | No |
-| `io.eprint_raw(x)` | raw stderr, no newline | No | No | No |
+| Operation | Argument | Behavior | Vtable-dispatched | Handler-interceptable | Trace |
+|---|---|---|---|---|---|
+| `io.print(x)` | `T: Display` | stdout, no newline | Yes (`IO.Print`) | Yes | Yes |
+| `io.println(x)` | `T: Display` | stdout, with newline | Yes (`IO.Print`) | Yes | Yes |
+| `io.log(x)` | `T: Display` | stderr, `[LOG]` prefix + newline | Yes (`IO.Log`) | Yes | Yes |
+| `io.eprintln(x)` | `T: Display` | stderr, with newline | No | No | Yes |
+| `io.eprint(x)` | `T: Display` | stderr, no newline | No | No | Yes |
+| `io.print_raw(s)` | `Str` | raw stdout, no newline | No | No | No |
+| `io.eprint_raw(s)` | `Str` | raw stderr, no newline | No | No | No |
 
 The `_raw` variants are escape hatches for cases where direct C output is needed (e.g., streaming JSON fragments, progress indicators). They bypass the effect handler system entirely and emit no trace effects. Prefer `io.print`/`io.println` for application code; reserve `_raw` for low-level tooling.
+
+**Argument types.** Each non-`_raw` operation takes any `Display` value, as `sb.write` and `"{x}"` do (§3.6 *Display Format Protocol*). So `io.println(42)`, `io.println(p)` and `io.println("n = {n}")` all compile, and a value with no `Display` impl is `error[E0523]` at the argument. The `_raw` operations take `Str` only. The split follows the `_raw` name, not the dispatch mode: `io.eprint` is not interceptable and still takes `Display`. A non-`Str` argument to a `_raw` operation is a type mismatch:
+
+```
+error[TypeError]: mismatched types
+ --> progress.bl:4:18
+  |
+4 |     io.print_raw(done)
+  |                  ^^^^ expected `Str`, found `Int`
+  |
+  = help: render it first: `io.print_raw("{done}")`
+```
+
+**Handler operations take `Str`.** The generic surface is a stdlib wrapper, not a generic effect operation. `io.println(x)` renders `x` via `x.display()`, then performs the handler operation with the result; `io.print` and `io.log` do the same. `io.eprint` and `io.eprintln` render the same way, then write the `Str` to stderr. The handler operations are:
+
+| Effect | Operation | Called by |
+|---|---|---|
+| `IO.Print` | `fn print(msg: Str)` | `io.println(x)`; the default handler writes `msg` and a newline |
+| `IO.Print` | `fn print_no_nl(msg: Str)` | `io.print(x)` |
+| `IO.Log` | `fn log(msg: Str)` | `io.log(x)` |
+
+The wrapper selects the operation; it does not add the newline to `msg`. A handler therefore sees the same `msg` for `io.println(42)` and `io.println("42")`: the text `42`, with no newline. (Implementation note: for a `Str` argument, `display()` returns the receiver, so the wrapper passes it on without a copy; §3.6.)
 
 **Handle naming is deterministic:**
 
