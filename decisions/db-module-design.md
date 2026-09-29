@@ -99,7 +99,7 @@ Method names don't need to mirror effect sub-names. Precedent: `Net.Connect` use
 
 | Method | Effect Required | Return Type |
 |--------|----------------|-------------|
-| `db.connect(path)` | `DB` | connection handler (scoped) |
+| `db.connect(path)` | `DB` | `Result[Connection, DBError]`; `Connection` is a scoped effect handler, used as `with db.connect(path)? { }` (see [scoped-effect-handler](scoped-effect-handler.md)) |
 | `db.query(sql)` | `DB.Read` | `Result[List[Row], DBError]` |
 | `db.query_one(sql)` | `DB.Read` | `Result[Option[Row], DBError]` |
 | `db.exec(sql)` | `DB.Write` | `Result[Void, DBError]` |
