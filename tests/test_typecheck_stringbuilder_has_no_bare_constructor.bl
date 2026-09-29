@@ -1,0 +1,81 @@
+// A StringBuilder is built with StringBuilder.new() or StringBuilder.with_capacity(n)
+// (sections/03_types.md: constructors use static method syntax on the type name). The type
+// name has no call form of its own, so a bare `StringBuilder()` or `StringBuilder(n)` is an
+// undefined function, reported with the repair and nothing else.
+import cg_test_helpers.{cg_probe_begin, cg_probe_errors_named}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_ice_count}
+import std.io
+
+// Checks `src` and answers the UndefinedFunction count. Any other error, or an internal
+// error, fails the row: the refusal must not cascade into the uses of the value.
+fn undefined_in(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    cg_probe_begin(path)
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut others = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.name != "UndefinedFunction" {
+            io.println("FAIL: {stem} recorded an error the row does not expect: {d.name}: {d.message}")
+            others = others + 1
+        }
+    }
+    assert_eq(others, 0)
+    assert_eq(diag_ice_count, 0)
+    cg_probe_errors_named("UndefinedFunction")
+}
+
+fn repair_names_both_constructors() -> Bool {
+    for d in diag_entries {
+        if d.severity == "error" && d.name == "UndefinedFunction" && d.message.contains("`StringBuilder`") {
+            return d.help.contains("StringBuilder.new()") && d.help.contains("StringBuilder.with_capacity(")
+        }
+    }
+    false
+}
+
+fn bare_empty_src() -> Str {
+    #"fn main() {
+    let mut sb = StringBuilder()
+    sb.write("hi")
+    io.println(sb.to_str())
+}
+"#
+}
+
+fn bare_capacity_src() -> Str {
+    #"fn main() {
+    let sb = StringBuilder(200)
+    io.println("{sb.capacity()}")
+}
+"#
+}
+
+fn static_ctors_src() -> Str {
+    #"fn main() {
+    let mut a = StringBuilder.new()
+    let b = StringBuilder.with_capacity(200)
+    a.write("hi")
+    io.println("{a.to_str()} {b.capacity()}")
+}
+"#
+}
+
+test "a bare StringBuilder() is an undefined function" {
+    assert_eq(undefined_in("typecheck_sb_bare_empty", bare_empty_src()), 1)
+    assert(repair_names_both_constructors())
+}
+
+test "a bare StringBuilder(n) is an undefined function" {
+    assert_eq(undefined_in("typecheck_sb_bare_capacity", bare_capacity_src()), 1)
+    assert(repair_names_both_constructors())
+}
+
+test "StringBuilder.new() and StringBuilder.with_capacity(n) still build one" {
+    assert_eq(undefined_in("typecheck_sb_static_ctors", static_ctors_src()), 0)
+}
