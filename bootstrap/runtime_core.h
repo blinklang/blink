@@ -1227,6 +1227,10 @@ static int      blink_kops_eq_bool (const void* a, const void* b) { return (*(co
 /* Char is U32 in Blink (codepoint). */
 static uint64_t blink_kops_hash_char(const void* k) { return blink_kops_mix_u64(blink_map_seed ^ (uint64_t)*(const uint32_t*)k); }
 static int      blink_kops_eq_char (const void* a, const void* b) { return *(const uint32_t*)a == *(const uint32_t*)b; }
+/* The unit type has one value, so its placeholder word is never read: every unit key
+   hashes alike and equals every other. */
+static uint64_t blink_kops_hash_unit(const void* k) { (void)k; return blink_kops_mix_u64(blink_map_seed); }
+static int      blink_kops_eq_unit (const void* a, const void* b) { (void)a; (void)b; return 1; }
 #endif
 
 /* Built-in kops tables — storage follows the same archive/extern pattern as
@@ -1253,6 +1257,7 @@ BLINK_KOPS_STORAGE const blink_kops blink_kops_i8;
 BLINK_KOPS_STORAGE const blink_kops blink_kops_u8;
 BLINK_KOPS_STORAGE const blink_kops blink_kops_bool;
 BLINK_KOPS_STORAGE const blink_kops blink_kops_char;
+BLINK_KOPS_STORAGE const blink_kops blink_kops_unit;
 #else
 BLINK_KOPS_STORAGE const blink_kops blink_kops_str  = { blink_kops_hash_str, blink_kops_eq_str, sizeof(void*), 0 };
 BLINK_KOPS_STORAGE const blink_kops blink_kops_i64  = { blink_kops_hash_i64, blink_kops_eq_i64, sizeof(int64_t), 1 };
@@ -1265,6 +1270,7 @@ BLINK_KOPS_STORAGE const blink_kops blink_kops_i8   = { blink_kops_hash_i8,  bli
 BLINK_KOPS_STORAGE const blink_kops blink_kops_u8   = { blink_kops_hash_u8,  blink_kops_eq_u8,  sizeof(uint8_t), 1 };
 BLINK_KOPS_STORAGE const blink_kops blink_kops_bool = { blink_kops_hash_bool,blink_kops_eq_bool,sizeof(uint8_t), 1 };
 BLINK_KOPS_STORAGE const blink_kops blink_kops_char = { blink_kops_hash_char,blink_kops_eq_char,sizeof(uint32_t), 1 };
+BLINK_KOPS_STORAGE const blink_kops blink_kops_unit = { blink_kops_hash_unit,blink_kops_eq_unit,sizeof(int64_t), 1 };
 #endif
 
 /* ── Hash set (kops vtable) ──────────────────────────────────────────── */

@@ -440,6 +440,7 @@ fn eq_false_block(span: Int) -> Int ! Diag.Report {
 }
 
 fn eq_guard(owner_tid: Int, ftid: Int, path: Str, span: Int) -> Int ! Diag.Report {
+    if member_is_unit(ftid) { return ir_block(span, []) }
     let differs = eq_differs(owner_tid, ftid, path, span)
     let answer = eq_false_block(span)
     if differs < 0 || answer < 0 { return -1 }
@@ -1457,11 +1458,8 @@ fn tuple_hash_body(tid: Int, span: Int) -> Int ! Diag.Report {
     let mut stmts = [ir_let(TYPE_U64, span, u64s, acc, u64_form(), init)]
     let mut i = 0
     while i < tc_tid_child_count(tid) {
-        let etid = tc_tid_child(tid, i)
         let path = c_tuple_member(i)
-        let value = field_value(tid, etid, path, "self", derive_hash, span)
-        if value < 0 { return -1 }
-        let folded = hash_fold(acc, etid, value, path, span)
+        let folded = hash_member(acc, tid, tc_tid_child(tid, i), path, path, span)
         if folded < 0 { return -1 }
         stmts.push(folded)
         i = i + 1
@@ -1533,17 +1531,27 @@ fn hash_struct_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
     let acc = c_mint_local("h")
     let mut stmts = [ir_let(TYPE_U64, span, u64s, acc, u64_form(), init)]
     for slot in tc_struct_field_slots(tid) {
-        let ftid = tc_member_tid_at_instance(tc_sfield_tid(slot), tid)
         let name = tc_sfield_name(slot)
-        let value = field_value(tid, ftid, c_field_name(name), "self", derive_hash, span)
-        if value < 0 { return -1 }
-        let folded = hash_fold(acc, ftid, value, name, span)
+        let folded = hash_member(acc, tid, tc_member_tid_at_instance(tc_sfield_tid(slot), tid), c_field_name(name), name, span)
         if folded < 0 { return -1 }
         stmts.push(folded)
     }
     stmts.push(ir_return(span, ir_var_ref(TYPE_U64, span, u64s, acc, u64_form())))
     ir_block(span, stmts)
 }
+
+// One member of a struct, tuple or variant folded into `acc`. `path` reads it off `self` and
+// `label` names it in a refusal. The unit type has one value, so a unit member is not read.
+fn hash_member(acc: Str, owner_tid: Int, ftid: Int, path: Str, label: Str, span: Int) -> Int ! Diag.Report {
+    if member_is_unit(ftid) { return ir_block(span, []) }
+    let value = field_value(owner_tid, ftid, path, "self", derive_hash, span)
+    if value < 0 { return -1 }
+    hash_fold(acc, ftid, value, label, span)
+}
+
+// A member of the unit type holds a placeholder word, not a value: every unit is equal to
+// every other, so Eq and Hash skip it.
+fn member_is_unit(ftid: Int) -> Bool { tc_tid_kind(tc_resolve(ftid)) == TyKind.Void }
 
 // One field's whole contribution as a statement: read it, mix it, put it back.
 fn hash_fold(acc: Str, ftid: Int, value: Int, path: Str, span: Int) -> Int ! Diag.Report {
@@ -1589,12 +1597,9 @@ fn hash_variant_block(decl: Int, tid: Int, slot: Int, acc: Str, span: Int) -> In
     let vname = tc_evar_name(slot)
     let mut stmts: List[Int] = []
     for f in tc_evar_field_slots(slot) {
-        let ftid = tc_member_tid_at_instance(tc_evfield_tid(f), tid)
         let fname = tc_evfield_name(f)
         let path = "{c_enum_payload_member()}.{vname}.{c_field_name(fname)}"
-        let value = field_value(tid, ftid, path, "self", derive_hash, span)
-        if value < 0 { return -1 }
-        let folded = hash_fold(acc, ftid, value, "{vname}.{fname}", span)
+        let folded = hash_member(acc, tid, tc_member_tid_at_instance(tc_evfield_tid(f), tid), path, "{vname}.{fname}", span)
         if folded < 0 { return -1 }
         stmts.push(folded)
     }
