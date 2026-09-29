@@ -1,0 +1,55 @@
+// A trait whose signature names an unknown type is reported once at the trait, and its
+// impls are spared a contract error measured against the salvaged signature. That record
+// belongs to one check. A long-lived process (the daemon, the LSP) checks many programs,
+// and a record left over from an earlier one silenced a real contract error in a later
+// program that declares a well-formed trait under the same name.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn contract_errors() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.name == "TraitContract" { n = n + 1 }
+    }
+    n
+}
+
+fn report_names() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        out = out.concat("[{d.severity}] {d.name}: {d.message}\n")
+    }
+    out
+}
+
+test "a parameter contract error is reported after an earlier check poisoned a same-named trait" {
+    typecheck_probe("build/trait_poison_param_a.bl", "trait Qpz \{ fn qpz(self, p: Zt) -> Int }\nfn main() \{ }\n")
+    let mut s = "trait Qpz \{ fn qpz(self, p: Int) -> Int }\n"
+    s = s.concat("type Qw \{ n: Int }\n")
+    s = s.concat("impl Qpz for Qw \{ fn qpz(self, p: Str) -> Int \{ 1 } }\n")
+    s = s.concat("fn main() \{ }\n")
+    typecheck_probe("build/trait_poison_param_b.bl", s)
+    assert(contract_errors() == 1, "want one TraitContract, got:\n{report_names()}")
+}
+
+test "a return contract error is reported after an earlier check poisoned a same-named trait" {
+    typecheck_probe("build/trait_poison_ret_a.bl", "trait Qpr \{ fn qpr(self) -> Zt }\nfn main() \{ }\n")
+    let mut s = "trait Qpr \{ fn qpr(self) -> Int }\n"
+    s = s.concat("type Qv \{ n: Int }\n")
+    s = s.concat("impl Qpr for Qv \{ fn qpr(self) -> Str \{ \"x\" } }\n")
+    s = s.concat("fn main() \{ }\n")
+    typecheck_probe("build/trait_poison_ret_b.bl", s)
+    assert(contract_errors() == 1, "want one TraitContract, got:\n{report_names()}")
+}
