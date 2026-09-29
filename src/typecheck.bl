@@ -3418,6 +3418,35 @@ pub fn tc_declared_field_tids(tid0: Int) -> List[Int] {
 // iterator, pointer or template context is opaque to a copy of the value, so the search
 // stops there. The
 // declaration is the identity, so `Tree[Int]` holding `Tree[List[Int]]` counts too.
+// Whether `Ptr` occurs anywhere in the type, through generic arguments and through the fields
+// of a struct or enum at any depth: the spec's "pointer-bearing" (§9.1.1, Scope tags). A
+// function type answers 0 — a closure carries a scope tag through what it captures, not
+// through its type.
+pub fn tc_tid_is_pointer_bearing(tid: Int) -> Int {
+    let mut seen: Map[Int, Int] = Map()
+    ptr_bearing_walk(tc_resolve(tid), seen)
+}
+
+fn ptr_bearing_walk(r: Int, seen: Map[Int, Int]) -> Int {
+    if r < 0 || r >= ty_pool.len() { return 0 }
+    if seen.contains_key(r) { return 0 }
+    seen.insert(r, 1)
+    let k = type_kind(r)
+    if k == TyKind.Ptr { return 1 }
+    if k == TyKind.Fn { return 0 }
+    if k == TyKind.Struct || k == TyKind.Enum {
+        for f in tc_declared_field_tids(r) {
+            if ptr_bearing_walk(tc_resolve(tc_member_tid_at_instance(f, r)), seen) != 0 { return 1 }
+        }
+    }
+    let mut i = 0
+    while i < tc_tid_child_count(r) {
+        if ptr_bearing_walk(tc_resolve(tc_tid_child(r, i)), seen) != 0 { return 1 }
+        i = i + 1
+    }
+    0
+}
+
 pub fn tc_tid_reaches_itself(tid: Int) -> Int {
     let mut open: List[Int] = []
     let mut done: Map[Int, Int] = Map()
@@ -11881,34 +11910,55 @@ fn nr_note_call_decl(call_node: Int, decl_node: Int) {
 // `let` is a C global, and the spelling alone does not say which one a read means: two
 // modules may each declare a private global under one name, so a later stage that searches
 // by the spelling finds both and picks by table order — reading the wrong module's value
-// with no diagnostic at all.
-let mut tc_global_decl: Map[Int, Int] = Map()
+// with no diagnostic at all. A top-level function named as a value is the same fact, kept in
+// the same record: the declaration's kind tells the two apart, and a reader of the global
+// answer takes the name for a C global, which a function is not.
+let mut tc_global_read_decl: Map[Int, Int] = Map()
 
 // The module-scope `let` this ident read resolved to, or -1 when the ident is not a read of
 // a global: a local, a parameter, a function name, a builtin.
 pub fn tc_global_decl_node(ident_node: Int) -> Int {
-    tc_global_decl.get(ident_node) ?? -1
+    let decl = tc_global_read_decl.get(ident_node) ?? -1
+    if decl < 0 || nk_of(node_kind(decl)) != NodeKind.LetBinding { return -1 }
+    decl
 }
 
 fn nr_note_global_decl(ident_node: Int, decl_node: Int) {
     if decl_node < 0 { return }
     if nk_of(node_kind(decl_node)) != NodeKind.LetBinding { return }
-    tc_global_decl.insert(ident_node, decl_node)
+    tc_global_read_decl.insert(ident_node, decl_node)
 }
-
-// A top-level function named as a value, not called. Kept apart from the global-let record
-// because a reader of that one takes the name for a C global, and a function is not one.
-let mut tc_fn_value_decl: Map[Int, Int] = Map()
 
 // The function declaration this ident read names as a value, or -1.
 pub fn tc_fn_value_decl_node(ident_node: Int) -> Int {
-    tc_fn_value_decl.get(ident_node) ?? -1
+    let decl = tc_global_read_decl.get(ident_node) ?? -1
+    if decl < 0 || nk_of(node_kind(decl)) != NodeKind.FnDef { return -1 }
+    decl
 }
 
 fn nr_note_fn_value_decl(ident_node: Int, decl_node: Int) {
     if decl_node < 0 { return }
     if nk_of(node_kind(decl_node)) != NodeKind.FnDef { return }
-    tc_fn_value_decl.insert(ident_node, decl_node)
+    tc_global_read_decl.insert(ident_node, decl_node)
+}
+
+// ── The local binder a read resolved to ─────────────────────────────
+//
+// The binder node, not the spelling, is a local's identity: two nested blocks may each bind
+// `s`, and a later pass that looks the name up again cannot tell which one a read meant.
+let mut tc_local_binder: Map[Int, Int] = Map()
+
+// The node that bound the local, parameter or pattern name this ident reads, or -1 when the
+// ident reads a global, a function, a builtin, or a binder that recorded no node.
+pub fn tc_ident_binder_node(ident_node: Int) -> Int {
+    tc_local_binder.get(ident_node) ?? -1
+}
+
+fn nr_note_local_binder(ident_node: Int, name: Str) {
+    if nr_top_binding_is_global(name) != 0 { return }
+    let binder = nr_binding_node(name)
+    if binder < 0 { return }
+    tc_local_binder.insert(ident_node, binder)
 }
 
 // A bare type name that two of a file's selective imports both answer for. A file that
@@ -13722,8 +13772,8 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     nr_module_decls = Map()
     nr_decls_by_name = Map()
     tc_call_decl = Map()
-    tc_global_decl = Map()
-    tc_fn_value_decl = Map()
+    tc_global_read_decl = Map()
+    tc_local_binder = Map()
     nr_push_scope()
 
     // Build private import set: imported non-pub fns, types, lets
@@ -14568,6 +14618,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     if nr_check_selective_access(assign_name, assign_target) != 0 { return }
                     nr_note_global_decl(assign_target, nr_resolve_bare_decl(assign_name, nr_current_module))
                 }
+                nr_note_local_binder(assign_target, assign_name)
                 tc_mark_symbol_used(assign_name)
             }
             nr_mark_written(assign_name, node)
@@ -14592,6 +14643,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if name == "true" || name == "false" || name == "None" { return }
         if nr_is_defined(name) != 0 {
             if nr_check_selective_access(name, node) != 0 { return }
+            nr_note_local_binder(node, name)
             if nr_top_binding_is_global(name) != 0 && is_private_access(name) != 0 {
                 tc_errors.push("cannot access private item `{name}`")
                 diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private item `{name}` from another module", node, "mark the item as `pub` in its module")
@@ -15355,7 +15407,7 @@ fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
 
     if kind == NodeKind.AsPattern {
         nr_check_pattern(node_pattern(node))
-        nr_define(node_name(node))
+        nr_define_typed(node_name(node), 0, TYPE_UNKNOWN, node)
         return
     }
 
