@@ -85,6 +85,8 @@ Two string types (`"plain"` vs `f"interpolated"`) create problems:
 
 With universal interpolation, `"Hello, {name}!"` just works. When no `{expr}` is present, the compiler treats it as a plain string literal — zero cost. Literal braces use `\{`, which is rare enough (JSON templates, regex) to be acceptable. The trade is a one-character escape in edge cases vs eliminating an entire class of bugs in the common case.
 
+Holes evaluate left to right, and each hole's value is appended before the next hole starts: `"{next()} {next()}"` calls the first `next()` first (§2.22).
+
 **Escape sequences.** Strings support the following backslash escapes:
 
 | Escape | Produces |
@@ -739,17 +741,17 @@ fn start_server(-- host: Str = "0.0.0.0", port: Port = 8080, debug: Bool = false
 start_server(port: 3000)
 
 // Keyword args are order-independent at call site
-transfer(300, to: bob, from: alice)  // valid, same as above
+transfer(300, to: bob, from: alice)  // valid, binds the same way; `bob` is evaluated before `alice`
 ```
 
 #### Rules
 
 - Params before `--` are **positional**: order matters, no labels at call site
-- Params after `--` are **keyword-required**: labels required, order-independent at call site
+- Params after `--` are **keyword-required**: labels required, order-independent at call site. Arguments evaluate in written order, not declaration order, and bind to their parameters after all of them are evaluated (§2.22)
 - Default values only allowed on keyword params (after `--`)
 - Default values must be const expressions (see [2.21](#221-const-declarations))
 - Labels are **call-site sugar** — the function type is `fn(Int, Account, Account)` regardless of `--`. Closures, trait impls, and higher-order functions are unaffected. See [3.3](#33-type-inference).
-- The formatter enforces declaration order at call sites for consistency
+- The formatter never reorders arguments, struct-literal fields or list elements. Their written order is their evaluation order (§2.22), so a reorder would change what the program does
 
 **Both rules are enforced by `blink check`.** A label written on a positional parameter is rejected, and a keyword parameter supplied without its label is rejected. Neither rule is a style preference, and neither is left to the formatter. The separator exists to make the swap in `transfer(300, bob, alice)` impossible; a rule the checker does not enforce makes nothing impossible, and a normative sentence the compiler does not hold up teaches a calling discipline that does not exist.
 
@@ -939,7 +941,7 @@ let interleaved = [..heads, separator, ..tails]
 - The spread source must be a `List[T]` with the same element type as the list being constructed. Type mismatches are compile errors.
 - **Multiple** `..source` spreads are allowed per literal (unlike struct copy-update which allows only one).
 - Spreads can appear at **any position** (unlike struct `..source` which must be last) — lists are ordered sequences with no key conflicts.
-- Spreads evaluate **left-to-right** and produce a new list (eager copy, not lazy view). `[..a, ..a]` copies `a` twice.
+- Spreads evaluate **left-to-right** and produce a new list (eager copy, not lazy view). `[..a, ..a]` copies `a` twice. Spreads and plain elements evaluate together in written order (§2.22).
 - Runtime cost: O(n) per spread source — same as any eager list construction.
 
 **Panel vote: 5-0** for including list spread in v1. The pattern/construction duality (`[first, ..]` deconstructs, `[..list, extra]` constructs) and absence of `.clone()` on lists made this essential. See [DECISIONS.md](../DECISIONS.md).
@@ -1130,6 +1132,8 @@ All operators either desugar to trait method calls or are language primitives.
 // -x     desugars to  Neg.neg(x)
 ```
 
+The left operand evaluates before the right one, and both before the trait method is called (§2.22).
+
 Operands must be the same type. Mixed-type arithmetic (`Int + Float`) is a compile error — use explicit conversion: `x.to_float() + y`. (Vote: 5-0)
 
 **Equality** — `==` and `!=` desugar to `Eq.eq` and `Eq.ne`. Any type can implement `Eq`. See §3.6.
@@ -1172,7 +1176,9 @@ count += 1       // desugars to: count = count + 1
 count *= 2       // desugars to: count = count * 2
 ```
 
-Only valid on `let mut` bindings. Desugaring is purely syntactic — `x += rhs` becomes `x = x + rhs` before type checking. (Vote: 5-0)
+Only valid on `let mut` bindings. For a bare variable, `x += rhs` means `x = x + rhs`: `x` is read before `rhs` runs. (Vote: 5-0)
+
+For any place, `place op= rhs` evaluates the place's sub-expressions once, left to right. Then it reads the place's current value, evaluates `rhs`, applies `op`, and stores the result to the same place. The rewrite to `place = place op rhs` binds the place's sub-expressions to fresh temporaries first, so `xs[next()] += 1` calls `next()` once. For a bare variable this is the same as `x = x op rhs`. See §2.22 *Assignment places*. (Vote: 6-0)
 
 #### String Concatenation
 
@@ -1969,3 +1975,96 @@ error[NonConstExpr]: expression is not a compile-time constant
 ```
 
 **Panel vote:** Const expression scope (literals + arithmetic) 5-0 unanimous. `const` keyword required 3-2 (PLT/DevOps/AI for `const`; Sys/Web for inferred `let`). Struct literals with const fields 3-1-1 (PLT/DevOps/AI for struct literals; Web for nested structs; Sys for scalars-only). Compiler-evaluated emit literals 5-0 unanimous. See [DECISIONS.md](../DECISIONS.md).
+
+### 2.22 Evaluation Order
+
+An expression evaluates its operand sub-expressions exactly once, one at a time, left to right in written order. A read of a variable is an evaluation at its written position. Each operand finishes, side effects and panics included, before the next starts. If one exits early through `?` or a panic, the operands after it are not evaluated, and the expression does not perform its operation. Otherwise the expression then performs its own operation.
+
+The forms whose semantics decide which sub-expressions run evaluate only the parts their sections select, and in the same relative order. The list is closed:
+
+- `&&` and `||` (§2.19): the right operand runs only as short-circuit selects it.
+- `??` (§3.5): the default runs only when the left side is `None`.
+- `if` (§2.9) and `match` (§3.5), arms and guards: the condition or scrutinee runs first; then only the selected arm, and the guards tried before it, in written order.
+- Loops, `while`, `loop` and `for` (§2.10, §2.11): the condition and the body run zero or more times. Each run follows this rule again.
+
+A closure literal is a value. Making it does not run its body; the body runs at each call, under this rule at that call. A block expression is an ordinary operand: in `f({ tick(1) }, tick(2))` the block runs first.
+
+An implementation may evaluate in another order only when no program can observe the difference. Observable means output, the value of any binding (including a `let mut` binding written through a closure, §2.8), which panic occurs, and whether evaluation terminates. An empty effect row is not enough to reorder: effect rows do not record writes to captured `let mut` bindings or overflow panics (§3).
+
+#### What each form evaluates
+
+These follow from the rule. They are not extra rules.
+
+- **Call:** the callee, when it is an expression, then the receiver of a method call, then the arguments as written. Keyword arguments run in written order, not declaration order, and bind to their parameters after all of them are evaluated. Omitted keyword arguments take const defaults (§2.21), so their placement cannot be observed.
+- **Operator:** left operand, then right operand, then the trait method. `x + y` is `Add.add(x, y)` (§2.19), so the call rule covers it.
+- **Literal:** list elements and spreads (§2.16), tuple elements, struct-literal fields and variant payloads, as written. Struct-literal fields run in written order, not declaration order.
+- **Interpolation:** holes left to right. Each hole's value is appended before the next hole starts. In a `Template[C]` context (§3c) the values list is built in the same order.
+- **`with` items:** left to right, as §4.7 *Disambiguation rules* states.
+- **Assignment `place = rhs`:** see *Assignment places* below.
+
+```blink
+fn f(-- a: Int, b: Int) -> Int { a + b }
+
+fn tick(n: Int) -> Int {
+    io.println("{n}")
+    n
+}
+
+fn main() {
+    let _ = f(b: tick(2), a: tick(1))   // prints 2, then 1: written order
+    let _ = tick(3) + tick(4)           // prints 3, then 4
+    io.println("{tick(5)} {tick(6)}")   // prints 5, 6, then "5 6"
+
+    let mut n = 0
+    let bump = fn() -> Int {
+        n = n + 1
+        n
+    }
+    io.println("{bump() + n * 100}")    // 101: n is read after bump() returns
+    io.println("{bump()} {bump()}")     // "2 3"
+}
+```
+
+#### Assignment places
+
+`place = rhs` evaluates the place, then `rhs`, then stores. Evaluating a place such as `xs[i]`, `m[k]` or `s.field` evaluates the index and key expressions along its path, in written order, to values. It does not read the binding at the root of the place, and it does not find or bounds-check any element. Those happen at the store, after `rhs`: the store reads the root binding, follows the path with the index and key values already computed, checks bounds at each step, and writes. So a write that `rhs` makes to the same binding, through a closure, is not lost. In a nested place such as `a[i()].f[j()] = v`, `i()` runs, then `j()`, then `v`, then the store.
+
+```blink
+fn fill() -> Int {
+    io.println("fill")
+    7
+}
+
+fn main() {
+    let mut xs = [1, 2, 3]
+    xs[10] = fill()   // prints "fill", then panics: the bounds check runs at the store
+}
+```
+
+Compound assignment `place op= rhs` evaluates the place's sub-expressions once. Then it reads the place's current value, evaluates `rhs`, applies `op`, and stores the result to the same place (§2.19).
+
+```blink
+fn main() {
+    let mut i = 0
+    let next = fn() -> Int {
+        i = i + 1
+        i
+    }
+    let mut xs = [0, 0, 0]
+    xs[next()] += 10      // next() runs once: xs == [0, 10, 0]
+
+    let mut n = 1
+    let bump = fn() -> Int {
+        n = n + 10
+        0
+    }
+    n += bump()
+    io.println("{n}")     // 1: n is read (1) before bump() runs, then 1 + 0 is stored
+}
+```
+
+The formatter never reorders arguments, struct-literal fields or list elements, because their written order is their evaluation order (§2.13).
+
+**Why not "unspecified".** C leaves argument order unspecified, and the C compilers Blink targets differ. An unspecified order would give one Blink program different output under gcc, clang and zig cc. No diagnostic can find the order-sensitive cases, because effect rows do not record writes to captured `let mut` bindings or overflow panics. That is under-determined behaviour with no error, which Blink rejects (§3.4, `E0301`).
+
+**Panel vote: 6-0** on each point: written order everywhere, the closed list, compound assignment, the formatter rule, and assignment places. See [decisions/argument-evaluation-order.md](../decisions/argument-evaluation-order.md).
