@@ -1,6 +1,6 @@
 [< All Decisions](../DECISIONS.md)
 
-# Parking Removal + Opaque Xfail Ticket — Design Rationale
+# Parking Removal + Xfail Ticket Removal — Design Rationale
 
 Revisits §8.10.5 (parking fixtures that cannot build) and the tracker coupling in §8.10.6 (`test.failing` `ticket:` and the closed-ticket lint) from [Expected-Failure Tests + Parking](xfail-and-parking.md). That decision's Q2 (ship xfail) and Q3 (boolean `expected_fail` encoding) stay decided and were not reopened.
 
@@ -672,7 +672,7 @@ STABLE, READY TO VOTE
 - **Q5: Wire encoding of a ticket** — V2b (separate `xfail_ticket` field), 6-0
 - **Q6: Closed-ticket lint** — OUT of the spec, 6-0
 
-Phase D did not run: no result was closer than 5-1.
+Phase D did not run: no result was closer than 5-1. The user (BDFL) later overruled Q4 and Q5; see **User override** below.
 
 ##### Systems ballot
 
@@ -866,6 +866,12 @@ Phase D did not run: no result was closer than 5-1.
 2. **Reasoning:** A spec-level lint needs a tracker protocol, and the spec cannot name one. The implementation already keeps the lint out of `task ci` because `br` is local-only. Taking it out of the spec makes the spec describe what ships, and strict unexpected-pass plus mandatory `reason:` stay as rot guards that need no tracker.
 3. **Concern:** Once the lint leaves the spec the repo may stop running `task xfail-tickets` at all, so stale rows that point at closed tickets could pile up unnoticed unless the repo gates on it somewhere.
 
+### User override (BDFL)
+
+After the vote the user overruled Q4 and Q5 and removed `ticket:` from the language. The user's words: "an official thing in a language to track a ticket? for a tool, that only I use, that only exists locally?" and "Overruled. This is dumb."
+
+The panel had debated only the shape of `ticket:` (mandatory, optional, or its own wire field), not whether the argument should exist. The one proposal to remove it (Minimalism's T1) was withdrawn in Phase B over migration cost. No consumer needs the value, and the only tool that read it is local to one project. A reference to tracked work fits in `reason:`.
+
 ### Final Spec
 
 ```blink
@@ -875,20 +881,12 @@ test.failing(
 ) {
   // ... test body, expected to fail today
 }
-
-test.failing(
-  "trait impl resolves through alias chain",
-  reason: "Phase 3 trait elaboration not yet implemented",
-  ticket: "https://example.com/issues/412",
-) {
-  // ... test body, expected to fail today
-}
 ```
 
 - §8.10.5 parking is removed: no `--parked` flag, no `parked_file` event, no `.tmp/<ticket>/` store, no `.tmp/` lint.
 - A test file that does not build is not a test. `blink test` reports it as a build failure for that file and runs the other files. Its NDJSON shape is left to a separate ticket.
 - One informative note: test rejected source through a compile step the project supplies; the standard library supplies none.
-- `reason:` stays mandatory and non-empty. `ticket:` is optional; if given it must be non-empty (E0835). Its value is opaque; no runner or lint behavior depends on it.
-- NDJSON: `xfail_reason` holds the reason only (no `br:` prefix). New optional `xfail_ticket: Str`, present if and only if `ticket:` is given, never `""` or `null`, JSON-escaped like `xfail_reason`.
-- The closed-ticket lint is not spec. Projects may check tickets in their own tooling.
+- `test.failing(name, reason: Str)` is the only form. `reason:` is mandatory and non-empty (E0835). There is no `ticket:` argument (user override of Q4/Q5).
+- NDJSON: `xfail_reason` holds the reason only (no `br:` prefix). There is no `xfail_ticket` field.
+- The closed-ticket lint is not spec.
 - Status and cause enums stay closed. Strict unexpected-pass stays.
