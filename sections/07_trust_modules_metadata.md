@@ -258,7 +258,9 @@ All pointer operations are methods on `Ptr[T]` and compiler-known functions in t
 2. the body of an `@trusted` function;
 3. a `with ffi.scope() as _ { }` block (§9.1.1, *`ffi.scope`* — the block that owns the pointer's lifetime).
 
-The region is a **purely syntactic**, per-function structural property, decided without type resolution. A closure literal written inside a region **inherits** it — the pointer operations stay legal in the closure body. A **named** nested `fn` item does **not** inherit the enclosing region: it is its own function and needs its own `@ffi`/`@trusted` annotation or its own `ffi.scope` block. A pointer that *escapes* its region dynamically — stored past it, returned, or captured by an escaping closure — is not E0811's concern; that is the scope-escape diagnostic E0601 (§9.1.1).
+The region is a **purely syntactic**, per-function structural property, decided without type resolution. A closure literal written inside a region **inherits** it — the pointer operations stay legal in the closure body. A **named** nested `fn` item does **not** inherit the enclosing region: it is its own function and needs its own `@ffi`/`@trusted` annotation or its own `ffi.scope` block. A pointer that *escapes* its region dynamically — returned, stored past it, captured by an escaping closure, passed to an effect handler, or passed beside a pointer-holding argument — is not E0811's concern; that is the scope-escape diagnostic E0601 (§9.1.1, *Scope tags*).
+
+An `@ffi.struct` type with a `Ptr` field, directly or through a nested `@ffi.struct` field, is subject to E0811 exactly as `Ptr[T]` is (§9.1.3).
 
 This is the **canonical** `Ptr[T]` operations table. §9.1.3 extends it with `@ffi.struct` field projection (`p.field.read()` / `p.field.write(v)`) and array regions (`scope.alloc_n`); no other section redefines these operations.
 
@@ -355,7 +357,7 @@ with ffi.scope() as scope {
 **Scope rules:**
 - All allocations made through a scope are freed when the `with` block exits (normal return, `?` early return, or any other exit path).
 - `scope.take(ptr)` removes a pointer from the scope's cleanup list. The caller assumes responsibility for the pointer's lifetime — typically by wrapping it in a safe Blink type whose `Closeable.close()` calls the appropriate C cleanup function.
-- Scope-allocated pointers that escape the scope without `.take()` trigger a compile error (reusing E0601 from `Closeable` diagnostics).
+- Scope-allocated pointers that escape the scope without `.take()` trigger a compile error (reusing E0601 from `Closeable` diagnostics). The compiler finds these by inferring a scope tag for each pointer; see *Scope tags*, below.
 
 **The `FfiScope` type.** `ffi.scope()` returns a value of type `FfiScope`. `FfiScope` is **scope-bound**: a value of this type may occur only as the resource of a `with ... as` block, **and nowhere else**. It may not be bound by a `let`, passed as an argument, returned, stored in a field, or written as a type argument.
 
@@ -432,6 +434,81 @@ let hostname = buf.to_str() ?? "unknown"
 
 **Guidance:** Use `ffi.scope()` when the C library requires deterministic cleanup (databases, file handles, allocated buffers). Use standalone `alloc_ptr` only for trivial, short-lived allocations where GC collection is acceptable.
 
+#### Scope tags
+
+Decided by panel deliberation [`ffi-scope-tag-inference`](../decisions/ffi-scope-tag-inference.md).
+
+The compiler gives each value that can carry a pointer a **scope tag**: the `ffi.scope` block whose exit frees the memory, or **unscoped** when no block frees it. The compiler infers every tag. Blink has no syntax to write a tag — not in a type, not in a signature, not anywhere. This is the same rule as for arena-local parameters (§5.2.1): no region-variable annotations are required or accepted.
+
+**Notation.** In this spec, `Ptr[T]^σ` and `Buf[T]^σ` are meta-notation for "a `Ptr[T]` (or `Buf[T]`) whose scope tag is σ". They are not source syntax: in source, `^` is only bitwise XOR. Hover and diagnostics print a tag as `(scope: outer)`, never as `^σ`.
+
+**Pointer-bearing types.** A type is *pointer-bearing* when `Ptr` or `Buf` occurs anywhere in it, including through the fields of an `@ffi.struct` at any depth (`Ptr[U8]`, `Option[Ptr[T]]`, `List[Ptr[T]]`, an `@ffi.struct` with a `Ptr` field). Only values of pointer-bearing types, and closures that capture them, carry a tag.
+
+**Tag identity.** A tag is the binder of one `with ffi.scope() as s` block — the syntax node, not its name. Two nested blocks that both bind `s` give two different tags. When two live binders have the same name, diagnostics and hover print the name with its line: `s (line 4)`.
+
+**Order.** An `FfiScope` cannot be let-bound, passed, returned or stored (*The `FfiScope` type*, above), so scope blocks nest lexically and the live tags at any point form one chain. Tag `a` **encloses** tag `b` when block `a` is block `b` or contains it, so `a` is freed at the same time as `b` or later. Unscoped encloses every tag. Any set of live tags therefore has exactly one innermost member.
+
+**Inference rules.** Each rule reads only the expression and the declared types of its callee. No rule reads the body of another function.
+
+| Expression | Tag of the result |
+|---|---|
+| `s.alloc[T]()`, `s.alloc_n[T](n)`, `s.cstr(str)` | `s` |
+| `libc.copy_to_buf(b)` | the innermost `ffi.scope` block around the call |
+| `s.take(p)` | unscoped |
+| `alloc_ptr[T]()`, `null_ptr[T]()` | unscoped |
+| `p.offset(i)`; `p.deref()` or `p.field.read()` that gives a pointer-bearing value | the tag of `p` |
+| A struct literal, tuple, `Some(v)`, `Ok(v)` or `Err(v)` | the innermost tag of its parts; unscoped if none has a tag |
+| A closure literal | the innermost tag of the values it captures; unscoped if none has a tag |
+| A pointer-bearing parameter of a closure literal (e.g. the `p` in `bs.with_ptr(fn(p) { ... })`) | a fresh tag whose block is the closure body: it encloses every scope block the body opens, and every tag live around the literal encloses it |
+| Any other call whose result type is pointer-bearing | the innermost tag of its pointer-bearing arguments (a method receiver is an argument); unscoped if there are none |
+
+A **cell** is a place that holds a value after the expression that puts it there ends. The cell's tag decides what it may hold:
+
+- the pointee of a `Ptr` (including a field reached through `p.field`): the tag of the `Ptr`;
+- a `let mut` binding: the innermost `ffi.scope` block around its declaration, or unscoped;
+- a `List`, `Map` or `Set` value: the innermost `ffi.scope` block around the expression that creates it, or unscoped;
+- an effect handler: the innermost `ffi.scope` block around the `with` that installs it, or unscoped.
+
+**`E0601 (value-escape)`.** A value with tag `s` that leaves block `s` as its result — by `return`, by `?`, or as the block's tail expression — is an error. `s.take(p)` is the way out: its result is unscoped.
+
+**`E0601 (tag-mismatch)`.** A value with tag `v` stored into a cell with tag `c` is an error unless `v` encloses `c`. There are exactly four ways to store a value into a cell:
+
+1. **Write.** `c.write(v)`, `c.field.write(v)`, or assignment `x = v` to a `let mut` binding.
+2. **Capture.** A closure that captures a value with tag `s` follows the escape rules of a closure that captures a `Closeable` bound by block `s` (§2, *Closures and Scoped Resources*; §5.5): it may not be returned from block `s` or stored in a cell that `s` does not enclose.
+3. **Effect argument.** Passing a tagged value as an argument to an effect operation stores it into the handler that receives it. A handler installed inside block `s` may receive a value with tag `s`; a handler installed outside `s` may not.
+4. **Call beside a pointer-holding argument.** At a call, a tagged value passed next to an argument whose declared parameter type is *pointer-holding* counts as stored into that argument. A parameter type is pointer-holding when a callee can store a pointer through it that the caller can reach after the call: `Ptr[P]` for a pointer-bearing `P` (`Ptr[Ptr[T]]`, or `Ptr[S]` for an `@ffi.struct S` with a `Ptr` field at any depth), or a `List`, `Map` or `Set` whose element type is pointer-bearing. `Ptr[U8]`, `Ptr[Void]` and `Ptr[S]` for a struct with no `Ptr` field are not pointer-holding. So `memcpy(dst, src)` with `dst` and `src` from different scopes is legal, and `c_writev(fd, iov, 2)` (one pointer argument) never pairs anything.
+
+This list is **closed and exhaustive**. A language change that adds a new way to store a value must add a row to it.
+
+**Pointer parameters inside `@trusted` bodies.** In the body of an `@trusted` function, every pointer-bearing parameter has one shared tag: the caller's. That tag encloses every scope block the body opens. A store from one parameter into another therefore passes the check inside the body. This is sound because rule 4 already rejected, at every call site, each call that pairs a younger pointer with an older pointer-holding argument. `blink audit` lists each such parameter-into-parameter store as `ptr-store-param`.
+
+```blink
+@ffi.struct(header = "sys/uio.h", name = "iovec")
+pub type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+
+@trusted(audit: "NET-012")
+fn set_iov(iov: Ptr[IoVec], buf: Ptr[U8], len: U64) {
+    iov.iov_base.write(buf)   // OK here: `iov` and `buf` share the caller's tag
+    iov.iov_len.write(len)
+}
+
+fn send_two(fd: Int) ! IO {
+    with ffi.scope() as outer {
+        let iov = outer.alloc_n[IoVec](2)
+        with ffi.scope() as inner {
+            let buf = inner.alloc_n[U8](64)
+            set_iov(iov, buf, 64)   // error[E0601] tag-mismatch: rule 4
+        }
+        c_writev(fd, iov, 2)        // would read `buf` after `inner` freed it
+    }
+}
+```
+
+**C-side retention is out of scope.** Tag checks see only stores the Blink program makes. A C function that keeps a pointer after it returns (`aio_write`, `io_uring` submission, `setvbuf`) or stores through a `Ptr[Void]` is part of the audited trust base, the same as an `@trusted` body. Passing the tag checks does not prove the absence of a use-after-free inside C. `blink audit` lists every `@ffi` function that takes a pointer-bearing argument, so a reviewer can find these.
+
 #### Diagnostic Integration
 
 Pointer types integrate with Blink's existing diagnostic infrastructure:
@@ -473,7 +550,25 @@ error[E0825]: cannot deref `Ptr[Void]` — the pointee type is unknown
           `.is_null()`, but there is no value behind it to read or write
   = help: if you know the pointee type, declare it — `Ptr[Int]`, `Ptr[U8]`, …
   = help: for a C struct, use `@ffi.struct` and read fields with `p.field.read()`
+
+error[E0601]: pointer from a shorter-lived scope passed beside a pointer container (tag-mismatch)
+  --> src/net.bl:9:9
+   |
+ 9 |         set_iov(iov, buf, 64)
+   |                 ---  ^^^ `buf` belongs to scope `inner` (line 7)
+   |                 |
+   |                 `iov` belongs to scope `outer` (line 4)
+   = note: parameter `iov: Ptr[IoVec]` can hold pointers (`IoVec.iov_base: Ptr[U8]`),
+           so `set_iov` may store `buf` in it
+   = help: allocate `buf` from `outer`
 ```
+
+**E0601 message conditions** (normative, per §3.1 *Diagnostic Discipline*):
+- Each tag prints as the author's own scope binder. When two live binders have the same name, it prints with its line: `s (line 4)`.
+- A tag-mismatch error names the store form (write, capture, effect argument, or call). For a call, it names the pointer-holding parameter and, for an `@ffi.struct` pointee, the `Ptr` field that makes it pointer-holding.
+- When a tag came from the call rule, the error names the argument that set it.
+- The repair ("allocate from `outer`") is not machine-applicable: the allocation site may be far from the store.
+- `blink explain E0601` gives one example per store form and states the C-side retention limit.
 
 `blink audit` includes pointer allocations alongside FFI call sites and `Raw()` query sites:
 
@@ -613,7 +708,9 @@ pub type Pollfd {
 }
 ```
 
-`@ffi.struct(header, name)` declares that a Blink type mirrors a named C struct from a specific C header. The header is resolved against the project's `[native-dependencies].headers` list. Fields are listed in declaration order and must use sized FFI-compatible types: `I8`/`I16`/`I32`/`Int`, `U8`/`U16`/`U32`/`U64`, `F32`/`Float`, `Bool`, or another `@ffi.struct` type. List, Str, Bytes, Map, Result, Option, and trait types are rejected with `E0812` (extending the existing GC-types-cannot-cross-FFI rule from `E0810` for `Ptr[T]`).
+`@ffi.struct(header, name)` declares that a Blink type mirrors a named C struct from a specific C header. The header is resolved against the project's `[native-dependencies].headers` list. Fields are listed in declaration order and must use sized FFI-compatible types: `I8`/`I16`/`I32`/`Int`, `U8`/`U16`/`U32`/`U64`, `F32`/`Float`, `Bool`, `Ptr[T]`, or another `@ffi.struct` type. List, Str, Bytes, Map, Result, Option, and trait types are rejected with `E0812` (extending the existing GC-types-cannot-cross-FFI rule from `E0810` for `Ptr[T]`). A `Buf[T]` field is rejected with `E0822`: a `Buf` value is a `blink_buf_t*`, not the C pointer the field declares, and the size `_Static_assert` cannot catch the difference. Use `Ptr[T]`.
+
+**Pointer-bearing structs and E0811.** An `@ffi.struct` with a `Ptr` field, directly or through a nested `@ffi.struct` field at any depth, is subject to E0811 exactly as `Ptr[T]` is: a value of it may appear only in an FFI region (§9.1.1). The E0811 error names the field, e.g. "`IoVec` holds `Ptr` in field `iov_base` (line 3), so it may appear only in an FFI region". A pointer stored into such a field is subject to the scope-tag store rules (§9.1.1, *Scope tags*).
 
 #### Field access on `Ptr[@ffi.struct T]`
 
@@ -724,9 +821,9 @@ Two reasons. First, `Bytes.data` is `GC_MALLOC`/`GC_REALLOC`-managed (see `boots
 
 Resolves the v1 ambiguity in §9.1.3 about what `Buf` actually *is*. Decided by panel deliberation [`buf-u8-runtime-representation`](../decisions/buf-u8-runtime-representation.md).
 
-**One generic type.** `Buf[T]^σ` is a single generic nominal type, σ-tagged to the enclosing `ffi.scope` (same region calculus as §9.1.3's `Ptr[T]^σ`). The typechecker accepts any `T` at declaration sites inside `@ffi.fn` and `@ffi.struct`. There is no separate `Buf[U8]` sibling type.
+**One generic type.** `Buf[T]` is a single generic nominal type, tagged to the enclosing `ffi.scope` by the same inferred scope tags as `Ptr[T]` (§9.1.1, *Scope tags*; `Buf[T]^σ` is meta-notation for that tag, not source syntax). The typechecker accepts any `T` at declaration sites in `@ffi.fn` signatures. There is no separate `Buf[U8]` sibling type.
 
-**Bridge alphabet.** A spec-encoded, closed set of element types — `{U8}` in v1 — is permitted to flow through the byte-bridge primitives (`copy_to_buf`, `copy_from_buf`, `copy_from_buf_n`). Formally, `BridgeAlpha(λ)` is a function from the language version `λ` to a finite, spec-enumerated set of element types, with `BridgeAlpha(v1) = {U8}`. Membership is consulted **only** to decide whether `W0816` fires; it is *not* an instantiation gate — `Buf[T]` type-checks for every `T` (any element type may back a `scope.alloc_n[T]` region, §9.1.3), and the alphabet narrows nothing about the type, it governs only which `T` cross the byte-bridge primitives without a diagnostic.
+**Bridge alphabet.** A spec-encoded, closed set of element types — `{U8}` in v1 — is permitted to flow through the byte-bridge primitives (`copy_to_buf`, `copy_from_buf`, `copy_from_buf_n`). Formally, `BridgeAlpha(λ)` is a function from the language version `λ` to a finite, spec-enumerated set of element types, with `BridgeAlpha(v1) = {U8}`. Membership is consulted **only** to decide whether `W0816` fires; it is *not* an instantiation gate — `Buf[T]` type-checks for every `T`, and the alphabet narrows nothing about the type, it governs only which `T` cross the byte-bridge primitives without a diagnostic.
 
 Here "**language version**" denotes the compiler/spec revision reported by `blink --version` (the `blink 0.3.0` field of `blink 0.3.0 (stdlib 0.3.0)`), **not** the per-package `edition` (§8.16.1) and **not** package semver. The bridge alphabet is governed by three guarantees:
 
@@ -734,13 +831,13 @@ Here "**language version**" denotes the compiler/spec revision reported by `blin
 - **G2 — Expansion = deliberation + version bump.** Adding an element type to the bridge alphabet is a language-version change: it requires panel deliberation recorded in `DECISIONS.md` and ships only in a new compiler release that carries a language-version bump. Membership is monotonically non-shrinking across versions — once `T ∈ BridgeAlpha(λ)`, `T ∈ BridgeAlpha(λ')` for every later `λ' ≥ λ` — so every expansion is a conservative extension: an `@ffi` declaration that previously drew `W0816` only ever *loses* the warning on upgrade, never the reverse. Introducing any bridge-membership declaration form is itself such a change, never an incremental addition.
 - **G3 — No third-party or link-time extension.** No third-party crate, stdlib helper, `@ffi` declaration, build script, edition, or linked object may add an element type to the alphabet. The set is closed **by construction**: Blink provides no surface syntax — no attribute, trait, keyword, manifest key, or registration API — by which membership could be declared. You cannot extend what has no extension point; this is a stronger guarantee than a rejection rule, and no diagnostic is reserved for an extension attempt (there is no construct to reject).
 
-**Sealed user surface.** `Buf[T]^σ` has no public methods. Specifically:
+**Sealed user surface.** `Buf[T]` has no public methods. Specifically:
 
 - No `.len()` (length lives in the runtime struct and is read by bridge primitives only).
 - No `.as_ptr()`, `.read(i)`, `.write(i, v)`.
-- No public constructors. The only ways to obtain a `Buf[T]^σ` are `libc.copy_to_buf(b)` (returning `Buf[U8]^σ`) and `scope.alloc_n[T](n)` (returning `Buf[T]^σ`, §9.1.3).
+- No public constructors. The only way to obtain a `Buf` is `libc.copy_to_buf(b)`, which returns a `Buf[U8]` tagged to the innermost enclosing `ffi.scope`. `scope.alloc_n[T](n)` returns a `Ptr[T]`, not a `Buf` (§9.1.3; see [`ffi-scope-tag-inference`](../decisions/ffi-scope-tag-inference.md), which amends this section's original decision).
 
-**Runtime representation.** A `Buf[T]^σ` value is a pointer to a heap-allocated struct of the shape:
+**Runtime representation.** A `Buf[T]` value is a pointer to a heap-allocated struct of the shape:
 
 ```c
 typedef struct {
@@ -757,16 +854,16 @@ The struct and its `data` payload are `malloc`'d (not GC-managed), registered wi
 | Context | Naming `Buf[T]` |
 |---|---|
 | `@ffi.fn` parameter and return types | **Legal** |
-| `@ffi.struct` field types | **Legal** |
+| `@ffi.struct` field types | **Error `E0822`** (use `Ptr[T]`; §9.1.3) |
 | Inferred `let` binding (`let b = libc.copy_to_buf(bs)`) | **Legal** (the type is computed by the typechecker, never written) |
 | Annotated `let` / `var` binding (`let b: Buf[U8] = ...`) | **Error `E0822`** |
 | Function parameter or return type in user Blink code | **Error `E0822`** |
 | Struct field type in user Blink code | **Error `E0822`** |
 | Generic parameter bound | **Error `E0822`** |
 
-`E0822` fires only on user-authored references to the name `Buf` outside the `@ffi.fn` / `@ffi.struct` surface. Help text directs the user to `libc.recv_bytes` / `libc.read_bytes` / `libc.getentropy_bytes` (for byte-payload syscalls) or `scope.alloc_n[T]` (for typed regions).
+`E0822` fires on user-authored references to the name `Buf` outside `@ffi.fn` signatures. Help text directs the user to `libc.recv_bytes` / `libc.read_bytes` / `libc.getentropy_bytes` (for byte-payload syscalls) or `scope.alloc_n[T]` (for typed regions).
 
-**Source-deterministic warning `W0816`.** When a `Buf[T]` appears in an `@ffi.fn` signature or `@ffi.struct` field for a `T` outside the bridge alphabet, the compiler emits:
+**Source-deterministic warning `W0816`.** When a `Buf[T]` appears in an `@ffi.fn` signature for a `T` outside the bridge alphabet, the compiler emits:
 
 ```
 W0816: Buf[i32] declared in @ffi.fn signature; only Buf[U8] crosses the
@@ -839,17 +936,17 @@ The law governs only the *shape* of a wrapper; it is not a license to auto-add w
 **Audit category.** `blink audit` reports a `bytes-bridge` category with three subcategories:
 
 - `bridge-call` — call sites of `copy_to_buf` / `copy_from_buf` / `copy_from_buf_n` (the sealed-`Buf` path).
-- `buf-mention` — any source mention of `Buf` (legally, inside `@ffi.fn` / `@ffi.struct`).
+- `buf-mention` — any source mention of `Buf` (legally, inside `@ffi.fn` signatures).
 - `byte-pin` — `Bytes.with_ptr` call sites (the `libc.*_bytes` family's crossings, both read-side and write-side pins).
 
 A single `blink audit bytes-bridge` query therefore returns *every* raw-byte crossing in a module — sealed-`Buf` copies and `with_ptr` pins alike — with no direction asymmetry. CI may use `blink build --no-unaudited-bridges` to require every `bytes-bridge` subcategory entry outside `lib/std/` to be approved by `blink audit approve`.
 
 A curated `*_bytes` wrapper **must keep its `@ffi` syscall call inline inside the `with_ptr` closure body** — the closure-lexical no-grow / no-escape check (§9.1.3.1) is syntactic and does not descend into helper functions, so factoring the call out would defeat the `E0814`/`E0815`/`E0817` pin guarantees.
 
-**Doc / LSP.** `blink doc` and the LSP hover for `Buf[T]^σ` render a fixed banner:
+**Doc / LSP.** `blink doc` and the LSP hover for `Buf[T]` render a fixed banner, followed by the value's tag as `(scope: name)` when hovering a value:
 
-> **Opaque, σ-tagged, bridge-only.** Bridge alphabet (v1): `{U8}`.
-> `Buf[T]^σ` is a region-tied buffer used by FFI bridge primitives.
+> **Opaque, scope-tied, bridge-only.** Bridge alphabet (v1): `{U8}`.
+> `Buf[T]` is a buffer freed with its `ffi.scope`, used by FFI bridge primitives.
 > User code should prefer `libc.*_bytes` helpers; for typed regions, use `scope.alloc_n[T]`.
 > See `blink doc bytes-bridge`.
 
@@ -927,14 +1024,14 @@ For C surfaces β cannot reach (varargs, signal handlers, glibc-version-conditio
 | `E0814` | error | growth-effecting call on `Bytes` inside its `with_ptr` closure body |
 | `E0815` | error | pinned `Bytes` passed as argument inside `with_ptr` closure body |
 | `E0817` | error | `Bytes` ↔ `Ptr[U8]` cast or `as_ptr` use in user code (use `with_ptr`, `libc.copy_to_buf`, or `libc.copy_from_buf`) |
-| `E0822` | error | `Buf` named in user Blink-typed code outside `@ffi.fn` / `@ffi.struct` declarations (§9.1.3.2) |
+| `E0822` | error | `Buf` named in user Blink-typed code outside `@ffi.fn` signatures, including as an `@ffi.struct` field type (§9.1.3, §9.1.3.2) |
 | `W0812` | warning | `@ffi.struct` declared without canonical header in `[native-dependencies].headers`; escalated to error under `--strict-struct-layout` (default-on for `@ffi` modules) |
-| `W0816` | warning | `Buf[T]` declared in `@ffi.fn` / `@ffi.struct` for `T` outside the v1 bridge alphabet `{U8}`; redirects to `scope.alloc_n[T]` (§9.1.3.2). Per-decl suppressible with `@allow(W0816)`. |
+| `W0816` | warning | `Buf[T]` declared in an `@ffi.fn` signature for `T` outside the v1 bridge alphabet `{U8}`; redirects to `scope.alloc_n[T]` (§9.1.3.2). Per-decl suppressible with `@allow(W0816)`. |
 
-`E0601` (existing) gains two sub-kinds for the σ-tag/scope-escape interactions raised by `Ptr` aliasing across `ffi.scope` boundaries:
+`E0601` (existing) gains two sub-kinds for the scope-tag interactions raised by `Ptr` aliasing across `ffi.scope` boundaries. Both are defined by the inferred scope tags of §9.1.1, *Scope tags*:
 
 - `E0601 (value-escape)`: a `Ptr[T]` value escapes its allocating `ffi.scope`.
-- `E0601 (tag-mismatch)`: two `Ptr[T]` values from distinct `ffi.scope` blocks combined where the typing rule requires the same scope tag.
+- `E0601 (tag-mismatch)`: a scope-tagged Ptr/Buf stored, by write, capture, effect argument, or a call beside a pointer-holding argument, into a cell whose scope it does not enclose. (A value of any pointer-bearing type counts as a Ptr here.)
 
 Diagnostic codes `W0811` (init-flow analysis), `W0813` (zero-len Buf), and `E0818` (endian-tag tracking) considered during deliberation are **not** shipped — see decision rationale.
 
