@@ -42,15 +42,13 @@ those calls errors rather than silent nonsense.
 
 ## One arm is not one arity
 
-Three arms cover methods whose counts differ, so the unit of the table is the
+Two arms cover methods whose counts differ, so the unit of the table is the
 method name and never the arm:
 
 | arm | methods | args |
 |---|---|---|
 | `Int`: `abs \|\| min \|\| max` | `abs` | 0 |
 | | `min`, `max` | 1 |
-| sized int: `wrapping_add \|\| ... \|\| wrapping_neg` | `wrapping_add`, `wrapping_sub`, `wrapping_mul`, `wrapping_div`, `wrapping_rem` | 1 |
-| | `wrapping_neg` | 0 |
 | scalar: `display` / `fmt` | `display` | 0 |
 | | `fmt` | 1 |
 
@@ -101,12 +99,12 @@ method name and never the arm:
 | method | args | reads |
 |---|---|---|
 | `Int.min`, `Int.max` | 1 | none |
-| sized `wrapping_add`, `wrapping_sub`, `wrapping_mul`, `wrapping_div`, `wrapping_rem` | 1 | none |
+| sized `wrapping_add`, `wrapping_sub`, `wrapping_mul` | 1 | none |
 | `Int.to_str`, `Int.to_string`, `Int.to_float`, `Int.abs`, `Int.to_i8` … `Int.to_u64` | 0 | none |
 | `Float.ieee_eq` | 1 | typed |
 | `Float.to_string`, `Float.to_int` | 0 | none |
 | `Char.to_int`, `Char.to_str` | 0 | none |
-| sized `to_int`, `to_i8` … `to_u64`, `wrapping_neg` | 0 | none |
+| sized `to_int`, `to_i8` … `to_u64` | 0 | none |
 
 The 1-argument rows here read nothing at all: the arm returns a type without
 looking at the argument, so today `x.min()` and `x.wrapping_add()` are both
@@ -168,11 +166,11 @@ Two conclusions follow, and they are what the enforcement step is built on.
 only. That is 64 of the rows above and none of the four MVCEs on the ticket:
 `xs.len(1, 2, 3)`, `"abc".len(9)`, `sb.clear(1)` and `tpl.count(1, 2, 3)` are
 all `args = 0, reads = none`, where there is no index for a counter to record.
-It would also miss every HOF row (`closure`), every `raw` row, and all seven
+It would also miss every HOF row (`closure`), every `raw` row, and all five
 1-argument rows on `Int` and the sized ints, whose arms read nothing.
 
 **The count is a fact about the method name, not about the arm.** It is fixed
-(no defaults, no variadics), it is knowable before any arm runs, and three arms
+(no defaults, no variadics), it is knowable before any arm runs, and two arms
 already cover mixed counts. So the check belongs in one place, ahead of the
 dispatch, driven by a lookup on the receiver kind and the method name — not
 distributed over the arms, where the next method added is the next one to
