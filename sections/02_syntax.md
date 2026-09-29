@@ -1180,7 +1180,7 @@ count *= 2       // desugars to: count = count * 2
 
 Only valid on `let mut` bindings. For a bare variable, `x += rhs` means `x = x + rhs`: `x` is read before `rhs` runs. (Vote: 5-0)
 
-For any place, `place op= rhs` evaluates the place's sub-expressions once, left to right. Then it reads the place's current value, evaluates `rhs`, applies `op`, and stores the result to the same place. The rewrite to `place = place op rhs` binds the place's sub-expressions to fresh temporaries first, so `xs[next()] += 1` calls `next()` once. For a bare variable this is the same as `x = x op rhs`. See §2.22 *Assignment places*. (Vote: 6-0)
+For a field path, `s.f op= rhs` reads `s.f`, evaluates `rhs`, applies `op`, and stores the result to `s.f`. A place has no sub-expressions that have effects, so this is the same as `s.f = s.f op rhs`. An index is not a place: `xs[i] += 1` is `error[NoIndexOperator]` (E0313, §3.4). See §2.22 *Assignment places*. (Vote: 6-0)
 
 #### String Concatenation
 
@@ -2027,9 +2027,7 @@ fn main() {
 }
 ```
 
-#### Assignment places
-
-`place = rhs` evaluates the place, then `rhs`, then stores. Evaluating a place such as `xs[i]`, `m[k]` or `s.field` evaluates the index and key expressions along its path, in written order, to values. It does not read the binding at the root of the place, and it does not find or bounds-check any element. Those happen at the store, after `rhs`: the store reads the root binding, follows the path with the index and key values already computed, checks bounds at each step, and writes. So a write that `rhs` makes to the same binding, through a closure, is not lost. In a nested place such as `a[i()].f[j()] = v`, `i()` runs, then `j()`, then `v`, then the store.
+An element write is a method call, so the call rule orders it. The arguments run before the method, and the method checks bounds when it runs:
 
 ```blink
 fn fill() -> Int {
@@ -2039,22 +2037,37 @@ fn fill() -> Int {
 
 fn main() {
     let mut xs = [1, 2, 3]
-    xs[10] = fill()   // prints "fill", then panics: the bounds check runs at the store
+    xs.set(10, fill())   // prints "fill", then panics: `set` runs after its arguments
 }
 ```
 
-Compound assignment `place op= rhs` evaluates the place's sub-expressions once. Then it reads the place's current value, evaluates `rhs`, applies `op`, and stores the result to the same place (§2.19).
+#### Assignment places
+
+A place is a `let mut` binding, or a field path `s.f.g` whose root is a `let mut` binding. A field path holds only names, so it has no sub-expressions that have effects or can fail. `place = rhs` evaluates `rhs`, then reads the root binding, then stores. So a write that `rhs` makes to the same binding, through a closure, is not lost.
+
+```blink
+type Stats {
+    count: Int
+    total: Int
+}
+
+fn main() {
+    let mut s = Stats { count: 0, total: 0 }
+    let record = fn() -> Int {
+        s.count = s.count + 1
+        5
+    }
+    s.total = record()
+    io.println("{s.count} {s.total}")   // "1 5": the store reads s after record() returns
+}
+```
+
+An index is not a place. Blink has no index operator (§2.6), so `xs[i] = v` and `xs[i] += v` are `error[NoIndexOperator]` (E0313, §3.4 *Postfix Brackets That Are Not a Type Application*). An element write is a method call: `List.set`, `Bytes.set` or `Map.insert`. The call rule orders it, as the `xs.set(10, fill())` example under *What each form evaluates* shows.
+
+Compound assignment `place op= rhs` reads the place's current value, then evaluates `rhs`, applies `op`, and stores the result to the same place (§2.19).
 
 ```blink
 fn main() {
-    let mut i = 0
-    let next = fn() -> Int {
-        i = i + 1
-        i
-    }
-    let mut xs = [0, 0, 0]
-    xs[next()] += 10      // next() runs once: xs == [0, 10, 0]
-
     let mut n = 1
     let bump = fn() -> Int {
         n = n + 10
