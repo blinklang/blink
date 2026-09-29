@@ -136,7 +136,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | AssertPanicsMessageMismatch | E0832 | `assert_panics` panic message did not match expected pattern | Test runner | §2.20 |
 | AssertPanicsOutsideTest | E0833 | `assert_panics` called outside a test | Test runner | §2.20 |
 | AssertPanicsNestedExpectPanic | E0834 | `assert_panics` nested inside another `assert_panics` | Test runner | §2.20 |
-| XfailMissingReason | E0835 | `test.failing(...)` missing or empty `reason:`/`ticket:` | Type checking | §8.10.6 |
+| XfailMissingReason | E0835 | `test.failing(...)` missing or empty `reason:`, or empty `ticket:` | Type checking | §8.10.6 |
 | TrustedRequiresAudit | E0836 | `@trusted` written without a non-empty `audit:` identifier | FFI | §9.1 |
 | AuditGatedSuppression | E0837 | An audit-gated diagnostic (`UnauditedFfi`, `RawBypassesParam`) named in `@allow(...)` or under `[lints]` — refused, not ignored, because neither channel records anything | FFI | §9.1 |
 | FfiOffsetUnknownStride | E0838 | `Ptr.offset` requires `@ffi.struct` element type | FFI | §9.1.1 |

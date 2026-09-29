@@ -1199,46 +1199,15 @@ The following are intentionally out of scope for this subsection and are tracked
 
 ---
 
-#### 8.10.5 Parking TDD fixtures that cannot build
+#### 8.10.5 Test files that do not build
 
-A red-phase fixture that exercises a language feature **the compiler does not yet implement** cannot live in `tests/`: it fails to *build*, and the test runner's cancel-on-first-failure cascade then reports spurious BUILD FAILED for every later task. Such fixtures are **parked** under `.tmp/<ticket>/` until the prerequisite phase lands.
+A test file that does not build is not a test. `blink test` reports it as a build failure for that file and runs the other files.
 
-`.tmp/` is gitignored at the repo level. Parking places the fixture, plus a `README.md` recording the originating `br` ticket id and the diagnostic the fixture is intended to provoke once the feature ships, inside `.tmp/<ticket>/`. When the prerequisite phase lands, the fixture moves into `tests/` as part of that phase's commit.
+The runner has no store, flag or event class for files that do not build. This section does not specify an NDJSON record for a build failure.
 
-Parked fixtures stay reachable through the runner via an opt-in flag:
+*Informative.* To test that a compiler rejects a program, or does not yet accept it, write a test that builds: it passes the program's source as a string to a compile step and asserts the result. The project supplies that compile step; the standard library does not.
 
-```
-blink test --parked <ticket>
-```
-
-`--parked` discovers `.tmp/<ticket>/*.bl`, attempts to compile each file, and emits one **file-level** NDJSON event per fixture on the same stream as ordinary test records:
-
-```json
-{ "event": "parked_file",
-  "path": ".tmp/a1b2c3/red_question_mark.bl",
-  "ticket": "a1b2c3",
-  "reason": "needs Phase-2 ? propagation in test bodies",
-  "diagnostic": "lex error: unexpected token '?'" }
-```
-
-`parked_file` events are a **distinct schema** from per-test records (which require `name` / `status` / `cause`); the runner is permitted to emit `parked_file` events because a parked file produced no test records to report against. The four top-level test statuses (`passed | failed | panicked | skipped`, §8.10 above) are unchanged — `parked_file` is not a status, it is a sibling event class.
-
-`--parked <ticket>` runs disable the cancel-on-first-failure cascade: a failed parked compile reports its diagnostic and the run continues. Outside `--parked`, the runner does not walk `.tmp/` at all.
-
-##### Mechanical lint over `.tmp/`
-
-`task ci` invokes a parking lint that:
-
-1. Walks `.tmp/*/` and extracts the ticket id from each directory name.
-2. Queries `br` for ticket status.
-3. Fails CI if **any** of:
-   - The ticket is closed (the fixture should have moved back into `tests/`).
-   - The ticket does not exist.
-   - The directory is older than 90 days **and** the originating ticket has had no status change in that window (stale park).
-
-The lint is mechanical and offline-safe: if `br` is unavailable the lint downgrades to a warning rather than failing CI.
-
-**Panel vote: 5-1** for the formalized `.tmp/<ticket>/` workflow with `--parked` flag, file-level `parked_file` NDJSON event, cancel-cascade suppression under `--parked`, and mechanical lint over `.tmp/` in `task ci`. PLT dissent: preferred a docs-only convention without runner integration, on the grounds that parking is a process artifact rather than a language-level concern. See [DECISIONS.md](../DECISIONS.md) and [decisions/xfail-and-parking.md](../decisions/xfail-and-parking.md).
+**Panel vote: 6-0** to remove the `.tmp/<ticket>/` parking workflow, the `--parked` flag, the `parked_file` NDJSON event and the `.tmp/` lint. **5-1** for the behavioral sentence above and **5-1** for the informative note; Minimalism dissented on both (the build-failure behavior belongs with the separate ticket that specifies its record shape, and the note serves only projects whose tests drive a compiler). This supersedes the 5-1 parking vote of the expected-failure decision. See [DECISIONS.md](../DECISIONS.md) and [decisions/parking-removal-and-xfail-ticket.md](../decisions/parking-removal-and-xfail-ticket.md).
 
 ---
 
@@ -1250,22 +1219,38 @@ A test that **builds and runs** but is *expected* to be red — because the feat
 test.failing(
   "trait impl resolves through alias chain",
   reason: "Phase 3 trait elaboration not yet implemented",
-  ticket: "a1b2c3",
 ) {
   // ... test body, expected to fail today
 }
 ```
 
-Both `reason: Str` and `ticket: Str` are **mandatory** and must be non-empty. `reason` describes *why* the test is expected to fail; `ticket` is a `br` ticket id that an automated lint can query.
+`reason: Str` is **mandatory** and must be non-empty. It tells *why* the test is expected to fail.
+
+`ticket: Str` is **optional**. Give it only when a real reference to the tracked work exists:
+
+```blink
+test.failing(
+  "trait impl resolves through alias chain",
+  reason: "Phase 3 trait elaboration not yet implemented",
+  ticket: "https://example.com/issues/412",
+) {
+  // ... test body, expected to fail today
+}
+```
+
+If `ticket:` is given, it must be non-empty. An empty `reason:`, a missing `reason:` or an empty `ticket:` is error E0835. The ticket value is **opaque**: an issue id, a URL or any other text. No runner or lint behavior depends on it.
 
 ##### Encoding in the NDJSON record
 
-`test.failing` does **not** add a new top-level status and does **not** add a new `cause` value. The four statuses (`passed | failed | panicked | skipped`) and the two `cause` values (`assertion | propagated_error`, §8.10) remain closed enums. Instead, each test record gains two optional fields:
+`test.failing` does **not** add a new top-level status and does **not** add a new `cause` value. The four statuses (`passed | failed | panicked | skipped`) and the two `cause` values (`assertion | propagated_error`, §8.10) remain closed enums. Instead, each test record gains three optional fields:
 
 | Field | Type | Meaning |
 |-------|------|---------|
 | `expected_fail` | `Bool` | `true` iff the test was registered with `test.failing` |
-| `xfail_reason` | `Str` | The `reason` + `ticket` from the registration, format `"br:<ticket> — <reason>"` |
+| `xfail_reason` | `Str` | The `reason` from the registration, unchanged |
+| `xfail_ticket` | `Str` | The `ticket` from the registration, unchanged |
+
+`xfail_ticket` is present if and only if the registration gives `ticket:`. It is never `""` or `null`. The runner JSON-escapes `xfail_ticket` and `xfail_reason` in the same way.
 
 The **expected** (red) case emits `status: "passed"`:
 
@@ -1273,7 +1258,7 @@ The **expected** (red) case emits `status: "passed"`:
 { "name": "trait impl resolves through alias chain",
   "status": "passed",
   "expected_fail": true,
-  "xfail_reason": "br:a1b2c3 — Phase 3 trait elaboration not yet implemented" }
+  "xfail_reason": "Phase 3 trait elaboration not yet implemented" }
 ```
 
 The test ran, failed as expected, and the runner counts that as a success — `status: "passed"` reflects the *suite-level* outcome.
@@ -1286,7 +1271,8 @@ An **unexpected pass** (the test was expected to fail but actually passed) becom
   "cause": "assertion",
   "assertion": "expected failure, got pass",
   "expected_fail": true,
-  "xfail_reason": "br:a1b2c3 — Phase 3 trait elaboration not yet implemented" }
+  "xfail_reason": "Phase 3 trait elaboration not yet implemented",
+  "xfail_ticket": "https://example.com/issues/412" }
 ```
 
 The suite-failure rule is mechanical:
@@ -1296,15 +1282,9 @@ The suite-failure rule is mechanical:
 
 There is **no** soft / "warn-only" mode for unexpected passes. The intent of `test.failing` is to record a known red state; the moment it goes green, the test must be moved back to `test(...)` in the same commit that removes the `test.failing` registration.
 
-##### Closed-ticket lint
+##### Tickets and trackers
 
-`task ci` runs a mechanical lint over `test.failing` registrations:
-
-1. Each registration's `ticket:` field is queried against `br`.
-2. If the ticket is **closed**, the lint fails and points at the registration site — the test must be converted back to `test(...)` or the ticket reopened.
-3. If the ticket does not exist, the lint fails the same way.
-
-The lint downgrades to a warning if `br` is unreachable.
+The spec defines no lint over `ticket:` values, because it names no tracker. A project can check the values against its own tracker in its own tooling. Strict unexpected-pass and the mandatory `reason:` need no tracker.
 
 ##### When to use which mechanism
 
@@ -1312,14 +1292,16 @@ A four-case decision rule, mechanical enough for AI code generators to apply wit
 
 | Situation | Mechanism |
 |-----------|-----------|
-| The fixture file **does not build** (uses syntax / feature the compiler does not yet accept) | Park in `.tmp/<ticket>/` (§8.10.5) |
-| The fixture builds, runs red, and the feature it exercises is **deliberately not yet implemented** | `test.failing(..., reason:, ticket:)` |
+| The fixture file **does not build** (uses syntax / feature the compiler does not yet accept) | Not a test (§8.10.5); keep it out of the test tree until it builds |
+| The fixture builds, runs red, and the feature it exercises is **deliberately not yet implemented** | `test.failing(..., reason:)`, with an optional `ticket:` |
 | The fixture builds, runs red, and the code under test has a **bug** | Ordinary `test(...)` — the failure is the regression signal |
 | The fixture builds but should not run yet (environmental gate, slow, etc.) | `skip(reason:)` |
 
 `test.failing` is reserved for the second row only. It is **not** a debugging tool, not a "mark this red for now" convenience, and not a substitute for fixing a bug.
 
-**Panel vote.** Q1 (`.tmp/<ticket>/` parking workflow with runner integration): **5-1**, PLT dissent. Q2 (ship runtime xfail now, not later): **3-3 → user (BDFL) tiebreak in favor of shipping** — Blink users are actively requesting it. Q3 (encoding under closed-status / closed-cause enums): **4-2** for the boolean `expected_fail` field with paired `xfail_reason` (rejected alternatives: new top-level `xfailed` status, new `cause` value). Mandatory non-empty `reason:` + `ticket:`, strict-by-default unexpected-pass semantics, and mechanical closed-ticket lint via `br` integration in `task ci` are non-negotiable mitigations bundled with shipping. See [DECISIONS.md](../DECISIONS.md) and [decisions/xfail-and-parking.md](../decisions/xfail-and-parking.md).
+**Panel vote.** Q1 (`.tmp/<ticket>/` parking workflow with runner integration): **5-1**, PLT dissent. Q2 (ship runtime xfail now, not later): **3-3 → user (BDFL) tiebreak in favor of shipping** — Blink users are actively requesting it. Q3 (encoding under closed-status / closed-cause enums): **4-2** for the boolean `expected_fail` field with paired `xfail_reason` (rejected alternatives: new top-level `xfailed` status, new `cause` value). Mandatory non-empty `reason:` and strict-by-default unexpected-pass semantics are non-negotiable mitigations bundled with shipping. See [DECISIONS.md](../DECISIONS.md) and [decisions/xfail-and-parking.md](../decisions/xfail-and-parking.md).
+
+**Superseded in part.** A later panel removed the parking workflow (Q1 above, §8.10.5) and the `br` coupling: `ticket:` is optional and opaque (**6-0**), it goes on the wire as its own `xfail_ticket` field and `xfail_reason` loses its `br:` prefix (**6-0**), and the closed-ticket lint leaves the spec (**6-0**). See [decisions/parking-removal-and-xfail-ticket.md](../decisions/parking-removal-and-xfail-ticket.md).
 
 ---
 
