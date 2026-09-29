@@ -1,5 +1,7 @@
 [< All Decisions](../DECISIONS.md)
 
+> **Amended in part** by [Display.fmt Has No Effect Row](display-fmt-empty-effect-row.md): `fmt` declares no effect row. There is no `StringBuilderPure` effect; the empty row carries point 4's intent, and impls may not widen it. The other locked points stand.
+
 # Display Trait Shape — Design Rationale
 
 ### Panel Deliberation
@@ -103,7 +105,7 @@ Triggered by Q1 (3-2-1 split) and Q4 (4-2). Q2 (5-1) treated as soft consensus g
 
 ```blink
 trait Display {
-    fn fmt(self, sb: StringBuilder) ! StringBuilderPure
+    fn fmt(self, sb: StringBuilder)
     final fn display(self) -> Str {
         let sb = StringBuilder.new()
         self.fmt(sb)
@@ -117,7 +119,7 @@ trait Display {
 1. **Push primary.** `fmt(self, sb: StringBuilder)` is the only user-implementable method. Recursive impls call `child.fmt(sb)` into the same builder; composition is O(n) in output size with zero intermediate `Str` allocations.
 2. **Sealed pull adapter.** `display(self) -> Str` is a `final` default method — non-overridable by `impl` blocks. Its body is fixed by the trait: build a `StringBuilder`, call `self.fmt(sb)`, materialize. `value.display()` and any push-style consumption are guaranteed to produce identical output by construction.
 3. **Three call shapes, one impl.** `"{x}"` interpolation, `x.display()`, and `sb.write(x)` all route through `fmt`. Drift is mechanically impossible.
-4. **`StringBuilderPure` effect on `fmt`.** Implementations may write to the supplied builder but cannot read external state, perform IO, or mutate state outside the builder. This is what makes the sealed `display` derivation safe.
+4. **No effect row on `fmt`.** *(Amended; originally "`StringBuilderPure` effect on `fmt`", an effect §4 never defined.)* `fmt` declares no `!`, so no implementation may perform IO or use any capability; it may write to the supplied builder. See [display-fmt-empty-effect-row.md](display-fmt-empty-effect-row.md).
 5. **Independent of `wk9gab`.** Surface is identical under monomorphization and erased-boxing. Generic `[T: Display]` callers' codegen cost is a downstream wk9gab concern, not a Display gate.
 6. **Diagnostic constraint.** Missing-impl errors for `T: !Display` MUST suggest `impl Display for X` or `@derive(Display)` and MUST NOT show `display()` as a "did you mean?" ghost-method.
 7. **Future Debug parallel.** When `Debug` is shaped, its pull adapter must be named `debug(x)`, not `to_debug_string(x)`, for consistency with the verb-form family chosen here.

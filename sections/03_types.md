@@ -2060,7 +2060,7 @@ Traits define shared behavior. They are the sole polymorphism mechanism in Blink
 
 ```blink
 trait Display {
-    fn fmt(self, sb: StringBuilder) ! StringBuilderPure
+    fn fmt(self, sb: StringBuilder)
     final fn display(self) -> Str {
         let sb = StringBuilder.new()
         self.fmt(sb)
@@ -2218,7 +2218,32 @@ error[SubtraitMethodRedeclaration]: cannot seal inherited open default `greet`
 
 `E0733` fires at the subtrait's redeclaration site, not at any call site, and applies only to redeclaring a method a supertrait already provides as an open default. A normal `impl`-block override of that open default (without `final`) is unaffected — that is the ordinary replace-only override of §3.6 *The `final` Modifier*.
 
-**Effect-row subtype for open overrides.** When an open default declares effect row `R_d` and an `impl` provides an override declaring row `R_o`, the typechecker requires `R_o ⊆ R_d`. An override may *narrow* the effect signature (drop effects the default declares but the override does not use) but may not *widen* it (introduce effects the default does not declare). See §4.5 *Effect Composition Rules* for the subtyping lattice. `final` defaults are effect-monomorphic at their declaration site — no override exists to widen them.
+**Effect-row subtype for trait impls.** Every method an `impl` provides for a trait, whether it implements a required method or overrides an open default, must declare an effect row `R_i` with `R_i ⊆ R_t`, where `R_t` is the row the trait declares for that method. An impl may *narrow* the row (drop effects it does not use) but may not *widen* it (add effects the trait does not declare). A trait method with no `!` has the empty row, so every impl of it must also have no `!`. This rule is what lets a bound `T: Trait` stand as an upper bound on the effects of a call through it: a generic function with no `!` that calls `x.m()` for `x: T` performs no effects for any `T`. A widening impl is rejected at the impl method with `error[TraitContractEffectMismatch]` (E0904). See §4.5 *Effect Composition Rules* for the subtyping lattice. `final` defaults have no override site, so their row is fixed at the declaration.
+
+```blink
+trait Shout {
+    fn shout(self) -> Int
+}
+
+type Box { v: Int }
+
+impl Shout for Box {
+    fn shout(self) -> Int ! IO {    // E0904 -- `Shout.shout` declares no effects
+        io.print("{self.v}")
+        self.v
+    }
+}
+```
+
+```
+error[TraitContractEffectMismatch]: `shout` declares effects its trait method does not
+  --> shout.bl:8:29
+   |
+8 |     fn shout(self) -> Int ! IO {
+   |                            ^^ `IO` is not in the row of `Shout.shout`, which is empty
+   |
+   = help: remove `! IO` and do the IO at the call site, or add `IO` to `Shout.shout` in the trait
+```
 
 **Migration: `@deprecate_override` warning hop.** Flipping a stdlib default from open to sealed is a breaking change for downstream impls. The transition path is a two-step deprecate-then-seal:
 
@@ -2263,7 +2288,7 @@ error[SelfOutsideTraitOrImpl]: `Self` outside trait or impl
 
 ```blink
 trait Display {
-    fn fmt(self, sb: StringBuilder) ! StringBuilderPure   // self: Self, enables x.fmt(sb)
+    fn fmt(self, sb: StringBuilder)                        // self: Self, enables x.fmt(sb)
     final fn display(self) -> Str {                        // sealed default, enables x.display()
         let sb = StringBuilder.new()
         self.fmt(sb)
@@ -2905,7 +2930,7 @@ The `Char` debug-form flows unchanged into every container position — a `Char`
 
 ```blink
 trait Display {
-    fn fmt(self, sb: StringBuilder) ! StringBuilderPure
+    fn fmt(self, sb: StringBuilder)
     final fn display(self) -> Str {
         let sb = StringBuilder.new()
         self.fmt(sb)
@@ -2962,7 +2987,7 @@ error[SealedMethodOverride]: cannot override sealed method `display`
 
 The interpolation lowering (built-in fast-path optimization aside) and the `display` derivation share the same call: `x.fmt(sb)`. They cannot disagree.
 
-**`StringBuilderPure` effect.** `fmt` is declared with the `StringBuilderPure` effect (§4.x): it may write into the supplied `StringBuilder`, but it cannot read external state, perform IO, allocate observably, or mutate any state outside the builder. This makes `fmt` referentially transparent given a fixed `(self, sb_initial_state)`, which is what makes the sealed `display` derivation safe and the interpolation cache-friendly.
+**`fmt` has no effect row.** `Display.fmt` declares no `!`, and that empty row is its contract. A function with no `!` performs no side effects (§4.1), and no impl may widen a trait method's row (§3.6 *Effect-row subtype for trait impls*). So no `fmt` impl can perform IO or use any other capability, and `"{x}"`, `x.display()` and `sb.write(x)` never need an effect or a handler in scope. An impl whose `fmt` declares an effect is rejected with `TraitContractEffectMismatch` (E0904). Writing into the supplied `sb` is not an effect: it mutates a parameter, which neither the effect row nor mutation analysis tracks (§4.16.2). Access to module-level `let mut` bindings is governed by §4.16, not by the effect row. There is no `StringBuilderPure` effect; `fmt(self, sb: StringBuilder) ! StringBuilderPure` names an undeclared effect.
 
 ##### Display Format Protocol
 
