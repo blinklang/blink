@@ -1,0 +1,278 @@
+// sections/07_trust_modules_metadata.md, *Scope tags*: a value with tag `v` stored into a cell
+// with tag `c` is E0601 (tag-mismatch) unless `v` encloses `c`. This file covers the first two
+// store forms. A write is `c.write(v)`, `c.field.write(v)`, or `x = v` to a `let mut`; the
+// pointee of a `Ptr` has the tag of the `Ptr`, and a `let mut` has the tag of the innermost
+// `ffi.scope` around its declaration. A capture follows the value: a closure has the innermost
+// tag of what it captures, whether it is a literal or a binding that holds one.
+import cg_test_helpers.{cg_probe_begin}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import escape.{analyze_escapes}
+import diagnostics.{DiagEntry, diag_entries, diag_ice_count}
+import std.io
+
+// Checks and escape-analyzes `src`, and answers its E0601 errors. Any other error, or an
+// internal error, fails the row: a probe that stops early reports nothing.
+fn e0601_in(stem: Str, src: Str) -> List[DiagEntry] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    cg_probe_begin(path)
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    analyze_escapes(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut found: List[DiagEntry] = []
+    let mut others = 0
+    for d in diag_entries {
+        if d.severity == "error" {
+            if d.code == "E0601" {
+                found.push(d)
+            } else {
+                io.println("FAIL: {stem} recorded an error the row does not expect: {d.name}: {d.message}")
+                others = others + 1
+            }
+        }
+    }
+    assert_eq(others, 0)
+    assert_eq(diag_ice_count, 0)
+    found
+}
+
+// "Name@line\n" for each E0601 in `src`.
+fn errors_in(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let mut out = ""
+    for d in e0601_in(stem, src) { out = "{out}{d.name}@{d.line}\n" }
+    out
+}
+
+// The message of the one E0601 in `src`, or "" when there is not exactly one.
+fn message_in(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let found = e0601_in(stem, src)
+    if found.len() != 1 { return "" }
+    found.get(0).unwrap().message
+}
+
+test "writing an inner pointer through an outer pointer is a tag mismatch" {
+    assert_eq(errors_in("store_write", #"fn main() {
+    with ffi.scope() as outer {
+        let slot = outer.alloc[Ptr[U8]]()
+        with ffi.scope() as inner {
+            let b = inner.alloc[U8]()
+            slot.write(b)
+        }
+    }
+}
+"#), "PtrTagMismatch@6\n")
+}
+
+test "writing an inner pointer into a field of outer memory is a tag mismatch" {
+    assert_eq(errors_in("store_field", #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let iov = outer.alloc_n[IoVec](2)
+        with ffi.scope() as inner {
+            let b = inner.alloc_n[U8](64)
+            iov.offset(1).iov_base.write(b)
+        }
+    }
+}
+"#), "PtrTagMismatch@12\n")
+}
+
+test "assigning an inner pointer to a let mut declared in the outer scope is a tag mismatch" {
+    assert_eq(errors_in("store_let_mut", #"fn main() {
+    with ffi.scope() as outer {
+        let mut p = outer.alloc[U8]()
+        with ffi.scope() as inner {
+            p = inner.alloc[U8]()
+        }
+        let _ = p.is_null()
+    }
+}
+"#), "PtrTagMismatch@5\n")
+}
+
+test "writing a scope pointer through an unscoped pointer is a tag mismatch" {
+    assert_eq(errors_in("store_unscoped_cell", #"fn main() {
+    let slot = alloc_ptr[Ptr[U8]]()
+    with ffi.scope() as s {
+        let b = s.alloc[U8]()
+        slot.write(b)
+    }
+}
+"#), "PtrTagMismatch@5\n")
+}
+
+test "the tag is the block, not its name, so an inner s stored into an outer s cell is a mismatch" {
+    assert_eq(errors_in("store_shadowed", #"fn main() {
+    with ffi.scope() as s {
+        let slot = s.alloc[Ptr[U8]]()
+        with ffi.scope() as s {
+            let b = s.alloc[U8]()
+            slot.write(b)
+        }
+    }
+}
+"#), "PtrTagMismatch@6\n")
+}
+
+test "an outer pointer may be stored into an inner cell" {
+    assert_eq(errors_in("store_outer_into_inner", #"fn main() {
+    with ffi.scope() as outer {
+        let a = outer.alloc[U8]()
+        with ffi.scope() as inner {
+            let slot = inner.alloc[Ptr[U8]]()
+            slot.write(a)
+            let mut q = inner.alloc[U8]()
+            q = a
+            let _ = q.is_null()
+        }
+    }
+}
+"#), "")
+}
+
+test "a pointer from the same scope may be stored into that scope's cell" {
+    assert_eq(errors_in("store_same_scope", #"fn main() {
+    with ffi.scope() as s {
+        let slot = s.alloc[Ptr[U8]]()
+        let b = s.alloc[U8]()
+        slot.write(b)
+        let mut p = s.alloc[U8]()
+        p = b
+        let _ = p.is_null()
+    }
+}
+"#), "")
+}
+
+test "a pointer detached with take may be stored into an outer cell" {
+    assert_eq(errors_in("store_taken", #"fn main() {
+    with ffi.scope() as outer {
+        let slot = outer.alloc[Ptr[U8]]()
+        with ffi.scope() as inner {
+            let b = inner.alloc[U8]()
+            slot.write(inner.take(b))
+        }
+    }
+}
+"#), "")
+}
+
+test "assigning a closure that captures a scope pointer to an outer let mut is a tag mismatch" {
+    assert_eq(errors_in("capture_literal", #"fn main() {
+    let mut f = fn() -> Bool { true }
+    with ffi.scope() as s {
+        let p = s.alloc[U8]()
+        f = fn() -> Bool { p.is_null() }
+    }
+    let _ = f()
+}
+"#), "PtrTagMismatch@5\n")
+}
+
+test "a let binding that holds a capturing closure keeps its tag when assigned on" {
+    assert_eq(errors_in("capture_via_let", #"fn main() {
+    let mut f = fn() -> Bool { true }
+    with ffi.scope() as s {
+        let p = s.alloc[U8]()
+        let g = fn() -> Bool { p.is_null() }
+        f = g
+    }
+    let _ = f()
+}
+"#), "PtrTagMismatch@6\n")
+}
+
+test "a let binding that holds a capturing closure escapes as the block tail" {
+    assert_eq(errors_in("capture_let_tail", #"fn main() {
+    let f = with ffi.scope() as s {
+        let p = s.alloc[U8]()
+        let g = fn() -> Bool { p.is_null() }
+        g
+    }
+    let _ = f()
+}
+"#), "PtrEscapesFfiScope@5\n")
+}
+
+test "assigning a capturing closure to a module-level let mut is a tag mismatch" {
+    assert_eq(errors_in("capture_global", #"fn yes() -> Bool { true }
+
+let mut hook = yes
+
+fn main() {
+    with ffi.scope() as s {
+        let p = s.alloc[U8]()
+        hook = fn() -> Bool { p.is_null() }
+    }
+    let _ = hook()
+}
+"#), "PtrTagMismatch@8\n")
+}
+
+test "a capturing closure may be assigned to a let mut declared in its own scope" {
+    assert_eq(errors_in("capture_same_scope", #"fn main() {
+    with ffi.scope() as s {
+        let p = s.alloc[U8]()
+        let mut f = fn() -> Bool { true }
+        f = fn() -> Bool { p.is_null() }
+        let _ = f()
+    }
+}
+"#), "")
+}
+
+test "a closure that captures an outer pointer may be assigned to an outer let mut from an inner scope" {
+    assert_eq(errors_in("capture_outer_value", #"fn main() {
+    with ffi.scope() as outer {
+        let p = outer.alloc[U8]()
+        let mut f = fn() -> Bool { true }
+        with ffi.scope() as inner {
+            let _b = inner.alloc[U8]()
+            f = fn() -> Bool { p.is_null() }
+        }
+        let _ = f()
+    }
+}
+"#), "")
+}
+
+// §9.1.1, E0601 message conditions: a tag-mismatch error names its subkind and its store form.
+test "a write mismatch names the write form and the tag-mismatch subkind" {
+    let msg = message_in("msg_write", #"fn main() {
+    with ffi.scope() as outer {
+        let slot = outer.alloc[Ptr[U8]]()
+        with ffi.scope() as inner {
+            let b = inner.alloc[U8]()
+            slot.write(b)
+        }
+    }
+}
+"#)
+    assert(msg.contains("(tag-mismatch)"))
+    assert(msg.contains("write"))
+    assert(msg.contains("`inner`"))
+    assert(msg.contains("`outer`"))
+}
+
+test "a capture mismatch names the capture form and the tag-mismatch subkind" {
+    let msg = message_in("msg_capture", #"fn main() {
+    let mut f = fn() -> Bool { true }
+    with ffi.scope() as s {
+        let p = s.alloc[U8]()
+        f = fn() -> Bool { p.is_null() }
+    }
+    let _ = f()
+}
+"#)
+    assert(msg.contains("(tag-mismatch)"))
+    assert(msg.contains("capture"))
+    assert(msg.contains("`s`"))
+}
