@@ -47,9 +47,13 @@
 # parent). Override with RATCHET_HEAD1_REF to pin one or the other. If the
 # resolved ref does not exist (shallow clone, or a repo with too few commits
 # for HEAD~1), the previous-commit comparison is skipped for that run instead
-# of failing every row against an empty tree. Known gap: on a clean tree with
-# several unpushed local commits, only the tip is checked against its
-# immediate parent.
+# of failing every row against an empty tree.
+#
+# Every commit on the branch is also checked against its parent: each commit
+# in RATCHET_BASE_REF..HEAD (default main) must not raise a tracked row. A
+# tip-only compare lets a mid-branch rise through when a later commit pays it
+# back. A merge commit rises only when it passes every parent. When the base
+# ref does not resolve, or HEAD is on it, there is nothing to walk.
 #
 # Env overrides (used by scripts/test_ratchet.sh; normal runs need none):
 #   RATCHET_SRC_DIR   root dir standing in for the repo root when computing
@@ -59,6 +63,8 @@
 #                     bypassing git entirely. Default: unset (materialize
 #                     RATCHET_HEAD1_REF via git into .tmp/ratchet_head1).
 #   RATCHET_HEAD1_REF git ref to materialize when RATCHET_HEAD1_DIR is unset.
+#   RATCHET_BASE_REF  the ref the branch walk starts from. Default: main. The
+#                     walk is skipped when RATCHET_HEAD1_DIR is set.
 #   RATCHET_NO_LINT   1 to skip scripts/lint_codegen.sh.
 set -u
 cd "$(dirname "$0")/.."
@@ -149,6 +155,36 @@ materialize_ref() {
   done
 }
 
+# Row names the ratchet.sh at $1 defined. A row it lacked has no count there.
+tracked_rows_at() {
+  git show "$1:scripts/ratchet.sh" 2>/dev/null |
+    sed -n 's/^\([a-z_][a-z_0-9]*\) \$.*/\1/p' | tr '\n' ' '
+}
+
+# Prints one line per row a commit in $1..HEAD raised above its parents.
+walk_branch() {
+  base_ref="$1"
+  walk=$(mktemp -d)
+  git rev-list --reverse --parents "${base_ref}..HEAD" | while read -r c parents; do
+    [ -n "$parents" ] || continue
+    [ -d "$walk/$c" ] || materialize_ref "$c" "$walk/$c"
+    rows_c=$(compute_rows "$walk/$c")
+    for p in $parents; do
+      [ -d "$walk/$p" ] || materialize_ref "$p" "$walk/$p"
+      compute_rows "$walk/$p" | sed "s/^/$p /"
+    done > "$walk/parents.txt"
+    tracked=""
+    for p in $parents; do tracked="$tracked $(tracked_rows_at "$p")"; done
+    subject=$(git log -1 --format='%h %s' "$c")
+    printf '%s\n' "$rows_c" | while read -r name n; do
+      case " $tracked " in *" $name "*) ;; *) continue ;; esac
+      before=$(awk -v n="$name" '$2==n && $3>m {m=$3} END {print m+0}' "$walk/parents.txt")
+      [ "$n" -gt "$before" ] && echo "$subject: $name $before -> $n"
+    done
+  done
+  rm -rf "$walk"
+}
+
 check_root "$now_root"
 rows_now=$(compute_rows "$now_root")
 
@@ -174,8 +210,7 @@ elif git rev-parse --verify --quiet "${head1_ref}^{commit}" >/dev/null 2>&1; the
   # computing it over the older files answers 0 for a metric nobody tracked,
   # which would fail the new row for the fact of existing. Its baseline,
   # written in the same commit, is its first reference.
-  head1_tracked=$(git show "${head1_ref}:scripts/ratchet.sh" 2>/dev/null |
-    sed -n 's/^\([a-z_][a-z_0-9]*\) \$.*/\1/p' | tr '\n' ' ')
+  head1_tracked=$(tracked_rows_at "$head1_ref")
 else
   echo "ratchet: warning: '$head1_ref' does not resolve; skipping the previous-commit comparison for this run" >&2
   rows_head1="$rows_now"
@@ -208,6 +243,20 @@ printf '%s\n' "$rows_now" | while read -r name now; do
   printf '%-26s %8s %8s %8s%s\n' "$name" "$base" "$h1" "$now" "$mark"
   [ -n "$mark" ] && printf x >> "$failmark"
 done
+
+base_ref="${RATCHET_BASE_REF:-main}"
+if [ -z "${RATCHET_HEAD1_DIR:-}" ]; then
+  if git rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null 2>&1; then
+    raised=$(walk_branch "$base_ref")
+    if [ -n "$raised" ]; then
+      echo "ratchet: a commit on this branch raised a row above its parent, even if a later commit paid it back:"
+      printf '%s\n' "$raised" | sed 's/^/  /'
+      printf x >> "$failmark"
+    fi
+  else
+    echo "ratchet: warning: '$base_ref' does not resolve; skipping the branch walk for this run" >&2
+  fi
+fi
 
 if [ -s "$failmark" ]; then
   echo "ratchet: a tracked count went up against the baseline or the previous commit. Remove the new use, or lower another row."

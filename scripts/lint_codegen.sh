@@ -27,12 +27,19 @@
 # uncommitted changes (the run precedes the commit that lands them), else
 # HEAD~1. Override with LINT_HEAD1_REF.
 #
+# Every commit on the branch is also held to the previous-commit rule against
+# its parents: in LINT_BASE_REF..HEAD (default main), no commit may raise a row
+# in debt. A tip-only compare lets a mid-branch rise through when a later
+# commit pays it back. A merge commit rises only when it passes every parent.
+#
 # Env overrides (used by scripts/test_lint_codegen.sh):
 #   LINT_SRC_DIR    root standing in for the repo (has src/ and tests/). Default: .
 #   LINT_BASELINE   baseline file. Default: scripts/lint_codegen_baseline.txt
 #   LINT_ALLOWLIST  pub let mut allowlist. Default: scripts/lint_pub_let_mut_allow.txt
 #   LINT_HEAD1_DIR  root standing in for the previous commit (bypasses git)
 #   LINT_HEAD1_REF  git ref to materialize when LINT_HEAD1_DIR is unset
+#   LINT_BASE_REF   the ref the branch walk starts from. Default: main. The walk
+#                   is skipped when LINT_HEAD1_DIR is set
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
@@ -264,6 +271,50 @@ materialize_ref() {
     git archive "$1" src tests scripts 2>/dev/null | tar -x -C "$2"
 }
 
+# Row names the lint_codegen.sh at $1 defined, space-separated, or a lone
+# space when that commit had no lint script (every row new).
+tracked_rows_at() {
+    if script=$(git show "$1:scripts/lint_codegen.sh" 2>/dev/null); then
+        printf ' %s' $(printf '%s\n' "$script" | sed -n 's/^L[0-9]* \([a-z_][a-z_0-9]*\) [0-9]*$/\1/p')
+    else
+        echo " "
+    fi
+}
+
+# Prints one line per debt row a commit in $1..HEAD raised above its parents.
+walk_branch() {
+    walk="$work/walk"
+    mkdir -p "$walk"
+    git rev-list --reverse --parents "$1..HEAD" | while read -r c parents; do
+        [ -n "$parents" ] || continue
+        for r in $c $parents; do
+            if [ ! -f "$walk/$r.rows" ]; then
+                materialize_ref "$r" "$walk/$r"
+                compute_rows "$walk/$r" "$walk/$r.det" > "$walk/$r.rows"
+                rm -rf "$walk/$r" "$walk/$r.det"
+            fi
+        done
+        tracked=""
+        for p in $parents; do tracked="$tracked$(tracked_rows_at "$p")"; done
+        subject=$(git log -1 --format='%h %s' "$c")
+        while read -r _id name thr; do
+            [ -z "$name" ] && continue
+            case " $tracked " in *" $name "*) ;; *) continue ;; esac
+            n=$(awk -v n="$name" '$1==n{print $2}' "$walk/$c.rows")
+            before=0
+            for p in $parents; do
+                v=$(awk -v n="$name" '$1==n{print $2}' "$walk/$p.rows")
+                [ "${v:-0}" -gt "$before" ] && before="$v"
+            done
+            if [ "${n:-0}" -gt "$thr" ] && [ "${n:-0}" -gt "$before" ]; then
+                echo "$subject: $name $before -> $n"
+            fi
+        done <<ROWLIST
+$ROWS
+ROWLIST
+    done
+}
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -335,6 +386,20 @@ while read -r id name thr; do
 done <<EOF
 $ROWS
 EOF
+
+base_ref="${LINT_BASE_REF:-main}"
+if [ -z "${LINT_HEAD1_DIR:-}" ]; then
+    if git rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null 2>&1; then
+        raised=$(walk_branch "$base_ref")
+        if [ -n "$raised" ]; then
+            echo "lint_codegen: a commit on this branch raised a row in debt above its parent, even if a later commit paid it back:"
+            printf '%s\n' "$raised" | sed 's/^/       /'
+            fail=1
+        fi
+    else
+        echo "lint_codegen: warning: '$base_ref' does not resolve; skipping the branch walk" >&2
+    fi
+fi
 
 if [ "$fail" -ne 0 ]; then
     echo "lint_codegen: FAIL. A row rose above its limit or above the previous commit. Remove the construct; the lint never gets an exception."

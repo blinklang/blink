@@ -202,6 +202,46 @@ else
     echo "FAIL git: new-row exemption:"; cat "$WORK/git3.out"; fail=1
 fi
 
+# The branch walk: every commit in main..HEAD against its parents. The tip
+# compare alone cannot see a rise that a later commit on the branch paid back.
+WALKWORK="$WORK/walkrepo"
+mkdir -p "$WALKWORK/scripts" "$WALKWORK/src" "$WALKWORK/tests"
+cp ./scripts/lint_codegen.sh "$WALKWORK/scripts/lint_codegen.sh"
+cp ./scripts/lint_pub_let_mut_allow.txt "$WALKWORK/scripts/lint_pub_let_mut_allow.txt"
+: > "$WALKWORK/tests/test_fixture.bl"
+printf '// br abc123\n' > "$WALKWORK/src/cg_a.bl"
+(
+    cd "$WALKWORK" || exit 1
+    git init -q -b main .
+    git config user.email t@example.com
+    git config user.name t
+    ./scripts/lint_codegen.sh --update > /dev/null
+    git add -A && git commit -qm base
+    git checkout -q -b paid_back
+    printf '// br def456\n' >> src/cg_a.bl
+    git commit -qam "raise a debt row"
+    printf '// br abc123\n' > src/cg_a.bl
+    git commit -qam "pay it back"
+)
+if (cd "$WALKWORK" && ./scripts/lint_codegen.sh > "$WORK/walk1.out" 2>&1) || ! grep -qE 'raise a debt row: br_ids_in_source 1 -> 2$' "$WORK/walk1.out"; then
+    echo "FAIL git: a mid-branch rise paid back by a later commit not caught:"; cat "$WORK/walk1.out"; fail=1
+else
+    echo "ok   git: a mid-branch rise in a debt row fails although the tip paid it back"
+fi
+# A row under its threshold may grow up to it on any commit.
+(
+    cd "$WALKWORK" || exit 1
+    git checkout -q main
+    git checkout -q -b under_threshold
+    printf 'pub let mut em_indent: Int = 0\n' > src/cg_emit.bl
+    git add -A && git commit -qm "grow a row under its threshold"
+)
+if (cd "$WALKWORK" && ./scripts/lint_codegen.sh > "$WORK/walk2.out" 2>&1) && grep -qE '^L3 +pub_let_mut_new +8 +0 +0 +1$' "$WORK/walk2.out"; then
+    echo "ok   git: a branch commit may grow a row up to its threshold"
+else
+    echo "FAIL git: growth under the threshold was failed by the branch walk:"; cat "$WORK/walk2.out"; fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "test_lint_codegen: FAIL"
     exit 1

@@ -271,6 +271,70 @@ echo 'pub let mut a: Int = 0' > "$GITWORK/src/codegen.bl"
 )
 if [ $? != 0 ]; then fail=1; fi
 
+# The branch walk: every commit in main..HEAD against its parents. The tip
+# compare alone cannot see a rise that a later commit on the branch paid back.
+WALKWORK="$WORK/walkrepo"
+mkdir -p "$WALKWORK/scripts" "$WALKWORK/src"
+cp ./scripts/ratchet.sh "$WALKWORK/scripts/ratchet.sh"
+chmod +x "$WALKWORK/scripts/ratchet.sh"
+echo 'pub let mut a: Int = 0' > "$WALKWORK/src/codegen.bl"
+: > "$WALKWORK/Taskfile.yml"
+(
+  cd "$WALKWORK" || exit 1
+  git init -q -b main .
+  git config user.email t@example.com
+  git config user.name t
+  ./scripts/ratchet.sh --update > /dev/null
+  git add -A
+  git commit -q -m base
+
+  git checkout -q -b neutral
+  echo '// no count change' >> src/codegen.bl
+  git commit -q -am "neutral edit"
+  if ! ./scripts/ratchet.sh > /dev/null 2>&1; then
+    echo "FAIL git-walk-neutral: a branch whose commits raise nothing must pass"
+    exit 1
+  fi
+  echo "PASS git-walk-neutral: a branch whose commits raise nothing passes"
+
+  git checkout -q main
+  git checkout -q -b paid_back
+  echo 'pub let mut b: Int = 0' >> src/codegen.bl
+  git commit -q -am "raise a row"
+  sed -i '/pub let mut b/d' src/codegen.bl
+  git commit -q -am "pay it back"
+  walk_out=$(./scripts/ratchet.sh 2>&1)
+  if [ $? = 0 ]; then
+    echo "FAIL git-walk-paid-back: a mid-branch rise paid back by a later commit must fail"
+    printf '%s\n' "$walk_out"
+    exit 1
+  fi
+  if ! printf '%s\n' "$walk_out" | rg -q 'raise a row: pub_let_mut 1 -> 2$'; then
+    echo "FAIL git-walk-paid-back: the run failed, but did not name the commit and row that rose"
+    printf '%s\n' "$walk_out"
+    exit 1
+  fi
+  echo "PASS git-walk-paid-back: a mid-branch rise is caught although the tip paid it back"
+
+  # A merge of main brings main's own counts. The merge rises only when it
+  # passes every parent, so a row main raised is not charged to the branch.
+  git checkout -q main
+  echo 'pub let mut m: Int = 0' > src/main_only.bl
+  git add -A
+  git commit -q -m "main raises a row"
+  git checkout -q neutral
+  git merge -q --no-edit main > /dev/null 2>&1 || { echo "FAIL git-walk-merge: fixture merge conflicted"; exit 1; }
+  ./scripts/ratchet.sh --update > /dev/null
+  git commit -q -am "rebaseline" > /dev/null 2>&1 || true
+  if ! RATCHET_HEAD1_REF=HEAD ./scripts/ratchet.sh > /dev/null 2>&1; then
+    echo "FAIL git-walk-merge: a merge of main was charged with a row main raised"
+    RATCHET_HEAD1_REF=HEAD ./scripts/ratchet.sh 2>&1 | sed 's/^/    /'
+    exit 1
+  fi
+  echo "PASS git-walk-merge: a merge rises only when it passes every parent"
+)
+if [ $? != 0 ]; then fail=1; fi
+
 if [ "$fail" != 0 ]; then
   echo "test_ratchet: FAILED"
   exit 1
