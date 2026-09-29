@@ -710,6 +710,30 @@ pub type Pollfd {
 
 `@ffi.struct(header, name)` declares that a Blink type mirrors a named C struct from a specific C header. The header is resolved against the project's `[native-dependencies].headers` list. Fields are listed in declaration order and must use sized FFI-compatible types: `I8`/`I16`/`I32`/`Int`, `U8`/`U16`/`U32`/`U64`, `F32`/`Float`, `Bool`, `Ptr[T]`, or another `@ffi.struct` type. List, Str, Bytes, Map, Result, Option, and trait types are rejected with `E0812` (extending the existing GC-types-cannot-cross-FFI rule from `E0810` for `Ptr[T]`). A `Buf[T]` field is rejected with `E0822`: a `Buf` value is a `blink_buf_t*`, not the C pointer the field declares, and the size `_Static_assert` cannot catch the difference. Use `Ptr[T]`.
 
+**`Bool` at the FFI boundary.** In an FFI position (an `@ffi.struct` field, an `@ffi` parameter or an `@ffi` return), `Bool` is C `bool` (`_Bool`): the struct mirror and the foreign prototype spell it `bool`, with C's size and alignment. A `Bool` read from C (an `@ffi` return, or an `@ffi.struct` field read) is always `true` or `false`, as every `Bool` is (§3.4 *`Bool` Is Distinct from `Int`*). A C `int` used as a flag is not a `bool`: declare it `I32` and convert with `!= 0`.
+
+```blink
+import blink.ffi.{Ptr, Void, I32}
+
+@ffi.struct(header = "opts.h", name = "opts_t")
+pub type Opts {
+    verbose: Bool,     // C: bool verbose;
+    level: I32,        // C: int level;
+}
+
+@ffi("libfoo", "foo_is_open")
+@effects(IO)
+@trusted(audit: "FOO-1")
+fn foo_is_open(h: Ptr[Void]) -> I32      // C: int foo_is_open(foo_t *h);
+
+@trusted(audit: "FOO-1")
+fn is_open(h: Ptr[Void]) -> Bool {
+    foo_is_open(h) != 0
+}
+```
+
+A `Bool` field that mirrors a C `int` field fails the layout check; the diagnostic says to declare the field `I32`.
+
 **Pointer-bearing structs and E0811.** An `@ffi.struct` with a `Ptr` field, directly or through a nested `@ffi.struct` field at any depth, is subject to E0811 exactly as `Ptr[T]` is: a value of it may appear only in an FFI region (§9.1.1). The E0811 error names the field, e.g. "`IoVec` holds `Ptr` in field `iov_base` (line 3), so it may appear only in an FFI region". A pointer stored into such a field is subject to the scope-tag store rules (§9.1.1, *Scope tags*).
 
 #### Field access on `Ptr[@ffi.struct T]`
