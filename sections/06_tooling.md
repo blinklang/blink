@@ -1224,33 +1224,16 @@ test.failing(
 }
 ```
 
-`reason: Str` is **mandatory** and must be non-empty. It tells *why* the test is expected to fail.
-
-`ticket: Str` is **optional**. Give it only when a real reference to the tracked work exists:
-
-```blink
-test.failing(
-  "trait impl resolves through alias chain",
-  reason: "Phase 3 trait elaboration not yet implemented",
-  ticket: "https://example.com/issues/412",
-) {
-  // ... test body, expected to fail today
-}
-```
-
-If `ticket:` is given, it must be non-empty. An empty `reason:`, a missing `reason:` or an empty `ticket:` is error E0835. The ticket value is **opaque**: an issue id, a URL or any other text. No runner or lint behavior depends on it.
+`reason: Str` is **mandatory** and must be non-empty. It tells *why* the test is expected to fail. A missing or empty `reason:` is error E0835. `test.failing` takes no other arguments. To point at tracked work, write the reference in `reason:`.
 
 ##### Encoding in the NDJSON record
 
-`test.failing` does **not** add a new top-level status and does **not** add a new `cause` value. The four statuses (`passed | failed | panicked | skipped`) and the two `cause` values (`assertion | propagated_error`, §8.10) remain closed enums. Instead, each test record gains three optional fields:
+`test.failing` does **not** add a new top-level status and does **not** add a new `cause` value. The four statuses (`passed | failed | panicked | skipped`) and the two `cause` values (`assertion | propagated_error`, §8.10) remain closed enums. Instead, each test record gains two optional fields:
 
 | Field | Type | Meaning |
 |-------|------|---------|
 | `expected_fail` | `Bool` | `true` iff the test was registered with `test.failing` |
 | `xfail_reason` | `Str` | The `reason` from the registration, unchanged |
-| `xfail_ticket` | `Str` | The `ticket` from the registration, unchanged |
-
-`xfail_ticket` is present if and only if the registration gives `ticket:`. It is never `""` or `null`. The runner JSON-escapes `xfail_ticket` and `xfail_reason` in the same way.
 
 The **expected** (red) case emits `status: "passed"`:
 
@@ -1271,8 +1254,7 @@ An **unexpected pass** (the test was expected to fail but actually passed) becom
   "cause": "assertion",
   "assertion": "expected failure, got pass",
   "expected_fail": true,
-  "xfail_reason": "Phase 3 trait elaboration not yet implemented",
-  "xfail_ticket": "https://example.com/issues/412" }
+  "xfail_reason": "Phase 3 trait elaboration not yet implemented" }
 ```
 
 The suite-failure rule is mechanical:
@@ -1282,10 +1264,6 @@ The suite-failure rule is mechanical:
 
 There is **no** soft / "warn-only" mode for unexpected passes. The intent of `test.failing` is to record a known red state; the moment it goes green, the test must be moved back to `test(...)` in the same commit that removes the `test.failing` registration.
 
-##### Tickets and trackers
-
-The spec defines no lint over `ticket:` values, because it names no tracker. A project can check the values against its own tracker in its own tooling. Strict unexpected-pass and the mandatory `reason:` need no tracker.
-
 ##### When to use which mechanism
 
 A four-case decision rule, mechanical enough for AI code generators to apply without judgment:
@@ -1293,7 +1271,7 @@ A four-case decision rule, mechanical enough for AI code generators to apply wit
 | Situation | Mechanism |
 |-----------|-----------|
 | The fixture file **does not build** (uses syntax / feature the compiler does not yet accept) | Not a test (§8.10.5); keep it out of the test tree until it builds |
-| The fixture builds, runs red, and the feature it exercises is **deliberately not yet implemented** | `test.failing(..., reason:)`, with an optional `ticket:` |
+| The fixture builds, runs red, and the feature it exercises is **deliberately not yet implemented** | `test.failing(..., reason:)` |
 | The fixture builds, runs red, and the code under test has a **bug** | Ordinary `test(...)` — the failure is the regression signal |
 | The fixture builds but should not run yet (environmental gate, slow, etc.) | `skip(reason:)` |
 
@@ -1301,7 +1279,7 @@ A four-case decision rule, mechanical enough for AI code generators to apply wit
 
 **Panel vote.** Q1 (`.tmp/<ticket>/` parking workflow with runner integration): **5-1**, PLT dissent. Q2 (ship runtime xfail now, not later): **3-3 → user (BDFL) tiebreak in favor of shipping** — Blink users are actively requesting it. Q3 (encoding under closed-status / closed-cause enums): **4-2** for the boolean `expected_fail` field with paired `xfail_reason` (rejected alternatives: new top-level `xfailed` status, new `cause` value). Mandatory non-empty `reason:` and strict-by-default unexpected-pass semantics are non-negotiable mitigations bundled with shipping. See [DECISIONS.md](../DECISIONS.md) and [decisions/xfail-and-parking.md](../decisions/xfail-and-parking.md).
 
-**Superseded in part.** A later panel removed the parking workflow (Q1 above, §8.10.5) and the `br` coupling: `ticket:` is optional and opaque (**6-0**), it goes on the wire as its own `xfail_ticket` field and `xfail_reason` loses its `br:` prefix (**6-0**), and the closed-ticket lint leaves the spec (**6-0**). See [decisions/parking-removal-and-xfail-ticket.md](../decisions/parking-removal-and-xfail-ticket.md).
+**Superseded in part.** A later decision removed the parking workflow (Q1 above, §8.10.5) and the `br` coupling: the panel voted to remove parking and the closed-ticket lint (**6-0** each), and the user (BDFL) overruled the panel's optional `ticket:` to remove the argument from the language, so `xfail_reason` holds the reason only. See [decisions/parking-removal-and-xfail-ticket.md](../decisions/parking-removal-and-xfail-ticket.md).
 
 ---
 

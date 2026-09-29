@@ -1,6 +1,6 @@
 [< All Decisions](../DECISIONS.md)
 
-> **Superseded in part** by [Parking Removal + Opaque Xfail Ticket](parking-removal-and-xfail-ticket.md): the Q1 parking workflow is removed; `ticket:` is optional and opaque; `xfail_ticket` is a third NDJSON field and `xfail_reason` has no `br:` prefix; the closed-ticket lint is not spec. Q2 (ship xfail) and Q3 (boolean `expected_fail` encoding) stand.
+> **Superseded in part** by [Parking Removal + Xfail Ticket Removal](parking-removal-and-xfail-ticket.md): the Q1 parking workflow is removed; `ticket:` is removed from `test.failing`; `xfail_reason` has no `br:` prefix; the closed-ticket lint is not spec. Q2 (ship xfail) and Q3 (boolean `expected_fail` encoding) stand.
 
 # Expected-Failure Tests + Parking — Design Rationale
 
