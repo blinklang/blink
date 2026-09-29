@@ -1,5 +1,7 @@
 [< All Decisions](../DECISIONS.md)
 
+> **Superseded in part** by [Parking Removal + Opaque Xfail Ticket](parking-removal-and-xfail-ticket.md): the Q1 parking workflow is removed; `ticket:` is optional and opaque; `xfail_ticket` is a third NDJSON field and `xfail_reason` has no `br:` prefix; the closed-ticket lint is not spec. Q2 (ship xfail) and Q3 (boolean `expected_fail` encoding) stand.
+
 # Expected-Failure Tests + Parking — Design Rationale
 
 Resolves br spec ticket **1c2zr6** ("should the testing framework support an expected-to-fail (xfail) marker?"). Motivating ticket: btvqbf — TDD red fixtures using `?` in test bodies that did not lex on the then-current compiler and triggered the runner's cancel-on-first-failure cascade when placed under `tests/`.
