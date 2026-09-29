@@ -196,7 +196,7 @@ This section formally defines the pointer types, operations, and lifetime semant
 
 The `ffi` namespace and the FFI pointer types are **compiler-known intrinsics**, not a distributable module. This has two consequences future readers must not re-derive a phantom gate from:
 
-**Resolution.** `import blink.ffi` and `import blink.core` resolve as **recognized, inert, optional no-ops** — accepted, never required, and never `ModuleNotFound`. The `ffi` namespace works with **no import at all**, exactly like `io`/`net`/`time`. Selective forms such as `import blink.ffi.{Ptr, Void, alloc_ptr, null_ptr}` are satisfiable no-ops: the names they list are compiler-known regardless, so the import is a documentation marker (signalling "this file does FFI") and never a capability gate. This follows the `blink.*` reservation in §10.7 (Standard Library Resolution).
+**Resolution.** `import blink.ffi` and `import blink.core` resolve as **recognized, inert, optional no-ops** — accepted, never required, and never `ModuleNotFound`. The `ffi` namespace works with **no import at all**, exactly like `io`/`net`/`time`. Selective forms such as `import blink.ffi.{Ptr, Void, alloc_ptr, null_ptr}` are satisfiable no-ops: the names they list are compiler-known regardless, so the import is a documentation marker (signalling "this file does FFI") and never a capability gate. An aliased form, `import blink.ffi.{Ptr as RawPtr}`, binds the alias to the compiler-known name; a module that declares its own `Ptr` uses it to reach the builtin (§10.6 *Shadowing Rules*). This follows the `blink.*` reservation in §10.7 (Standard Library Resolution).
 
 **The two real gates.** The unsafe FFI surface is gated twice, and these are the *only* gates:
 
@@ -1831,9 +1831,10 @@ All built-in types are in the prelude. They are available in every module withou
 | Name | Description |
 |------|-------------|
 | `Int` | 64-bit signed integer (the default integer type) |
-| `I8`, `I16`, `I32` | Sized signed integers |
+| `I8`, `I16`, `I32`, `I64` | Sized signed integers |
 | `U8`, `U16`, `U32`, `U64` | Unsigned integers |
 | `Float` | 64-bit IEEE 754 floating point |
+| `F32`, `F64` | Sized floating point (§3.2.3) |
 | `Str` | UTF-8 string, GC-managed |
 | `Char` | Unicode scalar value |
 | `Bool` | Boolean (`true` / `false`) |
@@ -1902,31 +1903,95 @@ These are compiler intrinsics — not library functions. They capture source loc
 
 User-defined names shadow test builtins within test blocks (standard scoping rules). The compiler warns when a test builtin is shadowed.
 
-#### What Is NOT in the Prelude
+#### Compiler-Known Type Names (closed set)
 
-The following compiler-known types are **not** in the prelude — they are used by specific subsystems and should be imported when needed:
+The table below is the **complete** set of compiler-known type names a program can write. Each one is usable in every module **without import**. The set is **closed**: a name the table does not list is not compiler-known, and the compiler must not treat it as one. A new built-in type is added as an ordinary declaration in a named `std` module and is reached through `import`, as `Duration` and `Instant` are in `std.time` (§3.2.3). It is never added to this table.
 
-- `ConversionError` — used by `TryFrom`. Import from `blink.core` when implementing `TryFrom` manually
-- `Range[T]` — used by `..`/`..=` syntax. The compiler creates ranges from range expressions; explicit construction is rare
-- `Handler[E]` — used by effect handlers. Import when writing handler functions
+| Name | Home | Specified in | Declaring it |
+|------|------|--------------|--------------|
+| `Int`, `I8`, `I16`, `I32`, `I64` | prelude | §3.2 | reserved |
+| `U8`, `U16`, `U32`, `U64` | prelude | §3.2 | reserved |
+| `Float`, `F32`, `F64` | prelude | §3.2, §3.2.3 | reserved |
+| `Str`, `Char`, `Bool` | prelude | §3.2 | reserved |
+| `Void` | `blink.ffi` | §9.1.1 | reserved |
+| `Self` | — | §3.6 *The `Self` Type* | reserved |
+| `List[T]`, `Map[K, V]`, `Set[T]` | prelude | §3.2 | shadows, W1010 |
+| `Option[T]`, `Result[T, E]`, `Ordering` | prelude | §3.2, §3.6 | shadows, W1010 |
+| `Iterator[T]` | prelude | §3c.1 | shadows, W1010 |
+| `Never` | prelude | §2.20 | shadows, W1010 |
+| `Bytes`, `StringBuilder` | prelude | §3.2.1, §3.2.3 | shadows, W1010 |
+| `Handle[T]`, `Channel[T]` | prelude | §4.13 | shadows, W1010 |
+| `Template[C]`, `Raw[T]` | prelude | §3b.5 | shadows, W1010 |
+| `ConversionError` | `blink.core` | §3c.2 | shadows, W1010 |
+| `Range[T]` | `blink.core` | §2.10 | shadows, W1010 |
+| `Handler[E]` | `blink.core` | §4.7.1 | shadows, W1010 |
+| `Ptr[T]`, `Buf[T]` | `blink.ffi` | §9.1.1, §9.1.3 | shadows, W1010 |
 
-This keeps the prelude focused on items that participate in core language semantics (operators, loops, pattern matching, string interpolation) and excludes items used only in specific programming patterns.
+The prelude trait names in *Prelude Traits* share the type namespace and follow the same shadowing rule, except the sealed method-surface traits: user code may not redefine those (§3.2.2).
+
+Every name marked *shadows* can also be named through a pseudo-module: `Ptr` and `Buf` through `blink.ffi`, every other one through `blink.core`. No such import is needed; `import blink.core.{Handler}` is an inert documentation marker (§10.7). An **aliased** import (*Import Aliases*, §10.5) binds the alias to the compiler-known type — `import blink.core.{Handle as TaskHandle}` — and this is how a module that shadows one of these names still reaches the builtin.
+
+`FfiScope` is not in the table. No program can write it: an `FfiScope` value occurs only as the resource of a `with ... as` block (§9.1.1), and its type is never written. The name is not reserved, and a user type named `FfiScope` is an ordinary type with no diagnostic. The same holds for spellings the compiler uses internally for function types (`fn(A) -> B`) and tuple types (`(A, B)`): they are not names, and a user may declare `type Fn` or `type Tuple` like any other type.
 
 #### Shadowing Rules
 
-Prelude names can be shadowed by local bindings, module-level definitions, or explicit imports. Shadowing is allowed but the compiler emits a warning:
+A **reserved** name cannot be declared. The reserved names are `Self`, the scalar types that literal syntax produces (`Int`, `I8`–`I64`, `U8`–`U64`, `Float`, `F32`, `F64`, `Str`, `Char`, `Bool`), and `Void`. Declaring one is an error:
 
 ```
-warning[W1010]: name shadows prelude type
- --> math/vector.bl:3:1
+error[ReservedTypeName]: `Int` is a reserved type name
+ --> geo/units.bl:1:6
   |
-3 | type Ordering { ... }
-  |      ^^^^^^^^ shadows prelude type `Ordering`
+1 | type Int {
+  |      ^^^ reserved: literals produce this type in every module
   |
-  = help: consider a different name to avoid confusion
+  = help: choose another name, for example `type IntValue`
 ```
 
-Keywords (`true`, `false`, `fn`, etc.) cannot be shadowed — they are reserved by the parser.
+The reserved set grows only when literal syntax grows.
+
+Every **other** compiler-known type name, and every prelude trait name, may be declared. The declaration wins in its module (§3.4 *Type Name Resolution*), and the compiler emits one warning at the declaration:
+
+```
+warning[W1010]: name shadows compiler-known type
+ --> app/effects.bl:3:6
+  |
+3 | type Handler {
+  |      ^^^^^^^ shadows compiler-known type `Handler[E]` (blink.core)
+  |
+  = help: to use the compiler-known type in this module, import it under another name:
+          import blink.core.{Handler as EffectHandler}
+```
+
+The rule covers every declaration that puts a name in the type namespace: `type` (struct or enum), type alias, `trait`, and `effect`. It also covers module-level definitions reached by an explicit import. Local bindings (`let`) live in the value namespace and are not type declarations.
+
+**Diagnostics that involve a shadowing name.** The escape must be visible where the error is, not only at the declaration. So:
+
+1. The W1010 `help:` line names the aliased-import fix: `import blink.core.{X as Y}`, or `import blink.ffi.{X as Y}` for `Ptr` and `Buf`.
+2. Every diagnostic whose subject is a name that shadows a compiler-known type — type-argument arity (E0303), type mismatch (E0300), missing method, and any other — adds a `note:` that gives the shadowing declaration's location and the builtin's home, and repeats the `help:` line from (1).
+3. When two different types with the same name appear in one diagnostic, each prints as `Name (module)`. Hover in the language server uses the same form.
+
+```blink
+type Handler {
+    n: Int
+}
+
+fn with_db(h: Handler[DB]) { }    // error[TypeArgArity]: see below
+```
+
+```
+error[TypeArgArity]: type `Handler` takes 0 type arguments, found 1
+ --> app/effects.bl:5:15
+  |
+5 | fn with_db(h: Handler[DB]) { }
+  |               ^^^^^^^^^^^
+  |
+  = note: `Handler` here is `type Handler` (app/effects.bl:1), which shadows the compiler-known `Handler[E]` (blink.core)
+  = help: import blink.core.{Handler as EffectHandler}
+```
+
+Shadowing never changes what the compiler inserts. `x?`, `T?`, `for`, `..`, `with`, `async.spawn` and every other desugaring use the compiler-known type by identity (§3.4 *Type Name Resolution*, *Hygiene*).
+
+Keywords (`true`, `false`, `fn`, `handler`, etc.) cannot be shadowed — they are reserved by the parser.
 
 ### 10.7 Standard Library Resolution
 
@@ -1964,7 +2029,7 @@ import std.toml.{toml_parse, toml_get}  // selective import
 
 The `std` prefix is mandatory. There are no bare stdlib imports — `import toml` resolves only to local `src/toml.bl`, never to stdlib. This avoids the ambiguity that plagues Python's stdlib (is `json` local or stdlib?) and matches Rust's `std::` convention.
 
-The `blink.*` namespace remains reserved for compiler-internal pseudo-modules (`blink.core`, `blink.ffi`) that are part of the language definition, not distributable packages. Imports from this reserved namespace resolve as **recognized no-ops** — accepted, inert, never required, and never `ModuleNotFound`. The pseudo-modules' contents (`ffi`'s pointer types and operations per §9.1.1, and `blink.core`'s `ConversionError` per §10.6 *What Is NOT in the Prelude*) are compiler-known and usable without importing them; the import is an optional documentation marker (see [FFI import namespace resolution](../decisions/ffi-import-namespace-resolution.md)).
+The `blink.*` namespace remains reserved for compiler-internal pseudo-modules (`blink.core`, `blink.ffi`) that are part of the language definition, not distributable packages. Imports from this reserved namespace resolve as **recognized no-ops** — accepted, inert, never required, and never `ModuleNotFound`. The pseudo-modules' contents (`ffi`'s pointer types and operations per §9.1.1, and the `blink.core` names per §10.6 *Compiler-Known Type Names*) are compiler-known and usable without importing them; the import is an optional documentation marker (see [FFI import namespace resolution](../decisions/ffi-import-namespace-resolution.md)). The one import from these pseudo-modules that has an effect is an aliased one, `import blink.core.{X as Y}`: it binds `Y` to the compiler-known type, which a module that declares its own `X` needs (§10.6 *Shadowing Rules*).
 
 #### Resolution Order
 
