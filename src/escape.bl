@@ -5,7 +5,7 @@ import parser.{
     node_target, node_iterable, node_obj, node_method, node_params, node_args,
     node_stmts, node_arms, node_fields, node_elements, node_handlers,
     node_type_name, node_effects, node_str_val, node_op, node_type_ann,
-    node_pattern, node_for_binder, node_value_child_ids, sublist_get, sublist_length,
+    node_pattern, node_for_binder, node_value_child_ids, node_is_mut, node_line, sublist_get, sublist_length,
 }
 import diagnostics.{
     Diag, diag_error_at, diag_warn_at, diag_set_last_fix,
@@ -17,7 +17,8 @@ import diagnostics.{
 import typecheck.{
     TyKind, tc_call_decl_is_fn, tc_call_decl_node, tc_fn_has_effect, tc_lookup_node_tid,
     tc_resolve, tc_tid_child, tc_tid_decl_node, tc_tid_kind,
-    tc_ident_binder_node, tc_tid_is_pointer_bearing, tc_tid_reaches_itself, tc_type_str,
+    tc_global_decl_node, tc_ident_binder_node, tc_tid_is_pointer_bearing, tc_tid_reaches_itself,
+    tc_type_str,
 }
 import free_names.{closure_read_idents, pattern_names, push_param_names}
 
@@ -539,12 +540,32 @@ let mut ea_ffi_scope_blocks: List[List[Int]] = []
 
 // Binder node -> tag of the value it binds, and closure literal -> innermost
 // tag of the values it captures. Keyed by node, so a shadowing binder of the
-// same name never reads or clobbers another's tag.
+// same name never reads or clobbers another's tag. A `let mut` binder's cell
+// tag lives here too, under ea_cell_key, since the value and the cell of one
+// binder can have different tags.
 let mut ea_node_tags: Map[Int, Int] = Map()
 
 fn ea_reset_ffi_scope_state() {
     ea_ffi_scope_blocks = []
     ea_node_tags = Map()
+}
+
+// Node ids are never negative, so a cell key never meets a node key.
+fn ea_cell_key(binder: Int) -> Int {
+    -2 - binder
+}
+
+// Records the tag of a `let mut` cell: the innermost ffi.scope around its
+// declaration, or unscoped (-1).
+fn ea_set_cell_tag(binder: Int, tag: Int) {
+    if binder < 0 { return }
+    ea_node_tags.insert(ea_cell_key(binder), tag)
+}
+
+// The tag of the `let mut` cell `binder` declares, or -2 when it declares none.
+fn ea_cell_tag(binder: Int) -> Int {
+    if binder < 0 { return -2 }
+    ea_node_tags.get(ea_cell_key(binder)) ?? -2
 }
 
 fn ea_push_ffi_scope_block() {
@@ -592,6 +613,28 @@ fn ea_ffi_scope_live(tag: Int) -> Int {
     if ea_scope_depth(tag) >= 0 { 1 } else { 0 }
 }
 
+// The position of `tag` in the live chain, outermost first, or -1 once its block
+// has closed. Two scopes one `with` opens are ordered as written.
+fn ea_scope_rank(tag: Int) -> Int {
+    if tag < 0 { return -1 }
+    let mut rank = 0
+    for block in ea_ffi_scope_blocks {
+        for own in block {
+            if own == tag { return rank }
+            rank = rank + 1
+        }
+    }
+    -1
+}
+
+fn ea_innermost_live_scope() -> Int {
+    let mut tag = -1
+    for block in ea_ffi_scope_blocks {
+        for own in block { tag = own }
+    }
+    tag
+}
+
 // The inner of two tags. A tag whose block has closed has no place in the live
 // chain, so a live tag wins over it.
 fn ea_innermost(a: Int, b: Int) -> Int {
@@ -630,7 +673,7 @@ fn ffi_tag_of(node: Int) -> Int {
     if node == -1 { return -1 }
     if node_kind(node) == NodeKind.Closure { return ea_node_tags.get(node) ?? -1 }
     let tid = tc_lookup_node_tid(node)
-    if tid >= 0 && tc_tid_is_pointer_bearing(tid) == 0 { return -1 }
+    if tid >= 0 && tc_tid_is_pointer_bearing(tid) == 0 && tc_tid_kind(tc_resolve(tid)) != TyKind.Fn { return -1 }
     ffi_raw_tag_of(node)
 }
 
@@ -914,6 +957,72 @@ fn check_ffi_ptr_tail_escape(val_node: Int, owning_scopes: List[Int]) ! Diag.Rep
     }
 }
 
+// The tag of the cell a `.write` receiver names, or -2 when it is not known: a
+// pointer bound by something that records no tag, such as a closure parameter.
+fn ffi_write_cell_tag(recv: Int) -> Int {
+    let mut root = recv
+    while root != -1 {
+        let k = node_kind(root)
+        if k == NodeKind.FieldAccess || k == NodeKind.IndexExpr {
+            root = node_obj(root)
+        } else if k == NodeKind.MethodCall && (node_method(root) == "offset" || node_method(root) == "deref" || node_method(root) == "read") {
+            root = node_obj(root)
+        } else {
+            break
+        }
+    }
+    if root != -1 && node_kind(root) == NodeKind.Ident {
+        if ea_node_tags.contains_key(tc_ident_binder_node(root)) == 0 { return -2 }
+    }
+    ffi_raw_tag_of(recv)
+}
+
+// The tag of the `let mut` cell an assignment names, or -2 when it is not a
+// cell this pass knows. A module-level `let mut` is unscoped.
+fn ffi_assign_cell_tag(target: Int) -> Int {
+    if target == -1 || node_kind(target) != NodeKind.Ident { return -2 }
+    if tc_global_decl_node(target) >= 0 { return -1 }
+    ea_cell_tag(tc_ident_binder_node(target))
+}
+
+// E0601 (tag-mismatch): a value stored into a cell must outlive it, so its tag
+// must enclose the cell's. An unscoped value encloses every cell.
+fn check_ffi_store(store_node: Int, val: Int, cell_tag: Int) ! Diag.Report {
+    if cell_tag == -2 { return }
+    let vtag = ffi_tag_of(val)
+    let vrank = ea_scope_rank(vtag)
+    if vrank < 0 { return }
+    if cell_tag >= 0 {
+        let crank = ea_scope_rank(cell_tag)
+        if crank < 0 || vrank <= crank { return }
+    }
+    let vtid = tc_lookup_node_tid(val)
+    let is_closure = node_kind(val) == NodeKind.Closure || (vtid >= 0 && tc_tid_kind(tc_resolve(vtid)) == TyKind.Fn)
+    let form = if is_closure { "capture" } else { "write" }
+    let what = if is_closure { "closure that captures a pointer" } else { "pointer" }
+    let vname = node_name(vtag)
+    let vlabel = ffi_scope_label(vtag, cell_tag)
+    let cell = if cell_tag >= 0 { "a cell of scope {ffi_scope_label(cell_tag, vtag)}" } else { "an unscoped cell" }
+    let help = if cell_tag >= 0 { "allocate the value from `{node_name(cell_tag)}`, or detach it with `{vname}.take(...)`" } else { "detach the value with `{vname}.take(...)`" }
+    emit_ffi_tag_mismatch(store_node, "{what} from scope {vlabel} stored by {form} into {cell}, which outlives it (tag-mismatch)", help)
+}
+
+// A scope as the author named it, with its line when the other scope in the
+// message has the same name.
+fn ffi_scope_label(tag: Int, other: Int) -> Str {
+    let name = node_name(tag)
+    if other >= 0 && other != tag && node_name(other) == name { return "`{name}` (line {node_line(tag)})" }
+    "`{name}`"
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn emit_ffi_tag_mismatch(node: Int, msg: Str, help: Str) ! Diag.Report {
+    let saved = diag_source_file
+    diag_source_file = diag_file_for_node(node)
+    diag_error_at("PtrTagMismatch", CLOSEABLE_ESCAPES_SCOPE, msg, node, help)
+    diag_source_file = saved
+}
+
 // True when `node` is a projection (FieldAccess / IndexExpr chain) whose
 // root ident names an in-scope Closeable binding. Promoting such a value
 // out of the arena would retain a reference into the resource's buffers
@@ -1022,6 +1131,12 @@ fn walk_method_call(node: Int) ! Diag.Report {
         while ai < sublist_length(args_sl) {
             walk_expr(sublist_get(args_sl, ai), 0)
             ai = ai + 1
+        }
+    }
+    if node_method(node) == "write" && args_sl != -1 && sublist_length(args_sl) == 1 {
+        let recv_tid = tc_lookup_node_tid(obj)
+        if recv_tid >= 0 && tc_tid_kind(tc_resolve(recv_tid)) == TyKind.Ptr {
+            check_ffi_store(node, sublist_get(args_sl, 0), ffi_write_cell_tag(obj))
         }
     }
 }
@@ -1242,6 +1357,7 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
 
     if kind == NodeKind.Assignment {
         walk_assignment(node)
+        check_ffi_store(node, node_value(node), ffi_assign_cell_tag(node_target(node)))
         // Flow-insensitive: the binding may hold any value ever assigned to it.
         let target = node_target(node)
         if target != -1 && node_kind(target) == NodeKind.Ident {
@@ -1344,6 +1460,7 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
         let tag = ffi_tag_of(val)
         ea_set_binder_tag(node, tag)
         ea_tag_pattern(node_elements(node), tag)
+        if node_is_mut(node) != 0 { ea_set_cell_tag(node, ea_innermost_live_scope()) }
         return
     }
     if kind == NodeKind.ExprStmt {
