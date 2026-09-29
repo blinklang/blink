@@ -65,7 +65,7 @@ import cg_expr.{
 }
 import cg_eff.{
     cg_eff_async_scope_exit_symbol, cg_eff_binder_is_shared, cg_eff_block_handler_calls,
-    cg_eff_block_handler_enter, cg_eff_block_handler_impl, cg_eff_frame_written, cg_eff_lower_handler_install,
+    cg_eff_block_handler_enter, cg_eff_block_handler_impl, cg_eff_frame_written, cg_eff_lower_handler_install, cg_eff_lower_handler_install_of,
     cg_eff_resource_cleanup,
     cg_eff_scan_shared_binders,
 }
@@ -2745,6 +2745,10 @@ fn wrap_resource(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, de
 // The handler is held in a hidden local, so enter and the guard's exit(ok) both read the
 // one value the item built. The guard is armed only after enter returns, so an enter that
 // never returns has no exit run for it.
+//
+// A Context of Handler[E] makes the item a scoped effect handler: enter()'s result is
+// installed for the body, inside the guard, so the handler is uninstalled before exit(ok)
+// runs on every way out. `as` binds that same handler and installs it all the same.
 fn wrap_block_handler(node: Int, items: Int, n: Int, i: Int, bh: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
     let item = sublist_get(items, i)
     let binds = nk_of(node_kind(item)) == NodeKind.WithResource
@@ -2762,16 +2766,38 @@ fn wrap_block_handler(node: Int, items: Int, n: Int, i: Int, bh: Int, tail: Int,
     // An enter returning Void gives an `as` binder nothing, and typecheck then types the
     // binder as the handler itself, so that is what it holds.
     let void_enter = tc_tid_kind(calls.context_tid) == TyKind.Void
+    let installs = tc_tid_kind(calls.context_tid) == TyKind.Handler
     let mut stmts: List[Int] = [held.stmt]
-    if !binds || void_enter { stmts.push(ir_expr_stmt(item, enter)) }
+    let mut installed = -1
+    if installs && !binds {
+        let h = bind_temp("sh", calls.context_tid, item, enter)
+        stmts.push(h.stmt)
+        installed = h.ref
+    } else if !binds || void_enter {
+        stmts.push(ir_expr_stmt(item, enter))
+    }
     let _ = open_scope()
     let bind = if !binds { 0 } else if void_enter { bind_context(item, held.ref) } else { bind_context(item, enter) }
+    if installs && binds && bind >= 0 { installed = binder_ref(item) }
     let rest = if bind < 0 { -1 } else { wrap_with_items(node, items, n, i + 1, tail, dest, dest_tid) }
     close_scope()
     if rest < 0 { return -1 }
     if binds { stmts.push(bind) }
-    stmts.push(ir_with_scope(item, calls.exit_symbol, held.ref, as_block(rest)))
+    let body = if installs {
+        cg_eff_lower_handler_install_of(item, calls.context_tid, installed, as_block(rest))
+    } else {
+        rest
+    }
+    if body < 0 { return -1 }
+    stmts.push(ir_with_scope(item, calls.exit_symbol, held.ref, as_block(body)))
     ir_block(item, stmts)
+}
+
+// A read of the `as` binder bind_context just declared, as a node of its own.
+fn binder_ref(item: Int) -> Int ! Diag.Report {
+    let tid = stmt_tid(item)
+    let rec = layout_at(tid, Position.Local, item)
+    ir_var_ref(tid, item, rec.c_spelling, cg_local_c_name(node_name(item)), rec.slot_form)
 }
 
 // The binder's type is typecheck's answer and the value's is the handler's own, so a
