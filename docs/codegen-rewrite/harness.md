@@ -151,7 +151,10 @@ jq -r '.files | sort_by(-.seconds) | .[:10][] | "\(.seconds)s \(.file)"' build/c
 
 To rerun a subset, write the file names to a list and run
 `scripts/corpus.sh --only <list>`. The result goes to
-`build/corpus_subset.json` and does not touch the baseline.
+`build/corpus_subset.json` and does not touch the baseline. A subset run
+exits 1 when any listed file fails and 2 when the run itself failed. A full
+run exits 0 with failing files, because corpus-check judges it against the
+baseline. `scripts/test_corpus.sh` proves these exit codes.
 
 ## The corpus sample
 

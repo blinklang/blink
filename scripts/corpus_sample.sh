@@ -26,7 +26,8 @@ if [ -z "$floor" ]; then
 fi
 
 out=build/corpus_sample.json
-CORPUS_OUT="$out" ./scripts/corpus.sh --only "$list" --no-lint
+# Exit 1 is a failing file, which the floor below judges; only 2 stops here.
+CORPUS_OUT="$out" ./scripts/corpus.sh --only "$list" --no-lint || [ $? -eq 1 ]
 
 passed=$(jq -r .passed "$out")
 total=$(jq -r .total "$out")
