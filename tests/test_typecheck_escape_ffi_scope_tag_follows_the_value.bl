@@ -1,0 +1,174 @@
+// sections/07_trust_modules_metadata.md, *Scope tags*: every value that can carry a pointer
+// has the tag of the `ffi.scope` block that frees it, and the tag follows the value through a
+// tuple, `Some`, a closure, a call, `offset` and `deref`. A value whose tag is block `s` may
+// not leave block `s` as its tail. The tag is the binder node, not its name, so an outer
+// `s` pointer passed out of an inner block that is also named `s` does not escape.
+import cg_test_helpers.{cg_probe_begin, cg_probe_errors_named}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import escape.{analyze_escapes}
+import diagnostics.{diag_entries, diag_ice_count}
+import std.io
+
+// Checks and escape-analyzes `src`, and answers the E0601 count. Any other error, or an
+// internal error, fails the row: a probe that stops early reports no escape.
+fn escapes_in(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    cg_probe_begin(path)
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    analyze_escapes(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut others = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.name != "PtrEscapesFfiScope" {
+            io.println("FAIL: {stem} recorded an error the row does not expect: {d.name}: {d.message}")
+            others = others + 1
+        }
+    }
+    assert_eq(others, 0)
+    assert_eq(diag_ice_count, 0)
+    cg_probe_errors_named("PtrEscapesFfiScope")
+}
+
+test "a tuple holding a scope pointer escapes as the block tail" {
+    assert_eq(escapes_in("tag_tuple", #"fn main() {
+    let _ = with ffi.scope() as s {
+        let p = s.alloc[U8]()
+        (p, 1)
+    }
+}
+"#), 1)
+}
+
+test "Some of a scope pointer escapes as the block tail" {
+    assert_eq(escapes_in("tag_some", #"fn main() {
+    let _ = with ffi.scope() as s {
+        let p = s.alloc[U8]()
+        Some(p)
+    }
+}
+"#), 1)
+}
+
+test "a closure that captures a scope pointer escapes as the block tail" {
+    assert_eq(escapes_in("tag_closure", #"fn main() {
+    let f = with ffi.scope() as s {
+        let p = s.alloc[U8]()
+        fn() -> Bool { p.is_null() }
+    }
+    let _ = f()
+}
+"#), 1)
+}
+
+test "a call result takes the tag of its pointer argument" {
+    assert_eq(escapes_in("tag_call", #"@ffi("c", "ident_ptr")
+@trusted(audit: "TAG-CALL")
+fn ident(p: Ptr[U8]) -> Ptr[U8] ! FFI { }
+
+fn main() ! FFI {
+    let _ = with ffi.scope() as s {
+        let p = s.alloc[U8]()
+        ident(p)
+    }
+}
+"#), 1)
+}
+
+test "deref of a pointer to a pointer keeps the outer pointer's tag" {
+    assert_eq(escapes_in("tag_deref", #"fn main() {
+    let _ = with ffi.scope() as s {
+        let pp = s.alloc[Ptr[U8]]()
+        pp.deref()
+    }
+}
+"#), 1)
+}
+
+test "an outer pointer passed out of an inner block of the same name does not escape" {
+    assert_eq(escapes_in("tag_same_name_outer", #"fn main() {
+    with ffi.scope() as s {
+        let p = s.alloc[U8]()
+        let q = with ffi.scope() as s {
+            let _inner = s.alloc[U8]()
+            p
+        }
+        let _ = q.is_null()
+    }
+}
+"#), 0)
+}
+
+test "an inner pointer leaving an inner block of the same name escapes" {
+    assert_eq(escapes_in("tag_same_name_inner", #"fn main() {
+    with ffi.scope() as s {
+        let _outer = s.alloc[U8]()
+        let q = with ffi.scope() as s {
+            s.alloc[U8]()
+        }
+        let _ = q.is_null()
+    }
+}
+"#), 1)
+}
+
+test "Some of a taken pointer does not escape" {
+    assert_eq(escapes_in("tag_some_take", #"fn main() {
+    let _ = with ffi.scope() as s {
+        let p = s.alloc[U8]()
+        Some(s.take(p))
+    }
+}
+"#), 0)
+}
+
+test "a call with no pointer argument gives an unscoped result" {
+    assert_eq(escapes_in("tag_call_unscoped", #"@ffi("c", "fresh_ptr")
+@trusted(audit: "TAG-CALL")
+fn fresh() -> Ptr[U8] ! FFI { }
+
+fn main() ! FFI {
+    let _ = with ffi.scope() as s {
+        let _p = s.alloc[U8]()
+        fresh()
+    }
+}
+"#), 0)
+}
+
+test "a pointer-free value computed from a scope pointer does not escape" {
+    assert_eq(escapes_in("tag_bool_tail", #"fn main() {
+    let _ = with ffi.scope() as s {
+        let p = s.alloc[U8]()
+        p.is_null()
+    }
+}
+"#), 0)
+}
+
+test "a match binder takes the tag of the scrutinee" {
+    assert_eq(escapes_in("tag_match_binder", #"fn main() {
+    let _ = with ffi.scope() as s {
+        let p = s.alloc[U8]()
+        match Some(p) {
+            Some(q) => q
+            None => null_ptr[U8]()
+        }
+    }
+}
+"#), 1)
+}
+
+test "a let mut binding holds the tag of a value assigned to it" {
+    assert_eq(escapes_in("tag_assigned", #"fn main() {
+    let _ = with ffi.scope() as s {
+        let mut q = null_ptr[U8]()
+        q = s.alloc[U8]()
+        q
+    }
+}
+"#), 1)
+}
