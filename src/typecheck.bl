@@ -4908,6 +4908,10 @@ fn check_arg_shapes_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offset
     let fs = fnsig_pool.get(sig).unwrap()
     let param_start = fs.params_start
     let param_count = fs.params_count
+    // What the arguments read so far say each type parameter is. A type parameter has one
+    // type per call, so a later argument is checked against the type an earlier one fixed,
+    // the rule a list literal's elements follow.
+    let mut seen: Map[Str, Int] = Map()
     let n = sublist_length(args_sl)
     let mut i = 0
     while i < n {
@@ -4921,8 +4925,10 @@ fn check_arg_shapes_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offset
         }
         let mut arg_t = -1
         if pidx >= 0 && pidx < param_count {
-            let ptid = substitute_typevar_tid(fnsig_param_list.get(param_start + pidx).unwrap(), binds)
+            let formal = fnsig_param_list.get(param_start + pidx).unwrap()
+            let ptid = substitute_typevar_tid(substitute_typevar_tid(formal, binds), tc_concrete_binds(seen))
             if tc_tid_is_no_info(ptid) == 0 { arg_t = check_one_arg_shape(fn_name, i, arg_node, ptid) }
+            if arg_t >= 0 { unify_typevar_binds(formal, arg_t, seen) }
         }
         // build_typevar_binds aligns by position, so a position with a parameter needs a
         // tid even where the check above had no parameter type to hint it from.
@@ -4931,6 +4937,16 @@ fn check_arg_shapes_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offset
         i = i + 1
     }
     tids
+}
+
+// A placeholder bind (a bare metavariable from `Map()` against `K`) says nothing yet, and
+// hinting the next argument with it would type that argument from a hole.
+fn tc_concrete_binds(binds: Map[Str, Int]) -> Map[Str, Int] {
+    let mut out: Map[Str, Int] = Map()
+    for (k, v) in binds {
+        if bind_target_is_concrete(v) != 0 { out.insert(k, v) }
+    }
+    out
 }
 
 // One argument against its parameter type `ptid`, answering the argument's type.
@@ -4957,7 +4973,10 @@ fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int) -> Int 
     // infers List[Int]). tc_unify returns 0 on a hard mismatch (real
     // arg-type error). Only when a metavar is actually present, so the
     // fully-concrete path keeps its existing types_compatible semantics.
-    if tc_tid_has_unbound_metavar(arg_t) != 0 {
+    //
+    // The parameter side can carry one too: `pick([], [1])` fixes T as List[α] from its first
+    // argument, and only the second argument can pin α.
+    if tc_tid_has_unbound_metavar(arg_t) != 0 || tc_tid_has_unbound_metavar(ptid) != 0 {
         if tc_unify(ptid, arg_t) == 0 {
             tc_error_at("argument {idx + 1} of `{fn_name}` expects {type_to_str(ptid)}, got {type_to_str(arg_t)}", arg_node)
         }
