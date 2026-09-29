@@ -241,8 +241,6 @@ impl Joinable for List[Str] {
 4. **`StringBuilder`** — for efficient incremental string building in loops and codegen:
 
 ```blink
-import std.str.{StringBuilder}
-
 fn build_json(fields: List[(Str, Str)]) -> Str {
     let mut sb = StringBuilder.new()
     sb.write("{")
@@ -536,7 +534,7 @@ A sealed trait may still be named in a generic bound — e.g. `fn f[T: Sized](x:
 
 #### §3.2.3 Additional Standard Library Types
 
-Beyond the built-in primitives (§3.2) and collections (§3.2.2), Blink's standard library provides typed value types for domains where raw primitives lose semantic meaning. These types are not compiler-known and not in the prelude — they live in stdlib modules and require explicit import. The compiler's built-in effect handles reference these types for their operation signatures.
+Beyond the built-in primitives (§3.2) and collections (§3.2.2), Blink's standard library provides typed value types for domains where raw primitives lose semantic meaning. Except for the types listed in §10.6 *Compiler-Known Type Names* (`Bytes`, `F32`), these types are not compiler-known and not in the prelude — they live in stdlib modules and require explicit import. The compiler's built-in effect handles reference these types for their operation signatures.
 
 ##### Instant and Duration (`std.time`, Tier 2)
 
@@ -610,13 +608,11 @@ Duration's `Display` writes the same text as Go's `time.Duration.String`. A dura
 
 **Wall-clock DateTime.** Calendar-aware datetime (year, month, day, timezone) lives in `std.time.DateTime`, constructed from an `Instant` via `DateTime.from(instant)`. Calendar decomposition carries unbounded complexity (timezones, DST, leap seconds) that belongs in stdlib, not built-in types.
 
-##### Bytes (`std.bytes`, Tier 1)
+##### Bytes (compiler-known, §10.6)
 
 `Bytes` is a contiguous byte buffer — the binary counterpart to `Str`. Where `Str` guarantees UTF-8 validity, `Bytes` carries no encoding invariant.
 
 ```blink
-import std.bytes.Bytes
-
 fn read_binary(path: Str) -> Bytes ! FS.Read {
     fs.read_bytes(path)
 }
@@ -1569,6 +1565,56 @@ The `Err(e) => n` arm does not rescue the scrutinee. It binds `e` but discards i
 **What pins `E`.** The error type of a `Result` is determined by any one of four things: a type annotation on the binding (`let r: Result[Int, Str] = Ok(3)`), a `?` in a context whose error type it must match, a `match` arm that reads the `Err` payload's type, or an enclosing return type that names it. When none is present, `E` is under-determined and the constructor must state it. The repair is an explicit type-argument list on the constructor — `Ok[Int, Str](3)` (§3.4 *Explicit Type Application*) — placed where the open parameter lives. As with every under-determined binding, E0301 is reported where its repair attaches (§3.4, as amended): the `let` when a binding dominates the value, otherwise the constructor's type-argument position, with the dual-span blame at the open constructor.
 
 There is no "an Ok-only value proves the error type is uninhabited, so resolve it to a bottom type" rule. Inferring a type the program never wrote — whether the erased unit `Void` or a bottom `Never` — into an unconstrained slot is the same unlicensed substitution the two-state model forbids; a `Never` error type is reached only when a program *writes* `Result[Int, Never]`, never chosen by inference for an open slot. The I0001 backstop that catches a variable reaching monomorphization keys on the variable's *kind*, never on the concrete tag it would have been given, so a genuine `Result[Void, Str]` or an explicitly-written `Result[Int, Never]` is unaffected.
+
+#### Type Name Resolution (normative)
+
+A type name resolves **once**, at name resolution, to **one declaration identity**. Every later phase — inference, trait resolution, monomorphization, code generation — works on that identity and never looks the name up again.
+
+- A name that resolves to no declaration is `error[UnknownType]` (E0507).
+- Only an explicit `[T]` binder on the enclosing declaration creates a type variable. A type name is never turned into a type variable because it is unresolved, special, or compiler-known.
+- A `type` declaration the compiler accepts is a declaration that code in the same module can name, construct, and use as a type. There is no declaration that is accepted and then unusable.
+
+```blink
+type Handler {    // warning[W1010]: shadows compiler-known type Handler
+    n: Int
+}
+
+fn use_it(h: Handler) -> Int { h.n }
+
+fn main() {
+    io.println("{use_it(5)}")    // error[TypeError]: expected `Handler (main)`, found `Int`
+}
+```
+
+```
+error[TypeError]: mismatched types
+ --> main.bl:6:25
+  |
+6 |     io.println("{use_it(5)}")
+  |                         ^ expected `Handler (main)`, found `Int`
+  |
+  = note: `Handler` here is `type Handler` (main.bl:1), which shadows the compiler-known `Handler[E]` (blink.core)
+  = help: to name the compiler-known type, import it under another name: import blink.core.{Handler as EffectHandler}
+```
+
+`Handler` in `use_it` is the module's own struct (it shadows the compiler-known `Handler[E]`, §10.6 *Shadowing Rules*), so `use_it(5)` is an ordinary type mismatch. It is never a type variable that accepts `5`.
+
+**Hygiene.** Syntax that the compiler expands, and types the compiler inserts, refer to the compiler-known type **by identity**, never by the name that is in scope at the use site. This covers `T?` and `??` (`Option`), `?` (`Result`/`Option`), `for` (`IntoIterator`/`Iterator`), `..`/`..=` (`Range`), `==`/`<` and the other operators (their traits), `with` (`Handler`, `Closeable`), `async.spawn` (`Handle`), `Template[C]` coercion, literals (`Int`, `Float`, `Str`, `Char`, `Bool`), and every other desugaring in this spec. A module that declares its own `Option` still gets the builtin `Option` from `x?`:
+
+```blink
+type Option {
+    label: Str
+}                                 // warning[W1010]: shadows compiler-known type `Option`
+
+fn first(xs: List[Int]) -> Int? {  // `Int?` is the builtin Option[Int], by identity
+    let x = xs.get(0)?
+    Some(x)
+}
+```
+
+**Identity, not spelling, selects behavior.** No compiler phase may choose behavior — a runtime representation, a method surface, a desugaring, a C name — from a type's name string. It chooses it from the declaration identity alone. Two types with the same name and different identities are different types everywhere.
+
+The set of names that may not be declared at all, and the rule for a declaration that takes any other compiler-known name, are in §10.6 *Shadowing Rules*.
 
 #### Recursive Types
 

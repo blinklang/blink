@@ -97,6 +97,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | CoalesceRequiresOption | E0513 | `??` operator used on non-Option value | Type checking | §3c.2 |
 | AmbiguousMethodCall | E0522 | Unqualified method call resolves to a method defined by two or more implemented traits | Name resolution | §3.6 |
 | MissingDisplayImpl | E0523 | Interpolated `{expr}` type does not implement `Display` | Type checking | §3.6 |
+| ReservedTypeName | E0524 | A `type`, type alias, `trait` or `effect` declaration takes a reserved name: `Self`, a scalar type that literal syntax produces, or `Void` | Name resolution | §10.6 |
 | NoSuchField | E0525 | Field access names a field the struct, tuple, or opaque handle does not declare | Type checking | §3.2 |
 | PositionalAfterKeyword | E0527 | A positional argument follows a labelled one in the same call | Name resolution | §2.13 |
 | DuplicateKeywordArg | E0528 | The same call-site label appears twice in one call | Name resolution | §2.13 |
@@ -209,7 +210,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | OverrideOfDeprecatedDefault | W0731 | `impl` overrides a trait default marked `@deprecate_override` | Trait sealing | §3.6 |
 | UnauditedFfi | W0800 | Unaudited foreign function call. Audit-gated: `@trusted(audit: K)` is its only suppression channel — `@allow` and `[lints]` are refused | FFI | §9.1 |
 | MissingCanonicalHeader | W0812 | `@ffi.struct` header not declared in blink.toml | FFI | §9.2.1 |
-| ShadowedPreludeName | W1010 | Module-level trait has the name of a prelude trait; it shadows the prelude one in its module | Modules | §10.6 |
+| ShadowedPreludeName | W1010 | A `type`, type alias, `trait` or `effect` declaration takes a compiler-known type name or prelude trait name that is not reserved; it shadows the builtin in its module. The `help:` line names the `import blink.core.{X as Y}` (or `blink.ffi`) escape | Modules | §10.6 |
 | DeprecatedUsage | W2000 | Use of an item annotated `@deprecated` | Linting | §6 |
 
 ---
