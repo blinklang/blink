@@ -1,0 +1,63 @@
+// Section 4.7 reads a with-item without `as` as a Handler[E], then a BlockHandler whose
+// Context is Handler[E], then one whose Context is (). A Result around a scoped handler is
+// none of these, and a Context the with site cannot see is none of them either.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn errors_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = "{out}{d.code} {d.message} | {d.help}\n" }
+    }
+    out
+}
+
+let SCOPED = "effect Greeter \{\n    effect Ops \{\n        fn greet() -> Str\n    }\n}\ntype Scoped \{ w: Str }\nimpl BlockHandler for Scoped \{\n    type Context = Handler[Greeter]\n    fn enter(self) -> Handler[Greeter] \{\n        let w = self.w\n        handler Greeter \{\n            fn greet() -> Str \{ w }\n        }\n    }\n    fn exit(self, ok: Bool) \{ }\n}\nfn open(w: Str) -> Result[Scoped, Str] \{ Ok(Scoped \{ w: w }) }\n"
+
+fn reported(name: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let _ = probe("build/tc_scoped_item_{name}.bl", src)
+    let got = errors_reported()
+    io.println("{name}: {got}")
+    got
+}
+
+test "a scoped effect handler item is accepted" {
+    let src = "{SCOPED}fn main() \{\n    with open(\"a\").unwrap() \{\n        io.println(greeter.greet())\n    }\n}\n"
+    assert_eq(reported("ok", src), "")
+}
+
+test "a scoped effect handler item bound by as is accepted" {
+    let src = "{SCOPED}fn main() \{\n    with open(\"a\").unwrap() as h \{\n        let g: Handler[Greeter] = h\n        with g \{ io.println(greeter.greet()) }\n    }\n}\n"
+    assert_eq(reported("as_ok", src), "")
+}
+
+test "a Result item is refused with a hint to unwrap it" {
+    let src = "{SCOPED}fn main() \{\n    with open(\"a\") \{\n        io.println(\"in\")\n    }\n}\n"
+    let got = reported("result", src)
+    assert(got.starts_with("E0839 "))
+    assert(got.contains("Result[Scoped, Str]"))
+    assert(got.contains("add ? or .unwrap()"))
+}
+
+test "an item whose Context is abstract is refused and names the Context" {
+    let src = "fn run[T: BlockHandler](t: T) \{\n    with t \{\n        io.println(\"in\")\n    }\n}\nfn main() \{ }\n"
+    let got = reported("abstract", src)
+    assert(got.starts_with("E0839 "))
+    assert(got.contains("T.Context"))
+    assert(!got.contains("BlockHandler[Context"))
+}

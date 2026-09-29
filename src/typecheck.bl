@@ -13592,12 +13592,13 @@ fn tc_unclaimed_call_nodes() -> List[Int] {
 pub fn tc_unresolved_call_count() -> Int { tc_unclaimed_call_nodes().len() }
 
 // `with X as ctx` does not always bind X: for a BlockHandler the binder is what
-// `enter()` returns, i.e. the impl's `type Context`. Resource type name -> Context type name,
-// filled from the same impl walk that fills the method registry below, since that loop already
-// holds both the impl node and its trait name. The Context is kept as a NAME and resolved to a
-// tid on demand — this registry is written in Phase 1, and a struct declared after the impl is
-// not interned yet.
-let mut nr_bh_context: Map[Str, Str] = Map()
+// `enter()` returns, i.e. the impl's `type Context`. Resource type name -> the impl's Context
+// AssocType node, filled from the same impl walk that fills the method registry below, since
+// that loop already holds both the impl node and its trait name. The Context is kept as a node
+// and resolved to a tid on demand — this registry is written in Phase 1, and a struct declared
+// after the impl is not interned yet. A node rather than a name, because a name keeps only the
+// head of `Handler[DB]`.
+let mut nr_bh_context: Map[Str, Int] = Map()
 
 fn is_callable_field_name(name: Str) -> Int {
     let mut i = 0
@@ -14149,7 +14150,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
                     while ai < sublist_length(ctx_sl) {
                         let at_node = sublist_get(ctx_sl, ai)
                         if node_name(at_node) == "Context" {
-                            nr_bh_context.insert(impl_type, node_type_name(at_node))
+                            nr_bh_context.insert(impl_type, at_node)
                         }
                         ai = ai + 1
                     }
@@ -20790,17 +20791,17 @@ fn tc_check_match_exhaustive(node: Int, scrut_tid: Int, arms_sl: Int) ! TypeChec
 // Conservative by construction: anything this cannot answer — a non-nominal resource, an impl with
 // no Context, a Context naming a type that does not resolve (a typevar on a generic handler) — falls
 // back to the resource tid, which is exactly what every caller got before.
-fn tc_with_binder_tid(res_tid: Int) -> Int ! TypeCheck.Resolve {
+fn tc_with_binder_tid(res_tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     let rname = tc_tid_struct(res_tid)
     if rname == "" { return res_tid }
-    let ctx_name = nr_bh_context.get(rname) ?? ""
-    if ctx_name == "" { return res_tid }
+    let ctx_node = nr_bh_context.get(rname) ?? -1
+    if ctx_node < 0 { return res_tid }
+    let ctx_tid = tc_resolve(resolve_type_ann(node_type_ann(ctx_node)))
+    if ctx_tid < 0 { return res_tid }
     // `type Context = Void` is the shape both stdlib handlers use (db_sqlite's Transaction,
     // testing's Cleanup): enter() returns nothing, so the handler does not rebind and the form is
     // `with sqlite_transaction(h) { ... }` with no `as` at all. Nothing to swap in.
-    if ctx_name == "Void" { return res_tid }
-    let ctx_tid = resolve_type_name(ctx_name)
-    if ctx_tid < 0 { return res_tid }
+    if tc_tid_kind(ctx_tid) == TyKind.Void { return res_tid }
     // A generic handler's `type Context = T` resolves to a typevar outside the binding instance.
     // Swapping a concrete resource tid for an unbound one trades a wrong answer for no answer, which
     // is worse for every downstream consumer. No generic BlockHandler impl exists in-tree yet, so
@@ -20817,11 +20818,39 @@ fn tc_check_with_handler_item(item: Int, tid0: Int) ! Diag.Report {
     let tid = tc_resolve(tid0)
     if tc_tid_is_no_info(tid) != 0 { return }
     let k = tc_tid_kind(tid)
+    if k == TyKind.Typevar && tc_typevar_binds_here(tid) != 0 {
+        let tp = type_to_str(tid)
+        if tc_pipe_has(tc_tparam_bound_traits(tp), "BlockHandler") != 0 {
+            tc_report_abstract_block_handler_context(item, tp)
+            return
+        }
+    }
     if k == TyKind.Unknown || k == TyKind.Typevar || k == TyKind.Handler { return }
     if tc_tid_has_block_handler(tid) != 0 { return }
+    // A scoped handler is usually acquired through a Result, and the item then holds the
+    // Result rather than the handler it carries.
+    let help = if k == TyKind.Result && tc_tid_is_with_handler(ty_pool.get(tid).unwrap().inner1) {
+        "add ? or .unwrap() to use the handler the Result holds"
+    } else {
+        "install a handler here, or bind a resource with `with <expr> as <name>`"
+    }
     diag_error_at("NonHandlerWithItem", WITH_ITEM_NOT_A_HANDLER,
-        "a with-item without `as` must be a Handler[E] or a BlockHandler, got {type_to_str(tid)}", item,
-        "install a handler here, or bind a resource with `with <expr> as <name>`")
+        "a with-item without `as` must be a Handler[E] or a BlockHandler, got {type_to_str(tid)}", item, help)
+}
+
+fn tc_tid_is_with_handler(tid0: Int) -> Bool ! Diag.Report {
+    let tid = tc_resolve(tid0)
+    if tc_tid_kind(tid) == TyKind.Handler { return true }
+    tc_tid_has_block_handler(tid) != 0
+}
+
+// A type parameter bounded by BlockHandler leaves its Context abstract, so the with site
+// cannot tell a scoped effect handler from a Context of () (sections/04_effects.md,
+// Scoped effect handlers): it installs no handler and meets no row.
+fn tc_report_abstract_block_handler_context(item: Int, tp: Str) ! Diag.Report {
+    diag_error_at("NonHandlerWithItem", WITH_ITEM_NOT_A_HANDLER,
+        "a with-item without `as` needs a known Context, but `{tp}.Context` is abstract here", item,
+        "call this with a concrete type, or bind the item with `with <expr> as <name>`")
 }
 
 // The receiver is matched by its declaration node, which every instance of a generic

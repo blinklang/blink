@@ -1,0 +1,110 @@
+// A BlockHandler whose Context is Handler[E] installs the handler enter() returns for the
+// body only, and runs exit(ok) after the handler is uninstalled.
+
+effect Greeter {
+    effect Ops {
+        fn greet() -> Str
+    }
+}
+
+type Scoped {
+    word: Str
+    log: List[Str]
+}
+
+impl BlockHandler for Scoped {
+    type Context = Handler[Greeter]
+    fn enter(self) -> Handler[Greeter] {
+        self.log.push("enter")
+        let w = self.word
+        handler Greeter {
+            fn greet() -> Str { w }
+        }
+    }
+    fn exit(self, ok: Bool) {
+        self.log.push("exit:{ok}")
+    }
+}
+
+fn greet_twice() -> Str ! Greeter.Ops {
+    "{greeter.greet()}{greeter.greet()}"
+}
+
+fn fails_inside(s: Scoped) -> Result[Int, Str] {
+    with s {
+        s.log.push("body:{greeter.greet()}")
+        let n: Result[Int, Str] = Err("no")
+        n?
+    }
+    Ok(0)
+}
+
+test "the body sees the handler enter returned" {
+    let s = Scoped { word: "hi", log: [] }
+    with s {
+        assert_eq(greeter.greet(), "hi")
+        assert_eq(greet_twice(), "hihi")
+    }
+    assert_eq(s.log.join(","), "enter,exit:true")
+}
+
+test "the outer handler is back after the block" {
+    with handler Greeter {
+        fn greet() -> Str { "outer" }
+    } {
+        let s = Scoped { word: "inner", log: [] }
+        with s {
+            assert_eq(greeter.greet(), "inner")
+        }
+        assert_eq(greeter.greet(), "outer")
+    }
+}
+
+test "as binds the installed handler and still installs it" {
+    let s = Scoped { word: "bound", log: [] }
+    with s as h {
+        assert_eq(greeter.greet(), "bound")
+        with handler Greeter {
+            fn greet() -> Str { "other" }
+        } {
+            assert_eq(greeter.greet(), "other")
+            with h {
+                assert_eq(greeter.greet(), "bound")
+            }
+        }
+    }
+    assert_eq(s.log.join(","), "enter,exit:true")
+}
+
+test "a later item uses the handler an earlier item installed" {
+    let s = Scoped { word: "first", log: [] }
+    let t = Scoped { word: "second", log: [] }
+    with s, t {
+        assert_eq(greeter.greet(), "second")
+    }
+    assert_eq(s.log.join(","), "enter,exit:true")
+    assert_eq(t.log.join(","), "enter,exit:true")
+}
+
+test "exit gets ok false when ? leaves the body" {
+    let s = Scoped { word: "q", log: [] }
+    assert(fails_inside(s).is_err())
+    assert_eq(s.log.join(","), "enter,body:q,exit:false")
+}
+
+test "an expected panic uninstalls the handler and runs exit false" {
+    with handler Greeter {
+        fn greet() -> Str { "outer" }
+    } {
+        let s = Scoped { word: "inner", log: [] }
+        let empty: List[Int] = []
+        assert_panics {
+            with s {
+                s.log.push("body:{greeter.greet()}")
+                let _ = empty.get(3).unwrap()
+            }
+        }
+        assert_eq(greeter.greet(), "outer")
+        assert_eq(s.log.join(","), "enter,body:inner,exit:false")
+    }
+}
