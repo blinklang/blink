@@ -2337,6 +2337,10 @@ error[SelfNotConstructor]: `Self` is not a constructor
 
 **`self` is always passed by value.** Blink is garbage-collected — there is no by-reference vs by-move distinction. The `self` parameter is a value like any other parameter. No `&self`, `&mut self`, or `self: Box[Self]` forms exist.
 
+A method cannot change its caller's value through `self`. State that must persist across calls lives in a `let mut` binding captured by a closure or handler (§2.8, §4.7). Whether an assignment to a field of `self`, or of any parameter, is a compile error is an open question; the panel that ruled on mock controllers recommends an error.
+
+Passing or binding a struct copies its fields. A field whose value is a shared cell — a `List`, `Map` or `Set`, or a closure or handler that captured a `let mut` binding — refers to the same cell after the copy. After `let mut b = a` and `b.x = 2`, `a.x` is unchanged; after `b.xs.push(5)`, `a.xs` holds the new element too.
+
 #### Operations on `Self` in a Default Body
 
 Inside a trait's default method body, `self` has the abstract type `Self`. `Self`
