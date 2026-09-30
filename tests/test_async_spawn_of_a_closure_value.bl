@@ -1,0 +1,128 @@
+import compile_test_helpers
+
+// async.spawn takes any value of type fn() -> T ! _, not only a closure literal
+// written at the call. Each run row returns a type that is not one machine word,
+// so a task whose return type was erased to a scalar cannot print the right answer.
+
+fn run_expect(src: Str, tag: Str, want: Str) {
+    let r = compile_test_helpers.compile_and_run(src, tag)
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, want)
+}
+
+// A wrong argument is a type error at the argument, not a missing member of `async`.
+fn expect_spawn_type_error(src: Str, tag: Str) {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_error(out, "E0300", "spawn argument is not fn() -> T")
+    assert(!out.contains("E0505"), "spawn argument reported as E0505: {out}")
+    assert(!out.contains("no member `spawn`"), "spawn reported as a missing member: {out}")
+}
+
+test "spawn of a local closure variable awaits its struct result" {
+    run_expect(#"type Node { n: Int }
+fn main() ! IO {
+    let f = fn() -> Node { Node { n: 5 } }
+    let h = async.spawn(f)
+    let v = h.await
+    io.println("n={v.n}")
+}
+"#, "_spawn_value_local", "n=5\n")
+}
+
+test "spawn of a top-level function name awaits its struct result" {
+    run_expect(#"type Node { n: Int }
+fn make() -> Node { Node { n: 6 } }
+fn main() ! IO {
+    let h = async.spawn(make)
+    let v = h.await
+    io.println("n={v.n}")
+}
+"#, "_spawn_value_fn_name", "n=6\n")
+}
+
+test "spawn of a closure held in a struct field awaits its struct result" {
+    run_expect(#"type Node { n: Int }
+type Maker { make: fn() -> Node }
+fn main() ! IO {
+    let m = Maker { make: fn() -> Node { Node { n: 7 } } }
+    let h = async.spawn(m.make)
+    let v = h.await
+    io.println("n={v.n}")
+}
+"#, "_spawn_value_field", "n=7\n")
+}
+
+test "spawn of a closure returned by a call awaits its struct result" {
+    run_expect(#"type Node { n: Int }
+fn maker(k: Int) -> fn() -> Node {
+    fn() -> Node { Node { n: k } }
+}
+fn main() ! IO {
+    let h = async.spawn(maker(8))
+    let v = h.await
+    io.println("n={v.n}")
+}
+"#, "_spawn_value_call", "n=8\n")
+}
+
+test "spawn of a closure value returning a Result awaits the whole Result" {
+    run_expect(#"type Node { n: Int }
+fn main() ! IO {
+    let f = fn() -> Result[Node, Str] { Ok(Node { n: 9 }) }
+    let h = async.spawn(f)
+    match h.await {
+        Ok(v) => io.println("ok n={v.n}")
+        Err(e) => io.println("err {e}")
+    }
+}
+"#, "_spawn_value_result", "ok n=9\n")
+}
+
+test "spawn of a closure value returning an Option awaits the whole Option" {
+    run_expect(#"type Node { n: Int }
+fn main() ! IO {
+    let f = fn() -> Option[Node] { Some(Node { n: 10 }) }
+    let h = async.spawn(f)
+    match h.await {
+        Some(v) => io.println("some n={v.n}")
+        None => io.println("none")
+    }
+}
+"#, "_spawn_value_option", "some n=10\n")
+}
+
+test "spawn of a function value that performs an effect is accepted" {
+    run_expect(#"type Node { n: Int }
+fn make() -> Node ! IO {
+    io.println("in task")
+    Node { n: 11 }
+}
+fn main() ! IO {
+    let h = async.spawn(make)
+    let v = h.await
+    io.println("n={v.n}")
+}
+"#, "_spawn_value_effectful", "in task\nn=11\n")
+}
+
+test "spawn of an Int is a type error" {
+    expect_spawn_type_error(#"fn main() {
+    let _h = async.spawn(5)
+}
+"#, "_spawn_value_int")
+}
+
+test "spawn of a closure value that takes a parameter is a type error" {
+    expect_spawn_type_error(#"fn main() {
+    let g = fn(x: Int) -> Int { x }
+    let _h = async.spawn(g)
+}
+"#, "_spawn_value_param")
+}
+
+test "spawn of a closure literal that takes a parameter is a type error" {
+    expect_spawn_type_error(#"fn main() {
+    let _h = async.spawn(fn(x: Int) -> Int { x })
+}
+"#, "_spawn_literal_param")
+}

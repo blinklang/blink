@@ -73,7 +73,7 @@ import cg_expr.{
 import cg_stmt.{enum_tag_word, lower_block_into}
 import cg_eff.{
     cg_eff_ev_argument, cg_eff_lower_builtin_perform, cg_eff_lower_time_perform, cg_eff_lower_user_perform,
-    cg_eff_lower_spawn_closure, cg_eff_pending_thunks, cg_eff_thunk_task_symbol, cg_eff_lower_fn_value,
+    cg_eff_lower_spawn_closure, cg_eff_spawn_value_task, cg_eff_pending_thunks, cg_eff_thunk_task_symbol, cg_eff_lower_fn_value,
 }
 import cg_print.{vtable_slot_self_spelling}
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
@@ -1674,13 +1674,26 @@ fn lower_async_call(node: Int, method: Str) -> Int ! Diag.Report {
         return -1
     }
 
-    // The index this thunk will land at is read before it is queued, because the queue is
+    // For a closure literal, the index its thunk will land at is read before it is queued, because the queue is
     // the only place the task wrapper's own symbol lives once cg_eff_lower_spawn_closure
     // returns -- the closure value it hands back is the runtime closure, not the wrapper.
-    let idx = cg_eff_pending_thunks()
-    let closure_val = cg_eff_lower_spawn_closure(sublist_get(node_args(node), 0))
-    if closure_val < 0 { return -1 }
-    let task_symbol = cg_eff_thunk_task_symbol(idx)
+    //
+    // Any other argument is already a closure value, so it lowers as one, and the wrapper
+    // that calls it is the one shared by every value spawn of its result type.
+    let arg = sublist_get(node_args(node), 0)
+    let mut closure_val = -1
+    let mut task_symbol = ""
+    if node_kind(arg) == NodeKind.Closure {
+        let idx = cg_eff_pending_thunks()
+        closure_val = cg_eff_lower_spawn_closure(arg)
+        if closure_val < 0 { return -1 }
+        task_symbol = cg_eff_thunk_task_symbol(idx)
+    } else {
+        closure_val = lower_expr(arg)
+        if closure_val < 0 { return -1 }
+        task_symbol = cg_eff_spawn_value_task(arg)
+        if task_symbol == "" { return -1 }
+    }
 
     let handle_name = c_mint_local("spawn")
     cg_expr_push_pending(node, ir_let(tid, node, handle_rec.c_spelling, handle_name, handle_rec.slot_form,

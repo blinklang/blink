@@ -5698,6 +5698,25 @@ fn tc_fn_tid_ret(fn_tid: Int) -> Int {
     tc_tid_child(r, 0)
 }
 
+// `async.spawn` takes `fn() -> T ! _` (sections/04_effects.md): the pool thread calls the task
+// with no arguments, so any value of that type is a task, whatever expression names it, and
+// the call is Handle[T]. Any other argument is reported the way a call argument that does not
+// fit its parameter is. An argument whose type is not yet determined is left alone: the pass
+// that leaves it open has its own report to make, and a second one here would guess.
+fn tc_spawn_value_handle(arg: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let t = infer_type(arg)
+    let r = tc_tid_resolved(t)
+    if tc_tid_kind(r) == TyKind.Fn && tc_tid_child_count(r) == 1 {
+        return make_handle_type(tc_tid_child(r, 0))
+    }
+    let holes = tc_tid_has_unbound_metavar(r) != 0 || tc_tid_has_unknown(r) != 0 || tc_tid_has_bare_typevar(r) != 0
+    let determined = tc_tid_is_concrete(r) != 0 && !holes
+    if tc_tid_kind(r) == TyKind.Fn || determined {
+        tc_error_at("argument 1 of `async.spawn` expects fn() -> T, got {type_to_str(t)}", arg)
+    }
+    TYPE_UNKNOWN
+}
+
 // A closure literal in a position whose type the context DECLARES — a call argument against
 // an fn-typed param, a `let` with an `fn(A, B) -> R` annotation — is where the expected
 // signature enters. The closure node is the only place both the inference walk and the body
@@ -17349,6 +17368,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 if sp_args != -1 && sublist_length(sp_args) >= 1 {
                     let sp_cls = sublist_get(sp_args, 0)
                     if node_kind(sp_cls) == NodeKind.Closure {
+                        // spawn calls its task with no arguments, so a literal that takes one is the same
+                        // type error as any other argument that is not `fn() -> T`.
+                        let sp_params = node_params(sp_cls)
+                        if sp_params != -1 && sublist_length(sp_params) > 0 {
+                            return tc_spawn_value_handle(sp_cls)
+                        }
                         // A DECLARED return wins; otherwise infer the body's tail, because
                         // tc_closure_declared_ret answers TYPE_VOID for an un-annotated
                         // closure and the corpus form is `async.spawn(fn() { compute(100) })`
@@ -17358,37 +17383,35 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         if node_type_ann(sp_cls) != -1 {
                             return make_handle_type(tc_closure_declared_ret(sp_cls))
                         }
-                        let sp_params = node_params(sp_cls)
-                        if sp_params == -1 || sublist_length(sp_params) == 0 {
-                            // Infer the inner from the body ONCE and reuse the memo. Re-walking the
-                            // body on a later pass is unstable: a body-local `let` falls out of
-                            // scope, a call's return gets mono-lowered to a struct kind, an unpinned
-                            // `Ok` loses its err type — so codegen would re-derive a different (and
-                            // wrong) handle than the check pass established. The annotated arm above
-                            // stays a per-call resolve so a generic-T spawn refines per instance.
-                            //
-                            // The memo is honoured only when its inner is DETERMINED. A
-                            // Handle[?] memo is the fingerprint of the annotation-blind
-                            // name-resolution pass, which walks this body before a captured
-                            // outer `let` has a type — locking Unknown there would outlive the
-                            // typed pass that could pin it. Re-inferring an under-determined
-                            // memo lets the later, in-scope pass upgrade it; a concrete memo is
-                            // authoritative and never re-walked (the instability above).
-                            // "Under-determined" is checked to any depth in BOTH forms an inner
-                            // can carry a hole — a raw TYPE_UNKNOWN (tc_tid_has_unknown) and an
-                            // unbound metavar (tc_tid_has_unbound_metavar) — so a compound like
-                            // Handle[List[?]] or Handle[Result[?,?]] is re-walked too, not just
-                            // a bare Handle[?].
-                            let sp_memo = tc_lookup_node_tid(node)
-                            if sp_memo != -1 && tc_tid_kind(sp_memo) == TyKind.Handle {
-                                let memo_inner = tc_tid_child(sp_memo, 0)
-                                if tc_tid_has_unknown(memo_inner) == 0 && tc_tid_has_unbound_metavar(memo_inner) == 0 {
-                                    return sp_memo
-                                }
+                        // Infer the inner from the body ONCE and reuse the memo. Re-walking the
+                        // body on a later pass is unstable: a body-local `let` falls out of
+                        // scope, a call's return gets mono-lowered to a struct kind, an unpinned
+                        // `Ok` loses its err type — so codegen would re-derive a different (and
+                        // wrong) handle than the check pass established. The annotated arm above
+                        // stays a per-call resolve so a generic-T spawn refines per instance.
+                        //
+                        // The memo is honoured only when its inner is DETERMINED. A
+                        // Handle[?] memo is the fingerprint of the annotation-blind
+                        // name-resolution pass, which walks this body before a captured
+                        // outer `let` has a type — locking Unknown there would outlive the
+                        // typed pass that could pin it. Re-inferring an under-determined
+                        // memo lets the later, in-scope pass upgrade it; a concrete memo is
+                        // authoritative and never re-walked (the instability above).
+                        // "Under-determined" is checked to any depth in BOTH forms an inner
+                        // can carry a hole — a raw TYPE_UNKNOWN (tc_tid_has_unknown) and an
+                        // unbound metavar (tc_tid_has_unbound_metavar) — so a compound like
+                        // Handle[List[?]] or Handle[Result[?,?]] is re-walked too, not just
+                        // a bare Handle[?].
+                        let sp_memo = tc_lookup_node_tid(node)
+                        if sp_memo != -1 && tc_tid_kind(sp_memo) == TyKind.Handle {
+                            let memo_inner = tc_tid_child(sp_memo, 0)
+                            if tc_tid_has_unknown(memo_inner) == 0 && tc_tid_has_unbound_metavar(memo_inner) == 0 {
+                                return sp_memo
                             }
-                            return make_handle_type(infer_type(node_body(sp_cls)))
                         }
+                        return make_handle_type(infer_type(node_body(sp_cls)))
                     }
+                    return tc_spawn_value_handle(sp_cls)
                 }
             }
         }
