@@ -697,6 +697,33 @@ fn tc_nominal_type_name_in(bare: Str, reader: Str) -> Str {
     bare
 }
 
+// Whether the module under check has a `type` declaration of a compiler-known name in scope,
+// its own or one its imports select. Where it does, the declaration is what the name means
+// and the builtin does not answer (sections/03_types.md, Type Name Resolution). Every site
+// that treats the name as the builtin asks this, so resolution and the checks agree.
+//
+// Only Handler and Template so far. The other shadowable names still wait on the full
+// shadowing policy.
+fn tc_declaration_shadows_builtin(name: Str) -> Int {
+    if name != "Handler" && name != "Template" { return 0 }
+    let cur = nr_current_module
+    match tc_namesake_type_modules.get(name) {
+        Some(mods) => {
+            if tc_nominal_type_name_in(name, cur) != name { return 1 }
+            if tc_module_key_is_main(cur) == 0 { return 0 }
+            if mods.contains("|__main__|") != 0 || mods.contains("||") != 0 { 1 } else { 0 }
+        }
+        None => {
+            let td = tc_type_decl_nodes.get(name) ?? -1
+            if td == -1 { return 0 }
+            let m = node_module(td)
+            if tc_module_key_is_main(m) != 0 { return tc_module_key_is_main(cur) }
+            if m == cur { return 1 }
+            if is_filtered_for_module(name, m, cur) == 0 { 1 } else { 0 }
+        }
+    }
+}
+
 // The type an impl header names, resolved in the impl's own module.
 fn tc_impl_target_name(im: Int) -> Str {
     tc_nominal_type_name_in(node_name(im), node_module(im))
@@ -6946,8 +6973,9 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     // phantom recurses through resolve_type_ann like every other carrier's child, so a
     // context that IS a real type resolves to it; the spec's own contexts are effect names,
     // which are not types, so those land on a typevar named for the effect. Either way the
-    // context is kept rather than discarded with the whole type.
-    if name == "Template" {
+    // context is kept rather than discarded with the whole type. A `type Template` declared
+    // in scope takes the name instead, and resolves below like any declared type.
+    if name == "Template" && tc_declaration_shadows_builtin(name) == 0 {
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
             return make_template_type(resolve_type_ann(sublist_get(elems_sl, 0)))
         }
@@ -6964,18 +6992,18 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     // TYPE_VOID for that case, not TYPE_UNKNOWN: it matches tc_closure_declared_ret and the
     // named-fn default, and Void is an ordinary inhabited type, not an unsolved one
     // (decisions/under-determined-types.md).
-    // `Handler[E]` belongs beside Fn for the identical reason its comment gives: the
-    // name is reserved (is_primitive_type claims it, :7105), so no user type could have taken it,
-    // and falling through to `make_typevar("Handler")` made an ANNOTATED handler both
-    // structureless and unsound. The parser puts the effect in `elements` (parser.bl:1478) as a
-    // TypeAnn node whose NAME is the effect — the effect is not a type, so the name is read
-    // directly rather than resolved.
+    // `Handler[E]` belongs beside Fn: falling through to `make_typevar("Handler")` made an
+    // ANNOTATED handler both structureless and unsound. Unlike Fn the name is not reserved: a
+    // `type Handler` declared in scope takes it, and resolves below like any declared type.
+    // The parser puts the effect in `elements` (parser.bl:1478) as a TypeAnn node whose NAME
+    // is the effect — the effect is not a type, so the name is read directly rather than
+    // resolved.
     //
     // A bare `Handler` with no `[E]` keeps the old typevar answer on purpose: it is not a type
     // anyone can write (the parser only builds this node from `handler[...]`), so minting a
     // handler-of-no-effect would invent an identity for a shape that cannot occur, and a typevar
     // is the honest "no information" answer if some path reaches here anyway.
-    if name == "Handler" {
+    if name == "Handler" && tc_declaration_shadows_builtin(name) == 0 {
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
             let eff = node_name(sublist_get(elems_sl, 0))
             if eff != "" { return make_handler_type(eff) }
@@ -8506,7 +8534,8 @@ fn tc_is_container_name(n: Str) -> Int {
 // builds and RUNS, printing `<?>` for the field with a BLINK_COMPILER_BUG marker compiled
 // into the binary — a silent wrong answer instead of a diagnostic.
 fn tc_is_non_debug_pseudo_type(n: Str) -> Int {
-    if n == "Fn" || n == "Tuple" || n == "Handler" || n == "Void" { return 1 }
+    if n == "Fn" || n == "Tuple" || n == "Void" { return 1 }
+    if n == "Handler" && tc_declaration_shadows_builtin(n) == 0 { return 1 }
     0
 }
 
@@ -10175,7 +10204,7 @@ fn tc_check_trait_sig_ann(ann: Int, trait_name: Str, mname: Str, m: Int) ! Diag.
     }
     // `Template[E]` and `Handler[E]` carry an EFFECT in their argument position. An effect
     // is not in the type namespace, so that position is not read as a type here either.
-    if name == "Template" || name == "Handler" { return }
+    if (name == "Template" || name == "Handler") && tc_declaration_shadows_builtin(name) == 0 { return }
     let elems = node_elements(ann)
     if elems != -1 {
         let mut i = 0
@@ -13560,7 +13589,8 @@ fn is_primitive_type(name: Str) -> Int {
     if name == "Bytes" || name == "Instant" || name == "Duration" || name == "Char" || name == "StringBuilder" { return 1 }
     if name == "Ptr" || name == "U8" || name == "U16" || name == "U32" || name == "U64" { return 1 }
     if name == "I8" || name == "I16" || name == "I32" || name == "I64" { return 1 }
-    if name == "Fn" || name == "Self" || name == "Tuple" || name == "Handler" || name == "Template" { return 1 }
+    if name == "Fn" || name == "Self" || name == "Tuple" { return 1 }
+    if name == "Handler" || name == "Template" { return 1 - tc_declaration_shadows_builtin(name) }
     // A name the language owns, even though every position that can write it is an error:
     // the report the writer gets must be the scope rule, not "unknown type".
     if name == "FfiScope" { return 1 }
@@ -14395,7 +14425,7 @@ fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report 
     if ann_node == -1 { return }
     let name = node_name(ann_node)
     nr_check_type_ref(name, ann_node)
-    if name == "Handler" || name == "Template" {
+    if (name == "Handler" || name == "Template") && tc_declaration_shadows_builtin(name) == 0 {
         let elems_sl = node_elements(ann_node)
         if elems_sl != -1 {
             let mut i = 0
