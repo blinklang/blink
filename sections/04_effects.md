@@ -2443,7 +2443,7 @@ The LSP shows inferred write sets on hover — developers and AI can see which g
 | Read module-level `let mut` (`return pos`) | No | Reads are free — no state corruption risk |
 | Read module-level `let` (immutable) | No | Immutable — equivalent to a constant |
 | Read/write function-local `let mut` | No | Contained within function scope |
-| Mutate collection received as parameter | No | Tracked through type system, not mutation analysis. Deferred to v2 |
+| Mutate collection received as parameter | No | The parameter must be declared `mut`, so the signature shows it (§3.6 *Mutable Parameters*) |
 | Mutate captured `let mut` in closure | No | Lexically scoped — visible within enclosing function body |
 
 #### 4.16.3 Purity and Non-Mutating Functions

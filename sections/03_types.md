@@ -297,7 +297,7 @@ trait StringBuildOps {
 
 ##### Construction and Mutability
 
-Collections are constructed via `Type.new()` for empty collections or literal syntax where available. Mutating methods (`push`, `pop`, `insert`, `remove`, `set`) require the binding to be `let mut`. Immutable bindings can only call non-mutating methods (`get`, `contains`, `len`, `keys`, `values`, etc.).
+Collections are constructed via `Type.new()` for empty collections or literal syntax where available. A **mutating method** is a method that declares `mut self` (§3.6 *Mutable Parameters*): `push`, `pop`, `insert`, `remove`, `set` and `clear` on collections, and every `write` method on `StringBuilder`. A call to a mutating method needs a mutable **root**: the first name of the receiver path must be a `let mut` binding or a `mut` parameter. `p.xs.push(x)` needs `p` to be mutable. An immutable root can only call non-mutating methods (`get`, `contains`, `len`, `keys`, `values`, etc.). A violation is `error[E0610] MutationRequiresMut`.
 
 ```blink
 // Empty collections
@@ -312,9 +312,21 @@ let mut scores = [100, 95, 87]                 // List[Int], mutable
 // Mutation requires let mut
 list.push("hello")                              // OK — list is mut
 names.push("Dave")                              // COMPILE ERROR — names is not mut
+
+// The root of a field path decides (type Form { tags: List[Str] })
+let mut form = Form { tags: List.new() }
+form.tags.push("new")                           // OK — root `form` is mut
 ```
 
-**Why `Type.new()` + `let mut`.** Mutability is a property of the *binding*, not the *type*. `List[T]` is one type regardless of whether the binding is mutable — no `MutList`/`ImmutableList` split, no doubled API surface, no coercion rules at function boundaries. `let mut` makes mutation points visible at the declaration site: `grep "let mut"` finds every mutation source. The C backend can emit `const` qualifiers for immutable bindings. (Vote: 5-0.)
+**Why `Type.new()` + `let mut`.** Mutability is a property of the *binding*, not the *type*. `List[T]` is one type regardless of whether the binding is mutable — no `MutList`/`ImmutableList` split, no doubled API surface, no coercion rules at function boundaries. `mut` marks every place where a mutation starts: each mutating call and each assignment names a `let mut` binding or a `mut` parameter. It does not mark every value that changes. Collections are shared cells, so an immutable name can observe a change made through a `mut` alias:
+
+```blink
+let a = [1, 2]
+let mut b = a          // warning[MutAliasOfImmutable] — `b` shares `a`'s list
+b.push(3)              // `a` now holds 3 as well
+```
+
+(Vote: 5-0. Rationale text revised by the parameter-mutation panel, 6-0 — see [Parameter Mutation rationale](../decisions/parameter-mutation.md).)
 
 ##### The `Contains` Trait
 
@@ -2140,7 +2152,7 @@ Traits define shared behavior. They are the sole polymorphism mechanism in Blink
 
 ```blink
 trait Display {
-    fn fmt(self, sb: StringBuilder)
+    fn fmt(self, mut sb: StringBuilder)
     final fn display(self) -> Str {
         let sb = StringBuilder.new()
         self.fmt(sb)
@@ -2368,7 +2380,7 @@ error[SelfOutsideTraitOrImpl]: `Self` outside trait or impl
 
 ```blink
 trait Display {
-    fn fmt(self, sb: StringBuilder)                        // self: Self, enables x.fmt(sb)
+    fn fmt(self, mut sb: StringBuilder)                        // self: Self, enables x.fmt(sb)
     final fn display(self) -> Str {                        // sealed default, enables x.display()
         let sb = StringBuilder.new()
         self.fmt(sb)
@@ -2396,11 +2408,97 @@ error[SelfNotConstructor]: `Self` is not a constructor
   = help: use the concrete type name: `Point { x: 0, y: 0 }`
 ```
 
-**`self` is always passed by value.** Blink is garbage-collected — there is no by-reference vs by-move distinction. The `self` parameter is a value like any other parameter. No `&self`, `&mut self`, or `self: Box[Self]` forms exist.
+**`self` is always passed by value.** Blink is garbage-collected — there is no by-reference vs by-move distinction. The `self` parameter is a value like any other parameter. No `&self`, `&mut self`, or `self: Box[Self]` forms exist. `mut self` is a mutable parameter (see *Mutable Parameters* below), not a reference.
 
-A method cannot change its caller's value through `self`. State that must persist across calls lives in a `let mut` binding captured by a closure or handler (§2.8, §4.7). Whether an assignment to a field of `self`, or of any parameter, is a compile error is an open question; the panel that ruled on mock controllers recommends an error.
+A method cannot change its caller's value through `self`. State that must persist across calls lives in a `let mut` binding captured by a closure or handler (§2.8, §4.7). An assignment to a field of `self`, or of any parameter, is a compile error (see *Mutable Parameters*).
 
 Passing or binding a struct copies its fields. A field whose value is a shared cell — a `List`, `Map` or `Set`, or a closure or handler that captured a `let mut` binding — refers to the same cell after the copy. After `let mut b = a` and `b.x = 2`, `a.x` is unchanged; after `b.xs.push(5)`, `a.xs` holds the new element too.
+
+#### Mutable Parameters
+
+A parameter is a binding and follows the binding rule (§3.2.2 *Construction and Mutability*). A parameter is immutable unless it is declared `mut`. A `mut` parameter, `self` included, may be the root of a mutating method call. The caller shares every collection it passes, so a `mut` parameter tells the caller: **this function may change the shared cells you pass.**
+
+```blink
+fn add_route(mut srv: Server, r: Route) {
+    srv.routes.push(r)                  // OK — root `srv` is mut
+}
+
+fn count(xs: List[Int]) -> Int {
+    xs.push(0)                          // error[E0610] — `xs` is not mut
+    xs.len()
+}
+
+impl Stack {
+    fn push(mut self, x: Int) {
+        self.items.push(x)              // OK — `mut self`
+    }
+}
+```
+
+**A parameter is never assigned.** An assignment to a parameter, or to a field of one, is always a compile error, with or without `mut`, `self` included. Such a write changes only the callee's copy of the value (§3.6 *`self` is always passed by value*), so the caller never sees it. To change a value locally, copy it to a new `let mut` name:
+
+```blink
+fn gcd(a: Int, b: Int) -> Int {
+    let mut x = a
+    let mut y = b
+    while y != 0 {
+        let t = y
+        y = x % y
+        x = t
+    }
+    x
+}
+
+impl Point {
+    fn with_x(self, x: Int) -> Point {
+        Point { x: x, y: self.y }       // build a new value; `self.x = x` is an error
+    }
+}
+```
+
+```
+error[ParamAssign]: cannot assign to parameter `a`
+ --> gcd.bl:3:9
+  |
+3 |         a = b
+  |         ^ `a` is a parameter
+  |
+  = note: a write to a parameter changes only this function's copy
+  = help: copy it to a new name: `let mut x = a`
+```
+
+The fix-it names a new binding. `let mut a = a` shadows the parameter and triggers `warning[W0603] ShadowedVariable`.
+
+**What `mut self` covers.** A method is mutating if and only if it declares `mut self`. The standard library declares `mut self` on methods that change state Blink holds as a value: the contents of a `List`, `Map`, `Set` or `StringBuilder`. A change to state outside the language — memory behind a `Ptr`, a socket, a file, a database — is an effect, tracked by the effect row (§4) and the `@trusted` boundary (§9), not by `mut`. So `Ptr.write` (§9 *Pointer Operations*) and `TcpConn.write` take plain `self`, and a plain `let` pointer can write through.
+
+**Traits and impls.** A trait method's `mut` markers are part of its contract. An impl may drop a `mut` that the trait declares, because an implementation that does not mutate satisfies a contract that allows mutation. An impl may not add a `mut` that the trait does not declare: `error[ImplAddsMut]`, with a related span on the trait's signature.
+
+```blink
+trait Display {
+    fn fmt(self, mut sb: StringBuilder)
+}
+
+type Marker { id: Int }
+
+impl Display for Marker {
+    fn fmt(self, sb: StringBuilder) { }    // OK — drops `mut`, never mutates `sb`
+}
+```
+
+**Function types erase `mut`.** A function type such as `fn(List[Int]) -> Int` carries no `mut` marker. A closure's `mut` parameter is local to that closure. A higher-order function can therefore change a collection through a closure argument with no `mut` at its own call site; `mut` marks where a mutation starts, not every path that reaches it.
+
+**Foreign functions.** An `@ffi` function has no Blink body to check. Its author declares `mut` on each parameter whose Blink value the foreign code changes (for example `sb_write(mut sb: StringBuilder, s: Str)`). The compiler trusts this declaration and cannot verify it; it is part of the audited premise of the `@ffi` boundary (§9).
+
+**Lints.** Two warnings support the rule. Neither is a guarantee:
+
+| Warning | Fires on | Help |
+|---|---|---|
+| `MutAliasOfImmutable` | An argument to a `mut` parameter, or the right side of `let mut b = a`, when it is a place with a non-`mut` root | "`b` shares `a`'s collections; a change through `b` is visible through `a`" |
+| `UnusedMut` | A `let mut` binding or `mut` parameter whose body never uses the mutability | Remove `mut`. Does not fire on a `mut` an impl keeps from its trait, or on `@ffi` parameters |
+
+`MutAliasOfImmutable` checks direct aliases only. An alias made through a call result (`id(a)`) or a struct literal (`W { xs: a }`) passes it. An immutable `let` is not a promise that the value behind it never changes (§3.2.2).
+
+**Rollout.** Each new error in this subsection ships first as a warning with a machine-applicable fix that `blink fix` applies, and becomes an error in the next release.
 
 #### Operations on `Self` in a Default Body
 
@@ -2870,7 +2968,7 @@ A polymorphic impl is parameterized over one or more type variables and may appl
 
 ```blink
 impl[T] Display for List[T] where T: Display {
-    fn fmt(self, sb: StringBuilder) ! Fmt {
+    fn fmt(self, mut sb: StringBuilder) ! Fmt {
         sb.write("[")
         let mut first = true
         for item in self {
@@ -2924,7 +3022,7 @@ impl[T] Sum for List[T] where T: Add[T, Output = T] + Zero {
 
 // Compile error: body inspects T's identity
 impl[T] Display for List[T] where T: Display {
-    fn fmt(self, sb: StringBuilder) ! Fmt {
+    fn fmt(self, mut sb: StringBuilder) ! Fmt {
         if T == Int { sb.write("(ints)") }  // ERROR: cannot dispatch on T
         // ...
     }
@@ -3132,7 +3230,7 @@ The `Char` debug-form flows unchanged into every container position — a `Char`
 
 ```blink
 trait Display {
-    fn fmt(self, sb: StringBuilder)
+    fn fmt(self, mut sb: StringBuilder)
     final fn display(self) -> Str {
         let sb = StringBuilder.new()
         self.fmt(sb)
@@ -3148,7 +3246,7 @@ trait Display {
 type Point { x: Int, y: Int }
 
 impl Display for Point {
-    fn fmt(self, sb: StringBuilder) {
+    fn fmt(self, mut sb: StringBuilder) {
         sb.write("(")
         sb.write(self.x)
         sb.write(", ")

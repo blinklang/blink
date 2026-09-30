@@ -269,7 +269,7 @@ This is the **canonical** `Ptr[T]` operations table. §9.1.3 extends it with `@f
 | `alloc_ptr[T]()` | `fn alloc_ptr[T]() -> Ptr[T]` | `calloc(1, sizeof(T))` | Allocate zero-initialized memory for one `T` (GC-registered fallback; prefer `scope.alloc`) |
 | `null_ptr[T]()` | `fn null_ptr[T]() -> Ptr[T]` | `NULL` | Construct a null pointer of type `Ptr[T]` — the only way to spell `NULL` in Blink |
 | `.deref()` | `fn deref(self) -> T` | `*ptr` | Read the value behind the pointer. **No null check** — the pointee is an audited premise (see *Nullability*). Rejected on `Ptr[Void]` (E0825) |
-| `.write(value)` | `fn write(self, value: T)` | `*ptr = value` | Write a value through the pointer. Rejected on `Ptr[Void]` (E0825) |
+| `.write(value)` | `fn write(self, value: T)` | `*ptr = value` | Write a value through the pointer. Takes plain `self`: a write through a pointer is an effect, not a `mut` mutation (§3.6 *Mutable Parameters*). Rejected on `Ptr[Void]` (E0825) |
 | `.is_null()` | `fn is_null(self) -> Bool` | `ptr == NULL` | Test whether the pointer is null. Defined as shorthand for `p == null_ptr()` |
 | `.addr()` | `fn addr(self) -> Int` | `(intptr_t)ptr` | The pointer's numeric address as an `Int`. **NOT** `&ptr` — an observation, not an out-parameter |
 | `.offset(i)` | `fn offset(self, i: Int) -> Ptr[T]` | `ptr + i` | Pointer to element `i` of an `alloc_n` region (§9.1.3). Rejected on a singleton `alloc[T]()`/`alloc_ptr[T]()` result (E0813) |
