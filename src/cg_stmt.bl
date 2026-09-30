@@ -72,7 +72,7 @@ import cg_eff.{
 import cg_call.{
     AssertKind, ForInIteration, ForInStrategy, cc_assert_family_kind, cc_display_or_placeholder,
     cc_is_ptr_write_stmt, cc_is_skip_call, cc_lower_ptr_write_stmt, cg_call_element_from_runtime,
-    cg_call_channel_take, cg_call_cursor_walk, for_in_iteration_of,
+    cg_call_channel_take, cg_call_cursor_walk, cg_call_str_step, for_in_iteration_of,
 }
 import unparse.{unparse_expr}
 import cg_promote.{
@@ -2281,8 +2281,9 @@ fn lower_loop(node: Int) -> Int ! Diag.Report {
 // `for i in a..b` is a counted loop, so it lowers with no help from the runtime. Every
 // other iterable walks through the strategy cg_call's for_in_iteration_of answers --
 // Indexed reads a container by position, Materialized reads one first into a List (or,
-// for a Map, a pair of them) and then walks that by position, and Drained has no
-// position at all, and Cursor pulls from a fresh cursor of an Iterator's recipe. The match is exhaustive, so a strategy added to ForInStrategy without
+// for a Map, a pair of them) and then walks that by position, Drained has no position at
+// all, Cursor pulls from a fresh cursor of an Iterator's recipe, and Stepped decodes one
+// Char of a Str per turn. The match is exhaustive, so a strategy added to ForInStrategy without
 // an arm here fails to compile rather than falling through to a silent wrong walk.
 fn lower_for_in(node: Int) -> Int ! Diag.Report {
     let iter = node_iterable(node)
@@ -2297,7 +2298,8 @@ fn lower_for_in(node: Int) -> Int ! Diag.Report {
         ForInStrategy.Indexed => lower_for_indexed(node, iter, walk)
         ForInStrategy.Materialized => lower_for_materialized(node, iter, walk)
         ForInStrategy.Drained => lower_for_drained(node, iter, walk)
-        ForInStrategy.Cursor => lower_for_cursor(node, iter, walk)
+        ForInStrategy.Cursor => lower_for_walk(node, iter, walk, false)
+        ForInStrategy.Stepped => lower_for_walk(node, iter, walk, true)
     }
 }
 
@@ -2542,7 +2544,10 @@ fn lower_for_drained(node: Int, iter: Int, walk: ForInIteration) -> Int ! Diag.R
 // `for x in it { b }`: the recipe is called once for a cursor, and each turn pulls one
 // Option from it and stops at None. The start, the pull and the read come from cg_call,
 // which reads every other Option, so the loop never spells a carrier on its own.
-fn lower_for_cursor(node: Int, iter: Int, walk: ForInIteration) -> Int ! Diag.Report {
+// `for c in s { b }` has the same shape: the start sets a byte position, and each turn
+// decodes one Char there and stops at the end of the string. The decode opens the turn, so
+// a `continue` in the body cannot skip it.
+fn lower_for_walk(node: Int, iter: Int, walk: ForInIteration, stepped: Bool) -> Int ! Diag.Report {
     let _ = open_scope()
     let elem = walk.element_tid
     let rec = layout_at(elem, Position.Local, node)
@@ -2554,7 +2559,8 @@ fn lower_for_cursor(node: Int, iter: Int, walk: ForInIteration) -> Int ! Diag.Re
     let src_rec = layout_at(src_tid, Position.Local, iter)
     let src = c_mint_local("iter")
     let src_let = ir_let(src_tid, node, src_rec.c_spelling, src, src_rec.slot_form, lower_value(iter))
-    let w = cg_call_cursor_walk(node, elem, container_ref(node, src_tid, src_rec, src))
+    let held = container_ref(node, src_tid, src_rec, src)
+    let w = if stepped { cg_call_str_step(node, elem, held) } else { cg_call_cursor_walk(node, elem, held) }
     if w.element < 0 {
         close_scope()
         return -1
