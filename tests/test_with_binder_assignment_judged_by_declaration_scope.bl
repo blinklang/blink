@@ -1,0 +1,125 @@
+// An assignment moves a `with ... as` binding out of its block when the variable it
+// writes was declared outside that block: a module-level variable, wherever it is
+// declared in the file, or a local declared before the block opened. A variable
+// declared inside the block, even one that shadows an outer name, dies with the block.
+// A mutable parameter was declared before the block too.
+
+import compile_test_helpers
+
+fn handler_prelude() -> Str {
+    #"
+import std.traits
+type Ctx { v: Int }
+type BH { x: Int }
+impl BlockHandler for BH {
+    type Context = Ctx
+    fn enter(self) -> Ctx { Ctx { v: 1 } }
+    fn exit(self, ok: Bool) { }
+}
+"#
+}
+
+fn rejects(body: Str, tag: Str, label: Str) {
+    let out = compile_test_helpers.compile_and_capture(handler_prelude().concat(body), tag)
+    compile_test_helpers.expect_error(out, "E0601", label)
+    compile_test_helpers.expect_contains(out, "CloseableEscapesScope", label)
+}
+
+fn accepts(body: Str, tag: Str, label: Str) {
+    let out = compile_test_helpers.compile_and_capture(handler_prelude().concat(body), tag)
+    compile_test_helpers.expect_compiles_clean(out, label)
+}
+
+test "assigning the binding to a module-level variable declared below the function is rejected" {
+    rejects(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        KEEP = ctx
+    }
+    assert_eq(KEEP.v, 1)
+}
+let mut KEEP: Ctx = Ctx { v: 0 }
+"#, "with_assign_module_below", "module-level variable declared below the function")
+}
+
+test "assigning the binding to an outer variable from a with block that also opens an arena is rejected" {
+    rejects(#"
+fn main() {
+    let mut keep = Ctx { v: 0 }
+    with arena, BH { x: 0 } as ctx {
+        keep = ctx
+    }
+    assert_eq(keep.v, 1)
+}
+"#, "with_assign_arena_item", "outer variable from a with block that opens an arena")
+}
+
+test "assigning the binding to a variable of the enclosing closure is rejected" {
+    rejects(#"
+fn main() {
+    let f = fn() -> Int {
+        let mut k = Ctx { v: 0 }
+        with BH { x: 0 } as ctx {
+            k = ctx
+        }
+        k.v
+    }
+    assert_eq(f(), 1)
+}
+"#, "with_assign_closure_outer", "variable of the enclosing closure")
+}
+
+test "assigning the binding to a mutable parameter is rejected" {
+    rejects(#"
+fn keep_in(mut p: Ctx) -> Int {
+    with BH { x: 0 } as ctx {
+        p = ctx
+    }
+    p.v
+}
+fn main() { assert_eq(keep_in(Ctx { v: 0 }), 1) }
+"#, "with_assign_mut_param", "mutable parameter")
+}
+
+test "assigning the binding to a mutable closure parameter is rejected" {
+    rejects(#"
+fn main() {
+    let f = fn(mut p: Ctx) -> Int {
+        with BH { x: 0 } as ctx {
+            p = ctx
+        }
+        p.v
+    }
+    assert_eq(f(Ctx { v: 0 }), 1)
+}
+"#, "with_assign_mut_closure_param", "mutable closure parameter")
+}
+
+test "assigning the binding to an inner variable that shadows an outer one is accepted" {
+    accepts(#"
+fn main() {
+    let mut keep = Ctx { v: 0 }
+    with BH { x: 0 } as ctx {
+        let mut keep = Ctx { v: 5 }
+        keep = ctx
+        assert_eq(keep.v, 1)
+    }
+    assert_eq(keep.v, 0)
+}
+"#, "with_assign_inner_shadow", "inner variable that shadows an outer one")
+}
+
+test "assigning the binding to a variable of a closure written inside the block is accepted" {
+    accepts(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        let f = fn() -> Int {
+            let mut k = Ctx { v: 0 }
+            k = ctx
+            k.v
+        }
+        assert_eq(f(), 1)
+    }
+}
+"#, "with_assign_inner_closure", "variable of a closure written inside the block")
+}
