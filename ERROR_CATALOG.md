@@ -106,6 +106,9 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | PositionalParamDefault | E0531 | A default value written on a positional parameter — only parameters declared after `--` may carry one | Type checking | §2.13 |
 | NonConstParamDefault | E0532 | A parameter default that is not a const expression | Type checking | §2.13, §2.21 |
 | NonConstExpr | E0533 | The right-hand side of a `const` is not a const expression | Type checking | §2.21 |
+| TemplateHoleType | E0534 | An interpolation hole in a `Template[C]` literal has a type outside the Template value set | Type checking | §3b.5 |
+| EffectTypeAsValue | E0535 | An effect's type is written as the type of a value (`fn f(x: DB)`, `let x: DB`); it is valid only as a type argument | Type checking | §3b.5 |
+| SubEffectAsType | E0536 | A sub-effect is written as a type (`Template[DB.Read]`); only a top-level effect gives a type | Type checking | §3b.5 |
 | CloseableEscapesScope | E0601 | `Closeable` value escapes `with...as` scope | Resources | §5.5 |
 | ArenaValueEscapes | E0700 | Arena-scoped value escapes arena scope | Arena | §5.2 |
 | ArenaTypeContainsCycle | E0701 | Type crossing `with arena { }` boundary contains a cycle | Arena | §5.2 |

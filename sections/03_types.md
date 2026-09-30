@@ -1388,15 +1388,18 @@ let r = Registry[User] { entries: [] }      // OK -- brackets on a struct-litera
 **Phantom type parameters are legal in user code.** Because no binder is erased, a type parameter mentioned by no field is supplied by the type annotation and keeps its instantiations distinct:
 
 ```blink
-type Template[C] {
+type Meters {}
+type Feet {}
+
+type Tagged[C] {
     source: Str
 }
 
-let db: Template[DB] = Template { source: "SELECT 1" }
-let sh: Template[Shell] = Template { source: "ls" }     // a distinct type from Template[DB]
+let m: Tagged[Meters] = Tagged { source: "12.5" }
+let f: Tagged[Feet] = Tagged { source: "41.0" }     // a distinct type from Tagged[Meters]
 ```
 
-`Template[DB]` and `Template[Shell]` are different types, and neither is assignable to the other. This pattern is not reserved to compiler-known types — it is the same mechanism `Template[C]` uses (§3b.5), available to user code on the same terms.
+`Tagged[Meters]` and `Tagged[Feet]` are different types, and neither is assignable to the other. This pattern is not reserved to compiler-known types — it is the same mechanism the compiler-known `Template[C]` uses (§3b.5), available to user code on the same terms.
 
 **Lint: a type parameter that occurs nowhere.** `W0604 UnusedTypeParamBinder` fires when **the type parameter occurs nowhere in the declaration or its body.** That is the whole gate, and it is decided by inspection of one declaration:
 
@@ -1651,6 +1654,7 @@ A type name resolves **once**, at name resolution, to **one declaration identity
 
 - A name that resolves to no declaration is `error[UnknownType]` (E0507).
 - Only an explicit `[T]` binder on the enclosing declaration creates a type variable. A type name is never turned into a type variable because it is unresolved, special, or compiler-known.
+- An `effect` name used as a type resolves to the nominal type that the effect declaration gives. That type has no values and is written only as a type argument (§3b.5 *The Context Parameter `C`*).
 - A `type` declaration the compiler accepts is a declaration that code in the same module can name, construct, and use as a type. There is no declaration that is accepted and then unusable.
 
 ```blink
@@ -3144,13 +3148,11 @@ let msg = "user {id}: {name}"           // "user 42: Alice"
 
 // Template[DB] context — Display NOT invoked:
 let q: Template[DB] = "SELECT * FROM users WHERE id = {id} AND name = {name}"
-// Produces: Template[DB] {
-//     parts: ["SELECT * FROM users WHERE id = ", " AND name = ", ""],
-//     values: [42, "Alice"]   ← raw typed values, not strings
-// }
+// q.parts()  == ["SELECT * FROM users WHERE id = ", " AND name = ", ""]
+// q.values() == [TemplateValue.Int(42), TemplateValue.Str("Alice")]   ← typed values, not strings
 ```
 
-The set of types valid as Template values is compiler-known: `Int`, `Float`, `Str`, `Bool`, `Option[T]` (where `T` is a valid value type). Using a type outside this set in a Template interpolation is a compile error. The `Raw(expr)` marker type bypasses decomposition for a specific interpolation (see §3b.5).
+The set of types valid as Template values is compiler-known: `Int` and the narrower integers `I8`, `I16`, `I32`, `U8`, `U16`, `U32` (widened to `Int`), `Float` and `F32` (widened to `Float`), `Bool`, `Str`, and `Option[T]` where `T` is one of these (`None` becomes `TemplateValue.Null`). `Option[Option[T]]` is not valid. Any other type in a Template interpolation is `error[TemplateHoleType]` at typecheck, with repairs that keep the value a parameter (§3b.5 *Template Values*). The `Raw(expr)` marker type bypasses decomposition for a specific interpolation (see §3b.5).
 
 This separation is critical: calling `Display.display()` first and then decomposing the resulting `Str` would defeat `Template[C]`'s injection safety by losing type information and forcing all values through string round-tripping.
 
