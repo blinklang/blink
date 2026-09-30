@@ -108,7 +108,7 @@ let b = Bytes.zeroed(64)
 b.with_ptr(fn(p) { libc_memcpy(p, src_ptr, 64) })
 ```
 
-`Bytes.with_ptr(fn(p) { ... })` is the only sanctioned path from a `Bytes` to a `Ptr[U8]`. The closure body pins the buffer; a parser-level no-grow check rejects mutating receiver methods that could relocate the buffer (`E0814` for `push`/`append`/`concat`/`extend`/`clear`/`truncate`/`resize`/`write_*_le/be`), and rejects passing the receiver as an argument (`E0815`). Closure body must be a single expression (`E0816`). Calling `Bytes.as_ptr()` outside a `with_ptr` closure is rejected with `E0817`.
+`Bytes.with_ptr(fn(p) { ... })` is the only sanctioned path from a `Bytes` to a `Ptr[U8]`. The closure body pins the buffer; a parser-level no-grow check rejects mutating receiver methods that could relocate the buffer (`E0814` for `push`/`append`/`concat`/`extend`/`clear`/`truncate`/`resize`/`write_*_le/be`), and rejects passing the receiver as an argument (`E0815`). Calling `Bytes.as_ptr()` outside a `with_ptr` closure is rejected with `E0817`.
 
 ### blink shim init (third-tier FFI escape hatch)
 

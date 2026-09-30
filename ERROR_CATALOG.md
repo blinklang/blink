@@ -126,7 +126,6 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | FfiOffsetOnSingleton | E0813 | `Ptr.offset(i)` called on single-cell allocation | FFI | §9.1.1 |
 | BytesGrowInWithPtr | E0814 | Bytes-growing call inside `bytes.with_ptr` closure | FFI | §9.1.1 |
 | PinnedBytesEscape | E0815 | Pinned Bytes receiver escapes its `with_ptr` closure | FFI | §9.1.1 |
-| WithPtrBodyTooComplex | E0816 | `Bytes.with_ptr` body is not a single inlinable expression | FFI | §9.1.1 |
 | BytesPtrCastForbidden | E0817 | Bytes coerced to `Ptr[U8]` outside `with_ptr` | FFI | §9.1.1 |
 | FfiScopeNotWithResource | E0819 | An `FfiScope` value occurs somewhere other than as a `with ... as` resource — bound by `let`, passed, returned, stored, or written as a type argument (its libc arena would never be freed) | FFI | §9.1.1 |
 | MissingNativeDep | E0820 | `@ffi` references undeclared native dependency | FFI | §9.2.1 |
@@ -225,6 +224,7 @@ A retired code and its name are never reused (see *Conventions*). `blink explain
 | Name | Code | Retired because | Replaced by |
 |------|------|-----------------|-------------|
 | CallSiteTypeArgs | E0307 | It refused explicit type application at a call, which §3.4 *Explicit Type Application* makes legal | TypeArgArity (E0303), NoIndexOperator (E0313), TypeArgsWithoutCall (E0314) |
+| WithPtrBodyTooComplex | E0816 | It rejected a `Bytes.with_ptr` body of more than one expression, an inlining limit of the old codegen; §9.1.3 lets the body be any `fn(Ptr[U8]) -> R` | None |
 
 ---
 

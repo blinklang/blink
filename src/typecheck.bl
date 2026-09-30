@@ -1,5 +1,6 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on, nk_of, nk_is_typed, trace, trace_mode}
 import std.str.{str_to_lower}
+import pkg.manifest.{manifest_name, manifest_header_is_declared}
 import parser.{
     ann_str_val, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
@@ -37,6 +38,7 @@ import diagnostics.{
     COALESCE_REQUIRES_OPT, MISSING_KEYWORD_ARG, INVALID_KEYWORD_ARG,
     FFI_SCOPE_NOT_WITH_RESOURCE, RAW_BYPASSES_PARAM, RAW_OUTSIDE_TEMPLATE,
     PTR_OUTSIDE_FFI, FFI_STRUCT_GC_FIELD, BUF_OUTSIDE_FFI_SURFACE, BYTES_GROW_IN_WITH_PTR,
+    MISSING_CANONICAL_HEADER,
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
     FFI_OFFSET_ON_SINGLETON, FFI_OFFSET_UNKNOWN_STRIDE, WITH_ITEM_NOT_A_HANDLER,
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
@@ -8337,10 +8339,31 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
     if has_annotation(td, "ffi.opaque") != 0 {
         ffi_opaque_type_set.insert(tid, 1)
     }
+    tc_warn_missing_canonical_header(td, "ffi.struct")
+    tc_warn_missing_canonical_header(td, "ffi.opaque")
 
     if has_annotation(td, "deprecated") != 0 {
         depr_type_nodes.insert(name, td)
     }
+}
+
+// W0812 (§9.1.3, §9.1.4): the header an @ffi type mirrors must be pinned in blink.toml, or
+// layout drift goes unnoticed. With no manifest there is no place to pin it, so there is
+// nothing to warn about. A stdlib @ffi type rides a compiler-managed native dep the user
+// never declares, so it is exempt.
+fn tc_warn_missing_canonical_header(td: Int, ann_name: Str) ! Diag.Report {
+    let ann = get_annotation(td, ann_name)
+    if ann == -1 || manifest_name == "" { return }
+    let header = get_str_named_arg(ann, "header")
+    if header == "" || manifest_header_is_declared(header) != 0 { return }
+    if node_source_module(td).starts_with("std_") { return }
+    diag_warn_at(
+        "MissingCanonicalHeader",
+        MISSING_CANONICAL_HEADER,
+        "@{ann_name} '{node_name(td)}' declares header '{header}' but no [native-dependencies] entry in blink.toml lists it",
+        td,
+        "add the header to blink.toml: [native-dependencies] <dep>.headers = [\"{header}\"]"
+    )
 }
 
 // Resolve a struct's field type annotations. Split out of register_struct_type
@@ -17477,6 +17500,28 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
         }
 
+        // §3c rule-3 on a List receiver: an unqualified call to a method
+        // defined by two or more owners is ambiguous. Owners are the user
+        // poly-impl traits (`impl[T] Trait for List[T]`, recorded via
+        // tc_record_method_trait under "List") plus, for a reused HOF name, the
+        // sealed built-in List surface. Placed BEFORE the builtin arity table and
+        // the builtin List block: ambiguity is a resolution error, so a user method
+        // shadowing fold/map/... must not first be counted as the sealed one. Mirrors the
+        // struct/enum guard below. The qualified call `Trait.method(receiver)`
+        // parses with obj = Ident(Trait), so obj_k != List — it never enters here.
+        if obj_k == TyKind.List {
+            let user_traits = tc_method_trait_count("List", method)
+            let sealed_hof = tc_is_sealed_list_hof(method)
+            if user_traits + sealed_hof >= 2 {
+                let user_names = tc_method_trait_names("List", method)
+                let names = if sealed_hof != 0 {
+                    if user_names != "" { "{user_names} and the sealed built-in List.{method}" } else { "the sealed built-in List.{method}" }
+                } else { user_names }
+                diag_error_at("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous method call: `.{method}` is defined in multiple traits implemented by List ({names})", node, "use a qualified call to disambiguate, e.g. `Trait.{method}(receiver)`")
+                return tc_error_recovery_tid()
+            }
+        }
+
         // A builtin method has no fnsig, so nothing counted the arguments a caller wrote:
         // the count is implicit in which arm below answers, and an arm that never asks about
         // an index — every nullary method — could not notice a surplus at all. Ask the table
@@ -17615,27 +17660,6 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 check_closure_param(cls, 0, init_t, method, "Iterator")
                 check_closure_param(cls, 1, elem, method, "Iterator")
                 return init_t
-            }
-        }
-
-        // §3c rule-3 on a List receiver: an unqualified call to a method
-        // defined by two or more owners is ambiguous. Owners are the user
-        // poly-impl traits (`impl[T] Trait for List[T]`, recorded via
-        // tc_record_method_trait under "List") plus, for a reused HOF name, the
-        // sealed built-in List surface. Placed BEFORE the builtin List block so a
-        // user method shadowing fold/map/... is caught (Gate B). Mirrors the
-        // struct/enum guard below. The qualified call `Trait.method(receiver)`
-        // parses with obj = Ident(Trait), so obj_k != List — it never enters here.
-        if obj_k == TyKind.List {
-            let user_traits = tc_method_trait_count("List", method)
-            let sealed_hof = tc_is_sealed_list_hof(method)
-            if user_traits + sealed_hof >= 2 {
-                let user_names = tc_method_trait_names("List", method)
-                let names = if sealed_hof != 0 {
-                    if user_names != "" { "{user_names} and the sealed built-in List.{method}" } else { "the sealed built-in List.{method}" }
-                } else { user_names }
-                diag_error_at("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous method call: `.{method}` is defined in multiple traits implemented by List ({names})", node, "use a qualified call to disambiguate, e.g. `Trait.{method}(receiver)`")
-                return tc_error_recovery_tid()
             }
         }
 
