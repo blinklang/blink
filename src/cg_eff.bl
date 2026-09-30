@@ -324,6 +324,8 @@ fn impl_method_named(im: Int, name: Str, node: Int) -> Int ! Diag.Report {
 // substitution from the one its literal was lowered under.
 type PendingThunk {
     closure: Int
+    // "" for an entry that is only a spawn task wrapper (cg_eff_spawn_value_task): it
+    // defines no thunk, and closure is the spawn argument whose Fn type it was minted for.
     symbol: Str
     fn_tid: Int
     // The captured names in first-read order, and the type each was bound at in the frame
@@ -420,6 +422,39 @@ pub fn cg_eff_lower_closure(node: Int) -> Int ! Diag.Report {
 pub fn cg_eff_lower_spawn_closure(node: Int) -> Int ! Diag.Report {
     eff_uses_async = true
     lower_closure_thunk(node, c_mint_local("spawn_task"))
+}
+
+// The task wrapper for a spawn whose argument is a closure VALUE, not a literal written at
+// the call. The wrapper calls through the closure record and reads nothing of the closure
+// but its result type, so one wrapper serves every such spawn of one result type. It is a
+// queue entry with no thunk of its own, which makes the memo per body: the queue drains
+// after each body, so a second body that spawns the same result type mints a second
+// wrapper. That costs code size only, and keeps the memo off module state.
+pub fn cg_eff_spawn_value_task(arg: Int) -> Str ! Diag.Report {
+    eff_uses_async = true
+    let tid = tid_of_node(arg)
+    if tid < 0 { return "" }
+    let ret_tid = child_tid(tid, Slot.Inner1)
+    for th in eff_thunks {
+        if is_task_only(th) && child_tid(th.fn_tid, Slot.Inner1) == ret_tid { return th.task_symbol }
+    }
+    let task_symbol = c_mint_local("spawn_task")
+    eff_thunks.push(PendingThunk {
+        closure: arg, symbol: "", fn_tid: tid, cap_names: [], cap_tids: [], cap_celled: [],
+        handler_tid: -1, outer_name: "", task_symbol: task_symbol, forward_to: -1,
+        forward_symbol: "", forward_ev: false,
+    })
+    task_symbol
+}
+
+fn is_task_only(th: PendingThunk) -> Bool { th.symbol == "" }
+
+// Whether the driver lowers a body for this queue entry. A task-only entry has none: it
+// prints its wrapper and nothing else.
+pub fn cg_eff_thunk_has_body(i: Int) -> Bool ! Diag.Report {
+    let t = thunk_at(i)
+    if t < 0 { return false }
+    !is_task_only(eff_thunks.get(t).unwrap())
 }
 
 fn lower_closure_thunk(node: Int, task_symbol: Str) -> Int ! Diag.Report {
@@ -973,8 +1008,14 @@ fn layout_or_ice(tid: Int, position: Position, node: Int, ice: Str, what: Str) -
 // printed on top of it.
 pub fn cg_eff_print_thunk(i: Int, body: Int) ! Diag.Report {
     let t = thunk_at(i)
-    if t < 0 || body < 0 { return }
+    if t < 0 { return }
     let th = eff_thunks.get(t).unwrap()
+    if is_task_only(th) {
+        let task_ret = cg_eff_thunk_ret(i)
+        if task_ret != "" { print_spawn_task_wrapper_for(i, th, task_ret) }
+        return
+    }
+    if body < 0 { return }
     let ret = cg_eff_thunk_ret(i)
     if ret == "" { return }
     let params = cg_eff_thunk_params(i)
