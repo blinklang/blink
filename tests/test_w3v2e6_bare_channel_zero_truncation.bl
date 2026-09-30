@@ -1,20 +1,20 @@
-// A sent 0 truncated a bare channel's for-in drain.
+// A sent 0 truncated a channel's for-in drain.
 //
 // A channel whose element codegen cannot spell falls back to reinterpreting that element as an
 // 8-byte word, and `send` emitted `blink_channel_send(ch, (void*)(intptr_t)x)`. For x == 0 that
 // payload IS NULL, and NULL is blink_channel_recv's end-of-stream sentinel, so the drain broke
 // on it: a sent 0 ended the stream silently, taking every value behind it as well.
 //
-//     let ch = Channel(4); ch.send(5); ch.send(0); ch.send(7); ch.close()
+//     let ch = channel.new[Int](buffer: 4); ch.send(5); ch.send(0); ch.send(7); ch.close()
 //     for v in ch { io.println("v={v}") }      // printed v=5 and stopped: 0 and 7 vanished
 //
 // The fallback now boxes the same 8-byte payload it used to send inline, so the address is
 // never NULL while the payload word, and every reinterpretation of it, is unchanged. The
 // fallback governs any channel whose element codegen boxes (a sent 0 among them). Every such
-// channel now carries a KNOWN element: an unpinned local channel is error[CannotInferType]
-// (E0301, decisions/under-determined-types.md) and a bare `Channel` in a type position is
+// channel carries a KNOWN element: `channel.new[T](buffer: N)` writes it at the construction
+// site (sections/04_effects.md), and a bare `Channel` in a type position is
 // error[TypeArgArity] (E0303, sections/03_types.md §3.4), so no element-less channel reaches
-// codegen at all — the rows below pin the element through a send or an annotation.
+// codegen at all.
 
 import std.process.{ProcessResult}
 
@@ -41,8 +41,8 @@ fn run_src(tag: Str, src: Str) -> ProcessResult {
     r
 }
 
-test "a leading zero does not truncate a bare channel's for-in drain" {
-    let src = "fn main() \{\n    let ch = Channel(4)\n    ch.send(0)\n    ch.send(1)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n    io.println(\"done\")\n\}\n"
+test "a leading zero does not truncate a channel's for-in drain" {
+    let src = "fn main() \{\n    let ch = channel.new[Int](buffer: 4)\n    ch.send(0)\n    ch.send(1)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n    io.println(\"done\")\n\}\n"
     let r = run_src("lead", src)
     assert_eq(r.exit_code, 0)
     assert(r.out.contains("v=0"))
@@ -53,7 +53,7 @@ test "a leading zero does not truncate a bare channel's for-in drain" {
 // The value BEHIND the zero is the one that shows this is truncation and not a bad rendering
 // of a single element: before the fix this drained `5` and stopped, losing both 0 and 7.
 test "a mid-stream zero does not truncate the values behind it" {
-    let src = "fn main() \{\n    let ch = Channel(4)\n    ch.send(5)\n    ch.send(0)\n    ch.send(7)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n\}\n"
+    let src = "fn main() \{\n    let ch = channel.new[Int](buffer: 4)\n    ch.send(5)\n    ch.send(0)\n    ch.send(7)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n\}\n"
     let r = run_src("mid", src)
     assert_eq(r.exit_code, 0)
     assert(r.out.contains("v=5"))
@@ -63,8 +63,8 @@ test "a mid-stream zero does not truncate the values behind it" {
 
 // The mechanism, not just the outcome: a behavioral row alone would pass if the drain stopped
 // treating NULL as end-of-stream, which would break a genuinely closed channel instead.
-test "the bare-channel send fallback boxes instead of reinterpreting the value as a pointer" {
-    let src = "fn main() \{\n    let ch = Channel(4)\n    ch.send(0)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n\}\n"
+test "the channel send fallback boxes instead of reinterpreting the value as a pointer" {
+    let src = "fn main() \{\n    let ch = channel.new[Int](buffer: 4)\n    ch.send(0)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n\}\n"
     let c = emit_c("box", src)
     assert(!c.contains("(intptr_t)"))
     assert(c.contains("(int64_t*)blink_alloc(sizeof(int64_t));"))
@@ -72,19 +72,19 @@ test "the bare-channel send fallback boxes instead of reinterpreting the value a
 
 // Controls that pin what must NOT move.
 
-test "the .recv() path on a bare channel still reads zero back" {
-    let src = "fn main() \{\n    let ch = Channel(4)\n    ch.send(0)\n    ch.send(1)\n    ch.close()\n    io.println(\"a=\{ch.recv()\} b=\{ch.recv()\}\")\n\}\n"
+test "the .recv() path on a channel still reads zero back" {
+    let src = "fn main() \{\n    let ch = channel.new[Int](buffer: 4)\n    ch.send(0)\n    ch.send(1)\n    ch.close()\n    io.println(\"a=\{ch.recv()\} b=\{ch.recv()\}\")\n\}\n"
     let r = run_src("recv", src)
     assert_eq(r.exit_code, 0)
     assert(r.out.contains("a=0 b=1"))
 }
 
 // A closed, empty channel must still end the drain and still answer the element's zero value
-// through .recv(). The channel is annotated because a channel nothing pins is now
-// error[CannotInferType] (E0301); the runtime property under test is unchanged. Boxing moves the
+// through .recv(). Nothing is ever sent, so the annotation and the constructor are the only
+// places the element is named; the runtime property under test is unchanged. Boxing moves the
 // NULL test from the payload to the box address, so this is the row that proves the sentinel survived.
 test "a closed empty annotated channel still ends the drain and reads back zero" {
-    let src = "fn main() \{\n    let ch: Channel[Int] = Channel(4)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n    io.println(\"drained\")\n    io.println(\"empty=\{ch.recv()\}\")\n\}\n"
+    let src = "fn main() \{\n    let ch: Channel[Int] = channel.new[Int](buffer: 4)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n    io.println(\"drained\")\n    io.println(\"empty=\{ch.recv()\}\")\n\}\n"
     let r = run_src("closed", src)
     assert_eq(r.exit_code, 0)
     assert(!r.out.contains("v="))
@@ -92,45 +92,43 @@ test "a closed empty annotated channel still ends the drain and reads back zero"
     assert(r.out.contains("empty=0"))
 }
 
-// The compiler's own shape (src/cli.bl:2169-2170): a 1-slot bare channel used as a mutable cell
+// The compiler's own shape (src/cli.bl): a 1-slot channel used as a mutable cell
 // whose stored value is legitimately 0. It worked before only because TWO bugs cancelled — the
 // payload 0 became NULL and .recv()'s NULL case answers the zero value — so it is correct by
 // accident on the old path and correct by construction on the new one. `blink test --parallel`'s
 // dot-column counter is this code.
-test "a one-slot bare channel used as a zero-valued mutable cell round-trips" {
-    let src = "fn main() \{\n    let cell = Channel(1)\n    cell.send(0)\n    let a = cell.recv()\n    cell.send(a + 1)\n    let b = cell.recv()\n    cell.send(b + 1)\n    io.println(\"a=\{a\} b=\{b\} c=\{cell.recv()\}\")\n\}\n"
+test "a one-slot channel used as a zero-valued mutable cell round-trips" {
+    let src = "fn main() \{\n    let cell = channel.new[Int](buffer: 1)\n    cell.send(0)\n    let a = cell.recv()\n    cell.send(a + 1)\n    let b = cell.recv()\n    cell.send(b + 1)\n    io.println(\"a=\{a\} b=\{b\} c=\{cell.recv()\}\")\n\}\n"
     let r = run_src("cell", src)
     assert_eq(r.exit_code, 0)
     assert(r.out.contains("a=0 b=1 c=2"))
 }
 
 test "an annotated Channel[Int] still drains a zero" {
-    let src = "fn main() \{\n    let ch: Channel[Int] = Channel(4)\n    ch.send(0)\n    ch.send(1)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n\}\n"
+    let src = "fn main() \{\n    let ch: Channel[Int] = channel.new[Int](buffer: 4)\n    ch.send(0)\n    ch.send(1)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n\}\n"
     let r = run_src("ann", src)
     assert_eq(r.exit_code, 0)
     assert(r.out.contains("v=0"))
     assert(r.out.contains("v=1"))
 }
 
-// R6 — the element is now INFERRED from the send, so a bare Str channel carries a Str. These
-// two rows previously pinned the still-wrong answers (a reinterpreted pointer here, a hard cc
-// failure below) as tripwires against the inference landing silently; it has landed, so they
-// now pin the right answers. The boxing fallback still governs any element codegen must box
-// (a sent 0 among them), but every channel it governs now carries a KNOWN element — a channel
-// nothing pins is error[CannotInferType] (E0301) and never reaches codegen.
-test "a bare Str channel carries its element" {
-    let src = "fn main() \{\n    let ch = Channel(4)\n    ch.send(\"hello\")\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n\}\n"
+// R6 — a Str channel carries a Str. These two rows once pinned wrong answers (a reinterpreted
+// pointer here, a hard cc failure below); they now pin the right ones. The boxing fallback
+// still governs any element codegen must box (a sent 0 among them), and every channel it
+// governs carries the element its constructor names.
+test "a Str channel carries its element" {
+    let src = "fn main() \{\n    let ch = channel.new[Str](buffer: 4)\n    ch.send(\"hello\")\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n\}\n"
     let r = run_src("bstr", src)
     assert_eq(r.exit_code, 0)
     assert(r.out.contains("v=hello"))
 }
 
-// R7 — a bare Float element used to fail in the C compiler ("cannot convert to a pointer
+// R7 — a Float element used to fail in the C compiler ("cannot convert to a pointer
 // type"). The box is now the element's own C type, so the double neither fails nor truncates.
 // Asserting the VALUE is what separates the fix from the old failure mode: an `int64_t` box
 // would have accepted the double and printed 1.
-test "a bare Float channel carries its element without truncating" {
-    let src = "fn main() \{\n    let ch = Channel(4)\n    ch.send(1.5)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n\}\n"
+test "a Float channel carries its element without truncating" {
+    let src = "fn main() \{\n    let ch = channel.new[Float](buffer: 4)\n    ch.send(1.5)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n\}\n"
     let r = run_src("bfl", src)
     assert_eq(r.exit_code, 0)
     assert(r.out.contains("v=1.5"))

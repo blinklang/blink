@@ -1,46 +1,46 @@
-// `Channel(n)` in call position must give the binding a Channel type with an inferable
-// element, the way `Map()` and `Set()` do.
+// An unannotated `Channel(n)` once took its element from a later send, the way `Map()` and
+// `Set()` take theirs from a later insert. The spec builds a channel only through
+// `channel.new[T](buffer: N)` (sections/04_effects.md), which writes the element at the
+// construction site, so every unannotated shape below is now refused as an undefined
+// function with that repair, whatever element a later send or read would have implied.
 //
-// Typecheck's builtin-constructor return typer had arms for Map, Set, Bytes and
-// StringBuilder but none for Channel, so the call fell through to TYPE_UNKNOWN and the
-// element was never recovered: `for v in ch` bound `v` at type `?`.
+// Each shape reads the element in a different position (recv, the for-in binder, a later
+// distinct read), so each is kept: a refusal that only one position reaches would let the
+// others back into inference.
 //
-// Only Int payloads worked, because int64_t is the erased default — and every channel test
-// in the corpus used Int, which is why this survived. Str payloads were REJECTED
-// (`unresolved method '.len' on type ?`) and struct payloads reached cc
-// (`request for member 'n' in something not a structure or union`).
-//
-// The annotated form `let ch: Channel[T] = Channel(n)` took a different route and already
-// worked, so each shape below is paired with its annotated control: a control that fails
-// means the annotation route regressed, not this one.
-//
-// CONTAINER elements (`Channel[List[Int]]`) are deliberately absent: they fail in the recv
-// and for-in positions whether annotated or not, so they are a depth-2 carrier defect with
-// its own fixture, not this hole.
+// The annotated controls build through `channel.new[T]`, which is the route that still
+// exists, and must keep carrying a Str and a struct element through recv and for-in.
+
+import compile_test_helpers
 
 type Msg { n: Int }
 
-// ── recv position ─────────────────────────────────────────────────────────────
-
-test "unannotated Channel carries a Str element through recv" {
-    let ch = Channel(4)
-    ch.send("abcd")
-    assert_eq(ch.recv().len(), 4)
+fn assert_refused(body: Str, tag: Str) {
+    let src = "import std.io\n\ntype Msg \{ n: Int }\n\nfn main() \{\n{body}\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_error(out, "E0504", "{tag}: bare Channel(n) is an undefined function")
+    compile_test_helpers.expect_contains(out, "channel.new[T](buffer: n)", "{tag}: the repair names the spec constructor")
+    assert(!out.contains("E0301"))
 }
 
-test "unannotated Channel carries a struct element through recv" {
-    let ch = Channel(4)
+// ── recv position ─────────────────────────────────────────────────────────────
+
+test "unannotated Channel(n) with a Str sent through recv is refused" {
+    assert_refused(#"    let ch = Channel(4)
+    ch.send("abcd")
+    io.println("{ch.recv().len()}")"#, "channel_ctor_elem_recv_str")
+}
+
+test "unannotated Channel(n) with a struct sent through recv is refused" {
+    assert_refused(#"    let ch = Channel(4)
     ch.send(Msg { n: 7 })
-    assert_eq(ch.recv().n, 7)
+    io.println("{ch.recv().n}")"#, "channel_ctor_elem_recv_struct")
 }
 
 // ── for-in binder position ────────────────────────────────────────────────────
-//
-// The binder is a separate consumer of the element type from recv, so a fix that only
-// reaches one of them leaves the other red.
 
-test "for-in over an unannotated Channel binds a Str element" {
-    let ch = Channel(4)
+test "for-in over an unannotated Channel(n) of Str is refused" {
+    assert_refused(#"    let ch = Channel(4)
     ch.send("ab")
     ch.send("cde")
     ch.close()
@@ -48,11 +48,11 @@ test "for-in over an unannotated Channel binds a Str element" {
     for v in ch {
         total = total + v.len()
     }
-    assert_eq(total, 5)
+    io.println("{total}")"#, "channel_ctor_elem_forin_str")
 }
 
-test "for-in over an unannotated Channel binds a struct element" {
-    let ch = Channel(4)
+test "for-in over an unannotated Channel(n) of a struct is refused" {
+    assert_refused(#"    let ch = Channel(4)
     ch.send(Msg { n: 7 })
     ch.send(Msg { n: 35 })
     ch.close()
@@ -60,14 +60,11 @@ test "for-in over an unannotated Channel binds a struct element" {
     for m in ch {
         total = total + m.n
     }
-    assert_eq(total, 42)
+    io.println("{total}")"#, "channel_ctor_elem_forin_struct")
 }
 
-// The element is minted as a metavar and solved by unification, so a second send of the
-// same type must not conflict with the first, and the solution must survive being read
-// back in a position other than the one that pinned it.
-test "the element solved by the first send serves a later distinct read" {
-    let ch = Channel(4)
+test "an unannotated Channel(n) read back in a second position is refused" {
+    assert_refused(#"    let ch = Channel(4)
     ch.send("first")
     ch.send("second")
     ch.close()
@@ -76,14 +73,13 @@ test "the element solved by the first send serves a later distinct read" {
     for v in ch {
         rest = "{rest}{v}"
     }
-    assert_eq(a, "first")
-    assert_eq(rest, "second")
+    io.println("{a}{rest}")"#, "channel_ctor_elem_second_read")
 }
 
-// ── controls: the annotated route already worked ──────────────────────────────
+// ── controls: the element written at the construction site ────────────────────
 
-test "annotated Channel[Str] still works" {
-    let ch: Channel[Str] = Channel(4)
+test "annotated Channel[Str] from channel.new[Str] still carries its element" {
+    let ch: Channel[Str] = channel.new[Str](buffer: 4)
     ch.send("ab")
     ch.close()
     let mut total = 0
@@ -93,8 +89,8 @@ test "annotated Channel[Str] still works" {
     assert_eq(total, 2)
 }
 
-test "annotated Channel[Msg] still works" {
-    let ch: Channel[Msg] = Channel(4)
+test "annotated Channel[Msg] from channel.new[Msg] still carries its element" {
+    let ch: Channel[Msg] = channel.new[Msg](buffer: 4)
     ch.send(Msg { n: 7 })
     ch.close()
     let mut total = 0
@@ -104,10 +100,8 @@ test "annotated Channel[Msg] still works" {
     assert_eq(total, 7)
 }
 
-// The Int shape is the one that already passed, on the erased default rather than on a real
-// element type. It has to keep passing for the right reason now.
-test "unannotated Channel with an Int element still works" {
-    let ch = Channel(4)
+test "unannotated Channel(n) with an Int element is refused too" {
+    assert_refused(#"    let ch = Channel(4)
     ch.send(10)
     ch.send(32)
     ch.close()
@@ -115,8 +109,7 @@ test "unannotated Channel with an Int element still works" {
     for v in ch {
         total = total + v
     }
-    assert_eq(total, 42)
     let ch2 = Channel(2)
     ch2.send(7)
-    assert_eq(ch2.recv(), 7)
+    io.println("{total} {ch2.recv()}")"#, "channel_ctor_elem_int")
 }
