@@ -1067,6 +1067,8 @@ with handler_expression {
 }
 ```
 
+A `handler E { ... }` expression captures bindings from its enclosing scope exactly as a closure does (§2.8). A captured `let mut` binding is a shared cell: writes in a handler op are visible to the enclosing scope and to any closure that captured the same binding. This differs from `BlockHandler` block bodies (§4.6.3), which run in the caller's scope and capture nothing. The `std.testing` mock controllers (§8.10.3) depend on this rule.
+
 #### Testing: mock handlers
 
 The most common use case. Replace real effects with test doubles:
@@ -1391,6 +1393,8 @@ let result = with db.transaction() {
 #### Implementing BlockHandler
 
 Any type can implement `BlockHandler`:
+
+> **Note:** this example assigns to `self.start` in `enter`. That write does not persist: `self` is a by-value copy, and `exit` receives the value the `with` expression built (§3.6). How state passes from `enter` to `exit` is an open question (the BlockHandler state ticket). Do not copy the `self.start = ...` line.
 
 ```blink
 struct Timer {
