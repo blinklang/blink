@@ -15,8 +15,8 @@
 // the element store, because a read that converted where a store did not would put a value
 // in a cell that comes back out as a different value.
 //
-// These tests pin the loop's shape, the element type the binder is declared at, and every
-// iterable that still has no lowering, each by the name it refuses under.
+// These tests pin the loop's shape and the element type the binder is declared at, for
+// every iterable kind the producer answers.
 
 import std.io
 import diagnostics.{diag_reset}
@@ -31,7 +31,7 @@ import cg_call.{cg_call_element_from_runtime}
 import typecheck.{TYPE_INT}
 import cg_expr.{cg_expr_reset}
 import lower_test_helpers.{
-    assert_eq_str, assert_shape, assert_verifies, ice_count, ice_count_exactly, last_ice,
+    assert_eq_str, assert_shape, assert_verifies, ice_count,
     shape,
 }
 
@@ -143,16 +143,6 @@ fn count_kind(id: Int, want: IrKind) -> Int {
         i = i + 1
     }
     n
-}
-
-// A refused for-in records the internal error and leaves an EMPTY block where the loop
-// would have been, so the block seam still answers a node. The refusal is therefore read
-// off the diagnostic record, and the empty block is checked too: a stage that refused and
-// then emitted a loop anyway would run the body on a container it could not index.
-fn assert_refused(body: Int, name: Str, marker: Str) {
-    assert_eq_str("refusal name", last_ice(), name)
-    assert_eq_str("refusals recorded", "{ice_count_exactly(name, marker)}", "1")
-    assert_eq_str("loops emitted", "{count_kind(body, IrKind.Loop)}", "0")
 }
 
 fn src_list_sum() -> Str {
@@ -355,10 +345,13 @@ test "a range still lowers with no runtime call of any kind" {
     assert_eq_str("refusals recorded", "{ice_count()}", "0")
 }
 
-// ── What still has no loop ────────────────────────────────────────────────
+// ── A string, stepped one character at a time ────────────────────────────
 
-test "a for-in over a string still refuses by name" {
-    let body = probe_body("cg_stmt_for_in_str", #"fn run(s: Str) -> Int {
+// A Str has no by-character position to index: UTF-8 spends one to four bytes on each
+// character. So the loop keeps a byte position of its own and asks the runtime, once per
+// turn, for the next character and the position past it -- no length call at all.
+test "a for-in over a string steps through the runtime once per turn" {
+    let body = probe_fn("cg_stmt_for_in_str", #"fn run(s: Str) -> Int {
     let mut n = 0
     for c in s {
         if c == 'a' { n = n + 1 }
@@ -366,8 +359,73 @@ test "a for-in over a string still refuses by name" {
     n
 }
 "#, "run")
-    assert_refused(body, "UnhandledIterable",
-        "for-in over this iterable has no lowering yet")
+    assert_verifies("str loop", body)
+    assert_eq_str("loops", "{count_kind(body, IrKind.Loop)}", "1")
+    assert_eq_str("runtime calls", runtime_symbols(body, "run").join(", "), "blink_str_next_char")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}
+
+// The step is the first thing a turn does, the same as every other walk here, so a
+// `continue` in the body lands on it and the position still moves.
+test "the string step opens the turn, so a continue cannot skip it" {
+    let body = probe_fn("cg_stmt_for_in_str_continue", #"fn count(s: Str) -> Int {
+    let mut n = 0
+    for c in s {
+        if c == ' ' {
+            continue
+        }
+        n = n + 1
+    }
+    n
+}
+"#, "count")
+    assert_verifies("str continue loop", body)
+    let loop_id = first_loop(body)
+    assert(loop_id >= 0)
+    let turn = ir_kid(loop_id, 0)
+    assert_eq_str("first statement in the turn", shape(ir_kid(turn, 0)), "Let")
+    let second = ir_kid(turn, 1)
+    assert_eq_str("second statement kind", "{ir_kind(second) == IrKind.If}", "true")
+    let skipped: List[Int] = []
+    let mut calls: List[Str] = []
+    collect_runtime_symbols(ir_kid(second, 0), [], skipped, calls)
+    assert_eq_str("the step's call", calls.join(", "), "blink_str_next_char")
+}
+
+test "the string loop's binder is declared at Char's own type" {
+    let body = probe_fn("cg_stmt_for_in_str_elem", #"fn run(s: Str) -> Int {
+    let witness = 'w'
+    let mut n = 0
+    for c in s {
+        if c == witness { n = n + 1 }
+    }
+    n
+}
+"#, "run")
+    let elem = spelling_of_let(body, "witness")
+    assert(elem != "")
+    assert_eq_str("binder spelling", spelling_of_let(body, "c"), elem)
+}
+
+test "a string loop inside a string loop mints a position of its own" {
+    let body = probe_fn("cg_stmt_for_in_str_nested", #"fn pairs(a: Str, b: Str) -> Int {
+    let mut n = 0
+    for x in a {
+        for y in b {
+            if x == y { n = n + 1 }
+        }
+    }
+    n
+}
+"#, "pairs")
+    assert_eq_str("loops", "{count_kind(body, IrKind.Loop)}", "2")
+    assert_verifies("nested str loops", body)
+    let names = let_names(body)
+    let mut seen: List[Str] = []
+    for nm in names {
+        assert(!seen.contains(nm))
+        seen.push(nm)
+    }
 }
 
 // ── The other iterables, each walked the shape its own strategy gives it ──
