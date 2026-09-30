@@ -38,6 +38,11 @@ typedef struct {
 
 typedef struct {
     void** buffer;
+    /* The sized entry points keep each element inline here, elem_size bytes a slot, so
+       "closed and empty" travels in recv's return value and no bit pattern of an element
+       can be read as it. */
+    char* slots;
+    int64_t elem_size;
     int64_t capacity;
     int64_t head;
     int64_t tail;
@@ -263,6 +268,66 @@ BLINK_RT_FN void* blink_channel_recv(blink_channel* ch) {
 }
 #endif
 
+/* The word entry points above are what a compiler built before the sized ones emits;
+   they stay until gen0 emits only the sized ones. */
+
+BLINK_RT_FN blink_channel* blink_channel_new_sized(int64_t capacity, int64_t elem_size);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_channel* blink_channel_new_sized(int64_t capacity, int64_t elem_size) {
+    blink_channel* ch = blink_channel_new(capacity);
+    ch->elem_size = elem_size;
+    /* A zero-sized element still needs a nonzero allocation to stay a valid ring. */
+    int64_t slot = elem_size > 0 ? elem_size : 1;
+    ch->slots = (char*)blink_alloc_shared(slot * ch->capacity);
+    return ch;
+}
+#endif
+
+/* A send on a closed channel is a bug in the program, so it panics with the text codegen
+   wrote at the call site, which names the send's source location. */
+BLINK_RT_FN void blink_channel_send_value(blink_channel* ch, const void* value, const char* closed_panic);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_channel_send_value(blink_channel* ch, const void* value, const char* closed_panic) {
+    pthread_mutex_lock(&ch->mutex);
+    while (ch->count >= ch->capacity && !ch->closed) {
+        pthread_cond_wait(&ch->send_cond, &ch->mutex);
+    }
+    if (ch->closed) {
+        pthread_mutex_unlock(&ch->mutex);
+        __blink_panic_dispatch(closed_panic);
+        return;
+    }
+    if (ch->elem_size > 0) memcpy(ch->slots + ch->tail * ch->elem_size, value, (size_t)ch->elem_size);
+    ch->tail = (ch->tail + 1) % ch->capacity;
+    ch->count++;
+    pthread_cond_signal(&ch->recv_cond);
+    pthread_mutex_unlock(&ch->mutex);
+}
+#endif
+
+/* 0 only when the channel is closed and drained; otherwise 1, with the next element copied
+   to out. */
+BLINK_RT_FN int blink_channel_recv_value(blink_channel* ch, void* out);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_channel_recv_value(blink_channel* ch, void* out) {
+    pthread_mutex_lock(&ch->mutex);
+    while (ch->count == 0 && !ch->closed) {
+        pthread_cond_wait(&ch->recv_cond, &ch->mutex);
+    }
+    if (ch->count == 0) {
+        pthread_mutex_unlock(&ch->mutex);
+        return 0;
+    }
+    if (ch->elem_size > 0) memcpy(out, ch->slots + ch->head * ch->elem_size, (size_t)ch->elem_size);
+    ch->head = (ch->head + 1) % ch->capacity;
+    ch->count--;
+    pthread_cond_signal(&ch->send_cond);
+    pthread_mutex_unlock(&ch->mutex);
+    return 1;
+}
+#endif
+
+/* A second close does nothing: closed is already set and every waiter already woken. */
 BLINK_RT_FN void blink_channel_close(blink_channel* ch);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_channel_close(blink_channel* ch) {

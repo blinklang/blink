@@ -6303,6 +6303,21 @@ fn tc_error_at_code(msg: Str, node_id: Int, name: Str, code: Str, help: Str) ! T
     diag_error_at(name, code, msg, node_id, help)
 }
 
+// A binding declared as T whose value is a channel `recv()`: recv answers Option[T], and the
+// help names the forms that handle a closed channel before the `.unwrap()` that panics on one.
+fn tc_report_declared_mismatch(msg: Str, at: Int, val: Int, declared: Int, got: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    tc_error_at_code(msg, at, "TypeError", TYPE_ERROR, tc_recv_option_help(val, declared, got))
+}
+
+fn tc_recv_option_help(val: Int, declared: Int, got: Int) -> Str ! TypeCheck.Resolve {
+    if val < 0 || node_kind(val) != NodeKind.MethodCall || node_method(val) != "recv" { return "" }
+    if type_kind(tc_lookup_node_tid(node_obj(val))) != TyKind.Channel { return "" }
+    let r = tc_resolve(got)
+    if type_kind(r) != TyKind.Option { return "" }
+    if !tc_tid_same_type(ty_pool.get(r).unwrap().inner1, declared) { return "" }
+    "recv answers None once the channel is closed and drained: use `ch.recv() ?? <default>`, a `match` on Some and None, or drain with `for v in ch`; write `.unwrap()` only where a value is known to be there"
+}
+
 
 // ── Incremental filter API ──────────────────────────────────────────
 
@@ -18025,20 +18040,15 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 check_builtin_arg(method, 0, elem, args_sl, "Channel")
                 return TYPE_VOID
             }
-            // Not an Option: the runtime end-of-stream sentinel is consumed by the for-in
-            // drain, so `let v = ch.recv()` binds the element itself.
+            // An Option: None only once the channel is closed and drained, so closed is
+            // never a value of the element (sections/04_effects.md §4.13).
             //
-            // An element nothing has pinned answers Unknown rather than the bare α, so
-            // `let v = ch.recv()` keeps the codegen reinterpretation fallback instead of
-            // becoming E0301. A bare `Channel` param annotation carries no element at all
-            // (`fn relay(src: Channel, dst: Channel)`), so a send through one pins the
-            // callee's element and never the caller's — whether that annotation should be
-            // rejected outright is a spec question, and answering it here by erroring on the
-            // read instead would reject the program at the wrong place.
+            // An element nothing has pinned answers Unknown rather than an Option over the
+            // bare α, so the read is not what reports the under-determined element.
             if method == "recv" {
                 let r = tc_resolve(elem)
                 if tc_tid_has_unbound_metavar(r) != 0 { return -1 }
-                return r
+                return make_option_type(r)
             }
             if method == "close" { return TYPE_VOID }
         }
@@ -21275,7 +21285,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 
         if tc_tid_is_no_info(declared_tid) == 0 && tc_tid_is_no_info(inferred_tid) == 0 {
             if assignment_types_compatible(declared_tid, inferred_tid, val) == 0 {
-                tc_error_at("variable `{vname}`: declared type {type_to_str(declared_tid)} but got {type_to_str(inferred_tid)}", node)
+                tc_report_declared_mismatch("variable `{vname}`: declared type {type_to_str(declared_tid)} but got {type_to_str(inferred_tid)}", node, val, declared_tid, inferred_tid)
             } else {
                 // A declared let type is an expected-type source for the value's
                 // metavars, not only something to compare against. This arm otherwise
@@ -22570,7 +22580,7 @@ fn tc_stamp_annotated_global_init(l: Int, l_val: Int) ! TypeCheck.Resolve, TypeC
         // Behind the compare, for the reason the LetBinding arm gives at its own pin: a pin
         // ahead of the compare can turn a mismatch into a silent success.
         if assignment_types_compatible(declared, v_tid, l_val) == 0 {
-            tc_error_at("variable `{node_name(l)}`: declared type {type_to_str(declared)} but got {type_to_str(v_tid)}", l)
+            tc_report_declared_mismatch("variable `{node_name(l)}`: declared type {type_to_str(declared)} but got {type_to_str(v_tid)}", l, l_val, declared, v_tid)
         } else {
             if tc_pin_ok_for_declared(l_val, declared) != 0 {
                 tc_pin_tail_ret_generic(declared, v_tid)
