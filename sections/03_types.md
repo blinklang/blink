@@ -329,12 +329,12 @@ trait Contains[T] {
 | Type | `contains` semantics | Status |
 |------|---------------------|--------|
 | `Set[T]` | Hash-based membership test | Implemented |
-| `List[T]` | Linear scan for element equality | Implemented (primitive elements) |
+| `List[T]` | Linear scan for element equality; needs `T: Eq` | Implemented (primitive elements) |
 | `Map[K, V]` | Key presence check (equivalent to `contains_key`) | Implemented |
 
 **Why a shared trait.** Containment is a universal set-theoretic predicate — "is X in this collection?" Every collection answers it, and generic code benefits: `fn has_item[C: Contains[T], T](c: C, item: T) -> Bool { c.contains(item) }`. The alternative — putting `contains` in each per-type trait — prevents writing functions generic over "any collection that can test membership." (Vote: 5-0.)
 
-**Implementation status.** `Set`, `Map`, and `List` all implement `Contains`. `Map.contains(k)` is equivalent to `Map.contains_key(k)`. `List.contains` is implemented for **primitive element types** — `Int`, `Bool`, `Str`, `Float` — via a linear scan over element equality; `Str` elements use string-value equality. Lists of structs/enums and lists of nested collections (`List[List[_]]`, `List[Map[_,_]]`) are **not yet supported** — `.contains()` on those is a compile error (`UnresolvedMethod`), because element equality for those types is not yet defined (`==` on boxed structs is pointer identity, not field-wise). Use `xs.into_iter().filter(...)` for those cases until value equality lands.
+**Implementation status.** `Set`, `Map`, and `List` all implement `Contains`. `Map.contains(k)` is equivalent to `Map.contains_key(k)`. `List.contains` is implemented for **primitive element types** — `Int`, `Bool`, `Str`, `Float` — via a linear scan over element equality; `Str` elements use string-value equality. `List[T].contains` needs `T: Eq` and compares elements with `==` (§3.6 *Container Equality*), so it applies to lists of `Eq` structs, enums and nested containers too. The compiler does not implement that yet: `.contains()` on a list of structs/enums or of nested collections (`List[List[_]]`, `List[Map[_,_]]`) is a compile error (`UnresolvedMethod`) until it does. Use `xs.into_iter().filter(...)` for those cases in the meantime.
 
 **Note on `Str`.** `Str` exposes substring search as `"hello".contains("ell")` — semantically "contains substring," not "contains element." This routes through `StrOps` (§3.2.1); `Str` is not a meaningful `Contains[Char]` element-membership type. For character search use `someStr.contains("{c}")`.
 
@@ -2141,7 +2141,7 @@ for name in names {
 }
 ```
 
-A function whose result depends on unsorted `Map`/`Set` iteration order is **not** referentially transparent with respect to its `Map`/`Set` arguments, even though it has no effect annotation. The compiler's purity analysis (§4 effects, truly-pure classification) treats iteration over a `Map`/`Set` as an opaque-order read of process state: any function that iterates a `Map` or `Set` is conservatively excluded from memoization and reordering. Iteration order is **not** part of a `Map`/`Set` value's identity — two maps with equal entry sets are `==`-equal regardless of insertion history or seed.
+A function whose result depends on unsorted `Map`/`Set` iteration order is **not** referentially transparent with respect to its `Map`/`Set` arguments, even though it has no effect annotation. The compiler's purity analysis (§4 effects, truly-pure classification) treats iteration over a `Map`/`Set` as an opaque-order read of process state: any function that iterates a `Map` or `Set` is conservatively excluded from memoization and reordering. Iteration order is **not** part of a `Map`/`Set` value's identity — two maps with equal entry sets are `==`-equal regardless of insertion history or seed (§3.6 *Container Equality*).
 
 **Float keys.** `F32`/`F64` do not implement `Hash`, and a `Float` (or any type transitively containing one) used as a `Map`/`Set` key is rejected at type-check as `E1400 MapKeyNotHashable`. This is a permanent contract, not a missing impl: float equality cannot satisfy the `Eq`/`Hash` coherence law — `-0.0 == 0.0` holds while the two have distinct bit patterns, so a bitwise hash would map equal values to different buckets. Round to an integer key instead.
 
@@ -2511,8 +2511,90 @@ For IEEE 754-strict comparison where `NaN != NaN` and `-0.0 != 0.0`: use `float.
 | Bool | -- | -- | -- | -- | -- | -- | Y | -- | Y | Y | Y | Y |
 | Str | -- | -- | -- | -- | -- | -- | Y | Y | Y | Y | Y | Y |
 | Char | -- | -- | -- | -- | -- | -- | Y | Y | Y | Y | Y | Y |
+| Bytes | -- | -- | -- | -- | -- | -- | Y | -- | -- | -- | Y | Y |
 
-Y* = total ordering semantics. Unsigned types don't impl `Neg`. `Float` doesn't impl `Hash`.
+Y* = total ordering semantics. Unsigned types don't impl `Neg`. `Float` doesn't impl `Hash`. `Bytes` equality is byte-wise; `Bytes` has no `Ord`.
+
+`Option`, `Result`, `List`, `Set`, `Map` and tuples implement `Eq` when their parts do — see *Container Equality* below.
+
+#### Container Equality
+
+The built-in containers implement `Eq` **conditionally**: a container is `Eq` when its parts are `Eq` (vote: 6-0; see [Container Equality rationale](../decisions/container-equality.md)). The compiler provides these impls. The orphan rule (*Trait Coherence*) stops user code from writing them.
+
+| Type | `Eq` when | `a == b` is `true` when |
+|------|-----------|-------------------------|
+| `Option[T]` | `T: Eq` | both are `None`, or both are `Some` and the payloads are `==` |
+| `Result[T, E]` | `T: Eq` and `E: Eq` | both are `Ok` with `==` payloads, or both are `Err` with `==` payloads |
+| `List[T]` | `T: Eq` | the lengths are equal and the elements at each index are `==` |
+| `Set[T]` | always (`Set` requires `T: Hash`, and `Hash: Eq`) | the sizes are equal and each element of `a` is a member of `b` |
+| `Map[K, V]` | `V: Eq` (`K: Hash` gives `K: Eq`) | the key sets are equal and, for each key, the values are `==` |
+| `Bytes` | always | the lengths are equal and the bytes are equal |
+| tuple | every element is `Eq` | element-wise `==` (§3.8 *Auto-Derived Trait Implementations*) |
+
+The check recurses through the type. `Option[List[Int]]` is `Eq` because `List[Int]` is `Eq`, because `Int` is `Eq`. `List[Widget]` is `Eq` only when `Widget` has an `Eq` impl or `@derive(Eq)`.
+
+```blink
+@derive(Eq)
+type Point { x: Int, y: Int }
+
+type Widget { id: Int }
+
+fn main() {
+    let a = [1, 2, 3]
+    let b = [1, 2, 3]
+    let same = a == b
+    io.println("{same}")                            // true: same elements, same order
+
+    let p: Option[List[Point]] = Some([Point { x: 1, y: 2 }])
+    let q: Option[List[Point]] = Some([Point { x: 1, y: 2 }])
+    let pq = p == q
+    io.println("{pq}")                              // true
+
+    let mut s1: Set[Int] = Set()
+    s1.insert(1)
+    s1.insert(2)
+    let mut s2: Set[Int] = Set()
+    s2.insert(2)
+    s2.insert(1)
+    let ss = s1 == s2
+    io.println("{ss}")                              // true: insertion order is not part of the value
+
+    let ws = [Widget { id: 1 }]
+    // ws == ws                                     // error: `Widget` does not implement `Eq`
+}
+```
+
+**Values, never identity.** `==` never compares identity. Two lists with equal elements are `==` when they are different cells, and wrapping a value in `Option` or `Result` does not change what `==` compares. `Set` and `Map` compare by membership: iteration order is not part of the value (*Hash Contract and Seeding*).
+
+**Generic code.** `==` on a container of a type parameter needs the bound that the table gives. `fn same[T](a: Option[T], b: Option[T]) -> Bool { a == b }` is an error. Write `fn same[T: Eq](a: Option[T], b: Option[T]) -> Bool { a == b }`.
+
+**Enums (interim rule).** An enum with no `Eq` impl and no `@derive(Eq)` is `Eq` only if every payload type is `Eq`. An enum with no payloads is `Eq`. So `Option[Color]` is `Eq` for a payload-free `Color`, and `Option[Shape]` is not `Eq` if a `Shape` variant carries a `List[Widget]`. Whether a data enum must write `@derive(Eq)` is an open question.
+
+**Ord.** `Set` and `Map` never implement `Ord`: no order over them is canonical and agrees with membership equality.
+
+**Eq laws.** An `Eq` impl must be reflexive (`a == a`), symmetric (`a == b` implies `b == a`) and transitive (`a == b` and `b == c` imply `a == c`). The compiler and the container impls may rely on these laws, as `Map` and `Set` rely on the Hash coherence law. For example, `==` may return `true` without comparing elements when both operands are the same cell. Every built-in `Eq` obeys the laws; `Float` obeys them because `NaN == NaN` (*Float Total Ordering*). If a user impl breaks a law, `==` on a container that holds that type returns an unspecified `Bool`. It stays memory-safe.
+
+**Cyclic data.** `List`, `Map` and `Set` are shared cells, so a value can contain itself (for example, through a struct field that holds the list that holds the struct). `==` on cyclic data may not terminate. The compiler adds no cycle guard.
+
+**Diagnostic for a failed `Eq` check.** When `==`, `!=`, an `Eq` bound (for example `assert_eq`, E0306) or `@derive(Eq)` (E1401) fails on a type that has no `Eq`, the error names the **innermost** type argument that has no `Eq`, and the chain from the operand type to it. It offers **at least** these machine-applicable fixes (§8.6):
+
+- `@derive(Eq)` on that type, when it is a user-declared `struct` or `enum`.
+- `x.is_none()` in place of `x == None` (and `x.is_some()` in place of `x != None`), when one operand is a bare `None` literal. `is_none()` and `is_some()` need no `Eq`.
+
+The exact wording is not normative, and tools may offer more fixes.
+
+```
+error[TypeError]: `Option[List[Widget]]` does not implement `Eq`
+ --> app.bl:9:8
+  |
+9 |     if found == None {
+  |        ^^^^^^^^^^^^^ `==` needs `Eq`
+  |
+  = note: `Option[List[Widget]]` is `Eq` only if `List[Widget]` is `Eq`,
+          and `List[Widget]` is `Eq` only if `Widget` is `Eq`
+  = help: add `@derive(Eq)` to `type Widget`
+  = help: to test for `None`, write `found.is_none()`
+```
 
 #### Integer Division
 
@@ -3357,6 +3439,8 @@ impl Eq for Pair[A, B] where A: Eq, B: Eq {
 ```
 
 The compiler inspects each field's type. If a field has type `A`, and the derived trait requires calling `.eq()` on that field, then `A: Eq` is added as a bound. Concrete types (e.g., `Int`) are checked at derive time — if `Int` doesn't implement the trait, it's an error (see Error Reporting below).
+
+For `@derive(Eq)`, a container or tuple field is checked by the rule in *Container Equality* (§3.6): `items: List[Item]` derives when `Item` is `Eq`, and `E1401 NonDerivableTrait` names `Item` when it is not. A field `List[A]` adds the bound `A: Eq`.
 
 ##### Supertrait Auto-Derivation
 

@@ -1427,6 +1427,8 @@ test "assertions demo" {
 }
 ```
 
+`assert_eq` and `assert_ne` enforce their `T: Eq` bound with the same check as `==` (§3.6 *Container Equality*), and they compare with `==`. A type that `==` rejects, `assert_eq` rejects too (`E0306 TraitBoundNotSatisfied`); add `@derive(Eq)` to the type.
+
 **Note:** `assert_matches` is a compiler intrinsic whose second argument is a **pattern** (same syntax as `match` arms), not an expression. It cannot be passed as a higher-order function.
 
 Assertion failure panics — unwinding to the test runner, which marks the test as failed and continues running other tests. This is the one context where Blink uses panic semantics, since tests are controlled environments where unwinding is safe. The test runner's per-test frame is a **runtime catch boundary** in the sense of §4.6.3, so `BlockHandler.exit(false)` and `Closeable.close()` run during the unwind — `with db.transaction() { assert_eq(...) }` rolls back the transaction on assertion failure.
