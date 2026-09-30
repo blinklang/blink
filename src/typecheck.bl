@@ -3077,6 +3077,15 @@ fn ensure_runtime_struct_type(name: Str, fnames: List[Str], ftids: List[Int], de
     tid
 }
 
+// Instant and Duration as lib/std/time.bl declares them, `derives` included.
+fn runtime_instant_tid() -> Int {
+    ensure_runtime_struct_type("Instant", ["nanos"], [TYPE_INT], ["Eq", "Ord", "Hash", "Clone", "Debug"])
+}
+
+fn runtime_duration_tid() -> Int {
+    ensure_runtime_struct_type("Duration", ["nanos"], [TYPE_INT], ["Eq", "Ord", "Clone", "Debug"])
+}
+
 fn runtime_process_result_tid() -> Int {
     ensure_runtime_struct_type("ProcessResult", ["out", "err_out", "exit_code"], [TYPE_STR, TYPE_STR, TYPE_INT], [])
 }
@@ -11767,6 +11776,20 @@ pub fn tc_call_user_effect(call_node: Int) -> Int {
     tc_ue_op_root.get(decl) ?? -1
 }
 
+// The builtin Handler tid a `default.op(args)` call performs through, or -1. Name resolution
+// typed the receiver as the handler the enclosing operation belongs to; a user root answers
+// through tc_call_user_effect instead, and a local named `default` is a value.
+pub fn tc_call_builtin_default(call: Int) -> Int {
+    if call < 0 || node_kind(call) != NodeKind.MethodCall { return -1 }
+    let obj = node_obj(call)
+    if obj < 0 || node_kind(obj) != NodeKind.Ident || node_name(obj) != "default" { return -1 }
+    if tc_mc_obj_is_value(call) != 0 { return -1 }
+    let tid = tc_lookup_node_tid(obj)
+    let eff = tc_tid_handler_effect(tid)
+    if eff == "" || !builtin_root_has_handler_ops(tc_handler_effect_root(eff)) { return -1 }
+    tid
+}
+
 // `default` in a handler operation names the handler this one was installed over (§4
 // explicit delegation). Name resolution is the walk that knows which operation it is in, so it
 // types the receiver as that handler and records the operation the call performs; inference and
@@ -11794,16 +11817,53 @@ fn tc_infer_default_perform(call: Int, root: Str, method: Str) -> Int ! TypeChec
         return tc_error_recovery_tid()
     }
     let handle = str_to_lower(root)
-    // A builtin root's operations are not named by its handle's methods; left unclaimed.
-    if is_user_effect_handle_name(handle) == 0 { return -1 }
-    let key = "{handle}.{method}"
-    let sig = lookup_fnsig(key)
+    let user = is_user_effect_handle_name(handle) != 0
+    if !user && !builtin_root_has_handler_ops(root) {
+        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD,
+            "`default` is not supported yet in a handler of effect `{root}`", call,
+            "call the effect's handle directly, or forward to a handler you hold")
+        return tc_error_recovery_tid()
+    }
+    let key = if user { "{handle}.{method}" } else { builtin_handler_op_key(root, method) }
+    let sig = if user { lookup_fnsig(key) } else { builtin_handler_op_sig(root, method) }
     if sig == -1 {
         diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "effect `{root}` has no operation `{method}`", call, "")
         return tc_error_recovery_tid()
     }
     let _ = check_arg_shapes(key, sig, node_args(call), 0, call)
     fnsig_pool.get(sig).unwrap().ret
+}
+
+// The builtin roots whose handler operations the spec names (§4.3): IO's three, which take
+// the rendered text, and Time's two. Env's names differ between the spec and the runtime, so
+// it has none here until that is settled; the other builtin roots name none.
+fn builtin_root_has_handler_ops(root: Str) -> Bool {
+    root == "IO" || root == "Time"
+}
+
+// No source spelling reaches this key, so no declaration can take it over.
+fn builtin_handler_op_key(root: Str, op: Str) -> Str {
+    "Handler[{root}].{op}"
+}
+
+// The signature of a handler operation of a builtin root, or -1 for a name the spec does not
+// give that root. io.eprint is not interceptable, so eprint is no operation, and a caller
+// name such as println is not one either. Registered on first use, so Instant and Duration are
+// minted only for a program that delegates a Time operation.
+fn builtin_handler_op_sig(root: Str, op: Str) -> Int {
+    let key = builtin_handler_op_key(root, op)
+    let found = lookup_fnsig(key)
+    if found != -1 { return found }
+    if root == "IO" && (op == "print" || op == "print_no_nl" || op == "log") {
+        register_intrinsic_fn_sig(key, [TYPE_STR], TYPE_VOID)
+    } else if root == "Time" && op == "read" {
+        register_intrinsic_fn_sig(key, [], runtime_instant_tid())
+    } else if root == "Time" && op == "sleep" {
+        register_intrinsic_fn_sig(key, [runtime_duration_tid()], TYPE_VOID)
+    } else {
+        return -1
+    }
+    lookup_fnsig(key)
 }
 
 pub fn is_user_effect_handle_name(name: Str) -> Int {
@@ -18578,7 +18638,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // lookup runs first inside ensure_runtime_struct_type, so the declared tid wins
                 // and `.to_ms()` on the result still resolves through `Duration_to_ms`. Same
                 // idempotent-mint reasoning as the Instant tid at the time.read() arm.
-                return ensure_runtime_struct_type("Duration", ["nanos"], [TYPE_INT], ["Eq", "Ord", "Clone", "Debug"])
+                return runtime_duration_tid()
             }
             // The synthesized sealed Display.display() has no user-written fnsig; it
             // always returns Str.
@@ -18730,7 +18790,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // is normally present — but a silent fall-through when it is not would
                     // be the same fail-open erasure as the process builtins had. Mint it,
                     // so the type is right whether or not std.time is in scope.
-                    return ensure_runtime_struct_type("Instant", ["nanos"], [TYPE_INT], ["Eq", "Ord", "Hash", "Clone", "Debug"])
+                    return runtime_instant_tid()
                 }
                 if obj_name == "time" && method == "sleep" { return TYPE_VOID }
             }
