@@ -1,0 +1,108 @@
+// A channel is built with channel.new[T](buffer: N) (sections/04_effects.md §4.13). Concurrent
+// primitives are made through namespaced functions, not through the type name, so neither a
+// bare `Channel(n)` nor `Channel.new(n)` builds one. Each is reported with the repair and
+// nothing else. The element must be written at the construction site, so the repair names it.
+import cg_test_helpers.{cg_probe_begin, cg_probe_errors_named}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_ice_count}
+import std.io
+
+// Checks `src` and answers the UndefinedFunction count. Any other error, or an internal
+// error, fails the row: the refusal must not cascade into the uses of the value.
+fn undefined_in(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    cg_probe_begin(path)
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut others = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.name != "UndefinedFunction" {
+            io.println("FAIL: {stem} recorded an error the row does not expect: {d.name}: {d.message}")
+            others = others + 1
+        }
+    }
+    assert_eq(others, 0)
+    assert_eq(diag_ice_count, 0)
+    cg_probe_errors_named("UndefinedFunction")
+}
+
+fn repair_names_the_spec_constructor() -> Bool {
+    for d in diag_entries {
+        if d.severity == "error" && d.name == "UndefinedFunction" && d.message.contains("`Channel`") {
+            return d.help.contains("channel.new[T](buffer: n)")
+        }
+    }
+    false
+}
+
+fn bare_annotated_src() -> Str {
+    #"fn main() {
+    let ch: Channel[Int] = Channel(10)
+    ch.send(1)
+    ch.close()
+    for v in ch { io.println("{v}") }
+}
+"#
+}
+
+fn bare_inferred_src() -> Str {
+    #"fn main() {
+    let ch = Channel(4)
+    ch.send("a")
+    ch.close()
+    for v in ch { io.println(v) }
+}
+"#
+}
+
+fn static_new_src() -> Str {
+    #"fn main() {
+    let ch: Channel[Int] = Channel.new(4)
+    ch.send(1)
+    ch.close()
+    for v in ch { io.println("{v}") }
+}
+"#
+}
+
+fn spec_ctor_src() -> Str {
+    #"fn main() {
+    let ch = channel.new[Str](buffer: 4)
+    ch.send("a")
+    ch.close()
+    for v in ch { io.println(v) }
+}
+"#
+}
+
+test.failing(
+    "a bare Channel(n) under an annotation is an undefined function",
+    reason: "the typechecker still accepts the bare Channel(n) call; it stays accepted until the compiler source stops using it",
+) {
+    assert_eq(undefined_in("typecheck_ch_bare_annotated", bare_annotated_src()), 1)
+    assert(repair_names_the_spec_constructor())
+}
+
+test.failing(
+    "a bare Channel(n) whose element only a send names is an undefined function",
+    reason: "the typechecker still accepts the bare Channel(n) call; it stays accepted until the compiler source stops using it",
+) {
+    assert_eq(undefined_in("typecheck_ch_bare_inferred", bare_inferred_src()), 1)
+    assert(repair_names_the_spec_constructor())
+}
+
+test.failing(
+    "Channel.new(n) is refused with the same repair",
+    reason: "the typechecker still accepts the static Channel.new(n) call; it is refused together with the bare form",
+) {
+    assert_eq(undefined_in("typecheck_ch_static_new", static_new_src()), 1)
+    assert(repair_names_the_spec_constructor())
+}
+
+test "channel.new[T](buffer: n) still builds one" {
+    assert_eq(undefined_in("typecheck_ch_spec_ctor", spec_ctor_src()), 0)
+}
