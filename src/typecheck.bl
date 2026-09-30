@@ -6884,7 +6884,7 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     // same reason List/Map/Set are: is_primitive_type already claims these names, so a user
     // type could not have taken them, and falling through to `make_typevar(name)` is what made
     // an ANNOTATED channel un-iterable — tc_check_body's deferred-iterable test asks
-    // `iter_tk == TyKind.Channel`, which a typevar is not, so `let ch: Channel[Int] = Channel(4)`
+    // `iter_tk == TyKind.Channel`, which a typevar is not, so `let ch: Channel[Int] = channel.new[Int](buffer: 4)`
     // followed by `for v in ch` drew E0302 while the unannotated program compiled.
     if name == "Handle" {
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
@@ -12694,7 +12694,6 @@ pub fn is_builtin_fn(name: Str) -> Int {
     if name == "Map" { return 1 }
     if name == "Set" { return 1 }
     if name == "Bytes" { return 1 }
-    if name == "Channel" { return 1 }
     if name == "StringBuilder" { return 1 }
     if name == "unix_socket_listen" { return 1 }
     if name == "unix_socket_connect" { return 1 }
@@ -12985,15 +12984,19 @@ fn is_builtin_method_on_receiver(obj_k: TyKind, name: Str) -> Int {
     1
 }
 
-// A builtin type whose name has no call form, unlike Map, Set and Channel, and the repair
-// to name for it; "" for any other name. The spec builds each of these through a static
-// constructor on the type name (sections/03_types.md).
+// A builtin type whose name has no call form, unlike Map and Set, and the repair to name for
+// it; "" for any other name. The spec builds List and StringBuilder through a static
+// constructor on the type name (sections/03_types.md), and a channel through the namespaced
+// `channel.new[T]` (sections/04_effects.md), which has to name the element.
 fn tc_no_call_form_repair(name: Str) -> Str {
     if name == "List" {
         return "`List` has no constructor call; build an empty list with `List.new()`, or with `[]` and an annotation, as in `let l: List[Int] = []`"
     }
     if name == "StringBuilder" {
         return "`StringBuilder` has no constructor call; build one with `StringBuilder.new()`, or with `StringBuilder.with_capacity(n)` to reserve n bytes"
+    }
+    if name == "Channel" {
+        return "`Channel` has no constructor call; build a channel with `channel.new[T](buffer: n)`, which names its element type"
     }
     ""
 }
@@ -13059,9 +13062,6 @@ fn get_builtin_fn_ret(name: Str) -> Int {
         return make_map_type(tc_container_slot_from_hint(TyKind.Map, 1), tc_container_slot_from_hint(TyKind.Map, 2))
     }
     if name == "Set" { return make_set_type(tc_container_slot_from_hint(TyKind.Set, 1)) }
-    // Channel stays a bare mint: `channel.new[T](..)` writes its element down at the
-    // construction site, so the ChannelNew arm answers before this one is reached.
-    if name == "Channel" { return make_channel_type(make_metavar()) }
     TYPE_UNKNOWN
 }
 
@@ -18015,9 +18015,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         }
 
         // Channel had no arm at all, so `.recv()` answered Unknown even for an annotated
-        // `Channel[Str]` — nothing compared its result against a declared type, and nothing
-        // pinned the element of a bare `Channel(n)`. `send` is the constraining use, exactly
-        // as `insert` is for Map/Set, so the pin goes through the same check_builtin_arg.
+        // `Channel[Str]` — nothing compared its result against a declared type. `send` is the
+        // constraining use, exactly as `insert` is for Map/Set, so it goes through the same
+        // check_builtin_arg.
         if obj_k == TyKind.Channel {
             let args_sl = node_args(node)
             let elem = ty_pool.get(tc_resolve(obj_t)).unwrap().inner1
@@ -18844,6 +18844,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // It sits above every declaration rung, as the builtin constructors below do, so a
             // program that declares `List_new` cannot type this call as its own function.
             if obj_name == "List" && obj_is_value == 0 && method == "new" { return tc_list_new_ctor(node) }
+            // Only the namespaced `channel.new[T]` builds a channel, so the static spelling gets
+            // the bare call's refusal. The recovery type keeps the uses of the value quiet.
+            if obj_name == "Channel" && obj_is_value == 0 && method == "new" && tc_names_type_without_call_form(obj_name) {
+                tc_errors.push("undefined function `Channel.new`")
+                diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `Channel.new`: `Channel` has no constructor", node, tc_no_call_form_repair(obj_name))
+                return tc_error_recovery_tid()
+            }
             if is_builtin_fn(obj_name) != 0 && obj_is_value == 0 {
                 if (obj_name == "Map" || obj_name == "Set") && method == "new" && tc_empty_ctor_arity("{obj_name}.new", node) == 0 {
                     return tc_error_recovery_tid()
@@ -22593,7 +22600,7 @@ fn tc_stamp_annotated_global_init(l: Int, l_val: Int) ! TypeCheck.Resolve, TypeC
 //
 // A clean but still-open tid is the module-scope form of the region-boundary under-determined
 // case (nr_pop_scope): a top-level binding takes its type at its own site from its RHS and
-// annotation ALONE, so an empty `[]`/`None`/`Channel(n)`/`Map()` that nothing here pins is
+// annotation ALONE, so an empty `[]`/`None`/`Map()` that nothing here pins is
 // under-determined -> error[CannotInferType] (E0301). A later cross-scope use (`ch.send(1)` in a
 // fn or test body) is the remote effect the panel rejected, so it cannot supply the type; leaving
 // the binding UNKNOWN would let codegen invent an arbitrary flat carrier — the forbidden "third
