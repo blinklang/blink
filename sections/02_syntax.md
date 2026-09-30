@@ -39,7 +39,7 @@ All decided through independent design and cross-team voting. None are revisitab
 | Statement terminator | Newline | No semicolons. Canonical formatting makes them redundant. Saves 1 token per line across every file. See [2.5](#25-contested-no-semicolons). |
 | String delimiter | `"double quotes"` only | One string syntax. No single quotes, no backticks, no raw strings. Zero style debates. |
 | String interpolation | `"Hello, {name}!"` | Universal — every string supports `{expr}`. No `f"..."` prefix needed. Literal brace via `\{`. See [2.4](#24-contested-universal-interpolation). |
-| Bindings | `let` / `let mut` | Immutable by default. `let mut` is a deliberate speed bump that says "this will change." `:=` was rejected 5-0 — it's ambiguous about mutability. |
+| Bindings | `let` / `let mut` | Immutable by default. `let mut` is a deliberate speed bump that says "this will change." `:=` was rejected 5-0 — it's ambiguous about mutability. Parameters follow the same rule: `mut name: T` (§3.6 *Mutable Parameters*). |
 | Pattern matching | `match val { P => e }` | Expression-based. `=>` for arms (not `->`, which means return type). |
 | Match arm separator | Newline | No commas between arms. Consistent with the newline-terminated philosophy. |
 | Generic syntax | `List[Str]` | Square brackets. Zero parsing ambiguity with comparison operators. See [2.6](#26-contested-square-bracket-generics). |
