@@ -12713,8 +12713,13 @@ fn tc_fence_test_only_symbol(name: Str, code: Str, short_name: Str, node: Int) !
 // Whether a call node is the std.testing skip intrinsic. Sole source of truth for this
 // question; cg_call and cg_stmt call this directly rather than keeping their own copy.
 // The intrinsic needs no import, so an unresolved callee still counts; a resolved callee
-// counts only when it names lib/std/testing.bl's skip.
+// counts only when it names lib/std/testing.bl's skip. A module-qualified call counts
+// only by its resolved declaration, since any module may export a fn of that spelling.
 pub fn tc_call_is_skip_intrinsic(node: Int) -> Bool {
+    if nk_of(node_kind(node)) == NodeKind.MethodCall {
+        let decl = tc_call_decl_node(node)
+        return decl >= 0 && node_source_module(decl) == "std_testing" && node_name(decl) == "skip"
+    }
     let callee = node_left(node)
     if callee < 0 || nk_of(node_kind(callee)) != NodeKind.Ident { return false }
     let name = tc_alias_to_original.get(node_name(callee)) ?? node_name(callee)
@@ -12722,6 +12727,23 @@ pub fn tc_call_is_skip_intrinsic(node: Int) -> Bool {
     let decl = tc_call_decl_node(node)
     if decl < 0 { return true }
     node_source_module(decl) == "std_testing" && node_name(decl) == "skip"
+}
+
+// The bare and the module-qualified spelling share this, so neither can drift from the
+// other on the fence or the argument checks.
+fn tc_check_skip_call(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    tc_fence_test_only_symbol("skip", SKIP_OUTSIDE_TEST, "SkipOutsideTest", node)
+    let args_sl = node_args(node)
+    let arg_count = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
+    if arg_count != 1 {
+        tc_error_at("skip() expects 1 argument (reason: Str), got {arg_count}", node)
+    } else {
+        let arg_t = infer_type(sublist_get(args_sl, 0))
+        if tc_tid_is_no_info(arg_t) == 0 && arg_t != TYPE_STR {
+            tc_error_at("skip() reason must be Str, got {type_to_str(arg_t)}", node)
+        }
+    }
+    TYPE_VOID
 }
 
 // pub so codegen resolves a CALL callee in the same order this file does: builtin
@@ -17090,20 +17112,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     }
                 }
                 let skip_is_intrinsic = fn_name != "skip" || tc_call_is_skip_intrinsic(node)
-                if fn_name == "skip" && skip_is_intrinsic {
-                    tc_fence_test_only_symbol("skip", SKIP_OUTSIDE_TEST, "SkipOutsideTest", node)
-                    let args_sl = node_args(node)
-                    let arg_count = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
-                    if arg_count != 1 {
-                        tc_error_at("skip() expects 1 argument (reason: Str), got {arg_count}", node)
-                    } else {
-                        let arg_t = infer_type(sublist_get(args_sl, 0))
-                        if tc_tid_is_no_info(arg_t) == 0 && arg_t != TYPE_STR {
-                            tc_error_at("skip() reason must be Str, got {type_to_str(arg_t)}", node)
-                        }
-                    }
-                    return TYPE_VOID
-                }
+                if fn_name == "skip" && skip_is_intrinsic { return tc_check_skip_call(node) }
                 // A resolved fn declaration always wins over a builtin's spelling: see
                 // tc_call_decl_is_fn. Skipping the builtin branch here lets this call fall
                 // through to lookup_fnsig below, which types it against the user's own
@@ -18693,6 +18702,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 }
             }
             if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) == 0 {
+                if tc_call_is_skip_intrinsic(node) { return tc_check_skip_call(node) }
                 let sig = lookup_fnsig(method)
                 if sig != -1 {
                     let mq_gen_args = node_args(node)

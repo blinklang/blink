@@ -1,0 +1,116 @@
+// `testing.skip(reason)` names the same declaration as a bare `skip(reason)`
+// imported from std.testing, so it is the same test intrinsic: the test stops,
+// reports skipped with its reason, and the call is fenced to test bodies. A
+// user module's own `skip` is a different declaration and stays an ordinary call.
+
+import compile_test_helpers.{compile_and_capture, compile_and_run_test_json, expect_compile_error, expect_contains, run_xmod}
+
+test "a qualified skip stops the test and reports skipped with its reason" {
+    let r = compile_and_run_test_json(#"import std.testing
+test "x" {
+    testing.skip("not ready yet")
+    assert_eq(1, 2)
+}
+"#, "qskip_stmt")
+    assert(r.out.contains("\"status\":\"skipped\""), "got {r.out}{r.err_out}")
+    assert(r.out.contains("\"reason\":\"not ready yet\""), "got {r.out}{r.err_out}")
+    assert(!r.out.contains("\"status\":\"failed\""), "got {r.out}{r.err_out}")
+}
+
+test "a qualified skip inside a for_each case halts the loop" {
+    let r = compile_and_run_test_json(#"import std.testing
+test "x" {
+    testing.for_each([("a", 1), ("b", 2), ("c", 3)], fn(v: Int) {
+        if v == 2 { testing.skip("skip b") }
+        assert(v < 2)
+    })
+}
+"#, "qskip_for_each")
+    assert(r.out.contains("\"status\":\"skipped\""), "got {r.out}{r.err_out}")
+    assert(r.out.contains("\"reason\":\"skip b\""), "got {r.out}{r.err_out}")
+    assert(!r.out.contains("\"status\":\"failed\""), "got {r.out}{r.err_out}")
+}
+
+test "a qualified skip as a match arm value skips like the bare form" {
+    let bare = compile_and_run_test_json(#"import std.testing.{skip}
+test "x" {
+    let n = 2
+    let y = match n {
+        1 => 5
+        _ => skip("r")
+    }
+    assert_eq(y, 2)
+}
+"#, "qskip_arm_bare")
+    let qual = compile_and_run_test_json(#"import std.testing
+test "x" {
+    let n = 2
+    let y = match n {
+        1 => 5
+        _ => testing.skip("r")
+    }
+    assert_eq(y, 2)
+}
+"#, "qskip_arm_qual")
+    assert(bare.out.contains("\"status\":\"skipped\""), "bare got {bare.out}{bare.err_out}")
+    assert(qual.out.contains("\"status\":\"skipped\""), "qualified got {qual.out}{qual.err_out}")
+    assert(!qual.out.contains("\"status\":\"failed\""), "qualified got {qual.out}{qual.err_out}")
+}
+
+// Parity, not a fixed outcome: whatever the bare form does as a let initializer,
+// the qualified form must do the same.
+test "a qualified skip as a let initializer does what the bare form does" {
+    let bare = compile_and_run_test_json(#"import std.testing.{skip}
+test "x" {
+    let _x = skip("r")
+    assert_eq(1, 2)
+}
+"#, "qskip_let_bare")
+    let qual = compile_and_run_test_json(#"import std.testing
+test "x" {
+    let _x = testing.skip("r")
+    assert_eq(1, 2)
+}
+"#, "qskip_let_qual")
+    let bare_all = bare.out.concat(bare.err_out)
+    let qual_all = qual.out.concat(qual.err_out)
+    assert_eq(bare_all.contains("E0827"), qual_all.contains("E0827"))
+    assert_eq(bare_all.contains("\"status\":\"skipped\""), qual_all.contains("\"status\":\"skipped\""))
+    assert_eq(bare_all.contains("\"status\":\"failed\""), qual_all.contains("\"status\":\"failed\""))
+    assert_eq(bare.exit_code == 0, qual.exit_code == 0)
+}
+
+test "a qualified skip outside a test fences with E0827" {
+    expect_compile_error(#"import std.testing
+fn main() {
+    testing.skip("nope")
+}
+"#, "qskip_outside", "E0827")
+}
+
+test "a qualified skip with no reason is an arity error" {
+    let out = compile_and_capture(#"import std.testing
+test "x" {
+    testing.skip()
+}
+"#, "qskip_arity")
+    expect_contains(out, "skip() expects 1 argument (reason: Str), got 0", "qualified skip arity")
+}
+
+test "a qualified skip with a non-Str reason is a type error" {
+    let out = compile_and_capture(#"import std.testing
+test "x" {
+    testing.skip(5)
+}
+"#, "qskip_reason_type")
+    expect_contains(out, "skip() reason must be Str, got Int", "qualified skip reason type")
+}
+
+test "a user module's own skip called qualified is an ordinary call" {
+    let helper = "pub fn skip(reason: Str) \{\n    io.println(\"user skip \{reason\}\")\n\}\n"
+    let entry = "import qsk.util\npub fn main() \{\n    util.skip(\"x\")\n    io.println(\"after\")\n\}\n"
+    let r = run_xmod(entry, "qsk", "util", helper, "qskip_user_module")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("user skip x"), "got {r.out}{r.err_out}")
+    assert(r.out.contains("after"), "got {r.out}{r.err_out}")
+}
