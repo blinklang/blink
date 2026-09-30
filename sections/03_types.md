@@ -2927,22 +2927,56 @@ the character as text rather than its integer code point — keeps `Debug` consi
 being a numeric type (§3c). A `Char` is **never** rendered as its bare code point: `'a'.debug()` is
 `'a'`, not `97`.
 
-`Char.debug()` escapes exactly the ratified `Char` literal escape set (§2, char literals): `\n`,
-`\r`, `\t`, `\\`, `\b`, `\f`, `\0`, and `\'`. Every other scalar — all printable ASCII and every
-non-ASCII Unicode scalar — is emitted as its literal UTF-8 character between the quotes. This gives
-the invariant that **`Char.debug()` emits only escapes the lexer already accepts**: for any `Char`
-`c` in the ratified literal set, `c.debug()` is a valid `Char` literal that reconstructs `c`
-(round-trip). The one v1 gap is a non-printable scalar that has no named escape (e.g. `U+0007` BEL):
-it is emitted as its raw byte(s) between the quotes, which is faithful but not always legible and not
-re-readable. A `'\u{N}'` output form for those is deferred to the task that adds `\u{...}` as input
-syntax (tracked separately), so input and output escaping land together.
+`Char.debug()` and `Str.debug()` use one escape rule. For each scalar, in order:
+
+1. **Named escape.** If the literal's escape table (§2.4) has a named escape for the scalar, emit
+   it. Both types use `\n`, `\r`, `\t`, `\\`, `\b` and `\f`. `Char` also uses `\0` and `\'`.
+   `Str` also uses `\"`, `\{` and `\}`.
+2. **`\u{h}`.** Else, if the scalar is in the escape class below, emit `\u{h}`, with lowercase hex
+   and no leading zeros: `'\u{7}'`, `"\u{1b}"`, `'\u{202e}'`.
+3. **Raw.** Else emit the scalar as its UTF-8 character. This covers all other printable ASCII
+   and every other non-ASCII scalar.
+
+The escape class is this closed list:
+
+| Range | Scalars |
+|---|---|
+| U+0000–U+001F | C0 controls (Unicode category Cc) |
+| U+007F | DEL (Cc) |
+| U+0080–U+009F | C1 controls (Cc) |
+| U+200B–U+200F | zero-width space, zero-width non-joiner and joiner, left-to-right and right-to-left marks |
+| U+2028–U+2029 | line separator, paragraph separator |
+| U+202A–U+202E | bidi embeddings and overrides |
+| U+2060–U+2064 | word joiner, invisible operators |
+| U+2066–U+2069 | bidi isolates |
+| U+FEFF | zero-width no-break space (byte order mark) |
+
+These scalars are controls, or they hide or reorder the text around them on a terminal. A raw
+U+202E can reorder a CI log line (Trojan Source, CVE-2021-42574). A raw U+200B makes two strings
+that differ look equal in an `assert_eq` diff. **The list is frozen.** It does not follow Unicode
+updates, and only a new spec decision can change it: each change alters `debug()` output, and so
+golden files, for programs whose source did not change.
+
+The rule gives the invariant that **debug output uses only escapes the lexer accepts**. For every
+`Char` `c`, `c.debug()` is a valid char literal that reconstructs `c`. For every `Str` `s`,
+`s.debug()` is a valid string literal that reconstructs `s` (round-trip). A `Str` cannot hold NUL,
+so `Str.debug()` never needs `\u{0}`.
 
 | `Char` value | `debug()` | | `Char` value | `debug()` |
 |---|---|---|---|---|
 | `'a'` | `'a'` | | `'\n'` | `'\n'` |
 | `'1'` | `'1'` (≠ `Int` `1` → `1`) | | `'\''` | `'\''` |
 | `' '` | `' '` | | `'\\'` | `'\\'` |
-| `'😀'` | `'😀'` (raw UTF-8) | | `'\0'` | `'\0'` |
+| `'😀'` | `'😀'` (raw UTF-8) | | `'\0'`, `'\u{0}'` | `'\0'` |
+| `'\u{7}'` (BEL) | `'\u{7}'` | | `'\u{8}'` | `'\b'` |
+| `'\u{202E}'` | `'\u{202e}'` | | `'\u{41}'` | `'A'` |
+
+| `Str` value | `debug()` |
+|---|---|
+| `"tab\there"` | `"tab\there"` |
+| `"\u{1b}[31m"` | `"\u{1b}[31m"` |
+| `"a\u{200B}b"` | `"a\u{200b}b"` |
+| `"é\u{1F600}"` | `"é😀"` |
 
 The `Char` debug-form flows unchanged into every container position — a `Char` struct field, a
 `List[Char]` element, an `Option[Char]` inner value, and a `Map[Char, V]` key all render via the same

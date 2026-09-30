@@ -95,11 +95,14 @@ Holes evaluate left to right, and each hole's value is appended before the next 
 | `\r` | carriage return |
 | `\t` | tab |
 | `\\` | literal `\` |
+| `\b` | backspace (U+0008) |
+| `\f` | form feed (U+000C) |
+| `\u{H}` | the Unicode scalar value with hex code `H` (see *Unicode escapes* below) |
 | `\"` | literal `"` |
 | `\{` | literal `{` (suppresses interpolation) |
 | `\}` | literal `}` |
 
-**Char literal escape sequences.** Char literals (`'x'`) accept a subset of string escapes (no interpolation-related `\{`/`\}`, no `\"`, adds `\'`):
+**Char literal escape sequences.** Char literals (`'x'`) share the common escapes with strings (`\n \r \t \\ \b \f \u{H}`). They do not accept `\{`, `\}` or `\"`, and they add `\0` and `\'`:
 
 | Escape | Produces |
 |--------|----------|
@@ -110,9 +113,41 @@ Holes evaluate left to right, and each hole's value is appended before the next 
 | `\b` | backspace |
 | `\f` | form feed |
 | `\0` | NUL byte |
+| `\u{H}` | the Unicode scalar value with hex code `H` (see *Unicode escapes* below) |
 | `\'` | literal `'` |
 
-A char literal must contain exactly one Unicode scalar value; `''` (empty) and `'ab'` (multi-char) are lexer errors. Surrogate codepoints (0xD800–0xDFFF) are rejected. Unicode/hex escapes (`\u{...}`) are deferred; use `Char.from_code_point(n)` until then.
+A char literal must contain exactly one Unicode scalar value, written as one raw UTF-8 character (`'é'`, `'😀'`) or as one escape. `''` (empty) and `'ab'` (multi-char) are lexer errors. Surrogate code points (0xD800–0xDFFF) are rejected.
+
+**Unicode escapes (`\u{H}`).** Both `"..."` and `'...'` accept `\u{H}`, which produces the Unicode scalar value with hex code `H`:
+
+```blink
+let esc = '\u{1b}'
+let red = "\u{1b}[31m"            // ESC [ 3 1 m — no interpolation hole
+let smile = "\u{1F600}"           // same Str as "😀"
+let zwsp = "a\u{200b}b"           // three scalars
+```
+
+- `H` is 1 to 6 hex digits, upper or lower case. Leading zeros are allowed: `\u{41}`, `\u{041}` and `\u{0041}` are the same escape.
+- The value must be a Unicode scalar value: 0x0–0xD7FF or 0xE000–0x10FFFF. These are the same bounds as `Char.from_code_point(n)` (§3c.3).
+- The `{` after `\u` is part of the escape. It never starts an interpolation hole.
+- A `Str` cannot hold NUL, so `"\u{0}"` is an error. In a char literal, `'\u{0}'` is the same `Char` as `'\0'`.
+- `#"..."#` strings do no escape processing: in `#"\u{41}"#`, `\u{41}` is six characters.
+- `\u{H}` is the only numeric escape. `\x..`, `\uXXXX` (no braces) and `\UXXXXXXXX` are errors in both literal kinds.
+- `blink fmt` keeps the author's spelling of `H`. Debug output always uses one spelling: lowercase hex, no leading zeros (§3.6, *Scalar debug-forms*).
+
+Each malformed escape is a lexer error in both literal kinds. Each error kind has its own registered code in the syntax diagnostic family (next to E1113). Its span covers the escape itself, not the start of the literal, and its help line shows the fix:
+
+| Source | Error | Help |
+|--------|-------|------|
+| `\u{}` | empty Unicode escape | write 1 to 6 hex digits: `\u{41}` |
+| `\u{1234567}` | more than 6 hex digits | write at most 6 hex digits |
+| `\u{12g}` | `g` is not a hex digit | use only `0-9`, `a-f`, `A-F` |
+| `\u{41` | unterminated Unicode escape | close the escape with `}`: `\u{41}` |
+| `\u{d800}` | surrogate code point is not a Unicode scalar value | surrogates 0xD800–0xDFFF cannot appear in a `Char` or `Str` |
+| `\u{110000}` | value is above 0x10FFFF | the largest Unicode scalar value is `\u{10ffff}` |
+| `\u0041`, `\U0001F600` | Unicode escape needs braces | write `\u{41}`, `\u{1f600}` |
+| `\x1b` | Blink has no `\x` escape | write `\u{1b}` |
+| `"\u{0}"` | a `Str` cannot hold NUL | use `Bytes` for data that contains NUL |
 
 **Context-sensitive interpolation.** When an interpolated string literal appears where `Template[C]` is expected (e.g., `db.query_one("SELECT * FROM users WHERE id = {id}")`), the compiler extracts `{expr}` as bound parameters instead of concatenating. The *receiving type* determines behavior: `{id}` in a `Str` context is concatenation, `{id}` in a `Template[DB]` context is parameterization. No new string syntax is needed — the same `"..."` literal does the right thing based on where it appears. See section 3.12 for details.
 
