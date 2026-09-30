@@ -2,14 +2,15 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
-## What's New (v0.53.1)
+## Changes (unreleased)
 
+- **`test.failing` takes only a name and `reason:`.** The `ticket:` argument is gone: writing it is now an `UnexpectedToken` error ("test.failing(...) takes only a name and `reason:`"). To point at tracked work, write the reference in the reason. The test report's `xfail_reason` is the reason as written, with no `br:<ticket> — ` prefix.
 - **A method that resolves to nothing on a known receiver type is now an error, not a warning.** `xs.iter()` on a `List[Int]`, `"hi".charAt(0)`, or `b.bogus()` on a `Bytes` used to emit `warning[UnknownMethod]: unknown method '...' -- may fail at compile time` and then fail later in the C compiler or at a codegen backstop. Any receiver whose type the front end knows -- the builtin scalars and containers, plus structs and enums, which already errored -- now reports **E0505 UnresolvedMethod** naming both the receiver type and the method, with a "did you mean" suggestion where one is close. The call's type is poisoned, so a declared type over the call does not draw a second, derived error. **W0501 UnknownMethod** survives for the one case that has no type to name: a receiver whose type is still a bare type parameter or an unresolved metavariable at the call.
 - **The `Bytes.set_*_le/be(offset, value)` family type-checks.** All twelve (`set_u16_be` through `set_i64_le`) are pinned by the spec and have been emitted by codegen since the family landed, but the front end did not know the names, so it reported them as unknown methods. They now check their two `Int` arguments and are typed `Result[(), Str]`.
+- **`--test-json` per-test status is now `"passed"`, not `"pass"`.** The per-test record's `status` value disagreed with both the summary object's `passed` count key and §8.10's documented wire format. Any external consumer matching the literal string `"pass"` needs updating to `"passed"`; the in-repo test suite has been updated to match.
 
 ## Fixes (v0.53.1)
 
-- **`--test-json` per-test status is now `"passed"`, not `"pass"`.** The per-test record's `status` value disagreed with both the summary object's `passed` count key and §8.10's documented wire format. Any external consumer matching the literal string `"pass"` needs updating to `"passed"`; the in-repo test suite has been updated to match.
 - **`blink test` no longer loses per-test output when a test file crashes at the C level.** The runner captures each compiled test binary's stdout through a pipe, which made glibc fully block-buffer it; a hardware-signal crash (stack overflow, out-of-bounds, null deref) skipped the atexit flush and discarded every buffered `test NAME ... ok/FAIL` line, so a run that had partly succeeded read as a total wipeout. Test stdout is now line-buffered, so each completed per-test line survives the crash — you see which tests ran before the file went down (the case summary still won't print on a mid-run crash, because the run didn't finish).
 
 ## What's New (v0.53.0)
