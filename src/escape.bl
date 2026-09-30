@@ -927,7 +927,8 @@ fn emit_ffi_scope_escape(node: Int, tag: Int) ! Diag.Report {
 // a field is data, not the binding, and may go.
 
 // Collects the with-as binders `node` reaches: the binding, a `let` alias of it,
-// or one a closure reads. `seen` stops a `let` whose value reads itself.
+// one a closure reads, or one a variant, tuple or struct holds. `seen` stops a
+// `let` whose value reads itself.
 fn with_binders_reached(node: Int, acc: List[Int], seen: List[Int]) {
     if node == -1 { return }
     let k = node_kind(node)
@@ -968,7 +969,156 @@ fn with_binders_reached(node: Int, acc: List[Int], seen: List[Int]) {
     }
     if k == NodeKind.ExprStmt {
         with_binders_reached(node_value(node), acc, seen)
+        return
     }
+    if k == NodeKind.TupleLit {
+        let elems_sl = node_elements(node)
+        let mut i = 0
+        while elems_sl != -1 && i < sublist_length(elems_sl) {
+            with_binders_reached(sublist_get(elems_sl, i), acc, seen)
+            i = i + 1
+        }
+        return
+    }
+    if k == NodeKind.StructLit {
+        let fields_sl = node_fields(node)
+        let mut i = 0
+        while fields_sl != -1 && i < sublist_length(fields_sl) {
+            with_binders_reached(node_value(sublist_get(fields_sl, i)), acc, seen)
+            i = i + 1
+        }
+        return
+    }
+    if call_builds_variant(node) {
+        let args_sl = node_args(node)
+        let mut i = 0
+        while args_sl != -1 && i < sublist_length(args_sl) {
+            with_binders_reached(sublist_get(args_sl, i), acc, seen)
+            i = i + 1
+        }
+    }
+}
+
+// The with-as binders `node` reaches, less any `ffi.scope()` handle: FfiScope
+// has its own diagnostic for every way a handle can leave its block.
+fn closeable_binders_reached(node: Int) -> List[Int] {
+    let mut reached: List[Int] = []
+    let mut seen: List[Int] = []
+    with_binders_reached(node, reached, seen)
+    let mut out: List[Int] = []
+    for binder in reached {
+        if ffi_scope_resource_name(binder) == "" { out.push(binder) }
+    }
+    out
+}
+
+fn node_encloses(outer: Int, inner: Int) -> Bool {
+    if outer == inner { return true }
+    for kid in node_value_child_ids(outer) {
+        if node_encloses(kid, inner) { return true }
+    }
+    false
+}
+
+// A `return` leaves every with block opened in its own body. A with block around
+// the closure the return is written in stays open: the closure returns to a
+// caller inside that block.
+fn check_with_binder_return(val: Int) ! Diag.Report {
+    if val == -1 { return }
+    let n = ea_closure_stack.len()
+    let body = if n > 0 { ea_closure_stack.get(n - 1).unwrap() } else { -1 }
+    for binder in closeable_binders_reached(val) {
+        if body == -1 || node_encloses(body, binder) {
+            emit_with_binder_leaves(val, binder, "returned out of")
+        }
+    }
+}
+
+// The with blocks whose value `node` hands on: `node` itself, or one at the tail
+// of an if, match or block that is `node`. A with block's value leaves the
+// block, so it may not reach the block's own binders. A with block whose value
+// is thrown away hands nothing on.
+fn check_flowing_with_tails(node: Int) ! Diag.Report {
+    if node == -1 { return }
+    let k = node_kind(node)
+    if k == NodeKind.WithBlock {
+        check_with_binder_tail(node)
+        check_flowing_with_tails(block_tail_node(node_body(node)))
+        return
+    }
+    if k == NodeKind.IfExpr {
+        check_flowing_with_tails(node_then_body(node))
+        check_flowing_with_tails(node_else_body(node))
+        return
+    }
+    if k == NodeKind.MatchExpr {
+        let arms_sl = node_arms(node)
+        let mut i = 0
+        while arms_sl != -1 && i < sublist_length(arms_sl) {
+            check_flowing_with_tails(node_body(sublist_get(arms_sl, i)))
+            i = i + 1
+        }
+        return
+    }
+    if k == NodeKind.Block {
+        check_flowing_with_tails(block_tail_node(node))
+        return
+    }
+    if k == NodeKind.ExprStmt {
+        check_flowing_with_tails(node_value(node))
+    }
+}
+
+// A body's tail is its result unless the body returns nothing.
+fn check_body_tail_flows(body: Int, ret_tid: Int) ! Diag.Report {
+    if ret_tid >= 0 && tc_tid_kind(tc_resolve(ret_tid)) == TyKind.Void { return }
+    check_flowing_with_tails(body)
+}
+
+fn check_with_binder_tail(with_node: Int) ! Diag.Report {
+    let tail = block_tail_node(node_body(with_node))
+    if tail == -1 { return }
+    let items_sl = node_handlers(with_node)
+    if items_sl == -1 { return }
+    for binder in closeable_binders_reached(tail) {
+        let mut i = 0
+        while i < sublist_length(items_sl) {
+            if sublist_get(items_sl, i) == binder {
+                emit_with_binder_leaves(tail, binder, "the value of")
+            }
+            i = i + 1
+        }
+    }
+}
+
+// An assignment to a variable declared before the with-as item outlives the
+// block. A variable in scope at the assignment was declared either before the
+// block or inside it, and the parser numbers nodes in source order, so the two
+// declarations' ids decide. A target with no local binder is module-level and
+// outlives every block.
+fn check_with_binder_assignment(node: Int) ! Diag.Report {
+    let target = node_target(node)
+    if target == -1 || node_kind(target) != NodeKind.Ident { return }
+    let cell = tc_ident_binder_node(target)
+    for binder in closeable_binders_reached(node_value(node)) {
+        if cell < 0 || cell < binder {
+            emit_with_binder_leaves(node_value(node), binder, "assigned out of")
+        }
+    }
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn emit_with_binder_leaves(node: Int, binder: Int, how: Str) ! Diag.Report {
+    let saved = diag_source_file
+    diag_source_file = diag_file_for_node(node)
+    let name = node_name(binder)
+    diag_error_at(
+        "CloseableEscapesScope", CLOSEABLE_ESCAPES_SCOPE,
+        "`{name}` is scoped to its `with ... as` block and cannot be {how} it",
+        node,
+        "copy the data you need out of `{name}` inside the block"
+    )
+    diag_source_file = saved
 }
 
 // `async.spawn(...)` with `async` not rebound by a local.
@@ -986,10 +1136,7 @@ fn check_spawn_scoped_capture(node: Int) ! Diag.Report {
     let mut i = 0
     while i < sublist_length(args_sl) {
         let arg = sublist_get(args_sl, i)
-        let mut binders: List[Int] = []
-        let mut seen: List[Int] = []
-        with_binders_reached(arg, binders, seen)
-        for binder in binders { emit_spawn_scoped_capture(arg, binder) }
+        for binder in closeable_binders_reached(arg) { emit_spawn_scoped_capture(arg, binder) }
         i = i + 1
     }
 }
@@ -1181,6 +1328,8 @@ fn walk_assignment(node: Int) ! Diag.Report {
             walk_expr(node_obj(target), 0)
         }
     }
+    check_with_binder_assignment(node)
+    check_flowing_with_tails(node_value(node))
 }
 
 fn walk_method_call(node: Int) ! Diag.Report {
@@ -1484,6 +1633,7 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
         push_param_names(node, params)
         ea_bind_all(params)
         walk_expr(node_body(node), 0)
+        check_body_tail_flows(node_body(node), if fn_tid < 0 { -1 } else { tc_tid_child(tc_resolve(fn_tid), 0) })
         ea_pop_binds()
         let _ = ea_closure_stack.pop()
         ea_pop_body()
@@ -1537,6 +1687,7 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
     if kind == NodeKind.LetBinding {
         let val = node_value(node)
         walk_expr(val, 0)
+        check_flowing_with_tails(val)
         if ea_in_arena() != 0 {
             if rhs_is_arena_value(val) != 0 {
                 let name = node_name(node)
@@ -1565,6 +1716,8 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
         walk_expr(rv, 1)
         ea_tail_floor = saved_floor
         check_ffi_ptr_return_escape(rv)
+        check_with_binder_return(rv)
+        check_flowing_with_tails(rv)
         return
     }
     if kind == NodeKind.ForIn {
@@ -1868,6 +2021,8 @@ fn analyze_fn(fn_node: Int) ! Diag.Report {
     let body = node_body(fn_node)
     if body != -1 {
         walk_expr(body, 0)
+        // A function with no declared return type returns nothing.
+        if ann != -1 { check_body_tail_flows(body, tc_lookup_node_tid(ann)) }
     }
     ea_pop_body()
     check_redundant_arena_effect(fn_node, arena_eff_node)
