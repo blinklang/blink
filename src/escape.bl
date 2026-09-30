@@ -211,6 +211,16 @@ fn ea_bind_pattern(pat: Int) {
     ea_bind_all(names)
 }
 
+// The live binder whose value is `value`, or -1 once its scope has closed.
+fn ea_bind_index_of(value: Int) -> Int {
+    let mut i = ea_bind_values.len() - 1
+    while i >= 0 {
+        if ea_bind_values.get(i).unwrap() == value { return i }
+        i = i - 1
+    }
+    -1
+}
+
 // The innermost binder of `name`, or -1 for a global, a function or a module.
 fn ea_lookup_bind(name: Str) -> Int {
     let mut i = ea_bind_names.len() - 1
@@ -1091,17 +1101,18 @@ fn check_with_binder_tail(with_node: Int) ! Diag.Report {
     }
 }
 
-// An assignment to a variable declared before the with-as item outlives the
-// block. A variable in scope at the assignment was declared either before the
-// block or inside it, and the parser numbers nodes in source order, so the two
-// declarations' ids decide. A target with no local binder is module-level and
-// outlives every block.
+// An assignment to a variable bound before the with-as item outlives the block.
+// Binders stack in scope order, so one below the item's was declared outside the
+// block and one above it inside. A target with no local binder is module-level
+// and outlives every block. An item whose scope has closed is reached only
+// through a block value, which the tail check reports.
 fn check_with_binder_assignment(node: Int) ! Diag.Report {
     let target = node_target(node)
     if target == -1 || node_kind(target) != NodeKind.Ident { return }
-    let cell = tc_ident_binder_node(target)
+    let cell = ea_lookup_bind(node_name(target))
     for binder in closeable_binders_reached(node_value(node)) {
-        if cell < 0 || cell < binder {
+        let item = ea_bind_index_of(binder)
+        if item >= 0 && cell < item {
             emit_with_binder_leaves(node_value(node), binder, "assigned out of")
         }
     }
@@ -1515,9 +1526,19 @@ fn walk_with_block(node: Int, outer_tail: Int) ! Diag.Report {
         ea_push_frame()
         ea_assigned.push([])
         ea_push_closeable_scope()
+        ea_push_binds()
+        if handlers_sl != -1 {
+            let mut ai = 0
+            while ai < sublist_length(handlers_sl) {
+                let aitem = sublist_get(handlers_sl, ai)
+                if node_kind(aitem) == NodeKind.WithResource { ea_bind(node_name(aitem), aitem) }
+                ai = ai + 1
+            }
+        }
         let saved_floor = ea_tail_floor
         ea_tail_floor = ea_frames.len()
         walk_expr(body, 1)
+        ea_pop_binds()
         ea_tail_floor = saved_floor
         flush_capture_escapes()
         ea_pop_closeable_scope()
@@ -1562,7 +1583,7 @@ fn walk_with_block(node: Int, outer_tail: Int) ! Diag.Report {
             let mut hi3 = 0
             while hi3 < sublist_length(handlers_sl) {
                 let item3 = sublist_get(handlers_sl, hi3)
-                if node_kind(item3) == NodeKind.WithResource { ea_bind(node_name(item3), -1) }
+                if node_kind(item3) == NodeKind.WithResource { ea_bind(node_name(item3), item3) }
                 hi3 = hi3 + 1
             }
         }
