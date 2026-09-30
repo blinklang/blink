@@ -25,7 +25,7 @@ src/layout.bl (C shape of a tid), src/cname.bl (C symbol names), src/ir.bl (type
 IMPORTANT: the tid-native emitters land stage by stage. A stage that has not landed
 reports ICE I0004 CodegenStageNotBuilt, so some programs do not compile yet. The compiler
 itself does: gen0 is pinned to a self-hosting build of this codegen (tag
-gen0-rewrite-selfhost-1). `task ci` is the gate. `test`, `test-fmt` and `ci-release` run
+gen0-rewrite-selfhost-2). `task ci` is the gate. `test`, `test-fmt` and `ci-release` run
 but fail on the programs the new codegen cannot compile yet
 Entry points: src/compiler.bl (compiler), src/cli.bl (CLI tool), src/blinkc_main.bl (compiler binary)
 Stdlib: lib/std/. Tests: tests/. Spec: sections/. Decisions: decisions/
