@@ -207,8 +207,10 @@ Locked design points:
   consistent with "`Char` is not numeric" (§3c); honors the 5-0 no-silent-fallback ban.
 - **Invariant:** `Char.debug()` emits only escapes the lexer already accepts, so `parse(c.debug()) == c`
   for every `c` in the ratified literal set (round-trip).
-- **Deferred-and-linked:** a `'\u{N}'` output form for non-printable scalars with no named escape is
-  deferred to **task qvan6m (successor to the cancelled 19v5gb)** (which adds `\u{...}` as *input* syntax); input and output escaping land
-  together. Until then such a scalar is emitted as its raw byte(s) — faithful, not always legible.
+- **Deferred-and-linked (resolved):** a `'\u{N}'` output form for non-printable scalars with no named
+  escape was deferred until `\u{...}` existed as *input* syntax, so input and output escaping land
+  together. [Unicode Escapes and Debug Output](unicode-escapes.md) decides both: `\u{H}` input in
+  Char and Str literals, and `\u{h}` output for a closed escape class in `Char.debug()` and
+  `Str.debug()`.
 - All positions (struct field, `List[Char]`, `Option[Char]`, `Map[Char, V]` key, bare `.debug()`)
   route through **one shared `Char` debug helper**, so they agree by construction.
