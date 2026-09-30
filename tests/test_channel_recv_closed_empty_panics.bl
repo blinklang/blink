@@ -1,6 +1,7 @@
-// recv answers the element itself, not an Option, so a closed channel with nothing left
-// has no value to give. It panics rather than hand back a zero no reader could tell from
-// a real one.
+// recv answers an Option: Some for every value sent, in order, and None only once the channel
+// is closed and drained (sections/04_effects.md §4.13). The panics that remain are the ones
+// the spec names: a send on a closed channel, and an unwrap the author wrote, which says
+// where the recv was.
 
 import compile_test_helpers.{compile_and_run}
 
@@ -10,17 +11,79 @@ fn src_closed_recv() -> Str {
     ch.send(4)
     ch.close()
     let a = ch.recv()
-    io.println("got {a}")
-    let b = ch.recv()
-    io.println("then {b}")
+    io.println("got {a ?? -1}")
+    match ch.recv() {
+        Some(b) => io.println("then some {b}")
+        None => io.println("then none")
+    }
+    io.println("still running")
 }
 "#
 }
 
-test "recv on a closed, empty channel panics after the values it held" {
+test "recv on a closed, empty channel answers None after the values it held" {
     let r = compile_and_run(src_closed_recv(), "channel_recv_closed_empty")
     assert(r.out.contains("got 4"))
-    assert(!r.out.contains("then"))
+    assert(r.out.contains("then none"))
+    assert(r.out.contains("still running"))
+    assert(r.exit_code == 0)
+}
+
+fn src_send_after_close() -> Str {
+    #"fn main() {
+    let ch: Channel[Int] = channel.new[Int](buffer: 4)
+    ch.close()
+    io.println("closed")
+    ch.send(1)
+    io.println("sent")
+}
+"#
+}
+
+test "send on a closed channel panics at the send" {
+    let r = compile_and_run(src_send_after_close(), "channel_send_after_close")
+    assert(r.out.contains("closed"))
+    assert(!r.out.contains("sent"))
     assert(r.exit_code != 0)
-    assert(r.err_out.contains("recv on a closed, empty channel"))
+    assert(r.err_out.contains("send on a closed channel"))
+    assert(r.err_out.contains(".bl:5"))
+}
+
+fn src_unwrap_closed_recv() -> Str {
+    #"fn main() {
+    let ch: Channel[Int] = channel.new[Int](buffer: 1)
+    ch.close()
+    io.println("before")
+    let v = ch.recv().unwrap()
+    io.println("after {v}")
+}
+"#
+}
+
+test "unwrap of a recv on a closed, empty channel panics at the recv line" {
+    let r = compile_and_run(src_unwrap_closed_recv(), "channel_unwrap_closed_recv")
+    assert(r.out.contains("before"))
+    assert(!r.out.contains("after"))
+    assert(r.exit_code != 0)
+    assert(r.err_out.contains("unwrap called on None"))
+    assert(r.err_out.contains(".bl:5"))
+}
+
+fn src_close_twice() -> Str {
+    #"fn main() {
+    let ch: Channel[Int] = channel.new[Int](buffer: 2)
+    ch.send(3)
+    ch.close()
+    ch.close()
+    io.println("first {ch.recv() ?? -1}")
+    io.println("second {ch.recv() ?? -1}")
+}
+"#
+}
+
+test "a second close does nothing and the held value still arrives" {
+    let r = compile_and_run(src_close_twice(), "channel_close_twice")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("first 3"))
+    assert(r.out.contains("second -1"))
 }

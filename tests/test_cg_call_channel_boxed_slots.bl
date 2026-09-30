@@ -1,11 +1,12 @@
-// The runtime reads a NULL Channel slot as "closed and empty", so every slot holds a box,
-// even for an element that fits the word. Send stores through that shape, and recv and the
-// for-in drain read through it, so the three can never disagree about what a slot holds.
+// A Channel keeps each element inline in its ring, and the runtime answers "closed and
+// empty" through recv's return value, never through the element's bits, so no element needs
+// a box. Send and recv pass the element by address, and recv and the for-in drain share one
+// take, so the three can never disagree about what a slot holds.
 
 import lower_test_helpers.{probe, let_node_of, assert_kind, assert_eq_str, assert_shape, assert_verifies, ice_count}
 import parser.{node_kind, node_method, node_value, nodes}
 import ast.{NodeKind, nk_of}
-import ir.{IrKind, ir_c_name}
+import ir.{IrKind, ir_c_name, ir_kid}
 import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
 import cg_call.{cg_call_channel_take}
 import typecheck.{TYPE_INT}
@@ -32,31 +33,41 @@ fn src_chan() -> Str {
 "#
 }
 
-test "a send boxes a word-sized element so a zero never reaches the slot as NULL" {
+test "a send passes the element by address, with the closed-channel panic text" {
     probe("cg_call_chan_send_box", src_chan())
+    let mark = cg_expr_pending_count()
     let built = lower_expr(call_after("ch", "send"))
-    assert_eq_str("symbol", ir_c_name(built), "blink_channel_send")
-    assert_shape("shape", built, "CallRuntime(VarRef, Box(Const))")
+    let pending = cg_expr_take_pending(mark)
+    assert_eq_str("refusals", "{ice_count()}", "0")
+    assert_eq_str("symbol", ir_c_name(built), "blink_channel_send_value")
+    assert_eq_str("pending", "{pending.len()}", "1")
+    assert_shape("element", pending.get(0).unwrap(), "Let(Const)")
+    assert_shape("shape", built, "CallRuntime(VarRef, Unary(VarRef), Const)")
     assert_verifies("send", built)
 }
 
-test "recv takes the word, panics when it is NULL, then unboxes the element" {
+test "recv fills a local, tests the runtime's answer, then builds the Option" {
     probe("cg_call_chan_recv", src_chan())
     let mark = cg_expr_pending_count()
     let built = lower_expr(node_value(let_node_of("got")))
     let pending = cg_expr_take_pending(mark)
     assert_eq_str("refusals", "{ice_count()}", "0")
-    assert_eq_str("pending", "{pending.len()}", "2")
-    assert_shape("take", pending.get(0).unwrap(), "Let(CallRuntime(VarRef))")
-    assert_shape("guard", pending.get(1).unwrap(), "If(Binary(VarRef, Const), Block(Panic(Const)))")
-    assert_shape("element", built, "Unbox(Cast(VarRef))")
+    assert_eq_str("pending", "{pending.len()}", "3")
+    assert_shape("element", pending.get(0).unwrap(), "Let")
+    assert_shape("held", pending.get(1).unwrap(), "Let")
+    let choose = pending.get(2).unwrap()
+    assert_kind("choose", choose, IrKind.If)
+    assert_shape("test", ir_kid(choose, 0), "CallRuntime(VarRef, Unary(VarRef))")
+    assert_eq_str("symbol", ir_c_name(ir_kid(choose, 0)), "blink_channel_recv_value")
+    assert_kind("answer", built, IrKind.VarRef)
 }
 
-test "the channel take tests the word before it decodes it" {
+test "the channel take fills the element local before it tests the answer" {
     probe("cg_call_chan_take", src_chan())
     let ch = lower_expr(node_value(let_node_of("ch")))
     let t = cg_call_channel_take(let_node_of("got"), TYPE_INT, ch)
-    assert_kind("closed", t.closed, IrKind.Binary)
-    assert_shape("closed", t.closed, "Binary(VarRef, Const)")
-    assert_shape("element", t.element, "Unbox(Cast(VarRef))")
+    assert_shape("take", t.take, "Let")
+    assert_kind("closed", t.closed, IrKind.Unary)
+    assert_shape("closed", t.closed, "Unary(CallRuntime(VarRef, Unary(VarRef)))")
+    assert_shape("element", t.element, "VarRef")
 }

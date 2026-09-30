@@ -1,0 +1,173 @@
+// Closed is a state of the channel, never a value of its element (sections/04_effects.md
+// §4.13). Every value sent comes back as Some, in order, and None comes only once the channel
+// is closed and drained. Each row sends the element type's zero, empty or None value between
+// two others, so a runtime that read any bit pattern of the element as "closed" loses the rest
+// of the stream. One row per element layout: a word scalar, a Str, a struct, a heap List and
+// an Option carrier.
+
+import compile_test_helpers.{compile_and_run}
+
+fn check(tag: Str, src: Str, want: Str) {
+    let r = compile_and_run(src, tag)
+    if r.exit_code != 0 || !r.out.contains(want) {
+        io.println("FAIL {tag}: exit {r.exit_code}, want '{want}'")
+        io.println("out: {r.out}")
+        io.println("err: {r.err_out}")
+    }
+    assert(r.exit_code == 0)
+    assert(r.out.contains(want))
+}
+
+test "an Int channel delivers a sent 0 as Some and ends with None" {
+    check("chan_oob_int", #"fn main() {
+    let ch = channel.new[Int](buffer: 4)
+    ch.send(0)
+    ch.send(7)
+    ch.send(0)
+    ch.close()
+    let mut seen = ""
+    loop {
+        match ch.recv() {
+            Some(v) => { seen = "{seen}[{v}]" }
+            None => break
+        }
+    }
+    io.println("seen={seen} end")
+}
+"#, "seen=[0][7][0] end")
+}
+
+test "a Bool channel delivers a sent false as Some and ends with None" {
+    check("chan_oob_bool", #"fn main() {
+    let ch = channel.new[Bool](buffer: 4)
+    ch.send(false)
+    ch.send(true)
+    ch.send(false)
+    ch.close()
+    let mut seen = ""
+    loop {
+        match ch.recv() {
+            Some(v) => { seen = "{seen}[{v}]" }
+            None => break
+        }
+    }
+    io.println("seen={seen} end")
+}
+"#, "seen=[false][true][false] end")
+}
+
+test "a Str channel delivers a sent empty string as Some and ends with None" {
+    check("chan_oob_str", #"fn main() {
+    let ch = channel.new[Str](buffer: 4)
+    ch.send("")
+    ch.send("x")
+    ch.send("")
+    ch.close()
+    let mut seen = ""
+    loop {
+        match ch.recv() {
+            Some(v) => { seen = "{seen}[{v}]" }
+            None => break
+        }
+    }
+    io.println("seen={seen} end")
+}
+"#, "seen=[][x][] end")
+}
+
+test "a struct channel delivers an all-zero struct as Some and ends with None" {
+    check("chan_oob_struct", #"type Pt {
+    x: Int
+    label: Str
+}
+
+fn main() {
+    let ch = channel.new[Pt](buffer: 4)
+    ch.send(Pt { x: 0, label: "" })
+    ch.send(Pt { x: 5, label: "p" })
+    ch.send(Pt { x: 0, label: "" })
+    ch.close()
+    let mut seen = ""
+    loop {
+        match ch.recv() {
+            Some(p) => { seen = "{seen}[{p.x}:{p.label}]" }
+            None => break
+        }
+    }
+    io.println("seen={seen} end")
+}
+"#, "seen=[0:][5:p][0:] end")
+}
+
+test "a List channel delivers an empty list as Some and ends with None" {
+    check("chan_oob_list", #"fn main() {
+    let ch = channel.new[List[Int]](buffer: 4)
+    let empty: List[Int] = []
+    ch.send(empty)
+    ch.send([1, 2])
+    ch.send(empty)
+    ch.close()
+    let mut seen = ""
+    loop {
+        match ch.recv() {
+            Some(xs) => { seen = "{seen}[{xs.len()}]" }
+            None => break
+        }
+    }
+    io.println("seen={seen} end")
+}
+"#, "seen=[0][2][0] end")
+}
+
+test "an Option channel delivers a sent None as Some(None) and ends with None" {
+    check("chan_oob_option", #"fn main() {
+    let ch = channel.new[Option[Int]](buffer: 4)
+    ch.send(None)
+    ch.send(Some(0))
+    ch.send(None)
+    ch.close()
+    let mut seen = ""
+    loop {
+        match ch.recv() {
+            Some(Some(v)) => { seen = "{seen}[some {v}]" }
+            Some(None) => { seen = "{seen}[none]" }
+            None => break
+        }
+    }
+    io.println("seen={seen} end")
+}
+"#, "seen=[none][some 0][none] end")
+}
+
+// sections/03c_protocols.md:139 makes `for v in ch` exactly one recv() per turn, ending on
+// the first None. The loop written out by hand is that desugaring without the closure, so
+// the two must print the same sequence from the same sends.
+test "a for-in drain and a hand-written recv loop give the same sequence" {
+    check("chan_oob_for_vs_recv", #"fn fill(ch: Channel[Int]) {
+    ch.send(0)
+    ch.send(3)
+    ch.send(0)
+    ch.send(9)
+    ch.close()
+}
+
+fn main() {
+    let a = channel.new[Int](buffer: 8)
+    fill(a)
+    let mut by_for = ""
+    for v in a { by_for = "{by_for}[{v}]" }
+    let b = channel.new[Int](buffer: 8)
+    fill(b)
+    let mut by_recv = ""
+    loop {
+        match b.recv() {
+            Some(v) => { by_recv = "{by_recv}[{v}]" }
+            None => break
+        }
+    }
+    io.println("for={by_for}")
+    io.println("recv={by_recv}")
+    io.println("same={by_for == by_recv}")
+}
+"#, "for=[0][3][0][9]\nrecv=[0][3][0][9]\nsame=true")
+}
