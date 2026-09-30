@@ -46,15 +46,17 @@ Five panelists (systems, web/scripting, PLT, DevOps/tooling, AI/ML) voted indepe
 
 ### Key Design Points
 
-**Structural representation:**
+> **Amended by [Template Surface](template-surface.md).** The panel quotes above are unchanged. The points below state the current design: `Template[C]` is opaque, a handler reads it through `parts()` and `values()`, the values are the closed enum `TemplateValue`, and `C` comes from the expected parameter type.
+
+**Representation (opaque):** `Template[C]` has no fields and no constructor. Only the literal coercion and `Raw` folding build one. It is immutable, and each observer returns a fresh list:
 ```blink
-type Template[C] {
-    parts: List[Str]      // literal segments (parts.len() == values.len() + 1)
-    values: List[Any]     // interpolated values, typed
-}
+// t.parts()  -> List[Str]            literal segments
+// t.values() -> List[TemplateValue]  interpolated values
+// t.parts().len() == t.values().len() + 1
+enum TemplateValue { Int(Int), Float(Float), Bool(Bool), Str(Str), Null }
 ```
 
-**Compiler coercion:** When an interpolated string literal appears where `Template[C]` is expected, the compiler decomposes it into parts and values instead of concatenating. The phantom `C` is inferred from the surrounding effect context (e.g., `db.query()` expects `Template[DB]`).
+**Compiler coercion:** When an interpolated string literal appears where `Template[C]` is expected, the compiler decomposes it into parts and values instead of concatenating. The phantom `C` comes from the expected parameter type (e.g., `db.query()` expects `Template[DB]`), never from the effects of the enclosing signature.
 
 **Handler reassembly:** Each handler decides its own parameterization syntax:
 ```blink

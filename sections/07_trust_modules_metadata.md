@@ -1233,16 +1233,16 @@ For internal function calls (Blink calling Blink), the compiler still attempts s
 
 Blink's universal string interpolation creates an injection risk when interpolated strings flow to databases, shells, or HTML renderers. The `Template[C]` type solves this at the type boundary without taint tracking.
 
-**v1 mechanism:** Effect handle methods that execute interpreted strings accept `Template[C]` instead of `Str`. When an interpolated string literal appears where `Template[C]` is expected, the compiler constructs a parameterized query — `{expr}` becomes a bound parameter, not string concatenation.
+**v1 mechanism:** Effect handle methods that execute interpreted strings accept `Template[C]` instead of `Str`. When an interpolated string literal appears where `Template[C]` is expected, the compiler decomposes it into literal parts and typed values — `{expr}` becomes a value the handler binds as a parameter, not string concatenation (§3b.5).
 
 ```blink
 // Developer writes this — identical to a normal interpolated string:
 fn get_user(id: Int) -> User? ! DB.Read {
     db.query_one("SELECT * FROM users WHERE id = {id}")
-    // Compiler sees: Template.param("SELECT * FROM users WHERE id = $1", [id])
+    // The handler receives parts ["SELECT * FROM users WHERE id = ", ""] and values [TemplateValue.Int(id)]
 }
 
-// Str → Query is a compile error:
+// Str → Template is a compile error:
 let q: Str = "SELECT * FROM users WHERE id = {id}"
 db.query_one(q)  // ERROR: expected Template[DB], got Str
 ```
@@ -1980,7 +1980,7 @@ The table below is the **complete** set of compiler-known type names a program c
 | `Never` | prelude | §2.20 | shadows, W1010 |
 | `Bytes`, `StringBuilder` | prelude | §3.2.1, §3.2.3 | shadows, W1010 |
 | `Handle[T]`, `Channel[T]` | prelude | §4.13 | shadows, W1010 |
-| `Template[C]`, `Raw[T]` | prelude | §3b.5 | shadows, W1010 |
+| `Template[C]`, `Raw[T]`, `TemplateValue` | prelude | §3b.5 | shadows, W1010 |
 | `ConversionError` | `blink.core` | §3c.2 | shadows, W1010 |
 | `Range[T]` | `blink.core` | §2.10 | shadows, W1010 |
 | `Handler[E]` | `blink.core` | §4.7.1 | shadows, W1010 |
