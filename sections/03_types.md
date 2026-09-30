@@ -1213,6 +1213,63 @@ if s == State.Running { }   // OK — comparison, not assignment
 
 > Pattern matching an `Int` scrutinee against enum-variant patterns (`match someInt { State.Idle => ... }`) is the pattern-side dual of the assignability rule and is likewise ill-typed. Enforcement of that case is staged behind the compiler's internal `kind: Int → NodeKind` representation migration; the rule itself holds from this decision.
 
+#### Str-Backed Enums
+
+An enum can give each variant a string literal. The literal is the variant's backing value:
+
+```blink
+type Status {
+    Open = "open"
+    InProgress = "in_progress"
+    Done = "done"
+}
+
+let s = Status.InProgress
+let wire = s.to_str()                  // "in_progress"
+let back = Status.from_str("done")     // Some(Status.Done)
+let bad = Status.from_str("Done")      // None: the match is case-sensitive
+```
+
+**Declaration rules.** Each rule below is a compile error when a declaration breaks it:
+
+- Every variant has a backing literal, or no variant has one. An enum that mixes the two is an error.
+- A variant with a backing literal has no payload. `Custom(code: Int) = "custom"` is an error.
+- The backing value is a plain string literal: no interpolation and no `const` name. This is `error[InvalidStringBackedEnum]` (E1201).
+- No two variants have the same backing literal. The error should point at both variants.
+
+**Conversion methods.** The compiler gives every Str-backed enum two methods:
+
+| Method | Signature | Result |
+|--------|-----------|--------|
+| `to_str` | `fn to_str(self) -> Str` | The variant's backing literal. Total |
+| `from_str` | `fn from_str(s: Str) -> Option[Self]` | `Some(v)` for the variant whose literal equals `s`, else `None` |
+
+`from_str` compares bytes. The match is exact and case-sensitive, and it applies no Unicode normalization: `"café"` in NFC and `"café"` in NFD are different inputs, and at most one of them matches.
+
+**Laws.** For every Str-backed enum `T`, every `x: T` and every `s: Str`:
+
+1. `T.from_str(x.to_str()) == Some(x)`.
+2. `from_str` never returns a variant whose literal differs from its input:
+
+   ```blink
+   match T.from_str(s) {
+       Some(v) => v.to_str() == s   // always true
+       None => true
+   }
+   ```
+
+3. With `@derive(Deserialize)`, `T.from_json(JsonValue.Str(s))` is `Ok(v)` exactly when `T.from_str(s) == Some(v)` (§3.6.2).
+
+**`from_str` returns `Option` on purpose.** This is the same choice as `Enum.from_int(n) -> Option[Enum]` above: an arbitrary `Str` may not name a variant, and there is only one way to fail, so there is nothing for an error value to say. It is not a `Result` in the way of Rust's `FromStr`.
+
+**Display.** A Str-backed enum has no `Display` unless it declares one. With `@derive(Display)`, its output equals `to_str()`: `"{Status.InProgress}"` is `in_progress`, not `InProgress` (§3.6.1 *Sum Type Codegen*).
+
+**JSON.** With `@derive(Serialize)`, a Str-backed enum serializes as a JSON string of its backing literal, not as a tagged object (§3.6.2 *Type Mapping*).
+
+**Backing literals rename variants, not fields.** A backing literal gives an enum value its wire spelling. It is not a precedent for renaming struct fields in JSON: `@json("name")` field renaming stays out of v1 (§3.6.2).
+
+> **Reference implementation:** `to_str` does not allocate; it returns a static string. `from_str` compares lengths, then bytes, and does not allocate or hash. This note describes one compiler. It is not a language rule, and other implementations may differ.
+
 #### `Bool` Is Distinct from `Int`
 
 `Bool` and `Int` are different types. A `Bool` is not assignable to an `Int` target, and an `Int` is not assignable to a `Bool` target. This holds at let-bindings, assignments, function arguments, function returns, struct fields and collection elements, and in both directions:
@@ -1704,15 +1761,14 @@ The set of names that may not be declared at all, and the rule for a declaration
 Types can reference themselves. The compiler handles the indirection:
 
 ```blink
-type JsonValue {
-    Null
-    Boolean(Bool)
-    Number(Float)
-    Str(Str)
-    Array(List[JsonValue])
-    Object(Map[Str, JsonValue])
+type Tree {
+    Leaf
+    Node(value: Int, children: List[Tree])
+    Named(labels: Map[Str, Tree])
 }
 ```
+
+The JSON data model is the compiler-known `JsonValue` (§3.6.2), not a user declaration.
 
 ---
 
@@ -1800,13 +1856,14 @@ fn area(shape: Shape) -> Float {
 ```blink
 fn describe(val: JsonValue) -> Str {
     match val {
-        Null => "null"
-        Boolean(true) => "yes"
-        Boolean(false) => "no"
-        Number(n) => "number: {n}"
-        Str(s) => "string: {s}"
-        Array(items) => "array of {items.len()}"
-        Object(map) => "object with {map.len()} keys"
+        JsonValue.Null => "null"
+        JsonValue.Bool(true) => "yes"
+        JsonValue.Bool(false) => "no"
+        JsonValue.Int(n) => "int: {n}"
+        JsonValue.Float(f) => "float: {f}"
+        JsonValue.Str(s) => "string: {s}"
+        JsonValue.Array(items) => "array of {items.len()}"
+        JsonValue.Object(fields) => "object with {fields.len()} fields"
     }
 }
 ```
@@ -3327,7 +3384,7 @@ Per-trait sum type rules:
 | `Ord` | Compare variant index first; if same variant, field-wise lexicographic comparison |
 | `Hash` | Hash variant index, then hash fields of data-carrying variants |
 | `Clone` | Match + reconstruct variant with copied field values |
-| `Display` | Variant name for unit variants; `"Variant(f1, f2)"` for data-carrying |
+| `Display` | Variant name for unit variants; `"Variant(f1, f2)"` for data-carrying. Exception: a Str-backed enum writes its backing literal, so the output equals `to_str()` (§3.4 *Str-Backed Enums*) |
 | `Debug` | `"Variant"` for unit variants; `"Variant({f1.debug()}, {f2.debug()})"` for data-carrying |
 
 ##### Container Debug Rendering
@@ -3488,6 +3545,8 @@ Rendering* above.
 
 Blink provides compiler-known `Serialize` and `Deserialize` traits for JSON serialization. These are Tier 1 (ship with the compiler) and derivable via `@derive`.
 
+> **Spec-only.** The compiler does not build `JsonValue` or `JsonError` yet, so this section describes the language, not the current compiler. Today a derived `to_json` returns JSON text as `Str`, and a derived `from_json` takes a `Str` and returns `Result[Self, Str]`. That Str surface is not part of the language: it becomes `json.encode` and `json.decode[T]` (§3.6.3). Built today: `@derive(Serialize, Deserialize)` on structs and enums (with the Str signatures), and Str-backed enums (§3.4). Each part of this note goes when the compiler builds that part.
+
 ##### Trait Declarations
 
 ```blink
@@ -3514,13 +3573,27 @@ type JsonValue {
 }
 ```
 
+`Object` keeps its entries in input order and keeps duplicate keys, so `json.stringify(json.parse(s)?)` does not drop or reorder them. Where a key occurs more than once, a lookup takes the **first** entry with that key. This holds for `JsonValue.get` (§3.6.3) and for derived `from_json`.
+
 `JsonError` is a single error type covering both serialization and deserialization failures:
 
 ```blink
 type JsonError {
     message: Str
+    path: Str
 }
 ```
+
+**`path`** tells where in the value a decode error happened. It starts with `$`, the whole value. Each step adds `.name` for an object key or `[i]` for an array index: `$.items[2].age`. A key that is not an identifier is written as `["key"]`, in JSON string syntax: `$.headers["content-type"]`. A `path` of `""` means the location is not known. A parse error has `path: ""`, and so does an error that a hand-written `from_json` builds without a path.
+
+When a derived `from_json` calls `from_json` for a field and gets `Err(e)`, it returns `e` with its own step put in `e.path` just after the `$`. A nested error from `$.age` in field `owner` becomes `$.owner.age`. A nested error with `path: ""` becomes `$.owner`. So a hand-written impl deep in the value still gets a path up to its own position.
+
+**`message`** is text for people. The spec fixes only its location content:
+
+- A parse error's `message` contains `line L, column C`. Both count from 1. Lines are split at `\n` (U+000A). The column counts bytes from the start of the line, the same unit as `Str.len()`.
+- A decode error whose `path` is not `""` has a `message` that contains `at <path>`, for example `at $.items[2].age`.
+
+The rest of the wording is not fixed, except that `json.decode[T]` and its two-step form give the same text (§3.6.3 *Typed Decoding and Encoding*).
 
 ##### Derive Behavior
 
@@ -3553,6 +3626,28 @@ impl Deserialize for Forecast {
 }
 ```
 
+A derived `from_json` reads each field from the first object entry with that field's name. It fills in the `path` of every error it returns.
+
+##### Numbers
+
+JSON has one number type. `JsonValue` has two, and these rules decide between them:
+
+- `json.parse` gives `JsonValue.Int` when the number has no fraction and no exponent and its value fits in `Int` (64-bit signed). It gives `JsonValue.Float` in every other case: `20` is `Int`, `20.0` and `2e1` are `Float`.
+- **An integer outside the `Int` range becomes a `Float` and loses precision.** `json.parse("18446744073709551615")` gives `Ok(JsonValue.Float(18446744073709551616.0))`, not an error. To keep a large ID exact, send it as a JSON string and give the field the type `Str`.
+- A derived `from_json` for a `Float` field accepts `JsonValue.Int` and converts it, so `{"temp_c": 20}` decodes into `temp_c: Float`.
+- A derived `from_json` for an `Int` field accepts only `JsonValue.Int`. It never narrows a `Float`, not even `3.0`.
+- `as_float()` on a `JsonValue.Int` gives `Some`. `as_int()` on a `JsonValue.Float` gives `None`.
+
+##### Str-Backed Enums
+
+With `@derive(Serialize)`, a Str-backed enum (§3.4) serializes as `JsonValue.Str(x.to_str())`. With `@derive(Deserialize)`, `from_json` accepts `JsonValue.Str(s)` and returns `Ok(v)` exactly when `T.from_str(s) == Some(v)`. Every other value is an error.
+
+When the input is a string that is not a backing literal, the `JsonError` message names the rejected value, the enum type, and every valid literal in declaration order. For a long enum, the message may list the first N literals and give the count of the rest. For example (the wording is not fixed):
+
+```
+unknown value "closed" for Status at $.status; expected one of: "open", "in_progress", "done"
+```
+
 ##### Type Mapping
 
 | Blink Type | JSON Representation |
@@ -3564,7 +3659,8 @@ impl Deserialize for Forecast {
 | `Option[T]` | `JsonValue.Null` for `None`, `T.to_json()` for `Some(v)` |
 | `List[T]` | `JsonValue.Array` |
 | Struct with `@derive(Serialize)` | `JsonValue.Object` |
-| Enum with `@derive(Serialize)` | Tagged object: `{"variant": "Name", "fields": {...}}` |
+| Enum with `@derive(Serialize)`, not Str-backed | Tagged object: `{"variant": "Name", "fields": {...}}` |
+| Str-backed enum with `@derive(Serialize)` | `JsonValue.Str` of its backing literal: `"in_progress"` |
 
 ##### Purity
 
@@ -3607,9 +3703,32 @@ impl Serialize for Pair[A, B] where A: Serialize, B: Serialize {
 }
 ```
 
+##### JSON Text Is Not a `JsonValue`
+
+Many languages name the method that returns JSON text `to_json`. In Blink, `to_json` returns a `JsonValue` and `from_json` takes one, so code written the other way is a type error. The compiler reports it as `error[JsonTextForValue]` (E0537) when:
+
+- a `Str` is the argument to a `from_json` that takes a `JsonValue`, or
+- the result of `to_json()` is used where a `Str` is required.
+
+The diagnostic names `json.decode[T]` or `json.encode` as the replacement, and it carries a machine-applicable fix:
+
+```blink
+let u = User.from_json(body)?     // error[JsonTextForValue]: body is Str
+let u = json.decode[User](body)?  // fix
+
+let text: Str = u.to_json()       // error[JsonTextForValue]: to_json gives JsonValue
+let text = json.encode(u)         // fix
+```
+
+The code, the trigger, the named replacements and the fix are part of the language. The message text is not.
+
 #### §3.6.3 JSON Codec Module
 
 The `std.json` module provides the public API for JSON parsing, serialization, and typed deserialization. All functions are pure — IO effects belong to the caller.
+
+> **Spec-only.** The compiler does not build this module surface yet: none of `parse`, `stringify`, `pretty`, `decode`, `encode` or the `JsonValue` methods exist. Today `lib/std/json.bl` ships an integer-handle API (`json_parse`, `json_get`, `json_serialize`, `json_clear` and others). That API is not part of the language. It leaves the public surface in the release where `JsonValue` lands. Each part of this note goes when the compiler builds that part.
+
+`std.json` keeps no global shared mutable state. A `JsonValue` is an ordinary value, and no call changes or frees a value that another caller holds. This also holds for any private store or cache behind the module.
 
 ##### Module API
 
@@ -3619,7 +3738,7 @@ import std.json
 // Parse JSON string into dynamic JsonValue tree
 json.parse(input: Str) -> Result[JsonValue, JsonError]
 
-// Convert JsonValue tree to comblink JSON string
+// Convert JsonValue tree to compact JSON string
 json.stringify(value: JsonValue) -> Str
 
 // Pretty-print JsonValue with indentation
@@ -3636,13 +3755,31 @@ json.encode[T: Serialize](value: T) -> Str
 
 `json.encode[T]` is sugar for `json.stringify(value.to_json())`.
 
+##### Typed Decoding and Encoding
+
+The spec defines `json.encode` and `json.decode[T]` by their results, not by how they compute them:
+
+- `json.encode(x)` returns the same `Str` as `json.stringify(x.to_json())`.
+- `json.decode[T](s)` returns a `Result` equal to the result of this two-step form:
+
+  ```blink
+  match json.parse(s) {
+      Ok(v) => T.from_json(v)
+      Err(e) => Err(e)
+  }
+  ```
+
+"Equal" includes every `JsonError` field: the same `path` and the same `message` text. Both paths accept the same inputs, give the same `Ok` values, and follow the number rules and the first-match key rule of §3.6.2.
+
+An implementation may fuse the two steps into a reader or writer per type that builds no `JsonValue` tree. Only derived impls may fuse. When a field's type has a hand-written `Deserialize`, the fused reader parses that field's part of the input into a `JsonValue` and calls that type's `from_json`.
+
 ##### Dynamic Navigation (JsonValue Methods)
 
 `JsonValue` provides navigation methods returning `Option` for partial access into the JSON tree. Navigation is inherently partial — a key may not exist, an index may be out of bounds, a value may not be the expected type. `Option` is the canonical encoding of partiality in Blink, composing naturally with `?` (early return) and `??` (default value).
 
 ```blink
 // Structural navigation
-fn get(self, key: Str) -> Option[JsonValue]    // object field lookup
+fn get(self, key: Str) -> Option[JsonValue]    // object field lookup; first entry with the key
 fn at(self, index: Int) -> Option[JsonValue]   // array index access
 fn len(self) -> Int                            // array/object child count
 fn keys(self) -> List[Str]                     // object keys (empty for non-objects)
