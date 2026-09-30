@@ -258,7 +258,7 @@ fn build_json(fields: List[(Str, Str)]) -> Str {
 
 ```blink
 trait StringBuildOps {
-    fn write(self, s: Str)
+    fn write[T: Display](self, x: T)
     fn write_char(self, c: Char)
     fn to_str(self) -> Str
     fn len(self) -> Int
@@ -273,8 +273,8 @@ trait StringBuildOps {
 |--------|-----------|-------|
 | `new` | `fn() -> StringBuilder` | Empty buffer, default capacity |
 | `with_capacity` | `fn(n: Int) -> StringBuilder` | Pre-allocate `n` bytes to avoid reallocs |
-| `write` | `fn(self, s: Str)` | Append string. Requires `let mut` |
-| `write_char` | `fn(self, c: Char)` | Append single character |
+| `write` | `fn[T: Display](self, x: T)` | Append `x` rendered by `Display`; same as `x.fmt(sb)`. Requires `let mut` |
+| `write_char` | `fn(self, c: Char)` | Append single character. Not generic; does not go through `Display` |
 | `to_str` | `fn(self) -> Str` | Produce immutable `Str` (copies buffer) |
 | `len` | `fn(self) -> Int` | Current content length in codepoints |
 | `capacity` | `fn(self) -> Int` | Current buffer capacity |
@@ -282,7 +282,7 @@ trait StringBuildOps {
 
 **`to_str()` always copies.** The returned `Str` is an independent immutable value. Subsequent `write()` or `clear()` calls on the builder do not affect previously returned strings. This is the only safe semantics given GC-managed immutable `Str`.
 
-**Interpolation optimization.** When the compiler sees `sb.write("{x}: {y}")` where the argument is an interpolated string literal, it lowers the call to a sequence of individual writes (`sb.write(x_str); sb.write(": "); sb.write(y_str)`) instead of materializing a temporary `Str`. This is a codegen optimization, transparent to the type system — the method signature is unchanged. (Vote: 4-1, Systems dissented wanting explicit multi-write.)
+**Interpolation optimization.** When the compiler sees `sb.write("{x}: {y}")` where the argument is an interpolated string literal, it lowers the call to a sequence of individual writes (`sb.write(x_str); sb.write(": "); sb.write(y_str)`) instead of materializing a temporary `Str`. This is a codegen optimization, transparent to the type system: the argument is a `Str`, so the call checks against `write[T: Display]` with `T = Str`, as any other `Str` argument does. (Vote: 4-1, Systems dissented wanting explicit multi-write.)
 
 **When to use which:**
 - **Interpolation** — inline composition, the 80% case
@@ -1381,7 +1381,7 @@ let r = Registry[User] { entries: [] }      // OK -- brackets on a struct-litera
 
 - **All or none.** A type-argument list supplies every one of the declaration's type parameters or none of them. There is no partial application and no placeholder for "infer this one."
 - **Arity is exact.** Supplying the wrong count is `error[TypeArgArity]` (E0303) in every position — at a callee exactly as in a type position (§3.4 *Kind-Correctness*) — not a prompt to infer the remainder.
-- **Bounds are checked against the arguments as written.** An explicit type argument satisfies the binder's bounds or the call is rejected; explicitness never bypasses a bound.
+- **Bounds are checked against the arguments as written.** An explicit type argument satisfies the binder's bounds or the call is rejected; explicitness never bypasses a bound. The error is E0306, or E0523 for a `Display` bound (§3.6 *Trait Bounds*).
 
 **A redundant type-argument list is permitted and carries no diagnostic.** When inference would have reached the same answer, writing the arguments anyway is neither an error nor a warning nor a lint — exactly as `let x: Int = 1` is permitted where `let x = 1` would do. A diagnostic here would be non-monotonic: adding an annotation elsewhere in the program could make an untouched line retroactively noisy.
 
@@ -2554,7 +2554,7 @@ fn max[T: Ord](a: T, b: T) -> T {
 
 fn print_all[T: Display](items: List[T]) ! IO {
     for item in items {
-        io.println(item.display())
+        io.println(item)
     }
 }
 
@@ -2566,6 +2566,8 @@ fn dedup[T: Eq + Hash](items: List[T]) -> List[T] {
     })
 }
 ```
+
+An argument whose type does not implement the bound's trait is `error[TraitBoundNotSatisfied]` (E0306), with one exception: a failed `Display` bound is `error[E0523]` (`MissingDisplayImpl`) at every call, so a missing `Display` impl reads the same whether the call is `"{x}"`, `sb.write(x)`, `io.println(x)` or `print_all(xs)` (§3.6 *Display Format Protocol*).
 
 #### Why Traits Over Inheritance
 
@@ -2975,6 +2977,17 @@ impl Display for Point {
 }
 ```
 
+`sb.write` takes any `Display` value (§3.2 *String Building*), so `sb.write(self.x)` writes the `Int` field with no `.display()` call. The `io` print functions take the same bound (§4.4):
+
+```blink
+fn main() ! IO {
+    let p = Point{ x: 3, y: 4 }
+    io.println(p)          // "(3, 4)"
+    io.println(42)         // "42"
+    io.println("at {p}")   // "at (3, 4)"
+}
+```
+
 **`display` (pull, sealed default).** Marked `final` — it cannot be overridden in any `impl` block. Provides Str-producing ergonomics for sites where no builder is in scope (error paths, test assertions, match arms):
 
 ```blink
@@ -3026,6 +3039,23 @@ error[E0523]: type `Matrix` does not implement `Display`
 ```
 
 Built-in types (`Int`, `Float`, `Bool`, `Str`, `Char`) have compiler-provided `Display` implementations. User types require `@derive(Display)` or a manual `impl Display for T` block. There is no fallback to `Debug` and no auto-synthesis — the trait bound is checked like any other.
+
+**The intrinsic seam.** These five impls are prelude impls whose `fmt` body the compiler provides. They are the only `fmt` bodies that do not call `sb.write`, and the list is closed: every other `Display` impl, including every derived one, writes through `sb.write`, `sb.write_char` or a child's `fmt`. `Str.fmt` appends the receiver's bytes to the builder directly; it does not call `sb.write`, so `sb.write(s)` for a `Str` lowers to `s.fmt(sb)` and stops there. `Str.display()` returns a `Str` equal to the receiver. (Implementation note: the compiler-provided impl may return the receiver without a copy.)
+
+**Every Display sink uses the same bound.** `"{x}"`, `x.display()`, `sb.write(x)` (§3.2 *String Building*) and the `io` print functions (§4.4) each require `T: Display` and nothing else. A `Str` argument is one `Display` type among five; it takes no separate path in the type system. A value that fails the bound at any of these sinks, or at any other call whose type parameter is bounded by `Display`, gets the same `MissingDisplayImpl` (E0523) error. The message names the sink and the span covers the argument:
+
+```
+error[E0523]: type `Matrix` does not implement `Display`
+  --> app.bl:14:14
+   |
+14 |     sb.write(matrix)
+   |              ^^^^^^ `Matrix` does not implement `Display`, which `StringBuilder.write` requires
+   |
+   = help: add `@derive(Display)` or implement `Display` manually
+   = note: use `matrix.debug()` for structural representation
+```
+
+A `Raw[T]` argument is the one exception: it reports `RawOutsideTemplate` (§3b.5 *`Raw(expr)` — The Escape Hatch*), not E0523.
 
 **Desugaring: two-phase (check + optimize).** The compiler processes string interpolation in two phases:
 
