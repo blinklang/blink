@@ -1,0 +1,443 @@
+// A `with ... as` binding lives only until its block exits: exit() or close() then
+// releases what it holds. So the binding may not leave the block, by `return`, as the
+// block's value, or by assignment to a variable declared outside the block. A closure
+// that reads the binding, or a value that wraps it, leaves with it. A value copied out
+// of the binding is data and may go.
+//
+// A `return` is judged against the blocks opened in its own function or closure: a
+// closure written inside the block returns to a caller that is still inside it.
+
+import compile_test_helpers
+
+fn handler_prelude() -> Str {
+    #"
+import std.traits
+type Ctx { v: Int }
+type Wrap { c: Ctx }
+type BH { x: Int }
+impl BlockHandler for BH {
+    type Context = Ctx
+    fn enter(self) -> Ctx { Ctx { v: 1 } }
+    fn exit(self, ok: Bool) { }
+}
+"#
+}
+
+fn expect_scoped_escape(out: Str, label: Str) {
+    compile_test_helpers.expect_error(out, "E0601", label)
+    compile_test_helpers.expect_contains(out, "CloseableEscapesScope", label)
+}
+
+fn rejects(body: Str, tag: Str, label: Str) {
+    let out = compile_test_helpers.compile_and_capture(handler_prelude().concat(body), tag)
+    expect_scoped_escape(out, label)
+}
+
+fn accepts(body: Str, tag: Str, label: Str) {
+    let out = compile_test_helpers.compile_and_capture(handler_prelude().concat(body), tag)
+    compile_test_helpers.expect_compiles_clean(out, label)
+}
+
+// ── return ──────────────────────────────────────────────────────────────────
+
+test "returning the binding from inside its with block is rejected" {
+    rejects(#"
+fn mk() -> Ctx {
+    with BH { x: 0 } as ctx {
+        return ctx
+    }
+    Ctx { v: 0 }
+}
+fn main() { let _c = mk() }
+"#, "with_leave_return_binder", "return of the binding")
+}
+
+test "returning a closure that reads the binding is rejected" {
+    rejects(#"
+fn mk() -> fn() -> Int {
+    with BH { x: 0 } as ctx {
+        return fn() { ctx.v }
+    }
+    fn() { 0 }
+}
+fn main() { let _f = mk() }
+"#, "with_leave_return_closure", "return of a closure over the binding")
+}
+
+test "returning a let alias of the binding is rejected" {
+    rejects(#"
+fn mk() -> Ctx {
+    with BH { x: 0 } as ctx {
+        let c = ctx
+        return c
+    }
+    Ctx { v: 0 }
+}
+fn main() { let _c = mk() }
+"#, "with_leave_return_alias", "return of an alias of the binding")
+}
+
+test "returning a Closeable binding is rejected" {
+    let src = #"
+import std.traits
+type Res { n: Int }
+impl Closeable for Res {
+    fn close(self) { }
+}
+fn mk() -> Res {
+    with Res { n: 4 } as r {
+        return r
+    }
+    Res { n: 0 }
+}
+fn main() { let _r = mk() }
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "with_leave_return_closeable")
+    expect_scoped_escape(out, "return of a Closeable binding")
+}
+
+test "returning the binding wrapped in Some, a tuple or a struct is rejected" {
+    rejects(#"
+fn mk() -> Option[Ctx] {
+    with BH { x: 0 } as ctx {
+        return Some(ctx)
+    }
+    None
+}
+fn main() { let _c = mk() }
+"#, "with_leave_return_some", "return of Some(binding)")
+    rejects(#"
+fn mk() -> (Ctx, Int) {
+    with BH { x: 0 } as ctx {
+        return (ctx, 1)
+    }
+    (Ctx { v: 0 }, 0)
+}
+fn main() { let _c = mk() }
+"#, "with_leave_return_tuple", "return of a tuple holding the binding")
+    rejects(#"
+fn mk() -> Wrap {
+    with BH { x: 0 } as ctx {
+        return Wrap { c: ctx }
+    }
+    Wrap { c: Ctx { v: 0 } }
+}
+fn main() { let _c = mk() }
+"#, "with_leave_return_struct", "return of a struct holding the binding")
+}
+
+test "a return inside a spawned closure that leaves a with block in that closure is rejected" {
+    rejects(#"
+fn main() {
+    async.scope {
+        let h = async.spawn(fn() -> Ctx {
+            with BH { x: 0 } as ctx {
+                return ctx
+            }
+            Ctx { v: 0 }
+        })
+        let _c = h.await
+    }
+}
+"#, "with_leave_return_in_spawn", "return out of a with block inside a spawned closure")
+}
+
+// ── the block's value ───────────────────────────────────────────────────────
+
+test "the binding as the with block's value is rejected" {
+    rejects(#"
+fn main() {
+    let c = with BH { x: 0 } as ctx { ctx }
+    assert_eq(c.v, 1)
+}
+"#, "with_leave_tail_binder", "binding as the block value")
+}
+
+test "a closure over the binding as the with block's value is rejected" {
+    rejects(#"
+fn main() {
+    let g = with BH { x: 0 } as ctx { fn() { ctx.v } }
+    assert_eq(g(), 1)
+}
+"#, "with_leave_tail_closure", "closure over the binding as the block value")
+}
+
+test "the binding reaching the block's value through if and else is rejected" {
+    rejects(#"
+fn pick(flag: Bool) -> Int {
+    let c = with BH { x: 0 } as ctx {
+        if flag { ctx } else { ctx }
+    }
+    c.v
+}
+fn main() { assert_eq(pick(true), 1) }
+"#, "with_leave_tail_if", "binding through if/else as the block value")
+}
+
+test "the binding as the value of a with block that ends a function is rejected" {
+    rejects(#"
+fn mk() -> Ctx {
+    with BH { x: 0 } as ctx { ctx }
+}
+fn main() { let _c = mk() }
+"#, "with_leave_fn_tail", "binding as the function's tail with block")
+}
+
+test "the binding as the value of a with block that ends a closure is rejected" {
+    rejects(#"
+fn main() {
+    async.scope {
+        let h = async.spawn(fn() -> Ctx {
+            with BH { x: 0 } as ctx { ctx }
+        })
+        let _c = h.await
+    }
+}
+"#, "with_leave_closure_tail", "binding as the closure's tail with block")
+}
+
+test "the binding wrapped in Some, a tuple or a struct as the block's value is rejected" {
+    rejects(#"
+fn main() {
+    let c = with BH { x: 0 } as ctx { Some(ctx) }
+    assert(c.is_some())
+}
+"#, "with_leave_tail_some", "Some(binding) as the block value")
+    rejects(#"
+fn main() {
+    let c = with BH { x: 0 } as ctx { (ctx, 1) }
+    assert_eq(c.1, 1)
+}
+"#, "with_leave_tail_tuple", "tuple holding the binding as the block value")
+    rejects(#"
+fn main() {
+    let c = with BH { x: 0 } as ctx { Wrap { c: ctx } }
+    assert_eq(c.c.v, 1)
+}
+"#, "with_leave_tail_struct", "struct holding the binding as the block value")
+}
+
+// ── assignment ──────────────────────────────────────────────────────────────
+
+test "assigning the binding to a variable declared outside the block is rejected" {
+    rejects(#"
+fn main() {
+    let mut keep = Ctx { v: 0 }
+    with BH { x: 0 } as ctx {
+        keep = ctx
+    }
+    assert_eq(keep.v, 1)
+}
+"#, "with_leave_assign_binder", "assignment of the binding to an outer variable")
+}
+
+test "assigning a closure over the binding to an outer variable is rejected" {
+    rejects(#"
+fn main() {
+    let mut g = fn() { 0 }
+    with BH { x: 0 } as ctx {
+        g = fn() { ctx.v }
+    }
+    assert_eq(g(), 1)
+}
+"#, "with_leave_assign_closure", "assignment of a closure over the binding to an outer variable")
+}
+
+test "assigning the binding wrapped in Some, a tuple or a struct to an outer variable is rejected" {
+    rejects(#"
+fn main() {
+    let mut keep: Option[Ctx] = None
+    with BH { x: 0 } as ctx {
+        keep = Some(ctx)
+    }
+    assert(keep.is_some())
+}
+"#, "with_leave_assign_some", "assignment of Some(binding) to an outer variable")
+    rejects(#"
+fn main() {
+    let mut keep = (Ctx { v: 0 }, 0)
+    with BH { x: 0 } as ctx {
+        keep = (ctx, 1)
+    }
+    assert_eq(keep.1, 1)
+}
+"#, "with_leave_assign_tuple", "assignment of a tuple holding the binding to an outer variable")
+    rejects(#"
+fn main() {
+    let mut keep = Wrap { c: Ctx { v: 0 } }
+    with BH { x: 0 } as ctx {
+        keep = Wrap { c: ctx }
+    }
+    assert_eq(keep.c.v, 1)
+}
+"#, "with_leave_assign_struct", "assignment of a struct holding the binding to an outer variable")
+}
+
+test "assigning the binding to a module-level variable is rejected" {
+    rejects(#"
+let mut KEEP: Option[Ctx] = None
+fn main() {
+    with BH { x: 0 } as ctx {
+        KEEP = Some(ctx)
+    }
+    assert(KEEP.is_some())
+}
+"#, "with_leave_assign_module_level", "assignment of the binding to a module-level variable")
+}
+
+test "a spawn that captures a value wrapping the binding is rejected" {
+    rejects(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        let w = Wrap { c: ctx }
+        async.scope {
+            let _h = async.spawn(fn() { w.c.v })
+        }
+    }
+}
+"#, "with_leave_spawn_wrapper", "spawn capture of a struct holding the binding")
+}
+
+// ── what stays legal ────────────────────────────────────────────────────────
+
+test "a with block inside a spawned closure may use its binding" {
+    accepts(#"
+fn main() {
+    async.scope {
+        let h = async.spawn(fn() {
+            with BH { x: 0 } as ctx { ctx.v }
+        })
+        assert_eq(h.await, 1)
+    }
+}
+"#, "with_leave_ok_inside_spawn", "with block inside a spawned closure")
+}
+
+test "a with block inside a spawned closure may call a closure over its binding" {
+    accepts(#"
+fn main() {
+    async.scope {
+        let h = async.spawn(fn() {
+            with BH { x: 0 } as ctx {
+                let r = fn() { ctx.v }
+                r()
+            }
+        })
+        assert_eq(h.await, 1)
+    }
+}
+"#, "with_leave_ok_inside_spawn_closure", "closure over the binding inside a spawned closure")
+}
+
+test "a value copied out of the binding may be returned or be the block's value" {
+    accepts(#"
+fn mk() -> Int {
+    with BH { x: 0 } as ctx {
+        return ctx.v
+    }
+    0
+}
+fn main() {
+    let n = with BH { x: 0 } as ctx { ctx.v }
+    assert_eq(n + mk(), 2)
+}
+"#, "with_leave_ok_copied", "copied value returned and as block value")
+}
+
+test "the binding may be assigned to a variable declared inside the block" {
+    accepts(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        let mut k = ctx
+        k = ctx
+        assert_eq(k.v, 1)
+    }
+}
+"#, "with_leave_ok_inner_assign", "assignment to a variable declared inside the block")
+}
+
+test "a value copied out of the binding may be assigned to an outer variable" {
+    accepts(#"
+fn main() {
+    let mut keep_v = 0
+    with BH { x: 0 } as ctx {
+        keep_v = ctx.v
+    }
+    assert_eq(keep_v, 1)
+}
+"#, "with_leave_ok_outer_assign_data", "copied value assigned to an outer variable")
+}
+
+test "a closure inside the block may return the binding to its caller in the block" {
+    accepts(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        let get = fn() -> Ctx { return ctx }
+        assert_eq(get().v, 1)
+    }
+}
+"#, "with_leave_ok_closure_return", "return from a closure called inside the block")
+}
+
+test "a wrapper built inside the block that never leaves it is allowed" {
+    accepts(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        let w = Wrap { c: ctx }
+        let o = Some(ctx)
+        let t = (ctx, 1)
+        assert_eq(w.c.v + o.unwrap().v + t.0.v, 3)
+    }
+}
+"#, "with_leave_ok_inner_wrapper", "wrapper that stays inside the block")
+}
+
+test "a with block in statement position may end with its binding" {
+    accepts(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        assert_eq(ctx.v, 1)
+        ctx
+    }
+    assert_eq(1, 1)
+}
+"#, "with_leave_ok_statement_tail", "discarded block value naming the binding")
+}
+
+test "a unit function may end with a with block whose last line is its binding" {
+    accepts(#"
+fn touch() {
+    with BH { x: 0 } as ctx {
+        assert_eq(ctx.v, 1)
+        ctx
+    }
+}
+fn main() { touch() }
+"#, "with_leave_ok_unit_fn_tail", "unit function ending in a with block naming the binding")
+}
+
+test "a shadowing let of the same name may be returned from inside the block" {
+    accepts(#"
+fn mk() -> Ctx {
+    with BH { x: 0 } as ctx {
+        let ctx = Ctx { v: ctx.v + 1 }
+        return ctx
+    }
+    Ctx { v: 0 }
+}
+fn main() { assert_eq(mk().v, 2) }
+"#, "with_leave_ok_shadowed", "shadowing let returned")
+}
+
+test "an outer binding of the same name may be returned after the block" {
+    accepts(#"
+fn mk() -> Ctx {
+    let ctx = Ctx { v: 7 }
+    with BH { x: 0 } as ctx {
+        assert_eq(ctx.v, 1)
+    }
+    return ctx
+}
+fn main() { assert_eq(mk().v, 7) }
+"#, "with_leave_ok_outer_same_name", "outer binding of the same name returned")
+}
