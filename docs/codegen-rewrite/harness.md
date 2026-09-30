@@ -7,7 +7,7 @@ how to add a lint row. The gate is `task ci`. The old full gate is now
 ## The compilers
 
 - **gen0** is the pinned compiler, built from the tag
-  `gen0-rewrite-selfhost-1` into `build/gen0/`. Run
+  `gen0-rewrite-selfhost-2` into `build/gen0/`. Run
   `task gen0` to build it. It is a fixed binary per pin, so it
   is a reference, never a thing under test.
 - **gen1** is the current source compiled by gen0. `task gen1` writes
