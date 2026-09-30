@@ -1,0 +1,72 @@
+// A user `type Handler` or `type Template` is the type those names mean in its module
+// (sections/03_types.md, Type Name Resolution; sections/07_trust_modules_metadata.md,
+// Shadowing Rules). The compiler-known `Handler[E]` / `Template[C]` answer only where no such
+// declaration is in scope. Before, the builtin arm answered first and turned the bare name
+// into a type variable, so the declaration was accepted and then unusable: an argument of the
+// wrong type slipped through typecheck, and codegen stopped on a free type variable.
+
+import compile_test_helpers
+
+fn declared(tname: Str, main_body: Str) -> Str {
+    let mut s = "type {tname} \{\n    n: Int\n}\n\n"
+    s = s.concat("fn use_it(h: {tname}) -> Int \{ h.n }\n\n")
+    s = s.concat("fn main() \{\n{main_body}}\n")
+    s
+}
+
+fn expect_spec_mismatch(tname: Str, tag: Str) {
+    let out = compile_test_helpers.compile_and_capture(declared(tname, "    io.println(\"\{use_it(5)}\")\n"), tag)
+    compile_test_helpers.expect_error(out, "E0300", "use_it(5) against a declared {tname}")
+    compile_test_helpers.expect_contains(out, "expects {tname}, got Int", "the parameter is the declared {tname}")
+    assert(!out.contains("\"code\":\"I0"))
+}
+
+fn expect_declared_runs(tname: Str, tag: Str) {
+    let r = compile_test_helpers.compile_and_run(declared(tname, "    io.println(\"got=\{use_it({tname} \{ n: 7 })}\")\n"), tag)
+    assert(r.exit_code == 0)
+    assert(r.out.contains("got=7"))
+}
+
+test "the spec example: a declared Handler is the parameter type, so use_it(5) is a type error" {
+    expect_spec_mismatch("Handler", "declared_handler_spec")
+}
+
+test "a declared Handler reads its field through a parameter" {
+    expect_declared_runs("Handler", "declared_handler_get")
+}
+
+test "a trait impl on a declared Handler reads self" {
+    let mut s = "trait Doubler \{\n    fn doubled(self) -> Int\n}\n\n"
+    s = s.concat("type Handler \{\n    n: Int\n}\n\n")
+    s = s.concat("impl Doubler for Handler \{\n    fn doubled(self) -> Int \{ self.n * 2 }\n}\n\n")
+    s = s.concat("fn main() \{\n    let h = Handler \{ n: 21 }\n    io.println(\"got=\{h.doubled()}\")\n}\n")
+    let r = compile_test_helpers.compile_and_run(s, "declared_handler_self")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("got=42"))
+}
+
+test "Handler[E] is still the builtin where no Handler is declared" {
+    let mut s = "effect Small \{\n    effect Only \{\n        fn one(a: Str)\n    }\n}\n\n"
+    s = s.concat("fn make_small() -> Handler[Small] \{\n    handler Small \{\n        fn one(a: Str) \{\n            io.println(\"[small.one] \{a}\")\n        }\n    }\n}\n\n")
+    s = s.concat("fn main() \{\n    let h = make_small()\n    with h \{\n        small.one(\"hi\")\n    }\n}\n")
+    let r = compile_test_helpers.compile_and_run(s, "builtin_handler_kept")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("[small.one] hi"))
+}
+
+test "the spec example with Template: a declared Template is the parameter type" {
+    expect_spec_mismatch("Template", "declared_template_spec")
+}
+
+test "a declared Template reads its field through a parameter" {
+    expect_declared_runs("Template", "declared_template_get")
+}
+
+test "Template[C] is still the builtin where no Template is declared" {
+    let mut s = "effect DB \{\n    effect Query \{\n        fn query(t: Template[DB]) -> Int\n    }\n}\n\n"
+    s = s.concat("fn db(t: Template[DB]) -> Int \{ t.count() }\n\n")
+    s = s.concat("fn main() \{\n    let n = 1\n    io.println(\"parts=\{db(\"n=\{n}\")}\")\n}\n")
+    let r = compile_test_helpers.compile_and_run(s, "builtin_template_kept")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("parts="))
+}
