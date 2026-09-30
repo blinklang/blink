@@ -2009,7 +2009,7 @@ fn tc_tid_has_unbound_metavar(tid0: Int) -> Int {
     // (decisions/under-determined-types.md). A bare Channel in a TYPE position is E0303,
     // not E0301, but that spelling lowers to TYPE_UNKNOWN — not a metavar — so it
     // does not reach this arm.
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator {
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator || k == TyKind.Handle {
         return tc_tid_has_unbound_metavar(e.inner1)
     }
     if k == TyKind.Result || k == TyKind.Map {
@@ -2046,7 +2046,7 @@ pub fn tc_tid_has_unknown(tid0: Int) -> Int {
     if tc_tid_is_no_info(tid) != 0 { return 1 }
     let e = ty_pool.get(tid).unwrap()
     let k = e.kind
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator {
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator || k == TyKind.Handle {
         return tc_tid_has_unknown(e.inner1)
     }
     if k == TyKind.Result || k == TyKind.Map {
@@ -2101,6 +2101,7 @@ fn tc_tid_fill_unknowns(base0: Int, src0: Int) -> Int {
     if eb.kind == TyKind.Set { return make_set_type(tc_tid_fill_unknowns(eb.inner1, es.inner1)) }
     if eb.kind == TyKind.Channel { return make_channel_type(tc_tid_fill_unknowns(eb.inner1, es.inner1)) }
     if eb.kind == TyKind.Iterator { return make_iterator_type(tc_tid_fill_unknowns(eb.inner1, es.inner1)) }
+    if eb.kind == TyKind.Handle { return make_handle_type(tc_tid_fill_unknowns(eb.inner1, es.inner1)) }
     if eb.kind == TyKind.Result {
         return make_result_type(tc_tid_fill_unknowns(eb.inner1, es.inner1), tc_tid_fill_unknowns(eb.inner2, es.inner2))
     }
@@ -19886,6 +19887,17 @@ fn tc_scoped_value_memo(node: Int, depth: Int) -> Int {
     // user type with a method of the same name is untouched.
     if k == NodeKind.MethodCall {
         let own = tc_lookup_node_tid(node)
+        // An un-annotated `async.spawn(fn() { .. })` takes its payload from the closure's tail, which
+        // infer_type read before the closure's scope existed. Only the payload's holes are filled,
+        // so a payload infer_type did answer is kept.
+        let sp_cls = tc_unannotated_spawn_closure(node)
+        if sp_cls != -1 {
+            let body_t = tc_closure_body_result_tid(sp_cls, depth)
+            if body_t == -1 { return own }
+            if tc_tid_is_no_info(own) != 0 { return make_handle_type(body_t) }
+            if tc_tid_kind(own) != TyKind.Handle { return own }
+            return make_handle_type(tc_tid_fill_unknowns(tc_tid_child(own, 0), body_t))
+        }
         if tc_tid_is_no_info(own) == 0 { return own }
         if node_method(node) == "with_ptr" {
             let recv_t = tc_lookup_node_tid(node_obj(node))
@@ -19895,7 +19907,34 @@ fn tc_scoped_value_memo(node: Int, depth: Int) -> Int {
         }
         return own
     }
+    // `.await` has its operand's payload as its type, so a spawn recovered above is read through.
+    if k == NodeKind.AwaitExpr {
+        let own = tc_lookup_node_tid(node)
+        if tc_tid_is_no_info(own) == 0 && tc_tid_has_unknown(own) == 0 { return own }
+        let h = tc_scoped_value_memo(node_obj(node), depth + 1)
+        if tc_tid_is_no_info(h) != 0 || tc_tid_kind(h) != TyKind.Handle { return own }
+        let payload = tc_tid_child(h, 0)
+        if tc_tid_is_no_info(own) != 0 { return payload }
+        return tc_tid_fill_unknowns(own, payload)
+    }
     tc_lookup_node_tid(node)
+}
+
+// The closure of an `async.spawn(fn() { .. })` whose payload comes from its body, or -1. The
+// same shape infer_type's spawn arm infers from the body: a zero-param closure with no declared
+// return, on the `async` module rather than a local of that name.
+fn tc_unannotated_spawn_closure(node: Int) -> Int {
+    if node_kind(node) != NodeKind.MethodCall { return -1 }
+    if node_method(node) != "spawn" { return -1 }
+    let obj = node_obj(node)
+    if obj == -1 || node_kind(obj) != NodeKind.Ident || node_name(obj) != "async" { return -1 }
+    if tc_tid_is_no_info(nr_get_type("async")) == 0 { return -1 }
+    let cls = closure_arg_at(node_args(node), 0)
+    if cls == -1 || node_kind(cls) != NodeKind.Closure { return -1 }
+    if node_type_ann(cls) != -1 { return -1 }
+    let params = node_params(cls)
+    if params != -1 && sublist_length(params) != 0 { return -1 }
+    cls
 }
 
 // Bracketed type arguments with no call after them, recorded when name resolution reports
@@ -23605,6 +23644,29 @@ fn tc_scoped_tail_node(node: Int, depth: Int) -> Int {
     -1
 }
 
+// A value whose type depends on a scope it opens — a block tail, a spawned closure's body — was
+// inferred before that scope existed, so a tail naming one of its locals left a hole in the
+// node's own type (`Option[?]`, `Handle[?]`). The in-scope walk has the answer by now, and
+// codegen reads the node, so the holes are filled from it here, in every position the value
+// can sit in. Only a memo with no hole left is taken, and only the node's holes change: a
+// value the program really leaves open keeps its hole for the checks that report it.
+fn tc_stamp_fill_scoped_holes(node: Int) -> Int {
+    let k = node_kind(node)
+    let scoped = k == NodeKind.Block || k == NodeKind.IfExpr || k == NodeKind.MatchExpr || k == NodeKind.WithBlock || k == NodeKind.AsyncScope
+    if !scoped && k != NodeKind.AwaitExpr && tc_unannotated_spawn_closure(node) == -1 { return 0 }
+    let own = tc_lookup_node_tid(node)
+    let open_own = tc_tid_is_no_info(own) == 0 && tc_tid_has_unknown(own) != 0
+    let open_await = k == NodeKind.AwaitExpr && tc_tid_is_no_info(own) != 0
+    if !open_own && !open_await { return 0 }
+    let memo = tc_scoped_value_memo(node, 0)
+    if tc_tid_is_no_info(memo) != 0 { return 0 }
+    if tc_tid_has_unknown(memo) != 0 || tc_tid_has_unbound_metavar(memo) != 0 { return 0 }
+    let filled = if open_await { memo } else { tc_tid_fill_unknowns(own, memo) }
+    if tc_tid_has_unknown(filled) != 0 { return 0 }
+    tc_publish_node_tid(node, filled)
+    1
+}
+
 // One node, after its children. Publishing nothing is always allowed here; Phase 5 is what
 // decides whether the absence is tolerable.
 fn tc_stamp_recover_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
@@ -23626,6 +23688,7 @@ fn tc_stamp_recover_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.
         if is_literal_string_part(node) != 0 { tc_publish_node_tid(node, TYPE_STR) }
         return
     }
+    if tc_stamp_fill_scoped_holes(node) != 0 { return }
     if tc_tid_is_concrete(tc_lookup_node_tid(node)) != 0 { return }
     if k == NodeKind.Block || k == NodeKind.IfExpr || k == NodeKind.MatchExpr {
         tc_publish_node_tid(node, tc_recovered_scope_tid(node))
