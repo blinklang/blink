@@ -660,9 +660,15 @@ blink test --json
         "error_type": "pg.ConnectError"
       },
       "span": {"file": "src/db_test.bl", "line": 12, "col": 21}
+    },
+    {
+      "name": "session token decodes",
+      "status": "panicked",
+      "message": "unwrap called on None",
+      "span": {"file": "src/auth.bl", "line": 91, "col": 17}
     }
   ],
-  "summary": {"total": 14, "passed": 12, "failed": 2, "duration_ms": 340}
+  "summary": {"total": 14, "passed": 11, "failed": 2, "panicked": 1, "skipped": 0, "duration_ms": 340}
 }
 ```
 
@@ -676,6 +682,55 @@ The AI reads structured test failures the same way it reads structured compiler 
 | `"propagated_error"` | The test body — **or a `prop_check` property closure** (§2.20 Error Propagation, Property-Based Testing) — returned `Err(TestError { ... })` via `?` propagation. The record carries an `error` object with `message` (the `Display`-rendered error string) and `error_type` (the static name of the source error type at the `?` site). When the failure comes from a property closure, the record *additionally* carries the property failure fields (`seed`, `shrunk_input`, `reproduce`); the `cause` axis (assertion vs propagated error) is orthogonal to whether the test is a property, so no new `cause` value is added. |
 
 `"status": "panicked"` and `"status": "skipped"` records have no `cause` field — the status itself identifies the path. The four top-level statuses (`passed | failed | panicked | skipped`) remain unchanged.
+
+**Panicked records.** A panic that escapes a test body — one that no `assert_panics` catches (§2.20) — gives the test `"status": "panicked"`. The runner records the panic and continues with the next test. `"failed"` means the test found a bug; `"panicked"` means the test itself is broken (§2.20). A `panicked` record carries:
+
+| Field | Meaning |
+|-------|---------|
+| `message` | The panic message, unchanged. |
+| `span` | Where the panic fired, in the same shape as the `span` of a `failed` record. Present only when the runtime knows the location. |
+
+A `panicked` record has no `cause`, no `error` object and no `assertion` fields. It never carries a placeholder location such as `line: 0`: when the location is not known, `span` is absent.
+
+`message` and `span` have one meaning on every status that carries them: `message` is the text of the outcome, and `span` is where the outcome fired.
+
+**Summary and exit code.** The `summary` object always carries all six keys — `total`, `passed`, `failed`, `panicked`, `skipped`, `duration_ms` — even when a count is `0`. The counts partition the tests:
+
+```
+total = passed + failed + panicked + skipped
+```
+
+A test counts once, under the status of its record. The test binary exits non-zero when `failed + panicked > 0`. A panic has no exit code of its own.
+
+**Human-readable output.** The per-test line for a panicked test uses the word `PANIC`, and the panic message follows it:
+
+```
+test session token decodes ... PANIC
+  unwrap called on None
+  at src/auth.bl:91:17
+```
+
+The summary line always shows `passed` and `failed`. It shows `panicked` and `skipped` only when their count is above `0`:
+
+```
+11 passed, 2 failed, 1 panicked (of 14)
+```
+
+**Cleanup warnings.** A record of any status can carry a `cleanup_warnings` array. Each entry is `{"code": "E0824", "message": <cleanup panic message>}`. When a cleanup (`exit(false)` or `close()`) panics during a catchable unwind, the runner adds an entry and does not change the status (§4.6.3, E0824; cleanup in §5.5). The test keeps one record. This includes a panic in cleanup while an armed `assert_panics` unwinds: the expected panic sets the status (`passed`, or `failed` under E0832), and the cleanup panic is an E0824 entry on that record, not a separate `panicked` record:
+
+```json
+{"name": "rejects bad header", "status": "passed", "duration_ms": 2,
+ "cleanup_warnings": [{"code": "E0824", "message": "close on released handle"}]}
+```
+
+The human output prints one line per entry under the test's result line, for every status, passing tests included:
+
+```
+test rejects bad header ... ok
+  warning: E0824 cleanup panicked during unwind: close on released handle
+```
+
+A signal crash (for example `SIGSEGV`) is not a Blink panic. This section does not specify a record for it.
 
 ```sh
 blink test                       # run all tests
@@ -850,14 +905,11 @@ test "add handles signs" {
 
 **Label uniqueness.** Duplicate labels within the same `for_each` call panic at the start of the offending iteration with `for_each: duplicate case label "<label>" at indices <j> and <i>`. Uniqueness is checked at runtime — labels are arbitrary `Str` values and may be computed, so static checking would be over-constrained. Empty-string labels are allowed but two empty strings still collide.
 
-**Failure attribution.** Failures inside the body unwind through the test runner's per-test catch boundary (§2.20) and mark the parent `test` as failed. The current runner does not yet emit per-iteration `case` records in NDJSON output, so a failure shows the parent test's name without naming the failing case. Until the runner change lands (tracked separately as a `type:bug` against `lib/std/testing.bl` and the runner reporter), tests that need per-case attribution should include the label in the assertion message:
+**Failure attribution.** The test record carries a `cases` array with one entry for each case that ran. An entry holds the case `label` and its `status`, a value from the closed status enum (`passed | failed | panicked | skipped`). A `panicked` entry also carries `message` and, when known, `span` (§8.10, *Panicked records*).
 
-```blink
-testing.for_each(cases, fn(case) {
-    let (label, expected) = case
-    assert_eq(compute(case), expected, "case {label}")
-})
-```
+A case that fails or panics does not stop the loop. The runner records the case and runs the next one, so every case runs on every invocation.
+
+The parent test's status is the most severe status among its cases, in the order `panicked > failed > passed`. The parent is `skipped` only when every case is skipped. A duplicate-label panic is a panic: that case records `panicked`.
 
 **Why explicit labels, not auto-generated names.** Two cases that stringify the same way (`(1.0, 1.0)` and `(1.0, 1.0)` from different file lines) would collide if names were auto-generated from `Display`. Forcing a label makes the case identifier deterministic and meaningful in CI logs. The two-token cost (`"label",`) is the price of unambiguous failure attribution.
 
@@ -1175,6 +1227,16 @@ FAIL  tests/test_net.bl::"port strings round-trip"
 
 The seed surfaces in **every** failure output mode — `--quiet`, `--json`, and color-stripped CI logs all include it. The reproduce line uses the suite seed as printed: `0x` + 16 hex digits, zero-padded.
 
+**A panic inside a property.** When a property closure panics, the test record has `"status": "panicked"` (§8.10, *Panicked records*). In this version the runner does not shrink the input after a panic. The record carries `seed`, `reproduce` and `input` — the input the trial ran with, not shrunk — in place of `shrunk_input`. The record never carries `shrunk_input` for a panic, because nothing was shrunk.
+
+```
+PANIC  tests/test_parser.bl::"parse never panics"
+  seed: 0xDEADBEEFCAFE1234
+  input: "{["
+  panic: index out of bounds: 3 >= 2
+  rerun: blink test --seed 0xDEADBEEFCAFE1234 --filter 'parse never panics'
+```
+
 ##### In-test seeded RNG: `MockRand` controller
 
 For tests that want to install a deterministic `Rand` handler in a `with` block (independent of the runner's suite seed), `std.testing` exposes a controller struct following the `mock_clock` / `mock_env` shape (§8.10.3):
@@ -1294,6 +1356,30 @@ The **expected** (red) case emits `status: "passed"`:
 ```
 
 The test ran, failed as expected, and the runner counts that as a success — `status: "passed"` reflects the *suite-level* outcome.
+
+A panic is also an expected red. Every expected-red record carries one more field, which names the status the test had before `test.failing` inverted it. An expected-red panic also keeps the panic's `message` and, when known, `span`:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `xfail_observed` | `"failed" \| "panicked"` | The status the test would have had without `test.failing` |
+
+```json
+{ "name": "trait impl resolves through alias chain",
+  "status": "passed",
+  "expected_fail": true,
+  "xfail_reason": "Phase 3 trait elaboration not yet implemented",
+  "xfail_observed": "panicked",
+  "message": "unwrap called on None",
+  "span": {"file": "tests/test_traits.bl", "line": 40, "col": 9} }
+```
+
+Rules for `xfail_observed`:
+
+- It appears only when `expected_fail` is `true` and `status` is `"passed"`. It never appears on any other record.
+- Its value is the status the test would have had without `test.failing`. The values are two members of the status enum, `failed` and `panicked`, and never any other string. It is not a separate enum.
+- It agrees with the rest of the record: a record with `xfail_observed: "panicked"` carries the panic's `message`, and `span` when known.
+
+A consumer reads `xfail_observed` to find which kind of red a known failure had. It never needs to search `message` text for this.
 
 An **unexpected pass** (the test was expected to fail but actually passed) becomes a suite failure with `status: "failed"`:
 
