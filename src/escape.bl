@@ -919,6 +919,95 @@ fn emit_ffi_scope_escape(node: Int, tag: Int) ! Diag.Report {
     diag_source_file = saved
 }
 
+// ── E0601 scoped binding sent to a spawned task (CloseableEscapesScope) ──────
+// exit() or close() releases what a `with ... as` binding holds when its block
+// exits, and a spawned task can outlive the block, so no spawn may reach the
+// binding. Reads resolve to their binder through typecheck's record, so a
+// shadowing `let` of the same name is another value. A value copied out through
+// a field is data, not the binding, and may go.
+
+// Collects the with-as binders `node` reaches: the binding, a `let` alias of it,
+// or one a closure reads. `seen` stops a `let` whose value reads itself.
+fn with_binders_reached(node: Int, acc: List[Int], seen: List[Int]) {
+    if node == -1 { return }
+    let k = node_kind(node)
+    if k == NodeKind.Ident {
+        let binder = tc_ident_binder_node(node)
+        if binder < 0 || seen.contains(binder) { return }
+        seen.push(binder)
+        let bk = node_kind(binder)
+        if bk == NodeKind.WithResource {
+            acc.push(binder)
+        } else if bk == NodeKind.LetBinding {
+            with_binders_reached(node_value(binder), acc, seen)
+        }
+        return
+    }
+    if k == NodeKind.Closure {
+        for read in closure_read_idents(node) { with_binders_reached(read, acc, seen) }
+        return
+    }
+    if k == NodeKind.IfExpr {
+        with_binders_reached(node_then_body(node), acc, seen)
+        with_binders_reached(node_else_body(node), acc, seen)
+        return
+    }
+    if k == NodeKind.MatchExpr {
+        let arms_sl = node_arms(node)
+        if arms_sl == -1 { return }
+        let mut i = 0
+        while i < sublist_length(arms_sl) {
+            with_binders_reached(node_body(sublist_get(arms_sl, i)), acc, seen)
+            i = i + 1
+        }
+        return
+    }
+    if k == NodeKind.Block {
+        with_binders_reached(block_tail_node(node), acc, seen)
+        return
+    }
+    if k == NodeKind.ExprStmt {
+        with_binders_reached(node_value(node), acc, seen)
+    }
+}
+
+// `async.spawn(...)` with `async` not rebound by a local.
+fn is_async_spawn(node: Int) -> Bool {
+    if node_method(node) != "spawn" { return false }
+    let obj = node_obj(node)
+    if obj == -1 || node_kind(obj) != NodeKind.Ident { return false }
+    node_name(obj) == "async" && tc_ident_binder_node(obj) < 0
+}
+
+fn check_spawn_scoped_capture(node: Int) ! Diag.Report {
+    if !is_async_spawn(node) { return }
+    let args_sl = node_args(node)
+    if args_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(args_sl) {
+        let arg = sublist_get(args_sl, i)
+        let mut binders: List[Int] = []
+        let mut seen: List[Int] = []
+        with_binders_reached(arg, binders, seen)
+        for binder in binders { emit_spawn_scoped_capture(arg, binder) }
+        i = i + 1
+    }
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn emit_spawn_scoped_capture(node: Int, binder: Int) ! Diag.Report {
+    let saved = diag_source_file
+    diag_source_file = diag_file_for_node(node)
+    let name = node_name(binder)
+    diag_error_at(
+        "CloseableEscapesScope", CLOSEABLE_ESCAPES_SCOPE,
+        "`{name}` is scoped to its `with ... as` block and cannot be sent to a spawned task",
+        node,
+        "copy the data the task needs out of `{name}` before the spawn, or do the work inside the with block"
+    )
+    diag_source_file = saved
+}
+
 // Function-return escape: a returned value tagged with ANY still-live local
 // ffi.scope dangles once the function returns.
 fn check_ffi_ptr_return_escape(val_node: Int) ! Diag.Report {
@@ -1133,6 +1222,7 @@ fn walk_method_call(node: Int) ! Diag.Report {
             ai = ai + 1
         }
     }
+    check_spawn_scoped_capture(node)
     if node_method(node) == "write" && args_sl != -1 && sublist_length(args_sl) == 1 {
         let recv_tid = tc_lookup_node_tid(obj)
         if recv_tid >= 0 && tc_tid_kind(tc_resolve(recv_tid)) == TyKind.Ptr {
@@ -1539,6 +1629,16 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
     }
     if kind == NodeKind.WithBlock {
         walk_with_block(node, tail_flag)
+        return
+    }
+    // A spawn usually sits in an async.scope, so its captures are only checked
+    // if the walk reaches the scope's body.
+    if kind == NodeKind.AsyncScope {
+        walk_expr(node_body(node), 0)
+        return
+    }
+    if kind == NodeKind.AwaitExpr {
+        walk_expr(node_obj(node), 0)
         return
     }
 }

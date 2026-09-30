@@ -1,0 +1,198 @@
+// A `with ... as` binding lives only until its block exits: exit() or close() then
+// releases what it holds. A spawned task can outlive that, so a spawn closure must not
+// capture the binding, whether the closure is written in the call or bound to a name first.
+// The check follows the binding itself, not its spelling, so a shadowing `let` of the same
+// name is a different value and may be captured. A closure used synchronously and a value
+// copied out of the binding stay legal.
+
+import compile_test_helpers
+
+fn handler_prelude() -> Str {
+    #"
+import std.traits
+type Ctx { v: Int }
+type BH { x: Int }
+impl BlockHandler for BH {
+    type Context = Ctx
+    fn enter(self) -> Ctx { Ctx { v: 1 } }
+    fn exit(self, ok: Bool) { }
+}
+"#
+}
+
+fn expect_scoped_escape(out: Str, label: Str) {
+    compile_test_helpers.expect_error(out, "E0601", label)
+    compile_test_helpers.expect_contains(out, "CloseableEscapesScope", label)
+}
+
+test "a spawn closure that captures a BlockHandler context binding is rejected" {
+    let src = handler_prelude().concat(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        async.scope {
+            let _h = async.spawn(fn() { ctx.v })
+        }
+    }
+}
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "spawn_with_binder_direct")
+    expect_scoped_escape(out, "direct spawn capture of a context binding")
+}
+
+test "a spawn outside async.scope that captures a context binding is rejected" {
+    let src = handler_prelude().concat(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        let _h = async.spawn(fn() { ctx.v })
+    }
+}
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "spawn_with_binder_unscoped")
+    expect_scoped_escape(out, "spawn capture without async.scope")
+}
+
+test.failing(
+    "a named closure that captures a context binding is rejected when spawned",
+    reason: "typecheck rejects async.spawn of a local closure value with E0505 before the escape pass runs, so the capture is never checked",
+) {
+    let src = handler_prelude().concat(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        async.scope {
+            let f = fn() { ctx.v }
+            let _h = async.spawn(f)
+        }
+    }
+}
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "spawn_with_binder_named")
+    expect_scoped_escape(out, "named closure passed to spawn")
+}
+
+test "a spawn closure that captures the binding through a nested closure is rejected" {
+    let src = handler_prelude().concat(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        async.scope {
+            let _h = async.spawn(fn() {
+                let read = fn() { ctx.v }
+                read()
+            })
+        }
+    }
+}
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "spawn_with_binder_nested")
+    expect_scoped_escape(out, "capture through a nested closure")
+}
+
+test "a spawn closure that calls a named closure over the binding is rejected" {
+    let src = handler_prelude().concat(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        let read = fn() { ctx.v }
+        async.scope {
+            let _h = async.spawn(fn() { read() })
+        }
+    }
+}
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "spawn_with_binder_via_named")
+    expect_scoped_escape(out, "capture through a named closure the spawn calls")
+}
+
+test "a spawn closure that captures an alias of the binding is rejected" {
+    let src = handler_prelude().concat(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        let same = ctx
+        async.scope {
+            let _h = async.spawn(fn() { same.v })
+        }
+    }
+}
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "spawn_with_binder_alias")
+    expect_scoped_escape(out, "capture of an alias of the binding")
+}
+
+test "a spawn closure that captures a Closeable binding is rejected" {
+    let src = #"
+import std.traits
+type Res { n: Int }
+impl Closeable for Res {
+    fn close(self) { }
+}
+fn main() {
+    with Res { n: 4 } as r {
+        async.scope {
+            let _h = async.spawn(fn() { r.n })
+        }
+    }
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "spawn_with_binder_closeable")
+    expect_scoped_escape(out, "Closeable binding captured by spawn")
+}
+
+test "a shadowing let of the binding's name may be captured by a spawn" {
+    let src = handler_prelude().concat(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        let ctx = Ctx { v: ctx.v + 1 }
+        async.scope {
+            let h = async.spawn(fn() { ctx.v })
+            assert_eq(h.await, 2)
+        }
+    }
+}
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "spawn_with_binder_shadowed")
+    compile_test_helpers.expect_compiles_clean(out, "shadowed binding captured by spawn")
+}
+
+test "a same-named binding outside the with block may be captured by a spawn" {
+    let src = handler_prelude().concat(#"
+fn main() {
+    let ctx = Ctx { v: 7 }
+    with BH { x: 0 } as ctx {
+        assert_eq(ctx.v, 1)
+    }
+    async.scope {
+        let h = async.spawn(fn() { ctx.v })
+        assert_eq(h.await, 7)
+    }
+}
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "spawn_with_binder_outer_same_name")
+    compile_test_helpers.expect_compiles_clean(out, "outer binding of the same name captured by spawn")
+}
+
+test "a value copied out of the binding may be captured by a spawn" {
+    let src = handler_prelude().concat(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        let v = ctx.v
+        async.scope {
+            let h = async.spawn(fn() { v })
+            assert_eq(h.await, 1)
+        }
+    }
+}
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "spawn_with_binder_copied_value")
+    compile_test_helpers.expect_compiles_clean(out, "copied value captured by spawn")
+}
+
+test "a closure used synchronously inside the with block may capture the binding" {
+    let src = handler_prelude().concat(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        let xs = [1, 2, 3].map(fn(i) { i + ctx.v })
+        assert_eq(xs.get(0).unwrap(), 2)
+    }
+}
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "spawn_with_binder_sync_closure")
+    compile_test_helpers.expect_compiles_clean(out, "synchronous closure capturing the binding")
+}
