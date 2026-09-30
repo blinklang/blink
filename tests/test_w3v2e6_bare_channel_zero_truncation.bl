@@ -8,10 +8,10 @@
 //     let ch = channel.new[Int](buffer: 4); ch.send(5); ch.send(0); ch.send(7); ch.close()
 //     for v in ch { io.println("v={v}") }      // printed v=5 and stopped: 0 and 7 vanished
 //
-// The fallback now boxes the same 8-byte payload it used to send inline, so the address is
-// never NULL while the payload word, and every reinterpretation of it, is unchanged. The
-// fallback governs any channel whose element codegen boxes (a sent 0 among them). Every such
-// channel carries a KNOWN element: `channel.new[T](buffer: N)` writes it at the construction
+// A channel now keeps each element inline in its ring and reports closed-and-drained through
+// recv's own answer (an Option), never through the element's bits, so no value of the element
+// type can read as end-of-stream (sections/04_effects.md §4.13). Every channel carries a KNOWN
+// element: `channel.new[T](buffer: N)` writes it at the construction
 // site (sections/04_effects.md), and a bare `Channel` in a type position is
 // error[TypeArgArity] (E0303, sections/03_types.md §3.4), so no element-less channel reaches
 // codegen at all.
@@ -62,43 +62,42 @@ test "a mid-stream zero does not truncate the values behind it" {
 }
 
 // The mechanism, not just the outcome: a behavioral row alone would pass if the drain stopped
-// treating NULL as end-of-stream, which would break a genuinely closed channel instead.
-test "the channel send fallback boxes instead of reinterpreting the value as a pointer" {
+// treating NULL as end-of-stream, which would break a genuinely closed channel instead. The
+// element goes to the runtime by address, so neither a word cast nor a box per send remains.
+test "channel send passes the element by address, with no pointer cast and no box per send" {
     let src = "fn main() \{\n    let ch = channel.new[Int](buffer: 4)\n    ch.send(0)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n\}\n"
     let c = emit_c("box", src)
     assert(!c.contains("(intptr_t)"))
-    assert(c.contains("(int64_t*)blink_alloc(sizeof(int64_t));"))
+    assert(!c.contains("(int64_t*)blink_alloc(sizeof(int64_t));"))
+    assert(c.contains("blink_channel_send_value("))
 }
 
 // Controls that pin what must NOT move.
 
-test "the .recv() path on a channel still reads zero back" {
-    let src = "fn main() \{\n    let ch = channel.new[Int](buffer: 4)\n    ch.send(0)\n    ch.send(1)\n    ch.close()\n    io.println(\"a=\{ch.recv()\} b=\{ch.recv()\}\")\n\}\n"
+test "the .recv() path on a channel answers Some for a sent zero" {
+    let src = "fn main() \{\n    let ch = channel.new[Int](buffer: 4)\n    ch.send(0)\n    ch.send(1)\n    ch.close()\n    io.println(\"a=\{ch.recv() ?? -1\} b=\{ch.recv() ?? -1\}\")\n\}\n"
     let r = run_src("recv", src)
     assert_eq(r.exit_code, 0)
     assert(r.out.contains("a=0 b=1"))
 }
 
-// A closed, empty channel must still end the drain and still answer the element's zero value
-// through .recv(). Nothing is ever sent, so the annotation and the constructor are the only
-// places the element is named; the runtime property under test is unchanged. Boxing moves the
-// NULL test from the payload to the box address, so this is the row that proves the sentinel survived.
-test "a closed empty annotated channel still ends the drain and reads back zero" {
-    let src = "fn main() \{\n    let ch: Channel[Int] = channel.new[Int](buffer: 4)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n    io.println(\"drained\")\n    io.println(\"empty=\{ch.recv()\}\")\n\}\n"
+// A closed, empty channel must still end the drain, and .recv() on it answers None: closed is
+// a state of the channel, not a value of the element (sections/04_effects.md §4.13). Nothing is
+// ever sent, so the annotation and the constructor are the only places the element is named.
+test "a closed empty annotated channel ends the drain and recv answers None" {
+    let src = "fn main() \{\n    let ch: Channel[Int] = channel.new[Int](buffer: 4)\n    ch.close()\n    for v in ch \{ io.println(\"v=\{v\}\") \}\n    io.println(\"drained\")\n    match ch.recv() \{\n        Some(v) => io.println(\"empty=some \{v\}\")\n        None => io.println(\"empty=none\")\n    \}\n\}\n"
     let r = run_src("closed", src)
     assert_eq(r.exit_code, 0)
     assert(!r.out.contains("v="))
     assert(r.out.contains("drained"))
-    assert(r.out.contains("empty=0"))
+    assert(r.out.contains("empty=none"))
 }
 
-// The compiler's own shape (src/cli.bl): a 1-slot channel used as a mutable cell
-// whose stored value is legitimately 0. It worked before only because TWO bugs cancelled — the
-// payload 0 became NULL and .recv()'s NULL case answers the zero value — so it is correct by
-// accident on the old path and correct by construction on the new one. `blink test --parallel`'s
-// dot-column counter is this code.
+// The compiler's own shape (src/cli.bl): a 1-slot channel used as a mutable cell whose stored
+// value is legitimately 0. `blink test --parallel`'s dot-column counter is this code. The cell
+// always holds a value when it is read, so the reader unwraps.
 test "a one-slot channel used as a zero-valued mutable cell round-trips" {
-    let src = "fn main() \{\n    let cell = channel.new[Int](buffer: 1)\n    cell.send(0)\n    let a = cell.recv()\n    cell.send(a + 1)\n    let b = cell.recv()\n    cell.send(b + 1)\n    io.println(\"a=\{a\} b=\{b\} c=\{cell.recv()\}\")\n\}\n"
+    let src = "fn main() \{\n    let cell = channel.new[Int](buffer: 1)\n    cell.send(0)\n    let a = cell.recv().unwrap()\n    cell.send(a + 1)\n    let b = cell.recv().unwrap()\n    cell.send(b + 1)\n    io.println(\"a=\{a\} b=\{b\} c=\{cell.recv().unwrap()\}\")\n\}\n"
     let r = run_src("cell", src)
     assert_eq(r.exit_code, 0)
     assert(r.out.contains("a=0 b=1 c=2"))

@@ -67,7 +67,7 @@ import ir.{
 }
 import cg_expr.{
     lower_expr, lower_expr_as_value, cg_expr_async_scope_current, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
-    x_unbox_payload, x_layout_checked, lower_value_as_text, cg_expr_option_some, cg_expr_option_none,
+    x_unbox_payload, x_layout_checked, lower_value_as_text, cg_expr_option_some, cg_expr_option_none, cg_expr_option_wrap,
     x_is_c_comparable,
 }
 import cg_stmt.{enum_tag_word, lower_block_into}
@@ -713,17 +713,17 @@ pub fn cg_call_element_from_word(node: Int, elem_tid: Int, raw: Int) -> Int ! Di
 
 // The tail cg_call_element_from_runtime builds after its own runtime call, split out for a
 // caller that already holds the raw slot word as a value rather than as a call this stage
-// can build fresh -- a Channel's drained read has to compare that raw word against the
-// close sentinel before this decode runs, so the call and the decode cannot be one step.
+// can build fresh.
 fn cg_call_decode_element(node: Int, elem_tid: Int, shape: ElementShape, raw: Int) -> Int ! Diag.Report {
     let read = ir_cast(elem_tid, node, shape.slot.c_spelling, cc_from_slot_word(elem_tid, node, shape.slot, raw))
     if !shape.boxed { return read }
     ir_unbox(elem_tid, node, shape.value.c_spelling, shape.value.slot_form, read)
 }
 
-// One receive from a channel: the statement that takes the slot word into a local, the
-// test that is true when the runtime answered NULL, and the element decoded from the word.
-// The word is tested before it is decoded, so a NULL is never followed as a box.
+// One receive from a channel: the statement that declares the local the runtime copies the
+// element into, the test that is true when the runtime answered "closed and drained", and
+// the element read from that local. The answer comes back beside the element, never in it,
+// so no value a program sends can end a reader.
 pub type ChannelTake {
     take: Int
     closed: Int
@@ -739,16 +739,19 @@ fn cc_channel_take(node: Int, shape: ElementShape, channel: Int) -> ChannelTake 
     if cc_shape_stopped(shape) { return refused }
     let answer = cc_local(TYPE_BOOL, node)
     if cc_stopped(answer) { return refused }
-    let cell = container_slot_spelling()
-    let word = c_mint_local("recv")
-    let call = ir_call_runtime(shape.tid, node, cell, c_runtime_helper(channel_recv_op), SlotForm.InlineWord, [channel])
-    let take = ir_let(shape.tid, node, cell, word, SlotForm.InlineWord, call)
-    let closed = ir_binary(TYPE_BOOL, node, answer.c_spelling, "==",
-        ir_var_ref(shape.tid, node, cell, word, SlotForm.InlineWord), ir_const(TYPE_INT, node, cell, "0"))
-    let element = cg_call_decode_element(node, shape.tid, shape,
-        ir_var_ref(shape.tid, node, cell, word, SlotForm.InlineWord))
-    if element < 0 { return refused }
-    ChannelTake { take: take, closed: closed, element: element }
+    let elem = c_mint_local("recv")
+    let take = ir_let(shape.tid, node, shape.value.c_spelling, elem, shape.value.slot_form, -1)
+    let got = cc_channel_recv_call(node, shape, answer, channel, elem)
+    let closed = ir_unary(TYPE_BOOL, node, answer.c_spelling, "!", got)
+    ChannelTake { take: take, closed: closed, element: cc_temp_ref(node, shape.tid, shape.value, elem) }
+}
+
+// The runtime copies the next element into the named local and answers true, or answers
+// false once the channel is closed and drained and leaves the local as it was.
+fn cc_channel_recv_call(node: Int, shape: ElementShape, answer: LayoutRecord, channel: Int, elem: Str) -> Int {
+    let into = ir_unary(shape.tid, node, pointer_spelling(shape.value.c_spelling), "&",
+        cc_temp_ref(node, shape.tid, shape.value, elem))
+    ir_call_runtime(TYPE_BOOL, node, answer.c_spelling, c_runtime_helper(channel_recv_op), answer.slot_form, [channel, into])
 }
 
 // One walk over an Iterator: the statement that starts a cursor from the recipe, then per
@@ -864,16 +867,15 @@ fn cc_element_shape(node: Int, elem_tid: Int) -> ElementShape ! Diag.Report {
 
 fn cc_shape_stopped(shape: ElementShape) -> Bool { cc_stopped(shape.slot) }
 
-// The runtime reads a NULL slot as "closed and empty", so a Channel slot always holds a
-// box, even for an element that fits the word: an Int 0 or a false sent as the word itself
-// would end every reader. Send, recv and the for-in drain all take their shape from here.
+// A Channel's ring holds each element inline at the size of its local, and the runtime
+// copies it in and out by address, so nothing is boxed and the slot IS the local. The
+// constructor, send, recv and the for-in drain all take their shape from here, so the size
+// the ring was made with is the size every copy moves.
 fn cc_channel_shape(node: Int, elem_tid: Int) -> ElementShape ! Diag.Report {
     let value = cc_element_layout(node, elem_tid, Position.Local)
     if cc_stopped(value) { return ElementShape { tid: -1, slot: value, value: value, boxed: false } }
-    let slot = cc_element_checked(node, address_layout_of(elem_tid, Position.Local))
-    if cc_stopped(slot) { return ElementShape { tid: -1, slot: slot, value: slot, boxed: false } }
     ensure_typedef_for(elem_tid)
-    ElementShape { tid: elem_tid, slot: slot, value: value, boxed: true }
+    ElementShape { tid: elem_tid, slot: value, value: value, boxed: false }
 }
 
 // The shape of a call that stores nothing. It reads as stopped, and reports nothing on its
@@ -2497,8 +2499,8 @@ fn lower_builtin_static_call(node: Int, owner: Str, method: Str) -> Int ! Diag.R
 }
 
 // `channel.new[T](buffer: n)` is its own node, not a Call. Typecheck has refused every
-// argument shape but the one `buffer:` label, so the runtime constructor's one operand is
-// that label's value. This is the only way to a channel: typecheck refuses `Channel(n)` and
+// argument shape but the one `buffer:` label, so the runtime constructor takes that label's
+// value and the size of the element the ring holds inline. This is the only way to a channel: typecheck refuses `Channel(n)` and
 // `Channel.new(n)`, so the runtime constructor is not in the type-name table below.
 pub fn lower_channel_new(node: Int) -> Int ! Diag.Report {
     let answer = tid_of_node(node)
@@ -2510,7 +2512,21 @@ pub fn lower_channel_new(node: Int) -> Int ! Diag.Report {
     }
     let want = 1
     if operands.len() != want { return cc_ctor_arity_wrong(node, "channel", "new", want, operands.len()) }
-    cc_build_call_of(node, c_runtime_helper("channel_new"), NO_RECEIVER, CallForm.Runtime, false, operands)
+    let held = child_tid(answer, Slot.Inner1)
+    if held < 0 {
+        cc_element_type_unrecorded(node, TyKind.Channel)
+        return -1
+    }
+    let shape = cc_channel_shape(node, held)
+    if cc_shape_stopped(shape) { return -1 }
+    let rec = cc_local(answer, node)
+    if cc_stopped(rec) { return -1 }
+    let ints = cc_local(TYPE_INT, node)
+    if cc_stopped(ints) { return -1 }
+    let buffer = lower_expr_as_value(operands.get(0).unwrap())
+    if buffer < 0 { return -1 }
+    let size = ir_const(TYPE_INT, node, ints.c_spelling, "sizeof({shape.value.c_spelling})")
+    ir_call_runtime(answer, node, rec.c_spelling, c_runtime_helper(channel_new_op), rec.slot_form, [buffer, size])
 }
 
 // Everything the qualifier can name once the compiler's own constructors have declined.
@@ -3212,6 +3228,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let primitive = cc_runtime_method(kind, mname)
     if primitive != "" { return cc_lower_runtime_method(node, obj, kind, mname, primitive) }
     if kind == TyKind.Channel && cc_is_channel_recv(mname) { return cc_channel_recv(node, obj) }
+    if kind == TyKind.Channel && cc_is_channel_send(mname) { return cc_channel_send(node, obj) }
     let keyed = cc_keyed_row(kind, mname)
     if keyed.op != "" { return cc_lower_keyed_method(node, obj, kind, mname, keyed) }
     if cc_is_map_slot_method(kind, mname) { return cc_map_slot_method(node, obj, kind, mname) }
@@ -3535,7 +3552,6 @@ fn cc_runtime_method(kind: TyKind, method: Str) -> Str {
     }
     if kind == TyKind.Channel {
         let mut table: Map[Str, Str] = Map()
-        table.insert("send", "channel_send")
         table.insert("close", "channel_close")
         return table.get(method) ?? ""
     }
@@ -3548,7 +3564,6 @@ fn cc_runtime_method_arity(op: Str) -> Int {
     let mut table: Map[Str, Int] = Map()
     table.insert("list_push", 1)
     table.insert("list_set", 2)
-    table.insert("channel_send", 1)
     table.insert("channel_close", 0)
     table.get(op) ?? NO_ARITY
 }
@@ -3597,8 +3612,10 @@ fn cc_template_method(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
 }
 
 // The one entry point every receive calls, a direct `ch.recv()` and a for-in drain alike.
-let channel_recv_op = "channel_recv"
-let channel_recv_closed = "recv on a closed, empty channel"
+let channel_recv_op = "channel_recv_value"
+let channel_send_op = "channel_send_value"
+let channel_new_op = "channel_new_sized"
+let channel_send_closed = "send on a closed channel"
 
 fn cc_is_channel_recv(method: Str) -> Bool {
     let mut table: Map[Str, Bool] = Map()
@@ -3606,11 +3623,22 @@ fn cc_is_channel_recv(method: Str) -> Bool {
     table.get(method) ?? false
 }
 
-// `ch.recv()` answers the element itself, not an Option, so a channel that is closed and
-// empty has no value to give and panics. A zero value would read the same as a sent zero.
-fn cc_channel_recv(node: Int, obj: Int) -> Int ! Diag.Report {
+fn cc_is_channel_send(method: Str) -> Bool {
+    let mut table: Map[Str, Bool] = Map()
+    table.insert("send", true)
+    table.get(method) ?? false
+}
+
+// The runtime copies the element from an address, so the value is bound to a local first:
+// an rvalue has no address. A send on a closed channel panics inside the runtime, which
+// is handed the text naming this call's line.
+fn cc_channel_send(node: Int, obj: Int) -> Int ! Diag.Report {
     let given = sublist_length(node_args(node))
-    if given != 0 { return cc_intrinsic_arity_wrong(node, TyKind.Channel, "recv", 0, given) }
+    if given != 1 { return cc_intrinsic_arity_wrong(node, TyKind.Channel, "send", 1, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let result = cc_local(tid, node)
+    if cc_stopped(result) { return -1 }
     let container = tid_of_node(obj)
     if container < 0 { return -1 }
     let shape = cc_slot_shape(node, container, TyKind.Channel, Slot.Inner1)
@@ -3619,13 +3647,48 @@ fn cc_channel_recv(node: Int, obj: Int) -> Int ! Diag.Report {
     if cc_stopped(said) { return -1 }
     let receiver = lower_expr(obj)
     if receiver < 0 { return -1 }
-    let t = cc_channel_take(node, shape, receiver)
-    if t.element < 0 { return -1 }
-    cg_expr_push_pending(node, t.take)
+    let value = lower_expr_as_value(sublist_get(node_args(node), 0))
+    if value < 0 { return -1 }
+    let elem = c_mint_local("send")
+    cg_expr_push_pending(node, ir_let(shape.tid, node, shape.value.c_spelling, elem, shape.value.slot_form, value))
+    let from = ir_unary(shape.tid, node, pointer_spelling(shape.value.c_spelling), "&",
+        cc_temp_ref(node, shape.tid, shape.value, elem))
     let message = ir_const(TYPE_STR, node, said.c_spelling,
-        c_string_literal(cc_panic_message(node, channel_recv_closed)))
-    cg_expr_push_pending(node, ir_if(node, t.closed, ir_block(node, [ir_panic(node, message)]), -1))
-    t.element
+        c_string_literal(cc_panic_message(node, channel_send_closed)))
+    ir_call_runtime(tid, node, result.c_spelling, c_runtime_helper(channel_send_op), result.slot_form, [receiver, from, message])
+}
+
+// `ch.recv()` answers Some for each value sent and None once the channel is closed and
+// drained. The runtime's answer picks the arm, so the element local is read only when it
+// was filled.
+fn cc_channel_recv(node: Int, obj: Int) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, TyKind.Channel, "recv", 0, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let carrier = cc_local(tid, node)
+    if cc_stopped(carrier) { return -1 }
+    let container = tid_of_node(obj)
+    if container < 0 { return -1 }
+    let shape = cc_slot_shape(node, container, TyKind.Channel, Slot.Inner1)
+    if cc_shape_stopped(shape) { return -1 }
+    let answer = cc_local(TYPE_BOOL, node)
+    if cc_stopped(answer) { return -1 }
+    let receiver = lower_expr(obj)
+    if receiver < 0 { return -1 }
+    let _td = ensure_typedef_for(tid)
+    let elem = c_mint_local("recv")
+    cg_expr_push_pending(node, ir_let(shape.tid, node, shape.value.c_spelling, elem, shape.value.slot_form, -1))
+    let held = c_mint_local("recv")
+    cg_expr_push_pending(node, ir_let(tid, node, carrier.c_spelling, held, carrier.slot_form, -1))
+    let some = cg_expr_option_wrap(tid, node, cc_temp_ref(node, shape.tid, shape.value, elem))
+    if some < 0 { return -1 }
+    let none = cg_expr_option_none(tid, node, carrier)
+    if none < 0 { return -1 }
+    cg_expr_push_pending(node, ir_if(node, cc_channel_recv_call(node, shape, answer, receiver, elem),
+        ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), some)]),
+        ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), none)])))
+    cc_temp_ref(node, tid, carrier, held)
 }
 
 // ── Keyed containers ──────────────────────────────────────────────────────

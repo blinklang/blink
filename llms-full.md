@@ -406,6 +406,14 @@ time.sleep(duration)            // sleep for Duration
 async.scope { ... }             // synchronous scope for spawned tasks
 async.spawn(fn() { ... })       // spawn task, returns Handle
 
+// Channel[T]
+let ch = channel.new[Int](buffer: 8)  // bounded queue; the buffer size is required
+ch.send(v)                      // blocks while full; panics if ch is closed
+ch.recv()                       // -> Option[T]: Some(next value), None once closed AND drained
+ch.close()                      // a second close does nothing
+for v in ch { ... }             // one recv() per turn; ends on the first None
+let v = ch.recv() ?? 0          // handle the closed case; .unwrap() panics on it
+
 // Database (effect: DB) — stdlib module, requires `import std.db`
 // Connection: effect-handler scoped (no global state)
 with db.connect(path) {         // open SQLite DB, installs DB handler for scope (v0.35+)

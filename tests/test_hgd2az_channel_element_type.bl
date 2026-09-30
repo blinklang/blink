@@ -65,10 +65,9 @@ import compile_test_helpers.{compile_and_run}
 //   - `ch.send(x)` is still not CHECKED against the element type — `Channel[Int]` accepts a
 //     `Str`. That is br eg0p6y, the typecheck half. This ticket makes the type FLOW; it does
 //     not add the check, and a row asserting rejection here would be asserting eg0p6y.
-//   - `ch.recv()` on a CLOSED, EMPTY channel still yields the element's zero value. That is
-//     today's behaviour preserved on purpose: what it SHOULD do (Option[T]? panic?) is br
-//     yzan52, a `type:spec` question about a documented concurrency primitive, and not
-//     answerable by a codegen fix.
+//   - `ch.recv()` answers Option[T], None once the channel is closed and drained
+//     (sections/04_effects.md §4.13). These rows unwrap it because every one sends first;
+//     the closed case has its own tests.
 
 type Pt { x: Int, y: Int }
 
@@ -88,7 +87,7 @@ type Pt { x: Int, y: Int }
 test "an annotated Str channel round-trips in the corpus, where the sweep can see it" {
     let ch: Channel[Str] = channel.new[Str](buffer: 4)
     ch.send("direct")
-    assert_eq(ch.recv(), "direct")
+    assert_eq(ch.recv().unwrap(), "direct")
 }
 
 test "an annotated struct channel drains by value in the corpus" {
@@ -105,11 +104,11 @@ test "an annotated struct channel drains by value in the corpus" {
 test "channel.new[T] round-trips in the corpus" {
     let ch = channel.new[Str](buffer: 2)
     ch.send("spec")
-    assert_eq(ch.recv(), "spec")
+    assert_eq(ch.recv().unwrap(), "spec")
 }
 
 test "a Str element survives .recv()" {
-    let src = "fn main() \{\n    let ch: Channel[Str] = channel.new[Str](buffer: 4)\n    ch.send(\"hello\")\n    let got = ch.recv()\n    io.println(\"recv \{got}\")\n}\n"
+    let src = "fn main() \{\n    let ch: Channel[Str] = channel.new[Str](buffer: 4)\n    ch.send(\"hello\")\n    let got = ch.recv().unwrap()\n    io.println(\"recv \{got}\")\n}\n"
     let r = compile_and_run(src, "hgd2az_recv_str")
     assert_eq(r.exit_code, 0)
     assert(r.out.contains("recv hello"))
@@ -124,21 +123,21 @@ test "a Str element survives the spec's for-in drain" {
 }
 
 test "a Float element compiles and round-trips" {
-    let src = "fn main() \{\n    let ch: Channel[Float] = channel.new[Float](buffer: 2)\n    ch.send(1.5)\n    let f = ch.recv()\n    io.println(\"f=\{f}\")\n}\n"
+    let src = "fn main() \{\n    let ch: Channel[Float] = channel.new[Float](buffer: 2)\n    ch.send(1.5)\n    let f = ch.recv().unwrap()\n    io.println(\"f=\{f}\")\n}\n"
     let r = compile_and_run(src, "hgd2az_float")
     assert_eq(r.exit_code, 0)
     assert(r.out.contains("f=1.5"))
 }
 
 test "a struct element compiles and round-trips by value" {
-    let src = "type Pt \{ x: Int, y: Int }\n\nfn main() \{\n    let ch: Channel[Pt] = channel.new[Pt](buffer: 2)\n    ch.send(Pt \{ x: 1, y: 2 })\n    let p = ch.recv()\n    io.println(\"p=\{p.x},\{p.y}\")\n}\n"
+    let src = "type Pt \{ x: Int, y: Int }\n\nfn main() \{\n    let ch: Channel[Pt] = channel.new[Pt](buffer: 2)\n    ch.send(Pt \{ x: 1, y: 2 })\n    let p = ch.recv().unwrap()\n    io.println(\"p=\{p.x},\{p.y}\")\n}\n"
     let r = compile_and_run(src, "hgd2az_struct")
     assert_eq(r.exit_code, 0)
     assert(r.out.contains("p=1,2"))
 }
 
 test "a Bool element prints as a Bool, not as its integer encoding" {
-    let src = "fn main() \{\n    let ch: Channel[Bool] = channel.new[Bool](buffer: 2)\n    ch.send(true)\n    let b = ch.recv()\n    io.println(\"b=\{b}\")\n}\n"
+    let src = "fn main() \{\n    let ch: Channel[Bool] = channel.new[Bool](buffer: 2)\n    ch.send(true)\n    let b = ch.recv().unwrap()\n    io.println(\"b=\{b}\")\n}\n"
     let r = compile_and_run(src, "hgd2az_bool")
     assert_eq(r.exit_code, 0)
     assert(r.out.contains("b=true"))
@@ -159,7 +158,7 @@ test "sending 0 does not truncate a for-in drain" {
 // The spec's own constructor spelling (04_effects.md:1751), where the element type is written
 // at the construction site and needs no annotation and no inference.
 test "channel.new[T] carries its explicit type argument to the seams" {
-    let src = "fn main() \{\n    let ch = channel.new[Str](buffer: 4)\n    ch.send(\"hello\")\n    let got = ch.recv()\n    io.println(\"new \{got}\")\n}\n"
+    let src = "fn main() \{\n    let ch = channel.new[Str](buffer: 4)\n    ch.send(\"hello\")\n    let got = ch.recv().unwrap()\n    io.println(\"new \{got}\")\n}\n"
     let r = compile_and_run(src, "hgd2az_channel_new_str")
     assert_eq(r.exit_code, 0)
     assert(r.out.contains("new hello"))
@@ -168,7 +167,7 @@ test "channel.new[T] carries its explicit type argument to the seams" {
 // A binding with no annotation: the element reaches the seams only through the constructor's
 // own type argument.
 test "the unannotated Int channel keeps working" {
-    let src = "fn main() \{\n    let ch = channel.new[Int](buffer: 4)\n    ch.send(7)\n    ch.send(8)\n    io.println(\"a=\{ch.recv()} b=\{ch.recv()}\")\n}\n"
+    let src = "fn main() \{\n    let ch = channel.new[Int](buffer: 4)\n    ch.send(7)\n    ch.send(8)\n    io.println(\"a=\{ch.recv().unwrap()} b=\{ch.recv().unwrap()}\")\n}\n"
     let r = compile_and_run(src, "hgd2az_bare_int")
     assert_eq(r.exit_code, 0)
     assert(r.out.contains("a=7 b=8"))
@@ -178,7 +177,7 @@ test "the unannotated Int channel keeps working" {
 // seams through the PARAMETER's tid, not through the initializer's, and those are different
 // ScopeVar construction sites.
 test "a Str channel passed as a parameter keeps its element type" {
-    let src = "fn feed(ch: Channel[Str]) \{\n    ch.send(\"via param\")\n}\n\nfn main() \{\n    let ch: Channel[Str] = channel.new[Str](buffer: 2)\n    feed(ch)\n    io.println(\"p \{ch.recv()}\")\n}\n"
+    let src = "fn feed(ch: Channel[Str]) \{\n    ch.send(\"via param\")\n}\n\nfn main() \{\n    let ch: Channel[Str] = channel.new[Str](buffer: 2)\n    feed(ch)\n    io.println(\"p \{ch.recv().unwrap()}\")\n}\n"
     let r = compile_and_run(src, "hgd2az_param_str")
     assert_eq(r.exit_code, 0)
     assert(r.out.contains("p via param"))
