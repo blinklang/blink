@@ -2199,6 +2199,47 @@ BLINK_RT_FN int64_t blink_str_char_at(const char* s, int64_t i) {
 }
 #endif
 
+/* One step of a for-in over a Str: decodes the scalar value at byte *pos into *out, moves
+ * *pos past it and returns 1, or returns 0 at the terminating NUL. A Str is valid UTF-8 by
+ * the spec, but FFI and Bytes.to_str can still hand in overlong forms, surrogates or cut
+ * sequences, and a Char must be a scalar value, so each maximal ill-formed subpart reads as
+ * one U+FFFD. The decoder never reads a byte past the NUL. */
+BLINK_RT_FN int blink_str_next_char(const char* s, int64_t* pos, int32_t* out);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_str_next_char(const char* s, int64_t* pos, int32_t* out) {
+    const unsigned char* p = (const unsigned char*)s + *pos;
+    unsigned char c = p[0];
+    if (c == 0) { return 0; }
+    if (c < 0x80) { *out = (int32_t)c; *pos += 1; return 1; }
+    int32_t need;
+    int32_t cp;
+    unsigned char lo = 0x80, hi = 0xBF;
+    if (c >= 0xC2 && c <= 0xDF) { need = 1; cp = c & 0x1F; }
+    else if (c >= 0xE0 && c <= 0xEF) {
+        need = 2; cp = c & 0x0F;
+        if (c == 0xE0) { lo = 0xA0; }
+        if (c == 0xED) { hi = 0x9F; }
+    }
+    else if (c >= 0xF0 && c <= 0xF4) {
+        need = 3; cp = c & 0x07;
+        if (c == 0xF0) { lo = 0x90; }
+        if (c == 0xF4) { hi = 0x8F; }
+    }
+    else { *out = 0xFFFD; *pos += 1; return 1; }
+    int32_t i = 1;
+    while (i <= need) {
+        unsigned char b = p[i];
+        if (b < lo || b > hi) { *out = 0xFFFD; *pos += i; return 1; }
+        cp = (cp << 6) | (b & 0x3F);
+        lo = 0x80; hi = 0xBF;
+        i++;
+    }
+    *out = cp;
+    *pos += need + 1;
+    return 1;
+}
+#endif
+
 BLINK_RT_FN const char* blink_str_substr(const char* s, int64_t start, int64_t len);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_str_substr(const char* s, int64_t start, int64_t len) {
