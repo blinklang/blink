@@ -237,7 +237,7 @@ The self-hosting compiler (`src/codegen_types.bl`, `src/codegen_expr.bl`) curren
 | E0502 | QuestionMarkInvalidOperand | `codegen_expr.bl` — `?` operator type check (to move to typecheck phase) |
 | E0513 | CoalesceRequiresOption | `codegen_expr.bl` — `??` operator type check |
 | E0827 | SkipOutsideTest | `typecheck.bl` — rejects `skip()` outside a test body (via the §2.20 test-only symbol fence) |
-| E0835 | XfailMissingReason | `typecheck.bl` — rejects `test.failing(...)` with an empty `reason:` or `ticket:` |
+| E0835 | XfailMissingReason | `typecheck.bl` — rejects `test.failing(...)` with a missing or empty `reason:` |
 | E0508 | QuestionMarkResultInNonResult | `codegen_expr.bl` — `?` on Result in non-Result function |
 | E0509 | QuestionMarkOptionInNonOption | `codegen_expr.bl` — `?` on Option in non-Option function |
 | E0512 | QuestionMarkErrorMismatch | Not yet implemented — requires type checker |
