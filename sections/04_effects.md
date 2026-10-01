@@ -1048,7 +1048,7 @@ This is the one normative statement of these rules. §9.1 (*`@effects`*, *`@trus
 
 ### 4.6 Effects on `main`
 
-`main` is the root of the capability tree. It implicitly holds all effects:
+`main` is the root of the capability tree. It implicitly holds all effects. The root has a handler for each built-in effect (§4.3), and those are the capabilities `main` holds. A user-declared effect has no root handler (§4.12): `main` must discharge it with `with`, or the program does not compile (see *Unhandled user effects* below).
 
 ```blink
 // Valid -- main implicitly has all effects
@@ -1071,6 +1071,47 @@ fn main() ! IO.Print, FS.Read, DB.Read {
 The LSP displays `main`'s actual effect set as an inlay hint, computed from the transitive closure of everything `main` calls. If `main` only calls pure functions and one `io.print`, the hint shows `! IO.Print` -- not "all effects." This is documentation, not enforcement.
 
 **Why implicit on `main`:** Requiring `main` to declare effects is pure ceremony. `main` is the program. Its effect set is "whatever the program does." An explicit annotation on `main` would just be a worse version of what the compiler already computes. Every other public function must declare effects explicitly -- `main` is the single exception.
+
+#### Unhandled user effects
+
+A user-declared effect that reaches `main`'s body with no `with` that discharges it is a compile error, `UnhandledEffect` (E0539). The check uses the effect rows the type checker infers (§4.5, §4.15), closures and `! _` rows included, and the same discharge rule as `with` (§4.7, and §4.6.3 *Scoped effect handlers* for a `BlockHandler` whose `Context` is `Handler[E]`). Test blocks are the other root, and the same code reports them (§2.20).
+
+```blink
+effect Store {
+    fn get(key: Str) -> Int
+}
+
+fn load() -> Int ! Store {
+    store.get("count")
+}
+
+// COMPILE ERROR: nothing discharges `Store`
+fn main() {
+    io.println("{load()}")
+}
+```
+
+```
+error[UnhandledEffect]: unhandled effect `Store` in `main`
+  --> src/app.bl:11:18
+   |
+11 |     io.println("{load()}")
+   |                  ^^^^^^ `load` requires `! Store`
+   |
+   = help: user-declared effects have no root handler; wrap the call in `with <handler> { ... }` (§4.12)
+```
+
+The fix installs a handler:
+
+```blink
+fn main() {
+    with memory_store() {
+        io.println("{load()}")
+    }
+}
+```
+
+The check runs at compile time, so it cannot see every operation. A handler may be partial, and an operation it omits can still find no handler at run time. That operation panics (§4.7.1 *Completeness and auto-delegation*).
 
 ---
 
@@ -1656,6 +1697,30 @@ The compiler desugars the above as if `write` and `admin` were defined with `def
 
 Auto-delegation means a `Handler[DB]` that only overrides `read` is still a complete `Handler[DB]` — the type system does not distinguish partial from total handlers. At runtime, unhandled operations bubble up to the nearest enclosing handler that implements them.
 
+When no enclosing handler implements the operation, the operation panics. This happens when a partial handler omits it and no outer handler implements it, or when a handler calls `default.op(args)` with no outer handler. The compile-time check at the roots (§4.6 *Unhandled user effects*, §2.20) does not rule this out, because it sees a partial handler as a complete one:
+
+```blink
+effect Cache {
+    fn get(key: Str) -> Option[Int]
+    fn put(key: Str, value: Int)
+}
+
+fn read_only_cache() -> Handler[Cache] {
+    handler Cache {
+        fn get(key: Str) -> Option[Int] { None }
+        // put omitted -- auto-delegates, but no outer handler implements it
+    }
+}
+
+fn main() {
+    with read_only_cache() {
+        cache.put("hits", 1)   // panics: no handler for `cache.put`
+    }
+}
+```
+
+The operation never returns and never produces a default value, whatever its return type, `-> Never` included. The panic message contains the operation as a program calls it, `<handle>.<op>` (here `cache.put`; handles are described in §4.4). The rest of the message and the source location are not specified, so a test matches on the operation: `assert_panics(matching: "cache.put") { ... }` (§2.20).
+
 #### Generic handler parameters
 
 In v1, handler type parameters must be concrete effects: `Handler[DB]`, `Handler[IO]`, `Handler[Net.Connect]`. Effect-kinded generic parameters (e.g., `fn foo[E: Effect](h: Handler[E])`) are deferred to v2, alongside named effect variables.
@@ -1939,7 +2004,7 @@ A function declaring `! Metrics.Emit` gets `metrics.counter(...)`, `metrics.gaug
 
 **Standard library handlers:**
 
-The standard library ships default handlers for built-in effects (real filesystem, real network, real database drivers). User-defined effects have no default handler -- you must provide one. This is intentional: the compiler forces you to explicitly wire up your domain effects, making the architecture visible.
+The standard library ships default handlers for built-in effects (real filesystem, real network, real database drivers). User-defined effects have no default handler -- you must provide one. This is intentional: the compiler forces you to explicitly wire up your domain effects, making the architecture visible. A user-defined effect that reaches `main` or a test block with no `with` that discharges it is `UnhandledEffect` (E0539, §4.6 *Unhandled user effects*). No operation answers a default value: an operation that finds no handler at run time panics (§4.7.1 *Completeness and auto-delegation*).
 
 ```blink
 fn main() {
@@ -1987,6 +2052,8 @@ fn load_dashboard(user_id: UserId) -> Dashboard ! Async, Http {
 ```
 
 `async.spawn` returns a `Handle[T]` — an opaque value representing a running task. `handle.await` is a method on `Handle[T]` that suspends the current task until the spawned task completes and returns its result. The compiler recognizes `.await` as a suspension point and requires `! Async` in the function's effect declaration.
+
+A spawned task performs effect operations with the handlers in force at its `async.spawn` site. Spawn is not a root: the closure's row is part of its caller's row (§4.15.4), so the check in §4.6 *Unhandled user effects* covers operations the task performs.
 
 **Why `handle.await` and not `async.join(handle)`:**
 
