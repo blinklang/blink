@@ -1359,7 +1359,7 @@ test "all rows parse" {
         // E0508: `?` inside a closure returning `()`.
         // Fix: change closure return to Result, or call .unwrap() / match.
         let n = parse_int(raw)?
-        assert_eq(n.to_str().len(), 1, label)
+        assert_eq(n.display().len(), 1, label)
     })
 }
 ```
@@ -1373,7 +1373,7 @@ fn parse_port(s: Str) -> Result[Int, ParseError] { /* ... */ }
 
 test "port strings round-trip" {
     prop_check(fn(p: Int) {
-        let s = p.to_str()
+        let s = p.display()
         let back = parse_port(s)?           // Err here = property failed for this input
         assert_eq(back, p)
     })
@@ -1388,7 +1388,7 @@ test "let-bound property closure is not elaborated" {
     // the direct argument of `prop_check`, so it is not elaborated.
     // Fix: inline the closure into the prop_check(...) call.
     let prop = fn(p: Int) {
-        let back = parse_port(p.to_str())?
+        let back = parse_port(p.display())?
         assert_eq(back, p)
     }
     prop_check(prop)
