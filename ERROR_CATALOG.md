@@ -121,6 +121,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | ArenaClosureUnsupportedCapture | E0702d | Closure-tail capture kind unsupported by descriptor walker | Arena | §5.2 |
 | SealedMethodOverride | E0731 | `impl` overrides a trait default method declared `final` | Trait sealing | §3.6 |
 | FinalRequiresBody | E0732 | `final` modifier applied to a body-less (required) trait method | Trait sealing | §3.6 |
+| QualifiedHeadNotTrait | E0740 | The left side of `for` in an impl-qualified call head `(Trait for Type)` does not name a trait. When the left side is a type and the right side is a trait, the note says which side is the trait and the help gives the swapped head; otherwise the help suggests no swap | Method resolution | §3c.4 |
 | FfiFunctionPublic | E0801 | FFI function cannot be `pub` | FFI | §9.1 |
 | FfiNoEffects | E0802 | `@ffi` function declares no effects | FFI | §9.1 |
 | ContractOnFfi | E0803 | `@requires`/`@ensures` not allowed on `@ffi` function | FFI | §9.1, §3b |
