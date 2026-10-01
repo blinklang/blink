@@ -258,7 +258,15 @@ All pointer operations are methods on `Ptr[T]` and compiler-known functions in t
 2. the body of an `@trusted` function;
 3. a `with ffi.scope() as _ { }` block (§9.1.1, *`ffi.scope`* — the block that owns the pointer's lifetime).
 
-The region is a **purely syntactic**, per-function structural property, decided without type resolution. A closure literal written inside a region **inherits** it — the pointer operations stay legal in the closure body. A **named** nested `fn` item does **not** inherit the enclosing region: it is its own function and needs its own `@ffi`/`@trusted` annotation or its own `ffi.scope` block. A pointer that *escapes* its region dynamically — returned, stored past it, captured by an escaping closure, passed to an effect handler, or passed beside a pointer-holding argument — is not E0811's concern; that is the scope-escape diagnostic E0601 (§9.1.1, *Scope tags*).
+The region is a **purely syntactic**, per-function structural property, decided without type resolution. A term that closes over its lexical environment inherits the region; an item does not:
+
+- A closure literal written inside a region **inherits** it — the pointer operations stay legal in the closure body.
+- A `fn` clause in a `handler E { }` expression written inside a region **inherits** it, the same as a closure literal. A handler clause is a member of an expression value that captures its environment the same way a closure does (§4.7, *Basic handler syntax*), not an item: you cannot call, import or refer to it by name.
+- A **named** nested `fn` item does **not** inherit the enclosing region: it is its own function and needs its own `@ffi`/`@trusted` annotation or its own `ffi.scope` block. Blink does not parse named nested `fn` items today; this rule fixes their region behavior in advance, and it does not apply to handler clauses.
+
+**E0811 covers bodies, not only signatures.** E0811 rejects a `Ptr[T]` (or an `@ffi.struct` that holds a `Ptr` field) at every site outside a region: a parameter or return type, a `let` annotation, and every expression in a function body whose checked type is a `Ptr[T]`. Whether a site is in a region is syntactic; whether an expression is a `Ptr` comes from its checked type. So a `p.deref()` in an ordinary function, outside every region, does not compile.
+
+A pointer that *escapes* its region dynamically — returned, stored past it, captured by an escaping closure, passed to an effect handler, or passed beside a pointer-holding argument — is not E0811's concern; that is the scope-escape diagnostic E0601 (§9.1.1, *Scope tags*).
 
 An `@ffi.struct` type with a `Ptr` field, directly or through a nested `@ffi.struct` field, is subject to E0811 exactly as `Ptr[T]` is (§9.1.3).
 
@@ -1162,9 +1170,40 @@ pub fn open(path: Str) -> Option[Connection] ! IO {
 }
 ```
 
-`out.deref()` returns a bare `Sqlite3` (deref on a non-`Void` pointer is legal — E0825 rejects only `Ptr[Void]`, §9.1.1). Round-tripping a handle *back* to a raw pointer to hand to another C call is likewise confined to an FFI region (E0811, §9.1.1); because the handle has no `.addr()` in ordinary code, it cannot be fabricated or re-crossed outside the boundary.
+`out.deref()` returns a bare `Sqlite3` (deref on a non-`Void` pointer is legal — E0825 rejects only `Ptr[Void]`, §9.1.1). Round-tripping a handle *back* to a raw pointer to hand to another C call is likewise confined to an FFI region (E0811, §9.1.1): you store the handle into a `Ptr` cell with `.write(h)`, and the C call takes the cell. The `.write` is the crossing. The C call that then takes the cell is an ordinary consume, which the declaration's audit record already covers. Because the handle has no `.addr()` in ordinary code, it cannot be fabricated or re-crossed outside the boundary.
 
-Every boundary crossing that produces or consumes an opaque handle is tagged with the `blink audit` category **`opaque-ffi-handle`**, so the FFI inventory (§9.1, *`blink audit`*) lists them alongside pointer allocations and `Raw()` sites. The crossings the audit tags are exactly those lexically inside an FFI region (E0811, above): a **mint** is a `Ptr[opaque].deref()` in such a region, a **round-trip** is a handle handed back to raw there. Because both the audit and E0811 read the same region set, a site cannot compile as legal yet slip the audit — the region predicate has one definition.
+#### Audit category `opaque-ffi-handle`
+
+Every boundary crossing that produces or consumes an opaque handle is tagged with the `blink audit` category **`opaque-ffi-handle`**, so the FFI inventory (§9.1, *`blink audit`*) lists them alongside pointer allocations and `Raw()` sites. The audit records two kinds of crossing.
+
+**Declaration records.** For each `@ffi` declaration, a parameter whose type is `H` or `Option[H]` is a **consume** crossing, and an opaque return type or a `Ptr` out-cell parameter whose pointee contains `H` (defined below) is a **produce** crossing. The audit records these once per declaration, not once per call. Passing a handle by value to an `@ffi` function is therefore not a body site: the handle is the C pointer, so nothing goes back to raw memory, and the call may sit in ordinary code.
+
+**Body sites.** Inside an FFI region (§9.1.1, *Pointer Operations*), and only there:
+
+- a **mint** (direction `produce`) is a `.deref()` or `.read()` that loads a value whose type is or contains an `@ffi.opaque` type `H`;
+- a **round-trip** (direction `consume`) is a `.write(v)` that stores such a value.
+
+A type **contains** `H` when it is `H`, `Option[H]`, or an `@ffi.struct` with a field whose type contains `H`, at any depth. Type aliases resolve first. The walk stops at `Ptr`: a `Ptr[H]` is a pointer, not a handle, so loading one is not a mint. The form of the receiver does not matter. A binder, a field projection `p.field`, an `.offset(i)` element, an index, a call result, and a `match` or `for` binder all count. A site that loads or stores more than one handle type gets one tag for each distinct `H`. (Today only the `H` case can occur: `Ptr[Option[H]]` is not a valid `Ptr` type (E0810, §9.1.1), and §9.1.3 does not allow an `@ffi.opaque` field in an `@ffi.struct`. The rule names the `Option` and struct cases so that a later change to those rules cannot open a gap in the audit.)
+
+```blink
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi("shim", "register_stream")
+@trusted(audit: "P-2")
+fn c_register(cell: Ptr[CFile]) -> Int ! IO   // declaration record: produce (out-cell)
+
+pub fn hand_back(h: CFile) -> CFile ! IO {
+    with ffi.scope() as scope {
+        let cell = scope.alloc[CFile]()
+        cell.write(h)             // round-trip: CFile stored into raw memory
+        c_register(cell)          // no body tag: the declaration record covers it
+        cell.deref()              // mint: CFile loaded from raw memory
+    }
+}
+```
+
+**Completeness.** The audit and E0811 share one region predicate, which is syntactic (§9.1.1). Whether a site loads or stores a handle is a type question, so the audit classifies each site from its checked type, not from the shape of the code. `blink audit` therefore typechecks the program first. If the program does not typecheck, the audit prints the type errors, says that it needs a program that typechecks, and exits non-zero; it does not print a partial inventory. The contract is exact: for every program that compiles, the audit tags every mint and round-trip site exactly once for each handle type, and tags nothing else. Because E0811 also covers function bodies (§9.1.1), no such site can compile outside a region, so none can slip the audit.
 
 #### Choosing among the three FFI type mechanisms
 
