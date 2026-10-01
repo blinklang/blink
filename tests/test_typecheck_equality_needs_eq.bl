@@ -1,0 +1,189 @@
+// `==` and `!=` need `Eq` on the operand type, and the check recurses through the type
+// (sections/03_types.md, *Container Equality*): `Option[T]` is `Eq` only when `T` is,
+// `Result[T, E]` only when both are, and an enum with no `Eq` impl or derive only when
+// every payload is. A failed check names the innermost type with no `Eq`, gives the chain
+// to it, and offers `@derive(Eq)` on a user type and `.is_none()` only against a bare
+// `None` literal.
+//
+// List, Set, Map, tuples and a payload enum with no derive are `Eq` by the spec, but code
+// generation cannot compare them yet. Their `==` is refused with its own wording, so it is
+// never compiled into an identity compare or a compiler crash.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    init_embedded_stdlib()
+    let path = "/tmp/zz_eqneeds_{stem}.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out = out.concat("{d.name}: {d.message}\n")
+            for n in d.notes { out = out.concat("note: {n}\n") }
+            if d.help != "" { out = out.concat("help: {d.help}\n") }
+        }
+    }
+    out
+}
+
+fn assert_has(stem: Str, errs: Str, want: Str) {
+    if !errs.contains(want) { io.println("FAIL: {stem}: want '{want}', got:\n{errs}") }
+    assert(errs.contains(want))
+}
+
+fn assert_lacks(stem: Str, errs: Str, unwanted: Str) {
+    if errs.contains(unwanted) { io.println("FAIL: {stem}: did not want '{unwanted}', got:\n{errs}") }
+    assert(!errs.contains(unwanted))
+}
+
+fn assert_accepted(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let errs = probe(stem, src)
+    if errs != "" { io.println("FAIL: {stem}: unexpected diagnostics:\n{errs}") }
+    assert(errs == "")
+}
+
+// Only the first error matters to these rows; the probe source has one comparison.
+fn assert_not_eq(stem: Str, src: Str, operand: Str, chain: Str, help: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let errs = probe(stem, src)
+    assert_has(stem, errs, "TypeError: `{operand}` does not implement `Eq`")
+    if chain != "" { assert_has(stem, errs, chain) }
+    assert_has(stem, errs, help)
+    assert_lacks(stem, errs, "incompatible types")
+    assert_lacks(stem, errs, "not supported yet")
+}
+
+fn assert_not_built(stem: Str, src: Str, operand: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let errs = probe(stem, src)
+    assert_has(stem, errs, "TypeError: `==` on `{operand}` is not supported yet")
+    assert_lacks(stem, errs, "incompatible types")
+    assert_lacks(stem, errs, "does not implement `Eq`")
+}
+
+fn widget_decl() -> Str {
+    "type Widget \{ id: Int }\n\n"
+}
+
+fn compare_src(decls: Str, ty: Str, a: Str, b: Str, op: Str) -> Str {
+    "{decls}fn main() \{\n    let a: {ty} = {a}\n    let b: {ty} = {b}\n    let same = a {op} b\n    io.println(\"\{same}\")\n}\n"
+}
+
+test "Option over a struct with no Eq names the struct and offers derive" {
+    let src = compare_src(widget_decl(), "Option[Widget]", "Some(Widget \{ id: 1 })", "None", "==")
+    assert_not_eq("opt_widget", src, "Option[Widget]", "`Option[Widget]` is `Eq` only if `Widget` is `Eq`",
+        "add `@derive(Eq)` to `type Widget`")
+    assert_lacks("opt_widget", probe("opt_widget2", src), "is_none")
+}
+
+test "!= on an Option over a struct with no Eq is refused the same way" {
+    let src = compare_src(widget_decl(), "Option[Widget]", "Some(Widget \{ id: 1 })", "None", "!=")
+    assert_not_eq("opt_widget_ne", src, "Option[Widget]", "", "add `@derive(Eq)` to `type Widget`")
+}
+
+test "== None on an Option with no Eq offers is_none" {
+    let src = "{widget_decl()}fn main() \{\n    let found: Option[Widget] = None\n    let gone = found == None\n    io.println(\"\{gone}\")\n}\n"
+    assert_not_eq("none_lit", src, "Option[Widget]", "", "write `found.is_none()`")
+}
+
+test "!= None on an Option with no Eq offers is_some" {
+    let src = "{widget_decl()}fn main() \{\n    let found: Option[Widget] = None\n    let here = found != None\n    io.println(\"\{here}\")\n}\n"
+    assert_not_eq("none_lit_ne", src, "Option[Widget]", "", "write `found.is_some()`")
+}
+
+test "Result with an error type that has no Eq names that type" {
+    let src = compare_src(widget_decl(), "Result[Int, Widget]", "Ok(1)", "Ok(2)", "==")
+    assert_not_eq("res_widget", src, "Result[Int, Widget]", "`Result[Int, Widget]` is `Eq` only if `Widget` is `Eq`",
+        "add `@derive(Eq)` to `type Widget`")
+}
+
+test "the chain runs from the operand type to the innermost type with no Eq" {
+    let src = compare_src(widget_decl(), "Option[Option[Widget]]", "None", "None", "==")
+    assert_not_eq("nested", src, "Option[Option[Widget]]", "`Option[Option[Widget]]` is `Eq` only if `Option[Widget]` is `Eq`",
+        "add `@derive(Eq)` to `type Widget`")
+    assert_has("nested", probe("nested2", src), "`Option[Widget]` is `Eq` only if `Widget` is `Eq`")
+}
+
+test "a List over a struct with no Eq is refused for the struct, not as unbuilt" {
+    let src = compare_src(widget_decl(), "List[Widget]", "[]", "[]", "==")
+    assert_not_eq("list_widget", src, "List[Widget]", "`List[Widget]` is `Eq` only if `Widget` is `Eq`",
+        "add `@derive(Eq)` to `type Widget`")
+}
+
+test "an enum with no derive whose payload has no Eq names the payload type" {
+    let decls = "{widget_decl()}type Slot \{\n    Held(w: Widget)\n    Empty\n}\n\n"
+    let src = compare_src(decls, "Slot", "Slot.Empty", "Slot.Empty", "==")
+    assert_not_eq("enum_payload", src, "Slot", "`Slot` is `Eq` only if `Widget` is `Eq`",
+        "add `@derive(Eq)` to `type Widget`")
+}
+
+test "Option over a type parameter needs the Eq bound" {
+    let src = "fn same[T](a: Option[T], b: Option[T]) -> Bool \{ a == b }\n\nfn main() \{\n    io.println(\"\{same(Some(1), Some(1))}\")\n}\n"
+    assert_not_eq("generic_opt", src, "Option[T]", "`Option[T]` is `Eq` only if `T` is `Eq`", "`[T: Eq]`")
+}
+
+test "== on a List is refused as not supported yet" {
+    assert_not_built("list", compare_src("", "List[Int]", "[1]", "[1]", "=="), "List[Int]")
+}
+
+test "== on a Set is refused as not supported yet" {
+    assert_not_built("set", compare_src("", "Set[Int]", "Set()", "Set()", "=="), "Set[Int]")
+}
+
+test "== on a Map is refused as not supported yet" {
+    assert_not_built("map", compare_src("", "Map[Str, Int]", "Map()", "Map()", "=="), "Map[Str, Int]")
+}
+
+test "== on a tuple is refused as not supported yet" {
+    assert_not_built("tuple", compare_src("", "(Int, Int)", "(1, 2)", "(1, 2)", "=="), "(Int, Int)")
+}
+
+test "== on an Option over a List is refused as not supported yet" {
+    assert_not_built("opt_list", compare_src("", "Option[List[Int]]", "Some([1])", "None", "=="), "Option[List[Int]]")
+}
+
+test "== on an enum with Eq payloads and no derive is refused as not supported yet" {
+    let decls = "type Shape \{\n    Circle(r: Int)\n    Dot\n}\n\n"
+    assert_not_built("enum_eq_payload", compare_src(decls, "Shape", "Shape.Dot", "Shape.Dot", "=="), "Shape")
+}
+
+test "Option and Result over Eq types compare" {
+    assert_accepted("opt_int", compare_src("", "Option[Int]", "Some(1)", "None", "=="))
+    assert_accepted("opt_int_ne", compare_src("", "Option[Int]", "Some(1)", "None", "!="))
+    assert_accepted("res_int_str", compare_src("", "Result[Int, Str]", "Ok(1)", "Err(\"x\")", "=="))
+    assert_accepted("res_int_str_ne", compare_src("", "Result[Int, Str]", "Ok(1)", "Err(\"x\")", "!="))
+    assert_accepted("opt_none_lit", "fn main() \{\n    let a: Option[Int] = None\n    io.println(\"\{a == None}\")\n}\n")
+}
+
+test "Option over a struct that derives or writes Eq compares" {
+    let derived = "@derive(Eq)\ntype Point \{ x: Int, y: Int }\n\n"
+    assert_accepted("opt_derived", compare_src(derived, "Option[Point]", "Some(Point \{ x: 1, y: 2 })", "None", "=="))
+    let written = "type Cell \{ v: Int }\n\nimpl Eq for Cell \{\n    fn eq(self, other: Cell) -> Bool \{ self.v == other.v }\n}\n\n"
+    assert_accepted("opt_written", compare_src(written, "Option[Cell]", "Some(Cell \{ v: 1 })", "None", "=="))
+}
+
+test "Option over a type parameter with the Eq bound compares" {
+    assert_accepted("generic_opt_eq", "fn same[T: Eq](a: Option[T], b: Option[T]) -> Bool \{ a == b }\n\nfn main() \{\n    io.println(\"\{same(Some(1), Some(1))}\")\n}\n")
+}
+
+test "enums with no payload or with a derive compare" {
+    let color = "type Color \{\n    Red\n    Green\n}\n\n"
+    assert_accepted("enum_plain", compare_src(color, "Color", "Color.Red", "Color.Green", "=="))
+    assert_accepted("opt_enum_plain", compare_src(color, "Option[Color]", "Some(Color.Red)", "None", "=="))
+    assert_accepted("res_enum_plain", compare_src(color, "Result[Int, Color]", "Ok(1)", "Err(Color.Red)", "=="))
+    let derived = "@derive(Eq)\ntype Shape \{\n    Circle(r: Int)\n    Dot\n}\n\n"
+    assert_accepted("enum_derived", compare_src(derived, "Shape", "Shape.Dot", "Shape.Circle(1)", "=="))
+}
+
+test "scalars, Str and Bytes still compare" {
+    assert_accepted("str", compare_src("", "Str", "\"a\"", "\"b\"", "=="))
+    assert_accepted("bytes", compare_src("", "Bytes", "Bytes.new()", "Bytes.new()", "=="))
+    assert_accepted("float", compare_src("", "Float", "1.0", "2.0", "!="))
+}
