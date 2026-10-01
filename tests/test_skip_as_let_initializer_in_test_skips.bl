@@ -1,0 +1,77 @@
+// skip() is legal anywhere lexically inside a test block (§2.20), so it may also be the
+// initializer of a `let`. Name resolution infers a let's call initializer before the
+// test-block typecheck runs, and that inference must still see the code as inside the
+// test, or the E0827 fence rejects a legal skip; the E0833 assert_panics fence reads the
+// same flag. In a regular fn the skip fence still holds.
+
+import compile_test_helpers
+
+fn expect_skipped(src: Str, tag: Str) {
+    let r = compile_test_helpers.compile_and_run_test_json(src, tag)
+    let fenced = r.out.contains("SkipOutsideTest") || r.err_out.contains("SkipOutsideTest")
+    if fenced { io.println("FAIL: {tag}: reported SkipOutsideTest") }
+    assert(!fenced)
+    compile_test_helpers.expect_contains(r.out, "\"status\":\"skipped\"", "{tag}: the test is skipped")
+    compile_test_helpers.expect_contains(r.out, "\"reason\":\"not here\"", "{tag}: the skip reason is kept")
+    let ran_on = r.out.contains("\"status\":\"failed\"")
+    if ran_on { io.println("FAIL: {tag}: the code after the skip ran") }
+    assert(!ran_on)
+}
+
+test "a bare skip as a let initializer in a test skips the test" {
+    expect_skipped(#"
+test "x" {
+    let _x = skip("not here")
+    assert_eq(1, 2)
+}
+"#, "_skiplet_bare")
+}
+
+test "a qualified skip as a let initializer in a test skips the test" {
+    expect_skipped(#"
+import std.testing
+test "x" {
+    let _x = testing.skip("not here")
+    assert_eq(1, 2)
+}
+"#, "_skiplet_qualified")
+}
+
+test "a skip as a let initializer in a closure inside a test skips the test" {
+    expect_skipped(#"
+test "x" {
+    [1].for_each(fn(i: Int) {
+        let _x = skip("not here")
+    })
+    assert_eq(1, 2)
+}
+"#, "_skiplet_closure")
+}
+
+// assert_panics is operand-only and cannot itself be a let initializer or an argument, but
+// a closure written in a test may hold one (§2.20), and that closure may be an argument of
+// a let's call initializer. The E0833 fence reads the same lexical flag as E0827.
+test "assert_panics in a closure argument of a let initializer in a test passes" {
+    let r = compile_test_helpers.compile_and_run_test_json(#"
+test "x" {
+    let _n = [1].map(fn(i: Int) -> Int {
+        assert_panics { let _y = [1].get(9).unwrap() }
+        i
+    })
+}
+"#, "_skiplet_assert_panics")
+    let fenced = r.out.contains("AssertPanicsOutsideTest") || r.err_out.contains("AssertPanicsOutsideTest")
+    if fenced { io.println("FAIL: _skiplet_assert_panics: reported AssertPanicsOutsideTest") }
+    assert(!fenced)
+    compile_test_helpers.expect_contains(r.out, "\"status\":\"passed\"", "_skiplet_assert_panics: the test passes")
+}
+
+test "a skip as a let initializer in a regular fn is still SkipOutsideTest" {
+    let out = compile_test_helpers.compile_and_capture(#"
+fn helper() {
+    let _x = skip("not here")
+}
+fn main() { helper() }
+"#, "_skiplet_helper")
+    compile_test_helpers.expect_error(out, "SkipOutsideTest", "_skiplet_helper: the fence holds outside a test")
+}
