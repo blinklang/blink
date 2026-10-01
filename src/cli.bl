@@ -2394,6 +2394,15 @@ fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     process_exec(output_path, rest)
 }
 
+// What one test file's task hands back. A spawned task may not capture a `let mut`
+// (E0650), so the tasks send their results and the caller files them by index.
+type TestFileResult {
+    idx: Int
+    exit_code: Int
+    out: Str
+    err_out: Str
+}
+
 fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     let source_path = args_positional(a, 0)
     apply_cache_flag(a)
@@ -2556,6 +2565,9 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     let dot_ch = channel.new[Int](buffer: 1)
     dot_ch.send(0)
 
+    // One slot per file, so no task blocks on its send while the scope waits for it.
+    let results = channel.new[TestFileResult](buffer: file_count)
+
     // SIGINT/SIGTERM on cmd_test forwards SIGTERM to every live spawned
     // child (build worker or test binary), preventing the orphan-worker
     // problem.
@@ -2581,7 +2593,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                             err_text = br.err_out
                         }
                     }
-                    errors.set(idx, err_text)
+                    results.send(TestFileResult { idx: idx, exit_code: -1, out: "", err_out: err_text })
                     if dots != 0 {
                         // One recv through a loop that stops after it: that spelling reads the
                         // same whether the pinned compiler types recv as the element or as an
@@ -2602,9 +2614,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                 }
                 let rpid = process_spawn(bin_path, rcmd)
                 let rr = process_pid_wait(rpid)
-                exit_codes.set(idx, rr.exit_code)
-                outputs.set(idx, rr.out)
-                errors.set(idx, rr.err_out)
+                results.send(TestFileResult { idx: idx, exit_code: rr.exit_code, out: rr.out, err_out: rr.err_out })
                 if dots != 0 {
                     for col in dot_ch {
                         if rr.exit_code != 0 {
@@ -2626,6 +2636,15 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
             })
             si = si + 1
         }
+    }
+
+    let mut received = 0
+    for r in results {
+        exit_codes.set(r.idx, r.exit_code)
+        outputs.set(r.idx, r.out)
+        errors.set(r.idx, r.err_out)
+        received = received + 1
+        if received == file_count { break }
     }
 
     if dots != 0 {
