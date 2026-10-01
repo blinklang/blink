@@ -1,12 +1,10 @@
-// `List.contains` is a linear scan over element equality, and the language defines element
-// equality only for Int, Bool, Str and Float. On a struct, an enum or a nested collection
-// `==` is pointer identity, not field-wise value equality, so a scan over one answers a
-// question the program did not ask and answers it wrong.
+// `List[T].contains` is a linear scan over `==`, so it needs `T: Eq` (sections/03_types.md,
+// *The `Contains` Trait* and *Container Equality*). A struct, enum, nested collection,
+// Option or tuple element is accepted when it is `Eq`, and refused when it is not.
 //
-// The spec says so twice, at sections/03_types.md:339 and :527: those element types are
-// UnresolvedMethod until value equality lands. Typecheck accepted them and typed the call
-// Bool, so the program compiled and the refusal, if it came at all, came from codegen with
-// no source location worth reading.
+// The refusal stays in typecheck, at the call, so it names a line of Blink and the element
+// type that has no `==`. A refusal left to codegen would come with no source location worth
+// reading, and an acceptance with no `==` behind it would answer from addresses.
 //
 // The rows below fix both halves: what is refused, and what must keep working.
 
@@ -153,32 +151,112 @@ fn main() {
 "#
 }
 
-test "a list of structs refuses contains" {
+fn derived_struct_src() -> Str {
+    #"@derive(Eq)
+type Pt { x: Int }
+
+fn main() {
+    let xs: List[Pt] = [Pt { x: 1 }]
+    let hit = xs.contains(Pt { x: 1 })
+    io.println("{hit}")
+}
+"#
+}
+
+fn nested_struct_src() -> Str {
+    #"type Pt { x: Int }
+
+fn main() {
+    let xs: List[List[Pt]] = [[Pt { x: 1 }]]
+    let hit = xs.contains([Pt { x: 1 }])
+    io.println("{hit}")
+}
+"#
+}
+
+fn payload_enum_src() -> Str {
+    #"type Pt { x: Int }
+
+type Holder {
+    Empty
+    Full(p: Pt)
+}
+
+fn main() {
+    let xs: List[Holder] = [Holder.Empty]
+    let hit = xs.contains(Holder.Empty)
+    io.println("{hit}")
+}
+"#
+}
+
+fn generic_src() -> Str {
+    #"fn has[T](xs: List[T], x: T) -> Bool {
+    xs.contains(x)
+}
+
+fn main() {
+    io.println("{has([1], 1)}")
+}
+"#
+}
+
+fn generic_eq_src() -> Str {
+    #"fn has[T: Eq](xs: List[T], x: T) -> Bool {
+    xs.contains(x)
+}
+
+fn main() {
+    io.println("{has([1], 1)}")
+}
+"#
+}
+
+test "a list of structs with no Eq refuses contains" {
     assert_refused("struct", struct_src(), "List[Pt]")
 }
 
-test "a list of enums refuses contains" {
-    assert_refused("enum", enum_src(), "List[Tag]")
+test "a list of payload-free enums answers contains" {
+    assert_accepted("enum", enum_src())
 }
 
-test "a list of lists refuses contains" {
-    assert_refused("nested_list", nested_list_src(), "List[List[Int]]")
+test "a list of lists answers contains" {
+    assert_accepted("nested_list", nested_list_src())
 }
 
-test "a list of maps refuses contains" {
-    assert_refused("nested_map", nested_map_src(), "List[Map[Str, Int]]")
+test "a list of maps answers contains" {
+    assert_accepted("nested_map", nested_map_src())
 }
 
-test "a list of sets refuses contains" {
-    assert_refused("nested_set", nested_set_src(), "List[Set[Str]]")
+test "a list of sets answers contains" {
+    assert_accepted("nested_set", nested_set_src())
 }
 
-test "a list of options refuses contains" {
-    assert_refused("option", option_src(), "List[Option[Int]]")
+test "a list of options answers contains" {
+    assert_accepted("option", option_src())
 }
 
-test "a list of tuples refuses contains" {
-    assert_refused("tuple", tuple_src(), "List[(Int, Int)]")
+test "a list of tuples answers contains" {
+    assert_accepted("tuple", tuple_src())
+}
+
+test "a list of structs that derive Eq answers contains" {
+    assert_accepted("derived_struct", derived_struct_src())
+}
+
+// The element is asked through every type it is built from, so a struct with no `Eq`
+// two lists down is still the reason.
+test "a list of lists of structs with no Eq refuses contains" {
+    assert_refused("nested_struct", nested_struct_src(), "List[List[Pt]]")
+}
+
+test "a list of enums whose payload has no Eq refuses contains" {
+    assert_refused("payload_enum", payload_enum_src(), "List[Holder]")
+}
+
+test "a list over a type parameter needs the Eq bound for contains" {
+    assert_refused("generic", generic_src(), "List[T]")
+    assert_accepted("generic_eq", generic_eq_src())
 }
 
 // `ListOps.contains(xs, v)` denotes the same call as `xs.contains(v)`. A rule that only one
@@ -187,8 +265,8 @@ test "the qualified spelling refuses the same element types" {
     assert_refused("qualified", qualified_src(), "List[Pt]")
 }
 
-// The other half of the rule. Refusing one element type must not cost the four the spec
-// names, or the gate is a regression dressed as a fix.
+// The other half of the rule. Widening the element types must not cost the four the spec
+// always allowed.
 test "the four primitive element types still answer contains" {
     assert_accepted("primitives", primitives_src())
 }
