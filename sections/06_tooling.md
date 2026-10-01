@@ -1431,7 +1431,7 @@ Precedence, highest first: `--deterministic` (pins `0`) > `BLINK_MAP_SEED` (pins
 
 ##### `W1401 MapOrderAssumption`
 
-Because the default seed is randomized, code that asserts on or indexes into `Map`/`Set` iteration order is a latent bug. The compiler emits the default-on warning `W1401 MapOrderAssumption` when a `keys()`, `values()`, or `entries()` result flows into a positional index or an equality assertion with **no intervening `sort()`/`sorted()`**, with a machine-applicable fix that inserts the sort:
+Because the default seed is randomized, code that asserts on or indexes into `Map`/`Set` iteration order is a latent bug. The compiler emits the default-on warning `W1401 MapOrderAssumption` when a `keys()`, `values()`, or `entries()` result flows into a positional index or an equality assertion with **no intervening `sort()`/`sort_by()`**, with a machine-applicable fix that inserts the sort:
 
 ```
 warning[W1401]: this compares Map iteration order, which is unspecified
@@ -1441,7 +1441,7 @@ warning[W1401]: this compares Map iteration order, which is unspecified
    |               ^^^^^^^^ Map/Set iteration order is randomized and not stable across runs
    |
    = fix: sort before comparing
-   |       assert_eq(m.keys().sorted(), ["a", "b"])
+   |       assert_eq(m.keys().sort(), ["a", "b"])
    = note: run with --deterministic only to pin a specific order intentionally
 ```
 
