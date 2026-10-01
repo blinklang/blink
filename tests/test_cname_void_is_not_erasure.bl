@@ -1,0 +1,141 @@
+// `Void` is an ordinary inhabited type, and an unsolved metavariable is not a type at
+// all, so the two must never share a spelling. A speller that meets a metavariable or a
+// tid outside the pool answers an ICE_SEG_* sentinel, and a carrier around such a slot
+// answers the bare sentinel: interpolated into a longer name it would no longer start
+// with the prefix diag_is_ice_seg looks for, and would compile as a legal C identifier.
+
+import typecheck.{make_metavar, make_option_type, make_result_type, make_map_type, make_tuple_type}
+import ast.{NodeKind}
+import diagnostics.{
+    diag_is_ice_seg, ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
+}
+import cname.{c_seg_top, c_seg_inner, c_typedef_name, c_mono_fn_name, c_mono_type_c_name}
+import cname_test_helpers.{assert_eq_str, find_decl, tid_of, compile_probe}
+import std.io
+
+fn probe_src() -> Str {
+    #"fn ident[T](x: T) -> T { x }
+fn main() {
+    let u: Void = ()
+    let r: Result[Void, Str] = Ok(())
+    let i: Int = ident(7)
+    assert(r.is_ok())
+    assert(i == 7)
+}
+"#
+}
+
+fn assert_true(label: Str, got: Bool) {
+    if !got { io.println("FAIL: {label}: got false want true") }
+    assert(got)
+}
+
+fn assert_false(label: Str, got: Bool) {
+    if got { io.println("FAIL: {label}: got true want false") }
+    assert(!got)
+}
+
+fn ident_symbol(arg: Int) -> Str {
+    c_mono_fn_name(find_decl(NodeKind.FnDef, "ident", ""), make_tuple_type([arg]))
+}
+
+test "a genuine Void spells Void at every position and is never a sentinel" {
+    let m = compile_probe("cname_void_erasure", probe_src())
+    let v = tid_of(m, "Void")
+    assert_eq_str("Void top", c_seg_top(v), "Void")
+    assert_eq_str("Void inner", c_seg_inner(v), "void")
+    assert_eq_str("ident[Void]", ident_symbol(v), "blink_ident_0Void")
+    assert_false("Void top is not a sentinel", diag_is_ice_seg(c_seg_top(v)))
+    assert_false("Void inner is not a sentinel", diag_is_ice_seg(c_seg_inner(v)))
+    assert_eq_str("Result[Void, Str]", c_typedef_name(tid_of(m, "Result[Void, Str]")), "blink_Result_void_str")
+}
+
+test "an unbound metavariable spells the unsolved sentinel, not void" {
+    let _m = compile_probe("cname_void_erasure", probe_src())
+    let mv = make_metavar()
+    assert_eq_str("metavar top", c_seg_top(mv), ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_eq_str("metavar inner", c_seg_inner(mv), ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_eq_str("ident[metavar]", ident_symbol(mv), ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_false("metavar inner is not void", c_seg_inner(mv) == "void")
+    assert_false("metavar top is not Void", c_seg_top(mv) == "Void")
+}
+
+test "Option over an unbound metavariable collapses to the bare sentinel" {
+    let _m = compile_probe("cname_void_erasure", probe_src())
+    let opt = make_option_type(make_metavar())
+    assert_eq_str("Option[metavar] top", c_seg_top(opt), ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_eq_str("Option[metavar] inner", c_seg_inner(opt), ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_eq_str("Option[metavar] typedef", c_typedef_name(opt), ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_false("never buried inside Option_", c_typedef_name(opt).contains("Option_"))
+}
+
+// Each slot on its own: a sound ok slot must not let an unsolved err slot through.
+test "Result over an unbound metavariable collapses whichever slot holds it" {
+    let m = compile_probe("cname_void_erasure", probe_src())
+    let v = tid_of(m, "Void")
+    let bad_ok = make_result_type(make_metavar(), v)
+    let bad_err = make_result_type(v, make_metavar())
+    assert_eq_str("Result[metavar, Void] typedef", c_typedef_name(bad_ok), ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_eq_str("Result[Void, metavar] typedef", c_typedef_name(bad_err), ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_eq_str("Result[Void, metavar] inner", c_seg_inner(bad_err), ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_false("never buried inside Result_void_", c_typedef_name(bad_err).contains("Result_void_"))
+}
+
+// A sound element before the unsolved one must not leave a partial tag behind.
+test "a tuple with one unbound-metavariable element collapses the whole tag" {
+    let m = compile_probe("cname_void_erasure", probe_src())
+    let tup = make_tuple_type([tid_of(m, "Void"), make_metavar()])
+    assert_eq_str("(Void, metavar) typedef", c_typedef_name(tup), ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_eq_str("(Void, metavar) inner", c_seg_inner(tup), ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_false("never partly spelled as Tuple2_void", c_typedef_name(tup).contains("Tuple2"))
+}
+
+// A symbol spells a Map's key and value, so an unsolved slot reaches the speller there.
+test "a Map over an unbound metavariable collapses a mono symbol, key or value" {
+    let m = compile_probe("cname_void_erasure", probe_src())
+    let v = tid_of(m, "Void")
+    let bad_key = ident_symbol(make_map_type(make_metavar(), v))
+    let bad_val = ident_symbol(make_map_type(v, make_metavar()))
+    assert_eq_str("ident[Map[metavar, Void]]", bad_key, ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_eq_str("ident[Map[Void, metavar]]", bad_val, ICE_SEG_UNSOLVED_TYPEVAR)
+}
+
+test.failing(
+    "a Map over an unbound metavariable collapses at the carrier positions",
+    reason: "seg_at returns Map/map at TOP and INNER before it walks the key and value, so an unsolved slot spells map; the comment above that arm says the slots are walked so it fails closed",
+) {
+    let m = compile_probe("cname_void_erasure", probe_src())
+    let mp = make_map_type(make_metavar(), tid_of(m, "Void"))
+    let inner = c_seg_inner(mp)
+    let top = c_seg_top(mp)
+    assert(inner == ICE_SEG_UNSOLVED_TYPEVAR, "Map[metavar, Void] inner spells '{inner}'")
+    assert(top == ICE_SEG_UNSOLVED_TYPEVAR, "Map[metavar, Void] top spells '{top}'")
+}
+
+test "a tid outside the pool spells the out-of-range sentinel, not Void" {
+    let _m = compile_probe("cname_void_erasure", probe_src())
+    let id = find_decl(NodeKind.FnDef, "ident", "")
+    assert_eq_str("top -1", c_seg_top(-1), ICE_SEG_TID_OUT_OF_RANGE)
+    assert_eq_str("inner past the pool", c_seg_inner(1000000000), ICE_SEG_TID_OUT_OF_RANGE)
+    assert_eq_str("typedef -1", c_typedef_name(-1), ICE_SEG_TID_OUT_OF_RANGE)
+    assert_eq_str("mono type -1", c_mono_type_c_name(-1), ICE_SEG_TID_OUT_OF_RANGE)
+    assert_eq_str("mono fn args -1", c_mono_fn_name(id, -1), ICE_SEG_TID_OUT_OF_RANGE)
+    assert_false("out of range is not Void", c_seg_top(-1) == "Void")
+    assert_false("out of range is not void", c_seg_inner(-1) == "void")
+}
+
+// Each sentinel names a different repair, so no two may share a string, and the detector
+// must not fire on any real name.
+test "diag_is_ice_seg holds for every sentinel and for no real name" {
+    assert_true("unsolved typevar", diag_is_ice_seg(ICE_SEG_UNSOLVED_TYPEVAR))
+    assert_true("unhandled kind", diag_is_ice_seg(ICE_SEG_UNHANDLED_KIND))
+    assert_true("tid out of range", diag_is_ice_seg(ICE_SEG_TID_OUT_OF_RANGE))
+    assert_false("unsolved != unhandled", ICE_SEG_UNSOLVED_TYPEVAR == ICE_SEG_UNHANDLED_KIND)
+    assert_false("unsolved != out of range", ICE_SEG_UNSOLVED_TYPEVAR == ICE_SEG_TID_OUT_OF_RANGE)
+    assert_false("unhandled != out of range", ICE_SEG_UNHANDLED_KIND == ICE_SEG_TID_OUT_OF_RANGE)
+    assert_false("Void", diag_is_ice_seg("Void"))
+    assert_false("void", diag_is_ice_seg("void"))
+    assert_false("Int", diag_is_ice_seg("Int"))
+    assert_false("Result_void_str", diag_is_ice_seg("Result_void_str"))
+    assert_false("empty", diag_is_ice_seg(""))
+}

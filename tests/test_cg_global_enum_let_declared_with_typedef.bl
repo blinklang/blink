@@ -1,0 +1,56 @@
+import compile_test_helpers
+import std.io
+
+// An unannotated module-level `let` whose initializer is not a literal must be declared with
+// the C type of its value. C converts a plain enum to and from int64_t silently, so a global
+// declared int64_t still computes the right value: only the declaration shows the type was
+// lost, which is why these rows read the emitted C. The alias reads the global above it, so
+// its type is known only once that global's is.
+
+fn probe_src() -> Str {
+    #"import std.io
+type Col { Red, Green }
+fn score(c: Col) -> Int {
+    match c {
+        Col.Red => 1
+        Col.Green => 2
+    }
+}
+let g_variant = Col.Green
+let g_alias = g_variant
+fn main() {
+    io.println("{score(g_variant) + score(g_alias)}")
+}
+"#
+}
+
+// The file-scope declaration of a global: an unindented line that names it, as a whole symbol.
+fn global_decl(c: Str, name: Str) -> Str {
+    for line in c.split("\n") {
+        if line.starts_with(" ") { continue }
+        if line.ends_with("_{name};") || line.contains("_{name} = ") { return line }
+    }
+    ""
+}
+
+fn assert_declared_col(name: Str) {
+    let c = compile_test_helpers.compile_and_emit_c(probe_src(), "cg_global_enum_let")
+    compile_test_helpers.expect_contains(c, "} blink_Col;", "the enum typedef exists")
+    let decl = global_decl(c, name)
+    if !decl.starts_with("blink_Col ") { io.println("FAIL: {name} is declared as `{decl}`") }
+    assert(decl.starts_with("blink_Col "))
+}
+
+test "a module let bound to a variant is declared with the enum typedef" {
+    assert_declared_col("g_variant")
+}
+
+test "a module let bound to another enum global is declared with the enum typedef" {
+    assert_declared_col("g_alias")
+}
+
+test "the globals hold the values they were bound to" {
+    let r = compile_test_helpers.compile_and_run(probe_src(), "cg_global_enum_let_run")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "4")
+}

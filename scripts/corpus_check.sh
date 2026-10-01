@@ -97,20 +97,10 @@ compare() {
         fail=1
         return
     fi
-    # A test moved to tests/pinned/ left the corpus on purpose: it pins a
-    # symbol the rewrite deletes and waits there to be re-pointed. Drop it
-    # from the reference so the denominator and the flip check agree with
-    # the corpus that actually ran.
-    pinned=$(ls tests/pinned/test_*.bl 2>/dev/null | xargs -rn1 basename | jq -R . | jq -s .)
-    ref_view=$(mktemp)
-    jq --argjson pinned "$pinned" '
-        .files |= map(select((.file | sub(".*/"; "")) as $b | $pinned | index($b) | not))
-        | .total = (.files | length)
-        | .passed = ([.files[] | select(.status == "pass")] | length)' "$ref" > "$ref_view"
     now_passed=$(jq -r .passed "$json")
     now_total=$(jq -r .total "$json")
-    ref_passed=$(jq -r .passed "$ref_view")
-    ref_total=$(jq -r .total "$ref_view")
+    ref_passed=$(jq -r .passed "$ref")
+    ref_total=$(jq -r .total "$ref")
     printf 'corpus-check: %-9s passed %s/%s, now %s/%s\n' "$label" "$ref_passed" "$ref_total" "$now_passed" "$now_total"
     if [ "$now_passed" -lt "$ref_passed" ]; then
         echo "corpus-check: FAIL pass count dropped against $label ($ref_passed -> $now_passed)"
@@ -125,17 +115,16 @@ compare() {
         | . as $f
         | ($cur[$f.file] // "missing") as $s
         | select($s != "pass")
-        | "  \($f.file): pass -> \($s)"' "$ref_view")
+        | "  \($f.file): pass -> \($s)"' "$ref")
     if [ -n "$flips" ]; then
         echo "corpus-check: FAIL files that passed in $label and no longer do:"
         printf '%s\n' "$flips"
         fail=1
     fi
-    new_files=$(jq -r --slurpfile ref "$ref_view" '
+    new_files=$(jq -r --slurpfile ref "$ref" '
         ($ref[0].files | map(.file)) as $known
         | .files[] | select(.file as $f | $known | index($f) | not) | .file' "$json" | wc -l | tr -d ' ')
     [ "$new_files" -gt 0 ] && echo "corpus-check: $new_files file(s) not in the $label baseline (new tests)"
-    rm -f "$ref_view"
 }
 
 compare baseline "$baseline"

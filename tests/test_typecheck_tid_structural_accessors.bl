@@ -1,0 +1,338 @@
+// tc_tid_kind / tc_tid_child_count / tc_tid_child / tc_tid_name are the structural view of a
+// pool tid. Every reader that walks a type composes them, so each compound constructor must
+// answer through them with its own kind, its own arity, its children in a fixed order, and -1
+// (never a made-up type) for a slot that does not exist. All four read the slot as stored; a
+// caller that wants a bound metavar followed calls tc_tid_resolved first.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{TyKind, check_types, tc_lookup_node_tid, tc_type_str, tc_tid_kind, tc_tid_child_count, tc_tid_child, tc_tid_name, tc_tid_resolved, tc_tid_handler_effect, tc_tid_list_elem, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, make_list_type, make_set_type, make_option_type, make_result_type, make_map_type, make_tuple_type, make_fn_type, make_struct_instance_type, make_enum_instance_type, make_handle_type, make_channel_type, make_iterator_type, make_ptr_type, make_template_type, make_raw_type, make_handler_type, make_ffi_scope_type, make_metavar}
+import parser.{nodes}
+
+// A match, not Display: a second enumeration of TyKind, so a new kind fails to compile here.
+fn kind_name(k: TyKind) -> Str {
+    match k {
+        TyKind.Int => "Int"
+        TyKind.Float => "Float"
+        TyKind.Bool => "Bool"
+        TyKind.Str => "Str"
+        TyKind.Void => "Void"
+        TyKind.List => "List"
+        TyKind.Option => "Option"
+        TyKind.Result => "Result"
+        TyKind.Fn => "Fn"
+        TyKind.Struct => "Struct"
+        TyKind.Enum => "Enum"
+        TyKind.Typevar => "Typevar"
+        TyKind.Unknown => "Unknown"
+        TyKind.Iterator => "Iterator"
+        TyKind.Handle => "Handle"
+        TyKind.Handler => "Handler"
+        TyKind.Channel => "Channel"
+        TyKind.Ptr => "Ptr"
+        TyKind.Tuple => "Tuple"
+        TyKind.Map => "Map"
+        TyKind.Bytes => "Bytes"
+        TyKind.Set => "Set"
+        TyKind.StringBuilder => "StringBuilder"
+        TyKind.Template => "Template"
+        TyKind.FfiScope => "FFIScope"
+        TyKind.Raw => "Raw"
+        TyKind.I8 => "I8"
+        TyKind.I16 => "I16"
+        TyKind.I32 => "I32"
+        TyKind.U8 => "U8"
+        TyKind.U16 => "U16"
+        TyKind.U32 => "U32"
+        TyKind.U64 => "U64"
+        TyKind.Char => "Char"
+        TyKind.Never => "Never"
+    }
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got}, want {want}") }
+    assert_eq(got, want)
+}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}', want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn assert_kind(label: Str, got: TyKind, want: TyKind) {
+    if got != want { io.println("FAIL: {label}: got {kind_name(got)}, want {kind_name(want)}") }
+    assert(got == want)
+}
+
+fn probe_src() -> Str {
+    "fn probe() -> Int \{\n    let a = 1\n    let b = \"s\"\n    let c = true\n    a\n}\n"
+}
+
+// Scalar tids are private globals seeded by check_types, so a probe program is the only way
+// to reach them. check_types also resets the pool, so build compounds only after this.
+fn harvest_scalars() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/test_typecheck_tid_structural_accessors_probe.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    while idx < nodes.len() {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 { m.insert(tc_type_str(tid), tid) }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 { io.println("FAIL: the probe produced no tid for '{key}'") }
+    assert(tid != -1)
+    tid
+}
+
+// One row per one-child constructor: kind, name, arity 1, child 0 is the argument, child 1
+// is -1.
+fn check_one_child(label: Str, t: Int, want_kind: TyKind, want_name: Str, child: Int) {
+    assert_kind("{label} kind", tc_tid_kind(t), want_kind)
+    assert_eq_str("{label} name", tc_tid_name(t), want_name)
+    assert_eq_int("{label} child_count", tc_tid_child_count(t), 1)
+    assert_eq_int("{label} child 0", tc_tid_child(t, 0), child)
+    assert_eq_int("{label} child 1", tc_tid_child(t, 1), -1)
+}
+
+test "every one-child constructor answers its kind, name and single child" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    check_one_child("List", make_list_type(int_tid), TyKind.List, "List", int_tid)
+    check_one_child("Set", make_set_type(str_tid), TyKind.Set, "Set", str_tid)
+    check_one_child("Option", make_option_type(int_tid), TyKind.Option, "Option", int_tid)
+    check_one_child("Handle", make_handle_type(str_tid), TyKind.Handle, "Handle", str_tid)
+    check_one_child("Channel", make_channel_type(int_tid), TyKind.Channel, "Channel", int_tid)
+    check_one_child("Iterator", make_iterator_type(str_tid), TyKind.Iterator, "Iterator", str_tid)
+    check_one_child("Ptr", make_ptr_type(int_tid), TyKind.Ptr, "Ptr", int_tid)
+    check_one_child("Template", make_template_type(str_tid), TyKind.Template, "Template", str_tid)
+    check_one_child("Raw", make_raw_type(int_tid), TyKind.Raw, "Raw", int_tid)
+}
+
+// Two distinct child types, so a swap of the slots cannot pass.
+test "Result and Map answer two children in declaration order" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    let r = make_result_type(int_tid, str_tid)
+    assert_kind("Result kind", tc_tid_kind(r), TyKind.Result)
+    assert_eq_str("Result name", tc_tid_name(r), "Result")
+    assert_eq_int("Result child_count", tc_tid_child_count(r), 2)
+    assert_eq_int("Result child 0 is ok", tc_tid_child(r, 0), int_tid)
+    assert_eq_int("Result child 1 is err", tc_tid_child(r, 1), str_tid)
+    assert_eq_int("Result child 2", tc_tid_child(r, 2), -1)
+    let mp = make_map_type(str_tid, int_tid)
+    assert_kind("Map kind", tc_tid_kind(mp), TyKind.Map)
+    assert_eq_str("Map name", tc_tid_name(mp), "Map")
+    assert_eq_int("Map child_count", tc_tid_child_count(mp), 2)
+    assert_eq_int("Map child 0 is key", tc_tid_child(mp, 0), str_tid)
+    assert_eq_int("Map child 1 is value", tc_tid_child(mp, 1), int_tid)
+    assert_eq_int("Map child 2", tc_tid_child(mp, 2), -1)
+}
+
+test "Tuple arity follows its element list" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    let bool_tid = expect_tid(m, "Bool")
+    let t = make_tuple_type([str_tid, int_tid, bool_tid])
+    assert_kind("Tuple kind", tc_tid_kind(t), TyKind.Tuple)
+    assert_eq_str("Tuple name", tc_tid_name(t), "Tuple")
+    assert_eq_int("Tuple3 child_count", tc_tid_child_count(t), 3)
+    assert_eq_int("elem 0", tc_tid_child(t, 0), str_tid)
+    assert_eq_int("elem 1", tc_tid_child(t, 1), int_tid)
+    assert_eq_int("elem 2", tc_tid_child(t, 2), bool_tid)
+    // Past the end, where a clamp to the last element would answer bool_tid.
+    assert_eq_int("elem 3", tc_tid_child(t, 3), -1)
+    assert_eq_int("Tuple2 child_count", tc_tid_child_count(make_tuple_type([int_tid, str_tid])), 2)
+}
+
+// Fn is the one shape that mixes a fixed slot (the return) with the variadic slice (params).
+test "Fn answers its return type as child 0 and its params after it" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    let bool_tid = expect_tid(m, "Bool")
+    let f = make_fn_type(bool_tid, [str_tid, int_tid])
+    assert_kind("Fn kind", tc_tid_kind(f), TyKind.Fn)
+    assert_eq_str("Fn name", tc_tid_name(f), "Fn")
+    assert_eq_int("child_count is 1 + params", tc_tid_child_count(f), 3)
+    assert_eq_int("child 0 is the return", tc_tid_child(f, 0), bool_tid)
+    assert_eq_int("child 1 is param 0", tc_tid_child(f, 1), str_tid)
+    assert_eq_int("child 2 is param 1", tc_tid_child(f, 2), int_tid)
+    assert_eq_int("child 3", tc_tid_child(f, 3), -1)
+    assert_eq_int("a no-param Fn has only its return", tc_tid_child_count(make_fn_type(int_tid, [])), 1)
+}
+
+// The name is the raw declared base, never a mono spelling such as `Pair_Int_Str`.
+test "struct and enum instances answer their base name and type arguments" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    let s = make_struct_instance_type("Pair", [int_tid, str_tid])
+    assert_kind("struct kind", tc_tid_kind(s), TyKind.Struct)
+    assert_eq_str("struct name", tc_tid_name(s), "Pair")
+    assert_eq_int("struct child_count", tc_tid_child_count(s), 2)
+    assert_eq_int("struct arg 0", tc_tid_child(s, 0), int_tid)
+    assert_eq_int("struct arg 1", tc_tid_child(s, 1), str_tid)
+    assert_eq_int("struct arg 2", tc_tid_child(s, 2), -1)
+    // A bare generic base has no args, which callers tell apart from an instance.
+    assert_eq_int("bare base child_count", tc_tid_child_count(make_struct_instance_type("Box", [])), 0)
+    let e = make_enum_instance_type("Tree", [str_tid])
+    assert_kind("enum kind", tc_tid_kind(e), TyKind.Enum)
+    assert_eq_str("enum name", tc_tid_name(e), "Tree")
+    assert_eq_int("enum child_count", tc_tid_child_count(e), 1)
+    assert_eq_int("enum arg 0", tc_tid_child(e, 0), str_tid)
+    assert_eq_int("enum arg 1", tc_tid_child(e, 1), -1)
+}
+
+// A handler's effect is a name, not a type, so it is not a child.
+test "Handler and FfiScope have no children" {
+    let h = make_handler_type("Metrics")
+    assert_kind("Handler kind", tc_tid_kind(h), TyKind.Handler)
+    assert_eq_str("Handler name holds the effect", tc_tid_name(h), "Metrics")
+    assert_eq_str("tc_tid_handler_effect agrees", tc_tid_handler_effect(h), "Metrics")
+    assert_eq_int("Handler child_count", tc_tid_child_count(h), 0)
+    assert_eq_int("Handler child 0", tc_tid_child(h, 0), -1)
+    let fs_tid = make_ffi_scope_type()
+    assert_kind("FfiScope kind", tc_tid_kind(fs_tid), TyKind.FfiScope)
+    assert_eq_str("FfiScope name", tc_tid_name(fs_tid), "FFIScope")
+    assert_eq_int("FfiScope child_count", tc_tid_child_count(fs_tid), 0)
+}
+
+test "scalars are leaves" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    let bool_tid = expect_tid(m, "Bool")
+    assert_kind("Int kind", tc_tid_kind(int_tid), TyKind.Int)
+    assert_kind("Str kind", tc_tid_kind(str_tid), TyKind.Str)
+    assert_kind("Bool kind", tc_tid_kind(bool_tid), TyKind.Bool)
+    assert_eq_int("Int child_count", tc_tid_child_count(int_tid), 0)
+    assert_eq_int("Str child_count", tc_tid_child_count(str_tid), 0)
+    assert_eq_int("Bool child_count", tc_tid_child_count(bool_tid), 0)
+    assert_eq_int("Int child 0", tc_tid_child(int_tid, 0), -1)
+}
+
+test "a negative index or a tid outside the pool answers -1 and Unknown, without a panic" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    assert_eq_int("List child -1", tc_tid_child(make_list_type(int_tid), -1), -1)
+    assert_eq_int("List child 99", tc_tid_child(make_list_type(int_tid), 99), -1)
+    assert_eq_int("child_count(-1)", tc_tid_child_count(-1), 0)
+    assert_eq_int("child(-1, 0)", tc_tid_child(-1, 0), -1)
+    assert_eq_int("child_count(huge)", tc_tid_child_count(999999999), 0)
+    assert_eq_int("child(huge, 0)", tc_tid_child(999999999, 0), -1)
+    assert_kind("kind(-1)", tc_tid_kind(-1), TyKind.Unknown)
+    assert_kind("kind(huge)", tc_tid_kind(999999999), TyKind.Unknown)
+    assert_eq_str("name(-1)", tc_tid_name(-1), "")
+    assert_eq_str("name(huge)", tc_tid_name(999999999), "")
+}
+
+// The older single-shape readers that still exist must answer what the uniform view answers.
+test "tc_tid_child agrees with tc_tid_list_elem and the struct-arg readers" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    let l = make_list_type(str_tid)
+    assert_eq_int("List elem", tc_tid_child(l, 0), tc_tid_list_elem(l))
+    assert_eq_int("list_elem on an Option", tc_tid_list_elem(make_option_type(int_tid)), -1)
+    let s = make_struct_instance_type("Pair", [int_tid, str_tid])
+    assert_eq_int("arg count", tc_tid_child_count(s), tc_tid_struct_arg_count(s))
+    assert_eq_int("arg 0", tc_tid_child(s, 0), tc_tid_struct_arg_tid(s, 0))
+    assert_eq_int("arg 1", tc_tid_child(s, 1), tc_tid_struct_arg_tid(s, 1))
+    let e = make_enum_instance_type("Tree", [int_tid])
+    assert_eq_int("enum arg count", tc_tid_child_count(e), tc_tid_struct_arg_count(e))
+    assert_eq_int("enum arg 0", tc_tid_child(e, 0), tc_tid_struct_arg_tid(e, 0))
+}
+
+test "Option[Map[Str, List[Int]]] walks to its Int leaf at depth 3" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    let deep = make_option_type(make_map_type(str_tid, make_list_type(int_tid)))
+    let d1 = tc_tid_child(deep, 0)
+    assert_kind("d1 Map", tc_tid_kind(d1), TyKind.Map)
+    assert_eq_int("d2 key is Str", tc_tid_child(d1, 0), str_tid)
+    let d2 = tc_tid_child(d1, 1)
+    assert_kind("d2 value List", tc_tid_kind(d2), TyKind.List)
+    assert_eq_int("d3 is Int", tc_tid_child(d2, 0), int_tid)
+}
+
+test "a struct instance nested in two containers keeps its name and arguments" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    let deep = make_list_type(make_result_type(make_struct_instance_type("Pair", [int_tid, str_tid]), str_tid))
+    let res = tc_tid_child(deep, 0)
+    assert_kind("Result at depth 1", tc_tid_kind(res), TyKind.Result)
+    let leaf = tc_tid_child(res, 0)
+    assert_kind("Struct at depth 2", tc_tid_kind(leaf), TyKind.Struct)
+    assert_eq_str("name survives", tc_tid_name(leaf), "Pair")
+    assert_eq_int("arg 0 is Int", tc_tid_child(leaf, 0), int_tid)
+    assert_eq_int("arg 1 is Str", tc_tid_child(leaf, 1), str_tid)
+    assert_eq_int("err slot is Str", tc_tid_child(res, 1), str_tid)
+}
+
+// If child_count over-reported or a child left the pool, this would miscount or not stop.
+fn count_leaves(tid: Int) -> Int {
+    let n = tc_tid_child_count(tid)
+    if n == 0 { return 1 }
+    let mut total = 0
+    let mut i = 0
+    while i < n {
+        let c = tc_tid_child(tid, i)
+        if c >= 0 { total = total + count_leaves(c) }
+        i = i + 1
+    }
+    total
+}
+
+test "one recursive walk covers every shape" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    assert_eq_int("scalar", count_leaves(int_tid), 1)
+    assert_eq_int("Map[Str, Int]", count_leaves(make_map_type(str_tid, int_tid)), 2)
+    assert_eq_int("depth 3", count_leaves(make_option_type(make_map_type(str_tid, make_list_type(int_tid)))), 2)
+    assert_eq_int("mixed", count_leaves(make_tuple_type([int_tid, make_map_type(str_tid, int_tid), make_raw_type(make_ptr_type(str_tid))])), 4)
+    assert_eq_int("Fn", count_leaves(make_fn_type(int_tid, [str_tid, make_list_type(int_tid)])), 3)
+}
+
+test "an unbound metavar reads as a childless Unknown" {
+    let mv = make_metavar()
+    assert_kind("unbound metavar", tc_tid_kind(mv), TyKind.Unknown)
+    assert_eq_int("no children", tc_tid_child_count(mv), 0)
+    assert_eq_int("child 0", tc_tid_child(mv, 0), -1)
+}
+
+// The child is the metavar itself, not -1 and not a default element type: "the element is an
+// unsolved alpha" is diagnosable, "the element is Int" is a silent miscompile.
+test "a container over an unbound metavar answers the metavar as its child" {
+    let mv = make_metavar()
+    let l = make_list_type(mv)
+    assert_kind("List kind", tc_tid_kind(l), TyKind.List)
+    assert_eq_int("one child", tc_tid_child_count(l), 1)
+    assert_eq_int("child is the metavar", tc_tid_child(l, 0), mv)
+}
+
+test "tc_tid_resolved is the identity on a type with nothing to resolve" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let l = make_list_type(int_tid)
+    assert_eq_int("resolved(Int)", tc_tid_resolved(int_tid), int_tid)
+    assert_eq_int("resolved(List)", tc_tid_resolved(l), l)
+    assert_eq_int("child after resolve", tc_tid_child(tc_tid_resolved(l), 0), int_tid)
+    assert_eq_int("resolved(-1)", tc_tid_resolved(-1), -1)
+}

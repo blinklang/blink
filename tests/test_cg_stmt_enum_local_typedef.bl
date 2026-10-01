@@ -1,0 +1,267 @@
+import compile_test_helpers
+
+// An enum-typed local must be declared with the C typedef of its enum, and that typedef must
+// stand above the first line that names it. C converts a plain enum to and from int64_t
+// silently, so a plain-enum local declared int64_t still computes the right value: only the
+// emitted C shows that the type was lost. A payload enum or a generic enum instance is a
+// struct, so for those a lost or late typedef is a C compile error instead. Both halves are
+// pinned: the value rows run the bindings in this file, and the C rows read the declarations.
+
+type Col { Red, Green }
+type Shape { Circle(Int), Rect(Int, Int), Empty }
+type Box[T] { Full(T), Vacant }
+type Bx { k: Col }
+
+fn pick() -> Col { Col.Red }
+fn make_shape() -> Shape { Shape.Circle(3) }
+fn make_box() -> Box[Int] { Box.Full(4) }
+fn idc[T](x: T) -> T { x }
+
+fn score(c: Col) -> Int {
+    match c {
+        Col.Red => 1
+        Col.Green => 2
+    }
+}
+
+fn area(s: Shape) -> Int {
+    match s {
+        Shape.Circle(r) => r * r
+        Shape.Rect(w, h) => w * h
+        Shape.Empty => 0
+    }
+}
+
+fn unbox(b: Box[Int]) -> Int {
+    match b {
+        Box.Full(v) => v
+        Box.Vacant => 0
+    }
+}
+
+test "a plain enum local holds the right value whatever produced it" {
+    let from_call = pick()
+    let from_if = if from_call == Col.Red { Col.Green } else { Col.Red }
+    let from_match = match from_call {
+        Col.Red => Col.Green
+        Col.Green => Col.Red
+    }
+    let mut from_mut = pick()
+    assert_eq(score(from_mut), 1)
+    from_mut = Col.Green
+    let bx = Bx { k: Col.Green }
+    let from_field = bx.k
+    let from_generic = idc(Col.Red)
+    let l: List[Col] = [Col.Green]
+    let from_list = l.get(0).unwrap()
+    let mp: Map[Str, Col] = Map()
+    let from_map = mp.get("x") ?? Col.Green
+    assert_eq(score(from_call), 1)
+    assert_eq(score(from_if), 2)
+    assert_eq(score(from_match), 2)
+    assert_eq(score(from_mut), 2)
+    assert_eq(score(from_field), 2)
+    assert_eq(score(from_generic), 1)
+    assert_eq(score(from_list), 2)
+    assert_eq(score(from_map), 2)
+}
+
+test "a payload enum local holds the right value whatever produced it" {
+    let c = pick()
+    let shape_lit = Shape.Rect(2, 3)
+    let shape_call = make_shape()
+    let shape_if = if c == Col.Red { Shape.Rect(1, 5) } else { Shape.Empty }
+    assert_eq(area(shape_lit), 6)
+    assert_eq(area(shape_call), 9)
+    assert_eq(area(shape_if), 5)
+}
+
+test "a generic enum instance local holds the right value whatever produced it" {
+    let c = pick()
+    let box_lit: Box[Int] = Box.Full(7)
+    let box_call = make_box()
+    let box_match = match c {
+        Col.Red => Box.Full(9)
+        Col.Green => Box.Full(0)
+    }
+    assert_eq(unbox(box_lit), 7)
+    assert_eq(unbox(box_call), 4)
+    assert_eq(unbox(box_match), 9)
+}
+
+// The same bindings as the value rows, as a program of its own, so its C can be read.
+fn probe_src() -> Str {
+    #"type Col { Red, Green }
+type Shape { Circle(Int), Rect(Int, Int), Empty }
+type Box[T] { Full(T), Vacant }
+type Bx { k: Col }
+fn pick() -> Col { Col.Red }
+fn make_shape() -> Shape { Shape.Circle(3) }
+fn make_box() -> Box[Int] { Box.Full(4) }
+fn idc[T](x: T) -> T { x }
+fn score(c: Col) -> Int {
+    match c {
+        Col.Red => 1
+        Col.Green => 2
+    }
+}
+fn area(s: Shape) -> Int {
+    match s {
+        Shape.Circle(r) => r * r
+        Shape.Rect(w, h) => w * h
+        Shape.Empty => 0
+    }
+}
+fn unbox(b: Box[Int]) -> Int {
+    match b {
+        Box.Full(v) => v
+        Box.Vacant => 0
+    }
+}
+fn main() {
+    let from_call = pick()
+    let from_if = if from_call == Col.Red { Col.Green } else { Col.Red }
+    let from_match = match from_call {
+        Col.Red => Col.Green
+        Col.Green => Col.Red
+    }
+    let mut from_mut = pick()
+    from_mut = Col.Green
+    let bx = Bx { k: Col.Green }
+    let from_field = bx.k
+    let from_generic = idc(Col.Red)
+    let l: List[Col] = [Col.Green]
+    let from_list = l.get(0).unwrap()
+    let mp: Map[Str, Col] = Map()
+    let from_map = mp.get("x") ?? Col.Green
+    let shape_lit = Shape.Rect(2, 3)
+    let shape_call = make_shape()
+    let shape_if = if from_call == Col.Red { Shape.Rect(1, 5) } else { Shape.Empty }
+    let box_lit: Box[Int] = Box.Full(7)
+    let box_call = make_box()
+    let box_match = match from_call {
+        Col.Red => Box.Full(9)
+        Col.Green => Box.Full(0)
+    }
+    io.println("{score(from_call)} {score(from_if)} {score(from_match)} {score(from_mut)}")
+    io.println("{score(from_field)} {score(from_generic)} {score(from_list)} {score(from_map)}")
+    io.println("{area(shape_lit)} {area(shape_call)} {area(shape_if)}")
+    io.println("{unbox(box_lit)} {unbox(box_call)} {unbox(box_match)}")
+}
+"#
+}
+
+// One compile serves every C row.
+let mut probe_c = ""
+
+fn emitted_c() -> Str {
+    if probe_c == "" {
+        probe_c = compile_test_helpers.compile_and_emit_c(probe_src(), "cg_stmt_enum_local_typedef")
+    }
+    probe_c
+}
+
+// The C type a local is declared with, read from its declaration `<type> <name> = ...;`.
+// "" when no declaration exists, so a missing local fails its row by name.
+fn decl_type(c: Str, name: Str) -> Str {
+    let needle = " {name} = "
+    for line in c.lines() {
+        let t = line.trim()
+        let at = t.index_of(needle)
+        if at > 0 && !t.slice(0, at).contains(" ") && !t.slice(0, at).contains("=") {
+            return t.slice(0, at)
+        }
+    }
+    ""
+}
+
+fn assert_decl(c: Str, name: Str, want: Str) {
+    let got = decl_type(c, name)
+    if got != want { io.println("FAIL: `{name}` declared as `{got}`, want `{want}`") }
+    assert_eq(got, want)
+}
+
+// A line names `ty` when `ty` appears there as a whole C identifier, not as the prefix of a
+// longer one such as a variant constant or a typedef guard macro.
+fn names_type(line: Str, ty: Str) -> Bool {
+    let mut rest = line
+    while rest.contains(ty) {
+        let at = rest.index_of(ty)
+        let before_ok = at == 0 || !is_ident_char(rest.slice(at - 1, at))
+        let after = at + ty.len()
+        let after_ok = after >= rest.len() || !is_ident_char(rest.slice(after, after + 1))
+        if before_ok && after_ok { return true }
+        rest = rest.slice(after, rest.len())
+    }
+    false
+}
+
+fn is_ident_char(ch: Str) -> Bool {
+    "_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".contains(ch)
+}
+
+// The typedef of `ty` closes on a line ending `} <ty>;`, and no line outside the
+// preprocessor names `ty` before that line does.
+fn assert_typedef_before_first_use(c: Str, ty: Str) {
+    let ls = c.lines()
+    let close = "} {ty};"
+    let mut typedef_at = -1
+    let mut first_use = -1
+    let mut i = 0
+    while i < ls.len() {
+        let line = ls.get(i).unwrap().trim()
+        if typedef_at < 0 && line.ends_with(close) { typedef_at = i }
+        if first_use < 0 && !line.starts_with("#") && !line.ends_with(close) && names_type(line, ty) {
+            first_use = i
+        }
+        i = i + 1
+    }
+    if typedef_at < 0 { io.println("FAIL: no typedef of `{ty}` in emitted C") }
+    if first_use < 0 { io.println("FAIL: nothing in emitted C names `{ty}`") }
+    if first_use >= 0 && first_use < typedef_at {
+        io.println("FAIL: `{ty}` used on C line {first_use + 1} before its typedef on line {typedef_at + 1}")
+    }
+    assert(typedef_at >= 0)
+    assert(first_use > typedef_at)
+}
+
+test "the probe reaches codegen" {
+    let c = emitted_c()
+    if !c.contains("blink_u_pick(") { io.println("FAIL: probe emitted no C") }
+    assert(c.contains("blink_u_pick("))
+}
+
+// One row per producer, because each reaches the declaration through a different temp or
+// none: a call, the if and match result temps, a reassigned local, a field, a generic
+// return, an unwrapped carrier temp, and a coalesce.
+test "a plain enum local is declared with the enum typedef whatever produced its value" {
+    let c = emitted_c()
+    for name in ["from_call", "from_if", "from_match", "from_mut", "from_field", "from_generic", "from_list", "from_map"] {
+        assert_decl(c, name, "blink_Col")
+    }
+}
+
+test "a payload enum local is declared with the enum typedef whatever produced its value" {
+    let c = emitted_c()
+    for name in ["shape_lit", "shape_call", "shape_if"] {
+        assert_decl(c, name, "blink_Shape")
+    }
+}
+
+// The instance typedef is named after the type arguments, so the bare base name is never a
+// declared type: a local that spells it does not compile.
+test "a generic enum instance local is declared with its instance typedef" {
+    let c = emitted_c()
+    let ty = decl_type(c, "box_lit")
+    if !ty.starts_with("blink_Box_") { io.println("FAIL: box_lit declared as `{ty}`, want an instance of blink_Box") }
+    assert(ty.starts_with("blink_Box_"))
+    assert_decl(c, "box_call", ty)
+    assert_decl(c, "box_match", ty)
+}
+
+test "every enum typedef the locals name is declared before its first use" {
+    let c = emitted_c()
+    assert_typedef_before_first_use(c, "blink_Col")
+    assert_typedef_before_first_use(c, "blink_Shape")
+    assert_typedef_before_first_use(c, decl_type(c, "box_lit"))
+}
