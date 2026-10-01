@@ -3227,6 +3227,10 @@ also be shown, which the assertion built-ins need (§2.20 *Built-in Assertions*)
 rendering and the one remaining exclusion (container map keys) are specified in *Container Debug
 Rendering* below.
 
+`Result.unwrap` and `Result.unwrap_err` also require `Debug` on the arm they panic on, and their
+panic text ends with that payload's `debug()` (§7.5). A change to a type's `Debug` format therefore
+also changes that panic text.
+
 **Scalar debug-forms.** The scalar leaf forms split by whether the type is textual or not. `Int`,
 `Float`, `Bool`, and the sized integers render **bare** — their `debug()` equals their `display()`.
 The textual scalars render **quoted and escaped** in their own source-literal syntax, so a debug

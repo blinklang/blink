@@ -1346,7 +1346,7 @@ match expr {
 
 For `Option[T]` operands, the lowering is identical except the `None` arm produces a `TestError` whose `message` is `"None"` and `error_type` is `"Option"`. Allocation occurs only on the error path; passing tests pay zero cost for this elaboration.
 
-**`Display` is required at each `?` site.** If `E` does not implement `Display`, the test fails to compile with E0514 pointing at the `?` site. This is the same rule the compiler uses for `?` outside tests under the exact-structural-match constraint (§3c.2 Rule 4): the test author must guarantee the error type can be rendered. The diagnostic suggests deriving or implementing `Display` for `E`.
+**`Display` is required at each `?` site.** If `E` does not implement `Display`, the test fails to compile with E0514 pointing at the `?` site. This is the same rule the compiler uses for `?` outside tests under the exact-structural-match constraint (§3c.2 Rule 4): the test author must guarantee the error type can be rendered. The diagnostic suggests implementing `Display` for `E`, or deriving `Debug` for `E` and calling `.unwrap()`, which needs only `Debug` (§7.5).
 
 **Hygiene.** The elaborated return type is internal to the test grammar form. User code cannot name it, dot into it, or observe it from outside. The runner is the sole caller of a test body and consumes the elaborated `Result[(), TestError]` directly.
 
@@ -1479,7 +1479,7 @@ test "division by zero panics" {
 }
 
 test "unwrap on empty list panics with the expected message" {
-    assert_panics(matching: "index out of bounds") {
+    assert_panics(matching: "unwrap called on None") {
         let xs: [Int] = []
         let _ = xs.get(0).unwrap()
     }
@@ -1488,7 +1488,7 @@ test "unwrap on empty list panics with the expected message" {
 
 **Form.** The body is a `{ ... }` block, *not* a `fn() { }` closure. It can appear only as the operand of `assert_panics` — it cannot be bound to a variable, passed as a higher-order argument, returned, or stored. This is the same syntactic discipline as the pattern argument of `assert_matches`: the construct is operand-only, so no first-class panic-catching handle ever exists. `assert_panics` itself yields no value (its type is `()`); you cannot write `let x = assert_panics { ... }`. There is no `PanicInfo` binding, no `Result`, no `Bool` — the only observable outcome is whether the surrounding test passes or fails.
 
-**Optional `matching:`.** The optional `matching:` keyword argument takes a `Str` and is a **literal substring test**, not a pattern or regular-expression language. The assertion passes only if the panic message *contains* that substring. Substring (rather than exact) matching is deliberate: panic messages carry a volatile ` at file:line` suffix, and a substring matches the stable part (`"index out of bounds"`) while ignoring the location. There is no anchoring, glob, or regex syntax — `matching:` is a plain substring and will not grow metacharacter semantics. String interpolation in the `matching:` argument follows the standard rules.
+**Optional `matching:`.** The optional `matching:` keyword argument takes a `Str` and is a **literal substring test**, not a pattern or regular-expression language. The assertion passes only if the panic message *contains* that substring. Substring (rather than exact) matching is deliberate: panic messages carry a volatile ` at file:line` suffix, and a substring matches the stable part (`"unwrap called on None"`, §7.5) while ignoring the location. There is no anchoring, glob, or regex syntax — `matching:` is a plain substring and will not grow metacharacter semantics. String interpolation in the `matching:` argument follows the standard rules.
 
 **Test-only.** `assert_panics` is rejected outside a test block at the parser/typecheck layer (**E0833** `AssertPanicsOutsideTest`), exactly like `skip()`. It is privileged test syntax, not a general-purpose primitive — there is no way to reach it from `main()`, a library function, or any production code.
 

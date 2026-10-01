@@ -868,7 +868,7 @@ test "scaled measurement matches expected ratio" {
 
 ```blink
 test "unwrap on empty list panics" {
-    assert_panics(matching: "index out of bounds") {
+    assert_panics(matching: "unwrap called on None") {
         let xs: [Int] = []
         let _ = xs.get(0).unwrap()
     }

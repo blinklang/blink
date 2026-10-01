@@ -2108,6 +2108,7 @@ Putting it all together -- a small order processing service demonstrating hierar
 @capabilities(DB.Read, DB.Write, Payment.Charge, IO.Log)
 module orders
 
+@derive(Debug)
 type OrderError {
     NotFound
     InsufficientStock(item_id: Int, available: Int)
