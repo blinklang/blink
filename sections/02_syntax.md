@@ -1412,9 +1412,9 @@ Four assertion functions are compiler built-ins, available in any test block wit
 | Function | Signature | On failure |
 |----------|-----------|------------|
 | `assert(expr)` | `fn assert(cond: Bool, msg: Str = "")` | Panics with source location and sub-expression values |
-| `assert_eq(a, b)` | `fn assert_eq[T: Eq + Display](left: T, right: T, msg: Str = "")` | Panics with both values displayed |
-| `assert_ne(a, b)` | `fn assert_ne[T: Eq + Display](left: T, right: T, msg: Str = "")` | Panics with the duplicated value displayed |
-| `assert_matches(expr, pat)` | `fn assert_matches[T](expr: T, pattern)` | Panics with actual value and expected pattern |
+| `assert_eq(a, b)` | `fn assert_eq[T: Eq + Debug](left: T, right: T, msg: Str = "")` | Panics with both values rendered by `debug()` |
+| `assert_ne(a, b)` | `fn assert_ne[T: Eq + Debug](left: T, right: T, msg: Str = "")` | Panics with the duplicated value rendered by `debug()` |
+| `assert_matches(expr, pat)` | `fn assert_matches[T: Debug](expr: T, pattern)` | Panics with the actual value rendered by `debug()` and the expected pattern |
 
 All assertions accept an optional trailing message for additional context. The message is a regular `Str` — Blink's universal string interpolation applies:
 
@@ -1428,6 +1428,21 @@ test "assertions demo" {
 ```
 
 `assert_eq` and `assert_ne` enforce their `T: Eq` bound with the same check as `==` (§3.6 *Container Equality*), and they compare with `==`. A type that `==` rejects, `assert_eq` rejects too (`E0306 TraitBoundNotSatisfied`); add `@derive(Eq)` to the type.
+
+The failure output shows the values, so `assert_eq`, `assert_ne` and `assert_matches` also require `T: Debug`, and they render each value with `debug()` (§3.6.1 *Debug vs Display*). They do not use `Display`. `Debug` quotes strings, so `"1"` and `1`, or `"a "` and `"a"`, never print the same. Every type that is `Eq` through *Container Equality* is also `Debug` when its parts are `Debug` (§3.6.1 *Container Debug Rendering*), so `assert_eq(p.parse(""), Ok([]))` compiles as written. A user type needs `@derive(Debug)` or an `impl Debug`. There is no placeholder: a `T` with no `Debug` does not compile.
+
+A missing `Debug` at an assertion call is `E0306 TraitBoundNotSatisfied`, the same code as a missing `Eq`. When `T` lacks both traits, one diagnostic names both. When `T` is a container, a note names the innermost type that has no `Debug`, found by the same walk that `E0520` uses for `@derive(Debug)`:
+
+```
+error[E0306]: trait bound not satisfied
+ --> tests/inventory_test.bl:12:5
+   |
+12 |     assert_eq(stock, expected)
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^ `List[Item]` does not implement `Debug`
+   |
+   = note: `Item` does not implement `Debug` (element of `List[Item]`)
+   = help: add `@derive(Debug)` to `Item`
+```
 
 **Note:** `assert_matches` is a compiler intrinsic whose second argument is a **pattern** (same syntax as `match` arms), not an expression. It cannot be passed as a higher-order function.
 
@@ -1605,7 +1620,7 @@ assertion failed: assert(account.balance > minimum)
   --> src/bank.bl:43:5
 ```
 
-For `assert_eq` and `assert_ne`, the output uses left/right labels since both arguments are already fully displayed:
+For `assert_eq` and `assert_ne`, the output uses left/right labels, and each value is rendered by `debug()`:
 
 ```
 assertion failed: assert_eq(result, Ok(500))
@@ -1614,7 +1629,7 @@ assertion failed: assert_eq(result, Ok(500))
   --> src/bank.bl:44:5
 ```
 
-For `assert_matches`, the output shows the actual value and expected pattern:
+For `assert_matches`, the output shows the actual value, rendered by `debug()`, and the expected pattern:
 
 ```
 assertion failed: assert_matches(result, Err(BankError.InsufficientFunds))
