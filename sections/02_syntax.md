@@ -1293,7 +1293,7 @@ test "integration test with shared environment" {
 This is consistent with Blink's effect system design — effects are explicit, never hidden. The compiler produces actionable errors when a test calls effectful code without a handler:
 
 ```
-error[UnhandledEffectInTest]: unhandled effect `Net` in test "fetch data"
+error[UnhandledEffect]: unhandled effect `Net` in test "fetch data"
   --> src/api.bl:45:9
    |
 45 |     let result = fetch_data(url)
@@ -1301,6 +1301,8 @@ error[UnhandledEffectInTest]: unhandled effect `Net` in test "fetch data"
    |
    = hint: wrap in `with mock_net(...) { ... }` to provide a handler
 ```
+
+This is `UnhandledEffect` (E0539). `main` is the other root, and the same code reports a user-declared effect that `main` does not discharge (§4.6 *Unhandled user effects*).
 
 Pure-by-default enables the compiler to safely parallelize test execution — tests with no effect handlers are guaranteed side-effect-free.
 

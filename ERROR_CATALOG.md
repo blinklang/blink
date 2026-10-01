@@ -111,6 +111,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | SubEffectAsType | E0536 | A sub-effect is written as a type (`Template[DB.Read]`); only a top-level effect gives a type | Type checking | §3b.5 |
 | JsonTextForValue | E0537 | A `Str` is passed to a `from_json` that takes `JsonValue`, or `to_json()`'s result is used as a `Str`; the fix names `json.decode[T]` / `json.encode` | Type checking | §3.6.2 |
 | UnknownEffect | E0538 | An effect row names an effect that is neither built-in nor declared. For `FFI` the help says a foreign call is not an effect and points to §9.1. No machine-applicable fix | Effects | §4.3 |
+| UnhandledEffect | E0539 | An effect reaches a root with no `with` that discharges it: a user-declared effect in `main`, or any effect in a test block. The header names the root (in `main`, or in test "..."); in `main` the help says user-declared effects have no root handler | Effects | §4.6, §2.20 |
 | CloseableEscapesScope | E0601 | `Closeable` value escapes `with...as` scope | Resources | §5.5 |
 | MutableCaptureInSpawn | E0650 | A closure passed to `async.spawn` captures a `let mut` binding | Closures | §2.8 |
 | ArenaValueEscapes | E0700 | Arena-scoped value escapes arena scope | Arena | §5.2 |
