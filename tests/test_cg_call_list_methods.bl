@@ -12,7 +12,7 @@ import lower_test_helpers.{
 }
 import parser.{node_kind, node_method, nodes}
 import ast.{NodeKind, nk_of}
-import ir.{ir_c_name, ir_kid, ir_kid_count}
+import ir.{ir_c_name, ir_kid, ir_kid_count, ir_kind, ir_kind_name}
 import layout.{layout_take_typedefs}
 import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
 import std.io
@@ -129,9 +129,8 @@ fn src_refused() -> Str {
 "#
 }
 
-// An element whose comparison travels by value: a Str already IS the pointer its table
-// compares, so nothing is bound to take its address, either for the needle or for the
-// element a turn of the loop reads.
+// A Str is a pointer, so its elements compare through the runtime's byte comparison
+// rather than C's `==`, which would compare addresses.
 fn src_scan_str_elem() -> Str {
     #"fn main() {
     let words: List[Str] = ["a", "b"]
@@ -141,9 +140,7 @@ fn src_scan_str_elem() -> Str {
 "#
 }
 
-// An element whose comparison travels by address: a word-sized Int is bound to a local so
-// the table's `eq` can be handed a pointer to it, both for the needle ahead of the loop and
-// for the element a turn of the loop reads.
+// A word-sized Int is its own whole value, so its elements compare with C's `==`.
 fn src_scan_word_elem() -> Str {
     #"fn main() {
     let xs: List[Int] = [1, 2]
@@ -153,9 +150,8 @@ fn src_scan_word_elem() -> Str {
 "#
 }
 
-// A Float element has no kops table, since a table carries a hash and Float has none, so
-// the scan calls the runtime's total-order equality directly. That equality says NaN
-// equals NaN, which C's `==` does not.
+// A Float compares through the runtime's total-order equality, which says NaN equals NaN,
+// as C's `==` does not.
 fn src_scan_float_elem() -> Str {
     #"fn main() {
     let xs: List[Float] = [1.0, 2.0]
@@ -165,9 +161,7 @@ fn src_scan_float_elem() -> Str {
 "#
 }
 
-// An enum element: a second non-primitive kind, distinct from the struct below, so the two
-// refusal rows each pin a different kind the spec excludes rather than proving the same
-// thing twice.
+// A payload-free enum is `Eq` with no derive, and is one ordinal word.
 fn src_scan_enum_elem() -> Str {
     #"type Suit { Clubs, Diamonds, Hearts, Spades }
 
@@ -179,12 +173,9 @@ fn main() {
 "#
 }
 
-// The spec permits List.contains over exactly Int, Bool, Str and Float; every other
-// element kind is refused, struct and enum included, whether or not the type happens to
-// carry a table of its own. Deriving Hash earns a struct a table for a keyed container's
-// slot, not for this scan -- so a struct that derives Hash (and, with it, Eq) is refused
-// exactly like one that derives nothing at all, proving the refusal is not gameable by
-// giving the element a table.
+// A struct that derives Eq compares through its derived method. It derives Hash as well,
+// so it also carries a key table, and the scan must not read that table: the table is for
+// a keyed container's slot, and the element type's own `==` is what `contains` means.
 fn src_scan_struct_with_table_elem() -> Str {
     #"@derive(Eq, Hash)
 type HashPoint {
@@ -336,32 +327,30 @@ fn contains_loop_and_match(stmts: List[Int]) -> Int {
     ir_kid(body, ir_kid_count(body) - 1)
 }
 
-// The kops table symbol a matched turn of the loop reads its `eq` field off, unwound from
-// the comparison the `if` branches on: `CallIndirect(FieldGet(GlobalRef))`.
-fn contains_table_symbol(matched: Int) -> Str {
+// The comparison the `if` branches on, as its node kind and the name it carries: the
+// operator for a Binary, the function for a call.
+fn contains_compare(matched: Int) -> Str {
     let cmp = ir_kid(matched, 0)
-    let call = ir_kid(cmp, 0)
-    let eq_fn = ir_kid(call, 0)
-    ir_c_name(ir_kid(eq_fn, 0))
+    "{ir_kind_name(ir_kind(cmp))} {ir_c_name(cmp)}"
 }
 
-test "a contains over Str elements compares through the string table by value" {
+test "a contains over Str elements compares bytes, not addresses" {
     probe("lm_cs", src_scan_str_elem())
     let mark = cg_expr_pending_count()
     let built = lower_expr(rhs_of("hit"))
     let stmts = cg_expr_take_pending(mark)
     assert_shape("answer", built, "VarRef")
-    assert_eq_str("table", contains_table_symbol(contains_loop_and_match(stmts)), "blink_kops_str")
+    assert_eq_str("compare", contains_compare(contains_loop_and_match(stmts)), "CallRuntime blink_str_eq")
     assert_verifies("contains str", built)
 }
 
-test "a contains over word-sized elements compares through the runtime's own table" {
+test "a contains over word-sized elements compares with C's ==" {
     probe("lm_ci", src_scan_word_elem())
     let mark = cg_expr_pending_count()
     let built = lower_expr(rhs_of("hit"))
     let stmts = cg_expr_take_pending(mark)
     assert_shape("answer", built, "VarRef")
-    assert_eq_str("table", contains_table_symbol(contains_loop_and_match(stmts)), "blink_kops_i64")
+    assert_eq_str("compare", contains_compare(contains_loop_and_match(stmts)), "Binary ==")
     assert_verifies("contains word", built)
 }
 
@@ -376,25 +365,28 @@ test "a contains over Float elements compares through the total-order equality h
     assert_verifies("contains float", built)
 }
 
-// Typecheck now refuses a non-primitive element before this stage ever runs. The codegen
-// backstop below is still reachable through this same probe, because dispatch to it reads
-// the receiver's own type, not whether this call resolved, so this row keeps both refusals
-// honest: the front gate's, and the one behind it.
-test "a contains over an enum element is refused by typecheck, naming the element" {
-    probe_but("lm_ce", src_scan_enum_elem(), "UnresolvedMethod")
-    assert_refused_saying("contains enum", "Suit", 1)
+test "a contains over a payload-free enum compares the ordinal with C's ==" {
+    probe("lm_ce", src_scan_enum_elem())
+    let mark = cg_expr_pending_count()
     let built = lower_expr(rhs_of("hit"))
-    assert_ice_saying("contains", built, "ElementNotPrimitive", "Suit")
+    let stmts = cg_expr_take_pending(mark)
+    assert_shape("answer", built, "VarRef")
+    assert_eq_str("compare", contains_compare(contains_loop_and_match(stmts)), "Binary ==")
+    assert_verifies("contains enum", built)
 }
 
-// The spec's four permitted kinds are the only door in, even for a struct that would
-// otherwise pass a kops-table check: deriving Hash earns HashPoint a table, but that table
-// is for a keyed container's slot, not for this scan, so this is refused exactly as the
-// enum row above is, over a different non-primitive kind. The codegen backstop already has
-// a test reference on that row, so this one stops at the front gate.
-test "a contains over a struct is refused by typecheck even when the struct derives a table" {
-    probe_but("lm_ct", src_scan_struct_with_table_elem(), "UnresolvedMethod")
-    assert_refused_saying("contains struct", "HashPoint", 1)
+test "a contains over a struct that derives Eq calls its derived eq, not its key table" {
+    probe("lm_ct", src_scan_struct_with_table_elem())
+    let mark = cg_expr_pending_count()
+    let built = lower_expr(rhs_of("hit"))
+    let stmts = cg_expr_take_pending(mark)
+    assert_shape("answer", built, "VarRef")
+    let compare = contains_compare(contains_loop_and_match(stmts))
+    if !compare.starts_with("CallDirect ") || !compare.contains("HashPoint") || !compare.contains("eq") {
+        io.println("FAIL: contains struct compares through '{compare}'")
+    }
+    assert(compare.starts_with("CallDirect ") && compare.contains("HashPoint") && compare.contains("eq"))
+    assert_verifies("contains struct", built)
 }
 
 test "a runtime-backed method called with too many arguments is refused by name" {
