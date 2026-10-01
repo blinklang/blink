@@ -1795,17 +1795,10 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
             check_closure_captures(node)
         }
         let fn_tid = tc_lookup_node_tid(node)
-        ea_push_body(if fn_tid < 0 { -1 } else { tc_tid_child(tc_resolve(fn_tid), 0) })
+        let ret_tid = if fn_tid < 0 { -1 } else { tc_tid_child(tc_resolve(fn_tid), 0) }
         ea_closure_stack.push(node)
-        ea_push_binds()
-        let mut params: List[Str] = []
-        push_param_names(node, params)
-        ea_bind_all(params)
-        walk_expr(node_body(node), 0)
-        check_body_tail_flows(node_body(node), if fn_tid < 0 { -1 } else { tc_tid_child(tc_resolve(fn_tid), 0) })
-        ea_pop_binds()
+        walk_callable_body(node, ret_tid, 1)
         let _ = ea_closure_stack.pop()
-        ea_pop_body()
         let mut ctag = -1
         for cap in closure_read_idents(node) { ctag = ea_innermost(ctag, ffi_tag_of(cap)) }
         ea_node_tags.insert(node, ctag)
@@ -1963,6 +1956,47 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
         walk_expr(node_obj(node), 0)
         return
     }
+    if kind == NodeKind.NamedArg || kind == NodeKind.SpreadExpr {
+        walk_expr(node_value(node), 0)
+        return
+    }
+    if kind == NodeKind.ChannelNew {
+        walk_elements(node_args(node))
+        return
+    }
+    // The body runs in place, so the enclosing with blocks are still open around it.
+    if kind == NodeKind.AssertPanics {
+        walk_expr(node_body(node), 0)
+        return
+    }
+    // Each op body is a function of its own: a `return` in it leaves the op, not the
+    // enclosing function.
+    if kind == NodeKind.HandlerExpr {
+        let methods_sl = node_methods(node)
+        let mut mi = 0
+        while methods_sl != -1 && mi < sublist_length(methods_sl) {
+            let m = sublist_get(methods_sl, mi)
+            if node_body(m) != -1 {
+                let ann = node_type_ann(m)
+                walk_callable_body(m, if ann == -1 { -1 } else { tc_lookup_node_tid(ann) }, if ann == -1 { 0 } else { 1 })
+            }
+            mi = mi + 1
+        }
+        return
+    }
+}
+
+// Walks a closure or handler op body in a frame of its own, with its params bound.
+fn walk_callable_body(callable: Int, ret_tid: Int, check_tail: Int) ! Diag.Report {
+    ea_push_body(ret_tid)
+    ea_push_binds()
+    let mut params: List[Str] = []
+    push_param_names(callable, params)
+    ea_bind_all(params)
+    walk_expr(node_body(callable), 0)
+    if check_tail != 0 { check_body_tail_flows(node_body(callable), ret_tid) }
+    ea_pop_binds()
+    ea_pop_body()
 }
 
 fn cc_scan_elements(sl: Int, locals: List[Str]) ! Diag.Report {
